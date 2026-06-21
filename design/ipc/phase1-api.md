@@ -201,4 +201,53 @@ When phase 2 lands, these tests should continue to pass against the wrapper API.
 
 ---
 
+## 8. P3 Closure Note (2026-06-21)
+
+### Errno Catalogue (Phase-1 & Phase-2 Compatibility)
+
+The phase-1 implementation uses the following errno-like codes for all IPC operations:
+
+#### Enqueue Error Codes
+| Code | Name | Meaning |
+|------|------|---------|
+| 0 | ENQUEUE_OK | Message successfully queued |
+| -1 | ENQUEUE_FULL | Ring buffer full; no slot available |
+| -2 | ENQUEUE_EMSGSIZE | Message size exceeds SLOT_SIZE (256 bytes) |
+| -3 | ENQUEUE_INVALID_CAP | Producer capability check failed |
+
+#### Dequeue Error Codes
+| Code | Name | Meaning |
+|------|------|---------|
+| 0..256 | DEQUEUE_OK_BASE + bytes_read | Message dequeued; RAX = bytes copied to output buffer |
+| -1 | DEQUEUE_EMPTY | Ring buffer empty; no message available |
+| -2 | DEQUEUE_EOVERFLOW | Output buffer too small for message |
+| -3 | DEQUEUE_INVALID_CAP | Consumer capability check failed |
+
+#### Destroy Error Codes
+| Code | Name | Meaning |
+|------|------|---------|
+| 0 | DESTROY_OK | Channel successfully destroyed and deallocated |
+| -1 | DESTROY_BADCHANNEL | Channel handle invalid or already destroyed |
+| -3 | DESTROY_INVALID_CAP | Caller lacks ipc_close right (0x10000) |
+
+### Protocol Invariant
+
+For dequeue: success is indicated by RAX >= 0 (bytes_read); errors have RAX < 0 (error code).
+This allows single-branch error checking:
+```nasm
+call ipc_dequeue
+cmp eax, 0
+jl .error        ; error if negative
+; RAX now contains bytes_read
+```
+
+### Migration to Phase-2
+
+These error codes remain valid in phase-2 with the following changes:
+- ENQUEUE_EMSGSIZE is relaxed (streaming enables arbitrarily large messages).
+- New errors may be added (e.g., ENQUEUE_EDEADLK for async contexts, ENQUEUE_EBUSY for slot-cap backpressure).
+- The success/error branch (RAX >= 0 vs < 0) remains the same.
+
+---
+
 *End of document.*
