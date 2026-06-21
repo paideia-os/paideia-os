@@ -110,3 +110,24 @@ Phase-4 scheduler implementation includes:
 - IDT entry installation for timer vector
 - 6 audit entries documenting unsafe block rationale and invariants
 - 6 smoke tests (stubs) for validation once real implementation ships
+
+## Phase-5 entries (3 unsafe blocks across 3 memory-management files)
+
+| Audit ID | File | Function | Effects |
+|----------|------|----------|---------|
+| memory_map-001 | src/kernel/core/mm/memory_map.pdx | (data; parser) | rawmem (E820 table read) |
+| aspace_activate-001 | src/kernel/core/mm/aspace_activate.pdx | p1_aspace_activate | sysreg (CR3 write) |
+| pf_handler-001 | src/kernel/core/mm/pf_handler.pdx | stub_pf_handler | sysreg (CR2/CR3 read), rawmem (PT update) |
+
+Phase-5 memory-management API includes:
+- E820 memory-map parsing for bootloader-provided RAM/reserved regions
+- Buddy allocator constants (4K–2M, 10 free lists)
+- Per-CPU magazine cache for fast allocation
+- Physical allocation/free API (p1_phys_alloc, p1_phys_free)
+- Address-space lifecycle (create, activate, destroy)
+- Page-table walk and mapping/unmapping (4K and 2M pages)
+- Page-fault handler entry point
+- PCID (Process-Context Identifier) support for TLB efficiency
+- NUMA preparation (per-domain free lists, domain-aware refill)
+- 3 audit entries documenting unsafe surfaces (bootloader table read, CR3 write, fault handler)
+- 7 smoke tests (stubs) for validation once Phase-6 implementation ships
