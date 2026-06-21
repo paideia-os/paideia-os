@@ -83,4 +83,44 @@ Phase-1 callers continue via wrapper functions over phase-2 capability operation
 
 ---
 
+## 4. Phase-5 closure
+
+**Date:** 2026-06-21  
+**Status:** Stubs and constants complete; Phase 6 will implement bodies.
+
+Phase 5 provides a complete skeleton of the Phase-1 memory-management API:
+
+- **22 core MM modules** in `src/kernel/core/mm/`:
+  - Memory-map parser (E820 audit)
+  - Kernel image reservation
+  - Buddy allocator (4K–2M, 10 free lists per order)
+  - Per-CPU magazine cache (16 pages)
+  - Physical allocation/free API
+  - Address-space struct and lifecycle
+  - PCID allocator (12-bit space, 4096 max)
+  - Page-table walking and mapping (4K + 2M)
+  - Page-fault handler (CR2/CR3 audit)
+  - Panic trace ring buffer
+  - NUMA preparation (per-domain lists, refill strategy)
+
+- **7 smoke tests** in `tests/smoke/`:
+  - `mm_torture.pdx` — buddy allocator stress
+  - `mm_aspace_roundtrip.pdx` — AS lifecycle
+  - `mm_2mib_mapping.pdx` — 2M page support
+  - `mm_pcid_exhaustion.pdx` — PCID overflow handling
+  - `mm_pf_userfault.pdx` — fault handler validation
+  - `perf_pt_walk.pdx` — page-table walk latency
+  - `perf_as_switch.pdx` — CR3 switch latency
+
+- **3 audit entries** in `design/audit/entries/`:
+  - `memory_map-001.md` — E820 table read (rawmem)
+  - `aspace_activate-001.md` — CR3 write (sysreg)
+  - `pf_handler-001.md` — fault handler (sysreg + rawmem)
+
+All modules contain stubs/constants only per Phase 6 paideia-as limitations.
+Real function bodies will be implemented in Phase 6 once paideia-as gains
+structured control flow and multi-instruction unsafe block support.
+
+---
+
 *End of document.*
