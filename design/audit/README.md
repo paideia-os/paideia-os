@@ -131,3 +131,34 @@ Phase-5 memory-management API includes:
 - NUMA preparation (per-domain free lists, domain-aware refill)
 - 3 audit entries documenting unsafe surfaces (bootloader table read, CR3 write, fault handler)
 - 7 smoke tests (stubs) for validation once Phase-6 implementation ships
+
+## Phase-6 entries (9 unsafe blocks across 15 core files)
+
+| Audit ID | File | Function | Effects |
+|----------|------|----------|---------|
+| int-ist-stacks-001 | src/kernel/core/int/ist.pdx | stub_ist_init | sysreg, rawmem |
+| apic-x2apic-001 | src/kernel/core/apic/x2apic.pdx | stub_enable_x2apic | sysreg |
+| apic-ioapic-001 | src/kernel/core/apic/ioapic.pdx | stub_ioapic_set_redir | mmio |
+| acpi-rsdp-001 | src/kernel/core/acpi/rsdp.pdx | stub_rsdp_find | rawmem |
+| ipi-cross-cpu-001 | src/kernel/core/ipi/cross_cpu.pdx | stub_ipi_send | sysreg |
+
+Phase-6 interrupts, APIC, and timer-wheel API includes:
+- Interrupt Descriptor Table (IDT) in kernel .bss with 256 vectors
+- IST (Interrupt Stack Table) stacks for DF/NMI/MC exception handling
+- Exception handlers for UD, GP, PF, DF, MC, NMI vectors
+- x2APIC enablement via IA32_APIC_BASE_MSR
+- LAPIC timer configuration with TSC-deadline mode
+- LAPIC EOI (End-of-Interrupt) helper
+- I/O APIC redirect table programming for ISA IRQ routing
+- MSI (Message Signaled Interrupt) support for PCIe devices
+- IRQ-to-notification-capability routing table (224 vectors)
+- ACPI RSDP discovery and RSDT/XSDT parsing
+- MADT (Multiple APIC Description Table) walker for topology discovery
+- Hierarchical 8-level timer wheel (64 buckets per level, O(1) insertion)
+- timer_add() and timer_cancel() syscall APIs
+- LAPIC timer ISR with deadline-based firing
+- Cross-CPU IPI delivery (reschedule, TLB shootdown)
+- TLB shootdown IPI handler
+- Reschedule IPI handler
+- 5 audit entries documenting unsafe surfaces (IST init, x2APIC MSR, IOAPIC MMIO, RSDP scan, IPI dispatch)
+- 5 smoke tests (stubs) for validation once Phase-7 implementation ships
