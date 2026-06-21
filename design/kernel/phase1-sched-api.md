@@ -78,4 +78,28 @@ Phase-1 callers continue via wrappers.
 
 ---
 
+## 4. Phase-4 Closure
+
+**Date:** 2026-06-21  
+**Status:** Phase 4 scheduler implementation completed as module stubs.
+
+The Phase-1 scheduler API defined in section 1 has been implemented as follows:
+- **TCB Layout** (#81/#203): 32-byte fixed structure with saved_regs, cspace, vspace, state
+- **TCB Allocator** (#83/#204): Slab-based allocator with 256 entries
+- **Context Switch** (#85/#95): Core switch mechanism with register/GS-base handling
+- **Per-CPU Current TCB** (#86): GS-base offset 0 for O(1) current thread lookup
+- **SC Descriptor** (#88/#99): 32-byte structure with budget, period, priority, refill_state
+- **Priority Bitmap** (#102): 256-bin bitmap for O(log N) thread selection
+- **Schedule Operations** (#100, #103-107): p1_sc_create/bind/unbind, enqueue/dequeue, pick_next, yield
+- **Budget Accounting** (#101): Cycle-based budget tracking with refills
+- **Timer Support** (#109-111): TSC-deadline and IDT integration
+- **Idle Thread** (#108): HLT-based CPU idle with interrupt wake-up
+- **Capability Integration** (#112-113): Process and SC operations capability registration
+
+All implementations are stubs (constants + placeholder functions) with design audit entries for unsafe blocks.
+
+Smoke tests created (#114-124) for validation once real implementation is complete.
+
+---
+
 *End of document.*
