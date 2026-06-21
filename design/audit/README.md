@@ -51,6 +51,16 @@ audit entry in the same commit. The CI smoke (Phase-1 m1-014) will
 eventually verify that every `unsafe { }` block in the source tree
 has a matching audit entry.
 
+## Phase-2 entries (1 unsafe block across 1 file)
+
+| Audit ID | File | Function | Effects |
+|----------|------|----------|---------|
+| cap-dump-001 | src/kernel/core/cap/dump.pdx | (placeholder, Phase 3+) | rawmem |
+
+The cap-dump-001 entry documents a deferred unsafe block for the cap_dump(handle)
+diagnostic introspection utility. The real implementation is scheduled for Phase 3
+when unsafe blocks gain structured control flow (if/else, loops) support.
+
 ## Phase 1 honest scope
 
 All Phase-1 unsafe blocks are Phase-1 stubs (single-instruction or
