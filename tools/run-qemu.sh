@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Boot the built kernel under QEMU. Serial output goes to stdout.
+#
+# Extra args after the script name pass through to qemu-system-x86_64,
+# e.g.: tools/run-qemu.sh -d int,cpu_reset
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+KERNEL="${REPO_ROOT}/build/kernel.elf"
+
+if [[ ! -f "${KERNEL}" ]]; then
+    echo "kernel not built; run tools/build.sh first" >&2
+    exit 1
+fi
+
+exec qemu-system-x86_64 \
+    -kernel "${KERNEL}" \
+    -serial stdio \
+    -display none \
+    -no-reboot \
+    -no-shutdown \
+    -m 256M \
+    "$@"
