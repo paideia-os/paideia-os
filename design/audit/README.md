@@ -88,3 +88,25 @@ encoders for the unsafe-block payload walker.
 Phase-3 extends this to include unsafe pointer arithmetic (ring buffer indexing)
 and atomic compare-and-swap (global MPSC lock), which remain stubs pending
 encoder support for these patterns in paideia-as Phase 6+.
+
+## Phase-4 entries (8 unsafe blocks across 8 scheduler files)
+
+| Audit ID | File | Function | Effects |
+|----------|------|----------|---------|
+| switch-001 | src/kernel/core/sched/switch.pdx | stub_context_switch | sysreg (CR3, MSR gs-base), registers |
+| gs-current-001 | src/kernel/core/sched/gs_current.pdx | stub_get/set_gs_base | sysreg (MSR 0xC0000102) |
+| current-001 | src/kernel/core/sched/current.pdx | stub_sched_current | rawmem (GS:[0]) |
+| idle-001 | src/kernel/core/sched/idle.pdx | stub_idle_hlt | sysreg (HLT instruction) |
+| tsc-deadline-001 | src/kernel/core/sched/tsc_deadline.pdx | stub_tsc_deadline_set | sysreg (MSR 0x6E0) |
+| timer-irq-001 | src/kernel/core/sched/timer_irq.pdx | stub_timer_irq_handler | sysreg (MSR ops), rawmem (queue manipulation) |
+| timer-idt-001 | src/kernel/core/sched/timer_idt.pdx | stub_idt_set_timer_handler | sysreg (LIDT), rawmem (IDT writes) |
+
+Phase-4 scheduler implementation includes:
+- Context switch with register save/restore and GS-base MSR access
+- Per-CPU current TCB via GS-base offset 0
+- Idle thread with HLT instruction
+- TSC-deadline timer programming via MSR
+- Timer interrupt handler with scheduler integration
+- IDT entry installation for timer vector
+- 6 audit entries documenting unsafe block rationale and invariants
+- 6 smoke tests (stubs) for validation once real implementation ships
