@@ -108,4 +108,27 @@ About a dozen distinct capabilities total in phase 1.
 
 ---
 
+## 6. P2 closure note (2026-06-21)
+
+**Phase-2 implementation status of Phase-1 API operations:**
+
+| Operation | Status | Notes |
+|-----------|--------|-------|
+| p1_cap_mint | Stub-shipped | Constants and module structure in place; real implementation deferred to Phase 3 (when unsafe blocks support structured control flow). See cap/mint.pdx. |
+| p1_cap_verify | Stub-shipped | Core capability verification pipeline in place (cap/verify.pdx); full multi-stage verification deferred to Phase 3. |
+| p1_cap_has_rights | Stub-shipped | Rights validation constants (cap/rights_table.pdx) and module structure in place; real checking logic deferred to Phase 3. |
+| p1_cap_revoke | Stub-shipped | Revocation subsystem stubs in place (cap/revoke.pdx); generation-number increments deferred to Phase 3. |
+| p1_cap_destroy | Stub-shipped | Slab-allocator stubs in place (cap/slab.pdx); real deallocation deferred to Phase 3. |
+
+**Smoke tests:**
+- Capability system smoke (cap_smoke.pdx) — placeholder, real implementation Phase 7+
+- Revocation-storm test (revoke_storm.pdx) — placeholder, real implementation Phase 7+
+- Forged-handle rejection (forged_handle.pdx) — placeholder, real implementation Phase 7+
+- Rights-mask boundary (rights_boundary.pdx) — placeholder, real implementation Phase 7+
+
+**Unsafe operations:**
+- cap_dump(handle) audit entry (cap-dump-001.md) — deferred to Phase 3
+
+---
+
 *End of document.*
