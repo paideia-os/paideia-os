@@ -34,10 +34,12 @@ if [[ ${#OBJECTS[@]} -eq 0 ]]; then
     exit 1
 fi
 
-echo "[stub] tools/stubs.S — Phase-7-in-progress link stubs"
-STUBS_OBJ="${BUILD_DIR}/stubs.o"
-as --64 -o "${STUBS_OBJ}" "${REPO_ROOT}/tools/stubs.S"
-OBJECTS+=("${STUBS_OBJ}")
+# Symbol export now provides uart_init/uart_puts definitions
+# tools/stubs.S is no longer needed for linking
+# echo "[stub] tools/stubs.S — Phase-7-in-progress link stubs"
+# STUBS_OBJ="${BUILD_DIR}/stubs.o"
+# as --64 -o "${STUBS_OBJ}" "${REPO_ROOT}/tools/stubs.S"
+# OBJECTS+=("${STUBS_OBJ}")
 
 echo "[link] ld -T link.ld -> kernel.elf"
 # paideia-as 0.6.0 doesn't yet emit top-level let-fn bindings as named ELF
