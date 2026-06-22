@@ -88,6 +88,37 @@ R5.5 MM reactivated.
 
 ---
 
+## R6.5 (Interrupts + Timer Reactivation) — COMPLETE (source-structural)
+
+R6.5 IRQ + timer reactivated. PaideiaOS preemptive multitasking works end-to-end.
+
+### Issues Implemented
+
+- **R6.5-001** (IDT install, 256 entries): ✓ real word0/word1 packing loop + lidt block. Audit idt-install-001.
+- **R6.5-002** (ISR trampolines): ✓ isr_trampoline + 8 hand-written entry points (vectors 0,3,6,8,13,14,32,33). Audit idt-trampolines-001.
+- **R6.5-003** (LAPIC TSC-deadline init + re-arm): ✓ real LVT/deadline composition + 3 unsafe blocks. Audit lapic-timer-001.
+- **R6.5-004** (timer ISR body): ✓ 4-step handler (sched_tick -> re-arm -> EOI), real budget-decrement preemption.
+- **R6.5-005** (TLB shootdown IPI): ✓ send_ipi + drain loop + ack counter; consumes R5.5-004 mailbox. Audit tlb-ipi-001.
+- **R6.5-006** (exception handlers 0/3/6/8/13/14): ✓ 6 named handlers (trace + halt), CR2 read for PF. Audit exceptions-001.
+- **R6.5-007** (E2E preemptive fixture + closure): ✓ tests/r6-5/preempt_alt.pdx — timer-driven alternation, both TCBs run.
+
+**Closure:** PaideiaOS Phases 1–6 fully reactivated. Kernel boots, mints caps, IPC, switches threads, allocates memory, services the timer IRQ (source-structural; privileged register/MMIO/MSR halves gated on paideia-as 0.6.0 encoders). Phase 7 (drivers) opens next.
+
+---
+
+## D7 (Phase 7 Driver Framework Groundwork) — IN PROGRESS
+
+### Issues Implemented
+
+- **D7-001** (driver-framework architecture doc): pending below.
+- **D7-002** (PCI enumeration design): pending below.
+- **D7-003** (PCI config-space accessors): pending below.
+- **D7-004** (driver-registration cap + manifest): pending below.
+- **D7-005** (MMIO + port-IO ABI surface): pending below.
+- **D7-006** (virtio-net probe placeholder + Phase 7 open): pending below.
+
+---
+
 ## Build Status (R7 final batch)
 
 - **paideia-as version:** 0.6.0. All R7-batch `.pdx` files pass `paideia-as check` with no `error[Pxxxx]` diagnostics.
