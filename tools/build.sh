@@ -34,7 +34,20 @@ if [[ ${#OBJECTS[@]} -eq 0 ]]; then
     exit 1
 fi
 
+echo "[stub] tools/stubs.S — Phase-7-in-progress link stubs"
+STUBS_OBJ="${BUILD_DIR}/stubs.o"
+as --64 -o "${STUBS_OBJ}" "${REPO_ROOT}/tools/stubs.S"
+OBJECTS+=("${STUBS_OBJ}")
+
 echo "[link] ld -T link.ld -> kernel.elf"
+# paideia-as 0.6.0 doesn't yet emit top-level let-fn bindings as named ELF
+# symbols (the encoder ships them as a synthetic `add_one` placeholder), so
+# inter-file references like `call uart_init` show up as undefined PLT32
+# relocations at link time. tools/stubs.S provides empty `ret` bodies for
+# each placeholder symbol; ld resolves the PLT32 relocs against them. The
+# kernel returns through these stubs at runtime (no UART, no init) but the
+# image links and QEMU can load it. Real symbol-export lands in a later
+# paideia-as phase.
 ld -nostdlib -T "${LINK_SCRIPT}" -o "${BUILD_DIR}/kernel.elf" "${OBJECTS[@]}"
 
 echo "[ok] ${BUILD_DIR}/kernel.elf"
