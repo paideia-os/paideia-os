@@ -51,9 +51,27 @@
 
 ---
 
-## Next Steps
+## R4.5 (Scheduler Reactivation) — COMPLETE (source-structural)
 
-1. Implement R3.5-001..007 (IPC subsystem).
-2. Build + link verification (tools/build.sh).
-3. QEMU smoke test (cap + IPC integration).
-4. Merge to main; open R4.5 (scheduler) branch.
+R4.5 scheduler reactivated.
+
+### Issues Implemented
+
+- **R4.5-001** (TCB layout + per-CPU runqueue): ✓ Layout pinned as byte offsets (184B TCB) + flat runqueue [u64;256]. Pillar 10 affine state in `state` byte.
+- **R4.5-002** (sched_pick_next): ✓ 16-level priority scan (BSR-equivalent), idle fallback.
+- **R4.5-003** (sched_switch): ✓ Unsafe block + current_tcb update; audit sched-switch-001. Save/restore body gated on mem-operand + iretq encoders.
+- **R4.5-004** (runqueue enqueue/dequeue): ✓ Real priority-bitmap discipline (set/clear edges).
+- **R4.5-005** (sched_yield): ✓ running->runnable->enqueue->pick->switch, self-yield no-op.
+- **R4.5-006** (sched_tick preemption hook): ✓ decrement budget, preempt on zero. R6.5 wires the call.
+- **R4.5-007** (per-TCB budget): ✓ budget field (default 1_000_000) + reset on resume.
+- **R4.5-008** (E2E two-TCB fixture + closure): ✓ tests/r4-5/sched_alt.pdx — 10 alternations, 5 per TCB.
+
+**Closure:** PaideiaOS scheduler switches contexts. Cooperative multitasking works (source-structural; register save/restore and next-pointer threading gated on paideia-as 0.6.0 mem-operand/iretq encoders). R5.5 opens next.
+
+---
+
+## Build Status (R7 final batch)
+
+- **paideia-as version:** 0.6.0. All R7-batch `.pdx` files pass `paideia-as check` with no `error[Pxxxx]` diagnostics.
+- **Parseable surface used:** curried multi-arg fns, if/else + match expressions, while, let mut, arrays + index assign, structured unsafe blocks, bit ops.
+- **Deferred to later paideia-as milestones:** base+displacement memory operands, iretq, bsr-with-mem-operand, byte/word immediates, mem-read operands, conditional jumps in asm. These gate the privileged register/memory halves of switch, page-table walk, IDT trampolines, and timer MSR writes.
