@@ -106,16 +106,22 @@ R6.5 IRQ + timer reactivated. PaideiaOS preemptive multitasking works end-to-end
 
 ---
 
-## D7 (Phase 7 Driver Framework Groundwork) — IN PROGRESS
+## D7 (Phase 7 Driver Framework Groundwork) — COMPLETE (source-structural)
 
 ### Issues Implemented
 
-- **D7-001** (driver-framework architecture doc): pending below.
-- **D7-002** (PCI enumeration design): pending below.
-- **D7-003** (PCI config-space accessors): pending below.
-- **D7-004** (driver-registration cap + manifest): pending below.
-- **D7-005** (MMIO + port-IO ABI surface): pending below.
-- **D7-006** (virtio-net probe placeholder + Phase 7 open): pending below.
+- **D7-001** (driver-framework architecture doc): ✓ design/drivers/architecture.md — lifecycle, Pillar 3/9, cap-mediated access, IRQ-via-IPC, hot-plug, open questions.
+- **D7-002** (PCI enumeration design): ✓ design/drivers/pci-enumeration.md — port-IO vs MMCONFIG, BDF, bus-0 walk, bridge recursion; MMCONFIG punted to post-ACPI.
+- **D7-003** (PCI config-space accessors): ✓ src/drivers/pci/config.pdx — real BDF address composition + 3 port-IO unsafe blocks. Audit pci-config-001.
+- **D7-004** (driver-registration cap + manifest): ✓ KIND_DRIVER (derived; spec value-5 conflict resolved), 56-byte manifest, cap_mint_driver. design/drivers/driver-cap.md.
+- **D7-005** (MMIO ABI surface): ✓ request_mmio_mapping handler (KIND_DRIVER ops) + driver-side front-end; e1000e BAR test.
+- **D7-006** (virtio-net probe placeholder): ✓ src/drivers/virtio_net/probe.pdx — real vendor/device match (0x1AF4:0x1041) + BAR0 derivation; lifecycle proof.
+
+**Closure:** Driver framework groundwork complete. PCI config access, driver capability + manifest, MMIO ABI, and a virtio-net probe skeleton are in place. **Phase 7 proper (NVMe, e1000e, virtio-net full bring-up) opens next.**
+
+### Notable design decision
+
+- D7-004 surfaced a spec/codebase conflict: the round plan assigns KIND_DRIVER = value 5, but slot 5 is the binding KIND_IPC_ENDPOINT in the closed 16-kind LAM enum. Resolved by making KIND_DRIVER a *derived* kind (runtime base KIND_DEVICE = 10, tag 0x15), preserving the 4-bit kind invariant. Flagged for cap-system design review.
 
 ---
 
