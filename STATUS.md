@@ -70,6 +70,24 @@ R4.5 scheduler reactivated.
 
 ---
 
+## R5.5 (Memory Management Reactivation) — COMPLETE (source-structural)
+
+R5.5 MM reactivated.
+
+### Issues Implemented
+
+- **R5.5-001** (buddy free-list heads): ✓ 11 orders (4KiB..4MiB) per NUMA node, buddy_init seeds max order.
+- **R5.5-002** (phys_alloc buddy walk): ✓ upward search + real split-down loop, null on no-fit.
+- **R5.5-003** (aspace_map 4-level walk): ✓ real 9-bit/level index extraction + leaf-PTE composition + INVLPG block. Audit aspace-map-001.
+- **R5.5-004** (aspace_unmap + shootdown mailbox): ✓ real per-CPU mailbox bookkeeping. Audit aspace-unmap-001.
+- **R5.5-005** (per-CPU magazine): ✓ real push/pop/refill-16/flush-16, order-0 fast path + order>=1 bypass.
+- **R5.5-006** (aspace_create + activate): ✓ upper-half copy loop + real CR3 composition (PML4|PCID|no-flush).
+- **R5.5-007** (E2E alloc-map-touch fixture + closure): ✓ tests/r5-5/mm_e2e.pdx — 5-step flow, progress==31.
+
+**Closure:** PaideiaOS memory management runs end-to-end. Buddy + magazine + 4-level paging (source-structural; PTE loads/stores, INVLPG, CR3 mov gated on paideia-as 0.6.0 mem-operand/instruction encoders). R6.5 opens next.
+
+---
+
 ## Build Status (R7 final batch)
 
 - **paideia-as version:** 0.6.0. All R7-batch `.pdx` files pass `paideia-as check` with no `error[Pxxxx]` diagnostics.
