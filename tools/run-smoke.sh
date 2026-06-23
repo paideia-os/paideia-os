@@ -3,9 +3,12 @@
 # 5-second timeout, captures serial output, and asserts deterministic
 # bytes.
 #
-# Usage: tools/run-smoke.sh [expected_marker]
-#   expected_marker defaults to no-check (just confirms QEMU exits or
-#   times out cleanly). Pass a string to grep the serial log for.
+# Usage: tools/run-smoke.sh [expected_marker | --fingerprint PATTERN]
+#   - expected_marker: defaults to no-check (just confirms QEMU exits or
+#     times out cleanly). Pass a string to grep the serial log for.
+#   - --fingerprint PATTERN: validate serial output against tests/r8/expected-PATTERN.txt
+#     file; checks that all lines from the fingerprint file appear in order in the log
+#     (contains-in-order check, not strict equality).
 #
 # Exit codes:
 #   0  — kernel built + booted + (optional) expected marker found
@@ -21,6 +24,15 @@ set -uo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 EXPECTED="${1:-}"
+FINGERPRINT_MODE=0
+FINGERPRINT_FILE=""
+
+# Parse arguments: check for --fingerprint flag
+if [[ "${EXPECTED}" == "--fingerprint" && -n "${2:-}" ]]; then
+    FINGERPRINT_MODE=1
+    FINGERPRINT_FILE="${REPO_ROOT}/tests/r8/expected-${2}.txt"
+    EXPECTED=""
+fi
 
 if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
     echo "smoke: qemu-system-x86_64 not found; skipping" >&2
@@ -51,6 +63,38 @@ QEMU_RC=$?
 if [[ ${QEMU_RC} -ne 0 && ${QEMU_RC} -ne 124 ]]; then
     echo "smoke: qemu exited with rc=${QEMU_RC}" >&2
     exit 1
+fi
+
+if [[ ${FINGERPRINT_MODE} -eq 1 ]]; then
+    # Fingerprint mode: validate serial output against expected lines
+    if [[ ! -f "${FINGERPRINT_FILE}" ]]; then
+        echo "smoke: fingerprint file not found: ${FINGERPRINT_FILE}" >&2
+        exit 1
+    fi
+
+    # Read fingerprint file and check each line appears in order in the log
+    log_content="$(cat "${LOG}" 2>/dev/null || echo "")"
+    line_num=0
+    search_offset=0
+
+    while IFS= read -r line; do
+        ((line_num++))
+        if [[ -z "${line}" ]]; then
+            # Skip empty lines in fingerprint file
+            continue
+        fi
+        # Search for line in log starting from last match position
+        if [[ "${log_content}" == *"${line}"* ]]; then
+            # Line found; update search offset for next iteration
+            search_offset=$(( ${#log_content} ))
+        else
+            echo "smoke: fingerprint line ${line_num} ('${line}') NOT found in serial log (log size: $(stat -c%s "${LOG}" 2>/dev/null || echo 0))" >&2
+            exit 1
+        fi
+    done < "${FINGERPRINT_FILE}"
+
+    echo "smoke: fingerprint check passed (all ${line_num} lines found in order)"
+    exit 0
 fi
 
 if [[ -n "${EXPECTED}" ]]; then

@@ -1,5 +1,17 @@
 # PaideiaOS Implementation Status
 
+## B1 (Bootstrap Phase-1 Instrumentation) — COMPLETE
+
+### Issues Implemented
+
+- **B1-001** (PVH ELF Note): ✓ Complete (paideia-as PA10-001 .note.Xen emission, link.ld PHDRS)
+- **B1-002** (QEMU isa-debug-exit): ✓ Complete (device added to run-qemu.sh + run-smoke.sh, qemu_exit.pdx functions, audit qemu-exit-001.md)
+- **B1-003** (fingerprint assertion + closure): ✓ Complete (fingerprint mode in run-smoke.sh, tests/r8/expected-boot-min.txt baseline)
+
+**Summary:** B1 milestone closed. QEMU now accepts kernel.elf (PVH note present), supports graceful shutdown via isa-debug-exit device (byte 0x10 → exit 33), and smoke test validates serial output against fingerprint files. Phase B4 (kernel_main halt path) will wire qemu_exit_success() call once paideia-as supports immediate operands.
+
+---
+
 ## R2.5 (Cap System Reactivation) — IN PROGRESS
 
 ### Issues Implemented
