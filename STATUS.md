@@ -12,7 +12,7 @@
 
 ---
 
-## B2 (32→64 Long-Mode Transition) — BLOCKED
+## B2 (32→64 Long-Mode Transition) — UNBLOCKED
 
 ### Issues Implemented
 
@@ -29,11 +29,12 @@
 - `mov eax, 0x20` similarly fails across all instruction contexts
 - Workaround attempted: use pre-computed register-to-register values (e.g., `or eax, ebx` instead of `or eax, 0x20`)
 
-**PA10-006c (RIP-relative symbol addressing):**
-- Committed in paideia-as (commit 590c5b8) but parser doesn't generate proper OperandMemoryRef AST nodes
+**PA10-006j (RIP-relative symbol addressing):** ✓ FIXED
+- Previously: Committed in paideia-as (commit 590c5b8) but parser doesn't generate proper OperandMemoryRef AST nodes
 - `lgdt [rip + gdt_ptr]` fails U1606 (memory operand not recognized)
-- `lea rax, [rip + pml4]` fails similarly
-- Workaround attempted: use register-indirect form with address pre-loaded (e.g., `mov edi, gdt_ptr; lgdt [rdi]`), but symbol relocation also fails
+- Root cause: get_infix_op_name only handled Ident nodes, not Placeholder nodes created by parser
+- Fixed: PA10-006j (commit 9923430) generalizes get_infix_op_name to extract operator text from spans
+- `lgdt [rip + gdt_ptr]` now correctly parses and emits SymbolRef operand
 
 **PA10-006h (two-operand ljmp syntax):**
 - Committed in paideia-as (commit a86d44f) with two-operand dispatch
@@ -61,21 +62,21 @@
 
 ### Path Forward
 
-1. **Immediate priority:** Debug PA10-006f elaborator pathway
-   - Trace why parse_immediate_from_literal is not being called for integer literals
-   - Check AST generation in parser for ExprLiteral nodes
-   - Test with minimal unsafe block to isolate the failure
-
-2. **Secondary:** Implement IN/OUT instruction support
+1. **Immediate priority:** Implement IN/OUT instruction support
    - Add Out/In mnemonics to unsafe_walker MNEMONIC_TABLE
    - Implement encoder for out r/imm, r forms
    - Test with uart_putc call pattern
+
+2. **Secondary:** Debug PA10-006f elaborator pathway
+   - Trace why parse_immediate_from_literal is not being called for integer literals
+   - Check AST generation in parser for ExprLiteral nodes
+   - Test with minimal unsafe block to isolate the failure
 
 3. **Tertiary:** Complete two-operand ljmp syntax
    - Verify parser generates proper AST for `ljmp selector, offset` form
    - Ensure elaborator dispatches to PA10-006h handler
 
-**Summary:** B2 infrastructure is in place (constants, module structure, long_mode_entry scaffold); actual implementation blocked on three paideia-as elaborator gaps (immediates, symbol addressing, I/O instructions). Encoder enhancements (OR instruction) landed but insufficient to unblock full transition sequence. Target: unblock 15 instructions (6 CR setup, ljmp, 7 COM1 writes, qemu_exit) with elaborator fixes.
+**Summary:** B2 infrastructure is in place (constants, module structure, long_mode_entry scaffold). PA10-006j (RIP-relative symbol addressing) now FIXED. Remaining blockers: PA10-006f (integer immediates) and I/O instruction support. Target: unblock 15 instructions (6 CR setup, ljmp, 7 COM1 writes, qemu_exit) with elaborator fixes.
 
 ---
 
