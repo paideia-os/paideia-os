@@ -9,9 +9,13 @@
 #
 # Exit codes:
 #   0  — kernel built + booted + (optional) expected marker found
-#   1  — kernel built but smoke failed (no marker / triple fault)
+#   1  — kernel built but smoke failed (no marker / unexpected QEMU exit)
 #   2  — kernel didn't build
+#  33  — kernel graceful clean exit (isa-debug-exit byte 0x10 → QEMU exits (0x10 << 1) | 1 = 33)
+#  35  — kernel failed exit (isa-debug-exit byte 0x11 → QEMU exits (0x11 << 1) | 1 = 35)
 #  77  — QEMU not installed (test skipped)
+# 124  — smoke timeout (5s runner timeout)
+# 137  — kernel killed (OOM / other fatal signal)
 
 set -uo pipefail
 
@@ -34,6 +38,7 @@ rm -f "${LOG}"
 
 timeout 5 qemu-system-x86_64 \
     -kernel "${KERNEL}" \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -serial "file:${LOG}" \
     -display none \
     -no-reboot \

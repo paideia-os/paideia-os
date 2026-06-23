@@ -18,6 +18,7 @@ fi
 # Real bootloader integration (GRUB multiboot2 or Limine) is a Phase-12 work item.
 exec qemu-system-x86_64 \
     -kernel "${KERNEL}" \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -serial stdio \
     -display none \
     -no-reboot \
