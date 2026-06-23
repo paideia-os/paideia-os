@@ -28,6 +28,12 @@ KERNEL_VMA_HIGHER_HALF = 0xFFFFFFFF80000000;
 /* Phase-1 load address (1 MiB physical, identity-mapped virtual). */
 KERNEL_VMA_PHASE1 = 0x100000;
 
+PHDRS
+{
+    text PT_LOAD FLAGS(5);
+    note PT_NOTE FLAGS(4);
+}
+
 SECTIONS
 {
     . = KERNEL_VMA_PHASE1;
@@ -38,20 +44,25 @@ SECTIONS
     .text : ALIGN(4K) {
         *(.text._start)
         *(.text*)
-    }
+    } :text
 
     .rodata : ALIGN(4K) {
         *(.rodata*)
-    }
+    } :text
 
     .data : ALIGN(4K) {
         *(.data*)
-    }
+    } :text
 
     .bss : ALIGN(4K) {
         *(COMMON)
         *(.bss*)
-    }
+    } :text
+
+    /* PVH ELF Note section for QEMU -kernel handoff. Emitted by paideia-as PA10-001. */
+    .note.Xen : ALIGN(4) {
+        KEEP(*(.note.Xen))
+    } :note
 
     /* End-of-Phase-1-image marker; downstream tools can read this to know
      * how far the kernel image spans in physical memory. */
@@ -63,5 +74,5 @@ SECTIONS
     _kernel_higher_half_base = KERNEL_VMA_HIGHER_HALF;
     _kernel_higher_half_text = KERNEL_VMA_HIGHER_HALF + 0x1000;
 
-    /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
+    /DISCARD/ : { *(.comment) *(.eh_frame*) }
 }

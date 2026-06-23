@@ -14,12 +14,10 @@ if [[ ! -f "${KERNEL}" ]]; then
     exit 1
 fi
 
-# The Phase-1 kernel.elf has no multiboot2 / PVH ELF Note (BP-D3 deferral),
-# so QEMU's `-kernel` flag rejects it. Load the raw bytes at the entry address
-# via `-device loader` and let the CPU jump into them. Real bootloader
-# integration (GRUB multiboot2 or Limine) is a Phase-12 work item.
+# PVH ELF Note emitted by paideia-as PA10-001; QEMU -kernel works directly.
+# Real bootloader integration (GRUB multiboot2 or Limine) is a Phase-12 work item.
 exec qemu-system-x86_64 \
-    -device loader,file="${KERNEL}",addr=0x100000,cpu-num=0 \
+    -kernel "${KERNEL}" \
     -serial stdio \
     -display none \
     -no-reboot \
