@@ -12,6 +12,73 @@
 
 ---
 
+## B2 (32→64 Long-Mode Transition) — BLOCKED
+
+### Issues Implemented
+
+- **B2-001** (GDT layout + lgdt): ✓ Complete (real GDT descriptors + 10-byte lgdt operand, design/audit/entries/_start-b2-status.md)
+- **B2-002** (CR4.PAE/CR3/EFER.LME/CR0.PG|PE): ⚠ Partial (constants defined in Gdt module, entry.pdx scaffolded with 6-step sequence comments; actual instructions BLOCKED)
+- **B2-003** (ljmp 0x08:long_mode_entry): ⚠ Partial (long_mode_entry function defined in LongMode module; ljmp call syntax NOT RECOGNIZED by parser)
+- **B2-004** (First 'B' on COM1): ⚠ Partial (long_mode_entry scaffolded with hlt placeholder; actual COM1 write BLOCKED on multiple elaborator features)
+
+### Blockers (Elaborator Limitations)
+
+**PA10-006f (integer literal immediates):**
+- Committed in paideia-as (commit 015ad6a) but elaborator has incomplete implementation
+- `mov al, 0x42` fails U1606 in unsafe blocks (operand parsing doesn't reach parse_immediate_from_literal)
+- `mov eax, 0x20` similarly fails across all instruction contexts
+- Workaround attempted: use pre-computed register-to-register values (e.g., `or eax, ebx` instead of `or eax, 0x20`)
+
+**PA10-006c (RIP-relative symbol addressing):**
+- Committed in paideia-as (commit 590c5b8) but parser doesn't generate proper OperandMemoryRef AST nodes
+- `lgdt [rip + gdt_ptr]` fails U1606 (memory operand not recognized)
+- `lea rax, [rip + pml4]` fails similarly
+- Workaround attempted: use register-indirect form with address pre-loaded (e.g., `mov edi, gdt_ptr; lgdt [rdi]`), but symbol relocation also fails
+
+**PA10-006h (two-operand ljmp syntax):**
+- Committed in paideia-as (commit a86d44f) with two-operand dispatch
+- Parser doesn't recognize `ljmp selector, offset_symbol` form with numeric selector
+- Unit test exists (test_ljmp_imm_symbol) but elaborator context differs from test harness
+
+**IN/OUT I/O instructions:**
+- `out dx, al` / `out imm8, al` mnemonics NOT in resolver table (U1605 "mnemonic not in resolver table")
+- No elaborator or encoder support for I/O port operations in current paideia-as
+- Blocks all COM1 UART output (B2-004, B3-001+)
+
+### Encoder Improvements Implemented
+
+- **OR instruction encoder:** Implemented full support for or r32/r64 with register and immediate operands (commit 07b6f56 in paideia-as)
+  - Encoders for or r32,r32 / or r64,r64 / or r32,imm32 / or r64,imm32
+  - 6 comprehensive round-trip tests via iced-x86 validation
+  - Unblocks register-to-register workarounds for CR bit manipulation
+
+### Test Results
+
+- **Build status:** ✓ Kernel builds successfully (./tools/build.sh exits 0, produces kernel.elf)
+- **Runtime:** ✗ No observable output (kernel halts immediately; CLI `out` instruction not available)
+- **Expected:** `B\n` on COM1 within 5 seconds (timeout 5 ./tools/run-qemu.sh)
+- **Actual:** (timeout/hang; no serial output)
+
+### Path Forward
+
+1. **Immediate priority:** Debug PA10-006f elaborator pathway
+   - Trace why parse_immediate_from_literal is not being called for integer literals
+   - Check AST generation in parser for ExprLiteral nodes
+   - Test with minimal unsafe block to isolate the failure
+
+2. **Secondary:** Implement IN/OUT instruction support
+   - Add Out/In mnemonics to unsafe_walker MNEMONIC_TABLE
+   - Implement encoder for out r/imm, r forms
+   - Test with uart_putc call pattern
+
+3. **Tertiary:** Complete two-operand ljmp syntax
+   - Verify parser generates proper AST for `ljmp selector, offset` form
+   - Ensure elaborator dispatches to PA10-006h handler
+
+**Summary:** B2 infrastructure is in place (constants, module structure, long_mode_entry scaffold); actual implementation blocked on three paideia-as elaborator gaps (immediates, symbol addressing, I/O instructions). Encoder enhancements (OR instruction) landed but insufficient to unblock full transition sequence. Target: unblock 15 instructions (6 CR setup, ljmp, 7 COM1 writes, qemu_exit) with elaborator fixes.
+
+---
+
 ## R2.5 (Cap System Reactivation) — IN PROGRESS
 
 ### Issues Implemented
