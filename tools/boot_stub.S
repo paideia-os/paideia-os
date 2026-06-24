@@ -1,7 +1,7 @@
 # tools/boot_stub.S — 32-bit PVH bridge to 64-bit paideia-as kernel.
 # Per Intel SDM Vol 3A §9.8.5 + Xen PVH ABI.
 
-.section .note.Xen, "a", @note
+.section .note.PVH-boot, "a", @note
     .long 4                      # n_namesz
     .long 8                      # n_descsz (8 bytes for ELF64 image)
     .long 18                     # n_type = XEN_ELFNOTE_PHYS32_ENTRY

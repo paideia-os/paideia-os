@@ -40,11 +40,13 @@ SECTIONS
 
     /* Boot-time start label, in the low region for the QEMU -kernel handoff. */
     _kernel_phase1_start = .;
+    ASSERT(_kernel_phase1_start == KERNEL_VMA_PHASE1,
+           "ERROR: _kernel_phase1_start must be at 0x100000, not a collision with paideia-as _start")
 
     .text : ALIGN(4K) {
-        KEEP(*(.text.boot))      /* boot_stub.S _pvh_entry — MUST be first */
-        *(.text._start)          /* paideia-as kernel entry */
-        *(.text*)
+        KEEP(*(.text.boot))     /* boot_stub.S _pvh_entry — MUST be first */
+        KEEP(*(.text._start))   /* paideia-as kernel entry */
+        *(.text .text.*)        /* rest of code */
     } :text
 
     .rodata : ALIGN(4K) {
@@ -61,10 +63,11 @@ SECTIONS
         . = ALIGN(4096);
     } :text
 
-    /* PVH ELF Note section for QEMU -kernel handoff. Emitted by paideia-as PA10-001. */
-    .note.Xen : ALIGN(4) {
-        KEEP(*(.note.Xen))
-    } :note
+    /* PVH ELF Note section for QEMU -kernel handoff. boot_stub.S emits as .note.PVH-boot.
+     * Placed in both PT_LOAD (so QEMU PVH loader can find it) and PT_NOTE (for ELF readers). */
+    .note.PVH-boot : ALIGN(4) {
+        KEEP(*(.note.PVH-boot))
+    } :text :note
 
     /* End-of-Phase-1-image marker; downstream tools can read this to know
      * how far the kernel image spans in physical memory. */
@@ -76,5 +79,9 @@ SECTIONS
     _kernel_higher_half_base = KERNEL_VMA_HIGHER_HALF;
     _kernel_higher_half_text = KERNEL_VMA_HIGHER_HALF + 0x1000;
 
-    /DISCARD/ : { *(.comment) *(.eh_frame*) }
+    /DISCARD/ : {
+        *(.comment)
+        *(.eh_frame*)
+        *(.note.Xen)  /* Drop paideia-as PVH notes to avoid duplication */
+    }
 }
