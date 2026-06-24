@@ -187,6 +187,41 @@ R6.5 IRQ + timer reactivated. PaideiaOS preemptive multitasking works end-to-end
 
 ---
 
+## B7 (Round Closure & Documentation) — COMPLETE
+
+### Issues Implemented
+
+- **B7-001** (Combined smoke matrix integration test): ✓ Complete (updated `tests/r8/expected-boot-banner.txt` with all 4 expected outputs: B, PaideiaOS R8, CAP OK, IPC OK)
+- **B7-002** (Phase 7 milestone document): ✓ Complete (`design/milestones/r8-closure.md` summarizing B1–B6 architecture and audit entries)
+- **B7-003** (Round closure + R9 kickoff): ✓ Complete (STATUS.md marked CLOSED, `design/milestones/r9-kickoff.md` stub created)
+
+**Summary:** B7 closure complete. R8 bootstrap round fully documented. Fingerprint harness gates on combined smoke test output. R9 (interrupt & timer reactivation) ready to kickoff pending paideia-as v0.7.0+ encoders.
+
+---
+
+## R8 Round Status: **CLOSED**
+
+All B1–B7 phases complete. Kernel boots to stable SPSC IPC channel state with all audit entries in place.
+
+**Final Boot Output:**
+```
+B
+PaideiaOS R8
+CAP OK
+IPC OK
+```
+
+**Key Subsystems Verified:**
+- Long-mode bootstrap via PVH (B1–B2)
+- UART driver and banner output (B3)
+- Smoke harness with fingerprint + null-byte modes (B4)
+- Capability mint/verify/invoke (B5)
+- Single-producer, single-consumer IPC channel (B6)
+
+**Next Round:** R9 (interrupt & timer reactivation) — See `design/milestones/r9-kickoff.md`
+
+---
+
 ## D7 (Phase 7 Driver Framework Groundwork) — COMPLETE (source-structural)
 
 ### Issues Implemented
