@@ -109,6 +109,47 @@ ipc_ok_msg:
 idt_ok_msg:
     .ascii "IDT OK\n\0"
 
+# R9-m1-004: Exception handler trace messages
+.global _exc0_msg
+.align 8
+_exc0_msg:
+    .ascii "EXC0 div\n\0"
+
+.global _exc3_msg
+.align 8
+_exc3_msg:
+    .ascii "EXC3 bp\n\0"
+
+.global _exc6_msg
+.align 8
+_exc6_msg:
+    .ascii "EXC6 ud\n\0"
+
+.global _exc8_msg
+.align 8
+_exc8_msg:
+    .ascii "EXC8 df\n\0"
+
+.global _exc13_msg
+.align 8
+_exc13_msg:
+    .ascii "EXC13 gp\n\0"
+
+.global _exc14_msg
+.align 8
+_exc14_msg:
+    .ascii "EXC14 pf\n\0"
+
+.global _exc32_msg
+.align 8
+_exc32_msg:
+    .ascii "EXC32 timer\n\0"
+
+.global _exc33_msg
+.align 8
+_exc33_msg:
+    .ascii "EXC33 kbd\n\0"
+
 .section .bss
 .align 4096
 .global pml4
