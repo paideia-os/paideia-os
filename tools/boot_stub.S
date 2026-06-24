@@ -85,6 +85,12 @@ gdt32_ptr:
     .word 5*8 - 1                    # limit
     .long gdt32                      # base (32-bit, flat zero-base GDT)
 
+# B3-004: Banner string for kernel startup message
+.global banner_msg
+.align 8
+banner_msg:
+    .ascii "PaideiaOS R8\n\0"
+
 .section .bss
 .align 4096
 .global pml4
