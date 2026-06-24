@@ -91,6 +91,12 @@ gdt32_ptr:
 banner_msg:
     .ascii "PaideiaOS R8\n\0"
 
+# B5-005: Capability system smoke test message
+.global cap_ok_msg
+.align 8
+cap_ok_msg:
+    .ascii "CAP OK\n\0"
+
 .section .bss
 .align 4096
 .global pml4
