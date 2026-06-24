@@ -109,6 +109,12 @@ ipc_ok_msg:
 idt_ok_msg:
     .ascii "IDT OK\n\0"
 
+# R9-m4-001: Tick worker message (emitted every K=16 IRQs)
+.global _tick_msg
+.align 8
+_tick_msg:
+    .ascii "TICK\n\0"
+
 .section .bss
 .align 4096
 .global pml4
