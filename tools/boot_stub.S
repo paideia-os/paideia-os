@@ -103,6 +103,12 @@ cap_ok_msg:
 ipc_ok_msg:
     .ascii "IPC OK\n\0"
 
+# R9-m1-002: IDT installation message
+.global idt_ok_msg
+.align 8
+idt_ok_msg:
+    .ascii "IDT OK\n\0"
+
 .section .bss
 .align 4096
 .global pml4
