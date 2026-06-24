@@ -34,4 +34,15 @@ if [[ "${LOWEST}" != "${MIN_VERSION}" ]]; then
     exit 1
 fi
 
+# Freshness gate: binary mtime must be >= submodule HEAD commit time.
+# Prevents silent staleness when submodule advances but target/ wasn't rebuilt.
+# (Surfaced by PA8-m1-002c #903: stale binary masqueraded as encoder bug.)
+SUBMODULE_HEAD_TIME=$(git -C "${REPO_ROOT}/tools/paideia-as" log -1 --format=%ct HEAD 2>/dev/null || echo "0")
+BINARY_TIME=$(stat -c %Y "${SUBMODULE_BIN}" 2>/dev/null || echo "0")
+if [[ "${BINARY_TIME}" -lt "${SUBMODULE_HEAD_TIME}" ]]; then
+    echo "paideia-as binary is older than submodule HEAD; rebuild required" >&2
+    echo "  run: (cd ${REPO_ROOT}/tools/paideia-as && cargo build --release -p paideia-as)" >&2
+    exit 1
+fi
+
 echo "${SUBMODULE_BIN}"
