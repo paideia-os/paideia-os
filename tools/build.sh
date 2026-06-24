@@ -19,6 +19,10 @@ fi
 
 mkdir -p "${BUILD_DIR}"
 
+echo "[boot-stub] tools/boot_stub.S -> boot_stub.o (32+64-bit, as --64)"
+BOOT_STUB_OBJ="${BUILD_DIR}/boot_stub.o"
+as --64 -o "${BOOT_STUB_OBJ}" "${REPO_ROOT}/tools/boot_stub.S"
+
 OBJECTS=()
 while IFS= read -r -d '' pdx; do
     rel="${pdx#"${KERNEL_SRC}"/}"
@@ -28,6 +32,8 @@ while IFS= read -r -d '' pdx; do
     "${PAIDEIA_AS}" build --emit elf64 "${pdx}" -o "${obj}"
     OBJECTS+=("${obj}")
 done < <(find "${KERNEL_SRC}" -name '*.pdx' -print0 | sort -z)
+
+OBJECTS=( "${BOOT_STUB_OBJ}" "${OBJECTS[@]}" )
 
 if [[ ${#OBJECTS[@]} -eq 0 ]]; then
     echo "no .pdx files found under ${KERNEL_SRC}" >&2

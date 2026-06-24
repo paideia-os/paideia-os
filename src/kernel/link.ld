@@ -20,7 +20,7 @@
 
 OUTPUT_FORMAT(elf64-x86-64)
 OUTPUT_ARCH(i386:x86-64)
-ENTRY(_start)
+ENTRY(_pvh_entry)
 
 /* Higher-half kernel base (placeholder; not yet active). */
 KERNEL_VMA_HIGHER_HALF = 0xFFFFFFFF80000000;
@@ -42,7 +42,8 @@ SECTIONS
     _kernel_phase1_start = .;
 
     .text : ALIGN(4K) {
-        *(.text._start)
+        KEEP(*(.text.boot))      /* boot_stub.S _pvh_entry — MUST be first */
+        *(.text._start)          /* paideia-as kernel entry */
         *(.text*)
     } :text
 
@@ -57,6 +58,7 @@ SECTIONS
     .bss : ALIGN(4K) {
         *(COMMON)
         *(.bss*)
+        . = ALIGN(4096);
     } :text
 
     /* PVH ELF Note section for QEMU -kernel handoff. Emitted by paideia-as PA10-001. */
