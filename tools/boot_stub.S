@@ -97,6 +97,12 @@ banner_msg:
 cap_ok_msg:
     .ascii "CAP OK\n\0"
 
+# B6-004: IPC smoke test message
+.global ipc_ok_msg
+.align 8
+ipc_ok_msg:
+    .ascii "IPC OK\n\0"
+
 .section .bss
 .align 4096
 .global pml4

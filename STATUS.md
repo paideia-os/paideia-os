@@ -171,6 +171,22 @@ R6.5 IRQ + timer reactivated. PaideiaOS preemptive multitasking works end-to-end
 
 ---
 
+## B6 (IPC MVP Milestone) — COMPLETE
+
+### Issues Implemented
+
+- **B6-001** (Channel pool placement + cursor mutability): ✓ Complete (unified `channel_data[66]` array in .bss, indices 0-63 ring + 64-65 cursors)
+- **B6-002** (Real ipc_enqueue with copy): ✓ Complete (unsafe assembly: full-check, ring write, head advance)
+- **B6-003** (Real ipc_dequeue with copy): ✓ Complete (unsafe assembly: empty-check, ring read, tail advance)
+- **B6-004** (Producer-consumer smoke fixture): ✓ Complete (ipc_smoke: enqueue 0xDEAD/0xBEEF, dequeue & verify, prints "IPC OK\n")
+- **B6-005** (Deadlock-freedom invariant + closure): ✓ Complete (audit entries + design closure)
+
+**Audit entries:** ipc-channel-pool-001.md, ipc-enqueue-001.md, ipc-dequeue-001.md, ipc-smoke-001.md, ipc-deadlock-freedom-001.md
+
+**Summary:** B6 IPC MVP complete. Single SPSC channel with 64-slot ring works end-to-end. Smoke test verifies FIFO ordering (enqueue/dequeue cycle). Boot now outputs: "B\nPaideiaOS R8\nCAP OK\nIPC OK\n". Defers multi-channel pooling, message headers, and cross-host bridges to Phase-2+.
+
+---
+
 ## D7 (Phase 7 Driver Framework Groundwork) — COMPLETE (source-structural)
 
 ### Issues Implemented
