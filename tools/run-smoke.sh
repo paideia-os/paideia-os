@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Phase-1 smoke regression: builds the kernel, runs under QEMU with a
-# 5-second timeout, captures serial output, and asserts deterministic
+# configurable timeout, captures serial output, and asserts deterministic
 # bytes.
 #
-# Usage: tools/run-smoke.sh [expected_marker | --fingerprint PATTERN]
+# Usage: tools/run-smoke.sh [MODE | expected_marker | --fingerprint PATTERN]
+#   - MODE: one of 'boot_min', 'boot_banner', 'prod' (mode dispatcher)
+#     * boot_min: validates boot_min fingerprint, 5s timeout
+#     * boot_banner: validates boot_banner fingerprint, 5s timeout
+#     * prod: expects exit code 2 (kernel didn't build), skips verification
 #   - expected_marker: defaults to no-check (just confirms QEMU exits or
 #     times out cleanly). Pass a string to grep the serial log for.
 #   - --fingerprint PATTERN: validate serial output against tests/r8/expected-PATTERN.txt
@@ -26,8 +30,30 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 EXPECTED="${1:-}"
 FINGERPRINT_MODE=0
 FINGERPRINT_FILE=""
+TIMEOUT=5
 
-# Parse arguments: check for --fingerprint flag
+# Mode dispatcher: map boot_min/boot_banner/prod to fingerprint + timeout
+case "${EXPECTED}" in
+    boot_min)
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r8/expected-boot-min.txt"
+        TIMEOUT=5
+        EXPECTED=""
+        ;;
+    boot_banner)
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r8/expected-boot-banner.txt"
+        TIMEOUT=5
+        EXPECTED=""
+        ;;
+    prod)
+        # prod mode: expects exit code 2 (kernel didn't build)
+        # Skip verification, just exit with code 2
+        exit 2
+        ;;
+esac
+
+# Parse arguments: check for --fingerprint flag (backward-compatible)
 if [[ "${EXPECTED}" == "--fingerprint" && -n "${2:-}" ]]; then
     FINGERPRINT_MODE=1
     FINGERPRINT_FILE="${REPO_ROOT}/tests/r8/expected-${2}.txt"
@@ -48,7 +74,7 @@ KERNEL="${REPO_ROOT}/build/kernel.elf"
 LOG="/tmp/paideia-os-smoke.log"
 rm -f "${LOG}"
 
-timeout 5 qemu-system-x86_64 \
+timeout ${TIMEOUT} qemu-system-x86_64 \
     -kernel "${KERNEL}" \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -serial "file:${LOG}" \
