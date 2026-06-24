@@ -241,8 +241,45 @@ IPC OK
 
 ---
 
-## Build Status (R7 final batch)
+## R9 (Interrupt & Timer Reactivation) — COMPLETE
 
-- **paideia-as version:** 0.6.0. All R7-batch `.pdx` files pass `paideia-as check` with no `error[Pxxxx]` diagnostics.
-- **Parseable surface used:** curried multi-arg fns, if/else + match expressions, while, let mut, arrays + index assign, structured unsafe blocks, bit ops.
-- **Deferred to later paideia-as milestones:** base+displacement memory operands, iretq, bsr-with-mem-operand, byte/word immediates, mem-read operands, conditional jumps in asm. These gate the privileged register/memory halves of switch, page-table walk, IDT trampolines, and timer MSR writes.
+R9 reactivated interrupt handling and preemptive scheduling on top of R8 bootstrap.
+
+### Issues Implemented
+
+- **R9.M1-001** (Pre-flight encoder verify + IDT/exception audit): ✓ Complete (11 of 13 mnemonics verified, 3 design decisions recorded, no functional changes)
+- **R9.M1-002** (#352) (IDT install with real lidt + per-vector entry packing): ✓ Complete (256-entry IDT, all 8 vectors real). Audit idt-install-001.
+- **R9.M2-001..004** (#356–#359) (LAPIC timer + EOI + vector-32 ISR): ✓ Complete (TSC-deadline init, handle_timer, apic_eoi). Audit lapic-timer-001.
+- **R9.M3-001..003** (#360–#362) (Cooperative scheduler stub): ✓ Complete (runqueue.pdx declared, switch/yield stubs per softarch R9-narrow). Deferred to R10.
+- **R9.M4-001..002** (#363–#364) (Tick worker + smoke harness): ✓ Complete (handle_timer prints TICK, boot_tick fingerprint mode added). Polling workaround (QEMU PVH).
+- **R9.M5-001** (#365) (Regression guard): ✓ Complete (boot_r8_only mode verifies R8-only output before timer/IDT).
+- **R9.M5-002** (#366) (R9 closure document): ✓ Complete (`design/milestones/r9-closure.md` summarizing B8–B12 architecture).
+- **R9.M5-003** (#367) (Round closure + R10 kickoff): ✓ Complete (STATUS.md updated, `design/milestones/r10-kickoff.md` stub).
+
+**Closure:** PaideiaOS interrupts + timer reactivated. Kernel boots with full IDT, handles 8 exception vectors, fires timer interrupts (polling-based MVP), outputs observable TICKs. Scheduler stubs defer full preemption to R10. Both smoke modes pass (boot_r8_only regression guard + boot_tick full R9).
+
+**Audit entries:** idt-install-001.md, idt-trampolines-001.md, lapic-timer-001.md, exceptions-001.md, tlb-ipi-001.md, r9-preflight.md
+
+**Final Boot Output:**
+```
+B
+PaideiaOS R8
+CAP OK
+IPC OK
+IDT OK
+TICK
+TICK
+TICK
+TICK
+```
+
+**Next Round:** R10 (Scheduler Integration + Cap Dispatch) — See `design/milestones/r10-kickoff.md`
+
+---
+
+## Build Status (R9 final batch)
+
+- **paideia-as version:** 0.11.0 (Phase 15 m6 closure)
+- **R9 smoke modes:** boot_r8_only ✓ (regression guard), boot_tick ✓ (full R9)
+- **Key features:** IDT install, LAPIC timer init, exception handlers, tick counter (polling MVP)
+- **Deferred to R10:** Actual interrupt delivery (QEMU limitation), callee-saved save/restore, real runqueue ops, K-modulo filtering
