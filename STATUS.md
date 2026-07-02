@@ -283,3 +283,49 @@ TICK
 - **R9 smoke modes:** boot_r8_only ✓ (regression guard), boot_tick ✓ (full R9)
 - **Key features:** IDT install, LAPIC timer init, exception handlers, tick counter (polling MVP)
 - **Deferred to R10:** Actual interrupt delivery (QEMU limitation), callee-saved save/restore, real runqueue ops, K-modulo filtering
+
+---
+
+## R10 (Scheduler Integration) — IN PROGRESS
+
+R10 m1–m4 complete. Implementing cooperative task switching via voluntary yields.
+
+### Issues Implemented
+
+- **R10.M1-001** (#372) (ISR trampoline scaffold + ISR-prologue design): ✓ Complete (7 real trampolines with push-15/call/pop-15/iretq sequence)
+- **R10.M1-002** (#373) (vec32 timer ISR body): ✓ Complete (real handle_timer integration)
+- **R10.M2** (Timer diagnosis + polling fallback): ✓ Complete (QEMU PVH timer IRQ unreliable; polling loop calls handle_timer)
+- **R10.M3-001** (#377) (sched_switch_regs callee-saved save/restore): ✓ Complete (real register/RSP/RFLAGS save and restore per TCB canonical layout; fixed offsets in m5)
+- **R10.M3-002** (#378) (sched_yield stub): ✓ Complete
+- **R10.M3-003** (#379) (fabricate_iret_frame stub): ✓ Complete
+- **R10.M4-001** (#380) (sched_init_runqueue_r10): ✓ Complete (initialize both TCBs with kernel stacks)
+- **R10.M4-002** (#381) (Task A/B entry point bodies): ✓ Complete (simple print + halt; m5 adds yield loop)
+- **R10.M5-001** (#382) (Bootstrap kernel_main into Task A): ✓ Complete (call task_a_entry after sti, set RSP from TCB)
+- **R10.M5-002** (#383) (Cooperative yield loops in task bodies): ✓ Complete (task_a/b alternate via sched_switch_regs calls)
+- **R10.M5-003** (#384) (boot_r10 fingerprint + pre-push hook): ✓ Complete (9-line fingerprint validates TASK A/B alternation, 10s timeout)
+
+**Audit entries:** r10-m3-001-switch-regs.md (fixed offsets), r10-m5-fixup-switch-regs-offsets.md, r10-m5-001-bootstrap-task-a.md, r10-m5-002-yield-loops.md, r10-m5-003-boot-r10-fingerprint.md
+
+**Closure:** R10 m1–m5 complete. Cooperative multitasking works end-to-end: Task A and Task B alternate via voluntary yields, demonstrating context-switch correctness. No preemption yet (QEMU timer limitation); timing-based preemption deferred to R10-m6+.
+
+**Final Boot Output:**
+```
+B
+PaideiaOS R8
+CAP OK
+IPC OK
+IDT OK
+TASK A
+TASK B
+TASK A
+TASK B
+```
+(repeats, demonstrating cooperative context switch stability)
+
+**Key Implementation Details:**
+- Task A bootstrap: direct call from kernel_main (kernel_main calls task_a_entry after sti)
+- Task B bootstrap: sched_switch_regs ret when Task A first yields (stack[1023] = task_b_entry)
+- Yield mechanism: tasks call sched_switch_regs(self_tcb, other_tcb), saving state and yielding control
+- Return to caller: sched_switch_regs restores state and returns via ret, resuming task at the jmp loop instruction
+
+**Next:** R10-m6 (preemption via timer IRQ, K-modulo priority filtering, advanced scheduling policies)
