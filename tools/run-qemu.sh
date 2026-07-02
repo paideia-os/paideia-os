@@ -19,7 +19,10 @@ fi
 # R10-m2-002: QEMU TCG does not support TSC-DEADLINE. Using periodic timer mode instead.
 # Per design/audit/entries/r10-timer-delivery-diagnosis-001.md, P3 identified but
 # QEMU TCG limitation requires fallback to LAPIC periodic mode.
+# R11-m1-002: Add -cpu max to expose CPUID.01H:ECX[24] (TSC-DEADLINE support flag).
+# This enables LAPIC SVR and allows for future TSC-DEADLINE mode support.
 exec qemu-system-x86_64 \
+    -cpu max \
     -kernel "${KERNEL}" \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -serial stdio \
