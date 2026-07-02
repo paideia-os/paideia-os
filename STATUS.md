@@ -286,9 +286,9 @@ TICK
 
 ---
 
-## R10 (Scheduler Integration) — IN PROGRESS
+## R10 (Scheduler Integration & Cooperative Multitasking) — COMPLETE
 
-R10 m1–m4 complete. Implementing cooperative task switching via voluntary yields.
+R10 implemented full cooperative multitasking with Task A/B alternation via voluntary yields.
 
 ### Issues Implemented
 
@@ -299,14 +299,21 @@ R10 m1–m4 complete. Implementing cooperative task switching via voluntary yiel
 - **R10.M3-002** (#378) (sched_yield stub): ✓ Complete
 - **R10.M3-003** (#379) (fabricate_iret_frame stub): ✓ Complete
 - **R10.M4-001** (#380) (sched_init_runqueue_r10): ✓ Complete (initialize both TCBs with kernel stacks)
-- **R10.M4-002** (#381) (Task A/B entry point bodies): ✓ Complete (simple print + halt; m5 adds yield loop)
+- **R10.M4-002** (#381) (Task A/B entry point bodies): ✓ Complete (print messages + cooperative yield loops)
 - **R10.M5-001** (#382) (Bootstrap kernel_main into Task A): ✓ Complete (call task_a_entry after sti, set RSP from TCB)
 - **R10.M5-002** (#383) (Cooperative yield loops in task bodies): ✓ Complete (task_a/b alternate via sched_switch_regs calls)
 - **R10.M5-003** (#384) (boot_r10 fingerprint + pre-push hook): ✓ Complete (9-line fingerprint validates TASK A/B alternation, 10s timeout)
+- **R10.M6-001** (#385) (R9 regression matrix): ✓ Complete (boot_r8_only + boot_r10 pass; boot_tick fails as expected)
+- **R10.M6-002** (#386) (R10 closure document + R11 kickoff): ✓ Complete (r10-closure.md + r11-kickoff.md + STATUS update)
 
-**Audit entries:** r10-m3-001-switch-regs.md (fixed offsets), r10-m5-fixup-switch-regs-offsets.md, r10-m5-001-bootstrap-task-a.md, r10-m5-002-yield-loops.md, r10-m5-003-boot-r10-fingerprint.md
+**Audit entries:** r10-m1-001-trampolines.md, r10-m3-001-switch-regs.md, r10-m5-001-bootstrap-task-a.md, r10-m5-002-yield-loops.md, r10-m5-003-boot-r10-fingerprint.md, r10-m5-fixup-switch-regs-offsets.md
 
-**Closure:** R10 m1–m5 complete. Cooperative multitasking works end-to-end: Task A and Task B alternate via voluntary yields, demonstrating context-switch correctness. No preemption yet (QEMU timer limitation); timing-based preemption deferred to R10-m6+.
+**Regression Matrix:**
+- boot_r8_only: ✓ 3/3 passes (R8 stability confirmed)
+- boot_tick: ✗ 0/3 passes (expected regression; task output replaces TICK diagnostics)
+- boot_r10: ✓ 3/3 passes (R10 cooperative alternation confirmed)
+
+**Closure:** R10 m1–m6 complete. Cooperative multitasking works end-to-end: Task A and Task B alternate via voluntary yields, demonstrating context-switch correctness. Regression matrix confirms R8 stability and R10 new functionality. boot_tick mode intentionally fails due to task scheduler output replacing timer diagnostics (deferred to R11 with real timer IRQ).
 
 **Final Boot Output:**
 ```
@@ -320,12 +327,13 @@ TASK B
 TASK A
 TASK B
 ```
-(repeats, demonstrating cooperative context switch stability)
+(repeats indefinitely, demonstrating stable cooperative context switching)
 
 **Key Implementation Details:**
 - Task A bootstrap: direct call from kernel_main (kernel_main calls task_a_entry after sti)
 - Task B bootstrap: sched_switch_regs ret when Task A first yields (stack[1023] = task_b_entry)
 - Yield mechanism: tasks call sched_switch_regs(self_tcb, other_tcb), saving state and yielding control
 - Return to caller: sched_switch_regs restores state and returns via ret, resuming task at the jmp loop instruction
+- Pre-push hook: Gates on boot_r8_only + boot_r10 (regression guard + primary feature)
 
-**Next:** R10-m6 (preemption via timer IRQ, K-modulo priority filtering, advanced scheduling policies)
+**Next Round:** R11 (Real Timer IRQ Delivery + Preemptive Scheduling) — See `design/milestones/r11-kickoff.md`
