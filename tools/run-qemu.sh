@@ -16,6 +16,9 @@ fi
 
 # PVH ELF Note emitted by paideia-as PA10-001; QEMU -kernel works directly.
 # Real bootloader integration (GRUB multiboot2 or Limine) is a Phase-12 work item.
+# R10-m2-002: QEMU TCG does not support TSC-DEADLINE. Using periodic timer mode instead.
+# Per design/audit/entries/r10-timer-delivery-diagnosis-001.md, P3 identified but
+# QEMU TCG limitation requires fallback to LAPIC periodic mode.
 exec qemu-system-x86_64 \
     -kernel "${KERNEL}" \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
