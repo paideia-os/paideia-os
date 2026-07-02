@@ -115,6 +115,18 @@ idt_ok_msg:
 _tick_msg:
     .ascii "TICK\n\0"
 
+# R10-m4-002: Task A entry message
+.global _task_a_msg
+.align 8
+_task_a_msg:
+    .ascii "TASK A\n\0"
+
+# R10-m4-002: Task B entry message
+.global _task_b_msg
+.align 8
+_task_b_msg:
+    .ascii "TASK B\n\0"
+
 .section .bss
 .align 4096
 .global pml4
