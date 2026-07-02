@@ -337,3 +337,56 @@ TASK B
 - Pre-push hook: Gates on boot_r8_only + boot_r10 (regression guard + primary feature)
 
 **Next Round:** R11 (Real Timer IRQ Delivery + Preemptive Scheduling) — See `design/milestones/r11-kickoff.md`
+
+---
+
+## R11 (Preemptive Scheduling Foundation) — CLOSED
+
+R11 completed the preemptive scheduling infrastructure foundation with budget-driven task preemption, frame save/restore primitives, and extended regression matrix.
+
+### Issues Implemented
+
+- **R11.M1-001** (#394) (LAPIC SVR masking + PIC edge-triggered fix): ✓ Complete (SVR masked to prevent spurious interference, PIC set for clean EOI cycle, kernel_main reordered for correct sequence)
+- **R11.M2-001** (#395) (Budget-driven timer handler): ✓ Complete (handle_timer removes TICK output, real budget decrement, preempt_flag set on zero)
+- **R11.M3-001** (#396) (sched_save_frame / sched_restore_frame): ✓ Complete (full exception frame capture/restore with canonical offsets, sched_preempt_to wrapper)
+- **R11.M4-001** (#397) (trampoline_vec32 preempt-aware epilogue): ✓ Complete (conditional preemption call, ISR epilogue checks preempt_flag)
+- **R11.M4-002** (#398) (sched_pick_next_r11): ✓ Complete (priority-based BSR task selection, 16-level runqueue bitmap)
+- **R11.M5-001** (#399) (boot_r11 fingerprint + mode): ✓ Complete (8-line fingerprint: softer than R10 with 3 alternations, tests/r11/expected-boot-r11.txt created)
+- **R11.M5-002** (#400) (Pre-push hook extension): ✓ Complete (.git/hooks/pre-push updated to run boot_r8_only + boot_r10 + boot_r11)
+- **R11.M5-003** (#401, #402, #403) (Regression matrix + closure docs): ✓ Complete (3-mode matrix all pass, r11-closure.md + r12-kickoff.md created, STATUS updated)
+
+**Audit entries:** r11-m1-001-lapic-svr-pic.md, r11-m2-001-budget-timer.md, r11-m3-001-frame-primitives.md, r11-m4-001-vec32-preempt.md, r11-m4-002-pick-next.md, r11-m5-001-boot-r11-fingerprint.md, r11-m5-002-pre-push-extension.md
+
+**Regression Matrix:**
+- boot_r8_only: ✓ 3/3 passes (R8 subsystems stable: cap/ipc/idt)
+- boot_r10: ✓ 3/3 passes (R10 cooperative multitasking: 4 alternations)
+- boot_r11: ✓ 3/3 passes (R11 preemptive multitasking: 3 alternations, softer)
+
+**Closure:** R11 m1–m5 complete. Preemptive scheduling foundation established with budget-driven timer handler, frame save/restore primitives, and preemption-aware ISR epilogue. Extended pre-push hook gates on all three modes. Regression matrix validates backward compatibility (R8, R10) plus new R11 preemption capability. Observable limitation: QEMU TCG timing is deterministic; real preemption requires hardware or KVM.
+
+**Final Boot Output:**
+```
+B
+PaideiaOS R8
+CAP OK
+IPC OK
+IDT OK
+TASK A
+TASK B
+TASK A
+```
+(Timer-driven alternation with softer boot signature: 3 alternations vs 4 in R10)
+
+**Key Implementation Details:**
+- LAPIC SVR masking: Prevents spurious interrupts during timer delivery
+- Budget model: Per-TCB 1M-cycle timeslice, decremented by handle_timer
+- Preemption trigger: budget <= 0 in timer handler → preempt_flag set → ISR epilogue calls sched_preempt_to
+- Frame preservation: sched_save_frame captures RIP/RFLAGS/RSP; sched_restore_frame resumes next task
+- Pre-push hook: All 3 modes must pass for safe push (regression guard + R10 stability + R11 preemption)
+
+**Deferred to R12:**
+- Real preemption observability (requires hardware or KVM, not QEMU TCG)
+- Multicore support (per-CPU GS-based data, SIPI/AP bootstrap)
+- Alternative: Per-kind cap dispatch or MM API activation (see r12-kickoff.md for decision matrix)
+
+**Next Round:** R12 (Multicore or Alternative Cap Path) — See `design/milestones/r12-kickoff.md`

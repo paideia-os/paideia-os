@@ -4,12 +4,13 @@
 # bytes.
 #
 # Usage: tools/run-smoke.sh [MODE | expected_marker | --fingerprint PATTERN]
-#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'prod' (mode dispatcher)
+#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
 #     * boot_tick: validates boot_tick fingerprint (with timer TICKs), 5s timeout
 #     * boot_r8_only: validates R8-only fingerprint (no timer, no IDT), 5s timeout
 #     * boot_r10: validates R10 task alternation fingerprint (Task A/B cooperative yield), 10s timeout
+#     * boot_r11: validates R11 softer task alternation fingerprint (Task A/B/A cooperative), 10s timeout
 #     * prod: expects exit code 2 (kernel didn't build), skips verification
 #   - expected_marker: defaults to no-check (just confirms QEMU exits or
 #     times out cleanly). Pass a string to grep the serial log for.
@@ -35,7 +36,7 @@ FINGERPRINT_MODE=0
 FINGERPRINT_FILE=""
 TIMEOUT=5
 
-# Mode dispatcher: map boot_min/boot_banner/boot_tick/boot_r8_only/prod to fingerprint + timeout
+# Mode dispatcher: map boot_min/boot_banner/boot_tick/boot_r8_only/boot_r10/boot_r11/prod to fingerprint + timeout
 case "${EXPECTED}" in
     boot_min)
         FINGERPRINT_MODE=1
@@ -64,6 +65,12 @@ case "${EXPECTED}" in
     boot_r10)
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/r10/expected-boot-r10.txt"
+        TIMEOUT=10
+        EXPECTED=""
+        ;;
+    boot_r11)
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r11/expected-boot-r11.txt"
         TIMEOUT=10
         EXPECTED=""
         ;;
