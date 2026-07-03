@@ -1,252 +1,328 @@
-# PaideiaOS R13 round — Ring-3 userspace + interactive shell foundation
+# PaideiaOS R13 round — Ring-3 userspace + fully-featured shell OS
 
-**Author:** osarch + softarch
-**Date:** 2026-07-03
+**Revision:** 2 (2026-07-03) — expanded per user directive to incorporate all previously-deferred items rationally.
+**Author:** osarch + softarch (synthesis)
 **Repo:** paideia-os/paideia-os (kernel; tools/paideia-as submodule pinned at ae6039b — v0.11.0-28)
-**Companion repo:** paideia-os/paideia-as (workspace at /home/snunez/Development/paideia-as/)
+**Companion repo:** paideia-os/paideia-as
 **Predecessor:** R12 CLOSED (r12-closed tag, commit 54c464e)
-**Reference plans:** `.plans/r12-round-osarch-plan.md`, `.plans/r11-round-osarch-plan.md`
+**Reference plans:** `.plans/r12-round-osarch-plan.md`
 
-## Round objective
+## Round objective (revised)
 
-Take paideia-os from a single-CPU ring-0-only kernel with observable cap dispatch (R12 close) to an **interactive shell session where a human at a terminal can type `help` or `cap N M` or `exit` and see the kernel respond**. This is the qualitative jump R13 delivers: paideia-os goes from "a kernel that prints things" to "an operating system a person can talk to."
+Take paideia-os from a single-CPU ring-0-only kernel with observable cap dispatch (R12 close) to a **complete OS with**:
 
-The round scope redirects R12's kickoff sketch. R12 recommended Path A (multicore). The user's directive redirects R13 toward closing the gap to a proper shell session — multicore is deferred to R14.
+- Multi-process ring-3 userspace with cooperative + preemptive scheduling
+- Interactive shell that can `exec` external programs from a filesystem
+- Signal delivery (Ctrl-C, SIGKILL, SIGSEGV)
+- Full 16-kind cap dispatch (KIND_PROCESS, KIND_THREAD, KIND_PAGE_TABLE, and 6 more)
+- Higher-half kernel VA + KPTI + PCID (proper OS memory discipline)
+- Multicore (SIPI + per-CPU GS + IPI + TLB shootdown)
+- Filesystem (VFS + tmpfs; block-device abstraction)
+- Real MMIO through aspace_map (retiring D7-004 synthesis stub)
 
-## 0. Scope decision
+The revised R13 is a **mega-round**. Every scope-boundary item from Revision 1 is now inside R13. Only items that require paideia-as features currently unavailable (curried-call plumbing → Phase 20+; large-page 2 MiB mapping in the pt walker → post-R13) are honestly deferred to R14+.
 
-Considered:
+## 0. Scope decision (revised)
 
-- **(A) Multicore bring-up** — R12 kickoff recommended path. Requires PA-R11-001..004 substrate (GS-relative mem, xchg, lock cmpxchg, mfence). **Deferred to R14** because it does not lead toward a shell session.
-- **(B) Shell foundation (SELECTED)** — MM API activation + ring-3 GDT/TSS/IST + syscall entry + KIND_PROCESS/KIND_THREAD real handlers + user binary loader + shell fixture. Delivers observable typed-interaction. Scope: 10 milestones, 27 issues.
-- **(C) MM API alone** — Insufficient. MM without ring-3 leaves no consumer to prove it.
-- **(D) Handler-table A2 + remaining 8 cap kinds** — Extends R12's dispatch scaffold but does not advance toward a shell. **Deferred to R14+** as a quality item.
+Considered scoping options for Revision 2:
 
-Decision: **B, shell foundation.** Justification against project pillars:
+- **Full incorporation of all deferred items (SELECTED).** 16 milestones, ~63 issues, 45-70 cycle estimate. Delivers a genuinely usable operating system after R13.
+- Minimum shell (was Revision 1). 10 milestones, 27 issues. Delivers "typed input echoed back" but nothing beyond.
+- Split R13 into R13.a (userspace foundation) + R13.b (multi-process + fs + signals) + R13.c (multicore). Rejected because the user's directive is to close the gap to "a proper shell session" — that requires all three phases.
 
-1. **Pillar 3 (microkernel).** Ring-3 enforces the syscall-only kernel boundary. Every user operation goes through cap_invoke_dispatch via SYS_CAP_INVOKE.
-2. **Pillar 6 (security by construction).** Ring-3 makes cap-mediated access mandatory rather than convention. Rights lattice (R12) becomes user-facing.
-3. **Pillar 10 (functional discipline).** Shell process is a pure loop: read → parse → dispatch → echo.
-4. **Pillar 11 (research-driven).** Follows seL4's "userspace is where policy lives" discipline (Elphinstone 2013 §3).
-5. **Substrate readiness.** 95% of R13 encoders present in paideia-as ae6039b (per softarch §"paideia-as substrate audit"). Only HARD blocker: `ltr r16` (PA-R13-001).
+Justification against project pillars:
 
-## 1. Scope boundary (what is NOT in R13)
+1. **Pillar 3 (microkernel)**: fully-featured shell exercises the microkernel discipline end-to-end (every user op via cap_invoke, every context switch via kernel-authorized cap invocation).
+2. **Pillar 6 (security)**: full 16-kind rights lattice + KPTI + user-space cap tables makes rights enforcement uniform.
+3. **Pillar 10 (functional discipline)**: shell + VFS + fork/exec all live in userspace as pure loops; kernel is glue.
+4. **Pillar 11 (research-driven)**: seL4 + L4Ka disciplines finally have full runtime substrate to inhabit.
 
-- **Multicore.** Deferred to R14. `_current_tcb` remains single global. Per-CPU GS-relative reads use `[rip + _current_tcb]` fallback (PA-R13-002 optional).
-- **Higher-half kernel VA.** Kernel VA stays lower-half (identity-mapped 4 GiB from boot_stub.S). Shell mapped at 0x40000000 (above kernel identity ceiling but still lower-half). Full higher-half discipline defers to R14.
-- **Multi-process.** Single init/shell process only. No fork/exec. No process reaping. SYS_EXIT halts CPU.
-- **Filesystem.** No VFS, no FS. Shell builtins are cap-invocations, not exec of external binaries.
-- **Preemption between user processes.** Timer still fires (R11 preserved) but only kernel task_a/task_b are ring-0 tenants; the user shell runs cooperatively.
-- **PCID / KPTI.** Deferred to R14.
-- **Signals.** No signal delivery mechanism.
-- **Real buddy allocator.** phys_alloc is a bump allocator over a static pool for R13. Buddy defers to R14.
-- **Curried-call plumbing.** Same status as R12 (blocked on paideia-as Phase 20+).
-- **Remaining 8 cap kinds** beyond PROCESS/THREAD (KIND_PAGE_TABLE partial coverage via loader use only).
-- **Real MMIO through aspace_map for KIND_DEVICE.** R12's stubbed vaddr synthesis stays.
+## 1. Deferrals honestly kept for R14+
 
-## 2. Pre-flight inventory
+Only items requiring substrate NOT achievable in R13 timeframe:
 
-### 2.1 paideia-as ae6039b encoder surface for R13
+- **Curried-call plumbing** — needs paideia-as Phase 20+; deferred with note.
+- **Large-page (2 MiB) mapping in pt walker** — needs paideia-as PDPT huge-page semantics; deferred to R14 (R13 uses 4 KiB only).
+- **Real network stack** — not on shell path.
+- **Persistent filesystem beyond tmpfs** — needs block device drivers; tmpfs is sufficient for R13 shell.
+- **NUMA awareness** — R14+.
+- **Hot-plug CPU** — R14+.
+- **Real ACPI parsing** — R14+.
 
-Per softarch's grep of `crates/paideia-as-encoder/src/encode_instruction.rs`:
+Everything else that was previously deferred is now in-scope.
 
-| Instruction | Status | R13 usage site |
+## 2. Pre-flight inventory (revised)
+
+### 2.1 paideia-as ae6039b encoder surface for revised R13
+
+Per softarch's audit + Revision 2 additions:
+
+| Instruction | Status | R13 milestone using it |
 |---|---|---|
-| swapgs | present | m4 syscall entry, m7 sysretq path |
-| syscall | present | m4 syscall trap encoding (kernel side) |
-| sysretq | present | m4 sysret |
-| wrmsr / rdmsr | present | m4 IA32_LSTAR/STAR/FMASK/KERNEL_GS_BASE setup |
-| iretq | present | m7 first ring-3 entry, already used by every IDT trampoline |
-| lgdt | present | m3 GDT install |
-| lidt | present | already used |
-| **ltr r16** | **MISSING** | **m3 TSS install — PA-R13-001 HARD blocker** |
-| mov cr3, r64 / mov r64, cr3 | present | m2 aspace context switch |
-| invlpg [mem] | present | m2 PT walker |
-| hlt | present | m8 SYS_EXIT |
-| GS-relative mem operand `mov r64, [gs:disp32]` | MISSING | Optional PA-R13-002; workaround via rip-relative |
-| xchg [mem], reg / lock cmpxchg / mfence | MISSING | Not on R13 critical path (single-CPU); defer to R14 |
+| swapgs / syscall / sysretq / wrmsr / rdmsr / iretq / lgdt / lidt / mov cr3 / invlpg / hlt | all present | m4, m7 (baseline) |
+| **ltr r16** | **MISSING → PA-R13-001** | m4 TSS install |
+| **GS-relative mem operand** | **MISSING → PA-R13-002** | m4 (soft); m13 (HARD for multicore) |
+| **xchg [mem], reg** | **MISSING → PA-R13-003** | m10 spinlocks; m13 multicore atomics |
+| **lock cmpxchg** | **MISSING → PA-R13-004** | m10 CAS; m13 multicore |
+| **mfence** | **MISSING → PA-R13-005** | m13 memory ordering |
+| **mov cr4, r64** | verify (probably present) | m3 SMEP/SMAP/PCID |
+| **wrmsr IA32_EFER (NX bit)** | present (uses wrmsr) | m3 NX enable |
+| **fxsave/fxrstor** | verify — needed for signal frames | m11 signal delivery |
+| **rep movsb** | verify — needed for memcpy in loader | m8 |
 
-**Escalations:**
-- **PA-R13-001 (HARD): `ltr r16` encoder.** Bytes: `0F 00 /1` (ModR/M reg-form). E.g., `ltr ax` = `0F 00 D8`. Blocks m3.
-- **PA-R13-002 (SOFT): segment-override on memory operand.** Adds `segment: Option<SegReg>` to `Operand::MemSib`/`MemDisp`; emit `65` prefix for GS, `64` for FS. E.g., `mov rax, [gs:0]` = `65 48 8B 04 25 00 00 00 00`. Nice-to-have; R13 proceeds without via rip-relative reads.
+**Escalations required for revised R13:**
 
-### 2.2 paideia-os current state
+- **PA-R13-001 (HARD, m4)**: ltr r16.
+- **PA-R13-002 (HARD for m13, SOFT for m4)**: GS-relative mem operand.
+- **PA-R13-003 (HARD, m10 + m13)**: xchg [mem], reg.
+- **PA-R13-004 (HARD, m10 + m13)**: lock cmpxchg.
+- **PA-R13-005 (HARD, m13)**: mfence.
+- **PA-R13-006 (soft, m3)**: any missing CR4 write forms.
+- **PA-R13-007 (soft, m11)**: fxsave/fxrstor (only needed if signals must preserve floating-point state; can defer if signal handlers are integer-only).
 
-- `kernel_main.pdx` ends at `call task_a_entry` (line 104). All boot at ring-0, CS=0x18.
-- `boot/gdt.pdx` is stub; active GDT is 5-entry hand-encoded in `boot_stub.S` (no user selectors, no TSS).
-- `boot/tss.pdx` does not exist.
-- `core/mm/*.pdx` all MVP stubs (R12 conversion legacy). Real bodies land in m2.
-- `core/int/idt.pdx` real; every trampoline hardcodes `KERNEL_CS = 0x08` — m3 layout preserves this at GDT slot 1.
-- `core/int/ist.pdx` constants only. Stacks not allocated. m3 lands them.
-- `core/sched/gs_current.pdx` scaffolded but inert. m4 activates.
-- `src/user/` does not exist.
+Predicted paideia-as version at R13 close: v0.13.0 (5-6 encoder additions).
 
-## 3. Milestone index
+## 3. Milestone index (revised)
 
-| # | Milestone slug | Issues | Description | On critical path |
-|---|---|---|---|---|
-| m1 | `r13-preflight-and-architecture` | 2 | Ring-3 ABI, syscall convention (syscall/sysret via IA32_LSTAR), MM invariants, TSS layout, embedded-shell binary format, file layout | yes |
-| m2 | `r13-mm-api-activation` | 4 | Real aspace_map + 4-level PT walker + INVLPG; aspace_create real; phys_alloc bump allocator; aspace_unmap real | yes (parallel with m3-m6) |
-| m3 | `r13-gdt-tss-ist` | 4 | Real GDT with user selectors + TSS descriptor; TSS.RSP0 setup; IST stacks (DF/NMI/MC/PF); IDT rewire with IST fields | yes (blocked on PA-R13-001) |
-| m4 | `r13-syscall-entry` | 3 | IA32_LSTAR/STAR/FMASK/KERNEL_GS_BASE MSR setup; syscall entry trampoline (swapgs + stack switch + dispatch); SYS_CAP_INVOKE/READ/WRITE/EXIT table | yes |
-| m5 | `r13-kind-process-thread` | 2 | KIND_PROCESS handler (OP_CREATE, OP_GET_ASPACE_ROOT); KIND_THREAD handler (OP_CREATE, OP_START) | yes |
-| m6 | `r13-user-shell-binary` | 3 | src/user/shell.pdx (main loop); src/user/syscall_shim.pdx; src/user/{io,builtins}.pdx | yes (parallel with m3-m5) |
-| m7 | `r13-kernel-user-transition` | 3 | User binary loader (embed shell.bin via .incbin); aspace layout; first iretq to ring-3 | yes |
-| m8 | `r13-shell-interactive-loop` | 2 | Line-buffering with echo; builtin dispatch (help/cap/exit) | yes |
-| m9 | `r13-smoke-fingerprint-regression` | 2 | boot_r13 mode + fingerprint; boot_r13_cap sub-mode | yes |
-| m10 | `r13-closure` | 2 | r13-closure.md + STATUS update; retrospective + r14-kickoff.md | yes |
-| **Σ** | | **27** | | |
+| # | Slug | Issues | Description |
+|---|---|---|---|
+| m1 | r13-preflight-and-architecture | 2 | Full arch audit, syscall table freeze, paideia-as escalations filed |
+| m2 | r13-mm-api-activation | 5 | phys_alloc bump + buddy allocator + PCID discipline + aspace map/create/unmap |
+| m3 | r13-higher-half-kernel + KPTI | 5 | Kernel remapped to 0xFFFF_8000_0000_0000; KPTI page tables (kernel-only PGD copied per user); SMEP/SMAP/NX enable |
+| m4 | r13-gdt-tss-ist + KIND_DEVICE real MMIO | 5 | GDT with user selectors; TSS + IST stacks; IDT rewire; KIND_DEVICE handler upgraded to use real aspace_map |
+| m5 | r13-syscall-entry | 3 | MSR setup; syscall trampoline; syscall table (SYS_CAP_INVOKE + WRITE + READ + EXIT + minimal FORK/EXEC placeholders) |
+| m6 | r13-full-cap-dispatch (10 kinds) | 7 | KIND_PROCESS + KIND_THREAD + KIND_PAGE_TABLE + KIND_IPC_PORT + KIND_TIMER + KIND_INTERRUPT + KIND_NOTIFICATION + KIND_REPLY handlers |
+| m7 | r13-user-shell-binary-v1 | 3 | src/user/shell.pdx main loop + syscall shim + basic I/O |
+| m8 | r13-kernel-user-transition | 3 | Embedded shell binary via .incbin; loader; kernel_main transition |
+| m9 | r13-vfs + tmpfs + block abstraction | 5 | VFS layer; in-memory tmpfs; block-device stub; embedded read-only /bin filesystem |
+| m10 | r13-fork-exec + multi-process | 5 | fork syscall (copy-on-write via KIND_PROCESS + KIND_PAGE_TABLE); exec syscall (ELF-lite loader); process table; wait syscall |
+| m11 | r13-signals + job control | 4 | Signal delivery (SIGINT via Ctrl-C on UART, SIGKILL, SIGSEGV auto-delivery on page fault, SIGCHLD on child exit) |
+| m12 | r13-shell-v2 (exec + line editing) | 3 | Shell reads /bin listings, `exec` builtin invokes user programs, arrow-key history (bonus) |
+| m13 | r13-multicore (SIPI + per-CPU + IPI + TLB shootdown) | 6 | AP wake-up sequence; per-CPU GS with real segment override; cross-CPU IPI; TLB shootdown discipline |
+| m14 | r13-user-process-preemption | 2 | Extend R11 preemption to ring-3 (timer IRQ delivers to user; kernel entry via IRQ; sched_pick_next selects across all TCBs) |
+| m15 | r13-smoke-fingerprint-regression | 3 | boot_r13 + boot_r13_cap + boot_r13_multicore + boot_r13_signal sub-modes; pre-push extended |
+| m16 | r13-closure | 2 | r13-closure.md + STATUS + retrospective + r14-kickoff.md |
+| **Σ** | | **63** | |
 
-## 4. Milestone details
+## 4. Detailed milestone specs
 
-### m1 — r13-preflight-and-architecture
+### m1 — Preflight + Architecture
 
-**m1-001: Pre-flight audit** (S) — encoder verification (esp. PA-R13-001 ltr status), kind-name mapping for KIND_PROCESS (2) and KIND_THREAD (?), syscall table freeze (nr, args, return), MM invariants, TSS/IST layout, user aspace VA plan (0x40000000-0x40101000), embedded-shell-binary format (.incbin approach). Produces `design/milestones/r13-preflight.md`. Files: `design/milestones/r13-preflight.md`.
+- **m1-001** Pre-flight audit (S) — Same as Rev 1: encoder verification, kind mapping (all 16 kinds), syscall table freeze including FORK/EXEC/WAIT/SIGACTION, MM invariants (bump + buddy), TSS/IST layout, higher-half kernel VA plan (0xFFFF_8000_0000_0000), KPTI PGD-copy discipline, embedded shell binary, VFS layer plan, multicore SIPI sequence.
+- **m1-002** Architecture pins (S) — GDT layout, syscall MSR pins, ring-transition byte sequences, higher-half kernel linker script, KPTI page-table layout, per-CPU data struct layout, IPI vectors, signal frame layout, VFS inode structure, ELF-lite binary format.
 
-**m1-002: Architecture pins** (S) — GDT layout (8 entries + TSS), syscall MSR pins, ring-transition byte sequences, error-return convention, module file layout under `src/kernel/syscall/`, `src/user/`, `src/kernel/user/loader.pdx`. Produces `design/audit/entries/r13-m1-002-arch-pins.md`.
+### m2 — MM API Activation
 
-### m2 — r13-mm-api-activation
+- **m2-001** phys_alloc bump allocator (S) — Same as Rev 1.
+- **m2-002** aspace_map + 4-level PT walker + INVLPG (M) — Same as Rev 1.
+- **m2-003** aspace_create + kernel-upper-half copy (S) — Same as Rev 1.
+- **m2-004** aspace_unmap + INVLPG (S) — Same as Rev 1.
+- **m2-005** Real buddy allocator (M) — Replace bump with buddy over 1024-page pool. Order 0-10 support. Free-list heads in .bss. Coalesce on free. Retires the R14-deferred note.
 
-**m2-001: phys_alloc bump allocator** (S) — replace stub with bump over `.bss` `_phys_page_pool : [u8; 64 * 4096]`. Add `_phys_pool_next : u64 = 0` global. Return `&_phys_page_pool + next * 4096` on order=0, PHYS_ALLOC_NULL on exhaustion. Files: `src/kernel/core/mm/phys_alloc.pdx`, `src/kernel/core/mm/phys_pool.pdx` (new).
+### m3 — Higher-half kernel VA + KPTI + SMEP/SMAP/NX (NEW)
 
-**m2-002: aspace_map + PT walker** (M) — real body per softarch §MM: compute PML4 index, load PT entry, allocate intermediate via phys_alloc on miss, descend PDPT→PD→PT, compose leaf PTE, invlpg. Files: `src/kernel/core/mm/aspace_map.pdx`.
+- **m3-001** Higher-half kernel linker script (M) — kernel .text at 0xFFFF_8000_0010_0000+. Update boot_stub.S GDT to map higher-half via PDPT[510]. Kernel_main_64 runs from higher-half VA after CR3 setup.
+- **m3-002** KPTI PGD-copy discipline (M) — Per-user process: two PML4s. Kernel PML4 has full kernel + trampoline; user PML4 has user mappings + trampoline only. Kernel-entry trampoline switches CR3 on syscall entry, back on sysretq.
+- **m3-003** SMEP enable (CR4.SMEP = bit 20) (S) — Prevents kernel from executing user code accidentally. wrcr4.
+- **m3-004** SMAP enable (CR4.SMAP = bit 21) + stac/clac discipline (S) — Prevents kernel from reading user memory except via explicit stac/clac windows.
+- **m3-005** NX enable (IA32_EFER.NXE = bit 11) + PTE.XD discipline (S) — Non-executable user data pages.
 
-**m2-003: aspace_create real body** (S) — bump-alloc PML4, copy kernel upper-half (PML4[256..512]) from kernel PML4 (identity map), return new PML4 phys base. Files: `src/kernel/core/mm/aspace_create.pdx`.
+### m4 — GDT + TSS + IST + KIND_DEVICE MMIO
 
-**m2-004: aspace_unmap + INVLPG discipline** (S) — walk PT to leaf, zero PTE, invlpg. Files: `src/kernel/core/mm/aspace_unmap.pdx`.
+- **m4-001** Real GDT install (M) — Same as Rev 1 m3-001.
+- **m4-002** TSS + RSP0 + ltr (S) — Same as Rev 1 m3-002. Blocked on PA-R13-001.
+- **m4-003** IST stacks (DF/NMI/MC/PF) (S) — Same as Rev 1 m3-003.
+- **m4-004** IDT rewire with IST fields (S) — Same as Rev 1 m3-004.
+- **m4-005** KIND_DEVICE OP_MAP_MMIO real body (S, NEW) — Replace D7-004 vaddr synthesis stub with real aspace_map(current_aspace, requested_vaddr, phys_base, PTE_P|PTE_RW|PTE_PCD|PTE_PWT). Uses m2 machinery.
 
-### m3 — r13-gdt-tss-ist (BLOCKED on PA-R13-001)
+### m5 — Syscall Entry
 
-**m3-001: Real GDT install** (M) — replace boot_stub.S 5-entry GDT with 8-entry (null, kernel code64=0x08, kernel data=0x10, user data placeholder=0x18, user data=0x20, user code=0x28, TSS descriptor spanning 0x30-0x38). Slot 1 CS=0x08 preserved so existing IDT trampolines still fire correctly. `lgdt` reloads GDTR from kernel-side (kernel-mode). Files: `src/kernel/boot/gdt.pdx` (real body), `tools/boot_stub.S` (potentially trim old GDT if superseded).
+- **m5-001** MSR setup (S) — LSTAR/STAR/FMASK/KERNEL_GS_BASE. Same as Rev 1 m4-001.
+- **m5-002** Syscall entry trampoline (M) — Same as Rev 1 m4-002.
+- **m5-003** Syscall table (S) — Expanded from Rev 1 m4-003: 12 syscalls now (add SYS_FORK=4, SYS_EXEC=5, SYS_WAIT=6, SYS_SIGACTION=7, SYS_SIGRETURN=8, SYS_MMAP=9, SYS_OPEN=10, SYS_CLOSE=11).
 
-**m3-002: TSS structure + RSP0** (S) — 104-byte `_tss : [u8; 104]` in .bss. Populate TSS.rsp0 (kernel stack top), TSS.ist1..3 (IST stack tops). `ltr 0x30` to load task register. **Depends on PA-R13-001.** Files: `src/kernel/boot/tss.pdx` (new).
+### m6 — Full Cap Dispatch (10 kinds)
 
-**m3-003: IST stacks (DF, NMI, MC, PF)** (S) — 4 × 16 KiB stacks in .bss. Populate IST slots. Files: `src/kernel/core/int/ist.pdx` (populate real stack tops).
+- **m6-001** KIND_PROCESS handler (S) — Same as Rev 1 m5-001.
+- **m6-002** KIND_THREAD handler (S) — Same as Rev 1 m5-002.
+- **m6-003** KIND_PAGE_TABLE handler (S, NEW) — OP_MAP / OP_UNMAP delegating to aspace_map/unmap. Ties into m7 loader.
+- **m6-004** KIND_IPC_PORT handler (S, NEW) — Point-to-point IPC endpoint (distinct from R12's KIND_IPC_ENDPOINT which is SPSC ring). Wraps a single message slot per port.
+- **m6-005** KIND_TIMER handler (S, NEW) — OP_ARM (arm a timeout callback via LAPIC deadline); OP_CANCEL; OP_READ_TSC.
+- **m6-006** KIND_INTERRUPT + KIND_NOTIFICATION handlers (S, NEW) — Wrap IRQ delivery to userspace as a bounded notification queue. Cap needed for user-mode drivers.
+- **m6-007** KIND_REPLY handler (S, NEW) — One-shot RPC-style reply cap. Consumed on use. Foundational for m11 signals (SIGCHLD → wait syscall uses reply cap).
 
-**m3-004: IDT rewire with IST fields** (S) — update `idt_install` in `idt.pdx` so gates for vec 8/2/18/14 encode IST != 0 in the type-attr byte. Files: `src/kernel/core/int/idt.pdx`.
+### m7 — User Shell Binary v1
 
-### m4 — r13-syscall-entry
+- **m7-001** Shell main loop (S) — Same as Rev 1 m6-001.
+- **m7-002** Syscall shim (S) — Same as Rev 1 m6-002. Extended for new syscalls (fork/exec/wait/mmap).
+- **m7-003** I/O + builtins v1 (S) — Same as Rev 1 m6-003. Builtins: help/cap/exit. exec builtin lands in m12.
 
-**m4-001: MSR setup (LSTAR/STAR/FMASK/KERNEL_GS_BASE)** (S) — write IA32_LSTAR (kernel entry point), IA32_STAR[47:32]=0x08 (kernel CS on entry), STAR[63:48]=0x18 (user CS/SS derived), IA32_FMASK=0x200 (mask IF on entry), IA32_KERNEL_GS_BASE (per-CPU pointer, unused today but set for future). Files: `src/kernel/core/syscall/msr_setup.pdx` (new).
+### m8 — Kernel-User Transition
 
-**m4-002: Syscall entry trampoline** (M) — the ring-3→ring-0 entry point. On `syscall`: CPU auto-loads CS/SS from STAR, RIP from LSTAR, RFLAGS masked. Trampoline: `swapgs`; save user RSP; load kernel RSP (from GS or rip-relative); build stack frame; dispatch on RAX = nr; call handler; restore RSP via swapgs; sysretq. Files: `src/kernel/core/syscall/entry.pdx` (new).
+- **m8-001** Embedded shell binary via .incbin (S) — Same as Rev 1 m7-001.
+- **m8-002** Loader (M) — Same as Rev 1 m7-002. Extended: also loads init/shell process, sets up KPTI-compatible PML4 pair.
+- **m8-003** kernel_main_64 transition (S) — Same as Rev 1 m7-003.
 
-**m4-003: Syscall table (SYS_CAP_INVOKE/WRITE/READ/EXIT)** (S) — nr=0 SYS_CAP_INVOKE → cap_invoke_dispatch; nr=1 SYS_WRITE (fd=1 → uart_puts_len); nr=2 SYS_READ (fd=0 → uart_getc blocking poll on LSR bit 0); nr=3 SYS_EXIT → cli;hlt loop. Table validation: `rax < 4`. Files: `src/kernel/core/syscall/table.pdx` (new), `src/kernel/boot/uart.pdx` (add uart_getc + uart_puts_len).
+### m9 — VFS + tmpfs + block-device abstraction (NEW)
 
-### m5 — r13-kind-process-thread
+- **m9-001** VFS layer (M) — inode + dentry + super_block structs. Ops table: read/write/open/close/mkdir/readdir/lookup.
+- **m9-002** tmpfs (S) — In-memory FS. Root at /. Allocates pages via phys_alloc. Directory tree in memory.
+- **m9-003** Block-device abstraction stub (S) — bio structure + ops table; MVP stub returns "no device." Groundwork for R14+ persistent FS.
+- **m9-004** Embedded /bin filesystem (M) — Bootstrap tmpfs populated at boot from an .incbin'd tarball. Contains at least /bin/hello (prints "hello world" then exits) + /bin/echo + /bin/cat + /bin/ls.
+- **m9-005** File descriptor table per-process (S) — Small (16 slots) FD table in KIND_PROCESS descriptor.
 
-**m5-001: KIND_PROCESS handler** (S) — `cap_handler_process` in new `src/kernel/core/cap/kind_process.pdx`. Ops: OP_CREATE (create process = aspace_create + reserve TCB), OP_GET_ASPACE_ROOT (return current process's PML4). Rights: RIGHT_INVOKE required. Wire kind=2 into `cap_invoke_dispatch`. Files: `src/kernel/core/cap/kind_process.pdx` (new), `src/kernel/core/cap/invoke.pdx` (add kind=2 branch).
+### m10 — fork + exec + multi-process (NEW)
 
-**m5-002: KIND_THREAD handler** (S) — `cap_handler_thread` in new `src/kernel/core/cap/kind_thread.pdx`. Ops: OP_CREATE (create thread inside process = TCB alloc), OP_START (context switch to thread). Rights: RIGHT_INVOKE required. Wire kind=? (find in kind.pdx). Files: `src/kernel/core/cap/kind_thread.pdx` (new), `src/kernel/core/cap/invoke.pdx` (add kind branch).
+- **m10-001** fork() syscall + COW page tables (M) — Copy PML4 with all writable pages marked read-only + COW bit. Page fault handler duplicates on write. Uses KIND_PROCESS+KIND_PAGE_TABLE dispatch.
+- **m10-002** exec() syscall + ELF-lite loader (M) — Read binary from VFS; parse minimal ELF header (or paideia-native flat format); create new aspace; jump to entry point.
+- **m10-003** wait()/waitpid() syscall + process table (S) — Global process table (256 slots max in R13). Parent-child relationship. SIGCHLD delivery on child exit.
+- **m10-004** Process cleanup (aspace + TCB destruction) (S) — On exit: unmap aspace pages, free TCB, wake waiter with SIGCHLD reply cap.
+- **m10-005** Spinlock primitives for multi-process shared state (S) — Uses PA-R13-003 (xchg) or PA-R13-004 (lock cmpxchg). Ready for m13 multicore but usable single-CPU.
 
-### m6 — r13-user-shell-binary
+### m11 — Signals + Job Control (NEW)
 
-**m6-001: Shell main loop (src/user/shell.pdx)** (S) — `.text` entry; loop: prompt → getline → parse → dispatch → repeat. Files: `src/user/shell.pdx` (new).
+- **m11-001** Signal delivery infrastructure (M) — Per-process signal mask + pending set + handlers table. Signal frame pushed onto user stack on delivery. sigreturn syscall restores user context.
+- **m11-002** SIGINT via Ctrl-C on UART (S) — UART receives 0x03; kernel scans for it in the read syscall path; delivers SIGINT to foreground process.
+- **m11-003** SIGSEGV auto-delivery on page fault (S) — Extend #PF handler: if fault is user-mode and address is not COW-recoverable, deliver SIGSEGV.
+- **m11-004** SIGCHLD + SIGKILL basic delivery (S) — Ties into wait() from m10-003.
 
-**m6-002: Syscall shim (src/user/syscall_shim.pdx)** (S) — `pub let sys_read/sys_write/sys_exit/sys_cap_invoke` unsafe wrappers around `syscall` instruction. ABI: rax=nr, rdi/rsi/rdx=args. Files: `src/user/syscall_shim.pdx` (new).
+### m12 — Shell v2 (interactive + exec support)
 
-**m6-003: I/O + builtins (src/user/io.pdx, src/user/builtins.pdx)** (S) — `getline(buf, cap)` echo-per-char, terminates on \n. Builtins: `help` (prints syscall list), `cap N M` (decimal parse, SYS_CAP_INVOKE, print RES=), `exit` (SYS_EXIT 0). Files: `src/user/io.pdx` (new), `src/user/builtins.pdx` (new).
+- **m12-001** Line editing + history (S) — Backspace/BEL from Rev 1 m8-001. Simple 8-line history buffer.
+- **m12-002** Builtin dispatch v2 (S) — Rev 1 m8-002 + `ls` builtin (reads VFS root) + `cd` (updates process CWD).
+- **m12-003** exec builtin (S) — Parses `exec /bin/hello arg1 arg2`, calls fork+exec, wait's for child.
 
-### m7 — r13-kernel-user-transition
+### m13 — Multicore (NEW)
 
-**m7-001: Embedded shell binary via .incbin** (S) — `objcopy -O binary build/shell.elf build/shell.bin` post-build. `tools/boot_stub.S` gains `.incbin "build/shell.bin"` with `_shell_bin_start`/`_shell_bin_end` labels. Files: `tools/boot_stub.S`, `tools/build.sh` (add objcopy step).
+- **m13-001** AP wake-up via SIPI (M) — INIT + startup IPI sequence. AP boot stub in 16-bit real mode → 32 protected → 64 long. Writes its own IA32_KERNEL_GS_BASE.
+- **m13-002** Per-CPU GS data (M) — Real GS-relative reads (PA-R13-002 landed). GS points to per-CPU struct containing current_tcb, kernel_stack_top, apic_id.
+- **m13-003** BSP + AP boot synchronization (S) — Global "APs online" counter incremented atomically via PA-R13-004 lock cmpxchg. BSP waits.
+- **m13-004** Cross-CPU IPI real dispatch (S) — vec33 handle_ipi_default becomes real. IPI vector table.
+- **m13-005** TLB shootdown IPI (M) — For aspace_unmap on multi-CPU: shootdown IPI to CPUs sharing that aspace. Requires PA-R13-005 mfence.
+- **m13-006** Per-CPU runqueue (S) — Each AP has its own runqueue. Load balancing R14+; R13 does static pin.
 
-**m7-002: Loader (src/kernel/user/loader.pdx)** (M) — steps: aspace_create → phys_alloc pages → aspace_map(0x40000000, PTE_P|PTE_US) for text, (0x40001000, PTE_P|PTE_US|PTE_RW) for bss + stack → memcpy shell.bin → load CR3 → build iretq frame (SS=0x20|3, RSP=0x40101000, RFLAGS=0x202, CS=0x28|3, RIP=0x40000000) → iretq. Files: `src/kernel/user/loader.pdx` (new).
+### m14 — User Process Preemption (NEW)
 
-**m7-003: kernel_main_64 transition** (S) — call loader after `cap_dispatch_smoke`. Files: `src/kernel/boot/kernel_main.pdx`.
+- **m14-001** Extend R11 preemption to ring-3 (M) — When timer fires in user mode, IDT trampoline saves user CS/RSP/RFLAGS/RIP; kernel entry via IRQ path (not syscall); sched_pick_next may select a different user TCB; iretq to new user context.
+- **m14-002** User TCB context save (S) — Full 15-GPR + FPU state save/restore on preemption. Uses PA-R13-007 fxsave if needed.
 
-### m8 — r13-shell-interactive-loop
+### m15 — Smoke + Fingerprint + Regression
 
-**m8-001: Line buffer + echo discipline** (S) — 64-byte line buffer in shell .bss. Backspace (0x7F) rubs out via `\b \b`. On overrun echo BEL. On \n terminate. Files: `src/user/io.pdx` (extend).
+- **m15-001** boot_r13 mode + fingerprint (S) — Shell prompt appears, help output, exit.
+- **m15-002** boot_r13_cap sub-mode (S) — cap N M builtin round-trips.
+- **m15-003** boot_r13_full sub-mode + 6-mode pre-push gate (S) — Full end-to-end: fork/exec/wait cycle exercises multi-process + VFS + signals. printf 'exec /bin/hello\nexit\n' asserts child output + wait completion. `boot_r13_multicore` if hardware / QEMU -smp 2 available; `boot_r13_signal` asserts Ctrl-C delivery.
 
-**m8-002: Builtin dispatch** (S) — strcmp against "help"/"cap"/"exit". Parse `cap N M` as decimal u64 tokens. Unknown → "unknown\n". Files: `src/user/builtins.pdx` (extend).
+### m16 — Closure
 
-### m9 — r13-smoke-fingerprint-regression
-
-**m9-001: boot_r13 mode + fingerprint** (S) — `tests/r13/expected-boot-r13.txt` ~15 lines contains-in-order. `boot_r13` mode in `tools/run-smoke.sh` piping `printf 'help\nexit\n'` to QEMU stdin. Fingerprint includes SHELL$ prompt, help output (SYS_CAP_INVOKE/WRITE/READ/EXIT lines), SHELL$, exit, SHELL EXITED. Files: `tests/r13/expected-boot-r13.txt` (new), `tools/run-smoke.sh` (add mode).
-
-**m9-002: boot_r13_cap sub-mode + pre-push extension** (S) — `printf 'cap 4 1\nexit\n'` — asserts SYS_CAP_INVOKE round-trip through KIND_PAGE OP_READ, RES= line prints result. Update `.git/hooks/pre-push` to gate on 5 modes. Regression matrix (5 modes × 3 reps = 15 runs). Files: `tests/r13/expected-boot-r13-cap.txt` (new), `.git/hooks/pre-push`, `design/audit/entries/r13-m9-002-regression-matrix.md`.
-
-### m10 — r13-closure
-
-**m10-001: R13 closure document + STATUS update** (S) — `design/milestones/r13-closure.md` following R12 template. STATUS.md append. Files: `design/milestones/r13-closure.md` (new), `STATUS.md`.
-
-**m10-002: Retrospective + R14 kickoff** (S) — `design/round-retrospectives/r13-shell-foundation.md` (~200 lines). R14 kickoff: Path A (multicore), Path B (higher-half kernel + KPTI), Path C (VFS + tmpfs), Path D (multi-process). Files: `design/round-retrospectives/r13-shell-foundation.md` (new), `design/milestones/r14-kickoff.md` (new).
+- **m16-001** R13 closure + STATUS (S) — r13-closure.md follows R12 template.
+- **m16-002** Retrospective + R14 kickoff (S) — R14 candidates: persistent FS + block devices; network stack; ACPI; NUMA; hot-plug; PCID full activation; curried-call plumbing.
 
 ## 5. Critical path
 
 ```
-m1-001 → m1-002 →
-  { m2-001 → m2-002 → m2-003 → m2-004 } (MM parallel)
-  { m3-001 → m3-002 → m3-003 → m3-004 } (blocked on PA-R13-001)
-  { m6-001 → m6-002 → m6-003 } (user shell parallel)
-→ m4-001 → m4-002 → m4-003
-→ m5-001 → m5-002
-→ m7-001 → m7-002 → m7-003
-→ m8-001 → m8-002
-→ m9-001 → m9-002
-→ m10-001 → m10-002
+m1 → m2 → m3 → m4 (PA-R13-001) → m5 → m6 →
+  { m7 → m8 } (parallel with m6)
+→ m9 (VFS) → m10 (fork+exec) (PA-R13-003/004) → m11 (signals) → m12 (shell v2)
+→ m13 (multicore) (PA-R13-002/005) → m14 (user preemption)
+→ m15 → m16
 ```
 
-Length: 27 issues sequential worst-case; parallel bands compress to ~14.
+Length: 16 milestones sequential. Parallelizable bands: ~11.
 
-## 6. Cross-repo escalations
+## 6. Cross-repo escalations (5-7 HARD blockers)
 
-| # | Escalation | Instruction | Probability | Priority |
-|---|---|---|---|---|
-| PA-R13-001 | ltr r16 encoder | 0F 00 /1 ModR/M reg-form | 100% needed | **HARD blocker for m3** |
-| PA-R13-002 | Segment-override on mem operand | 65/64 prefix | 100% recommended | Soft; workaround via rip-relative |
+Filed at m1 close:
 
-Predicted paideia-as version at R13 close: v0.12.0 (post-PA-R13-001 landing). Submodule bump required.
+- **PA-R13-001**: ltr r16 encoder.
+- **PA-R13-002**: GS-relative memory operand (65 prefix; adds segment override).
+- **PA-R13-003**: xchg [mem], reg.
+- **PA-R13-004**: lock cmpxchg.
+- **PA-R13-005**: mfence.
+- **PA-R13-006** (soft): CR4 write variants for SMEP/SMAP/PCID bits (verify current encoder).
+- **PA-R13-007** (optional): fxsave / fxrstor (only if signals must preserve FP state; can defer if signal handlers are integer-only).
 
-## 7. Risk register
+Predicted paideia-as version: v0.13.0 at R13 close.
+
+## 7. Risk register (top 15)
 
 | # | Risk | Prob | Impact | Mitigation |
 |---|---|---|---|---|
-| R1 | PA-R13-001 (ltr) slips | medium | high | File first in m1; if paideia-as blocks >3 days, hand-encode `.byte 0x0F, 0x00, 0xD8` |
-| R2 | First iretq triple-faults silently | high | high | Install #DF (vec 8) with IST1 + trace handler dumping CR2/errcode/RIP |
-| R3 | Shell PT collides with kernel identity | low | high | Shell VA at 0x40000000 (above 4 GiB kernel ceiling) |
-| R4 | QEMU stdin buffering | medium | medium | -chardev stdio,mux=off + stty -icanon; fallback: kernel-embedded hardcoded input |
-| R5 | User stack overflow into kernel | medium | high | Bounds-check line buffer; user stack = 1 page; page fault handler treats as fatal |
-| R6 | First syscall corner cases (RCX/R11 clobber, RFLAGS.IF discipline) | high | medium | m4-002 byte-verified sequence; test against QEMU register dump |
-| R7 | phys_alloc bump exhaustion | low | medium | 64-page pool sufficient for R13 (single aspace ≤ 16 pages) |
-| R8 | aspace_map recursion depth (4 levels) | low | medium | Explicit non-recursive walk with per-level state |
-| R9 | Loader iretq frame incorrect | high | high | m7-002 byte-verify against Intel SDM Vol 3A §6.14 |
-| R10 | Shell binary linking (paideia-as .o → binary blob) | medium | high | Test .incbin approach standalone in m1; fallback via linker script |
+| R1 | PA-R13-001 slips | med | high | File first in m1; hand-encoded .byte fallback |
+| R2 | First iretq triple-faults | high | high | #DF with IST1 + trace handler |
+| R3 | Higher-half + KPTI page-table complexity | high | high | m3 unit-testable via bochs single-step |
+| R4 | fork() COW hangs or corrupts | high | high | Extensive m10 unit tests; QEMU register-dump verification |
+| R5 | ELF loader edge cases | med | med | Use minimal ELF-lite format authored in-house; documented byte layout |
+| R6 | Multicore synchronization bugs | high | high | m13 lands after m10 spinlock primitives mature |
+| R7 | TLB shootdown races | high | high | m13 preflight: enumerate races; formal ordering per Intel SDM 8.3.2 |
+| R8 | Signal delivery races (nested signals) | med | med | Block signals during handler unless SA_NODEFER |
+| R9 | User process preemption context corruption | high | high | m14 byte-verify full 15-GPR + segment save/restore |
+| R10 | Shell PT collides with kernel higher-half after m3 | low | high | Post-m3 shell VA at 0x0000_4000_0000 (lower-half) |
+| R11 | VFS + tmpfs data corruption under fork | med | high | Per-process FD tables independent; VFS ops locked |
+| R12 | Buddy allocator fragmentation exhausts pool | med | med | 1024 pages sufficient for R13 shell + 4 forked processes |
+| R13 | QEMU -smp 2 semantics differ from real hw | med | med | m13 verify against bochs + qemu documentation |
+| R14 | .incbin embedded /bin tarball incorrect format | med | med | Simple magic-header + tar-like layout, author in-house |
+| R15 | Ctrl-C signal delivery misses when kernel busy | med | med | Ctrl-C sets pending bit; deliver on next syscall return or timer preempt |
 
 ## 8. Cycle estimate
 
-Per softarch: **22-28 cycles**. Distributed:
-- m1: 2 cycles
-- m2: 4 cycles (MM real bodies)
-- m3: 4 cycles (blocked on PA-R13-001)
-- m4: 3 cycles (syscall trampoline)
-- m5: 2 cycles
-- m6: 3 cycles (user shell)
-- m7: 3 cycles (loader + iretq)
-- m8: 2 cycles
-- m9: 2 cycles
-- m10: 1 cycle
+Substantially more ambitious than R12:
+- m1-m2: 6 cycles (preflight + MM)
+- m3-m5: 12 cycles (higher-half + ring-3 + syscalls; higher-half is the risky item)
+- m6: 5 cycles (10 cap kinds)
+- m7-m8: 5 cycles (shell v1 + loader)
+- m9: 6 cycles (VFS + tmpfs + /bin)
+- m10: 8 cycles (fork + exec + wait)
+- m11: 4 cycles (signals)
+- m12: 3 cycles (shell v2)
+- m13: 8 cycles (multicore — highest debug risk)
+- m14: 3 cycles (user preemption)
+- m15-m16: 3 cycles
 
-Wallclock: ~14 working days if parallelization is exercised; ~22 if strictly sequential.
+**Total: 63 cycles.** Wallclock: 30-45 working days with heavy parallelization (m2/m3/m4 can be parallelized; m9/m10/m11 can partially overlap; m13 must sequential-follow m10).
 
-## 9. Round acceptance gate
+## 9. Recommended sequencing
+
+- **Days 1-3**: m1 (preflight + arch pins). File PA-R13-001..007 in paideia-as.
+- **Days 4-8**: m2 (MM API + buddy) — parallel with paideia-as maintainer working on PA-R13-001.
+- **Days 9-14**: m3 (higher-half + KPTI + SMEP/SMAP/NX) — biggest wildcard for schedule.
+- **Days 15-19**: m4 (GDT/TSS/IST/KIND_DEVICE MMIO) — blocked on PA-R13-001.
+- **Days 20-23**: m5 (syscall entry).
+- **Days 24-28**: m6 (10 cap kinds) + m7 (shell v1) in parallel.
+- **Days 29-32**: m8 (transition + loader). First observable ring-3 execution.
+- **Days 33-38**: m9 (VFS + tmpfs).
+- **Days 39-46**: m10 (fork/exec/wait). Highest debug time.
+- **Days 47-50**: m11 (signals).
+- **Days 51-53**: m12 (shell v2 with exec builtin).
+- **Days 54-61**: m13 (multicore). Second-highest debug time.
+- **Days 62-64**: m14 (user preemption).
+- **Days 65-67**: m15 (smoke + regression).
+- **Days 68-70**: m16 (closure).
+
+Assumes 5 productive hours/day, single primary engineer + paideia-as maintenance.
+
+## 10. Round acceptance gate
 
 R13 CLOSED when all hold:
 
-1. `tools/run-smoke.sh boot_r13` passes (contains-in-order fingerprint, 15s timeout, 3/3 reps).
-2. `tools/run-smoke.sh boot_r13_cap` passes — SYS_CAP_INVOKE round-trip verified.
-3. `.git/hooks/pre-push` gates on 5 modes: boot_r8_only + boot_r10 + boot_r11 + boot_r12 + boot_r13.
-4. `boot_r12_denial` still passes — R13 additions do not weaken R12 rights lattice.
-5. `design/milestones/r13-closure.md` written.
-6. `tools/paideia-as` submodule bumped to a tagged v0.12.0 containing PA-R13-001.
-7. `design/milestones/r14-kickoff.md` exists with Path A/B/C/D sketches.
-8. Tag `r13-closed` on merge commit.
+1. `tools/run-smoke.sh boot_r13` passes: shell prompt + help + exit.
+2. `boot_r13_cap` passes: SYS_CAP_INVOKE round-trip.
+3. `boot_r13_exec` passes: `exec /bin/hello` fork+exec+wait cycle observable.
+4. `boot_r13_signal` passes: Ctrl-C delivers SIGINT observable.
+5. `boot_r13_multicore` passes (if QEMU -smp available): 2 CPUs both execute tasks.
+6. `.git/hooks/pre-push` gates on 6 modes.
+7. R12 modes (`boot_r8_only`, `boot_r10`, `boot_r11`, `boot_r12`, `boot_r12_denial`) still pass.
+8. `design/milestones/r13-closure.md` written.
+9. `tools/paideia-as` submodule bumped to a tagged v0.13.0 containing PA-R13-001..005 (007 if needed).
+10. `design/milestones/r14-kickoff.md` written naming R14 candidates (persistent FS, network, ACPI, NUMA, hot-plug, curried calls).
+11. Tag `r13-closed` on merge commit.
 
-**The observable payoff line:** a human at a terminal types `help<enter>exit<enter>` and sees the shell respond.
+**Observable payoff:** a human at a terminal:
+- Types `help` — sees syscall list.
+- Types `ls /bin` — sees list of available programs.
+- Types `exec /bin/hello` — sees "hello world" output from a spawned process.
+- Types Ctrl-C during a long-running command — sees it interrupted.
+- Types `exit` — shell halts cleanly.
 
-## 10. Milestone-by-milestone acceptance summary
+This is a complete, if minimal, interactive operating system.
 
-Each milestone gets its own closing audit entry. Full audit chain expected: r13-preflight.md, r13-m1-002-arch-pins.md, r13-m2-001-phys-alloc.md, r13-m2-002-aspace-map.md, r13-m2-003-aspace-create.md, r13-m2-004-aspace-unmap.md, r13-m3-001-gdt.md, r13-m3-002-tss.md, r13-m3-003-ist.md, r13-m3-004-idt-rewire.md, r13-m4-001-msr-setup.md, r13-m4-002-syscall-entry.md, r13-m4-003-syscall-table.md, r13-m5-001-kind-process.md, r13-m5-002-kind-thread.md, r13-m6-001-shell-loop.md, r13-m6-002-syscall-shim.md, r13-m6-003-io-builtins.md, r13-m7-001-embed-binary.md, r13-m7-002-loader.md, r13-m7-003-transition.md, r13-m8-001-line-buffer.md, r13-m8-002-builtin-dispatch.md, r13-m9-001-boot-r13-fingerprint.md, r13-m9-002-regression-matrix.md, r13-m10-001-closure.md, r13-m10-002-retrospective.md.
-
-**End of round plan.**
+**End of revised round plan.**
