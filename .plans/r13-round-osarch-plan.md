@@ -139,7 +139,7 @@ Predicted paideia-as version at R13 close: v0.13.0 (5-6 encoder additions).
 
 - **m5-001** MSR setup (S) — LSTAR/STAR/FMASK/KERNEL_GS_BASE. Same as Rev 1 m4-001.
 - **m5-002** Syscall entry trampoline (M) — Same as Rev 1 m4-002.
-- **m5-003** Syscall table (S) — Expanded from Rev 1 m4-003: 12 syscalls now (add SYS_FORK=4, SYS_EXEC=5, SYS_WAIT=6, SYS_SIGACTION=7, SYS_SIGRETURN=8, SYS_MMAP=9, SYS_OPEN=10, SYS_CLOSE=11).
+- **m5-003** Syscall table (S) — 13 native syscalls per preflight §C (frozen 2026-07-02): sys_exit_thread(0), sys_yield(1), sys_ipc_send(2), sys_ipc_recv(3), sys_cap_invoke(4), sys_cap_mint(5), sys_cap_query(6), sys_signal_register(7), sys_signal_return(8), sys_cpu_id(9), sys_sipi_target(10), sys_kpti_enable(11), sys_debug_puts(12). ABI: rdi/rsi/rdx/r10 args, rax result. POSIX shim (SYS_FORK/EXEC/WAIT/SIGACTION/etc.) is a userland-layer concern deferred to R13-m9+/R14; do NOT collide these IDs with native syscalls.
 
 ### m6 — Full Cap Dispatch (10 kinds)
 
