@@ -22,7 +22,9 @@ OUTPUT_FORMAT(elf64-x86-64)
 OUTPUT_ARCH(i386:x86-64)
 ENTRY(_pvh_entry)
 
-/* Higher-half kernel base (placeholder; not yet active). */
+/* Higher-half kernel base. R13-m3-001 Phase 1 (#445): PML4[256] alias now
+ * installed, mapping 0xFFFF_8000_0000_0000 through the same PDPT as 0x0.
+ * Execution remains in low VA until Phase 2 (#480) relocates kernel VMA. */
 KERNEL_VMA_HIGHER_HALF = 0xFFFFFFFF80000000;
 
 /* Phase-1 load address (1 MiB physical, identity-mapped virtual). */

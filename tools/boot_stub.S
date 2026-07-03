@@ -32,6 +32,15 @@ _pvh_entry:
     movl $0xC0000083, pdpt + 24
     movl $0,          pdpt + 28
 
+    # R13-m3-001 Phase 1 (#445): higher-half aliasing.
+    # PML4[256] mirrors PML4[0] so VA 0xFFFF_8000_XXXX_XXXX resolves via
+    # the same PDPT (identity map). Installs the mapping only; execution
+    # remains at low VA. Phase 2 (#480) relocates kernel VMA.
+    movl $pdpt, %eax
+    orl  $0x03, %eax               # RW | P
+    movl %eax, pml4 + (256 * 8)    # PML4[256].lo = PDPT phys | flags
+    movl $0,   pml4 + (256 * 8) + 4  # PML4[256].hi = 0
+
     # CR3 <- pml4
     movl $pml4, %eax
     movl %eax, %cr3
