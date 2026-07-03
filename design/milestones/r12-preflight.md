@@ -290,15 +290,17 @@ Consequence: a future maintainer looking for the KIND_PAGE handler can search fo
 `src/kernel/core/cap/tags.pdx` (new, m1-002) defines all human-readable tag strings as `.rodata` symbols:
 
 ```
-pub let cap_mem_msg : [u8; 15] = "CAP INVOKE MEM\n"
-pub let cap_ipc_msg : [u8; 15] = "CAP INVOKE IPC\n"
-pub let cap_sched_msg : [u8; 17] = "CAP INVOKE SCHED\n"
-pub let cap_dev_msg : [u8; 15] = "CAP INVOKE DEV\n"
-pub let cap_dispatch_ok_msg : [u8; 17] = "CAP DISPATCH OK\n"
-pub let cap_denied_msg : [u8; 12] = "CAP DENIED\n"
+pub let cap_mem_msg : [u8; 16] = "CAP INVOKE MEM\n\0"
+pub let cap_ipc_msg : [u8; 16] = "CAP INVOKE IPC\n\0"
+pub let cap_sched_msg : [u8; 18] = "CAP INVOKE SCHED\n\0"
+pub let cap_dev_msg : [u8; 16] = "CAP INVOKE DEV\n\0"
+pub let cap_dispatch_ok_msg : [u8; 17] = "CAP DISPATCH OK\n\0"
+pub let cap_denied_msg : [u8; 12] = "CAP DENIED\n\0"
 ```
 
 Each handler emits its tag by loading the symbol address and calling `uart_puts(tag_addr)`.
+
+**NUL terminator note**: `uart_puts` (uart.pdx) walks bytes until encountering `\0`. All six strings MUST include the terminating NUL byte. The byte-count array `[16, 16, 18, 16, 17, 12]` reflects NUL-inclusive sizes.
 
 **Finding (E)**: OK — Per-handler file layout pinned. Four files (kind_page.pdx, kind_ipc.pdx, kind_sched.pdx, kind_dev.pdx), one handler each. MECE invariant preserved. invoke.pdx as central dispatcher. tags.pdx as shared string table.
 
@@ -451,4 +453,381 @@ Mirroring the plan §4 m1-001 acceptance criteria:
 **Prepared**: 2026-07-02  
 **paideia-os SHA**: (to be filled on commit)  
 **paideia-as pin**: 43d62f9 (v0.11.0+19)  
-**Document Status**: Ready for implementation with m1-002 (dispatch architecture pin, tags.pdx, audit entries)
+**Document Status**: Extended by sections K–O below (m1-002 dispatch architecture pin).
+
+---
+
+## Section K — Dispatch style A1 (direct branch)
+
+**Preamble**: The cap_invoke_dispatch dispatcher (invoke.pdx, m2-001) must execute a four-way branch on the `kind` field of the capability descriptor. This section pins the dispatch style and refutes alternatives.
+
+### K — Pin statement (A1: direct conditional jumps)
+
+The dispatcher reads `descriptor.kind` and performs four back-to-back conditional comparisons:
+
+```
+mov rax, [descriptor + 0]          # Load kind field (first u64)
+cmp rax, 4                         # KIND_PAGE
+je call_handler_page
+cmp rax, 5                         # KIND_IPC_ENDPOINT
+je call_handler_ipc
+cmp rax, 7                         # KIND_SCHED_CTX
+je call_handler_sched
+cmp rax, 10                        # KIND_DEVICE
+je call_handler_dev
+# No match: fall through to R8 MVP or return INVOKE_UNSUPPORTED
+```
+
+Four comparisons, each followed by a conditional je (jump-if-equal). If no match, control falls through (or jumps to a default error path). This style is called **A1: direct-branch dispatch**.
+
+### K.1 Options table
+
+| Style | Dispatch mechanism | Latency (worst case) | Code size | Debuggability |
+|---|---|---|---|---|
+| **A1: Direct cmp/je** | Four sequential cmp+je pairs | 4 comparisons (N=4) | ~28 bytes | objdump-clear; breakpoints per handler |
+| A2 (deferred R13): Indexed jump table | Load kind; index into array of jump targets | 1 array load + 1 jump | ~16 bytes (table) | Requires symbol relocation; harder to debug |
+
+**A1 is pinned for R12.**
+
+### K.2 Rationale (3 points)
+
+1. **Four kinds are small.** N=4 comparisons is negligible (0.1 μs on modern CPU). Jump table would save ~8 bytes but introduces array-indexing bounds-checking complexity (R13+ concern).
+
+2. **objdump-debuggable.** The sequence `cmp rax, 4; je ...` is human-readable in disassembly and trivial to set breakpoints on with a debugger. Indexed jump table requires understanding the table layout and relocation semantics.
+
+3. **.bss layout deferral.** Direct branches do NOT require a `.rodata` dispatch table, so .bss layout remains deferred to R13+ (when jump-table optimization might be worthwhile).
+
+### K.3 Rejected: A2 (indexed jump table)
+
+**Why not use a jump-table array indexed by kind?**
+
+```
+# A2 alternative (NOT chosen for R12):
+mov rax, [descriptor + 0]                  # Load kind
+lea rcx, [rip + dispatch_table]           # Load table address
+mov r11, [rcx + rax * 8]                  # Index table (assumes kind <= table size)
+jmp r11                                    # Indirect jump
+```
+
+**Deferred to R13.** A2 requires bounds-checking (kind must be in range [0, table_size-1]) or a sparse-table encoding (both R13+ complexity). R12's four kinds warrant direct comparison.
+
+**Migration path (A1 → A2)**: If R13 adds >8 kinds, replace the four cmp/je pairs with a single indexed load+jmp. No handler code changes required.
+
+**Finding (K)**: OK — A1 (direct-branch dispatch with four cmp/je pairs) pinned for R12. Rationale: small N, debuggable, defers .bss layout. A2 (indexed table) deferred to R13+ if kind count exceeds 8.
+
+---
+
+## Section L — Rights-check placement B1 (per-handler)
+
+**Preamble**: Each per-kind handler (kind_page.pdx, kind_ipc.pdx, kind_sched.pdx, kind_dev.pdx) must check whether the capability's rights bitmask includes the required rights for the requested operation. This section pins where that check occurs.
+
+### L — Pin statement (B1: per-handler rights-check)
+
+Each handler performs its own rights validation **immediately after decoding the op_code**, before executing the underlying operation:
+
+```
+handler_kind_page(descriptor_addr, op_arg):
+    op_code = op_arg & 0xFF
+    if op_code == OP_READ:
+        rights = [descriptor_addr + 8]  # Load rights field
+        if (rights & 0x01) != 0x01:     # RIGHT_READ required
+            emit "CAP DENIED\n"
+            return INVOKE_DENIED
+        # proceed with read...
+    elif op_code == OP_WRITE:
+        rights = [descriptor_addr + 8]
+        if (rights & 0x02) != 0x02:     # RIGHT_WRITE required
+            emit "CAP DENIED\n"
+            return INVOKE_DENIED
+        # proceed with write...
+```
+
+Each handler owns its rights-check logic. No centralized rights-dispatcher in invoke.pdx.
+
+### L.1 Rationale (3 points)
+
+1. **Self-contained handler.** Each handler file (kind_page.pdx, etc.) is a complete, standalone module. Placing rights-check inside the handler keeps all logic for that kind in one place. A maintainer reading kind_page.pdx sees both dispatch and rights-check together.
+
+2. **Per-operation granularity.** Different operations on the same kind may require different rights. For example, KIND_PAGE has OP_READ (requires RIGHT_READ) and OP_WRITE (requires RIGHT_WRITE). Per-handler placement allows each op to have its own check (no need for a rights-dispatcher to know about all (kind, op) pairs).
+
+3. **Bounded code duplication.** The per-handler pattern results in 3–4 instructions of duplication per handler (load rights, and mask, cmp, jne). Four handlers × 3 instructions = 12 instructions total. Acceptable for R12; R13+ may explore centralized rights-checking if kind count exceeds 8 and duplication becomes problematic.
+
+### L.2 Rejected: B2 (centralized rights-dispatcher)
+
+**Why not have a separate rights-checking dispatcher in invoke.pdx?**
+
+```
+# B2 alternative (NOT chosen for R12):
+invoke.pdx:
+  read descriptor
+  read rights
+  read kind
+  call rights_dispatcher(kind, op_code, rights)  # Central rights check
+  if denied:
+    emit "CAP DENIED\n"
+    return INVOKE_DENIED
+  call kind-specific handler (without rights-check)
+```
+
+**Deferred to R13+.** A centralized dispatcher would require:
+1. A table of (kind, op_code) → required_rights mappings (additional .rodata).
+2. Lookups in that table before handler dispatch.
+3. Handler refactoring to remove embedded rights-checks.
+
+This is a net addition of complexity for R12. When kind × op > 4×2 (i.e., >8 distinct (kind, op) pairs), R13+ may revisit this. For now, R12 uses B1 (per-handler).
+
+**Finding (L)**: OK — B1 (per-handler rights-check, immediately after op-code decode) pinned for R12. Rationale: self-contained handlers, per-op granularity, bounded 3–4-instruction duplication acceptable for 4 kinds. B2 (centralized) deferred to R13+ if kind × op grows beyond 8.
+
+---
+
+## Section M — Descriptor read pattern + handler-arg convention
+
+**Preamble**: The dispatcher in invoke.pdx reads three fields from the capability descriptor: `kind` (offset 0), `rights` (offset 8), and `target_ptr` (offset 16). Handlers receive arguments in x86-64 calling convention registers (rdi, rsi, rdx). This section pins the descriptor-read pattern and documents the register-hazard crossing. The descriptor is **24 bytes** (kind@0, rights@8, target_ptr@16, each u64) — identical to the layout used by the R8 MVP dispatch in `src/kernel/core/cap/invoke.pdx` (`slot*8 + slot*16 = slot*24`).
+
+### M — Pin statement (slot-arithmetic prologue + descriptor read + handler ABI)
+
+```
+; ENTRY:   rdi = slot            (from caller cap_invoke)
+;          rsi = op_arg          (from caller cap_invoke)
+;
+; Slot-arithmetic prologue (identical to B5-004 MVP):
+mov rax, cap_table           ; rax = &cap_table
+mov r8, rdi                  ; r8 = slot
+shl r8, 3                    ; r8 = slot * 8
+mov r9, rdi                  ; r9 = slot
+shl r9, 4                    ; r9 = slot * 16
+add r8, r9                   ; r8 = slot * 24
+add rax, r8                  ; rax = &cap_table + slot*24 = &descriptor
+;
+; Descriptor field reads (three loads):
+mov rcx, [rax + 0]           ; rcx = descriptor.kind
+mov rdx, [rax + 8]           ; rdx = descriptor.rights
+mov r10, [rax + 16]          ; r10 = descriptor.target_ptr
+;
+; Handler-ABI setup — HAZARD ZONE:
+;   Incoming rsi (op_arg) MUST be saved before rsi is overwritten with target_ptr.
+;   First hazard-crossing move: `mov r11, rsi` — this is the operation that
+;   makes the rest of the sequence safe. All subsequent moves may proceed
+;   in any order because r11 now holds op_arg.
+mov r11, rsi                 ; <-- FIRST HAZARD-CROSSING MOVE
+                             ;     r11 = op_arg (saved from rsi)
+mov rdi, rdx                 ; rdi = rights (handler arg 1)
+mov rsi, r10                 ; rsi = target_ptr (handler arg 2) — rsi now clobbered but safe
+mov rdx, r11                 ; rdx = op_arg (handler arg 3)
+;
+; Kind switch (A1 direct branch):
+cmp rcx, 4;  je call_kind_page          ; KIND_PAGE
+cmp rcx, 5;  je call_kind_ipc           ; KIND_IPC_ENDPOINT
+cmp rcx, 7;  je call_kind_sched         ; KIND_SCHED_CTX
+cmp rcx, 10; je call_kind_dev           ; KIND_DEVICE
+;
+; Fallthrough: R8 MVP behaviour — return target_ptr
+mov rax, rsi                 ; rax = target_ptr
+ret
+```
+
+The `mov r11, rsi` at line 17 is the **first hazard-crossing move**. Before that instruction, `rsi` still holds `op_arg` from the caller. After it, r11 is the sole holder; rsi may be freely overwritten. The two subsequent moves (`mov rsi, r10`, `mov rdx, r11`) both clobber and read op_arg-carrying registers in a way that is only safe because r11 is the intermediate. Per System V AMD64 ABI, r11 is caller-saved (scratch) and no live value survives in it — safe to use as the hazard-bridge register.
+
+**Handler ABI (x86-64 calling convention)**: arguments are passed in order:
+- **RDI** (1st arg): rights (descriptor.rights)
+- **RSI** (2nd arg): target_ptr (descriptor.target_ptr)
+- **RDX** (3rd arg): op_arg (saved via r11)
+
+Result returned in RAX (x86-64 return value register).
+
+### M.1 Rationale (2 points)
+
+1. **Predictable memory layout.** Descriptors are fixed-size (24 bytes) and densely packed in `cap_table`. Slot arithmetic (`slot*8 + slot*16 = slot*24`) reuses the exact prologue proven in B5-004 MVP. Three consecutive u64 reads at predictable offsets (0, 8, 16) minimize cache misses.
+
+2. **Hazard-crossing annotation enables m2-001 verification.** The register-hazard analysis required by m2-001 (issue #405) must enumerate every move that crosses from one logical "hazard group" to another. `mov r11, rsi` is such a crossing because it is the last read of the caller's incoming `op_arg` from `rsi` before `rsi` is repurposed as a handler argument register. Annotating this crossing in the documentation allows m2-001 to verify that no data-dependent operation occurs before the hazard is resolved. Only caller-saved scratch registers (r8, r9, r10, r11) are used in this sequence — r12 (callee-saved per System V AMD64 ABI) is never touched, so no push/pop is required.
+
+### M.2 Finding and cross-reference
+
+The register-hazard-crossing move `mov r11, rsi` is annotated in design/audit/entries/r12-m1-002-dispatch-arch.md §2 (register-hazard analysis). This ensures traceability and allows future reviewers to understand where each hazard crossing occurs in the dispatch sequence.
+
+**Finding (M)**: OK — Descriptor-read pattern pinned (24-byte descriptor; 3×u64 reads at offsets 0, 8, 16 via slot*24 arithmetic). Handler ABI established (RDI=rights, RSI=target_ptr, RDX=op_arg via r11). Register-hazard-crossing annotation in place for m2-001 audit (`mov r11, rsi`). All scratch registers are caller-saved (r8, r9, r10, r11); r12 is never used, so no callee-saved register is clobbered. No blocking concerns.
+
+---
+
+## Section N — Return-code convention
+
+**Preamble**: Each handler returns a u64 sentinel value indicating the outcome: success (operation-specific), denial (rights failed), or unsupported operation. This section pins the sentinel values and their ranges.
+
+### N — Pin statement (two new sentinels + kind-specific success values)
+
+**High-sentinel range** (0xFFFFFFFFFFFFFFFF down to 0xFFFFFFFFFFFFFFF0):
+
+| Sentinel name | Hex value | Meaning | Milestone |
+|---|---|---|---|
+| INVOKE_RESULT_INVALID_HANDLE | 0xFFFFFFFFFFFFFFFE | Invalid cap slot (R8 MVP) | R8 |
+| **INVOKE_DENIED** | **0xFFFFFFFFFFFFFFFD** | Rights check failed | **R12-m1-002** |
+| **INVOKE_UNSUPPORTED** | **0xFFFFFFFFFFFFFFFC** | Operation not implemented for kind | **R12-m1-002** |
+
+All three are "high sentinels" (top 3 bits set in the u64 value), distinguishing them from normal operation results (which fit in lower bits).
+
+### N.1 Kind-specific success values
+
+For each (kind, op) pair that succeeds, the handler returns a kind-specific value:
+
+| Kind | Op | Op name | Success return value (R12) | Meaning |
+|---|---|---|---|---|
+| KIND_PAGE (4) | 1 | OP_READ | 0x0000000000000001 | Read completed; 1 page copied |
+| KIND_PAGE (4) | 2 | OP_WRITE | 0x0000000000000002 | Write completed; 2 pages modified |
+| KIND_IPC_ENDPOINT (5) | 3 | OP_SEND | 0x0000000000000003 | Message sent; 3 words enqueued |
+| KIND_IPC_ENDPOINT (5) | 4 | OP_RECV | 0x0000000000000004 | Message received; 4 words dequeued |
+| KIND_SCHED_CTX (7) | 5 | OP_YIELD | 0x0000000000000005 | Yield succeeded; 5 = priority-level |
+| KIND_DEVICE (10) | 6 | OP_MAP_MMIO | 0x0000000000000006 | MMIO region mapped; 6 = region ID |
+
+These values are arbitrary but chosen to match their op_code for clarity (return value often equals op_code when operation succeeds).
+
+### N.2 Rationale (3 points)
+
+1. **High-sentinel range avoids collision.** Using 0xFFFFFFFFFFFFFFFD and 0xFFFFFFFFFFFFFFFC ensures that legitimate operation results (positive integers, pointer values) never alias sentinel values. No handler should legitimately return 0xFFFFFFFFFFFFFFFE–0xFFFFFFFFFFFFFFFF; those values are reserved.
+
+2. **KIND_DEVICE ambiguity flagged.** For KIND_DEVICE, OP_MAP_MMIO, the success return value (0x06) is arbitrary. Future operations on KIND_DEVICE may need to distinguish "region 0x06" from "region 0x07", at which point the return-value encoding may need revision. For R12, a single OP_MAP_MMIO is sufficient; R13+ can extend if needed. This ambiguity is flagged here for transparency.
+
+3. **Default fallthrough preserves R8 cap_smoke.** If an unknown op_code is encountered, the dispatcher falls through and returns INVOKE_UNSUPPORTED. R8's cap_smoke test (which invokes only valid operations) continues to pass because valid operations return success sentinels (not INVOKE_UNSUPPORTED).
+
+### N.3 Rejected: single-error-sentinel
+
+**Why not use a single error sentinel (e.g., INVOKE_ERROR = 0xFFFFFFFFFFFFFFFD)?**
+
+If all errors (denied, unsupported, invalid-handle) returned the same sentinel, the caller would not know which error occurred. By using three distinct sentinels, the caller can distinguish:
+- 0xFFFFFFFFFFFFFFFE (INVOKE_RESULT_INVALID_HANDLE) → slot out of range
+- 0xFFFFFFFFFFFFFFFD (INVOKE_DENIED) → rights check failed
+- 0xFFFFFFFFFFFFFFFC (INVOKE_UNSUPPORTED) → op not implemented
+
+R12 pins three distinct sentinels. Future error recovery (R13+) may encode error details in lower bits (e.g., 0xFFFFFFFFFFFFFFD0 | error_code), but that is deferred.
+
+**Finding (N)**: OK — Return-code convention pinned. Three high sentinels (INVOKE_RESULT_INVALID_HANDLE, INVOKE_DENIED, INVOKE_UNSUPPORTED). Six (kind, op) → success-value entries. Default fallthrough returns INVOKE_UNSUPPORTED, preserving R8 regression. KIND_DEVICE ambiguity documented for R13+ review.
+
+---
+
+## Section O — COM1 tag discipline
+
+**Preamble**: Each handler emits a human-readable tag string to COM1 UART as the first substantive action after operation decode. This section pins the tag-emission point, the six tag strings, and confirms the E.2 byte-length errata.
+
+### O — Pin statement (tag-emission point, strings, and errata)
+
+**Tag-emission point (timing)**: Immediately after decoding op_code and **before** performing the rights-check.
+
+**Why?** If rights-check fails, the tag "CAP DENIED" is emitted (clearly indicating which operation was denied). If op is unsupported, "CAP UNSUPPORTED" is emitted. This ordering ensures diagnostic clarity: every cap_invoke attempt produces output, even failed ones.
+
+**Six tag strings** (from tags.pdx, m1-002):
+
+| String symbol | Hex value (with NUL) | Byte length (NUL-inclusive) |
+|---|---|---|
+| cap_mem_msg | "CAP INVOKE MEM\n\0" | 16 |
+| cap_ipc_msg | "CAP INVOKE IPC\n\0" | 16 |
+| cap_sched_msg | "CAP INVOKE SCHED\n\0" | 18 |
+| cap_dev_msg | "CAP INVOKE DEV\n\0" | 16 |
+| cap_dispatch_ok_msg | "CAP DISPATCH OK\n\0" | 17 |
+| cap_denied_msg | "CAP DENIED\n\0" | 12 |
+
+Each handler loads its corresponding symbol via `lea rax, [rip + cap_mem_msg]` and calls `uart_puts(rax)`.
+
+### O.1 Byte-length errata note (§E.2 correction)
+
+**Issue discovered in m1-001 review**: The original byte counts in §E.2 (sections A–J, issue #404) were calculated without the NUL terminator. The `uart_puts` function (uart.pdx) walks bytes until encountering `\0`; omitting NUL runs off-buffer.
+
+**Correction (landing with m1-002)**:
+
+Original (wrong):
+```
+pub let cap_mem_msg : [u8; 15] = "CAP INVOKE MEM\n"
+pub let cap_ipc_msg : [u8; 15] = "CAP INVOKE IPC\n"
+pub let cap_sched_msg : [u8; 17] = "CAP INVOKE SCHED\n"
+pub let cap_dev_msg : [u8; 15] = "CAP INVOKE DEV\n"
+pub let cap_dispatch_ok_msg : [u8; 17] = "CAP DISPATCH OK\n"
+pub let cap_denied_msg : [u8; 12] = "CAP DENIED\n"
+```
+
+Corrected (with NUL and updated byte counts):
+```
+pub let cap_mem_msg : [u8; 16] = "CAP INVOKE MEM\n\0"
+pub let cap_ipc_msg : [u8; 16] = "CAP INVOKE IPC\n\0"
+pub let cap_sched_msg : [u8; 18] = "CAP INVOKE SCHED\n\0"
+pub let cap_dev_msg : [u8; 16] = "CAP INVOKE DEV\n\0"
+pub let cap_dispatch_ok_msg : [u8; 17] = "CAP DISPATCH OK\n\0"
+pub let cap_denied_msg : [u8; 12] = "CAP DENIED\n\0"
+```
+
+Byte-count array (for reference): [16, 16, 18, 16, 17, 12].
+
+### O.2 Rationale (3 points)
+
+1. **Diagnostic completeness.** Tag emission before rights-check ensures that every cap_invoke attempt is logged (including failures). Boot-time fingerprints (verification in R12-m5) include these tags, making test execution auditable.
+
+2. **Lazy evaluation safety.** Tags are emitted before any heavy operation (rights-check, memory access). If a handler encounters a fault (e.g., invalid descriptor pointer), the tag has already been safely written to COM1, providing a last-breath diagnostic.
+
+3. **NUL-termination correctness.** uart_puts expects zero-terminated strings. Including NUL in the byte array ensures correctness and safety; omitting NUL causes buffer overrun (and random output until a zero byte is found in memory).
+
+### O.3 Alternative rejected (strings in boot_stub.S)
+
+**Why not store tag strings in boot_stub.S (like R8–R11 banner messages)?**
+
+R8–R11 pattern for banner strings:
+```asm
+# R10-m4-002: Task A entry message
+.global _task_a_msg
+.align 8
+_task_a_msg:
+    .ascii "TASK A\n\0"
+```
+
+This works for static boot-time messages (banner, task entry). However, for R12, tag strings are emitted from *multiple independent handler modules* (kind_page.pdx, kind_ipc.pdx, etc.). Storing all six tags in boot_stub.S would:
+1. Centralize handler state in a boot-only file (violates MECE invariant).
+2. Require extern linkage from each handler module to boot_stub.S (cross-module coupling).
+3. Make handler code less self-contained.
+
+**Decision (PA10-002 precedent)**: R12 stores tags in tags.pdx (a capability-system module file), not boot_stub.S. This preserves the per-kind module boundary (MECE) and keeps handler-related state in the handler-system code. PA10-002 (issue #386) established that capability-system strings live in capability-system modules; boot_stub.S is reserved for boot-sequence diagnostics only.
+
+(Note: this design decision supersedes any earlier plan that mentioned boot_stub.S. PA10-002 CHANGELOG entry confirms the tags.pdx approach as shipped for R11; R12 reuses the same pattern.)
+
+**Finding (O)**: OK — Tag-emission point pinned (immediately after op-code decode, before rights-check). Six tag strings defined with NUL-inclusive byte counts [16, 16, 18, 16, 17, 12]. Byte-length errata (§E.2) corrected and documented. Strings localized to tags.pdx per MECE and PA10-002 precedent. Boot_stub.S alternative considered and rejected.
+
+---
+
+## Section H* — Extended acceptance criteria (m1-002 dispatch architecture)
+
+Expansion of §H to reflect m1-001 and m1-002:
+
+- [ ] `design/milestones/r12-preflight.md` complete with sections A–O (preflight + dispatch pin).
+- [ ] Section K (A1 direct-branch dispatch) pins four-way cmp/je pattern and rationale.
+- [ ] Section L (B1 per-handler rights-check) pins placement and duplication bounds.
+- [ ] Section M (descriptor-read pattern) documents three u64 reads and register-hazard crossing (first hazard-crossing move annotated).
+- [ ] Section N (return-code convention) establishes three high sentinels and six kind-specific success values.
+- [ ] Section O (COM1 tag discipline) defines six tag strings with NUL-inclusive byte counts; errata (§E.2) corrected.
+- [ ] `src/kernel/core/cap/tags.pdx` created with six `pub let` symbols matching section O spec.
+- [ ] `design/audit/entries/r12-m1-002-dispatch-arch.md` created with 10 sections, register-hazard annotation, and traceability.
+- [ ] No paideia-as escalation blocks m1-002.
+- [ ] Smoke tests pass: `boot_r8_only`, `boot_r10`, `boot_r11` (regression verification).
+
+---
+
+## Section I* — Cross-references extension (m1-002)
+
+Expansion of §I to include m1-002 references:
+
+- **Issues**: #404 (r12-m1-001), **#405 (r12-m1-002)**
+- **Round plan**: `.plans/r12-round-osarch-plan.md` §§2.1 (encoder verification), 2.4 (op_arg encoding), 2.5 (kind-name mapping), 3 (dispatch-architecture), 4 (acceptance criteria, m1-001 and m1-002)
+- **Audit trail**: `design/audit/entries/r12-m1-002-dispatch-arch.md` (register hazards, return-code convention, tag discipline)
+- **Design references** (additions):
+  - `design/audit/entries/r11-m3-001-sched-save-frame.md` (register-hazard precedent and verification discipline)
+- **Source files** (additions):
+  - `src/kernel/core/cap/tags.pdx` (tag string constants, m1-002)
+- **Related milestones**:
+  - R12-m2-001, m2-002: Kind-branching skeleton + per-kind dispatch (issue #405)
+  - R12-m3-001, m3-002: MEM + SCHED handlers (issues #406–#407)
+  - R12-m4-001, m4-002: IPC + DEV handlers (issues #408–#409)
+  - R12-m5-001 through m5-003: Smoke + fingerprint + regression (issues #410–#412)
+
+---
+
+## Section P — Extended trailer (prepared 2026-07-02 for #404+#405)
+
+**Prepared**: 2026-07-02  
+**Issue**: #404 (r12-m1-001) + **#405 (r12-m1-002)**  
+**paideia-os SHA**: (to be filled on commit)  
+**paideia-as pin**: 43d62f9 (v0.11.0+19)  
+**Document Status**: Ready for m2-001/m2-002 (kind-branching skeleton + per-kind dispatch).
