@@ -466,3 +466,73 @@ TASK A
 - Real MM-backed OP_MAP_MMIO (currently uses request_mmio_mapping synthesized vaddr)
 
 **Next Round:** R13 (Multicore recommended Path A, or MM API / handler-table alternatives) — See `design/milestones/r13-kickoff.md`
+
+---
+
+## R13 (Cap-Dispatch Surface + Syscall Table) — CLOSED (PARTIAL)
+
+R13 was scoped as a full userspace + interactive shell round. Ring-3 was blocked on a substrate chain that R13 uncovered by trying to reach it; R13 instead landed the cap-dispatch surface, the SYSCALL/SYSRET entry path, the MMU-hardening perimeter, and the user-space source tree — the substrate R14 will execute against. Real ring-3 lands in R14.
+
+### Landed (15 issues, real bodies or structural stubs)
+
+- **M1** (#417, #418): pre-flight audit + 7-decision architecture pin (GDT byte layout, syscall MSRs, higher-half kernel VA, KPTI PGD, per-CPU struct, IPI vector table, signal frame, ELF-lite).
+- **M2** (#419, #420, #421, #422, #444): phys_alloc bump allocator (grown to 1024-page pool), aspace_map real 4-level PT walker + INVLPG, aspace_create real body, aspace_unmap + shootdown mailbox, buddy allocator interface parking.
+- **M3** (#445, #446, #447, #448, #449): PML4[256] higher-half alias (Phase 1), KPTI PGD-copy stub, SMEP enable, SMAP enable, NX enable (all with CPUID guards).
+- **M4** (#423, #425, #426, #450): real 8-slot GDT with SYSRET-compatible layout, IST stacks for DF/NMI/MC, IDT IST-field rewire for vec 2/8/14/18, KIND_DEVICE OP_MAP_MMIO vaddr-synthesis retained (real aspace_map deferred to R14).
+- **M5** (#427, #428, #429): five MSR pins (EFER.SCE, STAR = 0x0018000800000000, LSTAR, FMASK = 0x47700, KERNEL_GS_BASE), real SYSCALL entry trampoline with SysV ABI shuffle + sysret, 13-entry syscall table per preflight §C (3 real handlers: sys_yield, sys_cap_invoke, sys_debug_puts; 10 ENOSYS with per-handler deferral rationale).
+- **M6** (#430, #431, #451, #452, #453, #454, #455): 5 real handlers (KIND_THREAD, KIND_IPC_PORT, KIND_TIMER, KIND_NOTIFICATION, KIND_REPLY); 3 structural stubs with pinned data models (KIND_PROCESS, KIND_PAGE_TABLE, KIND_INTERRUPT); dispatch surface extended from 4 to 10 real + 2 structural branches.
+- **M7** (#432, #433, #434): src/user/ source tree — shell.pdx (§C-native straight-line main), syscall_shim.pdx (4 wrappers), io.pdx + builtins.pdx. Not compiled at R13 (tools/build.sh globs only src/kernel/).
+
+### Deferred to R14 (22 issues) — backtracking records #481–#486
+
+- **M4-002** (#424): TSS install + ltr — OPEN, blocked on PA-R13-001 (paideia-as #914).
+- **M8** (m8-001 / m8-002 / m8-003, 3 issues): kernel-user transition bundle — deferral record #484. Blocker chain: aspace_map huge-page fix → TSS+ltr (#424) → user-linker + build/shell.bin → cap_smoke migration (#482).
+- **Rev-1 m8 shell v2** (#438, #439): interactive shell — deferral record #483 (no sys_read in §C).
+- **Rev-1 m9 smoke** (#440, #441): depends on ring-3.
+- **Rev-2 m9 VFS** (#456–#460, 5 issues): bundle #485.
+- **Rev-2 m10 fork/exec/wait** (#461–#465, 5 issues): bundle #486, blocked on PA-R13-012 (paideia-as #925: xchg / lock cmpxchg / lock prefix).
+- **Rev-2 m11 signals** (#466–#469, 4 issues): requires sys_signal_register/return + signal-frame push.
+- **Rev-2 m12 exec builtin** (#470, 1 issue): requires m10 exec.
+- **Rev-2 m13 multicore** (#471–#476, 6 issues): blocked on PA-R13-012 + gs: prefix + mfence.
+- **Rev-2 m14 preemption to ring-3** (#477, #478, 2 issues): requires TSS + ring-3 frames.
+- **Rev-2 m15 smoke** (#479, 1 issue): Rev-2 bundle fixture.
+
+### Cross-repo escalations (paideia-as, PA-R13)
+
+- **PA-R13-001** (#914): ltr r16 — blocks m4-002 → gates ring-3 exception delivery.
+- **PA-R13-009** (#922): sysret encoder — **withdrawn as invalid** (verified present at ae6039b: `encode_sysret()` produces `48 0F 07`).
+- **PA-R13-010** (#923): sub reg, imm — workaround `add r, 0xFF...FF` accepted.
+- **PA-R13-011** (#924): back-to-back label sharing — workaround duplicate-block accepted.
+- **PA-R13-012** (#925): xchg / lock cmpxchg / lock prefix — blocks spinlocks → blocks Rev-2 m10 + m13.
+
+### Observable Proof (regression envelope)
+
+**boot_r12 fingerprint preserved byte-identically** across every R13 landing:
+
+```
+B
+PaideiaOS R8
+CAP OK
+IPC OK
+CAP INVOKE MEM
+CAP INVOKE IPC
+CAP INVOKE SCHED
+CAP INVOKE DEV
+CAP DISPATCH OK
+IDT OK
+TASK A
+TASK B
+TASK A
+```
+
+**No `CAP INVOKE THREAD/PORT/TIMER/NOTIF/REPLY` line emits at boot.** The five new real handlers exist and route correctly through cap_invoke_dispatch, but the R8 cap_smoke fixture still mints only KIND_PAGE / KIND_IPC_ENDPOINT / KIND_SCHED_CTX / KIND_DEVICE. The new handler code is reachable but dead in the 5-mode smoke suite — precisely the R13 partial-closure reality. R14 lands the fixtures via cap_smoke migration (#482).
+
+**5-mode regression matrix on the closure commit set: 15/15 PASS** (boot_r8_only ×3, boot_r10 ×3, boot_r11 ×3, boot_r12 ×3, boot_r12_denial ×3). Every R13 audit's "Regression" section attests "Fingerprints byte-identical."
+
+### Round-over-round scope statement
+
+R13 was scoped as a full userspace + shell OS. Ring-3 was blocked; R13 landed the cap-dispatch surface + syscall table + user-space source tree instead. Real ring-3 lands in R14. The R13 substrate is what R14 executes against.
+
+**Pre-push hook:** Unchanged from R12 — gates on four modes (boot_r8_only, boot_r10, boot_r11, boot_r12).
+
+**Next Round:** R14 (Ring-3 First-Jump + Real m8 + Structural-Stub Promotions) — See forthcoming `design/milestones/r14-kickoff.md`. See `design/milestones/r13-closure.md` for the full round document.
