@@ -34,3 +34,5 @@ RDI ← as_root, RSI ← vaddr, RDX ← self_cpu
 ```
 After return, `shootdown_mailbox` has a set bit per other CPU and
 `shootdown_vaddr` holds the queued address.
+
+> Retired: 2026-07-03 by r13-m2-004-aspace-unmap (issue #422). Content preserved for historical reference.
