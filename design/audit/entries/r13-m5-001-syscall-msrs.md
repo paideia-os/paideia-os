@@ -152,3 +152,38 @@ The syscall_msr_init function and syscall_entry_stub are marked with `effects: {
 - **Intel SDM Vol 3A §6.15:** SYSCALL/SYSRET instruction reference.
 - **Intel SDM Vol 3A §4.2:** Model-Specific Registers (MSR).
 - **Linux arch/x86/include/uapi/asm/processor-flags.h:** SYSCALL_MASK constant (0x47700).
+
+## Correction Record — 2026-07-03 (PA-R13-009 Withdrawn)
+
+### Previous Incorrect Claims
+
+In the initial r13-m5-001 audit (lines 18, 87, 90):
+- **Line 18:** "paideia-as does not yet encode sysret/sysretq (escalation PA-R13-009)."
+- **Line 87:** "The stub is explicitly documented as temporary... uses a placeholder because paideia-as does not yet encode sysret/sysretq (escalation PA-R13-009)."
+- **Line 90:** "Safe because unreachable; the actual sysretq trampoline (PA-R13-009 pending) lands in #428."
+
+These claims were based on a faulty workerbee report and are now **INCORRECT**.
+
+### Current Verified Status (2026-07-03)
+
+**sysret IS FULLY SUPPORTED in paideia-as at pinned rev ae6039b.**
+
+Verification:
+1. **Mnemonic listed:** `unsafe_walker.rs:94` — `("sysret", Mnemonic::Sysret)`.
+2. **Encoder implemented:** `encode_instruction.rs` — `fn encode_sysret_inst(...)` calls `encode_sysret()`.
+3. **Encoding function:** `encode.rs` — `pub fn encode_sysret(buf: &mut CodeBuffer)` produces `48 0F 07`.
+4. **Correct opcode:** `48 0F 07` is the correct REX.W prefix + two-byte opcode for sysretq (64-bit mode).
+
+### Resolution
+
+1. **entry_stub.pdx is DELETED** (via git rm in #428 landing).
+2. **Real syscall_entry (with genuine sysret instruction) is installed** as IA32_LSTAR target in #428 (r13-m5-002).
+3. **PA-R13-009 (paideia-as #922) is WITHDRAWN as INVALID.**
+   - Issue: Escalation claimed sysret encoder was missing.
+   - Fact: sysret encoder exists and works correctly.
+   - Root cause: Faulty workerbee report in #427 landing.
+   - Fix: Correction comment posted to paideia-as #922; marked closed/invalid.
+
+### Impact on r13-m5-001 Audit
+
+The r13-m5-001 audit's safety argument (§IA32_LSTAR Stub Safety Argument) is now superseded. The real trampoline in #428 removes the "sysretq encoder pending" gap. No changes to this document's other sections are required; they remain valid. This correction record is added for future reference and traceability.
