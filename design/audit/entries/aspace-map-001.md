@@ -48,3 +48,5 @@ objdump -d aspace_map.o   # expect 4 indexed loads, up to 3 parent writes, 1 lea
 ```
 Behavioral test (R5.5-003): map vaddr 0x4000_0000 -> paddr 0x10_0000 RW; read
 back via a walk; expect the leaf PTE = 0x100000 | RW | PRESENT.
+
+> Retired: 2026-07-03 by r13-m2-002-aspace-map (issue #420). Content preserved for historical reference.
