@@ -2,6 +2,8 @@
 audit_id: r12-m1-003-tags-fallback-b
 issue: 405
 cross_repo: paideia-as#910
+status: RESOLVED (2026-07-02)
+resolution: paideia-as #910 fix landed at commit 26ba157; tags.pdx reverted to inline PRIMARY form; boot_stub.S trimmed of the 6 R12 tag globals.
 file: src/kernel/core/cap/tags.pdx, tools/boot_stub.S
 function: cap_mem_msg, cap_ipc_msg, cap_dev_msg, cap_sched_msg, cap_dispatch_ok_msg, cap_denied_msg
 effects: []
@@ -10,7 +12,27 @@ reviewed_by:
 date: 2026-07-02
 ---
 
-# AUDIT r12-m1-003 — tags.pdx Fallback B: Strings Sourced from boot_stub.S
+# AUDIT r12-m1-003 — tags.pdx Fallback B: Strings Sourced from boot_stub.S (RESOLVED)
+
+## Resolution notice
+
+paideia-as issue #910 (PA-R12-001) was fixed at commit 26ba157: cmd_build.rs's
+Let-RHS data-table population cascade now includes an `IrKind::StringLiteral`
+branch. `pub let X : [u8; N] = "..."` inside a module now emits a `.rodata`
+symbol with truncation or zero-padding to the declared N.
+
+paideia-os reverted to the PRIMARY form:
+- `src/kernel/core/cap/tags.pdx` now contains inline `pub let cap_X_msg : [u8; N] = "..."` declarations for all 6 strings.
+- `tools/boot_stub.S` trimmed of the 6 R12 tag globals (banner_msg, cap_ok_msg, ipc_ok_msg, idt_ok_msg, _tick_msg, _task_a_msg, _task_b_msg remain).
+- Handler references (flat `[rip + cap_X_msg]`) unchanged — they now resolve against tags.pdx symbols instead of boot_stub.S symbols. Byte-count semantics preserved: [16, 16, 18, 16, 17, 12].
+
+Verification: `nm build/core/cap/tags.o` shows 6 V symbols (was 0); `nm build/kernel.elf` shows the 6 symbols at 0x103ea0-0x103f00 range; regression matrix green.
+
+Historical record of the fallback preserved below for retrospective reference.
+
+---
+
+# Historical: tags.pdx Fallback B: Strings Sourced from boot_stub.S
 
 ## Overview
 
