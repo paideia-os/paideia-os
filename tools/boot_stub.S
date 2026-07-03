@@ -127,6 +127,37 @@ _task_a_msg:
 _task_b_msg:
     .ascii "TASK B\n\0"
 
+# R12-m1-002: Per-kind cap-invoke tag messages (fallback B — paideia-as issue #910)
+.global cap_mem_msg
+.align 8
+cap_mem_msg:
+    .ascii "CAP INVOKE MEM\n\0"
+
+.global cap_ipc_msg
+.align 8
+cap_ipc_msg:
+    .ascii "CAP INVOKE IPC\n\0"
+
+.global cap_dev_msg
+.align 8
+cap_dev_msg:
+    .ascii "CAP INVOKE DEV\n\0"
+
+.global cap_sched_msg
+.align 8
+cap_sched_msg:
+    .ascii "CAP INVOKE SCHED\n\0"
+
+.global cap_dispatch_ok_msg
+.align 8
+cap_dispatch_ok_msg:
+    .ascii "CAP DISPATCH OK\n\0"
+
+.global cap_denied_msg
+.align 8
+cap_denied_msg:
+    .ascii "CAP DENIED\n\0"
+
 .section .bss
 .align 4096
 .global pml4
