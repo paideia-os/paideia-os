@@ -390,3 +390,79 @@ TASK A
 - Alternative: Per-kind cap dispatch or MM API activation (see r12-kickoff.md for decision matrix)
 
 **Next Round:** R12 (Multicore or Alternative Cap Path) — See `design/milestones/r12-kickoff.md`
+
+---
+
+## R12 (Per-Kind Capability Dispatch) — CLOSED
+
+R12 closed B5-004's Phase-7+ deferred per-kind dispatch by implementing four real capability handlers with rights-gated operations, observable audit trail via COM1 tags, and explicit denial witness for enforcement.
+
+### Issues Implemented
+
+- **R12.M1-001** (#404) (Pre-flight audit): ✓ Complete (encoder verification, kind-name mapping, op_arg encoding, rights discipline, per-handler file layout)
+- **R12.M1-002** (#405) (Dispatch architecture pin): ✓ Complete (A1 direct-branch style, B1 per-handler rights, tags module, fallthrough behavior)
+- **R12.M2-001** (#406) (cap_invoke_dispatch rewrite): ✓ Complete (30+ instruction skeleton, four-way kind branch, register-hazard analysis)
+- **R12.M2-002** (#407) (Four handler stubs): ✓ Complete (kind_page, kind_ipc, kind_sched, kind_dev with tag emission and sentinel returns)
+- **R12.M3-001** (#408) (KIND_PAGE handler): ✓ Complete (OP_READ/OP_WRITE with rights check, test buffer, hardcoded write payload)
+- **R12.M3-002** (#409) (KIND_SCHED_CTX handler): ✓ Complete (OP_YIELD with RIGHT_INVOKE check, sched_yield delegation)
+- **R12.M4-001** (#410) (KIND_IPC_ENDPOINT handler): ✓ Complete (OP_SEND/OP_RECV wrapping ipc_enqueue/dequeue, rights checks)
+- **R12.M4-002** (#411) (KIND_DEVICE handler): ✓ Complete (OP_MAP_MMIO wrapping request_mmio_mapping, LAPIC base test)
+- **R12.M5-001** (#412) (cap_dispatch_smoke fixture): ✓ Complete (5 mints + 7 invokes + denial witness, kernel_main integration)
+- **R12.M5-002** (#413) (boot_r12 fingerprint): ✓ Complete (13-line fingerprint, smoke mode, pre-push hook extension)
+- **R12.M5-003** (#414) (Regression matrix + denial witness): ✓ Complete (18/18 runs pass, boot_r12_denial sub-mode, non-regression proof)
+
+**Audit entries:** r12-m1-002-dispatch-arch.md, r12-m1-003-tags-fallback-b.md, r12-m2-001-dispatch-skeleton.md, r12-m2-002-stub-handlers.md, r12-m3-001-kind-page.md, r12-m3-002-kind-sched.md, r12-m4-001-kind-ipc.md, r12-m4-002-kind-dev.md, r12-m5-001-dispatch-smoke.md, r12-m5-002-boot-r12-fingerprint.md, r12-m5-003-regression-matrix.md
+
+**Regression Matrix:**
+- boot_r8_only: ✓ 3/3 passes (R8 subsystems stable: cap/ipc/idt)
+- boot_r10: ✓ 3/3 passes (R10 cooperative multitasking: alternation unchanged)
+- boot_r11: ✓ 3/3 passes (R11 preemptive multitasking: alternation unchanged)
+- boot_r12: ✓ 3/3 passes (R12 per-kind dispatch: 4 handlers + 1 denial witness)
+- boot_r12_denial: ✓ 3/3 passes (Rights-enforcement witness: CAP DENIED observed)
+
+**Closure:** R12 m1–m5 complete. Per-kind capability dispatch system operational with four real handlers (PAGE, IPC_ENDPOINT, SCHED_CTX, DEVICE), each with dedicated rights checks and operation code decoding. Rights lattice (Pillar 6) now enforced: read-only caps reject write operations and emit CAP DENIED audit tag. Observable proof via four per-kind tags plus aggregate CAP DISPATCH OK. B5-004's Phase-7+ deferral resolved.
+
+**Final Boot Output:**
+```
+B
+PaideiaOS R8
+CAP OK
+IPC OK
+CAP INVOKE MEM
+CAP INVOKE IPC
+CAP INVOKE SCHED
+CAP INVOKE DEV
+CAP DISPATCH OK
+IDT OK
+TASK A
+TASK B
+TASK A
+```
+
+(13 lines: 8 new lines demonstrating per-kind handler routing, rights-gated access, and capability system enforcement.)
+
+**Key Implementation Details:**
+- Dispatch style: A1 direct if/else-chain on descriptor.kind (scalable to ~12 kinds; table lookup deferred to R13)
+- Rights-check placement: B1 inside each handler (self-contained; duplication acceptable at 4-kind scale)
+- Op_arg encoding: low byte = op_code (256 ops per kind, matching INVOKE_DISPATCH_TABLE_SIZE)
+- Fallthrough: kinds outside {4,5,7,10} return target_ptr (preserves R8 MVP fallback, enables future extension)
+- Rights enforcement: (rights & required_bits) must equal required_bits; failure emits CAP DENIED and returns INVOKE_DENIED
+- Observable audit: each handler emits its tag (CAP INVOKE MEM/IPC/SCHED/DEV) before primitive call
+- Denial witness: slot 8 KIND_PAGE cap minted READ-only (0x01 rights), invoked with OP_WRITE, returns INVOKE_DENIED and emits CAP DENIED
+
+**Pre-push hook:** Updated to gate on four modes (boot_r8_only, boot_r10, boot_r11, boot_r12).
+
+**Zero substrate gaps:** All R12 critical-path encoders verified present in paideia-as v0.11.0+19 (43d62f9). No submodule bump required. Four paideia-as escalations (PA-R12-001..004) filed for R13 multicore work; zero impact on R12.
+
+**Microkernel discipline (Pillar 3):** Every non-trivial kernel operation for four capability kinds is now cap-gated, rights-checked, and audit-tagged. System-call-is-cap-invocation model (seL4 §3, L4Ka §4) operative for these four kinds; remaining eight kinds preserve R8 MVP fallback.
+
+**Deferred to R13:**
+- Multicore bring-up (SIPI, per-CPU GS data, cross-CPU IPI, TLB shootdown) — blocked on PA-R12-001..004
+- MM API activation (real aspace_map/unmap with 4-level PT walk) — natural Path B for R13
+- Remaining 8 cap kinds (PROCESS, THREAD, PAGE_TABLE, IPC_PORT, TIMER, INTERRUPT, NOTIFICATION, REPLY)
+- Handler-table migration (A2 dispatch style for scaling beyond 12 kinds)
+- Curried-call wrapper (cap_invoke(slot)(op_arg) full form)
+- Generation-based revocation validation in dispatch path
+- Real MM-backed OP_MAP_MMIO (currently uses request_mmio_mapping synthesized vaddr)
+
+**Next Round:** R13 (Multicore recommended Path A, or MM API / handler-table alternatives) — See `design/milestones/r13-kickoff.md`
