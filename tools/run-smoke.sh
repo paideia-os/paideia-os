@@ -108,6 +108,12 @@ case "${EXPECTED}" in
         TIMEOUT=5
         EXPECTED=""
         ;;
+    boot_r14b_loader)
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r14b/expected-boot-r14b-loader.txt"
+        TIMEOUT=8
+        EXPECTED=""
+        ;;
     prod)
         # prod mode: expects exit code 2 (kernel didn't build)
         # Skip verification, just exit with code 2
