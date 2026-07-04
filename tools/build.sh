@@ -56,6 +56,6 @@ echo "[link] ld -T link.ld -> kernel.elf"
 # kernel returns through these stubs at runtime (no UART, no init) but the
 # image links and QEMU can load it. Real symbol-export lands in a later
 # paideia-as phase.
-ld -nostdlib -T "${LINK_SCRIPT}" -o "${BUILD_DIR}/kernel.elf" "${OBJECTS[@]}"
+ld -nostdlib --warn-common --fatal-warnings -T "${LINK_SCRIPT}" -o "${BUILD_DIR}/kernel.elf" "${OBJECTS[@]}"
 
 echo "[ok] ${BUILD_DIR}/kernel.elf"
