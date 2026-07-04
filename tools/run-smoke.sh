@@ -88,6 +88,12 @@ case "${EXPECTED}" in
         TIMEOUT=8
         EXPECTED=""
         ;;
+    boot_r14b_hivma)
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r14b/expected-boot-r14b-hivma.txt"
+        TIMEOUT=5
+        EXPECTED=""
+        ;;
     prod)
         # prod mode: expects exit code 2 (kernel didn't build)
         # Skip verification, just exit with code 2

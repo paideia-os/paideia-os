@@ -139,6 +139,12 @@ idt_ok_msg:
 tss_ok_msg:
     .ascii "TSS OK\n\0"
 
+# R14B-M3-008 (#496): Higher-half execution witness.
+.global hi_va_msg
+.align 8
+hi_va_msg:
+    .ascii "HI VA FFFF8000\n\0"
+
 # R9-m4-001: Tick worker message (emitted every K=16 IRQs)
 .global _tick_msg
 .align 8
