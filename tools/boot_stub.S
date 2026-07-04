@@ -195,6 +195,11 @@ _task_a_msg:
 _task_b_msg:
     .ascii "TASK B\n\0"
 
+# R15-M4-003 (#537): Exit marker message
+.global exit_marker_msg
+.align 8
+exit_marker_msg: .ascii "[exit]\n\0"
+
 .section .bss.boot, "aw", @nobits
 .align 4096
 .global pml4
