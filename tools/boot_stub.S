@@ -157,6 +157,16 @@ kpti_ok_msg:
 kpti_fail_msg:
     .ascii "KPTI FAIL\n\0"
 
+# R14b-m5-007 (#512): Self-IPI smoke success message
+.global ipi_ok_msg
+.align 8
+ipi_ok_msg:   .ascii "IPI OK\n\0"
+
+# R14b-m5-007 (#512): Self-IPI smoke failure message
+.global ipi_fail_msg
+.align 8
+ipi_fail_msg: .ascii "IPI FAIL\n\0"
+
 # R9-m4-001: Tick worker message (emitted every K=16 IRQs)
 .global _tick_msg
 .align 8
