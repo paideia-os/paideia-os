@@ -100,6 +100,15 @@ gdt32_ptr:
 .section .rodata, "a", @progbits
 .align 8
 
+# R14B-M3-000c (#643): 64-bit absolute-address slot for boot PML4.
+# Bridges cross-VA rip-refs from higher-half kernel .pdx code to low-VA
+# .bss.boot pml4 (avoids R_X86_64_PC32 overflow once #489 splits VMA).
+# Linker emits R_X86_64_64 here → filled with runtime absolute VA of pml4.
+.global _pml4_addr
+.align 8
+_pml4_addr:
+    .quad pml4
+
 # B3-004: Banner string for kernel startup message
 .global banner_msg
 .align 8
