@@ -30,7 +30,7 @@ The TSS is a privileged CPU structure that:
 A ring-3→ring-0 transition (e.g., via `syscall`) would use CPU's cached IOPL=0 to
 suppress user-stack memory access, but without RSP0 in the TSS, the CPU has no
 kernel stack pointer and will fault or use undefined state. m4-002 fixes this by
-populating RSP0 (and IST fields) and loading the TSS selector into LDTR.
+populating RSP0 (and IST fields) and loading the TSS selector into TR.
 
 ## TSS layout (x86-64 64-bit mode)
 
@@ -127,7 +127,7 @@ call smep_enable;                // ← m3-003: continue with protection bits
 ```
 
 **CRITICAL RACE WINDOW** (m4-002 to m4-004):
-Between `tss_install` (which loads the TSS selector into LDTR) and `idt_install`'s
+Between `tss_install` (which loads the TSS selector into TR) and `idt_install`'s
 `idt_apply_ist_fields` (which rewires IDT entries to use IST1..3), there is a race
 window in which:
 
@@ -162,7 +162,7 @@ The function assembles the TSS descriptor via:
 
 3. **Load TSS**:
    - `mov rax, 0x30` (selector for TSS at GDT[6:7])
-   - `ltr ax` (privileged instruction; loads LDTR = 0x30, enables TSS)
+   - `ltr ax` (privileged instruction; loads TR = 0x30, enables TSS)
 
 ## Verification of ltr instruction encoding
 
@@ -200,7 +200,7 @@ share the same encoding; the operand size is 2 bytes for the selector in all mod
 - [x] `tss_install()` writes IST1/IST2/IST3 at offsets +36/+44/+52 via ist{1,2,3}_top() calls.
 - [x] `tss_install()` writes IOMAP_BASE = 104 (disabled) via qword mask+or at offset +96.
 - [x] `tss_install()` constructs TSS descriptor (limit=103, access=0x89) in GDT slots 6–7.
-- [x] `tss_install()` loads LDTR via `ltr 0x30` (paideia-as v0.12.0 ltr encoder).
+- [x] `tss_install()` loads TR via `ltr 0x30` (paideia-as v0.12.0 ltr encoder).
 - [x] Call inserted in `kernel_main.pdx` after `idt_install` and before `smep_enable`.
 - [x] "TSS OK\n" message added to `tools/boot_stub.S` and printed after tss_install().
 - [x] Build succeeds: `./tools/build.sh` completes without encoder errors.
