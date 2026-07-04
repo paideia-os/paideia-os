@@ -80,7 +80,10 @@ long_mode_trampoline:
     movw %ax, %gs
 
     # Jump to paideia-as kernel entry
-    jmp _start
+    # R14B-M3-000: absolute far jump — avoids R_X86_64_PC32 overflow
+    # when kernel VMA (higher-half) is far from boot stub LMA (#489 split).
+    movabsq $_start, %rax
+    jmpq    *%rax
 
 .section .rodata
 .align 8
