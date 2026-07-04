@@ -145,6 +145,18 @@ tss_ok_msg:
 hi_va_msg:
     .ascii "HI VA FFFF8000\n\0"
 
+# R14.M4-009 (#505): KPTI structural witness success message
+.global kpti_ok_msg
+.align 8
+kpti_ok_msg:
+    .ascii "KPTI OK\n\0"
+
+# R14.M4-009 (#505): KPTI structural witness failure message
+.global kpti_fail_msg
+.align 8
+kpti_fail_msg:
+    .ascii "KPTI FAIL\n\0"
+
 # R9-m4-001: Tick worker message (emitted every K=16 IRQs)
 .global _tick_msg
 .align 8

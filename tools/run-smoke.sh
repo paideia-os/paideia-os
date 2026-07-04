@@ -4,7 +4,7 @@
 # bytes.
 #
 # Usage: tools/run-smoke.sh [MODE | expected_marker | --fingerprint PATTERN]
-#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'prod' (mode dispatcher)
+#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
 #     * boot_tick: validates boot_tick fingerprint (with timer TICKs), 5s timeout
@@ -13,6 +13,8 @@
 #     * boot_r11: validates R11 softer task alternation fingerprint (Task A/B/A cooperative), 10s timeout
 #     * boot_r12: validates R12 capability dispatch fingerprint (5 cap tags + 3 task lines), 8s timeout
 #     * boot_r12_denial: validates R12 rights-denial witness (CAP DENIED between CAP INVOKE DEV and CAP DISPATCH OK), 8s timeout
+#     * boot_r14b_hivma: validates R14B higher-half execution witness (HI VA FFFF8000), 5s timeout
+#     * boot_r14b_kpti: validates R14B KPTI structural witness (KPTI OK), 5s timeout
 #     * prod: expects exit code 2 (kernel didn't build), skips verification
 #   - expected_marker: defaults to no-check (just confirms QEMU exits or
 #     times out cleanly). Pass a string to grep the serial log for.
@@ -91,6 +93,12 @@ case "${EXPECTED}" in
     boot_r14b_hivma)
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/r14b/expected-boot-r14b-hivma.txt"
+        TIMEOUT=5
+        EXPECTED=""
+        ;;
+    boot_r14b_kpti)
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r14b/expected-boot-r14b-kpti.txt"
         TIMEOUT=5
         EXPECTED=""
         ;;
