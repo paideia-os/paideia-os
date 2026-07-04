@@ -62,6 +62,13 @@ SECTIONS
     _kernel_high_text_start = ADDR(.text);
     _kernel_high_entry = kernel_main_64;
 
+    .rodata.userbin : AT(ADDR(.rodata.userbin) - KERNEL_VMA_BASE) ALIGN(4K) {
+                _shell_bin_section_start = .;
+                KEEP(*(.rodata.userbin))
+                _shell_bin_section_end = .;
+                . = ALIGN(4K);
+            } :text_high
+
     .rodata : AT(ADDR(.rodata) - KERNEL_VMA_BASE) ALIGN(4K) {
                 *(.rodata .rodata.*)
             } :text_high

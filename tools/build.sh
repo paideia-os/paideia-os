@@ -19,9 +19,16 @@ fi
 
 mkdir -p "${BUILD_DIR}"
 
+echo "[build-user] ensuring build/user/shell.bin (R15-M1-007 embed prerequisite)"
+"${REPO_ROOT}/tools/build-user.sh"
+
 echo "[boot-stub] tools/boot_stub.S -> boot_stub.o (32+64-bit, as --64)"
 BOOT_STUB_OBJ="${BUILD_DIR}/boot_stub.o"
 as --64 -o "${BOOT_STUB_OBJ}" "${REPO_ROOT}/tools/boot_stub.S"
+
+echo "[userbin] tools/userbin_embed.S -> userbin_embed.o"
+USERBIN_OBJ="${BUILD_DIR}/userbin_embed.o"
+( cd "${REPO_ROOT}" && as --64 -o "${USERBIN_OBJ}" tools/userbin_embed.S )
 
 OBJECTS=()
 while IFS= read -r -d '' pdx; do
@@ -33,7 +40,7 @@ while IFS= read -r -d '' pdx; do
     OBJECTS+=("${obj}")
 done < <(find "${KERNEL_SRC}" -name '*.pdx' -print0 | sort -z)
 
-OBJECTS=( "${BOOT_STUB_OBJ}" "${OBJECTS[@]}" )
+OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${OBJECTS[@]}" )
 
 if [[ ${#OBJECTS[@]} -eq 0 ]]; then
     echo "no .pdx files found under ${KERNEL_SRC}" >&2
