@@ -47,6 +47,13 @@ SECTIONS
     /* Step . into the higher-half alias. LMA continues from where . was. */
     . = . + KERNEL_VMA_BASE;
 
+    .text.syscall_trampoline : AT(ADDR(.text.syscall_trampoline) - KERNEL_VMA_BASE) ALIGN(4K) {
+                _syscall_trampoline_start = .;
+                KEEP(*core/syscall/entry.o(.text))
+                _syscall_trampoline_end = .;
+                . = ALIGN(4K);
+            } :text_high
+
     .text   : AT(ADDR(.text)   - KERNEL_VMA_BASE) ALIGN(4K) {
                 KEEP(*(.text._start))
                 *(.text .text.*)
