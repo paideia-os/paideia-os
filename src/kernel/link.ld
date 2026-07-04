@@ -53,6 +53,7 @@ SECTIONS
             } :text_high
 
     _kernel_high_text_start = ADDR(.text);
+    _kernel_high_entry = kernel_main_64;
 
     .rodata : AT(ADDR(.rodata) - KERNEL_VMA_BASE) ALIGN(4K) {
                 *(.rodata .rodata.*)
