@@ -58,4 +58,38 @@ echo "[link] ld -T link.ld -> kernel.elf"
 # paideia-as phase.
 ld -nostdlib --warn-common --fatal-warnings -T "${LINK_SCRIPT}" -o "${BUILD_DIR}/kernel.elf" "${OBJECTS[@]}"
 
+echo "[audit] R_X86_64_32 relocations must not target high-VA (>= 0xffff800000000000) symbols"
+
+NM_MAP="${BUILD_DIR}/.nm.map"
+SEC_MAP="${BUILD_DIR}/.sec.map"
+
+nm build/kernel.elf | awk 'NF>=3 {print $3, $1}' > "${NM_MAP}"
+readelf -SW build/kernel.elf \
+    | awk '$2 ~ /^[0-9]+\]$/ && $3 != "NULL" {print $3, $5}' > "${SEC_MAP}"
+
+AUDIT_FAIL=0
+for obj in "${OBJECTS[@]}"; do
+    while IFS= read -r target; do
+        [[ -z "${target}" ]] && continue
+        if [[ "${target}" == .* ]]; then
+            vma=$(awk -v s="${target}" '$1==s {print $2; exit}' "${SEC_MAP}")
+        else
+            vma=$(awk -v s="${target}" '$1==s {print $2; exit}' "${NM_MAP}")
+        fi
+        [[ -z "${vma}" ]] && continue
+        if [[ "${vma}" == ffff8* ]]; then
+            echo "[audit] FAIL: ${obj#"${BUILD_DIR}"/}: R_X86_64_32 -> ${target} @ 0x${vma}" >&2
+            AUDIT_FAIL=1
+        fi
+    done < <(readelf -r "${obj}" 2>/dev/null \
+             | awk '$3 == "R_X86_64_32" || $3 == "R_X86_64_32S" {print $5}' \
+             | sort -u)
+done
+
+if [[ ${AUDIT_FAIL} -ne 0 ]]; then
+    echo "[audit] R_X86_64_32 high-VA audit failed — see #490 census, #494 policy" >&2
+    exit 1
+fi
+echo "[audit] R_X86_64_32 relocations clean (all targets low-VA)"
+
 echo "[ok] ${BUILD_DIR}/kernel.elf"
