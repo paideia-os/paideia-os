@@ -85,7 +85,7 @@ long_mode_trampoline:
     movabsq $_start, %rax
     jmpq    *%rax
 
-.section .rodata
+.section .rodata.boot, "a", @progbits
 .align 8
 gdt32:
     .quad 0                          # 0x00 null
@@ -96,6 +96,9 @@ gdt32:
 gdt32_ptr:
     .word 5*8 - 1                    # limit
     .long gdt32                      # base (32-bit, flat zero-base GDT)
+
+.section .rodata, "a", @progbits
+.align 8
 
 # B3-004: Banner string for kernel startup message
 .global banner_msg
@@ -145,7 +148,7 @@ _task_a_msg:
 _task_b_msg:
     .ascii "TASK B\n\0"
 
-.section .bss
+.section .bss.boot, "aw", @nobits
 .align 4096
 .global pml4
 pml4: .skip 4096
