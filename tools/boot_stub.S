@@ -118,6 +118,12 @@ ipc_ok_msg:
 idt_ok_msg:
     .ascii "IDT OK\n\0"
 
+# R13-m4-002: TSS installation message
+.global tss_ok_msg
+.align 8
+tss_ok_msg:
+    .ascii "TSS OK\n\0"
+
 # R9-m4-001: Tick worker message (emitted every K=16 IRQs)
 .global _tick_msg
 .align 8
