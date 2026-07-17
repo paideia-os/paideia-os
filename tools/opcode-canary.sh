@@ -11,6 +11,10 @@ CANARIES=(
   "build/core/mm/pt_walk.o|entry_present|4c 21|4c 01|#1196/entry_present must AND not ADD"
   "build/core/mm/pt_walk.o|pt_index|4c 21|4c 01|#1196/pt_index must AND not ADD"
   "build/core/mm/pt_walk.o|make_pte|4c 21|4c 01|#1196/make_pte must AND not ADD"
+  # NOTE: #1230 C6 canary (entry_gt cmp/setcc/movzx assertion) deferred —
+  # requires a kernel-side comparison-op function to exist as an anchor.
+  # Filed as separate follow-up; the paideia-as-side operator-registry
+  # drift-detector already catches the class of miscompile this would gate.
 )
 
 fail=0
