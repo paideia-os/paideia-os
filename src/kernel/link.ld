@@ -50,6 +50,7 @@ SECTIONS
     .text.syscall_trampoline : AT(ADDR(.text.syscall_trampoline) - KERNEL_VMA_BASE) ALIGN(4K) {
                 _syscall_trampoline_start = .;
                 KEEP(*core/syscall/entry.o(.text))
+                KEEP(*core/syscall/enter_user.o(.text))
                 _syscall_trampoline_end = .;
                 . = ALIGN(4K);
             } :text_high

@@ -183,6 +183,16 @@ loader_ok_msg: .ascii "LOADER OK\n\0"
 .align 8
 loader_fail_msg: .ascii "LOADER FAIL\n\0"
 
+# R15-M2-005-followup (#651): enter_userland_initial relocation success witness message
+.global enter_reloc_ok_msg
+.align 8
+enter_reloc_ok_msg: .ascii "ENTER USER RELOC OK\n\0"
+
+# R15-M2-005-followup (#651): enter_userland_initial relocation failure witness message
+.global enter_reloc_fail_msg
+.align 8
+enter_reloc_fail_msg: .ascii "ENTER USER RELOC FAIL\n\0"
+
 # R9-m4-001: Tick worker message (emitted every K=16 IRQs)
 .global _tick_msg
 .align 8
