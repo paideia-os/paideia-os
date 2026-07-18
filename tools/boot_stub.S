@@ -311,6 +311,16 @@ _task_a_msg:
 _task_b_msg:
     .ascii "TASK B\n\0"
 
+# R15-M1-010 (#649): phys_free bitmap release witness success message
+.global phys_free_ok_msg
+.align 8
+phys_free_ok_msg: .ascii "PHYS FREE ROUNDTRIP OK\n\0"
+
+# R15-M1-010 (#649): phys_free bitmap release witness failure message
+.global phys_free_fail_msg
+.align 8
+phys_free_fail_msg: .ascii "PHYS FREE ROUNDTRIP FAIL\n\0"
+
 # R15-M4-003 (#537): Exit marker message
 .global exit_marker_msg
 .align 8
