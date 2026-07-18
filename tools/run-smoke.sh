@@ -114,6 +114,12 @@ case "${EXPECTED}" in
         TIMEOUT=8
         EXPECTED=""
         ;;
+    boot_r15_ring3)
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r15/expected-boot-r15-ring3.txt"
+        TIMEOUT=6
+        EXPECTED=""
+        ;;
     prod)
         # prod mode: expects exit code 2 (kernel didn't build)
         # Skip verification, just exit with code 2

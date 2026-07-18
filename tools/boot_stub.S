@@ -193,6 +193,106 @@ enter_reloc_ok_msg: .ascii "ENTER USER RELOC OK\n\0"
 .align 8
 enter_reloc_fail_msg: .ascii "ENTER USER RELOC FAIL\n\0"
 
+# R15-M2-006b (#652): Ring-3 witness start message
+.global ring3_start_msg
+.align 8
+ring3_start_msg: .ascii "R15 RING3 START\n\0"
+
+# R15-M2-006b (#652): Debug message after saving RSP
+.global ring3_saved_rsp_msg
+.align 8
+ring3_saved_rsp_msg: .ascii "R15 SAVED RSP\n\0"
+
+# R15-M2-006b (#652): Debug message after saving RIP marker
+.global ring3_saved_rip_msg
+.align 8
+ring3_saved_rip_msg: .ascii "R15 SAVED RIP\n\0"
+
+# R15-M2-006b (#652): Debug message before creating PML4
+.global ring3_create_pml4_msg
+.align 8
+ring3_create_pml4_msg: .ascii "R15 CREATE PML4\n\0"
+
+# R15-M2-006b (#652): Debug message after aspace_create
+.global ring3_aspace_done_msg
+.align 8
+ring3_aspace_done_msg: .ascii "R15 ASPACE DONE\n\0"
+
+# R15-M2-006b (#652): Debug message before phys_alloc
+.global ring3_phys_alloc_msg
+.align 8
+ring3_phys_alloc_msg: .ascii "R15 PHYS ALLOC\n\0"
+
+# R15-M2-006b (#652): Debug message after phys_alloc
+.global ring3_phys_done_msg
+.align 8
+ring3_phys_done_msg: .ascii "R15 PHYS DONE\n\0"
+
+# R15-M2-006b (#652): Debug message before calculating VA
+.global ring3_calc_va_msg
+.align 8
+ring3_calc_va_msg: .ascii "R15 CALC VA\n\0"
+
+# R15-M2-006b (#652): Debug message before writing hlt
+.global ring3_write_hlt_msg
+.align 8
+ring3_write_hlt_msg: .ascii "R15 WRITE HLT\n\0"
+
+# R15-M2-006b (#652): Debug message after writing hlt byte
+.global ring3_wrote_hlt_msg
+.align 8
+ring3_wrote_hlt_msg: .ascii "R15 WROTE HLT\n\0"
+
+# R15-M2-006b (#652): Debug message before aspace_map
+.global ring3_aspace_map_msg
+.align 8
+ring3_aspace_map_msg: .ascii "R15 ASPACE MAP\n\0"
+
+# R15-M2-006b (#652): Debug message before user_stack_alloc
+.global ring3_stack_alloc_msg
+.align 8
+ring3_stack_alloc_msg: .ascii "R15 STACK ALLOC\n\0"
+
+# R15-M2-006b (#652): Debug message after user_stack_alloc
+.global ring3_stack_done_msg
+.align 8
+ring3_stack_done_msg: .ascii "R15 STACK DONE\n\0"
+
+# R15-M2-006b (#652): Debug message before entering ring-3
+.global ring3_enter_msg
+.align 8
+ring3_enter_msg: .ascii "R15 ENTER RING3\n\0"
+
+# R15-M2-006b (#652): Debug message when witness is resumed from exception handler
+.global ring3_resumed_msg
+.align 8
+ring3_resumed_msg: .ascii "R15 WITNESS RESUMED\n\0"
+
+# R15-M2-006b (#652): Debug message if enter_userland_initial returns
+.global ring3_returned_msg
+.align 8
+ring3_returned_msg: .ascii "R15 RETURNED FROM RING3\n\0"
+
+# R15-M2-006b (#652): Debug message when handler is called
+.global ring3_handler_called_msg
+.align 8
+ring3_handler_called_msg: .ascii "R15 HANDLER CALLED\n\0"
+
+# R15-M2-006b (#652): Debug message when exception handler is called
+.global ring3_gp_debug_msg
+.align 8
+ring3_gp_debug_msg: .ascii "R15 GP DEBUG\n\0"
+
+# R15-M2-006b (#652): Ring-3 witness success message (user hlt → #GP → resume)
+.global ring3_hello_ok_msg
+.align 8
+ring3_hello_ok_msg: .ascii "R15 RING3 HELLO OK\n\0"
+
+# R15-M2-006b (#652): Ring-3 witness failure message (setup failed)
+.global ring3_fail_msg
+.align 8
+ring3_fail_msg: .ascii "R15 RING3 FAIL\n\0"
+
 # R9-m4-001: Tick worker message (emitted every K=16 IRQs)
 .global _tick_msg
 .align 8
