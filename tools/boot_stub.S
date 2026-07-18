@@ -371,6 +371,16 @@ pool_witness_ok_msg: .ascii "R15 TASK pool ok pids=1,2,3\n\0"
 .align 8
 pool_witness_fail_msg: .ascii "R15 TASK pool FAIL\n\0"
 
+# R15-M6-008 (#559): frame_meta refcount witness success message
+.global frame_meta_ok_msg
+.align 8
+frame_meta_ok_msg: .ascii "R15 FRAME META OK\n\0"
+
+# R15-M6-008 (#559): frame_meta refcount witness failure message
+.global frame_meta_fail_msg
+.align 8
+frame_meta_fail_msg: .ascii "R15 FRAME META FAIL\n\0"
+
 # R15-M4-003 (#537): Exit marker message
 .global exit_marker_msg
 .align 8
