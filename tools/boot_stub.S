@@ -439,6 +439,31 @@ frame_meta_ok_msg: .ascii "R15 FRAME META OK\n\0"
 .align 8
 frame_meta_fail_msg: .ascii "R15 FRAME META FAIL\n\0"
 
+# R15-M6-001 (#552): aspace_clone_cow witness markers (6 rodata strings)
+.global clone_cow_empty_ok_msg
+.align 8
+clone_cow_empty_ok_msg: .ascii "R15 CLONE COW EMPTY OK\n\0"
+
+.global clone_cow_empty_fail_msg
+.align 8
+clone_cow_empty_fail_msg: .ascii "R15 CLONE COW EMPTY FAIL\n\0"
+
+.global clone_cow_1page_ok_msg
+.align 8
+clone_cow_1page_ok_msg: .ascii "R15 CLONE COW 1PAGE OK\n\0"
+
+.global clone_cow_1page_fail_msg
+.align 8
+clone_cow_1page_fail_msg: .ascii "R15 CLONE COW 1PAGE FAIL\n\0"
+
+.global clone_cow_multi_ok_msg
+.align 8
+clone_cow_multi_ok_msg: .ascii "R15 CLONE COW MULTI OK\n\0"
+
+.global clone_cow_multi_fail_msg
+.align 8
+clone_cow_multi_fail_msg: .ascii "R15 CLONE COW MULTI FAIL\n\0"
+
 # R15-M4-003 (#537): Exit marker message
 .global exit_marker_msg
 .align 8
