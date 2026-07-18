@@ -351,6 +351,16 @@ fd_witness_ok_msg: .ascii "R15 FD TABLE OK\n\0"
 .align 8
 fd_witness_fail_msg: .ascii "R15 FD TABLE FAIL\n\0"
 
+# R15-M5-006 (#548): task_new witness success message
+.global task_new_witness_ok_msg
+.align 8
+task_new_witness_ok_msg: .ascii "R15 TASK NEW OK\n\0"
+
+# R15-M5-006 (#548): task_new witness failure message
+.global task_new_witness_fail_msg
+.align 8
+task_new_witness_fail_msg: .ascii "R15 TASK NEW FAIL\n\0"
+
 # R15-M4-003 (#537): Exit marker message
 .global exit_marker_msg
 .align 8
