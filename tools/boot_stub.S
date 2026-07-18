@@ -298,6 +298,16 @@ ring3_gp_debug_msg: .ascii "R15 GP DEBUG\n\0"
 .align 8
 ring3_hello_ok_msg: .ascii "R15 RING3 HELLO OK\n\0"
 
+# R14-M3-007c (#650): #UD witness success message.
+.global ud_witness_ok_msg
+.align 8
+ud_witness_ok_msg: .ascii "R14 UD OK\n\0"
+
+# R14-M3-007c (#650): #UD witness failure message (armed but not fired).
+.global ud_witness_fail_msg
+.align 8
+ud_witness_fail_msg: .ascii "R14 UD FAIL\n\0"
+
 # R15-M2-006b (#652): Ring-3 witness failure message (setup failed)
 .global ring3_fail_msg
 .align 8

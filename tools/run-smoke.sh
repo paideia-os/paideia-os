@@ -114,6 +114,12 @@ case "${EXPECTED}" in
         TIMEOUT=8
         EXPECTED=""
         ;;
+    boot_r14b_ud)
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r14b/expected-boot-r14b-ud.txt"
+        TIMEOUT=6
+        EXPECTED=""
+        ;;
     boot_r15_ring3)
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/r15/expected-boot-r15-ring3.txt"
