@@ -3,7 +3,7 @@
 .balign 4096
 .global _shell_bin_start
 _shell_bin_start:
-.incbin "build/user/shell.bin"
+.incbin "build/user/shell.elf"
 .global _shell_bin_end
 _shell_bin_end:
 .balign 4096

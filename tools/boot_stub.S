@@ -183,6 +183,16 @@ loader_ok_msg: .ascii "LOADER OK\n\0"
 .align 8
 loader_fail_msg: .ascii "LOADER FAIL\n\0"
 
+# R15-M1-008b (#648): ELF-lite loader runtime success witness message
+.global elf_load_ok_msg
+.align 8
+elf_load_ok_msg: .ascii "ELF LOAD OK\n\0"
+
+# R15-M1-008b (#648): ELF-lite loader runtime failure witness message
+.global elf_load_fail_msg
+.align 8
+elf_load_fail_msg: .ascii "ELF LOAD FAIL\n\0"
+
 # R15-M2-005-followup (#651): enter_userland_initial relocation success witness message
 .global enter_reloc_ok_msg
 .align 8
