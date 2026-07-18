@@ -381,6 +381,16 @@ sys_exit_witness_ok_msg: .ascii "R15 SYS EXIT OK\n\0"
 .align 8
 sys_exit_witness_fail_msg: .ascii "R15 SYS EXIT FAIL\n\0"
 
+# R15-M6-005 (#556): sys_wait witness success message
+.global sys_wait_witness_ok_msg
+.align 8
+sys_wait_witness_ok_msg: .ascii "R15 SYS WAIT OK\n\0"
+
+# R15-M6-005 (#556): sys_wait witness failure message
+.global sys_wait_witness_fail_msg
+.align 8
+sys_wait_witness_fail_msg: .ascii "R15 SYS WAIT FAIL\n\0"
+
 # R15-M6-008 (#559): frame_meta refcount witness success message
 .global frame_meta_ok_msg
 .align 8
