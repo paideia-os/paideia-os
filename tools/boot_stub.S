@@ -341,6 +341,16 @@ phys_free_ok_msg: .ascii "PHYS FREE ROUNDTRIP OK\n\0"
 .align 8
 phys_free_fail_msg: .ascii "PHYS FREE ROUNDTRIP FAIL\n\0"
 
+# R15-M5-007 (#549): fd_table witness success message
+.global fd_witness_ok_msg
+.align 8
+fd_witness_ok_msg: .ascii "R15 FD TABLE OK\n\0"
+
+# R15-M5-007 (#549): fd_table witness failure message
+.global fd_witness_fail_msg
+.align 8
+fd_witness_fail_msg: .ascii "R15 FD TABLE FAIL\n\0"
+
 # R15-M4-003 (#537): Exit marker message
 .global exit_marker_msg
 .align 8
