@@ -56,9 +56,9 @@ _pvh_entry:
     orl  $0x100, %eax
     wrmsr
 
-    # CR0.PG | PE
+    # CR0.PG | PE | WP  (WP = bit 16, enforces R-only PTEs from ring 0 — required for CoW)
     movl %cr0, %eax
-    orl  $0x80000001, %eax
+    orl  $0x80010001, %eax
     movl %eax, %cr0
 
     # Far jump to 64-bit code segment (selector 0x18)
@@ -144,6 +144,12 @@ tss_ok_msg:
 .align 8
 hi_va_msg:
     .ascii "HI VA FFFF8000\n\0"
+
+# R14b-m5-008 (#660): CR0.WP enabled — ring-0 respects R-only PTEs (CoW substrate).
+.global cr0_wp_ok_msg
+.align 8
+cr0_wp_ok_msg:
+    .ascii "R14B CR0 WP OK\n\0"
 
 # R14.M4-009 (#505): KPTI structural witness success message
 .global kpti_ok_msg
