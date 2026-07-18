@@ -426,6 +426,34 @@ sys_fork_witness_ok_msg: .ascii "R15 SYS FORK OK\n\0"
 .align 8
 sys_fork_witness_fail_msg: .ascii "R15 SYS FORK FAIL\n\0"
 
+# R15-M7-001 (#562): idle test start message
+.global idle_test_msg
+.align 8
+idle_test_msg: .ascii "IDLE TEST START\n\0"
+
+# R15-M7-001 (#562): idle-task witness debug messages
+.global idle_debug_1_msg
+.align 8
+idle_debug_1_msg: .ascii "IDLE DEBUG 1\n\0"
+
+.global idle_debug_2_msg
+.align 8
+idle_debug_2_msg: .ascii "IDLE DEBUG 2\n\0"
+
+.global idle_debug_3_msg
+.align 8
+idle_debug_3_msg: .ascii "IDLE DEBUG 3\n\0"
+
+# R15-M7-001 (#562): idle-task witness success message
+.global idle_witness_ok_msg
+.align 8
+idle_witness_ok_msg: .ascii "R15 IDLE TASK OK\n\0"
+
+# R15-M7-001 (#562): idle-task witness failure message
+.global idle_witness_fail_msg
+.align 8
+idle_witness_fail_msg: .ascii "R15 IDLE TASK FAIL\n\0"
+
 # R15-M6-004 (#555): sys_execve witness — bad-ELF payload for sub-test B.
 # 64 bytes; first 4 bytes deliberately NOT \x7fELF, so elf_lite_load
 # rejects at the magic gate (returns ELF_BAD_HDR = 0xFFFFFFFF).
