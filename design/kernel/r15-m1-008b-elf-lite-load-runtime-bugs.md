@@ -13,9 +13,10 @@ blocks:
   - "R15.M2 first shell process launch (needs elf_lite_load to actually load, not just symbol-resolve)"
   - "R15.M6 fork/exec (exec directly re-enters elf_lite_load per image)"
 touching:
-  - src/kernel/core/loader/elf_lite.pdx          (3 LOC — the two bug fixes)
+  - src/kernel/core/loader/elf_lite.pdx          (3 LOC — the two bug fixes, +1 LOC addendum — see §10)
   - src/kernel/boot/kernel_main.pdx              (~35 LOC — extend loader witness from symbol-check to runtime call)
   - tools/boot_stub.S                            (~8 LOC — two new witness message strings)
+  - tools/userbin_embed.S                        (1 LOC — embed shell.elf instead of shell.bin; see §10)
   - tests/r15/expected-boot-r15-ring3.txt        (+1 line marker)
   - design/kernel/r15-m1-008b-elf-lite-load-runtime-bugs.md (this file)
 related:
@@ -397,3 +398,66 @@ by the small mnemonic changes here — no encoder risk. Estimated
 effort: **1 sitting**, primarily writing the loader runtime witness
 block and its two message strings; the actual bug fixes take under
 five minutes.
+
+## 10. Addendum — third runtime bug found after the witness landed (post-mortem)
+
+The two encoder-level fixes above (§3) landed together with the runtime
+witness (§4) and the `userbin_embed.S` switch from `shell.bin` to
+`shell.elf`. On first boot the witness still printed `ELF LOAD FAIL`
+(error code `0xFFFFFFFB`, `ELF_OOM`) instead of `ELF LOAD OK`. Root-cause
+investigation (temporary hex/bitmap instrumentation in `kernel_main.pdx`,
+reverted before commit) found a **third, previously-unexercised bug**,
+distinct from the two this issue set out to fix:
+
+**Bug C — missing `phys_alloc` order argument in the PT_LOAD per-page
+loop (`elf_lite.pdx`, immediately before the `call phys_alloc;` in
+`elf_load_page_loop`).** Every other call site in the tree
+(`aspace_map.pdx`, `aspace_create.pdx`, `kpti.pdx`) sets `mov rdi, 0;`
+immediately before `call phys_alloc;`, per `phys_alloc`'s calling
+convention (`RDI = order`, must be `0`; non-zero is rejected via
+`phys_alloc_unsupported` → returns `0`). `elf_lite_load`'s own per-page
+loop never re-loads RDI before this call, so RDI still held the
+function's own first parameter (`user_pml4_pa` — a large non-zero
+kernel VA) from the prologue. `phys_alloc` therefore always rejected
+the call as an "unsupported order" and returned `0`, which
+`elf_lite_load` correctly (per its own contract) interpreted as
+`ELF_OOM` — a false OOM with the real pool sitting at >1000 free pages
+(confirmed via direct bitmap dump: only 14 of 1024 bits set at the
+point of failure).
+
+This bug was never exercised before this issue because, per the
+R15-M1-008 structural witness's own comment (§2.1), `elf_lite_load` had
+never actually been *called* at runtime prior to this issue — only
+`lea`'d and pointer-checked. It sat latent in the `elf_lite_load`
+skeleton since #517 and is squarely inside this issue's own scope
+(same function, same "runtime bugs" framing), so it was fixed in place
+rather than filed as a separate follow-up:
+
+```
+// Allocate physical page
+mov rdi, 0;         // phys_alloc(order=0) — RDI still held user_pml4_pa
+                    // from this function's own parameter; phys_alloc's
+                    // order-check (rdi != 0 => unsupported, returns 0)
+                    // was misfiring on every call, surfacing as false OOM.
+call phys_alloc;
+```
+
+**On the `userbin_embed.S` shell.bin → shell.elf change (the
+"suspicious" item flagged going into this investigation):** confirmed
+correct, not a regression. `shell.bin` is `objcopy -O binary` output —
+232 raw bytes with no ELF header at all (232 == the RE segment's
+`p_filesz`, i.e. it's just the segment's raw code, nothing else).
+Had `elf_lite_load` ever been pointed at the old `shell.bin` embed, the
+magic-number gate (`elf_lite.pdx`'s header validation) would reject it
+immediately as `ELF_BAD_HDR` — it was never a valid image for this
+loader to consume. `_shell_bin_start`/`_shell_bin_end` are referenced
+nowhere else in the tree (grepped `src/kernel`, `tools`, `tests`), so
+there is no legacy raw-binary consumer to break. The embed switch was a
+necessary correction, not an unrelated risk.
+
+**Verification:** `tools/run-smoke.sh boot_r15_ring3` passes
+(`ELF LOAD OK` after `LOADER OK`) across repeated runs. Full smoke
+sweep run clean except two pre-existing, unrelated failures
+(`boot_tick`, `boot_r12`) confirmed present identically on `f6195ed`
+(pre-#648) — not caused by this fix; `boot_r12` also confirmed flaky
+(passes on retry, consistent with #659).
