@@ -391,6 +391,28 @@ sys_wait_witness_ok_msg: .ascii "R15 SYS WAIT OK\n\0"
 .align 8
 sys_wait_witness_fail_msg: .ascii "R15 SYS WAIT FAIL\n\0"
 
+# R15-M6-004 (#555): sys_execve witness success message
+.global sys_execve_witness_ok_msg
+.align 8
+sys_execve_witness_ok_msg: .ascii "R15 SYS EXECVE OK\n\0"
+
+# R15-M6-004 (#555): sys_execve witness failure message
+.global sys_execve_witness_fail_msg
+.align 8
+sys_execve_witness_fail_msg: .ascii "R15 SYS EXECVE FAIL\n\0"
+
+# R15-M6-004 (#555): sys_execve witness — bad-ELF payload for sub-test B.
+# 64 bytes; first 4 bytes deliberately NOT \x7fELF, so elf_lite_load
+# rejects at the magic gate (returns ELF_BAD_HDR = 0xFFFFFFFF).
+.global _bad_elf_stub_start
+.align 8
+_bad_elf_stub_start:
+    .byte 0xDE, 0xAD, 0xBE, 0xEF
+    .byte 0x02, 0x01, 0x01, 0x00
+    .fill 56, 1, 0
+.global _bad_elf_stub_end
+_bad_elf_stub_end:
+
 # R15-M6-008 (#559): frame_meta refcount witness success message
 .global frame_meta_ok_msg
 .align 8
