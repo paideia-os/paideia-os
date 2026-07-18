@@ -157,6 +157,12 @@ kpti_ok_msg:
 kpti_fail_msg:
     .ascii "KPTI FAIL\n\0"
 
+# R14b-m4-006b (#645): KPTI scratch-slot round-trip witness success message
+.global kpti_scratch_ok_msg
+.align 8
+kpti_scratch_ok_msg:
+    .ascii "KPTI SCRATCH OK\n\0"
+
 # R14b-m5-007 (#512): Self-IPI smoke success message
 .global ipi_ok_msg
 .align 8

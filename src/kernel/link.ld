@@ -54,6 +54,13 @@ SECTIONS
                 . = ALIGN(4K);
             } :text_high
 
+    .data.syscall_trampoline : AT(ADDR(.data.syscall_trampoline) - KERNEL_VMA_BASE) ALIGN(4K) {
+                _syscall_trampoline_data_start = .;
+                KEEP(*core/syscall/trampoline_data.o(.data .bss))
+                _syscall_trampoline_data_end = .;
+                . = ALIGN(4K);
+            } :text_high
+
     .text   : AT(ADDR(.text)   - KERNEL_VMA_BASE) ALIGN(4K) {
                 KEEP(*(.text._start))
                 *(.text .text.*)
