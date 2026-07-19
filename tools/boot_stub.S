@@ -453,6 +453,15 @@ path_resolve_ok_msg: .ascii "R16 PATH RESOLVE OK\n\0"
 .align 8
 path_resolve_fail_msg: .ascii "R16 PATH RESOLVE FAIL\n\0"
 
+# R16-M1-005 (#574): mount_table witness success + failure messages
+.global mount_table_ok_msg
+.align 8
+mount_table_ok_msg: .ascii "R16 MOUNT TABLE OK\n\0"
+
+.global mount_table_fail_msg
+.align 8
+mount_table_fail_msg: .ascii "R16 MOUNT TABLE FAIL\n\0"
+
 # R16-M1-004 (#573): witness path strings for path_resolve sub-tests
 .global witness_path_slash
 .align 8

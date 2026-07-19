@@ -1,0 +1,316 @@
+// src/kernel/core/fs/mount.pdx — R16-M1-005 (#574)
+// Static mount table: 8 entries, 64 bytes total (one L1D cache line).
+//
+// Per design/kernel/r16-m1-005-mount-table.md:
+//
+//   _mount_table[MOUNT_MAX=8] is an @align(64) array of u64 entries. Each entry
+//   packs five fields into one 8-byte slot:
+//   - [0, 16): mountpoint_vnode_idx (u16)
+//   - [16, 32): root_vnode_idx (u16)
+//   - [32, 40): backend_type (u8) — NONE=0, TMPFS=1, DEVFS=2, PROCFS=3, TTY=4
+//   - [40, 48): flags (u8) — bit 0: VALID=0x01, bit 1: ROOT=0x02
+//   - [48, 64): _reserved (u16) — for R17+ growth (refcount or per-fs data index)
+//
+//   Slot 0 is pinned as the root mount. Linear scan from 0 finds it first on
+//   bootstrap (all slots empty); submounts take slots 1..7.
+//
+//   Three primitives:
+//   - mount(path_ptr, backend_type) → slot_idx or 0xFFFF on failure
+//   - mount_root_vnode() → root fs's root vnode idx
+//   - mount_lookup(vnode_idx) → traversed root idx if vnode is a mountpoint;
+//     identity fallthrough otherwise
+
+module Mount = structure {
+  // === Layout constants (pinned by design/kernel/r16-m1-005-mount-table.md §2) ===
+  pub let MOUNT_ENTRY_SIZE          : u64 = 8         // one u64 per entry
+  pub let MOUNT_MAX                 : u64 = 8         // slot count
+  pub let MOUNT_TABLE_BYTES         : u64 = 64        // MOUNT_ENTRY_SIZE * MOUNT_MAX
+  pub let MOUNT_ROOT_SLOT           : u64 = 0         // slot 0 = root fs (pinned)
+
+  // Per-entry field bit ranges (for shift/mask extraction)
+  pub let MOUNT_MOUNTPOINT_SHIFT    : u64 = 0
+  pub let MOUNT_ROOT_SHIFT          : u64 = 16
+  pub let MOUNT_BACKEND_SHIFT       : u64 = 32
+  pub let MOUNT_FLAGS_SHIFT         : u64 = 40
+  pub let MOUNT_RESERVED_SHIFT      : u64 = 48
+
+  pub let MOUNT_U16_MASK            : u64 = 0xFFFF
+  pub let MOUNT_U8_MASK             : u64 = 0xFF
+
+  // Backend discriminants
+  pub let MOUNT_BACKEND_NONE        : u64 = 0         // empty slot; matches zero-init
+  pub let MOUNT_BACKEND_TMPFS       : u64 = 1
+  pub let MOUNT_BACKEND_DEVFS       : u64 = 2         // reserved for R17
+  pub let MOUNT_BACKEND_PROCFS      : u64 = 3         // reserved for R17
+  pub let MOUNT_BACKEND_TTY         : u64 = 4         // reserved for R17
+
+  // Flag bits
+  pub let MOUNT_FLAG_VALID          : u64 = 0x01
+  pub let MOUNT_FLAG_ROOT           : u64 = 0x02      // this slot is _root_mount_slot
+  // bits 0x04..0x80 reserved for R17 (RO, NOSUID, NOEXEC, NODEV, BIND, ...)
+
+  // Sentinels — mirror vfs-layout.md §7.2 and vnode_pool.pdx discipline
+  pub let MOUNT_IDX_NONE            : u64 = 0xFFFF    // mount() failure sentinel
+  pub let VNODE_IDX_NONE            : u64 = 0xFFFF    // mirror for parent_idx write
+
+  // Vnode field mirrors (frozen by vfs-layout.md §3; not re-frozen here)
+  pub let VNODE_TYPE_OFFSET         : u64 = 0
+  pub let VNODE_TYPE_DIR            : u64 = 2
+  pub let VNODE_PARENT_IDX_OFFSET   : u64 = 8
+
+  // === Storage (.bss mount table — 64 B, @align(64) for L1D cache line) ===
+  // 8 x u64 = 64 B. @align(64) puts the entire table on one L1D cache line
+  // for hot access by mount_root_vnode and mount_lookup.
+  pub let mut _mount_table : [u64; 8] = uninit @align(64)
+
+  // ==========================================================================
+  // mount(path_ptr: u64, backend_type: u64) -> u64
+  //
+  // Install a filesystem at path_ptr under the given backend type.
+  // Returns slot index (u16 in low 16 bits) on success; 0xFFFF on failure.
+  //
+  // Bootstrap (slot 0): path_ptr nominally "/", not validated at R16.M1.
+  //   - mountpoint_vnode_idx = 0 (no parent)
+  //   - Allocates new root vnode via vnode_alloc
+  //   - Flags = MOUNT_FLAG_VALID | MOUNT_FLAG_ROOT
+  //
+  // Submount (slot 1-7): Resolves path_ptr via path_resolve, then mounts.
+  //   - mountpoint_vnode_idx = resolved vnode idx
+  //   - Allocates new root vnode via vnode_alloc
+  //   - Flags = MOUNT_FLAG_VALID (no ROOT flag)
+  //
+  // Failure modes (all return 0xFFFF):
+  //   - backend_type outside [1, 4]
+  //   - Mount table full
+  //   - Submount with path_resolve returning 0 (bad path)
+  //   - vnode_alloc OOM
+  //
+  // Register discipline: 5-push callee-save prologue lands rsp%16==0 for
+  // nested calls. Loop invariants:
+  //   rbx = root_vnode_idx (newly allocated vnode for mounted fs)
+  //   r12 = mountpoint_vnode_idx (0 for bootstrap, path_resolve result for submount)
+  //   r13 = slot idx (the u64 slot in _mount_table being filled)
+  //   r14 = backend_type (copied from rsi, preserved across nested calls)
+  //   r15 = path_ptr (copied from rdi, preserved across nested calls)
+  // ==========================================================================
+  pub let mount : (u64, u64) -> u64 !{mem} @{} =
+    fn (path_ptr: u64) (backend_type: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R16-M1-005 (#574) mount table entry installation. Five-phase: (1) prologue + save args, (2) validate backend_type ∈ [1,4], (3) linear scan for first empty slot, (4) branch on bootstrap vs. submount: bootstrap skips path_resolve and sets mountpoint_idx=0; submount calls path_resolve for mountpoint, (5) allocate root vnode via vnode_alloc + initialize type/parent_idx fields, (6) pack u64 entry and store. Register plan: r15=path_ptr, r14=backend_type, r13=slot, r12=mountpoint_idx, rbx=root_idx. Callee-save discipline: 5 pushes (40 B) + retaddr (8 B) = 48 B = 0 mod 16, so nested calls see rsp%16==0 (SysV ABI). Failure paths return rax=0xFFFF; success returns slot idx (0-7) in low 16 bits of rax.",
+      block: {
+        // --- Prologue: save callee-save regs (rsp%16 becomes 0 post-call) ---
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // --- Preserve arguments in callee-save regs ---
+        mov r15, rdi;                           // r15 = path_ptr
+        mov r14, rsi;                           // r14 = backend_type
+
+        // --- Phase 2: Validate backend_type ∈ [1, 4] ---
+        cmp r14, 1;
+        jb  mount_fail;
+        cmp r14, 4;
+        ja  mount_fail;
+
+        // --- Phase 3: Find first free slot (linear scan from 0) ---
+        lea r9, [rip + _mount_table];
+        xor rcx, rcx;                           // rcx = candidate slot
+      scan_free:
+        cmp rcx, 8;                             // MOUNT_MAX
+        jae mount_fail;
+        mov rax, [r9 + rcx*8];                  // load entry u64
+        shr rax, 32;                            // extract backend byte range
+        and rax, 0xFF;
+        cmp rax, 0;                             // MOUNT_BACKEND_NONE
+        je  found_slot;
+        add rcx, 1;
+        jmp scan_free;
+
+      found_slot:
+        mov r13, rcx;                           // r13 = slot idx
+
+        // --- Phase 4: Resolve mountpoint (bootstrap vs. submount) ---
+        cmp r13, 0;
+        jne resolve_submount;
+
+        // Bootstrap: mountpoint_idx = 0, path is nominally "/"
+        xor r12, r12;
+        jmp alloc_root;
+
+      resolve_submount:
+        call mount_root_vnode;                  // rax = root fs's root idx
+        mov  rsi, rax;
+        mov  rdi, r15;                          // path_ptr
+        xor  rdx, rdx;                          // cwd = 0 (irrelevant for absolute)
+        call path_resolve;                      // rax = mountpoint idx or 0
+        cmp  rax, 0;
+        je   mount_fail;
+        mov  r12, rax;                          // r12 = mountpoint idx
+
+        // --- Phase 5: Allocate mounted fs's root vnode + init ---
+      alloc_root:
+        call vnode_alloc;
+        cmp  rax, 0xFFFF;                       // VNODE_ALLOC_OOM
+        je   mount_fail;
+        mov  rbx, rax;                          // rbx = new root vnode idx
+
+        // Set type = VNODE_TYPE_DIR and parent_idx = VNODE_IDX_NONE
+        mov  rdi, rbx;
+        call vnode_slot;                        // rax = &vnode[root]
+        mov  rcx, 2;                            // VNODE_TYPE_DIR
+        mov  [rax + 0], rcx;                    // writes u64 (safe: slot was zeroed)
+        mov  rcx, 0xFFFF;                       // VNODE_IDX_NONE
+        mov  [rax + 8], rcx;                    // parent_idx = detached
+        // ops_ptr (+24) deliberately left at zero
+
+        // --- Phase 6: Pack the entry and store it ---
+        // entry_u64 = mp_idx | (root_idx << 16) | (backend << 32) | (flags << 40)
+
+        and  r12, 0xFFFF;                       // sanitize mp_idx (u16)
+        and  rbx, 0xFFFF;                       // sanitize root_idx (u16)
+        and  r14, 0xFF;                         // sanitize backend (u8)
+
+        mov  rax, rbx;
+        shl  rax, 16;
+        or   rax, r12;                          // rax = mp | (root << 16)
+
+        mov  rcx, r14;
+        shl  rcx, 32;
+        or   rax, rcx;                          // add backend at bits 32..40
+
+        // Compute flags: MOUNT_FLAG_VALID always; MOUNT_FLAG_ROOT if slot 0
+        mov  rcx, 1;                            // MOUNT_FLAG_VALID
+        cmp  r13, 0;
+        jne  no_root_flag;
+        or   rcx, 2;                            // MOUNT_FLAG_ROOT
+      no_root_flag:
+        shl  rcx, 40;
+        or   rax, rcx;                          // add flags at bits 40..48
+
+        // Store the packed entry
+        lea  r9, [rip + _mount_table];
+        mov  [r9 + r13*8], rax;                 // SIB scale-8, proven encoder pattern
+
+        // Return slot idx
+        mov  rax, r13;
+        jmp  mount_done;
+
+      mount_fail:
+        mov  rax, 0xFFFF;                       // MOUNT_IDX_NONE
+
+      mount_done:
+        pop  r15;
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mount_root_vnode() -> u64
+  //
+  // Return the root filesystem's root vnode index (u16 in low 16 bits of rax).
+  // Returns 0 if no root has been mounted yet.
+  //
+  // Leaf function: Load _mount_table[0], shift right by 16, mask to u16.
+  // Total: 4 instructions (no prologue, no nested calls).
+  //
+  // Semantics: Slot 0 is pinned as the root mount. On bootstrap,
+  // mount() fills slot 0 with the root vnode idx at bits [16, 32).
+  // mount_root_vnode returns that idx; callers use it as the start
+  // anchor for absolute-path resolution.
+  // ==========================================================================
+  pub let mount_root_vnode : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R16-M1-005 (#574) root vnode getter. Load _mount_table[0], shift right 16, mask to u16. Leaf function: no prologue, no nested calls, no callee-saved regs touched. Returns 0 iff slot 0 is empty (backend_type byte at bits [32,40) is zero, matching BSS zero-init). Safe to test rax==0 as 'no root mounted' without conflating with vnode index 0 (which is reserved per vfs-layout.md §7.2).",
+      block: {
+        lea rax, [rip + _mount_table];
+        mov rax, [rax];                         // rax = _mount_table[0]
+        shr rax, 16;                            // extract root_vnode_idx (bits [16, 32))
+        and rax, 0xFFFF;                        // mask to u16
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mount_lookup(vnode_idx: u64) -> u64
+  //
+  // Scan all 8 mount entries. For each entry with backend_type != 0,
+  // check two conditions:
+  //
+  // 1. entry.mountpoint_vnode_idx == vnode_idx → the input vnode is
+  //    a mountpoint directory; return the mounted fs's root vnode
+  //    (cross-mount descent).
+  // 2. entry.root_vnode_idx == vnode_idx → the input vnode is already
+  //    a mounted fs's root; return the same idx (self-loop / idempotent).
+  //
+  // Both conditions return entry.root_vnode_idx. Rationale: this makes
+  // mount_lookup idempotent — calling it twice is the same as calling
+  // it once.
+  //
+  // If no entry matches: return vnode_idx unchanged (identity fallthrough).
+  //
+  // Leaf function: no nested calls.
+  // ==========================================================================
+  pub let mount_lookup : (u64) -> u64 !{mem} @{} =
+    fn (vnode_idx: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R16-M1-005 (#574) mount table lookup. Scan all 8 entries: for each entry with backend_type!=0, check if mountpoint_vnode_idx or root_vnode_idx matches the input vnode_idx. If either matches, return the entry's root_vnode_idx (both cases return the same slot). If no entry matches, return vnode_idx unchanged (identity fallthrough). Leaf function: no prologue, no nested calls. Total is total — every input either matches an entry (returns traversed root) or returns unchanged. Idempotent: applying mount_lookup twice yields the same result as applying it once, because a traversed target is itself an entry's root_idx which matches condition 2 on a second call.",
+      block: {
+        and rdi, 0xFFFF;                        // Sanitize input to u16
+
+        lea r8, [rip + _mount_table];
+        xor rcx, rcx;                           // rcx = entry index
+
+      lookup_loop:
+        cmp rcx, 8;                             // MOUNT_MAX
+        jae lookup_not_found;
+
+        mov rax, [r8 + rcx*8];                  // load entry u64
+        shr rax, 32;                            // extract backend/flags high byte
+        and rax, 0xFF;                          // mask to backend_type
+        cmp rax, 0;                             // MOUNT_BACKEND_NONE
+        je  lookup_next;                        // skip empty slots
+
+        // Entry is occupied. Check if mountpoint_vnode_idx matches (bits [0, 16))
+        mov rax, [r8 + rcx*8];                  // reload entry
+        mov r10, rax;
+        and r10, 0xFFFF;                        // extract mountpoint_vnode_idx
+        cmp r10, rdi;
+        je  lookup_found;                       // match condition 1
+
+        // Check if root_vnode_idx matches (bits [16, 32))
+        mov r10, rax;
+        shr r10, 16;
+        and r10, 0xFFFF;                        // extract root_vnode_idx
+        cmp r10, rdi;
+        je  lookup_found;                       // match condition 2
+
+        // No match, try next entry
+      lookup_next:
+        add rcx, 1;
+        jmp lookup_loop;
+
+      lookup_found:
+        // Return entry.root_vnode_idx (bits [16, 32) of the loaded entry)
+        mov rax, [r8 + rcx*8];                  // reload entry
+        shr rax, 16;
+        and rax, 0xFFFF;                        // extract and mask to u16
+        ret;
+
+      lookup_not_found:
+        // No entry matched: return vnode_idx unchanged
+        mov rax, rdi;
+        ret
+      }
+    }
+}
