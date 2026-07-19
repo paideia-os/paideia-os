@@ -488,6 +488,11 @@ vfs_rw_ok_msg: .ascii "R16 VFS READ WRITE OK\n\0"
 .align 8
 vfs_rw_fail_msg: .ascii "R16 VFS READ WRITE FAIL\n\0"
 
+# R16-M1-001 (#578): VFS integration checkpoint message (all R16.M1 witnesses pass)
+.global vfs_ok_msg
+.align 8
+vfs_ok_msg: .ascii "VFS OK\n\0"
+
 # R16-M1-004 (#573): witness path strings for path_resolve sub-tests
 .global witness_path_slash
 .align 8
