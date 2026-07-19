@@ -462,6 +462,15 @@ mount_table_ok_msg: .ascii "R16 MOUNT TABLE OK\n\0"
 .align 8
 mount_table_fail_msg: .ascii "R16 MOUNT TABLE FAIL\n\0"
 
+# R16-M1-006 (#575): vfs_open witness success + failure messages
+.global vfs_open_ok_msg
+.align 8
+vfs_open_ok_msg: .ascii "R16 VFS OPEN OK\n\0"
+
+.global vfs_open_fail_msg
+.align 8
+vfs_open_fail_msg: .ascii "R16 VFS OPEN FAIL\n\0"
+
 # R16-M1-004 (#573): witness path strings for path_resolve sub-tests
 .global witness_path_slash
 .align 8
