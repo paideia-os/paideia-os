@@ -435,6 +435,15 @@ vnode_pool_ok_msg: .ascii "R16 VNODE POOL OK\n\0"
 .align 8
 vnode_pool_fail_msg: .ascii "R16 VNODE POOL FAIL\n\0"
 
+# R16-M1-003 (#572): vops dispatch witness success + failure messages
+.global vops_ok_msg
+.align 8
+vops_ok_msg: .ascii "R16 VOPS OK\n\0"
+
+.global vops_fail_msg
+.align 8
+vops_fail_msg: .ascii "R16 VOPS FAIL\n\0"
+
 # R15-M7-001 (#562): idle test start message
 .global idle_test_msg
 .align 8
