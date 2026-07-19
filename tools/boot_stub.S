@@ -577,6 +577,15 @@ tmpfs_read_ok_msg: .ascii "R16 TMPFS READ OK\n\0"
 .align 8
 tmpfs_read_fail_msg: .ascii "R16 TMPFS READ FAIL\n\0"
 
+# R16-M2-007 (#585): tmpfs_unlink witness success + failure messages
+.global tmpfs_unlink_ok_msg
+.align 8
+tmpfs_unlink_ok_msg: .ascii "R16 TMPFS UNLINK OK\n\0"
+
+.global tmpfs_unlink_fail_msg
+.align 8
+tmpfs_unlink_fail_msg: .ascii "R16 TMPFS UNLINK FAIL\n\0"
+
 # R16-M1-004 (#573): witness path strings for path_resolve sub-tests
 .global witness_path_slash
 .align 8

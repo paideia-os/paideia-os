@@ -1,0 +1,196 @@
+// src/kernel/core/fs/tmpfs/unlink.pdx — R16-M2-007 (#585)
+// tmpfs_unlink — splice + page release + inode release.
+//
+// Per design/kernel/r16-m2-007-tmpfs-unlink.md:
+//
+//   tmpfs_unlink removes a (dir_idx, name) binding from a directory's sibling
+//   chain and releases the target inode's backing memory. Type-gates the parent
+//   inode, locates the target via tmpfs_lookup, walks the parent's sibling chain
+//   a second time to find the target's predecessor, splices the target out of the
+//   chain, releases every non-zero page in the target's page_ptrs[16] back to the
+//   physical allocator, releases the target's inode slot via tmpfs_inode_free,
+//   and returns 0. Failure paths (bad parent type, name miss) return
+//   0xFFFFFFFFFFFFFFFF and mutate nothing.
+
+module Unlink = structure {
+  // ==========================================================================
+  // tmpfs_unlink(dir_idx: u64, name_ptr: u64) -> u64 — splice + release
+  // ==========================================================================
+  // Contract:
+  //   rdi = dir_inode_idx (u16 in low bits)
+  //   rsi = name_ptr (byte buffer, NUL-terminated)
+  //
+  //   rax = 0 on success
+  //   rax = 0xFFFFFFFFFFFFFFFF on failure (bad parent type, name miss)
+  //
+  // Register discipline (5-push prologue):
+  //   rbx = dir_idx — caller's arg1, saved on entry. Read at the type-gate
+  //         tmpfs_inode_slot(dir_idx) call, the tmpfs_lookup(dir_idx, name_ptr)
+  //         call, and the second tmpfs_inode_slot(dir_idx) call at splice time.
+  //   r12 = name_ptr — caller's arg2, saved on entry. Read exactly once, at the
+  //         tmpfs_lookup(dir_idx, name_ptr) call in Phase A. After that call
+  //         returns, name_ptr is semantically dead — its value is not read again,
+  //         but r12 stays occupied to preserve the 5-push alignment.
+  //   r13 = target_idx — result of tmpfs_lookup, saved into r13 the moment it
+  //         lands. Read at the walker's cur.next_sibling == target_idx termination
+  //         test, at the tmpfs_inode_slot(target_idx) call for target_ptr, and at
+  //         the final tmpfs_inode_free(target_idx) call.
+  //   r14 = target_ptr — result of tmpfs_inode_slot(target_idx). Read at the
+  //         target.next_sibling extraction and throughout the page-release loop.
+  //   r15 = Morphing role. Initially holds cur_idx during Phase-B walker. At
+  //         walker exit, r15 holds either 0xFFFF (head case) or actual prev_idx
+  //         (middle case). After splice, r15 is repurposed as the page-loop
+  //         counter (0..15).
+  //
+  pub let tmpfs_unlink : (u64, u64) -> u64 !{mem} @{} =
+    fn (dir_idx: u64, name_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R16-M2-007 (#585): Remove (dir_idx, name) binding from directory's sibling chain and release target's memory. Type-gates parent (must be DIR), locates target via tmpfs_lookup, walks chain to find predecessor, splices target out (head-case rewrites dir.first_child, middle-case rewrites prev.next_sibling), releases data pages via phys_free(page_va, 0), releases inode slot via tmpfs_inode_free (clears bitmap bit + zeros 256-byte payload). Five-push prologue (rbx, r12, r13, r14, r15) ensures rsp%16==0 at nested call sites (SysV AMD64). Splice happens before any release — critical for R17 concurrency correctness. r15 morphs from cur_idx→prev_idx during walker, then to page-loop counter after splice.",
+      block: {
+        // ====== Prologue (5 pushes for SysV alignment) ======
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                            // rsp%16 = 0
+
+        mov  rbx, rdi;                       // rbx = dir_idx
+        mov  r12, rsi;                       // r12 = name_ptr
+
+        // ====== Type-gate parent: dir.type at +0 must be VNODE_TYPE_DIR (2) ======
+        mov  rdi, rbx;
+        call tmpfs_inode_slot;               // rax = dir_ptr
+        xor  rcx, rcx;
+        mov_b rcx, [rax + 0];                // rcx = dir.type
+        cmp  rcx, 2;                         // VNODE_TYPE_DIR
+        jne  tmpfs_unlink_fail;              // parent is not a directory
+
+        // ====== Locate: tmpfs_lookup(dir_idx, name_ptr) ======
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tmpfs_lookup;                   // rax = target_idx or 0
+        cmp  rax, 0;
+        je   tmpfs_unlink_fail;              // name not present
+        mov  r13, rax;                       // r13 = target_idx (survives all nested calls)
+
+        // ====== Read dir.first_child (from dir's u64 @+176, bits [32, 48)) ======
+        mov  rdi, rbx;
+        call tmpfs_inode_slot;               // rax = dir_ptr
+        mov  rcx, [rax + 176];
+        shr  rcx, 32;
+        and  rcx, 0xFFFF;                    // rcx = dir.first_child
+
+        // ====== Head-case shortcut: if dir.first_child == target_idx, prev is virtual ======
+        cmp  rcx, r13;
+        je   tmpfs_unlink_head_splice;       // prev_idx = 0xFFFF; jump straight to splice
+
+        // ====== Walker: find cur such that cur.next_sibling == target_idx ======
+        mov  r15, rcx;                       // r15 = cur_idx (starts at first_child)
+
+      tmpfs_unlink_walker:
+        // cur_idx cannot be 0xFFFF here: tmpfs_lookup returned target_idx as a
+        // hit, so target is reachable from first_child. The head case above
+        // consumed the "target IS first_child" branch. Every iteration below
+        // either matches or advances to a valid next_sibling.
+        mov  rdi, r15;
+        call tmpfs_inode_slot;               // rax = cur_ptr
+        mov  rcx, [rax + 176];
+        shr  rcx, 16;
+        and  rcx, 0xFFFF;                    // rcx = cur.next_sibling
+        cmp  rcx, r13;                       // is cur the predecessor?
+        je   tmpfs_unlink_mid_splice;        // found — r15 holds prev_idx
+        mov  r15, rcx;                       // advance cursor
+        jmp  tmpfs_unlink_walker;
+
+        // ====== Splice — head case ======
+      tmpfs_unlink_head_splice:
+        // Head case: dir.first_child was target_idx; rewrite it.
+        // Need target.next_sibling and dir_ptr. dir_ptr is stale in rax
+        // from §4.4's tmpfs_inode_slot call — tmpfs_lookup was called
+        // between then and now (Phase A). rax is not preserved. So we re-call.
+        mov  rdi, r13;
+        call tmpfs_inode_slot;               // rax = target_ptr
+        mov  r14, rax;                       // r14 = target_ptr (survives phys_free later)
+
+        // Load target.next_sibling from bits [16, 32) of u64 @+176.
+        mov  rcx, [r14 + 176];
+        shr  rcx, 16;
+        and  rcx, 0xFFFF;                    // rcx = target.next_sibling
+
+        // Get dir_ptr for the first_child write.
+        mov  rdi, rbx;
+        call tmpfs_inode_slot;               // rax = dir_ptr
+
+        // Write target.next_sibling into dir.first_child at +180.
+        mov_w [rax + 180], rcx;
+        jmp  tmpfs_unlink_release;
+
+        // ====== Splice — middle case ======
+      tmpfs_unlink_mid_splice:
+        // Middle case: r15 = prev_idx.
+        mov  rdi, r13;
+        call tmpfs_inode_slot;               // rax = target_ptr
+        mov  r14, rax;
+
+        // target.next_sibling from bits [16, 32) of u64 @+176.
+        mov  rcx, [r14 + 176];
+        shr  rcx, 16;
+        and  rcx, 0xFFFF;                    // rcx = target.next_sibling
+
+        // prev_ptr = tmpfs_inode_slot(prev_idx).
+        mov  rdi, r15;
+        call tmpfs_inode_slot;               // rax = prev_ptr
+
+        // Write target.next_sibling into prev.next_sibling at +178.
+        mov_w [rax + 178], rcx;
+        // fall through to tmpfs_unlink_release
+
+        // ====== Data-page release loop ======
+        // Both splice branches converge at tmpfs_unlink_release. r14 = target_ptr,
+        // r13 = target_idx (still needed for the final tmpfs_inode_free call),
+        // r15 becomes the loop counter.
+      tmpfs_unlink_release:
+        // Loop counter in r15 (survives phys_free)
+        xor  r15, r15;                       // r15 = i = 0
+
+      tmpfs_unlink_page_loop:
+        cmp  r15, 16;                        // page_ptrs has 16 slots
+        jae  tmpfs_unlink_pages_done;
+
+        // Load page_ptrs[i]
+        lea  rax, [r14 + 16];                // rax = &page_ptrs[0]
+        mov  rdi, [rax + r15*8];             // rdi = page_ptrs[i]
+        cmp  rdi, 0;
+        je   tmpfs_unlink_page_next;         // slot empty — skip
+
+        // phys_free(page_va, order=0)
+        xor  rsi, rsi;                       // order = 0
+        call phys_free;                      // ignore rax (idempotent)
+
+      tmpfs_unlink_page_next:
+        add  r15, 1;
+        jmp  tmpfs_unlink_page_loop;
+
+      tmpfs_unlink_pages_done:
+        // tmpfs_inode_free(target_idx) — clears bitmap bit + zeros slot
+        mov  rdi, r13;
+        call tmpfs_inode_free;
+
+        // ====== Success: return 0 ======
+        xor  rax, rax;
+        jmp  tmpfs_unlink_done;
+
+      tmpfs_unlink_fail:
+        mov  rax, 0xFFFFFFFFFFFFFFFF;        // error sentinel
+
+      tmpfs_unlink_done:
+        pop  r15;
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+}
