@@ -59,7 +59,9 @@ topic: vfs_open — resolve path, alloc-if-O_CREAT, refcount++
 Preamble: mount is already done by #574 witness with fresh root vnode at some idx N.
 
 - Sub-test A: rax = vfs_open("/", 0). Expect rax != 0 (root vnode found).
-- Sub-test B: vnode_slot(rax).refcount now 2 (was 1 after mount).
+- Sub-test B: vnode_slot(rax).refcount now 1 (was 0 after mount — `mount()`'s
+  `alloc_root` phase never touches the refcount field, so a freshly allocated
+  vnode starts at 0; `vfs_open` is the first refcount++).
 - Sub-test C: rax = vfs_open("/nonexistent", 0). Expect rax == 0.
 - Sub-test D: rax = vfs_open("/nonexistent", 0x40). For R16.M1, expect rax == 0 (real create in R16.M2). Documented as scope limit — sub-test D checks that O_CREAT path is REACHED (branch taken), not that create succeeds.
 
