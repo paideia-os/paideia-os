@@ -1,0 +1,151 @@
+// src/kernel/core/fs/tmpfs/write.pdx — R16-M2-005 (#583)
+// tmpfs_write — lazy page allocation + memcpy + size update.
+//
+// Per design/kernel/r16-m2-005-tmpfs-write.md:
+//
+//   tmpfs_write allocates a backing page on first write, copies bytes
+//   via rep_movsb, and updates inode.size. Single-page constraint:
+//   cross-page writes return error sentinel (0xFFFFFFFFFFFFFFFF).
+//   All failures before allocation preserve pool byte-identically.
+
+module Write = structure {
+  // ==========================================================================
+  // tmpfs_write(inode_idx: u64, buf_ptr: u64, len: u64, offset: u64) -> u64
+  // — lazy allocation + copy + size bump (non-leaf)
+  // ==========================================================================
+  // Contract:
+  //   rdi = inode_idx (u16 in low bits)
+  //   rsi = buf_ptr (kernel VA, byte buffer)
+  //   rdx = len (byte count)
+  //   rcx = offset (starting byte offset within the file)
+  //
+  //   rax = len (bytes written) on success
+  //   rax = 0 when len == 0 (legal no-op)
+  //   rax = 0xFFFFFFFFFFFFFFFF on failure (bad type, range, cross-page, OOM)
+  //
+  // Register discipline (5-push prologue):
+  //   rbx = buf_ptr — caller's arg2, survives tmpfs_inode_slot and phys_alloc
+  //   r12 = len — caller's arg3, survives both nested calls
+  //   r13 = offset — caller's arg4, survives both nested calls
+  //   r14 = page_slot_addr — &page_ptrs[start_page], set after single-page check
+  //   r15 = inode_ptr — result of tmpfs_inode_slot, survives phys_alloc
+  //
+  // Scratch: rax (type load, arithmetic, end_offset), rcx (end_offset, page compute,
+  //   intra-page offset, rep_movsb count), rdx (end_page), r8 (page_ptr, rep_movsb dst),
+  //   r9 (start_page, feeds lea), rsi/rdi (rep_movsb src/dst)
+  pub let tmpfs_write : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (inode_idx: u64, buf_ptr: u64, len: u64, offset: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R16-M2-005 (#583): Single-page write — lazy-allocate page via phys_alloc(0), copy bytes via rep_movsb, update inode.size. Five-push prologue (rbx, r12, r13, r14, r15) ensures rsp%16==0 at nested call sites (SysV AMD64). All gates (type, range, single-page) execute before allocation to preserve pool on failure. Page pointer stored before copy (single-threaded at R16.M2); R17 concurrency will reorder via FS lock. rep_movsb emits F3 A4 per PA-R13-011 (#940).",
+      block: {
+        // ====== Prologue (5 pushes for SysV alignment) ======
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                            // rsp%16 = 0
+
+        mov  rbx, rsi;                       // rbx = buf_ptr
+        mov  r12, rdx;                       // r12 = len
+        mov  r13, rcx;                       // r13 = offset
+        // rdi still holds inode_idx for tmpfs_inode_slot call
+
+        // ====== §4.2: Zero-length fast path ======
+        cmp  r12, 0;
+        je   tmpfs_write_zero_len;
+
+        // ====== §4.3: Inode pointer + type gate ======
+        call tmpfs_inode_slot;               // rax = &inode
+        mov  r15, rax;                       // r15 = inode_ptr
+
+        xor  rcx, rcx;
+        mov_b rcx, [r15 + 0];                // rcx = inode.type
+        cmp  rcx, 1;                         // VNODE_TYPE_REG
+        jne  tmpfs_write_fail;
+
+        // ====== §4.4: Range gate ======
+        mov  rax, 65536;
+        cmp  r13, rax;                       // offset > 64 KiB?
+        ja   tmpfs_write_fail;
+        cmp  r12, rax;                       // len > 64 KiB?
+        ja   tmpfs_write_fail;
+        // both in [0, 65536], sum fits in u64 without overflow
+        mov  rcx, r13;
+        add  rcx, r12;                       // rcx = end_offset
+        cmp  rcx, rax;                       // end_offset > 64 KiB?
+        ja   tmpfs_write_fail;
+
+        // ====== §4.5: Single-page constraint ======
+        mov  r9, r13;                        // r9 = offset
+        shr  r9, 12;                         // r9 = start_page
+        mov  rdx, r13;
+        add  rdx, r12;                       // rdx = end_offset
+        sub  rdx, 1;                         // rdx = last_byte_offset
+        shr  rdx, 12;                        // rdx = end_page
+        cmp  r9, rdx;
+        jne  tmpfs_write_fail;               // cross-page (R16.M2 backtrack point)
+
+        // ====== §4.6: Page-slot address compute ======
+        lea  r14, [r15 + 16];                // r14 = &page_ptrs[0]
+        lea  r14, [r14 + r9*8];              // r14 = &page_ptrs[start_page]
+
+        // ====== §4.7: Lazy page allocation ======
+        mov  r8, [r14];                      // r8 = page_ptr
+        cmp  r8, 0;
+        jne  tmpfs_write_have_page;
+
+        // --- Allocate a fresh order-0 page ---
+        xor  rdi, rdi;                       // order = 0
+        call phys_alloc;                     // rax = page VA or 0
+        cmp  rax, 0;
+        je   tmpfs_write_fail;               // OOM
+        mov  r8, rax;                        // r8 = page_ptr
+        mov  [r14], r8;                      // publish into page_ptrs slot
+
+      tmpfs_write_have_page:
+
+        // ====== §4.8: Memcpy via rep_movsb ======
+        // --- dst = page_va + (offset & 0xFFF) ---
+        mov  rcx, r13;
+        and  rcx, 0xFFF;                     // rcx = intra-page offset
+        add  r8, rcx;                        // r8 = dst
+
+        // --- rep_movsb operands: rsi=src, rdi=dst, rcx=count ---
+        mov  rsi, rbx;                       // src = buf_ptr
+        mov  rdi, r8;                        // dst
+        mov  rcx, r12;                       // count = len
+        cld;                                 // DF=0 (forward copy)
+        rep_movsb;
+
+        // ====== §4.9: Size update ======
+        mov  rax, r13;
+        add  rax, r12;                       // rax = end_offset
+        mov  rdx, [r15 + 8];                 // rdx = inode.size
+        cmp  rax, rdx;
+        jbe  tmpfs_write_no_size_bump;       // end <= current size
+        mov  [r15 + 8], rax;                 // publish new size
+
+      tmpfs_write_no_size_bump:
+
+        // ====== §4.10: Success path ======
+        mov  rax, r12;                       // return len
+        jmp  tmpfs_write_done;
+
+      tmpfs_write_zero_len:
+        xor  rax, rax;                       // rax = 0 (bytes written = 0)
+        jmp  tmpfs_write_done;
+
+      tmpfs_write_fail:
+        mov  rax, 0xFFFFFFFFFFFFFFFF;        // error sentinel
+
+      tmpfs_write_done:
+        pop  r15;
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+}

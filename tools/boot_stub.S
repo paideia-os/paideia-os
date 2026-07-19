@@ -542,6 +542,23 @@ tmpfs_create_ok_msg: .ascii "R16 TMPFS CREATE OK\n\0"
 .align 8
 tmpfs_create_fail_msg: .ascii "R16 TMPFS CREATE FAIL\n\0"
 
+# R16-M2-005 (#583): tmpfs_write witness — 100-byte source buffer
+.global tmpfs_write_src_buf
+.align 8
+tmpfs_write_src_buf:
+	.rept 100
+	.byte 0x41						# 'A'
+	.endr
+
+# R16-M2-005 (#583): tmpfs_write witness success + failure messages
+.global tmpfs_write_ok_msg
+.align 8
+tmpfs_write_ok_msg: .ascii "R16 TMPFS WRITE OK\n\0"
+
+.global tmpfs_write_fail_msg
+.align 8
+tmpfs_write_fail_msg: .ascii "R16 TMPFS WRITE FAIL\n\0"
+
 # R16-M1-004 (#573): witness path strings for path_resolve sub-tests
 .global witness_path_slash
 .align 8
