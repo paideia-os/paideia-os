@@ -511,6 +511,28 @@ tmpfs_init_ok_msg: .ascii "R16 TMPFS INIT OK\n\0"
 .align 8
 tmpfs_init_fail_msg: .ascii "R16 TMPFS INIT FAIL\n\0"
 
+# R16-M2-003 (#581): tmpfs_lookup witness name strings
+.global witness_name_tmp
+.align 8
+witness_name_tmp: .ascii "tmp\0"
+
+.global witness_name_missing
+.align 8
+witness_name_missing: .ascii "missing\0"
+
+.global witness_name_any
+.align 8
+witness_name_any: .ascii "x\0"
+
+# R16-M2-003 (#581): tmpfs_lookup witness success + failure messages
+.global tmpfs_lookup_ok_msg
+.align 8
+tmpfs_lookup_ok_msg: .ascii "R16 TMPFS LOOKUP OK\n\0"
+
+.global tmpfs_lookup_fail_msg
+.align 8
+tmpfs_lookup_fail_msg: .ascii "R16 TMPFS LOOKUP FAIL\n\0"
+
 # R16-M1-004 (#573): witness path strings for path_resolve sub-tests
 .global witness_path_slash
 .align 8
