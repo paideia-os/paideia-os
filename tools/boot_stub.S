@@ -493,6 +493,15 @@ vfs_rw_fail_msg: .ascii "R16 VFS READ WRITE FAIL\n\0"
 .align 8
 vfs_ok_msg: .ascii "VFS OK\n\0"
 
+# R16-M2-001 (#579): tmpfs inode pool witness success + failure messages
+.global tmpfs_inode_pool_ok_msg
+.align 8
+tmpfs_inode_pool_ok_msg: .ascii "R16 TMPFS INODE POOL OK\n\0"
+
+.global tmpfs_inode_pool_fail_msg
+.align 8
+tmpfs_inode_pool_fail_msg: .ascii "R16 TMPFS INODE POOL FAIL\n\0"
+
 # R16-M1-004 (#573): witness path strings for path_resolve sub-tests
 .global witness_path_slash
 .align 8
