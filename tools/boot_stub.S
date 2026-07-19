@@ -426,6 +426,15 @@ sys_fork_witness_ok_msg: .ascii "R15 SYS FORK OK\n\0"
 .align 8
 sys_fork_witness_fail_msg: .ascii "R15 SYS FORK FAIL\n\0"
 
+# R16-M1-002 (#571): vnode_pool witness success + failure messages
+.global vnode_pool_ok_msg
+.align 8
+vnode_pool_ok_msg: .ascii "R16 VNODE POOL OK\n\0"
+
+.global vnode_pool_fail_msg
+.align 8
+vnode_pool_fail_msg: .ascii "R16 VNODE POOL FAIL\n\0"
+
 # R15-M7-001 (#562): idle test start message
 .global idle_test_msg
 .align 8
