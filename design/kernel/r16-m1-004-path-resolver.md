@@ -248,8 +248,6 @@ consumed a full path and can return `cur`.
   xor  rcx, rcx                                      ; rcx = j (component length)
 
 copy_char:
-  cmp  rcx, 63                                       ; NAME_MAX - 1 (reserve for NUL)
-  jae  path_fail
   cmp  r13, 256
   jae  path_fail
 
@@ -259,6 +257,9 @@ copy_char:
   je   end_component
   cmp  rax, 0x2F
   je   end_component
+
+  cmp  rcx, 63                                       ; NAME_MAX (component too long)
+  jae  path_fail
 
   mov_b [r14 + 0], rax                               ; store one byte
   add  r14, 1                                        ; advance write cursor
@@ -279,9 +280,20 @@ reg` is **not currently supported** for register-source narrow stores
 (see §6). Advancing the write pointer one byte at a time lets us use
 the supported `mov_b [base + disp], reg` form (disp = 0) uniformly.
 
-The `NAME_MAX = 63` check reserves the 64th byte for the NUL —
-`_path_component_buf` is sized exactly 64 B so a max-length component
-plus its terminator fits with no overrun.
+**Verify fix (#573 post-landing audit):** the `NAME_MAX = 63` length
+gate must come *after* the terminator check, not before. The original
+landed order checked `rcx >= 63` first, which fires at `rcx == 63`
+before `[r12]` (the 64th input byte) is ever read again — so a
+component of exactly `NAME_MAX` = 63 bytes was rejected one byte early
+instead of resolving cleanly, even though 63 is the documented
+maximum, not the first over-length value. Moving the gate below the
+terminator check lets a legal 63-byte component reach its `'\0'`/`'/'`
+on the next iteration and terminate normally, while the gate still
+fires (with no store) the moment a 64th real character shows up,
+so a 64+-byte component is rejected exactly as before with no
+buffer overrun — `_path_component_buf` is sized exactly 64 B so a
+max-length (63-byte) component plus its terminator fits with no
+overrun.
 
 ### 3.4 Handle `.` and `..` before dispatching to lookup
 
