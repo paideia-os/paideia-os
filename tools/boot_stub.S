@@ -605,6 +605,16 @@ sys_open_ok_msg: .ascii "R16 SYS OPEN OK\n\0"
 .align 8
 sys_open_fail_msg: .ascii "R16 SYS OPEN FAIL\n\0"
 
+# R16-M3-002 (#588): sys_close witness success message
+.global sys_close_ok_msg
+.align 8
+sys_close_ok_msg: .ascii "R16 SYS CLOSE OK\n\0"
+
+# R16-M3-002 (#588): sys_close witness failure message
+.global sys_close_fail_msg
+.align 8
+sys_close_fail_msg: .ascii "R16 SYS CLOSE FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
