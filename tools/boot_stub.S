@@ -625,6 +625,16 @@ sys_read_ok_msg: .ascii "R16 SYS READ OK\n\0"
 .align 8
 sys_read_fail_msg: .ascii "R16 SYS READ FAIL\n\0"
 
+# R16-M3-004 (#590): sys_write witness success message
+.global sys_write_ok_msg
+.align 8
+sys_write_ok_msg: .ascii "R16 SYS WRITE OK\n\0"
+
+# R16-M3-004 (#590): sys_write witness failure message
+.global sys_write_fail_msg
+.align 8
+sys_write_fail_msg: .ascii "R16 SYS WRITE FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
