@@ -635,6 +635,16 @@ sys_write_ok_msg: .ascii "R16 SYS WRITE OK\n\0"
 .align 8
 sys_write_fail_msg: .ascii "R16 SYS WRITE FAIL\n\0"
 
+# R16-M3-005 (#591): sys_dup2 witness success message
+.global sys_dup2_ok_msg
+.align 8
+sys_dup2_ok_msg: .ascii "R16 SYS DUP2 OK\n\0"
+
+# R16-M3-005 (#591): sys_dup2 witness failure message
+.global sys_dup2_fail_msg
+.align 8
+sys_dup2_fail_msg: .ascii "R16 SYS DUP2 FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
