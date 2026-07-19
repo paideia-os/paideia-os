@@ -615,6 +615,16 @@ sys_close_ok_msg: .ascii "R16 SYS CLOSE OK\n\0"
 .align 8
 sys_close_fail_msg: .ascii "R16 SYS CLOSE FAIL\n\0"
 
+# R16-M3-003 (#589): sys_read witness success message
+.global sys_read_ok_msg
+.align 8
+sys_read_ok_msg: .ascii "R16 SYS READ OK\n\0"
+
+# R16-M3-003 (#589): sys_read witness failure message
+.global sys_read_fail_msg
+.align 8
+sys_read_fail_msg: .ascii "R16 SYS READ FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
@@ -643,6 +653,11 @@ witness_path_nope: .ascii "/nope\0"
 .global witness_path_double_slash
 .align 8
 witness_path_double_slash: .ascii "//foo//bar\0"
+
+# R16-M3-003 (#589): sys_read witness path for /tmp/x
+.global witness_path_tmp_x
+.align 8
+witness_path_tmp_x: .ascii "/tmp/x\0"
 
 # R15-M7-001 (#562): idle test start message
 .global idle_test_msg
