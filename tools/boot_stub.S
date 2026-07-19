@@ -444,6 +444,40 @@ vops_ok_msg: .ascii "R16 VOPS OK\n\0"
 .align 8
 vops_fail_msg: .ascii "R16 VOPS FAIL\n\0"
 
+# R16-M1-004 (#573): path_resolve witness success + failure messages
+.global path_resolve_ok_msg
+.align 8
+path_resolve_ok_msg: .ascii "R16 PATH RESOLVE OK\n\0"
+
+.global path_resolve_fail_msg
+.align 8
+path_resolve_fail_msg: .ascii "R16 PATH RESOLVE FAIL\n\0"
+
+# R16-M1-004 (#573): witness path strings for path_resolve sub-tests
+.global witness_path_slash
+.align 8
+witness_path_slash: .ascii "/\0"
+
+.global witness_path_dot
+.align 8
+witness_path_dot: .ascii ".\0"
+
+.global witness_path_dotdot
+.align 8
+witness_path_dotdot: .ascii "..\0"
+
+.global witness_path_foo_bar
+.align 8
+witness_path_foo_bar: .ascii "/foo/bar\0"
+
+.global witness_path_nope
+.align 8
+witness_path_nope: .ascii "/nope\0"
+
+.global witness_path_double_slash
+.align 8
+witness_path_double_slash: .ascii "//foo//bar\0"
+
 # R15-M7-001 (#562): idle test start message
 .global idle_test_msg
 .align 8
