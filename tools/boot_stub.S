@@ -559,6 +559,24 @@ tmpfs_write_ok_msg: .ascii "R16 TMPFS WRITE OK\n\0"
 .align 8
 tmpfs_write_fail_msg: .ascii "R16 TMPFS WRITE FAIL\n\0"
 
+# R16-M2-006 (#584): tmpfs_read witness — 128-byte destination buffer
+# (16 u64 slots; covers the 100-byte read from /tmp/x plus tail slack)
+.global tmpfs_read_dst_buf
+.align 8
+tmpfs_read_dst_buf:
+	.rept 16
+	.quad 0x0000000000000000
+	.endr
+
+# R16-M2-006 (#584): tmpfs_read witness success + failure messages
+.global tmpfs_read_ok_msg
+.align 8
+tmpfs_read_ok_msg: .ascii "R16 TMPFS READ OK\n\0"
+
+.global tmpfs_read_fail_msg
+.align 8
+tmpfs_read_fail_msg: .ascii "R16 TMPFS READ FAIL\n\0"
+
 # R16-M1-004 (#573): witness path strings for path_resolve sub-tests
 .global witness_path_slash
 .align 8
