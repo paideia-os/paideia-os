@@ -454,6 +454,16 @@ idle_witness_ok_msg: .ascii "R15 IDLE TASK OK\n\0"
 .align 8
 idle_witness_fail_msg: .ascii "R15 IDLE TASK FAIL\n\0"
 
+# R15-M7-002 (#563): runqueue witness success message
+.global runq_witness_ok_msg
+.align 8
+runq_witness_ok_msg: .ascii "R15 RUNQUEUE OK\n\0"
+
+# R15-M7-002 (#563): runqueue witness failure message
+.global runq_witness_fail_msg
+.align 8
+runq_witness_fail_msg: .ascii "R15 RUNQUEUE FAIL\n\0"
+
 # R15-M6-004 (#555): sys_execve witness — bad-ELF payload for sub-test B.
 # 64 bytes; first 4 bytes deliberately NOT \x7fELF, so elf_lite_load
 # rejects at the magic gate (returns ELF_BAD_HDR = 0xFFFFFFFF).
