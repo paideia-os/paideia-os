@@ -479,6 +479,15 @@ vfs_close_ok_msg: .ascii "R16 VFS CLOSE OK\n\0"
 .align 8
 vfs_close_fail_msg: .ascii "R16 VFS CLOSE FAIL\n\0"
 
+# R16-M1-008 (#577): vfs_read/vfs_write witness success + failure messages
+.global vfs_rw_ok_msg
+.align 8
+vfs_rw_ok_msg: .ascii "R16 VFS READ WRITE OK\n\0"
+
+.global vfs_rw_fail_msg
+.align 8
+vfs_rw_fail_msg: .ascii "R16 VFS READ WRITE FAIL\n\0"
+
 # R16-M1-004 (#573): witness path strings for path_resolve sub-tests
 .global witness_path_slash
 .align 8
