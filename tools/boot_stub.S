@@ -586,6 +586,19 @@ tmpfs_unlink_ok_msg: .ascii "R16 TMPFS UNLINK OK\n\0"
 .align 8
 tmpfs_unlink_fail_msg: .ascii "R16 TMPFS UNLINK FAIL\n\0"
 
+# R16-M2-008 (#586): tmpfs vops table wire-up witness success + failure + name
+.global tmpfs_vops_ok_msg
+.align 8
+tmpfs_vops_ok_msg: .ascii "R16 TMPFS VOPS OK\n\0"
+
+.global tmpfs_vops_fail_msg
+.align 8
+tmpfs_vops_fail_msg: .ascii "R16 TMPFS VOPS FAIL\n\0"
+
+.global tmpfs_vops_witness_name_tmp
+.align 8
+tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
+
 # R16-M1-004 (#573): witness path strings for path_resolve sub-tests
 .global witness_path_slash
 .align 8
