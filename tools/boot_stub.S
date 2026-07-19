@@ -533,6 +533,15 @@ tmpfs_lookup_ok_msg: .ascii "R16 TMPFS LOOKUP OK\n\0"
 .align 8
 tmpfs_lookup_fail_msg: .ascii "R16 TMPFS LOOKUP FAIL\n\0"
 
+# R16-M2-004 (#582): tmpfs_create witness success + failure messages
+.global tmpfs_create_ok_msg
+.align 8
+tmpfs_create_ok_msg: .ascii "R16 TMPFS CREATE OK\n\0"
+
+.global tmpfs_create_fail_msg
+.align 8
+tmpfs_create_fail_msg: .ascii "R16 TMPFS CREATE FAIL\n\0"
+
 # R16-M1-004 (#573): witness path strings for path_resolve sub-tests
 .global witness_path_slash
 .align 8
