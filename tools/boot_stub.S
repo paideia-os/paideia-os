@@ -502,6 +502,15 @@ tmpfs_inode_pool_ok_msg: .ascii "R16 TMPFS INODE POOL OK\n\0"
 .align 8
 tmpfs_inode_pool_fail_msg: .ascii "R16 TMPFS INODE POOL FAIL\n\0"
 
+# R16-M2-002 (#580): tmpfs_init witness success + failure messages
+.global tmpfs_init_ok_msg
+.align 8
+tmpfs_init_ok_msg: .ascii "R16 TMPFS INIT OK\n\0"
+
+.global tmpfs_init_fail_msg
+.align 8
+tmpfs_init_fail_msg: .ascii "R16 TMPFS INIT FAIL\n\0"
+
 # R16-M1-004 (#573): witness path strings for path_resolve sub-tests
 .global witness_path_slash
 .align 8
