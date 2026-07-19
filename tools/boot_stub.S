@@ -645,6 +645,16 @@ sys_dup2_ok_msg: .ascii "R16 SYS DUP2 OK\n\0"
 .align 8
 sys_dup2_fail_msg: .ascii "R16 SYS DUP2 FAIL\n\0"
 
+# R16-M3-006 (#592): fd_inherit witness success message
+.global fd_inherit_ok_msg
+.align 8
+fd_inherit_ok_msg: .ascii "R16 FD INHERIT OK\n\0"
+
+# R16-M3-006 (#592): fd_inherit witness failure message
+.global fd_inherit_fail_msg
+.align 8
+fd_inherit_fail_msg: .ascii "R16 FD INHERIT FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
