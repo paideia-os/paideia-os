@@ -691,6 +691,16 @@ fd_cloexec_fail_sub_c: .ascii "R16 FD CLOEXEC FAIL (sub-test C)\n\0"
 .align 8
 fd_ok_msg: .ascii "FD OK\n\0"
 
+# R16-M4-001 (#595): uart_rx_init witness success message
+.global uart_rx_init_ok_msg
+.align 8
+uart_rx_init_ok_msg: .ascii "R16 UART RX INIT OK\n\0"
+
+# R16-M4-001 (#595): uart_rx_init witness failure message
+.global uart_rx_init_fail_msg
+.align 8
+uart_rx_init_fail_msg: .ascii "R16 UART RX INIT FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
