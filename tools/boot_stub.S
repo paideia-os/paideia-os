@@ -781,6 +781,16 @@ tty_vops_ok_msg: .ascii "R16 TTY VOPS OK\n\0"
 .align 8
 tty_vops_fail_msg: .ascii "R16 TTY VOPS FAIL\n\0"
 
+# R16-M5-003 (#604): tty_line_buffer witness success message
+.global tty_line_ok_msg
+.align 8
+tty_line_ok_msg: .ascii "R16 TTY LINE OK\n\0"
+
+# R16-M5-003 (#604): tty_line_buffer witness failure message
+.global tty_line_fail_msg
+.align 8
+tty_line_fail_msg: .ascii "R16 TTY LINE FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
