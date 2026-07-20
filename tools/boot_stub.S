@@ -686,6 +686,11 @@ fd_cloexec_fail_sub_b: .ascii "R16 FD CLOEXEC FAIL (sub-test B)\n\0"
 .align 8
 fd_cloexec_fail_sub_c: .ascii "R16 FD CLOEXEC FAIL (sub-test C)\n\0"
 
+# R16-M3-008 (#594): FD OK — milestone closure marker
+.global fd_ok_msg
+.align 8
+fd_ok_msg: .ascii "FD OK\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
