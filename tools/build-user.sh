@@ -93,6 +93,9 @@ if [[ ${#INIT_OBJECTS[@]} -gt 0 ]]; then
     echo "[objcopy-user] init.elf -> init.bin"
     objcopy -O binary "${BUILD_DIR}/init.elf" "${BUILD_DIR}/init.bin"
 
+    echo "[verify-user] byte-pattern canary on sys_open/sys_dup2/sys_close in init.elf"
+    "${REPO_ROOT}/tools/verify-user-init.sh" "${BUILD_DIR}/init.elf"
+
     echo "[ok] ${BUILD_DIR}/init.elf"
     echo "[ok] ${BUILD_DIR}/init.bin"
 fi
