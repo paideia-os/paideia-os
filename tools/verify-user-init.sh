@@ -229,13 +229,27 @@ else
     FAIL=1
 fi
 
-# Verify wait_status symbol exists (.bss or rodata) (R17-M2-004 #619)
-WAIT_STATUS=$(echo "$DUMP" | grep -c "wait_status" || true)
-if [[ $WAIT_STATUS -ge 1 ]]; then
-    echo "[ok]   wait_status symbol found in .bss"
-else
+# Verify wait_status symbol exists AND is actually placed in .bss (R17-M2-004 #619;
+# fix #619b — a bare grep for "wait_status" in the disassembly dump would also
+# match a .rodata placement and print a false-positive "[ok] ... in .bss", which
+# is exactly the bug that let the original R+X placement slip through review.
+# We cross-check the ELF symbol table (objdump -t) for the section field so a
+# regression back to .rodata/.data is caught here instead of at #GP fault time.
+WAIT_STATUS_SYMLINE=$(objdump -t "$ELF" 2>/dev/null | awk '$NF == "wait_status" { print }')
+if [[ -z "$WAIT_STATUS_SYMLINE" ]]; then
     echo "[FAIL] wait_status symbol not found"
     FAIL=1
+else
+    # Symtab line shape: <addr> <flags> <type> <section> <size> <name>
+    WAIT_STATUS_SECTION=$(echo "$WAIT_STATUS_SYMLINE" | awk '{print $(NF-2)}')
+    if [[ "$WAIT_STATUS_SECTION" == ".bss" ]]; then
+        echo "[ok]   wait_status symbol found in .bss (writable, per readelf -SW)"
+    else
+        echo "[FAIL] wait_status symbol found but placed in '${WAIT_STATUS_SECTION}', not .bss"
+        echo "       (a non-.bss placement means the kernel's sys_wait4 write into"
+        echo "        wait_status would fault #GP against a non-writable segment)"
+        FAIL=1
+    fi
 fi
 
 # Verify cmp + je branching pattern (fork child detection)
