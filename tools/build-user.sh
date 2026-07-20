@@ -79,6 +79,9 @@ echo "[verify-user] symbol + call-site canary on puts_new/getline in shell.elf"
 echo "[verify-libc-test] integration chain — all R17.M1 canaries"
 "${REPO_ROOT}/tools/verify-libc-test.sh" "${BUILD_DIR}/shell.elf"
 
+echo "[verify-shell] main loop skeleton for R17.M3-001 — prompt/getline/dispatch/loop"
+"${REPO_ROOT}/tools/verify-user-shell.sh" "${BUILD_DIR}/shell.elf"
+
 echo "[ok] ${BUILD_DIR}/shell.elf"
 echo "[ok] ${BUILD_DIR}/shell.bin"
 
