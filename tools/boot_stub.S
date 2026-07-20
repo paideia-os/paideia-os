@@ -801,6 +801,16 @@ tty_input_ok_msg: .ascii "R16 TTY INPUT OK\n\0"
 .align 8
 tty_input_fail_msg: .ascii "R16 TTY INPUT FAIL\n\0"
 
+# R16-M5-005 (#606): tty_read witness success message
+.global tty_read_ok_msg
+.align 8
+tty_read_ok_msg: .ascii "R16 TTY READ OK\n\0"
+
+# R16-M5-005 (#606): tty_read witness failure message
+.global tty_read_fail_msg
+.align 8
+tty_read_fail_msg: .ascii "R16 TTY READ FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
