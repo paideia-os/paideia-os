@@ -43,5 +43,8 @@ objcopy -O binary "${BUILD_DIR}/shell.elf" "${BUILD_DIR}/shell.bin"
 echo "[verify-user] byte-pattern canary on shell.elf"
 "${REPO_ROOT}/tools/verify-syscall-shim.sh" "${BUILD_DIR}/shell.elf"
 
+echo "[verify-user] byte-shape canary on strlen/memcmp in shell.elf"
+"${REPO_ROOT}/tools/verify-user-string.sh" "${BUILD_DIR}/shell.elf"
+
 echo "[ok] ${BUILD_DIR}/shell.elf"
 echo "[ok] ${BUILD_DIR}/shell.bin"
