@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Byte-pattern canary for src/user/init.pdx (R17-M2-002 / #617).
-# Verifies init contains calls to sys_open, sys_dup2 (3x), and sys_close.
-# Exits with "R17 INIT FD OK" or "R17 INIT FD FAIL".
+# Byte-pattern canary for src/user/init.pdx (R17-M2-003 / #618).
+# Verifies init contains: sys_open, sys_dup2 (3x), sys_close, sys_fork, sys_execve.
+# Also verifies: bin_sh_path rodata, cmp+je branching for fork result.
+# Exits with "R17 INIT FORK OK" or "R17 INIT FORK FAIL".
 set -euo pipefail
 
 ELF="${1:-build/user/init.elf}"
@@ -56,6 +57,10 @@ SYS_OPEN_PATTERN="48 c7 c0 02 00 00 00 0f 05 c3"
 SYS_DUP2_PATTERN="48 c7 c0 20 00 00 00 0f 05 c3"
 # sys_close: mov rax, 3; syscall; ret
 SYS_CLOSE_PATTERN="48 c7 c0 03 00 00 00 0f 05 c3"
+# sys_fork: mov rax, 56; syscall; ret
+SYS_FORK_PATTERN="48 c7 c0 38 00 00 00 0f 05 c3"
+# sys_execve: mov rax, 59; syscall; ret
+SYS_EXECVE_PATTERN="48 c7 c0 3b 00 00 00 0f 05 c3"
 
 # Check sys_open
 sys_open_bytes=$(extract_bytes "sys_open") || sys_open_bytes=""
@@ -90,6 +95,28 @@ else
     FAIL=1
 fi
 
+# Check sys_fork
+sys_fork_bytes=$(extract_bytes "sys_fork") || sys_fork_bytes=""
+if [[ "$sys_fork_bytes" == "$SYS_FORK_PATTERN" ]]; then
+    echo "[ok]   sys_fork found"
+else
+    echo "[FAIL] sys_fork not found or incorrect"
+    echo "       want: $SYS_FORK_PATTERN"
+    echo "       got : $sys_fork_bytes"
+    FAIL=1
+fi
+
+# Check sys_execve
+sys_execve_bytes=$(extract_bytes "sys_execve") || sys_execve_bytes=""
+if [[ "$sys_execve_bytes" == "$SYS_EXECVE_PATTERN" ]]; then
+    echo "[ok]   sys_execve found"
+else
+    echo "[FAIL] sys_execve not found or incorrect"
+    echo "       want: $SYS_EXECVE_PATTERN"
+    echo "       got : $sys_execve_bytes"
+    FAIL=1
+fi
+
 # Count actual calls to sys_open, sys_dup2, sys_close in _start disassembly
 # This verifies that init._start calls these functions (not just that they exist in the binary)
 _START_DUMP=$(echo "$DUMP" | awk '/^[0-9a-f]+ <_start>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag')
@@ -121,10 +148,48 @@ else
     FAIL=1
 fi
 
+# Count call sys_fork
+CALL_FORK=$(echo "$_START_DUMP" | grep -c "call.*sys_fork" || true)
+if [[ $CALL_FORK -ge 1 ]]; then
+    echo "[ok]   call sys_fork found (count: $CALL_FORK)"
+else
+    echo "[FAIL] call sys_fork not found in _start"
+    FAIL=1
+fi
+
+# Count call sys_execve
+CALL_EXECVE=$(echo "$_START_DUMP" | grep -c "call.*sys_execve" || true)
+if [[ $CALL_EXECVE -ge 1 ]]; then
+    echo "[ok]   call sys_execve found (count: $CALL_EXECVE)"
+else
+    echo "[FAIL] call sys_execve not found in _start"
+    FAIL=1
+fi
+
+# Verify bin_sh_path symbol exists in rodata
+BIN_SH_PATH=$(echo "$DUMP" | grep -c "bin_sh_path" || true)
+if [[ $BIN_SH_PATH -ge 1 ]]; then
+    echo "[ok]   bin_sh_path symbol found in rodata"
+else
+    echo "[FAIL] bin_sh_path symbol not found"
+    FAIL=1
+fi
+
+# Verify cmp + je branching pattern (fork child detection)
+# Check for both cmp and je instructions (they may be on separate lines)
+CMP_COUNT=$(echo "$_START_DUMP" | grep -c "cmp" || true)
+JE_COUNT=$(echo "$_START_DUMP" | grep -c "je" || true)
+if [[ $CMP_COUNT -ge 1 && $JE_COUNT -ge 1 ]]; then
+    echo "[ok]   cmp+je branching found (fork result check)"
+else
+    echo "[FAIL] cmp+je branching not found in _start (cmp: $CMP_COUNT, je: $JE_COUNT)"
+    FAIL=1
+fi
+
 if [[ $FAIL -eq 0 ]]; then
-    echo "R17 INIT FD OK"
+    echo "R17 INIT FORK OK"
     exit 0
 else
-    echo "R17 INIT FD FAIL"
+    echo "R17 INIT FORK FAIL"
     exit 1
 fi
