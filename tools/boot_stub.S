@@ -741,6 +741,16 @@ ioapic_irq4_ok_msg: .ascii "R16 IOAPIC IRQ4 OK\n\0"
 .align 8
 ioapic_irq4_fail_msg: .ascii "R16 IOAPIC IRQ4 FAIL\n\0"
 
+# R16-M4-006 (#600): uart_rx_notify witness success message
+.global uart_rx_notify_ok_msg
+.align 8
+uart_rx_notify_ok_msg: .ascii "R16 UART RX NOTIFY OK\n\0"
+
+# R16-M4-006 (#600): uart_rx_notify witness failure message
+.global uart_rx_notify_fail_msg
+.align 8
+uart_rx_notify_fail_msg: .ascii "R16 UART RX NOTIFY FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
