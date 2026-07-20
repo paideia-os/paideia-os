@@ -104,6 +104,58 @@ verify_fn errno_set 12 28
 # Rough byte count: ~80-120 bytes depending on encoding and branch distances.
 verify_fn syscall_check 50 150
 
+# #613 regression guard: syscall_check's -4095 boundary MUST be built via
+# xor+sub (encoder-safe), never via a bare 64-bit immediate mov. bebc377
+# used `mov r8, 0xFFFFF000` expecting sign-extension to -4096; paideia-as
+# instead emits MOVABS r64, imm64 with the immediate loaded verbatim
+# (unsigned), which made the subsequent `cmp rax, r8; jl` branch always
+# taken and turned the entire POSIX error-handling path into dead code.
+# Re-check both directions on every build:
+#   (a) the sub-based boundary construction IS present (49 81 e8 ff 0f =
+#       sub r8, 0xfff, i.e. r8 = -4095), and
+#   (b) no MOVABS r8, imm64 pattern (49 b8) appears anywhere in the
+#       function body.
+verify_syscall_check_no_movabs_boundary() {
+    local name="syscall_check"
+    local dump
+    dump=$(objdump -d -M intel "$ELF" 2>/dev/null | awk -v sym="$name" -F '\t' '
+        BEGIN { seen = 0; buf = "" }
+        $0 ~ "<"sym">:"       { seen = 1; next }
+        seen && $0 ~ /^[0-9a-f]+ </ { exit }         # next symbol
+        seen && NF >= 2 && $1 ~ /^[[:space:]]+[0-9a-f]+:/ {
+            hex_bytes = $2
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", hex_bytes)
+            if (hex_bytes != "") buf = buf " " hex_bytes
+        }
+        END { print buf }
+    ' | tr -s ' ' | sed 's/^ //;s/ $//')
+
+    if [[ -z "$dump" ]]; then
+        echo "[FAIL] $name: symbol not found in ELF (regression guard skipped)"
+        FAIL=1
+        return
+    fi
+
+    # (a) sub-based boundary construction present: 49 81 e8 ff 0f
+    #     (REX.WB 81 /5 id = sub r8, imm32; imm32 = 0x00000fff = 4095).
+    if ! echo "$dump" | grep -qE '49 81 e8 ff 0f'; then
+        echo "[FAIL] $name: missing encoder-safe boundary construction (49 81 e8 ff 0f = sub r8,0xfff / -4095) — #613 regression?"
+        FAIL=1
+    else
+        echo "[ok]   $name: encoder-safe -4095 boundary (sub r8,0xfff) present"
+    fi
+
+    # (b) no MOVABS r8, imm64: opcode byte 49 b8 (REX.WB + B8 = MOVABS r8,imm64).
+    if echo "$dump" | grep -qE '49 b8'; then
+        echo "[FAIL] $name: contains MOVABS r8, imm64 (49 b8) — #613 sign-extension bug has regressed"
+        FAIL=1
+    else
+        echo "[ok]   $name: no MOVABS r8, imm64 (49 b8) present"
+    fi
+}
+
+verify_syscall_check_no_movabs_boundary
+
 if (( FAIL == 0 )); then
     echo "R17 USER ERRNO OK"
     exit 0
