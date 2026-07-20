@@ -721,6 +721,16 @@ uart_rx_isr_ok_msg: .ascii "R16 UART RX ISR OK\n\0"
 .align 8
 uart_rx_isr_fail_msg: .ascii "R16 UART RX ISR FAIL\n\0"
 
+# R16-M4-004 (#598): idt vector 0x24 witness success message
+.global idt_vec24_ok_msg
+.align 8
+idt_vec24_ok_msg: .ascii "R16 IDT VEC24 OK\n\0"
+
+# R16-M4-004 (#598): idt vector 0x24 witness failure message
+.global idt_vec24_fail_msg
+.align 8
+idt_vec24_fail_msg: .ascii "R16 IDT VEC24 FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
