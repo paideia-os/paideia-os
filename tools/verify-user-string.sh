@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build-time shape canary for src/user/string.pdx (R17-M1-002 / #611).
-# Verifies strlen and memcmp exist, sit within size budgets, contain
-# byte-loop opcode signatures, and do NOT contain the syscall opcode.
-# Exits with "R17 USER STRING OK" or "R17 USER STRING FAIL".
+# Build-time shape canary for src/user/string.pdx (R17-M1-002 / #611 + R17-M1-003 / #612).
+# Verifies strlen, memcmp, memcpy, memset exist, sit within size budgets, contain
+# appropriate opcode signatures, and do NOT contain the syscall opcode.
+# Exits with "R17 USER MEM OK" or "R17 USER MEM FAIL".
 set -euo pipefail
 
 ELF="${1:-build/user/shell.elf}"
@@ -80,13 +80,77 @@ verify_fn() {
     fi
 }
 
+# Verify a rep-prefix function: name, min_bytes, max_bytes, rep_opcode.
+# rep_opcode: "a4" for rep_movsb, "aa" for rep_stosb.
+verify_rep_fn() {
+    local name="$1" lo="$2" hi="$3" rep_op="$4"
+
+    # Extract the function's disassembly (bytes column only).
+    local dump
+    dump=$(objdump -d -M intel "$ELF" 2>/dev/null | awk -v sym="$name" -F '\t' '
+        BEGIN { seen = 0; buf = "" }
+        $0 ~ "<"sym">:"       { seen = 1; next }
+        seen && $0 ~ /^[0-9a-f]+ </ { exit }         # next symbol
+        seen && NF >= 2 && $1 ~ /^[[:space:]]+[0-9a-f]+:/ {
+            hex_bytes = $2
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", hex_bytes)
+            if (hex_bytes != "") buf = buf " " hex_bytes
+        }
+        END { print buf }
+    ' | tr -s ' ' | sed 's/^ //;s/ $//')
+
+    if [[ -z "$dump" ]]; then
+        echo "[FAIL] $name: symbol not found in ELF"
+        FAIL=1
+        return
+    fi
+
+    # Count bytes (each byte is 2 hex chars + separator).
+    local nbytes
+    nbytes=$(echo "$dump" | tr ' ' '\n' | grep -c '^[0-9a-f][0-9a-f]$' || true)
+
+    if (( nbytes < lo || nbytes > hi )); then
+        echo "[FAIL] $name: $nbytes bytes outside budget [$lo, $hi]"
+        FAIL=1
+        return
+    fi
+
+    # rep-signature: must contain "fc" (cld), "f3 <rep_op>" (rep prefix +
+    # movsb/stosb), and "c3" (ret). Must NOT contain 0f 05 (syscall).
+    if ! echo "$dump" | grep -q "fc"; then
+        echo "[FAIL] $name: missing cld (fc)"
+        FAIL=1
+    fi
+    if ! echo "$dump" | grep -q "f3 ${rep_op}"; then
+        echo "[FAIL] $name: missing rep prefix f3 ${rep_op}"
+        FAIL=1
+    fi
+    if ! echo "$dump" | grep -q 'c3'; then
+        echo "[FAIL] $name: missing ret (c3)"
+        FAIL=1
+    fi
+    if echo "$dump" | grep -q '0f 05'; then
+        echo "[FAIL] $name: contains syscall opcode 0f 05 — must be pure userland"
+        FAIL=1
+    fi
+
+    if (( FAIL == 0 )); then
+        echo "[ok]   $name: $nbytes bytes; rep signature OK"
+    fi
+}
+
+# Existing byte-loop verifications (unchanged):
 verify_fn strlen 20 40
 verify_fn memcmp 40 70
 
+# New rep-prefix verifications:
+verify_rep_fn memcpy 10 30 a4
+verify_rep_fn memset 12 30 aa
+
 if (( FAIL == 0 )); then
-    echo "R17 USER STRING OK"
+    echo "R17 USER MEM OK"
     exit 0
 else
-    echo "R17 USER STRING FAIL"
+    echo "R17 USER MEM FAIL"
     exit 1
 fi
