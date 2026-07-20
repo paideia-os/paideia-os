@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# Build-time structural canary for src/user/shell.pdx (R17-M3-001 / #621).
-# Verifies shell main loop skeleton:
+# Build-time structural canary for src/user/shell.pdx (R17-M3-001 / #621 + R17-M3-002 / #622).
+# Verifies shell main loop skeleton with line reader:
 # - prompt_msg rodata symbol
 # - line_buf .bss symbol (256 bytes)
 # - puts_new call (for prompt emission)
-# - getline call (for line reading)
+# - shell_read_line call (for line reading, byte-by-byte until '\n' or EOF or buffer full)
+# - shell_read_line function body contains: sys_read call, cmp against 0x0A (\n), byte loop pattern
 # - Backward jump pattern (main loop)
 # - dispatch_line call (stub)
-# Exits with "R17 SHELL SKELETON OK" or "R17 SHELL SKELETON FAIL".
+# Exits with "R17 SHELL READER OK" or "R17 SHELL READER FAIL".
 set -euo pipefail
 
 ELF="${1:-build/user/shell.elf}"
 
 if [[ ! -f "$ELF" ]]; then
-    echo "R17 SHELL SKELETON FAIL" >&2
+    echo "R17 SHELL READER FAIL" >&2
     echo "ELF file not found: $ELF" >&2
     exit 1
 fi
@@ -25,6 +26,9 @@ DUMP=$(objdump -d -M intel "$ELF" 2>/dev/null || true)
 
 # Extract _start disassembly
 _START_DUMP=$(echo "$DUMP" | awk '/^[0-9a-f]+ <_start>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag')
+
+# Extract shell_read_line disassembly
+SHELL_READLINE_DUMP=$(echo "$DUMP" | awk '/^[0-9a-f]+ <shell_read_line>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag')
 
 # 1. Check for prompt_msg rodata symbol
 PROMPT_MSG=$(echo "$DUMP" | grep -c "prompt_msg" || true)
@@ -59,16 +63,43 @@ else
     FAIL=1
 fi
 
-# 4. Check for getline call in _start
-GETLINE_CALL=$(echo "$_START_DUMP" | grep -c "call.*getline" || true)
-if [[ $GETLINE_CALL -ge 1 ]]; then
-    echo "[ok]   call getline found (line reading)"
+# 4. Check for shell_read_line call in _start
+SHELL_READLINE_CALL=$(echo "$_START_DUMP" | grep -c "call.*shell_read_line" || true)
+if [[ $SHELL_READLINE_CALL -ge 1 ]]; then
+    echo "[ok]   call shell_read_line found (line reading, byte-by-byte)"
 else
-    echo "[FAIL] call getline not found in _start"
+    echo "[FAIL] call shell_read_line not found in _start"
     FAIL=1
 fi
 
-# 5. Check for dispatch_line call in _start
+# 5. Check for shell_read_line function exists
+SHELL_READLINE_FUNC=$(echo "$DUMP" | grep -c "<shell_read_line>" || true)
+if [[ $SHELL_READLINE_FUNC -ge 1 ]]; then
+    echo "[ok]   shell_read_line function found"
+else
+    echo "[FAIL] shell_read_line function not found"
+    FAIL=1
+fi
+
+# 6. Check for sys_read call in shell_read_line (byte-by-byte reading)
+SYS_READ_IN_READLINE=$(echo "$SHELL_READLINE_DUMP" | grep -c "call.*sys_read" || true)
+if [[ $SYS_READ_IN_READLINE -ge 1 ]]; then
+    echo "[ok]   sys_read call found in shell_read_line"
+else
+    echo "[FAIL] sys_read call not found in shell_read_line"
+    FAIL=1
+fi
+
+# 7. Check for cmp against 0x0A (\n) in shell_read_line
+CMP_0A_IN_READLINE=$(echo "$SHELL_READLINE_DUMP" | grep -c "cmp.*0xa" || true)
+if [[ $CMP_0A_IN_READLINE -ge 1 ]]; then
+    echo "[ok]   cmp against 0x0A (newline) found in shell_read_line"
+else
+    echo "[FAIL] cmp against 0x0A (newline) not found in shell_read_line"
+    FAIL=1
+fi
+
+# 8. Check for dispatch_line call in _start
 DISPATCH_CALL=$(echo "$_START_DUMP" | grep -c "call.*dispatch_line" || true)
 if [[ $DISPATCH_CALL -ge 1 ]]; then
     echo "[ok]   call dispatch_line found (line dispatch)"
@@ -77,9 +108,7 @@ else
     FAIL=1
 fi
 
-# 6. Check for backward jump pattern (loop)
-# Look for jmp instructions that reference labels (main_loop or similar)
-# A backward jump indicates loop structure
+# 9. Check for backward jump pattern (loop)
 LOOP_JMP=$(echo "$_START_DUMP" | grep -c "jmp" || true)
 if [[ $LOOP_JMP -ge 1 ]]; then
     echo "[ok]   jmp instruction found (loop structure)"
@@ -88,7 +117,7 @@ else
     FAIL=1
 fi
 
-# 7. Check for exit path (cmp + je or cmp + jne)
+# 10. Check for exit path (cmp + je or cmp + jne)
 CMP_COUNT=$(echo "$_START_DUMP" | grep -c "cmp" || true)
 JE_COUNT=$(echo "$_START_DUMP" | grep -c "je" || true)
 if [[ $CMP_COUNT -ge 1 && $JE_COUNT -ge 1 ]]; then
@@ -99,9 +128,9 @@ else
 fi
 
 if [[ $FAIL -eq 0 ]]; then
-    echo "R17 SHELL SKELETON OK"
+    echo "R17 SHELL READER OK"
     exit 0
 else
-    echo "R17 SHELL SKELETON FAIL"
+    echo "R17 SHELL READER FAIL"
     exit 1
 fi
