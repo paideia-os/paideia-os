@@ -655,6 +655,37 @@ fd_inherit_ok_msg: .ascii "R16 FD INHERIT OK\n\0"
 .align 8
 fd_inherit_fail_msg: .ascii "R16 FD INHERIT FAIL\n\0"
 
+# R16-M3-007 (#593): fd_cloexec witness success message
+.global fd_cloexec_ok_msg
+.align 8
+fd_cloexec_ok_msg: .ascii "R16 FD CLOEXEC OK\n\0"
+
+# R16-M3-007 (#593): fd_cloexec witness failure message
+.global fd_cloexec_fail_msg
+.align 8
+fd_cloexec_fail_msg: .ascii "R16 FD CLOEXEC FAIL\n\0"
+
+# Debug messages for fd_cloexec witness
+.global fd_cloexec_fail_setup
+.align 8
+fd_cloexec_fail_setup: .ascii "R16 FD CLOEXEC FAIL (setup)\n\0"
+
+.global fd_cloexec_fail_execve
+.align 8
+fd_cloexec_fail_execve: .ascii "R16 FD CLOEXEC FAIL (execve)\n\0"
+
+.global fd_cloexec_fail_sub_a
+.align 8
+fd_cloexec_fail_sub_a: .ascii "R16 FD CLOEXEC FAIL (sub-test A)\n\0"
+
+.global fd_cloexec_fail_sub_b
+.align 8
+fd_cloexec_fail_sub_b: .ascii "R16 FD CLOEXEC FAIL (sub-test B)\n\0"
+
+.global fd_cloexec_fail_sub_c
+.align 8
+fd_cloexec_fail_sub_c: .ascii "R16 FD CLOEXEC FAIL (sub-test C)\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
