@@ -1,41 +1,65 @@
 #!/usr/bin/env bash
-# Build the PaideiaOS user shell binary (R15-m1-003 / #515).
+# Build the PaideiaOS user shell and init binaries (R15-m1-003 / #515, R17-m2-001 / #616).
 set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 PAIDEIA_AS="$("${REPO_ROOT}/tools/find-paideia-as.sh")"
 USER_SRC="${REPO_ROOT}/src/user"
 BUILD_DIR="${REPO_ROOT}/build/user"
-LINK_SCRIPT="${USER_SRC}/link.ld"
+SHELL_LINK_SCRIPT="${USER_SRC}/link.ld"
+INIT_LINK_SCRIPT="${USER_SRC}/init.ld"
 
-if [[ ! -f "${LINK_SCRIPT}" ]]; then
-    echo "user linker script missing: ${LINK_SCRIPT}" >&2
+if [[ ! -f "${SHELL_LINK_SCRIPT}" ]]; then
+    echo "shell linker script missing: ${SHELL_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${INIT_LINK_SCRIPT}" ]]; then
+    echo "init linker script missing: ${INIT_LINK_SCRIPT}" >&2
     exit 1
 fi
 
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 
-OBJECTS=()
+# Build all .pdx files to objects
+ALL_OBJECTS=()
+SHELL_OBJECTS=()
+INIT_OBJECTS=()
+LIBS_OBJECTS=()
+
 while IFS= read -r -d '' pdx; do
     rel="${pdx#"${USER_SRC}"/}"
     obj="${BUILD_DIR}/${rel%.pdx}.o"
     mkdir -p "$(dirname "${obj}")"
     echo "[build-user] paideia-as ${rel} -> ${obj#"${BUILD_DIR}"/}"
     "${PAIDEIA_AS}" build --emit elf64 "${pdx}" -o "${obj}"
-    OBJECTS+=("${obj}")
+    ALL_OBJECTS+=("${obj}")
+
+    # Separate init from shell objects; shared libraries go to both
+    if [[ "${rel}" == "init.pdx" ]]; then
+        INIT_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "syscall_shim.pdx" ]] || [[ "${rel}" == "errno.pdx" ]] || [[ "${rel}" == "string.pdx" ]]; then
+        # These are library modules needed by both shell and init
+        LIBS_OBJECTS+=("${obj}")
+        SHELL_OBJECTS+=("${obj}")
+        INIT_OBJECTS+=("${obj}")
+    else
+        SHELL_OBJECTS+=("${obj}")
+    fi
 done < <(find "${USER_SRC}" -name '*.pdx' -print0 | sort -z)
 
-if [[ ${#OBJECTS[@]} -eq 0 ]]; then
+if [[ ${#ALL_OBJECTS[@]} -eq 0 ]]; then
     echo "no .pdx files found under ${USER_SRC}" >&2
     exit 1
 fi
 
+# Link shell.elf with all non-init objects
 echo "[link-user] ld -T link.ld -> shell.elf"
 ld -nostdlib --warn-common --fatal-warnings \
-    -T "${LINK_SCRIPT}" \
+    -T "${SHELL_LINK_SCRIPT}" \
     -o "${BUILD_DIR}/shell.elf" \
-    "${OBJECTS[@]}"
+    "${SHELL_OBJECTS[@]}"
 
 echo "[objcopy-user] shell.elf -> shell.bin"
 objcopy -O binary "${BUILD_DIR}/shell.elf" "${BUILD_DIR}/shell.bin"
@@ -57,3 +81,18 @@ echo "[verify-libc-test] integration chain — all R17.M1 canaries"
 
 echo "[ok] ${BUILD_DIR}/shell.elf"
 echo "[ok] ${BUILD_DIR}/shell.bin"
+
+# Link init.elf with init objects only
+if [[ ${#INIT_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T init.ld -> init.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${INIT_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/init.elf" \
+        "${INIT_OBJECTS[@]}"
+
+    echo "[objcopy-user] init.elf -> init.bin"
+    objcopy -O binary "${BUILD_DIR}/init.elf" "${BUILD_DIR}/init.bin"
+
+    echo "[ok] ${BUILD_DIR}/init.elf"
+    echo "[ok] ${BUILD_DIR}/init.bin"
+fi
