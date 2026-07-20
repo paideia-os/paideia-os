@@ -761,6 +761,16 @@ uart_rx_smoke_prefix_msg: .ascii "UART RX: \0"
 .align 8
 uart_rx_smoke_fail_msg: .ascii "R16 UART RX SMOKE FAIL\n\0"
 
+# R16-M5-001 (#602): tty_init witness success message
+.global tty_ok_msg
+.align 8
+tty_ok_msg: .ascii "R16 TTY VNODE OK\n\0"
+
+# R16-M5-001 (#602): tty_init witness failure message
+.global tty_fail_msg
+.align 8
+tty_fail_msg: .ascii "R16 TTY VNODE FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
