@@ -90,13 +90,33 @@ else
     FAIL=1
 fi
 
-# 7. Check for cmp against 0x0A (\n) in shell_read_line
-CMP_0A_IN_READLINE=$(echo "$SHELL_READLINE_DUMP" | grep -c "cmp.*0xa" || true)
-if [[ $CMP_0A_IN_READLINE -ge 1 ]]; then
-    echo "[ok]   cmp against 0x0A (newline) found in shell_read_line"
-else
+# 7. Check for cmp against 0x0A (\n) in shell_read_line with proper byte-width mitigation
+#    (paideia-as #1248 mitigation: cmp al, 0x0A must be either:
+#     - preceded by "and rax,0xff" OR
+#     - preceded by "movzx eax,al" OR
+#     - byte-narrow (opcode 3C 0A, not REX.W))
+CMP_0A_FOUND=$(echo "$SHELL_READLINE_DUMP" | grep "cmp.*0xa")
+if [[ -z "$CMP_0A_FOUND" ]]; then
     echo "[FAIL] cmp against 0x0A (newline) not found in shell_read_line"
     FAIL=1
+else
+    # Extract context around cmp instructions to check for preceding guard
+    CMP_LINES=$(echo "$SHELL_READLINE_DUMP" | grep -B 2 "cmp.*0xa")
+
+    # Check if any cmp 0xa is preceded by "and rax,0xff" or "movzx"
+    if echo "$CMP_LINES" | grep -q "and.*0xff"; then
+        echo "[ok]   cmp against 0x0A (newline) found with and rax,0xff guard (paideia-as #1248 mitigation)"
+    elif echo "$CMP_LINES" | grep -q "movzx"; then
+        echo "[ok]   cmp against 0x0A (newline) found with movzx guard"
+    elif echo "$CMP_LINES" | grep -q "3c 0a"; then
+        echo "[ok]   cmp against 0x0A (newline) found with byte-narrow opcode"
+    else
+        # Warn but don't fail — the cmp exists but guard is missing; this is fragile
+        echo "[WARN] cmp against 0x0A found but no byte-width guard detected (paideia-as #1248 risk)"
+        echo "[WARN] Expected: 'and rax,0xff' OR 'movzx eax,al' OR byte-narrow opcode 3c 0a"
+        echo "$CMP_LINES" | head -3
+        FAIL=1
+    fi
 fi
 
 # 8. Check for dispatch_line call in _start

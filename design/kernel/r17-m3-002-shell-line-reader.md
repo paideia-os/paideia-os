@@ -240,6 +240,21 @@ Expected:
 - Non-blocking I/O event loop in kernel
 - Kernel buffering for efficient batch reads
 
+## Addendum 2026-07-20: #1248 Mitigation
+
+**Issue**: paideia-as #1248 incorrectly emits `cmp al, imm8` as `cmp rax, imm8` with REX.W flag (full-register compare). This bypasses the intent of `al`-only register operations. In `shell_read_line`, the `cmp al, 0x0A` instruction currently passes only because `sys_read` leaves `rax ∈ {0, 1}` and upper bits happen to be zero. Future edits touching `rax` between `sys_read` and the `cmp` would silently corrupt EOF/newline detection.
+
+**Mitigation**: Insert `and rax, 0xff` immediately after `mov al, [r8]` and before `cmp al, 0x0A` to explicitly zero upper bits, making the byte-width intent explicit to the assembler and robust to future changes.
+
+**Verification Tightening**: `tools/verify-user-shell.sh` now checks that any `cmp .*, 0xa` in `shell_read_line` is preceded by one of:
+- `and rax, 0xff` (explicit mitigation) — preferred
+- `movzx eax, al` (zero-extension) — acceptable alternative
+- Byte-narrow opcode `3c 0a` (assembler chose correct form) — acceptable alternative
+
+If none are found, the verifier emits `[WARN]` and fails the check, surfacing the #1248 risk.
+
+**Impact**: ~1 instruction added to `shell_read_line` loop body (no functional change; improves robustness until paideia-as #1248 is fixed upstream).
+
 ## References
 
 - R17.M3-001 (#621): shell main loop skeleton
@@ -250,3 +265,4 @@ Expected:
 - src/user/shell.pdx: shell implementation
 - src/user/syscall_shim.pdx: sys_read syscall wrapper
 - tools/verify-user-shell.sh: verification script
+- paideia-as issue #1248: cmp al, imm8 incorrectly emitted with REX.W
