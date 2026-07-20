@@ -841,6 +841,21 @@ tty_smoke_ok_msg: .ascii "TTY OK\n\0"
 .align 8
 tty_smoke_fail_msg: .ascii "TTY SMOKE FAIL\n\0"
 
+# R17-M1-006 (#615): libc_test_witness start message
+.global libc_test_start_msg
+.align 8
+libc_test_start_msg: .ascii "LIBC TEST START\n\0"
+
+# R17-M1-006 (#615): libc_test_witness success message
+.global libc_test_ok_msg
+.align 8
+libc_test_ok_msg: .ascii "LIBC TEST OK\n\0"
+
+# R17-M1-006 (#615): libc_test_witness failure message
+.global libc_test_fail_msg
+.align 8
+libc_test_fail_msg: .ascii "LIBC TEST FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"

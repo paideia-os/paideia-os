@@ -52,5 +52,8 @@ echo "[verify-user] symbol + shape canary on _user_errno/errno_get/errno_set/sys
 echo "[verify-user] symbol + call-site canary on puts_new/getline in shell.elf"
 "${REPO_ROOT}/tools/verify-user-io.sh" "${BUILD_DIR}/shell.elf"
 
+echo "[verify-libc-test] integration chain — all R17.M1 canaries"
+"${REPO_ROOT}/tools/verify-libc-test.sh" "${BUILD_DIR}/shell.elf"
+
 echo "[ok] ${BUILD_DIR}/shell.elf"
 echo "[ok] ${BUILD_DIR}/shell.bin"
