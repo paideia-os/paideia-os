@@ -711,6 +711,16 @@ uart_rx_ring_ok_msg: .ascii "R16 UART RX RING OK\n\0"
 .align 8
 uart_rx_ring_fail_msg: .ascii "R16 UART RX RING FAIL\n\0"
 
+# R16-M4-003 (#597): uart_rx_isr witness success message
+.global uart_rx_isr_ok_msg
+.align 8
+uart_rx_isr_ok_msg: .ascii "R16 UART RX ISR OK\n\0"
+
+# R16-M4-003 (#597): uart_rx_isr witness failure message
+.global uart_rx_isr_fail_msg
+.align 8
+uart_rx_isr_fail_msg: .ascii "R16 UART RX ISR FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
