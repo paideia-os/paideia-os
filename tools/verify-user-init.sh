@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Byte-pattern canary for src/user/init.pdx (R17-M2-003 / #618).
-# Verifies init contains: sys_open, sys_dup2 (3x), sys_close, sys_fork, sys_execve.
-# Also verifies: bin_sh_path rodata, cmp+je branching for fork result.
-# Exits with "R17 INIT FORK OK" or "R17 INIT FORK FAIL".
+# Byte-pattern canary for src/user/init.pdx (R17-M2-004 / #619).
+# Verifies init contains: sys_open, sys_dup2 (3x), sys_close, sys_fork, sys_execve,
+# sys_wait4, sys_exit.
+# Also verifies: bin_sh_path, reaped_msg rodata, wait_status .bss, cmp+je branching.
+# Exits with "R17 INIT WAIT OK" or "R17 INIT WAIT FAIL".
 set -euo pipefail
 
 ELF="${1:-build/user/init.elf}"
@@ -61,6 +62,10 @@ SYS_CLOSE_PATTERN="48 c7 c0 03 00 00 00 0f 05 c3"
 SYS_FORK_PATTERN="48 c7 c0 38 00 00 00 0f 05 c3"
 # sys_execve: mov rax, 59; syscall; ret
 SYS_EXECVE_PATTERN="48 c7 c0 3b 00 00 00 0f 05 c3"
+# sys_exit: mov rax, 60; syscall; ret
+SYS_EXIT_PATTERN="48 c7 c0 3c 00 00 00 0f 05 c3"
+# sys_wait4: mov r10, rcx; mov rax, 61; syscall; ret
+SYS_WAIT4_PATTERN="49 89 ca 48 c7 c0 3d 00 00 00 0f 05 c3"
 
 # Check sys_open
 sys_open_bytes=$(extract_bytes "sys_open") || sys_open_bytes=""
@@ -117,6 +122,28 @@ else
     FAIL=1
 fi
 
+# Check sys_exit (R17-M2-004 #619)
+sys_exit_bytes=$(extract_bytes "sys_exit") || sys_exit_bytes=""
+if [[ "$sys_exit_bytes" == "$SYS_EXIT_PATTERN" ]]; then
+    echo "[ok]   sys_exit found"
+else
+    echo "[FAIL] sys_exit not found or incorrect"
+    echo "       want: $SYS_EXIT_PATTERN"
+    echo "       got : $sys_exit_bytes"
+    FAIL=1
+fi
+
+# Check sys_wait4 (R17-M2-004 #619)
+sys_wait4_bytes=$(extract_bytes "sys_wait4") || sys_wait4_bytes=""
+if [[ "$sys_wait4_bytes" == "$SYS_WAIT4_PATTERN" ]]; then
+    echo "[ok]   sys_wait4 found"
+else
+    echo "[FAIL] sys_wait4 not found or incorrect"
+    echo "       want: $SYS_WAIT4_PATTERN"
+    echo "       got : $sys_wait4_bytes"
+    FAIL=1
+fi
+
 # Count actual calls to sys_open, sys_dup2, sys_close in _start disassembly
 # This verifies that init._start calls these functions (not just that they exist in the binary)
 _START_DUMP=$(echo "$DUMP" | awk '/^[0-9a-f]+ <_start>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag')
@@ -166,12 +193,48 @@ else
     FAIL=1
 fi
 
+# Count call sys_wait4 (R17-M2-004 #619)
+CALL_WAIT4=$(echo "$_START_DUMP" | grep -c "call.*sys_wait4" || true)
+if [[ $CALL_WAIT4 -ge 1 ]]; then
+    echo "[ok]   call sys_wait4 found (count: $CALL_WAIT4)"
+else
+    echo "[FAIL] call sys_wait4 not found in _start"
+    FAIL=1
+fi
+
+# Count call sys_exit (R17-M2-004 #619)
+CALL_EXIT=$(echo "$_START_DUMP" | grep -c "call.*sys_exit" || true)
+if [[ $CALL_EXIT -ge 1 ]]; then
+    echo "[ok]   call sys_exit found (count: $CALL_EXIT)"
+else
+    echo "[FAIL] call sys_exit not found in _start"
+    FAIL=1
+fi
+
 # Verify bin_sh_path symbol exists in rodata
 BIN_SH_PATH=$(echo "$DUMP" | grep -c "bin_sh_path" || true)
 if [[ $BIN_SH_PATH -ge 1 ]]; then
     echo "[ok]   bin_sh_path symbol found in rodata"
 else
     echo "[FAIL] bin_sh_path symbol not found"
+    FAIL=1
+fi
+
+# Verify reaped_msg symbol exists in rodata (R17-M2-004 #619)
+REAPED_MSG=$(echo "$DUMP" | grep -c "reaped_msg" || true)
+if [[ $REAPED_MSG -ge 1 ]]; then
+    echo "[ok]   reaped_msg symbol found in rodata"
+else
+    echo "[FAIL] reaped_msg symbol not found"
+    FAIL=1
+fi
+
+# Verify wait_status symbol exists (.bss or rodata) (R17-M2-004 #619)
+WAIT_STATUS=$(echo "$DUMP" | grep -c "wait_status" || true)
+if [[ $WAIT_STATUS -ge 1 ]]; then
+    echo "[ok]   wait_status symbol found in .bss"
+else
+    echo "[FAIL] wait_status symbol not found"
     FAIL=1
 fi
 
@@ -187,9 +250,9 @@ else
 fi
 
 if [[ $FAIL -eq 0 ]]; then
-    echo "R17 INIT FORK OK"
+    echo "R17 INIT WAIT OK"
     exit 0
 else
-    echo "R17 INIT FORK FAIL"
+    echo "R17 INIT WAIT FAIL"
     exit 1
 fi
