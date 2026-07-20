@@ -751,6 +751,16 @@ uart_rx_notify_ok_msg: .ascii "R16 UART RX NOTIFY OK\n\0"
 .align 8
 uart_rx_notify_fail_msg: .ascii "R16 UART RX NOTIFY FAIL\n\0"
 
+# R16-M4-007 (#601): uart_rx_smoke witness prefix (fingerprint AC)
+.global uart_rx_smoke_prefix_msg
+.align 8
+uart_rx_smoke_prefix_msg: .ascii "UART RX: \0"
+
+# R16-M4-007 (#601): uart_rx_smoke witness failure message
+.global uart_rx_smoke_fail_msg
+.align 8
+uart_rx_smoke_fail_msg: .ascii "R16 UART RX SMOKE FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
