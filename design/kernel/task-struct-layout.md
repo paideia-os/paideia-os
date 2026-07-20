@@ -54,3 +54,11 @@ See design/kernel/r15-m7-003-sched-switch.md §3 for detailed rationale on field
 - design/kernel/r15-m7-003-sched-switch.md (issue #564 — full context-switch implementation)
 - design/kernel/r15-m7-001-idle-task.md (issue #562 — partial regs_save freeze)
 - design/kernel/r15-m7-002-runqueue.md (issue #563 — sched_pick_next_r15)
+
+## Additional reserved slots (frozen for future use)
+
+### INIT_ENTRY_OFF = 1712 (#620)
+
+| Offset | Size | Field                    | Type  | Frozen by | Notes                                                                                                       |
+|--------|------|--------------------------|-------|-----------|-------------------------------------------------------------------------------------------------------------|
+| +1712  | 8    | `init_entry_rip`         | u64   | #620      | Entry RIP for init task (ELF e_entry). Used by R17-M2-005 (Tier 2): stashed by init_bootstrap witness, read by enter_userland_initial to enter init's user-space code. Tier 1 (this issue) only writes; Tier 2 reads and uses to bootstrap ring-3 entry with enter_userland_initial. |

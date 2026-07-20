@@ -856,6 +856,16 @@ libc_test_ok_msg: .ascii "LIBC TEST OK\n\0"
 .align 8
 libc_test_fail_msg: .ascii "LIBC TEST FAIL\n\0"
 
+# R17-M2-005 (#620): init_bootstrap witness success message
+.global init_load_ok_msg
+.align 8
+init_load_ok_msg: .ascii "R17 INIT LOAD OK\n\0"
+
+# R17-M2-005 (#620): init_bootstrap witness failure message
+.global init_load_fail_msg
+.align 8
+init_load_fail_msg: .ascii "R17 INIT LOAD FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
