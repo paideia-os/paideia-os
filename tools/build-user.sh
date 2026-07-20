@@ -46,5 +46,8 @@ echo "[verify-user] byte-pattern canary on shell.elf"
 echo "[verify-user] byte-shape canary on strlen/memcmp/memcpy/memset in shell.elf"
 "${REPO_ROOT}/tools/verify-user-string.sh" "${BUILD_DIR}/shell.elf"
 
+echo "[verify-user] symbol + shape canary on _user_errno/errno_get/errno_set/syscall_check in shell.elf"
+"${REPO_ROOT}/tools/verify-user-errno.sh" "${BUILD_DIR}/shell.elf"
+
 echo "[ok] ${BUILD_DIR}/shell.elf"
 echo "[ok] ${BUILD_DIR}/shell.bin"
