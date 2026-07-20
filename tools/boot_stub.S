@@ -831,6 +831,16 @@ tty_connect_ok_msg: .ascii "R16 TTY CONNECT OK\n\0"
 .align 8
 tty_connect_fail_msg: .ascii "R16 TTY CONNECT FAIL\n\0"
 
+# R16-M5-009 (#609): tty_smoke integration witness success message
+.global tty_smoke_ok_msg
+.align 8
+tty_smoke_ok_msg: .ascii "TTY OK\n\0"
+
+# R16-M5-009 (#609): tty_smoke integration witness failure message
+.global tty_smoke_fail_msg
+.align 8
+tty_smoke_fail_msg: .ascii "TTY SMOKE FAIL\n\0"
+
 .global tmpfs_vops_witness_name_tmp
 .align 8
 tmpfs_vops_witness_name_tmp: .ascii "tmp\0"
