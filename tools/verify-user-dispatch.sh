@@ -79,19 +79,19 @@ else
     echo "[FAIL] exit_name bytes not found in .rodata"; FAIL=1
 fi
 
-# 7. builtin_names .bss size 0x10
+# 7. builtin_names .bss size 0x40
 SL=$(echo "$SYMS" | awk '$NF == "builtin_names" {print}' | head -1)
 if [[ -z "$SL" ]]; then echo "[FAIL] builtin_names missing"; FAIL=1
 elif [[ "$(echo "$SL" | awk '{print $(NF-2)}')" != ".bss" ]]; then echo "[FAIL] builtin_names not in .bss"; FAIL=1
-elif [[ "$(echo "$SL" | awk '{print $(NF-1)}')" != "0000000000000010" ]]; then echo "[FAIL] builtin_names wrong size ($(echo "$SL" | awk '{print $(NF-1)}'))"; FAIL=1
-else echo "[ok]   builtin_names in .bss, size 0x10"; fi
+elif [[ "$(echo "$SL" | awk '{print $(NF-1)}')" != "0000000000000040" ]]; then echo "[FAIL] builtin_names wrong size ($(echo "$SL" | awk '{print $(NF-1)}'))"; FAIL=1
+else echo "[ok]   builtin_names in .bss, size 0x40"; fi
 
-# 8. builtin_handlers .bss size 0x10
+# 8. builtin_handlers .bss size 0x40
 SL=$(echo "$SYMS" | awk '$NF == "builtin_handlers" {print}' | head -1)
 if [[ -z "$SL" ]]; then echo "[FAIL] builtin_handlers missing"; FAIL=1
 elif [[ "$(echo "$SL" | awk '{print $(NF-2)}')" != ".bss" ]]; then echo "[FAIL] builtin_handlers not in .bss"; FAIL=1
-elif [[ "$(echo "$SL" | awk '{print $(NF-1)}')" != "0000000000000010" ]]; then echo "[FAIL] builtin_handlers wrong size"; FAIL=1
-else echo "[ok]   builtin_handlers in .bss, size 0x10"; fi
+elif [[ "$(echo "$SL" | awk '{print $(NF-1)}')" != "0000000000000040" ]]; then echo "[FAIL] builtin_handlers wrong size"; FAIL=1
+else echo "[ok]   builtin_handlers in .bss, size 0x40"; fi
 
 # 9. builtin_count .bss size 0x8
 SL=$(echo "$SYMS" | awk '$NF == "builtin_count" {print}' | head -1)

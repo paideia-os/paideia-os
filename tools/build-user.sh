@@ -88,6 +88,9 @@ echo "[verify-tokenizer] in-place tokenization for R17.M3-003 — argv_buf/argc/
 echo "[verify-dispatch] builtin dispatch table for R17.M3-004 — echo/exit + runtime table + call rax"
 "${REPO_ROOT}/tools/verify-user-dispatch.sh" "${BUILD_DIR}/shell.elf"
 
+echo "[verify-builtins-m4] shell builtins batch for R17.M4 — pwd/help/env + dec_parse + cwd_init"
+"${REPO_ROOT}/tools/verify-user-builtins-m4.sh" "${BUILD_DIR}/shell.elf"
+
 echo "[verify-exec-child] fork/execve/wait4 for R17.M3-005 — fork+execve+wait4 + NULL-terminator + exit(127)"
 "${REPO_ROOT}/tools/verify-user-exec-child.sh" "${BUILD_DIR}/shell.elf"
 
