@@ -31,7 +31,7 @@ _START_DUMP=$(echo "$DUMP" | awk '/^[0-9a-f]+ <_start>:/{flag=1; next} /^[0-9a-f
 # Extract tokenize disassembly
 TOKENIZE_DUMP=$(echo "$DUMP" | awk '/^[0-9a-f]+ <tokenize>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag')
 
-# 1. Check for argv_buf .bss symbol, size 0x80
+# 1. Check for argv_buf .bss symbol, size 0x88 (17*8 = 136 bytes)
 ARGV_BUF_SYMLINE=$(objdump -t "$ELF" 2>/dev/null | awk '$NF == "argv_buf" { print }')
 if [[ -z "$ARGV_BUF_SYMLINE" ]]; then
     echo "[FAIL] argv_buf symbol not found"
@@ -40,10 +40,10 @@ else
     ARGV_BUF_SECTION=$(echo "$ARGV_BUF_SYMLINE" | awk '{print $(NF-2)}')
     ARGV_BUF_SIZE=$(echo "$ARGV_BUF_SYMLINE" | awk '{print $(NF-1)}')
     if [[ "$ARGV_BUF_SECTION" == ".bss" ]]; then
-        if [[ "$ARGV_BUF_SIZE" == "0000000000000080" ]] || [[ "$ARGV_BUF_SIZE" == "00000080" ]]; then
-            echo "[ok]   argv_buf symbol found in .bss, size 0x80 (128 bytes)"
+        if [[ "$ARGV_BUF_SIZE" == "0000000000000088" ]] || [[ "$ARGV_BUF_SIZE" == "00000088" ]]; then
+            echo "[ok]   argv_buf symbol found in .bss, size 0x88 (136 bytes)"
         else
-            echo "[FAIL] argv_buf found in .bss but size is $ARGV_BUF_SIZE (expected 0x80)"
+            echo "[FAIL] argv_buf found in .bss but size is $ARGV_BUF_SIZE (expected 0x88)"
             FAIL=1
         fi
     else
