@@ -147,6 +147,40 @@ else
     FAIL=1
 fi
 
+# 11. #627 Ctrl-D EOF exit: exit_on_eof label followed by call.*builtin_exit or sys_exit.
+EOF_EXIT=$(echo "$DUMP" | awk '/<exit_on_eof>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag' 2>/dev/null || true)
+if [[ -n "$EOF_EXIT" ]] && echo "$EOF_EXIT" | grep -Eq "call.*(builtin_exit|sys_exit)"; then
+    echo "[ok]   #627 exit_on_eof path present (Ctrl-D → sys_exit)"
+else
+    # Fallback: check _start has a call to builtin_exit as EOF path
+    if echo "$_START_DUMP" | grep -Eq "call.*(builtin_exit|sys_exit)"; then
+        echo "[ok]   #627 EOF exit call present in _start"
+    else
+        echo "[FAIL] #627 no EOF-exit path (expected call to builtin_exit or sys_exit)"
+        FAIL=1
+    fi
+fi
+
+# 12. #628 empty-line reprompt: cmp rax,0 + je main_loop between call tokenize and call dispatch_line.
+# Slice _start between call tokenize and call dispatch_line; must contain a je.
+TOK_PC=$(echo "$_START_DUMP" | grep -E "call.*tokenize" | head -1 | awk -F: '{print $1}' | tr -d ' ' || true)
+DL_PC=$(echo "$_START_DUMP" | grep -E "call.*dispatch_line" | head -1 | awk -F: '{print $1}' | tr -d ' ' || true)
+if [[ -n "$TOK_PC" && -n "$DL_PC" ]]; then
+    MID=$(echo "$_START_DUMP" | awk -v lo="$TOK_PC" -v hi="$DL_PC" '{
+        pc = $1; gsub(":","",pc);
+        if (pc > lo && pc < hi) print
+    }')
+    if echo "$MID" | grep -Eq "cmp.*rax,0x0" && echo "$MID" | grep -Eq "\bje\b"; then
+        echo "[ok]   #628 empty-line reprompt (cmp rax,0 + je between tokenize and dispatch_line)"
+    else
+        echo "[FAIL] #628 no empty-line skip between tokenize and dispatch_line"
+        FAIL=1
+    fi
+else
+    echo "[FAIL] could not locate tokenize/dispatch_line calls for #628 order check"
+    FAIL=1
+fi
+
 if [[ $FAIL -eq 0 ]]; then
     echo "R17 SHELL READER OK"
     exit 0
