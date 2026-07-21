@@ -82,6 +82,9 @@ echo "[verify-libc-test] integration chain — all R17.M1 canaries"
 echo "[verify-shell] main loop skeleton for R17.M3-001 — prompt/getline/dispatch/loop"
 "${REPO_ROOT}/tools/verify-user-shell.sh" "${BUILD_DIR}/shell.elf"
 
+echo "[verify-tokenizer] in-place tokenization for R17.M3-003 — argv_buf/argc/whitespace/ordering"
+"${REPO_ROOT}/tools/verify-user-tokenizer.sh" "${BUILD_DIR}/shell.elf"
+
 echo "[ok] ${BUILD_DIR}/shell.elf"
 echo "[ok] ${BUILD_DIR}/shell.bin"
 
