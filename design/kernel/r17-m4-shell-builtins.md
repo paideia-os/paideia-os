@@ -4,7 +4,7 @@
 
 Extend the PaideiaOS shell with 5 new built-in commands: `pwd` (print working directory), `help` (list all builtins), `env` (print environment), and enhancements to `echo` (add `-n` flag support) and `exit` (accept optional numeric exit code). These are fundamental utilities for shell usability and bootstrap.
 
-Issues: #629 (echo -n), #630 (pwd), #631 (help), #632 (cd — deferred), #633 (exit N), #634 (env).
+Issues: #629 (echo -n), #630 (exit N), #631 (pwd), #632 (cd — deferred), #633 (help), #634 (env).
 
 ## 2. Table Growth
 
