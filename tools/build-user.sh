@@ -91,6 +91,9 @@ echo "[verify-dispatch] builtin dispatch table for R17.M3-004 — echo/exit + ru
 echo "[verify-exec-child] fork/execve/wait4 for R17.M3-005 — fork+execve+wait4 + NULL-terminator + exit(127)"
 "${REPO_ROOT}/tools/verify-user-exec-child.sh" "${BUILD_DIR}/shell.elf"
 
+echo "[verify-path-resolve] /bin/ prefix path resolution for R17.M3-006 — resolve_path + exec_child wiring"
+"${REPO_ROOT}/tools/verify-user-path-resolve.sh" "${BUILD_DIR}/shell.elf"
+
 echo "[ok] ${BUILD_DIR}/shell.elf"
 echo "[ok] ${BUILD_DIR}/shell.bin"
 
