@@ -85,6 +85,9 @@ echo "[verify-shell] main loop skeleton for R17.M3-001 — prompt/getline/dispat
 echo "[verify-tokenizer] in-place tokenization for R17.M3-003 — argv_buf/argc/whitespace/ordering"
 "${REPO_ROOT}/tools/verify-user-tokenizer.sh" "${BUILD_DIR}/shell.elf"
 
+echo "[verify-dispatch] builtin dispatch table for R17.M3-004 — echo/exit + runtime table + call rax"
+"${REPO_ROOT}/tools/verify-user-dispatch.sh" "${BUILD_DIR}/shell.elf"
+
 echo "[ok] ${BUILD_DIR}/shell.elf"
 echo "[ok] ${BUILD_DIR}/shell.bin"
 
