@@ -109,11 +109,11 @@ Out of scope (deliberately deferred):
 
 - **`_user_errno` slot** (#613) — this shim does not touch it; every
   wrapper returns raw `rax`. #613 will wrap these returns.
-- **kernel-side real bodies for read/open/close/dup2/fork/execve/
-  wait4/getpid** — R15.M5+, R15.M6, R16.M3. Missing bodies return
-  ENOSYS (-38) from the dispatcher. The shim itself compiles and
-  behaves correctly independent of body landing. Runtime AC in #615
-  will land after those bodies are wired.
+- **kernel-side real bodies** — IDs {0, 2, 3, 32, 39, 56, 60, 61} are
+  wired per #668 (R17.M0) and ship with R15.M6 (#553–#558) and R16.M3
+  (#587–#591). ID 59 (execve) returns ENOSYS pending #671 path→image
+  shim. The shim itself compiles and behaves correctly independent of
+  body landing. Runtime AC in #615 exercised all 11 wired IDs post-#668.
 - **Follow-up caller updates** — `src/user/builtins.pdx:28` currently
   calls `sys_exit_thread` (R13 name). §3.6 explains why we preserve
   the legacy name as an alias so `builtins.pdx` compiles unchanged.

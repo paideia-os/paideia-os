@@ -99,4 +99,10 @@ if [[ ${AUDIT_FAIL} -ne 0 ]]; then
 fi
 echo "[audit] R_X86_64_32 relocations clean (all targets low-VA)"
 
+echo "[verify] kernel syscall dispatch alignment"
+"${REPO_ROOT}/tools/verify-syscall-dispatch.sh" "${BUILD_DIR}/kernel.elf" || {
+    echo "[FAIL] syscall dispatch verification failed" >&2
+    exit 1
+}
+
 echo "[ok] ${BUILD_DIR}/kernel.elf"
