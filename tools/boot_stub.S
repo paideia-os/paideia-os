@@ -462,15 +462,6 @@ mount_table_ok_msg: .ascii "R16 MOUNT TABLE OK\n\0"
 .align 8
 mount_table_fail_msg: .ascii "R16 MOUNT TABLE FAIL\n\0"
 
-# R17-M0-665 (#665): vnode_cache_or_alloc witness success + failure messages
-.global vnode_conflation_ok_msg
-.align 8
-vnode_conflation_ok_msg: .ascii "R17 VNODE CONFLATION FIX OK\n\0"
-
-.global vnode_conflation_fail_msg
-.align 8
-vnode_conflation_fail_msg: .ascii "R17 VNODE CONFLATION FIX FAIL\n\0"
-
 # R16-M1-006 (#575): vfs_open witness success + failure messages
 .global vfs_open_ok_msg
 .align 8

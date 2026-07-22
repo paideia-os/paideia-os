@@ -864,13 +864,3 @@ the u64-per-entry design deliberately avoids the one gap
   `_tmpfs_vops` is wired to the root vnode's `ops_ptr` slot).
 - Encoder verification: every shape used here is proven in prior
   R16.M1 modules (§9); no paideia-as gap surfaces.
-
----
-
-## Amended by R17-M0-665
-
-**Change**: mount() now wires the root vnode's ops_ptr (+24) and backend_ptr (+32) directly in the alloc_root block, using backend_ops_table and backend_root_inode dispatch helpers.
-
-**Previous AC status**: The AC ("root vnode is tmpfs") was only *partially* met at R16.M1: the mount entry was installed, but ops_ptr was left at zero and populated by witness pre-wires in R16.M3.
-
-**New status**: The AC is now *fully* met at R16.M1 (mount time). The root vnode is wired with ops_ptr and backend_ptr atomically during mount(), eliminating all witness pre-wires and the R16.M2 deferral.

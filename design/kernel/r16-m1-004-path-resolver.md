@@ -842,16 +842,3 @@ access). Not the hot path for anything at R16 scale.
   §Subsystem 11 item 4 (line 1252 onwards) — pins the file location
   (`src/kernel/core/fs/path.pdx`) and the ACs (`/tmp/x → dentry`,
   `//tmp//x collapses`, `bad component → -ENOENT`).
-
----
-
-## Amended by R17-M0-665
-
-**Change**: path_resolve now uses `vnode_cache_or_alloc` to allocate vnodes on-demand during component lookup (regular_lookup block).
-
-**Impact on witness**: Sub-test D (resolve "/foo/bar") no longer asserts a specific vnode_idx; instead, it:
-1. Asserts the return value is non-zero and non-0xFFFF (valid vnode).
-2. Inspects the returned vnode's backend_ptr at +32, masking to low 16 bits.
-3. Asserts backend_ptr & 0xFFFF == 3 (bar's backend index from witness_lookup_stub).
-
-The key insight: vnode_cache_or_alloc may deduplicate or allocate different vnode slots on repeated calls (depending on cache state), but the backend_ptr invariant holds: it always identifies the backend inode index that vops_lookup returned.
