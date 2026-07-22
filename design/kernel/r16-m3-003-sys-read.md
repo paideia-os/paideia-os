@@ -1350,3 +1350,16 @@ witness block, one new .pdx module, one new path string).
 - Prior-art witness pattern: `design/kernel/r16-m3-002-sys-close.md`
   §5 — `_*_witness_task` `.bss` blob + sub-tests A–E + marker line
   + fingerprint insertion
+
+---
+
+## Amended by R17-M0-665
+
+**Change**: Witness preamble pre-wiring removed. Manual ops_ptr and backend_ptr wiring for root, /tmp, and /tmp/x vnodes is no longer needed.
+
+**Rationale**: 
+- R17-M0 lands vnode_cache_or_alloc in path_resolve's regular_lookup block.
+- mount() now wires the root vnode at allocation time.
+- path_resolve now allocates and wires vnodes on-demand for all non-root components.
+
+**Result**: Witness code is cleaner (60+ LOC preamble removed), and sys_read now correctly relies on the VFS layer's own vnode allocation, not pre-wiring hacks. Sub-test logic unchanged; execution path flows through sys_open → path_resolve → vnode_cache_or_alloc instead of pre-wired slots.
