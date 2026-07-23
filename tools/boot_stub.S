@@ -701,6 +701,16 @@ uart_rx_init_ok_msg: .ascii "R16 UART RX INIT OK\n\0"
 .align 8
 uart_rx_init_fail_msg: .ascii "R16 UART RX INIT FAIL\n\0"
 
+# R17-M0-665 Phase 1: vnode_cache_or_alloc witness success message
+.global vcache_witness_ok_msg
+.align 8
+vcache_witness_ok_msg: .ascii "R17 VCACHE OK\n\0"
+
+# R17-M0-665 Phase 1: vnode_cache_or_alloc witness failure message
+.global vcache_witness_fail_msg
+.align 8
+vcache_witness_fail_msg: .ascii "R17 VCACHE FAIL\n\0"
+
 # R17-M0-665 Phase 0: word-store landmine microbench success message
 .global _wsl_ok_msg
 .align 8
