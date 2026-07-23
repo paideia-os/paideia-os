@@ -864,3 +864,13 @@ the u64-per-entry design deliberately avoids the one gap
   `_tmpfs_vops` is wired to the root vnode's `ops_ptr` slot).
 - Encoder verification: every shape used here is proven in prior
   R16.M1 modules (§9); no paideia-as gap surfaces.
+
+## 12. Amendment (R17-M0 #665 Phase 3)
+
+mount()'s phase 5 root-vnode allocation now populates ops_ptr(+24) and
+backend_ptr(+32) via calls to `backend_ops_table` and `backend_root_inode`
+(from `src/kernel/core/fs/backend_registry.pdx`). Prior to this
+amendment, the root vnode was allocated with ops_ptr=0 — a defect that
+caused #665 (silent conflation of vnode-pool and backend-inode indices
+in path_resolve). See `design/kernel/r17-m0-665-vnode-conflation-fix.md`
+§6 for full context.

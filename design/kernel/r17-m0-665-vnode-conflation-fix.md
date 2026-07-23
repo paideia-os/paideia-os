@@ -15,7 +15,7 @@ This fix lands across seven phases. Each phase is one commit and one push; each 
 - **Phase 0** (this commit) — design doc scaffold + word-store landmine microbench witness. NO change to any VFS path.
 - Phase 1 — add `vnode_cache_or_alloc` symbol to vnode_pool.pdx, exercised only by its own witness.
 - Phase 2 — add `backend_registry.pdx` with `backend_ops_table` + `backend_root_inode`, exercised only by its own witness.
-- Phase 3 — wire root vnode ops_ptr/backend_ptr in mount(); keep witness pre-wires as belt+suspenders.
+- **Phase 3** (LANDED) — wire root vnode ops_ptr/backend_ptr in mount() via backend_registry calls; keep witness pre-wires as belt+suspenders. Added sub-test E to verify ops_ptr and backend_ptr lands.
 - Phase 4 — rewire path.pdx regular_lookup to call vnode_cache_or_alloc; rewrite #573 sub-tests D/F to check backend_ptr not vnode_idx.
 - Phase 5a-e — remove witness pre-wires one witness at a time (sys_read, sys_write, sys_dup2, fd_inherit, fd_cloexec).
 - Phase 6 — finalize design doc (growth plan, alternatives, cross-refs).

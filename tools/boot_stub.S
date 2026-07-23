@@ -462,6 +462,11 @@ mount_table_ok_msg: .ascii "R16 MOUNT TABLE OK\n\0"
 .align 8
 mount_table_fail_msg: .ascii "R16 MOUNT TABLE FAIL\n\0"
 
+# R17-M0-665 Phase 3: mount_witness sub-test E message
+.global mount_witness_e_fail_msg
+.align 8
+mount_witness_e_fail_msg: .ascii "MOUNT WITNESS E FAIL\n\0"
+
 # R16-M1-006 (#575): vfs_open witness success + failure messages
 .global vfs_open_ok_msg
 .align 8
