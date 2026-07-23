@@ -1005,6 +1005,11 @@ _bad_elf_stub_start:
 .global _bad_elf_stub_end
 _bad_elf_stub_end:
 
+# R15-M7-006 (#663): sched_block precondition-fail message
+.global sched_block_precond_fail_msg
+.align 8
+sched_block_precond_fail_msg: .ascii "SCHED PRECOND FAIL: block on non-RUNNABLE\n\0"
+
 # R15-M6-008 (#559): frame_meta refcount witness success message
 .global frame_meta_ok_msg
 .align 8

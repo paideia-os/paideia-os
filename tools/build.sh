@@ -105,4 +105,10 @@ echo "[verify] kernel syscall dispatch alignment"
     exit 1
 }
 
+echo "[verify] sched_block/sched_wake precondition guards (#663)"
+"${REPO_ROOT}/tools/verify-sched-guards.sh" "${BUILD_DIR}/kernel.elf" || {
+    echo "[FAIL] sched guards verification failed" >&2
+    exit 1
+}
+
 echo "[ok] ${BUILD_DIR}/kernel.elf"
