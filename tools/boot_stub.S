@@ -701,6 +701,16 @@ uart_rx_init_ok_msg: .ascii "R16 UART RX INIT OK\n\0"
 .align 8
 uart_rx_init_fail_msg: .ascii "R16 UART RX INIT FAIL\n\0"
 
+# R17-M0-665 Phase 0: word-store landmine microbench success message
+.global _wsl_ok_msg
+.align 8
+_wsl_ok_msg: .ascii "R17 WORD STORE OK\n\0"
+
+# R17-M0-665 Phase 0: word-store landmine microbench failure message
+.global _wsl_fail_msg
+.align 8
+_wsl_fail_msg: .ascii "R17 WORD STORE FAIL\n\0"
+
 # R16-M4-002 (#596): uart_rx_ring witness success message
 .global uart_rx_ring_ok_msg
 .align 8
