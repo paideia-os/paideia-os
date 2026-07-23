@@ -711,6 +711,16 @@ vcache_witness_ok_msg: .ascii "R17 VCACHE OK\n\0"
 .align 8
 vcache_witness_fail_msg: .ascii "R17 VCACHE FAIL\n\0"
 
+# R17-M0-665 Phase 2: backend_registry witness success message
+.global backend_reg_ok_msg
+.align 8
+backend_reg_ok_msg: .ascii "R17 BACKEND REG OK\n\0"
+
+# R17-M0-665 Phase 2: backend_registry witness failure message
+.global backend_reg_fail_msg
+.align 8
+backend_reg_fail_msg: .ascii "R17 BACKEND REG FAIL\n\0"
+
 # R17-M0-665 Phase 0: word-store landmine microbench success message
 .global _wsl_ok_msg
 .align 8
