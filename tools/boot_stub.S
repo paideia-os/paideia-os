@@ -179,16 +179,6 @@ ipi_ok_msg:   .ascii "IPI OK\n\0"
 .align 8
 ipi_fail_msg: .ascii "IPI FAIL\n\0"
 
-# R14b-m5-007b (#646): Self-IPI runtime delivery success message
-.global ipi_delivered_msg
-.align 8
-ipi_delivered_msg: .ascii "IPI DELIVERED\n\0"
-
-# R14b-m5-007b (#646): Self-IPI runtime delivery failure message
-.global ipi_not_delivered_msg
-.align 8
-ipi_not_delivered_msg: .ascii "IPI NOT DELIVERED\n\0"
-
 # R15-M1-008 (#520): Loader success witness message
 .global loader_ok_msg
 .align 8
