@@ -451,3 +451,24 @@ the witness insertion. No `paideia-as` change anticipated (see §6).
   becomes MSR `0x808`. Same values; same sequence.
 - Vec 0xF1 (reschedule) reuses `apic_ipi_self(241)` in the R15.M7
   scheduler when preempting the currently-running task.
+
+## 12. R14b-M5-007b amendment (#646 landed)
+
+The runtime-delivery gap identified in this doc is fixed by two new modules
+and a wiring delta:
+
+1. `src/kernel/core/apic/tpr.pdx` — defensive TPR=0 write so vec 0xF0 is
+   not gated by priority class.
+2. `src/kernel/core/apic/ipi_self.pdx` — `apic_ipi_self(vec)` that writes
+   ICR_LO with SELF-shorthand encoding (0x44000 | vec) and bounded-polls
+   delivery-status bit 12.
+3. `boot_continue_after_ring3` (`kernel_main.pdx`) calls `apic_tpr_init`
+   after `apic_svr_enable`, and after the structural `IPI OK` marker
+   fires a self-IPI to vec 0xF0, polls `_ipi_f0_count` in a bounded spin
+   loop, and emits `IPI DELIVERED` (or `IPI NOT DELIVERED` on timeout —
+   does NOT halt).
+
+MMIO width caveat: paideia-as #1251 causes `mov [mem], eX` to silently
+widen to 64-bit REX.W stores. For LAPIC MMIO this is benign — SDM Vol 3A
+§10.4.1 says the LAPIC ignores upper 32 bits of a 64-bit access — but is
+tracked as latent risk for real-hardware/KVM once #1251 lands.
