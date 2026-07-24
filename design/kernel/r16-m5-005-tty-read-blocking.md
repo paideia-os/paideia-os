@@ -1273,3 +1273,28 @@ Marked `pub` to admit:
 - [ ] `tools/run-smoke.sh` — run 5-mode smoke; expect all
       green with the new marker present in three fingerprints.
 - [ ] Commit message: `Implement #606: tty_read — cooked-mode reader (fast-path copy + reset; blocking wrapper via install-waiter + sched_block)`.
+
+## 9. R16.M5 amendment (#667): real body
+
+The wrapper body at §3.3 / §3.10 lands verbatim into
+`src/kernel/core/tty/read.pdx`, replacing the two-instruction stub
+described in the R16.M5 landing note.
+
+Prerequisite deltas since R16.M5:
+- #567 (sched_block/sched_wake) — LANDED.
+- #663 (sched_block/sched_wake state-machine guards) — LANDED;
+  sched_block soft-panics on `_current_tcb.state != RUNNABLE`.
+  In wrapper callers post-process_init this is satisfied by
+  construction; in the pre-process_init tty_vops witness path
+  (kernel_main.pdx Sub-test C) it is NOT satisfied, so that
+  sub-test was edited in the same commit to pre-fill the line
+  buffer with "hi\n" — wrapper's first `tty_read_try` returns 3,
+  `jne ttr_read_done` fires, sched_block never reached.
+
+Verification stance: STRUCTURAL-ONLY at #667.
+`tools/verify-tty-read-wrapper.sh` greps compiled `tty_read`
+disassembly for the eight load-bearing mnemonics (push rbx,
+push r12, call tty_read_try, cli, call uart_rx_notify_set_waiter,
+call sched_block, symmetric pops). Runtime exercise is deferred
+to sys_read from ring-3 shell/init once that path is interactively
+driven.

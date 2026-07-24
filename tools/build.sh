@@ -111,4 +111,10 @@ echo "[verify] sched_block/sched_wake precondition guards (#663)"
     exit 1
 }
 
+echo "[verify] tty_read blocking wrapper real body (#667)"
+"${REPO_ROOT}/tools/verify-tty-read-wrapper.sh" || {
+    echo "[FAIL] tty_read wrapper verification failed" >&2
+    exit 1
+}
+
 echo "[ok] ${BUILD_DIR}/kernel.elf"
