@@ -4,9 +4,7 @@
 
 Verification pass of #567 (sched_block/sched_wake landing at 9fc81b0)
 surfaced two documented-deliberate design gaps as trackable issue #663.
-This addendum documents the fix. Base design doc
-`r15-m7-006-block-wake.md` was never checked in (see #674); this file
-stands alone.
+This addendum documents the fix. Base design doc: `design/kernel/r15-m7-006-block-wake.md` (backfilled by #674).
 
 ## 1. Failure modes
 
