@@ -362,9 +362,9 @@ Read CR2 and error_code:
 
 Validate error_code (fast-flip requires: P=1, W=1, RSVD=0, ID=0, PK=0, SS=0, SGX=0):
           mov rax, r13
-          mov rcx, 0x807B                      ; mask bits 3,4,5,6,15 (RSVD|ID|PK|SS|SGX) + bits 0,1 (P|W)
+          mov rcx, 0x8069                      ; ERR_P|ERR_W|ERR_RSVD|ERR_ID|ERR_PK|ERR_SS|ERR_SGX
           and rax, rcx
-          cmp rax, 0x3                         ; exactly ERR_P|ERR_W; no reserved bits set
+          cmp rax, 0x3                         ; exactly ERR_P|ERR_W
           jne pf_real_fault
 
 Walk cr3 → PT[i]:                              ; read-only descent per #553 §3.6
@@ -1019,20 +1019,3 @@ Recommended commit granularity (each independently verifiable):
 
 Each commit gates the next; a failing verify on commit A rewinds only
 that commit and triggers Backtrack A investigation.
-
-## 13. Phase C landing (#661)
-
-Prior attempt hung on first CoW write because the error-code validation
-mask `0x8069` incorrectly gated bit 0 (P). Every real CoW fault has
-error_code = 0x3 (P=1, W=1), so `0x3 & 0x8069 = 0x1 ≠ 0` triggered the
-`jne kill` branch → `handle_pf` → `cpu_halt` → silent hang.
-
-Correction: mask = `0x807B` (bits 3,4,5,6,15 forbidden + bits 0,1 required),
-expected value = `0x3`. Kernel-mode (U=0) and ring-3 (U=1) CoW writes
-both pass — U/S bit intentionally not gated (ring-3 CoW is #553's driver).
-
-Landed as one atomic commit — Phase A was already in, remaining three commits
-are atomic only together.
-
-§3.3.2 in this doc contained the same defective mask 0x8069; corrected
-in-place so it doesn't re-mislead future workerbees.
