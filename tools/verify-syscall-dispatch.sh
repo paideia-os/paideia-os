@@ -143,9 +143,7 @@ else
 fi
 
 # Check 13: ID 61 has wstatus writeback
-# After #1251 narrow-store fix: looks for 32-bit mov to [rsi] (89 /r, 2-byte form)
-# instead of REX.W 64-bit (48 89 /r, 3-byte form).
-if echo "$DISPATCH" | grep -A 10 "sys_wait_body" | grep -q "mov.*\[rsi\]"; then
+if echo "$DISPATCH" | grep -A 10 "sys_wait_body" | grep -q "mov.*QWORD PTR \[rsi\]"; then
     echo "[ok]   ID 61 (wait4): wstatus writeback present"
     CHECKS_PASSED=$((CHECKS_PASSED + 1))
 else
