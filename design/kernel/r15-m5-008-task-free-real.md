@@ -607,6 +607,16 @@ order matching stays byte-identically green.
   (`task_free must panic if state == RUNNING`) is a #547 concern, not
   a #550 concern.
 
+### 4.5 Placement update post-task_new_witness landing
+
+The original §4.1 plan assumed task_free_witness would be the first consumer of pid 1. Post-#548 (task_new_witness at kernel_main.pdx line ~979), pid 1 is consumed and not released before task_free_witness runs.
+
+Two placements considered:
+- **Option A (chosen)**: insert task_free_witness IMMEDIATELY BEFORE task_new_witness (before line 979). Preserves AC verbatim; task_new_witness runs after and gets pid 1 as originally designed.
+- Option B: insert AFTER task_new_witness, iterate on pid 2. Rejected — implicit AC drift.
+
+Fingerprint order becomes: `R15 FD TABLE OK` → `R15 TASK FREE OK` → `R15 TASK NEW OK` → `R15 SYS EXIT OK`.
+
 ## 5. LOC estimate
 
 | File                                                              | LOC delta |

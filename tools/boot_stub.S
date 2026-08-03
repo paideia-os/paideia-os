@@ -367,6 +367,16 @@ task_new_witness_ok_msg: .ascii "R15 TASK NEW OK\n\0"
 .align 8
 task_new_witness_fail_msg: .ascii "R15 TASK NEW FAIL\n\0"
 
+# R15-M5-008 (#550): task_free witness success message
+.global task_free_witness_ok_msg
+.align 8
+task_free_witness_ok_msg: .ascii "R15 TASK FREE OK\n\0"
+
+# R15-M5-008 (#550): task_free witness failure message
+.global task_free_witness_fail_msg
+.align 8
+task_free_witness_fail_msg: .ascii "R15 TASK FREE FAIL\n\0"
+
 # R15-M5-009 (#551): task pool witness — 3-task success message
 .global pool_witness_ok_msg
 .align 8
