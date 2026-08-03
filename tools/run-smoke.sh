@@ -207,12 +207,14 @@ if [[ ${FINGERPRINT_MODE} -eq 1 ]]; then
             # Skip empty lines in fingerprint file
             continue
         fi
-        # Search for line in log starting from last match position
-        if [[ "${log_content}" == *"${line}"* ]]; then
-            # Line found; update search offset for next iteration
-            search_offset=$(( ${#log_content} ))
+        # #673: search remaining log starting at search_offset (real ordered check)
+        remaining="${log_content:search_offset}"
+        if [[ "${remaining}" == *"${line}"* ]]; then
+            # Line found; advance search_offset past this occurrence
+            prefix="${remaining%%"${line}"*}"
+            search_offset=$((search_offset + ${#prefix} + ${#line}))
         else
-            echo "smoke: fingerprint line ${line_num} ('${line}') NOT found in serial log (log size: $(stat -c%s "${LOG}" 2>/dev/null || echo 0))" >&2
+            echo "smoke: fingerprint line ${line_num} ('${line}') NOT found in serial log after position ${search_offset} (log size: $(stat -c%s "${LOG}" 2>/dev/null || echo 0))" >&2
             exit 1
         fi
     done < "${FINGERPRINT_FILE}"
