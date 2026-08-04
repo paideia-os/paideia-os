@@ -1105,6 +1105,15 @@ clone_cow_multi_fail_msg: .ascii "R15 CLONE COW MULTI FAIL\n\0"
 .align 8
 exit_marker_msg: .ascii "[exit]\n\0"
 
+# R15-M4-007 (#541): user_ptr_ok witness messages
+.global user_ptr_ok_msg
+.align 8
+user_ptr_ok_msg: .ascii "R15 USER PTR OK\n\0"
+
+.global user_ptr_fail_msg
+.align 8
+user_ptr_fail_msg: .ascii "R15 USER PTR FAIL\n\0"
+
 .section .bss.boot, "aw", @nobits
 .align 4096
 .global pml4
