@@ -507,6 +507,29 @@ vfs_close_ok_msg: .ascii "R16 VFS CLOSE OK\n\0"
 .align 8
 vfs_close_fail_msg: .ascii "R16 VFS CLOSE FAIL\n\0"
 
+# #664 verification: vfs_open O_CREAT witness success + failure messages
+.global ocreat_ok_msg
+.align 8
+ocreat_ok_msg: .ascii "R16 OCREAT OK\n\0"
+
+.global ocreat_fail_msg
+.align 8
+ocreat_fail_msg: .ascii "OCREAT FAIL\n\0"
+
+# TEMP DEBUG (#664 diagnosis, to be removed): per-sub-test fail markers
+.global ocreat_debug_a_msg
+.align 8
+ocreat_debug_a_msg: .ascii "OCREAT DEBUG FAIL A\n\0"
+
+.global ocreat_debug_b_msg
+.align 8
+ocreat_debug_b_msg: .ascii "OCREAT DEBUG FAIL B\n\0"
+
+.global ocreat_debug_c_msg
+.align 8
+ocreat_debug_c_msg: .ascii "OCREAT DEBUG FAIL C\n\0"
+
+
 # R16-M1-008 (#577): vfs_read/vfs_write witness success + failure messages
 .global vfs_rw_ok_msg
 .align 8
@@ -948,6 +971,15 @@ witness_path_foo_bar: .ascii "/foo/bar\0"
 .global witness_path_nope
 .align 8
 witness_path_nope: .ascii "/nope\0"
+
+# #664 verification: vfs_open O_CREAT witness path/name strings
+.global witness_path_newfile
+.align 8
+witness_path_newfile: .ascii "/newfile\0"
+
+.global witness_name_newfile
+.align 8
+witness_name_newfile: .ascii "newfile\0"
 
 .global witness_path_double_slash
 .align 8
