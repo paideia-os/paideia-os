@@ -4,7 +4,7 @@
 
 Extend the PaideiaOS shell with 5 new built-in commands: `pwd` (print working directory), `help` (list all builtins), `env` (print environment), and enhancements to `echo` (add `-n` flag support) and `exit` (accept optional numeric exit code). These are fundamental utilities for shell usability and bootstrap.
 
-Issues: #629 (echo -n), #630 (exit N), #631 (pwd), #632 (cd — deferred), #633 (help), #634 (env).
+Issues: #629 (echo -n), #630 (exit N), #631 (pwd), #632 (cd), #633 (help), #634 (env).
 
 ## 2. Table Growth
 
@@ -15,9 +15,9 @@ The three dispatch tables grow from 2 entries (echo, exit) to 5 entries (echo, e
 - `builtin_names[8]`: Holds pointers to null-terminated builtin name strings (64 bytes = 8 × u64).
 - `builtin_handlers[8]`: Holds pointers to builtin function addresses (64 bytes = 8 × u64).
 - `builtin_descs[8]`: NEW — holds pointers to human-readable description strings for help (64 bytes = 8 × u64).
-- `builtin_count`: Updated to 5 during `dispatch_init`.
+- `builtin_count`: Updated to 6 during `dispatch_init` (6th entry is `cd` — #632).
 
-The tables remain overallocated to 8 entries; indices 5–7 are unused, reserved for future builtins (cd, etc.).
+The tables remain overallocated to 8 entries; indices 6–7 are unused, reserved for future builtins.
 
 ## 3. State & Buffers
 
@@ -28,7 +28,7 @@ The tables remain overallocated to 8 entries; indices 5–7 are unused, reserved
 - **Alignment**: 8 bytes
 - **Purpose**: Holds the current working directory path as a null-terminated C-string. Initially `/\0...\0`.
 - **Init**: Called via `cwd_init()` during `_start`.
-- **Reserved for**: Future `cd` builtin (when `sys_chdir` kernel syscall is available).
+- **Written by**: `cd_builtin` (#632) — copies argv[1] via memcpy after '/' + length checks.
 
 ### Echo Control Flag (`echo_emit_nl`)
 
@@ -230,16 +230,20 @@ The `cwd_init` call must occur immediately after `dispatch_init` and before the 
 | pwd_builtin | `{mem, sysreg}` | `{fs}` |
 | help_builtin | `{mem, sysreg}` | `{fs}` |
 | env_builtin | `{mem, sysreg}` | `{fs}` |
+| cd_builtin  | `{mem, sysreg}` | `{fs}` |
 
-## 10. Deferred Work (#632: cd)
+## 10. `cd` Builtin (#632) — Syntactic Landing
 
-The `cd` builtin is intentionally deferred until kernel-side `sys_chdir` syscall (issue #732 or later) is available. The `_cwd_buf` buffer and `pwd` command are in place to support it.
+The `cd` builtin landed as a purely syntactic path assignment: it copies
+`argv[1]` into `_cwd_buf` after two checks — absolute path (must start with
+`/`) and length (must be ≤ 255). `argc<2` resets to `/`. There is no
+kernel-side existence check because no `sys_chdir`/`sys_stat` syscall exists
+in the SC+ freeze.
 
-When `sys_chdir` is implemented:
-1. Parse destination path from `argv[1]`.
-2. Call `sys_chdir(dest_path)`.
-3. On success: update `_cwd_buf` with new path; return 0.
-4. On error: return non-zero; emit error message.
+Deferred to a future issue (post-`sys_stat` landing):
+- Reject `argv[1]` that names a non-directory (currently silently accepts).
+- Normalize trailing slash (`/tmp/` → `/tmp`).
+- Support `~`/`$HOME` and relative paths (currently error).
 
 ---
 

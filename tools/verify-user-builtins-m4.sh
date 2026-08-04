@@ -134,11 +134,11 @@ if [[ -z "$SZ" ]]; then echo "[FAIL] dispatch_init symbol missing"; FAIL=1
 elif ! size_ge "$SZ" 144; then echo "[FAIL] dispatch_init too small (0x$SZ, need >= 0x90)"; FAIL=1
 else echo "[ok]   dispatch_init present, size 0x$SZ"; fi
 
-# 15. dispatch_init writes builtin_count=5 (mov rax,0x5)
-if echo "$DI" | grep -Eq "mov[[:space:]]+rax,0x5|mov[[:space:]]+rax,5"; then
-    echo "[ok]   dispatch_init writes builtin_count=5"
+# 15. dispatch_init writes builtin_count=6 (mov rax,0x6) — #632 bumped 5->6
+if echo "$DI" | grep -Eq "mov[[:space:]]+rax,0x6|mov[[:space:]]+rax,6"; then
+    echo "[ok]   dispatch_init writes builtin_count=6"
 else
-    echo "[FAIL] dispatch_init missing mov rax,0x5 (builtin_count=5)"; FAIL=1
+    echo "[FAIL] dispatch_init missing mov rax,0x6 (builtin_count=6)"; FAIL=1
 fi
 
 # 16. _start calls cwd_init once
