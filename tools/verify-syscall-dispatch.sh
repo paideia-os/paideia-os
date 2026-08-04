@@ -142,8 +142,13 @@ else
     FAIL=1
 fi
 
-# Check 13: ID 61 has wstatus writeback
-if echo "$DISPATCH" | grep -A 10 "sys_wait_body" | grep -q "mov.*QWORD PTR \[rsi\]"; then
+# Check 13: ID 61 has wstatus writeback.
+# paideia-as #1251 fixed the store-direction widening bug — `mov [rsi], edx`
+# now correctly emits DWORD store (89 16) instead of buggily-widened QWORD
+# store (48 89 16). Wait4's wstatus is a 4-byte pid+status per Linux ABI, so
+# DWORD is the correct emission. Accept either DWORD or QWORD for
+# cross-version tolerance.
+if echo "$DISPATCH" | grep -A 10 "sys_wait_body" | grep -qE "mov\s+(DWORD|QWORD) PTR \[rsi\]"; then
     echo "[ok]   ID 61 (wait4): wstatus writeback present"
     CHECKS_PASSED=$((CHECKS_PASSED + 1))
 else
