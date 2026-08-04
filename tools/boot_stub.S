@@ -222,6 +222,13 @@ enter_reloc_ok_msg: .ascii "ENTER USER RELOC OK\n\0"
 .align 8
 enter_reloc_fail_msg: .ascii "ENTER USER RELOC FAIL\n\0"
 
+# #679 debug: exception-handler emit marker. exc_handle used to cpu_halt
+# silently — any unhandled exception left NO trace on serial, which hid
+# #679's post-iretq faults. Now emitted before halt so triage is possible.
+.global exc_halt_msg
+.align 8
+exc_halt_msg: .ascii "EXC HALT\n\0"
+
 # R15-M2-006b (#652): Ring-3 witness start message
 .global ring3_start_msg
 .align 8
