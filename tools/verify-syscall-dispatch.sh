@@ -124,8 +124,8 @@ else
     FAIL=1
 fi
 
-# Check 11: ID 60 has hlt loop
-if echo "$DISPATCH" | grep -A 10 "sys_exit_body" | grep -q "hlt"; then
+# Check 11: ID 60 has hlt loop or klog_panic (M4-002: #693)
+if echo "$DISPATCH" | grep -A 10 "sys_exit_body" | grep -qE "hlt|klog_panic"; then
     echo "[ok]   ID 60 (exit): halt loop present after body"
     CHECKS_PASSED=$((CHECKS_PASSED + 1))
 else
