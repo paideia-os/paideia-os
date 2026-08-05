@@ -62,6 +62,17 @@ SECTIONS
                 . = ALIGN(4K);
             } :text_high
 
+    /* #720 (#656 Phase C): ISR trampoline section — executable in user_pml4
+       so ring-3-to-ring-0 exception dispatch can flip CR3 back to user_pml4
+       before iretq without faulting on unreachable-code-page. Phase D wires
+       the entry stubs + return path. */
+    .text.isr_trampoline : AT(ADDR(.text.isr_trampoline) - KERNEL_VMA_BASE) ALIGN(4K) {
+                _isr_trampoline_start = .;
+                KEEP(*core/int/isr_trampoline.o(.text))
+                _isr_trampoline_end = .;
+                . = ALIGN(4K);
+            } :text_high
+
     .text   : AT(ADDR(.text)   - KERNEL_VMA_BASE) ALIGN(4K) {
                 KEEP(*(.text._start))
                 *(.text .text.*)

@@ -62,6 +62,16 @@ SECTIONS
                 . = ALIGN(4K);
             } :text_high
 
+    /* #720 (#656 Phase C): parity with link.ld — must include ISR trampoline
+       section so kpti_build_user_pml4's _isr_trampoline_start/_end references
+       resolve when this alternate link script is used. */
+    .text.isr_trampoline : AT(ADDR(.text.isr_trampoline) - KERNEL_VMA_BASE) ALIGN(4K) {
+                _isr_trampoline_start = .;
+                KEEP(*core/int/isr_trampoline.o(.text))
+                _isr_trampoline_end = .;
+                . = ALIGN(4K);
+            } :text_high
+
     .text   : AT(ADDR(.text)   - KERNEL_VMA_BASE) ALIGN(4K) {
                 KEEP(*(.text._start))
                 *(.text .text.*)
