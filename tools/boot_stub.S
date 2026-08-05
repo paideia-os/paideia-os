@@ -1139,6 +1139,20 @@ logp_tsc_ok_msg: .ascii "LOGP TSC OK\n\0"
 .align 8
 logp_tsc_fail_msg: .ascii "LOGP TSC FAIL\n\0"
 
+# M1-003 (#685): klog_emit_core witness tags
+.global tag_m1_emit_ok
+.align 8
+tag_m1_emit_ok: .ascii "M1 EMIT OK\0"
+
+.global tag_m1_emit_kv
+.align 8
+tag_m1_emit_kv: .ascii "M1 EMIT KV\0"
+
+# M1-003 (#685): klog_emit_core re-entrancy witness message
+.global m1_emit_reent_ok_msg
+.align 8
+m1_emit_reent_ok_msg: .ascii "M1 REENT OK\n\0"
+
 # M0-001 (#681): u64_to_hex expected outputs (18 bytes each, no null-terminator)
 .global logp_hex_expect_0
 .align 8
@@ -1164,6 +1178,12 @@ logp_dec_expect_12345: .ascii "12345"
 .global logp_dec_expect_max
 .align 8
 logp_dec_expect_max: .ascii "18446744073709551615"
+
+# M1-003 (#685): Re-entrancy gate for klog_emit_core (accessible from high-half kernel code)
+.section .bss, "aw", @nobits
+.global _klog_in_progress_bsp
+.align 8
+_klog_in_progress_bsp: .skip 8
 
 .section .bss.boot, "aw", @nobits
 .align 4096
