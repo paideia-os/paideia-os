@@ -4,7 +4,7 @@
 # bytes.
 #
 # Usage: tools/run-smoke.sh [MODE | expected_marker | --fingerprint PATTERN]
-#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r17_init', 'boot_panic', 'prod' (mode dispatcher)
+#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r17_init', 'boot_panic', 'boot_panic_halt', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
 #     * boot_tick: validates boot_tick fingerprint (with timer TICKs), 5s timeout
@@ -46,6 +46,7 @@ EXPECTED="${1:-}"
 FINGERPRINT_MODE=0
 FINGERPRINT_FILE=""
 TIMEOUT=5
+BUILD_PANIC=0
 
 # Mode dispatcher: map boot_min/boot_banner/boot_tick/boot_r8_only/boot_r10/boot_r11/prod to fingerprint + timeout
 case "${EXPECTED}" in
@@ -151,6 +152,13 @@ case "${EXPECTED}" in
         TIMEOUT=8
         EXPECTED=""
         ;;
+    boot_panic_halt)
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/logging/expected-panic-halt.txt"
+        TIMEOUT=5
+        BUILD_PANIC=1
+        EXPECTED=""
+        ;;
     prod)
         # prod mode: expects exit code 2 (kernel didn't build)
         # Skip verification, just exit with code 2
@@ -170,12 +178,21 @@ if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
     exit 77
 fi
 
-if ! "${REPO_ROOT}/tools/build.sh" >/dev/null 2>&1; then
-    echo "smoke: build failed" >&2
-    exit 2
+# M8-001 (#706): boot_panic_halt mode builds panic kernel instead of normal kernel
+if [[ ${BUILD_PANIC} -eq 1 ]]; then
+    if ! "${REPO_ROOT}/tools/build-panic.sh" >/dev/null 2>&1; then
+        echo "smoke: build-panic failed" >&2
+        exit 2
+    fi
+    KERNEL="${REPO_ROOT}/build/kernel-panic.elf"
+else
+    if ! "${REPO_ROOT}/tools/build.sh" >/dev/null 2>&1; then
+        echo "smoke: build failed" >&2
+        exit 2
+    fi
+    KERNEL="${REPO_ROOT}/build/kernel.elf"
 fi
 
-KERNEL="${REPO_ROOT}/build/kernel.elf"
 LOG="/tmp/paideia-os-smoke.log"
 rm -f "${LOG}"
 
@@ -190,8 +207,8 @@ timeout ${TIMEOUT} qemu-system-x86_64 \
     >/dev/null 2>&1
 QEMU_RC=$?
 
-# QEMU exit codes: 124 = timeout (expected for halt+stay-on); 0 = clean
-if [[ ${QEMU_RC} -ne 0 && ${QEMU_RC} -ne 124 ]]; then
+# QEMU exit codes: 124 = timeout (expected for halt+stay-on); 0 = clean; 35 = panic exit (expected for boot_panic_halt)
+if [[ ${QEMU_RC} -ne 0 && ${QEMU_RC} -ne 124 && ${QEMU_RC} -ne 35 ]]; then
     echo "smoke: qemu exited with rc=${QEMU_RC}" >&2
     exit 1
 fi

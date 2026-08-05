@@ -46,8 +46,8 @@ for IDX in "${!KERNEL_FILES[@]}"; do
   # Extract relative path and convert to snake_case symbol name
   RELPATH="${FILE#src/kernel/}"
   RELPATH="${RELPATH%.pdx}"
-  # Convert path separators to underscores
-  SYMBOL_NAME=$(echo "$RELPATH" | sed 's|/|_|g')
+  # Convert path separators + hyphens to underscores (identifier-safe)
+  SYMBOL_NAME=$(echo "$RELPATH" | sed -e 's|/|_|g' -e 's|-|_|g')
   # Compute string length (path + NUL terminator)
   STR_LEN=$((${#RELPATH} + 1))
 
