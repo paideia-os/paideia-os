@@ -234,6 +234,11 @@ exc_halt_msg: .ascii "EXC HALT\n\0"
 .align 8
 exc_dump_marker_msg: .ascii "M3 EXC DUMP\n\0"
 
+# M3-003 (#691): Fake-panic emission chain witness marker
+.global ud_panic_witness_msg
+.align 8
+ud_panic_witness_msg: .ascii "UD PANIC WITNESS\n\0"
+
 # R15-M2-006b (#652): Ring-3 witness start message
 .global ring3_start_msg
 .align 8

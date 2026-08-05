@@ -4,7 +4,7 @@
 # bytes.
 #
 # Usage: tools/run-smoke.sh [MODE | expected_marker | --fingerprint PATTERN]
-#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r17_init', 'prod' (mode dispatcher)
+#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r17_init', 'boot_panic', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
 #     * boot_tick: validates boot_tick fingerprint (with timer TICKs), 5s timeout
@@ -21,6 +21,7 @@
 #     * boot_r15_ring3: validates R15 ring-3 + fd_table + single-task witness, 6s timeout
 #     * boot_r15_process: validates R15 3-task pool witness with pids=1,2,3, 6s timeout
 #     * boot_r17_init: validates R17 init load structural witness (task_new + elf_lite_load), 8s timeout
+#     * boot_panic: validates M3-003 fake-panic emission chain witness, 8s timeout
 #     * prod: expects exit code 2 (kernel didn't build), skips verification
 #   - expected_marker: defaults to no-check (just confirms QEMU exits or
 #     times out cleanly). Pass a string to grep the serial log for.
@@ -141,6 +142,12 @@ case "${EXPECTED}" in
     boot_r17_init)
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/r17/expected-boot-r17-init.txt"
+        TIMEOUT=8
+        EXPECTED=""
+        ;;
+    boot_panic)
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/logging/expected-panic-dump.txt"
         TIMEOUT=8
         EXPECTED=""
         ;;
