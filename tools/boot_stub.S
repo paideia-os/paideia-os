@@ -372,6 +372,27 @@ m2_ring_fail_msg: .ascii "M2 RING FAIL\n\0"
 .align 8
 _m2_ring_witness_buf: .ascii "AB"
 
+# M2-002 (#688): klog_ring_dump_panic witness tags (5 markers)
+.global pdmp_w1_tag
+.align 8
+pdmp_w1_tag: .ascii "PDMP W1 OK\0"
+
+.global pdmp_w2_tag
+.align 8
+pdmp_w2_tag: .ascii "PDMP W2 OK\0"
+
+.global pdmp_w3_tag
+.align 8
+pdmp_w3_tag: .ascii "PDMP W3 OK\0"
+
+.global pdmp_w4_tag
+.align 8
+pdmp_w4_tag: .ascii "PDMP W4 OK\0"
+
+.global pdmp_w5_tag
+.align 8
+pdmp_w5_tag: .ascii "PDMP W5 OK\0"
+
 # R15-M1-010 (#649): phys_free bitmap release witness success message
 .global phys_free_ok_msg
 .align 8
