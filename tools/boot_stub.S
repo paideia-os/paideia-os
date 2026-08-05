@@ -121,12 +121,6 @@ banner_msg:
 cap_ok_msg:
     .ascii "CAP OK\0"
 
-# B6-004: IPC smoke test message
-.global ipc_ok_msg
-.align 8
-ipc_ok_msg:
-    .ascii "IPC OK\n\0"
-
 # R9-m1-002: IDT installation message
 .global idt_ok_msg
 .align 8
