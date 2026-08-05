@@ -314,35 +314,10 @@ ring3_stack_done_msg: .ascii "R15 STACK DONE\n\0"
 .align 8
 ring3_enter_msg: .ascii "R15 ENTER RING3\n\0"
 
-# R15-M2-006b (#652): Debug message when witness is resumed from exception handler
-.global ring3_resumed_msg
-.align 8
-ring3_resumed_msg: .ascii "R15 WITNESS RESUMED\n\0"
-
 # R15-M2-006b (#652): Debug message if enter_userland_initial returns
 .global ring3_returned_msg
 .align 8
 ring3_returned_msg: .ascii "R15 RETURNED FROM RING3\n\0"
-
-# R15-M2-006b (#652): Debug message when handler is called
-.global ring3_handler_called_msg
-.align 8
-ring3_handler_called_msg: .ascii "R15 HANDLER CALLED\n\0"
-
-# R15-M2-006b (#652): Debug message when exception handler is called
-.global ring3_gp_debug_msg
-.align 8
-ring3_gp_debug_msg: .ascii "R15 GP DEBUG\n\0"
-
-# R15-M2-006b (#652): Ring-3 witness success message (user hlt → #GP → resume)
-.global ring3_hello_ok_msg
-.align 8
-ring3_hello_ok_msg: .ascii "R15 RING3 HELLO OK\n\0"
-
-# R14-M3-007c (#650): #UD witness success message.
-.global ud_witness_ok_msg
-.align 8
-ud_witness_ok_msg: .ascii "R14 UD OK\n\0"
 
 # R14-M3-007c (#650): #UD witness failure message (armed but not fired).
 .global ud_witness_fail_msg
