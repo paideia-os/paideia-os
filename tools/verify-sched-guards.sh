@@ -16,17 +16,10 @@ echo "$DISASM" | grep -E 'cmp[[:space:]]+\$0x1,%[er]cx' > /dev/null || {
     exit 1
 }
 
-# 2. sched_block has a jne branch (precond fail)
+# 2. sched_block has kassert_fail call (#697 conversion from old guard)
 DISASM=$(objdump -d "${KERNEL_ELF}" --disassemble=sched_block 2>/dev/null)
-echo "$DISASM" | grep -E 'jne' > /dev/null || {
-    echo "[FAIL] sched_block missing jne guard branch"
-    exit 1
-}
-
-# 3. precond_fail_msg symbol exists in the binary
-NM_OUT=$(nm "${KERNEL_ELF}" 2>/dev/null)
-echo "$NM_OUT" | grep 'sched_block_precond_fail_msg' > /dev/null || {
-    echo "[FAIL] sched_block_precond_fail_msg symbol not found"
+echo "$DISASM" | grep -E 'call[[:space:]]+.*kassert_fail' > /dev/null || {
+    echo "[FAIL] sched_block missing kassert_fail call (#697)"
     exit 1
 }
 
