@@ -239,6 +239,11 @@ exc_dump_marker_msg: .ascii "M3 EXC DUMP\n\0"
 .align 8
 ud_panic_witness_msg: .ascii "UD PANIC WITNESS\n\0"
 
+# M5-001 (#695): klog_walk_rbp stack walker witness success message
+.global m5_walk_ok_msg
+.align 8
+m5_walk_ok_msg: .ascii "M5 STACK WALK OK\n\0"
+
 # R15-M2-006b (#652): Ring-3 witness start message
 .global ring3_start_msg
 .align 8
