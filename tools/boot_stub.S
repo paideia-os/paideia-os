@@ -357,6 +357,21 @@ _task_a_msg:
 _task_b_msg:
     .ascii "TASK B\n\0"
 
+# M2-001 (#687): klog_ring_write witness success message
+.global m2_ring_ok_msg
+.align 8
+m2_ring_ok_msg: .ascii "M2 RING OK\n\0"
+
+# M2-001 (#687): klog_ring_write witness failure message
+.global m2_ring_fail_msg
+.align 8
+m2_ring_fail_msg: .ascii "M2 RING FAIL\n\0"
+
+# M2-001 (#687): klog_ring_write witness buffer (2 bytes: "AB")
+.global _m2_ring_witness_buf
+.align 8
+_m2_ring_witness_buf: .ascii "AB"
+
 # R15-M1-010 (#649): phys_free bitmap release witness success message
 .global phys_free_ok_msg
 .align 8
