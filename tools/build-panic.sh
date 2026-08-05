@@ -40,7 +40,7 @@ while IFS= read -r -d '' pdx; do
     echo "[build] paideia-as ${rel} -> ${obj#"${BUILD_DIR}"/}"
     "${PAIDEIA_AS}" build --emit elf64 "${pdx}" -o "${obj}"
     OBJECTS+=("${obj}")
-done < <(find "${KERNEL_SRC}" -name '*.pdx' -print0 | sort -z)
+done < <(find "${KERNEL_SRC}" -name '*.pdx' -not -path '*/boot_exc3/*' -print0 | sort -z)
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${OBJECTS[@]}" )
 
