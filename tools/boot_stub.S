@@ -1121,6 +1121,41 @@ user_ptr_ok_msg: .ascii "R15 USER PTR OK\n\0"
 .align 8
 user_ptr_fail_msg: .ascii "R15 USER PTR FAIL\n\0"
 
+# M0-001 (#681): u64_to_hex and u64_to_dec leaf helpers witness messages
+.global logp_hex_ok_msg
+.align 8
+logp_hex_ok_msg: .ascii "LOGP HEX OK\n\0"
+
+.global logp_hex_fail_msg
+.align 8
+logp_hex_fail_msg: .ascii "LOGP HEX FAIL\n\0"
+
+# M0-001 (#681): u64_to_hex expected outputs (18 bytes each, no null-terminator)
+.global logp_hex_expect_0
+.align 8
+logp_hex_expect_0: .ascii "0x0000000000000000"
+
+.global logp_hex_expect_deadbeef
+.align 8
+logp_hex_expect_deadbeef: .ascii "0xdeadbeefcafef00d"
+
+.global logp_hex_expect_max
+.align 8
+logp_hex_expect_max: .ascii "0xffffffffffffffff"
+
+# M0-001 (#681): u64_to_dec expected outputs
+.global logp_dec_expect_0
+.align 8
+logp_dec_expect_0: .ascii "0"
+
+.global logp_dec_expect_12345
+.align 8
+logp_dec_expect_12345: .ascii "12345"
+
+.global logp_dec_expect_max
+.align 8
+logp_dec_expect_max: .ascii "18446744073709551615"
+
 .section .bss.boot, "aw", @nobits
 .align 4096
 .global pml4
