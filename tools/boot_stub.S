@@ -1148,6 +1148,64 @@ tag_m1_emit_ok: .ascii "M1 EMIT OK\0"
 .align 8
 tag_m1_emit_kv: .ascii "M1 EMIT KV\0"
 
+# M1-004 (#686): per-arity wrappers witness tags
+.global tag_m1_s1_ok
+.align 8
+tag_m1_s1_ok: .ascii "M1 S1 OK\0"
+
+.global tag_m1_s1x1
+.align 8
+tag_m1_s1x1: .ascii "M1 S1X1\0"
+
+.global tag_m1_s1x2
+.align 8
+tag_m1_s1x2: .ascii "M1 S1X2\0"
+
+.global tag_m1_s1x3
+.align 8
+tag_m1_s1x3: .ascii "M1 S1X3\0"
+
+.global tag_m1_s1x4
+.align 8
+tag_m1_s1x4: .ascii "M1 S1X4\0"
+
+.global tag_m1_s1d1
+.align 8
+tag_m1_s1d1: .ascii "M1 S1D1\0"
+
+.global tag_m1_sxd
+.align 8
+tag_m1_sxd: .ascii "M1 SXD\0"
+
+# M1-004 (#686): per-arity wrappers witness KV keys
+.global k_cr2
+.align 8
+k_cr2: .ascii "cr2\0"
+
+.global k_vec
+.align 8
+k_vec: .ascii "vec\0"
+
+.global k_err
+.align 8
+k_err: .ascii "err\0"
+
+.global k_rip
+.align 8
+k_rip: .ascii "rip\0"
+
+.global k_cs
+.align 8
+k_cs: .ascii "cs\0"
+
+.global k_pid
+.align 8
+k_pid: .ascii "pid\0"
+
+.global k_line
+.align 8
+k_line: .ascii "line\0"
+
 # M1-003 (#685): klog_emit_core re-entrancy witness message
 .global m1_emit_reent_ok_msg
 .align 8
