@@ -326,10 +326,10 @@ m2_ring_ok_msg: .ascii "M2 RING OK\n\0"
 .align 8
 m2_ring_fail_msg: .ascii "M2 RING FAIL\n\0"
 
-# M2-001 (#687): klog_ring_write witness buffer (2 bytes: "AB")
+# M2-001 (#687): klog_ring_write witness buffer (3 bytes: "AB\n")
 .global _m2_ring_witness_buf
 .align 8
-_m2_ring_witness_buf: .ascii "AB"
+_m2_ring_witness_buf: .ascii "AB\n"
 
 # M2-002 (#688): klog_ring_dump_panic witness tags (5 markers)
 .global pdmp_w1_tag
