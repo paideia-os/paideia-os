@@ -229,6 +229,11 @@ enter_reloc_fail_msg: .ascii "ENTER USER RELOC FAIL\n\0"
 .align 8
 exc_halt_msg: .ascii "EXC HALT\n\0"
 
+# M3-002 (#690): Exception frame dump witness marker
+.global exc_dump_marker_msg
+.align 8
+exc_dump_marker_msg: .ascii "M3 EXC DUMP\n\0"
+
 # R15-M2-006b (#652): Ring-3 witness start message
 .global ring3_start_msg
 .align 8
@@ -1274,6 +1279,14 @@ logp_dec_expect_12345: .ascii "12345"
 logp_dec_expect_max: .ascii "18446744073709551615"
 
 # M1-003 (#685): Re-entrancy gate for klog_emit_core (accessible from high-half kernel code)
+# M3-002 (#690): int3 breakpoint stub — emit breakpoint exception (vec 3)
+.section .text, "ax", @progbits
+.code64
+.global fire_int3
+fire_int3:
+	.byte 0xcc           # int3 opcode
+	ret
+
 .section .bss, "aw", @nobits
 .global _klog_in_progress_bsp
 .align 8
