@@ -223,10 +223,6 @@ enter_reloc_fail_msg: .ascii "ENTER USER RELOC FAIL\n\0"
 .align 8
 exc_halt_msg: .ascii "EXC HALT\n\0"
 
-# M3-002 (#690): Exception frame dump witness marker
-.global exc_dump_marker_msg
-.align 8
-exc_dump_marker_msg: .ascii "M3 EXC DUMP\n\0"
 
 # M3-003 (#691): Fake-panic emission chain witness marker
 .global ud_panic_witness_msg
@@ -248,10 +244,6 @@ ring3_start_msg: .ascii "R15 RING3 START\n\0"
 .align 8
 ring3_saved_rsp_msg: .ascii "R15 SAVED RSP\n\0"
 
-# R15-M2-006b (#652): Debug message after saving RIP marker
-.global ring3_saved_rip_msg
-.align 8
-ring3_saved_rip_msg: .ascii "R15 SAVED RIP\n\0"
 
 # R15-M2-006b (#652): Debug message before creating PML4
 .global ring3_create_pml4_msg
@@ -323,11 +315,6 @@ ud_witness_fail_msg: .ascii "R14 UD FAIL\n\0"
 .align 8
 ring3_fail_msg: .ascii "R15 RING3 FAIL\n\0"
 
-# R9-m4-001: Tick worker message (emitted every K=16 IRQs)
-.global _tick_msg
-.align 8
-_tick_msg:
-    .ascii "TICK\n\0"
 
 # M2-001 (#687): klog_ring_write witness success message
 .global m2_ring_ok_msg
@@ -1005,23 +992,7 @@ witness_path_double_slash: .ascii "//foo//bar\0"
 .align 8
 witness_path_tmp_x: .ascii "/tmp/x\0"
 
-# R15-M7-001 (#562): idle test start message
-.global idle_test_msg
-.align 8
-idle_test_msg: .ascii "IDLE TEST START\n\0"
 
-# R15-M7-001 (#562): idle-task witness debug messages
-.global idle_debug_1_msg
-.align 8
-idle_debug_1_msg: .ascii "IDLE DEBUG 1\n\0"
-
-.global idle_debug_2_msg
-.align 8
-idle_debug_2_msg: .ascii "IDLE DEBUG 2\n\0"
-
-.global idle_debug_3_msg
-.align 8
-idle_debug_3_msg: .ascii "IDLE DEBUG 3\n\0"
 
 # R15-M7-001 (#562): idle-task witness success message
 .global idle_witness_ok_msg
@@ -1075,10 +1046,6 @@ _bad_elf_stub_start:
 .global _bad_elf_stub_end
 _bad_elf_stub_end:
 
-# R15-M7-006 (#663): sched_block precondition-fail message
-.global sched_block_precond_fail_msg
-.align 8
-sched_block_precond_fail_msg: .ascii "SCHED PRECOND FAIL: block on non-RUNNABLE\n\0"
 
 # R15-M6-008 (#559): frame_meta refcount witness success message
 .global frame_meta_ok_msg
@@ -1115,10 +1082,6 @@ clone_cow_multi_ok_msg: .ascii "R15 CLONE COW MULTI OK\n\0"
 .align 8
 clone_cow_multi_fail_msg: .ascii "R15 CLONE COW MULTI FAIL\n\0"
 
-# R15-M4-003 (#537): Exit marker message
-.global exit_marker_msg
-.align 8
-exit_marker_msg: .ascii "[exit]\n\0"
 
 # R15-M4-007 (#541): user_ptr_ok witness messages
 .global user_ptr_ok_msg
@@ -1134,10 +1097,6 @@ user_ptr_fail_msg: .ascii "R15 USER PTR FAIL\n\0"
 .align 8
 logp_hex_ok_msg: .ascii "LOGP HEX OK\n\0"
 
-.global logp_hex_fail_msg
-.align 8
-logp_hex_fail_msg: .ascii "LOGP HEX FAIL\n\0"
-
 # M0-002 (#682): kread_tsc and kread_cpu_id witness messages
 .global logp_tsc_ok_msg
 .align 8
@@ -1151,10 +1110,6 @@ logp_tsc_fail_msg: .ascii "LOGP TSC FAIL\n\0"
 .global tag_m1_emit_ok
 .align 8
 tag_m1_emit_ok: .ascii "M1 EMIT OK\0"
-
-.global tag_m1_emit_kv
-.align 8
-tag_m1_emit_kv: .ascii "M1 EMIT KV\0"
 
 # M1-004 (#686): per-arity wrappers witness tags
 .global tag_m1_s1_ok
@@ -1214,36 +1169,7 @@ k_pid: .ascii "pid\0"
 .align 8
 k_line: .ascii "line\0"
 
-# M1-003 (#685): klog_emit_core re-entrancy witness message
-.global m1_emit_reent_ok_msg
-.align 8
-m1_emit_reent_ok_msg: .ascii "M1 REENT OK\n\0"
 
-# M0-001 (#681): u64_to_hex expected outputs (18 bytes each, no null-terminator)
-.global logp_hex_expect_0
-.align 8
-logp_hex_expect_0: .ascii "0x0000000000000000"
-
-.global logp_hex_expect_deadbeef
-.align 8
-logp_hex_expect_deadbeef: .ascii "0xdeadbeefcafef00d"
-
-.global logp_hex_expect_max
-.align 8
-logp_hex_expect_max: .ascii "0xffffffffffffffff"
-
-# M0-001 (#681): u64_to_dec expected outputs
-.global logp_dec_expect_0
-.align 8
-logp_dec_expect_0: .ascii "0"
-
-.global logp_dec_expect_12345
-.align 8
-logp_dec_expect_12345: .ascii "12345"
-
-.global logp_dec_expect_max
-.align 8
-logp_dec_expect_max: .ascii "18446744073709551615"
 
 # M1-003 (#685): Re-entrancy gate for klog_emit_core (accessible from high-half kernel code)
 # M3-002 (#690): int3 breakpoint stub — emit breakpoint exception (vec 3)
