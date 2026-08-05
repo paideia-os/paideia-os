@@ -1130,6 +1130,15 @@ logp_hex_ok_msg: .ascii "LOGP HEX OK\n\0"
 .align 8
 logp_hex_fail_msg: .ascii "LOGP HEX FAIL\n\0"
 
+# M0-002 (#682): kread_tsc and kread_cpu_id witness messages
+.global logp_tsc_ok_msg
+.align 8
+logp_tsc_ok_msg: .ascii "LOGP TSC OK\n\0"
+
+.global logp_tsc_fail_msg
+.align 8
+logp_tsc_fail_msg: .ascii "LOGP TSC FAIL\n\0"
+
 # M0-001 (#681): u64_to_hex expected outputs (18 bytes each, no null-terminator)
 .global logp_hex_expect_0
 .align 8
