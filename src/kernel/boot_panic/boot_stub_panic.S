@@ -145,6 +145,18 @@ hi_va_msg:
 cr0_wp_ok_msg:
     .ascii "R14B CR0 WP OK\n\0"
 
+# R14b-M5-008 (#660): pf_handler CoW fast-flip witness success message
+.global pf_flip_ok_msg
+.align 8
+pf_flip_ok_msg:
+    .ascii "R14B PF FLIP OK\n\0"
+
+# R14b-M5-008 (#660): pf_handler CoW fast-flip witness failure message
+.global pf_flip_fail_msg
+.align 8
+pf_flip_fail_msg:
+    .ascii "R14B PF FLIP FAIL\n\0"
+
 # R14.M4-009 (#505): KPTI structural witness success message
 .global kpti_ok_msg
 .align 8
