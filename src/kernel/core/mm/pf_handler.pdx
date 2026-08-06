@@ -1,4 +1,4 @@
-// src/kernel/core/mm/pf_handler.pdx — Phase 5 P5-018 + R14b-M5-008 (#660)
+// src/kernel/core/mm/pf_handler.pdx — Phase 5 P5-018 + R14b-M5-008 (#660) + R15-M6-002 (#553)
 // Page fault handler — audit entry pf_handler-001.
 //
 // Handles #PF (page fault) exceptions. Decodes the faulting address
@@ -7,8 +7,18 @@
 // error codes for invalid faults (e.g., write to read-only page).
 //
 // R14b-M5-008 (#660): Phase C — Implements pf_handle_cow fast-flip only.
-// Refcount == 1 → atomically flip PTE from (P|RW=0|COW) to (P|RW|~COW).
-// Refcount > 1 or 0 → return KILL (split path deferred to #553).
+// R15-M6-002 (#553): Phase D — Adds pf_cow_split for refcount >= 2:
+//   allocate fresh frame → copy 4 KiB → rewrite PTE (RW=1, COW=0, preserving
+//   US+NX from the old PTE) → invlpg cr2 → decref old frame via phys_free's
+//   #559 refcount decref-guard (bit stays set for remaining sharers).
+//
+// Branch matrix on refcount at leaf-PTE dispatch:
+//   refcount == 1     → fast flip in place (last owner promotes to R+W)
+//   refcount >= 2     → SPLIT (this task takes a private copy, old frame
+//                       stays live for the other sharer(s))
+//   refcount == 0     → invariant break — bitmap says allocated, refcount
+//                       says free; fall through to KILL/panic
+//   FRAME_META_INVALID (=-1) → out-of-pool leaf frame; KILL/panic
 
 module PfHandler = structure {
   let PF_HANDLE_OK   : i64 = 0
@@ -28,7 +38,7 @@ module PfHandler = structure {
   pub let pf_handle_cow : (u64) -> u64 !{mem, sysreg} @{boot} = fn(frame_ptr: u64) -> unsafe {
     effects: { mem, sysreg },
     capabilities: { boot },
-    justification: "R14b-M5-008 (#660): Phase C fast-flip handler for CoW pages with refcount==1. Five-register callee-save prologue (rbx, r12-r15). Walk PML4→PDPT→PD→PT, validate error_code (P|W only), check PTE (PRESENT + ~RW + COW), read frame refcount, branch on refcount: (1) → fast-flip: OR RW, AND ~COW, store, invlpg, return OK; (>1 or 0) → return KILL (split deferred to #553). No GS_BASE access (ring-0 only at #660 scope). Instrumented with 11 klog markers for bisection diagnostics (entry, 9 error paths, success).",
+    justification: "R14b-M5-008 (#660) + R15-M6-002 (#553): Full CoW handler for shared pages. Five-register callee-save prologue (rbx, r12-r15). Walk PML4→PDPT→PD→PT, validate error_code (P|W only), check PTE (PRESENT + ~RW + COW), read frame refcount, branch on refcount: (==1) → fast-flip in place (OR RW, AND ~COW, store, invlpg, return OK); (>=2) → SPLIT path: phys_alloc(0) fresh frame → memcpy 4 KiB (512 × u64 loop) → build new PTE = new_pa | PRESENT | RW | preserved(US|NX) → store PTE → tlb_shootdown_local(cr2) → phys_free(old_pa,0) which invokes #559 refcount decref-guard (n→n-1≥1 keeps bit set for remaining sharers, n→0 releases). Ordering (alloc → copy → point → decref) matches Linux do_wp_page. (==0 or FRAME_META_INVALID) → return KILL (invariant break, panics via handle_pf). No GS_BASE access (ring-0 witnesses only at R15.M6 scope; ring-3 CoW consumes identical path once #552 relands). Instrumented with klog markers for bisection diagnostics: entry + 9 validation-error paths + fast-flip success + split success + split alloc failure.",
     block: {
       // Prologue: save 5 callee-saved registers
       push rbx;
@@ -152,11 +162,18 @@ module PfHandler = structure {
       mov r13, rax;                    // capture refcount in r13 (dead post-err-validation)
 
       // Branch on refcount
+      //   ==1        → fast-flip (last owner promotes in place)
+      //   ==0 or -1  → invariant break, jump to kill/panic
+      //   >=2        → split path (this task takes a private copy)
       cmp rax, 1;
       je pf_cow_flip;
-
-      // refcount != 1: error path
-      jmp pf_cow_err_refcount;
+      cmp rax, 0;
+      je pf_cow_err_refcount;
+      mov r8, 0xFFFFFFFFFFFFFFFF;      // FRAME_META_INVALID sentinel
+      cmp rax, r8;
+      je pf_cow_err_refcount;
+      // refcount >= 2 → split path
+      jmp pf_cow_split;
 
     pf_cow_flip:
       // Fast-flip: OR PTE_RW, AND ~PTE_COW, store atomically
@@ -199,6 +216,108 @@ module PfHandler = structure {
       skip_klog_success:
 
       // Return PF_HANDLE_OK
+      xor rax, rax;
+      jmp pf_handle_cow_epilogue;
+
+    // ========================================================================
+    // R15-M6-002 (#553): Split path — refcount >= 2.
+    // ========================================================================
+    // The page is shared with at least one other aspace. Take a private copy
+    // for THIS task, rewrite the current-CR3 leaf PTE to point at the fresh
+    // frame with R+W (COW cleared), invalidate the TLB entry, and decref the
+    // old frame's refcount via phys_free's #559 guard (which keeps the bit
+    // set because refcount stays >= 1 — old page still has other sharers).
+    //
+    // Register discipline through the split body:
+    //   r12 = cr2 (faulting VA) — surviving, callee-save
+    //   r13 = new frame VA (bit-63 form from phys_alloc) — surviving,
+    //          overwrites the now-dead refcount value
+    //   r14 = &PT[idx] (leaf-PTE slot address) — surviving, callee-save
+    //   r15 = old leaf PTE value (untouched) — surviving, callee-save
+    //   rbx = frame_ptr (dead since error_code was read at prologue) — spare
+    //   rax/rcx/rdi/rsi/r8/r9/r10/r11 — scratch (all caller-save, no callee
+    //          preservation needed across the internal calls: phys_alloc
+    //          pushes r12/r13/r14 in its prologue; phys_free/tlb_shootdown_
+    //          local touch only caller-save registers; r15/rbx survive as
+    //          SysV callee-saves the callees never write).
+    pf_cow_split:
+      // --- 1. Allocate a fresh frame (born with refcount=1 via #559) ---
+      mov rdi, 0;                      // order = 0 (single 4 KiB page)
+      call phys_alloc;
+      cmp rax, 0;
+      je pf_cow_err_split_alloc;       // OOM → panic (no OOM-signalling at R15)
+      mov r13, rax;                    // r13 = new_va (surviving; overwrites refcount)
+
+      // --- 2. Copy old frame → new frame (512 × u64 = 4096 bytes) ---
+      // Source: high-half VA of old frame  = old_pa + KERNEL_VMA_BASE
+      // Dest:   new_va (already in phys_alloc's bit-63 form)
+      mov rax, r15;                    // old leaf PTE
+      mov rcx, 0x000FFFFFFFFFF000;     // PTE_FRAME_MASK
+      and rax, rcx;                    // rax = old_pa
+      mov rcx, 0xFFFF800000000000;     // KERNEL_VMA_BASE
+      add rax, rcx;                    // rax = old_va (source)
+      mov rsi, rax;                    // rsi = source VA
+      mov rdi, r13;                    // rdi = dest VA
+      xor rcx, rcx;                    // rcx = qword index
+    memcpy_split_loop:
+      cmp rcx, 512;
+      jae memcpy_split_done;
+      mov r8, [rsi + rcx * 8];         // load qword from src
+      mov [rdi + rcx * 8], r8;         // store qword to dst
+      add rcx, 1;
+      jmp memcpy_split_loop;
+    memcpy_split_done:
+
+      // --- 3. Build new PTE and store it into the current-CR3 leaf slot ---
+      // new_pte = new_pa | PTE_PRESENT | PTE_RW | preserved(US | NX)
+      // - PTE_COW is left cleared (bit 9 = 0): the new frame is singly owned
+      //   by this task and no longer participates in the CoW protocol until
+      //   another aspace_clone_cow re-shares it.
+      // - Cache/global/A/D bits (3..8) reset on the new frame — matches
+      //   Linux do_wp_page's pristine-flags policy.
+      mov rax, r13;                    // new_va (bit 63 form)
+      mov rcx, 0xFFFF800000000000;     // KERNEL_VMA_BASE
+      sub rax, rcx;                    // rax = new_pa (bit 63 cleared)
+      mov rcx, 0x000FFFFFFFFFF000;     // PTE_FRAME_MASK (12..51)
+      and rax, rcx;                    // rax = frame field
+      mov r8, r15;                     // old PTE
+      mov r9, 0x8000000000000004;      // NX (bit 63) | US (bit 2)
+      and r8, r9;                      // r8 = preserved US + NX flags
+      or rax, r8;                      // frame | preserved flags
+      or rax, 0x3;                     // | PTE_PRESENT | PTE_RW  (COW=0)
+      mov [r14], rax;                  // atomic 8-byte store into leaf PT slot
+
+      // --- 4. Invalidate the TLB entry for the faulting VA ---
+      // Post-store fence + local invlpg. Under iretq's serializing effect,
+      // the CPU's subsequent re-execution of the faulting write sees the
+      // new PTE (writable + pointing to the new frame).
+      mov rdi, r12;                    // cr2 → rdi
+      call tlb_shootdown_local;
+
+      // --- 5. Decref the old frame ---
+      // #559 decref-guard: (n → n-1 ≥ 1) → keep bit, return OK;
+      //                    (n → 0)       → clear bit, return OK.
+      // In the split path we entered because n ≥ 2, so the guard keeps the
+      // bit set: the old frame stays live for the other sharer(s).
+      mov rax, r15;                    // old PTE
+      mov rcx, 0x000FFFFFFFFFF000;     // PTE_FRAME_MASK
+      and rax, rcx;                    // rax = old_pa
+      mov rdi, rax;                    // page → rdi
+      xor rsi, rsi;                    // order = 0
+      call phys_free;                  // returns 0 in both keep-bit and clear-bit paths
+
+      // --- 6. Split success — emit klog marker if verbose ---
+      lea rax, [rip + _cow_witness_verbose];
+      mov rax, [rax];
+      cmp rax, 1;
+      jne skip_klog_split_ok;
+      mov rdi, 3;                      // INFO level
+      lea rsi, [rip + SUBSYS_MM__];
+      lea rdx, [rip + tag_pf_cow_split_ok];
+      call klog_s1;
+      skip_klog_split_ok:
+
+      // Return PF_HANDLE_OK — iretq re-executes the write on the new writable page.
       xor rax, rax;
       jmp pf_handle_cow_epilogue;
 
@@ -337,8 +456,24 @@ module PfHandler = structure {
       skip_klog_9:
       jmp pf_handle_cow_kill;
 
+    // [Split OOM marker] phys_alloc(0) returned NULL in split path
+    // R15 has no OOM-signal to userland; fall through to KILL → handle_pf panic.
+    pf_cow_err_split_alloc:
+      lea rax, [rip + _cow_witness_verbose];
+      mov rax, [rax];
+      cmp rax, 1;
+      jne skip_klog_split_alloc_fail;
+      mov rdi, 1;                      // ERROR level
+      lea rsi, [rip + SUBSYS_MM__];
+      lea rdx, [rip + tag_pf_cow_split_alloc_fail];
+      lea rcx, [rip + k_len];
+      mov r8, r13;                     // r13 still holds original refcount (pre-overwrite)
+      call klog_s1_x1;
+      skip_klog_split_alloc_fail:
+      jmp pf_handle_cow_kill;
+
     pf_handle_cow_kill:
-      // Return PF_HANDLE_KILL (non-CoW or refcount>1)
+      // Return PF_HANDLE_KILL (non-CoW, refcount==0, FRAME_META_INVALID, or split OOM)
       mov rax, 1;
 
     pf_handle_cow_epilogue:
