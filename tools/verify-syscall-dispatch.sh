@@ -151,7 +151,13 @@ fi
 # store (48 89 16). Wait4's wstatus is a 4-byte pid+status per Linux ABI, so
 # DWORD is the correct emission. Accept either DWORD or QWORD for
 # cross-version tolerance.
-if echo "$DISPATCH" | grep -A 10 "sys_wait_body" | grep -qE "mov\s+(DWORD|QWORD) PTR \[rsi\]"; then
+#
+# #724 D5a widened the window between the sys_wait_body call and the
+# writeback: on the rax==0 branch the dispatcher now performs sched_block
+# + wait_result_{pid,status} reads (~8 additional instructions) before
+# the writeback. -A 30 comfortably covers both the direct-return (reap or
+# ECHILD) path and the block-then-resume path.
+if echo "$DISPATCH" | grep -A 30 "sys_wait_body" | grep -qE "mov\s+(DWORD|QWORD) PTR \[rsi\]"; then
     echo "[ok]   ID 61 (wait4): wstatus writeback present"
     CHECKS_PASSED=$((CHECKS_PASSED + 1))
 else
