@@ -1,0 +1,261 @@
+// src/kernel/core/syscall/handlers/sys_execve_shim.pdx — R17-M0-671 (#671)
+// sys_execve dispatch shim: path→image copy-in.
+//
+// Bridges the SC+ userland ABI shape execve(path, argv, envp) to the
+// kernel-internal sys_execve_body(current, image_ptr, image_len) contract
+// from #555. Full design: design/kernel/r17-m0-671-sys-execve-shim.md.
+//
+// Sequence (all failure paths return sign-extended -errno in rax, rdx=0):
+//   1. user_ptr_ok(path_va, 1)                         — reject kernel ptrs early
+//   2. Byte-copy path into _execve_path_scratch        — bounded 256 B, NUL-terminated
+//   3. vfs_open(scratch_path, O_RDONLY=0) → vnode_idx  — 0 => -ENOENT
+//   4. Page-sized read loop into _execve_image_scratch — until EOF / short / cap
+//   5. ELF magic check on image[0..4] == "\x7fELF"     — mismatch => -ENOEXEC
+//   6. vfs_close(vnode_idx)                            — best-effort refcount drop
+//   7. sys_execve_body(current, image, image_len)      — forwards its {rax, rdx}
+//
+// Non-scope (see design doc §1): the successful sys_execve_body return commits
+// current->user_pml4_pa but does NOT flip CR3 or rewrite the syscall return
+// frame. Making a successful execve semantically re-enter the new image is
+// #723's job (return-path plumbing). #671 stops at "the shim reaches
+// sys_execve_body with a valid ELF and gets a legal return code."
+
+module SysExecveShim = structure {
+  // ==========================================================================
+  // Constants
+  // ==========================================================================
+
+  // Path buffer cap — matches _vfs_open_parent_scratch's 256 B (see vfs_open.pdx).
+  pub let EXECVE_PATH_MAX  : u64 = 256
+
+  // Image buffer cap — matches tmpfs's 64 KiB file-size cap (tmpfs/write.pdx
+  // section 4.4 range gate). 16 × 4 KiB pages, aligned so a future backtrack
+  // to phys_alloc(4) is drop-in.
+  pub let EXECVE_IMAGE_MAX : u64 = 65536
+  pub let EXECVE_PAGE_SIZE : u64 = 4096
+
+  // Linux errno constants (sign-extended to u64), matching PtrCheck.EFAULT
+  // and sys_open.pdx conventions.
+  pub let EFAULT_U64  : u64 = 0xFFFFFFFFFFFFFFF2   // -14
+  pub let ENOENT_U64  : u64 = 0xFFFFFFFFFFFFFFFE   // -2
+  pub let EIO_U64     : u64 = 0xFFFFFFFFFFFFFFFB   // -5
+  pub let ENOEXEC_U64 : u64 = 0xFFFFFFFFFFFFFFF8   // -8
+  pub let E2BIG_U64   : u64 = 0xFFFFFFFFFFFFFFF9   // -7
+
+  // VOPS error sentinel (matches vfs_read.pdx / tmpfs_read.pdx failure return).
+  pub let VOPS_ERR_SENTINEL : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ==========================================================================
+  // Kernel-owned scratch storage (.bss)
+  //
+  // Both live in the kernel high-half; loads/stores use RIP-relative lea.
+  // _execve_image_scratch is @align(4096) so a future backtrack to phys_alloc
+  // (per design §3.4 rationale 2) is a drop-in replacement.
+  // ==========================================================================
+  pub let mut _execve_path_scratch  : [u8; 256]   = uninit @align(8)
+  pub let mut _execve_image_scratch : [u8; 65536] = uninit @align(4096)
+
+  // ==========================================================================
+  // sys_execve_shim(current, path_va, argv_va, envp_va) -> u64
+  //
+  // SysV AMD64:
+  //   rdi = current   (task_struct*, non-NULL — dispatcher loads _current_tcb)
+  //   rsi = path_va   (user VA of NUL-terminated path)
+  //   rdx = argv_va   (IGNORED at R17.M0 — see design §1 Non-Scope)
+  //   rcx = envp_va   (IGNORED at R17.M0 — see design §1 Non-Scope)
+  //
+  // Returns:
+  //   rax = 0 on success (with rdx = ELF e_entry from sys_execve_body)
+  //   rax = -errno on failure (rdx = 0)
+  // ==========================================================================
+  pub let sys_execve_shim : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (current: u64) (path_va: u64) (argv_va: u64) (envp_va: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {},
+      justification: "R17-M0-671 (#671): sys_execve dispatch shim. Bridges the SC+ userland execve(path, argv, envp) shape to sys_execve_body(current, image_ptr, image_len) from #555, which cannot accept a path directly (its ABI expects an already-loaded ELF blob). Five-push callee-save prologue (rbx, r12, r13, r14, r15) lands rsp%16==0 for every nested call per SysV AMD64. Register plan: rbx=current (needed for sys_execve_body), r12=path_va (needed only through phase 3 copy, then dead), r13=vnode_idx (set by vfs_open in phase 4, used by vfs_read in phase 5 and vfs_close in phase 7), r14=byte-index / offset / image_len (repurposed across phases 3→5→8), r15=_execve_image_scratch base VA (lea'd once in phase 5, used by phase 6 magic check and phase 8 sys_execve_body call). Phase 2 calls user_ptr_ok(path_va, 1) to reject a kernel-half pointer up front — Phase 1 range check per #541; per-page walk is deferred. Phase 3 byte-copies path bytes from user VA (r12) into _execve_path_scratch via `mov_b rax, [r12 + r14*1]; mov_b [scratch + r14*1], rax` with NUL detection; loop bound = EXECVE_PATH_MAX = 256; overrun => -EFAULT. rax is pre-zeroed (xor rax, rax) before every mov_b load to guarantee upper-bit zero-extension (matches path.pdx and libc_test.pdx convention; the mov_b primitive emits an 8-bit MOV that does NOT movzx, so pre-zeroing is required for the subsequent `cmp rax, 0` byte compare to see only the loaded byte). Phase 4 calls vfs_open(scratch, O_RDONLY=0); a zero return means either path unresolvable or tmpfs backing missing, both surfaced as -ENOENT. Phase 5 is a page-loop calling vfs_read(r13, r15+offset, 4096, offset) at offsets 0, 4096, 8192, ... Each iteration receives EITHER a full-page 4096 return (continue), a short return < 4096 (last chunk, exit loop), a 0 return (EOF at page boundary, exit loop), or the VOPS_ERR_SENTINEL (0xFFFFFFFFFFFFFFFF, error — vfs_close and return -EIO). If offset ever reaches EXECVE_IMAGE_MAX (65536) before EOF, return -E2BIG (with vfs_close). Cross-page reads are structurally prevented by the page-aligned offset schedule: tmpfs_read.pdx §4.7 forbids cross-page but each iteration here fits inside one page by construction. Phase 6 validates ELF magic byte-by-byte at image[0..4]; mismatch => -ENOEXEC. Phase 7 vfs_close(vnode_idx); return value ignored per #576's phase 3.4 discipline (every legal producer-side vnode_idx round-trips safely through vfs_close's decrement). Phase 8 marshals (rbx, r15, r14) into (rdi, rsi, rdx) and calls sys_execve_body — its {rax, rdx} pair propagates verbatim as our return. Alignment for the sys_execve_body call: 5-push prologue + return-address = 48 B = 16 mod 0 aligned, no additional sub rsp,8 needed. All error branches jump to labelled shared exits (fail_efault, fail_enoent, fail_eio_close, fail_ebad_close, fail_e2big_close) that set rax=-errno, rdx=0, and (for the *_close variants) invoke vfs_close(r13) to release the vnode refcount before returning — matches the resource-discipline rule that every successful vfs_open must be paired with a vfs_close on every failure path past phase 4. On path-copy failure (phase 3) the vnode hasn't been opened yet, so no close needed.",
+      block: {
+        // ===== Prologue (5 pushes for rsp%16==0 at nested calls) =====
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ===== Phase 1: Save args in callee-save regs =====
+        mov rbx, rdi;                             // rbx = current
+        mov r12, rsi;                             // r12 = path_va
+        // rdx (argv_va), rcx (envp_va) intentionally ignored at R17.M0.
+
+        // ===== Phase 2: user_ptr_ok(path_va, 1) — reject kernel pointers =====
+        mov rdi, r12;                             // arg0 = path_va
+        mov rsi, 1;                               // arg1 = len (1 byte probe)
+        call user_ptr_ok;                         // rax = 0 (OK) or 1 (fault)
+        cmp rax, 0;
+        jne sys_execve_shim_fail_efault;
+
+        // ===== Phase 3: Byte-copy path from user VA into _execve_path_scratch =====
+        //   Running-pointer loop: r12 = src (mutated — path_va no longer needed
+        //   after phase 3), rdi = dst (running), r14 = remaining-budget counter.
+        //   NUL byte terminates copy; overrun with no NUL => -EFAULT.
+        //   NOTE: paideia-as's mov_b does NOT accept the [base + index*scale]
+        //   destination form (encoder error B1705 at OperandShape MovSized W8);
+        //   the running-pointer pattern here uses only [reg] and [reg + imm]
+        //   addressing, both of which are supported (see vfs_open.pdx).
+        xor r14, r14;                             // r14 = bytes copied so far
+        lea rdi, [rip + _execve_path_scratch];    // rdi = dst (running pointer)
+
+      sys_execve_shim_copy_loop:
+        cmp r14, 256;                             // EXECVE_PATH_MAX
+        jae sys_execve_shim_fail_efault;          // no NUL within cap
+        xor rax, rax;                             // pre-zero for mov_b byte load
+        mov_b rax, [r12];                         // load user byte via src ptr
+        mov_b [rdi], rax;                         // store via dst ptr
+        cmp rax, 0;                               // NUL terminator?
+        je  sys_execve_shim_copied;               // done — NUL already stored
+        add r12, 1;                               // advance src
+        add rdi, 1;                               // advance dst
+        add r14, 1;                               // increment counter
+        jmp sys_execve_shim_copy_loop;
+
+      sys_execve_shim_copied:
+        // ===== Phase 4: vfs_open(scratch_path, O_RDONLY=0) =====
+        lea rdi, [rip + _execve_path_scratch];    // arg0 = path_ptr (kernel scratch)
+        xor rsi, rsi;                             // arg1 = flags (O_RDONLY = 0)
+        call vfs_open;                            // rax = vnode_idx (u16 low bits) or 0
+        cmp rax, 0;
+        je  sys_execve_shim_fail_enoent;
+        mov r13, rax;                             // r13 = vnode_idx (survives loop + close)
+
+        // ===== Phase 5: page-sized read loop into _execve_image_scratch =====
+        //   r14 = accumulated offset (bytes read so far); starts at 0
+        //   r15 = _execve_image_scratch base VA (stable throughout)
+        //   Each iteration: vfs_read(r13, r15+r14, 4096, r14)
+        //     rax == VOPS_ERR_SENTINEL => -EIO (after vfs_close)
+        //     rax == 0                 => EOF at page boundary, exit loop
+        //     rax <  4096              => short chunk, add to r14, exit loop
+        //     rax == 4096              => full page, add, continue
+        //   Cap: r14 must stay strictly below EXECVE_IMAGE_MAX; hitting the cap
+        //   before EOF => -E2BIG.
+        xor r14, r14;                             // r14 = image offset / bytes read
+        lea r15, [rip + _execve_image_scratch];   // r15 = image scratch base
+
+      sys_execve_shim_read_loop:
+        // Cap check (before issuing another read).
+        mov rax, 65536;                           // EXECVE_IMAGE_MAX
+        cmp r14, rax;
+        jae sys_execve_shim_fail_e2big_close;
+
+        // vfs_read(vnode_idx=r13, buf=r15+r14, len=4096, offset=r14)
+        mov rdi, r13;                             // arg0 = vnode_idx
+        mov rsi, r15;
+        add rsi, r14;                             // arg1 = buf ptr = scratch + offset
+        mov rdx, 4096;                            // arg2 = len
+        mov rcx, r14;                             // arg3 = offset
+        call vfs_read;                            // rax = bytes read or sentinel
+
+        // Error sentinel check.
+        mov rcx, 0xFFFFFFFFFFFFFFFF;              // VOPS_ERR_SENTINEL
+        cmp rax, rcx;
+        je  sys_execve_shim_fail_eio_close;
+
+        // EOF (0 bytes) at page boundary.
+        cmp rax, 0;
+        je  sys_execve_shim_read_done;
+
+        // Accumulate.
+        add r14, rax;
+
+        // Short chunk (< 4096) means the file ended mid-page: last iteration.
+        cmp rax, 4096;
+        jb  sys_execve_shim_read_done;
+
+        // Full page — go around.
+        jmp sys_execve_shim_read_loop;
+
+      sys_execve_shim_read_done:
+        // r14 = total bytes read = image_len.
+
+        // ===== Phase 6: ELF magic check =====
+        // Need at least 4 bytes for the magic (in practice ELF64 header is
+        // 64 bytes; sys_execve_body / elf_lite_load will re-verify header
+        // size and phdr integrity, but we do a quick prefilter to catch
+        // clearly non-ELF payloads before allocating a new aspace).
+        cmp r14, 4;
+        jb  sys_execve_shim_fail_ebad_close;
+
+        xor rax, rax;                             // pre-zero for byte load
+        mov_b rax, [r15 + 0];
+        cmp rax, 0x7F;                            // \x7f
+        jne sys_execve_shim_fail_ebad_close;
+        xor rax, rax;
+        mov_b rax, [r15 + 1];
+        cmp rax, 0x45;                            // 'E'
+        jne sys_execve_shim_fail_ebad_close;
+        xor rax, rax;
+        mov_b rax, [r15 + 2];
+        cmp rax, 0x4C;                            // 'L'
+        jne sys_execve_shim_fail_ebad_close;
+        xor rax, rax;
+        mov_b rax, [r15 + 3];
+        cmp rax, 0x46;                            // 'F'
+        jne sys_execve_shim_fail_ebad_close;
+
+        // ===== Phase 7: vfs_close(vnode_idx) — drop refcount =====
+        // return value ignored per vfs_close.pdx §6 mode-4 discipline.
+        mov rdi, r13;
+        call vfs_close;
+
+        // ===== Phase 8: sys_execve_body(current, image_ptr, image_len) =====
+        // On success: rax = 0, rdx = entry_rip (u64 = ELF e_entry).
+        // On failure: rax = ELF_* errno (0xFFFFFFFA..FF), rdx = 0.
+        // We forward its {rax, rdx} verbatim.
+        mov rdi, rbx;                             // arg0 = current
+        mov rsi, r15;                             // arg1 = image_ptr = scratch base
+        mov rdx, r14;                             // arg2 = image_len
+        call sys_execve_body;                     // {rax, rdx} = body's return
+        jmp sys_execve_shim_done;
+
+        // ===== Failure exits =====
+        // Path-copy / user-pointer failures: no vnode was opened, no close.
+      sys_execve_shim_fail_efault:
+        mov rax, 0xFFFFFFFFFFFFFFF2;              // -EFAULT
+        xor rdx, rdx;
+        jmp sys_execve_shim_done;
+
+        // vfs_open failure: same — no vnode acquired, nothing to close.
+      sys_execve_shim_fail_enoent:
+        mov rax, 0xFFFFFFFFFFFFFFFE;              // -ENOENT
+        xor rdx, rdx;
+        jmp sys_execve_shim_done;
+
+        // Past phase 4: vnode was acquired; must close on error paths.
+      sys_execve_shim_fail_eio_close:
+        mov rdi, r13;
+        call vfs_close;
+        mov rax, 0xFFFFFFFFFFFFFFFB;              // -EIO
+        xor rdx, rdx;
+        jmp sys_execve_shim_done;
+
+      sys_execve_shim_fail_ebad_close:
+        mov rdi, r13;
+        call vfs_close;
+        mov rax, 0xFFFFFFFFFFFFFFF8;              // -ENOEXEC
+        xor rdx, rdx;
+        jmp sys_execve_shim_done;
+
+      sys_execve_shim_fail_e2big_close:
+        mov rdi, r13;
+        call vfs_close;
+        mov rax, 0xFFFFFFFFFFFFFFF9;              // -E2BIG
+        xor rdx, rdx;
+
+      sys_execve_shim_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

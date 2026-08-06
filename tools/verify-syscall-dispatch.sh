@@ -106,12 +106,15 @@ else
     FAIL=1
 fi
 
-# Check 9: ID 59 (0x3b) route to dispatch_enosys
-if echo "$DISPATCH" | grep -q "cmp.*0x3b"; then
-    echo "[ok]   ID 59 (execve): routes to dispatch_enosys"
+# Check 9: ID 59 (0x3b) route to sys_execve_shim (R17-M0-671 / #671).
+# Prior to #671 this checked for routing to dispatch_enosys; the shim now
+# owns sysno 59, so we require both the cmp gate AND a call to
+# sys_execve_shim in the dispatcher body.
+if echo "$DISPATCH" | grep -q "cmp.*0x3b" && echo "$DISPATCH" | grep -q "sys_execve_shim"; then
+    echo "[ok]   ID 59 (execve): routes to sys_execve_shim"
     CHECKS_PASSED=$((CHECKS_PASSED + 1))
 else
-    echo "[FAIL] ID 59 (execve): cmp missing"
+    echo "[FAIL] ID 59 (execve): cmp missing or sys_execve_shim call missing"
     FAIL=1
 fi
 
