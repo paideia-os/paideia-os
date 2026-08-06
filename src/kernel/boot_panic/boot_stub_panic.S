@@ -216,18 +216,19 @@ child_hello_embed_fail_msg: .ascii "R15 CHILD HELLO EMBED FAIL\n\0"
 .align 8
 elf_load_fail_msg: .ascii "ELF LOAD FAIL\n\0"
 
-# #678: Shell-boot messages (kernel_main bootstraps shell as initial ring-3 task)
-.global shell_boot_ok_msg
+# #723 (revert of #678): init is the initial ring-3 task; init forks+execs
+# its children (shell, child_hello) via sys_execve.
+.global init_boot_ok_msg
 .align 8
-shell_boot_ok_msg: .ascii "SHELL BOOT OK\n\0"
+init_boot_ok_msg: .ascii "INIT BOOT OK\n\0"
 
-.global shell_boot_fail_msg
+.global init_boot_fail_msg
 .align 8
-shell_boot_fail_msg: .ascii "SHELL BOOT FAIL\n\0"
+init_boot_fail_msg: .ascii "INIT BOOT FAIL\n\0"
 
-.global shell_boot_returned_msg
+.global init_boot_returned_msg
 .align 8
-shell_boot_returned_msg: .ascii "SHELL BOOT RETURNED\n\0"
+init_boot_returned_msg: .ascii "INIT BOOT RETURNED\n\0"
 
 # R15-M2-005-followup (#651): enter_userland_initial relocation success witness message
 .global enter_reloc_ok_msg
