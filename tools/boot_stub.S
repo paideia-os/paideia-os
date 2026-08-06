@@ -205,6 +205,20 @@ elf_load_ok_msg: .ascii "ELF LOAD OK\n\0"
 .align 8
 elf_load_fail_msg: .ascii "ELF LOAD FAIL\n\0"
 
+# R15-M6-009 (#560): child_hello ELF embed structural witness — success.
+# Emitted after kernel-side elf_lite_load(child_hello.elf) into a fresh
+# aspace returns ELF_OK. Proves the embed resolves, the ELF header is
+# well-formed, and the ELF-lite loader accepts the segment layout.
+# Runtime chain (init→fork→exec→child→wait) is deferred to the follow-up
+# that unblocks #671 (SC+ execve dispatcher) and reverts #678 (shell-bypass).
+.global child_hello_embed_ok_msg
+.align 8
+child_hello_embed_ok_msg: .ascii "R15 CHILD HELLO EMBED OK\n\0"
+
+.global child_hello_embed_fail_msg
+.align 8
+child_hello_embed_fail_msg: .ascii "R15 CHILD HELLO EMBED FAIL\n\0"
+
 # #678: Shell-boot messages (kernel_main bootstraps shell as initial ring-3 task)
 .global shell_boot_ok_msg
 .align 8

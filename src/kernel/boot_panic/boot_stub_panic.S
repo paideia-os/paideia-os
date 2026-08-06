@@ -200,6 +200,17 @@ loader_fail_msg: .ascii "LOADER FAIL\n\0"
 .align 8
 elf_load_ok_msg: .ascii "ELF LOAD OK\n\0"
 
+# R15-M6-009 (#560): child_hello ELF embed structural witness — success/fail
+# mirrors tools/boot_stub.S. kernel_main.pdx unconditionally emits these
+# regardless of build variant, so panic + exc3 variants must define them.
+.global child_hello_embed_ok_msg
+.align 8
+child_hello_embed_ok_msg: .ascii "R15 CHILD HELLO EMBED OK\n\0"
+
+.global child_hello_embed_fail_msg
+.align 8
+child_hello_embed_fail_msg: .ascii "R15 CHILD HELLO EMBED FAIL\n\0"
+
 # R15-M1-008b (#648): ELF-lite loader runtime failure witness message
 .global elf_load_fail_msg
 .align 8
