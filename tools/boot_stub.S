@@ -1097,6 +1097,38 @@ user_ptr_fail_msg: .ascii "R15 USER PTR FAIL\n\0"
 .align 8
 logp_hex_ok_msg: .ascii "LOGP HEX OK\n\0"
 
+# #712: byte-compare failure message + 6 fixture strings for u64_to_hex/u64_to_dec canaries
+.global logp_hex_fail_msg
+.align 8
+logp_hex_fail_msg: .ascii "LOGP HEX FAIL\n\0"
+
+# u64_to_hex fixtures — each is exactly 18 bytes ("0x" + 16 hex nibbles MSB-first)
+.global logp_hex_expect_0
+.align 8
+logp_hex_expect_0: .ascii "0x0000000000000000"
+
+.global logp_hex_expect_deadbeef
+.align 8
+logp_hex_expect_deadbeef: .ascii "0xdeadbeefcafef00d"
+
+.global logp_hex_expect_max
+.align 8
+logp_hex_expect_max: .ascii "0xffffffffffffffff"
+
+# u64_to_dec fixtures — variable-length decimal render
+.global logp_dec_expect_0
+.align 8
+logp_dec_expect_0: .ascii "0"
+
+.global logp_dec_expect_12345
+.align 8
+logp_dec_expect_12345: .ascii "12345"
+
+# 2^64 - 1 = 18446744073709551615 (20 digits)
+.global logp_dec_expect_max
+.align 8
+logp_dec_expect_max: .ascii "18446744073709551615"
+
 # M0-002 (#682): kread_tsc and kread_cpu_id witness messages
 .global logp_tsc_ok_msg
 .align 8
