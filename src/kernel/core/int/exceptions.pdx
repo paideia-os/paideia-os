@@ -134,42 +134,81 @@ module Exceptions = structure {
   // Global tick counter: incremented by each timer interrupt.
   pub let mut _tick_count : u64 = 0
 
-  // Timer ISR (vector 32) handler: R11-m2-001 (budget-driven preemption).
-  // Replaces R10-m2-003 TICK-print model.
-  // Procedure:
-  //   1. Load current TCB pointer from _current_tcb global
-  //   2. Decrement budget (u32 at offset 172)
-  //   3. If budget == 0, set _preempt_needed = 1
-  //   4. Rearm the LAPIC timer (set next deadline via TSC_DEADLINE MSR)
-  //   5. Signal EOI to LAPIC
-  //   6. Return (iretq in the trampoline)
+  // Timer ISR (vector 32) handler: R15-M7-566 (#566) — preemptive scheduling.
   //
-  // R11-m2-001: Budget-driven preemption. Each timer tick decrements the
-  // current TCB's budget field. When budget reaches 0, _preempt_needed is set
-  // so task bodies can yield cooperatively. No TICK print (diagnostic output
-  // moved to Task bodies).
+  // Called from trampoline_vec32 (core/int/idt.pdx) on every LAPIC timer
+  // tick (~100 Hz per lapic_timer_init_periodic_count in kernel_main).
+  // Procedure:
+  //   1. Load _current_tcb; skip decrement if unset (pre-sti window) or if
+  //      current is the idle task (idle never preempts — nothing to preempt
+  //      TO that isn't itself).
+  //   2. Decrement sched_budget (u32 at TCB offset +112) using a sized
+  //      32-bit store (mov_d) so the write does not straddle into +116..+119.
+  //   3. If budget hit 0: reset to SCHED_BUDGET_DEFAULT (10) and set
+  //      _preempt_needed = 1.  The trampoline's post-return preempt tail
+  //      (core/int/idt.pdx trampoline_vec32) will then consult sched_pick_
+  //      next_r15 and, if a different runnable task exists, invoke
+  //      sched_switch_r15 to it.
+  //   4. Rearm the LAPIC timer (no-op in periodic mode; kept for future
+  //      TSC-deadline mode migration).
+  //   5. Signal EOI to LAPIC.
+  //   6. Return to trampoline_vec32 (which pops GPRs + iretq).
+  //
+  // Field discipline (see design/kernel/r15-m7-566-timer-preempt.md §3.1):
+  //   TCB.sched_budget lives at +112 as a u32.  The pre-#566 body used
+  //   offset +172 (R11 TCB.budget), which under the R15 task_struct layout
+  //   straddled fd_table[0]'s upper half and fd_table[1]'s lower half —
+  //   an 8-byte u64 read/write silently corrupted 8 bytes of stdio pointers
+  //   on every tick.  The AC survived only because fd∈{1,2} writes routed
+  //   through dispatch_write's UART fast-path, bypassing the corrupted
+  //   pointer; any read syscall via the vfs would have page-faulted.
+  //   #566 fixes both defects: correct offset (+112) and sized store (mov_d).
+  //
+  // Preemption-safety: this handler runs with IF=0 (IDT gate type 0x8E
+  // clears IF on entry).  All memory ops here are on the current TCB slab
+  // and two global flags — no runqueue mutation — so a nested timer tick
+  // (impossible under IF=0 but a useful invariant) would find only stale
+  // snapshots, never partial state.
   pub let handle_timer : () -> () !{sysreg, mem} @{boot} = fn () -> unsafe {
     effects: { sysreg, mem },
     capabilities: { boot },
-    justification: "R11 m2-001: preempt-driven timer. Load _current_tcb; decrement budget at offset 172 (u32); if 0, set _preempt_needed=1. No UART print (moved to Task bodies). Rearm + EOI as before.",
+    justification: "R15-M7-566 (#566): R15-correct preemptive timer ISR body. (1) Load _current_tcb into rax; if 0 (pre-sti window during boot before init's _current_tcb publish) jump to ack. (2) Skip if rax == _idle_tcb — idle never preempts (nothing to preempt to; sched_pick_next_r15 would return _idle_tcb itself which the trampoline guard would then reject). (3) Decrement sched_budget u32 at rax+112 using a scratch ecx + mov_d sized store — this avoids the pre-#566 defect where a bare `mov [rax+172], rcx` widened to REX.W and corrupted 8 bytes of adjacent fd_table entries. (4) If ecx == 0 after decrement, reset to SCHED_BUDGET_DEFAULT (10) via mov_d, then set _preempt_needed = 1. Trampoline_vec32's preempt tail consumes the flag. (5) Rearm LAPIC (no-op in periodic mode — call kept for TSC-deadline mode symmetry per lapic_timer_rearm's own note) + apic_eoi. Register discipline: rax scratch (current TCB / _idle_tcb / _preempt_needed base), rcx scratch (budget value / reset constant / flag value), rdi scratch (lapic_timer_rearm arg). All caller-save. No callee-save touched. IF stays 0 throughout (gate-cleared, sti not issued).  See design/kernel/r15-m7-566-timer-preempt.md §3.2.",
     block: {
-      // Load _current_tcb pointer
+      // (1) rax = _current_tcb; skip if unset
       lea rax, [rip + _current_tcb]
-      mov rdi, [rax]
-      // Decrement budget at TCB offset 172 (u32).
-      // Load budget into rax, decrement using lea, store back.
-      mov rax, [rdi + 172]
-      lea rcx, [rax - 1]
-      mov [rdi + 172], rcx
-      // Check if budget == 0 after decrement
-      mov eax, ecx
-      cmp eax, 0
-      jne skip_preempt
+      mov rax, [rax]
+      cmp rax, 0
+      je handle_timer_ack
+
+      // (2) Skip if current == _idle_tcb — idle doesn't consume budget
+      lea rcx, [rip + _idle_tcb]
+      mov rcx, [rcx]
+      cmp rax, rcx
+      je handle_timer_ack
+
+      // (3) Decrement sched_budget (u32) at +112 using sized 32-bit store
+      mov rcx, 0
+      mov rcx, [rax + 112]                    // rcx = budget (only low 4 bytes meaningful)
+      sub rcx, 1                              // rcx-- (may underflow low 32 to 0xFFFFFFFF; we
+                                              // only care about the low-32 zero test)
+      mov_d [rax + 112], rcx                  // write 4 bytes back
+
+      // (4) If low-32 of decrement is 0, budget hit exactly zero — reset + preempt
+      and rcx, 0xFFFFFFFF
+      cmp rcx, 0
+      jne handle_timer_ack
+
+      // Reset budget to SCHED_BUDGET_DEFAULT (must match task_pool.pdx)
+      mov rcx, 1000000
+      mov_d [rax + 112], rcx
+
+      // Set _preempt_needed = 1
       lea rax, [rip + _preempt_needed]
       mov rcx, 1
       mov [rax], rcx
-      skip_preempt:
-      // Rearm + EOI as before
+
+    handle_timer_ack:
+      // (5) Rearm + EOI (unchanged behavior — periodic mode auto-reload)
       mov rdi, 100
       call lapic_timer_rearm
       call apic_eoi

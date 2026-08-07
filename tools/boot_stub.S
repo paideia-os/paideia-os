@@ -1080,6 +1080,15 @@ block_wake_witness_ok_msg: .ascii "R15 BLOCK WAKE OK\n\0"
 .align 8
 block_wake_witness_fail_msg: .ascii "R15 BLOCK WAKE FAIL\n\0"
 
+# R15-M7-566 (#566): timer-preempt witness success/failure messages
+.global preempt_witness_ok_msg
+.align 8
+preempt_witness_ok_msg: .ascii "R15 PREEMPT OK\n\0"
+
+.global preempt_witness_fail_msg
+.align 8
+preempt_witness_fail_msg: .ascii "R15 PREEMPT FAIL\n\0"
+
 # R15-M6-004 (#555): sys_execve witness — bad-ELF payload for sub-test B.
 # 64 bytes; first 4 bytes deliberately NOT \x7fELF, so elf_lite_load
 # rejects at the magic gate (returns ELF_BAD_HDR = 0xFFFFFFFF).
