@@ -1123,6 +1123,15 @@ clone_cow_multi_ok_msg: .ascii "R15 CLONE COW MULTI OK\n\0"
 .align 8
 clone_cow_multi_fail_msg: .ascii "R15 CLONE COW MULTI FAIL\n\0"
 
+# R16-M0-D11a: aspace_teardown leak-plug witness messages.
+.global aspace_teardown_ok_msg
+.align 8
+aspace_teardown_ok_msg: .ascii "R16 M0 D11A TEARDOWN OK\n\0"
+
+.global aspace_teardown_fail_msg
+.align 8
+aspace_teardown_fail_msg: .ascii "R16 M0 D11A TEARDOWN FAIL\n\0"
+
 
 # R15-M4-007 (#541): user_ptr_ok witness messages
 .global user_ptr_ok_msg
