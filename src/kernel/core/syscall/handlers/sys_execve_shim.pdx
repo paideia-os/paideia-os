@@ -1,9 +1,11 @@
 // src/kernel/core/syscall/handlers/sys_execve_shim.pdx — R17-M0-671 (#671)
-// sys_execve dispatch shim: path→image copy-in.
+//   + R17-M0-730 D10b (#730): return-frame rewrite for exec-completes semantics.
+// sys_execve dispatch shim: path→image copy-in + syscall return-frame rewrite.
 //
 // Bridges the SC+ userland ABI shape execve(path, argv, envp) to the
 // kernel-internal sys_execve_body(current, image_ptr, image_len) contract
-// from #555. Full design: design/kernel/r17-m0-671-sys-execve-shim.md.
+// from #555. Full design: design/kernel/r17-m0-671-sys-execve-shim.md and
+// design/kernel/r17-m0-730-d10-execve-complete.md.
 //
 // Sequence (all failure paths return sign-extended -errno in rax, rdx=0):
 //   1. user_ptr_ok(path_va, 1)                         — reject kernel ptrs early
@@ -12,13 +14,16 @@
 //   4. Page-sized read loop into _execve_image_scratch — until EOF / short / cap
 //   5. ELF magic check on image[0..4] == "\x7fELF"     — mismatch => -ENOEXEC
 //   6. vfs_close(vnode_idx)                            — best-effort refcount drop
-//   7. sys_execve_body(current, image, image_len)      — forwards its {rax, rdx}
-//
-// Non-scope (see design doc §1): the successful sys_execve_body return commits
-// current->user_pml4_pa but does NOT flip CR3 or rewrite the syscall return
-// frame. Making a successful execve semantically re-enter the new image is
-// #723's job (return-path plumbing). #671 stops at "the shim reaches
-// sys_execve_body with a valid ELF and gets a legal return code."
+//   7. sys_execve_body(current, image, image_len)      — commits new aspace in TCB+16
+//   8. (D10b) On body success (rax==0): user_stack_alloc(new_pml4_va, 4)
+//      → new_user_rsp_top; rewrite syscall return frame so sysret enters the
+//      new image:
+//        [current.kstack_top -  8] = entry_rip (from body's rdx)
+//        [current.kstack_top - 16] = 0x202 (fresh IF=1 rflags)
+//        [current + 104]            = new_user_rsp_top
+//      The syscall_entry epilogue reads these three slots plus TCB+16 (new
+//      user_pml4_va, already committed by body) to construct the sysret
+//      return. See design doc §4 for the exact stack topology.
 
 module SysExecveShim = structure {
   // ==========================================================================
@@ -41,6 +46,22 @@ module SysExecveShim = structure {
   pub let EIO_U64     : u64 = 0xFFFFFFFFFFFFFFFB   // -5
   pub let ENOEXEC_U64 : u64 = 0xFFFFFFFFFFFFFFF8   // -8
   pub let E2BIG_U64   : u64 = 0xFFFFFFFFFFFFFFF9   // -7
+  pub let ENOMEM_U64  : u64 = 0xFFFFFFFFFFFFFFF4   // -12
+
+  // (D10b) TCB byte-offsets used for return-frame rewrite. Must match
+  // task_pool.pdx (KSTACK_TOP @+24) and entry.pdx (SAVED_USER_RSP @+104).
+  pub let TCB_OFF_KSTACK_TOP     : u64 = 24
+  pub let TCB_OFF_SAVED_USER_RSP : u64 = 104
+
+  // (D10b) Fresh user RFLAGS for exec-completes sysret. Bit 1 is reserved-
+  // must-be-1, bit 9 is IF (interrupts on). Matches enter_userland_initial's
+  // iretq frame (enter_user.pdx) and Linux/BSD execve semantics.
+  pub let EXECVE_FRESH_RFLAGS : u64 = 0x202
+
+  // (D10b) User-stack size for the new image (in 4 KiB pages). Matches the
+  // init_boot_bootstrap allocation in kernel_main so the new process gets
+  // the same stack footprint init had at boot.
+  pub let EXECVE_USER_STACK_PAGES : u64 = 4
 
   // VOPS error sentinel (matches vfs_read.pdx / tmpfs_read.pdx failure return).
   pub let VOPS_ERR_SENTINEL : u64 = 0xFFFFFFFFFFFFFFFF
@@ -93,29 +114,31 @@ module SysExecveShim = structure {
         cmp rax, 0;
         jne sys_execve_shim_fail_efault;
 
-        // ===== Phase 3: Byte-copy path from user VA into _execve_path_scratch =====
-        //   Running-pointer loop: r12 = src (mutated — path_va no longer needed
-        //   after phase 3), rdi = dst (running), r14 = remaining-budget counter.
-        //   NUL byte terminates copy; overrun with no NUL => -EFAULT.
-        //   NOTE: paideia-as's mov_b does NOT accept the [base + index*scale]
-        //   destination form (encoder error B1705 at OperandShape MovSized W8);
-        //   the running-pointer pattern here uses only [reg] and [reg + imm]
-        //   addressing, both of which are supported (see vfs_open.pdx).
-        xor r14, r14;                             // r14 = bytes copied so far
-        lea rdi, [rip + _execve_path_scratch];    // rdi = dst (running pointer)
-
-      sys_execve_shim_copy_loop:
-        cmp r14, 256;                             // EXECVE_PATH_MAX
-        jae sys_execve_shim_fail_efault;          // no NUL within cap
-        xor rax, rax;                             // pre-zero for mov_b byte load
-        mov_b rax, [r12];                         // load user byte via src ptr
-        mov_b [rdi], rax;                         // store via dst ptr
-        cmp rax, 0;                               // NUL terminator?
-        je  sys_execve_shim_copied;               // done — NUL already stored
-        add r12, 1;                               // advance src
-        add rdi, 1;                               // advance dst
-        add r14, 1;                               // increment counter
-        jmp sys_execve_shim_copy_loop;
+        // ===== Phase 3: Copy path from user VA into _execve_path_scratch =====
+        // R17-M0-730 D10d (#730): strict-KPTI-safe path copy.
+        //
+        // Original Phase 3 did `mov_b rax, [r12]` reading via the caller's
+        // user VA under kernel CR3 (post-syscall_entry CR3 flip).  That
+        // read hits the boot PML4's low identity map at PHYSICAL
+        // address=user_va, which does NOT contain the user PML4's
+        // per-VA→phys mapping — same silent-NUL failure #724 D4 fixed
+        // for sys_debug_puts.  Confirmed on wire: shim printed 'Sn'
+        // (entered, then ENOENT) because vfs_open received a zero-length
+        // (immediate NUL) path buffer — the first byte read of the user
+        // path from the wrong physical page happened to be 0.
+        //
+        // Fix: delegate to user_read_str_via_walk which does a per-byte
+        // 4-level PML4 walk and reads via the higher-half identity map.
+        //
+        // Return semantics: >0 = strlen (NUL already copied at kernel
+        // dst[strlen]); 0 = fault (unmapped) OR cap-overflow with no NUL —
+        // both surface as -EFAULT.
+        mov rdi, r12;                             // arg0 = path_va (user VA)
+        lea rsi, [rip + _execve_path_scratch];    // arg1 = kernel_dst
+        mov rdx, 256;                             // arg2 = cap = EXECVE_PATH_MAX
+        call user_read_str_via_walk;              // rax = strlen or 0
+        cmp rax, 0;
+        je  sys_execve_shim_fail_efault;
 
       sys_execve_shim_copied:
         // ===== Phase 4: vfs_open(scratch_path, O_RDONLY=0) =====
@@ -213,11 +236,87 @@ module SysExecveShim = structure {
         // ===== Phase 8: sys_execve_body(current, image_ptr, image_len) =====
         // On success: rax = 0, rdx = entry_rip (u64 = ELF e_entry).
         // On failure: rax = ELF_* errno (0xFFFFFFFA..FF), rdx = 0.
-        // We forward its {rax, rdx} verbatim.
+        // On failure we forward {rax, rdx} verbatim (jmp done).
         mov rdi, rbx;                             // arg0 = current
         mov rsi, r15;                             // arg1 = image_ptr = scratch base
         mov rdx, r14;                             // arg2 = image_len
         call sys_execve_body;                     // {rax, rdx} = body's return
+
+        // Body-failure fast return.
+        cmp rax, 0;
+        jne sys_execve_shim_done;                 // rax != 0 → failure, {rax,rdx} passthrough
+
+        // ===== Phase 9 (D10b): exec-completes — allocate user stack + =====
+        //                       rewrite syscall return frame.
+        //
+        // At this point:
+        //   rbx = current (task_struct*)
+        //   rax = 0, rdx = entry_rip
+        //   TCB.user_pml4_va @+16 = NEW aspace's PML4 VA (committed by body)
+        //   Old aspace was torn down by body — the ONLY VA still valid in
+        //   the new aspace is the ELF's mapped segments; NO stack exists.
+        //
+        // Plan: (a) stash entry_rip in r14 (image_len is dead post-body);
+        // (b) user_stack_alloc(new_pml4_va, EXECVE_USER_STACK_PAGES) → r13;
+        // (c) if OOM, jump to fail_nomem (the process is in a broken state —
+        // old aspace gone, no stack — but at least sysret with -ENOMEM lets
+        // the caller observe the failure; likely followed by a #PF that
+        // kills the process); (d) rewrite the three slots (kstack_top-8,
+        // kstack_top-16, TCB+104) so syscall_entry's epilogue sysrets into
+        // the new image with fresh rflags on the new stack.
+        //
+        // Register discipline: rbx (current) and r15 (image scratch base)
+        // survive the user_stack_alloc call per SysV callee-save. r14 is
+        // repurposed from image_len (dead post-body) to entry_rip. r13 is
+        // repurposed from vnode_idx (dead post-vfs_close in phase 7) to
+        // user_rsp_top. Alignment: user_stack_alloc's own 4-push prologue
+        // (r12-r15) already handles its own %16==8 entry contract; the shim
+        // entered at %16==8 (dispatch's sub rsp,8 pad + our 5-push prologue),
+        // so the call site here is %16==8 — no additional pad needed.
+        mov r14, rdx;                             // r14 = entry_rip (save)
+        mov rdi, [rbx + 16];                      // arg0 = new_pml4_va (VA form)
+        mov rsi, 4;                               // arg1 = EXECVE_USER_STACK_PAGES
+        call user_stack_alloc;                    // rax = user_rsp_top or 0
+        cmp rax, 0;
+        je  sys_execve_shim_fail_nomem;
+        mov r13, rax;                             // r13 = new user_rsp_top
+
+        // (d.1) Rewrite [current.kstack_top - 8] with entry_rip. This slot
+        //       holds the user RIP that syscall_entry pushed (rcx post-syscall
+        //       via SDM §6.15 SYSCALL semantics). The epilogue's `pop rcx`
+        //       will load this into rcx, and sysret loads RIP <- rcx.
+        mov rax, [rbx + 24];                      // rax = current.kstack_top
+        mov [rax - 8], r14;                       // saved user RIP := entry_rip
+
+        // (d.2) Rewrite [current.kstack_top - 16] with fresh rflags. This slot
+        //       holds the user rflags that syscall_entry pushed (r11 pre-syscall
+        //       masked by IA32_FMASK). The epilogue's `pop r11` loads this into
+        //       r11, and sysret loads RFLAGS <- r11. 0x202 = IF|reserved-1.
+        mov rcx, 0x202;                           // EXECVE_FRESH_RFLAGS
+        mov [rax - 16], rcx;                      // saved user rflags := 0x202
+
+        // (d.3) Rewrite TCB.saved_user_rsp @+104 with new user_rsp_top. The
+        //       epilogue reloads rsp from this slot after the CR3 flip.
+        //       #728 D9 wired this slot; before D9 it was a global that
+        //       would have been clobbered by intervening tasks.
+        mov [rbx + 104], r13;                     // TCB.saved_user_rsp := new rsp
+
+        // Success return: rax = 0 (execve returns 0 to child on success,
+        // which the child never observes because sysret jumps to entry_rip,
+        // not to the post-syscall instruction of the pre-execve code).
+        // rdx cleared so nothing about the new image leaks into user rdx.
+        xor rax, rax;
+        xor rdx, rdx;
+        jmp sys_execve_shim_done;
+
+      sys_execve_shim_fail_nomem:
+        // Rare: user_stack_alloc OOM'd. Old aspace already torn down by
+        // body; TCB+16 already committed to new_pml4. The process is
+        // structurally broken but rax=-ENOMEM at least surfaces the error.
+        // A subsequent #PF (on sysret's instruction fetch or first user
+        // access) will kill the process.
+        mov rax, 0xFFFFFFFFFFFFFFF4;              // -ENOMEM
+        xor rdx, rdx;
         jmp sys_execve_shim_done;
 
         // ===== Failure exits =====

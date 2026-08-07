@@ -211,12 +211,24 @@ else
     FAIL=1
 fi
 
-# Verify bin_sh_path symbol exists in rodata
-BIN_SH_PATH=$(echo "$DUMP" | grep -c "bin_sh_path" || true)
-if [[ $BIN_SH_PATH -ge 1 ]]; then
-    echo "[ok]   bin_sh_path symbol found in rodata"
+# Verify bin_child_hello_path symbol exists in rodata (D10 rename of bin_sh_path).
+# The R17-M0-730 (#730) D10 change swaps the exec target from /bin/sh (never
+# seeded) to /bin/child_hello (seeded by kernel_main's bin_child_hello_seed
+# block). bin_sh_path no longer exists; the D10 landing renames the symbol.
+BIN_CHILD_HELLO_PATH=$(echo "$DUMP" | grep -c "bin_child_hello_path" || true)
+if [[ $BIN_CHILD_HELLO_PATH -ge 1 ]]; then
+    echo "[ok]   bin_child_hello_path symbol found in rodata"
 else
-    echo "[FAIL] bin_sh_path symbol not found"
+    echo "[FAIL] bin_child_hello_path symbol not found"
+    FAIL=1
+fi
+
+# Verify wait_msg symbol exists in rodata (D10: WAIT: pid=N status=N\n AC line)
+WAIT_MSG=$(echo "$DUMP" | grep -c "wait_msg" || true)
+if [[ $WAIT_MSG -ge 1 ]]; then
+    echo "[ok]   wait_msg symbol found in rodata"
+else
+    echo "[FAIL] wait_msg symbol not found"
     FAIL=1
 fi
 

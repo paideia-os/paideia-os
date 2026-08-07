@@ -222,6 +222,23 @@ elf_load_fail_msg: .ascii "ELF LOAD FAIL\n\0"
 .align 8
 init_boot_ok_msg: .ascii "INIT BOOT OK\n\0"
 
+# R17-M0-730 D10a (#730): /bin/child_hello tmpfs seed strings and markers.
+.global bin_seed_name
+.align 8
+bin_seed_name: .ascii "bin\0"
+
+.global child_hello_seed_name
+.align 8
+child_hello_seed_name: .ascii "child_hello\0"
+
+.global bin_seed_ok_msg
+.align 8
+bin_seed_ok_msg: .ascii "R17 BIN CHILD HELLO SEED OK\n\0"
+
+.global bin_seed_fail_msg
+.align 8
+bin_seed_fail_msg: .ascii "R17 BIN CHILD HELLO SEED FAIL\n\0"
+
 .global init_boot_fail_msg
 .align 8
 init_boot_fail_msg: .ascii "INIT BOOT FAIL\n\0"
