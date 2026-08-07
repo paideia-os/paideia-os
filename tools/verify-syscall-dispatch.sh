@@ -146,18 +146,21 @@ else
 fi
 
 # Check 13: ID 61 has wstatus writeback.
-# paideia-as #1251 fixed the store-direction widening bug — `mov [rsi], edx`
-# now correctly emits DWORD store (89 16) instead of buggily-widened QWORD
-# store (48 89 16). Wait4's wstatus is a 4-byte pid+status per Linux ABI, so
-# DWORD is the correct emission. Accept either DWORD or QWORD for
-# cross-version tolerance.
-#
+# #737 fix: the raw `mov [rsi], edx` under kernel CR3 (which hit the boot
+# PML4's low identity map instead of init's user PML4 frame) has been
+# replaced with a `call user_write_u32_via_walk` — a strict-KPTI-safe
+# helper that walks _current_tcb.user_pml4_va per byte and stores via the
+# kernel higher-half identity map. Same defect class as #724 D4 / #730
+# D10c / #730 D10d. Any of the three acceptable discipline shapes counts
+# as a valid writeback:
+#   (a) legacy raw store (pre-#737) — either DWORD or QWORD, per #1251
+#   (b) #737 helper call — `call ... user_write_u32_via_walk`
 # #724 D5a widened the window between the sys_wait_body call and the
 # writeback: on the rax==0 branch the dispatcher now performs sched_block
-# + wait_result_{pid,status} reads (~8 additional instructions) before
-# the writeback. -A 30 comfortably covers both the direct-return (reap or
+# + wait_result_{pid,status} reads + push/pop discipline before the
+# writeback, so -A 40 comfortably covers both the direct-return (reap or
 # ECHILD) path and the block-then-resume path.
-if echo "$DISPATCH" | grep -A 30 "sys_wait_body" | grep -qE "mov\s+(DWORD|QWORD) PTR \[rsi\]"; then
+if echo "$DISPATCH" | grep -A 40 "sys_wait_body" | grep -qE "mov\s+(DWORD|QWORD) PTR \[rsi\]|call.*user_write_u32_via_walk"; then
     echo "[ok]   ID 61 (wait4): wstatus writeback present"
     CHECKS_PASSED=$((CHECKS_PASSED + 1))
 else
