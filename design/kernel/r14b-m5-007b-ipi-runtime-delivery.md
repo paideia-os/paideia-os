@@ -451,3 +451,27 @@ the witness insertion. No `paideia-as` change anticipated (see §6).
   becomes MSR `0x808`. Same values; same sequence.
 - Vec 0xF1 (reschedule) reuses `apic_ipi_self(241)` in the R15.M7
   scheduler when preempting the currently-running task.
+
+## 12. Landing note (2026-08-07) — attempt #3 shipped
+
+Two prior attempts at this design (git `0d5659e` on 2026-07-24, reverted
+same day in `c14b869`) shipped `IPI NOT DELIVERED` on the wire. Both used
+bare `mov [rax], ecx` for LAPIC MMIO stores. paideia-as CHANGELOG v0.20.1
+later confirmed **paideia-as #1251** was the elaborator-side gap causing
+those stores to silently widen to 64-bit REX.W writes — and cited
+paideia-os #646 by name as a downstream hazard cleared by the fix.
+
+Attempt #3 (this landing, 2026-08-07) is the same design as §3 above
+with three hardening choices layered on:
+
+1. All LAPIC MMIO stores use the `mov_d [rax], rcx` sized-store idiom
+   (matches `eoi.pdx`, `lapic_timer.pdx`). Defence-in-depth against a
+   future encoder regression re-introducing #1251-class behaviour.
+2. The primitive is named `apic_send_self_ipi` in a new module
+   `src/kernel/core/apic/self_ipi.pdx`. The rename gates the two attempts
+   apart in git history; the encoding is identical to §3.2.
+3. Wire marker is `SELF IPI OK` (not the reverted-attempt-2's
+   `IPI DELIVERED`); matches the "SUBSYSTEM STATE" cadence of every
+   other boot witness (`KPTI OK`, `IPI OK`, `LOADER OK`, `ELF LOAD OK`, …).
+
+Full attempt-#3 report: `design/kernel/r14b-m5-646-self-ipi-runtime-delivery.md`.
