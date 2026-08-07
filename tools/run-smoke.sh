@@ -160,20 +160,14 @@ case "${EXPECTED}" in
     boot_r17_init)
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/r17/expected-boot-r17-init.txt"
-        # #1274: was 8s. uart_rx_wire_witness (kernel_main.pdx) busy-waits up
-        # to 200,000,000 TCG cycles (~1-2s on an idle host, comment-documented)
-        # before falling through when no chardev bytes are injected — true for
-        # every mode except boot_r16_uart_rx. That wall-clock cost is fixed-
-        # iteration, not RTC-timed, so it scales with host CPU contention. At
-        # load average ~5/8 cores this loop alone can eat several seconds,
-        # leaving too little of an 8s budget for the rest of the r17_init path
-        # (task_new + elf_lite_load + INIT BOOT OK + ring-3 entry + wait/reap).
-        # Reproduced 5/6 failures at 8s and 5/5 passes at 20s on the SAME
-        # byte-identical kernel.elf (verified via md5sum across the eb522b4 /
-        # b7d7ba4 paideia-as range) — confirms this is a host-load timing
-        # flake, not an encoder or kernel-logic regression. 20s gives headroom
-        # without materially slowing the smoke suite.
-        TIMEOUT=20
+        # paideia-os #747: TIMEOUT reverted 20 → 8. Root cause of the flake
+        # (uart_rx_wire_witness cycle-count-bound 200M-iteration busy-wait
+        # scaling with host CPU contention) fixed in kernel_main.pdx by
+        # replacing the countdown with an rdtsc-referenced ~2 s wall-clock
+        # budget. See kernel_main.pdx uart_rx_wire_witness comment block
+        # and paideia-os commit that pairs with this revert. The temporary
+        # workaround landed at ce3a17f; this revert closes the loop.
+        TIMEOUT=8
         EXPECTED=""
         ;;
     boot_panic)
