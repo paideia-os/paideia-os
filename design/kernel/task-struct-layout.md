@@ -27,9 +27,12 @@ This document freezes the layout of the `regs_save` region within the R15 `task_
 | +80    | 8    | `regs_save.r13`          | u64   | #564      | SysV callee-save.                                                                                           |
 | +88    | 8    | `regs_save.r14`          | u64   | #564      | SysV callee-save.                                                                                           |
 | +96    | 8    | `regs_save.r15`          | u64   | #564      | SysV callee-save.                                                                                           |
-| +104..+152 | 48 | `regs_save._reserved`    | u64×6 | (open)    | Reserved for future: FS_BASE, GS_BASE_KERNEL, MSR_KERNEL_GS_BASE, XSAVE-ptr, CR3, IST-stack.               |
+| +104   | 8    | `saved_user_rsp`         | u64   | #728 D9   | **No longer reserved.** Per-task copy of the user RSP at syscall entry, written/read by `syscall_entry` (entry.pdx). Survives being blocked across another task's syscalls — see r17-m0-728-d9-sys-exit-sched-switch-ud.md §6.1. |
+| +112..+152 | 40 | `regs_save._reserved`    | u64×5 | (open)    | Reserved for future: GS_BASE_KERNEL, MSR_KERNEL_GS_BASE, XSAVE-ptr, CR3, IST-stack. FS_BASE slot consumed by #728 D9's `saved_user_rsp` (was originally the first of 6 reserved slots at +104) — any future FS_BASE allocation must use a different offset. |
 
 **Total `regs_save` extent: [+32, +152) — 15 u64 slots, 120 bytes.**
+
+**#728 D9 note:** `TASK_OFF_KSTACK_TOP = 24` also landed, in the gap between `user_pml4_pa` (+16) and this region's start (+32). See task_pool.pdx and r17-m0-728-d9-sys-exit-sched-switch-ud.md for the per-task-kernel-stack design this offset supports.
 
 ## Invariants
 
