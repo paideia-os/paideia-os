@@ -223,12 +223,16 @@ else
     FAIL=1
 fi
 
-# Verify wait_msg symbol exists in rodata (D10: WAIT: pid=N status=N\n AC line)
-WAIT_MSG=$(echo "$DUMP" | grep -c "wait_msg" || true)
-if [[ $WAIT_MSG -ge 1 ]]; then
-    echo "[ok]   wait_msg symbol found in rodata"
+# Verify wait_prefix symbol exists in rodata (D12 #736: split fragments so
+# "WAIT: pid=<N> status=<M>\n" is emitted with runtime-formatted decimals via
+# print_u64_dec, rather than as a single rodata literal. wait_prefix is the
+# post-D12 anchor symbol — its presence signals the split-fragment rewrite
+# completed and print_u64_dec is wired.)
+WAIT_PREFIX=$(echo "$DUMP" | grep -c "wait_prefix" || true)
+if [[ $WAIT_PREFIX -ge 1 ]]; then
+    echo "[ok]   wait_prefix symbol found in rodata (D12: runtime u32→decimal)"
 else
-    echo "[FAIL] wait_msg symbol not found"
+    echo "[FAIL] wait_prefix symbol not found (D12 #736 not applied?)"
     FAIL=1
 fi
 
