@@ -30,6 +30,50 @@
 // Audit: design/kernel/r17-m0-724-d5-sys-wait-block.md
 
 module Dispatch = structure {
+  // ==========================================================================
+  // R16-M3-KPTI-sweep (#733 #734 #738 #739): per-syscall bounce scratches
+  //
+  // The sys_open/sys_read/sys_write dispatch paths receive user VA pointers
+  // (path / buf) from ring-3 via SysV registers. Under strict-KPTI the
+  // syscall_entry trampoline has flipped CR3 to _kernel_pml4_pa (= boot PML4,
+  // 0..4 GiB low identity map only), so any downstream kernel read/write via
+  // that raw user VA lands on whichever kernel byte the boot PML4 covers PA
+  // = user_va with — NOT the user-PML4-mapped frame. Same defect class as
+  // #724 D4 / #730 D10c / #730 D10d / #737 (already fixed at their own sites).
+  //
+  // Fix approach (Option B — dispatch-layer once):
+  //   Route the user VA copy through a bounce buffer here, before/after the
+  //   respective sys_*_body call. The bodies keep their existing "kernel VA"
+  //   contracts unchanged — sys_open_witness, sys_read_witness, and
+  //   sys_write_witness (kernel_main.pdx L4054+/L4227+/L4335+) all pass
+  //   kernel-VA pointers directly, so touching the body would regress them.
+  //   The dispatch layer is the natural user↔kernel boundary — same layer
+  //   #737 fixed dispatch_wait4 at.
+  //
+  // Concurrency: at R17.M0 the only user tasks are init + child_hello;
+  // neither calls sys_read or fd>=3 sys_write, and only init calls sys_open
+  // (once, for /dev/tty0). No two tasks concurrently touch any of these
+  // scratches, so the static (rather than per-task) allocation is race-free
+  // for this landing. Future work (multi-task sys_read on tty stdin): move
+  // the scratches into the TCB slab or use kernel-stack sub rsp allocation.
+  //
+  // Sizing:
+  //   _dispatch_open_path_scratch   : PATH_MAX == 256, aligned with
+  //                                   _vfs_open_parent_scratch (vfs_open.pdx)
+  //                                   and _execve_path_scratch (sys_execve_shim.pdx)
+  //   _dispatch_read_buf_scratch    : 4096 = tmpfs single-page cap
+  //                                   (tmpfs/read.pdx §4.7 cross-page reject)
+  //   _dispatch_write_buf_scratch   : 4096 = tmpfs single-page cap
+  //                                   (tmpfs/write.pdx §4.5 cross-page reject)
+  //
+  // Design: design/kernel/r16-m3-kpti-sweep-733-734-738-739.md
+  // ==========================================================================
+  pub let DISPATCH_PATH_MAX  : u64 = 256
+  pub let DISPATCH_IO_MAX    : u64 = 4096
+  pub let mut _dispatch_open_path_scratch  : [u8; 256]  = uninit @align(8)
+  pub let mut _dispatch_read_buf_scratch   : [u8; 4096] = uninit @align(8)
+  pub let mut _dispatch_write_buf_scratch  : [u8; 4096] = uninit @align(8)
+
   // syscall_dispatch(rdi=sysno, rsi=a0, rdx=a1, rcx=a2, r8=a3) -> u64 in rax.
   // Widened !{mem, sysreg} @{cap, sched}: reachable handlers touch cap/sched/uart paths.
   pub let syscall_dispatch : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
@@ -67,13 +111,102 @@ module Dispatch = structure {
         je dispatch_wait4;
         jmp dispatch_enosys;
 
+        // R16-M3-KPTI-sweep (#738 #739): route the sys_read path via a
+        // per-syscall bounce buffer so that BOTH tmpfs_read (§4.10 rep_movsb
+        // dst = user VA under kernel CR3, #738) and tty_read_try (§copy loop
+        // mov_b [r9+0], rax to user VA under kernel CR3, #739) transitively
+        // land bytes into a kernel scratch first. The bounce buffer's user
+        // copy back happens post sys_read_body via user_write_bytes_via_walk.
+        //
+        // Prior code passed rdx (raw user buf VA) straight through to
+        // sys_read_body → vfs_read → {tmpfs_read | tty_read → tty_read_try}
+        // whose byte-stores at dst = user_va executed under kernel CR3. Both
+        // sites are latent today (no user program calls sys_read at R17.M0)
+        // but would silently corrupt the moment the shell grows an fd-based
+        // read call. Same defect class as #724 D4 / #730 D10c / #730 D10d /
+        // #737, symmetric to #734 write path.
+        //
+        // Fix at dispatch (Option B): sys_read_body / vfs_read / tmpfs_read
+        // / tty_read_try keep their existing "buf is kernel VA" contracts
+        // unchanged (sys_read_witness at kernel_main.pdx:4278 exercises
+        // sys_read_body with a KERNEL VA buf, tty_vops_witness at :5589
+        // exercises tty_read with a KERNEL VA stack buf — both would break
+        // if the bodies started walking user PML4s). This layer bridges.
+        //
+        // Length cap: DISPATCH_IO_MAX = 4096, matching tmpfs single-page
+        // read ceiling and the write path's cap. Short-read semantics are
+        // POSIX-legal; sys_read_body's fd-offset-advance uses the returned
+        // bytes_read directly so the fd_table offset is correct even if the
+        // user requested more.
+        //
+        // Error taxonomy: sys_read_body returns bytes_read in [0, len] on
+        // success (0 = EOF), 0xFFFFFFFFFFFFFFF7 (-EBADF) on invalid fd,
+        // 0xFFFFFFFFFFFFFFFB (-EIO) on vfs_read sentinel. We copy back only
+        // on rax in [1, DISPATCH_IO_MAX]; rax == 0 means EOF (nothing to
+        // copy) and rax > DISPATCH_IO_MAX means an errno (pass through).
+        // On walker failure during writeback → -EFAULT.
+        //
+        // Alignment: entry rsp%16==8. Push r15 (save user buf VA) + push r14
+        // (save capped len) = 16 bytes → rsp%16==8. Add `sub rsp, 8` for
+        // the sys_read_body call to align.
         dispatch_read:
+        push r15;                             // save user buf VA (across body + walk)
+        push r14;                             // save capped len (across body + walk)
+
+        // Cap len at DISPATCH_IO_MAX.
+        mov rax, 4096;
+        cmp rcx, rax;
+        jbe dispatch_read_len_ok;
+        mov rcx, rax;
+      dispatch_read_len_ok:
+
+        mov r15, rdx;                         // r15 = orig user buf VA
+        mov r14, rcx;                         // r14 = capped len
+
         mov rax, [rip + _current_tcb];
         mov rdi, rax;                         // rdi = current
-        // rsi=fd, rdx=buf, rcx=len already positioned by SysV
+        // rsi=fd already positioned by SysV
+        lea rdx, [rip + _dispatch_read_buf_scratch]; // rdx = kernel scratch (not user buf)
+        // rcx=len (capped) already in place
         sub rsp, 8;                           // #672 MEDIUM: SysV alignment pad
         call sys_read_body;
         add rsp, 8;
+
+        // rax = bytes_read [0, cap] or errno (huge unsigned). Skip the
+        // writeback if rax == 0 (EOF: nothing to copy) or rax > cap
+        // (errno: don't touch user buf).
+        cmp rax, 0;
+        je dispatch_read_done;                // EOF fast-path
+        cmp rax, r14;
+        ja dispatch_read_done;                // errno passthrough
+
+        // 1 <= rax <= cap: copy scratch[0..rax] back to user buf via walk.
+        // Save bytes_read across the walk call.
+        //
+        // Alignment: at this point rsp%16==8 (post add rsp,8 above). Single
+        // `push rax` → %16==0 which is exactly what the SysV C ABI requires
+        // for a nested call (the call itself pushes RA and the callee sees
+        // rsp%16==8 at entry). No additional sub rsp,8 pad needed.
+        push rax;                             // save bytes_read for return + align
+        mov rdi, r15;                         // arg0 = user buf VA
+        lea rsi, [rip + _dispatch_read_buf_scratch]; // arg1 = kernel scratch
+        mov rdx, rax;                         // arg2 = bytes_read
+        call user_write_bytes_via_walk;       // rax = 0 or -EFAULT
+        mov r8, rax;                          // stash walk result
+        pop rax;                              // restore bytes_read (%16==8 again)
+
+        cmp r8, 0;
+        jne dispatch_read_efault;             // walker failed → -EFAULT
+
+        dispatch_read_done:
+        pop r14;
+        pop r15;
+        ret;
+
+        dispatch_read_efault:
+        pop r14;
+        pop r15;
+        mov rax, 0xFFFFFFFFFFFFFFF2;          // -EFAULT
         ret;
 
         dispatch_write:
@@ -99,10 +232,70 @@ module Dispatch = structure {
         je dispatch_write_uart;
         cmp rsi, 2;
         je dispatch_write_uart;
-        // Real body for fd >= 3
+
+        // R16-M3-KPTI-sweep (#734): real body path for fd >= 3.
+        //
+        // Prior code passed rdx (raw user buf VA) straight through to
+        // sys_write_body → vfs_write → tmpfs_write, whose rep_movsb src =
+        // rsi = user_va executed under kernel CR3 — same defect class as
+        // #724 D4 / #730 D10c / #730 D10d / #737. Latent because no user
+        // code exercises fd>=3 writes at R17.M0 (init uses only fd 1/2 via
+        // UART fast path + sys_debug_puts). Would silently corrupt file
+        // contents the moment a user program grows a real write() call.
+        //
+        // Fix: cap len at DISPATCH_IO_MAX (4096 — matches tmpfs single-page
+        // ceiling, so no legal write is truncated), walk-copy buf bytes
+        // into _dispatch_write_buf_scratch via user_read_bytes_via_walk,
+        // then pass the scratch VA (not the user VA) to sys_write_body.
+        // sys_write_body → vfs_write → tmpfs_write's rep_movsb src now
+        // reads from the kernel scratch (safe under kernel CR3), and its
+        // dst = allocated page (kernel VA, safe).
+        //
+        // Length cap semantics: POSIX permits short writes (write may
+        // accept fewer bytes than requested and return the accepted count).
+        // sys_write_body's own advance-offset logic uses `rax` (bytes
+        // written), so a cap at 4096 correctly advances by up to 4096 —
+        // user re-issues write for the remainder. At R17.M0 no caller
+        // requests >4096.
+        //
+        // Alignment: entry rsp%16==8 (SysV call from syscall_entry). We
+        // need to preserve rsi (fd) and the capped len across the walk
+        // call; user_ptr_ok's push/pop discipline restored them already so
+        // we start clean. Push rsi + push rcx pair (16 bytes) keeps
+        // rsp%16==8 for the nested walk call — WRONG, walk needs %16==0.
+        // Use push rsi + push rcx + sub rsp, 8 = 24 bytes → rsp%16==0. Pop
+        // in reverse plus add rsp, 8 to restore.
+        push rsi;                             // save fd across walk + body
+        push rcx;                             // save orig len (for cap)
+        sub rsp, 8;                           // align rsp%16==0 for nested call
+
+        // Cap len at DISPATCH_IO_MAX (4096).
+        mov rax, 4096;
+        cmp rcx, rax;
+        jbe dispatch_write_len_ok;
+        mov rcx, rax;
+      dispatch_write_len_ok:
+        // Overwrite the saved orig-len slot with the capped len so it
+        // matches what we pass to sys_write_body.
+        mov [rsp + 8], rcx;
+
+        // user_read_bytes_via_walk(dst=_dispatch_write_buf_scratch, user=buf, len=capped)
+        lea rdi, [rip + _dispatch_write_buf_scratch];
+        mov rsi, rdx;                         // user_va
+        mov rdx, rcx;                         // len
+        call user_read_bytes_via_walk;        // rax = 0 or -EFAULT
+
+        add rsp, 8;                           // undo alignment pad
+        pop rcx;                              // restore capped len
+        pop rsi;                              // restore fd
+
+        cmp rax, 0;
+        jne dispatch_write_efault;            // walker failed → -EFAULT (matches -EFAULT convention)
+
         mov rax, [rip + _current_tcb];
         mov rdi, rax;                         // rdi = current
-        // rsi=fd, rdx=buf, rcx=len already positioned by SysV
+        // rsi=fd, rcx=len (capped) already restored
+        lea rdx, [rip + _dispatch_write_buf_scratch]; // rdx = buf (kernel scratch)
         sub rsp, 8;                           // #672 MEDIUM: SysV alignment pad
         call sys_write_body;
         add rsp, 8;
@@ -141,13 +334,63 @@ module Dispatch = structure {
         mov rax, 0xFFFFFFFFFFFFFFF2;           // -EFAULT = -14
         ret;
 
+        // R16-M3-KPTI-sweep (#733): route the user path VA through a
+        // per-byte 4-level PML4 walk into _dispatch_open_path_scratch, then
+        // pass the kernel-side scratch to sys_open_body. Prior code passed
+        // rsi (raw user VA) straight through to sys_open_body → vfs_open →
+        // path_resolve, whose byte-loads via `mov_b rax, [r12]` (path.pdx
+        // §regular_lookup) executed under kernel CR3 — the boot PML4's low
+        // identity map hits whatever kernel byte sits at PA = user_va, NOT
+        // the frame the user PML4 maps user_va to. init's /dev/tty0 path at
+        // user VA 0x400000+ typically read the kernel .bss zero at PA
+        // 0x400000+, so byte 0 was NUL and vfs_open failed silently with
+        // -ENOENT — init's stdio setup (open + 3× dup2 + close) collapsed
+        // silently because init doesn't check the return.
+        //
+        // Post-fix, the walk-copy translates user VA → phys → higher-half
+        // identity via the user PML4 (per byte), lands the NUL-terminated
+        // path into _dispatch_open_path_scratch, and sys_open_body sees the
+        // kernel VA scratch. Same defect-class fix as #737's dispatch_wait4
+        // writeback via user_write_u32_via_walk and #730 D10d's
+        // sys_execve_shim path copy via user_read_str_via_walk.
+        //
+        // On walker failure (unmapped page / kernel-half VA / path exceeds
+        // 256 without NUL) → -EFAULT, matching sys_execve_shim's fail_efault
+        // shape. sys_open's own -ENOENT is reserved for "path resolvable but
+        // no such file" — walker failures are a distinct trust-boundary
+        // failure.
+        //
+        // Alignment: dispatch_open was reached via `call syscall_dispatch`
+        // from syscall_entry, so rsp%16==8 at entry. SysV C ABI requires
+        // rsp%16==0 at the call instruction (callee sees %16==8 at entry).
+        // Two 8-byte pushes leave %16==8, so we add sub rsp,8 to reach
+        // %16==0 for the nested call. Symmetric add rsp,8 + two pops
+        // restore alignment for the subsequent sys_open_body call.
         dispatch_open:
+        push rdx;                             // save flags (%16==0)
+        push rcx;                             // save mode (%16==8)
+        sub rsp, 8;                           // align for call (%16==0)
+        mov rdi, rsi;                         // arg0 = path_va (user VA)
+        lea rsi, [rip + _dispatch_open_path_scratch]; // arg1 = kernel scratch
+        mov rdx, 256;                         // arg2 = cap = DISPATCH_PATH_MAX
+        call user_read_str_via_walk;          // rax = strlen or 0 on fault
+        add rsp, 8;                           // undo alignment pad (%16==8)
+        pop rcx;                              // restore mode (%16==0)
+        pop rdx;                              // restore flags (%16==8)
+        cmp rax, 0;
+        je dispatch_open_efault;              // walker failed → -EFAULT
+
         mov rax, [rip + _current_tcb];
         mov rdi, rax;                         // rdi = current
-        // rsi=path, rdx=flags, rcx=mode already positioned by SysV
+        lea rsi, [rip + _dispatch_open_path_scratch]; // rsi = path (kernel scratch)
+        // rdx=flags, rcx=mode already restored
         sub rsp, 8;                           // #672 MEDIUM: SysV alignment pad
         call sys_open_body;
         add rsp, 8;
+        ret;
+
+        dispatch_open_efault:
+        mov rax, 0xFFFFFFFFFFFFFFF2;          // -EFAULT
         ret;
 
         dispatch_close:
