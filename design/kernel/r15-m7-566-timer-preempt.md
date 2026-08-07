@@ -251,15 +251,16 @@ mechanism as `sched_block`'s save of its own caller-return-address.
 ### 3.6 Interaction with per-task kernel stacks (#728 D9)
 
 #728 D9 introduced per-task kernel stacks for `syscall_entry` (each task's
-kstack is at `_task_kernel_stacks + pid*16384`). The interrupt entry
-continues to use **TSS.RSP0** (shared `_kernel_stack` at boot) because the
-CPU's IDT gate transition uses TSS.RSP0 unconditionally for ring-3 → ring-0.
+kstack is at `_task_kernel_stacks + pid*16384`). At the time of the #566
+landing, the interrupt entry continued to use **TSS.RSP0** (shared
+`_kernel_stack` at boot) because the CPU's IDT gate transition uses
+TSS.RSP0 unconditionally for ring-3 → ring-0.
 
 **Consequence**: when two ring-3 tasks are simultaneously runnable and both
 get preempted, their ISR-time saved GPRs share the same `_kernel_stack`
 region. The second task's ISR entry overwrites the first task's saved GPRs.
 
-**Mitigation at this issue**:
+**Mitigation at #566**:
 
 1. AC is protected: init and its child are never simultaneously runnable
    (init blocks in `sys_wait4` before yielding; from that point until the
@@ -269,12 +270,18 @@ region. The second task's ISR entry overwrites the first task's saved GPRs.
    sched_switch to point at the incoming task's per-task kstack top
    (already stored at TCB+24 by task_new step 6.5). This is a small change
    to `sched_switch_r15` — add a `[_tss + 4] = next.kstack_top` store
-   between the current-save and the next-load. Deferred to a follow-up
-   issue because (a) the AC does not exercise it, (b) the design here is
-   correct without it, and (c) TSS.RSP0 mutation from arbitrary sched paths
-   needs its own audit (interaction with SYSCALL/SYSRET's separate MSR
-   stack, and with the two IST-stack exception handlers whose stacks are
-   independent).
+   between the current-save and the next-load.
+
+**LANDED as #744** (see design/kernel/r15-m7-744-tss-rsp0-per-task.md).
+`sched_switch_r15` now updates TSS.RSP0 on every switch (guarded on
+`kstack_top != 0` to protect ring-0-only synthetic TCBs — idle, sched/
+preempt witnesses); `kpti_build_user_pml4` maps the 261 pages of
+`_task_kernel_stacks` (RW=1/U=0/XD=1) into every user PML4 so the CPU's
+push at TSS.RSP0 succeeds under user CR3. `SCHED_BUDGET_DEFAULT` remains
+at 1M pending a separate follow-up (see §7 of the #744 design doc) that
+lowers the default and adds a runtime preempt witness — the plumbing here
+is now unblocked but the AC hedge is deliberately kept for one more
+release cycle.
 
 ### 3.7 IST stacks
 
