@@ -4,7 +4,7 @@
 # bytes.
 #
 # Usage: tools/run-smoke.sh [MODE | expected_marker | --fingerprint PATTERN]
-#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r17_init', 'boot_panic', 'boot_panic_halt', 'boot_exc3', 'prod' (mode dispatcher)
+#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_panic', 'boot_panic_halt', 'boot_exc3', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
 #     * boot_tick: validates boot_tick fingerprint (with timer TICKs), 5s timeout
@@ -20,6 +20,7 @@
 #     * boot_r14b_ud: validates R14B undefined-instruction witness, 6s timeout
 #     * boot_r15_ring3: validates R15 ring-3 + fd_table + single-task witness, 6s timeout
 #     * boot_r15_process: validates R15 3-task pool witness with pids=1,2,3, 6s timeout
+#     * boot_r16_uart_rx: validates R16.M4-666 real-IRQ UART RX end-to-end smoke, 10s timeout, injects 'abc' via QEMU chardev pipe
 #     * boot_r17_init: validates R17 init load structural witness (task_new + elf_lite_load), 8s timeout
 #     * boot_panic: validates M3-003 fake-panic emission chain witness, 8s timeout
 #     * prod: expects exit code 2 (kernel didn't build), skips verification
@@ -48,6 +49,7 @@ FINGERPRINT_FILE=""
 TIMEOUT=5
 BUILD_PANIC=0
 BUILD_EXC3=0
+UART_RX_MODE=0
 
 # Mode dispatcher: map boot_min/boot_banner/boot_tick/boot_r8_only/boot_r10/boot_r11/prod to fingerprint + timeout
 case "${EXPECTED}" in
@@ -141,6 +143,20 @@ case "${EXPECTED}" in
         TIMEOUT=6
         EXPECTED=""
         ;;
+    boot_r16_uart_rx)
+        # R16.M4-666 (#666): real IRQ-driven end-to-end UART RX smoke.
+        # Kernel witness (kernel_main.pdx: uart_rx_wire_witness) `sti`s
+        # briefly before lapic_timer_init, polls _uart_rx_ring for 3 bytes,
+        # then emits "UART RX: abc\n" via uart_puts. Fingerprint requires
+        # this second "UART RX: abc" line AFTER the #601 structural one.
+        # QEMU serial is bridged through a named-pipe chardev so the smoke
+        # driver can inject 'abc' after kernel boot has ERBFI armed.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r16/expected-boot-r16-uart-rx.txt"
+        TIMEOUT=10
+        UART_RX_MODE=1
+        EXPECTED=""
+        ;;
     boot_r17_init)
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/r17/expected-boot-r17-init.txt"
@@ -211,16 +227,76 @@ fi
 LOG="/tmp/paideia-os-smoke.log"
 rm -f "${LOG}"
 
-timeout ${TIMEOUT} qemu-system-x86_64 \
-    -kernel "${KERNEL}" \
-    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-    -serial "file:${LOG}" \
-    -display none \
-    -no-reboot \
-    -no-shutdown \
-    -m 32M \
-    >/dev/null 2>&1
-QEMU_RC=$?
+if [[ ${UART_RX_MODE} -eq 1 ]]; then
+    # R16.M4-666 (#666) end-to-end UART RX real-IRQ smoke.
+    #
+    # QEMU chardev pipe requires two pre-existing named FIFOs at
+    # ${FIFO_BASE}.in and ${FIFO_BASE}.out. QEMU opens .in for READ
+    # (guest RX) and .out for WRITE (guest TX). Both opens block
+    # until the host side has a peer open — so we bring up the reader
+    # and the writer BEFORE launching QEMU, in the background, and
+    # let them keep the pipe alive for the full boot window.
+    #
+    # Injection timing: sleep 1.0s after QEMU launch, then write 'abc'.
+    # The kernel witness (uart_rx_wire_witness) polls up to ~2s under
+    # `sti` right before lapic_timer_init — that window straddles the
+    # 1s injection either way (bytes arrive live under sti, or bytes
+    # pre-queue in QEMU 16550 RBR and fire IRQ once ERBFI is set at
+    # kernel uart_rx_init). See design/kernel/r16-m4-666-uart-rx-e2e-smoke.md §5.
+    #
+    # Trailing sleep on the writer keeps the pipe open so QEMU's
+    # 16550 read side does not EOF mid-boot.
+    FIFO_BASE="/tmp/paideia-os-uart-rx-$$"
+    FIFO_IN="${FIFO_BASE}.in"
+    FIFO_OUT="${FIFO_BASE}.out"
+    rm -f "${FIFO_IN}" "${FIFO_OUT}"
+    mkfifo "${FIFO_IN}" "${FIFO_OUT}"
+
+    # Background reader: drain guest TX into LOG (matches the default
+    # -serial file:${LOG} behavior every other mode relies on).
+    cat "${FIFO_OUT}" > "${LOG}" &
+    READER_PID=$!
+
+    # Background writer: hold .in open for QEMU's read side; inject
+    # 'abc' after a 1s settle delay so the kernel reaches uart_rx_init
+    # before the bytes hit the 16550.
+    (
+        sleep 1.0
+        printf 'abc'
+        sleep 15
+    ) > "${FIFO_IN}" &
+    WRITER_PID=$!
+
+    timeout ${TIMEOUT} qemu-system-x86_64 \
+        -kernel "${KERNEL}" \
+        -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+        -chardev pipe,id=char0,path="${FIFO_BASE}" \
+        -serial chardev:char0 \
+        -display none \
+        -no-reboot \
+        -no-shutdown \
+        -m 32M \
+        >/dev/null 2>&1
+    QEMU_RC=$?
+
+    # Tear down background procs (may already be gone if writer sleep expired).
+    kill "${WRITER_PID}" 2>/dev/null || true
+    kill "${READER_PID}" 2>/dev/null || true
+    wait "${WRITER_PID}" 2>/dev/null || true
+    wait "${READER_PID}" 2>/dev/null || true
+    rm -f "${FIFO_IN}" "${FIFO_OUT}"
+else
+    timeout ${TIMEOUT} qemu-system-x86_64 \
+        -kernel "${KERNEL}" \
+        -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+        -serial "file:${LOG}" \
+        -display none \
+        -no-reboot \
+        -no-shutdown \
+        -m 32M \
+        >/dev/null 2>&1
+    QEMU_RC=$?
+fi
 
 # QEMU exit codes: 124 = timeout (expected for halt+stay-on); 0 = clean; 35 = panic exit (expected for boot_panic_halt)
 if [[ ${QEMU_RC} -ne 0 && ${QEMU_RC} -ne 124 && ${QEMU_RC} -ne 35 ]]; then
