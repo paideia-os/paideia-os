@@ -4,7 +4,7 @@
 # bytes.
 #
 # Usage: tools/run-smoke.sh [MODE | expected_marker | --fingerprint PATTERN]
-#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_interactive', 'boot_panic', 'boot_panic_halt', 'boot_exc3', 'prod' (mode dispatcher)
+#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_panic', 'boot_panic_halt', 'boot_exc3', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
 #     * boot_tick: validates boot_tick fingerprint (with timer TICKs), 5s timeout
@@ -22,7 +22,7 @@
 #     * boot_r15_process: validates R15 3-task pool witness with pids=1,2,3, 6s timeout
 #     * boot_r16_uart_rx: validates R16.M4-666 real-IRQ UART RX end-to-end smoke, 10s timeout, injects 'abc' via QEMU chardev pipe
 #     * boot_r17_init: validates R17 init load structural witness (task_new + elf_lite_load), 8s timeout
-#     * boot_r17_shell_interactive: injects 'echo hi\nexit\n' after SHELL START, asserts echo + shell-reap chain, 12s timeout (#757)
+#     * boot_r17_shell_echo_hello: injects 'echo hello\nexit\n' after SHELL START, asserts echo + shell-reap chain, 12s timeout (R17.M5 #636/#751/#752)
 #     * boot_panic: validates M3-003 fake-panic emission chain witness, 8s timeout
 #     * prod: expects exit code 2 (kernel didn't build), skips verification
 #   - expected_marker: defaults to no-check (just confirms QEMU exits or
@@ -222,40 +222,27 @@ case "${EXPECTED}" in
         TIMEOUT=8
         EXPECTED=""
         ;;
-    boot_r17_shell_interactive)
-        # #757 (harness) + #636 track: end-to-end shell interactivity
-        # smoke. Reuses the boot_r17_init kernel (init forks child_hello
-        # then execs /bin/sh from tmpfs seed). Injects `echo hi\nexit\n`
-        # via the chardev-pipe path after the shell prints "SHELL START"
-        # (INJECT_WAIT_FOR anchors on the shell-entry witness so
-        # injection cannot race the earlier tty stdin bridge sub-test
-        # into consuming the bytes). Fingerprint asserts the shell
-        # interactivity chain: SHELL START, then the echo builtin's
-        # "hi" output, then init's second wait4 reaping the shell.
+    boot_r17_shell_echo_hello)
+        # R17.M5 #636 / #751 / #752 (formerly `boot_r17_shell_interactive`
+        # from #757): end-to-end shell interactivity smoke. Reuses the
+        # boot_r17_init kernel (init forks child_hello then execs /bin/sh
+        # from tmpfs seed). Injects `echo hello\nexit\n` via the chardev-
+        # pipe path after the shell prints "SHELL START" (INJECT_WAIT_FOR
+        # anchors on the shell-entry witness so injection cannot race the
+        # earlier tty stdin bridge sub-test into consuming the bytes).
+        # Fingerprint asserts the shell interactivity chain: SHELL START,
+        # then the echo builtin's "hello" output, then init's second
+        # wait4 reaping the shell (REAPED).
         #
-        # HARNESS STATUS: fully wired. The wait-for-pattern + retry
-        # scaffolding introduced with #757 provably fires (bash -x of
-        # this mode shows `printf %b 'echo hi\nexit\n'` executes after
-        # SHELL START lands in LOG). BUT: with the current kernel
-        # (a6d9f9c — #756 tty_read_try cursor fix landed) the injected
-        # bytes are not observably consumed by the shell — 0/10 runs
-        # (with INJECT_RETRIES=5, INJECT_HOLD=20) show any post-prompt
-        # bytes on serial. The wave-11 debugger's 1/6 success rate is
-        # not reproducible on this exact HEAD. Root cause is NOT the
-        # chardev-pipe race — a bare `qemu-system-x86_64 … -chardev
-        # pipe …` launched outside run-smoke.sh with an interactive
-        # writer (sleep 4; printf 'echo hi\nexit\n'; sleep 20) > FIFO
-        # reproduces the same 10621-byte log ending at "$ ". The
-        # bytes reach FIFO_IN (verified by tracing the subshell) but
-        # never round-trip through UART→ISR→_uart_rx_ring→shell. This
-        # is a KERNEL-SIDE issue in the post-witness UART RX delivery
-        # path (candidates: IOAPIC RTE #4 mask/dest reprogrammed after
-        # the r16 witness's `cli`, LAPIC vec 0x24 IDT slot clobbered
-        # by later boot code, or the shell task's IF not truly set
-        # under iretq into user_ss). Filed for follow-up; do NOT add
-        # this mode to the pre-push hook until the kernel path clears.
+        # Rename note: the R14B tactical plan (§Subsystem 20) names the
+        # mode + golden per this R17.M5 form. The #757-era name
+        # `boot_r17_shell_interactive` was a provisional placeholder that
+        # predated the batched R17.M5 landing; it is renamed here so the
+        # smoke inventory matches the design doc verbatim. The kernel
+        # #758 fix (idle sti+hlt loop, landed pre-#757 close) makes the
+        # chain deterministic (5/5 in the sandbox).
         FINGERPRINT_MODE=1
-        FINGERPRINT_FILE="${REPO_ROOT}/tests/r17/expected-boot-r17-shell-interactive.txt"
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r17/shell-echo-hello.golden"
         TIMEOUT=12
         UART_RX_MODE=1
         # Defaults chosen for interactivity workload. Env overrides
@@ -264,7 +251,7 @@ case "${EXPECTED}" in
         # export it, so `${VAR:=default}` fires here for those, and
         # the global-defaults block below preserves boot_r16 behavior
         # for anything not explicitly set here or by the caller.
-        : "${INJECT_STRING:=echo hi\nexit\n}"
+        : "${INJECT_STRING:=echo hello\nexit\n}"
         : "${INJECT_WAIT_FOR:=SHELL START}"
         : "${INJECT_DELAY:=0.3}"
         : "${INJECT_HOLD:=10}"
