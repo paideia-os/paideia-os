@@ -4,7 +4,7 @@
 # bytes.
 #
 # Usage: tools/run-smoke.sh [MODE | expected_marker | --fingerprint PATTERN]
-#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_shutdown', 'boot_panic', 'boot_panic_halt', 'boot_exc3', 'prod' (mode dispatcher)
+#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_child_process', 'boot_r17_shell_shutdown', 'boot_panic', 'boot_panic_halt', 'boot_exc3', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
 #     * boot_tick: validates boot_tick fingerprint (with timer TICKs), 5s timeout
@@ -24,6 +24,7 @@
 #     * boot_r17_init: validates R17 init load structural witness (task_new + elf_lite_load), 8s timeout
 #     * boot_r17_shell_echo_hello: injects 'echo hello\nexit\n' after SHELL START, asserts echo + shell-reap chain, 12s timeout (R17.M5 #636/#751/#752)
 #     * boot_r17_shell_multi_command: injects 'pwd\ncd /tmp\npwd\nhelp\nexit\n', asserts /tmp + help output + REAPED (R17.M5 #637)
+#     * boot_r17_shell_child_process: injects 'true\nexit\n', asserts TRUE OK from /bin/true + shell-reap chain (R17.M5 #638)
 #     * boot_r17_shell_shutdown: injects 'exit\n', asserts shell exit + init reap + init shutdown (R17.M5 #639)
 #     * boot_panic: validates M3-003 fake-panic emission chain witness, 8s timeout
 #     * prod: expects exit code 2 (kernel didn't build), skips verification
@@ -277,6 +278,29 @@ case "${EXPECTED}" in
         TIMEOUT=15
         UART_RX_MODE=1
         : "${INJECT_STRING:=pwd\ncd /tmp\npwd\nhelp\nexit\n}"
+        : "${INJECT_WAIT_FOR:=SHELL START}"
+        : "${INJECT_DELAY:=0.3}"
+        : "${INJECT_HOLD:=12}"
+        EXPECTED=""
+        ;;
+    boot_r17_shell_child_process)
+        # R17.M5 #638: shell fork+execve+wait4 of /bin/true. The shell
+        # sees `true`, resolves to /bin/true via resolve_path, forks,
+        # execves the trivial user binary (src/user/true.pdx). The
+        # binary writes "TRUE OK\n" to fd 1 then sys_exit(0). Shell's
+        # wait4 returns; shell reprompts. Then `exit` unblocks init's
+        # second wait4.
+        #
+        # Golden asserts: SHELL START, TRUE OK (proves /bin/true was
+        # tmpfs-seeded, path-resolved, ELF-loaded, ran in ring-3, and
+        # wrote to shell-inherited stdout), REAPED (init reap of the
+        # shell — pid=3, since /bin/true is pid=4 and is reaped by
+        # the shell, not init).
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r17/shell-child-process.golden"
+        TIMEOUT=15
+        UART_RX_MODE=1
+        : "${INJECT_STRING:=true\nexit\n}"
         : "${INJECT_WAIT_FOR:=SHELL START}"
         : "${INJECT_DELAY:=0.3}"
         : "${INJECT_HOLD:=12}"

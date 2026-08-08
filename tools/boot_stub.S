@@ -268,6 +268,24 @@ bin_sh_seed_ok_msg: .ascii "R17 BIN SH SEED OK\n\0"
 .align 8
 bin_sh_seed_fail_msg: .ascii "R17 BIN SH SEED FAIL\n\0"
 
+# R17.M5 #638 (paideia-os): /bin/true tmpfs seed strings + markers.
+# /bin/true is a trivial 2-syscall self-contained user binary
+# (src/user/true.pdx) that emits "TRUE OK\n" then sys_exit(0). Seeded
+# into /bin at boot alongside /bin/child_hello and /bin/sh, using the
+# same vnode_cache_or_alloc pattern to avoid the #754 vnode conflation
+# bug (see design/kernel/r17-m0-665-vnode-conflation-fix.md).
+.global true_seed_name
+.align 8
+true_seed_name: .ascii "true\0"
+
+.global bin_true_seed_ok_msg
+.align 8
+bin_true_seed_ok_msg: .ascii "R17 BIN TRUE SEED OK\n\0"
+
+.global bin_true_seed_fail_msg
+.align 8
+bin_true_seed_fail_msg: .ascii "R17 BIN TRUE SEED FAIL\n\0"
+
 .global init_boot_fail_msg
 .align 8
 init_boot_fail_msg: .ascii "INIT BOOT FAIL\n\0"

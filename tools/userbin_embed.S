@@ -1,6 +1,7 @@
 # R15-M1-007 (#519): Embed user shell binary into kernel .rodata.userbin.
 # R17-M2-005 (#620): Embed init binary alongside shell.
 # R15-M6-009 (#560): Embed child_hello binary alongside init.
+# R17.M5 #638:      Embed /bin/true (trivial child-process test binary).
 .section .rodata.userbin, "a", @progbits
 .balign 4096
 .global _shell_bin_start
@@ -20,4 +21,10 @@ _child_hello_bin_start:
 .incbin "build/user/child_hello.elf"
 .global _child_hello_bin_end
 _child_hello_bin_end:
+.balign 4096
+.global _true_bin_start
+_true_bin_start:
+.incbin "build/user/true.elf"
+.global _true_bin_end
+_true_bin_end:
 .balign 4096

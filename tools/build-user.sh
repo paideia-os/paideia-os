@@ -10,6 +10,7 @@ BUILD_DIR="${REPO_ROOT}/build/user"
 SHELL_LINK_SCRIPT="${USER_SRC}/link.ld"
 INIT_LINK_SCRIPT="${USER_SRC}/init.ld"
 CHILD_HELLO_LINK_SCRIPT="${USER_SRC}/child_hello.ld"
+TRUE_LINK_SCRIPT="${USER_SRC}/true.ld"
 
 if [[ ! -f "${SHELL_LINK_SCRIPT}" ]]; then
     echo "shell linker script missing: ${SHELL_LINK_SCRIPT}" >&2
@@ -26,6 +27,11 @@ if [[ ! -f "${CHILD_HELLO_LINK_SCRIPT}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${TRUE_LINK_SCRIPT}" ]]; then
+    echo "true linker script missing: ${TRUE_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 
@@ -34,6 +40,7 @@ ALL_OBJECTS=()
 SHELL_OBJECTS=()
 INIT_OBJECTS=()
 CHILD_HELLO_OBJECTS=()
+TRUE_OBJECTS=()
 LIBS_OBJECTS=()
 
 while IFS= read -r -d '' pdx; do
@@ -44,13 +51,16 @@ while IFS= read -r -d '' pdx; do
     "${PAIDEIA_AS}" build --emit elf64 "${pdx}" -o "${obj}"
     ALL_OBJECTS+=("${obj}")
 
-    # Separate init / child_hello from shell objects; shared libraries go to both
-    # shell and init but NOT to child_hello (child_hello is self-contained and
-    # inlines its two syscalls to avoid pulling the shim's other 10 wrappers).
+    # Separate init / child_hello / true from shell objects; shared libraries
+    # go to both shell and init but NOT to the self-contained fixtures
+    # (child_hello and true both inline their two syscalls to avoid pulling
+    # the shim's other 10 wrappers — one .pdx file, one .elf pattern).
     if [[ "${rel}" == "init.pdx" ]]; then
         INIT_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "child_hello.pdx" ]]; then
         CHILD_HELLO_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "true.pdx" ]]; then
+        TRUE_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "syscall_shim.pdx" ]] || [[ "${rel}" == "errno.pdx" ]] || [[ "${rel}" == "string.pdx" ]]; then
         # These are library modules needed by both shell and init
         LIBS_OBJECTS+=("${obj}")
@@ -149,4 +159,20 @@ if [[ ${#CHILD_HELLO_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/child_hello.elf"
     echo "[ok] ${BUILD_DIR}/child_hello.bin"
+fi
+
+# Link true.elf with true objects only (R17.M5 #638).
+# Self-contained; no libs, no shim — mirrors child_hello.elf pattern.
+if [[ ${#TRUE_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T true.ld -> true.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${TRUE_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/true.elf" \
+        "${TRUE_OBJECTS[@]}"
+
+    echo "[objcopy-user] true.elf -> true.bin"
+    objcopy -O binary "${BUILD_DIR}/true.elf" "${BUILD_DIR}/true.bin"
+
+    echo "[ok] ${BUILD_DIR}/true.elf"
+    echo "[ok] ${BUILD_DIR}/true.bin"
 fi
