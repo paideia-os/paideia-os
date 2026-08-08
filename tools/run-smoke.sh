@@ -50,6 +50,12 @@ TIMEOUT=5
 BUILD_PANIC=0
 BUILD_EXC3=0
 UART_RX_MODE=0
+# #750: parameterize the chardev-pipe injection pattern so shell smoke modes
+# can reuse it. Defaults preserve boot_r16_uart_rx behavior byte-identically
+# (settle 1.0s, inject 'abc', hold 15s).
+INJECT_STRING="abc"
+INJECT_DELAY="1.0"
+INJECT_HOLD="15"
 
 # Mode dispatcher: map boot_min/boot_banner/boot_tick/boot_r8_only/boot_r10/boot_r11/prod to fingerprint + timeout
 case "${EXPECTED}" in
@@ -265,12 +271,16 @@ if [[ ${UART_RX_MODE} -eq 1 ]]; then
     READER_PID=$!
 
     # Background writer: hold .in open for QEMU's read side; inject
-    # 'abc' after a 1s settle delay so the kernel reaches uart_rx_init
-    # before the bytes hit the 16550.
+    # INJECT_STRING after INJECT_DELAY settle so the kernel reaches
+    # uart_rx_init (and any wait-for-prompt state) before the bytes
+    # hit the 16550. INJECT_HOLD keeps the pipe alive for the full
+    # boot window so QEMU's 16550 read side does not EOF mid-boot.
+    # #750: parameterized (was hardcoded 'abc' + 1.0s + 15s) so shell
+    # smoke modes can specify e.g. "echo hello\nexit\n" + 4.0s + 20s.
     (
-        sleep 1.0
-        printf 'abc'
-        sleep 15
+        sleep "${INJECT_DELAY}"
+        printf '%b' "${INJECT_STRING}"
+        sleep "${INJECT_HOLD}"
     ) > "${FIFO_IN}" &
     WRITER_PID=$!
 
