@@ -4,7 +4,7 @@
 # bytes.
 #
 # Usage: tools/run-smoke.sh [MODE | expected_marker | --fingerprint PATTERN]
-#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_panic', 'boot_panic_halt', 'boot_exc3', 'prod' (mode dispatcher)
+#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_interactive', 'boot_panic', 'boot_panic_halt', 'boot_exc3', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
 #     * boot_tick: validates boot_tick fingerprint (with timer TICKs), 5s timeout
@@ -22,6 +22,7 @@
 #     * boot_r15_process: validates R15 3-task pool witness with pids=1,2,3, 6s timeout
 #     * boot_r16_uart_rx: validates R16.M4-666 real-IRQ UART RX end-to-end smoke, 10s timeout, injects 'abc' via QEMU chardev pipe
 #     * boot_r17_init: validates R17 init load structural witness (task_new + elf_lite_load), 8s timeout
+#     * boot_r17_shell_interactive: injects 'echo hi\nexit\n' after SHELL START, asserts echo + shell-reap chain, 12s timeout (#757)
 #     * boot_panic: validates M3-003 fake-panic emission chain witness, 8s timeout
 #     * prod: expects exit code 2 (kernel didn't build), skips verification
 #   - expected_marker: defaults to no-check (just confirms QEMU exits or
@@ -50,12 +51,57 @@ TIMEOUT=5
 BUILD_PANIC=0
 BUILD_EXC3=0
 UART_RX_MODE=0
-# #750: parameterize the chardev-pipe injection pattern so shell smoke modes
-# can reuse it. Defaults preserve boot_r16_uart_rx behavior byte-identically
-# (settle 1.0s, inject 'abc', hold 15s).
-INJECT_STRING="abc"
-INJECT_DELAY="1.0"
-INJECT_HOLD="15"
+# #750 + #757: chardev-pipe injection knobs.
+#
+# Precedence:  caller env  >  mode-branch default  >  global fallback
+#
+# The case dispatcher below may set mode-specific defaults via
+# `: "${VAR:=...}"` — those fire only when the caller did NOT export
+# the var (or exported it empty). After the dispatcher, the "Global
+# injection defaults" block fills in any remaining unset knobs with
+# the historical boot_r16_uart_rx values, keeping that mode byte-for-
+# byte unchanged.
+#
+# Knobs:
+#   INJECT_STRING         — bytes to write into FIFO_IN. `printf %b`
+#                           interprets escape sequences (`\n`, `\t`).
+#   INJECT_DELAY          — seconds to sleep after WAIT_FOR (or on
+#                           subshell entry if WAIT_FOR is empty).
+#   INJECT_HOLD           — seconds to keep FIFO_IN open after writes
+#                           complete, so QEMU's 16550 read side does
+#                           not EOF mid-boot.
+#   INJECT_WAIT_FOR       — #757: optional pattern; if set, the writer
+#                           polls the serial log for this string
+#                           before injecting, replacing the blind
+#                           sleep-then-write timing. Closes the race
+#                           where injection lands before the guest
+#                           reaches the readiness state the injection
+#                           is meant to exercise (observed ~5/6 failure
+#                           rate on shell interactivity when bytes
+#                           were written at t≈1s but the shell did not
+#                           reach the read window until t≈4-5s, and
+#                           earlier tty sub-tests consumed the bytes
+#                           silently).
+#   INJECT_WAIT_TIMEOUT   — max integer seconds to wait for
+#                           INJECT_WAIT_FOR before falling through and
+#                           injecting anyway (default 8).
+#   INJECT_RETRIES        — number of times to write INJECT_STRING
+#                           (default 1). >1 re-injects with
+#                           INJECT_RETRY_INTERVAL between attempts;
+#                           useful when a single write may not overlap
+#                           the guest's read window.
+#   INJECT_RETRY_INTERVAL — seconds between retry writes (default 0.5).
+#
+# `set -u` is on above; the `${VAR-}` form (no colon) is a
+# safe-read that yields empty if unset, without triggering an
+# unbound-variable error. Do NOT change to `${VAR}` here.
+INJECT_STRING="${INJECT_STRING-}"
+INJECT_DELAY="${INJECT_DELAY-}"
+INJECT_HOLD="${INJECT_HOLD-}"
+INJECT_WAIT_FOR="${INJECT_WAIT_FOR-}"
+INJECT_WAIT_TIMEOUT="${INJECT_WAIT_TIMEOUT-}"
+INJECT_RETRIES="${INJECT_RETRIES-}"
+INJECT_RETRY_INTERVAL="${INJECT_RETRY_INTERVAL-}"
 
 # Mode dispatcher: map boot_min/boot_banner/boot_tick/boot_r8_only/boot_r10/boot_r11/prod to fingerprint + timeout
 case "${EXPECTED}" in
@@ -176,6 +222,54 @@ case "${EXPECTED}" in
         TIMEOUT=8
         EXPECTED=""
         ;;
+    boot_r17_shell_interactive)
+        # #757 (harness) + #636 track: end-to-end shell interactivity
+        # smoke. Reuses the boot_r17_init kernel (init forks child_hello
+        # then execs /bin/sh from tmpfs seed). Injects `echo hi\nexit\n`
+        # via the chardev-pipe path after the shell prints "SHELL START"
+        # (INJECT_WAIT_FOR anchors on the shell-entry witness so
+        # injection cannot race the earlier tty stdin bridge sub-test
+        # into consuming the bytes). Fingerprint asserts the shell
+        # interactivity chain: SHELL START, then the echo builtin's
+        # "hi" output, then init's second wait4 reaping the shell.
+        #
+        # HARNESS STATUS: fully wired. The wait-for-pattern + retry
+        # scaffolding introduced with #757 provably fires (bash -x of
+        # this mode shows `printf %b 'echo hi\nexit\n'` executes after
+        # SHELL START lands in LOG). BUT: with the current kernel
+        # (a6d9f9c — #756 tty_read_try cursor fix landed) the injected
+        # bytes are not observably consumed by the shell — 0/10 runs
+        # (with INJECT_RETRIES=5, INJECT_HOLD=20) show any post-prompt
+        # bytes on serial. The wave-11 debugger's 1/6 success rate is
+        # not reproducible on this exact HEAD. Root cause is NOT the
+        # chardev-pipe race — a bare `qemu-system-x86_64 … -chardev
+        # pipe …` launched outside run-smoke.sh with an interactive
+        # writer (sleep 4; printf 'echo hi\nexit\n'; sleep 20) > FIFO
+        # reproduces the same 10621-byte log ending at "$ ". The
+        # bytes reach FIFO_IN (verified by tracing the subshell) but
+        # never round-trip through UART→ISR→_uart_rx_ring→shell. This
+        # is a KERNEL-SIDE issue in the post-witness UART RX delivery
+        # path (candidates: IOAPIC RTE #4 mask/dest reprogrammed after
+        # the r16 witness's `cli`, LAPIC vec 0x24 IDT slot clobbered
+        # by later boot code, or the shell task's IF not truly set
+        # under iretq into user_ss). Filed for follow-up; do NOT add
+        # this mode to the pre-push hook until the kernel path clears.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r17/expected-boot-r17-shell-interactive.txt"
+        TIMEOUT=12
+        UART_RX_MODE=1
+        # Defaults chosen for interactivity workload. Env overrides
+        # (INJECT_STRING/DELAY/HOLD/WAIT_FOR) still win: the top-of-
+        # file init leaves each knob empty when the caller did not
+        # export it, so `${VAR:=default}` fires here for those, and
+        # the global-defaults block below preserves boot_r16 behavior
+        # for anything not explicitly set here or by the caller.
+        : "${INJECT_STRING:=echo hi\nexit\n}"
+        : "${INJECT_WAIT_FOR:=SHELL START}"
+        : "${INJECT_DELAY:=0.3}"
+        : "${INJECT_HOLD:=10}"
+        EXPECTED=""
+        ;;
     boot_panic)
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/logging/expected-panic-dump.txt"
@@ -202,6 +296,18 @@ case "${EXPECTED}" in
         exit 2
         ;;
 esac
+
+# Global injection defaults. Fills in any INJECT_* knob left unset by
+# both the caller's env AND the mode-branch. These values are exactly
+# the historical boot_r16_uart_rx defaults, so that mode's behavior is
+# preserved byte-for-byte.
+: "${INJECT_STRING:=abc}"
+: "${INJECT_DELAY:=1.0}"
+: "${INJECT_HOLD:=15}"
+: "${INJECT_WAIT_FOR:=}"
+: "${INJECT_WAIT_TIMEOUT:=8}"
+: "${INJECT_RETRIES:=1}"
+: "${INJECT_RETRY_INTERVAL:=0.5}"
 
 # Parse arguments: check for --fingerprint flag (backward-compatible)
 if [[ "${EXPECTED}" == "--fingerprint" && -n "${2:-}" ]]; then
@@ -267,7 +373,15 @@ if [[ ${UART_RX_MODE} -eq 1 ]]; then
 
     # Background reader: drain guest TX into LOG (matches the default
     # -serial file:${LOG} behavior every other mode relies on).
-    cat "${FIFO_OUT}" > "${LOG}" &
+    # #757: line-buffer via stdbuf so INJECT_WAIT_FOR's grep on LOG
+    # sees the readiness marker without waiting for cat's ~4KB stdio
+    # buffer to fill. Falls back to bare cat if stdbuf is missing
+    # (unlikely on Linux — ships with coreutils — but harmless).
+    if command -v stdbuf >/dev/null 2>&1; then
+        stdbuf -oL cat "${FIFO_OUT}" > "${LOG}" &
+    else
+        cat "${FIFO_OUT}" > "${LOG}" &
+    fi
     READER_PID=$!
 
     # Background writer: hold .in open for QEMU's read side; inject
@@ -277,9 +391,42 @@ if [[ ${UART_RX_MODE} -eq 1 ]]; then
     # boot window so QEMU's 16550 read side does not EOF mid-boot.
     # #750: parameterized (was hardcoded 'abc' + 1.0s + 15s) so shell
     # smoke modes can specify e.g. "echo hello\nexit\n" + 4.0s + 20s.
+    # #757: optional INJECT_WAIT_FOR replaces the blind sleep with a
+    # log-poll for a readiness marker (e.g. "SHELL START"), plus
+    # INJECT_RETRIES for cases where a single write may not land during
+    # the guest's read window. Redirection `> ${FIFO_IN}` opens the
+    # pipe at subshell entry and blocks until QEMU opens the read
+    # side; the body only runs once QEMU is attached, so the wait/
+    # inject sequence is anchored to QEMU-attached time, not host time.
     (
+        if [[ -n "${INJECT_WAIT_FOR}" ]]; then
+            # Poll the serial log for the readiness marker. LOG is
+            # populated by the background `cat ${FIFO_OUT} > ${LOG}`
+            # reader started just above, so it grows in real time as
+            # the guest writes to serial.
+            wait_start=${SECONDS}
+            while (( SECONDS - wait_start < INJECT_WAIT_TIMEOUT )); do
+                if [[ -s "${LOG}" ]] && grep -q "${INJECT_WAIT_FOR}" "${LOG}" 2>/dev/null; then
+                    break
+                fi
+                sleep 0.1
+            done
+        fi
+        # INJECT_DELAY still applies (post-ready settle when WAIT_FOR is
+        # set; sole pre-write timing when it isn't — preserves the
+        # boot_r16_uart_rx byte-for-byte default behavior).
         sleep "${INJECT_DELAY}"
-        printf '%b' "${INJECT_STRING}"
+        # Inject INJECT_STRING one or more times. `printf` here is the
+        # bash builtin (write(2), no libc stdio buffering), so bytes
+        # hit the FIFO promptly. Multiple attempts help when a single
+        # write may not overlap the guest's read window (e.g. tty
+        # bridge subtests may consume bytes before the shell reads).
+        for _ in $(seq 1 "${INJECT_RETRIES}"); do
+            printf '%b' "${INJECT_STRING}"
+            if (( INJECT_RETRIES > 1 )); then
+                sleep "${INJECT_RETRY_INTERVAL}"
+            fi
+        done
         sleep "${INJECT_HOLD}"
     ) > "${FIFO_IN}" &
     WRITER_PID=$!
