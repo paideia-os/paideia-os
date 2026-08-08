@@ -249,6 +249,20 @@ bin_seed_ok_msg: .ascii "R17 BIN CHILD HELLO SEED OK\n\0"
 .align 8
 bin_seed_fail_msg: .ascii "R17 BIN CHILD HELLO SEED FAIL\n\0"
 
+# R17-M5-636 (paideia-os #636): /bin/sh tmpfs seed strings + markers.
+# See design/kernel/r17-m5-636-shell-binary-seed.md.
+.global sh_seed_name
+.align 8
+sh_seed_name: .ascii "sh\0"
+
+.global bin_sh_seed_ok_msg
+.align 8
+bin_sh_seed_ok_msg: .ascii "R17 BIN SH SEED OK\n\0"
+
+.global bin_sh_seed_fail_msg
+.align 8
+bin_sh_seed_fail_msg: .ascii "R17 BIN SH SEED FAIL\n\0"
+
 .global init_boot_fail_msg
 .align 8
 init_boot_fail_msg: .ascii "INIT BOOT FAIL\n\0"
