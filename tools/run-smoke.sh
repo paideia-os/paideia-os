@@ -4,7 +4,7 @@
 # bytes.
 #
 # Usage: tools/run-smoke.sh [MODE | expected_marker | --fingerprint PATTERN]
-#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_panic', 'boot_panic_halt', 'boot_exc3', 'prod' (mode dispatcher)
+#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_panic', 'boot_panic_halt', 'boot_exc3', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
 #     * boot_tick: validates boot_tick fingerprint (with timer TICKs), 5s timeout
@@ -23,6 +23,7 @@
 #     * boot_r16_uart_rx: validates R16.M4-666 real-IRQ UART RX end-to-end smoke, 10s timeout, injects 'abc' via QEMU chardev pipe
 #     * boot_r17_init: validates R17 init load structural witness (task_new + elf_lite_load), 8s timeout
 #     * boot_r17_shell_echo_hello: injects 'echo hello\nexit\n' after SHELL START, asserts echo + shell-reap chain, 12s timeout (R17.M5 #636/#751/#752)
+#     * boot_r17_shell_multi_command: injects 'pwd\ncd /tmp\npwd\nhelp\nexit\n', asserts /tmp + help output + REAPED (R17.M5 #637)
 #     * boot_panic: validates M3-003 fake-panic emission chain witness, 8s timeout
 #     * prod: expects exit code 2 (kernel didn't build), skips verification
 #   - expected_marker: defaults to no-check (just confirms QEMU exits or
@@ -255,6 +256,29 @@ case "${EXPECTED}" in
         : "${INJECT_WAIT_FOR:=SHELL START}"
         : "${INJECT_DELAY:=0.3}"
         : "${INJECT_HOLD:=10}"
+        EXPECTED=""
+        ;;
+    boot_r17_shell_multi_command)
+        # R17.M5 #637: multi-command shell smoke. Injects the tactical-
+        # plan's exact script `pwd\ncd /tmp\npwd\nhelp\nexit\n`. Golden
+        # asserts, in order: SHELL START (shell entry), `/tmp` (from
+        # the second `pwd` after cd), the `echo - echo text to stdout`
+        # line (a distinctive fragment of `help`'s output that could
+        # not appear elsewhere in the boot log), REAPED (init's second
+        # wait4 unblocking on the shell exit).
+        #
+        # INJECT_HOLD is bumped to 12s (vs echo_hello's 10s) so the
+        # pipe stays open long enough for the shell to process five
+        # sequential lines through the tty stdin bridge; each line
+        # requires a full sys_read → dispatch → puts_new round trip.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r17/shell-multi-command.golden"
+        TIMEOUT=15
+        UART_RX_MODE=1
+        : "${INJECT_STRING:=pwd\ncd /tmp\npwd\nhelp\nexit\n}"
+        : "${INJECT_WAIT_FOR:=SHELL START}"
+        : "${INJECT_DELAY:=0.3}"
+        : "${INJECT_HOLD:=12}"
         EXPECTED=""
         ;;
     boot_panic)
