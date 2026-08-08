@@ -959,6 +959,16 @@ tty_read_ok_msg: .ascii "R16 TTY READ OK\n\0"
 .align 8
 tty_read_fail_msg: .ascii "R16 TTY READ FAIL\n\0"
 
+# R17-M5 (#748): tty_stdin_bridge witness success message
+.global tty_stdin_bridge_ok_msg
+.align 8
+tty_stdin_bridge_ok_msg: .ascii "R17 TTY STDIN BRIDGE OK\n\0"
+
+# R17-M5 (#748): tty_stdin_bridge witness failure message
+.global tty_stdin_bridge_fail_msg
+.align 8
+tty_stdin_bridge_fail_msg: .ascii "R17 TTY STDIN BRIDGE FAIL\n\0"
+
 # R16-M5-006 (#607): tty_write witness success message
 .global tty_write_ok_msg
 .align 8
