@@ -4,7 +4,7 @@
 # bytes.
 #
 # Usage: tools/run-smoke.sh [MODE | expected_marker | --fingerprint PATTERN]
-#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_child_process', 'boot_r17_shell_shutdown', 'boot_panic', 'boot_panic_halt', 'boot_exc3', 'prod' (mode dispatcher)
+#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_child_process', 'boot_r17_shell_shutdown', 'boot_smp', 'boot_panic', 'boot_panic_halt', 'boot_exc3', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
 #     * boot_tick: validates boot_tick fingerprint (with timer TICKs), 5s timeout
@@ -26,6 +26,7 @@
 #     * boot_r17_shell_multi_command: injects 'pwd\ncd /tmp\npwd\nhelp\nexit\n', asserts /tmp + help output + REAPED (R17.M5 #637)
 #     * boot_r17_shell_child_process: injects 'true\nexit\n', asserts TRUE OK from /bin/true + shell-reap chain (R17.M5 #638)
 #     * boot_r17_shell_shutdown: injects 'exit\n', asserts shell exit + init reap + init shutdown (R17.M5 #639)
+#     * boot_smp: validates R18.M1 SMP bring-up fingerprint on -smp 4; BSP wakes 3 APs (APIC IDs 1/2/3), each emits CPU_ID_XX_HELLO; bookended by SMP BRINGUP START / DONE (R18.M1 #764)
 #     * boot_panic: validates M3-003 fake-panic emission chain witness, 8s timeout
 #     * prod: expects exit code 2 (kernel didn't build), skips verification
 #   - expected_marker: defaults to no-check (just confirms QEMU exits or
@@ -54,6 +55,20 @@ TIMEOUT=5
 BUILD_PANIC=0
 BUILD_EXC3=0
 UART_RX_MODE=0
+# R18-M1 #764: boot_smp knobs.
+#   SMP_MODE               — enable multicore QEMU launch (`-smp N`).
+#   SMP_CPU_COUNT          — how many CPUs QEMU exposes (BSP + APs).
+#                            Kernel's AP list is hard-coded to 3 APs
+#                            (ap_list.pdx), so 4 (= BSP + 3 APs) is the
+#                            R18.M1 default. Raising it needs the AP list
+#                            + N_APS to grow in lockstep (R20-M2 MADT
+#                            work).
+#   SMP_UNORDERED_HELLO    — treat CPU_ID_XX_HELLO fingerprint lines as
+#                            presence-only (no cross-AP ordering).
+#                            The BSP START / DONE bookends stay ordered.
+SMP_MODE=0
+SMP_CPU_COUNT=1
+SMP_UNORDERED_HELLO=0
 # #750 + #757: chardev-pipe injection knobs.
 #
 # Precedence:  caller env  >  mode-branch default  >  global fallback
@@ -326,6 +341,44 @@ case "${EXPECTED}" in
         : "${INJECT_HOLD:=10}"
         EXPECTED=""
         ;;
+    boot_smp)
+        # R18-M1-005 (#764): SMP bring-up smoke.
+        #
+        # Kernel wire-in (src/kernel/boot/kernel_main.pdx, post
+        # lapic_timer_init): BSP emits "SMP BRINGUP START", calls
+        # ap_bring_up_all with the hard-coded AP list
+        # (_ap_apic_ids = [1,2,3], _ap_count = 3), busy-waits ~333 ms
+        # for the last-woken AP to reach _ap_entry's uart_puts, then
+        # emits "SMP BRINGUP DONE". Each AP emits `CPU_ID_XX_HELLO`
+        # from _ap_entry (src/kernel/core/smp/ap_entry.pdx) with XX =
+        # 2-hex APIC ID (01/02/03 on `-smp 4`).
+        #
+        # QEMU topology: `-smp 4` = BSP (APIC ID 0) + 3 APs. Matches
+        # the hard-coded AP list. Growing beyond 4 requires the kernel
+        # AP list + N_APS in ap_stacks.pdx to bump together (R20.M2
+        # MADT-driven enumeration retires the hard-code).
+        #
+        # Fingerprint order handling: the BSP bookends
+        # (SMP BRINGUP START / DONE) are strictly ordered around the
+        # AP hellos. The three CPU_ID_XX_HELLO lines are
+        # presence-checked only — Intel MP-init spec allows the APs
+        # to leave the wait-for-SIPI state at slightly different
+        # times, and COM1 is unlocked (per ap_entry.pdx concurrency
+        # note), so their emission order on the wire is not
+        # guaranteed. SMP_UNORDERED_HELLO=1 tells the fingerprint
+        # checker to skip cross-AP ordering while still enforcing the
+        # bookends.
+        #
+        # NOT wired into pre-push yet (per #764 task discipline).
+        # Promotes to gated smoke after 5/5 consecutive passes.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r18/expected-boot-smp.txt"
+        TIMEOUT=10
+        SMP_MODE=1
+        SMP_CPU_COUNT=4
+        SMP_UNORDERED_HELLO=1
+        EXPECTED=""
+        ;;
     boot_panic)
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/logging/expected-panic-dump.txt"
@@ -506,6 +559,16 @@ if [[ ${UART_RX_MODE} -eq 1 ]]; then
     wait "${READER_PID}" 2>/dev/null || true
     rm -f "${FIFO_IN}" "${FIFO_OUT}"
 else
+    # R18-M1 #764: multicore launch when SMP_MODE=1. QEMU's `-smp N`
+    # exposes N logical CPUs to the guest; the kernel BSP boots first,
+    # then wakes SMP_CPU_COUNT-1 APs (assumes contiguous APIC IDs
+    # 1..N-1 — matches the QEMU default topology). Passing `-smp 1`
+    # (SMP_MODE=0 default) preserves the historical single-CPU launch
+    # byte-for-byte for every legacy mode.
+    SMP_ARGS=()
+    if [[ ${SMP_MODE} -eq 1 ]]; then
+        SMP_ARGS=(-smp "${SMP_CPU_COUNT}")
+    fi
     timeout ${TIMEOUT} qemu-system-x86_64 \
         -kernel "${KERNEL}" \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
@@ -514,6 +577,7 @@ else
         -no-reboot \
         -no-shutdown \
         -m 32M \
+        "${SMP_ARGS[@]}" \
         >/dev/null 2>&1
     QEMU_RC=$?
 fi
@@ -541,6 +605,22 @@ if [[ ${FINGERPRINT_MODE} -eq 1 ]]; then
         if [[ -z "${line}" ]]; then
             # Skip empty lines in fingerprint file
             continue
+        fi
+        # R18-M1 #764: boot_smp — CPU_ID_XX_HELLO lines are presence-
+        # only (no cross-AP ordering). Intel MP-init lets APs leave
+        # wait-for-SIPI at slightly different times, and COM1 is
+        # unlocked (ap_entry.pdx concurrency note), so on-wire order
+        # of the three AP HELLOs is not deterministic. Bookend lines
+        # (SMP BRINGUP START / DONE) still go through the ordered
+        # check below, anchoring the AP HELLOs between them.
+        if [[ ${SMP_UNORDERED_HELLO} -eq 1 && "${line}" =~ ^CPU_ID_[0-9a-f][0-9a-f]_HELLO$ ]]; then
+            if [[ "${log_content}" == *"${line}"* ]]; then
+                # Presence confirmed; do NOT advance search_offset (unordered).
+                continue
+            else
+                echo "smoke: unordered fingerprint line ${line_num} ('${line}') NOT found anywhere in serial log (log size: $(stat -c%s "${LOG}" 2>/dev/null || echo 0))" >&2
+                exit 1
+            fi
         fi
         # #673: search remaining log starting at search_offset (real ordered check)
         remaining="${log_content:search_offset}"
