@@ -1,0 +1,197 @@
+// src/kernel/core/smp/ap_launch.pdx — R18-M1-003 / #762
+// BSP-side AP bring-up orchestrator: install trampoline, patch slots,
+// walk AP list, wake each.
+//
+// Issue: paideia-os/paideia-os#762
+//
+// Exports:
+//   ap_trampoline_patch(pml4_pa: u64, stack_top: u64, entry_va: u64)
+//     Patches the three parameter slots at the pinned trampoline
+//     physical address 0x8000 with:
+//        +0xb8  pml4_pa   (u32; low 32 bits used — kernel PML4 sits
+//                          below 4 GiB per boot_stub.S layout)
+//        +0xc0  stack_top (u64; per-AP kernel-stack top from ApStacks)
+//        +0xc8  entry_va  (u64; kernel higher-half VA of _ap_entry)
+//     Offsets and pin address are baked into tools/ap_trampoline.S at
+//     assembly time (VMA = 0x8000, slot offsets emitted via .set
+//     `_ap_trampoline_{pml4,stack,entry}_offset`). This module keeps
+//     literal copies matched by comment discipline — kept in lockstep
+//     with the .S source of truth. If the .S offsets change, either
+//     these literals or the build-time offset extraction path in
+//     tools/build.sh must be updated in the same commit.
+//
+//   ap_bring_up_all(id_list_ptr: u64, count: u64)
+//     Full BSP-side bring-up loop for the AP APIC-ID list:
+//       1. ap_trampoline_install(AP_TRAMPOLINE_PA) — memcpy the blob
+//          into the pinned low-memory frame.
+//       2. For each apic_id in id_list[0..count):
+//            a. Compute per-AP stack via ap_stack_top(cpu_idx).
+//            b. Patch pml4 / stack / entry slots via
+//               ap_trampoline_patch(_kernel_pml4_pa, stack, _ap_entry).
+//            c. Wake via ap_wake_one(apic_id, AP_TRAMPOLINE_PA).
+//              (ap_wake_one internally handles INIT + 10 ms wait +
+//              SIPI + 200 us wait + second SIPI per Intel MP-init
+//              spec §B.4. The 10 ms delay is comfortably longer than
+//              the AP needs to consume the slot bytes and enter
+//              long mode, so overwriting the slots for the next AP
+//              before that AP wakes is safe by construction.)
+//       The loop's cpu_idx counter is decoupled from apic_id — a
+//       sparse APIC-ID list (e.g. {0, 4, 8, 12} on a 4-socket box)
+//       still gets dense per-CPU stack slots [0, N_APS).
+//
+// Not-a-witness note: like the rest of R18.M1, this issue lands the
+// orchestrator only; kernel_main.pdx does NOT call ap_bring_up_all
+// yet. The wiring lives in #764 (boot_smp smoke), which stubs a
+// small AP list (BSP-adjacent APIC IDs) and observes the per-AP
+// `CPU_ID_XX_HELLO` fingerprint emitted by _ap_entry.
+//
+// Encoder: paideia-as v0.20.1+. Uses mov imm64, mov_d [mem], reg (for
+// the u32 pml4 slot), mov [mem], reg (for the two u64 slots), and
+// standard call/ret/loop primitives. All in-tree; no encoder work.
+
+module ApLaunch = structure {
+  // Pinned trampoline physical address. Matches tools/ap_trampoline.ld
+  // VMA and the `_ap_trampoline_start` linkage — the blob is
+  // position-DEPENDENT, so any change here requires re-linking the .S.
+  pub let AP_TRAMPOLINE_PA         : u64 = 0x8000
+
+  // Trampoline parameter-slot byte offsets. Kept in lockstep with
+  // tools/ap_trampoline.S (source of truth). Verified against
+  // build/ap_trampoline.elf at HEAD:
+  //   _ap_trampoline_pml4_offset   = 0xb8
+  //   _ap_trampoline_stack_offset  = 0xc0
+  //   _ap_trampoline_entry_offset  = 0xc8
+  // The build-time extraction in tools/build.sh (auto-generated
+  // ap_trampoline_offsets.o) exports these same values as ABS symbols
+  // for consumers that want to link against them; here we bake the
+  // literals directly so this module has no cross-object dependency
+  // on the .S offsets — a deliberate defensive choice while paideia-as
+  // symbol-immediate encoding for ABS ELF symbols is unverified.
+  pub let AP_TRAMPOLINE_PML4_OFF   : u64 = 0xb8
+  pub let AP_TRAMPOLINE_STACK_OFF  : u64 = 0xc0
+  pub let AP_TRAMPOLINE_ENTRY_OFF  : u64 = 0xc8
+
+  // Absolute VAs of the three slots (AP_TRAMPOLINE_PA + offset). The
+  // kernel PML4 identity-maps [0, 4 GiB) via PDPT[0..3] 1-GiB pages
+  // (boot_stub.S), so VA == PA for these addresses under kernel CR3.
+  pub let AP_SLOT_PML4_VA          : u64 = 0x80b8
+  pub let AP_SLOT_STACK_VA         : u64 = 0x80c0
+  pub let AP_SLOT_ENTRY_VA         : u64 = 0x80c8
+
+  // ============================================================================
+  // ap_trampoline_patch(pml4_pa, stack_top, entry_va)
+  // ============================================================================
+  // Writes the three parameter slots in the installed trampoline blob.
+  // MUST be called AFTER ap_trampoline_install (so the blob is at
+  // 0x8000) and BEFORE ap_wake_one for the AP that will consume the
+  // slots. Between two ap_trampoline_patch calls (one per AP),
+  // ap_wake_one interposes a 10 ms + 200 us delay — the AP has long
+  // finished slot reads by the time the next patch fires.
+  //
+  // Callee-clobber: RAX, RCX. RDI/RSI/RDX consumed. No callee-save
+  // registers touched (leaf, no frame).
+  pub let ap_trampoline_patch : (u64, u64, u64) -> () !{mem} @{boot} =
+    fn (pml4_pa: u64, stack_top: u64, entry_va: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "#762 R18-M1-003: patch the three parameter slots inside the AP boot trampoline blob at pinned physical address 0x8000. RDI = pml4_pa (kernel PML4 physical, expected < 4 GiB), RSI = stack_top (per-AP kernel-stack top VA), RDX = entry_va (kernel VA of _ap_entry). Slots are: (a) pml4 slot at 0x80b8 written 32-bit via mov_d [rax], ecx — the trampoline's .code32 CR3 load reads a 32-bit value; the kernel PML4 lives in .bss.boot below 4 GiB so truncating RDI to its low 32 bits is safe by boot layout convention. (b) stack slot at 0x80c0 written 64-bit via mov [rax], rcx — trampoline's .code64 preamble does `mov ap_stack_slot(%rip), %rsp` (64-bit). (c) entry slot at 0x80c8 written 64-bit — trampoline's `mov ap_entry_slot(%rip), %rax; jmp *%rax` reads it. VA == PA for these addresses under kernel CR3 because kernel PML4 identity-maps low 4 GiB via PDPT[0..3] 1-GiB pages (boot_stub.S) — no VA translation required. Register discipline: value copied into RCX per LAPIC-MMIO idiom (mov_d [rax], rcx pattern established by init_sipi.pdx / tpr.pdx / lapic_timer.pdx), staged serially so RDI/RSI/RDX are stashed via callee-save R12/R13 only if needed. Here we can shuffle in order RDX -> RSI -> RDI without extra spills because writes are strictly sequential and no call intervenes. Leaf, no frame.",
+      block: {
+        // ---- Slot 1: pml4 (u32) at 0x80b8 ----
+        mov rcx, rdi;                        // rcx = pml4_pa
+        mov rax, 0x80b8;                     // AP_SLOT_PML4_VA
+        mov_d [rax], rcx;                    // 32-bit store, ECX truncated
+
+        // ---- Slot 2: stack top (u64) at 0x80c0 ----
+        mov rcx, rsi;                        // rcx = stack_top
+        mov rax, 0x80c0;                     // AP_SLOT_STACK_VA
+        mov [rax], rcx;                      // 64-bit store
+
+        // ---- Slot 3: entry va (u64) at 0x80c8 ----
+        mov rcx, rdx;                        // rcx = entry_va
+        mov rax, 0x80c8;                     // AP_SLOT_ENTRY_VA
+        mov [rax], rcx;                      // 64-bit store
+
+        ret
+      }
+    }
+
+  // ============================================================================
+  // ap_bring_up_all(id_list_ptr, count)
+  // ============================================================================
+  // Full BSP-side bring-up orchestrator: install trampoline (once),
+  // then for each APIC ID patch slots + wake. See header block for
+  // per-step commentary.
+  //
+  // Register discipline: 5 callee-save pushes (rbx, r12, r13, r14, r15)
+  // to hold loop state across the inner call chain
+  // (ap_trampoline_install, ap_stack_top, ap_trampoline_patch,
+  // ap_wake_one) — each of these routinely clobbers RDI/RSI/RDX and
+  // several caller-save temporaries. 5 pushes = rsp % 16 == 0 at
+  // call boundaries, matching SysV.
+  //
+  // count = 0 is a valid no-op (matches ap_wake_all's discipline in
+  // ap_boot.pdx — safe to call before an AP list is populated).
+  pub let ap_bring_up_all : (u64, u64) -> () !{mem, sysreg} @{boot} =
+    fn (id_list_ptr: u64, count: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { boot },
+      justification: "#762 R18-M1-003: full BSP-side AP bring-up orchestrator. Given a u32[count] APIC-ID array at RDI, walks the list and for each AP: (1) computes the per-AP kernel-stack top via ap_stack_top(cpu_idx); (2) patches the trampoline pml4/stack/entry slots at 0x8000 via ap_trampoline_patch(_kernel_pml4_pa, stack_top, _ap_entry); (3) issues INIT-SIPI-SIPI via ap_wake_one(apic_id, 0x8000). The trampoline is installed once at loop entry via ap_trampoline_install(0x8000). Loop state: R12 = current entry ptr (u32*), R13 = remaining count, R14 = cpu_idx counter (dense, 0..N_APS-1 — decoupled from APIC-ID value so a sparse APIC space still gets contiguous stack slots), R15 = saved apic_id across the compute-stack + patch calls, RBX = saved stack_top across the patch call. APIC ID is read 32-bit zero-extend (mov ecx, [r12]) matching xAPIC ID width; x2APIC's full 32-bit ID uses the same slot. The kernel PML4 PA is read from _kernel_pml4_pa (populated at BSP boot in kernel_main.pdx per R14.M4-004 #500) — identity map means VA == PA here so no translation needed at the trampoline's .code32 CR3 load. _ap_entry's VA is captured via `lea rdx, [rip + _ap_entry]` — a canonical higher-half kernel VA that becomes the target of the trampoline's `mov ap_entry_slot(%rip), %rax; jmp *%rax`. Between two per-AP iterations, ap_wake_one internally waits ~10 ms after INIT + ~200 us between the two SIPIs; the AP consumes the slot bytes within microseconds of leaving WFS, so a subsequent patch for the next AP cannot race the previous AP's read. count = 0 is a valid no-op: the loop body checks R13 == 0 before any dereference; passing id_list_ptr = 0 with count > 0 is caller error and dereferences null. 5-push callee-save prologue (rbx, r12-r15) covers all state carried across the inner calls; rsp aligned at 16 on each call. Emits no witness line — that lives in #764's boot_smp smoke, which will publish the CPU_ID_XX_HELLO per-AP fingerprint emitted by _ap_entry.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // Save loop state.
+        mov r12, rdi;                        // r12 = id_list_ptr
+        mov r13, rsi;                        // r13 = remaining count
+        xor r14, r14;                        // r14 = cpu_idx = 0
+
+        // Install the trampoline blob at 0x8000 (once for the whole loop).
+        mov rdi, 0x8000;
+        call ap_trampoline_install;
+
+        ap_bring_up_loop:
+          cmp r13, 0;
+          je ap_bring_up_done;
+
+          // ---- Read u32 APIC ID at [r12] ----
+          mov ecx, [r12];
+          mov r15, rcx;                      // r15 = apic_id (u32 zero-extended)
+
+          // ---- Compute per-AP stack top: ap_stack_top(cpu_idx) ----
+          mov rdi, r14;
+          call ap_stack_top;
+          mov rbx, rax;                      // rbx = stack_top
+
+          // ---- Patch trampoline slots for this AP ----
+          //   pml4_pa   = [rip + _kernel_pml4_pa]
+          //   stack_top = rbx
+          //   entry_va  = &_ap_entry
+          mov rdi, [rip + _kernel_pml4_pa];
+          mov rsi, rbx;
+          lea rdx, [rip + _ap_entry];
+          call ap_trampoline_patch;
+
+          // ---- Wake this AP ----
+          mov rdi, r15;                      // apic_id
+          mov rsi, 0x8000;                   // trampoline_phys
+          call ap_wake_one;
+
+          // ---- Advance ----
+          add r12, 4;                        // next u32 slot
+          sub r13, 1;                        // one AP done
+          add r14, 1;                        // next dense cpu_idx
+          jmp ap_bring_up_loop;
+
+        ap_bring_up_done:
+          pop r15;
+          pop r14;
+          pop r13;
+          pop r12;
+          pop rbx;
+          ret
+      }
+    }
+}
