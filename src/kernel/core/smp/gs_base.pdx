@@ -1,0 +1,246 @@
+// src/kernel/core/smp/gs_base.pdx — R18-M2-002 / #766
+// IA32_GS_BASE + IA32_KERNEL_GS_BASE programming per-CPU.
+//
+// Issue: paideia-os/paideia-os#766
+//
+// Purpose:
+//   Program the two GS-family MSRs (IA32_GS_BASE = 0xC0000101 and
+//   IA32_KERNEL_GS_BASE = 0xC0000102) so that:
+//     (a) any `[gs:off]` load in kernel-mode resolves against the current
+//         CPU's per-CPU control block (`Percpu._percpu_cbs[cpu_idx]`), and
+//     (b) after a `swapgs` on the kernel-entry path (SYSCALL / ISR) the
+//         value that lands in GS_BASE is *still* the current CPU's CB —
+//         i.e. KERNEL_GS_BASE mirrors GS_BASE at boot time so the first
+//         user-mode → kernel-mode swap does not clobber the per-CPU
+//         pointer with a stale placeholder (previously the value of
+//         `Msr._cpu0_kernel_gs` programmed by `syscall_msr_init`).
+//
+// Design reference:
+//   design/multicore/per-cpu-layout.md (R14b `cpu_local_t`, superseded by
+//   `Percpu.PerCpu` in #765).
+//   design/multicore/swapgs-audit.md (this issue — enumerates every
+//   `swapgs` site and verifies pairing).
+//
+// Interaction with `Msr.syscall_msr_init`:
+//   `syscall_msr_init` (core/syscall/msr.pdx L58-63) writes
+//   IA32_KERNEL_GS_BASE = &_cpu0_kernel_gs — a legacy 16-byte BSP-only
+//   placeholder from R13-m5-001. This module's `gs_base_init_bsp` MUST
+//   run AFTER `syscall_msr_init` so its own write to 0xC0000102 wins
+//   (the placeholder is deliberately left in place to keep the syscall-
+//   ABI installation self-contained; a later cleanup can retire it).
+//
+// AP-side cpu_idx derivation:
+//   AP hardware provides the APIC ID (readable at xAPIC MMIO 0xFEE00020
+//   bits [31:24]). The dense logical `cpu_idx` used by
+//   `Percpu.percpu_cb_for` is *not* directly available to the AP — the
+//   BSP-side orchestrator (`ap_bring_up_all` in ap_launch.pdx) enumerates
+//   APs by walking `_ap_apic_ids` (ap_list.pdx) but does not stamp the
+//   mapping back into the AP's execution environment (a trampoline-slot
+//   extension is R20 scope). This module closes the gap with a linear
+//   search of `_ap_apic_ids` on the AP itself:
+//
+//     cpu_idx(apic_id) = 1 + index_of(apic_id, _ap_apic_ids)
+//     BSP special case: cpu_idx = 0 (via gs_base_init_bsp, not this path)
+//
+//   The +1 offset reserves `_percpu_cbs[0]` for the BSP so all four
+//   `MAX_CPUS` slots (BSP=0, AP1=1, AP2=2, AP3=3) map 1:1 to a distinct
+//   CB. For QEMU's default `-smp N` topology (BSP APIC 0, APs APIC 1..N-1)
+//   this yields `cpu_idx == apic_id` — the AP-side witness `GS_OK_XX`
+//   emitted after WRMSR reads the u32 at `[gs:0]` (via rdmsr to sidestep
+//   the missing `[gs:disp32]` encoder) and formats it as hex, so
+//   observers see it match the LAPIC-ID printout `CPU_ID_XX_HELLO`.
+//
+//   If the search misses (apic_id not in `_ap_apic_ids`), the AP falls
+//   back to cpu_idx = 0 (BSP's slot) — a caller bug this early in
+//   bring-up cannot be diagnostically recovered (no IDT yet, no klog),
+//   matching the discipline in ap_stack_top / percpu_cb_for.
+//
+// Not-a-witness note:
+//   `gs_base_init_bsp` is wired from `kernel_main.boot_continue_after_ring3`
+//   (immediately after `syscall_msr_init`); `gs_base_init_ap` is wired
+//   from `ApEntry._ap_entry` (immediately before the CPU_ID hello emit).
+//   The R14b-m5-002 `wrmsr` block against `_cpu_locals` in kernel_main is
+//   retired by the same commit.
+//
+// Encoder: paideia-as v0.20.1+. Uses call/ret, mov/lea/shl/add, rdmsr,
+// wrmsr, cmp/je/jmp. No new encoder work — all primitives in-tree.
+
+module GsBase = structure {
+  // IA32_GS_BASE (Intel SDM Vol 4 §2.5.1) — current-CPU GS segment base.
+  pub let IA32_GS_BASE        : u64 = 0xC0000101
+  // IA32_KERNEL_GS_BASE (Intel SDM Vol 4 §2.5.1) — the value SWAPGS
+  // exchanges with GS_BASE. In kernel mode this holds "what will become
+  // GS_BASE on the next swapgs → sysret/iretq to user"; symmetrically,
+  // user mode carries the kernel per-CPU CB here so the next syscall/ISR
+  // swapgs restores it.
+  pub let IA32_KERNEL_GS_BASE : u64 = 0xC0000102
+
+  // ==========================================================================
+  // gs_base_init_bsp() -> ()
+  //   Seed the BSP's per-CPU control block (_percpu_cbs[0]) via
+  //   `percpu_init(0, 0)`, then WRMSR both GS-family MSRs with its VA so
+  //   every subsequent [gs:off] read (including the first swapgs from a
+  //   future user-mode entry) resolves to that CB.
+  //
+  //   Callee-clobber: RAX, RCX, RDX. Preserves callee-save regs across
+  //   the two inner calls (percpu_init, percpu_cb_for) via 1 push (rbx)
+  //   which lands rsp % 16 == 0 at each nested call boundary
+  //   (return-addr push made rsp % 16 == 8; +rbx = 16-aligned).
+  //   rbx holds the CB VA across the second wrmsr so we do not have to
+  //   round-trip through memory.
+  // ==========================================================================
+  pub let gs_base_init_bsp : () -> () !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "#766 R18-M2-002 (BSP side): (1) percpu_init(0, 0) seeds _percpu_cbs[0] with the three identity fields (cpu_idx=0, apic_id=0, self_ptr=&CB0) per #765; (2) percpu_cb_for(0) returns &CB0 in rax; (3) WRMSR IA32_GS_BASE = &CB0 makes gs:[off] resolve there for all subsequent kernel code (Intel SDM Vol 3A §3.4.4 — 64-bit segment base is read from IA32_GS_BASE MSR when GS is used, ignoring the descriptor base); (4) WRMSR IA32_KERNEL_GS_BASE = &CB0 mirrors the value so the first swapgs on a future user→kernel entry does not overwrite GS_BASE with the legacy _cpu0_kernel_gs placeholder that syscall_msr_init leaves there. Must run AFTER syscall_msr_init to win the KERNEL_GS_BASE write. WRMSR takes EDX:EAX (value halves) with MSR index in ECX (Intel SDM Vol 2C §5.2.10) — the standard pattern (mov rdx, rax; shr rdx, 32; mov rcx, INDEX; wrmsr) matches the R14b-m5-002 sequence being retired and the existing sites in kernel/core/syscall/msr.pdx. rbx is callee-save under SysV AMD64 so we spill/reload the CB VA across the two calls; single push aligns rsp % 16 at each nested call boundary. Effect row: {sysreg, mem} — sysreg for the two WRMSRs, mem for the percpu_init stores (_percpu_cbs .bss). {boot} capability restricts this to BSP bring-up.",
+      block: {
+        push rbx;
+
+        // (1) percpu_init(0, 0) — seed _percpu_cbs[0].
+        mov rdi, 0;
+        mov rsi, 0;
+        call percpu_init;
+
+        // (2) rax = percpu_cb_for(0) = &_percpu_cbs[0]
+        mov rdi, 0;
+        call percpu_cb_for;
+        mov rbx, rax;                      // stash CB VA for step (4)
+
+        // (3) WRMSR IA32_GS_BASE = rax
+        mov rdx, rax;
+        shr rdx, 32;
+        mov rcx, 0xC0000101;
+        wrmsr;
+
+        // (4) WRMSR IA32_KERNEL_GS_BASE = rbx (same VA — kernel-only OS
+        // at this phase; when userland gains its own TLS base this write
+        // is either retired or swapped for the user TLS base).
+        mov rax, rbx;
+        mov rdx, rbx;
+        shr rdx, 32;
+        mov rcx, 0xC0000102;
+        wrmsr;
+
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gs_base_init_ap(apic_id: u64) -> ()
+  //   AP-side twin of gs_base_init_bsp:
+  //     (a) derive dense cpu_idx by linear search of _ap_apic_ids,
+  //     (b) percpu_init(cpu_idx, apic_id),
+  //     (c) WRMSR IA32_GS_BASE = &CB[cpu_idx],
+  //     (d) WRMSR IA32_KERNEL_GS_BASE = same.
+  //
+  //   Called from ApEntry._ap_entry with rdi = apic_id (already read from
+  //   xAPIC MMIO 0xFEE00020). Must run BEFORE any [gs:off] access on this
+  //   AP (which today means: before the CPU_ID_XX_HELLO fingerprint emit
+  //   is fine because uart_puts is APIC-ID-agnostic and does not touch GS,
+  //   and before the halt loop's cli/hlt which never touches memory).
+  //
+  //   Register discipline: 3 callee-save pushes (r12, r13, r14) keep rsp
+  //   16-aligned at every nested call boundary (return-addr push made
+  //   rsp % 16 == 8; +3 pushes = 16-aligned). r12 = apic_id, r13 = derived
+  //   cpu_idx, r14 = CB VA across the second WRMSR.
+  // ==========================================================================
+  pub let gs_base_init_ap : (u64) -> () !{sysreg, mem} @{boot} =
+    fn (apic_id: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "#766 R18-M2-002 (AP side): (1) derive dense cpu_idx via linear search of _ap_apic_ids (u32[3]) — cpu_idx = index_in_list + 1 (offset so BSP's slot 0 is reserved). Loop uses r14 as element cursor, r13 as counter, r12 as saved apic_id. u32 loads via `mov ecx, [r14]` (zero-extended into rcx per x86-64) then compare against saved apic_id in r12. Not-found: fall back to cpu_idx=0 (BSP slot — a defensive choice that avoids computing an out-of-pool CB VA that would corrupt neighbouring .bss). (2) percpu_init(cpu_idx, apic_id) seeds this AP's CB with its identity fields — same contract as BSP-side. (3) percpu_cb_for(cpu_idx) returns the CB VA; stash in r14 for the second wrmsr. (4) WRMSR IA32_GS_BASE = &CB[cpu_idx] — from this point on this AP's kernel-mode code that does [gs:off] resolves against its own CB, not the BSP's. (5) WRMSR IA32_KERNEL_GS_BASE = same — symmetric with BSP-side rationale; the AP has no userland today so no user-TLS-base distinction is needed. Ordering: percpu_init before the WRMSRs so the CB storage is initialised before it becomes reachable via gs. 3 callee-save pushes (r12/r13/r14) satisfy SysV rsp % 16 == 0 at each of the two nested `call` sites (percpu_init, percpu_cb_for). Effect row: {sysreg, mem} matches BSP-side. {boot} capability restricts this to AP bring-up.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        // r12 = apic_id (saved across calls)
+        mov r12, rdi;
+
+        // ---- Linear search: find apic_id in _ap_apic_ids[0..3) ----
+        // r13 = counter (0..3), r14 = cursor pointer
+        xor r13, r13;
+        lea r14, [rip + _ap_apic_ids];
+
+        gs_ap_search:
+          cmp r13, 3;
+          je gs_ap_bsp_fallback;
+          mov ecx, [r14];                    // u32 load, zero-extended
+          cmp rcx, r12;
+          je gs_ap_found;
+          add r14, 4;                        // sizeof(u32)
+          add r13, 1;
+          jmp gs_ap_search;
+
+        gs_ap_bsp_fallback:
+          xor r13, r13;                      // cpu_idx = 0 (safe fallback)
+          jmp gs_ap_init;
+
+        gs_ap_found:
+          add r13, 1;                        // cpu_idx = index + 1
+
+        gs_ap_init:
+          // (2) percpu_init(cpu_idx=r13, apic_id=r12)
+          mov rdi, r13;
+          mov rsi, r12;
+          call percpu_init;
+
+          // (3) rax = percpu_cb_for(cpu_idx=r13)
+          mov rdi, r13;
+          call percpu_cb_for;
+          mov r14, rax;                      // stash CB VA
+
+          // (4) WRMSR IA32_GS_BASE = rax
+          mov rdx, rax;
+          shr rdx, 32;
+          mov rcx, 0xC0000101;
+          wrmsr;
+
+          // (5) WRMSR IA32_KERNEL_GS_BASE = r14
+          mov rax, r14;
+          mov rdx, r14;
+          shr rdx, 32;
+          mov rcx, 0xC0000102;
+          wrmsr;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gs_base_read_cpu_idx() -> u64
+  //   Diagnostic accessor for the AP-side witness: returns the low 32 bits
+  //   of _percpu_cbs[current_cpu] + PERCPU_OFF_CPU_IDX (i.e. the cpu_idx
+  //   field of the per-CPU CB pointed to by GS_BASE).
+  //
+  //   Implemented via rdmsr rather than `mov eax, [gs:reg + 0]` because
+  //   paideia-as's `[gs:disp32-only]` encoding is not yet supported
+  //   (per CHANGELOG PA-R13-002: `[gs:reg+disp]` works but the no-base
+  //   form does not) and we would rather not carry a zero-register
+  //   idiom into the witness path — rdmsr is single-instruction-simple
+  //   and matches Local.cpu_local_get's existing pattern. Once
+  //   `[gs:disp32]` lands (PA followup), this body reduces to a single
+  //   `mov eax, [gs:0]` and this helper can be inlined.
+  //
+  //   Returns cpu_idx zero-extended in RAX. Leaf.
+  // ==========================================================================
+  pub let gs_base_read_cpu_idx : () -> u64 !{sysreg, mem} @{} =
+    fn () -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "#766 witness helper: rdmsr IA32_GS_BASE into rax (EDX:EAX combine — SDM Vol 2C §5.2.9), then load u32 at [rax + 0] (PERCPU_OFF_CPU_IDX per Percpu layout). This validates the AP-side WRMSR landed: the value read equals the cpu_idx the AP thought it was assigning to itself in gs_base_init_ap, and equals its APIC ID (for QEMU default topology where cpu_idx == apic_id). Effect row: {sysreg} for rdmsr, {mem} for the CB load. Leaf function, no callee-save clobber. Uses `mov eax, [rax]` (32-bit load, zero-extends into rax) to fetch the u32 cpu_idx.",
+      block: {
+        mov rcx, 0xC0000101;
+        rdmsr;
+        shl rdx, 32;
+        or rax, rdx;
+        mov eax, [rax];                      // load u32 at +0 (cpu_idx)
+        ret
+      }
+    } @no_frame
+}
