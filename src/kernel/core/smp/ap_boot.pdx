@@ -1,0 +1,197 @@
+// src/kernel/core/smp/ap_boot.pdx — R18-M1-001 / #760
+// BSP-driven AP wake orchestrator: INIT-SIPI-SIPI sequence with spec delays.
+// Issue: paideia-os/paideia-os#760
+//
+// Exports:
+//   ap_tsc_busy_wait(cycles: u64)
+//     Poll rdtsc until `cycles` TSC ticks have elapsed. `pause` in the loop
+//     to give the pipeline a hint. Used only as boot-time coarse delay —
+//     R18.M4/M5 will replace this with an HPET/TSC-deadline-based primitive
+//     once those subsystems are ready. Not intended for sub-microsecond
+//     precision.
+//
+//   ap_wake_one(apic_id: u64, trampoline_phys: u64)
+//     Executes the Intel MP-init spec §B.4 wake sequence for a single AP:
+//       1. INIT IPI (Assert, physical dest).
+//       2. Wait ~10 ms.
+//       3. SIPI (Assert, vector = trampoline_phys >> 12).
+//       4. Wait ~200 us.
+//       5. SIPI (same params — second SIPI is a no-op if the AP already
+//          left the wait-for-startup-IPI state; spec-mandated for legacy
+//          APs that missed the first).
+//     After step 5 the AP is executing in real mode at
+//     CS:IP = (vector << 8):0000. Trampoline (#761) must handle the
+//     real -> protected -> long-mode transition and jump into the kernel.
+//
+//   ap_wake_all(id_list_ptr: u64, count: u64, trampoline_phys: u64)
+//     Iterates `count` u32 APIC IDs at `id_list_ptr`, calling ap_wake_one
+//     on each. This is the entry point kernel_main (or an MADT-driven
+//     ap-init module in R20) will call once BSP boot is stable.
+//     Passing count = 0 is a no-op — safe to call before an AP list is
+//     populated. That is the current state at R18.M1 close (this issue):
+//     no MADT parsing yet + no #761 trampoline yet, so no call site is
+//     wired. #764 will publish a boot_smp smoke that wires ap_wake_all
+//     with a stub AP list once #761 lands the trampoline blob.
+//
+// TSC-cycle constants (QEMU TCG exposes host TSC directly, no --icount):
+//   The 10 ms and 200 us Intel-spec spacings are elastic — a slower host
+//   over-delays; a faster host still meets the lower bound. What matters
+//   is meeting the MINIMUM per spec. We pick generous upper bounds:
+//     AP_INIT_DELAY_TSC       = 40_000_000  (~13 ms at 3 GHz; ~40 ms at 1 GHz)
+//     AP_SIPI_DELAY_TSC       = 1_000_000   (~330 us at 3 GHz; ~1 ms at 1 GHz)
+//   Real hardware calibration (multiplying by measured TSC freq / bus freq)
+//   is R30 scope (time-subsystem hardening). Under QEMU-TCG this is safe.
+//
+// Encoder: paideia-as v0.20.1+. Uses rdtsc, shl/or/sub, cmp/jump, call/ret,
+// pause. All ambient primitives already in-tree.
+//
+// Not-a-witness note: per parent task directive, this issue lands the
+// driver code only; no runtime call is wired from kernel_main.pdx. The
+// AP wake AC log line ("IPI SIPI dispatched to AP <apic_id>") is deferred
+// to the boot_smp smoke issue (#764) where MADT/AP-list and the real
+// trampoline (#761) will be integrated. Landing this driver first keeps
+// #764 free of encoder/primitive concerns.
+
+module ApBoot = structure {
+  // TSC-cycle delay constants. See header block for rationale.
+  let AP_INIT_DELAY_TSC   : u64 = 40000000
+  let AP_SIPI_DELAY_TSC   : u64 = 1000000
+
+  // ============================================================================
+  // ap_tsc_busy_wait(cycles) — coarse boot-time delay
+  // ============================================================================
+  // RDI = number of TSC ticks to wait. Reads TSC, adds RDI to get deadline,
+  // spins with `pause` until TSC crosses the deadline. Wraparound-safe over
+  // the 4-billion-year TSC epoch (i.e., not at all — but current TSC + 40M
+  // ticks on a 64-bit counter has no realistic overflow window).
+  //
+  // Callee-clobber: RAX, RCX, RDX. RDI consumed. Preserves R12-R15.
+  pub let ap_tsc_busy_wait : (u64) -> () !{sysreg} @{boot} =
+    fn (cycles: u64) -> unsafe {
+      effects: { sysreg },
+      capabilities: { boot },
+      justification: "#760 R18-M1-001: coarse boot-time TSC busy-wait. Reads TSC via rdtsc (EDX:EAX), assembles into R8, adds RDI (delta) to form deadline in R9. Loop: rdtsc; reassemble into RAX; cmp against R9; jb wait. Emits `pause` inside the poll to hint the CPU's pipeline (mitigates power-draw + gives an SMT sibling breathing room; harmless on TCG). Wraparound is a non-concern (64-bit TSC + 40M-tick delta = ~13 ms at 3 GHz; no realistic overflow). This helper is boot-only and is superseded by HPET/TSC-deadline primitives at R21+; not for general-purpose latency-sensitive delays. Callee-preserves R12-R15 by never touching them. Callee-clobbers RAX/RCX/RDX per SysV.",
+      block: {
+        // Snapshot start TSC into R8.
+        rdtsc;
+        shl rdx, 32;
+        or rax, rdx;
+        mov r8, rax;
+
+        // Deadline = start + delta.
+        mov r9, r8;
+        add r9, rdi;
+
+        ap_wait_loop:
+          pause;
+          rdtsc;
+          shl rdx, 32;
+          or rax, rdx;
+          cmp rax, r9;
+          jb ap_wait_loop;
+          ret
+      }
+    }
+
+  // ============================================================================
+  // ap_wake_one(apic_id, trampoline_phys)
+  // ============================================================================
+  // Intel MP-init spec §B.4 INIT-SIPI-SIPI sequence for a single AP.
+  //
+  // Callee-clobber: everything SysV allows. RDI, RSI consumed on entry;
+  // saved into callee-save R14/R15 for the multi-step sequence.
+  pub let ap_wake_one : (u64, u64) -> () !{sysreg, mem} @{boot} =
+    fn (apic_id: u64, trampoline_phys: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "#760 R18-M1-001: BSP-side AP wake orchestrator for a single AP. Executes Intel MP-init spec §B.4: (1) INIT IPI via lapic_send_init_ipi(apic_id); (2) ~10 ms wait via ap_tsc_busy_wait(AP_INIT_DELAY_TSC); (3) first SIPI via lapic_send_startup_ipi(apic_id, trampoline_phys); (4) ~200 us wait via ap_tsc_busy_wait(AP_SIPI_DELAY_TSC); (5) redundant second SIPI (spec §B.4.2 note: second SIPI covers legacy APs that missed the first; AP already in real-mode ignores duplicate). Saves apic_id in R14, trampoline_phys in R15 (SysV callee-save) across the three inner calls + two waits — otherwise RDI/RSI would be clobbered by ap_tsc_busy_wait's rdtsc / lapic_send_init_ipi's mov chain. sub rsp,8/add rsp,8 keeps the ABI 16-byte alignment before/after external calls. Emits no witness line — that lives in #764's boot_smp smoke. Preconditions: apic_enable + apic_svr_enable + apic_tpr_init already called (BSP boot). trampoline_phys MUST be in low 1 MiB on 4 KiB boundary (enforced by caller / #761).",
+      block: {
+        // Save callee-preserved registers we're about to reuse.
+        push r14;
+        push r15;
+
+        // Preserve (apic_id, trampoline_phys) across inner calls.
+        mov r14, rdi;                        // r14 = apic_id
+        mov r15, rsi;                        // r15 = trampoline_phys
+
+        // Realign stack (2 pushes → 16-byte aligned; no adjustment needed).
+
+        // ---- Step 1: INIT IPI ----
+        mov rdi, r14;
+        call lapic_send_init_ipi;
+
+        // ---- Step 2: wait ~10 ms ----
+        mov rdi, 40000000;                   // AP_INIT_DELAY_TSC
+        call ap_tsc_busy_wait;
+
+        // ---- Step 3: first SIPI ----
+        mov rdi, r14;
+        mov rsi, r15;
+        call lapic_send_startup_ipi;
+
+        // ---- Step 4: wait ~200 us ----
+        mov rdi, 1000000;                    // AP_SIPI_DELAY_TSC
+        call ap_tsc_busy_wait;
+
+        // ---- Step 5: second (redundant) SIPI ----
+        mov rdi, r14;
+        mov rsi, r15;
+        call lapic_send_startup_ipi;
+
+        pop r15;
+        pop r14;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // ap_wake_all(id_list_ptr, count, trampoline_phys)
+  // ============================================================================
+  // Iterates `count` u32 APIC IDs at [id_list_ptr, id_list_ptr + 4*count),
+  // calling ap_wake_one on each. u32-per-entry matches the xAPIC ID width;
+  // x2APIC's full 32-bit IDs use the same slot. Reads via mov ecx, [ptr]
+  // (zero-extended into RCX).
+  //
+  // Passing count = 0 is a no-op. Passing id_list_ptr = 0 with count > 0
+  // is undefined behavior (caller responsibility).
+  //
+  // Callee-clobber: essentially everything. Preserves R12-R15 by push/pop.
+  pub let ap_wake_all : (u64, u64, u64) -> () !{sysreg, mem} @{boot} =
+    fn (id_list_ptr: u64, count: u64, trampoline_phys: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "#760 R18-M1-001: iterate APIC ID array and wake each AP. id_list_ptr (RDI) points at a u32[count] array of physical APIC IDs (xAPIC 8-bit values sit in the low byte; x2APIC 32-bit values use the full word — xAPIC ICR path in init_sipi.pdx masks to the low 8 anyway). count (RSI) is the number of entries; count = 0 is a valid no-op. trampoline_phys (RDX) is the common wake vector (low 1 MiB, 4 KiB-aligned). Iteration uses R12 = current pointer, R13 = remaining count, R14 = trampoline_phys (preserved across ap_wake_one — which itself uses R14/R15 via push/pop but restores them). Read is 32-bit zero-extend (`mov ecx, [r12]`) matching the xAPIC ID slot layout. Loop breaks on R13 == 0. Preserves R12-R15 via push/pop. Reason for not calling in kernel_main.pdx yet: no MADT parser (R20) to populate the id list, and no #761 trampoline. #764 (boot_smp smoke) will wire a stub call once #761 lands the trampoline blob.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                        // r12 = current entry ptr
+        mov r13, rsi;                        // r13 = remaining count
+        mov r14, rdx;                        // r14 = trampoline_phys
+
+        ap_wake_all_loop:
+          cmp r13, 0;
+          je ap_wake_all_done;
+
+          // Read u32 APIC ID at [r12].
+          mov ecx, [r12];
+
+          // Call ap_wake_one(apic_id, trampoline_phys).
+          mov rdi, rcx;
+          mov rsi, r14;
+          call ap_wake_one;
+
+          // Advance pointer 4 bytes; decrement count.
+          add r12, 4;
+          sub r13, 1;
+          jmp ap_wake_all_loop;
+
+        ap_wake_all_done:
+          pop r14;
+          pop r13;
+          pop r12;
+          ret
+      }
+    }
+}
