@@ -1,0 +1,326 @@
+// src/kernel/core/sync/spinlock.pdx — R18-M3-001 / #768
+// MCS (Mellor-Crummey Scott) queue-based fair spinlock.
+//
+// Issue: paideia-os/paideia-os#768
+//
+// Purpose:
+//   The kernel is entering multicore. Global structures — the physical
+//   allocator freelist, the VFS mount table, the IPC name registry — need
+//   mutual exclusion across cores. A test-and-set spinlock (xchg on a
+//   single word) is correct but scales O(n^2) in coherency traffic under
+//   contention (every releaser writes a cache line every waiter reads,
+//   producing n * n invalidations for n contending waiters). On the T14
+//   G4 hybrid P/E-core topology (see design/roadmap/r18-plus-bare-metal.md
+//   §R18) this behaviour is especially harmful: the E-cores share L2 with
+//   the P-cluster and contend for the same coherency ring.
+//
+//   MCS distributes the wait: each waiter spins on its OWN cache line
+//   (its per-CPU node's `locked` field). The releaser writes exactly one
+//   cache line (the successor's node) to hand off. Coherency traffic is
+//   O(n) instead of O(n^2), and fairness is FIFO by construction (the
+//   queue is a strictly linked list, no starvation).
+//
+//   Reference: Mellor-Crummey & Scott, "Algorithms for Scalable
+//   Synchronization on Shared-Memory Multiprocessors", ACM TOCS 1991.
+//
+// ============================================================================
+// Data model
+// ============================================================================
+//
+// MCSNode (64 B, one cache line, @align(64)):
+//   +0   next   : u64   — successor pointer (0 = no successor)
+//   +8   locked : u64   — 1 = waiting (spin); 0 = go
+//   +16  reserved : 48 B — padding to full cache line
+//
+//   Cache-line padding is not just tidiness: without it, 4 nodes fit in
+//   a single L1D line and every predecessor's "next->locked = 0" store
+//   invalidates every OTHER waiter's L1D copy — restoring the O(n^2)
+//   traffic pattern MCS is meant to eliminate. The 64-B pad is the whole
+//   point of MCS over simpler queue locks.
+//
+// MCSLock (8 B, caller-allocated):
+//   +0   tail : u64   — pointer to the tail MCSNode (0 = unlocked, no waiters)
+//
+//   Just a u64 tail pointer. The head of the queue is implicit — it is
+//   whichever CPU currently owns the lock and its node.locked == 0. The
+//   head is not stored anywhere; the invariant is that the current holder
+//   is dequeued (its predecessor already set node.locked = 0) but its node
+//   remains reachable via tail (if it is still tail) or via the chain of
+//   `next` pointers from tail backwards (not needed by the algorithm).
+//
+// Node ownership: exactly one node per CPU, in a static array indexed by
+// cpu_idx. A CPU may only hold ONE MCS-guarded resource at a time via
+// this pool (recursive/nested MCS locking requires per-lock nodes on the
+// stack, R21 scope). This restriction is acceptable through R18-R20 —
+// the kernel's global locks (phys_alloc, vfs_mount, ipc_registry) are
+// leaf locks and never nest.
+//
+// ============================================================================
+// Algorithm
+// ============================================================================
+//
+// spin_lock(lock, cpu_idx):
+//   my_node = &_mcs_nodes[cpu_idx]
+//   my_node.next   = 0
+//   my_node.locked = 1              // "I am waiting" — set BEFORE publish
+//   prev = xchg(&lock.tail, my_node)  // atomic swap; xchg is implicitly LOCKed
+//   if prev == 0:
+//       return                        // uncontended: we ARE the queue
+//   prev.next = my_node               // publish self to predecessor
+//   while my_node.locked != 0:
+//       pause                         // spin on OWN cache line
+//   return
+//
+// spin_unlock(lock, cpu_idx):
+//   my_node = &_mcs_nodes[cpu_idx]
+//   if my_node.next == 0:
+//       // No visible successor yet. Two cases:
+//       //   (a) truly no one else — CAS tail to NULL and we are done.
+//       //   (b) a lock() is mid-way through xchg but has not yet
+//       //       stored prev.next — wait for the store.
+//       if cmpxchg(&lock.tail, my_node, 0) succeeded:
+//           return                    // case (a): lock is free
+//       // case (b): fell through — wait for successor to publish
+//       while my_node.next == 0:
+//           pause
+//   next = my_node.next
+//   next.locked = 0                   // hand off (invalidates ONE cache line)
+//   return
+//
+// Correctness of the "case (b)" handshake:
+//   The acquirer executes { xchg publish; store prev.next = self } in that
+//   order. The releaser observes the two events in the SAME program order
+//   (xchg is total-order-observed under x86 TSO; the plain store may be
+//   delayed but cannot be reordered past the xchg in the acquirer's own
+//   view). So if release's cmpxchg fails (tail != my_node), someone has
+//   ALREADY done a successful xchg → they WILL do the store; spinning on
+//   my_node.next is bounded by that store's arrival. No memory barrier
+//   needed on x86 because xchg IS a full fence (Intel SDM Vol 3A §8.2.5).
+//
+// ============================================================================
+// Not-a-witness note
+// ============================================================================
+//
+// This module lands the mechanism only. No call to spin_lock / spin_unlock
+// exists yet — global-lock retrofits (phys_alloc, vfs_mount, ipc_registry)
+// are R18.M4+ scope, and the true contention smoke (8-core -smp 8, 100000
+// acquire/release cycles per issue #768's acceptance criterion) requires
+// (a) MAX_CPUS bump from 4 to 8 (blocks on #813 MADT integration in R20),
+// (b) a per-CPU worker task on each AP that hammers a shared lock (blocks
+// on runq / task migration, R18.M4). Both preconditions are open. The
+// witness therefore lands with #813 or R18.M4-004 (whichever crosses the
+// finish line first); this issue closes with the mechanism + a single-
+// threaded self-test comment (see spin_lock_self_test_note below).
+//
+// ============================================================================
+// Encoder
+// ============================================================================
+//
+// paideia-as v0.20.1+:
+//   - xchg [mem], reg               (PA-R13-003 #916 — Xchg mnemonic)
+//   - lock_cmpxchg [mem], reg       (PA-R13-004 #917 — LockCmpxchg mnemonic;
+//                                    implicit RAX = expected in / prev out)
+//   - pause                         (PA-R16-007 #973)
+//   - mov [mem+disp], imm           (already used in phys_alloc.pdx / task_pool)
+//   - mov [mem+disp], reg           (baseline)
+//   - lea rip-relative              (baseline)
+//   - cmp / je / jne / jz / jmp     (baseline)
+//   - xor reg, reg                  (baseline)
+//   - shl imm                       (baseline)
+//
+// mfence is NOT needed: xchg's implicit LOCK is a full fence on x86 (Intel
+// SDM Vol 3A §8.1.2, §8.2.5). lock_cmpxchg likewise. The only ordering
+// that could matter is the acquirer's { init locked=1 → xchg publish };
+// both are stores, x86 TSO forbids reordering stores past a LOCKed
+// operation, so the init is visible before the pointer publish. QED.
+//
+// Zero new paideia-as work required.
+
+module Spinlock = structure {
+  // === Node layout (load-bearing offsets) ===
+  pub let MCS_NODE_SIZE   : u64 = 64      // one cache line
+  pub let MCS_NODE_ALIGN  : u64 = 64
+  pub let MCS_OFF_NEXT    : u64 = 0       // u64: successor pointer
+  pub let MCS_OFF_LOCKED  : u64 = 8       // u64: 1 = spin, 0 = go
+
+  // === Lock layout ===
+  pub let MCS_LOCK_SIZE   : u64 = 8       // sizeof(MCSLock) — single u64 tail
+  pub let MCS_OFF_TAIL    : u64 = 0       // u64: tail node pointer (0 = free)
+
+  // === Node pool ===
+  // MAX_CPUS = 4 (matches ApStacks.N_APS + BSP, indexed [0..4)). Bumped
+  // to whatever MADT enumeration yields at R20 (#813); this array widens
+  // then. 4 * 64 = 256 bytes in .bss @align(64) — each node on its own
+  // cache line so spinning-and-handoff traffic is O(n) not O(n^2).
+  //
+  // Zero-initialised by .bss placement — an uninitialised node has
+  // next=0 and locked=0, which happens to match the "not yet acquired
+  // anything" state, so no explicit init pass is needed at bring-up.
+  pub let mut _mcs_nodes : [u64; 32] = uninit @align(64)
+
+  // ==========================================================================
+  // mcs_node_for(cpu_idx: u64) -> u64
+  //   Returns &_mcs_nodes + cpu_idx * MCS_NODE_SIZE.
+  //   Leaf, no frame. No range check on cpu_idx: caller enumerates
+  //   0..MAX_CPUS-1 by construction (contract mirrors percpu_cb_for in
+  //   core/smp/percpu.pdx). Passing cpu_idx >= 4 computes an out-of-pool
+  //   VA and any subsequent write corrupts the next .bss neighbour.
+  // ==========================================================================
+  pub let mcs_node_for : (u64) -> u64 !{} @{} =
+    fn (cpu_idx: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "#768 R18-M3-001: compute the VA of MCS node for cpu_idx (RDI). Body: rax = cpu_idx << 6 (multiply by MCS_NODE_SIZE=64 via shift-by-6; matches the shl-imm compact-encode idiom used by ap_stack_top and percpu_cb_for). rax += &_mcs_nodes via rip-relative lea into rcx. Result in rax per SysV. Leaf, no frame, no callee-save clobber. No range check on cpu_idx: caller enumerates 0..MAX_CPUS-1 by construction (contract mirrors percpu_cb_for). Effect row: {} — pure address arithmetic on a static VA; no memory read/write, no sysreg touch.",
+      block: {
+        // rax = cpu_idx * MCS_NODE_SIZE = cpu_idx << 6
+        mov rax, rdi;
+        shl rax, 6;
+
+        // rax += &_mcs_nodes
+        lea rcx, [rip + _mcs_nodes];
+        add rax, rcx;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // spin_lock(lock_ptr: u64, cpu_idx: u64) -> ()
+  //   Acquire the MCS lock at *lock_ptr* using this CPU's node.
+  //
+  //   Register discipline (leaf w.r.t. call graph — no `call` to any
+  //   other function, so caller-save is sufficient):
+  //     rdi = lock_ptr (in)
+  //     rsi = cpu_idx  (in)
+  //     r8  = my_node VA (computed once, held across the whole body)
+  //     rax = scratch / xchg swap register
+  //     rcx = scratch
+  //
+  //   No callee-save touched. No frame.
+  // ==========================================================================
+  pub let spin_lock : (u64, u64) -> () !{mem} @{} =
+    fn (lock_ptr: u64, cpu_idx: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "#768 R18-M3-001 (acquire): MCS acquire against lock at RDI using this CPU's node (RSI = cpu_idx, resolved to _mcs_nodes+cpu_idx*64 inlined; not `call mcs_node_for` because the leaf-discipline body would incur a call/ret + 16-byte stack alignment overhead for two instructions of pointer math). Sequence: (1) compute r8 = &my_node. (2) init my_node.next = 0 and my_node.locked = 1 BEFORE publishing self via xchg — order matters: if we published first, a predecessor's release could observe stale (or zero) locked and hand off to us while we're still initialising, which would race the subsequent write of locked=1 that our own body issues. Two direct-immediate `mov [r8+off], imm` stores; matches the phys_alloc.pdx `mov [r12 + rdi*8], 1` idiom that already exists in the tree. (3) xchg [rdi], rax with rax pre-loaded with my_node: xchg mem,reg atomically stores the register into memory and returns the previous memory value in the register — after the instruction rax = prev_tail. xchg on a memory operand is IMPLICITLY LOCK-prefixed on x86 (Intel SDM Vol 2B §XCHG) so it is a full fence AND an atomic RMW, exactly what MCS needs for the tail swap. (4) test rax, rax — if zero, the lock was uncontended and we now own it (early return via jz sl_done). (5) Contended path: publish self to predecessor via `mov [rax + 0], r8` (rax = prev_tail, offset 0 = MCS_OFF_NEXT). No ordering fence needed on x86: the plain store is TSO-ordered with respect to the xchg above, and the successor's release-side spin on my_node.next observes the write in program order per SDM Vol 3A §8.2.3. (6) Spin on my_node.locked = 1 with pause hint: `mov rcx, [r8 + 8]; test rcx; jnz` loop. The pause hint (PA-R16-007 #973) prevents memory-order-violation pipeline flushes on Intel and yields SMT siblings on hyperthreaded parts; a no-op on TCG. Cache-line-local spin: my_node has its own 64-byte cache line (@align(64) storage), so this loop reads exclusively from L1D until the predecessor's release invalidates the line — no bus traffic during the wait. Effect row: {mem} — writes to _mcs_nodes storage and to *lock_ptr. Capability row: {} — this primitive is caller-authorised; no kernel-privilege boundary crossed. Register discipline: only rax/rcx/r8 (all caller-save) touched; leaf function per graph (no nested `call`); no frame; SysV ABI-clean at both entry and exit.",
+      block: {
+        // ---- (1) r8 = &_mcs_nodes + cpu_idx * 64 ----
+        lea r8, [rip + _mcs_nodes];
+        mov rax, rsi;
+        shl rax, 6;                              // cpu_idx * MCS_NODE_SIZE
+        add r8, rax;
+
+        // ---- (2) Init node: next = 0, locked = 1 ----
+        // Must complete BEFORE the xchg publish (see justification).
+        mov [r8 + 0], 0;                         // my_node.next   = 0
+        mov [r8 + 8], 1;                         // my_node.locked = 1
+
+        // ---- (3) prev = xchg(lock.tail, my_node) ----
+        // rax carries my_node into the xchg, comes back with prev_tail.
+        mov rax, r8;
+        xchg [rdi], rax;
+
+        // ---- (4) If prev == 0, uncontended — we own the lock. ----
+        cmp rax, 0;
+        je sl_done;
+
+        // ---- (5) Contended: prev.next = my_node ----
+        mov [rax + 0], r8;
+
+        // ---- (6) Spin on my_node.locked until predecessor hands off ----
+      sl_wait:
+        pause;
+        mov rcx, [r8 + 8];
+        cmp rcx, 0;
+        jne sl_wait;
+
+      sl_done:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // spin_unlock(lock_ptr: u64, cpu_idx: u64) -> ()
+  //   Release the MCS lock at *lock_ptr* held by this CPU.
+  //
+  //   Register discipline (leaf w.r.t. call graph):
+  //     rdi = lock_ptr (in)
+  //     rsi = cpu_idx  (in)
+  //     r8  = my_node VA
+  //     rax = scratch / cmpxchg expected+prev slot (implicit)
+  //     rcx = scratch
+  //
+  //   No callee-save touched. No frame.
+  //
+  //   Caller MUST have paired this with a prior spin_lock on the same
+  //   (lock_ptr, cpu_idx) — no ownership check is performed. Releasing
+  //   a lock we do not hold silently corrupts the queue.
+  // ==========================================================================
+  pub let spin_unlock : (u64, u64) -> () !{mem} @{} =
+    fn (lock_ptr: u64, cpu_idx: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "#768 R18-M3-001 (release): MCS release for lock at RDI using this CPU's node (RSI = cpu_idx). Sequence: (1) compute r8 = &my_node. (2) Load my_node.next into rcx and test; if non-zero, a successor is already published — fast path to (6). (3) If next == 0, we might be the tail. Attempt lock_cmpxchg [rdi], 0 with expected=my_node in rax: if lock.tail is still my_node the CAS writes 0 (unlocked) and sets ZF=1 (je su_done). Note lock_cmpxchg's implicit-operand contract: RAX in = expected, RAX out = prev observed; RAX-clobber is intentional and does not conflict with our other in-use registers (RDI = lock_ptr, R8 = my_node, RCX = scratch) — no U1613 warning triggered because the memory operand's base is RDI not RAX (contrast the PaR16004ImplicitClobberU1613.pdx test case). (4) If the CAS failed (ZF=0), some later acquirer already xchg'd itself into tail but has not yet executed the `mov [rax + 0], r8` publish step (see spin_lock step 5). Their store is IN FLIGHT and observable in bounded time — spin on my_node.next with pause hint until it appears. This handshake is what makes MCS correct without an intervening barrier on x86: xchg is TSO-ordered before the plain publish store from the acquirer's point of view (SDM Vol 3A §8.2.3), so once a xchg is visible (our failed CAS observed a tail != my_node) the paired publish is guaranteed to arrive. (5) Once my_node.next is non-zero, fall through to (6). (6) rcx holds successor node VA (either from step 2 or step 4). Write 0 to successor.locked (offset +8): this is the hand-off. The successor's spin loop in spin_lock step 6 will observe locked==0 within a few cycles (L1D cache-line invalidation → refetch) and exit. Only ONE cache line is invalidated per release — the exact O(n) traffic property MCS delivers over test-and-set. Register discipline: rax/rcx/r8 caller-save; leaf per graph; no frame. Effect row: {mem} — reads/writes _mcs_nodes storage and *lock_ptr. Capability row: {} — caller-authorised, no privilege boundary. Correctness of the successor.locked store using immediate 0: the store is a single u64 write to an aligned address; x86 guarantees atomicity for aligned 8-byte stores (SDM Vol 3A §8.1.1), so no torn read is possible on the successor side.",
+      block: {
+        // ---- (1) r8 = &_mcs_nodes + cpu_idx * 64 ----
+        lea r8, [rip + _mcs_nodes];
+        mov rax, rsi;
+        shl rax, 6;
+        add r8, rax;
+
+        // ---- (2) Fast path: successor already published? ----
+        mov rcx, [r8 + 0];                       // rcx = my_node.next
+        cmp rcx, 0;
+        jne su_handoff;
+
+        // ---- (3) No visible successor. Try CAS(lock.tail, my_node, 0). ----
+        // rax = expected (my_node); rcx = new value (0).
+        mov rax, r8;
+        xor rcx, rcx;
+        lock_cmpxchg [rdi], rcx;
+        je su_done;                              // ZF=1 → success, lock free
+
+        // ---- (4) CAS failed: an acquirer took our tail slot but has not
+        //         yet published prev.next. Spin until they do. ----
+      su_wait_next:
+        pause;
+        mov rcx, [r8 + 0];
+        cmp rcx, 0;
+        je su_wait_next;
+
+        // ---- (5) Fall through: rcx = successor node VA ----
+      su_handoff:
+        // ---- (6) Hand off: successor.locked = 0 ----
+        mov [rcx + 8], 0;
+
+      su_done:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // spin_lock_self_test_note
+  //
+  // A single-CPU self-test (BSP alone) exercises only the uncontended
+  // path — spin_lock returns immediately after the xchg (prev == 0), and
+  // spin_unlock returns immediately after the CAS (tail == my_node → 0).
+  // This is the "no bugs in the arithmetic" smoke; it does NOT exercise:
+  //   - the contended-acquire path (spin on my_node.locked)
+  //   - the CAS-failed release path (spin on my_node.next)
+  //   - the O(n) cache-line handoff property
+  //   - fairness under queueing
+  //
+  // Real MCS validation requires the full 8-core -smp 8 contention smoke
+  // from issue #768's acceptance criteria: 100000 acquires+releases from
+  // each CPU against a shared lock, verified by a per-CPU counter that
+  // sums to exactly 8 * 100000 with no lost/double increments. That
+  // smoke blocks on:
+  //   - MAX_CPUS bump from 4 to 8 (R20 #813 MADT integration), AND
+  //   - per-AP worker task that runs the acquire/release loop, which
+  //     needs R18.M4 runq + task-per-CPU scheduling.
+  //
+  // Both preconditions are open at HEAD 6c4db58. The witness is deferred
+  // to whichever of R18.M4-004 or R20-#813 closes first; #768 closes
+  // with mechanism only. See also the not-a-witness discipline established
+  // in R18.M1/M2 (percpu.pdx, gs_base.pdx) which this module mirrors.
+  // ==========================================================================
+}
