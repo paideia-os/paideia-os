@@ -536,3 +536,51 @@ R13 was scoped as a full userspace + shell OS. Ring-3 was blocked; R13 landed th
 **Pre-push hook:** Unchanged from R12 — gates on four modes (boot_r8_only, boot_r10, boot_r11, boot_r12).
 
 **Next Round:** R14 (Ring-3 First-Jump + Real m8 + Structural-Stub Promotions) — See forthcoming `design/milestones/r14-kickoff.md`. See `design/milestones/r13-closure.md` for the full round document.
+
+---
+
+## R14–R17 — CLOSED (STATUS.md backfill queued)
+
+R14 (Ring-3), R15 (Scheduler + MM hardening), R16 (VFS + fork/exec/wait + TTY line discipline), R17 (Interactive shell on QEMU) all closed prior to R18 open. Their per-round detail lives in the individual `design/milestones/rNN-closure.md` and `design/round-retrospectives/rNN-*.md` documents; a consolidated STATUS.md backfill is queued as a soft-priority cleanup and does not gate R18/R19 progress.
+
+---
+
+## R18 (SMP Substrate — Multicore Bring-up) — CLOSED 2026-08-10
+
+R18 delivered the full SMP substrate: AP boot trampoline, per-CPU control block via `[gs:off]`, MCS spinlock, atomic refcount, TLB shootdown IPI, cross-CPU reschedule IPI, per-CPU runqueue + AP-side scheduler bring-up, per-CPU TSC-deadline timer, CPUID 0x0B / 0x1F / 0x1A topology walk. Pillar 2 target met: the "single-CPU deferred" audit posture is retired for the primitives R18 landed (see `design/round-retrospectives/r18-closure.md` §Sweep Results for the six remaining SMP-relevant follow-ups tracked as R21 / R29 / R30 debt).
+
+### Issues Implemented (23 total, 21 implementation + 2 closure)
+
+- **M1** (#760–#764) — INIT-SIPI-SIPI + BSP wake, AP real→prot→long trampoline (`tools/ap_trampoline.S`), per-CPU stack + `_ap_entry`, MADT stopgap (hard-coded `_ap_apic_ids`), `boot_smp` fingerprint.
+- **M2** (#765–#767) — Percpu CB struct (4 KiB-aligned per-AP), `gs_base_init_bsp`/`gs_base_init_ap` + `GS_OK_XX` round-trip witness, PerCpuOps stdlib trait (encoder-side landed, consumer-side gated on paideia-as #1290).
+- **M3** (#768–#770) — MCS spinlock (uncontended-path witnessed on BSP; 8-core contention witness deferred to R20 pending MAX_CPUS bump), atomic refcount primitive (RefcountOps trait), lock cmpxchg / lock xadd / mfence encoder verification + kernel wrappers.
+- **M4** (#771–#774) — LAPIC ICR IPI dispatch (four destination shorthands), cross-CPU reschedule IPI vector 0xF1 + `_ipi_handler_f1` (preempt-needed CB flag), per-CPU runqueue (retires BSP-only `_runq_head` sentinel), `ap_sched_init` per-AP idle TCB + rewired `sched_pick_next_r15` empty-runq fallback to CB[+80].
+- **M5** (#775–#778) — TLB shootdown IPI vector 0xF2 (INVLPG range; INVPCID deferred), mfence discipline audit, per-CPU TSC-deadline timer arming (replaces BSP-only LAPIC-timer periodic), TLB shootdown regression fixture under `-smp 4`.
+- **M6** (#779–#782) — CPUID 0x1A hybrid-topology per-AP tagging (P/E/LP-E), CPUID 0x0B / 0x1F topology walk, single-CPU-deferred marker sweep (#781 — 16 `single-CPU` + 5 `BSP-only` + 13 `#657-SWAPGS-TODO` matches classified into 4 categories; no new issues filed intra-round, deferred to R21/R29/R30 milestone-bootstrap PRs), R18 closure retrospective (this doc + `r18-closure.md`).
+
+### Cross-Repo Escalations to paideia-as (R18)
+
+- **#1011** (MS x64 callee prologue emitter) — CLOSED. Unblocks R19 UEFI stub.
+- **#1013** (@include_bytes embed primitive + verify-syscall-dispatch.sh SIGPIPE hardening) — CLOSED.
+- **#1290** (elaborator T0540: 2+ arg trait-method call at lambda-body position) — **OPEN**. Forced raw `rdmsr IA32_GS_BASE + indirect [rax+off]` idiom in every R18 SMP kernel site; blocks PerCpuOps trait consumption. Kernel-side callers deferred to R29 pending resolution.
+- **`ded3d48`** (PerCpuOps read_u64/write_u64/cmpxchg64 SysVRegs recipes) — LANDED. Encoder-side ready.
+
+### Substrate Pinning
+
+paideia-as submodule at `v0.20.1-23-gded3d48`. The `v0.21` blocker-tag from the roadmap plan is delivered piecewise across 23 untagged commits; the formal tag is intentionally deferred until paideia-as #1290 lands so consumers do not get stuck on a half-consumable PerCpuOps trait. `tools/find-paideia-as.sh` passes (`MIN_VERSION=0.4.0` satisfied; binary mtime >= submodule HEAD commit time).
+
+### Observable Proof
+
+- `boot_smp` (new fingerprint, `-smp 4`): 4 × `CPU_ID_XX_HELLO` + 4 × `GS_OK_XX` + per-AP hybrid/topology lines.
+- All prior fingerprints (`boot_r8_only`, `boot_r10`, `boot_r15_m7`, `boot_r16_*`, `boot_r17_*`) byte-identical: R18 SMP substrate is additive at boot-fingerprint level.
+- TLB shootdown fixture (#778): `-smp 4` map+unmap under concurrent read; ack counter matches expected under 1 000-iteration burst.
+
+### R18 Debt Carried Forward
+
+Ledger of nine deferred items in `design/round-retrospectives/r18-closure.md` §"What Was Deferred". Priority routing: R21 (AP-IDT + LAPIC per-AP + per-CPU TSS), R29 (mm hardening + PerCpuOps consumers), R30 (swapgs + KPTI). **Zero R18 debt blocks R19.**
+
+### Quirks Discovered on Real Hardware
+
+None. R18 ran entirely under QEMU; T14 G4 first-light is R19's deliverable per the UEFI stub round.
+
+**Next Round:** R19 (Paideia-native UEFI PE32+ boot) — see `design/round-retrospectives/r19-preflight.md`. Zero R18 blockers; paideia-as v0.21 tag pending (delivered piecewise; formal tag gated on paideia-as #1290).
