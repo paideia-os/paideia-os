@@ -1,0 +1,167 @@
+// src/kernel/core/sched/ap_bringup.pdx — R18-M4-004 / #774
+// AP-side scheduler bring-up: per-AP idle TCB + per-CPU runqueue init.
+//
+// Issue: paideia-os/paideia-os#774
+//
+// Purpose:
+//   Each AP, after gs_base_init_ap (#766) has programmed IA32_GS_BASE
+//   to point at its own Percpu CB, needs a scheduler baseline before it
+//   can safely park in the halt loop that ap_entry.pdx installs. This
+//   module provides that baseline:
+//
+//     (a) A per-AP idle TCB slab (padded to a full 4 KiB so the
+//         cpu_idx → slot lookup is a single shl-by-12) sharing the
+//         BSP's idle_code body (sti/hlt/jmp — pure position-independent).
+//     (b) A per-AP idle kernel stack (one 4 KiB page per AP), backing
+//         the idle TCB's regs_save.rsp field. Idle never grows a call
+//         chain (its whole body is 3 bytes), so 4 KiB is generous.
+//     (c) ap_sched_init(): the wire-in helper _ap_entry calls after
+//         gs_base_init_ap. Populates the per-AP idle TCB, publishes
+//         its VA into CB[PERCPU_OFF_IDLE_TCB] (so this AP's
+//         sched_pick_next_r15 fallback returns THIS CPU's idle rather
+//         than the BSP's), and re-zeroes CB.runqueue_head/tail via
+//         runq_init (defensive — .bss zero-init already satisfies the
+//         empty-runq invariant, but the explicit call documents intent
+//         and matches the BSP-side bootstrap sequence at
+//         kernel_main.pdx L7182 / L7189).
+//
+// Scope discipline (M4 initial):
+//   No actual task-switching to idle happens here. The AP has no IDT
+//   installed (ap_entry.pdx header block §"IDT install" — deferred to
+//   M2+ follow-up), so a `sti` in idle_code would #GP. The AP therefore
+//   retains its cli/hlt loop in _ap_entry as its idle stand-in; the
+//   per-AP idle TCB installed by ap_sched_init is a *structural*
+//   artifact that (i) sched_pick_next_r15 called from this AP returns
+//   a valid non-zero TCB pointer (this CPU's idle) on empty runqueue,
+//   and (ii) future preempt-tail / IPI-driven task_switch calls have a
+//   canonical destination when no user task is runnable on this AP.
+//
+//   The AC third bullet ("Test task migrated to AP-3 executes there")
+//   is blocked on AP-side IDT install: without an IDT the AP cannot
+//   accept a reschedule IPI (would #GP), and without preempt delivery
+//   it cannot execute a migrated task. This module closes the AC's
+//   first two bullets ("per-CPU idle task created and inserted",
+//   "idle task halts via hlt in its loop body" — the halt loop lives
+//   in _ap_entry after this init returns) and lays the storage the
+//   third bullet will consume once IDT install lands.
+//
+// Storage layout:
+//   _ap_idle_tcbs   : [u64; 2048]  = 4 * 4096 B slots  = 16 KiB
+//     Slot cpu_idx N at offset N * 4096.  Padded above the 2224-byte
+//     task_struct footprint used by BSP's Idle._idle_task_slot so the
+//     cpu_idx → VA lookup is a single shl-by-12 (12 = log2(4096)),
+//     avoiding an imul against 2224 (a non-power-of-two multiplier
+//     would work — imul is supported per PA-R13-009 — but shl keeps the
+//     helper 4-instruction-tight and mirrors ap_stack_top's shl-14
+//     idiom in ap_stacks.pdx).  Wasted 1872 B per slot × 4 slots =
+//     7488 B — trivial vs the 8 KiB kernel-map cost of the physical
+//     backing page.
+//
+//   _ap_idle_stacks : [u64; 2048]  = 4 * 4096 B slots  = 16 KiB
+//     Slot cpu_idx N's stack occupies bytes [N*4096, (N+1)*4096); the
+//     TOP (regs_save.rsp seed) is at &_ap_idle_stacks + (N+1)*4096.
+//
+//   Both arrays are sized against Percpu.MAX_CPUS = ApStacks.N_APS = 4.
+//   R20 (MADT-driven enumeration, #813) resizes both alongside the
+//   ApStacks / Percpu ceiling bump.
+//
+//   Slot 0 (cpu_idx == 0 = BSP) is deliberately allocated but unused:
+//   BSP keeps Idle._idle_task_slot (published into its own CB[+80] by
+//   idle_init).  Skipping slot 0 in indexing would save 8 KiB but add
+//   an (N-1)-based subtract to every helper — the flat cpu_idx-indexed
+//   scheme wins on code clarity for a fixed 4-CPU ceiling.
+//
+// Register / call discipline:
+//   ap_sched_init is not a leaf (it calls gs_base_read_cpu_idx and
+//   runq_init).  Two callee-save pushes (rbx, r12) keep rsp % 16 == 0
+//   at each nested call boundary (return-addr push made rsp % 16 == 8;
+//   +2 pushes = 16-aligned).  r12 stashes cpu_idx across the calls;
+//   rbx stashes the idle-TCB slot VA across the rdmsr sequence.
+//
+// Encoder: paideia-as v0.20.1+. Uses lea (rip-relative), shl, add,
+// mov (u64/u32 sized), rdmsr, cmp, call/ret. All primitives in-tree.
+
+module ApBringup = structure {
+  // Per-AP idle TCB slab pool.  4 * 4096 B = 16 KiB in .bss @align(4096).
+  // Slot cpu_idx N at &_ap_idle_tcbs + N * 4096.
+  pub let mut _ap_idle_tcbs : [u64; 2048] = uninit @align(4096)
+
+  // Per-AP idle kernel stacks.  4 * 4096 B = 16 KiB in .bss @align(16).
+  // Slot cpu_idx N's stack top (regs_save.rsp seed) is at
+  // &_ap_idle_stacks + (N + 1) * 4096.
+  pub let mut _ap_idle_stacks : [u64; 2048] = uninit @align(16)
+
+  // ==========================================================================
+  // ap_sched_init() -> ()
+  //   Precondition: gs_base_init_ap has programmed IA32_GS_BASE on the
+  //   calling AP so [gs:0] reads back cpu_idx.
+  //
+  //   Sequence:
+  //     (a) Read this AP's cpu_idx via gs_base_read_cpu_idx (rdmsr +
+  //         u32 load).
+  //     (b) Compute idle-TCB slot VA = &_ap_idle_tcbs + cpu_idx * 4096.
+  //     (c) Populate the three fields sched_switch (#564) reads:
+  //           +8   state (u32) = STATE_RUNNABLE (1)
+  //           +32  regs_save.rsp = &_ap_idle_stacks + (cpu_idx+1)*4096
+  //           +40  regs_save.rip = &idle_code (shared with BSP)
+  //     (d) Publish slot VA into CB[PERCPU_OFF_IDLE_TCB=80] via
+  //         rdmsr IA32_GS_BASE + [rax+80] store.
+  //     (e) runq_init — zero CB.runqueue_head/tail (defensive; .bss
+  //         zero-init already satisfies invariant, but explicit call
+  //         matches BSP-side sequence at kernel_main.pdx L7182).
+  //
+  //   Idempotent: repeated calls re-stamp the same fields.  Safe to
+  //   call from any AP context post-gs_base_init_ap.
+  // ==========================================================================
+  pub let ap_sched_init : () -> () !{mem, sysreg} @{boot} =
+    fn () -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { boot },
+      justification: "#774 R18-M4-004: AP-side scheduler bring-up. (a) gs_base_read_cpu_idx returns cpu_idx (u32 zero-extended) via rdmsr IA32_GS_BASE + [rax+0] load — matches the AP-side witness helper defined in gs_base.pdx L232. r12 stashes cpu_idx across the two subsequent calls (SysV callee-save). (b) Idle TCB slot VA = &_ap_idle_tcbs + (cpu_idx << 12) — shl-by-12 encodes cpu_idx * 4096 (12 = log2(4096)); rbx stashes the slot VA across the rdmsr sequence in (d) that clobbers rax/rdx. (c) Three-field TCB populate: state=1 via mov ecx,1 + mov [rbx+8],ecx (32-bit sized store — bare mov [rbx+8],rcx would emit REX.W and store 8 bytes, corrupting the pad+user_pml4_pa fields at [rbx+12..rbx+16); matches the mov_d/e-reg idiom in Percpu.percpu_init and Idle.idle_init step 4); regs_save.rsp = &_ap_idle_stacks + (cpu_idx+1)*4096 via add-then-shl to compute the stack top (mirror of ap_stack_top's `(cpu_idx+1) << 14` pattern in ap_stacks.pdx L91-94, but with 12-bit shift because the idle stack is 4 KiB not 16 KiB); regs_save.rip = &idle_code (rip-relative lea — idle_code is position-independent kernel code; APs share the BSP's idle body because sti/hlt/jmp reads no per-CPU state). (d) CB[PERCPU_OFF_IDLE_TCB]=slot_va: rdmsr IA32_GS_BASE, recombine EDX:EAX per SDM §5.2.9 to reconstruct the CB VA that gs_base_init_ap seeded via WRMSR, store rbx at [rax+80]. This closes the loop: sched_pick_next_r15's post-#774 empty-runq fallback (`mov rax, [rax+80]` on the pick_empty branch of pick_next.pdx) now returns THIS AP's idle rather than the BSP's _idle_tcb. (e) runq_init — zero CB.head/tail; .bss zero-init already satisfies the empty-runq invariant but this call is defensive (idempotent per runqueue.pdx §runq_init 'safe to re-call' note) and mirrors the BSP-side ordering at kernel_main.pdx L7182 where runq_init runs before the idle witness. Register discipline: rbx/r12 callee-save (2 pushes align rsp % 16 == 0 at each nested call boundary); rax/rcx/rdx/rdi all caller-save per SysV. Effects: {mem} for the TCB and CB stores and the runq_init CB stores, {sysreg} for the two rdmsr instructions (gs_base_read_cpu_idx has its own, plus the direct rdmsr in step (d)). Capability {boot} restricts to AP bring-up. Not a leaf — three nested calls (gs_base_read_cpu_idx, runq_init, and implicitly no others).",
+      block: {
+        push rbx;
+        push r12;
+
+        // (a) r12 = cpu_idx (u32 zero-extended into rax by gs_base_read_cpu_idx)
+        call gs_base_read_cpu_idx;
+        mov r12, rax;
+
+        // (b) rbx = &_ap_idle_tcbs + cpu_idx * 4096
+        mov rbx, r12;
+        shl rbx, 12;                          // cpu_idx * 4096
+        lea rcx, [rip + _ap_idle_tcbs];
+        add rbx, rcx;
+
+        // (c.1) TCB.state = STATE_RUNNABLE (1) — u32 store via ecx
+        mov ecx, 1;
+        mov [rbx + 8], ecx;
+
+        // (c.2) TCB.regs_save.rsp = &_ap_idle_stacks + (cpu_idx+1) * 4096
+        mov rax, r12;
+        add rax, 1;
+        shl rax, 12;                          // (cpu_idx + 1) * 4096
+        lea rcx, [rip + _ap_idle_stacks];
+        add rax, rcx;
+        mov [rbx + 32], rax;
+
+        // (c.3) TCB.regs_save.rip = &idle_code (shared with BSP)
+        lea rcx, [rip + idle_code];
+        mov [rbx + 40], rcx;
+
+        // (d) Publish CB[PERCPU_OFF_IDLE_TCB=80] = rbx (idle slot VA)
+        //     via rdmsr IA32_GS_BASE to get CB VA in rax.
+        mov rcx, 0xC0000101;                  // IA32_GS_BASE
+        rdmsr;
+        shl rdx, 32;
+        or  rax, rdx;                         // rax = CB VA (this CPU)
+        mov [rax + 80], rbx;                  // CB.idle_tcb = idle slot
+
+        // (e) runq_init — zero CB.head/tail (defensive; bss already 0).
+        call runq_init;
+
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
