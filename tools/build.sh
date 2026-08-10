@@ -19,6 +19,17 @@ fi
 
 mkdir -p "${BUILD_DIR}"
 
+# R20-M4-004 (#822): "No AML in kernel" guardrail. Refuses the build
+# if any AML-related identifier (aml*, dsdt, ssdt, acpica, \_SB_) has
+# leaked into src/kernel/**. See design/acpi/no-aml-in-kernel.md for
+# the full forbidden set and rationale. Runs first so a violation is
+# reported before any (slower) assembler work.
+echo "[no-aml-lint] tools/lint-no-kernel-aml.sh"
+"${REPO_ROOT}/tools/lint-no-kernel-aml.sh" || {
+    echo "[FAIL] no-AML kernel guardrail tripped (#822)" >&2
+    exit 1
+}
+
 echo "[build-user] ensuring build/user/shell.bin (R15-M1-007 embed prerequisite)"
 "${REPO_ROOT}/tools/build-user.sh"
 
