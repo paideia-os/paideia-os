@@ -87,6 +87,24 @@ while IFS= read -r -d '' pdx; do
     OBJECTS+=("${obj}")
 done < <(find "${KERNEL_SRC}" -name '*.pdx' -not -path '*/boot_panic/*' -not -path '*/boot_exc3/*' -print0 | sort -z)
 
+# R18-M5-004 (#778): compile any .pdx fixtures under tests/kernel/ into
+# kernel objects too. These live outside src/kernel/ so they do not
+# pollute the primary source tree, but they need to be linked into
+# kernel.elf so their `pub` witness functions (e.g. tlb_shootdown_witness)
+# are callable from bring-up wire-ups. Object paths are namespaced under
+# build/tests/kernel/ to keep the build tree unambiguous.
+TESTS_KERNEL_DIR="${REPO_ROOT}/tests/kernel"
+if [[ -d "${TESTS_KERNEL_DIR}" ]]; then
+    while IFS= read -r -d '' pdx; do
+        rel="${pdx#"${REPO_ROOT}"/}"
+        obj="${BUILD_DIR}/${rel%.pdx}.o"
+        mkdir -p "$(dirname "${obj}")"
+        echo "[build] paideia-as ${rel} -> ${obj#"${BUILD_DIR}"/}"
+        "${PAIDEIA_AS}" build --emit elf64 "${pdx}" -o "${obj}"
+        OBJECTS+=("${obj}")
+    done < <(find "${TESTS_KERNEL_DIR}" -name '*.pdx' -print0 | sort -z)
+fi
+
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
 if [[ ${#OBJECTS[@]} -eq 0 ]]; then
