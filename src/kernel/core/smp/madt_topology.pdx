@@ -1,0 +1,387 @@
+// src/kernel/core/smp/madt_topology.pdx — R20-M2-005 (#813)
+//
+// MADT-driven AP topology seeding — the R20.M2 successor to the R18
+// hard-coded `_ap_apic_ids : [u32; 3] = [1, 2, 3]` in ap_list.pdx.
+//
+// The R20 discovery pipeline is:
+//     RSDP  (#805, acpi/rsdp.pdx)
+//       → XSDT walker  (#806, acpi/xsdt.pdx, acpi_xsdt_find(SIG_APIC))
+//         → MADT sub-entry parsers  (#809/#810/#811/#812, acpi/madt.pdx)
+//           → topology_seed_from_madt(env)  (this file)
+//             → _madt_ap_list + _madt_ap_count populated
+//               → kernel_main.pdx AP bring-up wire chooses this list
+//                 over the hard-coded _ap_apic_ids/_ap_count.
+//
+// The hard-coded list in ap_list.pdx remains as a fallback for the
+// BIOS-boot / no-RSDP path — this module never mutates ap_list.pdx's
+// storage; instead kernel_main.pdx picks between `_madt_ap_list` and
+// `_ap_apic_ids` based on `_madt_ap_count > 0`.
+//
+// -----------------------------------------------------------------------------
+// Merge policy — LAPIC vs x2APIC entries
+// -----------------------------------------------------------------------------
+//
+// A MADT MAY publish both Type 0 (LAPIC) and Type 9 (x2APIC) entries;
+// per ACPI 6.5 §5.2.12.12, when both are present for a given logical
+// processor the x2APIC entry is authoritative. topology_seed_from_madt
+// implements this as:
+//
+//   1. Parse LAPICs (Type 0) into _madt_scratch_lapics.
+//   2. Filter into _madt_ap_list: drop BSP (apic_id == bsp_apic_id) and
+//      drop entries whose enabled+online-capable bits are both clear.
+//   3. Parse x2APICs (Type 9) into _madt_scratch_x2apics.
+//   4. For each x2APIC entry: if its x2apic_id matches an entry already
+//      in _madt_ap_list (LAPIC path), do nothing — the LAPIC entry
+//      already covers this CPU with a compatible ID. Otherwise, if
+//      x2apic_id != bsp_apic_id AND enabled: append.
+//
+// This preserves the "x2APIC wins" rule when x2APIC IDs > 255 arrive
+// (which cannot be represented in Type 0) while avoiding double-counting
+// when firmware supplies both records for a single CPU with an ID < 256
+// (the typical Alder-Lake+ hybrid layout).
+//
+// -----------------------------------------------------------------------------
+// BSP APIC-ID discovery
+// -----------------------------------------------------------------------------
+//
+// The BSP's APIC ID is read from CPUID leaf 1, EBX[31:24] — the
+// initial APIC ID assigned at CPU reset (Intel SDM Vol 3A §10.4.6 and
+// AMD APM Vol 2 §16.4.1). On x2APIC-capable systems CPUID leaf
+// 0x0B/0x1F EDX carries the full 32-bit ID, but the 8-bit initial ID
+// from leaf 1 is sufficient here because it is what a Type 0 LAPIC
+// entry's apic_id byte will match. Reading from IA32_APIC_BASE MSR +
+// LAPIC MMIO ID register would work too but requires the LAPIC to be
+// software-enabled; CPUID does not.
+//
+// -----------------------------------------------------------------------------
+// Encoder-gap posture (v0.20.1+)
+// -----------------------------------------------------------------------------
+//
+//   G1: `mov [mem], reg32` narrow-store widens → use mov_d for the u32
+//       stores into _madt_ap_list[k].
+//   G3: `add [mem], reg` not encoded → all counter bumps are
+//       load-add-store.
+//   G4: `cmp al, imm` may miscompile → we operate on full registers
+//       with explicit zero-extension.
+
+module MadtTopology = structure {
+  // ============================================================================
+  // Static caps
+  // ============================================================================
+
+  pub let MAX_APS      : u64 = 64
+  pub let MAX_IOAPICS  : u64 = 8
+  pub let MAX_ISOS     : u64 = 32
+
+  // ============================================================================
+  // Output arrays populated by topology_seed_from_madt.
+  // ============================================================================
+  //
+  // _madt_ap_list is the AP-only APIC-ID array kernel_main.pdx feeds
+  // to ap_bring_up_all when _madt_ap_count > 0. BSP is filtered out.
+  // Each slot is u32 to match ap_bring_up_all's 4-byte-stride reader
+  // (see ap_launch.pdx:160 `mov ecx, [r12]`).
+
+  pub let mut _madt_ap_list  : [u32; 64] = uninit @align(4)
+  pub let mut _madt_ap_count : u64 = 0
+
+  // ============================================================================
+  // Parser scratch buffers (interior — not consumed outside this module).
+  // ============================================================================
+  //
+  // Sized so each fits its parser's fixed record size × MAX_*:
+  //   _madt_scratch_lapics    : 16 B × 64 = 1024 B = 128 × u64
+  //   _madt_scratch_ioapics   : 24 B ×  8 =  192 B =  24 × u64
+  //   _madt_scratch_isos      : 16 B × 32 =  512 B =  64 × u64
+  //   _madt_scratch_x2apics   : 24 B × 64 = 1536 B = 192 × u64
+  //   _madt_scratch_lapic_nmi : 16 B × 64 = 1024 B = 128 × u64
+  //
+  // All @align(8) — parser records begin on qword boundaries, no
+  // straddle at the record boundary.
+
+  pub let mut _madt_scratch_lapics     : [u64; 128] = uninit @align(8)
+  pub let mut _madt_scratch_ioapics    : [u64;  24] = uninit @align(8)
+  pub let mut _madt_scratch_isos       : [u64;  64] = uninit @align(8)
+  pub let mut _madt_scratch_x2apics    : [u64; 192] = uninit @align(8)
+  pub let mut _madt_scratch_lapic_nmis : [u64; 128] = uninit @align(8)
+
+  // Cached (per-boot) counts — informational, useful for post-boot
+  // klog diagnostics.
+  pub let mut _madt_n_lapics    : u64 = 0
+  pub let mut _madt_n_ioapics   : u64 = 0
+  pub let mut _madt_n_isos      : u64 = 0
+  pub let mut _madt_n_x2apics   : u64 = 0
+  pub let mut _madt_n_lapic_nmi : u64 = 0
+
+  // Cached LAPIC MMIO base (with Type-5 override applied).
+  pub let mut _madt_lapic_base : u64 = 0
+
+  // ============================================================================
+  // topology_seed_from_madt(env) -> u64
+  // ============================================================================
+  //
+  // SysV: (env: u64) -> u64
+  //
+  //   rdi = pointer to a boot_env_t (may be 0 if the boot path did not
+  //         populate one — e.g. legacy BIOS).
+  //
+  // Returns rax = _madt_ap_count.
+  //
+  // Side effects (all .bss stores):
+  //   _madt_ap_list[0.._madt_ap_count) — u32 APIC IDs of APs (BSP filtered).
+  //   _madt_ap_count                    — # APs populated.
+  //   _madt_scratch_*                   — raw parser results.
+  //   _madt_n_*                         — parser return counts (informational).
+  //   _madt_lapic_base                  — resolved LAPIC MMIO base.
+  //
+  // On any early bailout (env==0, no RSDP, ACPI < 2.0, no XSDT, no MADT),
+  // returns 0 and leaves _madt_ap_count = 0 — the caller then falls
+  // back to the hard-coded R18 _ap_apic_ids list.
+  //
+  // Register plan: 5 callee-save pushes (rbx, r12, r13, r14, r15) hold
+  // state across the nested acpi_find_rsdp, acpi_xsdt_find, madt_parse_*
+  // calls. entry rsp % 16 == 8 → +5*8 = +40 → rsp % 16 == 0 pre-call
+  // (SysV requirement).
+  //   r12 = BSP APIC ID (kept across all merge loops)
+  //   r13 = madt pointer (kept across parse calls)
+  //   r14 = current LAPIC record cursor / x2APIC record cursor
+  //   r15 = current output slot index into _madt_ap_list
+
+  pub let topology_seed_from_madt : (u64) -> u64 !{mem, sysreg} @{boot} =
+    fn (env: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { boot },
+      justification: "R20-M2-005 (#813). Replaces R18's hard-coded _ap_apic_ids/[u32;3] with MADT-derived enumeration. Full pipeline: (1) rsdp = acpi_find_rsdp(env). If 0 → return 0 (BIOS-boot path with no ACPI; caller falls back to hard-coded). (2) rsdp->revision (u8 @ +15) < 2 → return 0 (ACPI 1.0 with no XSDT; not R20-supported). (3) xsdt_pa = rsdp->xsdt_address (u64 @ +0x18); if 0 → return 0. (4) madt = acpi_xsdt_find(xsdt_pa, SIG_APIC=0x43495041). If 0 → return 0 (no MADT indexed by XSDT). (5) Read BSP APIC ID via CPUID.1 → EBX[31:24] into r12 (the initial-APIC-ID byte per Intel SDM Vol 3A §10.4.6). This is what a Type 0 LAPIC entry's apic_id byte matches — using CPUID rather than the LAPIC MMIO ID register avoids needing the LAPIC to be software-enabled and is what Linux init/x86/kernel/apic/apic.c also does at the same stage. CPUID clobbers rax/rbx/rcx/rdx; rbx (SysV callee-save) is spilled at prologue so its clobber-and-restore is transparent to caller. (6) Cache _madt_lapic_base = madt_lapic_address(madt). (7) Parse LAPICs into _madt_scratch_lapics up to MAX_APS=64; cache count in _madt_n_lapics. (8) Filter LAPICs into _madt_ap_list: for each of _madt_n_lapics entries at offset k*16, load apic_id (u32 @ +4) and flags (u32 @ +8); skip if apic_id == bsp OR (flags & 3) == 0 (both enabled and online-capable bits clear). Append surviving entries to _madt_ap_list[r15] via mov_d (G1: 32-bit sized store). r15 tracks the AP slot; capped at MAX_APS. (9) Parse x2APICs into _madt_scratch_x2apics; cache count in _madt_n_x2apics. (10) For each x2APIC entry (x2apic_id @ +4, flags @ +8): dedupe by scanning _madt_ap_list[0..r15) for a matching u32; if found, skip. If x2apic_id != bsp AND (flags & 1) set AND slot free: append. This preserves the ACPI 6.5 §5.2.12.12 rule that x2APIC wins for same CPU, while avoiding double-counts when firmware supplies both entries for a single CPU with a small ID. (11) Also parse IOAPICs/ISOs/NMIs into their scratch slots and cache their counts — these are not consumed by AP bring-up but are needed by R20.M3+ IOAPIC init and are cheap to gather here. (12) Store final count into _madt_ap_count; return it. Encoder-gap workarounds throughout: G1 (mov_d for _madt_ap_list stores), G3 (load-add-store for any counter bumps — none needed here since counts are single-shot register→store), G4 (all comparisons on full 64-bit registers after zero-extension). Register plan: 5 callee-save pushes (rbx=r12/13/14/15) — rbx used to hold BSP APIC ID across the many nested calls (CPUID's forced ebx clobber is bracketed by the push/pop, matching topology.pdx L203-206). r12 = madt ptr. r13 = LAPIC scratch cursor. r14 = slot index (populated as _madt_ap_list write cursor). r15 = LAPIC/x2APIC entry counter across merge passes.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // Save env (rdi) — we don't need it beyond acpi_find_rsdp.
+
+        // ---- (1) rsdp = acpi_find_rsdp(env) ----
+        call acpi_find_rsdp;
+        cmp rax, 0;
+        je  seed_bail;
+
+        mov r12, rax;                          // r12 = rsdp
+
+        // ---- (2) reject ACPI 1.0 (revision < 2) ----
+        xor rcx, rcx;
+        mov_b rcx, [r12 + 15];                 // rsdp->revision
+        cmp rcx, 2;
+        jb  seed_bail;
+
+        // ---- (3) xsdt_pa = rsdp->xsdt_address (u64 @ +0x18 == +24) ----
+        mov rdi, [r12 + 24];
+        cmp rdi, 0;
+        je  seed_bail;
+
+        // ---- (4) madt = acpi_xsdt_find(xsdt_pa, SIG_APIC) ----
+        mov rsi, 0x43495041;                   // SIG_APIC
+        call acpi_xsdt_find;
+        cmp rax, 0;
+        je  seed_bail;
+
+        mov r13, rax;                          // r13 = madt
+
+        // ---- (5) rbx = BSP APIC ID from CPUID.1 EBX[31:24] ----
+        mov rax, 1;
+        xor rcx, rcx;
+        cpuid;
+        // Extract EBX[31:24] — the initial APIC ID byte.
+        mov rbx, rbx;                          // (identity; here for clarity)
+        shr rbx, 24;
+        and rbx, 0xFF;                         // rbx = bsp_apic_id (u8-widened)
+
+        // ---- (6) cache _madt_lapic_base ----
+        mov rdi, r13;
+        call madt_lapic_address;
+        mov [rip + _madt_lapic_base], rax;
+
+        // ---- (7) parse LAPICs into scratch ----
+        mov rdi, r13;
+        lea rsi, [rip + _madt_scratch_lapics];
+        mov rdx, 64;                           // MAX_APS
+        call madt_parse_lapics;
+        mov [rip + _madt_n_lapics], rax;
+
+        // ---- (8) filter into _madt_ap_list ----
+        //   r14 = write-cursor slot index (0..MAX_APS)
+        //   r15 = read cursor: current LAPIC scratch entry index
+        //   Loop terminator: r15 >= _madt_n_lapics
+        xor r14, r14;
+        xor r15, r15;
+
+      seed_lapic_filter_loop:
+        mov rax, [rip + _madt_n_lapics];
+        cmp r15, rax;
+        jae seed_lapic_filter_done;
+
+        // Compute record address: _madt_scratch_lapics + r15 * 16
+        mov rax, r15;
+        shl rax, 4;
+        lea rcx, [rip + _madt_scratch_lapics];
+        add rcx, rax;                          // rcx = &record
+
+        // apic_id (u32 @ +4)
+        mov edx, [rcx + 4];                    // 32-bit load, zero-ext into rdx
+
+        // flags (u32 @ +8)
+        mov eax, [rcx + 8];                    // rax = flags (zero-ext)
+
+        // Filter (a): drop BSP entry
+        cmp rdx, rbx;
+        je  seed_lapic_filter_next;
+
+        // Filter (b): drop if enabled+online-capable bits BOTH clear
+        //   (flags & 3) == 0 → skip.
+        and rax, 3;
+        cmp rax, 0;
+        je  seed_lapic_filter_next;
+
+        // Cap check
+        cmp r14, 64;                           // MAX_APS
+        jae seed_lapic_filter_next;
+
+        // Append: _madt_ap_list[r14] = apic_id (u32)
+        lea rax, [rip + _madt_ap_list];
+        mov r9, r14;
+        shl r9, 2;                             // slot offset = r14 * 4
+        add rax, r9;
+        mov_d [rax], rdx;                      // G1: 32-bit sized store
+
+        add r14, 1;
+
+      seed_lapic_filter_next:
+        add r15, 1;
+        jmp seed_lapic_filter_loop;
+
+      seed_lapic_filter_done:
+
+        // ---- (9) parse x2APICs into scratch ----
+        mov rdi, r13;
+        lea rsi, [rip + _madt_scratch_x2apics];
+        mov rdx, 64;                           // MAX_APS
+        call madt_parse_x2apics;
+        mov [rip + _madt_n_x2apics], rax;
+
+        // ---- (10) merge x2APICs with dedup ----
+        //   r14 stays as write-cursor (continues past LAPIC append).
+        //   r15 = current x2APIC scratch index
+        xor r15, r15;
+
+      seed_x2apic_merge_loop:
+        mov rax, [rip + _madt_n_x2apics];
+        cmp r15, rax;
+        jae seed_x2apic_merge_done;
+
+        // record addr = _madt_scratch_x2apics + r15 * 24
+        mov rax, r15;
+        shl rax, 3;                            // r15 * 8
+        mov r10, rax;
+        mov rax, r15;
+        shl rax, 4;                            // r15 * 16
+        add rax, r10;                          // rax = r15 * 24
+        lea rcx, [rip + _madt_scratch_x2apics];
+        add rcx, rax;                          // rcx = &record
+
+        // x2apic_id @ +4
+        mov edx, [rcx + 4];                    // rdx = x2apic_id
+
+        // flags @ +8
+        mov eax, [rcx + 8];                    // rax = flags
+
+        // Filter (a): drop BSP
+        cmp rdx, rbx;
+        je  seed_x2apic_merge_next;
+
+        // Filter (b): (flags & 1) == 0 (enabled bit) → skip
+        and rax, 1;
+        cmp rax, 0;
+        je  seed_x2apic_merge_next;
+
+        // Dedup: scan _madt_ap_list[0..r14) for a matching u32.
+        //   r8 = search cursor (0..r14)
+        //   r9 = per-iteration scratch (list entry, computed VA)
+        xor r8, r8;
+
+      seed_x2apic_dedup_loop:
+        cmp r8, r14;
+        jae seed_x2apic_dedup_notfound;
+
+        lea r9, [rip + _madt_ap_list];
+        mov r11, r8;
+        shl r11, 2;                            // r8 * 4
+        add r9, r11;
+        mov eax, [r9];                         // zero-ext u32 load
+        cmp rax, rdx;
+        je  seed_x2apic_merge_next;            // duplicate — skip append
+
+        add r8, 1;
+        jmp seed_x2apic_dedup_loop;
+
+      seed_x2apic_dedup_notfound:
+        // Cap check
+        cmp r14, 64;
+        jae seed_x2apic_merge_next;
+
+        // Append: _madt_ap_list[r14] = x2apic_id (u32)
+        lea rax, [rip + _madt_ap_list];
+        mov r9, r14;
+        shl r9, 2;
+        add rax, r9;
+        mov_d [rax], rdx;
+
+        add r14, 1;
+
+      seed_x2apic_merge_next:
+        add r15, 1;
+        jmp seed_x2apic_merge_loop;
+
+      seed_x2apic_merge_done:
+
+        // ---- (11) parse remaining table types (informational cache) ----
+        mov rdi, r13;
+        lea rsi, [rip + _madt_scratch_ioapics];
+        mov rdx, 8;                            // MAX_IOAPICS
+        call madt_parse_ioapics;
+        mov [rip + _madt_n_ioapics], rax;
+
+        mov rdi, r13;
+        lea rsi, [rip + _madt_scratch_isos];
+        mov rdx, 32;                           // MAX_ISOS
+        call madt_parse_isos;
+        mov [rip + _madt_n_isos], rax;
+
+        mov rdi, r13;
+        lea rsi, [rip + _madt_scratch_lapic_nmis];
+        mov rdx, 64;                           // MAX_APS
+        call madt_parse_lapic_nmis;
+        mov [rip + _madt_n_lapic_nmi], rax;
+
+        // ---- (12) publish _madt_ap_count ----
+        mov [rip + _madt_ap_count], r14;
+
+        mov rax, r14;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      seed_bail:
+        // Leave _madt_ap_count untouched (starts at 0). Return 0.
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

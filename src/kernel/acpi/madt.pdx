@@ -1,0 +1,865 @@
+// src/kernel/acpi/madt.pdx — R20-M2-001..004 (#809, #810, #811, #812)
+//
+// MADT (Multiple APIC Description Table) sub-entry parsers. The MADT
+// (SDT signature "APIC", SIG_APIC = 0x43495041 in SdtHdr) is the ACPI
+// table that describes the machine's interrupt topology:
+//
+//   - Local APICs (one per logical processor, x2APIC extension for
+//     32-bit APIC IDs) — the R20.M2 successor to R18's hard-coded
+//     `_ap_apic_ids : [u32; 3] = [1, 2, 3]` in core/smp/ap_list.pdx.
+//   - I/O APICs (one or more; each covers a GSI range).
+//   - Interrupt Source Overrides (ISA IRQ → GSI remapping records).
+//   - Local APIC NMI wiring (LINT# assignment per processor).
+//
+// The layered R20 pipeline is:
+//   RSDP (#805)  →  XSDT walker (#806)  →  MADT sub-entry parsers (M2)
+//
+// The R20.M1 XSDT walker (`acpi_xsdt_find(xsdt, SIG_APIC)`, xsdt.pdx)
+// returns a pointer to the MADT header; this module walks the
+// variable-length sub-entry stream that follows.
+//
+// -----------------------------------------------------------------------------
+// MADT layout (ACPI 6.5 §5.2.12)
+// -----------------------------------------------------------------------------
+//
+//   +0..35    sdt_hdr (see sdt_hdr.pdx) — signature "APIC" + length + ...
+//   +36 (0x24) u32  local_apic_address — legacy 32-bit MMIO base
+//                                        (0xFEE00000 typical, may be
+//                                         overridden by a Type 5 entry).
+//   +40 (0x28) u32  flags — bit 0 = PC-AT-compatible (has legacy 8259;
+//                           the OS must mask them).
+//   +44 (0x2C) [sub-entries] — variable-length TLV records:
+//
+//     Every sub-entry begins with:
+//        +0  u8  type
+//        +1  u8  length   (total record size including this header)
+//
+//   Sub-entry types parsed here (§5.2.12.2 .. §5.2.12.13):
+//     0  Local APIC (LAPIC)             — 8 bytes
+//     1  I/O APIC                       — 12 bytes
+//     2  Interrupt Source Override (ISO)— 10 bytes
+//     4  Local APIC NMI                 — 6 bytes
+//     5  Local APIC Address Override    — 12 bytes
+//     9  Processor Local x2APIC         — 16 bytes
+//
+// Types 3, 6, 7, 8, 0xA..0x10 are silently skipped by the walker's
+// `length`-based advance — the walker never dereferences their body
+// beyond the (type, length) header.
+//
+// -----------------------------------------------------------------------------
+// Storage model
+// -----------------------------------------------------------------------------
+//
+// Each parser fills a caller-provided static array (typically one of the
+// `_madt_*` slots below) with fixed-size records — the record layouts do
+// not mirror the on-wire ACPI records; they are cache-line-friendly
+// representations tuned for downstream consumers (topology_seed_from_madt,
+// ioapic_init, isa_irq_remap):
+//
+//   lapic_entry   (16 B) : acpi_uid (u32) + apic_id (u32) + flags (u32) + _pad (u32)
+//   ioapic_entry  (24 B) : id (u64) + mmio_base (u64) + gsi_base (u32) + _pad (u32)
+//   iso_entry     (16 B) : source_irq (u32) + gsi (u32) + flags (u32) + _pad (u32)
+//   x2apic_entry  (24 B) : acpi_uid (u32) + x2apic_id (u32) + flags (u32) + _pad0 (u32) + _pad1 (u64)
+//   lapic_nmi_entry (16B): processor_uid (u32) + flags (u32) + lint (u32) + _pad (u32)
+//
+// If the MADT holds more matching sub-entries than the caller's `max`
+// cap allows, the parser bumps a per-type `_madt_dropped_*_count` slot
+// rather than corrupting memory past the array — the count is a
+// diagnostic surface for the R20.M3+ MADT wire-in code to log.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.20.1+)
+// -----------------------------------------------------------------------------
+//
+// The R20.M2 gap sheet handed to this module lists four hazards:
+//
+//   (G1) `mov [mem], reg32` narrow-store silently widens to REX.W
+//        → use the sized `mov_d [mem], reg` mnemonic (see #662 Fix B,
+//          apic/eoi.pdx, apic/tsc_deadline.pdx). Every u32 field write
+//          in this module uses `mov_d`.
+//   (G2) `not reg` not encoded → we never invert bits in this module.
+//   (G3) `add [mem], reg` not encoded → the drop-counter bumps use
+//        an explicit load-add-store (`mov rax, [rip+_c]; add rax, 1;
+//        mov [rip+_c], rax`) rather than the missing RMW form.
+//   (G4) `cmp al, imm` may miscompile → we stay in full-register
+//        `cmp rN, imm` throughout after `xor rN,rN; mov_b rN,[mem]`
+//        zero-extension, same posture as acpi/checksum.pdx.
+//
+// -----------------------------------------------------------------------------
+// Register plan (shared across the 5 parsers)
+// -----------------------------------------------------------------------------
+//
+//   Prologue: 5 callee-save pushes (rbx, r12, r13, r14, r15).
+//     entry rsp % 16 == 8 → +5*8 = +40 → rsp % 16 == 0 at loop body.
+//     Parsers are leaf (no nested call), so alignment is not
+//     load-bearing; the discipline mirrors ap_launch.pdx.
+//
+//   Loop invariants:
+//     rbx = out array base (caller's arg1)
+//     r12 = madt base       (caller's arg0)
+//     r13 = end = madt + madt->length
+//     r14 = cursor (advances by sub-entry length each iteration)
+//     r15 = matching-count accumulator (return value)
+//     r8  = max cap (caller's arg2, saved before rdx gets clobbered)
+//
+//   Scratch: rax (address / value), rcx (type), rdx (length),
+//            r9  (out-slot address = out + count * record_size).
+
+module Madt = structure {
+
+  // ============================================================================
+  // Layout constants
+  // ============================================================================
+
+  pub let MADT_OFFSET_LAPIC_ADDR   : u64 = 36     // u32 legacy LAPIC base
+  pub let MADT_OFFSET_FLAGS        : u64 = 40     // u32 flags (bit 0 = PC-AT)
+  pub let MADT_OFFSET_SUBENTRIES   : u64 = 44     // variable-length TLV stream
+
+  // Sub-entry type codes (ACPI 6.5 §5.2.12.2 ..)
+  pub let MADT_TYPE_LAPIC          : u64 = 0
+  pub let MADT_TYPE_IOAPIC         : u64 = 1
+  pub let MADT_TYPE_ISO            : u64 = 2
+  pub let MADT_TYPE_LAPIC_NMI      : u64 = 4
+  pub let MADT_TYPE_LAPIC_ADDR_OVR : u64 = 5
+  pub let MADT_TYPE_X2APIC         : u64 = 9
+
+  // Sub-entry body sizes (informational; the walker trusts the on-wire
+  // `length` byte for advance, not these constants).
+  pub let MADT_LEN_LAPIC           : u64 = 8
+  pub let MADT_LEN_IOAPIC          : u64 = 12
+  pub let MADT_LEN_ISO             : u64 = 10
+  pub let MADT_LEN_LAPIC_NMI       : u64 = 6
+  pub let MADT_LEN_LAPIC_ADDR_OVR  : u64 = 12
+  pub let MADT_LEN_X2APIC          : u64 = 16
+
+  // Fixed record sizes for the caller-provided output arrays.
+  pub let LAPIC_ENTRY_SIZE         : u64 = 16
+  pub let IOAPIC_ENTRY_SIZE        : u64 = 24
+  pub let ISO_ENTRY_SIZE           : u64 = 16
+  pub let X2APIC_ENTRY_SIZE        : u64 = 24
+  pub let LAPIC_NMI_ENTRY_SIZE     : u64 = 16
+
+  // ============================================================================
+  // Overflow diagnostic counters (per-type)
+  // ============================================================================
+  //
+  // Incremented when a sub-entry matches the parser's target type but the
+  // caller's `max` cap is exhausted. .bss zero-init means an untouched
+  // MADT walk reads 0; the R20.M3+ MADT wire-in code will inspect these
+  // to emit a "MADT lapic overflow: N entries dropped" diagnostic when
+  // non-zero. G3 workaround: the increment is load-add-store, not the
+  // missing `add [mem], reg` RMW form.
+
+  pub let mut _madt_dropped_lapic_count     : u64 = 0
+  pub let mut _madt_dropped_ioapic_count    : u64 = 0
+  pub let mut _madt_dropped_iso_count       : u64 = 0
+  pub let mut _madt_dropped_x2apic_count    : u64 = 0
+  pub let mut _madt_dropped_lapic_nmi_count : u64 = 0
+
+  // ============================================================================
+  // madt_parse_lapics — Type 0 (Local APIC) sub-entries
+  // ============================================================================
+  //
+  // SysV: (madt: u64, out: u64, max: u64) -> u64
+  //
+  //   rdi = MADT base (a valid *sdt_hdr with signature "APIC", checksum
+  //         validated by the caller via acpi_checksum_ok).
+  //   rsi = out array (caller-allocated [lapic_entry; max], 16-byte records).
+  //   rdx = max — capacity ceiling; entries past this cap increment
+  //         _madt_dropped_lapic_count.
+  //
+  // Returns rax = number of Type 0 entries written to `out`.
+  //
+  // Per-record on-wire layout (ACPI 6.5 §5.2.12.2):
+  //   +0 u8 type=0     +1 u8 len=8    +2 u8 acpi_uid    +3 u8 apic_id
+  //   +4 u32 flags (bit 0 = enabled, bit 1 = online-capable)
+  //
+  // Record written to out[count]:
+  //   +0 u32 acpi_uid  (zero-extended from u8)
+  //   +4 u32 apic_id   (zero-extended from u8)
+  //   +8 u32 flags     (verbatim u32)
+  //  +12 u32 _pad      (zero — reserved for downstream cache-line packing)
+  //
+  // Note on G1: every u32 store here is `mov_d [r9+off], eax`, not the
+  // bare `mov [r9+off], eax` that widens to REX.W and would clobber
+  // adjacent record bytes.
+
+  pub let madt_parse_lapics : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (madt: u64, out: u64, max: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R20-M2-001 (#809). Type 0 (Local APIC) MADT sub-entry parser. Walks the variable-length TLV stream at madt+MADT_OFFSET_SUBENTRIES (0x2C) up to madt+madt->length. Per iteration: (a) bounds-guard 2 bytes for the (type, length) header; (b) zero-extend-load type (u8) and length (u8) via xor+mov_b; (c) reject length<2 (would infinite-loop) or cursor+length>end (malformed truncated entry) — both bail cleanly returning the count-so-far; (d) if type == MADT_TYPE_LAPIC (0): if count < max, extract acpi_uid/apic_id/flags into out[count*16], increment count; else bump _madt_dropped_lapic_count via load-add-store (G3 workaround for missing `add [mem], reg` RMW). Advance cursor by length regardless of type match — this is the mechanism by which non-Type-0 records (Type 1, 2, 4, 5, 9, ...) are skipped without dereferencing their body beyond the header. Loop invariants: rbx=out, r12=madt, r13=end, r14=cursor, r15=count, r8=max. All u32 field writes go through `mov_d` (G1 workaround) to prevent silent REX.W widening that would corrupt the 4 bytes at +12 (_pad) or beyond. Byte reads use `xor rN,rN; mov_b rN,[mem]` for explicit zero-extension (G4 posture — the compare against target type stays in full-register). Leaf function; 5-push callee-save prologue keeps rsp%16==0 across the body for review-symmetry with ap_launch.pdx even though no nested call needs the alignment.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Save args into invariant registers ----
+        mov r12, rdi;                          // r12 = madt base
+        mov rbx, rsi;                          // rbx = out base
+        mov r8,  rdx;                          // r8  = max
+
+        // ---- end = madt + madt->length (u32 @ +4, zero-extended) ----
+        xor rax, rax;
+        mov eax, [r12 + 4];
+        mov r13, r12;
+        add r13, rax;
+
+        // ---- cursor = madt + 0x2C ----
+        mov r14, r12;
+        add r14, 44;
+
+        // ---- count = 0 ----
+        xor r15, r15;
+
+      madt_lapic_loop:
+        // Need at least 2 bytes for (type, length) header.
+        mov rax, r14;
+        add rax, 2;
+        cmp rax, r13;
+        ja  madt_lapic_done;
+
+        // type = *(u8*)(cursor+0)
+        xor rcx, rcx;
+        mov_b rcx, [r14];
+
+        // length = *(u8*)(cursor+1)
+        xor rdx, rdx;
+        mov_b rdx, [r14 + 1];
+
+        // length < 2 → malformed; bail rather than loop forever.
+        cmp rdx, 2;
+        jb  madt_lapic_done;
+
+        // cursor + length > end → truncated; bail.
+        mov rax, r14;
+        add rax, rdx;
+        cmp rax, r13;
+        ja  madt_lapic_done;
+
+        // Type dispatch. MADT_TYPE_LAPIC = 0.
+        cmp rcx, 0;
+        jne madt_lapic_next;
+
+        // Match — check capacity.
+        cmp r15, r8;
+        jae madt_lapic_drop;
+
+        // out_slot = out + count * 16
+        mov rax, r15;
+        shl rax, 4;                            // *16
+        mov r9,  rbx;
+        add r9,  rax;
+
+        // acpi_uid (u8 at +2) → u32 at out+0
+        xor rax, rax;
+        mov_b rax, [r14 + 2];
+        mov_d [r9 + 0], rax;                   // G1: sized 32-bit store
+
+        // apic_id (u8 at +3) → u32 at out+4
+        xor rax, rax;
+        mov_b rax, [r14 + 3];
+        mov_d [r9 + 4], rax;
+
+        // flags (u32 at +4) → u32 at out+8. 32-bit load zero-extends.
+        mov eax, [r14 + 4];
+        mov_d [r9 + 8], rax;
+
+        // _pad = 0
+        xor rax, rax;
+        mov_d [r9 + 12], rax;
+
+        add r15, 1;
+        jmp madt_lapic_next;
+
+      madt_lapic_drop:
+        // G3: load-add-store on _madt_dropped_lapic_count.
+        mov rax, [rip + _madt_dropped_lapic_count];
+        add rax, 1;
+        mov [rip + _madt_dropped_lapic_count], rax;
+        // Fall through.
+
+      madt_lapic_next:
+        add r14, rdx;                          // cursor += length
+        jmp madt_lapic_loop;
+
+      madt_lapic_done:
+        mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // madt_parse_ioapics — Type 1 (I/O APIC) sub-entries
+  // ============================================================================
+  //
+  // SysV: (madt: u64, out: u64, max: u64) -> u64
+  //
+  // Per-record on-wire layout (ACPI 6.5 §5.2.12.3):
+  //   +0 u8 type=1  +1 u8 len=12  +2 u8 ioapic_id  +3 u8 reserved
+  //   +4 u32 ioapic_mmio_address    +8 u32 gsi_base
+  //
+  // Record written to out[count] (24 bytes):
+  //   +0  u64 id           (zero-extended from u8)
+  //   +8  u64 mmio_base    (zero-extended from u32 — I/O APIC MMIO
+  //                          lives in low 4 GiB on every known
+  //                          platform, but the u64 slot leaves room
+  //                          for future 64-bit relocation)
+  // +16  u32 gsi_base
+  // +20  u32 _pad
+
+  pub let madt_parse_ioapics : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (madt: u64, out: u64, max: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R20-M2-002 (#810). Type 1 (I/O APIC) MADT sub-entry parser. Same iteration skeleton as madt_parse_lapics (see that fn's justification for the loop invariants, bounds checks, and encoder-gap workarounds). Type-specific extraction: ioapic_id (u8) → u64 at out+0 (widened for register-width future-proofing), mmio_base (u32) → u64 at out+8 (widened for same reason — no known IOAPIC lives above 4 GiB but the ACPI 6.5 spec leaves the field u32 at the source, so we widen at store time to match the eventual mmap-based mapper's u64 addressing surface), gsi_base (u32) → u32 at out+16 via mov_d. Store record size = IOAPIC_ENTRY_SIZE (24); count*24 computed as `mov rax,count; shl rax,3; mov r10,rax; shl rax,1; add rax,r10` (24 = 8 + 16 = 8*(1+2)) — avoids the missing `imul` primitive by expressing 24*count as 8*count + 16*count. Overflow-cap path bumps _madt_dropped_ioapic_count via load-add-store (G3).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                          // madt
+        mov rbx, rsi;                          // out
+        mov r8,  rdx;                          // max
+
+        xor rax, rax;
+        mov eax, [r12 + 4];
+        mov r13, r12;
+        add r13, rax;                          // end
+
+        mov r14, r12;
+        add r14, 44;                           // cursor
+
+        xor r15, r15;                          // count
+
+      madt_ioapic_loop:
+        mov rax, r14;
+        add rax, 2;
+        cmp rax, r13;
+        ja  madt_ioapic_done;
+
+        xor rcx, rcx;
+        mov_b rcx, [r14];                      // type
+
+        xor rdx, rdx;
+        mov_b rdx, [r14 + 1];                  // length
+
+        cmp rdx, 2;
+        jb  madt_ioapic_done;
+
+        mov rax, r14;
+        add rax, rdx;
+        cmp rax, r13;
+        ja  madt_ioapic_done;
+
+        cmp rcx, 1;                            // MADT_TYPE_IOAPIC
+        jne madt_ioapic_next;
+
+        cmp r15, r8;
+        jae madt_ioapic_drop;
+
+        // out_slot = out + count * 24 (= count*8 + count*16)
+        mov rax, r15;
+        shl rax, 3;                            // count * 8
+        mov r10, rax;                          // stash count*8
+        mov rax, r15;
+        shl rax, 4;                            // count * 16
+        add rax, r10;                          // rax = count * 24
+        mov r9,  rbx;
+        add r9,  rax;
+
+        // ioapic_id (u8 at +2) → u64 at out+0
+        xor rax, rax;
+        mov_b rax, [r14 + 2];
+        mov [r9 + 0], rax;                     // full u64 store OK for u64 slot
+
+        // mmio_base (u32 at +4) → u64 at out+8 (zero-extended)
+        xor rax, rax;
+        mov eax, [r14 + 4];
+        mov [r9 + 8], rax;
+
+        // gsi_base (u32 at +8) → u32 at out+16
+        mov eax, [r14 + 8];
+        mov_d [r9 + 16], rax;
+
+        // _pad = 0
+        xor rax, rax;
+        mov_d [r9 + 20], rax;
+
+        add r15, 1;
+        jmp madt_ioapic_next;
+
+      madt_ioapic_drop:
+        mov rax, [rip + _madt_dropped_ioapic_count];
+        add rax, 1;
+        mov [rip + _madt_dropped_ioapic_count], rax;
+
+      madt_ioapic_next:
+        add r14, rdx;
+        jmp madt_ioapic_loop;
+
+      madt_ioapic_done:
+        mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // madt_lapic_address — resolve LAPIC MMIO base (with Type 5 override)
+  // ============================================================================
+  //
+  // SysV: (madt: u64) -> u64
+  //
+  // Returns the LAPIC MMIO base address to use for xAPIC accesses:
+  //   1. Walk sub-entries looking for a Type 5 (Local APIC Address
+  //      Override) record. If found, return its 64-bit override.
+  //   2. Otherwise return the u32 at madt+MADT_OFFSET_LAPIC_ADDR
+  //      (typically 0xFEE00000), zero-extended to u64.
+  //
+  // Type 5 body (ACPI 6.5 §5.2.12.8):
+  //   +0 u8 type=5   +1 u8 len=12   +2 u16 reserved
+  //   +4 u64 local_apic_address (aligned unaligned within MADT stream)
+  //
+  // Note on alignment: the u64 at Type-5 offset +4 lands 4-aligned
+  // relative to the record start; the record itself may land at any
+  // offset within the MADT (sub-entries are byte-packed). x86-64
+  // tolerates unaligned qword reads per SDM Vol.3 §7.1.1, matching
+  // the same posture xsdt.pdx L109 uses for its u64 entry-pointer
+  // loads. First Type 5 wins if multiple appear (per spec they
+  // should not).
+
+  pub let madt_lapic_address : (u64) -> u64 !{mem} @{} =
+    fn (madt: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R20-M2-002 (#810). Resolve the effective LAPIC MMIO base address for xAPIC accesses. Walks the MADT sub-entry stream once looking for a Type 5 (Local APIC Address Override) record — if present, its 64-bit body at cursor+4 replaces the 32-bit MADT header field. If absent, return the u32 at madt+MADT_OFFSET_LAPIC_ADDR (36) zero-extended. Same TLV walk shape as madt_parse_lapics minus the out-array bookkeeping — 3 callee-save pushes (r12=madt, r13=end, r14=cursor) instead of 5. Type 5's 64-bit body at cursor+4 loaded via `mov rax, [r14+4]` — spec-legal unaligned qword read (matches xsdt.pdx entry-pointer loads). First match wins; multiple Type 5 records are architecturally invalid but we defensively stop at the first. Fallback path: `xor rax,rax; mov eax, [r12+36]` zero-extends the u32 legacy base into the u64 return slot — matches the xAPIC MMIO convention that base is always <4 GiB on all shipping hardware. Leaf function; no nested call.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                          // madt
+
+        xor rax, rax;
+        mov eax, [r12 + 4];
+        mov r13, r12;
+        add r13, rax;                          // end
+
+        mov r14, r12;
+        add r14, 44;                           // cursor
+
+      madt_addr_loop:
+        mov rax, r14;
+        add rax, 2;
+        cmp rax, r13;
+        ja  madt_addr_fallback;
+
+        xor rcx, rcx;
+        mov_b rcx, [r14];                      // type
+
+        xor rdx, rdx;
+        mov_b rdx, [r14 + 1];                  // length
+
+        cmp rdx, 2;
+        jb  madt_addr_fallback;
+
+        mov rax, r14;
+        add rax, rdx;
+        cmp rax, r13;
+        ja  madt_addr_fallback;
+
+        cmp rcx, 5;                            // MADT_TYPE_LAPIC_ADDR_OVR
+        jne madt_addr_next;
+
+        // Found override — read u64 at cursor+4 and return.
+        mov rax, [r14 + 4];
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      madt_addr_next:
+        add r14, rdx;
+        jmp madt_addr_loop;
+
+      madt_addr_fallback:
+        // No override — return the u32 legacy base zero-extended.
+        xor rax, rax;
+        mov eax, [r12 + 36];                   // MADT_OFFSET_LAPIC_ADDR
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // madt_parse_isos — Type 2 (Interrupt Source Override) sub-entries
+  // ============================================================================
+  //
+  // SysV: (madt: u64, out: u64, max: u64) -> u64
+  //
+  // Per-record on-wire layout (ACPI 6.5 §5.2.12.5):
+  //   +0 u8 type=2  +1 u8 len=10  +2 u8 bus=0  +3 u8 source_irq
+  //   +4 u32 gsi                  +8 u16 mps_inti_flags
+  //
+  // Record written to out[count] (16 bytes):
+  //   +0 u32 source_irq  (zero-extended from u8)
+  //   +4 u32 gsi
+  //   +8 u32 flags       (zero-extended from u16 mps_inti_flags)
+  // +12 u32 _pad
+
+  pub let madt_parse_isos : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (madt: u64, out: u64, max: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R20-M2-003 (#811). Type 2 (Interrupt Source Override) MADT sub-entry parser. Extracts the ISA-IRQ → GSI remap records that firmware emits when the platform reroutes legacy ISA IRQs through non-identity GSI lines — the canonical example is PIT IRQ0 landing on GSI 2 on virtually every PC. Same TLV walk skeleton and 5-push register plan as madt_parse_lapics. Extraction: source_irq (u8 at +3) → u32 at out+0, gsi (u32 at +4) → u32 at out+4, mps_inti_flags (u16 at +8) → u32 at out+8 (zero-extended via xor rax,rax; mov_w rax,[mem]). All u32 stores go through `mov_d` (G1). Overflow-cap path bumps _madt_dropped_iso_count via load-add-store (G3). Bus field at +2 is spec-locked to 0 (ISA) and not extracted — a defensive `cmp bus, 0; jne skip` could reject non-ISA sources but no known firmware emits anything else and the ACPI 6.5 spec disallows non-zero values.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;
+        mov rbx, rsi;
+        mov r8,  rdx;
+
+        xor rax, rax;
+        mov eax, [r12 + 4];
+        mov r13, r12;
+        add r13, rax;
+
+        mov r14, r12;
+        add r14, 44;
+
+        xor r15, r15;
+
+      madt_iso_loop:
+        mov rax, r14;
+        add rax, 2;
+        cmp rax, r13;
+        ja  madt_iso_done;
+
+        xor rcx, rcx;
+        mov_b rcx, [r14];
+
+        xor rdx, rdx;
+        mov_b rdx, [r14 + 1];
+
+        cmp rdx, 2;
+        jb  madt_iso_done;
+
+        mov rax, r14;
+        add rax, rdx;
+        cmp rax, r13;
+        ja  madt_iso_done;
+
+        cmp rcx, 2;                            // MADT_TYPE_ISO
+        jne madt_iso_next;
+
+        cmp r15, r8;
+        jae madt_iso_drop;
+
+        // out_slot = out + count * 16
+        mov rax, r15;
+        shl rax, 4;
+        mov r9,  rbx;
+        add r9,  rax;
+
+        // source_irq (u8 at +3) → u32 at out+0
+        xor rax, rax;
+        mov_b rax, [r14 + 3];
+        mov_d [r9 + 0], rax;
+
+        // gsi (u32 at +4) → u32 at out+4
+        mov eax, [r14 + 4];
+        mov_d [r9 + 4], rax;
+
+        // mps_inti_flags (u16 at +8) → u32 at out+8 (zero-extended)
+        xor rax, rax;
+        mov_w rax, [r14 + 8];
+        mov_d [r9 + 8], rax;
+
+        xor rax, rax;
+        mov_d [r9 + 12], rax;                  // _pad
+
+        add r15, 1;
+        jmp madt_iso_next;
+
+      madt_iso_drop:
+        mov rax, [rip + _madt_dropped_iso_count];
+        add rax, 1;
+        mov [rip + _madt_dropped_iso_count], rax;
+
+      madt_iso_next:
+        add r14, rdx;
+        jmp madt_iso_loop;
+
+      madt_iso_done:
+        mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // madt_parse_x2apics — Type 9 (Processor Local x2APIC) sub-entries
+  // ============================================================================
+  //
+  // SysV: (madt: u64, out: u64, max: u64) -> u64
+  //
+  // Per-record on-wire layout (ACPI 6.5 §5.2.12.12):
+  //   +0 u8 type=9  +1 u8 len=16  +2 u16 reserved
+  //   +4 u32 x2apic_id           +8 u32 flags (bit 0 = enabled)
+  //  +12 u32 acpi_processor_uid
+  //
+  // Record written to out[count] (24 bytes):
+  //   +0  u32 acpi_uid
+  //   +4  u32 x2apic_id
+  //   +8  u32 flags
+  // +12  u32 _pad0
+  // +16  u64 _pad1
+
+  pub let madt_parse_x2apics : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (madt: u64, out: u64, max: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R20-M2-004 (#812). Type 9 (Processor Local x2APIC) MADT sub-entry parser. x2APIC extends the xAPIC 8-bit destination field to 32 bits — on machines with >256 logical CPUs (Sapphire Rapids +, EPYC Bergamo, ...) x2APIC entries are the ONLY way to enumerate CPUs whose full APIC ID does not fit in the legacy 8-bit lapic_entry.apic_id slot; firmware still emits Type 0 records for the first 255 CPUs on hybrid systems for backwards compatibility but the R20 SMP bring-up will prefer x2APIC entries when both are present (matching Linux's x86/kernel/apic/apic.c `apic_needs_pit` posture). Extraction: acpi_uid (u32 at +12) → u32 at out+0, x2apic_id (u32 at +4) → u32 at out+4, flags (u32 at +8) → u32 at out+8. Record size 24 computed identically to madt_parse_ioapics (count*8 + count*16). Same TLV walk skeleton and 5-push prologue as madt_parse_lapics. All u32 stores via mov_d (G1). Overflow-cap path bumps _madt_dropped_x2apic_count via load-add-store (G3).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;
+        mov rbx, rsi;
+        mov r8,  rdx;
+
+        xor rax, rax;
+        mov eax, [r12 + 4];
+        mov r13, r12;
+        add r13, rax;
+
+        mov r14, r12;
+        add r14, 44;
+
+        xor r15, r15;
+
+      madt_x2apic_loop:
+        mov rax, r14;
+        add rax, 2;
+        cmp rax, r13;
+        ja  madt_x2apic_done;
+
+        xor rcx, rcx;
+        mov_b rcx, [r14];
+
+        xor rdx, rdx;
+        mov_b rdx, [r14 + 1];
+
+        cmp rdx, 2;
+        jb  madt_x2apic_done;
+
+        mov rax, r14;
+        add rax, rdx;
+        cmp rax, r13;
+        ja  madt_x2apic_done;
+
+        cmp rcx, 9;                            // MADT_TYPE_X2APIC
+        jne madt_x2apic_next;
+
+        cmp r15, r8;
+        jae madt_x2apic_drop;
+
+        // out_slot = out + count * 24
+        mov rax, r15;
+        shl rax, 3;
+        mov r10, rax;
+        mov rax, r15;
+        shl rax, 4;
+        add rax, r10;
+        mov r9,  rbx;
+        add r9,  rax;
+
+        // acpi_uid (u32 at +12) → u32 at out+0
+        mov eax, [r14 + 12];
+        mov_d [r9 + 0], rax;
+
+        // x2apic_id (u32 at +4) → u32 at out+4
+        mov eax, [r14 + 4];
+        mov_d [r9 + 4], rax;
+
+        // flags (u32 at +8) → u32 at out+8
+        mov eax, [r14 + 8];
+        mov_d [r9 + 8], rax;
+
+        // _pad0 = 0
+        xor rax, rax;
+        mov_d [r9 + 12], rax;
+
+        // _pad1 = 0 (u64)
+        xor rax, rax;
+        mov [r9 + 16], rax;
+
+        add r15, 1;
+        jmp madt_x2apic_next;
+
+      madt_x2apic_drop:
+        mov rax, [rip + _madt_dropped_x2apic_count];
+        add rax, 1;
+        mov [rip + _madt_dropped_x2apic_count], rax;
+
+      madt_x2apic_next:
+        add r14, rdx;
+        jmp madt_x2apic_loop;
+
+      madt_x2apic_done:
+        mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // madt_parse_lapic_nmis — Type 4 (Local APIC NMI) sub-entries
+  // ============================================================================
+  //
+  // SysV: (madt: u64, out: u64, max: u64) -> u64
+  //
+  // Per-record on-wire layout (ACPI 6.5 §5.2.12.7):
+  //   +0 u8 type=4  +1 u8 len=6  +2 u8 acpi_processor_uid
+  //   +3 u16 mps_inti_flags     +5 u8 lint#  (0 or 1)
+  //
+  // A `processor_uid == 0xFF` value indicates "apply to all CPUs" — the
+  // parser preserves the raw byte; downstream (percpu_nmi_wire_up) is
+  // responsible for the fan-out interpretation.
+  //
+  // Record written to out[count] (16 bytes):
+  //   +0 u32 processor_uid  (zero-extended from u8; 0xFF preserved)
+  //   +4 u32 flags          (zero-extended from u16)
+  //   +8 u32 lint           (zero-extended from u8; expected 0 or 1)
+  // +12 u32 _pad
+
+  pub let madt_parse_lapic_nmis : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (madt: u64, out: u64, max: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R20-M2-004 (#812). Type 4 (Local APIC NMI) MADT sub-entry parser. Describes which LINT# input (0 or 1) on each processor's LAPIC is wired to the platform NMI source. Firmware typically emits one or two entries: a per-CPU entry per online processor, OR a single entry with processor_uid=0xFF meaning 'apply to all CPUs' — the parser preserves the raw byte and defers the fan-out decision to the eventual percpu_nmi_wire_up consumer. Extraction: processor_uid (u8 at +2) → u32 at out+0 (0xFF preserved), mps_inti_flags (u16 at +3, note UNALIGNED 2-byte read at odd offset — spec-legal on x86-64) → u32 at out+4, lint# (u8 at +5) → u32 at out+8. Same TLV walk skeleton and 5-push register plan as madt_parse_lapics; record size 16; all u32 stores via mov_d (G1); overflow-cap path bumps _madt_dropped_lapic_nmi_count via load-add-store (G3). The u16 unaligned read at cursor+3 uses `xor rax,rax; mov_w rax, [r14+3]` — x86-64 tolerates unaligned word loads per SDM Vol.3 §7.1.1 with the same perf-not-correctness caveat as the xsdt.pdx unaligned qword reads.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;
+        mov rbx, rsi;
+        mov r8,  rdx;
+
+        xor rax, rax;
+        mov eax, [r12 + 4];
+        mov r13, r12;
+        add r13, rax;
+
+        mov r14, r12;
+        add r14, 44;
+
+        xor r15, r15;
+
+      madt_nmi_loop:
+        mov rax, r14;
+        add rax, 2;
+        cmp rax, r13;
+        ja  madt_nmi_done;
+
+        xor rcx, rcx;
+        mov_b rcx, [r14];
+
+        xor rdx, rdx;
+        mov_b rdx, [r14 + 1];
+
+        cmp rdx, 2;
+        jb  madt_nmi_done;
+
+        mov rax, r14;
+        add rax, rdx;
+        cmp rax, r13;
+        ja  madt_nmi_done;
+
+        cmp rcx, 4;                            // MADT_TYPE_LAPIC_NMI
+        jne madt_nmi_next;
+
+        cmp r15, r8;
+        jae madt_nmi_drop;
+
+        // out_slot = out + count * 16
+        mov rax, r15;
+        shl rax, 4;
+        mov r9,  rbx;
+        add r9,  rax;
+
+        // processor_uid (u8 at +2) → u32 at out+0
+        xor rax, rax;
+        mov_b rax, [r14 + 2];
+        mov_d [r9 + 0], rax;
+
+        // mps_inti_flags (u16 at +3, unaligned) → u32 at out+4
+        xor rax, rax;
+        mov_w rax, [r14 + 3];
+        mov_d [r9 + 4], rax;
+
+        // lint# (u8 at +5) → u32 at out+8
+        xor rax, rax;
+        mov_b rax, [r14 + 5];
+        mov_d [r9 + 8], rax;
+
+        xor rax, rax;
+        mov_d [r9 + 12], rax;                  // _pad
+
+        add r15, 1;
+        jmp madt_nmi_next;
+
+      madt_nmi_drop:
+        mov rax, [rip + _madt_dropped_lapic_nmi_count];
+        add rax, 1;
+        mov [rip + _madt_dropped_lapic_nmi_count], rax;
+
+      madt_nmi_next:
+        add r14, rdx;
+        jmp madt_nmi_loop;
+
+      madt_nmi_done:
+        mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
