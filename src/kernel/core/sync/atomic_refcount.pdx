@@ -1,0 +1,220 @@
+// src/kernel/core/sync/atomic_refcount.pdx — R18-M3-002 / #769
+// Atomic reference-count primitives (u64).
+//
+// Issue: paideia-os/paideia-os#769
+//
+// Purpose:
+//   The kernel is entering multicore. Shared reference-counted objects
+//   — frame_meta (R15 #559), cap slots (R14), vnodes (R17) — need
+//   fetch-and-add semantics whose RMW cycle is not interruptible by
+//   another core. Today's hand-rolled `mov r, [ref]; add; mov [ref], r`
+//   in frame_meta.pdx (#559) is a lost-update race the moment two cores
+//   incref the same frame: both read the same value, both add one, both
+//   store the same +1, and one reference is silently dropped.
+//
+//   The x86_64 fix is the LOCK prefix on a read-modify-write instruction.
+//   `lock xadd [mem], reg` atomically:
+//     1. reads the current value of [mem] into a temp,
+//     2. writes (temp + reg) back to [mem],
+//     3. delivers the ORIGINAL [mem] value in reg,
+//   all as a single indivisible bus/cache-coherence transaction (Intel
+//   SDM Vol 2B §XADD, Vol 3A §8.1.2). This is exactly the fetch-and-add
+//   primitive Linux's `atomic_fetch_add` and C11's `atomic_fetch_add_explicit`
+//   compile to on x86_64 — no barrier is needed because LOCK is a full
+//   fence and x86 TSO makes plain loads/stores well-ordered around it.
+//
+// ============================================================================
+// Approach
+// ============================================================================
+//
+// The paideia-as stdlib DECLARES the `RefcountOps` trait (see
+// tools/paideia-as/crates/paideia-stdlib/pdx/refcount.pdx, PA-R16-009),
+// but the elaborator LOWERING for that trait is still deferred to
+// paideia-as v0.21 #1036 — no stdlib_lowering.rs recipes for
+// `refcount_incr` / `refcount_decr` / `refcount_decr_and_test` exist at
+// the HEAD paideia-as (paideia-as ded3d48 at time of writing). Consuming
+// the trait from a .pdx module would therefore fail elaboration.
+//
+// Even once #1036 lands, R18.M2-003 taught us (percpu.pdx / gs_base.pdx)
+// that 2+ argument trait-method calls at lambda-body position hit the
+// elaborator T0540 gap tracked in paideia-as #1290; RefcountOps is only
+// 1-arg per method, but the migration cost of adopting the trait later
+// is a mechanical grep-and-swap because the primitive signatures match
+// what RefcountOps exposes.
+//
+// Choice: raw asm now (the #768 MCS spinlock path), migrate to the
+// trait once both #1036 (recipe) and #1290 (T0540 arity gap, defensive
+// for future 2-arg additions to the trait) land. This module's public
+// signatures deliberately mirror `RefcountOps` so the swap is a
+// callsite-only rewrite.
+//
+// ============================================================================
+// Signatures
+// ============================================================================
+//
+// atomic_refcount_inc(ptr: u64) -> u64
+//   Increment *ptr atomically. Returns the PREVIOUS value (Linux
+//   atomic_fetch_add semantics). Caller derives new value as old+1.
+//
+// atomic_refcount_dec(ptr: u64) -> u64
+//   Decrement *ptr atomically. Returns the PREVIOUS value. Caller
+//   checks old==1 to detect "this was the last reference; safe to free"
+//   (Linux atomic_dec_and_test is (old==1); this primitive is one bit
+//   more general — the caller can also detect old==0 double-decrement,
+//   old>N thresholds, etc., without a second RMW).
+//
+// atomic_refcount_read(ptr: u64) -> u64
+//   Load *ptr. Not a RMW. On x86_64 an aligned 64-bit load is atomic
+//   without a LOCK prefix (SDM Vol 3A §8.1.1: naturally-aligned loads
+//   and stores up to 64 bits are single-copy-atomic). No fence: this
+//   is a relaxed load; callers that need acquire semantics against a
+//   subsequent load must interpose their own fence (mfence) or use
+//   an RMW that carries its own barrier.
+//
+// Width is u64 (not u32 as RefcountOps declares) because all in-tree
+// consumers (frame_meta [_u64; 1024]) use u64 slots. Migration to u32
+// slots (matching Linux/kernel-refcount idiom) is out of scope for
+// #769; a `_d` (W32) family can be added later without touching the
+// W64 primitives — the mnemonic `lock_xadd_d` already exists in the
+// encoder (PA-R15-002 #957).
+//
+// ============================================================================
+// Encoder
+// ============================================================================
+//
+// paideia-as v0.20.1+:
+//   - lock_xadd_q [mem], reg        (PA-R15-002 #957 — LockXadd W64)
+//   - mov reg, imm64                (baseline; 10-byte movabs)
+//   - mov reg, [mem]                (baseline; aligned 64-bit load)
+//   - mov reg, reg                  (baseline)
+//   - ret                           (baseline)
+//
+// No new paideia-as work required.
+//
+// ============================================================================
+// Not-a-witness note
+// ============================================================================
+//
+// This module lands the mechanism only. The 8-core concurrent inc/dec
+// convergence smoke from #769's acceptance criteria (8 cores × N
+// (incref → decref) pairs on a shared u64 → final value == 0) blocks
+// on the same preconditions as #768's MCS witness:
+//   - MAX_CPUS bump from 4 to 8 (R20 #813 MADT integration), AND
+//   - per-AP worker task that runs the inc/dec loop (R18.M4 runq).
+// Both are open at HEAD 1f0e441. Single-CPU exercise of the primitive
+// is trivially correct (uncontended lock_xadd degrades to a plain
+// read-modify-write with a LOCK that no other bus master contends for).
+// The witness lands with R18.M4-004 or R20-#813 — this issue closes
+// with the mechanism, matching the R18.M2/M3 not-a-witness discipline
+// established by percpu.pdx, gs_base.pdx, and spinlock.pdx.
+//
+// Consumer retrofits (frame_meta_incref / phys_free refcount block /
+// future cap+vnode refs) are also out of scope for #769: this ticket's
+// AC scope was widened during softarch to "land the primitive"
+// because the retrofit is a mechanical follow-up whose surface (call
+// sites) is well-enumerated but touches ~5 files across mm/cap/fs and
+// benefits from being a single reviewable diff filed separately.
+
+module AtomicRefcount = structure {
+
+  // ==========================================================================
+  // atomic_refcount_inc(ptr: u64) -> u64
+  //   Atomically increment *ptr and return the previous value.
+  //
+  //   Register discipline (leaf, no `call`, no callee-save touched):
+  //     rdi = ptr (in)
+  //     rax = 1 → previous value after xadd (in/out)
+  //
+  //   No frame.
+  // ==========================================================================
+  pub let atomic_refcount_inc : (u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "#769 R18-M3-002 (inc): atomic fetch-and-add on the u64 refcount at RDI. Sequence: (1) rax = 1 (the addend). (2) lock_xadd_q [rdi], rax — LOCK-prefixed exchange-and-add atomically {tmp = *[rdi]; *[rdi] = tmp + rax; rax = tmp}. After the instruction rax holds the ORIGINAL *[rdi] value; matches Linux atomic_fetch_add / C11 atomic_fetch_add_explicit(memory_order_seq_cst) semantics. LOCK is implicit-not-optional per Intel SDM Vol 2B §XADD (the assembler emits F0 for lock_xadd_q); LOCK is a full fence per SDM Vol 3A §8.1.2 §8.2.5, so no explicit mfence needed to order this RMW against subsequent memory ops in program order. Register discipline: only rdi (arg, caller-save) and rax (return, caller-save) touched. No frame. No `call` in the body — leaf per graph. Effect row: {mem} — the RMW writes to *[rdi]. Capability row: {} — caller-authorised; the pointer is validated by the caller, not by the primitive (the primitive is content-agnostic about which u64 slot it operates on).",
+      block: {
+        // rax = 1 (addend)
+        mov rax, 1;
+
+        // atomic { rax_out = *rdi ; *rdi = rax_out + 1 }
+        lock_xadd_q [rdi], rax;
+
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // atomic_refcount_dec(ptr: u64) -> u64
+  //   Atomically decrement *ptr and return the previous value.
+  //   Caller inspects the return: old==1 means "we dropped the last
+  //   reference; safe to release the object"; old==0 is a double-dec
+  //   bug the caller must trap.
+  //
+  //   Register discipline (leaf):
+  //     rdi = ptr (in)
+  //     rax = -1 → previous value after xadd (in/out)
+  //
+  //   No frame.
+  // ==========================================================================
+  pub let atomic_refcount_dec : (u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "#769 R18-M3-002 (dec): atomic fetch-and-add of -1 on the u64 refcount at RDI. Sequence: (1) rax = 0xFFFFFFFFFFFFFFFF (the 64-bit two's-complement encoding of -1 — same movabs-imm64 idiom already used across the tree in vops.pdx L83/110/etc for the VOPS error sentinel). (2) lock_xadd_q [rdi], rax — LOCK-prefixed RMW: {tmp = *[rdi]; *[rdi] = tmp + (-1); rax = tmp}. After the instruction rax holds the ORIGINAL *[rdi] value; caller checks (rax == 1) to detect the last-reference release-point, matching Linux atomic_dec_and_test semantics without the caller having to issue a second load. Underflow protection is deliberately NOT in the primitive: hitting refcount==0 and then decrementing produces rax=0 with *[rdi] wrapping to 0xFFFF...FFFF, which is a caller bug (a decref without a matching incref); the primitive is intentionally content-agnostic so it composes with slot-invalidation schemes (frame_meta uses 0 as 'free', so a caller-side `cmp rax, 0; je bug` on the return value is the right guard, and it is per-consumer). Register/frame/effect/capability discipline identical to atomic_refcount_inc: rax+rdi caller-save; no frame; {mem} effect; caller-authorised. LOCK-full-fence rationale identical.",
+      block: {
+        // rax = -1 (0xFFFFFFFFFFFFFFFF as the 64-bit two's-complement addend)
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+
+        // atomic { rax_out = *rdi ; *rdi = rax_out + (-1) }
+        lock_xadd_q [rdi], rax;
+
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // atomic_refcount_read(ptr: u64) -> u64
+  //   Read *ptr with x86 TSO relaxed-load semantics.
+  //
+  //   Register discipline (leaf):
+  //     rdi = ptr (in)
+  //     rax = *rdi (out)
+  //
+  //   No frame. No LOCK — an aligned 8-byte load on x86_64 is
+  //   single-copy-atomic per SDM Vol 3A §8.1.1. Callers that need
+  //   acquire semantics (i.e. reading the refcount MUST-happen-before
+  //   subsequent loads of the pointee) must interpose their own
+  //   mfence or use an RMW primitive.
+  // ==========================================================================
+  pub let atomic_refcount_read : (u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "#769 R18-M3-002 (read): plain aligned 64-bit load of the refcount at RDI. x86_64 guarantees a naturally-aligned qword load is single-copy-atomic (Intel SDM Vol 3A §8.1.1) — no LOCK prefix or fence is required for the atomic-read property itself. This is a RELAXED load in C11 memory-model terms: it is NOT an acquire; a caller that needs release/acquire pairing against a subsequent load of the pointee must issue mfence, or read the refcount via an RMW instead. Documented as {mem} effect (not {} even though it is read-only) to match the effect row of the sibling _inc/_dec primitives — every operation in this module touches shared memory and the row is the caller's cue to place these calls inside the appropriate critical section, not the compiler's cue that any bytes were written. Alignment discipline: the primitive does not check RDI mod 8 == 0; every current and planned consumer stores refcounts in [u64; N] arrays or at natural qword offsets within cap/vnode/frame records, which are all 8-aligned by construction. A future consumer that packs a refcount into an unaligned slot would need a different primitive (an 8-byte load straddling a cache-line boundary is not atomic on any x86 model). Register/frame discipline: rdi in, rax out, both caller-save; no frame; leaf per graph.",
+      block: {
+        // rax = *rdi (aligned 8-byte load, single-copy-atomic on x86-64)
+        mov rax, [rdi];
+
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // atomic_refcount_self_test_note
+  //
+  // Single-CPU exercise of the primitive is trivially correct: an
+  // uncontended lock_xadd degrades to a plain read-modify-write against
+  // a cache line no other bus master ever touches. The primitive's
+  // interesting property — no lost updates across cores — is unobservable
+  // without at least two CPUs simultaneously executing the same
+  // sequence, which requires the same 8-core witness harness as #768
+  // (MCS spinlock): a per-AP worker task hammering a shared u64.
+  //
+  // The #769 acceptance-criteria smoke ("8-core concurrent inc/dec on
+  // shared refcount converges to 0") therefore lands with the same
+  // upstream unblock as spinlock.pdx's contention witness — R18.M4
+  // (per-CPU runq / task migration) or R20 #813 (MADT enumeration to
+  // bump MAX_CPUS from 4 to 8), whichever crosses the finish line
+  // first. #769 closes with the mechanism.
+  // ==========================================================================
+}
