@@ -1,0 +1,281 @@
+// src/kernel/core/sync/atomic.pdx — R18-M3-003 / #770
+// Generic kernel-side atomic primitives on 64-bit machine words.
+//
+// Issue: paideia-os/paideia-os#770
+//
+// Purpose:
+//   This is the kernel's stdlib-level atomics surface — the primitives
+//   that any subsystem (sched, mm, vfs, ipc, cap) reaches for when it
+//   needs an atomic RMW on a u64 slot and does NOT want to reason about
+//   x86 mnemonics or the LOCK-prefix contract locally. The intended
+//   consumers include future retrofits currently blocked on this landing:
+//     - frame_meta refcount block (#559 → migrate off hand-rolled
+//       lost-update sequence to atomic_xadd_u64),
+//     - runq enqueue/dequeue head/tail pointer flips (R18.M4),
+//     - flag-word publishes in per-CPU control blocks (R18.M4+),
+//     - the future generic-refcount slot on cap and vnode records.
+//
+//   The three "instance" atomic modules that landed earlier in R18.M3
+//   remain the correct home for their algorithm-specific state:
+//     - spinlock.pdx (R18-M3-001 / #768) owns MCS queue-node choreography;
+//     - atomic_refcount.pdx (R18-M3-002 / #769) owns the "fetch-add + return
+//       previous" refcount contract (Linux atomic_fetch_add / Linux
+//       atomic_dec_and_test semantics).
+//   Both were laid down with raw asm rather than routing through this
+//   module because they landed before this module existed and because
+//   each carries algorithm-level commentary the caller needs to keep
+//   near the callsite. Future consumers (frame_meta retrofit, runq
+//   pointer flips) call the primitives here directly.
+//
+// ============================================================================
+// Contract
+// ============================================================================
+//
+// All primitives take u64-aligned VAs. The primitives are content-agnostic
+// about which slot they operate on — the caller is responsible for the
+// pointer validation (aliasing, alignment, aspace-visibility). Every
+// primitive is @no_frame leaf: no `call`, no callee-save touched, SysV
+// ABI clean at entry and exit.
+//
+// atomic_load_u64(ptr) -> u64
+//   Relaxed 64-bit load. On x86_64 a naturally-aligned qword load is
+//   single-copy-atomic (Intel SDM Vol 3A §8.1.1). NO fence. Callers
+//   that need acquire semantics against a subsequent load of the
+//   pointee must interpose mem_barrier() or read via a RMW primitive.
+//
+// atomic_store_u64(ptr, val)
+//   Release-flavoured 64-bit store. On x86_64 stores are TSO-ordered:
+//   prior stores in program order are visible before this store; other
+//   cores never observe a torn write for aligned qwords (SDM Vol 3A
+//   §8.1.1, §8.2.2). NO explicit fence: TSO already delivers the
+//   release semantics C11 asks for.
+//
+// atomic_cas_u64(ptr, expected, new) -> u64
+//   LOCK-prefixed compare-and-swap. Returns the OBSERVED old value:
+//     - success  (observed == expected): [ptr] := new, returns expected
+//     - failure  (observed != expected): [ptr] unchanged, returns observed
+//   The caller decides "was it success?" via (return_value == expected).
+//   Full fence via LOCK (SDM Vol 3A §8.1.2, §8.2.5).
+//
+// atomic_xadd_u64(ptr, delta) -> u64
+//   LOCK-prefixed fetch-and-add. Returns the PREVIOUS value; the new
+//   memory value is (previous + delta). Signed/unsigned agnostic —
+//   pass 0xFFFF...FFFF for -1 to get fetch-and-subtract-1. Full fence
+//   via LOCK.
+//
+// atomic_xchg_u64(ptr, val) -> u64
+//   Atomic swap. Returns the PREVIOUS memory value; memory becomes val.
+//   xchg with a memory operand is implicitly LOCKed (SDM Vol 2A §XCHG)
+//   even though the F0 prefix byte is not emitted — this is a full
+//   fence.
+//
+// mem_barrier()
+//   mfence — serializing memory barrier ordering all loads and stores
+//   in program order. Needed only when a subsequent read must observe
+//   a prior write from THIS cpu that was not itself a LOCKed RMW
+//   (which would already be a full fence).
+//
+// ============================================================================
+// Encoder
+// ============================================================================
+//
+// paideia-as v0.20.1+:
+//   - xchg [mem], reg               (PA-R13-003 #916 — implicit LOCK)
+//   - lock_cmpxchg [mem], reg       (PA-R13-004 #917 — RAX = expected/observed)
+//   - lock_xadd_q [mem], reg        (PA-R15-002 #957 — W64 fetch-and-add)
+//   - mfence                        (PA-R13-005 #918)
+//   - mov reg, [mem] / mov [mem], reg (baseline)
+//
+// No new paideia-as work required. Encoder correctness is proven twice:
+//   (a) In-tree by MCS spinlock (#768) using xchg + lock_cmpxchg and
+//       atomic refcount (#769) using lock_xadd_q — both already build
+//       and single-CPU exercise cleanly.
+//   (b) In-repo by tests/kernel/atomics/expected-bytes.txt + the
+//       tools/verify-atomics.sh witness which disassembles this module's
+//       .o and asserts the exact byte sequences for each mnemonic. That
+//       witness closes the AC loop for #770 without requiring a paideia-as
+//       cross-repo trip.
+//
+// ============================================================================
+// Not-a-witness note
+// ============================================================================
+//
+// Consistent with R18.M2/M3 discipline (percpu.pdx, gs_base.pdx,
+// spinlock.pdx, atomic_refcount.pdx): this module lands the mechanism
+// only. No production caller invokes atomic_* yet. The intended
+// consumer retrofits (frame_meta refcount, runq head/tail, flag-word
+// publishes) land in follow-up issues when their subsystems reach
+// their next milestone. The witness for cross-CPU visibility is the
+// same 8-core smoke as #768/#769 and unblocks together with them
+// (MAX_CPUS>=8 via R20 #813 MADT, plus per-AP worker via R18.M4 runq).
+
+module Atomic = structure {
+
+  // ==========================================================================
+  // atomic_load_u64(ptr: u64) -> u64
+  //   Relaxed aligned qword load. Single-copy-atomic on x86_64 for
+  //   naturally-aligned addresses; no LOCK or fence.
+  //
+  //   Register discipline (leaf, no `call`):
+  //     rdi = ptr (in)
+  //     rax = *rdi (out)
+  //
+  //   No frame. No callee-save touched.
+  // ==========================================================================
+  pub let atomic_load_u64 : (u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "#770 R18-M3-003 (load): relaxed aligned 64-bit load of *[rdi]. x86_64 guarantees single-copy-atomicity for naturally-aligned qword loads (Intel SDM Vol 3A §8.1.1); no LOCK prefix or fence required for the atomic-read property. This is a RELAXED load — no acquire ordering. Callers that need `atomic_load` to happen-before a subsequent load of the pointee must call `mem_barrier()` after this call, or use `atomic_cas_u64` instead (LOCK-prefixed RMW carries a full fence). Effect row: {mem} — same discipline as atomic_refcount_read (a read-only op is still {mem} because it inspects shared memory the caller must place inside their critical section). Register/frame: rdi in, rax out, caller-save only; no frame.",
+      block: {
+        mov rax, [rdi];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // atomic_store_u64(ptr: u64, val: u64) -> ()
+  //   Release-flavoured aligned qword store. TSO delivers release
+  //   ordering on x86 — no fence needed on the store side.
+  //
+  //   Register discipline (leaf):
+  //     rdi = ptr (in)
+  //     rsi = val (in)
+  //
+  //   No frame. No callee-save touched.
+  // ==========================================================================
+  pub let atomic_store_u64 : (u64, u64) -> () !{mem} @{} =
+    fn (ptr: u64, val: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "#770 R18-M3-003 (store): plain aligned 64-bit store *[rdi] = rsi. x86_64 guarantees single-copy-atomicity for naturally-aligned qword stores (Intel SDM Vol 3A §8.1.1) — other cores never observe a torn write. x86 TSO orders this store after all prior stores in program order (SDM §8.2.2), delivering the release semantics C11 asks of atomic_store_explicit(memory_order_release). NO mfence: an mfence here would order this store with respect to LATER loads on THIS cpu, which release semantics does not require and would waste ~15 cycles. Callers who need this store to be strictly ordered with respect to a subsequent load must call mem_barrier() themselves. Register/frame: rdi/rsi in, no return, caller-save only, no frame. Effect row: {mem}. Capability row: {} — caller-authorised.",
+      block: {
+        mov [rdi], rsi;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // atomic_cas_u64(ptr: u64, expected: u64, new: u64) -> u64
+  //   LOCK-prefixed compare-and-swap. Returns the observed old value.
+  //     - success (observed == expected): *[ptr] := new; returns expected
+  //     - failure (observed != expected): *[ptr] unchanged; returns observed
+  //   Caller detects success via (return_value == expected).
+  //
+  //   Register discipline (leaf):
+  //     rdi = ptr      (in)
+  //     rsi = expected (in)
+  //     rdx = new      (in)
+  //     rax = expected → observed (in/out, implicit for lock_cmpxchg)
+  //     rcx = new      (register operand for lock_cmpxchg — pointer base
+  //                     is rdi, so rax's implicit-clobber contract does
+  //                     not conflict with any memory-operand base; the
+  //                     U1613 warning is not triggered)
+  //
+  //   No frame. No callee-save touched.
+  // ==========================================================================
+  pub let atomic_cas_u64 : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (ptr: u64, expected: u64, new: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "#770 R18-M3-003 (cas): LOCK-prefixed compare-and-swap on the u64 at RDI. Sequence: (1) mov rax, rsi — the lock_cmpxchg mnemonic uses RAX implicitly as the `expected` value in and the observed-old value out (Intel SDM Vol 2A §CMPXCHG). (2) mov rcx, rdx — the `new` value must be in a general register that is NOT RAX (RAX carries expected/observed) and NOT one of RDI (memory base) or RSI (already consumed). RCX is caller-save and free of implicit contracts here. (3) lock_cmpxchg [rdi], rcx — atomically {if *[rdi] == rax then *[rdi] := rcx, ZF=1 else rax := *[rdi], ZF=0}. LOCK is a full fence (SDM Vol 3A §8.1.2, §8.2.5), so the RMW is total-order-observed by other cores. (4) ret — rax already carries the observed old value, matching the SysV return-register contract for u64. Success/failure discrimination is caller-side: (return == expected) → success. This mirrors Linux's atomic_cmpxchg return convention (returns 'the old value' not 'a bool'). Register/frame: rax/rcx/rdx/rdi/rsi caller-save; leaf per graph; no frame. U1613 implicit-clobber check: the memory operand base is RDI, not RAX (contrast tools/paideia-as/tests/build-emit/PaR16004ImplicitClobberU1613.pdx which would warn if we wrote lock_cmpxchg [rax], rcx). Effect row: {mem}. Capability row: {}.",
+      block: {
+        // rax = expected (implicit input to lock_cmpxchg)
+        mov rax, rsi;
+
+        // rcx = new (register operand carrying the store-on-success value)
+        mov rcx, rdx;
+
+        // atomic { if *rdi == rax then *rdi := rcx (ZF=1)
+        //          else rax := *rdi (ZF=0) }
+        lock_cmpxchg [rdi], rcx;
+
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // atomic_xadd_u64(ptr: u64, delta: u64) -> u64
+  //   LOCK-prefixed fetch-and-add. Returns the previous value.
+  //   Pass 0xFFFFFFFFFFFFFFFF as delta for fetch-and-subtract-1.
+  //
+  //   Register discipline (leaf):
+  //     rdi = ptr   (in)
+  //     rsi = delta (in)
+  //     rax = delta → previous (in/out; the register operand of
+  //           lock_xadd is both the addend and the receiver of the
+  //           original memory value per SDM Vol 2B §XADD)
+  //
+  //   No frame. No callee-save touched.
+  // ==========================================================================
+  pub let atomic_xadd_u64 : (u64, u64) -> u64 !{mem} @{} =
+    fn (ptr: u64, delta: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "#770 R18-M3-003 (xadd): LOCK-prefixed fetch-and-add on *[rdi] using delta from RSI. Sequence: (1) mov rax, rsi — the register operand of xadd is both the addend and the receiver of the prior memory value; we place delta in rax so the return-register convention (rax = previous) is satisfied by the instruction itself. (2) lock_xadd_q [rdi], rax — atomically {tmp = *[rdi]; *[rdi] = tmp + rax; rax = tmp}. LOCK is a full fence (SDM Vol 3A §8.1.2, §8.2.5). (3) ret. Signed/unsigned agnostic — the encoder emits F0 REX.W 0F C1 /r; two's-complement addition means passing 0xFFFF...FFFF as delta gives fetch-and-subtract-1, matching Linux atomic_fetch_sub with argument 1 (and equally usable for atomic_refcount_dec-style callers who prefer this generic entry point over the specialised atomic_refcount.pdx primitive). Register/frame: rax/rdi/rsi caller-save; leaf per graph; no frame. Effect row: {mem}. Capability row: {}.",
+      block: {
+        // rax = delta (addend AND receiver of prior memory value)
+        mov rax, rsi;
+
+        // atomic { rax_out = *rdi ; *rdi = rax_out + delta }
+        lock_xadd_q [rdi], rax;
+
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // atomic_xchg_u64(ptr: u64, val: u64) -> u64
+  //   Atomic swap. Returns the previous memory value; memory becomes val.
+  //   xchg with a memory operand is implicitly LOCKed (Intel SDM Vol 2A
+  //   §XCHG) — no F0 prefix byte is emitted, but the bus lock is held.
+  //
+  //   Register discipline (leaf):
+  //     rdi = ptr (in)
+  //     rsi = val (in)
+  //     rax = val → previous (in/out; xchg swaps memory with the
+  //           register operand, so placing val in rax makes rax
+  //           carry the previous memory value on exit, satisfying
+  //           the SysV return-register contract)
+  //
+  //   No frame. No callee-save touched.
+  // ==========================================================================
+  pub let atomic_xchg_u64 : (u64, u64) -> u64 !{mem} @{} =
+    fn (ptr: u64, val: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "#770 R18-M3-003 (xchg): atomic exchange on *[rdi] using val from RSI. Sequence: (1) mov rax, rsi — xchg with a memory operand swaps the register operand with memory; placing val in rax makes the swap deliver the prior memory value into rax, matching the SysV return-register convention. (2) xchg [rdi], rax — atomically {tmp = *[rdi]; *[rdi] = rax; rax = tmp}. Implicit LOCK per SDM Vol 2A §XCHG: 'If a memory operand is referenced, the processor's locking protocol is automatically implemented for the duration of the exchange operation, regardless of the presence or absence of the LOCK prefix.' The encoder omits the F0 byte (see tools/paideia-as encode.rs xchg_mem_base_disp_reg64) precisely because the CPU takes the bus lock unconditionally on the memory form. Full-fence semantics identical to explicit LOCK-prefixed RMWs. (3) ret. Register/frame: rax/rdi/rsi caller-save; leaf per graph; no frame. Effect row: {mem}. Capability row: {}.",
+      block: {
+        // rax = val (register operand for xchg; receives prior memory value)
+        mov rax, rsi;
+
+        // atomic swap: rax_out = *rdi ; *rdi = val
+        xchg [rdi], rax;
+
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // mem_barrier() -> ()
+  //   Serializing memory barrier. All loads and stores issued before
+  //   mfence in program order become globally visible before any load
+  //   or store issued after mfence (Intel SDM Vol 3A §8.2.5).
+  //
+  //   Register discipline (leaf):
+  //     (no arguments, no return)
+  //
+  //   No frame. No callee-save touched. mfence itself clobbers no
+  //   general registers (SDM Vol 2B §MFENCE).
+  // ==========================================================================
+  pub let mem_barrier : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "#770 R18-M3-003 (barrier): full memory-order fence via mfence. Encoded as 0F AE F0 (three bytes, zero operands, no REX). Semantics per Intel SDM Vol 3A §8.2.5: 'Performs a serializing operation on all load-from-memory and store-to-memory instructions that were issued prior the MFENCE instruction. This serializing operation guarantees that every load and store instruction that precedes the MFENCE instruction in program order becomes globally visible before any load or store instruction that follows the MFENCE instruction.' Needed only when a subsequent load must observe a prior store from THIS cpu that was itself a plain store (atomic_store_u64 above, or any `mov [mem], reg`) — LOCK-prefixed RMWs (atomic_cas_u64 / atomic_xadd_u64 / atomic_xchg_u64) already carry a full fence and do not need a follow-up mem_barrier() to observe their own effects. Register/frame: no arguments, no return, no clobbers per SDM (`mfence` is register-neutral); leaf per graph; no frame. Effect row: {mem} — this fence orders memory operations. Capability row: {}.",
+      block: {
+        mfence;
+        ret
+      }
+    } @no_frame
+}
