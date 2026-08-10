@@ -1,0 +1,467 @@
+// src/kernel/mm/uefi_phys_seed.pdx — R19-M5 (M4-deferred #2)
+//
+// UEFI EFI-memmap → physical-page bitmap seed. Complements the M4
+// counting pass (src/kernel/mm/uefi_physmap.pdx) by walking the EFI
+// memory map that the UEFI stub captured pre-ExitBootServices and
+// seeding a page-granular bitmap over the low 4 GiB of physical memory.
+// This is the first paideia allocator layer that represents actual
+// hardware PA extents (as opposed to the legacy phys_alloc.pdx which
+// operates over a fixed 4 MiB kernel-VA static pool).
+//
+// -----------------------------------------------------------------------------
+// Why a companion module, not an extension of phys_alloc
+// -----------------------------------------------------------------------------
+//
+// The existing phys_alloc (src/kernel/core/mm/phys_alloc.pdx) predates
+// the UEFI boot path and has a load-bearing invariant that every caller
+// (aspace_map, kpti_build_user_pml4, aspace_create's zero loop, ...)
+// depends on: the returned value is a KERNEL VIRTUAL ADDRESS derived
+// from `&_phys_page_pool + i * 4096`, not a genuine hardware physical
+// address. See phys_alloc.pdx §#658 CONTRACT for the audit trail on
+// the VA/PA mismatch and why it cannot be flipped without breaking
+// the KPTI structural witness and every ring-3 aspace consumer.
+//
+// The UEFI path needs a genuine PA allocator (the finalizer's kernel
+// image was placed at a firmware-chosen PA that has no relationship
+// to `_phys_page_pool`'s VA base). Retrofitting phys_alloc to serve
+// both regimes is a substantive redesign (deferred to R20 with a
+// newtype-driven PhysAddr vs PhysAllocVA split — see #658 audit). For
+// R19 the shipping shape is: this module owns the UEFI/PA-side
+// bitmap; phys_alloc keeps its VA-pool contract; the two are
+// invoked independently at boot (M4 counting → M5 seed pass) and
+// consumed by different downstream sites (phys_alloc by ring-3
+// aspace bring-up, this module by future UEFI-path page-table
+// materialisation in R20).
+//
+// -----------------------------------------------------------------------------
+// Bitmap layout
+// -----------------------------------------------------------------------------
+//
+// _uefi_phys_bitmap : [u64; 16384]
+//   = 16384 words × 64 bits/word
+//   = 1_048_576 bits
+//   = 1_048_576 pages × 4096 B
+//   = 4 GiB of physical address space, at 4 KiB granularity.
+//
+// Bit i in word w corresponds to physical page (w * 64 + i) * 4096.
+//   bit == 1 → allocated / reserved (do NOT use)
+//   bit == 0 → free (available)
+//
+// The 4 GiB cap is deliberate — real hardware regularly has extents
+// above 4 GiB, but the R19.M5 UEFI stub loads the kernel into the low
+// firmware-reserved region (typically 0x100000..~0x800000) and the
+// current M4 physmap counter only witnesses classification. R20+
+// firmware-plumbing extends the bitmap or moves to a two-level index
+// once we actually consume PA extents above 4 GiB. The 128 KiB .bss
+// cost is negligible in the 32 KiB memmap buffer's neighbourhood
+// (src/boot/uefi_stub.pdx _efi_memmap_buffer).
+//
+// -----------------------------------------------------------------------------
+// Seed algorithm (uefi_physmap_seed_alloc)
+// -----------------------------------------------------------------------------
+//
+// 1. Fill _uefi_phys_bitmap with ALL-ONES (every page reserved).
+// 2. Walk env->efi_memmap_pa..+efi_memmap_size, stride
+//    env->efi_memmap_desc_size (u32 read via 32-bit load).
+// 3. For each descriptor whose Type ∈ {1,2,3,4,7} (see uefi_physmap.pdx
+//    for the classification table), compute the descriptor's page range
+//    [start_page, start_page + NumberOfPages) where
+//    start_page = PhysicalStart >> 12, and CLEAR the corresponding bits
+//    in _uefi_phys_bitmap.
+// 4. Skip descriptors whose PhysicalStart >= 4 GiB (out of bitmap
+//    range) — count them into _uefi_phys_beyond_4g_pages for
+//    diagnostics but do NOT record them as free. Descriptors that
+//    straddle the 4 GiB boundary are truncated at 4 GiB.
+// 5. Clamp available extents against the kernel image carve-out
+//    (env->image_base .. env->image_base + env->image_size): mark
+//    those pages back to allocated so a future consumer can't hand
+//    the kernel's own code frames back to the pool.
+// 6. Emit tally into _uefi_phys_free_pages via a popcnt-style sweep
+//    of the finished bitmap.
+//
+// -----------------------------------------------------------------------------
+// EFI_MEMORY_DESCRIPTOR layout recap (UEFI 2.10 §7.2.3)
+// -----------------------------------------------------------------------------
+//
+//   +0   u32   Type
+//   +4   u32   _Pad
+//   +8   u64   PhysicalStart
+//   +16  u64   VirtualStart      (unused pre-EBS)
+//   +24  u64   NumberOfPages
+//   +32  u64   Attribute
+//   stride == env->efi_memmap_desc_size (do NOT hard-code 40)
+//
+// -----------------------------------------------------------------------------
+// boot_env_t field offsets recap (src/boot/uefi_env.pdx)
+// -----------------------------------------------------------------------------
+//
+//   +56  u64   image_base
+//   +64  u64   image_size
+//   +72  u64   efi_memmap_pa
+//   +80  u64   efi_memmap_size
+//   +88  u32   efi_memmap_desc_size (u32 at +88; u32 desc_ver at +92)
+//
+// -----------------------------------------------------------------------------
+// Milestone scope
+// -----------------------------------------------------------------------------
+//
+// R19.M5 delivers the seed pass + the free-count witness. It does NOT
+// deliver a genuine PA allocator API (`uefi_phys_alloc` / `uefi_phys_free`);
+// those land in R20 alongside the higher-half paging bring-up that
+// actually consumes the free extents. The seed pass on its own gives
+// the R19 milestone a testable audit witness — the fabricated 3-descriptor
+// memmap in tests/kernel/mm/uefi_physmap_synthetic.pdx compares
+// `_uefi_phys_free_pages` after seed against the expected free-page
+// count from its fabricated descriptors.
+
+module UefiPhysSeed = structure {
+
+  // ==========================================================================
+  // Result slots — populated by uefi_physmap_seed_alloc.
+  // ==========================================================================
+
+  // Number of 4 KiB pages currently marked free (bit == 0) in the
+  // bitmap after the last seed pass. Sums popcnt across all 16384
+  // words, subtracting from total bits.
+  pub let mut _uefi_phys_free_pages : u64 = 0
+
+  // Diagnostics: pages in EFI descriptors whose PhysicalStart >= 4 GiB
+  // (skipped by the seed because they fall outside the bitmap's range).
+  // Real hardware routinely has 8+ GiB extents; this counter surfaces
+  // them so R20's extended-bitmap redesign has a witness.
+  pub let mut _uefi_phys_beyond_4g_pages : u64 = 0
+
+  // Diagnostics: pages in the kernel image carve-out (image_base ..
+  // image_base + image_size) re-reserved after the initial free sweep.
+  pub let mut _uefi_phys_image_carveout_pages : u64 = 0
+
+  // ==========================================================================
+  // The bitmap itself — 128 KiB, 4 KiB-aligned .bss.
+  // ==========================================================================
+  //
+  // 16384 words × 8 B/word = 131072 B = 128 KiB. 4 KiB alignment is
+  // paranoia — the seed touches every word linearly so cacheline
+  // alignment (64 B) would suffice, but 4 KiB gives future ARM-style
+  // consumers page-boundary access if they mmap this into user space.
+
+  pub let mut _uefi_phys_bitmap : [u64; 16384] = uninit @align(4096)
+
+  // ==========================================================================
+  // Bitmap-size constants — kept as pub let for external cross-checks.
+  // ==========================================================================
+
+  pub let UEFI_PHYS_BITMAP_WORDS : u64 = 16384
+  pub let UEFI_PHYS_BITMAP_BITS  : u64 = 1048576   // = 16384 * 64
+  pub let UEFI_PHYS_BITMAP_PAGES : u64 = 1048576   // 1:1 bits:pages
+  pub let UEFI_PHYS_BITMAP_BYTES : u64 = 4294967296 // 4 GiB coverage
+
+  // ==========================================================================
+  // uefi_physmap_seed_alloc(env) — mark-all-reserved then clear the
+  // available extents.
+  // ==========================================================================
+  //
+  // SysV: (env: u64) -> u64
+  //
+  //   env = physical address of the boot_env_t (see src/boot/uefi_env.pdx).
+  //
+  //   Reads:  env->efi_memmap_pa    (u64 @ +72)
+  //           env->efi_memmap_size  (u64 @ +80)
+  //           env->efi_memmap_desc_size (u32 @ +88)
+  //           env->image_base       (u64 @ +56)
+  //           env->image_size       (u64 @ +64)
+  //
+  //   Writes: _uefi_phys_bitmap[]
+  //           _uefi_phys_free_pages
+  //           _uefi_phys_beyond_4g_pages
+  //           _uefi_phys_image_carveout_pages
+  //
+  //   Returns: _uefi_phys_free_pages (RAX).
+  //
+  // Register plan (SysV, callee-saves preserved):
+  //   rbx = env pointer (survives across nested calls if any)
+  //   r12 = desc iterator (efi_memmap_pa)
+  //   r13 = bytes remaining (efi_memmap_size)
+  //   r14 = desc stride (efi_memmap_desc_size)
+  //   r15 = scratch (bitmap base / descriptor loads)
+  //
+  //   Prologue pushes rbx, r12, r13, r14, r15 (5 pushes) — @no_frame is
+  //   safe because we do NOT touch rbp; rsp is aligned via the odd
+  //   push count (function is entered rsp%16==8, after 5 pushes
+  //   rsp%16==0, matches SysV requirement pre-call).
+
+  pub let uefi_physmap_seed_alloc : (u64) -> u64 !{mem} @{} =
+    fn (env: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R19.M5 (M4-deferred #2). Companion to uefi_build_physmap: seeds _uefi_phys_bitmap (128 KiB, 4 GiB coverage at 4 KiB granularity) from env->efi_memmap. Phase 1 fills bitmap with all-ones (every page reserved). Phase 2 walks the descriptor array (stride = env->efi_memmap_desc_size masked to u32 since desc_ver lives at +92 in the same u64 with desc_size at +88), and for each descriptor whose Type ∈ {1=EfiLoaderCode, 2=EfiLoaderData, 3=EfiBootServicesCode, 4=EfiBootServicesData, 7=EfiConventionalMemory} — the reusability set defined at uefi_physmap.pdx — clears the corresponding bits. PhysicalStart >= 4 GiB descriptors are skipped (tallied into _uefi_phys_beyond_4g_pages for R20 diagnostics); descriptors straddling 4 GiB are truncated at 4 GiB (npages capped). Phase 3 re-reserves the kernel image carve-out (env->image_base .. +image_size) so a future consumer cannot hand kernel .text frames back to the pool. Phase 4 sweeps the finished bitmap with Kernighan-style popcnt (matches phys_alloc_free_count's algorithm, no SSE4.2 dependency) to compute _uefi_phys_free_pages. Uses only volatile registers plus callee-saves (rbx/r12/r13/r14/r15) that the prologue saves and epilogue restores — @no_frame is sound because rbp is never touched. Bit-clear inner loop is byte-level per descriptor page: for each page in [start_page, start_page + npages), compute (word_idx, bit_idx) = (page >> 6, page & 63), read bitmap[word], AND with ~(1<<bit), store back. Deliberately not vectorised — clarity > speed for a one-shot boot-time pass.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // Save env pointer for phase-3 image carve-out.
+        mov rbx, rdi;
+
+        // ================================================================
+        // Phase 1: fill bitmap with all-ones.
+        // ================================================================
+        //
+        // 16384 iterations of `mov [rip + _uefi_phys_bitmap + i*8], -1`.
+        // Implemented via LEA + loop counter to avoid emitting 16384
+        // separate stores.
+
+        lea r15, [rip + _uefi_phys_bitmap];
+        mov rcx, 16384;
+        mov rdx, 0xFFFFFFFFFFFFFFFF;
+      seed_fill_loop:
+        cmp rcx, 0;
+        je  seed_fill_done;
+        mov [r15], rdx;
+        add r15, 8;
+        sub rcx, 1;
+        jmp seed_fill_loop;
+      seed_fill_done:
+
+        // ================================================================
+        // Phase 2: walk the descriptor array, clear bits for available extents.
+        // ================================================================
+
+        // Load env fields (rbx = env base).
+        mov r12, [rbx + 72];             // efi_memmap_pa (iterator base)
+        mov r13, [rbx + 80];             // efi_memmap_size (bytes remaining)
+        mov r14, [rbx + 88];             // desc_size (u32) | desc_ver (u32)
+        mov rax, 0xFFFFFFFF;
+        and r14, rax;                    // strip desc_ver from high 32 bits
+
+        // Zero the diagnostic counters — we're re-computing them.
+        mov rax, 0;
+        mov [rip + _uefi_phys_beyond_4g_pages], rax;
+        mov [rip + _uefi_phys_image_carveout_pages], rax;
+
+        // Guard: empty / bogus stride → skip.
+        cmp r14, 0;
+        je  seed_walk_done;
+        cmp r13, 0;
+        je  seed_walk_done;
+
+      seed_walk_loop:
+        // Terminate when fewer bytes remain than a full descriptor.
+        cmp r13, r14;
+        jl  seed_walk_done;
+
+        // Type (u32 @ +0) into eax.
+        mov eax, [r12 + 0];
+
+        // Classify: Type in {1,2,3,4,7}?
+        cmp rax, 7;
+        je  seed_desc_reusable;
+        cmp rax, 1;
+        je  seed_desc_reusable;
+        cmp rax, 2;
+        je  seed_desc_reusable;
+        cmp rax, 3;
+        je  seed_desc_reusable;
+        cmp rax, 4;
+        je  seed_desc_reusable;
+        // Not reusable — leave bits set (reserved).
+        jmp seed_desc_next;
+
+      seed_desc_reusable:
+        // Load PhysicalStart (u64 @ +8) and NumberOfPages (u64 @ +24).
+        mov rax, [r12 + 8];              // rax = PhysicalStart bytes
+        mov rdx, [r12 + 24];             // rdx = NumberOfPages
+
+        // start_page = PhysicalStart >> 12. Reject descriptor if
+        // PhysicalStart >= 4 GiB (start_page >= 1M pages).
+        shr rax, 12;
+        mov rcx, 1048576;                // UEFI_PHYS_BITMAP_PAGES
+        cmp rax, rcx;
+        jl  seed_desc_in_range;
+        // Descriptor is entirely above the bitmap — tally + skip.
+        // paideia-as v0.20.1 does not encode `add [mem], reg` — use
+        // load-add-store.
+        mov r8, [rip + _uefi_phys_beyond_4g_pages];
+        add r8, rdx;
+        mov [rip + _uefi_phys_beyond_4g_pages], r8;
+        jmp seed_desc_next;
+
+      seed_desc_in_range:
+        // Truncate npages if the extent straddles the 4 GiB boundary:
+        //   available = UEFI_PHYS_BITMAP_PAGES - start_page
+        //   if npages > available: tally (npages - available) as
+        //   beyond-4G and set npages = available.
+        mov r8, rcx;                     // r8 = 1M
+        sub r8, rax;                     // r8 = available pages
+        cmp rdx, r8;
+        jle seed_desc_within_cap;
+        // Straddles — split: keep r8 pages, tally the rest.
+        mov r9, rdx;
+        sub r9, r8;
+        // load-add-store (no `add [mem], reg` in paideia-as v0.20.1)
+        mov r10, [rip + _uefi_phys_beyond_4g_pages];
+        add r10, r9;
+        mov [rip + _uefi_phys_beyond_4g_pages], r10;
+        mov rdx, r8;
+      seed_desc_within_cap:
+        // Now rdx = npages to clear starting at page-index rax.
+        // Inner loop: for each page in [rax, rax + rdx), clear bit.
+        cmp rdx, 0;
+        je  seed_desc_next;
+      seed_desc_clear_loop:
+        // (word, bit) = (page >> 6, page & 63).
+        mov r8, rax;
+        shr r8, 6;                       // word index
+        mov r9, rax;
+        and r9, 63;                      // bit index (0..63)
+        // Load bitmap[word].
+        lea r15, [rip + _uefi_phys_bitmap];
+        mov r10, [r15 + r8 * 8];
+        // Compute mask = ~(1 << bit). `not` is not a resolvable mnemonic
+        // in paideia-as v0.20.1 — the codebase uses `xor r, 0xFFFF...FFFF`
+        // which round-trips through the imm8 -1 sign-extended form
+        // (precedent: src/kernel/core/fs/vnode_pool.pdx:72).
+        mov r11, 1;
+        mov rcx, r9;
+        shl r11, cl;                     // r11 = 1 << bit
+        xor r11, 0xFFFFFFFFFFFFFFFF;     // r11 = ~(1 << bit)
+        and r10, r11;                    // clear bit
+        mov [r15 + r8 * 8], r10;
+        // Advance.
+        add rax, 1;
+        sub rdx, 1;
+        cmp rdx, 0;
+        jne seed_desc_clear_loop;
+
+      seed_desc_next:
+        add r12, r14;                    // advance descriptor pointer
+        sub r13, r14;                    // consume bytes
+        jmp seed_walk_loop;
+
+      seed_walk_done:
+
+        // ================================================================
+        // Phase 3: re-reserve the kernel image carve-out.
+        // ================================================================
+        //
+        // env->image_base (rbx + 56), env->image_size (rbx + 64). Both
+        // are byte-level values; convert to page range and SET bits.
+
+        mov rax, [rbx + 56];             // image_base bytes
+        mov rdx, [rbx + 64];             // image_size bytes
+        cmp rdx, 0;
+        je  seed_carveout_done;
+
+        // start_page = image_base >> 12. end_page = (image_base +
+        // image_size + 4095) >> 12 (round up). npages = end - start.
+        // Skip if image_base >= 4 GiB (out of bitmap range).
+        mov rcx, 1048576;
+        mov r8, rax;
+        shr r8, 12;                      // r8 = start_page
+        cmp r8, rcx;
+        jge seed_carveout_done;
+
+        // Compute end_page = ceil((image_base + image_size) / 4096).
+        add rax, rdx;                    // rax = image_end bytes
+        add rax, 4095;
+        shr rax, 12;                     // rax = end_page (exclusive)
+        // Clamp end_page to bitmap size.
+        cmp rax, rcx;
+        jle seed_carveout_end_ok;
+        mov rax, rcx;
+      seed_carveout_end_ok:
+        // npages = end_page - start_page.
+        mov rdx, rax;
+        sub rdx, r8;
+        cmp rdx, 0;
+        jle seed_carveout_done;
+
+        // load-add-store (no `add [mem], reg` in paideia-as v0.20.1)
+        mov r9, [rip + _uefi_phys_image_carveout_pages];
+        add r9, rdx;
+        mov [rip + _uefi_phys_image_carveout_pages], r9;
+
+        // Set bits for [start_page, end_page).
+        mov rax, r8;                     // rax = current page index
+      seed_carveout_set_loop:
+        mov r8, rax;
+        shr r8, 6;                       // word
+        mov r9, rax;
+        and r9, 63;                      // bit
+        lea r15, [rip + _uefi_phys_bitmap];
+        mov r10, [r15 + r8 * 8];
+        mov r11, 1;
+        mov rcx, r9;
+        shl r11, cl;                     // r11 = (1 << bit)
+        or  r10, r11;                    // set bit
+        mov [r15 + r8 * 8], r10;
+        add rax, 1;
+        sub rdx, 1;
+        cmp rdx, 0;
+        jne seed_carveout_set_loop;
+
+      seed_carveout_done:
+
+        // ================================================================
+        // Phase 4: popcnt sweep → _uefi_phys_free_pages.
+        // ================================================================
+        //
+        // free = TOTAL_BITS - sum_set. Same Kernighan idiom as
+        // phys_alloc_free_count (SSE4.2-free).
+
+        lea r15, [rip + _uefi_phys_bitmap];
+        xor rcx, rcx;                    // rcx = total set bits
+        xor rdx, rdx;                    // rdx = word index
+      seed_pop_loop:
+        cmp rdx, 16384;
+        jge seed_pop_done;
+        mov r9, [r15 + rdx * 8];
+        // Popcnt r9 into r10.
+        xor r10, r10;
+      seed_pop_word:
+        cmp r9, 0;
+        je  seed_pop_word_done;
+        mov r11, r9;
+        sub r11, 1;
+        and r9, r11;                     // r9 &= r9 - 1
+        add r10, 1;
+        jmp seed_pop_word;
+      seed_pop_word_done:
+        add rcx, r10;
+        add rdx, 1;
+        jmp seed_pop_loop;
+      seed_pop_done:
+        // free = 1048576 - rcx.
+        mov rax, 1048576;
+        sub rax, rcx;
+        mov [rip + _uefi_phys_free_pages], rax;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // uefi_phys_seed_free_pages() -> u64 — read-only accessor.
+  // ==========================================================================
+  //
+  // Returns the value stored in _uefi_phys_free_pages at the last
+  // seed pass. Useful for witness sites that don't want to re-popcnt
+  // the whole 16384-word bitmap.
+
+  pub let uefi_phys_seed_free_pages : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "R19.M5 (M4-deferred #2). Read-only accessor for _uefi_phys_free_pages. Single RIP-relative load into rax + ret. Used by test witnesses (tests/kernel/mm/uefi_physmap_synthetic.pdx) to check the seed's tally against the fabricated memmap's expected free-page count.",
+      block: {
+        mov rax, [rip + _uefi_phys_free_pages];
+        ret
+      }
+    } @no_frame
+}
