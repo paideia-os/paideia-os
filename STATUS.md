@@ -584,3 +584,78 @@ Ledger of nine deferred items in `design/round-retrospectives/r18-closure.md` §
 None. R18 ran entirely under QEMU; T14 G4 first-light is R19's deliverable per the UEFI stub round.
 
 **Next Round:** R19 (Paideia-native UEFI PE32+ boot) — see `design/round-retrospectives/r19-preflight.md`. Zero R18 blockers; paideia-as v0.21 tag pending (delivered piecewise; formal tag gated on paideia-as #1290).
+
+---
+
+## R19 (Paideia-native UEFI PE32+ Boot) — CLOSED 2026-08-10
+
+R19 delivered the paideia-native UEFI stub replacing the Multiboot2 stopgap: `src/boot/uefi_stub.pdx` PE32+ entry, Boot Services wrappers (`GetMemoryMap`, `AllocatePages`, `LocateProtocol`, `OpenProtocol`, `ExitBootServices`) via `MsX64Regs` typed carriers, GOP + ACPI + TCG2 measured-boot probes, typed `boot_env_t` handoff record, USB-image assembly (`build/uefi/paideia-esp.img`, 64 MiB FAT32). Paved the R20 path: `boot_env.rsdp_pa` fills the RSDP fast-path slot; ExitBootServices key-retry loop hardens against Insyde firmware strictness. First-light on real T14 G4 remains queued behind R20's ELF-loader completion (M5 OVMF observable reaches the finalizer `push _kernel_main_uefi_pa; ret` and #UDs at the placeholder LMA — expected M5 behavior; see `design/roadmap/r19-t14-g4-boot-guide.md` §1).
+
+### Issues Implemented (22 landed across M1–M5)
+
+- **M1** (#783–#786) — PE32+ entry via paideia-native emit + UTF-16 literals + typed EFI system-table + GUID types.
+- **M2** (#787–#791) — MS x64 ABI Boot Services wrappers: `AllocatePages`/`FreePages`, `LocateProtocol`, `GetMemoryMap` (5-arg stack-4th), `OpenProtocol`/`CloseProtocol`, `EFI_STATUS` decode + panic-on-fatal.
+- **M3** (#792–#796) — GOP framebuffer probe, ACPI RSDP discovery via `EFI_CONFIGURATION_TABLE`, TCG2 measured-boot PCR-extend, LoadedImage protocol.
+- **M4** (#797–#800) — ExitBootServices key-retry loop, kernel-handoff finalizer, typed `boot_env_t` builder.
+- **M5** (#801–#804) — UEFI PE32+ image + ESP layout (`tools/build-uefi-image.sh`), OVMF boot fixture (`tools/run-uefi-ovmf.sh`), swtpm TPM 2.0 fixture (`tools/run-uefi-swtpm.sh`), LMA-substitution stub + phys-bitmap seed from UEFI memmap.
+
+### Cross-Repo Escalations to paideia-as (R19)
+
+- **#1011** (MS x64 callee prologue emitter) — CLOSED.
+- **#1292** (PE32+ emitter) — CLOSED (delivered piecewise; bumped via `9564dff`).
+- **#1293** (PE emitter fixes) — CLOSED.
+- **#1290** (elaborator T0540) — remained OPEN through R19; no R19 site consumed PerCpuOps.
+- `paideia-as` pin at R19 close: `b0cb6f3`.
+
+### Observable Proof
+
+- OVMF boot fixture (`tools/run-uefi-ovmf.sh`): stub prints the pre-EBS hello banner, invokes ExitBootServices, jumps to the LMA-substituted kernel_main_uefi.
+- SwTPM fixture (`tools/run-uefi-swtpm.sh`): TCG2 HashLogExtendEvent path validated end-to-end.
+- All R18 fingerprints byte-identical.
+
+### R19 Debt Carried Forward
+
+- ELF loader for the LMA-substituted stub — R20 was originally scoped to include ELF loading, but that scope re-negotiated into R21 (see roadmap). R20 delivered ACPI static-table foundation instead.
+- v0.21 tag cutting — deferred piecewise; not blocking.
+
+---
+
+## R20 (ACPI Static-Table Foundation) — CLOSED 2026-08-10
+
+R20 delivered the kernel-side ACPI static-table pipeline (RSDP → XSDT → MADT + MCFG + FADT + HPET, plus the GAS decoder), the 512-byte `phase1_acpi_info` typed handoff record, the `KIND_ACPI` derived-capability scaffold, the userspace `acpi_supervisor` IPC schema, and the "no-AML-in-kernel" architectural guardrail with build-time enforcement. Pillar 3 target met: the kernel handles static tables only; anything requiring AML interpretation is punted to the R34 ACPICA userspace bubble (see `design/round-retrospectives/r20-closure.md` for the full write-up + 15 T14-G4 PROVISIONAL quirk-rows).
+
+### Issues Implemented (19 total, 17 implementation + 1 deferred + 2 closure)
+
+- **M1** (#805–#808) — RSDP scanner (`acpi_rsdp_scan_range` + fast-path via `boot_env_t.rsdp_pa`), XSDT walker (`acpi_xsdt_find` + `acpi_xsdt_iter`), checksum primitive (`acpi_checksum_ok`) + SIG4 constants, synthetic RSDP/XSDT fixtures.
+- **M2** (#809–#813) — MADT sub-entry parsers (LAPIC / IOAPIC / ISO / x2APIC), `topology_seed_from_madt` retires R18's hard-coded `_ap_apic_ids: [u8; 4]` stopgap, synthetic MADT fixture.
+- **M3** (#814–#818) — MCFG segment extractor (`_mcfg_segments[16]`), FADT parser (length-gated ACPI 1.0/2.0+/6.x with X_ preferred-form policy), HPET parser (byte-load-recombined min_tick to sidestep misaligned u16), GAS decoder, 512-byte `phase1_acpi_info` typed handoff (fadt_info + hpet_info + LAPIC base + MCFG seg0 + topology counts + 360-byte reserved tail).
+- **M4** (#819, #821, #822; #820 deferred) — `KIND_ACPI` derived capability (`acpi_cap.pdx`, R_ACPI_READ only, ≤ 2 MiB bound), acpi_supervisor IPC schema (`design/ipc/acpi-supervisor-schema.md`), no-AML-in-kernel guardrail (`design/acpi/no-aml-in-kernel.md` + `tools/lint-no-kernel-aml.sh`, wired as pre-push gate #1 + build.sh first pass). **#820 deferred** as blocker **#1015** (userspace-server substrate — named endpoints, service broker, variable-length IPC framing, initial-cap-transfer slot).
+- **M5** (#823, #824) — T14 G4 fixture harness (`tools/parse-acpi-fixture.sh` + `tools/capture-t14-g4-acpi.md` + `tests/kernel/acpi/t14_g4_fixture.pdx` placeholder + `tests/kernel/acpi/fixtures/t14g4/README.md`); R20 closure retrospective + `design/hardware/quirks.md` seed.
+
+### Cross-Repo Escalations to paideia-as (R20)
+
+**None.** `paideia-as` submodule remained pinned at `b0cb6f3` for all five R20 milestones. Every encoder-gap workaround was pre-known (G1 mov_d, G4 full-reg compares) and applied inline in the parser sites. First round with zero cross-repo work since R15.
+
+### Observable Proof
+
+- Kernel builds clean under `tools/build.sh` with the no-AML lint as gate #1 (0 matches in `src/kernel/**`).
+- Synthetic fixtures at `tests/kernel/acpi/{rsdp,xsdt,madt,mcfg,fadt,hpet}_synth.pdx` — each hand-checksummed, GDB-invocable via `call <parser>_synth_witness`, verify parser encoder-lowering ahead of any runtime wire-up.
+- `phase1_acpi_gather` symbol is observable in `nm build/kernel.elf` (defined, not yet called).
+- All prior fingerprints (`boot_r8_only` through `boot_smp`) byte-identical at R20 close.
+- Pre-push gate count: 16/16 (14-mode QEMU matrix + no-AML lint + opcode-canary).
+
+### R20 Debt Carried Forward
+
+1. **#820 acpi_supervisor server binary** — gated on **#1015** (userspace-server substrate). Target: post-R21 user-substrate round.
+2. **`phase1_acpi_gather` wiring into `kernel_main_uefi`** — first R21.M1 commit.
+3. **T14 G4 fixture activation** — GATED ON HARDWARE. Enables when operator captures real .bin files per `tools/capture-t14-g4-acpi.md`; can happen at any R21+ boundary.
+4. **`phase1_acpi_info` reserved-tail sufficiency** — assess at R21.M1 whether 360 bytes cover PPTT + SRAT + IORT + TPM2 + PCCT; grow struct without ABI break if not.
+5. **Quirks-db PROVISIONAL rows** — 15 anchored rows in `design/hardware/quirks.md` §2; promote to CONFIRMED at first-boot on T14 G4.
+
+**None regress R20 acceptance.**
+
+### Quirks Discovered on Real Hardware
+
+None (R20 ran under QEMU + synthetic fixtures). `design/hardware/quirks.md` seeded with 15 PROVISIONAL rows anchored against Intel Raptor Lake datasheets + Lenovo PSREF + Intel PCH defaults. Notable anchors: FADT reset via GAS at 0xCF9 with RESET_VALUE=0x06 (Lenovo/Insyde typical), MCFG single seg-0 ECAM base 0xE0000000, HPET counter_base 0xFED00000 + block_id 0x8086A701, AVX-512 disabled at core level, LAM unavailable (Meteor Lake+ only), VMD-on default (BIOS-off recipe documented), no debug UART on chassis.
+
+**Next Round:** R21 (FPU/XSAVE + IOAPIC + MSI/MSI-X + x2APIC + HPET timing) — preflight to land at R21.M1 kickoff as `design/round-retrospectives/r21-preflight.md`. Zero R20 blockers.
