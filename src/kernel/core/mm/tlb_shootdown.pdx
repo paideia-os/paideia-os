@@ -1,0 +1,243 @@
+// src/kernel/core/mm/tlb_shootdown.pdx — R18-M5-001 / #775
+// TLB shootdown initiator API (SMP path)
+// Issue: paideia-os/paideia-os#775
+//
+// Exports:
+//   tlb_shootdown_range(va_start: u64, va_end: u64) -> u64
+//     Cross-CPU TLB invalidation for the [va_start, va_end) VA range.
+//     Sequence per Intel SDM Vol 3A §4.10.4:
+//       1. Populate every peer CPU's per-CPU CB shootdown slots
+//          (SHOOTDOWN_START/END/EPOCH), incrementing that CPU's epoch.
+//       2. Broadcast IPI vec 0xF2 excluding self (lapic_send_ipi_
+//          broadcast_excl_self #771). Each receiver's _ipi_handler_f2
+//          (ipi/vectors.pdx) INVLPGs the range and publishes ack=epoch.
+//       3. Flush the initiator's own TLB inline via INVLPG over the range
+//          (SDM guarantees the initiator's INVLPG is a real flush on the
+//          instruction that issues it — no self-IPI round-trip needed).
+//       4. Bounded-poll each peer's CB[SHOOTDOWN_ACK] until it reaches
+//          the epoch value we wrote. Timeout returns TLB_SHOOTDOWN_TIMEOUT.
+//     Returns TLB_SHOOTDOWN_OK on success, TLB_SHOOTDOWN_TIMEOUT if any
+//     peer failed to ack within the budget.
+//
+// Testability at R18.M5 posture:
+//   - Vector infrastructure (trampoline + IDT wire + handler + stub) all
+//     land in this issue. BSP-self-poll works today because the initiator's
+//     own INVLPG is inline (no IPI to self).
+//   - Runtime cross-CPU witness (AC's "mmap + munmap fixture on 8 cores")
+//     is blocked on AP-side IDT install (#762/#766 follow-up) — until an
+//     AP has an IDT loaded, an inbound vec 0xF2 IPI #GPs before reaching
+//     _ipi_handler_f2. The bounded poll (100M iterations) prevents the
+//     initiator from hanging in that pre-IDT window.
+//   - Not yet wired into aspace_unmap / munmap path — the initiator API
+//     lands here, but the callers integrate as a peer issue once the AP
+//     IDT install unblocks.
+//
+// Concurrency contract (MVP):
+//   The caller must serialize tlb_shootdown_range calls under a shared
+//   lock (typically the aspace unmap lock). The per-CPU epoch field is
+//   NOT atomic: two concurrent initiators racing on the same peer's CB
+//   would clobber start/end and blur the ack ordering. Follow-up work
+//   (post-#775) may swap the epoch bump for a `lock xadd` and introduce
+//   per-peer request queuing; for the R18.M5 landing, single-writer
+//   discipline is sufficient because no caller exists yet.
+//
+// Non-goals:
+//   - INVPCID range invalidation. paideia-as encoder support verified
+//     missing via grep of tools/paideia-as/crates/paideia-as-runtime/src/
+//     instruction.rs (only invlpg + wbinvd wired; no invpcid mnemonic).
+//     INVPCID upgrade deferred to a follow-up paired with a paideia-as
+//     encoder issue. INVLPG-per-page loop is the MVP path per issue #775's
+//     "INVLPG range; INVPCID when available" title.
+//   - Full-flush primitive (CR3 reload). Callers that need a full flush
+//     today pass start=0, end=~0 — the receiver's handler caps iteration
+//     at 65536 pages (256 MiB window) as an MVP guard; the CR3-reload
+//     alternative is a follow-up once the mov cr3, cr3 encoder for this
+//     loop shape lands.
+//   - NUMA-aware fan-out (target only same-node CPUs sharing the CR3).
+//     Reserved for R20+ alongside the MADT enumeration migration.
+//
+// Encoder: paideia-as v0.20.1+ (mov / mov_d / rdmsr / invlpg / cmp / call /
+// ret + rip-relative lea). No new gaps.
+
+module TlbShootdown = structure {
+  pub let TLB_SHOOTDOWN_OK      : u64 = 0
+  pub let TLB_SHOOTDOWN_TIMEOUT : u64 = 1
+
+  // Iteration ceiling for the initiator's own INVLPG sweep — mirrors the
+  // receiver-side cap in _ipi_handler_f2 (65536 pages = 256 MiB). Full-
+  // flush requests (start=0, end=~0) collapse to this ceiling rather than
+  // hanging the CPU for hours.
+  let INVLPG_SWEEP_BUDGET : u64 = 65536
+
+  // Peer-ack poll budget — sized generously to tolerate TCG spin latency.
+  // A real hardware bound is ~O(peer_count) LAPIC ICR round-trips + a few
+  // hundred INVLPGs per peer; 100M iterations is comfortably above that
+  // while still guaranteeing the initiator eventually returns if a peer
+  // is deaf (e.g., pre-IDT-install AP under R18.M5 posture).
+  let ACK_POLL_BUDGET : u64 = 100000000
+
+  // ==========================================================================
+  // tlb_shootdown_range(va_start, va_end) -> u64
+  // ==========================================================================
+  // RDI = va_start (page-aligned VA, inclusive).
+  // RSI = va_end   (page-aligned VA, exclusive).
+  //
+  // Body outline (see header block for full contract):
+  //   (1) Read self_cpu = [gs:PERCPU_OFF_CPU_IDX] via rdmsr IA32_GS_BASE +
+  //       load [rax+0] (u32 zero-extended). Stash in r12.
+  //   (2) For cpu_idx in 0..MAX_CPUS excluding self_cpu:
+  //         cb = &_percpu_cbs + cpu_idx * PERCPU_SIZE (inlined compute)
+  //         cb[+88]  = va_start
+  //         cb[+96]  = va_end
+  //         cb[+104] = cb[+104] + 1        (bump epoch)
+  //   (3) lapic_send_ipi_broadcast_excl_self(IPI_VECTOR_F2 = 242).
+  //   (4) Local INVLPG sweep: rbx = va_start; while (rbx < va_end and budget
+  //       remaining) { invlpg [rbx]; rbx += 4096; budget--; }.
+  //   (5) For cpu_idx in 0..MAX_CPUS excluding self_cpu:
+  //         cb = &_percpu_cbs + cpu_idx * PERCPU_SIZE
+  //         epoch = cb[+104]
+  //         wait_budget = ACK_POLL_BUDGET
+  //         while cb[+112] < epoch:
+  //             if --wait_budget == 0: return TLB_SHOOTDOWN_TIMEOUT
+  //   (6) return TLB_SHOOTDOWN_OK.
+  //
+  // Register discipline (SysV):
+  //   r12 = self_cpu (callee-save, spans multi-CPU loops + call).
+  //   r13 = cpu_idx walker (callee-save).
+  //   r14 = current CB VA (callee-save, spans nested reads).
+  //   r15 = poll budget / epoch scratch (callee-save).
+  //   rbx = local-INVLPG walker VA + local-sweep budget (callee-save).
+  //   Caller-save (rax/rcx/rdx/rsi/rdi/r8-r11) used freely for scratch and
+  //   for calls into rdmsr / lapic_send_ipi_broadcast_excl_self / invlpg.
+  //
+  // Stack alignment: five callee-save pushes (rbx, r12, r13, r14, r15) land
+  // rsp % 16 == 8 at each nested-call boundary — an extra `sub rsp, 8` /
+  // `add rsp, 8` is issued around each `call` to re-align to 16.
+  pub let tlb_shootdown_range : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (va_start: u64, va_end: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "#775 R18-M5-001: cross-CPU TLB shootdown initiator. (a) Reads self_cpu from CB[+0] via rdmsr IA32_GS_BASE + [rax+0] u32 load (same idiom as gs_base_read_cpu_idx in smp/gs_base.pdx). (b) Iterates cpu_idx in [0, MAX_CPUS=4), skipping self, populating peer CB slots at offsets +88 (start), +96 (end), +104 (epoch bump). Peer CB VA = &_percpu_cbs + cpu_idx * PERCPU_SIZE inlined per the leaf-arithmetic contract in percpu.pdx.percpu_cb_for. (c) Calls lapic_send_ipi_broadcast_excl_self(242) — the sender's INVLPG happens inline in step (d), so shorthand-11 (all-excl-self) delivers only to peers, avoiding a self-IPI round-trip. (d) Local INVLPG loop bounded by INVLPG_SWEEP_BUDGET (65536 pages) — mirrors the receiver-side ceiling in _ipi_handler_f2 so full-flush requests (start=0, end=~0) collapse to a 256 MiB window rather than hanging. (e) Bounded-poll each peer's ack (CB[+112]) until it reaches the epoch value we wrote (CB[+104]); ACK_POLL_BUDGET (100M) exhausted → return TLB_SHOOTDOWN_TIMEOUT (1). All-acked → return TLB_SHOOTDOWN_OK (0). Callee-save discipline: 5 pushes (rbx, r12, r13, r14, r15) — used for self_cpu / cpu_idx / cb VA / poll budget / local walker. Stack rsp % 16 == 8 after the 5 pushes; `sub rsp, 8` before each nested `call` (broadcast + IPI helper) re-aligns to 16. Encoder gaps: none — mov / mov_d / rdmsr / invlpg / cmp / call / ret / lea all pre-#771. INVPCID intentionally NOT used — paideia-as encoder support verified missing via grep of tools/paideia-as/crates/paideia-as-runtime/src/instruction.rs (only invlpg + wbinvd wired). Not wired into aspace_unmap / munmap yet — the initiator API lands here, callers integrate as a peer issue once AP-side IDT install (#762/#766 follow-up) unblocks the runtime cross-CPU witness.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ----- (a) self_cpu = [gs:0] -----
+        // Stash va_start / va_end in callee-save regs before clobbering rax/rdx
+        // via rdmsr. rbx will re-serve for the local sweep in step (d).
+        mov rbx, rdi;                             // rbx = va_start (holds through steps b, c)
+        mov r10, rsi;                             // r10 = va_end   (caller-save, safe until step d)
+
+        mov rcx, 0xC0000101;                      // IA32_GS_BASE MSR index
+        rdmsr;                                     // EDX:EAX = &CB[self]
+        shl rdx, 32;
+        or rax, rdx;                               // rax = &CB[self]
+        mov r12d, [rax];                           // r12 = self_cpu (u32 zero-extended into r12)
+
+        // ----- (b) Populate peer CB slots -----
+        // r13 = cpu_idx walker (0..MAX_CPUS=4).
+        // r14 = current CB VA scratch.
+        xor r13, r13;
+        populate_loop:
+          cmp r13, 4;                              // MAX_CPUS
+          jge populate_done;
+
+          cmp r13, r12;                            // skip self
+          je populate_next;
+
+          // r14 = &_percpu_cbs + r13 * 128
+          lea r14, [rip + _percpu_cbs];
+          mov rax, r13;
+          shl rax, 7;                              // r13 * PERCPU_SIZE
+          add r14, rax;
+
+          // cb[+88] = va_start (rbx)
+          mov [r14 + 88], rbx;
+          // cb[+96] = va_end (r10)
+          mov [r14 + 96], r10;
+          // cb[+104] = cb[+104] + 1 (epoch bump)
+          mov rax, [r14 + 104];
+          add rax, 1;
+          mov [r14 + 104], rax;
+
+          populate_next:
+          add r13, 1;
+          jmp populate_loop;
+        populate_done:
+
+        // ----- (c) Broadcast IPI vec 0xF2 excl self -----
+        // rdi = vector (242). sub/add rsp 8 keeps 16-byte SysV alignment
+        // across the nested `call` (5 callee-save pushes above → rsp % 16 == 8).
+        mov rdi, 242;
+        sub rsp, 8;
+        call lapic_send_ipi_broadcast_excl_self;
+        add rsp, 8;
+
+        // ----- (d) Local INVLPG sweep -----
+        // rbx = walking VA (still va_start from step a).
+        // r10 = va_end. r15 = INVLPG_SWEEP_BUDGET countdown.
+        mov r15, 65536;                            // INVLPG_SWEEP_BUDGET
+        local_invlpg_loop:
+          cmp rbx, r10;
+          jae local_invlpg_done;
+          invlpg [rbx];
+          add rbx, 4096;
+          sub r15, 1;
+          jnz local_invlpg_loop;
+        local_invlpg_done:
+
+        // ----- (e) Poll each peer's ack -----
+        // r13 = cpu_idx walker; r14 = CB VA; r15 = poll budget.
+        xor r13, r13;
+        ack_poll_outer:
+          cmp r13, 4;                              // MAX_CPUS
+          jge ack_poll_done_all;
+
+          cmp r13, r12;                            // skip self
+          je ack_poll_next;
+
+          // r14 = &_percpu_cbs + r13 * 128
+          lea r14, [rip + _percpu_cbs];
+          mov rax, r13;
+          shl rax, 7;
+          add r14, rax;
+
+          // rbx = epoch to observe (cb[+104]) — reuse rbx now that local sweep is done.
+          mov rbx, [r14 + 104];
+
+          // Bounded poll: while cb[+112] < rbx: budget--; if 0 → timeout.
+          mov r15, 100000000;                      // ACK_POLL_BUDGET
+          ack_poll_inner:
+            mov rax, [r14 + 112];
+            cmp rax, rbx;
+            jae ack_poll_this_done;
+            sub r15, 1;
+            jz ack_poll_timeout;
+            jmp ack_poll_inner;
+          ack_poll_this_done:
+
+          ack_poll_next:
+          add r13, 1;
+          jmp ack_poll_outer;
+        ack_poll_done_all:
+
+        // Success path — rax = TLB_SHOOTDOWN_OK.
+        mov rax, 0;
+        jmp tlb_shootdown_range_epilogue;
+
+        ack_poll_timeout:
+        mov rax, 1;                                // TLB_SHOOTDOWN_TIMEOUT
+
+        tlb_shootdown_range_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
