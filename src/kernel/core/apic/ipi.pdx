@@ -1,0 +1,247 @@
+// src/kernel/core/apic/ipi.pdx — R18-M4-001 / #771
+// LAPIC ICR IPI dispatch — Fixed delivery, all four destination shorthands
+// Issue: paideia-os/paideia-os#771
+//
+// Exports:
+//   lapic_write_icr(icr_hi: u64, icr_lo: u64)
+//     Base helper. Writes ICR_HI (32-bit at 0xFEE00310) then ICR_LO
+//     (32-bit at 0xFEE00300 — the "kick"), then polls delivery-status
+//     bit 12 to clear (bounded 100k reads). The vector byte, delivery
+//     mode, level, trigger, dest_mode, and destination shorthand are
+//     ALL encoded by the caller in icr_lo — this helper is deliberately
+//     encoding-agnostic so future NMI/SMI/TLB-shootdown IPI paths can
+//     share it without re-inlining the MMIO layer.
+//
+//   lapic_send_ipi_fixed(target_apic_id: u64, vector: u64)
+//     Shorthand 00 (No shorthand). Fixed delivery, edge, Level=Assert,
+//     physical destination mode. `target_apic_id` is placed in
+//     ICR_HI[31:24] (xAPIC 8-bit); `vector` occupies ICR_LO[7:0].
+//     Base for the R18-M4-002 reschedule IPI (#772).
+//
+//   lapic_send_ipi_self(vector: u64)
+//     Shorthand 01 (Self). ICR_HI is a don't-care per SDM §10.6.1 but
+//     the base helper writes 0 for hygiene. Coexists with
+//     self_ipi.pdx's apic_send_self_ipi (identical ICR encoding) —
+//     registered under the lapic_send_ipi_* family so R18-M4 callers
+//     that dispatch by shorthand can find it uniformly.
+//
+//   lapic_send_ipi_broadcast_incl_self(vector: u64)
+//     Shorthand 10 (All including self). Every CPU in the LAPIC bus
+//     including the sender.
+//
+//   lapic_send_ipi_broadcast_excl_self(vector: u64)
+//     Shorthand 11 (All excluding self). Every CPU except the sender.
+//     Base for the R18-M4-005 TLB-shootdown IPI (#775) — the initiator
+//     flushes its own TLB inline (invlpg / mov cr3), IPI carries the
+//     shootdown request only to the peers.
+//
+// Intel SDM Vol 3A §10.6.1 — ICR_LO layout:
+//   [ 7: 0]  Vector
+//   [10: 8]  Delivery mode        (000 = Fixed here; NMI/INIT/SIPI elsewhere)
+//   [   11]  Destination mode     (0 = Physical; unused when shorthand != 00)
+//   [   12]  Delivery status      (R/O — polled for idle)
+//   [   14]  Level                (1 = Assert)
+//   [   15]  Trigger mode         (0 = Edge)
+//   [19:18]  Destination shorthand:
+//              00 = No shorthand   (dest in ICR_HI[31:24])
+//              01 = Self
+//              10 = All including self
+//              11 = All excluding self
+// ICR_HI layout (xAPIC): [31:24] destination APIC ID; other bits reserved.
+//
+// All MMIO stores are 32-bit (mov_d). LAPIC registers are strictly 32-bit
+// per SDM §10.4.1; a bare `mov [rax], r64` REX.W 64-bit store spills into
+// the adjacent register slot and is silently corrupted by QEMU-TCG's LAPIC
+// (paideia-as #1251 class). The mov_d idiom is defence-in-depth against a
+// future encoder regression re-introducing that bug; it matches
+// self_ipi.pdx / init_sipi.pdx / lapic_timer.pdx / tpr.pdx.
+//
+// Delivery-status poll uses `mov ecx, [rax]` (32-bit load zero-extends
+// into RCX per SDM Vol 2A §3.4.1.1) and masks bit 12; loop breaks on
+// clear OR after 100k iterations. The bounded poll prevents smoke-mode
+// hangs on TCG builds where the bit is sticky; the outer counter-poll
+// in callers is the real delivery-fail signal.
+//
+// Non-goals:
+//   - NMI / SMI / INIT / SIPI delivery modes (not encoded here — INIT+SIPI
+//     live in init_sipi.pdx; NMI/SMI paths land in later R18.M4 issues).
+//   - Logical destination mode (Physical mode only; logical mode is R30+
+//     scope alongside x2APIC MSR path).
+//   - x2APIC MSR write path (this module is xAPIC MMIO only).
+//
+// Encoder: paideia-as v0.20.1+ (mov_d + mov imm64 + call/ret + jmp/cmp).
+// No new gaps.
+
+module Ipi = structure {
+  // xAPIC ICR MMIO addresses (LAPIC base = 0xFEE00000).
+  let LAPIC_ICR_LO_ADDR : u64 = 0xFEE00300
+  let LAPIC_ICR_HI_ADDR : u64 = 0xFEE00310
+
+  // Composed ICR_LO base values per shorthand. Fixed delivery (000 << 8),
+  // physical dest mode (0 << 11), edge trigger (0 << 15) are all implicit
+  // zeros. Assert level (1 << 14 = 0x4000) is set. Shorthand occupies
+  // bits [19:18]. OR with the 8-bit vector to get the final ICR_LO value.
+  let ICR_SHORTHAND_NONE_BASE      : u64 = 0x04000  // 0x4000 | (0b00 << 18)
+  let ICR_SHORTHAND_SELF_BASE      : u64 = 0x44000  // 0x4000 | (0b01 << 18)
+  let ICR_SHORTHAND_ALL_INCL_BASE  : u64 = 0x84000  // 0x4000 | (0b10 << 18)
+  let ICR_SHORTHAND_ALL_EXCL_BASE  : u64 = 0xC4000  // 0x4000 | (0b11 << 18)
+
+  // Delivery-status bit (ICR_LO bit 12) — polled for idle.
+  let ICR_DELIVERY_STATUS_BIT : u64 = 0x1000
+  let ICR_POLL_BUDGET         : u64 = 100000
+
+  // ============================================================================
+  // lapic_write_icr(icr_hi, icr_lo) — base MMIO helper
+  // ============================================================================
+  // RDI = icr_hi (already composed by caller). RSI = icr_lo (kick value).
+  // Writes ICR_HI first, then ICR_LO (the write to ICR_LO is what triggers
+  // delivery per SDM §10.6.1). Polls ICR_LO bit 12 until clear or budget
+  // exhausted. Both stores are mov_d (32-bit sized) using the low 32 bits
+  // of the input registers.
+  //
+  // Callee-clobber: RAX, RCX, RDX (SysV caller-save). RDI, RSI consumed.
+  pub let lapic_write_icr : (u64, u64) -> () !{sysreg, mem} @{boot} =
+    fn (icr_hi: u64, icr_lo: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "#771 R18-M4-001 base helper: write LAPIC ICR pair (ICR_HI at 0xFEE00310, ICR_LO at 0xFEE00300) with caller-composed values in RDI/RSI, then poll delivery-status. Both stores use mov_d (32-bit sized on the low 32 bits of RDI/RSI) — LAPIC registers are strictly 32-bit per Intel SDM Vol 3A §10.4.1; a REX.W 64-bit store spills into the adjacent register slot and is silently corrupted by QEMU-TCG's LAPIC (paideia-as #1251 class). ICR_HI is written first so that when the ICR_LO write kicks delivery per §10.6.1 the destination byte [31:24] is already settled — the ordering matters only for shorthand 00 (specific target) but is a harmless no-op for the shorthand-01/10/11 helpers that pass icr_hi = 0. Delivery-status poll reads ICR_LO with `mov ecx, [rax]` (32-bit zero-extend into RCX per SDM Vol 2A §3.4.1.1, same idiom as ioapic.pdx / self_ipi.pdx) and masks bit 12; loop breaks on clear OR after 100k iterations. Bounding the poll prevents smoke-mode hangs on TCG builds where the bit is sticky; the outer counter-poll in callers is the real delivery-fail signal. Encoding-agnostic by design: vector, delivery mode, level, trigger, dest_mode, and shorthand are all composed by callers — so future R18.M4 NMI / TLB-shootdown / reschedule IPI paths (#772, #775) share this MMIO layer without re-inlining. Callee-clobber: RAX, RCX, RDX per SysV; RDI/RSI consumed.",
+      block: {
+        // ---- ICR_HI = low 32 bits of RDI ----
+        mov rax, 0xFEE00310;
+        mov_d [rax], rdi;
+
+        // ---- ICR_LO = low 32 bits of RSI (this write kicks delivery) ----
+        mov rax, 0xFEE00300;
+        mov_d [rax], rsi;
+
+        // ---- Bounded poll on ICR_LO bit 12 (delivery status idle = 0) ----
+        mov rax, 0xFEE00300;
+        mov rdx, 100000;
+        lapic_write_icr_wait:
+          mov ecx, [rax];
+          and rcx, 0x1000;
+          je lapic_write_icr_wait_done;
+          sub rdx, 1;
+          jnz lapic_write_icr_wait;
+        lapic_write_icr_wait_done:
+          ret
+      }
+    }
+
+  // ============================================================================
+  // lapic_send_ipi_fixed(target_apic_id, vector) — shorthand 00
+  // ============================================================================
+  // RDI = target APIC ID (xAPIC 8-bit; masked). RSI = vector byte (masked).
+  // ICR_HI = (target & 0xFF) << 24. ICR_LO = 0x4000 | (vector & 0xFF).
+  //
+  // Callee-clobber: RAX, RCX, RDX. RDI, RSI consumed.
+  pub let lapic_send_ipi_fixed : (u64, u64) -> () !{sysreg, mem} @{boot} =
+    fn (target_apic_id: u64, vector: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "#771 R18-M4-001: Fixed, edge-triggered, Level=Assert, physical-destination, no-shorthand (00) IPI to target_apic_id (RDI) at vector (RSI). Composes ICR_HI = (RDI & 0xFF) << 24 in place — the xAPIC ICR_HI destination byte lives in [31:24]; the 0xFF mask enforces xAPIC 8-bit width even if caller passes an x2APIC 32-bit ID (x2APIC dispatch is the MSR path in a future round, not this MMIO). Composes ICR_LO = ICR_SHORTHAND_NONE_BASE (0x4000, Assert bit 14 only) | (vector & 0xFF); Fixed delivery mode (000 << 8), physical dest mode (0 << 11), edge trigger (0 << 15), no shorthand (00 << 18) are all implicit zeros. RDI/RSI double as this function's args and lapic_write_icr's args — compose in place, sub rsp,8/add rsp,8 keeps the 16-byte SysV alignment across `call lapic_write_icr` (entry rsp is 8 mod 16 after the caller's CALL; base helper must see 0 mod 16 pre-CALL). Base for the R18-M4-002 reschedule IPI (#772) which will pass vec = SCHED_RESCHED_VEC. Callee-clobber: RAX, RCX, RDX; RDI/RSI consumed.",
+      block: {
+        // ICR_HI = (target & 0xFF) << 24 — kept in RDI (arg1 to base helper).
+        and rdi, 0xFF;
+        shl rdi, 24;
+
+        // ICR_LO = ICR_SHORTHAND_NONE_BASE | (vector & 0xFF) — into RSI (arg2).
+        and rsi, 0xFF;
+        mov rax, 0x4000;
+        or rsi, rax;
+
+        // Call base helper; sub/add 8 keeps 16-byte stack alignment.
+        sub rsp, 8;
+        call lapic_write_icr;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // lapic_send_ipi_self(vector) — shorthand 01
+  // ============================================================================
+  // RDI = vector byte. ICR_HI is a don't-care under shorthand 01; base
+  // helper writes 0 for hygiene. ICR_LO = 0x44000 | (vector & 0xFF).
+  //
+  // Coexists with self_ipi.pdx's apic_send_self_ipi (identical encoding);
+  // this name plugs into the lapic_send_ipi_* naming family so callers
+  // can select shorthand programmatically.
+  //
+  // Callee-clobber: RAX, RCX, RDX. RDI consumed.
+  pub let lapic_send_ipi_self : (u64) -> () !{sysreg, mem} @{boot} =
+    fn (vector: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "#771 R18-M4-001: Fixed, edge-triggered, Level=Assert, shorthand-01 (Self) IPI at vector (RDI). ICR_HI is a don't-care under Self per Intel SDM Vol 3A §10.6.1 (destination byte unused); base helper writes 0 for hygiene. ICR_LO = ICR_SHORTHAND_SELF_BASE (0x44000 = Self shorthand 01 << 18 | Assert bit 14) | (vector & 0xFF); Fixed delivery mode (000) and physical dest mode (0) and edge trigger (0) are implicit zeros. Compose ICR_LO in RSI (from vector in RDI), then zero RDI to signal icr_hi = 0. sub rsp,8/add rsp,8 keeps 16-byte alignment across `call lapic_write_icr`. Coexists with self_ipi.pdx's apic_send_self_ipi under identical ICR encoding — this name plugs into the lapic_send_ipi_* family so R18-M4 callers that select shorthand programmatically find it under the uniform prefix. Callee-clobber: RAX, RCX, RDX; RDI consumed.",
+      block: {
+        // ICR_LO = ICR_SHORTHAND_SELF_BASE | (vector & 0xFF) — into RSI (arg2).
+        mov rsi, rdi;
+        and rsi, 0xFF;
+        mov rax, 0x44000;
+        or rsi, rax;
+
+        // ICR_HI = 0 (destination unused under Self).
+        xor rdi, rdi;
+
+        sub rsp, 8;
+        call lapic_write_icr;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // lapic_send_ipi_broadcast_incl_self(vector) — shorthand 10
+  // ============================================================================
+  // RDI = vector byte. Every CPU including sender receives. ICR_HI is a
+  // don't-care under shorthand 10.
+  //
+  // Callee-clobber: RAX, RCX, RDX. RDI consumed.
+  pub let lapic_send_ipi_broadcast_incl_self : (u64) -> () !{sysreg, mem} @{boot} =
+    fn (vector: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "#771 R18-M4-001: Fixed, edge-triggered, Level=Assert, shorthand-10 (All-including-self) IPI at vector (RDI). Every CPU in the LAPIC bus/system (including the sender) is targeted. ICR_HI is a don't-care under this shorthand per Intel SDM Vol 3A §10.6.1 — base helper writes 0 for hygiene. ICR_LO = ICR_SHORTHAND_ALL_INCL_BASE (0x84000 = All-incl 10 << 18 | Assert bit 14) | (vector & 0xFF); Fixed delivery mode (000) and physical dest mode (0) and edge trigger (0) are implicit zeros. Compose ICR_LO in RSI from vector in RDI, then zero RDI. sub rsp,8/add rsp,8 keeps 16-byte alignment across `call lapic_write_icr`. Reserved for global broadcast primitives where the initiator wants a fan-out that includes itself (e.g., a system-wide reschedule pulse from a management path); TLB-shootdown callers prefer the excl_self variant (#775) because the initiator flushes its own TLB inline. Callee-clobber: RAX, RCX, RDX; RDI consumed.",
+      block: {
+        mov rsi, rdi;
+        and rsi, 0xFF;
+        mov rax, 0x84000;
+        or rsi, rax;
+
+        xor rdi, rdi;
+
+        sub rsp, 8;
+        call lapic_write_icr;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // lapic_send_ipi_broadcast_excl_self(vector) — shorthand 11
+  // ============================================================================
+  // RDI = vector byte. Every CPU except sender receives. ICR_HI is a
+  // don't-care under shorthand 11. Base for R18-M4-005 TLB shootdown (#775).
+  //
+  // Callee-clobber: RAX, RCX, RDX. RDI consumed.
+  pub let lapic_send_ipi_broadcast_excl_self : (u64) -> () !{sysreg, mem} @{boot} =
+    fn (vector: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "#771 R18-M4-001: Fixed, edge-triggered, Level=Assert, shorthand-11 (All-excluding-self) IPI at vector (RDI). Every CPU EXCEPT the sender is targeted. ICR_HI is a don't-care under this shorthand per Intel SDM Vol 3A §10.6.1 — base helper writes 0 for hygiene. ICR_LO = ICR_SHORTHAND_ALL_EXCL_BASE (0xC4000 = All-excl 11 << 18 | Assert bit 14) | (vector & 0xFF); Fixed delivery mode (000) and physical dest mode (0) and edge trigger (0) are implicit zeros. Compose ICR_LO in RSI from vector in RDI, then zero RDI. sub rsp,8/add rsp,8 keeps 16-byte alignment across `call lapic_write_icr`. Base primitive for the R18-M4-005 TLB-shootdown IPI (#775): the initiator flushes its own TLB directly via invlpg / mov cr3 (cheaper and race-free vs. self-IPI), and this shorthand carries the shootdown request to peers only, avoiding the pathological self-fire loop. Callee-clobber: RAX, RCX, RDX; RDI consumed.",
+      block: {
+        mov rsi, rdi;
+        and rsi, 0xFF;
+        mov rax, 0xC4000;
+        or rsi, rax;
+
+        xor rdi, rdi;
+
+        sub rsp, 8;
+        call lapic_write_icr;
+        add rsp, 8;
+        ret
+      }
+    }
+}
