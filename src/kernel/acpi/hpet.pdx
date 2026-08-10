@@ -1,0 +1,216 @@
+// src/kernel/acpi/hpet.pdx — R20-M3-003 (#816)
+//
+// HPET (High Precision Event Timer) ACPI table parser. The HPET is a
+// memory-mapped timer block that supersedes the legacy PIT/RTC pair:
+// its main counter runs at ≥10 MHz (typically 14.31818 MHz on desktop
+// silicon, 24 MHz on server platforms) and it publishes 3..32
+// comparators, each capable of one-shot or periodic interrupts routed
+// via IOAPIC/MSI. R21.M5 will use it as the primary calibration
+// source for the LAPIC deadline TSC delta; R20.M3 only extracts the
+// MMIO base address of the counter block.
+//
+// -----------------------------------------------------------------------------
+// HPET table on-wire layout (IA-PC HPET Specification 1.0a §3.2.4)
+// -----------------------------------------------------------------------------
+//
+//   +0..35    sdt_hdr                     — signature "HPET" (SIG_HPET=0x54455048)
+//   +36..39   u32 event_timer_block_id    — vendor / capability bits (rev, comparators)
+//   +40..51   GAS  address                — 12-byte GAS pointing at counter block
+//                                            (address_space=0 SystemMemory always)
+//   +52       u8   hpet_number            — logical index (chipset can host ≥1)
+//   +53..54   u16  min_tick               — minimum periodic clock ticks (u16 @ odd offset)
+//   +55       u8   page_protection        — guest-visibility hint bits
+//
+// The u16 at +53 lands at an ODD offset relative to the table base
+// (53 mod 2 = 1); reading it as a naive `mov_w rax, [table+53]` is a
+// misaligned word load. x86-64 tolerates that per SDM Vol.3 §7.1.1
+// (same permission we use for the u64 at GAS+4 across gas.pdx), but
+// the R20.M3 mandate reminds us that "aligned reads of unaligned
+// fields" is a hazard. We take the same defensive posture: two u8
+// loads + a bit-shift OR — no penalty vs. a single misaligned word
+// on modern silicon (both are single-uop) and no possibility of a
+// straddled-cache-line stall on rare paravirt-firmware HPETs whose
+// alignment is unpredictable.
+//
+// -----------------------------------------------------------------------------
+// Note: HPET period is NOT in the ACPI table
+// -----------------------------------------------------------------------------
+//
+// The counter's tick period (10 ns .. 100 ns range) lives in the
+// GENERAL_CAPS register at counter_base+0, upper 32 bits (u32
+// COUNTER_CLK_PERIOD in femtoseconds). Reading it requires the
+// counter block to be MMIO-mapped, which happens in R21.M5 when the
+// physmap window covers 0xFED00000. R20.M3 explicitly does NOT touch
+// the MMIO — this module only extracts the ACPI-visible metadata.
+//
+// -----------------------------------------------------------------------------
+// hpet_info decoded layout (32 B, @align(8))
+// -----------------------------------------------------------------------------
+//
+//   +0   u64 counter_base_pa    — GAS.address (usually 0xFED00000)
+//   +8   u32 block_id           — event_timer_block_id verbatim
+//   +12  u16 min_tick           — recombined from two byte-loads at +53/+54
+//   +14  u8  hpet_number
+//   +15  u8  _pad
+//   +16  u64 _pad2              — reserved for R21 discovery cache
+//   +24  u64 _pad3              — reserved for R21 discovery cache
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.20.1+)
+// -----------------------------------------------------------------------------
+//
+//   G1: mov [mem], reg32 widens → mov_d for u32 stores (block_id, _pad).
+//   G4: cmp al, imm may miscompile → full-register compares after
+//       zero-extension.
+
+module Hpet = structure {
+
+  // ============================================================================
+  // Layout constants
+  // ============================================================================
+
+  pub let HPET_OFFSET_BLOCK_ID          : u64 = 36
+  pub let HPET_OFFSET_ADDRESS_GAS       : u64 = 40
+  pub let HPET_OFFSET_HPET_NUMBER       : u64 = 52
+  pub let HPET_OFFSET_MIN_TICK_LO       : u64 = 53     // u8 (low byte of u16)
+  pub let HPET_OFFSET_MIN_TICK_HI       : u64 = 54     // u8 (high byte of u16)
+  pub let HPET_OFFSET_PAGE_PROTECTION   : u64 = 55
+
+  pub let HPET_TABLE_MIN_LENGTH         : u64 = 56    // sdt_hdr(36) + body(20)
+
+  // hpet_info offsets.
+  pub let HPET_INFO_SIZE_BYTES          : u64 = 32
+  pub let HPET_INFO_OFFSET_COUNTER_BASE : u64 = 0
+  pub let HPET_INFO_OFFSET_BLOCK_ID     : u64 = 8
+  pub let HPET_INFO_OFFSET_MIN_TICK     : u64 = 12
+  pub let HPET_INFO_OFFSET_HPET_NUMBER  : u64 = 14
+  pub let HPET_INFO_OFFSET_PAD          : u64 = 15
+
+  // ============================================================================
+  // hpet_parse — decode the ACPI HPET table into a 32-byte hpet_info
+  // ============================================================================
+  //
+  // SysV: (hpet: u64, out: u64) -> u64
+  //
+  //   rdi = HPET base (a valid *sdt_hdr with signature "HPET"; caller
+  //         MUST have checksum-validated it via acpi_checksum_ok).
+  //   rsi = pointer to a 32-byte hpet_info (caller-allocated, @align(8) preferred).
+  //
+  // Returns rax = 1 if the parse succeeded (out fully populated + GAS
+  // resolves to a non-zero SystemMemory address), else 0.
+  //
+  // Failure modes:
+  //   - hpet == 0 or out == 0                           → return 0
+  //   - hpet->length < HPET_TABLE_MIN_LENGTH (56)       → return 0
+  //     (defensive against firmware truncation; the min-length is
+  //     what the spec requires to hold body + page_protection.)
+  //   - gas_read on the counter block address returns 0 → return 0
+  //     (address_space != {0,1} or address == 0 — both cases mean
+  //     the counter block is undiscoverable and we cannot proceed.)
+  //
+  // Register plan (2-push callee-save + local 16-byte gas_info spill):
+  //   Prologue: push rbx, r12 (+16), sub rsp, 16 (gas_info scratch) → +32.
+  //   entry rsp % 16 == 8 → +32 → rsp % 16 == 8 pre-call to gas_read
+  //   → gas_read CPU-push lands callee at rsp % 16 == 0? No — SysV
+  //   demands rsp%16==0 at the call site (before the `call` push).
+  //   Adjust: 2 pushes + sub rsp,16 = 32B, rsp%16 stays 8 (entry) → 8.
+  //   Need rsp%16==0. So use 2 pushes + sub rsp, 24 = 40B → 8+40=48
+  //   → rsp%16==0. Or use 3 pushes + sub rsp, 16 = 40B → same.
+  //   We take 3-push (rbx, r12, r13) + sub rsp, 16 = 40B, rsp%16==0.
+  //
+  //   rbx = out ptr (arg2)
+  //   r12 = hpet ptr (arg1)
+  //   r13 = &gas_info scratch (rsp + 0 after sub)
+
+  pub let hpet_parse : (u64, u64) -> u64 !{mem} @{} =
+    fn (hpet: u64, out: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R20-M3-003 (#816). Parse the ACPI HPET table into a 32-byte hpet_info. Null-guards on both pointers. Length guard: hpet->length (u32 @ +4, zero-extended) must be >= HPET_TABLE_MIN_LENGTH (56) — the spec-mandated minimum for a body that reaches through page_protection. Decode: (a) counter_base via gas_read(hpet+40, &tmp_gas_info) — the GAS's SystemMemory (address_space=0) address goes into out+0; if gas_read returns 0 (invalid GAS: null address OR unsupported address_space) we abort with return 0 because a missing counter block makes the whole record useless. (b) block_id (u32 @ +36 zero-extended via 32-bit load) → u32 @ out+8 via mov_d (G1). (c) min_tick RECONSTRUCTED from two byte loads at +53 (low) and +54 (high) via `xor rax,rax; mov_b rax,[hpet+54]; shl rax,8; mov_b rcx,[hpet+53]; or rax,rcx` — spec-legal misaligned u16 load avoided per R20.M3 mandate ('use byte reads + shifts'). The reconstructed u16 stored via mov_w. (d) hpet_number (u8 @ +52) → u8 @ out+14 via mov_b. (e) _pad (u8 @ out+15) zero via mov_b. (f) _pad2 (u64 @ out+16) and _pad3 (u64 @ out+24) zero via plain mov. Stack: 3-push callee-save (rbx,r12,r13) + sub rsp,16 (16-byte gas_info scratch) = 40B on top of entry rsp%16==8 → rsp%16==0 pre-call to gas_read, matching SysV. rbx=out, r12=hpet, r13=&gas_scratch = rsp after the sub. Encoder-gap workarounds: G1 (mov_d for u32 stores), G4 (full-reg compares).",
+      block: {
+        // Null-guards first — before any callee-save spill so early return is cheap.
+        cmp rdi, 0;
+        je  hpet_parse_fail_early;
+        cmp rsi, 0;
+        je  hpet_parse_fail_early;
+
+        push rbx;
+        push r12;
+        push r13;
+        sub rsp, 16;                           // 16-byte gas_info scratch on stack
+
+        mov r12, rdi;                          // r12 = hpet base
+        mov rbx, rsi;                          // rbx = out base
+        mov r13, rsp;                          // r13 = &gas_info scratch
+
+        // ---- Length guard: hpet->length >= HPET_TABLE_MIN_LENGTH (56) ----
+        xor rax, rax;
+        mov eax, [r12 + 4];                    // u32 length, zero-extended
+        cmp rax, 56;                           // HPET_TABLE_MIN_LENGTH
+        jb  hpet_parse_fail;
+
+        // ---- gas_read(hpet + 40, &gas_scratch) → validates + populates ----
+        mov rdi, r12;
+        add rdi, 40;                           // HPET_OFFSET_ADDRESS_GAS
+        mov rsi, r13;
+        call gas_read;
+        cmp rax, 1;
+        jne hpet_parse_fail;
+
+        // ---- counter_base_pa = gas_scratch.address (u64 @ scratch+0) ----
+        mov rax, [r13 + 0];
+        mov [rbx + 0], rax;                    // out+0 = counter_base_pa
+
+        // ---- block_id (u32 @ hpet+36) → u32 @ out+8 ----
+        mov eax, [r12 + 36];                   // 32-bit load zero-extends
+        mov_d [rbx + 8], rax;                  // G1: sized 32-bit store
+
+        // ---- min_tick recombine from two byte loads (avoid misaligned u16) ----
+        xor rax, rax;
+        mov_b rax, [r12 + 54];                 // high byte
+        shl rax, 8;                            // <<8
+        xor rcx, rcx;
+        mov_b rcx, [r12 + 53];                 // low byte
+        or  rax, rcx;                          // rax = (hi<<8) | lo
+        mov_w [rbx + 12], rax;                 // out+12 = min_tick (u16)
+
+        // ---- hpet_number (u8 @ hpet+52) → u8 @ out+14 ----
+        xor rax, rax;
+        mov_b rax, [r12 + 52];
+        mov_b [rbx + 14], rax;
+
+        // ---- _pad (u8 @ out+15) = 0 ----
+        xor rax, rax;
+        mov_b [rbx + 15], rax;
+
+        // ---- _pad2 (u64 @ out+16) = 0 ----
+        xor rax, rax;
+        mov [rbx + 16], rax;
+
+        // ---- _pad3 (u64 @ out+24) = 0 ----
+        xor rax, rax;
+        mov [rbx + 24], rax;
+
+        // Success.
+        mov rax, 1;
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      hpet_parse_fail:
+        xor rax, rax;
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      hpet_parse_fail_early:
+        // Reached before any push — nothing to unwind.
+        xor rax, rax;
+        ret
+      }
+    }
+}

@@ -1,0 +1,311 @@
+// src/kernel/acpi/mcfg.pdx — R20-M3-001 (#814)
+//
+// MCFG parser — extracts the per-PCIe-segment ECAM (Enhanced
+// Configuration Access Mechanism) base addresses that a future R22
+// PCIe accessor uses to compute a config-space MMIO VA from a
+// (segment, bus, device, function, register) tuple:
+//
+//   ecam_pa(seg, bus, dev, fn, reg) =
+//     segment_base_pa[seg]
+//     + ((bus - start_bus) << 20)
+//     + (dev << 15)
+//     + (fn  << 12)
+//     + reg
+//
+// R20.M3 only extracts the (base_pa, segment, start_bus, end_bus)
+// tuple per segment — the accessor computation is R22's problem.
+//
+// -----------------------------------------------------------------------------
+// MCFG on-wire layout (PCI Firmware Specification 3.3 §4.1.2)
+// -----------------------------------------------------------------------------
+//
+//   +0..35    sdt_hdr             — signature "MCFG" (SIG_MCFG=0x4746434D LE)
+//   +36..43   reserved (u64)      — spec-mandated 0, ignored by parser
+//   +44..     Configuration Space Allocation entries — N × 16 bytes:
+//
+//     +0  u64 base_address         — ECAM base for this PCIe segment
+//     +8  u16 segment_group        — segment number (usually 0)
+//     +10 u8  start_bus            — first bus number covered
+//     +11 u8  end_bus              — last bus number covered (inclusive)
+//     +12 u32 reserved             — spec-mandated 0
+//
+// Entry count is derived: N = (table.length - 44) / 16. Firmware never
+// publishes 0 entries — but we defensively cap at max regardless.
+//
+// -----------------------------------------------------------------------------
+// ecam_segment struct (24 B, @align(8)) — R20.M3 caller-consumed record
+// -----------------------------------------------------------------------------
+//
+//   +0  u64 base_pa       — verbatim from MCFG entry+0
+//   +8  u16 segment       — verbatim from MCFG entry+8
+//   +10 u8  start_bus     — verbatim from MCFG entry+10
+//   +11 u8  end_bus       — verbatim from MCFG entry+11
+//   +12 u32 _pad          — zero (reserved)
+//   +16 u64 _pad2         — zero (reserved for R22 refcount / ioremap slot)
+//
+// -----------------------------------------------------------------------------
+// Storage model
+// -----------------------------------------------------------------------------
+//
+// The parser takes a caller-provided output array. This module also
+// hosts a canonical static `_mcfg_segments[16]` + `_mcfg_count` slot
+// that the phase1_acpi_gather orchestrator (#818, phase1_info.pdx)
+// populates once at boot. `mcfg_ecam_base_for_segment(seg)` looks up
+// against this canonical slot — R22's PCIe accessor calls it during
+// bus enumeration.
+//
+// 16 segments is 8x the "single segment" that 99% of hardware
+// publishes, and covers every multi-domain workstation/server board
+// we know of (2-socket EPYC = 2 segments, Ampere Altra Max = 2).
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.20.1+)
+// -----------------------------------------------------------------------------
+//
+//   G1: mov [mem], reg32 widens → mov_d for the u32 _pad zero-init.
+//   G3: add [mem], reg not encoded → no counter bumps in this module.
+//   G4: cmp al, imm may miscompile → full-register compares throughout.
+//
+// -----------------------------------------------------------------------------
+// Register plan (mcfg_parse_segments, 5-push callee-save)
+// -----------------------------------------------------------------------------
+//
+//   Prologue: push rbx, r12, r13, r14, r15 (40 B → rsp%16==0 at loop).
+//   rbx = out array base (arg1)
+//   r12 = mcfg base (arg0)
+//   r13 = end of entry array (= mcfg + mcfg->length)
+//   r14 = cursor (advances by 16 per entry)
+//   r15 = matching-count accumulator (return value)
+//   r8  = max cap (arg2)
+
+module Mcfg = structure {
+
+  // ============================================================================
+  // Layout constants
+  // ============================================================================
+
+  pub let MCFG_OFFSET_RESERVED     : u64 = 36     // u64 reserved
+  pub let MCFG_OFFSET_ENTRIES      : u64 = 44     // first Configuration Space Allocation
+  pub let MCFG_ENTRY_SIZE          : u64 = 16     // one on-wire entry
+
+  pub let MCFG_ENTRY_OFFSET_BASE      : u64 = 0   // u64
+  pub let MCFG_ENTRY_OFFSET_SEGMENT   : u64 = 8   // u16
+  pub let MCFG_ENTRY_OFFSET_START_BUS : u64 = 10  // u8
+  pub let MCFG_ENTRY_OFFSET_END_BUS   : u64 = 11  // u8
+  pub let MCFG_ENTRY_OFFSET_RESERVED  : u64 = 12  // u32
+
+  pub let ECAM_SEGMENT_SIZE        : u64 = 24     // decoded output record
+
+  pub let MCFG_MAX_SEGMENTS        : u64 = 16     // static _mcfg_segments cap
+
+  // ============================================================================
+  // Canonical static slot — populated by phase1_acpi_gather (#818)
+  // ============================================================================
+  //
+  //   _mcfg_segments : 16 × 24 B = 384 B = 48 × u64
+  //   _mcfg_count    : entries populated by the last mcfg_parse_segments call
+  //
+  // These are the .bss-backed slots that mcfg_ecam_base_for_segment
+  // scans. Their default (zero) state is a valid "no MCFG discovered"
+  // signal — _mcfg_count = 0 means the lookup helper returns 0 for
+  // every segment.
+
+  pub let mut _mcfg_segments : [u64; 48] = uninit @align(8)
+  pub let mut _mcfg_count    : u64       = 0
+
+  // ============================================================================
+  // mcfg_parse_segments — extract Configuration Space Allocation entries
+  // ============================================================================
+  //
+  // SysV: (mcfg: u64, out_arr: u64, max: u64) -> u64
+  //
+  //   rdi = MCFG base (a valid *sdt_hdr with signature "MCFG"; caller
+  //         MUST have checksum-validated it via acpi_checksum_ok).
+  //   rsi = out array (caller-allocated [ecam_segment; max], 24-byte records).
+  //   rdx = max — capacity ceiling; entries past this cap are dropped
+  //         silently (no drop counter — MCFG segments are rare enough
+  //         that a cap hit means either a spec-violating fake or a
+  //         caller under-provisioned its buffer, both worth an
+  //         out-of-band assertion but not a runtime counter).
+  //
+  // Returns rax = number of entries written to out_arr.
+  //
+  // Iteration: N = (mcfg->length - 44) / 16, but we drive the loop off
+  // the raw cursor (`while cursor+16 <= end`) instead of computing N —
+  // matches the walk shape of madt_parse_* and defends against a
+  // truncated table whose length claims more entries than the memory
+  // region actually holds.
+
+  pub let mcfg_parse_segments : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (mcfg: u64, out_arr: u64, max: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R20-M3-001 (#814). MCFG Configuration Space Allocation extractor. Walks the fixed-stride 16-byte entry array at mcfg+MCFG_OFFSET_ENTRIES (44) up to mcfg+mcfg->length. Per iteration: (a) bounds-guard 16 bytes for a full entry (`mov rax, r14; add rax, 16; cmp rax, r13; ja done`); (b) if count < max, extract base_pa (u64 @ +0 verbatim), segment (u16 @ +8 zero-extended via xor+mov_w), start_bus (u8 @ +10) and end_bus (u8 @ +11) via xor+mov_b, and write into the 24-byte out record (base_pa u64 @ +0, segment u16 @ +8 via mov_w, start_bus u8 @ +10 via mov_b, end_bus u8 @ +11 via mov_b, _pad u32 @ +12 zero via mov_d G1, _pad2 u64 @ +16 zero via plain mov). If count >= max: silently skip (no drop counter — MCFG cap overflow is a spec-violating or misconfigured case, not a diagnostic-worth path). Advance cursor by 16 unconditionally. u64 base_pa read at entry+0 hits an alignment that depends on the parent table's alignment — MCFG starts at some firmware-chosen address that is typically 8-aligned but the +44 entry-array start pushes entry[0] to a 4-aligned address (44 mod 8 = 4). x86-64 tolerates unaligned qword reads per SDM Vol.3 §7.1.1 (perf penalty, no fault); same posture as xsdt.pdx L109. All u32 stores use mov_d (G1). Full-register compares (G4). Leaf function — no nested call; 5-push callee-save prologue matches madt_parse_lapics for review-symmetry even though no nested call needs the alignment.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Save args ----
+        mov r12, rdi;                          // r12 = mcfg base
+        mov rbx, rsi;                          // rbx = out base
+        mov r8,  rdx;                          // r8  = max
+
+        // ---- end = mcfg + mcfg->length (u32 @ +4, zero-extended) ----
+        xor rax, rax;
+        mov eax, [r12 + 4];
+        mov r13, r12;
+        add r13, rax;
+
+        // ---- cursor = mcfg + 44 ----
+        mov r14, r12;
+        add r14, 44;
+
+        // ---- count = 0 ----
+        xor r15, r15;
+
+      mcfg_seg_loop:
+        // Need 16 more bytes for a full entry.
+        mov rax, r14;
+        add rax, 16;
+        cmp rax, r13;
+        ja  mcfg_seg_done;
+
+        // Capacity check — silently drop past max.
+        cmp r15, r8;
+        jae mcfg_seg_advance;
+
+        // out_slot = out + count * 24 (= count*8 + count*16)
+        mov rax, r15;
+        shl rax, 3;                            // count * 8
+        mov r10, rax;                          // stash
+        mov rax, r15;
+        shl rax, 4;                            // count * 16
+        add rax, r10;                          // rax = count * 24
+        mov r9,  rbx;
+        add r9,  rax;
+
+        // base_pa (u64 @ entry+0) → u64 @ out+0
+        // Unaligned qword read spec-legal per SDM Vol.3 §7.1.1.
+        mov rax, [r14 + 0];
+        mov [r9 + 0], rax;
+
+        // segment (u16 @ entry+8) → u16 @ out+8
+        xor rax, rax;
+        mov_w rax, [r14 + 8];
+        mov_w [r9 + 8], rax;
+
+        // start_bus (u8 @ entry+10) → u8 @ out+10
+        xor rax, rax;
+        mov_b rax, [r14 + 10];
+        mov_b [r9 + 10], rax;
+
+        // end_bus (u8 @ entry+11) → u8 @ out+11
+        xor rax, rax;
+        mov_b rax, [r14 + 11];
+        mov_b [r9 + 11], rax;
+
+        // _pad (u32 @ out+12) = 0 — G1 sized store
+        xor rax, rax;
+        mov_d [r9 + 12], rax;
+
+        // _pad2 (u64 @ out+16) = 0
+        xor rax, rax;
+        mov [r9 + 16], rax;
+
+        add r15, 1;
+
+      mcfg_seg_advance:
+        add r14, 16;
+        jmp mcfg_seg_loop;
+
+      mcfg_seg_done:
+        mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // mcfg_ecam_base_for_segment — lookup helper over the static _mcfg_segments
+  // ============================================================================
+  //
+  // SysV: (seg: u64) -> u64
+  //
+  //   rdi = PCIe segment number (u16 semantically; we take u64 to match
+  //         the paideia-as calling convention and mask to 16 bits at
+  //         the compare site).
+  //
+  // Returns rax = base_pa for that segment's ECAM window, or 0 if no
+  // MCFG entry has that segment number (or _mcfg_count is 0 meaning
+  // MCFG was never discovered / parsed).
+  //
+  // Linear scan over _mcfg_count entries — MCFG segments are O(1..4)
+  // on real hardware, so O(N) is optimal (fewer branches than a
+  // dispatch table, and _mcfg_count == 0 short-circuits immediately).
+  //
+  // Register plan (@no_frame, leaf, no callee-save):
+  //   rdi = seg (arg, masked to 16 bits)
+  //   rcx = _mcfg_count (loaded once)
+  //   r8  = per-iteration index
+  //   r9  = per-iteration record VA (_mcfg_segments + r8 * 24)
+  //   rax = per-iteration segment field / return value
+
+  pub let mcfg_ecam_base_for_segment : (u64) -> u64 !{mem} @{} =
+    fn (seg: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R20-M3-001 (#814). Segment→ECAM-base lookup helper. Reads _mcfg_count (u64 @ .bss) once at entry — if zero, immediately return 0 (fast path for the common no-MCFG-parsed-yet case). Otherwise linear-scan _mcfg_segments[0.._mcfg_count) matching each record's segment (u16 @ +8, zero-extended via xor+mov_w) against the caller's seg argument (masked to 16 bits via `mov r10, rdi; and r10, 0xFFFF`). First match: return the record's base_pa (u64 @ +0). Fall-off: return 0. Record-address computation uses the same 24 = 8+16 shift trick as mcfg_parse_segments and madt_parse_ioapics. All compares on full 64-bit registers (G4). Leaf function; @no_frame sound.",
+      block: {
+        // Load _mcfg_count.
+        mov rcx, [rip + _mcfg_count];
+        cmp rcx, 0;
+        je  mcfg_lookup_notfound;
+
+        // Mask seg to 16 bits (defensive against dirty high bits from caller).
+        mov r10, rdi;
+        and r10, 0xFFFF;
+
+        xor r8, r8;                            // index = 0
+
+      mcfg_lookup_loop:
+        cmp r8, rcx;
+        jae mcfg_lookup_notfound;
+
+        // record VA = _mcfg_segments + r8 * 24
+        mov rax, r8;
+        shl rax, 3;                            // r8 * 8
+        mov r11, rax;
+        mov rax, r8;
+        shl rax, 4;                            // r8 * 16
+        add rax, r11;                          // rax = r8 * 24
+        lea r9, [rip + _mcfg_segments];
+        add r9, rax;
+
+        // Load segment (u16 @ record+8) into rax, zero-extended.
+        xor rax, rax;
+        mov_w rax, [r9 + 8];
+
+        cmp rax, r10;
+        je  mcfg_lookup_hit;
+
+        add r8, 1;
+        jmp mcfg_lookup_loop;
+
+      mcfg_lookup_hit:
+        // Return base_pa (u64 @ record+0).
+        mov rax, [r9 + 0];
+        ret;
+
+      mcfg_lookup_notfound:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+}
