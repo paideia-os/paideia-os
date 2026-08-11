@@ -1,0 +1,923 @@
+// src/kernel/core/net/ipv4.pdx — R27-M5-001..004 (#989 / #990 / #991 / #992)
+//
+// IPv4 header (20 B min), checksum, RX dispatch, TX path.
+//
+// -----------------------------------------------------------------------------
+// Wire layout (20 bytes minimum; options ignored at M5)
+// -----------------------------------------------------------------------------
+//
+//   +0    u8    version_ihl        high nibble = 4 (version)
+//                                  low  nibble = 5 (IHL, no options)
+//   +1    u8    tos                type-of-service / DSCP+ECN
+//   +2    u16   total_length       BE; header + payload bytes
+//   +4    u16   identification     BE; per-packet auto-increment
+//   +6    u16   flags_fragoff      BE; high 3 bits flags (DF), low 13 fragoff
+//   +8    u8    ttl                default 64
+//   +9    u8    protocol           1=ICMP, 6=TCP, 17=UDP
+//   +10   u16   header_checksum    BE; ones-complement sum
+//   +12   u8[4] src_ip
+//   +16   u8[4] dst_ip
+//
+// -----------------------------------------------------------------------------
+// Local address discipline
+// -----------------------------------------------------------------------------
+//
+// _ipv4_my_ip   = 10.0.0.2 (mirrors the R27.M4 ARP local; DHCP lands R29+).
+// _ipv4_gw_ip   = 10.0.0.1 (hardcoded gateway for off-subnet dst).
+// Subnet mask   = /24 (same-subnet test compares bytes 0..2 to my_ip 0..2).
+// _ipv4_bcast   = 255.255.255.255 (limited broadcast — accepted on RX).
+//
+// -----------------------------------------------------------------------------
+// Checksum discipline
+// -----------------------------------------------------------------------------
+//
+// ipv4_checksum sums u16 words interpreted as (byte[n]<<8 | byte[n+1]) —
+// the natural big-endian reading — accumulates into a u32, folds high
+// bits into low bits until the sum fits in 16 bits, and returns the
+// ones-complement (~sum & 0xFFFF) in the low 16 bits of rax. The
+// returned value is HOST-ORDER; the build path stores it as BE via two
+// mov_b writes (byte[10] = hi, byte[11] = lo), and the RX validator
+// exploits the identity that sum-all-including-received-cksum inverts
+// to zero for a valid header (so the caller compares recomputed to 0
+// instead of extracting the received checksum).
+//
+// -----------------------------------------------------------------------------
+// Protocol dispatch
+// -----------------------------------------------------------------------------
+//
+//   protocol = 1   (ICMP) -> icmp_rx_stub  (fingerprint only; R27.M6 #995)
+//   protocol = 17  (UDP)  -> udp_rx_stub   (fingerprint only; R27.M6 #993/#996)
+//   protocol = 6   (TCP)  -> deferred R30+
+//   otherwise             -> drop, bump _ipv4_rx_unknown_proto
+//
+// -----------------------------------------------------------------------------
+// TX path shape
+// -----------------------------------------------------------------------------
+//
+// ipv4_tx_send(bar0, tx_ring_pa, protocol, dst_ip, payload_pa, payload_len)
+//   (1) Determine next hop: same-/24 -> dst_ip; else -> _ipv4_gw_ip.
+//   (2) Pack next_hop bytes into canonical u32 host-word for cache lookup.
+//   (3) arp_cache_lookup(u32, &_ipv4_tx_mac). Miss -> arp_send_request
+//       (bar0, tx_ring_pa, next_hop_ptr); return IPV4_E_ARP_PENDING (3).
+//   (4) Bump _ipv4_tx_ident (u16 wraparound intended).
+//   (5) ipv4_build(&_ipv4_tx_scratch, protocol, &_ipv4_my_ip, dst_ip,
+//                  payload_len, ident).
+//   (6) rep_movsb payload_pa[0..payload_len] to _ipv4_tx_scratch+20.
+//   (7) l2_tx_send(bar0, tx_ring_pa, &_ipv4_tx_mac, 0x0800,
+//                  &_ipv4_tx_scratch, 20 + payload_len). Return its rc.
+//
+// -----------------------------------------------------------------------------
+// R27.M5 posture: dormant at boot
+// -----------------------------------------------------------------------------
+//
+// ipv4_rx_handle is called from l2_rx_handle (l2_rx.pdx) when the L2
+// dispatch table matches ethertype 0x0800. That path is dormant at
+// M5 pending the R23+ IDT-vector wiring — the IPv4 engine is a
+// callable symbol only.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: byte / word stores route via mov_b / mov_w.
+//   G6: [reg+imm] addressing only.
+//
+// Reserved-label discipline: labels prefixed `ipvp_` (parse),
+// `ipvc_` (checksum), `ipvb_` (build), `ipvrh_` (rx_handle),
+// `ipvts_` (tx_send).
+
+module Ipv4 = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  pub let IPV4_HDR_LEN              : u64 = 20
+  pub let IPV4_VERSION_IHL_DEFAULT  : u64 = 0x45
+  pub let IPV4_TTL_DEFAULT          : u64 = 64
+  pub let IPV4_DF_HI                : u64 = 0x40      // high byte of flags/frag_off with DF set + frag_off=0
+  pub let IPV4_PROTO_ICMP           : u64 = 1
+  pub let IPV4_PROTO_TCP            : u64 = 6
+  pub let IPV4_PROTO_UDP            : u64 = 17
+  pub let IPV4_ETHERTYPE            : u64 = 0x0800
+  pub let IPV4_E_ARP_PENDING        : u64 = 3
+
+  // Return codes for ipv4_rx_handle:
+  //   0 = accepted-and-dispatched
+  //   1 = malformed (bad length, bad version/IHL)
+  //   2 = bad checksum
+  //   3 = not-for-us (dst_ip drop)
+  pub let IPV4_RX_OK                : u64 = 0
+  pub let IPV4_RX_ERR_MALFORMED     : u64 = 1
+  pub let IPV4_RX_ERR_BAD_CKSUM     : u64 = 2
+  pub let IPV4_RX_DROP_NOT_FOR_US   : u64 = 3
+
+  // ============================================================================
+  // Rodata: local IPv4, gateway IPv4, limited broadcast IPv4
+  // ============================================================================
+
+  pub let _ipv4_my_ip    : [u8; 4] = [ 10u8,   0u8,   0u8,   2u8 ]
+  pub let _ipv4_gw_ip    : [u8; 4] = [ 10u8,   0u8,   0u8,   1u8 ]
+  pub let _ipv4_bcast_ip : [u8; 4] = [ 0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8 ]
+
+  // ============================================================================
+  // Canonical .bss slots
+  // ============================================================================
+  //
+  //   _ipv4_rx_scratch     : 20-byte parse buffer (32 B for u64 stride)
+  //   _ipv4_tx_scratch     : 2048-byte TX build buffer (IPv4 hdr + payload)
+  //   _ipv4_tx_mac         : 6-byte resolved next-hop MAC (8 B for u64 stride)
+  //   _ipv4_tx_ident       : per-packet identification counter (u16 wraparound)
+  //
+  //   Counters (all u64 wraparound):
+  //   _ipv4_rx_pkts            accepted-and-dispatched
+  //   _ipv4_rx_bad_hdr         short / bad version / bad IHL
+  //   _ipv4_rx_bad_cksum       header-checksum failures
+  //   _ipv4_rx_not_for_us      dst_ip not local nor limited-broadcast
+  //   _ipv4_rx_unknown_proto   protocol byte outside {1,17}
+  //   _ipv4_tx_pkts            l2_tx_send success count
+  //   _ipv4_tx_arp_pending     ARP-miss returns
+
+  pub let mut _ipv4_rx_scratch      : [u8;   32] = uninit @align(8)
+  pub let mut _ipv4_tx_scratch      : [u8; 2048] = uninit @align(8)
+  pub let mut _ipv4_tx_mac          : [u8;    8] = uninit @align(8)
+  pub let mut _ipv4_tx_ident        : u64        = 0
+  pub let mut _ipv4_rx_pkts         : u64        = 0
+  pub let mut _ipv4_rx_bad_hdr      : u64        = 0
+  pub let mut _ipv4_rx_bad_cksum    : u64        = 0
+  pub let mut _ipv4_rx_not_for_us   : u64        = 0
+  pub let mut _ipv4_rx_unknown_proto: u64        = 0
+  pub let mut _ipv4_tx_pkts         : u64        = 0
+  pub let mut _ipv4_tx_arp_pending  : u64        = 0
+
+  // ============================================================================
+  // ipv4_parse(pkt_pa, out) -> u64  — #989
+  // ============================================================================
+  //
+  // SysV: (pkt_pa: u64, out: u64) -> u64
+  //   rdi = physical address of the IPv4 header (frame_pa + 14 for
+  //         frames arriving through l2_rx_handle; identity-mapped
+  //         under KERNEL_VMA_BASE)
+  //   rsi = pointer to a 20-byte destination buffer (typically the
+  //         module-static _ipv4_rx_scratch)
+  //
+  // Copies the first 20 bytes of the header into out and returns 1 iff
+  // version == 4 AND IHL == 5. Returns 0 on any mismatch (unsupported
+  // IPv6-in-flight case, or an options-bearing header — MVP drops
+  // options-bearing packets rather than skipping them).
+  //
+  // Register plan: 1 push (rbx = out) — leaf beyond rep_movsb.
+
+  pub let ipv4_parse : (u64, u64) -> u64 !{mem} @{} =
+    fn (pkt_pa: u64, out: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R27-M5-001 (#989). Copy 20 IPv4-header bytes and validate version==4, IHL==5. Body: (1) 1-push callee-save (rbx=out) — 8 B; entry rsp%16==8 -> 16, %16==0 (leaf beyond rep_movsb; no nested call, no extra pad). (2) rep_movsb 20 bytes: swap entry-form (rdi=pkt_pa, rsi=out) into string-form (rdi=dest, rsi=src) via `mov rax,rdi; mov rdi,rsi; mov rsi,rax; mov rcx,20; cld; rep_movsb`. rbx (callee-save) survives. (3) Load byte @+0 into rax. Extract version = (byte >> 4) & 0xF via `mov rcx,rax; shr rcx,4; and rcx,0xF`; if != 4 -> ipvp_bad. Extract IHL = byte & 0xF via `and rax,0xF`; if != 5 -> ipvp_bad (options ignored — the R27.M5 MVP drops options-bearing packets rather than skipping them). (4) rax = 1 on success, 0 on failure. Reserved labels: `ipvp_`.",
+      block: {
+        push rbx;
+
+        mov rbx, rsi;                            // rbx = out
+
+        // rep_movsb: swap entry-form to (rdi=dest, rsi=src).
+        mov rax, rdi;
+        mov rdi, rsi;
+        mov rsi, rax;
+        mov rcx, 20;
+        cld;
+        rep_movsb;
+
+        // Validate version + IHL from byte @+0.
+        xor rax, rax;
+        mov_b rax, [rbx + 0];
+        mov rcx, rax;
+        shr rcx, 4;
+        and rcx, 0xF;
+        cmp rcx, 4;
+        jne ipvp_bad;
+        and rax, 0xF;
+        cmp rax, 5;
+        jne ipvp_bad;
+
+        mov rax, 1;
+        jmp ipvp_ret;
+
+      ipvp_bad:
+        xor rax, rax;
+
+      ipvp_ret:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // ipv4_checksum(hdr_pa, len) -> u64  — #990
+  // ============================================================================
+  //
+  // SysV: (hdr_pa: u64, len: u64) -> u64
+  //   rdi = physical address of the byte range to checksum
+  //   rsi = length in bytes (20 for the R27.M5 fixed-IHL=5 header)
+  //
+  // Sums consecutive u16 words interpreted big-endian into a u32
+  // accumulator, folds carries into the low 16 bits, and returns
+  // ~sum & 0xFFFF in the low 16 bits of rax. Upper bits are zero.
+  //
+  // The returned value is HOST-ORDER. The build path stores it as BE
+  // via two mov_b writes (byte[10] = hi, byte[11] = lo). The RX
+  // validator uses the identity that summing ALL bytes INCLUDING the
+  // received cksum yields ~0 (0xFFFF pre-invert), so the ones-
+  // complement (this function's return value) equals 0 iff the
+  // header is intact — the receiver compares recomputed to 0 rather
+  // than extracting the on-wire cksum.
+  //
+  // Register plan: 3 pushes (rbx = hdr_pa, rbp = len, r12 = sum
+  // accumulator). Leaf; no nested call, no extra pad needed. 3 pushes
+  // = 24 B; entry rsp%16==8 -> 32, %16==0.
+
+  pub let ipv4_checksum : (u64, u64) -> u64 !{mem} @{} =
+    fn (hdr_pa: u64, len: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R27-M5-002 (#990). Ones-complement 16-bit sum with big-endian word reading + fold + invert. Body: (1) 3-push callee-save (rbx=hdr_pa, rbp=len, r12=u32 sum accumulator) — 24 B; entry rsp%16==8 -> 32, %16==0 (leaf; no nested call). (2) Loop ipvc_pair: while (len - offset) >= 2, load 2 bytes at [rbx+off] as BE u16 = (byte0<<8) | byte1 via `xor rax,rax; mov_b rax,[rdx+0]; shl rax,8; xor r10,r10; mov_b r10,[rdx+1]; or rax,r10`; add rax to r12; offset += 2. (3) Tail ipvc_tail: if 1 byte remains (odd length), load as u16 = byte0<<8 (pad-with-zero low byte); add to r12. (4) Fold ipvc_fold: while (r12 >> 16) != 0: r12 = (r12 & 0xFFFF) + (r12 >> 16). (5) After fold r12 <= 0xFFFF, so ones-complement of the low 16 bits is `xor rax, 0xFFFF` — paideia-as v0.22 has no `not` mnemonic, but for values already masked to 16 bits `xor rax, 0xFFFF` yields the identical bitwise complement with the upper 48 bits guaranteed zero. Reserved labels: `ipvc_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+
+        mov rbx, rdi;                            // hdr_pa
+        mov rbp, rsi;                            // len
+        xor r12, r12;                            // sum
+        xor rcx, rcx;                            // offset
+
+      ipvc_pair:
+        mov rax, rbp;
+        sub rax, rcx;
+        cmp rax, 2;
+        jb ipvc_tail;
+
+        // Load BE u16 = (byte[off] << 8) | byte[off+1].
+        mov rdx, rbx;
+        add rdx, rcx;
+        xor rax, rax;
+        mov_b rax, [rdx + 0];
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [rdx + 1];
+        or rax, r10;
+
+        add r12, rax;
+        add rcx, 2;
+        jmp ipvc_pair;
+
+      ipvc_tail:
+        mov rax, rbp;
+        sub rax, rcx;
+        cmp rax, 0;
+        je ipvc_fold;
+
+        // One byte left: pad with zero low byte.
+        mov rdx, rbx;
+        add rdx, rcx;
+        xor rax, rax;
+        mov_b rax, [rdx + 0];
+        shl rax, 8;
+        add r12, rax;
+
+      ipvc_fold:
+        mov rax, r12;
+        shr rax, 16;
+        cmp rax, 0;
+        je ipvc_done;
+        mov rcx, r12;
+        and rcx, 0xFFFF;
+        add rcx, rax;
+        mov r12, rcx;
+        jmp ipvc_fold;
+
+      ipvc_done:
+        // After the fold loop r12 <= 0xFFFF, so `xor rax, 0xFFFF` is
+        // the bitwise complement of the low 16 bits with the upper
+        // bits guaranteed zero — equivalent to `~r12 & 0xFFFF` without
+        // needing a `not` mnemonic (paideia-as v0.22 lacks it).
+        mov rax, r12;
+        xor rax, 0xFFFF;
+
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // ipv4_build(out_pa, protocol, src_ip, dst_ip, payload_len, ident) -> u64
+  // ============================================================================
+  //
+  // SysV: (out_pa: u64, protocol: u64, src_ip: u64, dst_ip: u64,
+  //        payload_len: u64, ident: u64) -> u64
+  //   rdi = out_pa       — destination header buffer (>= 20 bytes)
+  //   rsi = protocol     — u8 (low byte meaningful; 1=ICMP, 17=UDP)
+  //   rdx = src_ip       — pointer to 4-byte source IPv4
+  //   rcx = dst_ip       — pointer to 4-byte destination IPv4
+  //   r8  = payload_len  — u16 host-order (bytes of L4 payload)
+  //   r9  = ident        — u16 host-order (identification field)
+  //
+  // Writes 20 bytes: version_ihl=0x45, tos=0, total_length=20+payload_len,
+  // ident, flags/frag_off=0x4000 (DF+no-frag), ttl=64, protocol,
+  // checksum=0 placeholder, src_ip, dst_ip. Then computes the header
+  // checksum over the freshly-written 20 bytes and stores it at
+  // bytes 10..11 in BE order.
+  //
+  // Returns rax = 20 (IPV4_HDR_LEN) — the header length only. Callers
+  // compute total_length themselves (20 + payload_len).
+  //
+  // Register plan: 6-push callee-save + 8-byte pad (aligned for the
+  // nested ipv4_checksum call).
+
+  pub let ipv4_build : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (out_pa: u64, protocol: u64, src_ip: u64, dst_ip: u64,
+        payload_len: u64, ident: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R27-M5-001 (#989). Build a 20-byte IPv4 header + compute header checksum. Body: (1) 6-push callee-save (rbx=out_pa, rbp=protocol, r12=src_ip, r13=dst_ip, r14=payload_len, r15=ident) + `sub rsp,8` — 48 + 8 = 56; entry rsp%16==8 -> 64, %16==0 (aligned for the nested ipv4_checksum call). (2) mov_b @+0 = 0x45 (V=4, IHL=5); mov_b @+1 = 0 (tos). (3) total_length (u16 BE @+2..+3) = 20 + payload_len: byte[2] = (tl>>8)&0xFF, byte[3] = tl&0xFF. (4) identification (u16 BE @+4..+5) from r15: byte[4] = (ident>>8)&0xFF, byte[5] = ident&0xFF. (5) flags_fragoff (u16 BE @+6..+7) = 0x4000 (DF bit set, frag_off=0): byte[6] = 0x40, byte[7] = 0. (6) mov_b @+8 = 64 (TTL). (7) mov_b @+9 = protocol (low byte of rbp). (8) Zero checksum placeholder: mov_b @+10 = 0, mov_b @+11 = 0. (9) rep_movsb 4 bytes src_ip -> @+12..+15. (10) rep_movsb 4 bytes dst_ip -> @+16..+19. (11) ipv4_checksum(out_pa, 20). Store host-order sum as BE at @+10..+11: byte[10] = (rax>>8)&0xFF, byte[11] = rax&0xFF. (12) rax = 20. rep_movsb clobbers rdi/rsi/rcx (caller-save); callee-save state survives. ipv4_checksum only clobbers caller-save; callee-save survives. Reserved labels: `ipvb_` (none currently emitted — no branches).",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // out_pa
+        mov rbp, rsi;                            // protocol
+        mov r12, rdx;                            // src_ip ptr
+        mov r13, rcx;                            // dst_ip ptr
+        mov r14, r8;                             // payload_len
+        mov r15, r9;                             // ident
+
+        // ============================================================
+        // (2) byte @+0 = 0x45; byte @+1 = 0 (tos).
+        // ============================================================
+        mov rax, 0x45;
+        mov_b [rbx + 0], rax;
+        xor rax, rax;
+        mov_b [rbx + 1], rax;
+
+        // ============================================================
+        // (3) total_length (u16 BE @+2..+3) = 20 + payload_len.
+        // ============================================================
+        mov rax, 20;
+        add rax, r14;
+        mov rcx, rax;
+        shr rcx, 8;
+        and rcx, 0xFF;
+        mov_b [rbx + 2], rcx;
+        and rax, 0xFF;
+        mov_b [rbx + 3], rax;
+
+        // ============================================================
+        // (4) identification (u16 BE @+4..+5).
+        // ============================================================
+        mov rax, r15;
+        shr rax, 8;
+        and rax, 0xFF;
+        mov_b [rbx + 4], rax;
+        mov rax, r15;
+        and rax, 0xFF;
+        mov_b [rbx + 5], rax;
+
+        // ============================================================
+        // (5) flags_fragoff (u16 BE @+6..+7) = 0x4000 (DF, no fragment).
+        // ============================================================
+        mov rax, 0x40;
+        mov_b [rbx + 6], rax;
+        xor rax, rax;
+        mov_b [rbx + 7], rax;
+
+        // ============================================================
+        // (6) TTL @+8 = 64.
+        // ============================================================
+        mov rax, 64;
+        mov_b [rbx + 8], rax;
+
+        // ============================================================
+        // (7) protocol @+9.
+        // ============================================================
+        mov rax, rbp;
+        and rax, 0xFF;
+        mov_b [rbx + 9], rax;
+
+        // ============================================================
+        // (8) Zero checksum placeholder @+10..+11.
+        // ============================================================
+        xor rax, rax;
+        mov_b [rbx + 10], rax;
+        mov_b [rbx + 11], rax;
+
+        // ============================================================
+        // (9) src_ip[4] -> @+12..+15.
+        // ============================================================
+        mov rdi, rbx;
+        add rdi, 12;
+        mov rsi, r12;
+        mov rcx, 4;
+        cld;
+        rep_movsb;
+
+        // ============================================================
+        // (10) dst_ip[4] -> @+16..+19.
+        // ============================================================
+        mov rdi, rbx;
+        add rdi, 16;
+        mov rsi, r13;
+        mov rcx, 4;
+        cld;
+        rep_movsb;
+
+        // ============================================================
+        // (11) ipv4_checksum(out_pa, 20) + store BE @+10..+11.
+        // ============================================================
+        mov rdi, rbx;
+        mov rsi, 20;
+        call ipv4_checksum;
+        mov rcx, rax;
+        shr rcx, 8;
+        and rcx, 0xFF;
+        mov_b [rbx + 10], rcx;
+        and rax, 0xFF;
+        mov_b [rbx + 11], rax;
+
+        // ============================================================
+        // (12) rax = 20.
+        // ============================================================
+        mov rax, 20;
+
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // icmp_rx_stub / udp_rx_stub — R27.M6 targets
+  // ============================================================================
+  //
+  // SysV: (payload_pa: u64, payload_len: u64) -> u64
+  //   rdi = physical address of the L4 payload (frame_pa + 14 + 20)
+  //   rsi = payload length (total_length - 20)
+  //
+  // Emit an "L3 RX ICMP" / "L3 RX UDP" fingerprint and return 0. The
+  // real handlers land at R27.M6 (#995 for ICMP echo, #993/#996 for
+  // UDP RX + socket delivery). At M5 the ipv4_rx_handle dispatch path
+  // exercises these stubs to observe the demux decision.
+
+  pub let icmp_rx_stub : (u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (payload_pa: u64, payload_len: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R27-M5-003 (#991). ICMP receive stub. Body: (1) `sub rsp,8` — entry rsp%16==8 -> 16, %16==0 (aligned for the nested klog_s1 call). (2) klog_s1(LEVEL_INFO=3, SUBSYS_NET_, tag_l3_icmp) — fingerprint. (3) xor rax,rax — success. Real handler lands in R27.M6 #995.",
+      block: {
+        sub rsp, 8;
+
+        mov rdi, 3;                              // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + tag_l3_icmp];
+        call klog_s1;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  pub let udp_rx_stub : (u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (payload_pa: u64, payload_len: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R27-M5-003 (#991). UDP receive stub. Body: (1) `sub rsp,8` — align. (2) klog_s1(LEVEL_INFO=3, SUBSYS_NET_, tag_l3_udp) — fingerprint. (3) xor rax,rax — success. Real handler lands in R27.M6 #993/#996.",
+      block: {
+        sub rsp, 8;
+
+        mov rdi, 3;                              // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + tag_l3_udp];
+        call klog_s1;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // ipv4_rx_handle(pkt_pa, pkt_len) -> u64  — #991
+  // ============================================================================
+  //
+  // SysV: (pkt_pa: u64, pkt_len: u64) -> u64
+  //   rdi = physical address of the whole received Ethernet frame
+  //         (l2_rx_handle hands us the frame_pa — we skip the 14-byte
+  //         Ethernet header internally)
+  //   rsi = frame length in bytes
+  //
+  // Behaviour:
+  //   - Emit an "L3 RX IPV4" klog fingerprint.
+  //   - Reject frames shorter than ETH_HDR_LEN + IPV4_HDR_LEN = 34.
+  //   - Parse the IPv4 header into _ipv4_rx_scratch (validates V=4,IHL=5).
+  //   - Verify checksum: sum-all yields ones-complement 0 for a valid header.
+  //   - Reject frames whose dst_ip is neither _ipv4_my_ip nor 255.255.255.255.
+  //   - Demux by protocol byte: 1 -> icmp_rx_stub, 17 -> udp_rx_stub.
+  //
+  // Returns 0 on accepted-and-dispatched, 1 on malformed header,
+  // 2 on bad checksum, 3 on not-for-us drop.
+  //
+  // Register plan (4-push callee-save + 8-byte pad):
+  //   rbx = pkt_pa (survives across nested calls)
+  //   rbp = pkt_len
+  //   r12 = payload_len (total_length - 20)
+  //   r13 = protocol byte
+
+  pub let ipv4_rx_handle : (u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (pkt_pa: u64, pkt_len: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R27-M5-003 (#991). IPv4 receive engine: parse + checksum verify + dst filter + protocol demux. Body: (1) 4-push callee-save (rbx=pkt_pa, rbp=pkt_len, r12=payload_len, r13=protocol) + `sub rsp,8` — 32 + 8 = 40; entry rsp%16==8 -> 48, %16==0 (aligned for klog_s1 + ipv4_parse + ipv4_checksum + icmp/udp stubs). (2) klog_s1(INFO, NET_, tag_l3_ipv4) — L3 dispatch fingerprint (parity with the R27-M4 arp_rx_handle idiom). (3) Length gate: cmp rbp, 34; jb ipvrh_malformed (14 Eth + 20 IP min). (4) ipv4_parse(pkt_pa+14, &_ipv4_rx_scratch). If rax==0 -> ipvrh_malformed. (5) ipv4_checksum(&_ipv4_rx_scratch, 20). If rax != 0 -> ipvrh_bad_cksum (a valid header sums to ones-complement 0). (6) dst_ip filter: byte-compare scratch+16..+19 against _ipv4_my_ip; on match -> ipvrh_dst_ok. Else compare against _ipv4_bcast_ip (255.255.255.255 limited broadcast); on match -> ipvrh_dst_ok. Otherwise -> ipvrh_not_for_us. (7) Extract protocol byte @ scratch+9 -> r13. Extract total_length (u16 BE @+2..+3) via `(byte<<8)|byte`; payload_len = total_length - 20 -> r12. (8) Dispatch: r13==1 -> ipvrh_icmp; r13==17 -> ipvrh_udp; else bump _ipv4_rx_unknown_proto, return 0 (accepted-but-no-handler, matches l2_rx unknown-ethertype discipline). (9) ipvrh_icmp/ipvrh_udp: call the corresponding stub with (pkt_pa+34, payload_len), bump _ipv4_rx_pkts, return 0. (10) Error paths bump counter + return non-zero. Reserved labels: `ipvrh_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // pkt_pa
+        mov rbp, rsi;                            // pkt_len
+
+        // ============================================================
+        // (1) klog fingerprint.
+        // ============================================================
+        mov rdi, 3;                              // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + tag_l3_ipv4];
+        call klog_s1;
+
+        // ============================================================
+        // (2) Length gate: 14 + 20 = 34.
+        // ============================================================
+        cmp rbp, 34;
+        jb ipvrh_malformed;
+
+        // ============================================================
+        // (3) ipv4_parse(pkt_pa+14, &_ipv4_rx_scratch).
+        // ============================================================
+        mov rdi, rbx;
+        add rdi, 14;
+        lea rsi, [rip + _ipv4_rx_scratch];
+        call ipv4_parse;
+        cmp rax, 0;
+        je ipvrh_malformed;
+
+        // ============================================================
+        // (4) Verify checksum: sum-all yields ~0 = 0 for valid headers.
+        // ============================================================
+        lea rdi, [rip + _ipv4_rx_scratch];
+        mov rsi, 20;
+        call ipv4_checksum;
+        cmp rax, 0;
+        jne ipvrh_bad_cksum;
+
+        // ============================================================
+        // (5) dst_ip filter: local (_ipv4_my_ip) OR limited broadcast.
+        // ============================================================
+        lea rdi, [rip + _ipv4_rx_scratch + 16];
+        lea rsi, [rip + _ipv4_my_ip];
+        mov rcx, 4;
+
+      ipvrh_dst_local_cmp:
+        cmp rcx, 0;
+        je ipvrh_dst_ok;
+        xor rax, rax;
+        mov_b rax, [rdi + 0];
+        xor rdx, rdx;
+        mov_b rdx, [rsi + 0];
+        cmp rax, rdx;
+        jne ipvrh_dst_try_bcast;
+        add rdi, 1;
+        add rsi, 1;
+        sub rcx, 1;
+        jmp ipvrh_dst_local_cmp;
+
+      ipvrh_dst_try_bcast:
+        lea rdi, [rip + _ipv4_rx_scratch + 16];
+        lea rsi, [rip + _ipv4_bcast_ip];
+        mov rcx, 4;
+
+      ipvrh_dst_bcast_cmp:
+        cmp rcx, 0;
+        je ipvrh_dst_ok;
+        xor rax, rax;
+        mov_b rax, [rdi + 0];
+        xor rdx, rdx;
+        mov_b rdx, [rsi + 0];
+        cmp rax, rdx;
+        jne ipvrh_not_for_us;
+        add rdi, 1;
+        add rsi, 1;
+        sub rcx, 1;
+        jmp ipvrh_dst_bcast_cmp;
+
+      ipvrh_dst_ok:
+        // ============================================================
+        // (6) Extract protocol byte @ scratch+9 -> r13.
+        // ============================================================
+        xor rax, rax;
+        mov_b rax, [rip + _ipv4_rx_scratch + 9];
+        mov r13, rax;
+
+        // ============================================================
+        // (7) Extract total_length (u16 BE @+2..+3), payload_len = tl-20.
+        // ============================================================
+        xor rax, rax;
+        mov_b rax, [rip + _ipv4_rx_scratch + 2];
+        shl rax, 8;
+        xor rcx, rcx;
+        mov_b rcx, [rip + _ipv4_rx_scratch + 3];
+        or rax, rcx;
+        sub rax, 20;
+        mov r12, rax;                            // payload_len
+
+        // ============================================================
+        // (8) Dispatch.
+        // ============================================================
+        cmp r13, 1;
+        je ipvrh_icmp;
+        cmp r13, 17;
+        je ipvrh_udp;
+
+        // Unknown protocol: bump counter, return 0 (dispatched-with-drop).
+        mov rax, [rip + _ipv4_rx_unknown_proto];
+        add rax, 1;
+        mov [rip + _ipv4_rx_unknown_proto], rax;
+        xor rax, rax;
+        jmp ipvrh_ret;
+
+      ipvrh_icmp:
+        mov rdi, rbx;
+        add rdi, 34;                             // payload_pa = pkt_pa + 14 + 20
+        mov rsi, r12;
+        call icmp_rx_stub;
+        mov rax, [rip + _ipv4_rx_pkts];
+        add rax, 1;
+        mov [rip + _ipv4_rx_pkts], rax;
+        xor rax, rax;
+        jmp ipvrh_ret;
+
+      ipvrh_udp:
+        mov rdi, rbx;
+        add rdi, 34;
+        mov rsi, r12;
+        call udp_rx_stub;
+        mov rax, [rip + _ipv4_rx_pkts];
+        add rax, 1;
+        mov [rip + _ipv4_rx_pkts], rax;
+        xor rax, rax;
+        jmp ipvrh_ret;
+
+      ipvrh_not_for_us:
+        mov rax, [rip + _ipv4_rx_not_for_us];
+        add rax, 1;
+        mov [rip + _ipv4_rx_not_for_us], rax;
+        mov rax, 3;
+        jmp ipvrh_ret;
+
+      ipvrh_bad_cksum:
+        mov rax, [rip + _ipv4_rx_bad_cksum];
+        add rax, 1;
+        mov [rip + _ipv4_rx_bad_cksum], rax;
+        mov rax, 2;
+        jmp ipvrh_ret;
+
+      ipvrh_malformed:
+        mov rax, [rip + _ipv4_rx_bad_hdr];
+        add rax, 1;
+        mov [rip + _ipv4_rx_bad_hdr], rax;
+        mov rax, 1;
+
+      ipvrh_ret:
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // ipv4_tx_send(bar0, tx_ring_pa, protocol, dst_ip, payload_pa,
+  //              payload_len) -> u64  — #992
+  // ============================================================================
+  //
+  // SysV: (bar0: u64, tx_ring_pa: u64, protocol: u64, dst_ip: u64,
+  //        payload_pa: u64, payload_len: u64) -> u64
+  //   rdi = BAR0 base of the transmitting NIC
+  //   rsi = tx_ring_pa (typically &_e1000e_tx_ring)
+  //   rdx = protocol byte (low; 1=ICMP, 17=UDP)
+  //   rcx = pointer to 4-byte destination IPv4
+  //   r8  = payload_pa (source of L4 payload; may be 0 iff payload_len==0)
+  //   r9  = payload_len (bytes; 14 + 20 + payload_len <= 2048)
+  //
+  // Returns rax:
+  //   0 = L2_TX_OK (l2_tx_send succeeded)
+  //   1 = L2_TX_ERR_PAYLOAD_TOO_BIG (from l2_tx_send)
+  //   2 = L2_TX_ERR_RING_FULL       (from l2_tx_send)
+  //   3 = IPV4_E_ARP_PENDING        (ARP miss; caller retries after
+  //                                  the reply lands in the cache)
+  //
+  // Register plan (6-push callee-save + 8-byte pad + [rsp+0] scratch):
+  //   rbx = bar0
+  //   rbp = tx_ring_pa
+  //   r12 = protocol
+  //   r13 = dst_ip ptr
+  //   r14 = payload_pa
+  //   r15 = payload_len
+  //   [rsp+0] = next_hop_ptr (survives arp_cache_lookup for potential
+  //             arp_send_request re-arm)
+  //
+  //   6 pushes = 48 B; entry rsp%16==8 -> 56, sub rsp,8 -> 64, %16==0
+  //   (aligned for arp_cache_lookup / arp_send_request / ipv4_build /
+  //   rep_movsb / l2_tx_send).
+
+  pub let ipv4_tx_send : (u64, u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (bar0: u64, tx_ring_pa: u64, protocol: u64, dst_ip: u64,
+        payload_pa: u64, payload_len: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R27-M5-004 (#992). IPv4 transmit: same-/24-subnet check + ARP resolve + build + payload memcpy + l2_tx_send. Body: (1) 6-push callee-save (rbx=bar0, rbp=tx_ring_pa, r12=protocol, r13=dst_ip ptr, r14=payload_pa, r15=payload_len) + `sub rsp,8` — 48 + 8 = 56; entry rsp%16==8 -> 64, %16==0 (aligned). [rsp+0] holds the chosen next_hop_ptr across arp_cache_lookup so a subsequent arp_send_request can re-arm resolution without recomputing the subnet decision. (2) Same-/24 check: byte-compare dst_ip[0..2] against _ipv4_my_ip[0..2]; on any mismatch -> ipvts_use_gw (next_hop = &_ipv4_gw_ip). Otherwise next_hop = dst_ip. Store next_hop_ptr at [rsp+0]. (3) Pack next_hop 4 bytes into canonical u32 host-word via 4 shl-8/or steps (matches the arp_rx_handle sender_ip assembly idiom). (4) arp_cache_lookup(u32, &_ipv4_tx_mac). rax==0 -> ipvts_arp_miss (bump _ipv4_tx_arp_pending; arp_send_request(bar0, tx_ring_pa, next_hop_ptr); return IPV4_E_ARP_PENDING=3). (5) Bump _ipv4_tx_ident (u16 wraparound). (6) ipv4_build(&_ipv4_tx_scratch, protocol, &_ipv4_my_ip, dst_ip, payload_len, ident). (7) If payload_len != 0: rep_movsb payload_pa -> _ipv4_tx_scratch+20, count=payload_len. (8) l2_tx_send(bar0, tx_ring_pa, &_ipv4_tx_mac, 0x0800, &_ipv4_tx_scratch, 20+payload_len). (9) On rax==0: bump _ipv4_tx_pkts. Return rax. Reserved labels: `ipvts_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // bar0
+        mov rbp, rsi;                            // tx_ring_pa
+        mov r12, rdx;                            // protocol
+        mov r13, rcx;                            // dst_ip ptr
+        mov r14, r8;                             // payload_pa
+        mov r15, r9;                             // payload_len
+
+        // ============================================================
+        // (2) Same-/24 subnet check via dst_ip[0..2] == _ipv4_my_ip[0..2].
+        //     rcx accumulates the chosen next_hop_ptr.
+        // ============================================================
+        xor rax, rax;
+        mov_b rax, [r13 + 0];
+        xor rdx, rdx;
+        mov_b rdx, [rip + _ipv4_my_ip + 0];
+        cmp rax, rdx;
+        jne ipvts_use_gw;
+
+        xor rax, rax;
+        mov_b rax, [r13 + 1];
+        xor rdx, rdx;
+        mov_b rdx, [rip + _ipv4_my_ip + 1];
+        cmp rax, rdx;
+        jne ipvts_use_gw;
+
+        xor rax, rax;
+        mov_b rax, [r13 + 2];
+        xor rdx, rdx;
+        mov_b rdx, [rip + _ipv4_my_ip + 2];
+        cmp rax, rdx;
+        jne ipvts_use_gw;
+
+        // Same subnet: next_hop = dst_ip.
+        mov rcx, r13;
+        jmp ipvts_have_hop;
+
+      ipvts_use_gw:
+        lea rcx, [rip + _ipv4_gw_ip];
+
+      ipvts_have_hop:
+        // Stash next_hop_ptr for potential ARP-request retry.
+        mov [rsp + 0], rcx;
+
+        // ============================================================
+        // (3) Pack next_hop bytes into canonical u32 host-word.
+        // ============================================================
+        xor rax, rax;
+        mov_b rax, [rcx + 0];
+        shl rax, 8;
+        xor rdx, rdx;
+        mov_b rdx, [rcx + 1];
+        or rax, rdx;
+        shl rax, 8;
+        xor rdx, rdx;
+        mov_b rdx, [rcx + 2];
+        or rax, rdx;
+        shl rax, 8;
+        xor rdx, rdx;
+        mov_b rdx, [rcx + 3];
+        or rax, rdx;
+
+        // ============================================================
+        // (4) arp_cache_lookup(next_hop_u32, &_ipv4_tx_mac).
+        // ============================================================
+        mov rdi, rax;
+        lea rsi, [rip + _ipv4_tx_mac];
+        call arp_cache_lookup;
+        cmp rax, 0;
+        je ipvts_arp_miss;
+
+        // ============================================================
+        // (5) Bump _ipv4_tx_ident (u16 wraparound).
+        // ============================================================
+        mov rax, [rip + _ipv4_tx_ident];
+        add rax, 1;
+        and rax, 0xFFFF;
+        mov [rip + _ipv4_tx_ident], rax;
+        mov r9, rax;                             // ident (arg 6 of ipv4_build)
+
+        // ============================================================
+        // (6) ipv4_build(&_ipv4_tx_scratch, protocol, &_ipv4_my_ip,
+        //                dst_ip, payload_len, ident).
+        // ============================================================
+        lea rdi, [rip + _ipv4_tx_scratch];
+        mov rsi, r12;                            // protocol
+        lea rdx, [rip + _ipv4_my_ip];
+        mov rcx, r13;                            // dst_ip ptr
+        mov r8, r15;                             // payload_len
+        // r9 already = ident.
+        call ipv4_build;
+
+        // ============================================================
+        // (7) Copy payload -> _ipv4_tx_scratch+20 if payload_len != 0.
+        // ============================================================
+        cmp r15, 0;
+        je ipvts_no_payload;
+
+        lea rdi, [rip + _ipv4_tx_scratch];
+        add rdi, 20;
+        mov rsi, r14;
+        mov rcx, r15;
+        cld;
+        rep_movsb;
+
+      ipvts_no_payload:
+        // ============================================================
+        // (8) l2_tx_send(bar0, tx_ring_pa, &_ipv4_tx_mac, 0x0800,
+        //                &_ipv4_tx_scratch, 20 + payload_len).
+        // ============================================================
+        mov rdi, rbx;                            // bar0
+        mov rsi, rbp;                            // tx_ring_pa
+        lea rdx, [rip + _ipv4_tx_mac];           // dst_mac
+        mov rcx, 0x0800;                         // ETH_TYPE_IPV4
+        lea r8, [rip + _ipv4_tx_scratch];        // payload_pa (built frame)
+        mov r9, 20;
+        add r9, r15;                             // 20 + payload_len
+        call l2_tx_send;
+
+        // ============================================================
+        // (9) On l2_tx_send success bump _ipv4_tx_pkts. rax carries the
+        //     return code either way.
+        // ============================================================
+        cmp rax, 0;
+        jne ipvts_ret;
+        mov rcx, [rip + _ipv4_tx_pkts];
+        add rcx, 1;
+        mov [rip + _ipv4_tx_pkts], rcx;
+        jmp ipvts_ret;
+
+      ipvts_arp_miss:
+        // arp_send_request(bar0, tx_ring_pa, next_hop_ptr).
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, [rsp + 0];                      // next_hop_ptr
+        call arp_send_request;
+
+        mov rcx, [rip + _ipv4_tx_arp_pending];
+        add rcx, 1;
+        mov [rip + _ipv4_tx_arp_pending], rcx;
+
+        mov rax, 3;                              // IPV4_E_ARP_PENDING
+
+      ipvts_ret:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
