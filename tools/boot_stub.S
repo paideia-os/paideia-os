@@ -1412,6 +1412,22 @@ broker_ok_msg: .ascii "R20b BROKER OK\n\0"
 .align 8
 broker_fail_msg: .ascii "R20b BROKER FAIL\n\0"
 
+
+# R20b.M2-001 (#1555): 8-byte frame header + frame_encode/frame_decode
+# witness fingerprints — opens R20b.M2 (framed variable-length IPC) on
+# top of the M1 substrate. Exercises the packed-u64 header shape from
+# acpi-supervisor-schema §3 (op@+0, ver@+1, flags@+2..3 LE, payload_len
+# @+4..7 LE) via encode → byte-check → packed-decode → field-accessor
+# round-trip, plus the FRAME_MAX_PAYLOAD (4088) boundary + rejection +
+# buf-not-modified property. See src/kernel/core/ipc/frame.pdx.
+.global frame_hdr_ok_msg
+.align 8
+frame_hdr_ok_msg: .ascii "R20b FRAME HDR OK\n\0"
+
+.global frame_hdr_fail_msg
+.align 8
+frame_hdr_fail_msg: .ascii "R20b FRAME HDR FAIL\n\0"
+
 # svc.<name> strings for the R20b.M1-003 (#1554) broker witness.
 # ASCII bytes only; no NUL required (svc_register / svc_lookup are
 # length-explicit), but a trailing NUL keeps the buffer safe for casual

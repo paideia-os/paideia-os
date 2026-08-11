@@ -1,0 +1,310 @@
+// src/kernel/core/ipc/frame.pdx — R20b.M2-001 (#1555)
+// 8-byte IPC message header struct + frame_encode / frame_decode
+// primitives + header field accessors.
+//
+// Design context
+// --------------
+// Opens the R20b.M2 (framed variable-length IPC) branch on top of the
+// M1 substrate (KIND_IPC_ENDPOINT + endpoint_table + payload_arena +
+// svc_broker). Per design/ipc/userspace-server-substrate.md §4.1 and
+// design/ipc/acpi-supervisor-schema.md §3, every IPC request/reply is
+// prefixed by an 8-byte header:
+//
+//   +------+------+-------------+---------------------+
+//   |  op  |  ver | flags (u16) |  payload_len (u32)  |
+//   +------+------+-------------+---------------------+
+//      u8     u8     LE-16            LE-32
+//
+// Field / offset / width / semantics:
+//
+//   Offset  Width  Field         Description
+//   ------  -----  ------------  ------------------------------------------
+//   +0      u8     op            RPC opcode; reply's op is request's op|0x80
+//   +1      u8     ver           Schema version — starts at 1
+//   +2      u16    flags         Reserved; MUST be 0 in v1 (LE)
+//   +4      u32    payload_len   Payload byte count, exclusive of header (LE)
+//
+// Header size: 8 bytes. All multi-byte scalars little-endian, matching
+// x86-64 native byte order and the raw ACPI-table byte order. Because
+// x86-64 stores u64s in native LE, the entire packed header IS byte-
+// identical to a single u64 stored at buf via `mov [buf], rax`. That is
+// the storage strategy: compose the header in a register, single 8-byte
+// store, single 8-byte load on decode.
+//
+// Max payload
+// -----------
+// PAYLOAD_MAX_BYTES = 4088 (= 4096 - 8) is pinned by the payload arena
+// page size (see payload_arena.pdx: each endpoint owns a 4 KiB page,
+// laid out as [hdr:8 | payload:payload_len | pad]). frame_encode rejects
+// payload_len > 4088 with FRAME_ENCODE_ERR_PAYLOAD_LEN (1) — distinct
+// error code per the design doc convention (§5.11 AcpiErrorRep's -E2BIG
+// case). The rejected encode does NOT write to buf: caller can hand the
+// same buffer to a retry without cleanup.
+//
+// Storage strategy — packed u64 header
+// -------------------------------------
+// The endpoint_table row's pending_hdr field (offset +24, per
+// endpoint_table.pdx §row-field offsets) is a u64 by design — the M2
+// send path caches the whole 8-byte header in one register-sized field.
+// frame_encode's packed layout matches that in-memory u64 shape byte-
+// for-byte:
+//
+//   bits  0.. 7   op            (byte 0)
+//   bits  8..15   ver           (byte 1)
+//   bits 16..31   flags         (bytes 2..3, LE)
+//   bits 32..63   payload_len   (bytes 4..7, LE)
+//
+// So `frame_decode(buf)` is literally `mov rax, [buf]` — the natural u64
+// load recovers the packed header. Field accessors (frame_hdr_op /
+// frame_hdr_ver / frame_hdr_flags / frame_hdr_payload_len) unpack the
+// u64 into individual fields via `shr` + `and` masks; they take the
+// packed hdr as a u64 argument, NOT a memory pointer, so callers can
+// decode once (single load) and then extract multiple fields without
+// re-touching memory.
+//
+// This shape also gives the M2 send path a zero-copy identity: the same
+// u64 that frame_encode composes at [buf] is what
+// endpoint.pending_hdr will hold (see design §4.3 step 4:
+// "Write hdr into endpoint.pending_hdr").
+//
+// Reply framing
+// -------------
+// Per design §4.1 and acpi-supervisor-schema §3: a reply's op is the
+// request's op with bit 7 set (`op | 0x80`). frame.pdx exposes
+// FRAME_OP_REPLY_BIT (0x80) as a named constant; encode/decode are
+// symmetric across request and reply (same 8-byte header, same field
+// layout). The bit-7 flip is a caller-side convention, not enforced by
+// frame_encode — sys_ipc_reply (M3-002) will enforce it via an assert
+// on hdr.op & FRAME_OP_REPLY_BIT before dispatching.
+//
+// Concurrency
+// -----------
+// Pure functions on a caller-owned buffer; no shared state. Multiple
+// callers can encode into disjoint buffers concurrently. Multi-CPU
+// discipline for the payload arena itself is upstream (§4.2 single in-
+// flight message per endpoint at R20b).
+
+module Frame = structure {
+
+  // ============================================================================
+  // Header geometry (pinned by acpi-supervisor-schema.md §3 +
+  // userspace-server-substrate.md §4.1).
+  // ============================================================================
+
+  pub let FRAME_HEADER_SIZE      : u64 = 8
+  pub let FRAME_MAX_PAYLOAD      : u64 = 4088       // 4096 - 8
+
+  // ============================================================================
+  // Field-offset constants (bytes, from buf base).
+  // ============================================================================
+
+  pub let FRAME_OFF_OP           : u64 = 0
+  pub let FRAME_OFF_VER          : u64 = 1
+  pub let FRAME_OFF_FLAGS        : u64 = 2
+  pub let FRAME_OFF_PAYLOAD_LEN  : u64 = 4
+
+  // ============================================================================
+  // Reply-op bit convention (acpi-supervisor-schema.md §3 last line: "a reply's
+  // op is the request op with bit 7 set"). Exposed here so downstream sys_ipc_*
+  // helpers can name the bit rather than hard-code 0x80.
+  // ============================================================================
+
+  pub let FRAME_OP_REPLY_BIT     : u64 = 0x80
+
+  // ============================================================================
+  // Result codes for frame_encode. Distinct u64 codes (matches
+  // SVC_REGISTER_ERR_* convention in svc_broker.pdx). Success == 0.
+  // ============================================================================
+
+  pub let FRAME_ENCODE_OK              : u64 = 0
+  pub let FRAME_ENCODE_ERR_PAYLOAD_LEN : u64 = 1    // payload_len > 4088
+
+  // ==========================================================================
+  // frame_encode(buf: u64, op: u64, ver: u64, flags: u64, payload_len: u64)
+  //   -> u64
+  //
+  // SysV ABI: rdi=buf, rsi=op, rdx=ver, rcx=flags, r8=payload_len -> rax=rc.
+  //
+  // Writes the 8-byte header to [buf..buf+8) as a single u64 store when the
+  // payload_len gate is satisfied. Returns FRAME_ENCODE_OK (0) on success or
+  // FRAME_ENCODE_ERR_PAYLOAD_LEN (1) if payload_len > FRAME_MAX_PAYLOAD;
+  // on the error path buf is NOT modified.
+  //
+  // Composition strategy: build the packed u64 in rax and store once.
+  //   rax  = (payload_len & 0xFFFFFFFF) << 32     bits 32..63
+  //   rax |= (flags       & 0xFFFF)     << 16     bits 16..31
+  //   rax |= (ver         & 0xFF)       << 8      bits  8..15
+  //   rax |= (op          & 0xFF)                 bits  0.. 7
+  //   [buf] = rax                                 single 8-byte store
+  //
+  // This exact bit layout matches the acpi-supervisor-schema §3 header
+  // byte-for-byte because x86-64 stores u64 in native LE, so
+  // [buf+0]=op / [buf+1]=ver / [buf+2..3]=flags / [buf+4..7]=payload_len.
+  //
+  // Field-width mask discipline: every field is masked to its declared
+  // width BEFORE shifting, so an oversize caller value cannot leak into
+  // an adjacent field's bit range. This defends against a mis-typed
+  // ver=0x1234 (which would otherwise smear the low byte of ver into
+  // the flags region without the & 0xFF gate).
+  // ==========================================================================
+
+  pub let frame_encode : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (buf: u64, op: u64, ver: u64, flags: u64, payload_len: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R20b.M2-001 (#1555): 8-byte header write per acpi-supervisor-schema.md §3. Gate: payload_len (r8) > 4088 (FRAME_MAX_PAYLOAD) -> return FRAME_ENCODE_ERR_PAYLOAD_LEN (1) via unsigned `ja`; buf is NOT written on the error path. Composition (packed u64 in rax): start rax = payload_len masked to u32 then shifted left 32 (bits 32..63); OR in flags masked to u16 shifted left 16; OR in ver masked to u8 shifted left 8; OR in op masked to u8 at bits 0..7. Each field masked BEFORE shift so an oversize caller value cannot leak into an adjacent field's bits — a mis-typed ver=0x1234 would otherwise smear its high byte into the flags region without the & 0xFF gate. Single 8-byte store `mov [rdi], rax` writes the packed header — x86-64 native LE u64 store produces the exact byte layout §3 pins (op@+0, ver@+1, flags@+2..3 LE, payload_len@+4..7 LE). Return FRAME_ENCODE_OK (0) via `xor rax,rax` after the store. Register plan: rdi=buf (untouched), rsi=op, rdx=ver, rcx=flags, r8=payload_len (all consumed via `mov r9, <arg>` scratch copies so args stay callee-visible for reasoning); r9=field scratch, rax=accumulator + return. Leaf function; no callee-save writes. shl-by-32/16/8 imm forms proven in ipv4.pdx L288 (shr 16), pdxfs_lite/write.pdx L306 (shl 32), endpoint_table.pdx L144 (shl 16). Full-reg cmp for the 4088 gate follows the G4 discipline (see fadt.pdx justification).",
+      block: {
+        // ---- Gate: payload_len <= FRAME_MAX_PAYLOAD (4088) ----
+        cmp r8, 4088;                       // FRAME_MAX_PAYLOAD
+        ja  frame_encode_bad_len;
+
+        // ---- Compose packed u64 in rax ----
+
+        // rax = (payload_len & 0xFFFFFFFF) << 32   -> bits 32..63
+        mov rax, r8;
+        and rax, 0xFFFFFFFF;                // mask to u32
+        shl rax, 32;
+
+        // r9 = (flags & 0xFFFF) << 16              -> bits 16..31
+        mov r9, rcx;
+        and r9, 0xFFFF;                     // mask to u16
+        shl r9, 16;
+        or  rax, r9;
+
+        // r9 = (ver & 0xFF) << 8                   -> bits 8..15
+        mov r9, rdx;
+        and r9, 0xFF;                       // mask to u8
+        shl r9, 8;
+        or  rax, r9;
+
+        // r9 = op & 0xFF                           -> bits 0..7
+        mov r9, rsi;
+        and r9, 0xFF;                       // mask to u8
+        or  rax, r9;
+
+        // ---- Single 8-byte store ----
+        mov [rdi], rax;
+
+        // ---- Return FRAME_ENCODE_OK ----
+        xor rax, rax;
+        ret;
+
+      frame_encode_bad_len:
+        mov rax, 1;                         // FRAME_ENCODE_ERR_PAYLOAD_LEN
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // frame_decode(buf: u64) -> u64
+  //
+  // SysV ABI: rdi=buf -> rax=packed header (u64).
+  //
+  // Single 8-byte load of the header. Because x86-64 native LE u64 load
+  // reconstructs the packed field layout that frame_encode wrote, the
+  // returned u64 has the same bit layout: op@bits 0..7, ver@bits 8..15,
+  // flags@bits 16..31, payload_len@bits 32..63. Callers extract fields
+  // via frame_hdr_op / frame_hdr_ver / frame_hdr_flags /
+  // frame_hdr_payload_len which take the packed u64 (not a buffer
+  // pointer), so a caller can decode once and read multiple fields
+  // without re-touching memory.
+  //
+  // Pure read; no writes; no state.
+  // ==========================================================================
+
+  pub let frame_decode : (u64) -> u64 !{mem} @{} =
+    fn (buf: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R20b.M2-001 (#1555): single 8-byte load of the header at [buf]. Native x86-64 LE u64 load reconstructs the byte layout frame_encode wrote — op at bits 0..7, ver at bits 8..15, flags at bits 16..31, payload_len at bits 32..63 — so the round-trip is `frame_decode(buf) == packed_u64_of(encode)` bit-exact. Field extraction is deferred to frame_hdr_* accessors which take the packed u64 directly, letting callers decode once and read multiple fields without re-touching memory. Pure read; no writes. Leaf function; no callee-save writes.",
+      block: {
+        mov rax, [rdi];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // frame_hdr_op(hdr: u64) -> u64
+  //
+  // SysV ABI: rdi=hdr -> rax=op (u8, zero-extended).
+  //
+  // Extracts bits 0..7 of the packed header.
+  // ==========================================================================
+
+  pub let frame_hdr_op : (u64) -> u64 !{} @{} =
+    fn (hdr: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "R20b.M2-001 (#1555): extract op field (bits 0..7 of packed header). rax = hdr & 0xFF. Pure register op; no memory access. Leaf function.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // frame_hdr_ver(hdr: u64) -> u64
+  //
+  // SysV ABI: rdi=hdr -> rax=ver (u8, zero-extended).
+  //
+  // Extracts bits 8..15 of the packed header.
+  // ==========================================================================
+
+  pub let frame_hdr_ver : (u64) -> u64 !{} @{} =
+    fn (hdr: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "R20b.M2-001 (#1555): extract ver field (bits 8..15 of packed header). rax = (hdr >> 8) & 0xFF. shr-8 shifts the ver byte into bits 0..7, then mask defends against reading further into the flags region. Pure register op; no memory access. Leaf function.",
+      block: {
+        mov rax, rdi;
+        shr rax, 8;
+        and rax, 0xFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // frame_hdr_flags(hdr: u64) -> u64
+  //
+  // SysV ABI: rdi=hdr -> rax=flags (u16, zero-extended).
+  //
+  // Extracts bits 16..31 of the packed header.
+  // ==========================================================================
+
+  pub let frame_hdr_flags : (u64) -> u64 !{} @{} =
+    fn (hdr: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "R20b.M2-001 (#1555): extract flags field (bits 16..31 of packed header). rax = (hdr >> 16) & 0xFFFF. shr-16 shifts the flags word into bits 0..15, then mask defends against reading further into the payload_len region. Pure register op; no memory access. Leaf function.",
+      block: {
+        mov rax, rdi;
+        shr rax, 16;
+        and rax, 0xFFFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // frame_hdr_payload_len(hdr: u64) -> u64
+  //
+  // SysV ABI: rdi=hdr -> rax=payload_len (u32, zero-extended).
+  //
+  // Extracts bits 32..63 of the packed header. The declared field width
+  // is u32, but the packed hdr's high 32 bits are the payload_len bytes;
+  // shr-32 leaves them in bits 0..31 with bits 32..63 zero, so no explicit
+  // mask is needed — the shift itself is the zero-extension.
+  // ==========================================================================
+
+  pub let frame_hdr_payload_len : (u64) -> u64 !{} @{} =
+    fn (hdr: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "R20b.M2-001 (#1555): extract payload_len field (bits 32..63 of packed header). rax = hdr >> 32. shr-32 shifts payload_len into bits 0..31 AND zero-fills bits 32..63 (SDM Vol 2A §4.3 SHR: shifted-in bits are zero for unsigned SHR), so the returned value is already the u32 payload_len zero-extended to u64. No explicit and-mask needed. Pure register op; no memory access. Leaf function.",
+      block: {
+        mov rax, rdi;
+        shr rax, 32;
+        ret
+      }
+    } @no_frame
+}
