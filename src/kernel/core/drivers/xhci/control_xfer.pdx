@@ -1,0 +1,715 @@
+// src/kernel/core/drivers/xhci/control_xfer.pdx — R26-M5-001..003 (#960, #961, #962)
+//
+// USB Control Transfers via xHCI transfer rings on EP0. A Control
+// Transfer is composed of 3 TRBs (Setup / optional Data / Status) that
+// SW enqueues onto the EP0 transfer ring, publishes via the per-slot
+// EP0 doorbell (DCI=1), and awaits via a Transfer Event on the event
+// ring (TRB Type 32).
+//
+// -----------------------------------------------------------------------------
+// Setup Stage TRB (xHCI 1.2 §6.4.1.2.1)
+// -----------------------------------------------------------------------------
+//
+//   Parameter (u64)   — 8 bytes of USB Setup packet packed LE:
+//                         byte 0 = bmRequestType
+//                         byte 1 = bRequest
+//                         bytes 2..3 = wValue      (LE u16)
+//                         bytes 4..5 = wIndex      (LE u16)
+//                         bytes 6..7 = wLength     (LE u16)
+//   Status    (u32)   — bits [16:0]  TRB Transfer Length = 8 (always)
+//                       bits [31:22] Interrupter Target (0)
+//   Control   (u32)   — bit 0        C (Cycle) — set by trb_write
+//                       bit 5        IOC (usually 0 — completion on Status)
+//                       bit 6        IDT (MUST be 1 — 8 bytes in Parameter)
+//                       bits [15:10] TRB Type = 2
+//                       bits [17:16] TRT (Transfer Type):
+//                         0 = No Data Stage
+//                         2 = OUT Data Stage
+//                         3 = IN Data Stage
+//
+// -----------------------------------------------------------------------------
+// Data Stage TRB (xHCI 1.2 §6.4.1.2.2)
+// -----------------------------------------------------------------------------
+//
+//   Parameter (u64)   — Data Buffer Pointer (PA of caller's I/O buffer)
+//   Status    (u32)   — bits [16:0]  TRB Transfer Length = wLength
+//                       bits [21:17] TD Size (0 — last TRB in a TD)
+//                       bits [31:22] Interrupter Target (0)
+//   Control   (u32)   — bit 0        C
+//                       bit 4        CH (Chain — 0)
+//                       bit 5        IOC (0 — completion on Status)
+//                       bits [15:10] TRB Type = 3
+//                       bit 16       DIR (1 = IN, 0 = OUT)
+//
+// -----------------------------------------------------------------------------
+// Status Stage TRB (xHCI 1.2 §6.4.1.2.3)
+// -----------------------------------------------------------------------------
+//
+//   Parameter (u64)   — 0
+//   Status    (u32)   — bits [31:22] Interrupter Target (0)
+//   Control   (u32)   — bit 0        C
+//                       bit 5        IOC (MUST be 1 — publishes the event)
+//                       bits [15:10] TRB Type = 4
+//                       bit 16       DIR — OPPOSITE of the Data Stage
+//                                            0 = OUT for an IN transfer
+//                                            1 = IN  for an OUT transfer
+//                                                (also the no-data case)
+//
+// -----------------------------------------------------------------------------
+// Precomputed control words (no cycle)
+// -----------------------------------------------------------------------------
+//
+//   Setup IN  (TRT=3, IDT=1)        = (2<<10) | (1<<6) | (3<<16) = 0x30840
+//   Setup NoData (TRT=0, IDT=1)     = (2<<10) | (1<<6)           = 0x00840
+//   Data IN                         = (3<<10) | (1<<16)          = 0x10C00
+//   Data OUT                        = (3<<10) | (0<<16)          = 0x00C00
+//   Status OUT + IOC (for IN xfer)  = (4<<10) | (1<<5) | (0<<16) = 0x01020
+//   Status IN  + IOC (for OUT/none) = (4<<10) | (1<<5) | (1<<16) = 0x11020
+//
+// -----------------------------------------------------------------------------
+// Setup packet composition (LE byte order)
+// -----------------------------------------------------------------------------
+//
+//   u64 = bmRequestType | (bRequest << 8) | (wValue << 16)
+//                       | (wIndex << 32)  | (wLength << 48)
+//
+// GET_DESCRIPTOR(Device, wLength=18):
+//   bytes: 80 06 00 01 00 00 12 00  →  u64 = 0x0012000001000680
+//
+// GET_DESCRIPTOR(Configuration, wLength=variable):
+//   bytes: 80 06 00 02 00 00 LL LL  →  base = 0x02000680; caller
+//                                              ORs (wLength << 48).
+//
+// SET_CONFIGURATION(config_value):
+//   bytes: 00 09 CV 00 00 00 00 00  →  base = 0x0900; caller
+//                                              ORs ((config_value & 0xFFFF) << 16).
+//
+// -----------------------------------------------------------------------------
+// EP0 doorbell semantics
+// -----------------------------------------------------------------------------
+//
+// EP0 (Control, bidirectional) lives at Device Context Index 1 (see
+// context.pdx L36). The per-slot doorbell targets DB[slot_id] with DB
+// Target = 1 (bits [7:0]) and Stream ID = 0.
+//
+// -----------------------------------------------------------------------------
+// Argument-ABI simplification: no cmd_ctx
+// -----------------------------------------------------------------------------
+//
+// The task spec drafts these functions with a cmd_ctx argument, mirroring
+// slot.pdx's shape. Control transfers never touch the command ring —
+// every TRB goes onto the EP0 transfer ring, and completions come off
+// the event ring. cmd_ctx would be genuinely dead in every function
+// body, so we drop it: 5 args for the simple cases (GET_DESCRIPTOR
+// Device, SET_CONFIGURATION) and 6 args for GET_DESCRIPTOR Configuration
+// (adds total_length). This keeps every function within the SysV 6-arg
+// integer-register cap without spilling to the stack. hid.pdx follows
+// the same 5-arg shape for xhci_hid_set_boot_protocol.
+//
+// -----------------------------------------------------------------------------
+// config_info layout (24 B, @align(8)) — output of xhci_parse_config_descriptor
+// -----------------------------------------------------------------------------
+//
+//   +0    u8   interface_class
+//   +1    u8   interface_subclass
+//   +2    u8   interface_protocol
+//   +3    u8   ep_addr
+//   +4    u16  ep_max_packet
+//   +6    u8   ep_interval
+//   +7    u8   found_flags        — bit 0 = interface parsed
+//                                    bit 1 = endpoint parsed
+//   +8    u64  _reserved
+//   +16   u64  _reserved
+//
+// -----------------------------------------------------------------------------
+// R26.M5 posture: dormant at boot
+// -----------------------------------------------------------------------------
+//
+// No HC under BIOS/`-kernel` boot means no port reset -> no slot enable
+// -> no configured EP0 -> no control transfers. Symbols exist for R26.M6+
+// HID keyboard bring-up + UEFI/OVMF activation.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: sized u16/u8/u32 stores + zero-extended sub-8-byte loads.
+//   G4: full-register compares in the parse loop.
+//
+// Reserved-label discipline: `xhci_ter_` (transfer enqueue raw),
+// `xhci_pte_` (poll transfer event), `xhci_gdd_` (get descriptor device),
+// `xhci_gdc_` (get descriptor config), `xhci_pcd_` (parse config
+// descriptor), `xhci_sc_` (set configuration).
+
+module ControlXfer = structure {
+
+  // ============================================================================
+  // TRB Type constants
+  // ============================================================================
+
+  pub let XHCI_TRB_TYPE_SETUP_STAGE     : u64 = 2
+  pub let XHCI_TRB_TYPE_DATA_STAGE      : u64 = 3
+  pub let XHCI_TRB_TYPE_STATUS_STAGE    : u64 = 4
+  pub let XHCI_TRB_TYPE_TRANSFER_EVENT  : u64 = 32
+
+  // ============================================================================
+  // Setup Stage TRT (Transfer Type) values
+  // ============================================================================
+
+  pub let XHCI_SETUP_TRT_NO_DATA        : u64 = 0
+  pub let XHCI_SETUP_TRT_OUT_DATA       : u64 = 2
+  pub let XHCI_SETUP_TRT_IN_DATA        : u64 = 3
+
+  // ============================================================================
+  // Precomputed control words (no cycle bit)
+  // ============================================================================
+
+  pub let XHCI_CTL_SETUP_IN             : u64 = 0x30840
+  pub let XHCI_CTL_SETUP_NODATA         : u64 = 0x00840
+  pub let XHCI_CTL_DATA_IN              : u64 = 0x10C00
+  pub let XHCI_CTL_DATA_OUT             : u64 = 0x00C00
+  pub let XHCI_CTL_STATUS_OUT_IOC       : u64 = 0x01020
+  pub let XHCI_CTL_STATUS_IN_IOC        : u64 = 0x11020
+
+  // ============================================================================
+  // USB request + descriptor constants
+  // ============================================================================
+
+  pub let USB_REQ_GET_DESCRIPTOR        : u64 = 0x06
+  pub let USB_REQ_SET_CONFIGURATION     : u64 = 0x09
+
+  pub let USB_DESC_TYPE_DEVICE          : u64 = 0x01
+  pub let USB_DESC_TYPE_CONFIGURATION   : u64 = 0x02
+  pub let USB_DESC_TYPE_INTERFACE       : u64 = 0x04
+  pub let USB_DESC_TYPE_ENDPOINT        : u64 = 0x05
+  pub let USB_DESC_TYPE_HID             : u64 = 0x21
+
+  // Precomposed 8-byte USB Setup packets.
+  pub let USB_SETUP_GET_DESC_DEVICE     : u64 = 0x0012000001000680
+  pub let USB_SETUP_GET_DESC_CFG_BASE   : u64 = 0x02000680
+  pub let USB_SETUP_SET_CFG_BASE        : u64 = 0x0900
+
+  // ============================================================================
+  // Transfer-event / completion codes
+  // ============================================================================
+
+  pub let XHCI_CC_SUCCESS               : u64 = 1
+  pub let XHCI_XFER_POLL_SPIN_MAX       : u64 = 5000000
+  pub let XHCI_EVT_SEG_TRBS             : u64 = 256
+
+  pub let XHCI_XFER_OK                  : u64 = 0
+  pub let XHCI_XFER_ERR_TYPE            : u64 = 1
+  pub let XHCI_XFER_ERR_TIMEOUT         : u64 = 2
+
+  // ============================================================================
+  // EP0 DCI (Data Context Index) — Control, bidirectional
+  // ============================================================================
+
+  pub let XHCI_EP0_DCI                  : u64 = 1
+
+  // ============================================================================
+  // config_info offsets (24 B, @align(8))
+  // ============================================================================
+
+  pub let XHCI_CFG_INFO_IFACE_CLASS     : u64 = 0
+  pub let XHCI_CFG_INFO_IFACE_SUBCLASS  : u64 = 1
+  pub let XHCI_CFG_INFO_IFACE_PROTOCOL  : u64 = 2
+  pub let XHCI_CFG_INFO_EP_ADDR         : u64 = 3
+  pub let XHCI_CFG_INFO_EP_MAX_PACKET   : u64 = 4
+  pub let XHCI_CFG_INFO_EP_INTERVAL     : u64 = 6
+  pub let XHCI_CFG_INFO_FOUND_FLAGS     : u64 = 7
+  pub let XHCI_CFG_INFO_SIZE            : u64 = 24
+
+  pub let XHCI_CFG_INFO_FLAG_IFACE      : u64 = 1
+  pub let XHCI_CFG_INFO_FLAG_ENDPOINT   : u64 = 2
+
+  // Config descriptor header field offsets.
+  pub let USB_CFG_DESC_TOTAL_LENGTH_OFF : u64 = 2
+  pub let USB_CFG_DESC_HDR_SIZE         : u64 = 9
+
+  // ============================================================================
+  // xhci_transfer_enqueue_raw(ctx, param, status, ctrl_no_cycle) -> u64
+  // ============================================================================
+  //
+  // Structurally identical to xhci_cmd_enqueue (cmd_ring.pdx L291) but
+  // for transfer_ring_ctx (same +0/+8/+16/+18 field offsets). Enqueues
+  // one arbitrary TRB with producer-safe Cycle-bit and Link-slot
+  // wraparound per xHCI 1.2 §4.9.3.
+
+  pub let xhci_transfer_enqueue_raw : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (ctx: u64, param: u64, status: u64, ctrl_no_cycle: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R26-M5-001..003 (#960..#962). Enqueue one arbitrary TRB (Setup / Data / Status stage) onto a transfer ring with producer-safe Cycle-bit and Link-slot wraparound per xHCI 1.2 §4.9.3 / §6.4.1. Structural mirror of xhci_cmd_enqueue (cmd_ring.pdx L291) and xhci_transfer_enqueue (transfer_ring.pdx L288). Both cmd_ring_ctx and transfer_ring_ctx share identical +0/+8/+16/+18 field offsets for the fields this function touches (ring_pa, ring_va, enqueue_idx, cycle_bit) — the trailing slot_id/ep_id bytes at +19/+20 in transfer_ring_ctx are untouched by this path. Body: (1) 5-push callee-save (rbx=ctx, rbp=idx-scratch, r12=ring_va, r13=cycle_bit, r14=unused) — 40 B; sub rsp,32 for arg-slot spills [rsp+0]=param, [rsp+8]=status, [rsp+16]=ctrl_no_cycle, [rsp+24]=pad. Entry rsp%16==8 -> 80, %16==0 (aligned for both trb_write calls). (2) Save caller args (rsi/rdx/rcx get clobbered by nested trb_write's arg setup) and stash ctx in rbx. (3) Load ring_va (u64 @ ctx+8) into r12. Load enqueue_idx (u16 @ ctx+16 zero-extended) into rbp. Load cycle_bit (u8 @ ctx+18 zero-extended) into r13. (4) trb_addr = r12 + rbp*16. Call trb_write(trb_addr, param, status, ctrl_no_cycle, cycle). (5) Advance idx: rbp += 1. (6) If rbp == 255 (Link slot): re-write Link TRB at r12+255*16 with param=r12 (ring_pa; VA==PA identity), status=0, ctrl=0x1802 (LINK|TC), cycle=r13. Then r13 ^= 1 (toggle); rbp = 0. (7) Persist idx (u16 @ ctx+16) + cycle_bit (u8 @ ctx+18). (8) Return rbp in rax. Reserved labels: `xhci_ter_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 32;
+
+        mov [rsp + 0], rsi;
+        mov [rsp + 8], rdx;
+        mov [rsp + 16], rcx;
+        mov rbx, rdi;
+
+        mov r12, [rbx + 8];
+
+        xor rax, rax;
+        mov_w rax, [rbx + 16];
+        mov rbp, rax;
+
+        xor rax, rax;
+        mov_b rax, [rbx + 18];
+        mov r13, rax;
+
+        mov rax, rbp;
+        shl rax, 4;
+        add rax, r12;
+        mov rdi, rax;
+        mov rsi, [rsp + 0];
+        mov rdx, [rsp + 8];
+        mov rcx, [rsp + 16];
+        mov r8, r13;
+        call trb_write;
+
+        add rbp, 1;
+
+        cmp rbp, 255;
+        jne xhci_ter_no_wrap;
+
+        mov rdi, r12;
+        add rdi, 4080;
+        mov rsi, r12;
+        xor rdx, rdx;
+        mov rcx, 6146;
+        mov r8, r13;
+        call trb_write;
+
+        xor r13, 1;
+        xor rbp, rbp;
+
+      xhci_ter_no_wrap:
+        mov_w [rbx + 16], rbp;
+        mov_b [rbx + 18], r13;
+
+        mov rax, rbp;
+
+        add rsp, 32;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // xhci_poll_transfer_event(event_ctx) -> u64
+  // ============================================================================
+  //
+  // Mirrors slot.pdx CCE poll (L210) but checks TRB Type == 32 (Transfer
+  // Event, §6.4.2.1) instead of 33.
+
+  pub let xhci_poll_transfer_event : (u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (event_ctx: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R26-M5-001 (#960). Poll event ring for a Transfer Event (TRB Type 32) per xHCI 1.2 §4.11.2 / §6.4.2.1. Structural mirror of the inlined CCE poll in xhci_enable_slot (slot.pdx L210) with TRB Type check == 32 instead of 33. Body: (1) 3-push callee-save (rbx=event_ctx, rbp=trb_addr, r12=expected cycle) + sub rsp,8 for defensive 16-alignment. (2) rbp = event_ring_va (u64 @ ctx+8) + dequeue_idx*16 (u16 @ ctx+16 zero-extended, << 4). r12 = expected cycle_bit (u8 @ ctx+18 zero-extended). (3) Spin loop budgeted by rax=5_000_000. Each iter: read Control word (u32 @ trb_addr+12) via `mov ecx, [rbp+12]` (zero-extends into rcx). Extract cycle (rcx & 1); compare with r12; jne no_event. On cycle match: extract TRB Type (rcx>>10 & 0x3F); if != 32 return XFER_ERR_TYPE. Check Completion Code at Status +8 bits 24..31; if != 1 return (code | 0x100). (4) Advance dequeue_idx: u16 @ ctx+16; add 1; if == 256 -> zero + toggle r12 (persist u8 @ ctx+18); persist u16 @ ctx+16. (5) Return 0. no_event: dec spin; if 0 return XFER_ERR_TIMEOUT else loop. Reserved labels: `xhci_pte_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+
+        mov rbp, [rbx + 8];
+        xor rax, rax;
+        mov_w rax, [rbx + 16];
+        shl rax, 4;
+        add rbp, rax;
+
+        xor r12, r12;
+        mov_b r12, [rbx + 18];
+
+        mov rax, 5000000;
+
+      xhci_pte_poll:
+        mov ecx, [rbp + 12];
+
+        mov rdx, rcx;
+        and rdx, 1;
+        cmp rdx, r12;
+        jne xhci_pte_no_event;
+
+        mov rdx, rcx;
+        shr rdx, 10;
+        and rdx, 0x3F;
+        cmp rdx, 32;
+        jne xhci_pte_wrong_type;
+
+        mov edx, [rbp + 8];
+        shr rdx, 24;
+        and rdx, 0xFF;
+        cmp rdx, 1;
+        jne xhci_pte_cc_err;
+
+        xor rcx, rcx;
+        mov_w rcx, [rbx + 16];
+        add rcx, 1;
+        cmp rcx, 256;
+        jne xhci_pte_no_wrap;
+        xor rcx, rcx;
+        xor r12, 1;
+        mov_b [rbx + 18], r12;
+      xhci_pte_no_wrap:
+        mov_w [rbx + 16], rcx;
+
+        xor rax, rax;
+        jmp xhci_pte_done;
+
+      xhci_pte_cc_err:
+        or  rdx, 0x100;
+        mov rax, rdx;
+        jmp xhci_pte_done;
+
+      xhci_pte_wrong_type:
+        mov rax, 1;
+        jmp xhci_pte_done;
+
+      xhci_pte_no_event:
+        sub rax, 1;
+        cmp rax, 0;
+        jne xhci_pte_poll;
+        mov rax, 2;
+
+      xhci_pte_done:
+        add rsp, 8;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // xhci_get_descriptor_device(bar0, event_ctx, slot_id, ep0_ring,
+  //                            out_buffer_pa) -> u64
+  // ============================================================================
+
+  pub let xhci_get_descriptor_device : (u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64, event_ctx: u64, slot_id: u64, ep0_ring: u64, out_buffer_pa: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R26-M5-001 (#960). GET_DESCRIPTOR(Device) 3-TRB Control Transfer per xHCI 1.2 §4.11.2 + USB 2.0 §9.4.3. Body: (1) 5-push callee-save (rbx=bar0, rbp=event_ctx, r12=slot_id, r13=ep0_ring, r14=out_buffer_pa) + sub rsp,8 align — 48 B; entry rsp%16==8 -> 56, %16==0 (aligned for every nested call). (2) Enqueue Setup TRB via xhci_transfer_enqueue_raw(ep0_ring, param=USB_SETUP_GET_DESC_DEVICE=0x0012000001000680, status=8, ctrl=XHCI_CTL_SETUP_IN=0x30840). status=8 = TRB Transfer Length (Setup always 8 bytes). ctrl encodes (SETUP<<10)|IDT|(TRT=IN<<16). (3) Enqueue Data IN TRB via xhci_transfer_enqueue_raw(ep0_ring, param=out_buffer_pa, status=18, ctrl=XHCI_CTL_DATA_IN=0x10C00). Length 18 = USB Device descriptor size (§9.6.1). (4) Enqueue Status OUT TRB with IOC via xhci_transfer_enqueue_raw(ep0_ring, param=0, status=0, ctrl=XHCI_CTL_STATUS_OUT_IOC=0x1020). Direction OUT is OPPOSITE of Data IN per §6.4.1.2.3; IOC=1 posts Transfer Event on completion. (5) Ring EP0 doorbell: xhci_ring_ep_doorbell(bar0, slot_id, 1). DCI=1 = EP0. (6) Poll: xhci_poll_transfer_event(event_ctx). Return the poll result unchanged. cmd_ctx is intentionally NOT an argument — control transfers never touch the command ring. Reserved labels: `xhci_gdd_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+        mov r12, rdx;
+        mov r13, rcx;
+        mov r14, r8;
+
+        mov rdi, r13;
+        mov rsi, 0x0012000001000680;
+        mov rdx, 8;
+        mov rcx, 0x30840;
+        call xhci_transfer_enqueue_raw;
+
+        mov rdi, r13;
+        mov rsi, r14;
+        mov rdx, 18;
+        mov rcx, 0x10C00;
+        call xhci_transfer_enqueue_raw;
+
+        mov rdi, r13;
+        xor rsi, rsi;
+        xor rdx, rdx;
+        mov rcx, 0x1020;
+        call xhci_transfer_enqueue_raw;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 1;
+        call xhci_ring_ep_doorbell;
+
+        mov rdi, rbp;
+        call xhci_poll_transfer_event;
+
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // xhci_get_descriptor_config(bar0, event_ctx, slot_id, ep0_ring,
+  //                            out_buffer_pa, total_length) -> u64
+  // ============================================================================
+
+  pub let xhci_get_descriptor_config : (u64, u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64, event_ctx: u64, slot_id: u64, ep0_ring: u64, out_buffer_pa: u64, total_length: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R26-M5-002 (#961). GET_DESCRIPTOR(Configuration) 3-TRB Control Transfer per xHCI 1.2 §4.11.2 + USB 2.0 §9.4.3. Structurally identical to xhci_get_descriptor_device but with wValue=(0x02<<8)|0=0x0200 (Configuration descriptor index 0) and wLength composed at runtime from the caller-supplied total_length. Body: (1) 6-push callee-save (rbx=bar0, rbp=event_ctx, r12=slot_id, r13=ep0_ring, r14=out_buffer_pa, r15=total_length) + sub rsp,8 align — 56 B; entry rsp%16==8 -> 64, %16==0. (2) Compose Setup packet u64 = USB_SETUP_GET_DESC_CFG_BASE (0x02000680) | ((total_length & 0xFFFF) << 48): mov rax, r15; and rax, 0xFFFF; shl rax, 48; mov rcx, 0x02000680; or rax, rcx. Fixed low 48 bits carry bmRequestType=0x80, bRequest=0x06, wValue=0x0200, wIndex=0; total_length (u16) occupies bytes 6..7. (3) Enqueue Setup TRB via xhci_transfer_enqueue_raw(ep0_ring, param=composed, status=8, ctrl=XHCI_CTL_SETUP_IN=0x30840). (4) Enqueue Data IN TRB via xhci_transfer_enqueue_raw(ep0_ring, param=out_buffer_pa, status=total_length, ctrl=XHCI_CTL_DATA_IN=0x10C00). (5) Enqueue Status OUT+IOC TRB (opposite direction of IN). (6) Ring EP0 doorbell. (7) Poll for Transfer Event. Reserved labels: `xhci_gdc_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+        mov r12, rdx;
+        mov r13, rcx;
+        mov r14, r8;
+        mov r15, r9;
+
+        mov rax, r15;
+        and rax, 0xFFFF;
+        shl rax, 48;
+        mov rcx, 0x02000680;
+        or  rax, rcx;
+
+        mov rdi, r13;
+        mov rsi, rax;
+        mov rdx, 8;
+        mov rcx, 0x30840;
+        call xhci_transfer_enqueue_raw;
+
+        mov rdi, r13;
+        mov rsi, r14;
+        mov rdx, r15;
+        mov rcx, 0x10C00;
+        call xhci_transfer_enqueue_raw;
+
+        mov rdi, r13;
+        xor rsi, rsi;
+        xor rdx, rdx;
+        mov rcx, 0x1020;
+        call xhci_transfer_enqueue_raw;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 1;
+        call xhci_ring_ep_doorbell;
+
+        mov rdi, rbp;
+        call xhci_poll_transfer_event;
+
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // xhci_parse_config_descriptor(buf_pa, out) -> u64
+  // ============================================================================
+  //
+  // Walks a Config-descriptor TLV chain per USB 2.0 §9.5. Captures the
+  // FIRST Interface descriptor (class/subclass/protocol) and the FIRST
+  // Endpoint descriptor (addr/mps/interval). HID + other class-specific
+  // descriptors are walked past. Returns 0 on success, 1 on Config-type
+  // mismatch.
+
+  pub let xhci_parse_config_descriptor : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (buf_pa: u64, out: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R26-M5-002 (#961). Parse a USB Configuration-descriptor TLV chain per USB 2.0 §9.5. Body: (1) 5-push callee-save (rbx=buf_pa, rbp=out, r12=offset, r13=total_length, r14=found_flags) — 40 B; leaf, no nested calls. (2) Validate Config header: mov_b bDescriptorType at [rbx+1]; cmp 2; jne fail (return 1). (3) Load total_length: mov_w u16 at [rbx+2]; save r13. offset = bLength u8 at [rbx+0]; save r12. (4) Zero out (24 B via 3 u64 stores) + found_flags (r14). (5) Walk loop: cmp r12,r13; jae end. desc_addr = rbx + r12 (into r10). bLen at [r10+0]; if 0 break. bType at [r10+1]. (6) Switch: 0x04 (Interface) — if !(r14 & IFACE): read u8 at desc+5/+6/+7 into out+0/+1/+2; OR IFACE (bit 0) into r14. 0x05 (Endpoint) — if !(r14 & ENDPOINT): read u8 at desc+2 into out+3, u16 at desc+4 into out+4 (u16), u8 at desc+6 into out+6; OR ENDPOINT (bit 1) into r14. 0x21 (HID) skipped by fall-through. (7) offset += bLen; loop. (8) End: mov_b out+7 = r14. Return 0. Reserved labels: `xhci_pcd_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+
+        xor rax, rax;
+        mov_b rax, [rbx + 1];
+        cmp rax, 2;
+        jne xhci_pcd_fail;
+
+        xor rax, rax;
+        mov_w rax, [rbx + 2];
+        mov r13, rax;
+
+        xor rax, rax;
+        mov_b rax, [rbx + 0];
+        mov r12, rax;
+
+        xor rax, rax;
+        mov [rbp + 0], rax;
+        mov [rbp + 8], rax;
+        mov [rbp + 16], rax;
+        xor r14, r14;
+
+      xhci_pcd_loop:
+        cmp r12, r13;
+        jae xhci_pcd_end;
+
+        mov r10, rbx;
+        add r10, r12;
+
+        xor rcx, rcx;
+        mov_b rcx, [r10 + 0];
+        cmp rcx, 0;
+        je  xhci_pcd_end;
+
+        xor rdx, rdx;
+        mov_b rdx, [r10 + 1];
+
+        cmp rdx, 4;
+        je  xhci_pcd_iface;
+        cmp rdx, 5;
+        je  xhci_pcd_endpoint;
+        jmp xhci_pcd_advance;
+
+      xhci_pcd_iface:
+        mov rax, r14;
+        and rax, 1;
+        cmp rax, 0;
+        jne xhci_pcd_advance;
+
+        xor rax, rax;
+        mov_b rax, [r10 + 5];
+        mov_b [rbp + 0], rax;
+
+        xor rax, rax;
+        mov_b rax, [r10 + 6];
+        mov_b [rbp + 1], rax;
+
+        xor rax, rax;
+        mov_b rax, [r10 + 7];
+        mov_b [rbp + 2], rax;
+
+        or  r14, 1;
+        jmp xhci_pcd_advance;
+
+      xhci_pcd_endpoint:
+        mov rax, r14;
+        and rax, 2;
+        cmp rax, 0;
+        jne xhci_pcd_advance;
+
+        xor rax, rax;
+        mov_b rax, [r10 + 2];
+        mov_b [rbp + 3], rax;
+
+        xor rax, rax;
+        mov_w rax, [r10 + 4];
+        mov_w [rbp + 4], rax;
+
+        xor rax, rax;
+        mov_b rax, [r10 + 6];
+        mov_b [rbp + 6], rax;
+
+        or  r14, 2;
+        jmp xhci_pcd_advance;
+
+      xhci_pcd_advance:
+        add r12, rcx;
+        jmp xhci_pcd_loop;
+
+      xhci_pcd_end:
+        mov_b [rbp + 7], r14;
+        xor rax, rax;
+        jmp xhci_pcd_done;
+
+      xhci_pcd_fail:
+        mov rax, 1;
+
+      xhci_pcd_done:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // xhci_set_configuration(bar0, event_ctx, slot_id, ep0_ring,
+  //                        config_value) -> u64
+  // ============================================================================
+
+  pub let xhci_set_configuration : (u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64, event_ctx: u64, slot_id: u64, ep0_ring: u64, config_value: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R26-M5-003 (#962). SET_CONFIGURATION 2-TRB Control Transfer per xHCI 1.2 §4.11.2 + USB 2.0 §9.4.7. Body: (1) 5-push callee-save (rbx=bar0, rbp=event_ctx, r12=slot_id, r13=ep0_ring, r14=config_value) + sub rsp,8 align — 48 B; entry rsp%16==8 -> 56, %16==0. (2) Compose Setup packet u64 = USB_SETUP_SET_CFG_BASE (0x0900) | ((config_value & 0xFFFF) << 16). Encodes bmRequestType=0x00, bRequest=0x09 SET_CONFIGURATION, wValue=config_value, wIndex=0, wLength=0. (3) Enqueue Setup TRB via xhci_transfer_enqueue_raw with ctrl=XHCI_CTL_SETUP_NODATA=0x840. TRT=0 (No Data Stage). (4) No Data TRB. (5) Enqueue Status IN+IOC TRB via xhci_transfer_enqueue_raw with ctrl=XHCI_CTL_STATUS_IN_IOC=0x11020. Direction IN is the OPPOSITE of implicit OUT for no-data Control transfers per §6.4.1.2.3; IOC=1 publishes completion. (6) Ring EP0 doorbell. (7) Poll for Transfer Event. Reserved labels: `xhci_sc_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+        mov r12, rdx;
+        mov r13, rcx;
+        mov r14, r8;
+
+        mov rax, r14;
+        and rax, 0xFFFF;
+        shl rax, 16;
+        mov rcx, 0x0900;
+        or  rax, rcx;
+
+        mov rdi, r13;
+        mov rsi, rax;
+        mov rdx, 8;
+        mov rcx, 0x840;
+        call xhci_transfer_enqueue_raw;
+
+        mov rdi, r13;
+        xor rsi, rsi;
+        xor rdx, rdx;
+        mov rcx, 0x11020;
+        call xhci_transfer_enqueue_raw;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 1;
+        call xhci_ring_ep_doorbell;
+
+        mov rdi, rbp;
+        call xhci_poll_transfer_event;
+
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
