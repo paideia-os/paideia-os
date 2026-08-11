@@ -1,0 +1,306 @@
+// src/kernel/core/net/l2_tx.pdx — R27-M3-003 (#983)
+//
+// L2 transmit path: bump-alloc a TX buffer from the module-static
+// pool, build an Ethernet frame into it, publish a legacy TX
+// descriptor, and advance TDT to hand the descriptor to hardware.
+//
+// -----------------------------------------------------------------------------
+// TX buffer pool
+// -----------------------------------------------------------------------------
+//
+// Sixteen 2 KiB buffers (16 * 2048 = 32 KiB, 4 KiB-aligned) form a
+// round-robin scratch pool addressed by `_l2_tx_buf_next`. 16 slots
+// covers a burst of 16 in-flight frames, comfortably above the
+// worst-case ARP-request + IPv4-fragment burst pattern the R27 stack
+// generates. The pool is a bring-up convenience: a phys_alloc-derived
+// SKB substrate replaces it at R28+ when the send path grows a
+// completion-observing free-list.
+//
+// -----------------------------------------------------------------------------
+// TX descriptor programming (mirror of e1000e_irq_handler's read path)
+// -----------------------------------------------------------------------------
+//
+//   desc.buffer_addr (u64 @+0)  = tx_buf_pa (physical address of the
+//                                  built frame)
+//   desc.length      (u16 @+8)  = total_len (14 + payload_len)
+//   desc.cso         (u8  @+10) = 0                (checksum offset unused)
+//   desc.cmd         (u8  @+11) = EOP | IFCS | RS  (0x0B)
+//   desc.sta_rsv     (u8  @+12) = 0                (HW writes STA.DD)
+//   desc.css         (u8  @+13) = 0                (unused)
+//   desc.special     (u16 @+14) = 0                (VLAN unused)
+//
+// EOP marks single-descriptor frames (no scatter/gather at M3).
+// IFCS asks the NIC to append the 4-byte FCS. RS asks the NIC to
+// write back STA.DD so the TXDW IRQ path (irq.pdx) can reclaim the
+// slot.
+//
+// -----------------------------------------------------------------------------
+// TDT bump discipline
+// -----------------------------------------------------------------------------
+//
+// SW owns descriptors in [TDH, TDT); HW owns [TDT, TDH). After
+// filling in descriptor N at _e1000e_tx_tail, we bump the shadow to
+// (N+1) & 127 and write that new value to TDT (0x3818). The MMIO
+// store is what triggers the controller to fetch and transmit the
+// new descriptor.
+//
+// -----------------------------------------------------------------------------
+// Ring-full guard
+// -----------------------------------------------------------------------------
+//
+// If (tail + 1) & 127 == head, the ring is full — every slot is HW-
+// owned pending completion. l2_tx_send returns E_TX_RING_FULL (2) in
+// this case; the caller retries after the next TXDW IRQ. At M3 the
+// path is dormant so the guard is a correctness invariant rather
+// than an observed failure mode.
+//
+// -----------------------------------------------------------------------------
+// R27.M3 posture: dormant at boot
+// -----------------------------------------------------------------------------
+//
+// l2_tx_send is a callable symbol at M3 but is NOT wired into
+// kernel_main.pdx. R27.M4 ARP request emission is the first live
+// caller.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: descriptor sub-8B stores route via mov_b / mov_w.
+//
+// Reserved-label discipline: labels prefixed `l2tx_`.
+
+module L2Tx = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  pub let L2_TX_BUF_COUNT           : u64 = 16
+  pub let L2_TX_BUF_SIZE            : u64 = 2048
+  pub let L2_TX_BUF_POOL_BYTES      : u64 = 32768        // 16 * 2048
+  pub let L2_TX_RING_DESCS          : u64 = 128
+
+  // Return codes.
+  pub let L2_TX_OK                  : u64 = 0
+  pub let L2_TX_ERR_PAYLOAD_TOO_BIG : u64 = 1
+  pub let L2_TX_ERR_RING_FULL       : u64 = 2
+
+  // TX descriptor CMD-byte composition (mirror of tx_ring.pdx constants
+  // to avoid a cross-module CMD-byte value drift under refactor).
+  //   EOP  (bit 0) = 0x01
+  //   IFCS (bit 1) = 0x02
+  //   RS   (bit 3) = 0x08
+  pub let L2_TX_CMD_EOP_IFCS_RS     : u64 = 0x0B
+
+  // ============================================================================
+  // Canonical .bss slots
+  // ============================================================================
+  //
+  //   _l2_tx_buffers : 16 * 2048 B = 32 KiB TX scratch pool
+  //                    (u64 count = 32768 / 8 = 4096)
+  //   _l2_tx_buf_next: round-robin bump-alloc cursor (0..15)
+  //   _l2_tx_pkts    : cumulative transmitted-frame count
+
+  pub let mut _l2_tx_buffers        : [u64; 4096] = uninit @align(4096)
+  pub let mut _l2_tx_buf_next       : u64          = 0
+  pub let mut _l2_tx_pkts           : u64          = 0
+
+  // ============================================================================
+  // l2_tx_send(bar0, tx_ring_pa, dst_mac, ethertype, payload_pa,
+  //            payload_len) -> u64
+  // ============================================================================
+  //
+  // SysV: (bar0: u64, tx_ring_pa: u64, dst_mac: u64, ethertype: u64,
+  //        payload_pa: u64, payload_len: u64) -> u64
+  //   rdi = BAR0 base
+  //   rsi = physical address of the TX descriptor ring
+  //         (typically `lea _e1000e_tx_ring` under the identity-map alias)
+  //   rdx = pointer to 6-byte destination MAC
+  //   rcx = ethertype (u16 host-byte-order)
+  //   r8  = payload_pa (may be 0 iff payload_len == 0)
+  //   r9  = payload_len (bytes; must satisfy 14 + payload_len <= 2048)
+  //
+  // The source MAC is drawn from _e1000e_devices[0].mac (record +24;
+  // populated by e1000e_read_mac during driver-attach in R27.M2+).
+  // paideia-as v0.22 caps callable-fn arity at 6, so the 7-parameter
+  // shape from the R27.M3 design brief collapses src_mac into a
+  // device-slot lookup — the T14 G4 / QEMU target ships a single
+  // e1000e NIC at slot 0, and multi-NIC dispatch is deferred to R28+
+  // when the send path grows a device-context substrate.
+  //
+  // Returns rax:
+  //   0 = L2_TX_OK
+  //   1 = L2_TX_ERR_PAYLOAD_TOO_BIG (14 + payload_len > 2048)
+  //   2 = L2_TX_ERR_RING_FULL       ((tail+1)&127 == head)
+  //
+  // Register plan (6-push callee-save + 8-byte pad):
+  //   rbx = bar0
+  //   rbp = tx_ring_pa
+  //   r12 = tx_buf_pa (allocated buffer)
+  //   r13 = total_len (14 + payload_len)
+  //   r14 = tail (current _e1000e_tx_tail; new_tail = (tail+1)&127)
+  //   r15 = desc_pa (tx_ring_pa + tail * 16)
+  //
+  //   6 pushes = 48 B; entry rsp%16==8 -> 56, sub rsp,8 -> 64, %16==0
+  //   (aligned for nested eth_build + e1000e_reg_write_u32 calls).
+
+  pub let l2_tx_send : (u64, u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (bar0: u64, tx_ring_pa: u64, dst_mac: u64, ethertype: u64,
+        payload_pa: u64, payload_len: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R27-M3-003 (#983). L2 transmit: bump-alloc buffer + eth_build + descriptor publish + TDT bump. Body: (1) 6-push callee-save prologue (rbx=bar0, rbp=tx_ring_pa, r12=tx_buf_pa, r13=total_len, r14=tail, r15=desc_pa) + `sub rsp,8` — 48 + 8 = 56; entry rsp%16==8 -> 64, %16==0 (aligned for eth_build (nested rep_movsb + htons) + e1000e_reg_write_u32). Args rdx (dst_mac), rcx (ethertype), r8 (payload_pa), r9 (payload_len) are caller-save so we stash the ones we need past eth_build's clobber via the stack scratch [rsp+0..15] before entering the compute chain. (2) Size gate: cmp r9+14, 2048; jae l2tx_too_big — the 2 KiB buffer size matches L2_TX_BUF_SIZE (parallel to E1000E_RX_BUF_SIZE for symmetry with the RX pool). Actually implemented as: mov rax, r9; add rax, 14; cmp rax, 2048; ja l2tx_too_big. (3) Ring-full guard: load head = _e1000e_tx_head, tail = _e1000e_tx_tail. new_tail = (tail+1)&127. If new_tail == head -> l2tx_full. r14 = tail. (4) Bump-alloc buffer: idx = _l2_tx_buf_next; new_idx = (idx+1)&15; store new_idx back. tx_buf_pa = &_l2_tx_buffers + idx*2048. r12 = tx_buf_pa. (5) eth_build(tx_buf_pa=r12, dst_mac=[rsp+0 restore], src_mac_ptr=&_e1000e_devices[0].mac (base +24), ethertype=[rsp+8 restore], payload_pa=[rsp+16 restore], payload_len=r9). Args go: rdi=r12; rsi=[rsp+0]; rdx=lea+24; rcx=[rsp+8]; r8=[rsp+16]; r9=r14_orig. eth_build returns rax = total_len. r13 = rax. (6) Publish descriptor at &_e1000e_tx_ring + tail*16. r15 = desc_pa. Stores: u64 @+0 = tx_buf_pa; mov_w @+8 = total_len (u16); mov_b @+10 = 0 (cso); mov_b @+11 = 0x0B (EOP|IFCS|RS); mov_b @+12 = 0 (sta_rsv — HW writes DD on completion); mov_b @+13 = 0 (css); mov_w @+14 = 0 (special/VLAN). (7) Bump TDT + shadow: new_tail = (r14+1)&127; mov [rip + _e1000e_tx_tail], new_tail; e1000e_reg_write_u32(bar0, 0x3818, new_tail). This MMIO store triggers HW to fetch the descriptor. (8) Bump _l2_tx_pkts. (9) Return 0. Error paths: l2tx_too_big -> mov rax, 1; l2tx_full -> mov rax, 2. Reserved labels: `l2tx_`. Every nested callee preserves rbx/rbp/r12-r15 per SysV.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 40;                             // 24 scratch + 16 pad -> aligned
+
+        // Scratch layout (survives across eth_build):
+        //   [rsp+0]  = dst_mac ptr (was rdx)
+        //   [rsp+8]  = ethertype  (was rcx)
+        //   [rsp+16] = payload_pa (was r8)
+        //   [rsp+24] = payload_len(was r9)
+        mov [rsp + 0], rdx;
+        mov [rsp + 8], rcx;
+        mov [rsp + 16], r8;
+        mov [rsp + 24], r9;
+
+        mov rbx, rdi;                            // rbx = bar0
+        mov rbp, rsi;                            // rbp = tx_ring_pa
+
+        // ============================================================
+        // (2) Size gate: 14 + payload_len <= 2048
+        // ============================================================
+        mov rax, r9;
+        add rax, 14;
+        cmp rax, 2048;
+        ja l2tx_too_big;
+
+        // ============================================================
+        // (3) Ring-full guard.
+        // ============================================================
+        mov r14, [rip + _e1000e_tx_tail];        // r14 = tail
+        mov rax, r14;
+        add rax, 1;
+        and rax, 127;                            // new_tail = (tail+1)&127
+        mov rcx, [rip + _e1000e_tx_head];        // rcx = head
+        cmp rax, rcx;
+        je l2tx_full;
+
+        // ============================================================
+        // (4) Bump-alloc buffer from _l2_tx_buffers pool.
+        // ============================================================
+        mov rax, [rip + _l2_tx_buf_next];        // idx
+        mov rcx, rax;                            // save idx
+        add rax, 1;
+        and rax, 15;                             // new_idx = (idx+1)&15
+        mov [rip + _l2_tx_buf_next], rax;
+
+        // tx_buf_pa = &_l2_tx_buffers + idx*2048
+        mov rax, rcx;
+        shl rax, 11;                             // idx * 2048
+        lea r12, [rip + _l2_tx_buffers];
+        add r12, rax;
+
+        // ============================================================
+        // (5) eth_build(tx_buf, dst_mac, src_mac, ethertype, payload_pa,
+        //               payload_len)
+        //
+        // src_mac_ptr = &_e1000e_devices[0].mac = _e1000e_devices + 24.
+        // (Record +24; probe.pdx L66 comment.  Populated by
+        // e1000e_read_mac during driver-attach.)
+        // ============================================================
+        mov rdi, r12;                            // out_pa
+        mov rsi, [rsp + 0];                      // dst_mac
+        lea rdx, [rip + _e1000e_devices];
+        add rdx, 24;                             // src_mac ptr
+        mov rcx, [rsp + 8];                      // ethertype
+        mov r8, [rsp + 16];                      // payload_pa
+        mov r9, [rsp + 24];                      // payload_len
+        call eth_build;
+        mov r13, rax;                            // r13 = total_len
+
+        // ============================================================
+        // (6) Publish descriptor at &_e1000e_tx_ring + tail*16.
+        //     Prefer rbp (tx_ring_pa) so a caller-supplied ring aliases
+        //     to the canonical .bss ring via the same rbp base.
+        // ============================================================
+        mov rax, r14;                            // tail
+        shl rax, 4;                              // * 16
+        mov r15, rbp;
+        add r15, rax;                            // r15 = desc_pa
+
+        // desc.buffer_addr (u64 @+0) = tx_buf_pa
+        mov [r15 + 0], r12;
+
+        // desc.length (u16 @+8) = total_len
+        mov_w [r15 + 8], r13;
+
+        // desc.cso (u8 @+10) = 0
+        xor rax, rax;
+        mov_b [r15 + 10], rax;
+
+        // desc.cmd (u8 @+11) = EOP | IFCS | RS = 0x0B
+        mov rax, 0x0B;
+        mov_b [r15 + 11], rax;
+
+        // desc.sta_rsv (u8 @+12) = 0 (HW writes STA.DD on completion)
+        xor rax, rax;
+        mov_b [r15 + 12], rax;
+
+        // desc.css (u8 @+13) = 0
+        mov_b [r15 + 13], rax;
+
+        // desc.special (u16 @+14) = 0
+        mov_w [r15 + 14], rax;
+
+        // ============================================================
+        // (7) Advance shadow + program TDT.
+        // ============================================================
+        mov rax, r14;
+        add rax, 1;
+        and rax, 127;                            // new_tail
+        mov [rip + _e1000e_tx_tail], rax;
+
+        mov rdi, rbx;                            // bar0
+        mov rsi, 0x3818;                         // E1000E_REG_TDT
+        mov rdx, rax;                            // new_tail
+        call e1000e_reg_write_u32;
+
+        // ============================================================
+        // (8) Bump _l2_tx_pkts.
+        // ============================================================
+        mov rax, [rip + _l2_tx_pkts];
+        add rax, 1;
+        mov [rip + _l2_tx_pkts], rax;
+
+        // ============================================================
+        // (9) Success.
+        // ============================================================
+        xor rax, rax;                            // L2_TX_OK
+        jmp l2tx_ret;
+
+      l2tx_too_big:
+        mov rax, 1;                              // L2_TX_ERR_PAYLOAD_TOO_BIG
+        jmp l2tx_ret;
+
+      l2tx_full:
+        mov rax, 2;                              // L2_TX_ERR_RING_FULL
+
+      l2tx_ret:
+        add rsp, 40;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
