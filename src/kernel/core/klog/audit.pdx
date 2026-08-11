@@ -1,0 +1,370 @@
+// src/kernel/core/klog/audit.pdx — logging-m9-003 (#710) audit-log bridge
+//
+// Per design/kernel/kernel-logging-substrate.md §12.10 + design/audit/log-structure.md:
+//
+//   "Audit-log bridge — a subset of PANIC + selected ERROR lines forwarded
+//    to the persistent audit log per design/audit/log-structure.md."
+//
+// Design constraints resolved:
+//
+//   1. The kernel dmesg ring is VOLATILE (§1 non-goal-1); the audit log at
+//      /system/audit/log.pdaudit is the durable, tamper-evident record.
+//      These are disjoint substrates — the bridge is a one-way filter from
+//      dmesg into audit; the audit log is not itself a klog.
+//
+//   2. klog_emit_core runs under a strict re-entrancy gate
+//      (_klog_in_progress_bsp) and cli, so we CANNOT call vfs_write /
+//      tmpfs_write directly from inside its critical section (any nested
+//      klog from a locked file-system path would silently drop, and any
+//      lock/allocator inside vfs_write would run under cli+ring-gate —
+//      hazardous). Instead, klog_audit_forward writes into a dedicated
+//      in-kernel audit ring (private from the dmesg ring, private from the
+//      re-entrancy gate), and klog_audit_flush is invoked from outside the
+//      critical section (a witness or a future periodic-drain hook) to
+//      copy the ring into the audit-log inode via a raw tmpfs_write.
+//
+//   3. R25 delivered pdxfs-lite but no boot-time mount of a real backing
+//      store lands in the qemu smoke path; /system/audit/log.pdaudit is
+//      seeded on tmpfs by the audit-bridge witness in kernel_main.pdx and
+//      its inode index is stashed in _klog_audit_log_inode. A future
+//      landing that mounts pdxfs-lite at boot points the same slot at the
+//      persistent inode and the bridge picks it up transparently.
+//
+// Level filter: only PANIC (0) + ERROR (1). WARN/INFO/DEBUG/TRACE never
+// enter the audit stream (their volume would overwhelm a tamper-evident
+// log and dilute its evidentiary weight).
+//
+// Ring semantics: fixed 16 KiB in-kernel buffer, monotonic head/tail (same
+// discipline as the dmesg ring — u64 counters, drop-oldest on wrap). The
+// audit ring is small on purpose: it accumulates only PANIC+ERROR under
+// steady state, and a healthy boot emits << 16 KiB of such lines.
+//
+// Audit: design/kernel/kernel-logging-substrate.md §12.10, §1 non-goal-1
+//        design/audit/log-structure.md §1 on-disk structure.
+
+module Audit = structure {
+  // === Constants ===
+  pub let KLOG_AUDIT_RING_SIZE : u64 = 16384    // 16 KiB
+  pub let KLOG_AUDIT_RING_MASK : u64 = 0x3FFF   // KLOG_AUDIT_RING_SIZE - 1
+
+  // === Storage (.bss slab; head/tail in .data) ===
+  pub let mut _klog_audit_buf  : [u8; 16384] = uninit @align(8)
+  pub let mut _klog_audit_head : u64 = 0
+  pub let mut _klog_audit_tail : u64 = 0
+
+  // Bridge readiness: set to 1 by kernel_main.pdx's audit-bridge witness
+  // after /system/audit/log.pdaudit is created + _klog_audit_log_inode is
+  // populated. Guards klog_audit_forward — pre-ready lines are dropped
+  // (they belong to the boot-witness noise before the audit substrate is
+  // available). Once set to 1, remains set for the lifetime of the kernel.
+  pub let mut _klog_audit_ready : u64 = 0
+
+  // Inode-index of /system/audit/log.pdaudit — populated by the boot
+  // witness. Reads through tmpfs_write for the drain path (raw, so no
+  // vfs_open/close overhead on each flush; the audit log has a single
+  // stable identity for the lifetime of the tmpfs seed).
+  pub let mut _klog_audit_log_inode : u64 = 0
+
+  // Persistent write-offset into the audit inode — advances by the number
+  // of bytes each flush appends. Ensures successive flushes append rather
+  // than overwrite. Never rewinds — the audit log is strictly append-only
+  // per design/audit/log-structure.md AUD-D2.
+  pub let mut _klog_audit_log_offset : u64 = 0
+
+  // ========================================================================
+  // klog_audit_forward(level: u64, line_ptr: u64, line_len: u64)
+  //
+  // Filter + append. Called from klog_emit_core AFTER klog_ring_write
+  // returns, still inside the re-entrancy gate + cli. Must be strictly
+  // side-effect-free w.r.t. the file system: any vfs / tmpfs call from
+  // here would recursively enter klog and be silently dropped by the
+  // gate. Append writes into _klog_audit_buf and returns.
+  //
+  // Register discipline (SysV): rdi=level, rsi=line_ptr, rdx=line_len.
+  // Preserves rbx (callee-save). Clobbers rax, rcx, r8-r11.
+  // ========================================================================
+  pub let klog_audit_forward : (u64, u64, u64) -> () !{mem} @{} =
+    fn (level: u64) (line_ptr: u64) (line_len: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "logging-m9-003 (#710) audit-bridge append. Level filter first (cheapest reject — level > 1 fast-paths out; ~99% of klog lines). Then readiness check — pre-witness lines are dropped as they belong to boot noise before /system/audit/log.pdaudit exists. Then split-copy append into _klog_audit_buf with drop-oldest overflow (same discipline as klog_ring_write): (1) snapshot head; (2) wrap_idx = head & MASK; (3) space_to_end = SIZE - wrap_idx; (4) if len <= space_to_end single-copy else split-copy; (5) head += len; (6) if head-tail > SIZE, tail = head - SIZE. Byte copies use mov_b [dst], al pattern (proven idiom; avoids paideia-as#1270). Callee-save discipline: push rbx to stash line_ptr; rdi/rsi/rdx consumed as SysV args. Runs inside klog_emit_core's re-entrancy gate + cli, so no concurrency guard needed here; no nested klog / vfs call (see file-level comment on why fs ops MUST NOT land here).",
+      block: {
+        // Fast reject: level > 1 (only PANIC=0 and ERROR=1 are forwarded).
+        cmp rdi, 1;
+        ja audit_forward_return;
+
+        // Readiness gate: bridge disabled until witness arms it.
+        mov rax, [rip + _klog_audit_ready];
+        cmp rax, 0;
+        je audit_forward_return;
+
+        // len == 0 short-circuit.
+        cmp rdx, 0;
+        je audit_forward_return;
+
+        push rbx;
+
+        // Snapshot head.
+        mov rcx, [rip + _klog_audit_head];
+        // wrap_idx = head & MASK
+        mov r8, rcx;
+        and r8, 0x3FFF;                      // r8 = wrap_idx
+        // space_to_end = SIZE - wrap_idx
+        mov r9, 16384;
+        sub r9, r8;                          // r9 = space_to_end
+
+        // Decide split vs single copy.
+        cmp rdx, r9;
+        jbe audit_forward_single;
+
+        // === SPLIT COPY ===
+        // First half: r9 bytes from [line_ptr] into [_klog_audit_buf + wrap_idx].
+        lea r10, [rip + _klog_audit_buf];
+        add r10, r8;                         // r10 = &buf[wrap_idx]
+        mov rbx, rsi;                        // rbx = source cursor
+        mov r11, r9;                         // r11 = byte count (space_to_end)
+
+        audit_forward_split_first:
+        cmp r11, 0;
+        je audit_forward_split_second_start;
+        mov al, [rbx + 0];
+        mov_b [r10 + 0], al;
+        inc rbx;
+        inc r10;
+        dec r11;
+        jmp audit_forward_split_first;
+
+        audit_forward_split_second_start:
+        // Second half: (len - space_to_end) bytes from [line_ptr + space_to_end]
+        // into [_klog_audit_buf + 0].
+        mov r11, rdx;
+        sub r11, r9;                         // r11 = remaining bytes
+        lea r10, [rip + _klog_audit_buf];    // r10 = &buf[0]
+
+        audit_forward_split_second:
+        cmp r11, 0;
+        je audit_forward_advance;
+        mov al, [rbx + 0];
+        mov_b [r10 + 0], al;
+        inc rbx;
+        inc r10;
+        dec r11;
+        jmp audit_forward_split_second;
+
+        // === SINGLE COPY ===
+        audit_forward_single:
+        lea r10, [rip + _klog_audit_buf];
+        add r10, r8;                         // r10 = &buf[wrap_idx]
+        mov rbx, rsi;                        // rbx = source cursor
+        mov r11, rdx;                        // r11 = byte count (len)
+
+        audit_forward_single_loop:
+        cmp r11, 0;
+        je audit_forward_advance;
+        mov al, [rbx + 0];
+        mov_b [r10 + 0], al;
+        inc rbx;
+        inc r10;
+        dec r11;
+        jmp audit_forward_single_loop;
+
+        // Advance head.
+        audit_forward_advance:
+        add rcx, rdx;                        // rcx = head + len
+        mov [rip + _klog_audit_head], rcx;
+
+        // Drop-oldest: if head - tail > SIZE, tail = head - SIZE.
+        mov rax, rcx;                        // rax = new head
+        mov r10, [rip + _klog_audit_tail];   // r10 = tail
+        sub rax, r10;                        // rax = head - tail
+        cmp rax, 16384;
+        jbe audit_forward_done;
+
+        mov rax, rcx;
+        sub rax, 16384;                      // tail = head - SIZE
+        mov [rip + _klog_audit_tail], rax;
+
+        audit_forward_done:
+        pop rbx;
+
+        audit_forward_return:
+        ret;
+      }
+    }
+
+  // ========================================================================
+  // klog_audit_flush() -> u64
+  //
+  // Drain: copy [_klog_audit_buf[tail..head]] into the audit-log inode
+  // via tmpfs_write, then advance both the ring tail and the persistent
+  // log offset. Returns the number of bytes flushed.
+  //
+  // Called from OUTSIDE klog_emit_core's critical section (witnesses,
+  // future periodic drain hooks). Safe to call vfs / tmpfs from here.
+  //
+  // Boundary handling: if the ring's live window spans the buffer wrap
+  // point ((tail & MASK) + n > SIZE), the flush splits into two
+  // tmpfs_write calls — first the tail-to-end chunk, then the 0-to-head
+  // wrap chunk. Persistent log_offset advances by the TOTAL bytes across
+  // both writes.
+  //
+  // Ring integrity: if the ring's window is SIZE (buffer is completely
+  // full due to overflow drops), the flush still writes the current
+  // [tail..head] window; overrun lines were dropped by klog_audit_forward's
+  // drop-oldest step and are not recoverable — POSIX dmesg-style semantics.
+  //
+  // Return value: bytes appended to the audit log this call.
+  // ========================================================================
+  pub let klog_audit_flush : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: {},
+      justification: "logging-m9-003 (#710) audit-log drain. Runs outside klog_emit_core's cli+gate section — safe to invoke tmpfs_write. (1) Bail-out if _klog_audit_ready == 0 (inode unmapped) or _klog_audit_log_inode == 0 (belt-and-braces). (2) Snapshot head, tail. (3) n = head - tail; if 0, return 0. (4) start_idx = tail & MASK. (5) if start_idx + n <= SIZE, single-write; else split at boundary. (6) Each tmpfs_write call: rdi=inode_idx, rsi=&buf[start], rdx=chunk_len, rcx=log_offset. rax = bytes_written. Advance both ring tail and log_offset by rax. Halt on tmpfs_write failure (rax indicates SYS_WRITE_ERR_* sentinel or 0xFFFFFFFFFFFFFFFF; treat non-progress as terminal — the audit log entered a broken state, which is itself observable via subsequent flush retries). Callee-save discipline: 4-push prologue (rbx, r12, r13, r14) — rbx=inode_idx, r12=running tail, r13=head, r14=cumulative bytes flushed. rsp%16==8+32=8 (0 mod 16) into first nested call — no extra pad needed. Return cumulative bytes in rax.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        // Readiness / inode-populated guard.
+        mov rax, [rip + _klog_audit_ready];
+        cmp rax, 0;
+        je audit_flush_zero;
+        mov rbx, [rip + _klog_audit_log_inode];
+        cmp rbx, 0;
+        je audit_flush_zero;
+
+        // Snapshot head + tail.
+        mov r13, [rip + _klog_audit_head];   // r13 = head
+        mov r12, [rip + _klog_audit_tail];   // r12 = tail
+
+        // n = head - tail
+        mov r14, r13;
+        sub r14, r12;                        // r14 = pending bytes total
+        cmp r14, 0;
+        je audit_flush_zero;
+
+        // Cap n at ring size (defensive — if the ring overflowed the
+        // drop-oldest step in forward already set tail = head - SIZE, so
+        // n <= SIZE by construction; this guard is belt-and-braces).
+        mov rax, 16384;
+        cmp r14, rax;
+        jbe audit_flush_n_ok;
+        mov r14, rax;
+      audit_flush_n_ok:
+
+        // start_idx = tail & MASK
+        mov rcx, r12;
+        and rcx, 0x3FFF;                     // rcx = start_idx
+
+        // space_to_end = SIZE - start_idx
+        mov r8, 16384;
+        sub r8, rcx;                         // r8 = space_to_end
+
+        // Decide single vs split.
+        cmp r14, r8;
+        jbe audit_flush_single;
+
+        // === SPLIT ===
+        // First chunk: [tail..end], space_to_end bytes.
+        mov rdi, rbx;                        // arg0 = inode_idx
+        lea rsi, [rip + _klog_audit_buf];
+        add rsi, rcx;                        // arg1 = &buf[start_idx]
+        mov rdx, r8;                         // arg2 = space_to_end
+        mov rcx, [rip + _klog_audit_log_offset];  // arg3 = log_offset
+        // #672: SysV alignment pad. Entry rsp%16==8; 4 pushes above -> %16==8.
+        //   `call` pushes RA → %16==0 for callee entry. No extra pad needed.
+        call tmpfs_write;
+
+        // Check tmpfs_write status. 0 or huge negative = failure; positive
+        // in [1, space_to_end] = bytes written. Treat any short-write as
+        // partial success and advance by rax; on 0 or 0xFFFFFFFFFFFFFF__
+        // treat as terminal fail.
+        cmp rax, 0;
+        je audit_flush_terminal;
+        cmp rax, r8;
+        ja audit_flush_terminal;             // rax > space_to_end is an errno
+
+        // Advance ring tail, log_offset by rax.
+        add r12, rax;
+        mov r10, [rip + _klog_audit_log_offset];
+        add r10, rax;
+        mov [rip + _klog_audit_log_offset], r10;
+        mov [rip + _klog_audit_tail], r12;
+        // r14 is total bytes flushed cumulative; add rax to it? For the
+        // FIRST chunk we haven't accumulated yet — start fresh here.
+        mov r14, rax;
+
+        // Second chunk: [0..head], remaining bytes.
+        mov r9, r13;
+        sub r9, r12;                         // r9 = remaining
+        cmp r9, 0;
+        je audit_flush_done;
+
+        mov rdi, rbx;                        // arg0 = inode_idx
+        lea rsi, [rip + _klog_audit_buf];    // arg1 = &buf[0]
+        mov rdx, r9;                         // arg2 = remaining
+        mov rcx, [rip + _klog_audit_log_offset];
+        call tmpfs_write;
+
+        cmp rax, 0;
+        je audit_flush_done;                 // partial: return what we already flushed
+        cmp rax, r9;
+        ja audit_flush_done;                 // errno on second chunk — first chunk already committed
+
+        add r12, rax;
+        mov r10, [rip + _klog_audit_log_offset];
+        add r10, rax;
+        mov [rip + _klog_audit_log_offset], r10;
+        mov [rip + _klog_audit_tail], r12;
+        add r14, rax;
+        jmp audit_flush_done;
+
+        // === SINGLE ===
+        audit_flush_single:
+        mov rdi, rbx;                        // arg0 = inode_idx
+        lea rsi, [rip + _klog_audit_buf];
+        add rsi, rcx;                        // arg1 = &buf[start_idx]
+        mov rdx, r14;                        // arg2 = n
+        mov rcx, [rip + _klog_audit_log_offset];
+        call tmpfs_write;
+
+        cmp rax, 0;
+        je audit_flush_terminal;
+        cmp rax, r14;
+        ja audit_flush_terminal;             // rax > n is an errno
+
+        add r12, rax;
+        mov r10, [rip + _klog_audit_log_offset];
+        add r10, rax;
+        mov [rip + _klog_audit_log_offset], r10;
+        mov [rip + _klog_audit_tail], r12;
+        mov r14, rax;
+
+        audit_flush_done:
+        mov rax, r14;                        // return bytes flushed
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        audit_flush_zero:
+        xor rax, rax;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        audit_flush_terminal:
+        // Terminal failure — return 0, leave tail unchanged.
+        xor rax, rax;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

@@ -310,6 +310,38 @@ sys_dmesg_ok_msg: .ascii "R18 SYS DMESG OK\n\0"
 .align 8
 sys_dmesg_fail_msg: .ascii "R18 SYS DMESG FAIL\n\0"
 
+# logging-m9-003 (#710): audit-log bridge witness — paths, tag, markers.
+.global system_dir_name
+.align 8
+system_dir_name: .ascii "system\0"
+
+.global audit_dir_name
+.align 8
+audit_dir_name: .ascii "audit\0"
+
+.global audit_log_name
+.align 8
+audit_log_name: .ascii "log.pdaudit\0"
+
+.global audit_bridge_ok_msg
+.align 8
+audit_bridge_ok_msg: .ascii "R18 AUDIT BRIDGE OK\n\0"
+
+.global audit_bridge_fail_msg
+.align 8
+audit_bridge_fail_msg: .ascii "R18 AUDIT BRIDGE FAIL\n\0"
+
+# Tag emitted during the ERROR-level test line to make it grep-recognizable
+# in the audit log after flush.
+.global audit_test_tag
+.align 8
+audit_test_tag: .ascii "AUDIT TEST\0"
+
+# Scratch buffer the audit bridge witness copies the audit log content into.
+.global _audit_bridge_witness_scratch
+.align 8
+_audit_bridge_witness_scratch: .zero 4096
+
 .global init_boot_fail_msg
 .align 8
 init_boot_fail_msg: .ascii "INIT BOOT FAIL\n\0"
