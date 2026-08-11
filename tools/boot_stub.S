@@ -286,6 +286,21 @@ bin_true_seed_ok_msg: .ascii "R17 BIN TRUE SEED OK\n\0"
 .align 8
 bin_true_seed_fail_msg: .ascii "R17 BIN TRUE SEED FAIL\n\0"
 
+# logging-m9-001 (#708): KIND_DMESG cap witness strings and markers.
+# See design/kernel/kernel-logging-substrate.md §12.10 + §14 Q6.
+.global dmesg_cap_ok_msg
+.align 8
+dmesg_cap_ok_msg: .ascii "R18 DMESG CAP OK\n\0"
+
+.global dmesg_cap_fail_msg
+.align 8
+dmesg_cap_fail_msg: .ascii "R18 DMESG CAP FAIL\n\0"
+
+# Scratch buffer the DMESG cap witness copies ring bytes into for OP_READ_TAIL.
+.global _dmesg_cap_witness_scratch
+.align 8
+_dmesg_cap_witness_scratch: .zero 512
+
 .global init_boot_fail_msg
 .align 8
 init_boot_fail_msg: .ascii "INIT BOOT FAIL\n\0"
