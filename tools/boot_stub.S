@@ -1399,6 +1399,42 @@ endpoint_alloc_ok_msg: .ascii "R20b ENDPOINT ALLOC OK\n\0"
 endpoint_alloc_fail_msg: .ascii "R20b ENDPOINT ALLOC FAIL\n\0"
 
 
+# R20b.M1-003 (#1554): svc_broker table + register/lookup witness
+# fingerprints — closes M1. Exercises svc_register (name-too-long
+# rejection, duplicate rejection, install success) + svc_lookup
+# (register/lookup round-trip on 'svc.test'). See
+# src/kernel/core/ipc/svc_broker.pdx.
+.global broker_ok_msg
+.align 8
+broker_ok_msg: .ascii "R20b BROKER OK\n\0"
+
+.global broker_fail_msg
+.align 8
+broker_fail_msg: .ascii "R20b BROKER FAIL\n\0"
+
+# svc.<name> strings for the R20b.M1-003 (#1554) broker witness.
+# ASCII bytes only; no NUL required (svc_register / svc_lookup are
+# length-explicit), but a trailing NUL keeps the buffer safe for casual
+# byte-level inspection during debugging. The "long" buffer is 32 raw
+# bytes so passing name_len=32 into svc_register triggers the
+# name-too-long gate WITHOUT reading past a shorter buffer.
+.global _svc_broker_witness_name_test
+.align 8
+_svc_broker_witness_name_test: .ascii "svc.test\0"
+
+.global _svc_broker_witness_name_other
+.align 8
+_svc_broker_witness_name_other: .ascii "svc.other\0"
+
+.global _svc_broker_witness_name_short
+.align 8
+_svc_broker_witness_name_short: .ascii "svc.a\0"
+
+.global _svc_broker_witness_name_long
+.align 8
+_svc_broker_witness_name_long: .ascii "abcdefghijklmnopqrstuvwxyz012345"  # 32 bytes, no NUL
+
+
 # M1-003 (#685): Re-entrancy gate for klog_emit_core (accessible from high-half kernel code)
 # M3-002 (#690): int3 breakpoint stub — emit breakpoint exception (vec 3)
 .section .text, "ax", @progbits

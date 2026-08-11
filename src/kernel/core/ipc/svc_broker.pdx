@@ -1,0 +1,344 @@
+// src/kernel/core/ipc/svc_broker.pdx — R20b.M1-003 (#1554)
+// 32-slot static broker table mapping svc.<name> -> endpoint_id, plus
+// svc_register / svc_lookup primitives.
+//
+// Design context
+// --------------
+// Per design/ipc/userspace-server-substrate.md §3.3, the broker is the
+// name-resolution layer above the endpoint_table (M1-002). It closes
+// the M1 milestone: KIND_IPC_ENDPOINT (M1-001) provides the descriptor
+// tail, endpoint_table + payload_arena (M1-002) provide the storage
+// substrate, and the broker (this file) publishes named endpoints so
+// clients can find them without hard-coding numeric ids.
+//
+//   BrokerEntry (48 bytes)
+//     +0    u8[32]  name             (NUL-terminated, <= 31 chars)
+//     +32   u16     endpoint_id
+//     +34   u16     reserved
+//     +36   u32     rights_gate      (reserved at M1-003; M3-004 wrapper will
+//                                     mint caps with this mask -- see §3.3)
+//     +40   u64     reserved         (future: session_state pointer)
+//
+// 32 rows x 48 bytes = 1536 B total. Static .bss, zero-initialized by
+// zero_bss.pdx. Fresh table => every row starts with name[0]==0 (free).
+//
+// Milestone scope
+// ---------------
+// This file lands the KERNEL-SIDE primitives only. The user-visible
+// syscall wrapper (sys_svc_lookup, sysno 43) lands in R20b.M3-004; that
+// wrapper will additionally mint a cap into the caller's cap_table via
+// the row's rights_gate field. At M1-003, rights_gate stays zero on
+// every registered row -- the field is reserved for the M3-004 wrap-in.
+//
+// The issue-specified 3-arg svc_register(name_ptr, name_len, endpoint_id)
+// is the M1-003 signature; the design doc's 4-arg form with rights_gate
+// is the M3-004 form. Kernel-side primitives at M1-003 stay 3-arg so the
+// witness plumbing that closes M1 doesn't hard-code a rights convention
+// before the syscall shim is designed. When M3-004 lands, svc_register
+// grows a rights_gate parameter and populates the +36 field.
+//
+// Free-row discipline
+// -------------------
+// A row is "free" iff its name[0] byte is zero. On fresh .bss every row
+// satisfies this. There is no svc_unregister at R20b (add-only semantics
+// through the whole M1 milestone), so the "free" set only shrinks; the
+// invariant that free rows have name[0]==0 holds inductively.
+//
+// Add-only means: once a name is registered, its row stays live for the
+// life of the kernel. This matches the userspace-server substrate's
+// bootstrap model -- daemons register at boot and never de-register.
+// A later round adds svc_unregister when server-restart lands.
+//
+// Match discipline
+// ----------------
+// A row matches an input name iff:
+//   - the first `name_len` bytes of row[0..name_len] equal input[0..name_len],
+//   - AND row[name_len] == 0 (the row's NUL sits exactly at that offset).
+// This prevents a 4-byte query "svc.foo" from matching a registered
+// "svc.foobar" (which has row[7]='b', not 0). Matches the pdxl_lu_strncmp
+// pattern at src/kernel/core/fs/pdxfs_lite/readdir.pdx:336.
+//
+// Concurrency
+// -----------
+// No spinlock at R20b -- single-flow phase-1 substrate matches the
+// endpoint_table's concurrency posture (design §14 Q3). SMP-safe register
+// arrives with the same round that adds per-row locking to the endpoint
+// table.
+
+module SvcBroker = structure {
+
+  // ============================================================================
+  // Table geometry (pinned by design/ipc/userspace-server-substrate.md §3.3)
+  // ============================================================================
+
+  pub let BROKER_TABLE_SLOTS     : u64 = 32
+  pub let BROKER_ROW_BYTES       : u64 = 48
+  pub let BROKER_TABLE_BYTES     : u64 = 1536        // 32 * 48
+  pub let BROKER_NAME_BUF_BYTES  : u64 = 32          // includes NUL
+  pub let BROKER_NAME_MAX        : u64 = 31          // NUL terminator claims byte 31
+
+  // ============================================================================
+  // Row-field offsets (bytes, from row base)
+  // ============================================================================
+
+  pub let BROKER_OFF_NAME          : u64 = 0
+  pub let BROKER_OFF_ENDPOINT_ID   : u64 = 32
+  pub let BROKER_OFF_RESERVED_34   : u64 = 34
+  pub let BROKER_OFF_RIGHTS_GATE   : u64 = 36
+  pub let BROKER_OFF_RESERVED_40   : u64 = 40
+
+  // ============================================================================
+  // Result codes for svc_register.
+  //
+  // Distinct u64 codes rather than a boolean, so the witness (and the
+  // future M3-004 syscall wrapper) can differentiate error categories
+  // per the issue AC: "svc_register refuses duplicates and returns a
+  // distinct error for name-too-long." Success == 0 is the standard
+  // convention across the kernel (endpoint_cap_mint, cap_mint_write).
+  // ============================================================================
+
+  pub let SVC_REGISTER_OK            : u64 = 0
+  pub let SVC_REGISTER_ERR_NAME_LEN  : u64 = 1       // name_len == 0 or > 31
+  pub let SVC_REGISTER_ERR_DUPLICATE : u64 = 2       // name already registered
+  pub let SVC_REGISTER_ERR_TABLE_FULL: u64 = 3       // all 32 rows in use
+
+  // ============================================================================
+  // Sentinels for svc_lookup.
+  //
+  // SVC_LOOKUP_NONE mirrors ENDPOINT_ALLOC_NONE (0xFFFFFFFFFFFFFFFF) so
+  // callers can use the same "-1 means not-found" convention across the
+  // IPC substrate. Valid endpoint_ids are in [0..127] (endpoint_table
+  // capacity), so -1 is unambiguously distinct.
+  // ============================================================================
+
+  pub let SVC_LOOKUP_NONE : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ============================================================================
+  // Storage -- 32 rows x 48 bytes = 1536 B = 192 u64s, @align(64).
+  //
+  // @align(64) puts the table start on a cache-line boundary. Rows are
+  // 48 B each, so only rows 0, 4, 8, ... land on cache-line starts (same
+  // arithmetic as endpoint_table.pdx; the 48-vs-64 coprime story is the
+  // same). Per-row @align(64) would waste 16 B per row (~0.5 KiB total)
+  // for no observable benefit at R20b (single-flow, no contention).
+  // ============================================================================
+
+  pub let mut _svc_broker_table : [u64; 192] = uninit @align(64)
+
+  // ==========================================================================
+  // svc_register(name_ptr: u64, name_len: u64, endpoint_id: u64) -> u64
+  //
+  // SysV ABI: rdi=name_ptr, rsi=name_len, rdx=endpoint_id -> rax=result.
+  //
+  // Gates + install:
+  //   1. name_len in [1..31] -- else SVC_REGISTER_ERR_NAME_LEN.
+  //   2. Full-table scan: if any live row matches (per §match discipline),
+  //      return SVC_REGISTER_ERR_DUPLICATE. Also tracks the first free row
+  //      seen (row where name[0]==0) so a full-scan-with-no-dup can
+  //      immediately claim it without a second pass.
+  //   3. If no free row was seen -> SVC_REGISTER_ERR_TABLE_FULL.
+  //   4. Copy name_len bytes into row[0..name_len], write NUL at
+  //      row[name_len], store endpoint_id at row+32 (packed u64 that
+  //      also zeroes reserved u16 + rights_gate u32 at +34..+39).
+  //
+  // The scan MUST complete every row before claiming, even after a free
+  // row is seen -- duplicates might sit at a higher row index than the
+  // first free row (e.g. after a hypothetical unregister opened a hole).
+  // At M1-003 with add-only semantics this can't happen, but the scan
+  // still runs the full 32 rows to keep the register discipline forward-
+  // compatible with a future svc_unregister.
+  // ==========================================================================
+
+  pub let svc_register : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (name_ptr: u64, name_len: u64, endpoint_id: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R20b.M1-003 (#1554): full-table scan of _svc_broker_table (32 rows x 48 B). Gate name_len in [1..31] -> return SVC_REGISTER_ERR_NAME_LEN (1) if out of range (empty name is meaningless as a key; 32-byte name buffer needs a NUL byte). Outer scan (r8=row cursor, r9=row idx, r10=first-free tracking sentinel initialised to 0=not-yet-found). For each row: (a) if name[0] (byte at [r8+0]) is zero -> row is free -> record r10 = r8 iff r10 was still zero, then advance; (b) else -- inline strncmp-with-NUL-tail match against input (rdi+r11): mismatch at any i in [0..name_len) -> advance; full name_len match AND [r8+name_len]==0 -> duplicate -> return SVC_REGISTER_ERR_DUPLICATE (2). Loop advances r8 += 48 (BROKER_ROW_BYTES) and r9 += 1 each iteration. Post-scan: if r10==0 (no free row) -> return SVC_REGISTER_ERR_TABLE_FULL (3). Install into r10: inner byte-copy loop of name_len bytes from rdi into [r10+i], write NUL at [r10+name_len], then pack (endpoint_id & 0xFFFF) as u64 at [r10+32] -- this single 64-bit store covers +32..+39 (u16 endpoint_id + u16 reserved + u32 rights_gate), leaving reserved=0 and rights_gate=0 as the M1-003 milestone requires (rights_gate populated by the M3-004 syscall wrapper). Return SVC_REGISTER_OK (0) in rax. Add-only semantics at R20b: no unregister; free rows only shrink, so name[0]==0 iff row zero-init still holds. Register plan: rdi/rsi/rdx = args (preserved), r8=row cursor, r9=row idx, r10=first-free ptr, r11=inner-loop i, rax/rcx=byte load scratch. Leaf function (no callee-save writes). mov_b [reg+reg*1] scaled indexing proven in path.pdx L141, readdir.pdx L349, pdxfs_lite/create.pdx L136.",
+      block: {
+        // ---- Gate: name_len in [1..31] ----
+        cmp rsi, 0;
+        je  svc_reg_bad_name;
+        cmp rsi, 31;                       // BROKER_NAME_MAX
+        ja  svc_reg_bad_name;
+
+        // ---- Scan initialization ----
+        lea r8, [rip + _svc_broker_table]; // r8 = row cursor at table base
+        xor r9, r9;                        // r9 = row idx (0..31)
+        xor r10, r10;                      // r10 = first-free row ptr (0 = not-yet-found)
+
+      svc_reg_scan:
+        cmp r9, 32;                        // BROKER_TABLE_SLOTS
+        jae svc_reg_scan_done;
+
+        // Test row[0] byte to classify free (== 0) vs live (!= 0).
+        xor rax, rax;
+        mov_b rax, [r8];
+        cmp rax, 0;
+        je  svc_reg_row_free;
+
+        // ---- Live row: inline name compare ----
+        xor r11, r11;                      // i = 0
+
+      svc_reg_cmp_loop:
+        cmp r11, rsi;                      // i == name_len?
+        je  svc_reg_cmp_check_tail;
+
+        xor rax, rax;
+        mov_b rax, [rdi + r11*1];          // input[i]
+        xor rcx, rcx;
+        mov_b rcx, [r8 + r11*1];           // row[i]
+        cmp rax, rcx;
+        jne svc_reg_row_advance;
+
+        add r11, 1;
+        jmp svc_reg_cmp_loop;
+
+      svc_reg_cmp_check_tail:
+        // Matched name_len bytes; row[name_len] must be 0 (NUL) for exact match.
+        xor rcx, rcx;
+        mov_b rcx, [r8 + r11*1];           // row[name_len]
+        cmp rcx, 0;
+        jne svc_reg_row_advance;           // row is longer -> prefix, not dup
+
+        // Duplicate.
+        mov rax, 2;                        // SVC_REGISTER_ERR_DUPLICATE
+        ret;
+
+      svc_reg_row_free:
+        // Remember first free row without overwriting a prior find.
+        cmp r10, 0;
+        jne svc_reg_row_advance;
+        mov r10, r8;
+
+      svc_reg_row_advance:
+        add r8, 48;                        // BROKER_ROW_BYTES
+        add r9, 1;
+        jmp svc_reg_scan;
+
+      svc_reg_scan_done:
+        // No duplicate found. Need a free row to install into.
+        cmp r10, 0;
+        je  svc_reg_table_full;
+
+        // ---- Install into r10 ----
+        xor r11, r11;                      // i = 0
+
+      svc_reg_install_loop:
+        cmp r11, rsi;                      // i == name_len?
+        je  svc_reg_install_terminate;
+
+        xor rax, rax;
+        mov_b rax, [rdi + r11*1];          // input[i]
+        mov_b [r10 + r11*1], rax;          // row[i] = input[i]
+        add r11, 1;
+        jmp svc_reg_install_loop;
+
+      svc_reg_install_terminate:
+        // NUL-terminate at row[name_len] (name_len <= 31 by gate, so
+        // this always stays inside the 32-byte name buffer).
+        xor rax, rax;
+        mov_b [r10 + r11*1], rax;
+
+        // Pack endpoint_id (low 16 bits) as a u64 store at row+32.
+        // Byte layout after this store:
+        //   [+32..+33] = endpoint_id (u16, LE)
+        //   [+34..+35] = 0           (u16 reserved)
+        //   [+36..+39] = 0           (u32 rights_gate; populated by M3-004)
+        // The reserved u64 at +40 stays zero (either never written since
+        // .bss zero-init, or explicitly zeroed by a future unregister).
+        mov rax, rdx;
+        and rax, 0xFFFF;                   // mask to u16 endpoint_id
+        mov [r10 + 32], rax;               // BROKER_OFF_ENDPOINT_ID
+
+        xor rax, rax;                      // SVC_REGISTER_OK
+        ret;
+
+      svc_reg_bad_name:
+        mov rax, 1;                        // SVC_REGISTER_ERR_NAME_LEN
+        ret;
+
+      svc_reg_table_full:
+        mov rax, 3;                        // SVC_REGISTER_ERR_TABLE_FULL
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // svc_lookup(name_ptr: u64, name_len: u64) -> u64
+  //
+  // SysV ABI: rdi=name_ptr, rsi=name_len -> rax=endpoint_id (u16 zero-
+  // extended) on hit, or SVC_LOOKUP_NONE (0xFFFFFFFFFFFFFFFF) on miss.
+  //
+  // Any name_len outside [1..31] returns SVC_LOOKUP_NONE (a name that
+  // could not have been registered cannot be found). Same match
+  // discipline as svc_register: prefix match over name_len bytes AND
+  // row[name_len] == 0.
+  //
+  // Pure read; no writes to the table. Callers with a live endpoint_id
+  // may pass it to endpoint_lookup for a row PA.
+  // ==========================================================================
+
+  pub let svc_lookup : (u64, u64) -> u64 !{mem} @{} =
+    fn (name_ptr: u64, name_len: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R20b.M1-003 (#1554): full-table scan of _svc_broker_table (32 rows x 48 B); returns endpoint_id (u16 zero-extended to u64) on match, SVC_LOOKUP_NONE (0xFFFFFFFFFFFFFFFF, -1) on miss. Length gate: name_len in [1..31] else miss -- a name outside the range that svc_register accepts cannot exist in the table. Outer scan (r8=row cursor, r9=row idx). Skip free rows via [r8+0]==0 gate. On live rows, inline strncmp-with-NUL-tail: mismatch at any i in [0..name_len) -> skip; full match AND [r8+name_len]==0 -> hit; load [r8+32] as u64 and mask low 16 bits (endpoint_id). Same match discipline as svc_register so the two primitives round-trip. Register plan: rdi/rsi = args, r8=row cursor, r9=row idx, r11=inner i, rax/rcx=byte load scratch. Leaf function; no writes to memory. mov_b [reg+reg*1] scaled indexing pattern per svc_register (this file) and readdir.pdx L349.",
+      block: {
+        // ---- Gate: name_len in [1..31] ----
+        cmp rsi, 0;
+        je  svc_lu_miss;
+        cmp rsi, 31;                       // BROKER_NAME_MAX
+        ja  svc_lu_miss;
+
+        // ---- Scan initialization ----
+        lea r8, [rip + _svc_broker_table];
+        xor r9, r9;
+
+      svc_lu_scan:
+        cmp r9, 32;                        // BROKER_TABLE_SLOTS
+        jae svc_lu_miss;
+
+        xor rax, rax;
+        mov_b rax, [r8];
+        cmp rax, 0;
+        je  svc_lu_row_advance;            // free row -> skip
+
+        // ---- Live row: inline name compare ----
+        xor r11, r11;
+
+      svc_lu_cmp_loop:
+        cmp r11, rsi;
+        je  svc_lu_cmp_check_tail;
+
+        xor rax, rax;
+        mov_b rax, [rdi + r11*1];
+        xor rcx, rcx;
+        mov_b rcx, [r8 + r11*1];
+        cmp rax, rcx;
+        jne svc_lu_row_advance;
+
+        add r11, 1;
+        jmp svc_lu_cmp_loop;
+
+      svc_lu_cmp_check_tail:
+        xor rcx, rcx;
+        mov_b rcx, [r8 + r11*1];
+        cmp rcx, 0;
+        jne svc_lu_row_advance;
+
+        // Hit -- return endpoint_id (low 16 bits of the u64 at row+32).
+        mov rax, [r8 + 32];                // BROKER_OFF_ENDPOINT_ID
+        and rax, 0xFFFF;
+        ret;
+
+      svc_lu_row_advance:
+        add r8, 48;                        // BROKER_ROW_BYTES
+        add r9, 1;
+        jmp svc_lu_scan;
+
+      svc_lu_miss:
+        mov rax, 0xFFFFFFFFFFFFFFFF;       // SVC_LOOKUP_NONE
+        ret
+      }
+    } @no_frame
+}
