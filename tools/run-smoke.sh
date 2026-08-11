@@ -575,6 +575,38 @@ case "${EXPECTED}" in
         echo "smoke: boot_r24_concurrent_io — SKIP (witness not wired at R24.M6; R25+ dependency: driver-attach + public sched_spawn per design/round-retrospectives/r24-closure.md § Preflight for R25)"
         exit 0
         ;;
+    boot_r25_pdxfs_corrupt_sb)
+        # R25-M5-003 (#931): opt-in PdxFS-lite superblock corruption
+        # fixture, gated by PAIDEIA_R25_PDXFS_CORRUPT=1.
+        #
+        # The witness at tests/kernel/fs/pdxfs_lite_corrupt_sb.pdx
+        # (symbol pdxfs_lite_corrupt_sb_witness) is NOT wired into
+        # kernel_main at R25.M5 — same posture as msix_ir_round_robin_
+        # witness at R22.M6 close: symbol existence + build-time link
+        # verification are the R25.M5 acceptance criterion, live
+        # invocation is deferred to a later milestone when the FS
+        # bring-up path exercises pdxfs_lite_mount from a real -kernel
+        # boot fingerprint (blocked on the KIND_BLKDEV cap plumbing
+        # already documented in mount_op.pdx as #1015).
+        #
+        # Under -kernel the QEMU boot has no NVMe controller → the
+        # witness itself would still be callable (it operates on a
+        # .bss-backed fake superblock, not a real device), but there
+        # is no boot-path caller wired at R25.M5. This SKIP-echo mode
+        # keeps the pre-push env-gate callable so PAIDEIA_R25_PDXFS_
+        # CORRUPT=1 does not abort the push.
+        #
+        # When kernel_main wires pdxfs_lite_corrupt_sb_witness into
+        # the boot-time bring-up (behind PAIDEIA_R25_PDXFS_CORRUPT
+        # gating), this mode flips to FINGERPRINT_MODE=1 with a
+        # tests/r25/expected-pdxfs-corrupt-sb.txt file matching
+        # "PDXFS CORRUPT SB OK\n". At R32+ (when Features.CRYPTO_ML_
+        # DSA_ENABLED=1 flips), the witness body itself is revised
+        # to expect verify FAIL on the bit-flipped signed region —
+        # see design/filesystem/pdxfs-lite-perf.md §5.
+        echo "smoke: boot_r25_pdxfs_corrupt_sb — SKIP (witness not wired at R25.M5; caller wire-up deferred pending KIND_BLKDEV cap plumbing per src/kernel/core/fs/pdxfs_lite/mount_op.pdx header — #1015)"
+        exit 0
+        ;;
     boot_panic)
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/logging/expected-panic-dump.txt"
