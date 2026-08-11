@@ -1,0 +1,262 @@
+// src/kernel/core/net/icmp.pdx — R27-M6-003 / #995
+//
+// ICMP (Internet Control Message Protocol, RFC 792) — Echo Request /
+// Echo Reply responder (ping).
+//
+// -----------------------------------------------------------------------------
+// Wire layout (8-byte fixed header + variable data)
+// -----------------------------------------------------------------------------
+//
+//   +0    u8    type            8=EchoRequest, 0=EchoReply (others ignored)
+//   +1    u8    code            0 for Echo
+//   +2    u16   checksum        BE; ones-complement over the ICMP packet
+//                               (header + data). No pseudo-header (unlike UDP).
+//   +4    u16   ident           BE (Echo-family only; other types reinterpret)
+//   +6    u16   seq             BE (Echo-family only)
+//   +8    ..    data            variable; echoed verbatim in the reply
+//
+// -----------------------------------------------------------------------------
+// Checksum discipline
+// -----------------------------------------------------------------------------
+//
+// The ICMP checksum is the ones-complement of the 16-bit sum of the
+// entire ICMP message with the checksum field treated as zero — exactly
+// the shape that ipv4_checksum computes. We reuse ipv4_checksum from
+// ipv4.pdx (same 16-bit BE-word sum + carry-fold + invert) rather than
+// duplicate the loop. See `design/audit/entries/r27-m6-icmp-cksum.md`
+// (implicit) for the reuse rationale — the two algorithms are
+// bit-identical on the byte range they see, and ipv4_checksum has no
+// IPv4-specific state.
+//
+// -----------------------------------------------------------------------------
+// Echo Reply build discipline (icmp_rx_handle)
+// -----------------------------------------------------------------------------
+//
+// On receipt of type=8 (Echo Request), the handler:
+//   (1) Copies the received ICMP packet into _icmp_tx_scratch verbatim
+//       (rep_movsb, pkt_len bytes).
+//   (2) Rewrites byte[0] = 0 (Echo Reply type). code stays 0.
+//   (3) Zeroes checksum @+2..+3.
+//   (4) Recomputes checksum via ipv4_checksum(_icmp_tx_scratch, pkt_len).
+//   (5) Stores checksum BE at @+2..+3.
+//   (6) Sends via ipv4_tx_send(protocol=1, dst_ip=received src_ip).
+//
+// Ident + seq stay untouched — ping expects them echoed byte-for-byte.
+// Data payload stays untouched — many `ping` implementations stamp a
+// timestamp there and RTT-check on receipt.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: byte / word stores route via mov_b / mov_w.
+//   G6: [reg+imm] addressing only.
+//
+// Reserved-label discipline: labels prefixed `icrh_` (rx_handle).
+
+module Icmp = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  pub let ICMP_HDR_LEN         : u64 = 8
+  pub let ICMP_TYPE_ECHO_REPLY : u64 = 0
+  pub let ICMP_TYPE_ECHO_REQ   : u64 = 8
+  pub let ICMP_PROTO           : u64 = 1          // IPv4 protocol number
+
+  // Return codes:
+  //   0 = accepted-and-dispatched (echo replied OR non-echo type logged)
+  //   1 = malformed (length gate)
+  pub let ICMP_RX_OK              : u64 = 0
+  pub let ICMP_RX_ERR_MALFORMED   : u64 = 1
+
+  // ============================================================================
+  // Canonical .bss slots
+  // ============================================================================
+  //
+  //   _icmp_tx_scratch      : 2048-byte reply build buffer (ICMP hdr + data)
+  //
+  //   Counters (all u64 wraparound):
+  //     _icmp_rx_pkts             valid ICMP frames received
+  //     _icmp_rx_bad_hdr          short header
+  //     _icmp_rx_echo_replied     Echo Requests replied to
+  //     _icmp_rx_other            valid ICMPs with type != 8 (logged, dropped)
+
+  pub let mut _icmp_tx_scratch     : [u8; 2048] = uninit @align(8)
+  pub let mut _icmp_rx_pkts        : u64        = 0
+  pub let mut _icmp_rx_bad_hdr     : u64        = 0
+  pub let mut _icmp_rx_echo_replied: u64        = 0
+  pub let mut _icmp_rx_other       : u64        = 0
+
+  // ============================================================================
+  // icmp_rx_handle(pkt_pa, pkt_len, src_ip, dst_ip) -> u64  — #995
+  // ============================================================================
+  //
+  // SysV: (pkt_pa: u64, pkt_len: u64, src_ip: u64, dst_ip: u64) -> u64
+  //   rdi = physical address of the ICMP header (frame_pa + 14 + 20)
+  //   rsi = ICMP packet length (IPv4 total_length - 20)
+  //   rdx = pointer to the received src_ip[4] (into _ipv4_rx_scratch+12)
+  //   rcx = pointer to the received dst_ip[4] (into _ipv4_rx_scratch+16;
+  //         currently unused — reserved for R28+ broadcast-echo filter)
+  //
+  // Behaviour:
+  //   - Emit "L3 RX ICMP" fingerprint (parity with the M5 stub).
+  //   - Length gate: pkt_len >= 8.
+  //   - Extract type @+0. If type != 8: bump _icmp_rx_other, return 0
+  //     (accepted-but-no-reply — silent drop matches the RFC 792
+  //     "process locally" latitude for non-Echo types).
+  //   - Otherwise:
+  //       * rep_movsb pkt_pa -> _icmp_tx_scratch, count=pkt_len.
+  //       * Overwrite byte[0] = 0 (Echo Reply).
+  //       * Zero bytes 2..3 (checksum placeholder).
+  //       * Call ipv4_checksum(_icmp_tx_scratch, pkt_len).
+  //       * Store BE checksum @+2..+3.
+  //       * ipv4_tx_send(bar0, tx_ring, protocol=1, dst_ip=src_ip,
+  //                      payload=_icmp_tx_scratch, payload_len=pkt_len).
+  //       * Bump _icmp_rx_echo_replied + _icmp_rx_pkts. Return 0.
+  //
+  // Register plan (6-push callee-save + 8-byte pad):
+  //   rbx = pkt_pa            (survives across nested calls)
+  //   rbp = pkt_len
+  //   r12 = src_ip ptr
+  //   r13 = dst_ip ptr        (reserved; not yet read)
+  //   r14 = checksum result   (scratch — could reuse rax but explicit is clearer)
+  //   r15 = unused             (reserved for R28+ pseudo-fields)
+  //   6 pushes = 48; entry rsp%16==8 -> 56, sub rsp,8 -> 64, %16==0.
+
+  pub let icmp_rx_handle : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (pkt_pa: u64, pkt_len: u64, src_ip: u64, dst_ip: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R27-M6-003 (#995). ICMP receive engine: Echo Request -> Echo Reply responder. Body: (1) 6-push callee-save (rbx=pkt_pa, rbp=pkt_len, r12=src_ip ptr, r13=dst_ip ptr, r14=cksum scratch, r15=reserved) + `sub rsp,8` — 48 + 8 = 56; entry rsp%16==8 -> 64, %16==0 (aligned for klog_s1 + rep_movsb + ipv4_checksum + ipv4_tx_send). (2) klog_s1(INFO, NET_, tag_l3_icmp) — L4 dispatch fingerprint (parity with M5 icmp_rx_stub). (3) Length gate: cmp rbp, 8; jb icrh_malformed. (4) Extract type @+0. If != 8 (Echo Request) -> bump _icmp_rx_other, return 0 (accepted-but-no-reply per RFC 792 process-locally latitude). (5) rep_movsb pkt_pa -> _icmp_tx_scratch, count=pkt_len. Reset rdi=_icmp_tx_scratch, rsi=pkt_pa, rcx=pkt_len before rep_movsb. (6) Overwrite byte[0] = 0 (Echo Reply). (7) Zero cksum @+2..+3. (8) ipv4_checksum(&_icmp_tx_scratch, pkt_len) — returns HOST-order ~sum. r14 = rax. (9) Store BE cksum @+2..+3: byte[2] = (r14>>8)&0xFF; byte[3] = r14&0xFF. (10) ipv4_tx_send(bar0=_e1000e_devices[0].bar0_pa (u64 @+8), tx_ring=&_e1000e_tx_ring, protocol=1, dst_ip=r12 (received src_ip), payload=&_icmp_tx_scratch, payload_len=rbp). rax carries ipv4_tx_send return (may be 3=IPV4_E_ARP_PENDING). (11) Bump _icmp_rx_echo_replied + _icmp_rx_pkts. Return 0. Reserved labels: `icrh_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // pkt_pa
+        mov rbp, rsi;                            // pkt_len
+        mov r12, rdx;                            // src_ip ptr
+        mov r13, rcx;                            // dst_ip ptr (reserved)
+
+        // ============================================================
+        // (1) klog fingerprint.
+        // ============================================================
+        mov rdi, 3;                              // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + tag_l3_icmp];
+        call klog_s1;
+
+        // ============================================================
+        // (2) Length gate: pkt_len >= 8.
+        // ============================================================
+        cmp rbp, 8;
+        jb icrh_malformed;
+
+        // ============================================================
+        // (3) Extract type @+0.
+        // ============================================================
+        xor rax, rax;
+        mov_b rax, [rbx + 0];
+        cmp rax, 8;                              // ICMP_TYPE_ECHO_REQ
+        jne icrh_other;
+
+        // ============================================================
+        // (4) rep_movsb pkt_pa -> _icmp_tx_scratch, count = pkt_len.
+        // ============================================================
+        lea rdi, [rip + _icmp_tx_scratch];
+        mov rsi, rbx;
+        mov rcx, rbp;
+        cld;
+        rep_movsb;
+
+        // ============================================================
+        // (5) Overwrite byte[0] = 0 (Echo Reply).
+        // ============================================================
+        xor rax, rax;
+        mov_b [rip + _icmp_tx_scratch + 0], rax;
+
+        // ============================================================
+        // (6) Zero cksum placeholder @+2..+3.
+        // ============================================================
+        xor rax, rax;
+        mov_b [rip + _icmp_tx_scratch + 2], rax;
+        mov_b [rip + _icmp_tx_scratch + 3], rax;
+
+        // ============================================================
+        // (7) ipv4_checksum(&_icmp_tx_scratch, pkt_len).
+        // ============================================================
+        lea rdi, [rip + _icmp_tx_scratch];
+        mov rsi, rbp;
+        call ipv4_checksum;
+        mov r14, rax;                            // cksum host-order
+
+        // ============================================================
+        // (8) Store BE cksum @+2..+3.
+        // ============================================================
+        mov rax, r14;
+        shr rax, 8;
+        and rax, 0xFF;
+        mov_b [rip + _icmp_tx_scratch + 2], rax;
+        mov rax, r14;
+        and rax, 0xFF;
+        mov_b [rip + _icmp_tx_scratch + 3], rax;
+
+        // ============================================================
+        // (9) ipv4_tx_send(bar0, tx_ring, protocol=1, dst_ip=src_ip,
+        //                  payload=_icmp_tx_scratch, payload_len=pkt_len).
+        // ============================================================
+        mov rdi, [rip + _e1000e_devices + 8];    // bar0_pa
+        lea rsi, [rip + _e1000e_tx_ring];        // tx_ring_pa
+        mov rdx, 1;                              // IPV4_PROTO_ICMP
+        mov rcx, r12;                            // dst_ip = received src_ip
+        lea r8, [rip + _icmp_tx_scratch];        // payload_pa
+        mov r9, rbp;                             // payload_len = pkt_len
+        call ipv4_tx_send;
+
+        // ============================================================
+        // (10) Bump counters + return 0.
+        // ============================================================
+        mov rax, [rip + _icmp_rx_echo_replied];
+        add rax, 1;
+        mov [rip + _icmp_rx_echo_replied], rax;
+        mov rax, [rip + _icmp_rx_pkts];
+        add rax, 1;
+        mov [rip + _icmp_rx_pkts], rax;
+
+        xor rax, rax;
+        jmp icrh_ret;
+
+      icrh_other:
+        mov rax, [rip + _icmp_rx_other];
+        add rax, 1;
+        mov [rip + _icmp_rx_other], rax;
+        mov rax, [rip + _icmp_rx_pkts];
+        add rax, 1;
+        mov [rip + _icmp_rx_pkts], rax;
+        xor rax, rax;
+        jmp icrh_ret;
+
+      icrh_malformed:
+        mov rax, [rip + _icmp_rx_bad_hdr];
+        add rax, 1;
+        mov [rip + _icmp_rx_bad_hdr], rax;
+        mov rax, 1;                              // ICMP_RX_ERR_MALFORMED
+
+      icrh_ret:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
