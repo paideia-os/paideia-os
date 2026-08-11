@@ -1005,3 +1005,52 @@ R27 delivered the first-packet-on-wire networking substrate: e1000e/i219-LM cont
 None (R27 ran under `qemu -kernel` throughout — no MCFG surface, no PCI enumeration, no e1000e controller, no packet capture). §2.5 Networking row in `design/hardware/quirks.md` to be seeded as PROVISIONAL on the R28 first-boot; `design/round-retrospectives/r27-closure.md §T14 ping demo` documents the promotion pass an R28+ operator will run when the first live-ping fires on real HW.
 
 **Next Round:** R28 (userspace-server substrate + driver-attach ceremony). Zero R27 blockers. Optional R28.M0 prelude discharges the R27 socket + DHCP debt (`net_supervisor` boot chain + KIND_UDP_SOCKET bind on ports 67/53/123 + userspace port-7 echo daemon retiring the kernel-side echo path) — decision to defer to R28.M1 kickoff per `design/round-retrospectives/r27-closure.md §Preflight for R28`.
+
+---
+
+## R28 (Bootable distribution + real-HW smoke -> MVP DEMO) — CLOSED 2026-08-11
+
+R28 delivered the MVP demo consolidation: bootable USB image assembly (`tools/build-image.sh` producing `build/mvp/paideia-mvp.img` ~64 MiB with GPT + FAT32 ESP + PdxFS-lite data partition; `tools/build-uefi-image.sh` producing the ESP layout with self-hosted `/EFI/PAIDEIA/PAIDEIA.EFI` + `/EFI/BOOT/BOOTX64.EFI` fallback; `tools/mkfs-pdxfs-lite-seed.sh` producing the rootfs blob with `/etc/hello` + `/bin/sh` + `/bin/true` seed entries), real-HW smoke harness (`tools/run-smoke-hw.sh` PAIDEIA_HW_SMOKE-gated serial-fingerprint verifier with 6 modes — boot / pdxfs / net / usb / all / boot_r28_hw_smoke composite — running the same in-order contains-check as `tools/run-smoke.sh` against `tests/hw/expected-hw-*.txt`), serial console fallback recipes (`design/kernel/serial-console-fallback.md` — screen/tio/picocom operator recipes with 115200 8N1 no-flow-control tty discipline matching the R16.M4 kernel COM1 init), T14 G4 first-boot walkthrough (`design/hardware/t14-g4-first-boot.md` — BIOS setup checklist + acceptance criteria + rootfs contents inventory + troubleshooting sequence), panic-FB photograph recovery recipe (`design/testing/panic-fb-photograph-recovery.md` + `tools/panic-fb-recovery-smoke.md` — verification recipe for the R23.M3 fb-mirror path with photograph-transcribability acceptance criteria), T14 G4 quirks-db pass (`design/hardware/quirks.md` — four rows anchored/re-anchored: §2.4 USB xHCI, §2.5 UART photograph fallback, §2.5 Ethernet, §2.6 GOP-Pixel-Format), HW regression matrix seed (`design/testing/hw-regression-matrix.md` — rows C1..C10 mapped to R18..R28.M3 source substrates × T14 G4 / Framework 13 / QEMU-OVMF targets), per-subsystem fingerprint catalogue (`tools/hw-smoke-fingerprints.md` — §1 boot / §2 pdxfs / §3 net / §4 USB / §5 composite fingerprints, each documented with substrate anchor + kernel-emitted klog lines + seeding recipe), MVP demo operator script (`design/testing/mvp-demo-script.md` — 7-step recipe: cold-boot -> `cat /etc/hello` -> peer-host `ping 10.0.0.2` -> `echo demo > /tmp/mvp` -> `exit` -> reboot -> `cat /tmp/mvp` -> `demo`), pre-push hook R28 opt-in (`.githooks/pre-push` PAIDEIA_HW_SMOKE=1 block that invokes `run-smoke-hw.sh boot_r28_hw_smoke` after the 15-mode QEMU-green matrix, treating rc=0 pass, rc=1 fail, rc=2/3/77/124 skip), and this closure retro. Pillar 11 target met at the scaffolding level: image builds, ships, boots, walks a per-subsystem fingerprint on real HW when the operator plugs a serial cable into a T14 G4, and closes with the `mvp-v0.1` release tag. Live end-to-end demo execution on physical hardware remains a `gated:hardware` deferral for the R28+ hardware bring-up sub-round (same posture as R23 first-visual-output, R24 first-NVMe-touch, R26 first-keystroke, R27 first-ping). **The MVP arc is complete.** See `design/round-retrospectives/r28-closure.md` for the full write-up including the R18-R28 round-by-round retrospective.
+
+### Issues Implemented (14 total across 4 milestones)
+
+- **M1** (#998, #999, #1000; #1001 deferred to R32) — MVP demo image assembly: `tools/build-image.sh` (kernel + userland + PdxFS-lite blob + ESP layout composited into `paideia-mvp.img`); `tools/build-uefi-image.sh` (ESP with self-hosted `/EFI/PAIDEIA/PAIDEIA.EFI`); `tools/mkfs-pdxfs-lite-seed.sh` (rootfs blob with seed entries). #1001 PE Secure Boot signing deferred to R32/R33 crypto substrate.
+- **M2** (#1002, #1003, #1004) — HW smoke harness + serial fallback + T14 first-boot: `tools/run-smoke-hw.sh` (PAIDEIA_HW_SMOKE-gated fingerprint verifier); `design/kernel/serial-console-fallback.md` (operator recipes); `design/hardware/t14-g4-first-boot.md` (cold-boot walkthrough).
+- **M3** (#1005, #1006, #1007) — Panic-FB + quirks + regression matrix: `design/testing/panic-fb-photograph-recovery.md` + `tools/panic-fb-recovery-smoke.md` (R23.M3 fb-mirror recipe); `design/hardware/quirks.md` T14 G4 pass (four rows); `design/testing/hw-regression-matrix.md` (rows C1..C10 seed).
+- **M4** (#1008, #1009, #1010, #1011) — Final MVP closure: `tools/hw-smoke-fingerprints.md` + `boot_r28_hw_smoke` composite mode extension in `tools/run-smoke-hw.sh` (per-subsystem fingerprint catalogue + composite fingerprint mode with 240s DEFAULT_TIMEOUT); `design/testing/mvp-demo-script.md` (7-step operator recipe); `.githooks/pre-push` PAIDEIA_HW_SMOKE=1 opt-in (rc=0 pass / rc=1 fail / rc=2/3/77/124 skip semantics); R28 closure retro + STATUS.md block + release tag `mvp-v0.1` (this entry + #1011).
+
+### Cross-Repo Escalations to paideia-as (R28)
+
+**None.** `paideia-as` submodule remained pinned at `2cf169d` for all four R28 milestones — unchanged since R21 close. **Eighth consecutive round** with zero cross-repo escalations. R28's work was entirely documentation, image-assembly shell scripts, hook extensions, and existing-substrate consumption; no new assembly encoders or elaborator behaviors were surfaced.
+
+### Observable Proof
+
+- Kernel builds clean under `tools/build.sh` (**15/15 gates**: no-AML lint + opcode-canary + kernel dispatch + sched guards + tty_read wrapper + link).
+- All 15 default pre-push smoke modes pass. No new fingerprint under `-kernel` — R28 is documentation + image-assembly + hook + composite fingerprint mode; every runtime primitive was landed in R18-R27.
+- R22/R21/R24/R25/R26 opt-in smokes pass unchanged.
+- `bash tools/build-image.sh` produces `build/mvp/paideia-mvp.img` (~64 MiB) reproducibly.
+- `bash tools/run-smoke-hw.sh boot_r28_hw_smoke` returns rc=3 (gate cleared) by default; with `PAIDEIA_HW_SMOKE=1` returns rc=2 (no serial adapter attached in CI/dev env), correctly matching AC #1010.
+
+### R28 Debt Carried Forward
+
+1. **#1001 PE Secure Boot signing** — R28.M1 ships unsigned; ML-DSA-65 (R32) + PE Certificate Table (R33) crypto substrate required. Target: R32/R33.
+2. **Live T14 MVP demo execution** — every step of `design/testing/mvp-demo-script.md §2` except 1 (cold boot) and 5 (exit) requires post-R28 driver-attach ceremony wiring in `kernel_main_uefi` plus R25 write-side debt discharge (`nvme_write_blocking` + `commit_dirty_metadata`). Target: R28+ hardware bring-up sub-round.
+3. **`kernel_main_uefi` driver-attach ceremony** — NVMe (R24 blkdev), PdxFS-lite (R25 mount), e1000e (R27 attach with MSI-X vec-0 IRQ walker into IDT), xHCI (R26 attach with MSI-X vec-0 event-ring walker into IDT). Target: R28+ hardware bring-up.
+4. **R27 debt items still open** (unchanged from R27 close): KIND_UDP_SOCKET descriptor slab write; UDP userspace socket delivery; full TCP; BPF-lite; DHCP; live T14 ping capture; e1000e IRQ walker into IDT; boot-time e1000e driver-attach.
+5. **R26 debt items still open** (unchanged from R26 close): full xHCI attach/detach chain; IRQ walker over event ring; HID mouse; userspace HID class driver; boot-time xHCI driver-attach; live T14 keyboard capture.
+6. **R25 debt items still open** (unchanged from R25 close): `nvme_write_blocking` kernel-side; `commit_dirty_metadata` pass; driver-attach wire-up in `kernel_main_uefi`; real ML-DSA-65 sig verify (R32); live PdxFS-lite E2E on real HW; `boot_r25_pdxfs_e2e` fingerprint flip; migration tool implementation (R40); directory-entry limit enforcement.
+7. **R24 debt items still open** (unchanged from R24 close): multi-controller support; concurrent-IO fixture body; `boot_r24_concurrent_io` fingerprint file; T14 G4 NVMe first-light.
+8. **R23 debt items still open** (unchanged from R23 close): UEFI/OVMF fb_console harness; T14 first-visual-output capture; `fb_map_lfb` BGRA assumption; `_fb_console_grid` fixed size; `k_panic_fb_banner_len` triplicate.
+9. **R22 debt items still open** (unchanged from R22 close): `_vtd_base` hardcoded; `has_dmar` unpopulated; `vtd_fault_dispatch` IDT wire; `msix_enable_device`; `msix_assignments` ledger; GCMD.TE + SIRTP + IRE ceremony; DMA-fault regression SKIP -> LIVE; T14 PCI/ACPI captures.
+10. **R21 debt items still open:** `hpet_now_ns` precision widening; `phase1_acpi_gather` full wire (partial at R22.M1 — MCFG only).
+11. **Long-tail #1015 blockers** (unchanged): #820 acpi_supervisor, #860 pci_enumerator, #906 userspace nvme_read_blocking, #963 userspace HID class driver, #994 KIND_UDP_SOCKET descriptor slab write, #996 UDP userspace socket delivery. All queued behind #1015 userspace-server substrate. Target: R28+/R29.
+
+**None regress R28 acceptance for the MVP demo scaffolding.**
+
+### Quirks Discovered on Real Hardware
+
+None (R28 ran entirely under QEMU / documentation-and-image-assembly). Four rows in `design/hardware/quirks.md` anchored/re-anchored during R28.M3 pass — every row remains PROVISIONAL until first-light on the T14 G4. `design/testing/mvp-demo-script.md` documents the operator recipe that promotes rows through the acceptance surface.
+
+**MVP arc summary:** R18-R28 landed **~257 issues across 60 milestones over 11 rounds**, **zero cross-repo paideia-as escalations for the final 8 rounds** (R21-R28), **11 rounds tagged** (`r18-closed` through `r27-closed` plus `mvp-v0.1`). The MVP arc is complete; the R28+ hardware bring-up sub-round discharges the live-execution deferrals.
+
+**Next Round:** R29 (xAPIC retirement completion + kernel timer redesign) OR post-R28 hardware bring-up sub-round (driver-attach ceremony + R25 write-side debt + #1015 userspace-server substrate stub). Decision to defer to R29.M1 kickoff per `design/round-retrospectives/r28-closure.md §Preflight for R29+`.

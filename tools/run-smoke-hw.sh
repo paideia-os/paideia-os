@@ -88,6 +88,19 @@
 #            on; between-mode reboot NOT required as long as the
 #            operator remembers to run each interactive step).
 #
+#   boot_r28_hw_smoke
+#          — R28.M4 (#1008) composite per-subsystem fingerprint walk.
+#            One capture window, one fingerprint file
+#            (tests/hw/expected-hw-r28-composite.txt) that concatenates
+#            §1 (boot) + §2 (pdxfs mount) + §3 (net probe/reset) + §4
+#            (USB probe/reset/slot) lines from tools/hw-smoke-
+#            fingerprints.md. NO interactive tail — the composite
+#            answers "did the cold-boot substrate come up?" without
+#            operator keypresses / peer-host pings / cat-etc-hello.
+#            Individual pdxfs/net/usb modes still exist for the
+#            interactive tails. See tools/hw-smoke-fingerprints.md §5
+#            for the per-subsystem breakdown.
+#
 # ---------------------------------------------------------------------
 # Exit codes
 # ---------------------------------------------------------------------
@@ -131,7 +144,7 @@ run-smoke-hw — real-hardware serial-fingerprint check for the T14 G4
                operator boots the paideia-mvp.img USB stick.
 
 Usage:
-  PAIDEIA_HW_SMOKE=1 tools/run-smoke-hw.sh {boot|pdxfs|net|all}
+  PAIDEIA_HW_SMOKE=1 tools/run-smoke-hw.sh {boot|pdxfs|net|usb|all|boot_r28_hw_smoke}
   tools/run-smoke-hw.sh {-h|--help}
 
 Modes:
@@ -142,7 +155,16 @@ Modes:
           (operator issues a `ping`-style command from userspace once
           such tooling exists; at R28.M2 the kernel probe fingerprint
           alone is the acceptance surface)
-  all     Run boot, pdxfs, net sequentially (single power-on).
+  usb     Verify xHCI probe + reset + slot enable + HID Boot Protocol
+          keypresses land as HID KEY <ascii> in the log.
+          (operator types "hello" on the attached USB keyboard during
+          the capture window)
+  all     Run boot, pdxfs, net, usb sequentially (single power-on).
+  boot_r28_hw_smoke
+          R28.M4 #1008 composite per-subsystem fingerprint. One
+          capture window; no interactive tail. Concatenates the
+          boot / pdxfs-mount / net-probe-reset / usb-probe-reset
+          lines from tools/hw-smoke-fingerprints.md §5.
 
 Guard:
   Refuses to run without PAIDEIA_HW_SMOKE=1 exported. This prevents
@@ -234,11 +256,23 @@ case "${MODE}" in
         FINGERPRINT_FILE="${REPO_ROOT}/tests/hw/expected-hw-net.txt"
         DEFAULT_TIMEOUT=60
         ;;
+    usb)
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/hw/expected-hw-usb.txt"
+        DEFAULT_TIMEOUT=60
+        ;;
+    boot_r28_hw_smoke)
+        # R28.M4 #1008 composite mode. One capture window walks every
+        # per-subsystem fingerprint documented in tools/hw-smoke-
+        # fingerprints.md §5. No interactive tail — operator does NOT
+        # type at the prompt during the capture window.
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/hw/expected-hw-r28-composite.txt"
+        DEFAULT_TIMEOUT=240
+        ;;
     all)
-        # `all` recurses into the three sub-modes in order, sharing the
+        # `all` recurses into the four sub-modes in order, sharing the
         # cold-power window; sub-mode timeouts accumulate.
         rc=0
-        for sub in boot pdxfs net; do
+        for sub in boot pdxfs net usb; do
             echo "run-smoke-hw[all]: === sub-mode: ${sub} ==="
             PAIDEIA_HW_SMOKE=1 bash "${BASH_SOURCE[0]}" "${sub}"
             sub_rc=$?
