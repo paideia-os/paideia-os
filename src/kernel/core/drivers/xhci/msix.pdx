@@ -1,0 +1,233 @@
+// src/kernel/core/drivers/xhci/msix.pdx — R26-M2-004 (#949)
+//
+// xHCI MSI-X setup — assign one MSI-X vector to Interrupter 0 on the
+// BSP (CPU 0) so the HC can raise a CPU interrupt when a Command
+// Completion Event lands on the event ring.
+//
+// -----------------------------------------------------------------------------
+// Wiring
+// -----------------------------------------------------------------------------
+//
+// The xHCI controller exposes MaxIntrs interrupters (HCSPARAMS1
+// bits [18:8]); each interrupter gets its own MSI-X vector, its own
+// event ring, and its own IMAN/IMOD/ERSTBA/ERDP register set (see
+// event_ring.pdx). For the MVP we wire only Interrupter 0 — enough to
+// receive Command Completion Events plus the handful of Port Status
+// Change Events that arrive during device attach. Multi-vector support
+// (per-CPU interrupter fan-out for high-throughput bulk endpoints)
+// lands in R26.M4+.
+//
+// The setup path chains three primitives already proven at R21.M4 +
+// R22.M5:
+//
+//   (1) msix_map_table(seg, bus, dev, fn, &info)     — resolve BAR-
+//                                                       referenced MMIO
+//                                                       table_pa and
+//                                                       table_size.
+//   (2) vector_alloc_for_cpu(cpu=0)                   — reserve a slot
+//                                                       in the BSP MSI-X
+//                                                       vector pool
+//                                                       (0x60..0xEF).
+//   (3) msix_program_entry(table_pa, 0, vector,
+//                          dest_apic_id=0, mask=0)    — 4×u32 MMIO
+//                                                       writes per PCI
+//                                                       3.0 §6.8.3.5.
+//   (4) msix_enable_device(seg, bus, dev, fn)         — flip msg_control
+//                                                       bit 15 in config
+//                                                       space.
+//
+// The IR-routed variant (msix_assign_at_ir → msix_program_entry_via_ir)
+// stays gated behind Features.IOMMU_ENABLED and Features.CRYPTO_IR_ENABLED
+// — neither yet flipped at R26.M2. The direct (non-IR) path used here
+// is the same one all pre-R25 drivers use.
+//
+// -----------------------------------------------------------------------------
+// R26.M2 posture: dormant at boot
+// -----------------------------------------------------------------------------
+//
+// Under BIOS/-kernel boot the PCI enumerator returns 0 devices, so
+// xhci_probe leaves _xhci_devices empty and xhci_msix_setup is never
+// called at boot. Symbol exists for R26.M3 driver-attach + the
+// UEFI/OVMF wire-in path.
+//
+// -----------------------------------------------------------------------------
+// Return semantics
+// -----------------------------------------------------------------------------
+//
+//   Returns the allocated vector (0x60..0xEF) on success, or
+//   XHCI_MSIX_ERR (0xFF) on any of:
+//
+//     * cap_msix_off is 0 (device does not advertise MSI-X)
+//     * msix_map_table failed (BAR decode error or cap not found)
+//     * vector_alloc_for_cpu exhausted the BSP pool
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: sized u16/u8 loads via `xor rax,rax; mov_w/mov_b rax, [mem]`
+//       zero-extension idiom (same pattern as probe.pdx).
+//   G4: full-register compares.
+//
+// Reserved-label discipline: `xhci_ms_`.
+
+module Msix = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  pub let XHCI_MSIX_ERR             : u64 = 0xFF
+  pub let XHCI_MSIX_BSP_CPU         : u64 = 0
+  pub let XHCI_MSIX_INT0_ENTRY      : u64 = 0        // interrupter 0
+
+  // Offsets into an _xhci_devices record (32 B; layout defined in
+  // probe.pdx — repeated here so this file compiles standalone).
+  pub let XHCI_DEV_OFF_SEG          : u64 = 0        // u16
+  pub let XHCI_DEV_OFF_BUS          : u64 = 2        // u8
+  pub let XHCI_DEV_OFF_DEV          : u64 = 3        // u8
+  pub let XHCI_DEV_OFF_FN           : u64 = 4        // u8
+  pub let XHCI_DEV_OFF_CAP_MSIX     : u64 = 6        // u16
+  pub let XHCI_DEV_OFF_BAR0_PA      : u64 = 8        // u64
+
+  // msix_table_info scratch: 24 B per core/pci/msix.pdx §"msix_table_info".
+  pub let mut _xhci_msix_table_info : [u64; 3] = uninit @align(8)
+
+  // ============================================================================
+  // xhci_msix_setup(xhci_dev) -> u64
+  // ============================================================================
+  //
+  // SysV: (xhci_dev: u64) -> u64
+  //   rdi = pointer to a 32-byte _xhci_devices record
+  //
+  // Returns rax = allocated MSI-X vector (0x60..0xEF) on success, or
+  // XHCI_MSIX_ERR (0xFF) on failure.
+  //
+  // Body:
+  //   (1) Reject records with cap_msix_off == 0.
+  //   (2) Extract seg/bus/dev/fn from the record and cache in stack
+  //       slots — every downstream call takes the (seg, bus, dev, fn)
+  //       tuple and each caller-save reload is cheaper than a
+  //       callee-save reg burn.
+  //   (3) msix_map_table(seg, bus, dev, fn, &_xhci_msix_table_info) → 0
+  //       on failure.
+  //   (4) Load table_pa from info[0..8].
+  //   (5) vector_alloc_for_cpu(0) → 0xFF on exhaustion.
+  //   (6) msix_program_entry(table_pa, 0, vector, dest=0, mask=0).
+  //   (7) msix_enable_device(seg, bus, dev, fn).
+  //   (8) Return vector.
+  //
+  // Register plan (2-push callee-save + 32-byte scratch):
+  //   rbx = xhci_dev ptr (survives every nested call)
+  //   rbp = vector      (saved after step 5, needed for step 6 and return)
+  //   Scratch:
+  //     [rsp+0]  = seg
+  //     [rsp+8]  = bus
+  //     [rsp+16] = dev
+  //     [rsp+24] = fn
+  //
+  //   2 pushes = 16 B + sub rsp, 32 = 48; entry rsp%16==8 -> 56;
+  //   ...that's %16=8 which is misaligned. Actually — pushing 2 regs
+  //   changes rsp by -16 (rsp%16 stays at 8), then sub rsp,32 -> rsp%16=8
+  //   still. Add 8 more bytes of pad: sub rsp,40 -> rsp%16=0. Aligned.
+
+  pub let xhci_msix_setup : (u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (xhci_dev: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R26-M2-004 (#949). MSI-X setup for xHCI Interrupter 0 on the BSP — chains msix_map_table + vector_alloc_for_cpu + msix_program_entry + msix_enable_device (R21.M4 + R22.M5 substrate). Body: (1) 2-push callee-save (rbx=xhci_dev, rbp=vector) + sub rsp,40 for 4 tuple slots [rsp+0..24] and 8 B align pad — 56 B; entry rsp%16==8 -> 64, %16==0 (aligned for every nested call). (2) Reject dev.cap_msix_off == 0 (u16 @ xhci_dev+6): xor rax,rax; mov_w rax, [rbx+6]; cmp rax, 0; je err. (3) Extract seg (u16 @+0), bus (u8 @+2), dev (u8 @+3), fn (u8 @+4) via zero-extended loads; stash into [rsp+0..24]. (4) msix_map_table(seg, bus, dev, fn, ptr=lea &_xhci_msix_table_info). If returns 0, err. (5) Load table_pa (u64 @ _xhci_msix_table_info+0) into r10. (6) vector_alloc_for_cpu(0): rdi=0, call. If returns 0xFF (VECTOR_INVALID), err. Save vector in rbp. (7) msix_program_entry(table_pa=r10, entry_idx=0, vector=rbp, dest_apic_id=0, mask=0). Reload table_pa from _xhci_msix_table_info in case the intervening call clobbered r10 — safe, no additional load cost. (8) msix_enable_device(seg, bus, dev, fn). (9) Return vector in rax. Err path: return 0xFF. Reserved labels: `xhci_ms_`.",
+      block: {
+        push rbx;
+        push rbp;
+        sub rsp, 40;                             // [rsp+0..24]=seg/bus/dev/fn, [rsp+32] pad
+
+        mov rbx, rdi;                            // rbx = xhci_dev
+
+        // ================================================================
+        // (2) Reject cap_msix_off == 0.
+        // ================================================================
+        xor rax, rax;
+        mov_w rax, [rbx + 6];                    // cap_msix_off
+        cmp rax, 0;
+        je xhci_ms_err;
+
+        // ================================================================
+        // (3) Extract seg/bus/dev/fn into scratch slots.
+        // ================================================================
+        xor rax, rax;
+        mov_w rax, [rbx + 0];                    // seg (u16)
+        mov [rsp + 0], rax;
+
+        xor rax, rax;
+        mov_b rax, [rbx + 2];                    // bus (u8)
+        mov [rsp + 8], rax;
+
+        xor rax, rax;
+        mov_b rax, [rbx + 3];                    // dev (u8)
+        mov [rsp + 16], rax;
+
+        xor rax, rax;
+        mov_b rax, [rbx + 4];                    // fn (u8)
+        mov [rsp + 24], rax;
+
+        // ================================================================
+        // (4) msix_map_table(seg, bus, dev, fn, &info).
+        // ================================================================
+        mov rdi, [rsp + 0];
+        mov rsi, [rsp + 8];
+        mov rdx, [rsp + 16];
+        mov rcx, [rsp + 24];
+        lea r8, [rip + _xhci_msix_table_info];
+        call msix_map_table;
+
+        cmp rax, 0;
+        je xhci_ms_err;
+
+        // ================================================================
+        // (5) vector_alloc_for_cpu(0).
+        // ================================================================
+        xor rdi, rdi;                            // cpu_idx = 0 (BSP)
+        call vector_alloc_for_cpu;
+
+        cmp rax, 0xFF;
+        je xhci_ms_err;
+
+        mov rbp, rax;                            // rbp = vector
+
+        // ================================================================
+        // (6) msix_program_entry(table_pa, 0, vector, dest=0, mask=0).
+        // ================================================================
+        mov r10, [rip + _xhci_msix_table_info];  // table_pa (u64 @+0)
+        mov rdi, r10;
+        xor rsi, rsi;                            // entry_idx = 0
+        mov rdx, rbp;                            // vector
+        xor rcx, rcx;                            // dest_apic_id = 0 (BSP)
+        xor r8, r8;                              // mask = 0 (unmasked)
+        call msix_program_entry;
+
+        // ================================================================
+        // (7) msix_enable_device(seg, bus, dev, fn).
+        // ================================================================
+        mov rdi, [rsp + 0];
+        mov rsi, [rsp + 8];
+        mov rdx, [rsp + 16];
+        mov rcx, [rsp + 24];
+        call msix_enable_device;
+
+        // ================================================================
+        // (8) Return vector.
+        // ================================================================
+        mov rax, rbp;
+        jmp xhci_ms_done;
+
+      xhci_ms_err:
+        mov rax, 0xFF;                           // XHCI_MSIX_ERR
+
+      xhci_ms_done:
+        add rsp, 40;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}

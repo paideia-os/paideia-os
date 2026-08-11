@@ -1,0 +1,369 @@
+// src/kernel/core/drivers/xhci/cmd_ring.pdx — R26-M2-002 (#947)
+//
+// xHCI Command Ring — a 256-TRB ring buffer written by software and
+// consumed by the xHC to receive commands (Enable Slot, Address Device,
+// Configure Endpoint, ...). Command completion is signalled back via
+// the Event Ring (see event_ring.pdx).
+//
+// -----------------------------------------------------------------------------
+// Ring layout (xHCI 1.2 §4.9.2 / §6.4.4.1)
+// -----------------------------------------------------------------------------
+//
+// The ring is a contiguous 256 × 16 B = 4 KiB block. Slots 0..254 hold
+// command TRBs. Slot 255 holds a Link TRB (type = 6) whose Parameter
+// field points back to ring_pa (slot 0) and whose control has:
+//   TC = 1 (Toggle Cycle): the consumer toggles its Cycle-state
+//                          Register when it traverses this Link.
+//
+// The Command Ring Control Register (CRCR @ op_base + 0x18) is
+// programmed with:
+//   bits 63..6  Command Ring Pointer (ring_pa; 64-byte aligned)
+//   bit  0      RCS (Ring Cycle State) — initial cycle-bit value SW
+//               will assign to freshly-produced TRBs (=1 at init).
+//   bit  1      CS  (Command Stop) — write to abort the current cmd.
+//   bit  2      CA  (Command Abort) — write to abort *all* pending.
+//   bit  3      CRR (Command Ring Running; read-only) — HC-set.
+//
+// -----------------------------------------------------------------------------
+// Producer-safety discipline (§4.9.3)
+// -----------------------------------------------------------------------------
+//
+// Software's local cycle_bit starts = 1 (matches CRCR.RCS at init).
+// Every enqueued TRB gets its C bit set to the current cycle_bit via
+// trb_write's cycle-last discipline. When the enqueue index would
+// advance into the Link slot (slot 255):
+//   (1) The Link TRB is re-published with the current cycle_bit
+//       (making the HC eligible to follow the wraparound once it
+//        finishes consuming slot 254).
+//   (2) The software cycle_bit is toggled (0 <-> 1).
+//   (3) The enqueue index is reset to 0.
+//
+// This matches the Linux xhci-hcd producer path (drivers/usb/host/
+// xhci-ring.c inc_enq).
+//
+// -----------------------------------------------------------------------------
+// cmd_ring_ctx layout (32 B, @align(8))
+// -----------------------------------------------------------------------------
+//
+//   +0    u64 ring_pa              — physical addr of ring[0]
+//   +8    u64 ring_va              — virtual addr (== ring_pa under
+//                                     boot-stub identity map, kept
+//                                     distinct here for clarity when
+//                                     the R25 IOMMU boundary lands)
+//   +16   u16 enqueue_idx          — next slot to write (0..254)
+//   +18   u8  cycle_bit            — current SW cycle (0 or 1)
+//   +19   u8  _pad0
+//   +20   u32 size                 — # of usable TRBs (255; slot 255
+//                                     is the Link — not a command slot)
+//   +24   u64 _reserved
+//
+// A single canonical .bss slot `_xhci_cmd_ring_ctx` holds the boot-line
+// command-ring ctx.
+//
+// -----------------------------------------------------------------------------
+// R26.M2 posture: dormant at boot
+// -----------------------------------------------------------------------------
+//
+// Under BIOS/`-kernel` boot the PCI enumerator returns 0 devices,
+// xhci_probe returns 0 controllers, and there is no bar0 to feed into
+// xhci_cmd_ring_init. Symbols exist for the R26.M3 driver-attach path
+// and for UEFI/OVMF activation.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: sized stores via mov_b / mov_w / mov_d for sub-8-byte fields.
+//   G4: full-register compares.
+//
+// Reserved-label discipline: labels prefixed `xhci_cr_` / `xhci_ce_`.
+
+module CmdRing = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  pub let XHCI_CMD_RING_TRBS        : u64 = 256
+  pub let XHCI_CMD_RING_BYTES       : u64 = 4096
+  pub let XHCI_CMD_RING_LINK_SLOT   : u64 = 255      // last slot is Link TRB
+
+  // cmd_ring_ctx field offsets.
+  pub let XHCI_CR_CTX_RING_PA       : u64 = 0        // u64
+  pub let XHCI_CR_CTX_RING_VA       : u64 = 8        // u64
+  pub let XHCI_CR_CTX_ENQ_IDX       : u64 = 16       // u16
+  pub let XHCI_CR_CTX_CYCLE_BIT     : u64 = 18       // u8
+  pub let XHCI_CR_CTX_SIZE_FIELD    : u64 = 20       // u32
+  pub let XHCI_CR_CTX_SIZE          : u64 = 32
+
+  // CRCR bit definitions.
+  pub let XHCI_CRCR_RCS             : u64 = 0x1
+  pub let XHCI_CRCR_CS              : u64 = 0x2
+  pub let XHCI_CRCR_CA              : u64 = 0x4
+  pub let XHCI_CRCR_CRR             : u64 = 0x8
+
+  // ============================================================================
+  // Canonical .bss storage
+  // ============================================================================
+  //
+  //   _xhci_cmd_ring        : 256 * 16 B = 4096 B = 512 * u64
+  //                           @align(64) per xHCI 1.2 §4.9.2.1.
+  //   _xhci_cmd_ring_ctx    : 32 B = 4 * u64.
+  //
+
+  pub let mut _xhci_cmd_ring        : [u64; 512] = uninit @align(64)
+  pub let mut _xhci_cmd_ring_ctx    : [u64; 4]   = uninit @align(8)
+
+  // ============================================================================
+  // xhci_cmd_ring_init(bar0, ctx) -> ()
+  // ============================================================================
+  //
+  // SysV: (bar0: u64, ctx: u64) -> ()
+  //   rdi = BAR0 base (page-aligned MMIO)
+  //   rsi = pointer to a 32-byte cmd_ring_ctx (writable)
+  //
+  // Body:
+  //   (1) Zero-fill the 4096-byte _xhci_cmd_ring (all slots start with
+  //       C=0 — "HC-owned" so no stale TRB is executed on first RS).
+  //   (2) Populate the Link TRB at slot 255 with:
+  //         param  = ring_pa   (wraparound target)
+  //         status = 0
+  //         ctrl   = (LINK << 10) | TC(bit 1)
+  //         cycle  = 0         (Link is "HC-owned" until wraparound —
+  //                             first enqueue past slot 254 re-writes
+  //                             it with cycle=1).
+  //   (3) Populate ctx:
+  //         ring_pa      = &_xhci_cmd_ring  (VA == PA under identity map)
+  //         ring_va      = &_xhci_cmd_ring
+  //         enqueue_idx  = 0
+  //         cycle_bit    = 1                 (matches CRCR.RCS = 1)
+  //         size         = XHCI_CMD_RING_TRBS - 1 = 255 usable slots
+  //   (4) Compute op_base = bar0 + CAPLENGTH via xhci_cap_u8.
+  //   (5) Program CRCR (u64 @ op_base + 0x18) = ring_pa | RCS(1).
+  //
+  // Register plan (5-push callee-save):
+  //   rbx = bar0        (survives all nested calls)
+  //   rbp = ctx         (survives all nested calls)
+  //   r12 = op_base     (computed from bar0 + CAPLENGTH)
+  //   r13 = ring_pa     (== &_xhci_cmd_ring; also written into ctx)
+  //   r14 = scratch
+  //
+  //   5 pushes = 40 B; entry rsp%16==8 -> 48, %16==0 (aligned for
+  //   every nested call — rep_stosb, xhci_cap_u8, trb_write,
+  //   xhci_op_write_u64 — without extra pre-call pad).
+
+  pub let xhci_cmd_ring_init : (u64, u64) -> () !{sysreg, mem} @{boot} =
+    fn (bar0: u64, ctx: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R26-M2-002 (#947). Command-ring bring-up per xHCI 1.2 §4.9.2 + CRCR programming per §5.4.5. Body: (1) 5-push callee-save prologue (rbx=bar0, rbp=ctx, r12=op_base, r13=ring_pa, r14=scratch) — 40 B; entry rsp%16==8 -> 48, %16==0 (aligned for every nested xhci_cap_u8 / trb_write / xhci_op_write_u64 without pre-call pad). (2) rep_stosb-zero the 4096-byte ring: rdi=lea &_xhci_cmd_ring, rax=0, rcx=4096, cld. rep_stosb clobbers rdi/rax/rcx but rbx/rbp/r12/r13/r14 survive per SysV. (3) Populate ring_pa = lea &_xhci_cmd_ring, save in r13. (4) Write Link TRB at slot 255 via trb_write(dst=ring_pa+255*16, param=ring_pa, status=0, ctrl=(LINK<<10)|TC=0x1802, cycle=0). LINK type = 6; 6<<10 = 0x1800. TC = bit 1 = 0x2. Combined ctrl = 0x1802. cycle=0 leaves the Link 'HC-owned' at boot — the producer wraparound path (xhci_cmd_enqueue below) re-writes the Link with cycle=1 the moment SW enters the wraparound branch. (5) Populate ctx fields: ring_pa (u64@+0), ring_va (u64@+8, same value), enqueue_idx=0 (u16@+16), cycle_bit=1 (u8@+18), size=255 (u32@+20). Sub-8-byte stores via mov_w/mov_b/mov_d per G1. Reserved word @+22 and @+19 (u8 pad) zeroed. Reserved u64 @+24 zeroed. (6) Compute op_base = bar0 + CAPLENGTH: rdi=rbx, rsi=0, call xhci_cap_u8 → rax; r12 = rbx + rax. (7) Program CRCR (u64 @ op_base+0x18) = ring_pa | RCS(1): rdi=r12, rsi=0x18, rdx=r13|1, call xhci_op_write_u64. RCS bit encodes SW's initial cycle_bit=1 so the HC's first TRB fetch sees cycle=1 (matches SW producer's first write). Reserved labels: `xhci_cr_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                            // rbx = bar0
+        mov rbp, rsi;                            // rbp = ctx
+
+        // ================================================================
+        // (2) Zero-fill the 4096-byte ring.
+        // ================================================================
+        lea rdi, [rip + _xhci_cmd_ring];
+        xor rax, rax;
+        mov rcx, 4096;
+        cld;
+        rep_stosb;
+
+        // ================================================================
+        // (3) ring_pa = &_xhci_cmd_ring (VA == PA under identity map).
+        // ================================================================
+        lea r13, [rip + _xhci_cmd_ring];
+
+        // ================================================================
+        // (4) Write the Link TRB at slot 255.
+        //     dst = ring_pa + 255*16 = ring_pa + 0xFF0
+        //     param = ring_pa, status = 0, ctrl = 0x1802 (LINK|TC), cycle=0.
+        // ================================================================
+        mov rdi, r13;
+        add rdi, 4080;                           // 255 * 16
+        mov rsi, r13;                            // param = ring_pa
+        xor rdx, rdx;                            // status = 0
+        mov rcx, 6144;                           // (LINK<<10) | TC = 0x1800 | 0x2 = 0x1802
+        add rcx, 2;                              // rcx = 0x1802
+        xor r8, r8;                              // cycle = 0
+        call trb_write;
+
+        // ================================================================
+        // (5) Populate ctx.
+        // ================================================================
+        // ring_pa @+0
+        mov [rbp + 0], r13;
+
+        // ring_va @+8 (same as ring_pa under identity map)
+        mov [rbp + 8], r13;
+
+        // enqueue_idx @+16 (u16) = 0
+        xor rax, rax;
+        mov_w [rbp + 16], rax;
+
+        // cycle_bit @+18 (u8) = 1
+        mov rax, 1;
+        mov_b [rbp + 18], rax;
+
+        // _pad0 @+19 (u8) = 0
+        xor rax, rax;
+        mov_b [rbp + 19], rax;
+
+        // size @+20 (u32) = 255
+        mov rax, 255;
+        mov_d [rbp + 20], rax;
+
+        // _reserved @+24 (u64) = 0
+        xor rax, rax;
+        mov [rbp + 24], rax;
+
+        // ================================================================
+        // (6) op_base = bar0 + CAPLENGTH.
+        // ================================================================
+        mov rdi, rbx;
+        xor rsi, rsi;                            // offset 0 = CAPLENGTH
+        call xhci_cap_u8;
+        mov r12, rbx;
+        add r12, rax;                            // r12 = op_base
+
+        // ================================================================
+        // (7) CRCR = ring_pa | RCS.
+        // ================================================================
+        mov rdi, r12;
+        mov rsi, 24;                             // XHCI_OP_CRCR = 0x18
+        mov rdx, r13;
+        or  rdx, 1;                              // RCS bit 0
+        call xhci_op_write_u64;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // xhci_cmd_enqueue(ctx, param, status, control_no_cycle) -> u64
+  // ============================================================================
+  //
+  // SysV: (ctx: u64, param: u64, status: u64, control_no_cycle: u64) -> u64
+  //   rdi = ctx pointer
+  //   rsi = TRB Parameter field
+  //   rdx = TRB Status field  (u32 semantics)
+  //   rcx = TRB Control-word bits EXCLUDING the Cycle bit
+  //
+  // Returns rax = new enqueue_idx (u16 semantics, zero-extended).
+  //
+  // Body:
+  //   (1) Load enqueue_idx (u16 @ +16) and cycle_bit (u8 @ +18).
+  //   (2) Compute trb_addr = ring_va + enqueue_idx * 16.
+  //   (3) trb_write(trb_addr, param, status, control_no_cycle, cycle_bit).
+  //   (4) Advance: idx += 1.
+  //   (5) If idx == 255 (Link slot):
+  //         (a) Re-write the Link TRB with the current cycle_bit
+  //             (published so HC follows the wraparound).
+  //         (b) cycle_bit ^= 1.
+  //         (c) idx = 0.
+  //   (6) Store idx back to ctx +16 and cycle_bit back to ctx +18.
+  //   (7) Return idx.
+  //
+  // Register plan (5-push callee-save):
+  //   rbx = ctx
+  //   rbp = new enqueue_idx (scratch across trb_write nested calls)
+  //   r12 = ring_va (loaded once from ctx)
+  //   r13 = cycle_bit (scratch)
+  //   r14 = saved args across the trb_write call (packs param+status+ctrl)
+  //         — actually simpler: use scratch stack slots for the 3 caller
+  //         args and reload from stack before each trb_write.
+  //
+  //   5 pushes = 40 B; sub rsp, 32 (3 arg slots + pad) = 72; entry
+  //   rsp%16==8 -> 80, %16==0 (aligned for trb_write calls).
+
+  pub let xhci_cmd_enqueue : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (ctx: u64, param: u64, status: u64, control_no_cycle: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R26-M2-002 (#947). Enqueue one TRB onto the command ring with producer-safe Cycle-bit and Link-slot wraparound per xHCI 1.2 §4.9.3. Body: (1) 5-push callee-save (rbx=ctx, rbp=idx-scratch, r12=ring_va, r13=cycle_bit, r14=unused) — 40 B; sub rsp,32 for arg-slot spills [rsp+0]=param, [rsp+8]=status, [rsp+16]=control_no_cycle, [rsp+24]=pad. Entry rsp%16==8 -> 80, %16==0 (aligned for both trb_write calls). (2) Save caller args into stack slots (rsi/rdx/rcx get clobbered by the nested trb_write's argument setup). Save ctx in rbx. (3) Load ring_va (u64 @ ctx+8) into r12. Load enqueue_idx (u16 @ ctx+16, zero-extended) into rbp. Load cycle_bit (u8 @ ctx+18, zero-extended) into r13. (4) trb_addr = r12 + rbp*16. Call trb_write(trb_addr, param=[rsp+0], status=[rsp+8], ctrl=[rsp+16], cycle=r13). (5) Advance idx: rbp += 1. (6) If rbp == 255 (Link slot): re-write Link TRB at r12 + 255*16 with param=r12 (ring_pa; ring_va under identity map), status=0, ctrl=0x1802 (LINK|TC), cycle=r13 (current cycle so HC follows wraparound). Then r13 ^= 1 (toggle); rbp = 0. (7) Store idx back (u16 @ ctx+16) and cycle_bit back (u8 @ ctx+18). (8) Return rbp. Reserved labels: `xhci_ce_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 32;                             // [rsp+0..23] arg spills, [rsp+24] pad
+
+        // (2) Save caller args to stack, ctx to rbx.
+        mov [rsp + 0], rsi;                      // param
+        mov [rsp + 8], rdx;                      // status
+        mov [rsp + 16], rcx;                     // control_no_cycle
+        mov rbx, rdi;                            // rbx = ctx
+
+        // (3) Load ring_va, enqueue_idx, cycle_bit.
+        mov r12, [rbx + 8];                      // r12 = ring_va
+
+        xor rax, rax;
+        mov_w rax, [rbx + 16];                   // idx
+        mov rbp, rax;                            // rbp = idx
+
+        xor rax, rax;
+        mov_b rax, [rbx + 18];                   // cycle_bit
+        mov r13, rax;                            // r13 = cycle_bit
+
+        // (4) trb_addr = ring_va + idx*16 = r12 + (rbp << 4).
+        mov rax, rbp;
+        shl rax, 4;
+        add rax, r12;
+        mov rdi, rax;                            // dst
+        mov rsi, [rsp + 0];                      // param
+        mov rdx, [rsp + 8];                      // status
+        mov rcx, [rsp + 16];                     // control_no_cycle
+        mov r8, r13;                             // cycle
+        call trb_write;
+
+        // (5) Advance idx.
+        add rbp, 1;
+
+        // (6) If idx == 255 (Link slot), publish Link TRB + wrap.
+        cmp rbp, 255;
+        jne xhci_ce_no_wrap;
+
+        // Re-write Link TRB at ring_va + 255*16.
+        mov rdi, r12;
+        add rdi, 4080;                           // 255 * 16
+        mov rsi, r12;                            // param = ring_va (== ring_pa)
+        xor rdx, rdx;                            // status = 0
+        mov rcx, 6146;                           // 0x1802 = (LINK<<10)|TC
+        mov r8, r13;                             // cycle = current SW cycle
+        call trb_write;
+
+        // Toggle SW cycle bit, reset idx.
+        xor r13, 1;
+        xor rbp, rbp;
+
+      xhci_ce_no_wrap:
+        // (7) Persist idx (u16 @ +16) and cycle_bit (u8 @ +18) into ctx.
+        mov_w [rbx + 16], rbp;
+        mov_b [rbx + 18], r13;
+
+        // (8) Return idx in rax.
+        mov rax, rbp;
+
+        add rsp, 32;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
