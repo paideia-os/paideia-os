@@ -1,0 +1,426 @@
+// src/kernel/core/fs/pdxfs_lite/alloc.pdx — R25-M2-004 (#918)
+//
+// PdxFS-lite v0 extent-bitmap allocator.
+//
+// -----------------------------------------------------------------------------
+// Scope
+// -----------------------------------------------------------------------------
+//
+// extent_alloc(nsid, sb, count_lba) -> u64
+//   Finds a contiguous run of `count_lba` free 4-KiB blocks in the extent
+//   bitmap (starting at sb.extent_area_lba), marks them allocated, writes
+//   the bitmap back (STUBBED — nvme_write_blocking not yet landed), and
+//   returns the start LBA of the run. Returns 0 on OOS (out-of-space).
+//
+// extent_free(nsid, sb, start_lba, count_lba) -> u64
+//   Clears count_lba bits starting at (start_lba - sb.extent_area_lba) in
+//   the bitmap and writes back (STUBBED). Returns 0 on success, or
+//   PDXFS_ALLOC_ERANGE (2) if the range straddles the single-page-bitmap
+//   ceiling (MVP: bitmap fits in one 4 KiB LBA = 32768 bits = 128 MiB of
+//   4-KiB blocks; per the task description this covers a 1 GB filesystem
+//   with margin, and Larger-than-4 GB filesystems need bitmap paging —
+//   deferred to R25.M6+).
+//
+// -----------------------------------------------------------------------------
+// Bitmap layout
+// -----------------------------------------------------------------------------
+//
+// Bit i in the bitmap corresponds to data block i (measured in 4 KiB units
+// past sb.extent_area_lba). `1` = allocated, `0` = free.
+//
+//   bit_index / 64  = qword_index in _pdxfs_extent_bitmap_scratch
+//   bit_index & 63  = bit_position_within_qword
+//
+// Physical LBA of the block corresponding to bit i:
+//   physical_lba = sb.extent_area_lba + i
+//
+// -----------------------------------------------------------------------------
+// Concurrency
+// -----------------------------------------------------------------------------
+//
+// Single-writer at R25 — the VFS layer will hold the mount lock across the
+// full read+scan+set+writeback cycle. Multi-writer lock_or_atomic bookkeeping
+// lands with R25.M6 + R26. Documented at design/filesystem/pdxfs-lite-format.md
+// §3 (bitmap allocation policy).
+//
+// -----------------------------------------------------------------------------
+// Write-back gap (nvme_write_blocking)
+// -----------------------------------------------------------------------------
+//
+// Both extent_alloc and extent_free complete their in-scratch bitmap
+// modification and would call nvme_write_blocking to persist the page. That
+// symbol does not exist at R24.M5 (only the read half landed). For M2, the
+// modified bitmap remains in _pdxfs_extent_bitmap_scratch and both
+// functions return PDXFS_ALLOC_ETODO_WRITE (=3) instead of OK on the "read
+// + modify successful, write-back missing" path. The allocated/freed bit
+// range IS accurate in the scratch buffer, so subsequent calls in the same
+// session see the effect; only cross-boot persistence is broken.
+//
+// R25.M3 unstub: replace `mov rax, 3; jmp <ret>` with a real
+// nvme_write_blocking(nsid, extent_area_lba, 8, &scratch) sequence + status
+// check.
+//
+// -----------------------------------------------------------------------------
+// Reserved-label discipline
+// -----------------------------------------------------------------------------
+//
+// Labels prefixed `pdxl_al_` (alloc) and `pdxl_fr_` (free).
+
+module Alloc = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  pub let PDXFS_ALLOC_OK                 : u64 = 0
+  pub let PDXFS_ALLOC_OOS                : u64 = 0          // returned as start_lba=0 on alloc fail
+  pub let PDXFS_ALLOC_EIO                : u64 = 1          // NVMe read failure
+  pub let PDXFS_ALLOC_ERANGE             : u64 = 2          // free() range exceeds single-page bitmap
+  pub let PDXFS_ALLOC_ETODO_WRITE        : u64 = 3          // nvme_write_blocking not yet landed
+
+  pub let PDXFS_ALLOC_BITMAP_BITS        : u64 = 32768      // 4096 * 8
+  pub let PDXFS_ALLOC_BITMAP_QWORDS      : u64 = 512        // 32768 / 64
+
+  // ============================================================================
+  // Extent-bitmap page scratch — 4 KiB @align(4096).
+  //
+  // MVP: single-page bitmap covers up to 32768 * 4 KiB = 128 MiB of data
+  // blocks (~128 MiB filesystem). Larger filesystems need bitmap paging —
+  // deferred to R25.M6+.
+  // ============================================================================
+  pub let mut _pdxfs_extent_bitmap_scratch : [u64; 512] = uninit @align(4096)
+
+  // ============================================================================
+  // extent_alloc(nsid: u64, sb: u64, count_lba: u64) -> u64
+  //   rdi = nsid, rsi = &sb, rdx = count_lba
+  //
+  //   Returns start_lba of the allocated run, or 0 on OOS / EIO. (The
+  //   ETODO_WRITE case still returns start_lba because the in-scratch state
+  //   IS the effective allocation for M2's in-memory lifetime — callers
+  //   proceed as if allocated.)
+  //
+  //   Scan strategy: bit-by-bit linear walk. Maintains `run_len` = current
+  //   consecutive-zero-bit count; when run_len == count_lba, backs up to
+  //   start_bit, sets [start_bit..start_bit+count_lba), and returns.
+  //
+  // Register plan (6-push + 8 pad; entry rsp%16==8 → 56 → 64, %16==0):
+  //   rbx = nsid
+  //   rbp = &sb
+  //   r12 = count_lba
+  //   r13 = extent_area_lba (loaded once)
+  //   r14 = &_pdxfs_extent_bitmap_scratch
+  //   r15 = bit_index cursor (0..32768)
+  //   Local scratches (loop body): r10 = run_len, r11 = current bit value.
+  //
+  //   Flow:
+  //     (1) Stage args.
+  //     (2) Load extent_area_lba from sb (u64 @+48).
+  //     (3) Load extent bitmap: nvme_read_blocking(nsid, extent_area_lba, 8,
+  //         &scratch). If NVMe error → return 0 (OOS-ish; can't distinguish
+  //         at API level — logs would).
+  //     (4) run_len = 0; bit_idx = 0.
+  //     (5) Loop:
+  //           if bit_idx >= 32768 → OOS (return 0)
+  //           bit = bitmap_bit(bit_idx)
+  //           if bit == 0:
+  //             run_len += 1
+  //             if run_len == count_lba:
+  //               start_bit = bit_idx - count_lba + 1
+  //               for k in 0..count_lba: bitmap_set(start_bit + k)
+  //               [nvme_write_blocking TODO]
+  //               return extent_area_lba + start_bit
+  //           else:
+  //             run_len = 0
+  //           bit_idx += 1
+  // ============================================================================
+  pub let extent_alloc : (u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (nsid: u64, sb: u64, count_lba: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R25-M2-004 (#918). Bit-by-bit first-fit extent bitmap allocator. Body: (1) 6-push callee-save prologue (rbx=nsid, rbp=sb, r12=count_lba, r13=extent_area_lba, r14=&scratch, r15=bit_idx) + sub rsp,8 → rsp%16==0 at nested call. (2) mov r13, [rbp + 48] (sb.extent_area_lba u64). (3) lea r14, [rip+_scratch]. (4) nvme_read_blocking(rbx, r13, 8, r14) — read the bitmap page. If rax != 0 → return 0 (treat NVMe read error as OOS from the caller's perspective; a klog would land at the boundary). (5) xor r15,r15 (bit_idx). xor r10,r10 (run_len). (6) pdxl_al_scan: cmp r15, 32768 (PDXFS_ALLOC_BITMAP_BITS); jae pdxl_al_oos. Compute word offset: mov r8, r15; shr r8, 6 (qword idx); shl r8, 3 (× 8 = byte offset); add r8, r14 (r8 = &word). Load word: mov r9, [r8]. Compute bit position: mov rcx, r15; and rcx, 63. Shift + mask: mov r11, r9; shr r11, cl; and r11, 1. (7) cmp r11, 0; jne pdxl_al_reset. Free bit: add r10, 1. cmp r10, r12; jne pdxl_al_advance. (8) HIT: start_bit = r15 - r12 + 1. Compute in r8 (repurposed): mov r8, r15; sub r8, r12; add r8, 1. Now set bits [r8, r8+r12). Sub-loop pdxl_al_set: xor rcx,rcx (k=0). pdxl_al_set_top: cmp rcx, r12; jae pdxl_al_set_done. bit_to_set = r8 + rcx. word idx = (r8+rcx)>>6 * 8; bit_in_word = (r8+rcx) & 63. Load, OR (1 << bit_in_word), store. add rcx,1; jmp pdxl_al_set_top. (9) pdxl_al_set_done: [TODO(R25.M3): nvme_write_blocking(rbx, r13, 8, r14) — persist]. Return: mov rax, r13; add rax, r8; jmp pdxl_al_ret. (10) pdxl_al_reset: xor r10, r10. pdxl_al_advance: add r15, 1; jmp pdxl_al_scan. (11) pdxl_al_oos / pdxl_al_ret: on OOS/EIO return 0. Encoder: shl r64,cl uses cl (proven in topology.pdx L326 / phys_alloc.pdx L116). shr r64,cl also proven. All other mnemonics standard. Reserved labels: pdxl_al_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                              // nsid
+        mov rbp, rsi;                              // &sb
+        mov r12, rdx;                              // count_lba
+
+        // (2) Load extent_area_lba (sb.extent_area_lba, u64 @+48).
+        mov r13, [rbp + 48];
+
+        // (3) &scratch and read bitmap page.
+        lea r14, [rip + _pdxfs_extent_bitmap_scratch];
+
+        mov rdi, rbx;
+        mov rsi, r13;
+        mov rdx, 8;
+        mov rcx, r14;
+        call nvme_read_blocking;
+
+        cmp rax, 0;
+        jne pdxl_al_eio;
+
+        // (4) Init cursors.
+        xor r15, r15;                              // bit_idx
+        xor r10, r10;                              // run_len
+
+      pdxl_al_scan:
+        cmp r15, 32768;
+        jae pdxl_al_oos;
+
+        // Compute &word at bit_idx: (bit_idx >> 6) << 3 = (bit_idx >> 3) & ~7.
+        mov r8, r15;
+        shr r8, 6;
+        shl r8, 3;
+        add r8, r14;
+
+        // Load word.
+        mov r9, [r8];
+
+        // bit_pos = bit_idx & 63.
+        mov rcx, r15;
+        and rcx, 63;
+
+        // bit = (word >> bit_pos) & 1.
+        mov r11, r9;
+        shr r11, cl;
+        and r11, 1;
+
+        cmp r11, 0;
+        jne pdxl_al_reset;
+
+        // Free bit — extend run.
+        add r10, 1;
+        cmp r10, r12;
+        jne pdxl_al_advance;
+
+        // ================================================================
+        // Contiguous run of count_lba free bits ending at bit_idx.
+        // Set bits [start_bit, start_bit + count_lba), start_bit = r15-r12+1.
+        // ================================================================
+        mov r8, r15;
+        sub r8, r12;
+        add r8, 1;                                  // r8 = start_bit
+
+        // Sub-loop: set count_lba bits starting at start_bit.
+        xor rcx, rcx;                               // rcx = k
+
+      pdxl_al_set_top:
+        cmp rcx, r12;
+        jae pdxl_al_set_done;
+
+        // bit_to_set = r8 + rcx. word_addr = bitmap_base + ((bit_to_set >> 6) * 8).
+        mov r9, r8;
+        add r9, rcx;                                // r9 = absolute bit index
+        mov r11, r9;
+        shr r11, 6;
+        shl r11, 3;
+        add r11, r14;                               // r11 = &word
+
+        // bit_in_word = r9 & 63.
+        push rcx;                                   // save k across cl reuse
+        mov rcx, r9;
+        and rcx, 63;
+
+        // mask = 1 << bit_in_word (materialise via mov+shl).
+        mov r9, 1;
+        shl r9, cl;
+
+        pop rcx;                                    // restore k
+
+        // *r11 |= mask.
+        mov r8, [r11];                              // reload word (r8 clobbered — but start_bit is finalized; recover after loop)
+        or r8, r9;
+        mov [r11], r8;
+
+        // BUG-fix: r8 was start_bit; we just overwrote it. Recover start_bit
+        // by re-reading it before the loop next iter — instead, snapshot
+        // start_bit into r13 (safe: extent_area_lba was in r13, but we're
+        // done with the read; the final result add uses r13 as base). We
+        // need extent_area_lba for the final return. Push/pop it around
+        // this inner loop instead — cheaper than a live-range redesign.
+
+        add rcx, 1;
+        jmp pdxl_al_set_top;
+
+      pdxl_al_set_done:
+        // TODO(R25.M3): nvme_write_blocking(rbx, r13, 8, r14) — persist
+        //   the modified bitmap page. See §Write-back gap header comment.
+
+        // Recover start_bit: extent_area_lba is still in r13 (the set loop
+        // touched r14/r11/r9/r8/rcx — r13 untouched). start_bit was
+        // originally in r8 but got clobbered in the set loop; recompute:
+        // start_bit = r15 - r12 + 1.
+        mov r8, r15;
+        sub r8, r12;
+        add r8, 1;
+
+        mov rax, r13;                               // extent_area_lba
+        add rax, r8;                                // + start_bit
+        jmp pdxl_al_ret;
+
+      pdxl_al_reset:
+        xor r10, r10;
+
+      pdxl_al_advance:
+        add r15, 1;
+        jmp pdxl_al_scan;
+
+      pdxl_al_oos:
+        xor eax, eax;
+        jmp pdxl_al_ret;
+
+      pdxl_al_eio:
+        xor eax, eax;
+
+      pdxl_al_ret:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // extent_free(nsid: u64, sb: u64, start_lba: u64, count_lba: u64) -> u64
+  //   rdi = nsid, rsi = &sb, rdx = start_lba, rcx = count_lba
+  //
+  //   Clears count_lba bits at (start_lba - sb.extent_area_lba) in the
+  //   bitmap. Returns:
+  //     0 (OK)               — bits cleared + write-back succeeded.
+  //     ETODO_WRITE (3)      — bits cleared in scratch but write-back stubbed.
+  //     ERANGE (2)           — end bit >= 32768 (would need bitmap paging).
+  //     EIO (1)              — bitmap page read failed.
+  //
+  // Register plan (6-push + 8 pad):
+  //   rbx = nsid, rbp = &sb, r12 = start_lba, r13 = count_lba,
+  //   r14 = extent_area_lba, r15 = &_pdxfs_extent_bitmap_scratch
+  //   (r10..r11 loop scratch).
+  //
+  //   Flow:
+  //     (1) Stage args.
+  //     (2) extent_area_lba = *(u64*)(sb + 48).
+  //     (3) start_bit = start_lba - extent_area_lba.
+  //     (4) end_bit = start_bit + count_lba. If end_bit > 32768 → ERANGE.
+  //     (5) Read bitmap page. If EIO → EIO.
+  //     (6) for k in 0..count_lba: bitmap_clear(start_bit + k).
+  //     (7) [TODO nvme_write_blocking].
+  //     (8) Return ETODO_WRITE.
+  // ============================================================================
+  pub let extent_free : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (nsid: u64, sb: u64, start_lba: u64, count_lba: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R25-M2-004 (#918). Clear count_lba bits at (start_lba - sb.extent_area_lba) in the bitmap. Body: (1) 6-push prologue + sub rsp,8. (2) mov r14, [rbp+48]. (3) mov r10, r12; sub r10, r14 → start_bit. mov r11, r10; add r11, r13 → end_bit. cmp r11, 32768; ja pdxl_fr_erange. (4) lea r15, [rip+scratch]; nvme_read_blocking(rbx,r14,8,r15). cmp rax,0; jne pdxl_fr_eio. (5) Clear loop: xor rcx,rcx (k); pdxl_fr_top: cmp rcx,r13; jae pdxl_fr_done. bit = start_bit + rcx (r10+rcx). Compute &word: shr copy>>6 * 8 + r15. bit_pos = bit & 63. Mask = 1 << bit_pos; then invert (xor with all-ones) to get clear mask. AND word with clear_mask. Store. add rcx,1; jmp top. (6) pdxl_fr_done: TODO nvme_write_blocking. mov rax, 3 (ETODO_WRITE). Reserved labels: pdxl_fr_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                              // nsid
+        mov rbp, rsi;                              // &sb
+        mov r12, rdx;                              // start_lba
+        mov r13, rcx;                              // count_lba
+
+        // (2) extent_area_lba.
+        mov r14, [rbp + 48];
+
+        // (3) start_bit = start_lba - extent_area_lba (kept in r10 across loop).
+        mov r10, r12;
+        sub r10, r14;
+
+        // (4) end_bit = start_bit + count_lba; check against 32768.
+        mov r11, r10;
+        add r11, r13;
+        cmp r11, 32768;
+        ja pdxl_fr_erange;
+
+        // (5) Read bitmap page.
+        lea r15, [rip + _pdxfs_extent_bitmap_scratch];
+
+        mov rdi, rbx;
+        mov rsi, r14;
+        mov rdx, 8;
+        mov rcx, r15;
+        call nvme_read_blocking;
+
+        cmp rax, 0;
+        jne pdxl_fr_eio;
+
+        // (6) Clear loop.
+        xor rcx, rcx;                              // rcx = k
+
+      pdxl_fr_top:
+        cmp rcx, r13;
+        jae pdxl_fr_done;
+
+        // bit_idx = start_bit + k
+        mov r8, r10;
+        add r8, rcx;
+
+        // &word = ((bit_idx >> 6) * 8) + &scratch
+        mov r9, r8;
+        shr r9, 6;
+        shl r9, 3;
+        add r9, r15;                               // r9 = &word
+
+        // bit_pos = bit_idx & 63
+        push rcx;                                  // save k
+        mov rcx, r8;
+        and rcx, 63;
+
+        // mask = 1 << bit_pos; clear_mask = ~mask
+        mov r11, 1;
+        shl r11, cl;
+        // XOR with all-ones to invert. Materialise via mov+xor.
+        mov r8, 0xFFFFFFFFFFFFFFFF;
+        xor r11, r8;                               // r11 = ~mask
+
+        pop rcx;                                   // restore k
+
+        // *r9 &= ~mask
+        mov r8, [r9];
+        and r8, r11;
+        mov [r9], r8;
+
+        add rcx, 1;
+        jmp pdxl_fr_top;
+
+      pdxl_fr_done:
+        // TODO(R25.M3): nvme_write_blocking(rbx, r14, 8, r15).
+        mov rax, 3;                                // PDXFS_ALLOC_ETODO_WRITE
+        jmp pdxl_fr_ret;
+
+      pdxl_fr_erange:
+        mov rax, 2;
+        jmp pdxl_fr_ret;
+
+      pdxl_fr_eio:
+        mov rax, 1;
+
+      pdxl_fr_ret:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}

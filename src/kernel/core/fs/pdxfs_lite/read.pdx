@@ -1,0 +1,291 @@
+// src/kernel/core/fs/pdxfs_lite/read.pdx — R25-M2-003 (#917)
+//
+// PdxFS-lite v0 extent-based file read: logical LBA -> physical LBA
+// translation + pdxfs_read block-by-block copy path.
+//
+// -----------------------------------------------------------------------------
+// Scope
+// -----------------------------------------------------------------------------
+//
+// extent_translate(inode, logical_lba) -> u64
+//   Walks inode.extent[0..8] until logical_lba falls inside an extent.
+//   Returns the corresponding physical LBA or 0 on not-found (LBA 0 = the
+//   superblock, so it's never a valid data-block LBA — safe sentinel).
+//   Indirect-extent walk is NOT implemented at R25.M2 (see §Indirect notes).
+//
+// pdxfs_read(nsid, sb, inode, offset, len, out_pa) -> u64
+//   Reads `len` bytes starting at file byte-offset `offset` from the file
+//   whose inode is `inode`, writing to physical buffer `out_pa`. Handles
+//   partial first/last 4 KiB chunks. Returns 0 on success, PDXFS_READ_EIO
+//   (1) on NVMe read failure, PDXFS_READ_EHOLE (2) if the extent walk lands
+//   on a hole (any logical block whose extent slot is empty).
+//
+// -----------------------------------------------------------------------------
+// bar0 signature note
+// -----------------------------------------------------------------------------
+//
+// Per mount.pdx L98 rationale, bar0 is dropped from the M2 signatures of the
+// data-path helpers because nvme_read_blocking resolves the target controller
+// from its own globals set at driver-attach time. A cap-resolved sibling that
+// threads bar0 through lands with #1015 (userspace-server substrate) — same
+// gating as get_inode/put_inode. This deviates from the issue-body
+// description; documented deviation.
+//
+// -----------------------------------------------------------------------------
+// Extent layout — 8 B stride, {start_lba u32, len_lba u32}
+// -----------------------------------------------------------------------------
+//
+//   inode + 40 + i*8 + 0   u32   extent[i].start_lba   (0 = slot empty)
+//   inode + 40 + i*8 + 4   u32   extent[i].len_lba
+//
+// -----------------------------------------------------------------------------
+// Indirect notes
+// -----------------------------------------------------------------------------
+//
+// Design §2.4 anticipates a single indirect-extent block pointed to by
+// inode.indirect_lba. At R25.M2 the walker checks the inline 8 slots only.
+// If the request runs off the end (all 8 slots consumed, indirect_lba != 0),
+// we return PDXFS_READ_EHOLE — the R25.M3 unstub adds the indirect fetch
+// path here. This bounds a single readable file to 8 extents × N blocks
+// each, which is enough for the MVP shell's small text files.
+//
+// -----------------------------------------------------------------------------
+// Physical buffer discipline
+// -----------------------------------------------------------------------------
+//
+// _pdxfs_read_page_scratch is a 4 KiB @align(4096) staging buffer holding
+// one data-block LBA at a time. out_pa is the caller's destination physical
+// address (assumed page-aligned only for whole-4-KiB copies; the memcpy
+// itself is byte-granular).
+//
+// -----------------------------------------------------------------------------
+// Reserved-label discipline
+// -----------------------------------------------------------------------------
+//
+// Labels prefixed `pdxl_rd_`.
+
+module Read = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  pub let PDXFS_READ_OK                  : u64 = 0
+  pub let PDXFS_READ_EIO                 : u64 = 1
+  pub let PDXFS_READ_EHOLE               : u64 = 2
+
+  pub let PDXFS_READ_BLOCK_SIZE          : u64 = 4096
+  pub let PDXFS_READ_BLOCK_SHIFT         : u64 = 12         // log2(4096)
+  pub let PDXFS_READ_BLOCK_MASK          : u64 = 4095       // & mask == mod block
+
+  pub let PDXFS_READ_LBAS_PER_BLOCK      : u64 = 8          // 4096/512
+
+  // ============================================================================
+  // Read-side page scratch — 4 KiB @align(4096).
+  // ============================================================================
+  pub let mut _pdxfs_read_page_scratch   : [u64; 512] = uninit @align(4096)
+
+  // ============================================================================
+  // extent_translate(inode: *128B, logical_lba: u64) -> u64
+  //   rdi = &inode, rsi = logical_lba
+  //
+  //   Returns physical_lba on hit, 0 on miss (not-found / hole).
+  //
+  //   Body walks the 8 inline extents at inode + PDXFS_INODE_EXTENTS_OFFSET
+  //   (=40), stride 8 bytes, until logical_lba falls inside one:
+  //
+  //     for i in 0..8:
+  //       start = *(u32*)(inode + 40 + i*8 + 0)
+  //       len   = *(u32*)(inode + 40 + i*8 + 4)
+  //       if start == 0: break (empty slot terminates walk — dense fill)
+  //       if logical_lba < len: return start + logical_lba
+  //       logical_lba -= len
+  //     return 0
+  //
+  // Leaf; caller-save-only.
+  // ============================================================================
+  pub let extent_translate : (u64, u64) -> u64 !{mem} @{} =
+    fn (inode: u64, logical_lba: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R25-M2-003 (#917). Walk inline extent[0..8] at inode+40 until logical_lba falls inside one. Body: (1) rcx = 0 (extent index). (2) r10 = rdi + 40 (extent base pointer). (3) Loop pdxl_rd_x_top: cmp rcx, 8; jae pdxl_rd_x_miss. Load start (u32 @+0) and len (u32 @+4) — xor r8,r8; mov_d r8, [r10]; xor r9,r9; mov_d r9, [r10 + 4]. (4) cmp r8, 0; je pdxl_rd_x_miss (empty slot terminates — extent table is dense-packed by extent_alloc). (5) cmp rsi, r9; jb pdxl_rd_x_hit (logical_lba < len). (6) sub rsi, r9 (consume this extent from the residual logical LBA). (7) add r10, 8 (next slot); add rcx, 1; jmp pdxl_rd_x_top. (8) pdxl_rd_x_hit: mov rax, r8; add rax, rsi; ret. (9) pdxl_rd_x_miss: xor eax, eax; ret. Leaf. Encoder: mov_d [reg+imm] loads, cmp / jae / jb / je / jmp, xor / add / sub / mov — all proven. Reserved labels: pdxl_rd_x_.",
+      block: {
+        xor rcx, rcx;                              // rcx = i
+        mov r10, rdi;
+        add r10, 40;                               // r10 = &extent[0]
+
+      pdxl_rd_x_top:
+        cmp rcx, 8;
+        jae pdxl_rd_x_miss;
+
+        // start (u32 @+0)
+        xor r8, r8;
+        mov_d r8, [r10];
+
+        // Empty slot terminates the walk (dense-packed by allocator).
+        cmp r8, 0;
+        je pdxl_rd_x_miss;
+
+        // len (u32 @+4)
+        xor r9, r9;
+        mov_d r9, [r10 + 4];
+
+        // if logical_lba < len: hit.
+        cmp rsi, r9;
+        jb pdxl_rd_x_hit;
+
+        // else: consume this extent, next slot.
+        sub rsi, r9;
+        add r10, 8;
+        add rcx, 1;
+        jmp pdxl_rd_x_top;
+
+      pdxl_rd_x_hit:
+        mov rax, r8;
+        add rax, rsi;
+        ret;
+
+      pdxl_rd_x_miss:
+        xor eax, eax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_read(nsid: u64, sb: u64, inode: *128B, offset: u64, len: u64,
+  //            out_pa: u64) -> u64
+  //   rdi = nsid, rsi = &sb (unused at M2, kept for API stability),
+  //   rdx = &inode, rcx = offset, r8 = len, r9 = out_pa.
+  //
+  //   Byte-granular read from the file described by `inode`. Handles partial
+  //   first + last blocks. Returns 0 on success, 1 on NVMe read error, 2 on
+  //   hole encountered mid-copy.
+  //
+  //   Loop invariant (per iteration):
+  //     r_offset    = current file byte-offset      (starts at `offset`)
+  //     r_remaining = bytes still to deliver         (starts at `len`)
+  //     r_out       = current destination PA         (starts at `out_pa`)
+  //
+  //     Each iteration:
+  //       logical_lba    = r_offset >> 12
+  //       in_block_off   = r_offset & 4095
+  //       can_copy       = min(r_remaining, 4096 - in_block_off)
+  //       physical_lba   = extent_translate(inode, logical_lba)
+  //       if physical_lba == 0: return EHOLE
+  //       nvme_read_blocking(nsid, physical_lba, 8, &_pdxfs_read_page_scratch)
+  //       if NVMe fail: return EIO
+  //       memcpy(r_out, &_pdxfs_read_page_scratch + in_block_off, can_copy)
+  //       r_offset    += can_copy
+  //       r_remaining -= can_copy
+  //       r_out       += can_copy
+  //     until r_remaining == 0
+  //
+  //   6 args (no bar0), all fit in registers.
+  //
+  // Register plan (6-push callee-save + 8 pad; entry rsp%16==8 → 56, sub 8 →
+  //   64, %16==0 for the two nested calls):
+  //     rbx = nsid                (u32 semantics)
+  //     rbp = &inode              (extent_translate operand)
+  //     r12 = r_remaining         (bytes-to-copy residual)
+  //     r13 = r_offset            (file byte-offset residual)
+  //     r14 = r_out               (destination PA residual)
+  //     r15 = &_pdxfs_read_page_scratch
+  // ============================================================================
+  pub let pdxfs_read : (u64, u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (nsid: u64, sb: u64, inode: u64, offset: u64, len: u64, out_pa: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R25-M2-003 (#917). Byte-granular extent-based file read. Body: (1) 6-push callee-save prologue (rbx=nsid, rbp=inode, r12=len/remaining, r13=offset, r14=out_pa, r15=&scratch) — 48 B; entry rsp%16==8 + 48 = 56, sub rsp,8 → 64, %16==0 (SysV call boundary). Note: sb (rsi arg) is discarded — kept in the signature for API stability but no callee needs it. inode arg was in rdx → rbp. offset (rcx) → r13. len (r8) → r12. out_pa (r9) → r14. (2) lea r15, [rip + _pdxfs_read_page_scratch]. (3) Main loop pdxl_rd_top: cmp r12, 0; je pdxl_rd_ok. (4) Compute logical_lba = r13 >> 12: mov rdi, r13; shr rdi, 12. Compute in_block_off = r13 & 4095: mov rsi, r13; and rsi, 4095. Save in_block_off in r10 (caller-save; safe across the extent_translate call because extent_translate does not touch r10 — reviewed against the pdxl_rd_x_ body above which uses only rcx/r8/r9/r10/r11 — wait, it does clobber r10). Alternative: recompute in_block_off after extent_translate. Better: use the callee-save r11? r11 is caller-save. Best plan: recompute after the extent_translate returns. (5) extent_translate(inode=rbp, logical_lba=rdi): mov rsi, rdi; mov rdi, rbp; call extent_translate → rax. (6) cmp rax, 0; je pdxl_rd_hole. (7) Save physical_lba: mov r11, rax (r11 is caller-save, but next call is nvme_read_blocking to which we pass rax anyway — so no save needed if we call immediately). (8) nvme_read_blocking(rbx, rax, 8, r15): mov rdi, rbx; mov rsi, rax; mov rdx, 8; mov rcx, r15; call nvme_read_blocking → rax. (9) cmp rax, 0; jne pdxl_rd_eio. (10) Recompute in_block_off = r13 & 4095: mov r10, r13; and r10, 4095. bytes_this_block = 4096 - in_block_off: mov r11, 4096; sub r11, r10. can_copy = min(r12, r11): cmp r12, r11; jae pdxl_rd_use_r11; mov r11, r12; pdxl_rd_use_r11: (r11 now holds can_copy). (11) memcpy: src = r15 + in_block_off = r15 + r10; dst = r14; count = r11. Use rep_movsb (byte-granular). mov rsi, r15; add rsi, r10; mov rdi, r14; mov rcx, r11; cld; rep_movsb. (12) Advance: add r13, r11; sub r12, r11; add r14, r11. jmp pdxl_rd_top. (13) Terminals: pdxl_rd_ok: xor eax, eax; jmp pdxl_rd_ret. pdxl_rd_eio: mov rax, 1; jmp pdxl_rd_ret. pdxl_rd_hole: mov rax, 2; pdxl_rd_ret: epilogue. Encoder: rep_movsb proven (libc_test.pdx L167 and mount.pdx pattern), shr/and/sub/add/cmp/jae/jne/je/jmp/mov all proven, mov r64,imm32 proven. Reserved labels: pdxl_rd_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                              // nsid
+        // rsi (sb) intentionally discarded — API-stability only at M2.
+        mov rbp, rdx;                              // &inode
+        mov r13, rcx;                              // r_offset
+        mov r12, r8;                               // r_remaining
+        mov r14, r9;                               // r_out
+
+        lea r15, [rip + _pdxfs_read_page_scratch];
+
+      pdxl_rd_top:
+        cmp r12, 0;
+        je pdxl_rd_ok;
+
+        // logical_lba = r_offset >> 12  → arg for extent_translate.
+        mov rdi, rbp;                              // inode
+        mov rsi, r13;
+        shr rsi, 12;                               // logical_lba
+        call extent_translate;
+        // rax = physical_lba (0 = miss)
+
+        cmp rax, 0;
+        je pdxl_rd_hole;
+
+        // nvme_read_blocking(nsid, physical, 8, &scratch)
+        mov rdi, rbx;
+        mov rsi, rax;
+        mov rdx, 8;
+        mov rcx, r15;
+        call nvme_read_blocking;
+
+        cmp rax, 0;
+        jne pdxl_rd_eio;
+
+        // in_block_off = r_offset & 4095
+        mov r10, r13;
+        and r10, 4095;
+
+        // bytes_this_block = 4096 - in_block_off
+        mov r11, 4096;
+        sub r11, r10;
+
+        // can_copy = min(r_remaining, bytes_this_block)
+        cmp r12, r11;
+        jae pdxl_rd_ccap;
+        mov r11, r12;                              // r_remaining < bytes_this_block
+
+      pdxl_rd_ccap:
+        // memcpy(r_out, &scratch + in_block_off, can_copy)
+        mov rsi, r15;
+        add rsi, r10;
+        mov rdi, r14;
+        mov rcx, r11;
+        cld;
+        rep_movsb;
+
+        // Advance: r_offset += can_copy; r_remaining -= can_copy; r_out += can_copy.
+        add r13, r11;
+        sub r12, r11;
+        add r14, r11;
+        jmp pdxl_rd_top;
+
+      pdxl_rd_ok:
+        xor eax, eax;
+        jmp pdxl_rd_ret;
+
+      pdxl_rd_eio:
+        mov rax, 1;
+        jmp pdxl_rd_ret;
+
+      pdxl_rd_hole:
+        mov rax, 2;
+
+      pdxl_rd_ret:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}

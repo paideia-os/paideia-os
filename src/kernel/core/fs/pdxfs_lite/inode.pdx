@@ -1,0 +1,559 @@
+// src/kernel/core/fs/pdxfs_lite/inode.pdx — R25-M2-001/002 (#915, #916)
+//
+// PdxFS-lite v0 inode struct + inode-table read/write.
+//
+// -----------------------------------------------------------------------------
+// Scope
+// -----------------------------------------------------------------------------
+//
+// This file lands the two issues that make an inode readable from the on-disk
+// inode table:
+//
+//   #915 — 128-byte inode struct (mode/uid/gid/times/extent[8]/indirect/checksum)
+//          + inode_serialize / inode_deserialize / inode_checksum.
+//
+//   #916 — inode-table LBA arithmetic + get_inode / put_inode. 32 inodes per
+//          4 KiB LBA (128 B stride); index -> (lba, offset_in_lba).
+//
+// Both share this file because #916's read-modify-write flow needs the
+// serialize+checksum helpers from #915 back-to-back, and splitting them
+// forces a header-like forward-decl the paideia-as encoder doesn't want.
+//
+// -----------------------------------------------------------------------------
+// Byte layout — mirrors design/filesystem/pdxfs-lite-format.md §2.1
+// -----------------------------------------------------------------------------
+//
+//   Offset  Size  Field           Type    Notes
+//   ------  ----  --------------  ------  ---------------------------------------
+//   0       2     mode            u16 LE  POSIX-ish type + perms
+//   2       2     uid             u16 LE  Owner UID (v0: always 0)
+//   4       2     gid             u16 LE  Group GID (v0: always 0)
+//   6       2     _pad0           u16     Zero
+//   8       8     size            u64 LE  File size in bytes
+//   16      8     atime           u64 LE  Access time (ns since epoch)
+//   24      8     mtime           u64 LE  Modify time
+//   32      8     ctime           u64 LE  Change (status) time
+//   40      64    extent[8]       8x8B    {start_lba u32, len_lba u32} per slot
+//   104     8     indirect_lba    u64 LE  LBA of an indirect-extent block or 0
+//   112     2     link_count      u16 LE  Hard-link count
+//   114     2     _pad1           u16     Zero
+//   116     8     _reserved       u64     Zero
+//   124     4     checksum        u32 LE  Hash over bytes [0, 124)
+//   -------------
+//   128 total
+//
+// The extent shape ({start_lba u32, len_lba u32} = 8 B per slot) deviates
+// from the M1 design doc's fixed-4KiB-per-slot notation (§2.3) and adopts
+// the R25.M4 upgrade path early — the writable path (#919) needs
+// variable-length extents to be usable at all. This is a *format*
+// commitment; images written under this M2 code are NOT compatible with
+// the M1-only fixed-length-slot reader. The superblock version stays at 1
+// because the M1 reader never landed a data path that touched extent[]
+// bytes (sb_validate only reads the superblock).
+//
+// -----------------------------------------------------------------------------
+// Checksum (R25.M2 interim; real CRC32C at R25.M5+)
+// -----------------------------------------------------------------------------
+//
+// The checksum field at [124..128) is a 31-u32-word XOR-fold-with-diffusion
+// over bytes [0, 124). Not CRC32C — that lands with the crypto substrate at
+// #929 R25.M5 alongside the ML-DSA-65 signature verify. The M2 hash catches:
+//
+//   - single-bit flips (they migrate through the accumulator via shift-xor)
+//   - swapped words (position-sensitive via the loop's per-word shift)
+//   - a torn write leaving trailing zeros (accumulator differs from any
+//     shorter prefix)
+//
+// It does NOT catch adversarial collisions — that's the job of the
+// per-inode extent MAC at R40 (PdxFS v1). Documented as MVP.
+//
+// -----------------------------------------------------------------------------
+// Physical buffer discipline
+// -----------------------------------------------------------------------------
+//
+// _pdxfs_inode_page_scratch is a 4 KiB @align(4096) staging buffer used by
+// get_inode / put_inode to hold one inode-table LBA (32 inodes) at a time.
+// Same identity-map assumption as mount.pdx: .bss VA == PA under the
+// R14-M2-onwards aspace map, so this VA doubles as PRP1 physical.
+//
+// R25.M2 is single-threaded (VFS lock held across get/put); a per-mount
+// scratch replaces the shared one at R25.M6+ concurrency substrate.
+//
+// -----------------------------------------------------------------------------
+// nvme_write_blocking gap
+// -----------------------------------------------------------------------------
+//
+// put_inode does read-modify-write on the containing 4 KiB inode-table LBA.
+// The final write step needs nvme_write_blocking, which does not yet exist
+// (R24.M5 landed the read half only — see design/drivers/nvme-issues.md and
+// src/kernel/core/drivers/nvme/sync.pdx). At R25.M2 put_inode stages the
+// modified 4 KiB into _pdxfs_inode_page_scratch and returns
+// PDXFS_INODE_ETODO_WRITE (=4), leaving the write-back for R25.M3 when
+// nvme_write_blocking lands. Serialize+checksum still runs so callers can
+// observe the correct hash in the scratch buffer under a debugger.
+//
+// -----------------------------------------------------------------------------
+// Reserved-label discipline
+// -----------------------------------------------------------------------------
+//
+// Labels prefixed `pdxl_in_` (avoids reserved `if`, `loop`, `end`, ...).
+
+module Inode = structure {
+
+  // ============================================================================
+  // Layout constants — frozen at R25.M2. Any change requires a superblock
+  // version bump per design/filesystem/pdxfs-lite-format.md §2.3 upgrade path.
+  // ============================================================================
+
+  pub let PDXFS_INODE_SIZE               : u64 = 128
+  pub let PDXFS_INODE_QWORDS             : u64 = 16          // 128 / 8
+  pub let PDXFS_INODE_PER_LBA            : u64 = 32          // 4096 / 128
+  pub let PDXFS_INODE_LBA_SHIFT          : u64 = 5           // log2(32)
+  pub let PDXFS_INODE_SLOT_SHIFT         : u64 = 7           // log2(128)
+  pub let PDXFS_INODE_SLOT_MASK          : u64 = 31          // & 31 == % 32
+
+  // Field offsets — frozen.
+  pub let PDXFS_INODE_MODE_OFFSET        : u64 = 0           // u16
+  pub let PDXFS_INODE_UID_OFFSET         : u64 = 2           // u16
+  pub let PDXFS_INODE_GID_OFFSET         : u64 = 4           // u16
+  pub let PDXFS_INODE_PAD0_OFFSET        : u64 = 6           // u16
+  pub let PDXFS_INODE_SIZE_FIELD_OFFSET  : u64 = 8           // u64  (byte-size)
+  pub let PDXFS_INODE_ATIME_OFFSET       : u64 = 16          // u64
+  pub let PDXFS_INODE_MTIME_OFFSET       : u64 = 24          // u64
+  pub let PDXFS_INODE_CTIME_OFFSET       : u64 = 32          // u64
+  pub let PDXFS_INODE_EXTENTS_OFFSET     : u64 = 40          // 8 * 8 B
+  pub let PDXFS_INODE_EXTENTS_END        : u64 = 104
+  pub let PDXFS_INODE_EXTENT_STRIDE      : u64 = 8           // {start_lba u32, len_lba u32}
+  pub let PDXFS_INODE_EXTENT_COUNT       : u64 = 8
+  pub let PDXFS_INODE_INDIRECT_OFFSET    : u64 = 104         // u64
+  pub let PDXFS_INODE_LINK_COUNT_OFFSET  : u64 = 112         // u16
+  pub let PDXFS_INODE_PAD1_OFFSET        : u64 = 114         // u16
+  pub let PDXFS_INODE_RESERVED_OFFSET    : u64 = 116         // u64
+  pub let PDXFS_INODE_CHECKSUM_OFFSET    : u64 = 124         // u32
+  pub let PDXFS_INODE_CHECKSUM_COVER     : u64 = 124         // bytes [0, 124) hashed
+
+  // Return-code sentinels.
+  pub let PDXFS_INODE_OK                 : u64 = 0
+  pub let PDXFS_INODE_EIO                : u64 = 1           // NVMe read/write failure
+  pub let PDXFS_INODE_ECKSUM             : u64 = 2           // stored != recomputed
+  pub let PDXFS_INODE_ERANGE             : u64 = 3           // inode_id out of table span
+  pub let PDXFS_INODE_ETODO_WRITE        : u64 = 4           // nvme_write_blocking not yet landed
+
+  // Checksum hash constants (interim; superseded by CRC32C at R25.M5+).
+  //   PDXL_HASH_INIT — Marsaglia-style seed, non-zero so empty-inode hash != 0.
+  //   PDXL_HASH_MIX  — golden-ratio-lite multiplier substitute (added, not
+  //                    multiplied, to avoid the imul encoder path — proven
+  //                    but avoided here for symmetry with the shift-only body).
+  pub let PDXL_HASH_INIT                 : u64 = 0xCBF29CE484222325
+  pub let PDXL_HASH_MIX                  : u64 = 0x9E3779B97F4A7C15
+
+  // ============================================================================
+  // Shared inode-table page scratch — 4 KiB @align(4096).
+  //
+  // Holds one inode-table LBA (32 inodes) during get_inode/put_inode. Under
+  // identity map its VA == PA (PRP1-legal).
+  // ============================================================================
+  pub let mut _pdxfs_inode_page_scratch  : [u64; 512] = uninit @align(4096)
+
+  // ============================================================================
+  // inode_checksum(inode: *128B) -> u64
+  //   rdi = &inode (128-byte buffer)
+  //   returns 32-bit hash of bytes [0, 124) in low 32 bits of rax; high 32 = 0.
+  //
+  // Body:
+  //   acc = PDXL_HASH_INIT
+  //   for i in 0..31:
+  //     word = *(u32*)(inode + i*4)
+  //     acc ^= word
+  //     acc = (acc << 5) | (acc >> 59)  // rotate-left-5 via shift+or, no `rol`
+  //     acc += PDXL_HASH_MIX
+  //   return acc & 0xFFFFFFFF
+  //
+  // Leaf (no callee-save touched). rax/rcx/r8..r11 caller-saved SysV.
+  // ============================================================================
+  pub let inode_checksum : (u64) -> u64 !{mem} @{} =
+    fn (inode: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R25-M2-001 (#915). Hash bytes [0, 124) of the 128-byte inode buffer at rdi into a 32-bit accumulator. Body: (1) rcx = 0 (word index). (2) r8 = PDXL_HASH_INIT (materialised via mov r64, imm64 — proven in uuid.pdx L87 for the diffuser constant). (3) r9 = PDXL_HASH_MIX (mov r64, imm64). (4) Loop pdxl_in_ck_top: cmp rcx, 31; jae pdxl_in_ck_done. r10 = rcx << 2 (word byte offset via shl); r11 = rdi + r10 (word address via add). xor rax, rax; mov_d rax, [r11] (u32 load, zero-extended). xor r8, rax. Rotate-left-5 emulated: mov r10, r8; shr r10, 59; shl r8, 5; or r8, r10. add r8, r9. add rcx, 1; jmp pdxl_in_ck_top. (5) pdxl_in_ck_done: mov rax, r8; mov r11, 0xFFFFFFFF; and rax, r11; ret. Encoder posture: mov r64,imm64 / mov_d [reg] / shl r64,imm / shr r64,imm / xor / or / and / add / cmp / jae / jmp — all proven. Leaf. Reserved labels: pdxl_in_ck_.",
+      block: {
+        xor rcx, rcx;                              // rcx = word index i
+        mov r8, 0xCBF29CE484222325;                // r8 = accumulator (PDXL_HASH_INIT)
+        mov r9, 0x9E3779B97F4A7C15;                // r9 = mixing constant
+
+      pdxl_in_ck_top:
+        cmp rcx, 31;
+        jae pdxl_in_ck_done;
+
+        // r11 = &inode + rcx * 4
+        mov r10, rcx;
+        shl r10, 2;
+        mov r11, rdi;
+        add r11, r10;
+
+        // Load u32 word (zero-extended into rax).
+        xor rax, rax;
+        mov_d rax, [r11];
+
+        // acc ^= word
+        xor r8, rax;
+
+        // acc = rotl(acc, 5) via shift+or
+        mov r10, r8;
+        shr r10, 59;                               // top-5 bits into low-5 (of r10)
+        shl r8, 5;
+        or r8, r10;
+
+        // acc += mix
+        add r8, r9;
+
+        // ++i
+        add rcx, 1;
+        jmp pdxl_in_ck_top;
+
+      pdxl_in_ck_done:
+        mov rax, r8;
+        mov r11, 0xFFFFFFFF;
+        and rax, r11;                              // truncate to u32
+        ret
+      }
+    }
+
+  // ============================================================================
+  // inode_serialize(src: *128B, dst: *128B) -> u64
+  //   rdi = src, rsi = dst
+  //
+  //   memcpy 128 B src -> dst, recompute checksum of dst[0..124), store into
+  //   dst[124..128). Returns 0.
+  //
+  //   Body:
+  //     (1) rep_movsq 16 qwords (src=rdi, dst=rsi, count=16).
+  //         Note: rep_movsq reads from rsi and writes to rdi under standard
+  //         cld; convention. rsi=src, rdi=dst is REVERSED here — we need to
+  //         swap: mov rax,rdi; mov rdi,rsi; mov rsi,rax; rep_movsq (proven in
+  //         mount.pdx L136 which does src->dst via `mov rsi,src; mov rdi,dst`).
+  //     (2) Recompute checksum on the fresh dst: rdi = original dst (saved),
+  //         call inode_checksum → rax (u32).
+  //     (3) mov_d [dst + 124], rax.
+  //     (4) Return 0.
+  // ============================================================================
+  pub let inode_serialize : (u64, u64) -> u64 !{mem} @{} =
+    fn (src: u64, dst: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R25-M2-001 (#915). Copy 128 B src->dst then stamp checksum. Body: (1) Prologue: 2-push callee-save (rbx=dst, r12=src) — 16 B; entry rsp%16==8 + 16 = 24, sub rsp,8 → 32, %16==0 for the nested inode_checksum call. (2) Set up rep_movsq: rsi=src (r12), rdi=dst (rbx), rcx=16 (128/8 qwords), cld, rep_movsq — matches mount.pdx L136 pattern exactly. (3) Recompute checksum on dst: mov rdi, rbx; call inode_checksum → rax = u32 hash. (4) Stamp: mov_d [rbx + 124], rax. (5) xor eax,eax; epilogue. Reserved labels: none (straight-line). Encoder: rep_movsq / mov_d [mem+imm], reg / call / cld all proven.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rsi;                              // rbx = dst
+        mov r12, rdi;                              // r12 = src
+
+        // memcpy 128 B (16 qwords) src -> dst
+        mov rsi, r12;                              // rep_movsq src
+        mov rdi, rbx;                              // rep_movsq dst
+        mov rcx, 16;
+        cld;
+        rep_movsq;
+
+        // Recompute checksum on dst.
+        mov rdi, rbx;
+        call inode_checksum;
+
+        // Stamp checksum at dst + 124.
+        mov_d [rbx + 124], rax;
+
+        xor eax, eax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // inode_deserialize(src: *128B, dst: *128B) -> u64
+  //   rdi = src, rsi = dst
+  //
+  //   memcpy 128 B src -> dst, then verify checksum: recompute over dst[0..124)
+  //   and compare against stored dst[124..128). Returns 0 on match,
+  //   PDXFS_INODE_ECKSUM (2) on mismatch.
+  //
+  //   Symmetric to inode_serialize but tests instead of stamps.
+  // ============================================================================
+  pub let inode_deserialize : (u64, u64) -> u64 !{mem} @{} =
+    fn (src: u64, dst: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R25-M2-001 (#915). Copy 128 B src->dst then verify stored checksum. Body: (1) 2-push callee-save (rbx=dst, r12=src) + sub rsp,8. (2) rep_movsq 16 qwords src->dst. (3) Load stored checksum: xor rax,rax; mov_d rax, [rbx + 124]; save in r13 — need another push. Rework: 3-push (rbx, r12, r13); entry+24 = 32; add sub rsp,0? 32 mod 16 = 0, aligned without pad. (4) mov rdi, rbx; call inode_checksum → rax (recomputed). (5) cmp rax, r13; jne pdxl_in_ds_bad. (6) xor eax,eax; epilogue. Bad path: mov rax, 2 (PDXFS_INODE_ECKSUM); epilogue. Reserved labels: pdxl_in_ds_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rsi;                              // rbx = dst
+        mov r12, rdi;                              // r12 = src
+
+        // memcpy 128 B (16 qwords) src -> dst
+        mov rsi, r12;
+        mov rdi, rbx;
+        mov rcx, 16;
+        cld;
+        rep_movsq;
+
+        // Save stored checksum (u32) into r13.
+        xor r13, r13;
+        mov_d r13, [rbx + 124];
+
+        // Recompute checksum on dst.
+        mov rdi, rbx;
+        call inode_checksum;
+
+        // Compare recomputed (rax) to stored (r13).
+        cmp rax, r13;
+        jne pdxl_in_ds_bad;
+
+        xor eax, eax;
+        jmp pdxl_in_ds_ret;
+
+      pdxl_in_ds_bad:
+        mov rax, 2;                                // PDXFS_INODE_ECKSUM
+
+      pdxl_in_ds_ret:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // inode_lba_for_id(sb: *pdxfs_sb, inode_id: u64) -> u64
+  //   rdi = &sb, rsi = inode_id
+  //
+  //   lba = sb.itable_lba + (inode_id / 32)
+  //       = *(u64*)(sb + PDXFS_SB_ITABLE_LBA_OFFSET) + (inode_id >> 5)
+  //
+  //   No bounds check (caller pre-validates via inode-table span). Leaf.
+  // ============================================================================
+  pub let inode_lba_for_id : (u64, u64) -> u64 !{mem} @{} =
+    fn (sb: u64, inode_id: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R25-M2-002 (#916). Compute containing inode-table LBA for the given inode_id. Body: (1) mov rax, [rdi + 32] — load sb.itable_lba (u64 field @ offset PDXFS_SB_ITABLE_LBA_OFFSET=32). (2) mov rcx, rsi; shr rcx, 5 — divide inode_id by 32 (PDXFS_INODE_PER_LBA). (3) add rax, rcx. (4) ret. Leaf. Encoder: mov r64,[reg+imm8] / mov r64,r64 / shr r64,imm / add / ret — all proven.",
+      block: {
+        mov rax, [rdi + 32];                       // sb.itable_lba
+        mov rcx, rsi;
+        shr rcx, 5;                                // inode_id / 32
+        add rax, rcx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // inode_offset_for_id(inode_id: u64) -> u64
+  //   rdi = inode_id
+  //
+  //   offset = (inode_id % 32) * 128
+  //          = (inode_id & 31) << 7
+  //
+  //   Leaf, single-shift + mask.
+  // ============================================================================
+  pub let inode_offset_for_id : (u64) -> u64 !{mem} @{} =
+    fn (inode_id: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R25-M2-002 (#916). offset_in_lba = (inode_id & 31) << 7 — bit-arithmetic form of (inode_id % 32) * 128. Body: mov rax,rdi; and rax,31; shl rax,7; ret. Leaf.",
+      block: {
+        mov rax, rdi;
+        and rax, 31;                               // % 32
+        shl rax, 7;                                // * 128
+        ret
+      }
+    }
+
+  // ============================================================================
+  // get_inode(nsid: u64, sb: u64, inode_id: u64, out: u64) -> u64
+  //   rdi = nsid, rsi = &sb, rdx = inode_id, rcx = out (128 writable bytes)
+  //
+  //   Returns 0 on success (inode read + checksum verified),
+  //   PDXFS_INODE_EIO (1) on NVMe read failure,
+  //   PDXFS_INODE_ECKSUM (2) on stored != recomputed checksum.
+  //
+  // Note on bar0: dropped from the M2 signature per the mount.pdx L98 rationale
+  // (nvme_read_blocking resolves the target controller from its own globals set
+  // at driver-attach time). A cap-resolved sibling that threads bar0 through
+  // lands with the #1015 userspace-server substrate.
+  //
+  // Register plan (5-push callee-save; entry rsp%16==8 → 48, no pad; %16==0
+  // for nested calls):
+  //   rbx = nsid
+  //   rbp = &sb
+  //   r12 = inode_id
+  //   r13 = out
+  //   r14 = &_pdxfs_inode_page_scratch (staging PA)
+  //   r15 = offset_in_lba (bytes)
+  //
+  //   Flow:
+  //     (1) Stage args.
+  //     (2) lba = inode_lba_for_id(sb, inode_id).
+  //     (3) offset_in_lba = inode_offset_for_id(inode_id); save in r15.
+  //     (4) nvme_read_blocking(nsid, lba, 8, &scratch) — 8 × 512 B = 4 KiB.
+  //         (M1 mount.pdx assumes 512 B LBAs — same fixture, same assumption.)
+  //     (5) If NVMe status != 0 → return EIO.
+  //     (6) src = &scratch + offset_in_lba. inode_deserialize(src, out).
+  //     (7) Return whatever inode_deserialize returned (OK or ECKSUM).
+  // ============================================================================
+  pub let get_inode : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (nsid: u64, sb: u64, inode_id: u64, out: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R25-M2-002 (#916). Read one inode (128 B) from the inode table: stage the containing 4 KiB LBA into _pdxfs_inode_page_scratch, then deserialize+verify into out. Body: (1) 5-push callee-save (rbx=nsid, rbp=sb, r12=inode_id, r13=out, r14=&scratch) — 40 B; entry rsp%16==8 + 40 = 48, %16==0 for the nested nvme_read_blocking / inode_deserialize calls, no pad required. Actually 8 + 40 = 48; 48 mod 16 = 0, then call pushes 8 → callee sees rsp%16==8 (correct SysV entry). Good — no pad. (2) Stage args into callee-saves. (3) lea r14, [rip + _pdxfs_inode_page_scratch]. (4) lba = inode_lba_for_id(rbp, r12): mov rdi,rbp; mov rsi,r12; call inode_lba_for_id → rax. Save in r15 (add 6th push). Push r15 too → 6 pushes = 48 B; entry+48 = 56, %16==8. Need sub rsp,8 → 64, %16==0. (5) nvme_read_blocking(rbx, rax, 8, r14): mov rdi,rbx; mov rsi,rax; mov rdx,8; mov rcx,r14; call nvme_read_blocking → rax. (6) cmp rax,0; jne EIO. (7) offset_in_lba = inode_offset_for_id(r12): mov rdi,r12; call inode_offset_for_id → rax. (8) src = r14 + rax. inode_deserialize(src, r13): lea rdi, [r14 + rax] (via add r14+rax into rdi); mov rsi, r13; call inode_deserialize → rax (0 or ECKSUM). (9) Forward rax. Epilogue add rsp,8; pops. Reserved labels: pdxl_in_g_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                              // nsid
+        mov rbp, rsi;                              // &sb
+        mov r12, rdx;                              // inode_id
+        mov r13, rcx;                              // out
+
+        // r14 = &_pdxfs_inode_page_scratch (page-aligned scratch, identity-map PA).
+        lea r14, [rip + _pdxfs_inode_page_scratch];
+
+        // lba = inode_lba_for_id(sb, inode_id).
+        mov rdi, rbp;
+        mov rsi, r12;
+        call inode_lba_for_id;
+        mov r15, rax;                              // r15 = lba
+
+        // nvme_read_blocking(nsid, lba, count=8, buf_pa=scratch).
+        mov rdi, rbx;
+        mov rsi, r15;
+        mov rdx, 8;
+        mov rcx, r14;
+        call nvme_read_blocking;
+
+        cmp rax, 0;
+        jne pdxl_in_g_eio;
+
+        // offset_in_lba = inode_offset_for_id(inode_id).
+        mov rdi, r12;
+        call inode_offset_for_id;
+
+        // src = &scratch + offset_in_lba. rax already holds offset.
+        mov rdi, r14;
+        add rdi, rax;                              // rdi = src
+        mov rsi, r13;                              // rsi = dst (out)
+        call inode_deserialize;
+        jmp pdxl_in_g_ret;
+
+      pdxl_in_g_eio:
+        mov rax, 1;                                // PDXFS_INODE_EIO
+
+      pdxl_in_g_ret:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // put_inode(nsid: u64, sb: u64, inode_id: u64, inode: u64) -> u64
+  //   rdi = nsid, rsi = &sb, rdx = inode_id, rcx = inode (128-byte src)
+  //
+  //   Read-modify-write: read the containing 4 KiB LBA into scratch, serialize
+  //   the inode (with a fresh checksum) into scratch at the correct offset,
+  //   write scratch back to disk.
+  //
+  //   RETURN AT R25.M2: PDXFS_INODE_ETODO_WRITE (4) — the write step is
+  //   stubbed because nvme_write_blocking does not yet exist. The
+  //   read+serialize+checksum path IS exercised so callers can observe the
+  //   correct 4 KiB post-image in _pdxfs_inode_page_scratch under a debugger
+  //   and future test harnesses can diff against the expected LBA layout.
+  //
+  //   R25.M3 unstub: replace `mov rax, 4; jmp pdxl_in_p_ret` with a real
+  //   `mov rdi, rbx; mov rsi, r15; mov rdx, 8; mov rcx, r14; call
+  //   nvme_write_blocking` sequence + status check.
+  //
+  // Register plan mirrors get_inode (6-push + 8 pad).
+  // ============================================================================
+  pub let put_inode : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (nsid: u64, sb: u64, inode_id: u64, inode: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R25-M2-002 (#916). Write one inode via read-modify-write: read the containing 4 KiB LBA into scratch, inode_serialize(inode_src, &scratch+offset) which memcpy+recomputes checksum, then write scratch back to disk (STUBBED at R25.M2 — nvme_write_blocking doesn't exist yet). Body mirrors get_inode: 6-push callee-save prologue + sub rsp,8 for align. (1) Stage args. (2) lba = inode_lba_for_id(sb, inode_id). Save in r15. (3) nvme_read_blocking(nsid, lba, 8, &scratch); if non-zero → EIO. (4) offset_in_lba = inode_offset_for_id(inode_id). (5) inode_serialize(src=inode, dst=&scratch+offset) — copies 128 B AND stamps a fresh checksum at [dst+124..128). (6) TODO(R25.M3): nvme_write_blocking(nsid, lba, 8, &scratch). For now: mov rax, 4 (PDXFS_INODE_ETODO_WRITE); jmp ret. Reserved labels: pdxl_in_p_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                              // nsid
+        mov rbp, rsi;                              // &sb
+        mov r12, rdx;                              // inode_id
+        mov r13, rcx;                              // inode src
+
+        lea r14, [rip + _pdxfs_inode_page_scratch];
+
+        // lba = inode_lba_for_id(sb, inode_id).
+        mov rdi, rbp;
+        mov rsi, r12;
+        call inode_lba_for_id;
+        mov r15, rax;
+
+        // Read the containing LBA into scratch.
+        mov rdi, rbx;
+        mov rsi, r15;
+        mov rdx, 8;
+        mov rcx, r14;
+        call nvme_read_blocking;
+        cmp rax, 0;
+        jne pdxl_in_p_eio;
+
+        // offset_in_lba = inode_offset_for_id(inode_id).
+        mov rdi, r12;
+        call inode_offset_for_id;
+
+        // inode_serialize(src=r13, dst=&scratch+offset).
+        mov rdi, r13;                              // src (inode arg)
+        mov rsi, r14;
+        add rsi, rax;                              // dst = &scratch + offset
+        call inode_serialize;
+        // rax = 0 (inode_serialize always OKs).
+
+        // TODO(R25.M3): nvme_write_blocking(nsid, lba, 8, &scratch).
+        //   Placeholder — write path not yet available. Scratch holds the
+        //   correct post-image; return ETODO_WRITE.
+        mov rax, 4;                                // PDXFS_INODE_ETODO_WRITE
+        jmp pdxl_in_p_ret;
+
+      pdxl_in_p_eio:
+        mov rax, 1;                                // PDXFS_INODE_EIO
+
+      pdxl_in_p_ret:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
