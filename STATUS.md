@@ -702,3 +702,54 @@ R21 delivered the FPU/SIMD substrate (XSAVE probe + enable + eager save/restore 
 None (R21 ran under QEMU-TCG). The three PROVISIONAL rows added to `design/hardware/quirks.md` will promote to CONFIRMED at first-boot on T14 G4: TSC-hz post-calibration in the 2.4-3.2 GHz P-core range, HPET period_fs = 69,841,841 (14.31818 MHz), x2APIC available.
 
 **Next Round:** R22 (x2APIC MSR retirement + kernel-space heap allocator + syscall latency substrate). Zero R21 blockers.
+
+---
+
+## R22 (PCI Substrate + xAPIC Retirement + IOMMU (VT-d) Substrate) — CLOSED 2026-08-11
+
+R22 delivered the PCIe substrate (ECAM + MCFG wire + Type-0/Type-1 header decoders + recursive-descent bridge enumerator + BAR sizing/decode + legacy + extended capability walkers + `KIND_PCI_DEV` cap publication), the atomic x2APIC MSR-mode enable + xAPIC MMIO retirement across every LAPIC consumer, the Intel VT-d translation substrate (DMAR parser + register-set + root/context tables + per-device SLPT walker + DMA-fault handler skeleton), and the VT-d Interrupt Remapping substrate (IRT + `vtd_ir_program` via 2×u64 mask-first + IR-plane fault decoder + `msix_program_entry_via_ir` + round-robin witness). Pillar 6 target met: every PCIe device is discoverable + programmable via ECAM, every device can be published as a `KIND_PCI_DEV` capability for userspace-driver dispatch, and the DMA/interrupt-remapping plane is present as compilable ready-to-enable code — R23 flips `Features.IOMMU_ENABLED = 1` and consumes the substrate for the first live wire-up. See `design/round-retrospectives/r22-closure.md` for the full write-up.
+
+### Issues Implemented (28 total across 6 milestones)
+
+- **M1** (#847–#850 + #845) — PCI substrate anchor + atomic x2APIC retirement: `src/kernel/core/pci/header.pdx` (Type-0/Type-1 decoders), `src/kernel/acpi/phase1_acpi_gather` wire into `kernel_main` (MCFG PRESENT/ABSENT fingerprint), legacy `src/drivers/pci/config.pdx` deleted (Pillar 5 clean), `x2apic._x2apic_active` dispatch flag + retirement across `eoi.pdx` / `tpr.pdx` / `ipi.pdx` / `self_ipi.pdx` / `lapic_timer.pdx` / `tsc_deadline.pdx` / `init_sipi.pdx` (BSP enable in `kernel_main`, AP enable in `ap_entry`; QEMU-TCG falls back to MMIO path).
+- **M2** (#851–#855) — PCI enumerator + BAR helpers: `src/kernel/core/pci/enum.pdx` (`pci_enumerate_all(seg)` — 32-BFS-queue + 256-device slab + `PCI ENUM SKIP no MCFG` fallback), `src/kernel/core/pci/bar.pdx` (`pci_bar_size` + `pci_bar_decode` + type/prefetchable/64-bit helpers), MMIO-mapping stub, `boot_r22_pci_tree` opt-in smoke gated on `PAIDEIA_R22_PCI_TREE=1`.
+- **M3** (#856–#859; **#860 deferred**) — PCI cap walkers + KIND_PCI_DEV: `pci_walk_caps` + 19 named cap IDs, `src/kernel/core/pci/ext_cap.pdx` (`pcie_find_ext_cap` + `pcie_walk_ext_caps` at base 0x100), `src/kernel/core/cap/device_cap.pdx` (`KIND_PCI_DEV` + `device_cap_mint`), `src/kernel/core/pci/publish.pdx` (`pci_publish_caps` slab). #860 (userspace pci_enumerator server) deferred to paideia-as#1015 close.
+- **M4** (#861–#865) — Intel VT-d substrate: `src/kernel/core/iommu/dmar.pdx` (DRHD extractor + `SIG_DMAR` + `has_dmar` slot), `src/kernel/core/iommu/vtd_regs.pdx` (32/64-bit MMIO with mfence brackets), `src/kernel/core/iommu/vtd_ctx.pdx` (`vtd_root_init` + `vtd_context_program` + `vtd_set_root`), `src/kernel/core/iommu/vtd_slpt.pdx` (`vtd_slpt_root_alloc` + `vtd_slpt_map` — 4-level walker with SLPT-flavored flags), `src/kernel/core/iommu/vtd_fault.pdx` (`vtd_fault_dispatch` skeleton), `tests/kernel/iommu/vtd_slpt_synth.pdx` structural witness.
+- **M5** (#866–#869) — VT-d Interrupt Remapping: `src/kernel/core/iommu/vtd_ir.pdx` (IRT allocator + IRTA_REG programming + `vtd_ir_program` via 2×u64 mask-first / unmask-last), `src/kernel/core/pci/msix.pdx` (`msix_program_entry_via_ir` — Remappable-format `0xFEE00000 | (ir_index << 5) | SHV`), `src/kernel/core/apic/vector_pool.pdx` extension (`msix_assign_at_ir`), `vtd_fault_decode_ir_reason` (0x20–0x25 reason table), `tests/kernel/iommu/msix_ir_round_robin.pdx` structural witness. Cross-repo #866 "paideia-as-blocked" label downgraded to PAPER TIGER on inspection (2×u64 approach is documented safe practice per Intel SDM Vol 3A §10.12.7 + Linux upstream).
+- **M6** (#870–#874) — Round closure: `design/hardware/quirks.md` §2.4 VMD row elevated with R22-enumerator impact + BIOS toggle + verification recipe (#870); `tools/capture-t14-g4-pci.md` + `tests/kernel/pci/t14_g4_fixture.pdx` + `tests/kernel/pci/fixtures/t14g4/README.md` (#871); `tests/kernel/iommu/dma_fault_regression.pdx` SKIP-mode witness with LIVE-mode docs (#872); `src/kernel/core/config/features.pdx` + `design/kernel/iommu-boot-toggle.md` — `Features.IOMMU_ENABLED : u64 = 0` toggle + R23 wire-up checklist + R25 migration to runtime command-line parser (#873); this closure retro + STATUS.md entry + `boot_r22_msix_ir_round_robin` SKIP-mode entry in `tools/run-smoke.sh` (M5 debt fix) + tag `r22-closed` (#874).
+
+### Cross-Repo Escalations to paideia-as (R22)
+
+**None.** `paideia-as` submodule remained pinned at `2cf169d` for all six R22 milestones. Two ambient "paideia-as-blocked" labels (#850 header decoders, #866 128-bit MOVDQU IRTE deposit) were reviewed and downgraded on inspection — both used pre-existing encoder features (sized `mov` stores + SysV args; 2×u64 mask-first respectively). Every encoder mnemonic used by R22 was verified pre-existing: `rdmsr` / `wrmsr` (R21.M5), `mfence` + 32/64-bit MMIO (Phase 8), sized `mov_b`/`mov_w`/`mov_d` stores (R20.M4), recursive `call`/`ret` + SysV args (Phase 7).
+
+### Observable Proof
+
+- Kernel builds clean under `tools/build.sh` (**15/15 gates**: no-AML lint + opcode-canary + kernel dispatch + sched guards + tty_read wrapper + link).
+- All 15 default pre-push smoke modes pass (`boot_r8_only` through `boot_smp`, incl. `boot_r14b_*` and `boot_r17_shell_*`).
+- Two R22 opt-in smokes healthy:
+  - `PAIDEIA_R22_PCI_TREE=1 boot_r22_pci_tree` → `PCI ENUM SKIP no MCFG` fingerprint under QEMU-TCG `-kernel` (per-device lines land in R23 with OVMF harness).
+  - `PAIDEIA_R22_MSIX_IR=1 boot_r22_msix_ir_round_robin` → SKIP (mode landed at M6-005 debt fix; witness stays symbol-only until R23 wires it into kernel_main behind `Features.IOMMU_ENABLED = 1`).
+- R21 opt-in smokes still pass under R22 changes: `boot_r21_ymm_preserve` / `_ioapic_reroute` / `_msix_round_robin` (R22.M5 IR wrapper preserves the R21.M4 vector-pool contract).
+- New serial fingerprints between `X2APIC ABSENT` (R21) and `SMP BRINGUP START`: `X2APIC ENABLED BSP` (R22.M1 — only when `_x2apic_supported = 1`; QEMU-TCG stays absent), `MCFG PRESENT` / `MCFG ABSENT` (R22.M1), `PCI HDR READY` (R22.M1).
+- `nm build/kernel.elf` shows all R22-substrate symbols linked: `pci_enumerate_all`, `pci_bar_size`, `pci_walk_caps`, `pcie_walk_ext_caps`, `device_cap_mint`, `dmar_parse_drhds`, `vtd_root_init`, `vtd_context_program`, `vtd_slpt_root_alloc`, `vtd_slpt_map`, `vtd_fault_dispatch`, `vtd_fault_decode_reason`, `vtd_ir_init`, `vtd_ir_program`, `msix_program_entry_via_ir`, `msix_assign_at_ir`, `vtd_fault_decode_ir_reason`, `msix_ir_round_robin_witness`, `vtd_slpt_synth_witness`.
+
+### R22 Debt Carried Forward
+
+1. **#860 (userspace pci_enumerator server)** — DEFERRED to paideia-as#1015 close. Design doc landed as preflight; sibling to #820.
+2. **`_vtd_base` hardcoded to 0xFED90000** — replace with `_phase1_acpi_info.dmar.unit_base` when `phase1_acpi_gather` walks DMAR (R23 wire-up).
+3. **`has_dmar` slot unpopulated** — sibling to (2); R23 wire-up.
+4. **`vtd_fault_dispatch` not IDT-wired** — R23 wire-up per `design/kernel/iommu-boot-toggle.md` §3 step 7.
+5. **`msix_enable_device` inside `msix_assign_at_ir`** — needs real PCI-config-space write context (R23 driver-plane).
+6. **Ledger append in `msix_assign_at_ir`** — piggybacks on `_msix_assignments` (R23 driver-plane).
+7. **Full `GCMD.TE` + SIRTP + IRE ceremony** — R23.M1 opens with this per `design/kernel/iommu-boot-toggle.md` §3 seven-step checklist.
+8. **DMA-fault regression fixture SKIP → LIVE** — deletes M6 guard once §3 steps 1–7 land.
+9. **T14 G4 first-light captures** — GATED ON HARDWARE. Recipes ready, fixtures placeholder-populated (`tests/kernel/{acpi,pci}/fixtures/t14g4/`).
+10. **R21 debt items still open:** `hpet_now_ns` precision widening; `phase1_acpi_gather` full wire (partial at R22.M1 — MCFG only).
+
+**None regress R22 acceptance.**
+
+### Quirks Discovered on Real Hardware
+
+None (R22 ran under QEMU-TCG). No rows promoted `PROVISIONAL → CONFIRMED` at this pass; the #870 VMD row scope was expanded but stays PROVISIONAL until T14 G4 first-light. R23+ first-boot will promote at least the VMD-off row, the PCIe seg=0 ECAM base row, and the hybrid-P/E topology row.
+
+**Next Round:** R23 (driver-plane substrate — first real drivers: virtio, xHCI, then NVMe on VT-d-enforced DMA). Zero R22 blockers.

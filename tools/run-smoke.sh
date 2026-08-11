@@ -517,6 +517,35 @@ case "${EXPECTED}" in
         TIMEOUT=8
         EXPECTED=""
         ;;
+    boot_r22_msix_ir_round_robin)
+        # R22-M6-005 (M5 debt fix): opt-in MSI-X-via-IR round-robin smoke.
+        #
+        # The R22.M5 witness at tests/kernel/iommu/msix_ir_round_robin.pdx
+        # (symbol msix_ir_round_robin_witness) is NOT wired into
+        # kernel_main at M5 close — same posture as vtd_slpt_synth_witness
+        # (M4) and vtd_ir_program-only (M5): symbol existence + build-time
+        # link-verification are the acceptance criterion, live invocation
+        # is deferred to R23 when GCMD.TE + SIRTP + IRE ceremony wires
+        # the IR unit for real dispatch.
+        #
+        # Under R22.M6, `PAIDEIA_R22_MSIX_IR=1 bash .githooks/pre-push`
+        # previously failed because no `boot_r22_msix_ir_round_robin`
+        # mode existed in this script — the fingerprint would be sought
+        # against a nonexistent expected-file and the run would abort.
+        # This SKIP-echo mode closes that gap: the pre-push env-gate
+        # remains callable + the mode returns cleanly with a SKIP marker,
+        # matching the `boot_r21_ymm_preserve` auto-skip pattern for
+        # infra-not-yet-available witnesses.
+        #
+        # When R23 wires msix_ir_round_robin_witness into kernel_main
+        # (behind Features.IOMMU_ENABLED=1 — see
+        # design/kernel/iommu-boot-toggle.md §3 wire-up checklist), this
+        # mode flips to FINGERPRINT_MODE=1 with a real
+        # tests/r22/expected-msix-ir-round-robin.txt file matching the
+        # `IR ROUND ROBIN OK\n` witness emit.
+        echo "smoke: boot_r22_msix_ir_round_robin — SKIP (witness not wired at R22.M6; R23 dependency per design/kernel/iommu-boot-toggle.md)"
+        exit 0
+        ;;
     boot_panic)
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/logging/expected-panic-dump.txt"

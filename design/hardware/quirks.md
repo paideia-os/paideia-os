@@ -79,7 +79,7 @@ landing an ELF loader.
 
 | Subsystem | Quirk | Impact | Handling | Status | Round observed | Source |
 |-----------|-------|--------|----------|--------|----------------|--------|
-| VMD | Intel VMD Controller enabled by default; NVMe appears behind VMD as a `pci-domain`-style controller rather than bare PCIe. | R24 NVMe bring-up cannot see the drive with VMD enabled unless a VMD driver exists (deferred R37+). MVP recipe is: BIOS-off VMD before R24 boot. | Documented in `design/roadmap/r18-plus-bare-metal.md` §7 + `design/roadmap/r19-t14-g4-boot-guide.md` §3. | PROVISIONAL | — | Lenovo Insyde BIOS default. |
+| VMD | Intel VMD Controller enabled by default; NVMe appears behind VMD as a `pci-domain`-style controller rather than bare PCIe. R22 PCI enumerator (bus-0 recursive descent) cannot see the drive as a first-class endpoint while VMD is on — VMD hides its children behind a proprietary indirection. | R24 NVMe bring-up cannot see the drive with VMD enabled unless a VMD driver exists (deferred R37+). R22 PCI enumerator sees a RAID/VMD container rather than the NVMe controller. **MVP recipe is: BIOS Setup → Storage → Intel VMD Controller → Disabled before any R22 PCI enum / R23 driver-plane / R24 NVMe boot.** Verification: post-VMD-off `pci_enumerate_all(0)` records an NVMe controller at approximately `00:0E.0` instead of the VMD RAID container. | PROVISIONAL | — | Lenovo Insyde BIOS default (T14 G4). `design/roadmap/r18-plus-bare-metal.md` §7 + `design/roadmap/r19-t14-g4-boot-guide.md` §3. Elevated in scope at R22.M6-001 (#870) to add the R22 PCI-enumerator impact + explicit BIOS toggle path + first-light verification recipe. |
 | USB | 2× TB4 + 2× USB-A + 1× USB-C 3.2; all under xHCI. | R26 xHCI driver targets single controller. | To be programmed. | PROVISIONAL | — | Lenovo PSREF. |
 | Ethernet | Intel i219-LM PHY (on-board, PCH-integrated). | R27 e1000e-family driver. | To be programmed. | PROVISIONAL | — | Lenovo PSREF. |
 | Wi-Fi / Bluetooth | Intel AX211 (Wi-Fi 6E + BT 5.2) integrated CNVi. | Deferred to R41+ per §0 constitutional decision. | Not on critical line. | PROVISIONAL | — | Lenovo PSREF. |
@@ -119,8 +119,20 @@ generic i7 desktop, an Ampere Altra board):
   this document's rows anchor against.
 - `tests/kernel/acpi/fixtures/t14g4/README.md` — where the captured
   .bin files land.
+- `tools/capture-t14-g4-pci.md` — how to capture the PCI device tree
+  this document's PCI-plane rows anchor against (added at R22.M6-002
+  #871).
+- `tests/kernel/pci/fixtures/t14g4/README.md` — where the captured
+  PCI config-space blobs land (added at R22.M6-002 #871).
 
 ---
 
 *Seeded 2026-08-10 at R20 close. Rows will move `PROVISIONAL` →
 `CONFIRMED` as physical bring-up happens.*
+
+*Updated 2026-08-11 at R22.M6 close (#870, #874) — VMD row §2.4
+expanded with the R22-PCI-enumerator impact + explicit BIOS toggle
++ first-light verification recipe. No rows promoted to CONFIRMED at
+this pass; R22 ran entirely under QEMU-TCG (no VT-d emulation, no
+hybrid P/E topology, no x2APIC). Promotion pass queued for the T14
+G4 first-light in R23+.*
