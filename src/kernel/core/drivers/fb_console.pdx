@@ -1,0 +1,1351 @@
+// src/kernel/core/drivers/fb_console.pdx — R23-M2-002/003/004 (#880/#881/#882)
+//
+// Scrolling text-console over the linear framebuffer, with a small ANSI
+// subset (SGR 16-color, CUP, ED/EL) and a byte-oriented write API.
+//
+// Round: R23 — Framebuffer console (GOP direct)
+// Milestone: R23.M2 rasterizer + console + ANSI + write API
+// Roadmap: design/roadmap/r18-plus-bare-metal.md §R23
+// Encoder floor: paideia-as v0.20.1 (mov_d / mov_w / mov_b sized stores;
+//                shl/shr r64 imm8; imul r64, r64 — all R21.M5 baseline).
+//
+// ==============================================================================
+// Data model
+// ==============================================================================
+//
+// * A fixed-size 2D grid of u16 cells backs the visible text:
+//     _fb_console_grid : [u16; MAX_COLS * MAX_ROWS] where each cell =
+//     (attr << 8) | glyph.
+//     MAX_COLS = 256, MAX_ROWS = 80 -> 20 480 cells = 40 960 bytes.
+//     Actual live area is _fb_console_ctx.cols x .rows, always <= max.
+//
+// * The attribute byte packs a 16-color fg (bits 0..3) and 16-color bg
+//   (bits 4..7).  Colors index into _ansi_palette : [u32; 16], which is
+//   compiled in with VGA-style RGB triples pre-shaped for 32-bpp
+//   BGR_8888 memory-byte order (EFI_PIXEL_BGR_8888 = 1, QEMU stdvga +
+//   Intel PCH default).  Each palette entry is the exact u32 that gets
+//   written to a pixel address.
+//
+// * _fb_console_ctx : [u64; 8] with offsets (all u64 slots for uniform
+//   plain-mov addressing, avoiding u32 sized-store discipline in the
+//   hot path):
+//     +0   fb_va       -- top-left VA of framebuffer (from fb_map_lfb)
+//     +8   pitch       -- bytes per scanline
+//     +16  cursor_x    -- current column (0..cols)
+//     +24  cursor_y    -- current row    (0..rows)
+//     +32  cur_attr    -- current SGR attribute byte (low 8 bits used)
+//     +40  cols        -- fb.width  / 8
+//     +48  rows        -- fb.height / 16
+//     +56  _pad
+//
+// * _ansi_state : [u64; 16].  Layout:
+//     +0    mode           (0 = NORMAL, 1 = ESC, 2 = CSI)
+//     +8    param_count    (committed CSI params in params[])
+//     +16   current_param  (accumulator for the in-flight param)
+//     +24   has_current    (1 if any digit accumulated into current_param)
+//     +32   params[0..7]   ([u64; 8], one per SGR/etc parameter)
+//     +96   _pad[0..3]     (pad to 128 B)
+//
+// ==============================================================================
+// ANSI subset accepted (#881)
+// ==============================================================================
+//
+// The state machine recognises the CSI framing `ESC [ p1 ; p2 ; ... F`
+// with these final bytes F:
+//
+//   'm' -- SGR  : per param p:
+//                 0            -> reset (attr = 0x07 = white on black)
+//                 1            -> bright (fg |= 0x08)
+//                 30..37       -> fg = p - 30            (dim 0..7)
+//                 40..47       -> bg = p - 40            (dim 0..7)
+//                 90..97       -> fg = 8 + (p - 90)      (bright)
+//                 100..107     -> bg = 8 + (p - 100)     (bright)
+//                 (anything else silently ignored)
+//   'H' -- CUP  : cursor to (row=p1, col=p2), 1-based; missing param -> 1
+//   'J' -- ED   : 0 -> clear cursor..end, 1 -> clear begin..cursor,
+//                 2 -> clear entire screen
+//   'K' -- EL   : 0 -> clear cursor..EOL, 1 -> clear BOL..cursor,
+//                 2 -> clear entire line
+//
+// Unknown final byte closes the state machine (mode <- NORMAL) and
+// discards the accumulated params.  Digits ('0'..'9') and ';' inside CSI
+// are consumed as accumulator input; every other byte is treated as the
+// final byte and dispatched.  ESC followed by any non-'[' byte cancels
+// the sequence (mode <- NORMAL, byte discarded).
+//
+// Colours are VGA-16 (task-spec palette):
+//   0 black, 1 red, 2 green, 3 yellow, 4 blue, 5 magenta, 6 cyan, 7 white
+//   8..15 = bright variants (0x55 -> 0xFF).  Pre-shaped u32 values for
+//   BGR_8888 memory-byte order:
+//
+//   idx  R    G    B    u32 stored as (LE bytes at pixel addr = B,G,R,A)
+//    0  0x00 0x00 0x00  0x00000000
+//    1  0xAA 0x00 0x00  0x00AA0000
+//    2  0x00 0xAA 0x00  0x0000AA00
+//    3  0xAA 0x55 0x00  0x00AA5500
+//    4  0x00 0x00 0xAA  0x000000AA
+//    5  0xAA 0x00 0xAA  0x00AA00AA
+//    6  0x00 0xAA 0xAA  0x0000AAAA
+//    7  0xAA 0xAA 0xAA  0x00AAAAAA
+//    8  0x55 0x55 0x55  0x00555555
+//    9  0xFF 0x00 0x00  0x00FF0000
+//   10  0x00 0xFF 0x00  0x0000FF00
+//   11  0xFF 0xFF 0x00  0x00FFFF00
+//   12  0x00 0x00 0xFF  0x000000FF
+//   13  0xFF 0x00 0xFF  0x00FF00FF
+//   14  0x00 0xFF 0xFF  0x0000FFFF
+//   15  0xFF 0xFF 0xFF  0x00FFFFFF
+//
+// (The task's `0xBBGGRR` shorthand names the *memory* byte order at the
+// pixel address; the u32 numeric value in registers is 0x00RRGGBB
+// because x86-64 is little-endian.  Comment retained here to prevent
+// future confusion.)
+//
+// ==============================================================================
+// klog wire (#882)
+// ==============================================================================
+//
+// _fb_console_active : u64 is a boolean.  It is set to 1 by
+// fb_console_init at the end of the init sequence.  klog_ring_drain_to_uart
+// (src/kernel/core/klog/ring.pdx) inspects it inside its inner drain loop
+// and, if set, mirrors each ring byte into fb_console_putchar right after
+// the UART store.  This preserves the existing serial log as the primary
+// journal while providing an on-screen mirror.  Under `qemu -kernel` the
+// PVH boot path never populates _boot_env, so kernel_main gates the
+// fb_console_init call on _boot_env_pa != 0 and the whole subsystem stays
+// dormant (as required by the R23.M2 tests which run under `-kernel`).
+//
+// ==============================================================================
+// Register conventions
+// ==============================================================================
+//
+// * Public entry points (fb_console_init, fb_console_putchar,
+//   fb_console_puts) use SysV calling convention.
+// * Private helpers (fb_console_scroll_up, fb_console_redraw_all,
+//   fb_console_draw_cell_at, fb_console_clear_grid, ansi_*_dispatch)
+//   are `let`-scoped (nm: `t`-local) — invoked via `call sym;` from the
+//   same object file.  paideia-as emits them as local text symbols,
+//   which the linker resolves within the file.
+//
+// * MMIO / grid stores follow the codebase's sized-store discipline:
+//     mov_w [mem], reg    for u16 grid cells (G1)
+//     mov_d [mem], reg    for u32 pixel writes (G1)
+//   Both live inside draw_glyph or the grid write paths; ANSI-parser
+//   state slots are all u64 to avoid sized-store hazards.
+
+module FbConsole = structure {
+
+  // ==========================================================================
+  // Compile-time constants
+  // ==========================================================================
+
+  pub let FB_CONSOLE_MAX_COLS  : u64 = 256
+  pub let FB_CONSOLE_MAX_ROWS  : u64 = 80
+  pub let FB_CONSOLE_MAX_CELLS : u64 = 20480       // 256 * 80
+
+  pub let FB_GLYPH_WIDTH_PX  : u64 = 8
+  pub let FB_GLYPH_HEIGHT_PX : u64 = 16
+
+  pub let FB_ATTR_DEFAULT    : u64 = 0x07          // fg=7 (white), bg=0
+  pub let FB_CELL_DEFAULT    : u64 = 0x0720        // (attr << 8) | ' '
+
+  // Context slot offsets (bytes).
+  pub let FB_CTX_OFF_FB_VA    : u64 = 0
+  pub let FB_CTX_OFF_PITCH    : u64 = 8
+  pub let FB_CTX_OFF_CURSOR_X : u64 = 16
+  pub let FB_CTX_OFF_CURSOR_Y : u64 = 24
+  pub let FB_CTX_OFF_CUR_ATTR : u64 = 32
+  pub let FB_CTX_OFF_COLS     : u64 = 40
+  pub let FB_CTX_OFF_ROWS     : u64 = 48
+
+  // ANSI state slot offsets (bytes).
+  pub let ANSI_OFF_MODE          : u64 = 0
+  pub let ANSI_OFF_PARAM_COUNT   : u64 = 8
+  pub let ANSI_OFF_CURRENT_PARAM : u64 = 16
+  pub let ANSI_OFF_HAS_CURRENT   : u64 = 24
+  pub let ANSI_OFF_PARAMS_BASE   : u64 = 32
+
+  pub let ANSI_MODE_NORMAL : u64 = 0
+  pub let ANSI_MODE_ESC    : u64 = 1
+  pub let ANSI_MODE_CSI    : u64 = 2
+
+  pub let ANSI_MAX_PARAMS  : u64 = 8
+
+  // ==========================================================================
+  // Storage
+  // ==========================================================================
+
+  // Backing text grid.  40 960 bytes in .bss; @align(8) so the byte-copy
+  // scroll loop can use 8-byte-aligned addressing when the pattern is
+  // widened in a follow-up.
+  pub let mut _fb_console_grid : [u16; 20480] = uninit @align(8)
+
+  // Console context state.  See file preamble for offsets.
+  pub let mut _fb_console_ctx : [u64; 8] = uninit @align(8)
+
+  // ANSI parser state.  128 bytes total.
+  pub let mut _ansi_state : [u64; 16] = uninit @align(8)
+
+  // "Console live" gate consumed by klog_ring_drain_to_uart.  0 pre-init
+  // and on the PVH `-kernel` boot path; set to 1 by fb_console_init.
+  pub let mut _fb_console_active : u64 = 0
+
+  // 16-entry VGA palette, pre-shaped for 32-bpp BGR_8888 memory-byte
+  // order.  Each u32 is directly storable into a pixel address (WC MMIO
+  // via mov_d).  See file preamble for the R/G/B derivation.
+  pub let _ansi_palette : [u32; 16] = [
+    0x00000000,        //  0 black
+    0x00AA0000,        //  1 red
+    0x0000AA00,        //  2 green
+    0x00AA5500,        //  3 yellow
+    0x000000AA,        //  4 blue
+    0x00AA00AA,        //  5 magenta
+    0x0000AAAA,        //  6 cyan
+    0x00AAAAAA,        //  7 white
+    0x00555555,        //  8 bright black
+    0x00FF0000,        //  9 bright red
+    0x0000FF00,        // 10 bright green
+    0x00FFFF00,        // 11 bright yellow
+    0x000000FF,        // 12 bright blue
+    0x00FF00FF,        // 13 bright magenta
+    0x0000FFFF,        // 14 bright cyan
+    0x00FFFFFF         // 15 bright white
+  ] @align(64)
+
+  // ==========================================================================
+  // fb_console_draw_cell_at(col, row, cell)  — private helper
+  // ==========================================================================
+  //
+  // Decode (attr, glyph) from a u16 cell (attr in bits 8..15, glyph in
+  // bits 0..7), resolve fg/bg u32 pixels from _ansi_palette, compute the
+  // pixel origin (col * 8, row * 16), and invoke draw_glyph.
+  //
+  // Called from redraw_all, scroll_up, and the printable-char path in
+  // handle_print_char.  All three callers already own valid (col, row)
+  // inside the live grid area.
+  //
+  // Register plan: 5-push prologue (rbx, r12-r15) so nested draw_glyph
+  // call sees rsp%16==0.  rbx = fb_va, r12 = pitch, r13 = pixel_x,
+  // r14 = pixel_y, r15 = fg_bg packed.  Cell byte extraction uses
+  // xor+mov / shr / and.
+  //
+  // Encoder floor: mov / shl / shr / and / or / lea / mov_b / mov_d /
+  // imul / call — all pre-existing.
+  // ==========================================================================
+  let fb_console_draw_cell_at : (u64, u64, u64) -> () !{mem} @{} =
+    fn (col: u64) (row: u64) (cell: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R23-M2-002 (#880) private helper. Decode cell (u16: attr in bits 8..15, glyph in bits 0..7), resolve fg/bg u32 pixels from _ansi_palette[fg] / _ansi_palette[bg], pack fg_bg = (bg << 32) | fg, compute pixel origin (col*8, row*16), invoke draw_glyph.  Register plan: 5-push callee-save (rbx=fb_va, r12=pitch, r13=pixel_x, r14=pixel_y, r15=fg_bg).  entry rsp%16==8, +40 pushes = rsp%16==0 — nested draw_glyph call needs no alignment pad (5 is odd, preserves aligned pre-call rsp).  6-arg SysV pre-call for draw_glyph loads rdi=fb_va, rsi=pitch, rdx=pixel_x, rcx=pixel_y, r8=glyph_idx, r9=fg_bg — all satisfied from callee-saves + scratch computation.  Palette lookup: lea rdi, [rip + _ansi_palette]; add rdi, idx*4; `mov eax, [rdi]` idiom (32-bit load auto-zero-extends into rax per x86-64 SDM Vol.1 §3.4.1.1; encoded as either `mov_d rax, [rdi]` or `mov eax, [rdi]` — both emit 8b 07).  No fingerprint (hot-path helper).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // rdi = col, rsi = row, rdx = cell (u16 in low 16 bits)
+
+        // Load context.
+        lea rax, [rip + _fb_console_ctx];
+        mov rbx, [rax + 0];                       // rbx = fb_va
+        mov r12, [rax + 8];                       // r12 = pitch
+
+        // pixel_x = col * 8.
+        mov r13, rdi;
+        shl r13, 3;                               // r13 = pixel_x
+
+        // pixel_y = row * 16.
+        mov r14, rsi;
+        shl r14, 4;                               // r14 = pixel_y
+
+        // Extract glyph (low 8 bits of cell) and attr (bits 8..15).
+        mov r8, rdx;
+        and r8, 0xFF;                             // r8 = glyph_idx (0..255)
+
+        mov r9, rdx;
+        shr r9, 8;
+        and r9, 0xFF;                             // r9 = attr
+
+        // fg = attr & 0x0F, bg = (attr >> 4) & 0x0F.
+        mov rax, r9;
+        and rax, 0x0F;                            // rax = fg index (0..15)
+
+        mov rcx, r9;
+        shr rcx, 4;
+        and rcx, 0x0F;                            // rcx = bg index (0..15)
+
+        // fg pixel = _ansi_palette[fg].
+        lea rdi, [rip + _ansi_palette];
+        mov rsi, rax;
+        shl rsi, 2;                               // rsi = fg * 4
+        add rdi, rsi;                             // rdi = &palette[fg]
+        mov rax, 0;
+        mov_d rax, [rdi + 0];                     // rax = fg u32 (zero-ext on x86)
+        mov r15, rax;                             // r15 = fg (low 32)
+
+        // bg pixel = _ansi_palette[bg].
+        lea rdi, [rip + _ansi_palette];
+        mov rsi, rcx;
+        shl rsi, 2;                               // rsi = bg * 4
+        add rdi, rsi;                             // rdi = &palette[bg]
+        mov rax, 0;
+        mov_d rax, [rdi + 0];                     // rax = bg u32
+
+        // Pack fg_bg = (bg << 32) | fg.
+        shl rax, 32;                              // rax = bg << 32
+        or  r15, rax;                             // r15 = (bg << 32) | fg
+
+        // Marshal SysV args for draw_glyph(fb_base, pitch, x, y, glyph, fg_bg).
+        mov rdi, rbx;                             // fb_base
+        mov rsi, r12;                             // pitch
+        mov rdx, r13;                             // pixel_x
+        mov rcx, r14;                             // pixel_y
+        // r8 already holds glyph_idx
+        mov r9, r15;                              // fg_bg
+
+        call draw_glyph;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // fb_console_clear_grid()  — private helper
+  // ==========================================================================
+  //
+  // Fill _fb_console_grid[0..cells) with FB_CELL_DEFAULT (0x0720).
+  // Used by fb_console_init (whole-screen clear) and by ansi_dispatch_ed(2).
+  //
+  // Iterates over ctx.cols * ctx.rows cells (not MAX_CELLS) — the pixels
+  // outside the live area are never drawn so leaving stale u16 values
+  // there is harmless, and touching only the live cells keeps the ED=2
+  // path proportional to the visible area.
+  // ==========================================================================
+  let fb_console_clear_grid : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R23-M2-002 (#880) private helper. Fill live grid area with default cell (0x0720 = attr 0x07 | glyph ' ').  cell count = ctx.cols * ctx.rows.  Byte-loop over 2-byte cells: mov_w [addr], rax pattern per hpet.pdx (G1 sized 16-bit store).  Leaf; no callee-save needed but push rbx for future-proofing / review-symmetry.  No nested call so no alignment adjustment needed.",
+      block: {
+        push rbx;
+
+        lea rax, [rip + _fb_console_ctx];
+        mov r8, [rax + 40];                       // r8 = cols
+        mov r9, [rax + 48];                       // r9 = rows
+        imul r8, r9;                              // r8 = total cells
+
+        lea rcx, [rip + _fb_console_grid];        // rcx = &grid[0]
+        xor rdx, rdx;                             // rdx = idx
+        mov rbx, 0x0720;                          // rbx = default cell
+
+      clear_grid_loop:
+        cmp rdx, r8;
+        jae clear_grid_done;
+
+        // Store rbx (low 16) at grid[idx] via mov_w.
+        mov rax, rbx;
+        mov_w [rcx + 0], rax;
+
+        add rcx, 2;
+        add rdx, 1;
+        jmp clear_grid_loop;
+
+      clear_grid_done:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // fb_console_redraw_all()  — private helper
+  // ==========================================================================
+  //
+  // Iterate the live grid area (ctx.cols * ctx.rows cells) and call
+  // fb_console_draw_cell_at for each.  Called from fb_console_init and
+  // fb_console_scroll_up.
+  //
+  // Register plan: 5-push prologue.  rbx = col, r12 = row, r13 = cols,
+  // r14 = rows, r15 = &grid[0].  Nested draw_cell_at call sees rsp%16==0.
+  // ==========================================================================
+  let fb_console_redraw_all : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R23-M2-002 (#880) private helper. Iterate live grid area and call fb_console_draw_cell_at(col, row, cell) per cell.  cell address = &grid[0] + (row * cols + col) * 2.  Register plan: 5-push callee-save (rbx=col, r12=row, r13=cols, r14=rows, r15=&grid).  entry rsp%16==8, 5 pushes = rsp%16==0 — pre-call to draw_cell_at is aligned.  Byte-cell load: xor rax,rax; mov_w rax,[addr] for u16 zero-extended load (avoids partial-reg hazard).  Naive O(cols*rows) — for 240x50 = 12000 cells this is fine at boot / scroll time.  R24+ may add dirty-cell tracking to avoid the full redraw on scroll.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        lea rax, [rip + _fb_console_ctx];
+        mov r13, [rax + 40];                      // r13 = cols
+        mov r14, [rax + 48];                      // r14 = rows
+        lea r15, [rip + _fb_console_grid];        // r15 = &grid[0]
+
+        xor r12, r12;                             // row = 0
+
+      redraw_row_loop:
+        cmp r12, r14;
+        jae redraw_all_done;
+
+        xor rbx, rbx;                             // col = 0
+
+      redraw_col_loop:
+        cmp rbx, r13;
+        jae redraw_row_next;
+
+        // idx = row * cols + col
+        mov rax, r12;
+        imul rax, r13;
+        add rax, rbx;
+        // byte offset = idx * 2
+        shl rax, 1;
+        add rax, r15;                             // rax = &cell
+
+        // cell = u16 at rax (zero-extended)
+        xor rdx, rdx;
+        mov_w rdx, [rax + 0];
+        and rdx, 0xFFFF;
+
+        // draw_cell_at(col, row, cell)
+        mov rdi, rbx;
+        mov rsi, r12;
+        // rdx already holds cell
+        call fb_console_draw_cell_at;
+
+        add rbx, 1;
+        jmp redraw_col_loop;
+
+      redraw_row_next:
+        add r12, 1;
+        jmp redraw_row_loop;
+
+      redraw_all_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // fb_console_scroll_up()  — private helper
+  // ==========================================================================
+  //
+  // Shift grid rows 1..rows into rows 0..rows-1 (byte-copy loop over the
+  // live area), blank the newly-vacated last row (memset to
+  // FB_CELL_DEFAULT), then redraw the whole grid so the pixel buffer
+  // catches up.  Naive full redraw — dirty tracking is deferred to
+  // R24+ per the file preamble note.
+  //
+  // Register plan: 5-push prologue.  rbx = cols, r12 = rows, r13 = &grid,
+  // r14/r15 = scratch counters.  Two loops:
+  //   (A) memmove-style: src = &grid[cols], dst = &grid[0], count = (rows-1)*cols cells.
+  //   (B) blank last row: fill &grid[(rows-1)*cols .. rows*cols) with 0x0720.
+  //   (C) redraw_all().
+  // ==========================================================================
+  let fb_console_scroll_up : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R23-M2-002 (#880) private helper.  (A) memmove grid[cols..rows*cols) into grid[0..(rows-1)*cols) — u16 byte-copy loop, ascending index so overlapping src/dst is safe (source always ahead of dest by exactly cols u16s).  (B) blank grid[(rows-1)*cols .. rows*cols) with 0x0720 (attr 0x07 | ' ').  (C) call fb_console_redraw_all so the pixel buffer catches up.  Register plan: 5-push callee-save (rbx=cols, r12=rows, r13=&grid, r14=cell count, r15=byte cursor).  entry rsp%16==8, +40 pushes = 0.  Nested redraw_all call sees aligned rsp.  Naive full redraw — an O(cols*rows) draw_glyph splat per scroll — acceptable for text-mode use at MVP; R24+ will layer dirty tracking + partial redraw.  16-bit sized store via mov_w (G1). u16 load via xor+mov_w (partial-reg hazard mitigation).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        lea rax, [rip + _fb_console_ctx];
+        mov rbx, [rax + 40];                      // rbx = cols
+        mov r12, [rax + 48];                      // r12 = rows
+        lea r13, [rip + _fb_console_grid];        // r13 = &grid[0]
+
+        // (A) memmove: shift rows 1..rows-1 -> 0..rows-2.
+        //     move count = (rows - 1) * cols cells.
+        mov r14, r12;
+        sub r14, 1;
+        imul r14, rbx;                            // r14 = (rows-1) * cols cells
+
+        // Ascending byte copy in u16 units.
+        xor r15, r15;                             // r15 = idx (u16 units, 0..count)
+
+      scroll_shift_loop:
+        cmp r15, r14;
+        jae scroll_shift_done;
+
+        // src = &grid[cols + idx], dst = &grid[idx]
+        mov rax, r15;
+        add rax, rbx;                             // rax = idx + cols (src cell idx)
+        shl rax, 1;                               // *2 (bytes)
+        add rax, r13;                             // rax = &src cell
+
+        mov rcx, r15;
+        shl rcx, 1;
+        add rcx, r13;                             // rcx = &dst cell
+
+        xor rdx, rdx;
+        mov_w rdx, [rax + 0];                     // load u16
+        and rdx, 0xFFFF;
+        mov_w [rcx + 0], rdx;                     // store u16
+
+        add r15, 1;
+        jmp scroll_shift_loop;
+
+      scroll_shift_done:
+        // (B) blank last row: grid[(rows-1)*cols .. rows*cols) = 0x0720.
+        //     r14 already = (rows-1)*cols  (start idx).
+        mov r15, r14;                             // r15 = start idx
+        mov r14, r15;
+        add r14, rbx;                             // r14 = end idx = (rows)*cols
+
+      scroll_blank_loop:
+        cmp r15, r14;
+        jae scroll_blank_done;
+
+        mov rax, r15;
+        shl rax, 1;
+        add rax, r13;                             // rax = &grid[idx]
+
+        mov rdx, 0x0720;
+        mov_w [rax + 0], rdx;
+
+        add r15, 1;
+        jmp scroll_blank_loop;
+
+      scroll_blank_done:
+        // (C) redraw everything.
+        call fb_console_redraw_all;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // fb_console_handle_print_char(ch)  — private helper
+  // ==========================================================================
+  //
+  // Handle a non-ANSI byte: \n / \r / \b / printable.
+  //   \n  : cursor_y++; cursor_x=0; scroll if overflow.
+  //   \r  : cursor_x = 0.
+  //   \b  : cursor_x = max(0, cursor_x - 1).
+  //   else: grid[cursor_y * cols + cursor_x] = (cur_attr << 8) | ch;
+  //         draw_cell_at(cursor_x, cursor_y, cell);
+  //         cursor_x++; if cursor_x >= cols: wrap to next line (like \n).
+  // ==========================================================================
+  let fb_console_handle_print_char : (u64) -> () !{mem} @{} =
+    fn (ch: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R23-M2-002 (#880) private helper for the ANSI-parser NORMAL state.  Dispatches control chars (\\n, \\r, \\b) and printable bytes.  On printable: grid[y*cols+x] = (cur_attr << 8) | ch; call fb_console_draw_cell_at(x, y, cell); advance cursor with wrap.  On \\n: line-feed with scroll on overflow.  On \\r: carriage return only.  On \\b: backspace within-line, no wrap-around.  Register plan: 5-push callee-save (rbx=ch, r12=&ctx, r13=cursor_x, r14=cursor_y, r15=cols).  entry rsp%16==8, +40 = 0 — nested calls (draw_cell_at, scroll_up) see aligned rsp.  Cell store via mov_w (G1).  Ctx updates via plain u64 stores.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                             // rbx = ch (low 8 bits meaningful)
+        and rbx, 0xFF;
+
+        lea r12, [rip + _fb_console_ctx];         // r12 = &ctx
+        mov r13, [r12 + 16];                      // r13 = cursor_x
+        mov r14, [r12 + 24];                      // r14 = cursor_y
+        mov r15, [r12 + 40];                      // r15 = cols
+
+        // Dispatch on control chars.
+        cmp rbx, 0x0A;                            // '\n'
+        je  handle_char_newline;
+        cmp rbx, 0x0D;                            // '\r'
+        je  handle_char_cr;
+        cmp rbx, 0x08;                            // '\b'
+        je  handle_char_bs;
+
+        // ----------------------------------------------------------
+        // Printable path.
+        // ----------------------------------------------------------
+        // cell = (cur_attr << 8) | ch
+        mov rax, [r12 + 32];                      // rax = cur_attr
+        and rax, 0xFF;
+        shl rax, 8;
+        or  rax, rbx;                             // rax = cell (u16 in low 16)
+
+        // Store cell at grid[y*cols + x].
+        mov rcx, r14;
+        imul rcx, r15;                            // rcx = y * cols
+        add rcx, r13;                             // rcx = idx
+        shl rcx, 1;                               // rcx = byte offset
+        lea rdx, [rip + _fb_console_grid];
+        add rdx, rcx;                             // rdx = &grid[idx]
+        mov_w [rdx + 0], rax;
+
+        // Draw the cell.
+        mov rdi, r13;                             // col
+        mov rsi, r14;                             // row
+        mov rdx, rax;                             // cell
+        and rdx, 0xFFFF;
+        call fb_console_draw_cell_at;
+
+        // Reload state after call (r13/r14/r15/r12 preserved — callee-save).
+        // Advance cursor_x.
+        add r13, 1;
+        cmp r13, r15;
+        jb  handle_char_store_cursor;             // no wrap
+
+        // Wrap: cursor_x = 0, cursor_y++, may scroll.
+        xor r13, r13;
+        add r14, 1;
+        jmp handle_char_maybe_scroll;
+
+      handle_char_newline:
+        xor r13, r13;                             // cursor_x = 0
+        add r14, 1;
+        jmp handle_char_maybe_scroll;
+
+      handle_char_cr:
+        xor r13, r13;                             // cursor_x = 0
+        jmp handle_char_store_cursor;
+
+      handle_char_bs:
+        cmp r13, 0;
+        je  handle_char_store_cursor;             // already at column 0
+        sub r13, 1;
+        jmp handle_char_store_cursor;
+
+      handle_char_maybe_scroll:
+        mov rax, [r12 + 48];                      // rax = rows
+        cmp r14, rax;
+        jb  handle_char_store_cursor;             // no scroll needed
+
+        // cursor_y went past bottom -> scroll up, park cursor on last row.
+        sub r14, 1;
+        // Persist tentative cursor before scroll (scroll_up doesn't touch ctx).
+        mov [r12 + 16], r13;
+        mov [r12 + 24], r14;
+        call fb_console_scroll_up;
+        // Reload after call — ctx pointer r12 is callee-save so still valid.
+        mov r13, [r12 + 16];
+        mov r14, [r12 + 24];
+        jmp handle_char_done;
+
+      handle_char_store_cursor:
+        mov [r12 + 16], r13;
+        mov [r12 + 24], r14;
+
+      handle_char_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ANSI dispatch helpers (SGR / CUP / ED / EL)
+  // ==========================================================================
+  //
+  // Each consumes the accumulated params in _ansi_state.params[0..count)
+  // and mutates ctx / grid accordingly.  Called from fb_console_putchar
+  // after a CSI-final byte closes the state machine.
+  //
+  // All four leaf-call fb_console_redraw_all or fb_console_draw_cell_at
+  // to reconcile the pixel buffer with the mutated grid / attr.
+  // ==========================================================================
+
+  // ansi_dispatch_sgr — iterate params[], mutate _ctx.cur_attr.
+  //   Default when param_count==0 is p=0 (reset).
+  let ansi_dispatch_sgr : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R23-M2-003 (#881).  SGR handler: iterate params[0..count) and mutate _fb_console_ctx.cur_attr byte by byte.  When count==0, behave as if a single p=0 was seen (reset).  Semantics per ANSI: 0=reset(attr=0x07), 1=bright(fg|=0x08), 30..37=dim fg, 40..47=dim bg, 90..97=bright fg, 100..107=bright bg.  Unknown codes silently ignored.  Register plan: 3-push callee-save (rbx=cur_attr, r12=idx, r13=count).  Leaf (no nested call) so no alignment work needed.  All state loaded from _fb_console_ctx / _ansi_state via plain u64 loads.  Writes cur_attr back via plain u64 store (only low 8 bits meaningful).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        lea rax, [rip + _fb_console_ctx];
+        mov rbx, [rax + 32];                      // rbx = cur_attr
+        and rbx, 0xFF;
+
+        lea rax, [rip + _ansi_state];
+        mov r13, [rax + 8];                       // r13 = param_count
+
+        // Empty param list -> treat as one p=0 (reset).
+        cmp r13, 0;
+        jne sgr_loop_start;
+        mov rbx, 0x07;                            // reset attr
+        jmp sgr_write_back;
+
+      sgr_loop_start:
+        xor r12, r12;                             // idx = 0
+
+      sgr_loop_body:
+        cmp r12, r13;
+        jae sgr_write_back;
+
+        // p = params[idx]
+        lea rax, [rip + _ansi_state];
+        add rax, 32;                              // rax = &params[0]
+        mov rcx, r12;
+        shl rcx, 3;
+        add rax, rcx;                             // rax = &params[idx]
+        mov r8, [rax + 0];                        // r8 = p
+
+        // Dispatch.
+        cmp r8, 0;
+        je  sgr_apply_reset;
+        cmp r8, 1;
+        je  sgr_apply_bright;
+
+        // fg dim: 30..37
+        mov rax, r8;
+        sub rax, 30;
+        cmp rax, 7;
+        ja  sgr_check_bg_dim;                     // unsigned > 7 -> not fg dim
+        // fg = rax; clear low nibble, or in rax
+        mov rcx, rbx;
+        and rcx, 0xF0;
+        or  rcx, rax;
+        mov rbx, rcx;
+        jmp sgr_loop_advance;
+
+      sgr_check_bg_dim:
+        // bg dim: 40..47
+        mov rax, r8;
+        sub rax, 40;
+        cmp rax, 7;
+        ja  sgr_check_fg_bright;
+        mov rcx, rbx;
+        and rcx, 0x0F;
+        shl rax, 4;
+        or  rcx, rax;
+        mov rbx, rcx;
+        jmp sgr_loop_advance;
+
+      sgr_check_fg_bright:
+        // fg bright: 90..97 -> fg = 8 + (p-90)
+        mov rax, r8;
+        sub rax, 90;
+        cmp rax, 7;
+        ja  sgr_check_bg_bright;
+        add rax, 8;                               // fg index 8..15
+        mov rcx, rbx;
+        and rcx, 0xF0;
+        or  rcx, rax;
+        mov rbx, rcx;
+        jmp sgr_loop_advance;
+
+      sgr_check_bg_bright:
+        // bg bright: 100..107 -> bg = 8 + (p-100)
+        mov rax, r8;
+        sub rax, 100;
+        cmp rax, 7;
+        ja  sgr_loop_advance;                     // unknown code, skip
+        add rax, 8;
+        shl rax, 4;                               // bg goes in bits 4..7
+        mov rcx, rbx;
+        and rcx, 0x0F;
+        or  rcx, rax;
+        mov rbx, rcx;
+        jmp sgr_loop_advance;
+
+      sgr_apply_reset:
+        mov rbx, 0x07;
+        jmp sgr_loop_advance;
+
+      sgr_apply_bright:
+        or  rbx, 0x08;                            // fg |= 0x08
+        jmp sgr_loop_advance;
+
+      sgr_loop_advance:
+        add r12, 1;
+        jmp sgr_loop_body;
+
+      sgr_write_back:
+        and rbx, 0xFF;
+        lea rax, [rip + _fb_console_ctx];
+        mov [rax + 32], rbx;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ansi_dispatch_cup — set cursor to (row=p0, col=p1), 1-based.
+  //   Missing param -> 1.  Clamps into [0, rows), [0, cols).
+  //
+  // No pixel redraw needed — pure cursor move.
+  let ansi_dispatch_cup : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R23-M2-003 (#881).  CUP handler.  Args: params[0]=row_1b, params[1]=col_1b (1-based per ANSI).  Missing params default to 1.  Convert to 0-based, clamp into [0, rows) and [0, cols) using an unsigned above-or-equal compare.  Store into ctx.cursor_x / cursor_y.  Leaf; no callee-save; no draw work — cursor position affects the NEXT print but does not itself paint pixels.  Register plan: 1-push rbx purely for review-symmetry.",
+      block: {
+        push rbx;
+
+        lea rax, [rip + _ansi_state];
+        mov r8, [rax + 8];                        // r8 = param_count
+
+        // row_1b default 1
+        mov r9, 1;
+        cmp r8, 1;
+        jb  cup_have_row;                         // count < 1
+        mov r9, [rax + 32];                       // r9 = params[0]
+
+      cup_have_row:
+        // col_1b default 1
+        mov r10, 1;
+        cmp r8, 2;
+        jb  cup_have_col;
+        mov r10, [rax + 40];                      // r10 = params[1]
+
+      cup_have_col:
+        // Convert to 0-based.  Guard underflow when param==0.
+        cmp r9, 0;
+        jne cup_row_sub;
+        mov r9, 1;
+      cup_row_sub:
+        sub r9, 1;
+
+        cmp r10, 0;
+        jne cup_col_sub;
+        mov r10, 1;
+      cup_col_sub:
+        sub r10, 1;
+
+        // Clamp against ctx.rows / ctx.cols.
+        lea rax, [rip + _fb_console_ctx];
+        mov rcx, [rax + 48];                      // rcx = rows
+        cmp r9, rcx;
+        jb  cup_row_ok;
+        mov r9, rcx;
+        sub r9, 1;                                // clamp to rows-1
+      cup_row_ok:
+
+        mov rcx, [rax + 40];                      // rcx = cols
+        cmp r10, rcx;
+        jb  cup_col_ok;
+        mov r10, rcx;
+        sub r10, 1;
+      cup_col_ok:
+
+        mov [rax + 16], r10;                      // cursor_x
+        mov [rax + 24], r9;                       // cursor_y
+
+        pop rbx;
+        ret
+      }
+    }
+
+  // ansi_dispatch_ed — clear regions of the screen.
+  //   p=0 (default): cursor..end.  p=1: begin..cursor.  p=2: entire.
+  let ansi_dispatch_ed : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R23-M2-003 (#881).  ED handler.  p=0 (default): clear from cursor to end.  p=1: clear from start to cursor (inclusive).  p=2: clear entire screen.  Uses default cell 0x0720.  Implements p=2 as clear_grid() + full redraw.  p=0 and p=1 write to a linear range [start_idx, end_idx) of the u16 grid and then redraw_all — naive but correct.  Register plan: 4-push callee-save (rbx=p, r12=start_idx, r13=end_idx, r14=&grid).  entry rsp%16==8, +32 pushes = rsp%16==8 — nested calls (clear_grid / redraw_all) need +8 pad.  Uses `sub rsp, 8` before each nested call, `add rsp, 8` after.  Byte-cell store via mov_w (G1).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        lea rax, [rip + _ansi_state];
+        mov r8, [rax + 8];                        // r8 = param_count
+
+        // p = 0 by default
+        xor rbx, rbx;
+        cmp r8, 0;
+        je  ed_have_p;
+        mov rbx, [rax + 32];                      // rbx = params[0]
+
+      ed_have_p:
+        // total_cells = cols * rows
+        lea rax, [rip + _fb_console_ctx];
+        mov r9, [rax + 40];                       // r9 = cols
+        mov r10, [rax + 48];                      // r10 = rows
+        imul r10, r9;                             // r10 = total cells
+
+        // cursor_idx = cursor_y * cols + cursor_x
+        mov r11, [rax + 24];                      // r11 = cursor_y
+        imul r11, r9;                             // r11 = cursor_y * cols
+        mov rcx, [rax + 16];                      // rcx = cursor_x
+        add r11, rcx;                             // r11 = cursor_idx
+
+        // Decide [start_idx, end_idx) window per p.
+        cmp rbx, 1;
+        je  ed_from_start;
+        cmp rbx, 2;
+        je  ed_all;
+
+        // Default p=0: [cursor_idx, total_cells)
+        mov r12, r11;
+        mov r13, r10;
+        jmp ed_fill;
+
+      ed_from_start:
+        xor r12, r12;
+        mov r13, r11;
+        add r13, 1;                               // inclusive of cursor
+        // Clamp end_idx <= total_cells.
+        cmp r13, r10;
+        jbe ed_fill;
+        mov r13, r10;
+        jmp ed_fill;
+
+      ed_all:
+        xor r12, r12;
+        mov r13, r10;
+
+      ed_fill:
+        lea r14, [rip + _fb_console_grid];
+
+      ed_fill_loop:
+        cmp r12, r13;
+        jae ed_fill_done;
+
+        mov rax, r12;
+        shl rax, 1;
+        add rax, r14;                             // rax = &grid[idx]
+
+        mov rdx, 0x0720;
+        mov_w [rax + 0], rdx;
+
+        add r12, 1;
+        jmp ed_fill_loop;
+
+      ed_fill_done:
+        // Reconcile pixels.  4 pushes => rsp%16==8 — pad for the call.
+        sub rsp, 8;
+        call fb_console_redraw_all;
+        add rsp, 8;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ansi_dispatch_el — clear regions of the current line.
+  //   p=0 (default): cursor..EOL.  p=1: BOL..cursor.  p=2: whole line.
+  let ansi_dispatch_el : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R23-M2-003 (#881).  EL handler.  p=0 (default) cursor..EOL, p=1 BOL..cursor, p=2 whole line.  Writes default cell (0x0720) into a linear u16 range within [row_start, row_start + cols) then redraws.  Register plan: 4-push callee-save (rbx=p, r12=start_idx, r13=end_idx, r14=&grid).  entry rsp%16==8 + 4 pushes = 8, +8 pad = 0 before nested redraw_all call.  mov_w (G1).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        lea rax, [rip + _ansi_state];
+        mov r8, [rax + 8];                        // r8 = param_count
+        xor rbx, rbx;
+        cmp r8, 0;
+        je  el_have_p;
+        mov rbx, [rax + 32];
+
+      el_have_p:
+        lea rax, [rip + _fb_console_ctx];
+        mov r9, [rax + 40];                       // r9 = cols
+        mov r11, [rax + 24];                      // r11 = cursor_y
+        imul r11, r9;                             // r11 = row_start (idx)
+        mov r10, [rax + 16];                      // r10 = cursor_x
+
+        cmp rbx, 1;
+        je  el_bol_to_cursor;
+        cmp rbx, 2;
+        je  el_whole;
+
+        // Default p=0: [row_start + cursor_x, row_start + cols)
+        mov r12, r11;
+        add r12, r10;
+        mov r13, r11;
+        add r13, r9;
+        jmp el_fill;
+
+      el_bol_to_cursor:
+        mov r12, r11;
+        mov r13, r11;
+        add r13, r10;
+        add r13, 1;
+        // Clamp end to row_start + cols
+        mov rax, r11;
+        add rax, r9;
+        cmp r13, rax;
+        jbe el_fill;
+        mov r13, rax;
+        jmp el_fill;
+
+      el_whole:
+        mov r12, r11;
+        mov r13, r11;
+        add r13, r9;
+
+      el_fill:
+        lea r14, [rip + _fb_console_grid];
+
+      el_fill_loop:
+        cmp r12, r13;
+        jae el_fill_done;
+
+        mov rax, r12;
+        shl rax, 1;
+        add rax, r14;
+
+        mov rdx, 0x0720;
+        mov_w [rax + 0], rdx;
+
+        add r12, 1;
+        jmp el_fill_loop;
+
+      el_fill_done:
+        sub rsp, 8;
+        call fb_console_redraw_all;
+        add rsp, 8;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // fb_console_init(fb_va, width, height, pitch)  — public entry
+  // ==========================================================================
+  //
+  // Initialise console state from the resolved framebuffer geometry:
+  //   - cols = min(width  / 8,  MAX_COLS)
+  //   - rows = min(height / 16, MAX_ROWS)
+  //   - clear grid, redraw, set _fb_console_active = 1.
+  //
+  // Called from kernel_main.pdx after fb_map_lfb succeeds and only when
+  // _boot_env_pa != 0 (UEFI boot path only — PVH `-kernel` does not
+  // populate boot_env and thus keeps the fb console dormant, matching
+  // the R23.M2 test discipline).
+  // ==========================================================================
+  pub let fb_console_init : (u64, u64, u64, u64) -> () !{mem} @{boot} =
+    fn (fb_va: u64) (width: u64) (height: u64) (pitch: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R23-M2-002 (#880).  Initialise the framebuffer console.  Args: rdi=fb_va (from fb_map_lfb), rsi=width, rdx=height, rcx=pitch (all bytes/pixels).  Compute cols=min(width/8, MAX_COLS=256), rows=min(height/16, MAX_ROWS=80) and populate _fb_console_ctx: fb_va at +0, pitch at +8, cursor_x=0 at +16, cursor_y=0 at +24, cur_attr=0x07 at +32, cols at +40, rows at +48.  Reset _ansi_state entirely (mode=NORMAL, param_count=0, current_param=0, has_current=0).  Then clear_grid() to fill live cells with 0x0720, redraw_all() to paint the pixel buffer, and finally set _fb_console_active=1 so klog_ring_drain_to_uart's inline hook starts mirroring log bytes onto the fb.  Register plan: 5-push callee-save (rbx=fb_va, r12=pitch, r13=cols, r14=rows, r15=&ctx) — entry rsp%16==8, +40 = 0; nested calls (clear_grid, redraw_all) see aligned rsp.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                             // fb_va
+        mov r12, rcx;                             // pitch (arg 3)
+
+        // cols = min(width / 8, MAX_COLS)
+        mov rax, rsi;
+        shr rax, 3;                               // width / 8
+        mov r13, rax;
+        mov rcx, 256;                             // MAX_COLS
+        cmp r13, rcx;
+        jbe fb_init_cols_ok;
+        mov r13, rcx;
+      fb_init_cols_ok:
+
+        // rows = min(height / 16, MAX_ROWS)
+        mov rax, rdx;
+        shr rax, 4;                               // height / 16
+        mov r14, rax;
+        mov rcx, 80;                              // MAX_ROWS
+        cmp r14, rcx;
+        jbe fb_init_rows_ok;
+        mov r14, rcx;
+      fb_init_rows_ok:
+
+        // Populate _fb_console_ctx.
+        lea r15, [rip + _fb_console_ctx];
+        mov [r15 + 0], rbx;                       // fb_va
+        mov [r15 + 8], r12;                       // pitch
+        xor rax, rax;
+        mov [r15 + 16], rax;                      // cursor_x = 0
+        mov [r15 + 24], rax;                      // cursor_y = 0
+        mov rax, 0x07;
+        mov [r15 + 32], rax;                      // cur_attr = 0x07
+        mov [r15 + 40], r13;                      // cols
+        mov [r15 + 48], r14;                      // rows
+        xor rax, rax;
+        mov [r15 + 56], rax;                      // _pad
+
+        // Reset _ansi_state (first 4 u64 slots + params[0..7]).
+        lea rax, [rip + _ansi_state];
+        xor rcx, rcx;
+        mov [rax + 0],  rcx;                      // mode = NORMAL
+        mov [rax + 8],  rcx;                      // param_count = 0
+        mov [rax + 16], rcx;                      // current_param = 0
+        mov [rax + 24], rcx;                      // has_current = 0
+        mov [rax + 32], rcx;                      // params[0]
+        mov [rax + 40], rcx;                      // params[1]
+        mov [rax + 48], rcx;                      // params[2]
+        mov [rax + 56], rcx;                      // params[3]
+        mov [rax + 64], rcx;                      // params[4]
+        mov [rax + 72], rcx;                      // params[5]
+        mov [rax + 80], rcx;                      // params[6]
+        mov [rax + 88], rcx;                      // params[7]
+
+        // Clear the live grid area and paint the pixel buffer.
+        call fb_console_clear_grid;
+        call fb_console_redraw_all;
+
+        // Activate the klog mirror hook.
+        mov rax, 1;
+        mov [rip + _fb_console_active], rax;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // fb_console_putchar(ch)  — public entry, ANSI-aware
+  // ==========================================================================
+  //
+  // Feed one byte into the ANSI state machine and either accumulate it
+  // (into current_param / params[]) or dispatch it (SGR/CUP/ED/EL/etc)
+  // or hand it to fb_console_handle_print_char.  See file preamble for
+  // the accepted CSI grammar.
+  // ==========================================================================
+  pub let fb_console_putchar : (u64) -> () !{mem} @{} =
+    fn (ch: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R23-M2-003 (#881).  ANSI state machine driving one byte at a time.  Modes: 0=NORMAL, 1=ESC, 2=CSI.  NORMAL: byte 0x1B -> mode<-ESC; else dispatch to fb_console_handle_print_char.  ESC: byte '[' -> mode<-CSI, reset param accumulator; else discard, mode<-NORMAL.  CSI: '0'..'9' -> current_param = current_param*10 + digit, has_current<-1; ';' -> commit current to params[param_count++], reset accumulator; else FINAL byte -> commit any accumulator, dispatch on final letter (m=SGR, H=CUP, J=ED, K=EL; others silently drop), mode<-NORMAL.  Byte 'ch' arrives zero-extended to u64 in rdi.  Register plan: 3-push callee-save (rbx=ch masked, r12=&ansi_state, r13=mode) — entry rsp%16==8, +24 pushes = rsp%16==0, so nested calls need NO alignment pad (odd push count preserves aligned pre-call rsp).  All state u64 so plain mov / cmp / je / call suffice; no G1 workarounds needed here.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;
+        and rbx, 0xFF;                            // rbx = ch (byte)
+
+        lea r12, [rip + _ansi_state];
+        mov r13, [r12 + 0];                       // r13 = mode
+
+        cmp r13, 1;
+        je  put_state_esc;
+        cmp r13, 2;
+        je  put_state_csi;
+
+        // ------------------------------------------------------------
+        // Mode NORMAL
+        // ------------------------------------------------------------
+        cmp rbx, 0x1B;                            // ESC
+        je  put_normal_enter_esc;
+
+        // Dispatch to print-char handler.
+        mov rdi, rbx;
+        call fb_console_handle_print_char;
+        jmp put_done;
+
+      put_normal_enter_esc:
+        mov rax, 1;                               // ANSI_MODE_ESC
+        mov [r12 + 0], rax;
+        jmp put_done;
+
+        // ------------------------------------------------------------
+        // Mode ESC — waiting for '['.
+        // ------------------------------------------------------------
+      put_state_esc:
+        cmp rbx, 0x5B;                            // '['
+        je  put_esc_enter_csi;
+        // Unknown ESC-<x>: cancel.
+        xor rax, rax;                             // mode = NORMAL
+        mov [r12 + 0], rax;
+        jmp put_done;
+
+      put_esc_enter_csi:
+        mov rax, 2;                               // ANSI_MODE_CSI
+        mov [r12 + 0], rax;
+        xor rax, rax;
+        mov [r12 + 8], rax;                       // param_count = 0
+        mov [r12 + 16], rax;                      // current_param = 0
+        mov [r12 + 24], rax;                      // has_current = 0
+        jmp put_done;
+
+        // ------------------------------------------------------------
+        // Mode CSI — accumulating params or final byte.
+        // ------------------------------------------------------------
+      put_state_csi:
+        // Digit '0'..'9' ?
+        cmp rbx, 0x30;
+        jb  put_csi_check_semi;
+        cmp rbx, 0x39;
+        ja  put_csi_check_semi;
+
+        // Digit: current_param = current_param * 10 + (ch - '0').
+        mov rax, [r12 + 16];                      // current_param
+        mov rcx, 10;
+        imul rax, rcx;
+        mov rcx, rbx;
+        sub rcx, 0x30;                            // ch - '0'
+        add rax, rcx;
+        mov [r12 + 16], rax;
+        mov rax, 1;
+        mov [r12 + 24], rax;                      // has_current = 1
+        jmp put_done;
+
+      put_csi_check_semi:
+        cmp rbx, 0x3B;                            // ';'
+        jne put_csi_final;
+
+        // Commit current -> params[param_count++]; reset accumulator.
+        mov rax, [r12 + 8];                       // param_count
+        cmp rax, 8;                               // ANSI_MAX_PARAMS
+        jae put_csi_semi_full;
+
+        mov rcx, [r12 + 16];                      // current_param
+        // slot = &params[0] + count * 8 = ansi_state + 32 + count*8
+        mov rdx, rax;
+        shl rdx, 3;
+        add rdx, 32;
+        add rdx, r12;
+        mov [rdx + 0], rcx;
+        add rax, 1;
+        mov [r12 + 8], rax;                       // param_count++
+
+      put_csi_semi_full:
+        xor rax, rax;
+        mov [r12 + 16], rax;                      // current_param = 0
+        mov [r12 + 24], rax;                      // has_current = 0
+        jmp put_done;
+
+      put_csi_final:
+        // FINAL byte.  Commit accumulator if any digit was seen.
+        mov rax, [r12 + 24];                      // has_current
+        cmp rax, 0;
+        je  put_csi_final_dispatch;
+
+        mov rax, [r12 + 8];                       // param_count
+        cmp rax, 8;
+        jae put_csi_final_dispatch;
+        mov rcx, [r12 + 16];
+        mov rdx, rax;
+        shl rdx, 3;
+        add rdx, 32;
+        add rdx, r12;
+        mov [rdx + 0], rcx;
+        add rax, 1;
+        mov [r12 + 8], rax;
+
+      put_csi_final_dispatch:
+        // Dispatch on final byte.
+        cmp rbx, 0x6D;                            // 'm' SGR
+        je  put_csi_do_sgr;
+        cmp rbx, 0x48;                            // 'H' CUP
+        je  put_csi_do_cup;
+        cmp rbx, 0x4A;                            // 'J' ED
+        je  put_csi_do_ed;
+        cmp rbx, 0x4B;                            // 'K' EL
+        je  put_csi_do_el;
+        // Unknown final -> silently drop.
+        jmp put_csi_final_done;
+
+      put_csi_do_sgr:
+        call ansi_dispatch_sgr;
+        jmp put_csi_final_done;
+
+      put_csi_do_cup:
+        call ansi_dispatch_cup;
+        jmp put_csi_final_done;
+
+      put_csi_do_ed:
+        call ansi_dispatch_ed;
+        jmp put_csi_final_done;
+
+      put_csi_do_el:
+        call ansi_dispatch_el;
+
+      put_csi_final_done:
+        xor rax, rax;                             // mode = NORMAL
+        mov [r12 + 0], rax;
+        xor rax, rax;
+        mov [r12 + 8], rax;                       // param_count = 0
+        mov [r12 + 16], rax;                      // current_param = 0
+        mov [r12 + 24], rax;                      // has_current = 0
+        jmp put_done;
+
+      put_done:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // fb_console_puts(s, len)  — public entry
+  // ==========================================================================
+  //
+  // Feed `len` bytes at s into fb_console_putchar in order.  Wire used
+  // by future top-level println / panic / klog-mirror paths.
+  // ==========================================================================
+  pub let fb_console_puts : (u64, u64) -> () !{mem} @{} =
+    fn (s: u64) (len: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R23-M2-004 (#882).  Feed a byte buffer through fb_console_putchar (which owns the ANSI parser).  Args: rdi=s (VA), rsi=len (bytes).  Register plan: 3-push callee-save (rbx=cursor, r12=end, r13=unused/alignment) — entry rsp%16==8, +24 = rsp%16==0, so nested putchar sees aligned rsp.  Byte load via mov_b + and.  Length may be 0 (empty puts is a no-op).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                             // rbx = cursor
+        mov r12, rdi;
+        add r12, rsi;                             // r12 = end
+
+      puts_loop:
+        cmp rbx, r12;
+        jae puts_done;
+
+        xor rdi, rdi;
+        mov_b rdi, [rbx + 0];
+        and rdi, 0xFF;                            // rdi = byte
+
+        call fb_console_putchar;
+
+        add rbx, 1;
+        jmp puts_loop;
+
+      puts_done:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
