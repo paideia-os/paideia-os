@@ -1,0 +1,423 @@
+// src/kernel/core/drivers/nvme/queue.pdx — R24-M2-001/002 (#890 / #891)
+//
+// NVMe admin queue substrate — queue-context initialization and
+// poll-mode admin-command submission.
+//
+// -----------------------------------------------------------------------------
+// admin_queue_ctx layout (32 B, @align(8))
+// -----------------------------------------------------------------------------
+//
+//   +0    u64 sq_pa            — physical address of admin submission queue
+//   +8    u64 cq_pa            — physical address of admin completion queue
+//   +16   u16 sq_tail          — next SQE slot to write (0..63)
+//   +18   u16 cq_head          — next CQE slot to read  (0..63)
+//   +20   u8  cq_phase         — expected Phase Tag (starts as 1; toggles wrap)
+//   +21   u8  _pad0
+//   +22   u16 _pad1
+//   +24   u32 doorbell_stride  — CAP.DSTRD-derived; 4 for DSTRD=0
+//   +28   u32 _pad2
+//   +32   end
+//
+// A single canonical .bss slot _nvme_admin_ctx holds the boot-line
+// admin context; callers may pass an alternate ctx pointer to
+// nvme_admin_queue_init if they own storage.
+//
+// -----------------------------------------------------------------------------
+// Doorbell layout (NVMe Base Spec 2.0 §3.1.14)
+// -----------------------------------------------------------------------------
+//
+// Doorbells begin at BAR0 + 0x1000. Stride = 2^(2 + CAP.DSTRD) bytes.
+// For DSTRD=0 (every commodity NVMe controller) stride = 4.
+//
+//   SQ0TDBL  @ BAR0 + 0x1000 + (2 * 0)     * stride  =  BAR0 + 0x1000
+//   CQ0HDBL  @ BAR0 + 0x1000 + (2 * 0 + 1) * stride  =  BAR0 + 0x1004
+//   SQnTDBL  @ BAR0 + 0x1000 + (2 * n)     * stride
+//   CQnHDBL  @ BAR0 + 0x1000 + (2 * n + 1) * stride
+//
+// -----------------------------------------------------------------------------
+// Poll-mode submit (nvme_admin_submit_poll)
+// -----------------------------------------------------------------------------
+//
+// R24.M2 uses a pre-IRQ path: after writing SQnTDBL, the CPU spins
+// reading the phase-tag bit of the next CQE until it matches the
+// expected phase. This is the exact bring-up path used by Linux's
+// nvme-cli during controller reset. IRQ-driven completion lands after
+// MSI-X wiring in a later revision.
+//
+// -----------------------------------------------------------------------------
+// CQE format (NVMe Base Spec 2.0 §4.6, Figure 92) — 16 bytes total
+// -----------------------------------------------------------------------------
+//
+//   +0..3   u32  DW0            — command-specific
+//   +4..7   u32  DW1            — command-specific
+//   +8..9   u16  SQ head ptr
+//   +10..11 u16  SQ identifier
+//   +12..13 u16  CID
+//   +14..15 u16  Status         — bit 0 = P (phase), bits 1..15 = SC/SCT/M/DNR
+//
+// The 16-bit status field is returned to the caller with the phase
+// bit intact so callers may distinguish spurious wakeups from real
+// completions. "Successful completion" = (status & 0xFFFE) == 0.
+//
+// -----------------------------------------------------------------------------
+// R24.M2 posture: dormant at boot
+// -----------------------------------------------------------------------------
+//
+// nvme_probe returns 0 under -kernel/BIOS boot (MCFG absent → PCI
+// enumerator drains empty), so nvme_admin_queue_init /
+// nvme_admin_submit_poll are dormant symbols at M2. Real activation
+// lands when the driver-attach path is wired against a UEFI/OVMF boot
+// path with a real nvme controller BAR0.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: sized stores via mov_b / mov_w / mov_d.
+//   G4: full-register compares (zero-extend loads via prior xor).
+//
+// Reserved-label discipline: labels prefixed `nvme_aq_` / `nvme_sp_`
+// to avoid the paideia-as reserved names (`loop`, `if`, ...).
+
+module Queue = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  pub let NVME_DOORBELL_BASE        : u64 = 0x1000
+
+  // Timeout ceiling for the completion poll. On a 3 GHz core each
+  // MMIO/CQE read pair is ~30 ns. 50,000,000 iterations ~= 1.5 s of
+  // wall-time. Well under the ~5 s Admin Command budget for any
+  // spec-conformant controller. Reserved as a sentinel — the loop
+  // terminates on the phase-tag transition, not the counter.
+  pub let NVME_SUBMIT_SPIN_MAX      : u64 = 50000000
+
+  pub let NVME_SUBMIT_TIMEOUT       : u64 = 0xFFFF
+
+  // ============================================================================
+  // admin_queue_ctx field offsets
+  // ============================================================================
+
+  pub let NVME_CTX_SQ_PA            : u64 = 0     // u64
+  pub let NVME_CTX_CQ_PA            : u64 = 8     // u64
+  pub let NVME_CTX_SQ_TAIL          : u64 = 16    // u16
+  pub let NVME_CTX_CQ_HEAD          : u64 = 18    // u16
+  pub let NVME_CTX_CQ_PHASE         : u64 = 20    // u8
+  pub let NVME_CTX_DBL_STRIDE       : u64 = 24    // u32
+  pub let NVME_CTX_SIZE             : u64 = 32
+
+  // ============================================================================
+  // Canonical boot-line ctx slot — .bss, @align(8)
+  // ============================================================================
+  //
+  //   4 × u64 = 32 B — matches NVME_CTX_SIZE.
+
+  pub let mut _nvme_admin_ctx       : [u64; 4] = uninit @align(8)
+
+  // ============================================================================
+  // Shared SQE scratch — filled by identify_ns/ns_list before submit
+  // ============================================================================
+  //
+  //   8 × u64 = 64 B = one Admin SQE. Single-shot, non-reentrant
+  //   (matches poll-mode discipline). Reused by every M2 admin builder.
+
+  pub let mut _nvme_admin_sqe_scratch : [u64; 8] = uninit @align(8)
+
+  // ============================================================================
+  // nvme_admin_queue_init(bar0, out_ctx) -> ()
+  // ============================================================================
+  //
+  // SysV: (bar0: u64, out_ctx: u64) -> ()
+  //   rdi = BAR0 base (MMIO physical address, page-aligned)
+  //   rsi = pointer to a 32-byte admin_queue_ctx buffer (writable)
+  //
+  // Populates ctx with:
+  //   sq_pa           = VA of _nvme_admin_sq (== PA under identity map)
+  //   cq_pa           = VA of _nvme_admin_cq
+  //   sq_tail         = 0
+  //   cq_head         = 0
+  //   cq_phase        = 1              (first-pass expected Phase Tag)
+  //   doorbell_stride = 4 << CAP.DSTRD
+  //
+  // Also zeros the 4 KiB _nvme_admin_sq and 1 KiB _nvme_admin_cq
+  // pages so a warm re-init (uncommon but supported) starts from a
+  // known-clean queue.
+  //
+  // Register plan (3-push callee-save):
+  //   rbx = bar0             (survives nvme_reg_u64)
+  //   rbp = out_ctx          (survives everything)
+  //   r12 = DSTRD (scratch)  (no longer needed after stride computed)
+  //
+  //   3 pushes = 24 B; entry rsp%16==8 → 24+8=32, %16==0 (aligned for
+  //   the nested nvme_reg_u64 call without extra pad).
+
+  pub let nvme_admin_queue_init : (u64, u64) -> () !{sysreg, mem} @{boot} =
+    fn (bar0: u64, out_ctx: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R24-M2-001 (#890). NVMe admin queue-context initialization. Body: (1) 3-push callee-save prologue (rbx=bar0, rbp=out_ctx, r12=DSTRD scratch) — 24 B; entry rsp%16==8 → 32, %16==0 (aligned for nvme_reg_u64 call). (2) Read CAP (u64 @ bar0+0x00) via nvme_reg_u64. (3) Extract DSTRD = (CAP >> 32) & 0xF (bits 35..32 per NVMe §3.1.1). (4) Compute stride = 4 << DSTRD via `shl rax, cl` — cl loaded from r12. (5) Store stride (u32 @+24) into ctx via mov_d. (6) Zero _pad2 (u32 @+28). (7) Store sq_pa = lea _nvme_admin_sq (64-bit store @+0). Identity-map assumption: VA of a .bss symbol in the low half equals its PA (established in boot_stub.S). (8) Store cq_pa = lea _nvme_admin_cq (64-bit store @+8). (9) Zero sq_tail (u16 @+16), cq_head (u16 @+18), _pad1 (u16 @+22). (10) Store cq_phase = 1 (u8 @+20) — first-pass expected phase per NVMe §4.6.1. (11) Zero _pad0 (u8 @+21). (12) rep_stosb-zero the 4096-byte admin SQ (rdi = lea _nvme_admin_sq, rcx = 4096, rax = 0, cld). (13) rep_stosb-zero the 1024-byte admin CQ (rdi = lea _nvme_admin_cq, rcx = 1024, rax = 0, cld). rep_stosb clobbers rcx/rax/rdi but rbx/rbp survive per SysV. (14) Epilogue. Encoder posture: G1 handled via mov_b/mov_w/mov_d for sub-8-byte stores. Reserved labels: `nvme_aq_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+
+        mov rbx, rdi;                            // rbx = bar0
+        mov rbp, rsi;                            // rbp = out_ctx
+
+        // ================================================================
+        // (2) Read CAP (u64 @ bar0 + 0x00).
+        // ================================================================
+        mov rdi, rbx;
+        xor rsi, rsi;                            // offset 0
+        call nvme_reg_u64;
+
+        // ================================================================
+        // (3) DSTRD = (CAP >> 32) & 0xF.
+        // ================================================================
+        shr rax, 32;
+        and rax, 0xF;
+        mov r12, rax;                            // r12 = DSTRD
+
+        // ================================================================
+        // (4) stride = 4 << DSTRD.
+        // ================================================================
+        mov rax, 4;
+        mov rcx, r12;
+        shl rax, cl;
+
+        // ================================================================
+        // (5) Store stride (u32 @+24).
+        // ================================================================
+        mov_d [rbp + 24], rax;
+
+        // ================================================================
+        // (6) _pad2 (u32 @+28) = 0.
+        // ================================================================
+        xor rax, rax;
+        mov_d [rbp + 28], rax;
+
+        // ================================================================
+        // (7) sq_pa (u64 @+0) = lea _nvme_admin_sq.
+        // ================================================================
+        lea rax, [rip + _nvme_admin_sq];
+        mov [rbp + 0], rax;
+
+        // ================================================================
+        // (8) cq_pa (u64 @+8) = lea _nvme_admin_cq.
+        // ================================================================
+        lea rax, [rip + _nvme_admin_cq];
+        mov [rbp + 8], rax;
+
+        // ================================================================
+        // (9) sq_tail (u16 @+16) = 0.
+        //     cq_head (u16 @+18) = 0.
+        //     _pad1   (u16 @+22) = 0.
+        // ================================================================
+        xor rax, rax;
+        mov_w [rbp + 16], rax;
+        mov_w [rbp + 18], rax;
+        mov_w [rbp + 22], rax;
+
+        // ================================================================
+        // (10) cq_phase (u8 @+20) = 1 (first-pass Phase Tag).
+        // ================================================================
+        mov rax, 1;
+        mov_b [rbp + 20], rax;
+
+        // ================================================================
+        // (11) _pad0 (u8 @+21) = 0.
+        // ================================================================
+        xor rax, rax;
+        mov_b [rbp + 21], rax;
+
+        // ================================================================
+        // (12) Zero the 4096-byte admin SQ.
+        // ================================================================
+        lea rdi, [rip + _nvme_admin_sq];
+        xor rax, rax;
+        mov rcx, 4096;
+        cld;
+        rep_stosb;
+
+        // ================================================================
+        // (13) Zero the 1024-byte admin CQ.
+        // ================================================================
+        lea rdi, [rip + _nvme_admin_cq];
+        xor rax, rax;
+        mov rcx, 1024;
+        cld;
+        rep_stosb;
+
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // nvme_admin_submit_poll(bar0, ctx, sqe_bytes) -> u64
+  // ============================================================================
+  //
+  // SysV: (bar0: u64, ctx: u64, sqe_bytes: u64) -> u64
+  //   rdi = BAR0 base
+  //   rsi = ptr to admin_queue_ctx
+  //   rdx = ptr to a 64-byte SQE image (caller-owned, contents copied)
+  //
+  // Returns rax = 16-bit CQE status field (bits 0..15). Phase bit is
+  // preserved. Successful completion = (status & 0xFFFE) == 0. On
+  // timeout returns NVME_SUBMIT_TIMEOUT (0xFFFF) sentinel.
+  //
+  // Body:
+  //   (1) Copy sqe_bytes into admin_sq[sq_tail] via rep_movsb (64 B).
+  //   (2) new_sq_tail = (sq_tail + 1) & 63; store back.
+  //   (3) Write SQ0TDBL doorbell.
+  //   (4) Spin reading admin_cq[cq_head].status until Phase == expected.
+  //   (5) Capture status, advance cq_head, toggle phase on wrap.
+  //   (6) Write CQ0HDBL doorbell.
+  //   (7) Return status.
+  //
+  // Register plan (5-push callee-save):
+  //   rbx = bar0                      (survives every nested call)
+  //   rbp = ctx                       (survives every nested call)
+  //   r12 = scratch (new tail/head)
+  //   r13 = sqe_bytes ptr / status result
+  //   r14 = spin counter
+  //
+  //   5 pushes = 40 B; entry rsp%16==8 → 40+8=48, %16==0 (aligned).
+
+  pub let nvme_admin_submit_poll : (u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64, ctx: u64, sqe_bytes: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R24-M2-002 (#891). NVMe admin poll-mode submit. Body: (1) 5-push callee-save prologue (rbx=bar0, rbp=ctx, r12=scratch, r13=sqe/status, r14=spin) — 40 B; entry rsp%16==8 → 48, %16==0 (aligned for nvme_reg_write_u32). (2) Load sq_tail (u16 @+16) into rcx via `xor rcx,rcx; mov_w rcx, [rbp+16]`. (3) Compute dst = sq_pa + (sq_tail << 6) — SQE size 64 B = 2^6. (4) memcpy 64 B via rep_movsb (rsi=sqe_bytes, rdi=dst, rcx=64, cld). rep_movsb clobbers rsi/rdi/rcx; sqe_bytes preserved in r13 across the copy. (5) new_sq_tail = (sq_tail + 1) & 63; store via mov_w @+16. (6) Write SQ0TDBL @ bar0+0x1000 via nvme_reg_write_u32. (7) Poll loop `nvme_sp_poll`: load cq_head (u16 @+18); compute cqe_addr = cq_pa + (cq_head << 4); read status (u16 @+14) via zero-extended mov_w; extract phase = status & 1; compare against expected phase (u8 @+20); if match → break. Timeout on r14 = NVME_SUBMIT_SPIN_MAX. (8) On match: save status in r13; new_cq_head = (cq_head + 1) & 63; if wrap (new_cq_head == 0) → toggle cq_phase (u8 @+20) via `xor rdx, 1`. (9) Store new_cq_head back to ctx (u16 @+18). (10) Write CQ0HDBL @ bar0 + 0x1000 + stride via nvme_reg_write_u32; stride loaded from ctx (u32 @+24). (11) Return status in rax. On timeout return NVME_SUBMIT_TIMEOUT (0xFFFF). Reserved labels: `nvme_sp_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                            // rbx = bar0
+        mov rbp, rsi;                            // rbp = ctx
+        mov r13, rdx;                            // r13 = sqe_bytes
+
+        // ================================================================
+        // (2)-(4) Copy SQE into admin_sq[sq_tail].
+        // ================================================================
+        xor rcx, rcx;
+        mov_w rcx, [rbp + 16];                   // rcx = sq_tail
+        mov rdi, [rbp + 0];                      // rdi = sq_pa
+        mov rax, rcx;
+        shl rax, 6;                              // * 64 (SQE size)
+        add rdi, rax;                            // rdi = &sq[sq_tail]
+
+        mov rsi, r13;                            // rsi = sqe_bytes (src)
+        mov rcx, 64;
+        cld;
+        rep_movsb;
+
+        // ================================================================
+        // (5) Advance sq_tail.
+        // ================================================================
+        xor rax, rax;
+        mov_w rax, [rbp + 16];
+        add rax, 1;
+        and rax, 63;
+        mov_w [rbp + 16], rax;
+        mov r12, rax;                            // r12 = new_sq_tail
+
+        // ================================================================
+        // (6) Write SQ0TDBL doorbell.
+        // ================================================================
+        mov rdi, rbx;
+        mov rsi, 0x1000;
+        mov rdx, r12;
+        call nvme_reg_write_u32;
+
+        // ================================================================
+        // (7) Poll admin_cq[cq_head].status.
+        // ================================================================
+        mov r14, 50000000;                       // NVME_SUBMIT_SPIN_MAX
+
+      nvme_sp_poll:
+        xor rax, rax;
+        mov_w rax, [rbp + 18];                   // rax = cq_head
+        mov rdi, [rbp + 8];                      // rdi = cq_pa
+        mov rcx, rax;
+        shl rcx, 4;                              // * 16 (CQE size)
+        add rdi, rcx;                            // rdi = &cq[cq_head]
+
+        // Load status (u16 @+14).
+        xor rax, rax;
+        mov_w rax, [rdi + 14];                   // rax = status
+        mov rcx, rax;
+        and rcx, 1;                              // rcx = phase-tag bit
+
+        // Load expected phase (u8 @+20).
+        xor rdx, rdx;
+        mov_b rdx, [rbp + 20];                   // rdx = expected phase
+
+        cmp rcx, rdx;
+        je nvme_sp_matched;
+
+        sub r14, 1;
+        cmp r14, 0;
+        je nvme_sp_timeout;
+        jmp nvme_sp_poll;
+
+      nvme_sp_matched:
+        // rax = raw 16-bit status; save for return.
+        mov r13, rax;
+
+        // ================================================================
+        // (8) Advance cq_head; toggle phase on wrap.
+        // ================================================================
+        xor rax, rax;
+        mov_w rax, [rbp + 18];
+        add rax, 1;
+        and rax, 63;
+
+        cmp rax, 0;
+        jne nvme_sp_no_wrap;
+
+        // Wrap: toggle cq_phase (u8 @+20).
+        xor rdx, rdx;
+        mov_b rdx, [rbp + 20];
+        xor rdx, 1;
+        mov_b [rbp + 20], rdx;
+
+      nvme_sp_no_wrap:
+        mov_w [rbp + 18], rax;
+        mov r12, rax;                            // r12 = new_cq_head
+
+        // ================================================================
+        // (10) Write CQ0HDBL doorbell @ bar0 + 0x1000 + stride.
+        // ================================================================
+        xor rax, rax;
+        mov_d rax, [rbp + 24];                   // rax = stride
+        mov rsi, 0x1000;
+        add rsi, rax;                            // offset = 0x1000 + stride
+
+        mov rdi, rbx;
+        mov rdx, r12;
+        call nvme_reg_write_u32;
+
+        mov rax, r13;                            // return raw status
+        jmp nvme_sp_done;
+
+      nvme_sp_timeout:
+        mov rax, 0xFFFF;                         // NVME_SUBMIT_TIMEOUT
+
+      nvme_sp_done:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
