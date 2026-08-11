@@ -1,0 +1,771 @@
+// src/kernel/core/drivers/nvme/io_queue.pdx — R24-M3-001/002/005 (#894 / #895 / #898)
+//
+// NVMe IO queue lifecycle — Create IO CQ (Admin 0x05), Create IO SQ
+// (Admin 0x01), Delete IO SQ (Admin 0x00), Delete IO CQ (Admin 0x04),
+// plus per-CPU queue-descriptor table.
+//
+// -----------------------------------------------------------------------------
+// Per-CPU queue partitioning (R24.M3 posture)
+// -----------------------------------------------------------------------------
+//
+// One (SQ, CQ) pair per CPU, matched by identical qid = cqid = cpu_idx + 1.
+// Admin queues own qid=0 by NVMe convention (§3.1.14). The controller is
+// programmed once during driver-attach (deferred, dormant at boot); the
+// per-CPU queue descriptors and their backing pages are reserved as .bss
+// so the queue-create/delete sequences can run without a phys_alloc round
+// trip.
+//
+// Storage sizes (NVME_IO_MAX_QUEUES = 8 slots, matching MADT AP topology
+// enumeration ceiling in practice; VECTOR_POOL_MAX_CPUS = 4 governs how
+// many are actually allocatable today):
+//
+//   _nvme_io_cq_buffers : 8 * 4 KiB = 32 KiB   (@align(4096))
+//   _nvme_io_sq_buffers : 8 * 4 KiB = 32 KiB   (@align(4096))
+//     - CQ occupies 64 * 16 = 1024 B of its 4 KiB page (waste is fine)
+//     - SQ occupies 64 * 64 = 4096 B — full page utilization
+//   _nvme_io_queues     : 8 * 32 B = 256 B     (@align(8))
+//
+// -----------------------------------------------------------------------------
+// io_queue_desc layout (32 B, @align(8))
+// -----------------------------------------------------------------------------
+//
+//   +0    u64 cq_pa            — physical address of this queue's CQ
+//   +8    u64 sq_pa            — physical address of this queue's SQ
+//   +16   u16 qid              — NVMe queue identifier (1..NVME_IO_MAX_QUEUES)
+//   +18   u16 sq_tail          — next SQE slot to write (0..63)
+//   +20   u16 cq_head          — next CQE slot to read  (0..63)
+//   +22   u8  vector           — allocated x86 IDT vector (0x60..0xEF, 0=unused)
+//   +23   u8  cq_phase         — expected Phase Tag (starts as 1)
+//   +24   u64 _reserved        — future request-slot bitmap head (M5)
+//   +32   end
+//
+// -----------------------------------------------------------------------------
+// SQE (Create IO CQ, OPC=0x05, §5.4)
+// -----------------------------------------------------------------------------
+//
+//   OPC   = 0x05
+//   NSID  = 0
+//   PRP1  = cq_pa
+//   CDW10 = ((size-1) << 16) | qid
+//   CDW11 = (iv << 16) | ((ien & 1) << 1) | PC(1)
+//
+// -----------------------------------------------------------------------------
+// SQE (Create IO SQ, OPC=0x01, §5.5)
+// -----------------------------------------------------------------------------
+//
+//   OPC   = 0x01
+//   NSID  = 0
+//   PRP1  = sq_pa
+//   CDW10 = ((size-1) << 16) | qid
+//   CDW11 = (cqid << 16) | ((qprio & 3) << 1) | PC(1)
+//
+// -----------------------------------------------------------------------------
+// SQE (Delete IO SQ, OPC=0x00, §5.6) / Delete IO CQ (OPC=0x04, §5.7)
+// -----------------------------------------------------------------------------
+//
+//   OPC   = 0x00 (SQ) or 0x04 (CQ)
+//   CDW10 = qid
+//
+// Delete SQ MUST precede delete CQ for the matched pair (NVMe §5.7).
+//
+// -----------------------------------------------------------------------------
+// R24.M3 posture: dormant at boot
+// -----------------------------------------------------------------------------
+//
+// nvme_probe returns 0 under BIOS/`-kernel` boot (MCFG absent), so none
+// of the functions in this file execute during smoke boot. Symbol
+// existence + link cleanliness is the M3 acceptance surface. IRQ-driven
+// completion wiring lands at R24.M5.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: sized stores via mov_b / mov_w / mov_d.
+//   G4: full-register compares (zero-extend loads via prior xor).
+//
+// Reserved-label discipline: labels prefixed `nvme_iocq_`, `nvme_iosq_`,
+// `nvme_iod_`, `nvme_icqs_`, `nvme_isqs_`, `nvme_itd_` to avoid the
+// paideia-as reserved names (`loop`, `if`, ...).
+
+module IoQueue = structure {
+
+  // ============================================================================
+  // Admin opcodes for IO-queue lifecycle (§5.1 / §5.4 / §5.5 / §5.6 / §5.7)
+  // ============================================================================
+
+  pub let NVME_ADMIN_OPC_DELETE_IO_SQ  : u64 = 0x00
+  pub let NVME_ADMIN_OPC_CREATE_IO_SQ  : u64 = 0x01
+  pub let NVME_ADMIN_OPC_DELETE_IO_CQ  : u64 = 0x04
+  pub let NVME_ADMIN_OPC_CREATE_IO_CQ  : u64 = 0x05
+
+  // ============================================================================
+  // Sizing constants
+  // ============================================================================
+
+  pub let NVME_IO_MAX_QUEUES        : u64 = 8      // per-CPU queue slots
+  pub let NVME_IO_QUEUE_ENTRIES     : u64 = 64     // 64 SQEs / CQEs per pair
+  pub let NVME_IO_QUEUE_PAGE        : u64 = 4096
+
+  pub let NVME_IO_DESC_CQ_PA        : u64 = 0      // u64
+  pub let NVME_IO_DESC_SQ_PA        : u64 = 8      // u64
+  pub let NVME_IO_DESC_QID          : u64 = 16     // u16
+  pub let NVME_IO_DESC_SQ_TAIL      : u64 = 18     // u16
+  pub let NVME_IO_DESC_CQ_HEAD      : u64 = 20     // u16
+  pub let NVME_IO_DESC_VECTOR       : u64 = 22     // u8
+  pub let NVME_IO_DESC_CQ_PHASE     : u64 = 23     // u8
+  pub let NVME_IO_DESC_RESERVED     : u64 = 24     // u64 (future request-slot head)
+  pub let NVME_IO_DESC_SIZE         : u64 = 32
+
+  // ============================================================================
+  // Per-CPU IO queue backing storage — page-aligned .bss
+  // ============================================================================
+  //
+  //   _nvme_io_cq_buffers : 8 * 512 u64  = 32 KiB — one 4 KiB page per CQ
+  //   _nvme_io_sq_buffers : 8 * 512 u64  = 32 KiB — one 4 KiB page per SQ
+  //   _nvme_io_queues     : 32 u64       = 256 B  — 8 * 32 B descriptors
+
+  pub let mut _nvme_io_cq_buffers   : [u64; 4096] = uninit @align(4096)
+  pub let mut _nvme_io_sq_buffers   : [u64; 4096] = uninit @align(4096)
+  pub let mut _nvme_io_queues       : [u64; 32]   = uninit @align(8)
+  pub let mut _nvme_io_queue_count  : u64         = 0
+
+  // ============================================================================
+  // Cached BAR0 for the currently attached controller (populated by
+  // nvme_create_all_io_cqs). Consumed by nvme_submit_io_cmd (dispatch.pdx)
+  // so its signature can stay to a single sqe-ptr argument.
+  // ============================================================================
+
+  pub let mut _nvme_current_bar0    : u64         = 0
+
+  // ============================================================================
+  // nvme_create_io_cq(bar0, ctx, qid, cq_pa, size, cdw11) -> u64
+  // ============================================================================
+  //
+  // SysV: (bar0, ctx, qid, cq_pa, size, cdw11) -> u64
+  //   rdi = BAR0 base
+  //   rsi = admin_queue_ctx pointer
+  //   rdx = qid  (u16 semantics)
+  //   rcx = cq_pa (physical address, 4 KiB aligned)
+  //   r8  = size (queue depth; CDW10 stores size - 1)
+  //   r9  = pre-packed CDW11:
+  //         bit 0    = PC (must be 1 for our contiguous pages)
+  //         bit 1    = IEN
+  //         bits 31:16 = IV (interrupt vector index)
+  //
+  // Returns rax = 16-bit CQE status from nvme_admin_submit_poll (0 on
+  // success; NVME_SUBMIT_TIMEOUT on poll timeout).
+  //
+  // Register plan (5-push callee-save):
+  //   rbx = bar0, rbp = ctx, r12 = qid, r13 = cq_pa, r14 = size,
+  //   r15 = cdw11
+  //   5 pushes = 40 B; entry rsp%16==8 → 48, %16==0 (aligned for the
+  //   nested nvme_admin_submit_poll call).
+
+  pub let nvme_create_io_cq : (u64, u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64, ctx: u64, qid: u64, cq_pa: u64, size: u64, cdw11: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R24-M3-001 (#894). Build + submit Admin Create-IO-CQ (OPC=0x05) per NVMe §5.4. Body: (1) 6-push callee-save prologue (rbx=bar0, rbp=ctx, r12=qid, r13=cq_pa, r14=size, r15=cdw11) — 48 B; entry rsp%16==8 → 56, %16==8, sub rsp,8 → 64, %16==0 (aligned for nvme_admin_submit_poll). (2) rep_stosb-zero the 64-byte _nvme_admin_sqe_scratch (rdi = lea scratch, rax=0, rcx=64, cld). rep_stosb clobbers rcx/rax/rdi; rbx..r15 survive per SysV. (3) Reload scratch base via lea. (4) OPC (u8 @+0) = 0x05 via mov_b. (5) PRP1 (u64 @+24) = cq_pa (plain 64-bit store). (6) Compute CDW10 = ((size-1) << 16) | qid: mov rax, r14; sub rax, 1; shl rax, 16; or rax, r12; mov_d [scratch+40], rax. (7) CDW11 (u32 @+44) = r15 (pre-packed by caller) via mov_d. (8) Submit via nvme_admin_submit_poll(bar0=rbx, ctx=rbp, sqe=scratch) → rax = raw 16-bit status. (9) Return status. Reserved labels: `nvme_iocq_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;                              // 16B align
+
+        mov rbx, rdi;                            // rbx = bar0
+        mov rbp, rsi;                            // rbp = ctx
+        mov r12, rdx;                            // r12 = qid
+        mov r13, rcx;                            // r13 = cq_pa
+        mov r14, r8;                             // r14 = size
+        mov r15, r9;                             // r15 = cdw11
+
+        // ================================================================
+        // (2) Zero the 64-byte SQE scratch.
+        // ================================================================
+        lea rdi, [rip + _nvme_admin_sqe_scratch];
+        xor rax, rax;
+        mov rcx, 64;
+        cld;
+        rep_stosb;
+
+        // ================================================================
+        // (3)-(7) Fill SQE fields.
+        // ================================================================
+        lea r10, [rip + _nvme_admin_sqe_scratch];
+
+        // OPC (u8 @+0) = 0x05.
+        mov rax, 5;
+        mov_b [r10 + 0], rax;
+
+        // PRP1 (u64 @+24) = cq_pa.
+        mov [r10 + 24], r13;
+
+        // CDW10 (u32 @+40) = ((size-1) << 16) | qid.
+        mov rax, r14;
+        sub rax, 1;
+        shl rax, 16;
+        or  rax, r12;
+        mov_d [r10 + 40], rax;
+
+        // CDW11 (u32 @+44) = cdw11 (pre-packed).
+        mov_d [r10 + 44], r15;
+
+        // ================================================================
+        // (8) Submit.
+        // ================================================================
+        mov rdi, rbx;                            // bar0
+        mov rsi, rbp;                            // ctx
+        lea rdx, [rip + _nvme_admin_sqe_scratch];
+        call nvme_admin_submit_poll;
+
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // nvme_create_io_sq(bar0, ctx, qid, sq_pa, size, cdw11) -> u64
+  // ============================================================================
+  //
+  // Same shape as nvme_create_io_cq but OPC=0x01. Caller pre-packs
+  // CDW11 with (cqid << 16) | ((qprio & 3) << 1) | PC(1).
+
+  pub let nvme_create_io_sq : (u64, u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64, ctx: u64, qid: u64, sq_pa: u64, size: u64, cdw11: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R24-M3-002 (#895). Build + submit Admin Create-IO-SQ (OPC=0x01) per NVMe §5.5. Structural twin of nvme_create_io_cq. CDW11 encodes (cqid<<16) | ((qprio&3)<<1) | PC=1. Body: (1) 6-push callee-save prologue + 8B align (matches nvme_create_io_cq for a cross-function-readable register plan). (2) Zero SQE scratch via rep_stosb. (3) OPC (u8 @+0) = 0x01. (4) PRP1 (u64 @+24) = sq_pa. (5) CDW10 (u32 @+40) = ((size-1)<<16) | qid. (6) CDW11 (u32 @+44) = cdw11. (7) Submit via nvme_admin_submit_poll → rax = raw status. Reserved labels: `nvme_iosq_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+        mov r12, rdx;                            // qid
+        mov r13, rcx;                            // sq_pa
+        mov r14, r8;                             // size
+        mov r15, r9;                             // cdw11
+
+        // Zero SQE scratch.
+        lea rdi, [rip + _nvme_admin_sqe_scratch];
+        xor rax, rax;
+        mov rcx, 64;
+        cld;
+        rep_stosb;
+
+        lea r10, [rip + _nvme_admin_sqe_scratch];
+
+        // OPC (u8 @+0) = 0x01.
+        mov rax, 1;
+        mov_b [r10 + 0], rax;
+
+        // PRP1 (u64 @+24) = sq_pa.
+        mov [r10 + 24], r13;
+
+        // CDW10 (u32 @+40) = ((size-1) << 16) | qid.
+        mov rax, r14;
+        sub rax, 1;
+        shl rax, 16;
+        or  rax, r12;
+        mov_d [r10 + 40], rax;
+
+        // CDW11 (u32 @+44) = cdw11.
+        mov_d [r10 + 44], r15;
+
+        // Submit.
+        mov rdi, rbx;
+        mov rsi, rbp;
+        lea rdx, [rip + _nvme_admin_sqe_scratch];
+        call nvme_admin_submit_poll;
+
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // nvme_delete_io_sq(bar0, ctx, qid) -> u64  (Admin OPC=0x00, §5.6)
+  // ============================================================================
+
+  pub let nvme_delete_io_sq : (u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64, ctx: u64, qid: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R24-M3-005 (#898). Build + submit Admin Delete-IO-SQ (OPC=0x00) per NVMe §5.6. Body: (1) 3-push callee-save (rbx=bar0, rbp=ctx, r12=qid) — 24 B; entry rsp%16==8 → 32, %16==0 (aligned). (2) Zero SQE scratch via rep_stosb. (3) OPC (u8 @+0) = 0x00 (already zero from step 2 — no store required). (4) CDW10 (u32 @+40) = qid via mov_d. (5) Submit via nvme_admin_submit_poll → rax = raw status. Contract: caller MUST delete each SQ BEFORE its paired CQ (NVMe §5.7). Reserved labels: `nvme_isqd_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+
+        mov rbx, rdi;                            // bar0
+        mov rbp, rsi;                            // ctx
+        mov r12, rdx;                            // qid
+
+        // Zero SQE scratch.
+        lea rdi, [rip + _nvme_admin_sqe_scratch];
+        xor rax, rax;
+        mov rcx, 64;
+        cld;
+        rep_stosb;
+
+        lea r10, [rip + _nvme_admin_sqe_scratch];
+
+        // OPC = 0x00 already zero. CDW10 (u32 @+40) = qid.
+        mov_d [r10 + 40], r12;
+
+        // Submit.
+        mov rdi, rbx;
+        mov rsi, rbp;
+        lea rdx, [rip + _nvme_admin_sqe_scratch];
+        call nvme_admin_submit_poll;
+
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // nvme_delete_io_cq(bar0, ctx, qid) -> u64  (Admin OPC=0x04, §5.7)
+  // ============================================================================
+
+  pub let nvme_delete_io_cq : (u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64, ctx: u64, qid: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R24-M3-005 (#898). Build + submit Admin Delete-IO-CQ (OPC=0x04) per NVMe §5.7. Structural twin of nvme_delete_io_sq with OPC=0x04. Body: 3-push callee-save prologue; zero SQE scratch; OPC (u8 @+0) = 0x04; CDW10 (u32 @+40) = qid; submit. Reserved labels: `nvme_icqd_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+
+        mov rbx, rdi;                            // bar0
+        mov rbp, rsi;                            // ctx
+        mov r12, rdx;                            // qid
+
+        // Zero SQE scratch.
+        lea rdi, [rip + _nvme_admin_sqe_scratch];
+        xor rax, rax;
+        mov rcx, 64;
+        cld;
+        rep_stosb;
+
+        lea r10, [rip + _nvme_admin_sqe_scratch];
+
+        // OPC (u8 @+0) = 0x04.
+        mov rax, 4;
+        mov_b [r10 + 0], rax;
+
+        // CDW10 (u32 @+40) = qid.
+        mov_d [r10 + 40], r12;
+
+        // Submit.
+        mov rdi, rbx;
+        mov rsi, rbp;
+        lea rdx, [rip + _nvme_admin_sqe_scratch];
+        call nvme_admin_submit_poll;
+
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // nvme_create_all_io_cqs(bar0, ctx) -> u64
+  // ============================================================================
+  //
+  // For each active CPU (up to NVME_IO_MAX_QUEUES, gated by
+  // vector_alloc_for_cpu availability):
+  //   (1) Alloc a per-CPU MSI-X vector.
+  //   (2) Compute qid = cpu_idx + 1, cq_pa = &_nvme_io_cq_buffers[cpu_idx * 4096].
+  //   (3) Pack CDW11 = (vector << 16) | (IEN=1 << 1) | PC=1.
+  //   (4) Submit Create-IO-CQ.
+  //   (5) On success, populate _nvme_io_queues[cpu_idx] with
+  //       {qid, cq_pa, vector, cq_phase=1}.
+  //
+  // Returns rax = count of CQs successfully created.
+  //
+  // Register plan (6-push callee-save):
+  //   rbx = bar0, rbp = ctx, r12 = cpu_idx (loop counter),
+  //   r13 = success count, r14 = active-CPU ceiling,
+  //   r15 = cached per-iter vector.
+
+  pub let nvme_create_all_io_cqs : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64, ctx: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R24-M3-001 (#894). Iterate active CPUs, allocating a per-CPU MSI-X vector via vector_alloc_for_cpu and submitting Create-IO-CQ (OPC=0x05) per NVMe §5.4. Also caches bar0 in _nvme_current_bar0 for later use by nvme_submit_io_cmd. Body: (1) 6-push callee-save prologue (rbx=bar0, rbp=ctx, r12=cpu_idx, r13=count, r14=ceiling, r15=vector) — 48 B; entry rsp%16==8 → 56, sub rsp,8 → 64, %16==0. (2) Cache bar0 in _nvme_current_bar0 (module-level u64) so dispatch.pdx's nvme_submit_io_cmd can reach it without a widened signature. (3) Compute active-CPU ceiling = min(_madt_ap_count + 1, NVME_IO_MAX_QUEUES). Load _madt_ap_count, add 1, cmp against 8, cmovae to 8. Since paideia-as may not have cmovae encoded, use branchy min. (4) Loop cpu_idx = 0..ceiling: (a) vector_alloc_for_cpu(cpu_idx) → rax; if == 0xFF (VECTOR_INVALID) → skip this cpu (bump counter, continue). Save vector in r15. (b) qid = cpu_idx + 1; cq_pa = &_nvme_io_cq_buffers + cpu_idx * 4096 (shl 12). (c) Pack cdw11 = (vector << 16) | (1 << 1) | 1 = (vector << 16) | 3. (d) Call nvme_create_io_cq(bar0, ctx, qid, cq_pa, 64, cdw11) → rax = raw status. (e) On success ((status & 0xFFFE) == 0): compute desc = &_nvme_io_queues + cpu_idx * 32; write cq_pa (@+0), qid (u16 @+16), vector (u8 @+22), cq_phase=1 (u8 @+23), cq_head=0 (u16 @+20), sq_tail=0 (u16 @+18), sq_pa=0 (@+8) — sq_pa left 0 until nvme_create_all_io_sqs pairs it. Bump r13. (5) Publish _nvme_io_queue_count = r13. (6) Return r13. All ancillary calls (vector_alloc_for_cpu, nvme_create_io_cq) preserve rbx/rbp/r12..r15 per SysV. Reserved labels: `nvme_icqs_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // rbx = bar0
+        mov rbp, rsi;                            // rbp = ctx
+
+        // Cache bar0 for dispatch.pdx.
+        mov [rip + _nvme_current_bar0], rbx;
+
+        // Compute active-CPU ceiling = min(_madt_ap_count + 1, 8).
+        mov rax, [rip + _madt_ap_count];
+        add rax, 1;
+        cmp rax, 8;                              // NVME_IO_MAX_QUEUES
+        jbe nvme_icqs_ceiling_ok;
+        mov rax, 8;
+
+      nvme_icqs_ceiling_ok:
+        mov r14, rax;                            // r14 = ceiling
+
+        xor r12, r12;                            // r12 = cpu_idx = 0
+        xor r13, r13;                            // r13 = success count = 0
+
+      nvme_icqs_loop:
+        cmp r12, r14;
+        jae nvme_icqs_done;
+
+        // ---- (4a) Allocate per-CPU MSI-X vector ----
+        mov rdi, r12;
+        call vector_alloc_for_cpu;
+
+        cmp rax, 0xFF;                           // VECTOR_INVALID
+        je  nvme_icqs_skip;
+
+        mov r15, rax;                            // r15 = vector
+
+        // ---- (4b) qid = cpu_idx + 1; cq_pa = base + cpu_idx * 4096 ----
+        mov r8, r12;
+        add r8, 1;                               // r8 = qid
+
+        mov rax, r12;
+        shl rax, 12;                             // * 4096
+        lea rcx, [rip + _nvme_io_cq_buffers];
+        add rcx, rax;                            // rcx = cq_pa
+
+        // ---- (4c) cdw11 = (vector << 16) | (1 << 1) | 1 = (vector<<16) | 3 ----
+        mov r9, r15;
+        shl r9, 16;
+        or  r9, 3;                               // PC=1 | IEN=1
+
+        // ---- (4d) nvme_create_io_cq(bar0, ctx, qid, cq_pa, 64, cdw11) ----
+        //
+        //   rdi = bar0, rsi = ctx, rdx = qid, rcx = cq_pa,
+        //   r8  = size (was qid — reload with 64), r9 = cdw11.
+        //
+        //   r8 currently holds qid; move qid → rdx first, then load
+        //   size=64 into r8 (order matters — rcx already holds cq_pa).
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r8;                             // qid → rdx
+        mov r8, 64;                              // size = NVME_IO_QUEUE_ENTRIES
+        call nvme_create_io_cq;
+
+        // ---- (4e) Success test: (status & 0xFFFE) == 0 ----
+        and rax, 0xFFFE;
+        cmp rax, 0;
+        jne nvme_icqs_skip;
+
+        // ---- Populate _nvme_io_queues[cpu_idx] ----
+        mov rax, r12;
+        shl rax, 5;                              // * 32
+        lea r10, [rip + _nvme_io_queues];
+        add r10, rax;                            // r10 = &desc[cpu_idx]
+
+        // cq_pa (u64 @+0) = _nvme_io_cq_buffers + cpu_idx * 4096
+        mov rax, r12;
+        shl rax, 12;
+        lea rcx, [rip + _nvme_io_cq_buffers];
+        add rcx, rax;
+        mov [r10 + 0], rcx;
+
+        // sq_pa (u64 @+8) = 0 for now (populated by nvme_create_all_io_sqs).
+        xor rax, rax;
+        mov [r10 + 8], rax;
+
+        // qid (u16 @+16) = cpu_idx + 1
+        mov rax, r12;
+        add rax, 1;
+        mov_w [r10 + 16], rax;
+
+        // sq_tail (u16 @+18) = 0
+        xor rax, rax;
+        mov_w [r10 + 18], rax;
+
+        // cq_head (u16 @+20) = 0
+        mov_w [r10 + 20], rax;
+
+        // vector (u8 @+22) = r15
+        mov_b [r10 + 22], r15;
+
+        // cq_phase (u8 @+23) = 1
+        mov rax, 1;
+        mov_b [r10 + 23], rax;
+
+        // _reserved (u64 @+24) = 0
+        xor rax, rax;
+        mov [r10 + 24], rax;
+
+        add r13, 1;                              // success++
+
+      nvme_icqs_skip:
+        add r12, 1;
+        jmp nvme_icqs_loop;
+
+      nvme_icqs_done:
+        mov [rip + _nvme_io_queue_count], r13;
+        mov rax, r13;
+
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // nvme_create_all_io_sqs(bar0, ctx) -> u64
+  // ============================================================================
+  //
+  // Precondition: nvme_create_all_io_cqs already ran (per-CPU descriptors
+  // populated with cq_pa/qid/vector). For each descriptor with a non-zero
+  // qid, submit Create-IO-SQ (OPC=0x01) with matched cqid = qid and
+  // qprio=0 (round-robin). On success, store sq_pa into the descriptor.
+  //
+  // Returns rax = count of SQs successfully created.
+  //
+  // Register plan mirrors nvme_create_all_io_cqs.
+
+  pub let nvme_create_all_io_sqs : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64, ctx: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R24-M3-002 (#895). Iterate the descriptors populated by nvme_create_all_io_cqs and submit a matched Create-IO-SQ per NVMe §5.5. Body: (1) 6-push callee-save prologue + 8B align — same shape as nvme_create_all_io_cqs. (2) Loop cpu_idx = 0..NVME_IO_MAX_QUEUES: (a) desc = &_nvme_io_queues + cpu_idx * 32; qid (u16 @+16) — zero-extended load; if qid == 0 → skip (this slot never had a CQ created). (b) sq_pa = &_nvme_io_sq_buffers + cpu_idx * 4096. (c) cdw11 = (cqid << 16) | (0 << 1) | 1 with cqid = qid (matched pair) and qprio=0. (d) nvme_create_io_sq(bar0, ctx, qid, sq_pa, 64, cdw11) → rax status. (e) On success, store sq_pa (u64 @+8) in desc; bump success count in r13. Reserved labels: `nvme_isqs_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // bar0
+        mov rbp, rsi;                            // ctx
+
+        xor r12, r12;                            // cpu_idx
+        xor r13, r13;                            // success count
+        mov r14, 8;                              // NVME_IO_MAX_QUEUES
+
+      nvme_isqs_loop:
+        cmp r12, r14;
+        jae nvme_isqs_done;
+
+        // desc = &_nvme_io_queues + cpu_idx * 32.
+        mov rax, r12;
+        shl rax, 5;
+        lea r10, [rip + _nvme_io_queues];
+        add r10, rax;
+        mov r15, r10;                            // r15 = desc
+
+        // qid (u16 @+16) — zero-extended.
+        xor rax, rax;
+        mov_w rax, [r15 + 16];
+        cmp rax, 0;
+        je  nvme_isqs_skip;
+
+        mov r11, rax;                            // r11 = qid
+
+        // sq_pa = &_nvme_io_sq_buffers + cpu_idx * 4096.
+        mov rax, r12;
+        shl rax, 12;
+        lea r8, [rip + _nvme_io_sq_buffers];
+        add r8, rax;                             // r8 = sq_pa
+
+        // Marshal args for nvme_create_io_sq:
+        //   rdi=bar0, rsi=ctx, rdx=qid, rcx=sq_pa, r8=size, r9=cdw11
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r11;                            // qid
+        mov rcx, r8;                             // sq_pa
+        mov r8, 64;                              // size
+        mov r9, r11;                             // cqid = qid
+        shl r9, 16;
+        or  r9, 1;                               // PC=1, QPRIO=0
+
+        call nvme_create_io_sq;
+
+        // Success test: (status & 0xFFFE) == 0.
+        and rax, 0xFFFE;
+        cmp rax, 0;
+        jne nvme_isqs_skip;
+
+        // Store sq_pa into descriptor (@+8). Recompute — r8/rcx got
+        // clobbered by the call.
+        mov rax, r12;
+        shl rax, 12;
+        lea rcx, [rip + _nvme_io_sq_buffers];
+        add rcx, rax;
+        mov [r15 + 8], rcx;
+
+        add r13, 1;
+
+      nvme_isqs_skip:
+        add r12, 1;
+        jmp nvme_isqs_loop;
+
+      nvme_isqs_done:
+        mov rax, r13;
+
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // nvme_teardown_all_io_queues(bar0, ctx) -> u64
+  // ============================================================================
+  //
+  // Shutdown path counterpart to nvme_create_all_io_cqs +
+  // nvme_create_all_io_sqs. For each populated descriptor:
+  //   (1) Delete IO SQ (OPC=0x00, qid).
+  //   (2) Delete IO CQ (OPC=0x04, qid).
+  //   (3) Zero the descriptor.
+  //
+  // Order matters: SQ MUST be deleted before its paired CQ (NVMe §5.7).
+  // Returns rax = count of queues fully torn down (both SQ+CQ succeeded).
+
+  pub let nvme_teardown_all_io_queues : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64, ctx: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R24-M3-005 (#898). Delete every populated IO SQ/CQ pair in order (SQ before CQ per NVMe §5.7). Body: (1) 5-push callee-save prologue (rbx=bar0, rbp=ctx, r12=cpu_idx, r13=teardown count, r14=NVME_IO_MAX_QUEUES) — 40 B; entry rsp%16==8 → 48, %16==0 (aligned). (2) Loop cpu_idx = 0..NVME_IO_MAX_QUEUES: load desc = &_nvme_io_queues + cpu_idx*32; qid = u16 @+16 (zero-extended); if qid == 0 → skip. (3) nvme_delete_io_sq(bar0, ctx, qid); save status in r15. (4) nvme_delete_io_cq(bar0, ctx, qid). (5) If both succeed ((status_sq & 0xFFFE) == 0 && (status_cq & 0xFFFE) == 0) → increment r13. (6) Zero descriptor via 4 × 8-byte stores. (7) Return r13. Also clears _nvme_io_queue_count. Reserved labels: `nvme_itd_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                            // bar0
+        mov rbp, rsi;                            // ctx
+        xor r12, r12;                            // cpu_idx
+        xor r13, r13;                            // teardown count
+        mov r14, 8;                              // NVME_IO_MAX_QUEUES
+
+      nvme_itd_loop:
+        cmp r12, r14;
+        jae nvme_itd_done;
+
+        // desc = &_nvme_io_queues + cpu_idx * 32.
+        mov rax, r12;
+        shl rax, 5;
+        lea r10, [rip + _nvme_io_queues];
+        add r10, rax;
+
+        // qid (u16 @+16) — zero-extended.
+        xor r11, r11;
+        mov_w r11, [r10 + 16];
+        cmp r11, 0;
+        je  nvme_itd_skip;
+
+        // ---- Delete SQ ----
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r11;
+        call nvme_delete_io_sq;
+
+        // Save SQ delete status in r15 (low 16 bits).
+        mov r15, rax;
+        and r15, 0xFFFE;
+
+        // Reload desc/qid — clobbered across call.
+        mov rax, r12;
+        shl rax, 5;
+        lea r10, [rip + _nvme_io_queues];
+        add r10, rax;
+        xor r11, r11;
+        mov_w r11, [r10 + 16];
+
+        // ---- Delete CQ ----
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r11;
+        call nvme_delete_io_cq;
+
+        and rax, 0xFFFE;
+        cmp rax, 0;
+        jne nvme_itd_zero;                       // CQ failed — still zero desc
+        cmp r15, 0;
+        jne nvme_itd_zero;                       // SQ had failed
+
+        add r13, 1;
+
+      nvme_itd_zero:
+        // Zero the descriptor (32 B = 4 × u64).
+        mov rax, r12;
+        shl rax, 5;
+        lea r10, [rip + _nvme_io_queues];
+        add r10, rax;
+        xor rcx, rcx;
+        mov [r10 + 0],  rcx;
+        mov [r10 + 8],  rcx;
+        mov [r10 + 16], rcx;
+        mov [r10 + 24], rcx;
+
+      nvme_itd_skip:
+        add r12, 1;
+        jmp nvme_itd_loop;
+
+      nvme_itd_done:
+        xor rax, rax;
+        mov [rip + _nvme_io_queue_count], rax;
+        mov rax, r13;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
