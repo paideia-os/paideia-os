@@ -286,21 +286,22 @@ case "${EXPECTED}" in
         # asserts, in order: SHELL START (shell entry), `/tmp` (from
         # the second `pwd` after cd), the `echo - echo text to stdout`
         # line (a distinctive fragment of `help`'s output that could
-        # not appear elsewhere in the boot log), REAPED (init's second
-        # wait4 unblocking on the shell exit).
+        # not appear elsewhere in the boot log), `hello world` (regression
+        # for #1016 — space between multi-token echo args), REAPED (init's
+        # second wait4 unblocking on the shell exit).
         #
-        # INJECT_HOLD is bumped to 12s (vs echo_hello's 10s) so the
-        # pipe stays open long enough for the shell to process five
+        # INJECT_HOLD is bumped to 14s (vs echo_hello's 10s) so the
+        # pipe stays open long enough for the shell to process six
         # sequential lines through the tty stdin bridge; each line
         # requires a full sys_read → dispatch → puts_new round trip.
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/r17/shell-multi-command.golden"
-        TIMEOUT=15
+        TIMEOUT=17
         UART_RX_MODE=1
-        : "${INJECT_STRING:=pwd\ncd /tmp\npwd\nhelp\nexit\n}"
+        : "${INJECT_STRING:=pwd\ncd /tmp\npwd\nhelp\necho hello world\nexit\n}"
         : "${INJECT_WAIT_FOR:=SHELL START}"
         : "${INJECT_DELAY:=0.3}"
-        : "${INJECT_HOLD:=12}"
+        : "${INJECT_HOLD:=14}"
         EXPECTED=""
         ;;
     boot_r17_shell_child_process)
