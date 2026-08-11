@@ -69,6 +69,11 @@ UART_RX_MODE=0
 SMP_MODE=0
 SMP_CPU_COUNT=1
 SMP_UNORDERED_HELLO=0
+# R21-M2 #832: QEMU_CPU knob for smoke modes that need CPUID feature bits
+# beyond qemu64-default (e.g. XSAVE, AVX2 for boot_r21_ymm_preserve).
+# Empty (default): no `-cpu` flag → qemu64 default. Set to "max" for the
+# widest advertised feature surface — enables XSAVE, AVX2, POPCNT, etc.
+QEMU_CPU=""
 # #750 + #757: chardev-pipe injection knobs.
 #
 # Precedence:  caller env  >  mode-branch default  >  global fallback
@@ -379,6 +384,35 @@ case "${EXPECTED}" in
         SMP_UNORDERED_HELLO=1
         EXPECTED=""
         ;;
+    boot_r21_ymm_preserve)
+        # R21-M2-003 (#832): YMM-preservation regression fixture smoke.
+        #
+        # Kernel wire-in (src/kernel/boot/kernel_main.pdx, after
+        # cpu_probe_avx512): unconditional calls to
+        # ymm_preserve_synth_witness_a and ..._witness_b, both of which
+        # SILENTLY SKIP if cpu_avx2_available() returns 0. On qemu64
+        # default (no XSAVE, no AVX2) that means no fingerprint appears
+        # — so this smoke mode uses `-cpu max` to expose XSAVE + AVX2
+        # and force the fixture down its real code path.
+        #
+        # Fingerprint contract: two lines must appear in order —
+        #   YMM PRESERVE A OK
+        #   YMM PRESERVE B OK
+        # Each witness round-trips YMM0 through xsave_save_for /
+        # xsave_restore_for (the same machinery sched_switch_r15 uses)
+        # with distinct pid slots (60 / 61) and distinct patterns (0xAA
+        # / 0xBB fill). A "YMM PRESERVE FAIL" indicates either the
+        # xsaveopt didn't persist YMM state to the area, the xrstor
+        # didn't restore it, or the vpxor clobber failed to null YMM0.
+        #
+        # Opt-in only (guarded by PAIDEIA_R21_YMM=1 in pre-push): this
+        # is a targeted validation, not a core boot smoke.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r21/expected-ymm-preserve.txt"
+        TIMEOUT=8
+        QEMU_CPU="max"
+        EXPECTED=""
+        ;;
     boot_panic)
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/logging/expected-panic-dump.txt"
@@ -569,6 +603,15 @@ else
     if [[ ${SMP_MODE} -eq 1 ]]; then
         SMP_ARGS=(-smp "${SMP_CPU_COUNT}")
     fi
+    # R21-M2 #832: opt-in `-cpu` override for smokes that need feature
+    # bits beyond qemu64 default (boot_r21_ymm_preserve → `-cpu max`
+    # for XSAVE + AVX2). Empty QEMU_CPU (default) leaves the QEMU
+    # `-cpu` unset, preserving qemu64-default behavior for every legacy
+    # mode byte-for-byte.
+    CPU_ARGS=()
+    if [[ -n "${QEMU_CPU}" ]]; then
+        CPU_ARGS=(-cpu "${QEMU_CPU}")
+    fi
     timeout ${TIMEOUT} qemu-system-x86_64 \
         -kernel "${KERNEL}" \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
@@ -577,6 +620,7 @@ else
         -no-reboot \
         -no-shutdown \
         -m 32M \
+        "${CPU_ARGS[@]}" \
         "${SMP_ARGS[@]}" \
         >/dev/null 2>&1
     QEMU_RC=$?
