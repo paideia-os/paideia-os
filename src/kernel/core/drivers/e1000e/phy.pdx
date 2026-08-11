@@ -1,0 +1,361 @@
+// src/kernel/core/drivers/e1000e/phy.pdx — R27-M1-005 (#975)
+//
+// Intel e1000e / i219 PHY register access via the MDIC MMIO window +
+// auto-negotiation restart.
+//
+// -----------------------------------------------------------------------------
+// MDIC (MDI Interface Control) register — 82574 §10.2.3.1
+// -----------------------------------------------------------------------------
+//
+// The e1000e family exposes the internal 10/100/1000BASE-T PHY through
+// a single 32-bit MMIO window at BAR0+0x0020. Every PHY read/write is
+// a two-step transaction:
+//
+//   Write MDIC:
+//     bits [15:0]  DATA        — write payload (0 for reads)
+//     bits [20:16] REGADDR     — PHY register (0..31 for MII, extended
+//                                registers via bank select on i219)
+//     bits [25:21] PHYADDR     — internal PHY MDIO address (1 on all
+//                                integrated Intel PHYs; external PHYs
+//                                may use 2)
+//     bits [27:26] OP          — 01 = write, 10 = read
+//     bit    28    READY       — set by controller when transaction
+//                                completes (cleared by us on issue)
+//     bit    29    INTERRUPT   — MDIC completion interrupt enable
+//     bit    30    ERROR       — set on PHY access error (bus timeout,
+//                                bad address)
+//
+//   Poll MDIC.READY until set (transaction complete). Then:
+//     * Read op:   DATA (bits [15:0]) holds the u16 result.
+//     * Write op:  transaction is complete; DATA fields ignored.
+//
+// -----------------------------------------------------------------------------
+// PHY register 0 — MII Control Register (IEEE 802.3 §22.2.4.1.1)
+// -----------------------------------------------------------------------------
+//
+//   bit 15  Reset             — assert & poll clear to reset PHY
+//   bit 14  Loopback
+//   bit 13  Speed select LSB
+//   bit 12  Auto-Negotiation Enable
+//   bit 11  Power Down
+//   bit 10  Isolate
+//   bit  9  Restart Auto-Negotiation (self-clearing)
+//   bit  8  Duplex Mode (1 = full duplex; forced-mode only)
+//   bit  7  Collision Test
+//   bit  6  Speed select MSB
+//   bits [5:0]  reserved
+//
+// e1000e_phy_auto_neg sets bit 12 (enable) + bit 9 (restart). Bit 9
+// self-clears once auto-neg begins; there is no polling requirement.
+//
+// -----------------------------------------------------------------------------
+// R27.M1 posture: dormant at boot
+// -----------------------------------------------------------------------------
+//
+// All three fns are callable at M1 but are NOT wired into
+// kernel_main. R27.M2 driver-attach invokes e1000e_phy_auto_neg
+// after e1000e_reset succeeds to trigger link-up before enabling the
+// receiver. Link-up latency is unbounded from software's perspective
+// (depends on link partner) and is signaled by STATUS.LU (bit 1) —
+// polled in the R27.M3 link-up path.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: u32 MMIO writes route through e1000e_reg_write_u32 (mov_d).
+//   G4: full-register compares.
+//
+// Reserved-label discipline: labels prefixed `e1kp_phy_`.
+
+module Phy = structure {
+
+  // ============================================================================
+  // MDIC timeout budget
+  // ============================================================================
+  //
+  // A PHY register access on internal Intel PHYs completes in a few
+  // microseconds on real silicon (MDIO clock is derived from LAN
+  // reference clock at ~2.5 MHz). QEMU returns synchronously. 100_000
+  // iterations (~3 ms wall-time on a 3 GHz core) is ~1000x margin
+  // over healthy hardware.
+
+  pub let E1000E_PHY_SPIN_MAX      : u64 = 100000
+
+  // ============================================================================
+  // Default PHY MDIO address for integrated Intel PHYs
+  // ============================================================================
+
+  pub let E1000E_PHY_ADDR_INTERNAL : u64 = 1
+
+  // ============================================================================
+  // PHY register indices (MII / IEEE 802.3 §22)
+  // ============================================================================
+
+  pub let E1000E_PHY_REG_CTRL      : u64 = 0     // MII Control Register
+  pub let E1000E_PHY_REG_STATUS    : u64 = 1     // MII Status Register
+  pub let E1000E_PHY_REG_ANAR      : u64 = 4     // Auto-Neg Advertisement
+  pub let E1000E_PHY_REG_ANLPAR    : u64 = 5     // Auto-Neg Link Partner Abil
+
+  // ============================================================================
+  // MII Control Register (PHY reg 0) bit definitions
+  // ============================================================================
+
+  pub let E1000E_PHY_CTRL_ANEG_EN  : u64 = 0x1000     // bit 12
+  pub let E1000E_PHY_CTRL_ANEG_RST : u64 = 0x0200     // bit 9
+
+  // ============================================================================
+  // Return codes for phy_read (in-band sentinel)
+  // ============================================================================
+  //
+  // A valid PHY register read returns a u16 in rax bits [15:0] with
+  // upper bits zero. On MDIC.ERROR or timeout we return the sentinel
+  // 0xFFFFFFFF (upper 32 bits zero) — this is trivially distinguishable
+  // from any legitimate u16 by the caller (u16 max value is 0xFFFF,
+  // upper 16 bits always zero on success). The sentinel is 0xFFFFFFFF
+  // rather than 0xFFFFFFFFFFFFFFFF to keep the compare cheap on the
+  // caller side (imm32 sign-extend).
+
+  pub let E1000E_PHY_READ_ERR      : u64 = 0xFFFFFFFF
+
+  // ============================================================================
+  // e1000e_phy_read(bar0, phy_addr, reg_addr) -> u64
+  // ============================================================================
+  //
+  // SysV: (bar0: u64, phy_addr: u64, reg_addr: u64) -> u64
+  //   rdi = BAR0 base
+  //   rsi = PHY MDIO address (1 for internal PHY)
+  //   rdx = PHY register index (0..31 for MII base regs)
+  //
+  // Returns rax = u16 PHY register value in bits [15:0], or
+  // E1000E_PHY_READ_ERR on timeout / MDIC.ERROR.
+  //
+  // Register plan (4-push callee-save + align):
+  //   rbx = bar0
+  //   r12 = spin counter
+  //   r13 = staged MDIC value / read-back
+  //   r14 = scratch
+  //
+  //   4 pushes = 32 B; entry rsp%16==8 → 40, %16==8. Add sub rsp,8
+  //   → 48, %16==0 (aligned for nested e1000e_reg_* calls).
+
+  pub let e1000e_phy_read : (u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64, phy_addr: u64, reg_addr: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R27-M1-005 (#975). Read a PHY register via the MDIC MMIO window per 82574 §10.2.3.1. Body: (1) 4-push callee-save (rbx=bar0, r12=spin, r13=mdic, r14=scratch) — 32 B + sub rsp,8 = 40; entry rsp%16==8 → 48, %16==0 (aligned for nested e1000e_reg_* calls). rbx = bar0. (2) Compose MDIC = (reg_addr << 16) | (phy_addr << 21) | (OP_READ=2 << 26). Compute staged into r13: r13 = reg_addr; shl r13,16; r14 = phy_addr; shl r14,21; or r13, r14; or r13, 0x08000000 (= 2 << 26). DATA field is 0 for reads (already zero). (3) Write MDIC via e1000e_reg_write_u32(bar0, 0x20, r13). (4) Poll MDIC.READY (bit 28 = 0x10000000): init r12 = E1000E_PHY_SPIN_MAX. Loop { rax = e1000e_reg_u32(bar0, 0x20); r13 = rax; and r13, 0x10000000; if != 0 → break; dec r12; if r12 == 0 → return E1000E_PHY_READ_ERR }. (5) Check MDIC.ERROR (bit 30 = 0x40000000): if set → return E1000E_PHY_READ_ERR. (6) Extract DATA (bits [15:0]) via `and rax, 0xFFFF` — returns clean u16. Reserved-label posture: labels prefixed `e1kp_phy_`.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // rbx = bar0
+
+        // (2) Compose MDIC = (reg_addr << 16) | (phy_addr << 21) |
+        //                    (OP_READ=2 << 26)
+        mov r13, rdx;
+        shl r13, 16;                             // REGADDR at [20:16]
+        mov r14, rsi;
+        shl r14, 21;                             // PHYADDR at [25:21]
+        or r13, r14;
+        or r13, 0x08000000;                      // OP_READ (2 << 26)
+
+        // (3) Write MDIC.
+        mov rdi, rbx;
+        mov rsi, 0x20;                           // E1000E_REG_MDIC
+        mov rdx, r13;
+        call e1000e_reg_write_u32;
+
+        // (4) Poll MDIC.READY (bit 28 = 0x10000000).
+        mov r12, 100000;                         // E1000E_PHY_SPIN_MAX
+
+      e1kp_phy_wait_rd:
+        mov rdi, rbx;
+        mov rsi, 0x20;                           // MDIC
+        call e1000e_reg_u32;
+
+        mov r13, rax;
+        and r13, 0x10000000;                     // READY
+        cmp r13, 0;
+        jne e1kp_phy_ready_rd;
+
+        sub r12, 1;
+        cmp r12, 0;
+        je e1kp_phy_err_rd;
+        jmp e1kp_phy_wait_rd;
+
+      e1kp_phy_ready_rd:
+        // (5) Check ERROR (bit 30 = 0x40000000).
+        mov r13, rax;
+        and r13, 0x40000000;
+        cmp r13, 0;
+        jne e1kp_phy_err_rd;
+
+        // (6) Extract DATA (bits [15:0]).
+        and rax, 0xFFFF;
+        jmp e1kp_phy_rd_done;
+
+      e1kp_phy_err_rd:
+        mov rax, 0xFFFFFFFF;                     // E1000E_PHY_READ_ERR
+
+      e1kp_phy_rd_done:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // e1000e_phy_write(bar0, phy_addr, reg_addr, value) -> u64
+  // ============================================================================
+  //
+  // SysV: (bar0: u64, phy_addr: u64, reg_addr: u64, value: u64) -> u64
+  //   rdi = BAR0 base
+  //   rsi = PHY MDIO address
+  //   rdx = PHY register index
+  //   rcx = u16 value to write (low 16 bits used)
+  //
+  // Returns rax = 0 on success, 1 on timeout / MDIC.ERROR.
+  //
+  // Register plan (4-push callee-save + align, same as phy_read).
+
+  pub let e1000e_phy_write : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64, phy_addr: u64, reg_addr: u64, value: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R27-M1-005 (#975). Write a PHY register via the MDIC MMIO window per 82574 §10.2.3.1. Body: (1) 4-push callee-save (rbx=bar0, r12=spin, r13=mdic, r14=scratch) — 32 B + sub rsp,8 = 40; entry rsp%16==8 → 48, %16==0 (aligned for nested e1000e_reg_* calls). rbx = bar0. (2) Compose MDIC = (value & 0xFFFF) | (reg_addr << 16) | (phy_addr << 21) | (OP_WRITE=1 << 26): r13 = value; and r13, 0xFFFF; r14 = reg_addr; shl r14, 16; or r13, r14; r14 = phy_addr; shl r14, 21; or r13, r14; or r13, 0x04000000 (= 1 << 26). (3) Write MDIC via e1000e_reg_write_u32(bar0, 0x20, r13). (4) Poll MDIC.READY (bit 28): same loop shape as phy_read. On timeout → return 1. (5) Check MDIC.ERROR (bit 30): if set → return 1. (6) Return 0. Reserved-label posture: labels prefixed `e1kp_phy_`.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // rbx = bar0
+
+        // (2) Compose MDIC.
+        mov r13, rcx;                            // value
+        and r13, 0xFFFF;                         // DATA at [15:0]
+        mov r14, rdx;
+        shl r14, 16;                             // REGADDR at [20:16]
+        or r13, r14;
+        mov r14, rsi;
+        shl r14, 21;                             // PHYADDR at [25:21]
+        or r13, r14;
+        or r13, 0x04000000;                      // OP_WRITE (1 << 26)
+
+        // (3) Write MDIC.
+        mov rdi, rbx;
+        mov rsi, 0x20;                           // MDIC
+        mov rdx, r13;
+        call e1000e_reg_write_u32;
+
+        // (4) Poll MDIC.READY.
+        mov r12, 100000;
+
+      e1kp_phy_wait_wr:
+        mov rdi, rbx;
+        mov rsi, 0x20;
+        call e1000e_reg_u32;
+
+        mov r13, rax;
+        and r13, 0x10000000;                     // READY
+        cmp r13, 0;
+        jne e1kp_phy_ready_wr;
+
+        sub r12, 1;
+        cmp r12, 0;
+        je e1kp_phy_err_wr;
+        jmp e1kp_phy_wait_wr;
+
+      e1kp_phy_ready_wr:
+        // (5) Check ERROR.
+        mov r13, rax;
+        and r13, 0x40000000;
+        cmp r13, 0;
+        jne e1kp_phy_err_wr;
+
+        xor rax, rax;                            // success
+        jmp e1kp_phy_wr_done;
+
+      e1kp_phy_err_wr:
+        mov rax, 1;
+
+      e1kp_phy_wr_done:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // e1000e_phy_auto_neg(bar0) -> u64
+  // ============================================================================
+  //
+  // SysV: (bar0: u64) -> u64
+  //   rdi = BAR0 base
+  //
+  // Reads PHY Control (reg 0), asserts Auto-Neg Enable (bit 12) and
+  // Restart Auto-Neg (bit 9), writes back. Uses the internal PHY
+  // MDIO address (E1000E_PHY_ADDR_INTERNAL = 1).
+  //
+  // Returns rax = 0 on success, non-zero if either the read or the
+  // write MDIC transaction faults.
+  //
+  // Register plan (1-push callee-save + align):
+  //   rbx = bar0
+  //
+  //   1 push = 8 B; entry rsp%16==8 → 16, %16==0. No additional
+  //   sub needed.
+
+  pub let e1000e_phy_auto_neg : (u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R27-M1-005 (#975). Trigger PHY auto-negotiation restart. Body: (1) 1-push callee-save (rbx=bar0) — 8 B; entry rsp%16==8 → 16, %16==0 (aligned for nested phy_read/phy_write calls without extra pad). (2) Read PHY reg 0 (Control) via e1000e_phy_read(bar0, PHY_ADDR=1, REG=0) → rax = u16 or E1000E_PHY_READ_ERR (0xFFFFFFFF). Fault check: if rax >= 0x10000 → return non-zero (fault). (3) Set bits 12 (ANEG_EN = 0x1000) and 9 (ANEG_RST = 0x0200) via `or rax, 0x1200`. (4) Write via e1000e_phy_write(bar0, 1, 0, rax) → rax = 0 or 1. (5) Return rax. Reserved-label posture: labels prefixed `e1kp_phy_`.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                            // rbx = bar0
+
+        // (2) Read PHY Control (reg 0), PHY addr 1.
+        mov rdi, rbx;
+        mov rsi, 1;                              // E1000E_PHY_ADDR_INTERNAL
+        mov rdx, 0;                              // E1000E_PHY_REG_CTRL
+        call e1000e_phy_read;
+
+        // Fault check: E1000E_PHY_READ_ERR = 0xFFFFFFFF has upper
+        // bits above u16 range; legitimate u16 values are <= 0xFFFF.
+        cmp rax, 0x10000;
+        jae e1kp_phy_an_err;
+
+        // (3) Set bits 12 (ANEG_EN) and 9 (ANEG_RST) = 0x1200.
+        or rax, 0x1200;
+
+        // (4) Write back.
+        mov rdi, rbx;
+        mov rsi, 1;                              // PHY_ADDR
+        mov rdx, 0;                              // REG
+        mov rcx, rax;                            // value
+        call e1000e_phy_write;
+
+        // rax already holds phy_write's return (0 = OK, 1 = err).
+        jmp e1kp_phy_an_done;
+
+      e1kp_phy_an_err:
+        mov rax, 1;                              // fault
+
+      e1kp_phy_an_done:
+        pop rbx;
+        ret
+      }
+    }
+}
