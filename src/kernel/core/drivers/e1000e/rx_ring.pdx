@@ -1,0 +1,308 @@
+// src/kernel/core/drivers/e1000e/rx_ring.pdx — R27-M2-001 / R27-M2-002 (#976 / #977)
+//
+// Intel e1000e / i219 legacy Receive descriptor ring + 2 KiB per-desc
+// receive-buffer pool + refill loop.
+//
+// -----------------------------------------------------------------------------
+// Legacy RX descriptor layout (82574 §7.1.5, 16 B total)
+// -----------------------------------------------------------------------------
+//
+//   +0    u64  buffer_addr      // physical address of the frame buffer
+//   +8    u16  length           // frame length written by HW on completion
+//   +10   u16  checksum         // 1's-complement checksum of packet body
+//   +12   u8   status
+//                bit 0  DD    — Descriptor Done (HW → SW handoff)
+//                bit 1  EOP   — End of Packet
+//                bit 2  IXSM  — Ignore Checksum
+//                bit 3  VP    — VLAN packet
+//                bit 4  UDPCS — UDP checksum computed
+//                bit 5  TCPCS — TCP checksum computed
+//                bit 6  IPCS  — IP checksum computed
+//   +13   u8   errors          // MAC / IPE / TCPE / CE flags
+//   +14   u16  vlan            // 802.1Q VLAN tag (if VP=1)
+//
+// The ring is a contiguous power-of-two-descriptor block. 128 entries
+// × 16 B = 2048 B, exactly 128-B-aligned (RDLEN must be a multiple of
+// 128 per 82574 §13.4.27). 4 KiB alignment on the underlying pool is
+// stricter than required (page-alignment simplifies IOMMU wire-up when
+// R25 lands VT-d contexts for the NIC).
+//
+// -----------------------------------------------------------------------------
+// Receive-buffer pool (2 KiB per descriptor)
+// -----------------------------------------------------------------------------
+//
+// 128 × 2048 B = 256 KiB. Sized to hold one MTU-worth (1500 B) plus
+// Ethernet framing (14 B) plus 4 B FCS with slack — 2048 B matches the
+// e1000e RCTL.BSIZE=00 (2 KB) default and requires no BSEX flip. Each
+// buffer lives at `_e1000e_rx_buffers + i*2048`. Callers may substitute
+// a phys_alloc-derived pool by passing an alternate `buffers_pa` to
+// e1000e_rx_refill — the .bss default is a bring-up convenience.
+//
+// -----------------------------------------------------------------------------
+// Ring programming discipline
+// -----------------------------------------------------------------------------
+//
+//   RDBAL   (0x2800)  = ring_pa & 0xFFFFFFFF
+//   RDBAH   (0x2804)  = ring_pa >> 32
+//   RDLEN   (0x2808)  = 2048        (bytes; multiple of 128)
+//   RDH     (0x2810)  = 0           (SW-visible; HW-managed)
+//   RDT     (0x2818)  = 127 after refill
+//                       (HW owns [RDH..RDT); SW owns [RDT..RDH))
+//
+// The (RDT = size - 1) initial value after refill hands every
+// descriptor to the controller.
+//
+// -----------------------------------------------------------------------------
+// R27.M2 posture: dormant at boot
+// -----------------------------------------------------------------------------
+//
+// e1000e_rx_ring_init + e1000e_rx_refill are callable symbols at M2
+// but are NOT wired into kernel_main.pdx. Real activation lands at
+// R27.M3 driver-attach after MSI-X vector programming (this module's
+// msix.pdx) + IRQ handler installation.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: u32 MMIO writes route via e1000e_reg_write_u32.
+//       Per-descriptor sub-8B stores use mov_b / mov_w / mov_d.
+//
+// Reserved-label discipline: labels prefixed `e1krx_`.
+
+module RxRing = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  pub let E1000E_RX_RING_DESCS      : u64 = 128
+  pub let E1000E_RX_DESC_SIZE       : u64 = 16
+  pub let E1000E_RX_RING_BYTES      : u64 = 2048         // 128 * 16
+  pub let E1000E_RX_BUF_SIZE        : u64 = 2048
+  pub let E1000E_RX_BUFFERS_BYTES   : u64 = 262144       // 128 * 2048
+
+  // RX descriptor status bits (byte @+12).
+  pub let E1000E_RXD_STAT_DD        : u64 = 0x01         // Descriptor Done
+  pub let E1000E_RXD_STAT_EOP       : u64 = 0x02         // End of Packet
+  pub let E1000E_RXD_STAT_IXSM      : u64 = 0x04
+  pub let E1000E_RXD_STAT_VP        : u64 = 0x08
+  pub let E1000E_RXD_STAT_UDPCS     : u64 = 0x10
+  pub let E1000E_RXD_STAT_TCPCS     : u64 = 0x20
+  pub let E1000E_RXD_STAT_IPCS      : u64 = 0x40
+
+  // ============================================================================
+  // Canonical .bss slots
+  // ============================================================================
+  //
+  //   _e1000e_rx_ring     : 256 x u64 = 2048 B (128 descriptors x 16 B)
+  //   _e1000e_rx_buffers  : 32768 x u64 = 262144 B (128 buffers x 2048 B)
+  //   _e1000e_rx_next     : driver-side "next-to-clean" cursor (0..127)
+  //   _e1000e_rx_pkts     : cumulative RX-completed-packet counter
+  //
+  // 4 KiB alignment is stricter than the 128-B RDLEN constraint but
+  // simplifies R25 IOMMU-domain mapping (page-granular vtd_slpt_map).
+
+  pub let mut _e1000e_rx_ring       : [u64; 256]   = uninit @align(4096)
+  pub let mut _e1000e_rx_buffers    : [u64; 32768] = uninit @align(4096)
+  pub let mut _e1000e_rx_next       : u64          = 0
+  pub let mut _e1000e_rx_pkts       : u64          = 0
+
+  // ============================================================================
+  // e1000e_rx_ring_init(bar0, ring_pa) -> ()  — #976
+  // ============================================================================
+  //
+  // SysV: (bar0: u64, ring_pa: u64) -> ()
+  //   rdi = BAR0 base (MMIO physical address)
+  //   rsi = physical address of the 2048-byte RX descriptor ring
+  //         (may be `lea _e1000e_rx_ring` under the identity-map alias,
+  //         or a phys_alloc-derived buffer for IOMMU-domain layouts).
+  //
+  // Body:
+  //   (1) rep_stosb-zero the 2048-byte descriptor ring at ring_pa.
+  //   (2) Program RDBAL/RDBAH/RDLEN via e1000e_reg_write_u32.
+  //   (3) Program RDH = 0, RDT = 0 (empty; the refill path advances
+  //       RDT once buffers are attached).
+  //
+  // Register plan (2-push callee-save):
+  //   rbx = bar0
+  //   rbp = ring_pa
+  //
+  //   2 pushes = 16 B; entry rsp%16==8 -> 24, sub rsp,8 -> 32,
+  //   %16==0 (aligned for every nested e1000e_reg_write_u32 without
+  //   extra pad).
+
+  pub let e1000e_rx_ring_init : (u64, u64) -> () !{sysreg, mem} @{boot} =
+    fn (bar0: u64, ring_pa: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R27-M2-001 (#976). Program the e1000e Receive-Descriptor-Ring base/length registers and zero the 2048-byte descriptor block. Body: (1) 2-push callee-save prologue (rbx=bar0, rbp=ring_pa) + `sub rsp,8` for alignment — 16 B pushes + 8 = 24; entry rsp%16==8 -> 32, %16==0 (aligned for every nested e1000e_reg_write_u32 without extra pre-call pad). (2) rep_stosb-zero 2048 bytes at ring_pa: rdi=ring_pa, rcx=2048, rax=0, cld, rep_stosb. rep_stosb clobbers rdi/rcx/rax but rbx/rbp survive per SysV. (3) Program RDBAL = ring_pa & 0xFFFFFFFF via e1000e_reg_write_u32(bar0, 0x2800, ring_pa_lo); low-32-of-64 handled inside the sized-mov_d MMIO store. (4) Program RDBAH = ring_pa >> 32 via e1000e_reg_write_u32(bar0, 0x2804, ring_pa_hi) — hi 32 bits computed via `mov rax, rbp; shr rax, 32`. (5) Program RDLEN = 2048 via e1000e_reg_write_u32(bar0, 0x2808, 2048). RDLEN is a byte-count and must be a multiple of 128 per 82574 §13.4.27; 2048 = 16 * 128, conformant. (6) Program RDH = 0 via e1000e_reg_write_u32(bar0, 0x2810, 0). (7) Program RDT = 0 via e1000e_reg_write_u32(bar0, 0x2818, 0). RDT stays at 0 until e1000e_rx_refill attaches buffers and advances it. (8) Emit fingerprint klog_s1(INFO, E1KE, tag_e1000e_rx_ring) — descriptor ring is a fixed 2048-byte block, no per-init KV variance justifies structured KV output at this stage. Reserved labels: `e1krx_`. Every nested callee preserves rbx/rbp per SysV.",
+      block: {
+        push rbx;
+        push rbp;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // rbx = bar0
+        mov rbp, rsi;                            // rbp = ring_pa
+
+        // ============================================================
+        // (2) Zero the 2048-byte descriptor ring.
+        // ============================================================
+        mov rdi, rbp;
+        xor rax, rax;
+        mov rcx, 2048;
+        cld;
+        rep_stosb;
+
+        // ============================================================
+        // (3) RDBAL = ring_pa & 0xFFFFFFFF.
+        // ============================================================
+        mov rdi, rbx;
+        mov rsi, 0x2800;                         // E1000E_REG_RDBAL
+        mov rdx, rbp;                            // low 32 bits taken by mov_d MMIO store
+        call e1000e_reg_write_u32;
+
+        // ============================================================
+        // (4) RDBAH = ring_pa >> 32.
+        // ============================================================
+        mov rax, rbp;
+        shr rax, 32;
+        mov rdi, rbx;
+        mov rsi, 0x2804;                         // E1000E_REG_RDBAH
+        mov rdx, rax;
+        call e1000e_reg_write_u32;
+
+        // ============================================================
+        // (5) RDLEN = 2048.
+        // ============================================================
+        mov rdi, rbx;
+        mov rsi, 0x2808;                         // E1000E_REG_RDLEN
+        mov rdx, 2048;
+        call e1000e_reg_write_u32;
+
+        // ============================================================
+        // (6) RDH = 0.
+        // ============================================================
+        mov rdi, rbx;
+        mov rsi, 0x2810;                         // E1000E_REG_RDH
+        xor rdx, rdx;
+        call e1000e_reg_write_u32;
+
+        // ============================================================
+        // (7) RDT = 0 (empty; e1000e_rx_refill will advance).
+        // ============================================================
+        mov rdi, rbx;
+        mov rsi, 0x2818;                         // E1000E_REG_RDT
+        xor rdx, rdx;
+        call e1000e_reg_write_u32;
+
+        // ============================================================
+        // (8) Fingerprint.
+        // ============================================================
+        mov rdi, 3;                              // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_E1KE];
+        lea rdx, [rip + tag_e1000e_rx_ring];
+        call klog_s1;
+
+        add rsp, 8;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // e1000e_rx_refill(bar0, ring_pa, buffers_pa) -> ()  — #977
+  // ============================================================================
+  //
+  // SysV: (bar0: u64, ring_pa: u64, buffers_pa: u64) -> ()
+  //   rdi = BAR0 base
+  //   rsi = physical address of the descriptor ring (2048 B)
+  //   rdx = physical address of the receive-buffer pool
+  //         (128 * 2048 B = 262144 B, page-aligned)
+  //
+  // For each descriptor i in 0..128:
+  //   ring[i].buffer_addr (u64 @+0) = buffers_pa + i * 2048
+  //   ring[i].status      (u8  @+12) = 0
+  //   ring[i].errors      (u8  @+13) = 0
+  //   (length/checksum/vlan already zeroed by ring_init)
+  //
+  // Then program RDT = 127 to hand all 128 descriptors to the controller.
+  //
+  // Register plan (4-push callee-save):
+  //   rbx = bar0
+  //   rbp = ring_pa (base of descriptor block)
+  //   r12 = buffers_pa (base of the 256 KiB pool)
+  //   r13 = i (descriptor index)
+  //
+  //   4 pushes = 32 B; entry rsp%16==8 -> 40, %16==8. Add `sub rsp,8`
+  //   -> 48, %16==0 (aligned for nested e1000e_reg_write_u32).
+
+  pub let e1000e_rx_refill : (u64, u64, u64) -> () !{sysreg, mem} @{boot} =
+    fn (bar0: u64, ring_pa: u64, buffers_pa: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R27-M2-002 (#977). Attach a 2 KiB receive buffer to each of the 128 RX descriptors and hand the ring to the controller by advancing RDT. Body: (1) 4-push callee-save prologue (rbx=bar0, rbp=ring_pa, r12=buffers_pa, r13=i) + `sub rsp,8` — 32 + 8 = 40; entry rsp%16==8 -> 48, %16==0 (aligned for nested e1000e_reg_write_u32). (2) Loop `e1krx_refill_loop`: initialize r13 = 0. Bounds check `cmp r13, 128; jae e1krx_refill_done`. (3) Compute desc_addr = ring_pa + i*16 via `mov rax, r13; shl rax, 4; add rax, rbp`. (4) Compute buf_addr = buffers_pa + i*2048 via `mov r10, r13; shl r10, 11; add r10, r12` (2048 = 2^11). (5) Store buf_addr as u64 @ desc+0 via `mov [rax+0], r10`. (6) Zero status/errors: `xor r11, r11; mov_b [rax+12], r11; mov_b [rax+13], r11`. length/checksum/vlan are already zero from ring_init's rep_stosb, so we don't rewrite them per-refill (spurious MMIO stores to the descriptor tail would trigger unnecessary IOMMU page-walks under R25). (7) Advance i: `add r13, 1; jmp e1krx_refill_loop`. (8) Write RDT = 127 via e1000e_reg_write_u32(bar0, 0x2818, 127). RDT points one past the last SW-owned slot; hardware owns [RDH, RDT). (9) Persist driver-side next-to-clean cursor: `xor rax,rax; mov [rip + _e1000e_rx_next], rax` — cursor tracks the next descriptor the IRQ handler expects to complete; a fresh refill resets it to 0 in lockstep with RDH which is HW-reset to 0 on ring re-init. Reserved labels: `e1krx_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // rbx = bar0
+        mov rbp, rsi;                            // rbp = ring_pa
+        mov r12, rdx;                            // r12 = buffers_pa
+
+        xor r13, r13;                            // i = 0
+
+      e1krx_refill_loop:
+        cmp r13, 128;
+        jae e1krx_refill_done;
+
+        // desc_addr = ring_pa + i*16
+        mov rax, r13;
+        shl rax, 4;
+        add rax, rbp;
+
+        // buf_addr = buffers_pa + i*2048
+        mov r10, r13;
+        shl r10, 11;                             // * 2048
+        add r10, r12;
+
+        // ring[i].buffer_addr (u64 @+0) = buf_addr
+        mov [rax + 0], r10;
+
+        // ring[i].status (u8 @+12) = 0
+        // ring[i].errors (u8 @+13) = 0
+        xor r11, r11;
+        mov_b [rax + 12], r11;
+        mov_b [rax + 13], r11;
+
+        add r13, 1;
+        jmp e1krx_refill_loop;
+
+      e1krx_refill_done:
+        // ============================================================
+        // (8) RDT = 127 (all 128 descriptors HW-owned).
+        // ============================================================
+        mov rdi, rbx;
+        mov rsi, 0x2818;                         // E1000E_REG_RDT
+        mov rdx, 127;
+        call e1000e_reg_write_u32;
+
+        // ============================================================
+        // (9) Reset driver-side next-to-clean cursor.
+        // ============================================================
+        xor rax, rax;
+        mov [rip + _e1000e_rx_next], rax;
+
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
