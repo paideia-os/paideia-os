@@ -1,0 +1,439 @@
+// src/kernel/core/drivers/xhci/transfer_ring.pdx — R26-M4-004 (#959)
+//
+// xHCI Transfer Ring — one per (Slot, Endpoint) tuple. Software produces
+// Normal / Setup / Data / Status TRBs onto the ring; the HC consumes
+// them and posts a Transfer Event (TRB Type 32) onto the Event Ring on
+// each IOC-marked TRB (§4.10 / §4.11.2).
+//
+// At the R26.M4 MVP we provision exactly ONE transfer ring — the EP1
+// IN Interrupt ring for a boot HID keyboard slot. Every additional
+// endpoint gets its own ring in later milestones (each ring is
+// endpoint-private; the HC associates it with the EP via the TR
+// Dequeue Pointer field of the Endpoint Context).
+//
+// -----------------------------------------------------------------------------
+// Ring layout (xHCI 1.2 §4.9.2)
+// -----------------------------------------------------------------------------
+//
+// Structurally identical to the Command Ring (cmd_ring.pdx): 256 × 16 B
+// = 4 KiB contiguous block, slots 0..254 are usable TRB slots and slot
+// 255 is a Link TRB whose Parameter points back to slot 0 and whose
+// control carries TC=1 (Toggle Cycle) so consumer cycle-state flips on
+// wraparound.
+//
+// The producer-safety discipline (§4.9.3) is identical:
+//   * SW cycle_bit starts = 1.
+//   * Each enqueued TRB gets its C bit set to the current cycle_bit
+//     (via trb_write's cycle-last discipline).
+//   * On wrap into slot 255: re-publish Link TRB with current cycle,
+//     toggle cycle_bit, reset idx = 0.
+//
+// -----------------------------------------------------------------------------
+// Doorbell ordering (xHCI 1.2 §5.6)
+// -----------------------------------------------------------------------------
+//
+// Per-endpoint doorbell DB[slot_id] at bar0 + DBOFF + slot_id * 4:
+//   bits [7:0]   DB Target = endpoint DCI (Data Context Index)
+//                              1..31 for endpoints
+//   bits [31:16] DB Stream ID (0 for non-streams-mode endpoints)
+//
+// The write publishes new TRBs to the HC — trb_write's mfence-after has
+// already ordered the TRB stores before this MMIO write can retire, so
+// no additional fence is needed at the doorbell callsite (the accessor
+// mfences internally as well).
+//
+// -----------------------------------------------------------------------------
+// transfer_ring_ctx layout (32 B, @align(8))
+// -----------------------------------------------------------------------------
+//
+//   +0    u64 ring_pa              — physical addr of ring[0]
+//   +8    u64 ring_va              — virtual addr (VA == PA under identity map)
+//   +16   u16 enqueue_idx          — next slot to write (0..254)
+//   +18   u8  cycle_bit            — current SW cycle (0 or 1)
+//   +19   u8  slot_id              — owning slot (1..127)
+//   +20   u8  ep_id                — endpoint DCI (1..31); EP1 IN = 3
+//   +21   u8  _pad0
+//   +22   u16 _pad1
+//   +24   u64 _reserved
+//
+// -----------------------------------------------------------------------------
+// TR Dequeue Pointer (Endpoint Context DW2+DW3)
+// -----------------------------------------------------------------------------
+//
+// The EP Context's TR Dequeue Pointer field (DW2 lo + DW3 hi, 64 bits
+// total) locates the ring the HC should consume for that endpoint. The
+// low bit (DCS — Dequeue Cycle State) is SW's initial cycle_bit, so the
+// first HC read sees the C bit written by the first SW enqueue as
+// producer-owned. That value is set at Configure Endpoint time (see
+// configure_ep.pdx L?? — passes ring_pa | 1 into DW2).
+//
+// -----------------------------------------------------------------------------
+// R26.M4 posture: dormant at boot
+// -----------------------------------------------------------------------------
+//
+// No real HC under BIOS/`-kernel` boot means no port reset -> no slot
+// -> no configured endpoint -> no transfer submissions. Symbols exist
+// for R26.M6+ HID keyboard bring-up + UEFI/OVMF activation.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: sized u16/u8 stores + zero-extended sub-8-byte loads.
+//
+// Reserved-label discipline: `xhci_tri_` (transfer ring init),
+// `xhci_te_` (transfer enqueue), `xhci_ted_` (transfer endpoint doorbell).
+
+module TransferRing = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  pub let XHCI_TR_RING_TRBS         : u64 = 256
+  pub let XHCI_TR_RING_BYTES        : u64 = 4096
+  pub let XHCI_TR_RING_LINK_SLOT    : u64 = 255
+
+  // transfer_ring_ctx field offsets.
+  pub let XHCI_TR_CTX_RING_PA       : u64 = 0        // u64
+  pub let XHCI_TR_CTX_RING_VA       : u64 = 8        // u64
+  pub let XHCI_TR_CTX_ENQ_IDX       : u64 = 16       // u16
+  pub let XHCI_TR_CTX_CYCLE_BIT     : u64 = 18       // u8
+  pub let XHCI_TR_CTX_SLOT_ID       : u64 = 19       // u8
+  pub let XHCI_TR_CTX_EP_ID         : u64 = 20       // u8
+  pub let XHCI_TR_CTX_SIZE          : u64 = 32
+
+  // Normal TRB Type + control-bit shifts.
+  pub let XHCI_TRB_TYPE_NORMAL      : u64 = 1
+  pub let XHCI_TRB_CTL_IOC_SHIFT    : u64 = 5        // IOC bit index
+
+  // ============================================================================
+  // Canonical .bss storage
+  // ============================================================================
+  //
+  //   _xhci_transfer_ring_ep1_in     : 256 * 16 B = 4096 B = 512 u64
+  //                                    @align(64) per xHCI 1.2 §4.9.2.1.
+  //   _xhci_transfer_ring_ep1_in_ctx : 32 B = 4 u64.
+
+  pub let mut _xhci_transfer_ring_ep1_in     : [u64; 512] = uninit @align(64)
+  pub let mut _xhci_transfer_ring_ep1_in_ctx : [u64; 4]   = uninit @align(8)
+
+  // ============================================================================
+  // xhci_transfer_ring_init(ctx, slot_id, ep_id) -> ()
+  // ============================================================================
+  //
+  // SysV: (ctx: u64, slot_id: u64, ep_id: u64) -> ()
+  //   rdi = pointer to a 32-byte transfer_ring_ctx (writable)
+  //   rsi = owning slot ID (1..127)
+  //   rdx = endpoint DCI (1..31); EP1 IN = 3
+  //
+  // Body:
+  //   (1) Zero-fill the 4096-byte _xhci_transfer_ring_ep1_in.
+  //   (2) Populate the Link TRB at slot 255 with:
+  //         param  = ring_pa   (wraparound target)
+  //         status = 0
+  //         ctrl   = (LINK << 10) | TC(bit 1) = 0x1802
+  //         cycle  = 0         (Link is HC-owned until wraparound —
+  //                             first enqueue past slot 254 re-writes
+  //                             it with cycle=1).
+  //   (3) Populate ctx:
+  //         ring_pa      = &_xhci_transfer_ring_ep1_in
+  //         ring_va      = &_xhci_transfer_ring_ep1_in
+  //         enqueue_idx  = 0
+  //         cycle_bit    = 1                (matches DCS bit written into
+  //                                          EP Context's TR Dequeue Ptr)
+  //         slot_id      = slot_id
+  //         ep_id        = ep_id
+  //
+  // Register plan (5-push callee-save):
+  //   rbx = ctx pointer   (survives every nested call)
+  //   rbp = slot_id       (u8 field write later)
+  //   r12 = ep_id         (u8 field write later)
+  //   r13 = ring_pa       (== &_xhci_transfer_ring_ep1_in; also written
+  //                        into ctx)
+  //   r14 = scratch
+  //
+  //   5 pushes = 40 B; entry rsp%16==8 -> 48, %16==0 (aligned for every
+  //   nested rep_stosb / trb_write without extra pad).
+
+  pub let xhci_transfer_ring_init : (u64, u64, u64) -> () !{sysreg, mem} @{boot} =
+    fn (ctx: u64, slot_id: u64, ep_id: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R26-M4-004 (#959). Transfer-ring bring-up per xHCI 1.2 §4.9.2 — structural mirror of xhci_cmd_ring_init (cmd_ring.pdx L155). Body: (1) 5-push callee-save prologue (rbx=ctx, rbp=slot_id, r12=ep_id, r13=ring_pa, r14=scratch) — 40 B; entry rsp%16==8 -> 48, %16==0 (aligned for every nested rep_stosb / trb_write without pre-call pad). (2) Stash args: rbx=ctx (rdi), rbp=slot_id (rsi), r12=ep_id (rdx). (3) rep_stosb-zero the 4096-byte ring: rdi = lea &_xhci_transfer_ring_ep1_in, rax=0, rcx=4096, cld. All slots start with C=0 so no stale TRB is HC-fetchable on first EP doorbell. (4) Populate ring_pa = lea &_xhci_transfer_ring_ep1_in, save in r13. (5) Write Link TRB at slot 255 via trb_write(dst=ring_pa+255*16, param=ring_pa, status=0, ctrl=(LINK<<10)|TC=0x1802, cycle=0). LINK type=6; 6<<10=0x1800; TC=bit 1=0x2. cycle=0 leaves Link HC-owned at boot — the producer wraparound path (xhci_transfer_enqueue below) re-writes with cycle=1. (6) Populate ctx: ring_pa (u64@+0), ring_va (u64@+8, same), enqueue_idx=0 (u16@+16 via mov_w), cycle_bit=1 (u8@+18 via mov_b), slot_id (u8@+19 via mov_b), ep_id (u8@+20 via mov_b), pads @+21/+22 zeroed, _reserved u64 @+24 zeroed. Sub-8-byte stores use mov_b/mov_w/mov_d per G1. Reserved labels: `xhci_tri_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                            // rbx = ctx
+        mov rbp, rsi;                            // rbp = slot_id
+        mov r12, rdx;                            // r12 = ep_id
+
+        // ================================================================
+        // (1) Zero-fill the 4096-byte transfer ring.
+        // ================================================================
+        lea rdi, [rip + _xhci_transfer_ring_ep1_in];
+        xor rax, rax;
+        mov rcx, 4096;
+        cld;
+        rep_stosb;
+
+        // ================================================================
+        // (2) ring_pa = &_xhci_transfer_ring_ep1_in.
+        // ================================================================
+        lea r13, [rip + _xhci_transfer_ring_ep1_in];
+
+        // ================================================================
+        // (3) Write Link TRB at slot 255.
+        //     dst = ring_pa + 255*16 = ring_pa + 0xFF0
+        //     param = ring_pa, status = 0, ctrl = 0x1802 (LINK|TC), cycle=0.
+        // ================================================================
+        mov rdi, r13;
+        add rdi, 4080;                           // 255 * 16
+        mov rsi, r13;                            // param = ring_pa
+        xor rdx, rdx;                            // status = 0
+        mov rcx, 6144;                           // (LINK<<10) = 0x1800
+        add rcx, 2;                              // | TC = 0x1802
+        xor r8, r8;                              // cycle = 0
+        call trb_write;
+
+        // ================================================================
+        // (4) Populate ctx.
+        // ================================================================
+        // ring_pa @+0
+        mov [rbx + 0], r13;
+
+        // ring_va @+8 (same under identity map)
+        mov [rbx + 8], r13;
+
+        // enqueue_idx @+16 (u16) = 0
+        xor rax, rax;
+        mov_w [rbx + 16], rax;
+
+        // cycle_bit @+18 (u8) = 1
+        mov rax, 1;
+        mov_b [rbx + 18], rax;
+
+        // slot_id @+19 (u8) = rbp
+        mov_b [rbx + 19], rbp;
+
+        // ep_id @+20 (u8) = r12
+        mov_b [rbx + 20], r12;
+
+        // _pad0 @+21 (u8) = 0
+        xor rax, rax;
+        mov_b [rbx + 21], rax;
+
+        // _pad1 @+22 (u16) = 0
+        xor rax, rax;
+        mov_w [rbx + 22], rax;
+
+        // _reserved @+24 (u64) = 0
+        xor rax, rax;
+        mov [rbx + 24], rax;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // xhci_transfer_enqueue(ctx, buffer_pa, len, ioc) -> u64
+  // ============================================================================
+  //
+  // SysV: (ctx: u64, buffer_pa: u64, len: u64, ioc: u64) -> u64
+  //   rdi = ctx pointer
+  //   rsi = buffer PA (data buffer for the transfer)
+  //   rdx = transfer length (u32 semantics; low 17 bits used for
+  //         Normal TRB TRB Transfer Length)
+  //   rcx = IOC bit value (0 or 1 — masked to bit 0 here, shifted to
+  //         control-word bit 5)
+  //
+  // Returns rax = new enqueue_idx (u16 semantics, zero-extended).
+  //
+  // Body (structurally identical to xhci_cmd_enqueue):
+  //   (1) Load enqueue_idx (u16 @ +16) and cycle_bit (u8 @ +18).
+  //   (2) Compute trb_addr = ring_va + enqueue_idx * 16.
+  //   (3) Build control_no_cycle:
+  //         = (NORMAL << 10) | (IOC << 5) | (CH=0 << 4)
+  //         = 0x400 | (ioc << 5)
+  //   (4) trb_write(trb_addr, buffer_pa, len, ctrl, cycle_bit).
+  //   (5) Advance: idx += 1.
+  //   (6) If idx == 255 (Link slot):
+  //         (a) Re-write Link TRB with current cycle_bit.
+  //         (b) cycle_bit ^= 1.
+  //         (c) idx = 0.
+  //   (7) Store idx + cycle_bit back to ctx.
+  //   (8) Return idx.
+  //
+  // Register plan (5-push callee-save + 32 B scratch):
+  //   rbx = ctx
+  //   rbp = new enqueue_idx (scratch across trb_write nested calls)
+  //   r12 = ring_va (loaded once from ctx)
+  //   r13 = cycle_bit
+  //   r14 = unused
+  //
+  //   5 pushes = 40 B; sub rsp, 32 (arg spills + pad) = 72; entry
+  //   rsp%16==8 -> 80, %16==0 (aligned for trb_write calls).
+  //   Scratch layout: [rsp+0]=buffer_pa, [rsp+8]=len, [rsp+16]=ctrl_no_cycle,
+  //                   [rsp+24]=pad.
+
+  pub let xhci_transfer_enqueue : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (ctx: u64, buffer_pa: u64, len: u64, ioc: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R26-M4-004 (#959). Enqueue one Normal TRB onto a transfer ring with producer-safe Cycle-bit and Link-slot wraparound per xHCI 1.2 §4.9.3 / §6.4.1.1. Structural mirror of xhci_cmd_enqueue (cmd_ring.pdx L291). Body: (1) 5-push callee-save (rbx=ctx, rbp=idx-scratch, r12=ring_va, r13=cycle_bit, r14=unused) — 40 B; sub rsp,32 for arg-slot spills [rsp+0]=buffer_pa, [rsp+8]=len, [rsp+16]=ctrl_no_cycle, [rsp+24]=pad. Entry rsp%16==8 -> 80, %16==0 (aligned for both trb_write calls). (2) Compose control_no_cycle = 0x400 | (ioc<<5): mov rax, rcx; and rax, 1; shl rax, 5; or rax, 0x400. NORMAL TRB type=1; 1<<10=0x400. IOC=bit 5=0x20. CH=bit 4=0x10 left cleared (single-TRB transfer). Save ctrl to [rsp+16]. Save buffer_pa (rsi) to [rsp+0] and len (rdx) to [rsp+8]. (3) rbx=ctx. Load ring_va (u64 @ ctx+8) into r12. Load enqueue_idx (u16 @ ctx+16 zero-extended) into rbp. Load cycle_bit (u8 @ ctx+18 zero-extended) into r13. (4) trb_addr = r12 + rbp*16. Call trb_write(trb_addr, buffer_pa=[rsp+0], len=[rsp+8], ctrl=[rsp+16], cycle=r13). (5) Advance idx: rbp += 1. (6) If rbp == 255 (Link slot): re-write Link TRB at r12+255*16 with param=r12 (ring_pa; VA==PA identity), status=0, ctrl=0x1802 (LINK|TC), cycle=r13 (current cycle so HC follows wraparound). Then r13 ^= 1 (toggle); rbp = 0. (7) Persist idx (u16 @ ctx+16 via mov_w) + cycle_bit (u8 @ ctx+18 via mov_b) into ctx. (8) Return rbp in rax. Reserved labels: `xhci_te_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 32;                             // arg spills + pad
+
+        // (1) Compose ctrl_no_cycle = 0x400 | (ioc << 5).
+        mov rax, rcx;
+        and rax, 1;
+        shl rax, 5;
+        or  rax, 0x400;                          // NORMAL TRB type = 1
+
+        // (2) Save caller args to stack (rsi/rdx will get clobbered by
+        // the nested trb_write's arg setup).
+        mov [rsp + 0], rsi;                      // buffer_pa
+        mov [rsp + 8], rdx;                      // len
+        mov [rsp + 16], rax;                     // ctrl_no_cycle
+        mov rbx, rdi;                            // rbx = ctx
+
+        // (3) Load ring_va, enqueue_idx, cycle_bit.
+        mov r12, [rbx + 8];                      // r12 = ring_va
+
+        xor rax, rax;
+        mov_w rax, [rbx + 16];                   // idx
+        mov rbp, rax;                            // rbp = idx
+
+        xor rax, rax;
+        mov_b rax, [rbx + 18];                   // cycle_bit
+        mov r13, rax;                            // r13 = cycle_bit
+
+        // (4) trb_addr = ring_va + idx*16 = r12 + (rbp << 4).
+        mov rax, rbp;
+        shl rax, 4;
+        add rax, r12;
+        mov rdi, rax;                            // dst
+        mov rsi, [rsp + 0];                      // buffer_pa
+        mov rdx, [rsp + 8];                      // len
+        mov rcx, [rsp + 16];                     // ctrl_no_cycle
+        mov r8, r13;                             // cycle
+        call trb_write;
+
+        // (5) Advance idx.
+        add rbp, 1;
+
+        // (6) If idx == 255, publish Link TRB + wrap.
+        cmp rbp, 255;
+        jne xhci_te_no_wrap;
+
+        // Re-write Link TRB at ring_va + 255*16.
+        mov rdi, r12;
+        add rdi, 4080;                           // 255 * 16
+        mov rsi, r12;                            // param = ring_va (== ring_pa)
+        xor rdx, rdx;                            // status = 0
+        mov rcx, 6146;                           // 0x1802 = (LINK<<10)|TC
+        mov r8, r13;                             // cycle = current SW cycle
+        call trb_write;
+
+        // Toggle SW cycle bit, reset idx.
+        xor r13, 1;
+        xor rbp, rbp;
+
+      xhci_te_no_wrap:
+        // (7) Persist idx (u16 @ +16) + cycle_bit (u8 @ +18) into ctx.
+        mov_w [rbx + 16], rbp;
+        mov_b [rbx + 18], r13;
+
+        // (8) Return idx in rax.
+        mov rax, rbp;
+
+        add rsp, 32;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // xhci_ring_ep_doorbell(bar0, slot_id, ep_id) -> ()
+  // ============================================================================
+  //
+  // SysV: (bar0: u64, slot_id: u64, ep_id: u64) -> ()
+  //   rdi = BAR0 base
+  //   rsi = slot ID (1..127)
+  //   rdx = endpoint DCI (1..31)
+  //
+  // Body:
+  //   (1) Read DBOFF (u32 @ bar0 + 0x14) → mask low 2 reserved bits.
+  //   (2) db_addr = bar0 + (DBOFF & ~0x3) + slot_id * 4.
+  //   (3) Write ep_id (as u32; bits [7:0] = DB Target) to db_addr via
+  //       xhci_mmio_write_u32. The accessor's internal mfence-before
+  //       pairs with the prior trb_write's mfence-after to enforce
+  //       TRB-visible-before-doorbell ordering across the caller
+  //       boundary.
+  //
+  // Register plan (3-push callee-save):
+  //   rbx = bar0 (survives xhci_cap_u32 call)
+  //   rbp = slot_id (scaled to slot_id * 4 later)
+  //   r12 = ep_id (u32 payload to store)
+  //
+  //   3 pushes = 24 B; entry rsp%16==8 -> 32, %16==0 (aligned for
+  //   xhci_cap_u32 + xhci_mmio_write_u32 without extra pad).
+
+  pub let xhci_ring_ep_doorbell : (u64, u64, u64) -> () !{sysreg, mem} @{boot} =
+    fn (bar0: u64, slot_id: u64, ep_id: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R26-M4-004 (#959). Ring DB[slot_id] (per-slot endpoint doorbell) per xHCI 1.2 §5.6. Structural sibling to xhci_ring_cmd_doorbell (doorbell.pdx L82) but with slot-scaled address and ep_id payload. Body: (1) 3-push callee-save prologue (rbx=bar0, rbp=slot_id, r12=ep_id) — 24 B; entry rsp%16==8 -> 32, %16==0 (aligned for xhci_cap_u32 + xhci_mmio_write_u32 nested calls). (2) Stash args in rbx/rbp/r12 (rsi/rdx clobbered by xhci_cap_u32's arg setup). (3) Read DBOFF (u32 @ bar0+0x14) via xhci_cap_u32; mask low 2 reserved bits via `and rax, 0xFFFFFFFFFFFFFFFC` (sign-extended imm32 pattern). (4) db_addr = bar0 + masked_dboff + slot_id * 4. Slot 0 is the host-controller doorbell (rung by xhci_ring_cmd_doorbell); slot IDs 1..127 map to per-device doorbells at DBOFF + 4*id. (5) Write ep_id to db_addr via xhci_mmio_write_u32(db_addr, ep_id). DB Target = ep_id (u8, bits [7:0] of the u32). Stream ID = 0 (bits [31:16]) — non-streams-mode endpoint. (6) The mfence in xhci_mmio_write_u32 pairs with any prior trb_write's mfence-after; the enqueued TRB is globally visible before this MMIO write publishes the doorbell edge to the HC. Reserved labels: `xhci_ted_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+
+        mov rbx, rdi;                            // bar0
+        mov rbp, rsi;                            // slot_id
+        mov r12, rdx;                            // ep_id
+
+        // (1) Read DBOFF.
+        mov rdi, rbx;
+        mov rsi, 20;                             // XHCI_CAP_DBOFF = 0x14
+        call xhci_cap_u32;
+
+        // (2) Mask low 2 reserved bits.
+        and rax, 0xFFFFFFFFFFFFFFFC;
+
+        // (3) db_addr = bar0 + dboff + slot_id * 4.
+        mov rcx, rbp;
+        shl rcx, 2;                              // slot_id * 4
+        add rax, rcx;                            // + dboff already in rax
+        add rax, rbx;                            // + bar0
+
+        // (4) Write ep_id to db_addr (as u32).
+        mov rdi, rax;
+        mov rsi, r12;                            // val = ep_id
+        call xhci_mmio_write_u32;
+
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}

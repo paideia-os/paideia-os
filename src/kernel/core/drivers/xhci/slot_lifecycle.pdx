@@ -1,0 +1,318 @@
+// src/kernel/core/drivers/xhci/slot_lifecycle.pdx — R26-M4-002 (#957)
+//
+// xHCI slot-state bookkeeping + the Disable Slot command sequence. Slots
+// walk a five-state lifecycle as commands complete against them (xHCI
+// 1.2 §4.5.3):
+//
+//   DISABLED (0)   — Slot is free; DCBAA[i] may be null.
+//   ENABLED  (1)   — Enable Slot succeeded; slot ID allocated; Input
+//                    Context populated but not yet handed to HC.
+//   DEFAULT  (2)   — Slot has been reset (Reset Device command); it is
+//                    ready for a fresh Address Device.
+//   ADDRESSED (3)  — Address Device succeeded; slot has a USB address
+//                    (or is in the deferred BSR=1 state); EP0 is running.
+//   CONFIGURED (4) — Configure Endpoint succeeded; non-zero endpoints
+//                    are active and transferring.
+//
+// The state array shadows the HC's own view (which the driver can read
+// out of the Device Context slot header). Keeping a SW-side shadow
+// avoids a MMIO read for state queries — every SW producer path
+// (enqueue interrupt-transfer, tear down endpoint, etc.) can gate on
+// the state without hitting UC memory.
+//
+// -----------------------------------------------------------------------------
+// Disable Slot command (xHCI 1.2 §4.6.4 / §6.4.3.3)
+// -----------------------------------------------------------------------------
+//
+//   TRB Type         = 10
+//   Parameter        = 0
+//   Status           = 0
+//   Control (no C)   = (10 << 10) | (SlotID << 24) = 0x2800 | (SlotID << 24)
+//
+// The HC:
+//   * Releases the slot ID back to the free pool.
+//   * Transitions the slot's Device Context header to Disabled.
+//   * DOES NOT touch DCBAA[i] — SW is free to leave the pointer as-is
+//     because Disabled slots never receive DMA.
+//
+// Completion is a Command Completion Event (TRB Type 33) on the event
+// ring, same discipline as Enable Slot / Address Device (see slot.pdx).
+//
+// -----------------------------------------------------------------------------
+// bar0 argument rationale (mirrors slot.pdx)
+// -----------------------------------------------------------------------------
+//
+// Ringing DB[0] requires bar0. cmd_ring_ctx does not carry it (ring is
+// memory-side; DCBAA / CRCR programming is register-side and lives in
+// dcbaap.pdx / cmd_ring.pdx). bar0 is passed explicitly so slot_disable
+// mirrors xhci_enable_slot / xhci_address_device — the caller already
+// has bar0 in hand from xhci_probe.
+//
+// -----------------------------------------------------------------------------
+// Return semantics (mirrors slot.pdx)
+// -----------------------------------------------------------------------------
+//
+//   xhci_slot_disable returns:
+//     0             success (state[slot_id] set to DISABLED)
+//     1             wrong TRB type came back
+//     2             timeout — HC never posted a completion
+//     0x100..0x1FF  non-success completion code (OR-ed with 0x100)
+//
+// -----------------------------------------------------------------------------
+// R26.M4 posture: dormant at boot
+// -----------------------------------------------------------------------------
+//
+// No HC under BIOS/`-kernel` boot means no slot enable, hence no slot
+// disable either. Symbols exist for the R26.M6+ device tear-down path
+// and for UEFI/OVMF activation.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: u8 stores via mov_b for state-array slots and sub-8-byte
+//       accessors on the event ring polling path.
+//
+// Reserved-label discipline: `xhci_ss_` (slot state), `xhci_sd_` (slot
+// disable).
+
+module SlotLifecycle = structure {
+
+  // ============================================================================
+  // State constants
+  // ============================================================================
+
+  pub let XHCI_SLOT_STATE_DISABLED   : u64 = 0
+  pub let XHCI_SLOT_STATE_ENABLED    : u64 = 1
+  pub let XHCI_SLOT_STATE_DEFAULT    : u64 = 2
+  pub let XHCI_SLOT_STATE_ADDRESSED  : u64 = 3
+  pub let XHCI_SLOT_STATE_CONFIGURED : u64 = 4
+
+  // Slot-array sizing — 128 entries so slot IDs 1..127 all map cleanly
+  // (the DCBAA_ENTRIES ceiling in dcbaap.pdx sets the ID upper bound).
+  pub let XHCI_SLOT_STATE_MAX        : u64 = 128
+
+  // Disable Slot command control (no cycle) base = (10 << 10) = 0x2800.
+  pub let XHCI_DISABLE_SLOT_CTRL_NC_BASE : u64 = 0x2800
+
+  // Command-Completion-Event TRB type.
+  pub let XHCI_TRB_TYPE_CCE          : u64 = 33
+
+  // Completion Code SUCCESS (mirrors slot.pdx).
+  pub let XHCI_CC_SUCCESS            : u64 = 1
+
+  // Event ring polling budget — matches slot.pdx.
+  pub let XHCI_SLOT_POLL_SPIN_MAX    : u64 = 5000000
+
+  // Event ring segment size (single-segment layout inherited from
+  // event_ring.pdx).
+  pub let XHCI_EVT_SEG_TRBS          : u64 = 256
+
+  // Return codes (mirror slot.pdx).
+  pub let XHCI_SLOT_OK               : u64 = 0
+  pub let XHCI_SLOT_ERR_TYPE         : u64 = 1
+  pub let XHCI_SLOT_ERR_TIMEOUT      : u64 = 2
+
+  // ============================================================================
+  // Canonical .bss storage
+  // ============================================================================
+  //
+  //   _xhci_slot_states : 128 * 1 B = 128 B = 16 u64 slots
+  //                       @align(8) — no HC DMA on this array; alignment
+  //                       is purely for SysV-friendly u64 loads.
+
+  pub let mut _xhci_slot_states : [u64; 16] = uninit @align(8)
+
+  // ============================================================================
+  // xhci_slot_state_set(slot_id, state) -> ()
+  // ============================================================================
+  //
+  // SysV: (slot_id: u64, state: u64) -> ()
+  //   rdi = slot_id (0..127)
+  //   rsi = state   (XHCI_SLOT_STATE_*)
+  //
+  // Body: _xhci_slot_states[slot_id] = state (u8 store).
+  //
+  // Leaf function.
+
+  pub let xhci_slot_state_set : (u64, u64) -> () !{sysreg, mem} @{boot} =
+    fn (slot_id: u64, state: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R26-M4-002 (#957). Set SW-side slot state shadow. Body: (1) lea rax, [rip + _xhci_slot_states] — RIP-relative anchor. (2) add rax, rdi — offset by slot_id bytes (u8 array). (3) mov_b [rax], rsi — G1 sized byte store to avoid REX.W widening into neighboring slots. Leaf — no callee-save, no prologue. Trusted caller: slot_id in [0, 128) is a driver-side precondition. state should be one of XHCI_SLOT_STATE_* but even out-of-range values only corrupt the shadow (never handed to HC).",
+      block: {
+        lea rax, [rip + _xhci_slot_states];
+        add rax, rdi;
+        mov_b [rax], rsi;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // xhci_slot_state_get(slot_id) -> u64
+  // ============================================================================
+  //
+  // SysV: (slot_id: u64) -> u64
+  //   rdi = slot_id (0..127)
+  //
+  // Returns rax = state (u8, zero-extended).
+  //
+  // Leaf function.
+
+  pub let xhci_slot_state_get : (u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (slot_id: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R26-M4-002 (#957). Read SW-side slot state shadow. Body: (1) lea rcx, [rip + _xhci_slot_states]. (2) add rcx, rdi — offset by slot_id. (3) xor rax, rax; mov_b rax, [rcx] — G1 zero-extended byte load. (4) ret. Leaf — no callee-save, no prologue. Trusted caller: slot_id in [0, 128) precondition.",
+      block: {
+        lea rcx, [rip + _xhci_slot_states];
+        add rcx, rdi;
+        xor rax, rax;
+        mov_b rax, [rcx];
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // xhci_slot_disable(bar0, cmd_ctx, event_ctx, slot_id) -> u64
+  // ============================================================================
+  //
+  // SysV: (bar0: u64, cmd_ctx: u64, event_ctx: u64, slot_id: u64) -> u64
+  //   rdi = BAR0 base
+  //   rsi = cmd_ring_ctx pointer
+  //   rdx = event_ring_ctx pointer
+  //   rcx = slot ID
+  //
+  // Returns rax per "Return semantics" (0 / 1 / 2 / 0x100+CC).
+  //
+  // Register plan (6-push callee-save + 8 B align pad):
+  //   rbx = bar0
+  //   rbp = cmd_ctx
+  //   r12 = event_ctx
+  //   r13 = slot_id                       (preserved for state set + control)
+  //   r14 = trb_addr / spin (post-enqueue)
+  //   r15 = expected cycle bit
+  //
+  //   6 pushes = 48 B + sub rsp,8 = 56; entry rsp%16==8 -> 64, %16==0
+  //   (aligned for every nested call).
+
+  pub let xhci_slot_disable : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64, cmd_ctx: u64, event_ctx: u64, slot_id: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R26-M4-002 (#957). Disable Slot command sequence per xHCI 1.2 §4.6.4. Structural mirror of xhci_enable_slot / xhci_address_device (slot.pdx L168/L308). Body: (1) 6-push callee-save (rbx=bar0, rbp=cmd_ctx, r12=event_ctx, r13=slot_id, r14=trb_addr/spin, r15=expected cycle) + sub rsp,8 align — 56 B; entry rsp%16==8 -> 64, %16==0 (aligned for every nested call). (2) Stash args in rbx/rbp/r12/r13. (3) Compose ctrl_no_cycle = 0x2800 | (slot_id << 24): mov rax, 0x2800; mov rcx, r13; and rcx, 0xFF; shl rcx, 24; or rax, rcx. TRB Type=10 shifted left 10 = 0x2800. (4) Enqueue Disable Slot TRB: xhci_cmd_enqueue(cmd_ctx=rbp, param=0, status=0, ctrl_no_cycle=rax). (5) Ring DB[0]: xhci_ring_cmd_doorbell(rbx). (6) Load event-ring polling state — r14 = event_ring_va + dequeue_idx*16 (trb_addr); r15 = expected cycle from event_ctx+18. (7) Spin poll (rax=5_000_000). Same discipline as xhci_enable_slot: cycle-match -> TRB Type check (== 33) -> completion-code check (== 1). (8) On success: advance dequeue_idx (with segment wrap), set slot state to DISABLED (mov_b [_xhci_slot_states + slot_id], 0 via xhci_slot_state_set), return 0. (9) Failure paths mirror xhci_enable_slot's return codes. Reserved labels: `xhci_sd_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // bar0
+        mov rbp, rsi;                            // cmd_ctx
+        mov r12, rdx;                            // event_ctx
+        mov r13, rcx;                            // slot_id
+
+        // (1) Compose ctrl_no_cycle = 0x2800 | (slot_id << 24).
+        mov rax, 0x2800;
+        mov rcx, r13;
+        and rcx, 0xFF;
+        shl rcx, 24;
+        or  rax, rcx;
+
+        // (2) Enqueue Disable Slot TRB.
+        mov rdi, rbp;                            // cmd_ctx
+        xor rsi, rsi;                            // param = 0
+        xor rdx, rdx;                            // status = 0
+        mov rcx, rax;                            // ctrl_no_cycle
+        call xhci_cmd_enqueue;
+
+        // (3) Ring DB[0].
+        mov rdi, rbx;
+        call xhci_ring_cmd_doorbell;
+
+        // (4) Load polling state from event_ctx.
+        mov r14, [r12 + 8];                      // event_ring_va
+        xor rax, rax;
+        mov_w rax, [r12 + 16];                   // dequeue_idx (u16)
+        shl rax, 4;                              // idx * 16
+        add r14, rax;                            // r14 = trb_addr
+
+        xor r15, r15;
+        mov_b r15, [r12 + 18];                   // expected cycle_bit
+
+        mov rax, 5000000;                        // spin budget
+
+      xhci_sd_poll:
+        // Read Control word (u32 @ trb_addr + 12).
+        mov ecx, [r14 + 12];                     // zero-extends into rcx
+
+        // Cycle compare.
+        mov rdx, rcx;
+        and rdx, 1;
+        cmp rdx, r15;
+        jne xhci_sd_no_event;
+
+        // TRB Type check (bits 10..15).
+        mov rdx, rcx;
+        shr rdx, 10;
+        and rdx, 0x3F;
+        cmp rdx, 33;                             // CCE
+        jne xhci_sd_wrong_type;
+
+        // Completion Code check (Status bits 24..31).
+        mov edx, [r14 + 8];                      // Status word
+        shr rdx, 24;
+        and rdx, 0xFF;
+        cmp rdx, 1;                              // SUCCESS
+        jne xhci_sd_cc_err;
+
+        // Advance dequeue_idx (with segment wrap).
+        xor rcx, rcx;
+        mov_w rcx, [r12 + 16];
+        add rcx, 1;
+        cmp rcx, 256;
+        jne xhci_sd_no_wrap;
+        xor rcx, rcx;
+        xor r15, 1;
+        mov_b [r12 + 18], r15;
+      xhci_sd_no_wrap:
+        mov_w [r12 + 16], rcx;
+
+        // Set slot state to DISABLED via xhci_slot_state_set(slot_id, 0).
+        mov rdi, r13;                            // slot_id
+        xor rsi, rsi;                            // state = 0 = DISABLED
+        call xhci_slot_state_set;
+
+        xor rax, rax;                            // SLOT_OK
+        jmp xhci_sd_done;
+
+      xhci_sd_cc_err:
+        or  rdx, 0x100;
+        mov rax, rdx;
+        jmp xhci_sd_done;
+
+      xhci_sd_wrong_type:
+        mov rax, 1;                              // SLOT_ERR_TYPE
+        jmp xhci_sd_done;
+
+      xhci_sd_no_event:
+        sub rax, 1;
+        cmp rax, 0;
+        jne xhci_sd_poll;
+        mov rax, 2;                              // SLOT_ERR_TIMEOUT
+
+      xhci_sd_done:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
