@@ -1428,6 +1428,21 @@ frame_hdr_ok_msg: .ascii "R20b FRAME HDR OK\n\0"
 .align 8
 frame_hdr_fail_msg: .ascii "R20b FRAME HDR FAIL\n\0"
 
+
+# R20b.M2-002 (#1556): pending-msg primitives witness fingerprints —
+# second M2 sub-issue. Exercises endpoint_write_pending /
+# endpoint_take_pending / endpoint_is_full round-trip on a freshly
+# allocated endpoint: publish-once + fill-check + EAGAIN on re-publish
+# + take round-trip (hdr + payload byte-compare) + EMPTY on re-take.
+# See src/kernel/core/ipc/endpoint_table.pdx (M2-002 helpers).
+.global pending_msg_ok_msg
+.align 8
+pending_msg_ok_msg: .ascii "R20b PENDING MSG OK\n\0"
+
+.global pending_msg_fail_msg
+.align 8
+pending_msg_fail_msg: .ascii "R20b PENDING MSG FAIL\n\0"
+
 # svc.<name> strings for the R20b.M1-003 (#1554) broker witness.
 # ASCII bytes only; no NUL required (svc_register / svc_lookup are
 # length-explicit), but a trailing NUL keeps the buffer safe for casual

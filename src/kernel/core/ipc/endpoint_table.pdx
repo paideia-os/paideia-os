@@ -1,6 +1,9 @@
 // src/kernel/core/ipc/endpoint_table.pdx — R20b.M1-002 (#1553)
+//                                          + R20b.M2-002 (#1556)
 // 128-slot static endpoint table + endpoint_alloc / endpoint_free /
-// endpoint_lookup primitives.
+// endpoint_lookup primitives (M1-002).
+// Single-in-flight pending-msg primitives — endpoint_write_pending /
+// endpoint_take_pending / endpoint_is_full (M2-002).
 //
 // Design context
 // --------------
@@ -61,6 +64,52 @@
 // endpoint (see design §4.2 — single in-flight message per endpoint).
 // SMP-safe alloc arrives in a later round when the substrate grows a
 // generation counter or a per-row spinlock (design §14 Q3).
+//
+// M2-002 pending-msg semantics (design §4.3)
+// ------------------------------------------
+// The M2 wire-up fuses the endpoint row (this file) with the payload
+// arena page (payload_arena.pdx) at every send/recv boundary — one
+// endpoint row + one 4 KiB payload page carry a single in-flight message.
+// endpoint_write_pending / endpoint_take_pending are the kernel-side
+// primitives sys_ipc_send / sys_ipc_recv (M3-001, M3-002) build on.
+//
+// Discriminator: the row's pending_hdr slot at +24 doubles as the "is
+// there a message?" bit. Zero == empty, non-zero == a valid encoded
+// header sits there. This is safe because every valid header (per
+// frame.pdx / acpi-supervisor-schema.md §3) has ver >= 1 in bits 8..15,
+// so the packed u64 is never zero for a live message. Choosing the hdr
+// slot as the discriminator collapses "is the endpoint full?" into a
+// single u64 read/write per state change; the flags byte at +3 stays
+// available for the M3 reply-path bit and the (future) waiter-count
+// accounting.
+//
+// Publish barrier — endpoint_write_pending writes the payload BEFORE
+// stamping pending_hdr. Under R20b's single-flow discipline there are
+// no concurrent readers, but ordering the writes as (payload then hdr)
+// preserves the invariant "pending_hdr non-zero ⇒ payload fully
+// published in payload_arena[id]" that R21+ SMP receivers will assume.
+// endpoint_take_pending mirrors this: (read hdr, copy payload out, then
+// zero hdr) — clearing the hdr LAST means a concurrent writer can never
+// see "hdr zero, payload half-consumed".
+//
+// Sentinel discipline. endpoint_write_pending returns:
+//   PENDING_WRITE_OK              (0) — hdr + payload published.
+//   PENDING_WRITE_ERR_EAGAIN      (1) — endpoint has a pending message
+//                                        (single-slot at R20b; EAGAIN per
+//                                        design §4.3 step 3).
+//   PENDING_WRITE_ERR_BAD_ID      (2) — id >= 128 or endpoint not live.
+//   PENDING_WRITE_ERR_PAYLOAD_LEN (3) — payload_len > FRAME_MAX_PAYLOAD
+//                                        (E2BIG per design §4.3 step 2).
+// endpoint_take_pending returns:
+//   PENDING_TAKE_EMPTY (0xFFFFFFFFFFFFFFFF) — no pending message; caller
+//                                              blocks/retries per §4.3
+//                                              recv step 2.
+//   otherwise           — the u32 payload_len that was in the packed
+//                         header. payload_len can be 0 (a header-only
+//                         message), distinct from the -1 empty sentinel.
+// endpoint_is_full returns 1 iff pending_hdr != 0, else 0. Bounds-check
+// off-range ids returns 0 (matches the "no pending message on an
+// invalid id" reading — the id could never have received a message).
 
 module EndpointTable = structure {
 
@@ -78,6 +127,33 @@ module EndpointTable = structure {
 
   pub let ENDPOINT_ALLOC_NONE    : u64 = 0xFFFFFFFFFFFFFFFF   // -1 on exhaustion
   pub let ENDPOINT_LOOKUP_NONE   : u64 = 0                    // NULL on miss
+
+  // ============================================================================
+  // R20b.M2-002 (#1556): pending-msg primitive result codes.
+  //
+  // endpoint_write_pending returns a small u64 rc; 0 = success, non-zero
+  // = distinct error category (mirrors FRAME_ENCODE_* / SVC_REGISTER_*
+  // discipline: success == 0, each error gets its own code).
+  //
+  // endpoint_take_pending returns either the payload_len (u32) that was
+  // in the pending header, or PENDING_TAKE_EMPTY when the endpoint has
+  // no pending message. Valid payload_len ∈ [0, FRAME_MAX_PAYLOAD=4088];
+  // 0xFFFFFFFFFFFFFFFF sits far outside that range so a caller can
+  // discriminate the two return kinds with a single `cmp rax, -1`.
+  // ============================================================================
+
+  pub let PENDING_WRITE_OK              : u64 = 0
+  pub let PENDING_WRITE_ERR_EAGAIN      : u64 = 1
+  pub let PENDING_WRITE_ERR_BAD_ID      : u64 = 2
+  pub let PENDING_WRITE_ERR_PAYLOAD_LEN : u64 = 3
+
+  pub let PENDING_TAKE_EMPTY            : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // FRAME_MAX_PAYLOAD sourced from design/ipc/userspace-server-substrate.md
+  // §4.1 (matches PayloadArena.PAYLOAD_MAX_BYTES / Frame.FRAME_MAX_PAYLOAD;
+  // frozen here so the length gate reads locally without cross-module
+  // constant lookups that paideia-as does not (yet) resolve at parse time).
+  pub let PENDING_PAYLOAD_MAX_BYTES     : u64 = 4088
 
   // ============================================================================
   // Row-field offsets (bytes, from row base)
@@ -240,6 +316,248 @@ module EndpointTable = structure {
 
       endpoint_lookup_none:
         xor rax, rax;                       // ENDPOINT_LOOKUP_NONE
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // endpoint_is_full(id: u64) -> u64
+  //
+  // SysV ABI: rdi = id -> rax = 1 if endpoint has a pending message, 0 if
+  // empty (or id out of range).
+  //
+  // Reads the row's pending_hdr slot at +24. Non-zero == a valid encoded
+  // header sits there (see file header: ver >= 1 invariant ensures no
+  // valid header packs to 0), so the endpoint is "full" per the single-
+  // slot semantics. Zero == empty. Out-of-range ids read as empty (an
+  // id that could never have received a message trivially has none
+  // pending).
+  //
+  // Pure read; no writes. Leaf function.
+  // ==========================================================================
+
+  pub let endpoint_is_full : (u64) -> u64 !{mem} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R20b.M2-002 (#1556): pending-msg fullness probe. id >= 128 -> return 0 (out-of-range ids can hold no pending message; matches endpoint_lookup's off-range NULL discipline). Otherwise compute row = &_ipc_endpoint_table + id*48 via the same shl-4 + shl-5 + add sequence as endpoint_free / endpoint_lookup. Load u64 at [row+24] (ENDPOINT_OFF_PENDING_HDR); non-zero -> full (return 1), zero -> empty (return 0). The pending_hdr == 0 <-> empty invariant is safe because every valid header per acpi-supervisor-schema §3 has ver in bits 8..15 with ver >= 1 (per frame.pdx doc), so no live header packs to 0 — see file-header 'Discriminator' paragraph. Pure read; no writes; no callee-save writes. Leaf function.",
+      block: {
+        cmp rdi, 128;                       // ENDPOINT_TABLE_SLOTS
+        jae endpoint_is_full_no;
+
+        // Compute row = &_ipc_endpoint_table + id * 48.
+        mov r8, rdi;
+        shl r8, 4;                          // id * 16
+        mov r9, rdi;
+        shl r9, 5;                          // id * 32
+        add r8, r9;                         // id * 48
+        lea r9, [rip + _ipc_endpoint_table];
+        add r8, r9;                         // r8 = &row
+
+        mov rax, [r8 + 24];                 // ENDPOINT_OFF_PENDING_HDR
+        cmp rax, 0;
+        je  endpoint_is_full_no;
+
+        mov rax, 1;
+        ret;
+
+      endpoint_is_full_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // endpoint_write_pending(id: u64, hdr: u64, payload_ptr: u64,
+  //                        payload_len: u64) -> u64
+  //
+  // SysV ABI: rdi=id, rsi=hdr, rdx=payload_ptr, rcx=payload_len -> rax=rc.
+  //
+  // Publishes a single in-flight message on endpoint `id`:
+  //   1. Reject id >= 128 or row-not-live -> PENDING_WRITE_ERR_BAD_ID (2).
+  //   2. Reject payload_len > 4088 -> PENDING_WRITE_ERR_PAYLOAD_LEN (3).
+  //   3. Reject pending_hdr already non-zero -> PENDING_WRITE_ERR_EAGAIN (1)
+  //      (endpoint busy — single-slot at R20b, per design §4.3 step 3).
+  //   4. rep_movsb payload_len bytes from payload_ptr into payload_arena[id]
+  //      (4 KiB page at _ipc_payload_arena + id * 4096).
+  //   5. Store hdr into row +24 (pending_hdr) as the publish barrier —
+  //      makes the endpoint "full" for concurrent readers.
+  //   Return PENDING_WRITE_OK (0).
+  //
+  // Publish order (payload BEFORE hdr) preserves the invariant
+  // "pending_hdr != 0 ⇒ payload_arena[id] fully published"; see file
+  // header 'Publish barrier' paragraph.
+  //
+  // payload_len == 0 is legal (header-only message). rep_movsb with rcx=0
+  // is architecturally a no-op (SDM Vol 2A REP: pre-decrement rcx == 0
+  // fast-exit), so the zero-payload path stores hdr with no memcpy.
+  //
+  // Cross-module reach: this primitive is the M2 wire-up boundary where
+  // the storage-layer independence of M1's endpoint_alloc/free/lookup
+  // (deliberately free of payload_arena references) is fused with the
+  // arena. Direct `lea [rip + _ipc_payload_arena]` inlines the arena
+  // base address; the id*4096 arithmetic replicates payload_buf_pa_for's
+  // formula, avoiding a call + register-save/restore across it (proof
+  // parity: same alignment invariant, same bounds discipline).
+  // ==========================================================================
+
+  pub let endpoint_write_pending : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (id: u64, hdr: u64, payload_ptr: u64, payload_len: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R20b.M2-002 (#1556): publish an in-flight message on endpoint id. Register plan: rdi=id, rsi=hdr (saved to r11 across rep_movsb since rsi becomes rep_movsb src), rdx=payload_ptr (moved into rsi for rep_movsb), rcx=payload_len (kept as rep_movsb count). r8=row addr (survives across rep_movsb; rep_movsb touches only rdi/rsi/rcx). r9=temp for id*32 during row-addr math, reused as scratch for the in_use mask. r10=payload_pa (rep_movsb dst; moved into rdi for the copy). r11=saved hdr (survives across rep_movsb -> stored into [row+24] after copy). Gate order: (a) `cmp rdi,128; jae bad_id` — out-of-range. (b) `cmp rcx,4088; ja bad_len` — over-limit (matches Frame.FRAME_MAX_PAYLOAD; ja for unsigned compare). (c) Compute row via shl-4 + shl-5 + add (matches endpoint_free/lookup). (d) Liveness gate: `mov rax,[r8]; shr rax,16; and rax,0xFF; cmp rax,0; je bad_id` — treats not-live as bad_id (an alloc'd endpoint that got freed underfoot is indistinguishable to the caller from an invalid id). (e) Full gate: `mov rax,[r8+24]; cmp rax,0; jne eagain` — pending_hdr slot non-zero means a prior message is still in flight (single-slot at R20b). (f) Compute payload_pa: `mov r10,rdi; shl r10,12; lea r9,[rip+_ipc_payload_arena]; add r10,r9` — same id*4096 arithmetic as payload_buf_pa_for; base is @align(4096) so alignment holds by construction. (g) Save hdr: `mov r11,rsi`. (h) rep_movsb setup: `mov rdi,r10; mov rsi,rdx; cld; rep_movsb` — rcx already holds payload_len; cld ensures forward direction (SysV requires DF=0 at call boundary but re-issuing is a proven safety pattern per libc_test.pdx L137, pdxfs_lite/read.pdx). rcx=0 fast-exits per SDM Vol 2A REP semantics. (i) Publish barrier: `mov [r8+24],r11` stores hdr LAST — payload-then-hdr order preserves 'hdr!=0 ⇒ payload fully published' for R21+ SMP readers. (j) `xor rax,rax; ret` returns PENDING_WRITE_OK. Error paths use single `mov rax,imm; ret`. Leaf function; no callee-save writes; no stack frame. cross-file `[rip + _ipc_payload_arena]` reference proven in kernel_main.pdx's cross-file RIP-relative refs (e.g. [rip + _boot_env_pa] at L146).",
+      block: {
+        // ---- Gate A: id in range ----
+        cmp rdi, 128;                       // ENDPOINT_TABLE_SLOTS
+        jae ep_wp_bad_id;
+
+        // ---- Gate B: payload_len <= FRAME_MAX_PAYLOAD ----
+        cmp rcx, 4088;                      // PENDING_PAYLOAD_MAX_BYTES
+        ja  ep_wp_bad_len;
+
+        // ---- Compute row addr in r8 ----
+        mov r8, rdi;
+        shl r8, 4;                          // id * 16
+        mov r9, rdi;
+        shl r9, 5;                          // id * 32
+        add r8, r9;                         // id * 48
+        lea r9, [rip + _ipc_endpoint_table];
+        add r8, r9;                         // r8 = &row
+
+        // ---- Gate C: row must be live (in_use byte at +2 non-zero) ----
+        mov rax, [r8];
+        shr rax, 16;
+        and rax, 0xFF;
+        cmp rax, 0;
+        je  ep_wp_bad_id;
+
+        // ---- Gate D: pending_hdr slot must be empty (== 0) ----
+        mov rax, [r8 + 24];                 // ENDPOINT_OFF_PENDING_HDR
+        cmp rax, 0;
+        jne ep_wp_eagain;
+
+        // ---- Compute payload_pa in r10 ----
+        mov r10, rdi;
+        shl r10, 12;                        // id * 4096
+        lea r9,  [rip + _ipc_payload_arena];
+        add r10, r9;                        // r10 = payload_pa
+
+        // ---- Save hdr across rep_movsb (which clobbers rsi) ----
+        mov r11, rsi;                       // r11 = hdr
+
+        // ---- rep_movsb: dst=payload_pa, src=payload_ptr, count=payload_len ----
+        mov rdi, r10;                       // dst
+        mov rsi, rdx;                       // src
+        // rcx already = payload_len
+        cld;
+        rep_movsb;
+
+        // ---- Publish barrier: store hdr LAST into pending_hdr slot ----
+        mov [r8 + 24], r11;
+
+        xor rax, rax;                       // PENDING_WRITE_OK
+        ret;
+
+      ep_wp_bad_id:
+        mov rax, 2;                         // PENDING_WRITE_ERR_BAD_ID
+        ret;
+
+      ep_wp_bad_len:
+        mov rax, 3;                         // PENDING_WRITE_ERR_PAYLOAD_LEN
+        ret;
+
+      ep_wp_eagain:
+        mov rax, 1;                         // PENDING_WRITE_ERR_EAGAIN
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // endpoint_take_pending(id: u64, dst_hdr_ptr: u64,
+  //                       dst_payload_ptr: u64) -> u64
+  //
+  // SysV ABI: rdi=id, rsi=dst_hdr_ptr, rdx=dst_payload_ptr
+  //        -> rax = payload_len (u32 zero-extended, in [0..4088])
+  //                 OR PENDING_TAKE_EMPTY (0xFFFFFFFFFFFFFFFF) when the
+  //                 endpoint has no pending message.
+  //
+  // Consumes the single in-flight message on endpoint `id`:
+  //   1. id >= 128 -> return PENDING_TAKE_EMPTY.
+  //   2. Load pending_hdr from row +24; if 0 -> return PENDING_TAKE_EMPTY.
+  //   3. Extract payload_len = hdr >> 32 (bits 32..63 of the packed hdr;
+  //      see frame_hdr_payload_len).
+  //   4. Store hdr into *dst_hdr_ptr (single 8-byte store).
+  //   5. rep_movsb payload_len bytes from payload_arena[id] into
+  //      *dst_payload_ptr.
+  //   6. Zero pending_hdr slot (release the endpoint for the next msg).
+  //   Return payload_len.
+  //
+  // Take order (read hdr, copy payload out, THEN zero hdr) is the mirror
+  // of write's (payload then hdr) publish order — clearing pending_hdr
+  // LAST means a concurrent writer (R21+ SMP) never sees "hdr zero,
+  // payload half-consumed". At R20b there are no concurrent readers or
+  // writers, but the ordering discipline is baked in.
+  //
+  // Note: payload_len == 0 is a valid return distinct from
+  // PENDING_TAKE_EMPTY (-1) — a header-only message consumes correctly
+  // and returns 0. Callers use `cmp rax, -1` (or equivalent) to detect
+  // the empty case.
+  // ==========================================================================
+
+  pub let endpoint_take_pending : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (id: u64, dst_hdr_ptr: u64, dst_payload_ptr: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R20b.M2-002 (#1556): consume an in-flight message from endpoint id. Register plan: rdi=id (consumed for row-addr math, then overwritten as rep_movsb dst), rsi=dst_hdr_ptr (used for the single 8-byte hdr store, then overwritten as rep_movsb src), rdx=dst_payload_ptr (moved into rdi as rep_movsb dst). r8=row addr (survives rep_movsb). r9=temp for id*32, then arena base. r10=payload_pa (rep_movsb src staging). r11=none needed here (payload_len lives in r9 across rep_movsb since r9 is caller-save but rep_movsb touches only rdi/rsi/rcx). Actually r9 is needed as scratch mid-flow; use r10 for payload_len persistence and recompute payload_pa into r11: cleaner: r11=payload_pa (rep_movsb src), r9=payload_len (survives). Gate order: (a) `cmp rdi,128; jae empty` — out-of-range treated as empty (a nonexistent endpoint can hold no msg). (b) Compute row addr via shl-4 + shl-5 + add (matches endpoint_free/lookup/is_full). (c) Load pending_hdr: `mov rax,[r8+24]; cmp rax,0; je empty` — zero hdr means empty per file-header discriminator invariant. (d) Publish hdr to caller: `mov [rsi],rax` — single 8-byte store; rsi is still the original dst_hdr_ptr (not clobbered yet). (e) Extract payload_len: `mov r9,rax; shr r9,32` — matches frame_hdr_payload_len's shift (no mask needed; shr 32 zero-extends per SDM). Save this in r9 for the eventual return and for the rep_movsb count. (f) Compute payload_pa in r11: `mov r11,rdi; shl r11,12; lea rax,[rip+_ipc_payload_arena]; add r11,rax`. (g) rep_movsb setup: `mov rdi,rdx; mov rsi,r11; mov rcx,r9; cld; rep_movsb`. Payload_len=0 is a no-op per SDM. (h) Clear pending_hdr slot (release barrier): `xor rax,rax; mov [r8+24],rax` — hdr cleared AFTER payload fully consumed, so a concurrent writer (R21+) never sees stale state mid-flight. (i) Return payload_len: `mov rax,r9; ret`. Empty path: `mov rax,-1; ret`. Leaf function; no callee-save writes; no stack frame.",
+      block: {
+        // ---- Bounds ----
+        cmp rdi, 128;                       // ENDPOINT_TABLE_SLOTS
+        jae ep_tp_empty;
+
+        // ---- Compute row addr in r8 ----
+        mov r8, rdi;
+        shl r8, 4;                          // id * 16
+        mov r9, rdi;
+        shl r9, 5;                          // id * 32
+        add r8, r9;                         // id * 48
+        lea r9, [rip + _ipc_endpoint_table];
+        add r8, r9;                         // r8 = &row
+
+        // ---- Load pending_hdr; empty if 0 ----
+        mov rax, [r8 + 24];                 // ENDPOINT_OFF_PENDING_HDR
+        cmp rax, 0;
+        je  ep_tp_empty;
+
+        // ---- Publish hdr to caller (rsi still holds original dst_hdr_ptr) ----
+        mov [rsi], rax;
+
+        // ---- Extract payload_len into r9 (survives rep_movsb) ----
+        mov r9, rax;
+        shr r9, 32;                         // payload_len (u32 zero-extended)
+
+        // ---- Compute payload_pa in r11 ----
+        mov r11, rdi;
+        shl r11, 12;                        // id * 4096
+        lea rax, [rip + _ipc_payload_arena];
+        add r11, rax;                       // r11 = payload_pa
+
+        // ---- rep_movsb: dst=dst_payload_ptr, src=payload_pa, count=payload_len ----
+        mov rdi, rdx;                       // dst
+        mov rsi, r11;                       // src
+        mov rcx, r9;                        // count
+        cld;
+        rep_movsb;
+
+        // ---- Release barrier: zero pending_hdr LAST ----
+        xor rax, rax;
+        mov [r8 + 24], rax;
+
+        // ---- Return payload_len ----
+        mov rax, r9;
+        ret;
+
+      ep_tp_empty:
+        mov rax, 0xFFFFFFFFFFFFFFFF;        // PENDING_TAKE_EMPTY
         ret
       }
     } @no_frame
