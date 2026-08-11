@@ -607,6 +607,43 @@ case "${EXPECTED}" in
         echo "smoke: boot_r25_pdxfs_corrupt_sb — SKIP (witness not wired at R25.M5; caller wire-up deferred pending KIND_BLKDEV cap plumbing per src/kernel/core/fs/pdxfs_lite/mount_op.pdx header — #1015)"
         exit 0
         ;;
+    boot_r25_pdxfs_e2e)
+        # R25-M7-001 (#937): opt-in PdxFS-lite end-to-end mount-check
+        # witness, gated by PAIDEIA_R25_PDXFS_E2E=1.
+        #
+        # The witness at tests/kernel/fs/pdxfs_lite_e2e_witness.pdx
+        # (symbol pdxfs_lite_e2e_witness) is NOT wired into kernel_main
+        # at R25.M7 — same posture as pdxfs_lite_corrupt_sb_witness at
+        # R25.M5 close and concurrent_io_witness at R24.M6 close: symbol
+        # existence + build-time link verification are the R25.M7
+        # acceptance criterion, live invocation is deferred to R26+
+        # when the driver-attach ceremony wires nvme_probe → identify →
+        # io_queues → pdxfs_lite_mount into kernel_main_uefi (blocked
+        # on the same #1015 userspace-server substrate as #820 acpi_
+        # supervisor / #860 pci_enumerator / #906 userspace half of
+        # nvme_read_blocking).
+        #
+        # Under -kernel the witness itself would take its SKIP branch
+        # (pdxfs_lite_is_mounted returns 0 because no NVMe controller
+        # ever surfaces via nvme_probe under q35 default), but at
+        # R25.M7 there is no boot-path caller wired. This SKIP-echo
+        # mode keeps the pre-push env-gate callable so
+        # PAIDEIA_R25_PDXFS_E2E=1 does not abort the push.
+        #
+        # The full E2E promotion recipe (mkfs → boot → write → reboot
+        # → read-verify) lives at tools/pdxfs-lite-e2e-smoke.md. Live
+        # end-to-end promotion is queued for R26+ real-HW alongside
+        # the R24 first-NVMe-touch moment.
+        #
+        # When kernel_main wires pdxfs_lite_e2e_witness into the boot-
+        # time bring-up (behind PAIDEIA_R25_PDXFS_E2E gating), this
+        # mode flips to FINGERPRINT_MODE=1 with a
+        # tests/r25/expected-pdxfs-e2e.txt file matching
+        # "PDXFS E2E OK mounted=1\n" (or "PDXFS E2E SKIP not mounted\n"
+        # if the boot-time caller runs pre-mount for structural proof).
+        echo "smoke: boot_r25_pdxfs_e2e — SKIP (witness not wired at R25.M7; live E2E deferred to R26+ per tools/pdxfs-lite-e2e-smoke.md — chained on #906 nvme_write_blocking + driver-attach)"
+        exit 0
+        ;;
     boot_panic)
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/logging/expected-panic-dump.txt"

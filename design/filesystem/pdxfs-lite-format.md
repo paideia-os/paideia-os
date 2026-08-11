@@ -129,6 +129,108 @@ Double-indirect blocks are **not** part of v0. A file that would exceed `32 KiB 
 
 ---
 
+## 2.5 Directory entry limits (MVP)
+
+**Issue anchor:** #939 (R25.M7-003).
+
+At R25 MVP a PdxFS-lite directory is stored as a sequence of 256-byte
+dentries (per PDXL-D5) packed into the data blocks the directory
+inode's extents point at. This section documents the practical entry
+counts an operator (or a fixture author) can expect before the
+directory hits an implementation-defined limit and `create` starts
+returning `EFBIG` — before the R40 CoW-PQ format lifts the limits via
+hash-indexed directories.
+
+### 2.5.1 Per-block dentry density
+
+- 4 KiB block / 256 B dentry = **16 dentries per data block**.
+- No block-level header (dentries begin at offset 0 of every dir data
+  block); the terminator is a dentry with `inode_id == 0`.
+- The first dentry of every non-empty directory is `.` (self-reference,
+  matches POSIX-ish semantics that R16 tmpfs already exposes); the
+  second is `..` (parent). Every non-root directory therefore reserves
+  2 slots out of the first block's 16 for these two, leaving 14 for
+  user-visible entries in that first block.
+
+### 2.5.2 Per-inode capacity via inline extents
+
+- 8 inline extents (§2.3) × 1 block/extent × 16 dentries/block =
+  **128 dentries** across the inline range before an indirect block is
+  needed.
+- Root dir has no `..` reservation (`..` in v0 root points at root
+  itself, same as tmpfs), so root loses only 1 slot to `.` — root's
+  inline capacity is **127 user-visible entries**.
+- Non-root inline capacity: **126 user-visible entries** (loses 2 to
+  `.` and `..`).
+
+### 2.5.3 Per-inode capacity with the indirect extent
+
+- The single `indirect_lba` extent block (§2.4) holds 512 extent
+  descriptors × 1 block × 16 dentries = **8192 additional dentries**.
+- Combined with inline, an inode maxes at
+  **128 + 8192 = 8320 raw dentry slots** (~8318 user-visible for a
+  non-root dir; ~8319 for root).
+- Double-indirect is **not** part of v0 (§2.4). A directory that would
+  need to exceed the single-indirect capacity returns `EFBIG` from the
+  R25.M6 `create.pdx` / `link.pdx` codepaths (once #906 unblocks
+  writes; at R25 close all mutating ops return `EROFS` first, so
+  `EFBIG` is a latent code path).
+
+### 2.5.4 Practical MVP limit — where performance degrades first
+
+The `EFBIG` threshold above is the correctness ceiling. The
+performance ceiling is lower and depends on the directory-walk
+algorithm the R25 primitives use:
+
+- `pdxl_dir_find` (used by R25.M4 `namei.pdx` for path resolution and
+  by R25.M6 `create.pdx` for EEXIST checks) is a **linear scan** at
+  MVP — every lookup reads and compares every dentry.
+- Every dir data block after the first triggers an NVMe read (the
+  extent walker fetches on demand; no dentry cache at R25).
+- Rule of thumb: **~64 entries per directory before latency
+  degrades noticeably** (~4 data blocks worth of dentries, all
+  fetched through a single NVMe read pipe per lookup).
+- At the correctness ceiling (~8318 entries), a `create` inside that
+  directory blocks on ~520 NVMe reads (8320 / 16) for the EEXIST
+  scan alone — hundreds of ms even on a fast M.2 drive.
+
+The 64-entry rule of thumb matches every current R25 use case (the
+MVP shell layout has ~10 entries in `/`, ~5 in `/tmp`, ~15 in `/bin`).
+The MVP shell's `find` builtin (deferred to R28+) is the first
+consumer that would exercise the ~1000-entry range and expose the
+degradation curve.
+
+### 2.5.5 Deferred to R40+
+
+- **Indirect extents outside the R25 dir path.** The 512-extent
+  indirect block IS the only overflow in v0. Double-indirect + a
+  proper B-tree index for large directories lands with PdxFS v1
+  (CoW-PQ round, R40) per `design/filesystem/cow-design.md`. The R40
+  format changes the dentry stride and adds a hash index; the
+  correctness ceiling rises to millions of entries with sub-log(N)
+  lookup cost.
+- **Dentry cache.** A per-mount LRU of `{parent_ino, name_hash} ->
+  child_ino` reduces the linear scan to O(1) on cache hit; landed
+  with the R40 VFS-cache overhaul (or earlier if R28 MVP demo
+  exercises deep directories and the profile shows dentry-walk
+  dominance).
+- **Directory-inode locking discipline for concurrent create/lookup.**
+  R25.M6 landed the single-writer FS lock; per-directory rwlocks
+  land with R40's multi-writer path.
+
+### 2.5.6 Cross-reference
+
+- §2.3–§2.4 for the extent layout that bounds the per-inode dentry
+  count.
+- `src/kernel/core/fs/pdxfs_lite/readdir.pdx` — dentry-walk primitive
+  that this section's rule-of-thumb characterises.
+- `src/kernel/core/fs/pdxfs_lite/create.pdx` — codepath that would
+  emit `EFBIG` once writes unblock (#906).
+- `design/filesystem/cow-design.md` — R40 successor that lifts every
+  limit in this section.
+
+---
+
 ## 3. Extent bitmap (allocation)
 
 A packed bitmap starting at `extent_area_lba`. Bit `i` corresponds to data block `i` (measured in 4 KiB units). `1` = allocated, `0` = free.

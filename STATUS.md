@@ -847,3 +847,58 @@ R24 delivered the kernel-side substrate for a userspace NVMe driver on top of R2
 None (R24 ran under `qemu -kernel` throughout — no UEFI/OVMF harness yet, no MCFG surface, no PCI enumeration, no NVMe controller). No rows in `design/hardware/quirks.md` promoted `PROVISIONAL → CONFIRMED` at this pass. §2.4 (Storage + peripherals) — the `VMD` row's Handling column now cross-references `tools/nvme-hw-smoke.md §1.2.1` (the BIOS toggle is the load-bearing knob) + `tests/kernel/drivers/nvme/hw_smoke.pdx` (the witness that verifies the toggle worked). Full promotion (§2.4 → `CONFIRMED`) lands at T14 G4 NVMe first-light per the recipe at `tools/nvme-hw-smoke.md` §3.
 
 **Next Round:** R25 (PdxFS-lite persistent FS MVP + NVMe driver-attach wire-up). Zero R24 blockers.
+
+---
+
+## R25 (PdxFS-lite — persistent FS MVP + NVMe driver-attach preflight) — CLOSED 2026-08-11
+
+R25 delivered the PdxFS-lite persistent-filesystem substrate on top of R24's NVMe driver: the v0 on-disk format spec (`design/filesystem/pdxfs-lite-format.md` with 4 KiB superblock, 128 B inodes, 8 inline extents + 1 indirect, ML-DSA-65 sig scope pinned per-superblock at MVP), the superblock read + validate path (`sb_validate` + `pdxfs_lite_read_superblock` — bridges R24.M5 `nvme_read_blocking` into the sb scratch slab), UUID helpers (`sb_generate_uuid` TSC-based + `sb_uuid_match`), the inode + inline+indirect extent layer (`get_inode` / `pdxfs_read` / `pdxl_ex_alloc_first_fit`), the `mkfs.pdxfs-lite` host tool (`tools/mkfs-pdxfs-lite.sh`), the VFS wire-up (`pdxfs_lite_vops` table + `pdxfs_lite_mount` + `_pdxfs_lite_mount_ctx` + `namei.pdx` path resolution), the ML-DSA-65 sig-verify substrate with dev-mode bypass under `Features.PDXFS_DEV_KEY_ONLY = 1` (`pdxfs_sb_verify_sig` + `pdxfs_lite_pubkey_ptr` — real crypto lands at R32; corruption fixture `pdxfs_lite_corrupt_sb_witness` proves 3 cases), the mutating-op scaffolding (`create.pdx` + `unlink.pdx` + `rename.pdx` — all return `EROFS` at MVP pending `nvme_write_blocking` R24 debt #906 sibling), and the closure surface: end-to-end fixture (`tools/pdxfs-lite-e2e-smoke.md` operator recipe + `tests/kernel/fs/pdxfs_lite_e2e_witness.pdx` placeholder witness + `boot_r25_pdxfs_e2e` SKIP-echo smoke + `PAIDEIA_R25_PDXFS_E2E=1` pre-push gate), the PdxFS-lite → PdxFS v1 migration design stub (`tools/migrate-pdxfs-lite-to-v1.md` — R40-scoped tool documented here so R25 v0 format is frozen against later drift), the directory-entry limit note (`design/filesystem/pdxfs-lite-format.md §2.5`), and this closure retrospective. Pillar 6 target met at the substrate level: kernel can mount / walk / read a PdxFS-lite image; write persistence is dormant until #906 unblocks kernel-side `nvme_write_blocking` at R26.M1 (or R26.5 if xHCI scope excludes the M0 prelude). Zero R25 debt blocks R26. See `design/round-retrospectives/r25-closure.md` for the full write-up including the per-superblock vs per-extent signature open-question resolution.
+
+### Issues Implemented (30 total across 7 milestones)
+
+- **M1** (#911, #912, #913, #914) — On-disk format spec (`design/filesystem/pdxfs-lite-format.md`), superblock struct + `_pdxfs_sb` .bss anchor + `sb_validate` (`src/kernel/core/fs/pdxfs_lite/superblock.pdx`), `pdxfs_lite_read_superblock` bridging NVMe read to sb scratch (`src/kernel/core/fs/pdxfs_lite/mount.pdx`), UUID generation + match (`src/kernel/core/fs/pdxfs_lite/uuid.pdx`).
+- **M2** (#915, #916, #917, #918, #919) — Inode struct + reserved slots + `get_inode`/`put_inode` (`inode.pdx`), inline extent walker + `pdxfs_read` (`read.pdx`), indirect extent lookup (`read.pdx`), extent-bitmap first-fit allocator (`alloc.pdx`).
+- **M3** (#920, #921, #922, #923) — mkfs specification, mkfs superblock stamp, mkfs inode-table seed, mkfs dentry seed (`tools/mkfs-pdxfs-lite.sh`).
+- **M4** (#924, #925, #926, #927, #928) — `pdxfs_lite_vops` table + `pdxfs_lite_vops_init` + `_pdxfs_lite_mount_ctx` (`vops.pdx`), `pdxfs_lite_mount` (`mount_op.pdx`), `pdxfs_lite_lookup_by_name` + `pdxfs_lite_path_resolve` (`namei.pdx`), `pdxfs_read` VFS adapter (`read.pdx`).
+- **M5** (#929, #930, #931, #932) — `pdxfs_sb_verify_sig` dev-bypass body (`verify.pdx`), `pdxfs_lite_pubkey_ptr` (`pubkey.pdx`), corruption fixture (`tests/kernel/fs/pdxfs_lite_corrupt_sb.pdx` + `boot_r25_pdxfs_corrupt_sb` SKIP-echo smoke + `PAIDEIA_R25_PDXFS_CORRUPT=1` pre-push gate), mount_op sig-verify gate wire (`mount_op.pdx`).
+- **M6** (#933, #934, #935, #936) — `pdxfs_lite_create` (`create.pdx`), `pdxfs_lite_unlink` (`unlink.pdx`), `pdxfs_lite_rename` (`rename.pdx`), `put_inode` scaffolding (`inode.pdx`) — all return `EROFS` at MVP pending `nvme_write_blocking` (R24 debt #906 sibling).
+- **M7** (#937, #938, #939, #940) — End-to-end fixture (`tools/pdxfs-lite-e2e-smoke.md` + `tests/kernel/fs/pdxfs_lite_e2e_witness.pdx` + `boot_r25_pdxfs_e2e` SKIP-echo + `PAIDEIA_R25_PDXFS_E2E=1`) (#937); migration path stub (`tools/migrate-pdxfs-lite-to-v1.md`) (#938); directory-entry limit note (`design/filesystem/pdxfs-lite-format.md §2.5`) (#939); R25 closure retro (`design/round-retrospectives/r25-closure.md`) + STATUS.md entry (this block) + per-superblock-vs-per-extent signature open-question resolution + tag `r25-closed` (#940).
+
+### Cross-Repo Escalations to paideia-as (R25)
+
+**None.** `paideia-as` submodule remained pinned at `2cf169d` for all seven R25 milestones — unchanged since R21 close. Fifth consecutive round with zero cross-repo escalations. Two ambient `paideia-as-blocked` labels queued into the R25 planning sheet (v0.22 tag slice+bitfield helpers, RDRAND for UUID generation) were reviewed and downgraded on inspection as **paper tigers** — every M3/M6 site used pre-existing `mov_b`/`mov_d` sized-store idioms (same shape as R24 SQE construction); TSC-based UUID acceptable at MVP per format spec §4.1. Zero paideia-as submodule bumps across R25.
+
+### Observable Proof
+
+- Kernel builds clean under `tools/build.sh` (**15/15 gates**: no-AML lint + opcode-canary + kernel dispatch + sched guards + tty_read wrapper + link).
+- All 15 default pre-push smoke modes pass (`boot_r8_only` through `boot_smp`, incl. `boot_r14b_*` and `boot_r17_shell_*`). No new fingerprint under `-kernel` — `pdxfs_lite_mount` never runs (no NVMe controller under QEMU q35 default → no driver attach → no mount call).
+- R22 opt-in smokes pass unchanged: `PAIDEIA_R22_PCI_TREE=1 boot_r22_pci_tree`, `PAIDEIA_R22_MSIX_IR=1 boot_r22_msix_ir_round_robin` (both SKIP under `-kernel`).
+- R21 opt-in smokes pass unchanged.
+- R24 opt-in smoke passes unchanged: `PAIDEIA_R24_CONCURRENT_IO=1 boot_r24_concurrent_io` (SKIP).
+- R25 opt-in smokes:
+  - `PAIDEIA_R25_PDXFS_CORRUPT=1 boot_r25_pdxfs_corrupt_sb` — SKIP (M5; witness not wired at kernel_main).
+  - **New R25.M7 opt-in smoke:** `PAIDEIA_R25_PDXFS_E2E=1 boot_r25_pdxfs_e2e` — SKIP (M7; live E2E deferred to R26+ pending kernel-side `nvme_write_blocking` + driver-attach wire-up per `tools/pdxfs-lite-e2e-smoke.md`).
+- `nm build/kernel.elf` shows every R25 substrate symbol linked: `sb_validate`, `_pdxfs_sb` (4096 B), `pdxfs_lite_read_superblock`, `sb_generate_uuid`, `sb_uuid_match`, `get_inode`, `put_inode`, `_pdxfs_lite_inode_scratch` (128 B), `pdxfs_read`, `pdxl_ex_alloc_first_fit`, `pdxfs_lite_vops_init`, `_pdxfs_lite_vops` (56 B), `_pdxfs_lite_mount_ctx` (64 B), `pdxfs_lite_mount`, `pdxfs_lite_is_mounted`, `pdxfs_lite_mount_root_vn`, `pdxfs_lite_lookup_by_name`, `pdxfs_lite_path_resolve`, `pdxfs_sb_verify_sig`, `pdxfs_lite_pubkey_ptr`, `pdxfs_lite_corrupt_sb_witness`, `pdxfs_lite_create`, `pdxfs_lite_unlink`, `pdxfs_lite_rename`, `pdxfs_lite_e2e_witness`.
+
+### R25 Debt Carried Forward
+
+1. **`nvme_write_blocking` (kernel-side)** — R24 debt item #2 inherited; all R25 mutating ops (`create`/`unlink`/`rename`/`write`) return `EROFS` pending this. Same shape as `nvme_read_blocking` with `OPC = 0x01`. Target: R26.M1 M0 prelude (or R26.5 sub-round).
+2. **`commit_dirty_metadata` pass** — sibling of (1); no code exists. Design pass at R26.M1.
+3. **Driver-attach wire-up in `kernel_main_uefi`** — R24 debt item #4 inherited unchanged; same #1015 gate.
+4. **Real ML-DSA-65 sig verify** — dev-bypass at MVP; R32 crypto round.
+5. **Live E2E on real HW** — recipe at `tools/pdxfs-lite-e2e-smoke.md`; R26+ real HW.
+6. **`boot_r25_pdxfs_e2e` fingerprint file** — currently SKIP-echo; flips when caller wire-up lands.
+7. **Migration tool implementation** — #938 landed design stub only; tool code lands at R40 CoW-PQ round.
+8. **Directory-entry limit enforcement in `create.pdx`** — #939 landed documentation; enforcement lands with write-persistence unblock.
+9. **R24 debt items still open** (unchanged from R24 close): multi-controller support; concurrent-IO fixture body; `boot_r24_concurrent_io` fingerprint file; T14 G4 NVMe first-light.
+10. **R23 debt items still open** (unchanged from R23 close): UEFI/OVMF fb_console harness; T14 first-visual-output capture; `fb_map_lfb` BGRA assumption; `_fb_console_grid` fixed size; `k_panic_fb_banner_len` triplicate; two paideia-as encoder polish gaps.
+11. **R22 debt items still open** (unchanged from R22 close): `_vtd_base` hardcoded; `has_dmar` unpopulated; `vtd_fault_dispatch` IDT wire; `msix_enable_device`; `msix_assignments` ledger; GCMD.TE + SIRTP + IRE ceremony; DMA-fault regression SKIP → LIVE; T14 PCI/ACPI captures.
+12. **R21 debt items still open:** `hpet_now_ns` precision widening; `phase1_acpi_gather` full wire (partial at R22.M1 — MCFG only).
+
+**None regress R25 acceptance.**
+
+### Quirks Discovered on Real Hardware
+
+None (R25 ran under `qemu -kernel` throughout — no UEFI/OVMF harness yet, no MCFG surface, no PCI enumeration, no NVMe controller, no mount attempt). No rows in `design/hardware/quirks.md` promoted `PROVISIONAL → CONFIRMED` at this pass. `tools/pdxfs-lite-e2e-smoke.md §4` documents the promotion pass an R26+ operator will run when the first live-mount fires on real HW.
+
+**Next Round:** R26 (USB xHCI + HID keyboard). Zero R25 blockers. Optional R26.M0 prelude discharges the R25 write-persistence debt (`nvme_write_blocking` + `commit_dirty_metadata` + driver-attach wire) — decision to defer to R26.M1 kickoff per `design/round-retrospectives/r25-closure.md §Preflight for R26`.
