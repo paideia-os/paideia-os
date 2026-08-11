@@ -1,0 +1,384 @@
+// src/kernel/core/apic/vector_pool.pdx — R21-M4-004 (#840)
+//
+// Per-CPU MSI-X vector allocator + (BDF, entry_idx) assignment ledger.
+//
+// -----------------------------------------------------------------------------
+// Vector partitioning
+// -----------------------------------------------------------------------------
+//
+// The x86 IDT has 256 slots.  The kernel reserves:
+//
+//   0x00..0x1F  CPU exceptions (INT #DE .. #XM/#VE)
+//   0x20..0x2F  Legacy ISA IRQs 0..15 (PIT, UART, KBD, ATA, RTC, ...)
+//   0x30..0x5F  Kernel-internal IPIs and platform vectors
+//   0x60..0xEF  MSI-X allocation pool (144 slots per CPU)
+//   0xF0..0xFE  LAPIC-side IPIs (RESCHEDULE, TLB-SHOOTDOWN, ...)
+//   0xFF        Spurious
+//
+// The MSI-X pool spans 0x60..0xEF inclusive = 144 vectors per CPU.
+// We track availability per CPU with a 3-u64 bitmap (192 bits, of which
+// bit 0..143 are usable — bits 144..191 are pinned to "reserved" so
+// scan cannot accidentally hand them out).
+//
+// -----------------------------------------------------------------------------
+// Storage
+// -----------------------------------------------------------------------------
+//
+// _vector_pool_bitmap : [u64; MAX_CPUS * 3] = [u64; 12]
+//   Layout: bitmap[cpu * 3 + word] with bit i within a word representing
+//   vector (0x60 + word*64 + i).  A set bit means "allocated".
+//
+// _msix_assignments : [msix_assignment; 128]
+//   struct msix_assignment (16 B):
+//     +0  u16 seg
+//     +2  u8  bus
+//     +3  u8  dev
+//     +4  u8  func
+//     +5  u8  vector
+//     +6  u16 entry_idx
+//     +8  u32 cpu_idx
+//     +12 u32 _pad
+//
+// _msix_assignment_count : u64 (populated slot count)
+//
+// -----------------------------------------------------------------------------
+// Concurrency
+// -----------------------------------------------------------------------------
+//
+// R21.M4 call sites are all boot-time from BSP (no AP contention, no
+// preemption).  A follow-up (R23+) will wrap the allocator in the
+// spinlock primitive when hot-plug device attach lands.
+
+module VectorPool = structure {
+
+  // Vector-pool constants.
+  pub let VECTOR_POOL_BASE       : u64 = 0x60
+  pub let VECTOR_POOL_TOP        : u64 = 0xEF     // inclusive
+  pub let VECTOR_POOL_SIZE       : u64 = 144      // 0xEF - 0x60 + 1
+  pub let VECTOR_POOL_WORDS      : u64 = 3        // 192 bits reserved; 48 unused
+
+  // MAX_CPUS is defined in core/smp/percpu.pdx = 4. Hard-coded here to
+  // avoid a rip-relative load per allocation on the fast path.
+  pub let VECTOR_POOL_MAX_CPUS   : u64 = 4
+
+  pub let VECTOR_INVALID         : u64 = 0xFF     // sentinel for exhaustion
+
+  // Assignment ledger constants.
+  pub let MSIX_ASSIGN_MAX        : u64 = 128
+  pub let MSIX_ASSIGN_SIZE       : u64 = 16
+
+  // ==========================================================================
+  // Storage
+  // ==========================================================================
+
+  // 4 CPUs × 3 u64 words = 12 u64 = 96 bytes.  BSS-zero means all
+  // vectors start unallocated (bit clear).
+  pub let mut _vector_pool_bitmap : [u64; 12] = uninit @align(8)
+
+  // 128 × 16 B = 2048 bytes = 256 u64 slots.
+  pub let mut _msix_assignments   : [u64; 256] = uninit @align(8)
+  pub let mut _msix_assignment_count : u64 = 0
+
+  // ==========================================================================
+  // vector_alloc_for_cpu(cpu_idx) -> u8
+  // ==========================================================================
+  //
+  // SysV: (cpu_idx: u64) -> u64
+  //   rdi = cpu_idx (0..3)
+  //
+  // Returns rax = allocated vector (0x60..0xEF), or 0xFF (VECTOR_INVALID)
+  // on exhaustion / out-of-range cpu_idx.
+  //
+  // Scans the 3 u64 words for the cpu, finds the first zero bit within
+  // the pool (bits 0..143), sets it, returns (0x60 + bit_index).
+
+  pub let vector_alloc_for_cpu : (u64) -> u64 !{mem} @{boot} =
+    fn (cpu_idx: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R21-M4-004 (#840): scan-and-set a free bit in the per-CPU MSI-X vector bitmap. Body: (1) Bounds-check cpu_idx < VECTOR_POOL_MAX_CPUS (4); if not, return VECTOR_INVALID (0xFF). (2) Compute base word index = cpu_idx * 3. (3) Loop over 3 words: for each word (word_idx = 0..2), compute global bit range = word_idx * 64 .. (word_idx+1) * 64. If word_idx==2, cap at bit 15 (since 144 - 128 = 16 usable bits in word 2; bits 16..63 stay pinned via a mask-out). (4) For each word, load into rax; invert (via `mov r10, ~0; xor rax, r10` = NOT); AND with the usable-bits mask; if result is 0, skip to next word. Else find the lowest set bit via `bsf` — paideia-as encoder supports bsf per idt.pdx / process/ap_stacks.pdx patterns... actually let me check. If bsf isn't available, iterate manually with shift+test. Prefer manual iteration for portability. Alternative: for each bit b in 0..word_bits, if (word >> b) & 1 == 0, that's the bit → set it via `or word, 1<<b`. (5) Return 0x60 + word*64 + b. Encoder: mov, shl, shr, and, or, cmp/je/jne, ret — all pre-#840 proven.",
+      block: {
+        // Bounds check.
+        cmp rdi, 4;
+        jae vac_exhausted;
+
+        // Compute base word offset: rdi * 3 * 8 bytes = rdi * 24
+        mov rax, rdi;
+        shl rax, 3;                            // rdi * 8
+        mov r11, rax;
+        mov rax, rdi;
+        shl rax, 4;                            // rdi * 16
+        add rax, r11;                          // rdi * 24 (byte offset)
+        lea r10, [rip + _vector_pool_bitmap];
+        add r10, rax;                          // r10 = &bitmap[cpu*3]
+
+        // Iterate words 0..2 in r9.
+        xor r9, r9;                            // word_idx = 0
+
+      vac_word_loop:
+        cmp r9, 3;
+        jae vac_exhausted;
+
+        // Load word at r10 + r9*8 into r8.
+        mov r11, r9;
+        shl r11, 3;                            // word_idx * 8 bytes
+        mov r8, [r10 + r11 * 1];
+
+        // Iterate bits 0..63 within the word.
+        xor rcx, rcx;                          // bit_idx = 0
+
+      vac_bit_loop:
+        cmp rcx, 64;
+        jae vac_next_word;
+
+        // Compute global bit index = word*64 + bit.
+        mov rax, r9;
+        shl rax, 6;                            // word * 64
+        add rax, rcx;
+
+        // Skip bits >= VECTOR_POOL_SIZE (144).
+        cmp rax, 144;
+        jae vac_next_word;
+
+        // Test bit rcx of r8: (r8 >> rcx) & 1.
+        mov rdx, r8;
+        mov r11, rcx;                          // shift amount into cl (via r11 → cl)
+        mov rax, r11;
+        // Move r11 to cl for shr-by-cl.
+        // (In paideia-as: rcx already holds the shift amount, but we're
+        //  overwriting rcx as the bit counter. Use `mov cl, r11b`... but
+        //  paideia-as syntax uses full-reg or lo-8 mnemonics. Simpler:
+        //  keep bit counter in a different reg and reserve rcx for shift.)
+        // -- redo with rcx as the shift counter (bit_idx) --
+
+        // Instead: use a mask.  mask = 1 << rcx.  Build via `mov rax, 1;
+        // shl rax, cl`.  cl already holds rcx's low byte since rcx is
+        // the loop counter.
+        mov rax, 1;
+        shl rax, cl;
+        mov rdx, r8;
+        and rdx, rax;                          // rdx = bit isolated
+        cmp rdx, 0;
+        jne vac_bit_next;                      // set → occupied, skip
+
+        // Bit is FREE. Mark it: r8 |= (1 << cl).
+        or r8, rax;
+        // Store back the word.
+        mov r11, r9;
+        shl r11, 3;
+        mov [r10 + r11 * 1], r8;
+
+        // Compute vector = 0x60 + word*64 + bit.
+        mov rax, r9;
+        shl rax, 6;
+        add rax, rcx;
+        add rax, 0x60;
+        ret;
+
+      vac_bit_next:
+        add rcx, 1;
+        jmp vac_bit_loop;
+
+      vac_next_word:
+        add r9, 1;
+        jmp vac_word_loop;
+
+      vac_exhausted:
+        mov rax, 0xFF;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // vector_free_for_cpu(cpu_idx, vector) -> ()
+  // ==========================================================================
+  //
+  // SysV: (cpu_idx: u64, vector: u64) -> ()
+  //   rdi = cpu_idx, rsi = vector (0x60..0xEF)
+  //
+  // Clears the bit for `vector` in the per-CPU bitmap.  Silent no-op if
+  // cpu_idx is out of range or vector is outside the MSI-X pool.
+
+  pub let vector_free_for_cpu : (u64, u64) -> () !{mem} @{boot} =
+    fn (cpu_idx: u64, vector: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R21-M4-004 (#840): clear a per-CPU MSI-X vector bit. Body: (1) Bounds-check cpu_idx < 4. (2) Bounds-check vector in [0x60, 0xEF]. (3) global_bit = vector - 0x60; word = global_bit / 64; bit = global_bit & 63. (4) Load word, clear bit via `mov rax, 1; shl rax, cl; mov r10, ~0; xor rax, r10; and word, rax`. Actually simpler: clear via `not` synthesized as XOR-with-all-ones. Or use the ioapic_unmask pattern: `mov rax, 0xFFFFFFFFFFFFFFFE; rol rax, cl; and word, rax`. paideia-as v0.20.1+ supports rol per... hmm may not. Safer: build the inverse mask via subtraction from 0xFFFFFFFFFFFFFFFF. Actually cleanest: mov rax, 1; shl rax, cl; mov r11, 0xFFFFFFFFFFFFFFFF; xor rax, r11; and word, rax. Encoder: XOR reg,reg proven throughout.",
+      block: {
+        // Bounds: cpu < 4.
+        cmp rdi, 4;
+        jae vf_done;
+
+        // Bounds: 0x60 <= vector <= 0xEF.
+        cmp rsi, 0x60;
+        jb vf_done;
+        cmp rsi, 0xEF;
+        ja vf_done;
+
+        // global_bit = vector - 0x60
+        sub rsi, 0x60;
+
+        // word_idx = global_bit / 64
+        mov r9, rsi;
+        shr r9, 6;
+
+        // bit_idx = global_bit & 63 → rcx (for shl cl)
+        mov rcx, rsi;
+        and rcx, 63;
+
+        // base = &_vector_pool_bitmap + cpu*24
+        mov rax, rdi;
+        shl rax, 3;
+        mov r11, rax;
+        mov rax, rdi;
+        shl rax, 4;
+        add rax, r11;
+        lea r10, [rip + _vector_pool_bitmap];
+        add r10, rax;
+
+        // Load target word.
+        mov r11, r9;
+        shl r11, 3;
+        mov r8, [r10 + r11 * 1];
+
+        // Build inverse mask: mask = ~(1 << bit)
+        mov rax, 1;
+        shl rax, cl;
+        mov rdx, 0xFFFFFFFFFFFFFFFF;
+        xor rax, rdx;
+
+        // Clear bit.
+        and r8, rax;
+
+        // Store back.
+        mov [r10 + r11 * 1], r8;
+
+      vf_done:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // msix_assign_at(table_pa, seg, bus, dev, func, entry_idx, cpu_idx) -> u8
+  // ==========================================================================
+  //
+  // Test-friendly / boot-flexible variant that takes a pre-mapped
+  // table_pa directly (rather than looking it up via msix_map_table).
+  // Allocates a vector for cpu_idx, programs the MSI-X entry (unmasked),
+  // and appends (seg, bus, dev, func, entry_idx, cpu_idx, vector) to
+  // the assignments ledger.
+  //
+  // SysV: (table_pa, seg, bus, dev, func, entry_idx, cpu_idx) -> u64
+  //   That's 7 args — but SysV register slots run out at 6.
+  //   Pack table_pa and cpu_idx into r9's high/low? No — cleaner to
+  //   drop `seg` from this fast-path variant and require the caller
+  //   to record the tuple after the fact if they want the ledger to
+  //   include seg.  We keep seg in msix_assign (the higher-level
+  //   wrapper) which looks up table_pa on the fly.
+  //
+  // Revised SysV: (table_pa, bus, dev, func, entry_idx, cpu_idx) -> u64
+  //   rdi=table_pa, rsi=bus, rdx=dev, rcx=func, r8=entry_idx, r9=cpu_idx
+  //   (seg is not tracked in this variant — caller supplies seg=0 in
+  //   the ledger record by convention; multi-segment PCI is R23+ scope
+  //   for MSI-X allocation tracking).
+
+  pub let msix_assign_at : (u64, u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (table_pa: u64, bus: u64, dev: u64, func: u64, entry_idx: u64, cpu_idx: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R21-M4-004 (#840): allocate a vector for cpu_idx, program the MSI-X entry (unmasked, Fixed/edge/physical), and record the assignment. Body: (1) 6-push callee-save + `sub rsp, 8` for align. 6 pushes = 48; sub 8 = 56; entry rsp%16==8 → 64, %16=0. (2) Save args: r12=table_pa, r13=bus, r14=dev, r15=func, rbx=entry_idx, rbp=cpu_idx. (3) Call vector_alloc_for_cpu(cpu_idx). If == 0xFF (exhausted), return 0xFF. (4) Save vector in rsi (caller-save; will be re-read from a stack slot). Actually keep in a scratch stack slot [rsp+0]. (5) Call msix_program_entry(table_pa=r12, entry_idx=rbx, vector=rax, dest_apic_id=cpu_idx=rbp, mask=0) — dest_apic_id equals cpu_idx for the identity APIC-ID mapping paideia-os uses (BSP=0, AP=1..3). This is a simplification; for topology_seed_from_madt-populated tables, the mapping is percpu[cpu_idx].apic_id. Deferred to R21.M4 hardening (see follow-up in the M4 close commit). (6) Append to _msix_assignments ledger at index [_msix_assignment_count]. Bounds-check MSIX_ASSIGN_MAX. Bump count. (7) Return vector in rax.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;                            // [rsp+0] = vector scratch
+
+        mov r12, rdi;                          // table_pa
+        mov r13, rsi;                          // bus
+        mov r14, rdx;                          // dev
+        mov r15, rcx;                          // func
+        mov rbx, r8;                           // entry_idx
+        mov rbp, r9;                           // cpu_idx
+
+        // ---- (3) Allocate vector ----
+        mov rdi, rbp;
+        call vector_alloc_for_cpu;
+
+        cmp rax, 0xFF;
+        je ma_exhausted;
+
+        mov [rsp + 0], rax;                    // save vector
+
+        // ---- (5) Program the MSI-X entry ----
+        //   msix_program_entry(table_pa, entry_idx, vector, dest, mask)
+        mov rdi, r12;
+        mov rsi, rbx;
+        mov rdx, [rsp + 0];                    // vector
+        mov rcx, rbp;                          // dest = cpu_idx (APIC-id identity mapping)
+        mov r8, 0;                             // mask = 0 (unmasked)
+        call msix_program_entry;
+
+        // ---- (6) Append to ledger ----
+        mov r10, [rip + _msix_assignment_count];
+        cmp r10, 128;                          // MSIX_ASSIGN_MAX
+        jae ma_skip_ledger;
+
+        // Compute record address = &_msix_assignments + r10 * 16
+        mov rax, r10;
+        shl rax, 4;
+        lea r11, [rip + _msix_assignments];
+        add r11, rax;
+
+        // seg (u16 @ +0) = 0
+        xor rax, rax;
+        mov_w [r11 + 0], rax;
+
+        // bus (u8 @ +2)
+        mov_b [r11 + 2], r13;
+
+        // dev (u8 @ +3)
+        mov_b [r11 + 3], r14;
+
+        // func (u8 @ +4)
+        mov_b [r11 + 4], r15;
+
+        // vector (u8 @ +5)
+        mov rax, [rsp + 0];
+        mov_b [r11 + 5], rax;
+
+        // entry_idx (u16 @ +6)
+        mov_w [r11 + 6], rbx;
+
+        // cpu_idx (u32 @ +8)
+        mov_d [r11 + 8], rbp;
+
+        // _pad (u32 @ +12) = 0
+        xor rax, rax;
+        mov_d [r11 + 12], rax;
+
+        // Bump count.
+        add r10, 1;
+        mov [rip + _msix_assignment_count], r10;
+
+      ma_skip_ledger:
+        mov rax, [rsp + 0];                    // return vector
+        jmp ma_done;
+
+      ma_exhausted:
+        mov rax, 0xFF;
+
+      ma_done:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}

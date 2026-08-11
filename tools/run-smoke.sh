@@ -384,6 +384,46 @@ case "${EXPECTED}" in
         SMP_UNORDERED_HELLO=1
         EXPECTED=""
         ;;
+    boot_r21_msix_round_robin)
+        # R21-M4-005 (#841): MSI-X round-robin structural smoke.
+        #
+        # Kernel wire-in (src/kernel/boot/kernel_main.pdx, immediately
+        # after ioapic_reroute_witness): unconditional call to
+        # msix_round_robin_witness (tests/kernel/apic/msix_round_robin.pdx).
+        # The witness allocates one MSI-X vector per CPU (0..3) via
+        # vector_alloc_for_cpu, programs a fabricated 16-entry MSI-X table
+        # via msix_program_entry (through the msix_assign_at bookkeeping
+        # wrapper), and verifies the 4 × u32 entry fields byte-for-byte.
+        # Emits "MSIX ROUND ROBIN OK\n" on pass.
+        #
+        # Fingerprint contract:
+        #   SMP BRINGUP DONE
+        #   IOAPIC REROUTE STRUCT OK
+        #   MSIX ROUND ROBIN OK
+        # The two witnesses run back-to-back, both inside the boot cli
+        # window; SMP BRINGUP DONE anchors the ordering.
+        #
+        # Zero real-MMIO side effects — writes only to the .bss-backed
+        # _fake_msix_table.  Uses per-CPU vector-pool bitmaps that stay
+        # populated post-witness (bit 0 of word 0 in each CPU's pool),
+        # so a follow-up allocator call at boot time would hand out
+        # vector 0x61.  This is not currently a problem because M4 has
+        # no other MSI-X allocation call sites at boot; when driver-plane
+        # MSI-X consumers land (R23+), the witness needs to either
+        # release its allocations or run pre-driver-plane.
+        #
+        # Opt-in only (guarded by PAIDEIA_R21_MSIX=1 in pre-push): this
+        # is targeted R21.M4 validation, not a core boot smoke.  The
+        # OK fingerprint appears in EVERY boot log (the witness is
+        # unconditionally wired) but only this mode asserts its presence.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r21/expected-msix-round-robin.txt"
+        TIMEOUT=10
+        SMP_MODE=1
+        SMP_CPU_COUNT=4
+        SMP_UNORDERED_HELLO=1
+        EXPECTED=""
+        ;;
     boot_r21_ioapic_reroute)
         # R21-M3-004 (#836): IOAPIC re-route structural smoke.
         #
