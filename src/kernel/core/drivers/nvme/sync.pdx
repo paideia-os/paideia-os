@@ -1,0 +1,289 @@
+// src/kernel/core/drivers/nvme/sync.pdx — R24-M5-004 / #906 (partial)
+//
+// Kernel-side request table + synchronous read wrapper for the NVMe
+// driver.
+//
+// -----------------------------------------------------------------------------
+// Scope (#906 is BLOCKED)
+// -----------------------------------------------------------------------------
+//
+// Issue #906 asks for a *userspace* synchronous read/write API + request
+// table. The userspace half depends on the userspace-server substrate
+// (#1015 — same blocker as #820 acpi_supervisor, #860 pci_enumerator).
+//
+// This module lands the kernel-side pieces that don't require #1015:
+//
+//   (1) _nvme_requests[128] — the per-CID request slot table walked
+//       by irq.pdx §nvme_irq_handler_qid (M5-001 / #903) to signal
+//       completion.
+//
+//   (2) nvme_read_blocking(nsid, lba, count, buf_pa) -> u16 — a
+//       kernel-only synchronous NVMe Read (OPC=0x02) that allocates
+//       a CID slot, submits, busy-waits on completion_flag, and
+//       returns the CQE status.
+//
+// The userspace RPC layer (blkdev_supervisor + client stubs) is
+// deferred to #1015 unblock. See design/ipc/blkdev-rpc-schema.md
+// for the intended wire format.
+//
+// -----------------------------------------------------------------------------
+// Request table layout (16 B stride, 128 entries → 2 KiB total)
+// -----------------------------------------------------------------------------
+//
+//   +0    u16 cid              — controller-visible CID (== slot idx at M5)
+//   +2    u16 completion_flag  — 0 = pending, 1 = complete
+//   +4    u32 blocked_task     — TCB pointer (stubbed at M5; live on #1015)
+//   +8    u16 user_status      — CQE.Status without Phase bit
+//   +10   u16 _pad0
+//   +12   u32 _pad1            — pad to 16-byte stride
+//
+// CID slot allocation at M5 is trivial: nvme_read_blocking uses a
+// monotonically-bumped _nvme_next_cid counter modulo the table size,
+// wrapping when needed. Concurrent-64-in-flight allocation lands
+// with the userspace-server substrate.
+//
+// -----------------------------------------------------------------------------
+// NVMe Read command (OPC=0x02, §5.11)
+// -----------------------------------------------------------------------------
+//
+//   OPC   = 0x02
+//   NSID  = nsid
+//   CID   = allocated slot idx
+//   PRP1  = buf_pa (page-aligned or with legal offset)
+//   PRP2  = 0 (single-page transfer at M5; multi-page via PRP list is
+//              R25+ once the userspace RPC layer needs it)
+//   CDW10 = LBA[31:0]
+//   CDW11 = LBA[63:32]
+//   CDW12 = (count - 1) & 0xFFFF  (NLB — 0-based)
+//
+// The single-page transfer restriction limits the M5 API to <= 4 KiB
+// transfers regardless of LBA size. That covers sector 0 round-trip
+// (issue #906 acceptance criterion) trivially.
+//
+// -----------------------------------------------------------------------------
+// R24.M5 posture: dormant at boot
+// -----------------------------------------------------------------------------
+//
+// Under -kernel/BIOS boot the driver-attach path never runs, so the
+// dispatch path (nvme_submit_io_cmd, nvme_irq_handler_qid) is dormant
+// and the request table remains all-zero. The functions are symbol-
+// existence + link-cleanliness surface at M5.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: sized stores via mov_b / mov_w / mov_d.
+//   G4: full-register compares.
+//
+// Reserved-label discipline: labels prefixed `nvme_sy_`.
+
+module Sync = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  pub let NVME_SYNC_REQUEST_MAX       : u64 = 128
+  pub let NVME_SYNC_REQUEST_STRIDE    : u64 = 16
+  pub let NVME_SYNC_OPC_READ          : u64 = 0x02
+  pub let NVME_SYNC_OPC_WRITE         : u64 = 0x01
+
+  // Busy-wait ceiling on completion_flag (M5: no scheduler-blocking
+  // primitive yet — see spec R25-ish). ~30 ns per store-buffered read
+  // of completion_flag, 50M iters ~ 1.5 s wall-clock. NVMe Read command
+  // latency budget is orders of magnitude lower; the counter is a
+  // sentinel for "controller has hung — driver should escalate to
+  // Abort" (see errors.pdx §nvme_abort_cmd).
+  pub let NVME_SYNC_SPIN_MAX          : u64 = 50000000
+
+  pub let NVME_SYNC_TIMEOUT           : u64 = 0xFFFF
+
+  // ============================================================================
+  // Request table — .bss, @align(8)
+  // ============================================================================
+  //
+  //   _nvme_requests : 128 × 16 B = 2048 B = 256 × u64.
+
+  pub let mut _nvme_requests          : [u64; 256] = uninit @align(8)
+
+  // ============================================================================
+  // CID allocator — monotonic bump modulo NVME_SYNC_REQUEST_MAX.
+  //
+  // Real concurrent-safe allocation (bitmap + lock_or_atomic) lands
+  // with #1015 unblock; M5's single-caller kernel path is sufficient
+  // for the sector-0 round-trip fixture.
+  // ============================================================================
+
+  pub let mut _nvme_next_cid          : u64 = 0
+
+  // ============================================================================
+  // nvme_read_blocking(nsid, lba, count, buf_pa) -> u64
+  // ============================================================================
+  //
+  // SysV: (nsid: u64, lba: u64, count: u64, buf_pa: u64) -> u64
+  //   rdi = namespace identifier (u32 semantics)
+  //   rsi = starting LBA (u64)
+  //   rdx = number of blocks (1-based; count-1 encoded into CDW12)
+  //   rcx = physical address of destination buffer
+  //
+  // Returns rax = 16-bit CQE status. Success = (status & 0xFFFE) == 0.
+  // NVME_SYNC_TIMEOUT (0xFFFF) on completion-flag timeout.
+  //
+  // Body:
+  //   (1) Allocate CID = _nvme_next_cid++ mod 128.
+  //   (2) Zero _nvme_requests[cid], stamp cid, completion_flag=0.
+  //   (3) Build a 64-byte SQE image in the admin SQE scratch:
+  //         OPC   = 0x02
+  //         CID   (u16 @+2)
+  //         NSID  = nsid
+  //         PRP1  = buf_pa
+  //         CDW10 = LBA[31:0]
+  //         CDW11 = LBA[63:32]
+  //         CDW12 = (count - 1) & 0xFFFF
+  //   (4) nvme_submit_io_cmd(sqe_ptr) — enqueues into the current
+  //       CPU's IO SQ and rings the doorbell.
+  //   (5) Busy-wait until _nvme_requests[cid].completion_flag == 1
+  //       or NVME_SYNC_SPIN_MAX iterations exhausted.
+  //   (6) Return user_status (or NVME_SYNC_TIMEOUT).
+  //
+  // Register plan (6-push callee-save + 8 pad):
+  //   rbx = nsid   (preserved across call)
+  //   rbp = lba
+  //   r12 = count
+  //   r13 = buf_pa
+  //   r14 = cid    (allocated slot idx)
+  //   r15 = &_nvme_requests[cid]
+  //
+  //   6 pushes = 48 B; entry rsp%16==8 → 56, sub rsp,8 → 64, %16==0
+  //   (aligned for nvme_submit_io_cmd).
+
+  pub let nvme_read_blocking : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (nsid: u64, lba: u64, count: u64, buf_pa: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R24-M5-004 (#906 partial). Kernel-side synchronous NVMe Read (OPC=0x02) — allocates a CID slot, builds an SQE image in _nvme_admin_sqe_scratch (reused as SQE scratch buffer at M5 since the IO path is dormant), submits via nvme_submit_io_cmd, busy-waits on _nvme_requests[cid].completion_flag, returns CQE status. Body: (1) 6-push callee-save prologue (rbx=nsid, rbp=lba, r12=count, r13=buf_pa, r14=cid, r15=&req) — 48 B; entry rsp%16==8 → 56, sub rsp,8 → 64, %16==0 (aligned for nvme_submit_io_cmd). (2) Allocate CID: load _nvme_next_cid into rax; new_cid = rax; next = (rax+1) & 127 (NVME_SYNC_REQUEST_MAX-1 = 127); store back. Save cid in r14. (3) Compute r15 = &_nvme_requests + cid*16 via `mov rax,r14; shl rax,4; lea r15, [rip+_nvme_requests]; add r15, rax`. (4) Zero the 16-byte req slot (two u64 stores). Stamp cid (u16 @+0) via mov_w. completion_flag (u16 @+2) already zero. (5) Build SQE at _nvme_admin_sqe_scratch (repurposed at M5 — the admin path is single-shot and dormant, and IO SQE also fits in 64 B). Zero via rep_stosb 64 B. OPC (u8 @+0) = 0x02. CID (u16 @+2) = r14. NSID (u32 @+4) = rbx. PRP1 (u64 @+24) = r13. CDW10 (u32 @+40) = LBA[31:0] = rbp low 32 bits. CDW11 (u32 @+44) = LBA[63:32] = rbp high 32 bits. CDW12 (u32 @+48) = (count - 1) & 0xFFFF. (6) Submit via nvme_submit_io_cmd(sqe_ptr = lea scratch). Return value in rax discarded — we use completion_flag to track status. (7) Busy-wait loop `nvme_sy_wait`: init r10 = NVME_SYNC_SPIN_MAX; check `xor rax,rax; mov_w rax, [r15 + 2]` (completion_flag); if rax == 1 → break with user_status = mov_w rax, [r15 + 8]; else dec r10; if r10 == 0 → return NVME_SYNC_TIMEOUT. (8) Return status. Callee-save preserved across nvme_submit_io_cmd per SysV. Reserved labels: `nvme_sy_`. Encoder posture: sized loads/stores (mov_b/mov_w/mov_d) throughout to avoid G1 width-widening.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // nsid
+        mov rbp, rsi;                            // lba
+        mov r12, rdx;                            // count
+        mov r13, rcx;                            // buf_pa
+
+        // ================================================================
+        // (2) Allocate CID.
+        // ================================================================
+        mov rax, [rip + _nvme_next_cid];
+        mov r14, rax;                            // r14 = cid = old counter
+        add rax, 1;
+        and rax, 127;                            // & (NVME_SYNC_REQUEST_MAX - 1)
+        mov [rip + _nvme_next_cid], rax;
+
+        // ================================================================
+        // (3) req = &_nvme_requests + cid * 16.
+        // ================================================================
+        mov rax, r14;
+        shl rax, 4;
+        lea r15, [rip + _nvme_requests];
+        add r15, rax;
+
+        // ================================================================
+        // (4) Zero the 16-byte slot + stamp cid.
+        // ================================================================
+        xor rax, rax;
+        mov [r15 + 0], rax;
+        mov [r15 + 8], rax;
+
+        // cid (u16 @+0) = r14
+        mov_w [r15 + 0], r14;
+
+        // completion_flag (u16 @+2) already zero from above.
+
+        // ================================================================
+        // (5) Build SQE at _nvme_admin_sqe_scratch (reused, see justification).
+        // ================================================================
+        lea rdi, [rip + _nvme_admin_sqe_scratch];
+        xor rax, rax;
+        mov rcx, 64;
+        cld;
+        rep_stosb;
+
+        lea r10, [rip + _nvme_admin_sqe_scratch];
+
+        // OPC (u8 @+0) = 0x02
+        mov rax, 2;
+        mov_b [r10 + 0], rax;
+
+        // CID (u16 @+2) = r14
+        mov_w [r10 + 2], r14;
+
+        // NSID (u32 @+4) = rbx
+        mov_d [r10 + 4], rbx;
+
+        // PRP1 (u64 @+24) = buf_pa
+        mov [r10 + 24], r13;
+
+        // CDW10 (u32 @+40) = LBA[31:0]
+        mov_d [r10 + 40], rbp;
+
+        // CDW11 (u32 @+44) = LBA[63:32]
+        mov rax, rbp;
+        shr rax, 32;
+        mov_d [r10 + 44], rax;
+
+        // CDW12 (u32 @+48) = (count - 1) & 0xFFFF
+        mov rax, r12;
+        sub rax, 1;
+        and rax, 0xFFFF;
+        mov_d [r10 + 48], rax;
+
+        // ================================================================
+        // (6) Submit.
+        // ================================================================
+        lea rdi, [rip + _nvme_admin_sqe_scratch];
+        call nvme_submit_io_cmd;
+
+        // ================================================================
+        // (7) Busy-wait on completion_flag.
+        // ================================================================
+        mov r10, 50000000;                       // NVME_SYNC_SPIN_MAX
+
+      nvme_sy_wait:
+        xor rax, rax;
+        mov_w rax, [r15 + 2];                    // completion_flag
+        cmp rax, 1;
+        je nvme_sy_done;
+
+        sub r10, 1;
+        cmp r10, 0;
+        je nvme_sy_timeout;
+        jmp nvme_sy_wait;
+
+      nvme_sy_done:
+        // Return user_status (u16 @+8).
+        xor rax, rax;
+        mov_w rax, [r15 + 8];
+        jmp nvme_sy_ret;
+
+      nvme_sy_timeout:
+        mov rax, 0xFFFF;                         // NVME_SYNC_TIMEOUT
+
+      nvme_sy_ret:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}

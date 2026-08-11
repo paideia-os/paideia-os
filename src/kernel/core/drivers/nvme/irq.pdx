@@ -1,0 +1,244 @@
+// src/kernel/core/drivers/nvme/irq.pdx — R24-M5-001 / #903
+//
+// NVMe IO completion queue IRQ walker.
+//
+// -----------------------------------------------------------------------------
+// Contract
+// -----------------------------------------------------------------------------
+//
+// nvme_irq_handler_qid(qid) is the per-queue handler invoked by the
+// eventual per-CPU MSI-X ISR trampoline. It walks the CQ for `qid`
+// starting at the descriptor's cq_head, consumes every completed CQE
+// (identified via the Phase Tag transition per NVMe §4.6.1), matches
+// each CID to an in-flight entry in _nvme_requests, marks that entry
+// complete, and rings CQnHDBL when done.
+//
+// -----------------------------------------------------------------------------
+// IDT-wire posture (R24.M5)
+// -----------------------------------------------------------------------------
+//
+// The handler is a callable symbol at M5 but IS NOT installed in the
+// IDT. Per-CPU IDT vector installation for a driver-side handler is
+// R22.M5 substrate work that was DEFERRED to R23 and now trails into
+// R24+ (no closed issue yet — see the M5 partial-close note in
+// design/round-retrospectives/r24-m5-partial.md). The M5 acceptance
+// surface here is symbol existence + CQ-walk correctness on synthetic
+// input; the ISR-to-notification bridge (which posts the R_NOTIFY_SEND
+// signal on the paired badge) lands when #1015 unblocks and the
+// userspace-server substrate exposes an IRQ endpoint.
+//
+// -----------------------------------------------------------------------------
+// CQE layout (NVMe Base Spec 2.0 §4.6, Figure 92)
+// -----------------------------------------------------------------------------
+//
+//   +0..3   u32  DW0            — command-specific
+//   +4..7   u32  DW1            — command-specific
+//   +8..9   u16  SQ head ptr
+//   +10..11 u16  SQ identifier
+//   +12..13 u16  CID
+//   +14..15 u16  Status         — bit 0 = P (phase), bits 1..15 = SC/SCT/M/DNR
+//
+// The Phase Tag toggles each queue wrap. The CQ starts with cq_phase=1
+// (matching io_queue.pdx §nvme_create_all_io_cqs). A CQE has been
+// posted iff its status.P == cq_phase.
+//
+// -----------------------------------------------------------------------------
+// Request table
+// -----------------------------------------------------------------------------
+//
+// _nvme_requests[128] provides CID slot 0..127. Entry stride = 16 B
+// (matches sync.pdx §nvme_read_blocking):
+//
+//   +0    u16 cid              — controller-visible CID (== slot idx at M5)
+//   +2    u16 completion_flag  — 0 = pending, 1 = complete
+//   +4    u32 blocked_task     — TCB pointer (M5 stubbed; live on #1015)
+//   +8    u16 user_status      — CQE.Status without Phase bit
+//   +10   u16 _pad0
+//   +12   u32 _pad1            — pad to 16-byte stride
+//
+// The table lives in sync.pdx alongside the read_blocking wrapper so
+// callers don't need to walk two headers.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: u16 loads/stores via mov_w (zero-extend after xor).
+//   G4: full-register compares.
+//
+// Reserved-label discipline: labels prefixed `nvme_ih_`.
+
+module Irq = structure {
+
+  // ============================================================================
+  // Constants (mirror io_queue.pdx / queue.pdx)
+  // ============================================================================
+  //
+  // Queue depth = NVME_IO_QUEUE_ENTRIES (64). Wrap mask = size - 1 = 63.
+  // CQE size = 16 B.
+
+  pub let NVME_IH_QUEUE_MASK      : u64 = 63     // = NVME_IO_QUEUE_ENTRIES - 1
+  pub let NVME_IH_CQE_SIZE        : u64 = 16
+  pub let NVME_IH_REQUEST_STRIDE  : u64 = 16     // matches sync.pdx entry layout
+  pub let NVME_IH_REQUEST_MAX     : u64 = 128    // CID slot count
+
+  // ============================================================================
+  // nvme_irq_handler_qid(qid) -> u64
+  // ============================================================================
+  //
+  // SysV: (qid: u64) -> u64
+  //   rdi = queue identifier (1..NVME_IO_MAX_QUEUES; qid=0 is admin,
+  //         handled separately by the admin poll path).
+  //
+  // Returns rax = number of CQEs consumed on this IRQ.
+  //
+  // Body:
+  //   (1) desc = &_nvme_io_queues + (qid - 1) * NVME_IO_DESC_SIZE (32).
+  //   (2) Load cq_pa (u64 @+0), cq_head (u16 @+20), cq_phase (u8 @+23).
+  //   (3) Walk loop:
+  //         cqe = cq_pa + cq_head * 16
+  //         status = *(u16*)(cqe + 14)
+  //         if (status & 1) != cq_phase → break (no more completions)
+  //         cid = *(u16*)(cqe + 12)
+  //         if cid < NVME_IH_REQUEST_MAX:
+  //           req = &_nvme_requests + cid * 16
+  //           *(u16*)(req + 8) = status & 0xFFFE      // user_status w/o phase
+  //           *(u16*)(req + 2) = 1                    // completion_flag
+  //         cq_head = (cq_head + 1) & 63
+  //         if cq_head == 0: cq_phase ^= 1
+  //         count++
+  //   (4) Persist cq_head (u16 @+20) and cq_phase (u8 @+23).
+  //   (5) If count > 0: nvme_ring_cq(_nvme_current_bar0, qid, cq_head).
+  //   (6) Return count.
+  //
+  // Register plan (6-push callee-save + 8 B align):
+  //   rbx = desc,  rbp = qid (preserved for the doorbell call),
+  //   r12 = cq_pa, r13 = cq_head, r14 = cq_phase, r15 = count
+  //
+  //   6 pushes = 48 B; entry rsp%16==8 → 56, sub rsp,8 → 64, %16==0
+  //   (aligned for nvme_ring_cq).
+
+  pub let nvme_irq_handler_qid : (u64) -> u64 !{sysreg, mem} @{} =
+    fn (qid: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R24-M5-001 (#903). NVMe IO CQ IRQ walker. Body: (1) 6-push callee-save prologue (rbx=desc, rbp=qid, r12=cq_pa, r13=cq_head, r14=cq_phase, r15=count) — 48 B; entry rsp%16==8 → 56, sub rsp,8 → 64, %16==0 (aligned for nested nvme_ring_cq call). (2) Compute desc = &_nvme_io_queues + (qid - 1) * 32 via `mov rax,rdi; sub rax,1; shl rax,5; lea rbx, [rip+_nvme_io_queues]; add rbx, rax`. Save qid in rbp before the sub. (3) Load cq_pa (u64 @+0) into r12, cq_head (u16 @+20) into r13 via `xor r13,r13; mov_w r13, [rbx+20]`, cq_phase (u8 @+23) into r14 via `xor r14,r14; mov_b r14, [rbx+23]`. Init r15=0 (count). (4) Walk loop `nvme_ih_walk`: cqe = cq_pa + cq_head*16 via `mov rax,r13; shl rax,4; add rax,r12`. Load status (u16 @+14) via `xor rcx,rcx; mov_w rcx, [rax+14]`. Compute status_phase = rcx & 1 via `mov r10,rcx; and r10,1`. Compare r10 vs r14 (expected phase); if unequal → break (no more completions this pass). Load cid (u16 @+12) via `xor rdx,rdx; mov_w rdx, [rax+12]`. CID range check: cmp rdx, 128 (NVME_IH_REQUEST_MAX); jae skip_req. Compute req = &_nvme_requests + cid*16 via `mov r8,rdx; shl r8,4; lea r9, [rip+_nvme_requests]; add r9,r8`. Store user_status = status & 0xFFFE (strip phase bit) via `mov r11,rcx; and r11,0xFFFE; mov_w [r9+8], r11`. Store completion_flag=1 via `mov r11,1; mov_w [r9+2], r11`. Fall through to advance cursor. Skip_req: still advance cursor. Advance cq_head = (cq_head + 1) & 63 via `add r13,1; and r13,63`. Toggle cq_phase on wrap: cmp r13, 0; jne no_wrap; xor r14, 1. no_wrap: inc r15; jmp walk. (5) Loop exit `nvme_ih_done`: persist cq_head (u16 @+20) via `mov_w [rbx+20], r13`, cq_phase (u8 @+23) via `mov_b [rbx+23], r14`. (6) If r15 > 0: nvme_ring_cq(_nvme_current_bar0=rdi, qid=rsi, cq_head=rdx). rbp holds the original qid. (7) Return r15 (count) in rax. Encoder: u16 sized load/store via mov_w (proven in identify_ns.pdx / io_queue.pdx). u8 sized store via mov_b. Callee-save preserved across nvme_ring_cq per SysV. Reserved labels: `nvme_ih_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;                              // 16B align for nested call
+
+        mov rbp, rdi;                            // rbp = qid (preserved)
+
+        // ================================================================
+        // (2) desc = &_nvme_io_queues + (qid - 1) * 32.
+        // ================================================================
+        mov rax, rdi;
+        sub rax, 1;
+        shl rax, 5;                              // * NVME_IO_DESC_SIZE
+        lea rbx, [rip + _nvme_io_queues];
+        add rbx, rax;
+
+        // ================================================================
+        // (3) Load cq_pa, cq_head, cq_phase.
+        // ================================================================
+        mov r12, [rbx + 0];                      // cq_pa
+
+        xor r13, r13;
+        mov_w r13, [rbx + 20];                   // cq_head
+
+        xor r14, r14;
+        mov_b r14, [rbx + 23];                   // cq_phase
+
+        xor r15, r15;                            // count = 0
+
+      nvme_ih_walk:
+        // cqe = cq_pa + cq_head * 16
+        mov rax, r13;
+        shl rax, 4;
+        add rax, r12;
+
+        // status (u16 @+14) → rcx
+        xor rcx, rcx;
+        mov_w rcx, [rax + 14];
+
+        // status_phase = rcx & 1; compare to expected phase (r14)
+        mov r10, rcx;
+        and r10, 1;
+        cmp r10, r14;
+        jne nvme_ih_done;
+
+        // cid (u16 @+12) → rdx
+        xor rdx, rdx;
+        mov_w rdx, [rax + 12];
+
+        // Bound-check cid against NVME_IH_REQUEST_MAX (128).
+        cmp rdx, 128;
+        jae nvme_ih_skip_req;
+
+        // req = &_nvme_requests + cid * 16
+        mov r8, rdx;
+        shl r8, 4;
+        lea r9, [rip + _nvme_requests];
+        add r9, r8;
+
+        // user_status = status & 0xFFFE (mask off phase bit)
+        mov r11, rcx;
+        and r11, 0xFFFE;
+        mov_w [r9 + 8], r11;
+
+        // completion_flag = 1
+        mov r11, 1;
+        mov_w [r9 + 2], r11;
+
+      nvme_ih_skip_req:
+        // Advance cq_head = (cq_head + 1) & 63.
+        add r13, 1;
+        and r13, 63;
+
+        // Toggle cq_phase on wrap.
+        cmp r13, 0;
+        jne nvme_ih_no_wrap;
+        xor r14, 1;
+
+      nvme_ih_no_wrap:
+        add r15, 1;                              // count++
+        jmp nvme_ih_walk;
+
+      nvme_ih_done:
+        // ================================================================
+        // (4) Persist cq_head + cq_phase back into descriptor.
+        // ================================================================
+        mov_w [rbx + 20], r13;
+        mov_b [rbx + 23], r14;
+
+        // ================================================================
+        // (5) Ring the CQ doorbell only if we consumed anything.
+        // ================================================================
+        cmp r15, 0;
+        je nvme_ih_return;
+
+        mov rdi, [rip + _nvme_current_bar0];
+        mov rsi, rbp;                            // qid
+        mov rdx, r13;                            // new cq_head
+        call nvme_ring_cq;
+
+      nvme_ih_return:
+        // (6) Return count.
+        mov rax, r15;
+
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
