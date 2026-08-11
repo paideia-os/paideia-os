@@ -312,17 +312,83 @@ paideia-as-v0.32-a11y-toolkit                 (blocks G10–G12)
 
 ---
 
-## 10. Open architectural questions (must resolve before filing issues)
+## 10. Open architectural questions — RESOLVED
 
-Both proposals raised open questions. Consolidated list — must resolve before the bulk-filing step:
+All seven open questions resolved via user disambiguation on 2026-08-11. Decisions are load-bearing and referenced by every round below.
 
-1. **Blob-driver capability policy** — R8 above. Draft `design/drivers/blob-policy.md` at R29 open. Blocking for R38 + R40.
-2. **VMD long-term stance** — still open per `r18-plus-bare-metal.md` §8. Not blocking R29–R40 as long as BIOS-off remains the policy.
-3. **Software Connection Manager for TBT4** — MVP is firmware-CM. Software-CM (multi-host TB4, display-tunnel priority arbitration) is a research-year of work; defer to post-R40.
-4. **Semantic terminal slot** — bare-metal roadmap placed it at R39; this synthesis re-uses R39/G-numbers differently. Recommend: rename semantic-terminal to R44+ (post-G12) so it's the *payoff* of a GPU-native GUI, not a competitor for reviewer attention.
-5. **PdxFS v1 slot** — bare-metal roadmap places PdxFS v1 at R40. This synthesis puts camera/WWAN at R40. Recommend: PdxFS v1 slot moves to R44+ so it doesn't compete with compositor bring-up.
-6. **Slot 14 base-kind allocation** — softarch reserves it for hardware-adjacent kinds; osarch doesn't touch base-kind assignment. **Decision:** adopt softarch's slot-14 use (`KIND_INTERRUPT`, `KIND_HW_TIMELINE`); document in `linearity-and-tags.md` at R29.M1 open.
-7. **CI reference hardware** — softarch defers HW-gated smokes; osarch names them explicitly per round. **Decision:** every round with `gated:hardware` label has both a QEMU-OVMF path (structural witness) AND a T14 G4 real-HW recipe under `tools/hw-smoke-*.md`.
+### D1 — Blob-driver capability policy (three sub-decisions)
+
+- **D1.a Signing trust model: DUAL SIGNATURE.** Every vendor firmware blob (Intel AX211 UMAC, Intel IPU6, Intel GuC/HuC, Intel BT HCI, Realtek SOF) must carry BOTH the vendor signature AND a Paideia manifest re-sign (ML-DSA-65 under our project root key from R32). Rejects blobs with only one. Highest assurance; costs a per-blob review step; blocks emergency vendor security updates until we re-sign (acknowledged trade-off).
+  - Implementation: `blob_load(fw_path)` verifies vendor sig against pinned vendor pubkey (`assets/keys/{intel,realtek}-firmware-*.pk`), then reads `.pdxsig` manifest, verifies `manifest.blob_hash == sha3_256(blob)`, verifies manifest sig against `paideia_root_pk`.
+  - Design doc: `design/drivers/blob-policy.md` (R29 close).
+
+- **D1.b IOMMU domain granularity: PER-DRIVER-PROCESS.** One `KIND_DMA_DOMAIN` per driver process, shared across all devices that driver owns. Accepts the risk that a compromised AX211 UMAC could peek at BT ring memory (both live in the same process). Chose over per-device for simplicity; over per-firmware-image for domain-churn cost.
+
+- **D1.c Audit access: FULL.** Blob drivers have same audit access (read + write) as non-blob drivers. Matches how Linux firmware-loading drivers work. Loses one layer of blast-radius reduction; accepted for operational simplicity.
+
+### D2 — Intel VMD: BIOS-OFF THROUGH NEXT-WAVE, VMD DRIVER AT R47+
+
+BIOS-off policy remains through R29–R46. Users on VMD-on hardware must toggle BIOS Setup → Storage → Intel VMD → Off. Documented in `design/hardware/quirks.md` §2.4 (already present from R22.M6 #870). VMD driver lands in a post-G-series hardening round (R47+). Accepts that some users must toggle BIOS through the whole 15–22 month wave.
+
+### D3 — Thunderbolt 4 Connection Manager: SOFTWARE-CM FROM R35
+
+R35 lands software-CM directly (Linux-style). ~40 issues (vs ~24 for firmware-CM). Strong Pillar 3 (userspace-first) and Pillar 5 (no legacy) alignment: one code path forever. OS drives topology walk + tunnel provisioning + per-dock IOMMU domain + DMA-consent arbitration. Non-goal: firmware-CM fallback path.
+
+### D4 — Semantic terminal: SPLIT (R41 fb-console + R44 GUI-native)
+
+Ship semantic terminal TWICE with shared `semantic-term-core` library:
+- **R41 `semantic-terminal-fb`** — uses R23 fb-console + R26 HID keyboard. Ships immediately after driver-closure R40. Preserves fb-console as recovery-mode terminal.
+- **R44 `semantic-terminal-gui`** — uses G12 `libpaideia-ui` + Vello + SDF text + IME + a11y + HDR. First-class GPU-accelerated app after G-series closes.
+- **Shared:** `semantic-term-core` (command lexer, semantic query engine, plot compositor) — two frontends, one backend.
+
+### D5 — PdxFS v1: R42, PARALLEL WITH G-SERIES
+
+PdxFS v1 (CoW + journal + snapshot upgrade of PdxFS-lite) lands at R42, immediately after R41 semantic-terminal-fb, running in parallel with G-series GUI stack. Uses R24 NVMe write path once #906 unblocks. ~4–6 weeks of dedicated work. Users get durable filesystem before GUI arrives.
+
+### D6 — Slot 14 base-kind: RESERVED FOR KIND_HW
+
+Slot 14 of the 16-frozen-base-kind enum is allocated to `KIND_HW` — a new base kind for hardware-adjacent capabilities. `KIND_INTERRUPT`, `KIND_HW_TIMELINE`, `KIND_MSIX_VECTOR`, and `KIND_DMA_DOMAIN` all derive over `KIND_HW`. Enables LAM kind-hint fast-dispatch on the CPU tag (saves one indirection per hardware-cap use). Slot 15 remains reserved for confidential-compute / TDX (per CAP-Q9 open issue).
+
+Document in `linearity-and-tags.md` §3.1 at R29.M1 open:
+```
+0  PAGE       8  CHANNEL
+1  MEMORY     9  SUPERVISOR
+2  DEVICE     10 (existing)
+...            14 HW              ← new (R29)
+               15 CONFIDENTIAL    ← reserved (TDX)
+```
+
+### D7 — HW-smoke discipline: EVERY ROUND HAS QEMU + T14 RECIPE
+
+Every next-wave round with a `gated:hardware` label ships BOTH:
+- (a) a QEMU-OVMF structural witness (compiles, links, dormant path exercised via synth fixture);
+- (b) a `tools/hw-smoke-<round>.md` operator recipe for T14 G4 real HW.
+
+Round does NOT close until both exist. Real-HW recipe execution remains user-triggered (not auto-CI, per `feedback_paideia_os_no_cicd.md`); each execution promotes quirks-db rows from PROVISIONAL → CONFIRMED. Aligns with R28.M2 HW-smoke harness landed at adf5083.
+
+### Consequences for milestone catalogue (§2)
+
+Adjustments to §2 driven by these decisions:
+- **R35 issue count: 24 → ~40** (D3 software-CM adds ~16 issues for topology walker, tunnel provisioner, multi-host arbitration).
+- **R41 slot renamed** from "hardening-slot" to `r41-semantic-terminal-fb` (D4). New round, ~15 issues (`semantic-term-core` + fb frontend).
+- **R42 slot added** as `r42-pdxfs-v1` (D5). New round, ~20 issues (CoW walker + journal + snapshot semantics).
+- **R44 slot added** as `r44-semantic-terminal-gui` (D4). New round, ~12 issues (G12 toolkit consumer of `semantic-term-core`).
+- **R47+ slot pre-registered** as `r47-vmd-driver` for the deferred VMD landing (D2). ~15 issues.
+- **R29.M1 issue added:** promote slot 14 → `KIND_HW`; update `linearity-and-tags.md` (D6). +1 issue.
+- **R29 issue added:** draft `design/drivers/blob-policy.md` capturing D1.a/D1.b/D1.c (D1). +1 issue. Blocking for R38 + R40 close.
+- **Every round with `gated:hardware`:** acceptance criterion updated to require both QEMU witness AND T14 recipe (D7). No new issues (existing AC updated); adjusts round-close discipline.
+
+**Revised grand total: 24 milestones + 3 new (R41/R42/R44) + 1 hardening (R47) = 28 milestones. Issues ~516 + ~65 = ~581.** Wall-clock estimate unchanged (parallelism absorbs the additions).
+
+**Revised milestone titles for GitHub filing (additions):**
+```
+r41-semantic-terminal-fb                     15 issues
+r42-pdxfs-v1                                 20 issues
+r44-semantic-terminal-gui                    12 issues
+r47-vmd-driver                               15 issues
+```
+
+All decisions load-bearing; §11 bulk-filing plan now unblocked.
 
 ---
 
