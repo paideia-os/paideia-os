@@ -1,0 +1,291 @@
+// src/kernel/core/time/tsc.pdx — R21-M5-002 (#843)
+//
+// TSC calibration against the ACPI PM Timer.
+//
+// Purpose: derive TSC frequency (tsc_hz) in cycles per second by
+// measuring how many TSC ticks elapse across a fixed PM_TMR
+// interval. The ACPI PM Timer runs at exactly 3.579545 MHz per
+// ACPI 6.5 §4.8.3.1 (independent of any CPU / bus frequency change
+// on any spec-compliant firmware). It is the canonical calibration
+// clock on x86 pre-Nehalem and remains the most portable reference
+// even on invariant-TSC platforms.
+//
+// Algorithm (busy-wait 10 ms):
+//   1. Sample pm_start = IN eax, PM_TMR (mask to 24 bits — the counter
+//      is 24-bit unless FADT.PM_TMR_LEN says 32 bits).
+//   2. Sample tsc_start = rdtsc.
+//   3. Busy-loop reading PM_TMR until (pm_now - pm_start) mod 2^24 >=
+//      35000 ticks (~= 9.77 ms at 3.579545 MHz).
+//   4. Sample tsc_end = rdtsc.
+//   5. Sample pm_end (the last read).
+//   6. pm_delta = (pm_end - pm_start) mod 2^24.
+//   7. tsc_delta = tsc_end - tsc_start.
+//   8. tsc_hz = tsc_delta * 3_579_545 / pm_delta.
+//
+// Store tsc_hz in _tsc_hz for consumers (tsc_ns_to_ticks / _ticks_to_ns).
+//
+// -----------------------------------------------------------------------------
+// PM_TMR port location
+// -----------------------------------------------------------------------------
+//
+// The PM_TMR port lives in FADT.PM_TMR_BLK (u32 legacy) or X_PM_TMR_BLK
+// (GAS-encoded ACPI 2.0+ preferred form). Both are exposed by the R20.M3
+// FADT parser via _phase1_acpi_info.fadt.pm_tmr_port (u16 @ +12 of
+// fadt_info). R21.M5 hardcodes PM_TMR_PORT_DEFAULT = 0x1808 (QEMU q35
+// default). T14 G4 Raptor Lake likely uses a different port — the actual
+// value will land once phase1_acpi_gather is wired from kernel_main
+// (deferred to R21.M6 or a follow-up).
+//
+// -----------------------------------------------------------------------------
+// Overflow analysis
+// -----------------------------------------------------------------------------
+//
+//   tsc_delta * 3_579_545 in step 8 can exceed 2^63 when the
+//   calibration window is very large. At 3 GHz TSC × 10 ms window
+//   the product is 3e7 * 3.58e6 ≈ 1.07e14 — well under 2^63 (9.2e18).
+//   Safe headroom for TSC up to ~2^32 Hz across a 1-second window.
+//
+//   pm_delta wrap: PM_TMR wraps at 2^24 = 16777216 counts, which at
+//   3.579545 MHz is ~4.7 seconds. Our 10 ms window is far shorter,
+//   so a single wrap is impossible during measurement provided the
+//   sampling loop runs at all. We still handle wrap defensively via
+//   (pm_now - pm_start) & 0xFFFFFF.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.20.1+)
+// -----------------------------------------------------------------------------
+//
+//   No new gaps. Uses rdtsc / in_eax al (32-bit port read) / imul /
+//   div — all pre-existing per encode_instruction.rs and per usage
+//   at klog/tsc.pdx (rdtsc) and klog/hex.pdx (div).
+
+module Tsc = structure {
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  // PM_TMR frequency per ACPI 6.5 §4.8.3.1 (exactly 3.579545 MHz).
+  pub let PM_TMR_HZ            : u64 = 3579545
+
+  // PM_TMR is 24-bit unless FADT says 32-bit. We mask to 24-bit for
+  // portability; 32-bit PM_TMR simply never wraps within our window.
+  pub let PM_TMR_MASK          : u64 = 0xFFFFFF
+
+  // ~10 ms window at 3.579545 MHz = 35795.45 ticks. Round to 35000
+  // to leave headroom against slight PM_TMR jitter on real HW.
+  pub let PM_TMR_WINDOW_TICKS  : u64 = 35000
+
+  // Defensive iteration cap. If the PM_TMR port is wrong (returns
+  // stuck-at-0/1 or non-monotonic values) the busy-poll would hang
+  // forever. Cap at ~10^8 iterations — on 3 GHz TSC that's ~1s wall
+  // clock and covers >10x the expected window; if we exhaust it the
+  // calibration bails with tsc_hz = 0 (consumers degrade gracefully).
+  pub let TSC_CALIBRATE_MAX_POLLS : u64 = 100000000
+
+  // QEMU q35 default PM_TMR port. Real hardware (T14 G4 Raptor Lake)
+  // reports a different port via FADT; the phase1_acpi_gather
+  // wire-up will supply the real value once R21.M6+ lands.
+  pub let PM_TMR_PORT_DEFAULT  : u64 = 0x1808
+
+  // ============================================================================
+  // _tsc_hz — cached TSC frequency in cycles/sec
+  // ============================================================================
+  //
+  // Populated by tsc_calibrate; 0 means "calibration hasn't run" and
+  // consumers should degrade gracefully (e.g. skip TSC-based timing).
+
+  pub let mut _tsc_hz : u64 = 0
+
+  // ============================================================================
+  // tsc_calibrate(pm_tmr_port: u16) -> u64
+  // ============================================================================
+  //
+  // Returns tsc_hz in rax; also publishes to _tsc_hz. Emits fingerprint
+  // "TSC CALIBRATED hz=<N>".
+  //
+  // Register plan (3-push callee-save):
+  //   rbx = pm_tmr_port (DX-loadable u16)
+  //   r12 = pm_start
+  //   r13 = tsc_start
+  //   r14 = pm_end (last sampled value)
+  //   r15 = tsc_end
+  //
+  // Runtime: ~10 ms busy-loop under WFI. Called from kernel_main after
+  // hpet_init. Not safe to call with interrupts enabled at line-rate —
+  // caller responsibility to keep IF quiet or accept measurement noise.
+
+  pub let tsc_calibrate : (u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (pm_tmr_port: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R21-M5-002 (#843). Calibrate TSC frequency against ACPI PM Timer. Algorithm: (1) Read pm_start via `mov dx, pm_tmr_port_u16; in_eax al` (32-bit port read; `al` operand is the paideia-as convention for RegId(0)=rax, width comes from mnemonic). Mask & 0xFFFFFF to handle 24-bit counters — 32-bit PM_TMR simply doesn't lose bits under mask. (2) rdtsc → tsc_start via edx:eax reconstruct (shl rdx,32; or rax,rdx — same idiom as klog/tsc.pdx L21). (3) Busy-poll loop: read PM_TMR each iteration, subtract pm_start, mask & 0xFFFFFF (handles PM_TMR 24-bit wrap safely — arithmetic is (u32-u32) with implicit 2^32 wrap semantics, then masked to 2^24), compare against PM_TMR_WINDOW_TICKS (35000 ~= 9.77 ms at 3.579545 MHz). (4) rdtsc → tsc_end. (5) pm_end from the last poll read. (6) pm_delta = (pm_end - pm_start) & 0xFFFFFF. (7) tsc_delta = tsc_end - tsc_start (u64 subtract; wrap-safe because rdtsc is monotonic even across the very short calibration window). (8) tsc_hz = tsc_delta * PM_TMR_HZ (3579545) / pm_delta via `imul r64,r64` (truncated 64-bit product — safe: 10 ms × 3 GHz × 3.58e6 = ~1.07e14 << 2^63) then `div r64` (64/64 unsigned quotient into rax). (9) Store rax to _tsc_hz. (10) Emit fingerprint via klog_s1_x1(LEVEL_INFO, SUBSYS_TIME, tag_tsc_calibrated, k_hz, tsc_hz). Return tsc_hz in rax. Callee-save: 5 pushes (rbx, r12-r15) — rsp%16==8 entry + 5 pushes → rsp%16==0 pre-call to klog_s1_x1 (5 * 8 = 40 = 8 mod 16... wait: entry 8, push 5 → 8-40 = -32 → -32 mod 16 = 0 → OK). Encoder: mov / in_eax / rdtsc / shl / shr / or / cmp / je / jb / sub / and / imul / div — all pre-existing.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                                // rbx = pm_tmr_port
+
+        // (1) pm_start = read PM_TMR (32-bit port read, mask 24 bits).
+        mov rdx, rbx;                                // dx = port
+        in_eax al;                                   // eax = PM_TMR value (32-bit)
+        and rax, 0xFFFFFF;                           // mask to 24 bits
+        mov r12, rax;                                // r12 = pm_start
+
+        // (2) tsc_start = rdtsc.
+        rdtsc;
+        shl rdx, 32;
+        or rax, rdx;
+        mov r13, rax;                                // r13 = tsc_start
+
+        // (3) Busy-poll until pm_delta >= PM_TMR_WINDOW_TICKS (35000)
+        // OR poll budget exhausted (10^8 iterations — defends against a
+        // wrong PM_TMR port returning stuck values; kernel wire-in
+        // hardcodes 0x1808 which is q35 default but WRONG for i440fx
+        // where smoke tests run — the timeout path yields tsc_hz = 0
+        // and hpet_now_ns remains the authoritative clock).
+        //
+        // Note the AT&T-style triangle: r9 is the poll counter, decremented
+        // and tested each iteration; if it hits 0 we abort the loop and
+        // publish tsc_hz = 0.
+        mov r9, 100000000;                           // TSC_CALIBRATE_MAX_POLLS
+
+      tsc_calibrate_poll:
+        cmp r9, 0;
+        je tsc_calibrate_timeout;
+        sub r9, 1;
+
+        mov rdx, rbx;
+        in_eax al;
+        and rax, 0xFFFFFF;
+        mov r14, rax;                                // r14 = pm_now (latest sample)
+
+        // pm_delta = (pm_now - pm_start) & 0xFFFFFF.
+        sub rax, r12;
+        and rax, 0xFFFFFF;                           // wrap-safe 24-bit delta
+        cmp rax, 35000;                              // PM_TMR_WINDOW_TICKS
+        jb tsc_calibrate_poll;
+
+        // (4) tsc_end = rdtsc.
+        rdtsc;
+        shl rdx, 32;
+        or rax, rdx;
+        mov r15, rax;                                // r15 = tsc_end
+
+        // (5) pm_end already in r14 (last poll sample).
+        // (6) pm_delta = (pm_end - pm_start) & 0xFFFFFF.
+        mov rax, r14;
+        sub rax, r12;
+        and rax, 0xFFFFFF;
+        mov rcx, rax;                                // rcx = pm_delta
+
+        // (7) tsc_delta = tsc_end - tsc_start.
+        mov rax, r15;
+        sub rax, r13;                                // rax = tsc_delta
+
+        // (8) tsc_hz = tsc_delta * PM_TMR_HZ / pm_delta.
+        mov rdx, 3579545;                            // PM_TMR_HZ
+        imul rax, rdx;                               // rax = tsc_delta * PM_TMR_HZ (truncated)
+        xor rdx, rdx;                                // clear high half for div
+        div rcx;                                     // rax = quotient (tsc_hz)
+
+        // (9) Publish _tsc_hz.
+        mov [rip + _tsc_hz], rax;
+
+      tsc_calibrate_emit:
+        // (10) Fingerprint klog_s1_x1(INFO, TIME, tag_tsc_calibrated, k_hz, tsc_hz).
+        // On the timeout path _tsc_hz stays 0 and the fingerprint still
+        // fires with k_hz=0x0 so the smoke pipeline observes the failure
+        // mode explicitly (instead of a silent hang).
+        mov r8, [rip + _tsc_hz];                     // v1 = tsc_hz (0 on timeout)
+        mov rdi, 3;                                  // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_TIME];
+        lea rdx, [rip + tag_tsc_calibrated];
+        lea rcx, [rip + k_hz];
+        call klog_s1_x1;
+
+        // Reload tsc_hz for return value (klog clobbered rax).
+        mov rax, [rip + _tsc_hz];
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tsc_calibrate_timeout:
+        // PM_TMR poll budget exhausted (wrong port or absent counter).
+        // Leave _tsc_hz = 0 (default); fall through to fingerprint emit
+        // so the smoke pipeline observes the failure mode explicitly.
+        xor rax, rax;
+        mov [rip + _tsc_hz], rax;
+        jmp tsc_calibrate_emit
+      }
+    }
+
+  // ============================================================================
+  // tsc_ns_to_ticks(ns: u64) -> u64
+  // ============================================================================
+  //
+  // Convert nanoseconds → TSC ticks: ticks = ns * tsc_hz / 10^9.
+  // Uses truncated imul; overflow at ns > 2^63 / tsc_hz (≥ ~3 seconds
+  // at 3 GHz — plenty for scheduler intervals which are ≤ 10 ms).
+  //
+  // Returns 0 if _tsc_hz == 0 (calibration hasn't run).
+
+  pub let tsc_ns_to_ticks : (u64) -> u64 !{mem} @{boot} =
+    fn (ns: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R21-M5-002 (#843). Convert nanoseconds to TSC ticks. Formula: ticks = ns * tsc_hz / 10^9. (1) Load _tsc_hz; if 0, return 0 (calibration hasn't run — degrade gracefully). (2) imul rax, rcx where rax=ns, rcx=tsc_hz — 64-bit truncated product. Safe for ns ≤ 2^63 / tsc_hz ≈ 3 seconds at 3 GHz TSC — bounded above by our max scheduler tick (~10 ms). (3) xor rdx,rdx; mov rcx,10^9; div rcx → quotient in rax = ticks. Encoder: mov / cmp / je / imul / xor / div — all pre-existing. Leaf; no callee-save.",
+      block: {
+        mov rcx, [rip + _tsc_hz];
+        cmp rcx, 0;
+        je tsc_ns_to_ticks_zero;
+
+        mov rax, rdi;                                // rax = ns
+        imul rax, rcx;                               // rax = ns * tsc_hz
+        xor rdx, rdx;
+        mov rcx, 1000000000;                         // 10^9
+        div rcx;                                     // rax = ticks
+        ret;
+
+      tsc_ns_to_ticks_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tsc_ticks_to_ns(ticks: u64) -> u64
+  // ============================================================================
+  //
+  // Convert TSC ticks → nanoseconds: ns = ticks * 10^9 / tsc_hz.
+
+  pub let tsc_ticks_to_ns : (u64) -> u64 !{mem} @{boot} =
+    fn (ticks: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R21-M5-002 (#843). Convert TSC ticks to nanoseconds. Formula: ns = ticks * 10^9 / tsc_hz. (1) Load _tsc_hz; if 0, return 0. (2) imul rax, rcx where rax=ticks, rcx=10^9 — 64-bit truncated product. Safe for ticks ≤ 2^63 / 10^9 ≈ 9.2e9 ticks (~3 seconds at 3 GHz). Callers with longer intervals (e.g. hpet_now_ns replacement) must chunk the conversion. (3) xor rdx,rdx; mov rcx,_tsc_hz; div rcx → quotient in rax = ns. Encoder: mov / cmp / je / imul / xor / div — all pre-existing.",
+      block: {
+        mov rcx, [rip + _tsc_hz];
+        cmp rcx, 0;
+        je tsc_ticks_to_ns_zero;
+
+        mov rax, rdi;                                // rax = ticks
+        mov rcx, 1000000000;                         // 10^9
+        imul rax, rcx;                               // rax = ticks * 10^9
+        xor rdx, rdx;
+        mov rcx, [rip + _tsc_hz];
+        div rcx;                                     // rax = ns
+        ret;
+
+      tsc_ticks_to_ns_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+}

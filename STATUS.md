@@ -659,3 +659,46 @@ R20 delivered the kernel-side ACPI static-table pipeline (RSDP → XSDT → MADT
 None (R20 ran under QEMU + synthetic fixtures). `design/hardware/quirks.md` seeded with 15 PROVISIONAL rows anchored against Intel Raptor Lake datasheets + Lenovo PSREF + Intel PCH defaults. Notable anchors: FADT reset via GAS at 0xCF9 with RESET_VALUE=0x06 (Lenovo/Insyde typical), MCFG single seg-0 ECAM base 0xE0000000, HPET counter_base 0xFED00000 + block_id 0x8086A701, AVX-512 disabled at core level, LAM unavailable (Meteor Lake+ only), VMD-on default (BIOS-off recipe documented), no debug UART on chassis.
 
 **Next Round:** R21 (FPU/XSAVE + IOAPIC + MSI/MSI-X + x2APIC + HPET timing) — preflight to land at R21.M1 kickoff as `design/round-retrospectives/r21-preflight.md`. Zero R20 blockers.
+
+---
+
+## R21 (FPU/XSAVE + Interrupt Controller Completion + Timing) — CLOSED 2026-08-10
+
+R21 delivered the FPU/SIMD substrate (XSAVE probe + enable + eager save/restore + AVX2/AVX-512 gating + YMM-preservation fixture), the interrupt-controller substrate (IOAPIC MMIO + programming + reroute, PCIe ECAM + MSI + MSI-X + per-CPU vector pool), and the timing substrate (HPET monotonic-time + TSC-vs-PM_TMR calibration + x2APIC probe). Pillar 6 target met: every SIMD-executing kernel path preserves YMM state across context switches, every PCIe device can be programmed to raise a per-CPU MSI/MSI-X vector, and the kernel has a wall-clock-quality nanosecond source not derived from the (variable-frequency) TSC. See `design/round-retrospectives/r21-closure.md` for the full write-up.
+
+### Issues Implemented (21 total across 5 milestones)
+
+- **M1** (#825–#829) — XSAVE substrate: CPUID leaf 0x0D probe (`xsave_probe_bsp`), CR4.OSXSAVE + XCR0 enable (`xsave_enable_this_cpu`), per-task 33 280-byte XSAVE region array, eager `xsaveopt` / `xrstor` around `sched_switch_r15`, XSTATE_BV=0 architectural-init policy on task creation.
+- **M2** (#830–#832) — CPU-feature gating: `cpu_probe_avx2` + `cpu_probe_avx512` populate `_cpu_has_avx2` / `_cpu_has_avx512` / `_cpu_avx512_bits`; YMM-preservation regression fixture with `ymm_preserve_synth_witness_a` / `_b` round-tripping YMM0 through the same `xsave_save_for` / `xsave_restore_for` machinery `sched_switch_r15` uses.
+- **M3** (#833–#836) — IOAPIC substrate: base-parametric `ioapic_read_at` / `ioapic_write_at`, `ioapic_program_redir` for RTE composition, IOAPIC re-route structural witness that saves + reprograms + restores RTE #4 in the boot cli window.
+- **M4** (#837–#841) — PCIe ECAM + MSI + MSI-X substrate: `pci_ecam_addr`, `pci_ecam_read32` / `_write32`, `msi_program`, `msix_program_entry`, per-CPU vector pool (`vector_alloc_for_cpu` / `_free_for_cpu`), MSI-X round-robin structural witness.
+- **M5** (#842, #843, #844, #846; #845 deferred) — HPET main-counter driver (`src/kernel/core/time/hpet.pdx` — `hpet_init` + `hpet_now_ns` + `_hpet_ctx` 32-B cache), TSC calibration against ACPI PM_TMR (`src/kernel/core/time/tsc.pdx` — `tsc_calibrate` + `tsc_ns_to_ticks` + `tsc_ticks_to_ns` + `_tsc_hz` cache), x2APIC probe substrate (`src/kernel/core/apic/x2apic.pdx` — `x2apic_probe` + `x2apic_enable_this_cpu` + `x2apic_read` + `x2apic_write` + `x2apic_probe_bsp` fingerprint), R21 closure retrospective + STATUS.md entry (this block). **#845 (retire xAPIC MMIO code paths) deferred**: enabling x2APIC without simultaneously retiring the eoi/tpr/ipi/self_ipi/lapic_timer/tsc_deadline MMIO consumers would silently break every LAPIC callsite (per Intel SDM Vol 3A §10.12.2: setting IA32_APIC_BASE.X2APIC=1 disables MMIO); the substrate is complete and the retirement is queued as a targeted R22.M1 refactor with boot_smp as the regression gate.
+
+### Cross-Repo Escalations to paideia-as (R21)
+
+**None.** `paideia-as` submodule remained pinned at `2cf169d` for all five R21 milestones. Every encoder mnemonic used by the M5 additions (`rdmsr`, `wrmsr`, `rdtsc`, `in_eax`, `imul r64,r64`, `div r64`, `mul` avoided via `imul` + precomputed integer division) was verified pre-existing before implementation.
+
+### Observable Proof
+
+- Kernel builds clean under `tools/build.sh` (16/16 gates: no-AML lint + opcode-canary + kernel dispatch + sched guards + tty_read wrapper + build).
+- All 14 pre-push smoke modes pass (`boot_r8_only` through `boot_smp`) — byte-identical to R20 close except for three new fingerprint lines appearing between `CPU AVX-512 unavailable` and `R17 WORD STORE OK`:
+  - `HPET INIT OK period_fs=0x0000000000989680 freq_hz=0x0000000005f5e100` (QEMU 100 MHz HPET at 0xFED00000)
+  - `TSC CALIBRATED hz=0x00000000896764c1` (~2.31 GHz TSC, calibrated via PM_TMR at 0x608 on QEMU default machine)
+  - `X2APIC ABSENT` (QEMU-TCG doesn't emulate x2APIC — probe correctly detects; will read `X2APIC AVAILABLE` on KVM / real T14 G4)
+- Three R21 opt-in smokes pass: `boot_r21_ymm_preserve` (M2), `boot_r21_ioapic_reroute` (M3), `boot_r21_msix_round_robin` (M4).
+
+### R21 Debt Carried Forward
+
+1. **#845 (retire xAPIC MMIO code paths)** — deferred to R22.M1. Substrate ready (`x2apic_read` / `x2apic_write` land under R21.M5); retirement is a mechanical rewrite of every xAPIC MMIO write site (eoi/tpr/ipi/self_ipi/lapic_timer/tsc_deadline/reschedule_ipi/init_sipi) to the MSR wrappers, with boot_smp as the primary regression gate. Cannot land intra-R21 alongside x2APIC enable without a multi-CPU stress test suite that R21 does not yet have.
+2. **PM_TMR port hardcoded to 0x608** — correct for QEMU default (both q35 and i440fx PIIX4/ICH9 with PMBASE=0x600) but wrong for T14 G4 Raptor Lake (Intel PCH publishes a different PMBASE via FADT). Replace with `_phase1_acpi_info.fadt.pm_tmr_port` once `phase1_acpi_gather` is wired into `kernel_main_uefi` (R20 debt item #2, gated on R22.M1 or an intra-R21 follow-up).
+3. **HPET base hardcoded to 0xFED00000** — correct for Intel PCH + QEMU; replace via `_phase1_acpi_info.hpet.counter_base_pa` when `phase1_acpi_gather` wires in.
+4. **`hpet_now_ns` precision** — uses precomputed integer `period_ns = period_fs / 10^6` (loss-free on QEMU q35 where period is exactly 10 ns; ~1.2% steady-state error on Intel PCH 14.31818 MHz where period = 69,841,841 fs → period_ns = 69). Widen to u32.32 fixed-point when a precision consumer arrives (R22+).
+5. **T14 G4 real-hardware validation (R21.M5 hybrid P/E fixture)** — GATED ON HARDWARE. `boot_r21_ymm_preserve` on qemu64 default emits nothing (AVX2 auto-skip), and neither the TSC calibration nor the x2APIC probe can be verified against real Raptor Lake surface. Manual procedure documented in the R21 closure retro.
+
+**None regress R21 acceptance.**
+
+### Quirks Discovered on Real Hardware
+
+None (R21 ran under QEMU-TCG). The three PROVISIONAL rows added to `design/hardware/quirks.md` will promote to CONFIRMED at first-boot on T14 G4: TSC-hz post-calibration in the 2.4-3.2 GHz P-core range, HPET period_fs = 69,841,841 (14.31818 MHz), x2APIC available.
+
+**Next Round:** R22 (x2APIC MSR retirement + kernel-space heap allocator + syscall latency substrate). Zero R21 blockers.

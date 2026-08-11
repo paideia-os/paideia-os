@@ -1,0 +1,271 @@
+// src/kernel/core/time/hpet.pdx — R21-M5-001 (#842)
+//
+// HPET (High Precision Event Timer) main-counter driver.
+//
+// Purpose: provide a wall-clock-quality monotonic-time source keyed
+// off the 64-bit HPET MAIN_COUNTER (register at counter_base + 0xF0).
+// HPET runs at ≥10 MHz (typically 14.31818 MHz on Intel desktop PCH,
+// 24 MHz on server platforms; ~100 MHz on virtual q35). Its period
+// is published in femtoseconds (1e-15 s) via the upper 32 bits of
+// GENERAL_CAPS at counter_base + 0x000. Ticks × period_fs = elapsed
+// femtoseconds; divide by 1e6 to get nanoseconds.
+//
+// This module is the first non-TSC wall-clock in the kernel. TSC
+// calibration (#843) uses it as the ground-truth reference; APIC
+// TSC-deadline (#777) will chain against HPET-derived TSC-hz once
+// the wire-up in R21.M6+ lands.
+//
+// -----------------------------------------------------------------------------
+// HPET MMIO layout (IA-PC HPET Specification 1.0a §2.3)
+// -----------------------------------------------------------------------------
+//
+//   +0x000   GENERAL_CAPS_AND_ID (u64) — read-only
+//             [63:32] u32 counter_period (fs per tick)
+//             [31:16] u16 vendor_id
+//             [15]    bit LEG_RT_CAP        (legacy replacement route)
+//             [14]    reserved
+//             [13]    bit COUNT_SIZE_CAP    (1 = 64-bit counter)
+//             [12: 8] u5  NUM_TIM_CAP-1     (comparator count - 1)
+//             [ 7: 0] u8  REV_ID
+//
+//   +0x010   GENERAL_CONFIG (u64) — read/write
+//             [0]     ENABLE_CNF (0 = halt counter, 1 = advance)
+//             [1]     LEG_RT_CNF (legacy replacement route)
+//             (upper bits reserved)
+//
+//   +0x020   GENERAL_INTR_STATUS (u64) — write-1-to-clear
+//   +0x0F0   MAIN_COUNTER_VALUE  (u64) — the monotonic tick counter
+//   +0x100+  per-comparator blocks (32 bytes each, up to 32 comparators)
+//
+// Registers may be accessed as 32-bit or 64-bit per §2.3.1. This
+// module uses 64-bit accesses throughout — the main counter is the
+// only reason we care about width, and reading it as two 32-bit
+// halves would require a coherence loop (Intel SDM says HPET
+// counter reads are single-copy atomic at 64-bit width per §17.20.1
+// on modern CPUs; QEMU-TCG honors that).
+//
+// -----------------------------------------------------------------------------
+// R21.M5 wiring policy
+// -----------------------------------------------------------------------------
+//
+// kernel_main calls hpet_init(0xFED00000) BEFORE tsc_calibrate: the
+// QEMU q35 machine + Intel PCH hardcode HPET at 0xFED00000, and the
+// R20.M3 ACPI HPET parser (src/kernel/acpi/hpet.pdx) can override
+// this later once phase1_acpi_gather wire-up is added. hpet_init
+// caches base + period + freq in _hpet_ctx; hpet_now_ns walks
+// _hpet_ctx.base + 0xF0 for each read.
+//
+// The hardcoded base is safe: 0xFED00000 is the fixed Intel-defined
+// PCH HPET address and QEMU q35 emulates it there. The hardcode is
+// documented as a temporary substitute for the ACPI-derived base
+// (which is present in _phase1_acpi_info.hpet.counter_base_pa but
+// requires gathering to populate — R21.M6 wire-up will replace this).
+//
+// -----------------------------------------------------------------------------
+// _hpet_ctx layout (32 B, @align(8))
+// -----------------------------------------------------------------------------
+//
+//   +0   u64 base           — MMIO base address of HPET counter block
+//   +8   u64 period_fs      — counter period in femtoseconds (raw from GENERAL_CAPS)
+//   +16  u64 freq_hz        — derived: 10^15 / period_fs (ticks/sec)
+//   +24  u64 period_ns      — derived: period_fs / 10^6 (integer; clamped to 1
+//                              if raw period_fs < 10^6, i.e. > 1 GHz HPET —
+//                              unheard-of on real silicon, but a defensive
+//                              clamp keeps hpet_now_ns's imul monotonic).
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.20.1+)
+// -----------------------------------------------------------------------------
+//
+//   HPET MMIO stores are 64-bit — no mov_d needed (contrast LAPIC
+//   MMIO which is strictly 32-bit and mandates mov_d Fix B). Plain
+//   `mov [rax], rcx` widens to REX.W 64-bit, which is CORRECT here.
+
+module Hpet = structure {
+  // ============================================================================
+  // MMIO offsets
+  // ============================================================================
+
+  pub let HPET_OFF_GENERAL_CAPS   : u64 = 0x000
+  pub let HPET_OFF_GENERAL_CONFIG : u64 = 0x010
+  pub let HPET_OFF_MAIN_COUNTER   : u64 = 0x0F0
+
+  // GENERAL_CONFIG bits.
+  pub let HPET_CFG_ENABLE_CNF     : u64 = 0x1
+
+  // ============================================================================
+  // _hpet_ctx — per-boot HPET runtime state (32 B, @align(8))
+  // ============================================================================
+  //
+  // Zeroed at .bss init. Populated by hpet_init exactly once on the
+  // BSP; APs and the runtime timing paths read this record verbatim.
+
+  pub let mut _hpet_ctx : [u64; 4] = uninit @align(8)
+
+  // ============================================================================
+  // hpet_init(counter_base: u64)
+  // ============================================================================
+  //
+  // Enable the HPET main counter and cache period + frequency in
+  // _hpet_ctx. Idempotent — repeated calls simply re-write the same
+  // values. Called once from kernel_main after IOAPIC/PCI subsystem
+  // init (M5 wave slot; before tsc_calibrate).
+  //
+  // Sequence:
+  //   (1) Store base into _hpet_ctx+0.
+  //   (2) Load GENERAL_CAPS (u64 @ base+0x000).
+  //   (3) Extract counter_period = caps >> 32 (u32) → _hpet_ctx+8.
+  //   (4) freq_hz = 10^15 / period_fs → _hpet_ctx+16.
+  //         (128-bit division via `div r64` reduces to 64-bit when
+  //          dividend fits in 64 bits — 10^15 = 0x38D7EA4C68000 does.)
+  //   (5) Load GENERAL_CONFIG (u64 @ base+0x010), OR bit 0, store back
+  //       (enable the counter).
+  //   (6) klog "HPET INIT OK period_fs=<N> freq_hz=<N>" via klog_s1_x2.
+  //
+  // Register discipline (leaf caller into klog):
+  //   Two callee-save spills (rbx = base, r12 = period_fs) so the
+  //   values survive the div (rax/rdx clobber) and the subsequent
+  //   klog_s1_x2 call. Entry rsp % 16 == 8; 2 pushes → rsp % 16 == 0
+  //   pre-call. klog_s1_x2 uses stack-passed 7th arg — matches the
+  //   cpu_probe_avx2 idiom.
+  //
+  // Argument: rdi = counter_base (typically 0xFED00000 on q35 / Intel PCH).
+
+  pub let hpet_init : (u64) -> () !{mem, sysreg} @{boot} =
+    fn (counter_base: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { boot },
+      justification: "R21-M5-001 (#842). Initialize HPET main counter and publish period_fs + freq_hz into _hpet_ctx. Sequence per IA-PC HPET Spec §2.3: (1) cache base at _hpet_ctx+0. (2) Read GENERAL_CAPS (u64 @ base+0x000) — bits 63:32 hold counter_period in femtoseconds. shr rax, 32 isolates period_fs; store at _hpet_ctx+8. (3) Compute freq_hz = 10^15 / period_fs via `div rcx` (128-bit dividend rdx:rax, 64-bit divisor rcx; quotient in rax). 10^15 = 1_000_000_000_000_000 = 0x38D7EA4C68000 fits in 63 bits so a zero high half is correct; store quotient at _hpet_ctx+16. (4) Enable the counter: read GENERAL_CONFIG (u64 @ base+0x010), OR bit 0 (ENABLE_CNF), store back — MUST be 64-bit stores here (contrast LAPIC MMIO which mandates 32-bit); paideia-as bare `mov [rax], rcx` emits REX.W 64-bit which matches HPET spec. (5) Emit fingerprint via klog_s1_x2 with keys k_period_fs=period_fs, k_freq_hz=freq_hz. Register: 2-push (rbx=base, r12=period_fs) preserves both across the div (clobbers rax/rdx) and the klog call. Entry rsp%16==8, 2 pushes → rsp%16==0 pre-call to klog_s1_x2 as SysV requires. klog_s1_x2 signature is (level, subsys, tag, k1, v1, k2, v2) — v2 (freq_hz) is the 7th arg, spilled onto stack per the wrappers.pdx convention (see klog_s1_x2 stack frame comment). Encoder: mov / shl / shr / or / mov (mem) / rdmsr N/A / div — all pre-existing (div used in klog/hex.pdx L106). SUBSYS_TIME + LEVEL_INFO=3.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                                // rbx = counter_base
+
+        // (1) _hpet_ctx.base = counter_base
+        lea rax, [rip + _hpet_ctx];
+        mov [rax + 0], rbx;
+
+        // (2) Read GENERAL_CAPS (u64) and extract period_fs (bits 63:32).
+        mov rax, [rbx + 0x000];
+        shr rax, 32;
+        mov r12, rax;                                // r12 = period_fs
+
+        // Store period_fs at _hpet_ctx+8.
+        lea rax, [rip + _hpet_ctx];
+        mov [rax + 8], r12;
+
+        // (3a) freq_hz = 10^15 / period_fs.
+        // rax = low 64 of 10^15, rdx = 0 (high 64), rcx = period_fs.
+        mov rax, 1000000000000000;                   // 10^15
+        xor rdx, rdx;
+        mov rcx, r12;
+        div rcx;                                     // rax = quotient (freq_hz)
+
+        lea rcx, [rip + _hpet_ctx];
+        mov [rcx + 16], rax;
+
+        // (3b) period_ns = period_fs / 10^6 (clamped to >= 1 for monotonicity).
+        // Precomputed here so hpet_now_ns is one imul instead of mul+div.
+        mov rax, r12;                                // rax = period_fs
+        xor rdx, rdx;
+        mov rcx, 1000000;                            // 10^6
+        div rcx;                                     // rax = period_ns
+        cmp rax, 0;
+        jne hpet_init_period_ok;
+        mov rax, 1;                                  // defensive clamp
+      hpet_init_period_ok:
+        lea rcx, [rip + _hpet_ctx];
+        mov [rcx + 24], rax;
+
+        // (4) Enable counter: OR bit 0 of GENERAL_CONFIG (u64 @ base+0x010).
+        mov rax, [rbx + 0x010];
+        or rax, 0x1;
+        mov [rbx + 0x010], rax;
+
+        // (5) klog "HPET INIT OK period_fs=<N> freq_hz=<N>".
+        //
+        // klog_s1_x2 wrappers.pdx signature (6 register args + v2 spilled
+        // on stack): (rdi=level, rsi=subsys, rdx=tag, rcx=k1, r8=v1,
+        // r9=k2, [rsp+8]=v2). Caller pushes v2 (freq_hz) then calls.
+        // Alignment: entry rsp%16==8; +2 pushes (rbx, r12) → rsp%16==8;
+        // +1 push (v2) → rsp%16==0 → call adds 8 → wrapper entry rsp%16==8
+        // as SysV requires.
+        //
+        // freq_hz reload: r12 (period_fs) and rbx (base) are still live;
+        // load freq_hz fresh from _hpet_ctx+16.
+        lea rax, [rip + _hpet_ctx];
+        mov rax, [rax + 16];                         // rax = freq_hz
+        push rax;                                    // v2 = freq_hz on stack
+
+        mov rdi, 3;                                  // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_TIME];
+        lea rdx, [rip + tag_hpet_init_ok];
+        lea rcx, [rip + k_period_fs];
+        mov r8, r12;                                 // v1 = period_fs
+        lea r9, [rip + k_freq_hz];                   // k2 = &k_freq_hz
+        call klog_s1_x2;
+        add rsp, 8;                                  // drop v2 slot
+
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // hpet_now_ns() -> u64
+  // ============================================================================
+  //
+  // Return the current monotonic time in nanoseconds since hpet_init
+  // enabled the counter. Reads MAIN_COUNTER (u64 @ base + 0xF0) via a
+  // single 64-bit load; multiplies by _hpet_ctx.period_ns (precomputed
+  // in hpet_init as period_fs / 10^6).
+  //
+  // Precision / overflow analysis:
+  //   period_ns is INTEGER — a raw HPET period of 69,841,841 fs
+  //   (typical Intel PCH ~14.31818 MHz) rounds to 69 ns, incurring a
+  //   ~1.2% steady-state error. On QEMU q35 (period = 10,000,000 fs
+  //   = exactly 10 ns) the round-trip is loss-free. R22+ can widen
+  //   the fraction (e.g. store period as u32.32 fixed-point) once a
+  //   real precision consumer arrives; today's callers (TSC calibration
+  //   in #843, later scheduler tick accounting) tolerate a few
+  //   percent of drift over intervals under a second.
+  //
+  //   `imul rax, rcx` is signed 64x64→64 truncated. Overflow occurs at
+  //   ticks * period_ns > 2^63. At Intel PCH 14 MHz × 69 ns/tick this
+  //   is uptime ~4000 years. Not a practical concern.
+  //
+  // Register discipline: leaf; no callee-save touched. rax/rcx are
+  // both SysV caller-save.
+
+  pub let hpet_now_ns : () -> u64 !{mem} @{boot} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R21-M5-001 (#842). Read HPET MAIN_COUNTER and convert ticks to nanoseconds via precomputed period_ns. (1) rcx = _hpet_ctx.base; if 0 (hpet_init not called), return 0 — defensive against callers that reach here before init. (2) rax = ticks = *(u64*)(base + 0xF0) — 64-bit MMIO load; HPET §2.3.1 allows 64-bit reads and modern CPUs make them single-copy atomic per Intel SDM Vol 3 §17.20.1. (3) rcx = _hpet_ctx.period_ns (u64) — precomputed at init to sidestep the missing `mul r64` primitive in paideia-as (only `imul r64, r64` exists, which is 64x64→64 truncated). (4) imul rax, rcx → rax = ticks * period_ns. Semantic error vs raw fs-precision: bounded by (period_fs mod 10^6) / period_fs — 0% on QEMU q35 (period_fs = 10^7 exactly), ~1.2% on Intel PCH 14.31818 MHz (period_fs = 69,841,841 → period_ns = 69). R22+ will widen the fraction if a precision consumer arrives. Overflow bound: 2^63 / 69 ≈ 4000 years — not practical concern. Encoder: mov (mem load) / cmp / je / imul r64,r64 — all pre-existing (imul in loader/elf_lite.pdx L141). Leaf; no callee-save touched.",
+      block: {
+        // (1) base = _hpet_ctx+0 — bail if 0.
+        lea rcx, [rip + _hpet_ctx];
+        mov rax, [rcx + 0];
+        cmp rax, 0;
+        je hpet_now_ns_zero;
+
+        // (2) ticks (u64) from MAIN_COUNTER at base+0xF0.
+        mov rcx, rax;                                // rcx = base
+        mov rax, [rcx + 0xF0];                       // rax = ticks
+
+        // (3) period_ns from _hpet_ctx+24.
+        lea rcx, [rip + _hpet_ctx];
+        mov rcx, [rcx + 24];                         // rcx = period_ns
+
+        // (4) rax = ticks * period_ns (truncated 64-bit product).
+        imul rax, rcx;
+        ret;
+
+      hpet_now_ns_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+}
