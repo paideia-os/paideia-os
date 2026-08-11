@@ -546,6 +546,35 @@ case "${EXPECTED}" in
         echo "smoke: boot_r22_msix_ir_round_robin — SKIP (witness not wired at R22.M6; R23 dependency per design/kernel/iommu-boot-toggle.md)"
         exit 0
         ;;
+    boot_r24_concurrent_io)
+        # R24-M6-002 (#909): opt-in 4-CPU concurrent-IO throughput
+        # scaffold, gated by PAIDEIA_R24_CONCURRENT_IO=1.
+        #
+        # The witness at tests/kernel/drivers/nvme/concurrent_io.pdx
+        # (symbol concurrent_io_witness) is NOT wired into kernel_main
+        # at M6 — same posture as msix_ir_round_robin_witness at
+        # R22.M6: symbol existence + build-time link verification are
+        # the R24-close acceptance criterion, live invocation is
+        # deferred to R25+ when the driver-attach path wires
+        # probe → identify → io_queues → sync_read into a boot-time
+        # bring-up sequence AND the public sched_spawn substrate lands.
+        #
+        # QEMU-TCG default `-kernel` has no MCFG → PCI enumerator
+        # drains empty → nvme_probe returns 0 → concurrent_io_witness
+        # would take the SKIP branch even if it were invoked. So the
+        # opt-in mode is a SKIP-echo at M6: the pre-push env-gate
+        # stays callable (does not abort the push), the mode returns
+        # cleanly with a SKIP marker, matching the R22.M6
+        # msix_ir_round_robin pattern.
+        #
+        # When R25+ wires concurrent_io_witness into a boot-time
+        # bring-up (behind PAIDEIA_R24_CONCURRENT_IO gating), this
+        # mode flips to FINGERPRINT_MODE=1 with a
+        # tests/r24/expected-concurrent-io.txt file matching the
+        # "NVME CONCURRENT IO OK cpus=4 iops=<N>\n" witness emit.
+        echo "smoke: boot_r24_concurrent_io — SKIP (witness not wired at R24.M6; R25+ dependency: driver-attach + public sched_spawn per design/round-retrospectives/r24-closure.md § Preflight for R25)"
+        exit 0
+        ;;
     boot_panic)
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/logging/expected-panic-dump.txt"

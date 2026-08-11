@@ -79,7 +79,7 @@ landing an ELF loader.
 
 | Subsystem | Quirk | Impact | Handling | Status | Round observed | Source |
 |-----------|-------|--------|----------|--------|----------------|--------|
-| VMD | Intel VMD Controller enabled by default; NVMe appears behind VMD as a `pci-domain`-style controller rather than bare PCIe. R22 PCI enumerator (bus-0 recursive descent) cannot see the drive as a first-class endpoint while VMD is on — VMD hides its children behind a proprietary indirection. | R24 NVMe bring-up cannot see the drive with VMD enabled unless a VMD driver exists (deferred R37+). R22 PCI enumerator sees a RAID/VMD container rather than the NVMe controller. **MVP recipe is: BIOS Setup → Storage → Intel VMD Controller → Disabled before any R22 PCI enum / R23 driver-plane / R24 NVMe boot.** Verification: post-VMD-off `pci_enumerate_all(0)` records an NVMe controller at approximately `00:0E.0` instead of the VMD RAID container. | PROVISIONAL | — | Lenovo Insyde BIOS default (T14 G4). `design/roadmap/r18-plus-bare-metal.md` §7 + `design/roadmap/r19-t14-g4-boot-guide.md` §3. Elevated in scope at R22.M6-001 (#870) to add the R22 PCI-enumerator impact + explicit BIOS toggle path + first-light verification recipe. |
+| VMD | Intel VMD Controller enabled by default; NVMe appears behind VMD as a `pci-domain`-style controller rather than bare PCIe. R22 PCI enumerator (bus-0 recursive descent) cannot see the drive as a first-class endpoint while VMD is on — VMD hides its children behind a proprietary indirection. | R24 NVMe bring-up cannot see the drive with VMD enabled unless a VMD driver exists (deferred R37+). R22 PCI enumerator sees a RAID/VMD container rather than the NVMe controller. **SEVERITY: LOAD-BEARING.** The BIOS toggle is the single blocker for the entire R24 NVMe substrate — without it `nvme_probe` records zero controllers, every downstream substrate step (identify / io_queues / dispatch / read_blocking) is unreachable, and the R24 HW smoke `nvme_hw_smoke_witness` (R24.M6 #908) takes the SKIP-on-no-controllers branch instantly. **MVP recipe is: BIOS Setup → Storage → Intel VMD Controller → Disabled before any R22 PCI enum / R23 driver-plane / R24 NVMe boot.** Full operator recipe with BIOS toggle path + GDB attach + witness-invocation ceremony at `tools/nvme-hw-smoke.md` §1.2.1 (R24.M6-001 #908). Verification: post-VMD-off `pci_enumerate_all(0)` records an NVMe controller at approximately `00:0E.0` instead of the VMD RAID container, and `nvme_probe` fingerprint reads `NVME PROBE N=1`. | PROVISIONAL | — | Lenovo Insyde BIOS default (T14 G4). `design/roadmap/r18-plus-bare-metal.md` §7 + `design/roadmap/r19-t14-g4-boot-guide.md` §3. Elevated in scope at R22.M6-001 (#870) to add the R22 PCI-enumerator impact + explicit BIOS toggle path + first-light verification recipe. Re-elevated at R24.M6-001 (#908) with a `SEVERITY: LOAD-BEARING` note + cross-reference to `tools/nvme-hw-smoke.md §1.2.1` (the operator recipe) + `tests/kernel/drivers/nvme/hw_smoke.pdx` (the witness that verifies the toggle worked). |
 | USB | 2× TB4 + 2× USB-A + 1× USB-C 3.2; all under xHCI. | R26 xHCI driver targets single controller. | To be programmed. | PROVISIONAL | — | Lenovo PSREF. |
 | Ethernet | Intel i219-LM PHY (on-board, PCH-integrated). | R27 e1000e-family driver. | To be programmed. | PROVISIONAL | — | Lenovo PSREF. |
 | Wi-Fi / Bluetooth | Intel AX211 (Wi-Fi 6E + BT 5.2) integrated CNVi. | Deferred to R41+ per §0 constitutional decision. | Not on critical line. | PROVISIONAL | — | Lenovo PSREF. |
@@ -148,3 +148,18 @@ row promotes to `WORKED-AROUND`. See
 new rows added at this pass; R23 ran entirely under `qemu -kernel`
 (no UEFI/OVMF harness yet — fb subsystem is dormant on that boot
 path by design).*
+
+*Updated 2026-08-11 at R24.M6 close (#908, #910) — §2.4 VMD row
+enriched with a `SEVERITY: LOAD-BEARING` note that flags the BIOS
+toggle as the single blocker for the entire R24 NVMe substrate,
+plus cross-references to `tools/nvme-hw-smoke.md §1.2.1` (the
+operator recipe) + `tests/kernel/drivers/nvme/hw_smoke.pdx` (the
+witness `nvme_hw_smoke_witness` that verifies the toggle worked).
+The row stays `PROVISIONAL` — promotion to `CONFIRMED` happens at
+the R24 HW smoke live run on the T14 G4 per
+`tools/nvme-hw-smoke.md` §3. No new rows added at this pass; R24
+ran entirely under `qemu -kernel` (no MCFG surface → PCI enumerator
+drains empty → nvme_probe returns 0 → every downstream NVMe
+substrate step takes the SKIP branch). See
+`design/round-retrospectives/r24-closure.md` § "Real-Hardware
+Verification Procedure" for the summary.*
