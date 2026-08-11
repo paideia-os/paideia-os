@@ -384,6 +384,42 @@ case "${EXPECTED}" in
         SMP_UNORDERED_HELLO=1
         EXPECTED=""
         ;;
+    boot_r21_ioapic_reroute)
+        # R21-M3-004 (#836): IOAPIC re-route structural smoke.
+        #
+        # Kernel wire-in (src/kernel/boot/kernel_main.pdx, immediately
+        # after smp_bringup_done_msg): unconditional call to
+        # ioapic_reroute_witness (tests/kernel/apic/ioapic_reroute_synth.pdx).
+        # The witness saves RTE #4 LO/HI, reprograms IRQ 4 → CPU 1 via
+        # ioapic_program_redir, reads back to verify vector + mask + dest,
+        # then restores the original RTE via ioapic_write_at. Emits
+        # "IOAPIC REROUTE STRUCT OK\n" on pass.
+        #
+        # Fingerprint contract:
+        #   SMP BRINGUP DONE
+        #   IOAPIC REROUTE STRUCT OK
+        # SMP BRINGUP DONE anchors the ordering — the witness runs right
+        # after that emit, so if the fingerprint appears without SMP
+        # BRINGUP DONE preceding it, the wire-in has drifted.
+        #
+        # Runs on -smp 4 (matches boot_smp) so the reroute-to-CPU-1 target
+        # is a valid APIC ID. The structural witness would also pass on
+        # -smp 1 (dest=1 is a valid RTE bit-pattern regardless of receiver
+        # existence, and no interrupt fires mid-witness because IF=0), but
+        # -smp 4 keeps the parallel with boot_smp's topology.
+        #
+        # Opt-in only (guarded by PAIDEIA_R21_IOAPIC=1 in pre-push): this
+        # is targeted R21.M3 validation, not a core boot smoke. The
+        # OK fingerprint appears in EVERY boot log (the witness is
+        # unconditionally wired) but only this mode asserts its presence.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r21/expected-ioapic-reroute.txt"
+        TIMEOUT=10
+        SMP_MODE=1
+        SMP_CPU_COUNT=4
+        SMP_UNORDERED_HELLO=1
+        EXPECTED=""
+        ;;
     boot_r21_ymm_preserve)
         # R21-M2-003 (#832): YMM-preservation regression fixture smoke.
         #
