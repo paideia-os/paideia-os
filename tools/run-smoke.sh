@@ -489,6 +489,34 @@ case "${EXPECTED}" in
         QEMU_CPU="max"
         EXPECTED=""
         ;;
+    boot_r22_pci_tree)
+        # R22-M2-005 (#855): PCI enumerator fingerprint.
+        #
+        # Kernel wire-in (src/kernel/boot/kernel_main.pdx, immediately
+        # after r22m1_mcfg_done): unconditional call to
+        # pci_enumerate_all(0). The enumerator gates on _mcfg_count:
+        # if MCFG was NOT discovered by phase1_acpi_gather (the -kernel
+        # boot path on QEMU q35), the enumerator emits
+        # "PCI ENUM SKIP no MCFG" and returns 0 without touching config
+        # space. If MCFG was discovered (UEFI/OVMF path, real hardware),
+        # the enumerator walks bus 0 and every bridge descendant,
+        # recording up to 256 devices in _pci_devices and emitting
+        # "PCI DEV bus=B dev=D vendor=V device=X" per device followed by
+        # "PCI ENUM DONE devices=N".
+        #
+        # Fingerprint (default -kernel path): "PCI ENUM SKIP no MCFG".
+        # This is a health-check for the enumerator's skip path — the
+        # UEFI/OVMF path with real device records requires the
+        # PAIDEIA_UEFI_OVMF flow which is not wired into this smoke
+        # yet.  When that wiring lands (R23), the fingerprint file
+        # will grow the per-device lines and the DONE marker.
+        #
+        # Opt-in only (guarded by PAIDEIA_R22_PCI_TREE=1 in pre-push).
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r22/expected-pci-tree.txt"
+        TIMEOUT=8
+        EXPECTED=""
+        ;;
     boot_panic)
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/logging/expected-panic-dump.txt"

@@ -1,0 +1,447 @@
+// src/kernel/core/pci/enum.pdx — R22-M2-001 (#851, #854, #855)
+//
+// PCI bus enumeration — recursive (bridge-descending) BDF walk.
+//
+// For every present function under every reachable bus, the enumerator
+// records a compact 32-byte pci_device_record and emits one klog line so
+// the on-wire fingerprint deterministically enumerates the topology.
+//
+// -----------------------------------------------------------------------------
+// pci_device_record layout (32 B, @align(8))
+// -----------------------------------------------------------------------------
+//
+//   +0    u16 segment
+//   +2    u8  bus
+//   +3    u8  dev
+//   +4    u8  fn
+//   +5    u8  header_type          // raw (bit 7 = multi-function flag)
+//   +6    u8  class_code
+//   +7    u8  subclass
+//   +8    u16 vendor_id
+//   +10   u16 device_id
+//   +12   u8  cap_ptr              // 0 if no capabilities-list
+//   +13   u8  _pad0
+//   +14   u16 bar_kinds_bitmap     // 2 bits × 6 BARs: 00=absent, 01=IO,
+//                                  //   10=MEM32, 11=MEM64 (populated by
+//                                  //   pci_bar_scan_device — R22.M2 optional)
+//   +16   u64 _reserved_0
+//   +24   u64 _reserved_1
+//   +32   end
+//
+// -----------------------------------------------------------------------------
+// Bus queue (bounded, 32 entries)
+// -----------------------------------------------------------------------------
+//
+// Bridges (Type-1 headers) publish a `secondary_bus` (u8 @ 0x19) that
+// downstream devices live on. The enumerator enqueues the secondary
+// bus, drains the queue in FIFO order, and de-duplicates via a
+// 256-bit visited bitmap. A 32-slot queue tolerates every consumer/
+// server chipset shipped to date; overflow silently drops.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: `mov [mem], reg32` narrow store widens → use `mov_d` / `mov_w`
+//       / `mov_b` for sized stores.
+//   G4: full-register compares.
+//
+// -----------------------------------------------------------------------------
+// MCFG-absent behavior
+// -----------------------------------------------------------------------------
+//
+// Under BIOS/`-kernel` boot, phase1_acpi_gather typically cannot find
+// the RSDP on QEMU q35, so `_mcfg_count` stays 0.  The enumerator
+// short-circuits with the "PCI ENUM SKIP no MCFG" fingerprint rather
+// than walking 65536 phantom BDF slots reading 0xFFFFFFFF.
+
+module Enum = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  pub let PCI_DEV_RECORD_SIZE  : u64 = 32
+  pub let PCI_MAX_DEVICES      : u64 = 256
+  pub let PCI_BUS_QUEUE_CAP    : u64 = 32
+
+  // ============================================================================
+  // Canonical static slots — all @align(8), .bss-backed
+  // ============================================================================
+  //
+  //   _pci_devices           : 256 × 32 B = 8192 B (= 1024 × u64)
+  //   _pci_device_count      : populated by pci_enumerate_all
+  //   _pci_bus_queue         : 32 × u8  = 32 B (aligned via u64 array of 4)
+  //   _pci_bus_visited       : 256-bit bitmap = 32 B (aligned via u64 array of 4)
+
+  pub let mut _pci_devices        : [u64; 1024] = uninit @align(8)
+  pub let mut _pci_device_count   : u64         = 0
+  pub let mut _pci_bus_queue      : [u64; 4]    = uninit @align(8)
+  pub let mut _pci_bus_visited    : [u64; 4]    = uninit @align(8)
+
+  // ============================================================================
+  // pci_enumerate_all(seg) -> u64
+  // ============================================================================
+  //
+  // SysV: (seg: u64) -> u64
+  //   rdi = segment (u16 in low bits)
+  //
+  // Returns rax = number of devices recorded.
+  //
+  // -----------------------------------------------------------------------------
+  // Stack frame
+  // -----------------------------------------------------------------------------
+  //
+  //   push rbx, rbp, r12, r13, r14, r15 (48 B)
+  //   sub rsp, 40 (5 u64 scratch slots)
+  //   Total decrement: 88 B. Entry rsp%16==8 → post-prologue rsp%16==0
+  //   for every nested call boundary (no per-call re-align needed).
+  //
+  //   Scratch layout (per BDF iteration):
+  //     [rsp+0]  = record_ptr
+  //     [rsp+8]  = hdr_type_masked (bit 7 stripped)
+  //     [rsp+16] = vendor_id
+  //     [rsp+24] = device_id
+  //     [rsp+32] = (spare)
+  //
+  //   Callee-save regs:
+  //     r12 = segment           (u16)
+  //     r13 = current bus       (u8)
+  //     r14 = current dev       (u8)
+  //     r15 = current fn        (u8)
+  //     rbx = queue head cursor (0..32)
+  //     rbp = queue tail cursor (0..32)
+
+  pub let pci_enumerate_all : (u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (seg: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R22-M2-001 (#851/#854/#855). PCI recursive-descent bus enumerator. Body: (1) MCFG-absence guard: read _mcfg_count; if 0 → emit klog_s1(INFO, PCI_, tag_pci_enum_skip_no_mcfg), zero _pci_device_count, return 0. This is the primary path under BIOS/`-kernel` boot on QEMU q35 where the RSDP is not published. (2) Init: zero _pci_device_count and _pci_bus_visited (4 × u64 = 32 B). Enqueue bus 0, mark visited bit 0. (3) Outer bus-drain loop (rbx=head, rbp=tail; while head<tail dequeue). (4) Inner dev/fn iteration (r14 0..31, r15 0..7). Per BDF: pci_probe_device — absent + fn==0 breaks fn-loop early (single-function-device optimisation); absent + fn>0 just skips. (5) For present function: populate record[count] via sequential pci_config_read_u{8,16} calls into record slots at 32-byte stride, populate vendor/device/class/subclass/header_type/cap_ptr. bar_kinds_bitmap kept zero at M2 — populated by pci_bar_scan_device on driver-attach in R23. (6) Emit klog_s1_x4(INFO, PCI_, tag_pci_dev, k_bus, bus, k_dev, dev, k_vendor, vendor, k_device, device) — 4 KV pairs is klog's max arity. (7) Bridge check: if (header_type & 0x7F) == 1 → read secondary_bus (u8 @ 0x19); if not already in visited bitmap → mark visited and enqueue. (8) On outer loop exit: emit klog_s1_d1(INFO, PCI_, tag_pci_enum_done, k_devices, count); return count. All nested pci_config_read_u{8,16} preserve callee-saves per SysV — record_ptr and per-BDF scratch survive across every read via stack slots [rsp+0..32]. Stack invariant: 6 pushes + sub rsp,40 = 88 B → rsp%16==0 (post-prologue). klog_s1_x4 5-push emit path uses one 8-byte pre-align (sub rsp,8; push5args; call; add rsp,40; add rsp,8) matching core/int/dump.pdx L80 pattern. G1 sized stores; G4 full-reg compares. Reserved labels avoided (loop → enum_bus_drain/enum_dev_iter/enum_fn_iter). Queue overflow silently drops (no counter — real overflow means firmware topology exceeds every consumer/server board ever built).",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 40;
+
+        // ---- Save segment. ----
+        mov r12, rdi;
+
+        // ---- (1) MCFG absence guard. ----
+        mov rax, [rip + _mcfg_count];
+        cmp rax, 0;
+        jne enum_mcfg_present;
+
+        // Emit "PCI ENUM SKIP no MCFG".
+        mov rdi, 3;                                  // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_PCI_];
+        lea rdx, [rip + tag_pci_enum_skip_no_mcfg];
+        call klog_s1;
+
+        // Zero _pci_device_count and return 0.
+        xor rax, rax;
+        mov [rip + _pci_device_count], rax;
+        jmp enum_epilogue;
+
+      enum_mcfg_present:
+
+        // ---- (2) Zero device count + visited bitmap (4 × u64 = 32 B). ----
+        xor rax, rax;
+        mov [rip + _pci_device_count], rax;
+        mov [rip + _pci_bus_visited + 0],  rax;
+        mov [rip + _pci_bus_visited + 8],  rax;
+        mov [rip + _pci_bus_visited + 16], rax;
+        mov [rip + _pci_bus_visited + 24], rax;
+
+        // ---- (3) Enqueue bus 0 into queue[0] as a u8. ----
+        lea rax, [rip + _pci_bus_queue];
+        xor rcx, rcx;
+        mov_b [rax + 0], rcx;
+
+        // Set visited bit 0 (byte 0, bit 0).
+        lea rax, [rip + _pci_bus_visited];
+        xor rcx, rcx;
+        mov_b rcx, [rax + 0];
+        or rcx, 1;
+        mov_b [rax + 0], rcx;
+
+        // head = 0, tail = 1.
+        xor rbx, rbx;
+        mov rbp, 1;
+
+        // ================================================================
+        // (4) Bus-drain outer loop.
+        // ================================================================
+      enum_bus_drain:
+        cmp rbx, rbp;
+        jae enum_bus_drain_done;
+
+        // Load current bus into r13.
+        lea rax, [rip + _pci_bus_queue];
+        xor r13, r13;
+        mov_b r13, [rax + rbx*1];
+        add rbx, 1;
+
+        // ---- dev 0..31 ----
+        xor r14, r14;
+      enum_dev_iter:
+        cmp r14, 32;
+        jae enum_dev_iter_done;
+
+        // ---- fn 0..7 ----
+        xor r15, r15;
+      enum_fn_iter:
+        cmp r15, 8;
+        jae enum_fn_iter_done;
+
+        // pci_probe_device(seg, bus, dev, fn)
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r14;
+        mov rcx, r15;
+        call pci_probe_device;
+
+        // If 0 (absent):
+        //   - fn==0: single-function absent → skip whole slot.
+        //   - fn>0:  just skip this function.
+        cmp rax, 0;
+        jne enum_fn_present;
+
+        cmp r15, 0;
+        je enum_fn_iter_done;
+        jmp enum_fn_next;
+
+      enum_fn_present:
+        // ---- (5) Compute record ptr and stash it. ----
+        mov rcx, [rip + _pci_device_count];
+        cmp rcx, 256;                                // PCI_MAX_DEVICES
+        jae enum_skip_record;                        // silent overflow
+
+        mov rax, rcx;
+        shl rax, 5;                                  // *32
+        lea rdi, [rip + _pci_devices];
+        add rax, rdi;                                // rax = &record[count]
+        mov [rsp + 0], rax;                          // stash record_ptr
+
+        // ---- +0 u16 segment ----
+        mov_w [rax + 0], r12;
+
+        // ---- +2 u8 bus ----
+        mov_b [rax + 2], r13;
+
+        // ---- +3 u8 dev ----
+        mov_b [rax + 3], r14;
+
+        // ---- +4 u8 fn ----
+        mov_b [rax + 4], r15;
+
+        // ---- header_type (u8 @ 0x0E) → +5 ----
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r14;
+        mov rcx, r15;
+        mov r8, 0x0E;
+        call pci_config_read_u8;
+        mov rcx, [rsp + 0];
+        mov_b [rcx + 5], rax;
+        and rax, 0x7F;                               // strip multi-function bit
+        mov [rsp + 8], rax;                          // stash hdr_type_masked
+
+        // ---- class_code (u8 @ 0x0B) → +6 ----
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r14;
+        mov rcx, r15;
+        mov r8, 0x0B;
+        call pci_config_read_u8;
+        mov rcx, [rsp + 0];
+        mov_b [rcx + 6], rax;
+
+        // ---- subclass (u8 @ 0x0A) → +7 ----
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r14;
+        mov rcx, r15;
+        mov r8, 0x0A;
+        call pci_config_read_u8;
+        mov rcx, [rsp + 0];
+        mov_b [rcx + 7], rax;
+
+        // ---- vendor_id (u16 @ 0x00) → +8 ----
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r14;
+        mov rcx, r15;
+        mov r8, 0x00;
+        call pci_config_read_u16;
+        mov rcx, [rsp + 0];
+        mov_w [rcx + 8], rax;
+        mov [rsp + 16], rax;                         // stash vendor_id
+
+        // ---- device_id (u16 @ 0x02) → +10 ----
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r14;
+        mov rcx, r15;
+        mov r8, 0x02;
+        call pci_config_read_u16;
+        mov rcx, [rsp + 0];
+        mov_w [rcx + 10], rax;
+        mov [rsp + 24], rax;                         // stash device_id
+
+        // ---- cap_ptr (u8 @ 0x34) → +12 ----
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r14;
+        mov rcx, r15;
+        mov r8, 0x34;
+        call pci_config_read_u8;
+        mov rcx, [rsp + 0];
+        mov_b [rcx + 12], rax;
+
+        // ---- Zero tail (u8 _pad0 @+13, u16 bar_kinds_bitmap @+14,
+        //      u64 _reserved_0 @+16, u64 _reserved_1 @+24). ----
+        mov rcx, [rsp + 0];
+        xor rax, rax;
+        mov_b [rcx + 13], rax;
+        mov_w [rcx + 14], rax;
+        mov [rcx + 16], rax;
+        mov [rcx + 24], rax;
+
+        // Advance _pci_device_count.
+        mov rax, [rip + _pci_device_count];
+        add rax, 1;
+        mov [rip + _pci_device_count], rax;
+
+        // ---- (6) klog_s1_x4(INFO, PCI_, tag_pci_dev,
+        //          k_bus, bus, k_dev, dev, k_vendor, vendor, k_device, device)
+        //
+        // Stack extended-args convention (klog_s1_x4 @rbp+16..48):
+        //   [rbp+16]=v2(dev), [rbp+24]=k3, [rbp+32]=v3(vendor),
+        //   [rbp+40]=k4, [rbp+48]=v4(device)
+        // Push in reverse order (rightmost first). Pre-align sub rsp,8
+        // then 5 × push (40 B) → rsp%16==0 at call. ---- ----
+        sub rsp, 8;
+        mov rax, [rsp + 32];                         // device_id (was [rsp+24] pre-sub)
+        push rax;                                    // v4 (rightmost)
+        lea rax, [rip + k_device];
+        push rax;                                    // k4
+        mov rax, [rsp + 40];                         // vendor_id (was [rsp+16] pre-sub-8-and-2-push)
+        push rax;                                    // v3
+        lea rax, [rip + k_vendor];
+        push rax;                                    // k3
+        mov rax, r14;                                // dev
+        push rax;                                    // v2
+
+        mov rdi, 3;                                  // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_PCI_];
+        lea rdx, [rip + tag_pci_dev];
+        lea rcx, [rip + k_bus];
+        mov r8, r13;                                 // v1 = bus
+        lea r9, [rip + k_dev];
+        call klog_s1_x4;
+
+        add rsp, 40;                                 // pop 5 pushed args
+        add rsp, 8;                                  // undo pre-align
+
+        // ---- (7) Bridge check ----
+        mov rax, [rsp + 8];                          // hdr_type_masked
+        cmp rax, 1;                                  // Type 1 (bridge)?
+        jne enum_after_bridge;
+
+        // secondary_bus (u8 @ 0x19)
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r14;
+        mov rcx, r15;
+        mov r8, 0x19;
+        call pci_config_read_u8;
+
+        // rax = sec. Skip 0 (self / uninitialized bridge).
+        cmp rax, 0;
+        je enum_after_bridge;
+
+        // Visited: byte = sec >> 3, bit = sec & 7.
+        mov r10, rax;                                // r10 = sec (also enqueue value)
+        mov r11, rax;
+        shr r11, 3;                                  // r11 = byte index
+        mov r8, rax;
+        and r8, 7;                                   // r8 = bit index
+
+        lea rdi, [rip + _pci_bus_visited];
+        xor rcx, rcx;
+        mov_b rcx, [rdi + r11*1];
+
+        // r9 = 1 << bit_index
+        mov r9, 1;
+        push rcx;
+        mov rcx, r8;
+        shl r9, cl;
+        pop rcx;
+
+        // If already visited, skip.
+        mov r8, rcx;
+        and r8, r9;
+        jnz enum_after_bridge;
+
+        // Mark visited.
+        or rcx, r9;
+        // Compute address into scratch reg (mov_b store does not
+        // support reg+reg SIB in current encoder).
+        mov r8, rdi;
+        add r8, r11;
+        mov_b [r8 + 0], rcx;
+
+        // Enqueue if space.
+        cmp rbp, 32;
+        jae enum_after_bridge;
+
+        lea rdi, [rip + _pci_bus_queue];
+        mov r8, rdi;
+        add r8, rbp;
+        mov_b [r8 + 0], r10;
+        add rbp, 1;
+
+      enum_after_bridge:
+        jmp enum_fn_next;
+
+      enum_skip_record:
+        // Overflow — silent drop. Fall into fn advance.
+
+      enum_fn_next:
+        add r15, 1;
+        jmp enum_fn_iter;
+
+      enum_fn_iter_done:
+        add r14, 1;
+        jmp enum_dev_iter;
+
+      enum_dev_iter_done:
+        jmp enum_bus_drain;
+
+      enum_bus_drain_done:
+
+        // ---- (8) Emit "PCI ENUM DONE devices=<N>" ----
+        mov rdi, 3;                                  // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_PCI_];
+        lea rdx, [rip + tag_pci_enum_done];
+        lea rcx, [rip + k_devices];
+        mov r8, [rip + _pci_device_count];
+        call klog_s1_d1;
+
+        mov rax, [rip + _pci_device_count];
+
+      enum_epilogue:
+        add rsp, 40;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
