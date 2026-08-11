@@ -1,0 +1,376 @@
+// src/kernel/core/iommu/vtd_ctx.pdx — R22-M4-003 (#863)
+//
+// VT-d root-table + context-table programming primitives. These are
+// the tables the VT-d hardware unit walks (RTADDR → root_entry[bus]
+// → context_entry[dev*8+fn] → SLPT root) on every device-issued DMA
+// to translate the (bus, dev, fn) source-ID + IOVA into a host PA
+// (Intel VT-d 4.0 §3.4).
+//
+// -----------------------------------------------------------------------------
+// Root table layout (VT-d 4.0 §9.1)
+// -----------------------------------------------------------------------------
+//
+// 4 KiB page (256 entries × 16 B), indexed by PCI bus number 0..255.
+// Each root-entry (RTE) is two qwords:
+//
+//   qword[0]:
+//     bit 0        Present (P)
+//     bits 1..11   reserved / mbz
+//     bits 12..63  CTP (Context-Table Pointer, 4KB-aligned host PA)
+//   qword[1]:
+//     reserved (mbz for scalable-mode-disabled)
+//
+// -----------------------------------------------------------------------------
+// Context table layout (VT-d 4.0 §9.3)
+// -----------------------------------------------------------------------------
+//
+// 4 KiB page (256 entries × 16 B), one per bus, indexed by
+// (device << 3) | function (0..255). Each context-entry (CTX) is two
+// qwords (legacy mode; scalable-mode is R23+ scope):
+//
+//   qword[0]:
+//     bit 0        Present (P)
+//     bit 1        Fault Processing Disable (FPD)
+//     bits 2..3    Translation Type (TT):
+//                    00 = legacy-untranslated + SLPT walk
+//                    01 = legacy-untranslated + SLPT walk + PT_ATS
+//                    10 = pass-through (identity)
+//     bits 4..11   reserved / mbz
+//     bits 12..63  SLPTPTR (Second-Level Page-Table pointer, PA)
+//   qword[1]:
+//     bits 0..2    AW (Address Width): 010 = 48-bit / 4-level
+//                                       011 = 57-bit / 5-level (R23+)
+//     bits 3..6    IGN (ignored)
+//     bits 8..23   DID (Domain Identifier — hardware TLB tag)
+//     bits 24..63  reserved / mbz
+//
+// -----------------------------------------------------------------------------
+// SRTP flow (VT-d 4.0 §6.6)
+// -----------------------------------------------------------------------------
+//
+// Programming a new root-table pointer requires the "Set Root Table
+// Pointer" ceremony:
+//   (1) Write root-table PA (4KB-aligned) + TTM (Translation Table Mode
+//       = 00 for legacy) into RTADDR (0x20).
+//   (2) Set GCMD.SRTP (bit 30). This is edge-triggered: hardware moves
+//       the RTADDR staging register into the working register.
+//   (3) Poll GSTS.RTPS (bit 30) until 1 — confirms the ceremony
+//       completed. Deferred to R22.M5+ (needs live MMIO).
+//   (4) Issue global context-cache invalidation via CCMD.
+//   (5) Issue global IOTLB invalidation via IOTLB register (higher offset).
+//
+// R22.M4 lands (1) + (2) as `vtd_set_root`. Poll (3) and invalidations
+// (4)(5) are R22.M5 wire-up work.
+//
+// -----------------------------------------------------------------------------
+// Storage — canonical static slot for the root-table VA + PA
+// -----------------------------------------------------------------------------
+//
+// The root table is a single 4KB page — one per IOMMU unit. R22.M4
+// only supports one unit (matches the constraint that we don't
+// actually enable translation). R23+ scales to N units by turning
+// _vtd_root_pa into an array indexed by unit index.
+//
+// Context tables are allocated lazily per-bus-touched (R22.M5 driver
+// attach), not eagerly at boot — a system with only bus 0 populated
+// wastes 255 × 4KB = 1MB of context-table pages if we eager-allocate.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: mov [mem], reg32 widens → mov_d for u32 stores.
+//   phys_alloc VA/PA contract: see phys_alloc.pdx L23-46; store
+//       (phys_alloc_result - KERNEL_VMA_BASE) in hardware-visible slots
+//       (root-table PA, context-entry SLPTPTR), keep VA for software
+//       indexing.
+
+module VtdCtx = structure {
+
+  // ============================================================================
+  // Layout constants
+  // ============================================================================
+
+  pub let VTD_TABLE_PAGE_SIZE       : u64 = 4096
+  pub let VTD_ROOT_ENTRIES          : u64 = 256
+  pub let VTD_CONTEXT_ENTRIES       : u64 = 256
+  pub let VTD_ENTRY_SIZE            : u64 = 16
+
+  // Root-entry bits
+  pub let VTD_RTE_PRESENT           : u64 = 0x1
+
+  // Context-entry bits (qword[0])
+  pub let VTD_CTX_PRESENT           : u64 = 0x1
+  pub let VTD_CTX_FPD               : u64 = 0x2
+  pub let VTD_CTX_TT_LEGACY         : u64 = 0x0    // TT bits (3:2) = 00
+  pub let VTD_CTX_TT_PASSTHRU       : u64 = 0x8    // TT bits (3:2) = 10
+
+  // Context-entry bits (qword[1])
+  pub let VTD_CTX_AW_48             : u64 = 0x2    // AW bits (2:0) = 010 (4-level)
+  pub let VTD_CTX_AW_57             : u64 = 0x3    // AW bits (2:0) = 011 (5-level R23+)
+
+  // Kernel VMA base — must match core/mm/aspace_map.pdx and
+  // core/mm/phys_alloc.pdx (#652 / #658).
+  pub let VTD_KERNEL_VMA_BASE       : u64 = 0xFFFF800000000000
+
+  // Address masks
+  pub let VTD_TABLE_ADDR_MASK       : u64 = 0xFFFFFFFFFFFFF000    // bits 12..63
+  pub let VTD_DID_SHIFT             : u64 = 8                     // DID field bit 8..23
+
+  // ============================================================================
+  // Canonical static slot — root-table VA + PA
+  // ============================================================================
+  //
+  //   _vtd_root_va : kernel VA of the 4KB root-table page (phys_alloc-form)
+  //   _vtd_root_pa : hardware-visible PA (VA - KERNEL_VMA_BASE)
+  //
+  // Both zero at .bss init — vtd_root_init() populates them idempotently.
+
+  pub let mut _vtd_root_va : u64 = 0
+  pub let mut _vtd_root_pa : u64 = 0
+
+  // ============================================================================
+  // vtd_root_init — allocate + zero the 4 KiB root-table page
+  // ============================================================================
+  //
+  // SysV: () -> u64
+  //
+  // Returns rax = root-table PA (hardware-visible; 4KB-aligned).
+  // Returns 0 on phys_alloc failure.
+  //
+  // Idempotent: returns the cached _vtd_root_pa if already initialized.
+  //
+  // Allocation source: phys_alloc(order=0) — one 4KB page. Per phys_alloc
+  // contract (phys_alloc.pdx L23-46), the returned value is a kernel VA
+  // (`&_phys_page_pool + i*4096`). We store both the VA (for future
+  // software indexing during vtd_context_program) and the derived PA
+  // (VA - KERNEL_VMA_BASE) which is what hardware ultimately walks.
+
+  pub let vtd_root_init : () -> u64 !{mem} @{boot} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R22-M4-003 (#863). Allocates + zeros the VT-d root-table page (4 KiB, 256 × 16-byte RTEs). Body: (1) Idempotence check — read _vtd_root_pa; if nonzero, return cached value (no reallocation). (2) phys_alloc(0) → rax = kernel VA of a fresh 4KB page. If 0, propagate the failure. (3) Zero the page — 512 × 8-byte stores. phys_alloc does NOT zero its returned pages (see aspace_map.pdx L86-108 for the identical zero discipline). (4) Compute PA = VA - KERNEL_VMA_BASE — the hardware-visible value RTADDR must eventually be programmed with. (5) Cache both VA (for software indexing) and PA (for hardware programming) in _vtd_root_va / _vtd_root_pa. (6) Return PA. Stack: 2-push callee-save (rbx=VA, r12=PA); rsp entry %16==8; after 2 pushes %16==8; sub rsp,8 pre-align to %16==0 for the phys_alloc call; add rsp,8 restore. Callee-save discipline: phys_alloc preserves rbx/r12..r15 per SysV (verified via phys_alloc.pdx L50 push discipline). NOT WIRED AT M4 BOOT — kernel_main never calls this. Encoder: cmp / je / call / mov / sub / xor / mov [mem], reg / add — all pre-#863 proven.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;                            // align rsp to 16 for phys_alloc call
+
+        // ---- (1) Idempotence check ----
+        mov rax, [rip + _vtd_root_pa];
+        cmp rax, 0;
+        jne vtd_root_init_cached;
+
+        // ---- (2) phys_alloc(order=0) ----
+        mov rdi, 0;
+        call phys_alloc;
+        cmp rax, 0;
+        je  vtd_root_init_oom;
+
+        // rax = kernel VA of the fresh page.
+        mov rbx, rax;                          // rbx = VA
+
+        // ---- (3) Zero the page (512 × 8-byte stores) ----
+        xor rcx, rcx;
+        xor rdx, rdx;
+      vtd_root_zero_loop:
+        cmp rcx, 512;
+        jae vtd_root_zero_done;
+        mov [rbx + rcx * 8], rdx;
+        add rcx, 1;
+        jmp vtd_root_zero_loop;
+      vtd_root_zero_done:
+
+        // ---- (4) PA = VA - KERNEL_VMA_BASE ----
+        mov r12, rbx;
+        mov rdx, 0xFFFF800000000000;           // KERNEL_VMA_BASE (movabs)
+        sub r12, rdx;
+
+        // ---- (5) Cache VA + PA ----
+        mov [rip + _vtd_root_va], rbx;
+        mov [rip + _vtd_root_pa], r12;
+
+        // ---- (6) Return PA ----
+        mov rax, r12;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      vtd_root_init_cached:
+        // rax already holds cached PA.
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      vtd_root_init_oom:
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // vtd_context_program — write one context-table entry for a BDF
+  // ============================================================================
+  //
+  // SysV: (root_va: u64, ctx_table_va: u64, bus: u64, devfn: u64,
+  //        slpt_root_pa: u64, domain_id: u64) -> u64
+  //
+  //   rdi = root-table VA (from _vtd_root_va after vtd_root_init).
+  //   rsi = context-table VA (caller-allocated + zeroed 4KB page; also
+  //         needs its PA written into root_va[bus] — done here.
+  //         Caller supplies the VA for software indexing; the function
+  //         derives the PA via VA - KERNEL_VMA_BASE, mirroring the
+  //         phys_alloc convention).
+  //   rdx = PCI bus number (0..255).
+  //   rcx = devfn = (dev << 3) | fn (0..255).
+  //   r8  = SLPT root PA (hardware-visible, 4KB-aligned host PA).
+  //   r9  = domain_id (0..65535 — the hardware DID/TLB-tag).
+  //
+  // Returns rax = 0 on success. (Reserved for future error codes; the
+  // MVP path has no error branch beyond parameter validation which is
+  // caller's responsibility.)
+  //
+  // Ordering discipline: writes are plain memory stores (not MMIO) —
+  // hardware only reads these tables during device DMA translation
+  // (which cannot happen until translation is enabled). No fence
+  // needed here. R22.M5 enable path issues global context-cache
+  // invalidation after batching all programming.
+
+  pub let vtd_context_program : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{boot} =
+    fn (root_va: u64, ctx_table_va: u64, bus: u64, devfn: u64, slpt_root_pa: u64, domain_id: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R22-M4-003 (#863). Programs one VT-d context-table entry + backfills the root-table entry that points at the containing context-table page. Body: (a) Root-entry linkage: compute root_entry_va = root_va + (bus * 16); if RTE.Present == 0, program qword[0] = (ctx_table_va - KERNEL_VMA_BASE) | 1 (P bit). qword[1] left zero (legacy-mode reserved). Re-programming with the same ctx_table is idempotent by construction — the CTP field already points there. (b) Context-entry program: compute ctx_entry_va = ctx_table_va + (devfn * 16); write qword[0] = (slpt_root_pa & 0xFFFFFFFFFFFFF000) | VTD_CTX_TT_LEGACY | VTD_CTX_PRESENT — SLPT PA merged with TT=00 (legacy untranslated + SLPT) + P=1. Write qword[1] = (domain_id << 8) | VTD_CTX_AW_48 — DID in bits 8..23, AW=010 for 4-level 48-bit SLPT. Callee-save: 5-push (rbx=root_va, r12=ctx_table_va, r13=bus, r14=devfn, r15=slpt_root_pa; domain_id stashed via r9 already in a callee-save-safe spot since r9 is caller-save only during nested calls, of which there are none in this leaf function). rsp entry %16==8 → 5 pushes %16==0 → no nested call so alignment moot but preserved for consistency with the codebase's push discipline. Encoder: mov / lea / shl / or / cmp / je / add / mov [reg+reg*imm], reg — all pre-#863 proven. G1 not applicable (all writes are 64-bit, source is a 64-bit register so REX.W-widening is the intended width).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                          // rbx = root_va
+        mov r12, rsi;                          // r12 = ctx_table_va
+        mov r13, rdx;                          // r13 = bus
+        mov r14, rcx;                          // r14 = devfn
+        mov r15, r8;                           // r15 = slpt_root_pa
+        // r9 = domain_id already in r9 (used late; leaf fn so no clobber)
+
+        // ---- (a) Root-entry linkage ----
+        // rte_va = root_va + bus * 16
+        mov rax, r13;
+        shl rax, 4;                            // bus * 16
+        mov r10, rbx;
+        add r10, rax;                          // r10 = &root_va[bus]
+
+        // Check P bit on qword[0].
+        mov rax, [r10 + 0];
+        mov r11, rax;
+        and r11, 1;
+        cmp r11, 1;
+        je  vtd_ctx_skip_rte;
+
+        // Program qword[0] = (ctx_table_va - KERNEL_VMA_BASE) | 1
+        mov rax, r12;
+        mov rdx, 0xFFFF800000000000;           // KERNEL_VMA_BASE
+        sub rax, rdx;                          // rax = ctx_table PA
+        or  rax, 1;                            // P bit
+        mov [r10 + 0], rax;
+
+        // Zero qword[1] (defensive — .bss should already be zero).
+        xor rax, rax;
+        mov [r10 + 8], rax;
+
+      vtd_ctx_skip_rte:
+
+        // ---- (b) Context-entry program ----
+        // ctx_va = ctx_table_va + devfn * 16
+        mov rax, r14;
+        shl rax, 4;                            // devfn * 16
+        mov r10, r12;
+        add r10, rax;                          // r10 = &ctx_table_va[devfn]
+
+        // qword[0] = (slpt_root_pa & TABLE_ADDR_MASK) | TT_LEGACY (0) | PRESENT (1)
+        mov rax, r15;
+        mov rdx, 0xFFFFFFFFFFFFF000;           // TABLE_ADDR_MASK
+        and rax, rdx;
+        or  rax, 1;                            // P bit (TT_LEGACY = 0 = no bits set)
+        mov [r10 + 0], rax;
+
+        // qword[1] = (domain_id << 8) | AW_48 (0x2)
+        mov rax, r9;
+        shl rax, 8;                            // DID field @ bits 8..23
+        or  rax, 2;                            // AW = 010 (48-bit, 4-level)
+        mov [r10 + 8], rax;
+
+        // Return 0 (success).
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // vtd_set_root — write RTADDR + issue SRTP (Set Root Table Pointer)
+  // ============================================================================
+  //
+  // SysV: (base: u64, root_pa: u64) -> ()
+  //
+  //   rdi = VT-d hardware unit MMIO base.
+  //   rsi = root-table PA (from vtd_root_init; 4KB-aligned).
+  //
+  // Executes step (1) + (2) of the SRTP ceremony (see module header):
+  //   - vtd_write_u64(base, VTD_REG_RTADDR=0x20, root_pa) — TTM=00
+  //     (legacy) since low 12 bits of root_pa are 0 by 4K alignment.
+  //   - Read current GCMD, set SRTP bit (bit 30), write back.
+  //
+  // Does NOT poll GSTS.RTPS — that's R22.M5 wire-up work (needs live
+  // MMIO on a real IOMMU-emulating platform).
+  //
+  // NOT WIRED AT M4 BOOT.
+
+  pub let vtd_set_root : (u64, u64) -> () !{sysreg, mem} @{boot} =
+    fn (base: u64, root_pa: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R22-M4-003 (#863). Executes steps (1)+(2) of the VT-d SRTP (Set Root Table Pointer) ceremony (VT-d 4.0 §6.6). Body: (1) 2-push callee-save (rbx=base, r12=root_pa); rsp entry %16==8 → 2 pushes %16==8; sub rsp,8 pre-align to %16==0 for nested vtd_write_* calls. (2) vtd_write_u64(base, VTD_REG_RTADDR=0x20, root_pa) — programs the RTADDR staging register. Low 12 bits of root_pa are 0 by 4K alignment (guaranteed by phys_alloc + vtd_root_init) so TTM (bits 10..11) = 00 = legacy mode; scalable-mode (TTM=01) is R23+. (3) Read GCMD via vtd_read_u32(base, VTD_REG_GCMD=0x18). Set SRTP bit (0x40000000). Write back via vtd_write_u32. SRTP is edge-triggered: hardware moves RTADDR staging → working on the 0→1 transition. Poll GSTS.RTPS deferred to R22.M5. NOT WIRED AT M4 BOOT. Encoder: mov / call / or — all pre-#863 proven.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;                            // align rsp to 16 for nested calls
+
+        mov rbx, rdi;                          // rbx = base
+        mov r12, rsi;                          // r12 = root_pa
+
+        // ---- (2) Program RTADDR ----
+        mov rdi, rbx;
+        mov rsi, 0x20;                         // VTD_REG_RTADDR
+        mov rdx, r12;
+        call vtd_write_u64;
+
+        // ---- (3) Issue SRTP via GCMD ----
+        mov rdi, rbx;
+        mov rsi, 0x18;                         // VTD_REG_GCMD
+        call vtd_read_u32;
+        mov rdx, 0x40000000;                   // VTD_GCMD_SRTP
+        or  rax, rdx;
+        mov rdx, rax;
+        mov rdi, rbx;
+        mov rsi, 0x18;
+        call vtd_write_u32;
+
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

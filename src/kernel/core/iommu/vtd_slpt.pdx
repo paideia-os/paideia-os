@@ -1,0 +1,402 @@
+// src/kernel/core/iommu/vtd_slpt.pdx — R22-M4-004 (#864)
+//
+// VT-d Second-Level Page Table (SLPT) walker + allocator. Each VT-d
+// context-entry's SLPTPTR field points at a per-device (or per-domain)
+// 4-level page-table root; VT-d hardware walks it identically to
+// x86-64 paging (SL-PML4 → SL-PDPT → SL-PD → SL-PT) with slightly
+// different bit semantics (Intel VT-d 4.0 §6.2.3.3 Table 6-11).
+//
+// -----------------------------------------------------------------------------
+// SLPT entry layout (VT-d 4.0 Table 6-11, legacy scalable-mode-disabled)
+// -----------------------------------------------------------------------------
+//
+//   Non-leaf (SL-PML4E, SL-PDPTE, SL-PDE):
+//     bit 0        R (Read)     — must be 1 for a valid entry (also acts as P)
+//     bit 1        W (Write)    — controls downstream write permission
+//     bit 2        X (Execute)  — controls downstream execute (with EAF)
+//     bit 7        PS (Page Size) — 1 = maps a large page here (2M at PDE,
+//                                       1G at PDPTE); 0 = table pointer
+//     bits 12..63  next-level table PA (4KB-aligned)
+//
+//   Leaf (SL-PTE, always 4KB):
+//     bit 0        R
+//     bit 1        W
+//     bit 2        X
+//     bit 62       SM (Snoop; ATS)  — R23+
+//     bit 63       SNP (Snoop)      — R23+
+//     bits 12..63  host PA (4KB-aligned)
+//
+// R22.M4 uses `R|W = 0b11` = 0x3 for all non-leaf entries and
+// `R|W|X = 0b111` = 0x7 for leaf entries (SLPT_FLAG_LEAF_RWX).
+//
+// -----------------------------------------------------------------------------
+// VA index extraction (identical to x86-64 4-level paging)
+// -----------------------------------------------------------------------------
+//
+//   pml4_idx  = (iova >> 39) & 0x1FF
+//   pdpt_idx  = (iova >> 30) & 0x1FF
+//   pd_idx    = (iova >> 21) & 0x1FF
+//   pt_idx    = (iova >> 12) & 0x1FF
+//
+// -----------------------------------------------------------------------------
+// PA vs VA conventions (mirror aspace_map.pdx)
+// -----------------------------------------------------------------------------
+//
+// phys_alloc returns kernel VA (`&_phys_page_pool + i*4096`), not a
+// genuine PA (see phys_alloc.pdx L23-46). Every SLPT entry write
+// stores (VA - KERNEL_VMA_BASE) as the frame field; every SLPT walk
+// that continues descending recovers VA via (PA + KERNEL_VMA_BASE).
+// The witness in tests/kernel/iommu/vtd_slpt_synth.pdx exercises the
+// full round-trip to guard against a silent VA/PA mix-up.
+//
+// -----------------------------------------------------------------------------
+// R22.M4 MVP scope
+// -----------------------------------------------------------------------------
+//
+// vtd_slpt_map handles one 4 KiB page per call — matching aspace_map's
+// shape. Large-page mapping (2 MiB via PS bit at PDE, 1 GiB at PDPTE)
+// is R23+ scope; loop-mapping a 2 MiB region in the caller is fine
+// for MVP substrate use.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: mov [mem], reg32 widens → mov_d for u32 stores (N/A here —
+//       all SLPT entry writes are 64-bit).
+//   Reserved-label prefix `slpt_map_*` avoids `loop`, `next`, `if`.
+
+module VtdSlpt = structure {
+
+  // ============================================================================
+  // Layout constants
+  // ============================================================================
+
+  pub let SLPT_ENTRIES_PER_TABLE    : u64 = 512
+  pub let SLPT_TABLE_SIZE           : u64 = 4096
+
+  pub let SLPT_SHIFT_PML4           : u64 = 39
+  pub let SLPT_SHIFT_PDPT           : u64 = 30
+  pub let SLPT_SHIFT_PD             : u64 = 21
+  pub let SLPT_SHIFT_PT             : u64 = 12
+  pub let SLPT_INDEX_MASK           : u64 = 0x1FF
+
+  // Entry permission bits
+  pub let SLPT_FLAG_R               : u64 = 0x1
+  pub let SLPT_FLAG_W               : u64 = 0x2
+  pub let SLPT_FLAG_X               : u64 = 0x4
+  pub let SLPT_FLAG_PS              : u64 = 0x80
+
+  // Convenience combos
+  pub let SLPT_FLAG_NONLEAF_RW      : u64 = 0x3    // R|W for non-leaf table ptrs
+  pub let SLPT_FLAG_LEAF_RWX        : u64 = 0x7    // R|W|X for leaf pages
+
+  // Address masks
+  pub let SLPT_TABLE_ADDR_MASK      : u64 = 0xFFFFFFFFFFFFF000    // bits 12..63
+
+  // Return codes
+  pub let SLPT_MAP_OK               : u64 = 0
+  pub let SLPT_MAP_OOM              : u64 = 4294967294
+  pub let SLPT_MAP_HUGE             : u64 = 4294967293
+
+  // Kernel VMA base (same as aspace_map / vtd_ctx).
+  pub let SLPT_KERNEL_VMA_BASE      : u64 = 0xFFFF800000000000
+
+  // ============================================================================
+  // vtd_slpt_root_alloc — allocate + zero a fresh SL-PML4 page
+  // ============================================================================
+  //
+  // SysV: () -> u64
+  //
+  // Returns rax = kernel VA of the fresh SL-PML4 (phys_alloc-form).
+  // Callers that eventually program this into a VT-d context-entry
+  // (vtd_context_program) MUST convert VA → PA at that boundary via
+  // (VA - KERNEL_VMA_BASE). vtd_slpt_map operates on the VA directly.
+  //
+  // Returns 0 on phys_alloc failure.
+
+  pub let vtd_slpt_root_alloc : () -> u64 !{mem} @{boot} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R22-M4-004 (#864). Allocates + zeros a fresh 4KB SL-PML4 (512 × 8-byte entries). Body: (1) phys_alloc(0) → rax = fresh page VA; 0 on OOM (propagate). (2) Zero the 512 u64 slots via a tight loop. phys_alloc doesn't zero (see aspace_map.pdx L86-108 for identical rationale). (3) Return VA. Stack: 1-push callee-save (rbx=VA); rsp entry %16==8; after 1 push %16==0. sub rsp,8 pre-align back to %16==0 for nested phys_alloc call — wait: after 1 push %16 is 0, phys_alloc needs %16==0 before call, so we need one more push OR sub rsp,8. Use sub rsp,8 to keep single-callee-save shape.",
+      block: {
+        push rbx;
+        sub rsp, 8;                            // align rsp to 16 for phys_alloc
+
+        mov rdi, 0;
+        call phys_alloc;
+        cmp rax, 0;
+        je  vtd_slpt_alloc_oom;
+
+        mov rbx, rax;                          // rbx = VA
+
+        // Zero 512 × 8-byte entries.
+        xor rcx, rcx;
+        xor rdx, rdx;
+      vtd_slpt_root_zero_loop:
+        cmp rcx, 512;
+        jae vtd_slpt_root_zero_done;
+        mov [rbx + rcx * 8], rdx;
+        add rcx, 1;
+        jmp vtd_slpt_root_zero_loop;
+      vtd_slpt_root_zero_done:
+
+        mov rax, rbx;
+        add rsp, 8;
+        pop rbx;
+        ret;
+
+      vtd_slpt_alloc_oom:
+        xor rax, rax;
+        add rsp, 8;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // vtd_slpt_map — map one 4 KiB IOVA → host PA in an SLPT
+  // ============================================================================
+  //
+  // SysV: (root_va: u64, iova: u64, host_pa: u64, flags: u64) -> u64
+  //
+  //   rdi = SL-PML4 root VA (from vtd_slpt_root_alloc — the software-
+  //         indexable VA form, NOT the PA that context-entry stores).
+  //   rsi = IOVA (device-issued virtual address; 4KB-aligned).
+  //   rdx = host_pa — the frame this IOVA should translate to
+  //         (phys_alloc-form kernel VA per module contract; converted
+  //         to genuine PA at leaf-PTE-write boundary).
+  //   rcx = leaf flags (typically SLPT_FLAG_LEAF_RWX = 0x7).
+  //
+  // Returns rax:
+  //   SLPT_MAP_OK     (0)          on success
+  //   SLPT_MAP_OOM    (4294967294) on intermediate-table phys_alloc failure
+  //   SLPT_MAP_HUGE   (4294967293) if descent hits a PS=1 huge-page entry
+  //
+  // Walker: identical shape to aspace_map (core/mm/aspace_map.pdx L47),
+  // but writes SLPT-flavored non-leaf flags (R|W = 0x3 instead of
+  // x86 paging's P|RW|US = 0x7 at that level) and leaf flags (R|W|X).
+  //
+  // Callee-save discipline: 4-push (r12=root_va, r13=iova, r14=host_pa,
+  // r15=flags). rsp entry %16==8 → 4 pushes %16==8 → phys_alloc nested
+  // calls need %16==0, so we push/pop the current level-pointer scratch
+  // reg (r8, which holds &table[idx]) around each phys_alloc call
+  // (same pattern as aspace_map.pdx L80-83) to preserve it AND to
+  // adjust alignment (each push adds 8 bytes; 1 extra push flips %16
+  // to 0). Same rationale documented in aspace_map.pdx #649 debugger
+  // follow-up.
+
+  pub let vtd_slpt_map : (u64, u64, u64, u64) -> u64 !{mem} @{boot} =
+    fn (root_va: u64, iova: u64, host_pa: u64, flags: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R22-M4-004 (#864). VT-d SLPT 4-level walker + leaf install for a single 4KB IOVA→host_pa mapping. Shape mirrors aspace_map (core/mm/aspace_map.pdx L47) with three deltas from x86-paging: (1) non-leaf entries use SLPT_FLAG_NONLEAF_RW (0x3 = R|W) instead of PTE_PRESENT|PTE_RW|PTE_US (0x7); (2) leaf entries use SLPT_FLAG_LEAF_RWX (0x7 = R|W|X) and DO NOT include PTE_PRESENT (bit 0 IS R which subsumes P per VT-d Table 6-11); (3) no INVLPG at the end — TLB flush is a VT-d IOTLB operation (CCMD/IOTLB registers) issued at context-cache-invalidation time by R22.M5, not per-map. Body: descend PML4→PDPT→PD; at each level, load entry; if present (R bit set) recover next-level table VA (bits 12..63 as PA + KERNEL_VMA_BASE); if not present, phys_alloc a fresh page, zero it (512 × 8B stores — phys_alloc does NOT zero per phys_alloc.pdx contract), convert VA→PA, write entry = PA | NONLEAF_RW. Level-4 (PT) leaf: convert host_pa VA→PA, mask to 4K, OR with caller flags, plain write (no INVLPG). Callee-save: 4-push (r12=root_va, r13=iova, r14=host_pa, r15=flags). Per-level: preserve &table[idx] (r8) across nested phys_alloc calls via push/pop — matches aspace_map.pdx L80-83 #649 debugger pattern (phys_alloc uses r8 as scratch, would otherwise clobber the target write address). Alignment: entry rsp%16==8; after 4 pushes %16==8; push r8 before each phys_alloc → %16==0, aligned for call; pop r8 → %16==8. Return: MAP_OK=0 on success; MAP_OOM=4294967294 on phys_alloc failure. Encoder: mov / shr / and / lea / cmp / je/jne / call / xor / or / sub — all pre-existing (aspace_map identically encoded). G1 N/A (all writes are 64-bit).",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                          // r12 = root_va (SL-PML4 VA)
+        mov r13, rsi;                          // r13 = iova
+        mov r14, rdx;                          // r14 = host_pa (phys_alloc-form VA)
+        mov r15, rcx;                          // r15 = leaf flags
+
+        // ============================================================
+        // Level 4: SL-PML4
+        // ============================================================
+        mov rax, r13;
+        shr rax, 39;
+        and rax, 0x1FF;
+        lea r8, [r12 + rax * 8];               // r8 = &pml4[idx]
+        mov r9, [r8];
+        mov r10, r9;
+        and r10, 1;                            // R bit = "present"
+        jnz slpt_map_pml4_present;
+
+        // Not present → allocate + zero + link.
+        push r8;
+        mov rdi, 0;
+        call phys_alloc;
+        pop r8;
+        cmp rax, 0;
+        je  slpt_map_oom;
+        mov r10, rax;                          // r10 = new-table VA
+
+        xor rcx, rcx;
+      slpt_map_pml4_zero_loop:
+        cmp rcx, 512;
+        jae slpt_map_pml4_zero_done;
+        xor rdi, rdi;
+        mov [r10 + rcx * 8], rdi;
+        add rcx, 1;
+        jmp slpt_map_pml4_zero_loop;
+      slpt_map_pml4_zero_done:
+
+        mov r11, rax;                          // r11 = new-table VA
+        mov rdi, 0xFFFF800000000000;           // KERNEL_VMA_BASE
+        sub r11, rdi;                          // r11 = new-table PA
+        or  r11, 0x3;                          // NONLEAF_RW
+        mov [r8], r11;
+        mov r12, r10;                          // r12 = next-level VA
+        jmp slpt_map_pml4_done;
+
+      slpt_map_pml4_present:
+        // Recover next-level VA from present entry.
+        shr r9, 12;
+        shl r9, 12;                            // r9 = PA (masked)
+        mov r10, 0xFFFF800000000000;
+        add r9, r10;                           // r9 = PA + KERNEL_VMA_BASE = VA
+        mov r12, r9;
+
+      slpt_map_pml4_done:
+
+        // ============================================================
+        // Level 3: SL-PDPT
+        // ============================================================
+        mov rax, r13;
+        shr rax, 30;
+        and rax, 0x1FF;
+        lea r8, [r12 + rax * 8];
+        mov r9, [r8];
+        mov r10, r9;
+        and r10, 1;
+        jnz slpt_map_pdpt_present;
+
+        push r8;
+        mov rdi, 0;
+        call phys_alloc;
+        pop r8;
+        cmp rax, 0;
+        je  slpt_map_oom;
+        mov r10, rax;
+
+        xor rcx, rcx;
+      slpt_map_pdpt_zero_loop:
+        cmp rcx, 512;
+        jae slpt_map_pdpt_zero_done;
+        xor rdi, rdi;
+        mov [r10 + rcx * 8], rdi;
+        add rcx, 1;
+        jmp slpt_map_pdpt_zero_loop;
+      slpt_map_pdpt_zero_done:
+
+        mov r11, rax;
+        mov rdi, 0xFFFF800000000000;
+        sub r11, rdi;
+        or  r11, 0x3;
+        mov [r8], r11;
+        mov r12, r10;
+        jmp slpt_map_pdpt_done;
+
+      slpt_map_pdpt_present:
+        // PS=1 → 1 GiB huge page maps here; descending would corrupt.
+        mov r10, r9;
+        and r10, 0x80;                         // PS bit
+        jnz slpt_map_huge;
+
+        shr r9, 12;
+        shl r9, 12;
+        mov r10, 0xFFFF800000000000;
+        add r9, r10;
+        mov r12, r9;
+
+      slpt_map_pdpt_done:
+
+        // ============================================================
+        // Level 2: SL-PD
+        // ============================================================
+        mov rax, r13;
+        shr rax, 21;
+        and rax, 0x1FF;
+        lea r8, [r12 + rax * 8];
+        mov r9, [r8];
+        mov r10, r9;
+        and r10, 1;
+        jnz slpt_map_pd_present;
+
+        push r8;
+        mov rdi, 0;
+        call phys_alloc;
+        pop r8;
+        cmp rax, 0;
+        je  slpt_map_oom;
+        mov r10, rax;
+
+        xor rcx, rcx;
+      slpt_map_pd_zero_loop:
+        cmp rcx, 512;
+        jae slpt_map_pd_zero_done;
+        xor rdi, rdi;
+        mov [r10 + rcx * 8], rdi;
+        add rcx, 1;
+        jmp slpt_map_pd_zero_loop;
+      slpt_map_pd_zero_done:
+
+        mov r11, rax;
+        mov rdi, 0xFFFF800000000000;
+        sub r11, rdi;
+        or  r11, 0x3;
+        mov [r8], r11;
+        mov r12, r10;
+        jmp slpt_map_pd_done;
+
+      slpt_map_pd_present:
+        // PS=1 → 2 MiB huge page maps here; descending would corrupt.
+        mov r10, r9;
+        and r10, 0x80;
+        jnz slpt_map_huge;
+
+        shr r9, 12;
+        shl r9, 12;
+        mov r10, 0xFFFF800000000000;
+        add r9, r10;
+        mov r12, r9;
+
+      slpt_map_pd_done:
+
+        // ============================================================
+        // Level 1: SL-PT (leaf)
+        // ============================================================
+        mov rax, r13;
+        shr rax, 12;
+        and rax, 0x1FF;
+        lea r8, [r12 + rax * 8];               // r8 = &pt[idx]
+
+        // Compute leaf entry: (host_pa - KERNEL_VMA_BASE) masked + flags.
+        mov rax, r14;                          // caller-supplied phys_alloc-form VA
+        mov r9, 0xFFFF800000000000;
+        sub rax, r9;                           // rax = genuine host PA
+        shr rax, 12;
+        shl rax, 12;                           // 4K-align
+        or  rax, r15;                          // OR in caller flags (R|W|X)
+        mov [r8], rax;
+
+        // No INVLPG — TLB flush is a VT-d IOTLB op, done in bulk elsewhere.
+
+        xor rax, rax;                          // SLPT_MAP_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      slpt_map_oom:
+        mov rax, 4294967294;                   // SLPT_MAP_OOM
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      slpt_map_huge:
+        mov rax, 4294967293;                   // SLPT_MAP_HUGE
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}
