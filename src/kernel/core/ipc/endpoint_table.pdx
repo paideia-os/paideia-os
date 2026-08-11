@@ -1,0 +1,246 @@
+// src/kernel/core/ipc/endpoint_table.pdx — R20b.M1-002 (#1553)
+// 128-slot static endpoint table + endpoint_alloc / endpoint_free /
+// endpoint_lookup primitives.
+//
+// Design context
+// --------------
+// This is the storage layer for KIND_IPC_ENDPOINT (base kind 5). Every
+// downstream R20b piece (broker M1-002b, framing M2, syscalls M3, loader-
+// seed M4) reads/writes this table through the primitives below. The
+// tail-encoding module (kind_endpoint.pdx, landed in R20b.M1-001) packs
+// (endpoint_id, direction) into the descriptor's target_ptr slot; the
+// endpoint_id it names is exactly the index into this table.
+//
+// Per design/ipc/userspace-server-substrate.md §3.1:
+//
+//   Endpoint (48 bytes, cache-line-aligned)
+//     +0    u16 endpoint_id           (redundant; helps audit)
+//     +2    u8  in_use                (1 = live, 0 = free)
+//     +3    u8  flags                 (bit 0 = has_pending_msg,
+//                                      bit 1 = has_pending_reply)
+//     +4    u32 reserved
+//     +8    u64 owner_tcb             (pointer to receiver's TCB, NULL until bound)
+//     +16   u64 payload_buf_pa        (4 KiB page holding in-flight message)
+//     +24   u64 pending_hdr           (8-byte header of the message)
+//     +32   u64 waiter_tcb            (TCB blocked on this endpoint's recv)
+//     +40   u64 reserved              (future: session_state pointer)
+//
+// 128 rows × 48 bytes = 6144 B total. No dynamic allocation at R20b:
+// the entire table lives in .bss, zero-initialized by zero_bss.pdx
+// (which means every row starts as free — u64 at [row+0] == 0).
+//
+// Alloc discipline
+// ----------------
+// endpoint_alloc scans rows low-to-high; the first row whose first
+// u64 is zero is claimed. Claim writes ((1 << 16) | id) into [row+0]
+// — setting in_use=1 at byte 2, endpoint_id at bytes 0..1, and
+// leaving flags (byte 3) + reserved (bytes 4..7) at zero. This
+// keeps the field-level free/live discipline atomic against a
+// single u64 load in endpoint_lookup: zero-init at .bss reset AND
+// zero-init at endpoint_free both leave the "is free" test as a
+// simple `cmp [row+0], 0`.
+//
+// The payload buffer (payload_arena.pdx) is bound to the endpoint by
+// convention (1:1 by id), NOT written into the row by endpoint_alloc.
+// R20b.M2 wire-up populates payload_buf_pa (offset +16) via a separate
+// bind step so the storage-layer primitive stays free of cross-module
+// dependencies; endpoint_alloc / endpoint_free / endpoint_lookup all
+// operate purely on the endpoint_table.
+//
+// Free discipline
+// ---------------
+// endpoint_free zeroes all six u64s of the row (48 bytes). Zeroing
+// [row+0] alone would be sufficient for the free/live discipline, but
+// full-row zeroing prevents stale owner_tcb / waiter_tcb / payload_buf_pa
+// pointers from leaking into a subsequent alloc's row-read.
+//
+// Concurrency / ABA
+// -----------------
+// No handle-generation or ABA guard at R20b: the substrate's single-flow
+// phase-1 discipline does not admit concurrent alloc/free on the same
+// endpoint (see design §4.2 — single in-flight message per endpoint).
+// SMP-safe alloc arrives in a later round when the substrate grows a
+// generation counter or a per-row spinlock (design §14 Q3).
+
+module EndpointTable = structure {
+
+  // ============================================================================
+  // Table geometry (pinned by design/ipc/userspace-server-substrate.md §3.1)
+  // ============================================================================
+
+  pub let ENDPOINT_ROW_BYTES     : u64 = 48
+  pub let ENDPOINT_TABLE_SLOTS   : u64 = 128
+  pub let ENDPOINT_TABLE_BYTES   : u64 = 6144        // 128 * 48
+
+  // ============================================================================
+  // Sentinels
+  // ============================================================================
+
+  pub let ENDPOINT_ALLOC_NONE    : u64 = 0xFFFFFFFFFFFFFFFF   // -1 on exhaustion
+  pub let ENDPOINT_LOOKUP_NONE   : u64 = 0                    // NULL on miss
+
+  // ============================================================================
+  // Row-field offsets (bytes, from row base)
+  // ============================================================================
+
+  pub let ENDPOINT_OFF_ID            : u64 = 0
+  pub let ENDPOINT_OFF_IN_USE        : u64 = 2
+  pub let ENDPOINT_OFF_FLAGS         : u64 = 3
+  pub let ENDPOINT_OFF_OWNER_TCB     : u64 = 8
+  pub let ENDPOINT_OFF_PAYLOAD_BUF   : u64 = 16
+  pub let ENDPOINT_OFF_PENDING_HDR   : u64 = 24
+  pub let ENDPOINT_OFF_WAITER_TCB    : u64 = 32
+  pub let ENDPOINT_OFF_RESERVED_40   : u64 = 40
+
+  // ============================================================================
+  // Storage — 128 rows x 48 bytes = 6144 B = 768 u64s, @align(64).
+  //
+  // @align(64): puts the table start on a cache-line boundary. Rows are
+  // 48 B each and therefore do NOT individually land on cache-line starts
+  // (only rows 0, 4, 8, ... — every fourth — do; row size and cache-line
+  // size are coprime after 48/16). A per-row @align(64) would waste 16 B
+  // per row (~2 KiB total) with no observable benefit at R20b (single-
+  // flow substrate, no per-endpoint contention). When R20b grows an SMP
+  // fast-path (design §14 Q3), the row-padding tradeoff revisits.
+  // ============================================================================
+
+  pub let mut _ipc_endpoint_table : [u64; 768] = uninit @align(64)
+
+  // ==========================================================================
+  // endpoint_alloc() -> u64
+  //
+  // SysV ABI: no args -> rax = endpoint_id in [0..127] on success,
+  // or ENDPOINT_ALLOC_NONE (0xFFFFFFFFFFFFFFFF) on exhaustion.
+  //
+  // Scans _ipc_endpoint_table low-to-high (r8 = row cursor, rcx = id).
+  // A row is "free" iff its first u64 ([r8+0]) is zero — on fresh .bss
+  // every row satisfies this; after endpoint_free the six-u64 zero
+  // preserves it. Claim writes ((1<<16) | id) into [r8+0], which
+  // sets in_use=1 at byte 2 and endpoint_id at bytes 0..1.
+  // ==========================================================================
+
+  pub let endpoint_alloc : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R20b.M1-002 (#1553): low-first row scan over _ipc_endpoint_table. r8 = row cursor (starts at table base, advances by 48 = ENDPOINT_ROW_BYTES each iteration); rcx = id (0..127). Row is free iff [r8+0] u64 is zero — invariant preserved by .bss zero-init AND by endpoint_free's full-row zero. Claim: ((1<<16) | id) into [r8+0] — sets in_use=1 at byte 2 (bit 16..23 of the u64), endpoint_id at bytes 0..1 (bit 0..15), leaves flags (byte 3) + reserved (bytes 4..7) at zero. Exhaustion returns 0xFFFFFFFFFFFFFFFF (ENDPOINT_ALLOC_NONE = -1). Return id in rax. Leaf function; no callee-save writes.",
+      block: {
+        lea r8, [rip + _ipc_endpoint_table];
+        xor rcx, rcx;
+
+      endpoint_alloc_scan:
+        cmp rcx, 128;                       // ENDPOINT_TABLE_SLOTS
+        jae endpoint_alloc_none;
+        mov rax, [r8];                      // u64 at row+0 (id + in_use + flags + reserved32)
+        cmp rax, 0;
+        je  endpoint_alloc_found;
+        add r8, 48;                         // ENDPOINT_ROW_BYTES
+        add rcx, 1;
+        jmp endpoint_alloc_scan;
+
+      endpoint_alloc_found:
+        // Pack in_use=1 at byte 2 (bit 16), id at bytes 0..1 (bits 0..15).
+        mov rax, 1;
+        shl rax, 16;                        // rax = 0x10000 = (in_use << 16)
+        or  rax, rcx;                       // rax |= id
+        mov [r8], rax;                      // write row header
+        mov rax, rcx;                       // return id
+        ret;
+
+      endpoint_alloc_none:
+        mov rax, 0xFFFFFFFFFFFFFFFF;        // ENDPOINT_ALLOC_NONE (-1)
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // endpoint_free(id: u64) -> ()
+  //
+  // SysV ABI: rdi = id.
+  //
+  // No-op if id >= 128 (out of range). Otherwise zeroes all six u64s of
+  // the row (48 bytes at offsets +0/+8/+16/+24/+32/+40). Zeroing [row+0]
+  // clears in_use (byte 2) and reopens the slot for endpoint_alloc's
+  // low-first scan. Full-row zeroing prevents stale owner_tcb /
+  // waiter_tcb / payload_buf_pa pointers from leaking into a subsequent
+  // alloc's row read.
+  // ==========================================================================
+
+  pub let endpoint_free : (u64) -> () !{mem} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R20b.M1-002 (#1553): id >= 128 -> silent no-op (out of range). Otherwise compute row = &_ipc_endpoint_table + id*48 via id*16 + id*32 (shl 4 + shl 5 + add) — no imul required, matches the multiply-by-24 pattern in cap/verify.pdx L67-71. Then zero all six u64s of the row via `xor rax,rax; mov [r8+off],rax` for off in {0,8,16,24,32,40}. Zeroing [row+0] alone would suffice for the free/live discipline (endpoint_alloc's scan gates on [row+0]==0) but full-row zero prevents stale pointer state from leaking into a subsequent alloc. No handle-generation or ABA guard at R20b — single-flow phase-1 substrate does not admit concurrent alloc/free (design §14 Q3). Leaf function; no callee-save writes.",
+      block: {
+        cmp rdi, 128;                       // ENDPOINT_TABLE_SLOTS
+        jae endpoint_free_done;
+
+        // Compute row = &_ipc_endpoint_table + id * 48.
+        mov r8, rdi;
+        shl r8, 4;                          // r8 = id * 16
+        mov r9, rdi;
+        shl r9, 5;                          // r9 = id * 32
+        add r8, r9;                         // r8 = id * 48
+        lea r9, [rip + _ipc_endpoint_table];
+        add r8, r9;                         // r8 = &row
+
+        // Zero the 48-byte row (six u64 stores).
+        xor rax, rax;
+        mov [r8 + 0],  rax;
+        mov [r8 + 8],  rax;
+        mov [r8 + 16], rax;
+        mov [r8 + 24], rax;
+        mov [r8 + 32], rax;
+        mov [r8 + 40], rax;
+
+      endpoint_free_done:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // endpoint_lookup(id: u64) -> u64
+  //
+  // SysV ABI: rdi = id -> rax = row PA if live, else 0 (NULL).
+  //
+  // Returns &_ipc_endpoint_table[id * 48] iff id in [0..127] AND the row's
+  // in_use byte (byte 2 of the first u64) is non-zero; else returns
+  // ENDPOINT_LOOKUP_NONE (0). Kernel-VA == PA in the R20b low-half
+  // .bss identity-map, so the returned address is both VA and PA.
+  // ==========================================================================
+
+  pub let endpoint_lookup : (u64) -> u64 !{} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "R20b.M1-002 (#1553): id >= 128 -> return 0 (ENDPOINT_LOOKUP_NONE, invalid id sentinel). Otherwise compute row = &_ipc_endpoint_table + id*48 (same shl-4 + shl-5 + add sequence as endpoint_free). Load [row+0] u64; extract in_use byte via `shr 16` + `and 0xFF`. in_use == 0 -> row is free -> return 0. Otherwise return row address (both VA and PA in the R20b low-half identity-map). Pure read; no writes to memory or registers other than caller-save rax/r8/r9/r10. Leaf function.",
+      block: {
+        cmp rdi, 128;                       // ENDPOINT_TABLE_SLOTS
+        jae endpoint_lookup_none;
+
+        // Compute row = &_ipc_endpoint_table + id * 48.
+        mov r8, rdi;
+        shl r8, 4;                          // id * 16
+        mov r9, rdi;
+        shl r9, 5;                          // id * 32
+        add r8, r9;                         // id * 48
+        lea r9, [rip + _ipc_endpoint_table];
+        add r8, r9;                         // r8 = &row
+
+        // Extract in_use = ([row+0] >> 16) & 0xFF.
+        mov rax, [r8];
+        shr rax, 16;
+        mov r10, 0xFF;
+        and rax, r10;
+        cmp rax, 0;
+        je  endpoint_lookup_none;
+
+        mov rax, r8;                        // return row PA
+        ret;
+
+      endpoint_lookup_none:
+        xor rax, rax;                       // ENDPOINT_LOOKUP_NONE
+        ret
+      }
+    } @no_frame
+}

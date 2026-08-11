@@ -1385,6 +1385,20 @@ endpoint_cap_ok_msg: .ascii "R20b ENDPOINT CAP OK\n\0"
 endpoint_cap_fail_msg: .ascii "R20b ENDPOINT CAP FAIL\n\0"
 
 
+# R20b.M1-002 (#1553): endpoint_table + payload_arena witness fingerprints —
+# exercises endpoint_alloc/endpoint_free/endpoint_lookup round-trip on the
+# full 128-slot range AND payload_buf_pa_for(0..127) 4 KiB-alignment +
+# contiguity. See src/kernel/core/ipc/endpoint_table.pdx and
+# src/kernel/core/ipc/payload_arena.pdx.
+.global endpoint_alloc_ok_msg
+.align 8
+endpoint_alloc_ok_msg: .ascii "R20b ENDPOINT ALLOC OK\n\0"
+
+.global endpoint_alloc_fail_msg
+.align 8
+endpoint_alloc_fail_msg: .ascii "R20b ENDPOINT ALLOC FAIL\n\0"
+
+
 # M1-003 (#685): Re-entrancy gate for klog_emit_core (accessible from high-half kernel code)
 # M3-002 (#690): int3 breakpoint stub — emit breakpoint exception (vec 3)
 .section .text, "ax", @progbits
