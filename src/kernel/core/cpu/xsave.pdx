@@ -1,0 +1,600 @@
+// src/kernel/core/cpu/xsave.pdx — R21-M1 (#825/#826/#827/#828/#829)
+//
+// XSAVE substrate: CPUID leaf 0x0D probe, XCR0 enablement, per-task XSAVE
+// area storage, and the save/restore primitives that sched_switch_r15 wraps
+// around the register-file swap.
+//
+// Round: R21 — FPU/XSAVE + interrupt controller completion
+// Milestone: R21.M1 XSAVE area sizing + eager save/restore
+// Roadmap: design/roadmap/r18-plus-bare-metal.md §R21
+// Encoder floor: paideia-as v0.20.1 + #1294 (xgetbv/xsetbv landed in v0.21-015).
+//
+// ==============================================================================
+// Design summary
+// ==============================================================================
+//
+// The XSAVE architecture (Intel SDM Vol 1 §13) lets the OS save + restore the
+// extended processor state (x87, SSE, YMM, ZMM, MPX, PT, PKRU, CET, HDC, …)
+// via a *single* pair of instructions (`xsaveopt` / `xrstor`) operating on a
+// per-thread memory buffer whose layout is CPUID-defined.  R21 delivers the
+// eager variant: every context switch unconditionally saves the outgoing
+// task's state and restores the incoming task's.  Lazy fault-in ("save on
+// first FP use, take a #NM to restore") is deferred to R35+ (roadmap §R21).
+//
+// Five acceptance criteria attach to this module (one per issue):
+//
+//   #825 CPUID leaf 0x0D probe + per-state size table (BSP fingerprint).
+//   #826 CR4.OSXSAVE enable + XCR0 write to enabled-component mask (BSP+APs).
+//   #827 Per-task XSAVE area allocation, aligned 64 (one region per Task).
+//   #828 Eager xsaveopt / xrstor around the register save in sched_switch_r15.
+//   #829 XSTATE_BV = 0 on task creation ⇒ first xrstor restores architectural
+//        init values (mxcsr = 0x1F80, x87 control word = 0x37F) — no BSP
+//        boot-time SIMD state leaks into fresh tasks.
+//
+// ==============================================================================
+// XSAVE area layout (Intel SDM Vol 1 §13.4)
+// ==============================================================================
+//
+// bytes  size  purpose
+// ----   ----  -------
+// 0      512   Legacy region: FCW, FSW, FTW, FOP, FIP, FDP, MXCSR, MXCSR_MASK,
+//              ST0-ST7 (10 bytes each padded to 16), XMM0-XMM15 (16 each).
+//              Contract with fxsave/fxrstor — byte-identical.
+// 512    64    XSAVE header: XSTATE_BV (8) + XCOMP_BV (8) + 48 rsvd (0).
+//              XSTATE_BV bit i indicates state component i is *populated* in
+//              this frame; xrstor clears bits whose components load from the
+//              initial state, sets bits whose components load explicitly.
+// 576    var   Extended region: per-component state at CPUID-defined offsets.
+//              For x87|SSE|YMM: YMM_Hi128 for YMM0-15 (256 B) at offset 576.
+//
+// #829 rationale: fresh tasks' XSTATE_BV = 0 causes xrstor to load the
+// *architectural init* values for every component enabled in XCR0.  That
+// means fpu = clean (FCW=0x37F, MXCSR=0x1F80, all XMM/YMM zero).  If XSTATE_BV
+// were left uninitialized (i.e. whatever bit pattern happened to sit in that
+// slot in .bss — always zero here, but the invariant matters for future
+// heap-allocated frames), a #GP would fire on xrstor: reserved bits in
+// XSTATE_BV are #GP-fatal per SDM Vol 2 XRSTOR §Exceptions.
+//
+// ==============================================================================
+// Storage & sizing
+// ==============================================================================
+//
+// _xsave_supported_mask  (u64) — populated by xsave_probe_bsp: bit i = 1 iff
+//                                the processor exposes state component i (CPUID
+//                                0x0D subleaf 0 EAX low, EDX high). 0 means
+//                                probe hasn't run yet.
+// _xsave_xcr0_target     (u64) — the mask we actually program into XCR0.  For
+//                                MVP: (supported & 0x7) — x87|SSE|YMM if
+//                                supported.  Bits 0 (x87) + 1 (SSE) always
+//                                required per SDM §13.3.
+// _xsave_area_size       (u64) — bytes per XSAVE area for the target mask
+//                                (CPUID 0x0D subleaf 0 EBX post-xsetbv).  Used
+//                                by xsave_area_zero and downstream.
+// _xsave_area_size_max   (u64) — ECX from the same CPUID call — the size the
+//                                processor would need for its full feature set,
+//                                for informational fingerprint per #825.
+// _xsave_area_size_compact (u64) — EBX from CPUID 0x0D subleaf 1 — the compact
+//                                (XSAVEC) area size for the current XCR0.
+//                                Informational per #825; we don't emit XSAVEC
+//                                since paideia-as has no encoder for it yet.
+//
+// _task_xsave_areas: [u64; 65 * 512] = 65 * 4096 B slots, @align(64).
+//   Same 65-slot pattern as _task_kernel_stacks in task_pool.pdx:
+//     slot pid ∈ [0..65) is at &_task_xsave_areas + pid * 4096.
+//   Slot 0 is unused (pids start at 1); slot pid occupies 4 KiB — a hard
+//   ceiling well above the ~832 B AVX2 area size, ~2624 B AVX-512 max.
+//   4 KiB per slot keeps the pid→area math a single `shl rN, 12` (12 =
+//   log2(4096)), mirroring kstack_top's shl-14 idiom.
+//   Total .bss cost: 65 * 4096 = 260 KiB.  Acceptable at 32 MiB kernel RAM.
+//
+// #827 acceptance ("TCB size grows by pointer only"): the "pointer" is the
+// per-pid arithmetic slot address, computed as `xsave_area_for(pid) =
+// &_task_xsave_areas + pid * 4096` — no additional TCB field, no per-task
+// allocator call, and the arithmetic returns a stable 64-aligned pointer.
+// This parallels how _task_kernel_stacks + pid*16384 is the "kstack_top" for
+// pid without any explicit TCB pointer field (task_new later mirrors that
+// pointer INTO TCB+24, but the storage itself is address-computed).
+//
+// ==============================================================================
+// Instruction floor
+// ==============================================================================
+//
+// - cpuid                          (0F A2)  — R11 encoder
+// - mov r64, cr4 / mov cr4, r64    (CR-move encoder — smep.pdx pattern)
+// - xsetbv                         (0F 01 D1) — paideia-as #1294 (v0.21-015)
+// - xgetbv                         (0F 01 D0) — paideia-as #1294 (v0.21-015)
+// - xsaveopt [mem]                 (0F AE /6)   — PA-R15-m4-005 (#1022)
+// - xrstor   [mem]                 (0F AE /5)   — PA-R15-m4-005 (#1022)
+//
+// Not used (deferred): xsave (non-opt, 0F AE /4) — xsaveopt is a strict
+// improvement (skips components untouched since last restore).  xsavec /
+// xsaves are R35+ scope (compact form + supervisor state).
+
+// Module-level target_features declaration (paideia-as #1033 / R16-m4-002).
+// xsaveopt (0F AE /6) requires the "xsaveopt" feature; xrstor (0F AE /5)
+// requires the plain "xsave" feature.  Both are gated by CPUID.01H:ECX
+// bits 26 (XSAVE) and 27 (XSAVEOPT) at runtime; the module attribute is a
+// compile-time capability declaration that satisfies the U1612 gate.  MVP
+// hardware (T14 G4 Raptor Lake, QEMU -cpu max) exposes both.
+#![target_features = "xsave, xsaveopt"]
+
+module Xsave = structure {
+  // ==========================================================================
+  // Constants
+  // ==========================================================================
+
+  // CR4.OSXSAVE (bit 18): enables xsetbv/xgetbv and the XSAVE family.
+  let CR4_OSXSAVE : u64 = 0x40000                     // 1 << 18
+
+  // XCR0 component bits (Intel SDM Vol 1 §13.3).
+  let XCR0_X87    : u64 = 0x1                         // bit 0 — MUST be 1
+  let XCR0_SSE    : u64 = 0x2                         // bit 1 — required if any
+  let XCR0_YMM    : u64 = 0x4                         // bit 2 — AVX YMM Hi128
+
+  // MVP baseline: x87 + SSE. YMM OR'd in iff CPUID says supported.
+  let XCR0_BASELINE : u64 = 0x3                       // x87 | SSE
+
+  // Compile-time upper bound on per-task area size.  Enforced at probe time:
+  // if CPUID's actual EBX exceeds this, we clamp (impossible on MVP hardware
+  // — AVX-512 max is ~2624 B; ZMM+PKRU+CET tops out ~2800 B).  Sets the .bss
+  // slot pitch so pid → area math is a bit-shift, not an imul.
+  pub let XSAVE_AREA_SLOT_BYTES  : u64 = 4096         // 1 << 12
+  pub let XSAVE_AREA_SLOT_SHIFT  : u64 = 12           // log2(4096)
+  pub let XSAVE_AREA_SLOTS       : u64 = 65           // pid ∈ [1..64], slot 0 unused
+
+  // XSAVE header layout (relative to area base).
+  pub let XSAVE_HEADER_OFFSET      : u64 = 512
+  pub let XSAVE_XSTATE_BV_OFFSET   : u64 = 512        // header +0: XSTATE_BV
+  pub let XSAVE_XCOMP_BV_OFFSET    : u64 = 520        // header +8: XCOMP_BV
+
+  // ==========================================================================
+  // Storage
+  // ==========================================================================
+
+  // Global XSAVE probe state.  Zero-initialized in .bss; populated by
+  // xsave_probe_bsp on the BSP once at boot.
+  pub let mut _xsave_supported_mask     : u64 = 0
+  pub let mut _xsave_xcr0_target        : u64 = 0
+  pub let mut _xsave_area_size          : u64 = 0
+  pub let mut _xsave_area_size_max      : u64 = 0
+  pub let mut _xsave_area_size_compact  : u64 = 0
+
+  // Per-task XSAVE areas.  65 slots × 4 KiB each, aligned 64.  Slot 0 unused
+  // (pids start at 1).  4096-byte alignment satisfies #827's 64-byte-aligned
+  // requirement (Intel SDM Vol 2 XSAVE §Exceptions: mem operand must be
+  // 64-byte-aligned or #GP fires) with room to spare.
+  pub let mut _task_xsave_areas : [u64; 33280] = uninit @align(64)
+  //                                       ^^^^^ 65 slots * 512 qwords/slot = 33280 qwords
+
+  // ==========================================================================
+  // xsave_probe_bsp: CPUID.0x0D probe + populate globals (#825).
+  // ==========================================================================
+  //
+  // Runs once on BSP before xsave_enable_this_cpu.  Sequence:
+  //   (1) CPUID.0x0D subleaf 0: EAX = XCR0 low mask (supported components),
+  //       EBX = area size for currently-enabled XCR0 (pre-xsetbv this is 0x1
+  //       plus reserved bits — not useful for sizing yet), ECX = max area
+  //       size across all supported components, EDX = XCR0 high mask
+  //       (currently must be 0 in 64-bit mode; ignored).
+  //   (2) Store _xsave_supported_mask = EAX, _xsave_area_size_max = ECX.
+  //   (3) Compute target XCR0 = XCR0_BASELINE (x87|SSE) | (supported & YMM).
+  //       Only bits 0-2 are enabled at MVP; wider AVX-512 state is R25+.
+  //       Store into _xsave_xcr0_target.
+  //   (4) DON'T write CR4/XCR0 here — that's xsave_enable_this_cpu's job.
+  //       We CAN'T pre-probe the actual EBX size (post-xsetbv) here because
+  //       xsetbv must run in ring-0 which we're already in, but the CPUID
+  //       size result depends on XCR0's value at read time.  Instead, size
+  //       is discovered inside xsave_enable_this_cpu (post-xsetbv) on the
+  //       BSP path and stored globally.
+  //
+  // The fingerprint emitted here reports the SUPPORTED mask and MAX size —
+  // both are properties of the CPU and constant across all logical CPUs on
+  // homogeneous hardware.  The AVX-2 R14a+ MVP hardware baseline (T14 G4 =
+  // Raptor Lake, QEMU -cpu max) always sets bits 0-2, so the target mask
+  // will always resolve to 0x7 on supported hardware.  Older CPUs without
+  // CPUID leaf 0x0D (pre-Sandy Bridge, ~2011) would return EAX=0 and this
+  // module would leave the target at 0x3 (x87+SSE) — still valid, just no
+  // YMM save-through.  Discovery: max_cpuid < 0x0D check via CPUID.0.
+  //
+  // Register / call discipline: leaf function (no nested calls).  Two-push
+  // callee-save prologue (rbx, r12) for the two persistent operand
+  // registers.  rsp % 16 == 0 pre-body (entry rsp % 16 == 8 + push+push = 16
+  // = 0 mod 16).  Emits an INFO klog line for the fingerprint.
+  // ==========================================================================
+  pub let xsave_probe_bsp : () -> () !{mem, sysreg} @{boot} =
+    fn () -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { boot },
+      justification: "R21-M1 #825 (CPUID leaf 0x0D enumeration). Runs on BSP once, before any XSAVE state-management primitive. (1) CPUID.0 → EAX = max_std_leaf; guard against pre-Sandy-Bridge CPUs where 0x0D isn't populated (`cmp rax, 0x0D; jb xsave_probe_no_support`). (2) CPUID.0x0D subleaf 0 (with `xor rcx, rcx` — sub-leaf ECX=0 is architecturally required per SDM Vol 2 CPUID even where sub-leaf is otherwise ignored, matches topology_init.pdx CPUID.0x1A pattern). (3) Store EAX into _xsave_supported_mask (u64 store; upper 32 zeroed by CPUID's implicit 32-bit write behavior — matches madt_topology.pdx L193 CPUID.1 store idiom). Store ECX into _xsave_area_size_max. (4) Compute target = XCR0_BASELINE (0x3 = x87|SSE per SDM §13.3, both mandatory) OR (supported_mask AND YMM_BIT 0x4). (5) Store target into _xsave_xcr0_target. (6) Emit klog_s1_x2 fingerprint 'XSAVE PROBE OK mask=<mask> max=<size>' at LEVEL_INFO/SUBSYS_BOOT so the wire has a machine-parseable substrate line that the R21.M1 fixture can grep. The compact-form size (subleaf 1 EBX) and current-XCR0 size (subleaf 0 EBX post-xsetbv) are discovered/stored inside xsave_enable_this_cpu — this probe function only reports what's INTRINSIC to the CPU (supported components + max footprint), leaving the current-XCR0-dependent size discovery for the enable step where XCR0 has been programmed. Register discipline: rbx (target mask across CPUID clobbers), r12 (unused today, pushed for stack alignment + future symmetry with the multi-CPUID-call pattern). Callee-save preserved via 2-push prologue. rsp %16 == 0 at every nested call boundary (only klog_s1_x2 called, at pre-call rsp %16 == 0 after 2 pushes atop entry's rsp %16 == 8; klog_s1_x2 adds 1 push rbp + sub 48 which land rsp %16 == 8 at klog_emit_core call, matching wrapper contract). No-support branch skips all mask math and emits FAIL fingerprint but returns cleanly — kernel continues with _xsave_area_size == 0 which xsave_enable_this_cpu treats as 'skip enable' guard.",
+      block: {
+        push rbx;
+        push r12;
+
+        // (1) Discover max supported CPUID standard leaf.
+        mov rax, 0;
+        xor rcx, rcx;
+        cpuid;
+        cmp rax, 0x0D;
+        jb xsave_probe_no_support;
+
+        // (1.5) Feature-flag gate: CPUID.01H:ECX bit 26 = XSAVE support.
+        //   Leaf 0x0D exists on many CPUs that don't set the ECX.XSAVE bit
+        //   (e.g. QEMU's default `qemu64` CPU — max_std_leaf=13 but ECX
+        //   bit 26 = 0).  Writing CR4.OSXSAVE on such a CPU raises #GP
+        //   ("attempt to set reserved bit"), triple-faulting the boot.
+        //   Skip everything if the feature bit is 0.  T14 G4 (Raptor Lake)
+        //   and QEMU -cpu max both set this bit, so the MVP path proceeds.
+        mov rax, 1;
+        xor rcx, rcx;
+        cpuid;
+        mov rbx, rcx;                       // save ECX (feature flags)
+        and rbx, 0x04000000;                // CPUID.01H:ECX bit 26 (XSAVE)
+        cmp rbx, 0;
+        je xsave_probe_no_support;
+
+        // (2) CPUID leaf 0x0D subleaf 0.
+        //   EAX = XCR0 low mask (supported state components)
+        //   EBX = area size for currently-enabled XCR0 (pre-xsetbv: uninformative)
+        //   ECX = max area size across ALL supported components (worst case)
+        //   EDX = XCR0 high mask (must be 0 in 64-bit MVP)
+        mov rax, 0x0D;
+        xor rcx, rcx;
+        cpuid;
+
+        // (2.5) Defensive: if CPUID.01H said XSAVE support but leaf 0x0D
+        //   subleaf 0 reports no components (EAX == 0), still bail.  This
+        //   should never happen on a spec-conformant CPU — SDM says
+        //   ECX.XSAVE=1 implies at least x87|SSE support in leaf 0x0D —
+        //   but the belt-and-suspenders guard costs 3 insts and closes a
+        //   theoretical hypervisor-quirk path.
+        cmp rax, 0;
+        je xsave_probe_no_support;
+
+        // (3) Store supported_mask (EAX zero-extended to u64 via CPUID's
+        //     implicit 32-bit clear of the upper half).
+        mov [rip + _xsave_supported_mask], rax;
+
+        // Store max area size (ECX).
+        mov [rip + _xsave_area_size_max], rcx;
+
+        // (4) Compute target = XCR0_BASELINE | (supported & YMM).
+        //     mov rbx, rax and rbx is the supported mask; mask off everything
+        //     except bit 2 (YMM), then OR in the mandatory x87|SSE baseline.
+        mov rbx, rax;                       // rbx = supported_mask
+        and rbx, 0x4;                       // rbx = supported & YMM
+        or  rbx, 0x3;                       // rbx = 0x3 | (supported & YMM)
+
+        // (5) Publish target.
+        mov [rip + _xsave_xcr0_target], rbx;
+
+        // (6) Fingerprint: klog_s1_x2(INFO, BOOT, tag_xsave_probe_ok,
+        //                              k_mask, supported_mask,
+        //                              k_size, max_size).
+        //     klog_s1_x2 takes 6 register args + v2 on stack: v2 = max_size.
+        //     Args: rdi=level=3, rsi=SUBSYS_BOOT, rdx=tag_xsave_probe_ok,
+        //           rcx=k_mask, r8=supported_mask, r9=k_size, [rsp+8]=v2.
+        mov rax, [rip + _xsave_area_size_max];
+        push rax;                            // [rsp+0] = v2 (becomes [rsp+8] after call push)
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + tag_xsave_probe_ok];
+        lea rcx, [rip + k_mask];
+        mov r8, [rip + _xsave_supported_mask];
+        lea r9, [rip + k_size];
+        call klog_s1_x2;
+        add rsp, 8;                          // drop v2 slot
+
+        pop r12;
+        pop rbx;
+        ret;
+
+      xsave_probe_no_support:
+        // Pre-Sandy Bridge CPU (or QEMU without XSAVE feature).  Leave all
+        // globals at zero; xsave_enable_this_cpu inspects _xsave_xcr0_target
+        // and skips the CR4/XCR0 writes if it's 0, and sched_switch_r15's
+        // pre-xsaveopt guard skips the save/restore if _xsave_area_size == 0.
+        // Emit a FAIL fingerprint so smoke tests notice regressed CPUs.
+        mov rdi, 1;                          // LEVEL_ERROR
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + tag_xsave_probe_no_support];
+        call klog_s1;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // xsave_enable_this_cpu: CR4.OSXSAVE + XCR0 write (#826).
+  // ==========================================================================
+  //
+  // Runs once per CPU (BSP + every AP).  Sequence:
+  //   (1) Guard on _xsave_xcr0_target != 0: probe didn't detect XSAVE, skip
+  //       everything (returns cleanly, sched_switch_r15 skips save/restore).
+  //   (2) Read CR4, OR in bit 18 (OSXSAVE), write CR4.  Enables xsetbv.
+  //   (3) Set ECX = 0 (XCR0 index), EDX:EAX = target mask (upper 32 zero;
+  //       target fits u32 for MVP since we only enable bits 0-2).  xsetbv.
+  //   (4) BSP-only: re-CPUID subleaf 0 EBX (now-actual area size for this
+  //       XCR0), store _xsave_area_size.  Also CPUID subleaf 1 EBX
+  //       (compact-form area size), store _xsave_area_size_compact.  APs
+  //       skip this — the sizes are cross-CPU invariant on homogeneous HW.
+  //   (5) BSP-only: emit klog_s1_x1 'XSAVE ENABLED xcr0=<mask>' fingerprint.
+  //
+  // BSP vs AP detection: check _xsave_area_size == 0 (only zero on the very
+  // first call — the BSP invocation).  Safe because APs strictly follow BSP
+  // in the bring-up sequence and any AP hitting _xsave_area_size == 0 would
+  // be a broken bring-up-order invariant we want to catch anyway.
+  //
+  // Register / call discipline: not a leaf (calls klog_s1_x1 on BSP branch).
+  // Two-push prologue (rbx = XCR0 target, r12 = CB size marker) plus a
+  // one-push alignment when calling.  rsp %16 == 0 at all nested call
+  // boundaries.  Never returns anything meaningful (void); XSAVE support is
+  // required MVP-wide, and a probe-fail already emitted its own FAIL line.
+  // ==========================================================================
+  pub let xsave_enable_this_cpu : () -> () !{mem, sysreg} @{boot} =
+    fn () -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { boot },
+      justification: "R21-M1 #826 (CR4.OSXSAVE + XCR0 program).  Runs per-CPU (BSP + every AP) after xsave_probe_bsp populated _xsave_xcr0_target.  (1) Load target = [_xsave_xcr0_target].  If zero (probe found no XSAVE support), skip everything — safe because sched_switch_r15's save/restore reads _xsave_area_size which is also zero in that case (guard chain).  (2) CR4 OR bit 18 (OSXSAVE = 0x40000): read CR4 via `mov rax, cr4` (0F 20 E0 — SMEP/SMAP encoder pattern from smep.pdx), OR the bit, write back.  Enables xsetbv (else #UD).  (3) xsetbv: mov ecx,0 (XCR0 index), rax=target (u32 fits our 0x3 or 0x7 MVP mask cleanly — upper 32 zeroed by mov ecx form's implicit zero-extension is not what we want here; we use `mov rdx, 0` explicitly for the upper 32 bits).  The 3-byte 0F 01 D1 encoding lands via paideia-as #1294 v0.21-015; without it, XCR0 would be unprogrammable.  (4) BSP-only sizing: cmp [_xsave_area_size], 0; jne skip_sizing.  Re-CPUID.0x0D.0 to get EBX = actual area size for the just-programmed XCR0 (SDM says EBX reflects CURRENT XCR0 at CPUID execution time).  Store _xsave_area_size = ebx.  CPUID.0x0D.1 also for compact size.  (5) BSP-only fingerprint: klog_s1_x1 'XSAVE ENABLED xcr0=<target>'.  Register discipline: rbx (target across CR4 write + xsetbv), r12 (BSP-branch scratch), 2-push prologue keeps rsp %16 == 0 pre-body.  klog_s1_x1 call preceded by no extra push (2-push prologue already aligned).  AP path is 0-nested-call fast path.  Never fails.",
+      block: {
+        push rbx;
+        push r12;
+
+        // (1) Load target; bail out if probe said 'no support'.
+        mov rbx, [rip + _xsave_xcr0_target];
+        cmp rbx, 0;
+        je xsave_enable_skip;
+
+        // (2) CR4 |= OSXSAVE (bit 18).
+        mov rax, cr4;
+        or  rax, 0x40000;                   // CR4_OSXSAVE
+        mov cr4, rax;
+
+        // (3) xsetbv XCR0 = target.
+        //     ECX = 0 (XCR0 selector), EDX:EAX = target (64-bit but MVP fits u32).
+        mov rcx, 0;
+        mov rax, rbx;                       // low 32 = target
+        mov rdx, 0;                         // high 32 = 0 (no XSS supervisor state)
+        xsetbv;
+
+        // (4) BSP-only sizing: has _xsave_area_size already been populated by
+        //     a prior BSP-path invocation?  APs skip re-probing.
+        mov rax, [rip + _xsave_area_size];
+        cmp rax, 0;
+        jne xsave_enable_sized;
+
+        // Re-CPUID.0x0D subleaf 0 for the standard-form area size (EBX now
+        // reflects the just-programmed XCR0).
+        mov rax, 0x0D;
+        xor rcx, rcx;
+        cpuid;
+        mov [rip + _xsave_area_size], rbx;
+
+        // CPUID.0x0D subleaf 1 for the compact-form (XSAVEC) area size.
+        // EBX = compact-form size for current XCR0 | XSS.  Informational at
+        // R21 (we emit xsaveopt not xsavec — the latter is R35+ scope).
+        mov rax, 0x0D;
+        mov rcx, 1;
+        cpuid;
+        mov [rip + _xsave_area_size_compact], rbx;
+
+        // (5) BSP-only fingerprint.  klog_s1_x1(INFO, BOOT, tag_xsave_enabled,
+        //                                        k_xcr0, target).
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + tag_xsave_enabled];
+        lea rcx, [rip + k_xcr0];
+        mov r8, [rip + _xsave_xcr0_target];
+        call klog_s1_x1;
+
+      xsave_enable_sized:
+      xsave_enable_skip:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // xsave_area_for(pid): compute per-task XSAVE area base VA (#827).
+  // ==========================================================================
+  //
+  // Contract: returns &_task_xsave_areas + pid * XSAVE_AREA_SLOT_BYTES.
+  //   pid ∈ [1..64]: valid; result is 64-byte aligned by construction (the
+  //                  slot pitch is 4096 which is 64-aligned and .bss base
+  //                  has @align(64)).
+  //   pid == 0     : returns slot-0 base — unused sentinel; caller must not
+  //                  emit xsaveopt/xrstor with it.  Not guarded (leaf, hot).
+  //   pid >= 65    : out-of-bounds; walker walks past the end of the array
+  //                  into whatever .bss neighbor lives next.  Guarded upstream
+  //                  by pid_alloc's 1..64 ceiling.
+  //
+  // Emits: `lea rax, [rip + _task_xsave_areas]; shl rdi, 12; add rax, rdi;
+  //         ret`.  Zero clobber beyond rax/rdi (SysV caller-save on both).
+  //
+  // Not @no_frame — is a leaf but only 3 body insts and 1 ret; adds a 4-byte
+  // frame pklogue that pays for itself via debugger walkability into the
+  // sched_switch_r15 chain (per #1276's Option-C default).
+  // ==========================================================================
+  pub let xsave_area_for : (u64) -> u64 !{} @{} =
+    fn (pid: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "R21-M1 #827 (per-task XSAVE area allocation, aligned 64).  Pure arithmetic accessor.  slot_va = &_task_xsave_areas + pid * 4096.  Encoded as `lea rax, [rip+base]; shl rdi, 12; add rax, rdi` (3 insts).  Register discipline: rdi = pid input (SysV caller-save, clobbered), rax = return.  Not @no_frame — walkability into the sched_switch chain from klog_walk_rbp panics costs 4 bytes prologue.  Alignment: pid*4096 is a multiple of 4096; .bss @align(64) on _task_xsave_areas plus 4096 slot pitch = every returned VA is 4096-aligned (satisfies #827's 64-alignment with room to spare).  Bounds: caller guarantees pid ∈ [1..64] via pid_alloc's ceiling; pid=0 sentinel returns the unused slot-0 base and any pid > 64 walks off the array (upstream guard suffices).",
+      block: {
+        lea rax, [rip + _task_xsave_areas];
+        shl rdi, 12;                        // XSAVE_AREA_SLOT_SHIFT
+        add rax, rdi;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // xsave_area_init_for_pid(pid): zero the header (#829).
+  // ==========================================================================
+  //
+  // Contract: on a fresh task, clear the XSAVE header's XSTATE_BV field so
+  // the first xrstor loads architectural init values for all XCR0-enabled
+  // components.  XCOMP_BV also zeroed (though only meaningful for XSAVEC/S).
+  //
+  // In practice this is already satisfied by _task_xsave_areas being in .bss
+  // (loader zero-fills) AND task_new's rep_stosq zeroing the task_struct
+  // slab.  The XSAVE area itself is NOT touched by that rep_stosq (different
+  // storage), so on first task_new after boot the header is zero from .bss.
+  //
+  // However, task_free followed by task_new REUSING the same pid would find
+  // whatever the prior task's xrstor loaded — which is fine architecturally
+  // (xsaveopt sets XSTATE_BV bits for populated components; a subsequent
+  // xrstor reads them back), but for #829's specific claim "first FPU op in
+  // a new task sees mxcsr = 0x1F80" the header must be re-zeroed on reuse.
+  //
+  // This function performs that re-zero explicitly.  Called from task_new
+  // AFTER the slab rep_stosq (which doesn't reach the XSAVE area but is
+  // still the canonical construction step).  Also called from xsave_probe_bsp
+  // on first-run to defensively guarantee slot 1 through 64 are clean before
+  // the first task ever runs.
+  //
+  // Zeroes 64 bytes (the full header).  #829 fixture ("first FPU op in a
+  // new task sees mxcsr = 0x1F80"): xrstor with XSTATE_BV bit 1 == 0
+  // architecturally loads MXCSR = 0x1F80 (SDM Vol 1 §13.6 "Operation of
+  // XRSTOR").  So header-only zeroing suffices; the legacy region at [0..512]
+  // is loaded from the initial state, not read.
+  //
+  // Register: rdi = pid input, rax/rcx scratch.  Leaf, 1-push prologue for
+  // callee-save discipline into potential rep_stosq callers.
+  // ==========================================================================
+  pub let xsave_area_init_for_pid : (u64) -> () !{mem} @{} =
+    fn (pid: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R21-M1 #829 (init-frame XSTATE_BV).  Zeroes the 64-byte XSAVE header at [xsave_area_for(pid) + XSAVE_HEADER_OFFSET=+512..+575].  Effect on next xrstor: XSTATE_BV=0 causes every XCR0-enabled component to load its architectural init state per SDM Vol 1 §13.6 (mxcsr=0x1F80, x87 FCW=0x37F, YMM* zero).  Prevents BSP boot-time SIMD state or a previously-freed task's residual state from leaking into a fresh task.  Called after task_new's rep_stosq — the slab zero-loop doesn't reach the parallel XSAVE-area storage, so header must be zeroed via a dedicated store here.  Sequence: (1) compute area base = &_task_xsave_areas + pid << 12 (same arith as xsave_area_for, inlined to avoid a nested call in task_new's already-tall call chain).  (2) Store 0 at [area+512] (XSTATE_BV) and [area+520] (XCOMP_BV).  (3) rep stosq 6 qwords to zero the remaining 48 bytes of reserved header space per SDM (all 48 MUST be zero or xrstor #GPs).  Register: rdi=pid (clobbered by rep stosq), rax=area base, rcx=count, rdi later reused as rep destination.  Leaf; no callee-save preservation needed.  Encoder: lea/shl/add/mov/rep_stosq — all pre-existing.",
+      block: {
+        // (1) area = &_task_xsave_areas + pid << 12.
+        lea rax, [rip + _task_xsave_areas];
+        shl rdi, 12;
+        add rax, rdi;
+
+        // (2) Zero XSTATE_BV and XCOMP_BV (8 bytes each).
+        mov [rax + 512], 0;                 // XSAVE_XSTATE_BV_OFFSET
+        mov [rax + 520], 0;                 // XSAVE_XCOMP_BV_OFFSET
+
+        // (3) rep stosq 6 more qwords (48 bytes reserved header).
+        //     rax + 528..575 = reserved region; SDM Vol 2 XRSTOR says these
+        //     must all be zero or #GP fires.
+        lea rdi, [rax + 528];
+        mov rcx, 6;
+        xor rax, rax;
+        rep_stosq;
+
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // xsave_save_for(pid): xsaveopt this pid's area (#828 outbound half).
+  // ==========================================================================
+  //
+  // Contract: emits `xsaveopt [xsave_area_for(pid)]` with EDX:EAX =
+  // _xsave_xcr0_target (which selects the state components to save).  Called
+  // by sched_switch_r15 on the OUTGOING task before the register-file swap.
+  //
+  // Guard: if _xsave_area_size == 0 (no XSAVE support), skip — the CPU has
+  // no extended state to preserve, plain callee-save GPRs cover everything.
+  //
+  // Register: rdi = pid input; rax/rdx/rcx clobbered (EDX:EAX are xsaveopt's
+  // implicit mask operands).  Leaf function.  MUST @no_frame — inlined into
+  // sched_switch_r15's already stack-critical path where a rbp write would
+  // sabotage the RSP swap.
+  // ==========================================================================
+  pub let xsave_save_for : (u64) -> () !{mem, sysreg} @{sched} =
+    fn (pid: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { sched },
+      justification: "R21-M1 #828 (eager xsave in sched_switch — save side).  Emits xsaveopt [xsave_area_for(pid)] with EDX:EAX = _xsave_xcr0_target selecting components to save.  Guard: [_xsave_area_size]==0 (probe found no XSAVE) → skip; the CPU has no extended state so callee-save GPRs already cover everything.  Sequence: (1) load target mask into rax; if 0, ret.  (2) compute area = &_task_xsave_areas + pid<<12.  (3) mov rdx = target>>32 (upper mask; MVP 0), mov rax = target low 32.  (4) xsaveopt [rax] — encoder: 0F AE /6 with area base in a scratch reg.  Register: rdi=pid (clobbered by shl), r8=area (scratch to survive rdx/rax reload), rax/rdx/rcx caller-save.  @no_frame — leaf and called from sched_switch_r15's ultra-tight save prologue where a frame prologue would race against the RSP swap; also called via the SysV entry contract with rsp %16 == 8 as ordinary leaves are.",
+      block: {
+        // Guard: no XSAVE support ⇒ skip save.
+        mov rax, [rip + _xsave_area_size];
+        cmp rax, 0;
+        je xsave_save_for_skip;
+
+        // area = &_task_xsave_areas + pid * 4096
+        lea r8, [rip + _task_xsave_areas];
+        shl rdi, 12;
+        add r8, rdi;
+
+        // EDX:EAX = _xsave_xcr0_target (mask of components to save).
+        mov rax, [rip + _xsave_xcr0_target];
+        mov rdx, rax;
+        shr rdx, 32;                        // upper 32 (MVP: 0)
+
+        // xsaveopt [r8]
+        xsaveopt [r8];
+
+      xsave_save_for_skip:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // xsave_restore_for(pid): xrstor this pid's area (#828 inbound half).
+  // ==========================================================================
+  //
+  // Mirror of xsave_save_for.  Called by sched_switch_r15 on the INCOMING
+  // task AFTER the register-file swap.  Loads state components per XSTATE_BV
+  // + mask contract (SDM Vol 2 XRSTOR): bits set in the mask AND set in
+  // XSTATE_BV load explicitly; bits set in mask but clear in XSTATE_BV load
+  // initial values (mxcsr=0x1F80 etc — this is #829's mechanism).
+  // ==========================================================================
+  pub let xsave_restore_for : (u64) -> () !{mem, sysreg} @{sched} =
+    fn (pid: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { sched },
+      justification: "R21-M1 #828 (eager xsave in sched_switch — restore side).  Emits xrstor [xsave_area_for(pid)] with EDX:EAX = _xsave_xcr0_target.  Guard on [_xsave_area_size]==0 mirrors xsave_save_for.  Sequence: (1) load target; if 0, ret.  (2) area = &_task_xsave_areas + pid<<12.  (3) EDX:EAX = target.  (4) xrstor [r8] (encoder: 0F AE /5).  Register discipline identical to save side.  @no_frame for the same tight-path reason.",
+      block: {
+        // Guard.
+        mov rax, [rip + _xsave_area_size];
+        cmp rax, 0;
+        je xsave_restore_for_skip;
+
+        // area = &_task_xsave_areas + pid * 4096
+        lea r8, [rip + _task_xsave_areas];
+        shl rdi, 12;
+        add r8, rdi;
+
+        // EDX:EAX = mask.
+        mov rax, [rip + _xsave_xcr0_target];
+        mov rdx, rax;
+        shr rdx, 32;
+
+        // xrstor [r8]
+        xrstor [r8];
+
+      xsave_restore_for_skip:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // xsave_read_xcr0(): xgetbv wrapper for the fingerprint fixture (#826).
+  // ==========================================================================
+  //
+  // Returns the current XCR0 value as u64.  Encoded as ECX=0, xgetbv,
+  // shl rdx,32; or rax,rdx.  Leaf function.
+  //
+  // Not guarded on OSXSAVE — caller (fingerprint fixture) is responsible.
+  // xgetbv without OSXSAVE fires #UD; callers verify enable succeeded first.
+  // ==========================================================================
+  pub let xsave_read_xcr0 : () -> u64 !{sysreg} @{} =
+    fn () -> unsafe {
+      effects: { sysreg },
+      capabilities: {},
+      justification: "R21-M1 #826 XGETBV fixture wrapper.  ECX=0 selects XCR0; xgetbv reads value into EDX:EAX; recombine to u64 return in rax via `shl rdx,32; or rax,rdx` (matches the rdmsr recombine idiom in ap_bringup.pdx L155-156).  Leaf; no clobber discipline needed.  Assumes OSXSAVE=1 (xsave_enable_this_cpu ran and did not skip) — a pre-enable call fires #UD.",
+      block: {
+        mov rcx, 0;
+        xgetbv;
+        shl rdx, 32;
+        or  rax, rdx;
+        ret
+      }
+    }
+}
