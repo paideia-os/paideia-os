@@ -1,0 +1,449 @@
+// src/kernel/core/drivers/nvme/prp.pdx — R24-M4-001/002 (#899 / #900)
+//
+// NVMe PRP (Physical Region Page) encoding for I/O SQEs. PRP is the
+// pointer format NVMe uses to describe host memory buffers for
+// data-transfer commands (Read, Write, Compare, ...). See NVMe Base
+// Spec 2.0 §4.4 ("PRP Entry Format").
+//
+// -----------------------------------------------------------------------------
+// PRP semantics (spec §4.4, Figure 90)
+// -----------------------------------------------------------------------------
+//
+//   PRP1 (SQE bytes 24..31, u64):
+//       - The first PRP. It MAY carry a non-zero byte offset (bits 0..11)
+//         so the buffer's first page can start mid-page.
+//
+//   PRP2 (SQE bytes 32..39, u64):
+//       - Interpretation depends on transfer size:
+//           * <= 4 KiB (fits in the single page addressed by PRP1):
+//                 PRP2 is reserved (must be 0).
+//           * 4 KiB < xfer <= 8 KiB (spans exactly two pages):
+//                 PRP2 = physical address of the second page,
+//                 which MUST be page-aligned (bits 0..11 = 0).
+//           * > 8 KiB:
+//                 PRP2 = physical address of a PRP List page (§4.4.1).
+//                 The PRP List enumerates pages 2..N of the buffer.
+//
+// -----------------------------------------------------------------------------
+// PRP List page layout (spec §4.4.1)
+// -----------------------------------------------------------------------------
+//
+//   A PRP List page is exactly one host page (4 KiB with MPS=0) of 512
+//   u64 entries.  Entries 0..510 are page-aligned data-page PAs. Entry
+//   511 (the last) is EITHER:
+//     - the final data page (when the walk ends here), OR
+//     - a pointer to the next PRP List page (chain).
+//
+//   Chaining fires when the walk needs to describe more than 512 pages
+//   beyond PRP1. With exactly PRP1 + 512 list entries we can cover
+//   513 pages (~2 MiB with 4 KiB MPS). Anything larger requires
+//   chaining via the last-slot rule.
+//
+// -----------------------------------------------------------------------------
+// Page-count computation
+// -----------------------------------------------------------------------------
+//
+//   Given (buf_pa, buf_len), the buffer covers all host pages from
+//   floor(buf_pa / 4096) through floor((buf_pa + buf_len - 1) / 4096).
+//   The count is thus:
+//
+//       first_page = buf_pa & ~0xFFF
+//       last_page  = (buf_pa + buf_len - 1) & ~0xFFF
+//       pages      = ((last_page - first_page) >> 12) + 1
+//
+//   No assumption of page-aligned start — a 1 KiB transfer starting at
+//   offset 3900 crosses into a second page and counts as 2.
+//
+// -----------------------------------------------------------------------------
+// R24.M4 posture: dormant at boot
+// -----------------------------------------------------------------------------
+//
+// nvme_probe returns 0 under BIOS/-kernel boot (MCFG absent -> PCI
+// enumerator drains empty), so no PRP is encoded during smoke boot.
+// The functions in this file are symbol-existence + link-cleanliness
+// surface at M4. Real activation lands with the R24.M5 IRQ-driven
+// completion path plus a UEFI/OVMF boot fixture that surfaces a real
+// nvme controller.
+//
+// -----------------------------------------------------------------------------
+// VA/PA identity-map inheritance
+// -----------------------------------------------------------------------------
+//
+// The PRP List pool _nvme_prp_list_pool is .bss (high-half-linked at
+// KERNEL_VMA_BASE + phys per link.ld) that the driver hands to the
+// controller as a physical address via SQE.PRP2. The boot stub aliases
+// PML4[256] -> PDPT[0..3] so the low-half PA equals the high-half VA
+// bit-pattern once bit 47..63 are masked. Every existing NVMe SQE
+// builder (identify.pdx L192, identify_ns.pdx L182, io_queue.pdx L205)
+// carries the same latent VA/PA-normalization debt — R25's IOMMU boot
+// wire-up will normalize all handoff sites uniformly (see
+// design/kernel/iommu-boot-toggle.md §4).
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: sized stores via mov_b / mov_w / mov_d for sub-8B fields.
+//       PRP1/PRP2 are u64 fields so bare mov (REX.W) is safe.
+//   G4: full-register compares (zero-extend loads via prior xor).
+//
+// Reserved-label discipline: labels prefixed `nvme_prp_`, `nvme_pl_`,
+// `nvme_pla_` avoid the paideia-as reserved names (`loop`, `if`, ...).
+
+module Prp = structure {
+
+  // ============================================================================
+  // Page geometry
+  // ============================================================================
+
+  pub let NVME_PAGE_SIZE            : u64 = 4096
+  pub let NVME_PAGE_MASK            : u64 = 0xFFFFFFFFFFFFF000
+  pub let NVME_PAGE_OFFSET_MASK     : u64 = 0xFFF
+  pub let NVME_PAGE_SHIFT           : u64 = 12
+
+  // ============================================================================
+  // Return codes (encoded to fit alongside NVMe status semantics —
+  // bits 1..15 of an NVMe CQE status field; bit 0 is Phase Tag)
+  // ============================================================================
+  //
+  //   NVME_PRP_OK              — success sentinel (matches "successful
+  //                              completion" masked value).
+  //   NVME_PRP_ERR_LEN_ZERO    — caller passed buf_len == 0.
+  //   NVME_PRP_ERR_TOO_LARGE   — small-encode call for > 2 pages.
+  //   NVME_PRP_ERR_OOM         — PRP List pool exhausted mid-chain.
+
+  pub let NVME_PRP_OK               : u64 = 0
+  pub let NVME_PRP_ERR_LEN_ZERO     : u64 = 0x1001
+  pub let NVME_PRP_ERR_TOO_LARGE    : u64 = 0x1002
+  pub let NVME_PRP_ERR_OOM          : u64 = 0x1003
+
+  // ============================================================================
+  // SQE PRP field offsets (mirror of Identify.NVME_SQE_PRP1/2)
+  // ============================================================================
+
+  pub let NVME_SQE_PRP1_OFF         : u64 = 24
+  pub let NVME_SQE_PRP2_OFF         : u64 = 32
+
+  // ============================================================================
+  // PRP List pool — round-robin allocator over 16 4-KiB pages (64 KiB)
+  // ============================================================================
+  //
+  //   _nvme_prp_list_pool : 16 x 512 u64 = 8192 u64 = 64 KiB.
+  //   _nvme_prp_list_next : bump cursor in [0, 16); wraps.
+  //
+  //   Each 4 KiB page holds 512 PRP entries. With 16 pool pages we can
+  //   have 16 concurrent large-transfer submissions in flight before
+  //   pool wrap. That headroom aligns with NVME_IO_MAX_QUEUES = 8
+  //   (io_queue.pdx L106) at up to 2 in-flight per queue, which is the
+  //   R24.M5 IRQ-driven completion ceiling.
+
+  pub let NVME_PRP_LIST_POOL_PAGES  : u64 = 16
+  pub let NVME_PRP_LIST_ENTRIES     : u64 = 512
+  pub let NVME_PRP_LIST_LAST_SLOT   : u64 = 511
+
+  pub let mut _nvme_prp_list_pool   : [u64; 8192] = uninit @align(4096)
+  pub let mut _nvme_prp_list_next   : u64         = 0
+
+  // ============================================================================
+  // nvme_prp_list_alloc() -> u64
+  // ============================================================================
+  //
+  // SysV: () -> u64
+  //
+  // Round-robin bump allocator over _nvme_prp_list_pool. Returns the
+  // VA (== PA under identity-map alias, see file-header debt note) of
+  // the next 4-KiB slot in the pool.
+  //
+  // No free path — MVP treats the pool as a ring, and the R24.M5 IRQ
+  // completion path reclaims slots implicitly by the fact that a
+  // completed command's PRP list is no longer read by the controller.
+  //
+  // Leaf function — no callee-save clobber, no frame.
+
+  pub let nvme_prp_list_alloc : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R24-M4-002 (#900). Round-robin bump allocator over the 16-page _nvme_prp_list_pool. Body: (1) Load cursor u64 = _nvme_prp_list_next (plain 64-bit load). (2) Compute VA = lea _nvme_prp_list_pool + (cursor << 12). NVME_PAGE_SHIFT = 12 so `shl rcx, 12` scales the slot index into a byte offset. (3) Advance cursor: new = (cursor + 1) & 15 — 16 slots so `and 0xF` = mod 16. (4) Store new cursor back. (5) Return page VA in rax. No callee-save clobber (only rax/rcx/rdx used which are caller-save per SysV). Encoder: mov / lea / add / shl / and / ret — all pre-existing. G1 N/A (both loads/stores are 64-bit).",
+      block: {
+        // Load current cursor.
+        mov rcx, [rip + _nvme_prp_list_next];
+
+        // Compute pool page VA = &_nvme_prp_list_pool + cursor * 4096.
+        lea rax, [rip + _nvme_prp_list_pool];
+        mov rdx, rcx;
+        shl rdx, 12;                             // * 4096
+        add rax, rdx;
+
+        // Advance cursor mod 16.
+        add rcx, 1;
+        and rcx, 15;
+        mov [rip + _nvme_prp_list_next], rcx;
+
+        ret;
+      }
+    } @no_frame
+
+  // ============================================================================
+  // nvme_prp_encode_small(sqe_ptr, buf_pa, buf_len) -> u64
+  // ============================================================================
+  //
+  // SysV: (sqe_ptr: u64, buf_pa: u64, buf_len: u64) -> u64
+  //   rdi = pointer to 64-byte SQE image (caller-owned, writable)
+  //   rsi = physical address of transfer buffer (byte offset allowed
+  //         in bits 0..11 for the first page)
+  //   rdx = byte length of transfer (must be > 0)
+  //
+  // Returns rax:
+  //   NVME_PRP_OK            (0)      on success
+  //   NVME_PRP_ERR_LEN_ZERO  (0x1001) if buf_len == 0
+  //   NVME_PRP_ERR_TOO_LARGE (0x1002) if the buffer spans > 2 pages
+  //                                    (caller must use encode_large)
+  //
+  // Encoding rules (§4.4):
+  //   pages == 1: SQE.PRP1 = buf_pa; SQE.PRP2 = 0.
+  //   pages == 2: SQE.PRP1 = buf_pa;
+  //               SQE.PRP2 = (buf_pa & ~0xFFF) + 4096.
+  //
+  // Leaf function — no nested calls.
+
+  pub let nvme_prp_encode_small : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (sqe_ptr: u64, buf_pa: u64, buf_len: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R24-M4-001 (#899). Encode PRP1 (+ optional PRP2) for a <= 2-page NVMe transfer per NVMe Base Spec 2.0 Sec 4.4. Body: (1) Reject buf_len == 0 with NVME_PRP_ERR_LEN_ZERO. (2) Compute page_count: first = buf_pa & ~0xFFF; last_byte = buf_pa + buf_len - 1; last = last_byte & ~0xFFF; pages = ((last - first) >> 12) + 1. (3) If pages > 2 return NVME_PRP_ERR_TOO_LARGE — caller uses nvme_prp_encode_large. (4) Store SQE.PRP1 (u64 @+24) = buf_pa via plain 64-bit mov (no G1 risk). (5) Branch on page count: pages == 1 -> PRP2 = 0; pages == 2 -> PRP2 = first + 4096 = (buf_pa & ~0xFFF) + 0x1000. (6) Store SQE.PRP2 (u64 @+32) via plain mov. (7) Return NVME_PRP_OK in rax. Leaf function; no callee-save clobber (only rax/rcx/rdx/r8/r9 used — all caller-save per SysV). Encoder: cmp / je / lea (for the sqe pointer arithmetic) / mov / shr / shl / and / sub / add — all pre-existing. Reserved labels: `nvme_prp_`.",
+      block: {
+        // (1) Reject buf_len == 0.
+        cmp rdx, 0;
+        je  nvme_prp_len_zero;
+
+        // (2) Compute page_count.
+        //     first = buf_pa & ~0xFFF
+        //     last  = (buf_pa + buf_len - 1) & ~0xFFF
+        //     pages = ((last - first) >> 12) + 1
+        mov r8, rsi;                             // r8 = first (buf_pa & ~0xFFF)
+        mov r9, 0xFFFFFFFFFFFFF000;
+        and r8, r9;
+
+        mov rcx, rsi;                            // rcx = buf_pa + buf_len - 1
+        add rcx, rdx;
+        sub rcx, 1;
+        and rcx, r9;                             // rcx = last
+
+        sub rcx, r8;                             // rcx = (last - first)
+        shr rcx, 12;                             // rcx = (last - first) / 4096
+        add rcx, 1;                              // rcx = pages
+
+        // (3) Reject > 2 pages.
+        cmp rcx, 2;
+        ja  nvme_prp_too_large;
+
+        // (4) SQE.PRP1 (u64 @+24) = buf_pa.
+        mov [rdi + 24], rsi;
+
+        // (5) Branch on page count.
+        cmp rcx, 1;
+        je  nvme_prp_one_page;
+
+        // pages == 2: PRP2 = first + 4096.
+        add r8, 4096;
+        mov [rdi + 32], r8;
+        jmp nvme_prp_ok;
+
+      nvme_prp_one_page:
+        // pages == 1: PRP2 = 0.
+        xor rax, rax;
+        mov [rdi + 32], rax;
+
+      nvme_prp_ok:
+        xor rax, rax;                            // NVME_PRP_OK
+        ret;
+
+      nvme_prp_len_zero:
+        mov rax, 0x1001;                         // NVME_PRP_ERR_LEN_ZERO
+        ret;
+
+      nvme_prp_too_large:
+        mov rax, 0x1002;                         // NVME_PRP_ERR_TOO_LARGE
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // nvme_prp_encode_large(sqe_ptr, buf_pa, buf_len, prp_list_page_pa) -> u64
+  // ============================================================================
+  //
+  // SysV: (sqe_ptr: u64, buf_pa: u64, buf_len: u64, prp_list_pa: u64) -> u64
+  //   rdi = SQE pointer
+  //   rsi = buffer PA (first-page byte offset allowed)
+  //   rdx = transfer byte length
+  //   rcx = physical address of an initial PRP List page (4 KiB aligned;
+  //         allocated by caller via nvme_prp_list_alloc)
+  //
+  // Returns rax:
+  //   NVME_PRP_OK          (0)      on success
+  //   NVME_PRP_ERR_LEN_ZERO (0x1001) if buf_len == 0
+  //   NVME_PRP_ERR_OOM      (0x1003) if chaining exhausts the pool
+  //
+  // Encoding:
+  //   SQE.PRP1 = buf_pa (first page + offset).
+  //   SQE.PRP2 = prp_list_pa.
+  //   PRP List slots [0..N-2]     = data-page PAs (page-aligned).
+  //   PRP List slot [511] (last)  = next-list-page-PA if the walk
+  //                                 needs more than 511 more entries
+  //                                 in the current list (chain), else
+  //                                 the final data page.
+  //
+  // Register plan (5-push callee-save):
+  //   rbx = sqe_ptr
+  //   rbp = current PRP list page VA (starts at prp_list_pa)
+  //   r12 = current data-page cursor (starts at (first + 4096))
+  //   r13 = remaining data pages (starts at pages - 1)
+  //   r14 = current list-slot index (0..NVME_PRP_LIST_ENTRIES)
+  //
+  //   5 pushes = 40 B; entry rsp%16==8 -> 48, %16==0 (aligned for
+  //   nested nvme_prp_list_alloc call during chain).
+
+  pub let nvme_prp_encode_large : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (sqe_ptr: u64, buf_pa: u64, buf_len: u64, prp_list_pa: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R24-M4-002 (#900). Encode a > 2-page NVMe transfer using a PRP List per NVMe Base Spec 2.0 Sec 4.4.1. Body: (1) 5-push callee-save prologue (rbx=sqe, rbp=list_va, r12=data_cursor, r13=remaining, r14=slot_idx) — 40 B; entry rsp%16==8 -> 48, %16==0 (aligned for nvme_prp_list_alloc). (2) Reject buf_len == 0. (3) Compute pages via the same first/last shift/AND idiom as nvme_prp_encode_small; if pages <= 2, delegate would waste an allocated list page — but the contract lets the caller pre-decide, so we accept the small case here as a legal (if degenerate) input and still encode via list. Simpler: encode PRP1 always, and if pages == 1 skip filling the list (still write PRP2 = list_pa so the SQE is well-formed even if the controller may never dereference the list). (4) SQE.PRP1 (u64 @+24) = buf_pa. (5) SQE.PRP2 (u64 @+32) = prp_list_pa. (6) Compute first_page = buf_pa & ~0xFFF; initialize r12 = first_page + 4096 (first data page beyond PRP1); r13 = pages - 1 (data pages remaining for the list). If r13 == 0 skip fill entirely. (7) Fill loop `nvme_pl_walk`: if r13 == 0 -> done; if r14 < 511 -> plain data store [rbp + r14*8] = r12, r14++, r12 += 4096, r13--; if r14 == 511: two sub-cases — if r13 == 1: store r12 as the last data entry (slot 511) and done (no chain needed); if r13 > 1: allocate next list via nvme_prp_list_alloc, store next_va into [rbp + 511*8], reset r14 = 0, rbp = next_va, and continue (don't decrement r13 in the chain arm — the current data page hasn't been placed yet). (8) On chain-alloc failure return NVME_PRP_ERR_OOM (0x1003). (9) Return NVME_PRP_OK. Reserved labels: `nvme_pl_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                            // rbx = sqe_ptr
+        mov rbp, rcx;                            // rbp = list VA
+
+        // ================================================================
+        // (2) Reject buf_len == 0.
+        // ================================================================
+        cmp rdx, 0;
+        je  nvme_pl_len_zero;
+
+        // ================================================================
+        // (3) Compute pages.
+        //     first = buf_pa & ~0xFFF
+        //     last  = (buf_pa + buf_len - 1) & ~0xFFF
+        //     pages = ((last - first) >> 12) + 1
+        // ================================================================
+        mov r8, rsi;                             // r8 = first
+        mov r9, 0xFFFFFFFFFFFFF000;
+        and r8, r9;
+
+        mov rax, rsi;
+        add rax, rdx;
+        sub rax, 1;
+        and rax, r9;                             // rax = last
+
+        sub rax, r8;
+        shr rax, 12;
+        add rax, 1;                              // rax = pages
+
+        // ================================================================
+        // (4) SQE.PRP1 (u64 @+24) = buf_pa (unchanged rsi).
+        // ================================================================
+        mov [rbx + 24], rsi;
+
+        // ================================================================
+        // (5) SQE.PRP2 (u64 @+32) = prp_list_pa (unchanged rcx / rbp).
+        // ================================================================
+        mov [rbx + 32], rbp;
+
+        // ================================================================
+        // (6) Init walker.
+        //     r12 = first + 4096 (first data page beyond PRP1)
+        //     r13 = pages - 1
+        //     r14 = 0 (slot index in current list)
+        // ================================================================
+        mov r12, r8;
+        add r12, 4096;
+
+        mov r13, rax;
+        sub r13, 1;                              // pages - 1
+
+        xor r14, r14;                            // slot index
+
+        // ================================================================
+        // (7) Fill loop.
+        // ================================================================
+      nvme_pl_walk:
+        cmp r13, 0;
+        je  nvme_pl_ok;
+
+        // If slot < 511, store data page directly.
+        cmp r14, 511;
+        je  nvme_pl_last_slot;
+
+        // Plain data slot.
+        //   [rbp + r14 * 8] = r12
+        mov rax, r14;
+        shl rax, 3;                              // * 8
+        add rax, rbp;                            // rax = &list[slot]
+        mov [rax], r12;
+
+        add r14, 1;
+        add r12, 4096;
+        sub r13, 1;
+        jmp nvme_pl_walk;
+
+      nvme_pl_last_slot:
+        // slot == 511. Two cases based on remaining.
+        cmp r13, 1;
+        je  nvme_pl_final_data;
+
+        // Chain: allocate next list page.
+        //   rbp becomes current list; store next list VA at [rbp + 511*8].
+        //   Then reset walker onto next list and continue with same r12/r13.
+        call nvme_prp_list_alloc;
+        cmp rax, 0;
+        je  nvme_pl_oom;
+
+        // Store chain pointer at slot 511 of current list.
+        mov [rbp + 4088], rax;                   // 511 * 8 = 4088
+
+        // Switch to new list; reset slot cursor. Do NOT touch r12/r13
+        // — the pending data page still needs to be placed.
+        mov rbp, rax;
+        xor r14, r14;
+        jmp nvme_pl_walk;
+
+      nvme_pl_final_data:
+        // Exactly one data page left and slot cursor == 511; place it
+        // directly (no chain needed).
+        mov [rbp + 4088], r12;                   // 511 * 8 = 4088
+        // Fall through to nvme_pl_ok.
+
+      nvme_pl_ok:
+        xor rax, rax;                            // NVME_PRP_OK
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      nvme_pl_len_zero:
+        mov rax, 0x1001;                         // NVME_PRP_ERR_LEN_ZERO
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      nvme_pl_oom:
+        mov rax, 0x1003;                         // NVME_PRP_ERR_OOM
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+}

@@ -1,0 +1,342 @@
+// src/kernel/core/drivers/nvme/dma.pdx — R24-M4-003 (#901)
+//
+// DMA-buffer allocator for the NVMe driver. Two paths:
+//
+//   (a) nvme_dma_scratch_alloc — bump allocator over a 128 KiB
+//       page-aligned .bss pool (_nvme_dma_pool). Used for admin
+//       responses and small transient IOs (Identify Controller /
+//       Identify Namespace / Namespace List already use _nvme_id_*_buf,
+//       but future admin commands and per-IO metadata regions land
+//       here).
+//
+//   (b) nvme_dma_alloc — thin wrapper over the kernel phys_alloc
+//       page pool for one-off DMA buffers up to a single 4 KiB page.
+//       Multi-page requests currently return 0 (allocation failure);
+//       R24.M5 will grow this to a contiguous-page allocator once
+//       phys_alloc gains order > 0.
+//
+// -----------------------------------------------------------------------------
+// IOMMU-domain awareness (deferred to R25 IOMMU wire-up)
+// -----------------------------------------------------------------------------
+//
+// #901's headline requirement is that DMA buffers land pre-mapped into
+// the NVMe driver's VT-d translation domain. At R22.M6 that domain is
+// not yet constructed (Features.IOMMU_ENABLED = 0 per features.pdx
+// L89), and there is no per-device SLPT root allocated for the NVMe
+// controller. The IOMMU-mapping path is therefore gated on the
+// IOMMU_ENABLED flag AND on the presence of a domain root — both
+// currently false. R25 (design/kernel/iommu-boot-toggle.md §3) will:
+//
+//   1. Allocate a per-controller SL-PML4 via vtd_slpt_root_alloc.
+//   2. Bind the controller's SourceID to that root via a VT-d
+//      context-entry write during driver-attach.
+//   3. Flip Features.IOMMU_ENABLED to 1.
+//   4. Add a vtd_slpt_map(_nvme_domain_pt, iova=pa, host_pa=pa, ..., RW)
+//      call inside nvme_dma_alloc post-phys_alloc, and a matching
+//      unmap in nvme_dma_free.
+//
+// This module reserves the wire-up sites as `nvme_da_iommu_map` /
+// `nvme_da_iommu_unmap` no-op stubs so R25 can drop the real bodies
+// in as a two-function patch without touching call sites.
+//
+// -----------------------------------------------------------------------------
+// VA/PA identity-map inheritance
+// -----------------------------------------------------------------------------
+//
+// The scratch pool is .bss (high-half-linked per link.ld) whose
+// low-half PA is aliased by the boot stub's PML4[256] identity
+// mapping. Every existing NVMe SQE builder assumes VA == PA at the
+// controller handoff; this module inherits the same posture. See
+// prp.pdx §"VA/PA identity-map inheritance" for the full
+// normalization-debt note (R25 fixes all sites together).
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: sized stores via mov_b / mov_w / mov_d for sub-8B fields.
+//   G4: full-register compares.
+//
+// Reserved-label discipline: `nvme_da_`, `nvme_dsa_`, `nvme_df_`.
+
+module Dma = structure {
+
+  // ============================================================================
+  // Return / status constants
+  // ============================================================================
+
+  pub let NVME_DMA_OK               : u64 = 0
+  pub let NVME_DMA_NULL             : u64 = 0        // alias for allocation failure
+
+  // ============================================================================
+  // Scratch pool sizing
+  // ============================================================================
+  //
+  //   32 pages x 4 KiB = 128 KiB. 16384 u64 entries.
+  //   Bump cursor _nvme_dma_scratch_next is a *byte* offset into the
+  //   pool for O(1) alignment math (round-up to 64 B, wrap at
+  //   NVME_DMA_SCRATCH_BYTES).
+
+  pub let NVME_DMA_SCRATCH_PAGES    : u64 = 32
+  pub let NVME_DMA_SCRATCH_BYTES    : u64 = 131072   // 32 * 4096
+  pub let NVME_DMA_SCRATCH_ALIGN    : u64 = 64       // per-allocation min-align
+
+  pub let mut _nvme_dma_pool        : [u64; 16384] = uninit @align(4096)
+  pub let mut _nvme_dma_scratch_next : u64          = 0
+
+  // ============================================================================
+  // nvme_dma_alloc(size) -> u64
+  // ============================================================================
+  //
+  // SysV: (size: u64) -> u64
+  //   rdi = byte size of requested DMA buffer.
+  //
+  // Returns rax = PA (== VA under identity-map alias) of the
+  // allocation, or 0 on failure.
+  //
+  // MVP semantics (R24.M4):
+  //   size == 0         -> return 0 (invalid).
+  //   size <= 4096      -> phys_alloc(order=0); return the frame.
+  //   size >  4096      -> return 0 (multi-page contiguous alloc not
+  //                        supported until phys_alloc gains order > 0
+  //                        in R24.M5).
+  //
+  // IOMMU-domain mapping (deferred): when Features.IOMMU_ENABLED is
+  // flipped in R25, this function will call nvme_da_iommu_map(pa, size)
+  // after the phys_alloc and propagate its status. Today the stub is
+  // a no-op that returns 0.
+  //
+  // Register plan (2-push callee-save):
+  //   rbx = size (survives phys_alloc call for the size-record path)
+  //   rbp = pa   (survives nvme_da_iommu_map stub call)
+  //
+  //   2 pushes = 16 B; entry rsp%16==8 -> 24, sub rsp,8 -> 32,
+  //   %16==0 (aligned for phys_alloc + iommu-stub nested calls).
+
+  pub let nvme_dma_alloc : (u64) -> u64 !{mem} @{boot} =
+    fn (size: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R24-M4-003 (#901). Allocate a DMA-usable page for NVMe transfers. Body: (1) 2-push callee-save prologue (rbx=size, rbp=pa) + 8 B align — 24 B; entry rsp%16==8 -> 32, %16==0 (aligned for phys_alloc + iommu-stub nested calls). (2) Reject size == 0 (return 0). (3) Reject size > 4096 (return 0 — multi-page phys_alloc requires order > 0 which is #559 debt not yet delivered). (4) Save size in rbx (survives phys_alloc). (5) Call phys_alloc(order=0). rdi = 0 for order argument. (6) If phys_alloc returned 0 (pool exhausted), return 0. (7) Save PA in rbp. (8) IOMMU-domain map stub: nvme_da_iommu_map(pa=rbp, size=rbx). Today a no-op returning 0; R25 fills in vtd_slpt_map. (9) Return rax = rbp (PA). Reserved labels: `nvme_da_`.",
+      block: {
+        push rbx;
+        push rbp;
+        sub rsp, 8;
+
+        // (2) Reject size == 0.
+        cmp rdi, 0;
+        je  nvme_da_zero;
+
+        // (3) Reject size > 4096.
+        cmp rdi, 4096;
+        ja  nvme_da_zero;
+
+        // (4) Save size.
+        mov rbx, rdi;
+
+        // (5) phys_alloc(order=0).
+        mov rdi, 0;
+        call phys_alloc;
+
+        // (6) Fail if allocator returned 0.
+        cmp rax, 0;
+        je  nvme_da_zero;
+
+        // (7) Save PA.
+        mov rbp, rax;
+
+        // (8) IOMMU stub call — no-op today; R25 fills in vtd_slpt_map.
+        mov rdi, rbp;
+        mov rsi, rbx;
+        call nvme_da_iommu_map;
+
+        // (9) Return PA (in rbp).
+        mov rax, rbp;
+
+        add rsp, 8;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      nvme_da_zero:
+        xor rax, rax;
+        add rsp, 8;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // nvme_dma_free(pa, size) -> ()
+  // ============================================================================
+  //
+  // SysV: (pa: u64, size: u64) -> ()
+  //   rdi = PA previously returned by nvme_dma_alloc
+  //   rsi = size that was passed to nvme_dma_alloc
+  //
+  // MVP semantics: only frees single-page allocations. Delegates to
+  // phys_free(order=0) at the pool boundary. IOMMU-unmap stub call
+  // precedes phys_free so R25's fill-in undoes vtd_slpt_map first
+  // (unmap-before-free is the standard ordering for driver-owned
+  // DMA regions — the frame must not be reissued to another domain
+  // while its context-entry still references it).
+  //
+  // Register plan (2-push callee-save):
+  //   rbx = pa, rbp = size.
+
+  pub let nvme_dma_free : (u64, u64) -> () !{mem} @{boot} =
+    fn (pa: u64, size: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R24-M4-003 (#901). Release an NVMe DMA-usable page. Body: (1) 2-push callee-save prologue (rbx=pa, rbp=size) — 16 B; entry rsp%16==8 -> 24, sub rsp,8 -> 32, %16==0 (aligned for iommu-stub + phys_free). (2) Reject pa == 0 (defensive no-op). (3) IOMMU-domain unmap stub first: nvme_da_iommu_unmap(pa, size). Today a no-op. (4) phys_free(pa, order=0). phys_free normalizes VA/PA at its own boundary (phys_free.pdx L20 contract), so passing the phys_alloc-form value unchanged is correct. (5) Return. Reserved labels: `nvme_df_`.",
+      block: {
+        push rbx;
+        push rbp;
+        sub rsp, 8;
+
+        cmp rdi, 0;
+        je  nvme_df_ret;
+
+        mov rbx, rdi;                            // rbx = pa
+        mov rbp, rsi;                            // rbp = size
+
+        // (3) IOMMU unmap stub (no-op today).
+        mov rdi, rbx;
+        mov rsi, rbp;
+        call nvme_da_iommu_unmap;
+
+        // (4) phys_free(pa, order=0).
+        mov rdi, rbx;
+        mov rsi, 0;
+        call phys_free;
+
+      nvme_df_ret:
+        add rsp, 8;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // nvme_dma_scratch_alloc(size) -> u64
+  // ============================================================================
+  //
+  // SysV: (size: u64) -> u64
+  //   rdi = byte size of the scratch region.
+  //
+  // Returns rax = VA (== PA under identity-map alias) of a 64-byte-
+  // aligned region within _nvme_dma_pool, or 0 on failure.
+  //
+  // Semantics:
+  //   size == 0                       -> 0 (invalid).
+  //   size > NVME_DMA_SCRATCH_BYTES   -> 0 (exceeds pool).
+  //   otherwise: round size up to a 64 B multiple, and if
+  //   (cursor + rounded) > pool_size, wrap cursor to 0 first
+  //   (ring semantics — MVP does not track live allocations, so
+  //   the caller must not depend on old slots surviving beyond
+  //   one full pool wrap).
+  //
+  // Leaf function — no callee-save clobber.
+
+  pub let nvme_dma_scratch_alloc : (u64) -> u64 !{mem} @{} =
+    fn (size: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R24-M4-003 (#901). Bump-allocate a 64B-aligned region from _nvme_dma_pool. Body: (1) Reject size == 0. (2) Round size up to 64 B: rounded = (size + 63) & ~63 via `add + and`. (3) Reject rounded > NVME_DMA_SCRATCH_BYTES. (4) Load cursor u64 = _nvme_dma_scratch_next (plain 64-bit load). (5) If cursor + rounded > NVME_DMA_SCRATCH_BYTES: wrap cursor = 0. (6) Compute region VA = &_nvme_dma_pool + cursor via lea + add. (7) Advance cursor: new = cursor + rounded; store back. (8) Return region VA in rax. Leaf function; rax/rcx/rdx/r8/r9 caller-save. Encoder: cmp / je / ja / add / and / mov / lea / ret — all pre-existing. Reserved labels: `nvme_dsa_`.",
+      block: {
+        // (1) Reject size == 0.
+        cmp rdi, 0;
+        je  nvme_dsa_zero;
+
+        // (2) Round size up to 64B: (size + 63) & ~63.
+        mov rax, rdi;
+        add rax, 63;
+        mov rcx, 0xFFFFFFFFFFFFFFC0;             // ~63
+        and rax, rcx;                            // rax = rounded
+
+        // (3) Reject rounded > pool size.
+        cmp rax, 131072;                         // NVME_DMA_SCRATCH_BYTES
+        ja  nvme_dsa_zero;
+
+        // (4) Load cursor.
+        mov r8, [rip + _nvme_dma_scratch_next];  // r8 = cursor
+
+        // (5) If cursor + rounded > pool size, wrap.
+        mov r9, r8;
+        add r9, rax;                             // r9 = cursor + rounded
+        cmp r9, 131072;
+        jbe nvme_dsa_no_wrap;
+
+        // Wrap cursor to 0; re-derive r9 = rounded.
+        xor r8, r8;
+        mov r9, rax;
+
+      nvme_dsa_no_wrap:
+        // (6) VA = &_nvme_dma_pool + cursor.
+        lea rdx, [rip + _nvme_dma_pool];
+        add rdx, r8;                             // rdx = region VA
+
+        // (7) Store new cursor.
+        mov [rip + _nvme_dma_scratch_next], r9;
+
+        // (8) Return region VA.
+        mov rax, rdx;
+        ret;
+
+      nvme_dsa_zero:
+        xor rax, rax;
+        ret;
+      }
+    } @no_frame
+
+  // ============================================================================
+  // nvme_da_iommu_map(pa, size) -> u64  — R25 wire-up stub
+  // ============================================================================
+  //
+  // SysV: (pa: u64, size: u64) -> u64
+  //   rdi = PA of allocated frame
+  //   rsi = byte size of allocation (may exceed one page in R24.M5+)
+  //
+  // Returns rax = 0 always today. R25 fills in:
+  //
+  //   1. Test Features.IOMMU_ENABLED. If 0, return 0 immediately.
+  //   2. For each 4 KiB page in [pa, pa + size), call
+  //        vtd_slpt_map(_nvme_domain_pt, iova = pa_page,
+  //                     host_pa = pa_page, flags = SLPT_FLAG_LEAF_RWX).
+  //   3. Propagate first non-OK status.
+  //
+  // Leaf function. Reserved as a jump target today so nvme_dma_alloc's
+  // call site does not need to change when the wire-up lands.
+
+  pub let nvme_da_iommu_map : (u64, u64) -> u64 !{mem} @{} =
+    fn (pa: u64, size: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R24-M4-003 (#901). Reserved-slot stub for R25 IOMMU wire-up. Body: xor rax, rax; ret. Returns 0 unconditionally. R25 will fill in the vtd_slpt_map loop guarded by Features.IOMMU_ENABLED (see file-header §IOMMU-domain awareness). Leaf, no callee-save clobber.",
+      block: {
+        xor rax, rax;
+        ret;
+      }
+    } @no_frame
+
+  // ============================================================================
+  // nvme_da_iommu_unmap(pa, size) -> u64  — R25 wire-up stub
+  // ============================================================================
+  //
+  // Structural twin of nvme_da_iommu_map. Today: no-op returning 0.
+  // R25 fills in vtd_slpt_unmap (per page) + IOTLB invalidation for
+  // the affected IOVAs.
+
+  pub let nvme_da_iommu_unmap : (u64, u64) -> u64 !{mem} @{} =
+    fn (pa: u64, size: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R24-M4-003 (#901). Reserved-slot stub for R25 IOMMU wire-up (unmap path). Body: xor rax, rax; ret. R25 fills in vtd_slpt_unmap + IOTLB invalidation. Leaf.",
+      block: {
+        xor rax, rax;
+        ret;
+      }
+    } @no_frame
+}

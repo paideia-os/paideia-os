@@ -1,0 +1,506 @@
+// src/kernel/core/drivers/nvme/mdts.pdx — R24-M4-004 (#902)
+//
+// MDTS (Max Data Transfer Size) enforcement + auto-split. NVMe Base
+// Spec 2.0 §5.17.2.1 defines MDTS as the largest single-command
+// transfer supported by the controller, expressed as a power of two
+// in host-memory-page units:
+//
+//     max_transfer_bytes = (2 ^ MPSMIN_bytes_log2) * (2 ^ MDTS)
+//                        = (1 << (12 + MPSMIN)) << MDTS
+//
+// MDTS == 0 is the "no limit" sentinel: the controller accepts any
+// single-command transfer size.  MPSMIN lives in CAP.MPSMIN
+// (bits 51..48) — for every commodity NVMe controller running on a
+// 4 KiB-page host, MPSMIN = 0 (giving 4 KiB pages).
+//
+// A caller with a transfer larger than max_transfer_bytes must split
+// the request into MDTS-sized chunks and submit each as its own
+// Read/Write command.  MDTS gating happens above the NVM/IO SQE
+// builder: each chunk is a self-contained SQE that then flows through
+// nvme_prp_encode_small / nvme_prp_encode_large (prp.pdx) and
+// nvme_submit_io_cmd (dispatch.pdx).
+//
+// -----------------------------------------------------------------------------
+// I/O SQE format (§4.2 / NVM Command Set §3)
+// -----------------------------------------------------------------------------
+//
+//   +0    u8   OPC     — 0x01 = Write, 0x02 = Read
+//   +1    u8   FUSE|PSDT — 0 for our path (PRP, no fused ops)
+//   +2    u16  CID     — command identifier (MVP: 0; R24.M5 CID pool)
+//   +4    u32  NSID    — namespace ID
+//   +8    u64  rsvd
+//   +16   u64  MPTR    — metadata pointer (0 for our contiguous NVM)
+//   +24   u64  PRP1    — populated by nvme_prp_encode_*
+//   +32   u64  PRP2    — populated by nvme_prp_encode_*
+//   +40   u32  CDW10   — SLBA[31:0]  (starting LBA low half)
+//   +44   u32  CDW11   — SLBA[63:32] (starting LBA high half)
+//   +48   u32  CDW12   — bits 15:0 = NLB (block count, 0-based)
+//                        bits 31:16 = DTYPE / STC / PRINFO / FUA / LR
+//                        MVP path uses 0 for the upper half.
+//   +52   u32  CDW13   — DSM directive (0 for MVP)
+//   +56   u32  CDW14   — ILBRT (initial LBA reference tag, 0 for MVP)
+//   +60   u32  CDW15   — LBAT / LBATM (metadata protection, 0 for MVP)
+//
+// -----------------------------------------------------------------------------
+// R24.M4 posture: dormant at boot
+// -----------------------------------------------------------------------------
+//
+// nvme_probe returns 0 under BIOS/-kernel boot; the whole R24 driver
+// stays in the "compile + link" acceptance surface.  Additionally at
+// M4, nvme_io_split_and_submit's per-chunk submission is fire-and-
+// forget (nvme_submit_io_cmd does not wait for completion — R24.M5
+// wires IRQ-driven CQ consumption). Callers that need per-chunk
+// completion aggregation must layer on top of the R24.M5 request-slot
+// future path.  For M4, the function returns 0 once the last chunk
+// has been enqueued (or the first non-OK PRP/submit status if any).
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: sized stores via mov_b / mov_w / mov_d for sub-8B fields.
+//   G4: full-register compares (zero-extend loads via prior xor).
+//
+// Reserved-label discipline: `nvme_md_`, `nvme_iss_`, `nvme_ibs_`.
+
+module Mdts = structure {
+
+  // ============================================================================
+  // NVM I/O opcodes (§3 NVM Command Set)
+  // ============================================================================
+
+  pub let NVME_NVM_OPC_WRITE        : u64 = 0x01
+  pub let NVME_NVM_OPC_READ         : u64 = 0x02
+
+  // ============================================================================
+  // SQE field offsets (mirror of Identify.NVME_SQE_*)
+  // ============================================================================
+
+  pub let NVME_IO_SQE_OPC           : u64 = 0
+  pub let NVME_IO_SQE_NSID          : u64 = 4
+  pub let NVME_IO_SQE_CDW10         : u64 = 40
+  pub let NVME_IO_SQE_CDW11         : u64 = 44
+  pub let NVME_IO_SQE_CDW12         : u64 = 48
+
+  // ============================================================================
+  // Return / status sentinels
+  // ============================================================================
+
+  pub let NVME_MDTS_UNLIMITED       : u64 = 0        // == "no cap"
+  pub let NVME_IO_SUBMIT_OK         : u64 = 0
+
+  // ============================================================================
+  // I/O SQE scratch — shared, single-shot at MVP posture
+  // ============================================================================
+  //
+  //   8 x u64 = 64 B = one NVMe SQE. Copied verbatim into the target
+  //   IO SQ by nvme_submit_io_cmd (dispatch.pdx L149), so no aliasing
+  //   concern once the doorbell rings for a given chunk.  R24.M5 will
+  //   convert this to per-CPU scratch once concurrent chunk submission
+  //   from different queues becomes real.
+
+  pub let mut _nvme_io_sqe_scratch  : [u64; 8] = uninit @align(8)
+
+  // ============================================================================
+  // nvme_mdts_bytes() -> u64
+  // ============================================================================
+  //
+  // SysV: () -> u64
+  //
+  // Compute the controller's per-command byte cap from
+  //   (a) Identify Controller[77] = MDTS  (populated by nvme_identify),
+  //   (b) CAP.MPSMIN                       (read via nvme_reg_u64).
+  //
+  // Return value:
+  //   0                             — no limit (MDTS == 0)          OR
+  //                                   driver not attached yet (bar0 == 0).
+  //                                   Callers treat 0 as "submit whole
+  //                                   transfer without splitting".
+  //   otherwise                     — byte cap = (1 << (12+MPSMIN)) << MDTS.
+  //
+  // Register plan (1-push callee-save):
+  //   rbx = cached MDTS byte value.
+  //   1 push = 8 B; entry rsp%16==8 -> 16, %16==0 (aligned for
+  //   nvme_reg_u64 call).
+
+  pub let nvme_mdts_bytes : () -> u64 !{sysreg, mem} @{} =
+    fn () -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R24-M4-004 (#902). Compute the controller's per-command byte cap from Identify Controller MDTS + CAP.MPSMIN. Body: (1) 1-push callee-save prologue (rbx = MDTS value) — 8 B; entry rsp%16==8 -> 16, %16==0 (aligned for nvme_reg_u64 nested call). (2) Load MDTS = u8 @ _nvme_id_ctrl_buf + 77 via `xor rbx, rbx; mov_b rbx, [rip + _nvme_id_ctrl_buf + 77]`. (3) If MDTS == 0: return 0 (no limit sentinel). (4) Load _nvme_current_bar0 (module-level u64, cached by nvme_create_all_io_cqs — io_queue.pdx L139). If bar0 == 0, driver not yet attached — return 0 (also-no-limit sentinel; equivalent to MDTS unset). (5) Call nvme_reg_u64(bar0, 0x00) -> rax = CAP register (64-bit). (6) Extract MPSMIN = (CAP >> 48) & 0xF. (7) Compute page_bytes = 1 << (12 + MPSMIN): mov rax, 1; mov rcx, mpsmin; add rcx, 12; shl rax, cl. (8) Compute cap = page_bytes << MDTS: mov rcx, rbx; shl rax, cl. (9) Return cap in rax. Reserved labels: `nvme_md_`.",
+      block: {
+        push rbx;
+
+        // (2) Load MDTS byte (u8 @ _nvme_id_ctrl_buf + 77).
+        xor rbx, rbx;
+        mov_b rbx, [rip + _nvme_id_ctrl_buf + 77];
+
+        // (3) MDTS == 0 => no limit.
+        cmp rbx, 0;
+        je  nvme_md_none;
+
+        // (4) Check bar0 cached.
+        mov rax, [rip + _nvme_current_bar0];
+        cmp rax, 0;
+        je  nvme_md_none;
+
+        // (5) CAP = nvme_reg_u64(bar0, 0x00).
+        mov rdi, rax;
+        xor rsi, rsi;                            // offset 0
+        call nvme_reg_u64;
+        // rax = CAP.
+
+        // (6) MPSMIN = (CAP >> 48) & 0xF.
+        shr rax, 48;
+        and rax, 0xF;                            // rax = MPSMIN
+
+        // (7) page_bytes = 1 << (12 + MPSMIN).
+        mov rcx, rax;
+        add rcx, 12;
+        mov rax, 1;
+        shl rax, cl;                             // rax = page_bytes
+
+        // (8) cap = page_bytes << MDTS.
+        mov rcx, rbx;
+        shl rax, cl;                             // rax = cap
+
+        pop rbx;
+        ret;
+
+      nvme_md_none:
+        xor rax, rax;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // nvme_io_build_and_submit_one — internal helper (one chunk)
+  // ============================================================================
+  //
+  // SysV: (user_op, nsid, lba, block_count, buf_pa, lba_size) -> u64
+  //   rdi = OPC (0x01 = Write, 0x02 = Read)
+  //   rsi = NSID
+  //   rdx = starting LBA (u64)
+  //   rcx = block count (>= 1)
+  //   r8  = buffer PA
+  //   r9  = LBA size in bytes (from nvme_identify_ns lba_size)
+  //
+  // Returns rax:
+  //   NVME_IO_SUBMIT_OK (0)        on submit-enqueued (no completion wait)
+  //   NVME_PRP_ERR_*     (0x1001+) on PRP encoding failure
+  //
+  // Body sketch:
+  //   (1) rep_stosb-zero _nvme_io_sqe_scratch (64 B).
+  //   (2) SQE.OPC   (u8  @+0)  = OPC.
+  //   (3) SQE.NSID  (u32 @+4)  = NSID.
+  //   (4) SQE.CDW10 (u32 @+40) = LBA[31:0].
+  //   (5) SQE.CDW11 (u32 @+44) = LBA[63:32].
+  //   (6) SQE.CDW12 (u32 @+48) = block_count - 1 (NLB is 0-based).
+  //   (7) Encode PRPs: compute pages from buf_pa + block_count*lba_size.
+  //       If pages <= 2: nvme_prp_encode_small.
+  //       Else:          list_pa = nvme_prp_list_alloc;
+  //                      nvme_prp_encode_large(sqe, buf, len, list_pa).
+  //   (8) If PRP encode failed, return its error.
+  //   (9) nvme_submit_io_cmd(sqe). Ignore its slot-index return; treat
+  //       as OK.
+  //   (10) Return 0.
+  //
+  // Register plan (6-push callee-save + 8B stash):
+  //   rbx = OPC, rbp = NSID, r12 = LBA, r13 = block_count,
+  //   r14 = buf_pa, r15 = lba_size.
+  //   6 pushes = 48 B; entry rsp%16==8 -> 56, sub rsp,8 -> 64, %16==0
+  //   (aligned for nvme_prp_encode_* and nvme_submit_io_cmd).
+
+  pub let nvme_io_build_and_submit_one : (u64, u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (user_op: u64, nsid: u64, lba: u64, block_count: u64, buf_pa: u64, lba_size: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R24-M4-004 (#902). Build a single NVM I/O SQE (Read/Write) and enqueue it via nvme_submit_io_cmd. Body: (1) 6-push callee-save prologue (rbx=OPC, rbp=NSID, r12=LBA, r13=block_count, r14=buf_pa, r15=lba_size) + 8B align — 48 B; entry rsp%16==8 -> 56, sub rsp,8 -> 64, %16==0 (aligned for nested calls). (2) rep_stosb-zero the 64-byte _nvme_io_sqe_scratch (rdi=lea, rax=0, rcx=64, cld). rep_stosb clobbers rcx/rax/rdi; rbx..r15 survive per SysV. (3) Fill SQE OPC (u8 @+0), NSID (u32 @+4), CDW10 (u32 @+40 = LBA[31:0]), CDW11 (u32 @+44 = LBA[63:32]), CDW12 (u32 @+48 = block_count - 1 as NLB 0-based). Extracting LBA halves: mov rax, r12; mov_d [scratch+40], rax stores low 32 bits; mov rax, r12; shr rax, 32; mov_d [scratch+44], rax stores high 32 bits. block_count-1 via `mov rax, r13; sub rax, 1`. (4) Compute transfer bytes = block_count * lba_size via `mov rax, r13; imul rax, r15`. Save on stack scratch. (5) Compute pages via first/last shift/AND idiom (matches prp.pdx). (6) If pages <= 2: nvme_prp_encode_small(sqe=&scratch, buf_pa=r14, len=stash). Else: nvme_prp_list_alloc -> list_pa; nvme_prp_encode_large(sqe=&scratch, buf_pa=r14, len=stash, list_pa). (7) If PRP status != 0, return it (early exit through epilogue). (8) Call nvme_submit_io_cmd(sqe=&scratch). Discard rax (slot index) — treat as OK sentinel 0. (9) Return 0. Reserved labels: `nvme_ibs_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // OPC
+        mov rbp, rsi;                            // NSID
+        mov r12, rdx;                            // LBA
+        mov r13, rcx;                            // block_count
+        mov r14, r8;                             // buf_pa
+        mov r15, r9;                             // lba_size
+
+        // ================================================================
+        // (2) Zero SQE scratch.
+        // ================================================================
+        lea rdi, [rip + _nvme_io_sqe_scratch];
+        xor rax, rax;
+        mov rcx, 64;
+        cld;
+        rep_stosb;
+
+        lea r10, [rip + _nvme_io_sqe_scratch];
+
+        // ================================================================
+        // (3) Fill SQE fields.
+        // ================================================================
+        // OPC (u8 @+0) = rbx
+        mov_b [r10 + 0], rbx;
+
+        // NSID (u32 @+4) = rbp
+        mov_d [r10 + 4], rbp;
+
+        // CDW10 (u32 @+40) = LBA[31:0]
+        mov rax, r12;
+        mov_d [r10 + 40], rax;
+
+        // CDW11 (u32 @+44) = LBA[63:32]
+        mov rax, r12;
+        shr rax, 32;
+        mov_d [r10 + 44], rax;
+
+        // CDW12 (u32 @+48) = block_count - 1 (NLB is 0-based)
+        mov rax, r13;
+        sub rax, 1;
+        mov_d [r10 + 48], rax;
+
+        // ================================================================
+        // (4) Compute transfer bytes = block_count * lba_size.
+        //     Stash at [rsp + 0].
+        // ================================================================
+        mov rax, r13;
+        imul rax, r15;
+        mov [rsp + 0], rax;                      // stash transfer bytes
+
+        // ================================================================
+        // (5) Compute pages.
+        //     first = buf_pa & ~0xFFF
+        //     last  = (buf_pa + len - 1) & ~0xFFF
+        //     pages = ((last - first) >> 12) + 1
+        // ================================================================
+        mov rcx, r14;                            // rcx = first
+        mov r9, 0xFFFFFFFFFFFFF000;
+        and rcx, r9;
+
+        mov r8, r14;
+        add r8, rax;                             // r8 = buf_pa + len
+        sub r8, 1;
+        and r8, r9;                              // r8 = last
+
+        sub r8, rcx;
+        shr r8, 12;
+        add r8, 1;                               // r8 = pages
+
+        // ================================================================
+        // (6) Encode PRPs.
+        // ================================================================
+        cmp r8, 2;
+        ja  nvme_ibs_large;
+
+        // Small path.
+        lea rdi, [rip + _nvme_io_sqe_scratch];   // sqe_ptr
+        mov rsi, r14;                            // buf_pa
+        mov rdx, [rsp + 0];                      // len
+        call nvme_prp_encode_small;
+        cmp rax, 0;
+        jne nvme_ibs_prp_fail;
+        jmp nvme_ibs_submit;
+
+      nvme_ibs_large:
+        // Allocate PRP list page.
+        call nvme_prp_list_alloc;
+        // rax = list_pa
+        mov r11, rax;                            // r11 = list_pa
+
+        lea rdi, [rip + _nvme_io_sqe_scratch];
+        mov rsi, r14;
+        mov rdx, [rsp + 0];
+        mov rcx, r11;
+        call nvme_prp_encode_large;
+        cmp rax, 0;
+        jne nvme_ibs_prp_fail;
+
+      nvme_ibs_submit:
+        // ================================================================
+        // (8) Enqueue via nvme_submit_io_cmd.
+        // ================================================================
+        lea rdi, [rip + _nvme_io_sqe_scratch];
+        call nvme_submit_io_cmd;
+        // Discard rax (SQ slot sentinel); treat as OK.
+
+        xor rax, rax;                            // NVME_IO_SUBMIT_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      nvme_ibs_prp_fail:
+        // rax already holds NVME_PRP_ERR_* from prp encoder.
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // nvme_io_split_and_submit(user_op, nsid, lba, block_count,
+  //                           buf_pa, lba_size) -> u64
+  // ============================================================================
+  //
+  // SysV (6 args, all u64):
+  //   rdi = user_op (0x01 Write / 0x02 Read)
+  //   rsi = nsid
+  //   rdx = starting LBA
+  //   rcx = total block count
+  //   r8  = buffer PA
+  //   r9  = LBA size in bytes
+  //
+  // Splits `block_count` into chunks of at most MDTS-bytes worth of
+  // blocks, submitting each chunk via nvme_io_build_and_submit_one.
+  // Returns 0 once the last chunk has been enqueued, or the first
+  // non-OK PRP/submit status on fail-fast (MVP — R24.M5 will layer
+  // per-chunk completion aggregation on top).
+  //
+  // MDTS == 0 (no limit) → single-shot submit of the entire request.
+  //
+  // Register plan (6-push callee-save + 24B stack scratch):
+  //   rbx = user_op, rbp = nsid, r12 = current_lba, r13 = remaining_blocks,
+  //   r14 = current_buf, r15 = lba_size.
+  //   [rsp + 0] = max_blocks_per_chunk (computed once from MDTS).
+  //
+  //   6 pushes = 48 B; entry rsp%16==8 -> 56, sub rsp,24 -> 80,
+  //   %16==0 (aligned for nested calls).
+
+  pub let nvme_io_split_and_submit : (u64, u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (user_op: u64, nsid: u64, lba: u64, block_count: u64, buf_pa: u64, lba_size: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R24-M4-004 (#902). Enforce MDTS by splitting a possibly-large NVMe I/O request into MDTS-sized chunks. Body: (1) 6-push callee-save prologue + 24B stack scratch — 48 B; entry rsp%16==8 -> 56, sub rsp,24 -> 80, %16==0 (aligned). (2) Save args to callee-save regs: rbx=user_op, rbp=nsid, r12=current_lba, r13=remaining_blocks, r14=current_buf, r15=lba_size. (3) Call nvme_mdts_bytes -> rax = mdts_bytes. If 0 (no limit): max_blocks = remaining_blocks (single chunk). Else: max_blocks = mdts_bytes / lba_size via 64-bit unsigned division (xor rdx, rdx; mov rcx, r15; div rcx). Guard: if max_blocks == 0 (mdts < lba_size, pathological — shouldn't happen but defensive) set max_blocks = 1 so we don't infinite-loop. (4) Stash max_blocks at [rsp + 0]. (5) Split loop `nvme_iss_loop`: if remaining == 0 -> done. chunk = min(remaining, max_blocks) via `mov rax, r13; mov rcx, [rsp+0]; cmp rax, rcx; jbe skip; mov rax, rcx`. Call nvme_io_build_and_submit_one(user_op=rbx, nsid=rbp, lba=r12, blocks=rax, buf=r14, lba_sz=r15). If rax != 0, fail-fast return (rax already holds status). Else advance cursors: recompute chunk (rax was clobbered by call); current_lba += chunk; current_buf += chunk * lba_size (via imul); remaining -= chunk. Loop. (6) Return 0 on completion. Reserved labels: `nvme_iss_`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 24;
+
+        mov rbx, rdi;                            // user_op
+        mov rbp, rsi;                            // nsid
+        mov r12, rdx;                            // current_lba
+        mov r13, rcx;                            // remaining_blocks
+        mov r14, r8;                             // current_buf
+        mov r15, r9;                             // lba_size
+
+        // ================================================================
+        // (3) Compute max_blocks_per_chunk.
+        // ================================================================
+        call nvme_mdts_bytes;
+        // rax = mdts_bytes.
+
+        cmp rax, 0;
+        jne nvme_iss_have_mdts;
+
+        // No limit -> max_blocks = remaining.
+        mov rax, r13;
+        jmp nvme_iss_have_max;
+
+      nvme_iss_have_mdts:
+        // max_blocks = mdts_bytes / lba_size.
+        xor rdx, rdx;
+        mov rcx, r15;
+        div rcx;                                 // rax = quotient
+
+        // Guard against pathological max_blocks == 0.
+        cmp rax, 0;
+        jne nvme_iss_have_max;
+        mov rax, 1;
+
+      nvme_iss_have_max:
+        mov [rsp + 0], rax;                      // stash max_blocks
+
+        // ================================================================
+        // (5) Split loop.
+        // ================================================================
+      nvme_iss_loop:
+        cmp r13, 0;
+        je  nvme_iss_done;
+
+        // chunk = min(remaining, max_blocks).
+        mov rax, r13;
+        mov rcx, [rsp + 0];
+        cmp rax, rcx;
+        jbe nvme_iss_chunk_ok;
+        mov rax, rcx;
+
+      nvme_iss_chunk_ok:
+        // Submit one chunk.
+        //   rdi = user_op, rsi = nsid, rdx = lba, rcx = block_count,
+        //   r8  = buf, r9 = lba_size.
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r12;
+        mov rcx, rax;
+        mov r8, r14;
+        mov r9, r15;
+        call nvme_io_build_and_submit_one;
+
+        cmp rax, 0;
+        jne nvme_iss_fail;
+
+        // Advance cursors. Recompute chunk (rax clobbered by call).
+        mov rax, r13;
+        mov rcx, [rsp + 0];
+        cmp rax, rcx;
+        jbe nvme_iss_chunk_ok2;
+        mov rax, rcx;
+
+      nvme_iss_chunk_ok2:
+        // current_lba += chunk
+        add r12, rax;
+
+        // current_buf += chunk * lba_size
+        mov rcx, rax;
+        imul rcx, r15;
+        add r14, rcx;
+
+        // remaining -= chunk
+        sub r13, rax;
+        jmp nvme_iss_loop;
+
+      nvme_iss_done:
+        xor rax, rax;
+        add rsp, 24;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      nvme_iss_fail:
+        // rax already holds the failing sub-status.
+        add rsp, 24;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+}
