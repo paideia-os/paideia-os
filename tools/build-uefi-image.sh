@@ -44,6 +44,20 @@ KERNEL_ELF="${BUILD_DIR}/kernel.elf"
 IMG_PATH="${BUILD_UEFI_DIR}/paideia-esp.img"
 IMG_SIZE_MB=64
 
+# R28-M1-002 (#999): the canonical branded path is /EFI/PAIDEIA/PAIDEIA.EFI;
+# /EFI/BOOT/BOOTX64.EFI is the UEFI 2.10 §3.5.1 removable-media fallback and
+# must exist so firmware that does not consult a stored BootOrder still finds
+# the loader. FAT does not do true symlinks, so both entries are byte-identical
+# copies of the same stub. NVRAM Boot#### entries added at first-run should
+# point at PAIDEIA.EFI; BOOTX64.EFI is the "any-firmware" cold-start entry.
+#
+# R28-M1-003 (#1000): the PdxFS-lite rootfs blob, when built, is copied into
+# the ESP at /paideia/rootfs.pdxfs so the kernel (R28.M2+ mount path) can find
+# it via a fixed ESP-relative path without needing a partition-table scan.
+# Empty by default so build-uefi-image.sh remains a standalone R19 tool; the
+# R28 orchestrator (build-image.sh) sets PDXFS_LITE_IMG=<path> to include it.
+PDXFS_LITE_IMG="${PDXFS_LITE_IMG:-}"
+
 mkdir -p "${BUILD_UEFI_DIR}"
 
 # -----------------------------------------------------------------------------
@@ -115,19 +129,35 @@ if [[ ${HAVE_MTOOLS} -eq 1 ]]; then
     # partitionless form is smaller and simpler for a boot-only image).
     mformat -F -v PAIDEIA -i "${IMG_PATH}" ::
 
-    echo "[build-uefi-image] mmd /EFI /EFI/BOOT /paideia"
+    echo "[build-uefi-image] mmd /EFI /EFI/BOOT /EFI/PAIDEIA /paideia"
     mmd -i "${IMG_PATH}" ::/EFI
     mmd -i "${IMG_PATH}" ::/EFI/BOOT
+    mmd -i "${IMG_PATH}" ::/EFI/PAIDEIA
     mmd -i "${IMG_PATH}" ::/paideia
 
-    echo "[build-uefi-image] mcopy uefi_stub.efi → /EFI/BOOT/BOOTX64.EFI"
+    echo "[build-uefi-image] mcopy uefi_stub.efi → /EFI/BOOT/BOOTX64.EFI (UEFI fallback)"
     mcopy -i "${IMG_PATH}" "${STUB_EFI}" ::/EFI/BOOT/BOOTX64.EFI
+
+    # #999 branded canonical path — same bytes, different path. FAT has no
+    # symlinks, so this is a real copy. The R28 signing workflow (#1001 /
+    # design/security/pe-secure-boot-signing.md) will sign both files
+    # identically when the crypto substrate lands (R32).
+    echo "[build-uefi-image] mcopy uefi_stub.efi → /EFI/PAIDEIA/PAIDEIA.EFI (branded canonical)"
+    mcopy -i "${IMG_PATH}" "${STUB_EFI}" ::/EFI/PAIDEIA/PAIDEIA.EFI
 
     echo "[build-uefi-image] mcopy kernel.elf → /paideia/kernel.elf"
     mcopy -i "${IMG_PATH}" "${KERNEL_ELF}" ::/paideia/kernel.elf
 
+    # #1000 rootfs blob (only if the orchestrator built one).
+    if [[ -n "${PDXFS_LITE_IMG}" && -f "${PDXFS_LITE_IMG}" ]]; then
+        echo "[build-uefi-image] mcopy ${PDXFS_LITE_IMG} → /paideia/rootfs.pdxfs"
+        mcopy -i "${IMG_PATH}" "${PDXFS_LITE_IMG}" ::/paideia/rootfs.pdxfs
+    fi
+
     echo "[build-uefi-image] mdir ::/EFI/BOOT (verification)"
     mdir -i "${IMG_PATH}" ::/EFI/BOOT
+    echo "[build-uefi-image] mdir ::/EFI/PAIDEIA (verification)"
+    mdir -i "${IMG_PATH}" ::/EFI/PAIDEIA
     echo "[build-uefi-image] mdir ::/paideia (verification)"
     mdir -i "${IMG_PATH}" ::/paideia
 else
@@ -142,9 +172,13 @@ else
     trap 'sudo umount "${MNT}" 2>/dev/null || true; rmdir "${MNT}" 2>/dev/null || true' EXIT
 
     sudo mount -o loop,uid="$(id -u)",gid="$(id -g)" "${IMG_PATH}" "${MNT}"
-    mkdir -p "${MNT}/EFI/BOOT" "${MNT}/paideia"
+    mkdir -p "${MNT}/EFI/BOOT" "${MNT}/EFI/PAIDEIA" "${MNT}/paideia"
     cp "${STUB_EFI}" "${MNT}/EFI/BOOT/BOOTX64.EFI"
+    cp "${STUB_EFI}" "${MNT}/EFI/PAIDEIA/PAIDEIA.EFI"
     cp "${KERNEL_ELF}" "${MNT}/paideia/kernel.elf"
+    if [[ -n "${PDXFS_LITE_IMG}" && -f "${PDXFS_LITE_IMG}" ]]; then
+        cp "${PDXFS_LITE_IMG}" "${MNT}/paideia/rootfs.pdxfs"
+    fi
     sync
     sudo umount "${MNT}"
     rmdir "${MNT}"
