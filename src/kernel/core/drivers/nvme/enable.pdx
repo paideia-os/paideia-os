@@ -1,0 +1,267 @@
+// src/kernel/core/drivers/nvme/enable.pdx — R24-M1-003 (#888)
+//
+// NVMe controller reset + enable sequence.
+//
+// Per NVMe Base Spec 2.0 §3.5.1, the software initialization flow is:
+//
+//   (1) Read CAP.  Verify NVM command set supported (bit 37 of CAP,
+//       aka CSS bit 0).  We defer this check to M2 — the M1 sequence
+//       trusts the caller-supplied BAR belongs to a spec-conformant
+//       NVMe controller (the class/subclass/prog_if filter in
+//       nvme_probe is authoritative on-boot).
+//
+//   (2) Clear CC.EN.  Software must not enable the controller until
+//       every admin-queue address has been programmed.  If CC.EN was
+//       previously set (e.g. warm reboot with firmware-initialized
+//       controller), clearing it triggers a reset.
+//
+//   (3) Poll CSTS.RDY until it clears (controller no longer processing
+//       commands).  Timeout budget is CAP.TO * 500 ms.  For M1 we use
+//       a fixed count-based spin — the tsc/hpet-derived deadline lands
+//       at R24.M2 when we couple the enable sequence to time.pdx.
+//
+//   (4) Program admin queue addresses:
+//         AQA  = (ACQS << 16) | ASQS   with ACQS = ASQS = queue_size - 1
+//         ASQ  = physical base of the admin submission queue
+//         ACQ  = physical base of the admin completion queue
+//
+//       For the boot-line 64-entry admin queues:
+//         AQA = 0x003F003F.
+//
+//   (5) Program CC:
+//         MPS    = 0     (4 KiB memory page size)
+//         CSS    = 0     (NVM command set)
+//         AMS    = 0     (round-robin arbitration)
+//         SHN    = 0     (no shutdown notification)
+//         IOSQES = 6     (I/O SQ entry size = 2^6 = 64 B)
+//         IOCQES = 4     (I/O CQ entry size = 2^4 = 16 B)
+//         EN     = 1
+//       → CC = 0x00460001 (NvmeRegs.NVME_CC_ENABLE_DEFAULT).
+//
+//   (6) Poll CSTS.RDY until it sets.  Timeout budget same as (3).
+//
+// -----------------------------------------------------------------------------
+// R24.M1 posture: dormant at boot
+// -----------------------------------------------------------------------------
+//
+// nvme_reset is a callable symbol at M1 but IS NOT wired into
+// kernel_main.  Under BIOS/`-kernel` boot the PCI enumerator returns
+// 0 devices (MCFG absent), the NVMe probe returns 0 controllers, and
+// there is no bar0 to hand to nvme_reset.  Real activation lands at
+// R24.M2 driver-attach after admin queue DMA-page allocation from
+// phys_alloc + IOMMU DTE programming.
+//
+// -----------------------------------------------------------------------------
+// Admin queue static storage
+// -----------------------------------------------------------------------------
+//
+// _nvme_admin_sq / _nvme_admin_cq are .bss-backed, page-aligned so
+// their physical addresses can be handed to the controller without
+// a phys_alloc call at the M1 close.  Under the identity-mapped low
+// half of the kernel address space (established in boot_stub.S), the
+// VA of a .bss symbol equals its PA.  Once the IOMMU is enabled per-
+// device (R25 scope), the driver-attach path must instead source
+// queue pages from phys_alloc and register them with the IOMMU DTE.
+//
+//   _nvme_admin_sq : 512 × u64 = 4096 B = 64 × 64 B entries (SQE size)
+//   _nvme_admin_cq : 128 × u64 = 1024 B = 64 × 16 B entries (CQE size)
+//
+// Both pages are @align(4096) — NVMe §3.1.14 / §3.1.15 require ASQ/
+// ACQ to be at least 4 KiB aligned.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.22.x)
+// -----------------------------------------------------------------------------
+//
+//   G1: u32 MMIO writes via nvme_reg_write_u32 use mov_d internally.
+//   G4: full-register compares.
+//
+// Reserved-label discipline: labels prefixed `nvme_en_` to avoid the
+// paideia-as reserved names (`loop`, `if`, ...).
+
+module Enable = structure {
+
+  // ============================================================================
+  // Timeout budget (fixed iterations — R24.M1 pending time-coupling)
+  // ============================================================================
+  //
+  // A raw count-based spin ceiling.  On a 3 GHz core each nvme_reg_u32
+  // read is ~30 ns (two mfences + one UC MMIO load).  5,000,000
+  // iterations ~= 150 ms of wall-time, well below the ~500 ms CAP.TO
+  // budget for any commodity NVMe controller.  Because nvme_reset is
+  // never called during -kernel boot the exact wall-time is
+  // documentary — the loop terminates on the CSTS.RDY transition, not
+  // on the counter.  M2 will replace this with a tsc/hpet-derived
+  // deadline once the driver-attach path is wired.
+
+  pub let NVME_RESET_SPIN_MAX       : u64 = 5000000
+
+  // ============================================================================
+  // Return codes
+  // ============================================================================
+
+  pub let NVME_RESET_OK             : u64 = 0
+  pub let NVME_RESET_ERR_DISABLE    : u64 = 1   // CSTS.RDY never cleared
+  pub let NVME_RESET_ERR_ENABLE     : u64 = 2   // CSTS.RDY never set
+  pub let NVME_RESET_ERR_CFS        : u64 = 3   // Controller Fatal Status set
+
+  // ============================================================================
+  // Admin queue backing storage — page-aligned .bss
+  // ============================================================================
+
+  pub let mut _nvme_admin_sq        : [u64; 512] = uninit @align(4096)
+  pub let mut _nvme_admin_cq        : [u64; 128] = uninit @align(4096)
+
+  // ============================================================================
+  // nvme_reset(bar0) -> u64
+  // ============================================================================
+  //
+  // SysV: (bar0: u64) -> u64
+  //   rdi = BAR0 base (MMIO physical address, page-aligned)
+  //
+  // Returns rax = NVME_RESET_OK (0) on success, or a non-zero
+  // NVME_RESET_ERR_* code on failure.
+  //
+  // Register plan (3-push callee-save + 8 B align):
+  //   rbx = bar0 (preserved across every nvme_reg_* callee-save call)
+  //   rbp = admin_sq_pa (saved before the CC-enable write)
+  //   r12 = spin counter
+  //
+  //   3 pushes = 24 B; entry rsp%16==8 → 24+8=32, %16==0 (already
+  //   aligned for nested calls without extra sub rsp,8).
+
+  pub let nvme_reset : (u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar0: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R24-M1-003 (#888). NVMe controller reset + enable sequence per NVMe Base Spec 2.0 §3.5.1. Body: (1) 3-push callee-save prologue (rbx, rbp, r12) — 24 B; entry rsp%16==8 → 24+8=32, %16==0 (aligned for every nested nvme_reg_* call without extra pre-align pad). rbx = bar0. (2) Disable-phase: read CC via nvme_reg_u32(bar0, 0x14); clear bit 0 (`and rax, 0xFFFFFFFFFFFFFFFE`); write back via nvme_reg_write_u32(bar0, 0x14, new_cc). (3) Poll CSTS.RDY = 0: init r12 = NVME_RESET_SPIN_MAX; loop { csts = nvme_reg_u32(bar0, 0x1C); if (csts & 1) == 0 → break; dec r12; if r12 == 0 → return NVME_RESET_ERR_DISABLE }. (4) Program AQA (0x24) = 0x003F003F for 64-entry admin queues. (5) Program ASQ (0x28) via nvme_reg_write_u64 with the physical address of _nvme_admin_sq. Because .bss is identity-mapped in the low half at boot, the VA loaded via `lea rax, [rip + _nvme_admin_sq]` equals the PA — no phys_alloc round trip at M1. (6) Program ACQ (0x30) with _nvme_admin_cq PA. (7) Enable-phase: write CC (0x14) = NVME_CC_ENABLE_DEFAULT = 0x00460001 (EN=1, CSS=0, MPS=0, AMS=0, SHN=0, IOSQES=6, IOCQES=4). (8) Poll CSTS.RDY = 1: same shape as (3); if CSTS.CFS set at any point → return NVME_RESET_ERR_CFS. (9) Return 0 (OK). Encoder: `and rax, 0xFFFFFFFFFFFFFFFE` (bit-0 clear) — same imm32 sign-extend pattern as core/pci/config.pdx L240 (`and r8, 0xFFFFFFFFFFFFFFFC`). CC_ENABLE_DEFAULT fits imm32 (0x00460001 < 2^31). All AQA/CC values fit imm32. Reserved-label posture: labels prefixed `nvme_en_`. Every nvme_reg_* callee preserves rbx/rbp/r12 per SysV.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+
+        mov rbx, rdi;                            // rbx = bar0
+
+        // ================================================================
+        // (2) Disable phase — clear CC.EN.
+        // ================================================================
+        mov rdi, rbx;
+        mov rsi, 0x14;                           // CC
+        call nvme_reg_u32;
+
+        and rax, 0xFFFFFFFFFFFFFFFE;             // clear bit 0 (EN)
+
+        mov rdi, rbx;
+        mov rsi, 0x14;
+        mov rdx, rax;
+        call nvme_reg_write_u32;
+
+        // ================================================================
+        // (3) Poll CSTS.RDY = 0.
+        // ================================================================
+        mov r12, 5000000;                        // NVME_RESET_SPIN_MAX
+
+      nvme_en_wait_off:
+        mov rdi, rbx;
+        mov rsi, 0x1C;                           // CSTS
+        call nvme_reg_u32;
+
+        // Check CFS (bit 1) — fatal.
+        mov rcx, rax;
+        and rcx, 2;
+        cmp rcx, 0;
+        jne nvme_en_cfs;
+
+        // RDY (bit 0) must clear.
+        and rax, 1;
+        cmp rax, 0;
+        je nvme_en_wait_off_done;
+
+        sub r12, 1;
+        cmp r12, 0;
+        je nvme_en_timeout_disable;
+        jmp nvme_en_wait_off;
+
+      nvme_en_wait_off_done:
+
+        // ================================================================
+        // (4) Program AQA = 0x003F003F.
+        // ================================================================
+        mov rdi, rbx;
+        mov rsi, 0x24;                           // AQA
+        mov rdx, 0x003F003F;
+        call nvme_reg_write_u32;
+
+        // ================================================================
+        // (5) Program ASQ (64-bit) with _nvme_admin_sq PA.
+        // ================================================================
+        mov rdi, rbx;
+        mov rsi, 0x28;                           // ASQ
+        lea rdx, [rip + _nvme_admin_sq];
+        call nvme_reg_write_u64;
+
+        // ================================================================
+        // (6) Program ACQ (64-bit) with _nvme_admin_cq PA.
+        // ================================================================
+        mov rdi, rbx;
+        mov rsi, 0x30;                           // ACQ
+        lea rdx, [rip + _nvme_admin_cq];
+        call nvme_reg_write_u64;
+
+        // ================================================================
+        // (7) Enable phase — write CC = 0x00460001.
+        // ================================================================
+        mov rdi, rbx;
+        mov rsi, 0x14;                           // CC
+        mov rdx, 0x00460001;                     // NVME_CC_ENABLE_DEFAULT
+        call nvme_reg_write_u32;
+
+        // ================================================================
+        // (8) Poll CSTS.RDY = 1.
+        // ================================================================
+        mov r12, 5000000;
+
+      nvme_en_wait_on:
+        mov rdi, rbx;
+        mov rsi, 0x1C;                           // CSTS
+        call nvme_reg_u32;
+
+        // Check CFS (bit 1) — fatal.
+        mov rcx, rax;
+        and rcx, 2;
+        cmp rcx, 0;
+        jne nvme_en_cfs;
+
+        // RDY (bit 0) must set.
+        and rax, 1;
+        cmp rax, 1;
+        je nvme_en_ok;
+
+        sub r12, 1;
+        cmp r12, 0;
+        je nvme_en_timeout_enable;
+        jmp nvme_en_wait_on;
+
+      nvme_en_ok:
+        xor rax, rax;                            // NVME_RESET_OK
+        jmp nvme_en_done;
+
+      nvme_en_timeout_disable:
+        mov rax, 1;                              // NVME_RESET_ERR_DISABLE
+        jmp nvme_en_done;
+
+      nvme_en_timeout_enable:
+        mov rax, 2;                              // NVME_RESET_ERR_ENABLE
+        jmp nvme_en_done;
+
+      nvme_en_cfs:
+        mov rax, 3;                              // NVME_RESET_ERR_CFS
+
+      nvme_en_done:
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
