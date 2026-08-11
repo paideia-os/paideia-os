@@ -1374,6 +1374,16 @@ k_pid: .ascii "pid\0"
 k_line: .ascii "line\0"
 
 
+# R20b.M1-001 (#1552): KIND_IPC_ENDPOINT capability witness — post-R20 IPC
+# substrate foundation. See design/ipc/userspace-server-substrate.md §3.1.
+.global endpoint_cap_ok_msg
+.align 8
+endpoint_cap_ok_msg: .ascii "R20b ENDPOINT CAP OK\n\0"
+
+.global endpoint_cap_fail_msg
+.align 8
+endpoint_cap_fail_msg: .ascii "R20b ENDPOINT CAP FAIL\n\0"
+
 
 # M1-003 (#685): Re-entrancy gate for klog_emit_core (accessible from high-half kernel code)
 # M3-002 (#690): int3 breakpoint stub — emit breakpoint exception (vec 3)
