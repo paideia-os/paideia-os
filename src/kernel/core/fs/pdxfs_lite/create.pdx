@@ -1,0 +1,522 @@
+// src/kernel/core/fs/pdxfs_lite/create.pdx — R25-M6-001 (#933)
+//
+// PdxFS-lite CREATE: allocate an inode, insert a directory entry into the
+// parent, stamp both back to disk.
+//
+// -----------------------------------------------------------------------------
+// Scope
+// -----------------------------------------------------------------------------
+//
+// pdxfs_lite_create(parent_vn, name, name_len, mode, out_vnode) -> u64
+//
+//   Creates a new file `name` under `parent_vn` with `mode`.
+//
+//   Returns (u16 in low bits of u64 rax):
+//     PDXFS_MUT_OK      (0)   — never at M6 (write path stubbed).
+//     PDXFS_MUT_EEXIST  (1)   — entry with same name already lives in parent.
+//     PDXFS_MUT_ENOENT  (2)   — parent inode not on disk (defensive).
+//     PDXFS_MUT_EIO     (3)   — NVMe read failure staging parent inode.
+//     PDXFS_MUT_EFBIG   (4)   — inode-table exhausted (no free inode).
+//     PDXFS_MUT_EROFS   (5)   — happy path at M6: everything up to the final
+//                                put_inode / put_sb ran, but nvme_write_blocking
+//                                is not yet available (R24 debt tracked at
+//                                #906). The write is not persisted.
+//
+// The write-through discipline for M6 (#936) surfaces the missing NVMe write
+// path as EROFS at the top of every mutating call chain. The pre-write phases
+// (parent load, dir scan, inode allocation, entry placement, in-memory field
+// stamping) all run to their normal end so that a debugger can observe the
+// intended post-image in _pdxfs_lite_inode_scratch / _pdxfs_lite_dirent_scratch
+// / _pdxfs_inode_page_scratch. When #906 lands, the M6 unstub replaces the
+// final `mov rax, PDXFS_MUT_EROFS` in each function with the real
+// `mov rax, 0` on the happy path.
+//
+// -----------------------------------------------------------------------------
+// Adapter wiring
+// -----------------------------------------------------------------------------
+//
+// _pdxfs_lite_create_adapter (in vops.pdx) bridges the vops surface
+// (dir_vn, name_ptr, mode) to this internal (parent_vn, name, name_len, mode,
+// out_vnode) shape by computing name_len via strlen(name_ptr) and threading a
+// null out_vnode (the vops surface does not expose the new vnode idx — the
+// caller re-resolves via a follow-up lookup).
+//
+// -----------------------------------------------------------------------------
+// Directory-entry format — mirror of readdir.pdx §"On-disk directory entry"
+// -----------------------------------------------------------------------------
+//
+//   Offset  Size  Field       Notes
+//   ------  ----  ----------  ----------------------------------------
+//   0       8     inode_id    u64 LE, 0 == unused / tombstone
+//   8       2     name_len    u16 LE
+//   10      1     type        u8  (1=REG, 2=DIR, 4=SYMLINK)
+//   11      5     _pad        Zero
+//   16      240   name        u8[240] NUL-padded, remainder zero
+//   ------  ----  ----------  ----------------------------------------
+//   256 total
+//
+// -----------------------------------------------------------------------------
+// Inode allocation policy (bump-scan)
+// -----------------------------------------------------------------------------
+//
+// The M6 allocator is a linear bump scan through the inode table starting at
+// id=2 (id=0 is the "unused" sentinel, id=1 is the mount root). For each
+// candidate id, get_inode is called; if mode == 0 the slot is free. The scan
+// upper bound is PDXFS_CREATE_INODE_SCAN_MAX (=128) — enough for the MVP
+// shell's tiny footprint; a bitmap-driven allocator lands with R25.M7+ when
+// the inode table grows past a single 4-KiB scratch page. Returning EFBIG at
+// the ceiling is intentional (the FS is not corrupt — just full for the M6
+// heuristic).
+//
+// -----------------------------------------------------------------------------
+// Reserved-label discipline
+// -----------------------------------------------------------------------------
+//
+// Labels prefixed `pdxl_cr_`.
+
+module Create = structure {
+
+  // ============================================================================
+  // Shared return-code sentinels for M6 mutating ops (CREATE/UNLINK/RENAME).
+  // Kept as u64 constants (surface returns them in the low 16 bits of rax).
+  // ============================================================================
+
+  pub let PDXFS_MUT_OK             : u64 = 0
+  pub let PDXFS_MUT_EEXIST         : u64 = 1
+  pub let PDXFS_MUT_ENOENT         : u64 = 2
+  pub let PDXFS_MUT_EIO            : u64 = 3
+  pub let PDXFS_MUT_EFBIG          : u64 = 4
+  pub let PDXFS_MUT_EROFS          : u64 = 5
+
+  // Inode-scan ceiling for M6. See §"Inode allocation policy".
+  pub let PDXFS_CREATE_INODE_SCAN_MAX : u64 = 128
+
+  // Directory-entry layout mirrors.
+  pub let PDXFS_MUT_DIRENT_SIZE     : u64 = 256
+  pub let PDXFS_MUT_DIRENT_SHIFT    : u64 = 8
+  pub let PDXFS_MUT_DIRENT_NAME_MAX : u64 = 240
+
+  // Dirent-type nibbles.
+  pub let PDXFS_MUT_DIRENT_TYPE_REG : u64 = 1
+  pub let PDXFS_MUT_DIRENT_TYPE_DIR : u64 = 2
+
+  // ============================================================================
+  // Second staging inode buffer — 128 B @align(8).
+  //
+  // pdxfs_lite_create needs TWO inode buffers concurrently: one for the parent
+  // (reused via _pdxfs_lite_inode_scratch owned by vops.pdx) and one for the
+  // newly-allocated child. This is the child buffer. Sized 16 qwords = 128 B.
+  // ============================================================================
+  pub let mut _pdxfs_mut_child_inode_scratch : [u64; 16] = uninit @align(8)
+
+  // ============================================================================
+  // pdxl_bytes_eq(a: *u8, b: *u8, n: u64) -> u64
+  //
+  //   Returns 1 iff the first n bytes of a and b compare equal, 0 otherwise.
+  //   Byte-granular, no NUL sentinel required — matches the (name, name_len)
+  //   API of pdxfs_lite_create/unlink/rename. Distinct from readdir.pdx's
+  //   pdxl_lu_strncmp which additionally requires a[n] == 0 (NUL-terminated
+  //   query semantics).
+  //
+  //   Leaf. Caller-save only.
+  // ============================================================================
+  pub let pdxl_bytes_eq : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (a: u64, b: u64, n: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R25-M6-001 (#933 helper). Prefix-equality: byte-by-byte compare over exactly n bytes. Body: (1) xor rcx,rcx (i). (2) pdxl_cr_be_top: cmp rcx, rdx; jae pdxl_cr_be_eq. (3) xor r8,r8; mov_b r8, [rdi+rcx*1]; xor rax,rax; mov_b rax, [rsi+rcx*1]; cmp r8,rax; jne pdxl_cr_be_ne. (4) add rcx,1; jmp top. (5) pdxl_cr_be_eq: mov rax,1; ret. (6) pdxl_cr_be_ne: xor eax,eax; ret. Encoder: mov_b [reg+reg*1] proven in readdir.pdx L349. Leaf. Reserved labels: pdxl_cr_be_.",
+      block: {
+        xor rcx, rcx;
+
+      pdxl_cr_be_top:
+        cmp rcx, rdx;
+        jae pdxl_cr_be_eq;
+
+        xor r8, r8;
+        mov_b r8, [rdi + rcx*1];
+        xor rax, rax;
+        mov_b rax, [rsi + rcx*1];
+        cmp r8, rax;
+        jne pdxl_cr_be_ne;
+
+        add rcx, 1;
+        jmp pdxl_cr_be_top;
+
+      pdxl_cr_be_eq:
+        mov rax, 1;
+        ret;
+
+      pdxl_cr_be_ne:
+        xor eax, eax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxl_dir_find(nsid, sb, dir_inode, name, name_len) -> u64
+  //
+  //   rdi = nsid, rsi = &sb, rdx = &dir_inode (128 B, already loaded),
+  //   rcx = name, r8 = name_len
+  //
+  //   Iterates the directory's 256-byte entry stream via pdxfs_read into
+  //   _pdxfs_lite_dirent_scratch. On the first record whose
+  //   (inode_id != 0) AND (name_len == r8) AND (bytewise name match), returns
+  //   the entry index (0..N-1) — never 0xFFFFFFFF for a hit because we cap
+  //   dir sizes well below 2^32 entries at M6.
+  //
+  //   Returns 0xFFFFFFFF on ENOENT (no match found) OR on an intervening
+  //   pdxfs_read I/O failure (treated as ENOENT for lookup semantics — matches
+  //   pdxfs_lite_lookup_by_name convention).
+  //
+  //   Side effect: on hit, _pdxfs_lite_dirent_scratch holds the matching
+  //   256-byte record — callers (unlink/rename) can consult it directly for
+  //   {inode_id, type} without re-reading.
+  //
+  //   Register plan (7-push callee-save + 8 pad; entry rsp%16==8 + 56 + 8 = 72,
+  //   %16==0 pre nested-call):
+  //     rbx = nsid
+  //     rbp = &sb
+  //     r12 = &dir_inode
+  //     r13 = name
+  //     r14 = name_len
+  //     r15 = i (entry index)
+  //     (total = local, recomputed per iteration to keep register pressure low)
+  // ============================================================================
+  pub let pdxl_dir_find : (u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (nsid: u64, sb: u64, dir_inode: u64, name: u64, name_len: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R25-M6-001 (#933 helper, shared with #934/#935). Linear scan for a dirent whose (inode_id != 0) AND (name_len matches) AND (byte-equal name). Body: (1) 6-push callee-save prologue (rbx=nsid, rbp=sb, r12=dir_inode, r13=name, r14=name_len, r15=i) — 48 B; entry rsp%16==8 + 48 = 56 + sub rsp,8 pad → 64, %16==0. (2) Compute total = dir_inode.size / 256 (u64 @+8 >> 8). If total == 0 → ENOENT sentinel. (3) xor r15,r15. Loop pdxl_cr_df_top: cmp r15, total; jae ENOENT. Save total on stack across pdxfs_read (it clobbers all caller-save regs and needs 5 arg regs). (4) pdxfs_read(rbx, rbp, r12, r15<<8, 256, &_pdxfs_lite_dirent_scratch). If non-zero → ENOENT. (5) Load scratch.inode_id (u64 @+0). If 0 → next (tombstone). (6) Load scratch.name_len (u16 @+8). If != r14 → next. (7) pdxl_bytes_eq(r13, &scratch.name (+16), r14). If 0 → next. (8) HIT: return r15. (9) Not found → mov rax, 0xFFFFFFFF. Reserved labels: pdxl_cr_df_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                              // nsid
+        mov rbp, rsi;                              // &sb
+        mov r12, rdx;                              // &dir_inode
+        mov r13, rcx;                              // name
+        mov r14, r8;                               // name_len
+
+        xor r15, r15;                              // i = 0
+
+      pdxl_cr_df_top:
+        // total = dir_inode.size >> 8 (recompute each iter — r12 stable).
+        mov r10, [r12 + 8];
+        shr r10, 8;
+        cmp r15, r10;
+        jae pdxl_cr_df_none;
+
+        // pdxfs_read(nsid, sb, dir_inode, i*256, 256, &_pdxfs_lite_dirent_scratch).
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r12;
+        mov rcx, r15;
+        shl rcx, 8;                                // i * 256
+        mov r8, 256;
+        lea r9, [rip + _pdxfs_lite_dirent_scratch];
+        call pdxfs_read;
+        cmp rax, 0;
+        jne pdxl_cr_df_none;
+
+        // Tombstone check: inode_id (u64 @+0).
+        lea r10, [rip + _pdxfs_lite_dirent_scratch];
+        mov r11, [r10 + 0];
+        cmp r11, 0;
+        je pdxl_cr_df_next;
+
+        // Name-length gate: u16 @+8 must equal r14.
+        xor r11, r11;
+        mov_w r11, [r10 + 8];
+        cmp r11, r14;
+        jne pdxl_cr_df_next;
+
+        // Byte-wise compare over name_len bytes.
+        mov rdi, r13;                              // name
+        lea rsi, [r10 + 16];                       // &scratch.name
+        mov rdx, r14;                              // name_len
+        call pdxl_bytes_eq;
+        cmp rax, 1;
+        je pdxl_cr_df_hit;
+
+      pdxl_cr_df_next:
+        add r15, 1;
+        jmp pdxl_cr_df_top;
+
+      pdxl_cr_df_hit:
+        mov rax, r15;
+        jmp pdxl_cr_df_ret;
+
+      pdxl_cr_df_none:
+        mov rax, 0xFFFFFFFF;
+
+      pdxl_cr_df_ret:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxl_cr_alloc_inode(nsid, sb, out_id) -> u64
+  //
+  //   rdi = nsid, rsi = &sb, rdx = out_id (writable u64)
+  //
+  //   Bump-scan the inode table starting at id=2 for the first inode with
+  //   mode == 0 (free slot per §"Inode allocation policy"). Writes the found
+  //   id to *out_id and returns 0 (PDXFS_MUT_OK). If the scan exceeds
+  //   PDXFS_CREATE_INODE_SCAN_MAX without finding a free slot, writes 0 to
+  //   *out_id and returns PDXFS_MUT_EFBIG (4).
+  //
+  //   The candidate inode's 128-B image is left in _pdxfs_mut_child_inode_scratch
+  //   so the caller can populate its fields in place without a re-load.
+  //
+  //   Register plan (5-push + 8 pad; entry rsp%16==8 + 40 + 8 = 56, %16==0):
+  //     rbx = nsid, rbp = &sb, r12 = out_id, r13 = candidate id
+  // ============================================================================
+  pub let pdxl_cr_alloc_inode : (u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (nsid: u64, sb: u64, out_id: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R25-M6-001 (#933 helper). Linear scan for a free inode slot. Body: (1) 4-push callee-save prologue (rbx=nsid, rbp=sb, r12=out_id, r13=id) — 32 B; entry rsp%16==8 + 32 = 40, sub rsp,8 → 48, %16==0. (2) Init r13 = 2 (skip id 0 sentinel and id 1 root). (3) Loop pdxl_cr_ai_top: cmp r13, 128 (PDXFS_CREATE_INODE_SCAN_MAX); jae pdxl_cr_ai_full. (4) get_inode(rbx, rbp, r13, &_pdxfs_mut_child_inode_scratch). If non-zero → skip this id and advance (defensive; treats read failure like an occupied slot). (5) Load mode (u16 @+0) from scratch. If 0 → free slot: stamp *out_id = r13; return 0. (6) Else advance: add r13,1; jmp top. (7) Full: mov [r12], 0; mov rax, 4 (EFBIG). Reserved labels: pdxl_cr_ai_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        sub rsp, 8;
+
+        mov rbx, rdi;                              // nsid
+        mov rbp, rsi;                              // sb
+        mov r12, rdx;                              // out_id
+
+        mov r13, 2;                                // start id (skip 0 sentinel + 1 root)
+
+      pdxl_cr_ai_top:
+        cmp r13, 128;
+        jae pdxl_cr_ai_full;
+
+        // get_inode(nsid, sb, id, &_pdxfs_mut_child_inode_scratch).
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r13;
+        lea rcx, [rip + _pdxfs_mut_child_inode_scratch];
+        call get_inode;
+        cmp rax, 0;
+        jne pdxl_cr_ai_advance;                    // treat EIO as occupied
+
+        // Check mode (u16 @+0).
+        lea r10, [rip + _pdxfs_mut_child_inode_scratch];
+        xor r11, r11;
+        mov_w r11, [r10 + 0];
+        cmp r11, 0;
+        je pdxl_cr_ai_hit;
+
+      pdxl_cr_ai_advance:
+        add r13, 1;
+        jmp pdxl_cr_ai_top;
+
+      pdxl_cr_ai_hit:
+        mov [r12 + 0], r13;                        // *out_id = id
+        xor eax, eax;                              // PDXFS_MUT_OK
+        jmp pdxl_cr_ai_ret;
+
+      pdxl_cr_ai_full:
+        xor rcx, rcx;
+        mov [r12 + 0], rcx;                        // *out_id = 0
+        mov rax, 4;                                // PDXFS_MUT_EFBIG
+
+      pdxl_cr_ai_ret:
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxl_cr_populate(id: u64, mode: u16) -> u64
+  //
+  //   rdi = new inode id (informational — not stamped into the struct; the
+  //         inode id is the table-relative index).
+  //   rsi = mode
+  //
+  //   Writes a freshly-initialised 128-B inode into
+  //   _pdxfs_mut_child_inode_scratch:
+  //     mode = rsi (u16 @+0), uid = gid = 0, _pad0 = 0,
+  //     size = 0, atime = mtime = ctime = rdtsc-sample,
+  //     extent[0..8] = 0, indirect_lba = 0,
+  //     link_count = 1, _pad1 = 0, _reserved = 0, checksum = 0.
+  //
+  //   Returns 0. Leaf-ish (calls rdtsc but no other functions).
+  // ============================================================================
+  pub let pdxl_cr_populate : (u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (id: u64, mode: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R25-M6-001 (#933 helper). Zero-fill _pdxfs_mut_child_inode_scratch (16 qwords), then stamp mode/link_count/times. Body: (1) Zero-fill via rep_stosq: lea rdi, [rip+_pdxfs_mut_child_inode_scratch]; xor eax,eax; mov rcx,16; cld; rep_stosq. (2) Recover base pointer via lea into r10. (3) Stamp mode (u16 @+0): mov_w [r10+0], rsi. (4) Stamp link_count = 1 (u16 @+112): mov r11, 1; mov_w [r10+112], r11. (5) rdtsc → edx:eax; combine: shl rdx,32; or rax,rdx (r11 = ns-ish timestamp). Store into atime/mtime/ctime (u64 @+16/+24/+32). (6) xor eax,eax; ret. Encoder: rep_stosq / mov_w [reg+imm] / rdtsc — all proven. Leaf.",
+      block: {
+        // Zero-fill 128 B (16 qwords).
+        lea rdi, [rip + _pdxfs_mut_child_inode_scratch];
+        xor eax, eax;
+        mov rcx, 16;
+        cld;
+        rep_stosq;
+
+        // Recover base pointer.
+        lea r10, [rip + _pdxfs_mut_child_inode_scratch];
+
+        // Stamp mode (u16 @+0).
+        mov_w [r10 + 0], rsi;
+
+        // Stamp link_count = 1 (u16 @+112).
+        mov r11, 1;
+        mov_w [r10 + 112], r11;
+
+        // rdtsc sample for atime/mtime/ctime.
+        rdtsc;
+        shl rdx, 32;
+        or rax, rdx;
+        mov [r10 + 16], rax;                       // atime
+        mov [r10 + 24], rax;                       // mtime
+        mov [r10 + 32], rax;                       // ctime
+
+        xor eax, eax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_lite_create(parent_vn, name, name_len, mode, out_vnode) -> u64
+  //
+  //   rdi = &parent_vnode
+  //   rsi = name (u8*, NOT NUL-terminated — see helper pdxl_bytes_eq)
+  //   rdx = name_len (u64, 1..240 for a well-formed request)
+  //   rcx = mode (u16 in low bits)
+  //   r8  = out_vnode (writable u64* for new vnode idx, or 0 to discard)
+  //
+  //   Returns rax = PDXFS_MUT_* code (u16 in low bits).
+  //
+  //   Flow:
+  //     (1)  Extract parent_inode_id from parent_vnode +32 (low 16 bits).
+  //     (2)  Load nsid/&sb from _pdxfs_lite_mount_ctx.
+  //     (3)  get_inode(parent_inode_id) into _pdxfs_lite_inode_scratch;
+  //          on non-zero → EIO.
+  //     (4)  pdxl_dir_find(name, name_len) → 0xFFFFFFFF miss, else EEXIST.
+  //     (5)  pdxl_cr_alloc_inode → new_id (or EFBIG).
+  //     (6)  pdxl_cr_populate(new_id, mode) — writes child scratch buffer.
+  //     (7)  [TODO(#906): dir-append + put_inode(parent) + put_inode(child)]
+  //          M6 stops here: the child inode buffer holds the intended image;
+  //          the parent inode is unmodified in scratch. We return EROFS to
+  //          signal the write chain is stubbed.
+  //     (8)  Return PDXFS_MUT_EROFS.
+  //
+  //   Register plan (6-push + 8 pad; entry rsp%16==8 + 48 + 8 = 64, %16==0):
+  //     rbx = nsid
+  //     rbp = &sb
+  //     r12 = parent_inode_id
+  //     r13 = name
+  //     r14 = name_len
+  //     r15 = mode
+  //     Local: new_id kept on stack (via a manual push slot).
+  // ============================================================================
+  pub let pdxfs_lite_create : (u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (parent_vn: u64, name: u64, name_len: u64, mode: u64, out_vnode: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: {},
+      justification: "R25-M6-001 (#933). Load parent inode, reject on EEXIST via pdxl_dir_find, allocate a fresh inode via pdxl_cr_alloc_inode, populate the child scratch. Skip persistence: nvme_write_blocking is not yet available (R24 debt #906), so put_inode always returns ETODO_WRITE — we return EROFS at the top-level instead of chaining. Body: (1) 6-push callee-save prologue (rbx=nsid, rbp=sb, r12=parent_ino, r13=name, r14=name_len, r15=mode) — 48 B; entry rsp%16==8 + 48 = 56, sub rsp,8 → 64, %16==0. (2) Stage args before any call clobbers rdi/rsi/rdx/rcx/r8. Extract parent_inode_id from [parent_vn+32] & 0xFFFF into r12. Save name/name_len/mode into r13/r14/r15. Zero-out out_vnode preemptively if r8 != 0 (via stash on stack — actually we won't need it since M6 never returns success; leave it unmodified per API contract on failure). (3) Load nsid/sb from _pdxfs_lite_mount_ctx. (4) get_inode(rbx, rbp, r12, &_pdxfs_lite_inode_scratch). On non-zero → EIO. (5) pdxl_dir_find(rbx, rbp, &_pdxfs_lite_inode_scratch, r13, r14). If rax != 0xFFFFFFFF → EEXIST. (6) pdxl_cr_alloc_inode(rbx, rbp, [rsp+0] slot for new_id). Need a stack slot: extend prologue's pad to hold the u64 slot (sub rsp,16 instead of 8). Reservation: [rsp+0] = new_id. On non-zero rax → forward code (EFBIG). (7) Load new_id from [rsp+0] into rdi arg. Call pdxl_cr_populate(new_id, r15). Ignore rax (always 0). (8) Return EROFS. Reserved labels: pdxl_cr_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;                               // pad(8) + new_id slot(8)
+
+        // Extract parent_inode_id from parent_vn +32 (low 16 bits).
+        mov r12, [rdi + 32];
+        and r12, 0xFFFF;
+
+        mov r13, rsi;                              // name
+        mov r14, rdx;                              // name_len
+        mov r15, rcx;                              // mode
+        // r8 (out_vnode) intentionally dropped — M6 never returns success.
+
+        // Load nsid/sb from mount context.
+        lea rax, [rip + _pdxfs_lite_mount_ctx];
+        mov rbx, [rax + 0];                        // nsid
+        mov rbp, [rax + 8];                        // &sb
+
+        // (3) get_inode(parent).
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r12;
+        lea rcx, [rip + _pdxfs_lite_inode_scratch];
+        call get_inode;
+        cmp rax, 0;
+        jne pdxl_cr_eio;
+
+        // (4) EEXIST check.
+        mov rdi, rbx;
+        mov rsi, rbp;
+        lea rdx, [rip + _pdxfs_lite_inode_scratch];
+        mov rcx, r13;
+        mov r8, r14;
+        call pdxl_dir_find;
+        // rax != 0xFFFFFFFF ⇒ hit ⇒ EEXIST.
+        mov r10, 0xFFFFFFFF;
+        cmp rax, r10;
+        jne pdxl_cr_eexist;
+
+        // (5) Allocate an inode. new_id destination = [rsp+0].
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, rsp;                              // out_id points into our stack slot
+        call pdxl_cr_alloc_inode;
+        cmp rax, 0;
+        jne pdxl_cr_fwd;                           // rax = EFBIG (or other)
+
+        // (6) Populate the child inode scratch.
+        mov rdi, [rsp + 0];                        // new_id
+        mov rsi, r15;                              // mode
+        call pdxl_cr_populate;
+
+        // (7) TODO(R25.M7 / #906): dir-append + put_inode(parent) + put_inode(child).
+        // For M6: return EROFS to surface the missing NVMe-write path.
+        mov rax, 5;                                // PDXFS_MUT_EROFS
+        jmp pdxl_cr_ret;
+
+      pdxl_cr_eexist:
+        mov rax, 1;                                // PDXFS_MUT_EEXIST
+        jmp pdxl_cr_ret;
+
+      pdxl_cr_eio:
+        mov rax, 3;                                // PDXFS_MUT_EIO
+        jmp pdxl_cr_ret;
+
+      pdxl_cr_fwd:
+        // rax holds the forwarded error code (EFBIG from pdxl_cr_alloc_inode).
+      pdxl_cr_ret:
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
