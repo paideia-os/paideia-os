@@ -74,6 +74,17 @@ module Dispatch = structure {
   pub let mut _dispatch_read_buf_scratch   : [u8; 4096] = uninit @align(8)
   pub let mut _dispatch_write_buf_scratch  : [u8; 4096] = uninit @align(8)
 
+  // logging-m9-002 (#709): sys_dmesg scratch. Symmetric to the read/write
+  // scratches above — dispatch_dmesg copies ring bytes into this kernel
+  // buffer via klog_ring_read_tail, then walks them out to the user's buf
+  // via user_write_bytes_via_walk. Size matches DISPATCH_IO_MAX so a
+  // single sys_dmesg call sees up to a page worth of ring; a caller
+  // requesting more issues subsequent calls (POSIX short-read semantics).
+  // Same "single reader at R18" concurrency note as the other scratches:
+  // future SMP dmesg readers park in a TCB-side scratch (see kernel-
+  // logging-substrate.md §14 Q3 per-CPU rings deferral).
+  pub let mut _dispatch_dmesg_buf_scratch  : [u8; 4096] = uninit @align(8)
+
   // syscall_dispatch(rdi=sysno, rsi=a0, rdx=a1, rcx=a2, r8=a3) -> u64 in rax.
   // Widened !{mem, sysreg} @{cap, sched}: reachable handlers touch cap/sched/uart paths.
   pub let syscall_dispatch : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
@@ -97,6 +108,11 @@ module Dispatch = structure {
         je dispatch_cap_invoke;
         cmp rdi, 12;
         je dispatch_debug_puts;
+        // logging-m9-002 (#709): sysno 13 = SYS_DMESG. Kept low so the
+        // existing `cmp rdi, 61` bounds check + tools/verify-syscall-
+        // dispatch.sh's TOTAL_CHECKS=15 fingerprint stay untouched.
+        cmp rdi, 13;
+        je dispatch_dmesg;
         cmp rdi, 32;
         je dispatch_dup2;
         cmp rdi, 39;
@@ -463,6 +479,95 @@ module Dispatch = structure {
         // executing the sys_debug_puts syscall (confirmed by QEMU
         // interrupt trace: cpl=3 pc=0x4001fd hit 861 times). See design
         // r17-m0-724-d4-init-post-iretq-gp.md §Root Cause.
+        // logging-m9-002 (#709): sys_dmesg(buf, len).
+        //
+        // SysV args at this point: rsi = user_buf VA, rdx = len. We copy
+        // ring bytes into _dispatch_dmesg_buf_scratch via sys_dmesg_body
+        // (which delegates to klog_ring_read_tail — a kernel-side ring
+        // walker; never touches user memory), then walk them out to the
+        // user buffer via user_write_bytes_via_walk. Same
+        // KPTI-bounce-buffer pattern as dispatch_read (#738); the ring is
+        // kernel .bss so no user_ptr_ok on the source is needed, but the
+        // destination buf still requires user_ptr_ok + walker-based
+        // writeback so a ring-3 caller cannot corrupt kernel memory (§741
+        // defense-in-depth).
+        //
+        // Length cap: DISPATCH_IO_MAX (4096) — matches sys_read/sys_write
+        // and the ring's per-call peek ceiling. Callers requesting more
+        // re-issue for the remainder; klog_ring_read_tail is a peek (does
+        // NOT advance tail), so successive calls see the same window and
+        // may double-report if the user does not track offsets themselves.
+        // This matches POSIX dmesg(1) contract: dmesg is idempotent-peek,
+        // syslog_read(SYSLOG_ACTION_READ_ALL) semantics.
+        //
+        // Alignment: entry rsp%16==8 (SysV). Two pushes (r15=user buf,
+        // r14=capped len) + push rsi (fd-preserve slot / align pad for
+        // user_ptr_ok call) = pattern identical to dispatch_read.
+        dispatch_dmesg:
+        push r15;                             // save user buf VA
+        push r14;                             // save capped len
+
+        // Cap len at DISPATCH_IO_MAX (4096).
+        mov rax, 4096;
+        cmp rdx, rax;
+        jbe dispatch_dmesg_len_ok;
+        mov rdx, rax;
+      dispatch_dmesg_len_ok:
+
+        mov r15, rsi;                         // r15 = user buf VA (arg0 was buf)
+        mov r14, rdx;                         // r14 = capped len
+
+        // #741 Layer 1: user_ptr_ok(user_buf, capped_len).
+        sub rsp, 8;                           // align (%16==0 for nested call)
+        mov rdi, r15;                         // arg0 = user buf VA
+        mov rsi, r14;                         // arg1 = capped len
+        call user_ptr_ok;                     // rax = 0 (OK) or 1 (fault)
+        add rsp, 8;                           // undo pad (%16==8)
+        cmp rax, 0;
+        jne dispatch_dmesg_efault;
+
+        // sys_dmesg_body(kernel_dst_ptr=scratch, len=capped_len)
+        //   -> rax = bytes copied in [0, capped_len].
+        sub rsp, 8;                           // #672 MEDIUM: SysV alignment pad
+        lea rdi, [rip + _dispatch_dmesg_buf_scratch]; // arg0 = kernel scratch
+        mov rsi, r14;                         // arg1 = capped len
+        call sys_dmesg_body;
+        add rsp, 8;
+
+        // rax = bytes copied in [0, capped_len]. Short-copy (rax < r14) is
+        // legal and expected when the ring holds fewer bytes than
+        // requested. rax > r14 is impossible (klog_ring_read_tail caps its
+        // return at the requested len). rax == 0 fast-paths out (nothing
+        // to walk; the syscall returns 0 to indicate "no more ring bytes"
+        // — parallel to sys_read EOF).
+        cmp rax, 0;
+        je dispatch_dmesg_done;
+
+        // Copy scratch[0..bytes_copied] back to user buf via walker.
+        // Alignment: rsp%16==8 now; single `push rax` (save bytes_copied)
+        // → %16==0 for nested call. `pop rax` restores %16==8.
+        push rax;                             // save bytes_copied for return
+        mov rdi, r15;                         // arg0 = user buf VA
+        lea rsi, [rip + _dispatch_dmesg_buf_scratch]; // arg1 = kernel scratch
+        mov rdx, rax;                         // arg2 = bytes_copied
+        call user_write_bytes_via_walk;       // rax = 0 (OK) or -EFAULT
+        mov r8, rax;                          // stash walker result
+        pop rax;                              // restore bytes_copied
+
+        cmp r8, 0;
+        jne dispatch_dmesg_efault;            // walker failed → -EFAULT
+
+        dispatch_dmesg_done:
+        pop r14;
+        pop r15;
+        ret;
+
+        dispatch_dmesg_efault:
+        pop r14;
+        pop r15;
+        mov rax, 0xFFFFFFFFFFFFFFF2;          // -EFAULT
+        ret;
+
         dispatch_debug_puts:
         // #741 Layer 1: user_ptr_ok(user_va, len) — pre-existing gap
         // from #724 D4. Prior to this gate a ring-3 caller could invoke

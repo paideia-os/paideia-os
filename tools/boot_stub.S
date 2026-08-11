@@ -301,6 +301,15 @@ dmesg_cap_fail_msg: .ascii "R18 DMESG CAP FAIL\n\0"
 .align 8
 _dmesg_cap_witness_scratch: .zero 512
 
+# logging-m9-002 (#709): sys_dmesg witness strings and markers.
+.global sys_dmesg_ok_msg
+.align 8
+sys_dmesg_ok_msg: .ascii "R18 SYS DMESG OK\n\0"
+
+.global sys_dmesg_fail_msg
+.align 8
+sys_dmesg_fail_msg: .ascii "R18 SYS DMESG FAIL\n\0"
+
 .global init_boot_fail_msg
 .align 8
 init_boot_fail_msg: .ascii "INIT BOOT FAIL\n\0"
