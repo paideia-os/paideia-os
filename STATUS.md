@@ -752,4 +752,48 @@ R22 delivered the PCIe substrate (ECAM + MCFG wire + Type-0/Type-1 header decode
 
 None (R22 ran under QEMU-TCG). No rows promoted `PROVISIONAL → CONFIRMED` at this pass; the #870 VMD row scope was expanded but stays PROVISIONAL until T14 G4 first-light. R23+ first-boot will promote at least the VMD-off row, the PCIe seg=0 ECAM base row, and the hybrid-P/E topology row.
 
-**Next Round:** R23 (driver-plane substrate — first real drivers: virtio, xHCI, then NVMe on VT-d-enforced DMA). Zero R22 blockers.
+**Next Round:** R23 (framebuffer console via GOP direct — per `design/roadmap/r18-plus-bare-metal.md` §R23 canonical schedule; the earlier "driver-plane substrate" phrasing in the R21 close was a planning-phase inconsistency that resolved in favor of the roadmap when R23 opened). Zero R22 blockers.
+
+---
+
+## R23 (Framebuffer Console via GOP Direct) — CLOSED 2026-08-11
+
+R23 delivered the first display-plane of the OS: IA32_PAT programming (BSP + AP) so the GOP LFB can be mapped write-combining, `fb_map_lfb` identity-mapping the LFB into a high-VA window at PML4[320], the embedded VGA 8x16 font asset + `fb_font_row` primitive, the byte-level glyph rasterizer `fb_draw_glyph`, the scrolling text console `fb_console` backed by a u16 cell grid + attr byte, the ANSI state machine (SGR 16-color, CUP, ED, EL), the public byte-in entry `fb_console_puts`, the dormant `_fb_console_active`-gated mirror hook inside `klog_ring_drain_to_uart` so every drained klog byte reaches both COM1 and the framebuffer, the TTY vnode `tty_write` alt-sink to the fb (#883) so direct userspace writes reach the display, and the kernel panic path fb-mirror (#884) with a bold-red `*** PANIC ***` banner + per-byte ring-dump mirror so a photograph of a frozen T14 G4 screen captures the last panic state — the design/hardware/quirks.md §2.5 "no debug UART on chassis" fallback recipe now has code behind it. Every fb code path is gated on `_fb_console_active`, which stays 0 on the `qemu -kernel` PVH boot path (fb_console_init requires `_boot_env_pa != 0` and a successful `fb_map_lfb`) — result: the R22 smoke matrix passes unchanged. First live first-light is queued for T14 G4 hardware bring-up under R24+ per the recipe in `design/round-retrospectives/r23-closure.md` § "Real-Hardware Verification Procedure (T14 first-visual-output moment)". See `design/round-retrospectives/r23-closure.md` for the full write-up.
+
+### Issues Implemented (11 total across 3 milestones)
+
+- **M1** (#875, #876, #877, #878) — Framebuffer substrate: `src/kernel/core/mm/pat.pdx` (`pat_init_this_cpu` + `pat_init_ap` — IA32_PAT MSR with slot 1 remapped to WC), `src/kernel/core/drivers/fb_map.pdx` (`fb_map_lfb` — identity-map LFB at PML4[320] with NX | PAT | RW; returns 0 on `fb_base_pa == 0` for PVH fallback), `assets/fonts/vga8x16.bin` (4096 B standard Linux vgacon font), `src/kernel/core/drivers/fb_font.pdx` (`_fb_font: [u8; 4096]` via `@include_bytes` + `fb_font_row(glyph, row) -> u8` primitive). Fingerprint `tag_pat_init_ok` on BSP + AP entry paths.
+- **M2** (#879, #880, #881, #882) — Framebuffer console body + ANSI subset: `src/kernel/core/drivers/fb_glyph.pdx` (`fb_draw_glyph` — 16-row × 8-column plot with fg/bg RGB per bit), `src/kernel/core/drivers/fb_console.pdx` (`fb_console_init` populating 8-slot `_fb_console_ctx` + `_fb_console_grid [u16; 20480]` + clearing + redrawing + setting `_fb_console_active`; `fb_console_putchar` driving 3-mode ANSI parser with SGR/CUP/ED/EL dispatch; `fb_console_puts` byte-buffer feeder; private scroll/redraw/clear/draw-cell helpers), `src/kernel/core/klog/ring.pdx` (klog drain fb-mirror hook — after each UART store, if `_fb_console_active`, call `fb_console_putchar(byte)` with mask-first byte stash in rbx). Wire-in at `kernel_main` gated on `_boot_env_pa != 0`.
+- **M3** (#883, #884, #885) — TTY alt-sink + panic fb-mirror + R23 closure: `src/kernel/core/tty/write.pdx` (`tty_write` gains post-UART tail — if `_fb_console_active`, hand caller's `(buf, len)` to `fb_console_puts`) (#883); `src/kernel/core/klog/panic.pdx` (step 3.7 fb banner via `k_panic_fb_banner` bold-red `*** PANIC ***`) + `src/kernel/core/klog/ring.pdx` (`klog_ring_dump_panic` busy loop gains r13-stashed fb mirror after `uart_putc`) + `src/kernel/core/klog/keys.pdx` (`k_panic_fb_banner: [u8; 26]` numeric array literal + `k_panic_fb_banner_len: u64 = 26`) (#884); this closure retro + STATUS.md entry + T14 first-visual-output recipe + tag `r23-closed` (#885).
+
+### Cross-Repo Escalations to paideia-as (R23)
+
+**None.** `paideia-as` submodule remained pinned at `2cf169d` for all three R23 milestones. Three ambient "paideia-as-blocked" labels (font `@include_bytes`, PAT MSR-slot programming, ANSI state machine emit) were reviewed and downgraded on inspection — all three tacked cleanly onto pre-existing encoder features (`@include_bytes` native to paideia-as directive set; `rdmsr`/`wrmsr` from R21.M5; state-machine dispatch via `cmp`+`je`+labeled targets). Every encoder mnemonic used by R23 was verified pre-existing.
+
+### Observable Proof
+
+- Kernel builds clean under `tools/build.sh` (**15/15 gates**: no-AML lint + opcode-canary + kernel dispatch + sched guards + tty_read wrapper + link).
+- All 15 default pre-push smoke modes pass (`boot_r8_only` through `boot_smp`, incl. `boot_r14b_*` and `boot_r17_shell_*`). No new fingerprint under `-kernel` — fb subsystem dormant by design on that boot path.
+- R22 opt-in smokes pass unchanged: `PAIDEIA_R22_PCI_TREE=1 boot_r22_pci_tree` and `PAIDEIA_R22_MSIX_IR=1 boot_r22_msix_ir_round_robin` (fb wire lives above the PCI/IR planes and does not touch them).
+- R21 opt-in smokes pass unchanged: `boot_r21_ymm_preserve` / `_ioapic_reroute` / `_msix_round_robin`.
+- No opt-in `boot_r23_*` smoke mode landed — under `-kernel` the fb path is dormant, so a SKIP-echo would be indistinguishable from the baseline. Live-first-light fingerprint lands with the R19 UEFI/OVMF harness (R24+ scope alongside the ESP drive assembly).
+- `nm build/kernel.elf` shows all R23 substrate symbols linked: `pat_init_this_cpu`, `pat_init_ap`, `fb_map_lfb`, `_fb_font` (4096 B), `fb_font_row`, `fb_draw_glyph`, `fb_console_init`, `fb_console_putchar`, `fb_console_puts`, `_fb_console_ctx`, `_fb_console_grid` (40960 B), `_fb_console_active`, `k_panic_fb_banner` (26 B), plus every ANSI dispatch helper (`ansi_dispatch_sgr` / `_cup` / `_ed` / `_el`).
+
+### R23 Debt Carried Forward
+
+1. **UEFI/OVMF fb_console smoke harness** — deferred to R24+ alongside the ESP drive assembly. Under `-kernel` the fb path is dormant by design.
+2. **T14 G4 first-visual-output capture** — GATED ON HARDWARE. Recipe in `design/round-retrospectives/r23-closure.md` § "Real-Hardware Verification Procedure". Fixture format (pixel-buffer checksum vs byte-stream fingerprint) needs a design pass — filed as R24 debt, not R23.
+3. **`fb_map_lfb` assumes 32-bpp BGRA** — OVMF canonicalises to BGRA on x86; R24+ hardens the rasterizer to consume the pixel-format enum on real HW.
+4. **`_fb_console_grid` fixed at [u16; 20480]** — 256 cols × 80 rows headroom (T14 G4 native 1920x1080 = 240×67 cells fits with room). Any GOP surface exceeding these bounds silently clips; R24+ can slab-size at boot.
+5. **`k_panic_fb_banner_len` duplicated in 3 places** — array-type dimension + `_len` constant + inline `mov rsi, 26` in `klog_panic`. Filed as paideia-as nice-to-have compile-time `sizeof_bytes(sym)` intrinsic; zero functional impact.
+6. **Two paideia-as encoder polish gaps from M2** — `cmp r64, imm32` sign-extend variant + `add r64, [mem]` load-op form. Both worked around inline (one extra instruction per use, zero correctness delta). Filed as paideia-as encoder polish; neither blocks R23 close or R24 opening.
+7. **R22 debt items unchanged from R22 close** — `_vtd_base` hardcoded; `has_dmar` slot unpopulated; `vtd_fault_dispatch` IDT wire; `msix_enable_device`; `msix_assignments` ledger; `GCMD.TE + SIRTP + IRE` ceremony; DMA-fault regression SKIP → LIVE; T14 G4 first-light PCI/ACPI captures. All queued for R24+.
+8. **R21 debt items still open:** `hpet_now_ns` precision widening; `phase1_acpi_gather` full wire (partial at R22.M1 — MCFG only).
+
+**None regress R23 acceptance.**
+
+### Quirks Discovered on Real Hardware
+
+None (R23 ran under `qemu -kernel` throughout — no UEFI/OVMF harness yet). No rows in `design/hardware/quirks.md` promoted `PROVISIONAL → CONFIRMED` at this pass. §2.5 (Debug + observability) — the `UART / No debug UART on chassis` row now cross-references #884 as its handling path (photograph-recoverable panic). Full promotion (§2.5 → `WORKED-AROUND`, plus any new display-plane rows) lands at T14 G4 first-visual-output.
+
+**Next Round:** R24 (NVMe userspace driver on top of R22's PCI substrate + R23's display plane). Zero R23 blockers.

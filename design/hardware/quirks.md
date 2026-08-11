@@ -88,7 +88,7 @@ landing an ELF loader.
 
 | Subsystem | Quirk | Impact | Handling | Status | Round observed | Source |
 |-----------|-------|--------|----------|--------|----------------|--------|
-| UART | No debug UART on the chassis; Intel DCI over USB-C possible with a debug dongle. | R21+ panic-log path cannot rely on serial output on physical HW; must fall back to framebuffer-photo. | Documented `design/roadmap/r18-plus-bare-metal.md` §7 R28 fallback. | PROVISIONAL | — | Modern ThinkPad chassis inventory. |
+| UART | No debug UART on the chassis; Intel DCI over USB-C possible with a debug dongle. | R21+ panic-log path cannot rely on serial output on physical HW; must fall back to framebuffer-photo. | R23.M3 (#884) landed: `klog_panic` step 3.7 emits a bold-red `*** PANIC ***` banner via `fb_console_puts`, then `klog_ring_dump_panic`'s busy loop mirrors every ring byte to `fb_console_putchar`. Photograph-recoverable per the R23 closure retro § "Real-Hardware Verification Procedure" — a phone photo of a frozen T14 G4 screen captures banner + full ring dump. Row promotes `PROVISIONAL → WORKED-AROUND` at T14 first-visual-output; formerly documented `design/roadmap/r18-plus-bare-metal.md` §7 R28 fallback. | PROVISIONAL | — | Modern ThinkPad chassis inventory. |
 
 ---
 
@@ -136,3 +136,15 @@ expanded with the R22-PCI-enumerator impact + explicit BIOS toggle
 this pass; R22 ran entirely under QEMU-TCG (no VT-d emulation, no
 hybrid P/E topology, no x2APIC). Promotion pass queued for the T14
 G4 first-light in R23+.*
+
+*Updated 2026-08-11 at R23.M3 close (#884, #885) — §2.5 UART row
+"Handling" column now points at the R23.M3 fb-panic path
+(`k_panic_fb_banner` + `klog_ring_dump_panic` fb mirror). The row
+stays `PROVISIONAL` until first-visual-output confirms the banner +
+ring dump render legibly on the T14 G4 eDP panel; on that day the
+row promotes to `WORKED-AROUND`. See
+`design/round-retrospectives/r23-closure.md` §
+"Real-Hardware Verification Procedure" for the acceptance recipe. No
+new rows added at this pass; R23 ran entirely under `qemu -kernel`
+(no UEFI/OVMF harness yet — fb subsystem is dormant on that boot
+path by design).*
