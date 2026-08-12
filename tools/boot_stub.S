@@ -1475,6 +1475,24 @@ sys_ipc_recv_ok_msg: .ascii "R20b SYS IPC RECV OK\n\0"
 .align 8
 sys_ipc_recv_fail_msg: .ascii "R20b SYS IPC RECV FAIL\n\0"
 
+
+# R20b.M3-002 (#1559): sys_ipc_send / sys_ipc_reply syscall witness
+# fingerprints — second sub-issue of the R20b.M3 (server-process model)
+# branch. Exercises sys_ipc_send_body + sys_ipc_reply_body directly with
+# both the no-waiter (msg queued, no wake) and waiter-present (waiter
+# runq_enqueue'd, endpoint.waiter_tcb cleared) paths, plus the EAGAIN
+# rejection on a full endpoint and the reply-bit (op & 0x80) enforcement.
+# See src/kernel/core/syscall/handlers/sys_ipc_send.pdx (M3-002 body),
+# src/kernel/core/syscall/handlers/sys_ipc_reply.pdx (M3-002 body), and
+# src/kernel/core/syscall/dispatch.pdx (sysno 41/42 dispatch shims).
+.global sys_ipc_send_ok_msg
+.align 8
+sys_ipc_send_ok_msg: .ascii "R20b SYS IPC SEND OK\n\0"
+
+.global sys_ipc_send_fail_msg
+.align 8
+sys_ipc_send_fail_msg: .ascii "R20b SYS IPC SEND FAIL\n\0"
+
 # svc.<name> strings for the R20b.M1-003 (#1554) broker witness.
 # ASCII bytes only; no NUL required (svc_register / svc_lookup are
 # length-explicit), but a trailing NUL keeps the buffer safe for casual

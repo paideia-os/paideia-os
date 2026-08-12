@@ -27,7 +27,7 @@ set -euo pipefail
 ELF="${1:-build/kernel.elf}"
 FAIL=0
 CHECKS_PASSED=0
-TOTAL_CHECKS=16
+TOTAL_CHECKS=18
 
 if [[ ! -f "$ELF" ]]; then
     echo "KERNEL SYSCALL DISPATCH FAIL" >&2
@@ -251,6 +251,30 @@ if grep -q "cmp.*0x28" "$DISPATCH_FILE" && grep -q "sys_ipc_recv_body" "$DISPATC
     CHECKS_PASSED=$((CHECKS_PASSED + 1))
 else
     echo "[FAIL] ID 40 (ipc_recv): cmp missing or sys_ipc_recv_body call missing"
+    FAIL=1
+fi
+
+# Check 17: ID 41 (0x29) route to sys_ipc_reply_body (R20b.M3-002 / #1559).
+# The dispatch shim mirrors dispatch_ipc_recv's user_ptr_ok gate pair
+# (hdr_va, payload_va) — the reply body's bit-7 pre-check + delegation
+# to sys_ipc_send_body is a body-layer concern; the shim only validates
+# user VAs and marshals the SysV args.
+if grep -q "cmp.*0x29" "$DISPATCH_FILE" && grep -q "sys_ipc_reply_body" "$DISPATCH_FILE"; then
+    echo "[ok]   ID 41 (ipc_reply): routes to sys_ipc_reply_body"
+    CHECKS_PASSED=$((CHECKS_PASSED + 1))
+else
+    echo "[FAIL] ID 41 (ipc_reply): cmp missing or sys_ipc_reply_body call missing"
+    FAIL=1
+fi
+
+# Check 18: ID 42 (0x2a) route to sys_ipc_send_body (R20b.M3-002 / #1559).
+# Same shim shape as dispatch_ipc_recv / dispatch_ipc_reply — two
+# user_ptr_ok gates + marshal + body call. Cap-lookup deferred to R20b.M4.
+if grep -q "cmp.*0x2a" "$DISPATCH_FILE" && grep -q "sys_ipc_send_body" "$DISPATCH_FILE"; then
+    echo "[ok]   ID 42 (ipc_send): routes to sys_ipc_send_body"
+    CHECKS_PASSED=$((CHECKS_PASSED + 1))
+else
+    echo "[FAIL] ID 42 (ipc_send): cmp missing or sys_ipc_send_body call missing"
     FAIL=1
 fi
 

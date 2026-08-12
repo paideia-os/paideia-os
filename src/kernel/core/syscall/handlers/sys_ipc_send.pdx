@@ -1,0 +1,215 @@
+// src/kernel/core/syscall/handlers/sys_ipc_send.pdx — R20b.M3-002 (#1559)
+// sys_ipc_send body — non-blocking send on an IPC endpoint (sysno 42).
+//
+// Design context
+// --------------
+// Second sub-issue of the R20b.M3 (server-process model) branch. Paired
+// producer for the R20b.M3-001 consumer (sys_ipc_recv). Builds on the M2
+// primitives: user_bounce_send (M2-003, KPTI-safe hdr + payload copy in) +
+// endpoint_write_pending (M2-002, publish under the single-slot per-endpoint
+// discipline).
+//
+// Per design/ipc/userspace-server-substrate.md §4.3 send steps 1..6 and
+// §5.2 (blocking-receive scheduler hook):
+//
+//   1. Cap-lookup + rights-gate (R_IPC_WRITE | R_IPC_INVOKE) on the caller's
+//      endpoint cap slot.
+//   2. Reject payload_len > 4088 (E2BIG).
+//   3. Reject endpoint's has_pending_msg (EAGAIN — single-slot).
+//   4. Write hdr into endpoint.pending_hdr.
+//   5. Bounce user payload into endpoint.payload_buf_pa via
+//      user_read_bytes_via_walk (KPTI-safe).
+//   6. Wake endpoint.waiter_tcb if non-NULL (state WAITING → RUNNABLE +
+//      runq_enqueue).
+//
+// Layer split
+// -----------
+// This body implements steps (2)..(6) — the endpoint-level publish + wake
+// logic. Step (1) — cap-lookup + rights-gate — lives in the dispatch shim
+// (syscall/dispatch.pdx §dispatch_ipc_send) so the body stays testable in
+// isolation from a boot witness that pre-mints the endpoint kernel-side
+// and passes a raw endpoint_id. Same layering the R20b.M3-001 sibling
+// (sys_ipc_recv_body) pinned; see sys_ipc_recv.pdx §Layer split for the
+// full rationale (the dispatch-side cap-lookup is a scaffold until R20b.M4
+// lands loader_seed_caps).
+//
+// Steps (2)+(4)+(5) are executed by user_bounce_send (user_bounce.pdx),
+// which itself calls endpoint_write_pending (endpoint_table.pdx M2-002)
+// after walker-copying the hdr + payload out of user VA into private
+// kernel scratches. Its return code (0=OK, 1=EAGAIN, 2=BAD_ID,
+// 3=PAYLOAD_LEN, -EFAULT for walker failure) is passed through to this
+// body's caller verbatim per the M2-003 contract (user_bounce.pdx §Return-
+// code layout: "downstream sys_ipc_send (M3-001) can pass the rc through
+// to the user as an errno with a single sign-check").
+//
+// Step (6) — the wake path — is this body's unique contribution. It reads
+// endpoint.waiter_tcb (endpoint row +32, ENDPOINT_OFF_WAITER_TCB per
+// endpoint_table.pdx), and if non-null clears the slot and calls sched_wake
+// on the target task. Structural mirror of uart_rx_notify_wake_if_waiter
+// (core/uart/rx_notify.pdx §uart_rx_notify_wake_if_waiter): clear-BEFORE-
+// wake ordering closes the re-entry window where a second wake would double-
+// enqueue (§3.4 of the rx_notify design; R20b is UP so re-entry is
+// impossible today, but R21+ SMP preserves this invariant).
+//
+// Wake-primitive choice — sched_wake, not raw runq_enqueue
+// --------------------------------------------------------
+// The design doc's §5.2 state-transition diagram writes
+// "WAITING_IPC → RUNNABLE (runq_enqueue)". The full semantic requires BOTH
+// the state flip AND the runq_enqueue; sched_wake (core/sched/wake_block.pdx
+// §sched_wake) is the canonical primitive that does both atomically
+// (matches the sched_block/sched_wake pair for the recv wait). state.pdx's
+// R20b.M3-001 note explicitly names sched_wake as the wake target: "sys_ipc_send
+// (R20b.M3-002) uses the endpoint's waiter_tcb to find the target task and
+// calls sched_wake — no state discrimination required at that layer".
+// A raw runq_enqueue would leave the target's state at STATE_WAITING (2)
+// and the scheduler's sched_switch_r15 path would resume a task whose state
+// slot still reads WAITING — architecturally OK today (sched_pick_next_r15
+// does not gate on state at R18.M4) but a landmine for the differentiated
+// wait-state model design §5.2 targets.
+//
+// sched_wake's #663 guard makes the wake idempotent — a spurious second
+// send on an endpoint whose waiter has already run early-exits without
+// re-linking the target, protecting the runqueue's doubly-linked
+// invariants (runqueue.pdx §runq_enqueue documents these).
+//
+// Effects / capabilities
+// ----------------------
+// !{mem, sysreg} @{cap, sched}:
+//   mem     — user_bounce_send writes the endpoint row + payload arena;
+//             sched_wake writes target.state + the runqueue links.
+//   sysreg  — sched_wake calls runq_enqueue which does rdmsr IA32_GS_BASE
+//             to reach the per-CPU control block.
+//   cap     — future dispatch-shim cap-lookup (M4).
+//   sched   — sched_wake requires @{sched} per wake_block.pdx §sched_wake.
+//
+// Widening matches sys_ipc_recv_body's !{mem, sysreg} @{cap, sched} for
+// family symmetry — dispatch.pdx's syscall_dispatch is already at this
+// union, so no upstream widening is required.
+//
+// Cross-references
+// ----------------
+//   design/ipc/userspace-server-substrate.md §4.3, §5.1, §5.2
+//   src/kernel/core/ipc/user_bounce.pdx (user_bounce_send)
+//   src/kernel/core/ipc/endpoint_table.pdx (endpoint_lookup, waiter_tcb offset)
+//   src/kernel/core/sched/wake_block.pdx (sched_wake)
+//   src/kernel/core/uart/rx_notify.pdx §uart_rx_notify_wake_if_waiter
+//     (clear-BEFORE-wake ordering precedent)
+//   src/kernel/core/syscall/handlers/sys_ipc_recv.pdx (M3-001 sibling)
+
+module SysIpcSend = structure {
+
+  // ============================================================================
+  // Result-code sentinels — negative-errno u64s so a caller can `sar rax, 63`
+  // sign-test + branch identically to any other syscall. Kept as literals
+  // (paideia-as does not resolve cross-module `let` at parse time — see
+  // endpoint_table.pdx §PENDING_PAYLOAD_MAX_BYTES).
+  //
+  // Note on error taxonomy: this body PASSES THROUGH user_bounce_send's
+  // return codes verbatim (0=OK, 1=EAGAIN, 2=BAD_ID, 3=E2BIG, -EFAULT for
+  // walker failure) rather than translating each to a Linux-style negative
+  // errno. Rationale per user_bounce.pdx §Return-code layout: the small
+  // codes 1..3 sit in a range disjoint from any legal syscall success (a
+  // send body never returns a positive value distinct from 0), so a caller
+  // can discriminate via `cmp rax, 3` (any rax > 3 is -EFAULT). Real errno-
+  // format translation lands with M3-004's syscall-shim wire-up once
+  // R20b.M4 seeds real caps into ring-3 and userspace begins consuming
+  // the return values.
+  // ============================================================================
+
+  pub let SYS_IPC_SEND_OK              : u64 = 0
+  pub let SYS_IPC_SEND_ERR_EAGAIN      : u64 = 1
+  pub let SYS_IPC_SEND_ERR_BAD_ID      : u64 = 2
+  pub let SYS_IPC_SEND_ERR_PAYLOAD_LEN : u64 = 3
+  pub let SYS_IPC_SEND_ERR_EFAULT      : u64 = 0xFFFFFFFFFFFFFFF2   // -14
+
+  // ==========================================================================
+  // sys_ipc_send_body(id, user_hdr_va, user_payload_va, payload_len) -> u64
+  //
+  // SysV ABI: rdi=id, rsi=user_hdr_va, rdx=user_payload_va, rcx=payload_len
+  //        -> rax = 0 (SYS_IPC_SEND_OK) OR one of the sentinels above.
+  //
+  // Register plan (5-push callee-save prologue aligns rsp %16 == 0 for
+  // nested calls; entry rsp %16 == 8 SysV; 5*8=40; 8+40=48; 48%16=0):
+  //   rbx = endpoint id                 (survives every nested call)
+  //   r12 unused (pushed for alignment)
+  //   r13 unused (pushed for alignment)
+  //   r14 unused (pushed for alignment)
+  //   r15 = endpoint row PA             (survives sched_wake)
+  //
+  // Flow:
+  //   (1) user_bounce_send(id, user_hdr_va, user_payload_va, payload_len)
+  //         — SysV args in rdi/rsi/rdx/rcx pass through unchanged.
+  //         rax = 0 on success or a pass-through error code.
+  //   (2) On any error, jump to epilogue (rax already holds the error).
+  //   (3) On success, endpoint_lookup(id) → row PA. Null-row means the
+  //         endpoint was freed under us between the write and the wake
+  //         (indistinguishable from a bad id at this layer, but publish
+  //         already succeeded, so we honor the send with no wake instead
+  //         of returning an error).
+  //   (4) Load waiter_tcb at [row + 32] (ENDPOINT_OFF_WAITER_TCB).
+  //         Null → no waiter → return 0.
+  //   (5) Clear waiter_tcb slot BEFORE calling sched_wake — matches
+  //         uart_rx_notify §3.4 clear-BEFORE-wake ordering.
+  //   (6) sched_wake(waiter): state WAITING → RUNNABLE + runq_enqueue.
+  //   (7) Return 0.
+  // ==========================================================================
+
+  pub let sys_ipc_send_body : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (id: u64) (user_hdr_va: u64) (user_payload_va: u64) (payload_len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap, sched},
+      justification: "R20b.M3-002 (#1559): sys_ipc_send body — pass-through send via user_bounce_send + wake endpoint.waiter_tcb (if any). 5-push callee-save prologue (rbx/r12/r13/r14/r15) aligns rsp %16 == 0 for nested calls AND preserves the endpoint id (rbx) across user_bounce_send (which shuffles rdi/rsi/rdx/rcx into the walker + endpoint_write_pending call chain, all caller-save). r15 stashes the endpoint row PA across sched_wake (which itself calls runq_enqueue; both caller-save the entire GPR set that matters to us via SysV — but rdi is the sched_wake arg, so we recompute nothing after wake). r12/r13/r14 pushed for alignment only. Flow: (a) `call user_bounce_send` with rdi/rsi/rdx/rcx already carrying (id, user_hdr_va, user_payload_va, payload_len) — pass through. rax = 0 (OK), 1 (EAGAIN), 2 (BAD_ID), 3 (E2BIG), or 0xFFFFFFFFFFFFFFF2 (-EFAULT). (b) `cmp rax, 0; jne sys_ipc_send_done` — propagate error verbatim; rax already carries the code. (c) On success, `endpoint_lookup(rbx)` → rax = row PA (or 0 if freed underfoot). Null-row branches to sys_ipc_send_done_ok — the send has already published; a race that freed the row leaves nothing to wake but does not undo the publish (design §14 Q3 defers ABA-safe alloc to R21+ SMP). r15 = row PA. (d) `mov rdi, [r15 + 32]` reads ENDPOINT_OFF_WAITER_TCB (u64). Null-waiter branches to sys_ipc_send_done_ok. (e) `xor rax, rax; mov [r15 + 32], rax` clears the waiter slot BEFORE sched_wake — matches uart_rx_notify_wake_if_waiter §3.4 (rx_notify.pdx L81) clear-BEFORE-wake ordering so a spurious re-entry cannot double-enqueue (R20b UP + IF=0 in the syscall path make re-entry impossible today, but R21+ SMP preserves this invariant). Note: for R20b the sys_ipc_recv_body wake path already defensively clears [row+32] on wake (recv-side belt-and-suspenders per its file-header 'Wait-slot invariants'); this send-side clear is the primary responsibility per the wake protocol. (f) `call sched_wake` — flips target.state STATE_WAITING (2) → STATE_RUNNABLE (1) then runq_enqueue's the target. sched_wake's #663 guard makes this idempotent: if a prior send already RUNNABLE'd the target (spurious re-wake, e.g. two producers racing at R21+ SMP), the early-exit prevents figure-8 corruption of the runqueue's doubly-linked invariants. sched_wake preserves rbx per its own SysV register discipline (caller-save-only clobber: rax, rdi, rcx). (g) `xor rax, rax` — return SYS_IPC_SEND_OK. Epilogue: pop r15/r14/r13/r12/rbx; ret. Error propagation (sys_ipc_send_done label) also pops all 5 registers so rsp is restored consistently — rax carries whatever user_bounce_send returned. ENDPOINT_OFF_WAITER_TCB literal (32) matches endpoint_table.pdx §row-field offsets. Widening rationale: !{mem,sysreg} @{cap,sched} — mirrors sys_ipc_recv_body's family shape (sysreg from sched_wake's transitive rdmsr in runq_enqueue; sched from sched_wake @{sched}). cap is the future dispatch-shim cap-lookup (M4); scoped now to keep the widening a no-op when M4 lands.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                            // rbx = id (survives user_bounce_send)
+
+        // ---- Step 1: publish via user_bounce_send (KPTI-safe hdr + payload) ----
+        // rdi/rsi/rdx/rcx already carry (id, user_hdr_va, user_payload_va, payload_len).
+        call user_bounce_send;                   // rax = rc (0 OK; 1..3 substrate; -EFAULT walker)
+
+        // ---- Propagate any error verbatim ----
+        cmp rax, 0;
+        jne sys_ipc_send_done;                   // rax carries the error
+
+        // ---- Step 2: wake path — locate the endpoint row ----
+        mov rdi, rbx;                            // arg0 = id
+        call endpoint_lookup;                    // rax = row PA (or 0 if freed underfoot)
+        cmp rax, 0;
+        je  sys_ipc_send_done_ok;                // race lost row — no wake, but publish succeeded
+        mov r15, rax;                            // r15 = row PA (survives sched_wake)
+
+        // ---- Step 3: read waiter_tcb slot ----
+        mov rdi, [r15 + 32];                     // rdi = waiter_tcb (ENDPOINT_OFF_WAITER_TCB)
+        cmp rdi, 0;
+        je  sys_ipc_send_done_ok;                // no waiter parked — no wake
+
+        // ---- Step 4: clear waiter slot BEFORE waking ----
+        // Matches uart_rx_notify_wake_if_waiter §3.4 (rx_notify.pdx L81):
+        // clearing the slot BEFORE sched_wake closes the re-entry window
+        // where a second send would double-enqueue the target.
+        xor rax, rax;
+        mov [r15 + 32], rax;                     // ENDPOINT_OFF_WAITER_TCB = 0
+
+        // ---- Step 5: sched_wake — state WAITING -> RUNNABLE + runq_enqueue ----
+        // rdi still holds the waiter TCB. sched_wake is idempotent per its
+        // #663 guard (early-exit if target already RUNNABLE).
+        call sched_wake;
+
+      sys_ipc_send_done_ok:
+        xor rax, rax;                            // SYS_IPC_SEND_OK
+
+      sys_ipc_send_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+}

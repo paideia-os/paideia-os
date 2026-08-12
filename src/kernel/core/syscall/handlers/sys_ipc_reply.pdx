@@ -1,0 +1,198 @@
+// src/kernel/core/syscall/handlers/sys_ipc_reply.pdx — R20b.M3-002 (#1559)
+// sys_ipc_reply body — non-blocking reply on an IPC endpoint (sysno 41).
+//
+// Design context
+// --------------
+// Companion body to sys_ipc_send (see sys_ipc_send.pdx §Design context).
+// Per design/ipc/userspace-server-substrate.md §5.1 and
+// acpi-supervisor-schema.md §3, a reply is byte-identical to a send but
+// with the request's op field bit 7 flipped ("a reply's op is the request
+// op with bit 7 set"). frame.pdx exposes FRAME_OP_REPLY_BIT (= 0x80) as
+// the named constant; this body enforces that gate before falling through
+// to sys_ipc_send_body.
+//
+// Enforcement placement
+// ---------------------
+// The bit-7 check happens in this body — NOT in sys_ipc_send_body — so
+// the send body stays symmetric across request and reply semantics (a
+// well-formed request send would also carry the bit-flipped op if the
+// caller wanted to encode a reply, but the send API contract per §4.1
+// makes bit 7 a caller-set discriminator, not a syscall-side constraint).
+// Pushing the assertion up to sys_ipc_reply keeps sys_ipc_send free of
+// the schema-version-dependent bit check and allows a future FRAME_OP_*
+// widening (per acpi-supervisor-schema.md §3's "u8 op — RPC opcode; reply's
+// op is request's op|0x80") to touch only this file.
+//
+// Copy-once discipline
+// --------------------
+// The bit-7 check requires reading the op byte from user memory BEFORE
+// deciding whether to publish. The natural options are:
+//
+//   (a) Pre-walk the op byte here, check bit 7, then delegate to
+//       sys_ipc_send_body (which will re-walk the full 8-byte hdr inside
+//       user_bounce_send). Cost: one extra 1-byte user_read_bytes_via_walk
+//       call — negligible; walker's 4-level walk is amortized on the same
+//       page as the 8-byte hdr copy.
+//
+//   (b) Re-implement the full send-body logic here with the bit-7 check
+//       between user_bounce_send and the wake path. Cost: duplicated ~40
+//       lines of logic; every future sys_ipc_send fix has to be applied
+//       twice.
+//
+// Choice: (a). One extra walker call is cheap; code duplication is
+// long-term expensive. The bit-7 check runs BEFORE any endpoint state is
+// mutated, so a rejection leaves the endpoint arena + row untouched — a
+// clean failure model that (b)'s post-publish assertion could not match
+// without rolling back the publish (worse still).
+//
+// Error taxonomy
+// --------------
+// This body's distinct-error space:
+//   0                             success (delegated from sys_ipc_send_body)
+//   1 / 2 / 3 / -EFAULT (0xFFFFFFFFFFFFFFF2)
+//                                 pass-through from sys_ipc_send_body
+//   -EFAULT (0xFFFFFFFFFFFFFFF2)  walker failure on the pre-check read
+//                                 (indistinguishable from user_bounce_send's
+//                                 own -EFAULT — same class of failure)
+//   -EINVAL (0xFFFFFFFFFFFFFFEA)  hdr.op bit 7 not set (the reply-gate
+//                                 rejection; distinct from every other
+//                                 error code so a caller can discriminate
+//                                 via cmp rax, -22)
+//
+// Cross-references
+// ----------------
+//   design/ipc/userspace-server-substrate.md §4.1, §5.1
+//   design/ipc/acpi-supervisor-schema.md §3
+//   src/kernel/core/ipc/frame.pdx §FRAME_OP_REPLY_BIT (= 0x80)
+//   src/kernel/core/syscall/handlers/sys_ipc_send.pdx (delegate)
+//   src/kernel/core/syscall/user_read.pdx §user_read_bytes_via_walk
+
+module SysIpcReply = structure {
+
+  // ============================================================================
+  // Result-code sentinels.
+  //
+  // The pass-through set mirrors sys_ipc_send.pdx (see there for the
+  // rationale). The distinct reply-gate rejection is -EINVAL (0xFFFFFFFFFFFFFFEA
+  // == -22 signed) — chosen because:
+  //   (1) It sits outside the 0..3 substrate-error range and outside -EFAULT
+  //       (-14), so callers can discriminate with a single compare.
+  //   (2) Standard POSIX errno for "invalid argument" — the reply-bit
+  //       requirement is a schema-level argument constraint on hdr.op,
+  //       not a resource-limit or fault condition.
+  // ============================================================================
+
+  pub let SYS_IPC_REPLY_ERR_EFAULT       : u64 = 0xFFFFFFFFFFFFFFF2   // -14
+  pub let SYS_IPC_REPLY_ERR_NOT_REPLY    : u64 = 0xFFFFFFFFFFFFFFEA   // -22 (-EINVAL)
+
+  // ============================================================================
+  // Kernel-side scratch for the 1-byte op-field pre-check.
+  //
+  // @align(8) matches the discipline used by the KPTI-bounce scratches in
+  // user_bounce.pdx and dispatch.pdx (dispatch_open/read/write scratches);
+  // wasteful for a single byte but consistent with the rest of the R20b
+  // scratch layout, and paideia-as pads .bss @align(8) so a bare [u8; 1]
+  // without the annotation would still occupy 8 bytes.
+  //
+  // .bss placement (uninit): freshly zero on first boot; each reply call
+  // overwrites the byte in-place, so no explicit reset needed.
+  //
+  // Single-flow discipline: R20b's single in-flight IPC per endpoint
+  // (design §4.2) means no two callers touch this scratch concurrently.
+  // R21+ SMP moves this into the TCB slab (matches the deferral note in
+  // user_bounce.pdx §Kernel-side scratch discipline).
+  // ============================================================================
+
+  pub let mut _sys_ipc_reply_op_scratch : [u8; 1] = uninit @align(8)
+
+  // ==========================================================================
+  // sys_ipc_reply_body(id, user_hdr_va, user_payload_va, payload_len) -> u64
+  //
+  // SysV ABI: rdi=id, rsi=user_hdr_va, rdx=user_payload_va, rcx=payload_len
+  //        -> rax = 0 on success, or one of:
+  //             -EFAULT (0xFFFFFFFFFFFFFFF2)  walker failure at pre-check
+  //             -EINVAL (0xFFFFFFFFFFFFFFEA)  hdr.op bit 7 not set
+  //             pass-through error code from sys_ipc_send_body.
+  //
+  // Register plan (5-push callee-save prologue aligns rsp %16 == 0 for
+  // nested calls; entry rsp %16 == 8 SysV; 5*8=40; 8+40=48; 48%16=0):
+  //   rbx = endpoint id                (survives walker + send-body calls)
+  //   r12 = user_hdr_va                (survives walker + send-body calls)
+  //   r13 = user_payload_va            (survives walker + send-body calls)
+  //   r14 = payload_len                (survives walker + send-body calls)
+  //   r15 unused (pushed for alignment)
+  //
+  // Flow:
+  //   (1) Save the four SysV args into rbx/r12/r13/r14 — walker's caller-
+  //       save clobber (rax/rcx/rdx/rdi/rsi/r8-r10) would otherwise lose them.
+  //   (2) user_read_bytes_via_walk(kernel_dst=_sys_ipc_reply_op_scratch,
+  //       user_va=user_hdr_va, len=1) — pull op byte across KPTI barrier.
+  //   (3) On walker rc != 0: return -EFAULT.
+  //   (4) Load the op byte; check bit 7. On bit-7-clear: return -EINVAL.
+  //   (5) Restore SysV args from callee-save regs; call sys_ipc_send_body.
+  //   (6) Return sys_ipc_send_body's rc verbatim.
+  // ==========================================================================
+
+  pub let sys_ipc_reply_body : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (id: u64) (user_hdr_va: u64) (user_payload_va: u64) (payload_len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap, sched},
+      justification: "R20b.M3-002 (#1559): sys_ipc_reply body — pre-check hdr.op bit 7 (FRAME_OP_REPLY_BIT = 0x80 per frame.pdx / acpi-supervisor-schema.md §3), then delegate to sys_ipc_send_body. 5-push callee-save prologue (rbx/r12/r13/r14/r15) aligns rsp %16 == 0 for nested calls AND preserves the four SysV args (id/hdr_va/payload_va/payload_len) across user_read_bytes_via_walk (walker's caller-save clobber covers rax/rcx/rdx/rdi/rsi/r8-r10 per user_read.pdx §user_read_bytes_via_walk register plan). rbx=id, r12=user_hdr_va, r13=user_payload_va, r14=payload_len (all callee-save-preserved so we can restore into rdi/rsi/rdx/rcx for the sys_ipc_send_body tail call). r15 pushed for alignment only. Flow: (a) Save args into callee-save regs. (b) `call user_read_bytes_via_walk` with rdi=_sys_ipc_reply_op_scratch, rsi=r12 (user_hdr_va points at op @ offset 0 per frame.pdx §encode layout: op is bits 0..7 of the packed u64 = byte 0 in native LE), rdx=1 (single op byte). rax = 0 (OK) or 0xFFFFFFFFFFFFFFF2 (-EFAULT — walker's own sentinel per user_read.pdx). (c) `cmp rax, 0; jne sys_ipc_reply_done_efault` — walker failure short-circuits with -EFAULT. (d) Load the op byte: `lea rax, [rip + _sys_ipc_reply_op_scratch]; xor rcx, rcx; mov_b rcx, [rax]`. The pre-zero is required because paideia-as's mov_b does NOT zero-extend the destination (same convention as sys_execve_shim.pdx §L110 and user_puts_via_walk.pdx §L). (e) Check bit 7: `and rcx, 0x80; cmp rcx, 0; je sys_ipc_reply_done_not_reply`. FRAME_OP_REPLY_BIT is 0x80 (frame.pdx §L112); the mask + compare-with-zero pair is the paideia-as idiom for single-bit test (BT with memory operand is not yet in the encoder). (f) Restore args: `mov rdi, rbx; mov rsi, r12; mov rdx, r13; mov rcx, r14`; `call sys_ipc_send_body`. rax carries the send body's return verbatim. (g) Epilogue: pop r15/r14/r13/r12/rbx; ret. Error paths (sys_ipc_reply_done_efault, sys_ipc_reply_done_not_reply) each load rax with the sentinel and jmp to the common epilogue — matches the sys_ipc_recv_body error-path shape at handlers/sys_ipc_recv.pdx §sys_ipc_recv_done_efault. Cross-module `call sys_ipc_send_body` proven in dispatch.pdx §dispatch_ipc_recv (cross-module `call sys_ipc_recv_body`); paideia-as's ELF encoder emits PLT32 relocations for cross-module function refs, resolved at link time. Cross-file [rip + _sys_ipc_reply_op_scratch] proven in every dispatch handler that references a local .bss scratch. Widening rationale: !{mem,sysreg} @{cap,sched} — inherited via the sys_ipc_send_body tail call, plus mem from the walker read.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                            // rbx = id
+        mov r12, rsi;                            // r12 = user_hdr_va
+        mov r13, rdx;                            // r13 = user_payload_va
+        mov r14, rcx;                            // r14 = payload_len
+
+        // ---- Step 1: walker-copy op byte from user_hdr_va into scratch ----
+        // op is byte 0 of the 8-byte packed hdr (frame.pdx §encode layout:
+        // bits 0..7 of the packed u64; native LE u64 store places op at
+        // buf[0]). A 1-byte walker read at user_hdr_va+0 fetches op.
+        lea rdi, [rip + _sys_ipc_reply_op_scratch];
+        mov rsi, r12;                            // user_hdr_va
+        mov rdx, 1;                              // len = 1 (op byte only)
+        call user_read_bytes_via_walk;           // rax = 0 (OK) or -EFAULT
+        cmp rax, 0;
+        jne sys_ipc_reply_done_efault;
+
+        // ---- Step 2: load op byte and test bit 7 ----
+        // pre-zero rcx because mov_b does NOT zero-extend (paideia-as
+        // convention: see sys_execve_shim.pdx L110).
+        lea rax, [rip + _sys_ipc_reply_op_scratch];
+        xor rcx, rcx;
+        mov_b rcx, [rax];                        // rcx = op (u8 zero-ext)
+        and rcx, 0x80;                           // FRAME_OP_REPLY_BIT
+        cmp rcx, 0;
+        je  sys_ipc_reply_done_not_reply;        // bit 7 clear -> reject
+
+        // ---- Step 3: delegate to sys_ipc_send_body ----
+        mov rdi, rbx;                            // id
+        mov rsi, r12;                            // user_hdr_va
+        mov rdx, r13;                            // user_payload_va
+        mov rcx, r14;                            // payload_len
+        call sys_ipc_send_body;                  // rax = send rc (pass through)
+
+      sys_ipc_reply_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      sys_ipc_reply_done_efault:
+        mov rax, 0xFFFFFFFFFFFFFFF2;             // -EFAULT
+        jmp sys_ipc_reply_done;
+
+      sys_ipc_reply_done_not_reply:
+        mov rax, 0xFFFFFFFFFFFFFFEA;             // -EINVAL (bit-7 not set)
+        jmp sys_ipc_reply_done
+      }
+    } @no_frame
+}
