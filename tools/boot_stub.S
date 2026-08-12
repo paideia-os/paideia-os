@@ -1510,6 +1510,23 @@ sys_svc_lookup_ok_msg: .ascii "R20b SVC LOOKUP OK\n\0"
 .align 8
 sys_svc_lookup_fail_msg: .ascii "R20b SVC LOOKUP FAIL\n\0"
 
+
+# R20b.M4-001 (#1561): InitCap sidecar format + validator witness fingerprints
+# — first sub-issue of the R20b.M4 (loader capability-seed hook) branch.
+# Exercises init_caps_validate (src/kernel/core/loader/init_caps.pdx) against
+# a hand-authored 2-entry sidecar synthesized in kernel .bss: accept path
+# (valid slot + kind for both entries) plus three reject paths — malformed
+# count (array overflows blob), out-of-range slot (>= 256), unknown kind
+# (not in {0..15, 0x15, 0x16}). Format documented in
+# design/loader/init-caps-sidecar.md §§1..4.
+.global init_caps_ok_msg
+.align 8
+init_caps_ok_msg: .ascii "R20b INIT CAPS FMT OK\n\0"
+
+.global init_caps_fail_msg
+.align 8
+init_caps_fail_msg: .ascii "R20b INIT CAPS FMT FAIL\n\0"
+
 # svc.<name> strings for the R20b.M1-003 (#1554) broker witness.
 # ASCII bytes only; no NUL required (svc_register / svc_lookup are
 # length-explicit), but a trailing NUL keeps the buffer safe for casual
