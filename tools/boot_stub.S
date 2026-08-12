@@ -1443,6 +1443,28 @@ kind_hw_msix_ok_msg: .ascii "R29 KIND_MSIX_VECTOR OK\n\0"
 kind_hw_msix_fail_msg: .ascii "R29 KIND_MSIX_VECTOR FAIL\n\0"
 
 
+# R29.M2-001 (#1023): driver lifecycle FSM witness fingerprints — opens
+# R29.M2 (Lifecycle FSM real bodies + regression corpus). The FSM has
+# six states (Init/Running/Suspended/Handoff/Stopping/Stopped) and its
+# whitelist of nine legal transitions is enforced by
+# driver_lifecycle_transition against the driver descriptor at
+# _driver_table[slot]. Witness at kernel_main.pdx §driver_lifecycle_witness
+# walks the full Init->Stopped path and asserts every rejected-transition
+# error code (ERR_BAD_SLOT / ERR_UNKNOWN_STATE / ERR_INVALID_TRANSITION).
+# See:
+#   - src/kernel/core/driver/lifecycle.pdx (FSM constants + transition_valid)
+#   - src/kernel/core/driver/driver_table.pdx (32-slot descriptor storage)
+#   - design/architecture/next-wave-derived-kinds.md §Driver lifecycle FSM
+#   - design/roadmap/next-wave-softarch.md §3 R29 (Milestones — R29.M2)
+.global driver_lifecycle_ok_msg
+.align 8
+driver_lifecycle_ok_msg: .ascii "R29 LIFECYCLE FSM OK\n\0"
+
+.global driver_lifecycle_fail_msg
+.align 8
+driver_lifecycle_fail_msg: .ascii "R29 LIFECYCLE FSM FAIL\n\0"
+
+
 # R20b.M1-002 (#1553): endpoint_table + payload_arena witness fingerprints —
 # exercises endpoint_alloc/endpoint_free/endpoint_lookup round-trip on the
 # full 128-slot range AND payload_buf_pa_for(0..127) 4 KiB-alignment +

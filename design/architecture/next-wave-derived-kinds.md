@@ -307,6 +307,125 @@ the corresponding R29.M1 sub-issue when it lands.
 
 ---
 
+## Driver runtime state (R29.M2)
+
+The R29.M2 milestone (Lifecycle FSM real bodies + regression corpus)
+introduces the *first non-capability* kernel-owned runtime table
+described in this document: the driver-process descriptor. The two
+subsystems are catalogued here because the descriptor is the substrate
+KIND_DRIVER (R29.M3+) will name-and-authorise, and the FSM is the
+sole legal state-machine every subsequent R29.M2..M7 op (start /
+suspend / resume / handoff_begin / stop, plus the R29.M7 chaos-restart
+cascade) drives.
+
+### Driver descriptor table — landed by R29.M2-001 (#1023)
+
+- **Storage:** `_driver_table` in `src/kernel/core/driver/driver_table.pdx`
+  — 32 rows × 48 bytes = 1536 B `.bss`, `@align(64)`. `.bss` zero-init
+  means every row starts with `in_use=0`; `driver_table_register` is the
+  sole entry point to flip `in_use` to 1.
+- **Row layout (48 B, six u64s):**
+  - `[+0]` u64 header: `bits [7:0] = state` (`DRIVER_STATE_*`),
+    `bits [15:8] = in_use` (0=free, 1=allocated), `bits [31:16] = reserved`,
+    `bits [63:32] = pid` (u32).
+  - `[+8]` u64: `caps_manifest_offset` (u32 low bits) — byte offset into
+    the supervisor's per-driver manifest region.
+  - `[+16]` u64: `name[0..7]`.
+  - `[+24]` u64: `name[8..15]`.
+  - `[+32]` u64: reserved — future `restart_count + last_restart_ns`.
+  - `[+40]` u64: reserved — future `audit_seq + supervisor_hint`.
+- **Capacity rationale:** 32 slots is one power-of-two above the T14 G4
+  driver census (≈24 drivers at boot per `design/drivers/architecture.md`
+  §2). Not sized to `cap_table` (256) because a driver-process density of
+  256 exceeds the wire-in-hand shape of a laptop and would waste ~11 KiB.
+- **Primitives:** `driver_table_register`, `driver_table_unregister`,
+  `driver_table_slot_in_use`, `driver_table_read_state_byte`,
+  `driver_table_write_state_byte`, `driver_table_read_pid`,
+  `driver_table_read_caps_offset`, `driver_table_row_addr`.
+- **Return codes:** `DRIVER_TABLE_REGISTER_OK` (0),
+  `DRIVER_TABLE_REGISTER_BAD_SLOT` (0xFFFFFEFF),
+  `DRIVER_TABLE_REGISTER_ALREADY_USED` (0xFFFFFEFE). Disjoint from the
+  `DRIVER_LIFECYCLE_*` codes below so a mixed-caller trace remains
+  observably distinct.
+
+### Driver lifecycle FSM — landed by R29.M2-001 (#1023)
+
+- **Module:** `src/kernel/core/driver/lifecycle.pdx`.
+- **States (six):**
+
+  | State | Value | Meaning |
+  |------:|:-----:|---------|
+  | `DRIVER_STATE_INIT`      | 0 | driver process spawned, capabilities plumbed, not yet running. |
+  | `DRIVER_STATE_RUNNING`   | 1 | driver serving requests. |
+  | `DRIVER_STATE_SUSPENDED` | 2 | paused (OS suspend, driver-directed pause, or supervisor policy). |
+  | `DRIVER_STATE_HANDOFF`   | 3 | draining state to a replacement driver (graceful takeover). |
+  | `DRIVER_STATE_STOPPING`  | 4 | committed to termination; queue is being drained. |
+  | `DRIVER_STATE_STOPPED`   | 5 | terminal; supervisor may `driver_table_unregister` after reaping the process. |
+
+- **Whitelist of nine legal transitions:**
+
+  ```text
+  Init      -> Running     (start)
+  Running   -> Suspended   (suspend)
+  Suspended -> Running     (resume)
+  Running   -> Handoff     (handoff_begin — graceful takeover)
+  Suspended -> Handoff     (handoff_begin from paused driver)
+  Handoff   -> Stopping    (stop)
+  Running   -> Stopping    (direct stop, no handoff)
+  Suspended -> Stopping    (direct stop from paused driver)
+  Stopping  -> Stopped     (final drain complete)
+  ```
+
+  Every other transition is rejected with `DRIVER_LIFECYCLE_ERR_INVALID_TRANSITION`.
+
+- **Representation:** the whitelist is packed into a single u64
+  constant `DRIVER_LIFECYCLE_TABLE = 0x00000020101A1C02`. Byte `i` holds
+  the 6-bit bitmap of legal target states from state `i`. Transition
+  check reduces to `(TABLE >> (cur * 8)) & (1 << new)` — O(1),
+  branch-free (past the outer bounds gates), fuzz-friendly.
+- **Primitives:**
+  - `driver_lifecycle_transition_valid(cur, new) -> u64` — pure predicate;
+    returns 1 iff the (cur, new) pair is on the whitelist. Exposed
+    independently so R29.M2-005's fuzz corpus enumerates the 36-cell
+    grid without touching `_driver_table`.
+  - `driver_lifecycle_get_state(slot) -> u64` — returns current state
+    byte (0..5) or `DRIVER_LIFECYCLE_ERR_BAD_SLOT` (slot out of range
+    OR row not in_use).
+  - `driver_lifecycle_transition(slot, new_state) -> u64` — validated
+    FSM transition. Sequence: slot gate → new_state range gate →
+    read cur → whitelist check → commit. Every gate returns a distinct
+    error code.
+- **Return codes:**
+  - `DRIVER_LIFECYCLE_OK` (0).
+  - `DRIVER_LIFECYCLE_ERR_BAD_SLOT` (0xFFFFFF01) — slot >= 32 OR not `in_use`.
+  - `DRIVER_LIFECYCLE_ERR_UNKNOWN_STATE` (0xFFFFFF02) — `new_state` >= 6.
+  - `DRIVER_LIFECYCLE_ERR_INVALID_TRANSITION` (0xFFFFFF03) — `(cur, new)`
+    not on whitelist.
+- **Boot witness:** `kernel_main.pdx §driver_lifecycle_witness` walks
+  the full `Init → Running → Suspended → Running → Suspended → Handoff
+  → Stopping → Stopped` chain, then exercises every rejection code
+  (Stopped→Running, bogus state, bogus slot, unregistered slot). Emits
+  `R29 LIFECYCLE FSM OK` on success — the R29.M2-001 boot fingerprint.
+- **Concurrency:** R29.M2 substrate is single-flow pre-scheduler-bringup;
+  no ABA guard, no per-row lock. SMP-safety revisits at R29.M7 (chaos-
+  restart harness).
+- **Downstream consumers** (all R29.M2..M7 issues):
+  - `#1024` — driver_supervisor_channel wiring: RPC ops `start` /
+    `suspend` / `resume` / `handoff_begin` / `stop` map 1:1 onto the
+    six FSM transitions.
+  - `#1025` — supervisor policy for driver-initiated `suspend` /
+    `resume` (self-suspend on idle timeout).
+  - `#1026` — handoff protocol (state serialisation over
+    `driver_hotplug_channel`).
+  - `#1027` — regression corpus: 36-cell fuzz grid via
+    `driver_lifecycle_transition_valid`.
+  - `#1028+` (R29.M3 registry v2) — persists the driver descriptor
+    across restarts.
+  - `#1035+` (R29.M6 audit surface) — every transition emits an audit
+    record tagged with (slot, old, new, ts).
+
+---
+
 ## Base kinds reserved for later rounds
 
 ### `KIND_RESERVED = 15` — confidential-computing / TDX (D1)
@@ -327,6 +446,7 @@ collision arises.
 | 2026-08-12 | R29.M0 | #1017 | Initial doc + `KIND_HW = 14` base kind row + R29.M1 derived-kind skeletons. |
 | 2026-08-12 | R29.M1 | #1019/#1020/#1021 | Refined `KIND_HW_INTERRUPT` row: finalized numeric tag (0x140), tail-encoding scheme (row indirection via `_hw_interrupt_table`), rights bitmask (`R_HW_INT_ALL = 0x618`), full mint/revoke API, dispatch handler. Landed by `src/kernel/core/cap/kind_hw_interrupt.pdx`. |
 | 2026-08-12 | R29.M1 | #1022 | Landed `KIND_HW_MSIX_VECTOR = 0x141` — second derived kind over KIND_HW, layered atop `KIND_HW_INTERRUPT`. Row-indirection tail via `_hw_msix_vector_table` encoding `{msix_table_offset:u32, msix_data:u32, parent_slot:u8}`. Rights bitmask `R_MSIX_ALL = 0x218` (INVOKE/REVOKE/MINT). Full mint / revoke / cascade-revoke API + dispatch handler in `src/kernel/core/cap/kind_hw_msix_vector.pdx`. Cascade wired into `hw_int_cap_revoke` (calls `msix_cascade_revoke_by_parent` before freeing its own row). Design doc `KIND_HW_MSIX_VECTOR` row rewritten from planning skeleton to as-landed spec; `KIND_HW_DMA_DOMAIN` + `KIND_HW_TIMELINE` rows relabeled as "planned for a later R29 milestone" (issue-number attribution corrected — R29.M1 closes with two derived kinds landed). Closes R29.M1. |
+| 2026-08-12 | R29.M2 | #1023 | Landed driver-process lifecycle FSM (Init/Running/Suspended/Handoff/Stopping/Stopped) with nine-transition whitelist packed as `DRIVER_LIFECYCLE_TABLE = 0x00000020101A1C02`. Landed 32-slot `_driver_table` (48 B rows in .bss) as the descriptor storage. Full primitives (`driver_lifecycle_transition`, `driver_lifecycle_get_state`, `driver_lifecycle_transition_valid`; `driver_table_register`, `driver_table_unregister`, `driver_table_slot_in_use`, `driver_table_read_state_byte`, `driver_table_write_state_byte`, `driver_table_read_pid`, `driver_table_read_caps_offset`, `driver_table_row_addr`) in `src/kernel/core/driver/lifecycle.pdx` + `driver_table.pdx`. Boot witness at `kernel_main.pdx §driver_lifecycle_witness` walks the full Init→Stopped path and exercises every rejection code — fingerprint `R29 LIFECYCLE FSM OK`. Opens R29.M2. |
 
 ---
 

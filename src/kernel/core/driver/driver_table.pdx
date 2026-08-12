@@ -1,0 +1,459 @@
+// src/kernel/core/driver/driver_table.pdx — R29.M2-001 (#1023)
+//
+// 32-row driver descriptor table + register/lookup/state primitives.
+// The storage substrate the R29.M2 lifecycle FSM (lifecycle.pdx) reads
+// from and writes to.
+//
+// Design context
+// --------------
+// Per design/roadmap/next-wave-softarch.md §3 R29, every driver in
+// PaideiaOS runs as its own userspace process holding narrow
+// capabilities (per-vector IRQ + per-device IOMMU domain + per-endpoint
+// MMIO) and is separately-restartable. The runtime state of each
+// driver process (Init / Running / Suspended / Handoff / Stopping /
+// Stopped) belongs to the kernel — a driver cannot forge or bypass its
+// own lifecycle FSM, and the supervisor sees the table via a
+// KIND_DRIVER capability (introduced separately in
+// src/kernel/core/cap/driver_cap.pdx).
+//
+// This module is the descriptor storage — a 32-slot .bss array where
+// each row holds the driver's runtime state byte, its process id, a
+// short name (16 bytes, NUL-padded), and an offset into the
+// capability-manifest region the supervisor keeps for that driver.
+// lifecycle.pdx builds the FSM primitives on top of this storage;
+// the KIND_DRIVER capability handler (R29.M3+) reads it to serve
+// driver_supervisor_channel RPCs.
+//
+// The 32-slot cap is deliberate: the T14 G4 target hardware
+// (design/drivers/architecture.md §2) needs ~24 drivers at boot
+// (uart+pci+xhci+e1000e+nvme+display+audio+wifi+bt+ec+thermal+
+// battery+backlight+i2c×3+gpio×2+lpss×2+ipu6+guc+hda) with headroom
+// for hot-plug. 32 rounds to a power of two, matching the cap_table
+// slot-count discipline (256 = 2^8 in src/kernel/core/cap/table.pdx).
+//
+// Row layout (48 bytes = six u64s)
+// --------------------------------
+//   [+0]  u64 header:
+//         bits [7:0]   state (u8; DRIVER_STATE_INIT..DRIVER_STATE_STOPPED)
+//         bits [15:8]  in_use (u8; 0=free, 1=allocated)
+//         bits [31:16] reserved (must be zero)
+//         bits [63:32] pid (u32)
+//   [+8]  u64 caps_manifest_offset (u32 in low bits) — byte offset
+//         into the supervisor's per-driver manifest region; not
+//         interpreted by this file. Reserved high bits (u32) MUST
+//         stay zero for future flags.
+//   [+16] u64 name[0..7]  — first 8 bytes of the NUL-padded driver name.
+//   [+24] u64 name[8..15] — last  8 bytes of the NUL-padded driver name.
+//   [+32] u64 reserved — future: restart_count + last_restart_ns.
+//   [+40] u64 reserved — future: audit_seq + supervisor_hint.
+//
+// Total: 6 * 8 = 48 bytes / row × 32 rows = 1536 bytes .bss, @align(64).
+//
+// State byte lives at [+0] byte 0 so an FSM transition is a single
+// byte store — no need to read-modify-write the header u64. The
+// separate in_use byte at [+1] distinguishes "free slot with state
+// DRIVER_STATE_INIT=0" from "unregistered slot with byte==0". Without
+// in_use the get_state discipline could not tell whether a zero byte
+// meant "freshly-registered Init driver" or "never registered".
+//
+// Concurrency
+// -----------
+// R29.M2 substrate is single-flow pre-scheduler-bringup + non-
+// preemptible; no ABA guard, no per-row lock. SMP-safety revisits
+// at R29.M7 (chaos-restart harness). Every mutator here writes at
+// most one u64 per operation, so a torn store cannot leave the row
+// in an intermediate-illegal state observable from another CPU —
+// but a concurrent register+get_state pair is undefined at R29.M2.
+
+module DriverTable = structure {
+
+  // ============================================================================
+  // Table geometry
+  // ============================================================================
+
+  pub let DRIVER_TABLE_SLOTS    : u64 = 32
+  pub let DRIVER_TABLE_ROW_BYTES: u64 = 48
+  pub let DRIVER_TABLE_BYTES    : u64 = 1536         // 32 * 48
+
+  // ============================================================================
+  // Row-field byte offsets (from row base)
+  // ============================================================================
+
+  pub let DRIVER_ROW_OFF_STATE          : u64 = 0
+  pub let DRIVER_ROW_OFF_IN_USE         : u64 = 1
+  pub let DRIVER_ROW_OFF_HEADER         : u64 = 0    // full [+0] u64 header
+  pub let DRIVER_ROW_OFF_CAPS_OFFSET    : u64 = 8
+  pub let DRIVER_ROW_OFF_NAME_LO        : u64 = 16
+  pub let DRIVER_ROW_OFF_NAME_HI        : u64 = 24
+  pub let DRIVER_ROW_OFF_RESERVED_32    : u64 = 32
+  pub let DRIVER_ROW_OFF_RESERVED_40    : u64 = 40
+
+  // ============================================================================
+  // Return codes (disjoint from lifecycle.pdx's DRIVER_LIFECYCLE_* space
+  // so a mixed-caller error trace remains observably distinct).
+  // ============================================================================
+
+  pub let DRIVER_TABLE_REGISTER_OK           : u64 = 0
+  pub let DRIVER_TABLE_REGISTER_BAD_SLOT     : u64 = 0xFFFFFEFF
+  pub let DRIVER_TABLE_REGISTER_ALREADY_USED : u64 = 0xFFFFFEFE
+
+  // ============================================================================
+  // Backing storage — 32 rows × 48 B = 1536 B = 192 u64s, @align(64).
+  //
+  // .bss zero-init means every row starts with state=0 (INIT), in_use=0
+  // (free), pid=0, caps_offset=0, name=empty. driver_table_register is
+  // the only mutator that flips in_use to 1.
+  // ============================================================================
+
+  pub let mut _driver_table : [u64; 192] = uninit @align(64)
+
+  // ============================================================================
+  // driver_table_row_addr(slot) -> u64
+  //
+  // SysV ABI: rdi = slot -> rax = &_driver_table + slot * 48 (kernel VA).
+  // No bounds check — internal helper, callers must gate slot first.
+  // ============================================================================
+
+  pub let driver_table_row_addr : (u64) -> u64 !{} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R29.M2-001 (#1023): compute row address for a slot in [0..DRIVER_TABLE_SLOTS). Multiply-by-48 via id*16 + id*32 (shl 4 + shl 5 + add) — no imul, matches endpoint_table.pdx's multiply-by-48 discipline. Add &_driver_table base. Pure computation; no memory access. Leaf function; no callee-save writes.",
+      block: {
+        mov r8, rdi;
+        shl r8, 4;                          // slot * 16
+        mov r9, rdi;
+        shl r9, 5;                          // slot * 32
+        add r8, r9;                         // slot * 48
+        lea r9, [rip + _driver_table];
+        add r8, r9;                         // r8 = &row
+        mov rax, r8;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // driver_table_slot_in_use(slot) -> u64
+  //
+  // SysV ABI: rdi = slot -> rax = 1 if slot < 32 AND row's in_use byte
+  // (byte 1 of the [+0] u64) is non-zero; else 0.
+  // ============================================================================
+
+  pub let driver_table_slot_in_use : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M2-001 (#1023): return 1 iff slot < DRIVER_TABLE_SLOTS AND row.in_use byte is non-zero. Bounds-check first, then compute row addr (multiply-by-48), load header u64, shift right 8 and mask 0xFF to extract in_use byte. Pure read; no writes to memory. Leaf function; no callee-save writes.",
+      block: {
+        cmp rdi, 32;                        // DRIVER_TABLE_SLOTS
+        jae drv_slot_in_use_no;
+
+        mov r8, rdi;
+        shl r8, 4;
+        mov r9, rdi;
+        shl r9, 5;
+        add r8, r9;                         // slot * 48
+        lea r9, [rip + _driver_table];
+        add r8, r9;                         // &row
+
+        mov rax, [r8 + 0];
+        shr rax, 8;                         // header >> 8 -> in_use in low byte
+        mov r10, 0xFF;
+        and rax, r10;
+        cmp rax, 0;
+        je  drv_slot_in_use_no;
+
+        mov rax, 1;
+        ret;
+
+      drv_slot_in_use_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // driver_table_register(slot, pid, name_ptr, caps_manifest_offset) -> u64
+  //
+  // SysV ABI:
+  //   rdi = slot                    (target row index; 0..31)
+  //   rsi = pid                     (u32 in low bits)
+  //   rdx = name_ptr                (kernel VA of 16-byte NUL-padded name)
+  //   rcx = caps_manifest_offset    (u32 in low bits)
+  //
+  // Returns:
+  //   DRIVER_TABLE_REGISTER_OK          (0)          — row populated,
+  //                                                    state=INIT, in_use=1.
+  //   DRIVER_TABLE_REGISTER_BAD_SLOT    (0xFFFFFEFF) — slot >= 32.
+  //   DRIVER_TABLE_REGISTER_ALREADY_USED(0xFFFFFEFE) — row already in_use.
+  //
+  // On success writes:
+  //   [row+0]  = (pid << 32) | (1 << 8) | DRIVER_STATE_INIT (0)
+  //              i.e. state byte = 0 at [+0], in_use = 1 at [+1],
+  //              reserved bytes 2..3 = 0, pid at bytes 4..7.
+  //   [row+8]  = caps_manifest_offset & 0xFFFFFFFF (upper 32 zero).
+  //   [row+16] = *(u64 *)(name_ptr + 0)   — first 8 bytes.
+  //   [row+24] = *(u64 *)(name_ptr + 8)   — last  8 bytes.
+  //   [row+32] = 0
+  //   [row+40] = 0
+  //
+  // Caller is responsible for ensuring name_ptr points to at least
+  // 16 readable bytes; passing a shorter buffer risks reading past the
+  // end. Convention: name is NUL-padded to 16 bytes; callers pass a
+  // 16-byte rodata buffer.
+  // ============================================================================
+
+  pub let driver_table_register : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (slot: u64) (pid: u64) (name_ptr: u64) (caps_manifest_offset: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M2-001 (#1023): register a driver descriptor at slot. Sequence: (1) bounds-check slot < DRIVER_TABLE_SLOTS -> BAD_SLOT on fail. (2) Compute row addr via multiply-by-48 (shl 4 + shl 5 + add), same shape as driver_table_row_addr but inlined for the fast path. (3) Load current header, extract in_use byte, if != 0 return ALREADY_USED (do not overwrite a live row — the supervisor must revoke first per design/drivers/framework.md §3.4). (4) Pack header: state=0 (INIT) at byte 0, in_use=1 at byte 1, reserved=0 at bytes 2..3, pid at bytes 4..7. Mask pid low 32 bits then shift left 32. OR with (1<<8). (5) Store header. (6) Store caps_manifest_offset & 0xFFFFFFFF at [+8]. (7) Copy 16-byte name via two u64 loads from name_ptr and stores to [+16] and [+24]. (8) Zero reserved slots [+32] and [+40]. Return REGISTER_OK. Preserve caller-save args across pushed callee-save. Written as unsafe block per paideia-as #913 discipline. r12 preserved to survive the potential future call chain, though this leaf currently makes no calls.",
+      block: {
+        // (1) Bounds-check slot.
+        cmp rdi, 32;                        // DRIVER_TABLE_SLOTS
+        jae drv_register_bad_slot;
+
+        // Spill callee-save regs used for arg staging (r12..r15).
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rsi;                       // pid
+        mov r13, rdx;                       // name_ptr
+        mov r14, rcx;                       // caps_manifest_offset
+        mov r15, rdi;                       // slot
+
+        // (2) row = &_driver_table + slot * 48.
+        mov r8, r15;
+        shl r8, 4;
+        mov r9, r15;
+        shl r9, 5;
+        add r8, r9;                         // slot * 48
+        lea r9, [rip + _driver_table];
+        add r8, r9;                         // r8 = &row
+
+        // (3) already-in-use gate.
+        mov rax, [r8 + 0];
+        mov r10, rax;
+        shr r10, 8;
+        mov r11, 0xFF;
+        and r10, r11;
+        cmp r10, 0;
+        jne drv_register_already;
+
+        // (4) build header:
+        //   pid (low 32 bits) << 32 | (1 << 8) | 0(state=INIT).
+        mov rax, r12;                       // pid
+        mov r10, 0xFFFFFFFF;
+        and rax, r10;
+        shl rax, 32;                        // pid at bytes 4..7
+        mov r10, 1;
+        shl r10, 8;                         // in_use = 1 at byte 1
+        or  rax, r10;
+        // state byte at [+0] = 0 (DRIVER_STATE_INIT) — implicit in
+        // the zero low byte of rax.
+
+        // (5) store header.
+        mov [r8 + 0], rax;
+
+        // (6) store caps_manifest_offset (low 32 bits).
+        mov rax, r14;
+        mov r10, 0xFFFFFFFF;
+        and rax, r10;
+        mov [r8 + 8], rax;
+
+        // (7) copy 16-byte name via two u64 loads/stores.
+        mov rax, [r13 + 0];
+        mov [r8 + 16], rax;
+        mov rax, [r13 + 8];
+        mov [r8 + 24], rax;
+
+        // (8) zero reserved slots.
+        xor rax, rax;
+        mov [r8 + 32], rax;
+        mov [r8 + 40], rax;
+
+        // Return OK.
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        xor rax, rax;                       // DRIVER_TABLE_REGISTER_OK
+        ret;
+
+      drv_register_already:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        mov rax, 0xFFFFFEFE;                // DRIVER_TABLE_REGISTER_ALREADY_USED
+        ret;
+
+      drv_register_bad_slot:
+        mov rax, 0xFFFFFEFF;                // DRIVER_TABLE_REGISTER_BAD_SLOT
+        ret
+      }
+    }
+
+  // ============================================================================
+  // driver_table_read_state_byte(slot) -> u64
+  //
+  // SysV ABI: rdi = slot -> rax = state byte (byte 0 of the [+0] u64).
+  // No bounds check, no in_use check — internal helper. Callers must
+  // gate slot AND in_use themselves.
+  // ============================================================================
+
+  pub let driver_table_read_state_byte : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M2-001 (#1023): read state byte at row[+0] byte 0. Compute row addr (multiply-by-48), load header u64, mask 0xFF. Pure read; no writes. Leaf function; no callee-save writes. Used by lifecycle.pdx after its own slot + in_use gates.",
+      block: {
+        mov r8, rdi;
+        shl r8, 4;
+        mov r9, rdi;
+        shl r9, 5;
+        add r8, r9;                         // slot * 48
+        lea r9, [rip + _driver_table];
+        add r8, r9;
+
+        mov rax, [r8 + 0];
+        mov r10, 0xFF;
+        and rax, r10;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // driver_table_write_state_byte(slot, new_state) -> ()
+  //
+  // SysV ABI: rdi = slot, rsi = new_state (0..255; caller must gate).
+  // Writes the low byte of new_state to row[+0] byte 0, preserving the
+  // remaining seven bytes of the header (in_use, reserved, pid).
+  //
+  // No bounds check — internal helper. Callers must gate slot themselves.
+  // Uses a read-modify-write on the header u64 rather than a raw byte
+  // store so cross-CPU tearing behaviour matches the rest of the
+  // R29.M2 substrate (a byte-store into a u64-aligned slot is fine on
+  // x86-64 today but the RMW keeps the store discipline uniform with
+  // the register-based helpers used elsewhere in the tree).
+  // ============================================================================
+
+  pub let driver_table_write_state_byte : (u64, u64) -> () !{mem} @{} =
+    fn (slot: u64) (new_state: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M2-001 (#1023): update state byte at row[+0] byte 0, preserving remaining seven bytes of the header (in_use at byte 1, reserved at bytes 2..3, pid at bytes 4..7). Compute row addr, load header, clear low byte via AND with ~0xFF (= 0xFFFFFFFFFFFFFF00), OR in new_state masked to low byte, store back. Single-byte precision matters: an accidental full-header overwrite would drop the in_use flag and pid. Leaf function; no callee-save writes. Called by lifecycle.pdx after transition validation.",
+      block: {
+        mov r8, rdi;
+        shl r8, 4;
+        mov r9, rdi;
+        shl r9, 5;
+        add r8, r9;                         // slot * 48
+        lea r9, [rip + _driver_table];
+        add r8, r9;                         // &row
+
+        mov rax, [r8 + 0];                  // load header
+        mov r10, 0xFFFFFFFFFFFFFF00;        // clear-low-byte mask
+        and rax, r10;
+        mov r10, rsi;                       // new_state
+        mov r11, 0xFF;
+        and r10, r11;                       // low byte only
+        or  rax, r10;
+        mov [r8 + 0], rax;                  // store updated header
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // driver_table_read_pid(slot) -> u64
+  //
+  // SysV ABI: rdi = slot -> rax = pid (u32 in low bits).
+  // No bounds check — internal helper. Extracts bits [63:32] of the row
+  // header. Returns 0 if the row was never registered (pid stays zero
+  // in .bss). Callers who need to distinguish "unregistered" from
+  // "registered with pid=0" must check driver_table_slot_in_use first.
+  // ============================================================================
+
+  pub let driver_table_read_pid : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M2-001 (#1023): read pid from row[+0] bits [63:32]. Compute row addr, load header, shift right 32 (pid was packed at bytes 4..7). No mask needed because we shift the upper 32 bits into the low 32; the low u32 of rax is now pid. Pure read; leaf function.",
+      block: {
+        mov r8, rdi;
+        shl r8, 4;
+        mov r9, rdi;
+        shl r9, 5;
+        add r8, r9;
+        lea r9, [rip + _driver_table];
+        add r8, r9;
+
+        mov rax, [r8 + 0];
+        shr rax, 32;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // driver_table_read_caps_offset(slot) -> u64
+  //
+  // SysV ABI: rdi = slot -> rax = caps_manifest_offset (u32 in low bits).
+  // Reads [row+8] low 32 bits. No bounds check — internal helper.
+  // ============================================================================
+
+  pub let driver_table_read_caps_offset : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M2-001 (#1023): read caps_manifest_offset from row[+8] low 32 bits. Compute row addr, load [+8], mask 0xFFFFFFFF. Pure read; leaf function.",
+      block: {
+        mov r8, rdi;
+        shl r8, 4;
+        mov r9, rdi;
+        shl r9, 5;
+        add r8, r9;
+        lea r9, [rip + _driver_table];
+        add r8, r9;
+
+        mov rax, [r8 + 8];
+        mov r10, 0xFFFFFFFF;
+        and rax, r10;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // driver_table_unregister(slot) -> ()
+  //
+  // SysV ABI: rdi = slot -> zeros the row at slot if slot < 32; no-op
+  // otherwise. Full-row zero clears state, in_use, pid, name, caps
+  // offset — leaves the slot free for a subsequent register call.
+  //
+  // Provided for the R29.M2 witness's cleanup discipline. In production
+  // the supervisor unregisters only after driver_lifecycle_get_state
+  // returns DRIVER_STATE_STOPPED; there is no gate in this helper.
+  // ============================================================================
+
+  pub let driver_table_unregister : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M2-001 (#1023): unregister a slot by zeroing its six u64s (48 bytes). Bounds-check slot < DRIVER_TABLE_SLOTS -> silent no-op on fail. Zero-fills clear state (byte 0), in_use (byte 1), pid (bytes 4..7), caps_offset ([+8]), name ([+16] / [+24]), and both reserved slots ([+32] / [+40]) so a subsequent register call reads .bss-fresh sentinels. Leaf function; no callee-save writes.",
+      block: {
+        cmp rdi, 32;
+        jae drv_unregister_done;
+
+        mov r8, rdi;
+        shl r8, 4;
+        mov r9, rdi;
+        shl r9, 5;
+        add r8, r9;
+        lea r9, [rip + _driver_table];
+        add r8, r9;                         // &row
+
+        xor rax, rax;
+        mov [r8 + 0],  rax;
+        mov [r8 + 8],  rax;
+        mov [r8 + 16], rax;
+        mov [r8 + 24], rax;
+        mov [r8 + 32], rax;
+        mov [r8 + 40], rax;
+
+      drv_unregister_done:
+        ret
+      }
+    } @no_frame
+}
