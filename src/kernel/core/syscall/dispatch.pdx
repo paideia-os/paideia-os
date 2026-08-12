@@ -88,6 +88,146 @@ module Dispatch = structure {
   // logging-substrate.md §14 Q3 per-CPU rings deferral).
   pub let mut _dispatch_dmesg_buf_scratch  : [u8; 4096] = uninit @align(8)
 
+  // ==========================================================================
+  // R20b.M6-002 (#1565): dispatch-layer cap-slot -> endpoint_id translator.
+  //
+  // The 4 IPC-family dispatch shims (sysnos 40 sys_ipc_recv, 41 sys_ipc_reply,
+  // 42 sys_ipc_send) landed at R20b.M3-001..003 as scaffolding — they treated
+  // a0 as a raw endpoint_id because userspace had not yet been seeded any
+  // KIND_IPC_ENDPOINT caps (R20b.M4 landed loader_seed_caps). Now that real
+  // userspace tasks receive endpoint caps via the loader (M4-002 / M6-001)
+  // and via sys_svc_lookup (M3-003), a0 arriving in the shim is a CAP SLOT,
+  // not an endpoint id. This helper is the shared cap-lookup + rights-gate
+  // that translates cap_slot -> endpoint_id (or a negative errno) before the
+  // shim falls into user_ptr_ok / body dispatch.
+  //
+  // Sysno 43 sys_svc_lookup is NOT wired through this helper — that syscall
+  // CREATES a cap into a free slot (see sys_svc_lookup.pdx L194 justification
+  // "mint a KIND_IPC_ENDPOINT cap in a free cap_table slot"); its a0 arg is
+  // a user-VA name pointer, not a cap slot.
+  //
+  // Naming/layout constants (mirror src/kernel/core/cap/kind_endpoint.pdx and
+  // cap/verify.pdx — see cap/table.pdx §Capability struct for the 24-byte
+  // descriptor layout that cap_mint_write / cap_verify_read pin):
+  //   [cap_table + slot*24 + 0]  = kind (u64)         — must == 5 (KIND_IPC_ENDPOINT)
+  //   [cap_table + slot*24 + 8]  = rights (u64)       — (rights & required) == required
+  //   [cap_table + slot*24 + 16] = target_ptr (u64)   — low 16 bits = endpoint_id
+  //                                                     (KIND_IPC_ENDPOINT tail encoding
+  //                                                     per kind_endpoint.pdx §endpoint_tail_encode)
+  //
+  // Errno sentinels — Linux-style negative-errno u64s so a caller can
+  // `cmp rax, 0; jl` to sign-test either error class in one branch (matches
+  // the syscall-return convention used by sys_close (EBADF), sys_ipc_recv,
+  // etc.).
+  //
+  //   -EBADF  (0xFFFFFFFFFFFFFFF7 = -9)  — slot out of range OR kind mismatch
+  //   -EACCES (0xFFFFFFFFFFFFFFF3 = -13) — kind OK, rights mask failed
+  //
+  // Per-task cap_tables (R21+): at R20b there is a single global cap_table
+  // (cap/table.pdx — [u64; 768] backing 256 x 24 B descriptors; see the
+  // "Per-task cap_table caveat" block in loader/seed_caps.pdx L55-63). When
+  // per-task cap_tables land (design/capabilities/per-task-cspace.md) this
+  // helper grows a `_current_tcb.cap_table` deref up front and every other
+  // caller of cap_mint_write / cap_verify_read follows suit — the slot-arith
+  // + kind/rights check body stays identical.
+  //
+  // Concurrency: single-threaded phase-1 (matches svc_broker.pdx and the M2
+  // endpoint_table). Reads only — no writes; concurrent minters (sys_svc_lookup
+  // body) update slots one at a time in the M3-003 free-scan pattern. SMP-safe
+  // rights checking arrives with the same round that adds per-row locking.
+  //
+  // Constants recorded here for cross-reference; not used as symbols in the
+  // helper body (paideia-as pattern per sys_ipc_recv.pdx §Result-code sentinels).
+  //
+  //   DISPATCH_KIND_IPC_ENDPOINT = 5
+  //   DISPATCH_R_IPC_READ        = 0x01
+  //   DISPATCH_R_IPC_WRITE       = 0x02
+  //   DISPATCH_R_IPC_INVOKE      = 0x08
+  //   DISPATCH_R_IPC_ALL         = 0x0B
+  //   Required for sys_ipc_recv  = R_IPC_READ  | R_IPC_INVOKE = 0x09
+  //   Required for sys_ipc_send  = R_IPC_WRITE | R_IPC_INVOKE = 0x0A
+  //   Required for sys_ipc_reply = R_IPC_WRITE | R_IPC_INVOKE = 0x0A
+  // ==========================================================================
+
+  pub let DISPATCH_KIND_IPC_ENDPOINT   : u64 = 5
+  pub let DISPATCH_R_IPC_READ          : u64 = 0x01
+  pub let DISPATCH_R_IPC_WRITE         : u64 = 0x02
+  pub let DISPATCH_R_IPC_INVOKE        : u64 = 0x08
+  pub let DISPATCH_R_IPC_ALL           : u64 = 0x0B
+  pub let DISPATCH_IPC_RECV_REQUIRED   : u64 = 0x09   // R_IPC_READ  | R_IPC_INVOKE
+  pub let DISPATCH_IPC_SEND_REQUIRED   : u64 = 0x0A   // R_IPC_WRITE | R_IPC_INVOKE
+  pub let DISPATCH_IPC_REPLY_REQUIRED  : u64 = 0x0A   // R_IPC_WRITE | R_IPC_INVOKE
+  pub let DISPATCH_ERR_EBADF           : u64 = 0xFFFFFFFFFFFFFFF7
+  pub let DISPATCH_ERR_EACCES          : u64 = 0xFFFFFFFFFFFFFFF3
+
+  // ipc_slot_to_endpoint(cap_slot: u64, required_rights: u64) -> u64
+  //
+  // SysV ABI: rdi = cap_slot, rsi = required_rights
+  //        -> rax = endpoint_id (>= 0, < ENDPOINT_ID_MAX == 128)
+  //           OR   0xFFFFFFFFFFFFFFF7 (-EBADF)  on slot out-of-range / kind mismatch
+  //           OR   0xFFFFFFFFFFFFFFF3 (-EACCES) on rights mask failure
+  //
+  // Called by dispatch_ipc_recv / dispatch_ipc_send / dispatch_ipc_reply's
+  // Gate-0 (cap-slot lookup) block. Bounds-first so a caller with `cap_slot ==
+  // 256` (or larger) never dereferences past the [u64; 768] table backing.
+  // Kind-check before rights-check so a stale free slot (kind == KIND_NULL == 0)
+  // returns -EBADF (matches POSIX "fd not open" semantics for the sibling
+  // fd_get / sys_close path). Rights mask uses `(rights & required) == required`
+  // so a superset (e.g. R_IPC_ALL for a required R_IPC_READ|R_IPC_INVOKE) still
+  // passes.
+  //
+  // Register plan (leaf function, no nested call):
+  //   rdi / rsi = args (consumed inline; no callee-save writes)
+  //   rax       = accumulator (descriptor ptr, then reused for return)
+  //   rcx       = temp for descriptor field loads
+  //   r8, r9    = slot-arithmetic temps (same shift-add pattern as
+  //               cap/verify.pdx L67-71 + cap/mint.pdx L104-108 to avoid imul)
+  //
+  // Effects / capabilities: !{mem} @{cap} — reads cap_table only; @{cap} matches
+  // cap_verify_read / cap_mint_write's own posture (design/capabilities/*.md).
+  pub let ipc_slot_to_endpoint : (u64, u64) -> u64 !{mem} @{cap} =
+    fn (cap_slot: u64) (required_rights: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R20b.M6-002 (#1565): translate cap_slot -> endpoint_id via cap_table, gate on kind == KIND_IPC_ENDPOINT (5) and (rights & required) == required. Bounds-check slot < 256 (cap_table has 256 slots x 24 B) as the first gate so an out-of-range slot returns -EBADF before any descriptor read. Slot-arithmetic pattern matches cap/verify.pdx §cap_verify_read L67-71 + cap/mint.pdx §cap_mint_write L104-108 (slot*8 + slot*16 = slot*24, no imul). Descriptor field offsets match cap_mint_write's write order: kind@+0, rights@+8, target_ptr@+16. Kind check FIRST so a stale free slot (kind == KIND_NULL == 0) maps to -EBADF (matches POSIX 'fd not open' shape of sys_close's EBADF); rights check second so kind-mismatch and rights-mismatch produce distinct errno classes. endpoint_id extraction masks target_ptr low 16 bits per KIND_IPC_ENDPOINT tail encoding (cap/kind_endpoint.pdx §endpoint_tail_encode — endpoint_id in bits [15:0]). Return codes chosen to be sign-testable (bit 63 set) so callers use `cmp rax, 0; jl err` to branch on any error class in one instruction. Leaf function; no callee-save writes (rax/rcx/r8/r9 all caller-save). Per-task cap_tables (R21+) will grow a _current_tcb.cap_table deref at the head; body stays byte-identical.",
+      block: {
+        // ---- Gate 1: slot < 256 ----
+        cmp rdi, 256;
+        jae ipc_slot_ebadf;
+
+        // ---- Descriptor address: cap_table + slot*24 ----
+        mov rax, cap_table;
+        mov r8, rdi;
+        shl r8, 3;                         // r8 = slot * 8
+        mov r9, rdi;
+        shl r9, 4;                         // r9 = slot * 16
+        add r8, r9;                        // r8 = slot * 24
+        add rax, r8;                       // rax = &cap_table[slot]
+
+        // ---- Gate 2: kind == KIND_IPC_ENDPOINT (5) ----
+        mov rcx, [rax + 0];
+        cmp rcx, 5;
+        jne ipc_slot_ebadf;
+
+        // ---- Gate 3: (rights & required) == required ----
+        mov rcx, [rax + 8];
+        and rcx, rsi;
+        cmp rcx, rsi;
+        jne ipc_slot_eacces;
+
+        // ---- Extract endpoint_id from target_ptr low 16 bits ----
+        mov rax, [rax + 16];
+        and rax, 0xFFFF;
+        ret;
+
+        ipc_slot_ebadf:
+          mov rax, 0xFFFFFFFFFFFFFFF7;     // -EBADF
+          ret;
+        ipc_slot_eacces:
+          mov rax, 0xFFFFFFFFFFFFFFF3;     // -EACCES
+          ret
+      }
+    } @no_frame
+
   // syscall_dispatch(rdi=sysno, rsi=a0, rdx=a1, rcx=a2, r8=a3) -> u64 in rax.
   // Widened !{mem, sysreg} @{cap, sched}: reachable handlers touch cap/sched/uart paths.
   pub let syscall_dispatch : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
@@ -631,8 +771,33 @@ module Dispatch = structure {
         // body call uses the standard #672 `sub rsp, 8` + `add rsp, 8`
         // bracket.
         dispatch_ipc_recv:
+        // ---- Gate 0: cap-slot -> endpoint_id (R20b.M6-002 / #1565) ----
+        // ipc_slot_to_endpoint(cap_slot=rsi, required=R_IPC_READ | R_IPC_INVOKE = 0x09)
+        // rax = endpoint_id on success, or -EBADF (kind mismatch / slot OOR)
+        // or -EACCES (rights mask failure). Any negative return (bit 63 set)
+        // short-circuits with the errno verbatim — this is the first gate so
+        // callers with a bogus cap slot never leak through to user_ptr_ok
+        // (matching POSIX: EBADF/EACCES take precedence over EFAULT).
+        push rsi;                                 // save cap_slot           (%16==0)
+        push rdx;                                 // save user_hdr_va        (%16==8)
+        push rcx;                                 // save user_payload_va    (%16==0)
+        push r8;                                  // save user_payload_max   (%16==8)
+        sub rsp, 8;                               // align                    (%16==0)
+        mov rdi, rsi;                             // arg0 = cap_slot
+        mov rsi, 0x09;                            // arg1 = R_IPC_READ | R_IPC_INVOKE
+        call ipc_slot_to_endpoint;                // rax = endpoint_id or -EBADF/-EACCES
+        mov r10, rax;                             // stash result across pops
+        add rsp, 8;                               //                          (%16==8)
+        pop r8;                                   //                          (%16==0)
+        pop rcx;                                  //                          (%16==8)
+        pop rdx;                                  //                          (%16==0)
+        pop rsi;                                  //                          (%16==8)
+        cmp r10, 0;
+        jl  dispatch_ipc_recv_cap_err;            // signed<0 = errno
+        mov rsi, r10;                             // substitute resolved endpoint_id
+
         // ---- Gate A: user_ptr_ok(user_hdr_va, 8) ----
-        push rsi;                                 // save cap_slot / id      (%16==0)
+        push rsi;                                 // save endpoint_id        (%16==0)
         push rdx;                                 // save user_hdr_va        (%16==8)
         push rcx;                                 // save user_payload_va    (%16==0)
         push r8;                                  // save user_payload_max   (%16==8)
@@ -683,6 +848,10 @@ module Dispatch = structure {
         mov rax, 0xFFFFFFFFFFFFFFF2;              // -EFAULT
         ret;
 
+        dispatch_ipc_recv_cap_err:
+        mov rax, r10;                             // propagate -EBADF or -EACCES
+        ret;
+
         // R20b.M3-002 (#1559): sysno 42 = sys_ipc_send(cap_slot, user_hdr_va,
         // user_payload_va, payload_len) -> 0 | 1(EAGAIN) | 2(BAD_ID) |
         // 3(E2BIG) | -EFAULT.
@@ -716,8 +885,29 @@ module Dispatch = structure {
         // body call uses the standard #672 `sub rsp, 8` + `add rsp, 8`
         // bracket. Identical shape to dispatch_ipc_recv.
         dispatch_ipc_send:
+        // ---- Gate 0: cap-slot -> endpoint_id (R20b.M6-002 / #1565) ----
+        // ipc_slot_to_endpoint(cap_slot=rsi, required=R_IPC_WRITE | R_IPC_INVOKE = 0x0A)
+        // See dispatch_ipc_recv §Gate 0 for the rationale + push/pop discipline.
+        push rsi;                                 // save cap_slot           (%16==0)
+        push rdx;                                 // save user_hdr_va        (%16==8)
+        push rcx;                                 // save user_payload_va    (%16==0)
+        push r8;                                  // save payload_len        (%16==8)
+        sub rsp, 8;                               // align                    (%16==0)
+        mov rdi, rsi;                             // arg0 = cap_slot
+        mov rsi, 0x0A;                            // arg1 = R_IPC_WRITE | R_IPC_INVOKE
+        call ipc_slot_to_endpoint;                // rax = endpoint_id or -EBADF/-EACCES
+        mov r10, rax;                             // stash result across pops
+        add rsp, 8;                               //                          (%16==8)
+        pop r8;                                   //                          (%16==0)
+        pop rcx;                                  //                          (%16==8)
+        pop rdx;                                  //                          (%16==0)
+        pop rsi;                                  //                          (%16==8)
+        cmp r10, 0;
+        jl  dispatch_ipc_send_cap_err;            // signed<0 = errno
+        mov rsi, r10;                             // substitute resolved endpoint_id
+
         // ---- Gate A: user_ptr_ok(user_hdr_va, 8) ----
-        push rsi;                                 // save cap_slot / id     (%16==0)
+        push rsi;                                 // save endpoint_id       (%16==0)
         push rdx;                                 // save user_hdr_va       (%16==8)
         push rcx;                                 // save user_payload_va   (%16==0)
         push r8;                                  // save payload_len       (%16==8)
@@ -768,6 +958,10 @@ module Dispatch = structure {
         mov rax, 0xFFFFFFFFFFFFFFF2;              // -EFAULT
         ret;
 
+        dispatch_ipc_send_cap_err:
+        mov rax, r10;                             // propagate -EBADF or -EACCES
+        ret;
+
         // R20b.M3-002 (#1559): sysno 41 = sys_ipc_reply(cap_slot, user_hdr_va,
         // user_payload_va, payload_len) -> 0 | pass-through send rc |
         // -EFAULT | -EINVAL (bit-7 not set).
@@ -782,8 +976,31 @@ module Dispatch = structure {
         // helper) matches the existing dispatch layer's discipline — every
         // sysno has its own shim body per the linear cmp/je switch style.
         dispatch_ipc_reply:
+        // ---- Gate 0: cap-slot -> endpoint_id (R20b.M6-002 / #1565) ----
+        // ipc_slot_to_endpoint(cap_slot=rsi, required=R_IPC_WRITE | R_IPC_INVOKE = 0x0A)
+        // Reply's rights requirement matches send (WRITE|INVOKE) — the bit-7
+        // FRAME_OP_REPLY_BIT check is a body-side gate, not a cap-side one.
+        // See dispatch_ipc_recv §Gate 0 for the shared rationale.
+        push rsi;                                 // save cap_slot           (%16==0)
+        push rdx;                                 // save user_hdr_va        (%16==8)
+        push rcx;                                 // save user_payload_va    (%16==0)
+        push r8;                                  // save payload_len        (%16==8)
+        sub rsp, 8;                               // align                    (%16==0)
+        mov rdi, rsi;                             // arg0 = cap_slot
+        mov rsi, 0x0A;                            // arg1 = R_IPC_WRITE | R_IPC_INVOKE
+        call ipc_slot_to_endpoint;                // rax = endpoint_id or -EBADF/-EACCES
+        mov r10, rax;
+        add rsp, 8;
+        pop r8;
+        pop rcx;
+        pop rdx;
+        pop rsi;
+        cmp r10, 0;
+        jl  dispatch_ipc_reply_cap_err;
+        mov rsi, r10;                             // substitute resolved endpoint_id
+
         // ---- Gate A: user_ptr_ok(user_hdr_va, 8) ----
-        push rsi;                                 // save cap_slot / id
+        push rsi;                                 // save endpoint_id
         push rdx;                                 // save user_hdr_va
         push rcx;                                 // save user_payload_va
         push r8;                                  // save payload_len
@@ -830,6 +1047,10 @@ module Dispatch = structure {
 
         dispatch_ipc_reply_efault:
         mov rax, 0xFFFFFFFFFFFFFFF2;              // -EFAULT
+        ret;
+
+        dispatch_ipc_reply_cap_err:
+        mov rax, r10;                             // propagate -EBADF or -EACCES
         ret;
 
         // R20b.M3-003 (#1560): sysno 43 = sys_svc_lookup(user_name_va, name_len)

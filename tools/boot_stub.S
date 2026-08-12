@@ -1511,6 +1511,22 @@ sys_svc_lookup_ok_msg: .ascii "R20b SVC LOOKUP OK\n\0"
 sys_svc_lookup_fail_msg: .ascii "R20b SVC LOOKUP FAIL\n\0"
 
 
+# R20b.M6-002 (#1565): dispatch cap_slot lookup witness fingerprints —
+# closes the syscall-shim cap-lookup gate. Exercises the ipc_slot_to_endpoint
+# helper (src/kernel/core/syscall/dispatch.pdx) end-to-end via the modified
+# dispatch_ipc_recv shim: mint a KIND_IPC_ENDPOINT cap at a known cap_table
+# slot, invoke syscall_dispatch(sysno=40, cap_slot, ...), verify success on
+# a valid cap and appropriate -EBADF / -EACCES rejections on empty / wrong-
+# kind / insufficient-rights slots.
+.global sys_ipc_cap_slot_ok_msg
+.align 8
+sys_ipc_cap_slot_ok_msg: .ascii "R20b IPC CAP SLOT OK\n\0"
+
+.global sys_ipc_cap_slot_fail_msg
+.align 8
+sys_ipc_cap_slot_fail_msg: .ascii "R20b IPC CAP SLOT FAIL\n\0"
+
+
 # R20b.M4-001 (#1561): InitCap sidecar format + validator witness fingerprints
 # — first sub-issue of the R20b.M4 (loader capability-seed hook) branch.
 # Exercises init_caps_validate (src/kernel/core/loader/init_caps.pdx) against
