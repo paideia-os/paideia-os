@@ -1,0 +1,320 @@
+// src/kernel/core/syscall/handlers/sys_svc_lookup.pdx — R20b.M3-003 (#1560)
+// sys_svc_lookup body — name-resolution + client-side cap mint (sysno 43).
+//
+// Design context
+// --------------
+// Fourth (and closing) sub-issue of the R20b.M3 (server-process model)
+// branch. Closes M3 by turning the M1-003 broker (svc_lookup / svc_broker.pdx)
+// + M1-001 cap-mint helpers (cap/mint.pdx + cap/kind_endpoint.pdx) into
+// a single userspace-visible primitive: given the name "svc.<foo>",
+// materialise a KIND_IPC_ENDPOINT capability in a free slot of the
+// caller's cap_table and return the slot id.
+//
+// Per design/ipc/userspace-server-substrate.md §3.3 (broker) + §5.1
+// (syscall table):
+//
+//   sys_svc_lookup(user_name_va, name_len)
+//     -> free_slot_id            on success (rax in [0..255])
+//     -> -EINVAL (0xFFFF...FFEA) name_len == 0 or > 31
+//     -> -EFAULT (0xFFFF...FFF2) walker failure on the user name buffer
+//     -> -ENOENT (0xFFFF...FFFE) no broker row matches
+//     -> -ENOSPC (0xFFFF...FFE4) no free cap-table slot
+//
+// Layer split
+// -----------
+// Same layering the M3-001/002/003 siblings pinned: the body owns the
+// substrate logic (walker bounce + broker lookup + free-slot scan +
+// cap mint); the dispatch shim (syscall/dispatch.pdx §dispatch_svc_lookup)
+// owns the trust-boundary gate (#741 Layer 1 user_ptr_ok on the user
+// name buffer) and the SysV-arg marshalling into the body's (rdi=user_va,
+// rsi=name_len) contract.
+//
+// The body itself handles the KPTI-safe name bounce internally via
+// user_read_bytes_via_walk (per the sub-issue task's "mirror the M2-003
+// bounce for hdr/payload pattern" instruction). Owning the bounce here
+// mirrors the sys_ipc_recv_body / sys_ipc_send_body discipline — those
+// bodies call user_bounce_recv / user_bounce_send internally rather than
+// receiving pre-bounced payloads from dispatch. Consistent layering
+// across the four M3 syscall bodies simplifies the mental model.
+//
+// Rights & direction derivation
+// -----------------------------
+// The broker row carries the mint's rights_gate at +36 (u32). The cap
+// tail's direction field (KindEndpoint.ENDPOINT_DIR_*) is derived from
+// the rights bits present:
+//
+//   (rights_gate & R_IPC_READ) && (rights_gate & R_IPC_WRITE) -> BIDI (2)
+//   (rights_gate & R_IPC_READ)                                -> RECV (1)
+//   otherwise (WRITE-only, INVOKE-only, or empty)             -> SEND (0)
+//
+// This matches the design's server/client asymmetry — a broker publishing
+// a client-side endpoint via rights_gate = R_IPC_WRITE|R_IPC_INVOKE hands
+// out a SEND-side cap; a server publishing via R_IPC_READ|R_IPC_INVOKE
+// hands out a RECV-side cap; a supervisor bootstrap via R_IPC_ALL hands
+// out a BIDI cap. The direction refinement lives in the tail's [17:16]
+// bits per KindEndpoint.endpoint_tail_encode.
+//
+// Free-slot discipline
+// --------------------
+// A cap_table slot is "free" iff its kind field (u64 at slot*24 + 0) is
+// KIND_NULL (=0). Fresh .bss satisfies this. The scan walks slots 0..255
+// in order; the first slot with kind==0 wins. Boot witnesses may have
+// reserved specific slots (e.g. slot 10 = KIND_DMESG, slot 11 = witness
+// endpoint cap) — the scan skips those and returns the next free slot.
+//
+// R20b has a single global cap_table (cap/table.pdx — [u64; 768] backing
+// 256 x 24 B descriptors). "Caller's cap_table" is therefore just that
+// table; per-task cap_tables land with R21+ SMP (design/capabilities/
+// linearity-and-tags.md §2.4 defers the per-task split).
+//
+// -ENOSPC discrimination
+// ----------------------
+// If all 256 slots are in use, the body returns 0xFFFFFFFFFFFFFFE4 (-28).
+// -ENOSPC is chosen over -ENOMEM because the failure is a fixed-size
+// table exhaustion, not a general allocator failure — matches POSIX's
+// convention that "no space left on device" surfaces on fixed-capacity
+// pools (fd table, mq table, etc.).
+//
+// Effects / capabilities
+// ----------------------
+// !{mem, sysreg} @{cap}:
+//   mem     — user_read_bytes_via_walk reads user memory + writes the
+//             name scratch; svc_lookup_row reads _svc_broker_table;
+//             the free-slot scan reads cap_table; cap_mint_write writes
+//             the descriptor.
+//   sysreg  — user_read_bytes_via_walk transitively reads _current_tcb
+//             (per its own justification); mirrors the widening in
+//             sys_ipc_recv_body / sys_ipc_send_body.
+//   cap     — cap_mint_write requires @{cap} (writes into the capability
+//             table).
+//
+// No @{sched} — this body neither blocks nor wakes; it is pure state
+// mutation on cap_table + a table read of _svc_broker_table.
+//
+// Cross-references
+// ----------------
+//   design/ipc/userspace-server-substrate.md §3.3, §5.1, §8
+//   src/kernel/core/ipc/svc_broker.pdx (svc_lookup_row helper)
+//   src/kernel/core/cap/kind_endpoint.pdx (endpoint_tail_encode + rights)
+//   src/kernel/core/cap/mint.pdx (cap_mint_write ABI)
+//   src/kernel/core/cap/table.pdx (cap_table geometry)
+//   src/kernel/core/syscall/user_read.pdx (user_read_bytes_via_walk)
+//   src/kernel/core/syscall/handlers/sys_ipc_recv.pdx (M3-001 sibling)
+
+module SysSvcLookup = structure {
+
+  // ============================================================================
+  // Result-code sentinels — negative-errno u64s so a caller can `sar rax, 63`
+  // sign-test + branch identically to any other syscall. Kept as literals
+  // per paideia-as cross-module `let` semantics (endpoint_table.pdx
+  // §PENDING_PAYLOAD_MAX_BYTES convention).
+  //
+  // Success returns a slot id in [0..255] — well below any negative-errno
+  // sentinel (all of which have bit 63 set), so a single `cmp rax, 256`
+  // (`jae` = errno; `jb` = slot) discriminates cleanly at the caller.
+  // ============================================================================
+
+  pub let SYS_SVC_LOOKUP_ERR_EINVAL : u64 = 0xFFFFFFFFFFFFFFEA   // -22
+  pub let SYS_SVC_LOOKUP_ERR_EFAULT : u64 = 0xFFFFFFFFFFFFFFF2   // -14
+  pub let SYS_SVC_LOOKUP_ERR_ENOSPC : u64 = 0xFFFFFFFFFFFFFFE4   // -28
+  pub let SYS_SVC_LOOKUP_ERR_ENOENT : u64 = 0xFFFFFFFFFFFFFFFE   // -2
+
+  // ============================================================================
+  // Kernel-side scratch for the name-buffer walker bounce.
+  //
+  // Sized at 32 bytes (BROKER_NAME_BUF_BYTES per svc_broker.pdx — includes
+  // the NUL, but svc_lookup_row is length-explicit so no NUL required).
+  // The body caps its walker read at min(name_len, 31) and the range
+  // gate rejects any name_len > 31 before the walker fires, so the
+  // scratch is never written past byte 30.
+  //
+  // .bss placement (uninit): freshly zero on first boot; each call
+  // overwrites bytes 0..name_len in-place, so no explicit reset needed.
+  //
+  // Single-flow discipline: R20b's substrate is single-flow (design §14
+  // Q3) so no two callers concurrently touch this scratch. R21+ SMP
+  // moves it into the TCB slab — matches the deferral note in
+  // user_bounce.pdx §Kernel-side scratch discipline and
+  // sys_ipc_reply.pdx §Kernel-side scratch.
+  //
+  // @align(8) mirrors the discipline of every dispatch/body scratch
+  // (dispatch_open/read/write scratches, sys_ipc_reply_op_scratch); a
+  // bare [u8; 32] without the annotation would still occupy 32 B in a
+  // paideia-as .bss @align(8) span, so the explicit annotation is
+  // documentation as well as insurance.
+  // ============================================================================
+
+  pub let mut _sys_svc_lookup_name_scratch : [u8; 32] = uninit @align(8)
+
+  // ==========================================================================
+  // sys_svc_lookup_body(user_name_va, name_len) -> u64
+  //
+  // SysV ABI: rdi=user_name_va, rsi=name_len
+  //        -> rax = slot_id in [0..255] on success, OR one of:
+  //             SYS_SVC_LOOKUP_ERR_EINVAL (0xFFFFFFFFFFFFFFEA)  name_len 0 or > 31
+  //             SYS_SVC_LOOKUP_ERR_EFAULT (0xFFFFFFFFFFFFFFF2)  walker rejected
+  //             SYS_SVC_LOOKUP_ERR_ENOENT (0xFFFFFFFFFFFFFFFE)  no broker row
+  //             SYS_SVC_LOOKUP_ERR_ENOSPC (0xFFFFFFFFFFFFFFE4)  no free cap slot
+  //
+  // Register plan (5-push callee-save prologue aligns rsp %16 == 0 for
+  // nested calls; entry rsp %16 == 8 SysV; 5*8=40; 8+40=48; 48%16=0):
+  //   rbx = tail (survives cap_mint_write's caller-save clobber)
+  //   r12 = rights_gate (u64; survives to cap_mint_write's rights arg)
+  //   r13 = free slot id (survives to cap_mint_write + becomes rax return)
+  //   r14 = name_len (survives across the walker call to svc_lookup_row)
+  //   r15 = row PA (survives across endpoint_tail_encode / free-slot scan)
+  //
+  // Flow:
+  //   (1) Gate name_len in [1..31] -> -EINVAL. Reject at entry BEFORE
+  //       the walker so a caller passing name_len=1000 sees -EINVAL
+  //       instead of -EFAULT (distinct errno taxonomy is more useful
+  //       for debugging).
+  //   (2) user_read_bytes_via_walk(_sys_svc_lookup_name_scratch,
+  //       user_name_va, name_len) — KPTI-safe copy of the name into
+  //       the body's scratch. On walker failure -> -EFAULT.
+  //   (3) svc_lookup_row(scratch, name_len) -> row_pa. On 0 -> -ENOENT.
+  //   (4) Read the packed u64 at [row+32]: low 16 = endpoint_id,
+  //       bits 32..63 = rights_gate (per svc_broker.pdx §BrokerEntry).
+  //   (5) Derive direction from rights_gate's low 2 bits:
+  //         both READ+WRITE -> BIDI (2); READ-only -> RECV (1);
+  //         else (WRITE-only, INVOKE-only) -> SEND (0).
+  //   (6) endpoint_tail_encode(endpoint_id, direction) -> tail (u64).
+  //   (7) Free-slot scan of cap_table: first slot in [0..255] whose
+  //       kind field (u64 at slot*24 + 0) is KIND_NULL (=0). No free ->
+  //       -ENOSPC.
+  //   (8) cap_mint_write(slot, KIND_IPC_ENDPOINT=5, rights_gate_u64, tail)
+  //       — writes the 24-byte descriptor at cap_table + slot*24.
+  //   (9) Return the slot id in rax.
+  // ==========================================================================
+
+  pub let sys_svc_lookup_body : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (user_name_va: u64, name_len: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap},
+      justification: "R20b.M3-003 (#1560): sys_svc_lookup body — walker-bounce user name into a kernel scratch, look up the broker row, mint a KIND_IPC_ENDPOINT cap in a free cap_table slot with the row's rights_gate + a direction derived from those rights bits. 5-push callee-save prologue (rbx/r12/r13/r14/r15) aligns rsp %16 == 0 for nested calls AND preserves the tail (rbx), rights_gate (r12), free slot id (r13), name_len (r14), and row PA (r15) across four nested calls (user_read_bytes_via_walk, svc_lookup_row, endpoint_tail_encode, cap_mint_write) whose caller-save clobbers cover the SysV scratch set. Flow: (a) Gate name_len in [1..31] -> -EINVAL at entry, before any walker call (cheaper failure mode and distinct errno taxonomy vs. -EFAULT). Save name_len to r14 first so the walker's caller-save clobber can't lose it. (b) `call user_read_bytes_via_walk` with rdi=&_sys_svc_lookup_name_scratch, rsi=user_name_va (already in rdi at entry, need to shuffle), rdx=name_len. rax = 0 (OK) or 0xFFFFFFFFFFFFFFF2 (-EFAULT). Note the arg shuffle: user_name_va arrives in rdi and must become rsi (walker's user_va arg); rdi becomes the kernel_dst scratch address. Both need to hold across the shuffle -- but we don't need user_name_va again after this call, so it's a one-way move. (c) `cmp rax, 0; jne sys_svc_lookup_done_efault` -- propagate walker failure verbatim. (d) `call svc_lookup_row(name_ptr=&scratch, name_len=r14)` with rdi=&scratch, rsi=r14. rax = row PA on hit, 0 on miss. `cmp rax, 0; je sys_svc_lookup_done_enoent`. Save row PA to r15. (e) Read packed u64 at [r15+32]: `mov r10, [r15+32]`. Extract endpoint_id (low 16): `mov rdi, r10; and rdi, 0xFFFF`. Extract rights_gate (bits 32..63): `mov r12, r10; shr r12, 32` -- rights_gate now in low 32 bits of r12, upper 32 clear (right-shift of a u64 zero-fills). Store rights_gate to r12 (survives cap_mint_write). (f) Derive direction from rights_gate's low 2 bits: `mov r10, r12; and r10, 0x03` (R_IPC_READ|R_IPC_WRITE mask). `cmp r10, 0x03; je dir_bidi` (both -> BIDI=2). `cmp r10, 0x01; je dir_recv` (READ-only -> RECV=1). Fall-through: SEND=0 (WRITE-only, INVOKE-only, or empty). Direction lands in rsi as arg1 to endpoint_tail_encode. (g) `call endpoint_tail_encode(endpoint_id=rdi, direction=rsi)` -- pure encoder, no side effects. rax = tail. Save to rbx (survives). (h) Free-slot scan of cap_table for slot in [0..256): compute slot_pa = cap_table + slot*24 (via slot*8 + slot*16 -- same shift-add pattern as cap/verify.pdx L67-71 and cap/mint.pdx L105-108, avoids imul). Load [slot_pa+0] (kind, u64); `cmp rax, 0; je slot_found` (kind==KIND_NULL means free). Advance slot; if slot == 256 -> -ENOSPC. Save free slot to r13. (i) `call cap_mint_write(slot=r13, kind=5=KIND_IPC_ENDPOINT, rights=r12, target_ptr=rbx=tail)` -- SysV: rdi=slot, rsi=kind, rdx=rights, rcx=target_ptr. Writes 24-byte descriptor at cap_table + slot*24. Return void. (j) `mov rax, r13; jmp done` -- return slot id. Error paths (bad_arg, no_entry, no_space, efault) each load rax with the corresponding sentinel and fall through to the common epilogue (pop 5 regs + ret). Cross-module `call svc_lookup_row` proven by dispatch.pdx §dispatch_ipc_recv cross-module `call sys_ipc_recv_body` (PLT32 relocation resolved at link time). Cross-file `cap_table` symbol reference proven by cap/verify.pdx L67 + cap/mint.pdx L103. Widening rationale: !{mem,sysreg} @{cap} -- mem from walker + broker/cap_table scans + cap_mint_write; sysreg from user_read_bytes_via_walk's transitive _current_tcb read; cap from cap_mint_write. No @{sched} -- body never blocks or wakes.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Save name_len to r14 (survives walker + svc_lookup_row calls) ----
+        mov r14, rsi;                            // r14 = name_len
+
+        // ---- Gate: name_len in [1..31] ----
+        cmp r14, 0;
+        je  sys_svc_lookup_done_einval;
+        cmp r14, 31;                             // BROKER_NAME_MAX
+        ja  sys_svc_lookup_done_einval;
+
+        // ---- Step (b): walker-bounce user_name_va into kernel scratch ----
+        // user_read_bytes_via_walk(kernel_dst=scratch, user_va=user_name_va, len=name_len)
+        // Current: rdi=user_name_va, r14=name_len.
+        // Want:    rdi=&scratch, rsi=user_name_va, rdx=name_len.
+        mov rsi, rdi;                            // rsi = user_name_va (was in rdi)
+        lea rdi, [rip + _sys_svc_lookup_name_scratch]; // rdi = kernel_dst
+        mov rdx, r14;                            // rdx = name_len
+        call user_read_bytes_via_walk;           // rax = 0 (OK) or -EFAULT
+        cmp rax, 0;
+        jne sys_svc_lookup_done_efault;
+
+        // ---- Step (d): svc_lookup_row(scratch, name_len) ----
+        lea rdi, [rip + _sys_svc_lookup_name_scratch];
+        mov rsi, r14;                            // name_len
+        call svc_lookup_row;                     // rax = row PA or 0
+        cmp rax, 0;
+        je  sys_svc_lookup_done_enoent;
+        mov r15, rax;                            // r15 = row PA (survives)
+
+        // ---- Step (e): extract endpoint_id (u16 at row+32) + rights_gate (u32 at row+36) ----
+        // Packed u64 at [row+32]: low 16 = endpoint_id, bits 16..31 = reserved,
+        // bits 32..63 = rights_gate. Single load, two extracts.
+        mov r10, [r15 + 32];                     // BROKER_OFF_ENDPOINT_ID (packed u64)
+        mov rdi, r10;
+        and rdi, 0xFFFF;                         // rdi = endpoint_id (for endpoint_tail_encode arg0)
+        mov r12, r10;
+        shr r12, 32;                             // r12 = rights_gate (u32 zero-extended)
+
+        // ---- Step (f): derive direction from rights_gate's low 2 bits ----
+        // R_IPC_READ=0x01, R_IPC_WRITE=0x02, R_IPC_INVOKE=0x08 (kind_endpoint.pdx).
+        // Direction: READ+WRITE -> BIDI (2); READ-only -> RECV (1);
+        //            WRITE-only / INVOKE-only / empty -> SEND (0).
+        mov r10, r12;
+        and r10, 0x03;                           // isolate READ|WRITE bits
+        mov rsi, 0;                              // default: SEND (0)
+        cmp r10, 0x03;
+        je  sys_svc_lookup_dir_bidi;
+        cmp r10, 0x01;
+        je  sys_svc_lookup_dir_recv;
+        jmp sys_svc_lookup_dir_done;
+      sys_svc_lookup_dir_bidi:
+        mov rsi, 2;                              // ENDPOINT_DIR_BIDI
+        jmp sys_svc_lookup_dir_done;
+      sys_svc_lookup_dir_recv:
+        mov rsi, 1;                              // ENDPOINT_DIR_RECV
+      sys_svc_lookup_dir_done:
+
+        // ---- Step (g): endpoint_tail_encode(endpoint_id, direction) ----
+        // rdi already carries endpoint_id; rsi = direction.
+        call endpoint_tail_encode;               // rax = tail
+        mov rbx, rax;                            // rbx = tail (survives cap_mint_write)
+
+        // ---- Step (h): scan cap_table for a free slot (kind == KIND_NULL) ----
+        // slot_pa(i) = cap_table + i*24 = cap_table + i*8 + i*16
+        // Same shift-add pattern as cap/verify.pdx L67-71 (avoids imul).
+        xor r13, r13;                            // r13 = slot idx (0..255)
+      sys_svc_lookup_scan:
+        cmp r13, 256;                            // CAP_SLAB_CAPACITY
+        jae sys_svc_lookup_done_enospc;
+        mov r10, r13;
+        shl r10, 3;                              // r10 = slot*8
+        mov r11, r13;
+        shl r11, 4;                              // r11 = slot*16
+        add r10, r11;                            // r10 = slot*24
+        mov rax, cap_table;
+        add rax, r10;                            // rax = &cap_table[slot]
+        mov rcx, [rax + 0];                      // kind (u64)
+        cmp rcx, 0;                              // KIND_NULL
+        je  sys_svc_lookup_slot_found;
+        add r13, 1;
+        jmp sys_svc_lookup_scan;
+
+      sys_svc_lookup_slot_found:
+        // ---- Step (i): cap_mint_write(slot, KIND_IPC_ENDPOINT, rights, tail) ----
+        // ABI (mint.pdx L97): rdi=slot, rsi=kind, rdx=rights, rcx=target_ptr.
+        mov rdi, r13;                            // slot
+        mov rsi, 5;                              // KIND_IPC_ENDPOINT
+        mov rdx, r12;                            // rights = rights_gate (u64)
+        mov rcx, rbx;                            // target_ptr = tail
+        call cap_mint_write;                     // void return
+
+        // ---- Step (j): return slot id ----
+        mov rax, r13;
+        jmp sys_svc_lookup_done;
+
+      sys_svc_lookup_done_einval:
+        mov rax, 0xFFFFFFFFFFFFFFEA;             // -EINVAL
+        jmp sys_svc_lookup_done;
+
+      sys_svc_lookup_done_efault:
+        mov rax, 0xFFFFFFFFFFFFFFF2;             // -EFAULT
+        jmp sys_svc_lookup_done;
+
+      sys_svc_lookup_done_enoent:
+        mov rax, 0xFFFFFFFFFFFFFFFE;             // -ENOENT
+        jmp sys_svc_lookup_done;
+
+      sys_svc_lookup_done_enospc:
+        mov rax, 0xFFFFFFFFFFFFFFE4;             // -ENOSPC
+
+      sys_svc_lookup_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+}

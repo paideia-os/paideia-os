@@ -27,7 +27,7 @@ set -euo pipefail
 ELF="${1:-build/kernel.elf}"
 FAIL=0
 CHECKS_PASSED=0
-TOTAL_CHECKS=18
+TOTAL_CHECKS=19
 
 if [[ ! -f "$ELF" ]]; then
     echo "KERNEL SYSCALL DISPATCH FAIL" >&2
@@ -275,6 +275,21 @@ if grep -q "cmp.*0x2a" "$DISPATCH_FILE" && grep -q "sys_ipc_send_body" "$DISPATC
     CHECKS_PASSED=$((CHECKS_PASSED + 1))
 else
     echo "[FAIL] ID 42 (ipc_send): cmp missing or sys_ipc_send_body call missing"
+    FAIL=1
+fi
+
+# Check 19: ID 43 (0x2b) route to sys_svc_lookup_body (R20b.M3-003 / #1560).
+# The dispatch shim performs a single user_ptr_ok gate on (user_name_va,
+# name_len) — the body then owns the KPTI-safe name-buffer bounce via
+# user_read_bytes_via_walk and the client cap-slot mint. Closes the
+# R20b.M3 (server-process model) milestone (last of sysnos 40..43).
+# Requires both the cmp gate AND a call to sys_svc_lookup_body in the
+# dispatcher body.
+if grep -q "cmp.*0x2b" "$DISPATCH_FILE" && grep -q "sys_svc_lookup_body" "$DISPATCH_FILE"; then
+    echo "[ok]   ID 43 (svc_lookup): routes to sys_svc_lookup_body"
+    CHECKS_PASSED=$((CHECKS_PASSED + 1))
+else
+    echo "[FAIL] ID 43 (svc_lookup): cmp missing or sys_svc_lookup_body call missing"
     FAIL=1
 fi
 

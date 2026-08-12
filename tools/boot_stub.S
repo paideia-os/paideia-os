@@ -1493,6 +1493,23 @@ sys_ipc_send_ok_msg: .ascii "R20b SYS IPC SEND OK\n\0"
 .align 8
 sys_ipc_send_fail_msg: .ascii "R20b SYS IPC SEND FAIL\n\0"
 
+
+# R20b.M3-003 (#1560): sys_svc_lookup syscall witness fingerprints — fourth
+# (and closing) sub-issue of the R20b.M3 (server-process model) branch.
+# Exercises sys_svc_lookup_body directly: walker-bounce a user-VA name
+# into the body's kernel scratch, look up the broker row, mint a
+# KIND_IPC_ENDPOINT cap in a free cap_table slot with the row's rights_gate
+# + a direction derived from those rights bits, and return the slot id.
+# See src/kernel/core/syscall/handlers/sys_svc_lookup.pdx (M3-003 body)
+# and src/kernel/core/syscall/dispatch.pdx (sysno 43 dispatch shim).
+.global sys_svc_lookup_ok_msg
+.align 8
+sys_svc_lookup_ok_msg: .ascii "R20b SVC LOOKUP OK\n\0"
+
+.global sys_svc_lookup_fail_msg
+.align 8
+sys_svc_lookup_fail_msg: .ascii "R20b SVC LOOKUP FAIL\n\0"
+
 # svc.<name> strings for the R20b.M1-003 (#1554) broker witness.
 # ASCII bytes only; no NUL required (svc_register / svc_lookup are
 # length-explicit), but a trailing NUL keeps the buffer safe for casual
