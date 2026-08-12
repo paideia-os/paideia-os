@@ -1611,6 +1611,31 @@ echo_roundtrip_ok_msg: .ascii "R20b ECHO ROUNDTRIP OK\n\0"
 .align 8
 echo_roundtrip_fail_msg: .ascii "R20b ECHO ROUNDTRIP FAIL\n\0"
 
+# R20b.M6-003 (#1566): dual-endpoint RPC roundtrip witness fingerprints —
+# closes R20b.M6 (substrate hardening; unblocks #820 acpi_supervisor +
+# #860 pci_enumerator as real userspace tasks). Proves the same-endpoint
+# request/reply race documented in
+# design/ipc/userspace-server-substrate.md §4.4 is closed by the
+# dual-endpoint pattern:
+#   Client sends request to server endpoint (ep=1) with
+#     hdr.reply_endpoint_id = client's reply endpoint (ep=2).
+#   Server drains from ep=1, preserves reply_endpoint_id in the reply hdr,
+#     flips bit 7 of op, calls sys_ipc_reply — which reads
+#     reply_endpoint_id from the hdr and publishes to ep=2 (NOT ep=1).
+#   Client drains reply from ep=2 — no race with the server's next-recv
+#     on ep=1 (they live in disjoint endpoints).
+# Witness lives kernel-side in kernel_main.pdx (m6_rpc_witness label);
+# echo_server + echo_client userspace binaries embedded for the shape but
+# the "real 2-task scheduler-driven" spawn is deferred to R21+ per
+# §4.4 "Deferred" paragraph.
+.global rpc_roundtrip_ok_msg
+.align 8
+rpc_roundtrip_ok_msg: .ascii "R20b RPC ROUNDTRIP OK\n\0"
+
+.global rpc_roundtrip_fail_msg
+.align 8
+rpc_roundtrip_fail_msg: .ascii "R20b RPC ROUNDTRIP FAIL\n\0"
+
 # svc.<name> string for the R20b.M5-001 (#1563) echo witness — used both
 # as the broker key (svc_register 3rd-arg scan at kernel VA) AND as the
 # body-input for sys_svc_lookup_body's walker copy (published to init's

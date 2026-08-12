@@ -431,6 +431,47 @@ case "${EXPECTED}" in
         TIMEOUT=10
         EXPECTED=""
         ;;
+    boot_r20b_rpc)
+        # R20b.M6-003 (#1566): dual-endpoint RPC roundtrip witness —
+        # closes R20b.M6 (substrate hardening; unblocks #820 acpi_supervisor
+        # + #860 pci_enumerator as real userspace tasks).
+        #
+        # Kernel wire-in (src/kernel/boot/kernel_main.pdx §m6_rpc_witness,
+        # immediately after m5_echo_witness_done and before sti): the
+        # kernel-driven dual-endpoint roundtrip proves the substrate fix
+        # documented in design/ipc/userspace-server-substrate.md §4.4
+        # (Option A compact variant — flags field of the v1 hdr
+        # repurposed as reply_endpoint_id; sys_ipc_reply_body reads it
+        # and routes the reply to the client's reply endpoint instead
+        # of the server's own endpoint, closing the same-endpoint
+        # request/reply race).
+        #
+        # Fingerprint contract (contains-in-order — narrow slice of the
+        # boot_r20b_echo matrix focused on the M6-003 closure):
+        #   R20b ECHO ROUNDTRIP OK   (M5-001; anchors ordering)
+        #   R20b RPC ROUNDTRIP OK    (M6-003 — R20b.M6 close)
+        # Any regression that breaks M6-003 without breaking M5-001
+        # surfaces here as the missing RPC line; the M5 line stays as
+        # ordering anchor so a broken M5 witness is diagnosed by
+        # boot_r20b_echo (the fuller fingerprint) instead.
+        #
+        # Opt-in only (guarded by PAIDEIA_R20B_RPC=1 in pre-push): the
+        # M6-003 witness spawns ~350 lines of kernel-side orchestration
+        # (2 endpoint allocs + 8-step client/server round trip + byte-
+        # exact verify per hop + 3 endpoint_is_full state assertions).
+        # The OK fingerprint appears in EVERY boot log (the witness is
+        # unconditionally wired inside kernel_main) but only this mode
+        # asserts its presence; boot_r20b_echo also asserts it as part
+        # of the fuller M1..M6 fingerprint. Promotes to the default
+        # matrix after 5/5 consecutive passes on the standard R20b round.
+        #
+        # NOT SMP (UP-only substrate at R20b per §14 Q3).
+        # NOT UART-RX (kernel-driven; no ring-3 involvement at M6-003).
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r20b/expected-rpc-roundtrip.txt"
+        TIMEOUT=10
+        EXPECTED=""
+        ;;
     boot_r21_msix_round_robin)
         # R21-M4-005 (#841): MSI-X round-robin structural smoke.
         #

@@ -168,6 +168,149 @@ Each endpoint owns exactly one 4 KiB page (allocated at kernel boot in `_ipc_pay
 
 ---
 
+## 4.4 Same-endpoint request/reply resolution (R20b.M6-003, #1566)
+
+**Problem.** §4.3 pins a single in-flight message per endpoint (single-slot
+`pending_hdr` on the endpoint row). Under that discipline, a naive
+same-endpoint request/reply pattern deadlocks the reply direction:
+
+```
+1. Server: sys_ipc_recv(ep=1)      // blocks, waiter=server
+2. Client: sys_ipc_send(ep=1, req) // publishes; wakes server
+3. Client: sys_ipc_recv(ep=1, ...) // endpoint holds req (not drained yet)
+                                    //   → client drains its OWN request!
+```
+
+Even without the client racing itself, the *server* can accidentally drain
+its own reply: after `sys_ipc_reply`, the endpoint's `pending_hdr` slot is
+non-zero (holding the reply). The server loops back to `sys_ipc_recv` on
+the same endpoint and immediately drains the reply as if it were a new
+request — semantic corruption.
+
+**Options considered.**
+
+| Option | Mechanism | Cost | Verdict |
+|---|---|---|---|
+| A. Dual endpoints — reply header carries `reply_endpoint_id` | Client mints a reply endpoint; encodes its id in the request hdr; server's `sys_ipc_reply` publishes to that endpoint | 1 extra endpoint per client + header field | **Chosen (compact variant).** |
+| B. Yield-hint on reply — scheduler cooperates | `sys_ipc_reply` sets a reply-pending bit, wakes client, force-yields server | Invasive scheduler-hint infra; still needs a second slot or lane discipline for reply | Rejected — scheduler churn without solving lane confusion. |
+| C. Bounded ring per endpoint — request lane + reply lane | Two `pending_hdr` slots + two payload arenas per endpoint | 2× payload storage + lane discriminator arg on recv/reply | Rejected — larger memory footprint AND changes recv/reply syscall shape. |
+
+**Chosen — Option A (compact variant).** The wire-format change is
+minimized by *repurposing the reserved `flags` u16 field of the existing
+8-byte header as `reply_endpoint_id`*. No header-size growth; no
+`FRAME_MAX_PAYLOAD` reduction; no endpoint row-layout change (`pending_hdr`
+stays 8 bytes at row +24). The trade-off is that the `flags` field
+(previously reserved MUST-be-zero in v1) is no longer available for
+future flag bits at v1 — a future v3 header that needs true flag bits
+must widen the header explicitly. This is acceptable at R20b because
+(1) no existing site consumed `flags` bits (§4.1 v1 pins `flags` = 0),
+and (2) header widening is a v-bump-gated change the substrate can
+absorb cleanly if it becomes necessary.
+
+**Repurposed header layout (semantic v2, byte-compatible with v1):**
+
+```
++------+------+-------------+---------------------+
+|  op  |  ver | reply_ep_id |    payload_len      |
++------+------+-------------+---------------------+
+   u8     u8     LE-16              LE-32
+   +0     +1    +2..+3            +4..+7
+```
+
+`reply_endpoint_id` is a u16 in [0, 127]:
+- `0` — **legacy "reply-on-source" semantic**. `sys_ipc_reply` publishes
+  to the endpoint the *request* was received on (the endpoint identified
+  by the reply's cap_slot). Preserves byte-compat with every R20b.M1..M5
+  witness and every one-way message pattern. This is the SAME-ENDPOINT
+  behavior; safe iff the caller sequences the send/reply/recv strictly
+  (as every kernel-driven witness does).
+- `[1, 127]` — **dual-endpoint semantic**. `sys_ipc_reply` publishes to
+  the endpoint identified by `reply_endpoint_id`, regardless of the
+  reply's cap_slot. The client's own reply endpoint receives the reply;
+  the server's endpoint stays available for the next request; no
+  same-endpoint race.
+
+**Wire protocol — dual-endpoint round trip:**
+
+1. Client mints (or is seeded, via `_init_caps` per M4-001) a *reply*
+   endpoint (say `endpoint_id=2`) with `R_IPC_READ | R_IPC_INVOKE` in a
+   distinct cap_slot (e.g. cap_slot 1).
+2. Client encodes the request header with
+   `reply_endpoint_id = 2` and calls
+   `sys_ipc_send(server_cap_slot, hdr_va, payload_va, len)`.
+3. Client calls `sys_ipc_recv(reply_cap_slot, hdr_va, payload_va, max)` —
+   blocks on `endpoint_id=2`.
+4. Server drains the request via `sys_ipc_recv(server_cap_slot, ...)`;
+   sees `hdr.reply_endpoint_id = 2` in the drained hdr.
+5. Server processes, sets `hdr.op |= 0x80` (`FRAME_OP_REPLY_BIT`),
+   preserves `reply_endpoint_id = 2` in the hdr, and calls
+   `sys_ipc_reply(server_cap_slot, hdr_va, payload_va, len)`.
+6. `sys_ipc_reply_body` reads the first 4 bytes of the hdr via the
+   KPTI-safe walker, extracts `reply_endpoint_id`, and — because it is
+   non-zero — publishes to `endpoint_id=2` (client's reply endpoint),
+   waking the client.
+7. Client returns from `sys_ipc_recv` with the reply payload.
+8. Server loops back to `sys_ipc_recv(server_cap_slot, ...)` — endpoint
+   is empty (only the request lived there, and the reply went to a
+   different endpoint), so server blocks cleanly for the next request.
+
+**Capability model at R20b.** The server does not hold a cap for the
+client's reply endpoint. The kernel trusts `hdr.reply_endpoint_id`
+because the request came in on a valid cap the server holds — this is a
+"reply back to whatever the request said" trust discipline. A future
+round (R21+) can tighten this via an implicit reply-cap minted at
+`sys_ipc_recv` time (granting the server one-shot `R_IPC_WRITE` on
+`reply_endpoint_id`) or via explicit cap-transfer in the header. R20b
+does neither and documents the trust discipline here.
+
+**Impact on existing sites.**
+
+- `frame.pdx` — u16 field at offset +2 renamed from `flags` to
+  `reply_endpoint_id` in docs; accessor `frame_hdr_reply_endpoint_id`
+  added as an alias for the byte-identical `frame_hdr_flags`.
+- `sys_ipc_reply.pdx` — walker read grows from 1 byte (op) to 4 bytes
+  (op + ver + reply_endpoint_id); bit-7 op check unchanged; new logic:
+  if `reply_endpoint_id != 0` override the cap-resolved endpoint id.
+- `sys_ipc_send.pdx` / `user_bounce.pdx` / `endpoint_table.pdx` — no
+  functional change (hdr copy is still 8 bytes; publish/take semantics
+  unchanged).
+- All kernel-driven witnesses (M2/M3/M5) — pass `flags = 0` in
+  `frame_encode`, which is now `reply_endpoint_id = 0`, which selects
+  the legacy same-endpoint behavior. Their kernel-side sequential drive
+  never triggered the race, so their behavior is preserved bit-exact.
+
+**Witness — R20b.M6-003 (dual-endpoint kernel-driven roundtrip).** A new
+witness in `kernel_main.pdx` (extends the M5-001 witness placement)
+allocates two endpoints, drives the full 8-step protocol above
+kernel-side (mirrors M5-001's discipline of direct
+`sys_ipc_send_body` / `sys_ipc_recv_body` / `sys_ipc_reply_body`
+calls against init's user_pml4), and emits
+`R20b RPC ROUNDTRIP OK` on success. Proves the substrate fix without
+requiring the loader + scheduler wiring for spawning two real
+userspace tasks.
+
+**Deferred (out of scope for R20b.M6-003).**
+
+- **Real 2-task scheduler-driven roundtrip** — spawning both
+  `echo_server` and `echo_client` as real userspace tasks with their
+  `_init_caps` sidecars processed and letting the scheduler alternate
+  them requires: (1) loader-side path to spawn tasks other than init
+  at boot with their sidecars; (2) tmpfs seeding of both binaries;
+  (3) init modifications to fork+exec each and wait4 both. The
+  `src/user/echo_server.pdx` + `src/user/echo_client.pdx` source
+  files land at R20b.M6-003 as the target-shape for this deferred
+  witness, but their spawn wiring is a future round (R21+ once
+  multi-task boot orchestration lands).
+- **Reply-cap minting at recv** — kernel-mints a short-lived
+  `R_IPC_WRITE` cap on `reply_endpoint_id` into the server's cap_table
+  at `sys_ipc_recv` time, so `sys_ipc_reply` gates against a real cap.
+  R21+.
+- **Cap-transfer in header** — client transfers a `R_IPC_WRITE` cap on
+  its reply endpoint via the header (session-type-shaped). R21+ session
+  types round.
+
+---
+
 ## 5. M3 — Server-process model
 
 ### 5.1 Syscall numbers

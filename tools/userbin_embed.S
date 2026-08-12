@@ -3,6 +3,7 @@
 # R15-M6-009 (#560): Embed child_hello binary alongside init.
 # R17.M5 #638:      Embed /bin/true (trivial child-process test binary).
 # R20b.M5-001 (#1563): Embed echo_server (R20b userspace-server closure witness).
+# R20b.M6-003 (#1566): Embed echo_client (dual-endpoint RPC target-shape).
 .section .rodata.userbin, "a", @progbits
 .balign 4096
 .global _shell_bin_start
@@ -34,4 +35,10 @@ _echo_server_bin_start:
 .incbin "build/user/echo_server.elf"
 .global _echo_server_bin_end
 _echo_server_bin_end:
+.balign 4096
+.global _echo_client_bin_start
+_echo_client_bin_start:
+.incbin "build/user/echo_client.elf"
+.global _echo_client_bin_end
+_echo_client_bin_end:
 .balign 4096

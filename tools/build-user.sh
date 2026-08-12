@@ -12,6 +12,7 @@ INIT_LINK_SCRIPT="${USER_SRC}/init.ld"
 CHILD_HELLO_LINK_SCRIPT="${USER_SRC}/child_hello.ld"
 TRUE_LINK_SCRIPT="${USER_SRC}/true.ld"
 ECHO_SERVER_LINK_SCRIPT="${USER_SRC}/echo_server.ld"
+ECHO_CLIENT_LINK_SCRIPT="${USER_SRC}/echo_client.ld"
 
 if [[ ! -f "${SHELL_LINK_SCRIPT}" ]]; then
     echo "shell linker script missing: ${SHELL_LINK_SCRIPT}" >&2
@@ -38,6 +39,11 @@ if [[ ! -f "${ECHO_SERVER_LINK_SCRIPT}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${ECHO_CLIENT_LINK_SCRIPT}" ]]; then
+    echo "echo_client linker script missing: ${ECHO_CLIENT_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 
@@ -48,6 +54,7 @@ INIT_OBJECTS=()
 CHILD_HELLO_OBJECTS=()
 TRUE_OBJECTS=()
 ECHO_SERVER_OBJECTS=()
+ECHO_CLIENT_OBJECTS=()
 LIBS_OBJECTS=()
 
 while IFS= read -r -d '' pdx; do
@@ -73,6 +80,12 @@ while IFS= read -r -d '' pdx; do
         # four IPC syscalls; same one-file-one-ELF discipline as child_hello /
         # true) so its object goes to its own set only — no library pull-in.
         ECHO_SERVER_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "echo_client.pdx" ]]; then
+        # R20b.M6-003 (#1566): echo_client.pdx is self-contained (inlines its
+        # three syscalls — sys_ipc_send/recv + sys_exit) so its object goes
+        # to its own set only — no library pull-in. Sidecar seeds TWO cap
+        # slots (server + reply endpoints) for the dual-endpoint pattern.
+        ECHO_CLIENT_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "syscall_shim.pdx" ]] || [[ "${rel}" == "errno.pdx" ]] || [[ "${rel}" == "string.pdx" ]]; then
         # These are library modules needed by both shell and init
         LIBS_OBJECTS+=("${obj}")
@@ -210,4 +223,28 @@ if [[ ${#ECHO_SERVER_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/echo_server.elf"
     echo "[ok] ${BUILD_DIR}/echo_server.bin"
+fi
+
+# Link echo_client.elf with echo_client objects only (R20b.M6-003 #1566).
+# Self-contained (inlines its three syscalls — sys_ipc_send/recv + sys_exit);
+# mirrors child_hello.elf / true.elf / echo_server.elf pattern. Declares an
+# `_init_caps` sidecar with TWO entries: cap_slot 0 → server endpoint
+# (endpoint_id=1, WRITE|INVOKE), cap_slot 1 → client's reply endpoint
+# (endpoint_id=2, READ|INVOKE). At R20b.M6-003 the sidecar exists in
+# .rodata and is shape-verified at build; the kernel M6-003 witness drives
+# the dual-endpoint roundtrip kernel-side against init's user_pml4 rather
+# than spawning echo_client as a userspace task (see the `R20b.M6 posture
+# note` in the source header). Runtime spawn wires up post-R20b.
+if [[ ${#ECHO_CLIENT_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T echo_client.ld -> echo_client.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${ECHO_CLIENT_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/echo_client.elf" \
+        "${ECHO_CLIENT_OBJECTS[@]}"
+
+    echo "[objcopy-user] echo_client.elf -> echo_client.bin"
+    objcopy -O binary "${BUILD_DIR}/echo_client.elf" "${BUILD_DIR}/echo_client.bin"
+
+    echo "[ok] ${BUILD_DIR}/echo_client.elf"
+    echo "[ok] ${BUILD_DIR}/echo_client.bin"
 fi
