@@ -1465,6 +1465,29 @@ driver_lifecycle_ok_msg: .ascii "R29 LIFECYCLE FSM OK\n\0"
 driver_lifecycle_fail_msg: .ascii "R29 LIFECYCLE FSM FAIL\n\0"
 
 
+# R29.M2-004 (#1026): driver lifecycle FSM fuzz witness fingerprints.
+# Runs a 1000-iteration Knuth-LCG fuzz over the six-state FSM: for each
+# iter, derives (cur, new) from the LCG state, seeds driver row slot=0
+# with cur via driver_table_write_state_byte, computes the whitelist
+# predicate via driver_lifecycle_transition_valid(cur, new), invokes
+# driver_lifecycle_transition(0, new), and asserts the two agree
+# (predicate == 1 iff transition returns OK AND state == new;
+#  predicate == 0 iff transition returns non-zero AND state unchanged).
+# The 3-bit (cur, new) slice covers values in [0..8), forcing ~25%
+# of iters to exercise ERR_UNKNOWN_STATE / ERR_INVALID_TRANSITION paths.
+# See:
+#   - src/kernel/core/driver/lifecycle.pdx (FSM primitives)
+#   - src/kernel/boot/kernel_main.pdx §driver_lifecycle_fuzz_witness
+#   - design/ipc/driver-lifecycle-schema.md §6 (kernel-side coupling)
+.global driver_lifecycle_fuzz_ok_msg
+.align 8
+driver_lifecycle_fuzz_ok_msg: .ascii "R29 LIFECYCLE FUZZ OK\n\0"
+
+.global driver_lifecycle_fuzz_fail_msg
+.align 8
+driver_lifecycle_fuzz_fail_msg: .ascii "R29 LIFECYCLE FUZZ FAIL\n\0"
+
+
 # R20b.M1-002 (#1553): endpoint_table + payload_arena witness fingerprints —
 # exercises endpoint_alloc/endpoint_free/endpoint_lookup round-trip on the
 # full 128-slot range AND payload_buf_pa_for(0..127) 4 KiB-alignment +
