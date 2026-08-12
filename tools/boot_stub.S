@@ -1548,6 +1548,27 @@ loader_seed_ok_msg: .ascii "R20b LOADER SEED OK\n\0"
 loader_seed_fail_msg: .ascii "R20b LOADER SEED FAIL\n\0"
 
 
+# R20b.M6-001 (#1564): loader phase-2 ELF-symbol walker witness fingerprints
+# — retires the R20b.M4-002 (#1562) empty-sidecar wire-in in elf_lite_load.
+# Drives a real elf_lite_load call against echo_server.elf (the only current
+# userspace image that declares an _init_caps / _init_caps_count sidecar per
+# src/user/echo_server.pdx L96-107) and asserts the walker
+# (loader_seed_caps_from_symtab in src/kernel/core/loader/seed_caps.pdx)
+# resolved both symbols via the ELF section header table + .symtab / .strtab,
+# colocated their bytes into its .bss sidecar scratch, and delegated to
+# loader_seed_caps which minted a KIND_IPC_ENDPOINT cap into cap_table[0]
+# with rights R_IPC_ALL and target_ptr encoding endpoint_id=1 dir=BIDI.
+# See kernel_main.pdx §m6_symtab_witness for the 6-sub-test enumeration and
+# design/loader/init-caps-sidecar.md §5 for the phase-1 -> phase-2 contract.
+.global loader_symtab_seed_ok_msg
+.align 8
+loader_symtab_seed_ok_msg: .ascii "R20b LOADER SYMTAB SEED OK\n\0"
+
+.global loader_symtab_seed_fail_msg
+.align 8
+loader_symtab_seed_fail_msg: .ascii "R20b LOADER SYMTAB SEED FAIL\n\0"
+
+
 # R20b.M5-001 (#1563): echo-server closure witness fingerprints — closes
 # R20b.M5 (and the R20b round + the #1015 userspace-server-substrate
 # blocker). Kernel-driven roundtrip against init's user_pml4 exercising
