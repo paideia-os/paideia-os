@@ -113,8 +113,18 @@ if [[ -d "${TESTS_KERNEL_DIR}" ]]; then
         echo "[build] paideia-as ${rel} -> ${obj#"${BUILD_DIR}"/}"
         "${PAIDEIA_AS}" build --emit elf64 "${pdx}" -o "${obj}"
         OBJECTS+=("${obj}")
-    done < <(find "${TESTS_KERNEL_DIR}" -name '*.pdx' -print0 | sort -z)
+    done < <(find "${TESTS_KERNEL_DIR}" -name '*.pdx' \
+        -not -path '*/drivers/elaborator/*' \
+        -print0 | sort -z)
 fi
+
+# R29-M2-002 (#1024): elaborator negatives under tests/kernel/drivers/
+# elaborator/ are INTENTIONALLY REJECTED by paideia-as. They must never
+# be swept into the kernel build — verified separately via
+# tools/verify-elaborator-negatives.sh, wired into .githooks/pre-push
+# as the `elaborator-negatives` step. The `-not -path` filter above
+# excludes the whole directory; verification lives in the negatives
+# script rather than the object-emitting build path.
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
