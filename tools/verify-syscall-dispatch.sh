@@ -27,7 +27,7 @@ set -euo pipefail
 ELF="${1:-build/kernel.elf}"
 FAIL=0
 CHECKS_PASSED=0
-TOTAL_CHECKS=15
+TOTAL_CHECKS=16
 
 if [[ ! -f "$ELF" ]]; then
     echo "KERNEL SYSCALL DISPATCH FAIL" >&2
@@ -236,6 +236,21 @@ if grep -q "0xffffffffffffffda" "$DISPATCH_FILE"; then
     CHECKS_PASSED=$((CHECKS_PASSED + 1))
 else
     echo "[FAIL] dispatch_enosys: does not return correct ENOSYS value"
+    FAIL=1
+fi
+
+# Check 16: ID 40 (0x28) route to sys_ipc_recv_body (R20b.M3-001 / #1558).
+# The dispatch shim performs two user_ptr_ok gates on user_hdr_va +
+# user_payload_va (per design/ipc/userspace-server-substrate.md §4.3 and
+# the #741 defense-in-depth pattern used by dispatch_read / dispatch_write
+# / dispatch_dmesg), then calls sys_ipc_recv_body with the raw endpoint_id
+# (cap-lookup deferred to R20b.M4 loader_seed_caps). Requires both the
+# cmp gate AND a call to sys_ipc_recv_body in the dispatcher body.
+if grep -q "cmp.*0x28" "$DISPATCH_FILE" && grep -q "sys_ipc_recv_body" "$DISPATCH_FILE"; then
+    echo "[ok]   ID 40 (ipc_recv): routes to sys_ipc_recv_body"
+    CHECKS_PASSED=$((CHECKS_PASSED + 1))
+else
+    echo "[FAIL] ID 40 (ipc_recv): cmp missing or sys_ipc_recv_body call missing"
     FAIL=1
 fi
 

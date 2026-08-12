@@ -1459,6 +1459,22 @@ ipc_bounce_ok_msg: .ascii "R20b IPC BOUNCE OK\n\0"
 .align 8
 ipc_bounce_fail_msg: .ascii "R20b IPC BOUNCE FAIL\n\0"
 
+
+# R20b.M3-001 (#1558): sys_ipc_recv syscall witness fingerprints — first
+# sub-issue of the R20b.M3 (server-process model) branch. Exercises the
+# sys_ipc_recv_body handler directly (pre-loading a pending msg via
+# endpoint_write_pending) to prove the drain path returns hdr + payload
+# to init's real user_pml4-mapped page via user_bounce_recv. See
+# src/kernel/core/syscall/handlers/sys_ipc_recv.pdx (M3-001 body) and
+# src/kernel/core/syscall/dispatch.pdx (sysno 40 dispatch shim).
+.global sys_ipc_recv_ok_msg
+.align 8
+sys_ipc_recv_ok_msg: .ascii "R20b SYS IPC RECV OK\n\0"
+
+.global sys_ipc_recv_fail_msg
+.align 8
+sys_ipc_recv_fail_msg: .ascii "R20b SYS IPC RECV FAIL\n\0"
+
 # svc.<name> strings for the R20b.M1-003 (#1554) broker witness.
 # ASCII bytes only; no NUL required (svc_register / svc_lookup are
 # length-explicit), but a trailing NUL keeps the buffer safe for casual
