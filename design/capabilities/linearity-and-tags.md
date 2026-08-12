@@ -173,10 +173,27 @@ The kernel maintains per-kind slab allocators; each kind's slab is sized for its
 | 11 | `audit` | audit-log channel pointer | Permission to write to the audit log. |
 | 12 | `seal-cap` | paired unseal-cap reference | Permission to seal capabilities. |
 | 13 | `unseal-cap` | paired seal-cap reference | Permission to unseal capabilities. |
-| 14 | `reserved-1` | reserved for one of: D14 distributed extension, future expansion | — |
-| 15 | `reserved-2` | reserved for one of: confidential-computing, attestation, future expansion | — |
+| 14 | `hw` | base kind for hardware-adjacent caps (see §3.1a) | Parent slot for `interrupt`, `msix-vector`, `dma-domain`, `hw-timeline` derived kinds (R29.M1 #1019–#1022). |
+| 15 | `reserved` | reserved for confidential-computing / TDX (per CAP-Q9) + KIND_DMESG derived-kind base | — |
 
-16 base kinds, encoded in 4 LAM tag bits (CAP-Q5). The reservation of two slots is deliberate: the LAM kind-hint must remain 4 bits, so future kinds added to the closed enum will displace one of the reserved slots and may require a major-version event.
+16 base kinds, encoded in 4 LAM tag bits (CAP-Q5). The reservation of one slot (15) is deliberate: the LAM kind-hint must remain 4 bits, so any post-D6 base-kind addition would displace slot 15 and require a major-version event.
+
+### 3.1a Slot 14: `KIND_HW` (R29.M0-001, #1017)
+
+Slot 14 was previously reserved (documented as "fault" in the paideia-os kernel enum; no code path ever consumed the label). Per `design/roadmap/next-wave-synthesis.md` §10 D6, slot 14 is promoted to **`KIND_HW`** — a base kind sheltering the R29 hardware-adjacent capability family. The rationale is fast-dispatch: with `KIND_HW` sitting at a base LAM kind-hint slot (4 bits), every hardware-adjacent capability can be routed with a single `cmp rcx, 14; je call_kind_hw` in `cap_invoke_dispatch` rather than a two-level derived-kind test.
+
+**Derived kinds landing over `KIND_HW` in R29.M1:**
+
+| Derived kind | Landed by | Descriptor-tail shape (planned) | Rights bitmask (planned) |
+|---|---|---|---|
+| `KIND_HW_INTERRUPT` | R29.M1-001 (#1019) | `{vector:u8, cpu_mask:u64, trigger:{edge\|level}, polarity:{high\|low}}` | `RIGHT_INVOKE` (unmask/ack) + `RIGHT_OBSERVE` + `RIGHT_REVOKE` |
+| `KIND_HW_MSIX_VECTOR` | R29.M1-002 (#1020) | `{msix_table_pa:u64, entry_index:u16, target_apic_id:u16, message_data:u32}` | `RIGHT_READ` + `RIGHT_WRITE` (mask bit) + `RIGHT_INVOKE` |
+| `KIND_HW_DMA_DOMAIN` | R29.M1-003 (#1021) | `{iommu_ctx_ptr:u64, bdf:u16, ats_enabled:u1, pri_enabled:u1}` | `RIGHT_MINT` (map/unmap page) + `RIGHT_REVOKE` |
+| `KIND_HW_TIMELINE` | R29.M1-004 (#1022) | `{monotonic_ns_offset:i64, resolution_ns:u32, source:{tsc\|hpet\|apic\|dev_clock}}` | `RIGHT_READ` + `RIGHT_OBSERVE` |
+
+**Today (this issue — R29.M0-001):** the base kind `KIND_HW = 14` is registered in `src/kernel/core/cap/kind.pdx` and mintable via `cap_mint_write`. There is no dedicated dispatch branch in `cap_invoke_dispatch` yet — a freshly minted `KIND_HW` cap falls through to the identity return of `target_ptr` (the R8 MVP fallthrough for slots without per-kind handlers). The dispatch branch + per-derived-kind handlers land as a coordinated set in R29.M1.
+
+**No conflict with slot 15.** Slot 15 (`KIND_RESERVED`) remains reserved for confidential-computing / TDX per CAP-Q9 open issue. It is currently also used as the runtime base for the `KIND_DMESG` derived kind (logging-m9-001, tag `0x16`) — see `src/kernel/core/cap/kind.pdx` — that derivation pattern is orthogonal to the D6 slot-14 promotion.
 
 ### 3.2 Derived kinds in the type system
 
@@ -739,7 +756,7 @@ The `minimum-skylake-x` and `minimum-skylake-s` CI lanes per `02-development-env
 | CAP-O6 | Derived-kind safety holes via lying `unsafe` blocks (§3.4) — formal acknowledgement and review-process spec. | `design/capabilities/derived-kinds.md` (future) |
 | CAP-O7 | Reclamation timing (§8.5) — the kernel's "deferred reclaim at quiescent point" needs a precise definition. | TLA+ spec |
 | CAP-O8 | Seal-cap / unseal-cap pair management — should pairs be revocable independently? What happens when only the seal-cap is revoked? | `design/capabilities/sealing.md` (future) |
-| CAP-O9 | Cross-domain capability translation for D14 distributed extension. Reserved kind slot #14 — design what it looks like. | `design/capabilities/distributed.md` (future) |
+| CAP-O9 | Cross-domain capability translation for D14 distributed extension. Slot 14 was consumed by KIND_HW at R29.M0-001 (#1017, see §3.1a); the D14 distributed extension now inherits from slot 15 (`KIND_RESERVED`) or a future post-D6 major-version enum grow. | `design/capabilities/distributed.md` (future) |
 | CAP-O10 | Audit-record format growth — the 32-byte format will need extension fields eventually. | `design/audit/format.md` (future) |
 | CAP-O11 | Performance baselines (§14) are aspirational; first bare-metal measurements drive `perf-baselines.md`. | `design/capabilities/perf-baselines.md` (future) |
 | CAP-O12 | Phase-1 fallback API design — what subset of the phase-2 API is available, ensuring forward-compatibility. | `design/capabilities/phase1-api.md` (future) |

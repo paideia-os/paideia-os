@@ -1385,6 +1385,24 @@ endpoint_cap_ok_msg: .ascii "R20b ENDPOINT CAP OK\n\0"
 endpoint_cap_fail_msg: .ascii "R20b ENDPOINT CAP FAIL\n\0"
 
 
+# R29.M0-001 (#1017): KIND_HW base-kind witness fingerprints — promotes
+# slot 14 of the 16-slot base_kind enum from the prior "fault" placeholder
+# to KIND_HW, the base kind for hardware-adjacent caps (KIND_HW_INTERRUPT
+# / KIND_HW_MSIX_VECTOR / KIND_HW_DMA_DOMAIN / KIND_HW_TIMELINE land as
+# derived kinds in R29.M1 #1019-#1022). See:
+#   - src/kernel/core/cap/kind.pdx (KIND_HW = 14 declaration + rationale)
+#   - design/capabilities/linearity-and-tags.md §3.1a
+#   - design/architecture/next-wave-derived-kinds.md §KIND_HW
+#   - design/roadmap/next-wave-synthesis.md §10 D6
+.global kind_hw_ok_msg
+.align 8
+kind_hw_ok_msg: .ascii "R29 KIND_HW OK\n\0"
+
+.global kind_hw_fail_msg
+.align 8
+kind_hw_fail_msg: .ascii "R29 KIND_HW FAIL\n\0"
+
+
 # R20b.M1-002 (#1553): endpoint_table + payload_arena witness fingerprints —
 # exercises endpoint_alloc/endpoint_free/endpoint_lookup round-trip on the
 # full 128-slot range AND payload_buf_pa_for(0..127) 4 KiB-alignment +
