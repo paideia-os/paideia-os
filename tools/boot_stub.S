@@ -1527,6 +1527,26 @@ init_caps_ok_msg: .ascii "R20b INIT CAPS FMT OK\n\0"
 .align 8
 init_caps_fail_msg: .ascii "R20b INIT CAPS FMT FAIL\n\0"
 
+
+# R20b.M4-002 (#1562): loader_seed_caps hook witness fingerprints — closes
+# R20b.M4 (loader capability-seed hook). Exercises loader_seed_caps
+# (src/kernel/core/loader/seed_caps.pdx) — the caller that binds M4-001's
+# init_caps_validate to cap/mint.pdx's cap_mint_write. Witness synthesizes
+# a 1-entry sidecar in kernel .bss (_loader_seed_witness_sidecar) and
+# drives two sub-tests: 0 = ACCEPT (mint KIND_TIMER cap into slot 5 and
+# read-back-verify kind/rights/target_ptr), 1 = REJECT (patch count to
+# 0xFFFF, expect LOADER_SEED_FAILED, verify slot 5 unchanged proving the
+# fail-fast invariant). See design/loader/init-caps-sidecar.md §5 for the
+# loader-side walk contract and design/ipc/userspace-server-substrate.md
+# §6.2 for the hook signature.
+.global loader_seed_ok_msg
+.align 8
+loader_seed_ok_msg: .ascii "R20b LOADER SEED OK\n\0"
+
+.global loader_seed_fail_msg
+.align 8
+loader_seed_fail_msg: .ascii "R20b LOADER SEED FAIL\n\0"
+
 # svc.<name> strings for the R20b.M1-003 (#1554) broker witness.
 # ASCII bytes only; no NUL required (svc_register / svc_lookup are
 # length-explicit), but a trailing NUL keeps the buffer safe for casual
