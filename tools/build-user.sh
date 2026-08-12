@@ -14,6 +14,7 @@ TRUE_LINK_SCRIPT="${USER_SRC}/true.ld"
 ECHO_SERVER_LINK_SCRIPT="${USER_SRC}/echo_server.ld"
 ECHO_CLIENT_LINK_SCRIPT="${USER_SRC}/echo_client.ld"
 ACPI_SUPERVISOR_LINK_SCRIPT="${USER_SRC}/acpi_supervisor.ld"
+PCI_ENUMERATOR_LINK_SCRIPT="${USER_SRC}/pci_enumerator.ld"
 
 if [[ ! -f "${SHELL_LINK_SCRIPT}" ]]; then
     echo "shell linker script missing: ${SHELL_LINK_SCRIPT}" >&2
@@ -50,6 +51,11 @@ if [[ ! -f "${ACPI_SUPERVISOR_LINK_SCRIPT}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${PCI_ENUMERATOR_LINK_SCRIPT}" ]]; then
+    echo "pci_enumerator linker script missing: ${PCI_ENUMERATOR_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 
@@ -62,6 +68,7 @@ TRUE_OBJECTS=()
 ECHO_SERVER_OBJECTS=()
 ECHO_CLIENT_OBJECTS=()
 ACPI_SUPERVISOR_OBJECTS=()
+PCI_ENUMERATOR_OBJECTS=()
 LIBS_OBJECTS=()
 
 while IFS= read -r -d '' pdx; do
@@ -100,6 +107,15 @@ while IFS= read -r -d '' pdx; do
         # cap slots (KIND_IPC_ENDPOINT + KIND_ACPI) per the dispatch loop's
         # request/reply pattern.
         ACPI_SUPERVISOR_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "pci_enumerator.pdx" ]]; then
+        # R22-M3-005 (#860): pci_enumerator.pdx is self-contained (inlines
+        # its two IPC syscalls — sys_ipc_recv + sys_ipc_reply) so its object
+        # goes to its own set only — no library pull-in. Sidecar seeds TWO
+        # cap slots (KIND_IPC_ENDPOINT + KIND_PCI_DEV) per the dispatch
+        # loop's request/reply pattern. Mirrors the acpi_supervisor.pdx
+        # shape byte-for-byte modulo the endpoint_id (4 vs 3) and derived
+        # cap kind (0x30 KIND_PCI_DEV vs 0x20 KIND_ACPI).
+        PCI_ENUMERATOR_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "syscall_shim.pdx" ]] || [[ "${rel}" == "errno.pdx" ]] || [[ "${rel}" == "string.pdx" ]]; then
         # These are library modules needed by both shell and init
         LIBS_OBJECTS+=("${obj}")
@@ -287,4 +303,32 @@ if [[ ${#ACPI_SUPERVISOR_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/acpi_supervisor.elf"
     echo "[ok] ${BUILD_DIR}/acpi_supervisor.bin"
+fi
+
+# Link pci_enumerator.elf with pci_enumerator objects only (R22-M3-005 #860).
+# Self-contained (inlines its two IPC syscalls — sys_ipc_recv + sys_ipc_reply);
+# mirrors child_hello.elf / true.elf / echo_server.elf / echo_client.elf /
+# acpi_supervisor.elf pattern. Declares an `_init_caps` sidecar with TWO
+# entries: cap_slot 0 → RPC endpoint (endpoint_id=4, R_IPC_ALL for
+# dispatch-loop request/reply — distinct from echo_server=1, echo_client
+# reply_ep=2, acpi_supervisor=3), cap_slot 1 → KIND_PCI_DEV (0x30,
+# R_DEV_CONFIG_READ) for future ring-3 access to the R22.M3-published
+# device-cap tree. At R22-M3-005 the sidecar exists in .rodata and is
+# shape-verified at build; the kernel M3-005 witness drives the three-op
+# RPC round-trip kernel-side via the pci_enum_* helpers in
+# src/kernel/core/pci/enumerator_dispatch.pdx rather than spawning
+# pci_enumerator as a userspace task (see the "Stub-reply posture" note
+# in the source header). Runtime spawn wires up post-R22.
+if [[ ${#PCI_ENUMERATOR_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T pci_enumerator.ld -> pci_enumerator.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${PCI_ENUMERATOR_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/pci_enumerator.elf" \
+        "${PCI_ENUMERATOR_OBJECTS[@]}"
+
+    echo "[objcopy-user] pci_enumerator.elf -> pci_enumerator.bin"
+    objcopy -O binary "${BUILD_DIR}/pci_enumerator.elf" "${BUILD_DIR}/pci_enumerator.bin"
+
+    echo "[ok] ${BUILD_DIR}/pci_enumerator.elf"
+    echo "[ok] ${BUILD_DIR}/pci_enumerator.bin"
 fi

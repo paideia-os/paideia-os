@@ -516,6 +516,52 @@ case "${EXPECTED}" in
         TIMEOUT=10
         EXPECTED=""
         ;;
+    boot_r20b_pci_rpc)
+        # R22-M3-005 (#860): PCI enumerator RPC witness — closes #860
+        # (userspace pci_enumerator server — walks tree via KIND_DEVICE
+        # caps).
+        #
+        # Kernel wire-in (src/kernel/boot/kernel_main.pdx §m3_005_pci_rpc_witness,
+        # immediately after m4_002_acpi_rpc_witness_done and before sti):
+        # the kernel-driven three-op RPC roundtrip proves the pci_enumerator
+        # server semantic end-to-end via the "Option B — kernel-side
+        # witness driving the RPC" posture (per
+        # design/ipc/userspace-server-substrate.md §4.4 Deferred and the
+        # matching M5-001 / M6-003 / M4-002 pattern). Loops op ∈ {1, 2, 3}
+        # — PCI_OP_LIST_DEVICES / DEVICE_INFO / GET_BAR_CAP — through
+        # sys_ipc_send_body → sys_ipc_recv_body (server drain) → kernel
+        # dispatch via pci_enum_* helpers
+        # (src/kernel/core/pci/enumerator_dispatch.pdx) → sys_ipc_reply_body
+        # → sys_ipc_recv_body (client drain). Op=1 additionally verifies
+        # n_devices >= 4 against a witness-synthesized 4-entry _pci_devices
+        # fixture (q35 device topology stand-in — under -kernel MCFG is
+        # absent so real pci_enumerate_all returns 0 devices, forcing the
+        # witness to seed _pci_devices deterministically before dispatch).
+        #
+        # Fingerprint contract (contains-in-order — anchors on the ACPI
+        # RPC witness and extends with the M3-005 closure):
+        #   R20b ACPI RPC OK        (M4-002; anchors ordering)
+        #   R20b PCI RPC OK         (M3-005 — #860 close)
+        # A regression that breaks M3-005 without breaking M4-002 surfaces
+        # here as the missing PCI line; the ACPI line stays as ordering
+        # anchor so a broken ACPI witness is diagnosed by
+        # boot_r20b_acpi_rpc.
+        #
+        # Opt-in only (guarded by PAIDEIA_R22_PCI_RPC=1 in pre-push): the
+        # M3-005 witness spawns ~300 lines of kernel-side orchestration
+        # (2 endpoint allocs + 3 iters × 10-sub-step round trip + kernel
+        # dispatch to 3 pci_enum_* helpers + TSC gate + verification). The
+        # OK fingerprint appears in EVERY boot log (the witness is
+        # unconditionally wired inside kernel_main) but only this mode
+        # asserts its presence.
+        #
+        # NOT SMP (UP-only substrate at R20b per §14 Q3).
+        # NOT UART-RX (kernel-driven; no ring-3 involvement at M3-005).
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r20b/expected-pci-rpc-roundtrip.txt"
+        TIMEOUT=10
+        EXPECTED=""
+        ;;
     boot_r21_msix_round_robin)
         # R21-M4-005 (#841): MSI-X round-robin structural smoke.
         #
