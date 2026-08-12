@@ -156,19 +156,115 @@ the corresponding R29.M1 sub-issue when it lands.
   `edge_or_level=2`; BAD_RIGHTS on `rights=0x04 EXEC`; BAD_PARENT on
   `parent_slot=0 KIND_PROCESS`). Emits `R29 KIND_INTERRUPT OK`.
 
-### `KIND_HW_MSIX_VECTOR` — landed by R29.M1-002 (#1020)
+### `KIND_HW_MSIX_VECTOR` — landed by R29.M1-004 (#1022)
 
 - **Runtime base kind:** `KIND_HW = 14`.
-- **Derived-kind tag:** `0x141`.
-- **Descriptor tail:** `{msix_table_pa:u64, entry_index:u16,
-  target_apic_id:u16, message_data:u32, mask_bit:u1}`.
-- **Rights:** `RIGHT_READ` (message table), `RIGHT_WRITE` (mask bit only),
-  `RIGHT_INVOKE` (redirect target).
-- **Ops:** `OP_MASK`, `OP_UNMASK`, `OP_REDIRECT`, `OP_READ_ENTRY`.
-- **Depends on:** `KIND_HW_DMA_DOMAIN` (for the underlying device's IOMMU
-  domain — MSI-X writes must be domain-consented).
+- **Derived-kind tag:** `0x141` (adjacent to `KIND_HW_INTERRUPT`
+  = `0x140`; distinct from every other derived-kind tag). LAM
+  kind-hint remains slot 14 (KIND_HW); the full `u64` kind field is
+  compared against `0x141` in `cap_invoke_dispatch` to route to
+  `cap_handler_hw_msix_vector`.
+- **Semantic layering.** Derives over `KIND_HW_INTERRUPT` (not
+  directly over `KIND_HW`). A `KIND_HW_INTERRUPT` cap authorizes a
+  line/GSI and MINTS N `KIND_HW_MSIX_VECTOR` children — one per MSI-X
+  vector on the underlying device (e.g. NVMe with 4 MSI-X vectors →
+  4 `KIND_HW_MSIX_VECTOR` children under one `KIND_HW_INTERRUPT`
+  parent). This preserves the per-device authority boundary: a
+  driver holds N children under exactly one interrupt-authority
+  parent, and revoking the parent auto-revokes every child.
+- **Descriptor tail (finalized at R29.M1-004 #1022):** the cap
+  descriptor's `target_ptr` slot holds a `row_id` in bits `[15:0]`;
+  upper bits `[63:16]` MUST be zero. The row lives in
+  `_hw_msix_vector_table[row_id]` (32 bytes / four u64s per row,
+  64 rows, `.bss`, `align 64`):
+  - `[+0]` u64: `bits [31:0]  = msix_table_offset (u32; byte offset
+    into the device's MSI-X table BAR)`,
+    `bits [39:32] = parent_slot (u8; cap_table slot of the
+    KIND_HW_INTERRUPT parent — used for O(N) cascade revocation)`,
+    `bits [63:56] = in_use flag`; bits `[55:40]` reserved.
+  - `[+8]` u64: `bits [31:0] = msix_data (u32; payload written to the
+    MSI-X message-data register on vector arm)`; `bits [63:32]`
+    reserved (future: `msix_addr_hi/lo` overrides, mask/pending
+    shadow bits).
+  - `[+16]` u64: reserved (future: `target_apic_id`, `delivery_mode`,
+    `polarity`).
+  - `[+24]` u64: reserved (future: `fire_count`, `last_fire_ns`).
+- **Tail encoding rationale.** Storing `parent_slot` inside the row
+  is what makes cascade revocation efficient. The parent's revoke
+  (`hw_int_cap_revoke`) calls `msix_cascade_revoke_by_parent(slot)`
+  which scans `cap_table[0..255]`; for each descriptor whose kind is
+  `0x141`, it reads the row's `parent_slot` field and revokes iff
+  it matches. Cost is O(256) per parent revoke — well below any
+  hot-path threshold at R29 substrate stage. Stashing `parent_slot`
+  in the descriptor's `rights` field was rejected because rights is
+  a security-sensitive bitmask and repurposing bits would leak into
+  the `msix_rights_valid` gate; the row is the correct home for
+  hardware-shape metadata.
+- **Rights (finalized at R29.M1-004 #1022):**
+  - `R_MSIX_INVOKE` (0x008 = `RIGHT_INVOKE`) — query ops
+    (OP_QUERY_TABLE_OFFSET / OP_QUERY_DATA / OP_QUERY_PARENT) plus
+    OP_MASK / OP_UNMASK (real MSI-X wire-up at R29.M2).
+  - `R_MSIX_REVOKE` (0x010 = `RIGHT_REVOKE`) — supervisor revoke path.
+  - `R_MSIX_MINT`   (0x200 = `RIGHT_MINT`) — reserved for a future
+    per-vector delegation path (unused at R29.M1-004).
+  - `R_MSIX_ALL`    (0x218) — bitwise OR of the three; the only
+    subset a supervisor-held cap ever needs.
+  - **No `RIGHT_OBSERVE` branch.** The #1022 directive pins rights to
+    `{MINT, REVOKE, INVOKE}` only. Query ops therefore gate on
+    `RIGHT_INVOKE` (not `RIGHT_OBSERVE`) — the two are cleanly
+    separated at the handler level.
+- **Ops (op_arg[7:0]):**
+  - `0 OP_QUERY_TABLE_OFFSET` — `RIGHT_INVOKE` -> `msix_table_offset`.
+  - `1 OP_QUERY_DATA`         — `RIGHT_INVOKE` -> `msix_data`.
+  - `2 OP_QUERY_PARENT`       — `RIGHT_INVOKE` -> `parent_slot`.
+  - `3 OP_MASK`               — `RIGHT_INVOKE` -> `INVOKE_UNSUPPORTED` (R29.M2).
+  - `4 OP_UNMASK`             — `RIGHT_INVOKE` -> `INVOKE_UNSUPPORTED` (R29.M2).
+- **Mint API (finalized at R29.M1-004 #1022).**
+  `msix_cap_mint(slot, parent_slot, rights, msix_table_offset,
+  msix_data) -> u64`. Sequence: (1) bounds-check `slot < 256`;
+  (2) `msix_check_parent_kind_hw_int(parent_slot)` asserts
+  `cap_table[parent_slot].kind == 0x140` (KIND_HW_INTERRUPT) AND
+  `rights & R_HW_INT_MINT != 0`; (3) `msix_rights_valid(rights)`;
+  (4) `msix_tail_alloc` reserves a row and stashes
+  `(msix_table_offset, msix_data, parent_slot)`; (5) `cap_mint_write`
+  writes the descriptor. Return: `MSIX_MINT_OK` (0) on success, or
+  one of `BAD_ARG` / `BAD_PARENT` / `BAD_RIGHTS` / `ENOSPC`
+  (all `>= 0xFFFFFFEA`, disjoint from `HW_INT_MINT_*`).
+- **Revoke API (finalized at R29.M1-004 #1022).**
+  `msix_cap_revoke(slot) -> u64`. Verifies
+  `cap_table[slot].kind == 0x141`, extracts `row_id`, frees the row,
+  clears the descriptor to (0,0,0). Idempotent
+  (`MSIX_REVOKE_ALREADY`). Return codes disjoint from mint.
+  **Cascade path** — `msix_cascade_revoke_by_parent(parent_slot) ->
+  count`: scans `cap_table[0..255]` for KIND_HW_MSIX_VECTOR children
+  whose row's `parent_slot` matches; revokes each. Called from
+  `hw_int_cap_revoke` BEFORE the parent frees its own row so the
+  cascade can still observe the parent-slot metadata during
+  row-decode. Returns the count of children revoked (informational).
+- **Boot witness.** `kernel_main.pdx §kind_hw_msix_vector_witness`
+  runs the full mint → dispatch → cascade-revoke loop:
+  - Mints one KIND_HW_INTERRUPT parent at slot 15 (gsi=0x40).
+  - Mints 4 KIND_HW_MSIX_VECTOR children at slots 16..19 with
+    distinct `(offset, data)` tuples:
+    - slot 16: `(0x00, 0x8001)`
+    - slot 17: `(0x10, 0x8002)`
+    - slot 18: `(0x20, 0x8003)`
+    - slot 19: `(0x30, 0x8004)`
+  - Verifies each `cap_table[16..19]` reads back `kind=0x141`,
+    `rights=0x218`.
+  - Round-trips OP_QUERY_TABLE_OFFSET / OP_QUERY_DATA /
+    OP_QUERY_PARENT through `cap_invoke_dispatch` on all four
+    children — 12 dispatch invocations total.
+  - Failure edge: mint with `parent_slot=14` (KIND_HW, not
+    KIND_HW_INTERRUPT) returns `MSIX_MINT_BAD_PARENT`.
+  - Failure edge: `msix_rights_valid(0x800)` (bit not in R_MSIX_ALL)
+    returns 0.
+  - Revokes the parent at slot 15 → cascade auto-revokes all four
+    children → verify each child slot and the parent slot are
+    cleared (`kind=0`, `rights=0`, `target_ptr=0`). Emits
+    `R29 KIND_MSIX_VECTOR OK`.
 
-### `KIND_HW_DMA_DOMAIN` — landed by R29.M1-003 (#1021)
+### `KIND_HW_DMA_DOMAIN` — planned for a later R29 milestone
 
 - **Runtime base kind:** `KIND_HW = 14`.
 - **Derived-kind tag:** `0x142`.
@@ -194,7 +290,7 @@ the corresponding R29.M1 sub-issue when it lands.
   both blob-consuming drivers (Wi-Fi, BT, IPU6, GuC, SOF) and native
   drivers uniformly.
 
-### `KIND_HW_TIMELINE` — landed by R29.M1-004 (#1022)
+### `KIND_HW_TIMELINE` — planned for a later R29 milestone
 
 - **Runtime base kind:** `KIND_HW = 14`.
 - **Derived-kind tag:** `0x143`.
@@ -230,6 +326,7 @@ collision arises.
 |------|-------|-------|--------|
 | 2026-08-12 | R29.M0 | #1017 | Initial doc + `KIND_HW = 14` base kind row + R29.M1 derived-kind skeletons. |
 | 2026-08-12 | R29.M1 | #1019/#1020/#1021 | Refined `KIND_HW_INTERRUPT` row: finalized numeric tag (0x140), tail-encoding scheme (row indirection via `_hw_interrupt_table`), rights bitmask (`R_HW_INT_ALL = 0x618`), full mint/revoke API, dispatch handler. Landed by `src/kernel/core/cap/kind_hw_interrupt.pdx`. |
+| 2026-08-12 | R29.M1 | #1022 | Landed `KIND_HW_MSIX_VECTOR = 0x141` — second derived kind over KIND_HW, layered atop `KIND_HW_INTERRUPT`. Row-indirection tail via `_hw_msix_vector_table` encoding `{msix_table_offset:u32, msix_data:u32, parent_slot:u8}`. Rights bitmask `R_MSIX_ALL = 0x218` (INVOKE/REVOKE/MINT). Full mint / revoke / cascade-revoke API + dispatch handler in `src/kernel/core/cap/kind_hw_msix_vector.pdx`. Cascade wired into `hw_int_cap_revoke` (calls `msix_cascade_revoke_by_parent` before freeing its own row). Design doc `KIND_HW_MSIX_VECTOR` row rewritten from planning skeleton to as-landed spec; `KIND_HW_DMA_DOMAIN` + `KIND_HW_TIMELINE` rows relabeled as "planned for a later R29 milestone" (issue-number attribution corrected — R29.M1 closes with two derived kinds landed). Closes R29.M1. |
 
 ---
 

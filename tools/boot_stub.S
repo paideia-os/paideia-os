@@ -1421,6 +1421,28 @@ kind_hw_int_ok_msg: .ascii "R29 KIND_INTERRUPT OK\n\0"
 kind_hw_int_fail_msg: .ascii "R29 KIND_INTERRUPT FAIL\n\0"
 
 
+# R29.M1-004 (#1022): KIND_HW_MSIX_VECTOR derived-kind witness
+# fingerprints — second derived kind over KIND_HW (base slot 14),
+# layered atop KIND_HW_INTERRUPT (0x140). Numeric derived tag 0x141
+# (decimal 321). Witness at kernel_main.pdx §kind_hw_msix_witness
+# mints one KIND_HW_INTERRUPT parent and 4 KIND_HW_MSIX_VECTOR
+# children, verifies each tail decode, then revokes the parent and
+# asserts all four children are auto-revoked via
+# msix_cascade_revoke_by_parent. See:
+#   - src/kernel/core/cap/kind_hw_msix_vector.pdx (module implementation)
+#   - src/kernel/core/cap/kind.pdx (KIND_HW_MSIX_VECTOR = 0x141 declaration)
+#   - src/kernel/core/cap/invoke.pdx (call_kind_hw_msix_vector branch)
+#   - src/kernel/core/cap/kind_hw_interrupt.pdx (cascade call site)
+#   - design/architecture/next-wave-derived-kinds.md §KIND_HW_MSIX_VECTOR
+.global kind_hw_msix_ok_msg
+.align 8
+kind_hw_msix_ok_msg: .ascii "R29 KIND_MSIX_VECTOR OK\n\0"
+
+.global kind_hw_msix_fail_msg
+.align 8
+kind_hw_msix_fail_msg: .ascii "R29 KIND_MSIX_VECTOR FAIL\n\0"
+
+
 # R20b.M1-002 (#1553): endpoint_table + payload_arena witness fingerprints —
 # exercises endpoint_alloc/endpoint_free/endpoint_lookup round-trip on the
 # full 128-slot range AND payload_buf_pa_for(0..127) 4 KiB-alignment +
