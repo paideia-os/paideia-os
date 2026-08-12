@@ -86,6 +86,27 @@ case "${STUB_KIND}" in
 esac
 
 # -----------------------------------------------------------------------------
+# R28-M1-004 (#1001): sign the stub with tools/sign-efi.sh (adds .pdxsgn/
+# .pdxpk/.pdxsig sections consumed by kernel-side verify_self.pdx at
+# boot). The signed .efi is what lands on the ESP under both the branded
+# canonical path (/EFI/PAIDEIA/PAIDEIA.EFI) and the UEFI fallback path
+# (/EFI/BOOT/BOOTX64.EFI). Skippable via NO_SIGN=1 for regression bisects.
+# -----------------------------------------------------------------------------
+
+SIGNED_STUB_EFI="${BUILD_UEFI_DIR}/uefi_stub.signed.efi"
+NO_SIGN="${NO_SIGN:-0}"
+
+if [[ "${NO_SIGN}" == "1" ]]; then
+    echo "[build-uefi-image] WARN: NO_SIGN=1 — using unsigned stub; kernel will log 'R28 EFI UNSIGNED (R33-gate off)'" >&2
+    SIGNED_STUB_EFI="${STUB_EFI}"
+else
+    echo "[build-uefi-image] sign-efi.sh -> ${SIGNED_STUB_EFI##*/}"
+    "${REPO_ROOT}/tools/sign-efi.sh" \
+        --in  "${STUB_EFI}" \
+        --out "${SIGNED_STUB_EFI}"
+fi
+
+# -----------------------------------------------------------------------------
 # Detect available filesystem-authoring tool.
 # -----------------------------------------------------------------------------
 
@@ -135,15 +156,16 @@ if [[ ${HAVE_MTOOLS} -eq 1 ]]; then
     mmd -i "${IMG_PATH}" ::/EFI/PAIDEIA
     mmd -i "${IMG_PATH}" ::/paideia
 
-    echo "[build-uefi-image] mcopy uefi_stub.efi → /EFI/BOOT/BOOTX64.EFI (UEFI fallback)"
-    mcopy -i "${IMG_PATH}" "${STUB_EFI}" ::/EFI/BOOT/BOOTX64.EFI
+    echo "[build-uefi-image] mcopy ${SIGNED_STUB_EFI##*/} → /EFI/BOOT/BOOTX64.EFI (UEFI fallback)"
+    mcopy -i "${IMG_PATH}" "${SIGNED_STUB_EFI}" ::/EFI/BOOT/BOOTX64.EFI
 
     # #999 branded canonical path — same bytes, different path. FAT has no
-    # symlinks, so this is a real copy. The R28 signing workflow (#1001 /
-    # design/security/pe-secure-boot-signing.md) will sign both files
-    # identically when the crypto substrate lands (R32).
-    echo "[build-uefi-image] mcopy uefi_stub.efi → /EFI/PAIDEIA/PAIDEIA.EFI (branded canonical)"
-    mcopy -i "${IMG_PATH}" "${STUB_EFI}" ::/EFI/PAIDEIA/PAIDEIA.EFI
+    # symlinks, so this is a real copy. Both entries are byte-identical
+    # signed .efi files (R28-M1-004 #1001 — tools/sign-efi.sh has already
+    # appended .pdxsgn/.pdxpk/.pdxsig sections; see design/security/
+    # efi-signing.md for the R28→R32→R33 upgrade path).
+    echo "[build-uefi-image] mcopy ${SIGNED_STUB_EFI##*/} → /EFI/PAIDEIA/PAIDEIA.EFI (branded canonical)"
+    mcopy -i "${IMG_PATH}" "${SIGNED_STUB_EFI}" ::/EFI/PAIDEIA/PAIDEIA.EFI
 
     echo "[build-uefi-image] mcopy kernel.elf → /paideia/kernel.elf"
     mcopy -i "${IMG_PATH}" "${KERNEL_ELF}" ::/paideia/kernel.elf
@@ -173,8 +195,8 @@ else
 
     sudo mount -o loop,uid="$(id -u)",gid="$(id -g)" "${IMG_PATH}" "${MNT}"
     mkdir -p "${MNT}/EFI/BOOT" "${MNT}/EFI/PAIDEIA" "${MNT}/paideia"
-    cp "${STUB_EFI}" "${MNT}/EFI/BOOT/BOOTX64.EFI"
-    cp "${STUB_EFI}" "${MNT}/EFI/PAIDEIA/PAIDEIA.EFI"
+    cp "${SIGNED_STUB_EFI}" "${MNT}/EFI/BOOT/BOOTX64.EFI"
+    cp "${SIGNED_STUB_EFI}" "${MNT}/EFI/PAIDEIA/PAIDEIA.EFI"
     cp "${KERNEL_ELF}" "${MNT}/paideia/kernel.elf"
     if [[ -n "${PDXFS_LITE_IMG}" && -f "${PDXFS_LITE_IMG}" ]]; then
         cp "${PDXFS_LITE_IMG}" "${MNT}/paideia/rootfs.pdxfs"

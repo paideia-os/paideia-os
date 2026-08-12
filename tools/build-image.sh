@@ -27,9 +27,13 @@
 #     mkfs + mtools chain uses fresh UUIDs and creation timestamps; a
 #     --deterministic flag (fixed UUID, fixed mformat -N) lands with the
 #     R28 reproducibility issue when we open it.
-#   - Signed PAIDEIA.EFI (#1001). See design/security/pe-secure-boot-signing.md
-#     for the full deferral rationale (paideia-as PE Certificate Table +
-#     PKCS#7 wrap + ML-DSA sign are all R32/R33 scope).
+#   - UEFI Secure-Boot Certificate-Table sign (PKCS#7 wrap +
+#     IMAGE_DIRECTORY_ENTRY_SECURITY population) remains R32/R33 scope —
+#     see design/security/pe-secure-boot-signing.md.
+#     Paideia-native scaffolding (.pdxsgn/.pdxpk/.pdxsig sections,
+#     kernel-side self-verify) landed at R28-M1-004 (#1001) via
+#     tools/sign-efi.sh — invoked automatically by build-uefi-image.sh.
+#     See design/security/efi-signing.md.
 #
 # Exit 0 on success, non-zero on any error.
 

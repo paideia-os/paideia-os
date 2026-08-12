@@ -20,6 +20,7 @@
 | PBS-D2 | MVP demo boots with **UEFI Secure Boot disabled** | Documented and gated (`design/security/secure-boot.md` SB-D1 relaxed for the pre-R32 demo window only). |
 | PBS-D3 | Do **not** emit an empty PE Certificate Table slot in R28 | The PE spec (§5.7) forbids a zero-size WIN_CERTIFICATE record; a stub slot would misrepresent the image as signed. Land the slot at R32 alongside real signature bytes. |
 | PBS-D4 | Track PE signing as a `paideia-as v0.24+` blocker | The `paideia-as-emitter-pe` crate needs (a) `IMAGE_DIRECTORY_ENTRY_SECURITY` population, (b) PKCS#7 SignedData wrap, (c) the crypto stack itself. Filed against paideia-as as a single blocker milestone. |
+| PBS-D5 | R28 lands a **paideia-native** scaffolding path (`tools/sign-efi.sh` + `.pdxsgn`/`.pdxpk`/`.pdxsig` PE sections) that boots and self-verifies WITHOUT the Secure-Boot / PKCS#7 machinery | Splits the pipeline into two independently landable halves: the paideia-native half (this file's PBS-D1..PBS-D4 domain) stays deferred to R32/R33 for firmware-visible Secure Boot; the scaffolding half (see `design/security/efi-signing.md`) lets R28 already prove sign/verify shape end-to-end under the R25.M5 dev-bypass discipline. The two halves share no bytes on disk — Certificate Table lives at `IMAGE_DIRECTORY_ENTRY_SECURITY`; the paideia-native trailer lives at RVA 0xd000. R33 turns on BOTH: the Certificate Table for firmware trust, and enforcement of the paideia-native trailer for kernel-side trust. |
 
 ---
 
