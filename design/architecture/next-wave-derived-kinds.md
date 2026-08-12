@@ -82,20 +82,79 @@ The four entries below are *planning skeletons* only — R29.M0-001 (this
 issue) does not implement them. Each row is refined into a full spec by
 the corresponding R29.M1 sub-issue when it lands.
 
-### `KIND_HW_INTERRUPT` — landed by R29.M1-001 (#1019)
+### `KIND_HW_INTERRUPT` — landed by R29.M1-001..003 (#1019/#1020/#1021)
 
 - **Runtime base kind:** `KIND_HW = 14`.
-- **Derived-kind tag:** `0x140` (12-bit tag; base slot in low 4 bits, family
-  discriminator in high 8 bits — pattern to be finalized at R29.M1-001).
-- **Descriptor tail:** `{vector:u8, cpu_mask:u64, trigger:{edge=0|level=1},
-  polarity:{high=0|low=1}, ioapic_id:u8, source_id:u16}`.
-- **Rights:** `RIGHT_INVOKE` (unmask / ack), `RIGHT_OBSERVE` (read pending
-  count / status), `RIGHT_REVOKE` (mask + reclaim vector).
-- **Ops:** `OP_UNMASK`, `OP_MASK`, `OP_ACK`, `OP_STATUS` (op-code layout per
-  R29.M1-001).
-- **Replaces:** the pre-R29 `KIND_INTERRUPT = 9` (slot 9) is deprecated at
-  R29.M1-001 close; the slot-9 kind stays alive as a compatibility alias
-  until R30 open.
+- **Derived-kind tag:** `0x140` (decimal 320; above the 4-bit base range,
+  distinct from every existing derived-kind tag). LAM kind-hint remains
+  slot 14 (KIND_HW) for fast-dispatch; the full `u64` kind field stored
+  in the descriptor is what cap_invoke_dispatch compares against `0x140`
+  to route to `cap_handler_hw_interrupt`.
+- **Descriptor tail (finalized at R29.M1-002 #1020):** the cap
+  descriptor's `target_ptr` slot holds a `row_id` in bits `[15:0]`; upper
+  bits `[63:16]` MUST be zero. The actual 128-bit tail lives in
+  `_hw_interrupt_table[row_id]`, a kernel-owned indirection table (32
+  bytes / four u64s per row, 64 rows, `.bss`, `align 64`):
+  - `[+0]` u64: `bits [31:0] = gsi (u32)` | `bits [39:32] = edge_or_level
+    (u8; 0=edge, 1=level)` | `bits [63:56] = in_use flag`; bits `[55:40]`
+    reserved (must be zero).
+  - `[+8]` u64: `cpu_affinity_mask (u64)`.
+  - `[+16]` u64: reserved (future: `polarity`, `ioapic_id`, `source_id`).
+  - `[+24]` u64: reserved (future: `pending_count`, `last_ack_ns`).
+- **Tail encoding rationale.** Softarch §3 R29 specifies the tail as
+  `{gsi:u32, cpu_affinity_mask:u64, edge_or_level:u8}` — a 104-bit
+  contract that cannot fit in the 64-bit `target_ptr`. Row indirection
+  keeps the descriptor's shape unchanged and reserves 152 bits of
+  headroom for R29.M2 (polarity/ioapic/source) without a descriptor
+  layout change.
+- **Rights (finalized at R29.M1-001 #1019):**
+  - `R_HW_INT_INVOKE` (0x008 = `RIGHT_INVOKE`) — `OP_MASK` / `OP_UNMASK` /
+    `OP_ACK` (deferred; stubs return `INVOKE_UNSUPPORTED` at R29.M1
+    close, real bodies at R29.M2).
+  - `R_HW_INT_REVOKE` (0x010 = `RIGHT_REVOKE`) — supervisor revoke.
+  - `R_HW_INT_MINT`   (0x200 = `RIGHT_MINT`) — reserved for
+    `KIND_HW_MSIX_VECTOR` derivation at R29.M1-004 (#1022); unused today.
+  - `R_HW_INT_OBSERVE` (0x400 = `RIGHT_OBSERVE`) — `OP_QUERY_GSI` /
+    `OP_QUERY_AFFINITY` / `OP_QUERY_TRIGGER`.
+  - `R_HW_INT_ALL`    (0x618) — bitwise OR of all four; the only subset
+    a supervisor-held cap ever needs.
+- **Ops (op_arg[7:0]):**
+  - `0 OP_QUERY_GSI`      — `R_HW_INT_OBSERVE` -> `gsi`.
+  - `1 OP_QUERY_AFFINITY` — `R_HW_INT_OBSERVE` -> `cpu_affinity_mask`.
+  - `2 OP_QUERY_TRIGGER`  — `R_HW_INT_OBSERVE` -> `edge_or_level`.
+  - `3 OP_MASK`           — `R_HW_INT_INVOKE`  -> `INVOKE_UNSUPPORTED` (R29.M2).
+  - `4 OP_UNMASK`         — `R_HW_INT_INVOKE`  -> `INVOKE_UNSUPPORTED` (R29.M2).
+  - `5 OP_ACK`            — `R_HW_INT_INVOKE`  -> `INVOKE_UNSUPPORTED` (R29.M2).
+- **Mint API (finalized at R29.M1-003 #1021).**
+  `hw_int_cap_mint(slot, parent_slot, rights, gsi, cpu_affinity_mask,
+  edge_or_level) -> u64`. Sequence: (1) bounds-check `slot` and
+  `edge_or_level`; (2) `hw_int_check_parent_kind_hw(parent_slot)`
+  asserts `cap_table[parent_slot].kind == 14` AND
+  `rights & R_HW_INT_MINT != 0`; (3) `hw_int_rights_valid(rights)`;
+  (4) `hw_int_tail_alloc` reserves + populates a row; (5) `cap_mint_write`
+  writes the descriptor. Return: `HW_INT_MINT_OK` (0) on success, or one
+  of `BAD_ARG`/`BAD_PARENT`/`BAD_RIGHTS`/`ENOSPC` (all `>= 0xFFFFFFFA`,
+  disjoint from cap_mint_write's void return).
+- **Revoke API (finalized at R29.M1-003 #1021).**
+  `hw_int_cap_revoke(slot) -> u64`. Verifies `cap_table[slot].kind ==
+  0x140`, extracts `row_id`, calls `hw_int_tail_free`, then clears the
+  descriptor to (0,0,0). Idempotent on an already-null slot
+  (`HW_INT_REVOKE_ALREADY`). Return codes disjoint from mint.
+  **Cascade:** the `KIND_HW_MSIX_VECTOR` (#1022) revoke cascade is NOT
+  performed here — landing when #1022 opens; the current implementation
+  only frees the row and clears the parent descriptor.
+- **Deprecation of pre-R29 `KIND_INTERRUPT = 9`.** The slot-9 kind
+  (`src/kernel/core/cap/kind_interrupt.pdx` legacy stub) is deprecated
+  at R29.M1-001 close but preserved as a compatibility alias until R30
+  open. Both dispatch entries coexist in `invoke.pdx`:
+  `cmp rcx, 9; je call_kind_interrupt` (legacy) and
+  `cmp rcx, 0x140; je call_kind_hw_interrupt` (R29).
+- **Boot witness.** `kernel_main.pdx §kind_hw_interrupt_witness` runs
+  the full tail_alloc → decode → mint → dispatch → revoke loop against
+  the KIND_HW parent minted at slot 14 (R29.M0-001). Twelve sub-tests
+  covering happy path + three failure edges (BAD_ARG on
+  `edge_or_level=2`; BAD_RIGHTS on `rights=0x04 EXEC`; BAD_PARENT on
+  `parent_slot=0 KIND_PROCESS`). Emits `R29 KIND_INTERRUPT OK`.
 
 ### `KIND_HW_MSIX_VECTOR` — landed by R29.M1-002 (#1020)
 
@@ -170,6 +229,7 @@ collision arises.
 | Date | Round | Issue | Change |
 |------|-------|-------|--------|
 | 2026-08-12 | R29.M0 | #1017 | Initial doc + `KIND_HW = 14` base kind row + R29.M1 derived-kind skeletons. |
+| 2026-08-12 | R29.M1 | #1019/#1020/#1021 | Refined `KIND_HW_INTERRUPT` row: finalized numeric tag (0x140), tail-encoding scheme (row indirection via `_hw_interrupt_table`), rights bitmask (`R_HW_INT_ALL = 0x618`), full mint/revoke API, dispatch handler. Landed by `src/kernel/core/cap/kind_hw_interrupt.pdx`. |
 
 ---
 

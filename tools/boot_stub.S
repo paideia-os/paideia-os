@@ -1403,6 +1403,24 @@ kind_hw_ok_msg: .ascii "R29 KIND_HW OK\n\0"
 kind_hw_fail_msg: .ascii "R29 KIND_HW FAIL\n\0"
 
 
+# R29.M1-001..003 (#1019/#1020/#1021): KIND_HW_INTERRUPT derived-kind
+# witness fingerprints — derived over KIND_HW (base slot 14, R29.M0-001
+# #1017). Numeric derived tag 0x140 (decimal 320), above the 4-bit base
+# range. See:
+#   - src/kernel/core/cap/kind_hw_interrupt.pdx (module implementation)
+#   - src/kernel/core/cap/kind.pdx (KIND_HW_INTERRUPT = 0x140 declaration)
+#   - src/kernel/core/cap/invoke.pdx (call_kind_hw_interrupt branch)
+#   - design/architecture/next-wave-derived-kinds.md §KIND_HW_INTERRUPT
+#   - design/roadmap/next-wave-softarch.md §3 R29 (tail spec)
+.global kind_hw_int_ok_msg
+.align 8
+kind_hw_int_ok_msg: .ascii "R29 KIND_INTERRUPT OK\n\0"
+
+.global kind_hw_int_fail_msg
+.align 8
+kind_hw_int_fail_msg: .ascii "R29 KIND_INTERRUPT FAIL\n\0"
+
+
 # R20b.M1-002 (#1553): endpoint_table + payload_arena witness fingerprints —
 # exercises endpoint_alloc/endpoint_free/endpoint_lookup round-trip on the
 # full 128-slot range AND payload_buf_pa_for(0..127) 4 KiB-alignment +
