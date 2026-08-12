@@ -1,0 +1,399 @@
+// src/kernel/core/ipc/user_bounce.pdx — R20b.M2-003 (#1557)
+// KPTI-safe user<->kernel payload bounce primitives for framed IPC.
+//
+// Design context
+// --------------
+// Third + final sub-issue of the R20b.M2 (framed variable-length IPC) branch;
+// closes M2. Bridges the raw user-VA arguments of the future sys_ipc_send /
+// sys_ipc_recv syscalls (M3-001/002, sysno 40/42) with the strict-KPTI-safe
+// byte-copy helpers that the syscall dispatch layer already uses for read /
+// write (see src/kernel/core/syscall/dispatch.pdx dispatch_read/write, #737/
+// #738/#739).
+//
+// Root problem this bridges
+// -------------------------
+// Under strict-KPTI, `syscall_entry` flips CR3 to `_kernel_pml4_pa` (the boot
+// PML4, low identity + KPTI mirror at PML4[256]) before dispatch runs. Any
+// downstream kernel `mov [user_va]` or `mov reg, [user_va]` executed under
+// kernel CR3 lands on whichever kernel byte the boot PML4's low identity map
+// covers PA = user_va with — NOT the frame the caller's user PML4 maps
+// user_va to. Same defect class as #724 D4 / #730 D10c / #730 D10d / #737 /
+// #738 / #739 (all fixed at their own sites).
+//
+// The R16-M3 KPTI sweep (#734 / #738 / #739) landed two per-byte 4-level
+// page-table walkers in `src/kernel/core/syscall/user_read.pdx`:
+//
+//   `user_read_bytes_via_walk(kernel_dst, user_va, len) -> u64`
+//   `user_write_bytes_via_walk(user_va, kernel_src, len) -> u64`
+//
+// Both walk `_current_tcb.user_pml4_va` per byte, translate user VA -> phys,
+// and complete the copy via the kernel higher-half identity map
+// (`frame_pa + KERNEL_VMA_BASE`) — U=0 in boot PML4[256]'s shared PDPT, so
+// SMAP-safe, TLB-hot after the CR3 flip. #741 Layer 2 range-gates them at
+// entry: any user_va >= KERNEL_VMA_BASE (or user_va + len wrapping into the
+// kernel half) returns -EFAULT with the stack untouched.
+//
+// This file is the M2 counterpart to `dispatch_read` / `dispatch_write`:
+// it fuses the walker with the endpoint substrate. Every send-path copy
+// lands the user's hdr + payload into a kernel-side scratch through the
+// walker; every recv-path copy pulls the kernel-side scratch back to the
+// user's out buffers through the walker's write direction. The endpoint
+// row + payload arena in between are always kernel-VA (safe under kernel
+// CR3), so once bytes are in the scratches all further movement is a
+// plain memcpy that `endpoint_write_pending` / `endpoint_take_pending`
+// already handle correctly (see endpoint_table.pdx M2-002).
+//
+// Contract at this layer (design/ipc/userspace-server-substrate.md §4.3)
+// ----------------------------------------------------------------------
+// `user_bounce_send(id, user_hdr_va, user_payload_va, payload_len)`:
+//   1. Gate `payload_len > 4088` -> `BOUNCE_SEND_ERR_PAYLOAD_LEN` (3) —
+//      matches endpoint_write_pending's PAYLOAD_LEN code; catching the
+//      gate here avoids walking the user's buffer at all when it's
+//      structurally too large.
+//   2. `user_read_bytes_via_walk(kernel_hdr_scratch, user_hdr_va, 8)` —
+//      copy the 8-byte header from user memory into a private kernel
+//      scratch. On walker failure -> `BOUNCE_SEND_ERR_EFAULT` (-EFAULT).
+//   3. Load the header as a u64 from the scratch (native LE u64 load
+//      reconstructs the packed layout `frame_encode` wrote per
+//      frame.pdx §encode-decode round-trip contract).
+//   4. `user_read_bytes_via_walk(kernel_payload_scratch, user_payload_va,
+//      payload_len)` — copy the payload bytes from user memory into the
+//      private kernel scratch. `payload_len == 0` is legal (header-only
+//      message) and short-circuits at the walker's loop-entry gate. On
+//      walker failure -> `BOUNCE_SEND_ERR_EFAULT`.
+//   5. `endpoint_write_pending(id, hdr, kernel_payload_scratch,
+//      payload_len)` — publish. Its return code (0=OK, 1=EAGAIN, 2=BAD_ID,
+//      3=PAYLOAD_LEN) is passed through verbatim so callers see the same
+//      taxonomy the primitive itself uses. (BAD_ID at this layer covers
+//      both "invalid id" and "endpoint got freed between validation and
+//      publish" — indistinguishable to the caller by design.)
+//
+// `user_bounce_recv(id, user_hdr_va, user_payload_va, user_payload_max)`:
+//   1. `endpoint_take_pending(id, kernel_hdr_scratch, kernel_payload_scratch)`
+//      -> `payload_len` (u32 in [0..4088]) OR `PENDING_TAKE_EMPTY` (-1).
+//      Empty case short-circuits — no user-visible side effect.
+//   2. Compute `write_len = min(payload_len, user_payload_max)` — the
+//      caller's cap is honored (POSIX short-read semantics per design
+//      §4.3 recv step 4: "Read min(hdr.payload_len, out_payload_cap)").
+//      Full `payload_len` is still returned so the caller can detect
+//      truncation via `payload_len > user_payload_max`.
+//   3. `user_write_bytes_via_walk(user_hdr_va, kernel_hdr_scratch, 8)` —
+//      publish the 8-byte header to the caller's out slot. On walker
+//      failure -> `BOUNCE_RECV_ERR_EFAULT`.
+//   4. `user_write_bytes_via_walk(user_payload_va, kernel_payload_scratch,
+//      write_len)` — publish the (possibly-short) payload. Zero-length
+//      writes are a no-op at the walker's loop-entry gate. On walker
+//      failure -> `BOUNCE_RECV_ERR_EFAULT`.
+//   5. Return `payload_len` (never `write_len`) so the caller sees the
+//      true message size regardless of their cap.
+//
+// The consume-then-write ordering deliberately mirrors dispatch_read's
+// consume-then-write ordering (#738): once `endpoint_take_pending` has
+// released the endpoint slot, the message bytes live only in this
+// module's kernel scratch until the walker copies them out. If the
+// walker fails mid-copy, the message is lost — same failure semantics
+// as dispatch_read's tmpfs_read + walker path. This is acceptable at
+// R20b because sys_ipc_recv is intended to be called with an already-
+// validated `user_hdr_va` / `user_payload_va` pair (via `user_ptr_ok`,
+// per design §4.3 in future M3-002 wire-up); the walker's #741 Layer 2
+// range gate is the last line of defense, not the first.
+//
+// Kernel-side scratch discipline
+// ------------------------------
+// Two static .bss slots — one per direction — sized exactly to the
+// framing bound:
+//
+//   _user_bounce_hdr_scratch     : 8 bytes  (one u64, matches FRAME_HEADER_SIZE)
+//   _user_bounce_payload_scratch : 4088 bytes (FRAME_MAX_PAYLOAD)
+//
+// The scratches are STATIC not per-task at R20b because the substrate's
+// single-flow phase-1 discipline admits only one in-flight IPC at a time
+// (design §4.3, matches endpoint_write_pending's single-slot semantics).
+// When R21+ grows an SMP fast-path or per-CPU concurrent send/recv, these
+// scratches move into the TCB slab or a per-CPU scratch pool (same
+// migration path as the dispatch_read/write scratches at
+// dispatch.pdx L74-86, deferred there for identical reasons).
+//
+// Placement rationale — the scratches are OWNED by this module (not by
+// the endpoint row and not by the payload arena). endpoint_write_pending
+// / endpoint_take_pending are pure kernel-VA memcpy primitives; putting
+// the bounce scratch inside them would require passing user VAs to a
+// primitive whose contract says "kernel VA in/out". Owning the scratch
+// here keeps the endpoint primitives' contracts intact — the bounce
+// wrappers are the sole boundary where a user VA turns into a kernel
+// VA (via the walker) or vice versa.
+//
+// Return-code layout
+// ------------------
+// The send-path result codes mirror endpoint_write_pending's exactly
+// (0=OK, 1=EAGAIN, 2=BAD_ID, 3=PAYLOAD_LEN) plus -EFAULT for walker
+// failure, so downstream sys_ipc_send (M3-001) can pass the rc through
+// to the user as an errno with a single sign-check (`rax > 3` implies
+// -EFAULT or -E2BIG range; below-3 stays inside the substrate's
+// enum).
+//
+// The recv-path returns either the payload_len (u64 with high 32 zero)
+// on success, `PENDING_TAKE_EMPTY` (-1) on empty, or -EFAULT on walker
+// failure. -1 and -EFAULT sit at the top of the u64 range far from any
+// legal payload_len (max 4088), so a caller can discriminate the three
+// return kinds with two compares (`cmp rax, -1` first, then `cmp rax,
+// -14`).
+//
+// Design doc: design/ipc/userspace-server-substrate.md §4.3
+// Cross-reference: src/kernel/core/syscall/dispatch.pdx dispatch_read/write
+//                  (#737 / #738 / #739 precedent), src/kernel/core/ipc/
+//                  endpoint_table.pdx (M2-002 pending-msg primitives).
+
+module UserBounce = structure {
+
+  // ============================================================================
+  // Result codes.
+  //
+  // Send path: mirrors endpoint_write_pending's PENDING_WRITE_* codes plus
+  // -EFAULT for walker failure. Kept as literal integers rather than
+  // cross-module refs so this file parses without cross-module constant
+  // resolution (matches the FRAME_MAX_PAYLOAD literal in endpoint_table.pdx
+  // §pending gate).
+  // ============================================================================
+
+  pub let BOUNCE_SEND_OK              : u64 = 0                        // PENDING_WRITE_OK
+  pub let BOUNCE_SEND_ERR_EAGAIN      : u64 = 1                        // PENDING_WRITE_ERR_EAGAIN
+  pub let BOUNCE_SEND_ERR_BAD_ID      : u64 = 2                        // PENDING_WRITE_ERR_BAD_ID
+  pub let BOUNCE_SEND_ERR_PAYLOAD_LEN : u64 = 3                        // PENDING_WRITE_ERR_PAYLOAD_LEN
+  pub let BOUNCE_SEND_ERR_EFAULT      : u64 = 0xFFFFFFFFFFFFFFF2       // -EFAULT (-14 signed)
+
+  // Recv path: payload_len on success (0..4088), or one of these sentinels.
+  pub let BOUNCE_RECV_EMPTY           : u64 = 0xFFFFFFFFFFFFFFFF       // PENDING_TAKE_EMPTY (-1)
+  pub let BOUNCE_RECV_ERR_EFAULT      : u64 = 0xFFFFFFFFFFFFFFF2       // -EFAULT
+
+  // FRAME_HEADER_SIZE / FRAME_MAX_PAYLOAD sourced from frame.pdx and
+  // acpi-supervisor-schema.md §3; frozen here so the length gates read
+  // locally without cross-module constant lookups (paideia-as does not
+  // resolve cross-module `let` constants at parse time — see the same
+  // frozen-constant pattern in endpoint_table.pdx §PENDING_PAYLOAD_MAX_BYTES).
+  pub let BOUNCE_HEADER_SIZE          : u64 = 8
+  pub let BOUNCE_MAX_PAYLOAD          : u64 = 4088
+
+  // ============================================================================
+  // Storage — 8-byte hdr scratch + 4088-byte payload scratch.
+  //
+  // @align(8) on the hdr matches the u64 load/store discipline; @align(8) on
+  // the payload matches rep_movsb's byte-granular native path (no wider
+  // alignment required by SDM Vol 2A REP MOVSB). Sizes are pinned to the
+  // upper bound so a maximum-legal in-flight message fits without a runtime
+  // bounds decision at the copy site — the payload_len gate at send entry
+  // (and endpoint_take_pending's own hdr-derived cap on recv) guarantee we
+  // never overflow the scratch.
+  //
+  // .bss placement (uninit) — freshly zero on first boot; cross-message
+  // residue from a prior send/recv is overwritten in-place at every entry
+  // (no explicit zeroing needed, and none desired — bzeroing 4088 bytes on
+  // every call would double the memcpy cost).
+  //
+  // 4088 payload bytes = 511 u64s; declared as [u64; 511].
+  // ============================================================================
+
+  pub let mut _user_bounce_hdr_scratch     : [u64; 1]   = uninit @align(8)
+  pub let mut _user_bounce_payload_scratch : [u64; 511] = uninit @align(8)
+
+  // ==========================================================================
+  // user_bounce_send(id: u64, user_hdr_va: u64, user_payload_va: u64,
+  //                  payload_len: u64) -> u64
+  //
+  // SysV ABI: rdi=id, rsi=user_hdr_va, rdx=user_payload_va, rcx=payload_len
+  //        -> rax=rc (see BOUNCE_SEND_* codes above).
+  //
+  // Bounces hdr (8 bytes) + payload (up to 4088 bytes) from user VA through
+  // this module's kernel scratches, then publishes via endpoint_write_pending.
+  // ==========================================================================
+
+  pub let user_bounce_send : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (id: u64, user_hdr_va: u64, user_payload_va: u64, payload_len: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R20b.M2-003 (#1557): KPTI-safe send-path bounce. Per design/ipc/userspace-server-substrate.md §4.3 send steps 2 + 5 (walker-copy hdr + payload from user into kernel scratch, then publish via endpoint_write_pending). Register plan: 5-push callee-save prologue (rbx/r12/r13/r14/r15). rbx = endpoint id (survives 4 nested calls to walker + endpoint_write_pending); r12 = user_hdr_va (survives to step 2); r13 = user_payload_va (survives to step 4); r14 = payload_len (survives to steps 4 + 5). r15 unused here but pushed for alignment (5 pushes -> rsp %16 == 0 for nested calls, entry rsp %16 == 8 SysV). Gate order: (a) `cmp rcx, 4088; ja bad_len` (unsigned) — reject over-limit BEFORE walking user memory; catches the same PAYLOAD_LEN failure class endpoint_write_pending would catch later, at strictly less cost. (b) user_read_bytes_via_walk(kernel_dst=_user_bounce_hdr_scratch, user_va=r12, len=8) — 8-byte hdr walk-copy; SysV requires DF=0 which the walkers preserve. On rax != 0 -> `jmp efault`. (c) Load hdr from scratch as u64 into r10 — native LE u64 load reconstructs the packed layout per frame.pdx §encode-decode. (d) user_read_bytes_via_walk(kernel_dst=_user_bounce_payload_scratch, user_va=r13, len=r14) — payload_len bytes walk-copy; payload_len=0 is a no-op at the walker's loop-entry `cmp r13, r10; jae ok` gate. On rax != 0 -> `jmp efault`. (e) endpoint_write_pending(id=rbx, hdr=r10, payload_ptr=_user_bounce_payload_scratch, payload_len=r14) — publish. rax = PENDING_WRITE_* passed through verbatim. Failure paths (bad_len -> 3, efault -> -EFAULT) each pop the 5 callee-save regs before ret so rsp is restored consistently. Leaf-within-function-boundary: the walker + endpoint_write_pending are all @no_frame primitives (see user_read.pdx / endpoint_table.pdx) so no stack pad needed beyond the 5-push prologue's alignment. Cross-file [rip + _user_bounce_hdr_scratch] proven in kernel_main.pdx's cross-file RIP-relative refs pattern (e.g. [rip + _dispatch_read_buf_scratch] at dispatch.pdx L206).",
+      block: {
+        // 5-push prologue: preserves callee-save regs AND aligns rsp to
+        // %16 == 0 for nested calls (entry rsp %16 == 8 SysV; 5*8=40; 8+40
+        // = 48; 48 %16 == 0).
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                          // rbx = id
+        mov r12, rsi;                          // r12 = user_hdr_va
+        mov r13, rdx;                          // r13 = user_payload_va
+        mov r14, rcx;                          // r14 = payload_len
+
+        // ---- Gate A: payload_len > BOUNCE_MAX_PAYLOAD ----
+        // Catch the length failure BEFORE walking the user's buffer.
+        // Matches endpoint_write_pending's PAYLOAD_LEN taxonomy (rc=3) so
+        // the caller sees a uniform error code regardless of which layer
+        // caught the violation.
+        mov rax, 4088;                         // BOUNCE_MAX_PAYLOAD
+        cmp r14, rax;
+        ja  user_bounce_send_bad_len;
+
+        // ---- Step 1: walk-copy 8-byte hdr from user_hdr_va into kernel scratch ----
+        lea rdi, [rip + _user_bounce_hdr_scratch];
+        mov rsi, r12;                          // user_va
+        mov rdx, 8;                            // BOUNCE_HEADER_SIZE
+        call user_read_bytes_via_walk;         // rax = 0 (OK) or -EFAULT
+        cmp rax, 0;
+        jne user_bounce_send_efault;
+
+        // ---- Step 2: load packed hdr as u64 into r15 ----
+        // Native LE u64 load reconstructs the packed layout frame_encode
+        // wrote per frame.pdx §encode-decode round-trip.
+        lea rax, [rip + _user_bounce_hdr_scratch];
+        mov r15, [rax];
+
+        // ---- Step 3: walk-copy payload from user_payload_va into kernel scratch ----
+        // payload_len == 0 is legal (header-only message) and short-circuits
+        // at the walker's loop-entry `cmp r13, r10; jae ok` gate — no
+        // separate zero-len fast-path needed here.
+        lea rdi, [rip + _user_bounce_payload_scratch];
+        mov rsi, r13;                          // user_va
+        mov rdx, r14;                          // payload_len
+        call user_read_bytes_via_walk;         // rax = 0 (OK) or -EFAULT
+        cmp rax, 0;
+        jne user_bounce_send_efault;
+
+        // ---- Step 4: publish via endpoint_write_pending ----
+        mov rdi, rbx;                          // id
+        mov rsi, r15;                          // hdr (loaded in step 2)
+        lea rdx, [rip + _user_bounce_payload_scratch];   // payload_ptr
+        mov rcx, r14;                          // payload_len
+        call endpoint_write_pending;           // rax = PENDING_WRITE_* rc
+
+        // rax carries the primitive's rc verbatim; return it.
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      user_bounce_send_efault:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 0xFFFFFFFFFFFFFFF2;           // -EFAULT
+        ret;
+
+      user_bounce_send_bad_len:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 3;                            // BOUNCE_SEND_ERR_PAYLOAD_LEN
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // user_bounce_recv(id: u64, user_hdr_va: u64, user_payload_va: u64,
+  //                  user_payload_max: u64) -> u64
+  //
+  // SysV ABI: rdi=id, rsi=user_hdr_va, rdx=user_payload_va, rcx=user_payload_max
+  //        -> rax = payload_len (0..4088) OR BOUNCE_RECV_EMPTY (-1)
+  //                 OR BOUNCE_RECV_ERR_EFAULT (-EFAULT).
+  //
+  // Consumes an in-flight message via endpoint_take_pending, then walk-writes
+  // the header + payload out to the caller's user VAs. Short-copies payload
+  // if user_payload_max < payload_len (POSIX read semantics per design §4.3
+  // recv step 4); the returned value is always the TRUE payload_len so the
+  // caller can detect truncation.
+  // ==========================================================================
+
+  pub let user_bounce_recv : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (id: u64, user_hdr_va: u64, user_payload_va: u64, user_payload_max: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R20b.M2-003 (#1557): KPTI-safe recv-path bounce. Per design/ipc/userspace-server-substrate.md §4.3 recv steps 3-6 (take from endpoint into kernel scratch, walker-write hdr + payload out to user, return true payload_len). Register plan: 5-push callee-save prologue (rbx/r12/r13/r14/r15). rbx = id (used once, freed after step 1); r12 = user_hdr_va (survives to step 3); r13 = user_payload_va (survives to step 4); r14 = user_payload_max (used in step 2's min computation); r15 = payload_len returned by endpoint_take_pending (survives 2 nested walker calls). Sequence: (a) endpoint_take_pending(id=rbx, dst_hdr_ptr=_user_bounce_hdr_scratch, dst_payload_ptr=_user_bounce_payload_scratch). rax = payload_len OR PENDING_TAKE_EMPTY (-1). (b) `mov r10, -1; cmp rax, r10; je empty_return` — empty short-circuits with rax already holding the -1 sentinel; no user-visible side effect. (c) Save true payload_len in r15 (survives walker calls; needed for return value). (d) Compute write_len = min(payload_len, user_payload_max): mov rdx, r15; cmp rdx, r14; jbe skip_cap; mov rdx, r14; skip_cap: — rdx = min. Kept in rdx (survives walker's callee-save discipline; walker doesn't preserve rdx but we recompute after each walker call because rdx is caller-save). Actually simpler: store min in r11 (caller-save but we don't nest walker across it — only one walker call uses it). Cleaner: recompute at step 4 since r14 (user_payload_max) and r15 (payload_len) both survive. (e) user_write_bytes_via_walk(user_va=r12, kernel_src=_user_bounce_hdr_scratch, len=8) — hdr writeback. On rax != 0 -> efault. (f) Recompute write_len for payload: mov rdx, r15; cmp rdx, r14; jbe pl_ok; mov rdx, r14; pl_ok: — inline min. (g) user_write_bytes_via_walk(user_va=r13, kernel_src=_user_bounce_payload_scratch, len=write_len) — payload writeback. write_len == 0 short-circuits at walker's loop-entry gate. On rax != 0 -> efault. (h) mov rax, r15; ret — return TRUE payload_len (not write_len) so caller sees the real message size regardless of their cap; caller detects truncation via `payload_len > user_payload_max`. Failure paths pop 5 callee-save regs before ret. Consume-then-write-out order (take at (a) BEFORE walker writes at (e)/(g)) mirrors dispatch_read (#738) — if walker fails mid-writeback, the message bytes are lost. Acceptable at R20b because the M3-002 wrapper will gate user pointers with user_ptr_ok BEFORE calling this primitive (see design §4.3); the walker's #741 Layer 2 range gate is the last line of defense, not the first.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                          // rbx = id
+        mov r12, rsi;                          // r12 = user_hdr_va
+        mov r13, rdx;                          // r13 = user_payload_va
+        mov r14, rcx;                          // r14 = user_payload_max
+
+        // ---- Step 1: consume the in-flight message into kernel scratches ----
+        mov rdi, rbx;                                   // id
+        lea rsi, [rip + _user_bounce_hdr_scratch];      // dst_hdr_ptr
+        lea rdx, [rip + _user_bounce_payload_scratch];  // dst_payload_ptr
+        call endpoint_take_pending;                     // rax = payload_len OR -1
+
+        // ---- Empty short-circuit: rax already holds PENDING_TAKE_EMPTY (-1) ----
+        mov r10, 0xFFFFFFFFFFFFFFFF;                    // BOUNCE_RECV_EMPTY (-1)
+        cmp rax, r10;
+        je  user_bounce_recv_empty_return;
+
+        // Save true payload_len for the return value + writeback lengths.
+        mov r15, rax;                                   // r15 = payload_len
+
+        // ---- Step 2: walk-write 8-byte hdr to user_hdr_va ----
+        mov rdi, r12;                                   // user_va
+        lea rsi, [rip + _user_bounce_hdr_scratch];      // kernel_src
+        mov rdx, 8;                                     // BOUNCE_HEADER_SIZE
+        call user_write_bytes_via_walk;                 // rax = 0 (OK) or -EFAULT
+        cmp rax, 0;
+        jne user_bounce_recv_efault;
+
+        // ---- Step 3: walk-write min(payload_len, user_payload_max) payload bytes ----
+        // POSIX short-read semantics per design §4.3 recv step 4:
+        //   write_len = min(payload_len, user_payload_max)
+        // Return value stays at the TRUE payload_len (r15) so the caller
+        // can detect truncation via `payload_len > user_payload_max`.
+        mov rdx, r15;                                   // rdx = payload_len
+        cmp rdx, r14;                                   // if payload_len > user_max
+        jbe user_bounce_recv_pl_capped;
+        mov rdx, r14;                                   //   rdx = user_max (cap)
+      user_bounce_recv_pl_capped:
+
+        mov rdi, r13;                                   // user_va
+        lea rsi, [rip + _user_bounce_payload_scratch];  // kernel_src
+        // rdx already = write_len
+        call user_write_bytes_via_walk;                 // rax = 0 (OK) or -EFAULT
+        cmp rax, 0;
+        jne user_bounce_recv_efault;
+
+        // ---- Return TRUE payload_len ----
+        mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      user_bounce_recv_empty_return:
+        // rax = 0xFFFFFFFFFFFFFFFF from endpoint_take_pending; pass through.
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      user_bounce_recv_efault:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        mov rax, 0xFFFFFFFFFFFFFFF2;                    // -EFAULT
+        ret
+      }
+    } @no_frame
+}

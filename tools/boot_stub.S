@@ -1443,6 +1443,22 @@ pending_msg_ok_msg: .ascii "R20b PENDING MSG OK\n\0"
 .align 8
 pending_msg_fail_msg: .ascii "R20b PENDING MSG FAIL\n\0"
 
+
+# R20b.M2-003 (#1557): KPTI-safe user<->kernel payload bounce witness
+# fingerprints — third + final M2 sub-issue, closes R20b.M2. Exercises the
+# user_bounce_send / user_bounce_recv wrappers with init's real user_pml4
+# and a 4088-byte (FRAME_MAX_PAYLOAD) round-trip through the endpoint
+# arena, verifying both walker directions land bytes on init's real
+# user-VA-mapped frames (not the boot PML4's low-identity aliases).
+# See src/kernel/core/ipc/user_bounce.pdx.
+.global ipc_bounce_ok_msg
+.align 8
+ipc_bounce_ok_msg: .ascii "R20b IPC BOUNCE OK\n\0"
+
+.global ipc_bounce_fail_msg
+.align 8
+ipc_bounce_fail_msg: .ascii "R20b IPC BOUNCE FAIL\n\0"
+
 # svc.<name> strings for the R20b.M1-003 (#1554) broker witness.
 # ASCII bytes only; no NUL required (svc_register / svc_lookup are
 # length-explicit), but a trailing NUL keeps the buffer safe for casual
