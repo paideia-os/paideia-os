@@ -13,6 +13,7 @@ CHILD_HELLO_LINK_SCRIPT="${USER_SRC}/child_hello.ld"
 TRUE_LINK_SCRIPT="${USER_SRC}/true.ld"
 ECHO_SERVER_LINK_SCRIPT="${USER_SRC}/echo_server.ld"
 ECHO_CLIENT_LINK_SCRIPT="${USER_SRC}/echo_client.ld"
+ACPI_SUPERVISOR_LINK_SCRIPT="${USER_SRC}/acpi_supervisor.ld"
 
 if [[ ! -f "${SHELL_LINK_SCRIPT}" ]]; then
     echo "shell linker script missing: ${SHELL_LINK_SCRIPT}" >&2
@@ -44,6 +45,11 @@ if [[ ! -f "${ECHO_CLIENT_LINK_SCRIPT}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${ACPI_SUPERVISOR_LINK_SCRIPT}" ]]; then
+    echo "acpi_supervisor linker script missing: ${ACPI_SUPERVISOR_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 
@@ -55,6 +61,7 @@ CHILD_HELLO_OBJECTS=()
 TRUE_OBJECTS=()
 ECHO_SERVER_OBJECTS=()
 ECHO_CLIENT_OBJECTS=()
+ACPI_SUPERVISOR_OBJECTS=()
 LIBS_OBJECTS=()
 
 while IFS= read -r -d '' pdx; do
@@ -86,6 +93,13 @@ while IFS= read -r -d '' pdx; do
         # to its own set only — no library pull-in. Sidecar seeds TWO cap
         # slots (server + reply endpoints) for the dual-endpoint pattern.
         ECHO_CLIENT_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "acpi_supervisor.pdx" ]]; then
+        # R20-M4-002 (#820): acpi_supervisor.pdx is self-contained (inlines
+        # its two IPC syscalls — sys_ipc_recv + sys_ipc_reply) so its object
+        # goes to its own set only — no library pull-in. Sidecar seeds TWO
+        # cap slots (KIND_IPC_ENDPOINT + KIND_ACPI) per the dispatch loop's
+        # request/reply pattern.
+        ACPI_SUPERVISOR_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "syscall_shim.pdx" ]] || [[ "${rel}" == "errno.pdx" ]] || [[ "${rel}" == "string.pdx" ]]; then
         # These are library modules needed by both shell and init
         LIBS_OBJECTS+=("${obj}")
@@ -247,4 +261,30 @@ if [[ ${#ECHO_CLIENT_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/echo_client.elf"
     echo "[ok] ${BUILD_DIR}/echo_client.bin"
+fi
+
+# Link acpi_supervisor.elf with acpi_supervisor objects only (R20-M4-002 #820).
+# Self-contained (inlines its two IPC syscalls — sys_ipc_recv + sys_ipc_reply);
+# mirrors child_hello.elf / true.elf / echo_server.elf / echo_client.elf
+# pattern. Declares an `_init_caps` sidecar with TWO entries: cap_slot 0 →
+# RPC endpoint (endpoint_id=3, R_IPC_ALL for dispatch-loop request/reply),
+# cap_slot 1 → KIND_ACPI (READ) for future ring-3 access to the ACPI static-
+# table byte range. At R20-M4-002 the sidecar exists in .rodata and is
+# shape-verified at build; the kernel M4-002 witness drives the four-op RPC
+# round-trip kernel-side via the sup_* helpers in
+# src/kernel/acpi/supervisor_dispatch.pdx rather than spawning
+# acpi_supervisor as a userspace task (see the "Stub-reply posture" note
+# in the source header). Runtime spawn wires up post-R20b.
+if [[ ${#ACPI_SUPERVISOR_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T acpi_supervisor.ld -> acpi_supervisor.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${ACPI_SUPERVISOR_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/acpi_supervisor.elf" \
+        "${ACPI_SUPERVISOR_OBJECTS[@]}"
+
+    echo "[objcopy-user] acpi_supervisor.elf -> acpi_supervisor.bin"
+    objcopy -O binary "${BUILD_DIR}/acpi_supervisor.elf" "${BUILD_DIR}/acpi_supervisor.bin"
+
+    echo "[ok] ${BUILD_DIR}/acpi_supervisor.elf"
+    echo "[ok] ${BUILD_DIR}/acpi_supervisor.bin"
 fi

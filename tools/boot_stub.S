@@ -1636,6 +1636,28 @@ rpc_roundtrip_ok_msg: .ascii "R20b RPC ROUNDTRIP OK\n\0"
 .align 8
 rpc_roundtrip_fail_msg: .ascii "R20b RPC ROUNDTRIP FAIL\n\0"
 
+# R20-M4-002 (#820): ACPI supervisor RPC witness fingerprints.
+# Closes #820 (userspace acpi_supervisor server — accepts KIND_ACPI +
+# serves parse queries). The witness lives kernel-side in
+# kernel_main.pdx (m4_002_acpi_rpc_witness label) and drives the four
+# RPC ops (enumerate_tables / get_madt_lapic_list / get_mcfg_ranges /
+# get_hpet) through sys_ipc_send_body / sys_ipc_recv_body /
+# sys_ipc_reply_body against init's user_pml4 — matches the "Option B —
+# kernel-side witness driving the RPC" posture used by R20b.M5-001 and
+# R20b.M6-003 (the acpi_supervisor userspace binary at
+# src/user/acpi_supervisor.pdx exists as the target shape but the
+# spawn wires up post-R20b per §4.4 Deferred).
+#
+# Success marker: "R20b ACPI RPC OK\n" — asserted by boot_r20b_acpi_rpc.
+# Failure marker: "R20b ACPI RPC FAIL\n" + line=<stage> KV.
+.global acpi_rpc_ok_msg
+.align 8
+acpi_rpc_ok_msg: .ascii "R20b ACPI RPC OK\n\0"
+
+.global acpi_rpc_fail_msg
+.align 8
+acpi_rpc_fail_msg: .ascii "R20b ACPI RPC FAIL\n\0"
+
 # svc.<name> string for the R20b.M5-001 (#1563) echo witness — used both
 # as the broker key (svc_register 3rd-arg scan at kernel VA) AND as the
 # body-input for sys_svc_lookup_body's walker copy (published to init's

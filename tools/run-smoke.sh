@@ -472,6 +472,50 @@ case "${EXPECTED}" in
         TIMEOUT=10
         EXPECTED=""
         ;;
+    boot_r20b_acpi_rpc)
+        # R20-M4-002 (#820): ACPI supervisor RPC witness — closes #820
+        # (userspace acpi_supervisor server — accepts KIND_ACPI + serves
+        # parse queries).
+        #
+        # Kernel wire-in (src/kernel/boot/kernel_main.pdx §m4_002_acpi_rpc_witness,
+        # immediately after m6_rpc_witness_done and before sti): the
+        # kernel-driven four-op RPC roundtrip proves the acpi_supervisor
+        # server semantic end-to-end via the "Option B — kernel-side
+        # witness driving the RPC" posture (per
+        # design/ipc/userspace-server-substrate.md §4.4 Deferred and the
+        # matching M5-001 / M6-003 pattern). Loops op ∈ {1, 2, 3, 4} —
+        # ACPI_OP_ENUMERATE / GET_MADT / GET_MCFG / GET_HPET — through
+        # sys_ipc_send_body → sys_ipc_recv_body (server drain) → kernel
+        # dispatch via sup_* helpers (src/kernel/acpi/supervisor_dispatch.pdx)
+        # → sys_ipc_reply_body → sys_ipc_recv_body (client drain). TSC
+        # delta measured with kread_tsc bracketing each roundtrip; max
+        # asserted < 2M ticks (~1 ms @ 2 GHz TSC, matching the AC
+        # threshold). Op=1 additionally verifies n_tables >= 4 (q35
+        # firmware always publishes at least FADT/MADT/MCFG/HPET).
+        #
+        # Fingerprint contract (contains-in-order — anchors on M6 and
+        # extends with the M4-002 closure):
+        #   R20b RPC ROUNDTRIP OK   (M6-003; anchors ordering)
+        #   R20b ACPI RPC OK        (M4-002 — #820 close)
+        # A regression that breaks M4-002 without breaking M6-003 surfaces
+        # here as the missing ACPI line; the M6 line stays as ordering
+        # anchor so a broken M6 witness is diagnosed by boot_r20b_rpc.
+        #
+        # Opt-in only (guarded by PAIDEIA_R20B_ACPI=1 in pre-push): the
+        # M4-002 witness spawns ~350 lines of kernel-side orchestration
+        # (2 endpoint allocs + 4 iters × 10-sub-step round trip + kernel
+        # dispatch to 4 sup_* helpers + TSC gate + verification). The OK
+        # fingerprint appears in EVERY boot log (the witness is
+        # unconditionally wired inside kernel_main) but only this mode
+        # asserts its presence.
+        #
+        # NOT SMP (UP-only substrate at R20b per §14 Q3).
+        # NOT UART-RX (kernel-driven; no ring-3 involvement at M4-002).
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r20b/expected-acpi-rpc-roundtrip.txt"
+        TIMEOUT=10
+        EXPECTED=""
+        ;;
     boot_r21_msix_round_robin)
         # R21-M4-005 (#841): MSI-X round-robin structural smoke.
         #
