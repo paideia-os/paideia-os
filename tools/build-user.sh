@@ -11,6 +11,7 @@ SHELL_LINK_SCRIPT="${USER_SRC}/link.ld"
 INIT_LINK_SCRIPT="${USER_SRC}/init.ld"
 CHILD_HELLO_LINK_SCRIPT="${USER_SRC}/child_hello.ld"
 TRUE_LINK_SCRIPT="${USER_SRC}/true.ld"
+ECHO_SERVER_LINK_SCRIPT="${USER_SRC}/echo_server.ld"
 
 if [[ ! -f "${SHELL_LINK_SCRIPT}" ]]; then
     echo "shell linker script missing: ${SHELL_LINK_SCRIPT}" >&2
@@ -32,6 +33,11 @@ if [[ ! -f "${TRUE_LINK_SCRIPT}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${ECHO_SERVER_LINK_SCRIPT}" ]]; then
+    echo "echo_server linker script missing: ${ECHO_SERVER_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 
@@ -41,6 +47,7 @@ SHELL_OBJECTS=()
 INIT_OBJECTS=()
 CHILD_HELLO_OBJECTS=()
 TRUE_OBJECTS=()
+ECHO_SERVER_OBJECTS=()
 LIBS_OBJECTS=()
 
 while IFS= read -r -d '' pdx; do
@@ -61,6 +68,11 @@ while IFS= read -r -d '' pdx; do
         CHILD_HELLO_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "true.pdx" ]]; then
         TRUE_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "echo_server.pdx" ]]; then
+        # R20b.M5-001 (#1563): echo_server.pdx is self-contained (inlines its
+        # four IPC syscalls; same one-file-one-ELF discipline as child_hello /
+        # true) so its object goes to its own set only — no library pull-in.
+        ECHO_SERVER_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "syscall_shim.pdx" ]] || [[ "${rel}" == "errno.pdx" ]] || [[ "${rel}" == "string.pdx" ]]; then
         # These are library modules needed by both shell and init
         LIBS_OBJECTS+=("${obj}")
@@ -175,4 +187,27 @@ if [[ ${#TRUE_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/true.elf"
     echo "[ok] ${BUILD_DIR}/true.bin"
+fi
+
+# Link echo_server.elf with echo_server objects only (R20b.M5-001 #1563).
+# Self-contained (inlines its four IPC syscalls); mirrors child_hello.elf /
+# true.elf pattern. Declares an `_init_caps` sidecar per
+# design/loader/init-caps-sidecar.md §2 that a future loader-side symbol
+# walker (Phase-2 of #1562) will pick up to auto-seed slot 0 with a
+# KIND_IPC_ENDPOINT cap; at R20b.M5 the sidecar exists in .rodata but the
+# kernel M5-001 witness drives the roundtrip kernel-side against init's
+# user_pml4 rather than spawning echo_server as a userspace task (see the
+# `R20b.M5 posture note` in the source header).
+if [[ ${#ECHO_SERVER_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T echo_server.ld -> echo_server.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${ECHO_SERVER_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/echo_server.elf" \
+        "${ECHO_SERVER_OBJECTS[@]}"
+
+    echo "[objcopy-user] echo_server.elf -> echo_server.bin"
+    objcopy -O binary "${BUILD_DIR}/echo_server.elf" "${BUILD_DIR}/echo_server.bin"
+
+    echo "[ok] ${BUILD_DIR}/echo_server.elf"
+    echo "[ok] ${BUILD_DIR}/echo_server.bin"
 fi

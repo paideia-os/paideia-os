@@ -1547,6 +1547,44 @@ loader_seed_ok_msg: .ascii "R20b LOADER SEED OK\n\0"
 .align 8
 loader_seed_fail_msg: .ascii "R20b LOADER SEED FAIL\n\0"
 
+
+# R20b.M5-001 (#1563): echo-server closure witness fingerprints — closes
+# R20b.M5 (and the R20b round + the #1015 userspace-server-substrate
+# blocker). Kernel-driven roundtrip against init's user_pml4 exercising
+# ALL M1..M4 primitives end-to-end:
+#   svc_register("svc.echo", 8, <id>)              [M1 broker]
+#   cap_mint_write(slot, KIND_IPC_ENDPOINT, ...)   [M4 cap-mint]
+#   sys_svc_lookup_body(name_va, 8)                [M3 svc_lookup]
+#   sys_ipc_send_body   (request)                  [M3 send + M2 hdr/bounce]
+#   sys_ipc_recv_body   (server-side drain)        [M3 recv + M2 bounce]
+#   sys_ipc_reply_body  (server-side reply w/ bit-7 flip)  [M3 reply]
+#   sys_ipc_recv_body   (client-side drain of reply)       [M3 recv]
+# Byte-exact hdr + payload verify per hop.  Witness lives kernel-side in
+# kernel_main.pdx (m5_echo_witness label); echo_server userspace binary
+# (src/user/echo_server.pdx) is embedded for the shape but not spawned at
+# R20b.M5 (deferred with the loader symbol-walker per
+# design/loader/init-caps-sidecar.md §5). See the witness comment block
+# for the sub-test enumeration and the roundtrip design in
+# design/ipc/userspace-server-substrate.md §7.
+.global echo_roundtrip_ok_msg
+.align 8
+echo_roundtrip_ok_msg: .ascii "R20b ECHO ROUNDTRIP OK\n\0"
+
+.global echo_roundtrip_fail_msg
+.align 8
+echo_roundtrip_fail_msg: .ascii "R20b ECHO ROUNDTRIP FAIL\n\0"
+
+# svc.<name> string for the R20b.M5-001 (#1563) echo witness — used both
+# as the broker key (svc_register 3rd-arg scan at kernel VA) AND as the
+# body-input for sys_svc_lookup_body's walker copy (published to init's
+# user page @ 0x7FFFFFFFB080 via user_write_bytes_via_walk before the
+# body call).  8 chars ("svc.echo") + trailing NUL for casual byte-level
+# inspection, though both svc_register and sys_svc_lookup are length-
+# explicit and never read past name_len.
+.global _svc_echo_name
+.align 8
+_svc_echo_name: .ascii "svc.echo\0"
+
 # svc.<name> strings for the R20b.M1-003 (#1554) broker witness.
 # ASCII bytes only; no NUL required (svc_register / svc_lookup are
 # length-explicit), but a trailing NUL keeps the buffer safe for casual

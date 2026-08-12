@@ -385,6 +385,52 @@ case "${EXPECTED}" in
         SMP_UNORDERED_HELLO=1
         EXPECTED=""
         ;;
+    boot_r20b_echo)
+        # R20b.M5-001 (#1563): echo-server end-to-end closure witness —
+        # closes R20b.M5, the R20b round, and the #1015 userspace-server
+        # substrate blocker (unblocks #820 acpi_supervisor + #860
+        # pci_enumerator + every post-R20 userspace daemon).
+        #
+        # Kernel wire-in (src/kernel/boot/kernel_main.pdx, immediately
+        # after loader_seed_witness_done and before sti): unconditional
+        # kernel-driven roundtrip against init's user_pml4 exercising ALL
+        # M1..M4 primitives end-to-end — svc_register + sys_svc_lookup_body
+        # (which internally cap_mint_writes) + sys_ipc_send_body +
+        # sys_ipc_recv_body (server drain) + sys_ipc_reply_body (bit-7 flip)
+        # + sys_ipc_recv_body (client drain of reply). Byte-exact hdr +
+        # payload verify per hop. Emits "R20b ECHO ROUNDTRIP OK\n" on pass.
+        #
+        # Fingerprint contract (contains-in-order — matches every prior
+        # R20b witness marker plus the M5 closure):
+        #   R20b BROKER OK          (M1-003)
+        #   R20b IPC BOUNCE OK      (M2-003 — M2 close)
+        #   R20b SYS IPC RECV OK    (M3-001)
+        #   R20b SYS IPC SEND OK    (M3-002)
+        #   R20b SVC LOOKUP OK      (M3-003 — M3 close)
+        #   R20b INIT CAPS FMT OK   (M4-001)
+        #   R20b LOADER SEED OK     (M4-002 — M4 close)
+        #   R20b ECHO ROUNDTRIP OK  (M5-001 — R20b + #1015 close)
+        # Enforces ordering because M5 depends on M1..M4 having landed
+        # cleanly first — a regression in any earlier witness surfaces as
+        # a missing-line failure BEFORE the checker gets to the M5 line.
+        #
+        # Opt-in only (guarded by PAIDEIA_R20B_ECHO=1 in pre-push): the
+        # M5 witness spawns a substantial new smoke path (~250 lines of
+        # kernel-side orchestration + 4 syscall body calls per hop). The
+        # OK fingerprint appears in EVERY boot log (the witness is
+        # unconditionally wired) but only this mode asserts its presence;
+        # promotes to the default matrix after 5/5 consecutive passes on
+        # the standard R20b round.
+        #
+        # NOT SMP (echo witness is UP-only at R20b.M5 — the substrate is
+        # single-flow per design/ipc/userspace-server-substrate.md §14 Q3).
+        # NOT UART-RX (no chardev injection; the roundtrip is entirely
+        # kernel-driven with no ring-3 involvement at this milestone).
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r20b/expected-echo-roundtrip.txt"
+        TIMEOUT=10
+        EXPECTED=""
+        ;;
     boot_r21_msix_round_robin)
         # R21-M4-005 (#841): MSI-X round-robin structural smoke.
         #
