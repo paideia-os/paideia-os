@@ -122,6 +122,18 @@ the corresponding R29.M1 sub-issue when it lands.
   every `OP_MAP` — the domain cap authorizes the mapping site, the page
   cap authorizes the physical page. Cross-cap consent per the R29 IOMMU
   invariant.
+- **Domain granularity — per-driver-process (D1.b).** One
+  `KIND_HW_DMA_DOMAIN` per driver process, shared across every device
+  the driver claims. Minted at driver-process spawn by the supervisor
+  and delivered via the loader's `_init_caps` sidecar
+  (`design/loader/init-caps-sidecar.md`); revoked on process exit,
+  which tears down every context entry attributed to it. Full rationale
+  (per-driver-process vs per-device vs per-firmware-image), the
+  CNVi-shared-domain blast-radius acknowledgment, and the
+  `dma_domain_attach(domain, bdf)` supervisor entry point are
+  documented in `design/drivers/blob-policy.md` §2. This rule governs
+  both blob-consuming drivers (Wi-Fi, BT, IPU6, GuC, SOF) and native
+  drivers uniformly.
 
 ### `KIND_HW_TIMELINE` — landed by R29.M1-004 (#1022)
 
