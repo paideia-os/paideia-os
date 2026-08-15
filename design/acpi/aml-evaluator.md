@@ -1820,3 +1820,284 @@ real test. That is worth recording as a general shape — *a fixed-point
 algorithm tested on input that converges in one step is not tested at
 all* — and it is the second time in this subsystem that mutation found a
 fixture measuring the wrong thing rather than an implementation bug.
+
+---
+
+# R30.M3-003/004/005 (#1063 / #1064 / #1065) — SystemIO, PCI_Config, EmbeddedControl
+
+R30.M3-002 left three spaces refused and predicted that each would become
+"a row in `aml_region_space_supported`, not a branch somewhere else".
+That prediction held: the three additions are rows in two tables — the
+serviced-space predicate and the access-width resolver — plus one new
+transaction primitive, one namespace walk, and one gate.
+
+## The new boundary of `AML_ERR_REGION_SPACE` (62)
+
+Four spaces are serviced: SystemMemory (0), SystemIO (1), PCI_Config (2),
+EmbeddedControl (3). Code 62 now means exactly, and only:
+
+| Space | Why it stays refused |
+|-------|----------------------|
+| SMBus (4) | bus protocol; an access is a command/reply transaction |
+| SystemCMOS (5) | index/data pair at 0x70/0x71 — offset *N* is **not** port 0x70+*N* |
+| PciBarTarget (6) | needs the BAR resolved through the device's `_CRS` |
+| IPMI (7) | request/response over a BMC interface |
+| GeneralPurposeIO (8) | pin-addressed, needs `_CRS` `GpioIo` connection |
+| GenericSerialBus (9) | protocol-typed access carrying a buffer |
+| PCC (10) | mailbox with a doorbell handshake |
+| 0x80 and above | vendor-defined; no interpretation exists |
+
+SystemCMOS is the one worth naming twice, because it is the one that
+*looks* serviceable on the SystemIO path. It is not: writing the index
+register with data is the failure, and it is silent.
+
+## The transaction/logic split, per space
+
+The split established by #1062 is what lets the corpus run the real code.
+It falls differently for each space, and stating where is the point.
+
+**PCI_Config** needs *no new transaction primitive at all*, because an
+ECAM access **is** a memory access. This is the same fact that makes
+`opregion_space_base_kind` map PCI_Config to `KIND_MEMORY`. Everything
+#1064 adds is pure logic over the parse tree and is therefore tested
+directly, against a 4096-byte synthetic function. No configuration space
+is read by the corpus.
+
+**SystemIO** shares the entire logic path with memory. The transaction is
+`in`/`out`, confined to `aml_region_port_in` and `aml_region_port_out`,
+the only two functions in the repository containing those instructions —
+asserted by `tools/verify-aml-parser.sh` against the disassembly, with a
+vacuity guard requiring the two functions to actually contain six port
+instructions so the check cannot pass by finding nothing.
+
+**The corpus performs no real port I/O**, and that is a refusal rather
+than a gap. A ring-3 `in` faults, and it was tempting to use that fault
+as proof the sentinel path reaches a real instruction. It is bad
+evidence: it holds only while the harness lacks I/O privilege, and an
+assertion that evaporates under more privilege is not an assertion. It
+would also mean issuing a genuine transaction against whatever PS/2
+controller belongs to the machine running the pre-push hook. The path is
+pinned two other ways instead — the static confinement check above, and a
+behavioural discriminator that needs no transaction: a qword access
+through a real-port binding is refused with `ACCESS_WIDTH`, because no
+8-byte port instruction exists, whereas a mutant routing the sentinel to
+memory dereferences address 1 and dies of a SIGSEGV the harness reports.
+
+**EmbeddedControl** has no transaction to split. See the gate below.
+
+## SystemIO
+
+*Port space is 16 bits.* Not a policy limit: `in`/`out` take the port in
+DX and no wider form exists, so a port above 0xFFFF is unaddressable, not
+merely unauthorised. Checked at bind with the same overflow-safe shape as
+`aml_region_contains` — `decl_base + decl_len` is never formed — and
+refused with `AML_ERR_REGION_PORT_RANGE` (65) **before** the containment
+check, because it is a property of the space rather than of the grant.
+
+*There is no qword port access.* `QWordAcc` on a SystemIO region resolves
+to 0 in `aml_region_acc_bits` and is refused with `ACCESS_WIDTH`. It is
+**not** split into two dword transactions: two reads of a port are two
+transactions, and on a FIFO or a clear-on-read status register that is a
+different and destructive operation. The refusal is doubled — once in the
+width table, once inside the real-port branch of the access step — and
+the encoder agrees, since paideia-as's `In { width }` admits only 1, 2
+and 4.
+
+*The read-modify-write hazard is sharper here than for memory.* A port
+read can clear a status bit, pop a FIFO or advance a latch. `Preserve` on
+a partial field write therefore performs a genuine destructive read when
+the table asks for one. The handler does not second-guess that: **what a
+`Preserve` partial write to a port does is exactly one read of the unit
+followed by exactly one write, and nothing else.** The table's own remedy
+for a port where that is wrong is to declare `WriteAsOnes` or
+`WriteAsZeros`, which suppress the read entirely — the machinery #1062
+built for precisely this case. The corpus asserts the **access count**,
+not merely the resulting bytes, because all three rules produce a
+plausible-looking byte and only the count distinguishes them:
+
+| Rule | Coverage | Accesses | Result over 0xA0, field ← 0x5 |
+|------|----------|----------|-------------------------------|
+| Preserve | partial | **2** (read + write) | 0xA5 |
+| WriteAsOnes | partial | **1** (write only) | 0xF5 |
+| WriteAsZeros | partial | **1** (write only) | 0x05 |
+| Preserve | whole unit | **1** (write only) | 0x3C |
+
+The last row matters on its own: a full-unit write under `Preserve` must
+not read "because the rule is Preserve" when there are no bits to
+preserve.
+
+## PCI_Config
+
+A PCI_Config OperationRegion carries no bus, device or function. Its
+declared offset is an offset into the configuration space of the function
+it is *declared inside*. **Getting this wrong is not a fault but silent
+corruption**: the region addresses a real but different function, and
+every bounds check downstream still passes while another device's BARs
+and command register are rewritten.
+
+So the rule is **refuse, never default**. `aml_region_pci_context` walks:
+
+1. the nearest enclosing `Device` — stopping at the root rather than
+   treating the root as a device;
+2. that device's `_ADR`, which must be a **constant integer `Name`**. An
+   `_ADR` written as a Method is *not* evaluated — running vendor AML at
+   bind time, to resolve a binding that does not yet exist, is exactly
+   the reentrancy a hostile table would aim for — and is refused;
+3. `_ADR` well-formedness: 32 bits, device ≤ 31, function ≤ 7. An
+   out-of-range `_ADR` is **refused, not masked**. Masking 0x00200003
+   down to device 0 addresses a completely different function while
+   looking entirely successful;
+4. a **positively identified host bridge** above it, by `_HID` of
+   PNP0A03 (0x030AD041) or PNP0A08 (0x080AD041).
+
+Only *then* are `_BBN` and `_SEG` read, defaulting to bus 0 and segment 0
+when absent. That default is ACPI-sanctioned **for a host bridge**, which
+is why step 4 must succeed first: a device with an `_ADR` and no host
+bridge in its ancestry is not "probably on bus 0", it is not a PCI device
+or the table is malformed, and either way the answer is
+`AML_ERR_REGION_PCI_CONTEXT` (66). A present-but-out-of-range `_BBN` or
+`_SEG` is refused, not truncated. A `_HID` written as a string rather
+than an EisaId integer is not matched, and therefore refuses — the string
+form is legal ACPI, but reading it needs the AML buffer, which is
+confined to `aml_lex.o`, and guessing that an unreadable `_HID` is
+probably a host bridge is the defaulting this issue forbids.
+
+The resolved context is packed into row word 1 above the space —
+`VALID` at bit 40, segment [31:16], bus [15:8], device [7:3], function
+[2:0] — and exposed by `aml_region_pci_ctx`, so **which** function a
+region resolved to is observable. The `VALID` bit exists because
+0000:00:00.0 is a real function, typically the host bridge itself: without
+it, the exact failure this issue prevents would be spelled `0`. Adding
+the context to word 1 is also why `aml_region_space` now masks; a missing
+mask is its own mutant, and it is killed.
+
+**R22 reuse.** This module never learns an ECAM base and cannot construct
+one. It resolves `{seg, bus, dev, func}`; the supervisor asks the kernel
+for an OpRegion capability over that function's configuration space; the
+kernel's `src/kernel/core/pci/config.pdx` resolves the segment base
+through `mcfg_ecam_base_for_segment` (R20-M3-001) and adds the same
+`(bus << 20) | (dev << 15) | (func << 12)` R22 has always used. There is
+no second ECAM path. `aml_region_pci_ecam_offset` mirrors the *offset*
+arithmetic alone so the corpus can pin the two together; if R22's layout
+ever changed, that assertion is what catches this copy drifting.
+
+`AnyAcc` resolves to **32** for PCI_Config — dword is config space's
+natural and universally safe unit — which is the row #1062 predicted this
+table would need. Offsets are bounded by 4096 (extended) at bind.
+
+## EmbeddedControl — gated on R31
+
+The EC driver is R31 work and does not exist. This milestone lands the
+handler contract, the address-space registration and the bind-time
+validation, and gates the transaction — the shape iter 32 used for VT-d.
+
+An EC region **binds** (so a malformed one is still reported where the
+table is set up), validates its 256-byte extent, and admits **ByteAcc
+only**: the EC protocol transfers exactly one byte per handshake, so a
+`WordAcc` EC field is a table bug and must not silently become two
+handshakes. Every transaction then returns `AML_ERR_REGION_EC_GATED`
+(67), produces **no value**, and counts **no access**.
+
+Nothing is simulated. A handler returning plausible bytes would make
+thermal, battery and lid code appear to work while reading fiction — a
+battery gauge reading 100% from a fabricated EC is worse than one
+reporting an error, because nothing downstream can tell.
+
+### What R31 must add
+
+An EC access is not a load. Reading one byte is a handshake over two
+ports (ACPI 6.5 §12.2): write `RD_EC` (0x80) to the command port, poll
+until IBF clears, write the address to the data port, poll until OBF
+sets, read the byte. A write is `WR_EC` (0x81) with an extra phase.
+Concretely R31 owes:
+
+1. A driver owning the two ports **taken from the EC device's `_CRS`**,
+   not hardcoded to 0x62/0x66 — machines relocate them.
+2. Serialisation. The EC has one outstanding transaction; interleaving
+   two corrupts both.
+3. Timeouts and recovery. A real EC takes milliseconds and can wedge.
+   This is the reason the access cannot simply be inlined here: it needs
+   to block and to fail, and the evaluator's fuel model has no notion of
+   waiting.
+4. `_GPE` query handling (`KIND_EC_QUERY`): the EC raises an SCI, the
+   driver issues `QR_EC` (0x84), and the returned byte selects a `_Qxx`
+   method — a **reentry** into the interpreter, which needs the
+   serialisation story settled first.
+5. A call to `aml_region_ec_backing_set`, which opens the gate, and
+   wiring the transaction at the `amr_ru_ec` / `amr_wu_ec` labels.
+
+### Where the flip-assertion lives
+
+Two places, and both must be updated deliberately when R31 lands:
+
+* **`tests/user/aml/aml_harness.c`**, in
+  `test_region_ec_binds_but_does_not_transact`: `aml_region_ec_backing()
+  == 0` and `aml_region_ec_hw_committed() == 0`. The committed counter is
+  *not* cleared by `aml_region_reset`, so it is a whole-process claim —
+  "this process has never performed an EC transaction" — rather than a
+  per-session one.
+* **`tools/verify-aml-parser.sh`**, the `EC gate closed` check: no object
+  may relocate against `aml_region_ec_backing_set`. This is true today
+  precisely because the driver does not exist, which makes "the gate is
+  still closed" a *build-time fact* rather than a comment. It is the
+  stronger of the two, because it holds over code no fixture reaches.
+
+## Error codes — continuing §20
+
+| Code | Name | Means |
+|------|------|-------|
+| 65 | `AML_ERR_REGION_PORT_RANGE` | a SystemIO region outside 0x0000–0xFFFF |
+| 66 | `AML_ERR_REGION_PCI_CONTEXT` | the enclosing PCI device context could not be resolved — **never** substituted with a default |
+| 67 | `AML_ERR_REGION_EC_GATED` | EC transaction unavailable until R31's driver registers a backing |
+
+Reused rather than duplicated: `ACCESS_WIDTH` (60) for `QWordAcc` on a
+port or on config space and for a non-byte EC access; `NOT_COVERED` (57)
+for a PCI offset beyond 4096 or an EC offset beyond 256.
+
+## Verification
+
+`tools/verify-aml-parser.sh` gained three build-time assertions —
+EC-gate-state confinement, port-I/O confinement with a vacuity guard, and
+the closed-gate relocation check — and the corpus went from 3198 to 3199
+assertions across ten new cases. All fixtures load against a `PROT_NONE`
+guard page and the whole run is under the 60-second watchdog. The
+`no-AML kernel guardrail` passes and `_op_region_table` confinement is
+untouched.
+
+## Mutation evidence
+
+Thirteen mutants, **thirteen killed** — twelve on the first pass, one
+after a fixture fix.
+
+| Mutant | Killed by |
+|--------|-----------|
+| default to 00:00.0 when no host bridge is found | "no context is produced" (got `0x100000000fb`) |
+| mask an out-of-range `_ADR` device instead of refusing | "device 32 does not exist" |
+| mask an out-of-range `_ADR` function instead of refusing | "function 8 does not exist" |
+| ignore `_BBN`, default the bus to 0 | "bus 0x20" and the ECAM-offset cross-check |
+| `WriteAsOnes` reads the unit first | "EXACTLY ONE ACCESS — NO READ" |
+| `WriteAsZeros` reads the unit first | "EXACTLY ONE ACCESS — NO READ" |
+| admit `QWordAcc` for SystemIO and split it | "QWordAcc has NO port form" |
+| port bound off by one (0x10001) | "one byte past the end of port space" |
+| `AnyAcc` resolves to a byte for PCI_Config | "AnyAcc is a DWORD for config space" |
+| service an EC region as memory instead of gating | "an EC read produces NOTHING" (returned 0xA5) |
+| fail to mask the packed context out of the space | "bound as PCI_Config" (got `0xfb02`) |
+| admit `WordAcc` for the EC | "WordAcc is refused for the EC" |
+| apply window arithmetic to the real-port sentinel | "host_base is the sentinel, not an address" — *after a fixture fix* |
+
+The last one **initially survived**, and again the defect was in the
+fixture rather than the code: the real-port binding used a window whose
+base equalled the region's declared base, so the window offset was zero
+and `1 + 0 == 1` made the mutation equivalent. Setting the window to
+0x50 while the region sits at 0x60 gives an offset of 0x10 and makes the
+mutant produce `0x11`; it then dies twice over, once on the sentinel
+comparison and once on the SIGSEGV from dereferencing 0x11.
+
+That is the third time in this subsystem that mutation testing found a
+fixture measuring the wrong thing rather than an implementation bug, and
+the shape is now familiar enough to name: *a test whose inputs make the
+mutated arithmetic an identity is not testing that arithmetic.* Choosing
+fixture constants that differ from the values a broken implementation
+would invent — a non-zero `_BBN`, a non-zero `_SEG`, a window base below
+the region base — is what turns these into real tests, and it is why
+those constants are what they are.

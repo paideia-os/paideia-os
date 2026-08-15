@@ -314,7 +314,21 @@ extern uint64_t aml_region_bounds_ok(uint64_t b, uint64_t off, uint64_t n);
 extern uint64_t aml_region_read_unit(uint64_t b, uint64_t off, uint64_t n);
 extern uint64_t aml_region_write_unit(uint64_t b, uint64_t off, uint64_t n,
                                       uint64_t v);
-extern uint64_t aml_region_acc_bits(uint64_t node);
+extern uint64_t aml_region_acc_bits(uint64_t node, uint64_t space);
+/* #1063 / #1064 / #1065 */
+extern uint64_t aml_region_pci_ctx(uint64_t b);
+extern uint64_t aml_region_row_word(uint64_t b, uint64_t w);
+extern uint64_t aml_region_port_in(uint64_t port, uint64_t n);
+extern uint64_t aml_region_port_out(uint64_t port, uint64_t n, uint64_t v);
+extern uint64_t aml_region_pci_ecam_offset(uint64_t ctx);
+extern uint64_t aml_region_pci_context(uint64_t node);
+extern uint64_t aml_region_enclosing_device(uint64_t node);
+extern uint64_t aml_region_host_bridge(uint64_t dev);
+extern uint64_t aml_region_named_int(uint64_t scope, uint64_t seg);
+extern uint64_t aml_region_named_int_val(uint64_t name_node);
+extern uint64_t aml_region_ec_backing(void);
+extern uint64_t aml_region_ec_hw_committed(void);
+extern uint64_t aml_region_ec_gated(void);
 extern uint64_t aml_region_acc_log(uint64_t aw);
 extern uint64_t aml_region_of_field(uint64_t node);
 extern uint64_t aml_region_field_binding(uint64_t node);
@@ -388,7 +402,17 @@ enum {
     E_REGION_NO_CAP = 56, E_REGION_NOT_COVERED = 57, E_REGION_UNBOUND = 58,
     E_REGION_OOB = 59, E_REGION_ACCESS_WIDTH = 60, E_REGION_FIELD_WIDTH = 61,
     E_REGION_SPACE = 62, E_REGION_TABLE_FULL = 63,
-    E_REGION_INDIRECT_FIELD = 64
+    E_REGION_INDIRECT_FIELD = 64,
+    /* #1063 / #1064 / #1065 */
+    E_REGION_PORT_RANGE = 65, E_REGION_PCI_CONTEXT = 66,
+    E_REGION_EC_GATED = 67
+};
+
+/* Address spaces, and the sentinel that selects real port transactions. */
+enum {
+    SP_MEM = 0, SP_IO = 1, SP_PCI = 2, SP_EC = 3,
+    IO_REAL = 1,
+    PCI_CTX_VALID_HI = 0x100  /* bit 40, as the top byte of a >>32 shift */
 };
 
 /* ACPI ObjectType codes — §19.6.101, and the object model's internal tag. */
@@ -5168,10 +5192,12 @@ static void test_region_arithmetic_edges(void)
     eq("mask 64 is all ones, not zero", aml_region_mask(64),
        0xFFFFFFFFFFFFFFFFull);
 
+    /* #1063 / #1064 / #1065 moved this boundary. The four serviced
+     * spaces and the enumerated refusal now live in
+     * test_region_space_boundary; this keeps only the anchor. */
     eq("SystemMemory is serviced", aml_region_space_supported(0), 1);
-    eq("SystemIO is not, yet", aml_region_space_supported(1), 0);
-    eq("PCI_Config is not, yet", aml_region_space_supported(2), 0);
-    eq("EmbeddedControl is not, yet", aml_region_space_supported(3), 0);
+    eq("SMBus is still a bus protocol, not a window",
+       aml_region_space_supported(4), 0);
     eq("this module handles no opcode", aml_region_handles(0x5B80), 0);
 
     eq("log2 8", aml_region_acc_log(8), 3);
@@ -5210,7 +5236,7 @@ static void test_region_unaligned_field_spanning_two_units(void)
         eq("F0 is 3 bits", aml_node_arg1(f0), 3);
         eq("FSP at bit 3", aml_node_arg0(fsp), 3);
         eq("FSP is 40 bits", aml_node_arg1(fsp), 40);
-        eq("its declared width is 32", aml_region_acc_bits(fsp), 32);
+        eq("its declared width is 32", aml_region_acc_bits(fsp, SP_MEM), 32);
 
         static const uint8_t seed[16] = {
             0x21, 0x43, 0x65, 0x87,   /* dword0 = 0x87654321 */
@@ -5408,12 +5434,12 @@ static void test_region_access_width_is_honoured(void)
         uint64_t qw  = nth_child(nth_child(root, 6), 1);
 
         /* The resolution table, in both directions. */
-        eq("AnyAcc resolves to 8 for a memory window", aml_region_acc_bits(aw), 8);
-        eq("ByteAcc  -> 8",  aml_region_acc_bits(bw), 8);
-        eq("WordAcc  -> 16", aml_region_acc_bits(ww), 16);
-        eq("DWordAcc -> 32", aml_region_acc_bits(dw), 32);
-        eq("QWordAcc -> 64", aml_region_acc_bits(qw), 64);
-        eq("BufferAcc is not a memory width", aml_region_acc_bits(xb), 0);
+        eq("AnyAcc resolves to 8 for a memory window", aml_region_acc_bits(aw, SP_MEM), 8);
+        eq("ByteAcc  -> 8",  aml_region_acc_bits(bw, SP_MEM), 8);
+        eq("WordAcc  -> 16", aml_region_acc_bits(ww, SP_MEM), 16);
+        eq("DWordAcc -> 32", aml_region_acc_bits(dw, SP_MEM), 32);
+        eq("QWordAcc -> 64", aml_region_acc_bits(qw, SP_MEM), 64);
+        eq("BufferAcc is not a memory width", aml_region_acc_bits(xb, SP_MEM), 0);
 
         static const uint8_t seed[6] = { 0, 0, 0, 0, 0x7E, 0 };
         uint8_t *back = backing_load(seed, sizeof seed);
@@ -5472,7 +5498,7 @@ static void test_region_boundary_refusals(void)
 {
     /* A SystemIO region, an IndexField, and a field wider than 64 bits. */
     uint8_t b[] = {
-        0x5B, 0x80, 'S','I','O','0', 0x01, 0x0A, 0x62, 0x0A, 0x02,
+        0x5B, 0x80, 'S','M','B','0', 0x04, 0x0A, 0x62, 0x0A, 0x02,
         0x5B, 0x80, 'R','G','N','4', 0x00, 0x0B, 0x00, 0x50, 0x0A, 0x20,
         0x5B, 0x81, 0x0C, 'R','G','N','4', 0x01,
             'W','I','D','E', 0x40, 0x08,         /* 128 bits (PkgLength) */
@@ -5485,7 +5511,7 @@ static void test_region_boundary_refusals(void)
         uint64_t rgn  = nth_child(root, 1);
         uint64_t wide = nth_child(nth_child(root, 2), 0);
         uint64_t ixf  = nth_child(nth_child(root, 3), 1);
-        eq("SystemIO", aml_node_flags(sio), 1);
+        eq("SMBus", aml_node_flags(sio), 4);
         eq("128 bits wide", aml_node_arg1(wide), 128);
         eq("an IndexField element", aml_node_kind(ixf), N_FIELD_ELEM);
 
@@ -5496,9 +5522,10 @@ static void test_region_boundary_refusals(void)
          * rather than at every later access. */
         aml_eval_reset(2);
         aml_region_reset();
-        eq("a SystemIO region is refused",
+        eq("an SMBus region is refused",
            aml_region_bind(sio, 9, 0x62, 2, (uint64_t)(uintptr_t)back), 0);
-        eq("SPACE (#1063)", aml_eval_err(), E_REGION_SPACE);
+        eq("SPACE — a bus protocol is not a window",
+           aml_eval_err(), E_REGION_SPACE);
         eq("nothing bound", aml_region_count(), 0);
 
         aml_eval_reset(2);
@@ -5672,6 +5699,792 @@ static void test_region_fieldunit_store_is_real_now(void)
     });
 }
 
+/* =====================================================================
+ * R30.M3-003/004/005 (#1063 / #1064 / #1065) — the other three spaces.
+ *
+ * THE TRANSACTION/LOGIC SPLIT, PER SPACE. #1062 established that the
+ * mapping step decides WHETHER and WHERE, and the access step does the
+ * arithmetic against whatever the mapping step recorded. That split is
+ * what lets the corpus run the real code. It falls differently for each
+ * of the three spaces added here, so each is stated:
+ *
+ *   PCI_Config — the transaction is a MEMORY access, because ECAM is
+ *   memory-mapped. So there is nothing new to stub at all: the corpus
+ *   points host_va at a 4096-byte synthetic function and the entire
+ *   handler runs for real. Everything #1064 adds — resolving
+ *   {seg, bus, dev, func} from the namespace, bounding by config-space
+ *   size, resolving AnyAcc to dword — is pure logic over the parse tree
+ *   and is tested directly. NO CONFIG SPACE IS READ.
+ *
+ *   SystemIO — the logic is identical to the memory path and is tested
+ *   against a synthetic backing, which is reached by handing bind a
+ *   host_va that is a buffer. The transaction is `in`/`out`, confined to
+ *   aml_region_port_in / aml_region_port_out.
+ *
+ *   NO REAL PORT I/O IS PERFORMED BY THIS CORPUS, and that is a
+ *   deliberate refusal rather than a gap. Executing `in` against, say,
+ *   port 0x60 would be a real transaction against the real PS/2
+ *   controller of whatever machine runs the pre-push hook. It happens to
+ *   fault in ring 3 on Linux — which is tempting to lean on as proof —
+ *   but "it faulted" is only true while the harness lacks I/O privilege,
+ *   and a corpus whose evidence evaporates if it is ever run with more
+ *   privilege is not evidence. So the port path is pinned two other
+ *   ways, both airtight and neither touching a port:
+ *
+ *     1. STRUCTURALLY. tools/verify-aml-parser.sh disassembles
+ *        aml_region.o and asserts that every `in` and `out` instruction
+ *        lies inside those two functions and nowhere else.
+ *     2. BEHAVIOURALLY, via a discriminator that needs no transaction: a
+ *        qword access through a real-port binding is refused with
+ *        ACCESS_WIDTH, because no 8-byte port instruction exists. A
+ *        mutant that routed the real-port sentinel to the memory path
+ *        would instead dereference address 1 and die of a SIGSEGV the
+ *        harness reports.
+ *
+ *   EmbeddedControl — there is no transaction to test, because R31 does
+ *   not exist. The corpus tests the logic and PINS the transaction at
+ *   zero. That pin is the assertion that flips when R31 lands.
+ * ===================================================================== */
+
+/* Emit a PkgLength for `n` bytes of body, then the body. */
+static size_t emit_pkg(uint8_t *out, const uint8_t *body, size_t n)
+{
+    size_t k = emit_pkglen(out, n);
+    memcpy(out + k, body, n);
+    return k + n;
+}
+
+/* OperationRegion (IOR0, SystemIO, base, len), then six Fields over it —
+ * one per UpdateRule, one covering a whole unit, one QWordAcc and one
+ * AnyAcc. Base and length are DWord-encoded whatever their value so the
+ * byte layout does not shift between cases. */
+static size_t build_io(uint8_t *out, uint32_t base, uint32_t len)
+{
+    static const struct { uint8_t flags; const char *n0; const char *n1; }
+    F[] = {
+        { 0x01, "FLDL", "FLDH" },   /* ByteAcc  Preserve      */
+        { 0x21, "ONEL", "ONEH" },   /* ByteAcc  WriteAsOnes   */
+        { 0x41, "ZERL", "ZERH" },   /* ByteAcc  WriteAsZeros  */
+    };
+    size_t o = 0;
+    out[o++] = 0x5B; out[o++] = 0x80;
+    out[o++]='I'; out[o++]='O'; out[o++]='R'; out[o++]='0';
+    out[o++] = 0x01;                                   /* SystemIO */
+    out[o++] = 0x0C;
+    out[o++]=(uint8_t)base;       out[o++]=(uint8_t)(base>>8);
+    out[o++]=(uint8_t)(base>>16); out[o++]=(uint8_t)(base>>24);
+    out[o++] = 0x0C;
+    out[o++]=(uint8_t)len;        out[o++]=(uint8_t)(len>>8);
+    out[o++]=(uint8_t)(len>>16);  out[o++]=(uint8_t)(len>>24);
+
+    for (size_t i = 0; i < sizeof F / sizeof F[0]; i++) {
+        uint8_t b[32]; size_t k = 0;
+        memcpy(b + k, "IOR0", 4); k += 4;
+        b[k++] = F[i].flags;
+        memcpy(b + k, F[i].n0, 4); k += 4; b[k++] = 4;
+        memcpy(b + k, F[i].n1, 4); k += 4; b[k++] = 4;
+        out[o++] = 0x5B; out[o++] = 0x81;
+        o += emit_pkg(out + o, b, k);
+    }
+    /* A field covering a WHOLE access unit — no rule applies. */
+    { uint8_t b[32]; size_t k = 0;
+      memcpy(b + k, "IOR0", 4); k += 4; b[k++] = 0x01;
+      memcpy(b + k, "WHOL", 4); k += 4; b[k++] = 8;
+      out[o++] = 0x5B; out[o++] = 0x81; o += emit_pkg(out + o, b, k); }
+    /* QWordAcc — refused for a port, which is the point. */
+    { uint8_t b[32]; size_t k = 0;
+      memcpy(b + k, "IOR0", 4); k += 4; b[k++] = 0x04;
+      memcpy(b + k, "QFLD", 4); k += 4; b[k++] = 32;
+      out[o++] = 0x5B; out[o++] = 0x81; o += emit_pkg(out + o, b, k); }
+    /* AnyAcc — must resolve to the narrowest width for a port. */
+    { uint8_t b[32]; size_t k = 0;
+      memcpy(b + k, "IOR0", 4); k += 4; b[k++] = 0x00;
+      memcpy(b + k, "ANYF", 4); k += 4; b[k++] = 8;
+      out[o++] = 0x5B; out[o++] = 0x81; o += emit_pkg(out + o, b, k); }
+    return o;
+}
+
+/* OperationRegion (ECR_, EmbeddedControl, 0, len) + a ByteAcc field and
+ * a WordAcc field. The EC transfers one byte per handshake, so the
+ * WordAcc one must be refused. */
+static size_t build_ec(uint8_t *out, uint32_t len)
+{
+    size_t o = 0;
+    out[o++] = 0x5B; out[o++] = 0x80;
+    out[o++]='E'; out[o++]='C'; out[o++]='R'; out[o++]='_';
+    out[o++] = 0x03;                                   /* EmbeddedControl */
+    out[o++] = 0x0C; out[o++]=0; out[o++]=0; out[o++]=0; out[o++]=0;
+    out[o++] = 0x0C;
+    out[o++]=(uint8_t)len;        out[o++]=(uint8_t)(len>>8);
+    out[o++]=(uint8_t)(len>>16);  out[o++]=(uint8_t)(len>>24);
+
+    { uint8_t b[32]; size_t k = 0;
+      memcpy(b + k, "ECR_", 4); k += 4; b[k++] = 0x01;   /* ByteAcc */
+      memcpy(b + k, "ECF0", 4); k += 4; b[k++] = 8;
+      out[o++] = 0x5B; out[o++] = 0x81; o += emit_pkg(out + o, b, k); }
+    { uint8_t b[32]; size_t k = 0;
+      memcpy(b + k, "ECR_", 4); k += 4; b[k++] = 0x02;   /* WordAcc */
+      memcpy(b + k, "ECW0", 4); k += 4; b[k++] = 16;
+      out[o++] = 0x5B; out[o++] = 0x81; o += emit_pkg(out + o, b, k); }
+    return o;
+}
+
+/* Device (DEV0) { Name(_ADR, adr)?  OperationRegion(PCFG, PCI_Config,
+ *                 rbase, rlen)  Field(PCFG, AccType, NoLock, Preserve)
+ *                 { PFLD, 32 } }
+ * optionally wrapped in a host bridge:
+ *   Device (PCI0) { _HID = EisaId(hid), _BBN = 0x20, _SEG = 0x01, DEV0 }
+ *
+ * _BBN and _SEG are deliberately NON-ZERO. A mutant that defaults the
+ * bus or the segment instead of reading them produces 0 and dies on the
+ * context comparison — which would be invisible if the fixture had used
+ * the values a defaulting implementation would invent. */
+static size_t build_pci(uint8_t *out, int with_bridge, int with_adr,
+                        uint32_t adr, uint32_t hid, uint32_t rbase,
+                        uint32_t rlen, uint8_t accflags)
+{
+    uint8_t inner[192]; size_t i = 0;
+    if (with_adr) {
+        inner[i++] = 0x08;
+        memcpy(inner + i, "_ADR", 4); i += 4;
+        inner[i++] = 0x0C;
+        inner[i++]=(uint8_t)adr;       inner[i++]=(uint8_t)(adr>>8);
+        inner[i++]=(uint8_t)(adr>>16); inner[i++]=(uint8_t)(adr>>24);
+    }
+    inner[i++] = 0x5B; inner[i++] = 0x80;
+    memcpy(inner + i, "PCFG", 4); i += 4;
+    inner[i++] = 0x02;                                 /* PCI_Config */
+    inner[i++] = 0x0C;
+    inner[i++]=(uint8_t)rbase;       inner[i++]=(uint8_t)(rbase>>8);
+    inner[i++]=(uint8_t)(rbase>>16); inner[i++]=(uint8_t)(rbase>>24);
+    inner[i++] = 0x0C;
+    inner[i++]=(uint8_t)rlen;        inner[i++]=(uint8_t)(rlen>>8);
+    inner[i++]=(uint8_t)(rlen>>16);  inner[i++]=(uint8_t)(rlen>>24);
+    { uint8_t b[32]; size_t k = 0;
+      memcpy(b + k, "PCFG", 4); k += 4; b[k++] = accflags;
+      memcpy(b + k, "PFLD", 4); k += 4; b[k++] = 32;
+      inner[i++] = 0x5B; inner[i++] = 0x81; i += emit_pkg(inner + i, b, k); }
+
+    uint8_t devbody[224]; size_t d = 0;
+    memcpy(devbody + d, "DEV0", 4); d += 4;
+    memcpy(devbody + d, inner, i);  d += i;
+
+    uint8_t dev[240]; size_t dn = 0;
+    dev[dn++] = 0x5B; dev[dn++] = 0x82;
+    dn += emit_pkg(dev + dn, devbody, d);
+
+    if (!with_bridge) { memcpy(out, dev, dn); return dn; }
+
+    uint8_t br[320]; size_t bn = 0;
+    memcpy(br + bn, "PCI0", 4); bn += 4;
+    br[bn++] = 0x08; memcpy(br + bn, "_HID", 4); bn += 4;
+    br[bn++] = 0x0C;
+    br[bn++]=(uint8_t)hid;       br[bn++]=(uint8_t)(hid>>8);
+    br[bn++]=(uint8_t)(hid>>16); br[bn++]=(uint8_t)(hid>>24);
+    br[bn++] = 0x08; memcpy(br + bn, "_BBN", 4); bn += 4;
+    br[bn++] = 0x0A; br[bn++] = 0x20;                  /* bus 0x20 */
+    br[bn++] = 0x08; memcpy(br + bn, "_SEG", 4); bn += 4;
+    br[bn++] = 0x0A; br[bn++] = 0x01;                  /* segment 1 */
+    memcpy(br + bn, dev, dn); bn += dn;
+
+    size_t o = 0;
+    out[o++] = 0x5B; out[o++] = 0x82;
+    o += emit_pkg(out + o, br, bn);
+    return o;
+}
+
+/* --- the enumerated boundary of AML_ERR_REGION_SPACE ------------------ */
+
+static void test_region_space_boundary(void)
+{
+    g_case = "region: the serviced spaces, and the enumerated refusal";
+
+    eq("SystemMemory serviced",    aml_region_space_supported(0), 1);
+    eq("SystemIO serviced",        aml_region_space_supported(1), 1);
+    eq("PCI_Config serviced",      aml_region_space_supported(2), 1);
+    eq("EmbeddedControl serviced", aml_region_space_supported(3), 1);
+
+    /* Everything still refused, named one by one. Each is a bus protocol
+     * whose access is a transaction, not a load from an offset. */
+    eq("SMBus refused",            aml_region_space_supported(4), 0);
+    eq("SystemCMOS refused",       aml_region_space_supported(5), 0);
+    eq("PciBarTarget refused",     aml_region_space_supported(6), 0);
+    eq("IPMI refused",             aml_region_space_supported(7), 0);
+    eq("GeneralPurposeIO refused", aml_region_space_supported(8), 0);
+    eq("GenericSerialBus refused", aml_region_space_supported(9), 0);
+    eq("PCC refused",              aml_region_space_supported(10), 0);
+    eq("vendor-defined refused",   aml_region_space_supported(0x80), 0);
+    eq("0xFF refused",             aml_region_space_supported(0xFF), 0);
+}
+
+/* --- SystemIO: the 16-bit port bound and the width refusal ------------ */
+
+static void test_region_systemio_port_bounds(void)
+{
+    static const struct { uint32_t base, len; int ok; const char *what; } C[] = {
+        { 0x0060,     0x0008, 1, "an ordinary port range binds" },
+        { 0x0000,     0x0001, 1, "port 0 is a real port" },
+        { 0xFFF8,     0x0008, 1, "a range ending exactly at 0x10000 binds" },
+        { 0xFFF8,     0x0009, 0, "one byte past the end of port space" },
+        { 0xFFFF,     0x0002, 0, "straddling the top of port space" },
+        { 0x10000,    0x0001, 0, "the first port that does not exist" },
+        { 0xFFFFFFFF, 0x0002, 0, "a base that would wrap if added to" },
+        { 0x0000,  0x10001,   0, "longer than the whole port space" },
+    };
+    for (size_t i = 0; i < sizeof C / sizeof C[0]; i++) {
+        uint8_t f[256];
+        size_t n = build_io(f, C[i].base, C[i].len);
+        WITH_PARSE(C[i].what, f, n, {
+            eq("parse ok", aml_lex_err(), AML_OK);
+            uint64_t rgn = nth_child(root, 0);
+            eq("an OperationRegion", aml_node_kind(rgn), N_OPREGION);
+            eq("in SystemIO", aml_node_flags(rgn), SP_IO);
+
+            uint8_t *back = backing_load(NULL, 0x40);
+            aml_eval_reset(2);
+            aml_region_reset();
+            uint64_t before = aml_region_refusals();
+            /* The window is handed in as the capability's own port range,
+             * so containment can never be what refuses these: the port
+             * bound is a property of the SPACE and is checked first. */
+            uint64_t b = aml_region_bind(rgn, 7, C[i].base, C[i].len,
+                                         (uint64_t)(uintptr_t)back);
+            if (C[i].ok) {
+                g_checks++;
+                if (b == 0) fail("%s — expected a binding", C[i].what);
+                eq("no error", aml_eval_err(), AML_OK);
+                eq("space recorded", aml_region_space(b), SP_IO);
+                eq("no PCI context on a port binding",
+                   aml_region_pci_ctx(b), 0);
+            } else {
+                eq("refused", b, 0);
+                eq("PORT_RANGE", aml_eval_err(), E_REGION_PORT_RANGE);
+                eq("and counted", aml_region_refusals(), before + 1);
+                eq("nothing bound", aml_region_count(), 0);
+            }
+            backing_free();
+        });
+    }
+}
+
+static void test_region_systemio_widths(void)
+{
+    uint8_t f[256];
+    size_t n = build_io(f, 0x60, 8);
+    WITH_PARSE("region: SystemIO admits byte/word/dword and refuses qword",
+               f, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t rgn  = nth_child(root, 0);
+        uint64_t qfld = nth_child(nth_child(root, 5), 0);   /* QWordAcc */
+        uint64_t anyf = nth_child(nth_child(root, 6), 0);   /* AnyAcc   */
+
+        /* THE WIDTH TABLE, read out directly in all four spaces. The
+         * three zeroes are the substance of this milestone's refusals. */
+        eq("QWordAcc is legal over memory",
+           aml_region_acc_bits(qfld, SP_MEM), 64);
+        eq("QWordAcc has NO port form",
+           aml_region_acc_bits(qfld, SP_IO), 0);
+        eq("QWordAcc has no config-space form",
+           aml_region_acc_bits(qfld, SP_PCI), 0);
+        eq("QWordAcc is not an EC transaction",
+           aml_region_acc_bits(qfld, SP_EC), 0);
+
+        eq("AnyAcc is a byte for memory", aml_region_acc_bits(anyf, SP_MEM), 8);
+        eq("AnyAcc is a byte for a port", aml_region_acc_bits(anyf, SP_IO), 8);
+        eq("AnyAcc is a DWORD for config space",
+           aml_region_acc_bits(anyf, SP_PCI), 32);
+        eq("AnyAcc is a byte for the EC", aml_region_acc_bits(anyf, SP_EC), 8);
+
+        /* And the refusal is reported through the field path, not merely
+         * available from the table. */
+        uint8_t *back = backing_load(NULL, 0x40);
+        aml_eval_reset(2);
+        aml_region_reset();
+        uint64_t b = aml_region_bind(rgn, 7, 0x60, 8,
+                                     (uint64_t)(uintptr_t)back);
+        g_checks++;
+        if (b == 0) fail("bind failed");
+
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        uint64_t before = aml_region_accesses();
+        eq("a QWordAcc field over a port is refused",
+           aml_region_field_read(qfld), 0);
+        eq("ACCESS_WIDTH", aml_eval_err(), E_REGION_ACCESS_WIDTH);
+        eq("and NOT split into two dword transactions",
+           aml_region_accesses(), before);
+
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        eq("nor is it split on the write side",
+           aml_region_field_store(qfld, 0x1122334455667788ull), 0);
+        eq("ACCESS_WIDTH", aml_eval_err(), E_REGION_ACCESS_WIDTH);
+        eq("still no transaction", aml_region_accesses(), before);
+
+        /* The port primitives themselves refuse the width too, without
+         * executing anything — the 8-byte case returns before reaching
+         * an instruction. This is the second line of the same defence. */
+        eq("port_in has no 8-byte form",  aml_region_port_in(0x60, 8), 0);
+        eq("port_out has no 8-byte form", aml_region_port_out(0x60, 8, 0), 0);
+        eq("nor a 3-byte one",            aml_region_port_in(0x60, 3), 0);
+
+        backing_free();
+    });
+}
+
+/* THE ACCESS-COUNT ASSERTION. For a port, "did it read?" is the entire
+ * question: a read can clear a status bit or pop a FIFO, so a Preserve
+ * partial write must perform exactly one read and one write, and a
+ * WriteAsOnes / WriteAsZeros partial write must perform exactly one
+ * write AND NO READ. Asserting the resulting bytes alone would not
+ * distinguish them — all three produce a correct-looking byte. */
+static void test_region_systemio_update_rule_access_counts(void)
+{
+    uint8_t f[256];
+    size_t n = build_io(f, 0x60, 8);
+    WITH_PARSE("region: SystemIO honours the UpdateRule, counted", f, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t rgn  = nth_child(root, 0);
+        uint64_t pres = nth_child(nth_child(root, 1), 0);   /* FLDL */
+        uint64_t ones = nth_child(nth_child(root, 2), 0);   /* ONEL */
+        uint64_t zers = nth_child(nth_child(root, 3), 0);   /* ZERL */
+        uint64_t whol = nth_child(nth_child(root, 4), 0);   /* WHOL */
+
+        uint8_t *back = backing_load(NULL, 8);
+        aml_eval_reset(2);
+        aml_region_reset();
+        /* A SYNTHETIC BACKING, not the real-port sentinel: this is the
+         * logic half of the split, and every line it runs is the line
+         * the real port path runs. */
+        uint64_t b = aml_region_bind(rgn, 7, 0x60, 8,
+                                     (uint64_t)(uintptr_t)back);
+        g_checks++;
+        if (b == 0) fail("bind failed");
+        eq("bound as SystemIO", aml_region_space(b), SP_IO);
+
+        /* -- Preserve, partial: READ then WRITE. Exactly two. */
+        back[0] = 0xA0;
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        uint64_t before = aml_region_accesses();
+        eq("preserve store ok", aml_region_field_store(pres, 0x5), 1);
+        eq("the field's nibble changed", (uint64_t)(back[0] & 0x0F), 0x5);
+        eq("the neighbouring nibble survived",
+           (uint64_t)(back[0] & 0xF0), 0xA0);
+        eq("exactly one read and one write",
+           aml_region_accesses(), before + 2);
+
+        /* -- WriteAsOnes, partial: WRITE ONLY. Exactly one.
+         *    If this ever reads, a clear-on-read status port loses a bit
+         *    that nothing downstream can recover. */
+        back[0] = 0xA0;
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        before = aml_region_accesses();
+        eq("write-as-ones store ok", aml_region_field_store(ones, 0x5), 1);
+        eq("uncovered bits became ones", (uint64_t)back[0], 0xF5);
+        eq("EXACTLY ONE ACCESS — NO READ",
+           aml_region_accesses(), before + 1);
+
+        /* -- WriteAsZeros, partial: WRITE ONLY. Exactly one. */
+        back[0] = 0xA0;
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        before = aml_region_accesses();
+        eq("write-as-zeros store ok", aml_region_field_store(zers, 0x5), 1);
+        eq("uncovered bits became zeros", (uint64_t)back[0], 0x05);
+        eq("EXACTLY ONE ACCESS — NO READ",
+           aml_region_accesses(), before + 1);
+
+        /* -- Preserve over a WHOLE unit: no rule applies, so no read
+         *    either. The fast path must not read "because the rule is
+         *    Preserve" when there are no bits to preserve. */
+        back[0] = 0xA0;
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        before = aml_region_accesses();
+        eq("whole-unit store ok", aml_region_field_store(whol, 0x3C), 1);
+        eq("the whole byte was replaced", (uint64_t)back[0], 0x3C);
+        eq("one write, no read", aml_region_accesses(), before + 1);
+
+        /* -- And the read path counts one access per unit. */
+        back[0] = 0x7E;
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        before = aml_region_accesses();
+        eq("the low nibble reads back", aml_region_field_read(pres), 0xE);
+        eq("one unit read", aml_region_accesses(), before + 1);
+
+        backing_free();
+    });
+}
+
+/* The real-port sentinel, proven WITHOUT performing a port transaction.
+ * See the section header for why executing one would be worse evidence,
+ * not better. */
+static void test_region_systemio_real_sentinel(void)
+{
+    uint8_t f[256];
+    size_t n = build_io(f, 0x60, 8);
+    WITH_PARSE("region: the real-port sentinel routes away from memory",
+               f, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t rgn = nth_child(root, 0);
+
+        aml_eval_reset(2);
+        aml_region_reset();
+        /* THE WINDOW DELIBERATELY STARTS BELOW THE REGION (0x50 vs 0x60),
+         * so the window offset is 0x10 and NOT zero. With an offset of
+         * zero the sentinel arithmetic is unobservable — 1 + 0 == 1 — and
+         * a mutant that applied the offset to the sentinel would survive.
+         * Mutation testing found exactly that, which is why the two
+         * numbers differ here. */
+        uint64_t b = aml_region_bind(rgn, 7, 0x50, 0x20, IO_REAL);
+        g_checks++;
+        if (b == 0) fail("a real-port binding was refused");
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("bound as SystemIO", aml_region_space(b), SP_IO);
+        eq("the declared port base is recorded", aml_region_base(b), 0x60);
+
+        /* THE SENTINEL IS STORED VERBATIM. If bind had added the window
+         * offset to it — the arithmetic every other space needs — it
+         * would become 0x11, no longer be recognisable as the sentinel,
+         * and the access step would dereference a small integer. */
+        eq("host_base is the sentinel, not an address",
+           aml_region_row_word(b, 4), IO_REAL);
+
+        /* THE DISCRIMINATOR. A qword access is refused because no 8-byte
+         * port instruction exists. A mutant routing the sentinel to the
+         * memory path would instead load from address 1 and take a
+         * SIGSEGV that GUARDED reports as a failure. */
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        GUARDED(eq("a qword port read is refused",
+                   aml_region_read_unit(b, 0, 8), 0));
+        eq("ACCESS_WIDTH", aml_eval_err(), E_REGION_ACCESS_WIDTH);
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        GUARDED(eq("and so is a qword port write",
+                   aml_region_write_unit(b, 0, 8, 0), 0));
+        eq("ACCESS_WIDTH", aml_eval_err(), E_REGION_ACCESS_WIDTH);
+    });
+
+    /* A SystemMemory region handed the sentinel is NOT a mapping. */
+    WITH_PARSE("region: the port sentinel is refused for a memory region",
+               k_rgn0, sizeof k_rgn0, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t rgn = nth_child(root, 0);
+        aml_eval_reset(2);
+        aml_region_reset();
+        eq("refused", aml_region_bind(rgn, 7, 0x1000, 0x40, IO_REAL), 0);
+        eq("NO_CAP", aml_eval_err(), E_REGION_NO_CAP);
+        eq("nothing bound", aml_region_count(), 0);
+    });
+}
+
+/* --- PCI_Config: the device context ----------------------------------- */
+
+/* segment 1, bus 0x20, device 31, function 3 — none of them the value a
+ * defaulting implementation would invent. */
+#define PCI_EXPECT_CTX ((1ull << 40) | (1ull << 16) | (0x20ull << 8) \
+                        | (31ull << 3) | 3ull)
+
+static void test_region_pci_context_resolution(void)
+{
+    uint8_t f[512];
+    size_t n = build_pci(f, 1, 1, 0x001F0003, 0x080AD041, 0x40, 0x10, 0x03);
+    WITH_PARSE("region: PCI context comes from _ADR / _BBN / _SEG", f, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t pci0 = nth_child(root, 0);
+        uint64_t dev0 = nth_child(pci0, 3);
+        uint64_t rgn  = nth_child(dev0, 1);
+        eq("the bridge is a Device", aml_node_kind(pci0), N_DEVICE);
+        eq("so is the function",     aml_node_kind(dev0), N_DEVICE);
+        eq("an OperationRegion",     aml_node_kind(rgn),  N_OPREGION);
+        eq("in PCI_Config",          aml_node_flags(rgn), SP_PCI);
+
+        /* The walk, in pieces, so a failure names the step that broke. */
+        eq("the enclosing Device is found",
+           aml_region_enclosing_device(rgn), dev0);
+        eq("the host bridge is found above it",
+           aml_region_host_bridge(dev0), pci0);
+
+        aml_eval_reset(2);
+        uint64_t ctx = aml_region_pci_context(rgn);
+        eq("the full context resolves", ctx, PCI_EXPECT_CTX);
+        eq("no error", aml_eval_err(), AML_OK);
+        /* Spelled out, so a packing change cannot silently pass. */
+        eq("segment 1",   (ctx >> 16) & 0xFFFF, 1);
+        eq("bus 0x20",    (ctx >> 8)  & 0xFF,   0x20);
+        eq("device 31",   (ctx >> 3)  & 0x1F,   31);
+        eq("function 3",  ctx & 0x7,            3);
+        eq("and it is marked valid", (ctx >> 40) & 1, 1);
+
+        /* The R22 offset arithmetic, mirrored and pinned. If
+         * src/kernel/core/pci/config.pdx ever changed its ECAM layout,
+         * this is the assertion that would catch the copy drifting. */
+        eq("ECAM offset matches R22's (bus<<20)|(dev<<15)|(fn<<12)",
+           aml_region_pci_ecam_offset(ctx),
+           (0x20ull << 20) | (31ull << 15) | (3ull << 12));
+
+        /* Binding records the context, so which function a region
+         * resolved to is OBSERVABLE — the corruption this issue exists
+         * to prevent is invisible otherwise. */
+        uint8_t *back = backing_load(NULL, 4096);
+        aml_eval_reset(2);
+        aml_region_reset();
+        uint64_t b = aml_region_bind(rgn, 7, 0, 4096,
+                                     (uint64_t)(uintptr_t)back);
+        g_checks++;
+        if (b == 0) fail("bind failed");
+        eq("bound as PCI_Config", aml_region_space(b), SP_PCI);
+        eq("with the resolved context", aml_region_pci_ctx(b), PCI_EXPECT_CTX);
+        eq("and the space still reads back masked",
+           aml_region_space(b), SP_PCI);
+        backing_free();
+    });
+
+    /* PNP0A03 — the other host-bridge _HID — resolves identically. */
+    n = build_pci(f, 1, 1, 0x001F0003, 0x030AD041, 0x40, 0x10, 0x03);
+    WITH_PARSE("region: PNP0A03 is a host bridge too", f, n, {
+        uint64_t rgn = nth_child(nth_child(nth_child(root, 0), 3), 1);
+        aml_eval_reset(2);
+        eq("resolves", aml_region_pci_context(rgn), PCI_EXPECT_CTX);
+    });
+}
+
+/* THE REFUSALS. Every one of these would, if defaulted instead, address
+ * a real but WRONG function — and every bounds check downstream would
+ * still pass. */
+static void test_region_pci_context_refusals(void)
+{
+    static const struct {
+        int bridge, adr; uint32_t adrval, hid; const char *what;
+    } C[] = {
+        { 0, 1, 0x001F0003, 0x080AD041,
+          "no host bridge in the ancestry — NOT 'probably bus 0'" },
+        { 1, 0, 0,          0x080AD041,
+          "a Device with no _ADR — NOT 'probably device 0'" },
+        { 1, 1, 0x00200003, 0x080AD041,
+          "device 32 does not exist — refused, NOT masked to device 0" },
+        { 1, 1, 0x001F0008, 0x080AD041,
+          "function 8 does not exist — refused, NOT masked to function 0" },
+        { 1, 1, 0x001F0003, 0x0C0CD041,
+          "an enclosing Device that is not a host bridge (PNP0C0C)" },
+    };
+    for (size_t i = 0; i < sizeof C / sizeof C[0]; i++) {
+        uint8_t f[512];
+        size_t n = build_pci(f, C[i].bridge, C[i].adr, C[i].adrval,
+                             C[i].hid, 0x40, 0x10, 0x03);
+        WITH_PARSE(C[i].what, f, n, {
+            eq("parse ok", aml_lex_err(), AML_OK);
+            uint64_t dev0 = C[i].bridge ? nth_child(nth_child(root, 0), 3)
+                                        : nth_child(root, 0);
+            uint64_t rgn  = nth_child(dev0, C[i].adr ? 1 : 0);
+            eq("an OperationRegion", aml_node_kind(rgn), N_OPREGION);
+
+            aml_eval_reset(2);
+            eq("no context is produced", aml_region_pci_context(rgn), 0);
+            eq("PCI_CONTEXT", aml_eval_err(), E_REGION_PCI_CONTEXT);
+
+            /* And the refusal propagates to the bind, with NOTHING
+             * bound — not a row addressed at 0000:00:00.0. */
+            uint8_t *back = backing_load(NULL, 4096);
+            aml_eval_reset(2);
+            aml_region_reset();
+            uint64_t before = aml_region_refusals();
+            eq("bind refused", aml_region_bind(rgn, 7, 0, 4096,
+                                               (uint64_t)(uintptr_t)back), 0);
+            eq("PCI_CONTEXT survives to the caller",
+               aml_eval_err(), E_REGION_PCI_CONTEXT);
+            eq("counted once", aml_region_refusals(), before + 1);
+            eq("and nothing was bound", aml_region_count(), 0);
+            backing_free();
+        });
+    }
+}
+
+static void test_region_pci_config_space_bounds(void)
+{
+    static const struct { uint32_t base, len; int ok; const char *what; } C[] = {
+        { 0x000, 0x100, 1, "the legacy 256 bytes fit" },
+        { 0xFF0, 0x010, 1, "a region ending exactly at 4096 fits" },
+        { 0xFF0, 0x011, 0, "one byte past extended config space" },
+        { 0x1000, 0x001, 0, "the first offset that does not exist" },
+        { 0x000, 0x1001, 0, "longer than config space itself" },
+    };
+    for (size_t i = 0; i < sizeof C / sizeof C[0]; i++) {
+        uint8_t f[512];
+        size_t n = build_pci(f, 1, 1, 0x001F0003, 0x080AD041,
+                             C[i].base, C[i].len, 0x03);
+        WITH_PARSE(C[i].what, f, n, {
+            uint64_t rgn = nth_child(nth_child(nth_child(root, 0), 3), 1);
+            uint8_t *back = backing_load(NULL, 4096);
+            aml_eval_reset(2);
+            aml_region_reset();
+            uint64_t b = aml_region_bind(rgn, 7, 0, 4096,
+                                         (uint64_t)(uintptr_t)back);
+            if (C[i].ok) {
+                g_checks++;
+                if (b == 0) fail("%s — expected a binding", C[i].what);
+                eq("no error", aml_eval_err(), AML_OK);
+            } else {
+                eq("refused", b, 0);
+                eq("NOT_COVERED", aml_eval_err(), E_REGION_NOT_COVERED);
+                eq("nothing bound", aml_region_count(), 0);
+            }
+            backing_free();
+        });
+    }
+}
+
+/* The PCI access path IS the memory path — which is the whole reason
+ * this space needed no new transaction primitive. Asserting it runs end
+ * to end against a synthetic function proves the reuse is real. */
+static void test_region_pci_access_is_the_memory_path(void)
+{
+    uint8_t f[512];
+    /* AnyAcc, so the dword resolution is exercised on the way through. */
+    size_t n = build_pci(f, 1, 1, 0x001F0003, 0x080AD041, 0x40, 0x10, 0x00);
+    WITH_PARSE("region: a PCI_Config field reads and writes through ECAM",
+               f, n, {
+        uint64_t dev0 = nth_child(nth_child(root, 0), 3);
+        uint64_t rgn  = nth_child(dev0, 1);
+        uint64_t pfld = nth_child(nth_child(dev0, 2), 0);
+
+        uint8_t *back = backing_load(NULL, 4096);
+        aml_eval_reset(2);
+        aml_region_reset();
+        uint64_t b = aml_region_bind(rgn, 7, 0, 4096,
+                                     (uint64_t)(uintptr_t)back);
+        g_checks++;
+        if (b == 0) fail("bind failed");
+
+        eq("AnyAcc resolved to a dword for config space",
+           aml_region_acc_bits(pfld, SP_PCI), 32);
+
+        /* The declared region begins at config offset 0x40, so the
+         * access must land there and NOT at offset 0. */
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        eq("store ok", aml_region_field_store(pfld, 0xDEADBEEF), 1);
+        eq("it landed at config offset 0x40",
+           (uint64_t)back[0x40] | ((uint64_t)back[0x41] << 8)
+           | ((uint64_t)back[0x42] << 16) | ((uint64_t)back[0x43] << 24),
+           0xDEADBEEF);
+        eq("and not at offset 0", (uint64_t)back[0], 0);
+
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        eq("and reads back", aml_region_field_read(pfld), 0xDEADBEEF);
+        backing_free();
+    });
+}
+
+/* --- EmbeddedControl: gated, and honestly so ------------------------- */
+
+static void test_region_ec_binds_but_does_not_transact(void)
+{
+    uint8_t f[256];
+    size_t n = build_ec(f, 0x100);
+    WITH_PARSE("region: EC binds, validates, and REFUSES to transact",
+               f, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t rgn  = nth_child(root, 0);
+        uint64_t ecf0 = nth_child(nth_child(root, 1), 0);   /* ByteAcc */
+        uint64_t ecw0 = nth_child(nth_child(root, 2), 0);   /* WordAcc */
+        eq("in EmbeddedControl", aml_node_flags(rgn), SP_EC);
+
+        uint8_t *back = backing_load(NULL, 0x100);
+        memset(back, 0xA5, 0x100);           /* would-be "EC data" */
+
+        aml_eval_reset(2);
+        aml_region_reset();
+        uint64_t b = aml_region_bind(rgn, 7, 0, 0x100,
+                                     (uint64_t)(uintptr_t)back);
+        g_checks++;
+        if (b == 0) fail("an EC region should BIND — only the transaction is gated");
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("bound as EmbeddedControl", aml_region_space(b), SP_EC);
+
+        /* The EC transfers one byte per handshake. A WordAcc EC field is
+         * a table bug and must not become two handshakes. */
+        eq("ByteAcc is the EC's only width",
+           aml_region_acc_bits(ecf0, SP_EC), 8);
+        eq("WordAcc is refused for the EC",
+           aml_region_acc_bits(ecw0, SP_EC), 0);
+
+        /* THE GATE. No value is produced, no access is counted, and the
+         * backing buffer is NOT consulted — which is the assertion that
+         * distinguishes an honest gate from a handler that quietly reads
+         * whatever is nearest and calls it EC data. */
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        uint64_t acc = aml_region_accesses();
+        uint64_t gat = aml_region_ec_gated();
+        eq("an EC read produces NOTHING", aml_region_read_unit(b, 0, 1), 0);
+        eq("EC_GATED", aml_eval_err(), E_REGION_EC_GATED);
+        eq("no access was counted", aml_region_accesses(), acc);
+        eq("and the refusal was counted", aml_region_ec_gated(), gat + 1);
+        /* 0xA5 is sitting at back[0]. A handler that read it would have
+         * returned 0xA5 above. It returned 0 and said why. */
+
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        eq("an EC write does NOTHING", aml_region_write_unit(b, 0, 1, 0x5A), 0);
+        eq("EC_GATED", aml_eval_err(), E_REGION_EC_GATED);
+        eq("the buffer is untouched", (uint64_t)back[0], 0xA5);
+        eq("no access was counted", aml_region_accesses(), acc);
+
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        eq("and so does a field read", aml_region_field_read(ecf0), 0);
+        eq("EC_GATED", aml_eval_err(), E_REGION_EC_GATED);
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        eq("and a field store", aml_region_field_store(ecf0, 0x5A), 0);
+        eq("EC_GATED", aml_eval_err(), E_REGION_EC_GATED);
+        eq("the buffer is still untouched", (uint64_t)back[0], 0xA5);
+
+        /* ===============================================================
+         * THE FLIP ASSERTION (#1065).
+         *
+         * These two pin the gate SHUT. When R31's EC driver lands and
+         * calls aml_region_ec_backing_set, and a transaction runs, they
+         * fail — deliberately. That failure is the signal that this test
+         * must be rewritten to assert the driver's behaviour instead of
+         * its absence. A gate that could be left closed after the
+         * hardware arrived, or opened before it, would be worth nothing.
+         * =============================================================== */
+        eq("NO EC BACKING IS REGISTERED — R31 has not landed",
+           aml_region_ec_backing(), 0);
+        eq("AND NO EC TRANSACTION HAS EVER BEEN PERFORMED",
+           aml_region_ec_hw_committed(), 0);
+
+        /* The gated counter is per-session; the committed count is not. */
+        aml_region_reset();
+        eq("reset clears the session's gated count", aml_region_ec_gated(), 0);
+        eq("but never the committed count",
+           aml_region_ec_hw_committed(), 0);
+        backing_free();
+    });
+
+    /* EC space is 256 bytes. */
+    n = build_ec(f, 0x101);
+    WITH_PARSE("region: an EC region larger than EC space is refused",
+               f, n, {
+        uint64_t rgn = nth_child(root, 0);
+        uint8_t *back = backing_load(NULL, 0x200);
+        aml_eval_reset(2);
+        aml_region_reset();
+        eq("refused", aml_region_bind(rgn, 7, 0, 0x200,
+                                      (uint64_t)(uintptr_t)back), 0);
+        eq("NOT_COVERED", aml_eval_err(), E_REGION_NOT_COVERED);
+        eq("nothing bound", aml_region_count(), 0);
+        backing_free();
+    });
+}
+
 int main(void)
 {
     struct sigaction sa;
@@ -5818,6 +6631,18 @@ int main(void)
     test_region_boundary_refusals();
     test_region_table_is_bounded();
     test_region_fieldunit_store_is_real_now();
+
+    /* ---- R30.M3-003/004/005: SystemIO, PCI_Config, EmbeddedControl ---- */
+    test_region_space_boundary();
+    test_region_systemio_port_bounds();
+    test_region_systemio_widths();
+    test_region_systemio_update_rule_access_counts();
+    test_region_systemio_real_sentinel();
+    test_region_pci_context_resolution();
+    test_region_pci_context_refusals();
+    test_region_pci_config_space_bounds();
+    test_region_pci_access_is_the_memory_path();
+    test_region_ec_binds_but_does_not_transact();
 
     if (g_fail) {
         fprintf(stderr, "[aml-corpus] %d assertion(s) failed out of %d\n",

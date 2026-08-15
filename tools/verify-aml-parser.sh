@@ -4,6 +4,7 @@
 #                              R30.M1-003/004/005 (#1051 / #1052 / #1053)
 #                              R30.M2-001/002 (#1054 / #1055)
 #                              R30.M3-002 (#1062)
+#                              R30.M3-003/004/005 (#1063 / #1064 / #1065)
 #
 # Build-time verification of the userspace AML tokenizer, namespace parser
 # and evaluator. Wired into `.githooks/pre-push` as the `aml-parser` step, in the
@@ -58,6 +59,18 @@
 #      policed; a module added with storage must extend the checks
 #      below.
 #
+#   3b. PORT I/O CONFINEMENT (#1063). Every `in` and `out` in the emitted
+#      machine code must lie inside aml_region_port_in or
+#      aml_region_port_out. The corpus deliberately performs no real port
+#      I/O, so this static check is where the claim is made; it comes
+#      with a vacuity guard requiring those two functions to actually
+#      contain port instructions.
+#
+#   3c. THE EC GATE IS CLOSED (#1065). No object may relocate against
+#      aml_region_ec_backing_set. True today because R31's EC driver does
+#      not exist, which makes "the transaction is gated" a build-time
+#      fact. R31 must update this check.
+#
 #   4. THE CORPUS. tests/user/aml/aml_harness.c is compiled against the
 #      objects and run. Every fixture is loaded so its last byte abuts a
 #      PROT_NONE guard page, so an out-of-bounds read is a SIGSEGV rather
@@ -78,6 +91,9 @@
 #   [aml-parser] encapsulation: notify ring confined to aml_ctl.o
 #   [aml-parser] encapsulation: serialized-method mutex pool confined to aml_ctl.o
 #   [aml-parser] encapsulation: region binding table confined to aml_region.o
+#   [aml-parser] encapsulation: EC gate state confined to aml_region.o
+#   [aml-parser] confinement: in/out only in aml_region_port_in/out
+#   [aml-parser] EC gate closed: no caller of aml_region_ec_backing_set (R31 opens it)
 #   [aml-corpus] NNN assertions PASS
 #   [aml-parser] PASS
 #
@@ -307,6 +323,95 @@ check_confined "serialized-method mutex pool confined to aml_ctl.o" aml_ctl \
 # a second writer makes the accounting stop meaning anything.
 check_confined "region binding table confined to aml_region.o" aml_region \
                "(aml_region_tab|aml_region_state)${END}"
+
+# R30.M3-005 (#1065). The EC gate's storage, for the same reason: word 0
+# is the registered transaction entry point, and a second writer could
+# open the gate without the EC driver existing.
+check_confined "EC gate state confined to aml_region.o" aml_region \
+               "(aml_region_ec_state)${END}"
+
+# ── 3b. R30.M3-003 (#1063): PORT I/O CONFINEMENT ─────────────────────
+#
+# The SystemIO handler's transaction/logic split rests on `in` and `out`
+# existing in exactly two functions — aml_region_port_in and
+# aml_region_port_out. Everything else on the port path is shared with
+# the memory path and is exercised by the corpus against a synthetic
+# backing buffer.
+#
+# The corpus deliberately performs NO REAL PORT I/O (see the section
+# header in tests/user/aml/aml_harness.c: leaning on the ring-3 #GP would
+# be evidence that evaporates the moment the harness is run with I/O
+# privilege). So the claim "the port path is confined" is asserted HERE
+# instead, statically, against the emitted machine code — which is a
+# stronger statement than any runtime probe could make, because it covers
+# code no fixture happens to reach.
+#
+# A stray `in`/`out` anywhere else in the AML tree would mean some other
+# function performs a bus transaction directly, bypassing the bounds
+# check, the fuel spend and the capability-derived binding all at once.
+port_io_confined() {
+    local m dis fn bad=0
+    for m in "${MODULES[@]}"; do
+        dis="$(objdump -d --no-show-raw-insn "${OUT}/${m}.o" 2>/dev/null || true)"
+        # Walk the disassembly tracking the enclosing symbol, and report
+        # any in/out that is not inside one of the two port primitives.
+        while IFS= read -r line; do
+            case "${line}" in
+                *'>:') fn="${line##*<}"; fn="${fn%>:}" ;;
+                *$'\t'in' '*|*$'\t'out' '*)
+                    if [[ "${fn}" != "aml_region_port_in" &&
+                          "${fn}" != "aml_region_port_out" ]]; then
+                        echo "[aml-parser] FAIL — port I/O outside the two port primitives:" >&2
+                        echo "    ${m}.o  ${fn}:  ${line#*$'\t'}" >&2
+                        bad=1
+                    fi
+                    ;;
+            esac
+        done <<< "${dis}"
+    done
+    return "${bad}"
+}
+if ! port_io_confined; then
+    echo "  Only aml_region_port_in and aml_region_port_out may contain in/out." >&2
+    echo "  Every other port-path line is shared with the memory path and is" >&2
+    echo "  exercised by the corpus; a transaction elsewhere bypasses the" >&2
+    echo "  bounds check, the fuel spend and the capability binding at once." >&2
+    exit 1
+fi
+# Vacuity guard: the two primitives must actually CONTAIN port I/O, or
+# the check above passes by having nothing to find.
+if [[ "$(objdump -d --no-show-raw-insn "${OUT}/aml_region.o" 2>/dev/null \
+         | grep -cE $'\t'"(in|out) ")" -lt 6 ]]; then
+    echo "[aml-parser] FAIL — the port primitives contain no port I/O;" >&2
+    echo "  the confinement check above would pass vacuously." >&2
+    exit 1
+fi
+echo "[aml-parser] confinement: in/out only in aml_region_port_in/out"
+
+# R30.M3-005 (#1065). THE EC GATE IS CLOSED, asserted mechanically.
+#
+# aml_region_ec_backing_set is the registration point R31's EC driver
+# calls. Until it does, NOTHING references it — and that is exactly what
+# makes "the EC transaction is gated" a build-time fact rather than a
+# comment. The corpus separately pins aml_region_ec_hw_committed() at 0.
+#
+# R31 MUST UPDATE THIS CHECK when it lands the driver. That is the point:
+# the gate cannot be quietly opened before the hardware exists, and it
+# cannot be quietly left shut after.
+ec_refs=0
+for m in "${MODULES[@]}"; do
+    ec_refs=$(( ec_refs + $(reloc_count "${OUT}/${m}.o" "aml_region_ec_backing_set${END}") ))
+done
+if [[ "${ec_refs}" -ne 0 ]]; then
+    echo "[aml-parser] FAIL — the EC gate has a caller (${ec_refs} relocation(s))." >&2
+    echo "  aml_region_ec_backing_set is R31's registration point. If R31 has" >&2
+    echo "  landed, update this check AND the aml_region_ec_hw_committed()" >&2
+    echo "  assertions in tests/user/aml/aml_harness.c to assert the driver's" >&2
+    echo "  behaviour rather than its absence. If it has not, something is" >&2
+    echo "  opening the gate without an EC driver behind it." >&2
+    exit 1
+fi
+echo "[aml-parser] EC gate closed: no caller of aml_region_ec_backing_set (R31 opens it)"
 
 # ── 4. the corpus ────────────────────────────────────────────────────
 OBJS=()
