@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # tools/verify-aml-parser.sh — R30.M1-001 (#1049) / R30.M1-002 (#1050)
+#                              R30.M2-003/004 (#1056 / #1057)
 #                              R30.M1-003/004/005 (#1051 / #1052 / #1053)
 #                              R30.M2-001/002 (#1054 / #1055)
 #
@@ -26,7 +27,7 @@
 #      braces alongside tools/lint-no-kernel-aml.sh: that script polices
 #      identifiers, this one polices files.
 #
-#   2. COMPILATION. All eight modules build with the pinned paideia-as.
+#   2. COMPILATION. All eleven modules build with the pinned paideia-as.
 #
 #   3. STORAGE ENCAPSULATION. Checked with `objdump -r`, which is the only
 #      way to prove it mechanically: a module's private .bss must be
@@ -66,11 +67,13 @@
 #
 #   $ bash tools/verify-aml-parser.sh
 #   [aml-parser] placement: no AML sources under src/kernel/**
-#   [aml-parser] compiled 8 module(s)
+#   [aml-parser] compiled 11 module(s)
 #   [aml-parser] encapsulation: aml_lex_state confined to aml_lex.o
 #   [aml-parser] encapsulation: arena storage confined to aml_arena.o
 #   [aml-parser] encapsulation: aml_optab confined to aml_optab.o
 #   [aml-parser] encapsulation: evaluator state confined to aml_eval.o
+#   [aml-parser] encapsulation: object arena confined to aml_obj.o
+#   [aml-parser] encapsulation: aml_conv_tab confined to aml_str.o
 #   [aml-corpus] NNN assertions PASS
 #   [aml-parser] PASS
 #
@@ -86,7 +89,8 @@ AML_SRC="${REPO_ROOT}/src/user/aml"
 HARNESS="${REPO_ROOT}/tests/user/aml/aml_harness.c"
 OUT="${REPO_ROOT}/build/aml"
 
-MODULES=(aml_lex aml_arena aml_optab aml_ns aml_term aml_resource aml_eval aml_arith)
+MODULES=(aml_lex aml_arena aml_optab aml_ns aml_term aml_resource aml_eval aml_arith
+         aml_obj aml_str aml_ref)
 
 # ── environment ──────────────────────────────────────────────────────
 PA_BIN="$(bash "${REPO_ROOT}/tools/find-paideia-as.sh")"
@@ -213,6 +217,41 @@ check_confined "aml_optab confined to aml_optab.o" aml_optab "aml_optab${END}|am
 # the accessor API.
 check_confined "evaluator state confined to aml_eval.o" aml_eval \
                "(aml_eval_state|aml_frame_pool|aml_path_buf|aml_path_anc)${END}"
+
+# R30.M2-003/004 (#1056 / #1057). The OBJECT ARENA is the third piece of state
+# with a safety invariant resting on single ownership, and the invariant is the
+# same shape as the lexer's.
+#
+#   aml_obj_table, aml_obj_heap and aml_obj_elem hold every String, Buffer and
+#   Package the evaluator has built. EVERY read and write of them is bounds-
+#   checked twice — once against the arena's high-water mark and once against
+#   the individual object's own recorded length — and both checks live inside
+#   aml_obj.o. A module that reached the heap array directly would be computing
+#   payload addresses itself, which is exactly the arithmetic that lets an
+#   Index() past the end of one Buffer read the next one and return a
+#   perfectly plausible byte.
+#
+#   aml_obj_bind is the map from arena node to current object. It is what makes
+#   a store visible WITHOUT mutating the parse tree, so the node arena stays
+#   byte-identical across an evaluation and remains valid as the IPC wire
+#   format. A second writer here would retype a named object behind the
+#   evaluator's back.
+#
+# aml_str.o and aml_ref.o declare no mutable storage at all, so adding them to
+# MODULES costs no new assertion and strengthens every existing one — the
+# conversion engine and the reference machinery are now proved unable to reach
+# the lexer cursor, the parse arenas, the opcode table, the evaluator context,
+# the frame pool or the object arena except through the accessor APIs.
+check_confined "object arena confined to aml_obj.o" aml_obj \
+               "(aml_obj_state|aml_obj_table|aml_obj_heap|aml_obj_elem|aml_obj_bind)${END}"
+
+# The operand table. Like aml_optab it is READ-ONLY data that is the single
+# authority on a decision — here, what type each operator wants in each operand
+# position (ACPI 6.5 §19.3.5.5). Its whole value is that the implementations
+# and the table cannot disagree, and a second reader with its own copy is
+# precisely how they would come to.
+check_confined "aml_conv_tab confined to aml_str.o" aml_str \
+               "(aml_conv_tab|aml_conv_len)${END}"
 
 # ── 4. the corpus ────────────────────────────────────────────────────
 OBJS=()

@@ -1,11 +1,11 @@
-# AML evaluator — context, budgets, frames, namespace walk, arithmetic
+# AML evaluator — context, budgets, frames, namespace walk, operators, objects
 
 **Round.** R30 — ACPICA userspace bubble + LPSS bus enablement
 **Issues.** #1054 (namespace walker + call frames) · #1055 (arithmetic and
-logical operators)
-**Status.** Landed. #1056 (string/buffer), #1057 (package/reference/index),
-#1058 (invocation + argument promotion), #1059 (Notify), #1060
-(recursive/serialized methods) follow.
+logical operators) · #1056 (string/buffer operators + §19.3.5 conversion) ·
+#1057 (package/reference/Index semantics)
+**Status.** Landed. #1058 (invocation + argument promotion), #1059 (Notify),
+#1060 (recursive/serialized methods) follow.
 **Builds on.** [`aml-parser.md`](aml-parser.md) — the R30.M1 tokenizer,
 arena and two-pass parser. This document assumes it.
 
@@ -394,12 +394,12 @@ the value every logical operator returns for TRUE — below `Zero`, and a
    through to that object's u64 side-table slot, which is what makes
    `Add(One, Two, FOO)` observable.
 
-Everything else is `BAD_TARGET` (41). **The boundary is drawn at "does this
-destination need a reference object to describe it"** — a field element, an
-`Index()` target, a string/buffer/package destination all do, and they get
-their real implementation with the rest of the reference machinery in
-#1057. A partial version here would be the placeholder this milestone is
-not allowed to ship.
+Everything else was `BAD_TARGET` (41). **The boundary was drawn at "does
+this destination need a reference object to describe it"** — a field
+element, an `Index()` target, a string/buffer/package destination all do.
+**§13 records where that boundary moved to in #1057**, and the four
+destinations above are now the *fast path* of a larger store rather than
+the whole of it.
 
 The write-through needed one new arena accessor, `aml_u64_set`. It lives in
 `aml_arena.pdx` rather than in the evaluator because `aml_u64_arena` is
@@ -569,3 +569,526 @@ ACPI's `Not`, `Nand` and `Nor` are each a one's complement, so this blocked
 test that starts from a `.pdx` fixture and asserts the emitted `.text`
 bytes — the pre-existing encoder tests built an `Instruction` by hand and
 passed throughout the entire period the bug existed.
+
+
+---
+
+## 11. The object model — #1056 / #1057
+
+`src/user/aml/aml_obj.pdx`. Integer, String, Buffer, Package, Reference,
+and the storage they live in.
+
+### Why a second arena and not a wider node
+
+The #1050 node arena is a **syntax** tree: it says what the table *says*.
+Evaluation needs to say what the table currently *means* — the buffer a
+`Name` holds after three stores, a package element assigned at run time, a
+reference produced by `Index`. Those are values, they change, and they have
+no source-buffer offset.
+
+Two designs were rejected first.
+
+- **Mutate the node arena.** This destroys the property `aml-parser.md` is
+  built on: the arena is *the wire format*, memcpy-able to another process,
+  and the same bytes for the life of the table. If evaluation mutated it, a
+  second evaluation would start where the first finished, `_STA` would
+  answer differently on the second boot-time sweep than on the first, and
+  the IPC payload would depend on *when* it was taken. **Evaluation never
+  writes the node arena.** Not rarely; never — and the corpus asserts the
+  `Name` node's data-kind flags are unchanged after a store that retypes
+  the object bound to it.
+- **Pointers to allocated objects.** The acpi_supervisor process has no
+  allocator by design (`acpica-bubble.md`), and a pointer graph
+  re-introduces the very thing the arena exists to avoid.
+
+So: a **second index-addressed arena** with the same three properties as
+the first — no pointers, fixed 32-byte stride, the arrays *are* the
+representation — plus a per-node **binding table** saying which object a
+declaration currently holds.
+
+### The record — 4 × u64, 32 bytes, the same stride as a node
+
+```
+word0  [15:0]  type       an ACPI ObjectType code
+       [23:16] refkind    reference sub-kind, type 20 only
+word1  primary field      value / heap offset / element-run start / ref base
+word2  length / index     String chars (NUL excluded), Buffer bytes,
+                          Package NumElements, or a reference's index
+word3  auxiliary          a frame reference's serial
+```
+
+**The type codes are the ACPI `ObjectType` codes, deliberately** — 1
+Integer, 2 String, 3 Buffer, 4 Package, 5 FieldUnit, … 14 BufferField
+(§19.6.101) — with 20 for a reference, following ACPICA's
+`ACPI_TYPE_LOCAL_REFERENCE`. `ObjectType` is then nearly a field read, and
+there is **one** numbering rather than two with a mapping table between
+them. A mapping table is a thing that gets out of step.
+
+### Reference sub-kinds — and why there are six, not three
+
+```
+1 REF_NAME       w1 = arena NODE index of the declaration
+2 REF_LOCAL      w1 = frame index, w2 = slot 0..7, w3 = frame serial
+3 REF_ARG        w1 = frame index, w2 = slot 0..6, w3 = frame serial
+4 REF_PKG_ELEM   w1 = package OBJECT, w2 = element index
+5 REF_BUF_FIELD  w1 = buffer OBJECT,  w2 = byte index
+6 REF_STR_FIELD  w1 = string OBJECT,  w2 = byte index
+```
+
+The last three are the point of #1057; see §12.
+
+**Frame references carry a serial, and that is not optional.** Frames are
+a pool of eight *reused* slots, so a reference holding only "frame 3, slot
+0" silently re-aims at a different method's `Local0` once frame 3 has been
+popped and re-pushed — a wrong value produced from a plausible reference.
+`aml_frame_push` stamps a monotonically increasing serial into slot +24 (a
+word #1054 reserved), a frame reference records it, and a dereference that
+finds a different serial is `STALE_REF` (49) rather than a read of someone
+else's local.
+
+### Storage, lifetime, confinement
+
+| array | size | holds |
+|---|---|---|
+| `aml_obj_table` | 512 × 32 B | the object records |
+| `aml_obj_heap` | 8192 B | String / Buffer payloads |
+| `aml_obj_elem` | 1024 × u32 | Package element slots |
+| `aml_obj_bind` | 512 × u32 | node index → current object |
+| `aml_obj_state` | 8 × u64 | the three bump cursors |
+
+All five are `.bss` private to `aml_obj.o` and **proved private by
+`objdump -r`** in `verify-aml-parser.sh`, the same mechanism as
+`aml_lex_state` and the node arena. That is not tidiness: every bounds
+check in the file (object index against the high-water mark, byte index
+against the object's own length, element index against `NumElements`) is
+an invariant only for as long as no other object can form an address into
+these arrays.
+
+**Lifetime is the evaluation session.** Allocation is a bump; there is no
+free. `aml_eval_reset` calls `aml_obj_reset`, so every session starts with
+an empty arena *and an empty binding table*, and therefore re-materialises
+each named object from its immutable declaration. Two consequences, both
+wanted:
+
+- evaluating the same table twice gives the same answers, because the
+  second evaluation cannot see the first one's stores;
+- a firmware method that allocates without bound fails with a **latched,
+  bounded** error — `OBJ_ARENA_FULL` (42), `OBJ_HEAP_FULL` (43),
+  `OBJ_ELEM_FULL` (44) — rather than growing the process. Same posture as
+  the frame pool: "allocate more" under firmware-controlled recursion is
+  the attack, not the mitigation.
+
+A collector was considered and rejected: the root set is the binding table
+plus every live frame slot plus **the evaluator's native stack**, and the
+last is not enumerable from here. A bump allocator with a hard ceiling is
+honest; a collector that cannot see one of its roots is a use-after-free.
+
+### The binding invariant
+
+`aml_obj_bind[node]` is the object a declaration currently holds, 0 meaning
+"not materialised — read the declaration". It is indexed by node so the
+node stride stays 32 bytes and the mutation stays outside the wire format.
+
+**An Integer-valued `Name` is never bound.** Its value lives in the u64
+side table, which #1054's `aml_eval_store` already writes, so the object
+built for an integer read is transient. Every other type *is* bound, and a
+bound name is by construction not an Integer. So
+
+> `aml_obj_bind_get(node) != 0` **is** the predicate "this name currently
+> holds something other than an Integer"
+
+which is exactly the test the integer fast path needs (§14). Break that
+invariant and a stored integer becomes invisible to object readers, or a
+stored buffer invisible to integer readers — in both cases silently. The
+corpus kills a mutant that binds integer names.
+
+---
+
+## 12. `Index` is three operators wearing one opcode
+
+§19.6.63. `Index(Source, Index, Result)` produces a **different kind of
+reference** for each legal source type, and they are not interchangeable:
+
+| source | reference | `DerefOf` yields | a store does |
+|---|---|---|---|
+| Buffer | `REF_BUF_FIELD` | that byte, as an Integer | writes **one byte**, truncating |
+| String | `REF_STR_FIELD` | that character, as an Integer | writes **one byte**, truncating |
+| Package | `REF_PKG_ELEM` | the **element object**, of whatever type | **replaces** the element, no conversion |
+
+Conflating the package case with either byte case is what this design is
+shaped to prevent. `Store(0x1234, Index(PKG,0))` must leave element 0
+holding the Integer `0x1234`; `Store(0x1234, Index(BUF,0))` must leave byte
+0 holding `0x34` and discard the rest. An implementation with one
+"container reference" kind gets one of the two wrong, **silently** — the
+table runs, the value is plausible, and the hardware is programmed with the
+low byte of something.
+
+Buffer and String are kept apart at one remove: they behave identically
+today, but a String owns a NUL the Buffer does not, so a later growth or
+`SizeOf` rule that treated them alike would be wrong for one of them.
+Distinct kinds make that a visible choice rather than an accident.
+
+`aml_ref_store_through` switches on the **sub-kind**, never on the base
+object's type, and the corpus asserts each `Index` form yields its own kind,
+that each `DerefOf` round-trips, and — the headline — that the *same*
+Integer stored through a buffer index and through a package index lands
+differently. Both bounds are checked at **construction**: a reference that
+is out of range is not a valid reference, and letting one be built means the
+error surfaces at some unrelated later place. Out of range is `OBJ_RANGE`
+(46); a String's NUL is out of range, because it is part of the encoding and
+not an addressable character.
+
+An index *within* `NumElements` whose slot was never initialised is a
+different fault and gets a different code: §20.2.5.4 permits
+`Package(0xFF){}`, so `aml_obj_elem_get` answers 0 without latching and the
+**caller** decides — `DerefOf` makes it `UNINIT_ELEMENT` (50), `Match`
+treats it as "never matches". Those are the two different right answers the
+spec gives to the same condition.
+
+---
+
+## 13. Conversion — §19.3.5, two rules that look like one
+
+This is the classic AML footgun. Implementations that treat it as one rule
+work on simple tables and corrupt real ones.
+
+### Rule 1 — operand conversion is keyed by the OPERATOR
+
+There is no universal coercion. `Add` converts a String operand **to** an
+Integer; `Concatenate` converts an Integer operand **to** a String or
+Buffer. Same operand, same type, opposite conversions, chosen by the
+operator.
+
+So the model is two tables, and the split is the whole design:
+
+```
+aml_conv_want(op16, pos)  ->  the type this operator wants HERE
+aml_conv_cast(obj, want)  ->  the object converted, or a refusal
+```
+
+`aml_conv_tab` is the first, **as data**: seventeen rows, each four
+want-codes packed one byte per operand position, confined to `aml_str.o` by
+`objdump -r` for the same reason as `aml_optab`. Any opcode with no row
+gets the default `(Integer, Integer, Target, Integer)` — the shape of every
+arithmetic and logical operator — so **#1055's twenty-four operators are
+described by the table without occupying a row, and needed no edit at all**
+when the object model arrived. Adding an operator is adding a row; it is
+never editing a branch.
+
+| want | meaning |
+|---|---|
+| 0 | ANY — the operator inspects the type itself |
+| 1 | Integer |
+| 2 | String, **hex** — the implicit Integer/Buffer → String rule |
+| 3 | Buffer |
+| 4 | Package |
+| 12 | String, **decimal** — reachable only from `ToDecimalString` |
+| 20 | Reference |
+| 100 | **same as operand 0** — `Concatenate`, and only `Concatenate` |
+| 101 | TARGET — a destination, never evaluated as a value |
+
+100 exists because §19.6.13 keys `Concatenate`'s second operand off the
+*runtime* type of its first. It is the only two-stage lookup in the
+specification, and giving it a code keeps it visible in the table instead
+of hidden inside one operator's body.
+
+**Four operators are a table row plus a store and have no conversion logic
+at all**: `ToBuffer` wants Buffer, `ToInteger` wants Integer, `ToHexString`
+wants String-hex, `ToDecimalString` wants String-decimal. The conversion
+*is* the operator. That is the strongest evidence the factoring is right,
+and it is why those four cannot drift apart from the implicit conversions
+`Concatenate` uses — they are literally the same code.
+
+Every operand in `aml_str.pdx` and `aml_ref.pdx` is fetched by
+`aml_conv_operand(expr, pos)`, which consults the table. An implementation
+that fetched its own operands could disagree with the table and nothing
+would notice.
+
+### Rule 2 — store conversion is keyed by the DESTINATION'S EXISTING TYPE
+
+§19.3.5.7. Storing an Integer into a `Name` that currently holds a Buffer
+converts **the Integer to a Buffer**. It does *not* retype the `Name`.
+Written the other way round it passes every fixture whose Names only ever
+hold integers, and then destroys a `_CRS` on real hardware.
+
+`aml_eval_store_named` implements it, and two details are ACPICA's rather
+than the prose's:
+
+- a **Buffer** destination **keeps its length**: the converted source is
+  copied over the first `min(dst,src)` bytes and the remainder is
+  **zeroed** (`AcpiExStoreBufferToBuffer`, ACPI 2.0+). A table that patches
+  two bytes of a resource template depends on that;
+- a **String** destination is **replaced**, because ACPICA reallocates a
+  string target rather than padding it. The two differ deliberately.
+
+The counterpart is §19.3.5.8: a store to a `LocalX` or to `DebugObj` does
+**no** conversion and overwrites wholesale, and `CopyObject` (§19.6.20)
+does no conversion anywhere. Three behaviours, three code paths, and the
+corpus runs `Store` and `CopyObject` **on the same fixture** — because the
+only way to prove `Store`'s conversion is doing something is to put it next
+to the operator that deliberately does not convert.
+
+### Where this follows ACPICA rather than the prose
+
+Firmware is written against ACPICA, so ACPICA is what is implemented:
+
+- **Integer → String (hex) is fixed width and zero padded**, `width/4`
+  characters. `ToHexString(One)` on a 64-bit table is
+  `"0000000000000001"`. Suppressing the leading zeros looks tidier and
+  breaks every table that indexes into the result at a fixed offset.
+- **Integer → String (decimal) suppresses leading zeros.** The two
+  disagree, deliberately.
+- **Buffer → String is a comma-separated element list**, not a number:
+  `"AB,CD,EF"` in hex, `"1,2,3"` in decimal, empty for an empty Buffer.
+  Reading a Buffer as one big number loses the fact that it was elements.
+- **String → Integer** accepts decimal *and* `0x`-prefixed hex, skips
+  leading blanks, and stops at the first character that is not a digit in
+  the chosen base. A string with **no digits at all is zero and not an
+  error**, which real tables rely on.
+- **`ToString` stops at the first NUL *or* at the length, whichever comes
+  first.** Both terminators. Stopping only at the NUL loses the length
+  argument; stopping only at the length copies embedded NULs into a String
+  that then measures longer than it prints.
+- **`ToBuffer` of a String includes the terminating NUL** (§19.6.140).
+- **`SizeOf` of an Integer is an error** (§19.6.125), not the integer
+  width. Answering the width is what an implementation that thinks `SizeOf`
+  is `sizeof()` does, and the answer is wrong in a way that only shows up
+  when a table branches on it.
+
+### The store boundary, moved
+
+#1055 refused anything needing a reference object. Storable now:
+
+1. the `Zero` literal — the null target, discards;
+2. `LocalX` — overwrite, **no** conversion (§19.3.5.8);
+3. `ArgX` — overwrite, **except** that an `ArgX` already holding a
+   Reference stores **through** it (§19.3.5.8: that is how a method mutates
+   an object its caller passed by `RefOf`). `LocalX` does **not** behave
+   this way, the asymmetry is the specification's, and the corpus pins both
+   halves because an implementation that made them agree would be wrong
+   whichever way it made them agree;
+4. a `NAMEREF` — convert to the destination's existing type, §19.3.5.7, for
+   **every** type and not only integers;
+5. `DebugObj` — a real sink; firmware writes to it constantly;
+6. an `Index()` expression — evaluated to a reference and stored through,
+   per its sub-kind;
+7. a `RefOf()` expression, or any operand evaluating to a Reference.
+
+**The new boundary is drawn at objects whose storage is not in this
+process.** A **FieldUnit** — an `OperationRegion` field element — is
+`BAD_TARGET` (41), because writing one is a bus transaction and belongs to
+R30.M3's region handlers. Reading one is refused for the same reason.
+Also refused: a Package or Buffer *object* used directly as a destination
+without an `Index`, and a Method or Device name, which are declarations
+rather than value cells.
+
+### `CondRefOf` — the one place a miss is a value
+
+§19.6.19 is the only construct in AML where a namespace miss is **data**:
+`CondRefOf` returns False for an absent name rather than failing.
+`aml_eval_set_quiet` suppresses **exactly one** latch —
+`NAME_NOT_FOUND` (36) — for the duration of one resolution, and restores
+the previous value on every path (which matters because a `CondRefOf` may
+appear inside another one's Result target). It does **not** suppress
+`BAD_PARENT_PREFIX` (39) or `NAME_TOO_DEEP` (38): a malformed path is not a
+miss, and `CondRefOf(^^^^^^FOO)` from the root is a broken table whether or
+not `FOO` exists. A flag rather than a third parameter on
+`aml_eval_resolve` because resolve has four exit paths and a parameter
+would touch all of them; the flag touches one.
+
+### `DerefOf` of a String is refused, deliberately
+
+§19.6.28 also permits a String naming a namespace path. Implementing it
+means building a **name-arena entry from heap bytes at evaluation time** —
+and the name arena is part of the parse tree, which evaluation is forbidden
+to mutate (§11). So it is `BAD_REF` (45), a refusal with a code, waiting for
+the evaluator to own name scratch of its own. A wrong dereference is worse
+than no dereference.
+
+---
+
+## 14. Two dispatchers, and why the integer one stays
+
+`aml_eval_obj` is the twin of `aml_eval_node`: it evaluates a node in
+**object** position and returns an object index. It takes its own step of
+fuel and its own level of depth *before* dispatch, so every object-valued
+construct inherits the termination and stack guarantees without a single
+handler remembering them — nested `Package`s consume depth without looping
+and are the construct that reaches the depth guard through this path.
+
+Keeping **two** dispatchers is not a speed optimisation, it is a
+correctness requirement of a bounded arena. The object arena is 512 records
+with no free, and a `While` loop containing a `Store` — an idiom in
+essentially every DSDT — would exhaust it in 512 iterations if every store
+allocated. So:
+
+- `aml_eval_node` keeps an allocation-free path for INT, untagged
+  `ArgX`/`LocalX`, a `NAMEREF` to an unbound integer `Name`, every #1055
+  operator, `CALL`, and `RevisionOp`;
+- it delegates to `aml_eval_obj` the moment a type appears that an integer
+  cannot represent;
+- `StoreOp` gets a fast path guarded by `aml_eval_expr_int_ok`, which is
+  `aml_eval_int_shaped(source) && aml_eval_dest_is_int(target)`. Both
+  predicates resolve a `NAMEREF` **quietly**, because a miss must not latch
+  from inside a predicate — the slow path is about to resolve it again and
+  latch the real error at the real site;
+- the same predicate is used by the statement dispatcher, so a `Store` in
+  statement position and the same `Store` inside an `If` predicate cannot
+  take different paths.
+
+Getting `aml_eval_dest_is_int` **too permissive** is the dangerous
+direction: it would silently skip the §19.3.5.7 conversion. Too restrictive
+only costs allocations.
+
+The corpus asserts an arithmetic-only method leaves `aml_obj_count()` at 1
+and touches no heap, and that a hundred-iteration `Store` loop does the
+same. A mutant that disables the fast path is killed by exactly those.
+
+### Frame slots as objects
+
+A slot holds a 64-bit word; which *interpretation* applies is a bit in the
+frame's tag bitmap at +192 — the tail #1054 reserved for this. Bits 0..6
+are `Arg0..Arg6`, bits 8..15 are `Local0..Local7`; the gap at bit 7 keeps
+the two runs on nibble boundaries. Clear means AML Integer, set means
+object index.
+
+A bitmap and not a byte per slot because a frame's whole type state is then
+**one word**: `aml_frame_push` zeroes it with the same loop that zeroes the
+slots, so a fresh `Local0` is the Integer Zero (§19.6) with no extra
+initialisation, and **an integer write retypes a slot by clearing one bit**
+rather than by maintaining a second array that could fall out of step. That
+clearing is load-bearing: an object index and a small integer are both
+small numbers, and no heuristic can tell them apart, so `Local0 = 3` would
+otherwise read back as a reference to object 3.
+
+---
+
+## 15. Error taxonomy — continuing §7
+
+| code | name | meaning |
+|---|---|---|
+| 42 | `AML_ERR_OBJ_ARENA_FULL` | 512 objects in use |
+| 43 | `AML_ERR_OBJ_HEAP_FULL` | 8192 payload bytes in use |
+| 44 | `AML_ERR_OBJ_ELEM_FULL` | 1024 package element slots in use |
+| 45 | `AML_ERR_BAD_REF` | `DerefOf`/store through a non-reference |
+| 46 | `AML_ERR_OBJ_RANGE` | index outside the object's own extent |
+| 47 | `AML_ERR_NO_CONVERSION` | §19.3.5 defines no conversion for the pair |
+| 48 | `AML_ERR_BAD_OBJTYPE` | an operand type the operator does not accept |
+| 49 | `AML_ERR_STALE_REF` | frame reference whose frame has been reused |
+| 50 | `AML_ERR_UNINIT_ELEMENT` | package element that was never initialised |
+
+They latch through `aml_eval_set_err` — the object module has **no error
+slot of its own**. Object allocation happens only during evaluation, and a
+second first-writer-wins slot would mean an arena-full condition that did
+not block evaluation, which is precisely the "caller forgot to check"
+failure `aml_eval_spend`'s execution-blocking rule exists to make
+impossible.
+
+---
+
+## 16. Verification — #1056 / #1057
+
+`tools/verify-aml-parser.sh` now compiles **eleven** modules and carries
+two more `objdump -r` confinement assertions: the object arena confined to
+`aml_obj.o`, and `aml_conv_tab` confined to `aml_str.o`. `aml_str.o` and
+`aml_ref.o` declare no mutable storage at all, so adding them to `MODULES`
+cost no new assertion and made every existing one strictly stronger — the
+conversion engine and the reference machinery are now proved unable to
+reach the lexer cursor, the parse arenas, the opcode table, the evaluator
+context, the frame pool or the object arena except through the accessor
+APIs.
+
+### Corpus — 2295 assertions, up from 1755
+
+New coverage, in the order the risk was ranked:
+
+- **The §19.3.5.7 direction test.** `Store(0x99, BUFX)` where `BUFX` holds
+  `Buffer(4)` leaves a **Buffer of length 4** whose byte 0 is `0x99` and
+  whose remaining bytes are zeroed — and `CopyObject(0x99, BUFX)` on the
+  same fixture retypes it to Integer. The parse tree is asserted unchanged
+  throughout, and a fresh session is asserted to see neither store.
+- **Operator-keyed conversion, proven by the pair.** `Add("5", 3)` is 8;
+  `ObjectType(Concatenate(5, 3))` is Buffer; `Concatenate("ab", 5)` is
+  eighteen characters, because the implicit Integer → String rule is
+  fixed-width hex.
+- **All three `Index` forms**, each asserted to yield its own reference
+  sub-kind, each `DerefOf` round-tripped through AML, and the same Integer
+  stored through a buffer index and a package index asserted to land
+  differently.
+- **`CondRefOf`** on a name declared inside a `Device` and therefore
+  invisible from the root: False, no latch, quiet flag restored — while a
+  plain `RefOf` of the same name is `NAME_NOT_FOUND`.
+- **`ToString`** truncating at the NUL and at the length, on the same
+  fixture, plus a buffer with no NUL at all.
+- **`ToInteger`** on decimal, `0x`-hex and Buffer sources.
+- **`Match`** over a Package, including the `MTR` shortcut and the raw
+  `MatchOpcode` bytes coming from the node's `arg0`/`arg1` rather than from
+  the child list.
+- **`ConcatenateResTemplate`**, with the descriptor chain **walked** to its
+  `EndTag` rather than assumed to end in one.
+- **Malformed**, each with its own code: `Index` out of bounds (46),
+  `DerefOf` of a non-reference (45), `SizeOf` of an Integer (48), package
+  element past `NumElements` (46), an uninitialised element within
+  `NumElements` (50), a stale frame reference (49), a Package converted to
+  an Integer (47).
+- **Budgets**: the object dispatcher spends exactly one step on a leaf and
+  refuses on a latched error; `Match` spends one step *per element*, proved
+  with a `Package(200){}` and a sixty-step budget; a `Concatenate` loop
+  terminates on fuel at a small budget and on `OBJ_HEAP_FULL` at the
+  default; fifty nested `Package`s reach `EVAL_DEPTH`; all three object
+  arenas refuse rather than grow.
+
+### Mutation testing — twenty-five mutants, twenty-four killed
+
+| mutant | killed by |
+|---|---|
+| store converts to the SOURCE type (§19.3.5.7 inverted) | `SizeOf is still 4 after storing an Integer` |
+| a Buffer destination is replaced, not length-preserved | `of the DESTINATION's length` |
+| `Index(String)` yields a buffer-field kind | `Index(String,n) is a StringField reference` |
+| buffer-field store routed to the element store | `stored through the buffer field` |
+| `CondRefOf` no longer suppresses the miss latch | `AND DOES NOT LATCH` |
+| `ToString` ignores its length argument | `stops at the LENGTH when that comes first` |
+| `ToString` ignores the NUL | `stops at the first NUL` |
+| `ToInteger` drops the `0x` prefix rule | `Add takes a hex string too` |
+| Integer → String hex is not zero padded | `Concatenate String+Integer converts to hex String` |
+| Buffer → String is one number, not a list | `hex elements, comma separated` |
+| `Mid` does not clamp its length | `Mid clamps its length to what remains` |
+| `SizeOf` of an Integer answers the width | `SizeOf of an Integer is refused` |
+| `mk_string` counts the NUL as a character | `SizeOf a String excludes its NUL` |
+| the `ToHexString` table row says decimal | `ToHexString wants hex` |
+| uninitialised element reads as the null object | `UNINIT_ELEMENT, not OBJ_RANGE` |
+| frames are not stamped with a serial | `but not the same serial` |
+| `ArgX` overwrites instead of storing through | `THE REFERENCED NAME WAS WRITTEN` |
+| an integer Local write does not clear the tag | `AND CLEARS THE TAG` |
+| an integer Arg write does not clear the tag | `AND CLEARS THE TAG` |
+| the tag bitmap puts locals on the arg run | `AND CLEARS THE TAG` |
+| the object dispatcher spends no fuel | `AND IT SPENT EXACTLY ONE STEP` |
+| the object dispatcher takes no depth | `nested Packages reach the DEPTH guard` |
+| `Match` spends no fuel per element | `FUEL_EXHAUSTED` |
+| an Integer-valued Name is bound (invariant broken) | `the reference it stored dereferences` |
+| `ObjectType` answers the DECLARED type | `CopyObject retypes the destination` |
+| `CopyObject` converts like `Store` | `CopyObject retypes the destination` |
+| a session does not reset the object arena | `Concatenate(Int,Int) is a 2*width Buffer` |
+| the `Store` fast path is disabled | `the Store fast path allocated nothing` |
+
+One mutant was **equivalent** and is recorded rather than chased: dropping
+the `and rax, 255` before a buffer-field store changes nothing, because
+`mov_b` truncates at the write. The semantically real version of that
+mutation — routing a buffer-field store to the *element* store — is in the
+table above and is killed.
+
+Two of the corpus's assertions were added *because* a mutant survived the
+first round, which is the failure mode the technique exists to find: the
+object dispatcher's fuel spend was invisible until the assertion used a
+**leaf** node (an operand that itself evaluates spends through
+`aml_eval_node` and hides the omission), and `Match`'s per-element spend
+was invisible until a package large enough to matter was in the corpus.
+
+### Toolchain
+
+No paideia-as gap surfaced. The object model exercises `mov_b` stores,
+`mov_d` indexed stores into `[u32; N]` arrays, variable shifts through
+`cl` and `imul r64, r64` — all already supported. One encoder note for the
+record: `mul r64` is not in the resolver table, and `imul r64, r64` is the
+supported form; the two differ only in the high half, which no conversion
+here needs.

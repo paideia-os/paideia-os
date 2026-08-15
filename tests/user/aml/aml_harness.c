@@ -191,6 +191,98 @@ extern uint64_t aml_arith_eval(uint64_t expr_node);
 /* Also needed by the evaluator corpus (#1054 added the setter). */
 extern uint64_t aml_u64_set(uint64_t ref, uint64_t value);
 
+/* #1056 / #1057 — the object model */
+extern void     aml_obj_reset(void);
+extern uint64_t aml_obj_count(void);
+extern uint64_t aml_obj_heap_used(void);
+extern uint64_t aml_obj_elem_used(void);
+extern uint64_t aml_obj_alloc(uint64_t ty);
+extern uint64_t aml_obj_word(uint64_t o, uint64_t w);
+extern uint64_t aml_obj_set_word(uint64_t o, uint64_t w, uint64_t v);
+extern uint64_t aml_obj_type(uint64_t o);
+extern uint64_t aml_obj_refkind(uint64_t o);
+extern uint64_t aml_obj_base(uint64_t o);
+extern uint64_t aml_obj_len(uint64_t o);
+extern uint64_t aml_obj_aux(uint64_t o);
+extern uint64_t aml_obj_int(uint64_t v);
+extern uint64_t aml_obj_int_value(uint64_t o);
+extern uint64_t aml_obj_heap_alloc(uint64_t n);
+extern uint64_t aml_obj_heap_get(uint64_t off);
+extern uint64_t aml_obj_heap_set(uint64_t off, uint64_t b);
+extern uint64_t aml_obj_str_alloc(uint64_t n);
+extern uint64_t aml_obj_buf_alloc(uint64_t n);
+extern uint64_t aml_obj_byte(uint64_t o, uint64_t i);
+extern uint64_t aml_obj_set_byte(uint64_t o, uint64_t i, uint64_t b);
+extern uint64_t aml_obj_copy(uint64_t d, uint64_t doff, uint64_t sO,
+                             uint64_t soff, uint64_t n);
+extern uint64_t aml_obj_pkg_alloc(uint64_t n);
+extern uint64_t aml_obj_elem_get(uint64_t o, uint64_t i);
+extern uint64_t aml_obj_elem_set(uint64_t o, uint64_t i, uint64_t v);
+extern uint64_t aml_obj_ref(uint64_t k, uint64_t b, uint64_t i, uint64_t ser);
+extern uint64_t aml_obj_bind_get(uint64_t n);
+extern uint64_t aml_obj_bind_set(uint64_t n, uint64_t o);
+extern uint64_t aml_obj_src_u8(uint64_t off);
+
+/* #1056 — conversion and the String/Buffer operators */
+extern uint64_t aml_conv_len;
+extern uint64_t aml_conv_tab[];
+extern uint64_t aml_conv_want(uint64_t op16, uint64_t pos);
+extern uint64_t aml_conv_dec_digits(uint64_t v);
+extern uint64_t aml_conv_int_to_str(uint64_t v, uint64_t base);
+extern uint64_t aml_conv_buf_to_str(uint64_t o, uint64_t base);
+extern uint64_t aml_conv_str_to_int(uint64_t o);
+extern uint64_t aml_conv_buf_to_int(uint64_t o);
+extern uint64_t aml_conv_int_to_buf(uint64_t v);
+extern uint64_t aml_conv_str_to_buf(uint64_t o);
+extern uint64_t aml_conv_cast(uint64_t o, uint64_t want);
+extern uint64_t aml_conv_operand(uint64_t n, uint64_t pos);
+extern uint64_t aml_str_cmp(uint64_t a, uint64_t b);
+extern uint64_t aml_str_concat(uint64_t a, uint64_t b);
+extern uint64_t aml_str_res_end(uint64_t o);
+extern uint64_t aml_str_concat_res(uint64_t a, uint64_t b);
+extern uint64_t aml_str_mid(uint64_t o, uint64_t i, uint64_t l);
+extern uint64_t aml_str_tostring(uint64_t o, uint64_t l);
+extern uint64_t aml_str_sizeof(uint64_t o);
+extern uint64_t aml_str_match_one(uint64_t e, uint64_t op, uint64_t a);
+extern uint64_t aml_str_match(uint64_t n);
+extern uint64_t aml_str_handles(uint64_t op16);
+extern uint64_t aml_str_eval(uint64_t n);
+
+/* #1057 — packages, references, Index */
+extern uint64_t aml_ref_node_objtype(uint64_t n);
+extern uint64_t aml_ref_objtype(uint64_t o);
+extern uint64_t aml_ref_deref(uint64_t o);
+extern uint64_t aml_ref_index(uint64_t sO, uint64_t i);
+extern uint64_t aml_ref_of_node(uint64_t n, uint64_t q);
+extern uint64_t aml_ref_store_through(uint64_t r, uint64_t sO);
+extern uint64_t aml_ref_handles(uint64_t op16);
+extern uint64_t aml_ref_eval(uint64_t n);
+
+/* #1057 — evaluator additions */
+extern uint64_t aml_eval_quiet(void);
+extern uint64_t aml_eval_set_quiet(uint64_t v);
+extern uint64_t aml_frame_bit(uint64_t k, uint64_t sl);
+extern uint64_t aml_frame_serial_of(uint64_t f);
+extern uint64_t aml_frame_slot_is_obj(uint64_t f, uint64_t k, uint64_t sl);
+extern uint64_t aml_frame_ref_get(uint64_t f, uint64_t k, uint64_t sl);
+extern uint64_t aml_frame_ref_set(uint64_t f, uint64_t k, uint64_t sl,
+                                  uint64_t o);
+extern uint64_t aml_frame_arg_is_obj(uint64_t i);
+extern uint64_t aml_frame_local_is_obj(uint64_t i);
+extern uint64_t aml_frame_set_arg_obj(uint64_t i, uint64_t o);
+extern uint64_t aml_frame_set_local_obj(uint64_t i, uint64_t o);
+extern uint64_t aml_eval_mk_string(uint64_t st, uint64_t en);
+extern uint64_t aml_eval_mk_buffer(uint64_t n);
+extern uint64_t aml_eval_mk_package(uint64_t n);
+extern uint64_t aml_eval_decl_obj(uint64_t n);
+extern uint64_t aml_eval_obj(uint64_t n);
+extern uint64_t aml_eval_store_named(uint64_t d, uint64_t o);
+extern uint64_t aml_eval_store_obj(uint64_t t, uint64_t o);
+extern uint64_t aml_eval_copy_obj(uint64_t t, uint64_t o);
+extern uint64_t aml_eval_int_shaped(uint64_t n);
+extern uint64_t aml_eval_dest_is_int(uint64_t n);
+extern uint64_t aml_eval_expr_int_ok(uint64_t n);
+
 /* ------------------------------------------------------------- error codes */
 
 enum {
@@ -216,7 +308,28 @@ enum {
     E_FUEL_EXHAUSTED = 31, E_EVAL_DEPTH = 32, E_FRAME_OVERFLOW = 33,
     E_DIVIDE_BY_ZERO = 34, E_NOT_EVALUABLE = 35, E_NAME_NOT_FOUND = 36,
     E_BAD_SLOT = 37, E_NAME_TOO_DEEP = 38, E_BAD_PARENT_PREFIX = 39,
-    E_NO_FRAME = 40, E_BAD_TARGET = 41
+    E_NO_FRAME = 40, E_BAD_TARGET = 41,
+    /* #1056 / #1057 — the object model. Same shared code space, so a code
+     * still identifies its origin unambiguously. */
+    E_OBJ_ARENA_FULL = 42, E_OBJ_HEAP_FULL = 43, E_OBJ_ELEM_FULL = 44,
+    E_BAD_REF = 45, E_OBJ_RANGE = 46, E_NO_CONVERSION = 47,
+    E_BAD_OBJTYPE = 48, E_STALE_REF = 49, E_UNINIT_ELEMENT = 50
+};
+
+/* ACPI ObjectType codes — §19.6.101, and the object model's internal tag. */
+enum {
+    T_UNINIT = 0, T_INT = 1, T_STR = 2, T_BUF = 3, T_PKG = 4,
+    T_FIELDUNIT = 5, T_DEVICE = 6, T_EVENT = 7, T_METHOD = 8, T_MUTEX = 9,
+    T_REGION = 10, T_POWER = 11, T_PROC = 12, T_THERMAL = 13,
+    T_BUFFIELD = 14, T_REF = 20,
+    /* want-codes that are not types */
+    T_STRDEC = 12, T_SAME0 = 100, T_TARGET = 101
+};
+
+/* reference sub-kinds */
+enum {
+    R_NAME = 1, R_LOCAL = 2, R_ARG = 3, R_PKG_ELEM = 4,
+    R_BUF_FIELD = 5, R_STR_FIELD = 6
 };
 
 /* node kinds */
@@ -334,33 +447,35 @@ static void on_alarm(int sig)
     _exit(96);
 }
 
-#define GUARDED(body)                                                        \
+/* Variadic since #1056: an object-model test body contains array
+ * initialisers, whose commas a single-parameter macro would split on. */
+#define GUARDED(...)                                                         \
     do {                                                                     \
         g_armed = 1;                                                         \
-        if (sigsetjmp(g_jb, 1) == 0) { body; }                               \
+        if (sigsetjmp(g_jb, 1) == 0) { __VA_ARGS__; }                        \
         else { fail("SIGSEGV — read past the end of the AML buffer"); }      \
         g_armed = 0;                                                         \
     } while (0)
 
 /* Bind the lexer to a guarded copy of `data` and run `body`. */
-#define WITH_FIXTURE(name, data, n, body)                                    \
+#define WITH_FIXTURE(name, data, n, ...)                                     \
     do {                                                                     \
         g_case = (name);                                                     \
         const uint8_t *_b = guard_load((data), (n));                         \
         aml_arena_reset();                                                   \
         aml_lex_init((uint64_t)(uintptr_t)_b, (uint64_t)(n));                \
-        GUARDED(body);                                                       \
+        GUARDED(__VA_ARGS__);                                                \
         guard_free();                                                        \
     } while (0)
 
 /* Parse a guarded copy of `data` and run `body` with `root` in scope. */
-#define WITH_PARSE(name, data, n, body)                                      \
+#define WITH_PARSE(name, data, n, ...)                                       \
     do {                                                                     \
         g_case = (name);                                                     \
         const uint8_t *_b = guard_load((data), (n));                         \
         volatile uint64_t root = 0;                                          \
         GUARDED(root = aml_parse((uint64_t)(uintptr_t)_b, (uint64_t)(n)));    \
-        { body; }                                                            \
+        { __VA_ARGS__; }                                                     \
         eq("depth unwound", aml_lex_depth(), 0);                             \
         guard_free();                                                        \
     } while (0)
@@ -2773,17 +2888,1014 @@ static void test_eval_arithmetic(void)
     EXPR_CASE("eval: Mod by zero", 2, 0, E_DIVIDE_BY_ZERO,
               0x85,0x0A,0x05,0x00,0x00);
 
-    /* Boundaries with #1056 / #1057, refused rather than approximated. */
     EXPR_CASE("eval: Increment of a literal is not a target",
               2, 0, E_BAD_TARGET, 0x75,0x0A,0x05);
-    EXPR_CASE("eval: Store is deferred", 2, 0, E_NOT_EVALUABLE,
+
+    /* #1056 / #1057 moved these from refusals to implementations. They stay
+     * here, next to the twenty-four operators they used to bound, so the
+     * boundary is visible as a boundary that MOVED rather than as a comment
+     * claiming it once existed.
+     *
+     * Store returns the value it stored (§19.6.126), which is what makes
+     * Store(Store(x,A),B) assign to both -- and it takes the integer fast
+     * path here, so it allocates nothing. */
+    EXPR_CASE("eval: Store returns the stored value", 2, 1, AML_OK,
               0x70,0x01,0x60);
-    EXPR_CASE("eval: Concat is deferred", 2, 0, E_NOT_EVALUABLE,
-              0x73,0x01,0x01,0x00);
-    EXPR_CASE("eval: a String is deferred", 2, 0, E_NOT_EVALUABLE,
-              0x0D,'h','i',0x00);
-    EXPR_CASE("eval: a Buffer is deferred", 2, 0, E_NOT_EVALUABLE,
-              0x11,0x03,0x01,0x00);
+    /* Concatenate of two Integers is a BUFFER of two width-sized integers
+     * (§19.6.13) -- not an Integer, which is the case an implementation that
+     * keys conversion off the OPERAND rather than the OPERATOR gets wrong. */
+    EXPR_CASE("eval: Concatenate(Int,Int) is a 2*width Buffer", 2, 16, AML_OK,
+              0x87,0x73,0x01,0x01,0x00);
+    EXPR_CASE("eval: SizeOf a String excludes its NUL", 2, 2, AML_OK,
+              0x87,0x0D,'h','i',0x00);
+    EXPR_CASE("eval: SizeOf a Buffer is its byte count", 2, 1, AML_OK,
+              0x87,0x11,0x03,0x01,0x00);
+    /* SizeOf of an INTEGER is an error, not the integer width (§19.6.125). */
+    EXPR_CASE("eval: SizeOf of an Integer is refused", 2, 0, E_BAD_OBJTYPE,
+              0x87,0x0A,0x05);
+    /* The new boundary: a FieldUnit read is a bus transaction, R30.M3's. */
+    EXPR_CASE("eval: DerefOf of a non-reference is refused", 2, 0, E_BAD_REF,
+              0x83,0x0A,0x05);
+
+    /* ---------------------------------------------------------------
+     * §19.3.5.5 — OPERAND CONVERSION IS KEYED BY THE OPERATOR. These two
+     * are the pair: the SAME operand type, converted in OPPOSITE
+     * directions, chosen by the operator and not by the operand.
+     * --------------------------------------------------------------- */
+    EXPR_CASE("eval: Add converts a STRING operand to Integer", 2, 8, AML_OK,
+              0x72,0x0D,'5',0x00,0x0A,0x03,0x00);
+    EXPR_CASE("eval: Add takes a hex string too", 2, 0x13, AML_OK,
+              0x72,0x0D,'0','x','1','0',0x00,0x0A,0x03,0x00);
+    EXPR_CASE("eval: Concatenate converts an INTEGER operand to Buffer",
+              2, T_BUF, AML_OK, 0x8E,0x73,0x0A,0x05,0x0A,0x03,0x00);
+    /* and the two integers really are laid end to end at the table width:
+     * byte 8 is the low byte of the SECOND operand */
+    EXPR_CASE("eval: Concatenate lays two integers end to end", 2, 3, AML_OK,
+              0x83,0x88,0x73,0x0A,0x05,0x0A,0x03,0x00,0x0A,0x08,0x00);
+    EXPR_CASE("eval: Concatenate of two Strings is a String", 2, 4, AML_OK,
+              0x87,0x73,0x0D,'a','b',0x00,0x0D,'c','d',0x00,0x00);
+    /* a String first operand converts the Integer to a String -- and the
+     * implicit Integer->String rule is FIXED-WIDTH HEX, so 2 + 16 */
+    EXPR_CASE("eval: Concatenate String+Integer converts to hex String",
+              2, 18, AML_OK, 0x87,0x73,0x0D,'a','b',0x00,0x0A,0x05,0x00);
+
+    /* ---------------------------------------------------------------
+     * The four operators that ARE a conversion-table row plus a store.
+     * --------------------------------------------------------------- */
+    EXPR_CASE("eval: ToInteger of a decimal String", 2, 42, AML_OK,
+              0x99,0x0D,'4','2',0x00,0x00);
+    EXPR_CASE("eval: ToInteger of a 0x-prefixed hex String", 2, 42, AML_OK,
+              0x99,0x0D,'0','x','2','A',0x00,0x00);
+    EXPR_CASE("eval: ToInteger of a Buffer is little-endian", 2, 0x1234, AML_OK,
+              0x99,0x11,0x05,0x0A,0x02,0x34,0x12,0x00);
+    EXPR_CASE("eval: ToHexString of an Integer is fixed width", 2, 16, AML_OK,
+              0x87,0x98,0x0A,0x05,0x00);
+    EXPR_CASE("eval: ToDecimalString of an Integer is not padded", 2, 2, AML_OK,
+              0x87,0x97,0x0A,0x2A,0x00);
+    EXPR_CASE("eval: ToBuffer of a String includes its NUL", 2, 3, AML_OK,
+              0x87,0x96,0x0D,'A','B',0x00,0x00);
+    EXPR_CASE("eval: ToBuffer of an Integer is width/8 bytes", 2, 8, AML_OK,
+              0x87,0x96,0x0A,0x05,0x00);
+
+    /* ---------------------------------------------------------------
+     * ToString stops at the FIRST NUL **or** at the length, whichever
+     * comes first. Both terminators, not one: a Buffer of a,b,NUL,c,d,NUL
+     * gives 2 with no limit and 1 with a limit of One.
+     * --------------------------------------------------------------- */
+    EXPR_CASE("eval: ToString stops at the first NUL", 2, 2, AML_OK,
+              0x87,0x9C,0x11,0x09,0x0A,0x06,'a','b',0x00,'c','d',0x00,
+              0xFF,0x00);
+    EXPR_CASE("eval: ToString stops at the LENGTH when that comes first",
+              2, 1, AML_OK,
+              0x87,0x9C,0x11,0x09,0x0A,0x06,'a','b',0x00,'c','d',0x00,
+              0x01,0x00);
+    EXPR_CASE("eval: ToString of a buffer with no NUL takes it all",
+              2, 3, AML_OK,
+              0x87,0x9C,0x11,0x06,0x0A,0x03,'x','y','z',0xFF,0x00);
+
+    /* Mid keeps the source's TYPE and clamps rather than failing. */
+    EXPR_CASE("eval: Mid of a String is a String", 2, 2, AML_OK,
+              0x87,0x9E,0x0D,'a','b','c','d',0x00,0x01,0x0A,0x02,0x00);
+    EXPR_CASE("eval: Mid past the end yields an empty result", 2, 0, AML_OK,
+              0x87,0x9E,0x0D,'a','b',0x00,0x0A,0x09,0x0A,0x02,0x00);
+    EXPR_CASE("eval: Mid clamps its length to what remains", 2, 1, AML_OK,
+              0x87,0x9E,0x0D,'a','b',0x00,0x01,0x0A,0x09,0x00);
+}
+
+
+/* ---------------------------------------------------------------------
+ * R30.M2-003 (#1056) / R30.M2-004 (#1057) — the object model.
+ *
+ * WHY SO MANY OF THESE TESTS ARE C-LEVEL RATHER THAN AML-LEVEL
+ * ------------------------------------------------------------
+ * Three properties this milestone has to prove are INVISIBLE from AML at
+ * this milestone and would be untestable if the corpus only ever ran
+ * methods:
+ *
+ *   * the three Index() forms produce three DISTINCT reference kinds.
+ *     From AML, DerefOf of a buffer index and DerefOf of a package index
+ *     of the same value are indistinguishable; the difference only shows
+ *     up on a STORE, and only in what gets truncated.
+ *   * a store to an ArgX holding a Reference goes THROUGH it while a
+ *     store to a LocalX does not (§19.3.5.8). Getting a reference into an
+ *     ArgX from AML needs argument promotion, which is #1058's.
+ *   * a frame reference is invalidated by its frame being popped.
+ *
+ * So those are driven through the module API directly, against the same
+ * machine code, and the AML-level fixtures cover everything that CAN be
+ * reached from bytecode. Both halves run under the guard page.
+ * --------------------------------------------------------------------- */
+
+#define OBJ_SESSION(name, ...)                                               \
+    do {                                                                     \
+        static const uint8_t _z[1] = { 0 };                                  \
+        g_case = (name);                                                     \
+        const uint8_t *_ob = guard_load(_z, 1);                              \
+        aml_arena_reset();                                                   \
+        aml_lex_init((uint64_t)(uintptr_t)_ob, 1);                           \
+        aml_eval_reset(2);                                                   \
+        GUARDED(__VA_ARGS__);                                                \
+        guard_free();                                                        \
+    } while (0)
+
+static uint64_t mkstr(const char *t)
+{
+    size_t n = strlen(t);
+    uint64_t o = aml_obj_str_alloc(n);
+    for (size_t k = 0; k < n; k++) aml_obj_set_byte(o, k, (uint8_t)t[k]);
+    return o;
+}
+
+static uint64_t mkbuf(const uint8_t *d, size_t n)
+{
+    uint64_t o = aml_obj_buf_alloc(n);
+    for (size_t k = 0; k < n; k++) aml_obj_set_byte(o, k, d[k]);
+    return o;
+}
+
+static void streq(const char *what, uint64_t o, const char *want)
+{
+    size_t n = strlen(want);
+    eq(what, aml_obj_len(o), (uint64_t)n);
+    for (size_t k = 0; k < n; k++)
+        eq(what, aml_obj_byte(o, k), (uint64_t)(uint8_t)want[k]);
+}
+
+static void test_obj_model(void)
+{
+    OBJ_SESSION("obj: arena discipline and record shape", {
+        eq("session starts empty", aml_obj_count(), 1);
+        eq("heap starts at 1", aml_obj_heap_used(), 1);
+        eq("elements start at 1", aml_obj_elem_used(), 1);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        uint64_t i = aml_obj_int(0x1234);
+        eq("integer type", aml_obj_type(i), T_INT);
+        eq("integer value", aml_obj_int_value(i), 0x1234);
+        eq("object 0 is the null sentinel", aml_obj_type(0), 0);
+        eq("and reads as zero on every word", aml_obj_word(0, 1), 0);
+        /* nothing above the high-water mark is reachable */
+        eq("above the mark reads as zero", aml_obj_word(aml_obj_count(), 0), 0);
+
+        uint64_t so = aml_obj_str_alloc(3);
+        eq("string type", aml_obj_type(so), T_STR);
+        eq("length EXCLUDES the NUL", aml_obj_len(so), 3);
+        eq("set byte", aml_obj_set_byte(so, 0, 'A'), 1);
+        eq("byte round-trips", aml_obj_byte(so, 0), 'A');
+        eq("the NUL is allocated behind it",
+           aml_obj_heap_get(aml_obj_base(so) + 3), 0);
+
+        uint64_t bo = aml_obj_buf_alloc(2);
+        eq("buffer type", aml_obj_type(bo), T_BUF);
+        eq("a fresh buffer is zero filled", aml_obj_byte(bo, 0), 0);
+
+        uint64_t po = aml_obj_pkg_alloc(3);
+        eq("package type", aml_obj_type(po), T_PKG);
+        eq("NumElements", aml_obj_len(po), 3);
+        eq("an uninitialised element is null", aml_obj_elem_get(po, 2), 0);
+        eq("and that is not an error", aml_eval_err(), AML_OK);
+        eq("elements bind", aml_obj_elem_set(po, 1, i), 1);
+        eq("and read back", aml_obj_elem_get(po, 1), i);
+
+        uint64_t r = aml_obj_ref(R_BUF_FIELD, bo, 1, 0);
+        eq("reference type is ACPICA's local 20", aml_obj_type(r), T_REF);
+        eq("sub-kind", aml_obj_refkind(r), R_BUF_FIELD);
+        eq("base", aml_obj_base(r), bo);
+        eq("index", aml_obj_len(r), 1);
+        eq("still clean", aml_eval_err(), AML_OK);
+    });
+
+    /* Each refusal gets its own session: a latched error is execution-
+     * blocking by design (#1054 invariant I3), so two in one session would
+     * make the second assertion vacuous. */
+    OBJ_SESSION("obj: a byte index past the object is refused", {
+        eq("refused", aml_obj_byte(aml_obj_buf_alloc(2), 2), 0);
+        eq("OBJ_RANGE", aml_eval_err(), E_OBJ_RANGE);
+    });
+    OBJ_SESSION("obj: an element index past NumElements is refused", {
+        eq("refused", aml_obj_elem_get(aml_obj_pkg_alloc(2), 2), 0);
+        eq("OBJ_RANGE", aml_eval_err(), E_OBJ_RANGE);
+    });
+    OBJ_SESSION("obj: an Integer has no bytes", {
+        eq("refused", aml_obj_byte(aml_obj_int(7), 0), 0);
+        eq("BAD_OBJTYPE", aml_eval_err(), E_BAD_OBJTYPE);
+    });
+    OBJ_SESSION("obj: a Buffer is not silently an Integer", {
+        eq("refused", aml_obj_int_value(aml_obj_buf_alloc(1)), 0);
+        eq("BAD_OBJTYPE", aml_eval_err(), E_BAD_OBJTYPE);
+    });
+    OBJ_SESSION("obj: an unknown reference sub-kind is refused", {
+        eq("refused", aml_obj_ref(9, 1, 0, 0), 0);
+        eq("BAD_REF", aml_eval_err(), E_BAD_REF);
+    });
+    OBJ_SESSION("obj: the payload heap refuses rather than growing", {
+        int guard = 0;
+        while (aml_eval_err() == AML_OK && guard++ < 400)
+            (void)aml_obj_buf_alloc(64);
+        eq("exhaustion is a LATCH", aml_eval_err(), E_OBJ_HEAP_FULL);
+        eq("bounded, never wrapped", aml_obj_heap_used() <= 8192, 1);
+    });
+    OBJ_SESSION("obj: the object table refuses rather than growing", {
+        int guard = 0;
+        while (aml_eval_err() == AML_OK && guard++ < 600)
+            (void)aml_obj_int(1);
+        eq("exhaustion is a LATCH", aml_eval_err(), E_OBJ_ARENA_FULL);
+        eq("bounded at 512 records", aml_obj_count(), 512);
+    });
+    OBJ_SESSION("obj: the element table refuses rather than growing", {
+        int guard = 0;
+        while (aml_eval_err() == AML_OK && guard++ < 400)
+            (void)aml_obj_pkg_alloc(64);
+        eq("exhaustion is a LATCH", aml_eval_err(), E_OBJ_ELEM_FULL);
+    });
+}
+
+/* ---------------------------------------------------------------------
+ * THE CONVERSION MODEL. Two rules that look like one (§19.3.5), and this
+ * is the half that says WHICH TYPE EACH OPERATOR WANTS WHERE.
+ * --------------------------------------------------------------------- */
+static void test_conv_table(void)
+{
+    OBJ_SESSION("conv: the operand table is keyed by OPERATOR, not operand", {
+        /* THE headline pair. Add wants Integers; Concatenate's second
+         * operand takes the type of its FIRST. Same operand type, opposite
+         * conversions, chosen by the operator. */
+        eq("Add operand 0 wants Integer",     aml_conv_want(0x72, 0), T_INT);
+        eq("Add operand 1 wants Integer",     aml_conv_want(0x72, 1), T_INT);
+        eq("Add operand 2 is a Target",       aml_conv_want(0x72, 2), T_TARGET);
+        eq("Concatenate operand 0 is ANY",    aml_conv_want(0x73, 0), 0);
+        eq("Concatenate operand 1 follows 0", aml_conv_want(0x73, 1), T_SAME0);
+        eq("Concatenate operand 2 is a Target",
+                                              aml_conv_want(0x73, 2), T_TARGET);
+        /* four operators that ARE a table row plus a store */
+        eq("ToBuffer wants Buffer",           aml_conv_want(0x96, 0), T_BUF);
+        eq("ToDecimalString wants decimal",   aml_conv_want(0x97, 0), T_STRDEC);
+        eq("ToHexString wants hex",           aml_conv_want(0x98, 0), T_STR);
+        eq("ToInteger wants Integer",         aml_conv_want(0x99, 0), T_INT);
+        eq("ToString wants a Buffer",         aml_conv_want(0x9C, 0), T_BUF);
+        eq("then an Integer length",          aml_conv_want(0x9C, 1), T_INT);
+        eq("Store operand 1 is a Target",     aml_conv_want(0x70, 1), T_TARGET);
+        eq("RefOf operand 0 is a Target",     aml_conv_want(0x71, 0), T_TARGET);
+        eq("Index operand 0 is ANY",          aml_conv_want(0x88, 0), 0);
+        eq("Index operand 1 wants Integer",   aml_conv_want(0x88, 1), T_INT);
+        eq("Mid operand 3 is a Target",       aml_conv_want(0x9E, 3), T_TARGET);
+        eq("an unlisted opcode gets the arithmetic default",
+                                              aml_conv_want(0x7B, 0), T_INT);
+        eq("and its position 2 is a Target",  aml_conv_want(0x7B, 2), T_TARGET);
+        eq("there is no operand position 4",  aml_conv_want(0x72, 4), 0);
+        /* every row must belong to an operator somebody actually implements,
+         * or the table is describing a promise nothing keeps */
+        for (uint64_t k = 0; k < aml_conv_len; k++) {
+            uint64_t op = aml_conv_tab[k] & 0xFFFF;
+            eq("every table row is an implemented operator",
+               aml_str_handles(op) || aml_ref_handles(op), 1);
+        }
+    });
+}
+
+static void test_conversions(void)
+{
+    OBJ_SESSION("conv: Integer -> String, hex is padded and decimal is not", {
+        uint64_t h = aml_conv_int_to_str(0x2A, 16);
+        streq("hex is fixed width/4", h, "000000000000002A");
+        streq("decimal suppresses leading zeros",
+              aml_conv_int_to_str(42, 10), "42");
+        streq("zero is one digit", aml_conv_int_to_str(0, 10), "0");
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+
+    OBJ_SESSION("conv: Buffer -> String is an ELEMENT LIST, not a number", {
+        static const uint8_t d[] = { 0x0F, 0xA0, 0x01 };
+        uint64_t b = mkbuf(d, sizeof d);
+        streq("hex elements, comma separated",
+              aml_conv_buf_to_str(b, 16), "0F,A0,01");
+        streq("decimal elements, comma separated",
+              aml_conv_buf_to_str(b, 10), "15,160,1");
+        streq("an empty Buffer is an empty String",
+              aml_conv_buf_to_str(aml_obj_buf_alloc(0), 16), "");
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+
+    OBJ_SESSION("conv: String -> Integer takes decimal AND 0x hex", {
+        eq("decimal",           aml_conv_str_to_int(mkstr("42")), 42);
+        eq("0x hex",            aml_conv_str_to_int(mkstr("0x2A")), 42);
+        eq("0X hex, lowercase", aml_conv_str_to_int(mkstr("0X2a")), 42);
+        eq("leading blanks skipped", aml_conv_str_to_int(mkstr("   7")), 7);
+        eq("stops at the first non-digit",
+           aml_conv_str_to_int(mkstr("12ab")), 12);
+        eq("no digits is ZERO and not an error",
+           aml_conv_str_to_int(mkstr("hi")), 0);
+        eq("still clean", aml_eval_err(), AML_OK);
+    });
+
+    OBJ_SESSION("conv: Buffer -> Integer is little-endian, min(len, width)", {
+        static const uint8_t d[] = { 0x34, 0x12 };
+        eq("little endian, zero extended",
+           aml_conv_buf_to_int(mkbuf(d, 2)), 0x1234);
+        static const uint8_t big[] = { 1,2,3,4,5,6,7,8,9 };
+        eq("a longer buffer keeps the LOW bytes",
+           aml_conv_buf_to_int(mkbuf(big, 9)), 0x0807060504030201ULL);
+    });
+
+    OBJ_SESSION("conv: Integer / String -> Buffer", {
+        uint64_t b = aml_conv_int_to_buf(0x1234);
+        eq("length follows the REVISION, not the value", aml_obj_len(b), 8);
+        eq("low byte first", aml_obj_byte(b, 0), 0x34);
+        eq("then the next",  aml_obj_byte(b, 1), 0x12);
+        uint64_t sb = aml_conv_str_to_buf(mkstr("AB"));
+        eq("a String Buffer INCLUDES the NUL", aml_obj_len(sb), 3);
+        eq("b0", aml_obj_byte(sb, 0), 'A');
+        eq("its last byte is the NUL", aml_obj_byte(sb, 2), 0);
+    });
+
+    OBJ_SESSION("conv: a cast to the same type does not copy", {
+        uint64_t so = mkstr("x");
+        eq("identity", aml_conv_cast(so, T_STR), so);
+        eq("ANY is identity too", aml_conv_cast(so, 0), so);
+        eq("SAME-AS-0 is resolved by the caller", aml_conv_cast(so, T_SAME0), so);
+    });
+    OBJ_SESSION("conv: a Package converts to nothing", {
+        eq("refused", aml_conv_cast(aml_obj_pkg_alloc(1), T_INT), 0);
+        eq("NO_CONVERSION", aml_eval_err(), E_NO_CONVERSION);
+    });
+    OBJ_SESSION("conv: a Reference converts to nothing either", {
+        eq("refused", aml_conv_cast(aml_obj_ref(R_NAME, 1, 0, 0), T_STR), 0);
+        eq("NO_CONVERSION", aml_eval_err(), E_NO_CONVERSION);
+    });
+}
+
+/* ---------------------------------------------------------------------
+ * ConcatenateResTemplate — §19.6.14. The EndTag of each source is dropped
+ * and ONE new one appended, which is the whole reason the operator exists.
+ * --------------------------------------------------------------------- */
+static void test_concat_res_template(void)
+{
+    OBJ_SESSION("str: ConcatenateResTemplate joins descriptor lists", {
+        /* Memory32Fixed: large item 6, 9 payload bytes, then an EndTag. */
+        static const uint8_t t1[] = { 0x86, 0x09, 0x00,
+                                      0x00, 1,0,0,0, 4,0,0,0, 0x79, 0x00 };
+        /* IO: small item 8, 7 payload bytes, then an EndTag. */
+        static const uint8_t t2[] = { 0x47, 0x01, 0x10,0x00, 0x10,0x00,
+                                      0x01, 0x08, 0x79, 0x00 };
+        uint64_t a = mkbuf(t1, sizeof t1), b = mkbuf(t2, sizeof t2);
+        eq("the chain is WALKED to its EndTag", aml_str_res_end(a), 12);
+        eq("and for the small form too", aml_str_res_end(b), 8);
+        uint64_t c = aml_str_concat_res(a, b);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("descriptors + one EndTag", aml_obj_len(c), 12 + 8 + 2);
+        eq("exactly one EndTag, at the end", aml_str_res_end(c), 20);
+        eq("generated EndTags carry checksum 0", aml_obj_byte(c, 21), 0);
+        eq("the second template survived intact", aml_obj_byte(c, 12), 0x47);
+    });
+    OBJ_SESSION("str: a buffer with no EndTag is not a template", {
+        static const uint8_t bad[] = { 0x86, 0x09, 0x00, 0,0,0,0,0,0,0,0,0 };
+        uint64_t a = mkbuf(bad, sizeof bad);
+        eq("no EndTag found", aml_str_res_end(a), 0);
+        eq("and concatenation refuses", aml_str_concat_res(a, a), 0);
+        eq("BAD_OBJTYPE", aml_eval_err(), E_BAD_OBJTYPE);
+    });
+}
+
+/* ---------------------------------------------------------------------
+ * §19.3.5.7 — THE DIRECTION TEST. Storing an Integer into a Name holding
+ * a Buffer produces a BUFFER. Implemented the other way round this passes
+ * every fixture whose Names only ever hold integers, and then destroys a
+ * _CRS on real hardware. CopyObject is run on the SAME fixture, because
+ * the only way to prove Store's conversion is doing something is to put
+ * it next to the operator that deliberately does not convert (§19.6.20).
+ * --------------------------------------------------------------------- */
+static void test_store_converts_to_the_destination_type(void)
+{
+    uint8_t b[] = {
+        /* Name(BUFX, Buffer(4){0x11,0x22,0x33,0x44}) */
+        0x08, 'B','U','F','X', 0x11, 0x07, 0x0A, 0x04, 0x11,0x22,0x33,0x44,
+        /* Method(STOR,0) { Store(0x99, BUFX) ; Return(SizeOf(BUFX)) } */
+        0x14, 0x13, 'S','T','O','R', 0x00,
+            0x70, 0x0A, 0x99, 'B','U','F','X',
+            0xA4, 0x87, 'B','U','F','X',
+        /* Method(COPY,0) { CopyObject(0x99, BUFX) ; Return(ObjectType(BUFX)) } */
+        0x14, 0x13, 'C','O','P','Y', 0x00,
+            0x9D, 0x0A, 0x99, 'B','U','F','X',
+            0xA4, 0x8E, 'B','U','F','X',
+        /* Method(TYPE,0) { Return(ObjectType(BUFX)) } */
+        0x14, 0x0C, 'T','Y','P','E', 0x00,
+            0xA4, 0x8E, 'B','U','F','X'
+    };
+    WITH_PARSE("eval: Store converts to the DESTINATION's existing type",
+               b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t nm  = nth_child(root, 0);
+        uint64_t stor = nth_child(root, 1);
+        uint64_t copy = nth_child(root, 2);
+        uint64_t type = nth_child(root, 3);
+        eq("name kind", aml_node_kind(nm), N_NAME);
+        eq("declared as a buffer", aml_node_flags(nm), 3);
+
+        aml_eval_reset(2);
+        eq("the declared type before any store", aml_eval_method(type), T_BUF);
+
+        aml_eval_reset(2);
+        eq("SizeOf is still 4 after storing an Integer",
+           aml_eval_method(stor), 4);
+        eq("no error", aml_eval_err(), AML_OK);
+        uint64_t o = aml_obj_bind_get(nm);
+        eq("the object bound to the name is a BUFFER", aml_obj_type(o), T_BUF);
+        eq("of the DESTINATION's length", aml_obj_len(o), 4);
+        eq("byte 0 took the low byte of the Integer", aml_obj_byte(o, 0), 0x99);
+        eq("byte 1 was zero filled", aml_obj_byte(o, 1), 0);
+        eq("byte 2 was zero filled", aml_obj_byte(o, 2), 0);
+        eq("byte 3 was zero filled", aml_obj_byte(o, 3), 0);
+        eq("THE PARSE TREE WAS NOT MUTATED", aml_node_flags(nm), 3);
+
+        /* CopyObject does NOT convert: the same store retypes the Name. */
+        aml_eval_reset(2);
+        eq("CopyObject retypes the destination",
+           aml_eval_method(copy), T_INT);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("and the bound object really is an Integer",
+           aml_obj_type(aml_obj_bind_get(nm)), T_INT);
+
+        /* A fresh session re-materialises from the declaration, so neither
+         * store is visible to the next evaluation of the same table. */
+        aml_eval_reset(2);
+        eq("a new session starts from the declaration again",
+           aml_eval_method(type), T_BUF);
+        eq("and its bindings are empty", aml_obj_bind_get(nm) != 0, 1);
+    });
+}
+
+/* ---------------------------------------------------------------------
+ * Index() is three operators wearing one opcode, and the three produce
+ * three DIFFERENT reference kinds. Conflating them does not fail — it
+ * corrupts: a store through a buffer index truncates to one byte, a store
+ * through a package index replaces the whole element.
+ * --------------------------------------------------------------------- */
+static void test_index_three_reference_kinds(void)
+{
+    uint8_t b[] = {
+        /* Name(BUFI, Buffer(3){0xAA,0xBB,0xCC}) */
+        0x08, 'B','U','F','I', 0x11, 0x06, 0x0A, 0x03, 0xAA, 0xBB, 0xCC,
+        /* Name(STRI, "hey") */
+        0x08, 'S','T','R','I', 0x0D, 'h','e','y', 0x00,
+        /* Name(PKGI, Package(2){0x10, 0x20}) */
+        0x08, 'P','K','G','I', 0x12, 0x06, 0x02, 0x0A, 0x10, 0x0A, 0x20,
+        /* Method(DRB_,0){ Return(DerefOf(Index(BUFI,1,Zero))) } */
+        0x14, 0x0F, 'D','R','B','_', 0x00,
+            0xA4, 0x83, 0x88, 'B','U','F','I', 0x01, 0x00,
+        /* Method(DRS_,0){ Return(DerefOf(Index(STRI,1,Zero))) } */
+        0x14, 0x0F, 'D','R','S','_', 0x00,
+            0xA4, 0x83, 0x88, 'S','T','R','I', 0x01, 0x00,
+        /* Method(DRP_,0){ Return(DerefOf(Index(PKGI,1,Zero))) } */
+        0x14, 0x0F, 'D','R','P','_', 0x00,
+            0xA4, 0x83, 0x88, 'P','K','G','I', 0x01, 0x00,
+        /* Method(OTB_,0){ Return(ObjectType(Index(BUFI,1,Zero))) } */
+        0x14, 0x0F, 'O','T','B','_', 0x00,
+            0xA4, 0x8E, 0x88, 'B','U','F','I', 0x01, 0x00,
+        /* Method(OTP_,0){ Return(ObjectType(Index(PKGI,1,Zero))) } */
+        0x14, 0x0F, 'O','T','P','_', 0x00,
+            0xA4, 0x8E, 0x88, 'P','K','G','I', 0x01, 0x00,
+        /* Method(SIZ_,0){ Return(SizeOf(PKGI)) } */
+        0x14, 0x0C, 'S','I','Z','_', 0x00,
+            0xA4, 0x87, 'P','K','G','I'
+    };
+    WITH_PARSE("eval: the three Index forms and their references",
+               b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t bn = nth_child(root, 0);
+        uint64_t sn = nth_child(root, 1);
+        uint64_t pn = nth_child(root, 2);
+
+        /* THE distinctness assertion. */
+        aml_eval_reset(2);
+        uint64_t bo = aml_eval_obj(bn);
+        uint64_t so = aml_eval_obj(sn);
+        uint64_t po = aml_eval_obj(pn);
+        eq("a Buffer declaration materialises as a Buffer",
+           aml_obj_type(bo), T_BUF);
+        eq("a String declaration as a String",  aml_obj_type(so), T_STR);
+        eq("a Package declaration as a Package", aml_obj_type(po), T_PKG);
+        eq("buffer contents", aml_obj_byte(bo, 1), 0xBB);
+        eq("string contents", aml_obj_byte(so, 1), 'e');
+        eq("string length excludes the NUL", aml_obj_len(so), 3);
+        eq("package elements", aml_obj_int_value(aml_obj_elem_get(po, 1)), 0x20);
+        eq("Index(Buffer,n)  is a BufferField reference",
+           aml_obj_refkind(aml_ref_index(bo, 1)), R_BUF_FIELD);
+        eq("Index(String,n)  is a StringField reference",
+           aml_obj_refkind(aml_ref_index(so, 1)), R_STR_FIELD);
+        eq("Index(Package,n) is a package-ELEMENT reference",
+           aml_obj_refkind(aml_ref_index(po, 1)), R_PKG_ELEM);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        /* DerefOf round-trips each kind, through AML this time. */
+        aml_eval_reset(2);
+        eq("DerefOf a buffer index", aml_eval_method(nth_child(root, 3)), 0xBB);
+        aml_eval_reset(2);
+        eq("DerefOf a string index", aml_eval_method(nth_child(root, 4)), 'e');
+        aml_eval_reset(2);
+        eq("DerefOf a package index", aml_eval_method(nth_child(root, 5)), 0x20);
+        aml_eval_reset(2);
+        eq("ObjectType of a buffer index is BufferField",
+           aml_eval_method(nth_child(root, 6)), T_BUFFIELD);
+        aml_eval_reset(2);
+        eq("ObjectType of a package index is the ELEMENT's type",
+           aml_eval_method(nth_child(root, 7)), T_INT);
+        aml_eval_reset(2);
+        eq("SizeOf a Package is its element count",
+           aml_eval_method(nth_child(root, 8)), 2);
+
+        /* THE CORRUPTION TEST. The same Integer stored through a buffer
+         * index and through a package index must land differently. */
+        aml_eval_reset(2);
+        bo = aml_eval_obj(bn);
+        po = aml_eval_obj(pn);
+        eq("stored through the buffer field",
+           aml_ref_store_through(aml_ref_index(bo, 0), aml_obj_int(0x1234)), 1);
+        eq("stored through the package element",
+           aml_ref_store_through(aml_ref_index(po, 0), aml_obj_int(0x1234)), 1);
+        eq("a buffer field takes ONLY the low byte", aml_obj_byte(bo, 0), 0x34);
+        eq("and does not disturb its neighbour", aml_obj_byte(bo, 1), 0xBB);
+        eq("a package element takes the WHOLE object",
+           aml_obj_int_value(aml_obj_elem_get(po, 0)), 0x1234);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        /* Out of range, each in a session of its own. */
+        aml_eval_reset(2);
+        eq("Index past a Buffer is refused",
+           aml_ref_index(aml_eval_obj(bn), 3), 0);
+        eq("OBJ_RANGE", aml_eval_err(), E_OBJ_RANGE);
+        aml_eval_reset(2);
+        eq("Index at a String's NUL is refused",
+           aml_ref_index(aml_eval_obj(sn), 3), 0);
+        eq("OBJ_RANGE", aml_eval_err(), E_OBJ_RANGE);
+        aml_eval_reset(2);
+        eq("Index past a Package is refused",
+           aml_ref_index(aml_eval_obj(pn), 2), 0);
+        eq("OBJ_RANGE", aml_eval_err(), E_OBJ_RANGE);
+        aml_eval_reset(2);
+        eq("Index of an Integer is refused",
+           aml_ref_index(aml_obj_int(1), 0), 0);
+        eq("BAD_OBJTYPE", aml_eval_err(), E_BAD_OBJTYPE);
+        aml_eval_reset(2);
+        eq("DerefOf of a non-reference passes through unchanged",
+           aml_obj_int_value(aml_ref_deref(aml_obj_int(7))), 7);
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+}
+
+/* An element WITHIN NumElements that was never initialised is a different
+ * fault from an index past NumElements, and gets a different code. */
+static void test_uninitialised_package_element(void)
+{
+    uint8_t b[] = {
+        /* Name(SPAR, Package(3){0x01}) — legal per §20.2.5.4 */
+        0x08, 'S','P','A','R', 0x12, 0x03, 0x03, 0x01,
+        /* Method(UNI_,0){ Return(DerefOf(Index(SPAR,2,Zero))) } */
+        0x14, 0x10, 'U','N','I','_', 0x00,
+            0xA4, 0x83, 0x88, 'S','P','A','R', 0x0A, 0x02, 0x00
+    };
+    WITH_PARSE("eval: an uninitialised package element is its own error",
+               b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t pn = nth_child(root, 0);
+        aml_eval_reset(2);
+        uint64_t po = aml_eval_obj(pn);
+        eq("three declared elements", aml_obj_len(po), 3);
+        eq("one was initialised",
+           aml_obj_int_value(aml_obj_elem_get(po, 0)), 1);
+        eq("the others are null", aml_obj_elem_get(po, 2), 0);
+        eq("and reading them is not an error yet", aml_eval_err(), AML_OK);
+        aml_eval_reset(2);
+        eq("but DEREFERENCING one is",
+           aml_eval_method(nth_child(root, 1)), 0);
+        eq("UNINIT_ELEMENT, not OBJ_RANGE", aml_eval_err(), E_UNINIT_ELEMENT);
+    });
+}
+
+/* ---------------------------------------------------------------------
+ * CondRefOf — the ONE construct where a namespace miss is a VALUE.
+ * --------------------------------------------------------------------- */
+static void test_cond_ref_of(void)
+{
+    uint8_t b[] = {
+        /* Device(DEV0) { Name(HIDE, 7) } — HIDE is not visible from root */
+        0x5B, 0x82, 0x0C, 'D','E','V','0',
+            0x08, 'H','I','D','E', 0x0A, 0x07,
+        /* Name(SEEN, 9) */
+        0x08, 'S','E','E','N', 0x0A, 0x09,
+        /* Method(CRM_,0){ Return(CondRefOf(HIDE, Local0)) } */
+        0x14, 0x0E, 'C','R','M','_', 0x00,
+            0xA4, 0x5B, 0x12, 'H','I','D','E', 0x60,
+        /* Method(CRS_,0){ Return(CondRefOf(SEEN, Local0)) } */
+        0x14, 0x0E, 'C','R','S','_', 0x00,
+            0xA4, 0x5B, 0x12, 'S','E','E','N', 0x60,
+        /* Method(CRV_,0){ CondRefOf(SEEN, Local0) ; Return(DerefOf(Local0)) } */
+        0x14, 0x10, 'C','R','V','_', 0x00,
+            0x5B, 0x12, 'S','E','E','N', 0x60,
+            0xA4, 0x83, 0x60
+    };
+    WITH_PARSE("eval: CondRefOf turns a miss into False, not an error",
+               b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t miss = nth_child(root, 2);
+        uint64_t hit  = nth_child(root, 3);
+        uint64_t val  = nth_child(root, 4);
+
+        aml_eval_reset(2);
+        eq("a miss returns Zero", aml_eval_method(miss), 0);
+        eq("AND DOES NOT LATCH", aml_eval_err(), AML_OK);
+        eq("the quiet flag was restored", aml_eval_quiet(), 0);
+
+        aml_eval_reset(2);
+        eq("a hit returns Ones", aml_eval_method(hit), 0xFFFFFFFFFFFFFFFFull);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("the quiet flag was restored", aml_eval_quiet(), 0);
+
+        aml_eval_reset(2);
+        eq("and the reference it stored dereferences",
+           aml_eval_method(val), 9);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        /* A plain RefOf of the same invisible name IS an error: only
+         * CondRefOf treats a miss as data. */
+        aml_eval_reset(2);
+        uint64_t crm_src = aml_node_first_child(
+                               aml_node_first_child(
+                                   aml_node_first_child(miss)));
+        eq("the CondRefOf source node", aml_node_kind(crm_src), N_NAMEREF);
+        eq("RefOf of the same name is refused",
+           aml_ref_of_node(crm_src, 0), 0);
+        eq("NAME_NOT_FOUND", aml_eval_err(), E_NAME_NOT_FOUND);
+    });
+}
+
+/* ---------------------------------------------------------------------
+ * §19.3.5.8 — a store to an ArgX holding a Reference goes THROUGH it; a
+ * store to a LocalX does not. The asymmetry is the specification's, and
+ * an implementation that made the two agree would be wrong either way.
+ * Driven through the module API because getting a reference INTO an ArgX
+ * from bytecode needs argument promotion, which is #1058's.
+ * --------------------------------------------------------------------- */
+static void test_arg_stores_through_a_reference(void)
+{
+    uint8_t b[] = {
+        /* Name(TGTV, 0) */
+        0x08, 'T','G','T','V', 0x0A, 0x00,
+        /* Method(STHR,1){ Store(0x77, Arg0) } */
+        0x14, 0x0A, 'S','T','H','R', 0x01, 0x70, 0x0A, 0x77, 0x68,
+        /* Method(LOCX,0){ Store(0x55, Local0) } */
+        0x14, 0x0A, 'L','O','C','X', 0x00, 0x70, 0x0A, 0x55, 0x60
+    };
+    WITH_PARSE("eval: ArgX stores through a reference, LocalX overwrites",
+               b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t nm   = nth_child(root, 0);
+        uint64_t m1   = nth_child(root, 1);
+        uint64_t m2   = nth_child(root, 2);
+        uint64_t argx = nth_child(aml_node_first_child(m1), 1);
+        uint64_t locx = nth_child(aml_node_first_child(m2), 1);
+        eq("ArgX target node", aml_node_kind(argx), N_ARGX);
+        eq("LocalX target node", aml_node_kind(locx), N_LOCALX);
+
+        aml_eval_reset(2);
+        eq("a frame is pushed", aml_frame_push(m1), 1);
+        eq("and stamped with a serial", aml_frame_serial_of(1) != 0, 1);
+        uint64_t r = aml_obj_ref(R_NAME, nm, 0, 0);
+        eq("Arg0 takes the reference", aml_frame_set_arg_obj(0, r), 1);
+        eq("and is tagged as an object", aml_frame_arg_is_obj(0), 1);
+        eq("stored", aml_eval_store_obj(argx, aml_obj_int(0x77)), 1);
+        eq("THE REFERENCED NAME WAS WRITTEN",
+           aml_u64_get(aml_node_arg0(nm)), 0x77);
+        eq("and the slot still holds the reference",
+           aml_frame_ref_get(1, R_ARG, 0), r);
+
+        eq("Local0 takes the same reference", aml_frame_set_local_obj(0, r), 1);
+        eq("stored", aml_eval_store_obj(locx, aml_obj_int(0x55)), 1);
+        eq("THE NAME IS UNCHANGED", aml_u64_get(aml_node_arg0(nm)), 0x77);
+        eq("the Local was retyped to the Integer",
+           aml_obj_int_value(aml_frame_ref_get(1, R_LOCAL, 0)), 0x55);
+
+        /* AN INTEGER WRITE RETYPES THE SLOT. The tag bit is what tells an
+         * object index from a small integer -- they are both small numbers
+         * and no heuristic can separate them -- so the #1054 integer
+         * writers must CLEAR it. If they did not, Local0 = 3 would read
+         * back as a reference to object 3 on the very next evaluation. */
+        eq("the slot is currently an object", aml_frame_local_is_obj(0), 1);
+        eq("an integer write succeeds", aml_frame_set_local(0, 3), 1);
+        eq("AND CLEARS THE TAG", aml_frame_local_is_obj(0), 0);
+        eq("so it reads back as the Integer", aml_frame_local(0), 3);
+        eq("and as an Integer object too",
+           aml_obj_int_value(aml_frame_ref_get(1, R_LOCAL, 0)), 3);
+        eq("the same holds for arguments", aml_frame_arg_is_obj(0), 1);
+        eq("an integer write succeeds", aml_frame_set_arg(0, 4), 1);
+        eq("AND CLEARS THE TAG", aml_frame_arg_is_obj(0), 0);
+
+        /* the bitmap layout itself: seven args on bits 0..6, eight locals
+         * on bits 8..15, and the asymmetry is §20.2.6.2's */
+        eq("Arg0 is bit 0",   aml_frame_bit(R_ARG, 0), 1);
+        eq("Arg6 is bit 6",   aml_frame_bit(R_ARG, 6), 7);
+        eq("there is no Arg7", aml_frame_bit(R_ARG, 7), 0);
+        eq("Local0 is bit 8", aml_frame_bit(R_LOCAL, 0), 9);
+        eq("Local7 is bit 15", aml_frame_bit(R_LOCAL, 7), 16);
+        eq("there is no Local8", aml_frame_bit(R_LOCAL, 8), 0);
+
+        eq("no error", aml_eval_err(), AML_OK);
+        aml_frame_pop();
+        eq("frames unwound", aml_eval_frames(), 0);
+    });
+}
+
+/* Eight frames are a REUSED POOL, so a reference that recorded only
+ * "frame 3, slot 0" would silently re-aim at whoever holds that slot
+ * next. The serial is what turns that into an error. */
+static void test_stale_frame_reference(void)
+{
+    uint8_t b[] = { 0x14, 0x07, 'N','U','L','L', 0x00, 0x60 };
+    WITH_PARSE("eval: a reference into a popped frame is stale, not wrong",
+               b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t m = aml_node_first_child(root);
+        aml_eval_reset(2);
+        uint64_t f1 = aml_frame_push(m);
+        uint64_t s1 = aml_frame_serial_of(f1);
+        uint64_t lref = aml_obj_ref(R_LOCAL, f1, 0, s1);
+        eq("Local0 holds an Integer", aml_frame_set_local_obj(0, aml_obj_int(11)), 1);
+        eq("the reference reads it", aml_obj_int_value(aml_ref_deref(lref)), 11);
+        aml_frame_pop();
+        uint64_t f2 = aml_frame_push(m);
+        eq("the pool reused the same slot", f2, f1);
+        eq("but not the same serial", aml_frame_serial_of(f2) != s1, 1);
+        eq("the old reference is REFUSED", aml_ref_deref(lref), 0);
+        eq("STALE_REF, not a read of someone else's local",
+           aml_eval_err(), E_STALE_REF);
+        aml_frame_pop();
+    });
+}
+
+/* ---------------------------------------------------------------------
+ * Match — §19.6.65. Fuel is spent PER ELEMENT, so a firmware package
+ * declaring 0xFFFF elements costs the budget rather than the wall clock.
+ * --------------------------------------------------------------------- */
+static void test_eval_match(void)
+{
+    uint8_t b[] = {
+        /* Name(MPKG, Package(4){0x10,0x20,0x30,0x40}) */
+        0x08, 'M','P','K','G', 0x12, 0x0A, 0x04,
+            0x0A,0x10, 0x0A,0x20, 0x0A,0x30, 0x0A,0x40,
+        /* Method(MAT_,0){ Return(Match(MPKG, MEQ, 0x30, MTR, Zero, Zero)) } */
+        0x14, 0x12, 'M','A','T','_', 0x00,
+            0xA4, 0x89, 'M','P','K','G', 0x01, 0x0A,0x30, 0x00, 0x00, 0x00,
+        /* Method(MNO_,0){ Return(Match(MPKG, MEQ, 0x99, MTR, Zero, Zero)) } */
+        0x14, 0x12, 'M','N','O','_', 0x00,
+            0xA4, 0x89, 'M','P','K','G', 0x01, 0x0A,0x99, 0x00, 0x00, 0x00,
+        /* Method(MGT_,0){ Return(Match(MPKG, MGT, 0x20, MTR, Zero, Zero)) } */
+        0x14, 0x12, 'M','G','T','_', 0x00,
+            0xA4, 0x89, 'M','P','K','G', 0x05, 0x0A,0x20, 0x00, 0x00, 0x00,
+        /* Name(BIGP, Package(200){}) — declared big, no initialisers, which
+         * §20.2.5.4 permits and which is how a firmware table makes a scan
+         * expensive without making the TABLE big */
+        0x08, 'B','I','G','P', 0x12, 0x02, 0xC8,
+        /* Method(BIGM,0){ Return(Match(BIGP, MEQ, 0x99, MTR, Zero, Zero)) } */
+        0x14, 0x12, 'B','I','G','M', 0x00,
+            0xA4, 0x89, 'B','I','G','P', 0x01, 0x0A,0x99, 0x00, 0x00, 0x00
+    };
+    WITH_PARSE("eval: Match scans a Package and spends fuel per element",
+               b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        aml_eval_reset(2);
+        eq("MEQ finds index 2", aml_eval_method(nth_child(root, 1)), 2);
+        aml_eval_reset(2);
+        eq("no match is Ones", aml_eval_method(nth_child(root, 2)),
+           0xFFFFFFFFFFFFFFFFull);
+        aml_eval_reset(2);
+        eq("MGT finds the first element above 0x20",
+           aml_eval_method(nth_child(root, 3)), 2);
+        eq("no error", aml_eval_err(), AML_OK);
+        /* the match opcodes came from the node's arg0/arg1, not from the
+         * child list — reading them as TermArgs would consume the package */
+        uint64_t mexpr = aml_node_first_child(
+                             aml_node_first_child(nth_child(root, 1)));
+        eq("MatchOpcode 1 is raw ByteData", aml_node_arg0(mexpr), 1);
+        eq("MatchOpcode 2 is raw ByteData", aml_node_arg1(mexpr), 0);
+        eq("four TermArg children", (uint64_t)count_children(mexpr), 4);
+
+        /* THE SCAN IS FUEL-BOUNDED. Two hundred declared elements and a
+         * sixty-step budget: the loop must stop on the BUDGET, not on the
+         * package's own claim about how long it is. Without a spend per
+         * element the scan is free and the only bound on Match's cost is a
+         * byte in the table. */
+        aml_eval_reset(2);
+        eq("budget clamped down", aml_eval_set_fuel(60), 60);
+        (void)aml_eval_method(nth_child(root, 5));
+        eq("FUEL_EXHAUSTED", aml_eval_err(), E_FUEL_EXHAUSTED);
+        eq("depth unwound", aml_eval_depth(), 0);
+        /* and with a real budget the same scan completes */
+        aml_eval_reset(2);
+        eq("no match over 200 elements", aml_eval_method(nth_child(root, 5)),
+           0xFFFFFFFFFFFFFFFFull);
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+}
+
+/* ---------------------------------------------------------------------
+ * ALLOCATION DISCIPLINE. The object arena is 512 records with no free, so
+ * the fast path is not an optimisation — it is what stops an idiom every
+ * DSDT contains from exhausting it.
+ * --------------------------------------------------------------------- */
+static void test_object_budgets(void)
+{
+    {
+        uint8_t b[] = {
+            /* Method(ARIT,0){ Return(Add(5,3,Zero)) } */
+            0x14, 0x0D, 'A','R','I','T', 0x00,
+                0xA4, 0x72, 0x0A, 0x05, 0x0A, 0x03, 0x00
+        };
+        WITH_PARSE("eval: arithmetic allocates NO objects", b, sizeof b, {
+            eq("parse ok", aml_lex_err(), AML_OK);
+            aml_eval_reset(2);
+            eq("value", aml_eval_method(aml_node_first_child(root)), 8);
+            eq("the integer fast path allocated nothing", aml_obj_count(), 1);
+            eq("and touched no heap", aml_obj_heap_used(), 1);
+
+            /* The object dispatcher takes its OWN step of fuel and its own
+             * level of depth. Without that, an object-valued construct
+             * would be free and only its enclosing statement would be
+             * counted -- which is exactly how a deeply nested Package or a
+             * Concatenate chain gets an unbounded budget. */
+            aml_eval_reset(2);
+            uint64_t expr = aml_node_first_child(
+                                aml_node_first_child(
+                                    aml_node_first_child(root)));
+            eq("the Return operand", aml_node_kind(expr), N_EXPR);
+            /* A LEAF node, so the only fuel that can be spent is this
+             * dispatcher's own step -- an operand that itself evaluated
+             * would spend through aml_eval_node and hide the omission. */
+            uint64_t leaf = nth_child(expr, 0);
+            eq("a literal operand", aml_node_kind(leaf), N_INT);
+            uint64_t before = aml_eval_fuel();
+            uint64_t o = aml_eval_obj(leaf);
+            eq("it produced an object", aml_obj_type(o), T_INT);
+            eq("of the literal's value", aml_obj_int_value(o), 5);
+            eq("AND IT SPENT EXACTLY ONE STEP", before - aml_eval_fuel(), 1);
+            eq("depth unwound", aml_eval_depth(), 0);
+            /* and a latched error blocks it, like every other spender */
+            (void)aml_eval_set_err(E_NOT_EVALUABLE);
+            uint64_t stuck = aml_eval_fuel();
+            eq("a blocked session produces nothing", aml_eval_obj(leaf), 0);
+            eq("and spends nothing", aml_eval_fuel(), stuck);
+        });
+    }
+    {
+        uint8_t b[] = {
+            /* Method(SLOP,0){ Store(Zero,Local0)
+             *                 While(LLess(Local0,100)) {
+             *                     Increment(Local0) ; Store(Local0,Local1) }
+             *                 Return(Local1) } */
+            0x14, 0x16, 'S','L','O','P', 0x00,
+                0x70, 0x00, 0x60,
+                0xA2, 0x0A, 0x95, 0x60, 0x0A, 0x64,
+                    0x75, 0x60,
+                    0x70, 0x60, 0x61,
+                0xA4, 0x61
+        };
+        WITH_PARSE("eval: a hundred Stores allocate NO objects", b, sizeof b, {
+            eq("parse ok", aml_lex_err(), AML_OK);
+            aml_eval_reset(2);
+            eq("value", aml_eval_method(aml_node_first_child(root)), 100);
+            eq("no error", aml_eval_err(), AML_OK);
+            eq("the Store fast path allocated nothing", aml_obj_count(), 1);
+        });
+    }
+    {
+        /* Method(CATL,0){ Store("x",Local0)
+         *                 While(One){ Store(Concatenate(Local0,"y",Zero),
+         *                                   Local0) }
+         *                 Return(Zero) } */
+        uint8_t b[] = {
+            0x14, 0x18, 'C','A','T','L', 0x00,
+                0x70, 0x0D, 'x', 0x00, 0x60,
+                0xA2, 0x0A, 0x01,
+                    0x70, 0x73, 0x60, 0x0D, 'y', 0x00, 0x00, 0x60,
+                0xA4, 0x00
+        };
+        WITH_PARSE("eval: a Concatenate loop terminates on FUEL",
+                   b, sizeof b, {
+            eq("parse ok", aml_lex_err(), AML_OK);
+            aml_eval_reset(2);
+            eq("budget clamped down", aml_eval_set_fuel(80), 80);
+            (void)aml_eval_method(aml_node_first_child(root));
+            eq("FUEL_EXHAUSTED", aml_eval_err(), E_FUEL_EXHAUSTED);
+            eq("fuel reached exactly zero", aml_eval_fuel(), 0);
+            eq("depth unwound", aml_eval_depth(), 0);
+            eq("frames unwound", aml_eval_frames(), 0);
+        });
+        WITH_PARSE("eval: and on the payload heap when fuel is plentiful",
+                   b, sizeof b, {
+            eq("parse ok", aml_lex_err(), AML_OK);
+            aml_eval_reset(2);
+            (void)aml_eval_method(aml_node_first_child(root));
+            /* Either bound is a DETERMINISTIC stop; what must never happen
+             * is that it runs. The 60-second watchdog covers the third
+             * possibility. */
+            uint64_t e = aml_eval_err();
+            eq("bounded by the object model, not by the clock",
+               e == E_OBJ_HEAP_FULL || e == E_OBJ_ARENA_FULL, 1);
+            eq("heap never exceeded its ceiling", aml_obj_heap_used() <= 8192, 1);
+            eq("depth unwound", aml_eval_depth(), 0);
+        });
+    }
+}
+
+/* The object dispatcher takes its own level of DEPTH as well as its own
+ * step of fuel, and the two bound different things: fuel bounds total work,
+ * depth bounds native stack. Nested Packages consume depth without looping,
+ * so they are the construct that reaches the depth guard through the object
+ * path -- an evaluator that spent fuel but took no depth would recurse
+ * 100 000 levels into the native stack before the fuel ran out. */
+static void test_object_depth_cap(void)
+{
+    static uint8_t tmp[8192], scratch[8192], meth[8192];
+    size_t len = 0;
+    /* innermost: Package(1){Zero} */
+    tmp[len++] = 0x12; tmp[len++] = 0x03; tmp[len++] = 0x01; tmp[len++] = 0x00;
+    for (int i = 0; i < 50; i++) {
+        uint8_t hdr[8], pk[4];
+        size_t hl = 0, pn = emit_pkglen(pk, 1 + len);
+        hdr[hl++] = 0x12;
+        memcpy(hdr + hl, pk, pn); hl += pn;
+        hdr[hl++] = 0x01;                       /* NumElements */
+        memcpy(scratch, tmp, len);
+        memcpy(tmp, hdr, hl);
+        memcpy(tmp + hl, scratch, len);
+        len += hl;
+    }
+    size_t n = 0;
+    uint8_t mk[4];
+    size_t mn = emit_pkglen(mk, 4 + 1 + 2 + len);
+    meth[n++] = 0x14;
+    memcpy(meth + n, mk, mn); n += mn;
+    memcpy(meth + n, "DEEP", 4); n += 4;
+    meth[n++] = 0x00;                           /* MethodFlags */
+    meth[n++] = 0xA4;                           /* Return */
+    meth[n++] = 0x87;                           /* SizeOf */
+    memcpy(meth + n, tmp, len); n += len;
+
+    WITH_PARSE("eval: nested Packages reach the DEPTH guard", meth, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        eq("parse depth unwound", aml_lex_depth(), 0);
+        aml_eval_reset(2);
+        (void)aml_eval_method(aml_node_first_child(root));
+        eq("EVAL_DEPTH, not a native stack overflow",
+           aml_eval_err(), E_EVAL_DEPTH);
+        eq("and the counter unwound exactly", aml_eval_depth(), 0);
+        eq("frames unwound", aml_eval_frames(), 0);
+    });
+}
+
+/* Every opcode belongs to exactly one module, asserted in both
+ * directions so the claim cannot rot into a stale header comment. */
+static void test_object_operator_coverage(void)
+{
+    static const uint64_t str_ops[] = { 0x73, 0x84, 0x87, 0x89, 0x96,
+                                        0x97, 0x98, 0x99, 0x9C, 0x9E };
+    static const uint64_t ref_ops[] = { 0x70, 0x71, 0x83, 0x88, 0x8E,
+                                        0x9D, 0x5B12 };
+    OBJ_SESSION("eval: each opcode is owned by exactly one module", {
+        for (size_t k = 0; k < sizeof str_ops / sizeof str_ops[0]; k++) {
+            eq("claimed by aml_str",     aml_str_handles(str_ops[k]), 1);
+            eq("and not by aml_ref",     aml_ref_handles(str_ops[k]), 0);
+            eq("and not by aml_arith",   aml_arith_handles(str_ops[k]), 0);
+        }
+        for (size_t k = 0; k < sizeof ref_ops / sizeof ref_ops[0]; k++) {
+            eq("claimed by aml_ref",     aml_ref_handles(ref_ops[k]), 1);
+            eq("and not by aml_str",     aml_str_handles(ref_ops[k]), 0);
+            eq("and not by aml_arith",   aml_arith_handles(ref_ops[k]), 0);
+        }
+        /* Acquire is a real opcode nobody evaluates yet, and it must stay
+         * refused rather than be quietly absorbed by a range test. */
+        eq("Acquire is claimed by nobody",
+           aml_str_handles(0x5B23) + aml_ref_handles(0x5B23)
+                                   + aml_arith_handles(0x5B23), 0);
+    });
 }
 
 /* ---------------------------------------------------------------------
@@ -3033,6 +4145,22 @@ int main(void)
     test_eval_integer_width_follows_revision();
     test_eval_operator_coverage();
     test_eval_name_contributing_kinds();
+
+    /* ---- R30.M2-003/004: the object model, conversion, references ---- */
+    test_obj_model();
+    test_conv_table();
+    test_conversions();
+    test_concat_res_template();
+    test_store_converts_to_the_destination_type();
+    test_index_three_reference_kinds();
+    test_uninitialised_package_element();
+    test_cond_ref_of();
+    test_arg_stores_through_a_reference();
+    test_stale_frame_reference();
+    test_eval_match();
+    test_object_budgets();
+    test_object_depth_cap();
+    test_object_operator_coverage();
 
     if (g_fail) {
         fprintf(stderr, "[aml-corpus] %d assertion(s) failed out of %d\n",
