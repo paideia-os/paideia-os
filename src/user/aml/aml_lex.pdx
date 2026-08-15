@@ -1,0 +1,1080 @@
+// src/user/aml/aml_lex.pdx — R30.M1-001 (#1049)
+//
+// AML byte-stream tokenizer per ACPI 6.5 §20.2.
+//
+// PLACEMENT — CONSTITUTIONAL
+// -------------------------
+// This file lives under src/user/, NOT src/kernel/. Pillar 3 (userspace
+// first) forbids AML from ever executing in ring 0; the boundary is
+// enforced mechanically by tools/lint-no-kernel-aml.sh, which fails the
+// push if AML identifiers appear under src/kernel/**. See
+// design/acpi/no-aml-in-kernel.md for the rationale and
+// design/acpi/aml-parser.md for this module's design.
+//
+// WHAT THIS MODULE IS
+// -------------------
+// A cursor over an untrusted, firmware-supplied byte buffer, plus the
+// §20.2 primitive decoders layered on it:
+//
+//   §20.2.3  opcode decoding, including the 0x5B ExtOpPrefix escape
+//   §20.2.4  PkgLength — all four encoded lengths
+//   §20.2.2  NameString — NullName / NameSeg / DualNamePath /
+//            MultiNamePath, with '\' RootChar and '^' ParentPrefixChar
+//   §20.2.3  integer literals — ZeroOp / OneOp / OnesOp and the
+//            Byte/Word/DWord/QWord prefixes
+//
+// It does NOT build a tree (that is aml_ns.pdx / #1050) and it does NOT
+// execute anything (that is R30.M2 / #1054+).
+//
+// SECURITY INVARIANT — THE WHOLE POINT
+// ------------------------------------
+// ACPI tables are firmware-supplied and therefore untrusted. Two
+// properties are maintained unconditionally:
+//
+//   (I1) EVERY read of the AML buffer goes through aml_lex_u8 or
+//        aml_lex_peek_u8. Both compare `pos` against `len` before
+//        forming the address. No other function in the AML tree
+//        dereferences the buffer pointer. This is mechanically checked
+//        by tools/verify-aml-parser.sh, which asserts that
+//        `aml_lex_state` is relocated against ONLY from aml_lex.o —
+//        every other module must go through the accessor API.
+//
+//   (I2) The error flag is STICKY and read-blocking: once
+//        aml_lex_state[err] is non-zero, aml_lex_u8 / aml_lex_peek_u8
+//        return 0 WITHOUT touching the buffer. A caller that ignores an
+//        error therefore cannot be walked off the end of the buffer by
+//        subsequent reads — the worst case is a tree built from zeroes,
+//        never an out-of-bounds access.
+//
+// The corpus in tests/user/aml/aml_harness.c runs every malformed
+// fixture against a buffer whose final byte abuts a PROT_NONE guard
+// page, so any violation of (I1)/(I2) is a hard SIGSEGV rather than a
+// silently-tolerated over-read.
+//
+// STATE LAYOUT — aml_lex_state : [u64; 12]
+// ----------------------------------------
+//   +0   buf                base address of the AML byte buffer
+//   +8   len                buffer length in bytes
+//   +16  pos                cursor, always in [0, len]
+//   +24  err                sticky error code (0 = AML_OK)
+//   +32  err_off            value of `pos` when the FIRST error fired
+//   +40  depth              recursion depth (owned by the parser via
+//                           aml_lex_depth_enter / aml_lex_depth_leave)
+//   +48  last_pkglen        raw decoded PkgLength value from the most
+//                           recent decode, stored even when the
+//                           subsequent bounds check rejects it (see
+//                           "PkgLength" below)
+//   +56  last_pkglen_nbytes number of trailing ByteData bytes (0..3) of
+//                           that decode; encoded size is nbytes + 1
+//   +64  init_magic         0xA3D1 once aml_lex_init has run
+//   +72..+88                reserved
+//
+// ERROR TAXONOMY (shared with aml_arena.pdx / aml_ns.pdx; the canonical
+// table is design/acpi/aml-parser.md §5)
+// ----------------------------------------------------------------------
+//    0  AML_OK
+//    1  AML_ERR_EOF                 read past end of buffer
+//    2  AML_ERR_PKGLEN_TRUNC        PkgLead promises bytes that are absent
+//    3  AML_ERR_PKGLEN_OVERFLOW     decoded package runs past buffer end
+//    4  AML_ERR_PKGLEN_TOO_SMALL    package shorter than its own length field
+//    5  AML_ERR_UNKNOWN_OPCODE      byte is not an AML opcode
+//    6  AML_ERR_BAD_NAMECHAR        NameSeg char outside the legal set
+//    7  AML_ERR_BAD_SEGCOUNT        MultiNamePath SegCount == 0
+//    8  AML_ERR_NAME_ARENA_FULL
+//    9  AML_ERR_NODE_ARENA_FULL
+//   10  AML_ERR_UNEXPECTED_OP       real opcode, not handled at this milestone
+//   11  AML_ERR_PKG_OVERRUN         child consumed past its package end
+//   12  AML_ERR_DEPTH               nesting deeper than AML_MAX_DEPTH (64)
+//   13  AML_ERR_BAD_FIELD_ELEM      FieldList element opcode unrecognised
+//   14  AML_ERR_NO_PROGRESS         term loop consumed zero bytes
+//   15  AML_ERR_BAD_INTEGER         expected an integer literal opcode
+//   16  AML_ERR_U64_ARENA_FULL
+//   17  AML_ERR_FIELD_OFFSET_OVF    running field bit offset exceeded 2^32-1
+//   18  AML_ERR_METHOD_INVOCATION   bare NameString in term position (#1051)
+//   19  AML_ERR_NOT_INITIALISED     API used before aml_lex_init
+//
+// PKGLENGTH — ACPI 6.5 §20.2.4
+// ----------------------------
+//   PkgLength := PkgLeadByte
+//              | PkgLeadByte ByteData
+//              | PkgLeadByte ByteData ByteData
+//              | PkgLeadByte ByteData ByteData ByteData
+//
+//   bits [7:6] of PkgLeadByte = the number of ByteData that follow (0..3).
+//   If that count is 0, bits [5:0] ARE the length (0..63) and the encoding
+//   is one byte. Otherwise bits [3:0] are the LOW FOUR bits of the length
+//   and each following ByteData supplies the next 8 bits, little-endian:
+//
+//     n=0   len = lead & 0x3F                                    (max 63)
+//     n=1   len = (lead & 0x0F) | (b1 << 4)                       (max 0xFFF)
+//     n=2   len = (lead & 0x0F) | (b1 << 4) | (b2 << 12)          (max 0xFFFFF)
+//     n=3   len = (lead & 0x0F) | (b1 << 4) | (b2 << 12) | (b3 << 20)
+//                                                                (max 0xFFFFFFF)
+//
+//   The decoded length INCLUDES the PkgLength bytes themselves.
+//
+//   TWO ENTRY POINTS, because §20.2.4's encoding is reused for two
+//   different things and only one of them is a byte extent:
+//
+//     aml_lex_pkglength()        PACKAGE semantics. Decode, then reject
+//                                (a) len < its own encoded size
+//                                    -> AML_ERR_PKGLEN_TOO_SMALL, and
+//                                (b) pkg_start + len > buffer len
+//                                    -> AML_ERR_PKGLEN_OVERFLOW.
+//                                The caller must sample aml_lex_pos()
+//                                BEFORE the call to obtain pkg_start.
+//
+//     aml_lex_pkglength_value()  RAW-INTEGER semantics. Used for
+//                                FieldList bit widths (§20.2.5.2), where
+//                                the same encoding expresses a BIT COUNT
+//                                that has no relationship to the byte
+//                                buffer. Applying the package bounds
+//                                check here would reject perfectly legal
+//                                field declarations, so only the
+//                                truncation check applies.
+//
+//   Both store the decoded value in aml_lex_state[last_pkglen] BEFORE the
+//   package bounds checks run. That lets the corpus assert the decoded
+//   value at all four length boundaries — including the 3- and 4-byte
+//   maxima, whose values (0xFFFFF, 0xFFFFFFF) could not otherwise be
+//   tested without allocating a 256 MB fixture — while simultaneously
+//   asserting that the overflow check rejected them.
+
+module AmlLex = structure {
+
+  // ==========================================================================
+  // Lexer state. Single array so the whole cursor is one cache line pair and
+  // so invariant (I1) has exactly one symbol to police.
+  // ==========================================================================
+  pub let mut aml_lex_state : [u64; 12] = uninit @align(8)
+
+  // ==========================================================================
+  // aml_lex_init(buf, len) — bind the cursor to a byte buffer and clear all
+  // error/derived state. Must be called before any other entry point.
+  // ==========================================================================
+  pub let aml_lex_init : (u64, u64) -> () !{mem} @{} =
+    fn (buf: u64) (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): bind the AML cursor to an untrusted byte buffer. rdi=buf, rsi=len. Writes state[buf]=rdi, state[len]=rsi, zeroes pos/err/err_off/depth/last_pkglen/last_pkglen_nbytes, and stamps init_magic=0xA3D1 so aml_lex_require_init can distinguish 'never initialised' from 'initialised over an empty buffer'. Leaf; no calls; @no_frame because the body is straight-line stores. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov [rcx + 0], rdi;              // buf
+        mov [rcx + 8], rsi;              // len
+        xor rax, rax;
+        mov [rcx + 16], rax;             // pos
+        mov [rcx + 24], rax;             // err
+        mov [rcx + 32], rax;             // err_off
+        mov [rcx + 40], rax;             // depth
+        mov [rcx + 48], rax;             // last_pkglen
+        mov [rcx + 56], rax;             // last_pkglen_nbytes
+        mov rax, 0xA3D1;
+        mov [rcx + 64], rax;             // init_magic
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Read-only accessors. The parser and the test harness reach lexer state
+  // ONLY through these; see invariant (I1).
+  // ==========================================================================
+
+  pub let aml_lex_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): return the sticky error code from aml_lex_state[err] (+24). Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_lex_err_off : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): return aml_lex_state[err_off] (+32) — the cursor position at which the FIRST error was recorded. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_lex_pos : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): return the cursor offset aml_lex_state[pos] (+16). Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_lex_len : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): return the bound buffer length aml_lex_state[len] (+8). Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_lex_depth : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): return the current recursion depth aml_lex_state[depth] (+40). Used by the harness to assert the parser unwinds its depth counter to zero on every exit path, success or failure. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_lex_last_pkglen : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): return aml_lex_state[last_pkglen] (+48) — the raw decoded PkgLength value from the most recent decode, recorded BEFORE the package bounds checks. This is what lets the corpus assert the 3- and 4-byte-form maxima (0xFFFFF / 0xFFFFFFF) without allocating a 256 MB fixture. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 48];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_lex_last_pkglen_nbytes : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): return aml_lex_state[last_pkglen_nbytes] (+56) — the ByteData count (0..3) taken from bits [7:6] of the PkgLeadByte of the most recent decode. Encoded size in bytes is this value plus one. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 56];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // aml_lex_set_err(code) -> code — record an error, FIRST WRITER WINS.
+  //
+  // Stickiness matters for two reasons: the first error is the one that
+  // localises the fault, and later errors are usually cascade noise from
+  // callers that did not check. Keeping the first also keeps err_off
+  // meaningful.
+  // ==========================================================================
+  pub let aml_lex_set_err : (u64) -> u64 !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): sticky error latch. rdi=code. If aml_lex_state[err] is already non-zero the call is a no-op (first writer wins) so that err/err_off continue to localise the ORIGINAL fault rather than the cascade. Otherwise store code at +24 and snapshot the current cursor into err_off at +32. Returns rdi so call sites can tail-return the code. Leaf. Reserved labels: aml_lex_se_.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 24];
+        cmp rax, 0;
+        jne aml_lex_se_done;             // first writer wins
+        mov [rcx + 24], rdi;
+        mov rax, [rcx + 16];
+        mov [rcx + 32], rax;             // err_off = pos
+      aml_lex_se_done:
+        mov rax, rdi;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // aml_lex_require_init() -> 0 | 19 — guard for the public entry points.
+  // ==========================================================================
+  pub let aml_lex_require_init : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): assert aml_lex_init has run by checking init_magic (+64) == 0xA3D1. Returns 0 when initialised; otherwise latches AML_ERR_NOT_INITIALISED (19) and returns 19. Guards against an API-misuse path that would otherwise read through a NULL buf pointer. Reserved labels: aml_lex_ri_.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 64];
+        mov rdx, 0xA3D1;
+        cmp rax, rdx;
+        jne aml_lex_ri_bad;
+        xor rax, rax;
+        ret;
+      aml_lex_ri_bad:
+        mov rdi, 19;                     // AML_ERR_NOT_INITIALISED
+        call aml_lex_set_err;
+        mov rax, 19;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // aml_lex_avail() -> bytes remaining at the cursor (0 when exhausted).
+  // ==========================================================================
+  pub let aml_lex_avail : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): return len - pos, saturating at 0. Used by the fixed-width readers to make each multi-byte read ATOMIC: they refuse up front rather than half-consuming a truncated literal, which keeps err_off pointing at the start of the malformed literal instead of somewhere inside it. Leaf. Reserved labels: aml_lex_av_.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 8];              // len
+        mov rdx, [rcx + 16];             // pos
+        cmp rdx, rax;
+        jae aml_lex_av_zero;
+        sub rax, rdx;
+        ret;
+      aml_lex_av_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // aml_lex_seek(off) -> 0 | 1 — reposition the cursor.
+  //
+  // off == len is legal and means "at end of stream". off > len is an EOF
+  // error, never a silent clamp: a caller that computed a bad package end
+  // must be told, not quietly rescued.
+  // ==========================================================================
+  pub let aml_lex_seek : (u64) -> u64 !{mem} @{} =
+    fn (off: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): set pos = rdi. Refuses when the sticky error is already latched (returns 1 without moving the cursor) and when off > len (latches AML_ERR_EOF=1). off == len is accepted and denotes end-of-stream. Returns 0 on success, 1 on refusal. Deliberately does NOT clamp: silently clamping a bad package end would convert a detectable structural fault into a plausible-looking tree. Reserved labels: aml_lex_sk_.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 24];
+        cmp rax, 0;
+        jne aml_lex_sk_refuse;           // sticky error: do not move
+        mov rdx, [rcx + 8];              // len
+        cmp rdi, rdx;
+        ja aml_lex_sk_bad;               // off > len
+        mov [rcx + 16], rdi;
+        xor rax, rax;
+        ret;
+      aml_lex_sk_bad:
+        mov rdi, 1;                      // AML_ERR_EOF
+        call aml_lex_set_err;
+      aml_lex_sk_refuse:
+        mov rax, 1;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // aml_lex_u8() -> byte — THE ONLY ADVANCING READ OF THE BUFFER.
+  //
+  // Invariant (I1)/(I2) live here. Every byte the AML subsystem ever sees
+  // passes through this function or its non-advancing twin below.
+  // ==========================================================================
+  pub let aml_lex_u8 : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): read one byte at the cursor and advance. This is one of exactly two functions in the AML subsystem that dereference the untrusted buffer pointer (see invariant I1 in the file header). Order of operations is load-bearing: (1) if the sticky error is already latched, return 0 WITHOUT forming an address — this is invariant I2, and it is what makes a caller that ignores an error unable to walk off the end; (2) compare pos against len with an UNSIGNED jae so that a pos that somehow exceeded len still fails closed; (3) only then compute buf+pos and load. Uses the xor-then-mov_b zero-extend idiom (paideia-as #1248 mitigation) rather than a byte-narrow compare. Returns the byte zero-extended into rax. Reserved labels: aml_lex_u8_.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 24];             // err
+        cmp rax, 0;
+        jne aml_lex_u8_quiet;            // (I2) refuse to read after an error
+        mov rdx, [rcx + 16];             // pos
+        mov r8, [rcx + 8];               // len
+        cmp rdx, r8;
+        jae aml_lex_u8_eof;              // (I1) bounds check before address form
+        mov r9, [rcx + 0];               // buf
+        add r9, rdx;
+        xor rax, rax;                    // #1248: zero-extend prelude
+        mov_b rax, [r9];
+        add rdx, 1;
+        mov [rcx + 16], rdx;             // pos++
+        ret;
+      aml_lex_u8_eof:
+        mov rdi, 1;                      // AML_ERR_EOF
+        call aml_lex_set_err;
+      aml_lex_u8_quiet:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // aml_lex_peek_u8() -> byte — non-advancing twin of aml_lex_u8.
+  // ==========================================================================
+  pub let aml_lex_peek_u8 : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): read the byte at the cursor WITHOUT advancing. Identical guard order to aml_lex_u8 — sticky-error refusal first, unsigned bounds check second, address formation last (invariants I1/I2). Peeking at end-of-stream is a genuine fault, not a benign query: every call site has already established that a byte is expected there, so EOF is latched. Reserved labels: aml_lex_pk_.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 24];
+        cmp rax, 0;
+        jne aml_lex_pk_quiet;
+        mov rdx, [rcx + 16];
+        mov r8, [rcx + 8];
+        cmp rdx, r8;
+        jae aml_lex_pk_eof;
+        mov r9, [rcx + 0];
+        add r9, rdx;
+        xor rax, rax;
+        mov_b rax, [r9];
+        ret;
+      aml_lex_pk_eof:
+        mov rdi, 1;
+        call aml_lex_set_err;
+      aml_lex_pk_quiet:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Fixed-width little-endian literals (§20.2.3 ComputationalData).
+  //
+  // Each pre-checks aml_lex_avail so the read is atomic: a truncated
+  // literal leaves the cursor where it was and reports EOF at the literal's
+  // first byte, which is the offset an operator can act on.
+  // ==========================================================================
+
+  pub let aml_lex_u16 : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): read a little-endian WordData. Pre-checks avail>=2 so a truncated literal is refused atomically (cursor unmoved, err_off = start of the literal) instead of half-consumed. Assembles with immediate shifts only — no variable-count shifts — so the encoding stays in the byte-for-byte verifiable subset. Reserved labels: aml_lex_u16_.",
+      block: {
+        call aml_lex_avail;
+        cmp rax, 2;
+        jb aml_lex_u16_eof;
+        push r12;
+        call aml_lex_u8;
+        mov r12, rax;
+        call aml_lex_u8;
+        shl rax, 8;
+        or rax, r12;
+        pop r12;
+        ret;
+      aml_lex_u16_eof:
+        mov rdi, 1;
+        call aml_lex_set_err;
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_lex_u32 : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): read a little-endian DWordData. Pre-checks avail>=4 for atomicity, then four aml_lex_u8 reads combined with immediate shifts 0/8/16/24. Accumulator in callee-saved r12 so the nested calls cannot clobber it. Reserved labels: aml_lex_u32_.",
+      block: {
+        call aml_lex_avail;
+        cmp rax, 4;
+        jb aml_lex_u32_eof;
+        push r12;
+        call aml_lex_u8;
+        mov r12, rax;
+        call aml_lex_u8;
+        shl rax, 8;
+        or r12, rax;
+        call aml_lex_u8;
+        shl rax, 16;
+        or r12, rax;
+        call aml_lex_u8;
+        shl rax, 24;
+        or r12, rax;
+        mov rax, r12;
+        pop r12;
+        ret;
+      aml_lex_u32_eof:
+        mov rdi, 1;
+        call aml_lex_set_err;
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_lex_u64 : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): read a little-endian QWordData. Pre-checks avail>=8 for atomicity, then eight aml_lex_u8 reads combined with immediate shifts 0/8/16/24/32/40/48/56. Accumulator in callee-saved r12. Reserved labels: aml_lex_u64_.",
+      block: {
+        call aml_lex_avail;
+        cmp rax, 8;
+        jb aml_lex_u64_eof;
+        push r12;
+        call aml_lex_u8;
+        mov r12, rax;
+        call aml_lex_u8;
+        shl rax, 8;
+        or r12, rax;
+        call aml_lex_u8;
+        shl rax, 16;
+        or r12, rax;
+        call aml_lex_u8;
+        shl rax, 24;
+        or r12, rax;
+        call aml_lex_u8;
+        shl rax, 32;
+        or r12, rax;
+        call aml_lex_u8;
+        shl rax, 40;
+        or r12, rax;
+        call aml_lex_u8;
+        shl rax, 48;
+        or r12, rax;
+        call aml_lex_u8;
+        shl rax, 56;
+        or r12, rax;
+        mov rax, r12;
+        pop r12;
+        ret;
+      aml_lex_u64_eof:
+        mov rdi, 1;
+        call aml_lex_set_err;
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // aml_lex_opcode() -> op16 — §20.2.3 opcode decode with ExtOp escape.
+  //
+  // Normalised 16-bit form: a single-byte opcode 0xNN decodes to 0x00NN; a
+  // two-byte escape 0x5B 0xNN decodes to 0x5BNN. That normalisation is what
+  // lets the opcode table (aml_optab.pdx) be ONE sorted array rather than
+  // two, and what lets #1051/#1052 extend it by adding rows.
+  // ==========================================================================
+  pub let aml_lex_opcode : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): decode one AML opcode and advance past it. Reads the lead byte; if it is 0x5B (ExtOpPrefix) reads a second byte and returns 0x5B00 | ext, otherwise returns the lead byte unchanged. Both reads are error-checked: a stream that ends immediately after a bare 0x5B must report AML_ERR_EOF rather than returning the plausible-looking opcode 0x5B00, which is why the second read is followed by an explicit err probe before the OR. Lead byte held in callee-saved r12 across the nested calls. Reserved labels: aml_lex_op_.",
+      block: {
+        push r12;
+        call aml_lex_u8;
+        mov r12, rax;
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 24];
+        cmp rax, 0;
+        jne aml_lex_op_fail;
+        cmp r12, 0x5B;                   // ExtOpPrefix
+        jne aml_lex_op_single;
+        call aml_lex_u8;                 // escape byte
+        mov r12, rax;
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 24];
+        cmp rax, 0;
+        jne aml_lex_op_fail;             // truncated after a bare 0x5B
+        mov rax, r12;
+        and rax, 0xFF;
+        or rax, 0x5B00;
+        pop r12;
+        ret;
+      aml_lex_op_single:
+        mov rax, r12;
+        pop r12;
+        ret;
+      aml_lex_op_fail:
+        xor rax, rax;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // PkgLength — ACPI 6.5 §20.2.4. See the file header for the encoding and
+  // for why there are two public entry points.
+  // ==========================================================================
+
+  pub let aml_lex_pkglength_raw : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): decode a §20.2.4 PkgLength with NO semantic bounds check. n = lead>>6 selects the form. For n=0 the value is lead&0x3F. For n>0 the value is (lead&0x0F) | b1<<4 | b2<<12 | b3<<20, taking exactly n trailing bytes. avail is checked against n BEFORE any trailing byte is consumed, so a lead byte that promises absent bytes yields AML_ERR_PKGLEN_TRUNC (2) with the cursor just past the lead byte — distinct from a plain AML_ERR_EOF, because the two faults call for different operator responses (a truncated table vs. a lead byte that lies). Records the decoded value and n into state so callers and the corpus can inspect both even when a later bounds check rejects the package. Locals in callee-saved r12 (lead), r13 (n), r14 (accumulator). Reserved labels: aml_lex_plr_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        call aml_lex_u8;                 // PkgLeadByte
+        mov r12, rax;
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 24];
+        cmp rax, 0;
+        jne aml_lex_plr_fail;
+        mov r13, r12;
+        shr r13, 6;                      // n = lead[7:6]
+        cmp r13, 0;
+        jne aml_lex_plr_multi;
+        mov r14, r12;
+        and r14, 0x3F;                   // one-byte form: 6-bit length
+        jmp aml_lex_plr_store;
+      aml_lex_plr_multi:
+        mov r14, r12;
+        and r14, 0x0F;                   // low nibble of the length
+        call aml_lex_avail;
+        cmp rax, r13;
+        jb aml_lex_plr_trunc;
+        call aml_lex_u8;
+        shl rax, 4;
+        or r14, rax;
+        cmp r13, 1;
+        je aml_lex_plr_store;
+        call aml_lex_u8;
+        shl rax, 12;
+        or r14, rax;
+        cmp r13, 2;
+        je aml_lex_plr_store;
+        call aml_lex_u8;
+        shl rax, 20;
+        or r14, rax;
+      aml_lex_plr_store:
+        lea rcx, [rip + aml_lex_state];
+        mov [rcx + 48], r14;             // last_pkglen
+        mov [rcx + 56], r13;             // last_pkglen_nbytes
+        mov rax, r14;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+      aml_lex_plr_trunc:
+        mov rdi, 2;                      // AML_ERR_PKGLEN_TRUNC
+        call aml_lex_set_err;
+      aml_lex_plr_fail:
+        xor rax, rax;
+        lea rcx, [rip + aml_lex_state];
+        mov [rcx + 48], rax;
+        mov [rcx + 56], rax;
+        xor rax, rax;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_lex_pkglength_value : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): RAW-INTEGER entry point for the §20.2.4 encoding. §20.2.5.2 reuses PkgLength to express FieldList element BIT WIDTHS, which bear no relation to the byte buffer — applying the package bounds check there would reject legal firmware. This is a named alias of aml_lex_pkglength_raw so that call sites and disassembly make the distinction visible rather than relying on a comment. Reserved labels: none.",
+      block: {
+        call aml_lex_pkglength_raw;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_lex_pkglength : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): PACKAGE entry point for §20.2.4. Samples pkg_start = pos BEFORE decoding (the PkgLength value INCLUDES its own encoded bytes, so the extent is measured from the lead byte, not from after it), decodes via aml_lex_pkglength_raw, then applies two checks the raw form deliberately omits. (a) TOO_SMALL: a package whose declared length is less than the size of its own length field (nbytes+1) is self-contradictory; accepting it would let a 1-byte 0x00 package declare a zero-length region that the term loop would then spin on. (b) OVERFLOW: pkg_start + len must stay within the buffer — this is the check that stops a firmware-supplied length from steering the parser off the end. Both leave last_pkglen populated so the corpus can assert the decoded arithmetic separately from the rejection. Locals: r12 = pkg_start, value carried on the stack across the checks. Reserved labels: aml_lex_pkg_.",
+      block: {
+        push r12;
+        lea rcx, [rip + aml_lex_state];
+        mov r12, [rcx + 16];             // pkg_start = pos (offset of the lead byte)
+        call aml_lex_pkglength_raw;
+        push rax;                        // decoded value
+        lea rcx, [rip + aml_lex_state];
+        mov rdx, [rcx + 24];
+        cmp rdx, 0;
+        jne aml_lex_pkg_fail;
+        mov rdx, [rcx + 56];             // nbytes
+        add rdx, 1;                      // encoded size
+        cmp rax, rdx;
+        jb aml_lex_pkg_small;
+        mov rdx, r12;
+        add rdx, rax;                    // pkg_end
+        mov r8, [rcx + 8];               // len
+        cmp rdx, r8;
+        ja aml_lex_pkg_over;
+        pop rax;
+        pop r12;
+        ret;
+      aml_lex_pkg_small:
+        mov rdi, 4;                      // AML_ERR_PKGLEN_TOO_SMALL
+        call aml_lex_set_err;
+        jmp aml_lex_pkg_fail;
+      aml_lex_pkg_over:
+        mov rdi, 3;                      // AML_ERR_PKGLEN_OVERFLOW
+        call aml_lex_set_err;
+      aml_lex_pkg_fail:
+        pop rcx;                         // discard the decoded value
+        xor rax, rax;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // NameString — ACPI 6.5 §20.2.2.
+  //
+  //   NameString       := RootChar NamePath | PrefixPath NamePath
+  //   PrefixPath       := nothing | '^' PrefixPath
+  //   NamePath         := NameSeg | DualNamePath | MultiNamePath | NullName
+  //   NullName         := 0x00
+  //   DualNamePath     := 0x2E NameSeg NameSeg
+  //   MultiNamePath    := 0x2F SegCount NameSeg(SegCount)
+  //   NameSeg          := LeadNameChar NameChar NameChar NameChar
+  //   LeadNameChar     := 'A'..'Z' | '_'
+  //   NameChar         := LeadNameChar | '0'..'9'
+  //   RootChar         := '\'  (0x5C)
+  //   ParentPrefixChar := '^'  (0x5E)
+  //
+  // The decoded name lands in the name arena (aml_arena.pdx) as a header
+  // word plus SegCount NameSeg words; the return value is the arena index,
+  // never a pointer. A bare NullName with no prefix returns index 0, which
+  // is the arena's reserved "no name" sentinel — callers distinguish that
+  // from failure by probing aml_lex_err(), not by testing the return value.
+  // ==========================================================================
+
+  pub let aml_lex_namechar_ok : (u64) -> u64 !{} @{} =
+    fn (b: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R30.M1-001 (#1049): NameChar predicate per §20.2.2 — digits '0'..'9' (0x30..0x39), uppercase 'A'..'Z' (0x41..0x5A), or underscore (0x5F). Returns 1 or 0. Lowercase is deliberately NOT accepted: AML NameSegs are uppercase-only, and accepting lowercase would silently admit a corrupt table whose bytes happen to land in the ASCII letter range. Pure; no memory touched. Reserved labels: aml_lex_nc_.",
+      block: {
+        cmp rdi, 0x5F;                   // '_'
+        je aml_lex_nc_yes;
+        cmp rdi, 0x41;                   // 'A'
+        jb aml_lex_nc_digit;
+        cmp rdi, 0x5A;                   // 'Z'
+        ja aml_lex_nc_no;
+        jmp aml_lex_nc_yes;
+      aml_lex_nc_digit:
+        cmp rdi, 0x30;                   // '0'
+        jb aml_lex_nc_no;
+        cmp rdi, 0x39;                   // '9'
+        ja aml_lex_nc_no;
+      aml_lex_nc_yes:
+        mov rax, 1;
+        ret;
+      aml_lex_nc_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_lex_leadnamechar_ok : (u64) -> u64 !{} @{} =
+    fn (b: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R30.M1-001 (#1049): LeadNameChar predicate per §20.2.2 — 'A'..'Z' or '_' only, digits excluded. Used both for the first character of every NameSeg and by the FieldList element dispatcher, where a LeadNameChar is what distinguishes a NamedField from the 0x00..0x03 element opcodes. Pure. Reserved labels: aml_lex_lnc_.",
+      block: {
+        cmp rdi, 0x5F;
+        je aml_lex_lnc_yes;
+        cmp rdi, 0x41;
+        jb aml_lex_lnc_no;
+        cmp rdi, 0x5A;
+        ja aml_lex_lnc_no;
+      aml_lex_lnc_yes:
+        mov rax, 1;
+        ret;
+      aml_lex_lnc_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_lex_nameseg : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): read one four-character NameSeg and return it packed little-endian into a u32 (first character in bits [7:0]) — the same in-memory order ACPICA uses, so a NameSeg compares against a literal like '_HID' with a single integer compare. Pre-checks avail>=4 so a truncated segment reports EOF at the segment start. Validates the lead character with aml_lex_leadnamechar_ok and the remaining three with aml_lex_namechar_ok; any violation latches AML_ERR_BAD_NAMECHAR (6), which is what stops a run of arbitrary firmware bytes from being accepted as a name. Locals: r12 = byte under test, r13 = accumulator. Reserved labels: aml_lex_seg_.",
+      block: {
+        call aml_lex_avail;
+        cmp rax, 4;
+        jb aml_lex_seg_eof;
+        push r12;
+        push r13;
+        call aml_lex_u8;
+        mov r12, rax;
+        mov rdi, r12;
+        call aml_lex_leadnamechar_ok;
+        cmp rax, 0;
+        je aml_lex_seg_bad;
+        mov r13, r12;
+        call aml_lex_u8;
+        mov r12, rax;
+        mov rdi, r12;
+        call aml_lex_namechar_ok;
+        cmp rax, 0;
+        je aml_lex_seg_bad;
+        mov rax, r12;
+        shl rax, 8;
+        or r13, rax;
+        call aml_lex_u8;
+        mov r12, rax;
+        mov rdi, r12;
+        call aml_lex_namechar_ok;
+        cmp rax, 0;
+        je aml_lex_seg_bad;
+        mov rax, r12;
+        shl rax, 16;
+        or r13, rax;
+        call aml_lex_u8;
+        mov r12, rax;
+        mov rdi, r12;
+        call aml_lex_namechar_ok;
+        cmp rax, 0;
+        je aml_lex_seg_bad;
+        mov rax, r12;
+        shl rax, 24;
+        or r13, rax;
+        mov rax, r13;
+        pop r13;
+        pop r12;
+        ret;
+      aml_lex_seg_bad:
+        mov rdi, 6;                      // AML_ERR_BAD_NAMECHAR
+        call aml_lex_set_err;
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        ret;
+      aml_lex_seg_eof:
+        mov rdi, 1;
+        call aml_lex_set_err;
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_lex_namestring : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): decode a full §20.2.2 NameString into the name arena and return its arena INDEX (never a pointer — see the arena rationale in design/acpi/aml-parser.md §4). Sequence: (1) optional prefix — a single RootChar '\\' (0x5C), or a run of ParentPrefixChar '^' (0x5E); the grammar makes these mutually exclusive, so a '\\' is consumed and the carat loop is skipped. The carat run is capped at 255 because the count is stored in a byte of the arena header and because a longer run cannot name anything real. (2) NamePath form — 0x00 NullName, 0x2E DualNamePath (two segments), 0x2F MultiNamePath (an explicit SegCount, which must be non-zero: SegCount==0 is rejected with AML_ERR_BAD_SEGCOUNT (7) rather than silently producing an empty name), or otherwise a single NameSeg. (3) A bare NullName with no prefix returns arena index 0, the reserved 'no name' sentinel; a prefixed NullName such as '\\' alone still allocates an entry so the prefix survives. Callers MUST test aml_lex_err() rather than the return value to detect failure, precisely because 0 is a legitimate result. Locals: r12 = carat count, r13 = root flag, r14 = segment count, r15 = arena index; r12 is reused as the segment loop counter once the header is written. Reserved labels: aml_lex_ns_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        xor r12, r12;                    // carats
+        xor r13, r13;                    // root flag
+        xor r14, r14;                    // seg count
+        xor r15, r15;                    // arena index
+        call aml_lex_peek_u8;
+        push rax;
+        call aml_lex_err;
+        cmp rax, 0;
+        pop rcx;
+        jne aml_lex_ns_fail;
+        cmp rcx, 0x5C;                   // RootChar
+        jne aml_lex_ns_carat;
+        call aml_lex_u8;
+        mov r13, 1;
+        jmp aml_lex_ns_path;
+      aml_lex_ns_carat:
+        cmp rcx, 0x5E;                   // ParentPrefixChar
+        jne aml_lex_ns_path;
+        call aml_lex_u8;
+        add r12, 1;
+        cmp r12, 255;
+        ja aml_lex_ns_badname;
+        call aml_lex_peek_u8;
+        push rax;
+        call aml_lex_err;
+        cmp rax, 0;
+        pop rcx;
+        jne aml_lex_ns_fail;
+        jmp aml_lex_ns_carat;
+      aml_lex_ns_path:
+        call aml_lex_peek_u8;
+        push rax;
+        call aml_lex_err;
+        cmp rax, 0;
+        pop rcx;
+        jne aml_lex_ns_fail;
+        cmp rcx, 0x00;                   // NullName
+        je aml_lex_ns_null;
+        cmp rcx, 0x2E;                   // DualNamePrefix
+        je aml_lex_ns_dual;
+        cmp rcx, 0x2F;                   // MultiNamePrefix
+        je aml_lex_ns_multi;
+        mov r14, 1;
+        jmp aml_lex_ns_alloc;
+      aml_lex_ns_null:
+        call aml_lex_u8;
+        xor r14, r14;
+        jmp aml_lex_ns_alloc;
+      aml_lex_ns_dual:
+        call aml_lex_u8;
+        mov r14, 2;
+        jmp aml_lex_ns_alloc;
+      aml_lex_ns_multi:
+        call aml_lex_u8;                 // consume 0x2F
+        call aml_lex_u8;                 // SegCount
+        mov r14, rax;
+        push r14;
+        call aml_lex_err;
+        cmp rax, 0;
+        pop r14;
+        jne aml_lex_ns_fail;
+        cmp r14, 0;
+        je aml_lex_ns_badseg;
+      aml_lex_ns_alloc:
+        cmp r14, 0;
+        jne aml_lex_ns_alloc_do;
+        cmp r13, 0;
+        jne aml_lex_ns_alloc_do;
+        cmp r12, 0;
+        jne aml_lex_ns_alloc_do;
+        xor rax, rax;                    // bare NullName -> sentinel index 0
+        jmp aml_lex_ns_ret;
+      aml_lex_ns_alloc_do:
+        mov rdi, r14;
+        call aml_name_alloc;
+        mov r15, rax;
+        cmp r15, 0;
+        je aml_lex_ns_fail;
+        mov rdi, r15;
+        mov rsi, r14;
+        mov rdx, r12;
+        mov rcx, r13;
+        call aml_name_set_hdr;
+        xor r12, r12;                    // reuse as segment index
+      aml_lex_ns_seg:
+        cmp r12, r14;
+        jae aml_lex_ns_done;
+        call aml_lex_nameseg;
+        push rax;
+        call aml_lex_err;
+        cmp rax, 0;
+        pop rcx;
+        jne aml_lex_ns_fail;
+        mov rdi, r15;
+        mov rsi, r12;
+        mov rdx, rcx;
+        call aml_name_set_seg;
+        add r12, 1;
+        jmp aml_lex_ns_seg;
+      aml_lex_ns_done:
+        mov rax, r15;
+      aml_lex_ns_ret:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+      aml_lex_ns_badname:
+        mov rdi, 6;                      // AML_ERR_BAD_NAMECHAR
+        call aml_lex_set_err;
+        jmp aml_lex_ns_fail;
+      aml_lex_ns_badseg:
+        mov rdi, 7;                      // AML_ERR_BAD_SEGCOUNT
+        call aml_lex_set_err;
+      aml_lex_ns_fail:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // aml_lex_integer() -> value — §20.2.3 integer literals.
+  //
+  //   ZeroOp 0x00 -> 0, OneOp 0x01 -> 1, OnesOp 0xFF -> all ones,
+  //   BytePrefix 0x0A / WordPrefix 0x0B / DWordPrefix 0x0C /
+  //   QWordPrefix 0x0E -> the following 1/2/4/8 LE bytes.
+  //
+  // OnesOp returns 0xFFFFFFFFFFFFFFFF. Whether that is later truncated to
+  // 32 bits depends on the DSDT's revision field, which is an EVALUATOR
+  // concern (R30.M2): a parser that silently truncated here would destroy
+  // information the evaluator needs.
+  // ==========================================================================
+  pub let aml_lex_integer : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): decode one §20.2.3 integer literal. Peeks the prefix, consumes it, and reads the fixed-width payload. ZeroOp/OneOp/OnesOp carry their value in the opcode itself. OnesOp yields 0xFFFFFFFFFFFFFFFF, built as xor-then-sub-1 to avoid a 64-bit immediate; revision-dependent truncation to 32 bits is an evaluator concern (R30.M2) and is deliberately NOT applied here, because a parser that truncates destroys information its consumer needs. Anything that is not an integer-literal opcode latches AML_ERR_BAD_INTEGER (15) — distinct from AML_ERR_UNEXPECTED_OP so that 'this TermArg position needs a literal and got an expression' is separable from 'this opcode is unimplemented'. Peeked prefix held on the stack across the err probe. Reserved labels: aml_lex_int_.",
+      block: {
+        call aml_lex_peek_u8;
+        push rax;
+        call aml_lex_err;
+        cmp rax, 0;
+        pop rcx;
+        jne aml_lex_int_fail;
+        cmp rcx, 0x00;
+        je aml_lex_int_zero;
+        cmp rcx, 0x01;
+        je aml_lex_int_one;
+        cmp rcx, 0xFF;
+        je aml_lex_int_ones;
+        cmp rcx, 0x0A;
+        je aml_lex_int_b;
+        cmp rcx, 0x0B;
+        je aml_lex_int_w;
+        cmp rcx, 0x0C;
+        je aml_lex_int_d;
+        cmp rcx, 0x0E;
+        je aml_lex_int_q;
+        mov rdi, 15;                     // AML_ERR_BAD_INTEGER
+        call aml_lex_set_err;
+        xor rax, rax;
+        ret;
+      aml_lex_int_zero:
+        call aml_lex_u8;
+        xor rax, rax;
+        ret;
+      aml_lex_int_one:
+        call aml_lex_u8;
+        mov rax, 1;
+        ret;
+      aml_lex_int_ones:
+        call aml_lex_u8;
+        xor rax, rax;
+        sub rax, 1;                      // 0xFFFFFFFFFFFFFFFF
+        ret;
+      aml_lex_int_b:
+        call aml_lex_u8;                 // consume BytePrefix
+        call aml_lex_u8;
+        ret;
+      aml_lex_int_w:
+        call aml_lex_u8;
+        call aml_lex_u16;
+        ret;
+      aml_lex_int_d:
+        call aml_lex_u8;
+        call aml_lex_u32;
+        ret;
+      aml_lex_int_q:
+        call aml_lex_u8;
+        call aml_lex_u64;
+        ret;
+      aml_lex_int_fail:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Recursion-depth budget. The parser is recursive descent over
+  // attacker-controlled nesting, so the depth counter is not a nicety —
+  // without it a crafted DSDT of nested Scopes would exhaust the userspace
+  // stack. AML_MAX_DEPTH = 64 is well beyond any real firmware (ACPICA's
+  // own limit is 10 for method invocation nesting; namespace nesting in
+  // shipping tables rarely exceeds 8).
+  // ==========================================================================
+
+  pub let aml_lex_depth_enter : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): claim one level of the recursion budget. Checks BEFORE incrementing so that a refused entry leaves the counter untouched and the caller can skip its matching aml_lex_depth_leave — this is what keeps the counter balanced on the failure path, which the harness asserts by requiring depth==0 after every fixture including the rejected ones. Latches AML_ERR_DEPTH (12) and returns non-zero when the budget is exhausted. Reserved labels: aml_lex_de_.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 40];
+        cmp rax, 64;                     // AML_MAX_DEPTH
+        jae aml_lex_de_full;
+        add rax, 1;
+        mov [rcx + 40], rax;
+        xor rax, rax;
+        ret;
+      aml_lex_de_full:
+        mov rdi, 12;                     // AML_ERR_DEPTH
+        call aml_lex_set_err;
+        mov rax, 12;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_lex_depth_leave : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M1-001 (#1049): release one level of the recursion budget. Saturates at zero rather than wrapping, so a mismatched leave cannot manufacture an enormous budget for a subsequent parse. Reserved labels: aml_lex_dl_.",
+      block: {
+        lea rcx, [rip + aml_lex_state];
+        mov rax, [rcx + 40];
+        cmp rax, 0;
+        je aml_lex_dl_done;
+        sub rax, 1;
+        mov [rcx + 40], rax;
+      aml_lex_dl_done:
+        ret
+      }
+    } @no_frame
+}

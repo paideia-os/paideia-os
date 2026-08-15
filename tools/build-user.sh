@@ -69,6 +69,7 @@ ECHO_SERVER_OBJECTS=()
 ECHO_CLIENT_OBJECTS=()
 ACPI_SUPERVISOR_OBJECTS=()
 PCI_ENUMERATOR_OBJECTS=()
+AML_OBJECTS=()
 LIBS_OBJECTS=()
 
 while IFS= read -r -d '' pdx; do
@@ -116,6 +117,20 @@ while IFS= read -r -d '' pdx; do
         # shape byte-for-byte modulo the endpoint_id (4 vs 3) and derived
         # cap kind (0x30 KIND_PCI_DEV vs 0x20 KIND_ACPI).
         PCI_ENUMERATOR_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == aml/* ]]; then
+        # R30.M1-001 (#1049) / R30.M1-002 (#1050): the userspace AML
+        # tokenizer, arena, opcode table and namespace parser. These are a
+        # LIBRARY, not a program — they have no _start and are consumed by
+        # the acpi_supervisor process once the userspace ACPI bubble wires
+        # up (R30.M2+). They get their own object set and are archived into
+        # libaml.a rather than falling through to the catch-all `else`,
+        # which would link them into shell.elf and drag a parser the shell
+        # has no use for into every boot image.
+        #
+        # AML lives here and nowhere else: Pillar 3 forbids it in ring 0,
+        # and tools/lint-no-kernel-aml.sh fails the push if it drifts into
+        # src/kernel/**. See design/acpi/no-aml-in-kernel.md.
+        AML_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "syscall_shim.pdx" ]] || [[ "${rel}" == "errno.pdx" ]] || [[ "${rel}" == "string.pdx" ]]; then
         # These are library modules needed by both shell and init
         LIBS_OBJECTS+=("${obj}")
@@ -331,4 +346,23 @@ if [[ ${#PCI_ENUMERATOR_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/pci_enumerator.elf"
     echo "[ok] ${BUILD_DIR}/pci_enumerator.bin"
+fi
+
+# Archive the AML modules (R30.M1-001 #1049 / R30.M1-002 #1050).
+#
+# An archive rather than a linked ELF because there is no entry point:
+# this is the parser library the acpi_supervisor process will link against
+# when the userspace ACPI bubble lands. Publishing it as libaml.a now means
+# the modules are built and their cross-module symbol graph is resolved on
+# every push, so a signature drift between the lexer, the arena and the
+# parser is caught here rather than in R30.M2.
+#
+# Behavioural verification is tools/verify-aml-parser.sh, which runs the
+# byte-fixture corpus against these same objects; it is a separate pre-push
+# step so its failures name the fixture rather than the link.
+if [[ ${#AML_OBJECTS[@]} -gt 0 ]]; then
+    echo "[archive-user] ar rcs -> libaml.a"
+    rm -f "${BUILD_DIR}/libaml.a"
+    ar rcs "${BUILD_DIR}/libaml.a" "${AML_OBJECTS[@]}"
+    echo "[ok] ${BUILD_DIR}/libaml.a"
 fi
