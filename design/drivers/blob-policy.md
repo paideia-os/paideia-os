@@ -955,9 +955,60 @@ audit rate exceeds a per-round threshold.
 `design/drivers/framework.md` §12.1 DR-D11 says "no `audit-channel
 cap` (the blob is untrusted; the supervisor's blob-watcher logs
 externally)". That sentence is superseded by this document per the
-R29 synthesis. `framework.md` should be updated at R29.M6 (Audit
-surface) with a note pointing here; that update is out of scope for
-this R29.M0-002 issue.
+R29 synthesis. `framework.md` was updated at R29.M6 (#1043): §12.1's two
+blob-watcher lines and §12.3 step 2 are struck through and carry an
+amendment note pointing here.
+
+### 3.5 Parity as a structural property (R29.M6-004, #1043)
+
+R29.M6 lands `driver_audit_channel`
+(`src/kernel/core/driver/audit_channel.pdx`, schema in
+`design/ipc/driver-audit-schema.md`). The parity rule above is
+implemented there in a stronger form than "we chose not to
+discriminate":
+
+> **The audit layer is not given the information required to
+> discriminate.**
+
+Concretely:
+
+- No audit record field encodes provenance. The eight fields are
+  `seq`, `event`, `kind`, `subject`, `principal`, `outcome`, `ts`,
+  `seal` — there is no image-origin bit, no blob flag, no trust tier.
+- No function in the audit layer takes a provenance argument.
+  `drv_audit_emit` is arity-5 (`event, kind, subject, principal,
+  outcome`) and none of the five is one; every reader
+  (`drv_audit_field`, `drv_audit_balance_since`,
+  `drv_audit_reconcile`, `drv_audit_gap_check`,
+  `drv_audit_seal_check`) is likewise provenance-blind.
+- Emission lives inside the mint / revoke / handoff primitives, which
+  are shared by every driver regardless of how it was loaded. There is
+  no blob-specific emission path to diverge from the native one,
+  because there is no second path at all.
+- `driver_table` carries no blob flag, so even a determined
+  special-case would have nothing to key on without first adding one.
+
+The consequence is that re-introducing discrimination is not a quiet
+conditional: it requires adding a field or a parameter, which is a
+visible, reviewable change. This is the same argument §1.10 makes for
+recording verification outcomes inside the verifier rather than at its
+call sites — the guarantee has to be a property of a single piece of
+code, or it is a convention that decays.
+
+The boot witness `drv_audit_witness` in
+`src/kernel/boot/kernel_main.pdx` pins it (stages 23–24): identical
+capability work is performed on a path that has just produced a
+blob-signature verdict via `blob_load_verify` and on one that has not,
+and the resulting audit records are required to be indistinguishable in
+`event`, `kind` and `outcome`, with both paths reconciling to zero
+under the same reader. A provenance gate anywhere in the audit layer —
+in the emitter or in a reader — fails that test.
+
+Note the direction: the blob path in stage 23 uses a **rejected** blob.
+A rejected blob is precisely the case an implementer would be tempted
+to treat specially, and it is the case where suppressing or filtering
+the driver's own audit records would do the most damage — the operator
+would lose the trail exactly when the driver is most suspect.
 
 ---
 
@@ -1108,14 +1159,20 @@ verdict distinct from `SIG_OK`; `SIG_OK` is unreachable until R32. |
 | 2026-08-14 | R29.M4 | #1033 | §1.8 added — pinned keyring layout, the
 three R29 roles, the build-time embedding rationale, the reader
 interface, and the fsck property table. |
+| 2026-08-15 | R29.M6 | #1043 | §3.5 added — D1.c parity implemented as
+a structural property (the audit layer holds no provenance field and
+takes no provenance argument, so it cannot discriminate). §3.4 updated:
+`framework.md` §12.1/§12.3 now carry the amendment. |
 
 ---
 
 ## 9. References
 
 - `design/roadmap/next-wave-synthesis.md` §10 D1.
-- `design/drivers/framework.md` §12 (DR-D11 hook; §12.1 to be updated
-  at R29.M6 for the D1.c reversal).
+- `design/drivers/framework.md` §12 (DR-D11 hook; §12.1 and §12.3
+  amended at R29.M6 for the D1.c reversal).
+- `design/ipc/driver-audit-schema.md` — the sealed one-way audit stream
+  that §3.5's parity claim is made about.
 - `design/architecture/next-wave-derived-kinds.md` `KIND_DMA_DOMAIN`.
 - `design/security/pq-trust-root.md` §0.2 (PQ-Q3), §PQ-Q9 (rotation).
 - `design/security/algorithm-catalog.md` (algorithm IDs referenced by

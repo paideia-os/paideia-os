@@ -636,10 +636,33 @@ Phase 1–2: PaideiaOS ships open-source drivers only. Phase 3+ may host vendor 
   - `iommu_cap` for its device only (per-device IOMMU domain).
   - `pager_cap` for its own AS.
   - Send/recv caps for *only* the IPC channels the supervisor designated.
-  - No `audit-channel cap` (the blob is untrusted; the supervisor's blob-watcher logs externally).
+  - ~~No `audit-channel cap` (the blob is untrusted; the supervisor's blob-watcher logs externally).~~ **SUPERSEDED at R29.M6 (#1043)** — see the note below.
   - No `reserved_core_cap`.
   - No `relax-mitigations`.
-- The supervisor's blob-watcher process audits all blob driver IPC and resource use.
+- ~~The supervisor's blob-watcher process audits all blob driver IPC and resource use.~~ **SUPERSEDED at R29.M6 (#1043).**
+
+> **R29.M6 amendment (#1043) — audit access is FULL, and the
+> blob-watcher is cancelled.**
+>
+> `design/drivers/blob-policy.md` §3 (D1.c) reverses the two struck
+> lines above: blob-consuming drivers hold the **same** audit-channel
+> capability as native drivers, with full read and write, and there is
+> no separate blob-watcher process. The reasoning is in blob-policy §3.2
+> — in short, the audit spine already assumes non-privileged writers, a
+> compromised blob writing self-serving records is a signal rather than
+> a vulnerability, and the blob-watcher alternative buys a second
+> privileged process and an IPC hop on every driver op for no
+> proportionate blast-radius reduction.
+>
+> R29.M6 implements this structurally rather than by policy: the audit
+> layer (`src/kernel/core/driver/audit_channel.pdx`,
+> `design/ipc/driver-audit-schema.md`) carries no provenance field and
+> takes no provenance argument, so it *cannot* special-case a blob
+> driver. See blob-policy §3.5.
+>
+> DR-D11 in §2's decision table should be read with this amendment
+> applied; the rest of DR-D11 — smaller cap set, per-device IOMMU
+> domain, no `reserved_core_cap` — stands unchanged.
 - A blob driver's crash is treated the same as any other (restart per policy).
 - A blob driver may use full hardware capabilities (it's a real driver), but its damage is bounded.
 
@@ -653,7 +676,7 @@ This is the cleanest possible "designed-in future hook" from Q6.
 
 When PaideiaOS decides to enable blob drivers (phase 3+):
 1. Define the `blob_driver_cap` derived kind in the type system.
-2. Implement the blob-watcher process (audit + anomaly detection).
+2. ~~Implement the blob-watcher process (audit + anomaly detection).~~ **SUPERSEDED at R29.M6 (#1043)** — blob drivers write to the shared audit spine directly (blob-policy §3, §3.5). Anomaly detection moves to the supervisor's chaos-restart policy and the audit spine's per-writer rate limiter.
 3. Document the threat model and user-consent flow.
 4. Update the registry to permit `blob_driver` entries.
 

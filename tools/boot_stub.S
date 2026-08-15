@@ -1684,6 +1684,37 @@ blob_dualsig_ok_msg: .ascii "R29 BLOB DUALSIG OK\n\0"
 blob_dualsig_fail_msg: .ascii "R29 BLOB DUALSIG FAIL\n\0"
 
 
+# R29.M6-001..004 (#1040/#1041/#1042/#1043): driver_audit_channel —
+# the sealed one-way audit stream.
+#
+# Covers: the eight-field record schema and its per-record sequence
+# number; emission from INSIDE the mint / revoke / handoff primitives
+# (so a refused mint is recorded even though it creates no descriptor);
+# gap detection by position; hash-chain seal detection, exercised by
+# CORRUPTING retained records and requiring both checks to trip and
+# then to clear on restore; descriptor-count reconciliation of the
+# audit-derived mint/revoke balance against an independently scanned
+# live descriptor count, across a cascade revoke that destroys three
+# descriptors from one call; the committed-Handoff edge carrying its
+# from-state while a refused transition stays silent; and D1.c blob
+# parity — identical capability work on a path that produced a
+# blob-signature verdict and one that did not yields indistinguishable
+# audit records.
+#
+# See:
+#   - design/ipc/driver-audit-schema.md
+#   - design/drivers/blob-policy.md §3 (D1.c)
+#   - src/kernel/core/driver/audit_channel.pdx
+#   - src/kernel/boot/kernel_main.pdx §drv_audit_witness
+.global drv_audit_ok_msg
+.align 8
+drv_audit_ok_msg: .ascii "R29 DRIVER AUDIT OK\n\0"
+
+.global drv_audit_fail_msg
+.align 8
+drv_audit_fail_msg: .ascii "R29 DRIVER AUDIT FAIL\n\0"
+
+
 # R20b.M1-002 (#1553): endpoint_table + payload_arena witness fingerprints —
 # exercises endpoint_alloc/endpoint_free/endpoint_lookup round-trip on the
 # full 128-slot range AND payload_buf_pa_for(0..127) 4 KiB-alignment +
