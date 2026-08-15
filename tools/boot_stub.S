@@ -1472,6 +1472,28 @@ kind_dma_domain_ok_msg: .ascii "R29 KIND_DMA_DOMAIN OK\n\0"
 kind_dma_domain_fail_msg: .ascii "R29 KIND_DMA_DOMAIN FAIL\n\0"
 
 
+# R30.M3-001 (#1061): KIND_OP_REGION witness fingerprints — the address-
+# space window capability, and the security boundary of R30. The witness
+# mints two ROOT windows (one memory-like over a KIND_MEMORY parent, one
+# port-like over a KIND_IO_PORT parent), proves the derivation asymmetry
+# by trying each space against the wrong parent kind, derives a contained
+# sub-window, REFUSES an uncontained one with OPREG_MINT_NO_COVER without
+# allocating or clipping, refuses a window with no covering capability at
+# all, and finally cascade-revokes transitively so no grandchild row
+# outlives the root that justified it. See:
+#   - src/kernel/core/cap/kind_op_region.pdx (module implementation)
+#   - src/kernel/core/cap/kind.pdx (KIND_OP_REGION decl)
+#   - src/kernel/core/cap/invoke.pdx (call_kind_op_region branch)
+#   - design/architecture/next-wave-derived-kinds.md §KIND_OP_REGION
+.global kind_op_region_ok_msg
+.align 8
+kind_op_region_ok_msg: .ascii "R30 KIND_OP_REGION OK\n\0"
+
+.global kind_op_region_fail_msg
+.align 8
+kind_op_region_fail_msg: .ascii "R30 KIND_OP_REGION FAIL\n\0"
+
+
 # R29.M2-001 (#1023): driver lifecycle FSM witness fingerprints — opens
 # R29.M2 (Lifecycle FSM real bodies + regression corpus). The FSM has
 # six states (Init/Running/Suspended/Handoff/Stopping/Stopped) and its

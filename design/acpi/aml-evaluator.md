@@ -1591,3 +1591,232 @@ immediates were likewise avoided — the drop counter saturates by
 incrementing and testing for wrap rather than by comparing against
 `0xFFFFFFFFFFFFFFFF`, and the owner/level word is split with a
 shift pair rather than an `and` against a 32-bit mask.
+
+---
+
+# R30.M3-002 (#1062) — the SystemMemory address-space handler
+
+`src/user/aml/aml_region.pdx`
+
+This is the milestone at which this subsystem stops being pure
+computation over a byte buffer. Everything before it could be tested
+exhaustively because it touched nothing but its own arenas. A region
+handler cannot claim that: its purpose is to read and write addresses
+outside the process.
+
+## The mapping / access split
+
+The module is cut in two along the line the security argument already
+runs along.
+
+**The mapping step** — `aml_region_bind(node, cap_handle, win_base,
+win_len, host_va)`. Takes a capability window and the host address that
+window is mapped at, checks the firmware-declared region against it, and
+records a binding. It decides *whether* an address may be touched and
+*where* it lives. It performs no access.
+
+**The access step** — `aml_region_read_unit` / `aml_region_write_unit`
+and the field machinery above them. Takes a **binding index** and a byte
+offset. It has no way to name an address: the base it uses is the one
+the mapping step recorded, the length it clips to is the one the mapping
+step validated.
+
+The corpus therefore exercises the **real** access step — the real
+bounds arithmetic, the real access-width selection, the real
+read-modify-write — against a synthetic backing buffer, by handing the
+mapping step a `host_va` that points at that buffer instead of at mapped
+device memory. Not one line of the code under test differs between the
+two cases. **No fixture in this repository names a real physical
+address**, and none needs to: the part that would differ is the part that
+does no arithmetic.
+
+The declared base and length come from the **parse tree** (the untrusted
+side — the node's `arg0`/`arg1` index the u64 side table); the window
+comes from the **capability** (the trusted side, read out of the
+`KIND_OP_REGION` row). They are never the same argument, which is what
+makes the containment check a real comparison rather than a value
+against itself.
+
+## Why a missing capability cannot be bypassed
+
+Four properties, together:
+
+1. **The access step takes no address.** `aml_region_read_unit(b, off,
+   n)` computes `host_base(b) + off`. No entry point in this module
+   accepts a raw pointer. A caller that has not been through
+   `aml_region_bind` has nothing to pass.
+2. **`host_base` has exactly one writer.** Only `aml_region_bind` stores
+   to a row, and it refuses before storing if the capability handle is
+   zero, the window length is zero, the host address is zero, or the
+   declared range is not contained in the window. There is no
+   "bind unchecked" variant, because the checked one is the only one.
+3. **The storage is confined.** `tools/verify-aml-parser.sh` asserts via
+   `objdump -r` that `aml_region_tab` and `aml_region_state` are
+   relocated against from `aml_region.o` and no other object. A module
+   that reached the table directly could fabricate a row; none can.
+4. **The liveness test is the lookup.** Every access path opens with
+   `aml_region_row_live`, which requires a non-zero node *and* a
+   non-zero capability handle *and* a non-zero host base. A row that
+   failed any gate in `aml_region_bind` was never written, so it fails
+   here exactly as a free row does — which makes "the bind was refused"
+   and "there was never a bind" the same safe outcome at the access
+   site, rather than two code paths one of which could be forgotten.
+
+The kernel half is `src/kernel/core/cap/kind_op_region.pdx`: no kernel
+path yields a `KIND_OP_REGION` covering a range the caller did not
+already hold, and the window this module receives comes out of that
+capability's own row — never out of the firmware table.
+
+**Refusal, never truncation.** A declared region exceeding its backing
+capability is refused whole at bind time (`AML_ERR_REGION_NOT_COVERED`);
+a region with no covering capability at all is
+`AML_ERR_REGION_NO_CAP`, refused before any address is formed.
+
+## Access width is declared, not chosen
+
+An AML `Field` carries an AccessType, and it is not a hint. Real
+hardware registers latch on the transaction width: servicing a
+`DWordAcc` field with four byte reads can return four snapshots of a
+register that changed between them; servicing a `ByteAcc` field with a
+dword write can touch three neighbouring registers with side effects.
+
+| Declared | Resolved width |
+|----------|----------------|
+| `AnyAcc` | 8 |
+| `ByteAcc` | 8 |
+| `WordAcc` | 16 |
+| `DWordAcc` | 32 |
+| `QWordAcc` | 64 |
+| `BufferAcc` | refused (`AML_ERR_REGION_ACCESS_WIDTH`) |
+
+`AnyAcc` resolves to 8 for a memory window: it means "the interpreter
+may choose", and the narrowest choice is always inside the permission
+granted, where a wider one may not fit near the end of a region. The
+resolver is a **table** so that #1064's PCI_Config handler — where dword
+is the natural unit and `AnyAcc` must resolve to 32 — becomes a row here
+rather than a special case elsewhere. `BufferAcc` is the SMBus /
+GenericSerialBus / IPMI protocol form; treating it as `ByteAcc` would
+run a protocol field as raw memory.
+
+## Bit-granular fields, and read-modify-write
+
+Fields are bit-granular and need not be aligned. The read loop walks the
+field's bit extent one **aligned access unit at the declared width** at a
+time, extracting the intersection of the field with each unit and
+appending it at the running output bit position.
+
+The write loop is the same walk, with the UpdateRule (§19.5.5.2)
+deciding the fate of the bits of a touched unit the field does not cover:
+
+| Rule | Uncovered bits | Reads first? |
+|------|----------------|--------------|
+| `Preserve` (0) | unchanged | **yes** — this is the RMW |
+| `WriteAsOnes` (1) | become 1 | **no** |
+| `WriteAsZeros` (2) | become 0 | **no** |
+
+The suppressed read under rules 1 and 2 is deliberate and is *why those
+rules exist*: they name registers where reading has a side effect
+(clear-on-read status, FIFO pops). An implementation that read anyway
+"to be safe" would corrupt exactly the hardware the rule was written to
+protect. The corpus asserts the access **count**, which is what makes
+the suppression observable: `Preserve` costs two accesses per partial
+unit, the other two cost one.
+
+## Straddling is an error, not a narrower access
+
+If an access unit at the declared width would extend past the end of the
+region, the access is refused (`AML_ERR_REGION_OOB`). It is not wrapped,
+not partially completed, and not silently narrowed to the bytes that fit.
+
+Narrowing is the tempting repair — the bits the field wants are inside
+the region, after all. It is wrong twice: it changes the transaction
+width the table declared, and it means the region's length no longer
+bounds what a table can reach with a well-chosen field offset. The
+corpus discriminates the two designs directly: a six-byte region with
+two fields over the same bits at byte 4, one `ByteAcc` and one
+`DWordAcc`. The byte one reads; the dword one must not.
+
+## The FieldUnit boundary moves here
+
+R30.M2-004 (#1057) left every FieldUnit load and store refused with
+`AML_ERR_BAD_TARGET` (41), noting that "writing one is a bus transaction
+and belongs to R30.M3's region handlers". This milestone is that, and
+three sites in `aml_eval.pdx` move: `aml_eval_read_named`,
+`aml_eval_obj`'s NAMEREF arm, and `aml_eval_store_named`.
+
+**Now real:** a load or store of a FieldUnit whose enclosing `Field`
+names a **SystemMemory** OperationRegion that has been **bound** to a
+capability window.
+
+**The new boundary**, stated so the next issue inherits a line and not a
+guess:
+
+| Case | Code | Owner |
+|------|------|-------|
+| SystemIO, PCI_Config, EmbeddedControl, any other space | `AML_ERR_REGION_SPACE` (62) | #1063 / #1064 / #1065 |
+| FieldUnit under an `IndexField` / `BankField` | `AML_ERR_REGION_INDIRECT_FIELD` (64) | R30.M4 |
+| Field wider than 64 bits (reads as a Buffer per ACPI) | `AML_ERR_REGION_FIELD_WIDTH` (61) | R30.M4 |
+| Region never bound to a capability | `AML_ERR_REGION_UNBOUND` (58) | — this is the refusal |
+| A destination that names no cell at all | `AML_ERR_BAD_TARGET` (41) | unchanged |
+
+`AML_ERR_REGION_UNBOUND` replacing `AML_ERR_NOT_EVALUABLE` on this path
+is a deliberate sharpening. `NOT_EVALUABLE` said only "I do not know
+how", which is no longer true and would hide a **missing grant** behind
+an implementation gap. An operator reading a log has to be able to tell
+those apart.
+
+## Error codes
+
+Continuing the shared code space of §5.
+
+| Code | Name | Meaning |
+|------|------|---------|
+| 56 | `AML_ERR_REGION_NO_CAP` | no covering capability at all |
+| 57 | `AML_ERR_REGION_NOT_COVERED` | declared range exceeds the window |
+| 58 | `AML_ERR_REGION_UNBOUND` | access to a region with no binding |
+| 59 | `AML_ERR_REGION_OOB` | outside the region, or straddling its end |
+| 60 | `AML_ERR_REGION_ACCESS_WIDTH` | access type illegal for this space |
+| 61 | `AML_ERR_REGION_FIELD_WIDTH` | field wider than 64 bits |
+| 62 | `AML_ERR_REGION_SPACE` | address space not serviced yet |
+| 63 | `AML_ERR_REGION_TABLE_FULL` | binding table exhausted |
+| 64 | `AML_ERR_REGION_INDIRECT_FIELD` | `IndexField` / `BankField` element |
+
+## Fuel
+
+Every unit access spends one unit of evaluator fuel through the same
+`aml_eval_spend` the termination guarantee rests on. A field spanning
+*K* access units costs *K*, not 1 — otherwise a `While` loop over a wide
+unaligned field becomes a way to buy unbounded hardware transactions
+with a bounded fuel budget. `aml_region_accesses` counts the same events
+so the corpus can assert the two agree; the assertion is written as
+`fuel_before - fuel_after == accesses_delta` rather than as a bare
+"fuel dropped", which is the lesson #1059 recorded about composite
+measurements.
+
+## Mutation evidence
+
+Seven mutants of the handler, all killed by the corpus:
+
+| Mutant | Killed by |
+|--------|-----------|
+| skip the containment check in `bind` | "short window → refused" |
+| skip the "is there a capability at all" gate | "no cap → refused" |
+| service a `DWordAcc` field with byte accesses | "its declared width is 32" |
+| drop the read-modify-write merge | "F0's bits are untouched" |
+| drop the upper bounds clip | "one past the end is out" |
+| make `aml_region_mask(64)` return 0 | "mask 64 is all ones, not zero" |
+| spend no fuel on a unit access | "fuel was spent once per access" |
+
+Three mutants of the kernel capability, all killed by the boot witness:
+skipping the containment check on derive, accepting either base kind for
+a root, and making the cascade single-pass.
+
+The third of those **initially survived**, and the fix was to the
+fixture rather than to the code: the witness had laid its window chain
+out with the root at the lowest cap slot, so the ascending cascade scan
+happened to reach every descendant in one sweep and the fixed-point loop
+was untested while looking tested. Reversing the slot order made it a
+real test. That is worth recording as a general shape — *a fixed-point
+algorithm tested on input that converges in one step is not tested at
+all* — and it is the second time in this subsystem that mutation found a
+fixture measuring the wrong thing rather than an implementation bug.

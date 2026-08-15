@@ -810,7 +810,7 @@ literal is atomic.
 | Sorted final-NameSeg index to replace the linear arity scan | still open — `aml_eval_find` now wants the same index, so the two should be replaced together (`aml-evaluator.md` §4) |
 | ~~Full scope resolution of a NameString to a namespace node~~ | **done** — #1054, `aml-evaluator.md` §4 |
 | `ExtendedSpace` (large item 11) accessors — different layout from the Word/DWord/QWord family | when a device presents one |
-| ~~Evaluation of anything at all — method execution~~ | **partly done** — #1054/#1055. OpRegion access is still open |
+| ~~Evaluation of anything at all — method execution~~ | **partly done** — #1054/#1055. SystemMemory OpRegion access landed at R30.M3-002 (#1062); SystemIO / PCI_Config / EmbeddedControl are #1063 / #1064 / #1065 |
 | ~~Revision-dependent truncation of `OnesOp` to 32 bits~~ | **done** — #1054. The parser still stores the full 64-bit value and the evaluator narrows on read, so one parse tree serves both table revisions (`aml-evaluator.md` §3) |
 | `Processor` `PblkAddr`/`PblkLen`, `PowerResource` `ResourceOrder` | recoverable from `src_off`; store them if a consumer ever needs them without re-reading |
 | Arena sizing for a full DSDT | a `.bss` change; exhaustion is already a clean error |

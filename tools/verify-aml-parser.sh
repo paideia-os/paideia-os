@@ -3,6 +3,7 @@
 #                              R30.M2-003/004 (#1056 / #1057)
 #                              R30.M1-003/004/005 (#1051 / #1052 / #1053)
 #                              R30.M2-001/002 (#1054 / #1055)
+#                              R30.M3-002 (#1062)
 #
 # Build-time verification of the userspace AML tokenizer, namespace parser
 # and evaluator. Wired into `.githooks/pre-push` as the `aml-parser` step, in the
@@ -27,7 +28,7 @@
 #      braces alongside tools/lint-no-kernel-aml.sh: that script polices
 #      identifiers, this one polices files.
 #
-#   2. COMPILATION. All eleven modules build with the pinned paideia-as.
+#   2. COMPILATION. All thirteen modules build with the pinned paideia-as.
 #
 #   3. STORAGE ENCAPSULATION. Checked with `objdump -r`, which is the only
 #      way to prove it mechanically: a module's private .bss must be
@@ -67,13 +68,16 @@
 #
 #   $ bash tools/verify-aml-parser.sh
 #   [aml-parser] placement: no AML sources under src/kernel/**
-#   [aml-parser] compiled 11 module(s)
+#   [aml-parser] compiled 13 module(s)
 #   [aml-parser] encapsulation: aml_lex_state confined to aml_lex.o
 #   [aml-parser] encapsulation: arena storage confined to aml_arena.o
 #   [aml-parser] encapsulation: aml_optab confined to aml_optab.o
 #   [aml-parser] encapsulation: evaluator state confined to aml_eval.o
 #   [aml-parser] encapsulation: object arena confined to aml_obj.o
 #   [aml-parser] encapsulation: aml_conv_tab confined to aml_str.o
+#   [aml-parser] encapsulation: notify ring confined to aml_ctl.o
+#   [aml-parser] encapsulation: serialized-method mutex pool confined to aml_ctl.o
+#   [aml-parser] encapsulation: region binding table confined to aml_region.o
 #   [aml-corpus] NNN assertions PASS
 #   [aml-parser] PASS
 #
@@ -90,7 +94,7 @@ HARNESS="${REPO_ROOT}/tests/user/aml/aml_harness.c"
 OUT="${REPO_ROOT}/build/aml"
 
 MODULES=(aml_lex aml_arena aml_optab aml_ns aml_term aml_resource aml_eval aml_arith
-         aml_obj aml_str aml_ref aml_ctl)
+         aml_obj aml_str aml_ref aml_ctl aml_region)
 
 # ── environment ──────────────────────────────────────────────────────
 PA_BIN="$(bash "${REPO_ROOT}/tools/find-paideia-as.sh")"
@@ -278,6 +282,31 @@ check_confined "notify ring confined to aml_ctl.o" aml_ctl \
                "(aml_notify_ring|aml_notify_state)${END}"
 check_confined "serialized-method mutex pool confined to aml_ctl.o" aml_ctl \
                "(aml_mutex_pool|aml_mutex_state)${END}"
+
+# R30.M3-002 (#1062). THE REGION BINDING TABLE, and this is the most
+# consequential assertion in this file.
+#
+# aml_region_tab holds, per bound OperationRegion, the HOST ADDRESS its
+# accesses are performed against. The security property of the whole
+# milestone is that such an address exists only as the result of
+# aml_region_bind having checked a capability window and having found the
+# firmware-declared range contained in it. That property is a property of
+# the WRITERS of this table, and it holds only for as long as there is
+# exactly one.
+#
+# A module that reached aml_region_tab directly would be computing a
+# host address itself — which is precisely the arithmetic the capability
+# check exists to be upstream of. It would not need to be malicious: a
+# future issue that "just caches the host base" in the evaluator, or a
+# handler for one of the other three address spaces that writes its own
+# row, would void the guarantee with no symptom at all until a table
+# named an address nobody had granted. This check fails the push instead.
+#
+# aml_region_state carries the access counter the fuel accounting is
+# cross-checked against, for the same reason aml_eval_state is confined:
+# a second writer makes the accounting stop meaning anything.
+check_confined "region binding table confined to aml_region.o" aml_region \
+               "(aml_region_tab|aml_region_state)${END}"
 
 # ── 4. the corpus ────────────────────────────────────────────────────
 OBJS=()

@@ -788,6 +788,291 @@ runtime base for the `KIND_DMESG` derived kind (logging-m9-001, tag
 kind and will migrate to a derived-tag over the future D1 kind if a
 collision arises.
 
+
+---
+
+## `KIND_OP_REGION` — landed by R30.M3-001 (#1061)
+
+**Runtime base kind.** *Both* `KIND_MEMORY` (= `KIND_PAGE`, slot 4) and
+`KIND_IO_PORT` (slot 11). This is the first derived kind in the catalog
+whose base slot is **not a constant**, and the reason is stated below.
+
+**Derived-kind tag.** `0x150` (decimal 336) — opens the R30 block. The
+R29 block (`0x140` interrupt, `0x141` msix, `0x142` dma domain, `0x143`
+timeline reserved) is left contiguous and untouched.
+
+### Why this kind is the security boundary of R30
+
+Every kind above it in this catalog authorises something the kernel
+already mediates: a vector, an IOMMU context, a log ring. This one
+authorises **touching a physical address named by a firmware table**.
+ACPI tables are vendor-supplied, unsigned, and rewritable by anyone with
+a flash programmer. `OperationRegion(FOO, SystemMemory, <addr>, <len>)`
+places no constraint whatsoever on `<addr>`: it may name kernel text,
+the page tables, a driver's bus-master buffer, or the ACPI supervisor's
+own object arena.
+
+Per `design/roadmap/next-wave-softarch.md` §3 R30 the design intent is
+that *the OperationRegion abstraction becomes a cap, and no other
+component of the system can silently poke a hardware address*. This kind
+is that cap.
+
+The invariant, and it is one sentence: **a window may be opened only
+inside a window the caller already holds, and every access derives from
+the held window's own recorded base and length — never from the address
+the table asked for.**
+
+### The derivation asymmetry
+
+The address space decides which base kind the mint gate demands:
+
+| Space | Keyword | Class | Required parent |
+|-------|---------|-------|-----------------|
+| `0x00` | SystemMemory | memory-like | `KIND_MEMORY` (4) |
+| `0x01` | SystemIO | port-like | `KIND_IO_PORT` (11) |
+| `0x02` | PCI_Config | memory-like | `KIND_MEMORY` (4) |
+| `0x03` | EmbeddedControl | port-like | `KIND_IO_PORT` (11) |
+| `0x05` | SystemCMOS | port-like | `KIND_IO_PORT` (11) |
+| `0x06` | PciBarTarget | memory-like | `KIND_MEMORY` (4) |
+| `0x0A` | PCC | memory-like | `KIND_MEMORY` (4) |
+| `0x04` / `0x07` / `0x08` / `0x09` | SMBus / IPMI / GPIO / GenericSerialBus | **bus** | refused |
+
+The reasoning is R29.M5-001's (#1036), one lattice over. A memory-space
+window must derive over `KIND_MEMORY`, because deriving it over port
+authority — or anything weaker — would let a holder of the lesser
+authority *manufacture memory reach*. The converse holds symmetrically.
+`opregion_space_base_kind` is the single table that decides, and the
+mint gate consults it rather than accepting whichever parent the caller
+presented.
+
+PCI_Config is classed memory-like because this platform reaches
+configuration space through the R22 ECAM aperture — an MMIO window — not
+through the `0xCF8`/`0xCFC` port pair. Classing it port-like would make
+the gate demand the wrong authority and make R30.M3-004's containment
+check meaningless.
+
+The four **bus** spaces are refused with `OPREG_MINT_BAD_SPACE`. Their
+accesses are serial-bus transactions, not loads and stores; they have
+their own capabilities in this round's catalog (`KIND_I2C_BUS`,
+`KIND_I2C_SLAVE`, `KIND_GPIO_LINE`). Admitting them would force this
+kind to carry a `{base, len}` pair that means nothing for them and a
+containment check over a coordinate that is not an address.
+
+Because one derived tag serves two base slots, the LAM kind-hint cannot
+be a constant for this kind — which is exactly why `cap_invoke_dispatch`
+compares the full `u64` kind field (`0x150`) rather than the 4-bit slot,
+as it already does for every derived kind.
+
+### Tail encoding — row indirection
+
+`{space:u8, base:u64, len:u64, parent_slot:u8, parent_row:u16,
+is_root:u1}` = 155 live bits, which does not fit the descriptor's 64-bit
+`target_ptr`. As with `KIND_HW_INTERRUPT` / `KIND_HW_MSIX_VECTOR` /
+`KIND_DMA_DOMAIN`, `target_ptr` carries `row_id` in bits `[15:0]` (bits
+`[63:16]` must be zero) and the payload lives in a kernel-private table.
+
+Row — `_op_region_table[row_id]`, 32 bytes:
+
+| Offset | Bits | Field |
+|--------|------|-------|
+| `[+0]` | `[7:0]` | `space` |
+| | `[15:8]` | `parent_slot` — the cap slot this row derived from |
+| | `[16]` | `is_root` (1 = platform window, 0 = derived sub-window) |
+| | `[23:17]` | reserved (must be zero) |
+| | `[39:24]` | `parent_row` (`0xFFFF` for a root) |
+| | `[55:40]` | reserved (must be zero) |
+| | `[63:56]` | `in_use` |
+| `[+8]` | u64 | `base` — physical address, or port number |
+| `[+16]` | u64 | `len` — **bytes**; zero is refused at allocation |
+| `[+24]` | u64 | reserved — R30.M4 access accounting |
+
+`parent_slot` is one field for both lineages because the cascade walk
+asks one question: *whose child is this?*
+
+`opregion_tail_pack(space, parent_slot, is_root, parent_row)` is the
+canonical encoder. It enforces the cross-field rule that `is_root == 1`
+**requires** `parent_row == 0xFFFF`: a root row that also carried a
+plausible `parent_row` would be revoked twice by the cascade, and the
+second revoke would report `WRONG_KIND` against a descriptor another
+mint had meanwhile reused. Making the combination unrepresentable is
+cheaper than detecting it.
+
+### Rights
+
+| Right | Value | Authorises |
+|-------|-------|------------|
+| `R_OPREG_READ` | `0x001` | the window may be read |
+| `R_OPREG_WRITE` | `0x002` | the window may be written |
+| `R_OPREG_INVOKE` | `0x008` | the query ops |
+| `R_OPREG_REVOKE` | `0x010` | supervisor teardown |
+| `R_OPREG_MINT` | `0x200` | **derive** a sub-window |
+| `R_OPREG_OBSERVE` | `0x400` | the canonical debug printer |
+| `R_OPREG_ALL` | `0x61B` | the union |
+
+READ and WRITE are separate — unlike `KIND_DMA_DOMAIN`, which folds
+both into INVOKE — because a **read-only window** is a shape this round
+needs: a thermal or battery region the supervisor may sample but must
+never poke. Folding them would make that unexpressible and would mean
+every region handed out for a query also carried the authority to write
+hardware.
+
+**Derive is monotone in rights as well as in extent:**
+`(child_rights & parent_rights) == child_rights`. Without it the
+containment check would hold on *addresses* while leaking authority on
+*operations* — a read-only 4 KiB window could derive a writable 4 KiB
+window inside itself.
+
+### Acquisition — why "forgot to check the cap" is not expressible
+
+`_op_region_table` has exactly **one writer**, `opregion_tail_alloc`,
+with exactly **two callers**:
+
+1. **Root** — `opregion_cap_mint_root(slot, parent_slot, rights, space,
+   base, len)`. Demands a parent of the base kind the *space* requires,
+   carrying `RIGHT_MINT`. Root windows encode **platform** knowledge (the
+   firmware memory map, the ECAM aperture, the EC port pair) and are
+   established by kernel-side boot code. It is deliberately **not an op
+   on any capability**, so nothing holding only a `KIND_OP_REGION` can
+   reach it — and therefore nothing a firmware table drives can widen its
+   own reach.
+2. **Derive** — `opregion_cap_derive(child_slot, parent_slot, rights,
+   base, len)`. The path a firmware-declared region takes. Requires a
+   live parent `KIND_OP_REGION` with `RIGHT_MINT`, checks rights
+   monotonicity, and **containment-checks** `[base, base+len)` against
+   the parent row's own extent. It takes **no space argument** — the
+   space is inherited from the parent row, so a caller cannot relabel a
+   memory window as an I/O window and route its accesses through a
+   handler that reads a different namespace.
+
+`tools/build.sh` asserts with `objdump -r` that `_op_region_table` is
+relocated against from `kind_op_region.o` and **no other kernel object**.
+That assertion is what upgrades "the containment check is the only path
+to a row" from a claim about one file to a property of the whole kernel.
+It lives in the build rather than in the pre-push hook so it runs on
+every build, including inside the smoke matrix.
+
+### Refusal, never truncation
+
+An uncovered request returns `OPREG_MINT_NO_COVER` (`0xFFFFFFC5`) and
+allocates nothing. It is **not** clipped to the permitted subrange.
+
+This is the choice an implementation gets wrong by being helpful. Silent
+truncation turns the capability system into an **oracle**: a table
+declares a 4 GiB region, observes that accesses succeed up to offset *N*
+and fail past it, and has thereby measured exactly how much of the
+address space the supervisor holds — without ever being refused
+anything. Refusal leaks one bit ("no"); truncation leaks the boundary.
+
+### Containment is overflow-safe
+
+`opregion_range_contains(o_base, o_len, i_base, i_len)` never adds two
+caller-supplied 64-bit values, because `i_base + i_len` is precisely the
+expression a firmware table controls both operands of. The naive
+`i_base + i_len <= o_base + o_len` wraps for `i_base = 2^64-1,
+i_len = 2` and reports **contained** for a window that starts at the top
+of the address space and runs off the end of it. The gates are ordered
+so both subtractions are proven non-underflowing before they are taken.
+The same predicate, independently implemented, guards the userspace
+handler (`aml_region_contains`) — the two live on opposite sides of a
+privilege boundary and neither may depend on the other having run.
+
+### Ops
+
+| Op | Code | Right |
+|----|------|-------|
+| `QUERY_SPACE` | 0 | INVOKE |
+| `QUERY_BASE` | 1 | INVOKE |
+| `QUERY_LEN` | 2 | INVOKE |
+| `QUERY_PARENT` | 3 | INVOKE |
+| `QUERY_ROOT` | 4 | INVOKE |
+| `DEBUG_PRINT` | 5 | OBSERVE |
+
+There is deliberately **no access op**. Reading or writing a window is
+not a three-register capability invocation — it needs a mapping, a width
+and a direction — and it belongs to the userspace address-space handler
+(#1062) acting on a mapping derived from this capability. A
+poke-this-address op would recreate, one layer up, exactly the property
+this kind exists to remove.
+
+### Revoke + transitive cascade
+
+`opregion_cap_revoke(slot)` verifies `kind == 0x150`, frees **and
+scrubs** the row, and clears the descriptor. Scrubbing matters more here
+than for any other kind: a stale row is a recorded permission to touch a
+physical address.
+
+`opregion_cascade_revoke_by_parent(parent_slot) -> count` is
+**transitive**, which is the one place this cascade differs from
+`KIND_DMA_DOMAIN`'s. A window may be derived from a window, so revoking
+a root must reach its grandchildren; a surviving grandchild is a live
+handle to an address whose only justification has been destroyed. It is
+implemented as a **fixed-point loop** — repeat the full scan until a pass
+revokes nothing — rather than as recursion, because recursion would put
+an unbounded-depth call chain on a teardown path, which is exactly the
+shape a hostile derivation chain would exploit. Termination: every
+continuing pass frees at least one of `OPREG_MAX` rows, so at most
+`OPREG_MAX + 1` passes run.
+
+The closure falls out of the table state rather than a worklist: a row
+whose recorded `parent_slot` no longer holds a `KIND_OP_REGION` is an
+orphan and goes with its parent. Root rows are exempt from the orphan
+test — their `parent_slot` legitimately names a `KIND_MEMORY` /
+`KIND_IO_PORT` descriptor — and go only by direct match.
+
+### Failure taxonomy
+
+Block `0xFFFFFFC2..0xFFFFFFCF`, disjoint from `DMA_*`
+(`0xFFFFFFD5..0xFFFFFFDF`), `MSIX_*` and `HW_INT_*`.
+
+| Code | Name | Meaning |
+|------|------|---------|
+| `0xFFFFFFCF` | `OPREG_TAIL_ENOSPC` | no free row |
+| `0xFFFFFFCE` | `OPREG_TAIL_BAD_ARG` | reserved bits set, or zero length |
+| `0xFFFFFFCD` | `OPREG_TAIL_BAD_SPACE` | space not admitted |
+| `0xFFFFFFCC` | `OPREG_TAIL_BAD_RANGE` | `base + len` wraps |
+| `0xFFFFFFCB` | `OPREG_MINT_BAD_PARENT` | wrong parent kind, or no `RIGHT_MINT` |
+| `0xFFFFFFCA` | `OPREG_MINT_BAD_RIGHTS` | not a subset of the parent's, or of `R_OPREG_ALL` |
+| `0xFFFFFFC9` | `OPREG_MINT_ENOSPC` | row table full |
+| `0xFFFFFFC8` | `OPREG_MINT_BAD_ARG` | slot out of range, or malformed header |
+| `0xFFFFFFC7` | `OPREG_MINT_BAD_SPACE` | bus space, or unknown keyword |
+| `0xFFFFFFC6` | `OPREG_MINT_BAD_RANGE` | `base + len` wraps |
+| **`0xFFFFFFC5`** | **`OPREG_MINT_NO_COVER`** | **no held capability covers the range** |
+| `0xFFFFFFC4` | `OPREG_REVOKE_BAD_SLOT` | slot out of range |
+| `0xFFFFFFC3` | `OPREG_REVOKE_WRONG_KIND` | descriptor is not `KIND_OP_REGION` |
+| `0xFFFFFFC2` | `OPREG_REVOKE_ALREADY` | already null (idempotent) |
+
+### Table sizing
+
+`OPREG_MAX = 32` rows × 32 B = 1024 B `.bss`, align 64. A real DSDT
+declares on the order of a dozen `OperationRegion`s; 32 covers the
+platform roots plus that with room.
+
+### Boot witness
+
+`kernel_main.pdx §kind_op_region_witness`, 24 sub-tests — fingerprint
+`R30 KIND_OP_REGION OK`. It asserts both directions of the derivation
+asymmetry, the overflow case of the containment predicate, the
+`NO_COVER` refusal *and* that the refused slot stayed null, the per-op
+rights gate, and the transitive cascade.
+
+**Slot ordering in the witness is part of the fixture.** The window
+chain is root=33 → child=32 → grandchild=30, i.e. **descending**, while
+the cascade walks the cap table **ascending**. One pass therefore reaches
+only the root. Laid out the other way round, a single-pass cascade would
+happen to finish in one sweep and the fixed-point loop would be untested
+while looking tested — mutation confirmed exactly that, and the layout
+was changed in response.
+
+### Naming note for the rest of R30
+
+The R30 catalog also lists `KIND_AML_SESSION`. **That name cannot be
+spelled kernel-side**: `tools/lint-no-kernel-aml.sh` forbids any
+identifier beginning `aml` under `src/kernel/**` (`design/acpi/
+no-aml-in-kernel.md` §3), and the guardrail is not negotiable — it is
+what keeps an AML interpreter out of ring 0. Whichever issue lands that
+capability must rename it (`KIND_FW_SESSION` is the obvious candidate)
+rather than weaken the lint.
+
 ---
 
 ## Change log
@@ -804,6 +1089,8 @@ collision arises.
 | 2026-08-12 | R29.M2 | #1027 | Landed `driver_lifecycle_channel` schema constants. Request/reply RPC (userspace driver-lifecycle-supervisor → driver process) with six v1 commands — `DRV_LC_OP_START/INIT_DONE/SUSPEND/RESUME/HANDOFF_BEGIN/STOP = 0x01..0x06` — each mapping 1:1 onto an FSM edge from the R29.M2-001 whitelist. Ack rep is 8 bytes `{driver_slot:u16, rc:u32}` with error codes `DRV_LC_ACK_ERR_{BAD_SLOT, INVALID_TRANS, TIMEOUT, DEVICE_GONE, CAP_MISSING, INTERNAL}` that mirror `DRIVER_LIFECYCLE_ERR_*`. Reply-bit-7 convention shared with `ipc/frame.pdx`. Constants in `src/kernel/core/driver/lifecycle_schema.pdx`; wire spec at `design/ipc/driver-lifecycle-schema.md`. R29.M2-004 fuzz witness (#1026 same wave) exercises the kernel-side coupling directly; wire encoders and canonical example driver (`lpss_uart`) deferred to R30 (per doc §7 rationale). Closes R29.M2. |
 | 2026-08-14 | R29.M5 | #1036/#1037 | Landed `KIND_DMA_DOMAIN = 0x142` — **renamed from the `KIND_HW_DMA_DOMAIN` planning skeleton and re-based from `KIND_HW` (14) to `KIND_MEMORY` (= `KIND_PAGE`, 4)** per softarch §3 R29 and the issue text; rationale is that a DMA domain is a memory-access scope, so the mint gate must require memory authority, not device authority. Added the `KIND_MEMORY = 4` name binding in `kind.pdx` so document vocabulary and runtime enum stop drifting. Row-indirection tail via `_dma_domain_table` (32 rows × 32 B) encoding `{iommu_ctx_id:u32, bus_dev_fn:u16, capacity_bytes:u64, coherency:u8, parent_slot:u8}`. Canonical tail-word encoder `dma_tail_pack` + word-level and row-level decoders (#1037), plus canonical debug printer `dma_domain_debug_print` (five-line `DMA DOMAIN ROW` record) reachable via `OP_DEBUG_PRINT`. Rights bitmask `R_DMA_ALL = 0x618` (INVOKE/REVOKE/MINT/OBSERVE) with **per-op** gating rather than a single entry gate. Full mint / revoke / cascade-revoke API + dispatch handler in `src/kernel/core/cap/kind_dma_domain.pdx`; dispatch branch in `invoke.pdx`; chatter tag `cap_dma_dom_msg` in `tags.pdx`. Failure taxonomy `0xFFFFFFD5..0xFFFFFFDF`, disjoint from `HW_INT_*` and `MSIX_*`. Boot witness `kernel_main.pdx §kind_dma_domain_witness` (21 sub-tests) — fingerprint `R29 KIND_DMA_DOMAIN OK`. Opens R29.M5. |
 | 2026-08-15 | R29.M7 | #1044/#1047/#1048 | Landed cascade restart — supervisor tree, restart budget, ChannelDead. Supervisor tree is recorded in the driver descriptor's previously-reserved `[+40]` **supervision word** (`parent_slot:5 | parent_present:1 | perm_failed:1 | restart_count:8 | incarnation:8 | window_start_coarse:40`), with `driver_sup_set_parent` refusing any edge that would close a cycle so every subtree walk is total. Restart strategy is **one-for-one across siblings with a mandatory downward cascade**: kill set = subtree(D), restart set = {D}; descendants are stopped and unregistered rather than restarted, because their capabilities were minted against an incarnation that no longer exists and the restarted D re-enumerates them. Justified by R29's own capability partitioning — siblings share no writable object (one `KIND_DMA_DOMAIN` each per D1.b), so one-for-all buys nothing; and a child's authority is *derived* from its parent's, so the downward cascade is forced rather than chosen. `DRIVER_LIFECYCLE_TABLE` widened `0x00000020101A1C02` → `0x00000020101A1C12` to add the `Init -> Stopping` abandon edge (already the documented intent of the R29.M5-003 signature-failure path, previously unreachable) so `driver_restart_force_stop` is total over the state space. Re-arming is **not** an FSM edge: `Stopped` stays terminal, and `driver_table_rearm_incarnation` retires one incarnation and installs the next, gated on Stopped + no-live-DMA-domain + not-permanently-failed. Budget: 5 restarts per 32768 coarse ticks (TSC >> 20, ≈11 s at 3 GHz) carried in the supervision word; exceeding it latches `perm_failed`, leaving the node in the FSM's own terminal state — escalation is the *absence* of a re-arm, and its terminality is enforced at the store rather than by supervisor convention. ChannelDead: the endpoint row's reserved `[+40]` becomes a **driver binding word** (`driver_slot:5 | bound:1 | dead:1 | incarnation:8`); `driver_restart_reap_endpoints` latches `dead` before detaching each parked waiter and wakes it, and both `sys_ipc_recv_body` and `sys_ipc_send_body` gate on `endpoint_is_dead` returning `-ECONNRESET` (104). Stale capabilities cannot attach to a restarted instance: `endpoint_bind_driver` refuses a dead row (`EP_BIND_ERR_DEAD`) with no revival operation, and `endpoint_attach_ok` additionally requires the incarnation to match. Three audit events (`DRV_AUDIT_EV_RESTART/ESCALATE/CHANDEAD` = 4/5/6, all `kind = 0` so cap-kind balances stay exact). New `src/kernel/core/driver/restart.pdx`; design doc `design/drivers/cascade-restart.md`. Boot witness `kernel_main.pdx §r29_cascade_restart_witness` (40 sub-tests over a four-node tree) — fingerprint `R29 CASCADE RESTART OK`. || 2026-08-15 | R30.M2 | #1058/#1059/#1060 | Added `KIND_ACPI_EVENT = 0x21` as a **planning row with a fixed wire format**, derived over `KIND_NOTIFICATION` (12) with rights `R_ACPI_EVENT_ALL = 0x408` (OBSERVE + REVOKE; deliberately no INVOKE, so a subscriber cannot forge an eject request, and no MINT, so the subscriber set stays the supervisor's). The capability itself is **not minted** — R30.M2 landed only the *producer*, because AML `Notify` delivery is a bounded userspace ring rather than an IPC send and the capability sits on the supervisor-to-consumer hop that R30.M4 wires. The 32-byte row is a transcription of the ring entry `src/user/aml/aml_ctl.pdx` now produces, carrying `sequence` and `drops_total` so a lossy stream is *localisably* lossy: two records whose sequences differ by more than one bracket the loss and a subscriber re-enumerates one bus instead of all of them. Producer contract: depth 32, tail-drop (never overwrite-oldest, so bounded loss never becomes reordering), a drop is a counted event and not a latched error, one step of interpreter fuel on both the accepted and the dropped path, and the invariant `offered == drained + depth + drops`. |
+
+| 2026-08-15 | R30.M3 | #1061/#1062 | Landed `KIND_OP_REGION = 0x150` — the address-space window capability and **the security boundary of R30**: the first kind whose base slot is not a constant (`KIND_MEMORY` 4 for memory-like spaces, `KIND_IO_PORT` 11 for port-like ones, decided by `opregion_space_base_kind` so a port holder cannot manufacture memory reach). Row-indirection tail via `_op_region_table` (32 × 32 B) encoding `{space:u8, base:u64, len:u64, parent_slot:u8, parent_row:u16, is_root:u1}`. Two mint paths and no third: a **root** path demanding the base-kind parent the space requires, reachable only from kernel-side boot code and deliberately not an op on any capability; and a **derive** path — the one a firmware-declared region takes — which inherits the space from its parent and containment-checks the request, **refusing with `OPREG_MINT_NO_COVER` rather than clipping**, because truncation would turn the capability system into an address oracle. Containment is overflow-safe (never forms `base + len`). Rights `R_OPREG_ALL = 0x61B` with READ/WRITE separate so a read-only window is expressible, and derive monotone in rights as well as extent. Transitive cascade revoke as a fixed-point scan (a window may derive a window; recursion on a teardown path is the shape a hostile chain exploits). `tools/build.sh` asserts via `objdump -r` that `_op_region_table` is relocated against from `kind_op_region.o` alone, which is what makes "the containment check is the only path to a row" a property of the kernel rather than of one file. Boot witness `§kind_op_region_witness` (24 sub-tests) — fingerprint `R30 KIND_OP_REGION OK`; its slot ordering is descending on purpose so the cascade's fixed point is genuinely exercised. Userspace half (#1062) is the SystemMemory handler in `src/user/aml/aml_region.pdx`. Opens R30.M3. |
 
 ---
 

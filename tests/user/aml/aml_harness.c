@@ -2,6 +2,7 @@
  *                                 R30.M1-003 (#1051) / R30.M1-004 (#1052)
  *                                 R30.M1-005 (#1053)
  *                                 R30.M2-001 (#1054) / R30.M2-002 (#1055)
+ *                                 R30.M3-002 (#1062)
  *
  * Executable corpus for the userspace AML tokenizer and namespace parser.
  *
@@ -291,6 +292,37 @@ extern uint64_t aml_method_serialized(uint64_t idx);
 extern uint64_t aml_method_synclevel(uint64_t idx);
 extern uint64_t aml_ref_eval(uint64_t n);
 
+/* #1062 — the SystemMemory address-space handler */
+extern void     aml_region_reset(void);
+extern uint64_t aml_region_count(void);
+extern uint64_t aml_region_accesses(void);
+extern uint64_t aml_region_refusals(void);
+extern uint64_t aml_region_space_supported(uint64_t space);
+extern uint64_t aml_region_mask(uint64_t n);
+extern uint64_t aml_region_contains(uint64_t wb, uint64_t wl,
+                                    uint64_t db, uint64_t dl);
+extern uint64_t aml_region_row_live(uint64_t b);
+extern uint64_t aml_region_node(uint64_t b);
+extern uint64_t aml_region_space(uint64_t b);
+extern uint64_t aml_region_base(uint64_t b);
+extern uint64_t aml_region_len(uint64_t b);
+extern uint64_t aml_region_cap(uint64_t b);
+extern uint64_t aml_region_find(uint64_t node);
+extern uint64_t aml_region_bind(uint64_t node, uint64_t cap, uint64_t wb,
+                                uint64_t wl, uint64_t host);
+extern uint64_t aml_region_bounds_ok(uint64_t b, uint64_t off, uint64_t n);
+extern uint64_t aml_region_read_unit(uint64_t b, uint64_t off, uint64_t n);
+extern uint64_t aml_region_write_unit(uint64_t b, uint64_t off, uint64_t n,
+                                      uint64_t v);
+extern uint64_t aml_region_acc_bits(uint64_t node);
+extern uint64_t aml_region_acc_log(uint64_t aw);
+extern uint64_t aml_region_of_field(uint64_t node);
+extern uint64_t aml_region_field_binding(uint64_t node);
+extern uint64_t aml_region_field_read(uint64_t node);
+extern uint64_t aml_region_field_store(uint64_t node, uint64_t v);
+extern uint64_t aml_region_field_load_obj(uint64_t node);
+extern uint64_t aml_region_handles(uint64_t op16);
+
 /* #1057 — evaluator additions */
 extern uint64_t aml_eval_quiet(void);
 extern uint64_t aml_eval_set_quiet(uint64_t v);
@@ -349,7 +381,14 @@ enum {
     E_BAD_OBJTYPE = 48, E_STALE_REF = 49, E_UNINIT_ELEMENT = 50,
     /* #1058 / #1059 / #1060 — invocation, Notify, serialized methods. */
     E_ARG_COUNT = 51, E_BAD_NOTIFY_TARGET = 52, E_SYNC_LEVEL = 53,
-    E_MUTEX_CONTENTION = 54, E_MUTEX_POOL_FULL = 55
+    E_MUTEX_CONTENTION = 54, E_MUTEX_POOL_FULL = 55,
+    /* #1062 — the address-space handler. These are the codes that mean
+     * "a firmware table asked to touch something", and each names a
+     * different reason it was refused. */
+    E_REGION_NO_CAP = 56, E_REGION_NOT_COVERED = 57, E_REGION_UNBOUND = 58,
+    E_REGION_OOB = 59, E_REGION_ACCESS_WIDTH = 60, E_REGION_FIELD_WIDTH = 61,
+    E_REGION_SPACE = 62, E_REGION_TABLE_FULL = 63,
+    E_REGION_INDIRECT_FIELD = 64
 };
 
 /* ACPI ObjectType codes — §19.6.101, and the object model's internal tag. */
@@ -2682,11 +2721,21 @@ static void test_eval_field_element_is_not_under_the_region(void)
         uint64_t m = nth_child(root, 2);
         eq("method kind", aml_node_kind(m), N_METHOD);
         aml_eval_reset(2);
+        aml_region_reset();
         eq("returns nothing", aml_eval_method(m), 0);
-        /* Found — and then refused as unreadable, which is #1057's work.
-         * NAME_NOT_FOUND here would mean the path was built wrong. */
-        eq("resolved, then refused as unreadable",
-           aml_eval_err(), E_NOT_EVALUABLE);
+        /* Found — and then refused, which is what this fixture is about:
+         * NAME_NOT_FOUND (36) here would mean the path was built wrong.
+         *
+         * The REFUSAL CODE MOVED at R30.M3-002 (#1062). #1057 refused a
+         * field element as NOT_EVALUABLE because reading one was a bus
+         * transaction nobody had implemented. It is implemented now, and
+         * the reason this read fails is different and more specific: the
+         * region was never bound to a capability window, so there is no
+         * grant covering it. UNBOUND (58) says that; NOT_EVALUABLE said
+         * only "I do not know how", which is no longer true and would
+         * hide a missing grant behind an implementation gap. */
+        eq("resolved, then refused for want of a capability",
+           aml_eval_err(), E_REGION_UNBOUND);
 
         /* The Field node itself carries a name_ref — the REGION's — while
          * contributing nothing to the path, so at top level its absolute
@@ -4816,6 +4865,813 @@ static void test_serialized_pool_bound_and_leak_detection(void)
     });
 }
 
+/* =====================================================================
+ * R30.M3-002 (#1062) — the SystemMemory address-space handler.
+ *
+ * This is the first section of this corpus whose subject can touch
+ * memory outside its own arenas, so it is also the first that needs a
+ * SECOND guarded mapping: one for the AML fixture (guard_load, as
+ * everywhere above) and one for the region's synthetic BACKING STORE.
+ *
+ * The backing store is placed so its LAST BYTE is the last byte of a
+ * mapped page, with the following page PROT_NONE. Every claim about
+ * clipping in this section therefore has teeth: an access one byte past
+ * the end of a region whose declared length equals the buffer is a hard
+ * SIGSEGV rather than a read of whatever follows. A missing bounds check
+ * cannot pass by returning a plausible number.
+ *
+ * NO FIXTURE HERE NAMES A REAL PHYSICAL ADDRESS. That is not a
+ * limitation of the corpus, it is the mapping/access split working: the
+ * handler's bounds arithmetic, access-width selection and
+ * read-modify-write all operate on a binding, and the binding's host
+ * address is supplied by the mapping step. Pointing that step at a
+ * malloc'd page instead of at mapped device memory changes no line of
+ * the code under test.
+ * ===================================================================== */
+
+static uint8_t *g_bmap;
+static size_t   g_bmaplen;
+
+static uint8_t *backing_load(const uint8_t *data, size_t n)
+{
+    long ps = sysconf(_SC_PAGESIZE);
+    size_t need = ((n + (size_t)ps - 1) / (size_t)ps) * (size_t)ps;
+    if (need == 0) need = (size_t)ps;
+    g_bmaplen = need + (size_t)ps;
+    g_bmap = mmap(NULL, g_bmaplen, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (g_bmap == MAP_FAILED) { perror("mmap"); exit(2); }
+    if (mprotect(g_bmap + need, (size_t)ps, PROT_NONE) != 0) {
+        perror("mprotect"); exit(2);
+    }
+    uint8_t *p = g_bmap + need - n;
+    if (n && data) memcpy(p, data, n);
+    else if (n) memset(p, 0, n);
+    return p;
+}
+
+static void backing_free(void)
+{
+    if (g_bmap) munmap(g_bmap, g_bmaplen);
+    g_bmap = NULL;
+}
+
+/* OperationRegion(RGN0, SystemMemory, 0x1000, 0x40)
+ * Field(RGN0, ByteAcc, NoLock, Preserve) { FLDA, 8, FLDB, 8 } */
+static const uint8_t k_rgn0[] = {
+    0x5B, 0x80, 'R','G','N','0', 0x00, 0x0B, 0x00, 0x10, 0x0A, 0x40,
+    0x5B, 0x81, 0x10, 'R','G','N','0', 0x01,
+        'F','L','D','A', 0x08,
+        'F','L','D','B', 0x08
+};
+
+/* THE HEADLINE SECURITY FIXTURE.
+ *
+ * A DSDT is vendor-supplied and unsigned. It can declare an
+ * OperationRegion at any 64-bit address it likes, including one the
+ * supervisor holds no capability over at all. That must be refused, and
+ * it must be refused BEFORE any address is formed. */
+static void test_region_refused_without_a_capability(void)
+{
+    WITH_PARSE("region: no covering capability at all is REFUSED", k_rgn0, sizeof k_rgn0, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t rgn = nth_child(root, 0);
+        uint64_t fld = nth_child(root, 1);
+        eq("a region", aml_node_kind(rgn), N_OPREGION);
+        eq("SystemMemory", aml_node_flags(rgn), 0);
+        eq("declared at 0x1000", aml_u64_get(aml_node_arg0(rgn)), 0x1000);
+        eq("for 0x40 bytes", aml_u64_get(aml_node_arg1(rgn)), 0x40);
+        uint64_t flda = nth_child(fld, 0);
+        eq("a field element", aml_node_kind(flda), N_FIELD_ELEM);
+
+        uint8_t *back = backing_load(NULL, 0x40);
+
+        /* A capability handle of zero is "I hold nothing". */
+        aml_eval_reset(2);
+        aml_region_reset();
+        eq("nothing bound", aml_region_count(), 0);
+        eq("no cap -> refused", aml_region_bind(rgn, 0, 0x1000, 0x40,
+                                                (uint64_t)(uintptr_t)back), 0);
+        eq("NO_CAP", aml_eval_err(), E_REGION_NO_CAP);
+        eq("still nothing bound", aml_region_count(), 0);
+        eq("and the refusal was counted", aml_region_refusals(), 1);
+
+        /* A zero-length window is the same thing said differently: a
+         * capability that covers nothing covers this region no better
+         * than no capability at all. */
+        aml_eval_reset(2);
+        eq("empty window -> refused", aml_region_bind(rgn, 7, 0x1000, 0,
+                                                      (uint64_t)(uintptr_t)back), 0);
+        eq("NO_CAP", aml_eval_err(), E_REGION_NO_CAP);
+
+        /* And a window that was never mapped. */
+        aml_eval_reset(2);
+        eq("unmapped window -> refused", aml_region_bind(rgn, 7, 0x1000, 0x40, 0), 0);
+        eq("NO_CAP", aml_eval_err(), E_REGION_NO_CAP);
+        eq("three refusals", aml_region_refusals(), 3);
+        eq("and after all three, nothing is bound", aml_region_count(), 0);
+
+        /* THE CONSEQUENCE, which is the part that actually matters: with
+         * no binding, a field access is refused and NO READ HAPPENS. An
+         * implementation that fell back to the declared address would
+         * dereference 0x1000. */
+        aml_eval_reset(2);
+        eq("no binding", aml_region_field_binding(flda), 0);
+        eq("UNBOUND", aml_eval_err(), E_REGION_UNBOUND);
+        aml_eval_reset(2);
+        eq("field read refused", aml_region_field_read(flda), 0);
+        eq("UNBOUND", aml_eval_err(), E_REGION_UNBOUND);
+        eq("and NOTHING was read", aml_region_accesses(), 0);
+        aml_eval_reset(2);
+        eq("field store refused", aml_region_field_store(flda, 0xFF), 0);
+        eq("UNBOUND", aml_eval_err(), E_REGION_UNBOUND);
+        eq("and NOTHING was written", aml_region_accesses(), 0);
+
+        backing_free();
+    });
+}
+
+/* Refusal, never truncation. A region larger than its backing capability
+ * is refused whole; it is NOT clipped to the covered part. */
+static void test_region_refused_beyond_its_capability(void)
+{
+    WITH_PARSE("region: a range beyond the capability is REFUSED, not clipped",
+               k_rgn0, sizeof k_rgn0, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t rgn = nth_child(root, 0);
+        uint8_t *back = backing_load(NULL, 0x140);
+
+        /* The window is half the region. */
+        aml_eval_reset(2);
+        aml_region_reset();
+        eq("short window -> refused", aml_region_bind(rgn, 7, 0x1000, 0x20,
+                                                      (uint64_t)(uintptr_t)back), 0);
+        eq("NOT_COVERED", aml_eval_err(), E_REGION_NOT_COVERED);
+        eq("NOTHING was bound -- not even the covered half",
+           aml_region_count(), 0);
+
+        /* The window starts above the region. */
+        aml_eval_reset(2);
+        eq("window above -> refused", aml_region_bind(rgn, 7, 0x1010, 0x40,
+                                                      (uint64_t)(uintptr_t)back), 0);
+        eq("NOT_COVERED", aml_eval_err(), E_REGION_NOT_COVERED);
+        eq("nothing bound", aml_region_count(), 0);
+
+        /* A COVERING window, offset from the region: the binding must
+         * record the region's own extent, unclipped and unextended, and
+         * the host address must be the window's host address plus the
+         * region's offset INTO the window. Getting that offset wrong is
+         * the quiet way to read the right number of bytes from the wrong
+         * place. */
+        aml_eval_reset(2);
+        uint64_t b = aml_region_bind(rgn, 7, 0x0F00, 0x140,
+                                     (uint64_t)(uintptr_t)back);
+        g_checks++;
+        if (b == 0) fail("a covering window was refused");
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("one binding", aml_region_count(), 1);
+        eq("the region's own base", aml_region_base(b), 0x1000);
+        eq("the region's own length, unclipped", aml_region_len(b), 0x40);
+        eq("the capability is recorded", aml_region_cap(b), 7);
+        eq("and it is live", aml_region_row_live(b), 1);
+        eq("found by node", aml_region_find(rgn), b);
+
+        /* Prove the offset arithmetic by writing through the handler and
+         * reading the raw buffer. The region starts 0x100 into the
+         * window. */
+        aml_eval_reset(2);
+        eq("write byte 0", aml_region_write_unit(b, 0, 1, 0xC3), 1);
+        g_checks++;
+        if (back[0x100] != 0xC3)
+            fail("region offset 0 landed at window offset %d, not 0x100",
+                 (int)(back[0] == 0xC3 ? 0 : -1));
+        eq("read it back", aml_region_read_unit(b, 0, 1), 0xC3);
+
+        /* Re-binding the same region returns the SAME row rather than a
+         * second one with a different window. */
+        eq("re-bind is idempotent", aml_region_bind(rgn, 7, 0x0F00, 0x140,
+                                                    (uint64_t)(uintptr_t)back), b);
+        eq("still one binding", aml_region_count(), 1);
+
+        backing_free();
+    });
+}
+
+/* Bounds. Every access clipped to the region; a straddling access is an
+ * error, not a wrap and not a partial transfer. The backing buffer abuts
+ * a guard page, so a missing clip is a SIGSEGV, not a wrong answer. */
+static void test_region_access_bounds(void)
+{
+    WITH_PARSE("region: accesses are clipped; straddling is an error",
+               k_rgn0, sizeof k_rgn0, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t rgn = nth_child(root, 0);
+        uint8_t *back = backing_load(NULL, 0x40);
+
+        aml_eval_reset(2);
+        aml_region_reset();
+        uint64_t b = aml_region_bind(rgn, 7, 0x1000, 0x40,
+                                     (uint64_t)(uintptr_t)back);
+        g_checks++;
+        if (b == 0) fail("bind failed");
+
+        aml_eval_reset(2);
+        eq("last byte is in", aml_region_bounds_ok(b, 0x3F, 1), 1);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        aml_eval_reset(2);
+        eq("one past the end is out", aml_region_bounds_ok(b, 0x40, 1), 0);
+        eq("OOB", aml_eval_err(), E_REGION_OOB);
+
+        /* STRADDLING. Bytes 0x3E and 0x3F are inside the region; 0x40
+         * and 0x41 are not. A dword access at 0x3E is refused whole. It
+         * is not narrowed to the two bytes that fit, and it does not
+         * wrap. */
+        aml_eval_reset(2);
+        eq("a dword straddling the end is out",
+           aml_region_bounds_ok(b, 0x3E, 4), 0);
+        eq("OOB", aml_eval_err(), E_REGION_OOB);
+
+        /* And the arithmetic does not wrap: an offset near 2^64 must not
+         * come back into range. */
+        aml_eval_reset(2);
+        eq("2^64-1 does not wrap into range",
+           aml_region_bounds_ok(b, 0xFFFFFFFFFFFFFFFFull, 1), 0);
+        eq("OOB", aml_eval_err(), E_REGION_OOB);
+        aml_eval_reset(2);
+        eq("nor does 2^64-2 with a word access",
+           aml_region_bounds_ok(b, 0xFFFFFFFFFFFFFFFEull, 2), 0);
+        eq("OOB", aml_eval_err(), E_REGION_OOB);
+
+        /* THE READ IS NOT PERFORMED. This is the assertion the guard
+         * page backs: if the clip were missing, the read below would
+         * touch the PROT_NONE page and the harness would report a
+         * SIGSEGV rather than a failed comparison. */
+        aml_eval_reset(2);
+        uint64_t before = aml_region_accesses();
+        GUARDED(eq("out-of-range read returns 0",
+                   aml_region_read_unit(b, 0x40, 1), 0));
+        eq("OOB", aml_eval_err(), E_REGION_OOB);
+        eq("and no access was performed", aml_region_accesses(), before);
+        aml_eval_reset(2);
+        GUARDED(eq("out-of-range write refused",
+                   aml_region_write_unit(b, 0x40, 1, 0xFF), 0));
+        eq("OOB", aml_eval_err(), E_REGION_OOB);
+        eq("and no access was performed", aml_region_accesses(), before);
+
+        /* An unbound index cannot reach the arithmetic at all. */
+        aml_eval_reset(2);
+        eq("binding 0 is the null sentinel", aml_region_row_live(0), 0);
+        eq("and is refused", aml_region_bounds_ok(0, 0, 1), 0);
+        eq("UNBOUND", aml_eval_err(), E_REGION_UNBOUND);
+        aml_eval_reset(2);
+        eq("so is an index past the table", aml_region_bounds_ok(99, 0, 1), 0);
+        eq("UNBOUND", aml_eval_err(), E_REGION_UNBOUND);
+
+        backing_free();
+    });
+}
+
+/* The containment predicate and the mask helper, driven directly. Both
+ * are pure, both have an overflow edge, and both are the kind of thing a
+ * refactor breaks silently. */
+static void test_region_arithmetic_edges(void)
+{
+    g_case = "region: containment and mask arithmetic";
+
+    eq("contained", aml_region_contains(0x1000, 0x1000, 0x1400, 0x400), 1);
+    eq("exactly the window", aml_region_contains(0x1000, 0x1000, 0x1000, 0x1000), 1);
+    eq("one byte past", aml_region_contains(0x1000, 0x1000, 0x1000, 0x1001), 0);
+    eq("starts below", aml_region_contains(0x1000, 0x1000, 0x0FFF, 0x10), 0);
+    eq("ends above", aml_region_contains(0x1000, 0x1000, 0x1FF0, 0x20), 0);
+    eq("empty inner", aml_region_contains(0x1000, 0x1000, 0x1400, 0), 0);
+    eq("empty outer", aml_region_contains(0x1000, 0, 0x1000, 1), 0);
+
+    /* THE WRAP. `d_base + d_len` overflows here; the naive form reports
+     * CONTAINED for a region that starts at the top of the address space
+     * and runs off the end of it. */
+    eq("2^64-1 + 2 does not wrap into the window",
+       aml_region_contains(0, 0x2000, 0xFFFFFFFFFFFFFFFFull, 2), 0);
+    eq("nor into a window at the top",
+       aml_region_contains(0xFFFFFFFFFFFF0000ull, 0x10000,
+                           0xFFFFFFFFFFFFFFFFull, 2), 0);
+    eq("but a window at the top does contain its own last byte",
+       aml_region_contains(0xFFFFFFFFFFFF0000ull, 0x10000,
+                           0xFFFFFFFFFFFFFFFFull, 1), 1);
+
+    eq("mask 0", aml_region_mask(0), 0);
+    eq("mask 1", aml_region_mask(1), 1);
+    eq("mask 3", aml_region_mask(3), 7);
+    eq("mask 32", aml_region_mask(32), 0xFFFFFFFFull);
+    eq("mask 63", aml_region_mask(63), 0x7FFFFFFFFFFFFFFFull);
+    /* x86 masks the shift count to 6 bits, so the naive (1<<64)-1 is 0. */
+    eq("mask 64 is all ones, not zero", aml_region_mask(64),
+       0xFFFFFFFFFFFFFFFFull);
+
+    eq("SystemMemory is serviced", aml_region_space_supported(0), 1);
+    eq("SystemIO is not, yet", aml_region_space_supported(1), 0);
+    eq("PCI_Config is not, yet", aml_region_space_supported(2), 0);
+    eq("EmbeddedControl is not, yet", aml_region_space_supported(3), 0);
+    eq("this module handles no opcode", aml_region_handles(0x5B80), 0);
+
+    eq("log2 8", aml_region_acc_log(8), 3);
+    eq("log2 16", aml_region_acc_log(16), 4);
+    eq("log2 32", aml_region_acc_log(32), 5);
+    eq("log2 64", aml_region_acc_log(64), 6);
+    eq("an inadmissible width has no log", aml_region_acc_log(24), 0);
+}
+
+/* THE BIT-GRANULAR, UNALIGNED, MULTI-UNIT FIELD — read and write.
+ *
+ * FSP is 40 bits starting at bit 3 of a DWordAcc region: it spans two
+ * dwords, is aligned to nothing, and covers neither whole unit. Its
+ * neighbours (F0 below it, and the top 21 bits of the second dword above
+ * it) must survive a write to it. */
+static void test_region_unaligned_field_spanning_two_units(void)
+{
+    /* OperationRegion(RGN1, SystemMemory, 0x2000, 0x10)
+     * Field(RGN1, DWordAcc, NoLock, Preserve) { F0__, 3, FSP_, 40 } */
+    uint8_t b[] = {
+        0x5B, 0x80, 'R','G','N','1', 0x00, 0x0B, 0x00, 0x20, 0x0A, 0x10,
+        0x5B, 0x81, 0x10, 'R','G','N','1', 0x03,
+            'F','0','_','_', 0x03,
+            'F','S','P','_', 0x28
+    };
+    WITH_PARSE("region: a bit-granular unaligned field spanning two units",
+               b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t rgn = nth_child(root, 0);
+        uint64_t fld = nth_child(root, 1);
+        uint64_t f0  = nth_child(fld, 0);
+        uint64_t fsp = nth_child(fld, 1);
+        eq("DWordAcc", aml_field_access_type(fld), 3);
+        eq("Preserve", aml_field_update_rule(fld), 0);
+        eq("F0 at bit 0", aml_node_arg0(f0), 0);
+        eq("F0 is 3 bits", aml_node_arg1(f0), 3);
+        eq("FSP at bit 3", aml_node_arg0(fsp), 3);
+        eq("FSP is 40 bits", aml_node_arg1(fsp), 40);
+        eq("its declared width is 32", aml_region_acc_bits(fsp), 32);
+
+        static const uint8_t seed[16] = {
+            0x21, 0x43, 0x65, 0x87,   /* dword0 = 0x87654321 */
+            0xA9, 0xCB, 0xED, 0x0F,   /* dword1 = 0x0FEDCBA9 */
+            0, 0, 0, 0, 0, 0, 0, 0
+        };
+        uint8_t *back = backing_load(seed, sizeof seed);
+
+        aml_eval_reset(2);
+        aml_region_reset();
+        uint64_t bd = aml_region_bind(rgn, 9, 0x2000, 0x10,
+                                      (uint64_t)(uintptr_t)back);
+        g_checks++;
+        if (bd == 0) fail("bind failed");
+        eq("the region resolves from the field element",
+           aml_region_of_field(fsp), rgn);
+        eq("and so does its binding", aml_region_field_binding(fsp), bd);
+
+        const uint64_t d0 = 0x87654321ull, d1 = 0x0FEDCBA9ull;
+
+        /* READ. The expected value is computed here by an expression
+         * written independently of the handler's loop -- if both were the
+         * same algorithm this assertion would only prove it is
+         * deterministic. */
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        uint64_t fuel0 = aml_eval_fuel();
+        uint64_t acc0  = aml_region_accesses();
+        uint64_t want  = ((d0 >> 3) & ((1ull << 29) - 1))
+                       | ((d1 & ((1ull << 11) - 1)) << 29);
+        eq("the field reads across both units",
+           aml_region_field_read(fsp), want);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("TWO unit accesses, one per dword",
+           aml_region_accesses(), acc0 + 2);
+        eq("and fuel was spent once per access",
+           fuel0 - aml_eval_fuel(), 2);
+
+        /* The narrow neighbour below it costs ONE access. */
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        fuel0 = aml_eval_fuel();
+        acc0  = aml_region_accesses();
+        eq("F0 reads the low three bits", aml_region_field_read(f0), d0 & 7);
+        eq("one unit access", aml_region_accesses(), acc0 + 1);
+        eq("one unit of fuel", fuel0 - aml_eval_fuel(), 1);
+
+        /* WRITE, under Preserve. The stored value is deliberately not
+         * all-ones and not all-zeros, so a lost-neighbour bug shows up as
+         * a wrong bit rather than as a value that happens to match. */
+        const uint64_t put = 0x5A5A5A5A5Aull & ((1ull << 40) - 1);
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        acc0 = aml_region_accesses();
+        eq("store", aml_region_field_store(fsp, put), 1);
+        eq("no error", aml_eval_err(), AML_OK);
+        /* Preserve reads each partial unit before writing it: two units,
+         * each read then written, is four accesses. */
+        eq("read-modify-write costs two accesses per partial unit",
+           aml_region_accesses(), acc0 + 4);
+
+        uint64_t n0 = (uint64_t)back[0] | ((uint64_t)back[1] << 8)
+                    | ((uint64_t)back[2] << 16) | ((uint64_t)back[3] << 24);
+        uint64_t n1 = (uint64_t)back[4] | ((uint64_t)back[5] << 8)
+                    | ((uint64_t)back[6] << 16) | ((uint64_t)back[7] << 24);
+
+        /* THE NEIGHBOURS SURVIVED. Bits 0..2 of dword0 are F0's; bits
+         * 11..31 of dword1 belong to nobody this field may touch. On real
+         * hardware those are other control bits, and losing them is the
+         * failure this whole read-modify-write exists to prevent. */
+        eq("F0's bits are untouched", n0 & 7, d0 & 7);
+        eq("dword1's upper 21 bits are untouched",
+           n1 & ~((1ull << 11) - 1), d1 & ~((1ull << 11) - 1));
+        /* ... and the field itself took the value. */
+        eq("the low 29 bits landed in dword0",
+           (n0 >> 3) & ((1ull << 29) - 1), put & ((1ull << 29) - 1));
+        eq("the high 11 bits landed in dword1",
+           n1 & ((1ull << 11) - 1), (put >> 29) & ((1ull << 11) - 1));
+
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        eq("and it reads back", aml_region_field_read(fsp), put);
+        eq("with F0 still intact", aml_region_field_read(f0), d0 & 7);
+
+        backing_free();
+    });
+}
+
+/* The UpdateRule decides the fate of the bits a partial write does not
+ * cover, and the two non-default rules must NOT read first -- they name
+ * registers where reading has a side effect. */
+static void test_region_update_rules(void)
+{
+    /* Three one-bit fields at bit 1 of a ByteAcc region, one per
+     * UpdateRule. FieldFlags: ByteAcc(1) | UpdateRule << 5. */
+    uint8_t b[] = {
+        0x5B, 0x80, 'R','G','N','2', 0x00, 0x0B, 0x00, 0x30, 0x0A, 0x04,
+        /* Preserve */
+        0x5B, 0x81, 0x0D, 'R','G','N','2', 0x01,
+            0x00, 0x01, 'P','R','S','V', 0x01,
+        /* WriteAsOnes */
+        0x5B, 0x81, 0x0D, 'R','G','N','2', 0x21,
+            0x00, 0x01, 'O','N','E','S', 0x01,
+        /* WriteAsZeros */
+        0x5B, 0x81, 0x0D, 'R','G','N','2', 0x41,
+            0x00, 0x01, 'Z','R','O','S', 0x01
+    };
+    WITH_PARSE("region: the UpdateRule decides the uncovered bits", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t rgn  = nth_child(root, 0);
+        uint64_t fpre = nth_child(nth_child(root, 1), 1);
+        uint64_t fone = nth_child(nth_child(root, 2), 1);
+        uint64_t fzer = nth_child(nth_child(root, 3), 1);
+        eq("Preserve", aml_field_update_rule(nth_child(root, 1)), 0);
+        eq("WriteAsOnes", aml_field_update_rule(nth_child(root, 2)), 1);
+        eq("WriteAsZeros", aml_field_update_rule(nth_child(root, 3)), 2);
+        eq("all three at bit 1", aml_node_arg0(fpre), 1);
+        eq("all three one bit wide", aml_node_arg1(fzer), 1);
+
+        static const uint8_t seed[4] = { 0xA5, 0, 0, 0 };
+        uint8_t *back = backing_load(seed, sizeof seed);
+
+        aml_eval_reset(2);
+        aml_region_reset();
+        uint64_t bd = aml_region_bind(rgn, 9, 0x3000, 4,
+                                      (uint64_t)(uintptr_t)back);
+        g_checks++;
+        if (bd == 0) fail("bind failed");
+
+        /* Preserve: only bit 1 changes. 0xA5 = 1010_0101; bit 1 is 0. */
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        uint64_t acc0 = aml_region_accesses();
+        eq("store 1", aml_region_field_store(fpre, 1), 1);
+        eq("one read + one write", aml_region_accesses(), acc0 + 2);
+        eq("only bit 1 moved", (uint64_t)back[0], 0xA7);
+
+        /* WriteAsOnes: every other bit of the byte becomes 1, and the
+         * unit is NOT read first. */
+        back[0] = 0xA5;
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        acc0 = aml_region_accesses();
+        eq("store 0", aml_region_field_store(fone, 0), 1);
+        eq("ONE access -- the unit was not read", aml_region_accesses(), acc0 + 1);
+        eq("uncovered bits became ones", (uint64_t)back[0], 0xFD);
+
+        /* WriteAsZeros: every other bit becomes 0, also without a read. */
+        back[0] = 0xA5;
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        acc0 = aml_region_accesses();
+        eq("store 1", aml_region_field_store(fzer, 1), 1);
+        eq("ONE access -- the unit was not read", aml_region_accesses(), acc0 + 1);
+        eq("uncovered bits became zeros", (uint64_t)back[0], 0x02);
+
+        backing_free();
+    });
+}
+
+/* THE ACCESS WIDTH IS DECLARED, NOT CHOSEN.
+ *
+ * The discriminator is a field whose bits are inside the region but
+ * whose ALIGNED UNIT at the declared width is not. A handler that
+ * quietly serviced a DWordAcc field with byte accesses would succeed
+ * here; the declared width makes it an error. */
+static void test_region_access_width_is_honoured(void)
+{
+    /* A 6-byte region. Two fields at bit 32 (byte 4), width 8: one
+     * DWordAcc, one ByteAcc. Byte 4 is inside the region; the dword
+     * containing it (bytes 4..7) is not. */
+    uint8_t b[] = {
+        0x5B, 0x80, 'R','G','N','3', 0x00, 0x0B, 0x00, 0x40, 0x0A, 0x06,
+        0x5B, 0x81, 0x0D, 'R','G','N','3', 0x03,          /* DWordAcc */
+            0x00, 0x20, 'D','W','I','D', 0x08,
+        0x5B, 0x81, 0x0D, 'R','G','N','3', 0x01,          /* ByteAcc  */
+            0x00, 0x20, 'B','W','I','D', 0x08,
+        0x5B, 0x81, 0x0D, 'R','G','N','3', 0x05,          /* BufferAcc */
+            0x00, 0x20, 'X','B','U','F', 0x08,
+        0x5B, 0x81, 0x0D, 'R','G','N','3', 0x00,          /* AnyAcc   */
+            0x00, 0x20, 'A','W','I','D', 0x08,
+        0x5B, 0x81, 0x0D, 'R','G','N','3', 0x02,          /* WordAcc  */
+            0x00, 0x20, 'W','W','I','D', 0x08,
+        0x5B, 0x81, 0x0D, 'R','G','N','3', 0x04,          /* QWordAcc */
+            0x00, 0x20, 'Q','W','I','D', 0x08
+    };
+    WITH_PARSE("region: the declared access width is honoured", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t rgn = nth_child(root, 0);
+        uint64_t dw  = nth_child(nth_child(root, 1), 1);
+        uint64_t bw  = nth_child(nth_child(root, 2), 1);
+        uint64_t xb  = nth_child(nth_child(root, 3), 1);
+        uint64_t aw  = nth_child(nth_child(root, 4), 1);
+        uint64_t ww  = nth_child(nth_child(root, 5), 1);
+        uint64_t qw  = nth_child(nth_child(root, 6), 1);
+
+        /* The resolution table, in both directions. */
+        eq("AnyAcc resolves to 8 for a memory window", aml_region_acc_bits(aw), 8);
+        eq("ByteAcc  -> 8",  aml_region_acc_bits(bw), 8);
+        eq("WordAcc  -> 16", aml_region_acc_bits(ww), 16);
+        eq("DWordAcc -> 32", aml_region_acc_bits(dw), 32);
+        eq("QWordAcc -> 64", aml_region_acc_bits(qw), 64);
+        eq("BufferAcc is not a memory width", aml_region_acc_bits(xb), 0);
+
+        static const uint8_t seed[6] = { 0, 0, 0, 0, 0x7E, 0 };
+        uint8_t *back = backing_load(seed, sizeof seed);
+
+        aml_eval_reset(2);
+        aml_region_reset();
+        uint64_t bd = aml_region_bind(rgn, 9, 0x4000, 6,
+                                      (uint64_t)(uintptr_t)back);
+        g_checks++;
+        if (bd == 0) fail("bind failed");
+
+        /* The ByteAcc field reads: its unit is byte 4, which is in. */
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        eq("the byte-wide field reads", aml_region_field_read(bw), 0x7E);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        /* The DWordAcc field over the SAME BITS is refused, because its
+         * unit runs to byte 7 and the region ends at byte 5. This is the
+         * assertion that a byte-serviced implementation fails. */
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        uint64_t acc0 = aml_region_accesses();
+        GUARDED(eq("the dword-wide field over the same bits is refused",
+                   aml_region_field_read(dw), 0));
+        eq("OOB", aml_eval_err(), E_REGION_OOB);
+        eq("and nothing was read", aml_region_accesses(), acc0);
+
+        /* QWordAcc likewise, and WordAcc succeeds (bytes 4..5 fit). */
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        GUARDED(eq("the qword-wide field is refused",
+                   aml_region_field_read(qw), 0));
+        eq("OOB", aml_eval_err(), E_REGION_OOB);
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        eq("the word-wide field fits", aml_region_field_read(ww), 0x7E);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        /* BufferAcc is refused as a WIDTH, not as a bounds problem --
+         * the two must not be conflated, or a future SMBus handler would
+         * inherit an error that says the wrong thing. */
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        eq("BufferAcc is refused", aml_region_field_read(xb), 0);
+        eq("ACCESS_WIDTH, not OOB", aml_eval_err(), E_REGION_ACCESS_WIDTH);
+
+        backing_free();
+    });
+}
+
+/* Everything this milestone does NOT service, stated as refusals rather
+ * than left to be discovered. This is the boundary #1063/#1064/#1065
+ * inherit. */
+static void test_region_boundary_refusals(void)
+{
+    /* A SystemIO region, an IndexField, and a field wider than 64 bits. */
+    uint8_t b[] = {
+        0x5B, 0x80, 'S','I','O','0', 0x01, 0x0A, 0x62, 0x0A, 0x02,
+        0x5B, 0x80, 'R','G','N','4', 0x00, 0x0B, 0x00, 0x50, 0x0A, 0x20,
+        0x5B, 0x81, 0x0C, 'R','G','N','4', 0x01,
+            'W','I','D','E', 0x40, 0x08,         /* 128 bits (PkgLength) */
+        0x5B, 0x86, 0x0F, 'R','G','N','4', 'S','I','O','0', 0x01,
+            'I','X','F','L', 0x08
+    };
+    WITH_PARSE("region: the boundary this milestone stops at", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t sio  = nth_child(root, 0);
+        uint64_t rgn  = nth_child(root, 1);
+        uint64_t wide = nth_child(nth_child(root, 2), 0);
+        uint64_t ixf  = nth_child(nth_child(root, 3), 1);
+        eq("SystemIO", aml_node_flags(sio), 1);
+        eq("128 bits wide", aml_node_arg1(wide), 128);
+        eq("an IndexField element", aml_node_kind(ixf), N_FIELD_ELEM);
+
+        uint8_t *back = backing_load(NULL, 0x20);
+
+        /* A space this milestone does not service is refused at BIND, so
+         * the failure is reported once, where the table is being set up,
+         * rather than at every later access. */
+        aml_eval_reset(2);
+        aml_region_reset();
+        eq("a SystemIO region is refused",
+           aml_region_bind(sio, 9, 0x62, 2, (uint64_t)(uintptr_t)back), 0);
+        eq("SPACE (#1063)", aml_eval_err(), E_REGION_SPACE);
+        eq("nothing bound", aml_region_count(), 0);
+
+        aml_eval_reset(2);
+        uint64_t bd = aml_region_bind(rgn, 9, 0x5000, 0x20,
+                                      (uint64_t)(uintptr_t)back);
+        g_checks++;
+        if (bd == 0) fail("bind failed");
+
+        /* A field wider than 64 bits reads as a Buffer per ACPI. It is
+         * refused rather than truncated: a truncated read returns a
+         * plausible wrong answer. */
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        uint64_t acc0 = aml_region_accesses();
+        eq("a 128-bit field is refused", aml_region_field_read(wide), 0);
+        eq("FIELD_WIDTH (Buffer-valued, R30.M4)",
+           aml_eval_err(), E_REGION_FIELD_WIDTH);
+        eq("and nothing was read", aml_region_accesses(), acc0);
+
+        /* An IndexField element is a two-step protocol, not an offset. */
+        aml_eval_reset(2);
+        eq("an IndexField element has no direct region",
+           aml_region_of_field(ixf), 0);
+        eq("INDIRECT_FIELD (R30.M4)", aml_eval_err(), E_REGION_INDIRECT_FIELD);
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        acc0 = aml_region_accesses();
+        eq("and reading it is refused", aml_region_field_read(ixf), 0);
+        eq("INDIRECT_FIELD", aml_eval_err(), E_REGION_INDIRECT_FIELD);
+        eq("with nothing read", aml_region_accesses(), acc0);
+
+        backing_free();
+    });
+}
+
+/* The binding table is bounded, and exhaustion is a clean refusal rather
+ * than an overwrite -- an overwritten row would silently re-point one
+ * region's accesses at another region's window. */
+static void test_region_table_is_bounded(void)
+{
+    uint8_t b[17 * 11];
+    size_t n = 0;
+    for (int i = 0; i < 17; i++) {
+        b[n++] = 0x5B; b[n++] = 0x80;
+        b[n++] = 'R';  b[n++] = 'G';
+        b[n++] = (uint8_t)('A' + i / 10);
+        b[n++] = (uint8_t)('0' + i % 10);
+        b[n++] = 0x00;                          /* SystemMemory */
+        /* Bases must stay inside a ByteConst, so 8 apart rather than 16:
+         * the seventeenth region at 0x10 * 17 would truncate to 0x10 and
+         * silently alias the first, which would make the exhaustion
+         * assertion below measure the wrong thing. */
+        b[n++] = 0x0A; b[n++] = (uint8_t)(0x08 * (i + 1));
+        b[n++] = 0x0A; b[n++] = 0x04;
+    }
+    WITH_PARSE("region: the binding table is bounded", b, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        eq("seventeen regions", (uint64_t)count_children(root), 17);
+
+        uint8_t *back = backing_load(NULL, 0x200);
+        aml_eval_reset(2);
+        aml_region_reset();
+
+        for (int i = 0; i < 15; i++) {
+            uint64_t r = nth_child(root, i);
+            uint64_t base = 0x08 * (uint64_t)(i + 1);
+            uint64_t bd = aml_region_bind(r, 9, base, 4,
+                                          (uint64_t)(uintptr_t)back);
+            g_checks++;
+            if (bd == 0) fail("bind %d failed", i);
+        }
+        eq("fifteen bound", aml_region_count(), 15);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        aml_eval_reset(2);
+        eq("the sixteenth is refused",
+           aml_region_bind(nth_child(root, 15), 9, 0x08 * 16, 4,
+                           (uint64_t)(uintptr_t)back), 0);
+        eq("TABLE_FULL", aml_eval_err(), E_REGION_TABLE_FULL);
+        eq("and the refusal changed nothing", aml_region_count(), 15);
+
+        /* A reset recovers the table. */
+        aml_region_reset();
+        eq("reset clears every binding", aml_region_count(), 0);
+        eq("and the counters with it", aml_region_accesses(), 0);
+
+        backing_free();
+    });
+}
+
+/* THE FIELDUNIT BOUNDARY, END TO END THROUGH THE EVALUATOR.
+ *
+ * #1057 left a FieldUnit store as AML_ERR_BAD_TARGET with the note that
+ * writing one is a bus transaction belonging to R30.M3. This is that
+ * milestone: the same AML that was refused then must now run. */
+static void test_region_fieldunit_store_is_real_now(void)
+{
+    /* OperationRegion(RGN5, SystemMemory, 0x6000, 0x08)
+     * Field(RGN5, ByteAcc, NoLock, Preserve) { FB0_, 8 }
+     * Method(RMAI, 0) { Store(0x5A, FB0_); Return(FB0_) } */
+    uint8_t b[] = {
+        0x5B, 0x80, 'R','G','N','5', 0x00, 0x0B, 0x00, 0x60, 0x0A, 0x08,
+        0x5B, 0x81, 0x0B, 'R','G','N','5', 0x01,
+            'F','B','0','_', 0x08,
+        0x14, 0x12, 'R','M','A','I', 0x00,
+            0x70, 0x0A, 0x5A, 'F','B','0','_',
+            0xA4, 'F','B','0','_'
+    };
+    WITH_PARSE("region: a FieldUnit store is a real access now", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t rgn  = nth_child(root, 0);
+        uint64_t fb0  = nth_child(nth_child(root, 1), 0);
+        uint64_t rmai = nth_child(root, 2);
+        eq("a method", aml_node_kind(rmai), N_METHOD);
+
+        static const uint8_t seed[8] = { 0x11, 0x22, 0, 0, 0, 0, 0, 0 };
+        uint8_t *back = backing_load(seed, sizeof seed);
+
+        /* UNBOUND FIRST. The method must fail cleanly, and it must fail
+         * with the code that says "no capability", not with a generic
+         * one -- an operator reading the log has to be able to tell a
+         * missing grant from a malformed table. */
+        aml_eval_reset(2);
+        aml_region_reset();
+        aml_eval_set_fuel(10000);
+        eq("unbound: no value", aml_eval_method(rmai), 0);
+        eq("UNBOUND", aml_eval_err(), E_REGION_UNBOUND);
+        eq("nothing was read or written", aml_region_accesses(), 0);
+        eq("the buffer is untouched", (uint64_t)back[0], 0x11);
+        eq("frames unwound", aml_eval_frames(), 0);
+
+        /* Now bind it and run the same bytes. */
+        aml_eval_reset(2);
+        uint64_t bd = aml_region_bind(rgn, 9, 0x6000, 8,
+                                      (uint64_t)(uintptr_t)back);
+        g_checks++;
+        if (bd == 0) fail("bind failed");
+
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        eq("the method returns what it stored", aml_eval_method(rmai), 0x5A);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("and the store reached the backing store", (uint64_t)back[0], 0x5A);
+        eq("without disturbing the next byte", (uint64_t)back[1], 0x22);
+        eq("frames unwound", aml_eval_frames(), 0);
+
+        /* A direct read through the evaluator's object path, which is
+         * the other half of the boundary move. */
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        uint64_t o = aml_region_field_load_obj(fb0);
+        g_checks++;
+        if (o == 0) fail("field load produced no object");
+        eq("an Integer", aml_obj_type(o), T_INT);
+        eq("holding the stored byte", aml_obj_int_value(o), 0x5A);
+
+        /* A field that genuinely reads ZERO must produce an object, not
+         * a failure. This is why the object wrapper consults the error
+         * latch rather than the returned value. */
+        back[0] = 0x00;
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        o = aml_region_field_load_obj(fb0);
+        g_checks++;
+        if (o == 0) fail("a field reading 0 was reported as a failure");
+        eq("still an Integer", aml_obj_type(o), T_INT);
+        eq("holding zero", aml_obj_int_value(o), 0);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        backing_free();
+    });
+}
+
 int main(void)
 {
     struct sigaction sa;
@@ -4947,6 +5803,21 @@ int main(void)
     test_serialized_recursion_is_still_bounded();
     test_serialized_sync_level_ordering();
     test_serialized_pool_bound_and_leak_detection();
+
+    /* ---- R30.M3-002: the SystemMemory address-space handler. The
+     * security fixtures run FIRST, because if the capability check is
+     * broken every later assertion in this block is measuring the wrong
+     * thing. ---- */
+    test_region_refused_without_a_capability();
+    test_region_refused_beyond_its_capability();
+    test_region_access_bounds();
+    test_region_arithmetic_edges();
+    test_region_unaligned_field_spanning_two_units();
+    test_region_update_rules();
+    test_region_access_width_is_honoured();
+    test_region_boundary_refusals();
+    test_region_table_is_bounded();
+    test_region_fieldunit_store_is_real_now();
 
     if (g_fail) {
         fprintf(stderr, "[aml-corpus] %d assertion(s) failed out of %d\n",

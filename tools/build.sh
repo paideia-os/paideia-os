@@ -126,6 +126,54 @@ fi
 # excludes the whole directory; verification lives in the negatives
 # script rather than the object-emitting build path.
 
+# R30.M3-001 (#1061): OP-REGION ROW-TABLE CONFINEMENT.
+#
+# _op_region_table is the only place in the kernel where a {address
+# space, base, length} triple lives, and the entire security argument of
+# R30.M3 is that its ONLY writer — opregion_tail_alloc — is reachable
+# solely through two gates: the root mint, which demands the base-kind
+# capability the space requires, and the derive path, which containment-
+# checks the request against the parent window and refuses rather than
+# clipping.
+#
+# That argument is a claim about ONE FILE until it is checked. `objdump
+# -r` is the only way to check it mechanically: a kernel object that
+# relocates against the table is an object that can write a row without
+# passing either gate. A future issue that "just pokes the base in" for
+# an EC or LPSS window, or a debug helper that fixes up a length, would
+# void the guarantee with no symptom until a firmware table reached an
+# address nobody granted it. The build fails here instead.
+#
+# The check is in build.sh rather than in the pre-push hook deliberately:
+# it then runs on every build, including inside the smoke matrix, rather
+# than only at push time.
+OPREG_OWNER="${BUILD_DIR}/core/cap/kind_op_region.o"
+if [[ ! -f "${OPREG_OWNER}" ]]; then
+    echo "[opregion-confine] FAIL: ${OPREG_OWNER} not built" >&2
+    exit 1
+fi
+if ! objdump -r "${OPREG_OWNER}" 2>/dev/null | grep -qE '_op_region_table([^a-zA-Z0-9_]|$)'; then
+    echo "[opregion-confine] FAIL: kind_op_region.o does not reference _op_region_table" >&2
+    echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+    echo "  check would then pass vacuously, so it fails instead." >&2
+    exit 1
+fi
+opreg_strays=""
+for o in "${OBJECTS[@]}"; do
+    [[ "${o}" == "${OPREG_OWNER}" ]] && continue
+    if objdump -r "${o}" 2>/dev/null | grep -qE '_op_region_table([^a-zA-Z0-9_]|$)'; then
+        opreg_strays="${opreg_strays} ${o#"${BUILD_DIR}"/}"
+    fi
+done
+if [[ -n "${opreg_strays}" ]]; then
+    echo "[opregion-confine] FAIL — objects other than kind_op_region.o relocate" >&2
+    echo "  against _op_region_table:${opreg_strays}" >&2
+    echo "  Only opregion_tail_alloc may write a region row, and only behind the" >&2
+    echo "  root-mint and derive gates. See src/kernel/core/cap/kind_op_region.pdx." >&2
+    exit 1
+fi
+echo "[opregion-confine] _op_region_table confined to core/cap/kind_op_region.o"
+
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
 if [[ ${#OBJECTS[@]} -eq 0 ]]; then
