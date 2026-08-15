@@ -1,0 +1,1840 @@
+// src/user/aml/aml_eval.pdx — R30.M2-001 (#1054)
+//
+// AML evaluator core: the evaluation context, the bounded frame pool, the
+// ACPI §5.3 namespace walker, and the node/statement dispatchers that walk
+// the arena the R30.M1 parser built.
+//
+// PLACEMENT — CONSTITUTIONAL
+// -------------------------
+// Userspace only. See design/acpi/no-aml-in-kernel.md and the header of
+// src/user/aml/aml_lex.pdx. Parsing firmware bytecode in ring 0 would be
+// bad; RUNNING it there is the thing Pillar 3 exists to forbid.
+//
+// =====================================================================
+// WHY THE BUDGETS ARE IN THE FIRST COMMIT AND NOT THE FIFTH
+// =====================================================================
+// Parsing untrusted input can over-read, and R30.M1 answered that with a
+// single bounds-checked read path and a guard-page corpus. EVALUATING
+// untrusted input can do three further things a parser cannot:
+//
+//   * loop forever            — `While` predicates are firmware-controlled
+//                               and `While(One)` is a legal encoding
+//   * recurse without bound   — nested expressions, mutually recursive
+//                               methods
+//   * exhaust memory          — a frame per invocation, unbounded
+//
+// Each has a guard here, each has its own error code, and each has a
+// corpus fixture. They are in the FIRST evaluator commit deliberately:
+// retrofitting a fuel counter after the evaluator exists means auditing
+// every path that could loop, and the paths that get missed are exactly
+// the ones nobody thought could loop. Threading it from the start means
+// the budget is spent in ONE place — aml_eval_spend — and every future
+// opcode inherits the guarantee by construction.
+//
+//   FUEL      1 000 000 steps, default, clamped as the maximum.
+//             One step is one evaluated node or one statement or one
+//             While iteration. A `_CRS` or `_PTS` on real hardware costs
+//             a few thousand; a million bounds any single evaluation to
+//             well under a millisecond of work while making a firmware
+//             infinite loop terminate DETERMINISTICALLY rather than
+//             hanging the acpi_supervisor process. Exhaustion is
+//             AML_ERR_FUEL_EXHAUSTED (31).
+//
+//             aml_eval_set_fuel lets a caller ask for LESS (a GPE handler
+//             wants a tighter budget than a boot-time _INI sweep) but it
+//             CLAMPS to the constant above, so no caller — including a
+//             compromised one — can disable the guard by asking for more.
+//             That is why the setter exists at all and why it clamps
+//             rather than validating.
+//
+//   DEPTH     48 levels, distinct from the parser's 64. Distinct so that
+//             a depth error is unambiguously attributable to evaluation
+//             rather than to parsing, and lower because an evaluator
+//             frame is bigger than a parser frame: 48 levels of nested
+//             aml_eval_node cost about 5 KiB of native stack, which is
+//             bounded and auditable. Real firmware nests expressions
+//             fewer than twenty deep. Exhaustion is AML_ERR_EVAL_DEPTH
+//             (32), checked BEFORE the increment so the counter stays
+//             balanced on the failure path.
+//
+//   FRAMES    8, from a fixed .bss pool — 9 slots, index 0 being the "no
+//             frame" sentinel, 256 bytes each, 2304 bytes total. ACPICA's
+//             own default nesting limit is 10; shipping firmware nests
+//             three or four (a _STA calling a helper calling a field
+//             read). Exhaustion is AML_ERR_FRAME_OVERFLOW (33), never a
+//             heap grow, because "allocate more" on firmware-controlled
+//             recursion is not a mitigation, it is the attack.
+//
+// A self-recursive method trips FRAMES before DEPTH — each invocation
+// costs one frame and roughly three depth levels, so eight frames are
+// gone by depth 24. Both limits are still needed and both are still
+// separately reachable: deeply NESTED EXPRESSIONS consume depth without
+// consuming a frame at all. The corpus exercises each through the path
+// that actually reaches it.
+//
+// (I3) ERROR IS EXECUTION-BLOCKING. aml_eval_spend refuses once
+// aml_eval_err is non-zero. Because every node, every statement and every
+// While iteration spends fuel, a latched error halts evaluation
+// everywhere, immediately, without each caller having to remember to
+// check. This is the evaluator's analogue of the lexer's read-blocking
+// invariant (I2), and it is what makes "a caller that ignores an error"
+// unable to spin rather than merely unlikely to.
+//
+// =====================================================================
+// INTEGER WIDTH IS A PROPERTY OF THE TABLE, NOT OF THE MACHINE
+// =====================================================================
+// ACPI 6.5 §19.6.  AML integers are 32-BIT when the DSDT/SSDT revision
+// field is 1 and 64-bit when it is 2 or greater. This is not a detail a
+// 64-bit interpreter may ignore: on a revision-1 table `Ones` is
+// 0xFFFFFFFF, `Not(Zero)` is 0xFFFFFFFF, `Add` wraps at 2^32, and a
+// comparison against 0xFFFFFFFF must succeed. Hardcoding 64 bits mis-
+// evaluates every revision-1 table — and revision-1 tables are still
+// shipped, because iasl emits revision 1 unless told otherwise.
+//
+// The revision is therefore THREADED: aml_eval_reset takes it, it is
+// normalised to 1 or 2 (width is the only thing it drives), and it is
+// applied at exactly one choke point — aml_eval_node truncates every
+// value it returns. Because every operand of every operator is obtained
+// through aml_eval_node, and every operator result is passed through
+// aml_eval_trunc before it is stored, no arithmetic path can bypass it.
+// One choke point, not twenty-six.
+//
+// This also discharges a deferral recorded in design/acpi/aml-parser.md
+// §9: "revision-dependent truncation of OnesOp to 32 bits — R30.M2, a
+// parser that truncated would destroy information the evaluator needs."
+// The parser still stores the full 0xFFFFFFFFFFFFFFFF; the evaluator
+// truncates on read, so the same parse tree serves both revisions.
+//
+// =====================================================================
+// NAMESPACE RESOLUTION — ACPI 6.5 §5.3, AND WHY ABSOLUTE PATHS
+// =====================================================================
+// The arena is a SYNTAX tree. The ACPI namespace is not: `Scope(\_SB.PCI0)`
+// written at the top of a table is lexically a child of the root but
+// namespace-wise lives two levels down, and a `Name(FOO,1)` inside it is
+// `\_SB.PCI0.FOO`. Resolving names by walking the lexical child lists
+// therefore gives WRONG ANSWERS — not misses, wrong answers — and a wrong
+// resolution silently drives the wrong hardware.
+//
+// So resolution is defined over ABSOLUTE PATHS, which are computable from
+// the syntax tree with no lookup at all:
+//
+//   abspath(node) = fold over the node's ancestor chain, root first:
+//     for each ancestor that NAMES a namespace object, apply its own
+//     NameString to the path so far — a '\' prefix resets it to empty,
+//     each '^' pops one segment, and every NameSeg is appended.
+//
+// A node "names a namespace object" per aml_eval_names. The predicate is
+// not "has a name_ref": several kinds carry a name_ref that is a
+// REFERENCE rather than a declaration, and including them would corrupt
+// every path underneath.
+//
+//   FIELD / INDEXFIELD / BANKFIELD carry the REGION's name. Their
+//     FIELD_ELEM children live in the scope containing the Field
+//     declaration, not under the region — so these three are
+//     name-transparent, and a field element's path skips them.
+//   CALL carries the CALLEE's name; a call site declares nothing.
+//   NAMEREF, FIELD_LINK, FIELD_CONNECT are references by construction.
+//
+// Getting that list wrong is the single most consequential mistake in
+// this file, which is why it is a table with a stated reason per row
+// rather than a "has a name" test.
+//
+// THE SEARCH RULE
+// ---------------
+// §5.3 defines four cases and they are NOT interchangeable:
+//
+//   \FOO.BAR   root-anchored — resolved from the root, absolutely. The
+//              current scope is irrelevant even if it contains a BAR.
+//   ^^FOO      parent-prefixed — pop N levels from the current scope,
+//              then resolve the segments EXACTLY. No search.
+//   FOO.BAR    multi-segment relative — resolved relative to the current
+//              scope ONLY. No search. (This is the case implementations
+//              most often get wrong by searching upward anyway.)
+//   FOO        single NameSeg — and ONLY this case gets the search rule:
+//              try the current scope, then its parent, then its parent,
+//              up to the root; first match wins.
+//
+// The search is implemented by noticing that the target segment is always
+// the LAST element of the candidate path, so popping a scope level means
+// deleting the second-to-last element. That makes the whole rule four
+// lines rather than a re-derivation per level.
+//
+// Popping more '^' levels than the scope has is AML_ERR_BAD_PARENT_PREFIX
+// (39) — a malformed path, not a miss, and worth its own code because the
+// operator response differs.
+//
+// COMPLEXITY, STATED
+// ------------------
+// aml_eval_find is a linear scan of the node arena and recomputes each
+// candidate's absolute path, so a lookup is O(nodes x depth) and a
+// searched lookup multiplies that by the scope depth. At the 512-node
+// fixture scale of this milestone that is nothing. It is the SAME scan
+// design/acpi/aml-parser.md §6a already flagged for replacement by a
+// sorted final-NameSeg index when the arena is grown for a real DSDT;
+// both callers want the same index, so they should be replaced together
+// and are noted here so they are.
+//
+// =====================================================================
+// FRAME LAYOUT — 7 ARGS AND 8 LOCALS, PER THE SPEC
+// =====================================================================
+// ACPI 6.5 §20.2.6.2 defines Arg0..Arg6 (SEVEN) and Local0..Local7
+// (EIGHT). The counts are asymmetric and they are not a choice: the
+// opcode space allocates 0x68..0x6E to args and 0x60..0x67 to locals, and
+// src/user/aml/aml_optab.pdx already encodes exactly that. Both are
+// FIXED — AML has no dynamic locals — so the pool is statically sized and
+// an out-of-range slot index is AML_ERR_BAD_SLOT (37) rather than a
+// growth.
+//
+//   frame[f] +0    method node index
+//            +8    caller frame index (0 = outermost)
+//            +16   declared argument count
+//            +24   reserved
+//            +64   Arg0..Arg6      (7 slots)
+//            +128  Local0..Local7  (8 slots)
+//            +192  reserved — #1058 will tag slots that hold object
+//                  references rather than integers, without restriding
+//
+// 256 bytes per frame, so frame f is at pool + (f << 8): one shift, no
+// multiply, and the reserved tail is what keeps it that way when #1058
+// needs per-slot type tags.
+//
+// FRAMES ARE ISOLATED BY CONSTRUCTION. aml_frame_push ZEROES all 32 slots
+// before the frame becomes current, so a callee's Local0 starts at Zero
+// (which §19.6 requires) and cannot observe the caller's. The caller's
+// frame is untouched throughout — the only link between them is the
+// caller index in slot 1, which is data, not aliasing.
+//
+// ARGUMENTS ARE EVALUATED IN THE CALLER'S FRAME. aml_eval_call evaluates
+// every argument expression onto the NATIVE stack first, and only then
+// pushes the callee frame and binds them. Doing it the other way round —
+// push, then evaluate into the new frame — would evaluate `FOO(Local0)`
+// against the callee's freshly-zeroed Local0 and pass Zero. It would also
+// make a nested call inside an argument collide with the half-built
+// frame. The scratch buffer is the fix for both, and it is why the order
+// in aml_eval_call is written out step by step.
+//
+// =====================================================================
+// ERROR CODES ADDED HERE (the taxonomy continues at 31)
+// =====================================================================
+//   31 AML_ERR_FUEL_EXHAUSTED     step budget spent
+//   32 AML_ERR_EVAL_DEPTH         evaluator recursion past 48
+//   33 AML_ERR_FRAME_OVERFLOW     method nesting past 8
+//   34 AML_ERR_DIVIDE_BY_ZERO     Divide/Mod with a zero divisor (#1055)
+//   35 AML_ERR_NOT_EVALUABLE      node kind or opcode not evaluated yet
+//   36 AML_ERR_NAME_NOT_FOUND     resolution found no declaration
+//   37 AML_ERR_BAD_SLOT           ArgX/LocalX index out of range
+//   38 AML_ERR_NAME_TOO_DEEP      path longer than 16 segs / chain > 64
+//   39 AML_ERR_BAD_PARENT_PREFIX  more '^' than the scope has levels
+//   40 AML_ERR_NO_FRAME           ArgX/LocalX with no active frame
+//   41 AML_ERR_BAD_TARGET         store destination is not storable
+//
+// DELIBERATELY NOT EVALUATED HERE
+// -------------------------------
+// Strings, Buffers, Packages and references are AML_ERR_NOT_EVALUABLE
+// (35), not silently coerced to zero. #1056 adds string/buffer ops,
+// #1057 adds Package/Index/DerefOf and the reference-typed store, #1058
+// argument promotion, #1059 Notify. An ALIAS resolves — the walker
+// returns the ALIAS node — but READING through one is #1057's job, so it
+// is refused rather than half-followed. Refusing is the whole discipline
+// of this subsystem: a wrong value is worse than no value.
+
+module AmlEval = structure {
+
+  // ==========================================================================
+  // Private storage. Confined to this object by tools/verify-aml-parser.sh,
+  // in the same way and for the same reason as aml_lex_state.
+  //
+  //   aml_eval_state  +0   magic (0x45414D4C once reset)
+  //                   +8   fuel remaining
+  //                   +16  evaluation depth
+  //                   +24  current frame index (0 = none)
+  //                   +32  current scope node
+  //                   +40  table revision, normalised to 1 or 2
+  //                   +48  pending return value
+  //                   +56  fuel budget as set
+  //                   +64  path-buffer A length
+  //                   +72  path-buffer B length
+  //                   +80  reserved
+  //                   +88  evaluation error code (per session)
+  //                   +96..127 reserved
+  // ==========================================================================
+  pub let mut aml_eval_state  : [u64; 16]  = uninit @align(8)
+  pub let mut aml_frame_pool  : [u64; 288] = uninit @align(8)
+  pub let mut aml_path_buf    : [u64; 32]  = uninit @align(8)
+  pub let mut aml_path_anc    : [u64; 64]  = uninit @align(8)
+
+  // ==========================================================================
+  // Context lifecycle.
+  // ==========================================================================
+
+  pub let aml_eval_reset : (u64) -> () !{mem} @{} =
+    fn (revision: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): begin an evaluation session over an already-parsed arena. rdi = the DSDT/SSDT header Revision field. Fuel goes to the 1000000 maximum, depth and frame top to zero, scope to node 1 (the synthetic ROOT the parser always allocates first), retval to zero. The revision is NORMALISED to 1 or 2 rather than stored raw because integer width is the only thing it drives and every later test is then a single compare against 1 -- a raw 5 stored here would otherwise have to be re-interpreted at each use, which is where a hardcoded 64 sneaks back in. Revision 0 is treated as 1: a table claiming revision 0 predates the 64-bit integer definition, so the narrow interpretation is the safe one. THE ERROR SLOT IS SEEDED FROM THE PARSE LATCH, which is the whole reason the evaluator has a slot of its own. Evaluation is per-invocation and parsing is per-table: sharing one first-writer-wins slot would mean the first method to exhaust its fuel or hit an unimplemented opcode permanently blocked every LATER evaluation of the same table, so acpi_supervisor could evaluate exactly one method per boot. Seeding rather than merely clearing keeps the other half of the guarantee: a table that failed to PARSE starts its session already-failed, so every aml_eval_spend refuses immediately and a caller who forgot to check the parse result cannot evaluate a broken arena. Reserved labels: aml_evr_.",
+      block: {
+        call aml_lex_err;                // THE parse latch, deliberately
+        lea rcx, [rip + aml_eval_state];
+        mov [rcx + 88], rax;             // seed from the parse latch
+        mov rax, 1000000;
+        mov [rcx + 8], rax;              // fuel remaining
+        mov [rcx + 56], rax;             // budget as set
+        xor rax, rax;
+        mov [rcx + 16], rax;             // depth
+        mov [rcx + 24], rax;             // frame top
+        mov [rcx + 48], rax;             // retval
+        mov [rcx + 64], rax;             // path A length
+        mov [rcx + 72], rax;             // path B length
+        mov rax, 1;
+        mov [rcx + 32], rax;             // scope = ROOT
+        mov rax, rdi;
+        cmp rax, 2;
+        jb aml_evr_narrow;
+        mov rax, 2;
+        jmp aml_evr_setrev;
+      aml_evr_narrow:
+        mov rax, 1;
+      aml_evr_setrev:
+        mov [rcx + 40], rax;
+        mov rax, 0x45414D4C;
+        mov [rcx + 0], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_set_fuel : (u64) -> u64 !{mem} @{} =
+    fn (budget: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): narrow the step budget for this evaluation and return the effective value. CLAMPED to [1, 1000000]. The clamp is the point of the function: a caller may want a tighter budget than the default -- a GPE handler running at interrupt time is not a boot-time _INI sweep -- but no caller may RAISE the ceiling, so the termination guarantee does not depend on any caller behaving. A zero request is clamped up to 1 rather than accepted, because a zero budget would make the very first spend fail and report FUEL_EXHAUSTED for an evaluation that never started, which is a confusing diagnostic for what is really a caller bug. Reserved labels: aml_evsf_.",
+      block: {
+        mov rax, rdi;
+        cmp rax, 0;
+        jne aml_evsf_hi;
+        mov rax, 1;
+      aml_evsf_hi:
+        mov rcx, 1000000;
+        cmp rax, rcx;
+        jbe aml_evsf_set;
+        mov rax, rcx;
+      aml_evsf_set:
+        lea rcx, [rip + aml_eval_state];
+        mov [rcx + 8], rax;
+        mov [rcx + 56], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): the evaluation session's latched error code, 0 when nothing has gone wrong. Distinct from aml_lex_err because the two have different lifetimes -- one per table, one per invocation -- and codes 31..41 continue the same taxonomy so a code still identifies its origin unambiguously. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 88];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_set_err : (u64) -> u64 !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): latch an evaluation error, FIRST WRITER WINS, and return the code now in force. Same discipline as aml_lex_set_err and for the same reason: a caller that does not check propagates a cascade of secondary failures, and the code worth keeping is the one that describes the original fault rather than the last consequence of it. A fuel exhaustion that follows a genuine NOT_EVALUABLE therefore reports the NOT_EVALUABLE. No byte offset is recorded: an evaluation fault localises to an arena NODE rather than to a buffer position, and stamping the current node on every latch would mean a store per evaluated node inside the fuel loop. Node-level localisation is a later refinement, noted rather than half-built. Reserved labels: aml_evse_.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 88];
+        cmp rax, 0;
+        jne aml_evse_out;
+        mov [rcx + 88], rdi;
+        mov rax, rdi;
+      aml_evse_out:
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_fuel : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): remaining step budget. Leaf accessor; the corpus asserts it strictly decreases and reaches exactly zero on the While(One) fixture. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_budget : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): the budget as it was set, so a caller can report 'spent N of M' rather than only 'exhausted'. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 56];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_depth : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): current evaluation depth. The corpus asserts this unwinds to zero after every fixture, accepted and refused alike -- an unbalanced counter would make the depth guard progressively tighter across evaluations and eventually refuse a legal table. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_frames : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): index of the current frame, which because frames are allocated contiguously from 1 is also the number of frames in use. Zero means no method is executing. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_scope : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): the node whose namespace scope names are currently resolved against. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_set_scope : (u64) -> () !{mem} @{} =
+    fn (node: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): set the current namespace scope. Used by aml_eval_call, which saves the caller's scope, switches to the callee's METHOD node for the duration of the body and restores it afterwards -- a method body resolves names against the method, per ACPI 6.5 §5.3, not against wherever the call was written. Leaf mutator. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov [rcx + 32], rdi;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_revision : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): the normalised table revision, 1 or 2. Also the value RevisionOp evaluates to. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_retval : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): the value the most recent Return statement produced. Read by aml_eval_call immediately after the body returns control 1 and before anything else can run, so a nested call cannot have overwritten it. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 48];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Integer width — ACPI 6.5 §19.6.
+  // ==========================================================================
+
+  pub let aml_eval_width : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): 32 on a revision-1 table, 64 otherwise. Used by the shift operators, which must produce zero when the shift count reaches the width -- x86 MASKS the count to 63 (or 31), so `ShiftLeft(One, 64)` computed with a bare shl yields One rather than Zero. That is a real mis-evaluation, and it is why the width is a value here rather than an assumption there. Reserved labels: aml_evw_.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 40];
+        cmp rax, 1;
+        jne aml_evw_wide;
+        mov rax, 32;
+        ret;
+      aml_evw_wide:
+        mov rax, 64;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_ones : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): the all-ones value at the current integer width -- 0xFFFFFFFF on a revision-1 table, 0xFFFFFFFFFFFFFFFF otherwise. This is what every logical operator returns for TRUE per ACPI 6.5 §19.6.72, and it is the value OnesOp denotes. Built with xor+not rather than a 64-bit immediate so no movabs encoding is required. Reserved labels: aml_evo_.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 40];
+        cmp rax, 1;
+        jne aml_evo_wide;
+        mov rax, 0xFFFFFFFF;
+        ret;
+      aml_evo_wide:
+        xor rax, rax;
+        not rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_trunc : (u64) -> u64 !{mem} @{} =
+    fn (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): truncate rdi to the table's integer width. THE choke point for revision-dependent semantics: aml_eval_node passes every value it returns through here, so every operand of every operator arrives already narrowed, and aml_arith passes every result through here before storing it. Two applications, both mandatory, and no third place where a 64-bit value can leak into a 32-bit table. The mask is materialised in a register because AND r64,imm32 sign-extends and an immediate 0xFFFFFFFF would be a no-op. Reserved labels: aml_evt_.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 40];
+        cmp rax, 1;
+        jne aml_evt_wide;
+        mov rcx, 0xFFFFFFFF;
+        mov rax, rdi;
+        and rax, rcx;
+        ret;
+      aml_evt_wide:
+        mov rax, rdi;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // The three budgets.
+  // ==========================================================================
+
+  pub let aml_eval_spend : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): consume one step of the fuel budget. Returns 1 when the step is granted and 0 when it is not. TWO refusals, and both matter. (1) Fuel at zero latches AML_ERR_FUEL_EXHAUSTED (31) -- this is what makes While(One) terminate instead of hanging the acpi_supervisor process. (2) An already-latched EVALUATION error refuses too, WITHOUT consuming fuel: because every node, every statement and every While iteration passes through here, one check makes a latched error halt evaluation everywhere immediately, so a caller that forgets to test cannot spin. That is invariant (I3) in the file header, and it is the reason this function -- not each loop -- owns the check. aml_eval_set_err is first-writer-wins, so a fuel exhaustion that follows a real fault reports the real fault. The slot read here is the EVALUATION slot, seeded from the parse latch by aml_eval_reset -- so a table that failed to parse cannot be evaluated at all, while a method that exhausted its fuel does not poison the next method's session. Reserved labels: aml_evsp_.",
+      block: {
+        call aml_eval_err;
+        cmp rax, 0;
+        jne aml_evsp_blocked;
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 8];
+        cmp rax, 0;
+        je aml_evsp_dry;
+        sub rax, 1;
+        mov [rcx + 8], rax;
+        mov rax, 1;
+        ret;
+      aml_evsp_dry:
+        mov rdi, 31;                     // AML_ERR_FUEL_EXHAUSTED
+        call aml_eval_set_err;
+      aml_evsp_blocked:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_enter : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): take one level of evaluation depth, budget 48. Returns 1 on success, 0 having latched AML_ERR_EVAL_DEPTH (32). The test is BEFORE the increment, so a refused enter leaves the counter untouched and its matching leave is never issued -- the same discipline as aml_lex_depth_enter, and the reason the corpus can assert depth == 0 after a refused evaluation as strongly as after an accepted one. Distinct from fuel: fuel bounds total work, depth bounds native stack, and a table can exhaust either without approaching the other. Reserved labels: aml_eve_.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 16];
+        cmp rax, 48;
+        jae aml_eve_deep;
+        add rax, 1;
+        mov [rcx + 16], rax;
+        mov rax, 1;
+        ret;
+      aml_eve_deep:
+        mov rdi, 32;                     // AML_ERR_EVAL_DEPTH
+        call aml_eval_set_err;
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_leave : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): release one level of evaluation depth. Clamped at zero so an unbalanced leave cannot wrap the counter to 2^64-1, which would silently disable the depth guard for the remainder of the session -- the failure mode of an underflowing guard is that it stops guarding. Reserved labels: aml_evl_.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 16];
+        cmp rax, 0;
+        je aml_evl_out;
+        sub rax, 1;
+        mov [rcx + 16], rax;
+      aml_evl_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // The frame pool.
+  // ==========================================================================
+
+  pub let aml_frame_push : (u64) -> u64 !{mem} @{} =
+    fn (method_node: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): allocate the next frame for an invocation of METHOD node rdi and make it current. Returns the frame index, or 0 having latched AML_ERR_FRAME_OVERFLOW (33) when all 8 are in use. Frames come from a fixed .bss pool and exhaustion is an ERROR, never a grow: 'allocate more' under firmware-controlled recursion is not a mitigation. All 32 slots are ZEROED before the frame becomes current, which is what makes frames isolated -- a callee's Local0 starts at Zero as ACPI 6.5 §19.6 requires and cannot observe the caller's, and the caller's frame is never written. Slot 1 records the caller index so pop is O(1) and the chain is data rather than aliasing. The stride is 256 bytes so the base is one shl 8, and the reserved tail above +192 is what lets #1058 add per-slot reference tags without restriding. Locals: r12=method node, r13=caller index, r14=new index, r15=frame base. Reserved labels: aml_fp_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rdi;
+        lea rcx, [rip + aml_eval_state];
+        mov r13, [rcx + 24];             // caller frame
+        mov rax, r13;
+        add rax, 1;
+        cmp rax, 8;
+        ja aml_fp_full;
+        mov r14, rax;
+        lea rcx, [rip + aml_frame_pool];
+        mov r15, r14;
+        shl r15, 8;                      // frame index * 256
+        add r15, rcx;
+        xor rax, rax;
+        xor rcx, rcx;
+      aml_fp_zero:
+        mov [r15 + rcx*8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb aml_fp_zero;
+        mov [r15 + 0], r12;              // method node
+        mov [r15 + 8], r13;              // caller frame
+        lea rcx, [rip + aml_eval_state];
+        mov [rcx + 24], r14;
+        mov rax, r14;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+      aml_fp_full:
+        mov rdi, 33;                     // AML_ERR_FRAME_OVERFLOW
+        call aml_eval_set_err;
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_frame_pop : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): make the caller's frame current again. The popped frame's contents are left in place rather than cleared, because the next push zeroes before use and clearing twice would be work for no invariant. A pop with no frame current is a no-op rather than an underflow, so an unbalanced call path degrades to 'no frame' -- which ArgX and LocalX then refuse with AML_ERR_NO_FRAME (40) -- instead of indexing outside the pool. Reserved labels: aml_fq_.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 24];
+        cmp rax, 0;
+        je aml_fq_out;
+        lea rdx, [rip + aml_frame_pool];
+        shl rax, 8;
+        add rax, rdx;
+        mov rax, [rax + 8];              // caller index
+        mov [rcx + 24], rax;
+      aml_fq_out:
+        ret
+      }
+    } @no_frame
+
+  pub let aml_frame_method : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): the METHOD node the current frame is executing, 0 when no method is executing. Diagnostic accessor -- the corpus uses it to prove a callee's frame really is a different frame and not the caller's re-labelled. Reserved labels: aml_fm_.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 24];
+        cmp rax, 0;
+        je aml_fm_none;
+        lea rdx, [rip + aml_frame_pool];
+        shl rax, 8;
+        add rax, rdx;
+        mov rax, [rax + 0];
+        ret;
+      aml_fm_none:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_frame_arg : (u64) -> u64 !{mem} @{} =
+    fn (i: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): read Arg[rdi] of the current frame. SEVEN args, per ACPI 6.5 §20.2.6.2 -- the opcode space allocates 0x68..0x6E and there is no Arg7. An index of 7 or more is AML_ERR_BAD_SLOT (37); no active frame is AML_ERR_NO_FRAME (40). Two codes rather than one because they mean different things to an operator: the first is a corrupt or mis-decoded opcode, the second is an ArgX evaluated outside any method, which is a table bug. Bounds are checked before the address is formed. Reserved labels: aml_fga_.",
+      block: {
+        cmp rdi, 7;
+        jae aml_fga_slot;
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 24];
+        cmp rax, 0;
+        je aml_fga_noframe;
+        lea rdx, [rip + aml_frame_pool];
+        shl rax, 8;
+        add rax, rdx;
+        add rax, 64;                     // Arg0 base
+        mov rax, [rax + rdi*8];
+        ret;
+      aml_fga_slot:
+        mov rdi, 37;                     // AML_ERR_BAD_SLOT
+        call aml_eval_set_err;
+        xor rax, rax;
+        ret;
+      aml_fga_noframe:
+        mov rdi, 40;                     // AML_ERR_NO_FRAME
+        call aml_eval_set_err;
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_frame_set_arg : (u64, u64) -> u64 !{mem} @{} =
+    fn (i: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): write Arg[rdi] of the current frame. Returns 1 on success, 0 having latched. Writable because ACPI permits ArgX as a Store target (§19.6.126 -- it is unusual but legal, and refusing it would refuse real tables). Same seven-slot bound and same two failure codes as aml_frame_arg. Reserved labels: aml_fsa_.",
+      block: {
+        cmp rdi, 7;
+        jae aml_fsa_slot;
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 24];
+        cmp rax, 0;
+        je aml_fsa_noframe;
+        lea rdx, [rip + aml_frame_pool];
+        shl rax, 8;
+        add rax, rdx;
+        add rax, 64;
+        mov [rax + rdi*8], rsi;
+        mov rax, 1;
+        ret;
+      aml_fsa_slot:
+        mov rdi, 37;                     // AML_ERR_BAD_SLOT
+        call aml_eval_set_err;
+        xor rax, rax;
+        ret;
+      aml_fsa_noframe:
+        mov rdi, 40;                     // AML_ERR_NO_FRAME
+        call aml_eval_set_err;
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_frame_local : (u64) -> u64 !{mem} @{} =
+    fn (i: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): read Local[rdi] of the current frame. EIGHT locals, per ACPI 6.5 §20.2.6.2 -- opcodes 0x60..0x67. The count is deliberately NOT the same as the argument count; the asymmetry is in the spec and in aml_optab.pdx, and evening it up to seven would refuse Local7, which real tables use. Same bound-then-address discipline and the same two failure codes as the argument accessors. Reserved labels: aml_fgl_.",
+      block: {
+        cmp rdi, 8;
+        jae aml_fgl_slot;
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 24];
+        cmp rax, 0;
+        je aml_fgl_noframe;
+        lea rdx, [rip + aml_frame_pool];
+        shl rax, 8;
+        add rax, rdx;
+        add rax, 128;                    // Local0 base
+        mov rax, [rax + rdi*8];
+        ret;
+      aml_fgl_slot:
+        mov rdi, 37;                     // AML_ERR_BAD_SLOT
+        call aml_eval_set_err;
+        xor rax, rax;
+        ret;
+      aml_fgl_noframe:
+        mov rdi, 40;                     // AML_ERR_NO_FRAME
+        call aml_eval_set_err;
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_frame_set_local : (u64, u64) -> u64 !{mem} @{} =
+    fn (i: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): write Local[rdi] of the current frame. Returns 1 on success, 0 having latched. This is the write the frame-isolation fixture turns on: a callee writing Local0 must not disturb its caller's, and it cannot, because the write is indexed off the CURRENT frame base and aml_frame_push zeroed that frame before it became current. Reserved labels: aml_fsl_.",
+      block: {
+        cmp rdi, 8;
+        jae aml_fsl_slot;
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 24];
+        cmp rax, 0;
+        je aml_fsl_noframe;
+        lea rdx, [rip + aml_frame_pool];
+        shl rax, 8;
+        add rax, rdx;
+        add rax, 128;
+        mov [rax + rdi*8], rsi;
+        mov rax, 1;
+        ret;
+      aml_fsl_slot:
+        mov rdi, 37;                     // AML_ERR_BAD_SLOT
+        call aml_eval_set_err;
+        xor rax, rax;
+        ret;
+      aml_fsl_noframe:
+        mov rdi, 40;                     // AML_ERR_NO_FRAME
+        call aml_eval_set_err;
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Namespace walker — ACPI 6.5 §5.3.
+  // ==========================================================================
+
+  pub let aml_eval_names : (u64) -> u64 !{} @{} =
+    fn (kind: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R30.M2-001 (#1054): does a node of this kind CONTRIBUTE ITS NAME to the namespace, i.e. is it a declaration whose NameString is a path component? The set is SCOPE 2, DEVICE 3, METHOD 4, NAME 5, ALIAS 6, PROCESSOR 7, POWERRES 8, THERMALZONE 9, OPREGION 10, FIELD_ELEM 14, EXTERNAL 15, MUTEX 17, EVENT 18 -- packed as bitmask 0x0006C7FC and tested with one shift. The predicate is NOT 'has a name_ref', and that distinction is the most consequential thing in this file. FIELD 11, INDEXFIELD 12 and BANKFIELD 13 carry the REGION's name, not their own: their FIELD_ELEM children live in the scope containing the Field declaration, so all three must be name-TRANSPARENT or every field element would resolve under a path that does not exist. CALL 23 carries the CALLEE's name; a call site declares nothing, and counting it would let a call be found as a declaration. NAMEREF 38, FIELD_LINK 19 and FIELD_CONNECT 22 are references by construction. ROOT 1 is excluded because it is the empty path, not a segment. Reserved labels: aml_evn_.",
+      block: {
+        cmp rdi, 19;
+        jae aml_evn_no;
+        mov rax, 0x0006C7FC;
+        mov rcx, rdi;
+        shr rax, cl;
+        and rax, 1;
+        ret;
+      aml_evn_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_abspath : (u64, u64) -> u64 !{mem} @{} =
+    fn (node: u64) (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): compute the ABSOLUTE namespace path of arena node rdi into path buffer rsi (0 = A, 1 = B) and record its segment count in aml_eval_state. Returns 1 on success, 0 having latched. Why absolute paths at all: the arena is a SYNTAX tree, and Scope(\\_SB.PCI0) written at the top of a table is lexically a child of the root while namespace-wise it lives two levels down. Resolving by walking lexical child lists therefore produces WRONG ANSWERS rather than misses, and a wrong resolution silently drives the wrong hardware. An absolute path is computable from the syntax tree with no lookup at all, which is what breaks the circularity. Two phases: (1) walk the parent chain into aml_path_anc, bounded at 64 -- the parser's own nesting limit -- so a cycle or an absurd tree cannot spin; (2) replay it root-first, and for each ancestor that aml_eval_names accepts apply its own NameString: a '\\' prefix RESETS the path to empty, each '^' pops one segment, then every NameSeg is appended. Ancestors the predicate rejects are skipped entirely, which is what makes a FIELD's region name absent from its elements' paths. Overflow of the 16-segment buffer is AML_ERR_NAME_TOO_DEEP (38); popping past the root is AML_ERR_BAD_PARENT_PREFIX (39). Locals: r12=which, r13=replay index, r14=path length, r15=name_ref; [rsp+0]=ancestor count, [rsp+8]=segment index, [rsp+16]=segment count, [rsp+24]=scratch. Reserved labels: aml_evap_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 32;
+        mov r12, rsi;                    // which buffer
+        // ---- phase 1: collect the ancestor chain, node first ----
+        xor rax, rax;
+        mov [rsp + 0], rax;              // count
+        mov r13, rdi;                    // walker
+      aml_evap_up:
+        cmp r13, 0;
+        je aml_evap_replay;
+        mov rax, [rsp + 0];
+        cmp rax, 64;
+        jae aml_evap_toodeep;
+        lea rcx, [rip + aml_path_anc];
+        mov [rcx + rax*8], r13;
+        add rax, 1;
+        mov [rsp + 0], rax;
+        mov rdi, r13;
+        call aml_node_parent;
+        mov r13, rax;
+        jmp aml_evap_up;
+        // ---- phase 2: replay root-first ----
+      aml_evap_replay:
+        xor r14, r14;                    // path length
+        mov r13, [rsp + 0];              // index, walked down from count
+      aml_evap_next:
+        cmp r13, 0;
+        je aml_evap_done;
+        sub r13, 1;
+        lea rcx, [rip + aml_path_anc];
+        mov rdi, [rcx + r13*8];
+        mov [rsp + 24], rdi;             // this ancestor
+        call aml_node_kind;
+        mov rdi, rax;
+        call aml_eval_names;
+        cmp rax, 0;
+        je aml_evap_next;                // name-transparent: skip entirely
+        mov rdi, [rsp + 24];
+        call aml_node_name;
+        mov r15, rax;
+        cmp r15, 0;
+        je aml_evap_next;
+        mov rdi, r15;
+        call aml_name_root;
+        cmp rax, 0;
+        je aml_evap_carats;
+        xor r14, r14;                    // '\' resets to the root
+        jmp aml_evap_segs;
+      aml_evap_carats:
+        mov rdi, r15;
+        call aml_name_carats;
+        cmp rax, r14;
+        ja aml_evap_badcarat;            // more '^' than levels
+        sub r14, rax;
+      aml_evap_segs:
+        mov rdi, r15;
+        call aml_name_segcount;
+        mov [rsp + 16], rax;
+        xor rax, rax;
+        mov [rsp + 8], rax;
+      aml_evap_seg:
+        mov rax, [rsp + 8];
+        mov rcx, [rsp + 16];
+        cmp rax, rcx;
+        jae aml_evap_next;
+        cmp r14, 16;
+        jae aml_evap_toodeep;
+        mov rdi, r15;
+        mov rsi, [rsp + 8];
+        call aml_name_seg;
+        lea rcx, [rip + aml_path_buf];
+        mov r8, r12;
+        shl r8, 7;                       // buffer B is 16 slots along
+        add r8, rcx;
+        mov [r8 + r14*8], rax;
+        add r14, 1;
+        mov rax, [rsp + 8];
+        add rax, 1;
+        mov [rsp + 8], rax;
+        jmp aml_evap_seg;
+      aml_evap_done:
+        lea rcx, [rip + aml_eval_state];
+        mov r8, r12;
+        shl r8, 3;
+        add r8, rcx;
+        mov [r8 + 64], r14;              // length of buffer A or B
+        mov rax, 1;
+        jmp aml_evap_ret;
+      aml_evap_toodeep:
+        mov rdi, 38;                     // AML_ERR_NAME_TOO_DEEP
+        call aml_eval_set_err;
+        xor rax, rax;
+        jmp aml_evap_ret;
+      aml_evap_badcarat:
+        mov rdi, 39;                     // AML_ERR_BAD_PARENT_PREFIX
+        call aml_eval_set_err;
+        xor rax, rax;
+      aml_evap_ret:
+        add rsp, 32;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_path_len : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): the segment count aml_eval_abspath last wrote into buffer rdi (0 = A, 1 = B). Exported because the absolute path is the whole basis of resolution and 'the walker computed the path I think it did' is otherwise unassertable from outside -- the corpus uses it to pin that a name-transparent node really does inherit its parent's path rather than adding a component. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_eval_state];
+        mov rax, rdi;
+        and rax, 1;
+        shl rax, 3;
+        add rax, rcx;
+        mov rax, [rax + 64];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_find : (u64) -> u64 !{mem} @{} =
+    fn (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): find the declaration whose absolute path is the first rdi segments of path buffer A. Returns the node index, or 0 WITHOUT latching -- a miss is not a fault here, because the §5.3 search rule probes several paths and only the last miss is an error. Candidates are restricted to nodes aml_eval_names accepts with a non-zero name_ref, so a CALL site or a Field's region reference can never be mistaken for a declaration. The scan is linear over the arena and recomputes each candidate's path into buffer B, making a lookup O(nodes x depth); at 512-node fixture scale that is nothing, and it is the same linear scan design/acpi/aml-parser.md §6a already earmarks for replacement by a sorted final-NameSeg index when the arena grows -- both callers want that index, so they should be replaced together. FIRST match wins, i.e. the earliest declaration, which is also the one aml_term_lookup would have used. Locals: r12=target length, r13=scan index, r14=node count, r15=comparison index. Reserved labels: aml_evf_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rdi;
+        call aml_node_count;
+        mov r14, rax;
+        mov r13, 1;
+      aml_evf_scan:
+        cmp r13, r14;
+        jae aml_evf_none;
+        mov rdi, r13;
+        call aml_node_kind;
+        mov rdi, rax;
+        call aml_eval_names;
+        cmp rax, 0;
+        je aml_evf_next;
+        mov rdi, r13;
+        call aml_node_name;
+        cmp rax, 0;
+        je aml_evf_next;
+        mov rdi, r13;
+        mov rsi, 1;                      // candidate path into buffer B
+        call aml_eval_abspath;
+        cmp rax, 0;
+        je aml_evf_none;                 // malformed declaration; latched
+        lea rcx, [rip + aml_eval_state];
+        mov rax, [rcx + 72];             // buffer B length
+        cmp rax, r12;
+        jne aml_evf_next;
+        xor r15, r15;
+      aml_evf_cmp:
+        cmp r15, r12;
+        jae aml_evf_hit;
+        lea rcx, [rip + aml_path_buf];
+        mov rax, [rcx + r15*8];          // buffer A — the target
+        add rcx, 128;                    // buffer B starts 16 slots along
+        mov rdx, [rcx + r15*8];          // buffer B — this candidate
+        cmp rax, rdx;
+        jne aml_evf_next;
+        add r15, 1;
+        jmp aml_evf_cmp;
+      aml_evf_hit:
+        mov rax, r13;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+      aml_evf_next:
+        add r13, 1;
+        jmp aml_evf_scan;
+      aml_evf_none:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_resolve : (u64, u64) -> u64 !{mem} @{} =
+    fn (scope: u64) (name_ref: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): resolve name-arena entry rsi against scope node rdi per ACPI 6.5 §5.3, returning the declaration's node index or 0 having latched AML_ERR_NAME_NOT_FOUND (36). The four cases are NOT interchangeable and conflating them is a correctness bug that does not announce itself. A '\\'-anchored name resolves from the ROOT, and the current scope is irrelevant even when it contains a matching name. A '^'-prefixed name pops that many levels from the current scope and then resolves EXACTLY -- no search. A multi-segment relative name resolves against the current scope ONLY; implementations most often get this one wrong by searching upward anyway, which finds a plausible object under a different device. And ONLY a bare single NameSeg gets the search rule: current scope, then each parent, up to the root, first match winning. The search itself is four instructions rather than a re-derivation per level, because the target segment is always the LAST element of the candidate path, so ascending one scope level is exactly 'delete the second-to-last element' -- the loop overwrites A[len-2] with A[len-1] and shortens. Termination is monotone: the length strictly decreases and the root-level probe (length 1) is the last one tried. Popping more '^' than the scope has levels is AML_ERR_BAD_PARENT_PREFIX (39), a malformed path rather than a miss. Locals: r12=scope, r13=name_ref, r14=path length, r15=segment count; [rsp+0]=root flag, [rsp+8]=carat count, [rsp+16]=segment index, [rsp+24]=scratch. Reserved labels: aml_evrs_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 32;
+        mov r12, rdi;
+        mov r13, rsi;
+        cmp r13, 0;
+        je aml_evrs_miss;
+        mov rdi, r13;
+        call aml_name_segcount;
+        mov r15, rax;
+        cmp r15, 0;
+        je aml_evrs_miss;                // NullName names nothing
+        mov rdi, r13;
+        call aml_name_root;
+        mov [rsp + 0], rax;
+        mov rdi, r13;
+        call aml_name_carats;
+        mov [rsp + 8], rax;
+        // ---- establish the base path ----
+        mov rax, [rsp + 0];
+        cmp rax, 0;
+        je aml_evrs_relative;
+        xor r14, r14;                    // root-anchored: base is empty
+        jmp aml_evrs_append;
+      aml_evrs_relative:
+        mov rdi, r12;
+        xor rsi, rsi;                    // scope path into buffer A
+        call aml_eval_abspath;
+        cmp rax, 0;
+        je aml_evrs_fail;
+        lea rcx, [rip + aml_eval_state];
+        mov r14, [rcx + 64];
+        mov rax, [rsp + 8];
+        cmp rax, 0;
+        je aml_evrs_append;
+        cmp rax, r14;
+        ja aml_evrs_badcarat;
+        sub r14, rax;
+        // ---- append the name's own segments ----
+      aml_evrs_append:
+        xor rax, rax;
+        mov [rsp + 16], rax;
+      aml_evrs_seg:
+        mov rax, [rsp + 16];
+        cmp rax, r15;
+        jae aml_evrs_probe;
+        cmp r14, 16;
+        jae aml_evrs_toodeep;
+        mov rdi, r13;
+        mov rsi, [rsp + 16];
+        call aml_name_seg;
+        lea rcx, [rip + aml_path_buf];
+        mov [rcx + r14*8], rax;
+        add r14, 1;
+        mov rax, [rsp + 16];
+        add rax, 1;
+        mov [rsp + 16], rax;
+        jmp aml_evrs_seg;
+        // ---- first probe: the path exactly as written ----
+      aml_evrs_probe:
+        lea rcx, [rip + aml_eval_state];
+        mov [rcx + 64], r14;
+        mov rdi, r14;
+        call aml_eval_find;
+        cmp rax, 0;
+        jne aml_evrs_ret;
+        call aml_eval_err;
+        cmp rax, 0;
+        jne aml_evrs_fail;               // the scan itself faulted
+        // ---- the search rule, and ONLY for a bare single NameSeg ----
+        mov rax, [rsp + 0];
+        cmp rax, 0;
+        jne aml_evrs_miss;               // root-anchored: no search
+        mov rax, [rsp + 8];
+        cmp rax, 0;
+        jne aml_evrs_miss;               // '^'-prefixed: no search
+        cmp r15, 1;
+        jne aml_evrs_miss;               // multi-segment: no search
+      aml_evrs_up:
+        cmp r14, 2;
+        jb aml_evrs_miss;                // the root-level probe already ran
+        lea rcx, [rip + aml_path_buf];
+        mov r8, r14;
+        sub r8, 1;
+        mov rax, [rcx + r8*8];           // the target segment
+        sub r8, 1;
+        mov [rcx + r8*8], rax;           // ascend one scope level
+        sub r14, 1;
+        lea rcx, [rip + aml_eval_state];
+        mov [rcx + 64], r14;
+        mov rdi, r14;
+        call aml_eval_find;
+        cmp rax, 0;
+        jne aml_evrs_ret;
+        call aml_eval_err;
+        cmp rax, 0;
+        jne aml_evrs_fail;
+        jmp aml_evrs_up;
+      aml_evrs_toodeep:
+        mov rdi, 38;                     // AML_ERR_NAME_TOO_DEEP
+        call aml_eval_set_err;
+        jmp aml_evrs_fail;
+      aml_evrs_badcarat:
+        mov rdi, 39;                     // AML_ERR_BAD_PARENT_PREFIX
+        call aml_eval_set_err;
+        jmp aml_evrs_fail;
+      aml_evrs_miss:
+        mov rdi, 36;                     // AML_ERR_NAME_NOT_FOUND
+        call aml_eval_set_err;
+      aml_evrs_fail:
+        xor rax, rax;
+      aml_evrs_ret:
+        add rsp, 32;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Reading and writing named objects.
+  // ==========================================================================
+
+  pub let aml_eval_read_named : (u64) -> u64 !{mem} @{} =
+    fn (node: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): read the value of a resolved declaration. Only an integer-valued NAME node (data kind 1) yields a value at this milestone; its 64-bit value lives in the u64 side table at arg0. Everything else -- a string or buffer or package NAME, an ALIAS, an OpRegion, a field element, an External -- is AML_ERR_NOT_EVALUABLE (35), which is a REFUSAL and not a zero. Returning zero for 'I cannot read this' would make a driver that asks for a _HID it cannot decode see a valid-looking answer, and the whole posture of this subsystem is that a wrong value is worse than no value. #1056 adds strings and buffers, #1057 adds packages and reference-typed reads including following an ALIAS to its source. A METHOD is deliberately not readable here: a bare name that resolves to a method is an INVOCATION, and the parser has already turned it into a CALL node, so a NAMEREF landing on a METHOD means the arena disagrees with itself. Reserved labels: aml_evrn_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rdi;
+        cmp r12, 0;
+        je aml_evrn_bad;
+        mov rdi, r12;
+        call aml_node_kind;
+        cmp rax, 5;                      // AML_NODE_NAME
+        jne aml_evrn_bad;
+        mov rdi, r12;
+        call aml_node_flags;
+        cmp rax, 1;                      // data kind 1 = integer
+        jne aml_evrn_bad;
+        mov rdi, r12;
+        call aml_node_arg0;
+        mov rdi, rax;
+        call aml_u64_get;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+      aml_evrn_bad:
+        mov rdi, 35;                     // AML_ERR_NOT_EVALUABLE
+        call aml_eval_set_err;
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_store : (u64, u64) -> u64 !{mem} @{} =
+    fn (target: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): store rsi into the destination the arena node rdi denotes. Returns 1 on success, 0 having latched AML_ERR_BAD_TARGET (41). FOUR destinations, and the boundary is drawn deliberately. (1) A literal INT whose value is zero is the NULL TARGET -- iasl emits ZeroOp in the optional Target slot of Add/Subtract/... to mean 'discard' -- so it succeeds and writes nothing. A literal INT with any other value is not a destination at all and is refused rather than ignored, because ignoring it would silently drop a result. (2) LocalX and (3) ArgX write the current frame, which is where frame isolation is actually delivered: the write is indexed off the CURRENT frame base, so a callee cannot reach its caller's slots. (4) A NAMEREF resolves and, if it names an integer NAME object, writes through to that object's u64 side-table slot -- a real store to a real named object, which is what makes `Add(One, Two, FOO)` observable. Everything else is refused: a field element, an Index target, a string or buffer or package destination all need the reference machinery of #1057, and inventing a partial version here would be the placeholder this milestone is not allowed to ship. The stored value is truncated to the table width first, so a revision-1 object can never come to hold a 64-bit value. Locals: r12=target node, r13=value, r14=resolved node. Reserved labels: aml_evst_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rdi;
+        mov r13, rsi;
+        cmp r12, 0;
+        je aml_evst_bad;
+        mov rdi, r12;
+        call aml_node_kind;
+        mov r15, rax;
+        cmp r15, 33;                     // AML_NODE_INT
+        je aml_evst_lit;
+        cmp r15, 39;                     // AML_NODE_ARGX
+        je aml_evst_arg;
+        cmp r15, 40;                     // AML_NODE_LOCALX
+        je aml_evst_local;
+        cmp r15, 38;                     // AML_NODE_NAMEREF
+        je aml_evst_name;
+        jmp aml_evst_bad;
+
+      aml_evst_lit:
+        mov rdi, r12;
+        call aml_node_arg0;
+        mov rdi, rax;
+        call aml_u64_get;
+        cmp rax, 0;
+        jne aml_evst_bad;                // a non-zero literal is not a target
+        mov rax, 1;                      // Zero target: discard, successfully
+        jmp aml_evst_ret;
+
+      aml_evst_arg:
+        mov rdi, r12;
+        call aml_node_flags;
+        mov rdi, rax;
+        mov rsi, r13;
+        call aml_frame_set_arg;
+        jmp aml_evst_ret;
+
+      aml_evst_local:
+        mov rdi, r12;
+        call aml_node_flags;
+        mov rdi, rax;
+        mov rsi, r13;
+        call aml_frame_set_local;
+        jmp aml_evst_ret;
+
+      aml_evst_name:
+        call aml_eval_scope;
+        mov rdi, rax;
+        mov r14, rdi;
+        mov rdi, r12;
+        call aml_node_name;
+        mov rsi, rax;
+        mov rdi, r14;
+        call aml_eval_resolve;
+        cmp rax, 0;
+        je aml_evst_fail;
+        mov r14, rax;
+        mov rdi, r14;
+        call aml_node_kind;
+        cmp rax, 5;                      // AML_NODE_NAME
+        jne aml_evst_bad;
+        mov rdi, r14;
+        call aml_node_flags;
+        cmp rax, 1;                      // integer-valued
+        jne aml_evst_bad;
+        mov rdi, r14;
+        call aml_node_arg0;
+        mov r15, rax;                    // u64 side-table index
+        mov rdi, r13;
+        call aml_eval_trunc;
+        mov rsi, rax;
+        mov rdi, r15;
+        call aml_u64_set;
+        cmp rax, 0;
+        je aml_evst_bad;
+        mov rax, 1;
+        jmp aml_evst_ret;
+
+      aml_evst_bad:
+        mov rdi, 41;                     // AML_ERR_BAD_TARGET
+        call aml_eval_set_err;
+      aml_evst_fail:
+        xor rax, rax;
+      aml_evst_ret:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // The value dispatcher.
+  // ==========================================================================
+
+  pub let aml_eval_node : (u64) -> u64 !{mem} @{} =
+    fn (node: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): evaluate arena node rdi in VALUE position and return its integer value. This is the choke point the whole milestone hangs off. Every evaluation spends one step of fuel and takes one level of depth BEFORE dispatching, so the two budgets cover every present and future node kind without each handler remembering them; and every value leaves through aml_eval_trunc, so the table's integer width is applied once rather than at twenty-six operator sites. The failure paths are split so the depth counter stays balanced: a refusal before the enter returns directly, everything after it converges on one exit that leaves. A latched error forces the result to zero on the way out, so a caller that ignores the error at least gets a value that cannot be mistaken for data. Kinds evaluated: INT (side-table literal), ARGX and LOCALX (current frame), NAMEREF (resolve then read), EXPR (delegated to aml_arith_eval, #1055), CALL (delegated to aml_eval_call), and MISC RevisionOp. STRING, BUFFER, PACKAGE and VARPACKAGE are AML_ERR_NOT_EVALUABLE (35) rather than zero, deferred to #1056/#1057 -- refusing is the point. Locals: r12=node, r13=kind, r14=value. Reserved labels: aml_evnd_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rdi;
+        cmp r12, 0;
+        je aml_evnd_zero;
+        call aml_eval_spend;
+        cmp rax, 0;
+        je aml_evnd_zero;
+        call aml_eval_enter;
+        cmp rax, 0;
+        je aml_evnd_zero;
+        xor r14, r14;
+        mov rdi, r12;
+        call aml_node_kind;
+        mov r13, rax;
+        cmp r13, 33;                     // INT
+        je aml_evnd_int;
+        cmp r13, 39;                     // ARGX
+        je aml_evnd_arg;
+        cmp r13, 40;                     // LOCALX
+        je aml_evnd_local;
+        cmp r13, 38;                     // NAMEREF
+        je aml_evnd_name;
+        cmp r13, 24;                     // EXPR
+        je aml_evnd_expr;
+        cmp r13, 23;                     // CALL
+        je aml_evnd_call;
+        cmp r13, 41;                     // MISC
+        je aml_evnd_misc;
+        jmp aml_evnd_unev;
+
+      aml_evnd_int:
+        mov rdi, r12;
+        call aml_node_arg0;
+        mov rdi, rax;
+        call aml_u64_get;
+        mov r14, rax;
+        jmp aml_evnd_done;
+
+      aml_evnd_arg:
+        mov rdi, r12;
+        call aml_node_flags;
+        mov rdi, rax;
+        call aml_frame_arg;
+        mov r14, rax;
+        jmp aml_evnd_done;
+
+      aml_evnd_local:
+        mov rdi, r12;
+        call aml_node_flags;
+        mov rdi, rax;
+        call aml_frame_local;
+        mov r14, rax;
+        jmp aml_evnd_done;
+
+      aml_evnd_name:
+        call aml_eval_scope;
+        mov r15, rax;
+        mov rdi, r12;
+        call aml_node_name;
+        mov rsi, rax;
+        mov rdi, r15;
+        call aml_eval_resolve;
+        cmp rax, 0;
+        je aml_evnd_done;
+        mov rdi, rax;
+        call aml_eval_read_named;
+        mov r14, rax;
+        jmp aml_evnd_done;
+
+      aml_evnd_expr:
+        mov rdi, r12;
+        call aml_arith_eval;
+        mov r14, rax;
+        jmp aml_evnd_done;
+
+      aml_evnd_call:
+        mov rdi, r12;
+        call aml_eval_call;
+        mov r14, rax;
+        jmp aml_evnd_done;
+
+      aml_evnd_misc:
+        mov rdi, r12;
+        call aml_node_flags;
+        mov rcx, 0x5B30;                 // RevisionOp
+        cmp rax, rcx;
+        jne aml_evnd_unev;
+        call aml_eval_revision;
+        mov r14, rax;
+        jmp aml_evnd_done;
+
+      aml_evnd_unev:
+        mov rdi, 35;                     // AML_ERR_NOT_EVALUABLE
+        call aml_eval_set_err;
+        xor r14, r14;
+
+      aml_evnd_done:
+        call aml_eval_leave;
+        call aml_eval_err;
+        cmp rax, 0;
+        jne aml_evnd_err;
+        mov rdi, r14;
+        call aml_eval_trunc;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+      aml_evnd_err:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+      aml_evnd_zero:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // The statement dispatcher.
+  //
+  // Control result: 0 normal, 1 return, 2 break, 3 continue, 4 error.
+  // ==========================================================================
+
+  pub let aml_eval_stmt : (u64) -> u64 !{mem} @{} =
+    fn (node: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): execute arena node rdi in STATEMENT position and return a control code -- 0 normal, 1 return, 2 break, 3 continue, 4 error. A separate code rather than an out-parameter because Break and Continue must unwind through an arbitrary depth of nested bodies to the innermost While, and threading that through return values keeps every unwind path visible at the call site. If takes its predicate from child 0 and its body from the remaining children; when the predicate is false the IMMEDIATELY FOLLOWING SIBLING is executed if it is an Else, which is how ACPI encodes Else and how R30.M1 represented it. A standalone ELSE reached by the body loop is a no-op precisely because its If already decided -- executing it there would run both arms. While spends one extra step of fuel PER ITERATION, which is what bounds a loop whose body is empty: the predicate evaluation alone would also spend, but the explicit spend makes the bound hold even if a future body evaluates nothing at all. Break ends the innermost While and is swallowed there; Return propagates all the way out to aml_eval_call. Declaration kinds are no-ops: the parser has already materialised them into the arena, so a Name or an OperationRegion inside a method body needs nothing at run time. Locals: r12=node, r13=kind, r14=control, r15=scratch. Reserved labels: aml_evsm_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rdi;
+        cmp r12, 0;
+        je aml_evsm_none;
+        call aml_eval_spend;
+        cmp rax, 0;
+        je aml_evsm_err0;
+        call aml_eval_enter;
+        cmp rax, 0;
+        je aml_evsm_err0;
+        xor r14, r14;
+        mov rdi, r12;
+        call aml_node_kind;
+        mov r13, rax;
+        cmp r13, 25;                     // IF
+        je aml_evsm_if;
+        cmp r13, 26;                     // ELSE
+        je aml_evsm_done;
+        cmp r13, 27;                     // WHILE
+        je aml_evsm_while;
+        cmp r13, 28;                     // RETURN
+        je aml_evsm_ret;
+        cmp r13, 29;                     // BREAK
+        je aml_evsm_break;
+        cmp r13, 30;                     // CONTINUE
+        je aml_evsm_cont;
+        cmp r13, 31;                     // NOOP
+        je aml_evsm_done;
+        cmp r13, 32;                     // BREAKPOINT
+        je aml_evsm_done;
+        cmp r13, 24;                     // EXPR in statement position
+        je aml_evsm_value;
+        cmp r13, 23;                     // CALL in statement position
+        je aml_evsm_value;
+        cmp r13, 38;                     // NAMEREF in statement position
+        je aml_evsm_done;                // reading and discarding has no effect
+        mov rdi, r13;
+        call aml_eval_names;
+        cmp rax, 0;
+        jne aml_evsm_done;               // a declaration: already materialised
+        cmp r13, 11;                     // FIELD
+        je aml_evsm_done;
+        cmp r13, 12;                     // INDEXFIELD
+        je aml_evsm_done;
+        cmp r13, 13;                     // BANKFIELD
+        je aml_evsm_done;
+        cmp r13, 16;                     // OPAQUE
+        je aml_evsm_done;
+        cmp r13, 19;                     // FIELD_LINK
+        je aml_evsm_done;
+        cmp r13, 20;                     // FIELD_ACCESS
+        je aml_evsm_done;
+        cmp r13, 21;                     // FIELD_RESERVED
+        je aml_evsm_done;
+        cmp r13, 22;                     // FIELD_CONNECT
+        je aml_evsm_done;
+        mov rdi, 35;                     // AML_ERR_NOT_EVALUABLE
+        call aml_eval_set_err;
+        mov r14, 4;
+        jmp aml_evsm_done;
+
+        // ---- If / Else ----
+      aml_evsm_if:
+        mov rdi, r12;
+        call aml_node_first_child;
+        mov rdi, rax;
+        call aml_eval_node;
+        mov r15, rax;
+        call aml_eval_err;
+        cmp rax, 0;
+        jne aml_evsm_err1;
+        cmp r15, 0;
+        je aml_evsm_else;
+        mov rdi, r12;
+        mov rsi, 1;                      // skip the predicate
+        call aml_eval_body;
+        mov r14, rax;
+        jmp aml_evsm_done;
+      aml_evsm_else:
+        mov rdi, r12;
+        call aml_node_next_sibling;
+        mov r15, rax;
+        cmp r15, 0;
+        je aml_evsm_done;
+        mov rdi, r15;
+        call aml_node_kind;
+        cmp rax, 26;                     // ELSE
+        jne aml_evsm_done;
+        mov rdi, r15;
+        xor rsi, rsi;
+        call aml_eval_body;
+        mov r14, rax;
+        jmp aml_evsm_done;
+
+        // ---- While ----
+      aml_evsm_while:
+        call aml_eval_spend;
+        cmp rax, 0;
+        je aml_evsm_err1;
+        mov rdi, r12;
+        call aml_node_first_child;
+        mov rdi, rax;
+        call aml_eval_node;
+        mov r15, rax;
+        call aml_eval_err;
+        cmp rax, 0;
+        jne aml_evsm_err1;
+        cmp r15, 0;
+        je aml_evsm_done;                // predicate false: loop ends
+        mov rdi, r12;
+        mov rsi, 1;
+        call aml_eval_body;
+        cmp rax, 1;
+        je aml_evsm_wret;
+        cmp rax, 2;
+        je aml_evsm_done;                // Break: swallowed here
+        cmp rax, 4;
+        je aml_evsm_werr;
+        jmp aml_evsm_while;              // 0 or 3 (Continue): iterate
+      aml_evsm_wret:
+        mov r14, 1;
+        jmp aml_evsm_done;
+      aml_evsm_werr:
+        mov r14, 4;
+        jmp aml_evsm_done;
+
+        // ---- Return ----
+      aml_evsm_ret:
+        mov rdi, r12;
+        call aml_node_flags;
+        and rax, 1;                      // implicit-Zero fixup flag
+        cmp rax, 0;
+        jne aml_evsm_ret0;
+        mov rdi, r12;
+        call aml_node_first_child;
+        cmp rax, 0;
+        je aml_evsm_ret0;
+        mov rdi, rax;
+        call aml_eval_node;
+        mov r15, rax;
+        call aml_eval_err;
+        cmp rax, 0;
+        jne aml_evsm_err1;
+        jmp aml_evsm_retset;
+      aml_evsm_ret0:
+        xor r15, r15;
+      aml_evsm_retset:
+        lea rcx, [rip + aml_eval_state];
+        mov [rcx + 48], r15;
+        mov r14, 1;
+        jmp aml_evsm_done;
+
+      aml_evsm_break:
+        mov r14, 2;
+        jmp aml_evsm_done;
+      aml_evsm_cont:
+        mov r14, 3;
+        jmp aml_evsm_done;
+
+      aml_evsm_value:
+        mov rdi, r12;
+        call aml_eval_node;
+        call aml_eval_err;
+        cmp rax, 0;
+        jne aml_evsm_err1;
+        jmp aml_evsm_done;
+
+      aml_evsm_err1:
+        mov r14, 4;
+      aml_evsm_done:
+        call aml_eval_leave;
+        mov rax, r14;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+      aml_evsm_err0:
+        mov rax, 4;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+      aml_evsm_none:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_body : (u64, u64) -> u64 !{mem} @{} =
+    fn (parent: u64) (skip: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): execute the children of rdi as a TermList, skipping the first rsi of them, and return the first non-zero control code any of them produced. The skip parameter exists because an If and a While both store their PREDICATE as child 0 and their body as the remainder, so 'the body' is 'the children after the first' -- passing the count rather than re-deriving it per caller keeps one loop instead of two nearly-identical ones. Any non-zero control ends the list immediately: a Return must not let the statements after it run, and neither must a Break or a Continue. No fuel is spent here; every child spends its own in aml_eval_stmt, and charging twice would make the budget mean something different depending on nesting. Locals: r12=child cursor, r13=control, r14=skip remaining. Reserved labels: aml_evbd_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r14, rsi;
+        call aml_node_first_child;
+        mov r12, rax;
+      aml_evbd_skip:
+        cmp r14, 0;
+        je aml_evbd_run;
+        cmp r12, 0;
+        je aml_evbd_none;
+        mov rdi, r12;
+        call aml_node_next_sibling;
+        mov r12, rax;
+        sub r14, 1;
+        jmp aml_evbd_skip;
+      aml_evbd_run:
+        cmp r12, 0;
+        je aml_evbd_none;
+        mov rdi, r12;
+        call aml_eval_stmt;
+        mov r13, rax;
+        cmp r13, 0;
+        jne aml_evbd_out;
+        mov rdi, r12;
+        call aml_node_next_sibling;
+        mov r12, rax;
+        jmp aml_evbd_run;
+      aml_evbd_none:
+        xor r13, r13;
+      aml_evbd_out:
+        mov rax, r13;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Invocation.
+  // ==========================================================================
+
+  pub let aml_eval_call : (u64) -> u64 !{mem} @{} =
+    fn (call_node: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): invoke the method a CALL node names and return its value. The order of operations is the whole content of this function and every step of it is load-bearing. (1) Resolve the callee through the §5.3 walker from the CURRENT scope -- a call written inside a device resolves against that device, not against wherever the method happens to live. (2) Take the argument count from the CALL node's flags, which the R30.M1 two-pass parser already resolved from the real declaration; it is never re-derived and never guessed. (3) Evaluate every argument onto the NATIVE STACK while the CALLER's frame is still current. Doing this after the push would evaluate FOO(Local0) against the callee's freshly-zeroed Local0 and silently pass Zero, and it would let a nested call inside an argument collide with the half-built frame. (4) Only then push the frame, which zeroes it, and bind. (5) Switch scope to the callee for the body and restore it afterwards. (6) Pop, and read the return value only if the body actually returned -- a method that falls off the end yields Zero, per ACPI 6.5 §19.6.100. An arity above 7 is refused with AML_ERR_BAD_SLOT (37) rather than truncated, because a flags byte claiming eight arguments means the arena disagrees with the opcode space. Locals: r12=call node, r13=callee, r14=argc, r15=scratch; [rsp+0..48]=evaluated arguments, [rsp+56]=argument cursor, [rsp+64]=index, [rsp+72]=saved scope, [rsp+80]=control. Reserved labels: aml_evc_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 96;
+        mov r12, rdi;
+        // ---- resolve the callee ----
+        call aml_eval_scope;
+        mov r15, rax;
+        mov rdi, r12;
+        call aml_node_name;
+        mov rsi, rax;
+        mov rdi, r15;
+        call aml_eval_resolve;
+        cmp rax, 0;
+        je aml_evc_fail;
+        mov r13, rax;
+        mov rdi, r13;
+        call aml_node_kind;
+        cmp rax, 4;                      // AML_NODE_METHOD
+        jne aml_evc_unev;
+        // ---- arity, from the declaration the parser already found ----
+        mov rdi, r12;
+        call aml_node_flags;
+        and rax, 0xFF;
+        mov r14, rax;
+        cmp r14, 7;
+        ja aml_evc_slot;
+        // ---- evaluate the arguments in the CALLER's frame ----
+        mov rdi, r12;
+        call aml_node_first_child;
+        mov [rsp + 56], rax;
+        xor rax, rax;
+        mov [rsp + 64], rax;
+      aml_evc_arg:
+        mov rax, [rsp + 64];
+        cmp rax, r14;
+        jae aml_evc_push;
+        mov rdi, [rsp + 56];
+        cmp rdi, 0;
+        je aml_evc_argzero;
+        call aml_eval_node;
+        mov r15, rax;
+        call aml_eval_err;
+        cmp rax, 0;
+        jne aml_evc_fail;
+        mov rdi, [rsp + 56];
+        call aml_node_next_sibling;
+        mov [rsp + 56], rax;
+        jmp aml_evc_argstore;
+      aml_evc_argzero:
+        xor r15, r15;
+      aml_evc_argstore:
+        mov rax, [rsp + 64];
+        mov [rsp + rax*8], r15;
+        add rax, 1;
+        mov [rsp + 64], rax;
+        jmp aml_evc_arg;
+        // ---- push the frame and bind ----
+      aml_evc_push:
+        mov rdi, r13;
+        call aml_frame_push;
+        cmp rax, 0;
+        je aml_evc_fail;
+        xor rax, rax;
+        mov [rsp + 64], rax;
+      aml_evc_bind:
+        mov rax, [rsp + 64];
+        cmp rax, r14;
+        jae aml_evc_body;
+        mov rsi, [rsp + rax*8];
+        mov rdi, rax;
+        call aml_frame_set_arg;
+        mov rax, [rsp + 64];
+        add rax, 1;
+        mov [rsp + 64], rax;
+        jmp aml_evc_bind;
+        // ---- run the body in the callee's scope ----
+      aml_evc_body:
+        call aml_eval_scope;
+        mov [rsp + 72], rax;
+        mov rdi, r13;
+        call aml_eval_set_scope;
+        mov rdi, r13;
+        xor rsi, rsi;
+        call aml_eval_body;
+        mov [rsp + 80], rax;
+        mov rdi, [rsp + 72];
+        call aml_eval_set_scope;
+        call aml_frame_pop;
+        mov rax, [rsp + 80];
+        cmp rax, 1;
+        jne aml_evc_novalue;
+        call aml_eval_retval;
+        jmp aml_evc_ret;
+      aml_evc_novalue:
+        xor rax, rax;
+        jmp aml_evc_ret;
+
+      aml_evc_slot:
+        mov rdi, 37;                     // AML_ERR_BAD_SLOT
+        call aml_eval_set_err;
+        jmp aml_evc_fail;
+      aml_evc_unev:
+        mov rdi, 35;                     // AML_ERR_NOT_EVALUABLE
+        call aml_eval_set_err;
+      aml_evc_fail:
+        xor rax, rax;
+      aml_evc_ret:
+        add rsp, 96;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_eval_method : (u64) -> u64 !{mem} @{} =
+    fn (method_node: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-001 (#1054): the top-level entry point -- run METHOD node rdi with no arguments and return its value. This is what the acpi_supervisor process will call to evaluate a _STA or a _CRS, and what the corpus calls to drive every fixture. It is aml_eval_call without the resolution and argument steps: push a frame so ArgX and LocalX have somewhere to live, switch scope to the method so its body resolves names against itself, run the body, restore, pop. A method that falls off the end yields Zero. A node of any other kind is AML_ERR_NOT_EVALUABLE (35) rather than a silent zero, because 'evaluate this thing that is not a method' is a caller bug worth surfacing. Locals: r12=method node, r13=saved scope, r14=control. Reserved labels: aml_evm_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rdi;
+        cmp r12, 0;
+        je aml_evm_unev;
+        mov rdi, r12;
+        call aml_node_kind;
+        cmp rax, 4;                      // AML_NODE_METHOD
+        jne aml_evm_unev;
+        mov rdi, r12;
+        call aml_frame_push;
+        cmp rax, 0;
+        je aml_evm_fail;
+        call aml_eval_scope;
+        mov r13, rax;
+        mov rdi, r12;
+        call aml_eval_set_scope;
+        mov rdi, r12;
+        xor rsi, rsi;
+        call aml_eval_body;
+        mov r14, rax;
+        mov rdi, r13;
+        call aml_eval_set_scope;
+        call aml_frame_pop;
+        cmp r14, 1;
+        jne aml_evm_novalue;
+        call aml_eval_retval;
+        jmp aml_evm_ret;
+      aml_evm_novalue:
+        xor rax, rax;
+        jmp aml_evm_ret;
+      aml_evm_unev:
+        mov rdi, 35;                     // AML_ERR_NOT_EVALUABLE
+        call aml_eval_set_err;
+      aml_evm_fail:
+        xor rax, rax;
+      aml_evm_ret:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+}

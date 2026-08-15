@@ -1,6 +1,7 @@
 /* tests/user/aml/aml_harness.c — R30.M1-001 (#1049) / R30.M1-002 (#1050)
  *                                 R30.M1-003 (#1051) / R30.M1-004 (#1052)
  *                                 R30.M1-005 (#1053)
+ *                                 R30.M2-001 (#1054) / R30.M2-002 (#1055)
  *
  * Executable corpus for the userspace AML tokenizer and namespace parser.
  *
@@ -143,6 +144,53 @@ extern uint64_t aml_res_serial_type(uint64_t d);
 extern uint64_t aml_res_i2c_speed(uint64_t d);
 extern uint64_t aml_res_i2c_addr(uint64_t d);
 
+/* #1054 — evaluator core: context, budgets, frames, namespace walker */
+extern void     aml_eval_reset(uint64_t revision);
+extern uint64_t aml_eval_err(void);
+extern uint64_t aml_eval_set_err(uint64_t code);
+extern uint64_t aml_eval_set_fuel(uint64_t budget);
+extern uint64_t aml_eval_fuel(void);
+extern uint64_t aml_eval_budget(void);
+extern uint64_t aml_eval_depth(void);
+extern uint64_t aml_eval_frames(void);
+extern uint64_t aml_eval_scope(void);
+extern void     aml_eval_set_scope(uint64_t node);
+extern uint64_t aml_eval_revision(void);
+extern uint64_t aml_eval_retval(void);
+extern uint64_t aml_eval_width(void);
+extern uint64_t aml_eval_ones(void);
+extern uint64_t aml_eval_trunc(uint64_t v);
+extern uint64_t aml_eval_spend(void);
+extern uint64_t aml_eval_enter(void);
+extern void     aml_eval_leave(void);
+extern uint64_t aml_frame_push(uint64_t method_node);
+extern void     aml_frame_pop(void);
+extern uint64_t aml_frame_method(void);
+extern uint64_t aml_frame_arg(uint64_t i);
+extern uint64_t aml_frame_set_arg(uint64_t i, uint64_t v);
+extern uint64_t aml_frame_local(uint64_t i);
+extern uint64_t aml_frame_set_local(uint64_t i, uint64_t v);
+extern uint64_t aml_eval_names(uint64_t kind);
+extern uint64_t aml_eval_abspath(uint64_t node, uint64_t which);
+extern uint64_t aml_eval_path_len(uint64_t which);
+extern uint64_t aml_eval_find(uint64_t len);
+extern uint64_t aml_eval_resolve(uint64_t scope, uint64_t name_ref);
+extern uint64_t aml_eval_read_named(uint64_t node);
+extern uint64_t aml_eval_store(uint64_t target, uint64_t value);
+extern uint64_t aml_eval_node(uint64_t node);
+extern uint64_t aml_eval_stmt(uint64_t node);
+extern uint64_t aml_eval_body(uint64_t parent, uint64_t skip);
+extern uint64_t aml_eval_call(uint64_t call_node);
+extern uint64_t aml_eval_method(uint64_t method_node);
+
+/* #1055 — arithmetic and logical operators */
+extern uint64_t aml_arith_child(uint64_t node, uint64_t n);
+extern uint64_t aml_arith_handles(uint64_t op16);
+extern uint64_t aml_arith_eval(uint64_t expr_node);
+
+/* Also needed by the evaluator corpus (#1054 added the setter). */
+extern uint64_t aml_u64_set(uint64_t ref, uint64_t value);
+
 /* ------------------------------------------------------------- error codes */
 
 enum {
@@ -159,7 +207,16 @@ enum {
     /* #1053 */
     E_RES_CHECKSUM = 25, E_RES_TRUNCATED = 26, E_RES_LENGTH = 27,
     E_RES_NO_ENDTAG = 28, E_RES_BAD_TAG = 29,
-    E_BAD_TERMARG = 30
+    E_BAD_TERMARG = 30,
+    /* #1054 / #1055 — evaluator. Latched in aml_eval_state, not in the
+     * lexer: parsing is per-table and evaluation is per-invocation, so
+     * one shared first-writer-wins slot would let the first failed
+     * evaluation block every later one. The CODE space is shared, so a
+     * code still identifies its origin unambiguously. */
+    E_FUEL_EXHAUSTED = 31, E_EVAL_DEPTH = 32, E_FRAME_OVERFLOW = 33,
+    E_DIVIDE_BY_ZERO = 34, E_NOT_EVALUABLE = 35, E_NAME_NOT_FOUND = 36,
+    E_BAD_SLOT = 37, E_NAME_TOO_DEEP = 38, E_BAD_PARENT_PREFIX = 39,
+    E_NO_FRAME = 40, E_BAD_TARGET = 41
 };
 
 /* node kinds */
@@ -238,7 +295,43 @@ static void on_segv(int sig)
 {
     (void)sig;
     if (g_armed) siglongjmp(g_jb, 1);
+    /* Outside a GUARDED region there is nothing to long-jump to, so the
+     * only useful thing left is to say so on the way out — a bare exit
+     * code 97 from a pre-push hook is a mystery, and this path is reached
+     * by exactly the class of bug (an index escaping a fixed-size pool)
+     * that is worth naming. write() rather than fprintf: async-signal
+     * safety. */
+    static const char msg[] =
+        "[aml-corpus] FATAL — SIGSEGV outside a guarded region; a bounds "
+        "check on a fixed-size array is missing or wrong\n";
+    ssize_t w = write(2, msg, sizeof msg - 1);
+    (void)w;
     _exit(97);
+}
+
+/* WHY A WATCHDOG.
+ *
+ * The evaluator's headline guarantee is that a `While(One)` over
+ * firmware-supplied bytes TERMINATES. The failure mode of losing that
+ * guarantee is not an assertion that reports false — it is a corpus that
+ * never returns, which in the pre-push matrix is a wedged hook and no
+ * diagnosis at all. Mutation testing confirmed it: neutralising
+ * aml_eval_spend produces a hang, and a hang is the one outcome this
+ * harness could not previously report.
+ *
+ * So the whole corpus runs under an alarm. Sixty seconds is roughly two
+ * orders of magnitude more than it needs (the full run, including the
+ * million-step default-budget fixture, is well under a second), so this
+ * can only fire on a real non-termination. */
+static void on_alarm(int sig)
+{
+    (void)sig;
+    static const char msg[] =
+        "[aml-corpus] FATAL — the corpus did not finish within 60s. An "
+        "evaluation guard (fuel, depth or frames) is not terminating.\n";
+    ssize_t w = write(2, msg, sizeof msg - 1);
+    (void)w;
+    _exit(96);
 }
 
 #define GUARDED(body)                                                        \
@@ -1897,6 +1990,924 @@ static void test_resource_malformed(void)
     }
 }
 
+/* ==================================================================== */
+/* R30.M2-001 (#1054) / R30.M2-002 (#1055) — the evaluator.             */
+/*                                                                      */
+/* Parsing untrusted input can over-read, and the corpus above answers   */
+/* that with a guard page. EVALUATING untrusted input can additionally   */
+/* loop forever, recurse without bound and exhaust memory, so the first  */
+/* thing asserted here is that each of those three terminates with its   */
+/* own distinct code rather than hanging the harness. See                */
+/* design/acpi/aml-evaluator.md.                                         */
+/* ==================================================================== */
+
+/* Build `Method(TEST, 0) { Return(<expr>) }` around a hand-written
+ * expression, evaluate it at the given table revision, and assert the
+ * value or the error code. Wrapping in a method rather than evaluating a
+ * bare node is deliberate: it means every one of these cases also
+ * exercises the frame push/pop and the scope switch, so a regression
+ * there cannot hide behind a corpus that only ever evaluates expressions. */
+static void eval_expr_case(const char *name, const uint8_t *expr, size_t en,
+                           uint64_t revision, uint64_t expect, uint64_t experr)
+{
+    uint8_t b[160];
+    uint8_t lenb[4];
+    size_t ln = emit_pkglen(lenb, 4 + 1 + 1 + en);
+    size_t n = 0;
+    b[n++] = 0x14;                       /* MethodOp */
+    memcpy(b + n, lenb, ln); n += ln;
+    memcpy(b + n, "TEST", 4); n += 4;
+    b[n++] = 0x00;                       /* MethodFlags: 0 args */
+    b[n++] = 0xA4;                       /* ReturnOp */
+    memcpy(b + n, expr, en); n += en;
+
+    WITH_PARSE(name, b, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t m = aml_node_first_child(root);
+        eq("method kind", aml_node_kind(m), N_METHOD);
+        aml_eval_reset(revision);
+        eq("session starts clean", aml_eval_err(), AML_OK);
+        uint64_t v = aml_eval_method(m);
+        eq("eval err", aml_eval_err(), experr);
+        if (experr == AML_OK)
+            eq("value", v, expect);
+        eq("eval depth unwound", aml_eval_depth(), 0);
+        eq("frames unwound", aml_eval_frames(), 0);
+    });
+}
+
+#define EXPR_CASE(nm, rev, want, err, ...)                                   \
+    do {                                                                     \
+        static const uint8_t _e[] = { __VA_ARGS__ };                         \
+        eval_expr_case((nm), _e, sizeof _e, (rev), (want), (err));           \
+    } while (0)
+
+/* ---------------------------------------------------------------------
+ * THE HEADLINE TEST. `While(One)` with a firmware-controlled predicate
+ * that is never false. Real ACPICA learned this the hard way. If the fuel
+ * budget is not threaded through every evaluated node, this fixture does
+ * not fail — it HANGS, and a hang in acpi_supervisor is a machine that
+ * does not boot.
+ * --------------------------------------------------------------------- */
+static void test_eval_fuel_terminates_while_one(void)
+{
+    uint8_t b[] = {
+        0x14, 0x09, 'W','H','I','L', 0x00,   /* Method(WHIL, 0) */
+            0xA2, 0x02, 0x01                  /*   While(One) { } */
+    };
+    WITH_PARSE("eval: While(One) terminates on fuel", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t m = aml_node_first_child(root);
+        eq("method kind", aml_node_kind(m), N_METHOD);
+        eq("while kind", aml_node_kind(aml_node_first_child(m)), N_WHILE);
+
+        /* A small budget first, so the mechanism is asserted cheaply. */
+        aml_eval_reset(2);
+        eq("narrowed budget", aml_eval_set_fuel(1000), 1000);
+        eq("returns nothing", aml_eval_method(m), 0);
+        eq("fuel exhausted", aml_eval_err(), E_FUEL_EXHAUSTED);
+        eq("budget fully spent", aml_eval_fuel(), 0);
+        eq("depth unwound", aml_eval_depth(), 0);
+        eq("frames unwound", aml_eval_frames(), 0);
+
+        /* And now at the REAL default budget — this is the assertion that
+         * the shipping configuration terminates, not just a test-sized one. */
+        aml_eval_reset(2);
+        eq("default budget", aml_eval_budget(), 1000000);
+        eq("returns nothing", aml_eval_method(m), 0);
+        eq("fuel exhausted at the default budget",
+           aml_eval_err(), E_FUEL_EXHAUSTED);
+        eq("budget fully spent", aml_eval_fuel(), 0);
+        eq("depth unwound", aml_eval_depth(), 0);
+        eq("frames unwound", aml_eval_frames(), 0);
+
+        /* The setter narrows and CLAMPS; it cannot raise the ceiling, so
+         * the termination guarantee does not depend on any caller. */
+        aml_eval_reset(2);
+        eq("clamped up from zero", aml_eval_set_fuel(0), 1);
+        eq("clamped down from above the max",
+           aml_eval_set_fuel(5000000), 1000000);
+    });
+}
+
+/* A fuel-exhausted evaluation must not poison the NEXT one. With a single
+ * shared first-writer-wins error slot it would: acpi_supervisor could
+ * evaluate exactly one method per boot. */
+static void test_eval_session_isolation(void)
+{
+    uint8_t b[] = {
+        0x14, 0x09, 'F','A','I','L', 0x00,
+            0xA2, 0x02, 0x01,                 /* While(One) { } */
+        0x14, 0x09, 'G','O','O','D', 0x00,
+            0xA4, 0x0A, 0x2A                  /* Return(42) */
+    };
+    WITH_PARSE("eval: a spent session does not poison the next", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t bad  = nth_child(root, 0);
+        uint64_t good = nth_child(root, 1);
+
+        aml_eval_reset(2);
+        aml_eval_set_fuel(500);
+        aml_eval_method(bad);
+        eq("first session failed", aml_eval_err(), E_FUEL_EXHAUSTED);
+
+        aml_eval_reset(2);
+        eq("second session starts clean", aml_eval_err(), AML_OK);
+        eq("second session evaluates", aml_eval_method(good), 42);
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+}
+
+/* A table that failed to PARSE must not be evaluable at all — the session
+ * is seeded from the parse latch, so a caller who forgets to check cannot
+ * walk an arena that was never finished. */
+static void test_eval_refuses_a_failed_parse(void)
+{
+    uint8_t b[] = { 0x14, 0x40, 'B','A','D','_', 0x00 };  /* pkglen past end */
+    WITH_PARSE("eval: a failed parse blocks evaluation", b, sizeof b, {
+        (void)root;
+        g_checks++;
+        if (aml_lex_err() == AML_OK)
+            fail("fixture should not have parsed");
+        uint64_t latched = aml_lex_err();
+        aml_eval_reset(2);
+        eq("session seeded from the parse latch", aml_eval_err(), latched);
+        eq("no fuel is spent", aml_eval_fuel(), 1000000);
+    });
+}
+
+/* Depth, reached WITHOUT touching the frame pool: 52 nested Adds. This is
+ * the fixture that keeps the two budgets genuinely distinct — a
+ * self-recursive method exhausts frames long before depth, so if depth
+ * were only ever reachable through recursion the cap would be untested. */
+static void test_eval_depth_cap(void)
+{
+    enum { N = 52 };
+    uint8_t body[1 + 3 * N];
+    size_t bn = 0;
+    for (int i = 0; i < N; i++) body[bn++] = 0x72;      /* AddOp x N */
+    body[bn++] = 0x01;                                  /* innermost One */
+    for (int i = 0; i < N; i++) { body[bn++] = 0x01; body[bn++] = 0x00; }
+
+    uint8_t b[16 + sizeof body];
+    uint8_t lenb[4];
+    size_t ln = emit_pkglen(lenb, 4 + 1 + bn);
+    size_t n = 0;
+    b[n++] = 0x14;
+    memcpy(b + n, lenb, ln); n += ln;
+    memcpy(b + n, "DEEP", 4); n += 4;
+    b[n++] = 0x00;
+    memcpy(b + n, body, bn); n += bn;
+
+    WITH_PARSE("eval: nested expressions hit the depth cap", b, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t m = aml_node_first_child(root);
+        aml_eval_reset(2);
+        eq("returns nothing", aml_eval_method(m), 0);
+        eq("depth, not fuel", aml_eval_err(), E_EVAL_DEPTH);
+        g_checks++;
+        if (aml_eval_fuel() == 0)
+            fail("fuel was exhausted too — the depth cap is not what fired");
+        eq("depth unwound", aml_eval_depth(), 0);
+        eq("frames unwound", aml_eval_frames(), 0);
+    });
+}
+
+/* Unbounded recursion. A method that calls itself takes one frame and
+ * about two depth levels per level, so the FRAME pool is what stops it —
+ * asserted by the code, so a change that made depth fire first would be
+ * visible rather than silently equivalent. */
+static void test_eval_frame_pool_exhaustion(void)
+{
+    uint8_t b[] = {
+        0x14, 0x0A, 'R','E','C','U', 0x00,
+            'R','E','C','U'                   /* RECU() — self-recursive */
+    };
+    WITH_PARSE("eval: unbounded recursion exhausts the frame pool", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t m = aml_node_first_child(root);
+        eq("call node", aml_node_kind(aml_node_first_child(m)), N_CALL);
+        aml_eval_reset(2);
+        eq("returns nothing", aml_eval_method(m), 0);
+        eq("frames, not fuel or depth", aml_eval_err(), E_FRAME_OVERFLOW);
+        g_checks++;
+        if (aml_eval_fuel() == 0)
+            fail("fuel was exhausted too — the frame cap is not what fired");
+        eq("every frame was popped on the way out", aml_eval_frames(), 0);
+        eq("depth unwound", aml_eval_depth(), 0);
+
+        /* The CALL node inside RECU is name-transparent, so its absolute
+         * path is its parent's — [RECU] — which is also the METHOD's.
+         * Two nodes, one path. Resolution still lands on the declaration
+         * because a parent is always allocated before its children and
+         * aml_eval_find takes the FIRST match. Pinned here so the
+         * coincidence is on the record rather than assumed by whoever
+         * replaces the linear scan with a sorted name index. */
+        uint64_t call = aml_node_first_child(m);
+        eq("the call site is name-transparent",
+           aml_eval_names(aml_node_kind(call)), 0);
+        eq("path computed", aml_eval_abspath(call, 0), 1);
+        eq("it inherits the method's path", aml_eval_path_len(0), 1);
+        eq("and the declaration is what that path resolves to",
+           aml_eval_find(1), m);
+    });
+}
+
+/* The frame pool as a unit: eight frames, isolation between them, and a
+ * ninth refused. Driven through the API rather than through AML because
+ * the AML path cannot reach slot indices the opcode space does not
+ * encode, and BAD_SLOT still has to be reachable and tested. */
+static void test_eval_frame_pool_api(void)
+{
+    uint8_t b[] = { 0x10, 0x06, '\\', '_','S','B','_' };  /* Scope(\_SB_){} */
+    WITH_PARSE("eval: frame pool isolation and bounds", b, sizeof b, {
+        (void)root;
+        eq("parse ok", aml_lex_err(), AML_OK);
+        aml_eval_reset(2);
+
+        /* No frame: ArgX and LocalX are refused, not silently zero. */
+        eq("local with no frame", aml_frame_local(0), 0);
+        eq("NO_FRAME latched", aml_eval_err(), E_NO_FRAME);
+
+        aml_eval_reset(2);
+        eq("arg with no frame", aml_frame_arg(0), 0);
+        eq("NO_FRAME latched", aml_eval_err(), E_NO_FRAME);
+
+        /* Seven args and EIGHT locals — ACPI 6.5 §20.2.6.2. The counts are
+         * asymmetric in the spec and in the opcode space (0x68..0x6E vs
+         * 0x60..0x67); evening them up would refuse Local7. */
+        aml_eval_reset(2);
+        eq("first frame", aml_frame_push(0), 1);
+        eq("Arg6 is in range", aml_frame_set_arg(6, 1), 1);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("Arg7 does not exist", aml_frame_set_arg(7, 1), 0);
+        eq("BAD_SLOT latched", aml_eval_err(), E_BAD_SLOT);
+
+        aml_eval_reset(2);
+        aml_frame_push(0);
+        eq("Local7 is in range", aml_frame_set_local(7, 1), 1);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("Local8 does not exist", aml_frame_set_local(8, 1), 0);
+        eq("BAD_SLOT latched", aml_eval_err(), E_BAD_SLOT);
+
+        /* Isolation, part one: a REUSED frame comes back clean. This has
+         * to be asserted against a DIRTY pool — the pool is .bss, so a
+         * frame that has never been written is zero whether or not
+         * aml_frame_push zeroes it, and an isolation test that only ever
+         * touches virgin frames proves nothing. So dirty frame 2 first,
+         * unwind, and then re-enter it. */
+        aml_eval_reset(2);
+        aml_frame_push(0);
+        aml_frame_push(0);                        /* frame 2 */
+        aml_frame_set_local(0, 0x9999);
+        aml_frame_set_local(7, 0x8888);
+        aml_frame_set_arg(3, 0x7777);
+        aml_frame_pop();
+        aml_frame_pop();
+        eq("pool empty", aml_eval_frames(), 0);
+
+        aml_eval_reset(2);
+        aml_frame_push(0);
+        aml_frame_push(0);                        /* frame 2, reused */
+        eq("reused frame Local0 is zeroed", aml_frame_local(0), 0);
+        eq("reused frame Local7 is zeroed", aml_frame_local(7), 0);
+        eq("reused frame Arg3 is zeroed", aml_frame_arg(3), 0);
+        eq("no error", aml_eval_err(), AML_OK);
+        aml_frame_pop();
+        aml_frame_pop();
+
+        /* Isolation, part two: a write to a callee's slot leaves the
+         * caller's untouched. */
+        aml_eval_reset(2);
+        eq("frame 1", aml_frame_push(0), 1);
+        eq("fresh frame is zeroed", aml_frame_local(0), 0);
+        aml_frame_set_local(0, 111);
+        aml_frame_set_arg(0, 211);
+        eq("caller local", aml_frame_local(0), 111);
+        eq("frame 2", aml_frame_push(0), 2);
+        eq("callee local starts at Zero", aml_frame_local(0), 0);
+        eq("callee arg starts at Zero", aml_frame_arg(0), 0);
+        aml_frame_set_local(0, 222);
+        eq("callee local", aml_frame_local(0), 222);
+        aml_frame_pop();
+        eq("caller local is undisturbed", aml_frame_local(0), 111);
+        eq("caller arg is undisturbed", aml_frame_arg(0), 211);
+        eq("no error throughout", aml_eval_err(), AML_OK);
+        aml_frame_pop();
+        eq("pool empty", aml_eval_frames(), 0);
+
+        /* Eight frames fit; the ninth is an error, never a grow. */
+        aml_eval_reset(2);
+        for (int i = 1; i <= 8; i++)
+            eq("frame allocated", aml_frame_push(0), (uint64_t)i);
+        eq("no error at eight", aml_eval_err(), AML_OK);
+        eq("ninth refused", aml_frame_push(0), 0);
+        eq("FRAME_OVERFLOW latched", aml_eval_err(), E_FRAME_OVERFLOW);
+        eq("top unchanged by the refusal", aml_eval_frames(), 8);
+    });
+}
+
+/* Frame isolation through real AML: the callee writes its own Local0 and
+ * the caller's survives. */
+static void test_eval_frame_isolation_in_aml(void)
+{
+    uint8_t b[] = {
+        0x14, 0x11, 'O','U','T','R', 0x00,
+            0x72, 0x0A, 0x0B, 0x00, 0x60,     /* Add(11, Zero, Local0) */
+            'I','N','N','R',                   /* INNR() */
+            0xA4, 0x60,                        /* Return(Local0) */
+        0x14, 0x0D, 'I','N','N','R', 0x00,
+            0x72, 0x0A, 0x16, 0x00, 0x60,     /* Add(22, Zero, Local0) */
+            0xA4, 0x60                         /* Return(Local0) */
+    };
+    WITH_PARSE("eval: callee Local0 does not disturb the caller's", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t outr = nth_child(root, 0);
+        uint64_t innr = nth_child(root, 1);
+
+        aml_eval_reset(2);
+        eq("callee sets its own Local0", aml_eval_method(innr), 22);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        aml_eval_reset(2);
+        eq("caller's Local0 survives the call", aml_eval_method(outr), 11);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("frames unwound", aml_eval_frames(), 0);
+    });
+}
+
+/* Arguments are evaluated in the CALLER's frame. Push-then-evaluate would
+ * read the callee's freshly-zeroed Local0 and pass Zero — a wrong value,
+ * silently. */
+static void test_eval_args_evaluated_in_caller_frame(void)
+{
+    uint8_t b[] = {
+        0x14, 0x08, 'I','D','N','T', 0x01,
+            0xA4, 0x68,                        /* Return(Arg0) */
+        0x14, 0x11, 'C','A','L','R', 0x00,
+            0x72, 0x0A, 0x09, 0x00, 0x60,     /* Add(9, Zero, Local0) */
+            0xA4, 'I','D','N','T', 0x60        /* Return(IDNT(Local0)) */
+    };
+    WITH_PARSE("eval: arguments evaluate in the caller's frame", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t calr = nth_child(root, 1);
+        aml_eval_reset(2);
+        eq("argument carried the caller's Local0", aml_eval_method(calr), 9);
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+}
+
+/* Two arguments, bound in order, read back as Arg0 and Arg1. */
+static void test_eval_method_arguments(void)
+{
+    uint8_t b[] = {
+        0x14, 0x0B, 'A','D','D','R', 0x02,
+            0xA4, 0x72, 0x68, 0x69, 0x00,     /* Return(Add(Arg0, Arg1, Zero)) */
+        0x14, 0x0F, 'M','A','I','N', 0x00,
+            0xA4, 'A','D','D','R', 0x0A, 0x07, 0x0A, 0x0B
+    };
+    WITH_PARSE("eval: two arguments bind in order", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t main_m = nth_child(root, 1);
+        aml_eval_reset(2);
+        eq("7 + 11", aml_eval_method(main_m), 18);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("frames unwound", aml_eval_frames(), 0);
+    });
+}
+
+/* ---------------------------------------------------------------------
+ * ACPI 6.5 §5.3 name resolution. The same NameSeg, written four ways,
+ * must resolve to two DIFFERENT objects. That is the property that makes
+ * this fixture able to fail: an implementation that ignores the root
+ * anchor, or that searches upward when it must not, still finds A
+ * declaration — just the wrong one.
+ * --------------------------------------------------------------------- */
+static void test_eval_name_resolution(void)
+{
+    /*  Name(VALU, 1)                     -> \VALU      = 1
+     *  Scope(SCPA) {
+     *      Name(VALU, 2)                 -> \SCPA.VALU = 2
+     *      Method(INNR) { Return(VALU)   }   search rule: inner wins  -> 2
+     *      Method(RTMD) { Return(\VALU)  }   root anchor              -> 1
+     *      Method(PPMD) { Return(^VALU)  }   parent of the method     -> 2
+     *      Method(PP2M) { Return(^^VALU) }   grandparent = root       -> 1
+     *  }
+     */
+    uint8_t inner[128];
+    size_t in = 0;
+    const uint8_t nm[] = { 0x08, 'V','A','L','U', 0x0A, 0x02 };
+    memcpy(inner + in, nm, sizeof nm); in += sizeof nm;
+
+    struct { const char *seg; uint8_t body[8]; size_t bn; } ms[] = {
+        { "INNR", { 0xA4, 'V','A','L','U' }, 5 },
+        { "RTMD", { 0xA4, 0x5C, 'V','A','L','U' }, 6 },
+        { "PPMD", { 0xA4, 0x5E, 'V','A','L','U' }, 6 },
+        { "PP2M", { 0xA4, 0x5E, 0x5E, 'V','A','L','U' }, 7 },
+    };
+    for (size_t i = 0; i < 4; i++) {
+        uint8_t lenb[4];
+        size_t ln = emit_pkglen(lenb, 4 + 1 + ms[i].bn);
+        inner[in++] = 0x14;
+        memcpy(inner + in, lenb, ln); in += ln;
+        memcpy(inner + in, ms[i].seg, 4); in += 4;
+        inner[in++] = 0x00;
+        memcpy(inner + in, ms[i].body, ms[i].bn); in += ms[i].bn;
+    }
+
+    uint8_t b[192];
+    size_t n = 0;
+    const uint8_t root_name[] = { 0x08, 'V','A','L','U', 0x0A, 0x01 };
+    memcpy(b + n, root_name, sizeof root_name); n += sizeof root_name;
+    uint8_t lenb[4];
+    size_t ln = emit_pkglen(lenb, 4 + in);
+    b[n++] = 0x10;                                    /* ScopeOp */
+    memcpy(b + n, lenb, ln); n += ln;
+    memcpy(b + n, "SCPA", 4); n += 4;
+    memcpy(b + n, inner, in); n += in;
+
+    WITH_PARSE("eval: §5.3 scoping — inner, root anchor, ^ and ^^", b, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        eq("consumed all", aml_lex_pos(), n);
+        uint64_t scope = nth_child(root, 1);
+        eq("scope kind", aml_node_kind(scope), N_SCOPE);
+
+        uint64_t innr = nth_child(scope, 1);
+        uint64_t rtmd = nth_child(scope, 2);
+        uint64_t ppmd = nth_child(scope, 3);
+        uint64_t pp2m = nth_child(scope, 4);
+
+        aml_eval_reset(2);
+        eq("bare NameSeg finds the INNER declaration",
+           aml_eval_method(innr), 2);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        aml_eval_reset(2);
+        eq("\\-anchored name reaches the root past an inner match",
+           aml_eval_method(rtmd), 1);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        aml_eval_reset(2);
+        eq("^ resolves to the method's parent scope",
+           aml_eval_method(ppmd), 2);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        aml_eval_reset(2);
+        eq("^^ resolves two levels up, to the root",
+           aml_eval_method(pp2m), 1);
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+}
+
+/* The two ways §5.3 resolution is allowed to FAIL, and the rule that a
+ * multi-segment relative path does NOT get the search. `SCPA.VALU`
+ * written inside \SCPA.MSMD names \SCPA.MSMD.SCPA.VALU, which does not
+ * exist; an implementation that searched upward anyway would find
+ * \SCPA.VALU and return 2. */
+static void test_eval_name_resolution_refusals(void)
+{
+    uint8_t inner[128];
+    size_t in = 0;
+    const uint8_t nm[] = { 0x08, 'V','A','L','U', 0x0A, 0x02 };
+    memcpy(inner + in, nm, sizeof nm); in += sizeof nm;
+
+    struct { const char *seg; uint8_t body[12]; size_t bn; } ms[] = {
+        /* Return(SCPA.VALU) — DualNamePath, multi-segment relative */
+        { "MSMD", { 0xA4, 0x2E, 'S','C','P','A', 'V','A','L','U' }, 10 },
+        /* Return(^^^VALU) — one level more than the scope has */
+        { "OVER", { 0xA4, 0x5E, 0x5E, 0x5E, 'V','A','L','U' }, 8 },
+    };
+    for (size_t i = 0; i < 2; i++) {
+        uint8_t lenb[4];
+        size_t ln = emit_pkglen(lenb, 4 + 1 + ms[i].bn);
+        inner[in++] = 0x14;
+        memcpy(inner + in, lenb, ln); in += ln;
+        memcpy(inner + in, ms[i].seg, 4); in += 4;
+        inner[in++] = 0x00;
+        memcpy(inner + in, ms[i].body, ms[i].bn); in += ms[i].bn;
+    }
+
+    uint8_t b[192];
+    size_t n = 0;
+    uint8_t lenb[4];
+    size_t ln = emit_pkglen(lenb, 4 + in);
+    b[n++] = 0x10;
+    memcpy(b + n, lenb, ln); n += ln;
+    memcpy(b + n, "SCPA", 4); n += 4;
+    memcpy(b + n, inner, in); n += in;
+
+    WITH_PARSE("eval: §5.3 refusals", b, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t scope = nth_child(root, 0);
+        uint64_t msmd = nth_child(scope, 1);
+        uint64_t over = nth_child(scope, 2);
+
+        aml_eval_reset(2);
+        eq("multi-segment relative name is not searched upward",
+           aml_eval_method(msmd), 0);
+        eq("NAME_NOT_FOUND", aml_eval_err(), E_NAME_NOT_FOUND);
+
+        aml_eval_reset(2);
+        eq("too many ^ is refused", aml_eval_method(over), 0);
+        eq("BAD_PARENT_PREFIX, not NOT_FOUND",
+           aml_eval_err(), E_BAD_PARENT_PREFIX);
+    });
+}
+
+/* A Field's NameString is the REGION's, not its own, so the three Field
+ * kinds must be name-transparent: a field element lives in the scope that
+ * contains the Field declaration. If they contributed a path component,
+ * FLD0 would sit at \REGN.FLD0 and this resolution would MISS (36) rather
+ * than resolve and then refuse to READ a field element (35). */
+static void test_eval_field_element_is_not_under_the_region(void)
+{
+    uint8_t b[] = {
+        0x5B, 0x80, 'R','E','G','N', 0x00, 0x0A, 0x10, 0x0A, 0x04,
+        0x5B, 0x81, 0x0B, 'R','E','G','N', 0x01, 'F','L','D','0', 0x08,
+        0x14, 0x0B, 'F','L','D','M', 0x00, 0xA4, 'F','L','D','0'
+    };
+    WITH_PARSE("eval: a field element is not under its region", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t m = nth_child(root, 2);
+        eq("method kind", aml_node_kind(m), N_METHOD);
+        aml_eval_reset(2);
+        eq("returns nothing", aml_eval_method(m), 0);
+        /* Found — and then refused as unreadable, which is #1057's work.
+         * NAME_NOT_FOUND here would mean the path was built wrong. */
+        eq("resolved, then refused as unreadable",
+           aml_eval_err(), E_NOT_EVALUABLE);
+
+        /* The Field node itself carries a name_ref — the REGION's — while
+         * contributing nothing to the path, so at top level its absolute
+         * path is EMPTY. The empty path names nothing, and the only thing
+         * that keeps such a node from being handed back as the declaration
+         * of the empty path is the declaration filter in aml_eval_find.
+         * This is the one place that filter is observable: everywhere else
+         * a transparent node shares its path with the naming ancestor it
+         * inherited from, and that ancestor is always allocated first, so
+         * first-match-wins already lands on the declaration. */
+        uint64_t fld = nth_child(root, 1);
+        eq("field node kind", aml_node_kind(fld), N_FIELD);
+        g_checks++;
+        if (aml_node_name(fld) == 0)
+            fail("the Field should carry its region's name_ref");
+        eq("path computed", aml_eval_abspath(fld, 0), 1);
+        eq("a Field contributes no path component", aml_eval_path_len(0), 0);
+        eq("the empty path is the declaration of nothing",
+           aml_eval_find(0), 0);
+    });
+}
+
+/* ---------------------------------------------------------------------
+ * Statements: If/Else, While that terminates, Break, Continue, Return.
+ * --------------------------------------------------------------------- */
+static void test_eval_if_else(void)
+{
+    uint8_t f[] = {
+        0x14, 0x11, 'I','F','E','L', 0x00,
+            0xA0, 0x05, 0x00, 0xA4, 0x0A, 0x01,   /* If(Zero){Return(1)} */
+            0xA1, 0x04, 0xA4, 0x0A, 0x02          /* Else  {Return(2)} */
+    };
+    WITH_PARSE("eval: If false takes the Else", f, sizeof f, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t m = aml_node_first_child(root);
+        aml_eval_reset(2);
+        eq("Else arm ran", aml_eval_method(m), 2);
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+
+    uint8_t t[] = {
+        0x14, 0x11, 'I','F','E','L', 0x00,
+            0xA0, 0x05, 0x01, 0xA4, 0x0A, 0x01,   /* If(One){Return(1)} */
+            0xA1, 0x04, 0xA4, 0x0A, 0x02          /* Else   {Return(2)} */
+    };
+    WITH_PARSE("eval: If true skips the Else", t, sizeof t, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t m = aml_node_first_child(root);
+        aml_eval_reset(2);
+        eq("If arm ran", aml_eval_method(m), 1);
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+}
+
+static void test_eval_while_terminates_naturally(void)
+{
+    uint8_t b[] = {
+        0x14, 0x1E, 'L','O','O','P', 0x00,
+            0x72, 0x0A, 0x00, 0x00, 0x60,          /* Local0 = 0 */
+            0x72, 0x0A, 0x00, 0x00, 0x61,          /* Local1 = 0 */
+            0xA2, 0x0B, 0x95, 0x60, 0x0A, 0x05,    /* While(LLess(Local0,5)) */
+                0x75, 0x60,                        /*   Increment(Local0) */
+                0x72, 0x61, 0x60, 0x61,            /*   Local1 += Local0 */
+            0xA4, 0x61                             /* Return(Local1) */
+    };
+    WITH_PARSE("eval: a While with a real predicate terminates", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t m = aml_node_first_child(root);
+        aml_eval_reset(2);
+        eq("1+2+3+4+5", aml_eval_method(m), 15);
+        eq("no error", aml_eval_err(), AML_OK);
+        g_checks++;
+        if (aml_eval_fuel() == 0)
+            fail("a terminating loop should not have spent the whole budget");
+    });
+}
+
+/* Break must leave the loop. Without it this fixture is `While(One)` and
+ * would end in FUEL_EXHAUSTED — so the assertion is not merely that the
+ * value is 3 but that no error was latched at all. */
+static void test_eval_break_leaves_the_loop(void)
+{
+    uint8_t b[] = {
+        0x14, 0x19, 'B','R','K','L', 0x00,
+            0x72, 0x0A, 0x00, 0x00, 0x60,          /* Local0 = 0 */
+            0xA2, 0x0B, 0x01,                      /* While(One) */
+                0x75, 0x60,                        /*   Increment(Local0) */
+                0xA0, 0x06, 0x93, 0x60, 0x0A, 0x03,/*   If(LEqual(Local0,3)) */
+                    0xA5,                          /*     Break */
+            0xA4, 0x60                             /* Return(Local0) */
+    };
+    WITH_PARSE("eval: Break leaves an otherwise infinite While", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t m = aml_node_first_child(root);
+        aml_eval_reset(2);
+        eq("loop left after three iterations", aml_eval_method(m), 3);
+        eq("no fuel exhaustion", aml_eval_err(), AML_OK);
+    });
+}
+
+/* ---------------------------------------------------------------------
+ * Stores. LocalX, ArgX and a named integer object; Zero as the null
+ * target; anything else refused.
+ * --------------------------------------------------------------------- */
+static void test_eval_named_store(void)
+{
+    uint8_t b[] = {
+        0x08, 'A','C','C','U', 0x0A, 0x00,         /* Name(ACCU, 0) */
+        0x14, 0x14, 'S','T','O','R', 0x00,
+            0x72, 0x0A, 0x07, 0x0A, 0x05, 'A','C','C','U',  /* ACCU = 7+5 */
+            0xA4, 'A','C','C','U'                  /* Return(ACCU) */
+    };
+    WITH_PARSE("eval: store into a named integer object", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t nm = nth_child(root, 0);
+        uint64_t m  = nth_child(root, 1);
+        eq("name kind", aml_node_kind(nm), N_NAME);
+        eq("initial value", aml_u64_get(aml_node_arg0(nm)), 0);
+        aml_eval_reset(2);
+        eq("reads back what was stored", aml_eval_method(m), 12);
+        eq("the object itself was updated",
+           aml_u64_get(aml_node_arg0(nm)), 12);
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+}
+
+static void test_eval_increment_decrement(void)
+{
+    uint8_t b[] = {
+        0x14, 0x13, 'I','N','C','D', 0x00,
+            0x72, 0x0A, 0x05, 0x00, 0x60,          /* Local0 = 5 */
+            0x75, 0x60,                            /* Increment -> 6 */
+            0x75, 0x60,                            /* Increment -> 7 */
+            0x76, 0x60,                            /* Decrement -> 6 */
+            0xA4, 0x60
+    };
+    WITH_PARSE("eval: Increment and Decrement read-modify-write", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t m = aml_node_first_child(root);
+        aml_eval_reset(2);
+        eq("5 +1 +1 -1", aml_eval_method(m), 6);
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+}
+
+/* Divide has TWO destinations and they are Remainder THEN Quotient
+ * (§19.6.34). Swapping them yields 23 instead of 32, so the arithmetic
+ * that reads them back is what pins the order. */
+static void test_eval_divide_two_destinations(void)
+{
+    uint8_t b[] = {
+        0x14, 0x16, 'D','I','V','T', 0x00,
+            0x78, 0x0A, 0x11, 0x0A, 0x05, 0x60, 0x61,  /* 17/5 -> r=2,q=3 */
+            0xA4, 0x72, 0x77, 0x61, 0x0A, 0x0A, 0x00, 0x60, 0x00
+    };
+    WITH_PARSE("eval: Divide fills Remainder then Quotient", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t m = aml_node_first_child(root);
+        aml_eval_reset(2);
+        eq("quotient*10 + remainder", aml_eval_method(m), 32);
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+}
+
+/* ---------------------------------------------------------------------
+ * The operator table (#1055). One method per expression, so each case
+ * also exercises a frame push, a scope switch and a Return.
+ * --------------------------------------------------------------------- */
+static void test_eval_arithmetic(void)
+{
+    const uint64_t ONES64 = 0xFFFFFFFFFFFFFFFFull;
+
+    EXPR_CASE("eval: Add",        2, 8,  AML_OK, 0x72,0x0A,0x05,0x0A,0x03,0x00);
+    EXPR_CASE("eval: Subtract",   2, 2,  AML_OK, 0x74,0x0A,0x05,0x0A,0x03,0x00);
+    EXPR_CASE("eval: Multiply",   2, 15, AML_OK, 0x77,0x0A,0x05,0x0A,0x03,0x00);
+    EXPR_CASE("eval: Divide",     2, 3,  AML_OK, 0x78,0x0A,0x11,0x0A,0x05,0x00,0x00);
+    EXPR_CASE("eval: Mod",        2, 2,  AML_OK, 0x85,0x0A,0x11,0x0A,0x05,0x00);
+    EXPR_CASE("eval: ShiftLeft",  2, 16, AML_OK, 0x79,0x0A,0x01,0x0A,0x04,0x00);
+    EXPR_CASE("eval: ShiftRight", 2, 4,  AML_OK, 0x7A,0x0A,0x10,0x0A,0x02,0x00);
+
+    /* x86 masks a shift count to 6 bits, so a bare `shl` would compute
+     * these as the operand unchanged. ACPI says every bit is shifted out. */
+    EXPR_CASE("eval: ShiftLeft by the full width is Zero",
+              2, 0, AML_OK, 0x79,0x0A,0x01,0x0A,0x40,0x00);
+    EXPR_CASE("eval: ShiftRight by the full width is Zero",
+              2, 0, AML_OK, 0x7A,0xFF,0x0A,0x40,0x00);
+    EXPR_CASE("eval: ShiftLeft beyond the width is Zero",
+              2, 0, AML_OK, 0x79,0x0A,0x01,0x0A,0x7F,0x00);
+
+    EXPR_CASE("eval: And",  2, 0x30, AML_OK, 0x7B,0x0A,0xF0,0x0A,0x3C,0x00);
+    EXPR_CASE("eval: Or",   2, 0xFC, AML_OK, 0x7D,0x0A,0xF0,0x0A,0x0C,0x00);
+    EXPR_CASE("eval: Xor",  2, 0xF0, AML_OK, 0x7F,0x0A,0xFF,0x0A,0x0F,0x00);
+    EXPR_CASE("eval: Nand", 2, ~(uint64_t)0x30, AML_OK,
+              0x7C,0x0A,0xF0,0x0A,0x3C,0x00);
+    EXPR_CASE("eval: Nor",  2, ~(uint64_t)0xFC, AML_OK,
+              0x7E,0x0A,0xF0,0x0A,0x0C,0x00);
+    EXPR_CASE("eval: Not",  2, ~(uint64_t)0x0F, AML_OK, 0x80,0x0A,0x0F,0x00);
+
+    EXPR_CASE("eval: FindSetLeftBit",       2, 8, AML_OK, 0x81,0x0A,0x80,0x00);
+    EXPR_CASE("eval: FindSetLeftBit(Zero)", 2, 0, AML_OK, 0x81,0x00,0x00);
+    EXPR_CASE("eval: FindSetRightBit",      2, 3, AML_OK, 0x82,0x0A,0x0C,0x00);
+    EXPR_CASE("eval: FindSetRightBit(Zero)",2, 0, AML_OK, 0x82,0x00,0x00);
+    EXPR_CASE("eval: FindSetLeftBit(One)",  2, 1, AML_OK, 0x81,0x01,0x00);
+
+    EXPR_CASE("eval: LAnd true",  2, ONES64, AML_OK, 0x90,0x01,0x01);
+    EXPR_CASE("eval: LAnd false", 2, 0,      AML_OK, 0x90,0x01,0x00);
+    EXPR_CASE("eval: LOr true",   2, ONES64, AML_OK, 0x91,0x00,0x01);
+    EXPR_CASE("eval: LOr false",  2, 0,      AML_OK, 0x91,0x00,0x00);
+    EXPR_CASE("eval: LNot(Zero)", 2, ONES64, AML_OK, 0x92,0x00);
+    EXPR_CASE("eval: LNot(One)",  2, 0,      AML_OK, 0x92,0x01);
+    EXPR_CASE("eval: LEqual",     2, ONES64, AML_OK, 0x93,0x0A,0x05,0x0A,0x05);
+    EXPR_CASE("eval: LGreater",   2, ONES64, AML_OK, 0x94,0x0A,0x05,0x0A,0x03);
+    EXPR_CASE("eval: LLess",      2, ONES64, AML_OK, 0x95,0x0A,0x03,0x0A,0x05);
+
+    /* AML integers are UNSIGNED. With jg/jl instead of ja/jb, Ones is -1
+     * and both of these invert. */
+    EXPR_CASE("eval: LGreater is unsigned", 2, ONES64, AML_OK, 0x94,0xFF,0x01);
+    EXPR_CASE("eval: LLess is unsigned",    2, 0,      AML_OK, 0x95,0xFF,0x01);
+
+    /* LGreaterEqual / LLessEqual / LNotEqual have no opcodes: iasl emits
+     * LNot of the dual, and that is what is asserted. */
+    EXPR_CASE("eval: LGreaterEqual is LNot(LLess)", 2, ONES64, AML_OK,
+              0x92,0x95,0x0A,0x05,0x0A,0x05);
+    EXPR_CASE("eval: LLessEqual is LNot(LGreater)", 2, ONES64, AML_OK,
+              0x92,0x94,0x0A,0x05,0x0A,0x05);
+    EXPR_CASE("eval: LNotEqual is LNot(LEqual)", 2, ONES64, AML_OK,
+              0x92,0x93,0x0A,0x05,0x0A,0x03);
+
+    EXPR_CASE("eval: RevisionOp", 2, 2, AML_OK, 0x5B,0x30);
+
+    /* Divide by zero is an error, not a #DE — which in a userspace process
+     * would be SIGFPE and would let firmware bytecode kill the supervisor. */
+    EXPR_CASE("eval: Divide by zero", 2, 0, E_DIVIDE_BY_ZERO,
+              0x78,0x0A,0x05,0x00,0x00,0x00);
+    EXPR_CASE("eval: Mod by zero", 2, 0, E_DIVIDE_BY_ZERO,
+              0x85,0x0A,0x05,0x00,0x00);
+
+    /* Boundaries with #1056 / #1057, refused rather than approximated. */
+    EXPR_CASE("eval: Increment of a literal is not a target",
+              2, 0, E_BAD_TARGET, 0x75,0x0A,0x05);
+    EXPR_CASE("eval: Store is deferred", 2, 0, E_NOT_EVALUABLE,
+              0x70,0x01,0x60);
+    EXPR_CASE("eval: Concat is deferred", 2, 0, E_NOT_EVALUABLE,
+              0x73,0x01,0x01,0x00);
+    EXPR_CASE("eval: a String is deferred", 2, 0, E_NOT_EVALUABLE,
+              0x0D,'h','i',0x00);
+    EXPR_CASE("eval: a Buffer is deferred", 2, 0, E_NOT_EVALUABLE,
+              0x11,0x03,0x01,0x00);
+}
+
+/* ---------------------------------------------------------------------
+ * Integer width follows the TABLE REVISION, not the machine. ACPI 6.5
+ * §19.6: 32-bit when the DSDT/SSDT revision is 1, 64-bit from 2 on. iasl
+ * still emits revision 1 unless told otherwise, so this is not a legacy
+ * concern.
+ * --------------------------------------------------------------------- */
+static void test_eval_integer_width_follows_revision(void)
+{
+    const uint64_t ONES64 = 0xFFFFFFFFFFFFFFFFull;
+
+    /* Ones truncates. design/acpi/aml-parser.md §9 deferred exactly this
+     * to R30.M2: the parser stores the full 64-bit value so one parse
+     * tree serves both revisions, and the evaluator narrows on read. */
+    EXPR_CASE("eval rev1: Ones is 32-bit", 1, 0xFFFFFFFFull, AML_OK, 0xFF);
+    EXPR_CASE("eval rev2: Ones is 64-bit", 2, ONES64,        AML_OK, 0xFF);
+
+    EXPR_CASE("eval rev1: Not(Zero) is 32-bit", 1, 0xFFFFFFFFull, AML_OK,
+              0x80,0x00,0x00);
+    EXPR_CASE("eval rev2: Not(Zero) is 64-bit", 2, ONES64, AML_OK,
+              0x80,0x00,0x00);
+
+    /* Addition wraps at the table's width. */
+    EXPR_CASE("eval rev1: Add wraps at 2^32", 1, 0, AML_OK,
+              0x72,0x0C,0xFF,0xFF,0xFF,0xFF,0x0A,0x01,0x00);
+    EXPR_CASE("eval rev2: Add does not wrap at 2^32", 2, 0x100000000ull, AML_OK,
+              0x72,0x0C,0xFF,0xFF,0xFF,0xFF,0x0A,0x01,0x00);
+
+    /* A shift by 32 empties a 32-bit integer and does not empty a 64-bit
+     * one, so the width is doing real work in both directions. */
+    EXPR_CASE("eval rev1: ShiftLeft by 32 is Zero", 1, 0, AML_OK,
+              0x79,0x01,0x0A,0x20,0x00);
+    EXPR_CASE("eval rev2: ShiftLeft by 32 is 2^32", 2, 0x100000000ull, AML_OK,
+              0x79,0x01,0x0A,0x20,0x00);
+
+    /* The discriminator: on a revision-1 table Ones EQUALS 0xFFFFFFFF. A
+     * hardcoded 64-bit interpreter answers Zero here. */
+    EXPR_CASE("eval rev1: Ones == 0xFFFFFFFF", 1, 0xFFFFFFFFull, AML_OK,
+              0x93,0xFF,0x0C,0xFF,0xFF,0xFF,0xFF);
+    EXPR_CASE("eval rev2: Ones != 0xFFFFFFFF", 2, 0, AML_OK,
+              0x93,0xFF,0x0C,0xFF,0xFF,0xFF,0xFF);
+
+    /* Revision 0 predates the 64-bit definition and is read narrowly. */
+    EXPR_CASE("eval rev0: narrowed to 32-bit", 0, 0xFFFFFFFFull, AML_OK, 0xFF);
+
+    /* And a store into a named object narrows too, so a revision-1 object
+     * can never come to hold a 64-bit value. */
+    EXPR_CASE("eval rev1: RevisionOp reports 1", 1, 1, AML_OK, 0x5B,0x30);
+}
+
+/* aml_arith_handles is the executable form of "which opcodes #1055 owns".
+ * Asserting it in both directions is what stops the header list and the
+ * dispatch chain drifting apart. */
+static void test_eval_operator_coverage(void)
+{
+    g_case = "eval: operator coverage is exact";
+    static const uint64_t owned[] = {
+        0x72, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C,
+        0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x82, 0x85,
+        0x90, 0x91, 0x92, 0x93, 0x94, 0x95
+    };
+    static const uint64_t not_owned[] = {
+        0x70,        /* Store        — #1057 */
+        0x71,        /* RefOf        — #1057 */
+        0x73,        /* Concat       — #1056 */
+        0x83,        /* DerefOf      — #1057 */
+        0x84,        /* ConcatRes    — #1056 */
+        0x86,        /* Notify       — #1059 */
+        0x87,        /* SizeOf       — #1056 */
+        0x88,        /* Index        — #1057 */
+        0x8E,        /* ObjectType   — #1057 */
+        0x96,        /* ToBuffer     — #1056 */
+        0x99,        /* ToInteger    — #1056 */
+        0x9E,        /* Mid          — #1056 */
+        0x5B12       /* CondRefOf    — #1057 */
+    };
+    for (size_t i = 0; i < sizeof owned / sizeof owned[0]; i++)
+        eq("owned", aml_arith_handles(owned[i]), 1);
+    for (size_t i = 0; i < sizeof not_owned / sizeof not_owned[0]; i++)
+        eq("not owned", aml_arith_handles(not_owned[i]), 0);
+    /* 0x83..0x84 sit inside no range; 0x85 Mod sits outside the 0x72..0x82
+     * block and is reached by its own arm, which is why both ends of the
+     * arithmetic range are probed here rather than assumed contiguous. */
+    eq("below the range", aml_arith_handles(0x71), 0);
+    eq("above the logical range", aml_arith_handles(0x96), 0);
+}
+
+/* aml_eval_names decides which nodes contribute a component to an absolute
+ * namespace path, and getting it wrong corrupts every path underneath
+ * rather than failing visibly. It is a table with a reason per row in
+ * aml_eval.pdx, so it is asserted here as a table too — every kind the
+ * arena defines, in both directions. The three Field kinds and the four
+ * reference kinds are the rows that matter: they all CARRY a name_ref, so
+ * a "has a name" implementation would include them and would place every
+ * field element under its region. */
+static void test_eval_name_contributing_kinds(void)
+{
+    g_case = "eval: which node kinds contribute a namespace component";
+    static const uint64_t names_it[] = {
+        N_SCOPE, N_DEVICE, N_METHOD, N_NAME, N_ALIAS, N_PROCESSOR,
+        N_POWERRES, N_THERMALZONE, N_OPREGION, N_FIELD_ELEM, N_EXTERNAL,
+        N_MUTEX, N_EVENT
+    };
+    static const uint64_t transparent[] = {
+        N_ROOT,                             /* the empty path, not a segment */
+        N_FIELD, N_INDEXFIELD, N_BANKFIELD, /* carry the REGION's name */
+        N_FIELD_LINK, N_FIELD_CONNECT,      /* references */
+        N_OPAQUE, N_FIELD_ACCESS, N_FIELD_RESERVED,
+        N_CALL,                             /* carries the CALLEE's name */
+        N_NAMEREF,                          /* a use, not a declaration */
+        N_EXPR, N_IF, N_ELSE, N_WHILE, N_RETURN, N_BREAK, N_CONTINUE,
+        N_NOOP, N_BREAKPOINT, N_INT, N_STRING, N_BUFFER, N_PACKAGE,
+        N_VARPACKAGE, N_ARGX, N_LOCALX, N_MISC, N_RESOURCE, N_RESDESC
+    };
+    for (size_t i = 0; i < sizeof names_it / sizeof names_it[0]; i++)
+        eq("contributes", aml_eval_names(names_it[i]), 1);
+    for (size_t i = 0; i < sizeof transparent / sizeof transparent[0]; i++)
+        eq("transparent", aml_eval_names(transparent[i]), 0);
+    /* and nothing beyond the kind space */
+    eq("kind 0 is not a kind", aml_eval_names(0), 0);
+    eq("past the table", aml_eval_names(64), 0);
+}
+
 /* ============================================ self-check on the apparatus */
 
 /* If the guard page is not actually adjacent to the fixture, every
@@ -1938,6 +2949,12 @@ int main(void)
     sa.sa_flags = SA_NODEFER;
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
+
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_alarm;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGALRM, &sa, NULL);
+    alarm(60);
 
     test_guard_page_is_armed();
 
@@ -1986,11 +3003,43 @@ int main(void)
     test_arena_exhaustion();
     test_field_offset_overflow();
 
+    /* ---- R30.M2: the evaluator. The three termination guards come
+     * first, because if any of them is broken the rest of this list
+     * never runs — it hangs. ---- */
+    test_eval_fuel_terminates_while_one();
+    test_eval_depth_cap();
+    test_eval_frame_pool_exhaustion();
+    test_eval_frame_pool_api();
+    test_eval_session_isolation();
+    test_eval_refuses_a_failed_parse();
+
+    test_eval_name_resolution();
+    test_eval_name_resolution_refusals();
+    test_eval_field_element_is_not_under_the_region();
+
+    test_eval_frame_isolation_in_aml();
+    test_eval_args_evaluated_in_caller_frame();
+    test_eval_method_arguments();
+
+    test_eval_if_else();
+    test_eval_while_terminates_naturally();
+    test_eval_break_leaves_the_loop();
+
+    test_eval_named_store();
+    test_eval_increment_decrement();
+    test_eval_divide_two_destinations();
+
+    test_eval_arithmetic();
+    test_eval_integer_width_follows_revision();
+    test_eval_operator_coverage();
+    test_eval_name_contributing_kinds();
+
     if (g_fail) {
         fprintf(stderr, "[aml-corpus] %d assertion(s) failed out of %d\n",
                 g_fail, g_checks);
         return 1;
     }
+    alarm(0);
     printf("[aml-corpus] %d assertions PASS\n", g_checks);
     return 0;
 }

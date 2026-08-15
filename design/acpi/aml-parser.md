@@ -3,7 +3,9 @@
 **Round.** R30 — ACPICA userspace bubble + LPSS bus enablement
 **Issues.** #1049 (tokenizer) · #1050 (namespace objects) · #1051 (control
 flow) · #1052 (data objects) · #1053 (resource templates)
-**Status.** Landed — R30.M1 complete. R30.M2 (#1054+) adds the evaluator.
+**Status.** Landed — R30.M1 complete. The evaluator (#1054/#1055 and on)
+is [`aml-evaluator.md`](aml-evaluator.md), which continues this document's
+error taxonomy at code 31 and its module layout with two more files.
 
 ---
 
@@ -44,8 +46,14 @@ built on every push so the cross-module symbol graph stays resolved.
 | `src/user/aml/aml_ns.pdx` | namespace-object recursive-descent parser | #1050 |
 | `src/user/aml/aml_term.pdx` | control flow, expressions, data objects, method invocation | #1051 / #1052 |
 | `src/user/aml/aml_resource.pdx` | resource-descriptor mini-language | #1053 |
+| `src/user/aml/aml_eval.pdx` | evaluation context, budgets, frame pool, §5.3 namespace walker | #1054 |
+| `src/user/aml/aml_arith.pdx` | arithmetic and logical operators | #1055 |
 | `tests/user/aml/aml_harness.c` | executable byte-fixture corpus | all |
 | `tools/verify-aml-parser.sh` | build-time verification, wired into pre-push | all |
+
+The two evaluator modules are documented in
+[`aml-evaluator.md`](aml-evaluator.md); they are listed here so this table
+stays the single index of the subsystem.
 
 `aml_term.pdx` and `aml_resource.pdx` declare **no private storage at
 all** — everything they touch is reached through the lexer and arena
@@ -337,6 +345,12 @@ consumes at minimum the opcode byte itself — and is retained as a
 structural guard; #1052's package-element loop carries it for exactly the
 same reason. Code 18 is retired, above. Both are documented as untested
 rather than given contrived tests.
+
+Codes **31..41** belong to the evaluator and are tabulated in
+[`aml-evaluator.md`](aml-evaluator.md) §7. They share this numbering space
+deliberately — one code space means a code identifies its origin
+unambiguously — but they are latched in a **different slot**, because
+parsing is per-table and evaluation is per-invocation.
 
 ---
 
@@ -790,14 +804,14 @@ literal is atomic.
 
 | Deferred | To |
 |---|---|
-| `DataRegion` (three TermArgs plus a NameString) — the one ACPI 6.5 opcode still refused with `UNEXPECTED_OP` | R30.M2 |
+| `DataRegion` (three TermArgs plus a NameString) — the one ACPI 6.5 opcode still refused with `UNEXPECTED_OP` | R30.M2, still open |
 | Computed `Name` initialisers — `DataRefObject` admits only literals and aggregates per §20.2.5.1, so a computed one is genuinely malformed and stays refused | — |
-| A `Method` declared inside an If/While body, called from a body swept earlier (§6a) — refused, never mis-parsed | R30.M2, with the namespace index |
-| Sorted final-NameSeg index to replace the linear arity scan | R30.M2, together with the arena growth |
-| Full scope resolution of a NameString to a namespace node | R30.M2 |
+| A `Method` declared inside an If/While body, called from a body swept earlier (§6a) — refused, never mis-parsed | still open — needs the namespace index |
+| Sorted final-NameSeg index to replace the linear arity scan | still open — `aml_eval_find` now wants the same index, so the two should be replaced together (`aml-evaluator.md` §4) |
+| ~~Full scope resolution of a NameString to a namespace node~~ | **done** — #1054, `aml-evaluator.md` §4 |
 | `ExtendedSpace` (large item 11) accessors — different layout from the Word/DWord/QWord family | when a device presents one |
-| Evaluation of anything at all — OpRegion access, method execution | R30.M2 (#1054+) |
-| Revision-dependent truncation of `OnesOp` to 32 bits | R30.M2 — a parser that truncated would destroy information the evaluator needs |
+| ~~Evaluation of anything at all — method execution~~ | **partly done** — #1054/#1055. OpRegion access is still open |
+| ~~Revision-dependent truncation of `OnesOp` to 32 bits~~ | **done** — #1054. The parser still stores the full 64-bit value and the evaluator narrows on read, so one parse tree serves both table revisions (`aml-evaluator.md` §3) |
 | `Processor` `PblkAddr`/`PblkLen`, `PowerResource` `ResourceOrder` | recoverable from `src_off`; store them if a consumer ever needs them without re-reading |
 | Arena sizing for a full DSDT | a `.bss` change; exhaustion is already a clean error |
 

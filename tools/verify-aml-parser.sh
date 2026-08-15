@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # tools/verify-aml-parser.sh — R30.M1-001 (#1049) / R30.M1-002 (#1050)
 #                              R30.M1-003/004/005 (#1051 / #1052 / #1053)
+#                              R30.M2-001/002 (#1054 / #1055)
 #
-# Build-time verification of the userspace AML tokenizer and namespace
-# parser. Wired into `.githooks/pre-push` as the `aml-parser` step, in the
+# Build-time verification of the userspace AML tokenizer, namespace parser
+# and evaluator. Wired into `.githooks/pre-push` as the `aml-parser` step, in the
 # same slot and the same style as tools/verify-elaborator-negatives.sh.
 #
 # WHY BUILD-TIME AND NOT A BOOT WITNESS
@@ -25,7 +26,7 @@
 #      braces alongside tools/lint-no-kernel-aml.sh: that script polices
 #      identifiers, this one polices files.
 #
-#   2. COMPILATION. All six modules build with the pinned paideia-as.
+#   2. COMPILATION. All eight modules build with the pinned paideia-as.
 #
 #   3. STORAGE ENCAPSULATION. Checked with `objdump -r`, which is the only
 #      way to prove it mechanically: a module's private .bss must be
@@ -42,9 +43,12 @@
 #      state from the parser would quietly void the guarantee; this check
 #      fails the push instead.
 #
-#      #1051/#1052/#1053 added aml_term.o and aml_resource.o with NO
-#      private storage of their own, so this check needed no new
-#      assertion — but adding them to MODULES makes the three existing
+#      #1054 added aml_eval.o, whose state carries the fuel and depth
+#      counters and the frame pool, so it gets its own assertion — the
+#      termination and frame-isolation guarantees both rest on single
+#      ownership. #1051/#1052/#1053/#1055 added aml_term.o,
+#      aml_resource.o and aml_arith.o with NO private storage of their
+#      own, so those needed no new assertion — but adding them to MODULES makes the three existing
 #      assertions strictly stronger, because they now also prove that
 #      the term parser and the resource decoder cannot reach the lexer
 #      cursor, the arenas or the opcode table except through the
@@ -62,10 +66,11 @@
 #
 #   $ bash tools/verify-aml-parser.sh
 #   [aml-parser] placement: no AML sources under src/kernel/**
-#   [aml-parser] compiled 6 module(s)
+#   [aml-parser] compiled 8 module(s)
 #   [aml-parser] encapsulation: aml_lex_state confined to aml_lex.o
 #   [aml-parser] encapsulation: arena storage confined to aml_arena.o
 #   [aml-parser] encapsulation: aml_optab confined to aml_optab.o
+#   [aml-parser] encapsulation: evaluator state confined to aml_eval.o
 #   [aml-corpus] NNN assertions PASS
 #   [aml-parser] PASS
 #
@@ -81,7 +86,7 @@ AML_SRC="${REPO_ROOT}/src/user/aml"
 HARNESS="${REPO_ROOT}/tests/user/aml/aml_harness.c"
 OUT="${REPO_ROOT}/build/aml"
 
-MODULES=(aml_lex aml_arena aml_optab aml_ns aml_term aml_resource)
+MODULES=(aml_lex aml_arena aml_optab aml_ns aml_term aml_resource aml_eval aml_arith)
 
 # ── environment ──────────────────────────────────────────────────────
 PA_BIN="$(bash "${REPO_ROOT}/tools/find-paideia-as.sh")"
@@ -178,6 +183,36 @@ check_confined "aml_lex_state confined to aml_lex.o" aml_lex "aml_lex_state${END
 check_confined "arena storage confined to aml_arena.o" aml_arena \
                "(aml_node_arena|aml_name_arena|aml_u64_arena|aml_arena_state|aml_node_last)${END}"
 check_confined "aml_optab confined to aml_optab.o" aml_optab "aml_optab${END}|aml_optab_len${END}"
+
+# R30.M2-001 (#1054). The evaluator's context is the second piece of state in
+# this subsystem with a safety invariant attached to single ownership, so it
+# gets the same treatment as the lexer cursor.
+#
+#   aml_eval_state carries the FUEL COUNTER, the DEPTH COUNTER and the frame
+#   top. The termination guarantee — a While(One) over firmware-controlled
+#   bytes stops rather than hangs — holds only for as long as the counters are
+#   decremented exclusively by aml_eval_spend and aml_eval_enter. A module
+#   that wrote the fuel slot directly, or that "just topped it up" inside a
+#   loop, would void the guarantee with no other symptom than a hang on
+#   hardware nobody has yet. This check fails the push instead.
+#
+#   aml_frame_pool carries every method's Arg and Local slots. Frame ISOLATION
+#   — a callee cannot observe or corrupt its caller's locals — is delivered by
+#   indexing every access off the CURRENT frame base inside aml_eval.o. Any
+#   other object reaching the pool array would be computing frame addresses
+#   itself, which is precisely the arithmetic isolation depends on.
+#
+#   aml_path_buf and aml_path_anc are the namespace walker's scratch. They are
+#   confined for a different reason: they are reused across the search rule's
+#   repeated probes, so a second writer would corrupt a resolution in flight
+#   and produce a WRONG name binding rather than a failure.
+#
+# aml_arith.o declares no storage at all, so adding it to MODULES costs no new
+# assertion and makes all four of these strictly stronger — they now also
+# prove the operator implementations reach none of this state except through
+# the accessor API.
+check_confined "evaluator state confined to aml_eval.o" aml_eval \
+               "(aml_eval_state|aml_frame_pool|aml_path_buf|aml_path_anc)${END}"
 
 # ── 4. the corpus ────────────────────────────────────────────────────
 OBJS=()
