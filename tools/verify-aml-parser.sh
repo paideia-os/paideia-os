@@ -90,7 +90,7 @@ HARNESS="${REPO_ROOT}/tests/user/aml/aml_harness.c"
 OUT="${REPO_ROOT}/build/aml"
 
 MODULES=(aml_lex aml_arena aml_optab aml_ns aml_term aml_resource aml_eval aml_arith
-         aml_obj aml_str aml_ref)
+         aml_obj aml_str aml_ref aml_ctl)
 
 # ── environment ──────────────────────────────────────────────────────
 PA_BIN="$(bash "${REPO_ROOT}/tools/find-paideia-as.sh")"
@@ -252,6 +252,32 @@ check_confined "object arena confined to aml_obj.o" aml_obj \
 # precisely how they would come to.
 check_confined "aml_conv_tab confined to aml_str.o" aml_str \
                "(aml_conv_tab|aml_conv_len)${END}"
+
+# The notification ring (#1059) and the serialized-method mutex pool (#1060).
+#
+# The ring is the evaluator's only EGRESS and the mutex pool its only
+# cross-invocation state, so both are worth one assertion each rather than
+# being folded in behind aml_eval.o's.
+#
+# The ring's guarantee is the accounting identity
+#     offered == drained + depth + drops
+# and that identity holds only for as long as the three counters move
+# together inside aml_notify_enqueue and aml_notify_pop. A second writer --
+# an evaluator that "just bumped the drop count" on some other refusal, or a
+# supervisor that advanced head without going through pop -- would break it
+# with no symptom other than a notification the OS never hears about and
+# never learns it missed.
+#
+# The mutex pool's guarantee is that an acquisition count is incremented in
+# exactly one place and decremented in exactly one other, which is what makes
+# a recursive serialized method unwind exactly as deep as it nested. A second
+# writer here reintroduces the deadlock the recursive acquire exists to
+# prevent, or leaks a hold that silently refuses every later acquire in the
+# session on SyncLevel grounds.
+check_confined "notify ring confined to aml_ctl.o" aml_ctl \
+               "(aml_notify_ring|aml_notify_state)${END}"
+check_confined "serialized-method mutex pool confined to aml_ctl.o" aml_ctl \
+               "(aml_mutex_pool|aml_mutex_state)${END}"
 
 # ── 4. the corpus ────────────────────────────────────────────────────
 OBJS=()

@@ -1,0 +1,913 @@
+// src/user/aml/aml_ctl.pdx — R30.M2-006 (#1059) / R30.M2-007 (#1060)
+//
+// The two things an AML evaluation does that reach OUTSIDE the evaluator:
+// it signals the OS (`Notify`) and it serialises against itself
+// (`Method(..., Serialized, SyncLevel)`).
+//
+// PLACEMENT — CONSTITUTIONAL
+// -------------------------
+// Userspace only. See design/acpi/no-aml-in-kernel.md and the header of
+// src/user/aml/aml_lex.pdx.
+//
+// =====================================================================
+// WHY THIS IS A SEPARATE MODULE
+// =====================================================================
+// Both features need PRIVATE MUTABLE STORAGE — a notification ring and a
+// mutex pool — and tools/verify-aml-parser.sh proves each such arena is
+// written by exactly one object file. Putting the ring inside aml_eval.o
+// would put it behind the same confinement assertion as the frame pool
+// and the fuel counter, which would then no longer say what it says
+// today: that NOTHING but the budget accountant touches the budget. Two
+// arenas with two owners is two assertions; one arena with two purposes
+// is none.
+//
+// It is also the honest boundary. `Notify` is the evaluator's only
+// EGRESS and the serialisation pool is its only cross-invocation STATE.
+// Everything else in the evaluator is a pure function of the arena plus
+// the current frame. Naming that boundary in the file layout means a
+// future reader looking for "what can this thing do to the rest of the
+// system" reads one file.
+//
+// =====================================================================
+// PART 1 — Notify, AND WHY THE EVALUATOR MUST NEVER BLOCK ON IT
+// =====================================================================
+// ACPI 6.5 §19.6.85. `Notify(Object, NotificationValue)` tells the OS
+// that something about a Device, Processor or ThermalZone changed: a bus
+// wants re-enumerating (0x00), a device check (0x01), an eject request
+// (0x03), a thermal trip (0x80). The OS is expected to act on it.
+//
+// The naive implementation sends an IPC message and waits for the
+// supervisor to take it. That implementation is a supervisor stall with
+// a firmware-controlled trigger, and it is reachable from a table:
+//
+//     While (One) { Notify(\_SB.PCI0, 0x00) }
+//
+// Both the loop bound and the message rate are chosen by the firmware.
+// A blocking send would park the interpreter holding whatever the
+// interpreter holds, and every other ACPI consumer — the thermal poll,
+// the lid switch, the battery — waits behind it. Worse, a `Notify`
+// issued while the supervisor is itself handling a notification would
+// deadlock outright: the drainer is not draining, because it is inside
+// the evaluator that is trying to enqueue.
+//
+// So delivery is a BOUNDED RING WITH A DROP POLICY, and the evaluator
+// returns from `Notify` unconditionally.
+//
+//   DEPTH        32 entries. A docking or undocking event — the largest
+//                real burst — emits under a dozen; a full `_Lxx` GPE
+//                sweep emits one per changed device. 32 is comfortably
+//                above both and costs 1 KiB of .bss. A power of two so
+//                the slot index is an AND, not a division, which matters
+//                because the enqueue happens with the interpreter's
+//                budget already ticking.
+//
+//   ENTRY        4 x u64, 32 bytes — the same stride as an object record
+//                and as an arena node, deliberately, so the whole
+//                subsystem has ONE stride and a dump is readable.
+//                  +0  OFFER SEQUENCE — monotonic, counting every Notify
+//                      the evaluator attempted, INCLUDING the dropped
+//                      ones. See below.
+//                  +8  target arena node (the Device/Processor/TZ decl)
+//                  +16 notification value
+//                  +24 target ObjectType — 6 Device, 12 Processor,
+//                      13 ThermalZone — so the supervisor routes without
+//                      re-entering the evaluator to ask.
+//
+//   DROP POLICY  TAIL-DROP: a full ring refuses the NEW event and keeps
+//                the old ones. NOT overwrite-oldest, and the difference
+//                is not a preference.
+//
+//                Overwrite-oldest turns bounded LOSS into REORDERING.
+//                The oldest entries are the ones the supervisor is about
+//                to act on; discarding a pending `Notify(DEV0, 0x03)`
+//                (eject request — the user pressed the button) because a
+//                later `Notify(DEV0, 0x80)` (thermal) needed the slot
+//                means the eject silently never happens while a
+//                lower-priority event does. Tail-drop loses the NEWEST,
+//                which is the one the supervisor has not yet formed any
+//                expectation about, and it makes the drop counter mean
+//                exactly "events you were never told about".
+//
+//   OBSERVABILITY  Three counters, and the third is the one that matters.
+//                  aml_notify_drops   — how many were refused
+//                  aml_notify_depth   — how many are pending
+//                  aml_notify_offered — how many were attempted
+//                and the per-entry OFFER SEQUENCE. A global drop count
+//                tells the supervisor THAT it missed something; the
+//                sequence number tells it WHERE, because two consecutive
+//                drained entries whose sequences differ by more than one
+//                bracket the loss. A supervisor that sees a gap can
+//                re-enumerate the affected bus rather than re-enumerating
+//                everything, and that is the difference between a
+//                recoverable drop and a useless one.
+//
+//                The invariant, asserted by the corpus:
+//                    offered == drained + depth + drops
+//                It is what makes "no event went anywhere unaccounted"
+//                a checkable statement rather than a claim.
+//
+//   FUEL         The enqueue spends a step of its own, ON BOTH PATHS —
+//                accepted and dropped. On both, because a dropped Notify
+//                still cost the operand evaluation and the ring probe,
+//                and because a firmware loop that only ever drops must
+//                not be cheaper than one that succeeds; if it were,
+//                filling the ring would be the way to make a Notify
+//                storm free. The step is charged HERE and not only by
+//                aml_eval_stmt's dispatch, for the same reason While
+//                charges one per iteration on top of its predicate: an
+//                IPC-visible side effect is worth more than an arithmetic
+//                node and the budget should say so.
+//
+//   THE COUNTERS DO NOT RESET WITH THE SESSION. aml_eval_reset is
+//   per-invocation; the ring is per-SUPERVISOR. Clearing the drop count
+//   when a new method starts would hide exactly the pattern worth seeing
+//   (a table that drops on every evaluation), and clearing the RING
+//   would discard notifications the supervisor has not drained yet. So
+//   aml_ctl_reset — which aml_eval_reset calls — deliberately touches
+//   the MUTEX pool and not the ring. The ring is cleared only by
+//   aml_notify_reset, which is the supervisor's to call.
+//
+// =====================================================================
+// PART 2 — SERIALIZED METHODS, AND THE RE-ENTRY THAT MUST NOT DEADLOCK
+// =====================================================================
+// ACPI 6.5 §20.2.5.2. The MethodFlags byte carries SerializeFlag at bit 3
+// and SyncLevel at bits 4..7. A serialized method acquires an implicit
+// mutex at its SyncLevel on entry and releases it on exit.
+//
+// THE RULE THAT CATCHES PEOPLE: the implicit mutex is RECURSIVE FOR ITS
+// OWNER. A serialized method that calls itself — directly, or through a
+// helper that calls back — must run, not hang. ACPICA implements this
+// with an acquisition COUNT (AcpiExAcquireMutexObject: "Support for
+// multiple acquires by the owning thread"), and a straight
+// test-and-set implementation of `Serialized` deadlocks on the first
+// recursive table it meets. Since firmware writers mark methods
+// Serialized precisely because they touch shared state, and shared-state
+// helpers are exactly what gets called recursively, this is not an
+// exotic input.
+//
+// So: acquire is
+//     count == 0            -> take it, owner = ctx, count = 1
+//     count > 0, owner==ctx -> count += 1, PROCEED
+//     count > 0, owner!=ctx -> would block
+// and release decrements, freeing the entry at zero.
+//
+// SYNC LEVEL ORDERING — §19.6.2, and ACPICA AcpiExAcquireMutex:
+//
+//     if (mutex->SyncLevel < thread->CurrentSyncLevel) -> MUTEX_ORDER
+//
+// Acquiring a mutex at a level BELOW the highest currently held is the
+// error. It is the whole point of SyncLevel: it makes lock ordering a
+// static property of the table, so a table that cannot deadlock can be
+// distinguished from one that can WITHOUT running it. Enforcing it is
+// therefore not pedantry — a table that violates it is a table whose
+// deadlock-freedom nobody has established, and running it anyway is
+// choosing to find out on hardware.
+//
+// The ordering check does NOT fire on recursive re-entry: re-entering a
+// mutex already held is `level == CurrentSyncLevel`, and the test is
+// strictly-less-than. That is not a special case bolted on; it falls out
+// of using the same comparison ACPICA uses.
+//
+// On first acquisition the entry saves the CurrentSyncLevel it displaced
+// and restores it on final release — ACPICA's OriginalSyncLevel. Saving
+// it per-MUTEX rather than keeping a stack is what makes release correct
+// without a separate unwind structure.
+//
+// The release-order check ACPICA also has (`mutex->SyncLevel >
+// CurrentSyncLevel` on release) is not implemented, because for IMPLICIT
+// method mutexes it cannot fire: they are acquired and released by
+// aml_eval_call around aml_eval_body, so their nesting is the call
+// stack's and is LIFO by construction. It becomes reachable when
+// explicit Acquire/Release (§19.6.2) land in R30.M3, and belongs there
+// with the fixture that reaches it.
+//
+// ONE EXECUTION CONTEXT, STATED HONESTLY
+// --------------------------------------
+// There is exactly one AML execution context today: acpi_supervisor
+// evaluates one method at a time. aml_ctl_ctx therefore returns the
+// constant 1, and the "owner != ctx" arm above is UNREACHABLE from any
+// input. It is implemented anyway and it latches
+// AML_ERR_MUTEX_CONTENTION (54) rather than blocking, because the one
+// thing that must not happen when a second context arrives is a silent
+// wrong answer; a refusal is a bug report, a fake acquire is a data
+// race. The corpus cannot test that arm and does not pretend to — it
+// tests what one context can reach: recursive self-entry SUCCEEDS, the
+// acquire count BALANCES across nesting, a SyncLevel violation ERRORS,
+// and a leaked acquire is DETECTED.
+//
+// POOL SIZE — 8, exactly the frame pool's depth. A method's mutex is
+// held only while the method is on the stack, at most 8 frames are ever
+// live, so at most 8 distinct serialized methods can be held at once and
+// a ninth is unreachable through AML: aml_frame_push refuses first with
+// AML_ERR_FRAME_OVERFLOW (33). The bound is still CHECKED, and reachable
+// through the API, because "unreachable" is a property of today's frame
+// count and a pool that indexed past its end when that changed would
+// corrupt the ring next door.
+//
+// ERROR CODES ADDED HERE — continuing aml-parser.md §5 and
+// aml-evaluator.md §7/§15
+// -----------------------------------------------------------------
+//   51 AML_ERR_ARG_COUNT          call arity disagrees with the decl
+//   52 AML_ERR_BAD_NOTIFY_TARGET  Notify target is not a Device,
+//                                 Processor or ThermalZone
+//   53 AML_ERR_SYNC_LEVEL         acquire below the current sync level
+//   54 AML_ERR_MUTEX_CONTENTION   held by another context (unreachable)
+//   55 AML_ERR_MUTEX_POOL_FULL    more than 8 serialized methods held
+
+module AmlCtl = structure {
+
+  // ==========================================================================
+  // STORAGE. Confined to aml_ctl.o by tools/verify-aml-parser.sh.
+  //
+  //   aml_notify_ring   32 entries x 4 u64            1 KiB
+  //   aml_notify_state  +0  head    entries POPPED, monotonic
+  //                     +8  tail    entries ACCEPTED, monotonic
+  //                     +16 drops   entries REFUSED, saturating
+  //                     +24..+56 reserved
+  //   aml_mutex_pool    8 entries x 4 u64
+  //                     +0  method node, 0 = free
+  //                     +8  acquisition count
+  //                     +16 sync level of this method
+  //                     +24 the CurrentSyncLevel this acquire displaced
+  //   aml_mutex_state   +0  current sync level
+  //                     +8  total acquisitions, monotonic (diagnostic)
+  //                     +16 leaked-entry count, monotonic
+  //                     +24..+56 reserved
+  // ==========================================================================
+  pub let mut aml_notify_ring  : [u64; 128] = uninit @align(8)
+  pub let mut aml_notify_state : [u64; 8]   = uninit @align(8)
+  pub let mut aml_mutex_pool   : [u64; 32]  = uninit @align(8)
+  pub let mut aml_mutex_state  : [u64; 8]   = uninit @align(8)
+
+  // ==========================================================================
+  // Part 1 — the notification ring.
+  // ==========================================================================
+
+  pub let aml_notify_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-006 (#1059): empty the ring and zero every counter. THE SUPERVISOR'S CALL, NOT THE EVALUATOR'S -- aml_eval_reset deliberately does not call this. An evaluation session is per-invocation and the ring is per-supervisor: clearing it when a new method starts would discard notifications nobody has drained yet, and clearing the DROP COUNT would erase the one signal that says this table overruns the ring on every evaluation. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_notify_state];
+        xor rax, rax;
+        mov [rcx + 0], rax;
+        mov [rcx + 8], rax;
+        mov [rcx + 16], rax;
+        mov [rcx + 24], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_notify_depth : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-006 (#1059): how many notifications are pending, i.e. tail minus head. Both are MONOTONIC counters rather than wrapped indices, so this subtraction is the depth directly and cannot be confused about a full ring versus an empty one -- the classic head==tail ambiguity does not arise because the counters do not wrap at the ring size, only the SLOT INDEX derived from them does. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_notify_state];
+        mov rax, [rcx + 8];
+        mov rdx, [rcx + 0];
+        sub rax, rdx;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_notify_drops : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-006 (#1059): how many notifications were REFUSED because the ring was full. The observable that makes tail-drop safe to reason about: a non-zero value means the supervisor was not told about something, and combined with the per-entry offer sequence it says which somethings. Saturating rather than wrapping, so a long-running supervisor cannot see it roll back to zero and conclude nothing was lost. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_notify_state];
+        mov rax, [rcx + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_notify_drained : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-006 (#1059): how many notifications the supervisor has popped. Diagnostic, and one of the four terms in the accounting identity offered == drained + depth + drops. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_notify_state];
+        mov rax, [rcx + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_notify_offered : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-006 (#1059): how many notifications the evaluator ATTEMPTED, accepted and dropped alike -- tail plus drops. This is the number stamped into each accepted entry's sequence field, and it is what turns a global drop count into a localisable one: a supervisor draining entries whose sequences jump from 40 to 43 knows two events were lost BETWEEN THOSE TWO, not merely that two were lost somewhere. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_notify_state];
+        mov rax, [rcx + 8];
+        mov rdx, [rcx + 16];
+        add rax, rdx;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_notify_peek : (u64) -> u64 !{mem} @{} =
+    fn (field: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-006 (#1059): field rdi (0 sequence, 1 target node, 2 value, 3 target ObjectType) of the OLDEST pending notification. Returns 0 on an empty ring or an out-of-range field, WITHOUT latching an error: draining is a poll, and a supervisor that polls an empty ring has done nothing wrong. That is the one place in this subsystem where a zero is not a refusal, and it is safe because the caller establishes non-emptiness with aml_notify_depth first -- which the corpus asserts it must. A peek/pop pair rather than a copy-out through a pointer because handing a raw destination address across the module boundary is exactly the aliasing the confinement assertions exist to prevent. Locals: r12=field. Reserved labels: aml_np_.",
+      block: {
+        cmp rdi, 4;
+        jae aml_np_none;
+        lea rcx, [rip + aml_notify_state];
+        mov rax, [rcx + 8];
+        mov rdx, [rcx + 0];
+        cmp rax, rdx;
+        je aml_np_none;                  // empty
+        mov rax, [rcx + 0];
+        and rax, 31;                     // slot = head mod 32
+        shl rax, 2;                      // 4 words per entry
+        add rax, rdi;
+        lea rcx, [rip + aml_notify_ring];
+        mov rax, [rcx + rax*8];
+        ret;
+      aml_np_none:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_notify_pop : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-006 (#1059): retire the oldest pending notification. Returns 1 when one was retired, 0 when the ring was already empty. The slot's contents are left in place rather than cleared, because the enqueue overwrites all four words before publishing and clearing twice is work for no invariant -- the same reasoning as aml_frame_pop. Reserved labels: aml_nq_.",
+      block: {
+        lea rcx, [rip + aml_notify_state];
+        mov rax, [rcx + 8];
+        mov rdx, [rcx + 0];
+        cmp rax, rdx;
+        je aml_nq_empty;
+        mov rax, [rcx + 0];
+        add rax, 1;
+        mov [rcx + 0], rax;
+        mov rax, 1;
+        ret;
+      aml_nq_empty:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_notify_enqueue : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (node: u64) (value: u64) (objtype: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-006 (#1059): offer a notification for target arena node rdi, value rsi, ObjectType rdx. RETURNS 1 WHEN ACCEPTED AND 0 WHEN DROPPED, AND NEVER BLOCKS AND NEVER LATCHES AN ERROR -- a dropped notification is a droppable event, not a table fault, and turning it into a latched error would let firmware halt an evaluation by filling a ring the supervisor happens not to have drained. The step of fuel is spent BEFORE the fullness test, so the accepted and dropped paths cost the same: if dropping were cheaper, filling the ring would be the way to make a Notify storm free, and a storm is precisely what the bound exists to survive. The four words are written BEFORE tail advances, so a drainer can never observe a slot that is counted but not yet filled -- there is one execution context today, but the publish-last discipline is what makes this ring correct when there is not, and retrofitting it later means auditing every store. Locals: r12=node, r13=value, r14=objtype, r15=slot address. Reserved labels: aml_ne_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rdi;
+        mov r13, rsi;
+        mov r14, rdx;
+        call aml_eval_spend;             // charged on BOTH paths
+        cmp rax, 0;
+        je aml_ne_drop;
+        lea rcx, [rip + aml_notify_state];
+        mov rax, [rcx + 8];
+        mov rdx, [rcx + 0];
+        sub rax, rdx;
+        cmp rax, 32;
+        jae aml_ne_drop;                 // TAIL-DROP: keep the old ones
+        // ---- slot address from the monotonic tail ----
+        mov rax, [rcx + 8];
+        and rax, 31;
+        shl rax, 5;                      // 32 bytes per entry
+        lea r15, [rip + aml_notify_ring];
+        add r15, rax;
+        // ---- the offer sequence: tail + drops, the number this IS ----
+        mov rax, [rcx + 8];
+        mov rdx, [rcx + 16];
+        add rax, rdx;
+        mov [r15 + 0], rax;
+        mov [r15 + 8], r12;
+        mov [r15 + 16], r13;
+        mov [r15 + 24], r14;
+        // ---- publish ----
+        lea rcx, [rip + aml_notify_state];
+        mov rax, [rcx + 8];
+        add rax, 1;
+        mov [rcx + 8], rax;
+        mov rax, 1;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+      aml_ne_drop:
+        lea rcx, [rip + aml_notify_state];
+        mov rax, [rcx + 16];
+        add rax, 1;
+        cmp rax, 0;
+        jne aml_ne_dropped;
+        sub rax, 1;                      // it wrapped: saturate at the maximum
+      aml_ne_dropped:
+        mov [rcx + 16], rax;
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_ctl_handles : (u64) -> u64 !{} @{} =
+    fn (op16: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R30.M2-006 (#1059): the exact set of opcodes this module evaluates, as an executable predicate -- the same device as aml_arith_handles, aml_str_handles and aml_ref_handles, and asserted by the corpus in both directions. One opcode: NotifyOp 0x86. It is alone because it is the only Type1Opcode with an operand list that reaches outside the interpreter; Acquire, Release, Signal and Wait join it in R30.M3 and each will be a row here rather than a branch elsewhere. Reserved labels: aml_ch_.",
+      block: {
+        cmp rdi, 0x86;
+        je aml_ch_yes;
+        xor rax, rax;
+        ret;
+      aml_ch_yes:
+        mov rax, 1;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_ctl_notify_kind_ok : (u64) -> u64 !{} @{} =
+    fn (kind: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R30.M2-006 (#1059): may a node of arena kind rdi be the target of a Notify? ACPI 6.5 §19.6.85 names exactly three -- Device (3), Processor (7) and ThermalZone (9) -- and the list is closed. Notifying a Name, a Method, a Mutex or an OperationRegion is a table bug: the supervisor's handler table is keyed by those three ObjectTypes and has nowhere to route anything else, so accepting one would enqueue an event that can only be dropped later, at a point with no context left to report it. Refusing here reports it at the site that got it wrong. A predicate rather than three compares inline so the corpus can assert the set as a table in both directions. Reserved labels: aml_nk_.",
+      block: {
+        cmp rdi, 3;                      // AML_NODE_DEVICE
+        je aml_nk_yes;
+        cmp rdi, 7;                      // AML_NODE_PROCESSOR
+        je aml_nk_yes;
+        cmp rdi, 9;                      // AML_NODE_THERMALZONE
+        je aml_nk_yes;
+        xor rax, rax;
+        ret;
+      aml_nk_yes:
+        mov rax, 1;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_ctl_notify_objtype : (u64) -> u64 !{} @{} =
+    fn (kind: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R30.M2-006 (#1059): the ACPI ObjectType a notifiable arena kind reports -- Device 3 -> 6, Processor 7 -> 12, ThermalZone 9 -> 13, everything else 0. Stamped into the ring entry so the supervisor routes on the SPEC's numbering rather than on this parser's internal node kinds, which are an implementation detail it must not learn. Reserved labels: aml_no_.",
+      block: {
+        cmp rdi, 3;
+        je aml_no_dev;
+        cmp rdi, 7;
+        je aml_no_cpu;
+        cmp rdi, 9;
+        je aml_no_tz;
+        xor rax, rax;
+        ret;
+      aml_no_dev:
+        mov rax, 6;
+        ret;
+      aml_no_cpu:
+        mov rax, 12;
+        ret;
+      aml_no_tz:
+        mov rax, 13;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_ctl_notify : (u64) -> u64 !{mem} @{} =
+    fn (expr_node: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-006 (#1059): evaluate `Notify(Object, Value)` -- EXPR node rdi, op16 0x86. Returns 1 when the notification was OFFERED (accepted or dropped) and 0 having latched. BOTH OPERANDS GO THROUGH aml_conv_operand, so the (operator, position) table in aml_str.pdx is what says operand 0 is a Reference and operand 1 an Integer; there is no operand fetch of this operator's own, which is what stops the table and the implementation drifting apart. Operand 0's want of 20 does real work: aml_conv_cast returns a Reference unchanged and latches AML_ERR_BAD_REF (45) for anything else, so `Notify(5, 0x80)` and `Notify(SOMENAME, 0x80)` -- where SOMENAME holds an Integer -- are both refused by the TABLE rather than by a hand-written type test. What the table cannot say is that the reference must name a DEVICE and not, say, a Mutex; that is AML_ERR_BAD_NOTIFY_TARGET (52) and it is checked here. A DROPPED notification RETURNS SUCCESS: see aml_notify_enqueue. Locals: r12=node, r13=reference, r14=value, r15=target node; [rsp+0]=target kind. Reserved labels: aml_cn_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;
+        mov r12, rdi;
+        // ---- operand 0: a Reference, per the table row for 0x86 ----
+        mov rdi, r12;
+        xor rsi, rsi;
+        call aml_conv_operand;
+        mov r13, rax;
+        cmp r13, 0;
+        je aml_cn_fail;
+        // ---- it must be a REF_NAME naming a notifiable declaration ----
+        mov rdi, r13;
+        call aml_obj_refkind;
+        cmp rax, 1;                      // REF_NAME
+        jne aml_cn_badtarget;
+        mov rdi, r13;
+        call aml_obj_base;
+        mov r15, rax;
+        cmp r15, 0;
+        je aml_cn_badtarget;
+        mov rdi, r15;
+        call aml_node_kind;
+        mov [rsp + 0], rax;
+        mov rdi, rax;
+        call aml_ctl_notify_kind_ok;
+        cmp rax, 0;
+        je aml_cn_badtarget;
+        // ---- operand 1: an Integer, per the same row ----
+        mov rdi, r12;
+        mov rsi, 1;
+        call aml_conv_operand;
+        cmp rax, 0;
+        je aml_cn_fail;
+        mov rdi, rax;
+        call aml_obj_int_value;
+        mov r14, rax;
+        call aml_eval_err;
+        cmp rax, 0;
+        jne aml_cn_fail;
+        // ---- offer it; a drop is not a failure ----
+        mov rdi, [rsp + 0];
+        call aml_ctl_notify_objtype;
+        mov rdx, rax;
+        mov rdi, r15;
+        mov rsi, r14;
+        call aml_notify_enqueue;
+        call aml_eval_err;
+        cmp rax, 0;
+        jne aml_cn_fail;                 // fuel ran out inside the enqueue
+        mov rax, 1;
+        jmp aml_cn_out;
+      aml_cn_badtarget:
+        mov rdi, 52;                     // AML_ERR_BAD_NOTIFY_TARGET
+        call aml_eval_set_err;
+      aml_cn_fail:
+        xor rax, rax;
+      aml_cn_out:
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Part 2 — serialized methods.
+  // ==========================================================================
+
+  pub let aml_ctl_ctx : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R30.M2-007 (#1060): the identity of the CURRENT AML execution context. Constant 1 today, because acpi_supervisor evaluates one method at a time and there is exactly one. It exists as a FUNCTION and not as the literal 1 spelled into aml_ctl_acquire because the recursive-acquire rule is 'the owner may re-enter' and the owner comparison is the entire difference between a recursive mutex and a broken one; writing it as a comparison against a named context now means the second context is a change to THIS function, not a re-derivation of the locking rule. Leaf accessor. Reserved labels: none.",
+      block: {
+        mov rax, 1;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_ctl_level : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-007 (#1060): the current context's SyncLevel -- the highest level it holds, or 0 when it holds nothing. Compared against on every acquire (§19.6.2) and restored on every final release. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_mutex_state];
+        mov rax, [rcx + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_ctl_acquires : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-007 (#1060): total successful acquisitions this session, recursive re-entries included. Diagnostic, and the number the recursion fixture asserts: a serialized method that recurses three deep must show THREE acquisitions and one held entry, which is what distinguishes a recursive mutex from one that merely failed to notice it was already held. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_mutex_state];
+        mov rax, [rcx + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_ctl_leaked : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-007 (#1060): how many mutex entries were still HELD when a session was reset, summed over every reset. A LEAK DETECTOR, and the reason it is a counter rather than an assertion: the acquire is released on aml_eval_call's error path as well as its success path, so a non-zero value here means that pairing was broken -- by a new early return, most likely -- and the next session would then start with a phantom SyncLevel floor and refuse acquires that should succeed. Silent recovery plus a visible count beats either a crash or an undetected wedge. Monotonic across resets, so a single stray reset cannot hide behind a later clean one. Leaf accessor. Reserved labels: none.",
+      block: {
+        lea rcx, [rip + aml_mutex_state];
+        mov rax, [rcx + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let aml_ctl_held : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-007 (#1060): how many DISTINCT serialized methods are currently held. Counts occupied pool entries, not acquisitions -- a method entered three times recursively is ONE held entry with a count of three, and the corpus asserts both numbers separately because an implementation that conflated them would pass a balance test while leaking an entry per recursion. Locals: r12=cursor, r13=tally. Reserved labels: aml_hd_.",
+      block: {
+        push r12;
+        push r13;
+        xor r12, r12;
+        xor r13, r13;
+        lea rcx, [rip + aml_mutex_pool];
+      aml_hd_scan:
+        cmp r12, 8;
+        jae aml_hd_out;
+        mov rax, r12;
+        shl rax, 2;
+        mov rax, [rcx + rax*8];
+        cmp rax, 0;
+        je aml_hd_next;
+        add r13, 1;
+      aml_hd_next:
+        add r12, 1;
+        jmp aml_hd_scan;
+      aml_hd_out:
+        mov rax, r13;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_ctl_count_of : (u64) -> u64 !{mem} @{} =
+    fn (method_node: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-007 (#1060): the acquisition count for METHOD node rdi, 0 when it is not held. THE observable for the recursion rule: a serialized method that calls itself must show a count that RISES with the nesting and returns to zero, and a test-and-set implementation shows either a permanent 1 or a hang. A node of 0 is never held, so the sentinel and a real query cannot collide. Locals: r12=node, r13=cursor. Reserved labels: aml_co_.",
+      block: {
+        push r12;
+        push r13;
+        mov r12, rdi;
+        cmp r12, 0;
+        je aml_co_none;
+        xor r13, r13;
+        lea rcx, [rip + aml_mutex_pool];
+      aml_co_scan:
+        cmp r13, 8;
+        jae aml_co_none;
+        mov rax, r13;
+        shl rax, 2;
+        mov rdx, [rcx + rax*8];
+        cmp rdx, r12;
+        je aml_co_hit;
+        add r13, 1;
+        jmp aml_co_scan;
+      aml_co_hit:
+        mov rax, r13;
+        shl rax, 2;
+        add rax, 1;
+        mov rax, [rcx + rax*8];
+        pop r13;
+        pop r12;
+        ret;
+      aml_co_none:
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_ctl_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-007 (#1060): begin a new evaluation session -- free every mutex entry and drop the sync level to zero, COUNTING what was still held. aml_eval_reset calls this; it does NOT call aml_notify_reset, and that asymmetry is the design: mutex state belongs to an INVOCATION and cannot outlive it (a held mutex after the evaluator returned is by definition leaked), while ring state belongs to the SUPERVISOR and clearing it would discard undelivered work. Forcing the pool clean rather than refusing to start is what stops one broken evaluation from wedging every later one behind a phantom SyncLevel floor; aml_ctl_leaked is how the breakage stays visible. Locals: r12=cursor, r13=leaks. Reserved labels: aml_cr_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        xor r12, r12;
+        xor r13, r13;
+        lea r14, [rip + aml_mutex_pool];
+      aml_cr_scan:
+        cmp r12, 8;
+        jae aml_cr_done;
+        mov rax, r12;
+        shl rax, 2;
+        mov rdx, [r14 + rax*8];
+        cmp rdx, 0;
+        je aml_cr_next;
+        add r13, 1;
+      aml_cr_next:
+        mov rax, r12;
+        shl rax, 2;
+        xor rdx, rdx;
+        mov [r14 + rax*8], rdx;
+        add rax, 1;
+        mov [r14 + rax*8], rdx;
+        add rax, 1;
+        mov [r14 + rax*8], rdx;
+        add rax, 1;
+        mov [r14 + rax*8], rdx;
+        add r12, 1;
+        jmp aml_cr_scan;
+      aml_cr_done:
+        lea rcx, [rip + aml_mutex_state];
+        xor rax, rax;
+        mov [rcx + 0], rax;              // sync level
+        mov [rcx + 8], rax;              // acquisitions, per session
+        mov rax, [rcx + 16];
+        add rax, r13;                    // leaks, MONOTONIC across sessions
+        mov [rcx + 16], rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_ctl_acquire : (u64) -> u64 !{mem} @{} =
+    fn (method_node: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-007 (#1060): acquire the implicit mutex of serialized METHOD node rdi at its declared SyncLevel. Returns 1 on success, 0 having latched. THREE OUTCOMES AND THE MIDDLE ONE IS THE WHOLE ISSUE. (1) Not held: check the ordering, take it, save the displaced level. (2) Held BY THIS CONTEXT: increment the count and PROCEED -- the implicit mutex is recursive for its owner (§19.6.2, ACPICA AcpiExAcquireMutexObject), and a test-and-set here deadlocks the first serialized method that calls itself, which is a shape real firmware ships because Serialized is exactly the marking a shared-state helper gets. (3) Held by ANOTHER context: AML_ERR_MUTEX_CONTENTION (54), unreachable today with one context and refused rather than faked. THE ORDERING TEST IS `level < current`, STRICTLY: re-entry is level == current and passes without a special case, which is why the same comparison ACPICA uses is used rather than a hand-rolled one. A violation is AML_ERR_SYNC_LEVEL (53) -- a table acquiring downward is a table whose deadlock-freedom nobody established, and running it anyway is choosing to discover that on hardware. Locals: r12=node, r13=level, r14=free slot+1, r15=cursor. Reserved labels: aml_ma_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rdi;
+        cmp r12, 0;
+        je aml_ma_fail;
+        mov rdi, r12;
+        call aml_method_synclevel;
+        mov r13, rax;
+        // ---- THE ORDER CHECK COMES FIRST, as in ACPICA ----
+        //
+        // AcpiExAcquireMutex tests the level BEFORE AcpiExAcquireMutexObject
+        // gets to notice the mutex is already ours, and the ordering that
+        // produces is deliberate: A(5) -> B(7) -> A(5) is refused, because
+        // re-entering the OUTER lock while holding an inner one is precisely
+        // the cycle SyncLevel exists to make visible. Straight self-recursion
+        // is untouched -- there level == current, and the test is strict.
+        call aml_ctl_level;
+        cmp r13, rax;
+        jb aml_ma_order;
+        // ---- is it already held? ----
+        xor r15, r15;
+        xor r14, r14;
+        lea rcx, [rip + aml_mutex_pool];
+      aml_ma_scan:
+        cmp r15, 8;
+        jae aml_ma_fresh;
+        mov rax, r15;
+        shl rax, 2;
+        mov rdx, [rcx + rax*8];
+        cmp rdx, r12;
+        je aml_ma_again;
+        cmp rdx, 0;
+        jne aml_ma_next;
+        cmp r14, 0;
+        jne aml_ma_next;
+        mov r14, r15;
+        add r14, 1;                      // first free slot, plus one
+      aml_ma_next:
+        add r15, 1;
+        jmp aml_ma_scan;
+
+        // ---- (2)/(3) already held: the owner may re-enter ----
+      aml_ma_again:
+        call aml_ctl_ctx;
+        mov r13, rax;                    // the level is not needed again here:
+                                         // re-entry does not move the floor
+        lea rcx, [rip + aml_mutex_pool];
+        mov rax, r15;
+        shl rax, 2;
+        add rax, 3;
+        mov rax, [rcx + rax*8];
+        shr rax, 32;                     // owner rides the high half
+        cmp rax, r13;
+        jne aml_ma_contend;
+        lea rcx, [rip + aml_mutex_pool];
+        mov rax, r15;
+        shl rax, 2;
+        add rax, 1;
+        mov rdx, [rcx + rax*8];
+        add rdx, 1;
+        mov [rcx + rax*8], rdx;
+        jmp aml_ma_won;
+
+        // ---- (1) not held: take it ----
+      aml_ma_fresh:
+        cmp r14, 0;
+        je aml_ma_full;
+        sub r14, 1;
+        call aml_ctl_level;
+        mov r15, rax;                    // the level this acquire displaces
+        call aml_ctl_ctx;
+        shl rax, 32;
+        or r15, rax;                     // owner in the high half
+        lea rcx, [rip + aml_mutex_pool];
+        mov rax, r14;
+        shl rax, 2;
+        mov [rcx + rax*8], r12;          // +0 method node
+        add rax, 1;
+        mov rdx, 1;
+        mov [rcx + rax*8], rdx;          // +1 count
+        add rax, 1;
+        mov [rcx + rax*8], r13;          // +2 this method's sync level
+        add rax, 1;
+        mov [rcx + rax*8], r15;          // +3 displaced level | owner << 32
+        lea rcx, [rip + aml_mutex_state];
+        mov [rcx + 0], r13;              // current level := this one
+      aml_ma_won:
+        lea rcx, [rip + aml_mutex_state];
+        mov rax, [rcx + 8];
+        add rax, 1;
+        mov [rcx + 8], rax;
+        mov rax, 1;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      aml_ma_order:
+        mov rdi, 53;                     // AML_ERR_SYNC_LEVEL
+        call aml_eval_set_err;
+        jmp aml_ma_fail;
+      aml_ma_contend:
+        mov rdi, 54;                     // AML_ERR_MUTEX_CONTENTION
+        call aml_eval_set_err;
+        jmp aml_ma_fail;
+      aml_ma_full:
+        mov rdi, 55;                     // AML_ERR_MUTEX_POOL_FULL
+        call aml_eval_set_err;
+      aml_ma_fail:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+  pub let aml_ctl_release : (u64) -> u64 !{mem} @{} =
+    fn (method_node: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M2-007 (#1060): release one acquisition of METHOD node rdi's implicit mutex. Returns 1 when it was held, 0 when it was not. RELEASING SOMETHING NOT HELD IS A SILENT 0 AND NOT A LATCH, deliberately: this is called on aml_eval_call's ERROR path as well as its success path, and an error path that latched a SECOND error would replace the code describing what actually went wrong -- the latch is first-writer-wins, so the damage would be to diagnosis rather than to correctness, which is the kind of damage that is hardest to notice. The count is decremented and the entry freed only at ZERO, which is what makes the recursive case unwind exactly as deep as it nested. On the final release the CurrentSyncLevel is restored to the value this acquisition displaced -- ACPICA's OriginalSyncLevel -- rather than recomputed from the pool, because recomputation would need a maximum over the remaining entries and would silently differ the moment two methods share a level. Locals: r12=node, r13=cursor. Reserved labels: aml_mr_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rdi;
+        cmp r12, 0;
+        je aml_mr_no;
+        xor r13, r13;
+        lea rcx, [rip + aml_mutex_pool];
+      aml_mr_scan:
+        cmp r13, 8;
+        jae aml_mr_no;
+        mov rax, r13;
+        shl rax, 2;
+        mov rdx, [rcx + rax*8];
+        cmp rdx, r12;
+        je aml_mr_hit;
+        add r13, 1;
+        jmp aml_mr_scan;
+      aml_mr_hit:
+        lea rcx, [rip + aml_mutex_pool];
+        mov rax, r13;
+        shl rax, 2;
+        add rax, 1;
+        mov rdx, [rcx + rax*8];
+        cmp rdx, 0;
+        je aml_mr_no;
+        sub rdx, 1;
+        mov [rcx + rax*8], rdx;
+        cmp rdx, 0;
+        jne aml_mr_yes;                  // still nested: nothing else changes
+        // ---- final release: restore the displaced level, free the entry ----
+        mov rax, r13;
+        shl rax, 2;
+        add rax, 3;
+        mov rdx, [rcx + rax*8];
+        shl rdx, 32;
+        shr rdx, 32;                     // the saved level is the low half
+        lea r15, [rip + aml_mutex_state];
+        mov [r15 + 0], rdx;
+        mov rax, r13;
+        shl rax, 2;
+        xor rdx, rdx;
+        mov [rcx + rax*8], rdx;          // free the entry
+        add rax, 2;
+        mov [rcx + rax*8], rdx;
+        add rax, 1;
+        mov [rcx + rax*8], rdx;
+      aml_mr_yes:
+        mov rax, 1;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+      aml_mr_no:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    } @no_frame
+
+}

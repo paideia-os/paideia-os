@@ -256,6 +256,39 @@ extern uint64_t aml_ref_index(uint64_t sO, uint64_t i);
 extern uint64_t aml_ref_of_node(uint64_t n, uint64_t q);
 extern uint64_t aml_ref_store_through(uint64_t r, uint64_t sO);
 extern uint64_t aml_ref_handles(uint64_t op16);
+
+/* #1058 — invocation: the return-value tag and the arity cross-check. */
+extern uint64_t aml_conv_argop;
+extern uint64_t aml_eval_retval_is_obj(void);
+extern uint64_t aml_eval_arity_ok(uint64_t call_node, uint64_t method_node);
+
+/* #1059 — the notification ring. */
+extern uint64_t aml_ctl_handles(uint64_t op16);
+extern uint64_t aml_ctl_notify_kind_ok(uint64_t kind);
+extern uint64_t aml_ctl_notify_objtype(uint64_t kind);
+extern uint64_t aml_ctl_notify(uint64_t expr_node);
+extern void     aml_notify_reset(void);
+extern uint64_t aml_notify_depth(void);
+extern uint64_t aml_notify_drops(void);
+extern uint64_t aml_notify_drained(void);
+extern uint64_t aml_notify_offered(void);
+extern uint64_t aml_notify_peek(uint64_t field);
+extern uint64_t aml_notify_pop(void);
+extern uint64_t aml_notify_enqueue(uint64_t node, uint64_t val, uint64_t objtype);
+
+/* #1060 — serialized methods. */
+extern void     aml_ctl_reset(void);
+extern uint64_t aml_ctl_ctx(void);
+extern uint64_t aml_ctl_level(void);
+extern uint64_t aml_ctl_held(void);
+extern uint64_t aml_ctl_acquires(void);
+extern uint64_t aml_ctl_leaked(void);
+extern uint64_t aml_ctl_count_of(uint64_t method_node);
+extern uint64_t aml_ctl_acquire(uint64_t method_node);
+extern uint64_t aml_ctl_release(uint64_t method_node);
+extern uint64_t aml_method_argcount(uint64_t idx);
+extern uint64_t aml_method_serialized(uint64_t idx);
+extern uint64_t aml_method_synclevel(uint64_t idx);
 extern uint64_t aml_ref_eval(uint64_t n);
 
 /* #1057 — evaluator additions */
@@ -313,7 +346,10 @@ enum {
      * still identifies its origin unambiguously. */
     E_OBJ_ARENA_FULL = 42, E_OBJ_HEAP_FULL = 43, E_OBJ_ELEM_FULL = 44,
     E_BAD_REF = 45, E_OBJ_RANGE = 46, E_NO_CONVERSION = 47,
-    E_BAD_OBJTYPE = 48, E_STALE_REF = 49, E_UNINIT_ELEMENT = 50
+    E_BAD_OBJTYPE = 48, E_STALE_REF = 49, E_UNINIT_ELEMENT = 50,
+    /* #1058 / #1059 / #1060 — invocation, Notify, serialized methods. */
+    E_ARG_COUNT = 51, E_BAD_NOTIFY_TARGET = 52, E_SYNC_LEVEL = 53,
+    E_MUTEX_CONTENTION = 54, E_MUTEX_POOL_FULL = 55
 };
 
 /* ACPI ObjectType codes — §19.6.101, and the object model's internal tag. */
@@ -323,7 +359,7 @@ enum {
     T_REGION = 10, T_POWER = 11, T_PROC = 12, T_THERMAL = 13,
     T_BUFFIELD = 14, T_REF = 20,
     /* want-codes that are not types */
-    T_STRDEC = 12, T_SAME0 = 100, T_TARGET = 101
+    T_ANY = 0, T_STRDEC = 12, T_SAME0 = 100, T_TARGET = 101
 };
 
 /* reference sub-kinds */
@@ -3163,13 +3199,57 @@ static void test_conv_table(void)
                                               aml_conv_want(0x7B, 0), T_INT);
         eq("and its position 2 is a Target",  aml_conv_want(0x7B, 2), T_TARGET);
         eq("there is no operand position 4",  aml_conv_want(0x72, 4), 0);
-        /* every row must belong to an operator somebody actually implements,
-         * or the table is describing a promise nothing keeps */
+        /* every row must belong to something somebody actually implements,
+         * or the table is describing a promise nothing keeps. Three owners
+         * now: aml_str, aml_ref and — since #1059 — aml_ctl, which owns
+         * Notify. The METHOD-ARGUMENT row is the one row that is not an
+         * opcode at all; it is checked separately below. */
         for (uint64_t k = 0; k < aml_conv_len; k++) {
             uint64_t op = aml_conv_tab[k] & 0xFFFF;
+            if (op == aml_conv_argop)
+                continue;
             eq("every table row is an implemented operator",
-               aml_str_handles(op) || aml_ref_handles(op), 1);
+               aml_str_handles(op) || aml_ref_handles(op)
+                                   || aml_ctl_handles(op), 1);
         }
+    });
+
+    /* #1059 — Notify's operand types come from the table, and the want of
+     * REFERENCE in position 0 is what refuses `Notify(5, 0x80)` without
+     * Notify's body containing a type test. */
+    OBJ_SESSION("conv: Notify's operands are table rows, not a special case", {
+        eq("operand 0 wants a Reference", aml_conv_want(0x86, 0), T_REF);
+        eq("operand 1 wants an Integer",  aml_conv_want(0x86, 1), T_INT);
+        eq("there is no operand 2",       aml_conv_want(0x86, 2), T_ANY);
+        eq("aml_ctl owns it",             aml_ctl_handles(0x86), 1);
+        eq("and owns nothing else",       aml_ctl_handles(0x87), 0);
+        eq("nor an arithmetic opcode",    aml_ctl_handles(0x72), 0);
+        eq("nor CondRefOf",               aml_ctl_handles(0x5B12), 0);
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+
+    /* #1058 — the METHOD ARGUMENT row. ACPI 6.5 §19.6.83 gives arguments no
+     * implicit conversion, and this row is how that is SAID rather than
+     * merely not-done: without it the default shape applies, and the
+     * default wants Integer at position 0 and a TARGET at position 2 —
+     * both wrong for an argument, and the first would coerce every Buffer
+     * ever passed to a method. The pseudo-opcode is 0xFF01 because op16 is
+     * either a single byte (0x00..0xFF) or 0x5Bxx, so it can never
+     * collide. */
+    OBJ_SESSION("conv: method arguments are a table row that says ANY", {
+        eq("the pseudo-opcode is outside the encoding", aml_conv_argop, 0xFF01);
+        for (uint64_t p = 0; p < 7; p++)
+            eq("no implicit conversion at any argument position",
+               aml_conv_want(aml_conv_argop, p), T_ANY);
+        /* and the row is load-bearing: this is what the DEFAULT would say */
+        eq("without a row, position 0 would want Integer",
+           aml_conv_want(0x0072, 0), T_INT);
+        eq("without a row, position 2 would be a TARGET",
+           aml_conv_want(0x0072, 2), T_TARGET);
+        eq("no operator owns the pseudo-opcode",
+           aml_str_handles(aml_conv_argop) || aml_ref_handles(aml_conv_argop)
+                                           || aml_ctl_handles(aml_conv_argop), 0);
+        eq("no error", aml_eval_err(), AML_OK);
     });
 }
 
@@ -4052,6 +4132,690 @@ static void test_guard_page_is_armed(void)
 
 /* ==================================================================== main */
 
+/* =====================================================================
+ * R30.M2-005 (#1058) — invocation: arity, argument promotion, return type.
+ * ===================================================================== */
+
+/* THE PROMOTION FIXTURE. Two methods with IDENTICAL bodies — Store(0x2A,
+ * Arg0) — called two different ways, and the two must disagree about
+ * whether the caller sees the write.
+ *
+ * That disagreement is the whole of §19.3.5.8's ArgX rule: an ArgX holding
+ * a REFERENCE stores through it, an ArgX holding a VALUE does not. Before
+ * #1058 the question could not arise, because aml_eval_call evaluated
+ * every argument through the INTEGER dispatcher and bound it with
+ * aml_frame_set_arg, which clears the object tag — so RefOf(TGTR) was
+ * either refused or flattened, and either way both methods would agree.
+ *
+ * Two Names rather than one, because a single shared target could be
+ * written by the by-reference call and then read by the by-value one, and
+ * the fixture would pass while proving nothing. */
+static void test_eval_argument_promotion(void)
+{
+    uint8_t b[] = {
+        0x08, 'T','G','T','R', 0x0A, 0x00,     /* Name(TGTR, 0) */
+        0x08, 'T','G','T','V', 0x0A, 0x00,     /* Name(TGTV, 0) */
+        0x14, 0x0A, 'S','E','T','A', 0x01,
+            0x70, 0x0A, 0x2A, 0x68,            /* Store(0x2A, Arg0) */
+        0x14, 0x14, 'B','Y','R','F', 0x00,
+            'S','E','T','A', 0x71,'T','G','T','R',   /* SETA(RefOf(TGTR)) */
+            0xA4, 'T','G','T','R',                   /* Return(TGTR) */
+        0x14, 0x13, 'B','Y','V','L', 0x00,
+            'S','E','T','A', 'T','G','T','V',        /* SETA(TGTV) */
+            0xA4, 'T','G','T','V'                    /* Return(TGTV) */
+    };
+    WITH_PARSE("eval: an argument passed by reference writes through", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t byrf = nth_child(root, 3);
+        uint64_t byvl = nth_child(root, 4);
+
+        aml_eval_reset(2);
+        eq("SETA(RefOf(TGTR)) reached the caller's Name",
+           aml_eval_method(byrf), 0x2A);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("frames unwound", aml_eval_frames(), 0);
+
+        /* The control. Same callee, same body, an argument that is a VALUE
+         * rather than a reference — and the caller's Name is untouched. */
+        aml_eval_reset(2);
+        eq("SETA(TGTV) wrote only the callee's slot",
+           aml_eval_method(byvl), 0);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("frames unwound", aml_eval_frames(), 0);
+    });
+}
+
+/* An argument that is not an integer at all. Before #1058 aml_eval_call
+ * evaluated arguments with aml_eval_node, so a Buffer argument was
+ * NOT_EVALUABLE — which refuses a shape real tables use constantly, since
+ * a helper taking a resource template is how _CRS is usually factored. */
+static void test_eval_object_argument_and_return(void)
+{
+    uint8_t b[] = {
+        0x14, 0x09, 'B','L','E','N', 0x01,
+            0xA4, 0x87, 0x68,                  /* Return(SizeOf(Arg0)) */
+        0x14, 0x12, 'B','M','A','I', 0x00,
+            0xA4, 'B','L','E','N',
+                0x11, 0x06, 0x0A, 0x03, 0x01, 0x02, 0x03,  /* Buffer(3){1,2,3} */
+        0x14, 0x0F, 'R','B','U','F', 0x00,
+            0xA4, 0x11, 0x07, 0x0A, 0x04, 0x09, 0x08, 0x07, 0x06
+    };
+    WITH_PARSE("eval: a Buffer survives being passed and being returned", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t bmai = nth_child(root, 1);
+        uint64_t rbuf = nth_child(root, 2);
+
+        aml_eval_reset(2);
+        eq("the callee saw a Buffer of three", aml_eval_method(bmai), 3);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        /* The return type. `Return(Buffer(...))` is how every _CRS ends,
+         * and #1054 refused it because the retval slot had no way to say
+         * the word was an object index rather than an Integer. */
+        aml_eval_reset(2);
+        uint64_t r = aml_eval_method(rbuf);
+        eq("the return value is tagged as an object",
+           aml_eval_retval_is_obj(), 1);
+        eq("and it is a Buffer", aml_obj_type(r), T_BUF);
+        eq("of the declared length", aml_obj_len(r), 4);
+        eq("with its bytes intact", aml_obj_byte(r, 0), 0x09);
+        eq("and its last byte too", aml_obj_byte(r, 3), 0x06);
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+}
+
+/* An integer-returning method must NOT set the tag, or every caller that
+ * checks it would read a small integer as an arena index. The pairing is
+ * one store, so this is the assertion that keeps it one store. */
+static void test_eval_return_tag_is_exact(void)
+{
+    uint8_t b[] = {
+        0x14, 0x09, 'I','N','T','M', 0x00,
+            0xA4, 0x0A, 0x2A,                  /* Return(42) */
+        0x14, 0x0A, 'V','O','I','D', 0x00,
+            0x70, 0x0A, 0x01, 0x60             /* Store(1, Local0) — no Return */
+    };
+    WITH_PARSE("eval: the return tag says Integer for an Integer", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t intm = nth_child(root, 0);
+        uint64_t voidm = nth_child(root, 1);
+
+        aml_eval_reset(2);
+        eq("value", aml_eval_method(intm), 42);
+        eq("not tagged as an object", aml_eval_retval_is_obj(), 0);
+
+        /* §19.6.100: falling off the end yields Zero. The tag must be
+         * cleared too — otherwise the PREVIOUS invocation's object index
+         * is still sitting in the slot with its tag set, and a caller
+         * reads a stale Buffer as this method's answer. */
+        eq("falling off the end yields Zero", aml_eval_method(voidm), 0);
+        eq("and clears the tag", aml_eval_retval_is_obj(), 0);
+        eq("and the retval slot itself", aml_eval_retval(), 0);
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+}
+
+/* The arity cross-check. Driven through aml_eval_arity_ok directly, and
+ * that is the honest way to test it: the R30.M1 parser refuses with
+ * AMBIGUOUS_CALL (21) the only tables that could make the two counts
+ * disagree, so NO AML INPUT REACHES THE MISMATCH. Asserting an unreachable
+ * branch through AML would mean writing a fixture that cannot fail; calling
+ * the real function the real path calls, with a mismatched pair, tests the
+ * check itself. */
+static void test_eval_arity_cross_check(void)
+{
+    uint8_t b[] = {
+        0x14, 0x08, 'O','N','E','A', 0x01,
+            0xA4, 0x68,                        /* Return(Arg0) */
+        0x14, 0x08, 'T','W','O','A', 0x02,
+            0xA4, 0x68,                        /* Return(Arg0) */
+        0x14, 0x0D, 'C','A','L','1', 0x00,
+            0xA4, 'O','N','E','A', 0x0A, 0x05  /* Return(ONEA(5)) */
+    };
+    WITH_PARSE("eval: a call's arity is checked against the declaration", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t onea = nth_child(root, 0);
+        uint64_t twoa = nth_child(root, 1);
+        uint64_t cal1 = nth_child(root, 2);
+        uint64_t ret  = aml_node_first_child(cal1);
+        uint64_t call = aml_node_first_child(ret);
+        eq("the call node", aml_node_kind(call), N_CALL);
+        eq("declared arities differ", aml_method_argcount(onea), 1);
+        eq("as they must for this to test anything",
+           aml_method_argcount(twoa), 2);
+
+        aml_eval_reset(2);
+        eq("agreement passes", aml_eval_arity_ok(call, onea), 1);
+        eq("and latches nothing", aml_eval_err(), AML_OK);
+
+        aml_eval_reset(2);
+        eq("disagreement is refused", aml_eval_arity_ok(call, twoa), 0);
+        eq("ARG_COUNT latched", aml_eval_err(), E_ARG_COUNT);
+
+        /* and the happy path still runs end to end */
+        aml_eval_reset(2);
+        eq("the call itself evaluates", aml_eval_method(cal1), 5);
+        eq("no error", aml_eval_err(), AML_OK);
+    });
+}
+
+/* =====================================================================
+ * R30.M2-006 (#1059) — Notify.
+ * ===================================================================== */
+
+static void test_notify_target_table(void)
+{
+    g_case = "notify: the notifiable kinds are exactly three";
+    /* §19.6.85 names Device, Processor and ThermalZone and the list is
+     * closed. Asserted as a table in BOTH directions, because the failure
+     * mode of a too-permissive list is an event the supervisor enqueues
+     * and can only drop later, at a point with no context left to say
+     * which table produced it. */
+    static const uint64_t ok[]  = { 3, 7, 9 };
+    static const uint64_t objt[] = { 6, 12, 13 };
+    for (size_t i = 0; i < 3; i++) {
+        eq("notifiable", aml_ctl_notify_kind_ok(ok[i]), 1);
+        eq("and reports the spec's ObjectType",
+           aml_ctl_notify_objtype(ok[i]), objt[i]);
+    }
+    static const uint64_t no[] = { 0, 1, 2, 4, 5, 6, 8, 10, 11, 14, 17, 18, 23, 24, 38 };
+    for (size_t i = 0; i < sizeof no / sizeof no[0]; i++) {
+        eq("not notifiable", aml_ctl_notify_kind_ok(no[i]), 0);
+        eq("and has no ObjectType to report",
+           aml_ctl_notify_objtype(no[i]), 0);
+    }
+}
+
+/* The happy path, and the accounting identity that makes the ring's
+ * bounded loss reasonable about. */
+static void test_notify_delivery(void)
+{
+    uint8_t b[] = {
+        0x5B, 0x82, 0x05, 'D','E','V','0',     /* Device(DEV0) {} */
+        0x14, 0x0D, 'N','T','F','Y', 0x00,
+            0x86, 'D','E','V','0', 0x0A, 0x80  /* Notify(DEV0, 0x80) */
+    };
+    WITH_PARSE("notify: a delivered notification carries node, value and type", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t dev0 = nth_child(root, 0);
+        uint64_t ntfy = nth_child(root, 1);
+        eq("the device", aml_node_kind(dev0), 3);
+
+        aml_notify_reset();
+        aml_eval_reset(2);
+        uint64_t fuel_before = aml_eval_fuel();
+        eq("the method completes", aml_eval_method(ntfy), 0);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("one notification pending", aml_notify_depth(), 1);
+        eq("none dropped", aml_notify_drops(), 0);
+        eq("one offered", aml_notify_offered(), 1);
+        eq("none drained yet", aml_notify_drained(), 0);
+
+        /* Delivery spends fuel. If it did not, a Notify storm would be the
+         * one construct a firmware table could run for free. */
+        g_checks++;
+        if (aml_eval_fuel() >= fuel_before)
+            fail("Notify delivery spent no fuel");
+
+        /* AND IT SPENT EXACTLY ONE STEP OF ITS OWN. Measured on
+         * aml_notify_enqueue directly, because Notify's two operands
+         * evaluate through aml_eval_obj and spend their own — a
+         * before-and-after across the whole statement cannot tell an
+         * enqueue that charges from one riding for free, and a mutant
+         * that deleted the spend survived the coarse check above. Same
+         * lesson as #1057's object dispatcher: measure the leaf. */
+        aml_notify_reset();
+        aml_eval_reset(2);
+        uint64_t f0 = aml_eval_fuel();
+        eq("accepted", aml_notify_enqueue(dev0, 0x81, 6), 1);
+        eq("and it cost exactly one step", f0 - aml_eval_fuel(), 1);
+
+        /* The DROPPED path costs the same. If it were cheaper, filling the
+         * ring would be the way to make a Notify storm free. */
+        for (int i = 0; i < 31; i++)
+            eq("accepted", aml_notify_enqueue(dev0, 0x01, 6), 1);
+        eq("the ring is full", aml_notify_depth(), 32);
+        uint64_t f1 = aml_eval_fuel();
+        eq("refused", aml_notify_enqueue(dev0, 0x01, 6), 0);
+        eq("and a drop costs exactly one step too", f1 - aml_eval_fuel(), 1);
+        eq("counted", aml_notify_drops(), 1);
+        eq("and it did NOT latch — a drop is an event, not a fault",
+           aml_eval_err(), AML_OK);
+
+        aml_notify_reset();
+        aml_eval_reset(2);
+        eq("the method completes again", aml_eval_method(ntfy), 0);
+
+        eq("sequence 0 — the first offer", aml_notify_peek(0), 0);
+        eq("the target node", aml_notify_peek(1), dev0);
+        eq("the notification value", aml_notify_peek(2), 0x80);
+        eq("the ObjectType, not the arena kind", aml_notify_peek(3), 6);
+        eq("field 4 does not exist", aml_notify_peek(4), 0);
+
+        eq("popped", aml_notify_pop(), 1);
+        eq("ring empty", aml_notify_depth(), 0);
+        eq("one drained", aml_notify_drained(), 1);
+        eq("popping an empty ring is a poll, not an error",
+           aml_notify_pop(), 0);
+        eq("and latches nothing", aml_eval_err(), AML_OK);
+
+        /* THE ACCOUNTING IDENTITY. Everything offered went exactly one of
+         * three places, and this is what makes "no event went anywhere
+         * unaccounted" checkable rather than claimed. */
+        eq("offered == drained + depth + drops",
+           aml_notify_offered(),
+           aml_notify_drained() + aml_notify_depth() + aml_notify_drops());
+
+        /* The ring is NOT cleared by a new evaluation session — it belongs
+         * to the supervisor, not to the invocation. */
+        aml_eval_reset(2);
+        eq("a new session does not discard the counters",
+           aml_notify_offered(), 1);
+    });
+}
+
+/* Two failure edges, and they are DIFFERENT failures. The first is caught
+ * by the conversion table (want REFERENCE, cast refuses an Integer); the
+ * second by Notify itself, because the table can say "a reference" but not
+ * "a reference to a Device". */
+static void test_notify_refusals(void)
+{
+    uint8_t b[] = {
+        0x5B, 0x82, 0x05, 'D','E','V','0',
+        0x5B, 0x01, 'M','U','T','X', 0x00,     /* Mutex(MUTX, 0) */
+        0x14, 0x0B, 'N','I','N','T', 0x00,
+            0x86, 0x0A, 0x05, 0x0A, 0x80,      /* Notify(5, 0x80) */
+        0x14, 0x0D, 'N','M','U','X', 0x00,
+            0x86, 'M','U','T','X', 0x0A, 0x80, /* Notify(MUTX, 0x80) */
+        0x14, 0x0D, 'N','O','K','_', 0x00,
+            0x86, 'D','E','V','0', 0x0A, 0x81
+    };
+    WITH_PARSE("notify: a non-reference and a wrong-kind target fail differently", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t nint = nth_child(root, 2);
+        uint64_t nmux = nth_child(root, 3);
+        uint64_t nok  = nth_child(root, 4);
+
+        /* (1) Not a reference at all. Refused by aml_conv_cast, driven by
+         * the table row for 0x86 — Notify's body has no type test. */
+        aml_notify_reset();
+        aml_eval_reset(2);
+        eq("refused", aml_eval_method(nint), 0);
+        eq("BAD_REF, from the conversion table", aml_eval_err(), E_BAD_REF);
+        eq("nothing was enqueued", aml_notify_offered(), 0);
+
+        /* (2) A perfectly good reference to something that cannot be
+         * notified. The table cannot express this; Notify can. */
+        aml_notify_reset();
+        aml_eval_reset(2);
+        eq("refused", aml_eval_method(nmux), 0);
+        eq("BAD_NOTIFY_TARGET", aml_eval_err(), E_BAD_NOTIFY_TARGET);
+        eq("nothing was enqueued", aml_notify_offered(), 0);
+
+        /* (3) Notify is a Type1Opcode — a STATEMENT. In value position it
+         * is a refusal and not a plausible zero, which is what stops
+         * `Store(Notify(D,1), X)` from looking like it worked. */
+        aml_notify_reset();
+        aml_eval_reset(2);
+        uint64_t expr = aml_node_first_child(nok);
+        eq("the Notify node", aml_node_kind(expr), N_EXPR);
+        eq("it has no value", aml_eval_obj(expr), 0);
+        eq("NOT_EVALUABLE", aml_eval_err(), E_NOT_EVALUABLE);
+        eq("and it was not delivered as a side effect",
+           aml_notify_offered(), 0);
+
+        /* and the same node in statement position works */
+        aml_notify_reset();
+        aml_eval_reset(2);
+        eq("delivered", aml_eval_method(nok), 0);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("one offered", aml_notify_offered(), 1);
+        eq("value 0x81", aml_notify_peek(2), 0x81);
+    });
+}
+
+/* THE RING UNDER LOAD. Forty notifications into a thirty-two-deep ring:
+ * the evaluator must not block, must not fail, must deliver the first
+ * thirty-two, and must COUNT the eight it refused.
+ *
+ * The 60-second watchdog is what makes a regression here visible rather
+ * than a hang — an implementation that waited for a drainer would stop
+ * dead at the thirty-third and this fixture would time out instead of
+ * failing an assertion. */
+static void test_notify_ring_drops(void)
+{
+    uint8_t b[] = {
+        0x5B, 0x82, 0x05, 'D','E','V','0',
+        0x14, 0x1A, 'N','S','T','M', 0x00,
+            0x70, 0x00, 0x60,                  /* Store(Zero, Local0) */
+            0xA2, 0x0E,                        /* While ( */
+                0x95, 0x60, 0x0A, 0x28,        /*   LLess(Local0, 40) ) { */
+                0x86, 'D','E','V','0', 0x0A, 0x80,
+                0x75, 0x60,                    /*   Increment(Local0) } */
+            0xA4, 0x60                         /* Return(Local0) */
+    };
+    WITH_PARSE("notify: a full ring drops, counts, and does not block", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t nstm = nth_child(root, 1);
+
+        aml_notify_reset();
+        aml_eval_reset(2);
+        eq("the loop ran to completion", aml_eval_method(nstm), 40);
+        eq("a dropped notification is NOT an error", aml_eval_err(), AML_OK);
+        eq("the ring is full", aml_notify_depth(), 32);
+        eq("eight were refused", aml_notify_drops(), 8);
+        eq("forty were offered", aml_notify_offered(), 40);
+        eq("offered == drained + depth + drops",
+           aml_notify_offered(),
+           aml_notify_drained() + aml_notify_depth() + aml_notify_drops());
+
+        /* TAIL-DROP, not overwrite-oldest: what survived is the OLDEST
+         * thirty-two, with contiguous sequence numbers 0..31. Under
+         * overwrite-oldest the survivors would be 8..39, and the eject
+         * request the user pressed at sequence 0 would be the one lost. */
+        for (uint64_t i = 0; i < 32; i++) {
+            eq("the oldest survived, in order", aml_notify_peek(0), i);
+            eq("with its value", aml_notify_peek(2), 0x80);
+            eq("and its target type", aml_notify_peek(3), 6);
+            eq("popped", aml_notify_pop(), 1);
+        }
+        eq("drained", aml_notify_drained(), 32);
+        eq("empty", aml_notify_depth(), 0);
+        eq("the drop count survives the drain", aml_notify_drops(), 8);
+        eq("identity still holds",
+           aml_notify_offered(),
+           aml_notify_drained() + aml_notify_depth() + aml_notify_drops());
+    });
+}
+
+/* The unbounded case. `While(One) { Notify(...) }` is legal AML and the
+ * ring cannot save it — only the fuel budget can, and it must, WITHOUT
+ * the ring having blocked on the way. */
+static void test_notify_unbounded_loop_terminates(void)
+{
+    uint8_t b[] = {
+        0x5B, 0x82, 0x05, 'D','E','V','0',
+        0x14, 0x12, 'N','I','N','F', 0x00,
+            0xA2, 0x09,                        /* While ( */
+                0x01,                          /*   One ) { */
+                0x86, 'D','E','V','0', 0x0A, 0x80,   /*   Notify(DEV0, 0x80) } */
+            0xA4, 0x00
+    };
+    WITH_PARSE("notify: an unbounded Notify loop ends on fuel, not on a block", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t ninf = nth_child(root, 1);
+
+        aml_notify_reset();
+        aml_eval_reset(2);
+        eq("a tighter budget", aml_eval_set_fuel(300), 300);
+        eq("no value", aml_eval_method(ninf), 0);
+        eq("fuel, not a hang and not the object arena",
+           aml_eval_err(), E_FUEL_EXHAUSTED);
+        eq("fuel really is gone", aml_eval_fuel(), 0);
+        eq("the ring filled", aml_notify_depth(), 32);
+        g_checks++;
+        if (aml_notify_drops() == 0)
+            fail("the loop never overran the ring — the bound proves nothing");
+        eq("identity holds even on the error path",
+           aml_notify_offered(),
+           aml_notify_drained() + aml_notify_depth() + aml_notify_drops());
+        eq("frames unwound", aml_eval_frames(), 0);
+    });
+}
+
+/* =====================================================================
+ * R30.M2-007 (#1060) — serialized methods.
+ * ===================================================================== */
+
+/* The acquire count, driven directly. This is where the RECURSIVE part of
+ * the recursive mutex is pinned: three acquires of one method give a count
+ * of three and ONE held entry, and the two numbers are asserted separately
+ * because an implementation that leaked an entry per acquire would still
+ * balance the count. */
+static void test_serialized_acquire_balance(void)
+{
+    uint8_t b[] = {
+        0x14, 0x08, 'S','R','L','0', 0x08,     /* Method(SRL0, 0, Serialized, 0) */
+            0xA4, 0x00,
+        0x14, 0x08, 'S','R','L','5', 0x58,     /* Method(SRL5, 0, Serialized, 5) */
+            0xA4, 0x00
+    };
+    WITH_PARSE("serialized: the acquisition count balances across nesting", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t s0 = nth_child(root, 0);
+        uint64_t s5 = nth_child(root, 1);
+        eq("SRL0 is serialized", aml_method_serialized(s0), 1);
+        eq("at level 0", aml_method_synclevel(s0), 0);
+        eq("SRL5 is serialized", aml_method_serialized(s5), 1);
+        eq("at level 5", aml_method_synclevel(s5), 5);
+        eq("and neither takes arguments", aml_method_argcount(s5), 0);
+
+        aml_eval_reset(2);
+        eq("nothing held to start", aml_ctl_held(), 0);
+        eq("level 0", aml_ctl_level(), 0);
+
+        eq("first acquire", aml_ctl_acquire(s0), 1);
+        eq("count 1", aml_ctl_count_of(s0), 1);
+        eq("one entry", aml_ctl_held(), 1);
+        eq("re-entry by the owner SUCCEEDS", aml_ctl_acquire(s0), 1);
+        eq("count 2", aml_ctl_count_of(s0), 2);
+        eq("still ONE entry", aml_ctl_held(), 1);
+        eq("and again", aml_ctl_acquire(s0), 1);
+        eq("count 3", aml_ctl_count_of(s0), 3);
+        eq("three acquisitions recorded", aml_ctl_acquires(), 3);
+        eq("no error anywhere", aml_eval_err(), AML_OK);
+
+        eq("release", aml_ctl_release(s0), 1);
+        eq("count 2", aml_ctl_count_of(s0), 2);
+        eq("still held", aml_ctl_held(), 1);
+        eq("release", aml_ctl_release(s0), 1);
+        eq("release", aml_ctl_release(s0), 1);
+        eq("count 0", aml_ctl_count_of(s0), 0);
+        eq("entry freed", aml_ctl_held(), 0);
+        eq("level restored", aml_ctl_level(), 0);
+        eq("releasing what is not held is a silent 0",
+           aml_ctl_release(s0), 0);
+        eq("and does NOT latch — it is called on error paths",
+           aml_eval_err(), AML_OK);
+
+        /* Two distinct methods, acquired upward: two entries, and the
+         * level tracks the highest held and is RESTORED, not recomputed. */
+        aml_eval_reset(2);
+        eq("low first", aml_ctl_acquire(s0), 1);
+        eq("level 0", aml_ctl_level(), 0);
+        eq("then high", aml_ctl_acquire(s5), 1);
+        eq("level 5", aml_ctl_level(), 5);
+        eq("two entries", aml_ctl_held(), 2);
+        eq("release the high one", aml_ctl_release(s5), 1);
+        eq("the level it displaced comes back", aml_ctl_level(), 0);
+        eq("release the low one", aml_ctl_release(s0), 1);
+        eq("nothing held", aml_ctl_held(), 0);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        /* The contention arm — HONESTLY UNTESTED. There is exactly one AML
+         * execution context, so "held by someone else" has no reachable
+         * input and this corpus does not pretend otherwise. What IS
+         * reachable is the branch that decides: the owner comparison, which
+         * every re-entry above takes. If that comparison were inverted the
+         * re-entries would report MUTEX_CONTENTION rather than succeeding,
+         * so the assertions above are what guard it until R30.M3 adds a
+         * second context and, with it, a fixture that can reach the other
+         * side. */
+        eq("there is exactly one execution context", aml_ctl_ctx(), 1);
+    });
+}
+
+/* THE ANTI-DEADLOCK FIXTURE. A serialized method that calls itself must
+ * RUN. Under a test-and-set mutex this hangs, and the 60-second watchdog
+ * — not an assertion — is what makes that visible. */
+static void test_serialized_recursion_does_not_deadlock(void)
+{
+    uint8_t b[] = {
+        0x14, 0x19, 'S','R','E','C', 0x09,     /* Method(SREC, 1, Serialized, 0) */
+            0xA0, 0x06, 0x93, 0x68, 0x00, 0xA4, 0x00,  /* If(Arg0==0){Return(0)} */
+            0xA4, 0x72, 0x68,                  /* Return(Add(Arg0, */
+                'S','R','E','C', 0x74, 0x68, 0x01, 0x00,  /*  SREC(Arg0-1), */
+                0x00,                          /*                  Zero)) */
+        0x14, 0x0D, 'S','M','A','I', 0x00,
+            0xA4, 'S','R','E','C', 0x0A, 0x03  /* Return(SREC(3)) */
+    };
+    WITH_PARSE("serialized: a serialized method may call itself", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t srec = nth_child(root, 0);
+        uint64_t smai = nth_child(root, 1);
+        eq("SREC is serialized", aml_method_serialized(srec), 1);
+        eq("with one argument", aml_method_argcount(srec), 1);
+
+        aml_eval_reset(2);
+        eq("3 + 2 + 1 + 0", aml_eval_method(smai), 6);
+        eq("no error — and, above all, no hang", aml_eval_err(), AML_OK);
+        eq("four entries into SREC, four acquisitions",
+           aml_ctl_acquires(), 4);
+        eq("all released", aml_ctl_held(), 0);
+        eq("count back to zero", aml_ctl_count_of(srec), 0);
+        eq("level back to zero", aml_ctl_level(), 0);
+        eq("frames unwound", aml_eval_frames(), 0);
+    });
+}
+
+/* Unbounded serialized recursion. It must end the same way unbounded
+ * NON-serialized recursion does — on the frame pool — and it must not
+ * leak the mutex on the way out. The leak is the interesting half: a
+ * release wired only to the success path would leave SINF permanently
+ * held, and every later acquire in the session would then be refused on
+ * SyncLevel grounds for reasons nothing in the error would explain. */
+static void test_serialized_recursion_is_still_bounded(void)
+{
+    uint8_t b[] = {
+        0x14, 0x0A, 'S','I','N','F', 0x08,
+            'S','I','N','F'
+    };
+    WITH_PARSE("serialized: unbounded recursion trips the frame pool, not a leak", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t sinf = nth_child(root, 0);
+        uint64_t leaked_before = aml_ctl_leaked();
+
+        aml_eval_reset(2);
+        eq("no value", aml_eval_method(sinf), 0);
+        eq("frames, not fuel and not a hang",
+           aml_eval_err(), E_FRAME_OVERFLOW);
+        g_checks++;
+        if (aml_eval_fuel() == 0)
+            fail("fuel was exhausted too — the frame cap is not what fired");
+        eq("frames unwound", aml_eval_frames(), 0);
+        /* eight frames, plus the ninth call that acquired and then could
+         * not get a frame — and released again on its way out */
+        eq("nine acquisitions", aml_ctl_acquires(), 9);
+        eq("nothing still held", aml_ctl_held(), 0);
+        eq("level back to zero", aml_ctl_level(), 0);
+
+        /* the leak detector agrees, which is what makes it worth having */
+        aml_eval_reset(2);
+        eq("no leak was recorded", aml_ctl_leaked(), leaked_before);
+    });
+}
+
+/* SyncLevel ordering — §19.6.2. Acquiring DOWNWARD is the error; acquiring
+ * upward is fine. Both directions are asserted, because a check that
+ * refused everything would pass a one-sided test. */
+static void test_serialized_sync_level_ordering(void)
+{
+    uint8_t b[] = {
+        0x14, 0x08, 'S','L','L','O', 0x28,     /* Method(SLLO,0,Serialized,2){Return(1)} */
+            0xA4, 0x01,
+        0x14, 0x0B, 'S','L','H','I', 0x78,     /* Method(SLHI,0,Serialized,7){Return(SLLO())} */
+            0xA4, 'S','L','L','O',
+        0x14, 0x09, 'S','L','T','P', 0x78,     /* Method(SLTP,0,Serialized,7){Return(42)} */
+            0xA4, 0x0A, 0x2A,
+        0x14, 0x0B, 'S','L','U','P', 0x28,     /* Method(SLUP,0,Serialized,2){Return(SLTP())} */
+            0xA4, 'S','L','T','P'
+    };
+    WITH_PARSE("serialized: SyncLevel orders acquisition, downward is an error", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t sllo = nth_child(root, 0);
+        uint64_t slhi = nth_child(root, 1);
+        uint64_t sltp = nth_child(root, 2);
+        uint64_t slup = nth_child(root, 3);
+        eq("SLLO at 2", aml_method_synclevel(sllo), 2);
+        eq("SLHI at 7", aml_method_synclevel(slhi), 7);
+        eq("SLTP at 7", aml_method_synclevel(sltp), 7);
+        eq("SLUP at 2", aml_method_synclevel(slup), 2);
+
+        /* 7 then 2 — downward. A table that does this has not established
+         * its own deadlock-freedom, and running it anyway is choosing to
+         * find that out on hardware. */
+        aml_eval_reset(2);
+        eq("refused", aml_eval_method(slhi), 0);
+        eq("SYNC_LEVEL", aml_eval_err(), E_SYNC_LEVEL);
+        eq("the outer method's mutex was still released",
+           aml_ctl_held(), 0);
+        eq("level back to zero", aml_ctl_level(), 0);
+        eq("frames unwound", aml_eval_frames(), 0);
+
+        /* 2 then 7 — upward, and legal. Without this half, a check that
+         * simply refused every nested acquire would pass. */
+        aml_eval_reset(2);
+        eq("permitted", aml_eval_method(slup), 42);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("both released", aml_ctl_held(), 0);
+        eq("level back to zero", aml_ctl_level(), 0);
+        eq("two acquisitions", aml_ctl_acquires(), 2);
+    });
+}
+
+/* The pool bound, and the leak detector. Both are driven through the API:
+ * the pool cannot overflow through AML, because a mutex is held only while
+ * its method is on the stack and aml_frame_push refuses a ninth frame
+ * first. The bound is still checked, because "unreachable" is a property
+ * of today's frame count and a pool that indexed past its end when that
+ * changed would corrupt the notification ring next door. */
+static void test_serialized_pool_bound_and_leak_detection(void)
+{
+    uint8_t b[64];
+    size_t n = 0;
+    for (int i = 0; i < 9; i++) {
+        b[n++] = 0x08;                          /* Name(Xnnn, 0) */
+        b[n++] = 'X';
+        b[n++] = (uint8_t)('0' + i);
+        b[n++] = '_';
+        b[n++] = '_';
+        b[n++] = 0x0A;
+        b[n++] = 0x00;
+    }
+    WITH_PARSE("serialized: the mutex pool is bounded and a leak is detected", b, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t nodes[9];
+        for (int i = 0; i < 9; i++) {
+            nodes[i] = nth_child(root, i);
+            eq("a Name node", aml_node_kind(nodes[i]), N_NAME);
+        }
+
+        aml_eval_reset(2);
+        for (int i = 0; i < 8; i++)
+            eq("acquired", aml_ctl_acquire(nodes[i]), 1);
+        eq("eight held", aml_ctl_held(), 8);
+        eq("no error at eight", aml_eval_err(), AML_OK);
+        eq("the ninth is refused", aml_ctl_acquire(nodes[8]), 0);
+        eq("MUTEX_POOL_FULL", aml_eval_err(), E_MUTEX_POOL_FULL);
+        eq("and the refusal changed nothing", aml_ctl_held(), 8);
+
+        /* Now walk away without releasing. The next session must recover
+         * — a wedged pool would refuse correct acquires forever — and must
+         * COUNT what it recovered, because silent recovery is how a broken
+         * acquire/release pairing survives review. */
+        uint64_t leaked_before = aml_ctl_leaked();
+        aml_eval_reset(2);
+        eq("the pool was forced clean", aml_ctl_held(), 0);
+        eq("the level with it", aml_ctl_level(), 0);
+        eq("and all eight leaks were counted",
+           aml_ctl_leaked(), leaked_before + 8);
+        eq("a fresh acquire works again", aml_ctl_acquire(nodes[0]), 1);
+        eq("no error", aml_eval_err(), AML_OK);
+        aml_ctl_release(nodes[0]);
+        eq("balanced", aml_ctl_held(), 0);
+    });
+}
+
 int main(void)
 {
     struct sigaction sa;
@@ -4161,6 +4925,28 @@ int main(void)
     test_object_budgets();
     test_object_depth_cap();
     test_object_operator_coverage();
+
+    /* ---- R30.M2-005/006/007: invocation, Notify, serialized methods.
+     * The two that can HANG rather than fail — the unbounded Notify loop
+     * and serialized self-recursion — are here rather than at the end, so
+     * a regression in either shows up before the rest of the list has
+     * spent its time. ---- */
+    test_eval_argument_promotion();
+    test_eval_object_argument_and_return();
+    test_eval_return_tag_is_exact();
+    test_eval_arity_cross_check();
+
+    test_notify_target_table();
+    test_notify_delivery();
+    test_notify_refusals();
+    test_notify_ring_drops();
+    test_notify_unbounded_loop_terminates();
+
+    test_serialized_acquire_balance();
+    test_serialized_recursion_does_not_deadlock();
+    test_serialized_recursion_is_still_bounded();
+    test_serialized_sync_level_ordering();
+    test_serialized_pool_bound_and_leak_detection();
 
     if (g_fail) {
         fprintf(stderr, "[aml-corpus] %d assertion(s) failed out of %d\n",

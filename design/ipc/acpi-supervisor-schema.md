@@ -285,6 +285,54 @@ Consequently:
 
 ---
 
+## 7a. The notification stream — producer landed at R30.M2-006 (#1059)
+
+Everything in §§1–7 is **request/reply**: a client asks, the supervisor
+answers. `Notify` is the one flow that runs the other way, and it does not
+fit the RPC shape, so it does not use it.
+
+### The producer does not send
+
+The AML evaluator (`src/user/aml/aml_ctl.pdx`) **enqueues to a bounded
+32-entry ring and returns**. It never sends and never waits. The reason is
+in `design/acpi/aml-evaluator.md` §18 and it is worth restating here,
+because it constrains what this schema may later specify: `Notify` appears
+inside firmware-controlled loops, so an evaluator that sent synchronously
+would let a table stall the supervisor, and a `Notify` issued while the
+supervisor is handling a notification would deadlock — the drainer is not
+draining, because it is inside the evaluator trying to enqueue.
+
+So the supervisor's own loop is: evaluate → drain the ring → send. The
+send is a separate step with separate error handling, and a slow or absent
+consumer **cannot** back-pressure the interpreter.
+
+### What this schema must therefore carry
+
+Delivery is **lossy by construction** — the ring tail-drops when full —
+and any future `ACPI_OP_EVENT` record must make that loss *localisable*
+rather than merely countable:
+
+| offset | field | type | note |
+|--------|-------|------|------|
+| +0 | `sequence` | u64 | monotonic offer number; **a gap means dropped events** |
+| +8 | `target_path` | u32 | interned absolute namespace path |
+| +12 | `object_type` | u8 | 6 Device / 12 Processor / 13 ThermalZone |
+| +13 | `notify_value` | u8 | the ACPI notification value |
+| +14 | `flags` | u16 | bit 0 — a drop occurred immediately before this |
+| +16 | `drops_total` | u64 | producer's cumulative drop count at enqueue |
+
+A consumer that sees `sequence` jump by more than one re-enumerates the
+affected bus; without the sequence it would have to re-enumerate
+everything on any non-zero drop count, which is the difference between a
+recoverable drop and a useless one.
+
+Full derived-kind row — base kind, rights bitmask, why no `INVOKE` right
+— in `design/architecture/next-wave-derived-kinds.md`,
+`KIND_ACPI_EVENT = 0x21`. The capability mint and the drain loop are
+R30.M4's; only the producer and the record shape are fixed today.
+
+---
+
 ## 8. Cross-references
 
 - `design/ipc/phase1-api.md` — the target IPC framing shape.

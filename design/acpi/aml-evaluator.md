@@ -3,9 +3,10 @@
 **Round.** R30 — ACPICA userspace bubble + LPSS bus enablement
 **Issues.** #1054 (namespace walker + call frames) · #1055 (arithmetic and
 logical operators) · #1056 (string/buffer operators + §19.3.5 conversion) ·
-#1057 (package/reference/Index semantics)
-**Status.** Landed. #1058 (invocation + argument promotion), #1059 (Notify),
-#1060 (recursive/serialized methods) follow.
+#1057 (package/reference/Index semantics) ·
+#1058 (invocation, argument promotion, return type) · #1059 (`Notify`
+delivery) · #1060 (recursive and serialized methods)
+**Status.** Landed. R30.M2 closed.
 **Builds on.** [`aml-parser.md`](aml-parser.md) — the R30.M1 tokenizer,
 arena and two-pass parser. This document assumes it.
 
@@ -433,6 +434,10 @@ hand-written table, and is noted as such.
 
 ## 8. Deliberately not evaluated
 
+*(As of #1056–#1060 the first three rows below have landed; they are struck
+through rather than deleted so the deferral and its discharge stay
+legible.)*
+
 Strings, Buffers, Packages and references are `NOT_EVALUABLE` (35) — a
 **refusal**, not a zero. Returning zero for "I cannot read this" would make
 a driver that asks for a `_HID` it cannot decode see a valid-looking
@@ -443,9 +448,13 @@ worse than no value.
 |---|---|
 | String and Buffer operators — `Concat`, `SizeOf`, `ToBuffer`, `ToInteger`, `Mid`, … | #1056 |
 | `Package`, `Index`, `DerefOf`, `RefOf`, `CondRefOf`, `ObjectType`; reference-typed stores; following an `ALIAS` to its source (the walker *resolves* one, reading through it is refused) | #1057 |
-| Argument promotion and implicit conversion at invocation | #1058 |
-| `Notify` delivery | #1059 |
-| Serialized methods, per-method mutexes, `SyncLevel` ordering, real recursion support | #1060 |
+| ~~Argument promotion and implicit conversion at invocation~~ | landed, #1058 — §17 |
+| ~~`Notify` delivery~~ | landed, #1059 — §18 |
+| ~~Serialized methods, per-method mutexes, `SyncLevel` ordering, real recursion support~~ | landed, #1060 — §19 |
+| Explicit `Mutex` / `Acquire` / `Release` / `Event` / `Signal` / `Wait`, and the release-order check §19 defers with them | R30.M3 |
+| A second AML execution context, and with it the only fixture that can reach `MUTEX_CONTENTION` (54) | R30.M3 |
+| Predefined-method argument signatures (`_OSI` wanting String, …) — a **row** in `aml_conv_tab`, not a code path | when a predefined-method table exists |
+| The supervisor-side drain of the notification ring and the `KIND_ACPI_EVENT` mint | R30.M4 |
 | OpRegion access — the point of the whole round | #1061+ |
 | `DebugOp` and `TimerOp` in value position | when there is somewhere to send them |
 | Node-level error localisation (which arena node faulted) | a store per node in the fuel loop; deferred deliberately |
@@ -1092,3 +1101,493 @@ No paideia-as gap surfaced. The object model exercises `mov_b` stores,
 record: `mul r64` is not in the resolver table, and `imul r64, r64` is the
 supported form; the two differ only in the high half, which no conversion
 here needs.
+
+---
+
+## 17. Invocation — #1058
+
+Three things arrive together because they are one mechanism seen from
+three sides: what a call *checks*, what it *passes*, and what it *gives
+back*.
+
+### The arity cross-check, and why it is defence in depth
+
+`aml_eval_call` has always taken the argument count from the **CALL
+node's** flags, which R30.M1's two-pass parser fixed. It now also reads
+the count from the **METHOD node** the §5.3 walk actually landed on, and
+refuses a disagreement with `ARG_COUNT` (51).
+
+The two numbers have different provenance, and that is the entire reason
+to compare them. The parser matched on the **final NameSeg**, because full
+scope resolution needs a namespace it does not yet have; the evaluator
+resolved the **full path**. When those disagree, the parser consumed the
+wrong number of argument bytes and every byte after the call site is
+misaligned — a parse that *succeeded* and is wrong, which is the failure
+class `aml-parser.md` §3 exists to eliminate.
+
+No AML input reaches it today: `aml_term_lookup` refuses with
+`AMBIGUOUS_CALL` (21) the only tables that could produce a disagreement.
+That is exactly why the check is a **named function with its own two
+parameters**, `aml_eval_arity_ok`, rather than four lines inlined in the
+caller — the corpus drives it directly with a mismatched pair, so the
+check is tested rather than merely present. Writing an AML fixture for an
+unreachable branch would mean writing a fixture that cannot fail.
+
+### Argument promotion — shape, then table
+
+An argument is evaluated in the **caller's** frame (that was #1054's
+ordering, and it is unchanged), then routed:
+
+| the argument node is | evaluated by | bound by |
+|---|---|---|
+| integer-shaped (`aml_eval_int_shaped`) | `aml_eval_node` | `aml_frame_set_arg` |
+| anything else | `aml_eval_obj`, then `aml_conv_cast` | `aml_frame_set_arg_obj` |
+
+The shape test first, because the fast path is the point: a loop calling
+an arithmetic helper must not allocate an object per call, or the 512-record
+arena is gone in 512 iterations. The **table** second, and it is a real
+table row rather than a hook:
+
+```
+0x000000000000FF01   METHOD ARG   ANY, ANY, ANY, ANY   (§19.6.83)
+```
+
+`0xFF01` is not an opcode. op16 is a single byte (`0x00..0xFF`) or an
+extended `0x5Bxx`, so nothing in the encoding can collide with it. The row
+says **ANY in every position**, which is a positive statement and not a
+filler: §19.6.83 gives method arguments no implicit conversion, the callee
+sees exactly the object the caller computed — and *without the row* the
+default shape applies, which wants **Integer at position 0** and a
+**TARGET at position 2**. Both are wrong for an argument and the first
+would coerce every Buffer ever passed to a method. The corpus asserts both
+halves: that the row says ANY, and that the default would not.
+
+The payoff is that a future predefined-method signature table — `_OSI`
+wanting String, `_SRS` wanting Buffer — is a **row**, and `aml_eval_call`
+does not change.
+
+### The consequence that is the actual feature
+
+`Store(0x2A, Arg0)` in a callee now means two different things depending
+on what the caller passed, and that difference is §19.3.5.8:
+
+```asl
+Method (SETA, 1) { Store (0x2A, Arg0) }
+
+Method (BYRF) { SETA (RefOf (TGTR));  Return (TGTR) }   /* -> 0x2A */
+Method (BYVL) { SETA (TGTV);          Return (TGTV) }   /* -> 0    */
+```
+
+Identical callee, identical body, opposite observable effect. Before
+#1058 the question could not arise: every argument was bound with
+`aml_frame_set_arg`, which *clears* the object tag, so a `RefOf` argument
+was flattened or refused and the two methods would have agreed. The
+corpus uses **two** Names rather than one, because a single shared target
+could be written by the by-reference call and then read by the by-value
+one, and the fixture would pass while proving nothing.
+
+### The return type
+
+The retval slot is one 64-bit word, and an object index is
+indistinguishable from an Integer in it. So there is now a tag —
+`aml_eval_state + 104`, read through `aml_eval_retval_is_obj` — set by
+exactly one place, `aml_eval_stmt`'s `Return` arm, and cleared by the same
+store on the integer path.
+
+Without it, `Return (Buffer (4) {...})` had two possible treatments and
+both were wrong: refuse it (#1054 did, which refuses every `_CRS` ever
+shipped), or flatten it to an Integer (which loses the buffer, silently,
+one frame from where it was needed).
+
+Three consumers, three behaviours, and they are deliberately not one:
+
+- **`aml_eval_node`** (the integer dispatcher) converts through
+  `aml_conv_cast(·, Integer)` — exactly as an operator wanting an Integer
+  would, so `Add(FOO(), 1)` on a String-returning method applies §19.3.5
+  rather than a bespoke rule, and on a Package-returning one is refused.
+- **`aml_eval_obj`** takes the object with its type intact, which is what
+  makes `SizeOf(FOO())` and `Index(FOO(), 0)` work.
+- **`aml_eval_method`**, the top-level entry, returns the word plus the
+  tag, with **one** unwrapping: an Integer *object* comes back as its
+  value and the tag is cleared. An Integer object and an AML Integer are
+  the same number, and making every caller unwrap would be ceremony — and
+  a caller that forgot would read an arena index as data, which is a small
+  plausible number and therefore the kind of wrong answer that survives
+  review. Every other type comes back as an index with the tag set, and is
+  **not** forced through a conversion: a Package-returning method is a
+  perfectly good method, and latching `NO_CONVERSION` at the door would
+  poison the session of a caller who only ever wanted the Package.
+
+A `Return` whose child is itself a **CALL** is its own case rather than a
+shape test, because `Return(FOO())` must re-return the callee's value
+*with its type*, and `aml_eval_int_shaped` answers yes for every CALL.
+
+---
+
+## 18. `Notify` — #1059, and why the evaluator must never block
+
+`Notify(Object, NotificationValue)` (§19.6.85) is the interpreter's only
+**egress**: everything else in the evaluator is a pure function of the
+arena plus the current frame. It therefore lives in a module of its own,
+`aml_ctl.pdx`, with storage of its own and its own confinement assertion.
+
+### The thing that must not be built
+
+Send an IPC message and wait for the supervisor to take it. That is a
+supervisor stall with a firmware-controlled trigger, and it is one line of
+ASL away:
+
+```asl
+While (One) { Notify (\_SB.PCI0, 0x00) }
+```
+
+Firmware chooses the loop bound *and* the message rate. A blocking send
+parks the interpreter, and every other ACPI consumer — thermal poll, lid
+switch, battery — queues behind it. A `Notify` issued while the supervisor
+is itself handling a notification deadlocks outright: the drainer is not
+draining, because it is inside the evaluator that is trying to enqueue.
+
+### What is built instead
+
+A **bounded ring**, and the evaluator returns from `Notify`
+unconditionally.
+
+| | |
+|---|---|
+| depth | **32** entries, 1 KiB of `.bss`, never grown |
+| entry | 4 × u64 — offer sequence, target arena node, notification value, target ObjectType |
+| index | monotonic head/tail counters; only the *slot* wraps, so `head == tail` is unambiguously empty |
+| drop policy | **tail-drop** |
+| on drop | return 0, latch **nothing**, continue |
+| fuel | one step, on the accepted **and** the dropped path |
+
+**Tail-drop, not overwrite-oldest**, and the difference is not a
+preference. Overwrite-oldest turns bounded *loss* into *reordering*: the
+oldest entries are the ones the supervisor is about to act on, and
+discarding a pending `Notify(DEV0, 0x03)` — an eject request, the user
+pressed the button — because a later `Notify(DEV0, 0x80)` needed the slot
+means the eject silently never happens while a thermal event does.
+Tail-drop loses the newest, the one the supervisor has formed no
+expectation about, and it makes the drop counter mean exactly "events you
+were never told about".
+
+**A drop is not an error.** `aml_notify_enqueue` returns 0 and latches
+nothing. Making it a latched error would hand firmware a way to halt an
+evaluation by filling a ring the supervisor happens not to have drained —
+converting a bounded, recoverable loss into a hard failure, which is
+backwards.
+
+**Fuel is charged on both paths.** If dropping were cheaper than
+succeeding, filling the ring would be the way to make a `Notify` storm
+free.
+
+### Observability — three counters and a sequence
+
+```
+aml_notify_offered   attempted, accepted and dropped alike
+aml_notify_drained   popped by the supervisor
+aml_notify_depth     pending
+aml_notify_drops     refused
+```
+
+with the invariant the corpus asserts on every path, including the error
+one:
+
+```
+offered == drained + depth + drops
+```
+
+The counter that matters is not `drops`. A global drop count tells the
+supervisor **that** it missed something; the **per-entry offer sequence**
+tells it **where**, because two consecutive drained entries whose
+sequences differ by more than one bracket the loss. A supervisor that sees
+a gap re-enumerates the affected bus instead of re-enumerating everything
+— the difference between a recoverable drop and a useless one.
+
+**The counters do not reset with the evaluation session.** `aml_eval_reset`
+is per-invocation; the ring is per-supervisor. Clearing the drop count when
+a new method starts would hide exactly the pattern worth seeing (a table
+that overruns on every evaluation), and clearing the *ring* would discard
+notifications nobody has drained. `aml_eval_reset` therefore calls
+`aml_ctl_reset`, which touches the **mutex pool only**; the ring is cleared
+by `aml_notify_reset`, which is the supervisor's to call.
+
+### Types, and the two different refusals
+
+Both operands go through `aml_conv_operand`, so the row in `aml_str.pdx`
+is what says operand 0 is a Reference and operand 1 an Integer:
+
+```
+0x0000000001140086   0x086 Notify   REFERENCE, INTEGER
+```
+
+The want of `REFERENCE` does real work. `aml_conv_cast` returns a
+Reference unchanged and latches `BAD_REF` (45) for anything else, so
+`Notify(5, 0x80)` — and `Notify(SOMEINT, 0x80)`, where the name holds an
+Integer — are refused by the **table**, and `Notify`'s body contains no
+type test. What the table *cannot* say is that the reference must name a
+**Device, Processor or ThermalZone**; that is `BAD_NOTIFY_TARGET` (52),
+checked in `aml_ctl_notify_kind_ok`, and the list is closed because the
+supervisor's handler table is keyed by those three ObjectTypes and has
+nowhere to route anything else. Accepting a fourth would enqueue an event
+that can only be dropped later, at a point with no context left to say
+which table produced it.
+
+### `Notify` is a statement, and that is load-bearing
+
+§20.2.5.3 makes `DefNotify` a **Type1Opcode** — no value. It is therefore
+intercepted in `aml_eval_stmt`, not in either value dispatcher. Two
+consequences, both wanted:
+
+- `Store(Notify(D,1), X)` is `NOT_EVALUABLE` rather than a plausible zero;
+- a `Notify` allocates **no result object**, so a `While` loop full of them
+  exhausts its fuel rather than the 512-record object arena — which means
+  the ring-overrun fixture measures the bound it claims to.
+
+### What the supervisor sees
+
+The capability is **not** minted here. Delivery to a consumer is an IPC
+hop the supervisor makes *after* draining, and it is R30.M4's. The wire
+format is pinned now — `design/architecture/next-wave-derived-kinds.md`,
+`KIND_ACPI_EVENT = 0x21` over `KIND_NOTIFICATION` — because a kind whose
+record shape is decided in one round and written down in another is a kind
+whose two halves disagree.
+
+---
+
+## 19. Serialized methods — #1060
+
+`MethodFlags` (§20.2.5.2) carries `SerializeFlag` at bit 3 and `SyncLevel`
+at bits 4–7. A serialized method holds an implicit mutex at its SyncLevel
+for the duration of the invocation.
+
+### The re-entry that must not deadlock
+
+The implicit mutex is **recursive for its owner**. A serialized method
+that calls itself — directly, or through a helper that calls back — must
+run, not hang. ACPICA implements this with an acquisition **count**
+(`AcpiExAcquireMutexObject`: *"Support for multiple acquires by the owning
+thread"*), and a straight test-and-set implementation of `Serialized`
+deadlocks on the first recursive table it meets. This is not an exotic
+input: firmware marks a method `Serialized` precisely because it touches
+shared state, and shared-state helpers are exactly what gets called
+recursively.
+
+```
+count == 0              -> take it, owner := ctx, count := 1
+count > 0, owner == ctx -> count += 1, PROCEED
+count > 0, owner != ctx -> would block
+```
+
+Release decrements and frees the entry at zero, so a recursive method
+unwinds exactly as deep as it nested.
+
+### SyncLevel ordering, enforced
+
+§19.6.2, and ACPICA `AcpiExAcquireMutex`:
+
+```
+if (mutex->SyncLevel < thread->CurrentSyncLevel) -> AE_AML_MUTEX_ORDER
+```
+
+Acquiring **below** the highest level currently held is the error, and it
+is `SYNC_LEVEL` (53). This is enforced rather than deferred, because
+SyncLevel is what makes lock ordering a *static* property of the table: a
+table that cannot deadlock can be distinguished from one that can without
+running it, and a table that violates the ordering is one whose
+deadlock-freedom nobody has established. Running it anyway is choosing to
+find out on hardware.
+
+The check is placed **before** the already-held test, as ACPICA places it,
+and the ordering that produces is deliberate: `A(5) → B(7) → A(5)` is
+refused, because re-entering the outer lock while holding an inner one is
+precisely the cycle SyncLevel exists to expose. Straight self-recursion is
+untouched — there `level == current`, and the test is strictly-less-than,
+so the recursive case falls out of the same comparison rather than needing
+a special case.
+
+On first acquisition the entry saves the `CurrentSyncLevel` it displaced
+(ACPICA's `OriginalSyncLevel`) and restores it on final release. Saved
+**per mutex** rather than kept as a stack, so release is correct with no
+separate unwind structure — and restored rather than recomputed, because a
+maximum over the remaining entries would silently differ the moment two
+methods share a level.
+
+The release-order check ACPICA also has (`SyncLevel > CurrentSyncLevel` on
+release) is **not** implemented, and the reason is that for *implicit*
+method mutexes it cannot fire: they are acquired and released around
+`aml_eval_body`, so their nesting is the call stack's and is LIFO by
+construction. It becomes reachable when explicit `Acquire`/`Release` land
+in R30.M3, and belongs there with the fixture that reaches it.
+
+### Acquire and release are paired on every exit
+
+Not on "the body returned". `aml_eval_call` releases after
+`aml_eval_body` on the success path *and* on the error path, and
+`aml_evc_frameless` releases when the frame pool refused a frame the
+acquire had already been taken for. That last one is not hypothetical: it
+is precisely what unbounded serialized recursion does — nine acquires,
+eight frames, and the ninth call must give its mutex back on the way out.
+A release wired only to the success path would leave the method
+permanently held, and every later acquire in the session would then be
+refused on SyncLevel grounds for reasons nothing in the error would
+explain.
+
+`aml_ctl_release` on something not held is a silent 0 and **not** a latch,
+for the same reason: it is called on error paths, and a second latch would
+replace the code describing what actually went wrong. The latch is
+first-writer-wins, so the damage would be to diagnosis rather than to
+correctness — which is the kind of damage that is hardest to notice.
+
+`aml_ctl_leaked` counts entries still held when a session resets, and the
+pool is forced clean rather than the reset refusing. Silent recovery plus
+a visible count beats either a crash or an undetected wedge.
+
+### Pool size
+
+**8**, exactly the frame pool's depth. A mutex is held only while its
+method is on the stack and at most 8 frames are live, so a ninth is
+unreachable through AML — `aml_frame_push` refuses first with
+`FRAME_OVERFLOW` (33). The bound is checked anyway, and the corpus reaches
+it through the API, because "unreachable" is a property of *today's* frame
+count and a pool that indexed past its end when that changed would corrupt
+the notification ring next door.
+
+### One execution context, stated honestly
+
+There is exactly one AML execution context: `acpi_supervisor` evaluates
+one method at a time. `aml_ctl_ctx` returns the constant 1, and the
+`owner != ctx` arm **is unreachable from any input**. It is implemented
+anyway, and it latches `MUTEX_CONTENTION` (54) rather than blocking,
+because the thing that must not happen when a second context arrives is a
+silent wrong answer — a refusal is a bug report, a fake acquire is a data
+race.
+
+The corpus does not pretend to test it. What it tests is what one context
+can reach:
+
+- recursive self-entry **succeeds** (the anti-deadlock fixture — under a
+  test-and-set mutex this *hangs*, and the 60-second watchdog rather than
+  an assertion is what makes that visible);
+- the acquisition count **balances** across nested entry and exit, with
+  the count and the held-entry count asserted **separately**, because an
+  implementation that leaked an entry per recursion would still balance
+  the count;
+- a SyncLevel violation **errors**, and the legal upward direction still
+  **succeeds** — a check that refused every nested acquire would pass a
+  one-sided test;
+- a leaked acquire is **detected** and recovered.
+
+The owner comparison itself *is* covered: every successful re-entry takes
+it, and inverting it turns those re-entries into `MUTEX_CONTENTION`. The
+corpus kills that mutant. What has no fixture is the other side of the
+comparison, and it stays that way until R30.M3 supplies a second context.
+
+---
+
+## 20. Error taxonomy — continuing §15
+
+| # | Name | Meaning |
+|---|---|---|
+| 51 | `ARG_COUNT` | a call's arity disagrees with the declaration the walk resolved |
+| 52 | `BAD_NOTIFY_TARGET` | `Notify` target is not a Device, Processor or ThermalZone |
+| 53 | `SYNC_LEVEL` | serialized acquire below the currently-held maximum |
+| 54 | `MUTEX_CONTENTION` | held by another execution context |
+| 55 | `MUTEX_POOL_FULL` | more than 8 serialized methods held at once |
+
+51, 54 and 55 are **not reachable from AML** today and each says so above:
+51 because the parser refuses the inputs that would produce it, 54 because
+there is one execution context, 55 because the frame pool exhausts first.
+51 and 55 are reachable — and tested — through the API. 54 is not
+reachable at all, and is recorded as such rather than given a fixture that
+cannot fail.
+
+---
+
+## 21. Verification — #1058 / #1059 / #1060
+
+`tools/verify-aml-parser.sh`, eleven modules to twelve, and two new
+encapsulation assertions:
+
+> `aml_notify_ring` and `aml_notify_state` are relocated against from
+> `aml_ctl.o` and no other object.
+>
+> `aml_mutex_pool` and `aml_mutex_state` are relocated against from
+> `aml_ctl.o` and no other object.
+
+The ring's guarantee is the accounting identity, and it holds only for as
+long as the three counters move together inside `aml_notify_enqueue` and
+`aml_notify_pop`. A second writer — an evaluator that "just bumped the
+drop count" on some other refusal, a supervisor that advanced head without
+going through `pop` — breaks it with no symptom other than a notification
+the OS never hears about and never learns it missed.
+
+The mutex pool's guarantee is that a count is incremented in exactly one
+place and decremented in exactly one other. A second writer there
+reintroduces the deadlock the recursive acquire exists to prevent, or
+leaks a hold that silently refuses every later acquire in the session.
+
+### Corpus — 2723 assertions, up from 2295
+
+Fourteen new fixtures. The ones worth naming:
+
+| fixture | what only it can catch |
+|---|---|
+| `an argument passed by reference writes through` | two identical callee bodies, opposite effect — the §19.3.5.8 ArgX rule |
+| `a Buffer survives being passed and being returned` | object arguments and object return values, neither of which #1054 could express |
+| `the return tag says Integer for an Integer` | the tag's *negative* half, including that falling off the end clears a previous invocation's tag |
+| `a call's arity is checked against the declaration` | the cross-check, driven directly because no AML input reaches it |
+| `a full ring drops, counts, and does not block` | tail-drop *and* the accounting identity, over 40 offers into a 32-deep ring |
+| `an unbounded Notify loop ends on fuel, not on a block` | that the ring never blocks — under the watchdog, a regression here hangs |
+| `a serialized method may call itself` | the anti-deadlock property; a test-and-set mutex hangs rather than fails |
+| `unbounded recursion trips the frame pool, not a leak` | the release on the frame-overflow path |
+| `SyncLevel orders acquisition, downward is an error` | both directions, so a check that refused everything would not pass |
+| `the mutex pool is bounded and a leak is detected` | the pool bound and the leak counter, both through the API |
+
+### Mutation testing — sixteen mutants, sixteen killed, one after a fix
+
+| mutant | killed by |
+|---|---|
+| the drop counter never increments | `eight were refused` |
+| the enqueue spends no fuel | `and it cost exactly one step` |
+| a Device reports its arena kind, not its ObjectType | `the ObjectType, not the arena kind` |
+| every node kind is notifiable | `not notifiable` |
+| `Notify` operand 0 wants ANY, not REFERENCE | `BAD_REF, from the conversion table` |
+| `Notify` is not intercepted in statement position | `callee sets its own Local0` (NOT_EVALUABLE cascade) |
+| the serialized acquire is test-and-set | `re-entry by the owner SUCCEEDS` |
+| release frees the entry on every release, not at zero | `count 2` |
+| the SyncLevel order check is removed | `SYNC_LEVEL` |
+| final release does not restore the displaced level | `the level it displaced comes back` |
+| no release when the frame pool refuses | `nothing still held` |
+| arguments are always bound as integers | `SETA(RefOf(TGTR)) reached the caller's Name` |
+| the return tag is never set | `SizeOf a Buffer is its byte count` |
+| the arity cross-check is inverted | `caller's Local0 survives the call` |
+| the METHOD-ARG table row is removed | `no implicit conversion at any argument position` |
+| tail-drop becomes overwrite-oldest | `eight were refused` |
+
+**One mutant survived the first round**, and the fix is the interesting
+part. Deleting the fuel spend from `aml_notify_enqueue` passed every
+assertion, because the fixture measured fuel *across the whole `Notify`
+statement* — and `Notify`'s two operands evaluate through `aml_eval_obj`,
+which spends its own steps, so the total still dropped. The corpus now
+measures the **leaf**: `aml_notify_enqueue` called directly, asserted to
+cost exactly one step on the accepted path and exactly one on the dropped
+path. This is the same lesson #1057 recorded for the object dispatcher's
+fuel spend, arrived at independently, which is itself worth recording: a
+before-and-after measurement across a composite operation cannot see a
+missing charge inside it.
+
+### Toolchain
+
+One paideia-as encoder limit met and worked around rather than escalated,
+because a workaround exists and is not worse: `sub r64, [mem]` and
+`add r64, [mem]` are not in the phase-3-m2-002 encoder minimum
+(`error[B1705]: sub form not in phase-3-m2-002 minimum`). The register-
+register forms are, so every such site loads through a scratch register
+first. No paideia-as issue was filed: the two-instruction form is what the
+rest of this subsystem already writes, and a one-off encoder addition for
+readability would not have paid for the version churn. `movabs`-width
+immediates were likewise avoided — the drop counter saturates by
+incrementing and testing for wrap rather than by comparing against
+`0xFFFFFFFFFFFFFFFF`, and the owner/level word is split with a
+shift pair rather than an `and` against a 32-bit mask.
