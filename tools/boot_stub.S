@@ -1387,9 +1387,12 @@ endpoint_cap_fail_msg: .ascii "R20b ENDPOINT CAP FAIL\n\0"
 
 # R29.M0-001 (#1017): KIND_HW base-kind witness fingerprints — promotes
 # slot 14 of the 16-slot base_kind enum from the prior "fault" placeholder
-# to KIND_HW, the base kind for hardware-adjacent caps (KIND_HW_INTERRUPT
-# / KIND_HW_MSIX_VECTOR / KIND_HW_DMA_DOMAIN / KIND_HW_TIMELINE land as
-# derived kinds in R29.M1 #1019-#1022). See:
+# to KIND_HW, the base kind for hardware-adjacent caps. KIND_HW_INTERRUPT
+# and KIND_HW_MSIX_VECTOR derive over it in R29.M1 (#1019-#1022);
+# KIND_DMA_DOMAIN (R29.M5, #1036) landed over KIND_MEMORY instead — the
+# planning skeleton's `KIND_HW_DMA_DOMAIN` name is retired, see
+# src/kernel/core/cap/kind_dma_domain.pdx §"Naming reconciliation".
+# KIND_HW_TIMELINE remains reserved. See:
 #   - src/kernel/core/cap/kind.pdx (KIND_HW = 14 declaration + rationale)
 #   - design/capabilities/linearity-and-tags.md §3.1a
 #   - design/architecture/next-wave-derived-kinds.md §KIND_HW
@@ -1482,6 +1485,34 @@ kind_dma_domain_fail_msg: .ascii "R29 KIND_DMA_DOMAIN FAIL\n\0"
 #   - src/kernel/core/driver/driver_table.pdx (32-slot descriptor storage)
 #   - design/architecture/next-wave-derived-kinds.md §Driver lifecycle FSM
 #   - design/roadmap/next-wave-softarch.md §3 R29 (Milestones — R29.M2)
+# R29.M5-003 (#1038) + R29.M5-004 (#1039): per-driver-process DMA domain
+# + IOMMU domain-switching contract fingerprints — closes R29.M5.
+# D1.b fixes IOMMU granularity at exactly ONE KIND_DMA_DOMAIN per driver
+# process; driver_lifecycle_start mints it on the FSM's single Init ->
+# Running entry edge and driver_lifecycle_teardown revokes it after the
+# terminal Stopped state. iommu_domain_switch is the kernel-owned path
+# from a domain capability to a VT-d context entry: it validates holder,
+# authority, liveness, quiescence, BDF-in-binding and context-entry
+# exclusivity, each with its own refusal code, and drives the row [+24]
+# state machine (NONE / PENDING / PROGRAMMED). The real VT-d write is
+# wired to vtd_context_program but dormant behind the R22.M5 backing
+# registration (Features.IOMMU_ENABLED = 0). Witness at kernel_main.pdx
+# §dma_domain_switch_witness spawns two fake driver processes, proves the
+# duplicate-mint refusal, walks every switch refusal edge, and asserts no
+# row leaks across two spawn/exit cycles. See:
+#   - src/kernel/core/iommu/domain_switch.pdx (the contract)
+#   - src/kernel/core/driver/lifecycle.pdx (start / teardown)
+#   - src/kernel/core/driver/driver_table.pdx (the cardinality gate)
+#   - design/drivers/blob-policy.md §2.5 / §2.6
+.global dma_domain_switch_ok_msg
+.align 8
+dma_domain_switch_ok_msg: .ascii "R29 DMA DOMAIN SWITCH OK\n\0"
+
+.global dma_domain_switch_fail_msg
+.align 8
+dma_domain_switch_fail_msg: .ascii "R29 DMA DOMAIN SWITCH FAIL\n\0"
+
+
 .global driver_lifecycle_ok_msg
 .align 8
 driver_lifecycle_ok_msg: .ascii "R29 LIFECYCLE FSM OK\n\0"

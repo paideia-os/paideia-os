@@ -153,6 +153,46 @@ module Lifecycle = structure {
   // error; every unauthorised transition returns this code.
   pub let DRIVER_LIFECYCLE_ERR_INVALID_TRANSITION   : u64 = 0xFFFFFF03
 
+  // -- R29.M5-003 (#1038): spawn/teardown codes -----------------------
+  //
+  // ERR_NOT_INIT: driver_lifecycle_start was called on a slot whose state
+  // is not Init. Distinct from ERR_INVALID_TRANSITION because start does
+  // more than transition — it mints a scarce IOMMU domain — and a caller
+  // must be able to tell "you may not start a running driver" from "the
+  // FSM refused an edge".
+  pub let DRIVER_LIFECYCLE_ERR_NOT_INIT             : u64 = 0xFFFFFF04
+
+  // ERR_DOMAIN_EXISTS: the D1.b cardinality refusal at the lifecycle
+  // boundary — the slot already carries a KIND_DMA_DOMAIN. Mirrors
+  // DRIVER_TABLE_DOMAIN_EXISTS one layer down; both exist because the
+  // policy must be observable at the layer the supervisor calls.
+  pub let DRIVER_LIFECYCLE_ERR_DOMAIN_EXISTS        : u64 = 0xFFFFFF05
+
+  // ERR_NOT_STOPPED: driver_lifecycle_teardown was called on a slot that
+  // has not reached the terminal Stopped state. Tearing down a domain
+  // under a driver that may still be issuing DMA is the one ordering
+  // mistake that turns a clean teardown into a use-after-free with a
+  // bus-mastering device on the other end.
+  pub let DRIVER_LIFECYCLE_ERR_NOT_STOPPED          : u64 = 0xFFFFFF06
+
+  // ERR_DOMAIN_REVOKE: the domain survived both the cascade and the
+  // precise revoke. Reported rather than swallowed — a driver descriptor
+  // cleared over a live domain row is exactly the leak this issue closes.
+  pub let DRIVER_LIFECYCLE_ERR_DOMAIN_REVOKE        : u64 = 0xFFFFFF07
+
+  // ============================================================================
+  // Audit strings (.rodata) — R29.M5-003 (#1038)
+  //
+  // Emitted under SUBSYS_CAP_ at LEVEL_INFO, the same channel as the
+  // KIND_DMA_DOMAIN dispatch chatter and the iommu/domain_switch.pdx
+  // bind/unbind lines, so a domain's whole life — mint, bind, unbind,
+  // revoke — lands on one filter.
+  // ============================================================================
+
+  pub let drv_dom_mint_msg   : [u8; 19] = "DRIVER DOMAIN MINT\0"
+  pub let drv_dom_revoke_msg : [u8; 21] = "DRIVER DOMAIN REVOKE\0"
+  pub let drv_dom_k_row      : [u8; 4]  = "row\0"
+
   // ============================================================================
   // driver_lifecycle_transition_valid(cur_state, new_state) -> u64
   //
@@ -345,6 +385,359 @@ module Lifecycle = structure {
         pop r13;
         pop r12;
         mov rax, 0xFFFFFF03;                 // ERR_INVALID_TRANSITION
+        ret
+      }
+    }
+
+  // ============================================================================
+  // R29.M5-003 (#1038) — per-driver-process DMA-domain lifetime
+  // ============================================================================
+  //
+  // Where the mint is wired, and why there
+  // --------------------------------------
+  // The domain is minted on the Init -> Running edge, inside
+  // driver_lifecycle_start, and revoked after the driver reaches the
+  // terminal Stopped state, inside driver_lifecycle_teardown. Three other
+  // sites were candidates; each is wrong for a specific reason:
+  //
+  //   * driver_table_register (slot allocation). Registration is pure
+  //     bookkeeping: the supervisor may register a driver it then
+  //     declines to start — R29.M4's signature check takes exactly that
+  //     path, walking Init -> Stopping without the driver ever executing.
+  //     Minting there would strand one of 32 IOMMU rows behind a driver
+  //     that never ran.
+  //
+  //   * Suspended -> Running (resume). A domain minted on resume would be
+  //     a *different* domain than the one the driver was using before it
+  //     suspended, silently dropping every mapping. Resume must find the
+  //     domain it left; that is only true if the mint happened once, on
+  //     the entry edge.
+  //
+  //   * First device_arrived. This is the natural-looking choice and it
+  //     is the one D1.b explicitly rejects: minting on device arrival
+  //     makes the domain's identity depend on which device showed up
+  //     first, which is per-device granularity wearing a per-process
+  //     label. design/drivers/blob-policy.md §2.4 fixes the mint "at
+  //     driver-process spawn, before the first device_arrived message".
+  //
+  // Init -> Running is the FSM's single entry edge (see
+  // DRIVER_LIFECYCLE_TABLE: byte 0 admits only Running). Putting the mint
+  // there means there is exactly one code path that can create a domain
+  // for a driver, which is what makes the cardinality claim checkable
+  // rather than aspirational. The domain therefore exists for precisely
+  // the driver's executable lifetime: it cannot be running without one,
+  // and it cannot keep one after it stops.
+  //
+  // Ordering inside start: the cardinality check precedes the mint, so a
+  // refused second start consumes no row. Every failure after the mint
+  // rolls the mint back, so no partial state survives an error return.
+  // ============================================================================
+
+  // ============================================================================
+  // driver_lifecycle_start(slot, cap_slot, parent_mem_slot, tail_word,
+  //                        capacity_bytes) -> u64
+  //
+  // Spawn-time transition: mint the driver's one KIND_DMA_DOMAIN, record
+  // it in the descriptor, and move Init -> Running.
+  //
+  // SysV ABI:
+  //   rdi = slot             driver_table slot (0..31), state Init
+  //   rsi = cap_slot         cap_table slot to receive the domain cap
+  //   rdx = parent_mem_slot  ancestor KIND_MEMORY slot (the driver
+  //                          process's memory root)
+  //   rcx = tail_word        from dma_tail_pack(ctx_id, bdf, coherency)
+  //   r8  = capacity_bytes   mapped-window ceiling (non-zero)
+  //
+  // Returns:
+  //   DRIVER_LIFECYCLE_OK              (0)
+  //   DRIVER_LIFECYCLE_ERR_BAD_SLOT    — slot >= 32 or not in_use.
+  //   DRIVER_LIFECYCLE_ERR_NOT_INIT    — slot's state is not Init.
+  //   DRIVER_LIFECYCLE_ERR_DOMAIN_EXISTS — slot already has a domain.
+  //   a DMA_MINT_* code                — propagated verbatim from
+  //                                      dma_cap_mint (see below).
+  //   a DRIVER_TABLE_DOMAIN_* code     — propagated from set_domain.
+  //   a DRIVER_LIFECYCLE_ERR_* code    — propagated from transition.
+  //
+  // The DMA_MINT_* code is propagated verbatim rather than collapsed into
+  // one "mint failed" value. The five mint failures (bad parent kind,
+  // illegal rights, row exhaustion, bad argument, bad coherency) call for
+  // five different supervisor responses, and the code blocks are disjoint
+  // by construction (DMA_* live at 0xFFFFFFD8.., DRIVER_LIFECYCLE_* at
+  // 0xFFFFFF0x), so a caller can always tell which layer refused.
+  // ============================================================================
+
+  pub let driver_lifecycle_start : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (slot: u64) (cap_slot: u64) (parent_mem_slot: u64)
+       (tail_word: u64) (capacity_bytes: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R29.M5-003 (#1038): driver-process spawn — mint exactly one KIND_DMA_DOMAIN and move the FSM Init -> Running. Sequence: (1) driver_table_slot_in_use(slot) == 0 -> ERR_BAD_SLOT. (2) driver_table_read_state_byte(slot) != DRIVER_STATE_INIT (0) -> ERR_NOT_INIT. (3) driver_table_has_domain(slot) != 0 -> ERR_DOMAIN_EXISTS — checked BEFORE the mint so a refused duplicate consumes no _dma_domain_table row. (4) dma_cap_mint(cap_slot, parent_mem_slot, R_DMA_ALL=0x618, tail_word, capacity_bytes); non-zero propagated verbatim. Rights are fixed at R_DMA_ALL rather than taken as a sixth argument: the supervisor mints the full set and hands the driver a diminished copy, and SysV has only six argument registers of which this call already uses five. (5) row_id = cap_table[cap_slot].target_ptr bits [15:0], read at stride 24. (6) driver_table_set_domain(slot, row_id, cap_slot); on failure revoke the just-minted cap and propagate. (7) driver_lifecycle_transition(slot, DRIVER_STATE_RUNNING); on failure clear the descriptor field AND revoke the cap, then propagate — no partial state survives an error return. (8) klog_s1_x1(LEVEL_INFO, SUBSYS_CAP_, drv_dom_mint_msg, drv_dom_k_row, row_id) audit line. Callee-save: r12=slot, r13=cap_slot, r14=parent then row_id, r15=tail_word, rbx=capacity_bytes. Five pushes leave rsp 16-byte aligned at every nested call (entry %16 == 8, five pushes -> %16 == 0).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                        // slot
+        mov r13, rsi;                        // cap_slot
+        mov r14, rdx;                        // parent_mem_slot
+        mov r15, rcx;                        // tail_word
+        mov rbx, r8;                         // capacity_bytes
+
+        // (1) slot gate.
+        mov rdi, r12;
+        call driver_table_slot_in_use;
+        cmp rax, 0;
+        je  drv_start_bad_slot;
+
+        // (2) state must be Init.
+        mov rdi, r12;
+        call driver_table_read_state_byte;
+        cmp rax, 0;                          // DRIVER_STATE_INIT
+        jne drv_start_not_init;
+
+        // (3) D1.b cardinality — before any allocation.
+        mov rdi, r12;
+        call driver_table_has_domain;
+        cmp rax, 0;
+        jne drv_start_dom_exists;
+
+        // (4) mint the domain.
+        mov rdi, r13;                        // target cap slot
+        mov rsi, r14;                        // parent KIND_MEMORY slot
+        mov rdx, 0x618;                      // R_DMA_ALL
+        mov rcx, r15;                        // tail_word
+        mov r8,  rbx;                        // capacity_bytes
+        call dma_cap_mint;
+        cmp rax, 0;
+        jne drv_start_epilogue;              // propagate DMA_MINT_* verbatim
+
+        // (5) row_id = cap_table[cap_slot].target_ptr[15:0].
+        mov rax, cap_table;
+        mov r8, r13;
+        shl r8, 3;
+        mov r9, r13;
+        shl r9, 4;
+        add r8, r9;                          // cap_slot * 24
+        add rax, r8;
+        mov rax, [rax + 16];
+        mov r10, 0xFFFF;
+        and rax, r10;
+        mov r14, rax;                        // row_id (parent no longer needed)
+
+        // (6) record it in the descriptor.
+        mov rdi, r12;
+        mov rsi, r14;
+        mov rdx, r13;
+        call driver_table_set_domain;
+        cmp rax, 0;
+        jne drv_start_attach_fail;
+
+        // (7) FSM Init -> Running.
+        mov rdi, r12;
+        mov rsi, 1;                          // DRIVER_STATE_RUNNING
+        call driver_lifecycle_transition;
+        cmp rax, 0;
+        jne drv_start_trans_fail;
+
+        // (8) audit.
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + drv_dom_mint_msg];
+        lea rcx, [rip + drv_dom_k_row];
+        mov r8,  r14;                        // row_id
+        call klog_s1_x1;
+
+        xor rax, rax;                        // DRIVER_LIFECYCLE_OK
+        jmp drv_start_epilogue;
+
+      drv_start_attach_fail:
+        // Roll back the mint — a refused attach must leave no cap behind.
+        mov r15, rax;                        // save rc
+        mov rdi, r13;
+        call dma_cap_revoke;
+        mov rax, r15;
+        jmp drv_start_epilogue;
+
+      drv_start_trans_fail:
+        // Roll back attach + mint.
+        mov r15, rax;                        // save rc
+        mov rdi, r12;
+        call driver_table_clear_domain;
+        mov rdi, r13;
+        call dma_cap_revoke;
+        mov rax, r15;
+        jmp drv_start_epilogue;
+
+      drv_start_bad_slot:
+        mov rax, 0xFFFFFF01;                 // ERR_BAD_SLOT
+        jmp drv_start_epilogue;
+
+      drv_start_not_init:
+        mov rax, 0xFFFFFF04;                 // ERR_NOT_INIT
+        jmp drv_start_epilogue;
+
+      drv_start_dom_exists:
+        mov rax, 0xFFFFFF05;                 // ERR_DOMAIN_EXISTS
+
+      drv_start_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // driver_lifecycle_teardown(slot) -> u64
+  //
+  // Driver-process exit. Requires the FSM to have reached the terminal
+  // Stopped state, then:
+  //
+  //   1. Releases the IOMMU context entry the domain owns, if any, via
+  //      iommu_domain_unswitch. Doing this BEFORE the revoke is the whole
+  //      ordering point: dma_cap_revoke frees the row, and a freed row
+  //      cannot tell the hardware path which context entry to clear.
+  //   2. Reads the row's parent_slot — the driver process's KIND_MEMORY
+  //      root — and calls dma_cascade_revoke_by_parent on it. The cascade
+  //      rather than a precise revoke is what closes the leak: at process
+  //      exit the memory root dies, and any domain derived from it that
+  //      the descriptor did not name (a supervisor bug, a partially-rolled-
+  //      back start) would otherwise outlive the memory authority that
+  //      justified it. A stale IOMMU context entry is a device with reach
+  //      into memory nobody owns.
+  //   3. Falls back to a precise dma_cap_revoke if the row somehow
+  //      survived the cascade, and reports ERR_DOMAIN_REVOKE if even that
+  //      leaves it live. Clearing the descriptor over a live row would
+  //      make the leak invisible, which is worse than failing loudly.
+  //   4. Clears the descriptor's domain field, so the slot may be
+  //      re-registered and started again with a fresh domain.
+  //
+  // Idempotent on a slot with no domain (returns OK immediately), so a
+  // supervisor may call it unconditionally on the exit path.
+  //
+  // SysV ABI: rdi = slot.
+  // ============================================================================
+
+  pub let driver_lifecycle_teardown : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R29.M5-003 (#1038): driver-process exit — release the context entry, revoke the domain, clear the descriptor field. Sequence: (1) driver_table_slot_in_use(slot) == 0 -> ERR_BAD_SLOT. (2) driver_table_read_state_byte(slot) != DRIVER_STATE_STOPPED (5) -> ERR_NOT_STOPPED. (3) driver_table_has_domain(slot) == 0 -> return OK (idempotent). (4) Read row_id + cap_slot from the descriptor. (5) dma_ctx_state(row_id): if neither DMA_CTX_NONE (0) nor DMA_DECODE_BAD, call iommu_domain_unswitch(cap_slot, row_id) and propagate any failure — the hardware entry must go before the row does. (6) dma_tail_decode_parent(row_id) BEFORE any revoke (the revoke frees the row); if it is not DMA_DECODE_BAD, dma_cascade_revoke_by_parent(parent). (7) If dma_tail_valid(row_id) still reports live, dma_cap_revoke(cap_slot); a non-zero rc there -> ERR_DOMAIN_REVOKE. (8) driver_table_clear_domain(slot). (9) klog_s1_x1(LEVEL_INFO, SUBSYS_CAP_, drv_dom_revoke_msg, drv_dom_k_row, row_id) audit line. Callee-save: r12=slot, r13=row_id, r14=cap_slot, r15=parent_slot, rbx=saved rc. Five pushes keep rsp 16-byte aligned at every nested call.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                        // slot
+
+        // (1) slot gate.
+        mov rdi, r12;
+        call driver_table_slot_in_use;
+        cmp rax, 0;
+        je  drv_td_bad_slot;
+
+        // (2) terminal-state gate.
+        mov rdi, r12;
+        call driver_table_read_state_byte;
+        cmp rax, 5;                          // DRIVER_STATE_STOPPED
+        jne drv_td_not_stopped;
+
+        // (3) nothing to do?
+        mov rdi, r12;
+        call driver_table_has_domain;
+        cmp rax, 0;
+        je  drv_td_ok;
+
+        // (4) descriptor fields.
+        mov rdi, r12;
+        call driver_table_read_domain_row;
+        mov r13, rax;                        // row_id
+        mov rdi, r12;
+        call driver_table_read_domain_cap;
+        mov r14, rax;                        // cap_slot
+
+        // (5) release the context entry first.
+        mov rdi, r13;
+        call dma_ctx_state;
+        cmp rax, 0;                          // DMA_CTX_NONE
+        je  drv_td_ctx_done;
+        mov r10, 0xFFFFFFFFFFFFFFFF;         // DMA_DECODE_BAD
+        cmp rax, r10;
+        je  drv_td_ctx_done;
+
+        mov rdi, r14;
+        mov rsi, r13;
+        call iommu_domain_unswitch;
+        cmp rax, 0;
+        jne drv_td_epilogue;                 // propagate verbatim
+
+      drv_td_ctx_done:
+        // (6) cascade through the dying process's memory root.
+        mov rdi, r13;
+        call dma_tail_decode_parent;
+        mov r15, rax;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp r15, r10;
+        je  drv_td_precise;
+
+        mov rdi, r15;
+        call dma_cascade_revoke_by_parent;
+
+      drv_td_precise:
+        // (7) precise fallback if the row outlived the cascade.
+        mov rdi, r13;
+        call dma_tail_valid;
+        cmp rax, 0;
+        je  drv_td_clear;
+
+        mov rdi, r14;
+        call dma_cap_revoke;
+        cmp rax, 0;
+        jne drv_td_revoke_fail;
+
+        mov rdi, r13;
+        call dma_tail_valid;
+        cmp rax, 0;
+        jne drv_td_revoke_fail;
+
+      drv_td_clear:
+        // (8) drop the descriptor field.
+        mov rdi, r12;
+        call driver_table_clear_domain;
+
+        // (9) audit.
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + drv_dom_revoke_msg];
+        lea rcx, [rip + drv_dom_k_row];
+        mov r8,  r13;                        // row_id
+        call klog_s1_x1;
+
+      drv_td_ok:
+        xor rax, rax;                        // DRIVER_LIFECYCLE_OK
+        jmp drv_td_epilogue;
+
+      drv_td_bad_slot:
+        mov rax, 0xFFFFFF01;                 // ERR_BAD_SLOT
+        jmp drv_td_epilogue;
+
+      drv_td_not_stopped:
+        mov rax, 0xFFFFFF06;                 // ERR_NOT_STOPPED
+        jmp drv_td_epilogue;
+
+      drv_td_revoke_fail:
+        mov rax, 0xFFFFFF07;                 // ERR_DOMAIN_REVOKE
+
+      drv_td_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
         ret
       }
     }

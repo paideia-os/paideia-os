@@ -758,6 +758,146 @@ attributed to it — the pattern documented in
 `design/architecture/next-wave-derived-kinds.md`
 `KIND_DMA_DOMAIN` §"Ops".
 
+### 2.5 Cardinality enforcement (R29.M5-003, #1038)
+
+"Exactly one domain per driver process" is a policy only if the kernel
+refuses the second one. As landed:
+
+- The driver descriptor (`src/kernel/core/driver/driver_table.pdx`, row
+  `[+32]`) carries `{dma_domain_row_id, dma_domain_cap_slot, present}`.
+  The `present` bit is the enforcement point:
+  `driver_table_set_domain` returns `DRIVER_TABLE_DOMAIN_EXISTS`
+  (`0xFFFFFEFC`) if it is already set, and leaves the existing field
+  byte-for-byte intact. The check lives at the *store* rather than in a
+  caller, because the store is what would have to be corrupted for two
+  domains to coexist; a check anywhere upstream is a convention.
+- The lifecycle boundary surfaces the same refusal as
+  `DRIVER_LIFECYCLE_ERR_DOMAIN_EXISTS` (`0xFFFFFF05`) so a supervisor
+  sees a policy violation at the layer it called, not a storage code
+  leaking upward.
+- Both codes are distinct from every "bad argument" code in their block.
+  A second-domain request and a malformed request call for opposite
+  responses: the first is a policy violation to audit, the second a
+  caller bug to fix.
+
+**Where the mint happens, and why.** `driver_lifecycle_start`
+(`src/kernel/core/driver/lifecycle.pdx`) performs the mint on the FSM's
+`Init -> Running` edge — the machine's single entry edge, so there is
+exactly one code path that can create a domain. Three alternatives were
+rejected:
+
+| Site | Why not |
+|---|---|
+| Slot registration | Registration is bookkeeping; §1's signature check walks `Init -> Stopping` without the driver ever executing, which would strand one of 32 IOMMU rows behind a driver that never ran. |
+| `Suspended -> Running` (resume) | Would hand the driver a *different* domain than the one it suspended with, silently dropping every mapping. |
+| First `device_arrived` | Makes the domain's identity depend on which device arrived first — per-device granularity wearing a per-process label, i.e. the thing §2.2 rejects. |
+
+The domain therefore exists for precisely the driver's executable
+lifetime: it cannot be Running without one, and it cannot keep one after
+it Stops. The cardinality check runs *before* the mint, so a refused
+duplicate consumes no row; every failure after the mint rolls the mint
+back.
+
+**Teardown.** `driver_lifecycle_teardown` requires the terminal `Stopped`
+state (`DRIVER_LIFECYCLE_ERR_NOT_STOPPED` otherwise — tearing a domain
+down under a driver that may still be issuing DMA is a use-after-free
+with a bus-mastering device on the other end), then, in order: releases
+the IOMMU context entry via `iommu_domain_unswitch` (before the revoke,
+because a freed row cannot tell the hardware path which entry to clear);
+cascades through the row's `parent_slot` — the dying process's
+`KIND_MEMORY` root — via `dma_cascade_revoke_by_parent`; falls back to a
+precise `dma_cap_revoke` if the row somehow outlived the cascade; and
+reports `DRIVER_LIFECYCLE_ERR_DOMAIN_REVOKE` rather than clearing the
+descriptor over a live row. The boot witness asserts no row leaks across
+two full spawn/exit cycles — a leaked row would push the second spawn off
+row 0.
+
+### 2.6 The domain-switching contract (R29.M5-004, #1039)
+
+`src/kernel/core/iommu/domain_switch.pdx`. Userspace drivers never touch
+VT-d context entries; a driver that could write its own context entry
+could point it at a page table it controls, which is unmediated physical
+memory access wearing a capability's name.
+
+**Binding.** Because the domain is per-process and a process may own more
+than one function, the domain carries a binding — a `(base, mask)` prefix
+at row `[+16]` — and the kernel accepts a switch only for BDFs inside it:
+`(bdf & mask) == (base & mask)`. Minting seeds `base` = the minted BDF and
+`mask` = `0xFFFF` (exactly one function, the narrowest legal shape);
+`dma_domain_set_binding` is the supervisor authority that widens it —
+`0xFFF8` for every function of one device (the CNVi Wi-Fi/BT case in
+§2.1), `0xFF00` for a whole bus. A zero mask is refused: it would make
+every BDF a member, an unbounded grant dressed as a narrowing operation.
+
+**What the kernel validates**, in order, each with its own refusal code:
+
+| # | Gate | Refusal |
+|---|---|---|
+| 1 | `row_id < 32`, `bdf < 2^16` | `IOMMU_SW_ERR_BAD_ARG` `0xFFFFFFCF` |
+| 2 | Caller holds a `KIND_DMA_DOMAIN` cap naming that row | `IOMMU_SW_ERR_NOT_HELD` `0xFFFFFFCE` |
+| 3 | That cap carries `RIGHT_MINT` | `IOMMU_SW_ERR_NO_RIGHT` `0xFFFFFFCD` |
+| 4 | The row is live | `IOMMU_SW_ERR_DEAD_ROW` `0xFFFFFFCC` |
+| 5 | The row is not mid-switch | `IOMMU_SW_ERR_IN_TRANSITION` `0xFFFFFFC9` |
+| 6 | BDF ∈ the domain's binding | `IOMMU_SW_ERR_BDF_UNBOUND` `0xFFFFFFCB` |
+| 7 | No *other* live domain owns that context entry | `IOMMU_SW_ERR_CTX_OWNED` `0xFFFFFFCA` |
+
+`RIGHT_MINT` rather than `RIGHT_INVOKE` (gate 3): switching a domain onto
+a function widens what that function can reach from nothing to the
+domain's whole mapped set — the same authority class as `OP_MAP`.
+Grouping it with the read-only query ops would let a monitor holding only
+`INVOKE` re-point production hardware.
+
+Exclusivity (gate 7) is a kernel check rather than a driver convention
+because VT-d has exactly one context entry per `(bus, devfn)`. Two
+domains believing they own the same entry is not a race the last writer
+wins — it is one driver silently acquiring the other's memory reach.
+There is no "force" flag: the supervisor revokes the other domain first,
+which is an auditable act, or the request stays refused. The kernel also
+refuses to program an *unowned* entry outside the binding — the binding
+is the supervisor's statement of what the process owns, and an unowned
+entry is not an invitation.
+
+**Context-entry state machine** (row `[+24]`, the offset #1036 reserved):
+
+```
+NONE ──switch──▶ PENDING ──commit──▶ PROGRAMMED
+                    │                     │
+                    └◀──── restore ───────┤ (hardware refused)
+
+PROGRAMMED ──switch(other bdf)──▶ PENDING ──▶ PROGRAMMED
+PROGRAMMED ──unswitch──▶ PENDING ──▶ NONE
+```
+
+`PENDING` is never a resting state: every path that writes it either
+completes or restores the exact prior word. A request against a `PENDING`
+row is refused rather than queued — at R29 the kernel is single-flow, so
+`PENDING` is observable only if a fault unwound the middle of a switch,
+and refusing is the right answer to "the previous switch did not finish".
+
+**Audit.** `mint`, `bind`, `unbind`, and `revoke` each emit a `SUBSYS_CAP_`
+`LEVEL_INFO` klog record (`DRIVER DOMAIN MINT`, `IOMMU DOMAIN BIND`,
+`IOMMU DOMAIN UNBIND`, `DRIVER DOMAIN REVOKE`), so a domain's whole life
+lands on one filter.
+
+**Real VT-d programming: wired but dormant, gated on R22.**
+`iommu_ctx_commit_hw` calls the real R22 primitive `vtd_context_program`,
+and `iommu_ctx_uncommit_hw` clears the entry's two qwords directly.
+Neither runs today, because R22 left its tables unwired:
+`Features.IOMMU_ENABLED` is `0`; `vtd_root_init`'s own justification
+records "NOT WIRED AT M4 BOOT — kernel_main never calls this"; and no
+per-bus context-table page or SLPT root is allocated anywhere in the
+tree. Rather than fake any of that, the module takes the three missing
+values as an explicit registration — R22.M5's enable path calls
+`iommu_hw_backing_set(bus, ctx_table_va, slpt_root_pa)` once it has
+allocated them. Until then `iommu_ctx_commit_hw` returns
+`IOMMU_HW_GATED` and the switch completes as a **software-only ownership
+record**: the domain owns the entry in the kernel's accounting, the row's
+`hw_committed` bit stays `0`, and no hardware is touched. That bit is
+recorded per-row rather than inferred, because teardown must know whether
+there is a hardware entry to clear. The boot witness asserts
+`hw_committed == 0` explicitly, so the day R22.M5 lands the assertion
+flips and says so.
+
 ---
 
 ## 3. D1.c — Audit access: FULL
