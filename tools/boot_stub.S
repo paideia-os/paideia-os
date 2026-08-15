@@ -1443,6 +1443,32 @@ kind_hw_msix_ok_msg: .ascii "R29 KIND_MSIX_VECTOR OK\n\0"
 kind_hw_msix_fail_msg: .ascii "R29 KIND_MSIX_VECTOR FAIL\n\0"
 
 
+# R29.M5-001 (#1036) + R29.M5-002 (#1037): KIND_DMA_DOMAIN derived-kind
+# witness fingerprints — per-driver-process IOMMU domain, derived over
+# KIND_MEMORY (= KIND_PAGE, base slot 4) rather than KIND_HW. Numeric
+# derived tag 0x142 (decimal 322), third entry in the R29 derived-kind
+# block. Witness at kernel_main.pdx §kind_dma_domain_witness mints a
+# KIND_MEMORY parent, mints two domains under it with distinct
+# {iommu_ctx_id, bus_dev_fn, capacity_bytes, coherency} tuples, asserts
+# the encode->decode identity for all four tail fields through
+# cap_invoke_dispatch, walks every failure edge (bad parent kind,
+# insufficient rights, out-of-range coherency, zero capacity, row-table
+# exhaustion, revoke of a foreign kind, double revoke), then
+# cascade-revokes both domains via the memory parent and asserts the
+# rows and descriptors are cleared. See:
+#   - src/kernel/core/cap/kind_dma_domain.pdx (module implementation)
+#   - src/kernel/core/cap/kind.pdx (KIND_MEMORY + KIND_DMA_DOMAIN decls)
+#   - src/kernel/core/cap/invoke.pdx (call_kind_dma_domain branch)
+#   - design/architecture/next-wave-derived-kinds.md §KIND_DMA_DOMAIN
+.global kind_dma_domain_ok_msg
+.align 8
+kind_dma_domain_ok_msg: .ascii "R29 KIND_DMA_DOMAIN OK\n\0"
+
+.global kind_dma_domain_fail_msg
+.align 8
+kind_dma_domain_fail_msg: .ascii "R29 KIND_DMA_DOMAIN FAIL\n\0"
+
+
 # R29.M2-001 (#1023): driver lifecycle FSM witness fingerprints — opens
 # R29.M2 (Lifecycle FSM real bodies + regression corpus). The FSM has
 # six states (Init/Running/Suspended/Handoff/Stopping/Stopped) and its

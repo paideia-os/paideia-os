@@ -14,7 +14,7 @@ this document absorbs and generalizes).
   ML-DSA-65 for release-signed artifacts).
 - `design/tooling/plan.md` D4 (the tool-package dual-sign analog).
 - `design/loader/init-caps-sidecar.md` (loader seed-caps contract).
-- `design/architecture/next-wave-derived-kinds.md` `KIND_HW_DMA_DOMAIN`.
+- `design/architecture/next-wave-derived-kinds.md` `KIND_DMA_DOMAIN`.
 
 ---
 
@@ -36,7 +36,7 @@ load-bearing for R38 (Wi-Fi), R39 (BT), R40 (camera + WWAN), R37 (GuC
 firmware on the GPU submission path), and R33 (SOF audio topology),
 are: **dual signature** (every blob carries both a vendor signature
 AND a Paideia manifest re-sign under `paideia_root_pk` from R32);
-**per-driver-process IOMMU domain** (one `KIND_HW_DMA_DOMAIN` per
+**per-driver-process IOMMU domain** (one `KIND_DMA_DOMAIN` per
 driver process, shared across every device that driver claims); and
 **full audit access** (blob-holding drivers get the same read + write
 audit capability that native drivers hold). Each is a
@@ -673,7 +673,7 @@ grep-verifiable form of "no path returns the OK verdict".
 
 ### 2.1 The rule
 
-Every driver process holds exactly one `KIND_HW_DMA_DOMAIN`
+Every driver process holds exactly one `KIND_DMA_DOMAIN`
 capability, minted at driver-process spawn by the supervisor. Every
 device that driver claims (via the framework's device-arrival
 handshake, `design/drivers/framework.md` §5) is mapped into that
@@ -693,7 +693,7 @@ memory outside the GPU's IOMMU context regardless.
 ### 2.2 Rationale (versus per-device and per-firmware-image)
 
 - **Versus per-device:** Per-device would require one
-  `KIND_HW_DMA_DOMAIN` per BDF the driver holds, which for CNVi means
+  `KIND_DMA_DOMAIN` per BDF the driver holds, which for CNVi means
   the driver juggles a domain per {Wi-Fi PHY, BT HCI, WWAN companion
   when installed}. The domain-switching cost on the hot IPC-to-DMA
   path is measurable (an IOTLB flush at minimum, per
@@ -743,7 +743,7 @@ consumer contain the exploit in every realistic case.
 ### 2.4 Implementation shape
 
 The driver-lifecycle supervisor (`design/drivers/framework.md`
-§4) mints `KIND_HW_DMA_DOMAIN` at driver-process spawn, before the
+§4) mints `KIND_DMA_DOMAIN` at driver-process spawn, before the
 first `device_arrived` message (per R29.M5-003 #1038). The domain
 cap is delivered via the loader's `_init_caps` sidecar
 (`design/loader/init-caps-sidecar.md`) — one slot per driver process,
@@ -756,7 +756,7 @@ hardware; `OP_UNMAP` reclaims it. On driver-process exit the domain
 cap is revoked, which tears down every context entry and IOTLB entry
 attributed to it — the pattern documented in
 `design/architecture/next-wave-derived-kinds.md`
-`KIND_HW_DMA_DOMAIN` §"Ops".
+`KIND_DMA_DOMAIN` §"Ops".
 
 ---
 
@@ -852,7 +852,7 @@ same verified code path.
 The loader plumbs two blob-specific `_init_caps` sidecar entries into
 every blob-consuming driver at spawn:
 
-1. `KIND_HW_DMA_DOMAIN` — the per-driver-process domain (§2.4).
+1. `KIND_DMA_DOMAIN` — the per-driver-process domain (§2.4).
 2. `KIND_HW` reservation — the base slot 14 handle the driver refines
    into `KIND_HW_INTERRUPT` / `KIND_HW_MSIX_VECTOR` handles when it
    claims its devices' IRQ vectors.
@@ -867,7 +867,7 @@ driver in its capability shape.
 ### 4.3 Loader-side sidecar shape (illustrative)
 
 Every blob-driver process has the same first four `_init_caps`
-slots: `KIND_HW_DMA_DOMAIN` (§2.4), `KIND_AUDIT_CHANNEL` write
+slots: `KIND_DMA_DOMAIN` (§2.4), `KIND_AUDIT_CHANNEL` write
 (§3.1), a base `KIND_HW` handle for IRQ refinement, and
 `KIND_PDXFS_READ` for `blob_load` to open the firmware path.
 Additional slots vary per driver (MMIO caps, DMA-consent tokens,
@@ -887,7 +887,7 @@ IPC endpoints to the class driver, sealed-key caps for BT/Wi-Fi).
 | **R33** | `sof_audio_driver` | Realtek SOF ALC287 topology | (SOF is the only blob in the audio path; standalone process) |
 
 Each row is a driver-process granule for §2.1: each driver process
-gets exactly one `KIND_HW_DMA_DOMAIN`. R38 + R39 share a process
+gets exactly one `KIND_DMA_DOMAIN`. R38 + R39 share a process
 (the CNVi transport is shared silicon); R37 GuC firmware executes on
 the GPU inside the `i915_driver`'s existing domain and does not mint a
 new one.
@@ -976,7 +976,7 @@ interface, and the fsck property table. |
 - `design/roadmap/next-wave-synthesis.md` §10 D1.
 - `design/drivers/framework.md` §12 (DR-D11 hook; §12.1 to be updated
   at R29.M6 for the D1.c reversal).
-- `design/architecture/next-wave-derived-kinds.md` `KIND_HW_DMA_DOMAIN`.
+- `design/architecture/next-wave-derived-kinds.md` `KIND_DMA_DOMAIN`.
 - `design/security/pq-trust-root.md` §0.2 (PQ-Q3), §PQ-Q9 (rotation).
 - `design/security/algorithm-catalog.md` (algorithm IDs referenced by
   `.pdxsig` manifests).

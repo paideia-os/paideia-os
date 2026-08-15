@@ -133,7 +133,7 @@ All seven escalations (PA-R13-001 through PA-R13-007) are filed for paideia-as. 
 | KIND_IO_PORT | KIND_IO_PORT | 11 | `src/kernel/core/cap/kind.pdx` line 49 | Legacy I/O port access |
 | KIND_NOTIFICATION | KIND_NOTIFICATION | 12 | `src/kernel/core/cap/kind.pdx` line 50 | Async notification bits; inter-CPU signaling |
 | KIND_REPLY | KIND_REPLY | 13 | `src/kernel/core/cap/kind.pdx` line 51 | RPC return path; deferred to R14+ |
-| KIND_HW | KIND_HW | 14 | `src/kernel/core/cap/kind.pdx` (R29.M0-001 #1017) | Hardware-adjacent base kind; parent for R29.M1 KIND_HW_INTERRUPT / KIND_HW_MSIX_VECTOR / KIND_HW_DMA_DOMAIN / KIND_HW_TIMELINE. Slot 14 was previously reserved (nominally "fault") — promoted per design/roadmap/next-wave-synthesis.md §10 D6. Exception/fault handling is instead expressed via the R15/R18 IDT+IST substrate, not a base cap kind. |
+| KIND_HW | KIND_HW | 14 | `src/kernel/core/cap/kind.pdx` (R29.M0-001 #1017) | Hardware-adjacent base kind; parent for R29.M1 KIND_HW_INTERRUPT / KIND_HW_MSIX_VECTOR / KIND_HW_TIMELINE. (KIND_HW_DMA_DOMAIN was originally listed here too; R29.M5-001 #1036 renamed it to KIND_DMA_DOMAIN and re-based it over KIND_MEMORY = slot 4.) Slot 14 was previously reserved (nominally "fault") — promoted per design/roadmap/next-wave-synthesis.md §10 D6. Exception/fault handling is instead expressed via the R15/R18 IDT+IST substrate, not a base cap kind. |
 | KIND_RESERVED | KIND_RESERVED | 15 | `src/kernel/core/cap/kind.pdx` | Reserved for confidential-computing / TDX (CAP-Q9); also serves as runtime base for the KIND_DMESG derived kind (tag 0x16) per logging-m9-001. |
 
 ### B.1 Multicore-Safety Property: Atomicity per kind

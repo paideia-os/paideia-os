@@ -45,8 +45,11 @@ inherited from `src/kernel/core/cap/mint.pdx`:
 raw `KIND_HW` cap without a derived-kind tag is a *reservation marker*
 only — it holds no hardware authority on its own. Derivation to one of
 the R29.M1 concrete kinds (KIND_HW_INTERRUPT / KIND_HW_MSIX_VECTOR /
-KIND_HW_DMA_DOMAIN / KIND_HW_TIMELINE) is required before any
-hardware effect can be invoked.
+KIND_HW_TIMELINE) is required before any hardware effect can be
+invoked. (The fourth skeleton originally listed here,
+`KIND_HW_DMA_DOMAIN`, was renamed to `KIND_DMA_DOMAIN` and re-based over
+`KIND_MEMORY` at R29.M5-001 #1036 — see "Derived kinds over
+`KIND_MEMORY`" below.)
 
 **Rights bitmask (base):**
 
@@ -78,9 +81,11 @@ sub-issues add functional-dispatch witnesses per derived kind.
 
 ## Derived kinds over `KIND_HW` (R29.M1)
 
-The four entries below are *planning skeletons* only — R29.M0-001 (this
-issue) does not implement them. Each row is refined into a full spec by
-the corresponding R29.M1 sub-issue when it lands.
+The entries below started as *planning skeletons* at R29.M0-001, each
+refined into a full spec by its sub-issue when it lands. Two have landed
+(`KIND_HW_INTERRUPT`, `KIND_HW_MSIX_VECTOR`); `KIND_HW_TIMELINE` remains
+a skeleton. A fourth skeleton, `KIND_HW_DMA_DOMAIN`, left this family
+entirely at R29.M5-001 (#1036) — see "Derived kinds over `KIND_MEMORY`".
 
 ### `KIND_HW_INTERRUPT` — landed by R29.M1-001..003 (#1019/#1020/#1021)
 
@@ -264,31 +269,12 @@ the corresponding R29.M1 sub-issue when it lands.
     cleared (`kind=0`, `rights=0`, `target_ptr=0`). Emits
     `R29 KIND_MSIX_VECTOR OK`.
 
-### `KIND_HW_DMA_DOMAIN` — planned for a later R29 milestone
-
-- **Runtime base kind:** `KIND_HW = 14`.
-- **Derived-kind tag:** `0x142`.
-- **Descriptor tail:** `{iommu_ctx_ptr:u64, bdf:u16, ats_enabled:u1,
-  pri_enabled:u1, address_width:u8}`.
-- **Rights:** `RIGHT_MINT` (map / unmap a page into the domain),
-  `RIGHT_REVOKE` (tear the domain down), `RIGHT_OBSERVE` (fault log).
-- **Ops:** `OP_MAP`, `OP_UNMAP`, `OP_FLUSH`, `OP_QUERY_FAULT`.
-- **Interaction with `KIND_PAGE = 4`:** a `KIND_PAGE` cap must accompany
-  every `OP_MAP` — the domain cap authorizes the mapping site, the page
-  cap authorizes the physical page. Cross-cap consent per the R29 IOMMU
-  invariant.
-- **Domain granularity — per-driver-process (D1.b).** One
-  `KIND_HW_DMA_DOMAIN` per driver process, shared across every device
-  the driver claims. Minted at driver-process spawn by the supervisor
-  and delivered via the loader's `_init_caps` sidecar
-  (`design/loader/init-caps-sidecar.md`); revoked on process exit,
-  which tears down every context entry attributed to it. Full rationale
-  (per-driver-process vs per-device vs per-firmware-image), the
-  CNVi-shared-domain blast-radius acknowledgment, and the
-  `dma_domain_attach(domain, bdf)` supervisor entry point are
-  documented in `design/drivers/blob-policy.md` §2. This rule governs
-  both blob-consuming drivers (Wi-Fi, BT, IPU6, GuC, SOF) and native
-  drivers uniformly.
+> **`KIND_HW_DMA_DOMAIN` — retired name.** The DMA-domain skeleton that
+> previously sat here has been renamed to **`KIND_DMA_DOMAIN`** and moved
+> to its own section below, because it does *not* derive over `KIND_HW`.
+> See "Derived kinds over `KIND_MEMORY` (R29.M5)" for the as-landed spec
+> and the full naming rationale. No code ever referenced the old name, so
+> this is a rename, not an alias.
 
 ### `KIND_HW_TIMELINE` — planned for a later R29 milestone
 
@@ -304,6 +290,291 @@ the corresponding R29.M1 sub-issue when it lands.
   crossing carries a `KIND_HW_TIMELINE` cap. GPU→display, GPU→CPU,
   audio-mclk→CPU, USB-SOF→isoch endpoint, network-PTP→application all
   derive from this base (see `next-wave-softarch.md` §4).
+
+---
+
+## Derived kinds over `KIND_MEMORY` (R29.M5)
+
+`KIND_MEMORY` is the name `design/roadmap/next-wave-softarch.md` §P10
+uses for the memory base kind. In the closed 16-slot runtime enum that
+base kind is **slot 4, `KIND_PAGE`** ("individual memory page or
+region"; its dispatch chatter is literally `CAP INVOKE MEM`). R29.M5-001
+binds the two names together once, in
+`src/kernel/core/cap/kind.pdx` (`pub let KIND_MEMORY : u64 = 4`), so
+that every derived kind specified as "derived over `KIND_MEMORY`" lands
+on the same slot instead of drifting. This is an **alias, not a new base
+kind** — the closed enum is unchanged.
+
+### `KIND_DMA_DOMAIN` — landed by R29.M5-001 (#1036) + R29.M5-002 (#1037)
+
+- **Runtime base kind:** `KIND_MEMORY = KIND_PAGE = 4`.
+- **Derived-kind tag:** `0x142` (decimal 322). The full `u64` kind field
+  is compared against `0x142` in `cap_invoke_dispatch` to route to
+  `cap_handler_dma_domain`; the LAM kind-hint reads slot 4.
+
+#### Naming + derivation reconciliation (resolved at #1036)
+
+This doc previously carried a planning skeleton named
+`KIND_HW_DMA_DOMAIN` with runtime base `KIND_HW = 14`, grouped with the
+R29.M1 hardware-adjacent kinds. `design/roadmap/next-wave-softarch.md`
+§3 R29 — and issues #1036/#1037, which are the binding specification —
+name it `KIND_DMA_DOMAIN` and derive it over `KIND_MEMORY`. **The
+softarch / issue form wins.** Rationale:
+
+- **A DMA domain is a memory-access scope, not a device-authority
+  handle.** It names the set of physical pages a bus-mastering device is
+  permitted to reach. Deriving it over `KIND_HW` would let a holder of
+  pure device authority manufacture new memory reach — the exact
+  inversion of the R29 IOMMU invariant, under which the domain cap
+  authorizes the mapping *site* and a `KIND_PAGE` cap authorizes the
+  *page*. Deriving over `KIND_MEMORY` makes the mint gate structurally
+  enforce "you cannot widen a device's reach beyond memory authority you
+  already hold."
+- **The name had to move with the base.** Keeping the `HW_` infix while
+  changing the base would leave the name asserting a base kind that is
+  no longer true, so `KIND_HW_DMA_DOMAIN` is *renamed*, not aliased. No
+  code ever referenced the skeleton, so nothing breaks.
+- **The numeric tag `0x142` is retained.** The `0x14x` block is the
+  *R29-round* derived-kind block, not a base-slot encoding — the
+  pre-existing derived tags already show no correspondence between tag
+  prefix and base slot (`KIND_DRIVER = 0x15` has base 10;
+  `KIND_DMESG = 0x16` has base 15). Keeping `0x142` leaves the R29 block
+  contiguous (`0x140` interrupt / `0x141` msix / `0x142` dma domain /
+  `0x143` timeline reserved) and avoids re-numbering a published value.
+
+#### Descriptor tail (finalized at #1036/#1037)
+
+The tail is `{iommu_ctx_id:u32, bus_dev_fn:u16, capacity_bytes:u64,
+coherency:u8}` = 104 live bits, which does not fit the descriptor's
+64-bit `target_ptr`. It therefore uses the **same row-indirection shape**
+as `KIND_HW_INTERRUPT` (#1019) and `KIND_HW_MSIX_VECTOR` (#1022) — a
+third encoding would fragment the revoke/cascade reasoning. `target_ptr`
+holds a `row_id` in bits `[15:0]`; bits `[63:16]` MUST be zero.
+
+Rows live in `_dma_domain_table` (32 rows × 32 bytes = 1024 B, `.bss`,
+`align 64`), in `src/kernel/core/cap/kind_dma_domain.pdx`:
+
+- `[+0]` u64: `bits [31:0] = iommu_ctx_id` (u32; VT-d context-entry id),
+  `bits [47:32] = bus_dev_fn` (u16; PCI BDF — bus`[15:8]`, dev`[7:3]`,
+  fn`[2:0]`), `bits [55:48] = coherency` (u8; `0` = coherent,
+  `1` = non-coherent), `bits [63:56] = in_use` flag.
+- `[+8]` u64: `capacity_bytes` — mapped-window ceiling. The one tail
+  field that gets a whole word rather than a bitfield, because a 1 TiB
+  GPU aperture must be representable.
+- `[+16]` u64: `bits [7:0] = parent_slot` (u8; cap_table slot of the
+  `KIND_MEMORY` ancestor, for O(N) cascade revocation — exactly as
+  `KIND_HW_MSIX_VECTOR` stores its parent); `bits [63:8]` reserved.
+- `[+24]` u64: reserved (R29.M5-003/004: `mapped_bytes` running total,
+  ATS/PRI enable bits, `address_width`, fault counter).
+
+**Table sizing.** `DMA_DOMAIN_MAX = 32`. One domain per driver process
+(D1.b) and `_driver_table` is itself 32 slots, so 32 domains is exactly
+the reachable ceiling — a larger table could not be filled by legal
+minting.
+
+#### Canonical tail word (#1037)
+
+`dma_tail_pack(iommu_ctx_id, bus_dev_fn, coherency) -> u64` is THE
+canonical encoding of the three bitfield members:
+
+```
+tail_word = (iommu_ctx_id & 0xFFFFFFFF)
+          | ((bus_dev_fn  & 0xFFFF) << 32)
+          | ((coherency   & 0xFF)   << 48)
+```
+
+It returns `0xFFFFFFFFFFFFFFFF` on malformed input (`ctx >= 2^32`,
+`bdf >= 2^16`, `coherency > 1`). That sentinel can never collide with a
+well-formed word, whose bits `[63:56]` are always zero — those bits
+belong to the allocator's `in_use` flag, and a caller-supplied word with
+them set is rejected.
+
+The tail word is not cosmetic. SysV argument registers cap the mint
+entry point at 6 arguments; a naive
+`(slot, parent_slot, rights, ctx, bdf, capacity, coherency)` needs 7.
+Folding the three bitfields into their on-row representation brings it
+to 5 **and** makes the caller's argument byte-identical to what lands in
+the row — so the encoding is defined in exactly one place, with no
+reshuffle between API boundary and storage. `capacity_bytes` stays
+separate because it is a full u64.
+
+Decoders come in two families: `dma_tail_word_{ctx_id,bdf,coherency}`
+operate on a packed word (round-trip assertable without touching the
+table), and `dma_tail_decode_{ctx_id,bdf,capacity,coherency,parent}`
+operate on a live row (bounds- + `in_use`-checked, returning
+`DMA_DECODE_BAD` on a dead row so a legitimate zero value is never
+confused with failure).
+
+#### Rights (finalized at #1036)
+
+- `R_DMA_INVOKE`  (`0x008` = `RIGHT_INVOKE`)  — query ops + `OP_FLUSH`.
+- `R_DMA_REVOKE`  (`0x010` = `RIGHT_REVOKE`)  — supervisor teardown.
+- `R_DMA_MINT`    (`0x200` = `RIGHT_MINT`)    — `OP_MAP` / `OP_UNMAP`.
+- `R_DMA_OBSERVE` (`0x400` = `RIGHT_OBSERVE`) — `OP_QUERY_FAULT` and the
+  canonical debug printer.
+- `R_DMA_ALL`     (`0x618`) — bitwise OR of the four.
+
+Unlike `KIND_HW_MSIX_VECTOR` (whose #1022 directive pinned rights to
+`{MINT, REVOKE, INVOKE}`), this kind **does** carry `RIGHT_OBSERVE`: the
+IOMMU fault stream is an observe-class channel, and a monitor should be
+able to read DMA faults without holding authority to map pages. The
+handler therefore gates **per-op**, not once at entry — mapping a page
+into a device's reach is a strictly stronger authority than reading which
+BDF the domain is bound to, and reading the fault log is strictly weaker.
+A single entry gate would collapse all three into whichever was chosen,
+which is precisely the over-grant this kind exists to prevent.
+
+#### Ops (`op_arg[7:0]`) and required right
+
+| Op | Code | Right | Behavior |
+|----|------|-------|----------|
+| `OP_QUERY_CTX_ID`    | 0 | INVOKE  | -> `iommu_ctx_id` |
+| `OP_QUERY_BDF`       | 1 | INVOKE  | -> `bus_dev_fn` |
+| `OP_QUERY_CAPACITY`  | 2 | INVOKE  | -> `capacity_bytes` |
+| `OP_QUERY_COHERENCY` | 3 | INVOKE  | -> `coherency` |
+| `OP_QUERY_PARENT`    | 4 | INVOKE  | -> `parent_slot` |
+| `OP_MAP`             | 5 | MINT    | `INVOKE_UNSUPPORTED` (R29.M5-003) |
+| `OP_UNMAP`           | 6 | MINT    | `INVOKE_UNSUPPORTED` (R29.M5-003) |
+| `OP_FLUSH`           | 7 | INVOKE  | `INVOKE_UNSUPPORTED` (R29.M5-004) |
+| `OP_QUERY_FAULT`     | 8 | OBSERVE | `INVOKE_UNSUPPORTED` (R29.M5-004) |
+| `OP_DEBUG_PRINT`     | 9 | OBSERVE | canonical row printer -> `DMA_TAIL_OK` |
+
+The rights gate runs **before** the unimplemented-op return, so an
+unauthorized caller gets `INVOKE_DENIED` even for an op that is not yet
+implemented.
+
+**Interaction with `KIND_PAGE = 4`:** a `KIND_PAGE` cap must accompany
+every `OP_MAP` — the domain cap authorizes the mapping site, the page cap
+authorizes the physical page. Cross-cap consent per the R29 IOMMU
+invariant. (`OP_MAP` lands at R29.M5-003.)
+
+#### Canonical debug printer (#1037)
+
+`dma_domain_debug_print(row_id)` emits one klog line per tail field at
+`LEVEL_INFO` under `SUBSYS_CAP_`, all sharing the tag `DMA DOMAIN ROW`
+so the five lines read as one record:
+
+```
+... |I|CAP_|DMA DOMAIN ROW row=0x0000000000000000
+... |I|CAP_|DMA DOMAIN ROW ctx=0x00000000deadbeef
+... |I|CAP_|DMA DOMAIN ROW bdf=0x0000000000000308
+... |I|CAP_|DMA DOMAIN ROW cap=0x0000000040000000
+... |I|CAP_|DMA DOMAIN ROW coh=0x0000000000000001
+```
+
+Five `klog_s1_x1` calls rather than one wide wrapper: the KV wrappers cap
+out at what fits in SysV argument registers (`klog_s1_x2` already needs a
+caller-side stack push for its second value), and a per-field line keeps
+the printer's own failure mode trivial. A dead or out-of-range row prints
+**nothing** and returns `DMA_DECODE_BAD` — a debug printer must never
+emit fabricated field values for a row that does not exist. Reachable
+through dispatch as `OP_DEBUG_PRINT` (needs `RIGHT_OBSERVE`).
+
+#### Mint API
+
+`dma_cap_mint(slot, parent_slot, rights, tail_word, capacity_bytes)`.
+Sequence: (1) bounds-check `slot < 256`;
+(2) `dma_check_parent_kind_memory(parent_slot)` asserts
+`cap_table[parent_slot].kind == 4` (`KIND_MEMORY`) **and**
+`rights & RIGHT_MINT != 0`; (3) `dma_rights_valid(rights)`;
+(4) `dma_tail_alloc(tail_word, capacity_bytes, parent_slot)` reserves and
+populates a row; (5) `cap_mint_write` writes the descriptor.
+
+`capacity_bytes == 0` is rejected rather than silently accepted: a domain
+that may map nothing is indistinguishable from no domain at all, and
+admitting it would let a caller mint a cap whose only effect is to consume
+a scarce IOMMU context id.
+
+#### Revoke API + cascade
+
+`dma_cap_revoke(slot)` verifies `kind == 0x142`, frees **and scrubs** the
+row (zeroing all 32 bytes, which is what clears `in_use`, so no stale
+`iommu_ctx_id` / `bdf` survives in the table), then clears the descriptor
+to `(0,0,0)`. Idempotent (`DMA_REVOKE_ALREADY`). A non-matching kind is
+refused (`DMA_REVOKE_WRONG_KIND`) — one kind's revoke may never clear
+another kind's descriptor.
+
+`dma_cascade_revoke_by_parent(parent_slot) -> count` scans
+`cap_table[0..255]` for `KIND_DMA_DOMAIN` descriptors whose row records
+that `parent_slot`, and revokes each. This is the real cascade edge:
+tearing down the memory authority a domain was derived from must not
+leave a live IOMMU context entry behind, because a stale context entry is
+a device with reach into memory nobody owns any more. R29.M5-003 wires it
+into driver-process teardown; until then it is a supervisor entry point
+exercised by the boot witness. Cost is O(256) per parent revoke —
+identical to the MSI-X cascade.
+
+#### Failure taxonomy (each edge a distinct code)
+
+Return-code block `0xFFFFFFD5..0xFFFFFFDF`, disjoint from `HW_INT_*`
+(`0xFFFFFFF7..0xFFFFFFFF`) and `MSIX_*` (`0xFFFFFFE7..0xFFFFFFEF`) so a
+witness failure names its originating kind unambiguously.
+
+| Code | Name | Raised when |
+|------|------|-------------|
+| `0xFFFFFFDF` | `DMA_TAIL_ENOSPC` | no free row |
+| `0xFFFFFFDE` | `DMA_TAIL_BAD_ARG` | reserved tail bits set / zero capacity / parent_slot ≥ 256 |
+| `0xFFFFFFDD` | `DMA_TAIL_BAD_COHERENCY` | coherency field > 1 |
+| `0xFFFFFFDC` | `DMA_MINT_BAD_PARENT` | parent is not `KIND_MEMORY`, or lacks `RIGHT_MINT` |
+| `0xFFFFFFDB` | `DMA_MINT_BAD_RIGHTS` | rights not a subset of `R_DMA_ALL` |
+| `0xFFFFFFDA` | `DMA_MINT_ENOSPC` | row table exhausted at mint |
+| `0xFFFFFFD9` | `DMA_MINT_BAD_ARG` | slot out of range, or bad tail/capacity args |
+| `0xFFFFFFD8` | `DMA_MINT_BAD_COHERENCY` | coherency out of range at mint |
+| `0xFFFFFFD7` | `DMA_REVOKE_BAD_SLOT` | slot ≥ 256 |
+| `0xFFFFFFD6` | `DMA_REVOKE_WRONG_KIND` | descriptor is not `KIND_DMA_DOMAIN` |
+| `0xFFFFFFD5` | `DMA_REVOKE_ALREADY` | slot already null (idempotent) |
+| `0xFFFFFFFFFFFFFFFF` | `DMA_DECODE_BAD` | encoder/decoder malformed input or dead row |
+
+#### Domain granularity — per-driver-process (D1.b)
+
+One `KIND_DMA_DOMAIN` per driver process, shared across every device the
+driver claims — not one per device and not one per firmware image. The
+`bus_dev_fn` field records the BDF the domain is *currently bound to*
+(the primary function attached via the R29.M5-003 `dma_domain_attach`
+path), not an exclusive ownership claim. Minted at driver-process spawn
+by the supervisor and delivered via the loader's `_init_caps` sidecar
+(`design/loader/init-caps-sidecar.md`); revoked on process exit, which
+cascades through `dma_cascade_revoke_by_parent` and tears down every
+context entry attributed to it. Full rationale (per-driver-process vs
+per-device vs per-firmware-image), the CNVi-shared-domain blast-radius
+acknowledgment, and the `dma_domain_attach(domain, bdf)` supervisor entry
+point are documented in `design/drivers/blob-policy.md` §2. This rule
+governs blob-consuming drivers (Wi-Fi, BT, IPU6, GuC, SOF) and native
+drivers uniformly.
+
+#### Boot witness
+
+`kernel_main.pdx §kind_dma_domain_witness` (21 sub-tests, A..U; stage
+tracker `_kind_dma_witness_stage`, values 1..40):
+
+- Tail-word encoder round-trip, table-free:
+  `dma_tail_pack(0xDEADBEEF, 0x0308, 1) == 0x00010308DEADBEEF`, and each
+  field recovered by `dma_tail_word_*`.
+- Encoder failure edges: `ctx >= 2^32`, `bdf >= 2^16`, `coherency = 2`.
+- Mints a `KIND_MEMORY` parent at slot 24 (`rights = 0x618`), then two
+  domains under it — slot 25 `(ctx=0xDEADBEEF, bdf=0x0308,
+  capacity=0x40000000, coherency=1)` and slot 26 `(ctx=0x00C0FFEE,
+  bdf=0x00F8, capacity=0x1000, coherency=0)`. The tuples differ in every
+  field, and coherency takes both legal values, so a decode reading the
+  wrong row could not pass.
+- Round-trips all five query ops through `cap_invoke_dispatch` on both
+  domains (10 dispatch invocations), asserting encode→decode identity for
+  all four spec fields plus `parent_slot`.
+- Failure edges, each asserting its own distinct code: bad parent kind
+  (`parent_slot = 25`, a `KIND_DMA_DOMAIN`); illegal rights
+  (`0x004 RIGHT_EXEC`) plus `dma_rights_valid(0x800) == 0`;
+  out-of-range coherency via a hand-built tail word (proving the
+  allocator re-checks rather than trusting its caller); zero capacity;
+  row-table exhaustion (fills rows 2..31 directly, asserts low-first
+  allocation, then a real mint reports `ENOSPC`, then releases them).
+- Asserts slot 27 — the target of five failed mints — is still null.
+- Exercises `OP_DEBUG_PRINT` and `OP_MAP` through dispatch.
+- `dma_cascade_revoke_by_parent(24)` returns 2; both descriptors are
+  cleared and both rows freed; double-revoke yields `REVOKE_ALREADY` and
+  revoking the memory parent through the DMA path yields
+  `REVOKE_WRONG_KIND` with the parent descriptor intact.
+- Cleans up slot 24 so the cap table is left exactly as found. Emits
+  `R29 KIND_DMA_DOMAIN OK`.
 
 ---
 
@@ -451,6 +722,7 @@ collision arises.
 | 2026-08-12 | R29.M2 | #1025 | Landed `driver_hotplug_channel` schema constants. Session-typed stream (bus driver → userspace driver-loader) with two v1 opcodes — `DRV_HP_OP_DEVICE_ARRIVED = 0x01` (24-byte record carrying `{bdf, vendor, device, class_code, device_cap:Cap<KIND_DEVICE>}`) and `DRV_HP_OP_DEVICE_DEPARTED = 0x02` (8-byte record carrying `{bdf, reason}`). Constants in `src/kernel/core/driver/hotplug_schema.pdx`; wire spec at `design/ipc/driver-hotplug-schema.md`. Wire encoders / decoders deferred to R29.M3 registry v2 (per doc §7 rationale). |
 | 2026-08-12 | R29.M2 | #1026 | Landed driver lifecycle FSM fuzz witness — 1000-iter Knuth LCG (A=0x5851F42D4C957F2D, C=0x14057B7EF767814F, seed=0x0BADBEEFC0FFEE01) over 3-bit (cur, new) slices from LCG state bits [42:40] / [50:48] (values in [0..8) so ~25% out-of-range). Per-iter asserts the transition-whitelist predicate (`driver_lifecycle_transition_valid`) agrees with the stateful primitive (`driver_lifecycle_transition`) on both direction (rc == 0 iff predicate == 1) and state-mutation (state == new on OK; state unchanged on any error). Witness at `kernel_main.pdx §driver_lifecycle_fuzz_witness` — fingerprint `R29 LIFECYCLE FUZZ OK`. Pure test artifact; no new kernel functionality. |
 | 2026-08-12 | R29.M2 | #1027 | Landed `driver_lifecycle_channel` schema constants. Request/reply RPC (userspace driver-lifecycle-supervisor → driver process) with six v1 commands — `DRV_LC_OP_START/INIT_DONE/SUSPEND/RESUME/HANDOFF_BEGIN/STOP = 0x01..0x06` — each mapping 1:1 onto an FSM edge from the R29.M2-001 whitelist. Ack rep is 8 bytes `{driver_slot:u16, rc:u32}` with error codes `DRV_LC_ACK_ERR_{BAD_SLOT, INVALID_TRANS, TIMEOUT, DEVICE_GONE, CAP_MISSING, INTERNAL}` that mirror `DRIVER_LIFECYCLE_ERR_*`. Reply-bit-7 convention shared with `ipc/frame.pdx`. Constants in `src/kernel/core/driver/lifecycle_schema.pdx`; wire spec at `design/ipc/driver-lifecycle-schema.md`. R29.M2-004 fuzz witness (#1026 same wave) exercises the kernel-side coupling directly; wire encoders and canonical example driver (`lpss_uart`) deferred to R30 (per doc §7 rationale). Closes R29.M2. |
+| 2026-08-14 | R29.M5 | #1036/#1037 | Landed `KIND_DMA_DOMAIN = 0x142` — **renamed from the `KIND_HW_DMA_DOMAIN` planning skeleton and re-based from `KIND_HW` (14) to `KIND_MEMORY` (= `KIND_PAGE`, 4)** per softarch §3 R29 and the issue text; rationale is that a DMA domain is a memory-access scope, so the mint gate must require memory authority, not device authority. Added the `KIND_MEMORY = 4` name binding in `kind.pdx` so document vocabulary and runtime enum stop drifting. Row-indirection tail via `_dma_domain_table` (32 rows × 32 B) encoding `{iommu_ctx_id:u32, bus_dev_fn:u16, capacity_bytes:u64, coherency:u8, parent_slot:u8}`. Canonical tail-word encoder `dma_tail_pack` + word-level and row-level decoders (#1037), plus canonical debug printer `dma_domain_debug_print` (five-line `DMA DOMAIN ROW` record) reachable via `OP_DEBUG_PRINT`. Rights bitmask `R_DMA_ALL = 0x618` (INVOKE/REVOKE/MINT/OBSERVE) with **per-op** gating rather than a single entry gate. Full mint / revoke / cascade-revoke API + dispatch handler in `src/kernel/core/cap/kind_dma_domain.pdx`; dispatch branch in `invoke.pdx`; chatter tag `cap_dma_dom_msg` in `tags.pdx`. Failure taxonomy `0xFFFFFFD5..0xFFFFFFDF`, disjoint from `HW_INT_*` and `MSIX_*`. Boot witness `kernel_main.pdx §kind_dma_domain_witness` (21 sub-tests) — fingerprint `R29 KIND_DMA_DOMAIN OK`. Opens R29.M5. |
 
 ---
 
