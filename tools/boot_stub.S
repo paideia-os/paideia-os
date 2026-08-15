@@ -1588,6 +1588,45 @@ sig_keyring_ok_msg: .ascii "R29 SIG KEYRING OK\n\0"
 sig_keyring_fail_msg: .ascii "R29 SIG KEYRING FAIL\n\0"
 
 
+# R29.M4-003/004 (#1034/#1035): blob-driver DUAL-SIGNATURE enforcement
+# and its telemetry / audit path.
+#
+# Exercises the D1.a two-gate rule end to end: a firmware blob is
+# accepted only if BOTH the vendor signature (against the pinned
+# vendor_intel / vendor_realtek keyring role) AND the Paideia manifest
+# re-sign (against paideia_root) pass. Both gates always run — there is
+# no control-flow edge from the vendor gate to a return — and the
+# combined verdict names WHICH half failed, because a vendor-sig failure
+# (tampered/substituted blob) and a paideia-sig failure (unreviewed
+# blob) get different operator responses.
+#
+# Covers: both-scaffold -> BLOB_UNSIGNED_SCAFFOLD and NOT BLOB_OK;
+# vendor half malformed -> BLOB_ERR_VENDOR_SIG_BAD; paideia half
+# malformed -> BLOB_ERR_PAIDEIA_SIG_BAD; both -> BLOB_ERR_BOTH_SIG_BAD;
+# blob/manifest length disagreement -> BLOB_ERR_LEN_MISMATCH; a supplied
+# digest that differs from manifest.blob_hash -> BLOB_ERR_HASH_MISMATCH;
+# the five manifest-malformed codes; the single-valid-signature rule
+# (one half SIG_OK, the other unsigned -> REJECTED, both directions);
+# the SHA3-256 R32 dependency reported as BLOB_ERR_HASH_UNAVAILABLE
+# rather than skipped; and that every outcome appended an audit record
+# at the right level, with failures reaching the audit bridge.
+#
+# No path in the verifier returns BLOB_OK at R29.
+#
+# See:
+#   - design/drivers/blob-policy.md §1.9 (dual gate), §1.10 (telemetry)
+#   - src/kernel/core/driver/blob_load.pdx
+#   - src/kernel/core/driver/sig_telemetry.pdx
+#   - src/kernel/boot/kernel_main.pdx §blob_dualsig_witness
+.global blob_dualsig_ok_msg
+.align 8
+blob_dualsig_ok_msg: .ascii "R29 BLOB DUALSIG OK\n\0"
+
+.global blob_dualsig_fail_msg
+.align 8
+blob_dualsig_fail_msg: .ascii "R29 BLOB DUALSIG FAIL\n\0"
+
+
 # R20b.M1-002 (#1553): endpoint_table + payload_arena witness fingerprints —
 # exercises endpoint_alloc/endpoint_free/endpoint_lookup round-trip on the
 # full 128-slot range AND payload_buf_pa_for(0..127) 4 KiB-alignment +

@@ -135,6 +135,55 @@ length is variable per `vendor_sig_alg`, so the parser reads
 signature length. `paideia_sig` covers all preceding bytes including
 `vendor_sig`.
 
+### 1.3.1 The *parsed* manifest (R29.M4-003, #1034)
+
+The packed on-disk form above is what a `.pdxsig` file contains. It is
+**not** what the verifier consumes. `blob_load_verify` operates on a
+*parsed* manifest: the same fields, widened to `u64` and naturally
+aligned, 6784 bytes total, produced from the packed bytes by the
+`.pdxsig` reader that lands with the filesystem path at R32.
+
+The split is deliberate. Bit-extraction from attacker-controlled bytes
+— variable-length fields, endianness, packed sub-word reads — is where
+length-confusion bugs live. Confining it to one reviewed parser, and
+handing the trust decision a structure whose every field is a
+naturally-aligned machine word, means the verifier's gates cannot be
+subverted by a manifest that parses differently the second time it is
+read. The verifier never re-reads the wire form.
+
+| Offset | Size | Field | Notes |
+|---:|---:|---|---|
+| 0 | 8 | `magic` | `0x50445853` (`'PDXS'`) |
+| 8 | 8 | `version` | 1 |
+| 16 | 8 | `paideia_algo_id` | ML-DSA-65 = 1 |
+| 24 | 8 | `vendor_algo_id` | ML-DSA-65 = 1 at R29 |
+| 32 | 8 | `vendor_role` | keyring role: 1 `vendor_intel`, 2 `vendor_realtek` |
+| 40 | 8 | `hash_algo_id` | SHA3-256 = 1 |
+| 48 | 8 | `blob_len` | |
+| 56 | 8 | `timestamp` | |
+| 64 | 8 | `vendor_sig_len` | 3309 for ML-DSA-65 |
+| 72 | 8 | `paideia_sig_len` | 3309 |
+| 80 | 32 | `blob_hash` | `sha3_256(blob)` |
+| 112 | 16 | `signer_pk_id` | |
+| 128 | 16 | `vendor_pk_id` | |
+| 144 | 16 | reserved | |
+| 160 | 3312 | `vendor_sig` | 3309 used, 3 bytes pad to realign |
+| 3472 | 3312 | `paideia_sig` | |
+| **6784** | | end | `BLOB_MANIFEST_BYTES` |
+
+`paideia_sig` covers bytes `[0, 3472)` — the whole header **and** the
+vendor signature, exactly as §1.3 specifies for the wire form. That
+ordering is load-bearing: re-signing the vendor signature is what stops
+an attacker pairing a genuine Paideia manifest with a *different*
+vendor signature.
+
+`vendor_role` names a keyring role rather than carrying a key, and the
+role must be a **vendor** role. Role 0 (`paideia_root`) is refused, as
+firmly as a nonexistent role is: a manifest naming the Paideia root as
+its vendor key would make both gates verify against the same anchor and
+collapse the dual signature into a single one — D1.a defeated by a
+one-byte edit in an unchecked field.
+
 ### 1.4 The `blob_load(fw_path)` verification pipeline
 
 ```
@@ -373,6 +422,250 @@ keyring, `0xFFFFFD8x` signature verdict.
 `src/kernel/boot/kernel_main.pdx` runs 29 gates over both modules and
 emits `R29 SIG KEYRING OK`. Stage 16 is the one that matters:
 `driver_sig_verdict_is_ok(SIG_UNSIGNED_SCAFFOLD) == 0`.
+
+### 1.9 Dual-gate enforcement and the combined verdict (R29.M4-003, #1034)
+
+*Implemented in `src/kernel/core/driver/blob_load.pdx`. Boot witness:
+`blob_dualsig_witness` in `src/kernel/boot/kernel_main.pdx`, marker
+`R29 BLOB DUALSIG OK`, 35 stages.*
+
+#### 1.9.1 The structure
+
+`blob_load_verify(blob_ptr, blob_len, manifest_ptr, manifest_len)` runs
+six steps, of which two are the gates §1.1 requires:
+
+```
+1. blob pointer / length              -> BLOB_ERR_BAD_BLOB_{PTR,LEN}
+2. manifest structure                 -> blob_manifest_check
+3. blob identity                      -> blob_hash_gate
+4. VENDOR GATE   driver_sig_verify_algo(m.vendor_algo_id,
+                     blob, blob_len,
+                     m.vendor_sig, m.vendor_sig_len,
+                     keyring_lookup(m.vendor_role))
+5. PAIDEIA GATE  driver_sig_verify_algo(m.paideia_algo_id,
+                     manifest, 3472,
+                     m.paideia_sig, m.paideia_sig_len,
+                     keyring_lookup(paideia_root))
+6. blob_combine_verdicts(v_vendor, v_paideia)
+```
+
+**Neither gate can be skipped, and this is structural rather than
+documented.** There is no control-flow edge from step 4 to any `ret`:
+the vendor gate falls through into the paideia gate unconditionally,
+both verdicts are recorded, and only then does
+`blob_combine_verdicts` — which reads both of its arguments on every
+path — produce an answer. Adding a short-circuit would mean adding a
+jump that is visibly absent today.
+
+A **keyring miss is not an early return either**. When
+`keyring_lookup` fails for a role, `blob_verify_core` substitutes a
+null public key and runs the gate anyway; `driver_sig_verify_algo`'s
+gate 6 answers `SIG_BAD_PK_PTR`, which flows through the ordinary
+attribution machinery onto the correct half. The invariant stays total
+at the cost of one `xor`.
+
+Because neither half short-circuits the other, the §1.4 ordering
+(Paideia before vendor) is immaterial here — it was a fail-fast
+optimisation, and this path does not fail fast between the halves. The
+vendor gate runs first only so the register carrying its verdict is
+established before the second call clobbers `rax`.
+
+#### 1.9.2 Combined-verdict table
+
+`clean(x)` means `x == SIG_OK || x == SIG_UNSIGNED_SCAFFOLD` — "this
+gate reached a sound conclusion about a well-formed signature field".
+It is an **attribution** predicate, never an acceptance one; without
+it, during the scaffold epoch (where the paideia half is permanently
+`SIG_UNSIGNED_SCAFFOLD`) every vendor-half malformation would report as
+a double failure and the taxonomy would be useless exactly when it is
+needed.
+
+| `v_vendor` | `v_paideia` | Combined verdict | Meaning |
+|---|---|---|---|
+| `SIG_OK` | `SIG_OK` | `BLOB_OK` (0) | Both halves verified. **Unreachable at R29** |
+| `SCAFFOLD` | `SCAFFOLD` | `BLOB_UNSIGNED_SCAFFOLD` (1) | Both halves provably unsigned. **Not a pass** |
+| not clean | not clean | `BLOB_ERR_BOTH_SIG_BAD` | Catastrophic; §1.5 calls for an alert |
+| not clean | clean | `BLOB_ERR_VENDOR_SIG_BAD` | Blob is not what the vendor published |
+| clean | not clean | `BLOB_ERR_PAIDEIA_SIG_BAD` | Blob was never reviewed by Paideia |
+| `SIG_OK` | `SCAFFOLD` | `BLOB_ERR_PAIDEIA_SIG_BAD` | **Single valid signature — REJECTED** |
+| `SCAFFOLD` | `SIG_OK` | `BLOB_ERR_VENDOR_SIG_BAD` | **Single valid signature — REJECTED** |
+
+The last two rows are §1.1's rule stated operationally, and they are the
+case an attacker constructs. `BLOB_UNSIGNED_SCAFFOLD` is reserved for
+the honest situation where **both** halves are absent — which is what
+the whole tree looks like today — and must never be confused with a
+half-signed blob.
+
+`BLOB_OK` requires two exact equalities against `SIG_OK`. Since no path
+in `sig_verify.pdx` returns `SIG_OK` at R29 (§1.7), no verification at
+R29 can produce `BLOB_OK` — unreachable by construction, not by
+convention. Witness stage 24 shows the arm is reachable only from
+synthetic arguments; stage 2 pins that
+`blob_verdict_is_ok(BLOB_UNSIGNED_SCAFFOLD) == 0`.
+
+#### 1.9.3 Verdict codes (`0xFFFFFDAx` block)
+
+| Code | Name | Gate | Operator reading |
+|---|---|---|---|
+| 0 | `BLOB_OK` | — | Unreachable at R29 |
+| 1 | `BLOB_UNSIGNED_SCAFFOLD` | — | Both halves unsigned; log-and-continue at R29, hard reject at R32 |
+| `0xFFFFFDA0` | `BLOB_ERR_BAD_BLOB_PTR` | ARGS | |
+| `0xFFFFFDA1` | `BLOB_ERR_BAD_BLOB_LEN` | ARGS | |
+| `0xFFFFFDA2` | `BLOB_ERR_BAD_MANIFEST_PTR` | MANIFEST | §1.5 "missing `.pdxsig`" |
+| `0xFFFFFDA3` | `BLOB_ERR_BAD_MANIFEST_LEN` | MANIFEST | |
+| `0xFFFFFDA4` | `BLOB_ERR_BAD_MAGIC` | MANIFEST | §1.5 "manifest magic/version bad" |
+| `0xFFFFFDA5` | `BLOB_ERR_BAD_VERSION` | MANIFEST | |
+| `0xFFFFFDA6` | `BLOB_ERR_BAD_HASH_ALGO` | MANIFEST | |
+| `0xFFFFFDA7` | `BLOB_ERR_BAD_VENDOR_ROLE` | MANIFEST | Includes naming `paideia_root` as vendor |
+| `0xFFFFFDA8` | `BLOB_ERR_LEN_MISMATCH` | HASH | Blob and manifest disagree on size |
+| `0xFFFFFDA9` | `BLOB_ERR_HASH_MISMATCH` | HASH | Blob tampered, or manifest stale |
+| `0xFFFFFDAA` | `BLOB_ERR_HASH_UNAVAILABLE` | HASH | No SHA3-256 and the scaffold epoch is over — fail closed |
+| `0xFFFFFDAB` | `BLOB_ERR_VENDOR_SIG_BAD` | VENDOR | Highest severity: attempted supply-chain substitution |
+| `0xFFFFFDAC` | `BLOB_ERR_PAIDEIA_SIG_BAD` | PAIDEIA | Unreviewed blob, or a missed key roll |
+| `0xFFFFFDAD` | `BLOB_ERR_BOTH_SIG_BAD` | BOTH | Alert |
+
+The combined verdict names *which half*; the precise per-half reason is
+read from `blob_last_vendor_verdict()` / `blob_last_paideia_verdict()`,
+which carry the raw `SIG_*` verdict (so `SIG_BAD_LENGTH` — a wrong-sized
+signature field — is distinguishable from `SIG_UNVERIFIABLE` — real
+material, no substrate). Both are seeded to `BLOB_GATE_NOT_RUN`
+(`0xFFFFFFFF`) at the top of every verification, so a stale verdict from
+a previous call can never be read as this call's result.
+
+Signature **lengths** are deliberately not checked in
+`blob_manifest_check`. They are per-half properties, and letting
+`driver_sig_verify_algo` gate 5 reject them preserves the attribution —
+checking them centrally would collapse "the vendor signature is the
+wrong length" and "the Paideia signature is the wrong length" into one
+code and throw away the distinction this section is about.
+
+#### 1.9.4 The hash gate and the SHA3-256 R32 dependency
+
+Step 4 of the §1.4 pipeline needs `sha3_256(blob)`. **No SHA3-256
+exists anywhere in this tree** — `grep -rniE "sha3|keccak" src/` returns
+design prose and one comment in `keyring.pdx` admitting the same gap.
+It is an R32 deliverable alongside the ML-DSA-65 lattice verifier, and
+hand-rolling a Keccak here would be the same category of mistake §1.7
+refuses to make with the lattice primitive: a subtly wrong hash that
+says "match" is worse than no hash at all.
+
+So the gate is split, and only the primitive is missing:
+
+| Piece | State at R29 |
+|---|---|
+| `blob_hash_eq(a, b)` | Real. 32-byte comparison, four qword loads, no tail. Exercised by witness stages 13 and 14. |
+| `blob_hash_gate(manifest, digest)` | Real. Compares when given a digest; **defers** while the scaffold epoch is live and **fails closed** with `BLOB_ERR_HASH_UNAVAILABLE` once it is not. |
+| `blob_hash_compute(blob, len, out)` | Declared dependency. Returns `BLOB_ERR_HASH_UNAVAILABLE` and **writes nothing** — deliberately not a zero-fill, which would manufacture a digest matching an all-zero manifest field. |
+
+The digest enters through a parameter
+(`blob_load_verify_with_hash(..., computed_hash_ptr)`) rather than being
+fetched inside the gate. That is what makes the comparison path testable
+today with a caller-supplied buffer, and it is the shape R32 wants
+anyway: the caller owns the scratch page the digest lands in.
+
+Fail-closed is the load-bearing half. The deferral is bounded by exactly
+one condition — `driver_sig_scaffold_epoch() == 1` — and that is the same
+flag R32 clears when it lands the real primitives. If R32 ships the
+lattice verifier and forgets SHA3-256, every blob load starts failing
+loudly instead of a signature-verified blob whose bytes nobody compared
+against the manifest sailing through.
+
+### 1.10 Signing-failure telemetry and the audit path (R29.M4-004, #1035)
+
+*Implemented in `src/kernel/core/driver/sig_telemetry.pdx`.*
+
+#### 1.10.1 Where the recording lives
+
+`blob_load_verify` calls `blob_sig_audit` **unconditionally on every
+outcome** — pass, scaffold, and each of the thirteen failure codes.
+"Every rejection is audited" cannot be a convention that N driver load
+paths each honour; it has to be a property of the one function that
+produces the verdict, or the first path someone adds in a hurry is the
+one that loads an unverified blob silently. The verifier records; no
+caller can opt out.
+
+Per **D1.c**, blob drivers have full audit access — there is no
+special-casing of blob-driver events on the audit path, and no separate
+reduced-privilege channel.
+
+#### 1.10.2 Level mapping — this *is* the audit-bridge filter
+
+| Verdict | Level | Reaches `/system/audit/log.pdaudit`? |
+|---|---|---|
+| `BLOB_OK` | `LEVEL_INFO` (3) | No — dmesg only |
+| `BLOB_UNSIGNED_SCAFFOLD` | `LEVEL_WARN` (2) | No — dmesg only |
+| every failure | `LEVEL_ERROR` (1) | **Yes** |
+
+`klog_audit_forward` (`src/kernel/core/klog/audit.pdx`) forwards
+`level <= 1`, so the level mapping decides what becomes a durable,
+tamper-evident record. Changing `blob_audit_level` changes what an
+auditor can see six months later.
+
+The scaffold verdict sits at WARN rather than ERROR on purpose: at R29
+*every* blob is unsigned, so recording each one as a durable audit
+failure would fill the tamper-evident log with a fact the boot log
+already states and teach operators to ignore it. It is loud in dmesg and
+quiet in the audit log. When R32 makes the scaffold verdict a hard
+rejection, its level moves to ERROR in the same one-line edit.
+
+An unrecognised verdict defaults to ERROR. An unknown outcome must be
+loud and must reach the bridge, never be silently downgraded.
+
+#### 1.10.3 Record schema
+
+16 records × 8 fields, drop-oldest, indexed by a **monotonic** sequence
+counter — so `blob_audit_seq()` reports the true number of verifications
+ever performed even after the ring wraps. A ring that silently forgets
+how much it forgot is not an audit surface.
+
+| Field | Name | Contents |
+|---:|---|---|
+| 0 | `ts` | Raw TSC (`kread_tsc`). Wall-clock correlation is the audit log's job; ordering and delta are what matter here |
+| 1 | `verdict` | Combined `BLOB_*` verdict |
+| 2 | `gate` | `BLOB_GATE_*` — which half or stage failed |
+| 3 | `vendor_role` | Keyring role id — blob identity, part 1 |
+| 4 | `blob_len` | From the manifest, 0 if none |
+| 5 | `hash_prefix` | First 8 bytes of `manifest.blob_hash` — blob identity, part 2 |
+| 6 | `vendor_verdict` | Raw `SIG_*` from the vendor gate |
+| 7 | `paideia_verdict` | Raw `SIG_*` from the paideia gate |
+
+Gate identifiers: `NONE` 0, `ARGS` 1, `MANIFEST` 2, `HASH` 3, `VENDOR`
+4, `PAIDEIA` 5, `BOTH` 6, `UNKNOWN` 7. `blob_failed_gate` is total —
+a verdict outside the table maps to `UNKNOWN`, never to `NONE`, because
+an unrecognised failure reported as "no gate failed" is the one misread
+that would matter.
+
+Eight bytes of the digest rather than all thirty-two: enough to
+correlate a log line with a release artefact, and the full digest is in
+the manifest the operator already has.
+
+**Reader interface**, for `safectl` and the boot witness:
+
+| Entry point | Contract |
+|---|---|
+| `blob_audit_seq()` | Verifications ever performed (not retained) |
+| `blob_audit_field(back, field)` | `back = 0` is newest; 0 for any record that does not exist or field out of range. Guards on `back < 16` **and** `back < seq`, so an unwritten slot is never reported as history |
+| `blob_audit_error_count()` / `_warn_` / `_info_` | Per-level counts |
+| `blob_audit_last_gate()` | Gate id of the most recent verification |
+| `blob_audit_level(verdict)` | The filter above, as a pure function |
+
+#### 1.10.4 Emitted line
+
+```
+<tsc>|<cpu>|E|DRV_|BLOB SIG REJECT verdict=0x00000000fffffdab gate=0x0000000000000004
+<tsc>|<cpu>|W|DRV_|BLOB SIG UNSIGNED verdict=0x0000000000000001 gate=0x0000000000000000
+```
+
+Three tags rather than one — `BLOB SIG OK` / `BLOB SIG UNSIGNED` /
+`BLOB SIG REJECT` — selected by the combined verdict, so an operator can
+grep the audit log for `BLOB SIG REJECT` alone without matching the
+routine scaffold-epoch traffic. Subsystem `DRV_` is the driver
+framework's trust path, deliberately not the per-device subsystem: a
+blob-signature rejection is a property of the framework, and someone
+hunting supply-chain events wants one tag, not one per driver.
+
+**At R29 no boot emits `BLOB SIG OK`.** That absence is the
+grep-verifiable form of "no path returns the OK verdict".
 
 ---
 
