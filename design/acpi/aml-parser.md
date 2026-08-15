@@ -1,9 +1,9 @@
 # AML tokenizer and namespace parser
 
 **Round.** R30 — ACPICA userspace bubble + LPSS bus enablement
-**Issues.** #1049 (R30.M1-001, tokenizer) · #1050 (R30.M1-002, namespace objects)
-**Status.** Landed. #1051 (control flow), #1052 (data objects) and
-#1053 (resource templates) extend the structures defined here.
+**Issues.** #1049 (tokenizer) · #1050 (namespace objects) · #1051 (control
+flow) · #1052 (data objects) · #1053 (resource templates)
+**Status.** Landed — R30.M1 complete. R30.M2 (#1054+) adds the evaluator.
 
 ---
 
@@ -42,8 +42,17 @@ built on every push so the cross-module symbol graph stays resolved.
 | `src/user/aml/aml_optab.pdx` | sorted opcode descriptor table + binary search | #1049 |
 | `src/user/aml/aml_arena.pdx` | flat index-addressed AST arena | #1050 |
 | `src/user/aml/aml_ns.pdx` | namespace-object recursive-descent parser | #1050 |
-| `tests/user/aml/aml_harness.c` | executable byte-fixture corpus | both |
-| `tools/verify-aml-parser.sh` | build-time verification, wired into pre-push | both |
+| `src/user/aml/aml_term.pdx` | control flow, expressions, data objects, method invocation | #1051 / #1052 |
+| `src/user/aml/aml_resource.pdx` | resource-descriptor mini-language | #1053 |
+| `tests/user/aml/aml_harness.c` | executable byte-fixture corpus | all |
+| `tools/verify-aml-parser.sh` | build-time verification, wired into pre-push | all |
+
+`aml_term.pdx` and `aml_resource.pdx` declare **no private storage at
+all** — everything they touch is reached through the lexer and arena
+accessor APIs. Adding them to the script's `MODULES` list therefore
+required no new assertion and made the three existing ones strictly
+stronger: they now also prove the term parser and the resource decoder
+cannot reach the cursor, the arenas or the opcode table directly (§7).
 
 Each module owns its storage privately, and that ownership is **mechanically
 enforced** (§7).
@@ -68,9 +77,10 @@ is adding a row.**
 | `[15:0]` | `op16` | normalised opcode: `0x00NN` single-byte, `0x5BNN` for an `ExtOpPrefix` escape |
 | `[23:16]` | `class` | 1 NAMESPACE, 2 DATA, 3 CONTROL, 4 EXPR, 5 ARG, 6 LOCAL, 7 MISC, 8 NAMELEAD |
 | `[31:24]` | `flags` | see below |
-| `[39:32]` | `argc` | fixed TermArg count — carried now, consumed by #1051/#1052 |
+| `[39:32]` | `argc` | fixed operand count |
 | `[47:40]` | `node` | `AML_NODE_*` to allocate, 0 for none |
-| `[63:48]` | — | reserved, zero |
+| `[55:48]` | `shape` | operand shape (#1051) — see below |
+| `[63:56]` | — | reserved, zero |
 
 `class` is never 0, so a real entry can never pack to zero, which makes 0 a
 safe "not found" return from `aml_optab_find`.
@@ -85,8 +95,38 @@ safe "not found" return from `aml_optab_find`.
 | `0x08` | `F_TERMLIST` | the package body is a TermList |
 | `0x10` | `F_FIELDLIST` | the package body is a FieldList |
 | `0x20` | `F_EXTOP` | opcode is a `0x5B` escape |
-| `0x40` | `F_M1_HANDLED` | parsed by R30.M1-002 |
+| `0x40` | `F_M1_HANDLED` | parsed by the R30.M1 parser |
 | `0x80` | `F_OPAQUE_OK` | safe to skip wholesale via its PkgLength |
+
+### Operand shape — the `[55:48]` field (#1051)
+
+Sixty of the sixty-six expression opcodes are "`argc` TermArgs, in order"
+and need nothing more. The other six interleave a raw `ByteData`,
+`WordData`, `DWordData` or `NameString` among their TermArgs at a fixed
+position:
+
+| Shape | Name | Operand sequence |
+|---|---|---|
+| 0 | `REGULAR` | `argc` TermArgs |
+| 1 | `NAME_LAST` | `argc-1` TermArgs then a NameString — the `Create*Field` family, whose trailing operand *declares* a name |
+| 2 | `MATCH` | TermArg, ByteData, TermArg, ByteData, TermArg, TermArg |
+| 3 | `ACQUIRE` | TermArg then a `WordData` timeout |
+| 4 | `FATAL` | ByteData, DWordData, TermArg |
+| 5 | `NAME_FIRST` | NameString then `argc-1` TermArgs — `Load`, whose first operand names a table |
+
+Reading one of those scalars as a TermArg consumes the wrong number of
+bytes and desynchronises the enclosing TermList **silently**. Encoding the
+irregularity as *data* keeps `aml_term_expr` a single loop and puts the
+six exceptions somewhere `aml_optab_selfcheck` can police them (shape ≤ 5,
+and non-zero only on class 4). The alternative — six special cases inside
+the operand loop — is six chances to write that bug.
+
+### What #1051/#1052 cost the table
+
+Bringing in every DATA, CONTROL, EXPR, ARG, LOCAL and MISC opcode was a
+**regeneration of the rows** plus one new packed field. `aml_optab_find`,
+`aml_optab_selfcheck` and the parser's dispatch structure were untouched.
+That is the property the table was bought for.
 
 ### Why the table is complete, not just sufficient
 
@@ -116,10 +156,18 @@ An unparsed construct is handled one of exactly two ways:
   produce a namespace that looks plausible and is wrong. A wrong namespace is
   worse than no namespace: it silently mis-drives hardware. **Refused.**
 
-Six opcodes carry `F_OPAQUE_OK` today: `Buffer`, `Package`, `VarPackage`,
-`If`, `Else`, `While`. #1051 and #1052 replace the opaque treatment by
-changing those rows and adding handlers — the skip logic itself never needs
-touching.
+Six opcodes carried `F_OPAQUE_OK` before #1051/#1052: `Buffer`, `Package`,
+`VarPackage`, `If`, `Else`, `While`. All six are now really parsed, and
+they were the only PkgLength-bearing opcodes ACPI 6.5 defines — so **no row
+carries `F_OPAQUE_OK` any more** and the skip branch is unreachable.
+
+It is kept anyway. It is the only sound way to admit a future
+PkgLength-bearing opcode without implementing it, and re-deriving it under
+time pressure is exactly how a guessed skip distance gets written. To stop
+it rotting untested, the corpus asserts the bearer count is **zero**: a
+later issue that adds one fails that assertion and is forced to put the
+branch back under test. (This also vindicated the prediction above — the
+change really was rows plus handlers, with the skip logic untouched.)
 
 ### Self-check
 
@@ -283,11 +331,12 @@ cascade of a caller that did not check.
 | 18 | `AML_ERR_METHOD_INVOCATION` | bare NameString in term position (#1051) |
 | 19 | `AML_ERR_NOT_INITIALISED` | API used before `aml_lex_init` |
 
-Every code except 14 is exercised by a corpus fixture. **Code 14 is
-unreachable by construction at this milestone** — every handler consumes at
-minimum the opcode byte itself — and is retained deliberately as a structural
-guard for the handlers #1051 and #1052 will add. It is documented as
-untested rather than given a contrived test.
+Every code except 14 and 18 is exercised by a corpus fixture. Code 14
+(`NO_PROGRESS`) remains **unreachable by construction** — every handler
+consumes at minimum the opcode byte itself — and is retained as a
+structural guard; #1052's package-element loop carries it for exactly the
+same reason. Code 18 is retired, above. Both are documented as untested
+rather than given contrived tests.
 
 ---
 
@@ -338,6 +387,205 @@ Both entry points record the decoded value in `aml_lex_state[last_pkglen]`
 decoded arithmetic at all four length maxima — including `0xFFFFF` and
 `0xFFFFFFF`, which no reasonable fixture could satisfy — *and* asserts that
 the overflow check rejected them, from the same fixture.
+
+---
+
+## 6a. Method invocation — the hardest problem in the format
+
+In AML a bare NameString in term position **may be a method call, and the
+number of TermArgs that follow it is not in the byte stream.** It comes
+from bits `[2:0]` of the `MethodFlags` byte of the corresponding `Method`
+declaration, which may appear *later* in the same table or in a different
+table entirely.
+
+Getting the count wrong does not produce a parse error. It produces a
+parse that **succeeds and is wrong**: read one argument too few and the
+next one is re-interpreted as a statement; read one too many and a
+following statement is swallowed as an argument. Everything downstream is
+then plausible and incorrect. **The count is never guessed.**
+
+### The strategy: two passes
+
+`aml_parse` runs the buffer twice — the same shape ACPICA uses, for the
+same reason.
+
+| | What it does | Why it can |
+|---|---|---|
+| **Pass A** — declaration | `aml_parse_termlist(root, len, 0)`. Descends only name-defining constructs. Method bodies and If/Else/While packages are recorded as **byte extents** in `arg0`/`arg1` and not entered. | It never needs an arity to walk past a body, because every body is delimited by a PkgLength. |
+| **Pass B** — body | `aml_term_bodies()` sweeps the **arena, not the buffer**, and parses the body of every `METHOD` / `IF` / `ELSE` / `WHILE` from its recorded extent. | When it starts, *every* `Method` declaration in the table is already in the arena. |
+
+A forward reference — a method calling one defined later in the same
+table, which ASL permits and real DSDTs contain — therefore resolves
+correctly. Nothing is parsed twice: pass A allocates the body-bearing
+node, pass B allocates only its children, and flags bit 15 marks the node
+done so the sweep is idempotent. The high-water mark is sampled once
+before the sweep, so nested control flow found *during* pass B (parsed
+inline, since arities are all known by then) is never revisited — there is
+no third pass and no fixed-point loop.
+
+### Where the arity comes from
+
+`aml_term_lookup` searches, in order:
+
+1. **Interpreter built-ins.** `_OSI` is a one-argument method the
+   interpreter supplies and no table declares; `_OS_`, `_REV` and `_GL_`
+   are interpreter *objects*. Omitting these would make essentially every
+   shipping DSDT unparseable.
+2. **A `Method` node** in the arena — arity from `MethodFlags[2:0]`.
+3. **An `External` node** declaring ObjectType 8 (`MethodObj`) — arity
+   from its `ArgumentCount` byte. This is precisely the mechanism ACPI
+   defines for naming an object another table owns, and it is what makes
+   the cross-table case *resolvable* rather than guessed.
+4. **Any other declaration** of the name — it is an object, not a method,
+   so the NameString is a reference and consumes no further bytes.
+
+Matching is on the **final NameSeg**, not the full path: full scope
+resolution needs the evaluator's namespace walk (R30.M2), and arity is a
+property of the method rather than of the path used to reach it. The
+approximation is made *safe* rather than merely convenient — if two
+declarations share a final NameSeg and disagree on arity, the parse is
+refused with `AML_ERR_AMBIGUOUS_CALL` instead of picking one. Two
+same-named methods with different arities are the only input this
+approximation could mis-parse, and that input is rejected.
+
+### When it cannot be resolved
+
+A NameString matching nothing at all is refused with
+`AML_ERR_UNRESOLVED_CALL`. It is tempting to assume "not a method,
+therefore a plain reference" — but that is exactly the mis-parse above:
+`Store(FOO(1), Local0)` and `Store(FOO, One)` differ only in whether `FOO`
+takes an argument. ACPI *requires* an `External` declaration for any
+object a table references but does not own, so refusing is
+spec-conformant, and the operator gets a precise code and offset instead
+of a wrong namespace.
+
+Two related rules fall out of the same reasoning:
+
+- **Inside a `Package`, a bare NameString is always a reference**, never
+  an invocation — §20.2.5.4 admits only data there. Routing package
+  elements through the TermArg path would submit every element name to
+  arity resolution and could refuse a perfectly legal `_PRT`-shaped
+  package of device paths.
+- **A `Return` with no operand** is accepted when the cursor is already at
+  the enclosing body's end, recorded as an implicit `Zero` via `flags`
+  bit 0. The grammar requires an `ArgObject` and iasl always emits one,
+  but some shipping firmware does not; parsing the following byte as the
+  operand would consume a byte belonging to the enclosing package. This
+  is a bounded, *explicitly flagged* concession — a consumer can see
+  exactly which Returns were fixed up.
+
+### Known limit, stated rather than papered over
+
+A `Method` declared **inside** an If/While body is invisible to pass A,
+which does not enter those bodies. A call to it from a body swept earlier
+in pass B is unresolvable and is refused. Descending control flow in pass
+A would reintroduce the very circularity the two passes exist to break,
+since a control-flow body is arbitrary terms. Conditional method
+definitions are rare and are normally called from within the same block,
+which pass B parses in order and therefore resolves. **This is a refusal,
+never a mis-parse.**
+
+### Complexity
+
+`aml_term_lookup` is a linear scan of the node arena, so resolution is
+O(nodes × calls). At 512-node fixture scale that is nothing. When the
+arena is grown for a real DSDT (§4) it becomes the first thing to
+replace, with a sorted final-NameSeg index built at the end of pass A.
+Noted here so the growth and the index land together.
+
+---
+
+## 6b. Resource templates — eager or lazy, and the discriminator
+
+A resource template is a `Buffer` whose *contents* happen to be a list of
+resource descriptors — what `_CRS`, `_PRS` and `_SRS` return, and the only
+way a driver learns its interrupt, its MMIO window or its I²C address.
+
+**Nothing in the byte stream marks such a buffer.** `Buffer` is `Buffer`.
+The distinction is contextual: it comes from the name of the object the
+buffer is the value of.
+
+### The choice: lazy
+
+Parsing eagerly at Buffer-parse time means reinterpreting **every** buffer
+in the table as a resource list. Ordinary data buffers are common —
+firmware blobs, UUIDs, EC scratch — and their first byte will sometimes
+land on a plausible small-descriptor tag. Two bad outcomes follow: a data
+buffer acquires a fictitious resource tree a consumer may act on, or a
+legal data buffer fails resource validation and the whole *table* is
+refused. Both are worse than what eager parsing buys, which is nothing —
+no consumer needs the resource view until it asks.
+
+So `aml_res_parse(buffer_node)` is called by a consumer that already
+knows, from context, that this buffer is a template.
+
+### The discriminator: whole-buffer validation, not a sniff
+
+Context alone is not enough, because the caller's context can be wrong and
+the bytes are still firmware-supplied. `aml_res_is_template` answers
+structurally, over the **whole buffer**:
+
+> every descriptor from the first byte onward has a tag the specification
+> defines and an in-bounds length; the walk arrives **exactly** at an
+> EndTag; the EndTag is the last thing in the buffer; and its checksum
+> byte is either `0` (§6.4.2.9 "not computed", which iasl emits) or makes
+> the sum of every byte in the template zero modulo 256.
+
+A first-byte sniff would accept any buffer beginning `0x22`. This accepts
+only a complete, self-consistent, exactly-fitting descriptor list. The
+corpus makes the point with a data buffer that *does* begin `0x22` and is
+still correctly refused — three bytes in, `0xBE` turns out to be a
+reserved large item name.
+
+`aml_res_is_template` **latches nothing**: "not a template" is not a
+fault, and a speculative question must not poison a parse that is
+otherwise fine. `aml_res_parse` runs the same validation as its first
+phase and latches the specific reason, which is the only difference
+between the two entry points — a caller who *asserts* the buffer is a
+template wants to know why it is not.
+
+### Two phases, so a partial tree cannot exist
+
+Validation runs to completion before a single node is allocated. That is
+why `aml_res_build` carries no structural error handling: by the time it
+runs, every tag and length has been proven. Duplicating the checks there
+would mean two implementations of the same arithmetic that could disagree,
+and the failure mode would be a tree describing something the validator
+never saw.
+
+### What is decoded
+
+Small items IRQ, DMA, IO, FixedIO, FixedDMA, StartDependent,
+EndDependent, VendorShort and EndTag; large items Memory24,
+GenericRegister, VendorLong, Memory32, Memory32Fixed, DWord/Word/QWord
+address space, ExtendedIRQ, ExtendedSpace, GpioConnection, PinFunction,
+GenericSerialBus and the PinGroup family. Reserved names are **refused**,
+not skipped by their length — a reserved tag in a buffer a caller believes
+is a template is evidence the caller is wrong about the buffer.
+
+Payload bytes are **not copied**: `arg0`/`arg1` delimit each descriptor in
+the AML buffer and the accessors read it there, so a `_CRS` with forty
+descriptors costs forty 32-byte nodes rather than a copy of the buffer.
+Fixed-offset fields are read with `aml_res_u8/u16/u32/u64` at offsets
+tabulated in the module header. The three families whose field positions
+are *computed* get real accessors, because that arithmetic is where the
+bugs are:
+
+- **Address spaces** — `aml_res_space_width/min/max/len`. Minimum is at
+  payload `3 + W`, Maximum at `3 + 2W`, Length at `3 + 4W`, where `W` is
+  2, 4 or 8 by item name.
+- **GPIO** — `aml_res_gpio_pin_count/pin`. `PinTableOffset` is measured
+  from the *descriptor's first byte* while the readers index from the
+  payload, so the three-byte header is subtracted once, here.
+- **Serial bus** — `aml_res_serial_type/i2c_speed/i2c_addr`. The
+  type-specific data has a different layout per bus, so the type must be
+  tested first; reading an SPI descriptor as I²C yields a valid-looking
+  address for a device that is not there.
+
+`aml_res_read` bounds every field against **the descriptor's own extent**,
+not merely the buffer. Reading past a descriptor into its neighbour is the
+characteristic bug of a hand-written resource decoder, and it produces
+plausible garbage rather than a fault.
 
 ---
 
@@ -418,12 +666,46 @@ having read outside the buffer on the way there*.
 
 The harness proves the trap is armed before trusting anything it claims
 (`self-check: guard page traps a one-byte over-read`); otherwise every
-out-of-bounds assertion would be vacuous. Both properties were confirmed by
-mutation: defeating the bounds check in `aml_lex_u8` produces four `SIGSEGV`
-failures, and transposing two opcode-table rows produces three ordering
-failures.
+out-of-bounds assertion would be vacuous.
 
-### Corpus contents (617 assertions)
+### Mutation testing
+
+A malformed-input check that is never exercised is decoration. Every
+structural check added by #1051/#1052/#1053 was neutralised in turn (by
+rewriting its comparison so the branch can never be taken) and the corpus
+re-run. **All twelve mutants were killed:**
+
+| Mutation | Killed by |
+|---|---|
+| If/While containment against the enclosing TermList | `If overruns the enclosing TermList` — `err_off` and node count |
+| Package element-count check | `more package elements than declared` |
+| Buffer literal-size check | `Buffer size exceeds its extent` |
+| Unresolved call treated as a plain reference | `unresolvable invocation` |
+| Ambiguous arity resolved by taking the first | `ambiguous method arity` |
+| Else/If sibling-kind pairing | `Else after a non-If sibling` |
+| EndTag checksum | `resource: bad EndTag checksum` |
+| Large-descriptor length overrun | `resource: large length overruns` |
+| Per-descriptor bound in `aml_res_read` | `read past the descriptor` |
+| EndTag-must-be-last | `resource: trailing bytes after EndTag` |
+| Two opcode-table rows transposed | five ordering / lookup failures |
+| Two passes collapsed into one | twelve failures, led by `parse forward method invocation` |
+
+Two of those initially **survived**, and both were corpus gaps rather than
+code gaps — worth recording because they are the failure mode this
+technique exists to find:
+
+- *If containment.* The fixture asserted only the error **code**, and the
+  enclosing TermList loop reports the same `PKG_OVERRUN` once the cursor
+  has walked out of its parent. The check's real contribution is *when* it
+  fires, so the fixture now asserts `err_off` (immediately after the lying
+  PkgLength, not at the far end of the damage) and the node count (nothing
+  from inside the bogus If was ever allocated).
+- *Else/If pairing.* The only fixture had an `Else` with **no** preceding
+  sibling, which the null test catches before the kind test is ever
+  reached. A second fixture — an `Else` after a `Noop` — exercises the
+  kind test.
+
+### Corpus contents (1073 assertions)
 
 **Tokenizer.** All four PkgLength forms at both ends of each range
 (1-byte 0/5/63; 2-byte 64/65/0xFFF; 3-byte 0x1000/0xFFFFF;
@@ -457,6 +739,46 @@ the node, name and u64 arenas plus a field bit-offset overflow. Each asserts
 a **distinct** error code, that the parse returned 0, and that the depth
 counter unwound to zero.
 
+**Control flow and invocation (#1051).** `Method` containing
+`If`/`Else`/`While`/`Return`/`Break`, asserting that the `Else` is the
+immediately-following sibling of its `If` and that child 0 of an `If` is
+its predicate. A **forward** method invocation — `AAAA` calling `BBBB`,
+declared after it — which a single-pass parser could not resolve without
+guessing, and which is therefore the direct test of the two-pass design.
+The `_OSI` built-in. An `External`-declared cross-table callee. A
+NameString resolving to a non-method declaration and becoming a reference
+rather than a call.
+
+**Data objects (#1052).** `Package` with an integer, a string and a name
+reference; an under-filled `Package` (legal — the remainder is
+uninitialised); `VarPackage` with a computed count; `Buffer` with
+initialisers, asserting the bytes stay in the source buffer;
+`Store`/`DerefOf`/`Index` nested three deep and `CondRefOf` through the
+two-byte extended form.
+
+**Resource templates (#1053).** A ten-descriptor `_CRS` — IRQ, DMA, IO,
+Memory32Fixed, Word/DWord/QWord address space, GpioInt, I2cSerialBus and
+a checksummed EndTag — built with a runtime-computed checksum, then
+decoded field by field: IRQ mask, DMA channel mask, IO bounds/alignment/
+length, memory base and length, address-space min/max/length at all three
+widths, GPIO pin count and pin number, I²C bus type, speed and slave
+address. Plus the discriminator refusing an ordinary data buffer that
+*starts* like an IRQ descriptor, without latching; a field read past a
+descriptor returning 0; and the accessors leaving the cursor undisturbed.
+
+**Malformed (#1051/#1052/#1053).** An `If` whose PkgLength overruns the
+enclosing TermList (asserted by `err_off` and node count, not just the
+code); `Else` with no preceding sibling and `Else` after a non-`If`
+sibling; ambiguous method arity; more package elements than declared; a
+`Buffer` whose literal size exceeds its extent; control flow in TermArg
+position; an unresolvable invocation; `DataRegion` as the
+still-unimplemented opcode. For resources: a valid non-zero checksum and
+a zero "not computed" checksum both accepted, a wrong checksum, a small
+descriptor truncated mid-payload, a large descriptor whose length field
+overruns, a large header itself cut short, a missing EndTag, bytes after
+the EndTag, reserved small and large item names, an EndTag with the wrong
+length nibble, and an empty buffer.
+
 **Invariants.** A hundred reads at end-of-stream fault nothing; a latched
 error freezes the cursor and blocks reads; `set_err` is first-writer-wins;
 `seek` past the end is refused rather than clamped; a truncated multi-byte
@@ -468,15 +790,18 @@ literal is atomic.
 
 | Deferred | To |
 |---|---|
-| `If` / `Else` / `While` / `Return` bodies, expression TermArgs, method invocation | #1051 |
-| `Buffer` / `Package` / `VarPackage` contents; computed `Name` initialisers; `DataRegion` | #1052 |
-| Resource templates inside `Buffer` (`_CRS` / `_PRS` decoding) | #1053 |
-| Method **bodies** — recorded as `arg0`/`arg1` extents, not descended | #1051 |
-| Evaluation of anything at all — namespace resolution, OpRegion access, method execution | R30.M2 (#1054+) |
+| `DataRegion` (three TermArgs plus a NameString) — the one ACPI 6.5 opcode still refused with `UNEXPECTED_OP` | R30.M2 |
+| Computed `Name` initialisers — `DataRefObject` admits only literals and aggregates per §20.2.5.1, so a computed one is genuinely malformed and stays refused | — |
+| A `Method` declared inside an If/While body, called from a body swept earlier (§6a) — refused, never mis-parsed | R30.M2, with the namespace index |
+| Sorted final-NameSeg index to replace the linear arity scan | R30.M2, together with the arena growth |
+| Full scope resolution of a NameString to a namespace node | R30.M2 |
+| `ExtendedSpace` (large item 11) accessors — different layout from the Word/DWord/QWord family | when a device presents one |
+| Evaluation of anything at all — OpRegion access, method execution | R30.M2 (#1054+) |
 | Revision-dependent truncation of `OnesOp` to 32 bits | R30.M2 — a parser that truncated would destroy information the evaluator needs |
 | `Processor` `PblkAddr`/`PblkLen`, `PowerResource` `ResourceOrder` | recoverable from `src_off`; store them if a consumer ever needs them without re-reading |
 | Arena sizing for a full DSDT | a `.bss` change; exhaustion is already a clean error |
 
-When #1051 lands, descending into method bodies is a change to walk
-`[arg0, arg1)` — the node already carries the extent, so no re-parse and no
-representation change is needed.
+That prediction held. #1051 descends method bodies by walking
+`[arg0, arg1)` from the node the declaration pass already built: no
+re-parse of the buffer, no change to the node representation, and the
+`METHOD` record gained nothing but one flag bit.

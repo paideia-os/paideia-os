@@ -118,8 +118,10 @@ while IFS= read -r -d '' pdx; do
         # cap kind (0x30 KIND_PCI_DEV vs 0x20 KIND_ACPI).
         PCI_ENUMERATOR_OBJECTS+=("${obj}")
     elif [[ "${rel}" == aml/* ]]; then
-        # R30.M1-001 (#1049) / R30.M1-002 (#1050): the userspace AML
-        # tokenizer, arena, opcode table and namespace parser. These are a
+        # R30.M1-001..005 (#1049-#1053): the userspace AML tokenizer,
+        # arena, opcode table, namespace parser, term parser and
+        # resource-template decoder. Everything under src/user/aml/ is
+        # globbed in, so a new module joins libaml.a by existing. These are a
         # LIBRARY, not a program — they have no _start and are consumed by
         # the acpi_supervisor process once the userspace ACPI bubble wires
         # up (R30.M2+). They get their own object set and are archived into
@@ -348,7 +350,7 @@ if [[ ${#PCI_ENUMERATOR_OBJECTS[@]} -gt 0 ]]; then
     echo "[ok] ${BUILD_DIR}/pci_enumerator.bin"
 fi
 
-# Archive the AML modules (R30.M1-001 #1049 / R30.M1-002 #1050).
+# Archive the AML modules (R30.M1-001..005, #1049-#1053).
 #
 # An archive rather than a linked ELF because there is no entry point:
 # this is the parser library the acpi_supervisor process will link against

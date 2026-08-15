@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # tools/verify-aml-parser.sh — R30.M1-001 (#1049) / R30.M1-002 (#1050)
+#                              R30.M1-003/004/005 (#1051 / #1052 / #1053)
 #
 # Build-time verification of the userspace AML tokenizer and namespace
 # parser. Wired into `.githooks/pre-push` as the `aml-parser` step, in the
@@ -24,7 +25,7 @@
 #      braces alongside tools/lint-no-kernel-aml.sh: that script polices
 #      identifiers, this one polices files.
 #
-#   2. COMPILATION. All four modules build with the pinned paideia-as.
+#   2. COMPILATION. All six modules build with the pinned paideia-as.
 #
 #   3. STORAGE ENCAPSULATION. Checked with `objdump -r`, which is the only
 #      way to prove it mechanically: a module's private .bss must be
@@ -41,6 +42,16 @@
 #      state from the parser would quietly void the guarantee; this check
 #      fails the push instead.
 #
+#      #1051/#1052/#1053 added aml_term.o and aml_resource.o with NO
+#      private storage of their own, so this check needed no new
+#      assertion — but adding them to MODULES makes the three existing
+#      assertions strictly stronger, because they now also prove that
+#      the term parser and the resource decoder cannot reach the lexer
+#      cursor, the arenas or the opcode table except through the
+#      accessor API. A module added here without storage still gets
+#      policed; a module added with storage must extend the checks
+#      below.
+#
 #   4. THE CORPUS. tests/user/aml/aml_harness.c is compiled against the
 #      objects and run. Every fixture is loaded so its last byte abuts a
 #      PROT_NONE guard page, so an out-of-bounds read is a SIGSEGV rather
@@ -51,7 +62,7 @@
 #
 #   $ bash tools/verify-aml-parser.sh
 #   [aml-parser] placement: no AML sources under src/kernel/**
-#   [aml-parser] compiled 4 module(s)
+#   [aml-parser] compiled 6 module(s)
 #   [aml-parser] encapsulation: aml_lex_state confined to aml_lex.o
 #   [aml-parser] encapsulation: arena storage confined to aml_arena.o
 #   [aml-parser] encapsulation: aml_optab confined to aml_optab.o
@@ -70,7 +81,7 @@ AML_SRC="${REPO_ROOT}/src/user/aml"
 HARNESS="${REPO_ROOT}/tests/user/aml/aml_harness.c"
 OUT="${REPO_ROOT}/build/aml"
 
-MODULES=(aml_lex aml_arena aml_optab aml_ns)
+MODULES=(aml_lex aml_arena aml_optab aml_ns aml_term aml_resource)
 
 # ── environment ──────────────────────────────────────────────────────
 PA_BIN="$(bash "${REPO_ROOT}/tools/find-paideia-as.sh")"
@@ -154,10 +165,19 @@ check_confined() {
     echo "[aml-parser] encapsulation: ${label}"
 }
 
-check_confined "aml_lex_state confined to aml_lex.o" aml_lex 'aml_lex_state'
+# Each storage symbol is matched with an explicit right-hand boundary. A
+# bare 'aml_node_last' would also match the ACCESSOR aml_node_last_child
+# (#1051), which is a function every module may legitimately call, and the
+# check would then fail on a caller that touches no storage at all. The
+# temptation at that point is to drop the symbol from the list — which
+# would stop policing the storage. Anchoring is the fix: it keeps the
+# assertion exactly as strong and makes it mean what it says.
+END='([^a-zA-Z0-9_]|$)'
+
+check_confined "aml_lex_state confined to aml_lex.o" aml_lex "aml_lex_state${END}"
 check_confined "arena storage confined to aml_arena.o" aml_arena \
-               'aml_node_arena|aml_name_arena|aml_u64_arena|aml_arena_state|aml_node_last'
-check_confined "aml_optab confined to aml_optab.o" aml_optab 'aml_optab$|aml_optab_len'
+               "(aml_node_arena|aml_name_arena|aml_u64_arena|aml_arena_state|aml_node_last)${END}"
+check_confined "aml_optab confined to aml_optab.o" aml_optab "aml_optab${END}|aml_optab_len${END}"
 
 # ── 4. the corpus ────────────────────────────────────────────────────
 OBJS=()
