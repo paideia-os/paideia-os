@@ -109,6 +109,28 @@ gdt32_ptr:
 _pml4_addr:
     .quad pml4
 
+# R49.M2-001 (#1573): ASCII-art boot banner.
+# Emitted via uart_puts (RAW), never klog_s1 — the klog formatter prefixes
+# every line with "TSC|cpu|level|SUBSYS|", which would shred the art.
+# banner_msg below is deliberately left byte-identical: the literal line
+# "PaideiaOS R8" is asserted in 21 expected/golden files, and goldens are
+# ordered-subsequence checks, so the art is ADDED around it rather than
+# replacing it.
+.global banner_art
+.align 8
+banner_art:
+    .ascii "================================================================\n"
+    .ascii " ____          _      _        _          ___   ____  \n"
+    .ascii "|  _ \\   __ _ (_)  __| |  ___ (_)  __ _  / _ \\ / ___| \n"
+    .ascii "| |_) | / _` || | / _` | / _ \\| | / _` || | | |\\___ \\ \n"
+    .ascii "|  __/ | (_| || || (_| ||  __/| || (_| || |_| | ___) |\n"
+    .ascii "|_|     \\__,_||_| \\__,_| \\___||_| \\__,_| \\___/ |____/ \n"
+    .ascii "\n"
+    .ascii "  Capability-based post-quantum x86_64 microkernel\n"
+    .ascii "  (C) 2026, Santiago Nunez-Corrales\n"
+    .ascii "================================================================\n"
+    .ascii "\0"
+
 # B3-004: Banner string for kernel startup message
 .global banner_msg
 .align 8
