@@ -2255,3 +2255,46 @@ lpss_i2c_ok_msg: .ascii "R30 LPSS I2C OK\n\0"
 .global lpss_i2c_fail_msg
 .align 8
 lpss_i2c_fail_msg: .ascii "R30 LPSS I2C FAIL\n\0"
+
+# ---------------------------------------------------------------------------
+# R30.M5-005 (#1074): interrupt-driven transfer engine marker.
+#
+# Emitted by the same witness, after the polled marker, once sub-tests
+# S..X have passed. A second fingerprint rather than a widened first
+# one, because it stands for claims the first does not make and a boot
+# in which the polled engine works and the interrupt engine does not is
+# a boot somebody needs to be able to see.
+#
+# What the fingerprint stands for:
+#   * an interrupt-driven write, read and combined transfer reach the
+#     wire with the SAME command flags and the SAME device address as
+#     the polled engine, taken from the capability and from nowhere a
+#     caller can reach;
+#   * TX_EMPTY -- a level that is asserted forever once the FIFO
+#     drains -- is masked at the instant the last command is queued,
+#     asserted by a level-triggered delivery pump that measures how
+#     many times a CPU would have entered interrupt context, and shown
+#     to be a real bound by putting the mask back and watching the same
+#     measurement blow past it;
+#   * an address NACK and a data NACK stay distinct, and a data NACK
+#     reports how many bytes the device ACKNOWLEDGED -- not how many
+#     were pushed, since the abort flushes the TX FIFO and the NACKed
+#     byte never landed;
+#   * the same armed abort produces the same code through both engines,
+#     because there is one decode and not two;
+#   * a transfer that never sees STOP_DET hits the existing bounded
+#     timeout rather than hanging, and gives the bus back;
+#   * one claim and one wedge latch are shared by both engines.
+#
+# See also:
+#   - src/kernel/core/drivers/i2c/dw_irq.pdx  (FSM context + ownership)
+#   - src/kernel/core/drivers/i2c/dw_isr.pdx  (the service routine)
+#   - tools/build.sh [dw-isr-allowlist]       (bounded call graph)
+#   - design/drivers/lpss-i2c-controller.md
+.global lpss_i2c_irq_ok_msg
+.align 8
+lpss_i2c_irq_ok_msg: .ascii "R30 LPSS I2C IRQ OK\n\0"
+
+.global lpss_i2c_irq_fail_msg
+.align 8
+lpss_i2c_irq_fail_msg: .ascii "R30 LPSS I2C IRQ FAIL\n\0"

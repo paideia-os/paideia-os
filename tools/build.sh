@@ -389,8 +389,25 @@ i2c_addr_pin_in "${I2C_XFER_SRC}" 'pub let i2c_xfer_write : (u64, u64, u64, u64)
 i2c_addr_pin_in "${I2C_XFER_SRC}" 'pub let i2c_xfer_read : (u64, u64, u64, u64) -> u64'
 i2c_addr_pin_in "${I2C_XFER_SRC}" 'pub let i2c_xfer_write_read : (u64, u64, u64, u64, u64, u64) -> u64'
 i2c_addr_pin_in "${I2C_XFER_SRC}" 'pub let i2c_smbus_op : (u64, u64, u64, u64, u64) -> u64'
+
+# R30.M5-005 (#1074): the interrupt-driven entry points are pinned on the
+# same terms.
+#
+# An engine that delivers its completion by interrupt rather than by
+# polling has no reason whatsoever to take an address, and every reason
+# not to: it is the path a driver will actually use at input rates, so a
+# caller-supplied address here would be the address parameter that gets
+# used. i2c_xfer_irq_begin is pinned as well as the three transfers,
+# because it is the function that actually resolves the capability and a
+# parameter added there would reach the wire through all three.
+I2C_IRQ_SRC="${REPO_ROOT}/src/kernel/core/drivers/i2c/dw_irq.pdx"
+i2c_addr_pin_in "${I2C_IRQ_SRC}" 'pub let i2c_xfer_irq_begin : (u64, u64, u64, u64, u64) -> u64'
+i2c_addr_pin_in "${I2C_IRQ_SRC}" 'pub let i2c_xfer_irq_write : (u64, u64, u64, u64) -> u64'
+i2c_addr_pin_in "${I2C_IRQ_SRC}" 'pub let i2c_xfer_irq_read : (u64, u64, u64, u64) -> u64'
+i2c_addr_pin_in "${I2C_IRQ_SRC}" 'pub let i2c_xfer_irq_write_read : (u64, u64, u64, u64, u64, u64) -> u64'
 echo "[i2c-addr-confine] address/mode/bus resolvers and all four transfer"
 echo "[i2c-addr-confine] entry points take no caller-supplied address"
+echo "[i2c-addr-confine] interrupt-driven entry points likewise"
 
 # ---------------------------------------------------------------------------
 # R30.M5-003 (#1072): I²C REGISTER-PATH CONFINEMENT.
@@ -513,6 +530,25 @@ i2c_ctrl_confine() {
 }
 i2c_ctrl_confine '_lpss_i2c_ctrl'      'core/drivers/i2c/lpss_probe.o'
 i2c_ctrl_confine '_i2c_xfer_abort_src' 'core/drivers/i2c/dw_xfer.o'
+# R30.M5-005 (#1074): the interrupt engine's FSM contexts and the single
+# transfer claim.
+#
+# _dw_irq_ctx is the one place in the kernel where the state of an
+# in-flight I2C transfer lives, and the entire SMP argument for it is
+# that its fields have exactly ONE writer at any instant, chosen by the
+# state word at offset 0. That argument is a claim about which objects
+# can touch the table, and objdump -r is the only way to check it. Note
+# that dw_isr.o -- which does more writing into these rows than anything
+# else -- is NOT an owner: it reaches them through dw_irq_row, so the
+# rows have one relocating object and the ISR's access is exactly the
+# access the ownership protocol grants it.
+#
+# _dw_irq_seam_owner is stronger still: it is a SINGLE cell whose CAS is
+# what makes "one transfer in flight at a time" true across both the
+# polled and the interrupt engine. A second object writing it would be a
+# second way to believe you own the bus.
+i2c_ctrl_confine '_dw_irq_ctx'         'core/drivers/i2c/dw_irq.o'
+i2c_ctrl_confine '_dw_irq_seam_owner'  'core/drivers/i2c/dw_irq.o'
 if [[ "${I2C_MMIO_OK}" -ne 1 ]]; then
     echo "  See src/kernel/core/drivers/i2c/dw_io.pdx for why the window" >&2
     echo "  capability must be re-resolved per access and why no second" >&2
@@ -591,6 +627,87 @@ if [[ -n "${sci_isr_bad}" ]]; then
     exit 1
 fi
 echo "[sci-isr-allowlist] sci_isr.o call targets within the bounded allowlist"
+
+# ---------------------------------------------------------------------------
+# R30.M5-005 (#1074): DESIGNWARE I²C ISR CALL-TARGET ALLOWLIST.
+#
+# A SECOND, SEPARATE list. It deliberately does not extend the SCI one
+# and the SCI one does not extend it: the two routines are bounded for
+# different reasons and by different arguments, and a shared list would
+# let a symbol justified for one appear, unexamined, in the other.
+#
+# src/kernel/core/drivers/i2c/dw_isr.pdx contains exactly one function
+# for this check's sake. Every symbol below is a bounded, non-blocking
+# leaf or near-leaf:
+#
+#   dw_irq_row           range check plus address arithmetic
+#   atomic_load_u64      one aligned load
+#   atomic_cas_u64       one LOCK CMPXCHG
+#   atomic_xchg_u64      one XCHG
+#   atomic_store_u64     one aligned store
+#   dw_i2c_select        two table reads and a slot store
+#   dw_io_read32         capability re-resolve plus one MMIO load
+#   dw_io_write32        capability re-resolve plus one MMIO store
+#   dw_xfer_check_abort  straight-line, three register accesses
+#   i2c_xfer_last_abort  one load
+#   dw_irq_close         two CAS attempts, three stores, one register
+#                        write; no loop
+#
+# None allocates, none takes a lock, none can block, none reaches a
+# scheduler, an IPC send, or a firmware-method interpreter. Adding a
+# call to anything else fails the build by name.
+#
+# The routine's own loops are counted against DW_IRQ_TX_BURST and
+# DW_IRQ_RX_BURST, both fixed, so its cost does not grow with transfer
+# length -- a 256-byte write is thirty-two short invocations, not one
+# long one.
+DW_ISR_OBJ="${BUILD_DIR}/core/drivers/i2c/dw_isr.o"
+if [[ ! -f "${DW_ISR_OBJ}" ]]; then
+    echo "[dw-isr-allowlist] FAIL: ${DW_ISR_OBJ} not built" >&2
+    exit 1
+fi
+DW_ISR_ALLOWED="
+dw_irq_row
+dw_irq_close
+dw_i2c_select
+dw_io_read32
+dw_io_write32
+dw_xfer_check_abort
+i2c_xfer_last_abort
+atomic_load_u64
+atomic_store_u64
+atomic_cas_u64
+atomic_xchg_u64
+"
+dw_isr_refs=$(objdump -r "${DW_ISR_OBJ}" 2>/dev/null \
+    | awk 'NF >= 3 && $1 ~ /^[0-9a-f]+$/ { print $3 }' \
+    | sed -e 's/[-+]0x[0-9a-f]*$//' | sort -u)
+if [[ -z "${dw_isr_refs}" ]]; then
+    echo "[dw-isr-allowlist] FAIL: no relocations found in dw_isr.o" >&2
+    echo "  The ISR was gutted or inlined away; the allowlist would then pass" >&2
+    echo "  vacuously, so it fails instead." >&2
+    exit 1
+fi
+dw_isr_bad=""
+while IFS= read -r sym; do
+    [[ -z "${sym}" ]] && continue
+    if ! printf '%s\n' ${DW_ISR_ALLOWED} | grep -qx -- "${sym}"; then
+        dw_isr_bad="${dw_isr_bad} ${sym}"
+    fi
+done <<< "${dw_isr_refs}"
+if [[ -n "${dw_isr_bad}" ]]; then
+    echo "[dw-isr-allowlist] FAIL — core/drivers/i2c/dw_isr.o references:${dw_isr_bad}" >&2
+    echo "  The I2C service routine may only call bounded, non-blocking" >&2
+    echo "  primitives. No allocation, no lock, no scheduling, no IPC, no" >&2
+    echo "  unbounded loop behind a call." >&2
+    echo "  If a new call really belongs in interrupt context, add it to" >&2
+    echo "  DW_ISR_ALLOWED here AND say in the commit why it is bounded." >&2
+    echo "  Do NOT widen SCI_ISR_ALLOWED instead; the two lists are separate" >&2
+    echo "  on purpose." >&2
+    echo "  See src/kernel/core/drivers/i2c/dw_isr.pdx §The allowlist." >&2
+    exit 1
+fi
+echo "[dw-isr-allowlist] dw_isr.o call targets within the bounded allowlist"
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 

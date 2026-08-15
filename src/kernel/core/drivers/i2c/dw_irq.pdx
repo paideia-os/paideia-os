@@ -1,0 +1,1258 @@
+// src/kernel/core/drivers/i2c/dw_irq.pdx — R30.M5-005 (#1074)
+//
+// The interrupt-driven transfer engine: the FSM context, the ownership
+// protocol that makes it safe to share between interrupt and thread
+// context, and the submit/complete half of the transfer.
+//
+// The other half — the service routine itself — is `dw_isr.pdx`, which
+// contains exactly one function so that `tools/build.sh` can assert its
+// entire call graph against an allowlist. Same structural device as
+// `core/acpi/sci_isr.pdx`, for the same reason.
+//
+// =============================================================================
+// 1. WHY INTERRUPTS AT ALL, AND WHY THE POLLED ENGINE STAYS
+// =============================================================================
+//
+// A polled transfer holds the CPU for the whole of a bus transaction.
+// At Standard mode a single byte is ninety microseconds; a touchpad
+// report is a dozen bytes behind a register-pointer write, so a polled
+// read is over a millisecond of a core doing nothing but reading
+// IC_STATUS. That is affordable once at bring-up and unaffordable at
+// input rates.
+//
+// So this file adds an interrupt-driven engine. It does NOT delete the
+// polled one (`dw_xfer.pdx`), and the reason is boot order: before an
+// interrupt vector is bound to the controller — which needs
+// `KIND_HW_MSIX_VECTOR` plumbing this milestone does not do — an
+// engine that waits for an interrupt waits forever. The polled engine
+// is what identification, bring-up and SMBus use, and it is what works
+// when the IDT is not yet live.
+//
+// TWO ENGINES IS THE THING THAT GOES WRONG. The failure mode is not
+// that one of them is slow; it is that they drift. A NACK decodes one
+// way on one path and another way on the other, a timeout is reported
+// with two different codes, one path clears IC_CLR_TX_ABRT and the
+// other forgets, and which behaviour a caller gets depends on which
+// boot phase it ran in. Three things are done about that, and they are
+// mechanisms rather than intentions:
+//
+//   (a) THE ERROR HANDLING IS NOT DUPLICATED, IT IS CALLED. Both
+//       engines decode aborts through the SAME `dw_xfer_check_abort`,
+//       resolve capabilities and rights through the SAME
+//       `i2c_xfer_resolve`, program the target through the SAME
+//       `i2c_xfer_set_target`, and check the SAME wedge latch on the
+//       controller row. There is exactly one copy of "what a NACK
+//       means", so the two cannot disagree about it. The witness
+//       asserts this directly: the same armed abort produces the same
+//       code through `i2c_xfer_write` and through
+//       `i2c_xfer_irq_write`.
+//
+//   (b) THE INTERRUPT ENGINE HAS EXACTLY ONE IMPLEMENTATION OF ITS
+//       FSM, and who calls it is the only thing that varies.
+//       `dw_i2c_isr_body` is the whole engine. With a vector bound, an
+//       interrupt trampoline calls it. With no vector bound — today,
+//       and during early boot forever — `dw_irq_wait` calls it from
+//       thread context, bounded by the caller's budget. That is not a
+//       second code path; it is the same function with a different
+//       caller, which is why it cannot diverge from itself. When a
+//       vector does get bound, BOTH callers are active at once, and
+//       that is safe for the reasons in §2 rather than by luck.
+//
+//   (c) THE CONTROLLER HAS ONE OWNER AT A TIME, ACROSS BOTH ENGINES.
+//       `dw_irq_claim` is taken by the interrupt path AND by the three
+//       polled entry points in `dw_xfer.pdx`, so a polled transfer and
+//       an interrupt-driven transfer can never be in flight on the
+//       same wire. Before this, two CPUs could run polled transfers
+//       against one controller and interleave their IC_DATA_CMD
+//       writes; R18 landed SMP and nothing had closed that.
+//
+// =============================================================================
+// 2. WHERE THE TRANSFER STATE LIVES, AND WHO MAY TOUCH IT
+// =============================================================================
+//
+// This is the part that is actually hard, and it is not the register
+// writes.
+//
+// A polled transfer keeps its state in registers and locals on one
+// stack, so there is nothing to share. An interrupt-driven transfer's
+// state is read and written by a routine that fires asynchronously, on
+// a CPU of the interrupt controller's choosing, while the requesting
+// thread is still running on another. The FSM context is therefore
+// SHARED MUTABLE STATE between two contexts, and "it works because
+// there is one CPU today" is not available: R18 landed SMP.
+//
+// The context is `_dw_irq_ctx[ctrl_idx]`, one 128-byte row per
+// controller, cache-line aligned so two controllers' rows cannot false-
+// share. `tools/build.sh` confines the table to this object.
+//
+// -----------------------------------------------------------------------------
+// THE BATON
+// -----------------------------------------------------------------------------
+//
+// Exactly ONE field is written by both contexts: `state`, at offset 0.
+// It is never written by a plain store — only by `atomic_cas_u64` or
+// `atomic_xchg_u64`, both of which are LOCK-prefixed and therefore full
+// fences. Every other field has, at any instant, exactly one writer,
+// and `state` is what says which context that is:
+//
+//   state          who may WRITE the rest of the row
+//   -----          ---------------------------------
+//   FREE           nobody
+//   SETUP          the claiming thread, exclusively
+//   ARMED/RUNNING  the ISR, exclusively
+//   CLOSING        whoever won the CLOSING transition, exclusively
+//   DONE/ABORT     the claiming thread, exclusively
+//
+// So the row is not protected by a lock. It is handed back and forth,
+// and each handover is a single LOCK-prefixed read-modify-write:
+//
+//   * PUBLISH (thread -> ISR). The thread fills wbuf/wlen/rbuf/rlen
+//     with plain stores, then `CAS(state, SETUP -> ARMED)`. x86 TSO
+//     orders those stores before the CAS in global order (SDM Vol 3A
+//     §8.2.2), and the CAS is a full fence, so no CPU can observe
+//     ARMED without also observing every field. The HARDWARE arm —
+//     writing IC_INTR_MASK — happens strictly AFTER the software arm,
+//     which is what guarantees the first interrupt cannot find an
+//     unpublished row.
+//
+//   * RETURN (ISR -> thread). The ISR writes err/nack_phase/landed,
+//     then `atomic_store(state, DONE|ABORT)`. The waiting thread reads
+//     `state` with `atomic_load_u64` and only touches the rest of the
+//     row once it has seen a terminal value; TSO again orders the
+//     writes before the publishing store, so a thread that has seen
+//     DONE has seen everything that produced it.
+//
+// The ISR's own entry guard is the other half: it loads `state` first
+// and returns immediately unless it is ARMED or RUNNING. A row in
+// SETUP, CLOSING or terminal is invisible to it. So the windows do not
+// overlap — they are separated by the same word that carries the data
+// dependency.
+//
+// -----------------------------------------------------------------------------
+// TERMINATION IS A CLAIM, NOT A WRITE
+// -----------------------------------------------------------------------------
+//
+// Two contexts can decide to end a transfer at the same instant: the
+// ISR on a STOP_DET, and the waiting thread on a budget it has just
+// exhausted. If both simply wrote `err` and then `state`, the surviving
+// `err` would be whichever store happened to be second — i.e. the
+// caller could be told "timed out" about a transfer that in fact
+// completed, or vice versa.
+//
+// So terminating is a two-phase transition through CLOSING.
+// `dw_irq_close` first tries `CAS(RUNNING -> CLOSING)` and then
+// `CAS(ARMED -> CLOSING)`; exactly one context can win, and only the
+// winner writes the outcome fields and publishes the terminal state.
+// The loser writes nothing and reports that it lost, so the outcome
+// that reaches the caller is the outcome of whichever context actually
+// finished the transfer. Both contexts call the SAME `dw_irq_close` —
+// there is one copy of "how a transfer ends", for the same reason
+// there is one copy of "what a NACK means".
+//
+// -----------------------------------------------------------------------------
+// TWO ISRs AT ONCE
+// -----------------------------------------------------------------------------
+//
+// Once a vector is bound, `dw_irq_wait`'s self-service call and a real
+// interrupt can both be inside `dw_i2c_isr_body` for one controller at
+// the same time, on two CPUs. The incremental cursors (wcmd, rcmd,
+// rdone) are read-modify-written there, so that must be excluded — and
+// it must be excluded WITHOUT A LOCK, because an ISR may not block.
+//
+// The row therefore carries a `gate` word. The ISR's third act is
+// `atomic_xchg(gate, 1)`; if the previous value was 1 another CPU is
+// already inside and this invocation RETURNS IMMEDIATELY rather than
+// spinning. Nothing is lost by returning: the DesignWare interrupt is
+// a level, so the condition that raised it is still true and the line
+// re-asserts, and the CPU that holds the gate is servicing that same
+// condition anyway. This is exclusion by declining, which is the only
+// kind an interrupt handler may use.
+//
+// The thread's timeout path is the one context that must wait for the
+// gate rather than decline it, because it is about to return the
+// caller's buffer to the caller and the ISR writes into that buffer.
+// It therefore spins bounded — see `dw_irq_wait`.
+//
+// =============================================================================
+// 3. THE SEAM HAS ONE BINDING, SO THE CLAIM IS GLOBAL
+// =============================================================================
+//
+// `dw_io.pdx` binds ONE window capability at a time, kernel-wide:
+// `dw_i2c_select` overwrites `_dw_io_win_slot`. A per-controller claim
+// would therefore be worthless — controller A's thread and controller
+// B's ISR would fight over which window the seam points at, and the
+// loser would read and write the other controller's registers through
+// a capability that legitimately covers them.
+//
+// So `_dw_irq_seam_owner` is a SINGLE cell and the claim is global: one
+// I²C transfer in flight in the whole kernel at a time, on any
+// controller, by either engine. That is a real serialisation and it is
+// stated rather than hidden. It is also the honest consequence of the
+// seam's shape: the day `dw_io` carries a per-CPU or per-controller
+// binding, this claim becomes per-controller by changing this file's
+// cell into the row's, and nothing else moves.
+//
+// The invariant it buys is the one the ISR relies on: a row can only be
+// ARMED if its controller holds the seam, so an ISR that finds its row
+// ARMED knows the seam is already pointed at its own window.
+//
+// `i2c_bus_recover` deliberately does NOT take the claim. It is the
+// escape hatch for a controller whose owner has stopped making
+// progress, and an escape hatch that requires the thing it is escaping
+// from is not one.
+//
+// =============================================================================
+// 4. FAILURE TAXONOMY — band 0xFFFFFFE0..0xFFFFFFE6
+// =============================================================================
+//
+// Sits in the gap between DMA_* (0xFFFFFFD5..DF) and MSIX_*
+// (0xFFFFFFE7..EF) and closes it. Every code is at or above
+// I2C_XFER_ERR_FLOOR (0xFFFFFF30), which is what every caller in this
+// tree tests against to tell an error from a value — a code below the
+// floor would be returned as if it were data.
+//
+// Only three facts are new here. Everything else an interrupt-driven
+// transfer can fail with is a fact the polled engine could already
+// state, and reuses its code: NACK_ADDR, NACK_DATA, ARB_LOST,
+// TIMEOUT_RXFIFO, TIMEOUT_STOP, BUS_WEDGED, the rights refusals,
+// LPSS_I2C_IO_FAULT. Minting parallel codes for those would be exactly
+// the divergence this file exists to prevent.
+//
+//   Reserved-label discipline: labels prefixed `dwq_`.
+
+module DwIrq = structure {
+
+  // ==========================================================================
+  // FSM states
+  // ==========================================================================
+
+  pub let DW_IRQ_ST_FREE    : u64 = 0
+  pub let DW_IRQ_ST_SETUP   : u64 = 1
+  pub let DW_IRQ_ST_ARMED   : u64 = 2
+  pub let DW_IRQ_ST_RUNNING : u64 = 3
+  pub let DW_IRQ_ST_CLOSING : u64 = 4
+  pub let DW_IRQ_ST_DONE    : u64 = 5
+  pub let DW_IRQ_ST_ABORT   : u64 = 6
+
+  // A state is terminal iff it is at or above DONE. Written as a
+  // threshold rather than two compares because every waiter asks the
+  // same question and a two-compare form invites one of them to test
+  // only DONE and hang on an abort.
+  pub let DW_IRQ_ST_TERMINAL : u64 = 5
+
+  // ==========================================================================
+  // Row layout — 128 bytes, cache-line aligned
+  // ==========================================================================
+
+  pub let DW_IRQ_ROW_BYTES : u64 = 128
+
+  pub let DW_IRQ_F_STATE  : u64 = 0    // +0    THE BATON. CAS/xchg only.
+  pub let DW_IRQ_F_GATE   : u64 = 1    // +8    ISR-vs-ISR exclusion
+  pub let DW_IRQ_F_WBUF   : u64 = 2    // +16   thread, in SETUP
+  pub let DW_IRQ_F_WLEN   : u64 = 3    // +24
+  pub let DW_IRQ_F_RBUF   : u64 = 4    // +32
+  pub let DW_IRQ_F_RLEN   : u64 = 5    // +40
+  pub let DW_IRQ_F_WCMD   : u64 = 6    // +48   ISR, under the gate
+  pub let DW_IRQ_F_RCMD   : u64 = 7    // +56   ISR, under the gate
+  pub let DW_IRQ_F_RDONE  : u64 = 8    // +64   ISR, under the gate
+  pub let DW_IRQ_F_ERR    : u64 = 9    // +72   the CLOSING winner
+  pub let DW_IRQ_F_PHASE  : u64 = 10   // +80   the CLOSING winner
+  pub let DW_IRQ_F_LANDED : u64 = 11   // +88   the CLOSING winner
+  pub let DW_IRQ_F_CALLS  : u64 = 12   // +96   ISR, under the gate
+  pub let DW_IRQ_F_MASKAT : u64 = 13   // +104  ISR, under the gate
+  pub let DW_IRQ_F_ABRT   : u64 = 14   // +112  the CLOSING winner
+  pub let DW_IRQ_F_CTRL   : u64 = 15   // +120  thread, in SETUP
+
+  pub let DW_IRQ_F_MAX    : u64 = 16
+
+  // ==========================================================================
+  // NACK phase — the distinction the caller cannot afford to lose
+  // ==========================================================================
+  //
+  // An address NACK and a data NACK are different facts about the world
+  // and different problems for the caller. Nobody answered at all means
+  // the part is absent, in reset, or at another address — the ordinary
+  // outcome of a probe, and a caller that is probing wants to move on
+  // without a word. A device that answered and then rejected a byte
+  // means the part is there and stopped mid-message, which is a real
+  // failure, and the caller needs to know HOW FAR the message got
+  // because a partially applied register write can leave a device in a
+  // state its driver does not believe it is in.
+  //
+  // Collapsing them into one code would make a probe indistinguishable
+  // from a half-applied configuration.
+
+  pub let DW_IRQ_NACK_NONE : u64 = 0
+  pub let DW_IRQ_NACK_ADDR : u64 = 1
+  pub let DW_IRQ_NACK_DATA : u64 = 2
+
+  // ==========================================================================
+  // Interrupt masks
+  // ==========================================================================
+  //
+  // XFER is what a transfer arms: TX_EMPTY (the FIFO wants more),
+  // RX_FULL (a byte is ready), TX_ABRT (it went wrong), STOP_DET (it
+  // finished).
+  //
+  // TAIL is XFER WITHOUT TX_EMPTY, and it is the whole of the storm
+  // fix. TX_EMPTY is not an event — it is a LEVEL, asserted whenever
+  // TXFLR <= IC_TX_TL, and bring-up programs IC_TX_TL to 0. Once the
+  // last byte has left the FIFO that condition is true forever, so a
+  // driver that leaves TX_EMPTY unmasked past its last byte takes an
+  // interrupt on every EOI until something else stops it. The transfer
+  // still completes; the machine just spends the rest of the transfer
+  // in interrupt context. THE MASK IS DROPPED TO TAIL AT THE MOMENT
+  // THE LAST COMMAND IS QUEUED — see `dw_isr.pdx`, label
+  // `dwi_isr_tx_masked`, which is the single point in the kernel where
+  // this happens.
+  //
+  // NONE is what `dw_irq_close` writes. A controller with no transfer
+  // in flight must not assert its line at all: an interrupt nobody is
+  // waiting for is a storm with no service routine to end it.
+
+  pub let DW_IRQ_MASK_XFER : u64 = 0x254   // TX_EMPTY|RX_FULL|TX_ABRT|STOP_DET
+  pub let DW_IRQ_MASK_TAIL : u64 = 0x244   // RX_FULL|TX_ABRT|STOP_DET
+  pub let DW_IRQ_MASK_NONE : u64 = 0x000
+
+  // ==========================================================================
+  // Bounds
+  // ==========================================================================
+  //
+  // The ISR queues at most TX_BURST commands and drains at most
+  // RX_BURST bytes per invocation. Both are FIXED, which is what makes
+  // the routine's cost independent of transfer length: a 256-byte write
+  // costs 32 short invocations rather than one long one, and no single
+  // interrupt holds a CPU for the length of a bus transaction. The
+  // level re-asserts for the remainder, so nothing is lost by stopping
+  // early — that is the property a level-triggered source gives, and
+  // the reason a bounded handler is correct here rather than merely
+  // safe.
+
+  pub let DW_IRQ_TX_BURST : u64 = 8
+  pub let DW_IRQ_RX_BURST : u64 = 8
+
+  // How long the timeout path will wait for an in-flight ISR to leave
+  // the row before it takes the row apart. The ISR body is a fixed
+  // number of register accesses with no lock, no allocation and no
+  // blocking call — the build-asserted allowlist is what makes that
+  // true rather than hoped — so it completes in bounded time on its own
+  // CPU. This bound is three orders of magnitude beyond that, and its
+  // exhaustion means a CPU has stopped executing, at which point
+  // nothing else is safe either.
+  pub let DW_IRQ_GATE_SPIN : u64 = 65536
+
+  // ==========================================================================
+  // Failure taxonomy
+  // ==========================================================================
+
+  pub let I2C_IRQ_OK        : u64 = 0
+  pub let I2C_IRQ_BUSY      : u64 = 0xFFFFFFE6
+  pub let I2C_IRQ_NOT_OWNER : u64 = 0xFFFFFFE5
+  pub let I2C_IRQ_BAD_STATE : u64 = 0xFFFFFFE4
+  pub let I2C_IRQ_BAD_IDX   : u64 = 0xFFFFFFE3
+
+  // ==========================================================================
+  // Storage. Confined to this object; tools/build.sh asserts it.
+  // ==========================================================================
+
+  pub let mut _dw_irq_ctx        : [u64; 128] = uninit @align(64)
+  pub let mut _dw_irq_seam_owner : u64 = 0
+
+  // ==========================================================================
+  // dw_irq_reset() -> ()
+  // ==========================================================================
+
+  pub let dw_irq_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M5-005 (#1074): return every FSM context and the seam claim to empty. The whole table is zeroed rather than just the state words, for the reason lpss_i2c_table_reset zeroes whole rows: a row that kept its rbuf pointer while its state said FREE would let a stray ISR -- one delivered for a transfer that has already been torn down -- write a received byte into memory the caller has long since released. The claim cell is cleared last, so no observer can find the claim free while a row still describes a transfer. Leaf; counted loop. Labels prefixed dwq_rs_.",
+      block: {
+        lea r10, [rip + _dw_irq_ctx];
+        xor rax, rax;
+        xor rcx, rcx;
+      dwq_rs_clear:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 128;
+        jb  dwq_rs_clear;
+        lea r10, [rip + _dw_irq_seam_owner];
+        mov [r10 + 0], rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // dw_irq_row(idx) -> row address | 0
+  //
+  // The single place row address arithmetic happens.
+  // ==========================================================================
+
+  pub let dw_irq_row : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M5-005 (#1074): resolve a controller index to the address of its 128-byte FSM context, or 0 out of range. Returning an ADDRESS is what lets dw_isr.o -- which tools/build.sh forbids from relocating against _dw_irq_ctx -- reach the row through one allowlisted call rather than through a dozen field accessors, each of which would be another call target to justify. The confinement argument is unaffected: the table has one writer object for the purposes of the linker, and the ISR's writes are exactly the ones this file's ownership protocol assigns to it. Unlike lpss_i2c_row there is no liveness bit -- every controller index has a context, whose state word says whether anything is in it, and folding liveness into the address would give the ISR two different ways to learn the same fact. 128 = shl 7. Leaf. Labels prefixed dwq_row_.",
+      block: {
+        cmp rdi, 8;                      // LPSS_I2C_MAX_CTRL
+        jae dwq_row_none;
+        mov rax, rdi;
+        shl rax, 7;
+        lea r10, [rip + _dw_irq_ctx];
+        add rax, r10;
+        ret;
+      dwq_row_none:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Observers
+  // ==========================================================================
+
+  pub let dw_irq_field : (u64, u64) -> u64 !{mem} @{} =
+    fn (idx: u64, field: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M5-005 (#1074): bounds-checked read of one FSM context field. Both guards precede all address arithmetic. This is a NON-ATOMIC read and is for observation only -- the witness, and a future diagnostic dump; nothing in the transfer path learns anything through it, because a field read without the state word that says who owns it is a value with no meaning attached. One push (rbx) restores rsp%16 to 0 at the nested call. Labels prefixed dwq_fd_.",
+      block: {
+        push rbx;
+        cmp rsi, 16;                     // DW_IRQ_F_MAX
+        jae dwq_fd_zero;
+        mov rbx, rsi;
+        call dw_irq_row;
+        cmp rax, 0;
+        je  dwq_fd_zero;
+        mov rax, [rax + rbx * 8];
+        pop rbx;
+        ret;
+      dwq_fd_zero:
+        xor rax, rax;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let dw_irq_state : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M5-005 (#1074): the FSM state of one controller's context, read atomically. Atomically and not through dw_irq_field, because this is the one field a caller may read while ANOTHER context owns the row, and it is the field whose value licenses reading the others. A naturally aligned qword load is single-copy-atomic on x86_64 (SDM Vol 3A 8.1.1), so no LOCK is needed for the read itself; the ordering that makes the rest of the row safe to read afterwards comes from the LOCK-prefixed store that published the terminal state. Three pushes (rbx, r12, r13) leave rsp%16 == 0 at both nested calls -- an ODD number, because entry rsp%16 is 8. Labels prefixed dwq_st_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        call dw_irq_row;
+        cmp rax, 0;
+        je  dwq_st_free;
+        mov rdi, rax;
+        call atomic_load_u64;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      dwq_st_free:
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let dw_irq_owner : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M5-005 (#1074): the controller currently holding the seam claim, biased by one so that zero means free -- controller 0 is a real controller and a bare index could not say 'nobody'. Leaf load.",
+      block: {
+        lea r10, [rip + _dw_irq_seam_owner];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let i2c_xfer_bytes_done : (u64) -> u64 !{mem} @{} =
+    fn (ctrl_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M5-005 (#1074): how many DATA BYTES OF THE LAST TRANSFER WERE ACKNOWLEDGED BY THE DEVICE. This is the number a caller needs after a data NACK and cannot compute from anything else it can see. It is not the number of bytes the driver pushed: DesignWare FLUSHES AND HOLDS THE TX FIFO on an abort, so bytes that were queued but had not yet reached the wire are discarded, and the byte that was actually NACKed reached the wire but was not acknowledged. The ISR therefore computes pushed - IC_TXFLR - 1 at the moment of the abort, which is the only moment IC_TXFLR still describes the aborted transfer. After an address NACK it is zero by construction; after a clean transfer it is the full write length. A caller that assumed 'all of it' after a data NACK would leave a device holding a half-applied multi-byte register write and believe otherwise. One push. Labels prefixed dwq_bd_.",
+      block: {
+        push rbx;
+        mov rsi, 11;                     // DW_IRQ_F_LANDED
+        call dw_irq_field;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let dw_irq_nack_phase : (u64) -> u64 !{mem} @{} =
+    fn (ctrl_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M5-005 (#1074): whether the last abort was at the address phase, in the data phase, or neither. The error code already distinguishes the two NACKs; this is the same fact in the form a dispatcher wants -- 'was anybody there' as a value rather than as a comparison against a code -- and it is what a probe loop tests. One push.",
+      block: {
+        push rbx;
+        mov rsi, 10;                     // DW_IRQ_F_PHASE
+        call dw_irq_field;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let dw_irq_isr_calls : (u64) -> u64 !{mem} @{} =
+    fn (ctrl_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M5-005 (#1074): how many times the service routine did WORK for the last transfer -- invocations that found the line asserted, not invocations that were made. That distinction is what makes the number a measurement of interrupt load rather than of how eagerly something called the handler, and interrupt load is exactly the quantity the TX_EMPTY storm shows up in: a correct transfer needs two or three service events whatever its length, and one that leaves TX_EMPTY unmasked needs one per EOI until the STOP lands. The witness asserts a hard ceiling on it, and asserts separately that the ceiling is violated when the mask is put back by hand -- a bound nothing can breach is a bound that proves nothing. One push.",
+      block: {
+        push rbx;
+        mov rsi, 12;                     // DW_IRQ_F_CALLS
+        call dw_irq_field;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let dw_irq_masked_at : (u64) -> u64 !{mem} @{} =
+    fn (ctrl_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M5-005 (#1074): how many commands had been queued when TX_EMPTY was masked, or 0 if it never was. The claim 'TX_EMPTY is masked at the last-queued command and not before' is a statement about WHICH command, and only a position can express it: a witness that checked merely that the mask ended up correct would pass a driver that masked TX_EMPTY at the FIRST byte and then took a TX FIFO stall it could no longer be told about. One push.",
+      block: {
+        push rbx;
+        mov rsi, 13;                     // DW_IRQ_F_MASKAT
+        call dw_irq_field;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let dw_irq_last_abort : (u64) -> u64 !{mem} @{} =
+    fn (ctrl_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M5-005 (#1074): the raw IC_TX_ABRT_SOURCE word of this controller's last aborted interrupt-driven transfer. The module-wide i2c_xfer_last_abort in dw_xfer.pdx keeps the same fact for the polled engine but keeps only ONE of them, which is right for a single-writer diagnostic and wrong here: an ISR can abort controller B's transfer while a thread is still reading the reason controller A's failed. Per-controller, because the FSM context already is. One push.",
+      block: {
+        push rbx;
+        mov rsi, 14;                     // DW_IRQ_F_ABRT
+        call dw_irq_field;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dw_irq_claim(ctrl_idx) -> 0 | I2C_IRQ_BUSY | I2C_IRQ_BAD_IDX
+  //
+  // THE SINGLE-OWNER GATE, shared by both engines.
+  // ==========================================================================
+
+  pub let dw_irq_claim : (u64) -> u64 !{mem} @{} =
+    fn (ctrl_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M5-005 (#1074): take the transfer claim, or refuse. One atomic CAS of _dw_irq_seam_owner from 0 to ctrl_idx+1; a failure means somebody else -- another CPU, either engine, possibly another controller -- is transacting, and the caller is refused I2C_IRQ_BUSY rather than queued. Refusing rather than queueing is deliberate: a queue in a driver with no wait channel is a spin, a spin in a path that a device driver may call from anywhere is a place a system deadlocks, and 'the bus is busy, come back' is a fact the caller can act on. THE CLAIM IS GLOBAL RATHER THAN PER-CONTROLLER because the register seam has ONE binding kernel-wide (dw_io.pdx _dw_io_win_slot); a per-controller claim would let controller A's thread and controller B's ISR each repoint the seam under the other, and each would then read the other's registers through a capability that legitimately covers them. It is the honest consequence of the seam's shape, and it is what lets the ISR assume that a row it finds ARMED belongs to the controller the seam is pointed at. Three pushes (rbx, r12, r13) leave rsp%16 == 0 at both nested calls -- an ODD number, because entry rsp%16 is 8. Labels prefixed dwq_cl_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        call dw_irq_row;
+        cmp rax, 0;
+        je  dwq_cl_badidx;
+
+        lea rdi, [rip + _dw_irq_seam_owner];
+        xor rsi, rsi;                    // expected: free
+        mov rdx, r12;
+        add rdx, 1;                      // new: ctrl+1
+        call atomic_cas_u64;
+        cmp rax, 0;
+        jne dwq_cl_busy;
+
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      dwq_cl_busy:
+        mov rax, 0xFFFFFFE6;             // I2C_IRQ_BUSY
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      dwq_cl_badidx:
+        mov rax, 0xFFFFFFE3;             // I2C_IRQ_BAD_IDX
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dw_irq_release(ctrl_idx) -> 0 | I2C_IRQ_NOT_OWNER
+  // ==========================================================================
+
+  pub let dw_irq_release : (u64) -> u64 !{mem} @{} =
+    fn (ctrl_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M5-005 (#1074): give the transfer claim back. The state returns to FREE and the OUTCOME FIELDS DO NOT -- err, nack_phase, landed and the abort source survive, which is what lets a caller ask 'how many bytes landed' after the call that told it a data NACK had happened. The terminal state itself is therefore not observable after a completed transfer, and that is correct rather than a gap: 'this row is FREE' and 'the last transfer on it ended DONE' are different facts, and only the first is a statement about the row's availability. A witness that wants to see DONE observes it between submission and completion, which is what i2c_xfer_irq_begin and i2c_xfer_irq_finish exist to allow. THE ORDER IS THE POINT: the row's state is returned to FREE first and the claim is released second, because the reverse order leaves a window in which a new owner has the claim while the old row still says ARMED -- and an interrupt arriving in that window would be serviced against a transfer that has already been reported to its caller, writing into a buffer that caller may already have released. Releasing the claim is itself the CAS ctrl+1 -> 0, so a caller that does not hold it is refused I2C_IRQ_NOT_OWNER rather than freeing somebody else's transfer; a stray release is a bug that would otherwise present as two owners at once, which is the one thing this cell exists to prevent. Three pushes (rbx, r12, r13) leave rsp%16 == 0 at every nested call. Labels prefixed dwq_rl_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        call dw_irq_row;
+        cmp rax, 0;
+        je  dwq_rl_notowner;
+        mov r13, rax;
+
+        mov rdi, r13;
+        xor rsi, rsi;                    // DW_IRQ_ST_FREE
+        call atomic_store_u64;
+        mov rdi, r13;
+        add rdi, 8;                      // gate
+        xor rsi, rsi;
+        call atomic_store_u64;
+
+        lea rdi, [rip + _dw_irq_seam_owner];
+        mov rsi, r12;
+        add rsi, 1;                      // expected: us
+        xor rdx, rdx;                    // new: free
+        call atomic_cas_u64;
+        mov r11, r12;
+        add r11, 1;
+        cmp rax, r11;
+        jne dwq_rl_notowner;
+
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      dwq_rl_notowner:
+        mov rax, 0xFFFFFFE5;             // I2C_IRQ_NOT_OWNER
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dw_irq_prepare(ctrl_idx, wbuf, wlen, rbuf, rlen) -> rc
+  //
+  // Fill the context. Thread context owns the row exclusively here.
+  // ==========================================================================
+
+  pub let dw_irq_prepare : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (ctrl_idx: u64, wbuf: u64, wlen: u64, rbuf: u64, rlen: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M5-005 (#1074): describe one transfer into the controller's FSM context. FREE -> SETUP is itself a CAS, not a store, so two threads that somehow both hold the claim -- which the claim CAS already forbids, but a second independent check costs one instruction and turns a protocol violation into a refusal instead of a corruption -- cannot both believe they are filling the row. Every ISR-owned cursor is zeroed here rather than at completion, because a transfer must not be able to inherit the previous one's progress: a row whose rdone survived would have its first RX_FULL write the new transfer's byte past the end of the new buffer. ONE DESCRIPTOR EXPRESSES ALL THREE OPERATIONS -- write is (wlen>0, rlen=0), read is (wlen=0, rlen>0), combined write-then-read is both -- which is why there is one FSM and not three: the repeated START, the STOP placement and the abort handling are stated once, so a combined transfer cannot acquire a bug the simple ones do not have. Six pushes (48 B) + sub rsp, 8 gives rsp%16 == 0 at every nested call. Labels prefixed dwq_pp_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // ctrl
+        mov rbp, rsi;                    // wbuf
+        mov r12, rdx;                    // wlen
+        mov r13, rcx;                    // rbuf
+        mov r14, r8;                     // rlen
+
+        mov rdi, rbx;
+        call dw_irq_row;
+        cmp rax, 0;
+        je  dwq_pp_badidx;
+        mov r15, rax;
+
+        mov rdi, r15;
+        xor rsi, rsi;                    // expected FREE
+        mov rdx, 1;                      // new SETUP
+        call atomic_cas_u64;
+        cmp rax, 0;
+        jne dwq_pp_badstate;
+
+        xor rax, rax;
+        mov [r15 + 8],   rax;            // gate
+        mov [r15 + 48],  rax;            // wcmd
+        mov [r15 + 56],  rax;            // rcmd
+        mov [r15 + 64],  rax;            // rdone
+        mov [r15 + 72],  rax;            // err
+        mov [r15 + 80],  rax;            // nack phase
+        mov [r15 + 88],  rax;            // landed
+        mov [r15 + 96],  rax;            // isr calls
+        mov [r15 + 104], rax;            // masked_at
+        mov [r15 + 112], rax;            // abort source
+
+        mov [r15 + 16],  rbp;            // wbuf
+        mov [r15 + 24],  r12;            // wlen
+        mov [r15 + 32],  r13;            // rbuf
+        mov [r15 + 40],  r14;            // rlen
+        mov [r15 + 120], rbx;            // ctrl
+
+        xor rax, rax;
+        jmp dwq_pp_out;
+
+      dwq_pp_badstate:
+        mov rax, 0xFFFFFFE4;             // I2C_IRQ_BAD_STATE
+        jmp dwq_pp_out;
+      dwq_pp_badidx:
+        mov rax, 0xFFFFFFE3;             // I2C_IRQ_BAD_IDX
+
+      dwq_pp_out:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dw_irq_arm(ctrl_idx) -> rc
+  //
+  // SOFTWARE ARM FIRST, HARDWARE ARM SECOND.
+  // ==========================================================================
+
+  pub let dw_irq_arm : (u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (ctrl_idx: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R30.M5-005 (#1074): hand the context to interrupt context and then let the controller raise its line. THE ORDER IS LOAD-BEARING AND IS NOT THE OBVIOUS ONE. Arming the hardware first would open a window in which the controller can assert its line -- from a condition left by bring-up, or immediately, since TX_EMPTY is a level and is true the moment the core is enabled -- while the state word still says SETUP, and the ISR would decline it. Nothing would break, because the level re-asserts, but the ordering would be true by accident. Arming the software first makes it true by construction: CAS(SETUP -> ARMED) is a LOCK-prefixed read-modify-write and therefore a full fence (SDM Vol 3A 8.1.2, 8.2.5), so every plain store dw_irq_prepare made is globally visible before any CPU can observe ARMED, and the FIRST interrupt the controller ever raises finds a completely published row. The mask written is DW_IRQ_MASK_XFER -- TX_EMPTY, RX_FULL, TX_ABRT, STOP_DET -- and no others: RX_UNDER, TX_OVER and the rest describe conditions this engine cannot produce, and unmasking a condition nothing services is how a line ends up asserted with nobody to quiet it. A seam refusal here leaves the row ARMED with the hardware not armed, which would hang; so it closes the transfer through the shared dw_irq_close rather than returning and hoping. Four pushes + sub rsp, 8 gives rsp%16 == 0 at every nested call. Labels prefixed dwq_am_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov r12, rdi;
+        call dw_irq_row;
+        cmp rax, 0;
+        je  dwq_am_badidx;
+        mov r13, rax;
+
+        // ---- software arm ----
+        mov rdi, r13;
+        mov rsi, 1;                      // expected SETUP
+        mov rdx, 2;                      // new ARMED
+        call atomic_cas_u64;
+        cmp rax, 1;
+        jne dwq_am_badstate;
+
+        // ---- hardware arm ----
+        mov rdi, 0x30;                   // IC_INTR_MASK
+        mov rsi, 0x254;                  // DW_IRQ_MASK_XFER
+        call dw_io_write32;
+        cmp rax, 0;
+        jne dwq_am_iofault;
+
+        xor rax, rax;
+        jmp dwq_am_out;
+
+      dwq_am_iofault:
+        mov rdi, r12;
+        mov rsi, 0xFFFFFF50;             // LPSS_I2C_IO_FAULT
+        xor rdx, rdx;
+        xor rcx, rcx;
+        call dw_irq_close;
+        mov rax, 0xFFFFFF50;
+        jmp dwq_am_out;
+
+      dwq_am_badstate:
+        mov rax, 0xFFFFFFE4;             // I2C_IRQ_BAD_STATE
+        jmp dwq_am_out;
+      dwq_am_badidx:
+        mov rax, 0xFFFFFFE3;             // I2C_IRQ_BAD_IDX
+
+      dwq_am_out:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dw_irq_close(ctrl_idx, err, nack_phase, landed) -> 1 if we published
+  //
+  // THE ONLY WAY A TRANSFER ENDS, from either context.
+  // ==========================================================================
+
+  pub let dw_irq_close : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (ctrl_idx: u64, err: u64, nack_phase: u64, landed: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R30.M5-005 (#1074): end a transfer, exactly once, from whichever context got there first. Two contexts can decide simultaneously -- the ISR on a STOP_DET or an abort, the waiting thread on an exhausted budget -- and if both simply wrote the outcome the caller would be told whichever story stored second, i.e. 'timed out' about a transfer that completed. So terminating is an EXCLUSIVE CLAIM: CAS(RUNNING -> CLOSING), else CAS(ARMED -> CLOSING); exactly one context can win, only the winner writes err, nack_phase and landed, and the loser returns 0 having touched nothing. CLOSING exists as a distinct state rather than going straight to DONE/ABORT precisely so the outcome fields are written under exclusion and published afterwards -- a single CAS to the terminal state would publish before the fields were written and let a waiter read the previous transfer's error. IC_INTR_MASK is dropped to zero BEFORE the terminal state is published, so no interrupt can be raised for a transfer that already has an answer; a controller asserting a line for a completed transfer is a storm with no service routine willing to touch it. The terminal store is a plain atomic_store, which is enough: x86 TSO orders it after the three field stores (SDM Vol 3A 8.2.2), giving release semantics, and a waiter that has seen DONE has therefore seen everything that produced it. Both callers use THIS function -- there is one copy of how a transfer ends, for the same reason there is one copy of what a NACK means. Six pushes + sub rsp, 8 gives rsp%16 == 0 at every nested call. Labels prefixed dwq_cs_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // ctrl
+        mov rbp, rsi;                    // err
+        mov r12, rdx;                    // nack phase
+        mov r13, rcx;                    // landed
+
+        mov rdi, rbx;
+        call dw_irq_row;
+        cmp rax, 0;
+        je  dwq_cs_lost;
+        mov r14, rax;
+
+        // ---- exclusive terminal claim ----
+        mov rdi, r14;
+        mov rsi, 3;                      // RUNNING
+        mov rdx, 4;                      // CLOSING
+        call atomic_cas_u64;
+        cmp rax, 3;
+        je  dwq_cs_won;
+
+        mov rdi, r14;
+        mov rsi, 2;                      // ARMED
+        mov rdx, 4;                      // CLOSING
+        call atomic_cas_u64;
+        cmp rax, 2;
+        jne dwq_cs_lost;
+
+      dwq_cs_won:
+        mov [r14 + 72], rbp;             // err
+        mov [r14 + 80], r12;             // nack phase
+        mov [r14 + 88], r13;             // landed
+
+        // The line goes quiet before anyone can be told the transfer is
+        // over.
+        mov rdi, 0x30;                   // IC_INTR_MASK
+        xor rsi, rsi;                    // DW_IRQ_MASK_NONE
+        call dw_io_write32;
+
+        mov rdi, r14;
+        cmp rbp, 0;
+        je  dwq_cs_done;
+        mov rsi, 6;                      // DW_IRQ_ST_ABORT
+        jmp dwq_cs_publish;
+      dwq_cs_done:
+        mov rsi, 5;                      // DW_IRQ_ST_DONE
+      dwq_cs_publish:
+        call atomic_store_u64;
+        mov rax, 1;
+        jmp dwq_cs_out;
+
+      dwq_cs_lost:
+        xor rax, rax;
+
+      dwq_cs_out:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dw_irq_wait(ctrl_idx, budget) -> rc
+  //
+  // The requesting thread's half. It reads `state` and NOTHING ELSE in
+  // the row until `state` says terminal.
+  // ==========================================================================
+
+  pub let dw_irq_wait : (u64, u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (ctrl_idx: u64, budget: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R30.M5-005 (#1074): wait, bounded, for the FSM to reach a terminal state, and SERVICE THE CONTROLLER WHILE WAITING. The self-service call is what makes this engine usable before an interrupt vector is bound -- which is today, and which is early boot forever -- without a second implementation of anything: the loop calls dw_i2c_isr_body, the same function an interrupt trampoline will call, so the interrupt-driven path and the boot path cannot diverge because they are the same code. When a vector IS bound both callers are live at once, and the ISR's own gate makes the loser of that race return immediately rather than spin; the loop then simply finds the state already terminal. The thread reads ONLY the state word until it is terminal, which is the whole of the ownership discipline on this side. On exhaustion it does not merely return: it closes the transfer through the same dw_irq_close the ISR uses, so the row cannot be left ARMED with its claim held and an ISR still writing into a buffer this function is about to hand back. Before closing it waits, bounded, for the gate -- the ONE place a context waits for the gate rather than declining it, because it is about to return the caller's buffer and the ISR writes into that buffer. I2C_XFER_TIMEOUT_STOP is reused rather than a new code minted, and it is exactly right: the terminal states are reached by STOP_DET or by an abort, so a transfer that reached neither is one whose STOP never appeared -- which is what that code has meant since #1073, and which is the one timeout that means the bus is probably still held. Six pushes + sub rsp, 8 gives rsp%16 == 0 at every nested call. Labels prefixed dwq_wt_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // ctrl
+        mov rbp, rsi;                    // budget
+        cmp rbp, 0;
+        jne dwq_wt_budget_ok;
+        mov rbp, 4096;                   // I2C_XFER_BUDGET_DEFAULT
+      dwq_wt_budget_ok:
+
+        mov rdi, rbx;
+        call dw_irq_row;
+        cmp rax, 0;
+        je  dwq_wt_badidx;
+        mov r12, rax;
+
+        xor r13, r13;                    // iterations
+
+      dwq_wt_next:
+        mov rdi, r12;
+        call atomic_load_u64;
+        cmp rax, 5;                      // DW_IRQ_ST_TERMINAL
+        jae dwq_wt_terminal;
+
+        cmp r13, rbp;
+        jae dwq_wt_timeout;
+
+        mov rdi, rbx;
+        call dw_i2c_isr_body;
+
+        add r13, 1;
+        jmp dwq_wt_next;
+
+      dwq_wt_timeout:
+        // Wait for any in-flight service routine to leave the row. The
+        // ISR body is a fixed number of register accesses with no lock,
+        // no allocation and no blocking call -- the build-asserted
+        // allowlist is what makes that structural -- so it drains in
+        // bounded time on its own CPU.
+        xor r14, r14;
+      dwq_wt_gate:
+        mov rdi, r12;
+        add rdi, 8;
+        call atomic_load_u64;
+        cmp rax, 0;
+        je  dwq_wt_gate_free;
+        add r14, 1;
+        mov r15, 65536;                  // DW_IRQ_GATE_SPIN
+        cmp r14, r15;
+        jb  dwq_wt_gate;
+
+      dwq_wt_gate_free:
+        mov rdi, rbx;
+        mov rsi, 0xFFFFFF64;             // I2C_XFER_TIMEOUT_STOP
+        xor rdx, rdx;
+        mov rcx, [r12 + 24];             // landed: whatever the write phase
+        call dw_irq_close;                //         had already queued
+        // Whoever won the close, the published error is the answer.
+
+      dwq_wt_terminal:
+        mov rax, [r12 + 72];             // err
+        jmp dwq_wt_out;
+
+      dwq_wt_badidx:
+        mov rax, 0xFFFFFFE3;             // I2C_IRQ_BAD_IDX
+
+      dwq_wt_out:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // i2c_xfer_irq_begin(slave_slot, wbuf, wlen, rbuf, rlen) -> ctrl | error
+  //
+  // NO ADDRESS PARAMETER. tools/build.sh pins this literal signature.
+  // ==========================================================================
+
+  pub let i2c_xfer_irq_begin : (u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (slave_slot: u64, wbuf: u64, wlen: u64, rbuf: u64, rlen: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R30.M5-005 (#1074): submit one interrupt-driven transfer and return the controller servicing it. THE PARAMETER LIST HAS NO ADDRESS and tools/build.sh pins this literal line, exactly as it pins the four polled entry points: the device addressed is whichever one the capability in slave_slot names, resolved inside i2c_xfer_set_target from the row and from nowhere a caller can reach. An interrupt-driven path that took an address would spend the property #1071 and #1073 were built to have. Rights are derived from the SHAPE of the transfer and checked by the SAME i2c_xfer_resolve the polled engine uses -- INVOKE always, WRITE when there are bytes to send, READ when there are bytes to receive -- so a combined transfer needs both, because its command byte moves the device's register pointer and that is a state change a read-only holder must not be able to make. Everything resolve checks it checks here too: kind, the three rights, live rows, an attached controller, the WEDGE LATCH, and READY -- one copy, so a wedged bus fails fast on this path for the same reason and with the same code as on the other. ORDER: validate lengths, resolve (no registers touched), CLAIM, retarget, publish, arm. The claim comes before the first register write and after every refusal that does not need one, so a refused transfer never takes the bus away from a caller that could have used it. Every failure after the claim releases it before returning, through a single scratch slot that preserves the code across the release. Six pushes + sub rsp, 8 gives rsp%16 == 0 at every nested call; [rsp+0] holds the code across dw_irq_release. Labels prefixed dwq_bg_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // slave slot
+        mov rbp, rsi;                    // wbuf
+        mov r12, rdx;                    // wlen
+        mov r13, rcx;                    // rbuf
+        mov r14, r8;                     // rlen
+
+        // ---- lengths ----
+        mov rax, r12;
+        add rax, r14;
+        cmp rax, 0;
+        je  dwq_bg_badlen;
+        cmp r12, 0;
+        je  dwq_bg_chk_r;
+        mov rdi, r12;
+        call i2c_xfer_len_valid;
+        cmp rax, 1;
+        jne dwq_bg_badlen;
+      dwq_bg_chk_r:
+        cmp r14, 0;
+        je  dwq_bg_rights;
+        mov rdi, r14;
+        call i2c_xfer_len_valid;
+        cmp rax, 1;
+        jne dwq_bg_badlen;
+
+        // ---- rights from the shape of the transfer ----
+      dwq_bg_rights:
+        mov r15, 0x008;                  // R_I2C_SLAVE_INVOKE
+        cmp r12, 0;
+        je  dwq_bg_no_w;
+        or  r15, 0x002;                  // R_I2C_SLAVE_WRITE
+      dwq_bg_no_w:
+        cmp r14, 0;
+        je  dwq_bg_no_r;
+        or  r15, 0x001;                  // R_I2C_SLAVE_READ
+      dwq_bg_no_r:
+
+        mov rdi, rbx;
+        mov rsi, r15;
+        call i2c_xfer_resolve;
+        mov r11, 0xFFFFFF30;             // I2C_XFER_ERR_FLOOR
+        cmp rax, r11;
+        jae dwq_bg_out;
+        mov r15, rax;                    // ctrl
+
+        // ---- claim: the first thing that can block another caller ----
+        mov rdi, r15;
+        call dw_irq_claim;
+        cmp rax, 0;
+        jne dwq_bg_out;
+
+        mov rdi, r15;
+        mov rsi, rbx;
+        call i2c_xfer_set_target;
+        cmp rax, 0;
+        jne dwq_bg_rel;
+
+        mov rdi, r15;
+        mov rsi, rbp;
+        mov rdx, r12;
+        mov rcx, r13;
+        mov r8,  r14;
+        call dw_irq_prepare;
+        cmp rax, 0;
+        jne dwq_bg_rel;
+
+        mov rdi, r15;
+        call dw_irq_arm;
+        cmp rax, 0;
+        jne dwq_bg_rel;
+
+        mov rax, r15;
+        jmp dwq_bg_out;
+
+      dwq_bg_rel:
+        mov [rsp + 0], rax;
+        mov rdi, r15;
+        call dw_irq_release;
+        mov rax, [rsp + 0];
+        jmp dwq_bg_out;
+
+      dwq_bg_badlen:
+        mov rax, 0xFFFFFF67;             // I2C_XFER_BAD_LEN
+
+      dwq_bg_out:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // i2c_xfer_irq_finish(ctrl_idx, budget) -> rc
+  // ==========================================================================
+
+  pub let i2c_xfer_irq_finish : (u64, u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (ctrl_idx: u64, budget: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R30.M5-005 (#1074): collect the result of a submitted transfer and give the bus back. The claim is checked before the wait rather than only released after it, so a caller that finishes a controller it never began is refused I2C_IRQ_NOT_OWNER instead of freeing somebody else's in-flight transfer -- the same failure dw_irq_release refuses, caught one level earlier where the caller can still be told which call was wrong. The claim is released on EVERY exit including the timeout, because a claim held past a failed transfer converts one stuck device into a controller nobody else can ever use; the wedge latch is the mechanism for a bus that really is unusable, and it is reached through i2c_bus_recover, not by leaking a claim. The return value is the FSM's own recorded error rather than anything computed here, so the code a caller sees is the code the context that actually ended the transfer chose. Five pushes leave rsp%16 == 0 at every nested call. Labels prefixed dwq_fn_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                    // ctrl
+        mov r13, rsi;                    // budget
+
+        call dw_irq_owner;
+        mov r11, r12;
+        add r11, 1;
+        cmp rax, r11;
+        jne dwq_fn_notowner;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        call dw_irq_wait;
+        mov r14, rax;
+
+        mov rdi, r12;
+        call dw_irq_release;
+
+        mov rax, r14;
+        jmp dwq_fn_out;
+
+      dwq_fn_notowner:
+        mov rax, 0xFFFFFFE5;             // I2C_IRQ_NOT_OWNER
+
+      dwq_fn_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // The three public transfers. Signatures pinned by tools/build.sh.
+  // ==========================================================================
+
+  pub let i2c_xfer_irq_write : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (slave_slot: u64, buf: u64, len: u64, budget: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R30.M5-005 (#1074): an interrupt-driven addressed write of len bytes terminated by a STOP. NO ADDRESS PARAMETER; the signature line is pinned. Requires INVOKE|WRITE, derived inside i2c_xfer_irq_begin from rlen == 0, and refused by the same i2c_xfer_resolve that refuses the polled write -- so a read-only capability gets I2C_XFER_NO_WRITE_RIGHT here exactly as it does there, before any register is touched. This is a two-line composition of begin and finish deliberately: separating submission from completion is what lets a caller with more than one controller keep several transfers in flight, and what lets the witness interpose a faithful level-triggered delivery pump between the two and measure the resulting interrupt load. Six pushes + sub rsp, 8 gives rsp%16 == 0 at every nested call. Labels prefixed dwq_wr_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+        mov r12, rdx;
+        mov r13, rcx;
+
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r12;
+        xor rcx, rcx;                    // no read phase
+        xor r8,  r8;
+        call i2c_xfer_irq_begin;
+        mov r11, 0xFFFFFF30;
+        cmp rax, r11;
+        jae dwq_wr_out;
+
+        mov rdi, rax;
+        mov rsi, r13;
+        call i2c_xfer_irq_finish;
+
+      dwq_wr_out:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let i2c_xfer_irq_read : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (slave_slot: u64, buf: u64, len: u64, budget: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R30.M5-005 (#1074): an interrupt-driven addressed read of len bytes terminated by a STOP. NO ADDRESS PARAMETER; signature pinned. Requires INVOKE|READ. Unlike the polled engine, which interleaves one pushed read command with one popped byte because it must not model the core's RX FIFO depth, the interrupt engine does not have to guess either: it queues read commands up to its fixed burst and pops only bytes for commands it has ALREADY QUEUED (the rdone < rcmd guard in dw_isr.pdx), so it can never pop a byte that no command asked for and can never outrun a shallow FIFO -- IC_STATUS.RFNE is still consulted before every pop. Six pushes + sub rsp, 8. Labels prefixed dwq_rd_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+        mov r12, rdx;
+        mov r13, rcx;
+
+        mov rdi, rbx;
+        xor rsi, rsi;                    // no write phase
+        xor rdx, rdx;
+        mov rcx, rbp;
+        mov r8,  r12;
+        call i2c_xfer_irq_begin;
+        mov r11, 0xFFFFFF30;
+        cmp rax, r11;
+        jae dwq_rd_out;
+
+        mov rdi, rax;
+        mov rsi, r13;
+        call i2c_xfer_irq_finish;
+
+      dwq_rd_out:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let i2c_xfer_irq_write_read : (u64, u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (slave_slot: u64, wbuf: u64, wlen: u64, rbuf: u64, rlen: u64, budget: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R30.M5-005 (#1074): interrupt-driven write-then-REPEATED-START-then-read. NO ADDRESS PARAMETER; signature pinned. Requires INVOKE|READ|WRITE. The repeated START is the reason this is one operation and not two, and the reason is unchanged by the delivery mechanism: a STOP between the register-pointer write and the read releases the bus, at which point another master may take it or the part may time out its own pointer, and the read returns a different register's contents with no error anywhere. On this path the guarantee is stronger than a promise not to emit a STOP -- the whole transaction is ONE FSM context, so there is no point at which the bus could be handed back even if a caller wanted it to be. The command flags are placed by the same rule as the polled engine's: no write-phase command carries STOP, the first read command carries RESTART, the last read command carries STOP. Six pushes + sub rsp, 8; the budget arrives in r9. Labels prefixed dwq_wrr_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+        mov r12, rdx;
+        mov r13, rcx;
+        mov r14, r8;
+        mov r15, r9;
+
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r12;
+        mov rcx, r13;
+        mov r8,  r14;
+        call i2c_xfer_irq_begin;
+        mov r11, 0xFFFFFF30;
+        cmp rax, r11;
+        jae dwq_wrr_out;
+
+        mov rdi, rax;
+        mov rsi, r15;
+        call i2c_xfer_irq_finish;
+
+      dwq_wrr_out:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}

@@ -8,7 +8,24 @@
 `src/kernel/core/drivers/i2c/xfer_schema.pdx`; engine in
 `src/kernel/core/drivers/i2c/dw_xfer.pdx`; boot witness `R30 LPSS I2C OK`.
 
-Companion: `design/drivers/lpss-i2c-controller.md` (#1072).
+Companion: `design/drivers/lpss-i2c-controller.md` (#1072), whose §12
+covers the interrupt-driven engine R30.M5-005 (#1074) added beside the
+polled one.
+
+**The schema is unchanged by #1074.** The four opcodes and both record
+layouts stay as specified here; the interrupt-driven engine adds kernel
+entry points (`i2c_xfer_irq_write` / `_read` / `_write_read`, plus the
+split `i2c_xfer_irq_begin` / `_finish`) with the SAME parameter shape
+and the same "no address, ever" pin, and reuses this document's failure
+taxonomy in full rather than minting a parallel one. The only new codes
+are the three `I2C_IRQ_*` facts the polled engine cannot state (busy,
+non-owner, impossible transition); in particular the interrupt path's
+completion timeout is this document's `I2C_XFER_TIMEOUT_STOP`, because
+its terminal states are reached by STOP_DET or by an abort and a
+transfer that reached neither is one whose STOP never appeared. One
+addition is worth naming: `i2c_xfer_bytes_done` answers how many data
+bytes a device ACKNOWLEDGED before a data NACK, which the reply record's
+`rd_len` never expressed for the write direction.
 
 ---
 

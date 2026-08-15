@@ -1,0 +1,484 @@
+// src/kernel/core/drivers/i2c/dw_isr.pdx — R30.M5-005 (#1074)
+//
+// The DesignWare I²C interrupt service routine.
+//
+// This file contains exactly one function, and that is a structural
+// decision rather than a stylistic one — see "The allowlist" below.
+// Same device, and the same reason, as `core/acpi/sci_isr.pdx`.
+//
+// -----------------------------------------------------------------------------
+// The four sources, and what each one means
+// -----------------------------------------------------------------------------
+//
+//   TX_ABRT   (bit 6)  the transfer was aborted. This includes every
+//                      NACK. It is handled FIRST and terminates the
+//                      transfer, because an aborted core FLUSHES AND
+//                      HOLDS its TX FIFO — TFNF never rises again — so
+//                      a handler that tried to push more first would
+//                      queue nothing and then report a FIFO problem
+//                      instead of the NACK that caused it.
+//   RX_FULL   (bit 2)  a received byte is waiting. Drained before the
+//                      TX phase, so that a STOP_DET arriving in the
+//                      same status word finds every byte accounted
+//                      for; the other order would report a short
+//                      transfer for a transfer that was not short.
+//   TX_EMPTY  (bit 4)  the TX FIFO wants more.
+//   STOP_DET  (bit 9)  the STOP reached the wire. The only non-error
+//                      terminator.
+//
+// -----------------------------------------------------------------------------
+// TX_EMPTY IS A LEVEL, AND THAT IS THE BUG THIS FILE IS MOSTLY ABOUT
+// -----------------------------------------------------------------------------
+//
+// TX_EMPTY is not raised when the FIFO drains. It is asserted for as
+// long as `TXFLR <= IC_TX_TL`, and bring-up programs `IC_TX_TL` to 0.
+// Once the last byte has left, that comparison is true forever.
+//
+// So a handler that unmasks TX_EMPTY and leaves it unmasked past its
+// last byte is re-entered on every EOI, indefinitely, until something
+// else ends the transfer. The transfer still completes — which is what
+// makes this bug so easy to ship: it produces no wrong data, no error
+// and no failed test, only a CPU that spends the microseconds between
+// the last byte and the STOP entirely in interrupt context, and on a
+// bus at Standard mode that is a long time.
+//
+// THE FIX IS ONE WRITE, AT ONE POINT: label `dwi_isr_tx_masked` below,
+// reached only when the command just pushed was the one carrying
+// DW_CMD_STOP, drops IC_INTR_MASK from DW_IRQ_MASK_XFER to
+// DW_IRQ_MASK_TAIL. That is the earliest instant at which the driver
+// has nothing left to send, and therefore the correct one: masking
+// earlier would blind the handler to a TX FIFO that had not accepted
+// everything, and masking later is the storm.
+//
+// The position is recorded in the context (`masked_at`) so the witness
+// can assert WHICH command it happened at rather than merely that the
+// mask ended up right — a driver that masked TX_EMPTY at the first
+// byte would leave the final mask identical and be wrong.
+//
+// -----------------------------------------------------------------------------
+// The allowlist
+// -----------------------------------------------------------------------------
+//
+// `tools/build.sh` reads `objdump -r` on this object and asserts that
+// the symbols it references are a SUBSET of an explicit list, with a
+// vacuity guard that fails the build if the object has no relocations
+// at all (which is what a gutted or inlined-away ISR would look like,
+// and would otherwise pass). It is a separate list from the SCI one and
+// widening either is a separate decision.
+//
+// Every symbol on it is bounded and non-blocking:
+//
+//   dw_irq_row            address arithmetic and a range check
+//   atomic_load_u64       one aligned load
+//   atomic_cas_u64        one LOCK CMPXCHG
+//   atomic_xchg_u64       one XCHG
+//   atomic_store_u64      one aligned store
+//   dw_i2c_select         two table reads and a slot store
+//   dw_io_read32          capability re-resolve + one MMIO load
+//   dw_io_write32         capability re-resolve + one MMIO store
+//   dw_xfer_check_abort   straight-line; three register accesses
+//   i2c_xfer_last_abort   one load
+//   dw_irq_close          two CAS attempts, three stores, one register
+//                         write; no loop
+//
+// None allocates, none takes a lock, none can block, none reaches an
+// interpreter or an IPC send. The routine's own two loops are counted
+// against fixed constants (DW_IRQ_TX_BURST, DW_IRQ_RX_BURST), so the
+// worst case is a fixed number of register accesses regardless of
+// transfer length — a 256-byte write costs thirty-two short
+// invocations, not one long one.
+//
+// -----------------------------------------------------------------------------
+// Why stopping early is correct and not merely safe
+// -----------------------------------------------------------------------------
+//
+// Every early exit here — burst exhausted, TX FIFO full, another CPU
+// holding the gate — leaves work undone. That is sound because the
+// DesignWare interrupt is a LEVEL: the condition that raised it is
+// still true, so the line is still asserted and the handler is called
+// again. A bounded handler on a level-triggered source loses nothing.
+// The same argument is what lets the gate exclude a concurrent
+// invocation by DECLINING rather than spinning, which is the only form
+// of exclusion an interrupt handler may use.
+//
+//   Reserved-label discipline: labels prefixed `dwi_isr_`.
+
+module DwIsr = structure {
+
+  // ============================================================================
+  // dw_i2c_isr_body(ctrl_idx) -> 1 if the controller was serviced, else 0
+  //
+  // Callable directly — which is what `dw_irq_wait` does while no
+  // interrupt vector is bound, and what the boot witness does — and
+  // from an interrupt entry stub once one is. It touches no
+  // interrupt-frame state of its own: the SysV callee-save contract is
+  // the whole of its interface, exactly as for `sci_isr_body`.
+  //
+  // It does not EOI. The SCI routine does, because it owns a line whose
+  // acknowledgement is part of the quiescing sequence; here the vector,
+  // its allocation and its acknowledgement belong to the
+  // KIND_HW_MSIX_VECTOR binding that R30.M6 will do, and an EOI issued
+  // by a routine that is currently being called from thread context
+  // would acknowledge an interrupt nobody delivered.
+  //
+  // Frame after the 6-push prologue and `sub rsp, 40`:
+  //   [rsp+0]  context row address
+  //   [rsp+8]  controller index
+  //   [rsp+16] masked interrupt status for this invocation
+  //   [rsp+24] spare
+  //   [rsp+32] spare
+  //
+  // rbx carries the row address across every nested call; r12 is the
+  // burst counter; r13/r14 are loop scratch reloaded after each call;
+  // rbp and r15 carry the command word and the is-last flag through the
+  // push sequence.
+  // ============================================================================
+
+  pub let dw_i2c_isr_body : (u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (ctrl_idx: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R30.M5-005 (#1074): the DesignWare I2C service routine, and the whole of the interrupt-driven transfer engine. Order of business, and every element of it is forced rather than chosen: (0) resolve the context row; (1) LOAD THE STATE WORD FIRST and return unless it is ARMED or RUNNING -- that single load is what keeps this routine out of a row whose owner is the requesting thread, and it is the reason the rest of the row needs no lock; (2) claim the row's gate with one atomic exchange and RETURN, not spin, if another CPU holds it, because a level-triggered source will call us again and a spinning interrupt handler is a deadlock waiting for a scheduler; (3) re-point the seam at this controller's window -- redundant while the transfer claim is global, and kept because it makes the routine correct rather than merely lucky if the seam ever becomes per-CPU; (4) read IC_INTR_STAT, which is raw status ANDed with the mask, so a quiet line costs one register read and no bookkeeping -- and DO NOT count that as service, which is what makes the invocation counter a measurement of interrupt load rather than of how often something called us; (5) TX_ABRT first, because an aborted core flushes and HOLDS its TX FIFO so TFNF never rises again, and a routine that tried to push first would spend its burst on a FIFO the abort had already closed and then report the wrong failure. The abort is decoded by dw_xfer_check_abort -- THE SAME FUNCTION THE POLLED ENGINE USES, which is what makes 'a NACK decodes identically either way' true by construction rather than by review, and which reads IC_CLR_TX_ABRT on every path and so leaves the controller usable. Address NACK and data NACK are kept apart: the first means nothing is there and lands zero bytes by definition; the second means a device answered and then gave up, and the caller needs the COUNT, which is pushed - IC_TXFLR - 1 because the abort flushed whatever had not yet reached the wire and the byte that was NACKed reached it without being acknowledged. IC_TXFLR is read at the abort because that is the only moment it still describes this transfer. (6) RX_FULL drains before TX fills, bounded by DW_IRQ_RX_BURST, popping only bytes for commands ALREADY QUEUED (rdone < rcmd) so a spurious RX_FULL cannot write past what was asked for, and consulting IC_STATUS.RFNE before every pop so a shallow synthesised FIFO is correct rather than merely likely. Draining before filling also means a STOP_DET in the same status word finds every byte accounted for. (7) TX_EMPTY queues up to DW_IRQ_TX_BURST commands from ONE descriptor covering all three operations -- write bytes first with no STOP unless there is no read phase, then read commands with RESTART on the first when a write phase preceded it and STOP on the last -- and, at the instant the command carrying STOP is accepted, DROPS TX_EMPTY FROM THE MASK. That write is the storm fix and there is exactly one of it; the count of commands queued at that moment is recorded so the witness can assert WHICH command it was, since a driver that masked at the first byte would leave the same final mask and be wrong. (8) STOP_DET clears IC_CLR_STOP_DET and terminates: DONE when every commanded byte arrived, and I2C_XFER_TIMEOUT_RXFIFO -- an existing code meaning exactly 'a byte never arrived' -- when the STOP came with bytes still owed. Every terminating path goes through dw_irq_close, which is shared with the waiting thread's timeout path and resolves the race between them by an exclusive CAS, so the caller is told the outcome of whichever context actually ended the transfer. Bounds: two counted loops against fixed constants, no allocation, no lock, no blocking call, every call target on the build-asserted allowlist. Six pushes plus a 40-byte frame keep rsp%16 == 0 at every call site (entry 8, +48 = 56, +40 = 96). Labels prefixed dwi_isr_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 40;
+
+        mov [rsp + 8], rdi;              // controller index
+        call dw_irq_row;
+        cmp rax, 0;
+        je  dwi_isr_none;
+        mov [rsp + 0], rax;
+        mov rbx, rax;                    // row, across every call
+
+        // ---- (1) is this row ours to touch? ----
+        mov rdi, rbx;
+        call atomic_load_u64;
+        cmp rax, 2;                      // DW_IRQ_ST_ARMED
+        je  dwi_isr_mine;
+        cmp rax, 3;                      // DW_IRQ_ST_RUNNING
+        jne dwi_isr_none;
+
+      dwi_isr_mine:
+        // ---- (2) exclude a concurrent service routine by DECLINING ----
+        mov rdi, rbx;
+        add rdi, 8;                      // gate
+        mov rsi, 1;
+        call atomic_xchg_u64;
+        cmp rax, 0;
+        jne dwi_isr_none;
+
+        // ---- (3) point the seam at this controller ----
+        mov rdi, [rsp + 8];
+        call dw_i2c_select;
+        cmp rax, 0;
+        jne dwi_isr_iofault;
+
+        // ---- (4) what is the controller asking for? ----
+        mov rdi, 0x2C;                   // IC_INTR_STAT = raw & mask
+        call dw_io_read32;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  dwi_isr_iofault;
+        mov [rsp + 16], rax;
+        cmp rax, 0;
+        je  dwi_isr_quiet;
+
+        mov rdi, rbx;
+        mov rsi, 2;                      // ARMED
+        mov rdx, 3;                      // RUNNING
+        call atomic_cas_u64;
+
+        mov rax, [rbx + 96];
+        add rax, 1;
+        mov [rbx + 96], rax;             // isr_calls: SERVICE events only
+
+        // ---- (5) TX_ABRT: terminate, with the phase and the count ----
+        mov rax, [rsp + 16];
+        and rax, 0x40;                   // DW_INTR_TX_ABRT
+        cmp rax, 0;
+        jne dwi_isr_abort;
+
+        // ---- (6) RX_FULL: drain, bounded ----
+        mov rax, [rsp + 16];
+        and rax, 0x04;                   // DW_INTR_RX_FULL
+        cmp rax, 0;
+        je  dwi_isr_tx;
+        xor r12, r12;
+
+      dwi_isr_rx_next:
+        cmp r12, 8;                      // DW_IRQ_RX_BURST
+        jae dwi_isr_tx;
+        mov r13, [rbx + 64];             // rdone
+        mov r14, [rbx + 40];             // rlen
+        cmp r13, r14;
+        jae dwi_isr_tx;
+        mov r14, [rbx + 56];             // rcmd
+        cmp r13, r14;
+        jae dwi_isr_tx;                  // never pop an uncommanded byte
+
+        mov rdi, 0x70;                   // IC_STATUS
+        call dw_io_read32;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  dwi_isr_iofault;
+        and rax, 0x08;                   // DW_STATUS_RFNE
+        cmp rax, 0;
+        je  dwi_isr_tx;
+
+        mov rdi, 0x10;                   // IC_DATA_CMD
+        call dw_io_read32;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  dwi_isr_iofault;
+        and rax, 0xFF;
+
+        mov r13, [rbx + 64];
+        mov r14, [rbx + 32];             // rbuf
+        add r14, r13;
+        mov_b [r14 + 0], rax;
+        add r13, 1;
+        mov [rbx + 64], r13;
+        add r12, 1;
+        jmp dwi_isr_rx_next;
+
+        // ---- (7) TX_EMPTY: queue, bounded, and mask at the last ----
+      dwi_isr_tx:
+        mov rax, [rsp + 16];
+        and rax, 0x10;                   // DW_INTR_TX_EMPTY
+        cmp rax, 0;
+        je  dwi_isr_stop;
+        xor r12, r12;
+
+      dwi_isr_tx_next:
+        cmp r12, 8;                      // DW_IRQ_TX_BURST
+        jae dwi_isr_stop;
+
+        xor r15, r15;                    // is-last
+        mov r13, [rbx + 48];             // wcmd
+        mov r14, [rbx + 24];             // wlen
+        cmp r13, r14;
+        jae dwi_isr_tx_read;
+
+        // write phase: no command carries STOP unless there is no read
+        // phase to follow it. A STOP between the register-pointer write
+        // and the read is the bug i2c_xfer_write_read exists to remove.
+        mov r10, [rbx + 16];             // wbuf
+        add r10, r13;
+        xor rbp, rbp;
+        mov_b rbp, [r10 + 0];
+        and rbp, 0xFF;
+        mov r10, r14;
+        sub r10, 1;
+        cmp r13, r10;
+        jne dwi_isr_tx_push;
+        mov r10, [rbx + 40];             // rlen
+        cmp r10, 0;
+        jne dwi_isr_tx_push;
+        mov r11, 0x200;                  // DW_CMD_STOP
+        or  rbp, r11;
+        mov r15, 1;
+        jmp dwi_isr_tx_push;
+
+      dwi_isr_tx_read:
+        mov r13, [rbx + 56];             // rcmd
+        mov r14, [rbx + 40];             // rlen
+        cmp r13, r14;
+        jae dwi_isr_stop;                // everything is queued
+
+        mov rbp, 0x100;                  // DW_CMD_READ
+        cmp r13, 0;
+        jne dwi_isr_tx_rd_rest;
+        mov r10, [rbx + 24];             // wlen
+        cmp r10, 0;
+        je  dwi_isr_tx_rd_rest;
+        mov r11, 0x400;                  // DW_CMD_RESTART
+        or  rbp, r11;
+      dwi_isr_tx_rd_rest:
+        mov r10, r14;
+        sub r10, 1;
+        cmp r13, r10;
+        jne dwi_isr_tx_push;
+        mov r11, 0x200;                  // DW_CMD_STOP
+        or  rbp, r11;
+        mov r15, 1;
+
+      dwi_isr_tx_push:
+        mov rdi, 0x70;                   // IC_STATUS
+        call dw_io_read32;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  dwi_isr_iofault;
+        and rax, 0x02;                   // DW_STATUS_TFNF
+        cmp rax, 0;
+        je  dwi_isr_stop;                // no room; the level calls back
+
+        mov rdi, 0x10;                   // IC_DATA_CMD
+        mov rsi, rbp;
+        call dw_io_write32;
+        cmp rax, 0;
+        jne dwi_isr_iofault;
+
+        mov r13, [rbx + 48];
+        mov r14, [rbx + 24];
+        cmp r13, r14;
+        jae dwi_isr_tx_bump_rd;
+        add r13, 1;
+        mov [rbx + 48], r13;
+        jmp dwi_isr_tx_masked;
+      dwi_isr_tx_bump_rd:
+        mov r13, [rbx + 56];
+        add r13, 1;
+        mov [rbx + 56], r13;
+
+      dwi_isr_tx_masked:
+        cmp r15, 0;
+        je  dwi_isr_tx_bump;
+
+        // ***********************************************************
+        // THE TX_EMPTY MASKING POINT. The command carrying DW_CMD_STOP
+        // has been accepted, so there is nothing left to send, and
+        // TX_EMPTY -- a level that is true whenever TXFLR <= IC_TX_TL
+        // and therefore true forever from here -- comes out of the
+        // mask. Leaving it in is the interrupt storm; masking it any
+        // earlier would blind this routine to a TX FIFO that had not
+        // taken everything.
+        // ***********************************************************
+        mov rdi, 0x30;                   // IC_INTR_MASK
+        mov rsi, 0x244;                  // DW_IRQ_MASK_TAIL
+        call dw_io_write32;
+        cmp rax, 0;
+        jne dwi_isr_iofault;
+        mov r13, [rbx + 48];
+        mov r14, [rbx + 56];
+        add r13, r14;
+        mov [rbx + 104], r13;            // masked_at
+        jmp dwi_isr_stop;
+
+      dwi_isr_tx_bump:
+        add r12, 1;
+        jmp dwi_isr_tx_next;
+
+        // ---- (8) STOP_DET: the only non-error terminator ----
+      dwi_isr_stop:
+        mov rax, [rsp + 16];
+        mov r11, 0x200;                  // DW_INTR_STOP_DET
+        and rax, r11;
+        cmp rax, 0;
+        je  dwi_isr_rel;
+
+        mov rdi, 0x60;                   // IC_CLR_STOP_DET
+        call dw_io_read32;
+
+        mov r13, [rbx + 64];             // rdone
+        mov r14, [rbx + 40];             // rlen
+        mov rbp, [rbx + 24];             // wlen -- all of it acknowledged
+        cmp r13, r14;
+        jae dwi_isr_stop_ok;
+
+        mov rdi, [rsp + 8];
+        mov rsi, 0xFFFFFF65;             // I2C_XFER_TIMEOUT_RXFIFO
+        xor rdx, rdx;
+        mov rcx, rbp;
+        call dw_irq_close;
+        jmp dwi_isr_rel;
+
+      dwi_isr_stop_ok:
+        mov rdi, [rsp + 8];
+        xor rsi, rsi;                    // success
+        xor rdx, rdx;                    // DW_IRQ_NACK_NONE
+        mov rcx, rbp;
+        call dw_irq_close;
+        jmp dwi_isr_rel;
+
+        // ---- the abort path ----
+      dwi_isr_abort:
+        call dw_xfer_check_abort;        // shared with the polled engine
+        mov rbp, rax;                    // err
+
+        xor r15, r15;                    // DW_IRQ_NACK_NONE
+        mov r11, 0xFFFFFF63;             // I2C_XFER_NACK_ADDR
+        cmp rbp, r11;
+        jne dwi_isr_ab_data;
+        mov r15, 1;                      // DW_IRQ_NACK_ADDR
+        xor r13, r13;                    // nobody answered: nothing landed
+        jmp dwi_isr_ab_src;
+
+      dwi_isr_ab_data:
+        mov r11, 0xFFFFFF62;             // I2C_XFER_NACK_DATA
+        cmp rbp, r11;
+        jne dwi_isr_ab_count;
+        mov r15, 2;                      // DW_IRQ_NACK_DATA
+
+      dwi_isr_ab_count:
+        // Bytes the device ACKNOWLEDGED, which is not the number
+        // pushed: the abort flushed everything the FIFO still held, and
+        // the byte that was NACKed reached the wire unacknowledged.
+        mov rdi, 0x74;                   // IC_TXFLR
+        call dw_io_read32;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  dwi_isr_ab_zero;
+        mov r13, [rbx + 48];             // commands pushed
+        cmp r13, rax;
+        jbe dwi_isr_ab_zero;
+        sub r13, rax;
+        sub r13, 1;
+        jmp dwi_isr_ab_src;
+
+      dwi_isr_ab_zero:
+        xor r13, r13;
+
+      dwi_isr_ab_src:
+        call i2c_xfer_last_abort;
+        mov [rbx + 112], rax;
+
+        mov rdi, [rsp + 8];
+        mov rsi, rbp;
+        mov rdx, r15;
+        mov rcx, r13;
+        call dw_irq_close;
+        jmp dwi_isr_rel;
+
+        // ---- exits ----
+      dwi_isr_iofault:
+        mov rdi, [rsp + 8];
+        mov rsi, 0xFFFFFF50;             // LPSS_I2C_IO_FAULT
+        xor rdx, rdx;
+        xor rcx, rcx;
+        call dw_irq_close;
+
+      dwi_isr_rel:
+        mov rdi, rbx;
+        add rdi, 8;
+        xor rsi, rsi;
+        call atomic_store_u64;
+        mov rax, 1;
+        jmp dwi_isr_out;
+
+      dwi_isr_quiet:
+        mov rdi, rbx;
+        add rdi, 8;
+        xor rsi, rsi;
+        call atomic_store_u64;
+        xor rax, rax;
+        jmp dwi_isr_out;
+
+      dwi_isr_none:
+        xor rax, rax;
+
+      dwi_isr_out:
+        add rsp, 40;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
