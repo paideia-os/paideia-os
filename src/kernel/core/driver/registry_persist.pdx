@@ -1,0 +1,546 @@
+// src/kernel/core/driver/registry_persist.pdx — R29.M3-002 (#1029)
+//
+// Driver registry v2 persistence — chunked file I/O, shadow-write
+// publish, and byte-exact round-trip verification.
+//
+// Full rationale: design/drivers/registry-v2.md §4.
+//
+// FS-agnosticism via inode-idx indirection
+// ----------------------------------------
+// This module never names a path and never names a backend. It holds an
+// *inode index* in `_registry_persist_inode` (and a shadow index in
+// `_registry_persist_shadow_inode`) and issues raw tmpfs_read /
+// tmpfs_write against them. The boot witness seeds
+// /system/registry/drivers.pdxreg on tmpfs and publishes the resulting
+// indices here — exactly the pattern the audit-log bridge uses for
+// /system/audit/log.pdaudit (src/kernel/core/klog/audit.pdx, R18). When
+// a later round mounts pdxfs-lite at boot, the seeding witness points
+// the same two slots at persistent inodes and every call site above this
+// module is unchanged.
+//
+// Chunked I/O
+// -----------
+// tmpfs_write / tmpfs_read are single-page primitives: they reject any
+// request whose byte range crosses a 4 KiB boundary. A sealed registry
+// image is 96*N + 3357 bytes — 3453 B for the two-record boot witness,
+// 6429 B at the 32-record cap — so it crosses pages by construction.
+// Both functions here therefore loop, issuing
+// min(remaining, 4096 - (offset & 4095)) bytes per call. This is not a
+// workaround for a deficient primitive: page-at-a-time is what a real
+// block backend wants anyway, and it makes the registry's size ceiling a
+// property of the inode (64 KiB in tmpfs) rather than of the write path.
+//
+// Shadow write
+// ------------
+// A registry that is half-written when the machine dies is worse than
+// one that is absent: it parses, and it understates entitlements.
+// registry_persist_publish writes the whole image to the shadow inode,
+// reads it back, runs the fsck validator over the read-back bytes, and
+// only then writes the live inode and re-validates. The crash window
+// shrinks to the live write. A true atomic swap needs a directory
+// rename, which tmpfs does not implement (R16.M2 shipped
+// create/lookup/read/write/unlink) and which is meaningless on a
+// volatile backend regardless; the swap lands with pdxfs-lite's rename
+// when the registry moves to that backend, and `publish` is the only
+// function that changes.
+//
+// Concurrency: R29.M3 is single-flow pre-scheduler-bringup; no lock on
+// the scratch buffer or the inode slots. SMP-safety revisits with the
+// R29.M7 chaos-restart harness.
+
+module RegistryPersist = structure {
+
+  // ============================================================================
+  // Return codes — 0xFFFFFD2x, one step past registry_v2.pdx's 0xFFFFFD0x
+  // fsck space so an I/O failure is never confused with a schema failure.
+  // ============================================================================
+
+  pub let REGISTRY_PERSIST_OK            : u64 = 0
+  pub let REGISTRY_PERSIST_ERR_NO_INODE  : u64 = 0xFFFFFD20
+  pub let REGISTRY_PERSIST_ERR_WRITE     : u64 = 0xFFFFFD21
+  pub let REGISTRY_PERSIST_ERR_READ      : u64 = 0xFFFFFD22
+  pub let REGISTRY_PERSIST_ERR_TOO_MANY  : u64 = 0xFFFFFD23
+
+  // ============================================================================
+  // Inode-index slots. Zero means "not seeded" — inode index 0 is the
+  // reserved sentinel in the tmpfs pool (index 1 is root), so zero is an
+  // unambiguous "unset" marker and needs no separate ready flag.
+  // ============================================================================
+
+  pub let mut _registry_persist_inode        : u64 = 0
+  pub let mut _registry_persist_shadow_inode : u64 = 0
+
+  // ============================================================================
+  // Read-back scratch — same geometry as the live image buffer so a
+  // full-size registry round-trips without a second allocation. 6432 B.
+  // ============================================================================
+
+  pub let mut _registry_persist_scratch : [u64; 804] = uninit @align(64)
+
+  // ============================================================================
+  // registry_persist_scratch_addr() -> u64
+  // ============================================================================
+
+  pub let registry_persist_scratch_addr : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R29.M3-002 (#1029): return the kernel VA of the read-back scratch image via rip-relative lea. Pure address computation. Leaf; no callee-save writes.",
+      block: {
+        lea rax, [rip + _registry_persist_scratch];
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // registry_persist_bind(live_inode, shadow_inode) -> u64
+  //
+  // SysV: rdi = live inode index, rsi = shadow inode index
+  //       -> rax = REGISTRY_PERSIST_OK / ERR_NO_INODE.
+  //
+  // Publishes the two inode indices the module operates on. Called once
+  // by the boot witness after the files are created. Both must be
+  // non-zero; binding a zero index would leave a half-armed module whose
+  // failure would surface only at publish time.
+  // ============================================================================
+
+  pub let registry_persist_bind : (u64, u64) -> u64 !{mem} @{} =
+    fn (live_inode: u64, shadow_inode: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M3-002 (#1029): bind the live + shadow inode indices. Both gated non-zero BEFORE either store, so a rejected bind leaves the module in its previous (possibly unbound) state rather than half-armed — the same preserve-on-failure ordering the tmpfs mutators use. Shadow is stored first, then live: a reader that samples mid-bind either sees the module unbound (live == 0, rejected by every entry point) or fully bound, never live-without-shadow. Leaf; no callee-save writes.",
+      block: {
+        cmp rdi, 0;
+        je  registry_persist_bind_bad;
+        cmp rsi, 0;
+        je  registry_persist_bind_bad;
+
+        lea r8, [rip + _registry_persist_shadow_inode];
+        mov [r8 + 0], rsi;
+        lea r8, [rip + _registry_persist_inode];
+        mov [r8 + 0], rdi;
+
+        xor rax, rax;
+        ret;
+
+      registry_persist_bind_bad:
+        mov rax, 0xFFFFFD20;                // REGISTRY_PERSIST_ERR_NO_INODE
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // registry_persist_write(inode, buf_ptr, len) -> u64
+  //
+  // SysV: rdi = inode index, rsi = source VA, rdx = byte length
+  //       -> rax = len on success, ERR_WRITE on any short/failed chunk.
+  //
+  // Chunked writer: issues min(remaining, bytes-left-in-current-page)
+  // per tmpfs_write call, starting at file offset 0. A chunk that
+  // returns anything other than the requested count is a hard failure —
+  // tmpfs_write returns exactly len or the 0xFFFF... sentinel, so a
+  // partial return means the primitive's contract changed and continuing
+  // would silently produce a truncated registry.
+  // ============================================================================
+
+  pub let registry_persist_write : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (inode: u64, buf_ptr: u64, len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M3-002 (#1029): page-chunked write of an arbitrary span to an inode. Five-push prologue (rbx, r12, r13, r14, r15) ensures rsp%16==0 at the nested tmpfs_write call per SysV AMD64, and holds every loop invariant in a callee-save register so nothing needs re-loading across the call: rbx = inode, r12 = source cursor, r13 = remaining, r14 = file offset, r15 = current chunk size. Chunk size = 4096 - (offset & 4095), clamped to remaining — this is the largest span that provably cannot cross the page boundary tmpfs_write rejects. Exactly one register (r15) carries the chunk across the call, so no stack spill is needed and the 16-byte alignment established by the 5-push prologue is never perturbed. Zero-length is a legal no-op returning 0 (mirrors tmpfs_write's own len==0 contract). Return value is the final offset, which equals len on the success path by induction.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                           // rsp%16 = 0
+
+        mov rbx, rdi;                       // inode
+        mov r12, rsi;                       // source cursor
+        mov r13, rdx;                       // remaining
+        xor r14, r14;                       // file offset = 0
+
+      registry_persist_write_loop:
+        cmp r13, 0;
+        je  registry_persist_write_done;
+
+        // chunk = 4096 - (offset & 4095), clamped to remaining
+        mov rax, r14;
+        mov rcx, 4095;
+        and rax, rcx;
+        mov r15, 4096;
+        sub r15, rax;
+        cmp r13, r15;
+        jae registry_persist_write_have_chunk;
+        mov r15, r13;
+
+      registry_persist_write_have_chunk:
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r15;
+        mov rcx, r14;
+        call tmpfs_write;
+
+        cmp rax, r15;
+        jne registry_persist_write_fail;
+
+        add r12, r15;
+        add r14, r15;
+        sub r13, r15;
+        jmp registry_persist_write_loop;
+
+      registry_persist_write_done:
+        mov rax, r14;                       // total bytes written
+        jmp registry_persist_write_ret;
+
+      registry_persist_write_fail:
+        mov rax, 0xFFFFFD21;                // REGISTRY_PERSIST_ERR_WRITE
+
+      registry_persist_write_ret:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // registry_persist_read(inode, buf_ptr, len) -> u64
+  //
+  // SysV: rdi = inode index, rsi = destination VA, rdx = byte length
+  //       -> rax = len on success, ERR_READ on any short/failed chunk.
+  //
+  // Chunked reader, mirror of the writer. A short chunk is a hard
+  // failure: tmpfs_read clamps to inode.size, so a short return means
+  // the stored image is smaller than the image the caller expected from
+  // the header's record_count — precisely the truncation the fsck must
+  // not paper over.
+  // ============================================================================
+
+  pub let registry_persist_read : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (inode: u64, buf_ptr: u64, len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M3-002 (#1029): page-chunked read of an inode span into a buffer. Register discipline identical to registry_persist_write (rbx = inode, r12 = destination cursor, r13 = remaining, r14 = file offset, r15 = chunk), five-push prologue for rsp%16==0 at the nested tmpfs_read. Short-chunk handling is deliberately strict rather than a partial-read loop: tmpfs_read clamps to inode.size, so a chunk returning fewer bytes than requested means the file is shorter than the caller computed from record_count — a truncated registry, which must fail loudly rather than be silently zero-padded into a buffer the validator would then judge.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                           // rsp%16 = 0
+
+        mov rbx, rdi;                       // inode
+        mov r12, rsi;                       // destination cursor
+        mov r13, rdx;                       // remaining
+        xor r14, r14;                       // file offset = 0
+
+      registry_persist_read_loop:
+        cmp r13, 0;
+        je  registry_persist_read_done;
+
+        mov rax, r14;
+        mov rcx, 4095;
+        and rax, rcx;
+        mov r15, 4096;
+        sub r15, rax;
+        cmp r13, r15;
+        jae registry_persist_read_have_chunk;
+        mov r15, r13;
+
+      registry_persist_read_have_chunk:
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r15;
+        mov rcx, r14;
+        call tmpfs_read;
+
+        cmp rax, r15;
+        jne registry_persist_read_fail;
+
+        add r12, r15;
+        add r14, r15;
+        sub r13, r15;
+        jmp registry_persist_read_loop;
+
+      registry_persist_read_done:
+        mov rax, r14;                       // total bytes read
+        jmp registry_persist_read_ret;
+
+      registry_persist_read_fail:
+        mov rax, 0xFFFFFD22;                // REGISTRY_PERSIST_ERR_READ
+
+      registry_persist_read_ret:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // registry_persist_compare(a_ptr, b_ptr, len) -> u64
+  //
+  // SysV: rdi = A, rsi = B, rdx = byte length
+  //       -> rax = 0 when the spans are byte-identical,
+  //          rax = 1 + index_of_first_differing_byte otherwise.
+  //
+  // The +1 bias makes "equal" and "differ at byte 0" distinguishable in
+  // a single return value, so the round-trip witness can report *where*
+  // a persistence bug corrupted the image, not merely that it did.
+  // ============================================================================
+
+  pub let registry_persist_compare : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (a_ptr: u64, b_ptr: u64, len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M3-002 (#1029): byte-exact span comparison. Byte-at-a-time rather than qword-at-a-time so the reported index is the exact differing byte — a qword loop would have to re-scan the differing word anyway, and this runs once per boot over ~3.4 KiB. Byte loads use the `mov al, [ptr]` idiom with an explicit 0xFF mask on both sides, since an 8-bit load leaves the upper 56 bits of the destination register untouched; masking makes the comparison width-correct regardless of prior register contents. Return is 0 for equal, 1+index for the first difference, so byte 0 differing is distinguishable from equality. Read-only. Leaf; no nested calls; no callee-save writes.",
+      block: {
+        xor r10, r10;                       // index
+
+      registry_persist_compare_loop:
+        cmp r10, rdx;
+        jae registry_persist_compare_equal;
+
+        mov r8, rdi;
+        add r8, r10;
+        mov al, [r8 + 0];
+        mov r11, 0xFF;
+        and rax, r11;
+        mov rcx, rax;                       // rcx = A byte
+
+        mov r8, rsi;
+        add r8, r10;
+        mov al, [r8 + 0];
+        mov r11, 0xFF;
+        and rax, r11;                       // rax = B byte
+
+        cmp rcx, rax;
+        jne registry_persist_compare_diff;
+
+        inc r10;
+        jmp registry_persist_compare_loop;
+
+      registry_persist_compare_equal:
+        xor rax, rax;
+        ret;
+
+      registry_persist_compare_diff:
+        mov rax, r10;
+        inc rax;                            // 1 + index
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // registry_persist_publish(count) -> u64
+  //
+  // SysV: rdi = record_count of the already-sealed live image
+  //       -> rax = REGISTRY_PERSIST_OK, an ERR_* from this module, or an
+  //          0xFFFFFD0x fsck code from registry_v2_validate.
+  //
+  // The commit path. Steps:
+  //   1. bound-check count; both inodes must be bound.
+  //   2. total = registry_v2_total_bytes(count).
+  //   3. write the live image to the SHADOW inode.
+  //   4. read the shadow inode back into the scratch buffer.
+  //   5. registry_v2_validate(scratch) — the shadow copy must be a
+  //      well-formed registry before it is allowed to become the live one.
+  //   6. write the live image to the LIVE inode.
+  //   7. read the live inode back into scratch and validate again.
+  //
+  // Step 5 is the point of the shadow: an image that fails fsck after a
+  // full write-then-read round trip is evidence of an I/O fault, and it
+  // is caught while the live file still holds the previous good
+  // registry. Step 7 re-validates because the live write is the one
+  // remaining unprotected window; catching a fault there does not save
+  // the file, but it does mean the boot fails loudly rather than the
+  // supervisor minting capabilities from a corrupt manifest.
+  //
+  // The live buffer is written to both inodes (rather than the shadow's
+  // read-back bytes being copied to the live inode) so that a scratch
+  // corruption between steps 4 and 6 cannot propagate into the live
+  // file; scratch is only ever a verification target, never a source.
+  // ============================================================================
+
+  pub let registry_persist_publish : (u64) -> u64 !{mem} @{} =
+    fn (count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M3-002 (#1029): shadow-write publish of the sealed live image. Five-push prologue (rbx, r12, r13, r14, r15) for rsp%16==0 across seven nested calls; rbx = count, r12 = total bytes, r13 = live image VA, r14 = scratch VA, r15 = live inode. Gates (count bound, both inodes bound) run before any I/O so a rejected publish touches no file. Shadow-first ordering is the whole point: the image is proven to survive a full write-read-fsck cycle against a file nobody depends on before the live file is disturbed, so an I/O fault is caught while the previous good registry is still intact. The live image buffer — never the scratch read-back — is the source for both writes, so a scratch corruption between the shadow verify and the live write cannot propagate into the live file. Step 7 re-validates the live read-back to close the one window the shadow cannot cover; it cannot repair the file, but it converts a silent corrupt-manifest boot into a loud failure. Any non-zero fsck code is returned verbatim so the caller sees which stage failed rather than a flattened I/O error.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                           // rsp%16 = 0
+
+        mov rbx, rdi;                       // count
+
+        cmp rbx, 32;                        // REGISTRY_V2_MAX_RECORDS
+        ja  registry_persist_publish_too_many;
+
+        lea rax, [rip + _registry_persist_inode];
+        mov r15, [rax + 0];                 // live inode
+        cmp r15, 0;
+        je  registry_persist_publish_no_inode;
+
+        lea rax, [rip + _registry_persist_shadow_inode];
+        mov rax, [rax + 0];
+        cmp rax, 0;
+        je  registry_persist_publish_no_inode;
+
+        // ---- total bytes ----
+        mov rdi, rbx;
+        call registry_v2_total_bytes;
+        mov r12, rax;                       // total
+
+        call registry_v2_buf_addr;
+        mov r13, rax;                       // live image VA
+
+        call registry_persist_scratch_addr;
+        mov r14, rax;                       // scratch VA
+
+        // ---- Step 3: write shadow ----
+        lea rax, [rip + _registry_persist_shadow_inode];
+        mov rdi, [rax + 0];
+        mov rsi, r13;
+        mov rdx, r12;
+        call registry_persist_write;
+        cmp rax, r12;
+        jne registry_persist_publish_write_err;
+
+        // ---- Step 4: read shadow back ----
+        lea rax, [rip + _registry_persist_shadow_inode];
+        mov rdi, [rax + 0];
+        mov rsi, r14;
+        mov rdx, r12;
+        call registry_persist_read;
+        cmp rax, r12;
+        jne registry_persist_publish_read_err;
+
+        // ---- Step 5: fsck the shadow copy ----
+        mov rdi, r14;
+        call registry_v2_validate;
+        cmp rax, 0;
+        jne registry_persist_publish_ret;   // return fsck code verbatim
+
+        // ---- Step 6: write live ----
+        mov rdi, r15;
+        mov rsi, r13;
+        mov rdx, r12;
+        call registry_persist_write;
+        cmp rax, r12;
+        jne registry_persist_publish_write_err;
+
+        // ---- Step 7: read live back + fsck ----
+        mov rdi, r15;
+        mov rsi, r14;
+        mov rdx, r12;
+        call registry_persist_read;
+        cmp rax, r12;
+        jne registry_persist_publish_read_err;
+
+        mov rdi, r14;
+        call registry_v2_validate;
+        jmp registry_persist_publish_ret;   // 0 on success, fsck code otherwise
+
+      registry_persist_publish_too_many:
+        mov rax, 0xFFFFFD23;
+        jmp registry_persist_publish_ret;
+
+      registry_persist_publish_no_inode:
+        mov rax, 0xFFFFFD20;
+        jmp registry_persist_publish_ret;
+
+      registry_persist_publish_write_err:
+        mov rax, 0xFFFFFD21;
+        jmp registry_persist_publish_ret;
+
+      registry_persist_publish_read_err:
+        mov rax, 0xFFFFFD22;
+
+      registry_persist_publish_ret:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // registry_persist_load(count) -> u64
+  //
+  // SysV: rdi = expected record_count -> rax = REGISTRY_PERSIST_OK, an
+  //       ERR_* from this module, or an 0xFFFFFD0x fsck code.
+  //
+  // Read path: pulls the live inode into the scratch image and fscks it.
+  // The caller supplies the expected count (from the previous publish,
+  // or from a two-stage load that first reads the 32 B header) because
+  // the number of bytes to read is a function of the count, and reading
+  // the whole 64 KiB inode ceiling to find out would be wasteful.
+  //
+  // On success the decoded image is in the scratch buffer and every
+  // registry_v2_field / registry_v2_image_count accessor may be pointed
+  // at registry_persist_scratch_addr().
+  // ============================================================================
+
+  pub let registry_persist_load : (u64) -> u64 !{mem} @{} =
+    fn (count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M3-002 (#1029): read the live registry into scratch and fsck it. Five-push prologue for rsp%16==0 across four nested calls; rbx = count, r12 = total bytes, r14 = scratch VA, r15 = live inode. Count bound and inode binding are checked before any I/O. The expected count is a parameter rather than being read from the file first because the byte length to read is derived from it — a self-describing read would need two I/O passes (header, then body) and the caller already knows the count in every current path. Validation is unconditional on the read-back bytes: a load that skipped fsck would hand the supervisor a manifest it had no reason to trust, which is the exact failure the signed registry exists to prevent. The fsck code is returned verbatim so the failing stage is named.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                           // rsp%16 = 0
+
+        mov rbx, rdi;                       // count
+
+        cmp rbx, 32;
+        ja  registry_persist_load_too_many;
+
+        lea rax, [rip + _registry_persist_inode];
+        mov r15, [rax + 0];
+        cmp r15, 0;
+        je  registry_persist_load_no_inode;
+
+        mov rdi, rbx;
+        call registry_v2_total_bytes;
+        mov r12, rax;
+
+        call registry_persist_scratch_addr;
+        mov r14, rax;
+
+        mov rdi, r15;
+        mov rsi, r14;
+        mov rdx, r12;
+        call registry_persist_read;
+        cmp rax, r12;
+        jne registry_persist_load_read_err;
+
+        mov rdi, r14;
+        call registry_v2_validate;
+        jmp registry_persist_load_ret;      // 0 on success, fsck code otherwise
+
+      registry_persist_load_too_many:
+        mov rax, 0xFFFFFD23;
+        jmp registry_persist_load_ret;
+
+      registry_persist_load_no_inode:
+        mov rax, 0xFFFFFD20;
+        jmp registry_persist_load_ret;
+
+      registry_persist_load_read_err:
+        mov rax, 0xFFFFFD22;
+
+      registry_persist_load_ret:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+}

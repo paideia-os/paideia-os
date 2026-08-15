@@ -1488,6 +1488,50 @@ driver_lifecycle_fuzz_ok_msg: .ascii "R29 LIFECYCLE FUZZ OK\n\0"
 driver_lifecycle_fuzz_fail_msg: .ascii "R29 LIFECYCLE FUZZ FAIL\n\0"
 
 
+# R29.M3-001 (#1028) + R29.M3-002 (#1029): driver registry v2 witness —
+# path components + fingerprints.
+#
+# The witness seeds /system/registry/{drivers.pdxreg,drivers.pdxreg.new}
+# on tmpfs (/system itself is created by the audit-bridge witness), binds
+# the two inode indices into registry_persist.pdx, encodes two driver
+# records projected from driver_table slots 0 and 1, seals the image
+# (content checksum + ML-DSA-65 signature block with an all-zero scaffold
+# body), publishes it shadow-first, reads it back, and asserts the
+# round-trip is byte-exact across all 3549 bytes. It then exercises five
+# failure edges against the read-back copy (corrupt magic, corrupt
+# record, non-zero signature body, out-of-range record index,
+# out-of-range publish count).
+#
+# The shadow file name is a sibling rather than a dotfile because tmpfs
+# stores a 32-byte inline name; "drivers.pdxreg.new" (18 B) fits without
+# truncation and cannot collide with "drivers.pdxreg" (14 B).
+#
+# See:
+#   - design/drivers/registry-v2.md (schema, layout, versioning, signing)
+#   - src/kernel/core/driver/registry_v2.pdx
+#   - src/kernel/core/driver/registry_persist.pdx
+#   - src/kernel/boot/kernel_main.pdx §registry_v2_witness
+.global registry_dir_name
+.align 8
+registry_dir_name: .ascii "registry\0"
+
+.global registry_file_name
+.align 8
+registry_file_name: .ascii "drivers.pdxreg\0"
+
+.global registry_shadow_name
+.align 8
+registry_shadow_name: .ascii "drivers.pdxreg.new\0"
+
+.global registry_v2_ok_msg
+.align 8
+registry_v2_ok_msg: .ascii "R29 REGISTRY V2 OK\n\0"
+
+.global registry_v2_fail_msg
+.align 8
+registry_v2_fail_msg: .ascii "R29 REGISTRY V2 FAIL\n\0"
+
+
 # R20b.M1-002 (#1553): endpoint_table + payload_arena witness fingerprints —
 # exercises endpoint_alloc/endpoint_free/endpoint_lookup round-trip on the
 # full 128-slot range AND payload_buf_pa_for(0..127) 4 KiB-alignment +
