@@ -1,0 +1,425 @@
+// src/kernel/core/driver/registry_snapshot.pdx — R29.M3-004 (#1031)
+//
+// Driver registry v2 snapshot ring + rollback.
+//
+// Full rationale: design/drivers/registry-v2.md §9.
+//
+// What a snapshot is for
+// ----------------------
+// Every mutation of the registry — a hotplug-driven re-encode, a
+// hot-reload that adopts new on-disk content, an operator edit — changes
+// what drivers are entitled to. Some of those mutations are wrong, and
+// "wrong" is often only discovered after the fact (a driver that will not
+// start, a manifest that fails the cap-vs-effect check at launch, a
+// signature that does not verify once real signing lands). Rollback is
+// the escape: capture a known-good sealed image before the risky step,
+// restore it afterwards if the step went badly.
+//
+// Where the ring lives, and why
+// -----------------------------
+// The ring is .bss — 4 * 6432 = 25728 bytes of kernel image — not tmpfs
+// files and not a second registry directory.
+//
+// A snapshot stored on the same filesystem as the artifact it protects
+// shares that artifact's failure domain. The scenarios rollback exists
+// for include "the registry file is corrupt", "the write path is
+// misbehaving", and "the FS is not mounted yet" — in all three, a
+// tmpfs-resident snapshot is either unreachable or suspect at exactly the
+// moment it is needed. .bss is reachable before any mount, cannot be
+// truncated by a failing write path, and costs one fixed allocation known
+// at link time rather than an inode budget that competes with the rest of
+// /system.
+//
+// The price is that snapshots do not survive reboot. That is the correct
+// trade: a snapshot is a short-lived undo buffer for an in-progress
+// reconfiguration, while cross-boot durability is what the persisted
+// registry file itself provides. Nothing here is a substitute for the
+// file; everything here is a substitute for having to rebuild the file by
+// hand after a bad step.
+//
+// Why four slots
+// --------------
+// Depth 4 covers the supervisor's realistic nesting — a snapshot before a
+// hotplug batch, one before the reload that batch triggers, one before a
+// manual repair, and one spare — at 25 KiB. Depth 2 would make the third
+// concurrent operation lose its baseline; depth 8 doubles a fixed .bss
+// cost for a nesting level no caller in R29 can produce. It is a ring
+// rather than a stack because eviction must be deterministic and silent:
+// with a ring, taking a fifth snapshot always succeeds and always evicts
+// the oldest, and a caller holding an evicted id learns so from
+// ERR_BAD_SNAPSHOT at rollback time. With a stack, the fifth snapshot
+// would have to fail, which turns a bookkeeping limit into a failed
+// operation at the worst possible moment.
+//
+// Snapshot ids are monotonic and never reused, so an evicted id can never
+// be confused with a live one: slot = (id - 1) & 3 locates the candidate
+// slot, and the id stored in that slot must match exactly. Wrapping the
+// id space would require 2^64 snapshots.
+//
+// Rollback goes through the existing publish path
+// -----------------------------------------------
+// registry_rollback restores the image into the live buffer and then
+// calls registry_persist_publish — the same shadow-write-then-fsck-then-
+// publish path every other write uses. There is deliberately no second
+// path to the live file: a rollback-specific writer would be the one
+// write path in the system that had never been exercised by the boot
+// witness, and it would be reached only when something had already gone
+// wrong.
+//
+// Concurrency: R29.M3 is single-flow pre-scheduler-bringup; no lock on
+// the ring. SMP-safety revisits with the R29.M7 chaos-restart harness.
+
+module RegistrySnapshot = structure {
+
+  // ============================================================================
+  // Return codes — 0xFFFFFD5x, one step past registry_lookup's
+  // 0xFFFFFD4x query space.
+  //
+  // registry_snapshot returns a snapshot id (>= 1) on success, so the
+  // error codes must be outside the plausible id range; 0xFFFFFD5x is,
+  // and callers separate them with `cmp rax, 0xFFFFFD00; jae`.
+  // ============================================================================
+
+  pub let REGISTRY_SNAPSHOT_OK             : u64 = 0
+  pub let REGISTRY_SNAPSHOT_ERR_BAD_SNAP   : u64 = 0xFFFFFD50
+  pub let REGISTRY_SNAPSHOT_ERR_TOO_MANY   : u64 = 0xFFFFFD51
+
+  // Ring geometry. SLOT_BYTES matches REGISTRY_V2_IMAGE_MAX_BYTES so a
+  // full 32-record image fits a slot without a second size rule.
+  pub let REGISTRY_SNAPSHOT_SLOTS      : u64 = 4
+  pub let REGISTRY_SNAPSHOT_SLOT_BYTES : u64 = 6432
+
+  // ============================================================================
+  // The ring itself: 4 slots * 804 qwords (6432 B) = 3216 qwords, 25728 B.
+  //
+  // _registry_snapshot_ids[i]    — the snapshot id occupying slot i, or 0
+  //                                for "empty". Ids start at 1 precisely
+  //                                so zero can mean empty without a
+  //                                separate occupancy bitmap.
+  // _registry_snapshot_counts[i] — record_count of the image in slot i;
+  //                                needed to size the restore copy and to
+  //                                hand registry_persist_publish its count.
+  // _registry_snapshot_next      — the id the next snapshot will receive.
+  // ============================================================================
+
+  pub let mut _registry_snapshot_ring   : [u64; 3216] = uninit @align(64)
+  pub let mut _registry_snapshot_ids    : [u64; 4]    = uninit @align(64)
+  pub let mut _registry_snapshot_counts : [u64; 4]    = uninit @align(64)
+  pub let mut _registry_snapshot_next   : u64         = 1
+
+  // ============================================================================
+  // registry_snapshot_init() -> u64
+  //
+  // Clears every slot's id and count and resets the id counter to 1.
+  //
+  // This exists rather than relying on .bss zeroing because the "empty"
+  // encoding of a slot (id == 0) is a correctness invariant, not a
+  // convenience: a slot whose id happened to hold garbage matching a
+  // caller's id would hand back an arbitrary 6432-byte buffer as a
+  // registry image. The image bytes themselves are NOT cleared — they are
+  // never read without a matching id, and zeroing 25 KiB to protect
+  // against a case the id check already covers is work for nothing.
+  // ============================================================================
+
+  pub let registry_snapshot_init : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M3-004 (#1031): reset the snapshot ring's bookkeeping. Writes id = 0 and count = 0 for all four slots and sets the next id to 1. The 25 KiB of image storage is intentionally left as-is: a slot is only ever read after its id matches, so its bytes are unreachable while its id is zero. Loop over four slots with the slot index in rcx and the byte offset in r8 = rcx*8. Leaf; no callee-save writes; no nested calls.",
+      block: {
+        xor rcx, rcx;
+
+      registry_snapshot_init_slot:
+        cmp rcx, 4;                         // REGISTRY_SNAPSHOT_SLOTS
+        jae registry_snapshot_init_done;
+
+        mov r8, rcx;
+        shl r8, 3;                          // slot * 8
+
+        lea r9, [rip + _registry_snapshot_ids];
+        add r9, r8;
+        xor rax, rax;
+        mov [r9 + 0], rax;
+
+        lea r9, [rip + _registry_snapshot_counts];
+        add r9, r8;
+        mov [r9 + 0], rax;
+
+        add rcx, 1;
+        jmp registry_snapshot_init_slot;
+
+      registry_snapshot_init_done:
+        lea r9, [rip + _registry_snapshot_next];
+        mov rax, 1;
+        mov [r9 + 0], rax;
+
+        xor rax, rax;                       // REGISTRY_SNAPSHOT_OK
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // registry_snapshot_slot_addr(slot) -> u64
+  //
+  // SysV: rdi = ring slot (0..3) -> rax = VA of that slot's image.
+  //
+  // slot * 6432 without imul: 6432 = 4096 + 2048 + 256 + 32, i.e.
+  // shl 12 + shl 11 + shl 8 + shl 5 summed — the same no-imul discipline
+  // registry_v2's multiply-by-96 follows.
+  // ============================================================================
+
+  pub let registry_snapshot_slot_addr : (u64) -> u64 !{} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R29.M3-004 (#1031): base VA of a ring slot. slot*6432 decomposed as (slot<<12) + (slot<<11) + (slot<<8) + (slot<<5) = slot*(4096+2048+256+32), avoiding imul. No bounds check — the only two callers mask the slot to 2 bits before calling. Pure computation plus one rip-relative lea. Leaf; no callee-save writes.",
+      block: {
+        mov r8, rdi;
+        shl r8, 12;
+        mov r9, rdi;
+        shl r9, 11;
+        add r8, r9;
+        mov r9, rdi;
+        shl r9, 8;
+        add r8, r9;
+        mov r9, rdi;
+        shl r9, 5;
+        add r8, r9;                         // slot * 6432
+        lea r9, [rip + _registry_snapshot_ring];
+        add r8, r9;
+        mov rax, r8;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // registry_snapshot() -> u64
+  //
+  // -> rax = snapshot id (>= 1), or ERR_TOO_MANY, or an 0xFFFFFD0x fsck
+  //    code forwarded verbatim.
+  //
+  // Captures the CURRENT LIVE SEALED IMAGE. It takes no count argument:
+  // the image is self-describing (record_count sits in its header), and
+  // asking the caller to restate a number the artifact already carries is
+  // an opportunity for the two to disagree.
+  //
+  // The live image is fscked BEFORE it is captured. A snapshot of a
+  // malformed image is an undo button that restores corruption — worse
+  // than no snapshot, because rollback would then be the thing that broke
+  // the machine. The fsck code is returned verbatim so the caller learns
+  // which stage of its own live image is bad.
+  // ============================================================================
+
+  pub let registry_snapshot : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M3-004 (#1031): capture the sealed live image into the next ring slot. Five-push prologue (rbx, r12, r13, r14, r15) for rsp%16==0 across the nested calls (registry_v2_buf_addr, registry_v2_validate, registry_v2_image_count, registry_v2_total_bytes, registry_snapshot_slot_addr); rbx = snapshot id, r12 = live image VA, r13 = destination slot VA, r14 = record count, r15 = byte length. Order is validate -> derive id/slot -> copy -> commit bookkeeping: the id and count stores happen only after the image bytes are in place, so a slot is never advertised as holding a snapshot it does not yet hold. Copy length is the sealed size rounded up to a qword multiple (96*count + 3357 is never 8-aligned); the <= 7 trailing bytes lie past the signature block inside both the 6432-byte source buffer and the 6432-byte slot, so the round-up cannot overrun and removes the copy loop's tail case. Slot = (id - 1) & 3 — ids are monotonic from 1, so consecutive snapshots cycle the four slots and the oldest is evicted deterministically.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                           // rsp%16 = 0
+
+        call registry_v2_buf_addr;
+        mov r12, rax;                       // live image VA
+
+        mov rdi, r12;
+        call registry_v2_validate;
+        cmp rax, 0;
+        jne registry_snapshot_ret;          // forward fsck code verbatim
+
+        mov rdi, r12;
+        call registry_v2_image_count;
+        mov r14, rax;
+        cmp r14, 32;                        // REGISTRY_V2_MAX_RECORDS
+        ja  registry_snapshot_too_many;
+
+        mov rdi, r14;
+        call registry_v2_total_bytes;
+        add rax, 7;
+        mov r9, 0xFFFFFFFFFFFFFFF8;
+        and rax, r9;
+        mov r15, rax;                       // byte length (qword multiple)
+
+        // ---- id + ring slot ----
+        lea rax, [rip + _registry_snapshot_next];
+        mov rbx, [rax + 0];                 // id
+
+        mov rdi, rbx;
+        mov r9, 1;
+        sub rdi, r9;
+        mov r9, 3;
+        and rdi, r9;                        // (id - 1) & 3
+        call registry_snapshot_slot_addr;
+        mov r13, rax;                       // destination VA
+
+        // ---- copy live -> slot ----
+        xor rdx, rdx;
+
+      registry_snapshot_copy:
+        cmp rdx, r15;
+        jae registry_snapshot_copy_done;
+        mov r8, r12;
+        add r8, rdx;
+        mov r8, [r8 + 0];
+        mov r9, r13;
+        add r9, rdx;
+        mov [r9 + 0], r8;
+        add rdx, 8;
+        jmp registry_snapshot_copy;
+
+      registry_snapshot_copy_done:
+        // ---- commit bookkeeping (after the bytes are in place) ----
+        mov r10, rbx;
+        mov r9, 1;
+        sub r10, r9;
+        mov r9, 3;
+        and r10, r9;                        // ring index
+        shl r10, 3;                         // * 8
+
+        lea r9, [rip + _registry_snapshot_counts];
+        add r9, r10;
+        mov [r9 + 0], r14;
+
+        lea r9, [rip + _registry_snapshot_ids];
+        add r9, r10;
+        mov [r9 + 0], rbx;
+
+        lea r9, [rip + _registry_snapshot_next];
+        mov rax, rbx;
+        add rax, 1;
+        mov [r9 + 0], rax;
+
+        mov rax, rbx;                       // return the id
+        jmp registry_snapshot_ret;
+
+      registry_snapshot_too_many:
+        mov rax, 0xFFFFFD51;                // ERR_TOO_MANY
+
+      registry_snapshot_ret:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // registry_rollback(snapshot_id) -> u64
+  //
+  // SysV: rdi = snapshot id -> rax = REGISTRY_SNAPSHOT_OK,
+  //       ERR_BAD_SNAP, or an 0xFFFFFD0x / 0xFFFFFD2x code forwarded
+  //       verbatim from validate / publish.
+  //
+  // Sequence:
+  //   1. id != 0 and _registry_snapshot_ids[(id-1) & 3] == id, else
+  //      ERR_BAD_SNAP. This single equality covers "never existed",
+  //      "already evicted" and "id 0" without a separate liveness table.
+  //   2. fsck the snapshot IN THE RING, before it is copied anywhere. The
+  //      live buffer is therefore only ever overwritten with an image
+  //      that has just passed validation — a rollback that fails leaves
+  //      the current image intact, which is the same preserve-on-failure
+  //      posture as every other mutator in this family.
+  //   3. Copy ring -> live buffer.
+  //   4. registry_persist_publish(count) — the one publish path
+  //      (shadow write, read back, fsck, live write, re-fsck).
+  //   5. Bump the registry generation, because the content the supervisor
+  //      may have cached has just been replaced.
+  // ============================================================================
+
+  pub let registry_rollback : (u64) -> u64 !{mem} @{} =
+    fn (snapshot_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M3-004 (#1031): restore a ring snapshot into the live image and republish it. Five-push prologue (rbx, r12, r13, r14, r15) for rsp%16==0 across the nested calls (registry_snapshot_slot_addr, registry_v2_validate, registry_v2_buf_addr, registry_v2_total_bytes, registry_persist_publish, registry_gen_bump); rbx = snapshot id, r12 = live image VA, r13 = source slot VA, r14 = record count, r15 = byte length. The id check is an exact equality against the id stored in slot (id-1)&3, which is what makes an evicted id fail closed: ids are monotonic and never reused, so a stale id can only ever mismatch. Validation runs against the ring copy BEFORE the live buffer is touched, so a corrupt snapshot cannot become the live image. Publication reuses registry_persist_publish rather than issuing writes here — a rollback-specific write path would be the only writer in the system never exercised by the boot witness, reached only when something had already gone wrong. Copy length is the sealed size rounded up to a qword multiple, bounded by the 6432-byte slot and the 6432-byte live buffer.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                           // rsp%16 = 0
+
+        mov rbx, rdi;                       // snapshot id
+
+        cmp rbx, 0;
+        je  registry_rollback_bad;
+
+        // ---- ring index + id equality ----
+        mov r10, rbx;
+        mov r9, 1;
+        sub r10, r9;
+        mov r9, 3;
+        and r10, r9;                        // ring index
+        mov r11, r10;
+        shl r11, 3;                         // * 8
+
+        lea r9, [rip + _registry_snapshot_ids];
+        add r9, r11;
+        mov rax, [r9 + 0];
+        cmp rax, rbx;
+        jne registry_rollback_bad;          // never existed, or evicted
+
+        lea r9, [rip + _registry_snapshot_counts];
+        add r9, r11;
+        mov r14, [r9 + 0];                  // record count
+
+        mov rdi, r10;
+        call registry_snapshot_slot_addr;
+        mov r13, rax;                       // source VA
+
+        // ---- fsck the snapshot before it touches the live image ----
+        mov rdi, r13;
+        call registry_v2_validate;
+        cmp rax, 0;
+        jne registry_rollback_ret;          // forward fsck code verbatim
+
+        mov rdi, r14;
+        call registry_v2_total_bytes;
+        add rax, 7;
+        mov r9, 0xFFFFFFFFFFFFFFF8;
+        and rax, r9;
+        mov r15, rax;                       // byte length
+
+        call registry_v2_buf_addr;
+        mov r12, rax;                       // live image VA
+
+        // ---- copy slot -> live ----
+        xor rdx, rdx;
+
+      registry_rollback_copy:
+        cmp rdx, r15;
+        jae registry_rollback_copy_done;
+        mov r8, r13;
+        add r8, rdx;
+        mov r8, [r8 + 0];
+        mov r9, r12;
+        add r9, rdx;
+        mov [r9 + 0], r8;
+        add rdx, 8;
+        jmp registry_rollback_copy;
+
+      registry_rollback_copy_done:
+        // ---- republish through the one publish path ----
+        mov rdi, r14;
+        call registry_persist_publish;
+        cmp rax, 0;
+        jne registry_rollback_ret;          // forward publish/fsck code
+
+        call registry_gen_bump;
+
+        xor rax, rax;                       // REGISTRY_SNAPSHOT_OK
+        jmp registry_rollback_ret;
+
+      registry_rollback_bad:
+        mov rax, 0xFFFFFD50;                // ERR_BAD_SNAP
+
+      registry_rollback_ret:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+}

@@ -1532,6 +1532,34 @@ registry_v2_ok_msg: .ascii "R29 REGISTRY V2 OK\n\0"
 registry_v2_fail_msg: .ascii "R29 REGISTRY V2 FAIL\n\0"
 
 
+# R29.M3-003 (#1030) + R29.M3-004 (#1031): registry lookup / hot-reload /
+# snapshot-rollback witness fingerprints.
+#
+# The witness rebuilds a two-record image over driver_table slots 0
+# (uart-16550, driven to RUNNING) and 1 (nvme-pcie, left at INIT),
+# publishes it, then exercises: lookup by name (hit, hit, prefix-miss,
+# absent-miss, over-long key), lookup by slot (hit, hit, absent-miss,
+# out-of-range), a no-op hot-reload, snapshot -> mutate -> rollback with
+# the mutation proven gone in memory AND on disk, two bad-snapshot
+# rejections, a hot-reload that would change a RUNNING driver's manifest
+# (rejected with ERR_RELOAD_CONFLICT, live image proven untouched), and a
+# hot-reload that changes a non-RUNNING driver's manifest (adopted, with
+# the generation id bumped).
+#
+# See:
+#   - design/drivers/registry-v2.md §8 (lookup + hot-reload), §9 (snapshot)
+#   - src/kernel/core/driver/registry_lookup.pdx
+#   - src/kernel/core/driver/registry_snapshot.pdx
+#   - src/kernel/boot/kernel_main.pdx §registry_lookup_witness
+.global registry_lookup_ok_msg
+.align 8
+registry_lookup_ok_msg: .ascii "R29 REGISTRY LOOKUP OK\n\0"
+
+.global registry_lookup_fail_msg
+.align 8
+registry_lookup_fail_msg: .ascii "R29 REGISTRY LOOKUP FAIL\n\0"
+
+
 # R20b.M1-002 (#1553): endpoint_table + payload_arena witness fingerprints —
 # exercises endpoint_alloc/endpoint_free/endpoint_lookup round-trip on the
 # full 128-slot range AND payload_buf_pa_for(0..127) 4 KiB-alignment +

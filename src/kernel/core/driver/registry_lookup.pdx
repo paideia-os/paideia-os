@@ -1,0 +1,667 @@
+// src/kernel/core/driver/registry_lookup.pdx — R29.M3-003 (#1030)
+//
+// Driver registry v2 query layer + hot-reload.
+//
+// Full rationale: design/drivers/registry-v2.md §8.
+//
+// Three things live here:
+//
+//   1. The two lookups the supervisor needs before it launches or
+//      re-parents a driver: by name (the human/manifest key) and by
+//      driver_table slot (the runtime key). Both return a *record index*
+//      into the image they were pointed at, because every other decoder
+//      in this family (registry_v2_field, registry_v2_record_addr) is
+//      indexed, and handing back a record address instead would fork the
+//      accessor convention.
+//
+//   2. Hot-reload: re-read the on-disk file into the in-memory view
+//      without tearing down live driver state.
+//
+//   3. The monotonic generation id. Every adoption of new registry
+//      content — a reload that changed something, a rollback — bumps it.
+//      A consumer that cached a record index or a manifest bitmap
+//      compares the gen id it captured against registry_gen_id() to
+//      learn, in one load, that its cache is stale. Nothing else in the
+//      registry gives that answer cheaply: the content checksum changes
+//      for benign reasons and is not monotonic, so it cannot order two
+//      observations.
+//
+// Image-relative, not buffer-relative
+// -----------------------------------
+// Both lookups take an `image_ptr` as their first argument rather than
+// implicitly addressing the live buffer. This is not gratuitous
+// generality: the reload conflict scan below has to look a slot up in
+// the *candidate* image (the read-back copy in registry_persist's
+// scratch) while simultaneously reading the live image, and a
+// buffer-implicit lookup could not express that. It also matches
+// registry_v2_record_addr / registry_v2_field, which are image-relative
+// for the same reason.
+//
+// Hot-reload semantics — the RUNNING-conflict rule
+// ------------------------------------------------
+// A reload rewrites the entitlement record of drivers that may be
+// executing. The registry answers "what is this driver allowed to do";
+// changing that answer under a driver that is already exercising the old
+// answer is a capability-safety violation, not a configuration update.
+// The rule enforced by registry_reload is therefore:
+//
+//   For every record in the LIVE image whose driver_table slot is
+//   currently in DRIVER_STATE_RUNNING, the candidate image must contain
+//   a record for that slot whose cap_manifest_lo, cap_manifest_hi and
+//   effect_row are byte-identical. Otherwise the whole reload is
+//   rejected with ERR_RELOAD_CONFLICT and the live image is left
+//   byte-untouched.
+//
+// Disappearance counts as a conflict: dropping a RUNNING driver's record
+// is a silent revocation of everything it holds, which is strictly worse
+// than changing one bit of it. Records whose slot is INIT, SUSPENDED,
+// HANDOFF, STOPPING, STOPPED, or absent from the table entirely apply
+// freely — nothing is executing against them, so the new content becomes
+// the truth the supervisor will use at the *next* launch, which is
+// exactly what a hot-reload is for.
+//
+// Only those three fields are conflict-relevant. Version, name, pid and
+// lifecycle_state may all change under a RUNNING driver: version and name
+// are descriptive, pid and lifecycle_state are snapshots of the table
+// (which is authoritative for them, per design §7), and none of them is
+// something a capability is minted from.
+//
+// Incremental reload
+// ------------------
+// The reload diffs the candidate against the live image record by record
+// before doing anything else. A reload that finds no differing record
+// touches no memory at all, bumps no generation, and returns OK with
+// registry_reload_changed() == 0 — so a supervisor may poll the file as
+// often as it likes and pay only the read plus one 96-byte-per-record
+// compare. Only when something differs does the conflict scan run, and
+// only then is the image adopted. That ordering is also why the conflict
+// scan cannot false-positive on a no-op reload.
+//
+// Concurrency: R29.M3 is single-flow pre-scheduler-bringup; there is no
+// lock around the diff/conflict/adopt sequence. A concurrent publish
+// between the load and the adopt would be a torn view; SMP-safety
+// revisits with the R29.M7 chaos-restart harness, at which point the
+// generation id becomes the seqlock counter this module already needs.
+
+module RegistryLookup = structure {
+
+  // ============================================================================
+  // Return codes — 0xFFFFFD4x, one step past registry_persist's
+  // 0xFFFFFD2x I/O space so a query failure is never confused with an
+  // I/O failure or with an 0xFFFFFD0x schema failure.
+  //
+  // The lookups return a record index (0..31) on a hit. Index 0 is a
+  // legitimate answer, so "not found" cannot be signalled by zero; the
+  // 0xFFFFFD4x codes are unmistakably out of the index range, and every
+  // caller distinguishes them with a single `cmp rax, 32; jae`.
+  // ============================================================================
+
+  pub let REGISTRY_LOOKUP_OK             : u64 = 0
+  pub let REGISTRY_LOOKUP_ERR_NOT_FOUND  : u64 = 0xFFFFFD40
+  pub let REGISTRY_LOOKUP_ERR_BAD_NAME   : u64 = 0xFFFFFD41
+  pub let REGISTRY_LOOKUP_ERR_CONFLICT   : u64 = 0xFFFFFD42
+  pub let REGISTRY_LOOKUP_ERR_TOO_MANY   : u64 = 0xFFFFFD43
+
+  // Name field width — 16 bytes, NUL-padded, byte-identical to the
+  // driver_table row's name field (design §2, record +8/+16).
+  pub let REGISTRY_LOOKUP_NAME_BYTES     : u64 = 16
+
+  // ============================================================================
+  // _registry_gen_id: monotonic generation counter. Starts at 0 ("no
+  // content ever adopted from disk"); every reload that adopts a change
+  // and every rollback increments it. It is never reset, so two
+  // observations are always orderable.
+  //
+  // _registry_reload_changed: number of records that differed in the most
+  // recent registry_reload call — the incremental-reload signal. Valid
+  // after any reload that got as far as the diff scan (i.e. any call that
+  // did not fail in load); zero means the on-disk image already matched
+  // the live one.
+  // ============================================================================
+
+  pub let mut _registry_gen_id         : u64 = 0
+  pub let mut _registry_reload_changed : u64 = 0
+
+  // ============================================================================
+  // registry_gen_id() -> u64
+  // ============================================================================
+
+  pub let registry_gen_id : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M3-003 (#1030): read the monotonic registry generation counter. rip-relative lea then one qword load. Leaf; no callee-save writes; no nested calls.",
+      block: {
+        lea rax, [rip + _registry_gen_id];
+        mov rax, [rax + 0];
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // registry_gen_bump() -> u64
+  //
+  // Increments and returns the new generation. Exported rather than
+  // private because registry_snapshot.pdx's rollback path adopts new
+  // content through the same publish path and must advertise it the same
+  // way — a second, private counter there would let a consumer see a
+  // rollback as "no change".
+  // ============================================================================
+
+  pub let registry_gen_bump : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M3-003 (#1030): increment the generation counter and return the new value. Load, add 1, store, return. Monotonic and never reset, so a wrap would require 2^64 adoptions. Leaf; no callee-save writes; no nested calls.",
+      block: {
+        lea r8, [rip + _registry_gen_id];
+        mov rax, [r8 + 0];
+        add rax, 1;
+        mov [r8 + 0], rax;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // registry_reload_changed() -> u64
+  // ============================================================================
+
+  pub let registry_reload_changed : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M3-003 (#1030): read the differing-record count from the most recent reload. rip-relative lea then one qword load. Leaf; no callee-save writes; no nested calls.",
+      block: {
+        lea rax, [rip + _registry_reload_changed];
+        mov rax, [rax + 0];
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // registry_lookup_by_name(image_ptr, name_ptr, name_len) -> u64
+  //
+  // SysV: rdi = image base VA, rsi = name bytes, rdx = name length (1..16)
+  //       -> rax = record index (0..31), or ERR_NOT_FOUND / ERR_BAD_NAME
+  //          / ERR_TOO_MANY.
+  //
+  // Matches against the record's 16-byte NUL-padded name field. The match
+  // is exact, not prefix: after the first `name_len` bytes compare equal,
+  // the record's byte at [name_len] must be NUL (unless name_len is the
+  // full 16). Without that terminator check "uart" would match
+  // "uart-16550", and a supervisor asking for a short name would be
+  // handed a different driver's entitlements — the single most dangerous
+  // way this function could be wrong.
+  //
+  // Records without the valid flag (header bit 16) are skipped: an
+  // invalid record's name field is not meaningful.
+  //
+  // Scan is linear over record_count. At the 32-record cap that is at
+  // most 32 * 16 byte compares; an index would cost more to keep
+  // coherent across reload and rollback than it could ever save at this
+  // scale, and would have to be rebuilt on every generation bump.
+  // ============================================================================
+
+  pub let registry_lookup_by_name : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (image_ptr: u64, name_ptr: u64, name_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M3-003 (#1030): linear exact-match name lookup over an arbitrary registry image. Five-push prologue (rbx, r12, r13, r14, r15) keeps rsp%16==0 and preserves image/name/len/count/index; there are no nested calls, so the pushes exist only to hold the five live values without spilling. Gates: name_len in 1..16 (a zero-length key would match the NUL padding of every record; a >16 key cannot fit the field) and record_count <= 32 before any record is touched. Per record: valid flag (header bit 16) first, then a byte-at-a-time compare of the name field at +8, then the terminator check at [name_len] which is what makes the match exact rather than prefix. Record address computed inline as image + 32 + index*96 via shl 6 + shl 5 + add (no imul), matching registry_v2_record_addr. mov_b zero-extending byte loads into rax/rdx only — the two registers the codebase already uses for byte loads. Read-only throughout; writes no memory.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                           // rsp%16 = 0
+
+        mov rbx, rdi;                       // image base
+        mov r12, rsi;                       // name bytes
+        mov r13, rdx;                       // name length
+
+        // ---- Gates (before any record is read) ----
+        cmp r13, 0;
+        je  registry_lookup_name_bad;
+        cmp r13, 16;                        // REGISTRY_LOOKUP_NAME_BYTES
+        ja  registry_lookup_name_bad;
+
+        mov rax, [rbx + 8];
+        shr rax, 32;                        // record_count
+        cmp rax, 32;                        // REGISTRY_V2_MAX_RECORDS
+        ja  registry_lookup_name_too_many;
+        mov r14, rax;                       // count
+
+        xor r15, r15;                       // index
+
+      registry_lookup_name_scan:
+        cmp r15, r14;
+        jae registry_lookup_name_miss;
+
+        // ---- record address = image + 32 + index*96 ----
+        mov r10, r15;
+        shl r10, 6;
+        mov r11, r15;
+        shl r11, 5;
+        add r10, r11;                       // index * 96
+        add r10, rbx;
+        mov r11, 32;
+        add r10, r11;                       // r10 = &record[index]
+
+        // ---- valid flag (record_flags bit0, header bit 16) ----
+        mov rax, [r10 + 0];
+        shr rax, 16;
+        mov r9, 1;
+        and rax, r9;
+        cmp rax, 1;
+        jne registry_lookup_name_next;
+
+        // ---- byte compare over name_len bytes of the name field ----
+        add r10, 8;                         // r10 = &record.name[0]
+        xor rcx, rcx;
+
+      registry_lookup_name_byte:
+        cmp rcx, r13;
+        jae registry_lookup_name_tail;
+
+        mov r8, r10;
+        add r8, rcx;
+        mov_b rax, [r8 + 0];                // record byte
+        mov r8, r12;
+        add r8, rcx;
+        mov_b rdx, [r8 + 0];                // key byte
+        cmp rax, rdx;
+        jne registry_lookup_name_next;
+
+        add rcx, 1;
+        jmp registry_lookup_name_byte;
+
+      registry_lookup_name_tail:
+        // Exact-match terminator: a key shorter than the field must be
+        // followed by NUL in the record, else this is a prefix, not a name.
+        cmp r13, 16;
+        je  registry_lookup_name_hit;
+        mov r8, r10;
+        add r8, r13;
+        mov_b rax, [r8 + 0];
+        cmp rax, 0;
+        jne registry_lookup_name_next;
+
+      registry_lookup_name_hit:
+        mov rax, r15;
+        jmp registry_lookup_name_ret;
+
+      registry_lookup_name_next:
+        add r15, 1;
+        jmp registry_lookup_name_scan;
+
+      registry_lookup_name_miss:
+        mov rax, 0xFFFFFD40;                // ERR_NOT_FOUND
+        jmp registry_lookup_name_ret;
+
+      registry_lookup_name_bad:
+        mov rax, 0xFFFFFD41;                // ERR_BAD_NAME
+        jmp registry_lookup_name_ret;
+
+      registry_lookup_name_too_many:
+        mov rax, 0xFFFFFD43;                // ERR_TOO_MANY
+
+      registry_lookup_name_ret:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // registry_lookup_by_slot(image_ptr, slot) -> u64
+  //
+  // SysV: rdi = image base VA, rsi = driver_table slot (0..31)
+  //       -> rax = record index (0..31), or ERR_NOT_FOUND / ERR_TOO_MANY.
+  //
+  // The record index and the driver_table slot are deliberately NOT the
+  // same number: an image may hold a subset of the table's rows, in any
+  // order (the encoder takes both as independent arguments). This scan is
+  // what turns the runtime key into the record key.
+  //
+  // An out-of-range slot returns ERR_NOT_FOUND rather than a distinct
+  // bad-slot code: the question "is there a record for slot 99" has the
+  // honest answer "no", and a caller that wants slot validation has
+  // driver_table_slot_in_use for exactly that.
+  // ============================================================================
+
+  pub let registry_lookup_by_slot : (u64, u64) -> u64 !{mem} @{} =
+    fn (image_ptr: u64, slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M3-003 (#1030): linear slot lookup over an arbitrary registry image. Five-push prologue for a consistent frame with the by-name lookup; no nested calls. record_count gated <= 32 before any record is read. Per record: valid flag (header bit 16) then the low byte of the header (driver_table_slot) compared against the key. Record address computed inline as image + 32 + index*96 via shl 6 + shl 5 + add. Read-only throughout; writes no memory.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                           // rsp%16 = 0
+
+        mov rbx, rdi;                       // image base
+        mov r12, rsi;                       // slot
+
+        mov rax, [rbx + 8];
+        shr rax, 32;                        // record_count
+        cmp rax, 32;
+        ja  registry_lookup_slot_too_many;
+        mov r14, rax;
+
+        xor r15, r15;
+
+      registry_lookup_slot_scan:
+        cmp r15, r14;
+        jae registry_lookup_slot_miss;
+
+        mov r10, r15;
+        shl r10, 6;
+        mov r11, r15;
+        shl r11, 5;
+        add r10, r11;
+        add r10, rbx;
+        mov r11, 32;
+        add r10, r11;                       // r10 = &record[index]
+
+        mov rax, [r10 + 0];
+        mov r13, rax;                       // stash header
+        shr rax, 16;
+        mov r9, 1;
+        and rax, r9;
+        cmp rax, 1;
+        jne registry_lookup_slot_next;
+
+        mov rax, r13;
+        mov r9, 0xFF;
+        and rax, r9;                        // driver_table_slot
+        cmp rax, r12;
+        je  registry_lookup_slot_hit;
+
+      registry_lookup_slot_next:
+        add r15, 1;
+        jmp registry_lookup_slot_scan;
+
+      registry_lookup_slot_hit:
+        mov rax, r15;
+        jmp registry_lookup_slot_ret;
+
+      registry_lookup_slot_miss:
+        mov rax, 0xFFFFFD40;                // ERR_NOT_FOUND
+        jmp registry_lookup_slot_ret;
+
+      registry_lookup_slot_too_many:
+        mov rax, 0xFFFFFD43;                // ERR_TOO_MANY
+
+      registry_lookup_slot_ret:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // registry_reload(count) -> u64
+  //
+  // SysV: rdi = expected record count -> rax = REGISTRY_LOOKUP_OK,
+  //       ERR_CONFLICT, or an 0xFFFFFD0x / 0xFFFFFD2x code forwarded
+  //       verbatim from the load path.
+  //
+  // Sequence:
+  //   1. registry_persist_load(count) — reads the live file into scratch
+  //      and fscks it. An image that fails fsck is never diffed, never
+  //      compared against, and never adopted.
+  //   2. Diff scan: candidate vs live, record by record. A count mismatch
+  //      is treated as "every record changed" (the geometry itself moved).
+  //      The differing-record count is published in
+  //      _registry_reload_changed.
+  //   3. If nothing differs: return OK. No store to the live image, no
+  //      generation bump. This is the polling fast path.
+  //   4. Conflict scan: for every live record whose slot is RUNNING, the
+  //      candidate must carry the same slot with identical
+  //      cap_manifest_lo / cap_manifest_hi / effect_row. Any violation —
+  //      including the record having vanished — returns ERR_CONFLICT with
+  //      the live image untouched.
+  //   5. Adopt: bulk-copy the candidate over the live buffer, re-fsck the
+  //      result, bump the generation.
+  //
+  // Step 5 re-fscks after the copy even though step 1 already fscked the
+  // same bytes: the copy is the only operation between them, and a
+  // validate here is the difference between "the copy is correct" and
+  // "the copy was believed correct". It costs one pass over <= 6432 bytes
+  // on a path that already did file I/O.
+  //
+  // The copy length is the sealed image size rounded UP to a qword
+  // multiple (96*count + 3357 is never 8-aligned). The extra <= 7 bytes
+  // sit past the signature block inside both 6432-byte buffers, are
+  // ignored by every reader, and buy a copy loop with no tail case.
+  // ============================================================================
+
+  pub let registry_reload : (u64) -> u64 !{mem} @{} =
+    fn (count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M3-003 (#1030): hot-reload the on-disk registry into the live image under the RUNNING-conflict rule. Five-push prologue (rbx, r12, r13, r14, r15) for rsp%16==0 across the nested calls (registry_persist_load, registry_v2_buf_addr, registry_persist_scratch_addr, driver_lifecycle_get_state, registry_lookup_by_slot, registry_v2_total_bytes, registry_v2_validate, registry_gen_bump); rbx = count, r12 = live image VA, r13 = candidate (scratch) VA, r14 = changed-record count then live record_count, r15 = loop index. The slot being examined in the conflict scan is deliberately re-derived from the live image after every call rather than parked in a sixth callee-save: r12 and r15 survive the calls, so the derivation is three instructions and a load, and a sixth push would need a stack pad to keep rsp%16==0. Ordering is load -> diff -> early-out -> conflict -> adopt: the diff runs first because a no-op reload must touch nothing, and because a record that did not change cannot conflict. The live buffer is written only in the adopt step, after every gate, so a rejected reload leaves the in-memory view byte-identical — the same preserve-on-failure ordering registry_persist_publish uses for the live file. Conflict detection compares only cap_manifest_lo (+32), cap_manifest_hi (+40) and effect_row (+48): those are the fields a capability is minted from; name, version, pid and lifecycle_state are descriptive or table-authoritative and may change under a RUNNING driver.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                           // rsp%16 = 0
+
+        mov rbx, rdi;                       // count
+
+        // ---- Step 1: read the live file into scratch and fsck it ----
+        mov rdi, rbx;
+        call registry_persist_load;
+        cmp rax, 0;
+        jne registry_reload_ret;            // forward load/fsck code verbatim
+
+        call registry_v2_buf_addr;
+        mov r12, rax;                       // live image VA
+
+        call registry_persist_scratch_addr;
+        mov r13, rax;                       // candidate image VA
+
+        // ---- Step 2: diff scan ----
+        xor r14, r14;                       // changed-record count
+
+        mov rax, [r12 + 8];
+        shr rax, 32;                        // live record_count
+        cmp rax, rbx;
+        jne registry_reload_structural;     // geometry moved: all changed
+
+        xor r15, r15;
+
+      registry_reload_diff:
+        cmp r15, rbx;
+        jae registry_reload_diff_done;
+
+        mov r10, r15;
+        shl r10, 6;
+        mov r11, r15;
+        shl r11, 5;
+        add r10, r11;
+        mov r11, 32;
+        add r10, r11;                       // r10 = 32 + index*96 (offset)
+
+        mov r8, r12;
+        add r8, r10;                        // live record
+        mov r9, r13;
+        add r9, r10;                        // candidate record
+
+        xor rcx, rcx;
+
+      registry_reload_qword:
+        cmp rcx, 96;                        // REGISTRY_V2_RECORD_BYTES
+        jae registry_reload_rec_same;
+
+        mov rax, r8;
+        add rax, rcx;
+        mov rax, [rax + 0];
+        mov rdx, r9;
+        add rdx, rcx;
+        mov rdx, [rdx + 0];
+        cmp rax, rdx;
+        jne registry_reload_rec_diff;
+
+        add rcx, 8;
+        jmp registry_reload_qword;
+
+      registry_reload_rec_diff:
+        add r14, 1;
+
+      registry_reload_rec_same:
+        add r15, 1;
+        jmp registry_reload_diff;
+
+      registry_reload_structural:
+        mov r14, rbx;                       // treat every record as changed
+
+      registry_reload_diff_done:
+        lea rax, [rip + _registry_reload_changed];
+        mov [rax + 0], r14;
+
+        // ---- Step 3: nothing changed -> no-op reload ----
+        cmp r14, 0;
+        je  registry_reload_ok;
+
+        // ---- Step 4: conflict scan over the LIVE records ----
+        mov rax, [r12 + 8];
+        shr rax, 32;
+        mov r14, rax;                       // live record_count
+        xor r15, r15;
+
+      registry_reload_conflict:
+        cmp r15, r14;
+        jae registry_reload_adopt;
+
+        // live record address
+        mov r10, r15;
+        shl r10, 6;
+        mov r11, r15;
+        shl r11, 5;
+        add r10, r11;
+        add r10, r12;
+        mov r11, 32;
+        add r10, r11;
+
+        mov rax, [r10 + 0];
+        mov r9, 0x10000;
+        and rax, r9;                        // valid flag
+        cmp rax, 0;
+        je  registry_reload_cf_next;        // invalid record protects nothing
+
+        mov rax, [r10 + 0];
+        mov r9, 0xFF;
+        and rax, r9;                        // driver_table slot
+        mov rdi, rax;
+        call driver_lifecycle_get_state;
+        cmp rax, 1;                         // DRIVER_STATE_RUNNING
+        jne registry_reload_cf_next;
+
+        // Re-derive the slot (rax was consumed by the call; r12/r15 held).
+        mov r10, r15;
+        shl r10, 6;
+        mov r11, r15;
+        shl r11, 5;
+        add r10, r11;
+        add r10, r12;
+        mov r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        mov r9, 0xFF;
+        and rax, r9;
+
+        mov rdi, r13;
+        mov rsi, rax;
+        call registry_lookup_by_slot;
+        cmp rax, 32;                        // REGISTRY_V2_MAX_RECORDS
+        jae registry_reload_conflict_hit;   // vanished == revocation
+
+        // candidate record address
+        mov r10, rax;
+        shl r10, 6;
+        mov r11, rax;
+        shl r11, 5;
+        add r10, r11;
+        add r10, r13;
+        mov r11, 32;
+        add r10, r11;                       // r10 = candidate record
+
+        // live record address (re-derived)
+        mov r8, r15;
+        shl r8, 6;
+        mov r9, r15;
+        shl r9, 5;
+        add r8, r9;
+        add r8, r12;
+        mov r9, 32;
+        add r8, r9;                         // r8 = live record
+
+        mov rax, [r8 + 32];                 // cap_manifest_lo
+        mov rdx, [r10 + 32];
+        cmp rax, rdx;
+        jne registry_reload_conflict_hit;
+
+        mov rax, [r8 + 40];                 // cap_manifest_hi
+        mov rdx, [r10 + 40];
+        cmp rax, rdx;
+        jne registry_reload_conflict_hit;
+
+        mov rax, [r8 + 48];                 // effect_row
+        mov rdx, [r10 + 48];
+        cmp rax, rdx;
+        jne registry_reload_conflict_hit;
+
+      registry_reload_cf_next:
+        add r15, 1;
+        jmp registry_reload_conflict;
+
+        // ---- Step 5: adopt ----
+      registry_reload_adopt:
+        mov rdi, rbx;
+        call registry_v2_total_bytes;
+        add rax, 7;
+        mov r9, 0xFFFFFFFFFFFFFFF8;
+        and rax, r9;                        // round up to a qword multiple
+        mov rcx, rax;
+        xor rdx, rdx;
+
+      registry_reload_copy:
+        cmp rdx, rcx;
+        jae registry_reload_copy_done;
+        mov r8, r13;
+        add r8, rdx;
+        mov r8, [r8 + 0];
+        mov r9, r12;
+        add r9, rdx;
+        mov [r9 + 0], r8;
+        add rdx, 8;
+        jmp registry_reload_copy;
+
+      registry_reload_copy_done:
+        mov rdi, r12;
+        call registry_v2_validate;
+        cmp rax, 0;
+        jne registry_reload_ret;            // forward fsck code verbatim
+
+        call registry_gen_bump;
+
+      registry_reload_ok:
+        xor rax, rax;                       // REGISTRY_LOOKUP_OK
+        jmp registry_reload_ret;
+
+      registry_reload_conflict_hit:
+        mov rax, 0xFFFFFD42;                // ERR_RELOAD_CONFLICT
+
+      registry_reload_ret:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+}
