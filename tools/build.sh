@@ -174,6 +174,148 @@ if [[ -n "${opreg_strays}" ]]; then
 fi
 echo "[opregion-confine] _op_region_table confined to core/cap/kind_op_region.o"
 
+# R30.M4-001 (#1066) / R30.M4-002 (#1067): SCI/GPE PATH GUARDRAILS.
+#
+# Three checks, in increasing order of what they buy.
+#
+# (1) STORAGE CONFINEMENT, the same shape as the OP-REGION check above.
+#     _gpe_cfg holds the validated block geometry, _gpe_dispatch_table
+#     and _gpe_event_ring hold the registration rows and the queued
+#     events, and _gpe_io_mode selects between real port I/O and the
+#     synthetic window. Each has exactly one legitimate writing module,
+#     and an object outside it that relocates against one of these is
+#     an object that can install an unvalidated geometry, register a
+#     subscriber without a range check, forge an event, or leave the
+#     kernel addressing RAM in place of the platform's GPE block.
+#
+# (2) PORT-I/O CONFINEMENT. `in`/`out` carry no effect-row or
+#     capability coupling in paideia-as yet (paideia-as#1312), so the
+#     elaborator cannot refuse a stray port access the way it refuses
+#     an uncapability'd MMIO effect. Until it can, "every GPE register
+#     access goes through gpe_io_read8 / gpe_io_write8" is enforced
+#     here: core/acpi/gpe_io.o is the only object under core/acpi/ that
+#     may contain the IN/OUT opcodes at all.
+#
+# (3) ISR CALL-TARGET ALLOWLIST — the important one. A GPE's meaning is
+#     a firmware control method; those are bytecode, the interpreter is
+#     a userspace process, and evaluating one can block for
+#     milliseconds. "The ISR does not evaluate one" has to be a
+#     property of the call graph rather than of anyone's intent, so the
+#     set of symbols core/acpi/sci_isr.o references is required to be a
+#     SUBSET of the list below. Every entry is a bounded, non-blocking
+#     leaf or near-leaf, which makes this simultaneously the no-
+#     evaluation guarantee and the boundedness guarantee: adding a call
+#     to an interpreter entry point, an IPC send, a scheduler yield, a
+#     lock or an allocator fails the build by name.
+GPE_CONFINE_OK=1
+gpe_confine_one() {
+    # $1 = symbol, $2 = owning object path (relative to BUILD_DIR)
+    local sym="$1" owner="${BUILD_DIR}/$2" strays=""
+    if [[ ! -f "${owner}" ]]; then
+        echo "[gpe-confine] FAIL: ${owner} not built" >&2
+        GPE_CONFINE_OK=0
+        return
+    fi
+    if ! objdump -r "${owner}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+        echo "[gpe-confine] FAIL: $2 does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  check would then pass vacuously, so it fails instead." >&2
+        GPE_CONFINE_OK=0
+        return
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${owner}" ]] && continue
+        if objdump -r "${o}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[gpe-confine] FAIL — objects other than $2 relocate against ${sym}:${strays}" >&2
+        GPE_CONFINE_OK=0
+    fi
+}
+gpe_confine_one '_gpe_cfg'            'core/acpi/gpe_block.o'
+gpe_confine_one '_gpe_dispatch_table' 'core/acpi/gpe_table.o'
+gpe_confine_one '_gpe_event_ring'     'core/acpi/gpe_table.o'
+gpe_confine_one '_gpe_io_mode'        'core/acpi/gpe_io.o'
+gpe_confine_one '_gpe_io_synth_ram'   'core/acpi/gpe_io.o'
+if [[ "${GPE_CONFINE_OK}" -ne 1 ]]; then
+    echo "  See src/kernel/core/acpi/gpe_block.pdx and gpe_table.pdx for why each" >&2
+    echo "  of these has exactly one legitimate writer." >&2
+    exit 1
+fi
+echo "[gpe-confine] GPE geometry, dispatch table, event ring and I/O seam confined"
+
+# (2) Port I/O confinement under core/acpi/.
+gpe_io_strays=""
+for o in "${OBJECTS[@]}"; do
+    case "${o}" in
+        "${BUILD_DIR}"/core/acpi/*) ;;
+        *) continue ;;
+    esac
+    [[ "${o}" == "${BUILD_DIR}/core/acpi/gpe_io.o" ]] && continue
+    # IN AL,DX = 0xEC ; IN EAX,DX = 0xED ; OUT DX,AL = 0xEE ; OUT DX,EAX = 0xEF
+    if objdump -d "${o}" 2>/dev/null | grep -qE '^\s+[0-9a-f]+:.*\b(in|out)\s+(\(%dx\),%(al|ax|eax)|%(al|ax|eax),\(%dx\))'; then
+        gpe_io_strays="${gpe_io_strays} ${o#"${BUILD_DIR}"/}"
+    fi
+done
+if [[ -n "${gpe_io_strays}" ]]; then
+    echo "[gpe-portio] FAIL — port I/O outside core/acpi/gpe_io.o:${gpe_io_strays}" >&2
+    echo "  Every GPE register access must go through gpe_io_read8 / gpe_io_write8." >&2
+    echo "  paideia-as#1312 will make this an effect-row property; until then it is" >&2
+    echo "  this check. See src/kernel/core/acpi/gpe_io.pdx." >&2
+    exit 1
+fi
+echo "[gpe-portio] port I/O under core/acpi/ confined to gpe_io.o"
+
+# (3) ISR call-target allowlist.
+SCI_ISR_OBJ="${BUILD_DIR}/core/acpi/sci_isr.o"
+if [[ ! -f "${SCI_ISR_OBJ}" ]]; then
+    echo "[sci-isr-allowlist] FAIL: ${SCI_ISR_OBJ} not built" >&2
+    exit 1
+fi
+SCI_ISR_ALLOWED="
+gpe_block_reg_bytes
+gpe_block_status_base
+gpe_block_enable_base
+gpe_block_index_base
+gpe_io_read8
+gpe_io_write8
+gpe_io_eoi
+gpe_lookup
+gpe_note_strike
+gpe_mark_perm_masked
+gpe_mark_pending
+gpe_event_enqueue
+drv_audit_emit
+"
+sci_isr_refs=$(objdump -r "${SCI_ISR_OBJ}" 2>/dev/null \
+    | awk 'NF >= 3 && $1 ~ /^[0-9a-f]+$/ { print $3 }' \
+    | sed -e 's/[-+]0x[0-9a-f]*$//' | sort -u)
+if [[ -z "${sci_isr_refs}" ]]; then
+    echo "[sci-isr-allowlist] FAIL: no relocations found in sci_isr.o" >&2
+    echo "  The ISR was gutted or inlined away; the allowlist would then pass" >&2
+    echo "  vacuously, so it fails instead." >&2
+    exit 1
+fi
+sci_isr_bad=""
+while IFS= read -r sym; do
+    [[ -z "${sym}" ]] && continue
+    if ! printf '%s\n' ${SCI_ISR_ALLOWED} | grep -qx -- "${sym}"; then
+        sci_isr_bad="${sci_isr_bad} ${sym}"
+    fi
+done <<< "${sci_isr_refs}"
+if [[ -n "${sci_isr_bad}" ]]; then
+    echo "[sci-isr-allowlist] FAIL — core/acpi/sci_isr.o references:${sci_isr_bad}" >&2
+    echo "  The SCI ISR may only call bounded, non-blocking primitives. No firmware" >&2
+    echo "  method evaluation, no IPC, no scheduling, no allocation, no locks." >&2
+    echo "  If a new call really belongs in interrupt context, add it to" >&2
+    echo "  SCI_ISR_ALLOWED here AND say in the commit why it is bounded." >&2
+    echo "  See src/kernel/core/acpi/sci_isr.pdx §The allowlist." >&2
+    exit 1
+fi
+echo "[sci-isr-allowlist] sci_isr.o call targets within the bounded allowlist"
+
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
 if [[ ${#OBJECTS[@]} -eq 0 ]]; then

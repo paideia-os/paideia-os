@@ -1,0 +1,699 @@
+// src/kernel/core/acpi/gpe_table.pdx — R30.M4-002 (#1067)
+//
+// GPE dispatch table, strike accounting, and the ISR-to-supervisor
+// event ring.
+//
+// -----------------------------------------------------------------------------
+// What a "handler" is in this design, and what it deliberately is not
+// -----------------------------------------------------------------------------
+//
+// A GPE fires and the platform's answer is a firmware control method.
+// Firmware control methods are bytecode, the interpreter for that
+// bytecode runs in a userspace process (see design/acpi/
+// no-aml-in-kernel.md), and evaluating one can take milliseconds and
+// block on an embedded-controller transaction. None of that can happen
+// in an interrupt handler.
+//
+// So the registration table does NOT hold a code pointer. It holds a
+// SUBSCRIBER IDENTITY: an opaque non-zero token that R30.M4-004
+// (#1069) resolves to the userspace supervisor endpoint the event is
+// routed to. The kernel never calls it. The ISR's entire relationship
+// to a handler is "enqueue a record naming this subscriber's event".
+//
+// That is not a stylistic preference. It is why there is no field in
+// this table that a future change could plausibly turn into a call
+// from interrupt context: there is nothing to call.
+//
+// -----------------------------------------------------------------------------
+// Strike accounting and the storm threshold
+// -----------------------------------------------------------------------------
+//
+// The ISR masks a GPE before queueing it, so a well-behaved event
+// cannot re-fire while its handler is outstanding. The storm case is
+// the other one: the supervisor evaluates the method, re-enables the
+// GPE, and the source asserts again immediately because the underlying
+// condition was never resolved — a wedged embedded controller, a
+// firmware bug, a device holding its line. Clear-before-EOI is correct
+// and the machine still makes no progress, because the event genuinely
+// keeps recurring.
+//
+// Every assertion increments a per-GPE strike count. A successful
+// acknowledgement from the supervisor (gpe_ack) resets it to zero. If
+// the count exceeds GPE_STORM_THRESHOLD the GPE is retired: its enable
+// bit stays clear, GPE_ROW_F_PERM_MASKED is set so gpe_ack can never
+// re-enable it, and an audit record is emitted.
+//
+// The threshold is 8. Reasoning for that number rather than a smaller
+// or larger one:
+//
+//   * It has to be greater than the longest legitimate burst. An
+//     embedded controller servicing a thermal or lid event asserts its
+//     GPE once per query in a short sequence; ACPICA's threshold of 3
+//     is known to retire such bursts on some machines. 8 clears that.
+//   * It has to be small enough that a wedged line costs a bounded
+//     and trivial amount of time. Eight ISR entries is microseconds.
+//   * Retirement must never be silent, hence the audit record, and
+//     must never be a panic: losing one GPE on a laptop with broken
+//     firmware is a degraded machine, and livelocking on it is a dead
+//     one. The system keeps running with that event retired.
+//
+// -----------------------------------------------------------------------------
+// Storage
+// -----------------------------------------------------------------------------
+//
+// _gpe_dispatch_table : 256 rows x 32 B. Row layout:
+//   +0  u64 flags          IN_USE | PERM_MASKED | PENDING
+//   +8  u64 subscriber_id  opaque, non-zero when IN_USE
+//   +16 u64 strikes        consecutive assertions without an ack
+//   +24 u64 events         lifetime assertions, for observability
+//
+// _gpe_event_ring : 32 records x 32 B. Record layout:
+//   +0  u64 gpe_index
+//   +8  u64 enable_snapshot   the enable byte READ BACK at enqueue time
+//   +16 u64 strikes
+//   +24 u64 seq
+//
+// The enable_snapshot field is the mask-before-enqueue evidence. The
+// ISR does not record what it intended to write; it re-reads the
+// enable register through the same seam every other access uses and
+// stores what the register actually says at the moment the record is
+// created. A witness can then assert that this event's bit is clear
+// in the byte that was live when the event was queued, which is the
+// literal property, not a proxy for it.
+//
+// Both tables are confined to this object; tools/build.sh asserts that
+// no other object relocates against either symbol.
+
+module GpeTable = structure {
+
+  // ============================================================================
+  // Geometry
+  // ============================================================================
+
+  pub let GPE_TABLE_ROWS        : u64 = 256
+  pub let GPE_TABLE_ROW_BYTES   : u64 = 32
+
+  pub let GPE_EVENT_SLOTS       : u64 = 32
+  pub let GPE_EVENT_MASK        : u64 = 31
+  pub let GPE_EVENT_REC_BYTES   : u64 = 32
+
+  pub let GPE_STORM_THRESHOLD   : u64 = 8
+
+  // Row flags.
+  pub let GPE_ROW_F_IN_USE      : u64 = 1
+  pub let GPE_ROW_F_PERM_MASKED : u64 = 2
+  pub let GPE_ROW_F_PENDING     : u64 = 4
+
+  // Event-record field indices for gpe_event_field.
+  pub let GPE_EV_F_INDEX        : u64 = 0
+  pub let GPE_EV_F_ENABLE_SNAP  : u64 = 1
+  pub let GPE_EV_F_STRIKES      : u64 = 2
+  pub let GPE_EV_F_SEQ          : u64 = 3
+
+  // Audit event code for a storm retirement. Continues the
+  // audit_channel.pdx enumeration (MINT 1, REVOKE 2, HANDOFF 3,
+  // RESTART 4, ESCALATE 5, CHANDEAD 6). Carries kind = 0 per the
+  // convention for events that are not capability transitions, so
+  // drv_audit_balance_since and drv_audit_live_count -- which filter
+  // on kind -- are unaffected by storm traffic.
+  pub let GPE_AUDIT_EV_STORM    : u64 = 7
+
+  // ============================================================================
+  // Storage
+  // ============================================================================
+
+  pub let mut _gpe_dispatch_table : [u64; 1024] = uninit @align(64)
+  pub let mut _gpe_event_ring     : [u64; 128]  = uninit @align(64)
+  pub let mut _gpe_event_head     : u64 = 0
+  pub let mut _gpe_event_read     : u64 = 0
+  pub let mut _gpe_event_drops    : u64 = 0
+
+  // ============================================================================
+  // gpe_table_reset() -> ()
+  // ============================================================================
+
+  pub let gpe_table_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): clear all 1024 qwords of the dispatch table. Counted loop over qwords rather than rows because the row stride is irrelevant to a full zero and a qword loop has one bound to get wrong instead of two. Leaf. Labels prefixed gpe_tbl_reset_ per reserved-label discipline.",
+      block: {
+        lea r10, [rip + _gpe_dispatch_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      gpe_tbl_reset_next:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 1024;
+        jb  gpe_tbl_reset_next;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // gpe_row_field(index, field) -> value, 0 for an out-of-range index.
+  // ============================================================================
+
+  pub let gpe_row_field : (u64, u64) -> u64 !{mem} @{} =
+    fn (index: u64, field: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): bounds-checked read of one qword of one dispatch row. field < 4 and index < 256 are both checked before any address arithmetic, so no byte outside the 8192-byte table is read. Offset = index*32 + field*8; the row stride is a power of two so the index scale is a single shift. Leaf, read-only. Labels prefixed gpe_row_f_ per reserved-label discipline.",
+      block: {
+        cmp rsi, 4;
+        jae gpe_row_f_zero;
+        cmp rdi, 256;                          // GPE_TABLE_ROWS
+        jae gpe_row_f_zero;
+        mov rax, rdi;
+        shl rax, 5;                            // * GPE_TABLE_ROW_BYTES
+        mov r11, rsi;
+        shl r11, 3;
+        add rax, r11;
+        lea r10, [rip + _gpe_dispatch_table];
+        add r10, rax;
+        mov rax, [r10 + 0];
+        ret;
+      gpe_row_f_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let gpe_row_flags : (u64) -> u64 !{mem} @{} =
+    fn (index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): row flags word. One push (rbx, unused) brings rsp%16 to 0 at the nested gpe_row_field call. Labels prefixed gpe_row_fl_ per reserved-label discipline.",
+      block: {
+        push rbx;
+        xor rsi, rsi;
+        call gpe_row_field;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let gpe_lookup : (u64) -> u64 !{mem} @{} =
+    fn (index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): the registered subscriber identity, or 0 when nothing is registered. Returns the stored token only when GPE_ROW_F_IN_USE is set, so an unregister that left a stale token could not resurrect it. One push (rbx) carries the index across the flags read and restores rsp%16 to 0 at both nested calls. Labels prefixed gpe_lk_ per reserved-label discipline.",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+        xor rsi, rsi;
+        call gpe_row_field;
+        and rax, 1;                            // GPE_ROW_F_IN_USE
+        cmp rax, 1;
+        jne gpe_lk_none;
+        mov rdi, rbx;
+        mov rsi, 1;
+        call gpe_row_field;
+        pop rbx;
+        ret;
+      gpe_lk_none:
+        xor rax, rax;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let gpe_strikes : (u64) -> u64 !{mem} @{} =
+    fn (index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): consecutive assertions since the last acknowledgement. One push (rbx, unused) aligns the nested call. Labels prefixed gpe_st_ per reserved-label discipline.",
+      block: {
+        push rbx;
+        mov rsi, 2;
+        call gpe_row_field;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let gpe_events : (u64) -> u64 !{mem} @{} =
+    fn (index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): lifetime assertion count for this GPE. One push (rbx, unused) aligns the nested call. Labels prefixed gpe_ev_ per reserved-label discipline.",
+      block: {
+        push rbx;
+        mov rsi, 3;
+        call gpe_row_field;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let gpe_is_perm_masked : (u64) -> u64 !{mem} @{} =
+    fn (index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): 1 iff this GPE has been retired by the storm gate. One push (rbx, unused) aligns the nested call. Labels prefixed gpe_pm_ per reserved-label discipline.",
+      block: {
+        push rbx;
+        xor rsi, rsi;
+        call gpe_row_field;
+        shr rax, 1;
+        and rax, 1;                            // GPE_ROW_F_PERM_MASKED
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // gpe_register(index, subscriber_id) -> GPE_OK | GPE_REG_*
+  //
+  // Gate order matters and is documented in the justification: the
+  // range check must precede the duplicate check, because a duplicate
+  // check on an out-of-range index would read outside the table.
+  // ============================================================================
+
+  pub let gpe_register : (u64, u64) -> u64 !{mem} @{} =
+    fn (index: u64, subscriber_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): install a subscriber for one GPE index. Gates, in this order: (1) the module must be configured -- GPE_REG_UNCONFIGURED. Registering against an unknown geometry would accept indices that no block owns and then silently never dispatch them. (2) gpe_resolve(index) must succeed -- GPE_REG_BAD_INDEX. This is the range check, and it is deliberately expressed as 'the configured geometry can decompose it' rather than 'index < 256': an index inside the 256-entry table but outside both blocks has no register bit and must be refused. It also has to precede everything that touches the table, because a duplicate check on an unbounded index would read outside the 8192-byte object. (3) subscriber_id must be non-zero -- GPE_REG_BAD_HANDLER. Zero is the sentinel gpe_lookup returns for 'nothing registered', so a zero token would be indistinguishable from absence. (4) GPE_ROW_F_IN_USE must be clear -- GPE_REG_DUPLICATE. Second registration is refused rather than replacing the first, because silently replacing means one subscriber stops receiving events it believes it is still subscribed to. The three failure codes are distinct values so a caller can tell which gate refused. On success: flags = IN_USE (which also clears any stale PERM_MASKED and PENDING from a previous incarnation), subscriber stored, strikes and events zeroed. Three pushes (rbx, r12, r13) hold index and subscriber across the two nested calls; entry rsp%16 == 8 and an odd push count returns it to 0 at each call site. Labels prefixed gpe_reg_ per reserved-label discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                          // index
+        mov r12, rsi;                          // subscriber_id
+
+        call gpe_configured;
+        cmp rax, 1;
+        jne gpe_reg_unconfigured;
+
+        mov rdi, rbx;
+        call gpe_resolve;
+        mov r13, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r13;
+        je  gpe_reg_bad_index;
+
+        cmp r12, 0;
+        je  gpe_reg_bad_handler;
+
+        // Duplicate gate.
+        mov rdi, rbx;
+        xor rsi, rsi;
+        call gpe_row_field;
+        and rax, 1;                            // GPE_ROW_F_IN_USE
+        cmp rax, 0;
+        jne gpe_reg_duplicate;
+
+        // Commit.
+        mov rax, rbx;
+        shl rax, 5;
+        lea r10, [rip + _gpe_dispatch_table];
+        add r10, rax;
+        mov r11, 1;                            // IN_USE only
+        mov [r10 + 0],  r11;
+        mov [r10 + 8],  r12;
+        xor r11, r11;
+        mov [r10 + 16], r11;
+        mov [r10 + 24], r11;
+
+        xor rax, rax;                          // GPE_OK
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      gpe_reg_unconfigured:
+        mov rax, 0xFFFFFFB7;                   // GPE_REG_UNCONFIGURED
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      gpe_reg_bad_index:
+        mov rax, 0xFFFFFFBB;                   // GPE_REG_BAD_INDEX
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      gpe_reg_bad_handler:
+        mov rax, 0xFFFFFFB9;                   // GPE_REG_BAD_HANDLER
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      gpe_reg_duplicate:
+        mov rax, 0xFFFFFFBA;                   // GPE_REG_DUPLICATE
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // gpe_unregister(index) -> GPE_OK | GPE_REG_BAD_INDEX |
+  //                          GPE_REG_NOT_REGISTERED
+  // ============================================================================
+
+  pub let gpe_unregister : (u64) -> u64 !{mem} @{} =
+    fn (index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): remove a subscriber. index < 256 is checked directly here rather than through gpe_resolve, because a row that was registered under a geometry that has since been replaced must still be removable -- refusing to unregister it would strand a row that gpe_register would then refuse as a duplicate. GPE_ROW_F_IN_USE clear is GPE_REG_NOT_REGISTERED, a distinct code from BAD_INDEX so an idempotent caller can tell 'never was' from 'cannot be'. On success the whole row is zeroed, including PERM_MASKED: unregistering a retired GPE and registering it again is the sanctioned way to give a storm-retired event a second chance, and it is deliberately explicit rather than automatic. Three pushes (rbx, r12, r13) for the odd-count call alignment. Labels prefixed gpe_unreg_ per reserved-label discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;
+        cmp rbx, 256;
+        jae gpe_unreg_bad_index;
+
+        mov rdi, rbx;
+        xor rsi, rsi;
+        call gpe_row_field;
+        and rax, 1;
+        cmp rax, 1;
+        jne gpe_unreg_absent;
+
+        mov rax, rbx;
+        shl rax, 5;
+        lea r10, [rip + _gpe_dispatch_table];
+        add r10, rax;
+        xor r11, r11;
+        mov [r10 + 0],  r11;
+        mov [r10 + 8],  r11;
+        mov [r10 + 16], r11;
+        mov [r10 + 24], r11;
+
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      gpe_unreg_bad_index:
+        mov rax, 0xFFFFFFBB;                   // GPE_REG_BAD_INDEX
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      gpe_unreg_absent:
+        mov rax, 0xFFFFFFB8;                   // GPE_REG_NOT_REGISTERED
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // Strike / flag mutators. Called from interrupt context, so each one
+  // is a bounded straight line over a single row.
+  // ============================================================================
+
+  // gpe_note_strike(index) -> new strike count (0 for a bad index).
+  pub let gpe_note_strike : (u64) -> u64 !{mem} @{} =
+    fn (index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): record one assertion of this GPE -- increment both the consecutive-strike counter and the lifetime event counter, and return the new strike count so the ISR can compare it against GPE_STORM_THRESHOLD without a second table read. Bounded straight line over one row; safe to call from interrupt context. index < 256 guarded before address arithmetic. Leaf, no nested calls. Labels prefixed gpe_ns_ per reserved-label discipline.",
+      block: {
+        cmp rdi, 256;
+        jae gpe_ns_zero;
+        mov rax, rdi;
+        shl rax, 5;
+        lea r10, [rip + _gpe_dispatch_table];
+        add r10, rax;
+        mov rax, [r10 + 16];
+        add rax, 1;
+        mov [r10 + 16], rax;
+        mov r11, [r10 + 24];
+        add r11, 1;
+        mov [r10 + 24], r11;
+        ret;
+      gpe_ns_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let gpe_clear_strikes : (u64) -> () !{mem} @{} =
+    fn (index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): reset the consecutive-strike counter, leaving the lifetime event counter intact. Called on a successful acknowledgement. index < 256 guarded. Leaf. Labels prefixed gpe_cs_ per reserved-label discipline.",
+      block: {
+        cmp rdi, 256;
+        jae gpe_cs_out;
+        mov rax, rdi;
+        shl rax, 5;
+        lea r10, [rip + _gpe_dispatch_table];
+        add r10, rax;
+        xor r11, r11;
+        mov [r10 + 16], r11;
+      gpe_cs_out:
+        ret
+      }
+    } @no_frame
+
+  pub let gpe_mark_perm_masked : (u64) -> () !{mem} @{} =
+    fn (index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): set GPE_ROW_F_PERM_MASKED and clear GPE_ROW_F_PENDING. Retirement is a flag rather than an unregistration so the subscriber identity survives: an operator reading the table after a storm can see WHICH subscriber lost its event, which is exactly the information a bare removal would destroy. Clearing PENDING is what stops a retired GPE from being acknowledged back into service by an in-flight handler. index < 256 guarded. Leaf. Labels prefixed gpe_mpm_ per reserved-label discipline.",
+      block: {
+        cmp rdi, 256;
+        jae gpe_mpm_out;
+        mov rax, rdi;
+        shl rax, 5;
+        lea r10, [rip + _gpe_dispatch_table];
+        add r10, rax;
+        mov r11, [r10 + 0];
+        or  r11, 2;                            // PERM_MASKED
+        mov r9, 0xFFFFFFFFFFFFFFFB;            // ~GPE_ROW_F_PENDING
+        and r11, r9;
+        mov [r10 + 0], r11;
+      gpe_mpm_out:
+        ret
+      }
+    } @no_frame
+
+  pub let gpe_mark_pending : (u64) -> () !{mem} @{} =
+    fn (index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): set GPE_ROW_F_PENDING -- an event for this GPE is queued and its enable bit is clear until the supervisor acknowledges. index < 256 guarded. Leaf. Labels prefixed gpe_mp_ per reserved-label discipline.",
+      block: {
+        cmp rdi, 256;
+        jae gpe_mp_out;
+        mov rax, rdi;
+        shl rax, 5;
+        lea r10, [rip + _gpe_dispatch_table];
+        add r10, rax;
+        mov r11, [r10 + 0];
+        or  r11, 4;
+        mov [r10 + 0], r11;
+      gpe_mp_out:
+        ret
+      }
+    } @no_frame
+
+  pub let gpe_clear_pending : (u64) -> () !{mem} @{} =
+    fn (index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): clear GPE_ROW_F_PENDING. index < 256 guarded. Leaf. Labels prefixed gpe_cp_ per reserved-label discipline.",
+      block: {
+        cmp rdi, 256;
+        jae gpe_cp_out;
+        mov rax, rdi;
+        shl rax, 5;
+        lea r10, [rip + _gpe_dispatch_table];
+        add r10, rax;
+        mov r11, [r10 + 0];
+        mov r9, 0xFFFFFFFFFFFFFFFB;            // ~GPE_ROW_F_PENDING
+        and r11, r9;
+        mov [r10 + 0], r11;
+      gpe_cp_out:
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // Event ring
+  // ============================================================================
+
+  pub let gpe_event_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): empty the ISR-to-supervisor ring and zero the drop counter. Leaf.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _gpe_event_head];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _gpe_event_read];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _gpe_event_drops];
+        mov [r10 + 0], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let gpe_event_pending : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): head - read, the number of records the supervisor has not yet consumed. Both counters are boot-monotonic and never masked, so the difference is exact and cannot be confused by a wrap. Leaf.",
+      block: {
+        lea r10, [rip + _gpe_event_head];
+        mov rax, [r10 + 0];
+        lea r10, [rip + _gpe_event_read];
+        mov r11, [r10 + 0];
+        sub rax, r11;
+        ret
+      }
+    } @no_frame
+
+  pub let gpe_event_drops : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): records the ring refused because the supervisor was behind. Leaf.",
+      block: {
+        lea r10, [rip + _gpe_event_drops];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let gpe_event_seq : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): total records ever enqueued. Leaf.",
+      block: {
+        lea r10, [rip + _gpe_event_head];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // gpe_event_enqueue(index, enable_snapshot, strikes) -> 1 | 0
+  //
+  // Tail-drop, not head-overwrite.
+  // ============================================================================
+
+  pub let gpe_event_enqueue : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (index: u64, enable_snapshot: u64, strikes: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): append one event record for the userspace supervisor, or refuse and count a drop when the ring is full. TAIL-DROP rather than head-overwrite, matching src/user/firmware control ring discipline: overwriting the oldest unread record would let a storm erase the very first report of the condition that caused it, which is the record an operator most needs. Returning 0 rather than blocking is what keeps the ISR bounded -- there is no state in which this function waits. Slot = head & 31, offset = slot << 5. seq is stored IN the record so a consumer can detect the gap a drop leaves. Leaf, no nested calls, safe from interrupt context. Labels prefixed gpe_enq_ per reserved-label discipline.",
+      block: {
+        lea r10, [rip + _gpe_event_head];
+        mov rax, [r10 + 0];
+        lea r11, [rip + _gpe_event_read];
+        mov r11, [r11 + 0];
+        mov r9, rax;
+        sub r9, r11;                           // in-flight
+        cmp r9, 32;                            // GPE_EVENT_SLOTS
+        jae gpe_enq_full;
+
+        mov r9, rax;
+        and r9, 31;                            // GPE_EVENT_MASK
+        shl r9, 5;                             // * GPE_EVENT_REC_BYTES
+        lea r11, [rip + _gpe_event_ring];
+        add r11, r9;
+        mov [r11 + 0],  rdi;
+        mov [r11 + 8],  rsi;
+        mov [r11 + 16], rdx;
+        mov [r11 + 24], rax;                   // seq
+
+        add rax, 1;
+        mov [r10 + 0], rax;
+        mov rax, 1;
+        ret;
+
+      gpe_enq_full:
+        lea r10, [rip + _gpe_event_drops];
+        mov rax, [r10 + 0];
+        add rax, 1;
+        mov [r10 + 0], rax;
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // gpe_event_dequeue(out) -> 1 | 0
+  //
+  // Copies 32 bytes into `out` and advances the read cursor.
+  // ============================================================================
+
+  pub let gpe_event_dequeue : (u64) -> u64 !{mem} @{} =
+    fn (out: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): pop the oldest unread record into a caller-supplied 32-byte buffer. Returns 0 without touching the buffer when the ring is empty or `out` is null, so a supervisor loop that ignores the return value cannot mistake stale bytes for an event. The read cursor advances only after the copy completes. This is the consumer side R30.M4-003 (#1068) builds the SCI event stream on. Leaf, no nested calls. Labels prefixed gpe_deq_ per reserved-label discipline.",
+      block: {
+        cmp rdi, 0;
+        je  gpe_deq_none;
+        lea r10, [rip + _gpe_event_head];
+        mov rax, [r10 + 0];
+        lea r10, [rip + _gpe_event_read];
+        mov r11, [r10 + 0];
+        cmp r11, rax;
+        jae gpe_deq_none;
+
+        mov r9, r11;
+        and r9, 31;
+        shl r9, 5;
+        lea rax, [rip + _gpe_event_ring];
+        add rax, r9;
+
+        mov r9, [rax + 0];
+        mov [rdi + 0],  r9;
+        mov r9, [rax + 8];
+        mov [rdi + 8],  r9;
+        mov r9, [rax + 16];
+        mov [rdi + 16], r9;
+        mov r9, [rax + 24];
+        mov [rdi + 24], r9;
+
+        add r11, 1;
+        mov [r10 + 0], r11;
+        mov rax, 1;
+        ret;
+
+      gpe_deq_none:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // gpe_event_field(back, field) -> value
+  //
+  // Read a retained record by back-distance from the head, without
+  // consuming it. Same shape as drv_audit_field.
+  // ============================================================================
+
+  pub let gpe_event_field : (u64, u64) -> u64 !{mem} @{} =
+    fn (back: u64, field: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R30.M4-002 (#1067): non-consuming read of a retained event record, addressed by distance back from the head -- the same shape drv_audit_field uses, so a reader who knows one knows the other. Guards: field < 4, back < 32 (the ring never retains more), and back < head so an unwritten slot is never read. idx = (head - 1 - back) & 31, offset = idx << 5 plus field << 3. Leaf, read-only. Labels prefixed gpe_evf_ per reserved-label discipline.",
+      block: {
+        lea r10, [rip + _gpe_event_head];
+        mov r10, [r10 + 0];
+        cmp r10, 0;
+        je  gpe_evf_zero;
+        cmp rsi, 4;
+        jae gpe_evf_zero;
+        cmp rdi, 32;
+        jae gpe_evf_zero;
+        cmp rdi, r10;
+        jae gpe_evf_zero;
+
+        sub r10, 1;
+        sub r10, rdi;
+        and r10, 31;
+        shl r10, 5;
+        mov rax, rsi;
+        shl rax, 3;
+        add r10, rax;
+        lea r11, [rip + _gpe_event_ring];
+        add r11, r10;
+        mov rax, [r11 + 0];
+        ret;
+
+      gpe_evf_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+}

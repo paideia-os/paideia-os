@@ -2145,3 +2145,24 @@ pml4: .skip 4096
 .align 4096
 .global pdpt
 pdpt: .skip 4096
+
+# ---------------------------------------------------------------------------
+# R30.M4-001 (#1066) / R30.M4-002 (#1067): SCI/GPE dispatch witness markers.
+#
+# Emitted by tests/kernel/acpi/gpe_synth.pdx §gpe_dispatch_witness, which
+# drives the shipping ISR (src/kernel/core/acpi/sci_isr.pdx) against a
+# synthetic GPE register window and a synthetic IOAPIC MMIO window.
+#
+# See also:
+#   - src/kernel/core/acpi/gpe_block.pdx (block/bit decomposition)
+#   - src/kernel/core/acpi/gpe_io.pdx    (register-access seam + trace)
+#   - src/kernel/core/acpi/gpe_table.pdx (registration + event ring)
+#   - src/kernel/core/acpi/gpe_ack.pdx   (enable/disable/clear/ack)
+#   - src/kernel/core/acpi/sci_route.pdx (SCI_INT -> RTE)
+.global gpe_dispatch_ok_msg
+.section .rodata
+gpe_dispatch_ok_msg: .ascii "R30 GPE DISPATCH OK\n\0"
+
+.global gpe_dispatch_fail_msg
+.section .rodata
+gpe_dispatch_fail_msg: .ascii "R30 GPE DISPATCH FAIL\n\0"
