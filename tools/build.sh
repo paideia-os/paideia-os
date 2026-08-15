@@ -19,6 +19,42 @@ fi
 
 mkdir -p "${BUILD_DIR}"
 
+# ---------------------------------------------------------------------------
+# obj_relocs_against OBJ SYM — "does this object relocate against SYM?"
+#
+# Every confinement check below is built on this one question, and the
+# obvious way to ask it is wrong.
+#
+#     objdump -r "$obj" | grep -q "$sym"
+#
+# Under `set -o pipefail` -- which this script sets, and should --
+# `grep -q` exits at its first match, `objdump` then takes SIGPIPE, and
+# the PIPELINE's status is failure even though the symbol WAS found.
+# Whether it happens depends on pipe-buffer timing, so the same tree
+# builds on one run and fails on the next.
+#
+# Both directions of that mistake matter and one of them is dangerous:
+#
+#   * in an OWNER check it reports "the owner does not reference the
+#     symbol" and fails a correct build -- visible, annoying, and the
+#     reason this was found at all;
+#   * in a STRAY LOOP it reports "this object does not relocate against
+#     the symbol" and PASSES A REAL VIOLATION. A guardrail that
+#     intermittently stops checking is worse than one that is absent,
+#     because nothing tells you which run it skipped.
+#
+# Snapshotting objdump's output first removes the pipeline entirely: a
+# here-string is a redirect, not a pipe, so grep's status is the
+# function's status and nothing can take SIGPIPE. A non-zero objdump
+# (missing or unreadable object) reports "no reference", which every
+# caller already handles -- owner checks fail loudly on it because they
+# stat the file first.
+obj_relocs_against() {
+    local out
+    out="$(objdump -r "$1" 2>/dev/null)" || return 1
+    grep -qE -- "$2([^a-zA-Z0-9_]|\$)" <<< "${out}"
+}
+
 # R20-M4-004 (#822): "No AML in kernel" guardrail. Refuses the build
 # if any AML-related identifier (aml*, dsdt, ssdt, acpica, \_SB_) has
 # leaked into src/kernel/**. See design/acpi/no-aml-in-kernel.md for
@@ -152,7 +188,7 @@ if [[ ! -f "${OPREG_OWNER}" ]]; then
     echo "[opregion-confine] FAIL: ${OPREG_OWNER} not built" >&2
     exit 1
 fi
-if ! objdump -r "${OPREG_OWNER}" 2>/dev/null | grep -qE '_op_region_table([^a-zA-Z0-9_]|$)'; then
+if ! obj_relocs_against "${OPREG_OWNER}" '_op_region_table'; then
     echo "[opregion-confine] FAIL: kind_op_region.o does not reference _op_region_table" >&2
     echo "  The symbol was renamed or the module was gutted; the confinement" >&2
     echo "  check would then pass vacuously, so it fails instead." >&2
@@ -161,7 +197,7 @@ fi
 opreg_strays=""
 for o in "${OBJECTS[@]}"; do
     [[ "${o}" == "${OPREG_OWNER}" ]] && continue
-    if objdump -r "${o}" 2>/dev/null | grep -qE '_op_region_table([^a-zA-Z0-9_]|$)'; then
+    if obj_relocs_against "${o}" '_op_region_table'; then
         opreg_strays="${opreg_strays} ${o#"${BUILD_DIR}"/}"
     fi
 done
@@ -216,7 +252,7 @@ gpe_confine_one() {
         GPE_CONFINE_OK=0
         return
     fi
-    if ! objdump -r "${owner}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+    if ! obj_relocs_against "${owner}" "${sym}"; then
         echo "[gpe-confine] FAIL: $2 does not reference ${sym}" >&2
         echo "  The symbol was renamed or the module was gutted; the confinement" >&2
         echo "  check would then pass vacuously, so it fails instead." >&2
@@ -225,7 +261,7 @@ gpe_confine_one() {
     fi
     for o in "${OBJECTS[@]}"; do
         [[ "${o}" == "${owner}" ]] && continue
-        if objdump -r "${o}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+        if obj_relocs_against "${o}" "${sym}"; then
             strays="${strays} ${o#"${BUILD_DIR}"/}"
         fi
     done
@@ -305,7 +341,7 @@ i2c_confine_one() {
         I2C_CONFINE_OK=0
         return
     fi
-    if ! objdump -r "${owner}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+    if ! obj_relocs_against "${owner}" "${sym}"; then
         echo "[i2c-confine] FAIL: $2 does not reference ${sym}" >&2
         echo "  The symbol was renamed or the module was gutted; the confinement" >&2
         echo "  assertion below would then pass vacuously." >&2
@@ -314,7 +350,7 @@ i2c_confine_one() {
     fi
     for o in "${OBJECTS[@]}"; do
         [[ "${o}" == "${owner}" ]] && continue
-        if objdump -r "${o}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+        if obj_relocs_against "${o}" "${sym}"; then
             strays="${strays} ${o#"${BUILD_DIR}"/}"
         fi
     done
@@ -447,7 +483,7 @@ i2c_mmio_owner_only() {
         I2C_MMIO_OK=0
         return
     fi
-    if ! objdump -r "${owner}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+    if ! obj_relocs_against "${owner}" "${sym}"; then
         echo "[i2c-mmio-confine] FAIL: dw_io.o does not reference ${sym}" >&2
         echo "  The seam no longer resolves the window capability itself; the" >&2
         echo "  confinement assertion below would then pass vacuously." >&2
@@ -461,7 +497,7 @@ i2c_mmio_owner_only() {
             *) continue ;;
         esac
         [[ "${o}" == "${owner}" ]] && continue
-        if objdump -r "${o}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+        if obj_relocs_against "${o}" "${sym}"; then
             strays="${strays} ${o#"${BUILD_DIR}"/}"
         fi
     done
@@ -475,14 +511,14 @@ i2c_seam_state_confine() {
     local sym="$1"
     local owner="${BUILD_DIR}/core/drivers/i2c/dw_io.o"
     local strays=""
-    if ! objdump -r "${owner}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+    if ! obj_relocs_against "${owner}" "${sym}"; then
         echo "[i2c-mmio-confine] FAIL: dw_io.o does not reference ${sym}" >&2
         I2C_MMIO_OK=0
         return
     fi
     for o in "${OBJECTS[@]}"; do
         [[ "${o}" == "${owner}" ]] && continue
-        if objdump -r "${o}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+        if obj_relocs_against "${o}" "${sym}"; then
             strays="${strays} ${o#"${BUILD_DIR}"/}"
         fi
     done
@@ -511,14 +547,14 @@ i2c_ctrl_confine() {
         I2C_MMIO_OK=0
         return
     fi
-    if ! objdump -r "${owner}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+    if ! obj_relocs_against "${owner}" "${sym}"; then
         echo "[i2c-mmio-confine] FAIL: $2 does not reference ${sym}" >&2
         I2C_MMIO_OK=0
         return
     fi
     for o in "${OBJECTS[@]}"; do
         [[ "${o}" == "${owner}" ]] && continue
-        if objdump -r "${o}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+        if obj_relocs_against "${o}" "${sym}"; then
             strays="${strays} ${o#"${BUILD_DIR}"/}"
         fi
     done
@@ -567,7 +603,8 @@ for o in "${OBJECTS[@]}"; do
     esac
     [[ "${o}" == "${BUILD_DIR}/core/acpi/gpe_io.o" ]] && continue
     # IN AL,DX = 0xEC ; IN EAX,DX = 0xED ; OUT DX,AL = 0xEE ; OUT DX,EAX = 0xEF
-    if objdump -d "${o}" 2>/dev/null | grep -qE '^\s+[0-9a-f]+:.*\b(in|out)\s+(\(%dx\),%(al|ax|eax)|%(al|ax|eax),\(%dx\))'; then
+    gpe_io_dis="$(objdump -d "${o}" 2>/dev/null || true)"
+    if grep -qE '^\s+[0-9a-f]+:.*\b(in|out)\s+(\(%dx\),%(al|ax|eax)|%(al|ax|eax),\(%dx\))' <<< "${gpe_io_dis}"; then
         gpe_io_strays="${gpe_io_strays} ${o#"${BUILD_DIR}"/}"
     fi
 done
@@ -613,7 +650,7 @@ fi
 sci_isr_bad=""
 while IFS= read -r sym; do
     [[ -z "${sym}" ]] && continue
-    if ! printf '%s\n' ${SCI_ISR_ALLOWED} | grep -qx -- "${sym}"; then
+    if ! grep -qxF -- "${sym}" <<< "${SCI_ISR_ALLOWED}"; then
         sci_isr_bad="${sci_isr_bad} ${sym}"
     fi
 done <<< "${sci_isr_refs}"
@@ -691,7 +728,7 @@ fi
 dw_isr_bad=""
 while IFS= read -r sym; do
     [[ -z "${sym}" ]] && continue
-    if ! printf '%s\n' ${DW_ISR_ALLOWED} | grep -qx -- "${sym}"; then
+    if ! grep -qxF -- "${sym}" <<< "${DW_ISR_ALLOWED}"; then
         dw_isr_bad="${dw_isr_bad} ${sym}"
     fi
 done <<< "${dw_isr_refs}"
@@ -708,6 +745,242 @@ if [[ -n "${dw_isr_bad}" ]]; then
     exit 1
 fi
 echo "[dw-isr-allowlist] dw_isr.o call targets within the bounded allowlist"
+
+# ---------------------------------------------------------------------------
+# R30.M6-001 (#1075) / R30.M6-002 (#1076): GPIO PIN CONFINEMENT.
+#
+# A pad controller owns EVERY PIN ON THE PACKAGE. On a T14 G4 those pins
+# include device reset asserts, power-rail enables, write-protect straps
+# and firmware-flash control. Acting on the wrong one is not a data
+# error: a pin has no acknowledgement, no arbitration and no status bit
+# that says "that was the wrong pin". It simply becomes whatever the last
+# writer made it, and the first symptom appears in whatever hardware the
+# pin controls.
+#
+# The claim this milestone makes is therefore the I²C claim with the
+# stakes raised:
+#
+#   A capability naming pin P cannot be used to act on pin Q, and
+#   "act on Q instead" is not a request that can be PHRASED.
+#
+# That is a claim about the SHAPE of the code, and it is checked here in
+# three parts.
+#
+# (1) STORAGE CONFINEMENT, the same shape as the op-region, GPE and I²C
+#     checks above. `_gpio_line_table` is the only place in the kernel
+#     where a pin ASSIGNMENT lives; `_lpss_gpio_ctrl` and
+#     `_lpss_gpio_comm` are the only places a controller's identity and
+#     its pin-to-register geometry live. Confining each to its owning
+#     object is what makes "the mint gate is the only path to a row" and
+#     "the community table has one validating writer" properties of the
+#     kernel rather than of two files.
+#
+# (2) SEAM CONFINEMENT. `opregion_row_base` / `opregion_row_len` are the
+#     only functions in the kernel that can turn a capability into a
+#     physical address, so an object under `core/drivers/gpio/` that
+#     calls them is an object forming a pad-controller address outside
+#     the seam. The seam's own state has one writer for the same reason
+#     `dw_io.pdx`'s does: a second writer could bind a window, or switch
+#     the seam to its synthetic side, from somewhere the review never
+#     looked.
+#
+# (3) THE PIN-ARGUMENT ARITY PIN, and it is WIDER than the I²C one.
+#     A pad's register address is
+#
+#         community.reg_off + community.padbar + pad_index * stride
+#
+#     so a caller-supplied COMMUNITY reaches a different pin exactly as
+#     surely as a caller-supplied pin does, and a caller-supplied PAD
+#     INDEX more surely still. All five capability-form resolvers are
+#     therefore pinned — pin, community, pad index, controller identity,
+#     and the pad register offset itself — plus the row-form pin
+#     resolver. A confinement that guarded only the pin number would
+#     leave two doors into the same room.
+#
+#     `lpss_gpio_pad_off` is confined ON TOP of that. It is the raw
+#     arithmetic, it takes (controller, community, pad) with no
+#     capability anywhere, and it is exactly what a future driver would
+#     reach for. Restricting it to its own object and to the capability
+#     module makes `gpio_line_pad_off_of_slot(slot)` the ONLY route in
+#     the kernel from anything to a pad register address — capability
+#     in, address out, no other parameter. R30.M6-004 (#1078) is the
+#     issue that will write PADCFG registers, and this is the check that
+#     decides what address it is able to write to.
+#
+#     The runtime half of the same argument is sub-test J of
+#     tests/kernel/cap/gpio_cap_synth.pdx, which calls all five resolvers
+#     with a NEIGHBOURING pin's number, community, pad index and register
+#     offset loaded into every register an added parameter could arrive
+#     in.
+# ---------------------------------------------------------------------------
+GPIO_CONFINE_OK=1
+gpio_confine_one() {
+    # $1 = symbol, $2 = owning object path (relative to BUILD_DIR)
+    local sym="$1"
+    local owner="${BUILD_DIR}/$2"
+    local strays=""
+    if [[ ! -f "${owner}" ]]; then
+        echo "[gpio-confine] FAIL: ${owner} not built" >&2
+        GPIO_CONFINE_OK=0
+        return
+    fi
+    if ! obj_relocs_against "${owner}" "${sym}"; then
+        echo "[gpio-confine] FAIL: $2 does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  assertion below would then pass vacuously, so it fails instead." >&2
+        GPIO_CONFINE_OK=0
+        return
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${owner}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[gpio-confine] FAIL — objects other than $2 relocate against ${sym}:${strays}" >&2
+        GPIO_CONFINE_OK=0
+    fi
+}
+# Unlike gpio_confine_one, this one confines a FUNCTION rather than a
+# table, so the two ends of the non-vacuousness check are different: the
+# defining object must still DEFINE it (a renamed or deleted function
+# would make the stray scan pass on nothing), and the one permitted
+# CALLER must still call it (a capability route that stopped using it
+# would make the confinement guard a path nobody takes). Used only for
+# lpss_gpio_pad_off.
+gpio_confine_pair() {
+    # $1 = symbol, $2 = defining object, $3 = the one permitted caller
+    local sym="$1"
+    local a="${BUILD_DIR}/$2"
+    local b="${BUILD_DIR}/$3"
+    local strays=""
+    local defs
+    if [[ ! -f "${a}" || ! -f "${b}" ]]; then
+        echo "[gpio-confine] FAIL: ${a} or ${b} not built" >&2
+        GPIO_CONFINE_OK=0
+        return
+    fi
+    defs="$(nm --defined-only "${a}" 2>/dev/null || true)"
+    if ! grep -qE -- "[[:space:]]${sym}\$" <<< "${defs}"; then
+        echo "[gpio-confine] FAIL: $2 does not define ${sym}" >&2
+        echo "  The symbol was renamed or the function was deleted; the stray" >&2
+        echo "  scan below would then pass vacuously, so it fails instead." >&2
+        GPIO_CONFINE_OK=0
+        return
+    fi
+    if ! obj_relocs_against "${b}" "${sym}"; then
+        echo "[gpio-confine] FAIL: $3 does not reference ${sym}" >&2
+        echo "  gpio_line_pad_off_of_slot is meant to be the only capability-" >&2
+        echo "  bearing route to a pad address; if it no longer calls this," >&2
+        echo "  the confinement below is checking nothing." >&2
+        GPIO_CONFINE_OK=0
+        return
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${a}" ]] && continue
+        [[ "${o}" == "${b}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[gpio-confine] FAIL — objects other than $2 and $3 relocate against" >&2
+        echo "  ${sym}:${strays}" >&2
+        echo "  A pad register address may only be formed from a CAPABILITY," >&2
+        echo "  through gpio_line_pad_off_of_slot. An object holding the raw" >&2
+        echo "  (controller, community, pad) calculator can address any pin on" >&2
+        echo "  the package. See src/kernel/core/cap/kind_gpio_line.pdx." >&2
+        GPIO_CONFINE_OK=0
+    fi
+}
+gpio_confine_one '_gpio_line_table' 'core/cap/kind_gpio_line.o'
+gpio_confine_one '_lpss_gpio_ctrl'  'core/drivers/gpio/lpss_gpio.o'
+gpio_confine_one '_lpss_gpio_comm'  'core/drivers/gpio/lpss_gpio.o'
+gpio_confine_one '_gpio_io_mode'      'core/drivers/gpio/gpio_io.o'
+gpio_confine_one '_gpio_io_win_slot'  'core/drivers/gpio/gpio_io.o'
+gpio_confine_one '_gpio_io_bound'     'core/drivers/gpio/gpio_io.o'
+gpio_confine_one '_gpio_io_synth_ram' 'core/drivers/gpio/gpio_io.o'
+gpio_confine_one '_gpio_io_trace'     'core/drivers/gpio/gpio_io.o'
+gpio_confine_one '_gpio_io_trace_n'   'core/drivers/gpio/gpio_io.o'
+gpio_confine_pair 'lpss_gpio_pad_off' 'core/drivers/gpio/lpss_gpio.o' 'core/cap/kind_gpio_line.o'
+
+# The address producers, restricted to the seam WITHIN core/drivers/gpio/.
+# Same argument as [i2c-mmio-confine]: an object under this directory
+# that calls them is a second, unguarded path to controller registers.
+gpio_seam_addr_only() {
+    local sym="$1"
+    local owner="${BUILD_DIR}/core/drivers/gpio/gpio_io.o"
+    local strays=""
+    if [[ ! -f "${owner}" ]]; then
+        echo "[gpio-confine] FAIL: ${owner} not built" >&2
+        GPIO_CONFINE_OK=0
+        return
+    fi
+    if ! obj_relocs_against "${owner}" "${sym}"; then
+        echo "[gpio-confine] FAIL: gpio_io.o does not reference ${sym}" >&2
+        echo "  The seam no longer resolves the window capability itself; the" >&2
+        echo "  confinement assertion below would then pass vacuously." >&2
+        GPIO_CONFINE_OK=0
+        return
+    fi
+    for o in "${OBJECTS[@]}"; do
+        case "${o}" in
+            "${BUILD_DIR}"/core/drivers/gpio/*) ;;
+            *) continue ;;
+        esac
+        [[ "${o}" == "${owner}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[gpio-confine] FAIL — objects under core/drivers/gpio/ other than" >&2
+        echo "  gpio_io.o relocate against ${sym}:${strays}" >&2
+        GPIO_CONFINE_OK=0
+    fi
+}
+gpio_seam_addr_only 'opregion_row_base'
+gpio_seam_addr_only 'opregion_row_len'
+if [[ "${GPIO_CONFINE_OK}" -ne 1 ]]; then
+    echo "  See src/kernel/core/cap/kind_gpio_line.pdx and" >&2
+    echo "  src/kernel/core/drivers/gpio/lpss_gpio.pdx for why each of these" >&2
+    echo "  has exactly one legitimate writer, and gpio_io.pdx for why no" >&2
+    echo "  second address-producing path may exist under core/drivers/gpio/." >&2
+    exit 1
+fi
+echo "[gpio-confine] line row table, controller and community tables, seam"
+echo "[gpio-confine] state and the pad-address calculator confined"
+
+GPIO_LINE_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_gpio_line.pdx"
+gpio_pin_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${GPIO_LINE_SRC}"; then
+        echo "[gpio-pin-confine] FAIL — expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "  Every GPIO line resolver takes a CAPABILITY SLOT (or a row id)" >&2
+        echo "  and NOTHING ELSE. An extra parameter on any of them -- a 'pin', a" >&2
+        echo "  'community', a 'pad' the caller supplies -- would make 'act on a" >&2
+        echo "  pin other than the one my capability names' expressible, which is" >&2
+        echo "  precisely the property KIND_GPIO_LINE exists to remove on a part" >&2
+        echo "  that owns every pin on the package. Note that a pad's register" >&2
+        echo "  address is community.reg_off + community.padbar + pad*stride, so" >&2
+        echo "  a supplied community or pad index reaches a different pin just as" >&2
+        echo "  surely as a supplied pin number does -- which is why all five are" >&2
+        echo "  pinned and not only the first. If this fired because a signature" >&2
+        echo "  legitimately changed, the confinement argument in" >&2
+        echo "  kind_gpio_line.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+gpio_pin_pin_one 'pub let gpio_line_row_pin : (u64) -> u64'
+gpio_pin_pin_one 'pub let gpio_line_pin_of_slot : (u64) -> u64'
+gpio_pin_pin_one 'pub let gpio_line_community_of_slot : (u64) -> u64'
+gpio_pin_pin_one 'pub let gpio_line_pad_of_slot : (u64) -> u64'
+gpio_pin_pin_one 'pub let gpio_line_ctrl_of_slot : (u64) -> u64'
+gpio_pin_pin_one 'pub let gpio_line_pad_off_of_slot : (u64) -> u64'
+echo "[gpio-pin-confine] pin, community, pad, controller and pad-address"
+echo "[gpio-pin-confine] resolvers take no caller-supplied pin"
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 

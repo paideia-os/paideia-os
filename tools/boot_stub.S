@@ -2320,3 +2320,69 @@ lpss_i2c_irq_ok_msg: .ascii "R30 LPSS I2C IRQ OK\n\0"
 .global lpss_i2c_irq_fail_msg
 .align 8
 lpss_i2c_irq_fail_msg: .ascii "R30 LPSS I2C IRQ FAIL\n\0"
+
+# ---------------------------------------------------------------------------
+# R30.M6-001 (#1075) / R30.M6-002 (#1076): pad-controller witness markers.
+#
+# TWO fingerprints, in boot order:
+#
+#   R30 LPSS GPIO OK   — emitted by
+#       tests/kernel/drivers/gpio/lpss_gpio_synth.pdx §lpss_gpio_witness,
+#       which drives the shipping probe, window mint, identification and
+#       community description against the synthetic side of the register
+#       seam in src/kernel/core/drivers/gpio/gpio_io.pdx. It stands for:
+#         * the controller's BAR is reached through a KIND_OP_REGION
+#           capability re-resolved per access, never a raw address, and
+#           the checks run in the synthetic mode as well as the real one;
+#         * a candidate that reads back the DesignWare I2C signature is
+#           REJECTED with its own code -- the LPSS class code does not
+#           distinguish the two blocks, so this negative check is the
+#           only thing keeping the pad-controller driver off the I2C
+#           controller's registers;
+#         * PADBAR and the PADCFG stride are READ FROM THE PART rather
+#           than assumed, and a community whose described extent falls
+#           outside the window, or overlaps another, is REFUSED rather
+#           than clipped.
+#
+#   R30 KIND_GPIO OK   — emitted by
+#       tests/kernel/cap/gpio_cap_synth.pdx §gpio_cap_witness. It stands
+#       for the property the whole milestone exists to establish:
+#         * a line capability names ONE pin, the pin comes from the
+#           capability row, and no resolver has a parameter a caller
+#           could put a pin, a community or a pad index into -- proven
+#           at runtime by calling every resolver with a neighbouring
+#           pin's number loaded into every register a smuggled parameter
+#           could arrive in, and at build time by the arity pins in
+#           tools/build.sh [gpio-pin-confine];
+#         * the community mapping is correct OUTSIDE community 0, where
+#           it is not the identity, asserted against an independently
+#           computed register offset and read back through the seam;
+#         * an out-of-range pin and an unmapped pin are REFUSED with
+#           distinct codes and never clamped;
+#         * a second capability for the same pin is refused, while the
+#           same pad index in two different communities coexists;
+#         * a controller teardown cascades to every line on it and
+#           leaves no ghost rows.
+#
+# See also:
+#   - src/kernel/core/cap/kind_gpio_line.pdx      (the derived kind)
+#   - src/kernel/core/drivers/gpio/lpss_gpio.pdx  (probe + communities)
+#   - src/kernel/core/drivers/gpio/gpio_io.pdx    (seam + trace)
+#   - src/kernel/core/cap/invoke.pdx              (0x154 branch)
+#   - design/drivers/lpss-gpio-controller.md
+#   - design/architecture/next-wave-derived-kinds.md §KIND_GPIO_LINE
+.global lpss_gpio_ok_msg
+.align 8
+lpss_gpio_ok_msg: .ascii "R30 LPSS GPIO OK\n\0"
+
+.global lpss_gpio_fail_msg
+.align 8
+lpss_gpio_fail_msg: .ascii "R30 LPSS GPIO FAIL\n\0"
+
+.global kind_gpio_ok_msg
+.align 8
+kind_gpio_ok_msg: .ascii "R30 KIND_GPIO OK\n\0"
+
+.global kind_gpio_fail_msg
+.align 8
+kind_gpio_fail_msg: .ascii "R30 KIND_GPIO FAIL\n\0"

@@ -1499,6 +1499,327 @@ every case.
 
 ---
 
+## `KIND_GPIO_LINE = 0x154` — landed by R30.M6-001 (#1075)
+
+### Catalog reconciliation
+
+There was **no planning row**. The R30 catalog named `KIND_GPIO_LINE`
+only in the round summary's "new capabilities" list, with the deliverable
+line "kind + tail {controller_id, pin, direction, pull}". No tag, no
+base, no rights and no gate were ever fixed, so — as with the I²C pair —
+there was nothing to re-base and nothing to contradict. The section below
+is the first specification of the kind.
+
+The planning line's four tail fields all survive, in a different shape:
+`controller_id` is a `bdf_pack` key inherited from the parent, `pin` is
+the absolute pin number, and `direction` / `pull` are the reserved bits
+`[55:48]` of the header word that R30.M6-004 (#1078) populates. Two
+fields the planning line did not anticipate are added, and they are the
+substance of the milestone: **`community` and `pad_index`**, derived at
+mint, because on this hardware the pin number is not the pad index.
+
+### Why this kind is more dangerous than `KIND_I2C_SLAVE`
+
+Same structural problem — one component must own one endpoint on a
+fabric that has no protection domain — with a categorically different
+failure mode.
+
+Addressing the wrong device on I²C produces a **data error**: the wrong
+peripheral answers, or none does, and something downstream notices.
+Acting on the wrong pin produces a **physical state change with no error
+path at all**. A pad controller owns every pin on the package: device
+reset asserts, power-rail enables, write-protect straps, firmware-flash
+control. There is no NACK, no arbitration loss, no status bit that says
+"that was the wrong pin". The pin becomes whatever the last writer made
+it, and the first symptom appears in whatever hardware the pin controls.
+
+Two consequences run through the whole design:
+
+* **nothing is clamped.** Every out-of-range or unmapped input is
+  refused, because clamping picks *some* pin.
+* **every field that selects a pad is confined**, not just the pin.
+
+### Derivation — over `KIND_DEVICE`, in two halves
+
+The gate demands `kind == KIND_DEVICE (10)` carrying `RIGHT_MINT`, and
+then demands something the kind check cannot express: **the device must
+be a probed, identified pad controller**.
+
+The controller identity is read from the parent descriptor's
+`target_ptr` — inherited, never argued, the discipline
+`i2c_bus_parent_controller_id` established — and looked up in
+`_lpss_gpio_ctrl` via `lpss_gpio_resolve_pin`. A `KIND_DEVICE`
+capability for the network card passes the kind check and is refused
+`GPIO_LINE_MINT_NO_CONTROLLER`.
+
+That second half is what makes the gate mean anything. A pad controller
+is not distinguishable from any other PCI function by capability kind,
+so a gate that only checked the kind would let any device-capability
+holder mint pins — except that it cannot *name* the controller, because
+the identity is inherited. The lookup is the check that the inheritance
+landed on a pad controller.
+
+Unlike `KIND_I2C_SLAVE`, the parent is a **base slot** rather than a
+derived tag. There is no intermediate "the pads are configured"
+authority to derive over the way `KIND_I2C_BUS` proves a controller was
+brought up at a validated rate; the machine-side lookup stands in for
+it, and stating that honestly is better than inventing a ceremonial
+intermediate kind.
+
+### The community mapping — derived, never supplied
+
+`gpio_line_cap_mint(slot, parent_slot, rights, pin, driver_hint)` takes
+a **pin** and nothing else about location. The community and the
+community-relative pad index are computed once, at mint, and stored.
+
+```
+community  = the c with c.pin_base <= pin < c.pin_base + c.npins
+pad_index  = pin - c.pin_base
+reg offset = c.reg_off + c.padbar + pad_index * stride
+```
+
+For the first community `pin_base` is 0 and `pad_index == pin`. **The
+mapping is the identity there and nowhere else.** A driver that skips
+the subtraction is correct on every pin of community 0 and drives the
+wrong pin on every pin of every other community, silently.
+
+Making the caller supply the community would put that arithmetic — whose
+failure mode is "a different pin than intended, with no error" — in
+every caller. Deriving it once, from the one table that knows the
+geometry, removes the class of bug rather than relocating it. See
+`design/drivers/lpss-gpio-controller.md` §2.
+
+### Pin validity — refused per reason, never clamped
+
+| condition | code |
+|---|---|
+| `pin >= GPIO_PIN_MAX (512)` | `GPIO_LINE_MINT_PIN_RANGE` |
+| no community of this controller covers it | `GPIO_LINE_MINT_PIN_UNMAPPED` |
+| the parent names no probed pad controller | `GPIO_LINE_MINT_NO_CONTROLLER` |
+
+Three codes, because they are three different operator problems: a pin
+that cannot be represented, a pin the platform did not route on this
+part, and a device capability for something that is not a pad controller
+at all. Collapsing them would make a driver bound to the wrong PCI
+function look like a driver asking for a pin the board does not have.
+
+The range check runs **before** the mapping, so an unrepresentable pin is
+refused as unrepresentable rather than as unrouted.
+
+### Pin collision — the second mint is REFUSED
+
+Two live line capabilities for the same `(controller_id, pin)` are
+refused with `GPIO_LINE_MINT_PIN_IN_USE`.
+
+The I²C argument for refusing a duplicate address was that two owners
+interleaving register-pointer-then-read sequences silently read each
+other's data. The GPIO argument is stronger **in kind**, not in degree.
+
+A pin has **one state**. It is not a transaction that can be serialised,
+retried or arbitrated; it is a voltage on a net. Two drivers each
+believing they own a reset line do not race for a resource — one holds
+the device in reset and the other releases it, and which one wins is
+whichever wrote last. Neither can detect the other. And unlike a bus
+transaction, the loser's failure does not surface in the loser's driver;
+it surfaces in whatever hardware the pin controls.
+
+There is also **no arbiter shape that fixes it afterwards**. On I²C a
+shared device can be fronted by one holder that serialises access,
+because the underlying operation is a transaction with a beginning and
+an end. A pin's state has no end. The only coherent way to share one is
+for exactly one component to own it and expose its own interface — which
+starts with the capability being unique.
+
+**The key is scoped to the controller.** A machine with two pad
+controllers numbers each one's pins from zero; a global pin table would
+refuse the second and make an ordinary board unbootable.
+
+**The key is the absolute pin, not `(community, pad_index)`.** They are
+equivalent within a controller, but the absolute pin is the number the
+platform description carries, so the uniqueness test applies to what the
+caller asked for. It also makes the following true and testable: **the
+same pad index in two different communities coexists.** Community 0 pad
+5 and community 1 pad 5 are different absolute pins on different
+register windows, and a key that looked only at the pad index would
+wrongly refuse the second.
+
+### Pin confinement — the property, and how it is made structural
+
+> The pin comes from the capability row, never from the caller.
+
+**Six** signatures are arity-pinned by `tools/build.sh`
+(`[gpio-pin-confine]`), not one:
+
+```
+pub let gpio_line_row_pin            : (u64) -> u64
+pub let gpio_line_pin_of_slot        : (u64) -> u64
+pub let gpio_line_community_of_slot  : (u64) -> u64
+pub let gpio_line_pad_of_slot        : (u64) -> u64
+pub let gpio_line_ctrl_of_slot       : (u64) -> u64
+pub let gpio_line_pad_off_of_slot    : (u64) -> u64
+```
+
+Six rather than one because the register address is
+`community.reg_off + community.padbar + pad_index * stride`: a
+caller-supplied **community** reaches a different pin exactly as surely
+as a caller-supplied pin does, and a caller-supplied **pad index** more
+surely still. A confinement guarding only the pin number would leave two
+doors into the same room. (This is #1073's argument for pinning
+`i2c_slave_mode_of_slot` and `i2c_slave_bus_row_of_slot` alongside the
+address resolver — every field that participates in selecting the
+physical target *is* the target.)
+
+On top of that, `lpss_gpio_pad_off` — the raw
+`(controller, community, pad) -> offset` arithmetic, with no capability
+anywhere — is confined by `objdump -r` to its own object and to
+`kind_gpio_line.o`. That makes `gpio_line_pad_off_of_slot(slot)` the
+**only route in the kernel from anything to a pad register address**:
+capability in, address out, no other parameter. R30.M6-004 (#1078) is
+the issue that will write PADCFG registers, and this check decides what
+address it is able to write to.
+
+The dispatch handler masks `op_arg` to its low byte, closing the last
+channel a caller might use to smuggle a pin into an invocation.
+
+### Tail encoding — row indirection via `_gpio_line_table`
+
+Row — 32 bytes, `GPIO_LINE_MAX = 32`:
+
+| off | field |
+|---|---|
+| `+0` `[7:0]` | `parent_slot` — the `KIND_DEVICE` slot at mint; audit and query only |
+| `+0` `[23:8]` | `pin` — u16, **absolute** on the controller, `< 512` |
+| `+0` `[39:24]` | `pad_index` — u16, **community-relative**, derived at mint |
+| `+0` `[47:40]` | `community` — u8 |
+| `+0` `[55:48]` | reserved, must be zero — #1078's direction / pull / trigger |
+| `+0` `[63:56]` | `in_use` |
+| `+8` | `controller_id` — `bdf_pack` key, **inherited**. The cascade key and the first term of the uniqueness key |
+| `+16` | `driver_hint` — opaque, non-zero; zero is the "unclaimed" sentinel and is refused |
+| `+24` | reserved, must be zero — #1078's edge-interrupt subscription state |
+
+`gpio_line_tail_pack` enforces the cross-field rule `pad_index <= pin`
+(a community-relative index can never exceed the absolute pin it was
+derived from), so a row whose recorded pin and recorded register address
+disagree is unrepresentable rather than something every consumer has to
+decide about.
+
+`tools/build.sh` asserts by `objdump -r` that no object other than
+`kind_gpio_line.o` relocates against `_gpio_line_table`.
+
+### Rights
+
+| bit | name | status |
+|---|---|---|
+| `0x001` | `R_GPIO_LINE_READ` | reserved for #1077's level get |
+| `0x002` | `R_GPIO_LINE_WRITE` | reserved for #1077's level set |
+| `0x004` | `R_GPIO_LINE_CONFIG` | reserved for #1078's direction / pull / trigger |
+| `0x008` | `R_GPIO_LINE_INVOKE` | the query ops |
+| `0x010` | `R_GPIO_LINE_REVOKE` | teardown |
+| `0x400` | `R_GPIO_LINE_OBSERVE` | the canonical printer |
+| `0x41F` | `R_GPIO_LINE_ALL` | OR of the six |
+
+`RIGHT_MINT (0x200)` is **absent and its absence is structural**: there
+is nothing below a single pin on a single controller, and a MINT bit no
+gate reads is the shape that later acquires a meaning nobody audited.
+
+**`CONFIG` is separate from `WRITE`**, and on this kind that separation
+carries more weight than `READ`/`WRITE` does. Driving an output that
+firmware already configured as an output is ordinary. Turning an *input*
+into an output is not: a pin firmware left as an input may be a strap
+another device is driving, and reconfiguring it starts a contention on a
+physical net. "May toggle this line, may not change what kind of line it
+is" has to be expressible.
+
+All three are reserved **now** for #1071's stability reason: a
+capability minted today will still be refused a level change when #1077
+lands, instead of silently acquiring the authority to drive a pin on the
+day the op appears.
+
+### Ops (`op_arg[7:0]`) and required right
+
+| op | name | right | returns |
+|---|---|---|---|
+| 0 | `QUERY_PIN` | `INVOKE` | absolute pin |
+| 1 | `QUERY_COMM` | `INVOKE` | community id |
+| 2 | `QUERY_PAD` | `INVOKE` | pad index |
+| 3 | `QUERY_CTRL` | `INVOKE` | parent cap slot |
+| 4 | `QUERY_HINT` | `INVOKE` | driver hint |
+| 5 | `DEBUG_PRINT` | `OBSERVE` | canonical row dump |
+
+Query only. **No get, no set, no configure**, and holding every right in
+`R_GPIO_LINE_ALL` still cannot reach a pad register through this
+capability — asserted by the witness, which drives ops 6 and 7 (where
+#1077 and #1078 will put them) and gets `INVOKE_UNSUPPORTED`.
+
+### Revoke, and the controller cascade
+
+`gpio_line_cap_revoke` scrubs the row and clears the descriptor. It
+**does not touch the pad**, and that is deliberate rather than an
+omission: "return the pin to a safe state" has no meaning this kernel
+could supply, because whether high or low is safe is a property of the
+board. Driving a reset line to a guessed level on revoke would be a
+worse bug than any this kind prevents.
+
+`lpss_gpio_release` calls `gpio_line_cascade_revoke_by_controller`
+**before** it revokes the window or frees its own row. Two phases:
+
+* **Phase 1**, by descriptor — every `cap_table` slot holding a
+  `KIND_GPIO_LINE` whose row records this controller.
+* **Phase 2**, by row — every live row recording this controller even if
+  no descriptor points at it. Phase 2 is what makes "no row leak"
+  structural: a descriptor cleared by some other path would otherwise
+  strand its row forever, and a stranded row still holds a **pin** on a
+  controller that no longer exists — so the next legitimate mint of that
+  pin would be refused `IN_USE` by a ghost. On this kind the ghost may
+  hold the only way to bring a device out of reset.
+
+Keyed on `controller_id` rather than the parent cap slot: a slot can be
+reused by a different device, a part's bdf key names the part. A single
+level suffices — this kind is a leaf.
+
+### Failure taxonomy — `0xFFFFFF10..0xFFFFFF1F`
+
+Sixteen codes, exactly the band width, between `GPIO_IO_*`
+(`0xFFFFFF08..0F`) below and `LPSS_GPIO_*` (`0xFFFFFF20..2F`) above.
+Three adjacent, disjoint bands, and the adjacency is the point: all
+three layers refuse for structurally similar reasons during a probe, and
+a shared band would make "which layer refused" a guess.
+
+### Boot witness
+
+`tests/kernel/cap/gpio_cap_synth.pdx §gpio_cap_witness`, sub-tests A..O
+(fifteen stages) — fingerprint **`R30 KIND_GPIO OK`**. Cap slots 64..79,
+disjoint from every other witness's set; both exits revoke the windows
+and clear the slots.
+
+It builds its controller through the **shipping** allocator and the
+shipping community API, so it tests the shape the machine has.
+
+Two sub-tests carry the milestone:
+
+* **F** — the mapping outside community 0, asserted through the
+  capability against independently computed offsets, read back through
+  the seam, and asserted **against the two wrong answers** an identity
+  mapping (`0x18D0`) and a community-0-only mapping (`0x650`) would
+  give. Deleting the `pin - pin_base` subtraction fails this at stage 6.
+* **J** — the runtime mutant: all five capability-form resolvers and the
+  dispatch handler called with a *neighbouring pin's* number, community,
+  pad index, register offset and the other controller's identity loaded
+  into `rsi`/`rdx`/`rcx`/`r8`/`r9` and packed into the upper 56 bits of
+  `op_arg`. Every answer is still the capability's own.
+
+Sub-test **L** manufactures a **ghost row** — a minted line whose
+descriptor is then cleared by hand — so phase 2 of the cascade is
+exercised rather than assumed.
+
+Ordering note: this witness runs **after**
+`tests/kernel/drivers/gpio/lpss_gpio_synth.pdx`, the opposite way round
+from the I²C pair. There the capability witness ran first and the driver
+consumed its kinds; here the capability depends on the driver, because a
+line mint resolves its pin through the controller's community table.
+
+---
+
 ## Change log
 
 | Date | Round | Issue | Change |
@@ -1532,3 +1853,4 @@ every case.
 - `src/kernel/core/cap/invoke.pdx` — dispatch table.
 | 2026-08-15 | R30.M5 | #1072/#1073 | Landed the **LPSS I²C controller** and the **`i2c_transfer_channel`** — the two issues that turn the #1070/#1071 capability pair from structure into traffic. **Identification carries no device-ID table**, deliberately: a table is a claim about which silicon exists, wrong the moment a machine ships that its author had not seen, and its failure shape is the worst available — a present, healthy, *unprobed* controller and a silent log. Two stages instead: a loose PCI **class** candidate filter (`0x0C/0x80` or `0x11/0x80`, both seen in the wild for LPSS depending on firmware), then confirmation against **`IC_COMP_TYPE == 0x44570140`**, the constant every Synopsys `DW_apb_i2c` instance carries regardless of vendor, wrapper or SoC generation — an answer from the *part*, so it is right on silicon nobody here has seen. A class-matched candidate that fails stage 2 is `REJECTED` and **logged at LEVEL_ERROR with its BDF**, because "something is at this address and it is not what we expected" is the sentence that turns an unexplained dead touchpad into a bug report. The one vendor-specific fact — Intel's private reset at BAR0+0x204 — is gated on VID 0x8086 recorded at probe, and **released before** the identity read, an ordering that reversed rejects every Intel controller on the machine since the block reads back zero until then. **The BAR is reached only through a capability**: `lpss_i2c_bind_window` mints a `KIND_OP_REGION` root over space `PCI_BAR` (0x06, memory-like → demands a `KIND_MEMORY` parent with `RIGHT_MINT`) whose base and length are **inherited from the probed row, never argued** — a caller-supplied base would let a memory-authority holder mint a window over any address and call it a controller, i.e. #1061's own hole reopened by its client. The seam (`dw_io.pdx`) stores the **cap slot, not the address**, and re-resolves it per access, so a revoke takes effect immediately, a read-only window refuses writes, and out-of-window offsets are refused rather than clamped; `objdump -r` asserts that no object under `core/drivers/i2c/` other than `dw_io.o` relocates against `opregion_row_base`/`_len`, the only two functions that can turn a capability into a physical address. **Divider provenance is a stated ladder**: firmware-supplied HCNT/LCNT (best, deferred — needs the interpreter hop), computed from an ic_clk drawn from a **closed domain** of the three shipped Intel frequencies (implemented), or **refused** `INIT_CLK_UNKNOWN` — never defaulted, because a wrong divider does not error, it mis-clocks on a cold boot at the customer's desk. Counts at 100 MHz are `(397,469)/(57,129)/(23,49)/(3,11)`; the last is *below the core's hcnt minimum of 6*, which is why High-speed is refused rather than clamped (and refused twice over — it also needs a master-code preamble). **Bring-up ordering is the milestone's ordering claim**: disable, **poll `IC_ENABLE_STATUS` not `IC_ENABLE`** (the core's enable is asynchronous, and DesignWare *accepts and discards* configuration written while enabled), configure, enable, poll — asserted by **trace position**, since both orders leave identical final state. Only the count bank the rate uses is programmed, because the rate lives in the bus capability and a rate change is a different capability, not a register poke. **`i2c_transfer_channel`** (`{write, read, write_read, smbus_op}`, replies `| 0x80`) has **no address field in any revision**, two must-be-zero fields so a v2 cannot add one silently, and four kernel primitives plus three arity-one resolvers (`addr`/`mode`/`bus_row` — mode and bus row each being *half of an address* on a shared bus) whose seven literal signatures `tools/build.sh` now pins. `WRITE_READ` is its own opcode because a STOP between the pointer write and the read releases the bus and returns a different register's contents with **no error anywhere**; the engine emits exactly one RESTART and one STOP, asserted from the command-flag trace. `IC_TAR` is programmed **every** transfer and never cached: a stale target reaches the wrong device at full speed, which is the one failure the capability pair exists to prevent. Rights are **per direction** with three distinct refusals, consuming the `READ`/`WRITE` bits #1071 reserved so a capability minted before this landing is refused rather than silently widened — and `WRITE_READ` needs `WRITE` because the command byte moves the device's register pointer. Every wait is **bounded by an iteration budget** (reproducible, and independent of TSC calibration) with distinct codes per wait, and every loop checks for an abort *first*, since an aborted core holds its TX FIFO and would otherwise turn a NACK into a timeout. **NACK is an outcome**: `IC_CLR_TX_ABRT` is read on every abort path before any decoding — omitting it leaves the next transfer by any driver facing a latched abort — and the three real-world facts (nothing there / rejected a byte / lost arbitration) get three codes with the raw source retained. **Wedged bus: tier 1 implemented** (`IC_ENABLE.ABORT` + cycle, recovering every case where the master is stuck); **tier 2 deferred with its reason** — freeing a slave that latched SDA low needs SCL pulsed at the pad, i.e. `KIND_GPIO_LINE` from R30.M6 — and the state is *handled*: detected behaviourally at three consecutive failures (one can be a transient arbitration loss), latched, fast-failing without touching a register, with `lpss_i2c_unwedge` as the named exit. New bands `DW_IO_*` `0xFFFFFF30..3F`, `LPSS_I2C_*` `0xFFFFFF40..5F`, `I2C_XFER_*` `0xFFFFFF60..6F`, disjoint from each other and from every existing band. Seam pattern follows `gpe_io.pdx`, with the synthetic side a **device model** rather than a RAM buffer (read-to-clear registers clear, a commanded STOP raises STOP_DET, an armed NACK aborts) — without which "a NACK does not wedge the controller" would be unobservable. paideia-as#1312 does **not** apply: no port I/O here, and MMIO already carries the cap/effect coupling R29.M2-002 landed. Boot witness `tests/kernel/drivers/i2c/lpss_i2c_synth.pdx` (sub-tests A..R) — fingerprint `R30 LPSS I2C OK`, placed after the #1070/#1071 witness because both reset the bus and slave tables. Closes R30.M5. |
 | 2026-08-15 | R30.M5 | #1074 | Landed the **interrupt-driven I²C transfer engine**, closing R30.M5. **Path choice is "both", and the shape of "both" is the whole design**: two engines is not a performance question, it is a drift question — a NACK decoding one way on one path and another on the other, depending on which boot phase a caller ran in. So (a) the error handling is **not duplicated, it is called**: both engines decode aborts through the same `dw_xfer_check_abort`, resolve rights through the same `i2c_xfer_resolve`, retarget through the same `i2c_xfer_set_target` and check the same wedge latch, and the witness asserts the same armed abort yields the same code through `i2c_xfer_write` and `i2c_xfer_irq_write`; (b) the interrupt engine has **one implementation and only its caller varies** — `dw_i2c_isr_body` *is* the engine, called by a trampoline when a vector is bound and by `dw_irq_wait` from thread context when none is (today, and early boot forever), so the boot path cannot diverge from the interrupt path because it is the same function; (c) the polled engine stays for bring-up and SMBus as **distinct entry points, not a mode flag**, since a hidden flag is exactly how one call comes to behave two ways. **FSM state ownership is a baton, not a lock.** `_dw_irq_ctx[ctrl]` (128 B, cache-line aligned, `objdump -r`-confined) has exactly ONE field written by both contexts — `state`, written only by LOCK-prefixed CAS/xchg — and every other field has one writer at a time, chosen by that word: thread in `SETUP`, ISR in `ARMED`/`RUNNING`, the `CLOSING` winner in `CLOSING`, thread again once terminal. Publish is `CAS(SETUP→ARMED)` with the **software arm strictly before the hardware arm** (the `IC_INTR_MASK` write), so the first interrupt cannot find an unpublished row; return is field stores then `atomic_store(state, DONE|ABORT)`, TSO-ordered, so a thread that has seen `DONE` has seen everything that produced it. **Termination is an exclusive claim** through a distinct `CLOSING` state, because the ISR on a STOP_DET and the thread on an exhausted budget can decide simultaneously and a single CAS would publish before the outcome was written — the caller would be told "timed out" about a transfer that completed. Two concurrent service routines are excluded by a gate the loser **declines rather than spins on**, which is sound because the source is a level and is the only exclusion an ISR may use. **TX_EMPTY is a level, not an event** (`TXFLR <= IC_TX_TL`, and bring-up sets `IC_TX_TL = 0`), so it is true forever once the FIFO drains: a driver that leaves it unmasked completes correctly and takes an interrupt per EOI until the STOP lands, with nothing in final state recording it. Masked at ONE point — `dwi_isr_tx_masked`, the instant the command carrying `DW_CMD_STOP` is accepted, the earliest moment with nothing left to send — and the POSITION is recorded (`masked_at`) so the witness asserts *which* command, since masking at the first byte leaves an identical final mask and is wrong. Measured by a **level-triggered delivery pump** over a model extended to compute `IC_INTR_STAT = raw & mask`, hold TX_EMPTY from enable, follow RX_FULL with the queue, and **arm a commanded STOP as a countdown rather than reporting it instantly** — with a zero-length interval the storm cannot exist. A one-byte write costs exactly two service events; sub-test U puts the mask back by hand and asserts the same measurement exceeds ten, because *a ceiling nothing can breach proves nothing*. **Address NACK and data NACK stay distinct** and the data NACK reports `pushed − IC_TXFLR − 1` acknowledged bytes read at the abort — not the number pushed, since the core flushes the FIFO and the NACKed byte never landed; a caller assuming "all of it" would leave a device holding a half-applied multi-byte register write. Making that testable forced two model corrections of things `dw_regs.pdx` had asserted in prose since #1072 without modelling: an abort can now let N commands through first, and an abort **clears `IC_STATUS.TFNF`** with `IC_CLR_TX_ABRT` restoring it. **`dw_isr.pdx` is one function** so `objdump -r` can bound it: new `[dw-isr-allowlist]` with eleven targets and a vacuity guard, **separate from** `[sci-isr-allowlist]` and neither widening the other; two fixed bursts (8/8) so cost does not grow with transfer length. **The polled engine also gained the claim**: until #1074 two CPUs could interleave `IC_DATA_CMD` writes into one FIFO under one `IC_TAR` — one device's bytes under another's address, no error anywhere — an R18-SMP exposure nothing had closed. The claim is a **single global cell** because the seam has one binding; per-controller would let two controllers repoint it under each other. Also fixed: `dw_io_trace_append` reserves with `lock xadd`, since the ISR shares the seam and a read-modify-write loses one record and *aliases* another, which is the exact corruption that makes an ordering assertion say the opposite of the truth. New band `I2C_IRQ_*` `0xFFFFFFE0..E6`, closing the gap between `DMA_*` and `MSIX_*`; only THREE codes are new (`BUSY`, `NOT_OWNER`, `BAD_STATE`/`BAD_IDX`) because everything else reuses the polled taxonomy — the completion timeout is `I2C_XFER_TIMEOUT_STOP`, which is exactly right since the terminal states are STOP_DET or abort. Four interrupt entry points added to the signature pin set. Vector allocation, IDT install and EOI belong to R30.M6's `KIND_HW_MSIX_VECTOR` binding; the routine is written so binding one **adds a caller, not a code path**. Boot witness sub-tests S..X — second fingerprint `R30 LPSS I2C IRQ OK`. **Closes R30.M5.** |
+| 2026-08-15 | R30.M6 | #1075/#1076 | Landed `KIND_GPIO_LINE = 0x154` — derived over `KIND_DEVICE` with a two-part gate (kind + RIGHT_MINT, then the inherited identity must resolve to a probed pad controller). Row-indirection tail via `_gpio_line_table` encoding `{parent_slot:u8, pin:u16 absolute, pad_index:u16 community-relative, community:u8}` plus an inherited `controller_id`. Rights `R_GPIO_LINE_ALL = 0x41F`, with `CONFIG` split from `WRITE`. Community/pad mapping DERIVED at mint by `lpss_gpio_resolve_pin`; six resolver signatures arity-pinned and `lpss_gpio_pad_off` confined, so `gpio_line_pad_off_of_slot` is the only capability-to-pad-address route. Duplicate `(controller, pin)` refused; out-of-range and unmapped pins refused with distinct codes, never clamped. Two-phase controller cascade via `lpss_gpio_release`. Driver half in `core/drivers/gpio/{lpss_gpio,gpio_io}.pdx` with `design/drivers/lpss-gpio-controller.md`. Witnesses `R30 LPSS GPIO OK` + `R30 KIND_GPIO OK`. Opens R30.M6. |
