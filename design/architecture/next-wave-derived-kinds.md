@@ -1195,6 +1195,310 @@ rather than weaken the lint.
 
 ---
 
+## `KIND_I2C_BUS = 0x152` / `KIND_I2C_SLAVE = 0x153` — landed by R30.M5-001 (#1070) / R30.M5-002 (#1071)
+
+### Catalog reconciliation
+
+There was **no planning row** for either kind. The R30 catalog named
+`KIND_I2C_BUS` and `KIND_I2C_SLAVE` only in prose — in the
+`KIND_OP_REGION` section's explanation of why the four *bus* address
+spaces (`0x04` SMBus, `0x07` IPMI, `0x08` GeneralPurposeIO, `0x09`
+GenericSerialBus) are refused there. No tag, no base, no tail, no rights
+were ever fixed, so unlike `KIND_ACPI_EVENT` (#1068) there was nothing
+to re-base and nothing to contradict. The sections below are the first
+specification of either kind.
+
+The `KIND_OP_REGION` prose stands unchanged and is now discharged: those
+four spaces are bus spaces whose accesses are serial-bus *transactions*
+rather than loads and stores, and the transaction authority for I²C is
+`KIND_I2C_SLAVE`, not a `{base, len}` window.
+
+### Why two kinds and not one
+
+**I²C is a shared bus.** Every peripheral hangs off the same two wires
+and the controller can address any of them. A component holding "the I²C
+controller" therefore holds *every device on it*: the touchpad driver
+could talk to the fingerprint reader, the sensor hub, or whatever else
+the board designer found a free address for.
+
+So per-device isolation on I²C is not a property of the hardware. It
+does not exist unless the capability system manufactures it, and one
+capability per *controller* cannot manufacture it. Hence the split:
+
+| | holder | authorises |
+|---|---|---|
+| `KIND_I2C_BUS` | a **controller** driver | reading the bus's own properties; **minting slaves under it**. Nothing on the wire. |
+| `KIND_I2C_SLAVE` | a **device** driver | exactly one address on exactly one bus. |
+
+**The bus capability is deliberately non-transacting** — no read op, no
+write op, and `RIGHT_READ` / `RIGHT_WRITE` are outside
+`R_I2C_BUS_ALL` so no future op can quietly consume them. If the bus
+could transact, the slave capability would be an optional courtesy and
+per-device isolation would be decorative.
+
+### Derivation
+
+```
+KIND_DEVICE (base slot 10)          R22's PCI device authority
+      └── KIND_I2C_BUS   0x152      + RIGHT_MINT on the parent
+            └── KIND_I2C_SLAVE 0x153  + RIGHT_MINT on the parent
+```
+
+`KIND_I2C_SLAVE` is a **leaf**: `R_I2C_SLAVE_ALL` deliberately excludes
+`RIGHT_MINT`, so the lattice bottoms out and the cascade needs no fixed
+point (contrast `KIND_OP_REGION`, where a window may derive a window).
+
+**Which device tag.** R22 spells the PCI device authority two ways: base
+slot `KIND_DEVICE = 10`, which real descriptors carry and `invoke.pdx`
+routes; and derived tag `KIND_PCI_DEV = 0x30`, whose mint path
+`device_cap_mint` is still R22-M3 scaffolding that **writes no
+descriptor**. Gating on `0x30` would be a *vacuous* gate — it would
+refuse nothing because nothing could satisfy it either. The gate uses
+slot 10, matching `opregion_check_parent_base`'s use of slots 4 and 11,
+and the boot witness both satisfies it and is refused by it.
+
+### Controller identity is inherited, never argued
+
+`i2c_bus_cap_mint(slot, parent_slot, rights, max_speed_hz)` has **no
+controller argument**. The row's `controller_id` is the parent
+`KIND_DEVICE` descriptor's own `target_ptr` (the `bdf_pack` key),
+read out of the descriptor the gate just checked.
+
+This is #1068's discipline (the GSI inherited from the parent
+`KIND_HW_INTERRUPT` row) applied to identity. If the caller supplied it,
+a holder of device A's capability could mint a bus claiming to be device
+B's controller, and every audit record and every dump would be reporting
+a claim rather than a checked fact.
+
+`max_speed_hz` *is* an argument — it is a board property, not a
+controller property — but its domain is closed to the four rates the
+spec defines (100 k / 400 k / 1 M / 3.4 M). An unvalidated rate becomes
+an unvalidated clock divider in #1072, and the failure mode of a wrong
+divider is not a refusal but a bus that transacts and corrupts.
+
+### Address confinement — the property, and how it is made structural
+
+> A capability naming address A cannot be used to address B, and
+> "address B instead" is not a request that can be **phrased**.
+
+Three mechanisms, none of which is a check that could be forgotten:
+
+1. **The resolvers take no address.** `i2c_slave_addr_of_slot(slot)` and
+   `i2c_slave_row_addr(row_id)` are arity-one. There is no parameter for
+   a caller-supplied address, so the transfer path #1073 builds on them
+   physically cannot be handed one.
+2. **No op takes an operand.** `cap_handler_i2c_slave` masks `op_arg` to
+   its low byte before any dispatch decision, discarding the 56 bits a
+   caller might hide an address in. `QUERY_ADDR` is introspection — a
+   holder learning which device it owns — not addressing.
+3. **`tools/build.sh` pins it.** The `i2c-addr-confine` step asserts the
+   two literal signature lines, so a mutant that adds an `addr`
+   parameter fails the *build*, not the review. The runtime half is
+   sub-test O of the witness, which calls both resolvers with a
+   neighbouring device's address loaded into every register such a
+   parameter would arrive in.
+
+The address *is* an argument at **mint**, and only there. Mint is the
+authorising moment: gated on the bus capability with `RIGHT_MINT`, it is
+where the platform decides which driver owns which device. Afterwards
+the row is the sole source of truth.
+
+### Address validity — refused per range, with distinct codes
+
+7-bit mode (`I2C_ADDR_MODE_7BIT = 0`) admits **0x08..0x77** only:
+
+| range | meaning | code |
+|---|---|---|
+| `0x00..0x07` | general call, CBUS, other-bus-format, future, Hs-mode master codes | `I2C_SLAVE_MINT_ADDR_RESERVED_LOW` `0xFFFFFF77` |
+| `0x08..0x77` | **usable** | — |
+| `0x78..0x7B` | **10-bit addressing prefix (11110xx)** | `I2C_SLAVE_MINT_ADDR_RESERVED_HIGH` `0xFFFFFF76` |
+| `0x7C..0x7F` | reserved / device ID | `I2C_SLAVE_MINT_ADDR_RESERVED_HIGH` |
+| `> 0x7F` | not a 7-bit address | `I2C_SLAVE_MINT_ADDR_RANGE` `0xFFFFFF78` |
+
+The high range is confinement-critical, not spec pedantry: a 7-bit
+capability minted at `0x78` would put the controller into 10-bit
+framing, letting a capability that names *one* address reach a
+256-address space.
+
+10-bit mode (`= 1`) admits **0x000..0x3FF** entirely — the prefix
+distinguishes the framing on the wire, so no 10-bit address collides
+with a 7-bit device address. Any other mode →
+`I2C_SLAVE_MINT_BAD_MODE 0xFFFFFF79`.
+
+Three codes rather than one because the ends fail for different reasons
+and an operator debugging a bad ACPI `_CRS` needs to know which.
+**Refusal, never masking** — the `KIND_OP_REGION` argument again: a
+driver silently moved from `0x00` to `0x40` would be talking to a device
+it does not own, and the first symptom would surface in the *other*
+driver.
+
+### Address collision — the second mint is REFUSED
+
+Key: **`(parent_row, mode, addr)`** → `I2C_SLAVE_MINT_ADDR_IN_USE`
+(`0xFFFFFF75`).
+
+*Why refuse rather than share.* An I²C peripheral is not a stateless
+register file; the near-universal access pattern is "write the register
+pointer, then read" — two transactions with device-side state between
+them. Two independent owners interleaving those sequences do not get an
+error, they get each other's data, silently, and no protocol-level
+mechanism lets either notice. A device that genuinely must be shared
+needs an **arbiter** — one holder that serialises access and exposes its
+own interface — and an arbiter is a thing you *build*, not a thing you
+get by minting the capability twice. Permitting the second mint would
+make the broken configuration the easy one.
+
+*Why the key is scoped to the bus.* 0x1A on the touchpad's controller
+and 0x1A on the sensor hub are two devices on two pairs of wires. A
+global address table would reject the second — not a conservative
+failure, but one that makes an ordinary board unbootable. The witness
+asserts this direction explicitly (sub-test M).
+
+*Why mode is in the key.* 7-bit `0x1A` and 10-bit `0x01A` are different
+byte sequences on the wire and may legitimately coexist (sub-test N).
+
+### Tail encoding — row indirection
+
+Both kinds use the family's row indirection: `target_ptr` holds
+`row_id` in bits [15:0] and the payload lives in a kernel-owned private
+table.
+
+`_i2c_bus_table[row_id]`, 8 rows × 32 B:
+
+| off | field |
+|---|---|
+| `+0` | `[7:0]` parent_slot · `[55:8]` reserved · `[63:56]` in_use |
+| `+8` | `controller_id` — the parent `KIND_DEVICE`'s `target_ptr`. **Inherited.** Zero refused. |
+| `+16` | `max_speed_hz` — one of the four validated rates |
+| `+24` | `num_slaves` — live derived-slave count |
+
+`_i2c_slave_table[row_id]`, 32 rows × 32 B:
+
+| off | field |
+|---|---|
+| `+0` | `[7:0]` parent_slot · `[23:8]` **parent_row** · `[39:24]` addr · `[47:40]` mode · `[55:48]` reserved · `[63:56]` in_use |
+| `+8` | `driver_hint` — opaque owner identity, non-zero (zero is the "unclaimed" sentinel) |
+| `+16` / `+24` | reserved — #1073 transfer counters |
+
+`parent_row` rather than `parent_slot` is the **cascade and uniqueness
+key**: a cap slot can later hold a different bus, a live row_id cannot.
+
+`num_slaves` has exactly **two mutators**,
+`i2c_bus_note_slave_added` / `_removed`, exported across the object
+boundary precisely because `tools/build.sh` forbids `kind_i2c_slave.o`
+from touching `_i2c_bus_table`.
+
+### Rights
+
+| | bits | value |
+|---|---|---|
+| `R_I2C_BUS_ALL` | INVOKE \| REVOKE \| MINT \| OBSERVE | `0x618` |
+| `R_I2C_SLAVE_ALL` | READ \| WRITE \| INVOKE \| REVOKE \| OBSERVE | `0x41B` |
+
+Bus has **no READ/WRITE** (it authorises no transaction). Slave has
+**no MINT** (it is a leaf). Slave's READ/WRITE are reserved though
+nothing consumes them yet: reserving now means a capability minted today
+with `0x418` will still be *refused* a transfer when #1073 lands, rather
+than silently acquiring transfer authority on the day the op appears.
+
+### Revoke + cascade
+
+`i2c_bus_cap_revoke(slot)` **cascades first**, then frees its own row.
+`i2c_slave_cascade_revoke_by_bus_row(bus_row)` has two phases:
+
+* **Phase 1, by descriptor** — every `cap_table` slot holding a
+  `KIND_I2C_SLAVE` whose row records this bus row.
+* **Phase 2, by row** — every live row recording this bus row even if no
+  descriptor points at it. This is what makes "no row leak" *structural*:
+  a stranded row still occupies an address on a bus that no longer
+  exists, so the next legitimate mint at that address would be refused
+  `ADDR_IN_USE` **by a ghost**.
+
+After the cascade a non-zero `num_slaves` is reported
+(`I2C_BUS_REVOKE_SLAVES_LIVE 0xFFFFFF84`) but does **not** abort the
+teardown: a revoke that refuses to finish would leave the bus alive,
+which is strictly worse than a completed teardown with a named anomaly
+in the audit record.
+
+Free is **scrub** in both kinds. For slaves that matters specifically
+because the address is the uniqueness key — an unscrubbed freed row is
+the ghost above.
+
+### What a slave capability does NOT yet permit
+
+Holding a `KIND_I2C_SLAVE` today permits reading back its own address,
+mode, parent bus and driver hint (`INVOKE`), the canonical dump
+(`OBSERVE`), and being revoked. It does **not** permit, and no code
+would honour:
+
+* any transaction on the wire — no read, write, combined write-then-read
+  or SMBus block transfer. **R30.M5-004 (#1073)** defines the transfer
+  channel;
+* bringing the controller up, programming its divider, or touching any
+  controller register — those live behind the parent `KIND_DEVICE`'s
+  BARs, which **R30.M5-003 (#1072)** maps;
+* deriving anything (leaf kind, no `RIGHT_MINT`);
+* any bus-level operation. A slave holder cannot even count its
+  siblings.
+
+### Failure taxonomy
+
+`KIND_I2C_BUS` occupies `0xFFFFFF83..0xFFFFFF8F`; `KIND_I2C_SLAVE`
+occupies `0xFFFFFF70..0xFFFFFF7F` (sixteen codes, the exact width of the
+band). Both are disjoint from `ACPI_EVT_*` `0xFFFFFF90..9F`,
+`DRV_RESTART_*` `0xFFFFFFB5..BE`, `OPREG_*` `0xFFFFFFC2..CF`, `DMA_*`
+`0xFFFFFFD5..DF`, `MSIX_*` `0xFFFFFFE7..EF` and `HW_INT_*`
+`0xFFFFFFF7..FF` — and from **each other**, which matters more here than
+usual because the two kinds refuse for structurally similar reasons and
+a shared band would make "which of the two refused" a guess.
+
+| code | name |
+|---|---|
+| `0xFFFFFF8F` | `I2C_BUS_TAIL_ENOSPC` |
+| `0xFFFFFF8E` | `I2C_BUS_TAIL_BAD_ARG` |
+| `0xFFFFFF8D` | `I2C_BUS_MINT_BAD_PARENT` |
+| `0xFFFFFF8C` | `I2C_BUS_MINT_BAD_RIGHTS` |
+| `0xFFFFFF8B` | `I2C_BUS_MINT_BAD_ARG` |
+| `0xFFFFFF8A` | `I2C_BUS_MINT_ENOSPC` |
+| `0xFFFFFF89` | `I2C_BUS_MINT_BAD_SPEED` |
+| `0xFFFFFF88` | `I2C_BUS_MINT_BAD_CONTROLLER` |
+| `0xFFFFFF87` | `I2C_BUS_REVOKE_BAD_SLOT` |
+| `0xFFFFFF86` | `I2C_BUS_REVOKE_WRONG_KIND` |
+| `0xFFFFFF85` | `I2C_BUS_REVOKE_ALREADY` |
+| `0xFFFFFF84` | `I2C_BUS_REVOKE_SLAVES_LIVE` |
+| `0xFFFFFF83` | `I2C_BUS_COUNT_BAD_ROW` |
+| `0xFFFFFF7F` | `I2C_SLAVE_TAIL_ENOSPC` |
+| `0xFFFFFF7E` | `I2C_SLAVE_TAIL_BAD_ARG` |
+| `0xFFFFFF7D` | `I2C_SLAVE_MINT_BAD_PARENT` |
+| `0xFFFFFF7C` | `I2C_SLAVE_MINT_BAD_RIGHTS` |
+| `0xFFFFFF7B` | `I2C_SLAVE_MINT_BAD_ARG` |
+| `0xFFFFFF7A` | `I2C_SLAVE_MINT_ENOSPC` |
+| `0xFFFFFF79` | `I2C_SLAVE_MINT_BAD_MODE` |
+| `0xFFFFFF78` | `I2C_SLAVE_MINT_ADDR_RANGE` |
+| `0xFFFFFF77` | `I2C_SLAVE_MINT_ADDR_RESERVED_LOW` |
+| `0xFFFFFF76` | `I2C_SLAVE_MINT_ADDR_RESERVED_HIGH` |
+| `0xFFFFFF75` | `I2C_SLAVE_MINT_ADDR_IN_USE` |
+| `0xFFFFFF74` | `I2C_SLAVE_MINT_BAD_HINT` |
+| `0xFFFFFF73` | `I2C_SLAVE_REVOKE_BAD_SLOT` |
+| `0xFFFFFF72` | `I2C_SLAVE_REVOKE_WRONG_KIND` |
+| `0xFFFFFF71` | `I2C_SLAVE_REVOKE_ALREADY` |
+| `0xFFFFFF70` | `I2C_SLAVE_BUS_LOST` |
+
+### Boot witness
+
+`tests/kernel/cap/i2c_cap_synth.pdx §i2c_cap_witness`, sub-tests A..T
+(twenty stages) — fingerprint **`R30 KIND_I2C OK`**. Cap slots 34..45,
+disjoint from every other witness's set; both exits clear them and reset
+both row tables.
+
+Sub-test **O** is the runtime mutant: it calls `i2c_slave_addr_of_slot`
+and the dispatch handler with a *neighbouring device's* address loaded
+into `rsi`/`rdx`/`rcx`/`r8`/`r9` and packed into the upper 56 bits of
+`op_arg`, and asserts the answer is still the capability's own address in
+every case.
+
+---
+
 ## Change log
 
 | Date | Round | Issue | Change |
@@ -1213,6 +1517,7 @@ rather than weaken the lint.
 
 | 2026-08-15 | R30.M3 | #1061/#1062 | Landed `KIND_OP_REGION = 0x150` — the address-space window capability and **the security boundary of R30**: the first kind whose base slot is not a constant (`KIND_MEMORY` 4 for memory-like spaces, `KIND_IO_PORT` 11 for port-like ones, decided by `opregion_space_base_kind` so a port holder cannot manufacture memory reach). Row-indirection tail via `_op_region_table` (32 × 32 B) encoding `{space:u8, base:u64, len:u64, parent_slot:u8, parent_row:u16, is_root:u1}`. Two mint paths and no third: a **root** path demanding the base-kind parent the space requires, reachable only from kernel-side boot code and deliberately not an op on any capability; and a **derive** path — the one a firmware-declared region takes — which inherits the space from its parent and containment-checks the request, **refusing with `OPREG_MINT_NO_COVER` rather than clipping**, because truncation would turn the capability system into an address oracle. Containment is overflow-safe (never forms `base + len`). Rights `R_OPREG_ALL = 0x61B` with READ/WRITE separate so a read-only window is expressible, and derive monotone in rights as well as extent. Transitive cascade revoke as a fixed-point scan (a window may derive a window; recursion on a teardown path is the shape a hostile chain exploits). `tools/build.sh` asserts via `objdump -r` that `_op_region_table` is relocated against from `kind_op_region.o` alone, which is what makes "the containment check is the only path to a row" a property of the kernel rather than of one file. Boot witness `§kind_op_region_witness` (24 sub-tests) — fingerprint `R30 KIND_OP_REGION OK`; its slot ordering is descending on purpose so the cascade's fixed point is genuinely exercised. Userspace half (#1062) is the SystemMemory handler in `src/user/aml/aml_region.pdx`. Opens R30.M3. |
 | 2026-08-15 | R30.M4 | #1068/#1069 | Landed `KIND_ACPI_EVENT = 0x151` — **re-tagged from the `0x21` planning row and re-based from `KIND_NOTIFICATION` (12) to `KIND_HW_INTERRUPT` (`0x140`)**; reconciliation table in the row above. The forcing fact is that the event stream carries **two sources**, not the one the planning row was written from: a firmware `Notify` (informational, nothing to acknowledge) and a hardware **GPE** arriving through the SCI (masked until acknowledged, and the acknowledgement is a *write to the GPE enable register*). `KIND_NOTIFICATION` cannot gate hardware authority, so the endpoint derives over the SCI's own interrupt capability and the gate demands `kind == 0x140` **and** `RIGHT_MINT`; the GSI is **inherited** from the parent row rather than accepted as an argument, so a child cannot misreport which line its events came from. Rights widened `0x408` → `R_ACPI_EVT_ALL = 0x618`: the planning row's no-forged-`Notify` argument is preserved (there is no inject op and no op that writes a record), but acknowledging is not injecting and needs `INVOKE`. Row indirection via `_acpi_event_table` (8 rows × 32 B, sized for **processes** not event sources) encoding `{parent_slot:u8, gsi:u32, subscriber_id:u64, delivered:u64, acked:u64}`; `delivered - acked` is the standing observable for a GPE that is masked, dispatched, handled and never re-enabled. The #1059 32-byte wire format was not discarded — it moved one level down to the stream **record** (64 B, `evt_stream.pdx`), widened by the source discriminator plus a redundant `NEEDS_ACK` flag so what a subscriber *owes* is a field of its own. Bounded stream depth 32 with tail-drop, and the #1059 identity gains one term for the failure mode that ring lacks: `offered == drained + depth + drops + unrouted`, with ring-full and no-subscriber counted **separately** because a wedged subscriber and an absent one need different fixes. `sci_arm` (`core/acpi/sci_arm.pdx`) refuses `SCI_ARM_NOT_READY` without touching the IOAPIC until an endpoint is bound, which is what closes the ordering #1066 left open by programming the SCI masked. Revocation *pushes*: revoke unbinds the stream in the same operation that frees the row. The ISR call-target allowlist in `tools/build.sh` is **unchanged** — the no-subscriber audit record reuses `drv_audit_emit`, already on it. Failure band `0xFFFFFF90..9F`. Boot witness `tests/kernel/acpi/evt_route_synth.pdx` (sub-tests A..G) — fingerprint `R30 ACPI EVENT ROUTE OK`. Closes R30.M4. |
+| 2026-08-15 | R30.M5 | #1070/#1071 | Landed the I²C capability **pair** — `KIND_I2C_BUS = 0x152` over `KIND_DEVICE` (base slot 10) and `KIND_I2C_SLAVE = 0x153` over the bus. **No planning row existed for either**: the R30 catalog named them only in `KIND_OP_REGION`'s prose about refusing the four bus address spaces, with no tag, base, tail or rights fixed, so unlike #1068 there was nothing to re-base. Two kinds rather than one because I²C is a *shared bus*: the controller can address every peripheral on it, so a single per-controller capability makes per-device isolation decorative. The bus cap is therefore **non-transacting by construction** — no read/write op and `RIGHT_READ`/`RIGHT_WRITE` outside `R_I2C_BUS_ALL = 0x618`, so no later op can quietly consume them — and the only path to the wire is a slave cap naming one address. Controller identity is **inherited** from the parent `KIND_DEVICE` descriptor's `target_ptr` (the mint has no controller argument), extending #1068's GSI-inheritance discipline to identity; bus rate is an argument but with a **closed domain** of the four spec rates, because an unvalidated rate becomes an unvalidated clock divider in #1072 and a wrong divider does not refuse, it corrupts. Gates on base slot 10 rather than R22's derived `KIND_PCI_DEV = 0x30` because `device_cap_mint` still writes no descriptor — a `0x30` gate would be *vacuous*. **Address confinement is structural**: both resolvers (`i2c_slave_addr_of_slot`, `i2c_slave_row_addr`) are arity-one, no op takes an operand (`op_arg` masked to its low byte before any dispatch decision), and `tools/build.sh`'s new `i2c-addr-confine` step pins both literal signature lines so a mutant that adds an `addr` parameter fails the *build*; the runtime half is witness sub-test O, which loads a neighbouring device's address into every register such a parameter would arrive in. 7-bit addressing admits `0x08..0x77` with **distinct codes per reserved range** (`0x00..0x07` LOW, `0x78..0x7F` HIGH — the high one confinement-critical, since `0x78..0x7B` is the 10-bit prefix and a 7-bit cap there would reach a 256-address space); 10-bit admits all of `0x000..0x3FF`. Duplicate `(parent_row, mode, addr)` is **refused** `ADDR_IN_USE`, because two owners of one I²C part interleave register-pointer-then-read sequences and silently read each other's data with no protocol-level way to notice — a shared device needs an arbiter, which is built, not minted twice; the key is **scoped to the bus**, since a global table would reject 0x1A-on-two-controllers and make an ordinary board unbootable. Row indirection via `_i2c_bus_table` (8 × 32 B) and `_i2c_slave_table` (32 × 32 B), both confined by `objdump -r` to their owning object — which is *why* the bus's live-device count has exactly two mutators, `i2c_bus_note_slave_added`/`_removed`. Bus revoke **cascades** in two phases, by descriptor and then by row; phase 2 is what makes "no row leak" structural, since a stranded row would refuse the next legitimate mint at that address by a ghost. `KIND_I2C_SLAVE` is a **leaf** (no `RIGHT_MINT`), so no fixed point is needed. A slave cap does **not** yet permit any transaction, any controller register access, or any bus operation — #1072 maps the BARs and #1073 defines the transfer channel. Failure bands `0xFFFFFF83..8F` (bus) and `0xFFFFFF70..7F` (slave), disjoint from each other and from every other kind. Boot witness `tests/kernel/cap/i2c_cap_synth.pdx` (sub-tests A..T) — fingerprint `R30 KIND_I2C OK`. Opens R30.M5. |
 
 ---
 

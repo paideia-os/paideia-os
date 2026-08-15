@@ -260,6 +260,98 @@ fi
 echo "[gpe-confine] GPE geometry, dispatch table, event ring, I/O seam,"
 echo "[gpe-confine] endpoint table and subscriber stream confined"
 
+# ---------------------------------------------------------------------------
+# R30.M5-001 (#1070) / R30.M5-002 (#1071): I²C CAPABILITY CONFINEMENT.
+#
+# I²C is a shared bus. Every peripheral hangs off the same two wires and
+# the controller can address any of them, so per-device isolation is not
+# a property of the hardware — it exists only if the capability system
+# manufactures it. The claim this milestone makes is:
+#
+#   A capability naming address A cannot be used to address B, and
+#   "address B instead" is not a request that can be PHRASED.
+#
+# That is a claim about the SHAPE of the code, and it is checked here in
+# two parts.
+#
+# (1) STORAGE CONFINEMENT, the same shape as the op-region and GPE
+#     checks above. `_i2c_slave_table` is the only place in the kernel
+#     where an I²C device address lives, and `_i2c_bus_table` is the
+#     only place a controller identity and a device count live. Confining
+#     each to its owning object is what makes "the mint gate is the only
+#     path to a row" a property of the kernel rather than of one file.
+#     It is also what forces kind_i2c_slave.o to maintain the bus's
+#     device count through i2c_bus_note_slave_added / _removed instead of
+#     reaching into the bus table, which is why that count has exactly
+#     two mutators.
+#
+# (2) ADDRESS-ARGUMENT ARITY PIN. The two address resolvers take a
+#     capability (or a row) and nothing else. A mutant that adds an
+#     `addr` parameter to either — the natural, helpful-looking change
+#     that would quietly destroy the confinement property — changes the
+#     declared signature, and this check fails the build on it. The
+#     runtime half of the same argument is sub-test O of
+#     tests/kernel/cap/i2c_cap_synth.pdx, which calls both resolvers
+#     with a neighbouring device's address loaded into every register an
+#     added parameter could arrive in.
+# ---------------------------------------------------------------------------
+I2C_CONFINE_OK=1
+i2c_confine_one() {
+    local sym="$1"
+    local owner="${BUILD_DIR}/$2"
+    local strays=""
+    if [[ ! -f "${owner}" ]]; then
+        echo "[i2c-confine] FAIL: ${owner} not built" >&2
+        I2C_CONFINE_OK=0
+        return
+    fi
+    if ! objdump -r "${owner}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+        echo "[i2c-confine] FAIL: $2 does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  assertion below would then pass vacuously." >&2
+        I2C_CONFINE_OK=0
+        return
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${owner}" ]] && continue
+        if objdump -r "${o}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[i2c-confine] FAIL — objects other than $2 relocate against ${sym}:${strays}" >&2
+        I2C_CONFINE_OK=0
+    fi
+}
+i2c_confine_one '_i2c_bus_table'   'core/cap/kind_i2c_bus.o'
+i2c_confine_one '_i2c_slave_table' 'core/cap/kind_i2c_slave.o'
+if [[ "${I2C_CONFINE_OK}" -ne 1 ]]; then
+    echo "  See src/kernel/core/cap/kind_i2c_bus.pdx and kind_i2c_slave.pdx" >&2
+    echo "  for why each table has exactly one legitimate writer." >&2
+    exit 1
+fi
+echo "[i2c-confine] bus row table and slave address table confined"
+
+I2C_SLAVE_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_i2c_slave.pdx"
+i2c_addr_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${I2C_SLAVE_SRC}"; then
+        echo "[i2c-addr-confine] FAIL — expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "  The I²C slave address resolvers take a capability slot (or a row" >&2
+        echo "  id) and NOTHING ELSE. An extra parameter here — an 'addr' the" >&2
+        echo "  caller supplies — would make 'address a device other than the one" >&2
+        echo "  my capability names' expressible, which is precisely the property" >&2
+        echo "  KIND_I2C_SLAVE exists to remove on a shared bus. If this fired" >&2
+        echo "  because the signature legitimately changed, the confinement" >&2
+        echo "  argument in kind_i2c_slave.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+i2c_addr_pin_one 'pub let i2c_slave_addr_of_slot : (u64) -> u64'
+i2c_addr_pin_one 'pub let i2c_slave_row_addr : (u64) -> u64'
+echo "[i2c-addr-confine] slave address resolvers take no caller-supplied address"
+
 # (2) Port I/O confinement under core/acpi/.
 gpe_io_strays=""
 for o in "${OBJECTS[@]}"; do

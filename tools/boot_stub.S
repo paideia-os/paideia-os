@@ -2190,3 +2190,29 @@ evt_route_ok_msg: .ascii "R30 ACPI EVENT ROUTE OK\n\0"
 .global evt_route_fail_msg
 .section .rodata
 evt_route_fail_msg: .ascii "R30 ACPI EVENT ROUTE FAIL\n\0"
+
+
+# R30.M5-001 (#1070) / R30.M5-002 (#1071): I²C capability-pair witness
+# fingerprints. I²C is a shared bus: every peripheral hangs off the same
+# two wires and the controller can address any of them, so per-device
+# isolation exists only if it is manufactured inside the capability
+# system. KIND_I2C_BUS (0x152) is the controller capability and
+# deliberately authorises NO transaction on the wire; KIND_I2C_SLAVE
+# (0x153) derives over it and names exactly one address, taken from the
+# capability row and never from a caller. The witness proves both
+# derivation gates, the per-range reserved-address refusals, the
+# duplicate-address refusal, same-address-different-bus coexistence, the
+# address-argument mutant, the bus-to-slave cascade and the absence of
+# row leaks. See:
+#   - src/kernel/core/cap/kind_i2c_bus.pdx   (bus kind)
+#   - src/kernel/core/cap/kind_i2c_slave.pdx (slave kind)
+#   - src/kernel/core/cap/invoke.pdx         (0x152 / 0x153 branches)
+#   - tests/kernel/cap/i2c_cap_synth.pdx     (this witness)
+#   - design/architecture/next-wave-derived-kinds.md §KIND_I2C_BUS
+.global kind_i2c_ok_msg
+.align 8
+kind_i2c_ok_msg: .ascii "R30 KIND_I2C OK\n\0"
+
+.global kind_i2c_fail_msg
+.align 8
+kind_i2c_fail_msg: .ascii "R30 KIND_I2C FAIL\n\0"
