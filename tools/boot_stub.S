@@ -2216,3 +2216,42 @@ kind_i2c_ok_msg: .ascii "R30 KIND_I2C OK\n\0"
 .global kind_i2c_fail_msg
 .align 8
 kind_i2c_fail_msg: .ascii "R30 KIND_I2C FAIL\n\0"
+
+# ---------------------------------------------------------------------------
+# R30.M5-003 (#1072) / R30.M5-004 (#1073): LPSS I²C controller + transfer
+# engine witness markers.
+#
+# Emitted by tests/kernel/drivers/i2c/lpss_i2c_synth.pdx §lpss_i2c_witness,
+# which drives the shipping probe, window mint, identification, bring-up
+# and transfer engine against the synthetic side of the register seam in
+# src/kernel/core/drivers/i2c/dw_io.pdx.
+#
+# The four claims the fingerprint stands for:
+#   * the controller's BAR is reached through a KIND_OP_REGION capability
+#     resolved per access, never through a raw physical address;
+#   * the controller was DISABLED before its configuration registers were
+#     written and re-enabled after -- asserted by trace POSITION, since
+#     both orderings leave identical final state;
+#   * the device address comes from the slave capability's row and from
+#     nowhere else, including when a neighbour's address is loaded into
+#     every register a smuggled parameter could arrive in;
+#   * every wait is bounded with a distinct timeout, a NACK leaves the
+#     controller usable, and a wedged bus is a latched, fast-failing,
+#     exitable state rather than a hang.
+#
+# See also:
+#   - src/kernel/core/drivers/i2c/dw_regs.pdx     (register map + divider)
+#   - src/kernel/core/drivers/i2c/dw_io.pdx       (seam + trace + model)
+#   - src/kernel/core/drivers/i2c/lpss_probe.pdx  (probe + window mint)
+#   - src/kernel/core/drivers/i2c/dw_init.pdx     (identify + bring-up)
+#   - src/kernel/core/drivers/i2c/xfer_schema.pdx (i2c_transfer_channel)
+#   - src/kernel/core/drivers/i2c/dw_xfer.pdx     (transfer engine)
+#   - design/drivers/lpss-i2c-controller.md
+#   - design/drivers/i2c-transfer-schema.md
+.global lpss_i2c_ok_msg
+.align 8
+lpss_i2c_ok_msg: .ascii "R30 LPSS I2C OK\n\0"
+
+.global lpss_i2c_fail_msg
+.align 8
+lpss_i2c_fail_msg: .ascii "R30 LPSS I2C FAIL\n\0"

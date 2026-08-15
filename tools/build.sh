@@ -333,6 +333,25 @@ fi
 echo "[i2c-confine] bus row table and slave address table confined"
 
 I2C_SLAVE_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_i2c_slave.pdx"
+I2C_XFER_SRC="${REPO_ROOT}/src/kernel/core/drivers/i2c/dw_xfer.pdx"
+i2c_addr_pin_in() {
+    local src="$1"
+    local decl="$2"
+    if ! grep -qF -- "${decl}" "${src}"; then
+        echo "[i2c-addr-confine] FAIL — expected declaration not found in" >&2
+        echo "  ${src#"${REPO_ROOT}"/}:" >&2
+        echo "    ${decl}" >&2
+        echo "  Every I²C address-bearing entry point takes a CAPABILITY SLOT and" >&2
+        echo "  no address. An extra parameter on any of them — an 'addr', a" >&2
+        echo "  'mode', a 'bus' the caller supplies — would make 'address a device" >&2
+        echo "  other than the one my capability names' expressible, which is" >&2
+        echo "  precisely the property KIND_I2C_SLAVE exists to remove on a shared" >&2
+        echo "  bus. If this fired because a signature legitimately changed, the" >&2
+        echo "  confinement argument in kind_i2c_slave.pdx and dw_xfer.pdx must be" >&2
+        echo "  rewritten first." >&2
+        exit 1
+    fi
+}
 i2c_addr_pin_one() {
     local decl="$1"
     if ! grep -qF -- "${decl}" "${I2C_SLAVE_SRC}"; then
@@ -350,7 +369,158 @@ i2c_addr_pin_one() {
 }
 i2c_addr_pin_one 'pub let i2c_slave_addr_of_slot : (u64) -> u64'
 i2c_addr_pin_one 'pub let i2c_slave_row_addr : (u64) -> u64'
-echo "[i2c-addr-confine] slave address resolvers take no caller-supplied address"
+
+# R30.M5-004 (#1073): the pin set extends to the two OTHER identity
+# resolvers and to all four transfer entry points.
+#
+# Mode and bus row are each half of an address on this bus. A 7-bit
+# device at 0x1A and a 10-bit device at 0x01A are the same number and
+# different byte sequences on the wire; address 0x1A on the touchpad
+# controller and 0x1A on the sensor hub are two devices on two pairs of
+# wires, which #1071 deliberately permitted at mint by scoping the
+# uniqueness key to the bus. A transfer path that accepted either from
+# its caller could therefore reach a device its capability does not
+# name while passing every address check — so all three resolvers are
+# arity one, and all four transfer entry points take a capability slot
+# first and no address at all.
+i2c_addr_pin_one 'pub let i2c_slave_mode_of_slot : (u64) -> u64'
+i2c_addr_pin_one 'pub let i2c_slave_bus_row_of_slot : (u64) -> u64'
+i2c_addr_pin_in "${I2C_XFER_SRC}" 'pub let i2c_xfer_write : (u64, u64, u64, u64) -> u64'
+i2c_addr_pin_in "${I2C_XFER_SRC}" 'pub let i2c_xfer_read : (u64, u64, u64, u64) -> u64'
+i2c_addr_pin_in "${I2C_XFER_SRC}" 'pub let i2c_xfer_write_read : (u64, u64, u64, u64, u64, u64) -> u64'
+i2c_addr_pin_in "${I2C_XFER_SRC}" 'pub let i2c_smbus_op : (u64, u64, u64, u64, u64) -> u64'
+echo "[i2c-addr-confine] address/mode/bus resolvers and all four transfer"
+echo "[i2c-addr-confine] entry points take no caller-supplied address"
+
+# ---------------------------------------------------------------------------
+# R30.M5-003 (#1072): I²C REGISTER-PATH CONFINEMENT.
+#
+# The claim: the LPSS controller's registers are reachable ONLY through
+# a KIND_OP_REGION capability, resolved on every access.
+#
+# That claim is a property of one file — core/drivers/i2c/dw_io.pdx —
+# until it is checked. Two checks make it a property of the kernel.
+#
+# (a) The seam's own state (mode, bound window slot, synthetic window,
+#     access trace) has exactly one writer object. A second writer could
+#     bind a window, or switch the seam to its synthetic side, from
+#     somewhere the review never looked.
+#
+# (b) NO OTHER OBJECT UNDER core/drivers/i2c/ MAY RELOCATE AGAINST
+#     opregion_row_base OR opregion_row_len. Those two functions are the
+#     only ones in the kernel that can turn a capability into a physical
+#     address — _op_region_table is confined to kind_op_region.o by the
+#     [opregion-confine] step above — so an object under this directory
+#     that calls them is an object forming a device address outside the
+#     seam. That is precisely the second, unguarded path to controller
+#     registers that R30.M3 spent an issue removing for firmware-declared
+#     regions; re-opening it one layer down, for the same physical
+#     addresses, would void the argument with no symptom until something
+#     wrote a register nobody granted it.
+#
+# The transfer engine, the bring-up sequence and the probe all reach
+# registers through dw_io_read32 / dw_io_write32 and therefore relocate
+# against those, not against the address producers.
+I2C_MMIO_OK=1
+i2c_mmio_owner_only() {
+    local sym="$1"
+    local owner="${BUILD_DIR}/core/drivers/i2c/dw_io.o"
+    if [[ ! -f "${owner}" ]]; then
+        echo "[i2c-mmio-confine] FAIL: ${owner} not built" >&2
+        I2C_MMIO_OK=0
+        return
+    fi
+    if ! objdump -r "${owner}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+        echo "[i2c-mmio-confine] FAIL: dw_io.o does not reference ${sym}" >&2
+        echo "  The seam no longer resolves the window capability itself; the" >&2
+        echo "  confinement assertion below would then pass vacuously." >&2
+        I2C_MMIO_OK=0
+        return
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        case "${o}" in
+            "${BUILD_DIR}"/core/drivers/i2c/*) ;;
+            *) continue ;;
+        esac
+        [[ "${o}" == "${owner}" ]] && continue
+        if objdump -r "${o}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[i2c-mmio-confine] FAIL — objects under core/drivers/i2c/ other than" >&2
+        echo "  dw_io.o relocate against ${sym}:${strays}" >&2
+        I2C_MMIO_OK=0
+    fi
+}
+i2c_seam_state_confine() {
+    local sym="$1"
+    local owner="${BUILD_DIR}/core/drivers/i2c/dw_io.o"
+    local strays=""
+    if ! objdump -r "${owner}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+        echo "[i2c-mmio-confine] FAIL: dw_io.o does not reference ${sym}" >&2
+        I2C_MMIO_OK=0
+        return
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${owner}" ]] && continue
+        if objdump -r "${o}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[i2c-mmio-confine] FAIL — objects other than dw_io.o relocate" >&2
+        echo "  against ${sym}:${strays}" >&2
+        I2C_MMIO_OK=0
+    fi
+}
+i2c_mmio_owner_only 'opregion_row_base'
+i2c_mmio_owner_only 'opregion_row_len'
+i2c_seam_state_confine '_dw_io_mode'
+i2c_seam_state_confine '_dw_io_win_slot'
+i2c_seam_state_confine '_dw_io_synth_ram'
+i2c_seam_state_confine '_dw_io_trace'
+# The controller table and the abort-source diagnostic likewise have one
+# writer each: bring-up and the transfer engine mutate controller state
+# only through lpss_probe.o's exported mutators, which is what keeps
+# "which controller is wedged" a single fact rather than a race.
+i2c_ctrl_confine() {
+    local sym="$1"
+    local owner="${BUILD_DIR}/$2"
+    local strays=""
+    if [[ ! -f "${owner}" ]]; then
+        echo "[i2c-mmio-confine] FAIL: ${owner} not built" >&2
+        I2C_MMIO_OK=0
+        return
+    fi
+    if ! objdump -r "${owner}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+        echo "[i2c-mmio-confine] FAIL: $2 does not reference ${sym}" >&2
+        I2C_MMIO_OK=0
+        return
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${owner}" ]] && continue
+        if objdump -r "${o}" 2>/dev/null | grep -qE "${sym}([^a-zA-Z0-9_]|\$)"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[i2c-mmio-confine] FAIL — objects other than $2 relocate against" >&2
+        echo "  ${sym}:${strays}" >&2
+        I2C_MMIO_OK=0
+    fi
+}
+i2c_ctrl_confine '_lpss_i2c_ctrl'      'core/drivers/i2c/lpss_probe.o'
+i2c_ctrl_confine '_i2c_xfer_abort_src' 'core/drivers/i2c/dw_xfer.o'
+if [[ "${I2C_MMIO_OK}" -ne 1 ]]; then
+    echo "  See src/kernel/core/drivers/i2c/dw_io.pdx for why the window" >&2
+    echo "  capability must be re-resolved per access and why no second" >&2
+    echo "  address-producing path may exist under core/drivers/i2c/." >&2
+    exit 1
+fi
+echo "[i2c-mmio-confine] controller registers reachable only through the"
+echo "[i2c-mmio-confine] window capability; seam and controller state confined"
 
 # (2) Port I/O confinement under core/acpi/.
 gpe_io_strays=""

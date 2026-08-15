@@ -1,0 +1,605 @@
+// src/kernel/core/drivers/i2c/dw_init.pdx — R30.M5-003 (#1072)
+//
+// Stage-2 identification and DesignWare controller bring-up.
+//
+// -----------------------------------------------------------------------------
+// ONE CONTROLLER AT A TIME
+// -----------------------------------------------------------------------------
+//
+// `dw_io` holds exactly one bound window. Every operation in this file
+// and in dw_xfer.pdx therefore begins with `dw_i2c_select(idx)`, which
+// re-binds the seam to that controller's window capability. Selection is
+// a capability rebind and touches no register, so it is cheap.
+//
+// This is a single-threaded boot-time posture and it is stated rather
+// than hidden: two CPUs driving two LPSS controllers concurrently would
+// race on the bound slot. When R30.M5 grows a per-controller driver
+// process (softarch §3 R30: one `lpss_i2c_bus_driver` per controller),
+// the seam's single binding becomes per-process state and the race
+// disappears without any caller changing. Making it per-controller
+// state *now* would mean either eight seams or a seam that takes an
+// index — and a seam that takes an index takes an address one refactor
+// later.
+//
+// -----------------------------------------------------------------------------
+// IDENTIFICATION, STAGE 2
+// -----------------------------------------------------------------------------
+//
+// `dw_i2c_identify` is where a class candidate becomes a known
+// DesignWare core, by reading the core's own identity register:
+//
+//   1. If the row records an Intel wrapper, release the LPSS function
+//      reset — write 0x7 to BAR0 + 0x204. UNTIL THIS IS DONE EVERY
+//      DESIGNWARE REGISTER READS BACK ZERO, including IC_COMP_TYPE. A
+//      confirmation read placed before the reset release would reject
+//      every Intel controller on the machine, which is the kind of
+//      ordering bug that looks like "this laptop has no I²C".
+//   2. Read IC_COMP_TYPE (BAR0 + 0xFC).
+//   3. 0x44570140 confirms. Anything else calls `lpss_i2c_reject`,
+//      which logs the BDF at LEVEL_ERROR and parks the row.
+//
+// The read goes through the seam, so it is subject to the window
+// capability like every other access; a candidate whose window was
+// minted without READ is refused before it is identified.
+//
+// -----------------------------------------------------------------------------
+// BRING-UP ORDERING — THE PART THAT IS EASY TO GET SILENTLY WRONG
+// -----------------------------------------------------------------------------
+//
+// DesignWare latches most of its configuration only while it is
+// disabled. IC_CON, the SCL count registers, IC_SDA_HOLD and IC_TAR are
+// all in that set. Writing them to an enabled controller does not
+// error — the write is accepted and DISCARDED. The controller then runs
+// with its previous (usually reset-default) configuration, which for
+// the count registers means a clock rate nobody chose.
+//
+// And "disabled" is not "IC_ENABLE was written 0". The core's enable is
+// asynchronous: IC_ENABLE_STATUS.IC_EN lags the request by up to
+// twenty-five bus cycles, and the databook's own instruction is to poll
+// the STATUS register. A bring-up that writes IC_ENABLE = 0 and
+// immediately writes IC_CON is racing the core, and it wins that race
+// on a fast bench and loses it on a cold boot with a slow ic_clk.
+//
+// So the order is exactly:
+//
+//   1.  IC_ENABLE      <- 0
+//   2.  poll IC_ENABLE_STATUS.IC_EN == 0        [bounded]
+//   3.  IC_INTR_MASK   <- 0        (we are polled, not interrupt-driven)
+//   4.  read IC_CLR_INTR           (drop anything latched by firmware)
+//   5.  IC_CON         <- master | speed | restart_en | slave_disable
+//   6.  IC_{SS,FS}_SCL_{HCNT,LCNT} <- the computed divider
+//   7.  IC_SDA_HOLD    <- 300 ns worth of ic_clk periods
+//   8.  IC_TX_TL, IC_RX_TL <- 0
+//   9.  IC_DMA_CR      <- 0        (PIO; a stale DMA enable would have
+//                                   the core waiting on a channel that
+//                                   is not coming)
+//   10. IC_ENABLE      <- 1
+//   11. poll IC_ENABLE_STATUS.IC_EN == 1        [bounded]
+//
+// Steps 1 and 2 before 3..9, and 10 after them, is the claim the
+// witness checks by TRACE POSITION: the index of the first IC_ENABLE
+// write is below the index of the IC_CON write, which is below the
+// index of the second IC_ENABLE write. That is an ordering claim, and
+// an ordering claim cannot be checked from final state — both orders
+// leave the same registers holding the same values.
+//
+// Only the count-register bank the selected rate uses is programmed.
+// The others keep their reset values. This is deliberate: the rate is a
+// property of the bus CAPABILITY, validated at mint against the four
+// spec rates, so changing rate means holding a different capability,
+// and that means re-running bring-up rather than poking one register.
+// A driver that could switch banks at runtime would be a driver that
+// can change the bus's rate without anyone re-checking it against the
+// slowest part on the wire.
+//
+// IC_TAR IS NOT PROGRAMMED HERE. The target address belongs to a slave
+// capability, is written per transfer, and never appears in bring-up —
+// see dw_xfer.pdx.
+//
+// -----------------------------------------------------------------------------
+// EVERY WAIT IS BOUNDED
+// -----------------------------------------------------------------------------
+//
+// Both enable polls have an iteration budget and a DISTINCT timeout
+// code (`LPSS_I2C_INIT_DISABLE_TIMEOUT` / `_ENABLE_TIMEOUT`). Not one
+// shared code: "the controller would not turn off" and "the controller
+// would not turn on" have different causes and different fixes, and a
+// single TIMEOUT would make the log say only that something took too
+// long.
+//
+// The budget is an iteration count and not a wall-clock deadline. Two
+// reasons, both load-bearing. It is exactly reproducible, so the
+// witness can drive a timeout on purpose and assert the code. And it
+// does not depend on TSC calibration, which at the point in boot where
+// controllers come up may not have run — a deadline computed from an
+// uncalibrated TSC is either instantaneous or infinite, and both are
+// worse than a count.
+//
+//   Reserved-label discipline: labels prefixed `dwi_`.
+
+module DwInit = structure {
+
+  // ==========================================================================
+  // Wait budgets
+  // ==========================================================================
+  //
+  // 1000 iterations of a seam read. The databook asks for a poll of
+  // 25 ic_clk periods' worth; at any supported ic_clk one seam read is
+  // far longer than one period, so 1000 is generous by orders of
+  // magnitude and still bounded. Generosity is correct here: this
+  // budget exists to catch a controller that never transitions, not to
+  // enforce latency.
+
+  pub let DW_ENABLE_POLL_MAX : u64 = 1000
+
+  // SDA output hold. The I²C specification requires a transmitter to
+  // hold SDA for at least 300 ns after SCL falls so that a receiver
+  // with a slow input stage still samples the old bit. Expressed in
+  // ic_clk periods.
+  pub let DW_SDA_HOLD_NS : u64 = 300
+
+  // ==========================================================================
+  // dw_i2c_sda_hold(ic_clk_khz) -> counts
+  // ==========================================================================
+
+  pub let dw_i2c_sda_hold : (u64) -> u64 !{} @{} =
+    fn (ic_clk_khz: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R30.M5-003 (#1072): SDA output hold in ic_clk periods for a 300 ns hold -- (ic_clk_khz * 300 + 500000) / 1000000, floored at 1. The floor matters: IC_SDA_HOLD of zero means the core releases SDA on the same edge that drops SCL, and a receiver with any input delay at all then samples the NEXT bit. That failure is data corruption without an error, on some devices and not others, which is the worst debugging shape there is. 300 ns is the specification's t_HD;DAT transmitter requirement rather than a tuned value; a board that needs more supplies it through the firmware-timing path named in dw_regs.pdx. Pure leaf; imul/div as in the count functions. Labels prefixed dwi_sh_.",
+      block: {
+        mov rax, rdi;
+        mov r10, 300;
+        imul rax, r10;
+        mov r10, 500000;
+        add rax, r10;
+        xor rdx, rdx;
+        mov r10, 1000000;
+        div r10;
+        cmp rax, 1;
+        jae dwi_sh_out;
+        mov rax, 1;
+      dwi_sh_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // dw_i2c_select(idx) -> rc
+  // ==========================================================================
+
+  pub let dw_i2c_select : (u64) -> u64 !{mem} @{cap} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R30.M5-003 (#1072): bind the register seam to this controller's window capability. Refuses LPSS_I2C_WIN_UNBOUND when the row has no window, which is the state a candidate is in before lpss_i2c_bind_window has run -- so an attempt to identify or transfer before the BAR was turned into a capability is a named refusal rather than a read through a stale binding left by another controller. That last case is the reason selection re-binds unconditionally instead of checking whether the right window is already bound: 'already bound' is cheap to believe and expensive to be wrong about, and being wrong means writing controller A's configuration into controller B. Three pushes (rbx, r12, r13) leave rsp%16 == 0 at both nested calls. Labels prefixed dwi_sel_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        call lpss_i2c_ctrl_window;
+        cmp rax, 0;
+        je  dwi_sel_unbound;
+        mov r13, rax;
+
+        mov rdi, r13;
+        call dw_io_bind;
+        cmp rax, 0;
+        jne dwi_sel_io;
+
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      dwi_sel_io:
+        mov rax, 0xFFFFFF50;             // LPSS_I2C_IO_FAULT
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      dwi_sel_unbound:
+        mov rax, 0xFFFFFF59;             // LPSS_I2C_WIN_UNBOUND
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dw_i2c_poke(off, val) -> 0 | LPSS_I2C_IO_FAULT
+  // ==========================================================================
+
+  pub let dw_i2c_poke : (u64, u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (off: u64, val: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R30.M5-003 (#1072): a register write with the seam's refusal collapsed to one bring-up-level code. The collapse is deliberate and its cost is understood: the seam's own code (NO_WRITE, DEAD_ROW, RANGE, UNBOUND) is the one that names the cause, and it is lost here. It is not lost from the SYSTEM -- the caller's failure path reports which STEP of bring-up failed, and the pair (step, IO_FAULT) is what an operator needs; carrying seven seam codes through every bring-up step would give each step seven exits and no more information. One push (rbx) leaves rsp%16 == 0 at the nested call. Labels prefixed dwi_pk_.",
+      block: {
+        push rbx;
+        call dw_io_write32;
+        cmp rax, 0;
+        jne dwi_pk_fault;
+        xor rax, rax;
+        pop rbx;
+        ret;
+      dwi_pk_fault:
+        mov rax, 0xFFFFFF50;             // LPSS_I2C_IO_FAULT
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dw_i2c_wait_enable(want) -> 0 | distinct timeout | IO fault
+  // ==========================================================================
+
+  pub let dw_i2c_wait_enable : (u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (want: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R30.M5-003 (#1072): poll IC_ENABLE_STATUS.IC_EN until it equals `want`, at most DW_ENABLE_POLL_MAX times. THE POLL IS ON IC_ENABLE_STATUS (0x9C) AND NOT ON IC_ENABLE (0x6C): the request register reads back what was written immediately, so polling it would be polling our own store and would report success while the core was still transitioning -- a check that always passes, which is worse than no check because it looks like one. The timeout code is chosen by direction (want == 0 -> DISABLE_TIMEOUT, want == 1 -> ENABLE_TIMEOUT) so 'it would not turn off' and 'it would not turn on' are distinguishable in a log; they have different causes (a held bus versus a dead clock) and a shared code would say only that something took too long. A seam refusal mid-poll ends the loop immediately with IO_FAULT rather than spinning out the budget against a window we are not allowed to read. Three pushes leave rsp%16 == 0 at the nested call. Labels prefixed dwi_we_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;                    // want
+        and r12, 1;
+        xor r13, r13;                    // iterations
+
+      dwi_we_next:
+        cmp r13, 1000;                   // DW_ENABLE_POLL_MAX
+        jae dwi_we_timeout;
+
+        mov rdi, 0x9C;                   // IC_ENABLE_STATUS
+        call dw_io_read32;
+        mov rbx, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, rbx;
+        je  dwi_we_io;
+
+        and rax, 1;
+        cmp rax, r12;
+        je  dwi_we_ok;
+
+        add r13, 1;
+        jmp dwi_we_next;
+
+      dwi_we_ok:
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      dwi_we_timeout:
+        cmp r12, 0;
+        je  dwi_we_dis;
+        mov rax, 0xFFFFFF54;             // LPSS_I2C_INIT_ENABLE_TIMEOUT
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      dwi_we_dis:
+        mov rax, 0xFFFFFF55;             // LPSS_I2C_INIT_DISABLE_TIMEOUT
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      dwi_we_io:
+        mov rax, 0xFFFFFF50;             // LPSS_I2C_IO_FAULT
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dw_i2c_identify(idx) -> rc
+  // ==========================================================================
+
+  pub let dw_i2c_identify : (u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (idx: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R30.M5-003 (#1072): stage-2 identification. Requires the row to be in LPSS_I2C_STATE_WINDOWED -- a candidate with no window cannot be identified, and an already-identified one is refused LPSS_I2C_IDENTIFY_ALREADY rather than re-run, because re-releasing the reset of a controller that is mid-transfer would abort it silently. Selects the window; if the row records an Intel wrapper, writes LPSS_RESETS_RELEASE (0x7) to LPSS_PRIV_RESETS (BAR0 + 0x204) FIRST -- until the function reset is released every DesignWare register reads back zero, so a confirmation read placed before it would reject every Intel controller on the machine. Then reads IC_COMP_TYPE (0xFC) and compares against 0x44570140, the constant every DW_apb_i2c instance carries regardless of vendor, wrapper or synthesis parameters. That comparison is the whole identification strategy: it is an answer from the part rather than from a device-id table someone maintained, so it is right on silicon nobody in this repository has seen. A mismatch goes to lpss_i2c_reject, which logs the BDF at LEVEL_ERROR -- loud, because a class-matched device that is not the expected core is the single most informative thing this driver can say about an unfamiliar machine. Four pushes plus one dummy would misalign; five pushes (rbx, r12-r15) leave rsp%16 == 0 at every nested call. Labels prefixed dwi_id_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                    // idx
+
+        mov rdi, r12;
+        call lpss_i2c_ctrl_state;
+        cmp rax, 2;                      // LPSS_I2C_STATE_WINDOWED
+        je  dwi_id_go;
+        cmp rax, 3;
+        jae dwi_id_already;
+        mov rax, 0xFFFFFF59;             // LPSS_I2C_WIN_UNBOUND
+        jmp dwi_id_out;
+
+      dwi_id_go:
+        mov rdi, r12;
+        call dw_i2c_select;
+        cmp rax, 0;
+        jne dwi_id_out;
+
+        mov rdi, r12;
+        call lpss_i2c_ctrl_intel;
+        cmp rax, 0;
+        je  dwi_id_read;
+
+        mov rdi, 0x204;                  // LPSS_PRIV_RESETS
+        mov rsi, 0x7;                    // LPSS_RESETS_RELEASE
+        call dw_i2c_poke;
+        cmp rax, 0;
+        jne dwi_id_out;
+
+      dwi_id_read:
+        mov rdi, 0xFC;                   // IC_COMP_TYPE
+        call dw_io_read32;
+        mov r14, rax;
+        mov r15, 0xFFFFFFFFFFFFFFFF;
+        cmp r14, r15;
+        je  dwi_id_io;
+
+        mov r15, 0x44570140;             // DW_COMP_TYPE_MAGIC
+        cmp r14, r15;
+        jne dwi_id_reject;
+
+        mov rdi, r12;
+        mov rsi, 3;                      // LPSS_I2C_STATE_IDENTIFIED
+        call lpss_i2c_set_state;
+        jmp dwi_id_out;
+
+      dwi_id_reject:
+        mov rdi, r12;
+        call lpss_i2c_reject;
+        mov rax, 0xFFFFFF5C;             // LPSS_I2C_PROBE_NOT_DESIGNWARE
+        jmp dwi_id_out;
+
+      dwi_id_io:
+        mov rax, 0xFFFFFF50;             // LPSS_I2C_IO_FAULT
+        jmp dwi_id_out;
+
+      dwi_id_already:
+        mov rax, 0xFFFFFF49;             // LPSS_I2C_IDENTIFY_ALREADY
+
+      dwi_id_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dw_i2c_bringup(idx, ic_clk_hz, speed_hz, ten_bit) -> rc
+  // ==========================================================================
+
+  pub let dw_i2c_bringup : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (idx: u64, ic_clk_hz: u64, speed_hz: u64, ten_bit: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R30.M5-003 (#1072): bring a DesignWare controller to a usable state at a validated rate. Refusals come FIRST and touch no register: state must be IDENTIFIED or READY (else NOT_IDENTIFIED); ic_clk_hz must be one of the three shipped LPSS frequencies (else INIT_CLK_UNKNOWN -- it is NEVER defaulted, because a wrong divider does not error, it mis-clocks); 3.4 MHz is refused INIT_SPEED_UNSUPPORTED for two independent reasons, that High-speed mode needs a master-code preamble and arbitration sequence this milestone does not implement, and that its computed hcnt at every supported ic_clk is below the core's minimum; the computed counts must pass dw_i2c_counts_valid (else INIT_DIVIDER_RANGE) -- a refusal rather than a clamp, since a clamped count is a controller reporting success at a rate nobody asked for. Only then does the register sequence run, in the order the file header fixes: IC_ENABLE<-0, POLL IC_ENABLE_STATUS to 0, IC_INTR_MASK<-0, read IC_CLR_INTR, IC_CON, the count pair for the selected bank, IC_SDA_HOLD, IC_TX_TL/IC_RX_TL/IC_DMA_CR, IC_ENABLE<-1, POLL to 1. The two polls are on IC_ENABLE_STATUS because the core's enable is asynchronous, and both are bounded with distinct codes. Only the bank the rate uses is programmed; the rate lives in the bus capability, so a rate change is a different capability and a re-run, not a register poke. IC_TAR is deliberately absent -- the target address belongs to a slave capability and is written per transfer. Five-push prologue (rbx, r12-r15) = 40 B; entry rsp%16 == 8 -> 48; sub rsp, 32 -> 80, %16 == 0 at every nested call. Scratch: [rsp+0] hcnt, [rsp+8] lcnt, [rsp+16] con, [rsp+24] clk_khz. Labels prefixed dwi_bu_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 32;
+
+        mov r12, rdi;                    // idx
+        mov r13, rsi;                    // ic_clk_hz
+        mov r14, rdx;                    // speed_hz
+        mov r15, rcx;                    // ten_bit
+
+        // ---- refusals, before any register is touched ----
+        mov rdi, r12;
+        call lpss_i2c_ctrl_state;
+        cmp rax, 3;                      // IDENTIFIED
+        je  dwi_bu_state_ok;
+        cmp rax, 4;                      // READY (re-bring-up)
+        je  dwi_bu_state_ok;
+        mov rax, 0xFFFFFF53;             // LPSS_I2C_INIT_NOT_IDENTIFIED
+        jmp dwi_bu_out;
+
+      dwi_bu_state_ok:
+        mov rdi, r13;
+        call dw_i2c_clk_valid;
+        cmp rax, 1;
+        je  dwi_bu_clk_ok;
+        mov rax, 0xFFFFFF58;             // LPSS_I2C_INIT_CLK_UNKNOWN
+        jmp dwi_bu_out;
+
+      dwi_bu_clk_ok:
+        mov rax, 3400000;
+        cmp r14, rax;
+        jne dwi_bu_speed_ok;
+        mov rax, 0xFFFFFF57;             // LPSS_I2C_INIT_SPEED_UNSUPPORTED
+        jmp dwi_bu_out;
+
+      dwi_bu_speed_ok:
+        // clk_khz = ic_clk_hz / 1000
+        mov rax, r13;
+        xor rdx, rdx;
+        mov r10, 1000;
+        div r10;
+        mov [rsp + 24], rax;
+
+        mov rdi, r14;
+        call dw_i2c_t_high;
+        mov rbx, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, rbx;
+        je  dwi_bu_bad_speed;
+        mov rdi, [rsp + 24];
+        mov rsi, rax;
+        xor rdx, rdx;                    // t_fall = I2C_T_FALL_DEFAULT
+        call dw_i2c_scl_hcnt;
+        mov [rsp + 0], rax;
+
+        mov rdi, r14;
+        call dw_i2c_t_low;
+        mov rbx, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, rbx;
+        je  dwi_bu_bad_speed;
+        mov rdi, [rsp + 24];
+        mov rsi, rax;
+        xor rdx, rdx;
+        call dw_i2c_scl_lcnt;
+        mov [rsp + 8], rax;
+
+        mov rdi, [rsp + 0];
+        mov rsi, [rsp + 8];
+        call dw_i2c_counts_valid;
+        cmp rax, 1;
+        je  dwi_bu_counts_ok;
+        mov rax, 0xFFFFFF56;             // LPSS_I2C_INIT_DIVIDER_RANGE
+        jmp dwi_bu_out;
+
+      dwi_bu_counts_ok:
+        mov rdi, r14;
+        mov rsi, r15;
+        call dw_i2c_con_for_speed;
+        mov rbx, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, rbx;
+        je  dwi_bu_bad_speed;
+        mov [rsp + 16], rax;
+
+        mov rdi, r12;
+        call dw_i2c_select;
+        cmp rax, 0;
+        jne dwi_bu_out;
+
+        // ---- 1. disable ----
+        mov rdi, 0x6C;                   // IC_ENABLE
+        xor rsi, rsi;
+        call dw_i2c_poke;
+        cmp rax, 0;
+        jne dwi_bu_out;
+
+        // ---- 2. poll disabled ----
+        xor rdi, rdi;
+        call dw_i2c_wait_enable;
+        cmp rax, 0;
+        jne dwi_bu_out;
+
+        // ---- 3. mask interrupts; we are polled ----
+        mov rdi, 0x30;                   // IC_INTR_MASK
+        xor rsi, rsi;
+        call dw_i2c_poke;
+        cmp rax, 0;
+        jne dwi_bu_out;
+
+        // ---- 4. drop anything firmware latched ----
+        mov rdi, 0x40;                   // IC_CLR_INTR (read to clear)
+        call dw_io_read32;
+
+        // ---- 5. IC_CON ----
+        mov rdi, 0x00;                   // IC_CON
+        mov rsi, [rsp + 16];
+        call dw_i2c_poke;
+        cmp rax, 0;
+        jne dwi_bu_out;
+
+        // ---- 6. the count pair, into the bank this rate uses ----
+        mov rax, 100000;
+        cmp r14, rax;
+        je  dwi_bu_ss;
+
+        mov rdi, 0x1C;                   // IC_FS_SCL_HCNT
+        mov rsi, [rsp + 0];
+        call dw_i2c_poke;
+        cmp rax, 0;
+        jne dwi_bu_out;
+        mov rdi, 0x20;                   // IC_FS_SCL_LCNT
+        mov rsi, [rsp + 8];
+        call dw_i2c_poke;
+        cmp rax, 0;
+        jne dwi_bu_out;
+        jmp dwi_bu_hold;
+
+      dwi_bu_ss:
+        mov rdi, 0x14;                   // IC_SS_SCL_HCNT
+        mov rsi, [rsp + 0];
+        call dw_i2c_poke;
+        cmp rax, 0;
+        jne dwi_bu_out;
+        mov rdi, 0x18;                   // IC_SS_SCL_LCNT
+        mov rsi, [rsp + 8];
+        call dw_i2c_poke;
+        cmp rax, 0;
+        jne dwi_bu_out;
+
+        // ---- 7. SDA hold ----
+      dwi_bu_hold:
+        mov rdi, [rsp + 24];
+        call dw_i2c_sda_hold;
+        mov rsi, rax;
+        mov rdi, 0x7C;                   // IC_SDA_HOLD
+        call dw_i2c_poke;
+        cmp rax, 0;
+        jne dwi_bu_out;
+
+        // ---- 8. FIFO thresholds ----
+        mov rdi, 0x3C;                   // IC_TX_TL
+        xor rsi, rsi;
+        call dw_i2c_poke;
+        cmp rax, 0;
+        jne dwi_bu_out;
+        mov rdi, 0x38;                   // IC_RX_TL
+        xor rsi, rsi;
+        call dw_i2c_poke;
+        cmp rax, 0;
+        jne dwi_bu_out;
+
+        // ---- 9. no DMA ----
+        mov rdi, 0x88;                   // IC_DMA_CR
+        xor rsi, rsi;
+        call dw_i2c_poke;
+        cmp rax, 0;
+        jne dwi_bu_out;
+
+        // ---- 10. enable ----
+        mov rdi, 0x6C;                   // IC_ENABLE
+        mov rsi, 1;
+        call dw_i2c_poke;
+        cmp rax, 0;
+        jne dwi_bu_out;
+
+        // ---- 11. poll enabled ----
+        mov rdi, 1;
+        call dw_i2c_wait_enable;
+        cmp rax, 0;
+        jne dwi_bu_out;
+
+        // ---- record what we assumed and what we reached ----
+        mov rdi, r12;
+        mov rsi, r13;
+        call lpss_i2c_set_clk;
+        mov rdi, r12;
+        mov rsi, 4;                      // LPSS_I2C_STATE_READY
+        call lpss_i2c_set_state;
+        xor rax, rax;
+        jmp dwi_bu_out;
+
+      dwi_bu_bad_speed:
+        mov rax, 0xFFFFFF57;             // LPSS_I2C_INIT_SPEED_UNSUPPORTED
+
+      dwi_bu_out:
+        add rsp, 32;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
