@@ -454,7 +454,7 @@ worse than no value.
 | Explicit `Mutex` / `Acquire` / `Release` / `Event` / `Signal` / `Wait`, and the release-order check §19 defers with them | R30.M3 |
 | A second AML execution context, and with it the only fixture that can reach `MUTEX_CONTENTION` (54) | R30.M3 |
 | Predefined-method argument signatures (`_OSI` wanting String, …) — a **row** in `aml_conv_tab`, not a code path | when a predefined-method table exists |
-| The supervisor-side drain of the notification ring and the `KIND_ACPI_EVENT` mint | R30.M4 |
+| The supervisor-side drain of the notification ring and the `KIND_ACPI_EVENT` mint | **landed R30.M4-003/004 (#1068/#1069)** — kind at `0x151` over `KIND_HW_INTERRUPT`, forwarded through `acpi_evt_notify` |
 | OpRegion access — the point of the whole round | #1061+ |
 | `DebugOp` and `TimerOp` in value position | when there is somewhere to send them |
 | Node-level error localisation (which arena node faulted) | a store per node in the fuel loop; deferred deliberately |
@@ -1346,12 +1346,25 @@ consequences, both wanted:
 
 ### What the supervisor sees
 
-The capability is **not** minted here. Delivery to a consumer is an IPC
-hop the supervisor makes *after* draining, and it is R30.M4's. The wire
-format is pinned now — `design/architecture/next-wave-derived-kinds.md`,
-`KIND_ACPI_EVENT = 0x21` over `KIND_NOTIFICATION` — because a kind whose
-record shape is decided in one round and written down in another is a kind
-whose two halves disagree.
+The capability is **not** minted here. Delivery to a consumer is a hop
+the supervisor makes *after* draining, and it was R30.M4's. The wire
+format was pinned at this point — because a kind whose record shape is
+decided in one round and written down in another is a kind whose two
+halves disagree — and it survived the implementation, one level down.
+
+**As landed (R30.M4-003, #1068).** `KIND_ACPI_EVENT = 0x151` over
+**`KIND_HW_INTERRUPT`**, not `0x21` over `KIND_NOTIFICATION`. The
+evaluator's `Notify` is only *one* of the stream's two sources; the other
+is a hardware GPE arriving through the SCI, which is masked until the
+subscriber acknowledges, and the acknowledgement is a write to the GPE
+enable register. The record shape pinned here became the stream record
+in `src/kernel/core/acpi/evt_stream.pdx` — widened to 64 B by a `source`
+discriminator and a redundant `NEEDS_ACK` flag, so a subscriber can tell
+a firmware notification (informational) from a GPE (owed an
+acknowledgement) without inspecting the payload. `sequence` survives as
+`seq`; the localisability argument is unchanged. Reconciliation table in
+`design/architecture/next-wave-derived-kinds.md`; design record in
+`design/kernel/r30-m4-sci-gpe-path.md` §§11–12.
 
 ---
 

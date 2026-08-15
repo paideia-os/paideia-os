@@ -326,10 +326,28 @@ affected bus; without the sequence it would have to re-enumerate
 everything on any non-zero drop count, which is the difference between a
 recoverable drop and a useless one.
 
-Full derived-kind row — base kind, rights bitmask, why no `INVOKE` right
-— in `design/architecture/next-wave-derived-kinds.md`,
-`KIND_ACPI_EVENT = 0x21`. The capability mint and the drain loop are
-R30.M4's; only the producer and the record shape are fixed today.
+Full derived-kind row — base kind, rights bitmask, ops — in
+`design/architecture/next-wave-derived-kinds.md`,
+`KIND_ACPI_EVENT = 0x151`.
+
+**Superseded numbering.** This section originally cited
+`KIND_ACPI_EVENT = 0x21` over `KIND_NOTIFICATION`. R30.M4-003 (#1068)
+landed the kind at **`0x151` over `KIND_HW_INTERRUPT`**, with rights
+widened from `0x408` to `R_ACPI_EVT_ALL = 0x618`. The forcing fact is
+that the stream carries **two sources** rather than the one this schema
+was written from: the firmware `Notify` described here, and a hardware
+GPE arriving through the SCI which stays *masked until acknowledged* —
+and acknowledging writes the GPE enable register, which
+`KIND_NOTIFICATION` cannot gate. The no-forged-`Notify` argument that
+motivated withholding `INVOKE` is preserved: there is no inject op on the
+kind and no op that writes a record into the stream. Reconciliation
+table in the derived-kinds row; full design record in
+`design/kernel/r30-m4-sci-gpe-path.md` §11.
+
+The record shape pinned here survives as the kernel-side stream
+**record** (`src/kernel/core/acpi/evt_stream.pdx`), widened to 64 B by
+the source discriminator; the mint and the drain loop landed with
+#1068/#1069.
 
 ---
 

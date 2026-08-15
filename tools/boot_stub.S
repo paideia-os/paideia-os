@@ -2166,3 +2166,27 @@ gpe_dispatch_ok_msg: .ascii "R30 GPE DISPATCH OK\n\0"
 .global gpe_dispatch_fail_msg
 .section .rodata
 gpe_dispatch_fail_msg: .ascii "R30 GPE DISPATCH FAIL\n\0"
+
+# ---------------------------------------------------------------------------
+# R30.M4-003 (#1068) / R30.M4-004 (#1069): ACPI event stream + routing
+# witness markers.
+#
+# Emitted by tests/kernel/acpi/evt_route_synth.pdx §evt_route_witness,
+# which drives the KIND_ACPI_EVENT derivation gate, the subscriber
+# stream, the routing pump and the full GPE round trip -- assert, mask,
+# queue, route, drain, acknowledge, RE-ENABLE -- against the same
+# synthetic GPE register window gpe_synth.pdx installs. It writes no
+# IOAPIC register: both arming calls resolve to GSI 0, which
+# core/acpi/sci_route.pdx refuses before any MMIO.
+#
+# See also:
+#   - src/kernel/core/cap/kind_acpi_event.pdx (derived kind + mint gate)
+#   - src/kernel/core/acpi/evt_stream.pdx     (bounded stream + routing)
+#   - src/kernel/core/acpi/sci_arm.pdx        (readiness-gated unmask)
+.global evt_route_ok_msg
+.section .rodata
+evt_route_ok_msg: .ascii "R30 ACPI EVENT ROUTE OK\n\0"
+
+.global evt_route_fail_msg
+.section .rodata
+evt_route_fail_msg: .ascii "R30 ACPI EVENT ROUTE FAIL\n\0"

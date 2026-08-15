@@ -700,80 +700,200 @@ cascade) drives.
 
 ---
 
-### `KIND_ACPI_EVENT = 0x21` — planned for R30.M4; producer contract fixed by R30.M2-006 (#1059)
+### `KIND_ACPI_EVENT = 0x151` — landed by R30.M4-003 (#1068) / R30.M4-004 (#1069)
 
-**Status.** **Not yet minted.** The *producer* side landed with #1059; the
-capability lands when the channel is wired. This row exists now, ahead of
-the mint, because #1059 fixed the record shape and the delivery semantics,
-and a kind whose wire format is decided in one round and written down in
-another is a kind whose two halves disagree.
+**Status.** **Landed.** `src/kernel/core/cap/kind_acpi_event.pdx`, with the
+stream it binds to in `src/kernel/core/acpi/evt_stream.pdx` and the
+readiness-gated SCI unmask in `src/kernel/core/acpi/sci_arm.pdx`. Full
+design record: `design/kernel/r30-m4-sci-gpe-path.md` §§11–15.
 
-**Why it is not landed with the evaluator.** The AML evaluator runs
-entirely in userspace (`design/acpi/no-aml-in-kernel.md`), and `Notify`
-delivery inside it is a **bounded ring in `aml_ctl.pdx`**, not an IPC send.
-That is deliberate and it is the whole design of #1059: a `Notify` in a
-`While` loop is firmware-controlled, so an evaluator that sent
-synchronously would let a table stall the supervisor. The evaluator
-therefore enqueues and returns; the supervisor drains the ring and *then*
-sends. So the capability is on the **supervisor-to-consumer** hop, not on
-the evaluator-to-supervisor one, and it is R30.M4's to mint.
+#### Reconciliation with the R30.M2 planning row (resolved at #1068)
 
-**Base kind:** `KIND_NOTIFICATION = 12`. Not `KIND_IPC_ENDPOINT` (5): an
-ACPI event is a one-way signal a consumer subscribes to, with no reply
-channel and no request, which is exactly what slot 12 is for. Deriving it
-from the endpoint kind would hand every subscriber a send right it has no
-use for.
+This row existed from #1059 as a planning skeleton with a fixed wire
+format, specified as `0x21` over `KIND_NOTIFICATION = 12` with rights
+`0x408`. Three of those decisions changed at implementation, for one
+underlying reason, and the change is recorded here rather than silently
+applied — the same treatment `KIND_DMA_DOMAIN` got at #1036.
 
-**Derived-kind tag:** `0x21`, immediately after `KIND_ACPI = 0x20`, so the
-two ACPI kinds sit adjacent in the tag space and a dump groups them.
+**The underlying reason: the stream carries TWO sources, not one.** The
+planning row was written from the evaluator's side, where the only event
+is a firmware `Notify(Object, Value)` landing in the bounded userspace
+ring. R30.M4 built the other half and found the second source: a
+**General Purpose Event**, asserted by hardware, delivered through the
+SCI, masked and queued by the kernel ISR. Those two mean different
+things and impose different obligations — the GPE is *masked until the
+subscriber acknowledges*, and the acknowledgement is a **write to the GPE
+enable register**. A capability spec derived from only one of the two
+sources could not gate the other.
 
-**Tail encoding** — row indirection via `_acpi_event_table`, mirroring the
-`KIND_HW_INTERRUPT` pattern. Each row is 32 B and is a **transcription of
-the ring entry `aml_ctl.pdx` already produces**, which is what keeps the
-two halves from drifting:
+| Decision | Planned (#1059) | Landed (#1068) | Why |
+|---|---|---|---|
+| Tag | `0x21` | `0x151` | `0x21` was chosen for adjacency to `KIND_ACPI = 0x20`. But every derived kind since R29 sits in a per-round block — `0x14x` for R29, `0x15x` opened by `KIND_OP_REGION = 0x150` for R30 — and that block is what a tag dump now groups by. `0x151` keeps R30 contiguous and keeps the low tag space clear for base-slot growth. |
+| Base kind | `KIND_NOTIFICATION = 12` | `KIND_HW_INTERRUPT = 0x140` | The endpoint's holder may **acknowledge** a GPE, which re-enables a hardware source. `KIND_NOTIFICATION` cannot gate hardware authority. Deriving over the SCI's own interrupt capability makes the whole of the endpoint's reach strictly downstream of the interrupt whose delivery produces the events — a holder cannot manufacture event reach, or acknowledgement authority, without holding the line it comes from. The planning row's argument *against* `KIND_IPC_ENDPOINT` (5) stands untouched: this is still a one-way subscription with no reply channel. |
+| Rights | `R_ACPI_EVENT_ALL = 0x408` | `R_ACPI_EVT_ALL = 0x618` | The planning row's reasoning — *a subscriber must not be able to inject a forged `Notify`, because a forged eject request is an eject the platform never issued* — is **correct and preserved**: there is no inject op on this kind and no op that writes a record into the stream. What it did not anticipate is that acknowledging is not injecting. It is a subscriber telling the kernel it has finished with an event *the kernel itself queued*, and `gpe_ack` refuses any index that is not actually pending. That needs `INVOKE`. `MINT` is admitted as subset-legal for a future per-device sub-endpoint; it grants nothing today because the mint path is kernel-side and is not an op on any capability. (The planning row also transposed two bit values: in this tree `INVOKE = 0x008`, `REVOKE = 0x010`, `MINT = 0x200`, `OBSERVE = 0x400`, so `0x408` was `OBSERVE|INVOKE`, not `OBSERVE|REVOKE`.) |
+
+**The 32-byte wire format from #1059 was not discarded — it moved one
+level down.** It described an *event*, and the capability describes a
+*subscription*; keeping it as the capability's tail would have meant one
+capability row per event. It is now the stream **record** layout in
+`evt_stream.pdx` (§12.2 of the milestone doc), widened to 64 B to carry
+the source discriminator the second source made necessary. `sequence`
+survives as the record's `seq`, `drops_total` as the stream's `drops`
+counter, and the localisability argument — *two records whose sequences
+differ by more than one bracket the loss, so a subscriber re-enumerates
+one bus instead of all of them* — is preserved verbatim and asserted by
+the boot witness at stage 53.
+
+#### Derivation gate
+
+`acpi_evt_check_parent_hw_int(parent_slot)`:
+`cap_table[parent_slot].kind == 0x140` **and** `rights & RIGHT_MINT`
+(`0x200`). Both, not either — the kind says the holder may service the
+line, `MINT` says it may hand that authority onward. Same shape as
+`msix_check_parent_hw_int` (#1022) and `opregion_check_parent_base`
+(#1061).
+
+**The GSI is inherited, never accepted.** `acpi_evt_cap_mint` takes no
+GSI argument; it reads the parent's `row_id` from `target_ptr[15:0]` and
+asks `hw_int_tail_decode_gsi`. Same discipline `opregion_cap_derive`
+applies to the address space: a field identifying *what the parent is*
+must come from the parent, or the child's claim decouples from the
+authority that was checked.
+
+#### Tail encoding — row indirection via `_acpi_event_table`
+
+8 rows × 32 B. Eight, not 32 or 256: an endpoint is a per-**process**
+subscription, and per-GPE fan-out is carried by the `subscriber_id` the
+GPE dispatch table already stores per event source, stamped on every
+record. Sizing for processes rather than event sources is the whole
+reason eight is enough.
 
 ```
-+0   sequence:u64        monotonic offer number, gaps == dropped events
-+8   target_path:u32     interned absolute namespace path of the object
-+12  object_type:u8      6 Device / 12 Processor / 13 ThermalZone (§19.6.101)
-+13  notify_value:u8     the ACPI notification value (0x00..0xFF)
-+14  flags:u16           bit 0 = a drop occurred immediately before this
-+16  drops_total:u64     the producer's cumulative drop count at enqueue
-+24  reserved:u64
++0  [7:0]    reserved       must be zero
++0  [15:8]   parent_slot    cap_table slot of the parent KIND_HW_INTERRUPT
++0  [47:16]  gsi            u32, INHERITED from the parent row at mint
++0  [55:48]  reserved       must be zero
++0  [63:56]  in_use         allocator flag (.bss zero-init => free at boot)
++8           subscriber_id  opaque, non-zero
++16          delivered      records accepted for this endpoint, lifetime
++24          acked          successful acknowledgements, lifetime
 ```
 
-`sequence` and `drops_total` are the two fields that would not exist in a
-naive design and are the reason the wire format is worth pinning here.
-Delivery is **lossy by construction** — the producer's ring is 32 deep and
-tail-drops — so a subscriber needs to know not merely *that* it missed
-something but *where*: two consecutive records whose sequences differ by
-more than one bracket the loss, and a subscriber can re-enumerate the
-affected bus rather than re-enumerating everything.
+`delivered - acked` is the milestone's most useful single number: platform
+events this endpoint was told about and never finished. It is the only
+observable that catches a GPE which is masked, dispatched, handled and
+never re-enabled — a device that works exactly once and reports no error
+anywhere.
 
-**Rights bitmask:** `R_ACPI_EVENT_ALL = 0x408` — `OBSERVE` (0x8) and
-`REVOKE` (0x400). Deliberately **no `INVOKE` and no `MINT`.** A subscriber
-may read the stream and may drop its own subscription; it may not
-*inject* an event, because a forged `Notify(\_SB.PCI0, 0x03)` is an eject
-request the platform never issued, and it may not re-mint, because the
-subscriber set is the supervisor's to control.
+`tools/build.sh` asserts via `objdump -r` that `_acpi_event_table` is
+relocated against from `kind_acpi_event.o` alone (with a vacuity guard
+requiring the owner to reference it), which is what makes "the derivation
+gate is the only path to a row" a property of the kernel rather than of
+one file. The same assertion covers `_acpi_evt_ring` and
+`_acpi_evt_state` in `evt_stream.o`.
 
-**Producer-side contract, as landed (#1059).** `src/user/aml/aml_ctl.pdx`,
-and `design/acpi/aml-evaluator.md` §18 for the reasoning:
+#### Rights
 
-- ring depth **32**, entries 32 B, `.bss`, never grown;
-- **tail-drop** — a full ring refuses the *newest* and keeps the oldest,
-  so bounded loss never becomes reordering;
-- a drop is **not an error**: `aml_notify_enqueue` returns 0, latches
-  nothing, and the evaluation continues;
-- one step of interpreter **fuel** on both the accepted and the dropped
-  path;
-- observability is `aml_notify_{offered,drained,depth,drops}` plus the
-  per-entry sequence, with the invariant
-  `offered == drained + depth + drops` asserted by the corpus.
+`R_ACPI_EVT_ALL = 0x618` — `INVOKE` (0x008) | `REVOKE` (0x010) |
+`MINT` (0x200) | `OBSERVE` (0x400). Validated as a **subset**, not an
+equality, so a strictly weaker endpoint is expressible: an observe-only
+monitor can read its own metadata and cannot acknowledge anything.
 
-**Downstream consumers.** R30.M4 (supervisor drain loop + mint), R31
-(thermal zone `_TZ` handling), R32 (EC `_Qxx` query events), R33 (audio
-jack detection), R35 (Thunderbolt hotplug).
+#### Ops (`op_arg[7:0]`) and required right
+
+| Op | Code | Right | Returns |
+|---|---|---|---|
+| `OP_QUERY_GSI`        | 0 | OBSERVE | the inherited GSI |
+| `OP_QUERY_PARENT`     | 1 | OBSERVE | parent `cap_table` slot |
+| `OP_QUERY_SUBSCRIBER` | 2 | OBSERVE | opaque subscriber identity |
+| `OP_QUERY_DELIVERED`  | 3 | OBSERVE | lifetime deliveries |
+| `OP_QUERY_ACKED`      | 4 | OBSERVE | lifetime acknowledgements |
+| `OP_QUERY_DEPTH`      | 5 | INVOKE  | stream depth |
+| `OP_QUERY_DROPS`      | 6 | INVOKE  | stream ring drops |
+
+Per-op gating rather than one entry gate: ops 0–4 read the endpoint's own
+metadata, ops 5–6 read the **shared stream**, and a monitor holding only
+`OBSERVE` must not learn the platform's event rate from a capability that
+entitles it only to introspect itself.
+
+**No `DRAIN` and no `ACK` op**, though both are real operations on this
+capability. Draining copies a 64-byte record out, which a three-register
+invocation cannot express without taking a destination pointer — and a
+destination pointer across that boundary is exactly the aliasing the
+`_acpi_evt_ring` confinement assertion exists to prevent. Both go through
+`evt_stream.pdx` entries that the bound endpoint authorises.
+
+#### Failure taxonomy — `0xFFFFFF90..0xFFFFFF9F`
+
+Disjoint from every other band in tree (`chaos.pdx` `0xFFFFFFA0..AD`, GPE
+path `0xFFFFFFB5..BE`, `KIND_OP_REGION` `0xFFFFFFC5..CF`,
+`KIND_DMA_DOMAIN` `0xFFFFFFD5..DF`).
+
+| Code | Name | Raised when |
+|---|---|---|
+| `0xFFFFFF9F` | `ACPI_EVT_TAIL_ENOSPC` | no free row |
+| `0xFFFFFF9E` | `ACPI_EVT_TAIL_BAD_ARG` | reserved header bits set, or zero subscriber |
+| `0xFFFFFF9D` | `ACPI_EVT_MINT_BAD_PARENT` | **the derivation gate** — parent is not a live `KIND_HW_INTERRUPT`, or lacks `RIGHT_MINT` |
+| `0xFFFFFF9C` | `ACPI_EVT_MINT_BAD_RIGHTS` | rights not a subset of `R_ACPI_EVT_ALL` |
+| `0xFFFFFF9B` | `ACPI_EVT_MINT_BAD_ARG` | slot ≥ 256, or a malformed header |
+| `0xFFFFFF9A` | `ACPI_EVT_MINT_ENOSPC` | row table exhausted at mint |
+| `0xFFFFFF99` | `ACPI_EVT_MINT_BAD_SUBSCRIBER` | subscriber identity is zero |
+| `0xFFFFFF98` | `ACPI_EVT_REVOKE_BAD_SLOT` | slot ≥ 256 |
+| `0xFFFFFF97` | `ACPI_EVT_REVOKE_WRONG_KIND` | descriptor is not `KIND_ACPI_EVENT` |
+| `0xFFFFFF96` | `ACPI_EVT_REVOKE_ALREADY` | slot already null (idempotent) |
+| `0xFFFFFF95` | `ACPI_EVT_NOT_READY` | acknowledgement with no endpoint bound |
+| `0xFFFFFF94` | `ACPI_EVT_BIND_BAD_CAP` | bind target not a usable live endpoint with `INVOKE` |
+| `0xFFFFFF93` | `ACPI_EVT_BIND_ALREADY` | the stream already has a consumer |
+| `0xFFFFFF92` | `ACPI_EVT_NOT_BOUND` | unbind with nothing bound |
+| `0xFFFFFF91` | `SCI_ARM_NOT_READY` | **unmask attempted before routing was ready** |
+| `0xFFFFFF90` | `SCI_ARM_PROGRAM_FAILED` | the redirection entry could not be programmed |
+| `0xFFFFFFFFFFFFFFFF` | `ACPI_EVT_DECODE_BAD` | dead row / malformed encoder input |
+
+#### Revoke — no cascade, but it unbinds
+
+Nothing in this tree derives from `KIND_ACPI_EVENT`, so there is no
+cascade; an empty cascade call would be a hook that looks maintained and
+is not. `acpi_evt_cap_revoke_inner` does call `acpi_evt_unbind_slot(slot)`
+**before** freeing the row, so stream readiness falls in the same
+operation that frees the endpoint. Revocation therefore *pushes* rather
+than being polled, and `acpi_evt_ready()` can stay a latched read instead
+of a descriptor re-validation — which would have forced the `{cap}`
+capability up the entire SCI arming path.
+
+#### Producer-side contract, unchanged from #1059
+
+`src/user/aml/aml_ctl.pdx`, and `design/acpi/aml-evaluator.md` §18:
+ring depth **32**, 32 B entries, `.bss`, never grown; **tail-drop**; a
+drop is not an error; one step of interpreter fuel on both paths;
+observability `{offered, drained, depth, drops}` plus the per-entry
+sequence, invariant `offered == drained + depth + drops`.
+
+The kernel-side stream reuses that discipline exactly, with **one extra
+term** for the failure mode the userspace ring does not have — no
+subscriber to route to:
+
+```
+offered == drained + depth + drops + unrouted
+```
+
+`drops` (the ring was full: the subscriber is alive but behind) and
+`unrouted` (there was nobody to route to) are kept separate because they
+are different problems with different fixes, and one number would make a
+wedged subscriber and an absent one indistinguishable.
+
+#### Boot witness
+
+`tests/kernel/acpi/evt_route_synth.pdx` §`evt_route_witness`, sub-tests
+A..G, fingerprint **`R30 ACPI EVENT ROUTE OK`**. Writes no IOAPIC
+register: both arming calls resolve to GSI 0, which `sci_route_program`
+refuses before any MMIO, so the readiness gate is exercised in *both*
+directions without reprogramming the platform's interrupt controller
+during boot. Stage table in `design/kernel/r30-m4-sci-gpe-path.md` §15.
+
+#### Downstream consumers
+
+R31 (thermal zone handling), R32 (EC query events), R33 (audio jack
+detection), R35 (Thunderbolt hotplug).
 
 ---
 
@@ -1088,9 +1208,11 @@ rather than weaken the lint.
 | 2026-08-12 | R29.M2 | #1026 | Landed driver lifecycle FSM fuzz witness — 1000-iter Knuth LCG (A=0x5851F42D4C957F2D, C=0x14057B7EF767814F, seed=0x0BADBEEFC0FFEE01) over 3-bit (cur, new) slices from LCG state bits [42:40] / [50:48] (values in [0..8) so ~25% out-of-range). Per-iter asserts the transition-whitelist predicate (`driver_lifecycle_transition_valid`) agrees with the stateful primitive (`driver_lifecycle_transition`) on both direction (rc == 0 iff predicate == 1) and state-mutation (state == new on OK; state unchanged on any error). Witness at `kernel_main.pdx §driver_lifecycle_fuzz_witness` — fingerprint `R29 LIFECYCLE FUZZ OK`. Pure test artifact; no new kernel functionality. |
 | 2026-08-12 | R29.M2 | #1027 | Landed `driver_lifecycle_channel` schema constants. Request/reply RPC (userspace driver-lifecycle-supervisor → driver process) with six v1 commands — `DRV_LC_OP_START/INIT_DONE/SUSPEND/RESUME/HANDOFF_BEGIN/STOP = 0x01..0x06` — each mapping 1:1 onto an FSM edge from the R29.M2-001 whitelist. Ack rep is 8 bytes `{driver_slot:u16, rc:u32}` with error codes `DRV_LC_ACK_ERR_{BAD_SLOT, INVALID_TRANS, TIMEOUT, DEVICE_GONE, CAP_MISSING, INTERNAL}` that mirror `DRIVER_LIFECYCLE_ERR_*`. Reply-bit-7 convention shared with `ipc/frame.pdx`. Constants in `src/kernel/core/driver/lifecycle_schema.pdx`; wire spec at `design/ipc/driver-lifecycle-schema.md`. R29.M2-004 fuzz witness (#1026 same wave) exercises the kernel-side coupling directly; wire encoders and canonical example driver (`lpss_uart`) deferred to R30 (per doc §7 rationale). Closes R29.M2. |
 | 2026-08-14 | R29.M5 | #1036/#1037 | Landed `KIND_DMA_DOMAIN = 0x142` — **renamed from the `KIND_HW_DMA_DOMAIN` planning skeleton and re-based from `KIND_HW` (14) to `KIND_MEMORY` (= `KIND_PAGE`, 4)** per softarch §3 R29 and the issue text; rationale is that a DMA domain is a memory-access scope, so the mint gate must require memory authority, not device authority. Added the `KIND_MEMORY = 4` name binding in `kind.pdx` so document vocabulary and runtime enum stop drifting. Row-indirection tail via `_dma_domain_table` (32 rows × 32 B) encoding `{iommu_ctx_id:u32, bus_dev_fn:u16, capacity_bytes:u64, coherency:u8, parent_slot:u8}`. Canonical tail-word encoder `dma_tail_pack` + word-level and row-level decoders (#1037), plus canonical debug printer `dma_domain_debug_print` (five-line `DMA DOMAIN ROW` record) reachable via `OP_DEBUG_PRINT`. Rights bitmask `R_DMA_ALL = 0x618` (INVOKE/REVOKE/MINT/OBSERVE) with **per-op** gating rather than a single entry gate. Full mint / revoke / cascade-revoke API + dispatch handler in `src/kernel/core/cap/kind_dma_domain.pdx`; dispatch branch in `invoke.pdx`; chatter tag `cap_dma_dom_msg` in `tags.pdx`. Failure taxonomy `0xFFFFFFD5..0xFFFFFFDF`, disjoint from `HW_INT_*` and `MSIX_*`. Boot witness `kernel_main.pdx §kind_dma_domain_witness` (21 sub-tests) — fingerprint `R29 KIND_DMA_DOMAIN OK`. Opens R29.M5. |
-| 2026-08-15 | R29.M7 | #1044/#1047/#1048 | Landed cascade restart — supervisor tree, restart budget, ChannelDead. Supervisor tree is recorded in the driver descriptor's previously-reserved `[+40]` **supervision word** (`parent_slot:5 | parent_present:1 | perm_failed:1 | restart_count:8 | incarnation:8 | window_start_coarse:40`), with `driver_sup_set_parent` refusing any edge that would close a cycle so every subtree walk is total. Restart strategy is **one-for-one across siblings with a mandatory downward cascade**: kill set = subtree(D), restart set = {D}; descendants are stopped and unregistered rather than restarted, because their capabilities were minted against an incarnation that no longer exists and the restarted D re-enumerates them. Justified by R29's own capability partitioning — siblings share no writable object (one `KIND_DMA_DOMAIN` each per D1.b), so one-for-all buys nothing; and a child's authority is *derived* from its parent's, so the downward cascade is forced rather than chosen. `DRIVER_LIFECYCLE_TABLE` widened `0x00000020101A1C02` → `0x00000020101A1C12` to add the `Init -> Stopping` abandon edge (already the documented intent of the R29.M5-003 signature-failure path, previously unreachable) so `driver_restart_force_stop` is total over the state space. Re-arming is **not** an FSM edge: `Stopped` stays terminal, and `driver_table_rearm_incarnation` retires one incarnation and installs the next, gated on Stopped + no-live-DMA-domain + not-permanently-failed. Budget: 5 restarts per 32768 coarse ticks (TSC >> 20, ≈11 s at 3 GHz) carried in the supervision word; exceeding it latches `perm_failed`, leaving the node in the FSM's own terminal state — escalation is the *absence* of a re-arm, and its terminality is enforced at the store rather than by supervisor convention. ChannelDead: the endpoint row's reserved `[+40]` becomes a **driver binding word** (`driver_slot:5 | bound:1 | dead:1 | incarnation:8`); `driver_restart_reap_endpoints` latches `dead` before detaching each parked waiter and wakes it, and both `sys_ipc_recv_body` and `sys_ipc_send_body` gate on `endpoint_is_dead` returning `-ECONNRESET` (104). Stale capabilities cannot attach to a restarted instance: `endpoint_bind_driver` refuses a dead row (`EP_BIND_ERR_DEAD`) with no revival operation, and `endpoint_attach_ok` additionally requires the incarnation to match. Three audit events (`DRV_AUDIT_EV_RESTART/ESCALATE/CHANDEAD` = 4/5/6, all `kind = 0` so cap-kind balances stay exact). New `src/kernel/core/driver/restart.pdx`; design doc `design/drivers/cascade-restart.md`. Boot witness `kernel_main.pdx §r29_cascade_restart_witness` (40 sub-tests over a four-node tree) — fingerprint `R29 CASCADE RESTART OK`. || 2026-08-15 | R30.M2 | #1058/#1059/#1060 | Added `KIND_ACPI_EVENT = 0x21` as a **planning row with a fixed wire format**, derived over `KIND_NOTIFICATION` (12) with rights `R_ACPI_EVENT_ALL = 0x408` (OBSERVE + REVOKE; deliberately no INVOKE, so a subscriber cannot forge an eject request, and no MINT, so the subscriber set stays the supervisor's). The capability itself is **not minted** — R30.M2 landed only the *producer*, because AML `Notify` delivery is a bounded userspace ring rather than an IPC send and the capability sits on the supervisor-to-consumer hop that R30.M4 wires. The 32-byte row is a transcription of the ring entry `src/user/aml/aml_ctl.pdx` now produces, carrying `sequence` and `drops_total` so a lossy stream is *localisably* lossy: two records whose sequences differ by more than one bracket the loss and a subscriber re-enumerates one bus instead of all of them. Producer contract: depth 32, tail-drop (never overwrite-oldest, so bounded loss never becomes reordering), a drop is a counted event and not a latched error, one step of interpreter fuel on both the accepted and the dropped path, and the invariant `offered == drained + depth + drops`. |
+| 2026-08-15 | R29.M7 | #1044/#1047/#1048 | Landed cascade restart — supervisor tree, restart budget, ChannelDead. Supervisor tree is recorded in the driver descriptor's previously-reserved `[+40]` **supervision word** (`parent_slot:5 | parent_present:1 | perm_failed:1 | restart_count:8 | incarnation:8 | window_start_coarse:40`), with `driver_sup_set_parent` refusing any edge that would close a cycle so every subtree walk is total. Restart strategy is **one-for-one across siblings with a mandatory downward cascade**: kill set = subtree(D), restart set = {D}; descendants are stopped and unregistered rather than restarted, because their capabilities were minted against an incarnation that no longer exists and the restarted D re-enumerates them. Justified by R29's own capability partitioning — siblings share no writable object (one `KIND_DMA_DOMAIN` each per D1.b), so one-for-all buys nothing; and a child's authority is *derived* from its parent's, so the downward cascade is forced rather than chosen. `DRIVER_LIFECYCLE_TABLE` widened `0x00000020101A1C02` → `0x00000020101A1C12` to add the `Init -> Stopping` abandon edge (already the documented intent of the R29.M5-003 signature-failure path, previously unreachable) so `driver_restart_force_stop` is total over the state space. Re-arming is **not** an FSM edge: `Stopped` stays terminal, and `driver_table_rearm_incarnation` retires one incarnation and installs the next, gated on Stopped + no-live-DMA-domain + not-permanently-failed. Budget: 5 restarts per 32768 coarse ticks (TSC >> 20, ≈11 s at 3 GHz) carried in the supervision word; exceeding it latches `perm_failed`, leaving the node in the FSM's own terminal state — escalation is the *absence* of a re-arm, and its terminality is enforced at the store rather than by supervisor convention. ChannelDead: the endpoint row's reserved `[+40]` becomes a **driver binding word** (`driver_slot:5 | bound:1 | dead:1 | incarnation:8`); `driver_restart_reap_endpoints` latches `dead` before detaching each parked waiter and wakes it, and both `sys_ipc_recv_body` and `sys_ipc_send_body` gate on `endpoint_is_dead` returning `-ECONNRESET` (104). Stale capabilities cannot attach to a restarted instance: `endpoint_bind_driver` refuses a dead row (`EP_BIND_ERR_DEAD`) with no revival operation, and `endpoint_attach_ok` additionally requires the incarnation to match. Three audit events (`DRV_AUDIT_EV_RESTART/ESCALATE/CHANDEAD` = 4/5/6, all `kind = 0` so cap-kind balances stay exact). New `src/kernel/core/driver/restart.pdx`; design doc `design/drivers/cascade-restart.md`. Boot witness `kernel_main.pdx §r29_cascade_restart_witness` (40 sub-tests over a four-node tree) — fingerprint `R29 CASCADE RESTART OK`. |
+| 2026-08-15 | R30.M2 | #1058/#1059/#1060 | Added `KIND_ACPI_EVENT = 0x21` as a **planning row with a fixed wire format**, derived over `KIND_NOTIFICATION` (12) with rights `R_ACPI_EVENT_ALL = 0x408` (OBSERVE + REVOKE; deliberately no INVOKE, so a subscriber cannot forge an eject request, and no MINT, so the subscriber set stays the supervisor's). The capability itself is **not minted** — R30.M2 landed only the *producer*, because AML `Notify` delivery is a bounded userspace ring rather than an IPC send and the capability sits on the supervisor-to-consumer hop that R30.M4 wires. The 32-byte row is a transcription of the ring entry `src/user/aml/aml_ctl.pdx` now produces, carrying `sequence` and `drops_total` so a lossy stream is *localisably* lossy: two records whose sequences differ by more than one bracket the loss and a subscriber re-enumerates one bus instead of all of them. Producer contract: depth 32, tail-drop (never overwrite-oldest, so bounded loss never becomes reordering), a drop is a counted event and not a latched error, one step of interpreter fuel on both the accepted and the dropped path, and the invariant `offered == drained + depth + drops`. |
 
 | 2026-08-15 | R30.M3 | #1061/#1062 | Landed `KIND_OP_REGION = 0x150` — the address-space window capability and **the security boundary of R30**: the first kind whose base slot is not a constant (`KIND_MEMORY` 4 for memory-like spaces, `KIND_IO_PORT` 11 for port-like ones, decided by `opregion_space_base_kind` so a port holder cannot manufacture memory reach). Row-indirection tail via `_op_region_table` (32 × 32 B) encoding `{space:u8, base:u64, len:u64, parent_slot:u8, parent_row:u16, is_root:u1}`. Two mint paths and no third: a **root** path demanding the base-kind parent the space requires, reachable only from kernel-side boot code and deliberately not an op on any capability; and a **derive** path — the one a firmware-declared region takes — which inherits the space from its parent and containment-checks the request, **refusing with `OPREG_MINT_NO_COVER` rather than clipping**, because truncation would turn the capability system into an address oracle. Containment is overflow-safe (never forms `base + len`). Rights `R_OPREG_ALL = 0x61B` with READ/WRITE separate so a read-only window is expressible, and derive monotone in rights as well as extent. Transitive cascade revoke as a fixed-point scan (a window may derive a window; recursion on a teardown path is the shape a hostile chain exploits). `tools/build.sh` asserts via `objdump -r` that `_op_region_table` is relocated against from `kind_op_region.o` alone, which is what makes "the containment check is the only path to a row" a property of the kernel rather than of one file. Boot witness `§kind_op_region_witness` (24 sub-tests) — fingerprint `R30 KIND_OP_REGION OK`; its slot ordering is descending on purpose so the cascade's fixed point is genuinely exercised. Userspace half (#1062) is the SystemMemory handler in `src/user/aml/aml_region.pdx`. Opens R30.M3. |
+| 2026-08-15 | R30.M4 | #1068/#1069 | Landed `KIND_ACPI_EVENT = 0x151` — **re-tagged from the `0x21` planning row and re-based from `KIND_NOTIFICATION` (12) to `KIND_HW_INTERRUPT` (`0x140`)**; reconciliation table in the row above. The forcing fact is that the event stream carries **two sources**, not the one the planning row was written from: a firmware `Notify` (informational, nothing to acknowledge) and a hardware **GPE** arriving through the SCI (masked until acknowledged, and the acknowledgement is a *write to the GPE enable register*). `KIND_NOTIFICATION` cannot gate hardware authority, so the endpoint derives over the SCI's own interrupt capability and the gate demands `kind == 0x140` **and** `RIGHT_MINT`; the GSI is **inherited** from the parent row rather than accepted as an argument, so a child cannot misreport which line its events came from. Rights widened `0x408` → `R_ACPI_EVT_ALL = 0x618`: the planning row's no-forged-`Notify` argument is preserved (there is no inject op and no op that writes a record), but acknowledging is not injecting and needs `INVOKE`. Row indirection via `_acpi_event_table` (8 rows × 32 B, sized for **processes** not event sources) encoding `{parent_slot:u8, gsi:u32, subscriber_id:u64, delivered:u64, acked:u64}`; `delivered - acked` is the standing observable for a GPE that is masked, dispatched, handled and never re-enabled. The #1059 32-byte wire format was not discarded — it moved one level down to the stream **record** (64 B, `evt_stream.pdx`), widened by the source discriminator plus a redundant `NEEDS_ACK` flag so what a subscriber *owes* is a field of its own. Bounded stream depth 32 with tail-drop, and the #1059 identity gains one term for the failure mode that ring lacks: `offered == drained + depth + drops + unrouted`, with ring-full and no-subscriber counted **separately** because a wedged subscriber and an absent one need different fixes. `sci_arm` (`core/acpi/sci_arm.pdx`) refuses `SCI_ARM_NOT_READY` without touching the IOAPIC until an endpoint is bound, which is what closes the ordering #1066 left open by programming the SCI masked. Revocation *pushes*: revoke unbinds the stream in the same operation that frees the row. The ISR call-target allowlist in `tools/build.sh` is **unchanged** — the no-subscriber audit record reuses `drv_audit_emit`, already on it. Failure band `0xFFFFFF90..9F`. Boot witness `tests/kernel/acpi/evt_route_synth.pdx` (sub-tests A..G) — fingerprint `R30 ACPI EVENT ROUTE OK`. Closes R30.M4. |
 
 ---
 

@@ -239,12 +239,26 @@ gpe_confine_one '_gpe_dispatch_table' 'core/acpi/gpe_table.o'
 gpe_confine_one '_gpe_event_ring'     'core/acpi/gpe_table.o'
 gpe_confine_one '_gpe_io_mode'        'core/acpi/gpe_io.o'
 gpe_confine_one '_gpe_io_synth_ram'   'core/acpi/gpe_io.o'
+# R30.M4-003 (#1068) / R30.M4-004 (#1069). Same argument, one layer up:
+#   _acpi_event_table  — the KIND_ACPI_EVENT rows. The mint gate in
+#     kind_acpi_event.o is the only path to a row; confining the symbol is
+#     what upgrades that from a convention to a build failure, exactly as
+#     it does for _op_region_table.
+#   _acpi_evt_ring / _acpi_evt_state — the subscriber stream. Confining
+#     the ring is also why acpi_evt_peek is a field accessor rather than a
+#     copy-out through a caller-supplied pointer: no other object may hold
+#     an address inside it.
+gpe_confine_one '_acpi_event_table'   'core/cap/kind_acpi_event.o'
+gpe_confine_one '_acpi_evt_ring'      'core/acpi/evt_stream.o'
+gpe_confine_one '_acpi_evt_state'     'core/acpi/evt_stream.o'
 if [[ "${GPE_CONFINE_OK}" -ne 1 ]]; then
-    echo "  See src/kernel/core/acpi/gpe_block.pdx and gpe_table.pdx for why each" >&2
-    echo "  of these has exactly one legitimate writer." >&2
+    echo "  See src/kernel/core/acpi/gpe_block.pdx, gpe_table.pdx and" >&2
+    echo "  evt_stream.pdx for why each of these has exactly one legitimate" >&2
+    echo "  writer." >&2
     exit 1
 fi
-echo "[gpe-confine] GPE geometry, dispatch table, event ring and I/O seam confined"
+echo "[gpe-confine] GPE geometry, dispatch table, event ring, I/O seam,"
+echo "[gpe-confine] endpoint table and subscriber stream confined"
 
 # (2) Port I/O confinement under core/acpi/.
 gpe_io_strays=""
