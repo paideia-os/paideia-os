@@ -1,0 +1,1071 @@
+// src/kernel/core/driver/restart.pdx — R29.M7-001/004/005
+//                                      (#1044 / #1047 / #1048)
+//
+// Cascade-restart driver: supervisor tree, restart budget + rate-limit,
+// and the ChannelDead cascade over dependent clients.
+//
+// Design context
+// --------------
+// design/drivers/cascade-restart.md is the authority for every policy
+// decision below; this file is its executable form. The three claims it
+// defends, in one paragraph:
+//
+//   The supervisor tree IS the capability derivation tree. A driver's
+//   DMA authority descends from its process memory root, and
+//   dma_cascade_revoke_by_parent already tears down every domain
+//   derived from a dying parent. The parent link recorded here does not
+//   invent a hierarchy — it makes the one that already governs
+//   authority visible to the lifecycle layer, so process lifetime and
+//   authority lifetime cannot drift apart.
+//
+// Restart strategy: one-for-one across siblings, cascade downward
+// ---------------------------------------------------------------
+// For a death at node D:
+//
+//     kill set    = { D } union descendants(D)
+//     restart set = { D }
+//
+// ONE-FOR-ONE, not one-for-all. One-for-all is the right answer when
+// siblings share mutable state they cannot resynchronise after one dies
+// mid-update. That condition is structurally absent here, and absent by
+// construction rather than by luck: R29 gives each driver process
+// exactly one KIND_DMA_DOMAIN (D1.b cardinality, enforced at
+// driver_table_set_domain), its own KIND_INTERRUPT / KIND_MSIX_VECTOR
+// vectors, and its own MMIO windows. Two sibling drivers share no
+// writable object, so there is nothing for one to have corrupted on
+// behalf of the other. Restarting e1000e because NVMe faulted would
+// lose the root filesystem over a network fault and buy back nothing.
+// The capability partitioning R29 spent five milestones building is
+// exactly what earns the cheaper policy.
+//
+// Rest-for-one is likewise unmotivated: it models start-order
+// dependencies between siblings, and sibling start order carries no
+// authority relation in this design. A real dependency is expressed as
+// a parent link, and the cascade already covers it.
+//
+// The DOWNWARD cascade is not a policy choice at all. A child's
+// authority is derived from its parent's; when the parent dies its
+// memory root dies and the child's IOMMU domain is revoked whether or
+// not the supervisor agrees. Letting the child keep running would leave
+// a driver executing against revoked authority — the stale-context-
+// entry hazard driver_lifecycle_teardown documents. The cascade makes
+// process lifetime match the authority lifetime the cap layer ended.
+//
+// And descendants are NOT auto-restarted, which is what makes the
+// restart set exactly {D}. A descendant's capabilities were minted
+// against an incarnation of D that no longer exists; re-minting them
+// would require the kernel to attribute a fresh grant to a principal
+// that is dead. The sound answer is the one hotplug already uses: the
+// restarted D re-enumerates and re-registers its children, at which
+// point every child capability is minted afresh against a live,
+// identified principal. So this file unregisters each descendant after
+// tearing it down, leaving no descriptor behind.
+//
+// Restart against the FSM
+// -----------------------
+// The walk DOWN is ordinary FSM traffic — driver_restart_force_stop
+// drives any state to Stopped using only whitelisted edges, through
+// driver_lifecycle_transition, so the descriptor remains the only
+// record of state. (The Init -> Stopping edge added in this landing is
+// what makes that walk total; see lifecycle.pdx §The Init -> Stopping
+// edge.)
+//
+// The walk BACK UP is deliberately NOT an FSM edge. Stopped stays
+// terminal. driver_table_rearm_incarnation retires one incarnation and
+// installs the next in the same slot — a storage operation gated on
+// Stopped + no-live-domain + not-permanently-failed. Adding a
+// Stopped -> Init transition instead would assert that what comes back
+// is the same driver that died, and every stale-capability refusal in
+// §6.5 of the design depends on it not being.
+//
+// Budget and escalation
+// ---------------------
+// MAX_INTENSITY restarts per WINDOW, both carried in the descriptor's
+// supervision word, timed off kread_tsc — the same monotonic source
+// that stamps every audit record. Exceeding the budget escalates: the
+// node is already sitting in the FSM's terminal Stopped state (it got
+// there through the whitelist before the budget was consulted), and
+// escalation consists of not re-arming it plus latching perm_failed so
+// that nothing else re-arms it either. The latch is checked inside
+// driver_table_rearm_incarnation, so terminality is a storage invariant
+// and holds against callers that do not exist yet.
+//
+// Concurrency
+// -----------
+// Single-flow, non-preemptible at this layer — matching the note
+// driver_table.pdx and endpoint_table.pdx already carry. The
+// supervision word is read-modify-written across several stores and the
+// endpoint scan is not atomic against a concurrent endpoint_alloc. A
+// per-row lock or generation counter lands with the SMP pass.
+
+module Restart = structure {
+
+  // ============================================================================
+  // Supervision-word field geometry (mirrors driver_table.pdx §[+40]).
+  // Duplicated as locals because paideia-as does not resolve cross-module
+  // `let` constants at parse time — the same reason
+  // endpoint_table.pdx freezes PENDING_PAYLOAD_MAX_BYTES locally.
+  // ============================================================================
+
+  pub let DRV_SUP_PARENT_MASK       : u64 = 0x1F        // bits [4:0]
+  pub let DRV_SUP_PARENT_PRESENT    : u64 = 0x20        // bit 5
+  pub let DRV_SUP_PERM_FAILED       : u64 = 0x40        // bit 6
+  pub let DRV_SUP_RESTARTS_SHIFT    : u64 = 8           // bits [15:8]
+  pub let DRV_SUP_INCARN_SHIFT      : u64 = 16          // bits [23:16]
+  pub let DRV_SUP_WINDOW_SHIFT      : u64 = 24          // bits [63:24]
+
+  // ============================================================================
+  // Budget policy
+  //
+  // MAX_INTENSITY = 5 restarts inside WINDOW = 32768 coarse ticks.
+  //
+  // A coarse tick is TSC >> 20, so the window is 32768 * 2^20 ~= 3.4e10
+  // cycles ~= 11 s at 3 GHz — deliberately close to the OTP default
+  // shape of a handful of restarts inside roughly ten seconds, which is
+  // the shape decades of supervised-process experience converged on.
+  //
+  // The >> 20 shift buys range as much as it costs resolution: 40 bits
+  // of coarse ticks covers 60 bits of TSC, about a decade at 3 GHz, so
+  // window_start cannot wrap during a boot. A raw 40-bit TSC field
+  // would wrap every ~6 minutes and hand the budget a false reset on
+  // every wrap.
+  // ============================================================================
+
+  pub let DRV_RESTART_MAX_INTENSITY : u64 = 5
+  pub let DRV_RESTART_WINDOW_COARSE : u64 = 32768
+  pub let DRV_RESTART_TSC_SHIFT     : u64 = 20
+  pub let DRV_RESTART_COARSE_MASK   : u64 = 0xFFFFFFFFFF   // 40 bits
+
+  // ============================================================================
+  // Return codes. A fresh block at 0xFFFFFFB1.. — disjoint from
+  // DRV_AUDIT_* (0xFFFFFFC4..C7), DMA_* (0xFFFFFFD5..DC),
+  // DRIVER_LIFECYCLE_* (0xFFFFFF0x) and DRIVER_TABLE_* (0xFFFFFEFx),
+  // so a mixed error trace still names the layer that refused.
+  // ============================================================================
+
+  pub let DRV_RESTART_OK              : u64 = 0
+  pub let DRV_RESTART_ERR_BAD_SLOT    : u64 = 0xFFFFFFB1
+  pub let DRV_RESTART_ERR_PERM_FAILED : u64 = 0xFFFFFFB2
+  pub let DRV_RESTART_ESCALATED       : u64 = 0xFFFFFFB3
+  pub let DRV_RESTART_ERR_STOP        : u64 = 0xFFFFFFB4
+  pub let DRV_RESTART_ERR_TEARDOWN    : u64 = 0xFFFFFFB5
+  pub let DRV_RESTART_ERR_REARM       : u64 = 0xFFFFFFB6
+  pub let DRV_RESTART_ERR_CYCLE       : u64 = 0xFFFFFFB7
+
+  // Sentinel for driver_sup_parent: this node is a forest root.
+  pub let DRV_RESTART_PARENT_NONE     : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ============================================================================
+  // driver_sup_parent(slot) -> u64
+  //
+  // SysV ABI: rdi = slot -> rax = parent slot (0..31), or
+  // DRV_RESTART_PARENT_NONE when the node has no parent (a forest root),
+  // or when the slot is out of range / not in_use.
+  //
+  // Collapsing "no parent" and "bad slot" into one sentinel is correct
+  // here rather than lazy: both mean "there is nothing above this node
+  // to walk to", which is the only question every caller asks.
+  // ============================================================================
+
+  pub let driver_sup_parent : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M7-001 (#1044): decode the parent link from the supervision word. One push (r12) puts rsp at %16 == 0 for the nested call (entry is %16 == 8), matching driver_lifecycle_get_state's idiom; r12 is not otherwise needed but the push is the cheapest way to satisfy the alignment discipline. driver_table_read_sup already gates slot range and in_use and returns 0 for a bad slot, and a zero word has the parent_present bit clear, so the bad-slot case falls out of the same test as the no-parent case without a second branch. Return (word & DRV_SUP_PARENT_MASK) when bit 5 is set, else DRV_RESTART_PARENT_NONE.",
+      block: {
+        push r12;
+        call driver_table_read_sup;          // rdi = slot; rax = word | 0
+
+        mov r10, rax;
+        shr r10, 5;                          // DRV_SUP_PARENT_PRESENT
+        mov r11, 1;
+        and r10, r11;
+        cmp r10, 0;
+        je  drv_sup_parent_none;
+
+        mov r10, 0x1F;                       // DRV_SUP_PARENT_MASK
+        and rax, r10;
+        pop r12;
+        ret;
+
+      drv_sup_parent_none:
+        pop r12;
+        mov rax, 0xFFFFFFFFFFFFFFFF;         // DRV_RESTART_PARENT_NONE
+        ret
+      }
+    }
+
+  // ============================================================================
+  // driver_sup_incarnation(slot)  -> u64  (0..255)
+  // driver_sup_perm_failed(slot)  -> u64  (1 | 0)
+  // driver_sup_restart_count(slot)-> u64  (0..255)
+  //
+  // Field decoders over the same word. Each returns the zero-valued
+  // reading on a bad slot, which is the honest answer: a slot holding no
+  // driver is at incarnation 0, has not failed, and has never been
+  // restarted.
+  // ============================================================================
+
+  pub let driver_sup_incarnation : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M7-001 (#1044): extract bits [23:16] (incarnation) from the supervision word. One push for call alignment. Bad slot yields word 0 -> incarnation 0, the correct reading for a slot holding no driver.",
+      block: {
+        push r12;
+        call driver_table_read_sup;
+        shr rax, 16;                         // DRV_SUP_INCARN_SHIFT
+        mov r10, 0xFF;
+        and rax, r10;
+        pop r12;
+        ret
+      }
+    }
+
+  pub let driver_sup_perm_failed : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M7-004 (#1047): extract bit 6 (perm_failed) from the supervision word. One push for call alignment. Bad slot yields word 0 -> 0, i.e. 'not permanently failed', which is correct: a slot holding no driver has no escalation to report, and callers gate on slot_in_use before acting on a 0.",
+      block: {
+        push r12;
+        call driver_table_read_sup;
+        shr rax, 6;                          // DRV_SUP_PERM_FAILED
+        mov r10, 1;
+        and rax, r10;
+        pop r12;
+        ret
+      }
+    }
+
+  pub let driver_sup_restart_count : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M7-004 (#1047): extract bits [15:8] (restart_count within the current window) from the supervision word. One push for call alignment. Bad slot yields word 0 -> 0 restarts.",
+      block: {
+        push r12;
+        call driver_table_read_sup;
+        shr rax, 8;                          // DRV_SUP_RESTARTS_SHIFT
+        mov r10, 0xFF;
+        and rax, r10;
+        pop r12;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // driver_sup_set_parent(slot, parent_slot) -> u64
+  //
+  // SysV ABI: rdi = slot, rsi = parent_slot.
+  // Returns DRV_RESTART_OK, DRV_RESTART_ERR_BAD_SLOT, or
+  // DRV_RESTART_ERR_CYCLE.
+  //
+  // The cycle check is the whole reason this is a function rather than a
+  // field write. driver_sup_subtree_mask and driver_restart_force_stop
+  // both walk the tree, and a cycle would make "the subtree of a node"
+  // either non-terminating or wrong. Rejecting the edge that would close
+  // a cycle is what makes every downstream walk a total function.
+  //
+  // Two guards, because there are two ways a cycle can appear:
+  //
+  //   * The edge being added closes one. Walk up from parent_slot; if
+  //     we reach `slot`, the new edge would complete the loop. Refuse.
+  //   * A cycle already exists above parent_slot (only reachable if
+  //     something bypassed this function and wrote the word directly).
+  //     The walk is bounded at DRIVER_TABLE_SLOTS hops — the longest
+  //     possible acyclic chain in a 32-row table — and exceeding it
+  //     means the chain is not acyclic. Refuse rather than spin.
+  // ============================================================================
+
+  pub let driver_sup_set_parent : (u64, u64) -> u64 !{mem} @{} =
+    fn (slot: u64) (parent_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M7-001 (#1044): install a supervision edge slot -> parent_slot after proving it cannot close a cycle. Five pushes (rbx/r12/r13/r14/r15) put rsp at %16 == 0 for every nested call. rbx = slot, r12 = parent_slot, r13 = walk cursor, r14 = hop count, r15 = scratch word. Gate order: (1) either slot >= DRIVER_TABLE_SLOTS -> ERR_BAD_SLOT. (2) slot == parent_slot -> ERR_CYCLE (a self-edge is the degenerate cycle; reported as CYCLE not BAD_SLOT because the argument is well-formed and the relation is what is refused). (3) both rows in_use via driver_table_slot_in_use -> else ERR_BAD_SLOT. (4) Cycle walk: cursor = parent_slot; each hop, if cursor == slot the new edge would close a loop -> ERR_CYCLE; if hop count reaches DRIVER_TABLE_SLOTS (32) the chain above parent is already cyclic -> ERR_CYCLE; read the cursor's supervision word, stop when parent_present is clear, else cursor = word & DRV_SUP_PARENT_MASK. (5) Commit: read slot's word, clear bits [5:0] with mask 0xFFFFFFFFFFFFFFC0, OR in (parent_slot & 0x1F) | DRV_SUP_PARENT_PRESENT, write it back with driver_table_write_sup. restart_count, incarnation, window_start and perm_failed are preserved by construction — re-parenting a node must not forgive its crash history.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                            // 5 pushes -> rsp %16 = 0
+
+        mov rbx, rdi;                        // slot
+        mov r12, rsi;                        // parent_slot
+
+        // (1) range.
+        cmp rbx, 32;                         // DRIVER_TABLE_SLOTS
+        jae drv_sup_sp_bad_slot;
+        cmp r12, 32;
+        jae drv_sup_sp_bad_slot;
+
+        // (2) self-edge.
+        cmp rbx, r12;
+        je  drv_sup_sp_cycle;
+
+        // (3) both rows must hold a driver.
+        mov rdi, rbx;
+        call driver_table_slot_in_use;
+        cmp rax, 0;
+        je  drv_sup_sp_bad_slot;
+
+        mov rdi, r12;
+        call driver_table_slot_in_use;
+        cmp rax, 0;
+        je  drv_sup_sp_bad_slot;
+
+        // (4) cycle walk upward from the proposed parent.
+        mov r13, r12;                        // cursor
+        xor r14, r14;                        // hops
+
+      drv_sup_sp_walk:
+        cmp r13, rbx;
+        je  drv_sup_sp_cycle;                // the new edge would close a loop
+
+        cmp r14, 32;                         // DRIVER_TABLE_SLOTS
+        jae drv_sup_sp_cycle;                // chain above parent already cyclic
+
+        mov rdi, r13;
+        call driver_table_read_sup;
+        mov r15, rax;
+
+        mov rax, r15;
+        shr rax, 5;                          // DRV_SUP_PARENT_PRESENT
+        mov r10, 1;
+        and rax, r10;
+        cmp rax, 0;
+        je  drv_sup_sp_commit;               // reached a forest root — acyclic
+
+        mov r10, 0x1F;                       // DRV_SUP_PARENT_MASK
+        and r15, r10;
+        mov r13, r15;
+        add r14, 1;
+        jmp drv_sup_sp_walk;
+
+      drv_sup_sp_commit:
+        mov rdi, rbx;
+        call driver_table_read_sup;
+
+        mov r10, 0xFFFFFFFFFFFFFFC0;         // clear bits [5:0]
+        and rax, r10;
+
+        mov r10, r12;
+        mov r11, 0x1F;                       // DRV_SUP_PARENT_MASK
+        and r10, r11;
+        or  rax, r10;
+
+        mov r10, 0x20;                       // DRV_SUP_PARENT_PRESENT
+        or  rax, r10;
+
+        mov rdi, rbx;
+        mov rsi, rax;
+        call driver_table_write_sup;
+
+        xor rax, rax;                        // DRV_RESTART_OK
+        jmp drv_sup_sp_epilogue;
+
+      drv_sup_sp_bad_slot:
+        mov rax, 0xFFFFFFB1;                 // DRV_RESTART_ERR_BAD_SLOT
+        jmp drv_sup_sp_epilogue;
+
+      drv_sup_sp_cycle:
+        mov rax, 0xFFFFFFB7;                 // DRV_RESTART_ERR_CYCLE
+
+      drv_sup_sp_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // driver_sup_clear_parent(slot) -> ()
+  //
+  // Detach a node from its supervisor, making it a forest root. Clears
+  // bits [5:0] only; the budget, incarnation and escalation latch are
+  // untouched, because none of them is a property of the edge.
+  // ============================================================================
+
+  pub let driver_sup_clear_parent : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M7-001 (#1044): clear the parent link, leaving every other supervision field intact. Three pushes (r12/r13/r14) keep rsp %16 == 0 across the two nested calls; r12 holds the slot across driver_table_read_sup. Mask 0xFFFFFFFFFFFFFFC0 drops parent_slot and parent_present together — clearing the present bit alone would leave a stale slot index that a future widening of the field could resurrect. Silent on a bad slot: driver_table_read_sup returns 0 and driver_table_write_sup no-ops, so the composition is already a no-op with no branch of its own.",
+      block: {
+        push r12;
+        push r13;
+        push r14;                            // 3 pushes -> rsp %16 = 0
+
+        mov r12, rdi;                        // slot
+
+        mov rdi, r12;
+        call driver_table_read_sup;
+
+        mov r10, 0xFFFFFFFFFFFFFFC0;         // clear bits [5:0]
+        and rax, r10;
+
+        mov rdi, r12;
+        mov rsi, rax;
+        call driver_table_write_sup;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // driver_sup_subtree_mask(slot) -> u64
+  //
+  // SysV ABI: rdi = slot -> rax = a 32-bit mask in which bit `s` is set
+  // iff driver slot `s` is `slot` itself or a descendant of it. Returns
+  // 0 when the slot is out of range or not in_use.
+  //
+  // Computed as a fixpoint rather than a recursive descent: seed the
+  // mask with the root, then repeatedly sweep all 32 slots adding any
+  // in-use node whose parent is already in the mask, until a sweep adds
+  // nothing. This is O(32 * depth) with depth <= 32, so at most ~1024
+  // slot visits — trivially bounded, and it needs no explicit stack in a
+  // context (driver death) where the kernel stack is the last thing that
+  // should be growing unpredictably.
+  //
+  // Termination does not depend on the tree being acyclic — each sweep
+  // only ever SETS bits, and there are 32 of them, so at most 32 sweeps
+  // can make progress. Acyclicity (guaranteed by driver_sup_set_parent)
+  // is what makes the RESULT meaningful, not what makes it terminate.
+  // ============================================================================
+
+  pub let driver_sup_subtree_mask : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M7-001 (#1044): compute the subtree membership mask by fixpoint. Five pushes (rbx/r12/r13/r14/r15) put rsp at %16 == 0 for the nested calls. rbx = mask, r12 = root slot, r13 = sweep cursor, r14 = changed flag, r15 = scratch supervision word. Gate: driver_table_slot_in_use(root) == 0 -> return 0. Seed mask = 1 << root (variable shift via cl). Each sweep sets changed = 0 and walks s in [0,32): skip if s is already in the mask (single shr/and bit test); skip if the row is not in_use; read the supervision word and skip if parent_present is clear; extract parent and skip if the parent bit is NOT in the mask; otherwise OR 1 << s into the mask and set changed. Repeat while changed. Terminates unconditionally because a sweep only ever sets bits and there are 32 of them — acyclicity makes the result meaningful, not terminating. Iterative rather than recursive: driver death is the worst moment to grow the kernel stack by an unbounded depth.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                            // 5 pushes -> rsp %16 = 0
+
+        mov r12, rdi;                        // root slot
+
+        mov rdi, r12;
+        call driver_table_slot_in_use;
+        cmp rax, 0;
+        je  drv_sup_mask_zero;
+
+        mov rbx, 1;
+        mov rcx, r12;
+        shl rbx, cl;                         // mask = 1 << root
+
+      drv_sup_mask_sweep:
+        xor r14, r14;                        // changed = 0
+        xor r13, r13;                        // s = 0
+
+      drv_sup_mask_scan:
+        cmp r13, 32;                         // DRIVER_TABLE_SLOTS
+        jae drv_sup_mask_sweep_end;
+
+        // Already in the mask?
+        mov rax, rbx;
+        mov rcx, r13;
+        shr rax, cl;
+        mov r10, 1;
+        and rax, r10;
+        cmp rax, 0;
+        jne drv_sup_mask_next;
+
+        // Holds a driver?
+        mov rdi, r13;
+        call driver_table_slot_in_use;
+        cmp rax, 0;
+        je  drv_sup_mask_next;
+
+        // Has a parent?
+        mov rdi, r13;
+        call driver_table_read_sup;
+        mov r15, rax;
+
+        mov rax, r15;
+        shr rax, 5;                          // DRV_SUP_PARENT_PRESENT
+        mov r10, 1;
+        and rax, r10;
+        cmp rax, 0;
+        je  drv_sup_mask_next;
+
+        // Is that parent already in the mask?
+        mov r10, 0x1F;                       // DRV_SUP_PARENT_MASK
+        and r15, r10;                        // r15 = parent slot
+
+        mov rax, rbx;
+        mov rcx, r15;
+        shr rax, cl;
+        mov r10, 1;
+        and rax, r10;
+        cmp rax, 0;
+        je  drv_sup_mask_next;
+
+        // Add s to the subtree.
+        mov rax, 1;
+        mov rcx, r13;
+        shl rax, cl;
+        or  rbx, rax;
+        mov r14, 1;                          // changed = 1
+
+      drv_sup_mask_next:
+        add r13, 1;
+        jmp drv_sup_mask_scan;
+
+      drv_sup_mask_sweep_end:
+        cmp r14, 0;
+        jne drv_sup_mask_sweep;
+
+        mov rax, rbx;
+        jmp drv_sup_mask_epilogue;
+
+      drv_sup_mask_zero:
+        xor rax, rax;
+
+      drv_sup_mask_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // driver_restart_force_stop(slot) -> u64
+  //
+  // Drive a driver to the FSM's terminal Stopped state using only
+  // whitelisted transitions. Returns DRV_RESTART_OK,
+  // DRV_RESTART_ERR_BAD_SLOT, or DRV_RESTART_ERR_STOP.
+  //
+  // From any state the walk is at most two edges:
+  //
+  //   Init | Running | Suspended | Handoff  ->  Stopping  ->  Stopped
+  //   Stopping                              ->  Stopped
+  //   Stopped                               ->  (already there)
+  //
+  // Every step goes through driver_lifecycle_transition, so the
+  // whitelist is consulted on each one and the descriptor stays the sole
+  // record of state. The loop is capped at eight iterations — four times
+  // the worst case — so a future FSM revision that accidentally admits a
+  // cycle degrades to a clean ERR_STOP instead of hanging the kernel in
+  // a death path.
+  // ============================================================================
+
+  pub let driver_restart_force_stop : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R29.M7-001 (#1044): walk the lifecycle FSM to its terminal state via whitelisted edges only. Three pushes (rbx/r12/r13) keep rsp %16 == 0 across nested calls; rbx = slot, r12 = iteration guard. Each iteration reads driver_lifecycle_get_state: DRIVER_LIFECYCLE_ERR_BAD_SLOT (0xFFFFFF01) -> ERR_BAD_SLOT; state 5 (Stopped) -> OK; state 4 (Stopping) -> target Stopped (5); every other state -> target Stopping (4), which is legal from Init, Running, Suspended and Handoff alike (Init since the R29.M7-001 table edge). driver_lifecycle_transition returning non-zero -> ERR_STOP, because at this point the FSM has refused an edge its own whitelist admits, which is a substrate bug rather than a caller error and must not be papered over. The eight-iteration cap is four times the worst case: a future FSM revision that accidentally admits a cycle degrades to a clean ERR_STOP instead of hanging the kernel inside a driver-death path. {sysreg} is inherited from driver_lifecycle_transition's audit timestamp read.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;                            // 3 pushes -> rsp %16 = 0
+
+        mov rbx, rdi;                        // slot
+        xor r12, r12;                        // iteration guard
+
+      drv_fstop_loop:
+        cmp r12, 8;
+        jae drv_fstop_err;
+
+        mov rdi, rbx;
+        call driver_lifecycle_get_state;     // rax = state | ERR_BAD_SLOT
+
+        mov r10, 0xFFFFFF01;                 // DRIVER_LIFECYCLE_ERR_BAD_SLOT
+        cmp rax, r10;
+        je  drv_fstop_bad_slot;
+
+        cmp rax, 5;                          // DRIVER_STATE_STOPPED
+        je  drv_fstop_ok;
+
+        cmp rax, 4;                          // DRIVER_STATE_STOPPING
+        je  drv_fstop_to_stopped;
+
+        mov rsi, 4;                          // -> DRIVER_STATE_STOPPING
+        jmp drv_fstop_step;
+
+      drv_fstop_to_stopped:
+        mov rsi, 5;                          // -> DRIVER_STATE_STOPPED
+
+      drv_fstop_step:
+        mov rdi, rbx;
+        call driver_lifecycle_transition;
+        cmp rax, 0;
+        jne drv_fstop_err;
+
+        add r12, 1;
+        jmp drv_fstop_loop;
+
+      drv_fstop_ok:
+        xor rax, rax;                        // DRV_RESTART_OK
+        jmp drv_fstop_epilogue;
+
+      drv_fstop_bad_slot:
+        mov rax, 0xFFFFFFB1;                 // DRV_RESTART_ERR_BAD_SLOT
+        jmp drv_fstop_epilogue;
+
+      drv_fstop_err:
+        mov rax, 0xFFFFFFB4;                 // DRV_RESTART_ERR_STOP
+
+      drv_fstop_epilogue:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // driver_restart_reap_endpoints(driver_slot) -> u64
+  //
+  // The ChannelDead cascade (#1048). Scans all 128 endpoint rows and,
+  // for each live row bound to this driver slot and not already dead:
+  //
+  //   1. endpoint_mark_dead — latches the dead bit FIRST, then detaches
+  //      and returns the parked waiter. The ordering is what makes the
+  //      wake safe: a woken client re-examines the endpoint on its retry
+  //      path and must never find it alive, or it would go straight back
+  //      into sched_block with no wake source left.
+  //   2. Emits DRV_AUDIT_EV_CHANDEAD so the post-restart reconciler can
+  //      account for every channel a restart killed.
+  //   3. sched_wake if a waiter was parked — the same idempotent
+  //      sched_wake sys_ipc_send_body uses, so a double cascade cannot
+  //      corrupt the runqueue.
+  //
+  // Returns the number of endpoints killed.
+  //
+  // The audit record is emitted BEFORE the wake, so the record cannot
+  // describe a wake that has not happened yet — the same commit-then-
+  // record ordering driver_lifecycle_transition uses for Handoff, run
+  // in the direction that matters here.
+  // ============================================================================
+
+  pub let driver_restart_reap_endpoints : (u64) -> u64 !{mem, sysreg} @{sched} =
+    fn (driver_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched},
+      justification: "R29.M7-005 (#1048): mark every endpoint bound to this driver dead and wake any client parked on it. Five pushes (rbx/r12/r13/r14/r15) put rsp at %16 == 0 for the nested calls. rbx = driver_slot, r12 = endpoint id cursor, r13 = kill count, r14 = binding word, r15 = detached waiter TCB. Per row: endpoint_binding_word (which already gates id range and row liveness, returning 0 for both) -> skip unless bit 5 (bound) is set, skip if bit 6 (dead) is already set (idempotence — a second cascade must not double-count or double-wake), skip unless bits [4:0] == driver_slot. Then endpoint_mark_dead, which publishes the dead latch BEFORE detaching the waiter so a woken client cannot re-read the endpoint as alive and re-block with no wake source remaining. drv_audit_emit(EV_CHANDEAD=6, kind=0, subject=driver_slot, principal=endpoint id, outcome=0) is issued BEFORE sched_wake so no record can describe a wake that has not happened. sched_wake is called only when a waiter was actually parked; it is idempotent per its #663 guard, so a double cascade cannot corrupt the runqueue. Effects: {mem} for the table scan, {sysreg} from drv_audit_emit's TSC read and sched_wake's transitive rdmsr in runq_enqueue, @{sched} from sched_wake.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                            // 5 pushes -> rsp %16 = 0
+
+        mov rbx, rdi;                        // driver_slot
+        xor r12, r12;                        // endpoint id cursor
+        xor r13, r13;                        // kill count
+
+      drv_reap_scan:
+        cmp r12, 128;                        // ENDPOINT_TABLE_SLOTS
+        jae drv_reap_done;
+
+        mov rdi, r12;
+        call endpoint_binding_word;          // 0 for bad id / dead row
+        mov r14, rax;
+
+        // Bound to anyone?
+        mov rax, r14;
+        shr rax, 5;                          // ENDPOINT_BIND_PRESENT
+        mov r10, 1;
+        and rax, r10;
+        cmp rax, 0;
+        je  drv_reap_next;
+
+        // Already dead? (idempotence)
+        mov rax, r14;
+        shr rax, 6;                          // ENDPOINT_BIND_DEAD
+        mov r10, 1;
+        and rax, r10;
+        cmp rax, 0;
+        jne drv_reap_next;
+
+        // Bound to THIS driver?
+        mov rax, r14;
+        mov r10, 0x1F;                       // ENDPOINT_BIND_DRIVER_MASK
+        and rax, r10;
+        cmp rax, rbx;
+        jne drv_reap_next;
+
+        // Kill it; take the parked waiter.
+        mov rdi, r12;
+        call endpoint_mark_dead;             // rax = waiter TCB | 0
+        mov r15, rax;
+
+        // Record before waking.
+        mov rdi, 6;                          // DRV_AUDIT_EV_CHANDEAD
+        xor rsi, rsi;                        // kind = 0: not a cap event
+        mov rdx, rbx;                        // subject   = driver slot
+        mov rcx, r12;                        // principal = endpoint id
+        xor r8,  r8;                         // outcome   = OK
+        call drv_audit_emit;
+
+        cmp r15, 0;
+        je  drv_reap_counted;
+
+        mov rdi, r15;
+        call sched_wake;                     // WAITING -> RUNNABLE + enqueue
+
+      drv_reap_counted:
+        add r13, 1;
+
+      drv_reap_next:
+        add r12, 1;
+        jmp drv_reap_scan;
+
+      drv_reap_done:
+        mov rax, r13;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // driver_restart_kill_one(slot) -> u64
+  //
+  // Wind one driver's life all the way down, in the only order that is
+  // safe:
+  //
+  //   1. force_stop  — reach the FSM's terminal state. Everything below
+  //                    requires Stopped.
+  //   2. reap        — kill the channels and wake the clients. Done
+  //                    BEFORE teardown so a client wakes to find a dead
+  //                    endpoint rather than racing a half-revoked
+  //                    driver.
+  //   3. teardown    — release the IOMMU context entry, cascade-revoke
+  //                    the DMA domain through the process memory root,
+  //                    clear the descriptor's domain field.
+  //
+  // Does not unregister and does not re-arm: those are the caller's
+  // decision, and they differ between the node that died (re-armed) and
+  // its descendants (unregistered). Keeping the decision out of here is
+  // what lets one primitive serve both.
+  // ============================================================================
+
+  pub let driver_restart_kill_one : (u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "R29.M7-001/005 (#1044/#1048): stop, reap and tear down one driver. Three pushes (rbx/r12/r13) keep rsp %16 == 0 across the nested calls; rbx = slot. Order: (1) driver_restart_force_stop — any non-zero rc propagates VERBATIM, so ERR_BAD_SLOT and ERR_STOP stay distinguishable to the supervisor. (2) driver_restart_reap_endpoints — return value (kill count) discarded here; the audit records are the durable account. Runs BEFORE teardown so a woken client finds a dead endpoint rather than racing a half-revoked driver's domain. (3) driver_lifecycle_teardown — its DRIVER_LIFECYCLE_* codes are collapsed to DRV_RESTART_ERR_TEARDOWN because from the supervisor's position they all mean the same thing (the previous life did not fully wind down, so re-arming is unsafe) and the underlying code has already been logged by teardown itself. Deliberately does NOT unregister or re-arm: those differ between the node that died and its descendants, and keeping the choice in the caller lets one primitive serve both. Effect/cap set is the union of the three callees: {mem, sysreg} @{cap, sched}.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;                            // 3 pushes -> rsp %16 = 0
+
+        mov rbx, rdi;                        // slot
+
+        // (1) reach the terminal state.
+        mov rdi, rbx;
+        call driver_restart_force_stop;
+        cmp rax, 0;
+        jne drv_kill_one_epilogue;           // propagate BAD_SLOT / ERR_STOP
+
+        // (2) kill the channels, wake the clients.
+        mov rdi, rbx;
+        call driver_restart_reap_endpoints;
+
+        // (3) release the hardware authority.
+        mov rdi, rbx;
+        call driver_lifecycle_teardown;
+        cmp rax, 0;
+        jne drv_kill_one_teardown_fail;
+
+        xor rax, rax;                        // DRV_RESTART_OK
+        jmp drv_kill_one_epilogue;
+
+      drv_kill_one_teardown_fail:
+        mov rax, 0xFFFFFFB5;                 // DRV_RESTART_ERR_TEARDOWN
+
+      drv_kill_one_epilogue:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // driver_restart_kill_descendants(slot) -> u64
+  //
+  // The downward cascade. Computes the subtree of `slot` and, for every
+  // member OTHER than the root, kills it and unregisters it.
+  //
+  // Unregistering rather than restarting is the substance of the
+  // strategy (see the file header): a descendant's capabilities were
+  // minted against an incarnation that no longer exists, and the kernel
+  // cannot re-mint them on behalf of a dead principal. The restarted
+  // root re-enumerates and re-registers its children, at which point
+  // every child capability is minted afresh against a live one.
+  //
+  // The sweep runs low-to-high over slot indices rather than
+  // leaf-to-root. Order does not matter for correctness — each node's
+  // kill_one is independent, and the DMA cascade at the capability layer
+  // is already order-insensitive — and a fixed index order is cheaper
+  // than reconstructing a topological one from the parent links.
+  // ============================================================================
+
+  pub let driver_restart_kill_descendants : (u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "R29.M7-001 (#1044): stop and unregister every descendant of slot. Five pushes (rbx/r12/r13/r14/r15) put rsp at %16 == 0 for the nested calls. rbx = root slot, r12 = subtree mask from driver_sup_subtree_mask, r13 = sweep cursor. Per set bit other than the root: driver_restart_kill_one (non-zero rc aborts the whole cascade and propagates verbatim — a descendant that will not stop means the subtree is not safe to declare dead, and continuing would leave the supervisor believing a live driver was reaped); then drv_audit_emit(EV_RESTART=4, kind=0, subject=descendant slot, principal=the slot that died, outcome=1) where outcome 1 distinguishes 'cascaded to a stop, not restarted' from the outcome-0 record the restarted node emits; then driver_table_unregister, which zeroes the row including its supervision word so the descendant leaves no parent link behind for a later sweep to find. Audit precedes unregister so the record is written while the descriptor it names still exists. Low-to-high index order rather than leaf-to-root: each kill_one is independent and the capability-layer DMA cascade is order-insensitive, so a fixed index order is strictly cheaper than reconstructing a topological one.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                            // 5 pushes -> rsp %16 = 0
+
+        mov rbx, rdi;                        // root slot
+
+        mov rdi, rbx;
+        call driver_sup_subtree_mask;
+        mov r12, rax;                        // subtree mask
+
+        xor r13, r13;                        // cursor
+
+      drv_kill_desc_scan:
+        cmp r13, 32;                         // DRIVER_TABLE_SLOTS
+        jae drv_kill_desc_ok;
+
+        cmp r13, rbx;
+        je  drv_kill_desc_next;              // the root is not a descendant
+
+        mov rax, r12;
+        mov rcx, r13;
+        shr rax, cl;
+        mov r10, 1;
+        and rax, r10;
+        cmp rax, 0;
+        je  drv_kill_desc_next;
+
+        mov rdi, r13;
+        call driver_restart_kill_one;
+        cmp rax, 0;
+        jne drv_kill_desc_epilogue;          // propagate verbatim
+
+        mov rdi, 4;                          // DRV_AUDIT_EV_RESTART
+        xor rsi, rsi;                        // kind = 0
+        mov rdx, r13;                        // subject   = descendant
+        mov rcx, rbx;                        // principal = the node that died
+        mov r8,  1;                          // outcome 1 = cascaded stop
+        call drv_audit_emit;
+
+        mov rdi, r13;
+        call driver_table_unregister;
+
+      drv_kill_desc_next:
+        add r13, 1;
+        jmp drv_kill_desc_scan;
+
+      drv_kill_desc_ok:
+        xor rax, rax;                        // DRV_RESTART_OK
+
+      drv_kill_desc_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // driver_restart_node(slot) -> u64
+  //
+  // THE entry point. One driver died; put the system back in a
+  // consistent state.
+  //
+  // Returns:
+  //   DRV_RESTART_OK              — node re-armed at a fresh incarnation,
+  //                                 subtree stopped and unregistered.
+  //   DRV_RESTART_ESCALATED       — budget exhausted. The node is left in
+  //                                 the FSM's terminal Stopped state with
+  //                                 perm_failed latched. Terminal.
+  //   DRV_RESTART_ERR_PERM_FAILED — already escalated; refused up front.
+  //   DRV_RESTART_ERR_BAD_SLOT / _STOP / _TEARDOWN / _REARM — propagated.
+  //
+  // Sequence:
+  //   1. Gate the slot; refuse immediately if already permanently
+  //      failed, so a crash loop does not even pay for the teardown walk
+  //      once escalation has landed.
+  //   2. Kill and unregister the descendants (downward cascade).
+  //   3. Kill the node itself — stop, reap channels, tear down the DMA
+  //      domain.
+  //   4. Charge the restart against the budget.
+  //   5. Over budget -> latch perm_failed, audit, return ESCALATED
+  //      WITHOUT re-arming. The node is already in Stopped via a legal
+  //      FSM transition; escalation is the absence of a re-arm, not a
+  //      new state.
+  //   6. Under budget -> re-arm to a fresh incarnation and audit.
+  //
+  // Steps 4 and 6 touch the same supervision word in that order, and
+  // they must stay in it: step 4 writes restart_count and window_start,
+  // step 6 (inside driver_table_rearm_incarnation) increments
+  // incarnation while preserving everything else. Swapping them would
+  // have step 4 overwrite the fresh incarnation with the stale one it
+  // read before the re-arm.
+  // ============================================================================
+
+  pub let driver_restart_node : (u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "R29.M7-001/004/005 (#1044/#1047/#1048): full cascade restart of one driver node. Five pushes (rbx/r12/r13/r14/r15) put rsp at %16 == 0 for every nested call. rbx = slot, r12 = supervision word under construction, r13 = now (coarse tick), r14 = restart count, r15 = window start / scratch. Sequence: (1) driver_table_slot_in_use == 0 -> ERR_BAD_SLOT; supervision word bit 6 set -> ERR_PERM_FAILED, refused BEFORE any teardown so a crash loop pays nothing once escalation has landed. (2) driver_restart_kill_descendants, propagating any failure verbatim. (3) driver_restart_kill_one on the node itself, likewise. (4) Budget: now = (kread_tsc() >> DRV_RESTART_TSC_SHIFT) & DRV_RESTART_COARSE_MASK — the same monotonic source that stamps every audit record, shifted so 40 bits of field covers 60 bits of TSC and cannot wrap during a boot. Re-read the supervision word AFTER the teardown (teardown does not touch it, but re-reading costs one call and removes an ordering assumption). Extract restart_count from bits [15:8]; if it is 0, or now - window_start >= DRV_RESTART_WINDOW_COARSE, open a fresh window (window_start = now, count = 0). The count == 0 arm makes the first restart always open a window, so the sequence is deterministic from a cold descriptor regardless of uptime. Unsigned subtraction of a window_start that somehow exceeds now yields a huge difference and therefore a reset — the conservative direction, since a reset can only delay escalation, never fabricate one. Increment the count, then rebuild the word: mask 0x0000000000FF00FF preserves bits [7:0] (parent link + perm_failed) and [23:16] (incarnation) while clearing the two budget fields, then OR in (count & 0xFF) << 8 and window_start << 24. (5) count > DRV_RESTART_MAX_INTENSITY -> OR in DRV_SUP_PERM_FAILED, write the word, emit EV_ESCALATE (5) with principal = count and outcome = 1, return DRV_RESTART_ESCALATED without re-arming: the node is already in the FSM's terminal Stopped state via a whitelisted transition, and escalation is the ABSENCE of a re-arm rather than a new state. (6) Otherwise write the word, then driver_table_rearm_incarnation (non-zero -> ERR_REARM; its four gates re-check Stopped, no-live-domain and not-permanently-failed, so a bug upstream fails closed here), then read back the new incarnation and emit EV_RESTART (4) with outcome 0. Steps 4 and 6 must stay in this order: step 4 writes count and window, step 6 increments incarnation while preserving them; swapping would have step 4 write back the pre-re-arm incarnation.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                            // 5 pushes -> rsp %16 = 0
+
+        mov rbx, rdi;                        // slot
+
+        // ---- (1) gates ----
+        mov rdi, rbx;
+        call driver_table_slot_in_use;
+        cmp rax, 0;
+        je  drv_rnode_bad_slot;
+
+        mov rdi, rbx;
+        call driver_table_read_sup;
+        mov r15, rax;
+        shr r15, 6;                          // DRV_SUP_PERM_FAILED
+        mov r10, 1;
+        and r15, r10;
+        cmp r15, 0;
+        jne drv_rnode_perm_failed;
+
+        // ---- (2) downward cascade over descendants ----
+        mov rdi, rbx;
+        call driver_restart_kill_descendants;
+        cmp rax, 0;
+        jne drv_rnode_epilogue;              // propagate verbatim
+
+        // ---- (3) the node itself ----
+        mov rdi, rbx;
+        call driver_restart_kill_one;
+        cmp rax, 0;
+        jne drv_rnode_epilogue;              // propagate verbatim
+
+        // ---- (4) charge the restart against the budget ----
+        call kread_tsc;                      // rax = monotonic TSC
+        mov r13, rax;
+        shr r13, 20;                         // DRV_RESTART_TSC_SHIFT
+        mov r10, 0xFFFFFFFFFF;               // DRV_RESTART_COARSE_MASK
+        and r13, r10;                        // r13 = now (40 bits)
+
+        mov rdi, rbx;
+        call driver_table_read_sup;
+        mov r12, rax;                        // supervision word
+
+        mov r14, r12;
+        shr r14, 8;                          // DRV_SUP_RESTARTS_SHIFT
+        mov r10, 0xFF;
+        and r14, r10;                        // r14 = restart_count
+
+        cmp r14, 0;
+        je  drv_rnode_new_window;            // first restart opens a window
+
+        mov r15, r12;
+        shr r15, 24;                         // DRV_SUP_WINDOW_SHIFT
+        mov rax, r13;
+        sub rax, r15;                        // now - window_start
+        mov r10, 32768;                      // DRV_RESTART_WINDOW_COARSE
+        cmp rax, r10;
+        jae drv_rnode_new_window;
+        jmp drv_rnode_have_window;
+
+      drv_rnode_new_window:
+        mov r15, r13;                        // window_start = now
+        xor r14, r14;                        // count = 0
+
+      drv_rnode_have_window:
+        add r14, 1;                          // charge this restart
+
+        // Rebuild: keep parent link + perm_failed [7:0] and
+        // incarnation [23:16]; replace count [15:8] and window [63:24].
+        mov r10, 0x0000000000FF00FF;
+        and r12, r10;
+
+        mov rax, r14;
+        mov r10, 0xFF;
+        and rax, r10;
+        shl rax, 8;                          // DRV_SUP_RESTARTS_SHIFT
+        or  r12, rax;
+
+        mov rax, r15;
+        shl rax, 24;                         // DRV_SUP_WINDOW_SHIFT
+        or  r12, rax;
+
+        // ---- (5) over budget? ----
+        mov r10, 5;                          // DRV_RESTART_MAX_INTENSITY
+        cmp r14, r10;
+        ja  drv_rnode_escalate;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        call driver_table_write_sup;
+
+        // ---- (6) re-arm at a fresh incarnation ----
+        mov rdi, rbx;
+        call driver_table_rearm_incarnation;
+        cmp rax, 0;
+        jne drv_rnode_rearm_fail;
+
+        mov rdi, rbx;
+        call driver_sup_incarnation;
+        mov r15, rax;                        // new incarnation
+
+        mov rdi, 4;                          // DRV_AUDIT_EV_RESTART
+        xor rsi, rsi;                        // kind = 0
+        mov rdx, rbx;                        // subject   = driver slot
+        mov rcx, r15;                        // principal = new incarnation
+        xor r8,  r8;                         // outcome   = restarted
+        call drv_audit_emit;
+
+        xor rax, rax;                        // DRV_RESTART_OK
+        jmp drv_rnode_epilogue;
+
+      drv_rnode_escalate:
+        mov r10, 0x40;                       // DRV_SUP_PERM_FAILED
+        or  r12, r10;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        call driver_table_write_sup;
+
+        mov rdi, 5;                          // DRV_AUDIT_EV_ESCALATE
+        xor rsi, rsi;                        // kind = 0
+        mov rdx, rbx;                        // subject   = driver slot
+        mov rcx, r14;                        // principal = restart count
+        mov r8,  1;                          // outcome   = refused
+        call drv_audit_emit;
+
+        mov rax, 0xFFFFFFB3;                 // DRV_RESTART_ESCALATED
+        jmp drv_rnode_epilogue;
+
+      drv_rnode_rearm_fail:
+        mov rax, 0xFFFFFFB6;                 // DRV_RESTART_ERR_REARM
+        jmp drv_rnode_epilogue;
+
+      drv_rnode_bad_slot:
+        mov rax, 0xFFFFFFB1;                 // DRV_RESTART_ERR_BAD_SLOT
+        jmp drv_rnode_epilogue;
+
+      drv_rnode_perm_failed:
+        mov rax, 0xFFFFFFB2;                 // DRV_RESTART_ERR_PERM_FAILED
+
+      drv_rnode_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

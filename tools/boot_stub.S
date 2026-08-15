@@ -1715,6 +1715,30 @@ drv_audit_ok_msg: .ascii "R29 DRIVER AUDIT OK\n\0"
 drv_audit_fail_msg: .ascii "R29 DRIVER AUDIT FAIL\n\0"
 
 
+# R29.M7-001/004/005 (#1044/#1047/#1048): cascade-restart witness
+# fingerprints. Builds a four-node supervisor tree, kills an interior
+# node, and asserts the one-for-one restart set, the ChannelDead wake of
+# a blocked client, the refusal of a stale endpoint capability against
+# the restarted incarnation, and escalation to permanently-failed once
+# the restart budget is exhausted.
+#
+# See:
+#   - design/drivers/cascade-restart.md
+#   - src/kernel/core/driver/restart.pdx
+#   - src/kernel/boot/kernel_main.pdx §r29_cascade_restart_witness
+.global r29_restart_ok_msg
+.align 8
+r29_restart_ok_msg: .ascii "R29 CASCADE RESTART OK\n\0"
+
+.global r29_restart_fail_msg
+.align 8
+r29_restart_fail_msg: .ascii "R29 CASCADE RESTART FAIL\n\0"
+
+.global r29_restart_wit_name
+.align 8
+r29_restart_wit_name: .ascii "restart-witness\0"
+
+
 # R20b.M1-002 (#1553): endpoint_table + payload_arena witness fingerprints —
 # exercises endpoint_alloc/endpoint_free/endpoint_lookup round-trip on the
 # full 128-slot range AND payload_buf_pa_for(0..127) 4 KiB-alignment +

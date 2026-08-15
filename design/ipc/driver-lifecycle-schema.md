@@ -20,7 +20,10 @@ timeouts + error codes; canonical example driver".
 
 Each opcode drives one edge of the six-state FSM defined by
 `src/kernel/core/driver/lifecycle.pdx` (see the whitelist encoded as
-`DRIVER_LIFECYCLE_TABLE = 0x00000020101A1C02`). The kernel enforces
+`DRIVER_LIFECYCLE_TABLE = 0x00000020101A1C12`, widened from
+`0x00000020101A1C02` by R29.M7-001 (#1044) to admit the
+`Init -> Stopping` abandon edge — see
+`design/drivers/cascade-restart.md` §4.1). The kernel enforces
 transition validity via `driver_lifecycle_transition`; the schema
 below is the *userspace* protocol that carries the intent from
 supervisor to driver plus the driver's ack back.
