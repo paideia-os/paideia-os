@@ -1560,6 +1560,34 @@ registry_lookup_ok_msg: .ascii "R29 REGISTRY LOOKUP OK\n\0"
 registry_lookup_fail_msg: .ascii "R29 REGISTRY LOOKUP FAIL\n\0"
 
 
+# R29.M4-001/002 (#1032/#1033): pinned keyring + driver-artifact
+# signature-verifier witness fingerprints.
+#
+# Exercises: keyring fsck clean over all three roles; lookup hit for
+# paideia_root / vendor_intel / vendor_realtek with the three key blobs
+# proven distinct and 64-byte aligned; lookup miss (ERR_NO_SUCH_KEY) for
+# an unknown role; the declared 1952-byte ML-DSA-65 pk length; a bounded
+# metadata read; scaffold-epoch fingerprints; then the verifier's full
+# gate taxonomy — SIG_BAD_ALGO / _ARTIFACT / _ARTIFACT_LEN / _SIG_PTR /
+# _LENGTH / _PK_PTR / _PK_ALIGN / SIG_UNVERIFIABLE — and, centrally, that
+# an all-zero signature over a well-formed artifact returns
+# SIG_UNSIGNED_SCAFFOLD and that driver_sig_verdict_is_ok rejects it.
+# No path in the verifier returns SIG_OK at R29.
+#
+# See:
+#   - design/drivers/blob-policy.md §1.7 (verdict taxonomy), §1.8 (keyring)
+#   - src/kernel/core/driver/keyring.pdx
+#   - src/kernel/core/driver/sig_verify.pdx
+#   - src/kernel/boot/kernel_main.pdx §sig_keyring_witness
+.global sig_keyring_ok_msg
+.align 8
+sig_keyring_ok_msg: .ascii "R29 SIG KEYRING OK\n\0"
+
+.global sig_keyring_fail_msg
+.align 8
+sig_keyring_fail_msg: .ascii "R29 SIG KEYRING FAIL\n\0"
+
+
 # R20b.M1-002 (#1553): endpoint_table + payload_arena witness fingerprints —
 # exercises endpoint_alloc/endpoint_free/endpoint_lookup round-trip on the
 # full 128-slot range AND payload_buf_pa_for(0..127) 4 KiB-alignment +

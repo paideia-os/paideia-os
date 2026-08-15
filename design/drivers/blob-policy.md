@@ -195,6 +195,185 @@ future work §7.2). This is the price of the dual-signature guarantee
 and is accepted as a matter of principle: the Paideia project vouches
 for every bit that runs under its trust root.
 
+### 1.7 Verdict taxonomy and the all-zero-signature scaffold epoch
+
+*(R29.M4-001, #1032. Implemented in
+`src/kernel/core/driver/sig_verify.pdx`.)*
+
+Sections 1.1–1.5 describe the policy as it will stand once R32 has
+provisioned `paideia_root_pk` and landed the ML-DSA-65 primitive. Until
+then the tree is in what this document names the **scaffold epoch**: no
+signing key exists, so every signature field the build produces is
+bytewise zero — the `.pdxsig` section from `tools/sign-efi.sh`, the
+PdxFS-lite superblock signature, the registry-v2 signature field. R25.M5
+and R28.M1 both call this the "dev bypass"; the name understates it, and
+the understatement is the risk.
+
+The danger is precise. When every signature in the tree is all zeros,
+the path of least resistance is to let all-zero mean "acceptable" so the
+boot log stays quiet. Do that and the scaffold becomes permanent: on the
+day R32 lands, an unsigned artifact still verifies, and nothing in the
+log ever changed to say so. The verifier therefore treats an all-zero
+signature as its own verdict — **structurally well formed, provably NOT
+signed** — numerically distinct from success.
+
+`driver_sig_verify(artifact_ptr, artifact_len, sig_ptr, sig_len, pk_ptr)`
+and its explicit-algorithm form
+`driver_sig_verify_algo(algo_id, …)` return exactly one of:
+
+| Verdict | Value | Meaning | Reachable at R29? |
+|---|---|---|---|
+| `SIG_OK` | `0` | Real ML-DSA-65 verification succeeded. | **No.** Reserved for R32. No path in `sig_verify.pdx` returns it. |
+| `SIG_UNSIGNED_SCAFFOLD` | `1` | Well-formed artifact, well-formed pk, bytewise-zero signature. **Not a pass.** | Yes — the normal R29 outcome. |
+| `SIG_BAD_ALGO` | `0xFFFFFD80` | `algo_id` is not ML-DSA-65. | Yes |
+| `SIG_BAD_ARTIFACT` | `0xFFFFFD81` | `artifact_ptr` is null. | Yes |
+| `SIG_BAD_ARTIFACT_LEN` | `0xFFFFFD82` | `artifact_len` is zero. | Yes |
+| `SIG_BAD_SIG_PTR` | `0xFFFFFD83` | `sig_ptr` is null. | Yes |
+| `SIG_BAD_LENGTH` | `0xFFFFFD84` | `sig_len != 3309` (FIPS 204 §5.4). | Yes |
+| `SIG_BAD_PK_PTR` | `0xFFFFFD85` | `pk_ptr` is null. | Yes |
+| `SIG_BAD_PK_ALIGN` | `0xFFFFFD86` | `pk_ptr` is not 64-byte aligned, so it did not come from the keyring (§1.8). | Yes |
+| `SIG_UNVERIFIABLE` | `0xFFFFFD87` | Real signature material present; no crypto substrate to judge it. **Not a pass.** R32 dependency. | Yes |
+
+Two invariants make the R32 transition a safe one-line flip rather than
+an audit of every call site:
+
+1. **`SIG_OK` is unreachable at R29.** It appears in `sig_verify.pdx`
+   only as a constant and inside `driver_sig_verdict_is_ok`. R32 wires
+   it to the lattice verifier and nothing else ever returns it.
+2. **`driver_sig_verdict_is_ok(v)` is the only sanctioned accept test.**
+   It answers 1 for `SIG_OK` and 0 for everything else, including
+   `SIG_UNSIGNED_SCAFFOLD`. Consumers route their accept/reject decision
+   through it rather than open-coding a comparison, because the natural
+   open-coded shorthand for "OK or the scaffold case" (`cmp rax, 1;
+   jbe`) would silently accept unsigned artifacts.
+
+**R29 consumer discipline: log and continue.** A `SIG_UNSIGNED_SCAFFOLD`
+verdict loads the artifact and records that it loaded unsigned.
+`driver_sig_scaffold_epoch()` reports whether the scaffold is still live
+(1 at R29), giving consumers one symbol to gate that behaviour on.
+
+**R32 flips it to reject.** In the commit that lands
+`src/kernel/core/crypto/ml_dsa/verify.pdx` and provisions real keys:
+`_sig_scaffold_epoch` becomes 0, the `SIG_UNVERIFIABLE` arm becomes a
+call into the lattice verifier (which may then return `SIG_OK`), and the
+`SIG_UNSIGNED_SCAFFOLD` arm is retired. Consumers change from logging to
+refusing per §1.5. No verdict value is renumbered.
+
+The `SIG_BAD_*` gates run in the order algorithm, artifact pointer,
+artifact length, signature pointer, signature length, pk pointer, pk
+alignment — chosen so that no gate dereferences a pointer an earlier
+gate has not validated, and so a short signature buffer yields
+`SIG_BAD_LENGTH` rather than an over-read.
+
+No lattice arithmetic lives in `sig_verify.pdx`. A subtly wrong
+hand-rolled ML-DSA-65 verifier that returns `SIG_OK` is strictly more
+dangerous than no verifier at all, because every consumer downstream
+would then be trusting a number nobody checked.
+
+### 1.8 Keyring layout, roles, and embedding
+
+*(R29.M4-002, #1033. Implemented in
+`src/kernel/core/driver/keyring.pdx`.)*
+
+**On-disk layout.** One file per key under `assets/keys/`, each exactly
+1952 bytes (ML-DSA-65 `pk_bytes`, FIPS 204 §5.4). At R29 the three
+pinned dev keys are:
+
+```
+assets/keys/
+  paideia-root-dev.pub        role paideia_root    (from R28.M1, #1001)
+  intel-firmware-dev.pub      role vendor_intel
+  realtek-firmware-dev.pub    role vendor_realtek
+```
+
+All three are 1952 zero bytes at this epoch — see §1.7. The production
+layout in §1.2, with its year-suffixed per-device-family keys, is the
+R32 shape; it becomes a second index level under the same role ids
+rather than a change to the reader's interface.
+
+**Roles, not filenames.** Lookup is by role, because a role is the
+question a caller actually has ("who is supposed to have signed this
+Intel firmware blob?") and it is stable across the key rotations the
+filename encodes.
+
+| Role | Id | Algorithm | pk length |
+|---|---|---|---|
+| `paideia_root` | 0 | ML-DSA-65 (`algorithm_id = 1`) | 1952 |
+| `vendor_intel` | 1 | ML-DSA-65 | 1952 |
+| `vendor_realtek` | 2 | ML-DSA-65 | 1952 |
+
+**Embedded at build time, not read from a filesystem.** The keys are
+`@include_bytes`'d into `.rodata`, exactly as
+`src/kernel/boot/verify_self.pdx` embeds the root key for the EFI
+self-check. This is not a convenience. The PdxFS-lite superblock is
+itself signature-checked, so reading trust anchors off a mounted volume
+would make the anchors depend on a verification that depends on the
+anchors. The only honest resolution is that the root of trust must exist
+before any storage does and must be covered by whatever signature covers
+the kernel image. The keys are consequently available at the first
+instruction of `kernel_main` — before ACPI, PCI, NVMe, or mount — with
+no init step, no allocation, and no failure mode between boot and first
+lookup. The cost is that rotating a key requires a kernel rebuild, which
+§1.2 already states as policy.
+
+Each blob is `@align(64)`: the R32 lattice verifier burst-loads key
+words in aligned 64-byte chunks, and the alignment doubles as the
+provenance proxy that `SIG_BAD_PK_ALIGN` checks. The `[u8; 1952]` type
+is the build-time length check — `@include_bytes` on a file of any other
+size fails the build, so the 1952-byte invariant is established before
+the kernel exists.
+
+**Reader interface.**
+
+| Entry point | Contract |
+|---|---|
+| `keyring_lookup(role_id)` | Public-key VA on a hit, else `KEYRING_ERR_NO_SUCH_KEY` (`0xFFFFFD60`). Checked: validates role range, `algorithm_id == 1`, declared `pk_len == 1952`, and a non-null resolved address. |
+| `keyring_pk_ptr(role_id)` | Raw role→address resolver; 0 for an unknown role. Exists so `keyring_fsck` can obtain an address without going through the validation it is testing. |
+| `keyring_meta_field(role, field)` | Bounds-checked read of `{role_id, algorithm_id, pk_len, reserved}`. Both bounds precede the address arithmetic — the 96-byte table abuts 5856 bytes of key material. |
+| `keyring_fingerprint(role_id)` | FNV-1a-64 over the role's 1952 bytes, for logs and witnesses. **Non-cryptographic**; never an input to a trust decision. SHA3-256 replaces it at R32. |
+| `keyring_keys_distinct()` | 1 if all three roles carry different material. **0 at R29** — the three dev keys are the same zeros. Reported, not enforced; R32 must flip it. |
+| `keyring_fsck()` | `KEYRING_OK`, or the first failure's code with the offending role in `keyring_fsck_bad_role()`. |
+
+`keyring_lookup` collapses four distinct failure conditions into one
+error code deliberately: from the caller's position they are the same
+fact — there is no usable ML-DSA-65 key for this role — and a caller
+able to distinguish "role unknown" from "role declares the wrong
+algorithm" would be tempted to reach past the keyring for the bytes
+anyway. The distinctions live in `keyring_fsck`, where they drive a
+repair rather than a fallback.
+
+**fsck properties**, checked for each of the three entries, fail-fast:
+
+| Property | Failure code |
+|---|---|
+| `meta[i].role_id == i` (table is index-addressed everywhere else) | `KEYRING_ERR_BAD_ROLE_ID` `0xFFFFFD61` |
+| `meta[i].algorithm_id == 1` (ML-DSA-65) | `KEYRING_ERR_BAD_ALGO` `0xFFFFFD62` |
+| `meta[i].pk_len == 1952` | `KEYRING_ERR_BAD_PK_LEN` `0xFFFFFD63` |
+| `keyring_pk_ptr(i) != 0` | `KEYRING_ERR_NULL_PK` `0xFFFFFD64` |
+
+The `pk_len` check is the one #1033 names. It is not redundant with the
+embedded blob: the blob's true size is fixed at 1952 by its type, while
+`pk_len` is the number this module *believes*. fsck proves the two agree
+— the pair that would otherwise drift apart the first time someone
+edited one of them.
+
+Public-key *addresses* are deliberately absent from the metadata table.
+A static initializer holding the address of another static needs a
+relocation in otherwise position-independent `.rodata` and would force
+an init pass — the exact pre-first-use dependency the embedding decision
+was made to avoid. `keyring_pk_ptr` resolves role→address with a
+rip-relative `lea` per role instead.
+
+Error-code blocks are disjoint by design so a failure is never
+misclassified where it surfaces: `0xFFFFFD0x` registry schema,
+`0xFFFFFD2x` registry I/O, `0xFFFFFD4x` registry query, `0xFFFFFD6x`
+keyring, `0xFFFFFD8x` signature verdict.
+
+**Boot witness.** `sig_keyring_witness` in
+`src/kernel/boot/kernel_main.pdx` runs 29 gates over both modules and
+emits `R29 SIG KEYRING OK`. Stage 16 is the one that matters:
+`driver_sig_verdict_is_ok(SIG_UNSIGNED_SCAFFOLD) == 0`.
+
 ---
 
 ## 2. D1.b — IOMMU domain granularity: PER-DRIVER-PROCESS
@@ -490,6 +669,12 @@ the round fails.
 end-user-installed blobs. |
 | 2026-08-12 | R29.M0 | #1018 | v0.2 rewrite — captures D1.a/D1.b/D1.c
 per synthesis §10. Absorbs and generalizes v0.1. |
+| 2026-08-14 | R29.M4 | #1032 | §1.7 added — signature verdict taxonomy
+and the all-zero-signature scaffold epoch. `SIG_UNSIGNED_SCAFFOLD` is a
+verdict distinct from `SIG_OK`; `SIG_OK` is unreachable until R32. |
+| 2026-08-14 | R29.M4 | #1033 | §1.8 added — pinned keyring layout, the
+three R29 roles, the build-time embedding rationale, the reader
+interface, and the fsck property table. |
 
 ---
 
@@ -506,7 +691,12 @@ per synthesis §10. Absorbs and generalizes v0.1. |
   DMA-domain + audit caps).
 - `design/tooling/plan.md` §D4 (parallel dual-sign construction for
   user-tool packages).
-- `assets/keys/paideia-root-dev.pub` (current dev root; production
-  `paideia_root_pk` lands at R32).
+- `assets/keys/paideia-root-dev.pub`, `assets/keys/intel-firmware-dev.pub`,
+  `assets/keys/realtek-firmware-dev.pub` (current dev keyring, §1.8;
+  production keys land at R32).
+- `src/kernel/core/driver/sig_verify.pdx` (§1.7 verdict taxonomy).
+- `src/kernel/core/driver/keyring.pdx` (§1.8 keyring + reader + fsck).
+- `src/kernel/boot/verify_self.pdx` (the R28.M1 EFI self-check that
+  established the embedding convention §1.8 follows).
 
 *End of document.*

@@ -1,0 +1,455 @@
+// src/kernel/core/driver/sig_verify.pdx — R29.M4-001 (#1032)
+//
+// ML-DSA-65 signature verifier SURFACE for driver artifacts.
+//
+// Policy: design/drivers/blob-policy.md §1.7 (verdict taxonomy) and
+// §1.4 (the blob_load pipeline this verifier is step 5/6 of).
+//
+// -----------------------------------------------------------------------------
+// What this file is, and — more importantly — what it is not
+// -----------------------------------------------------------------------------
+//
+// This is the *structural* half of driver-artifact signature verification:
+// the entry point, the algorithm dispatch, every well-formedness gate on
+// the (artifact, signature, public key) triple, and the complete verdict
+// taxonomy those gates produce.
+//
+// It contains NO lattice arithmetic. ML-DSA-65 (FIPS 204) NTT, sampling,
+// and the actual verify equation land at R32 in
+// src/kernel/core/crypto/ml_dsa/verify.pdx, together with real key
+// provisioning. Hand-rolling that primitive here would be the single
+// worst thing this file could do: a subtly wrong lattice verifier that
+// returns OK is strictly more dangerous than no verifier at all, because
+// every consumer downstream would then be trusting a number nobody
+// checked. So the non-zero-signature path in this file returns
+// SIG_UNVERIFIABLE — "there is real signature material here and I have no
+// substrate with which to judge it" — and never a pass.
+//
+// -----------------------------------------------------------------------------
+// The all-zero-signature scaffold epoch
+// -----------------------------------------------------------------------------
+//
+// The whole codebase is currently in what the R25.M5 / R28.M1 work calls
+// the dev-bypass, and what this file names precisely: the *scaffold
+// epoch*. Every signature field the build system produces — the
+// .pdxsig section from tools/sign-efi.sh, the PdxFS-lite superblock sig
+// (src/kernel/core/fs/pdxfs_lite/verify.pdx), the registry v2 sig field
+// (registry_v2.pdx ERR_SIG_NOT_ZERO) — is bytewise all zeros, because no
+// signing key exists yet. R32 provisions paideia_root_pk and replaces
+// those zeros with real ML-DSA-65 bytes.
+//
+// The temptation, when every signature in the tree is all zeros, is to
+// let all-zero mean "fine" so the boot path stays quiet. That is exactly
+// how a scaffold becomes a permanent hole: the day R32 lands, an
+// unsigned artifact still verifies, and nobody notices because the log
+// line never changed. This file refuses that shape. An all-zero
+// signature over a well-formed artifact returns SIG_UNSIGNED_SCAFFOLD —
+// a verdict of its own, numerically distinct from SIG_OK, that means
+// "structurally well formed, provably NOT signed".
+//
+// The R29 discipline for that verdict is log-and-continue: the artifact
+// loads, and the supervisor records that it loaded unsigned. R32 flips
+// the same verdict to a hard reject in one edit at the call sites,
+// without touching this file. The two properties that make that flip
+// safe are enforced here:
+//
+//   1. SIG_OK is unreachable at R29. No path in driver_sig_verify_algo
+//      returns 0. It is reserved for the R32 lattice verifier and
+//      nothing else. Grep-verifiable: `SIG_OK` appears in this file
+//      only as a constant definition and in driver_sig_verdict_is_ok.
+//   2. driver_sig_verdict_is_ok(v) returns 1 for v == SIG_OK and 0 for
+//      every other value INCLUDING SIG_UNSIGNED_SCAFFOLD. Callers that
+//      route their accept/reject decision through that predicate — which
+//      is why it exists rather than open-coding `cmp rax, 0` — cannot
+//      accidentally accept a zero signature, at R29 or ever.
+//
+// driver_sig_scaffold_epoch() reports whether the scaffold is still
+// live. R32 flips it to 0 in the same commit that lands the real
+// primitive, giving consumers a single symbol to gate their
+// log-versus-reject behaviour on rather than a per-call-site constant.
+//
+// -----------------------------------------------------------------------------
+// Gate ordering
+// -----------------------------------------------------------------------------
+//
+// The gates run in an order chosen so that no gate dereferences a
+// pointer another gate has not yet validated, and so the *most
+// diagnostic* failure wins when several apply:
+//
+//   1. algorithm id            -> SIG_BAD_ALGO
+//   2. artifact_ptr != 0       -> SIG_BAD_ARTIFACT
+//   3. artifact_len != 0       -> SIG_BAD_ARTIFACT_LEN
+//   4. sig_ptr != 0            -> SIG_BAD_SIG_PTR
+//   5. sig_len == 3309         -> SIG_BAD_LENGTH
+//   6. pk_ptr != 0             -> SIG_BAD_PK_PTR
+//   7. pk_ptr 64-byte aligned  -> SIG_BAD_PK_ALIGN
+//   8. sig all zero ? SIG_UNSIGNED_SCAFFOLD : SIG_UNVERIFIABLE
+//
+// Length before content is the load-bearing part: gate 5 rejects a wrong
+// sig_len before gate 8 reads 3309 bytes through sig_ptr, so a caller
+// that passes a short buffer gets SIG_BAD_LENGTH rather than a read off
+// the end of it. Same reason gate 4 precedes gate 5 and gate 6 precedes
+// gate 7.
+//
+// The pk alignment gate is not cosmetic. Every public key this verifier
+// is meant to be handed comes from the keyring (keyring.pdx), where each
+// blob is @align(64); the R32 lattice verifier will burst-load key words
+// in aligned 64-byte chunks. A pk_ptr that is not 64-byte aligned did
+// not come from the keyring, and treating a stack buffer or an
+// attacker-chosen address as a trust anchor is precisely the confusion
+// this gate exists to catch. It is cheap now and load-bearing later.
+//
+// -----------------------------------------------------------------------------
+// Verdict numbering
+// -----------------------------------------------------------------------------
+//
+// 0 and 1 for the two "the artifact is structurally sound" verdicts;
+// 0xFFFFFD8x for the eight failures. The 0xFFFFFD8x block sits one step
+// past registry_lookup's 0xFFFFFD4x and keyring's 0xFFFFFD6x, so a
+// signature verdict is never confused with a registry query failure or a
+// keyring miss when it surfaces in a log or a witness stage dump. All
+// error codes are far below any kernel VA and far above any plausible
+// index, so a caller can classify with one `cmp rax, 0xFFFFFD80; jae`.
+
+module SigVerify = structure {
+
+  // ============================================================================
+  // Algorithm identifiers — shared with the .pdxsig manifest's
+  // algorithm_id field (blob-policy §1.3) and tools/sign-efi.sh's
+  // sig_algo_id. ML-DSA-65 is the only algorithm this verifier will ever
+  // dispatch; the id exists so a manifest signed under a future
+  // algorithm fails loudly at gate 1 rather than being verified under
+  // the wrong parameter set.
+  // ============================================================================
+
+  pub let SIG_ALGO_ML_DSA_65 : u64 = 1
+
+  // ML-DSA-65 fixed sizes, NIST FIPS 204 §5.4 "Parameter Sets". Mirrored
+  // byte-for-byte from tools/sign-efi.sh (PDX_PK_BYTES / PDX_SIG_BYTES)
+  // and src/kernel/boot/verify_self.pdx.
+  pub let SIG_ML_DSA_65_SIG_BYTES : u64 = 3309
+  pub let SIG_ML_DSA_65_PK_BYTES  : u64 = 1952
+
+  // Public keys are 64-byte aligned by construction (keyring.pdx).
+  pub let SIG_PK_ALIGN_MASK : u64 = 63
+
+  // ============================================================================
+  // Verdict taxonomy. See blob-policy.md §1.7 for the normative table.
+  //
+  // SIG_OK                 real ML-DSA-65 verification succeeded.
+  //                        UNREACHABLE AT R29 — reserved for R32.
+  // SIG_UNSIGNED_SCAFFOLD  well-formed artifact + well-formed pk +
+  //                        bytewise-zero signature. NOT a pass. R29
+  //                        callers log and continue; R32 rejects.
+  // SIG_BAD_*              structural rejection, per gate.
+  // SIG_UNVERIFIABLE       real signature material present, no crypto
+  //                        substrate to judge it (R32 dependency).
+  //                        NOT a pass.
+  // ============================================================================
+
+  pub let SIG_OK                : u64 = 0
+  pub let SIG_UNSIGNED_SCAFFOLD : u64 = 1
+
+  pub let SIG_BAD_ALGO          : u64 = 0xFFFFFD80
+  pub let SIG_BAD_ARTIFACT      : u64 = 0xFFFFFD81
+  pub let SIG_BAD_ARTIFACT_LEN  : u64 = 0xFFFFFD82
+  pub let SIG_BAD_SIG_PTR       : u64 = 0xFFFFFD83
+  pub let SIG_BAD_LENGTH        : u64 = 0xFFFFFD84
+  pub let SIG_BAD_PK_PTR        : u64 = 0xFFFFFD85
+  pub let SIG_BAD_PK_ALIGN      : u64 = 0xFFFFFD86
+  pub let SIG_UNVERIFIABLE      : u64 = 0xFFFFFD87
+
+  // ============================================================================
+  // _sig_scaffold_epoch — 1 while the all-zero-signature scaffold is the
+  // convention across the tree; 0 once R32 has provisioned real keys and
+  // wired the lattice verifier.
+  //
+  // Mutable rather than a constant so a future test harness can drive
+  // both sides of a consumer's log-versus-reject branch without a
+  // rebuild, and so the R32 flip is a one-line initializer change here
+  // instead of an edit at every call site.
+  // ============================================================================
+
+  pub let mut _sig_scaffold_epoch : u64 = 1
+
+  // ============================================================================
+  // driver_sig_scaffold_epoch() -> u64
+  //
+  //   -> rax = 1 if the all-zero-signature scaffold is still live.
+  //
+  // Consumers gate their handling of SIG_UNSIGNED_SCAFFOLD on this:
+  // epoch 1 means log-and-continue, epoch 0 means the verdict can only
+  // arise from an artifact that genuinely carries no signature and must
+  // be refused.
+  // ============================================================================
+
+  pub let driver_sig_scaffold_epoch : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M4-001 (#1032): read the scaffold-epoch flag. rip-relative lea then one qword load. Leaf; no callee-save writes; no nested calls.",
+      block: {
+        lea rax, [rip + _sig_scaffold_epoch];
+        mov rax, [rax + 0];
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // driver_sig_verdict_is_ok(verdict: u64) -> u64
+  //
+  //   rdi = a verdict returned by driver_sig_verify / _algo
+  //   -> rax = 1 if and only if verdict == SIG_OK, else 0.
+  //
+  // The point of this predicate is that it is the ONLY sanctioned way to
+  // turn a verdict into an accept/reject decision. Open-coding
+  // `cmp rax, 0; je accept` is equivalent today and would stay correct;
+  // open-coding `cmp rax, 1; jbe accept` (a natural way to write "OK or
+  // the scaffold case") would silently accept unsigned artifacts, and
+  // that mistake is exactly what a scaffold epoch invites. Routing
+  // through a named predicate makes the accepting comparison exist in
+  // one place that can be reviewed once.
+  //
+  // SIG_UNSIGNED_SCAFFOLD returns 0 here. That is the whole contract.
+  // ============================================================================
+
+  pub let driver_sig_verdict_is_ok : (u64) -> u64 !{} @{} =
+    fn (verdict: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R29.M4-001 (#1032): exact-equality predicate against SIG_OK (0). xor rax,rax then cmp rdi,0 / jne out sets 1 only on exact zero, so every non-zero verdict — including SIG_UNSIGNED_SCAFFOLD (1) — answers 0. No memory touched, no effects. Leaf; no callee-save writes; no nested calls.",
+      block: {
+        xor rax, rax;
+        cmp rdi, 0;
+        jne driver_sig_verdict_is_ok_out;
+        mov rax, 1;
+
+      driver_sig_verdict_is_ok_out:
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // driver_sig_all_zero(ptr: u64, len: u64) -> u64
+  //
+  //   rdi = buffer, rsi = length
+  //   -> rax = 1 if every byte in [ptr, ptr+len) is zero, else 0.
+  //        A zero-length buffer answers 0, not 1 — "nothing was
+  //        examined" must never read as "examined and clean", which is
+  //        the same principle the scaffold verdict rests on.
+  //
+  // Byte-at-a-time rather than qword-at-a-time. 3309 is not a multiple
+  // of 8, so a qword loop needs a tail; the tail is where an
+  // off-by-one lets a non-zero trailing byte slip through, and this
+  // predicate is what stands between a tampered signature and the
+  // SIG_UNSIGNED_SCAFFOLD verdict. 3309 byte loads on a load path that
+  // runs a handful of times per boot is not a cost worth trading
+  // correctness margin for. R32 replaces the caller, not this function.
+  //
+  // Not early-exit-timing-safe, and deliberately so: the input is a
+  // public signature field, not a secret, and "is this all zeros" leaks
+  // nothing an attacker who supplied the bytes does not already know.
+  // The R32 lattice verifier's secret-dependent paths carry their own
+  // constant-time obligation; this one does not.
+  // ============================================================================
+
+  pub let driver_sig_all_zero : (u64, u64) -> u64 !{mem} @{} =
+    fn (ptr: u64, len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M4-001 (#1032): byte-at-a-time all-zero scan over [rdi, rdi+rsi). Zero length returns 0 (see the header note: unexamined must not read as clean). Null pointer also returns 0 without dereferencing, because the caller's gate order already rejected null and a defensive answer of 'not clean' is the safe one. Loop: mov_b rax,[r8] zero-extending byte load, cmp against 0, bail to the not-zero exit on any mismatch. r8 walks the buffer, rcx counts down; both caller-save, so no prologue is needed. Read-only; writes no memory. Leaf; no nested calls.",
+      block: {
+        xor rax, rax;
+
+        cmp rdi, 0;
+        je  driver_sig_all_zero_out;        // null -> 0 (not clean)
+        cmp rsi, 0;
+        je  driver_sig_all_zero_out;        // empty -> 0 (not clean)
+
+        mov r8,  rdi;
+        mov rcx, rsi;
+
+      driver_sig_all_zero_scan:
+        cmp rcx, 0;
+        je  driver_sig_all_zero_clean;
+        mov_b rax, [r8 + 0];
+        cmp rax, 0;
+        jne driver_sig_all_zero_dirty;
+        add r8, 1;
+        sub rcx, 1;
+        jmp driver_sig_all_zero_scan;
+
+      driver_sig_all_zero_dirty:
+        xor rax, rax;
+        ret;
+
+      driver_sig_all_zero_clean:
+        mov rax, 1;
+
+      driver_sig_all_zero_out:
+        ret
+      }
+    } @no_frame
+
+  // ============================================================================
+  // driver_sig_verify_algo(algo_id, artifact_ptr, artifact_len,
+  //                        sig_ptr, sig_len, pk_ptr) -> u64
+  //
+  //   rdi = algorithm id (must be SIG_ALGO_ML_DSA_65)
+  //   rsi = artifact bytes
+  //   rdx = artifact length
+  //   rcx = signature bytes
+  //   r8  = signature length (must be 3309)
+  //   r9  = ML-DSA-65 public key (1952 B, 64-byte aligned; from keyring)
+  //   -> rax = one of the verdicts above.
+  //
+  // The explicit-algorithm form. driver_sig_verify below is the
+  // ML-DSA-65-implicit wrapper most callers want; this one exists so a
+  // .pdxsig manifest's algorithm_id field can be passed through
+  // unexamined and rejected HERE, in the verifier, rather than being
+  // compared against a constant at each call site — the difference
+  // between one place that knows which algorithms are acceptable and N
+  // places that each believe they do.
+  //
+  // Gate order is documented in the file header and is load-bearing:
+  // sig_len is validated before any of the 3309 bytes behind sig_ptr are
+  // read.
+  //
+  // At R29 the terminal branch cannot produce SIG_OK. An all-zero
+  // signature yields SIG_UNSIGNED_SCAFFOLD; anything else yields
+  // SIG_UNVERIFIABLE. R32 replaces the SIG_UNVERIFIABLE arm with a call
+  // into ml_dsa_verify(artifact, artifact_len, sig, pk) and retires the
+  // SIG_UNSIGNED_SCAFFOLD arm in the same commit.
+  // ============================================================================
+
+  pub let driver_sig_verify_algo : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (algo_id: u64, artifact_ptr: u64, artifact_len: u64,
+        sig_ptr: u64, sig_len: u64, pk_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M4-001 (#1032): eight structural gates over the (artifact, signature, public key) triple, then the scaffold-epoch terminal branch. Single-push prologue (rbx): at entry rsp%16==8, so one push brings it to 0 as SysV requires immediately before the one nested call (driver_sig_all_zero). It is an alignment pad as much as a save — nothing needs to survive that call, because the only value read after it is rax. Gates run in the order algo, artifact_ptr, artifact_len, sig_ptr, sig_len, pk_ptr, pk alignment — every pointer is null-checked and every length is range-checked before the byte scan dereferences anything, so a short signature buffer produces SIG_BAD_LENGTH rather than an over-read. The pk alignment gate (and rax,63) enforces that the key came from the 64-byte-aligned keyring rather than an arbitrary address. Terminal branch: all-zero signature -> SIG_UNSIGNED_SCAFFOLD (1), otherwise SIG_UNVERIFIABLE. No path returns SIG_OK (0) at R29 — that verdict is reserved for the R32 lattice verifier. Error constants materialised via mov r10, imm32 then cmp/mov, matching the 0xFFFFFDxx convention in registry_lookup.pdx. Read-only; writes no memory. Labels prefixed driver_sig_verify_algo_ to satisfy reserved-label discipline.",
+      block: {
+        push rbx;                            // rsp%16 = 0 (pad + save)
+
+        // ---- Gate 1: algorithm id ----
+        cmp rdi, 1;                          // SIG_ALGO_ML_DSA_65
+        jne driver_sig_verify_algo_bad_algo;
+
+        // ---- Gate 2: artifact pointer ----
+        cmp rsi, 0;
+        je  driver_sig_verify_algo_bad_artifact;
+
+        // ---- Gate 3: artifact length ----
+        cmp rdx, 0;
+        je  driver_sig_verify_algo_bad_artifact_len;
+
+        // ---- Gate 4: signature pointer ----
+        cmp rcx, 0;
+        je  driver_sig_verify_algo_bad_sig_ptr;
+
+        // ---- Gate 5: signature length (BEFORE any sig deref) ----
+        mov r10, 3309;                       // SIG_ML_DSA_65_SIG_BYTES
+        cmp r8, r10;
+        jne driver_sig_verify_algo_bad_length;
+
+        // ---- Gate 6: public-key pointer ----
+        cmp r9, 0;
+        je  driver_sig_verify_algo_bad_pk_ptr;
+
+        // ---- Gate 7: public-key alignment (keyring provenance) ----
+        mov rax, r9;
+        and rax, 63;                         // SIG_PK_ALIGN_MASK
+        cmp rax, 0;
+        jne driver_sig_verify_algo_bad_pk_align;
+
+        // ---- Terminal branch: is the signature field bytewise zero? ----
+        // Nothing is live across this call but its own result, so the
+        // arguments move straight from rcx/r8 into rdi/rsi.
+        mov rdi, rcx;                        // sig_ptr
+        mov rsi, r8;                         // sig_len (== 3309, gate 5)
+        call driver_sig_all_zero;
+        cmp rax, 1;
+        je  driver_sig_verify_algo_scaffold;
+
+        // Real signature material, no substrate to judge it. NOT a pass.
+        mov rax, 0xFFFFFD87;                 // SIG_UNVERIFIABLE
+        jmp driver_sig_verify_algo_ret;
+
+      driver_sig_verify_algo_scaffold:
+        // Structurally sound, provably UNSIGNED. Distinct from SIG_OK.
+        mov rax, 1;                          // SIG_UNSIGNED_SCAFFOLD
+        jmp driver_sig_verify_algo_ret;
+
+      driver_sig_verify_algo_bad_algo:
+        mov rax, 0xFFFFFD80;
+        jmp driver_sig_verify_algo_ret;
+
+      driver_sig_verify_algo_bad_artifact:
+        mov rax, 0xFFFFFD81;
+        jmp driver_sig_verify_algo_ret;
+
+      driver_sig_verify_algo_bad_artifact_len:
+        mov rax, 0xFFFFFD82;
+        jmp driver_sig_verify_algo_ret;
+
+      driver_sig_verify_algo_bad_sig_ptr:
+        mov rax, 0xFFFFFD83;
+        jmp driver_sig_verify_algo_ret;
+
+      driver_sig_verify_algo_bad_length:
+        mov rax, 0xFFFFFD84;
+        jmp driver_sig_verify_algo_ret;
+
+      driver_sig_verify_algo_bad_pk_ptr:
+        mov rax, 0xFFFFFD85;
+        jmp driver_sig_verify_algo_ret;
+
+      driver_sig_verify_algo_bad_pk_align:
+        mov rax, 0xFFFFFD86;
+
+      driver_sig_verify_algo_ret:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // driver_sig_verify(artifact_ptr, artifact_len, sig_ptr, sig_len,
+  //                   pk_ptr) -> u64
+  //
+  //   rdi = artifact bytes
+  //   rsi = artifact length
+  //   rdx = signature bytes
+  //   rcx = signature length
+  //   r8  = ML-DSA-65 public key (from keyring_lookup)
+  //   -> rax = one of the verdicts above.
+  //
+  // The entry point named by issue #1032. ML-DSA-65 is implicit; this is
+  // a pure argument shift into driver_sig_verify_algo with algo_id = 1.
+  //
+  // The shift walks the registers in descending order (r9 <- r8,
+  // r8 <- rcx, rcx <- rdx, rdx <- rsi, rsi <- rdi) so no move
+  // overwrites a source that a later move still needs. Written the
+  // other way round it would clobber rsi with rdi before rdx has read
+  // rsi, and the artifact length would silently become the artifact
+  // pointer — a bug that would not fail any structural gate, because a
+  // pointer is a perfectly plausible non-zero length. Hence the
+  // explicit ordering note rather than a bare sequence of movs.
+  // ============================================================================
+
+  pub let driver_sig_verify : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (artifact_ptr: u64, artifact_len: u64,
+        sig_ptr: u64, sig_len: u64, pk_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M4-001 (#1032): ML-DSA-65-implicit wrapper over driver_sig_verify_algo. Shifts the five SysV argument registers one slot right in descending order (r9<-r8, r8<-rcx, rcx<-rdx, rdx<-rsi, rsi<-rdi) so no move clobbers a source a later move still reads, then loads rdi with SIG_ALGO_ML_DSA_65 (1) and forwards. The single `push rbx` is an alignment pad, not a save: at entry rsp%16==8, and SysV requires rsp%16==0 immediately before a call, so one push both restores the required alignment and preserves rbx (which the callee's own prologue pushes anyway). rax carries the callee's verdict back untouched. One nested call; no other callee-save writes.",
+      block: {
+        mov r9,  r8;
+        mov r8,  rcx;
+        mov rcx, rdx;
+        mov rdx, rsi;
+        mov rsi, rdi;
+        mov rdi, 1;                          // SIG_ALGO_ML_DSA_65
+
+        push rbx;                            // rsp%16 = 0 for the call
+        call driver_sig_verify_algo;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+}
