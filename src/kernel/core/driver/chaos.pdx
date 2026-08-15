@@ -1,0 +1,1326 @@
+// src/kernel/core/driver/chaos.pdx — R29.M7-002/003 (#1045 / #1046)
+//
+// The chaos harness. Kills every driver in a supervisor tree, over and
+// over, while clients are mid-operation against it, and asserts after
+// EVERY kill that the substrate landed in #1044's specified state and
+// that not one descriptor went missing or appeared from nowhere.
+//
+// Design context
+// --------------
+// design/drivers/cascade-restart.md §Verification is the authority for
+// what this file claims to prove and — just as important — what it does
+// not. The short version:
+//
+//   restart.pdx is the mechanism. This file is the adversary. A
+//   mechanism witness (kernel_main §r29_cascade_restart_witness) drives
+//   one restart through one tree shape and checks the result; it proves
+//   the code does the right thing ONCE, from a clean descriptor table,
+//   at quiescence. Neither of those conditions is what a driver
+//   substrate actually lives in. What survives one restart may still
+//   leak a row on the fortieth; what is correct when the driver is idle
+//   may not be when a client is parked inside recv on the endpoint that
+//   is about to die.
+//
+// So this harness differs from the mechanism witness in exactly three
+// ways, and each of the three is load-bearing:
+//
+//   REPETITION — 100 kills per tree shape, not one. A leak of one row
+//     per restart is invisible in a single-shot witness and fatal in a
+//     running system. Every cycle re-samples its own baseline and
+//     re-checks conservation against it, so the cycle index at which
+//     the accounting first drifts is reported rather than inferred.
+//
+//   LOAD — the kill lands while the driver is in the middle of serving
+//     someone. Concretely, at the instant driver_restart_node is called:
+//     a client TCB is parked in STATE_WAITING in the victim's endpoint
+//     waiter slot (a blocked recv), a second endpoint carries an
+//     unconsumed published message (a send that arrived and was never
+//     drained), and further endpoints are live on nodes both inside and
+//     outside the victim's subtree. Killing a quiescent driver tests
+//     the easy case; every hazard in §6 of the design is a mid-operation
+//     hazard.
+//
+//   SHAPE — the victim rotates through three positions in the same
+//     tree: a LEAF (empty cascade), a MID node (one descendant), and
+//     the ROOT (the whole forest below it). The cascade's correctness
+//     is a claim about the subtree relation, and a harness that only
+//     ever kills one position only ever tests one instance of it.
+//
+// What makes it able to FAIL
+// --------------------------
+// A harness that cannot fail is a very expensive `return 0`. Each of
+// the following defects trips a specific, named check:
+//
+//   a restart leaks a descriptor
+//       -> DRV_CHAOS_ERR_LEAK. live_count(KIND_HW_INTERRUPT) at cycle
+//          end must equal the count sampled at cycle start.
+//   a free happens with no audit record (a row zeroed behind the
+//   stream's back — the shape §5.2 of the design exists to expose)
+//       -> DRV_CHAOS_ERR_MISMATCH, via drv_audit_reconcile. Note this
+//          is a STRICTLY stronger check than the count check above: a
+//          silent free followed by a silent re-mint conserves the count
+//          and still fails reconciliation.
+//   a cascade misses a descendant, or over-reaches into a non-descendant
+//       -> DRV_CHAOS_ERR_CASCADE. The post-kill in_use bit of every
+//          fixture slot is compared against the PRE-kill subtree mask,
+//          in both directions. Missing a descendant and killing a
+//          sibling are the same assertion read from opposite ends.
+//   an endpoint is left bound to a dead incarnation
+//       -> DRV_CHAOS_ERR_ORPHAN (a table-wide scan: no live, undead
+//          binding may name a slot that is no longer in_use) and
+//          DRV_CHAOS_ERR_STALE_BIND (the victim's own endpoint must not
+//          attach against the incarnation the restart just installed).
+//   a driver row leaks
+//       -> DRV_CHAOS_ERR_ROWS. The census of in_use driver rows is
+//          taken across the whole table, not just the fixture, so a
+//          cascade that unregisters someone else's driver is caught by
+//          the same number.
+//   the budget fails to escalate under sustained kills
+//       -> DRV_CHAOS_ERR_RC. The expected return code is PREDICTED from
+//          the pre-kill restart count before the call is made:
+//          count == DRV_RESTART_MAX_INTENSITY predicts ESCALATED and
+//          anything less predicts OK. A budget that never escalates
+//          fails at the sixth kill; one that escalates early fails at
+//          the first.
+//   a blocked client is not woken
+//       -> DRV_CHAOS_ERR_WAKE.
+//   audit sequence gaps or a broken seal chain
+//       -> DRV_CHAOS_ERR_AUDIT.
+//
+// The WINDOWED question
+// ---------------------
+// drv_audit_reconcile has three outcomes, and the third one is a trap.
+// DRV_AUDIT_ERR_WINDOWED means "the retained ring no longer covers the
+// interval you asked about, so I decline to answer". Treating that as a
+// pass would silently convert this entire harness into a no-op the
+// moment churn outran the ring — which is precisely when it matters.
+//
+// So WINDOWED is a HARD FAILURE here, with its own code
+// (DRV_CHAOS_ERR_WINDOWED), and the harness is structured so that a
+// correct implementation can never produce it: the checkpoint interval
+// is one cycle, one cycle emits on the order of ten records (one cap
+// mint, one cap revoke, one ChannelDead per reaped endpoint, one
+// EV_RESTART per cascaded descendant, one EV_RESTART or EV_ESCALATE for
+// the node), and the ring retains 128. A WINDOWED result therefore does
+// not mean "the harness checkpointed too rarely"; it means something
+// emitted an order of magnitude more records than the protocol
+// accounts for, which is itself a finding.
+//
+// Cost
+// ----
+// The full 100-cycle run is entirely table churn — no MMIO, no serial,
+// no page-table work, and deliberately no DMA domain (attaching one
+// would put driver_lifecycle_teardown's klog audit line inside the
+// inner loop and turn 300 restarts into 300 serial writes). Measured
+// cost is far below the boot's existing noise floor, which is why the
+// full count runs in the DEFAULT smoke matrix rather than behind an
+// opt-in gate. See design/drivers/cascade-restart.md §Verification.
+//
+// Concurrency
+// -----------
+// Single-flow, matching restart.pdx and driver_table.pdx. The harness
+// parks a waiter by writing the endpoint row directly rather than by
+// blocking a real task, because a real block would need a second
+// thread of control that phase-1 does not have. The parked TCB is a
+// static fixture flipped to STATE_WAITING before each kill and dequeued
+// from the runqueue after each wake, so the runqueue is left exactly as
+// the harness found it.
+
+module Chaos = structure {
+
+  // ============================================================================
+  // Return codes. Each names ONE invariant, so a failing boot log
+  // identifies the broken claim without a debugger.
+  // ============================================================================
+
+  pub let DRV_CHAOS_OK             : u64 = 0
+  pub let DRV_CHAOS_ERR_FIXTURE    : u64 = 0xFFFFFFA0  // harness could not set up
+  pub let DRV_CHAOS_ERR_RC         : u64 = 0xFFFFFFA1  // restart rc != prediction
+  pub let DRV_CHAOS_ERR_INCARN     : u64 = 0xFFFFFFA2  // incarnation / state wrong
+  pub let DRV_CHAOS_ERR_CASCADE    : u64 = 0xFFFFFFA3  // kill set != subtree
+  pub let DRV_CHAOS_ERR_CHANNEL    : u64 = 0xFFFFFFA4  // endpoint liveness wrong
+  pub let DRV_CHAOS_ERR_WAKE       : u64 = 0xFFFFFFA5  // blocked client not woken
+  pub let DRV_CHAOS_ERR_STALE_BIND : u64 = 0xFFFFFFA6  // dead ep usable again
+  pub let DRV_CHAOS_ERR_ORPHAN     : u64 = 0xFFFFFFA7  // binding to a dead slot
+  pub let DRV_CHAOS_ERR_AUDIT      : u64 = 0xFFFFFFA8  // gap or seal chain broken
+  pub let DRV_CHAOS_ERR_ROWS       : u64 = 0xFFFFFFA9  // driver row census drifted
+  pub let DRV_CHAOS_ERR_LEAK       : u64 = 0xFFFFFFAA  // descriptor count drifted
+  pub let DRV_CHAOS_ERR_WINDOWED   : u64 = 0xFFFFFFAB  // reconcile declined to answer
+  pub let DRV_CHAOS_ERR_MISMATCH   : u64 = 0xFFFFFFAC  // reconcile said no
+  pub let DRV_CHAOS_ERR_REPLACE    : u64 = 0xFFFFFFAD  // post-escalation replace failed
+
+  // ============================================================================
+  // Parameters.
+  //
+  // DRV_CHAOS_CYCLES_FULL is the #1045 headline number: 100 kills of
+  // each driver position. DRV_CHAOS_CYCLES_QUICK exists for a bisect or
+  // a bring-up run and is not what the default witness passes.
+  // ============================================================================
+
+  pub let DRV_CHAOS_CYCLES_FULL  : u64 = 100
+  pub let DRV_CHAOS_CYCLES_QUICK : u64 = 10
+
+  pub let DRV_CHAOS_ROLES : u64 = 3
+
+  // Fixture driver slots. 12..15 are untouched by every other witness
+  // (lifecycle/registry take 0, 1 and 5; the cascade-restart mechanism
+  // witness takes 8..11), and the harness pre-cleans them regardless.
+  //
+  //        12  root
+  //        / \
+  //      13   14
+  //      |
+  //      15
+  //
+  // victim(role) = 14 - role, so role 0 kills the LEAF (14, empty
+  // cascade), role 1 kills the MID node (13, one descendant), and
+  // role 2 kills the ROOT (12, three descendants).
+  pub let DRV_CHAOS_SLOT_LO : u64 = 12
+  pub let DRV_CHAOS_SLOT_HI : u64 = 16
+
+  // Capability slots used for the per-cycle descriptor churn. Both are
+  // asserted free before the run starts, so a future witness that
+  // claims them produces DRV_CHAOS_ERR_FIXTURE rather than a confusing
+  // reconciliation failure.
+  pub let DRV_CHAOS_CAP_ANCESTOR : u64 = 199
+  pub let DRV_CHAOS_CAP_INT      : u64 = 200
+
+  pub let DRV_CHAOS_KIND_HW_INT : u64 = 0x140
+
+  pub let drv_chaos_name : [u8; 6] = "chaos\0"
+
+  // ============================================================================
+  // Harness state.
+  //
+  // Everything the assertions read lives in .data rather than in
+  // callee-save registers, for the reason the blob and audit witnesses
+  // give: an assertion that depends on a callee's register discipline is
+  // partly an assertion ABOUT that callee, and the callee here is the
+  // code under test.
+  //
+  // The observable counters (_kills / _escalations / _wakes /
+  // _cycles_run) are not assertions — they are what a passing run
+  // reports so that "it passed" can be distinguished from "it did
+  // nothing".
+  // ============================================================================
+
+  pub let mut _drv_chaos_stage       : u64 = 0
+  pub let mut _drv_chaos_cycle_idx   : u64 = 0
+  pub let mut _drv_chaos_role        : u64 = 0
+  pub let mut _drv_chaos_kills       : u64 = 0
+  pub let mut _drv_chaos_escalations : u64 = 0
+  pub let mut _drv_chaos_wakes       : u64 = 0
+  pub let mut _drv_chaos_cycles_run  : u64 = 0
+
+  pub let mut _drv_chaos_rows0    : u64 = 0
+  pub let mut _drv_chaos_seq0     : u64 = 0
+  pub let mut _drv_chaos_live0    : u64 = 0
+  pub let mut _drv_chaos_premask  : u64 = 0
+  pub let mut _drv_chaos_scratch  : u64 = 0
+
+  pub let mut _drv_chaos_ep0 : u64 = 0
+  pub let mut _drv_chaos_ep1 : u64 = 0
+  pub let mut _drv_chaos_ep2 : u64 = 0
+  pub let mut _drv_chaos_ep3 : u64 = 0
+
+  pub let mut _drv_chaos_in_target  : u64 = 0
+  pub let mut _drv_chaos_out_target : u64 = 0
+
+  // The blocked client. Same 2224-byte (278 u64) TCB shape the IPC and
+  // cascade-restart witnesses use; state is the u32 at [+8].
+  pub let mut _drv_chaos_fake_tcb : [u64; 278] = uninit @align(8)
+
+  // Payload for the unconsumed in-flight message. 32 bytes.
+  pub let mut _drv_chaos_payload : [u64; 4] = uninit @align(8)
+
+  // ============================================================================
+  // drv_chaos_row_census() -> u64
+  //
+  //   -> rax = number of driver_table rows currently in_use.
+  //
+  // Deliberately TABLE-WIDE rather than fixture-scoped. A cascade bug
+  // that unregisters a driver outside the fixture is exactly as fatal
+  // as one that leaks a fixture row, and scoping the census to slots
+  // 12..15 would make the harness blind to it.
+  // ============================================================================
+
+  pub let drv_chaos_row_census : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M7-002 (#1045): count in_use driver rows across the whole 32-slot table. Three pushes (rbx/r12/r13) put rsp at %16 == 0 for the nested driver_table_slot_in_use call (entry is %16 == 8). rbx = accumulator, r12 = slot cursor, r13 unused but pushed to make the count odd-to-even and keep the alignment arithmetic identical to the other harness entry points. driver_table_slot_in_use already gates the slot range and returns 0/1, so the accumulator is a plain add with no branch. Table-wide rather than fixture-scoped on purpose: a cascade that unregisters a driver OUTSIDE slots 12..15 is as much a bug as one that leaks a fixture row, and this is the only number that sees it. Labels prefixed drv_chaos_census_ per reserved-label discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;                            // 3 pushes -> rsp %16 = 0
+
+        xor rbx, rbx;                        // count
+        xor r12, r12;                        // slot
+
+      drv_chaos_census_scan:
+        cmp r12, 32;                         // DRIVER_TABLE_SLOTS
+        jae drv_chaos_census_done;
+
+        mov rdi, r12;
+        call driver_table_slot_in_use;       // 1 | 0
+        add rbx, rax;
+
+        add r12, 1;
+        jmp drv_chaos_census_scan;
+
+      drv_chaos_census_done:
+        mov rax, rbx;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // drv_chaos_orphans() -> u64
+  //
+  //   -> rax = number of endpoint rows that are live, NOT marked dead,
+  //            and bound to a driver slot that is no longer in_use.
+  //
+  // The invariant: "no endpoint outlives the driver it names". A
+  // restart that reaped its own endpoints but missed a descendant's, or
+  // a cascade that unregistered a row without reaping its channels,
+  // both show up here as a non-zero count — and they show up TABLE-WIDE,
+  // so a channel the harness never allocated is covered too.
+  //
+  // Endpoints that ARE marked dead are excluded by design: a dead
+  // endpoint bound to a departed driver is the correct end state, not a
+  // leak. It is the LIVE binding to a departed driver that would let a
+  // client send into a void.
+  // ============================================================================
+
+  pub let drv_chaos_orphans : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R29.M7-002 (#1045): count live, undead endpoint bindings whose driver slot is no longer registered. Three pushes (rbx/r12/r13) put rsp at %16 == 0 for the nested calls. rbx = accumulator, r12 = endpoint id cursor, r13 = the binding word held across the driver_table_slot_in_use call (a caller-save register would not survive it). Per row: endpoint_binding_word gates id range and row liveness itself and returns 0 for both, and a zero word has bit 5 clear, so the dead-row and bad-id cases fall out of the same present-bit test. Skip unless bit 5 (bound) is set; skip if bit 6 (dead) is set — a dead endpoint naming a departed driver is the CORRECT end state and counting it would make the check fire on every successful cascade; then decode bits [4:0] and count the row iff driver_table_slot_in_use of that slot is 0. Read-only. Labels prefixed drv_chaos_orphan_ per reserved-label discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;                            // 3 pushes -> rsp %16 = 0
+
+        xor rbx, rbx;                        // count
+        xor r12, r12;                        // endpoint id
+
+      drv_chaos_orphan_scan:
+        cmp r12, 128;                        // ENDPOINT_TABLE_SLOTS
+        jae drv_chaos_orphan_done;
+
+        mov rdi, r12;
+        call endpoint_binding_word;
+        mov r13, rax;
+
+        // Bound at all?
+        mov rax, r13;
+        shr rax, 5;                          // ENDPOINT_BIND_PRESENT
+        mov r10, 1;
+        and rax, r10;
+        cmp rax, 0;
+        je  drv_chaos_orphan_next;
+
+        // Already dead? That is the correct end state, not an orphan.
+        mov rax, r13;
+        shr rax, 6;                          // ENDPOINT_BIND_DEAD
+        mov r10, 1;
+        and rax, r10;
+        cmp rax, 0;
+        jne drv_chaos_orphan_next;
+
+        mov rax, r13;
+        mov r10, 0x1F;                       // ENDPOINT_BIND_DRIVER_MASK
+        and rax, r10;
+
+        mov rdi, rax;
+        call driver_table_slot_in_use;
+        cmp rax, 0;
+        jne drv_chaos_orphan_next;
+
+        add rbx, 1;                          // live binding to a departed driver
+
+      drv_chaos_orphan_next:
+        add r12, 1;
+        jmp drv_chaos_orphan_scan;
+
+      drv_chaos_orphan_done:
+        mov rax, rbx;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // drv_chaos_cycle(role, victim) -> u64
+  //
+  //   rdi = role (0 = leaf, 1 = mid, 2 = root) — recorded for the failure
+  //         report; the assertions themselves are derived from the
+  //         subtree mask, not from the role, so they stay correct if the
+  //         tree shape is ever changed.
+  //   rsi = victim slot, which the caller keeps registered ACROSS cycles
+  //         so the restart budget accumulates.
+  //   -> rax = DRV_CHAOS_OK or one of the DRV_CHAOS_ERR_* codes.
+  //
+  // One kill, start to finish. Phases (written into _drv_chaos_stage as
+  // they are entered, so a failure names the phase as well as the
+  // invariant):
+  //
+  //   1  sample the cycle baseline: driver-row census, audit sequence,
+  //      live KIND_HW_INTERRUPT descriptor count. All three are sampled
+  //      TOGETHER and BEFORE the fixture is built, which is what makes
+  //      the end-of-cycle equalities meaningful.
+  //   2  (re)build the tree — register whatever the previous cycle's
+  //      cascade removed, re-assert the three supervision edges, and
+  //      drive every Init node to Running.
+  //   3  mint the per-cycle KIND_HW_INTERRUPT descriptor. This is the
+  //      churn the reconciliation accounts for.
+  //   4  build the IO load and snapshot the pre-kill subtree mask.
+  //   5  predict the return code from the pre-kill restart count, then
+  //      kill.
+  //   6  incarnation / FSM state, split by whether this kill escalated.
+  //   7  the kill set equals the subtree, in both directions.
+  //   8  channel liveness matches subtree membership.
+  //   9  the blocked client was woken and the waiter slot detached.
+  //   10 the dead channel cannot be re-attached at the new incarnation.
+  //   11 no live binding anywhere names a departed driver.
+  //   12 the audit ring's gap and seal chains survived the kill.
+  //   13 cleanup, including replacing the victim if it escalated.
+  //   14 conservation: row census and descriptor count back to baseline.
+  //   15 reconciliation: the audit stream agrees with the descriptors.
+  //
+  // Phases 14 and 15 are both kept because neither subsumes the other.
+  // 14 catches a descriptor that vanished or appeared. 15 catches a
+  // descriptor that changed WITHOUT a record — a silent free plus a
+  // silent re-mint conserves the count of 14 and fails 15.
+  //
+  // Register plan: five pushes (rbx/r12/r13/r14/r15) put rsp at %16 == 0
+  // for every nested call.
+  //   rbx = victim slot
+  //   r12 = role
+  //   r13 = general scratch before the kill; the restart return code
+  //         after it, held all the way to phase 13
+  //   r14 = the victim's incarnation BEFORE the kill
+  //   r15 = loop cursors and comparison scratch
+  // ============================================================================
+
+  pub let drv_chaos_cycle : (u64, u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (role: u64) (victim: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "R29.M7-002/003 (#1045/#1046): one adversarial kill of `victim`, from baseline sampling through conservation and reconciliation. Five pushes (rbx/r12/r13/r14/r15) put rsp at %16 == 0 for every nested call. rbx = victim, r12 = role (reporting only), r13 = pre-kill scratch then the restart return code, r14 = pre-kill incarnation, r15 = loop cursors. The three baselines of phase 1 are sampled together and before any fixture work, which is the precondition drv_audit_reconcile's contract requires of (from_seq, base_live). Phase 4 snapshots driver_sup_subtree_mask BEFORE the kill because after it the descendants are unregistered and the relation is unrecoverable; every post-kill structural assertion is then derived from that mask rather than from the role, so the checks remain correct if the tree shape changes. Phase 5 PREDICTS the return code from the pre-kill restart count (== DRV_RESTART_MAX_INTENSITY predicts ESCALATED, less predicts OK) rather than accepting whatever comes back, which is what makes a budget that never escalates, or escalates early, a failure rather than a shrug; the coarse window is 32768 ticks of TSC>>20 (~11s of wall time) and a cycle costs microseconds, so a window expiry cannot make the prediction wrong. Phase 8 requires an endpoint to be dead iff its bound node is in the pre-kill mask, which is the cascade's under- and over-reach checked as one equality. Phase 13 replaces an escalated victim by unregister + re-register, the operator recovery path, because perm_failed is deliberately terminal and the harness must not be able to clear it any other way. Phase 15 treats DRV_AUDIT_ERR_WINDOWED as a HARD failure with its own code: a cycle emits ~10 records against a 128-record ring, so WINDOWED cannot arise from checkpointing too rarely, and accepting it would turn the whole harness into a no-op exactly when churn is highest. Effects/caps are the union of the callees, dominated by driver_restart_node's {mem, sysreg} @{cap, sched}. Labels prefixed drv_chaos_ per reserved-label discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                            // 5 pushes -> rsp %16 = 0
+
+        mov r12, rdi;                        // role
+        mov rbx, rsi;                        // victim
+
+        // ================= phase 1: baselines =================
+        mov rax, 1;
+        lea rcx, [rip + _drv_chaos_stage];
+        mov [rcx + 0], rax;
+
+        call drv_chaos_row_census;
+        lea rcx, [rip + _drv_chaos_rows0];
+        mov [rcx + 0], rax;
+
+        call drv_audit_seq;
+        lea rcx, [rip + _drv_chaos_seq0];
+        mov [rcx + 0], rax;
+
+        mov rdi, 0x140;                      // DRV_CHAOS_KIND_HW_INT
+        call drv_audit_live_count;
+        lea rcx, [rip + _drv_chaos_live0];
+        mov [rcx + 0], rax;
+
+        // ================= phase 2: (re)build the tree =================
+        mov rax, 2;
+        lea rcx, [rip + _drv_chaos_stage];
+        mov [rcx + 0], rax;
+
+        mov r15, 12;                         // DRV_CHAOS_SLOT_LO
+
+      drv_chaos_reg_scan:
+        cmp r15, 16;                         // DRV_CHAOS_SLOT_HI
+        jae drv_chaos_reg_done;
+
+        mov rdi, r15;
+        call driver_table_slot_in_use;
+        cmp rax, 0;
+        jne drv_chaos_reg_next;              // survived the last cascade
+
+        mov rdi, r15;
+        mov rsi, r15;
+        add rsi, 1200;                       // a distinct device id per slot
+        lea rdx, [rip + drv_chaos_name];
+        xor rcx, rcx;
+        call driver_table_register;
+        cmp rax, 0;
+        jne drv_chaos_fail_fixture;
+
+      drv_chaos_reg_next:
+        add r15, 1;
+        jmp drv_chaos_reg_scan;
+
+      drv_chaos_reg_done:
+        // Edges: 13 -> 12, 14 -> 12, 15 -> 13. Re-asserted every cycle
+        // rather than only after a re-registration; driver_sup_set_parent
+        // preserves restart_count, window_start, incarnation and
+        // perm_failed by construction, so re-writing a surviving node's
+        // existing edge is a no-op that cannot forgive its crash history.
+        mov rdi, 13;
+        mov rsi, 12;
+        call driver_sup_set_parent;
+        cmp rax, 0;
+        jne drv_chaos_fail_fixture;
+
+        mov rdi, 14;
+        mov rsi, 12;
+        call driver_sup_set_parent;
+        cmp rax, 0;
+        jne drv_chaos_fail_fixture;
+
+        mov rdi, 15;
+        mov rsi, 13;
+        call driver_sup_set_parent;
+        cmp rax, 0;
+        jne drv_chaos_fail_fixture;
+
+        // Drive every node that is at Init to Running. A node that is
+        // already Running (a survivor of the last cascade) is skipped
+        // rather than transitioned, because Running -> Running is not on
+        // the whitelist and asking for it would fail the fixture on a
+        // correct FSM.
+        mov r15, 12;
+
+      drv_chaos_start_scan:
+        cmp r15, 16;
+        jae drv_chaos_start_done;
+
+        mov rdi, r15;
+        call driver_lifecycle_get_state;
+        cmp rax, 0;                          // DRIVER_STATE_INIT
+        jne drv_chaos_start_next;
+
+        mov rdi, r15;
+        mov rsi, 1;                          // DRIVER_STATE_RUNNING
+        call driver_lifecycle_transition;
+        cmp rax, 0;
+        jne drv_chaos_fail_fixture;
+
+      drv_chaos_start_next:
+        add r15, 1;
+        jmp drv_chaos_start_scan;
+
+      drv_chaos_start_done:
+
+        // ================= phase 3: descriptor churn =================
+        // One KIND_HW_INTERRUPT minted per cycle and revoked at the end
+        // of it. Both halves are audited inside the capability
+        // primitives (R29.M6-002), so the pair is exactly what the
+        // reconciliation of phase 15 has to account for.
+        mov rax, 3;
+        lea rcx, [rip + _drv_chaos_stage];
+        mov [rcx + 0], rax;
+
+        mov rdi, 200;                        // DRV_CHAOS_CAP_INT
+        mov rsi, 199;                        // DRV_CHAOS_CAP_ANCESTOR
+        mov rdx, 0x618;                      // R_HW_INT_ALL
+        mov rcx, 0x51;                       // gsi
+        mov r8,  0x01;                       // affinity
+        xor r9,  r9;                         // edge-triggered
+        call hw_int_cap_mint;
+        cmp rax, 0;
+        jne drv_chaos_fail_fixture;
+
+        // ================= phase 4: the IO load =================
+        mov rax, 4;
+        lea rcx, [rip + _drv_chaos_stage];
+        mov [rcx + 0], rax;
+
+        // The subtree relation must be captured BEFORE the kill: after
+        // it the descendants are unregistered and the relation is gone.
+        mov rdi, rbx;
+        call driver_sup_subtree_mask;
+        lea rcx, [rip + _drv_chaos_premask];
+        mov [rcx + 0], rax;
+
+        mov rdi, rbx;
+        call driver_sup_incarnation;
+        mov r14, rax;                        // incarnation before the kill
+
+        // -- ep0: a client parked in recv on the victim. --
+        call endpoint_alloc;
+        mov r13, 0xFFFFFFFFFFFFFFFF;         // ENDPOINT_ALLOC_NONE
+        cmp rax, r13;
+        je  drv_chaos_fail_fixture;
+        lea rcx, [rip + _drv_chaos_ep0];
+        mov [rcx + 0], rax;
+
+        mov rdi, rax;
+        mov rsi, rbx;
+        mov rdx, r14;
+        call endpoint_bind_driver;
+        cmp rax, 0;
+        jne drv_chaos_fail_fixture;
+
+        // Park the waiter. STATE_WAITING is set BEFORE the TCB is
+        // published into the row, and before the kill, so sched_wake's
+        // early-exit guard cannot swallow the wake and the kill lands
+        // with a genuinely blocked client on the other end.
+        lea rcx, [rip + _drv_chaos_ep0];
+        mov rdi, [rcx + 0];
+        call endpoint_lookup;
+        cmp rax, 0;
+        je  drv_chaos_fail_fixture;
+        mov r13, rax;                        // row PA
+
+        lea r10, [rip + _drv_chaos_fake_tcb];
+        mov rcx, 2;                          // STATE_WAITING
+        mov [r10 + 8], ecx;                  // fake_tcb.state (u32 @ +8)
+        mov [r13 + 32], r10;                 // ENDPOINT_OFF_WAITER_TCB
+
+        // -- ep1: a message that arrived and was never drained. --
+        call endpoint_alloc;
+        mov r13, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r13;
+        je  drv_chaos_fail_fixture;
+        lea rcx, [rip + _drv_chaos_ep1];
+        mov [rcx + 0], rax;
+
+        mov rdi, rax;
+        mov rsi, rbx;
+        mov rdx, r14;
+        call endpoint_bind_driver;
+        cmp rax, 0;
+        jne drv_chaos_fail_fixture;
+
+        lea rcx, [rip + _drv_chaos_ep1];
+        mov rdi, [rcx + 0];
+        mov rsi, 0xC0FFEE01;                 // a non-zero pending hdr
+        lea rdx, [rip + _drv_chaos_payload];
+        mov rcx, 32;
+        call endpoint_write_pending;
+        cmp rax, 0;
+        jne drv_chaos_fail_fixture;
+
+        // -- Pick the two remaining channel targets from the mask. --
+        //
+        // in_target: the lowest fixture slot other than the victim that
+        //   IS in the victim's subtree, falling back to the victim
+        //   itself when the victim is a leaf. Its channel must die.
+        // out_target: the lowest fixture slot that is NOT in the
+        //   subtree, or 0xFF when the victim is the root and there is
+        //   no such node. Its channel must survive.
+        //
+        // Derived from the mask rather than from the role so the
+        // expectations stay true if the tree is ever reshaped.
+        mov r13, rbx;                        // fallback: the victim
+        mov r15, 12;
+
+      drv_chaos_in_scan:
+        cmp r15, 16;
+        jae drv_chaos_in_done;
+        cmp r15, rbx;
+        je  drv_chaos_in_next;
+
+        lea r10, [rip + _drv_chaos_premask];
+        mov rax, [r10 + 0];
+        mov rcx, r15;
+        shr rax, cl;
+        mov r10, 1;
+        and rax, r10;
+        cmp rax, 0;
+        je  drv_chaos_in_next;
+
+        mov r13, r15;
+        jmp drv_chaos_in_done;
+
+      drv_chaos_in_next:
+        add r15, 1;
+        jmp drv_chaos_in_scan;
+
+      drv_chaos_in_done:
+        lea rcx, [rip + _drv_chaos_in_target];
+        mov [rcx + 0], r13;
+
+        mov r13, 0xFF;                       // sentinel: no outsider
+        mov r15, 12;
+
+      drv_chaos_out_scan:
+        cmp r15, 16;
+        jae drv_chaos_out_done;
+
+        lea r10, [rip + _drv_chaos_premask];
+        mov rax, [r10 + 0];
+        mov rcx, r15;
+        shr rax, cl;
+        mov r10, 1;
+        and rax, r10;
+        cmp rax, 0;
+        jne drv_chaos_out_next;
+
+        mov r13, r15;
+        jmp drv_chaos_out_done;
+
+      drv_chaos_out_next:
+        add r15, 1;
+        jmp drv_chaos_out_scan;
+
+      drv_chaos_out_done:
+        lea rcx, [rip + _drv_chaos_out_target];
+        mov [rcx + 0], r13;
+
+        // -- ep2: a channel on a node inside the subtree. --
+        call endpoint_alloc;
+        mov r13, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r13;
+        je  drv_chaos_fail_fixture;
+        lea rcx, [rip + _drv_chaos_ep2];
+        mov [rcx + 0], rax;
+
+        lea rcx, [rip + _drv_chaos_in_target];
+        mov rdi, [rcx + 0];
+        call driver_sup_incarnation;
+        mov r13, rax;
+
+        lea rcx, [rip + _drv_chaos_ep2];
+        mov rdi, [rcx + 0];
+        lea rcx, [rip + _drv_chaos_in_target];
+        mov rsi, [rcx + 0];
+        mov rdx, r13;
+        call endpoint_bind_driver;
+        cmp rax, 0;
+        jne drv_chaos_fail_fixture;
+
+        // -- ep3: a channel on a node outside the subtree, when one
+        //    exists. This is the over-reach detector: killing the root
+        //    is supposed to take everything, killing anything else is
+        //    not, and the difference has to be observable. --
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        lea rcx, [rip + _drv_chaos_ep3];
+        mov [rcx + 0], rax;                  // "not allocated" sentinel
+
+        lea rcx, [rip + _drv_chaos_out_target];
+        mov r13, [rcx + 0];
+        cmp r13, 0xFF;
+        je  drv_chaos_ep3_done;
+
+        call endpoint_alloc;
+        mov r13, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r13;
+        je  drv_chaos_fail_fixture;
+        lea rcx, [rip + _drv_chaos_ep3];
+        mov [rcx + 0], rax;
+
+        lea rcx, [rip + _drv_chaos_out_target];
+        mov rdi, [rcx + 0];
+        call driver_sup_incarnation;
+        mov r13, rax;
+
+        lea rcx, [rip + _drv_chaos_ep3];
+        mov rdi, [rcx + 0];
+        lea rcx, [rip + _drv_chaos_out_target];
+        mov rsi, [rcx + 0];
+        mov rdx, r13;
+        call endpoint_bind_driver;
+        cmp rax, 0;
+        jne drv_chaos_fail_fixture;
+
+      drv_chaos_ep3_done:
+
+        // ================= phase 5: predict, then kill =================
+        mov rax, 5;
+        lea rcx, [rip + _drv_chaos_stage];
+        mov [rcx + 0], rax;
+
+        mov rdi, rbx;
+        call driver_sup_restart_count;
+        mov r15, rax;                        // count BEFORE the kill
+
+        mov rdi, rbx;
+        call driver_restart_node;
+        mov r13, rax;                        // the return code, held to phase 13
+
+        lea rcx, [rip + _drv_chaos_kills];
+        mov rax, [rcx + 0];
+        add rax, 1;
+        mov [rcx + 0], rax;
+
+        mov r10, 5;                          // DRV_RESTART_MAX_INTENSITY
+        cmp r15, r10;
+        jne drv_chaos_predict_ok;
+
+        mov r10, 0xFFFFFFB3;                 // DRV_RESTART_ESCALATED
+        cmp r13, r10;
+        jne drv_chaos_fail_rc;
+
+        lea rcx, [rip + _drv_chaos_escalations];
+        mov rax, [rcx + 0];
+        add rax, 1;
+        mov [rcx + 0], rax;
+        jmp drv_chaos_predict_done;
+
+      drv_chaos_predict_ok:
+        cmp r13, 0;                          // DRV_RESTART_OK
+        jne drv_chaos_fail_rc;
+
+      drv_chaos_predict_done:
+
+        // ================= phase 6: incarnation and state =================
+        mov rax, 6;
+        lea rcx, [rip + _drv_chaos_stage];
+        mov [rcx + 0], rax;
+
+        cmp r13, 0;
+        jne drv_chaos_esc_state;
+
+        // Restarted: a NEW life, at Init.
+        mov rdi, rbx;
+        call driver_sup_incarnation;
+        mov r10, r14;
+        add r10, 1;
+        cmp rax, r10;
+        jne drv_chaos_fail_incarn;
+
+        mov rdi, rbx;
+        call driver_lifecycle_get_state;
+        cmp rax, 0;                          // DRIVER_STATE_INIT
+        jne drv_chaos_fail_incarn;
+        jmp drv_chaos_state_done;
+
+      drv_chaos_esc_state:
+        // Escalated: latched, terminal, and NOT re-armed. The
+        // incarnation check is the substance — escalation is the
+        // ABSENCE of a re-arm, so an incarnation that moved would mean
+        // the budget was charged and the node came back anyway.
+        mov rdi, rbx;
+        call driver_sup_perm_failed;
+        cmp rax, 1;
+        jne drv_chaos_fail_incarn;
+
+        mov rdi, rbx;
+        call driver_lifecycle_get_state;
+        cmp rax, 5;                          // DRIVER_STATE_STOPPED
+        jne drv_chaos_fail_incarn;
+
+        mov rdi, rbx;
+        call driver_sup_incarnation;
+        cmp rax, r14;
+        jne drv_chaos_fail_incarn;
+
+      drv_chaos_state_done:
+
+        // ================= phase 7: kill set == subtree =================
+        // For every fixture slot other than the victim: in the pre-kill
+        // mask implies unregistered, out of it implies still in_use.
+        // Under-reach and over-reach are the two directions of the same
+        // equality, so both are checked by one loop.
+        mov rax, 7;
+        lea rcx, [rip + _drv_chaos_stage];
+        mov [rcx + 0], rax;
+
+        mov r15, 12;
+
+      drv_chaos_casc_scan:
+        cmp r15, 16;
+        jae drv_chaos_casc_done;
+        cmp r15, rbx;
+        je  drv_chaos_casc_next;             // the victim is neither
+
+        lea r10, [rip + _drv_chaos_premask];
+        mov rax, [r10 + 0];
+        mov rcx, r15;
+        shr rax, cl;
+        mov r10, 1;
+        and rax, r10;
+        lea rcx, [rip + _drv_chaos_scratch];
+        mov [rcx + 0], rax;                  // 1 iff in the subtree
+
+        mov rdi, r15;
+        call driver_table_slot_in_use;
+        lea rcx, [rip + _drv_chaos_scratch];
+        mov r10, [rcx + 0];
+
+        cmp r10, 0;
+        je  drv_chaos_casc_must_live;
+
+        cmp rax, 0;
+        jne drv_chaos_fail_cascade;          // descendant survived
+        jmp drv_chaos_casc_next;
+
+      drv_chaos_casc_must_live:
+        cmp rax, 0;
+        je  drv_chaos_fail_cascade;          // non-descendant was taken
+
+      drv_chaos_casc_next:
+        add r15, 1;
+        jmp drv_chaos_casc_scan;
+
+      drv_chaos_casc_done:
+
+        // ================= phase 8: channel liveness =================
+        mov rax, 8;
+        lea rcx, [rip + _drv_chaos_stage];
+        mov [rcx + 0], rax;
+
+        lea rcx, [rip + _drv_chaos_ep0];
+        mov rdi, [rcx + 0];
+        call endpoint_is_dead;
+        cmp rax, 1;
+        jne drv_chaos_fail_channel;
+
+        lea rcx, [rip + _drv_chaos_ep1];
+        mov rdi, [rcx + 0];
+        call endpoint_is_dead;
+        cmp rax, 1;
+        jne drv_chaos_fail_channel;          // the undrained message's channel
+
+        lea rcx, [rip + _drv_chaos_ep2];
+        mov rdi, [rcx + 0];
+        call endpoint_is_dead;
+        cmp rax, 1;
+        jne drv_chaos_fail_channel;          // the in-subtree node's channel
+
+        lea rcx, [rip + _drv_chaos_ep3];
+        mov r15, [rcx + 0];
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp r15, r10;
+        je  drv_chaos_channel_done;
+
+        mov rdi, r15;
+        call endpoint_is_dead;
+        cmp rax, 0;
+        jne drv_chaos_fail_channel;          // the outsider's channel died
+
+      drv_chaos_channel_done:
+
+        // ================= phase 9: the client was woken =================
+        mov rax, 9;
+        lea rcx, [rip + _drv_chaos_stage];
+        mov [rcx + 0], rax;
+
+        lea rcx, [rip + _drv_chaos_ep0];
+        mov rdi, [rcx + 0];
+        call endpoint_lookup;
+        cmp rax, 0;
+        je  drv_chaos_fail_wake;             // dead is not the same as freed
+        mov r10, [rax + 32];                 // ENDPOINT_OFF_WAITER_TCB
+        cmp r10, 0;
+        jne drv_chaos_fail_wake;             // waiter never detached
+
+        lea r10, [rip + _drv_chaos_fake_tcb];
+        xor rax, rax;
+        mov eax, [r10 + 8];
+        cmp rax, 1;                          // STATE_RUNNABLE
+        jne drv_chaos_fail_wake;
+
+        lea rcx, [rip + _drv_chaos_wakes];
+        mov rax, [rcx + 0];
+        add rax, 1;
+        mov [rcx + 0], rax;
+
+        // Runqueue hygiene, every cycle: the woken fixture must not be
+        // pickable, and must not accumulate 300 stale enqueues.
+        lea rdi, [rip + _drv_chaos_fake_tcb];
+        call runq_dequeue;
+
+        // ================= phase 10: no revival =================
+        // Only meaningful on the restarted path — an escalated node has
+        // no new incarnation to test against.
+        mov rax, 10;
+        lea rcx, [rip + _drv_chaos_stage];
+        mov [rcx + 0], rax;
+
+        cmp r13, 0;
+        jne drv_chaos_stale_done;
+
+        lea rcx, [rip + _drv_chaos_ep0];
+        mov rdi, [rcx + 0];
+        mov rsi, rbx;
+        mov rdx, r14;
+        add rdx, 1;                          // the incarnation just installed
+        call endpoint_attach_ok;
+        cmp rax, 0;
+        jne drv_chaos_fail_stale;
+
+      drv_chaos_stale_done:
+
+        // ================= phase 11: no orphan bindings =================
+        mov rax, 11;
+        lea rcx, [rip + _drv_chaos_stage];
+        mov [rcx + 0], rax;
+
+        call drv_chaos_orphans;
+        cmp rax, 0;
+        jne drv_chaos_fail_orphan;
+
+        // ================= phase 12: audit chain intact =================
+        mov rax, 12;
+        lea rcx, [rip + _drv_chaos_stage];
+        mov [rcx + 0], rax;
+
+        call drv_audit_gap_check;
+        cmp rax, 0;
+        jne drv_chaos_fail_audit;
+
+        call drv_audit_seal_check;
+        cmp rax, 0;
+        jne drv_chaos_fail_audit;
+
+        // ================= phase 13: cleanup =================
+        mov rax, 13;
+        lea rcx, [rip + _drv_chaos_stage];
+        mov [rcx + 0], rax;
+
+        lea rcx, [rip + _drv_chaos_ep0];
+        mov rdi, [rcx + 0];
+        call endpoint_free;
+
+        lea rcx, [rip + _drv_chaos_ep1];
+        mov rdi, [rcx + 0];
+        call endpoint_free;
+
+        lea rcx, [rip + _drv_chaos_ep2];
+        mov rdi, [rcx + 0];
+        call endpoint_free;
+
+        lea rcx, [rip + _drv_chaos_ep3];
+        mov r15, [rcx + 0];
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp r15, r10;
+        je  drv_chaos_free_done;
+        mov rdi, r15;
+        call endpoint_free;
+
+      drv_chaos_free_done:
+        // Give the per-cycle descriptor back. A non-zero rc here is a
+        // fixture failure rather than a leak report, because the leak
+        // report is phase 14's job and it would be unable to distinguish
+        // "the revoke was refused" from "the restart lost a row".
+        mov rdi, 200;                        // DRV_CHAOS_CAP_INT
+        call hw_int_cap_revoke;
+        cmp rax, 0;
+        jne drv_chaos_fail_fixture;
+
+        // Unregister every fixture slot EXCEPT the victim; the victim
+        // stays so its restart budget accumulates across cycles, which
+        // is the only way the escalation edge is ever reached.
+        mov r15, 12;
+
+      drv_chaos_unreg_scan:
+        cmp r15, 16;
+        jae drv_chaos_unreg_done;
+        cmp r15, rbx;
+        je  drv_chaos_unreg_next;
+
+        mov rdi, r15;
+        call driver_table_unregister;
+
+      drv_chaos_unreg_next:
+        add r15, 1;
+        jmp drv_chaos_unreg_scan;
+
+      drv_chaos_unreg_done:
+        // If this cycle escalated, the victim is permanently failed and
+        // no amount of restarting will bring it back — by design. The
+        // operator recovery path is to REPLACE the driver: unregister
+        // the descriptor and register a fresh one. Doing it any other
+        // way (clearing the latch in place) would be the harness
+        // forgiving a crash history the substrate deliberately refuses
+        // to forgive, and would make the terminality claim untestable.
+        cmp r13, 0;
+        je  drv_chaos_cycle_conserve;
+
+        mov rdi, rbx;
+        call driver_table_unregister;
+
+        mov rdi, rbx;
+        mov rsi, rbx;
+        add rsi, 1200;
+        lea rdx, [rip + drv_chaos_name];
+        xor rcx, rcx;
+        call driver_table_register;
+        cmp rax, 0;
+        jne drv_chaos_fail_replace;
+
+        // The replacement starts clean, or the escalation latch has
+        // outlived the descriptor that carried it.
+        mov rdi, rbx;
+        call driver_sup_perm_failed;
+        cmp rax, 0;
+        jne drv_chaos_fail_replace;
+
+        mov rdi, rbx;
+        call driver_sup_restart_count;
+        cmp rax, 0;
+        jne drv_chaos_fail_replace;
+
+        mov rdi, rbx;
+        call driver_sup_incarnation;
+        cmp rax, 0;
+        jne drv_chaos_fail_replace;
+
+      drv_chaos_cycle_conserve:
+        // ================= phase 14: conservation =================
+        mov rax, 14;
+        lea rcx, [rip + _drv_chaos_stage];
+        mov [rcx + 0], rax;
+
+        call drv_chaos_row_census;
+        lea rcx, [rip + _drv_chaos_rows0];
+        mov r10, [rcx + 0];
+        cmp rax, r10;
+        jne drv_chaos_fail_rows;
+
+        mov rdi, 0x140;                      // DRV_CHAOS_KIND_HW_INT
+        call drv_audit_live_count;
+        lea rcx, [rip + _drv_chaos_live0];
+        mov r10, [rcx + 0];
+        cmp rax, r10;
+        jne drv_chaos_fail_leak;
+
+        // ================= phase 15: reconciliation =================
+        mov rax, 15;
+        lea rcx, [rip + _drv_chaos_stage];
+        mov [rcx + 0], rax;
+
+        mov rdi, 0x140;
+        lea rcx, [rip + _drv_chaos_seq0];
+        mov rsi, [rcx + 0];
+        lea rcx, [rip + _drv_chaos_live0];
+        mov rdx, [rcx + 0];
+        call drv_audit_reconcile;
+        cmp rax, 0;                          // DRV_AUDIT_OK
+        je  drv_chaos_cycle_ok;
+
+        mov r10, 0xFFFFFFC5;                 // DRV_AUDIT_ERR_WINDOWED
+        cmp rax, r10;
+        je  drv_chaos_fail_windowed;
+        jmp drv_chaos_fail_mismatch;
+
+      drv_chaos_cycle_ok:
+        xor rax, rax;                        // DRV_CHAOS_OK
+        jmp drv_chaos_cycle_epilogue;
+
+      drv_chaos_fail_fixture:
+        mov rax, 0xFFFFFFA0;
+        jmp drv_chaos_cycle_epilogue;
+
+      drv_chaos_fail_rc:
+        mov rax, 0xFFFFFFA1;
+        jmp drv_chaos_cycle_epilogue;
+
+      drv_chaos_fail_incarn:
+        mov rax, 0xFFFFFFA2;
+        jmp drv_chaos_cycle_epilogue;
+
+      drv_chaos_fail_cascade:
+        mov rax, 0xFFFFFFA3;
+        jmp drv_chaos_cycle_epilogue;
+
+      drv_chaos_fail_channel:
+        mov rax, 0xFFFFFFA4;
+        jmp drv_chaos_cycle_epilogue;
+
+      drv_chaos_fail_wake:
+        mov rax, 0xFFFFFFA5;
+        jmp drv_chaos_cycle_epilogue;
+
+      drv_chaos_fail_stale:
+        mov rax, 0xFFFFFFA6;
+        jmp drv_chaos_cycle_epilogue;
+
+      drv_chaos_fail_orphan:
+        mov rax, 0xFFFFFFA7;
+        jmp drv_chaos_cycle_epilogue;
+
+      drv_chaos_fail_audit:
+        mov rax, 0xFFFFFFA8;
+        jmp drv_chaos_cycle_epilogue;
+
+      drv_chaos_fail_rows:
+        mov rax, 0xFFFFFFA9;
+        jmp drv_chaos_cycle_epilogue;
+
+      drv_chaos_fail_leak:
+        mov rax, 0xFFFFFFAA;
+        jmp drv_chaos_cycle_epilogue;
+
+      drv_chaos_fail_windowed:
+        mov rax, 0xFFFFFFAB;
+        jmp drv_chaos_cycle_epilogue;
+
+      drv_chaos_fail_mismatch:
+        mov rax, 0xFFFFFFAC;
+        jmp drv_chaos_cycle_epilogue;
+
+      drv_chaos_fail_replace:
+        mov rax, 0xFFFFFFAD;
+
+      drv_chaos_cycle_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // drv_chaos_run(cycles) -> u64
+  //
+  //   rdi = cycles per role.
+  //   -> rax = DRV_CHAOS_OK, or the DRV_CHAOS_ERR_* code of the first
+  //            cycle that failed. _drv_chaos_role / _drv_chaos_cycle_idx
+  //            / _drv_chaos_stage name where.
+  //
+  // Three roles x `cycles` kills each. The victim of a role stays
+  // registered for the whole role so its restart budget accumulates and
+  // the escalation edge is actually reached; everything else is rebuilt
+  // per cycle by drv_chaos_cycle because the cascade removed it.
+  //
+  // The KIND_HW ancestor the per-cycle interrupt descriptors derive from
+  // is minted once here rather than per cycle, so the churn the
+  // reconciliation accounts for is exactly one mint and one revoke of
+  // one kind per cycle — a moving ancestor would put a second kind in
+  // the stream for no added coverage.
+  // ============================================================================
+
+  pub let drv_chaos_run : (u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (cycles: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "R29.M7-002/003 (#1045/#1046): drive `cycles` adversarial kills against each of three victim positions in one supervisor tree. Five pushes (rbx/r12/r13/r14/r15) put rsp at %16 == 0 for every nested call. rbx = cycles, r12 = role, r13 = victim, r14 = cycle cursor, r15 = scratch. victim = 14 - role yields 14 (leaf, empty cascade), 13 (mid, one descendant) and 12 (root, three descendants), so the three cascade shapes the design distinguishes are each exercised `cycles` times. Both capability slots are asserted EMPTY before the run: a future witness that claims 199 or 200 would otherwise surface as an unexplained reconciliation failure deep inside the loop instead of as a fixture error on the first line. The KIND_HW ancestor is minted once rather than per cycle so the audited churn is exactly one mint plus one revoke of one kind per cycle. The victim is registered before the cycle loop and left registered across it, which is what lets the restart budget accumulate to DRV_RESTART_MAX_INTENSITY and the escalation edge be reached at all; the per-cycle fixture is rebuilt inside drv_chaos_cycle because the cascade removes it. Slots 12..15 are pre-cleaned per role so a role cannot inherit the previous role's supervision edges. The counters are reset at entry so a second call reports its own run rather than a running total. Labels prefixed drv_chaos_run_ per reserved-label discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                            // 5 pushes -> rsp %16 = 0
+
+        mov rbx, rdi;                        // cycles per role
+
+        xor rax, rax;
+        lea rcx, [rip + _drv_chaos_kills];
+        mov [rcx + 0], rax;
+        lea rcx, [rip + _drv_chaos_escalations];
+        mov [rcx + 0], rax;
+        lea rcx, [rip + _drv_chaos_wakes];
+        mov [rcx + 0], rax;
+        lea rcx, [rip + _drv_chaos_cycles_run];
+        mov [rcx + 0], rax;
+
+        // Both capability slots must be free, or the reconciliation
+        // would be accounting for somebody else's descriptor.
+        mov rax, cap_table;
+        add rax, 4776;                       // DRV_CHAOS_CAP_ANCESTOR * 24
+        mov r15, [rax + 0];
+        cmp r15, 0;
+        jne drv_chaos_run_fixture;
+
+        mov rax, cap_table;
+        add rax, 4800;                       // DRV_CHAOS_CAP_INT * 24
+        mov r15, [rax + 0];
+        cmp r15, 0;
+        jne drv_chaos_run_fixture;
+
+        mov rdi, 199;                        // DRV_CHAOS_CAP_ANCESTOR
+        mov rsi, 14;                         // KIND_HW
+        mov rdx, 0x600;                      // RIGHT_OBSERVE | RIGHT_MINT
+        mov rcx, 0xC0DE;
+        call cap_mint_write;
+
+        xor r12, r12;                        // role
+
+      drv_chaos_run_role_scan:
+        cmp r12, 3;                          // DRV_CHAOS_ROLES
+        jae drv_chaos_run_ok;
+
+        // Pre-clean, so a role cannot inherit the previous role's edges.
+        mov r15, 12;
+
+      drv_chaos_run_clean_scan:
+        cmp r15, 16;
+        jae drv_chaos_run_clean_done;
+        mov rdi, r15;
+        call driver_table_unregister;
+        add r15, 1;
+        jmp drv_chaos_run_clean_scan;
+
+      drv_chaos_run_clean_done:
+        mov r13, 14;
+        sub r13, r12;                        // victim = 14 - role
+
+        mov rdi, r13;
+        mov rsi, r13;
+        add rsi, 1200;
+        lea rdx, [rip + drv_chaos_name];
+        xor rcx, rcx;
+        call driver_table_register;
+        cmp rax, 0;
+        jne drv_chaos_run_fixture;
+
+        xor r14, r14;                        // cycle cursor
+
+      drv_chaos_run_cycle_scan:
+        cmp r14, rbx;
+        jae drv_chaos_run_role_done;
+
+        lea rcx, [rip + _drv_chaos_role];
+        mov [rcx + 0], r12;
+        lea rcx, [rip + _drv_chaos_cycle_idx];
+        mov [rcx + 0], r14;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        call drv_chaos_cycle;
+        cmp rax, 0;
+        jne drv_chaos_run_epilogue;          // propagate the invariant code
+
+        lea rcx, [rip + _drv_chaos_cycles_run];
+        mov rax, [rcx + 0];
+        add rax, 1;
+        mov [rcx + 0], rax;
+
+        add r14, 1;
+        jmp drv_chaos_run_cycle_scan;
+
+      drv_chaos_run_role_done:
+        mov r15, 12;
+
+      drv_chaos_run_tail_scan:
+        cmp r15, 16;
+        jae drv_chaos_run_tail_done;
+        mov rdi, r15;
+        call driver_table_unregister;
+        add r15, 1;
+        jmp drv_chaos_run_tail_scan;
+
+      drv_chaos_run_tail_done:
+        add r12, 1;
+        jmp drv_chaos_run_role_scan;
+
+      drv_chaos_run_ok:
+        xor rax, rax;                        // DRV_CHAOS_OK
+        jmp drv_chaos_run_epilogue;
+
+      drv_chaos_run_fixture:
+        mov rax, 0xFFFFFFA0;                 // DRV_CHAOS_ERR_FIXTURE
+
+      drv_chaos_run_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

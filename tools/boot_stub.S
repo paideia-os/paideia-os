@@ -1739,6 +1739,41 @@ r29_restart_fail_msg: .ascii "R29 CASCADE RESTART FAIL\n\0"
 r29_restart_wit_name: .ascii "restart-witness\0"
 
 
+# R29.M7-002/003 (#1045/#1046): chaos-harness fingerprints. Drives 100
+# kills against each of three victim positions (leaf / mid / root) in the
+# same supervisor tree, with a client parked in a blocked recv and an
+# undrained message published on the victim at the instant of every kill,
+# and re-checks descriptor conservation plus audit reconciliation after
+# every single one.
+#
+# The FAIL line carries three decimal fields — role, cycle and phase —
+# so a failing boot log localises the first drift without a debugger.
+#
+# See:
+#   - design/drivers/cascade-restart.md §Verification
+#   - src/kernel/core/driver/chaos.pdx
+#   - src/kernel/boot/kernel_main.pdx §r29_chaos_witness
+.global r29_chaos_ok_msg
+.align 8
+r29_chaos_ok_msg: .ascii "R29 CHAOS OK\n\0"
+
+.global r29_chaos_fail_msg
+.align 8
+r29_chaos_fail_msg: .ascii "R29 CHAOS FAIL\n\0"
+
+.global r29_chaos_k_role
+.align 8
+r29_chaos_k_role: .ascii "role\0"
+
+.global r29_chaos_k_cycle
+.align 8
+r29_chaos_k_cycle: .ascii "cycle\0"
+
+.global r29_chaos_k_phase
+.align 8
+r29_chaos_k_phase: .ascii "phase\0"
+
+
 # R20b.M1-002 (#1553): endpoint_table + payload_arena witness fingerprints —
 # exercises endpoint_alloc/endpoint_free/endpoint_lookup round-trip on the
 # full 128-slot range AND payload_buf_pa_for(0..127) 4 KiB-alignment +

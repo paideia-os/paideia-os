@@ -422,6 +422,176 @@ every re-arm, and the escalation that ended the loop.
   driver table and endpoint table already carry (single-flow,
   non-preemptible at this layer). A per-row lock or a generation counter
   lands with the SMP pass, not here.
-* **Chaos injection and post-restart accounting.** #1045 and #1046,
-  deliberately written against this completed mechanism rather than
-  alongside it.
+* **A back-pressure path from escalation to userspace.** When a driver
+  is permanently failed, nothing today tells its former clients to stop
+  reconnecting. They discover it one `-ECONNRESET` at a time. A
+  supervisor-visible "this device is gone" notification is a service
+  question rather than a restart question, and belongs with the R30
+  service registry.
+
+---
+
+## 9. Verification: the chaos harness (#1045, #1046)
+
+`src/kernel/core/driver/chaos.pdx`, driven from
+`kernel_main.pdx §r29_chaos_witness`. Everything above this section is a
+claim; this section records what is *held to* the claim, and — more
+usefully — what is not.
+
+### 9.1 Why a second harness at all
+
+The mechanism witness (`§r29_cascade_restart_witness`) drives one
+restart, through one tree shape, from a clean descriptor table, with the
+victim at rest. It proves the code does the right thing **once**. None of
+those three qualifiers describes the condition a driver substrate
+actually runs in, and each one hides a different class of defect:
+
+| Qualifier | What it hides | How the harness removes it |
+|---|---|---|
+| *once* | a leak of one row per restart | 100 kills per victim position, 300 total |
+| *clean table* | drift that only appears after N cycles | every cycle re-samples its own baseline and re-checks against it |
+| *at rest* | every mid-operation hazard in §6 | the kill lands while a client is parked and a message is undrained |
+| *one shape* | a cascade correct for one subtree relation | the victim rotates through leaf, mid-node and root |
+
+### 9.2 What "under IO load" concretely means
+
+At the instant `driver_restart_node` is called, on every one of the 300
+kills:
+
+* a client TCB is parked in `STATE_WAITING` in the victim's endpoint
+  waiter slot — a blocked `recv`, so the kill interrupts an operation
+  rather than finding a quiescent driver;
+* a second victim endpoint carries an **undrained published message**
+  (`endpoint_write_pending` with a live `pending_hdr`) — a send that
+  arrived and was never consumed;
+* a third endpoint is live on a node *inside* the victim's subtree, and
+  a fourth on a node *outside* it, so under-reach and over-reach are
+  both observable.
+
+The parked client is a static TCB written into the row rather than a
+genuinely blocked task, because a real block needs a second thread of
+control that phase-1 does not have. That is a real limitation and it is
+recorded in §9.6.
+
+### 9.3 The invariants, and the defect each one exists to catch
+
+Every check has its own return code, so a failing boot log names the
+broken claim without a debugger.
+
+| Code | Invariant | Defect it catches |
+|---|---|---|
+| `ERR_RC` | the return code **predicted** from the pre-kill restart count | a budget that never escalates, or escalates early |
+| `ERR_INCARN` | incarnation +1 and `Init` on restart; latched, `Stopped` and **not** re-armed on escalation | escalation that re-arms anyway |
+| `ERR_CASCADE` | post-kill `in_use` matches the **pre-kill** subtree mask, in both directions | a missed descendant *and* a killed sibling — one equality, read from either end |
+| `ERR_CHANNEL` | an endpoint is dead iff its node is in that mask | a cascade that reaps too little or too much |
+| `ERR_WAKE` | waiter detached, TCB `RUNNABLE` | a client left hanging on a dead channel |
+| `ERR_STALE_BIND` | the dead endpoint will not attach at the new incarnation | §6.5 revival |
+| `ERR_ORPHAN` | table-wide: no live, undead binding names a departed slot | an endpoint outliving its driver anywhere, not just in the fixture |
+| `ERR_AUDIT` | gap and seal chains intact | a hole or a forged record |
+| `ERR_ROWS` | table-wide driver-row census back to baseline | a leaked row, or an unregister that hit an innocent slot |
+| `ERR_LEAK` | `live_count(KIND_HW_INTERRUPT)` back to baseline | a descriptor that vanished or appeared |
+| `ERR_MISMATCH` | `drv_audit_reconcile` agrees | a descriptor that changed **without a record** |
+| `ERR_WINDOWED` | reconciliation was *able* to answer | see §9.5 |
+
+`ERR_LEAK` and `ERR_MISMATCH` are both kept because neither subsumes the
+other. A silent free followed by a silent re-mint conserves the count
+that `ERR_LEAK` watches and fails the reconciliation that `ERR_MISMATCH`
+watches. This is not hypothetical — it is the third falsification run in
+§9.4.
+
+The `ERR_RC` prediction deserves its own note, because it is what turns
+the budget from a thing that happens into a thing that is *required* to
+happen. The expected return code is computed from the pre-kill restart
+count **before the call is made**: `count == DRV_RESTART_MAX_INTENSITY`
+predicts `ESCALATED`, anything less predicts `OK`. A budget that never
+escalates fails at the sixth kill; one that escalates early fails at the
+first. Accepting whatever came back would have tested nothing.
+
+After an escalation the harness **replaces** the driver — unregister,
+then register a fresh descriptor — and asserts the replacement starts
+with `perm_failed`, `restart_count` and `incarnation` all zero. That is
+the operator recovery path. Clearing the latch in place would be the
+harness forgiving a crash history the substrate deliberately refuses to
+forgive, and would make §5.2's terminality claim untestable.
+
+### 9.4 How we know the harness can fail
+
+A harness that cannot fail is an expensive `return 0`. Three defects
+were injected into the *mechanism* (not into the harness), one at a
+time, and each was caught at the predicted place and then reverted:
+
+| Injected defect | Predicted | Observed |
+|---|---|---|
+| `kill_descendants` scan bound 32 → 15, skipping one descendant | first role with a descendant | `role=1 cycle=0 phase=7` (`ERR_CASCADE`) |
+| `MAX_INTENSITY` 5 → 255, so escalation never fires | the 6th kill of the first role | `role=0 cycle=5 phase=5` (`ERR_RC`) |
+| `hw_int_cap_revoke`'s `drv_audit_emit` removed — a real free with no record | reconciliation only; the count still balances | `role=0 cycle=0 phase=15` (`ERR_MISMATCH`) |
+
+The first result is worth reading twice: with the cascade broken, role 0
+still passed all 100 of its cycles, because a leaf victim *has* no
+descendants and the broken code is never reached. The harness failed
+where the defect was and nowhere else.
+
+The third is the one that justifies carrying two accounting checks. The
+descriptor count returned to baseline — `ERR_LEAK` passed — and only the
+audit reconciliation noticed that a row had changed behind the stream's
+back.
+
+### 9.5 `WINDOWED` is a failure, never a pass
+
+`drv_audit_reconcile` has three outcomes and the third is a trap.
+`DRV_AUDIT_ERR_WINDOWED` means *"the retained ring no longer covers the
+interval you asked about, so I decline to answer."* Treating that as a
+pass would silently convert this entire harness into a no-op at exactly
+the moment churn was highest — which is to say, at exactly the moment it
+was doing its job.
+
+So `WINDOWED` is a hard failure with its own code, and the harness is
+structured so a correct implementation cannot produce it: the checkpoint
+interval is **one cycle**, one cycle emits on the order of ten records
+(one cap mint, one cap revoke, one `ChannelDead` per reaped endpoint,
+one `EV_RESTART` per cascaded descendant, one `EV_RESTART` or
+`EV_ESCALATE` for the node), and the ring retains 128. A `WINDOWED`
+result therefore cannot mean "the harness checkpointed too rarely"; it
+means something emitted an order of magnitude more records than this
+protocol accounts for, which is itself a finding worth a red build.
+
+### 9.6 Iteration counts, cost, and what is *not* proved
+
+**Counts.** 100 cycles × 3 victim positions = **300 kills, all in the
+default smoke matrix.** There is no reduced default and no opt-in mode:
+the full count is what runs. That was a measurement, not an aspiration —
+the harness costs ~0.7 × 10⁹ TSC cycles (well under a second) because it
+is pure table churn. Three deliberate choices keep it there: no MMIO, no
+serial output inside the loop, and **no DMA domain on the fixture
+drivers**, since attaching one would put `driver_lifecycle_teardown`'s
+klog audit line inside the inner loop and turn 300 restarts into 300
+serial writes.
+
+**What the harness does not prove.**
+
+* **Not a real concurrent client.** The parked waiter is a static TCB
+  written into the endpoint row, not a task genuinely blocked in
+  `sys_ipc_recv`. It exercises the wake path and the detach ordering; it
+  does not exercise a client that is *running* on another CPU while the
+  kill lands. That needs SMP, and SMP needs the per-row locking §8
+  defers.
+* **Not the DMA-domain teardown path.** The fixture deliberately
+  attaches no domain, so `driver_lifecycle_teardown`'s IOMMU unswitch
+  and `dma_cascade_revoke_by_parent` are covered by the R29.M5 and
+  R29.M7 mechanism witnesses, not by the 300-kill loop. Descriptor
+  accounting under churn is carried by `KIND_HW_INTERRUPT` mint/revoke
+  pairs instead.
+* **Not a fault-injected driver.** Every kill is a supervisor-initiated
+  `driver_restart_node`, not a driver that faulted at an arbitrary
+  instruction. The restart entry point is what is under test; the fault
+  path that *reaches* it is R30's.
+* **Not adversarial against the audit ring itself.** Seal and gap
+  tampering are covered by the R29.M6 witness (stages 13–16), which
+  corrupts retained records and requires the checks to trip. The chaos
+  harness only asserts those chains stay clean under churn.
+
+### 9.7 What was found
+
+Nothing. The harness passed on its first run against the #1044
+mechanism, and the three injected defects of §9.4 are the only evidence
+that it is capable of doing otherwise — which is why §9.4 exists.
