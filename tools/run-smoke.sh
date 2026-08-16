@@ -4,7 +4,7 @@
 # bytes.
 #
 # Usage: tools/run-smoke.sh [MODE | expected_marker | --fingerprint PATTERN]
-#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_child_process', 'boot_r17_shell_shutdown', 'boot_smp', 'boot_panic', 'boot_panic_halt', 'boot_exc3', 'prod' (mode dispatcher)
+#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_child_process', 'boot_r17_shell_shutdown', 'boot_smp', 'boot_r31_spawn_pair', 'boot_panic', 'boot_panic_halt', 'boot_exc3', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
 #     * boot_tick: validates boot_tick fingerprint (with timer TICKs), 5s timeout
@@ -821,6 +821,77 @@ case "${EXPECTED}" in
         # if the boot-time caller runs pre-mount for structural proof).
         echo "smoke: boot_r25_pdxfs_e2e — SKIP (witness not wired at R25.M7; live E2E deferred to R26+ per tools/pdxfs-lite-e2e-smoke.md — chained on #906 nvme_write_blocking + driver-attach)"
         exit 0
+        ;;
+    boot_r31_spawn_pair)
+        # R31.M2-1590 (#1590): loader-side multi-task boot spawn — the
+        # first time this kernel runs a userspace server as a distinct
+        # ring-3 process rather than synthesizing both halves of its RPC
+        # from ring 0.
+        #
+        # Kernel wire-in: src/kernel/boot/kernel_main.pdx, immediately
+        # after r29_chaos_witness_done and before sti. Claims endpoint
+        # rows 1 and 2 by id (endpoint_alloc_at), witnesses the losing
+        # and winning service-lookup orders, then spawns echo_client and
+        # echo_server through boot_spawn_user_task (task_new ->
+        # elf_lite_load with the owning task -> user_stack_alloc ->
+        # fresh-task trampoline -> runq_enqueue) and asserts both tasks'
+        # seeded capabilities carry their own (pid, generation) in the
+        # cap_owner column.
+        #
+        # Fingerprint contract (contains-in-order):
+        #   R31 SVC ORDER OK             lookup before register is -ENOENT;
+        #                                after register it resolves to the
+        #                                registered endpoint.
+        #   R31 BOOT SPAWN OK            both tasks created and enqueued.
+        #   R31 SPAWN OWNER OK           cap_owner[slot] == pack(pid, gen)
+        #                                for each spawned task's own cap.
+        #   R31 ECHO CLIENT RING3 OK     printed BY the client, in ring 3.
+        #   R31 ECHO SERVER RING3 OK     printed BY the server, in ring 3.
+        #   R31 ECHO PAIR OK             printed by the client after it
+        #                                verified the reply length and the
+        #                                server's FRAME_OP_REPLY_BIT flip —
+        #                                a round trip between two real
+        #                                processes, driven by the scheduler.
+        #   R31 SPAWN CAP SWEEP OK count=1
+        #                                the client died and the owner sweep
+        #                                MATCHED. The count is asserted, not
+        #                                just the marker: a sweep that
+        #                                matches zero is exactly the
+        #                                signature of capabilities seeded
+        #                                but never claimed, which is the bug
+        #                                #1590 closes, and a bare marker
+        #                                would accept it.
+        #
+        # Why count is 1 and not 2: echo_client's sidecar seeds slots 0 and
+        # 1, but R20b still runs ONE GLOBAL cap_table shared by all tasks,
+        # so the server — spawned second — re-mints slot 0, and
+        # cap_mint_write clears the owner column on every mint. The client
+        # therefore owns exactly slot 1 by the time it dies. That the pair
+        # still works is luck rather than design (both slot-0 entries name
+        # endpoint 1, and the server's rights are a superset of the
+        # client's); it is filed separately, not papered over here.
+        #
+        # Client spawn order is deliberate: the CLIENT is spawned first,
+        # i.e. the order in which a client can run to completion before its
+        # server has ever been scheduled. It works because the kernel claims
+        # both endpoint rows before either task exists, so the send lands in
+        # a live buffer and the recv blocks until the server drains it. A
+        # test that always spawns the server first proves nothing about the
+        # order that arrives the moment scheduling changes.
+        #
+        # Opt-in only (PAIDEIA_R31_SPAWN=1 in pre-push) until it has run
+        # 5/5 consecutive passes, matching the promotion discipline used
+        # for boot_r20b_echo and boot_r20b_rpc. The markers appear in
+        # EVERY boot log — the spawn is unconditionally wired — but only
+        # this mode asserts them.
+        #
+        # NOT SMP (the substrate is single-flow per
+        # design/ipc/userspace-server-substrate.md §14 Q3, and
+        # _iretq_frame_scratch is still one global).
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r31/expected-spawn-pair.txt"
+        TIMEOUT=12
+        EXPECTED=""
         ;;
     boot_panic)
         FINGERPRINT_MODE=1

@@ -182,6 +182,58 @@ records: a genuine CPU-raised ring-3 fault arriving at the handler from a
 real process. #1086 stays open on that basis, and not because anything
 above is in doubt.
 
+#### Update — R31.M2-1590 (#1590): the spawn path landed
+
+The sentence quoted above (*"the actual ring-3 spawn wires up post-R20b when
+multi-task boot orchestration lands"*) is no longer true. #1590 landed the
+loader-side multi-task boot spawn path
+(`src/kernel/core/loader/boot_spawn.pdx`; see
+`design/ipc/userspace-server-substrate.md` §4.5), and `boot_r31_spawn_pair`
+witnesses `echo_server` + `echo_client` running as two distinct ring-3
+processes with the scheduler alternating them.
+
+Three things that were previously synthetic are now real, and they are the
+three this section flagged:
+
+- a **genuine CPU-raised ring-3 fault from a real process** reaches
+  `fault_kill` (the run also surfaced that a ring-3 fault produces *two*
+  `driver_death_notify` calls, not one — `fault_kill` calls it directly and
+  then again via `sys_exit_body`; harmless for the idempotent driver row but
+  fatal to a naive reading of the sweep count, so the boot-spawn observer
+  latches per task);
+- a **real process death** drives `cap_owner_sweep_revoke` on a real owner
+  key, asserted non-zero on the wire as `R31 SPAWN CAP SWEEP OK count=1`;
+- the capabilities being swept were **seeded through the loader's own
+  sidecar path** rather than minted by a witness.
+
+It also closed a defect that would have made P2 unwitnessable even with a
+subject: `elf_lite_load` passed a hard-coded `task_ptr = 0` to the seed hook,
+so every loader-seeded capability carried `CAP_OWNER_NONE` — and a sweep
+against `CAP_OWNER_NONE` returns 0 before reading a slot. An
+`acpi_supervisor` seeded with `KIND_OP_REGION` windows would have died with
+those windows still live, and the sweep would have reported success.
+
+**#1086 is still open**, and the remaining distance is now specific rather
+than structural:
+
+1. `acpi_supervisor` is still not in `tools/userbin_embed.S`. Embedding it is
+   mechanical.
+2. `init_caps_validate`'s kind-accept set (`init_caps.pdx` L178-184) admits
+   kinds `0..15` plus `0x15`/`0x16`. `acpi_supervisor`'s sidecar declares
+   `0x20` (`KIND_ACPI`) and `pci_enumerator`'s declares `0x30`
+   (`KIND_PCI_DEV`). Either image, spawned today, fails
+   `INIT_CAPS_BAD_KIND` → `LOADER_SEED_FAILED` → `ELF_CAP_SEED_FAILED` and
+   the load aborts. This gate must widen before either can be spawned.
+3. The single global `cap_table` means two spawned images whose sidecars name
+   the same slot overwrite each other (§4.5.4 of the substrate doc). With one
+   supervisor this is invisible; with a supervisor *and* an enumerator it is
+   an authority swap.
+4. `ChannelDead` on surviving clients and auto-restart through the R29
+   lifecycle FSM remain unwitnessed against a real subject.
+
+Items 1–3 are prerequisites for killing the *right* process; item 4 is the
+deliverable itself.
+
 ### 3.5 P1, strengthened
 
 P1 was witnessed by R29 and is not re-witnessed here, but its *content*

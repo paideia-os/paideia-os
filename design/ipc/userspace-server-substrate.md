@@ -291,16 +291,8 @@ userspace tasks.
 
 **Deferred (out of scope for R20b.M6-003).**
 
-- **Real 2-task scheduler-driven roundtrip** — spawning both
-  `echo_server` and `echo_client` as real userspace tasks with their
-  `_init_caps` sidecars processed and letting the scheduler alternate
-  them requires: (1) loader-side path to spawn tasks other than init
-  at boot with their sidecars; (2) tmpfs seeding of both binaries;
-  (3) init modifications to fork+exec each and wait4 both. The
-  `src/user/echo_server.pdx` + `src/user/echo_client.pdx` source
-  files land at R20b.M6-003 as the target-shape for this deferred
-  witness, but their spawn wiring is a future round (R21+ once
-  multi-task boot orchestration lands).
+- ~~**Real 2-task scheduler-driven roundtrip**~~ — **LANDED at
+  R31.M2-1590 (#1590).** See §4.5 below.
 - **Reply-cap minting at recv** — kernel-mints a short-lived
   `R_IPC_WRITE` cap on `reply_endpoint_id` into the server's cap_table
   at `sys_ipc_recv` time, so `sys_ipc_reply` gates against a real cap.
@@ -308,6 +300,204 @@ userspace tasks.
 - **Cap-transfer in header** — client transfers a `R_IPC_WRITE` cap on
   its reply endpoint via the header (session-type-shaped). R21+ session
   types round.
+
+---
+
+## 4.5 Loader-side multi-task boot spawn (R31.M2-1590, #1590)
+
+**Status:** landed. Closes the §4.4 "Deferred / Real 2-task
+scheduler-driven roundtrip" item and the standing blocker behind #1086.
+
+### 4.5.1 What changed
+
+`src/kernel/core/loader/boot_spawn.pdx` — `boot_spawn_user_task(image_base,
+image_len) -> task_ptr | 0`. Creates a task from an embedded ELF, gives it
+its own address space, runs its `_init_caps` sidecar through the loader, and
+hands it to the scheduler. `kernel_main` calls it twice, immediately before
+`sti`, for `echo_client` and then `echo_server`.
+
+Of the three prerequisites §4.4 listed, only the first was actually needed:
+
+1. **loader-side path to spawn tasks other than init** — this is the work.
+2. ~~tmpfs seeding of both binaries~~ — not required. Both images are already
+   embedded in `.rodata.userbin` (`tools/userbin_embed.S`), which is where
+   `elf_lite_load` reads them from anyway; routing them through tmpfs would
+   have added a filesystem dependency to the boot path for no gain.
+3. ~~init modifications to fork+exec each and wait4 both~~ — **rejected, and
+   the rejection matters.** A boot service is not init's child. `sys_wait4`
+   matches on `parent_pid == current->pid`, so making these tasks init's
+   children puts a daemon into init's fork/wait sequence, and `wait4(-1)`
+   then reaps whichever child dies first. `echo_client` exits; `child_hello`
+   exits; the order between them is a scheduling accident. Spawning with
+   `parent = NULL` keeps the services entirely outside init's reap universe,
+   which is both the correct model for a system service and the only one with
+   a deterministic wire signature.
+
+### 4.5.2 Ring-3 entry for a task that has never run
+
+There is no `sched_spawn`. `enter_userland_initial` is a one-shot — it builds
+an iretq frame, flips CR3, and never returns — so it can launch the last task
+from `kernel_main` and no others. The only composable path is the fresh-task
+trampoline convention `sched_switch_r15` documents (switch.pdx §6.2), of which
+`sys_fork` was the sole instance:
+
+| Slab offset | Value |
+|---|---|
+| +1720 | `fork_user_rip` = ELF `e_entry` |
+| +1728 | `fork_user_rsp` = `user_stack_alloc` result |
+| +1736 | `fork_user_rflags` = `0x202` (IF=1) |
+| +40 | `regs_save.rip` = `&sched_switch_r15_continuation` |
+| +48 | `regs_save.rflags` = `0x2` (IF=**0**, required — see below) |
+| +2216 | landing RA = `&sys_fork_child_landing` |
+| +32 | `regs_save.rsp` = slab + 2216 |
+| +8 | `STATE_RUNNABLE`, written **before** `runq_enqueue` |
+
+`sys_fork_child_landing` is reused rather than duplicated. It reads only the
+four TCB fields above off `_current_tcb` and zeroes `rax`/`rdx` before
+`iretq`; nothing in it is fork-specific, and the two zeroed registers are as
+correct for an ELF entry point as they are for a forked child. One audited
+ring-3 entry path is better than two that must be kept in agreement.
+
+`regs_save.rflags = 0x2` is a requirement, not a default: the continuation's
+`popfq` and the landing pad's `cli` are one instruction apart, and an
+interrupt in that window would push a 5-slot iretq frame onto the 24-byte
+in-slab landing stack.
+
+### 4.5.3 Seeding must claim — the interaction this issue is really about
+
+`elf_lite_load` grew a fourth argument, `owner_task`. It had passed a
+hard-coded `0` to `loader_seed_caps_from_symtab` since M6-001, on the
+argument that the pointer was meaningless until per-task CSpaces landed.
+That argument was about *where* a descriptor lives; the `cap_owner` column
+(#1587) is about *whose* it is, and the two are independent.
+
+With the constant `0`, `loader_seed_caps` took its `task_ptr == 0 → stamp
+nothing` branch on every real image load. Every loader-seeded capability was
+`CAP_OWNER_NONE`, and `cap_owner_sweep_revoke` returns 0 *before reading a
+single slot* when the packed key is 0. The system would have reported a clean
+teardown over a live leak, and it would have done so most severely for the
+processes that matter most — an ACPI supervisor holding `KIND_OP_REGION`
+windows with reach into the embedded controller.
+
+Witnessed on both sides:
+- **at spawn** — `R31 SPAWN OWNER OK` asserts `cap_owner[slot] ==
+  cap_owner_pack(pid, pid_gen_read(pid))` for each spawned task, computed
+  from the same primitives rather than a literal;
+- **at death** — `R31 SPAWN CAP SWEEP OK count=1` asserts the sweep *matched*.
+  The count is in the golden, not just the marker: a sweep matching zero is
+  precisely the leak signature, and a bare marker would accept it.
+
+### 4.5.4 Known limitation: sidecar slot collision
+
+R20b still runs **one global `cap_table`** shared by all tasks. Two spawned
+images whose sidecars name the same slot number overwrite each other:
+`echo_client` seeds slots 0 and 1, then `echo_server` — spawned second —
+re-mints slot 0, and `cap_mint_write` clears the owner column on every mint.
+The client therefore owns exactly one slot by the time it dies, which is why
+the asserted sweep count is 1 and not 2.
+
+That the pair still *works* is luck, not design: both slot-0 entries name
+endpoint 1, and the server's `R_IPC_ALL` is a superset of the client's
+`WRITE|INVOKE`. Two servers with genuinely different slot-0 capabilities
+would silently steal each other's authority. This is the strongest argument
+yet for per-task CSpaces (`design/capabilities/per-task-cspace.md`) and is
+filed separately rather than papered over.
+
+### 4.5.5 Ordering
+
+Two distinct ordering questions, only one of which is a real hazard here.
+
+**Name resolution** is a real hazard and is witnessed in both directions:
+`svc_lookup_row` on an unregistered name returns 0 (the predicate that drives
+`sys_svc_lookup`'s `-ENOENT`), and after `svc_register` it resolves to the
+registered endpoint. Witnessed losing-order-first, because a test that always
+registers first proves nothing.
+
+**Spawn order** is *not* a hazard for this pair, and the reason is structural
+rather than lucky: the kernel claims both endpoint rows by id
+(`endpoint_alloc_at`, new in #1590) before either task exists. A client that
+runs to completion before its server has ever been scheduled still succeeds —
+its send lands in a live endpoint buffer and its recv blocks until the server
+drains it. The pair is therefore spawned **client-first**, which is the harder
+order, so the shipped configuration is not the one that happens to work.
+
+`endpoint_alloc_at` exists because a well-known service endpoint is named by
+number in the image at build time. Depending on `endpoint_alloc`'s free-list
+cursor to land on 1 and 2 would couple the spawn path to every preceding
+witness's alloc/free arithmetic.
+
+### 4.5.6 Frame budget
+
+`phys_alloc` backs a fixed 1024-page (4 MiB) pool with no reclaim and no
+growth. A spawned task costs ~1 PML4 root + `ceil(p_memsz/4096)` per PT_LOAD
++ up to 3 intermediate table levels per fresh 2 MiB region + 4 stack pages —
+about a dozen frames for a small server.
+
+`boot_spawn_user_task` **refuses rather than overlapping**:
+`BOOT_SPAWN_MIN_FREE_FRAMES` (64) is checked against
+`phys_alloc_free_count()` *before* `task_new`, and any failure after
+`task_new` runs `task_free` (aspace teardown + slab zero + `pid_free`). A
+spawn that cannot complete never starts, and a failed spawn consumes no pid —
+which matters, because a leaked pid shifts every subsequent `task_new` and is
+diagnosed as an unrelated regression downstream.
+
+### 4.5.7 Two loader bugs this exposed
+
+Neither was introduced by #1590; both had been latent because nothing had
+ever loaded an image that triggered them.
+
+1. **The ELF loader had never mapped a multi-page segment.**
+   `elf_lite_load`'s per-page loop hoisted `p_memsz` into `r8` above the
+   loop, and the copy step inside the body reloads `r8` with `p_filesz`. From
+   the second iteration the loop bound compared the page offset against
+   `p_filesz`. Every image in the tree has both segments under 4 KiB, so the
+   loop always exited after page 0 having already covered the segment.
+   `echo_client`'s 3-page RW segment (8 bytes of `.data` + 8 KiB of `.bss`)
+   was the first to span more, and it faulted in ring 3 on its first `.bss`
+   write while `elf_lite_load` returned `ELF_OK`. Fixed by reloading the
+   bound from its spill slot each iteration.
+
+2. **The segment size gate was not a bound.** It was
+   `cmp p_memsz, image_len ; jg bad_size`, comparing a memory size against a
+   *file* size with a signed comparison on attacker-supplied `u64`s — and
+   `.bss` is exactly the case where `p_memsz` legitimately exceeds the whole
+   image. Meanwhile the gate that was actually needed did not exist: nothing
+   checked that a segment's file-backed bytes lay inside the image before the
+   copy loop read them. Replaced with three real bounds — `p_offset` and
+   `p_filesz` inside the image (written as a subtraction so a crafted header
+   cannot wrap), `p_filesz <= p_memsz`, and `p_memsz <= ELF_MAX_SEG_BYTES`
+   (1 MiB = 256 frames, so one malformed program header cannot drain a
+   1024-frame pool).
+
+A third, in the userspace linker scripts: `echo_client.ld` placed `.data` at
+`0x600000` and `.bss` at `0x700000` inside a single PT_LOAD, yielding
+`p_memsz = 0x102000` — a 1 MiB program header describing ~4 KiB of real
+content. Inert for the other seven scripts only because none of them has a
+non-empty `.data`. Fixed for `echo_client` by letting `.bss` follow `.data`;
+the same hazard remains latent in the others and is filed rather than fixed
+here.
+
+### 4.5.8 What this does not do
+
+No restart policy, no supervision tree, no dynamic spawn syscall. The service
+registry records `(pid, generation)` per spawned task for exactly one purpose:
+so the death path can distinguish "a service died" from "some task died".
+`(pid, generation)` and not `pid`, for the same reason #1583 keys the driver
+row that way — a bare pid matches a recycled incarnation.
+
+Restart — #1086's actual deliverable — is **not** landed. See §4.5.9.
+
+### 4.5.9 What #1086 still needs
+
+#1590 gives #1086 the thing it was missing: a real process to kill. It does
+not give it the rest. Still outstanding:
+
+- kill `acpi_supervisor` (not `echo_server`) mid-evaluation — which first
+  requires embedding it in `userbin_embed.S` and widening
+  `init_caps_validate`'s kind-accept set to include `0x20` (`KIND_ACPI`) and
+  `0x30` (`KIND_PCI_DEV`), neither of which it currently admits;
+- assert surviving clients observe `ChannelDead` on their bound endpoints;
+- auto-restart at a fresh incarnation through the R29 driver-lifecycle FSM.
 
 ---
 
