@@ -236,50 +236,85 @@ one-shot `_ring3_witness_active` escape is already spent by `boot_r15_ring3`.
 
 ---
 
-## 6. What death does NOT revoke, and why
+## 6. The two axes death travels along
 
-`driver_death_notify` revokes exactly what the driver row **names**:
+**Updated by R31.M1-1587 (#1587).** This section previously read *"What
+death does NOT revoke, and why"*, and its answer was: the five ACPI kinds
+are not revoked, **not because the cascades are missing — they all exist —
+but because there is no relation to walk.** That relation now exists.
+`design/capabilities/ownership-and-lineage.md` is the write-up; this is the
+part of it that belongs to death.
 
-- the DMA domain at `[+32]`, through `driver_lifecycle_teardown`;
-- every endpoint bound to the slot, through
-  `driver_restart_reap_endpoints` — the ChannelDead cascade.
+`driver_death_notify` now runs **two** revocations, and keeping them
+distinct is the point of this section.
 
-It does **not** revoke the dead process's `KIND_OP_REGION` (`0x150`),
+### 6.1 Ownership — step 1.5, for every dying process
+
+`cap_owner_sweep_revoke(pid, gen)` revokes every capability whose **owner
+column** names the dying incarnation: its `KIND_OP_REGION` (`0x150`),
 `KIND_I2C_BUS` (`0x152`), `KIND_I2C_SLAVE` (`0x153`), `KIND_GPIO_LINE`
-(`0x154`) or `KIND_FW_SESSION` (`0x155`) capabilities.
+(`0x154`) and `KIND_FW_SESSION` (`0x155`) capabilities, and anything else
+it held.
 
-**Not because the cascades are missing — they all exist — but because there
-is no relation to walk.**
+It runs **before** the driver-row lookup and **unconditionally**, because it
+applies to every dying process and not only to registered drivers. A crashed
+ACPI bubble holds all five of those without necessarily occupying a driver
+row, and a sweep gated on `driver_death_find_slot` succeeding would miss
+exactly the process #1086 P2 is about.
 
-- `cap_table` descriptors carry `(kind, rights, target_ptr)`. The struct
-  declares `generation` and `flags`; nothing writes them. There is **no
-  owner field**, and `cap_mint_write` takes no owner argument.
-- There is one global `cap_table` and no per-task CSpaces.
-  `loader/seed_caps.pdx:270` says so outright.
-- Every cascade in the kernel keys on a **parent** identity — a cap slot
-  (`opregion_cascade_revoke_by_parent`), a bus row
-  (`i2c_slave_cascade_revoke_by_bus_row`), a controller id
-  (`gpio_line_cascade_revoke_by_controller`) — never on a holder.
-- The `driver_hint` fields on `kind_i2c_slave` and `kind_gpio_line` are
-  stored at mint and read by nothing. They are reserved for the R31 binder.
+The owner is the pair `(pid, generation)`, reusing `_pid_gen[64]` — the
+counter §"A pid is not an identity" above already argues for. A bare pid
+would revoke a **live** process's capabilities the moment its pid recycled.
 
-So **"the capabilities held by process P" is not a representable query
-today.** #1583's scope item 3 — a composed witness of one bubble death
-revoking all five kinds — assumed it was. Writing that witness would have
-required inventing the ownership relation in the same change that wires the
-trigger, and inventing it badly (a side table that can drift from the rows
-it describes is exactly what `design/drivers/cascade-restart.md` §2 argues
-against for the supervision link).
+### 6.2 Lineage — steps 2–5, unchanged
 
-**That is filed as #1587.** It is a different gap from the one
-#1583 names: #1583's title and evidence are entirely about the missing
-*trigger*, and the trigger is now real, fires on both routes, and is
-witnessed. The ownership relation is a capability-layer design with its own
-argument to make about where the relation lives — most plausibly by giving
-the driver row a manifest of the **root** capabilities the driver was seeded
-with, since all five kinds cascade from a root, and by populating
-`driver_hint` with the driver slot for the two kinds that already reserve
-the field.
+The driver row's teardown revokes what the **row** names: the DMA domain at
+`[+32]` through `driver_lifecycle_teardown`, and every endpoint bound to the
+slot through `driver_restart_reap_endpoints` — the ChannelDead cascade.
+Every cascade beneath it keys on a **parent** identity:
+`opregion_cascade_revoke_by_parent` on a cap slot,
+`i2c_slave_cascade_revoke_by_bus_row` on a row id,
+`gpio_line_cascade_revoke_by_controller` on a bdf key.
+
+### 6.3 Why neither may stand in for the other
+
+A capability can be **derived from** a parent owned by X while being **held
+by** Y. X dying must cascade to it; Y dying must revoke it. The two sweeps
+answer different questions and their failure modes are not symmetric:
+lineage standing in for ownership *under*-revokes (the leak #1587 named);
+ownership standing in for lineage *over*-revokes in one direction and
+under-revokes in the other.
+
+They compose **exactly once**, inside `cap_revoke_slot`, which dispatches
+each owned slot to that kind's own audited revoke — so the owner sweep runs
+the lineage cascade beneath every slot it finds, and the audit ring gets the
+same one-record-per-capability trail a lineage teardown would leave.
+
+`tests/kernel/cap/owner_sweep_synth.pdx` (`R31 OWNER SWEEP OK`) witnesses
+the composition by making the two numbers **differ**: six slots carry the
+dying pid's key and the sweep answers six, while nine descriptors are
+cleared — the extra three being an OpRegion child and grandchild and a
+second I²C slave, none of which any process owned.
+
+### 6.4 What death still does not do
+
+It does not defend a **stale handle**. A handle whose slot was revoked and
+re-minted resolves to the new capability; the only guard is the `kind` check
+every gate performs, which catches a re-mint to a different kind and not to
+the same one. That is a handle-layout question
+(`design/capabilities/handle-layout.md`), not a revocation one, and it is
+recorded in `cap/revoke.pdx` §Stale handles rather than implied by a
+`generation` field that #1589 removed for having no storage.
+
+It does not reclaim every **tail-table row**. A row whose descriptor was
+cleared by some other path is a *ghost*, and each kind's phase-2 row scan —
+not the owner sweep — is what reclaims it. For I²C the sweep reaches one
+transitively, because revoking an owned bus runs the slave cascade whose
+phase 2 frees ghost rows. For GPIO it does not: a line row is swept by
+`gpio_line_cascade_revoke_by_controller`, and a process dying is not a
+controller going away. Sub-test O of the witness asserts that survival
+explicitly rather than not looking, because "the sweep reclaims every row"
+is false and a silent witness would be read as having established it.
 
 ---
 
@@ -290,7 +325,7 @@ the field.
 | # | Property | Before | After |
 |---|---|---|---|
 | P1 | The kernel survives a ring-3 fault | witnessed (R29) | **strengthened** — it now survives by *killing the task*, not by halting |
-| P2 | The dead bubble's capabilities are revoked | blocked, no trigger | **the trigger lands**; the DMA domain and every channel are revoked, the five ACPI kinds are not (§6) |
+| P2 | The dead bubble's capabilities are revoked | blocked, no trigger | **the trigger lands (#1583) and the sweep lands (#1587)**; the DMA domain, every channel and all five ACPI kinds are revoked by one death (§6) |
 | P3 | The Global Lock is not stranded | `aml_glk_abandon` landed | unchanged; residual below |
 
 ### P3's residual is not closed

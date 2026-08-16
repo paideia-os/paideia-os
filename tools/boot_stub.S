@@ -2422,6 +2422,51 @@ death_witness_ok_msg: .ascii "R31 DEATH CASCADE OK\n\0"
 .align 8
 death_witness_fail_msg: .ascii "R31 DEATH CASCADE FAIL\n\0"
 
+#   R31 OWNER SWEEP OK — emitted by
+#       tests/kernel/cap/owner_sweep_synth.pdx §owner_sweep_witness,
+#       R31.M1-1587 (#1587) + R31.M1-1589 (#1589). It stands for the
+#       relation #1583's witness could not walk: capabilities now carry
+#       an OWNER, so "revoke everything the dead process held" is a
+#       representable query and one death revokes all five R30 derived
+#       kinds together.
+#         * OWNERSHIP AND LINEAGE ARE DIFFERENT AXES. Every cascade the
+#           kernel has keys on a PARENT identity -- a cap slot, a bus
+#           row, a controller bdf. The owner sweep keys on the HOLDER. A
+#           capability can be derived from a parent owned by X while
+#           being held by Y, so neither subsumes the other. They compose
+#           exactly once, in cap_revoke_slot, which dispatches each owned
+#           slot to that kind's own audited revoke -- so the owner sweep
+#           runs the lineage cascade beneath every slot it finds.
+#         * OP_REGION IS TRANSITIVE AND STAYS A FIXED POINT. A window
+#           derived from a window must not outlive its parent, and the
+#           cascade reaches grandchildren by iterating a full scan until
+#           a pass revokes nothing -- never by recursion, which would put
+#           an unbounded-depth call chain on a teardown path.
+#         * THE GHOST ROW IS SWEPT FOR EVERY KIND. A row left allocated
+#           with no descriptor naming it holds the uniqueness key its
+#           allocator enforces -- an I2C address that can no longer be
+#           minted, or a PIN that may be the only way to bring a device
+#           out of reset. Each kind's phase-2 row scan is asserted, in
+#           the shape of gpio_cap_synth.pdx sub-test L.
+#         * THE SENTINELS ARE UNSWEEPABLE. CAP_OWNER_NONE (unowned) and
+#           CAP_OWNER_KERNEL (the kernel's own) are DIFFERENT VALUES, and
+#           a sweep can reach neither: a valid key is never zero, and the
+#           kernel sentinel's pid field is 0xFFFF, which the sweep
+#           refuses before it scans anything. If the two were one value,
+#           a dying process would collect the kernel's capabilities.
+#         * A RECYCLED PID REVOKES NOTHING. The owner is the pair
+#           (pid, generation), reusing the _pid_gen counter #1583 built,
+#           because pid_alloc hands a reaped pid to the very next
+#           task_new -- and destroying a live process's authority is
+#           worse than the leak being fixed.
+.global owner_sweep_ok_msg
+.align 8
+owner_sweep_ok_msg: .ascii "R31 OWNER SWEEP OK\n\0"
+
+.global owner_sweep_fail_msg
+.align 8
+owner_sweep_fail_msg: .ascii "R31 OWNER SWEEP FAIL\n\0"
+
 #   R30 GPIO PAD OK   — emitted by
 #       tests/kernel/drivers/gpio/gpio_pad_synth.pdx §gpio_pad_witness,
 #       R30.M6-003 (#1077) + R30.M6-004 (#1078). It stands for the first

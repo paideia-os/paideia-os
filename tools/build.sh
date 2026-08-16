@@ -80,6 +80,25 @@ echo "[fingerprint-coverage] tools/verify-fingerprint-coverage.sh"
     exit 1
 }
 
+# R31.M1 / #1589: the capability descriptor stride is 24 bytes, and the
+# struct that documents it must not describe a layout nothing implements.
+# `generation` was declared with no storage, and at stride 24 its offset
+# (+24) is the NEXT DESCRIPTOR'S kind — so a contributor following the
+# struct, which is the natural thing to do since the struct is the
+# documentation, would have silently retyped an unrelated capability.
+# Because kind is the first thing every gate checks, the symptom would
+# have appeared arbitrarily far from the write.
+#
+# Source-level, so it runs beside the other two pre-assembler gates: a
+# stride divergence must fail at the point it is introduced, not after
+# 136 sites have been assembled against two different beliefs about how
+# wide a descriptor is.
+echo "[cap-stride] tools/verify-cap-stride.sh"
+"${REPO_ROOT}/tools/verify-cap-stride.sh" || {
+    echo "[FAIL] capability descriptor stride divergence (#1589 gate)" >&2
+    exit 1
+}
+
 echo "[build-user] ensuring build/user/shell.bin (R15-M1-007 embed prerequisite)"
 "${REPO_ROOT}/tools/build-user.sh"
 

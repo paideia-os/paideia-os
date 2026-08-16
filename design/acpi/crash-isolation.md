@@ -114,45 +114,73 @@ The corresponding test (`tests/kernel/cap/gpio_cap_synth.pdx` sub-test L)
 its descriptor by hand — and asserts phase 2 collects it. That is the
 standard any P2 witness should meet.
 
-### 3.4 P2 after #1583 — the trigger landed, the sweep did not
+### 3.4 P2 after #1583 and #1587 — the trigger landed, then the sweep did
 
 The gap this section named — "the revocation mechanism is complete, nothing
-triggers it on process death" — **is closed**. `design/drivers/process-death.md`
-is the write-up; in summary:
+triggers it on process death" — was closed by #1583. The *second* gap it then
+named — "there is no relation from a dead process to the capabilities it
+held" — is closed by #1587. Both halves of P2's revocation are now
+mechanised and witnessed.
 
-- `sys_exit_body` step 2.6 and `fault_ring3_death_check` (reached from
-  vectors 0, 6, 13 and 14) both call `driver_death_notify`, which resolves
-  the dying task to the driver row it owned and runs `driver_restart_node`.
-- The correlation key is the pair **(pid, generation)**, not the pid.
-  `pid_alloc` hands a reaped pid to the very next `task_new`, so a pid alone
-  would eventually revoke a **live** process's capabilities — worse than the
-  leak being closed. Two independent defences: the binding is invalidated
-  the moment it stops being true, and a per-pid incarnation counter refuses
-  a stale one that slips through.
-- Witnessed by `R31 DEATH CASCADE OK`, including the ring-0 refusal, the
-  recycled-pid refusal, and double-revocation.
+**The trigger (#1583).** `sys_exit_body` step 2.6 and
+`fault_ring3_death_check` (reached from vectors 0, 6, 13 and 14) both call
+`driver_death_notify`. The correlation key is the pair **(pid, generation)**,
+not the pid: `pid_alloc` hands a reaped pid to the very next `task_new`, so a
+pid alone would eventually revoke a **live** process's capabilities — worse
+than the leak being closed. Witnessed by `R31 DEATH CASCADE OK`.
 
-**What still does not happen is the five-kind sweep this section's §3.2
-tabulates**, and the reason is not the trigger:
+**The sweep (#1587).** `cap_table` now carries an **owner column**, so *"the
+capabilities held by process P"* is a representable query.
+`driver_death_notify` runs `cap_owner_sweep_revoke(pid, gen)` at step 1.5 —
+before the driver-row lookup and unconditionally, because a crashed bubble
+holds OpRegion windows and I²C claims without necessarily occupying a driver
+row. Each owned slot is dispatched to its kind's own **audited** revoke, so
+the **lineage** cascade runs beneath the **owner** sweep. Witnessed by
+`R31 OWNER SWEEP OK` (`tests/kernel/cap/owner_sweep_synth.pdx`).
 
-> `cap_table` descriptors carry `(kind, rights, target_ptr)` and **no
-> owner**. There is one global `cap_table` and no per-task CSpaces. Every
-> cascade in the kernel keys on a *parent* identity — a cap slot, a bus
-> row, a controller id — never on a holder. **"The capabilities held by
-> process P" is not a representable query today.**
+The composed witness §3.3 calls for now exists. It asserts, in one
+`driver_death_notify` call:
 
-So the composed witness §3.3 calls for cannot be written honestly yet, for
-a *different* reason than the one this section originally gave. It is no
-longer "there is no path into the mechanism"; it is "there is no relation
-from a dead process to the capabilities it held". That is a
-capability-layer design with its own argument to make, and it is filed as
-**#1587** rather than improvised here. See
-`design/drivers/process-death.md` §6 for the shape it most plausibly takes.
+- all five kinds — `KIND_OP_REGION` (`0x150`), `KIND_I2C_BUS` (`0x152`),
+  `KIND_I2C_SLAVE` (`0x153`), `KIND_GPIO_LINE` (`0x154`), `KIND_FW_SESSION`
+  (`0x155`) — revoked together;
+- **OpRegion transitivity preserved as a fixed point**, not recursion: a
+  grandchild window derived two levels below an owned root is revoked, and
+  the walk is an iterated full re-scan rather than a call chain whose depth a
+  hostile derivation could choose;
+- a **ghost-row sweep** followed to its reclaimer for two kinds, in the shape
+  of `gpio_line_cascade_revoke_by_controller` phase 2 and
+  `gpio_cap_synth.pdx` sub-test L — including the GPIO one the owner sweep
+  does **not** reclaim, asserted as surviving rather than not looked at;
+- the two sentinels — unowned and kernel-held — untouched and, critically,
+  **distinct**, so a dying process cannot collect the kernel's own
+  capabilities;
+- a recycled pid at a dead generation matching nothing.
 
-What death **does** revoke today is exactly what the driver row names: the
-DMA domain at `[+32]`, and every endpoint bound to the slot — which is the
-ChannelDead half of P2, and is asserted client-side (the parked client is
-woken, not merely disconnected).
+**ChannelDead** remains the driver row's half, unchanged and already
+asserted client-side by `R31 DEATH CASCADE OK` sub-test H: the parked client
+is woken, not merely disconnected.
+
+#### What P2 still cannot witness end to end
+
+**There is no `acpi_supervisor` process to kill.** The binary is built
+(`build/user/acpi_supervisor.elf`) and its RPC surface is witnessed
+kernel-side under the "Option B" posture recorded at
+`kernel_main.pdx:20428`, but it is not in `tools/userbin_embed.S` and no
+boot path spawns it: *"the actual ring-3 spawn wires up post-R20b when
+multi-task boot orchestration lands"*. Both witnesses therefore drive
+**synthetic** deaths — `death_witness.pdx` through a fabricated ring-3 trap
+frame, `owner_sweep_synth.pdx` through a pid with an incarnation and no
+task.
+
+So what remains for #1086's deliverable — *"kill acpi_supervisor mid-eval;
+assert clients see ChannelDead; auto-restart"* — is the **subject**, not the
+mechanism. Every step of the mechanism is now witnessed on a synthetic
+subject; none of it has been run against a real AML evaluation in flight.
+The residual gap is the same one `design/drivers/process-death.md` §7
+records: a genuine CPU-raised ring-3 fault arriving at the handler from a
+real process. #1086 stays open on that basis, and not because anything
+above is in doubt.
 
 ### 3.5 P1, strengthened
 
