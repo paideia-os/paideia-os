@@ -16,6 +16,15 @@
 **Witness.** `kernel_main.pdx §r29_cascade_restart_witness` — fingerprint
 `R29 CASCADE RESTART OK`.
 
+**Superseded on one point.** This document describes the mechanism. Until
+#1583 **nothing triggered it on process death**: `driver_restart_node` had
+five call sites and all five were synthetic. `design/drivers/process-death.md`
+is the trigger — `sys_exit_body` step 2.6 and `fault_ring3_death_check`
+resolve a dying task to its driver row through a (pid, generation) key and
+call `driver_restart_node`. Read that document alongside §4 here; the
+restart budget and the escalation latch described below are now reachable
+from a real crash loop rather than only from the chaos harness.
+
 ---
 
 ## 1. The claim this document defends

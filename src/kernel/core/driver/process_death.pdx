@@ -1,0 +1,360 @@
+// src/kernel/core/driver/process_death.pdx — R31.M0-1583 (#1583)
+//
+// The trigger. R29 built a complete cascade-restart and capability-
+// revocation mechanism (restart.pdx, lifecycle.pdx, #1044/#1047/#1048) and
+// nothing called it when a process died. This module is the correlation
+// step that was missing: a pid goes in, and if that pid owned a driver row,
+// the row's authority is torn down and the node is restarted.
+//
+// Design context
+// --------------
+// design/drivers/process-death.md is the full write-up. The three claims
+// that shape this file:
+//
+// 1. This is leaked AUTHORITY, not leaked memory. A capability slot that
+//    outlives its owner is inherited by whatever process next occupies it.
+//    Leaked memory is recovered by reboot; leaked authority is exercised
+//    first.
+//
+// 2. The fault path matters more than sys_exit. A process that calls exit
+//    has usually finished its work and is the case LEAST likely to be
+//    holding anything dangerous. The process that faults mid-transaction is
+//    the one holding an OpRegion window or an I2C claim. Both call in here;
+//    int/fault_kill.pdx is the arm that matters.
+//
+// 3. A pid is not an identity. pid_alloc is a dense-low-first scan and
+//    pid_free zeroes the slot, so a reaped pid is handed to the very next
+//    task_new. Correlating on the number alone would eventually revoke a
+//    LIVE process's capabilities — worse than the leak being fixed. The key
+//    is the pair (pid, generation); see §Two lines of defence below.
+//
+// Two lines of defence against pid reuse
+// --------------------------------------
+// FIRST, the binding is invalidated the moment it stops being true. It is
+// dropped here before any teardown runs, dropped by
+// driver_table_rearm_incarnation whenever a node is re-armed, and dropped by
+// driver_table_unregister with the rest of the row. So a stale binding — a
+// row naming a pid whose task is gone — is already a bug in the first line
+// before the generation is ever consulted.
+//
+// SECOND, the row carries the low 16 bits of the owning task's incarnation
+// counter, and the scan requires it to equal the generation currently
+// occupying that pid slot. A stale binding that survives the first line is
+// refused rather than acted on.
+//
+// Two independent mechanisms, because the failure they guard against is not
+// symmetric with the failure they replace. Missing a revocation leaks
+// authority the dead process held; performing the wrong one destroys
+// authority a live process is using. The second is worse, so it gets the
+// belt as well as the braces.
+//
+// Order of operations, and why
+// ----------------------------
+// driver_death_notify resolves the row, UNBINDS IT, and only then calls
+// driver_restart_node. The unbind-first ordering is the whole of the
+// idempotence argument: death, an explicit teardown and a supervisor sweep
+// can all reach the same row, and the second arrival must resolve nothing
+// and do nothing. If the unbind came last, a second call arriving while the
+// first was mid-teardown would charge a second restart against the budget
+// and drive the FSM through a life that no longer exists — which, five
+// times over, latches perm_failed on a node whose only crime was dying once.
+//
+// What this module does NOT do
+// -----------------------------
+// It revokes exactly what the driver row NAMES: the DMA domain at [+32]
+// (through driver_lifecycle_teardown) and every endpoint bound to the slot
+// (through driver_restart_reap_endpoints). It does not revoke the dead
+// process's KIND_OP_REGION / KIND_I2C_* / KIND_GPIO_LINE / KIND_FW_SESSION
+// capabilities, because no such relation exists to walk: cap_table
+// descriptors carry (kind, rights, target_ptr) and no owner, and every
+// cascade in the kernel keys on a PARENT identity — a cap slot, a bus row,
+// a controller id — never on a holder. "The capabilities held by process P"
+// is not a representable query today. That gap is filed separately; see
+// design/drivers/process-death.md §6.
+
+module ProcessDeath = structure {
+
+  // ============================================================================
+  // Return codes
+  //
+  // Continue restart.pdx's DRV_RESTART_* block downward so a mixed error
+  // trace still names its origin, and stay disjoint from it: a caller
+  // holding a u64 from this module must never be able to mistake it for a
+  // restart outcome.
+  // ============================================================================
+
+  pub let DRV_DEATH_OK          : u64 = 0
+
+  // NOT AN ERROR. The overwhelmingly common answer: the task that died was
+  // not a driver. Distinct from OK because a caller that wants to log
+  // "a driver died" must not log it for every shell command that exits.
+  pub let DRV_DEATH_NO_SLOT     : u64 = 0xFFFFFFC1
+
+  // The pid resolved to a row, but the restart machinery refused. The
+  // underlying DRV_RESTART_* code is returned verbatim instead of this in
+  // every real case — this exists so the constant block is complete and so
+  // a future caller that collapses failures has a name to collapse to.
+  pub let DRV_DEATH_ERR_RESTART : u64 = 0xFFFFFFC2
+
+  // driver_death_bind refusals.
+  pub let DRV_DEATH_BIND_OK     : u64 = 0
+  pub let DRV_DEATH_BIND_NO_TASK: u64 = 0xFFFFFFC3   // pid hosts no live task
+  pub let DRV_DEATH_BIND_REFUSED: u64 = 0xFFFFFFC4   // storage layer refused
+
+  // driver_death_find_slot's "no row owns this task".
+  pub let DRV_DEATH_SLOT_NONE   : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ============================================================================
+  // driver_death_bind(slot, pid) -> u64
+  //
+  // The audited way to install a correlation key: read the pid's CURRENT
+  // incarnation out of the scheduler and hand it to the storage layer.
+  //
+  // Refuses a pid with no live incarnation (generation 0), which is what
+  // "pid_gen_read answers zero" means for both a never-allocated pid and an
+  // out-of-range one. Binding a row to a pid that hosts nothing would
+  // install a key that the next occupant of that pid slot would match — the
+  // wrong-process revocation this whole design exists to prevent, created
+  // at bind time instead of at death time.
+  //
+  // The supervisor calls this when it spawns a driver process. There is no
+  // in-kernel supervisor yet, so today the callers are the boot witness and
+  // the tests; that is a gap in WHO binds, not in whether death fires.
+  // ============================================================================
+
+  pub let driver_death_bind : (u64, u64) -> u64 !{mem} @{} =
+    fn (slot: u64) (pid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R31.M0-1583 (#1583): install the (pid, generation) correlation key on a driver row, reading the generation from the scheduler rather than from the caller. Three pushes (rbx/r12/r13) keep rsp %16 == 0 across the two nested calls; rbx = slot, r12 = pid. Sequence: (1) pid_gen_read(pid) -> generation; zero means the pid hosts no live task (never allocated, already reaped, or out of range — pid_gen_read collapses all three deliberately) and is refused with BIND_NO_TASK rather than bound, because a key naming a pid that hosts nothing is a key the NEXT occupant of that pid slot will match, which manufactures the wrong-process revocation at bind time instead of at death time. (2) driver_table_bind_pid(slot, pid, gen); any non-zero storage-layer refusal (BAD_SLOT / BAD_PID / BAD_GEN) collapses to BIND_REFUSED, because from a supervisor's position they all mean the same thing — this row cannot be correlated — and the specific code has already been decided by gates the supervisor does not control. Deliberately NOT the same function as driver_table_bind_pid: keeping the generation lookup out of the storage layer preserves driver_table.pdx's zero-dependency posture, and is also what lets the witness manufacture a stale key by calling the storage primitive directly with a dead generation.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;                            // 3 pushes -> rsp %16 = 0
+
+        mov rbx, rdi;                        // slot
+        mov r12, rsi;                        // pid
+
+        // (1) the pid must host a live incarnation.
+        mov rdi, r12;
+        call pid_gen_read;
+        cmp rax, 0;
+        je  drv_death_bind_no_task;
+        mov r13, rax;                        // generation
+
+        // (2) install the key.
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        call driver_table_bind_pid;
+        cmp rax, 0;
+        jne drv_death_bind_refused;
+
+        xor rax, rax;                        // DRV_DEATH_BIND_OK
+        jmp drv_death_bind_epilogue;
+
+      drv_death_bind_no_task:
+        mov rax, 0xFFFFFFC3;                 // DRV_DEATH_BIND_NO_TASK
+        jmp drv_death_bind_epilogue;
+
+      drv_death_bind_refused:
+        mov rax, 0xFFFFFFC4;                 // DRV_DEATH_BIND_REFUSED
+
+      drv_death_bind_epilogue:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // driver_death_find_slot(pid, gen) -> u64
+  //
+  // The correlation scan. Returns the slot whose row is bound to exactly
+  // this (pid, generation), or DRV_DEATH_SLOT_NONE.
+  //
+  // Both halves of the key are compared, and BOTH comparisons are
+  // load-bearing:
+  //
+  //   * pid alone would match a recycled pid — a row left naming pid 7 by a
+  //     previous occupant, against an unrelated new task handed pid 7.
+  //   * generation alone names nothing; generations are per-pid counters,
+  //     so generation 3 of pid 7 and generation 3 of pid 8 are unrelated.
+  //
+  // The scan takes the generation as an argument rather than reading it,
+  // so a caller that has already resolved the dying task's identity cannot
+  // have it change underneath the scan, and so the recycled-pid case is
+  // directly expressible in a test.
+  //
+  // First match wins. Two rows bound to the same live task would be a
+  // supervisor bug — one driver process, one driver row — and returning the
+  // first is the conservative answer: the second row keeps its binding and
+  // is still reachable by the next sweep, whereas a "refuse on duplicate"
+  // policy would revoke neither and leak both.
+  // ============================================================================
+
+  pub let driver_death_find_slot : (u64, u64) -> u64 !{mem} @{} =
+    fn (pid: u64) (gen: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R31.M0-1583 (#1583): linear scan of the 32 driver rows for the one bound to (pid, gen). Five pushes (rbx/r12/r13/r14/r15) keep rsp %16 == 0 across the three nested calls per iteration; rbx = pid, r12 = gen, r13 = cursor. Up-front refusals: pid 0 (the reserved sentinel, which every unbound row's pid field also reads as) and gen 0 (DRIVER_ROW_PIDGEN_UNBOUND, which every unbound row's generation field also reads as) both answer SLOT_NONE without scanning — without those two gates a caller passing zeros would match the first free row and revoke it. Per slot: driver_table_slot_in_use == 0 -> skip (a free row's key bytes are zero anyway, but the gate keeps the invariant local rather than relying on unregister's zeroing); driver_table_read_pid_gen != gen -> skip BEFORE reading the pid, because the generation is the discriminating half and checking it first makes the common no-match case one call cheaper; driver_table_read_pid != pid -> skip. First match returns its slot index. Both comparisons are required: pid alone matches a recycled pid against an unrelated new task, and a generation alone names nothing because generations are per-pid counters. Linear over 32 rows rather than a reverse index for the same reason driver_restart_reap_endpoints scans 128 endpoints — the table is the only storage that could be corrupted for the relation to break, and a side index could drift from it. Effects {mem} only; no audit emission here, so the scan stays callable from a probe that must not perturb the audit ring.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                            // 5 pushes -> rsp %16 = 0
+
+        mov rbx, rdi;                        // pid
+        mov r12, rsi;                        // gen
+
+        // A zero pid or a zero generation is what an UNBOUND row reads as.
+        // Scanning for them would match the first free row.
+        cmp rbx, 0;
+        je  drv_death_find_none;
+        cmp r12, 0;
+        je  drv_death_find_none;
+
+        xor r13, r13;                        // cursor
+
+      drv_death_find_scan:
+        cmp r13, 32;                         // DRIVER_TABLE_SLOTS
+        jae drv_death_find_none;
+
+        mov rdi, r13;
+        call driver_table_slot_in_use;
+        cmp rax, 0;
+        je  drv_death_find_next;
+
+        // Generation first — it is the discriminating half, so the common
+        // no-match case costs one call less.
+        mov rdi, r13;
+        call driver_table_read_pid_gen;
+        cmp rax, r12;
+        jne drv_death_find_next;
+
+        mov rdi, r13;
+        call driver_table_read_pid;
+        cmp rax, rbx;
+        jne drv_death_find_next;
+
+        mov rax, r13;                        // found
+        jmp drv_death_find_epilogue;
+
+      drv_death_find_next:
+        add r13, 1;
+        jmp drv_death_find_scan;
+
+      drv_death_find_none:
+        mov rax, 0xFFFFFFFFFFFFFFFF;         // DRV_DEATH_SLOT_NONE
+
+      drv_death_find_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // driver_death_notify(pid) -> u64
+  //
+  // THE entry point. A task with this pid has died — by exit or by fault.
+  // Put the system back in a state where nothing it held is still live.
+  //
+  // Returns:
+  //   DRV_DEATH_NO_SLOT — the task owned no driver row. Not an error; this
+  //                       is the answer for every process that is not a
+  //                       driver, which is nearly all of them.
+  //   DRV_DEATH_OK      — the row was torn down and the node re-armed.
+  //   DRV_RESTART_*     — propagated VERBATIM from driver_restart_node, so
+  //                       ESCALATED (budget exhausted, node left Stopped
+  //                       and permanently failed) stays distinguishable
+  //                       from a genuine failure. A crash loop that
+  //                       escalates is the system working, not the system
+  //                       breaking, and collapsing the two would hide it.
+  //
+  // Sequence:
+  //   1. gen = pid_gen_read(pid). Zero -> NO_SLOT. This is the dying task's
+  //      own incarnation: the pid slot is not freed until a parent reaps,
+  //      so at death time the counter still names the process that is
+  //      dying, not its successor.
+  //   2. slot = driver_death_find_slot(pid, gen). None -> NO_SLOT.
+  //   3. UNBIND THE ROW, before anything else touches it.
+  //   4. Audit the correlation, while the row still exists to be named.
+  //   5. driver_restart_node(slot), rc propagated verbatim.
+  //
+  // Step 3 before step 5 is the idempotence argument and it is not an
+  // optimisation. Death, an explicit teardown and a supervisor sweep can
+  // all reach the same row. With the unbind first, the second arrival
+  // resolves nothing and returns NO_SLOT. With the unbind last — or with no
+  // unbind at all — the second arrival would charge another restart against
+  // the budget, and five arrivals would latch perm_failed on a node whose
+  // only fault was dying once.
+  //
+  // Step 3 before step 4 keeps the audit record honest in the other
+  // direction: the record says "this pid's binding was consumed", and it is
+  // written after the consumption, so no record can describe an unbinding
+  // that did not happen.
+  // ============================================================================
+
+  pub let driver_death_notify : (u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (pid: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "R31.M0-1583 (#1583): the process-death trigger for the R29 cascade. Five pushes (rbx/r12/r13/r14/r15) put rsp at %16 == 0 for every nested call; rbx = pid, r12 = generation, r13 = slot. Sequence: (1) pid_gen_read(pid) — zero (never allocated, already reaped, or out of range) answers NO_SLOT without scanning; at death time this counter still names the DYING task, because pid_free runs at reap and not at exit, so the pid slot has not yet acquired a successor. (2) driver_death_find_slot(pid, gen) — SLOT_NONE answers NO_SLOT, which is the ordinary result for every process that is not a driver and is deliberately NOT an error code. (3) driver_table_unbind_pid(slot) BEFORE any teardown: this is the whole idempotence argument, not an optimisation. Death, an explicit teardown and a supervisor sweep can all reach one row; with the unbind first the second arrival resolves nothing, and with it last the second arrival charges another restart against the budget — five of which latch perm_failed on a node whose only fault was dying once. It also closes the pid-reuse window, since a pid recycled while the teardown runs can no longer resolve to this row. (4) drv_audit_emit(EV_RESTART=4, kind=0, subject=slot, principal=pid, outcome=2) AFTER the unbind so no record can describe an unbinding that did not happen; outcome 2 is a new discriminator in the existing event's outcome field — 0 is 'restarted by a supervisor', 1 is 'cascaded to a stop', 2 is 'the owning process died' — chosen over a new event id so the audit ring's existing decoder, its schema and its two consumers stay unchanged for what is a provenance distinction, not a new kind of thing happening. (5) driver_restart_node(slot), return value propagated VERBATIM so DRV_RESTART_ESCALATED stays distinguishable from a failure: a crash loop that escalates is the supervision policy working, and collapsing it into a generic error would hide exactly the signal an operator needs. Effects/caps are the union of the callees: {mem, sysreg} @{cap, sched}.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                            // 5 pushes -> rsp %16 = 0
+
+        mov rbx, rdi;                        // pid
+
+        // ---- (1) the dying task's own incarnation ----
+        mov rdi, rbx;
+        call pid_gen_read;
+        cmp rax, 0;
+        je  drv_death_no_slot;
+        mov r12, rax;                        // generation
+
+        // ---- (2) which row did it own? ----
+        mov rdi, rbx;
+        mov rsi, r12;
+        call driver_death_find_slot;
+        mov r14, 0xFFFFFFFFFFFFFFFF;         // DRV_DEATH_SLOT_NONE
+        cmp rax, r14;
+        je  drv_death_no_slot;
+        mov r13, rax;                        // slot
+
+        // ---- (3) consume the binding FIRST ----
+        mov rdi, r13;
+        call driver_table_unbind_pid;
+
+        // ---- (4) record the correlation, after consuming it ----
+        mov rdi, 4;                          // DRV_AUDIT_EV_RESTART
+        xor rsi, rsi;                        // kind = 0: not a cap event
+        mov rdx, r13;                        // subject   = driver slot
+        mov rcx, rbx;                        // principal = the dead pid
+        mov r8,  2;                          // outcome 2 = owning process died
+        call drv_audit_emit;
+
+        // ---- (5) the R29 cascade ----
+        mov rdi, r13;
+        call driver_restart_node;
+        jmp drv_death_epilogue;              // propagate verbatim
+
+      drv_death_no_slot:
+        mov rax, 0xFFFFFFC1;                 // DRV_DEATH_NO_SLOT
+
+      drv_death_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

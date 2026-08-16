@@ -2387,6 +2387,41 @@ kind_gpio_ok_msg: .ascii "R30 KIND_GPIO OK\n\0"
 .align 8
 kind_gpio_fail_msg: .ascii "R30 KIND_GPIO FAIL\n\0"
 
+#   R31 DEATH CASCADE OK — emitted by
+#       tests/kernel/driver/death_witness.pdx §death_witness,
+#       R31.M0-1583 (#1583). It stands for the trigger R29 was missing:
+#       process death now REACHES the cascade-restart machinery, by both
+#       routes, and the three ways that could have been got wrong are each
+#       asserted rather than assumed.
+#         * The FAULT path fires, and is the one that matters -- a process
+#           that calls exit has usually finished its work, while the one
+#           that faults mid-transaction is the one still holding an
+#           OpRegion window. Sub-tests E-J drive fault_ring3_death_check
+#           through a synthetic ring-3 trap frame and assert the whole
+#           revocation: binding consumed, endpoint dead, parked client
+#           woken, node re-armed at a fresh incarnation.
+#         * A RING-0 fault still panics (sub-test C). Converting a
+#           kernel-integrity failure into a task death would keep the
+#           machine running on an invariant already observed broken.
+#         * A RECYCLED PID does not revoke a live process (sub-test M).
+#           pid_alloc hands a reaped pid to the very next task_new, so
+#           correlating on the number alone would eventually destroy a
+#           LIVE process's authority -- worse than the leak being fixed.
+#           The sub-test manufactures a stale binding no audited path can
+#           produce, in the shape of gpio_cap_synth.pdx sub-test L's ghost
+#           row, and asserts the guard refuses it.
+#         * A SECOND revocation is a no-op (sub-tests K/L), asserted on the
+#           restart budget and not only on the return code: five spurious
+#           charges latch perm_failed on a node whose only fault was dying
+#           once.
+.global death_witness_ok_msg
+.align 8
+death_witness_ok_msg: .ascii "R31 DEATH CASCADE OK\n\0"
+
+.global death_witness_fail_msg
+.align 8
+death_witness_fail_msg: .ascii "R31 DEATH CASCADE FAIL\n\0"
+
 #   R30 GPIO PAD OK   — emitted by
 #       tests/kernel/drivers/gpio/gpio_pad_synth.pdx §gpio_pad_witness,
 #       R30.M6-003 (#1077) + R30.M6-004 (#1078). It stands for the first

@@ -1,6 +1,7 @@
 # PaideiaOS — ACPI Bubble Crash Isolation
 
-**Status:** v1.0 — one of three properties implemented; the other two specified and blocked
+**Status:** v1.1 — P1 and P3 landed; P2's trigger landed by #1583, its
+capability sweep still blocked on a gap named in §3.4
 **Date:** 2026-08-16
 **Issue:** R30.M9-002 (#1086)
 **Code:** `src/user/aml/aml_glk.pdx` (`aml_glk_abandon`), `tests/user/aml/aml_harness.c`
@@ -20,8 +21,8 @@ how easy they are to get wrong:
 
 | # | Property | Status |
 |---|---|---|
-| **P1** | The kernel survives a ring-3 fault, observably | **Already witnessed** — R29 (§2) |
-| **P2** | The dead bubble's capabilities are revoked | **Blocked** — mechanism exists, trigger does not (§3) |
+| **P1** | The kernel survives a ring-3 fault, observably | **Witnessed** — R29 (§2), and **strengthened by #1583**: it now survives by killing the task rather than by halting (§3.5) |
+| **P2** | The dead bubble's capabilities are revoked | **Partly** — the trigger landed with #1583; the DMA domain and every channel go, the five ACPI kinds do not (§3.4) |
 | **P3** | A bubble that dies mid-transaction does not strand the Global Lock | **Implemented and tested** (§4) |
 
 This document is honest about which is which. P3 is the one landed by this
@@ -113,31 +114,65 @@ The corresponding test (`tests/kernel/cap/gpio_cap_synth.pdx` sub-test L)
 its descriptor by hand — and asserts phase 2 collects it. That is the
 standard any P2 witness should meet.
 
-### 3.4 Why P2 is not closed by this issue
+### 3.4 P2 after #1583 — the trigger landed, the sweep did not
 
-**The revocation mechanism is complete. Nothing triggers it on process
-death.**
+The gap this section named — "the revocation mechanism is complete, nothing
+triggers it on process death" — **is closed**. `design/drivers/process-death.md`
+is the write-up; in summary:
 
-- `sys_exit` (`src/kernel/core/syscall/handlers/sys_exit.pdx`) sets
-  `STATE_ZOMBIE`, writes `exit_status`, wakes a waiting parent, and
-  reparents orphans. **It revokes no capabilities and calls nothing in
-  `driver/`.**
-- `driver_restart_node` has five call sites, **all synthetic** — the chaos
-  harness and the boot witness. No fault handler and no supervisor process
-  reaches it.
-- The driver descriptor carries a `pid`, but **no code reads it** to
-  correlate a dying task with a driver slot.
+- `sys_exit_body` step 2.6 and `fault_ring3_death_check` (reached from
+  vectors 0, 6, 13 and 14) both call `driver_death_notify`, which resolves
+  the dying task to the driver row it owned and runs `driver_restart_node`.
+- The correlation key is the pair **(pid, generation)**, not the pid.
+  `pid_alloc` hands a reaped pid to the very next `task_new`, so a pid alone
+  would eventually revoke a **live** process's capabilities — worse than the
+  leak being closed. Two independent defences: the binding is invalidated
+  the moment it stops being true, and a per-pid incarnation counter refuses
+  a stale one that slips through.
+- Witnessed by `R31 DEATH CASCADE OK`, including the ring-0 refusal, the
+  recycled-pid refusal, and double-revocation.
 
-So today a bubble crash revokes nothing, and a composed "bubble death
-revokes all five kinds" witness would be asserting against a path that
-cannot be entered. Writing one would produce a green test for a property
-the system does not have — the worst possible outcome.
+**What still does not happen is the five-kind sweep this section's §3.2
+tabulates**, and the reason is not the trigger:
 
-**Filed as its own issue** (number in the commit message): wire process
-death to the cascade machinery — `sys_exit` and the fault path resolve the
-dying task to its driver slot and call `driver_restart_node`. P2's witness
-follows immediately after, and should be modelled on the ghost-row sweep
-in §3.3.
+> `cap_table` descriptors carry `(kind, rights, target_ptr)` and **no
+> owner**. There is one global `cap_table` and no per-task CSpaces. Every
+> cascade in the kernel keys on a *parent* identity — a cap slot, a bus
+> row, a controller id — never on a holder. **"The capabilities held by
+> process P" is not a representable query today.**
+
+So the composed witness §3.3 calls for cannot be written honestly yet, for
+a *different* reason than the one this section originally gave. It is no
+longer "there is no path into the mechanism"; it is "there is no relation
+from a dead process to the capabilities it held". That is a
+capability-layer design with its own argument to make, and it is filed as
+**#1587** rather than improvised here. See
+`design/drivers/process-death.md` §6 for the shape it most plausibly takes.
+
+What death **does** revoke today is exactly what the driver row names: the
+DMA domain at `[+32]`, and every endpoint bound to the slot — which is the
+ChannelDead half of P2, and is asserted client-side (the parked client is
+woken, not merely disconnected).
+
+### 3.5 P1, strengthened
+
+P1 was witnessed by R29 and is not re-witnessed here, but its *content*
+changed with #1583 and the change is worth recording.
+
+Before: every CPU exception ended in `klog_panic` and a halt, with no CPL
+discrimination anywhere. A `#GP` raised by a ring-3 process **stopped the
+machine**. "The kernel survives a ring-3 fault" was true only of the
+specific faults the R29 witness arranged to intercept.
+
+After: a ring-3 fault in a non-init task kills the task, revokes its
+authority, and schedules on. A ring-0 fault still panics, and that refusal
+is asserted rather than assumed — converting a kernel-integrity failure
+into a task death would keep the machine running on an invariant already
+observed broken, silently.
+
+A machine that halts on a bubble crash has not contained the crash; it has
+been taken down by it. That distinction is the whole of P1 and it is only
+now true.
 
 ---
 
@@ -246,9 +281,14 @@ The intended callers, in order of preference:
    process's address space — but it does work for an orderly stop, which
    is the common case.
 
-**The residual risk, named.** A fault taken *inside* the critical section,
-with no fault handler, strands the lock and nothing in this design
-recovers it. The successor incarnation cannot safely reclaim, because the
+**The residual risk, named — and still open after #1583.** A fault taken
+*inside* the critical section strands the lock and nothing in this design
+recovers it. #1583 built the fault path this section said did not exist, so
+"no fault handler" is no longer the obstacle — but a kernel-side death path
+is a *precondition* for closing this, not a substitute for it. The lock's
+nesting bookkeeping lives in the dying process's address space and the
+kernel cannot execute there; it can revoke capabilities, and it cannot
+surrender a lock whose state it does not own. The successor incarnation cannot safely reclaim, because the
 lock word carries no owner identity: an Owned bit it did not set is
 indistinguishable from firmware's own hold, and stealing a lock firmware
 genuinely holds is worse than leaving ours stranded.
@@ -273,7 +313,8 @@ already the shape of `aml_ec_xact`.
 
 | Property | Landed | Where |
 |---|---|---|
-| P1 kernel survives | ✅ pre-existing | R29 witness, `R29 CASCADE RESTART OK` |
-| P2 caps revoked on death | ❌ blocked | mechanism complete; no trigger (§3.4) |
-| P3 Global Lock not stranded | ✅ this issue | `aml_glk_abandon` + 6 fixtures (§4) |
-| P3 residual (fault inside the section) | ❌ specified | journal design (§4.4) |
+| P1 kernel survives | ✅ and strengthened | R29 witness + #1583's ring-3 fault kill (§3.5) |
+| P2 trigger — death reaches the cascade | ✅ #1583 | `R31 DEATH CASCADE OK` (§3.4) |
+| P2 sweep — all five ACPI kinds revoked | ❌ blocked | no cap→owner relation exists (§3.4) |
+| P3 Global Lock not stranded | ✅ #1086 | `aml_glk_abandon` + 6 fixtures (§4) |
+| P3 residual (fault inside the section) | ❌ specified | journal design (§4.4) — unblocked, not built |
