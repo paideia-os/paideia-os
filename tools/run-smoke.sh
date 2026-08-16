@@ -852,7 +852,7 @@ case "${EXPECTED}" in
         #                                server's FRAME_OP_REPLY_BIT flip —
         #                                a round trip between two real
         #                                processes, driven by the scheduler.
-        #   R31 SPAWN CAP SWEEP OK count=1
+        #   R31 SPAWN CAP SWEEP OK count=2
         #                                the client died and the owner sweep
         #                                MATCHED. The count is asserted, not
         #                                just the marker: a sweep that
@@ -862,14 +862,25 @@ case "${EXPECTED}" in
         #                                #1590 closes, and a bare marker
         #                                would accept it.
         #
-        # Why count is 1 and not 2: echo_client's sidecar seeds slots 0 and
-        # 1, but R20b still runs ONE GLOBAL cap_table shared by all tasks,
-        # so the server — spawned second — re-mints slot 0, and
-        # cap_mint_write clears the owner column on every mint. The client
-        # therefore owns exactly slot 1 by the time it dies. That the pair
-        # still works is luck rather than design (both slot-0 entries name
-        # endpoint 1, and the server's rights are a superset of the
-        # client's); it is filed separately, not papered over here.
+        # Why count is 2, and why it used to be 1 (R31.M2-1596, #1596):
+        #
+        # echo_client's sidecar seeds slots 0 and 1, so 2 is the number of
+        # capabilities it dies holding and always should have been. It read
+        # 1 because R20b runs ONE GLOBAL cap_table and every image named
+        # slot 0, so the server — spawned second — re-minted the client's
+        # slot 0 and cap_mint_write cleared its owner column on the way past.
+        # The client lost a capability to another process, silently, and
+        # this golden recorded the loss as the expected value.
+        #
+        # The pair kept working only by coincidence: both slot-0 entries
+        # named endpoint 1 and the server's rights were a superset of the
+        # client's. Two images whose slot 0 named different objects would
+        # have swapped authority with nothing reporting it.
+        #
+        # #1596 gave the images disjoint slot windows (client 0-1, server 2)
+        # and made loader_seed_caps REFUSE to seed a slot a live task holds.
+        # So the count is now the count, and a regression to 1 means the
+        # overwrite is back.
         #
         # Client spawn order is deliberate: the CLIENT is spawned first,
         # i.e. the order in which a client can run to completion before its

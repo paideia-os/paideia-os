@@ -350,6 +350,29 @@ if [[ ${#PCI_ENUMERATOR_OBJECTS[@]} -gt 0 ]]; then
     echo "[ok] ${BUILD_DIR}/pci_enumerator.bin"
 fi
 
+# R31.M2-1595 (#1595): PT_LOAD extent gate over every image linked above.
+#
+# Runs here rather than as a per-image step because two of its three rules
+# are whole-tree properties: the page budget is a statement about what a
+# spawn costs out of one shared 1024-frame pool, and the linker-script lint
+# reads src/user/*.ld rather than any single ELF.
+#
+# This is the check that was missing while seven linker scripts drifted into
+# putting a 1 MiB hole inside a single PT_LOAD. Nothing looked, so nothing
+# found them; the trigger for the latent form going live is adding one
+# initialised mutable to a .pdx under src/user/.
+echo "[verify-user] PT_LOAD extent + page budget + linker-script lint (#1595)"
+"${REPO_ROOT}/tools/verify-user-image-extent.sh"
+
+# R31.M2-1596/1597 (#1596, #1597): _init_caps sidecar gate over every image
+# linked above. Reads each sidecar the way the loader does (symtab + section
+# headers) and asserts (a) every kind it names is in KIND_SEEDABLE_TABLE, so
+# an image cannot be built that the loader will refuse to seed, and (b) no
+# two images name the same absolute cap slot, so the runtime
+# LOADER_SEED_SLOT_TAKEN refusal is unreachable from a tree that builds.
+echo "[verify-user] _init_caps sidecar kinds + slot disjointness (#1596/#1597)"
+"${REPO_ROOT}/tools/verify-user-cap-sidecars.sh"
+
 # Archive the AML modules (R30.M1-001..005, #1049-#1053).
 #
 # An archive rather than a linked ELF because there is no entry point:
