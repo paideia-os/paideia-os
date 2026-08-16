@@ -248,29 +248,96 @@ done
 # script from being written, rules 1 and 2 stop any other route to an
 # oversized segment (a genuinely huge .bss, a third PHDR, a hand-edited
 # script this parser does not understand).
+#
+# ---------------------------------------------------------------------------
+# R31.M2-1601 (#1601) — WHY RULE 3 CARRIES A POSITIVE SELF-TEST
+#
+# Rule 3 shipped BROKEN. The `;` handler anchored its DOT-statement match
+# against the whole accumulated buffer instead of against the buffer's last
+# line, and after an output section closes that buffer carries the ` :phdr`
+# suffix that followed the `}` -- so every location-counter jump except the
+# very first one in the file failed to match. The lint therefore passed a
+# linker script with a genuinely restored 1 MiB hole. It was caught by a
+# mutation test and by nothing else.
+#
+# None of rule 3's own vacuity guards fire on that bug, and they cannot:
+#
+#   no-output-sections-parsed        - sections still parse fine
+#   no-section-carries-a-phdr        - :phdr suffixes still parse fine
+#   no-location-counter-statement-parsed
+#                                    - the FIRST `. = 0x00400000;` sits at
+#                                      the top of SECTIONS with an empty
+#                                      buffer before it, so it DOES match;
+#                                      the count is 1, not 0, and a
+#                                      "did anything parse" guard is
+#                                      satisfied by exactly the one
+#                                      statement that never mattered.
+#
+# A vacuity guard proves the extractor produced SOMETHING. It cannot prove
+# the extractor still produces the RIGHT thing. That gap is not academic
+# here, because rule 3 is the ONLY protection against the latent form of
+# this defect: with `.data` empty, ld drops the zero-size section and no
+# program header shows a hole, so rules 1 and 2 provably see nothing (see
+# the measurement above). If rule 3 silently stops matching, the defect is
+# unguarded at both levels simultaneously and stays that way until someone
+# adds an initialised mutable months later.
+#
+# So rule 3 is run, on every invocation, over a checked-in KNOWN-BAD linker
+# script that it MUST flag:
+#
+#   tests/linker/fixtures/rule3/*.ld
+#
+# The fixture is not a build input; every real link script is named
+# explicitly in tools/build-user.sh and the fixture is not among them.
+#
+# FAILURE MODES, each with its own greppable tag:
+#
+#   rule3-selftest-no-fixtures            fixture dir missing or no *.ld in
+#                                         it -- coverage deleted, not reduced
+#   rule3-selftest-fixture-unparsable     fixture hit a per-script vacuity
+#                                         guard instead of being analysed
+#   rule3-selftest-fixture-not-flagged    fixture parsed but produced no
+#                                         HOLE -- THE extractor regression
+#   rule3-dot-statement-floor             fewer depth-1 `. =` statements
+#                                         extracted from the real scripts
+#                                         than the pinned minimum; the
+#                                         whole-buffer bug drops this from
+#                                         RULE3_MIN_DOT_STATEMENTS to one
+#                                         per script
+#   rule3-dot-count-missing               the counter itself did not report
 # ---------------------------------------------------------------------------
 
 echo "[user-image-extent] linting src/user/*.ld for intra-segment location-counter jumps"
 
-LINT_OUT="$(python3 - "${REPO_ROOT}/src/user" <<'PYEOF'
+# Pinned floor for rule 3's DOT extractor across src/user/*.ld. See the
+# #1601 block above: the whole-buffer bug yields exactly one DOT per script,
+# so any floor above the script count detects it. This is the MEASURED count
+# and it moves only when a real script gains or loses a depth-1 `. =`.
+RULE3_MIN_DOT_STATEMENTS="${RULE3_MIN_DOT_STATEMENTS:-16}"
+RULE3_FIXTURE_DIR="${REPO_ROOT}/tests/linker/fixtures/rule3"
+
+LINT_OUT="$(python3 - "${REPO_ROOT}/src/user" "${RULE3_FIXTURE_DIR}" <<'PYEOF'
 import pathlib, re, sys
 
-src = pathlib.Path(sys.argv[1])
-scripts = sorted(src.glob("*.ld"))
-if not scripts:
-    print("PARSE-FAIL no-linker-scripts")           # vacuity guard
-    raise SystemExit(0)
 
-failed = False
-for path in scripts:
+def scan(path):
+    """Parse one linker script.
+
+    Returns (events, tag). `tag` is a vacuity-guard name when the script
+    could not be analysed, else None. Events are ordered:
+        ("DOT", statement, lineno)
+        ("SEC", name, phdr_or_None, lineno)
+
+    The REAL scripts and the #1601 self-test fixtures go through this one
+    function. That is the whole point of the self-test: if this extractor
+    regresses, the fixture stops being flagged.
+    """
     text = path.read_text()
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)   # strip C comments
 
     m = re.search(r"\bSECTIONS\b\s*\{", text)
     if not m:
-        print("PARSE-FAIL %s no-SECTIONS-block" % path.name)
-        failed = True
-        continue
+        return [], "no-SECTIONS-block"
 
     # Walk the SECTIONS body with a brace counter, recording an ordered
     # event list. Only depth-1 constructs matter: a `. = <expr>;` directly
@@ -278,7 +345,7 @@ for path in scripts:
     # definition at depth 1 carries the `:phdr` on its closing brace.
     i = m.end()
     depth = 1
-    events = []            # ("DOT", lineno) | ("SEC", name, phdr, lineno)
+    events = []
     pending = None         # (name, lineno) for the section currently open
     buf = ""
     line = text[:i].count("\n") + 1
@@ -308,8 +375,8 @@ for path in scripts:
             # buffer: after a section closes, the buffer carries the ` :phdr`
             # suffix that followed its `}`, so anchoring the match at the
             # start of `buf` never fires. That bug made this lint pass on a
-            # deliberately reintroduced hole; the mutation test below is what
-            # caught it, which is the argument for running one.
+            # deliberately reintroduced hole; the #1601 fixture self-test
+            # below exists so it cannot come back silently.
             stmt = buf.rsplit("\n", 1)[-1]
             if depth == 1 and re.match(r"^\s*\.\s*=", stmt):
                 events.append(("DOT", stmt.strip(), line))
@@ -319,26 +386,25 @@ for path in scripts:
         i += 1
 
     if not any(e[0] == "SEC" for e in events):
-        print("PARSE-FAIL %s no-output-sections-parsed" % path.name)
-        failed = True
-        continue
+        return events, "no-output-sections-parsed"
     # VACUITY GUARD. The whole rule is a comparison between sections that
     # share a PHDR. If no section parsed with a `:phdr` suffix there is
     # nothing to compare and the script would pass without looking.
     if not any(e[0] == "SEC" and e[2] for e in events):
-        print("PARSE-FAIL %s no-section-carries-a-phdr" % path.name)
-        failed = True
-        continue
+        return events, "no-section-carries-a-phdr"
     if not any(e[0] == "DOT" for e in events):
         # Every script in this tree sets the location counter at least once
         # (`. = 0x00400000;` before .text). None parsing means the statement
-        # scanner is broken, which is exactly the bug fixed above.
-        print("PARSE-FAIL %s no-location-counter-statement-parsed" % path.name)
-        failed = True
-        continue
+        # scanner is broken. NOTE: this guard is satisfied by ONE statement
+        # and so does not detect the whole-buffer bug -- see #1601 block.
+        return events, "no-location-counter-statement-parsed"
+    return events, None
 
-    # For each pair of sections sharing a PHDR, was there a location-counter
-    # jump between them?
+
+def holes(events):
+    """For each pair of sections sharing a PHDR, was there a location-counter
+    jump between them? Returns [(phdr, first, second, lineno, stmt), ...]."""
+    out = []
     last_by_phdr = {}      # phdr -> (index into events, section name)
     for idx, ev in enumerate(events):
         if ev[0] != "SEC":
@@ -350,24 +416,74 @@ for path in scripts:
         if prev is not None:
             between = [e for e in events[prev[0] + 1:idx] if e[0] == "DOT"]
             if between:
-                print("HOLE %s %s %s %s %d %s"
-                      % (path.name, phdr, prev[1], name,
-                         between[-1][2], between[-1][1]))
-                failed = True
+                out.append((phdr, prev[1], name, between[-1][2],
+                            between[-1][1]))
         last_by_phdr[phdr] = (idx, name)
+    return out
+
+
+src = pathlib.Path(sys.argv[1])
+fixture_dir = pathlib.Path(sys.argv[2])
+
+scripts = sorted(src.glob("*.ld"))
+if not scripts:
+    print("PARSE-FAIL no-linker-scripts")           # vacuity guard
+    raise SystemExit(0)
+
+# --- the real scripts -------------------------------------------------
+dot_total = 0
+for path in scripts:
+    events, tag = scan(path)
+    if tag:
+        print("PARSE-FAIL %s %s" % (path.name, tag))
+        continue
+    dot_total += sum(1 for e in events if e[0] == "DOT")
+    for phdr, first, second, lineno, stmt in holes(events):
+        print("HOLE %s %s %s %s %d %s"
+              % (path.name, phdr, first, second, lineno, stmt))
+
+print("DOT-COUNT %d" % dot_total)
+
+# --- #1601 positive self-test ----------------------------------------
+# Known-bad fixtures that rule 3 MUST flag. An empty or missing fixture set
+# is a FAILURE with its own tag, not a quiet reduction in coverage.
+fixtures = sorted(fixture_dir.glob("*.ld")) if fixture_dir.is_dir() else []
+if not fixtures:
+    print("SELFTEST-FAIL rule3-selftest-no-fixtures %s" % fixture_dir)
+else:
+    for path in fixtures:
+        events, tag = scan(path)
+        if tag:
+            print("SELFTEST-FAIL rule3-selftest-fixture-unparsable %s %s"
+                  % (path.name, tag))
+            continue
+        found = holes(events)
+        if not found:
+            print("SELFTEST-FAIL rule3-selftest-fixture-not-flagged %s"
+                  % path.name)
+            continue
+        print("SELFTEST-OK %s %d hole(s)" % (path.name, len(found)))
 
 print("LINT-DONE %d scripts" % len(scripts))
 PYEOF
 )"
 
+LINT_FAILED=0
+
 if [[ -z "${LINT_OUT}" ]] || ! grep -q "LINT-DONE" <<<"${LINT_OUT}"; then
     echo "[user-image-extent] FAIL — linker-script lint did not complete: ${LINT_OUT:-<empty>}" >&2
     RC=1
-elif grep -q "PARSE-FAIL" <<<"${LINT_OUT}"; then
+    LINT_FAILED=1
+fi
+
+if grep -q "PARSE-FAIL" <<<"${LINT_OUT}"; then
     echo "[user-image-extent] FAIL — linker-script lint could not parse:" >&2
     grep "PARSE-FAIL" <<<"${LINT_OUT}" >&2
     RC=1
-elif grep -q "^HOLE " <<<"${LINT_OUT}"; then
+    LINT_FAILED=1
+fi
+
+if grep -q "^HOLE " <<<"${LINT_OUT}"; then
     while read -r _ script phdr first second lineno jump; do
         echo "[user-image-extent] FAIL ${script} — SCRIPT-HOLE: a location-counter jump sits" >&2
         echo "    between two output sections assigned to the SAME program header." >&2
@@ -380,9 +496,69 @@ elif grep -q "^HOLE " <<<"${LINT_OUT}"; then
         echo "  Let the later section follow the earlier one contiguously, or give" >&2
         echo "  it a PHDR of its own. See #1595." >&2
         RC=1
+        LINT_FAILED=1
     done < <(grep "^HOLE " <<<"${LINT_OUT}")
-else
-    echo "[user-image-extent] ${LINT_OUT##*$'\n'} — no intra-segment jumps"
+fi
+
+# --- #1601 self-test verdict ------------------------------------------
+if grep -q "^SELFTEST-FAIL " <<<"${LINT_OUT}"; then
+    while read -r _ tag detail extra; do
+        echo "[user-image-extent] FAIL — RULE3-SELFTEST: ${tag}" >&2
+        echo "      detail   : ${detail} ${extra}" >&2
+        case "${tag}" in
+        rule3-selftest-no-fixtures)
+            echo "  The rule-3 known-bad fixture set is EMPTY or MISSING. Rule 3 is the" >&2
+            echo "  only check that can see the LATENT form of the #1595 defect (with" >&2
+            echo "  .data empty, ld drops the section and no program header shows a" >&2
+            echo "  hole, so rules 1 and 2 provably pass). Without a fixture that rule" >&2
+            echo "  3 must flag, a silent extractor regression is undetectable." >&2
+            echo "  Restore tests/linker/fixtures/rule3/*.ld. See #1601." >&2
+            ;;
+        rule3-selftest-fixture-unparsable)
+            echo "  A known-bad fixture hit a vacuity guard instead of being analysed." >&2
+            echo "  Either the fixture was edited into an unparsable shape or the" >&2
+            echo "  SECTIONS walker regressed. See #1601." >&2
+            ;;
+        rule3-selftest-fixture-not-flagged)
+            echo "  A DELIBERATELY BAD fixture was NOT flagged. Rule 3's extractor has" >&2
+            echo "  stopped matching location-counter jumps where they matter -- this" >&2
+            echo "  is exactly the bug rule 3 shipped with (the DOT regex anchored on" >&2
+            echo "  the whole buffer rather than its last line), and the vacuity guards" >&2
+            echo "  do NOT catch it because the first '. = ' in each file still" >&2
+            echo "  matches. Fix the extractor; do not 'fix' the fixture. See #1601." >&2
+            ;;
+        esac
+        RC=1
+        LINT_FAILED=1
+    done < <(grep "^SELFTEST-FAIL " <<<"${LINT_OUT}")
+fi
+
+# --- #1601 counted floor ----------------------------------------------
+# A count, not a presence test. Whole-buffer anchoring still yields one DOT
+# per script, which every presence-based guard accepts.
+DOT_COUNT="$(grep -m1 '^DOT-COUNT ' <<<"${LINT_OUT}" | cut -d' ' -f2)"
+if [[ -z "${DOT_COUNT}" ]]; then
+    echo "[user-image-extent] FAIL — RULE3-SELFTEST: rule3-dot-count-missing" >&2
+    echo "  The lint did not report a DOT-COUNT line at all." >&2
+    RC=1
+    LINT_FAILED=1
+elif (( DOT_COUNT < RULE3_MIN_DOT_STATEMENTS )); then
+    echo "[user-image-extent] FAIL — RULE3-SELFTEST: rule3-dot-statement-floor" >&2
+    echo "      extracted: ${DOT_COUNT} depth-1 '. =' statements from src/user/*.ld" >&2
+    echo "      floor    : ${RULE3_MIN_DOT_STATEMENTS}" >&2
+    echo "  Rule 3 is seeing fewer location-counter statements than the pinned" >&2
+    echo "  minimum. Either a real script legitimately lost one -- in which case" >&2
+    echo "  re-pin RULE3_MIN_DOT_STATEMENTS deliberately -- or the DOT extractor" >&2
+    echo "  regressed. The whole-buffer anchoring bug drops this to one per" >&2
+    echo "  script while leaving every vacuity guard satisfied. See #1601." >&2
+    RC=1
+    LINT_FAILED=1
+fi
+
+if (( LINT_FAILED == 0 )); then
+    echo "[user-image-extent] ${LINT_OUT##*$'\n'} — no intra-segment jumps" \
+         "(${DOT_COUNT}/${RULE3_MIN_DOT_STATEMENTS} '. =' statements;" \
+         "$(grep -c '^SELFTEST-OK ' <<<"${LINT_OUT}") known-bad fixture(s) flagged as required)"
 fi
 
 if (( RC != 0 )); then
