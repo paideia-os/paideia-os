@@ -173,6 +173,45 @@ stores and never call a revoke function at all, of which the tree has
 several. Ownership is then stamped *after* the mint, by
 `cap_owner_claim(slot, pid)`, which is a separate, audited step.
 
+#### 2.3.1 The route a stale key actually arrives by (#1592)
+
+The paragraph above is the design. #1592 showed that it was, for a while,
+**only** the design: the instruction could be deleted and every test in the
+14-mode matrix still passed, because no fixture reused a capability slot.
+Every mint in the tree's witnesses went into a fresh slot whose column was
+already `.bss`-zero, and clearing an already-zero column is indistinguishable
+from not clearing it.
+
+Writing the missing witness turned up something worth recording, because the
+obvious version of it proves nothing:
+
+> **A slot freed by an OWNER SWEEP has a clean column already.**
+> `cap_revoke_slot` clears the column of every slot the sweep matched, on
+> every path, including a refused per-kind revoke. So "mint for P, kill P,
+> sweep, re-mint" leaves nothing for the mint's clear to do, and a witness
+> built that way passes with the instruction deleted.
+
+The route that does leave a stale key is the other axis:
+
+> **THE LINEAGE CASCADES DO NOT TOUCH THE OWNER COLUMN.**
+> `cap_owner` is written in exactly five files — `table.pdx`, `mint.pdx`,
+> `owner.pdx`, `loader/seed_caps.pdx`, `driver/process_death.pdx` — and no
+> per-kind revoke and no cascade is among them.
+
+So when a capability is revoked because its *parent* died, its descriptor
+goes and its owner column stays. If its holder was somebody other than the
+parent's holder — which §2 of this document establishes is possible, because
+ownership and lineage are independent relations — the freed slot now carries
+a **live** process's key, and the next mint into it would hand the new
+capability to that live process. When *it* dies, it takes a capability it
+never held.
+
+That is the concrete reachable path, in shipping code, with nothing
+synthetic in it. `owner_sweep_synth.pdx` sub-test U builds exactly it: an
+op-region root held by one process, a child derived from it held by a
+second, the first dies, and the child's slot is re-minted and must come back
+unowned. Deleting the clear fails it at stage 20.
+
 ---
 
 ## 3. Owner identity is `(pid, generation)`, never a bare pid
@@ -305,7 +344,7 @@ This is filed forward, not resolved here.
 
 In the shape of the existing `[gpio-pin-confine]` and `[fw-session-confine]`
 arity pins, in `tools/build.sh`, so a future divergence is a **build
-failure** rather than a memory-corruption bug. Four independent halves:
+failure** rather than a memory-corruption bug. Five independent halves:
 
 1. **Declarations.** `cap_table : [u64; 768]`, `cap_owner : [u64; 256]`, and
    the three constants `CAP_SLOT_MAX = 256`, `CAP_DESC_BYTES = 24`,
@@ -323,9 +362,35 @@ failure** rather than a memory-corruption bug. Four independent halves:
    file and line. A vacuity guard fires if the classifier finds fewer than
    60 V-form, 20 C-form or 120 total sites, so a refactor that makes the
    pattern stop matching cannot make the gate pass by scanning nothing.
+5. **What is dereferenced from the base (#1591).** Halves 1–4 police how a
+   descriptor *address is computed* and say nothing about the offsets then
+   used through it. That is not a theoretical gap: a single stray
+   `mov [rax + 24], rdx` appended after a correct base computation and a
+   correct three-word write passed all four halves with exit 0, while
+   corrupting the next descriptor's `kind` — #1589's exact failure shape,
+   reached without touching `table.pdx` at all. Half 5 walks forward from
+   each classified site, follows the register holding the computed base, and
+   checks every constant offset dereferenced through it: **V** sites are
+   pinned to `{0, 8, 16}`, because a variable-slot base reaching past its
+   own descriptor lands on a slot nobody chose; **C** and **Z** sites, whose
+   base names a constant slot, are bounds-checked only (8-byte aligned, and
+   inside the table), because from a slot-aligned constant base every
+   multiple of 8 is legitimately *some* descriptor's field and no arithmetic
+   can separate deliberate from accidental. A register-indexed dereference
+   through a tracked base is refused for every form and needs an explicit
+   `// [cap-stride-ok: <reason>]` annotation; the tree currently needs none.
+
+Half 5 is a **bounded scan, not a dataflow analysis**, and the gate's own
+header enumerates what it cannot see — writes after a `call`, past a label,
+beyond an 80-line window, or through a base that was parked in memory. The
+bound is written down there rather than left to be discovered, which is the
+lesson #1591 taught about half 4.
 
 Non-vacuity of each half is demonstrated by mutation; the induced failures
-and their tags are recorded in the commit message.
+and their tags are recorded in the commit message. Half 5 has its own
+vacuity floor (120 V-form dereferences, 240 total) for the same reason half
+4 does: its walk has several stop conditions, and a change that made it stop
+immediately everywhere would leave it passing without inspecting anything.
 
 ---
 
@@ -397,7 +462,27 @@ header for the sub-test map. What it asserts:
   held or an I²C address unmintable;
 - a stale `(pid, generation)` — live pid, dead generation — matches nothing;
 - `CAP_OWNER_KERNEL` and `CAP_OWNER_NONE` slots are untouched, and the sweep
-  for either is refused before it scans.
+  for either is refused before it scans;
+- **a re-minted slot does not inherit the previous holder's key** (sub-test
+  U, added by #1592) — the slot is freed by a *lineage* cascade, which leaves
+  the column set, and the re-mint must clear it or a later sweep destroys a
+  live, unrelated capability. See §2.3.1.
+
+One correction to that witness's own narrative, made by #1592. Its header
+said six owned slots were swept while **nine** descriptors were cleared, the
+extra three being the OpRegion child, the OpRegion grandchild, and the second
+I²C slave. The number is **eight**. The I²C slave's descriptor was already
+null before the composed death — the fixture ghosts it at sub-test I as
+scaffolding for sub-tests N and O, and sub-test N's own comment says so — so
+the death cleared no descriptor there. What the death reclaims at that slot
+is its *row*, which is a different fact and is sub-test N's subject. Two
+lineage-cleared descriptors and one lineage-reclaimed row. Every individual
+assertion the fixture made was true; the sentence summarising them was not,
+and the assertion offered as evidence for the ninth (`kind == 0` on a slot
+already zeroed two sub-tests earlier) was true and empty. It has been
+replaced by the assertion that carries the argument: the two lineage-cleared
+slots read `CAP_OWNER_NONE`, so the owner axis demonstrably never touched
+them.
 
 **What remains outside the witness**, and therefore what #1086 must still be
 read as not covering: the bubble is a *synthetic* death driven through
@@ -418,8 +503,32 @@ here.
 | `src/kernel/core/cap/table.pdx` | the 3-field struct, the three pinned constants, `cap_owner[256]`, the two sentinels |
 | `src/kernel/core/cap/owner.pdx` | `cap_owner_pack` / `_set` / `_get` / `_claim` / `_claim_kernel` / `_clear`, `cap_revoke_slot`, `cap_owner_sweep_revoke` |
 | `src/kernel/core/cap/mint.pdx` | `cap_mint_write` clears the owner column; TODO corrected |
-| `src/kernel/core/cap/revoke.pdx` | `cap_revoke` delegates to `cap_revoke_slot`; TODO corrected |
+| `src/kernel/core/cap/revoke.pdx` | `cap_revoke` delegates to `cap_revoke_slot`; TODO corrected. **Currently has no caller** — see below |
 | `src/kernel/core/loader/seed_caps.pdx` | stamps `(pid, gen)` from the previously-unused `task_ptr` |
 | `src/kernel/core/driver/process_death.pdx` | `driver_death_notify` runs the sweep between steps 1 and 2 |
-| `tools/build.sh` | the `[cap-stride]` gate |
-| `tests/kernel/cap/owner_sweep_synth.pdx` | the composed five-kind witness |
+| `tools/build.sh` | invokes the `[cap-stride]` gate |
+| `tools/verify-cap-stride.sh` | the gate itself, five halves (§4.2) |
+| `tests/kernel/cap/owner_sweep_synth.pdx` | the composed five-kind witness, plus the slot-reuse witness (§2.3.1) |
+
+### 8.1 `cap_revoke(handle)` is unreachable, and that is stated rather than implied
+
+`cap_revoke` gained a real body in #1589 and, as of #1592, **has no caller
+anywhere in `src/kernel/`**. There is no `call cap_revoke` in the tree; the
+only invocations are direct calls from witnesses. Every revocation the
+running kernel performs enters one layer down at `cap_revoke_slot` — from
+`cap_owner_sweep_revoke` on process death, from each kind's own audited
+revoke, or from a lineage cascade.
+
+It is recorded because the gap between *has a real body* and *is exercised by
+the system* is precisely the gap that lets a function rot: witness calls
+cover the body, so no gate complains, while nothing in production depends on
+it being right. A function with a real body and no caller reads as live code
+and is not.
+
+**What would make it reachable:** a syscall that takes a *handle*. The five
+derived kinds all take a slot and re-derive their row from the descriptor on
+every call, so none of them route through it. A handle-taking revoke syscall
+needs §4.1's handle-layout question settled first — a handle today is bits
+[7:0] with nowhere to put a generation, so `cap_revoke(h)` cannot distinguish
+a live capability from a stale handle to a re-minted slot. Wiring it up ahead
+of that decision would ship the ambiguity rather than resolve it.

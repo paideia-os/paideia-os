@@ -24,7 +24,7 @@
 # correctly, which is the argument for a BUILD FAILURE rather than a
 # review comment.
 #
-# FOUR INDEPENDENT HALVES
+# FIVE INDEPENDENT HALVES
 #
 #   1. DECLARATIONS. The three constants and the two array declarations
 #      appear verbatim in cap/table.pdx. A number that lives only in a
@@ -49,10 +49,50 @@
 #        Z — slot 0:         mov rax, cap_table  with no scaling at all
 #            (offset 0 is stride-independent)
 #
+#   5. WHAT IS DEREFERENCED FROM THE BASE. Halves 1–4 police how a
+#      descriptor ADDRESS IS COMPUTED and say nothing about which
+#      offsets are then read or written through it. #1591 demonstrated
+#      the consequence: a single stray `mov [rax + 24], rdx` appended
+#      after a correct base computation and a correct three-word write
+#      passed all four halves, exit 0, while corrupting the NEXT
+#      descriptor's `kind` — the exact #1589 failure shape, reachable
+#      without touching table.pdx at all.
+#
+#      Half 5 walks forward from each classified site, tracking the
+#      register that holds the computed base, and checks every constant
+#      offset dereferenced through it:
+#
+#        V sites — the base names descriptor `slot` for a RUNTIME slot,
+#          so +24 is descriptor slot+1 at an index nobody chose. Offsets
+#          are restricted to {0, 8, 16}. There is no legitimate reason
+#          for a variable-slot site to reach outside its own descriptor:
+#          a site that wants a different slot recomputes the base, and
+#          every one of the 151 V-form dereferences in the tree does.
+#
+#        C and Z sites — the base names a CONSTANT slot, so +24 is
+#          "slot n+1", which kernel_main legitimately does when it seeds
+#          a run of descriptors. These are bounds-checked only: each
+#          offset must be 8-byte aligned and `base + offset` must land
+#          inside cap_table. See WHAT IT DOES NOT PROVE.
+#
+#      A register-indexed dereference (`[rax + rcx*8]`) through a
+#      tracked base is refused for every form, because its offset is not
+#      knowable here. If one is genuinely wanted, annotate the line:
+#
+#        mov [rax + rcx*8], r8;   // [cap-stride-ok: <why this is safe>]
+#
+#      The reason text is required and is not parsed — it exists so the
+#      exception is argued at the site rather than accumulated in a list
+#      somewhere else. The tree currently needs none.
+#
 # A VACUITY GUARD fires if the classifier finds implausibly few sites of
 # any form — i.e. if a refactor of the address-computation idiom made
 # these regexes stop matching. Without it the gate would "pass" by
 # scanning nothing, which is the failure mode it exists to prevent.
+# Half 5 has its own floor on dereferences inspected, for the same
+# reason: its walk stops at several conditions (below), and a change
+# that made it stop immediately everywhere would leave it silently
+# checking nothing.
 #
 # WHAT IT DOES NOT PROVE
 #
@@ -61,9 +101,49 @@
 # hypothetical widening would slip past half 4 alone. Halves 1 and 2
 # catch the widening at its source, which is where a real one would
 # start. Non-vacuousness is proved by mutation, per-half; see the #1589
-# commit message.
+# and #1592 commit messages.
 #
-# Exit 0 = struct, storage, constants and every site agree on 24 bytes.
+# HALF 5 IS A BOUNDED SCAN, NOT A DATAFLOW ANALYSIS, and the bound is
+# stated here rather than left for the next person to discover the way
+# #1591 discovered half 4's:
+#
+#   * THE WALK STOPS at the first `call` (a callee's clobbers are
+#     unconstrained, so the base register can no longer be trusted), at
+#     the first label (a branch target is a control-flow join and the
+#     straight-line assumption ends there), at `ret`, at the end of the
+#     unsafe block, and after 80 lines. A stray write placed after any
+#     of those, in the same function, IS NOT SEEN. Of the 141 sites, the
+#     walk currently ends at a call for 43, at a label for 6, at a `ret`
+#     or the block's closing brace for 9, and for the remaining 83 by
+#     running out of window or losing track of the register. The 151
+#     V-form dereferences it does reach are every V-form dereference in
+#     the tree.
+#
+#   * FOR C AND Z SITES THE OFFSET CHECK IS A BOUND, NOT A PIN. From a
+#     slot-aligned constant base every multiple of 8 is some
+#     descriptor's field, so no arithmetic here can distinguish "slot
+#     n+1's kind, deliberately" from "past the end of slot n, by
+#     mistake". The check that survives is alignment and in-range. The
+#     12 sites in kernel_main.pdx that reach past +16 are all
+#     constant-base descriptor-seeding runs, and they are why the strict
+#     rule is applied to V only.
+#
+#   * TRACKING IS SYNTACTIC. The base is followed through
+#     `mov <reg>, <base-reg>`; it is dropped on any other write to the
+#     register, on `add <reg>, <immediate>`, and on any `add` after the
+#     first dereference. Dropping early costs coverage, never
+#     correctness — an untracked register is simply not checked.
+#
+#   * IT IS BLIND TO ALIASING. A base parked in memory and reloaded, or
+#     passed to a callee, is a new value as far as this is concerned.
+#
+# What half 5 DOES see is the case that has now bitten twice: a
+# descriptor written correctly and then written past, in one
+# straight-line run, at a slot chosen at runtime.
+#
+# Exit 0 = struct, storage, constants agree on 24 bytes; every site's
+#          address computation is stride-24; and no site dereferences
+#          outside the descriptor it computed.
 # Exit 1 = a divergence, named by file and line, or a vacuous scan.
 
 set -uo pipefail
@@ -183,6 +263,10 @@ PRUNE = {".git", "paideia-as", "build", "target", "node_modules"}
 
 nV = nC = nZ = 0
 strays = []
+# (rel, line_index, base_reg, form, const_base_bytes) for half 5.
+sites = []
+# rel -> (comment-stripped lines, raw lines); half 5 needs both.
+filelines = {}
 
 for sub in ("src", "tests"):
     for root, dirs, files in os.walk(os.path.join(ROOT, sub)):
@@ -192,10 +276,12 @@ for sub in ("src", "tests"):
                 continue
             path = os.path.join(root, fn)
             rel  = os.path.relpath(path, ROOT)
+            raw = open(path, encoding="utf-8", errors="replace").read().split("\n")
             # Strip line comments: a stride mentioned in prose is not a
-            # stride the machine computes.
-            lines = [l.split("//")[0] for l in
-                     open(path, encoding="utf-8", errors="replace").read().split("\n")]
+            # stride the machine computes. The raw text is kept because
+            # half 5's annotation escape lives in a comment.
+            lines = [l.split("//")[0] for l in raw]
+            filelines[rel] = (lines, raw)
             for i, line in enumerate(lines):
                 m = BASE.search(line)
                 if not m:
@@ -208,6 +294,7 @@ for sub in ("src", "tests"):
                 shls = sorted(a for _, a in SHL.findall(win))
                 if shls == ["3", "4"]:
                     nV += 1
+                    sites.append((rel, i, reg, "V", None))
                     continue
                 nxt = lines[i + 1] if i + 1 < len(lines) else ""
                 am = re.search(r"add\s+" + reg + r"\s*,\s*(\d+)\s*;", nxt)
@@ -215,12 +302,14 @@ for sub in ("src", "tests"):
                     off = int(am.group(1))
                     if off % 24 == 0 and off // 24 < 256:
                         nC += 1
+                        sites.append((rel, i, reg, "C", off))
                         continue
                     strays.append((rel, i + 1,
                                    f"constant offset {off} is not slot*24 for a slot < 256"))
                     continue
                 if not shls and not am:
                     nZ += 1
+                    sites.append((rel, i, reg, "Z", 0))
                     continue
                 strays.append((rel, i + 1,
                                f"scaling by shl {{{','.join(shls)}}} is not slot*8 + slot*16"))
@@ -233,6 +322,168 @@ if strays:
          "  A site that scales differently reads a DIFFERENT, LIVE descriptor",
          "  rather than faulting — the failure mode #1589 names, at whichever",
          "  slot the arithmetic happens to land on.")
+
+# ---------------------------------------------------------------------------
+# HALF 5 — what is dereferenced FROM the base. (#1591)
+#
+# Halves 1–4 classify how the address is computed. Nothing above this
+# line looks at the offsets that are then read or written through it,
+# which is how a stray `mov [rax + 24], rdx` appended after a correct
+# three-word descriptor write passed the gate with exit 0 while
+# corrupting the next descriptor's kind.
+#
+# The walk is bounded and its bound is documented in the header. It
+# stops early rather than guessing; an untracked register is simply not
+# checked, so every way this can be wrong costs coverage, not
+# correctness.
+# ---------------------------------------------------------------------------
+
+REGS = r"(?:r[a-d]x|rsi|rdi|rbp|rsp|r8|r9|r1[0-5])"
+MEM     = re.compile(r"\[\s*(" + REGS + r")\s*([^\]]*)\]")
+MOVREG  = re.compile(r"^\s*mov\s+(" + REGS + r")\s*,\s*(" + REGS + r")\s*;")
+ADDREG  = re.compile(r"^\s*add\s+(" + REGS + r")\s*,\s*(\S+?)\s*;")
+KILL    = re.compile(r"^\s*(?:mov|lea|pop|xor|shl|shr|sar|and|or|sub|imul|movzx|movsx)\s+("
+                     + REGS + r")\s*,")
+# A write to a 32-bit alias zero-extends and so clobbers the full
+# register. Tracking it as a kill costs a little coverage and can only
+# ever remove a false positive, never create one.
+ALIAS32 = {"eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
+           "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp",
+           **{f"r{n}d": f"r{n}" for n in range(8, 16)}}
+KILL32  = re.compile(r"^\s*(?:mov|lea|pop|xor|shl|shr|sar|and|or|sub|add|imul|movzx|movsx)\s+("
+                     + "|".join(ALIAS32) + r")\s*,")
+LABEL   = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*:\s*$")
+OFFSET  = re.compile(r"^\+\s*(\d+)$")
+OKANN   = re.compile(r"//.*\[cap-stride-ok:\s*(\S[^\]]*)\]")
+
+CANON_FIELD_OFFSETS = (0, 8, 16)
+TABLE_BYTES = (tbl_u64s or 0) * 8
+
+WINDOW = 80
+offset_hits = 0          # constant dereferences inspected — half 5's vacuity floor
+annotated   = 0
+inspected_V = 0
+bad_offsets = []
+
+for rel, i, reg, form, cbase in sites:
+    lines, raw = filelines[rel]
+    tracked = {reg}
+    derefed = False
+    for j in range(i + 1, min(len(lines), i + WINDOW)):
+        l = lines[j]
+        if not l.strip():
+            continue
+        # Stop conditions. Each one is a place where the base register
+        # stops being something this scan can reason about.
+        if LABEL.match(l):
+            break
+        if re.search(r"\bcall\b", l) or re.search(r"\bret\b", l) or re.match(r"^\s*\}", l):
+            break
+
+        for dm in MEM.finditer(l):
+            if dm.group(1) not in tracked:
+                continue
+            derefed = True
+            expr = dm.group(2).strip()
+            if OKANN.search(raw[j] if j < len(raw) else ""):
+                annotated += 1
+                continue
+            om = OFFSET.match(expr) if expr else None
+            if not expr:
+                off = 0
+            elif om:
+                off = int(om.group(1))
+            else:
+                bad_offsets.append((
+                    rel, j + 1, form,
+                    f"dereference `[{dm.group(1)}{(' ' + expr) if expr else ''}]` through a "
+                    f"cap_table descriptor base is not a constant offset, so this gate cannot "
+                    f"bound it"))
+                continue
+            offset_hits += 1
+            if form == "V":
+                inspected_V += 1
+                if off not in CANON_FIELD_OFFSETS:
+                    bad_offsets.append((
+                        rel, j + 1, form,
+                        f"offset +{off} on a VARIABLE-slot descriptor base; the descriptor is "
+                        f"{desc_len} bytes and its only fields are +0 kind, +8 rights, "
+                        f"+16 target_ptr, so this addresses descriptor "
+                        f"slot+{off // (desc_len or 24)} at a slot nobody chose"))
+            else:
+                absolute = (cbase or 0) + off
+                if off % 8 != 0:
+                    bad_offsets.append((
+                        rel, j + 1, form,
+                        f"offset +{off} is not 8-byte aligned; cap_table is a u64 array"))
+                elif TABLE_BYTES and absolute >= TABLE_BYTES:
+                    bad_offsets.append((
+                        rel, j + 1, form,
+                        f"offset +{off} from a base at byte {cbase} addresses byte "
+                        f"{absolute}, past the end of cap_table ({TABLE_BYTES} bytes)"))
+
+        mm = MOVREG.match(l)
+        if mm:
+            dst, src = mm.group(1), mm.group(2)
+            if src in tracked:
+                tracked.add(dst)          # the base, parked in a second register
+            elif dst in tracked:
+                tracked.discard(dst)
+            if not tracked:
+                break
+            continue
+
+        am2 = ADDREG.match(l)
+        if am2 and am2.group(1) in tracked:
+            # `add rax, r8` is how the V-form base is finished. An
+            # immediate add, or any add once the descriptor has already
+            # been dereferenced, is re-basing: stop trusting it.
+            if re.match(r"^\d+$", am2.group(2)) or derefed:
+                tracked.discard(am2.group(1))
+            if not tracked:
+                break
+            continue
+
+        km = KILL.match(l)
+        if km and km.group(1) in tracked:
+            tracked.discard(km.group(1))
+            if not tracked:
+                break
+            continue
+
+        k32 = KILL32.match(l)
+        if k32 and ALIAS32[k32.group(1)] in tracked:
+            tracked.discard(ALIAS32[k32.group(1)])
+            if not tracked:
+                break
+
+if bad_offsets:
+    fail("dereferences outside the descriptor the site computed:",
+         *[f"    {r}:{n} [{f}] — {why}" for r, n, f, why in bad_offsets],
+         "  The base register at this site was established as a cap_table",
+         "  DESCRIPTOR address. Reading or writing outside +0/+8/+16 of it",
+         "  touches an ADJACENT, LIVE capability — and because `kind` is the",
+         "  first thing every gate checks, the corruption presents arbitrarily",
+         "  far from the write. This is #1589's failure shape reached without",
+         "  changing any declaration, which is #1591.",
+         "  If the access is genuinely correct, annotate the line and say why:",
+         "      mov [rax + N], rX;   // [cap-stride-ok: <reason>]")
+
+# Half 5's own vacuity floor. The walk has several stop conditions, and
+# a change that made it stop immediately everywhere would leave it
+# passing without inspecting anything. Current tree: 151 V-form
+# dereferences, 312 constant dereferences in total.
+MIN_V_DEREFS, MIN_DEREFS = 120, 240
+if inspected_V < MIN_V_DEREFS or offset_hits < MIN_DEREFS:
+    fail(f"vacuous half 5 — {inspected_V} variable-slot dereferences inspected "
+         f"(min {MIN_V_DEREFS}), {offset_hits} constant dereferences in total "
+         f"(min {MIN_DEREFS}).",
+         "  The forward walk stopped finding dereferences through the computed",
+         "  base, so half 5 is checking little or nothing — the same failure",
+         "  mode the half-4 vacuity guard exists to prevent, one level down. If",
+         "  the address-computation or dereference idiom legitimately changed,",
+         "  update the walk here and re-baseline these floors in the same",
+         "  commit.")
 
 # Vacuity guard. Current tree: V=71, C=30, Z=35, total 136.
 MIN_V, MIN_C, MIN_TOTAL = 60, 20, 120
@@ -254,5 +505,7 @@ if fails:
     sys.exit(1)
 
 print(f"{TAG} struct, storage and constants agree on 24 bytes; "
-      f"{total} sites pinned (V={nV} C={nC} Z={nZ})")
+      f"{total} sites pinned (V={nV} C={nC} Z={nZ}); "
+      f"{offset_hits} dereferences bounded ({inspected_V} of them pinned to "
+      f"+0/+8/+16), {annotated} annotated")
 PYEOF
