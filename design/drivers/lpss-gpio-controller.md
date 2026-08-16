@@ -318,8 +318,183 @@ different operator problems.
 
 ---
 
-## 10. Change log
+## 10. Driving pins: the channel, the pad driver, and the edge ISR
+
+R30.M6-003 (#1077) and R30.M6-004 (#1078). Everything above this section
+could have been wrong and the board would have been unharmed, because
+nothing reached a pad. This section is where that stops being true.
+
+### 10.1 Three authorities, not one
+
+| Right | What it permits | Worst outcome of getting it wrong |
+|---|---|---|
+| `READ` | sample the line | a stale reading |
+| `WRITE` | drive a line **this kernel already made an output** | a voltage on a net this component holds |
+| `CONFIG` | direction, pull, trigger | a **driver conflict** or a **resistor across a live net** |
+
+The split between `WRITE` and `CONFIG` is load-bearing and it is not
+symmetry for its own sake. Toggling an output changes a voltage on a net
+this component was granted. Turning an *input into an output* starts
+sourcing current into a net something else may already be driving; the
+pad controller does it happily and the failure is thermal, with no status
+bit anywhere.
+
+**Pull is `CONFIG`, not `WRITE`,** for a weaker version of the same
+reason that does not move it: a pull-up on a line an external device
+drives low is a real current path from the rail, through the pad's
+termination resistor, into whatever is holding the net down. A
+"preference" that can put a resistor across a live net is configuration
+authority.
+
+`WRITE` additionally cannot drive a pad this kernel never configured.
+`gpio_pad_set_level` gates on the row's **cached** direction, and that
+cache is written only after a successful physical read-modify-write, so
+`GPIO_LINE_CFG_DIR == OUTPUT` means *this kernel put it there*. Deciding
+from a live `PADCFG0` read instead would mean driving a net on the
+strength of a configuration platform firmware chose and nobody audited.
+
+### 10.2 Read-modify-write, and why the test needs a background pattern
+
+`PADCFG0` holds direction, level, inversion, trigger, interrupt routing,
+pad mode, and a scatter of reserved and vendor bits in one 32-bit word.
+A setter that computes a fresh word from the fields it cares about zeroes
+the rest — releasing interrupt routing, changing pad mode, clearing
+vendor configuration.
+
+**That failure is invisible under QEMU and permanent on silicon.** There
+is no pad controller in QEMU; the synthetic cell simply holds whatever
+was written, so a field-wise assertion passes either way. The witness
+therefore seeds a **non-zero background pattern** and asserts the *whole
+word* afterwards: `0xF69FC3FE` becomes `0xF69FC0FE` after a
+direction change to output and nothing else moves. A rebuild-from-scratch
+mutant leaves `0x00000000` there and is killed.
+
+`PADCFG1` (pull) is the *neighbouring* register, which is why the seam's
+synthetic store is a 32-bit `mov_d`: a store that widened to eight bytes
+would take `PADCFG1` with `PADCFG0`.
+
+### 10.3 The synthetic register model gained write-1-to-clear
+
+`GPI_IS`, the per-pad interrupt status word, is **not storage**. The part
+sets a bit when the configured edge arrives; software clears it by
+writing a 1 back. Writing 0 does nothing, and no write can set it.
+
+R30.M6-002 shipped the synthetic side as a plain cell array and said so,
+on the grounds that nothing in that milestone drove a non-storage
+register. A cell array **absorbs** a W1C write and then answers with the
+value written, so against it:
+
+* an ISR that writes the bit back (correct — clears the status), and
+* an ISR that never writes anything (broken — status stays set, the line
+  re-interrupts forever)
+
+leave the cell in the **same state**. An interrupt-acknowledgement test
+written on top of that model tests nothing. That is why the W1C model
+(`gpio_io.pdx` §`_gpio_io_w1c`) lands with the issue that reads `GPI_IS`
+and not after it: the clear path and its test arrive together or the test
+is theatre.
+
+Registration is fixture-driven — the community-relative offset of
+`GPI_IS` is a property of the platform description, not of the seam — and
+the registry is confined to `gpio_io.o`, because a second writer could
+make a status register behave as storage from somewhere the review never
+looked.
+
+### 10.4 An interrupt storm is a livelock, not a slow system
+
+A GPIO status bit is level-sticky. An ISR that returns with `GPI_IS`
+still asserted for an enabled pad is re-entered immediately, before any
+task runs, because the interrupt outranks everything that could diagnose
+it. The machine does not get slower; it stops.
+
+Two ordinary mistakes produce exactly this: the wrong trigger (a level
+configuration where an edge was meant), and enabling a pad whose status
+bit was already set by whatever owned the pin before this kernel did.
+
+Both ends are closed.
+
+* `gpio_pad_edge_subscribe` **clears `GPI_IS` before setting `GPI_IE`**,
+  and the reverse order on unsubscribe, so a configured edge is never
+  left enabled with nothing servicing it. The ordering claim is asserted
+  from the seam's trace, because final register state cannot express it.
+* `gpio_pad_isr` drains at most `GPIO_ISR_LINE_BUDGET` (4) times per line
+  per entry, then **masks the line in `GPI_IE`** and raises a storm flag
+  visible to a holder of `OBSERVE`. Masking is the only correct answer to
+  a bit that will not clear; leaving the loop running is the livelock
+  with extra steps.
+
+Both arms are witnessed. A line whose status register **is** registered
+W1C is serviced exactly once with no storm; a line whose status register
+is a **plain cell** — which is precisely a bit that will not clear —
+reaches the budget, sets the flag and is masked. Under the pre-#1078
+model both lines storm and the first assertion is unmakeable.
+
+`gpio_isr.pdx` holds exactly one function so that `tools/build.sh` can
+check the symbols the *object* relocates against. `GPIO_ISR_ALLOWED` is a
+**third** list, separate from `SCI_ISR_ALLOWED` and `DW_ISR_ALLOWED` on
+purpose: the three routines are bounded by different arguments over
+different hardware, and a shared list would let a symbol justified for
+one appear unexamined in another. It carries the same vacuity guard — an
+object with no relocations fails rather than passes, because "references
+nothing outside the allowlist" is trivially true of a function that
+references nothing.
+
+### 10.5 Confinement was not widened
+
+The channel ops carry an operand, which ops 0..5 did not, so the `op_arg`
+discipline changed shape rather than relaxing:
+
+```
+op_arg[7:0]    op code
+op_arg[15:8]   operand (masked to 1 or 2 bits per op, out-of-range REFUSED)
+op_arg[63:16]  MUST BE ZERO -> GPIO_LINE_OP_ARG_RESERVED
+```
+
+Eight bits cannot name one of 512 pins, one of 16 communities or one of
+128 pads — and the fifty-six bits where one *would* fit are a refusal,
+not a mask. Ops 0..5 keep discarding their upper bits because they have
+no operand for those bits to be confused with.
+
+The handler ABI is `(rights, target_ptr, op_arg)`; `cap_invoke` does not
+pass a slot. Rather than add a row-form pad-address function — which
+would take a table index from anywhere and hand back a pad address, i.e.
+exactly the second route the pin confinement exists to deny — the mint
+records the **owning slot in `target_ptr[31:16]`**, where only
+`cap_mint_write` can put it. `[15:0]` is still the row id, so every
+existing decoder is unaffected. `gpio_line_pad_off_of_slot(slot)` remains
+the only route in the kernel from anything to a pad register address.
+
+`tools/build.sh` `[gpio-pin-confine]` now pins twelve more signatures —
+the four cached-configuration accessors and the eight pad-driver
+entry points. A mutant that adds a caller-supplied pin, community or pad
+parameter to any of them fails the build.
+
+### 10.6 Failure taxonomy, extended
+
+`GPIO_PAD_*` occupies a **new** band, `0xFFFFFEE0..0xFFFFFEEF`, disjoint
+from the three adjacent bands in §9. The GPIO layers stay separate
+because "the seam refused you", "the capability refused you" and "the pad
+refused you" are three different operator problems: a rights or window
+fault, a capability fault, and a statement about the pin itself.
+
+| Code | Meaning |
+|---|---|
+| `GPIO_PAD_BAD_SLOT` | the slot is not a live line capability |
+| `GPIO_PAD_BAD_DIR` / `BAD_PULL` / `BAD_TRIG` / `BAD_LEVEL` | value outside its space — refused, never clamped |
+| `GPIO_PAD_NOT_OUTPUT` | drive attempted on a line this kernel did not make an output |
+| `GPIO_PAD_NOT_INPUT` | edge subscription attempted on an output |
+| `GPIO_PAD_NOT_GPIO` | the pad is in a native function; refused, not stolen |
+| `GPIO_PAD_IO_FAULT` | the seam refused the register access |
+| `GPIO_PAD_NO_COMM` | the community window did not resolve |
+| `GPIO_PAD_SUB_FULL` / `ALREADY_SUB` / `NOT_SUB` | subscription registry states |
+| `GPIO_PAD_STORM` | reserved for the storm verdict |
+| `GPIO_PAD_CFG_FAIL` | the register write landed but the row cache did not |
+
+---
+
+## 11. Change log
 
 | Date | Issue | Change |
 |---|---|---|
 | 2026-08-15 | #1076 | Initial: probe, BAR-to-capability, two-stage identification with the DesignWare-I²C negative check, derived PADCFG stride, community description with six refusals, the pin map, `lpss_gpio_release`, the `gpio_io` seam with its ordered trace, and the `R30 LPSS GPIO OK` witness. |
+| 2026-08-15 | #1077, #1078 | The channel (get / set / direction / pull / edge subscribe) behind the `READ`/`WRITE`/`CONFIG` bits #1075 reserved; the pad driver with read-modify-write preservation on `PADCFG0`/`PADCFG1`; write-1-to-clear semantics in the synthetic register model; the bounded edge ISR with its third call-target allowlist and storm mask; and the `R30 GPIO PAD OK` witness. |

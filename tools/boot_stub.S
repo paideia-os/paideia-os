@@ -2386,3 +2386,33 @@ kind_gpio_ok_msg: .ascii "R30 KIND_GPIO OK\n\0"
 .global kind_gpio_fail_msg
 .align 8
 kind_gpio_fail_msg: .ascii "R30 KIND_GPIO FAIL\n\0"
+
+#   R30 GPIO PAD OK   — emitted by
+#       tests/kernel/drivers/gpio/gpio_pad_synth.pdx §gpio_pad_witness,
+#       R30.M6-003 (#1077) + R30.M6-004 (#1078). It stands for the first
+#       code in this kernel that changes physical board state, and for
+#       the four properties that make that defensible:
+#         * every register write is a READ-MODIFY-WRITE that preserves
+#           the bits it does not own, asserted against a seeded non-zero
+#           background pattern -- the failure it prevents is invisible
+#           under QEMU and permanent on silicon;
+#         * the synthetic register model implements WRITE-1-TO-CLEAR, so
+#           an interrupt acknowledgement that clears the status bit and
+#           one that does not are DISTINGUISHABLE; against the plain cell
+#           array of #1076 they are not, and an edge-interrupt test
+#           written on top of one is theatre;
+#         * a misconfigured edge is BOUNDED: the service routine drains
+#           at most GPIO_ISR_LINE_BUDGET times per line per entry and
+#           then masks the line and raises a storm flag, and BOTH arms of
+#           that -- serviced-once and stormed-and-masked -- are witnessed;
+#         * turning an input into an output and putting a pull on a line
+#           are CONFIG authority, distinct from the WRITE authority that
+#           toggles an already-configured output, because each can start
+#           a fight on a net something else is driving.
+.global gpio_pad_ok_msg
+.align 8
+gpio_pad_ok_msg: .ascii "R30 GPIO PAD OK\n\0"
+
+.global gpio_pad_fail_msg
+.align 8
+gpio_pad_fail_msg: .ascii "R30 GPIO PAD FAIL\n\0"

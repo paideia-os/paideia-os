@@ -66,6 +66,20 @@ echo "[no-aml-lint] tools/lint-no-kernel-aml.sh"
     exit 1
 }
 
+# R49.M3 / #1578: emitted-vs-asserted fingerprint coverage gate. Refuses
+# the build if any "... OK" fingerprint the tree can print is asserted in
+# no expected/golden file. This defect class is invisible by construction
+# — the marker prints whether or not anything checks it — and it has now
+# recurred twice (3212fdb: 2 markers; #1578: 7 more, three of them KPTI).
+# Runs alongside the no-AML lint, before any assembler work, so a new
+# unwitnessed marker fails at the point it is introduced rather than
+# surviving until someone runs another mechanical sweep.
+echo "[fingerprint-coverage] tools/verify-fingerprint-coverage.sh"
+"${REPO_ROOT}/tools/verify-fingerprint-coverage.sh" || {
+    echo "[FAIL] unwitnessed boot fingerprint (#1578 gate)" >&2
+    exit 1
+}
+
 echo "[build-user] ensuring build/user/shell.bin (R15-M1-007 embed prerequisite)"
 "${REPO_ROOT}/tools/build-user.sh"
 
@@ -747,6 +761,87 @@ fi
 echo "[dw-isr-allowlist] dw_isr.o call targets within the bounded allowlist"
 
 # ---------------------------------------------------------------------------
+# R30.M6-004 (#1078): GPIO EDGE-ISR CALL-TARGET ALLOWLIST.
+#
+# A THIRD, SEPARATE list. It does not extend SCI_ISR_ALLOWED and it does
+# not extend DW_ISR_ALLOWED, and neither of those extends it, for the
+# reason already stated above the I2C one: the three routines are bounded
+# by different arguments over different hardware, and a shared list would
+# let a symbol justified for the ACPI SCI appear, unexamined, in the
+# pad-controller path. If a call belongs in GPIO interrupt context, it
+# goes here and the commit says why it is bounded.
+#
+# src/kernel/core/drivers/gpio/gpio_isr.pdx contains exactly one function
+# for this check's sake. Every symbol below is bounded and non-blocking:
+#
+#   gpio_pad_sub_slot        bounds check plus one load
+#   gpio_pad_is_off_of_slot  capability resolve plus table reads; its one
+#                            internal loop is bounded by GPIO_COMM_MAX_PINS
+#   gpio_pad_bit_of_slot     capability resolve plus a shift loop bounded
+#                            by 32
+#   gpio_io_read32           window capability re-resolve plus one load
+#   gpio_io_write32          window capability re-resolve plus one store
+#   gpio_pad_sub_bump        two row accesses and a store, no loop
+#   gpio_pad_sub_storm       one GPI_IE read-modify-write, no loop
+#
+# None allocates, none takes a lock, none can block, none reaches a
+# scheduler, an IPC send, or a firmware-method interpreter.
+#
+# The ISR's own loops are 4 subscriptions x GPIO_ISR_LINE_BUDGET services,
+# both compile-time constants, so its cost cannot grow with anything the
+# hardware controls -- which is the whole point on a part where a
+# mis-triggered pad re-raises its interrupt forever. See
+# src/kernel/core/drivers/gpio/gpio_isr.pdx §Why an interrupt storm is a
+# livelock.
+GPIO_ISR_OBJ="${BUILD_DIR}/core/drivers/gpio/gpio_isr.o"
+if [[ ! -f "${GPIO_ISR_OBJ}" ]]; then
+    echo "[gpio-isr-allowlist] FAIL: ${GPIO_ISR_OBJ} not built" >&2
+    exit 1
+fi
+GPIO_ISR_ALLOWED="
+gpio_pad_sub_slot
+gpio_pad_sub_bump
+gpio_pad_sub_storm
+gpio_pad_is_off_of_slot
+gpio_pad_bit_of_slot
+gpio_io_read32
+gpio_io_write32
+"
+gpio_isr_refs=$(objdump -r "${GPIO_ISR_OBJ}" 2>/dev/null \
+    | awk 'NF >= 3 && $1 ~ /^[0-9a-f]+$/ { print $3 }' \
+    | sed -e 's/[-+]0x[0-9a-f]*$//' | sort -u)
+if [[ -z "${gpio_isr_refs}" ]]; then
+    echo "[gpio-isr-allowlist] FAIL: no relocations found in gpio_isr.o" >&2
+    echo "  The ISR was gutted or inlined away; the allowlist would then pass" >&2
+    echo "  vacuously, so it fails instead. An ISR that references nothing" >&2
+    echo "  trivially satisfies 'references nothing outside the allowlist'." >&2
+    exit 1
+fi
+gpio_isr_bad=""
+while IFS= read -r sym; do
+    [[ -z "${sym}" ]] && continue
+    if ! grep -qxF -- "${sym}" <<< "${GPIO_ISR_ALLOWED}"; then
+        gpio_isr_bad="${gpio_isr_bad} ${sym}"
+    fi
+done <<< "${gpio_isr_refs}"
+if [[ -n "${gpio_isr_bad}" ]]; then
+    echo "[gpio-isr-allowlist] FAIL — core/drivers/gpio/gpio_isr.o references:${gpio_isr_bad}" >&2
+    echo "  The GPIO edge service routine may only call bounded, non-blocking" >&2
+    echo "  primitives. No allocation, no lock, no scheduling, no IPC, no" >&2
+    echo "  unbounded loop behind a call. A GPIO status bit is level-sticky:" >&2
+    echo "  an ISR that cannot finish promptly does not make the machine slow," >&2
+    echo "  it stops it, because the interrupt outranks anything that could" >&2
+    echo "  diagnose the problem." >&2
+    echo "  If a new call really belongs in GPIO interrupt context, add it to" >&2
+    echo "  GPIO_ISR_ALLOWED here AND say in the commit why it is bounded." >&2
+    echo "  Do NOT widen SCI_ISR_ALLOWED or DW_ISR_ALLOWED instead; the three" >&2
+    echo "  lists are separate on purpose." >&2
+    echo "  See src/kernel/core/drivers/gpio/gpio_isr.pdx §The allowlist." >&2
+    exit 1
+fi
+echo "[gpio-isr-allowlist] gpio_isr.o call targets within the bounded allowlist"
+
+# ---------------------------------------------------------------------------
 # R30.M6-001 (#1075) / R30.M6-002 (#1076): GPIO PIN CONFINEMENT.
 #
 # A pad controller owns EVERY PIN ON THE PACKAGE. On a T14 G4 those pins
@@ -903,6 +998,19 @@ gpio_confine_one '_gpio_io_bound'     'core/drivers/gpio/gpio_io.o'
 gpio_confine_one '_gpio_io_synth_ram' 'core/drivers/gpio/gpio_io.o'
 gpio_confine_one '_gpio_io_trace'     'core/drivers/gpio/gpio_io.o'
 gpio_confine_one '_gpio_io_trace_n'   'core/drivers/gpio/gpio_io.o'
+# R30.M6-004 (#1078): the write-1-to-clear registry decides whether a
+# store to a synthetic register is absorbed or acknowledged, so a second
+# writer could make a status register behave as storage from somewhere
+# the review never looked -- and an interrupt test against a storage
+# status register cannot tell a correct acknowledgement from a missing
+# one. Same argument as _gpio_io_mode's, which it sits beside.
+gpio_confine_one '_gpio_io_w1c'       'core/drivers/gpio/gpio_io.o'
+# R30.M6-004 (#1078): the edge-subscription registry. It holds capability
+# SLOTS and no cached addresses, and it is what the ISR walks; a second
+# writer could enrol a line the capability layer never authorised, and
+# the ISR would then be re-deriving a pad address from someone else's
+# descriptor on every interrupt.
+gpio_confine_one '_gpio_pad_sub'      'core/drivers/gpio/gpio_pad.o'
 gpio_confine_pair 'lpss_gpio_pad_off' 'core/drivers/gpio/lpss_gpio.o' 'core/cap/kind_gpio_line.o'
 
 # The address producers, restricted to the seam WITHIN core/drivers/gpio/.
@@ -979,8 +1087,54 @@ gpio_pin_pin_one 'pub let gpio_line_community_of_slot : (u64) -> u64'
 gpio_pin_pin_one 'pub let gpio_line_pad_of_slot : (u64) -> u64'
 gpio_pin_pin_one 'pub let gpio_line_ctrl_of_slot : (u64) -> u64'
 gpio_pin_pin_one 'pub let gpio_line_pad_off_of_slot : (u64) -> u64'
+# R30.M6-003 (#1077): the cached-configuration accessors. The getters are
+# arity one like every resolver above. The SETTERS take a second
+# parameter and it is a six-bit configuration VALUE, never a selector --
+# six bits cannot name one of 512 pins, one of 16 communities or one of
+# 128 pads, and gpio_line_set_cfg_of_slot refuses anything wider rather
+# than masking it. Pinned here so a mutant that widens either second
+# parameter into a pin, community or pad argument fails the build.
+gpio_pin_pin_one 'pub let gpio_line_cfg_of_slot : (u64) -> u64'
+gpio_pin_pin_one 'pub let gpio_line_set_cfg_of_slot : (u64, u64) -> u64'
+gpio_pin_pin_one 'pub let gpio_line_edge_of_slot : (u64) -> u64'
+gpio_pin_pin_one 'pub let gpio_line_set_edge_of_slot : (u64, u64) -> u64'
+# R30.M6-004 (#1078): the pad driver and its interrupt-register helpers.
+# THE STAKES ARE HIGHER HERE THAN FOR THE RESOLVERS ABOVE, because these
+# functions WRITE. A caller-supplied pin, community or pad on any of them
+# would mean a caller choosing which physical net to drive, which
+# terminate, or whose interrupt to acknowledge. Every one of them takes a
+# capability slot and, at most, a two-bit configuration value.
+GPIO_PAD_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpio/gpio_pad.pdx"
+gpio_pad_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${GPIO_PAD_SRC}"; then
+        echo "[gpio-pin-confine] FAIL — expected pad-driver declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "  Every function in gpio_pad.pdx takes a CAPABILITY SLOT and, at" >&2
+        echo "  most, a narrow configuration value. These are the functions that" >&2
+        echo "  actually write PADCFG0, PADCFG1, GPI_IS and GPI_IE, so an extra" >&2
+        echo "  parameter here is a caller choosing which physical net to drive." >&2
+        echo "  If a signature legitimately changed, the confinement argument in" >&2
+        echo "  gpio_pad.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+gpio_pad_pin_one 'pub let gpio_pad_get_level : (u64) -> u64'
+gpio_pad_pin_one 'pub let gpio_pad_set_level : (u64, u64) -> u64'
+gpio_pad_pin_one 'pub let gpio_pad_set_dir : (u64, u64) -> u64'
+gpio_pad_pin_one 'pub let gpio_pad_set_pull : (u64, u64) -> u64'
+gpio_pad_pin_one 'pub let gpio_pad_edge_subscribe : (u64, u64) -> u64'
+gpio_pad_pin_one 'pub let gpio_pad_edge_unsubscribe : (u64) -> u64'
+gpio_pad_pin_one 'pub let gpio_pad_edge_count : (u64) -> u64'
+gpio_pad_pin_one 'pub let gpio_pad_edge_storm : (u64) -> u64'
+gpio_pad_pin_one 'pub let gpio_pad_comm_base_of_slot : (u64) -> u64'
+gpio_pad_pin_one 'pub let gpio_pad_is_off_of_slot : (u64) -> u64'
+gpio_pad_pin_one 'pub let gpio_pad_ie_off_of_slot : (u64) -> u64'
+gpio_pad_pin_one 'pub let gpio_pad_bit_of_slot : (u64) -> u64'
 echo "[gpio-pin-confine] pin, community, pad, controller and pad-address"
 echo "[gpio-pin-confine] resolvers take no caller-supplied pin"
+echo "[gpio-pin-confine] pad driver and interrupt-register helpers take no"
+echo "[gpio-pin-confine] caller-supplied pin, community or pad"
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
