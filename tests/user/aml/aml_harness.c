@@ -7474,6 +7474,58 @@ static void test_ec_query_dispatch_reenters_the_ec(void)
     });
 }
 
+/* R30.M8-DEBUG. aml_ec_query_pump's own QR_EC handshake calls
+ * aml_ec_glk_enter exactly as aml_ec_xact does, but the call site was
+ * left unchecked when #1082 landed: aml_ec_xact was gated with cmp/je
+ * aml_ecx_glk, this one was not, and it fell straight through into the
+ * handshake on a refusal -- the same defect class the #1082 commit
+ * describes fixing, unfixed one call site over.
+ *
+ * The symptom is exactly the balance identity ec_glk_balanced checks:
+ * a refused aml_ec_glk_enter does not bump GLK_IN, but the unconditional
+ * aml_ec_glk_leave on every exit path still bumps GLK_OUT, so
+ * GLK_IN == GLK_OUT fails whenever a query lands while firmware holds
+ * the lock -- which no existing fixture arranged. */
+static void test_ec_query_refused_when_glk_denied(void)
+{
+    uint8_t f[256];
+    size_t n = build_ec_device(f);
+    WITH_PARSE("ec: a query pump refuses rather than transacting against "
+               "an EC firmware currently owns", f, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t dev = nth_child(root, 1);
+
+        eq("attach", aml_ec_attach(dev, 0x62, 0x66), 1);
+
+        ec_fresh(EC_WEDGE_NONE);
+        aml_ec_synth_query_set(0x80);
+
+        /* Firmware holds the Global Lock and never lets go -- the same
+         * setup test_glk_firmware_that_never_releases_is_refused uses
+         * against aml_glk_enter directly, exercised here through the
+         * QR_EC handshake instead. */
+        glk_fresh(GLK_OWNED);
+        aml_glk_smm_signal_after(0);
+
+        aml_eval_reset(2);
+        aml_eval_set_fuel(100000);
+        uint64_t dc = aml_ec_stat(EC_ST_COMMITTED);
+        uint64_t seen = aml_ec_stat(EC_ST_Q_SEEN);
+
+        eq("the query pump refuses rather than issuing QR_EC",
+           aml_ec_query_pump(), EC_FAIL);
+        eq("with the Global Lock's own timeout code",
+           aml_eval_err(), E_GLK_TIMEOUT);
+        eq("NOT either EC timeout code",
+           (uint64_t)(aml_eval_err() == 69 || aml_eval_err() == 70), 0);
+        eq("no QR_EC transaction was ever committed",
+           aml_ec_stat(EC_ST_COMMITTED), dc);
+        eq("and no query byte was seen",
+           aml_ec_stat(EC_ST_Q_SEEN), seen);
+        ec_glk_balanced("a GLK-denied query pump unbalanced the seam");
+    });
+}
+
 static void test_ec_direct_field_access_through_the_evaluator(void)
 {
     uint8_t f[256];
@@ -7705,6 +7757,7 @@ int main(void)
     test_ec_out_of_range_is_refused_not_wrapped();
     test_ec_reentrant_transaction_is_refused_outer_survives();
     test_ec_query_dispatch_reenters_the_ec();
+    test_ec_query_refused_when_glk_denied();
     test_ec_direct_field_access_through_the_evaluator();
 
     /* R30.M8-001 (#1082) — the ACPI Global Lock. AFTER the EC block,
