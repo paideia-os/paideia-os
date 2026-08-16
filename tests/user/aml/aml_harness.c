@@ -363,6 +363,10 @@ extern uint64_t aml_glk_try(void);
 extern uint64_t aml_glk_enter(void);
 extern uint64_t aml_glk_leave(void);
 extern uint64_t aml_glk_depth(void);
+/* R30.M9-002 (#1086) — the death/teardown path. */
+extern uint64_t aml_glk_abandon(void);
+extern uint64_t aml_glk_abandon_stat(uint64_t which);
+extern void     aml_glk_smm_step(void);
 extern uint64_t aml_eval_find_in_scope(uint64_t scope, uint64_t seg);
 extern uint64_t aml_region_acc_log(uint64_t aw);
 extern uint64_t aml_region_of_field(uint64_t node);
@@ -7065,6 +7069,206 @@ static void test_glk_wait_completes_when_firmware_releases(void)
     eq("guard intact", aml_glk_facs_guard(), GLK_GUARD);
 }
 
+/* ==================================================================== */
+/* R30.M9-002 (#1086) — DEATH WHILE HOLDING THE GLOBAL LOCK.            */
+/*                                                                      */
+/* The acpi_supervisor is a userspace process and a fault inside it is  */
+/* ordinary. What is NOT ordinary is a fault taken while it holds the   */
+/* ACPI Global Lock: the lock word lives in firmware-owned memory at    */
+/* FACS+0x10, so a process that dies holding it leaves firmware waiting */
+/* for a release that is never coming. On the T14 G4 the firmware side  */
+/* owns thermal response, which makes a stranded lock not a hung        */
+/* process but a machine that has stopped managing its own temperature. */
+/*                                                                      */
+/* aml_glk_abandon is the operation that gives it back. These fixtures  */
+/* first make the hazard VISIBLE — a held lock really does leave the    */
+/* Owned bit set — and then assert that abandon clears it, at every     */
+/* nesting level, while keeping the balance identities true so that     */
+/* "not stranded" is an assertion rather than an inspection.            */
+/*                                                                      */
+/* See design/acpi/crash-isolation.md §4.                               */
+/* ==================================================================== */
+
+/* THE HAZARD, DEMONSTRATED BEFORE IT IS ANSWERED.
+ *
+ * A test that only showed abandon working would leave open whether there
+ * was ever anything to fix. So this holds the lock, does NOT release it,
+ * and asserts the stranded state exists — Owned set, our depth non-zero,
+ * and the hardware acquire/release counts UNBALANCED, which is what a
+ * leak looks like from the outside. Only then is abandon called. */
+static void test_glk_death_while_holding_strands_the_lock(void)
+{
+    g_case = "glk: dying while holding leaves the lock stranded";
+    glk_fresh_clean(0);
+
+    eq("we take the lock", aml_glk_enter(), 1);
+    eq("and hold it", aml_glk_depth(), 1);
+
+    /* This is the moment of death: no leave will ever be issued. */
+    eq("FIRMWARE'S LOCK WORD STILL SAYS OWNED",
+       aml_glk_facs_word() & GLK_OWNED, GLK_OWNED);
+    /* Pin both counters rather than asserting the derived inequality.
+     * `acquires == releases` is 1 == 0 here by construction and cannot
+     * fail once the enter above is known to have succeeded, so it
+     * carries no information; the individual values do — they would
+     * catch an enter that double-counted its hardware acquire, which is
+     * the accounting error that would later make abandon's balance
+     * restoration look correct while being wrong. */
+    eq("exactly one hardware acquire", aml_glk_stat(GLK_ST_ACQUIRES), 1);
+    eq("and no release yet — this is the leak",
+       aml_glk_stat(GLK_ST_RELEASES), 0);
+
+    /* Now the successor surrenders it. */
+    eq("abandon surrenders one level", aml_glk_abandon(), 1);
+    eq("THE LOCK WORD IS CLEAR", aml_glk_facs_word(), 0);
+    eq("we hold nothing", aml_glk_depth(), 0);
+    eq("and the hardware counts balance again — not stranded",
+       aml_glk_stat(GLK_ST_ACQUIRES), aml_glk_stat(GLK_ST_RELEASES));
+    eq("guard intact", aml_glk_facs_guard(), GLK_GUARD);
+    eq("no error was latched", aml_eval_err(), AML_OK);
+}
+
+/* ONE HARDWARE RELEASE, HOWEVER DEEPLY WE NESTED.
+ *
+ * Nesting depth is our own bookkeeping; the hardware lock is held once.
+ * An abandon that looped the hardware arm would, from its second pass,
+ * be releasing a lock it no longer held — which is precisely what
+ * aml_glk_leave's underflow refusal exists to catch. */
+static void test_glk_abandon_surrenders_every_nesting_level(void)
+{
+    g_case = "glk: abandon surrenders every nesting level at once";
+    glk_fresh_clean(0);
+
+    eq("outermost", aml_glk_enter(), 1);
+    eq("nested",    aml_glk_enter(), 1);
+    eq("nested",    aml_glk_enter(), 1);
+    eq("depth 3",   aml_glk_depth(), 3);
+    eq("but only ONE hardware acquire", aml_glk_stat(GLK_ST_ACQUIRES), 1);
+
+    eq("abandon reports all three levels", aml_glk_abandon(), 3);
+    eq("depth 0", aml_glk_depth(), 0);
+    eq("word clear", aml_glk_facs_word(), 0);
+
+    /* Exactly one hardware release, matching the one acquire. */
+    eq("one hardware release, not three", aml_glk_stat(GLK_ST_RELEASES), 1);
+    eq("hardware balance", aml_glk_stat(GLK_ST_ACQUIRES),
+                           aml_glk_stat(GLK_ST_RELEASES));
+
+    /* THE NESTING IDENTITY SURVIVES TOO. The two inner levels are
+     * credited to nested leaves; an abandon that forgot to account for
+     * them would leave this identity broken in exactly the way a real
+     * leak does, which would make it useless as a leak detector. */
+    eq("nesting balance", aml_glk_stat(GLK_ST_NEST_IN),
+                          aml_glk_stat(GLK_ST_NEST_OUT));
+
+    eq("levels surrendered, last", aml_glk_abandon_stat(2), 3);
+    eq("levels surrendered, total", aml_glk_abandon_stat(1), 3);
+    eq("guard intact", aml_glk_facs_guard(), GLK_GUARD);
+}
+
+/* HOLDING NOTHING IS NOT AN ERROR.
+ *
+ * aml_glk_leave answers depth 0 with AML_ERR_GLK_UNDERFLOW because a
+ * release with nothing outstanding means a caller's bracketing is
+ * broken. On a teardown path the same condition is the ORDINARY case:
+ * most deaths do not happen inside the critical section. If abandon
+ * latched a refusal every clean shutdown, an operator would learn to
+ * ignore this code — and then ignore the one that mattered. */
+static void test_glk_abandon_holding_nothing_is_not_an_error(void)
+{
+    g_case = "glk: abandon while holding nothing is silent";
+    glk_fresh_clean(0);
+
+    eq("we hold nothing", aml_glk_depth(), 0);
+    eq("abandon surrenders nothing", aml_glk_abandon(), 0);
+    eq("AND LATCHES NO ERROR", aml_eval_err(), AML_OK);
+    eq("no underflow was counted", aml_glk_stat(GLK_ST_UNDERFLOW), 0);
+    eq("this module's own latch is clean too",
+       aml_glk_stat(GLK_ST_LAST_ERR), 0);
+    eq("no hardware release was attempted", aml_glk_stat(GLK_ST_RELEASES), 0);
+    eq("the lock word was not touched", aml_glk_facs_word(), 0);
+    eq("but the call was counted", aml_glk_abandon_stat(0), 1);
+
+    /* Contrast, in the same fixture, so the difference is on one screen:
+     * the ORDINARY release path still refuses at depth 0. */
+    eq("leave still refuses", aml_glk_leave(), 0);
+    eq("with UNDERFLOW", aml_eval_err(), E_GLK_UNDERFLOW);
+    eq("and counts it", aml_glk_stat(GLK_ST_UNDERFLOW), 1);
+}
+
+/* A dying process may be torn down more than once — a fault handler and
+ * a supervisor sweep can both reach it. The second abandon must be a
+ * no-op, not a second release of a lock somebody else may by then hold. */
+static void test_glk_abandon_is_idempotent(void)
+{
+    g_case = "glk: a second abandon releases nothing";
+    glk_fresh_clean(0);
+
+    eq("hold it", aml_glk_enter(), 1);
+    eq("first abandon", aml_glk_abandon(), 1);
+    eq("one hardware release", aml_glk_stat(GLK_ST_RELEASES), 1);
+
+    eq("SECOND ABANDON SURRENDERS NOTHING", aml_glk_abandon(), 0);
+    eq("and issues no second hardware release",
+       aml_glk_stat(GLK_ST_RELEASES), 1);
+    eq("no error", aml_eval_err(), AML_OK);
+    eq("word still clear", aml_glk_facs_word(), 0);
+    eq("two calls counted", aml_glk_abandon_stat(0), 2);
+    eq("but only one level ever surrendered", aml_glk_abandon_stat(1), 1);
+}
+
+/* THE DOORBELL IS NOT OPTIONAL ON THE DEATH PATH EITHER.
+ *
+ * If firmware registered Pending while we held the lock, it is parked
+ * waiting for GBL_STS. Abandoning the lock without ringing the doorbell
+ * clears the word and still leaves firmware asleep — the failure mode is
+ * identical to not releasing at all, and it is quieter. */
+static void test_glk_abandon_rings_the_doorbell_iff_someone_waits(void)
+{
+    g_case = "glk: abandon rings the doorbell when firmware is pending";
+    glk_fresh_clean(0);
+
+    eq("hold it", aml_glk_enter(), 1);
+    uint64_t bells = aml_glk_smm_stat(GLK_SMM_BELLS);
+
+    /* Firmware registers its interest while we hold the lock. */
+    aml_glk_smm_arm(1, GLK_PENDING);
+    aml_glk_smm_step();
+    eq("firmware is now pending",
+       aml_glk_facs_word() & GLK_PENDING, GLK_PENDING);
+
+    eq("abandon", aml_glk_abandon(), 1);
+    eq("THE DOORBELL RANG", aml_glk_smm_stat(GLK_SMM_BELLS), bells + 1);
+    eq("word clear", aml_glk_facs_word(), 0);
+    eq("guard intact", aml_glk_facs_guard(), GLK_GUARD);
+
+    /* And the negative half: with nobody pending, no doorbell. A signal
+     * on every release would be indistinguishable from a correct one
+     * here, so both directions have to be asserted. */
+    glk_fresh_clean(0);
+    eq("hold it", aml_glk_enter(), 1);
+    bells = aml_glk_smm_stat(GLK_SMM_BELLS);
+    eq("abandon", aml_glk_abandon(), 1);
+    eq("NO doorbell, because nobody was waiting",
+       aml_glk_smm_stat(GLK_SMM_BELLS), bells);
+}
+
+/* NOT TESTED HERE, AND THE REASON IS STRUCTURAL, NOT AN OMISSION.
+ *
+ * aml_glk_abandon's unbound arm — the refusal when no FACS was ever
+ * located — cannot be exercised at this point in the file. The binding
+ * DELIBERATELY SURVIVES aml_glk_reset (see its justification: where the
+ * FACS is is a system fact, not a per-session one), and there is no
+ * detach operation, so "nothing is bound" is a ONE-SHOT observation. It
+ * is spent by test_ec_refuses_before_it_is_attached, which must run
+ * before the first attach and therefore long before this block.
+ *
+ * A test that re-attached in order to un-attach would be asserting
+ * against a state the shipping code cannot enter. The arm itself is
+ * byte-for-byte the shape of aml_glk_leave's unbound arm, which IS under
+ * test; recorded here so the gap is visible rather than merely absent.
+ */
+
 static void test_ec_name_segment_construction(void)
 {
     g_case = "ec: _Qxx name construction";
@@ -7771,6 +7975,28 @@ int main(void)
     test_glk_refusals_are_distinct_and_counted();
     test_glk_firmware_that_never_releases_is_refused();
     test_glk_wait_completes_when_firmware_releases();
+
+    /* R30.M9-002 (#1086) — death while holding the Global Lock.
+     *
+     * ON ORDERING. These five are self-contained: each opens with
+     * glk_fresh_clean(0), which resets the evaluation session and the
+     * lock state, so none depends on a predecessor. The hazard fixture
+     * does hold the lock mid-body, but it abandons it and asserts
+     * depth == 0 and a clear FACS word before returning.
+     *
+     * The one residue is in test_glk_abandon_holding_nothing_is_not_an_
+     * error, which deliberately ends by calling aml_glk_leave() at
+     * depth 0 to show the contrasting refusal — latching
+     * E_GLK_UNDERFLOW into the first-writer-wins evaluator slot. That is
+     * cleared by the next fixture's glk_fresh_clean, and nothing runs
+     * after this block but the g_fail check. A fixture inserted AFTER
+     * these that asserted on aml_eval_err() without resetting first
+     * would read that underflow and be wrong about why. */
+    test_glk_death_while_holding_strands_the_lock();
+    test_glk_abandon_surrenders_every_nesting_level();
+    test_glk_abandon_holding_nothing_is_not_an_error();
+    test_glk_abandon_is_idempotent();
+    test_glk_abandon_rings_the_doorbell_iff_someone_waits();
 
     if (g_fail) {
         fprintf(stderr, "[aml-corpus] %d assertion(s) failed out of %d\n",
