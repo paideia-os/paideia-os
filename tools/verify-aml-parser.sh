@@ -110,7 +110,7 @@ HARNESS="${REPO_ROOT}/tests/user/aml/aml_harness.c"
 OUT="${REPO_ROOT}/build/aml"
 
 MODULES=(aml_lex aml_arena aml_optab aml_ns aml_term aml_resource aml_eval aml_arith
-         aml_obj aml_str aml_ref aml_ctl aml_region aml_ec)
+         aml_obj aml_str aml_ref aml_ctl aml_region aml_ec aml_glk)
 
 # ── environment ──────────────────────────────────────────────────────
 PA_BIN="$(bash "${REPO_ROOT}/tools/find-paideia-as.sh")"
@@ -353,6 +353,35 @@ check_confined "EC gate state confined to aml_region.o" aml_region \
 check_confined "EC driver state confined to aml_ec.o" aml_ec \
                "(aml_ec_state|aml_ec_synth|aml_ec_ram)${END}"
 
+# R30.M8-001 (#1082). THE GLOBAL LOCK'S STATE.
+#
+# aml_glk_state carries THE OWNERSHIP DEPTH, and the depth is the whole
+# nesting argument. The hardware lock is taken at 0->1 and released at
+# 1->0; a second writer that set the depth to 1 would make the next
+# release drop a hardware lock this process never took, handing the EC
+# to firmware while some other caller is mid-transaction on it. One that
+# zeroed the depth mid-episode would make the outer release underflow
+# and leave the lock held forever — firmware locked out of its own
+# embedded controller until the machine is power-cycled.
+#
+# It also carries the FACS address and the two PM1 ports. A second
+# writer there is a compare-exchange against a guessed address and a
+# doorbell delivered to the wrong port, which is to say a doorbell that
+# never rings.
+#
+# aml_glk_facs and aml_glk_smm are the synthetic FACS and the synthetic
+# System Management Mode. They are confined for the reason aml_ec_synth
+# is, and one reason more. The corpus proves that an adversary which
+# mutated the lock word between our read and our write was DETECTED —
+# that the compare-exchange failed and we re-derived from the truth. If
+# any other object could write either the model or the lock word, the
+# detection claim would be worth nothing, because the interference the
+# corpus attributes to the injection point could have come from
+# anywhere. Single ownership is what makes the adversarial fixture
+# evidence rather than decoration.
+check_confined "Global Lock state confined to aml_glk.o" aml_glk \
+               "(aml_glk_state|aml_glk_facs|aml_glk_smm)${END}"
+
 # ── 3b. R30.M3-003 (#1063): PORT I/O CONFINEMENT ─────────────────────
 #
 # The SystemIO handler's transaction/logic split rests on `in` and `out`
@@ -486,6 +515,74 @@ pin_signature "${EC_SRC}" \
     "pub let aml_ec_attach : (u64, u64, u64) -> u64 !{mem} @{} =" \
     "Both EC ports come from the device's _CRS through this one entry point. If it grew a default, a machine that relocates the EC would be transacted against at 0x62/0x66 anyway."
 echo "[aml-parser] signatures pinned: aml_ec_xact / aml_ec_query_pump / aml_ec_attach"
+
+# R30.M8-001 (#1082). THE GLOBAL LOCK'S ARITIES.
+#
+# aml_glk_enter and aml_glk_leave take NOTHING. The lock they operate on
+# is the one aml_glk_attach bound, and there is exactly one Global Lock
+# on a machine — it is a platform singleton, not a resource with
+# instances. A caller-supplied FACS address here would be the same class
+# of defect as the caller-supplied EC base #1081 refused: it would make
+# "compare-exchange against a word that is not the platform's lock"
+# expressible, and the code that did it would look correct and would
+# serialize this process against nothing at all.
+#
+# aml_glk_leave is pinned as returning u64 rather than unit for a
+# narrower reason: the release path CAN refuse (underflow, unbound,
+# compare-exchange stuck), and a signature with nowhere to put that
+# answer is a signature that invites discarding it silently at every
+# future call site rather than at the one that has an argument for it.
+GLK_SRC="${AML_SRC}/aml_glk.pdx"
+pin_signature "${GLK_SRC}" \
+    "pub let aml_glk_enter : () -> u64 !{mem} @{} =" \
+    "The acquire takes NO arguments. The FACS comes from aml_glk_attach; a caller-supplied address would compare-exchange a word that is not the platform's Global Lock, serializing this process against nothing. See design/acpi/global-lock.md §6."
+pin_signature "${GLK_SRC}" \
+    "pub let aml_glk_leave : () -> u64 !{mem} @{} =" \
+    "The release takes NO arguments and RETURNS one. See design/acpi/global-lock.md §6."
+pin_signature "${GLK_SRC}" \
+    "pub let aml_glk_attach : (u64, u64, u64) -> u64 !{mem} @{} =" \
+    "The FACS address and both PM1 ports enter through this one point, with no defaults. A default FACS address is a compare-exchange against a guessed word; a default PM1_CNT port is a doorbell that never rings. See design/acpi/global-lock.md §6."
+echo "[aml-parser] signatures pinned: aml_glk_enter / aml_glk_leave / aml_glk_attach"
+
+# R30.M8-001 (#1082). THE COMPARE-EXCHANGE IS 32-BIT, ASSERTED IN BYTES.
+#
+# The ACPI Global Lock is the u32 at FACS+0x10. The FACS `Flags` field is
+# the u32 at FACS+0x14, immediately after it. A 64-bit compare-exchange
+# at +0x10 read-modify-writes BOTH — it carries Flags through the acquire
+# arithmetic and stores it back, silently reverting any firmware update
+# that landed in the window.
+#
+# `lock_cmpxchg` and `lock_cmpxchg_d` differ by one character in the
+# source and by one REX.W bit in the emitted machine code, and the wrong
+# one assembles, links, boots and works on every machine whose Flags
+# field happens not to change. So the assertion is made HERE, in bytes,
+# in the style of tools/verify-atomics.sh: every compare-exchange emitted
+# by this module must carry the 32-bit opcode, and NONE may carry the
+# 64-bit one.
+#
+# The vacuity guard matters as much as the assertion: a refactor that
+# removed the compare-exchange entirely would otherwise satisfy "no
+# 64-bit form present" trivially.
+GLK_OBJ="${OUT}/aml_glk.o"
+glk_dis="$(objdump -d "${GLK_OBJ}" 2>/dev/null || true)"
+glk_cx32="$(printf '%s\n' "${glk_dis}" | grep -c 'f0 41\{0,1\} *0f b1' || true)"
+glk_cx64="$(printf '%s\n' "${glk_dis}" | grep -cE 'f0 4[89abcdef] 0f b1' || true)"
+if [[ "${glk_cx32}" -lt 2 ]]; then
+    echo "[aml-parser] FAIL — aml_glk.o emits ${glk_cx32} 32-bit LOCK CMPXCHG(s), expected at least 2" >&2
+    echo "  The acquire loop and the release loop must each compare-exchange the" >&2
+    echo "  Global Lock. Fewer than two means one of them lost its atomic — which" >&2
+    echo "  still assembles and still works whenever firmware does not interleave." >&2
+    exit 1
+fi
+if [[ "${glk_cx64}" -ne 0 ]]; then
+    echo "[aml-parser] FAIL — aml_glk.o emits a 64-bit LOCK CMPXCHG (F0 REX.W 0F B1)" >&2
+    echo "  The Global Lock is the u32 at FACS+0x10 and FACS Flags is the u32 at" >&2
+    echo "  +0x14. A 64-bit compare-exchange read-modify-writes both, reverting any" >&2
+    echo "  firmware update to Flags that lands inside the window. Use" >&2
+    echo "  lock_cmpxchg_d. See design/acpi/global-lock.md §4." >&2
+    exit 1
+fi
+echo "[aml-parser] Global Lock: ${glk_cx32} 32-bit LOCK CMPXCHG, 0 64-bit"
 
 # ── 4. the corpus ────────────────────────────────────────────────────
 OBJS=()

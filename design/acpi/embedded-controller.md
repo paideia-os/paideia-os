@@ -293,25 +293,62 @@ some *other* device's `_Q80`.
 
 ---
 
-## 7. The Global Lock seam
+## 7. The Global Lock seam — **filled by R30.M8-001 (#1082)**
 
-The ACPI Global Lock lands in a later R30 issue. It is not implemented
-here. What is implemented is the seam, in a form that cannot silently rot:
+This section originally described a seam with nothing behind it. The lock
+is now real: `src/user/aml/aml_glk.pdx`, documented in
+`design/acpi/global-lock.md`.
 
 `aml_ec_glk_enter()` / `aml_ec_glk_leave()` bracket the **handshake**,
-inside `xact_busy`, on every path including every timeout exit. Today
-they only count. The corpus asserts
+inside `xact_busy`, on every path including every timeout exit. They now
+delegate to `aml_glk_enter` / `aml_glk_leave`, which run the ACPI 6.5
+§5.2.10.1 compare-exchange against the FACS and count ownership so a
+recursive acquire does not re-take the hardware lock.
 
-> `glk_enters == glk_leaves`  and  `glk_enters == transactions attempted`
+**The placement was chosen so that this substitution needed no other
+change to the transaction body** beyond honouring the new failure, and
+that is what happened.
 
-after every fixture. That is a balance assertion, not a comment: an
-implementation that acquires the real lock and leaks it on the timeout
-path — the single most likely way to get the Global Lock wrong — fails a
-test that already exists, written before the lock did.
+### The balance assertion survived, which is why it was written first
+
+The corpus asserted, when the seam could not fail:
+
+> `glk_enters == glk_leaves == transactions attempted`
+
+A real lock can be refused, so the invariant **generalises rather than
+weakens**:
+
+> `glk_enters == glk_leaves` &nbsp;&nbsp;(still exact)
+> `glk_enters + glk_denied == attempted` &nbsp;&nbsp;(the new accounting)
+
+On every fixture where the lock is obtainable — all of them except the
+ones that deliberately arrange otherwise — `glk_denied` is 0 and the
+original triple equality is recovered **exactly**. The test passes
+because the property still holds, not because it was relaxed to fit. An
+implementation that acquires the lock and leaks it on the timeout path
+still fails the first equation, exactly as it was going to.
+
+### A refused acquire refuses the transaction
+
+`aml_ec_xact` honours a failed acquire with `AML_EC_XACT_FAIL`. A refusal
+means **firmware holds the EC**, and proceeding would drive the registers
+SMM is mid-handshake on — the entire condition the lock exists to
+prevent. The latched code is deliberately **not** overwritten: the Global
+Lock has already recorded the specific cause (76 `UNBOUND` / 77
+`TIMEOUT` / 80 `CAS_STUCK`), and an EC-flavoured code on top would send
+an operator to replace the embedded controller when the fault is firmware
+holding a lock it will not release.
+
+Note the asymmetry with every other refusal in `aml_ec_xact`: this one
+releases `xact_busy` but does **not** call `aml_ec_glk_leave`, because
+nothing was acquired. That is what keeps `glk_enters == glk_leaves`
+exact, and it is counted separately at `AML_EC_ST_GLK_DENIED`.
 
 **The seam is per-transaction by design, and the episode is deliberately
 outside it.** §4.5 explains why: SMM may interleave between a `_Qxx`'s
-transactions, and must be allowed to.
+transactions, and must be allowed to — holding the Global Lock across a
+`_Qxx` would starve firmware for milliseconds, and the firmware paths
+that starve are the ones that run the fans.
 
 ---
 
@@ -417,7 +454,7 @@ and what the existing #1065 assertions continue to prove.
 
 | Not implemented | Why | Where it goes |
 |---|---|---|
-| ACPI Global Lock | later R30 issue; seam is §7 | that issue |
+| ACPI Global Lock | **landed** R30.M8-001 (#1082), `src/user/aml/aml_glk.pdx`; see §7 and `design/acpi/global-lock.md` | done |
 | Burst mode | §5.1 | if ever, with the autonomous-exit model |
 | `_REG` notification to the table | needs the supervisor's session plumbing | with the transport |
 | EC ports discovered from `_CRS` | `aml_resource.pdx` decodes them; nothing wires the decode to `aml_ec_attach` yet | the supervisor, with the transport |

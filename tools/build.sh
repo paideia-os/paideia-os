@@ -1060,6 +1060,104 @@ fi
 echo "[gpio-confine] line row table, controller and community tables, seam"
 echo "[gpio-confine] state and the pad-address calculator confined"
 
+# ---------------------------------------------------------------------
+# R30.M8-002 (#1083): KIND_FW_SESSION storage confinement.
+#
+# _fw_object_table IS THE ARBITRATION. It carries the writer claim, the
+# claim depth and the session refcount for every firmware object in the
+# machine. A second writer could:
+#
+#   * set a holder, making the next release drop a claim this process
+#     never took — which lets a second writer into an object in the
+#     middle of the first one's update;
+#   * clear a holder mid-episode, with the same consequence and no
+#     symptom on either side until the object is read back;
+#   * write a scope path, merging two distinct firmware objects into one
+#     arbitration domain, so that the claim on one silently excludes a
+#     writer on the other and fails to exclude its real peer.
+#
+# None of those has a symptom at the point of the bug. All three surface
+# as a firmware object holding interleaved half-updates, somewhere else,
+# later.
+#
+# _fw_session_table binds a capability to an object. A second writer
+# there is a capability that arbitrates against a different object than
+# the one it was minted for — the same merge failure reached from the
+# other side.
+#
+# _fw_ep_registry is THE SECOND HALF OF THE DERIVATION GATE. It is the
+# whole difference between "the parent is an IPC endpoint", which every
+# endpoint in the system satisfies, and "the parent is the firmware
+# supervisor's endpoint". A second writer could register the shell's
+# endpoint and mint arbitration authority over the embedded controller.
+FW_SESSION_CONFINE_OK=1
+fw_session_confine_one() {
+    local sym="$1" owner="${BUILD_DIR}/$2" strays=""
+    if ! obj_relocs_against "${owner}" "${sym}"; then
+        echo "[fw-session-confine] FAIL — owner $2 does not reference ${sym}" >&2
+        echo "  A confinement assertion that names a symbol its owner does not" >&2
+        echo "  use is vacuous; it would pass after the storage was deleted." >&2
+        FW_SESSION_CONFINE_OK=0
+        return
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${owner}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[fw-session-confine] FAIL — objects other than $2 relocate against" >&2
+        echo "  ${sym}:${strays}" >&2
+        FW_SESSION_CONFINE_OK=0
+    fi
+}
+fw_session_confine_one '_fw_object_table'  'core/cap/kind_fw_session.o'
+fw_session_confine_one '_fw_session_table' 'core/cap/kind_fw_session.o'
+fw_session_confine_one '_fw_ep_registry'   'core/cap/kind_fw_session.o'
+if [[ "${FW_SESSION_CONFINE_OK}" -ne 1 ]]; then
+    echo "  See src/kernel/core/cap/kind_fw_session.pdx for why each of these" >&2
+    echo "  has exactly one legitimate writer. The claim, the object identity" >&2
+    echo "  and the derivation gate all rest on single ownership; none of the" >&2
+    echo "  three failures a second writer produces has a symptom where the" >&2
+    echo "  bug is." >&2
+    exit 1
+fi
+echo "[fw-session-confine] object table, session table and endpoint registry confined"
+
+# R30.M8-002 (#1083): THE ARBITRATION IS THE OBJECT'S, NOT THE SESSION'S.
+#
+# fw_session_claim and fw_session_unclaim take a SESSION ROW and nothing
+# else. The object they arbitrate is the one that session's row names,
+# resolved through fw_session_row_obj.
+#
+# An object parameter here would make "claim an object my capability does
+# not name" expressible — and, worse, would let a caller claim object X
+# while writing object Y, which is arbitration that reports success and
+# excludes nobody. Pinning the arity means a mutant that adds one fails
+# the build rather than the review, the discipline #1075 established for
+# GPIO pins and #1081 for the EC transaction address.
+FW_SESSION_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_fw_session.pdx"
+fw_session_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${FW_SESSION_SRC}"; then
+        echo "[fw-session-confine] FAIL — expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "  The claim operations take a SESSION ROW and nothing else. An" >&2
+        echo "  object, scope or domain parameter would make 'arbitrate against" >&2
+        echo "  something other than what my capability names' expressible, and" >&2
+        echo "  a caller that claimed one object while writing another would be" >&2
+        echo "  excluding nobody while reporting success. If a signature" >&2
+        echo "  legitimately changed, the confinement argument in" >&2
+        echo "  kind_fw_session.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+fw_session_pin_one 'pub let fw_session_claim : (u64) -> u64'
+fw_session_pin_one 'pub let fw_session_unclaim : (u64) -> u64'
+fw_session_pin_one 'pub let fw_session_row_obj : (u64) -> u64'
+echo "[fw-session-confine] claim/unclaim/resolve arities pinned"
+
 GPIO_LINE_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_gpio_line.pdx"
 gpio_pin_pin_one() {
     local decl="$1"

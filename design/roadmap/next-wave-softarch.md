@@ -94,7 +94,7 @@ This section covers **twelve rounds**, ~230 issues, ~80 milestones, targeting ex
 **Purpose.** The single hardest post-MVP round. Without an AML interpreter we can't reach EC, thermal zones, I²C-HID, backlight, GPIO, or lid/power events on the T14 G4. AML runs *in userspace*, in a dedicated `acpi_supervisor` process, per pillar 3. This round also brings up LPSS UART/I²C/GPIO enumeration (the T14 G4 exposes touchpad + fingerprint + sensor hub via LPSS I²C).
 
 **New capabilities.**
-- `KIND_AML_SESSION` — *derived over `KIND_IPC_ENDPOINT`*, tail `{scope_path:[u8;64], op_region_domain:u8}`. A capability the ACPI bubble uses to arbitrate concurrent AML evaluations on the same object.
+- `KIND_FW_SESSION` — *derived over `KIND_IPC_ENDPOINT`*, tail `{scope_path:[u8;64], op_region_domain:u8}`. A capability the ACPI bubble uses to arbitrate concurrent evaluations against the same firmware-supplied object. **Renamed from `KIND_AML_SESSION` by #1569**, before any code was written against the old name: capabilities live under `src/kernel/core/cap/`, `tools/lint-no-kernel-aml.sh` refuses any identifier there beginning `aml`, and that guardrail is what keeps a bytecode interpreter out of ring 0 (`design/acpi/no-aml-in-kernel.md` §3). The new name is also the more accurate one — the capability arbitrates evaluation *sessions* against firmware objects, and nothing about it is specific to the AML bytecode language.
 - `KIND_OP_REGION` — *derived over `KIND_MEMORY` OR `KIND_PORT`*, tail `{addr_space:{sys_mem|sys_io|pci_cfg|ec|smbus|cmos|pci_bar|ipmi}, base:u64, len:u64}`. The AML `OpRegion` abstraction becomes a cap; no other component of the system can *silently* poke a hardware address.
 - `KIND_I2C_BUS` — *derived over `KIND_DEVICE`*, tail `{controller_id:u16, max_speed_hz:u32, num_slaves:u8}`. LPSS I²C controllers hand these out.
 - `KIND_I2C_SLAVE` — *derived over `KIND_I2C_BUS`*, tail `{addr_7bit:u8, addr_10bit:bool, driver_hint:[u8;32]}`. Every slave is a first-class cap.
@@ -793,7 +793,7 @@ The 16 base kinds (from `linearity-and-tags.md` §3.1) are frozen with two reser
 | `KIND_MSIX_VECTOR` | `KIND_INTERRUPT` | R29 | Fine-grained MSI-X vector routing without cross-driver reads. |
 | `KIND_DMA_DOMAIN` | `KIND_MEMORY` | R29 | Per-device IOMMU domain; DMA-consent flow anchors here. |
 | `KIND_HW_TIMELINE` | slot 14 | R29 | First appearance of the timeline primitive; foundation for GPU/audio/display sync. |
-| `KIND_AML_SESSION` | `KIND_IPC_ENDPOINT` | R30 | Arbitration of concurrent AML evaluations. |
+| `KIND_FW_SESSION` | `KIND_IPC_ENDPOINT` | R30 | Arbitration of concurrent evaluations against one firmware object. Renamed from `KIND_AML_SESSION` by #1569 — see the note above. |
 | `KIND_OP_REGION` | `KIND_MEMORY`/`KIND_PORT` | R30 | AML's `OpRegion` as an explicit cap; no other component can silently poke hardware. |
 | `KIND_I2C_BUS` | `KIND_DEVICE` | R30 | LPSS I²C controllers hand these out. |
 | `KIND_I2C_SLAVE` | `KIND_I2C_BUS` | R30 | Every I²C slave is a discrete cap. |

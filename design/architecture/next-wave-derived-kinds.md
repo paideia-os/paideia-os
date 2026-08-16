@@ -1183,15 +1183,32 @@ happen to finish in one sweep and the fixed-point loop would be untested
 while looking tested — mutation confirmed exactly that, and the layout
 was changed in response.
 
-### Naming note for the rest of R30
+### Naming note for the rest of R30 — resolved by #1569
 
-The R30 catalog also lists `KIND_AML_SESSION`. **That name cannot be
-spelled kernel-side**: `tools/lint-no-kernel-aml.sh` forbids any
-identifier beginning `aml` under `src/kernel/**` (`design/acpi/
-no-aml-in-kernel.md` §3), and the guardrail is not negotiable — it is
-what keeps an AML interpreter out of ring 0. Whichever issue lands that
-capability must rename it (`KIND_FW_SESSION` is the obvious candidate)
-rather than weaken the lint.
+The R30 catalog originally listed this arbitration capability as
+`KIND_AML_SESSION`. **That name cannot be spelled kernel-side**:
+`tools/lint-no-kernel-aml.sh` forbids any identifier beginning `aml`
+under `src/kernel/**` (`design/acpi/no-aml-in-kernel.md` §3),
+capabilities live in `src/kernel/core/cap/`, and the guardrail is not
+negotiable — it is what keeps a bytecode interpreter out of ring 0.
+
+**#1569 renamed it to `KIND_FW_SESSION` across the catalog before any
+code was written against the old name**, and was filed deliberately
+ahead of the issue that introduces the kind so that this iteration
+starts from the right identifier rather than discovering the collision
+at push time. The alternative — an allowlist entry carving out one
+identifier — was rejected on principle: a constitutional boundary with
+one exception is a boundary with a precedent for exceptions, and the
+next one is argued from this one rather than from the rationale.
+
+The rename is not merely a workaround. `KIND_FW_SESSION` is the more
+accurate name: the capability arbitrates evaluation *sessions* against
+**firmware-supplied** objects, and nothing about the arbitration is
+specific to the AML bytecode language. The lint pushed the catalog
+toward a better name, which is the behaviour one wants from a
+guardrail placed at a real boundary.
+
+The kind itself is specified below, landed by R30.M8-003 (#1083).
 
 ---
 
@@ -1820,6 +1837,154 @@ line mint resolves its pin through the controller's community table.
 
 ---
 
+## `KIND_FW_SESSION = 0x155` — landed by R30.M8-002 (#1083) / R30.M8-003 (#1084)
+
+Full design: `design/acpi/firmware-session-arbitration.md`.
+
+### Catalog reconciliation — the rename
+
+The R30 catalog named this `KIND_AML_SESSION`. **That identifier cannot
+be spelled in `src/kernel/core/cap/`**: `tools/lint-no-kernel-aml.sh`
+refuses any identifier beginning `aml` under `src/kernel/**`. #1569
+renamed it to `KIND_FW_SESSION` *before any code existed against the old
+name*, rather than weakening the lint — see the naming note under
+`KIND_OP_REGION` above. Base, tail and purpose are otherwise unchanged
+from the planning row.
+
+### Derivation — over `KIND_IPC_ENDPOINT`, in two halves
+
+```
+KIND_IPC_ENDPOINT (base slot 5)     the supervisor conversation
+      └── KIND_FW_SESSION  0x155    + RIGHT_MINT on the parent
+                                    + the parent's INHERITED endpoint id
+                                      registered for the requested domain
+```
+
+A kind check alone is **empty** here, and more obviously so than for any
+previous kind: every IPC endpoint in the system is a
+`KIND_IPC_ENDPOINT`, the shell's stdout included. The second half —
+`fw_ep_domains(inherited_eid)` non-zero *and* the requested domain bit
+set — is what refuses an ordinary endpoint carrying `RIGHT_MINT`. This
+is the `KIND_GPIO_LINE` (#1075) shape: kind check plus an inherited
+identity that must resolve in a table the platform wrote.
+
+`KIND_FW_SESSION` is a **leaf**: `R_FW_SESSION_ALL` excludes
+`RIGHT_MINT`, so the lattice bottoms out and no fixed point is needed.
+
+### Tail encoding — row indirection, path stored whole
+
+The tail `{scope_path:[u8;64], op_region_domain:u8}` is 65 bytes against
+a 64-**bit** `target_ptr`, so it lives in a private table.
+`target_ptr` = row id in `[15:0]`, owning slot in `[31:16]`.
+
+**Two tables, because a capability names a session and arbitration is
+about the object** (N sessions to 1 object):
+
+| table | rows | fields |
+|---|---|---|
+| `_fw_object_table` | 8 × 128 B | `hdr{in_use:u8, domain:u8, path_len:u8}`, `holder:u64` (= row + 1, 0 unclaimed), `depth:u64`, `refcount:u64`, `scope_path[64]` |
+| `_fw_session_table` | 16 × 16 B | `hdr{in_use:u8, domain:u8, parent_slot:u8}`, `object_index:u64` |
+| `_fw_ep_registry` | 8 × 16 B | `endpoint_id:u64` (0 = empty), `domain_mask:u64` |
+
+Putting the claim in the *session* row would give every session its own
+claim — every holder would successfully claim, observe that it held it,
+and write concurrently with every other holder. `fw_object_alloc`
+therefore **finds first and allocates second**, and the witness asserts
+ten sessions leave `fw_objects_live()` at 1.
+
+Object rows are padded 96 → 128 B so the row index is a shift;
+paideia-as has no `mul`.
+
+**The scope path is stored in full, not hashed.** A collision would
+merge two firmware objects into one arbitration domain — a writer on the
+EC excluding a writer on an unrelated scope, and, worse, two paths that
+*should* share an object failing to exclude each other. Comparison
+requires equal lengths first and then all bytes; stopping at a shared
+prefix or a NUL would make `\_SB.PCI0.LPCB.EC0` and
+`\_SB.PCI0.LPCB.EC0X` the same object. The kernel does not parse the
+path and must not — it is a firmware namespace this ring is forbidden to
+interpret.
+
+### Rights — `R_FW_SESSION_ALL = 0x41B`
+
+| bit | right | authorises |
+|---|---|---|
+| `0x001` | `READ` | sampling the object |
+| `0x002` | `WRITE` | modifying it, **and taking the claim** |
+| `0x008` | `INVOKE` | reading back the row's own object and domain |
+| `0x010` | `REVOKE` | being revoked |
+| `0x400` | `OBSERVE` | holder, depth, canonical dump |
+
+`RIGHT_MINT` (`0x200`) is outside the mask — leaf kind. Taking the claim
+requires `WRITE` even though it stores nothing, because its whole effect
+is to exclude other writers, and a read-only holder that could exclude
+writers could stall the platform stack. The converse configuration is
+legitimate and is why the two are separate bits: a session needing a
+consistent multi-read snapshot takes the claim precisely so nobody
+writes underneath it.
+
+### Ops (`op_arg[7:0]`) and required right
+
+| op | name | right |
+|---|---|---|
+| 0 | `QUERY_OBJ` | `INVOKE` |
+| 1 | `QUERY_DOMAIN` | `INVOKE` |
+| 2 | `QUERY_HOLDER` | `OBSERVE` |
+| 3 | `QUERY_DEPTH` | `OBSERVE` |
+| 4 | `CLAIM` | `WRITE` |
+| 5 | `UNCLAIM` | `WRITE` |
+| 6 | `DEBUG_PRINT` | `OBSERVE` |
+
+No op takes an object, a scope or a domain: `op_arg` is masked to its low
+byte on entry and the object a session acts on comes from its own row.
+`tools/build.sh` pins the arities of `fw_session_claim`,
+`fw_session_unclaim` and `fw_session_row_obj`.
+
+### The claim
+
+Recursive for the same session (a method evaluating a method against the
+same object must not deadlock against itself); **refused** for a
+different one (`FW_SESSION_CLAIM_HELD` — no queue, because there is
+nowhere to park a waiter and a silent grant is a data race dressed as
+success); released only at depth 1→0, since an inner release would let a
+second session write in the middle of the outer session's update.
+
+`holder` stores `row + 1`: row 0 is legitimate, and a raw row id would
+make "row 0 holds it" and "nobody holds it" the same bit pattern.
+
+### Revoke
+
+Releases the claim if this session held it **at any depth** — a claim
+left held by a dead session excludes every other writer on that object
+forever — then frees the row, decrements the object refcount and frees
+the object row at 0. Both mint and revoke go through `cap_mint_write`,
+so this module adds no second descriptor writer (#1579).
+
+### Failure taxonomy — `0xFFFFFE10..0xFFFFFE1F`, a NEW BAND
+
+The `0xFFFFFFxx` band is **exhausted** — two free runs of eight and
+nothing wider, while every previous derived kind took a contiguous
+sixteen. Splitting across two holes would have made the taxonomy
+discontiguous for no reason but scarcity and left the next kind worse
+off, so `0xFFFFFExx` is opened here as the successor band.
+
+### Boot witness
+
+`tests/kernel/cap/fw_session_cap_synth.pdx`, sections A..I — fingerprint
+`R30 KIND_FW_SESSION OK`, cap slots 160..175.
+
+Sections C–F cover the gate in both directions, the shared-object
+property, prefix-sharing scopes not merging, and the claim's recursion
+and refusals. **Sections G–H are R30.M8-003 (#1084)**: ten evaluators,
+interleaved at operation granularity, asserting linearizability defined
+as (L1) mutual exclusion checked between *every* pair of adjacent steps,
+(L2) no lost updates, and (L3) non-vacuity. Phase A's schedule is
+hand-derived from the failure modes rather than round-robin; Phase B
+rotates the starting session so all ten complete an episode. See
+`design/acpi/firmware-session-arbitration.md` §10–§11.
+
+---
+
 ## Change log
 
 | Date | Round | Issue | Change |
@@ -1854,3 +2019,4 @@ line mint resolves its pin through the controller's community table.
 | 2026-08-15 | R30.M5 | #1072/#1073 | Landed the **LPSS I²C controller** and the **`i2c_transfer_channel`** — the two issues that turn the #1070/#1071 capability pair from structure into traffic. **Identification carries no device-ID table**, deliberately: a table is a claim about which silicon exists, wrong the moment a machine ships that its author had not seen, and its failure shape is the worst available — a present, healthy, *unprobed* controller and a silent log. Two stages instead: a loose PCI **class** candidate filter (`0x0C/0x80` or `0x11/0x80`, both seen in the wild for LPSS depending on firmware), then confirmation against **`IC_COMP_TYPE == 0x44570140`**, the constant every Synopsys `DW_apb_i2c` instance carries regardless of vendor, wrapper or SoC generation — an answer from the *part*, so it is right on silicon nobody here has seen. A class-matched candidate that fails stage 2 is `REJECTED` and **logged at LEVEL_ERROR with its BDF**, because "something is at this address and it is not what we expected" is the sentence that turns an unexplained dead touchpad into a bug report. The one vendor-specific fact — Intel's private reset at BAR0+0x204 — is gated on VID 0x8086 recorded at probe, and **released before** the identity read, an ordering that reversed rejects every Intel controller on the machine since the block reads back zero until then. **The BAR is reached only through a capability**: `lpss_i2c_bind_window` mints a `KIND_OP_REGION` root over space `PCI_BAR` (0x06, memory-like → demands a `KIND_MEMORY` parent with `RIGHT_MINT`) whose base and length are **inherited from the probed row, never argued** — a caller-supplied base would let a memory-authority holder mint a window over any address and call it a controller, i.e. #1061's own hole reopened by its client. The seam (`dw_io.pdx`) stores the **cap slot, not the address**, and re-resolves it per access, so a revoke takes effect immediately, a read-only window refuses writes, and out-of-window offsets are refused rather than clamped; `objdump -r` asserts that no object under `core/drivers/i2c/` other than `dw_io.o` relocates against `opregion_row_base`/`_len`, the only two functions that can turn a capability into a physical address. **Divider provenance is a stated ladder**: firmware-supplied HCNT/LCNT (best, deferred — needs the interpreter hop), computed from an ic_clk drawn from a **closed domain** of the three shipped Intel frequencies (implemented), or **refused** `INIT_CLK_UNKNOWN` — never defaulted, because a wrong divider does not error, it mis-clocks on a cold boot at the customer's desk. Counts at 100 MHz are `(397,469)/(57,129)/(23,49)/(3,11)`; the last is *below the core's hcnt minimum of 6*, which is why High-speed is refused rather than clamped (and refused twice over — it also needs a master-code preamble). **Bring-up ordering is the milestone's ordering claim**: disable, **poll `IC_ENABLE_STATUS` not `IC_ENABLE`** (the core's enable is asynchronous, and DesignWare *accepts and discards* configuration written while enabled), configure, enable, poll — asserted by **trace position**, since both orders leave identical final state. Only the count bank the rate uses is programmed, because the rate lives in the bus capability and a rate change is a different capability, not a register poke. **`i2c_transfer_channel`** (`{write, read, write_read, smbus_op}`, replies `| 0x80`) has **no address field in any revision**, two must-be-zero fields so a v2 cannot add one silently, and four kernel primitives plus three arity-one resolvers (`addr`/`mode`/`bus_row` — mode and bus row each being *half of an address* on a shared bus) whose seven literal signatures `tools/build.sh` now pins. `WRITE_READ` is its own opcode because a STOP between the pointer write and the read releases the bus and returns a different register's contents with **no error anywhere**; the engine emits exactly one RESTART and one STOP, asserted from the command-flag trace. `IC_TAR` is programmed **every** transfer and never cached: a stale target reaches the wrong device at full speed, which is the one failure the capability pair exists to prevent. Rights are **per direction** with three distinct refusals, consuming the `READ`/`WRITE` bits #1071 reserved so a capability minted before this landing is refused rather than silently widened — and `WRITE_READ` needs `WRITE` because the command byte moves the device's register pointer. Every wait is **bounded by an iteration budget** (reproducible, and independent of TSC calibration) with distinct codes per wait, and every loop checks for an abort *first*, since an aborted core holds its TX FIFO and would otherwise turn a NACK into a timeout. **NACK is an outcome**: `IC_CLR_TX_ABRT` is read on every abort path before any decoding — omitting it leaves the next transfer by any driver facing a latched abort — and the three real-world facts (nothing there / rejected a byte / lost arbitration) get three codes with the raw source retained. **Wedged bus: tier 1 implemented** (`IC_ENABLE.ABORT` + cycle, recovering every case where the master is stuck); **tier 2 deferred with its reason** — freeing a slave that latched SDA low needs SCL pulsed at the pad, i.e. `KIND_GPIO_LINE` from R30.M6 — and the state is *handled*: detected behaviourally at three consecutive failures (one can be a transient arbitration loss), latched, fast-failing without touching a register, with `lpss_i2c_unwedge` as the named exit. New bands `DW_IO_*` `0xFFFFFF30..3F`, `LPSS_I2C_*` `0xFFFFFF40..5F`, `I2C_XFER_*` `0xFFFFFF60..6F`, disjoint from each other and from every existing band. Seam pattern follows `gpe_io.pdx`, with the synthetic side a **device model** rather than a RAM buffer (read-to-clear registers clear, a commanded STOP raises STOP_DET, an armed NACK aborts) — without which "a NACK does not wedge the controller" would be unobservable. paideia-as#1312 does **not** apply: no port I/O here, and MMIO already carries the cap/effect coupling R29.M2-002 landed. Boot witness `tests/kernel/drivers/i2c/lpss_i2c_synth.pdx` (sub-tests A..R) — fingerprint `R30 LPSS I2C OK`, placed after the #1070/#1071 witness because both reset the bus and slave tables. Closes R30.M5. |
 | 2026-08-15 | R30.M5 | #1074 | Landed the **interrupt-driven I²C transfer engine**, closing R30.M5. **Path choice is "both", and the shape of "both" is the whole design**: two engines is not a performance question, it is a drift question — a NACK decoding one way on one path and another on the other, depending on which boot phase a caller ran in. So (a) the error handling is **not duplicated, it is called**: both engines decode aborts through the same `dw_xfer_check_abort`, resolve rights through the same `i2c_xfer_resolve`, retarget through the same `i2c_xfer_set_target` and check the same wedge latch, and the witness asserts the same armed abort yields the same code through `i2c_xfer_write` and `i2c_xfer_irq_write`; (b) the interrupt engine has **one implementation and only its caller varies** — `dw_i2c_isr_body` *is* the engine, called by a trampoline when a vector is bound and by `dw_irq_wait` from thread context when none is (today, and early boot forever), so the boot path cannot diverge from the interrupt path because it is the same function; (c) the polled engine stays for bring-up and SMBus as **distinct entry points, not a mode flag**, since a hidden flag is exactly how one call comes to behave two ways. **FSM state ownership is a baton, not a lock.** `_dw_irq_ctx[ctrl]` (128 B, cache-line aligned, `objdump -r`-confined) has exactly ONE field written by both contexts — `state`, written only by LOCK-prefixed CAS/xchg — and every other field has one writer at a time, chosen by that word: thread in `SETUP`, ISR in `ARMED`/`RUNNING`, the `CLOSING` winner in `CLOSING`, thread again once terminal. Publish is `CAS(SETUP→ARMED)` with the **software arm strictly before the hardware arm** (the `IC_INTR_MASK` write), so the first interrupt cannot find an unpublished row; return is field stores then `atomic_store(state, DONE|ABORT)`, TSO-ordered, so a thread that has seen `DONE` has seen everything that produced it. **Termination is an exclusive claim** through a distinct `CLOSING` state, because the ISR on a STOP_DET and the thread on an exhausted budget can decide simultaneously and a single CAS would publish before the outcome was written — the caller would be told "timed out" about a transfer that completed. Two concurrent service routines are excluded by a gate the loser **declines rather than spins on**, which is sound because the source is a level and is the only exclusion an ISR may use. **TX_EMPTY is a level, not an event** (`TXFLR <= IC_TX_TL`, and bring-up sets `IC_TX_TL = 0`), so it is true forever once the FIFO drains: a driver that leaves it unmasked completes correctly and takes an interrupt per EOI until the STOP lands, with nothing in final state recording it. Masked at ONE point — `dwi_isr_tx_masked`, the instant the command carrying `DW_CMD_STOP` is accepted, the earliest moment with nothing left to send — and the POSITION is recorded (`masked_at`) so the witness asserts *which* command, since masking at the first byte leaves an identical final mask and is wrong. Measured by a **level-triggered delivery pump** over a model extended to compute `IC_INTR_STAT = raw & mask`, hold TX_EMPTY from enable, follow RX_FULL with the queue, and **arm a commanded STOP as a countdown rather than reporting it instantly** — with a zero-length interval the storm cannot exist. A one-byte write costs exactly two service events; sub-test U puts the mask back by hand and asserts the same measurement exceeds ten, because *a ceiling nothing can breach proves nothing*. **Address NACK and data NACK stay distinct** and the data NACK reports `pushed − IC_TXFLR − 1` acknowledged bytes read at the abort — not the number pushed, since the core flushes the FIFO and the NACKed byte never landed; a caller assuming "all of it" would leave a device holding a half-applied multi-byte register write. Making that testable forced two model corrections of things `dw_regs.pdx` had asserted in prose since #1072 without modelling: an abort can now let N commands through first, and an abort **clears `IC_STATUS.TFNF`** with `IC_CLR_TX_ABRT` restoring it. **`dw_isr.pdx` is one function** so `objdump -r` can bound it: new `[dw-isr-allowlist]` with eleven targets and a vacuity guard, **separate from** `[sci-isr-allowlist]` and neither widening the other; two fixed bursts (8/8) so cost does not grow with transfer length. **The polled engine also gained the claim**: until #1074 two CPUs could interleave `IC_DATA_CMD` writes into one FIFO under one `IC_TAR` — one device's bytes under another's address, no error anywhere — an R18-SMP exposure nothing had closed. The claim is a **single global cell** because the seam has one binding; per-controller would let two controllers repoint it under each other. Also fixed: `dw_io_trace_append` reserves with `lock xadd`, since the ISR shares the seam and a read-modify-write loses one record and *aliases* another, which is the exact corruption that makes an ordering assertion say the opposite of the truth. New band `I2C_IRQ_*` `0xFFFFFFE0..E6`, closing the gap between `DMA_*` and `MSIX_*`; only THREE codes are new (`BUSY`, `NOT_OWNER`, `BAD_STATE`/`BAD_IDX`) because everything else reuses the polled taxonomy — the completion timeout is `I2C_XFER_TIMEOUT_STOP`, which is exactly right since the terminal states are STOP_DET or abort. Four interrupt entry points added to the signature pin set. Vector allocation, IDT install and EOI belong to R30.M6's `KIND_HW_MSIX_VECTOR` binding; the routine is written so binding one **adds a caller, not a code path**. Boot witness sub-tests S..X — second fingerprint `R30 LPSS I2C IRQ OK`. **Closes R30.M5.** |
 | 2026-08-15 | R30.M6 | #1075/#1076 | Landed `KIND_GPIO_LINE = 0x154` — derived over `KIND_DEVICE` with a two-part gate (kind + RIGHT_MINT, then the inherited identity must resolve to a probed pad controller). Row-indirection tail via `_gpio_line_table` encoding `{parent_slot:u8, pin:u16 absolute, pad_index:u16 community-relative, community:u8}` plus an inherited `controller_id`. Rights `R_GPIO_LINE_ALL = 0x41F`, with `CONFIG` split from `WRITE`. Community/pad mapping DERIVED at mint by `lpss_gpio_resolve_pin`; six resolver signatures arity-pinned and `lpss_gpio_pad_off` confined, so `gpio_line_pad_off_of_slot` is the only capability-to-pad-address route. Duplicate `(controller, pin)` refused; out-of-range and unmapped pins refused with distinct codes, never clamped. Two-phase controller cascade via `lpss_gpio_release`. Driver half in `core/drivers/gpio/{lpss_gpio,gpio_io}.pdx` with `design/drivers/lpss-gpio-controller.md`. Witnesses `R30 LPSS GPIO OK` + `R30 KIND_GPIO OK`. Opens R30.M6. |
+| 2026-08-16 | R30.M8 | #1569/#1083/#1084 | Landed `KIND_FW_SESSION = 0x155`, **renamed from the catalog's `KIND_AML_SESSION` by #1569** before any code existed against the old name — capabilities live in `src/kernel/core/cap/` and `tools/lint-no-kernel-aml.sh` refuses any identifier beginning `aml` there, so the catalog name and the file's address were in direct contradiction; the lint was left alone, and the new name is the more accurate one since what is arbitrated is an evaluation *session* against a *firmware-supplied* object. Derived over `KIND_IPC_ENDPOINT` (base slot 5) with a two-part gate whose first half is **emptier than any previous kind's** — every endpoint in the system is a `KIND_IPC_ENDPOINT`, the shell's stdout included — so the second half requires the parent's **inherited** endpoint id to be registered in `_fw_ep_registry` for the requested op-region domain, the `KIND_GPIO_LINE` (#1075) shape. **Two tables, not one**, because a capability names a session and arbitration is about the object (N:1): `_fw_object_table` (8 × 128 B) carries the claim, depth, refcount and the whole 64-byte scope path; `_fw_session_table` (16 × 16 B) carries the object index. Putting the claim in the session row would give every session its own, so every holder would claim successfully, observe that it held it, and write concurrently with all the others — a failure with **no symptom on the claiming side**, surfacing as a firmware object with interleaved half-updates; `fw_object_alloc` therefore finds first and allocates second, and the witness asserts ten sessions leave one object row. The **path is stored whole, not hashed**, and compared length-first then bytewise: a collision merges two arbitration domains, and a comparison stopping at a shared prefix or a NUL would make `\_SB.PCI0.LPCB.EC0` and `\_SB.PCI0.LPCB.EC0X` the same object — the fixture's two paths share 17 bytes and differ in the 18th for exactly that reason. Rights `R_FW_SESSION_ALL = 0x41B`; the claim requires `WRITE` because its whole effect is to exclude other writers, while `WRITE` and the claim stay separate bits so a consistent-snapshot reader can hold one without the other. Claim is recursive for the same session, **refused** (`CLAIM_HELD`, no queue) for a different one, and released only at depth 1→0; `holder` stores `row + 1` because row 0 is legitimate and a raw id would make 'row 0 holds it' and 'nobody holds it' the same bit pattern. Revoke releases a held claim at any depth — a claim held by a dead session excludes every other writer forever — and frees the object row at refcount 0. Both mint and revoke go through `cap_mint_write`, adding no second descriptor writer (#1579). **New failure band `0xFFFFFE10..1F`**: the `0xFFFFFFxx` band is exhausted at two free runs of eight, and splitting across them would have made the taxonomy discontiguous for no reason but scarcity while leaving the next kind worse off. **#1084 is sections G–H of the same witness**: ten evaluators interleaved at operation granularity, asserting linearizability *defined before it is claimed* — (L1) mutual exclusion checked between every pair of adjacent steps rather than at the end, since every episode terminates with an UNCLAIM and the quiescent final state is consistent with any amount of overlap; (L2) no lost updates, the object's value equalling the completed-write count; (L3) non-vacuity, asserted as exact step and blocked-step totals because a schedule that silently stopped contending would still clear a floor. Each episode is five separate steps (CLAIM/READ/BUMP/WRITE/UNCLAIM) so another session can be scheduled between the read and the write, and a session proceeds on **its own successful claim** rather than on the object's holder field — modelling it the other way would build the property under test into the harness. Phase A's 14-step schedule is hand-derived from the two failure modes (two sessions both observing the object free; a release landing between another session's check and its use); Phase B rotates the starting session each pass, without which session 0 would win every pass and the other nine would never complete an episode. Boot witness `tests/kernel/cap/fw_session_cap_synth.pdx` (A..I) — fingerprint `R30 KIND_FW_SESSION OK`. Closes R30.M8. |

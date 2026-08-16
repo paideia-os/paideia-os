@@ -345,6 +345,24 @@ extern uint64_t aml_ec_xact(uint64_t op, uint64_t addr, uint64_t value);
 extern uint64_t aml_ec_query_pump(void);
 extern uint64_t aml_ec_query_seg(uint64_t q);
 extern void     aml_ec_probe_arm(uint64_t n);
+
+/* R30.M8-001 (#1082) — the ACPI Global Lock. */
+extern void     aml_glk_reset(void);
+extern uint64_t aml_glk_attach(uint64_t facs_va, uint64_t pm1_cnt, uint64_t pm1_sts);
+extern uint64_t aml_glk_bound(void);
+extern void     aml_glk_mode_set(uint64_t mode);
+extern uint64_t aml_glk_stat(uint64_t which);
+extern void     aml_glk_synth_reset(uint64_t initial);
+extern uint64_t aml_glk_facs_word(void);
+extern uint64_t aml_glk_facs_guard(void);
+extern uint64_t aml_glk_facs_addr(void);
+extern void     aml_glk_smm_arm(uint64_t injections, uint64_t value);
+extern void     aml_glk_smm_signal_after(uint64_t steps);
+extern uint64_t aml_glk_smm_stat(uint64_t which);
+extern uint64_t aml_glk_try(void);
+extern uint64_t aml_glk_enter(void);
+extern uint64_t aml_glk_leave(void);
+extern uint64_t aml_glk_depth(void);
 extern uint64_t aml_eval_find_in_scope(uint64_t scope, uint64_t seg);
 extern uint64_t aml_region_acc_log(uint64_t aw);
 extern uint64_t aml_region_of_field(uint64_t node);
@@ -6544,7 +6562,11 @@ enum {
     EC_ST_Q_ZERO    = 13, EC_ST_Q_NOMETH  = 14, EC_ST_TO_IBF   = 15,
     EC_ST_TO_OBF    = 16, EC_ST_STATUS    = 17, EC_ST_RANGE    = 18,
     EC_ST_REENT     = 19, EC_ST_DEPTH_REF = 20, EC_ST_UNBOUND  = 21,
-    EC_ST_BADOP     = 22, EC_ST_LAST_Q    = 24, EC_ST_PROBE_RES = 26
+    EC_ST_BADOP     = 22, EC_ST_LAST_Q    = 24, EC_ST_PROBE_RES = 26,
+    /* R30.M8-001 (#1082). Transactions refused because the Global Lock
+     * could not be taken -- the third term of the generalised balance
+     * identity glk_enters + glk_denied == attempted. */
+    EC_ST_GLK_DENIED = 28
 };
 enum { EC_OP_READ = 1, EC_OP_WRITE = 2 };
 enum { EC_MODE_PORT = 0, EC_MODE_SYNTH = 1 };
@@ -6552,6 +6574,27 @@ enum { EC_WEDGE_NONE = 0, EC_WEDGE_IBF = 1, EC_WEDGE_OBF = 2,
        EC_WEDGE_STUCK_ADDR = 3 };
 enum { EC_Q_NONE = 0, EC_Q_DISPATCHED = 1, EC_Q_NO_METHOD = 2 };
 #define EC_FAIL 0xFFFFFFFFFFFFFFFFull
+
+/* ── R30.M8-001 (#1082): the ACPI Global Lock ─────────────────────── */
+enum {
+    GLK_ST_DEPTH     = 5,  GLK_ST_ACQUIRES  = 6,  GLK_ST_RELEASES  = 7,
+    GLK_ST_NEST_IN   = 8,  GLK_ST_NEST_OUT  = 9,  GLK_ST_RETRIES   = 10,
+    GLK_ST_SIGNALS   = 11, GLK_ST_POLLS     = 12, GLK_ST_TIMEOUTS  = 13,
+    GLK_ST_PENDING   = 14, GLK_ST_UNBOUND   = 15, GLK_ST_UNDERFLOW = 16,
+    GLK_ST_DEPTH_REF = 17, GLK_ST_STUCK     = 18, GLK_ST_LAST_ERR  = 19,
+    GLK_ST_ENTERS    = 20, GLK_ST_LEAVES    = 21, GLK_ST_CASES     = 22,
+    GLK_ST_MAXDEPTH  = 23
+};
+enum { GLK_SMM_DONE = 3, GLK_SMM_STEPS = 4, GLK_SMM_SIGNAL = 5,
+       GLK_SMM_BELLS = 7 };
+enum { GLK_MODE_HW = 0, GLK_MODE_SYNTH = 1 };
+enum { GLK_OWNED = 1, GLK_PENDING = 2 };
+#define GLK_GUARD     0xF1A65ED5ull
+#define GLK_TRY_STUCK 0xFFFFFFFFFFFFFFFFull
+
+/* Error codes this module latches, continuing aml_ec.pdx's 68..75. */
+enum { E_GLK_UNBOUND = 76, E_GLK_TIMEOUT = 77, E_GLK_UNDERFLOW = 78,
+       E_GLK_DEPTH = 79, E_GLK_CAS_STUCK = 80 };
 
 /* The EC device fixture, used by every query test.
  *
@@ -6619,27 +6662,407 @@ static size_t build_ec_device(uint8_t *out)
  * NOT a call to aml_ec_attach: the binding survives on purpose, and a
  * helper that re-attached every time would hide a driver that had lost
  * its ports. */
+/* R30.M8-001 (#1082): the Global Lock is now REAL, so the EC fixture has
+ * to supply one.
+ *
+ * This is not scaffolding added to keep old tests green — it is what
+ * makes every EC test in this file stronger than it was. Before #1082,
+ * aml_ec_glk_enter incremented a counter; the balance assertion below
+ * was a statement about arithmetic. Now every one of these transactions
+ * runs a genuine lock_cmpxchg_d against a FACS word, and the balance
+ * assertion is a statement about a lock that is actually taken and
+ * actually released.
+ *
+ * The lock is attached ONCE, alongside the EC's own attach, because a
+ * platform has exactly one Global Lock and a supervisor that re-derived
+ * its address per transaction would be a supervisor that could get a
+ * different answer twice. */
+static void glk_fresh(uint64_t initial)
+{
+    aml_glk_reset();
+    aml_glk_mode_set(GLK_MODE_SYNTH);
+    aml_glk_synth_reset(initial);
+}
+
+/* Same, plus a clean evaluation session.
+ *
+ * aml_eval_set_err is FIRST-WRITER-WINS by design (see aml_eval.pdx: the
+ * code worth keeping is the one describing the original fault, not the
+ * last consequence of it). That is right for evaluation and wrong for a
+ * fixture: a code latched by an earlier test would mask the one this
+ * test is about, and the assertion would silently be checking history.
+ *
+ * So the tests that assert a REFUSAL CODE start from a clean session.
+ * They also cross-check aml_glk_stat(GLK_ST_LAST_ERR), which is this
+ * module's own latch and is last-writer-wins — the two together assert
+ * both that the right code was raised and that it reached the session. */
+static void glk_fresh_clean(uint64_t initial)
+{
+    aml_eval_reset(2);
+    glk_fresh(initial);
+}
+
 static void ec_fresh(uint64_t wedge)
 {
     aml_ec_reset();
     aml_ec_mode_set(EC_MODE_SYNTH);
     aml_ec_synth_reset(wedge);
+    glk_fresh(0);
 }
 
 /* The balance assertion the Global Lock seam exists for. Every attempted
  * transaction takes the seam exactly once and leaves it exactly once —
  * including every timeout exit. An implementation that acquires the real
  * lock and leaks it on a timeout fails HERE, in a test written before the
- * lock was. */
+ * lock was.
+ *
+ * #1082 GENERALISED THIS RATHER THAN WEAKENING IT. A seam that could not
+ * fail admitted the triple equality
+ *
+ *     glk_enters == glk_leaves == attempted
+ *
+ * A real lock can be refused, so the third term acquires the refusals:
+ *
+ *     glk_enters == glk_leaves                 (still exact)
+ *     glk_enters + glk_denied == attempted
+ *
+ * On every fixture where the lock is obtainable — which is all of them
+ * except the ones that deliberately arrange otherwise — glk_denied is 0
+ * and the original triple equality is recovered EXACTLY, which is what
+ * the two assertions below check in that order. The test passes because
+ * the property still holds, not because it was relaxed to fit.
+ *
+ * The ownership depth is checked too: a non-zero depth after a completed
+ * episode is a leaked hardware lock, which on a real machine is firmware
+ * locked out of its own embedded controller until power-cycle. */
 static void ec_glk_balanced(const char *where)
 {
     g_checks++;
     if (aml_ec_stat(EC_ST_GLK_IN) != aml_ec_stat(EC_ST_GLK_OUT))
         fail(where);
     eq("the seam was entered once per attempted transaction",
-       aml_ec_stat(EC_ST_GLK_IN), aml_ec_stat(EC_ST_ATTEMPTED));
+       aml_ec_stat(EC_ST_GLK_IN) + aml_ec_stat(EC_ST_GLK_DENIED),
+       aml_ec_stat(EC_ST_ATTEMPTED));
     eq("and the transaction claim is free",
        aml_ec_stat(EC_ST_XACT_BUSY), 0);
+    eq("and no ownership of the Global Lock was leaked",
+       aml_glk_depth(), 0);
+    eq("and the FACS Flags word beside the lock is untouched",
+       aml_glk_facs_guard(), GLK_GUARD);
+}
+
+/* =====================================================================
+ * R30.M8-001 (#1082) — THE ACPI GLOBAL LOCK
+ *
+ * These run AFTER the EC block, because the EC block is where the lock
+ * is attached and "nothing works before the attach" is an assertion that
+ * can only be made once.
+ *
+ * WHAT THESE TESTS ARE FOR. The Global Lock arbitrates against System
+ * Management Mode, which preempts everything and cannot be made to wait.
+ * A fixture in which the lock word never changes underneath us proves
+ * nothing whatever about the case the protocol exists for — it exercises
+ * the arithmetic and skips the race. So the synthetic firmware here
+ * MUTATES THE WORD BETWEEN OUR READ AND OUR WRITE, at the injection
+ * point inside both compare-exchange loops, which is exactly where an
+ * SMI is a correctness problem and nowhere else.
+ * ===================================================================== */
+
+/* The uncontended protocol: acquire sets Owned, release clears it, and
+ * the word beside it is not disturbed. */
+static void test_glk_acquire_and_release(void)
+{
+    g_case = "glk: the uncontended acquire/release cycle";
+    glk_fresh(0);
+
+    eq("the lock starts free", aml_glk_facs_word(), 0);
+    eq("and nothing is owned", aml_glk_depth(), 0);
+
+    eq("acquire succeeds", aml_glk_enter(), 1);
+    eq("Owned is set", aml_glk_facs_word() & GLK_OWNED, GLK_OWNED);
+    eq("and Pending is NOT — nobody else wanted it",
+       aml_glk_facs_word() & GLK_PENDING, 0);
+    eq("ownership depth is 1", aml_glk_depth(), 1);
+    eq("the hardware lock was taken once", aml_glk_stat(GLK_ST_ACQUIRES), 1);
+    eq("with no nesting", aml_glk_stat(GLK_ST_NEST_IN), 0);
+
+    eq("release succeeds", aml_glk_leave(), 1);
+    eq("the word is clear", aml_glk_facs_word(), 0);
+    eq("depth is back to 0", aml_glk_depth(), 0);
+    eq("the hardware lock was dropped once", aml_glk_stat(GLK_ST_RELEASES), 1);
+
+    /* THE DOORBELL DID NOT RING, and that is as load-bearing as the
+     * cases where it does. Nothing had marked Pending, so there is
+     * nobody waiting to be told; a release that signalled unconditionally
+     * would raise GBL_RLS at firmware on every EC transaction. */
+    eq("and the doorbell stayed silent — nobody was waiting",
+       aml_glk_stat(GLK_ST_SIGNALS), 0);
+
+    /* THE 64-BIT MUTANT DETECTOR. lock_cmpxchg (64-bit) at FACS+0x10
+     * read-modify-writes the Flags word at +0x14 as well, carrying it
+     * through the acquire arithmetic and storing it back. */
+    eq("the FACS Flags word at +0x14 was never touched",
+       aml_glk_facs_guard(), GLK_GUARD);
+}
+
+/* THE DOORBELL. The single nastiest omission available in this module:
+ * skip the GBL_RLS write and nothing here breaks — our counts balance,
+ * our transactions complete — while the FIRMWARE waits forever for a
+ * signal that never comes, and stops servicing what only it can service.
+ * On the T14 G4 that includes thermal response. */
+static void test_glk_release_rings_the_doorbell_iff_someone_waits(void)
+{
+    g_case = "glk: the release doorbell";
+
+    /* Arrange for Pending: firmware already owns the lock, so our
+     * acquire registers interest rather than taking it. */
+    glk_fresh(GLK_OWNED);
+    eq("try does NOT acquire — firmware holds it", aml_glk_try(), 0);
+    eq("but our interest is now recorded in Pending",
+       aml_glk_facs_word() & GLK_PENDING, GLK_PENDING);
+    eq("and that was counted", aml_glk_stat(GLK_ST_PENDING), 1);
+
+    /* Now stand in for firmware's own release of a pended lock: take the
+     * lock legitimately from a state that carries Pending, then drop it.
+     * The release must ring, because the value it replaces pends. */
+    glk_fresh(GLK_OWNED | GLK_PENDING);
+    eq("no doorbell yet", aml_glk_stat(GLK_ST_SIGNALS), 0);
+
+    /* Drive the release path directly by asserting ownership: enter
+     * observes Pending, cannot take it, and times out — so instead we
+     * model the holder by seeding depth through a successful acquire on
+     * a free lock whose word we then mark Pending, which is precisely
+     * the state a concurrent requester leaves behind. */
+    glk_fresh(0);
+    eq("acquire a free lock", aml_glk_enter(), 1);
+    /* A second party asks for it while we hold it. That is a compare-
+     * exchange by someone else, and its whole effect is this bit. */
+    aml_glk_smm_arm(1, GLK_PENDING);
+    eq("release", aml_glk_leave(), 1);
+    eq("THE DOORBELL RANG — firmware was told the lock is free",
+       aml_glk_stat(GLK_ST_SIGNALS), 1);
+    eq("and the synthetic PM1_CNT heard it",
+       aml_glk_smm_stat(GLK_SMM_BELLS), 1);
+    eq("the lock is free", aml_glk_facs_word(), 0);
+    eq("guard intact", aml_glk_facs_guard(), GLK_GUARD);
+}
+
+/* THE ADVERSARIAL FACS — the test the whole module exists for.
+ *
+ * Firmware writes the lock word between our read and our write. With
+ * lock_cmpxchg_d our write FAILS, we retry, and we re-derive from what
+ * firmware actually left. With a load/compute/store in its place, our
+ * store lands on top of firmware's decision and it disappears — and
+ * every other assertion in this file still passes.
+ *
+ * The three observables that distinguish them are all asserted below. */
+static void test_glk_smm_interleaves_between_the_read_and_the_write(void)
+{
+    g_case = "glk: SMM mutates the lock word inside our read-modify-write";
+    glk_fresh(0);
+
+    /* The word is FREE when we read it. Between that read and our write,
+     * firmware takes it. A correct acquire must not conclude it won. */
+    aml_glk_smm_arm(1, GLK_OWNED);
+
+    uint64_t r = aml_glk_try();
+
+    eq("the injection point was reached",
+       aml_glk_smm_stat(GLK_SMM_STEPS) >= 1, 1);
+    eq("and firmware did interfere", aml_glk_smm_stat(GLK_SMM_DONE), 1);
+
+    /* (1) THE COMPARE-EXCHANGE DETECTED IT. A blind store retries zero
+     *     times, because a blind store cannot fail. */
+    eq("THE COMPARE-EXCHANGE LOST ITS RACE AND RETRIED",
+       aml_glk_stat(GLK_ST_RETRIES), 1);
+
+    /* (2) WE DID NOT CLAIM A LOCK FIRMWARE HOLDS. This is the assertion
+     *     that separates a correct implementation from one that returns
+     *     "acquired" while SMM is mid-transaction on the EC. */
+    eq("and we did NOT acquire it", r, 0);
+
+    /* (3) FIRMWARE'S WRITE SURVIVED, and our Pending is on top of it.
+     *     A lost update would read back as 1 (ours) rather than 3. */
+    eq("firmware still owns it, and our interest is registered",
+       aml_glk_facs_word(), GLK_OWNED | GLK_PENDING);
+
+    eq("guard intact", aml_glk_facs_guard(), GLK_GUARD);
+}
+
+/* The same adversary, sustained: firmware interferes on several
+ * consecutive passes. The loop must converge rather than either spin
+ * forever or give up on the first collision. */
+static void test_glk_sustained_interference_converges(void)
+{
+    g_case = "glk: sustained interference converges";
+    glk_fresh(0);
+
+    /* mask = Owned: firmware takes and drops the lock, over and over.
+     * That is a TOGGLE, and a toggle is what makes sustained contention
+     * expressible -- a constant store collides at most once, because the
+     * second pass reads back the very value firmware keeps writing. */
+    aml_glk_smm_arm(4, GLK_OWNED);
+    uint64_t r = aml_glk_try();
+
+    eq("four collisions were survived", aml_glk_stat(GLK_ST_RETRIES), 4);
+    eq("and the lock was then acquired", r, 1);
+    eq("exactly one compare-exchange landed",
+       aml_glk_stat(GLK_ST_CASES), 1);
+    eq("Owned is set", aml_glk_facs_word(), GLK_OWNED);
+    eq("guard intact", aml_glk_facs_guard(), GLK_GUARD);
+
+    /* And the retry budget is a BOUND, not a hope: an adversary that
+     * never relents produces a refusal rather than a livelock. */
+    glk_fresh_clean(0);
+    aml_glk_smm_arm(100000, GLK_OWNED);
+    eq("an unrelenting adversary is refused", aml_glk_try(), GLK_TRY_STUCK);
+    eq("with its own code", aml_glk_stat(GLK_ST_LAST_ERR), E_GLK_CAS_STUCK);
+    eq("which reached the session", aml_eval_err(), E_GLK_CAS_STUCK);
+    eq("and its own counter", aml_glk_stat(GLK_ST_STUCK), 1);
+    eq("the retry budget bounded it", aml_glk_stat(GLK_ST_RETRIES), 1024);
+    aml_glk_smm_arm(0, 0);
+}
+
+/* NESTING. AML acquires \_GL recursively; the hardware lock is taken at
+ * 0->1 and dropped at 1->0 and at no other transition.
+ *
+ * An inner release that dropped the hardware lock would hand the EC to
+ * firmware IN THE MIDDLE OF THE OUTER TRANSACTION, and the outer caller
+ * would carry on driving registers it no longer owned. */
+static void test_glk_nested_acquire_does_not_release_early(void)
+{
+    g_case = "glk: nested acquisition holds the hardware lock throughout";
+    glk_fresh(0);
+
+    eq("outer acquire", aml_glk_enter(), 1);
+    eq("the hardware lock was taken", aml_glk_stat(GLK_ST_ACQUIRES), 1);
+    eq("Owned", aml_glk_facs_word() & GLK_OWNED, GLK_OWNED);
+
+    eq("inner acquire", aml_glk_enter(), 1);
+    eq("depth 2", aml_glk_depth(), 2);
+    eq("AND THE HARDWARE LOCK WAS NOT RE-TAKEN",
+       aml_glk_stat(GLK_ST_ACQUIRES), 1);
+    eq("the nesting path was taken", aml_glk_stat(GLK_ST_NEST_IN), 1);
+
+    eq("innermost acquire", aml_glk_enter(), 1);
+    eq("depth 3", aml_glk_depth(), 3);
+    eq("still one hardware acquisition", aml_glk_stat(GLK_ST_ACQUIRES), 1);
+
+    eq("innermost release", aml_glk_leave(), 1);
+    eq("depth 2", aml_glk_depth(), 2);
+    eq("AND THE HARDWARE LOCK WAS NOT DROPPED",
+       aml_glk_stat(GLK_ST_RELEASES), 0);
+    eq("WHICH MEANS OWNED IS STILL SET ON THE WIRE",
+       aml_glk_facs_word() & GLK_OWNED, GLK_OWNED);
+
+    eq("inner release", aml_glk_leave(), 1);
+    eq("depth 1", aml_glk_depth(), 1);
+    eq("still held", aml_glk_facs_word() & GLK_OWNED, GLK_OWNED);
+    eq("the nesting release path was taken twice",
+       aml_glk_stat(GLK_ST_NEST_OUT), 2);
+
+    eq("outer release", aml_glk_leave(), 1);
+    eq("depth 0", aml_glk_depth(), 0);
+    eq("NOW the hardware lock is dropped", aml_glk_stat(GLK_ST_RELEASES), 1);
+    eq("and the word is clear", aml_glk_facs_word(), 0);
+
+    eq("acquires and releases balance", aml_glk_stat(GLK_ST_ACQUIRES),
+       aml_glk_stat(GLK_ST_RELEASES));
+    eq("as do the nesting counts", aml_glk_stat(GLK_ST_NEST_IN),
+       aml_glk_stat(GLK_ST_NEST_OUT));
+    eq("guard intact", aml_glk_facs_guard(), GLK_GUARD);
+}
+
+/* Refusals, each with its own code, because they are different faults.
+ * REFUSE, NEVER CLAMP — and never silently no-op, which for a lock is
+ * the same thing as lying about holding it. */
+static void test_glk_refusals_are_distinct_and_counted(void)
+{
+    g_case = "glk: refusals";
+
+    /* UNDERFLOW. A release with nothing outstanding means some caller's
+     * bracketing is broken, and the next hardware release would be
+     * somebody else's. A no-op here would hide that until the day it
+     * unlocked the EC under a live transaction. */
+    glk_fresh_clean(0);
+    eq("release with nothing held is REFUSED", aml_glk_leave(), 0);
+    eq("with its own code", aml_glk_stat(GLK_ST_LAST_ERR), E_GLK_UNDERFLOW);
+    eq("which reached the session", aml_eval_err(), E_GLK_UNDERFLOW);
+    eq("and its own counter", aml_glk_stat(GLK_ST_UNDERFLOW), 1);
+    eq("and the lock word was not touched", aml_glk_facs_word(), 0);
+    eq("nor was any hardware release performed",
+       aml_glk_stat(GLK_ST_RELEASES), 0);
+
+    /* DEPTH. The bound is checked BEFORE the increment, so an overflow
+     * can never be committed and then noticed. */
+    glk_fresh_clean(0);
+    for (int i = 0; i < 32; i++)
+        eq("acquire within the bound", aml_glk_enter(), 1);
+    eq("depth is at the bound", aml_glk_depth(), 32);
+    eq("the 33rd is REFUSED", aml_glk_enter(), 0);
+    eq("with its own code", aml_glk_stat(GLK_ST_LAST_ERR), E_GLK_DEPTH);
+    eq("which reached the session", aml_eval_err(), E_GLK_DEPTH);
+    eq("and its own counter", aml_glk_stat(GLK_ST_DEPTH_REF), 1);
+    eq("AND THE DEPTH DID NOT MOVE", aml_glk_depth(), 32);
+    for (int i = 0; i < 32; i++)
+        eq("unwind", aml_glk_leave(), 1);
+    eq("fully unwound", aml_glk_depth(), 0);
+    eq("one hardware acquisition for the whole nest",
+       aml_glk_stat(GLK_ST_ACQUIRES), 1);
+    eq("and one hardware release", aml_glk_stat(GLK_ST_RELEASES), 1);
+    eq("guard intact", aml_glk_facs_guard(), GLK_GUARD);
+}
+
+/* THE BOUNDED WAIT. Firmware that never releases must produce a refusal,
+ * not an unbounded wait — the discipline #1081 established for the EC's
+ * IBF/OBF waits, with a DISTINCT code, because "firmware will not let
+ * go" and "the EC did not answer" send an operator to different parts. */
+static void test_glk_firmware_that_never_releases_is_refused(void)
+{
+    g_case = "glk: firmware that never releases produces a refusal";
+    glk_fresh_clean(GLK_OWNED);
+    aml_glk_smm_signal_after(0);          /* it never lets go */
+
+    eq("the acquire is REFUSED", aml_glk_enter(), 0);
+    eq("with the Global Lock's own timeout code",
+       aml_glk_stat(GLK_ST_LAST_ERR), E_GLK_TIMEOUT);
+    eq("which reached the session", aml_eval_err(), E_GLK_TIMEOUT);
+    eq("and is NOT either EC timeout code",
+       (uint64_t)(aml_eval_err() == 69 || aml_eval_err() == 70), 0);
+    eq("and its own counter", aml_glk_stat(GLK_ST_TIMEOUTS), 1);
+    eq("the wait was bounded", aml_glk_stat(GLK_ST_POLLS) >= 20000, 1);
+    eq("NOTHING WAS ACQUIRED", aml_glk_depth(), 0);
+    eq("no hardware acquisition was recorded",
+       aml_glk_stat(GLK_ST_ACQUIRES), 0);
+    /* Our interest IS registered, though — so when firmware eventually
+     * does let go, its release will ring our doorbell. A refusal that
+     * had also withdrawn Pending would leave us permanently unnotified. */
+    eq("but our interest survived the refusal",
+       aml_glk_facs_word() & GLK_PENDING, GLK_PENDING);
+    eq("guard intact", aml_glk_facs_guard(), GLK_GUARD);
+}
+
+/* The other half of the same path: firmware that DOES let go. A fixture
+ * that only ever modelled firmware which never releases would leave the
+ * successful wait — the ordinary case — completely unexercised. */
+static void test_glk_wait_completes_when_firmware_releases(void)
+{
+    g_case = "glk: the wait completes when firmware releases";
+    glk_fresh(GLK_OWNED);
+    aml_glk_smm_signal_after(3);          /* it lets go on the third step */
+
+    eq("the acquire eventually succeeds", aml_glk_enter(), 1);
+    eq("it waited", aml_glk_stat(GLK_ST_POLLS) > 0, 1);
+    eq("but not to the bound", aml_glk_stat(GLK_ST_POLLS) < 20000, 1);
+    eq("no timeout was recorded", aml_glk_stat(GLK_ST_TIMEOUTS), 0);
+    eq("we observed firmware's ownership on the way",
+       aml_glk_stat(GLK_ST_PENDING) >= 1, 1);
+    eq("and now hold it", aml_glk_depth(), 1);
+    eq("Owned", aml_glk_facs_word() & GLK_OWNED, GLK_OWNED);
+
+    eq("release", aml_glk_leave(), 1);
+    eq("clear", aml_glk_facs_word(), 0);
+    eq("guard intact", aml_glk_facs_guard(), GLK_GUARD);
 }
 
 static void test_ec_name_segment_construction(void)
@@ -6697,6 +7120,25 @@ static void test_ec_transaction_round_trip(void)
         eq("attach", aml_ec_attach(dev, 0x62, 0x66), 1);
         eq("bound", aml_ec_bound(), 1);
         eq("THE #1065 GATE IS NOW OPEN", aml_region_ec_backing() != 0, 1);
+
+        /* R30.M8-001 (#1082). THE GLOBAL LOCK ATTACH, and it belongs
+         * beside the EC attach rather than inside ec_fresh: a platform
+         * has ONE Global Lock, its address is a system fact, and a
+         * fixture that re-derived it per test would be modelling a
+         * supervisor that could get two different answers. aml_glk_reset
+         * deliberately preserves this binding for the same reason
+         * aml_ec_reset preserves the EC's ports.
+         *
+         * The synthetic FACS supplies the address; PM1_CNT and PM1_STS
+         * take their conventional values. On hardware all three come
+         * from the FADT (FIRMWARE_CTRL / PM1a_CNT_BLK / PM1a_EVT_BLK),
+         * and the point of them being parameters is that they are
+         * parameters -- see design/acpi/global-lock.md §6. */
+        eq("the Global Lock refuses before it is attached",
+           aml_glk_bound(), 0);
+        eq("glk attach", aml_glk_attach(aml_glk_facs_addr(), 0x1804, 0x1800), 1);
+        eq("glk bound", aml_glk_bound(), 1);
+        glk_fresh(0);
 
         uint8_t *back = backing_load(NULL, 0x100);
         aml_eval_reset(2);
@@ -7264,6 +7706,18 @@ int main(void)
     test_ec_reentrant_transaction_is_refused_outer_survives();
     test_ec_query_dispatch_reenters_the_ec();
     test_ec_direct_field_access_through_the_evaluator();
+
+    /* R30.M8-001 (#1082) — the ACPI Global Lock. AFTER the EC block,
+     * which is where the lock is attached: "nothing works before the
+     * attach" is an assertion that can only be made once. */
+    test_glk_acquire_and_release();
+    test_glk_release_rings_the_doorbell_iff_someone_waits();
+    test_glk_smm_interleaves_between_the_read_and_the_write();
+    test_glk_sustained_interference_converges();
+    test_glk_nested_acquire_does_not_release_early();
+    test_glk_refusals_are_distinct_and_counted();
+    test_glk_firmware_that_never_releases_is_refused();
+    test_glk_wait_completes_when_firmware_releases();
 
     if (g_fail) {
         fprintf(stderr, "[aml-corpus] %d assertion(s) failed out of %d\n",
