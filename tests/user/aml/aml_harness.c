@@ -329,6 +329,23 @@ extern uint64_t aml_region_named_int_val(uint64_t name_node);
 extern uint64_t aml_region_ec_backing(void);
 extern uint64_t aml_region_ec_hw_committed(void);
 extern uint64_t aml_region_ec_gated(void);
+
+/* R30.M7-001/002/003 (#1079 / #1080 / #1081) — the EC driver. */
+extern uint64_t aml_ec_attach(uint64_t node, uint64_t data_port, uint64_t cmd_port);
+extern uint64_t aml_ec_bound(void);
+extern void     aml_ec_reset(void);
+extern uint64_t aml_ec_stat(uint64_t which);
+extern void     aml_ec_mode_set(uint64_t mode);
+extern void     aml_ec_synth_reset(uint64_t wedge);
+extern void     aml_ec_ram_poke(uint64_t addr, uint64_t value);
+extern uint64_t aml_ec_ram_peek(uint64_t addr);
+extern void     aml_ec_synth_query_set(uint64_t q);
+extern uint64_t aml_ec_synth_writes(void);
+extern uint64_t aml_ec_xact(uint64_t op, uint64_t addr, uint64_t value);
+extern uint64_t aml_ec_query_pump(void);
+extern uint64_t aml_ec_query_seg(uint64_t q);
+extern void     aml_ec_probe_arm(uint64_t n);
+extern uint64_t aml_eval_find_in_scope(uint64_t scope, uint64_t seg);
 extern uint64_t aml_region_acc_log(uint64_t aw);
 extern uint64_t aml_region_of_field(uint64_t node);
 extern uint64_t aml_region_field_binding(uint64_t node);
@@ -405,7 +422,16 @@ enum {
     E_REGION_INDIRECT_FIELD = 64,
     /* #1063 / #1064 / #1065 */
     E_REGION_PORT_RANGE = 65, E_REGION_PCI_CONTEXT = 66,
-    E_REGION_EC_GATED = 67
+    E_REGION_EC_GATED = 67,
+    /* R30.M7 — the EC driver's own refusals. */
+    E_EC_UNBOUND      = 68,
+    E_EC_TIMEOUT_IBF  = 69,
+    E_EC_TIMEOUT_OBF  = 70,
+    E_EC_STATUS       = 71,
+    E_EC_RANGE        = 72,
+    E_EC_REENTRANT    = 73,
+    E_EC_QUERY_DEPTH  = 74,
+    E_EC_BAD_OP       = 75
 };
 
 /* Address spaces, and the sentinel that selects real port transactions. */
@@ -6447,16 +6473,23 @@ static void test_region_ec_binds_but_does_not_transact(void)
         eq("the buffer is still untouched", (uint64_t)back[0], 0xA5);
 
         /* ===============================================================
-         * THE FLIP ASSERTION (#1065).
+         * THE FLIP ASSERTION (#1065), RESOLVED BY R30.M7 (#1079).
          *
-         * These two pin the gate SHUT. When R31's EC driver lands and
-         * calls aml_region_ec_backing_set, and a transaction runs, they
-         * fail — deliberately. That failure is the signal that this test
-         * must be rewritten to assert the driver's behaviour instead of
-         * its absence. A gate that could be left closed after the
-         * hardware arrived, or opened before it, would be worth nothing.
+         * These two pinned the gate SHUT while no driver existed. The
+         * driver now exists, so what they pin is the PRE-ATTACH state:
+         * a supervisor that has not called aml_ec_attach gets a gate
+         * that is still closed, still refuses, and still performs no
+         * transaction. That is the posture of every process that parses
+         * a table without owning the EC, and it is worth asserting for
+         * exactly as long as such a process can exist.
+         *
+         * THIS TEST MUST RUN BEFORE ANY aml_ec_attach. Registration is a
+         * system fact and deliberately survives aml_region_reset, so
+         * there is no way back to this state once the driver attaches.
+         * main() orders it accordingly; if that ordering is ever broken
+         * these two fail and say so rather than passing vacuously.
          * =============================================================== */
-        eq("NO EC BACKING IS REGISTERED — R31 has not landed",
+        eq("NO EC BACKING IS REGISTERED — nothing has attached yet",
            aml_region_ec_backing(), 0);
         eq("AND NO EC TRANSACTION HAS EVER BEEN PERFORMED",
            aml_region_ec_hw_committed(), 0);
@@ -6481,6 +6514,571 @@ static void test_region_ec_binds_but_does_not_transact(void)
                                       (uint64_t)(uintptr_t)back), 0);
         eq("NOT_COVERED", aml_eval_err(), E_REGION_NOT_COVERED);
         eq("nothing bound", aml_region_count(), 0);
+        backing_free();
+    });
+}
+
+/* ====================================================================
+ * R30.M7-001/002/003 (#1079 / #1080 / #1081) — THE EMBEDDED CONTROLLER.
+ *
+ * EVERY TEST BELOW RUNS AFTER test_region_ec_binds_but_does_not_transact,
+ * AND THE ORDER IS LOAD-BEARING. aml_ec_attach registers a transaction
+ * backing with aml_region, and that registration deliberately survives
+ * aml_region_reset — it is a system fact, not a session one. So the
+ * pre-attach assertions ("the gate is shut, nothing transacts") can only
+ * be made before the driver attaches, exactly once, and they are made
+ * there. Reordering main() would not make them fail silently: that test
+ * asserts aml_region_ec_backing() == 0 on entry and says why.
+ *
+ * The synthetic EC is the same device gpe_io.pdx's GPE_IO_MODE_SYNTH is.
+ * aml_ec_xact is byte-identical in both modes, so these are assertions
+ * about the shipping transaction rather than about a test double of it.
+ * The wedge modes exist because A TEST SUITE IN WHICH THE FAKE EC ALWAYS
+ * ANSWERS PROVES NOTHING ABOUT THE PATH THAT MATTERS.
+ * ==================================================================== */
+
+enum {
+    EC_ST_XACT_BUSY = 4,  EC_ST_EPISODE   = 5,  EC_ST_DEPTH    = 6,
+    EC_ST_COMMITTED = 7,  EC_ST_GLK_IN    = 8,  EC_ST_GLK_OUT  = 9,
+    EC_ST_ATTEMPTED = 10, EC_ST_Q_SEEN    = 11, EC_ST_Q_DISP   = 12,
+    EC_ST_Q_ZERO    = 13, EC_ST_Q_NOMETH  = 14, EC_ST_TO_IBF   = 15,
+    EC_ST_TO_OBF    = 16, EC_ST_STATUS    = 17, EC_ST_RANGE    = 18,
+    EC_ST_REENT     = 19, EC_ST_DEPTH_REF = 20, EC_ST_UNBOUND  = 21,
+    EC_ST_BADOP     = 22, EC_ST_LAST_Q    = 24, EC_ST_PROBE_RES = 26
+};
+enum { EC_OP_READ = 1, EC_OP_WRITE = 2 };
+enum { EC_MODE_PORT = 0, EC_MODE_SYNTH = 1 };
+enum { EC_WEDGE_NONE = 0, EC_WEDGE_IBF = 1, EC_WEDGE_OBF = 2,
+       EC_WEDGE_STUCK_ADDR = 3 };
+enum { EC_Q_NONE = 0, EC_Q_DISPATCHED = 1, EC_Q_NO_METHOD = 2 };
+#define EC_FAIL 0xFFFFFFFFFFFFFFFFull
+
+/* The EC device fixture, used by every query test.
+ *
+ *   Name(QCNT, 0)
+ *   Device(EC0_) {
+ *     OperationRegion(ECR_, EmbeddedControl, 0, 0x100)
+ *     Field(ECR_, ByteAcc, NoLock, Preserve) { ECF0, 8 }
+ *     Method(_Q00, 0) { Store(0x99, \QCNT) }   <- MUST NEVER RUN
+ *     Method(_Q80, 0) { Store(ECF0, \QCNT) }   <- reads the EC from
+ *                                                 inside the episode
+ *   }
+ *
+ * _Q80's body is the reentrancy witness in one line: it performs an EC
+ * OperationRegion read while the query episode that dispatched it is
+ * still open. If the transaction claim were held across the dispatch,
+ * this read would be refused and \QCNT would keep its old value.
+ *
+ * _Q00 exists to be NOT CALLED. Its body is observable for exactly that
+ * reason — a fixture whose _Q00 did nothing could not tell "we correctly
+ * declined to dispatch it" from "we dispatched it and it happened to be
+ * a no-op".
+ */
+static size_t build_ec_device(uint8_t *out)
+{
+    size_t o = 0;
+
+    /* Name(QCNT, 0) */
+    out[o++] = 0x08; memcpy(out + o, "QCNT", 4); o += 4; out[o++] = 0x00;
+
+    uint8_t body[192]; size_t k = 0;
+    memcpy(body + k, "EC0_", 4); k += 4;
+
+    /* OperationRegion(ECR_, EmbeddedControl, 0, 0x100) */
+    body[k++] = 0x5B; body[k++] = 0x80;
+    memcpy(body + k, "ECR_", 4); k += 4;
+    body[k++] = 0x03;                                  /* EmbeddedControl */
+    body[k++] = 0x0C; body[k++]=0; body[k++]=0; body[k++]=0; body[k++]=0;
+    body[k++] = 0x0C; body[k++]=0x00; body[k++]=0x01; body[k++]=0; body[k++]=0;
+
+    /* Field(ECR_, ByteAcc, NoLock, Preserve) { ECF0, 8 } */
+    { uint8_t f[32]; size_t j = 0;
+      memcpy(f + j, "ECR_", 4); j += 4; f[j++] = 0x01;  /* ByteAcc */
+      memcpy(f + j, "ECF0", 4); j += 4; f[j++] = 8;
+      body[k++] = 0x5B; body[k++] = 0x81; k += emit_pkg(body + k, f, j); }
+
+    /* Method(_Q00, 0) { Store(0x99, \QCNT) } */
+    { uint8_t m[32]; size_t j = 0;
+      memcpy(m + j, "_Q00", 4); j += 4; m[j++] = 0x00;
+      m[j++] = 0x70; m[j++] = 0x0A; m[j++] = 0x99;
+      m[j++] = 0x5C; memcpy(m + j, "QCNT", 4); j += 4;
+      body[k++] = 0x14; k += emit_pkg(body + k, m, j); }
+
+    /* Method(_Q80, 0) { Store(ECF0, \QCNT) } */
+    { uint8_t m[32]; size_t j = 0;
+      memcpy(m + j, "_Q80", 4); j += 4; m[j++] = 0x00;
+      m[j++] = 0x70; memcpy(m + j, "ECF0", 4); j += 4;
+      m[j++] = 0x5C; memcpy(m + j, "QCNT", 4); j += 4;
+      body[k++] = 0x14; k += emit_pkg(body + k, m, j); }
+
+    out[o++] = 0x5B; out[o++] = 0x82; o += emit_pkg(out + o, body, k);
+    return o;
+}
+
+/* Put the driver and the synthetic device in a known state. Deliberately
+ * NOT a call to aml_ec_attach: the binding survives on purpose, and a
+ * helper that re-attached every time would hide a driver that had lost
+ * its ports. */
+static void ec_fresh(uint64_t wedge)
+{
+    aml_ec_reset();
+    aml_ec_mode_set(EC_MODE_SYNTH);
+    aml_ec_synth_reset(wedge);
+}
+
+/* The balance assertion the Global Lock seam exists for. Every attempted
+ * transaction takes the seam exactly once and leaves it exactly once —
+ * including every timeout exit. An implementation that acquires the real
+ * lock and leaks it on a timeout fails HERE, in a test written before the
+ * lock was. */
+static void ec_glk_balanced(const char *where)
+{
+    g_checks++;
+    if (aml_ec_stat(EC_ST_GLK_IN) != aml_ec_stat(EC_ST_GLK_OUT))
+        fail(where);
+    eq("the seam was entered once per attempted transaction",
+       aml_ec_stat(EC_ST_GLK_IN), aml_ec_stat(EC_ST_ATTEMPTED));
+    eq("and the transaction claim is free",
+       aml_ec_stat(EC_ST_XACT_BUSY), 0);
+}
+
+static void test_ec_name_segment_construction(void)
+{
+    g_case = "ec: _Qxx name construction";
+    /* Uppercase is not cosmetic: NameSegs compare as integers, so '_Q8a'
+     * and '_Q8A' are different names and only one is declared. */
+    eq("_Q00", aml_ec_query_seg(0x00), SEG4('_','Q','0','0'));
+    eq("_Q80", aml_ec_query_seg(0x80), SEG4('_','Q','8','0'));
+    eq("_Q0F", aml_ec_query_seg(0x0F), SEG4('_','Q','0','F'));
+    eq("_QFF", aml_ec_query_seg(0xFF), SEG4('_','Q','F','F'));
+    eq("_QA5", aml_ec_query_seg(0xA5), SEG4('_','Q','A','5'));
+    eq("_Q10", aml_ec_query_seg(0x10), SEG4('_','Q','1','0'));
+    /* The digit/letter boundary, from both sides. */
+    eq("_Q09", aml_ec_query_seg(0x09), SEG4('_','Q','0','9'));
+    eq("_Q0A", aml_ec_query_seg(0x0A), SEG4('_','Q','0','A'));
+}
+
+static void test_ec_refuses_before_it_is_attached(void)
+{
+    g_case = "ec: nothing transacts before aml_ec_attach";
+    /* This runs while the driver is still unbound, which is the only
+     * moment it can be observed. */
+    ec_fresh(EC_WEDGE_NONE);
+    eq("not bound yet", aml_ec_bound(), 0);
+
+    aml_eval_reset(2);
+    aml_eval_set_fuel(10000);
+    uint64_t unb = aml_ec_stat(EC_ST_UNBOUND);
+    eq("a read against no EC refuses", aml_ec_xact(EC_OP_READ, 0, 0), EC_FAIL);
+    eq("UNBOUND", aml_eval_err(), E_EC_UNBOUND);
+    eq("counted", aml_ec_stat(EC_ST_UNBOUND), unb + 1);
+    eq("and no transaction was attempted", aml_ec_stat(EC_ST_ATTEMPTED), 0);
+    eq("so the Global Lock seam was never taken", aml_ec_stat(EC_ST_GLK_IN), 0);
+
+    aml_eval_reset(2);
+    aml_eval_set_fuel(10000);
+    eq("and neither does a query pump", aml_ec_query_pump(), EC_FAIL);
+    eq("UNBOUND", aml_eval_err(), E_EC_UNBOUND);
+}
+
+static void test_ec_transaction_round_trip(void)
+{
+    uint8_t f[256];
+    size_t n = build_ec_device(f);
+    WITH_PARSE("ec: a real transaction reads and writes the byte it named",
+               f, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t dev = nth_child(root, 1);
+        uint64_t rgn = nth_child(dev, 0);
+
+        /* THE ATTACH. Ports would come from the EC device's _CRS on real
+         * hardware; the fixture supplies the conventional pair, and the
+         * point of the parameter is that it is a parameter. */
+        eq("attach", aml_ec_attach(dev, 0x62, 0x66), 1);
+        eq("bound", aml_ec_bound(), 1);
+        eq("THE #1065 GATE IS NOW OPEN", aml_region_ec_backing() != 0, 1);
+
+        uint8_t *back = backing_load(NULL, 0x100);
+        aml_eval_reset(2);
+        aml_region_reset();
+        uint64_t b = aml_region_bind(rgn, 7, 0, 0x100,
+                                     (uint64_t)(uintptr_t)back);
+        g_checks++;
+        if (b == 0) fail("EC region did not bind");
+
+        ec_fresh(EC_WEDGE_NONE);
+        aml_ec_ram_poke(0x00, 0x5A);
+        aml_ec_ram_poke(0x01, 0xC3);
+        aml_ec_ram_poke(0x2A, 0x77);
+
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        /* Both counts are LIFETIME claims — "this process has never
+         * performed an EC transaction" — so they survive every reset and
+         * every assertion here is a delta. */
+        uint64_t hw = aml_region_ec_hw_committed();
+        uint64_t dc = aml_ec_stat(EC_ST_COMMITTED);
+
+        /* THE FLIP. #1065 pinned this at "produces nothing". */
+        eq("an EC read returns the byte at that offset",
+           aml_region_read_unit(b, 0x00, 1), 0x5A);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("and a different offset returns a different byte",
+           aml_region_read_unit(b, 0x2A, 1), 0x77);
+        eq("the neighbour is not what came back",
+           aml_region_read_unit(b, 0x01, 1), 0xC3);
+
+        eq("three transactions committed at the region layer",
+           aml_region_ec_hw_committed(), hw + 3);
+        eq("and at the driver layer", aml_ec_stat(EC_ST_COMMITTED), dc + 3);
+        ec_glk_balanced("Global Lock seam unbalanced after three reads");
+
+        /* THE BACKING BUFFER IS NOT THE EC. aml_region_bind wants a
+         * non-zero host address and gets one, but an EmbeddedControl
+         * access is a port handshake and must never touch it — a handler
+         * that fell through to the memory path would have returned
+         * whatever memset left there. */
+        memset(back, 0xA5, 0x100);
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        eq("the region's host buffer is not consulted",
+           aml_region_read_unit(b, 0x00, 1), 0x5A);
+
+        /* Writes. */
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        uint64_t w = aml_ec_synth_writes();
+        eq("an EC write completes", aml_region_write_unit(b, 0x40, 1, 0x3C), 1);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("the byte landed", aml_ec_ram_peek(0x40), 0x3C);
+        eq("exactly one byte was written", aml_ec_synth_writes(), w + 1);
+        eq("and the neighbour is untouched", aml_ec_ram_peek(0x41), 0);
+        eq("the host buffer is still untouched", (uint64_t)back[0x40], 0xA5);
+
+        /* ONE BYTE PER HANDSHAKE. A WordAcc EC field is a table bug, and
+         * a direct wide unit access is refused rather than silently
+         * turned into two transactions on a device where a read is not
+         * free of side effects. */
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        uint64_t com = aml_ec_stat(EC_ST_COMMITTED);
+        eq("a two-byte EC access produces nothing",
+           aml_region_read_unit(b, 0x00, 2), 0);
+        eq("ACCESS_WIDTH", aml_eval_err(), E_REGION_ACCESS_WIDTH);
+        eq("and no transaction was performed",
+           aml_ec_stat(EC_ST_COMMITTED), com);
+
+        backing_free();
+    });
+}
+
+static void test_ec_timeouts_refuse_rather_than_hang(void)
+{
+    g_case = "ec: a wedged EC produces a refusal, not a hang";
+
+    /* ---- the input buffer never drains ---- */
+    ec_fresh(EC_WEDGE_IBF);
+    uint64_t dc = aml_ec_stat(EC_ST_COMMITTED);   /* lifetime; delta only */
+    aml_eval_reset(2);
+    aml_eval_set_fuel(10000);
+    eq("a read against an EC that never clears IBF refuses",
+       aml_ec_xact(EC_OP_READ, 0x10, 0), EC_FAIL);
+    eq("TIMEOUT_IBF — its own code, not a generic failure",
+       aml_eval_err(), E_EC_TIMEOUT_IBF);
+    eq("counted as an IBF timeout", aml_ec_stat(EC_ST_TO_IBF), 1);
+    eq("and NOT as an OBF timeout", aml_ec_stat(EC_ST_TO_OBF), 0);
+    eq("nothing was committed", aml_ec_stat(EC_ST_COMMITTED), dc);
+    ec_glk_balanced("the IBF timeout path leaked the Global Lock seam");
+
+    /* THE CLAIM IS FREE AFTERWARDS. A timeout that leaked it would turn
+     * one wedged transaction into a permanently dead EC path — the same
+     * defect as no timeout at all, arriving one transaction later. */
+    aml_ec_synth_reset(EC_WEDGE_NONE);
+    aml_ec_ram_poke(0x10, 0x81);
+    aml_eval_reset(2);
+    aml_eval_set_fuel(10000);
+    eq("and the NEXT transaction succeeds normally",
+       aml_ec_xact(EC_OP_READ, 0x10, 0), 0x81);
+    eq("no error", aml_eval_err(), AML_OK);
+
+    /* ---- the output buffer never fills ---- */
+    ec_fresh(EC_WEDGE_OBF);
+    aml_eval_reset(2);
+    aml_eval_set_fuel(10000);
+    eq("a read against an EC that never sets OBF refuses",
+       aml_ec_xact(EC_OP_READ, 0x10, 0), EC_FAIL);
+    eq("TIMEOUT_OBF — distinguishable from the IBF case",
+       aml_eval_err(), E_EC_TIMEOUT_OBF);
+    eq("counted as an OBF timeout", aml_ec_stat(EC_ST_TO_OBF), 1);
+    eq("and NOT as an IBF timeout", aml_ec_stat(EC_ST_TO_IBF), 0);
+    ec_glk_balanced("the OBF timeout path leaked the Global Lock seam");
+
+    /* A QUERY on a wedged EC must refuse for the same reason: the query
+     * path is the one that runs at event time, when a hang is least
+     * recoverable. */
+    ec_fresh(EC_WEDGE_OBF);
+    aml_ec_synth_query_set(0x80);
+    aml_eval_reset(2);
+    aml_eval_set_fuel(10000);
+    eq("a query against a wedged EC refuses", aml_ec_query_pump(), EC_FAIL);
+    eq("TIMEOUT_OBF", aml_eval_err(), E_EC_TIMEOUT_OBF);
+    eq("and no query was counted as seen", aml_ec_stat(EC_ST_Q_SEEN), 0);
+    eq("nor dispatched", aml_ec_stat(EC_ST_Q_DISP), 0);
+    ec_glk_balanced("the query timeout path leaked the Global Lock seam");
+
+    /* ---- the EC answers without consuming the address ---- */
+    ec_fresh(EC_WEDGE_STUCK_ADDR);
+    aml_ec_ram_poke(0x10, 0x42);
+    aml_eval_reset(2);
+    aml_eval_set_fuel(10000);
+    eq("an inconsistent status produces NO VALUE",
+       aml_ec_xact(EC_OP_READ, 0x10, 0), EC_FAIL);
+    eq("STATUS — a third distinct cause", aml_eval_err(), E_EC_STATUS);
+    eq("counted", aml_ec_stat(EC_ST_STATUS), 1);
+    eq("and neither timeout counter moved",
+       aml_ec_stat(EC_ST_TO_IBF) + aml_ec_stat(EC_ST_TO_OBF), 0);
+    /* 0x42 was sitting in the output buffer. A handler that trusted OBF
+     * alone would have returned it, and thermal code would have believed
+     * a number the EC never answered with. */
+    ec_glk_balanced("the status-refusal path leaked the Global Lock seam");
+}
+
+static void test_ec_out_of_range_is_refused_not_wrapped(void)
+{
+    g_case = "ec: an address outside EC space is refused";
+    ec_fresh(EC_WEDGE_NONE);
+    aml_ec_ram_poke(0x00, 0x11);
+
+    aml_eval_reset(2);
+    aml_eval_set_fuel(10000);
+    eq("address 256 is refused", aml_ec_xact(EC_OP_READ, 256, 0), EC_FAIL);
+    eq("RANGE", aml_eval_err(), E_EC_RANGE);
+    eq("counted", aml_ec_stat(EC_ST_RANGE), 1);
+
+    /* THE ASSERTION THAT MATTERS. 256 & 0xFF is 0, and byte 0 holds
+     * 0x11. A handler that masked instead of refusing would have
+     * returned 0x11 and looked entirely correct. */
+    g_checks++;
+    if (aml_ec_xact(EC_OP_READ, 256, 0) == 0x11)
+        fail("the address WRAPPED to 0 instead of being refused");
+
+    aml_eval_reset(2);
+    aml_eval_set_fuel(10000);
+    eq("and a far address is refused too",
+       aml_ec_xact(EC_OP_READ, 0x10000, 0), EC_FAIL);
+    eq("RANGE", aml_eval_err(), E_EC_RANGE);
+
+    /* A REFUSED WRITE MUST NOT REACH THE DEVICE. This is the destructive
+     * case: an EC write outside the range firmware declared can do things
+     * no specification describes. */
+    uint64_t w = aml_ec_synth_writes();
+    aml_eval_reset(2);
+    aml_eval_set_fuel(10000);
+    eq("an out-of-range write is refused",
+       aml_ec_xact(EC_OP_WRITE, 300, 0xFF), EC_FAIL);
+    eq("RANGE", aml_eval_err(), E_EC_RANGE);
+    eq("and NOTHING was written", aml_ec_synth_writes(), w);
+    eq("byte 44 — 300 & 0xFF — is untouched", aml_ec_ram_peek(44), 0);
+
+    /* The range refusals happen BEFORE the transaction claim is taken,
+     * which is why the balance identity is over ATTEMPTED transactions
+     * and not over calls. */
+    eq("no transaction was attempted", aml_ec_stat(EC_ST_ATTEMPTED), 0);
+    ec_glk_balanced("a refused address touched the Global Lock seam");
+
+    /* Not a read and not a write. */
+    aml_eval_reset(2);
+    aml_eval_set_fuel(10000);
+    eq("an unknown operation is refused", aml_ec_xact(7, 0, 0), EC_FAIL);
+    eq("BAD_OP", aml_eval_err(), E_EC_BAD_OP);
+    eq("counted", aml_ec_stat(EC_ST_BADOP), 1);
+}
+
+static void test_ec_reentrant_transaction_is_refused_outer_survives(void)
+{
+    g_case = "ec: a transaction inside a handshake is refused, and the "
+             "outer one still completes";
+    ec_fresh(EC_WEDGE_NONE);
+    aml_ec_ram_poke(0x20, 0x6E);
+    aml_ec_ram_poke(0x00, 0xDD);
+
+    /* The probe fires from inside aml_ec_wait_ibf_clear — there is no
+     * other way to be mid-handshake. */
+    uint64_t dc = aml_ec_stat(EC_ST_COMMITTED);   /* lifetime; delta only */
+    aml_ec_probe_arm(1);
+    aml_eval_reset(2);
+    aml_eval_set_fuel(10000);
+    uint64_t v = aml_ec_xact(EC_OP_READ, 0x20, 0);
+
+    eq("THE NESTED ATTEMPT WAS REFUSED",
+       aml_ec_stat(EC_ST_PROBE_RES), EC_FAIL);
+    eq("as REENTRANT", aml_ec_stat(EC_ST_REENT), 1);
+
+    /* AND THE OUTER TRANSACTION STILL COMPLETED, WITH THE RIGHT BYTE.
+     * A reentrancy guard that poisoned the transaction it fired inside
+     * would be worse than the bug it guards against: every EC access
+     * would then depend on nothing else ever touching the EC. */
+    eq("the outer read returned its own byte", v, 0x20 == 0x20 ? 0x6E : 0);
+    eq("not the nested read's address-0 byte", v != 0xDD, 1);
+    eq("one transaction committed, not two",
+       aml_ec_stat(EC_ST_COMMITTED), dc + 1);
+    ec_glk_balanced("the reentrant refusal disturbed the seam balance");
+
+    /* The refusal left no residue. */
+    aml_ec_probe_arm(0);
+    aml_eval_reset(2);
+    aml_eval_set_fuel(10000);
+    eq("the next transaction is unaffected",
+       aml_ec_xact(EC_OP_READ, 0x00, 0), 0xDD);
+    eq("no error", aml_eval_err(), AML_OK);
+}
+
+static void test_ec_query_dispatch_reenters_the_ec(void)
+{
+    uint8_t f[256];
+    size_t n = build_ec_device(f);
+    WITH_PARSE("ec: _Qxx dispatch, and the _Qxx reads the EC from inside "
+               "the episode", f, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t qcnt = nth_child(root, 0);
+        uint64_t dev  = nth_child(root, 1);
+        uint64_t rgn  = nth_child(dev, 0);
+        uint64_t q80  = nth_child(dev, 3);
+
+        eq("attach", aml_ec_attach(dev, 0x62, 0x66), 1);
+
+        /* Exact resolution in the EC's own scope — NOT the §5.3 upward
+         * search, which would find an ancestor's _Q80 when this device
+         * declares none and run the wrong device's handler. */
+        eq("_Q80 resolves under the EC device",
+           aml_eval_find_in_scope(dev, aml_ec_query_seg(0x80)), q80);
+        eq("a query the table does not define resolves to nothing",
+           aml_eval_find_in_scope(dev, aml_ec_query_seg(0x7E)), 0);
+
+        uint8_t *back = backing_load(NULL, 0x100);
+        aml_eval_reset(2);
+        aml_region_reset();
+        uint64_t b = aml_region_bind(rgn, 7, 0, 0x100,
+                                     (uint64_t)(uintptr_t)back);
+        g_checks++;
+        if (b == 0) fail("EC region did not bind");
+
+        ec_fresh(EC_WEDGE_NONE);
+        aml_ec_ram_poke(0x00, 0x4B);       /* what _Q80 will read */
+        aml_ec_synth_query_set(0x80);
+
+        aml_eval_reset(2);
+        aml_eval_set_fuel(100000);
+        uint64_t dc = aml_ec_stat(EC_ST_COMMITTED);   /* lifetime; delta */
+        eq("QCNT starts at zero", aml_eval_read_named(qcnt), 0);
+
+        /* ============ THE REENTRANT CASE ============
+         * The pump issues QR_EC (one transaction), releases the claim,
+         * then dispatches _Q80 — whose body performs an EC read (a
+         * second transaction) while the episode is still open. If the
+         * claim were held across the dispatch this would refuse and
+         * QCNT would still be 0. */
+        eq("a query was dispatched", aml_ec_query_pump(), EC_Q_DISPATCHED);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("_Q80 RAN AND READ THE EC FROM INSIDE THE EPISODE",
+           aml_eval_read_named(qcnt), 0x4B);
+        eq("two transactions: the query and the _Qxx's own read",
+           aml_ec_stat(EC_ST_COMMITTED), dc + 2);
+        eq("one query seen", aml_ec_stat(EC_ST_Q_SEEN), 1);
+        eq("one dispatched", aml_ec_stat(EC_ST_Q_DISP), 1);
+        eq("the query byte was recorded", aml_ec_stat(EC_ST_LAST_Q), 0x80);
+        ec_glk_balanced("the query episode unbalanced the seam");
+
+        /* THE EPISODE CLOSED. A dispatch that left the depth raised
+         * would refuse every later query with QUERY_DEPTH after four
+         * lid events, which is a machine that works for a while. */
+        eq("the episode is closed", aml_ec_stat(EC_ST_EPISODE), 0);
+        eq("and its depth is back to zero", aml_ec_stat(EC_ST_DEPTH), 0);
+        eq("frames unwound", aml_eval_frames(), 0);
+
+        /* ============ QUERY ZERO IS NOT A QUERY ============
+         * The synthetic EC has already had its query byte consumed, so
+         * the next QR_EC returns 0. _Q00 IS DEFINED in this fixture and
+         * its body would set QCNT to 0x99. */
+        aml_eval_reset(2);
+        aml_eval_set_fuel(100000);
+        uint64_t before = aml_eval_read_named(qcnt);
+        eq("a second pump finds nothing pending",
+           aml_ec_query_pump(), EC_Q_NONE);
+        eq("no error", aml_eval_err(), AML_OK);
+        eq("counted as a zero query", aml_ec_stat(EC_ST_Q_ZERO), 1);
+        eq("NOT counted as a dispatch", aml_ec_stat(EC_ST_Q_DISP), 1);
+        eq("_Q00 WAS NOT INVOKED", aml_eval_read_named(qcnt), before);
+        g_checks++;
+        if (aml_eval_read_named(qcnt) == 0x99)
+            fail("_Q00 ran on a query byte of 0 — that event did not happen");
+
+        /* ============ a query with no handler ============ */
+        ec_fresh(EC_WEDGE_NONE);
+        aml_ec_synth_query_set(0x7E);
+        aml_eval_reset(2);
+        aml_eval_set_fuel(100000);
+        eq("an undeclared _Qxx is reported, not dispatched",
+           aml_ec_query_pump(), EC_Q_NO_METHOD);
+        eq("and is NOT an error — firmware need not define every query",
+           aml_eval_err(), AML_OK);
+        eq("counted separately from 'nothing pending'",
+           aml_ec_stat(EC_ST_Q_NOMETH), 1);
+        eq("no dispatch", aml_ec_stat(EC_ST_Q_DISP), 0);
+        eq("the episode never opened", aml_ec_stat(EC_ST_DEPTH), 0);
+        ec_glk_balanced("the no-method path unbalanced the seam");
+
+        backing_free();
+    });
+}
+
+static void test_ec_direct_field_access_through_the_evaluator(void)
+{
+    uint8_t f[256];
+    size_t n = build_ec_device(f);
+    WITH_PARSE("ec: a FieldUnit over EC space is a real transaction",
+               f, n, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t dev = nth_child(root, 1);
+        uint64_t rgn = nth_child(dev, 0);
+        uint64_t ecf0 = nth_child(nth_child(dev, 1), 0);
+
+        eq("attach", aml_ec_attach(dev, 0x62, 0x66), 1);
+
+        uint8_t *back = backing_load(NULL, 0x100);
+        aml_eval_reset(2);
+        aml_region_reset();
+        uint64_t b = aml_region_bind(rgn, 7, 0, 0x100,
+                                     (uint64_t)(uintptr_t)back);
+        g_checks++;
+        if (b == 0) fail("EC region did not bind");
+
+        ec_fresh(EC_WEDGE_NONE);
+        aml_ec_ram_poke(0x00, 0x37);
+
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        eq("a field read reaches the EC", aml_region_field_read(ecf0), 0x37);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        eq("a field store reaches the EC",
+           aml_region_field_store(ecf0, 0x91), 1);
+        eq("the byte landed", aml_ec_ram_peek(0x00), 0x91);
+        eq("the host buffer was never touched", (uint64_t)back[0], 0);
+
+        /* A WEDGED EC SEEN THROUGH THE FIELD LAYER. The refusal has to
+         * survive the whole way up, or a thermal method would read a
+         * plausible zero and act on it. */
+        ec_fresh(EC_WEDGE_OBF);
+        aml_eval_reset(2);
+        aml_eval_set_fuel(10000);
+        eq("a field read over a wedged EC produces nothing",
+           aml_region_field_read(ecf0), 0);
+        eq("and the reason survives to the top",
+           aml_eval_err(), E_EC_TIMEOUT_OBF);
+
         backing_free();
     });
 }
@@ -6643,6 +7241,29 @@ int main(void)
     test_region_pci_config_space_bounds();
     test_region_pci_access_is_the_memory_path();
     test_region_ec_binds_but_does_not_transact();
+
+    /* ---- R30.M7-001/002/003: THE EMBEDDED CONTROLLER.
+     *
+     * ORDER IS LOAD-BEARING AND IS NOT A STYLE CHOICE. Everything above
+     * this line runs with no EC driver attached, which is the only state
+     * in which "the #1065 gate is shut" can be observed — aml_ec_attach
+     * registers a transaction backing that deliberately survives
+     * aml_region_reset. test_ec_refuses_before_it_is_attached is the
+     * last observation of the unattached driver and must stay ahead of
+     * the first attach for the same reason.
+     *
+     * Within the block, the wedge fixtures come before the query
+     * fixtures: if the timeout path is broken the query tests would hang
+     * rather than fail, and the harness's 60-second alarm is a worse
+     * diagnostic than an assertion. ---- */
+    test_ec_name_segment_construction();
+    test_ec_refuses_before_it_is_attached();
+    test_ec_transaction_round_trip();
+    test_ec_timeouts_refuse_rather_than_hang();
+    test_ec_out_of_range_is_refused_not_wrapped();
+    test_ec_reentrant_transaction_is_refused_outer_survives();
+    test_ec_query_dispatch_reenters_the_ec();
+    test_ec_direct_field_access_through_the_evaluator();
 
     if (g_fail) {
         fprintf(stderr, "[aml-corpus] %d assertion(s) failed out of %d\n",

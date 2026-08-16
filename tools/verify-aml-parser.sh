@@ -110,7 +110,7 @@ HARNESS="${REPO_ROOT}/tests/user/aml/aml_harness.c"
 OUT="${REPO_ROOT}/build/aml"
 
 MODULES=(aml_lex aml_arena aml_optab aml_ns aml_term aml_resource aml_eval aml_arith
-         aml_obj aml_str aml_ref aml_ctl aml_region)
+         aml_obj aml_str aml_ref aml_ctl aml_region aml_ec)
 
 # ── environment ──────────────────────────────────────────────────────
 PA_BIN="$(bash "${REPO_ROOT}/tools/find-paideia-as.sh")"
@@ -330,6 +330,29 @@ check_confined "region binding table confined to aml_region.o" aml_region \
 check_confined "EC gate state confined to aml_region.o" aml_region \
                "(aml_region_ec_state)${END}"
 
+# R30.M7-001/002/003 (#1079 / #1080 / #1081). THE EC DRIVER'S STATE.
+#
+# aml_ec_state carries THE TWO CLAIMS the whole serialization argument
+# rests on — the transaction claim that covers one register handshake,
+# and the episode claim that covers a _Qxx dispatch and deliberately
+# ADMITS transactions rather than excluding them (see
+# design/acpi/embedded-controller.md §4). Both are single-writer
+# properties: a second module that cleared xact_busy would let a
+# transaction start inside another one's handshake, which corrupts both
+# and is exactly the condition the EC has no arbitration for. One that
+# wrote the episode depth would void the nesting bound.
+#
+# It also carries the port binding. A second writer there is a
+# transaction against a port the _CRS did not name.
+#
+# aml_ec_synth and aml_ec_ram are the synthetic controller. They are
+# confined for a different and equally load-bearing reason: the corpus
+# proves that a read returned THE BYTE IT NAMED, and that claim is worth
+# nothing if any module could have written the model behind the
+# transaction's back.
+check_confined "EC driver state confined to aml_ec.o" aml_ec \
+               "(aml_ec_state|aml_ec_synth|aml_ec_ram)${END}"
+
 # ── 3b. R30.M3-003 (#1063): PORT I/O CONFINEMENT ─────────────────────
 #
 # The SystemIO handler's transaction/logic split rests on `in` and `out`
@@ -388,30 +411,81 @@ if [[ "$(objdump -d --no-show-raw-insn "${OUT}/aml_region.o" 2>/dev/null \
 fi
 echo "[aml-parser] confinement: in/out only in aml_region_port_in/out"
 
-# R30.M3-005 (#1065). THE EC GATE IS CLOSED, asserted mechanically.
+# R30.M3-005 (#1065), INVERTED BY R30.M7-001 (#1079). THE EC GATE.
 #
-# aml_region_ec_backing_set is the registration point R31's EC driver
-# calls. Until it does, NOTHING references it — and that is exactly what
-# makes "the EC transaction is gated" a build-time fact rather than a
-# comment. The corpus separately pins aml_region_ec_hw_committed() at 0.
+# #1065 asserted that NOTHING relocated against aml_region_ec_backing_set,
+# which made "the EC transaction is gated" a build-time fact. Its own
+# comment said the milestone that landed the driver must update this
+# check, because a gate that could be left shut after the hardware
+# arrived would be as much of a defect as one opened before it.
 #
-# R31 MUST UPDATE THIS CHECK when it lands the driver. That is the point:
-# the gate cannot be quietly opened before the hardware exists, and it
-# cannot be quietly left shut after.
-ec_refs=0
-for m in "${MODULES[@]}"; do
-    ec_refs=$(( ec_refs + $(reloc_count "${OUT}/${m}.o" "aml_region_ec_backing_set${END}") ))
-done
-if [[ "${ec_refs}" -ne 0 ]]; then
-    echo "[aml-parser] FAIL — the EC gate has a caller (${ec_refs} relocation(s))." >&2
-    echo "  aml_region_ec_backing_set is R31's registration point. If R31 has" >&2
-    echo "  landed, update this check AND the aml_region_ec_hw_committed()" >&2
-    echo "  assertions in tests/user/aml/aml_harness.c to assert the driver's" >&2
-    echo "  behaviour rather than its absence. If it has not, something is" >&2
-    echo "  opening the gate without an EC driver behind it." >&2
+# R30.M7 lands the driver, so the assertion inverts rather than
+# disappearing — and it inverts to something JUST AS STRONG. The
+# registration point must have EXACTLY ONE caller, and that caller must
+# be aml_ec.o. A second registrant, or a registrant in any other module,
+# means something other than the EC driver is deciding what services
+# EmbeddedControl accesses — which on a part that owns battery charging
+# and fan control is the failure this gate was built for.
+ec_owner_refs="$(reloc_count "${OUT}/aml_ec.o" "aml_region_ec_backing_set${END}")"
+if [[ "${ec_owner_refs}" -ne 1 ]]; then
+    echo "[aml-parser] FAIL — aml_ec.o registers the EC backing ${ec_owner_refs} time(s), expected exactly 1." >&2
+    echo "  0 means the driver no longer opens the gate and every EC access" >&2
+    echo "  silently returns AML_ERR_REGION_EC_GATED — the subsystem would" >&2
+    echo "  look present and do nothing. More than 1 means there are two" >&2
+    echo "  registration paths and the last one to run wins." >&2
+    echo "  See design/acpi/embedded-controller.md §10." >&2
     exit 1
 fi
-echo "[aml-parser] EC gate closed: no caller of aml_region_ec_backing_set (R31 opens it)"
+ec_stray=""
+for m in "${MODULES[@]}"; do
+    [[ "${m}" == "aml_ec" ]] && continue
+    if [[ "$(reloc_count "${OUT}/${m}.o" "aml_region_ec_backing_set${END}")" -ne 0 ]]; then
+        ec_stray="${ec_stray} ${m}.o"
+    fi
+done
+if [[ -n "${ec_stray}" ]]; then
+    echo "[aml-parser] FAIL — the EC gate is opened outside the driver:${ec_stray}" >&2
+    echo "  Only src/user/aml/aml_ec.pdx may register an EC transaction entry." >&2
+    exit 1
+fi
+echo "[aml-parser] EC gate open: aml_ec.o is the sole registrant of aml_region_ec_backing_set"
+
+# R30.M7-001/003 (#1079/#1081). THE EC TRANSACTION SIGNATURE.
+#
+# THE SIGNATURE IS THE SECURITY ARGUMENT, so it is pinned verbatim
+# rather than described in a comment. aml_ec_xact takes an EC-SPACE
+# ADDRESS that aml_region derived from the binding row's own offset
+# arithmetic — the same confined footing #1075/#1076 put the GPIO pad
+# path on. There is no base parameter and no region parameter, and a
+# mutant that adds one must fail the BUILD rather than the review:
+# an EC write outside the range firmware declared can do things no
+# specification describes, on a part that owns battery charging, fan
+# control and the lid switch.
+#
+# aml_ec_query_pump is pinned at ARITY ZERO for the same reason. The
+# namespace scope _Qxx resolves in comes from aml_ec_attach, not from
+# the caller; a caller-supplied scope would let a query dispatch some
+# OTHER device's _Q80, which is the same class of mistake one level up.
+pin_signature() {
+    local file="$1" sig="$2" why="$3"
+    if ! grep -qF -- "${sig}" "${file}"; then
+        echo "[aml-parser] FAIL — signature not found verbatim in ${file#"${REPO_ROOT}"/}:" >&2
+        echo "    ${sig}" >&2
+        echo "  ${why}" >&2
+        exit 1
+    fi
+}
+EC_SRC="${AML_SRC}/aml_ec.pdx"
+pin_signature "${EC_SRC}" \
+    "pub let aml_ec_xact : (u64, u64, u64) -> u64 !{mem} @{} =" \
+    "The transaction takes (op, EC-space address, value) and NOTHING ELSE. A base, a region handle or a length parameter here would let a caller name a byte the binding row does not cover. See design/acpi/embedded-controller.md §6.1."
+pin_signature "${EC_SRC}" \
+    "pub let aml_ec_query_pump : () -> u64 !{mem} @{} =" \
+    "The query pump takes NO arguments. The EC's namespace scope comes from aml_ec_attach; a caller-supplied scope would dispatch another device's _Qxx. See design/acpi/embedded-controller.md §6.1."
+pin_signature "${EC_SRC}" \
+    "pub let aml_ec_attach : (u64, u64, u64) -> u64 !{mem} @{} =" \
+    "Both EC ports come from the device's _CRS through this one entry point. If it grew a default, a machine that relocates the EC would be transacted against at 0x62/0x66 anyway."
+echo "[aml-parser] signatures pinned: aml_ec_xact / aml_ec_query_pump / aml_ec_attach"
 
 # ── 4. the corpus ────────────────────────────────────────────────────
 OBJS=()
