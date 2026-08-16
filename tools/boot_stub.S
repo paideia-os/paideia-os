@@ -2467,6 +2467,38 @@ owner_sweep_ok_msg: .ascii "R31 OWNER SWEEP OK\n\0"
 .align 8
 owner_sweep_fail_msg: .ascii "R31 OWNER SWEEP FAIL\n\0"
 
+#   R31 TASK POOL BOUNDS OK — emitted by
+#       tests/kernel/sched/task_pool_bounds.pdx §task_pool_bounds_witness,
+#       R31.M2-1594 (#1594). It stands for the property that _task_pool
+#       CONTAINS every slab the pid ceiling can name -- which it did not.
+#       The array was `[u64; 17792]`, 64 * 2224, the STRUCT size; task_new
+#       strides 4096, the SLOT size. 142336 / 4096 = 34.75, so every pid
+#       from 36 to 63 wrote a complete task_struct past the end of the
+#       array and into `_task_kernel_stacks`.
+#         * IT WAS INVISIBLE BECAUSE BOOT USES FOUR PIDS. No test had ever
+#           asked for a thirty-sixth. A bound that only the untravelled
+#           part of the range violates is invisible to every test that
+#           travels the ordinary part, so the fixture DRIVES the range.
+#         * THE OBVIOUS CANARY PASSES ON THE BROKEN TREE. _pid_table and
+#           _pid_gen sat in slot 34's unused padding; pid 35 stops 848
+#           bytes short of them and pid 36 starts 1024 bytes past them.
+#           So the watched region is MEASURED -- the lowest pid-indexed
+#           structure above the pool base -- not guessed.
+#         * SUB-TEST C IS THE DETECTOR: slab(63) + 2224 against that
+#           measured address. On the broken tree, 256176 against 142336.
+#         * SUB-TEST E RUNS task_new ITSELF at the top of the range, since
+#           task_new is where the defect lived; A-D only ask the address
+#           helper. It forces the pid table full to 62, builds a real task
+#           at 63, asserts pid / kstack-top / generation, frees it, and
+#           restores exactly the entries it forced.
+.global task_pool_bounds_ok_msg
+.align 8
+task_pool_bounds_ok_msg: .ascii "R31 TASK POOL BOUNDS OK\n\0"
+
+.global task_pool_bounds_fail_msg
+.align 8
+task_pool_bounds_fail_msg: .ascii "R31 TASK POOL BOUNDS FAIL\n\0"
+
 #   R30 GPIO PAD OK   — emitted by
 #       tests/kernel/drivers/gpio/gpio_pad_synth.pdx §gpio_pad_witness,
 #       R30.M6-003 (#1077) + R30.M6-004 (#1078). It stands for the first

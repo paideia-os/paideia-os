@@ -99,6 +99,29 @@ echo "[cap-stride] tools/verify-cap-stride.sh"
     exit 1
 }
 
+# R31.M2 / #1594: the task pool is addressed by STRIDE and was sized by
+# STRUCT. `_task_pool : [u64; 17792]` is 142336 bytes = 64 * 2224, but
+# task_new strides 4096 per slot and pid_alloc hands out 63 — so the array
+# held 34.75 slots and every pid from 36 up wrote a complete task_struct
+# past its end, into `_task_kernel_stacks`. A TCB aliased onto another
+# task's kernel stack is two writers disagreeing about what the bytes are,
+# one of them a return-address chain.
+#
+# The literal was wrong; the DEFECT is that the size and the ceiling were
+# independent numbers with no checked relation, so they could disagree and
+# nothing would say so. paideia-as cannot express the relation in the type
+# — an arithmetic array length is not an `ExprLiteral` and degrades to an
+# 8-byte .bss object rather than failing — so it is expressed here.
+#
+# Source-level, so it joins the other three pre-assembler gates: a geometry
+# divergence must fail at the point it is introduced, not after the pool has
+# been assembled against two different beliefs about how wide a slot is.
+echo "[task-pool-bounds] tools/verify-task-pool-bounds.sh"
+"${REPO_ROOT}/tools/verify-task-pool-bounds.sh" || {
+    echo "[FAIL] task pool geometry divergence (#1594 gate)" >&2
+    exit 1
+}
+
 echo "[build-user] ensuring build/user/shell.bin (R15-M1-007 embed prerequisite)"
 "${REPO_ROOT}/tools/build-user.sh"
 
