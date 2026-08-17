@@ -110,7 +110,7 @@ HARNESS="${REPO_ROOT}/tests/user/aml/aml_harness.c"
 OUT="${REPO_ROOT}/build/aml"
 
 MODULES=(aml_lex aml_arena aml_optab aml_ns aml_term aml_resource aml_eval aml_arith
-         aml_obj aml_str aml_ref aml_ctl aml_region aml_ec aml_glk)
+         aml_obj aml_str aml_ref aml_ctl aml_region aml_ec aml_glk aml_thermal)
 
 # ── environment ──────────────────────────────────────────────────────
 PA_BIN="$(bash "${REPO_ROOT}/tools/find-paideia-as.sh")"
