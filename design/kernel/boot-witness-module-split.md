@@ -107,6 +107,108 @@ any gate says it must. This is filed as **#1604**, not fixed here: a
 refactor that also changes behaviour cannot be checked against "the log is
 identical".
 
+## How #1604 was resolved
+
+The dependency was first *confirmed*, not assumed. Inserting
+
+```
+mov r13, 0xdeadbeef;
+```
+
+immediately after `push rbp` in `witness_r31_spawn` — one line, in the
+last of the six witnesses, ~500 lines from anything it appears to concern
+— made the boot fail with `'R31 ECHO CLIENT RING3 OK' NOT found`.
+Reverting restored it. No assembler diagnostic, no elaborator error, no
+lint, no unit test objected. The only thing that noticed was QEMU.
+
+Of the six witnesses in the span, three never touched the registers and
+said so only in prose; `rpc_servers.pdx` and `r29_cascade.pdx` used
+`r13`/`r14` as scratch under their own `push`/`pop`; `r20b_ipc.pdx`
+bracketed all three with a push at its line 147 and the matching pops
+1,545 lines later. Every one of those was correct. Correct-by-inspection,
+in five files, forever, is not a property a boot path should rest on.
+
+### What replaced it
+
+Three `.bss` slots in `kernel_main.pdx` —
+`_init_handoff_task`, `_init_handoff_entry_rip`, `_init_handoff_user_rsp`
+— written once at the end of the init wire-up and read once immediately
+before `call enter_userland_initial`.
+
+Two decisions make this an improvement rather than a lateral move, and
+they are the whole of the design:
+
+**1. Confinement, enforced.** Moving state from a register to a global
+trades an unenforced *calling* convention for an unenforced *global* one,
+and the global is reachable from strictly more places. What repays the
+trade is that there are exactly two accesses, both in one function, and
+`tools/verify-init-handoff.sh` fails the build the moment a third
+appears. paideia-as cannot express this — a module-private `let` still
+emits a global symbol — so it is expressed as a gate, the same argument
+`[cap-stride]` and `[task-pool-bounds]` make for their invariants. The
+gate also refuses to let another *file* so much as name the symbols, in
+code or in prose: prose that names a slot is the first step toward code
+that reads it, and "init's ring-3 handoff" costs nothing to write
+instead.
+
+**2. The register path is dead, not merely unused.** `r12`/`r13`/`r14`
+are overwritten with a non-canonical constant (`0xDEAD16040DEAD160`)
+between the store and the first witness call, and `kernel_main.pdx` does
+not name them again before the ring-3 entry.
+
+The alternative — leave the registers carrying the values too, as
+insurance — would have been **strictly worse than either mechanism
+alone**. The register path would have stayed unenforced *and* become
+untested, because the `.bss` path would have masked every failure of it;
+the first symptom would have appeared whenever someone later removed the
+`.bss` path believing the registers still worked. Poison converts
+"nothing downstream reads these" from a claim into a page fault.
+
+### The acceptance test is a pair, and it has to be
+
+Either half alone is compatible with the dependency merely having become
+invisible:
+
+| mutation | before #1604 | after #1604 |
+|---|---|---|
+| `mov r13, 0xdeadbeef` after `push rbp` in `witness_r31_spawn` | FAIL — `R31 ECHO CLIENT RING3 OK` missing | **PASS** |
+| corrupt `_init_handoff_entry_rip` at its store | (slot did not exist) | **FAIL** — `R31 ECHO CLIENT RING3 OK` missing |
+
+The second row reproduces the *exact* failure signature of the first,
+which is what shows the dependency moved into the slot rather than
+evaporating. Each of the gate's five halves was likewise mutated
+individually and each failed with the message it exists to print.
+
+### What the push/pop scopes are now for
+
+`r20b_ipc.pdx`'s 1,545-line `push`/`pop` scope was **kept**, and the
+distinction matters:
+
+- `r13`/`r14` are that module's own scratch (a row PA in
+  `sys_ipc_recv_witness`, a row PA and a slot id in
+  `sys_svc_lookup_witness`). It is a `call`ed function, so SysV requires
+  it to hand them back. These saves were never really about init.
+- `r12` is never written inside it, so its save is redundant on its own
+  terms. It stays because the **count**, not the contents, is
+  load-bearing: three pushes take `rsp` from `%16 == 8` to `%16 == 0`,
+  which every nested `call` in those 1,545 lines assumes. Removing one
+  push to tidy up would invert the parity of the whole region — the
+  failure mode of paideia-os #1192, #1195 and #1584. The same reasoning
+  keeps `rpc_servers.pdx`'s and `r29_cascade.pdx`'s scopes intact.
+
+No push/pop count changed anywhere in this commit, so no `rsp % 16`
+argument needed recomputing.
+
+### Consequences left deliberately unclaimed
+
+Several witnesses spill values to `.bss` *specifically because*
+`r12`/`r13`/`r14` were reserved — `m6_symtab_witness`'s task-slab holder
+and all of `r31_spawn.pdx`'s state. That constraint is now lifted and
+none of that code was changed: the `.bss` form is correct as written, and
+a second behavioural change layered onto a one-commit-old refactor would
+make both hard to review. The comments say the constraint is retired and
+why the storage stays.
+
 ## Storage ownership
 
 120 of the 149 declarations moved to the module that reads them. The rule:
@@ -207,7 +309,9 @@ follow the symbols to their new modules. The pin itself is unchanged.
   declared: `!{sysreg}` with `effects: { sysreg }, capabilities: { boot }`.
   Same instruction stream, same authority.
 - **No bug found during the move was fixed in the same commit.** Four are
-  filed: #1604, #1605, #1606, #1607.
+  filed: #1604, #1605, #1606, #1607. #1604 was taken immediately
+  afterwards, on its own, before anything else touched the witness
+  modules — see *How #1604 was resolved* above.
 
 ## Where this could go next
 

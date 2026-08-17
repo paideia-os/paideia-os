@@ -122,6 +122,25 @@ echo "[task-pool-bounds] tools/verify-task-pool-bounds.sh"
     exit 1
 }
 
+# R31.M2 / #1604: init's ring-3 handoff (task slab / e_entry / user_rsp)
+# crosses six witness calls into five modules. It used to cross them in
+# r12/r13/r14 on an unenforced callee-save convention — a dependency the
+# verifying debugger broke on purpose with one `mov r13, 0xdeadbeef` and
+# which nothing in the toolchain caught before boot. It now crosses in
+# three .bss slots, and this gate is what keeps that an improvement
+# rather than a lateral move: two accesses, one file, register path
+# poisoned. A global anyone can read would be no better than the
+# register convention it replaced.
+#
+# Source-level, so it joins the other pre-assembler gates: a third
+# accessor must fail at the point it is written, not at the point a
+# ring-3 entry iretqs into a stale value on someone else's machine.
+echo "[init-handoff] tools/verify-init-handoff.sh"
+"${REPO_ROOT}/tools/verify-init-handoff.sh" || {
+    echo "[FAIL] init ring-3 handoff escaped its two access sites (#1604 gate)" >&2
+    exit 1
+}
+
 echo "[build-user] ensuring build/user/shell.bin (R15-M1-007 embed prerequisite)"
 "${REPO_ROOT}/tools/build-user.sh"
 
