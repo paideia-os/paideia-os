@@ -1834,6 +1834,146 @@ if grep -qE 'battery_(set_design|design_set|raise_design|lower_design|design_ove
 fi
 echo "[battery-confine] no static-identity-mutating primitive"
 
+# ---------------------------------------------------------------------------
+# R31.M3-002 (#1100): BATTERY CHANNEL SCHEMA ARITY PINS.
+#
+# The schema has no storage of its own -- it is pure pack/unpack -- so
+# there is no _table to confine. What there IS to defend is the arity of
+# every packer and unpacker. A fifth parameter on pack_reply is a caller-
+# supplied scale that turns a percent into per-mille and truncates it to
+# a byte; a fourth parameter on any unpacker is a caller-supplied bit
+# width that reads a different field from the same word. Neither is
+# expressible against a pinned signature.
+BCH_SRC="${REPO_ROOT}/src/kernel/core/ipc/battery_channel.pdx"
+if [[ ! -f "${BCH_SRC}" ]]; then
+    echo "[battery-channel-confine] FAIL - ${BCH_SRC} not found" >&2
+    exit 1
+fi
+bch_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${BCH_SRC}"; then
+        echo "[battery-channel-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A BATTERY CHANNEL FIELD IS DECIDED BY THE SCHEMA AND NEVER BY" >&2
+        echo "  A CALLER. An extra parameter on any packer or unpacker makes" >&2
+        echo "  'pack a field my subscriber does not know about' or 'extract" >&2
+        echo "  a bit range my packer never wrote to' expressible, and both" >&2
+        echo "  ways that goes wrong silently reads or writes the wrong bits." >&2
+        echo "  If a signature legitimately changed, the schema doc" >&2
+        echo "  design/ipc/battery-channel-schema.md §3/§4 must be rewritten" >&2
+        echo "  first." >&2
+        exit 1
+    fi
+}
+bch_pin_one 'pub let battery_channel_op_valid : (u64) -> u64'
+bch_pin_one 'pub let battery_channel_ev_valid : (u64) -> u64'
+bch_pin_one 'pub let battery_channel_pack_reply : (u64, u64, u64, u64) -> u64'
+bch_pin_one 'pub let battery_channel_reply_percent : (u64) -> u64'
+bch_pin_one 'pub let battery_channel_reply_state : (u64) -> u64'
+bch_pin_one 'pub let battery_channel_reply_voltage : (u64) -> u64'
+bch_pin_one 'pub let battery_channel_reply_reports : (u64) -> u64'
+bch_pin_one 'pub let battery_channel_pack_state_changed : (u64, u64, u64, u64) -> u64'
+bch_pin_one 'pub let battery_channel_pack_low_warning : (u64, u64, u64) -> u64'
+echo "[battery-channel-confine] pack and unpack arities pinned"
+
+# ---------------------------------------------------------------------------
+# R31.M3-003 (#1101): BATTERY MONITOR STATE + ARITY PINS.
+#
+# Three symbols to confine:
+#   _battery_monitor_prev      — the per-row previous-sample cache
+#   _battery_monitor_flags     — the per-row pending-flag word
+#   _battery_monitor_threshold — the low-warning threshold
+#
+# The threshold is the most load-bearing of the three. §2 of
+# core/policy/battery_monitor.pdx says it is monotone -- a value that
+# can only be set once between resets -- and the whole discipline is
+# the threshold's ONE WRITER (battery_monitor_threshold_install) plus
+# the sole wholesale-reset (battery_monitor_table_reset). A second
+# object relocating against the threshold would be an object that can
+# raise or lower it with no capability involved, and a hostile process
+# holding that path can suppress a LOW_WARNING on a perpetually-
+# charging pack (raise the threshold to 100) or fire one on every
+# sample (raise it to 100 then drop to 0).
+#
+# The prev-sample cache is confined for the sibling reason: a second
+# writer computes a different account of the pack's last state, and the
+# two disagree by exactly one transition every time a subscriber wants
+# them to agree (§1). The flag word is the same argument at one remove
+# -- a second setter would raise F_STATE_CHANGED on ticks where the
+# state did not change.
+#
+# Arity pins as well: tick pins at ARITY FOUR (a fifth argument would
+# be a per-tick threshold, defeating §2's monotonicity in one call
+# site); threshold_install at ONE (a second argument is a caller
+# supplied override); ack at TWO (row and mask, no third argument that
+# could reach LOW_LATCHED).
+BM_OWNER="${BUILD_DIR}/core/policy/battery_monitor.o"
+BM_SRC="${REPO_ROOT}/src/kernel/core/policy/battery_monitor.pdx"
+if [[ ! -f "${BM_SRC}" ]]; then
+    echo "[battery-monitor-confine] FAIL - ${BM_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${BM_OWNER}" ]]; then
+    echo "[battery-monitor-confine] FAIL: ${BM_OWNER} not built" >&2
+    exit 1
+fi
+bm_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${BM_OWNER}" "${sym}"; then
+        echo "[battery-monitor-confine] FAIL: battery_monitor.o does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  check would then pass vacuously, so it fails instead." >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${BM_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[battery-monitor-confine] FAIL - objects other than" >&2
+        echo "  core/policy/battery_monitor.o relocate against ${sym}:${strays}" >&2
+        echo "  Only battery_monitor_tick/_threshold_install/_ack/_table_reset may" >&2
+        echo "  write monitor state, and each of those is behind a gate in" >&2
+        echo "  core/policy/battery_monitor.pdx. See §1/§2." >&2
+        exit 1
+    fi
+}
+bm_confine_one '_battery_monitor_prev'
+bm_confine_one '_battery_monitor_flags'
+bm_confine_one '_battery_monitor_threshold'
+echo "[battery-monitor-confine] prev-sample cache, pending flags and threshold confined"
+
+bm_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${BM_SRC}"; then
+        echo "[battery-monitor-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A BATTERY MONITOR DECISION IS TAKEN FROM THE ROW AND THE" >&2
+        echo "  INSTALLED THRESHOLD, NEVER FROM A CALLER. An extra parameter" >&2
+        echo "  on tick is how a per-tick threshold reaches the LOW crossing," >&2
+        echo "  defeating §2's monotonicity in one call site; an extra" >&2
+        echo "  parameter on threshold_install is how a caller-supplied" >&2
+        echo "  override reaches the stored value without the monotonicity" >&2
+        echo "  gate seeing it; an extra parameter on ack is how a caller" >&2
+        echo "  could reach LOW_LATCHED (bit 16) and re-arm the warning" >&2
+        echo "  without the pack recovering. If a signature legitimately" >&2
+        echo "  changed, §1/§2 of battery_monitor.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+bm_pin_one 'pub let battery_monitor_tick : (u64, u64, u64, u64) -> u64'
+bm_pin_one 'pub let battery_monitor_threshold_install : (u64) -> u64'
+bm_pin_one 'pub let battery_monitor_threshold : () -> u64'
+bm_pin_one 'pub let battery_monitor_ack : (u64, u64) -> u64'
+bm_pin_one 'pub let battery_monitor_flags : (u64) -> u64'
+bm_pin_one 'pub let battery_monitor_seen : (u64) -> u64'
+echo "[battery-monitor-confine] tick, threshold, ack, flags and seen arities pinned"
+
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
