@@ -2047,6 +2047,216 @@ bch_pin_one 'pub let battery_channel_pack_low_warning : (u64, u64, u64) -> u64'
 echo "[battery-channel-confine] pack and unpack arities pinned"
 
 # ---------------------------------------------------------------------------
+# R31.M5-002 (#1107): BACKLIGHT CHANNEL SCHEMA ARITY PINS.
+#
+# Same shape as the battery-channel-confine block: the schema has no
+# storage of its own -- it is pure pack/unpack -- so there is no _table
+# to confine. What there IS to defend is the arity of every packer and
+# unpacker. A third parameter on pack_get_reply is a caller-supplied
+# ceiling that reaches the wire; a second parameter on pack_set_request
+# is a caller-supplied brightness_max the packer would silently compare
+# against instead of leaving that gate to backlight_report_install.
+# Neither is expressible against a pinned signature.
+BCHL_SRC="${REPO_ROOT}/src/kernel/core/ipc/backlight_channel.pdx"
+if [[ ! -f "${BCHL_SRC}" ]]; then
+    echo "[backlight-channel-confine] FAIL - ${BCHL_SRC} not found" >&2
+    exit 1
+fi
+bchl_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${BCHL_SRC}"; then
+        echo "[backlight-channel-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A BACKLIGHT CHANNEL FIELD IS DECIDED BY THE SCHEMA AND NEVER BY" >&2
+        echo "  A CALLER. An extra parameter on any packer or unpacker makes" >&2
+        echo "  'pack a field my subscriber does not know about' or 'extract" >&2
+        echo "  a bit range my packer never wrote to' expressible, and both" >&2
+        echo "  ways that goes wrong silently reads or writes the wrong bits." >&2
+        echo "  If a signature legitimately changed, the schema doc" >&2
+        echo "  design/ipc/backlight-channel-schema.md §3/§4 must be rewritten" >&2
+        echo "  first." >&2
+        exit 1
+    fi
+}
+bchl_pin_one 'pub let backlight_channel_op_valid : (u64) -> u64'
+bchl_pin_one 'pub let backlight_channel_ev_valid : (u64) -> u64'
+bchl_pin_one 'pub let backlight_channel_pack_get_reply : (u64, u64) -> u64'
+bchl_pin_one 'pub let backlight_channel_get_reply_current : (u64) -> u64'
+bchl_pin_one 'pub let backlight_channel_get_reply_reports : (u64) -> u64'
+bchl_pin_one 'pub let backlight_channel_pack_range_reply : (u64, u64) -> u64'
+bchl_pin_one 'pub let backlight_channel_range_reply_min : (u64) -> u64'
+bchl_pin_one 'pub let backlight_channel_range_reply_max : (u64) -> u64'
+bchl_pin_one 'pub let backlight_channel_pack_set_request : (u64) -> u64'
+bchl_pin_one 'pub let backlight_channel_set_request_level : (u64) -> u64'
+bchl_pin_one 'pub let backlight_channel_pack_brightness_changed : (u64, u64) -> u64'
+bchl_pin_one 'pub let backlight_channel_bc_prev : (u64) -> u64'
+bchl_pin_one 'pub let backlight_channel_bc_new : (u64) -> u64'
+echo "[backlight-channel-confine] pack and unpack arities pinned"
+
+# ---------------------------------------------------------------------------
+# R31.M5-003 (#1108): PWM BACKLIGHT DRIVER STATE + ARITY PINS.
+#
+# Two symbols to confine, in the same shape as ec_access_state and
+# battery_monitor's per-row tables:
+#
+#   _backlight_pwm_bound  -- the one flag that says the scaffold has
+#                            been bound
+#   _backlight_pwm_stats  -- the counters
+#
+# The bound flag is the load-bearing one. §2 of backlight_pwm.pdx says
+# there is ONE WRITER (backlight_pwm_bind), and the whole discipline
+# rests on that: a stray relocation against the flag would be a second
+# path claiming this driver was initialised without any capability
+# check, and when the gated:hardware milestone plumbs the KIND_MMIO_
+# WINDOW capability through bind the flag becomes the gate for the
+# write path -- a spuriously-set flag then lets writes touch registers
+# no capability authorised.
+#
+# The stats counter is confined for the sibling reason ec_event's,
+# thermal_zone's, battery's and cooling's counters are: they are the
+# only evidence that the seam was exercised without a real bus
+# transaction landing, and evidence a second object can write is not
+# evidence.
+#
+# Arity pins as well: bind/bound/writes at ZERO (any argument on bind
+# would let a caller declare a window the capability does not name);
+# write at ONE (a second argument is a caller-supplied ceiling or
+# offset reaching the register value); arbitrated at ZERO (a value
+# a boot pin can assert on, per the honesty argument in §4).
+BLPWM_OWNER="${BUILD_DIR}/core/drivers/backlight_pwm.o"
+BLPWM_SRC="${REPO_ROOT}/src/kernel/core/drivers/backlight_pwm.pdx"
+if [[ ! -f "${BLPWM_SRC}" ]]; then
+    echo "[backlight-pwm-confine] FAIL - ${BLPWM_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${BLPWM_OWNER}" ]]; then
+    echo "[backlight-pwm-confine] FAIL: ${BLPWM_OWNER} not built" >&2
+    exit 1
+fi
+blpwm_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${BLPWM_OWNER}" "${sym}"; then
+        echo "[backlight-pwm-confine] FAIL: backlight_pwm.o does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  check would then pass vacuously, so it fails instead." >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${BLPWM_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[backlight-pwm-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/backlight_pwm.o relocate against ${sym}:${strays}" >&2
+        echo "  Only backlight_pwm_bind may write the bound flag, and only" >&2
+        echo "  backlight_pwm_bind/write may write the stats counters. See" >&2
+        echo "  src/kernel/core/drivers/backlight_pwm.pdx §2." >&2
+        exit 1
+    fi
+}
+blpwm_confine_one '_backlight_pwm_bound'
+blpwm_confine_one '_backlight_pwm_stats'
+echo "[backlight-pwm-confine] bound flag and stats confined"
+
+blpwm_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${BLPWM_SRC}"; then
+        echo "[backlight-pwm-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A PWM BACKLIGHT DRIVER BIND TAKES NO CALLER ARGUMENTS AT THIS" >&2
+        echo "  MILESTONE. An extra parameter on any of these is how a" >&2
+        echo "  caller-supplied MMIO window or ceiling would reach the register" >&2
+        echo "  write path; both are set-once facts the row and the future" >&2
+        echo "  KIND_MMIO_WINDOW capability alone define. If a signature" >&2
+        echo "  legitimately changed, §2 and §4 of backlight_pwm.pdx must be" >&2
+        echo "  rewritten first." >&2
+        exit 1
+    fi
+}
+blpwm_pin_one 'pub let backlight_pwm_bind : () -> u64'
+blpwm_pin_one 'pub let backlight_pwm_bound : () -> u64'
+blpwm_pin_one 'pub let backlight_pwm_arbitrated : () -> u64'
+blpwm_pin_one 'pub let backlight_pwm_write : (u64) -> u64'
+blpwm_pin_one 'pub let backlight_pwm_writes : () -> u64'
+echo "[backlight-pwm-confine] bind, bound, arbitrated, write and writes arities pinned"
+
+# ---------------------------------------------------------------------------
+# R31.M5-004 (#1109): DPAUX BACKLIGHT DRIVER STATE + ARITY PINS.
+#
+# Symmetric to backlight-pwm-confine. The DPAUX driver has ONE EXTRA
+# refusal code -- BACKLIGHT_DPAUX_FALLBACK_ACPI -- that names the
+# outcome for a panel that does not advertise VESA eDP AUX backlight
+# capability; the compositor keys off this sentinel to bind an ACPI
+# backend instead. The confinement discipline is unchanged: one writer
+# of the bound flag, no strays against the stats counters, and the
+# same five signatures pinned at the same arities.
+BLDPX_OWNER="${BUILD_DIR}/core/drivers/backlight_dpaux.o"
+BLDPX_SRC="${REPO_ROOT}/src/kernel/core/drivers/backlight_dpaux.pdx"
+if [[ ! -f "${BLDPX_SRC}" ]]; then
+    echo "[backlight-dpaux-confine] FAIL - ${BLDPX_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${BLDPX_OWNER}" ]]; then
+    echo "[backlight-dpaux-confine] FAIL: ${BLDPX_OWNER} not built" >&2
+    exit 1
+fi
+bldpx_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${BLDPX_OWNER}" "${sym}"; then
+        echo "[backlight-dpaux-confine] FAIL: backlight_dpaux.o does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  check would then pass vacuously, so it fails instead." >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${BLDPX_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[backlight-dpaux-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/backlight_dpaux.o relocate against ${sym}:${strays}" >&2
+        echo "  Only backlight_dpaux_bind may write the bound flag, and only" >&2
+        echo "  backlight_dpaux_bind/write may write the stats counters. See" >&2
+        echo "  src/kernel/core/drivers/backlight_dpaux.pdx §2." >&2
+        exit 1
+    fi
+}
+bldpx_confine_one '_backlight_dpaux_bound'
+bldpx_confine_one '_backlight_dpaux_stats'
+echo "[backlight-dpaux-confine] bound flag and stats confined"
+
+bldpx_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${BLDPX_SRC}"; then
+        echo "[backlight-dpaux-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A DPAUX BACKLIGHT DRIVER BIND TAKES NO CALLER ARGUMENTS AT THIS" >&2
+        echo "  MILESTONE. An extra parameter on any of these is how a" >&2
+        echo "  caller-supplied AUX channel or panel-capability claim would" >&2
+        echo "  reach the write path; both are facts the future KIND_AUX_" >&2
+        echo "  CHANNEL capability and a DPCD 0x701 probe alone define." >&2
+        echo "  If a signature legitimately changed, §2 and §4 of" >&2
+        echo "  backlight_dpaux.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+bldpx_pin_one 'pub let backlight_dpaux_bind : () -> u64'
+bldpx_pin_one 'pub let backlight_dpaux_bound : () -> u64'
+bldpx_pin_one 'pub let backlight_dpaux_arbitrated : () -> u64'
+bldpx_pin_one 'pub let backlight_dpaux_write : (u64) -> u64'
+bldpx_pin_one 'pub let backlight_dpaux_writes : () -> u64'
+echo "[backlight-dpaux-confine] bind, bound, arbitrated, write and writes arities pinned"
+
+# ---------------------------------------------------------------------------
 # R31.M3-003 (#1101): BATTERY MONITOR STATE + ARITY PINS.
 #
 # Three symbols to confine:
