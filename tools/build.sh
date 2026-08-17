@@ -1750,6 +1750,90 @@ tp_pin_one 'pub let thermal_policy_intent_of_slot : (u64) -> u64'
 tp_pin_one 'pub let thermal_policy_map_install : (u64, u64) -> u64'
 echo "[thermal-policy-confine] intent-reader and map-install arities pinned"
 
+# ---------------------------------------------------------------------------
+# R31.M3-001 (#1099): THE BATTERY PATH.
+#
+# Same shape as the thermal-zone check above. Two claims:
+#
+# (a) _battery_table is the only place in the kernel where a design
+#     capacity lives. A second writer could raise or lower it with no
+#     capability involved and no refusal recorded, and every future
+#     percent calculation for that pack would then divide by a number
+#     the firmware never advertised. _battery_stats is confined for the
+#     weaker but adjacent reason ec_event's and thermal_zone's counters
+#     are: they are the only evidence that a pack's reports are being
+#     refused as implausible, and evidence a second object can write is
+#     not evidence.
+#
+# (b) Arity pins. The static identity (design capacity, index,
+#     chemistry) comes from the ROW, so the slot-arity-one resolvers
+#     take a capability and nothing else. `design_of_slot(slot, scale)`
+#     is how a healthy pack silently becomes a nearly-dead one; refused
+#     by the pinned signature. battery_report_install pins at ARITY
+#     FOUR: a fifth argument would be a caller-supplied design capacity
+#     or index reaching a row §1 declares set-once at mint.
+BATTERY_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_battery.pdx"
+if [[ ! -f "${BATTERY_SRC}" ]]; then
+    echo "[battery-confine] FAIL - ${BATTERY_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_battery_table' 'core/cap/kind_battery.o'
+ec_confine_one '_battery_stats' 'core/cap/kind_battery.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/cap/kind_battery.pdx §1 for why the row" >&2
+    echo "  table has exactly one writer." >&2
+    exit 1
+fi
+echo "[battery-confine] battery rows and sensor counters confined"
+
+bt_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${BATTERY_SRC}"; then
+        echo "[battery-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A BATTERY DESIGN CAPACITY, INDEX AND CHEMISTRY COME FROM THE" >&2
+        echo "  CAPABILITY'S OWN ROW AND NEVER FROM A CALLER. An extra" >&2
+        echo "  parameter on any of these makes 'report against a battery" >&2
+        echo "  other than the one my capability names' expressible, and the" >&2
+        echo "  two ways that goes wrong are a healthy pack labelled" >&2
+        echo "  CRITICAL and a nearly-flat pack reporting as full. If a" >&2
+        echo "  signature legitimately changed, the confinement argument in" >&2
+        echo "  src/kernel/core/cap/kind_battery.pdx §1 must be rewritten" >&2
+        echo "  first." >&2
+        exit 1
+    fi
+}
+bt_pin_one 'pub let battery_design_of_slot : (u64) -> u64'
+bt_pin_one 'pub let battery_percent_of_slot : (u64) -> u64'
+bt_pin_one 'pub let battery_state_of_slot : (u64) -> u64'
+bt_pin_one 'pub let battery_row_of_slot : (u64) -> u64'
+bt_pin_one 'pub let battery_row_design : (u64) -> u64'
+bt_pin_one 'pub let battery_report_install : (u64, u64, u64, u64) -> u64'
+bt_pin_one 'pub let battery_percent_valid : (u64) -> u64'
+bt_pin_one 'pub let battery_voltage_valid : (u64) -> u64'
+bt_pin_one 'pub let battery_state_valid : (u64) -> u64'
+bt_pin_one 'pub let battery_chem_valid : (u64) -> u64'
+echo "[battery-confine] static-identity resolvers, report installer and unit validators arities pinned"
+
+# A DESIGN CAPACITY THAT CAN BE CHANGED IS NOT DESIGN DATA. The natural
+# names for the mutant are searched for so a contributor adding one gets
+# told why it must not exist at the moment of adding it rather than in
+# review — the same shape as the thermal-zone latch-clear grep.
+if grep -qE 'battery_(set_design|design_set|raise_design|lower_design|design_override|set_chem|chem_set|set_index)' "${BATTERY_SRC}"; then
+    echo "[battery-confine] FAIL - a static-identity-mutating primitive was" >&2
+    echo "  added to the battery kind." >&2
+    echo "" >&2
+    echo "  design_cap_mwh, index and chemistry are set once, by the mint," >&2
+    echo "  and there is no primitive that changes them; see" >&2
+    echo "  src/kernel/core/cap/kind_battery.pdx §1." >&2
+    echo "  A DESIGN CAPACITY THAT CAN BE RAISED WOULD MAKE A NEARLY-FLAT" >&2
+    echo "  PACK LOOK BARELY USED; ONE THAT CAN BE LOWERED WOULD MAKE A" >&2
+    echo "  HEALTHY PACK LOOK NEARLY DEAD." >&2
+    exit 1
+fi
+echo "[battery-confine] no static-identity-mutating primitive"
+
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
