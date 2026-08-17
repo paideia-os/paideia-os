@@ -1418,6 +1418,12 @@ ec_pin_one "${EC_QUERY_SRC}"  'pub let ec_query_row_narrow : (u64, u64) -> u64'
 ec_pin_one "${EC_EVENT_SRC}"  'pub let ec_event_map_bind : (u64) -> u64'
 ec_pin_one "${EC_EVENT_SRC}"  'pub let ec_event_class_of : (u64, u64) -> u64'
 ec_pin_one "${EC_EVENT_SRC}"  'pub let ec_event_admit : (u64) -> u64'
+# R31.M2-002 (#1095): the class is the ONLY input to the policy. A second
+# argument — a depth, a "pressure" hint, an override — is how a caller talks
+# a safety class into the sheddable set, and the whole point of splitting the
+# policy out of ec_event_admit is that the set membership is a property of the
+# class and of nothing else.
+ec_pin_one "${EC_EVENT_SRC}"  'pub let ec_event_shed_policy : (u64) -> u64'
 ec_pin_one "${EC_QUERY_SRC}"  'pub let ec_query_row_class : (u64, u64) -> u64'
 # acpi_evt_offer's arity, pinned here because R31.M1-005 (#1093) made the
 # meaning of its fifth argument load-bearing for the class of a platform
@@ -1477,6 +1483,195 @@ if grep -qE 'ec_event_(remap|unmap|map_clear|map_override|map_force)' "${EC_EVEN
     exit 1
 fi
 echo "[ec-confine] query-byte meaning table has no demotion primitive"
+
+# ---------------------------------------------------------------------------
+# R31.M2-002 (#1095): THE ADMISSION POLICY IS TOTAL OVER THE CLASS ENUMERATION.
+#
+# §7's shed rule used to be one inequality against EC_EVT_CLASS_HOTKEY. That
+# form could say which class IS sheddable but never which classes were
+# CONSIDERED, so every class added afterwards was admitted unconditionally by
+# a default nobody had to look at. The default is right for a singleton event
+# (thermal, battery) and WRONG for a high-rate one -- R31.M4's platform
+# sensors would quietly consume the same 32-slot tail-drop ring the power
+# button shares, which is §7's inversion arriving past the rule that prevents
+# it.
+#
+# So ec_event_shed_policy enumerates BOTH sets, one equality per member, each
+# carrying a `policy: <NAME>` marker. This check is what makes the enumeration
+# total: every EC_EVT_CLASS_* declared in the file (except the _MAX bound)
+# must have a marker in the policy body. A class declared without one fails
+# the build here rather than inheriting an admission decision.
+#
+# Read out of the source rather than pinned as a number, so the check cannot
+# drift from the declarations it is about. Two vacuity guards: the class list
+# must be non-empty, and the policy body must be found.
+EC_EVT_CLASSES_DECLARED="$(grep -oE '^  pub let EC_EVT_CLASS_([A-Z]+)[[:space:]]*:' "${EC_EVENT_SRC}" \
+    | sed -E 's/^  pub let EC_EVT_CLASS_([A-Z]+)[[:space:]]*:/\1/' | grep -v '^MAX$' | sort -u)"
+if [[ -z "${EC_EVT_CLASSES_DECLARED}" ]]; then
+    echo "[ec-confine] FAIL - no EC_EVT_CLASS_* declarations found in" >&2
+    echo "  ${EC_EVENT_SRC}" >&2
+    echo "  This check is vacuous unless it can read the enumeration." >&2
+    exit 1
+fi
+EC_EVT_POLICY_BODY="$(awk '/pub let ec_event_shed_policy/,/ec_evt_sp_always:/' "${EC_EVENT_SRC}")"
+if ! grep -q 'ec_evt_sp_always' <<<"${EC_EVT_POLICY_BODY}"; then
+    echo "[ec-confine] FAIL - ec_event_shed_policy not found in" >&2
+    echo "  ${EC_EVENT_SRC}" >&2
+    echo "  §7's admission policy must be a total function over the class" >&2
+    echo "  enumeration; without it every class is admitted by default." >&2
+    exit 1
+fi
+for _cls in ${EC_EVT_CLASSES_DECLARED}; do
+    if ! grep -qE "//[[:space:]]*policy:[[:space:]]*${_cls}\$" <<<"${EC_EVT_POLICY_BODY}"; then
+        echo "[ec-confine] FAIL - EC_EVT_CLASS_${_cls} is declared but has no" >&2
+        echo "  \`policy: ${_cls}\` row in ec_event_shed_policy." >&2
+        echo "" >&2
+        echo "  A CLASS MUST BE ADMITTED OR SHED BY A DECISION, NEVER BY A" >&2
+        echo "  DEFAULT. Add it to the SHED_ALWAYS enumeration if it is a" >&2
+        echo "  singleton the machine produced once and cannot replay (AC," >&2
+        echo "  lid, power button, a thermal trip), or to SHED_WATERMARK if" >&2
+        echo "  it is bursty and its loss costs a keystroke. Both are" >&2
+        echo "  enumerations in src/kernel/core/acpi/ec_event.pdx §7; the" >&2
+        echo "  marker comment is what this check reads." >&2
+        exit 1
+    fi
+done
+echo "[ec-confine] shed policy covers every declared event class"
+
+# ---------------------------------------------------------------------------
+# R31.M2-001 (#1094): THE THERMAL PATH.
+#
+# Three claims, all of them about the same thing: a temperature THRESHOLD is
+# never an argument, and a temperature is never converted before it is
+# compared.
+#
+# (a) _thermal_zone_table is the only place in the kernel where a critical
+#     threshold lives. A second writer could raise a _CRT with no capability
+#     involved and no refusal recorded, and the machine would then run past a
+#     limit its firmware set. _thermal_zone_stats is confined for the weaker
+#     but adjacent reason ec_event's counters are: they are the only evidence
+#     that a zone's readings are being refused as implausible, and evidence a
+#     second object can write is not evidence.
+#
+# (b) Arity pins. The critical threshold comes from the ROW, so the functions
+#     that reach one take a capability and nothing else. `crt_of_slot(slot,
+#     fallback)` reads as a convenience and is a way to shut a machine down by
+#     arithmetic; `assess(slot, temp, threshold)` is a way to keep it running
+#     past its limit. Neither is expressible against the pinned signatures.
+#     thermal_dk_to_dc is pinned at ONE argument for the sibling reason: a
+#     scale or an offset parameter is how a conversion silently becomes the
+#     wrong conversion.
+#
+# (c) Absence greps for the primitives whose natural names a future change
+#     would reach for. A _CRT that can be raised is not a critical threshold.
+THERMAL_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_thermal_zone.pdx"
+if [[ ! -f "${THERMAL_SRC}" ]]; then
+    echo "[thermal-confine] FAIL - ${THERMAL_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_thermal_zone_table' 'core/cap/kind_thermal_zone.o'
+ec_confine_one '_thermal_zone_stats' 'core/cap/kind_thermal_zone.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/cap/kind_thermal_zone.pdx §1 and §3 for why" >&2
+    echo "  the row table has exactly one writer." >&2
+    exit 1
+fi
+echo "[thermal-confine] zone rows and sensor counters confined"
+
+th_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${THERMAL_SRC}"; then
+        echo "[thermal-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A THERMAL THRESHOLD COMES FROM THE CAPABILITY'S OWN ROW AND" >&2
+        echo "  NEVER FROM A CALLER. An extra parameter on any of these makes" >&2
+        echo "  'compare against a critical threshold of my choosing'" >&2
+        echo "  expressible, and the two ways that goes wrong are a healthy" >&2
+        echo "  machine powered off and a part left running past its limit." >&2
+        echo "  If a signature legitimately changed, the confinement argument" >&2
+        echo "  in src/kernel/core/cap/kind_thermal_zone.pdx §1 must be" >&2
+        echo "  rewritten first." >&2
+        exit 1
+    fi
+}
+th_pin_one 'pub let thermal_zone_crt_of_slot : (u64) -> u64'
+th_pin_one 'pub let thermal_zone_level_of_slot : (u64) -> u64'
+th_pin_one 'pub let thermal_zone_crt_latched_of_slot : (u64) -> u64'
+th_pin_one 'pub let thermal_zone_row_of_slot : (u64) -> u64'
+th_pin_one 'pub let thermal_zone_row_crt : (u64) -> u64'
+th_pin_one 'pub let thermal_zone_assess : (u64, u64) -> u64'
+th_pin_one 'pub let thermal_dk_to_dc : (u64) -> u64'
+th_pin_one 'pub let thermal_dk_plausible : (u64) -> u64'
+echo "[thermal-confine] threshold resolvers, assess and unit conversion arities pinned"
+
+# A _CRT THAT CAN BE RAISED IS NOT A CRITICAL THRESHOLD. The trip table is
+# installed once per row and _CRT is not part of the installable set at all;
+# these are the names a future "the machine keeps shutting down, let me nudge
+# the limit" change would be given, and it is the most plausible-sounding
+# request anybody will ever make of this file.
+if grep -qE 'thermal_zone_(set_crt|crt_set|raise_crt|crt_override|trips_update|trips_set|trip_override|relatch|clear_latch|latch_clear)' "${THERMAL_SRC}"; then
+    echo "[thermal-confine] FAIL - a threshold-mutating or latch-clearing" >&2
+    echo "  primitive was added to the thermal zone kind." >&2
+    echo "" >&2
+    echo "  _CRT is set once, by the mint, and the optional trips fill exactly" >&2
+    echo "  once; see src/kernel/core/cap/kind_thermal_zone.pdx §1 and §2." >&2
+    echo "  A CONFIRMED CRITICAL CROSSING IS ALSO NOT CLEARABLE: a part that" >&2
+    echo "  went past its limit did go past it, and a later cool reading is" >&2
+    echo "  evidence that something started cooling it, not evidence that it" >&2
+    echo "  never happened. Only a revoke clears the latch." >&2
+    exit 1
+fi
+echo "[thermal-confine] no threshold-mutating or latch-clearing primitive"
+
+# The unit discipline, as a build fact. thermal_dk_to_dc is DISPLAY ONLY;
+# see §0. A control-path caller would be a place where a deci-Kelvin
+# quantity is turned into a deci-Celsius one before a comparison, which is
+# the entire class of bug §0 is written about — and it would be invisible,
+# because the arithmetic is a single subtraction that never fails.
+#
+# TWO objects may reach it, not one, and the second is not a weakening.
+# core/cap/kind_thermal_zone.o is the printer. tests/kernel/cap/
+# thermal_zone_synth.o is the witness that asserts 3000 dK -> 268 dC
+# against the two wrong answers a missing offset and a reversed one would
+# give, and a confinement that excluded it would be a confinement that
+# forbade checking the thing it protects. Both are enumerated by name, so
+# a THIRD caller still fails here.
+th_dc_owners='core/cap/kind_thermal_zone.o tests/kernel/cap/thermal_zone_synth.o'
+th_dc_strays=''
+th_dc_seen=0
+for o in "${OBJECTS[@]}"; do
+    rel="${o#"${BUILD_DIR}"/}"
+    if obj_relocs_against "${o}" 'thermal_dk_to_dc'; then
+        case " ${th_dc_owners} " in
+            *" ${rel} "*) th_dc_seen=$((th_dc_seen + 1)) ;;
+            *) th_dc_strays="${th_dc_strays} ${rel}" ;;
+        esac
+    fi
+done
+if [[ "${th_dc_seen}" -ne 2 ]]; then
+    echo "[thermal-confine] FAIL - expected both the printer and the witness" >&2
+    echo "  to call thermal_dk_to_dc; found ${th_dc_seen} of 2." >&2
+    echo "  A confinement assertion that names a symbol nobody uses is" >&2
+    echo "  vacuous; it would pass after the conversion was deleted, and the" >&2
+    echo "  witness half is what proves the conversion is the right one." >&2
+    exit 1
+fi
+if [[ -n "${th_dc_strays}" ]]; then
+    echo "[thermal-confine] FAIL - objects other than the printer and its" >&2
+    echo "  witness relocate against thermal_dk_to_dc:${th_dc_strays}" >&2
+    echo "" >&2
+    echo "  thermal_dk_to_dc is the ONLY unit conversion in the thermal path" >&2
+    echo "  and it exists for the row printer. Every comparison that decides" >&2
+    echo "  anything happens between two deci-Kelvin quantities, which is why" >&2
+    echo "  no decision in that module can be wrong about the unit. A third" >&2
+    echo "  object calling it is an object that has an opinion about which" >&2
+    echo "  scale a threshold is in, and that opinion is where a trip point" >&2
+    echo "  silently becomes 178 degrees below zero." >&2
+    echo "  See src/kernel/core/cap/kind_thermal_zone.pdx §0." >&2
+    exit 1
+fi
+echo "[thermal-confine] unit conversion reached only by the printer and its witness"
 
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
