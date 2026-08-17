@@ -2257,6 +2257,89 @@ bldpx_pin_one 'pub let backlight_dpaux_writes : () -> u64'
 echo "[backlight-dpaux-confine] bind, bound, arbitrated, write and writes arities pinned"
 
 # ---------------------------------------------------------------------------
+# R31.M6-001/002/003 (#1111/#1112/#1113): HOT-KEY DISPATCH TABLE CONFINEMENT.
+#
+# Two symbols to confine to the owning object:
+#
+#   _hotkey_dispatch_table  — 256 (query byte, sink, action) entries.
+#                             The only place in the kernel where a hot-
+#                             key meaning lives. A second writer could
+#                             silently remap Fn+F4 from VOLUME_MUTE to
+#                             BACKLIGHT_UP with no capability involved
+#                             and no refusal recorded -- exactly the
+#                             failure §2 of core/input/hotkey_dispatch.pdx
+#                             exists to prevent.
+#
+#   _hotkey_dispatch_stats  — the per-sink routing counters. Evidence a
+#                             hot-key was decoded and routed to VOLUME/
+#                             BACKLIGHT/MEDIA (or refused as UNMAPPED),
+#                             and evidence a second object can write is
+#                             not evidence -- the sibling reason
+#                             ec_event_stats and backlight_stats are
+#                             confined to their own owners.
+HK_OWNER="${BUILD_DIR}/core/input/hotkey_dispatch.o"
+HK_SRC="${REPO_ROOT}/src/kernel/core/input/hotkey_dispatch.pdx"
+if [[ ! -f "${HK_SRC}" ]]; then
+    echo "[hotkey-confine] FAIL - ${HK_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_hotkey_dispatch_table' 'core/input/hotkey_dispatch.o'
+ec_confine_one '_hotkey_dispatch_stats' 'core/input/hotkey_dispatch.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/input/hotkey_dispatch.pdx §2 for why" >&2
+    echo "  the dispatch table has exactly one writer." >&2
+    exit 1
+fi
+echo "[hotkey-confine] dispatch table and counters confined"
+
+# THE MONOTONE MEANING TABLE — the same shape as ec_event's meaning table
+# and for the same reason: the table starts EMPTY and only FILLS, and an
+# entry that has a (sink, action) cannot acquire a different one while
+# it is bound. hotkey_dispatch_install is the only per-entry writer and
+# it REFUSES a change of meaning; the only wholesale clear is
+# hotkey_dispatch_reset, which is a boot/teardown operation.
+#
+# What a demotion primitive would cost: every downstream routing
+# decision is taken from the (sink, action) pair, so a byte silently
+# remapped from VOLUME_MUTE to BACKLIGHT_UP inverts a physical action
+# with no symptom. The natural names for the mutant are the ones being
+# searched for.
+if grep -qE 'hotkey_dispatch_(remap|unmap|override|force)' "${HK_SRC}"; then
+    echo "[hotkey-confine] FAIL - a demotion primitive was added to the" >&2
+    echo "  hot-key dispatch table. It starts empty and only ever fills," >&2
+    echo "  and an installed meaning cannot change while it is bound; see" >&2
+    echo "  src/kernel/core/input/hotkey_dispatch.pdx §2" >&2
+    echo "  A HOT-KEY MEANING MUST NOT BE SILENTLY REDEFINED." >&2
+    exit 1
+fi
+echo "[hotkey-confine] hot-key dispatch table has no demotion primitive"
+
+hk_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HK_SRC}"; then
+        echo "[hotkey-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A HOT-KEY BYTE'S MEANING IS THE ONLY INPUT TO THE ROUTE, AND" >&2
+        echo "  A BACKLIGHT STEP TAKES A CAPABILITY AND NOTHING ELSE. An" >&2
+        echo "  extra parameter on any of these is how a caller-supplied" >&2
+        echo "  sink override or brightness ceiling would reach the actuator" >&2
+        echo "  path -- and on backlight, a caller-controlled ceiling is a" >&2
+        echo "  way to blind an operator on a panel whose electronics" >&2
+        echo "  cannot survive the substituted duty cycle. If a signature" >&2
+        echo "  legitimately changed, §0.1 and §2 of hotkey_dispatch.pdx" >&2
+        echo "  must be rewritten first." >&2
+        exit 1
+    fi
+}
+hk_pin_one 'pub let hotkey_dispatch_install : (u64, u64, u64) -> u64'
+hk_pin_one 'pub let hotkey_dispatch_sink_of : (u64) -> u64'
+hk_pin_one 'pub let hotkey_dispatch_action_of : (u64) -> u64'
+hk_pin_one 'pub let hotkey_dispatch_route : (u64) -> u64'
+hk_pin_one 'pub let hotkey_dispatch_backlight_step : (u64, u64, u64, u64) -> u64'
+echo "[hotkey-confine] install, lookup, route and backlight-step arities pinned"
+
+# ---------------------------------------------------------------------------
 # R31.M3-003 (#1101): BATTERY MONITOR STATE + ARITY PINS.
 #
 # Three symbols to confine:
