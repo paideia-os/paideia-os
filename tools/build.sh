@@ -2448,6 +2448,228 @@ bm_pin_one 'pub let battery_monitor_flags : (u64) -> u64'
 bm_pin_one 'pub let battery_monitor_seen : (u64) -> u64'
 echo "[battery-monitor-confine] tick, threshold, ack, flags and seen arities pinned"
 
+# ---------------------------------------------------------------------------
+# R32.M1-001 (#1115): I²C-HID TRANSPORT SCAFFOLD STATE + ARITY PINS.
+#
+# Same shape as [backlight-pwm-confine] and [backlight-dpaux-confine]:
+# a bind latch, a stashed opaque bus handle, a stashed descriptor
+# register address and the stats counters, each with exactly one
+# legitimate writer (i2c_hid_transport_bind for latches; the read/write
+# seams for counters). The load-bearing symbol is _i2c_hid_transport_bus:
+# a stray writer would be a second path stashing a bus handle no
+# capability named, and when R32.M2 plumbs the KIND_I2C_BUS-shaped
+# transfer through this transport, the spuriously-set handle would let
+# transfers reach a controller the capability did not authorise.
+I2CHID_TR_OWNER="${BUILD_DIR}/core/drivers/i2c_hid/transport.o"
+I2CHID_TR_SRC="${REPO_ROOT}/src/kernel/core/drivers/i2c_hid/transport.pdx"
+if [[ ! -f "${I2CHID_TR_SRC}" ]]; then
+    echo "[i2c-hid-transport-confine] FAIL - ${I2CHID_TR_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${I2CHID_TR_OWNER}" ]]; then
+    echo "[i2c-hid-transport-confine] FAIL: ${I2CHID_TR_OWNER} not built" >&2
+    exit 1
+fi
+i2chid_tr_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${I2CHID_TR_OWNER}" "${sym}"; then
+        echo "[i2c-hid-transport-confine] FAIL: transport.o does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  check would then pass vacuously, so it fails instead." >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${I2CHID_TR_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[i2c-hid-transport-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/i2c_hid/transport.o relocate against ${sym}:${strays}" >&2
+        echo "  Only i2c_hid_transport_bind may write the bind latch, and only" >&2
+        echo "  the read/write seams may write the stats counters. See" >&2
+        echo "  src/kernel/core/drivers/i2c_hid/transport.pdx §2." >&2
+        exit 1
+    fi
+}
+i2chid_tr_confine_one '_i2c_hid_transport_bound'
+i2chid_tr_confine_one '_i2c_hid_transport_bus'
+i2chid_tr_confine_one '_i2c_hid_transport_hid_desc_addr'
+i2chid_tr_confine_one '_i2c_hid_transport_stats'
+echo "[i2c-hid-transport-confine] bind latch, bus handle, desc addr and stats confined"
+
+i2chid_tr_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${I2CHID_TR_SRC}"; then
+        echo "[i2c-hid-transport-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  AN I²C-HID TRANSPORT BIND TAKES THE OPAQUE BUS HANDLE AND THE" >&2
+        echo "  ACPI-SUPPLIED DESCRIPTOR REGISTER, NOTHING ELSE. An extra" >&2
+        echo "  parameter on bind is how a caller-supplied controller BASE or" >&2
+        echo "  EXTENT would reach the transfer path when R32.M2 wires it --" >&2
+        echo "  exactly what §2 of ec_access.pdx exists to prevent. If a" >&2
+        echo "  signature legitimately changed, §0/§2/§4 of transport.pdx" >&2
+        echo "  must be rewritten first." >&2
+        exit 1
+    fi
+}
+i2chid_tr_pin_one 'pub let i2c_hid_transport_bind : (u64, u64) -> u64'
+i2chid_tr_pin_one 'pub let i2c_hid_transport_bound : () -> u64'
+i2chid_tr_pin_one 'pub let i2c_hid_transport_arbitrated : () -> u64'
+i2chid_tr_pin_one 'pub let i2c_hid_transport_read : (u64, u64) -> u64'
+i2chid_tr_pin_one 'pub let i2c_hid_transport_write : (u64, u64) -> u64'
+i2chid_tr_pin_one 'pub let i2c_hid_transport_reads : () -> u64'
+i2chid_tr_pin_one 'pub let i2c_hid_transport_writes : () -> u64'
+i2chid_tr_pin_one 'pub let i2c_hid_transport_bus : () -> u64'
+i2chid_tr_pin_one 'pub let i2c_hid_transport_hid_desc_addr : () -> u64'
+echo "[i2c-hid-transport-confine] bind, seams and accessor arities pinned"
+
+# ---------------------------------------------------------------------------
+# R32.M1-002 (#1116): I²C-HID DESCRIPTOR SCAFFOLD STATE + ARITY PINS.
+#
+# The valid latch and the four parsed fields (report_len, input_reg,
+# max_input, vendor_product), each confined to descriptor.o. The
+# load-bearing symbol is _i2c_hid_desc_vendor_product: a stray writer
+# would be a second path claiming a different (vendor, product) key,
+# and #1119's quirk table keys off exactly this value to decide whether
+# to issue a reset before the first report -- a spuriously-changed
+# identifier would misclassify the device and skip the reset.
+I2CHID_DESC_OWNER="${BUILD_DIR}/core/drivers/i2c_hid/descriptor.o"
+I2CHID_DESC_SRC="${REPO_ROOT}/src/kernel/core/drivers/i2c_hid/descriptor.pdx"
+if [[ ! -f "${I2CHID_DESC_SRC}" ]]; then
+    echo "[i2c-hid-descriptor-confine] FAIL - ${I2CHID_DESC_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${I2CHID_DESC_OWNER}" ]]; then
+    echo "[i2c-hid-descriptor-confine] FAIL: ${I2CHID_DESC_OWNER} not built" >&2
+    exit 1
+fi
+i2chid_desc_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${I2CHID_DESC_OWNER}" "${sym}"; then
+        echo "[i2c-hid-descriptor-confine] FAIL: descriptor.o does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  check would then pass vacuously, so it fails instead." >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${I2CHID_DESC_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[i2c-hid-descriptor-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/i2c_hid/descriptor.o relocate against ${sym}:${strays}" >&2
+        echo "  Only i2c_hid_descriptor_install may write parsed fields. See" >&2
+        echo "  src/kernel/core/drivers/i2c_hid/descriptor.pdx §2." >&2
+        exit 1
+    fi
+}
+i2chid_desc_confine_one '_i2c_hid_desc_valid'
+i2chid_desc_confine_one '_i2c_hid_desc_report_len'
+i2chid_desc_confine_one '_i2c_hid_desc_input_reg'
+i2chid_desc_confine_one '_i2c_hid_desc_max_input'
+i2chid_desc_confine_one '_i2c_hid_desc_vendor_product'
+echo "[i2c-hid-descriptor-confine] valid latch and parsed fields confined"
+
+i2chid_desc_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${I2CHID_DESC_SRC}"; then
+        echo "[i2c-hid-descriptor-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  THE DESCRIPTOR INSTALL SEAM TAKES THE FOUR FIELDS THE HID PATH" >&2
+        echo "  CONSUMES, NEVER FEWER AND NEVER MORE. Widening it would let a" >&2
+        echo "  caller set fields no live parser would; narrowing it would" >&2
+        echo "  strand the ISR's max_input ceiling or the quirk-table key." >&2
+        echo "  If a signature legitimately changed, §1/§2/§3 of" >&2
+        echo "  descriptor.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+i2chid_desc_pin_one 'pub let i2c_hid_descriptor_install : (u64, u64, u64, u64) -> u64'
+i2chid_desc_pin_one 'pub let i2c_hid_descriptor_valid : () -> u64'
+i2chid_desc_pin_one 'pub let i2c_hid_descriptor_fetch : () -> u64'
+i2chid_desc_pin_one 'pub let i2c_hid_descriptor_report_len : () -> u64'
+i2chid_desc_pin_one 'pub let i2c_hid_descriptor_input_reg : () -> u64'
+i2chid_desc_pin_one 'pub let i2c_hid_descriptor_max_input : () -> u64'
+i2chid_desc_pin_one 'pub let i2c_hid_descriptor_vendor_product : () -> u64'
+echo "[i2c-hid-descriptor-confine] install, fetch, valid and accessor arities pinned"
+
+# ---------------------------------------------------------------------------
+# R32.M1-003 (#1117): I²C-HID ISR SCAFFOLD STATE + ARITY PINS.
+#
+# Two symbols to confine, in the same shape as backlight-pwm-confine.
+# The bind latch is the load-bearing one: §1 of isr.pdx says
+# i2c_hid_isr_bind is the ONE writer, and when R32.M2 plumbs
+# gpio_pad_edge_subscribe through the bind, a spuriously-set bound flag
+# would let the ISR's assert path invoke transport reads for a pad no
+# capability named. Arity of bind is ZERO for the mirror reason.
+I2CHID_ISR_OWNER="${BUILD_DIR}/core/drivers/i2c_hid/isr.o"
+I2CHID_ISR_SRC="${REPO_ROOT}/src/kernel/core/drivers/i2c_hid/isr.pdx"
+if [[ ! -f "${I2CHID_ISR_SRC}" ]]; then
+    echo "[i2c-hid-isr-confine] FAIL - ${I2CHID_ISR_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${I2CHID_ISR_OWNER}" ]]; then
+    echo "[i2c-hid-isr-confine] FAIL: ${I2CHID_ISR_OWNER} not built" >&2
+    exit 1
+fi
+i2chid_isr_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${I2CHID_ISR_OWNER}" "${sym}"; then
+        echo "[i2c-hid-isr-confine] FAIL: isr.o does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  check would then pass vacuously, so it fails instead." >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${I2CHID_ISR_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[i2c-hid-isr-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/i2c_hid/isr.o relocate against ${sym}:${strays}" >&2
+        echo "  Only i2c_hid_isr_bind may write the bind latch, and only" >&2
+        echo "  the assert seam may write the stats counters. See" >&2
+        echo "  src/kernel/core/drivers/i2c_hid/isr.pdx §1." >&2
+        exit 1
+    fi
+}
+i2chid_isr_confine_one '_i2c_hid_isr_bound'
+i2chid_isr_confine_one '_i2c_hid_isr_stats'
+echo "[i2c-hid-isr-confine] bind latch and stats confined"
+
+i2chid_isr_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${I2CHID_ISR_SRC}"; then
+        echo "[i2c-hid-isr-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  AN I²C-HID ISR BIND TAKES NO CALLER ARGUMENTS AT THIS" >&2
+        echo "  MILESTONE. An extra parameter on bind is how a caller-supplied" >&2
+        echo "  GPIO line would reach gpio_pad_edge_subscribe when R32.M2" >&2
+        echo "  wires it -- exactly what §2 of gpio_pad.pdx exists to prevent." >&2
+        echo "  If a signature legitimately changed, §0/§1 of isr.pdx must" >&2
+        echo "  be rewritten first." >&2
+        exit 1
+    fi
+}
+i2chid_isr_pin_one 'pub let i2c_hid_isr_bind : () -> u64'
+i2chid_isr_pin_one 'pub let i2c_hid_isr_bound : () -> u64'
+i2chid_isr_pin_one 'pub let i2c_hid_isr_arbitrated : () -> u64'
+i2chid_isr_pin_one 'pub let i2c_hid_isr_assert : () -> u64'
+i2chid_isr_pin_one 'pub let i2c_hid_isr_asserts : () -> u64'
+echo "[i2c-hid-isr-confine] bind, bound, arbitrated, assert and asserts arities pinned"
+
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
