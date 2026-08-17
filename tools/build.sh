@@ -1835,6 +1835,89 @@ fi
 echo "[battery-confine] no static-identity-mutating primitive"
 
 # ---------------------------------------------------------------------------
+# R31.M4-001 (#1103): THE COOLING-DEVICE PATH.
+#
+# Same shape as the thermal-zone and battery checks above. Two claims:
+#
+# (a) _cooling_device_table is the only place in the kernel where a
+#     cooling state_max lives. A second writer could raise or lower it
+#     with no capability involved and no refusal recorded, and every
+#     future policy decision for that actuator would then be taken
+#     against a range the firmware never advertised. _cooling_device_stats
+#     is confined for the weaker but adjacent reason ec_event's,
+#     thermal_zone's and battery's counters are: they are the only
+#     evidence that a cooler's reports are being refused as
+#     implausible, and evidence a second object can write is not
+#     evidence.
+#
+# (b) Arity pins. The static identity (state_max, cooling_type) comes
+#     from the ROW, so the slot-arity-one resolvers take a capability
+#     and nothing else. `max_of_slot(slot, scale)` is how the
+#     advertised range of a fan silently widens or shrinks; refused by
+#     the pinned signature. cooling_report_install pins at ARITY TWO:
+#     a third argument would be a caller-supplied state_max or index
+#     reaching a row §1 declares set-once at mint.
+COOLING_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_cooling_device.pdx"
+if [[ ! -f "${COOLING_SRC}" ]]; then
+    echo "[cooling-confine] FAIL - ${COOLING_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_cooling_device_table' 'core/cap/kind_cooling_device.o'
+ec_confine_one '_cooling_device_stats' 'core/cap/kind_cooling_device.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/cap/kind_cooling_device.pdx §1 for why the" >&2
+    echo "  row table has exactly one writer." >&2
+    exit 1
+fi
+echo "[cooling-confine] cooling rows and actuator counters confined"
+
+cool_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${COOLING_SRC}"; then
+        echo "[cooling-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A COOLING STATE_MAX, TYPE AND INDEX COME FROM THE CAPABILITY'S" >&2
+        echo "  OWN ROW AND NEVER FROM A CALLER. An extra parameter on any of" >&2
+        echo "  these makes 'report against a cooler other than the one my" >&2
+        echo "  capability names' expressible, and the two ways that goes" >&2
+        echo "  wrong are a fan pinned at its top speed regardless of intent" >&2
+        echo "  and a part left uncooled because the actuator dropped to its" >&2
+        echo "  floor. If a signature legitimately changed, the confinement" >&2
+        echo "  argument in src/kernel/core/cap/kind_cooling_device.pdx §1" >&2
+        echo "  must be rewritten first." >&2
+        exit 1
+    fi
+}
+cool_pin_one 'pub let cooling_max_of_slot : (u64) -> u64'
+cool_pin_one 'pub let cooling_state_of_slot : (u64) -> u64'
+cool_pin_one 'pub let cooling_type_of_slot : (u64) -> u64'
+cool_pin_one 'pub let cooling_row_of_slot : (u64) -> u64'
+cool_pin_one 'pub let cooling_row_max : (u64) -> u64'
+cool_pin_one 'pub let cooling_report_install : (u64, u64) -> u64'
+cool_pin_one 'pub let cooling_type_valid : (u64) -> u64'
+echo "[cooling-confine] static-identity resolvers, report installer and type validator arities pinned"
+
+# A STATE_MAX THAT CAN BE CHANGED IS NOT A CONTROL SURFACE. The natural
+# names for the mutant are searched for so a contributor adding one gets
+# told why it must not exist at the moment of adding it rather than in
+# review — the same shape as the battery static-identity-mutant grep.
+if grep -qE 'cooling_(set_max|max_set|raise_max|lower_max|max_override|set_min|min_set|set_type|type_set|set_index)' "${COOLING_SRC}"; then
+    echo "[cooling-confine] FAIL - a static-identity-mutating primitive was" >&2
+    echo "  added to the cooling-device kind." >&2
+    echo "" >&2
+    echo "  state_min, state_max, cooling_type and index are set once, by" >&2
+    echo "  the mint, and there is no primitive that changes them; see" >&2
+    echo "  src/kernel/core/cap/kind_cooling_device.pdx §1." >&2
+    echo "  A STATE_MAX THAT CAN BE RAISED WOULD WIDEN A FAN'S ADVERTISED" >&2
+    echo "  RANGE PAST WHAT THE FIRMWARE APPROVED; ONE THAT CAN BE LOWERED" >&2
+    echo "  WOULD MAKE THE TOP SPEED THE PLATFORM IS WILLING TO RUN" >&2
+    echo "  UNREACHABLE." >&2
+    exit 1
+fi
+echo "[cooling-confine] no static-identity-mutating primitive"
+
+# ---------------------------------------------------------------------------
 # R31.M3-002 (#1100): BATTERY CHANNEL SCHEMA ARITY PINS.
 #
 # The schema has no storage of its own -- it is pure pack/unpack -- so
