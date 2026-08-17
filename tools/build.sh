@@ -1673,6 +1673,83 @@ if [[ -n "${th_dc_strays}" ]]; then
 fi
 echo "[thermal-confine] unit conversion reached only by the printer and its witness"
 
+# ---------------------------------------------------------------------------
+# R31.M2-003 (#1096): THERMAL POLICY MAP CONFINEMENT.
+#
+# `_thermal_policy_map` is the only place in the kernel where a
+# level-to-intent binding lives, and the whole security argument of §2 is
+# that its ONLY writer -- `thermal_policy_map_install` -- is monotone: an
+# entry, once filled with an intent, cannot silently mean something
+# different later. A kernel object outside `thermal_policy.o` that
+# relocated against the table would be an object that could write an
+# entry without passing the monotonicity gate, and there would be no
+# symptom until an installed NOMINAL that used to mean NONE started
+# meaning ACTIVE.
+#
+# Same shape as the op-region, GPE and thermal-zone table checks above.
+# Runs on every build (including inside the smoke matrix) rather than only
+# at push time, so a mutant that spread writes across two objects fails
+# here before the boot witness has a chance to look like it passed.
+#
+# The two readers -- `thermal_policy_intent_of_level` and
+# `thermal_policy_intent_of_slot` -- ALSO have their arities pinned. A
+# level reader that took a second argument would be a lookup a caller
+# could satisfy with a value not in the table (§2 in thermal_policy.pdx
+# spells the shape). A slot reader that took a second argument would be
+# how a caller-supplied "assumed level" reaches a comparison whose
+# outcome is a shutdown intent (§3 in thermal_policy.pdx). Both fail
+# reviewably; the arity pin is what catches the drift mechanically.
+# ---------------------------------------------------------------------------
+TP_OWNER="${BUILD_DIR}/core/policy/thermal_policy.o"
+if [[ ! -f "${TP_OWNER}" ]]; then
+    echo "[thermal-policy-confine] FAIL: ${TP_OWNER} not built" >&2
+    exit 1
+fi
+if ! obj_relocs_against "${TP_OWNER}" '_thermal_policy_map'; then
+    echo "[thermal-policy-confine] FAIL: thermal_policy.o does not reference" >&2
+    echo "  _thermal_policy_map. The symbol was renamed or the module was" >&2
+    echo "  gutted; the confinement check would then pass vacuously." >&2
+    exit 1
+fi
+tp_strays=""
+for o in "${OBJECTS[@]}"; do
+    [[ "${o}" == "${TP_OWNER}" ]] && continue
+    if obj_relocs_against "${o}" '_thermal_policy_map'; then
+        tp_strays="${tp_strays} ${o#"${BUILD_DIR}"/}"
+    fi
+done
+if [[ -n "${tp_strays}" ]]; then
+    echo "[thermal-policy-confine] FAIL - objects other than" >&2
+    echo "  core/policy/thermal_policy.o relocate against _thermal_policy_map:" >&2
+    echo " ${tp_strays}" >&2
+    echo "  Only thermal_policy_map_install may write an entry, and the" >&2
+    echo "  monotonicity gate is the only reason a level cannot silently" >&2
+    echo "  change meaning. See src/kernel/core/policy/thermal_policy.pdx §2." >&2
+    exit 1
+fi
+echo "[thermal-policy-confine] level-to-intent map confined"
+
+TP_SRC="${REPO_ROOT}/src/kernel/core/policy/thermal_policy.pdx"
+if [[ ! -f "${TP_SRC}" ]]; then
+    echo "[thermal-policy-confine] FAIL - ${TP_SRC} not found" >&2
+    exit 1
+fi
+tp_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${TP_SRC}"; then
+        echo "[thermal-policy-confine] FAIL - expected declaration not found:" >&2
+        echo "  ${decl}" >&2
+        echo "  A signature change to either intent reader is how a caller-" >&2
+        echo "  supplied value reaches a policy decision it should not be" >&2
+        echo "  able to influence. See §2/§3 in thermal_policy.pdx." >&2
+        exit 1
+    fi
+}
+tp_pin_one 'pub let thermal_policy_intent_of_level : (u64) -> u64'
+tp_pin_one 'pub let thermal_policy_intent_of_slot : (u64) -> u64'
+tp_pin_one 'pub let thermal_policy_map_install : (u64, u64) -> u64'
+echo "[thermal-policy-confine] intent-reader and map-install arities pinned"
+
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
