@@ -1412,6 +1412,18 @@ ec_pin_one "${EC_ACCESS_SRC}" 'pub let ec_access_bind : (u64) -> u64'
 ec_pin_one "${EC_ACCESS_SRC}" 'pub let ec_access_base : () -> u64'
 ec_pin_one "${EC_ACCESS_SRC}" 'pub let ec_access_len : () -> u64'
 ec_pin_one "${EC_ACCESS_SRC}" 'pub let ec_access_arbitrated : () -> u64'
+# R31.M6-#1580: the arbitration binder takes three ADDRESSES, not slots,
+# because the FACS host VA and the two PM1 ports come out of fadt_parse
+# (not out of a cap_table) and are what aml_glk_attach in ring 3 will
+# eventually consume. A caller-facing arity that added a "kind of lock"
+# or a "revision" argument would make it expressible to bind arbitration
+# against a Global Lock that is not the platform's; the FACS is a system
+# singleton, exactly as aml_glk_attach's own arity is pinned in
+# tools/verify-aml-parser.sh for the same reason.
+ec_pin_one "${EC_ACCESS_SRC}" 'pub let ec_access_bind_arbitration : (u64, u64, u64) -> u64'
+ec_pin_one "${EC_ACCESS_SRC}" 'pub let ec_access_facs : () -> u64'
+ec_pin_one "${EC_ACCESS_SRC}" 'pub let ec_access_pm1_cnt : () -> u64'
+ec_pin_one "${EC_ACCESS_SRC}" 'pub let ec_access_pm1_sts : () -> u64'
 ec_pin_one "${EC_QUERY_SRC}"  'pub let ec_query_row_addr : (u64) -> u64'
 ec_pin_one "${EC_QUERY_SRC}"  'pub let ec_query_row_target : (u64, u64, u64) -> u64'
 ec_pin_one "${EC_QUERY_SRC}"  'pub let ec_query_row_narrow : (u64, u64) -> u64'

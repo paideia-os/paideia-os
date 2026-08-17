@@ -342,9 +342,16 @@ case "${EXPECTED}" in
         # witness adds one more cluster (KIND_BACKLIGHT OK + BACKLIGHT
         # SCALE OK) plus its debug-print pass, which slid the tail of
         # the sequence past the previous 12s bound.
+        #
+        # R31.M6-#1580 bumped 15s -> 17s: global_lock_witness adds a
+        # synthetic-FADT parse + ec_access_bind_arbitration end-to-end
+        # exercise before ec_query_witness, and the added instructions
+        # push the tail of the sequence far enough that COOLING SCALE OK
+        # was landing after the previous 15s window closed on slower
+        # runners.
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/r17/shell-shutdown.golden"
-        TIMEOUT=15
+        TIMEOUT=17
         UART_RX_MODE=1
         : "${INJECT_STRING:=exit\n}"
         : "${INJECT_WAIT_FOR:=SHELL START}"
