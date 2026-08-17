@@ -2670,6 +2670,160 @@ i2chid_isr_pin_one 'pub let i2c_hid_isr_assert : () -> u64'
 i2chid_isr_pin_one 'pub let i2c_hid_isr_asserts : () -> u64'
 echo "[i2c-hid-isr-confine] bind, bound, arbitrated, assert and asserts arities pinned"
 
+# ---------------------------------------------------------------------------
+# R32.M1-004 (#1118): I²C-HID RESET + WAKE SCAFFOLD STATE + ARITY PINS.
+#
+# Two stats arrays, one per seam, each with exactly one legitimate
+# writer -- the seam that dispatches. The load-bearing symbol is
+# _i2c_hid_reset_stats: a stray writer would be a second path counting
+# a reset that never issued, and the R32.M2 bring-up sequence that
+# gates on the reset count would advance without the device having
+# been reset. Same applies mirror-fashion to _i2c_hid_wake_stats.
+#
+# The arity pins are the load-bearing check: both seams are ARITY ZERO
+# by design. §0 of reset_wake.pdx: a caller-supplied opcode would let
+# arbitrary bytes reach wCommandRegister, and the opcode set is
+# enumerated by the spec, not negotiated at the driver.
+I2CHID_RW_OWNER="${BUILD_DIR}/core/drivers/i2c_hid/reset_wake.o"
+I2CHID_RW_SRC="${REPO_ROOT}/src/kernel/core/drivers/i2c_hid/reset_wake.pdx"
+if [[ ! -f "${I2CHID_RW_SRC}" ]]; then
+    echo "[i2c-hid-reset-wake-confine] FAIL - ${I2CHID_RW_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${I2CHID_RW_OWNER}" ]]; then
+    echo "[i2c-hid-reset-wake-confine] FAIL: ${I2CHID_RW_OWNER} not built" >&2
+    exit 1
+fi
+i2chid_rw_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${I2CHID_RW_OWNER}" "${sym}"; then
+        echo "[i2c-hid-reset-wake-confine] FAIL: reset_wake.o does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  check would then pass vacuously, so it fails instead." >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${I2CHID_RW_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[i2c-hid-reset-wake-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/i2c_hid/reset_wake.o relocate against ${sym}:${strays}" >&2
+        echo "  Only i2c_hid_reset_send may write _i2c_hid_reset_stats, and only" >&2
+        echo "  i2c_hid_wake_send may write _i2c_hid_wake_stats. See" >&2
+        echo "  src/kernel/core/drivers/i2c_hid/reset_wake.pdx §1." >&2
+        exit 1
+    fi
+}
+i2chid_rw_confine_one '_i2c_hid_reset_stats'
+i2chid_rw_confine_one '_i2c_hid_wake_stats'
+echo "[i2c-hid-reset-wake-confine] reset and wake stats confined"
+
+i2chid_rw_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${I2CHID_RW_SRC}"; then
+        echo "[i2c-hid-reset-wake-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  RESET AND WAKE SEAMS ARE ARITY ZERO. A caller-supplied opcode" >&2
+        echo "  would let arbitrary bytes reach wCommandRegister -- the opcode" >&2
+        echo "  set is enumerated by HID-over-I²C v1.0 §7, not negotiated at" >&2
+        echo "  the driver. If a signature legitimately changed, §0/§2 of" >&2
+        echo "  reset_wake.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+i2chid_rw_pin_one 'pub let i2c_hid_reset_send : () -> u64'
+i2chid_rw_pin_one 'pub let i2c_hid_wake_send : () -> u64'
+i2chid_rw_pin_one 'pub let i2c_hid_reset_arbitrated : () -> u64'
+i2chid_rw_pin_one 'pub let i2c_hid_wake_arbitrated : () -> u64'
+i2chid_rw_pin_one 'pub let i2c_hid_reset_count : () -> u64'
+i2chid_rw_pin_one 'pub let i2c_hid_wake_count : () -> u64'
+echo "[i2c-hid-reset-wake-confine] reset, wake, arbitrated and count arities pinned"
+
+# ---------------------------------------------------------------------------
+# R32.M1-005 (#1119): I²C-HID QUIRK TABLE CONFINEMENT + ARITY PINS.
+#
+# The table itself is a COMPILE-TIME CONSTANT in .rodata, and the row
+# count is a compile-time constant beside it. The consumer counter is
+# an honesty pin: it is 0 today, and the R32.M2 bring-up sequence that
+# calls the lookup for real will flip it -- the boot witness assertion
+# `quirks_consumed() == 0` fails at that point, forcing the doc to be
+# rewritten with the live consumer's shape.
+#
+# Confinement of _i2c_hid_quirk_table is the load-bearing check: a
+# stray writer -- or a stray reader outside quirks.o forming a row
+# address of its own -- would be a second path taking the table's
+# contents as authority without going through the lookup gate that
+# enforces the wildcard order (§1 of quirks.pdx).
+#
+# Arity pin: lookup is ARITY ONE (packed key). §1 explains why -- a
+# caller that supplies (vendor, product) as two arguments could look
+# up a device whose descriptor has not been parsed, and the whole
+# quirk-lookup discipline is that the caller must have parsed a
+# descriptor first.
+I2CHID_QK_OWNER="${BUILD_DIR}/core/drivers/i2c_hid/quirks.o"
+I2CHID_QK_SRC="${REPO_ROOT}/src/kernel/core/drivers/i2c_hid/quirks.pdx"
+if [[ ! -f "${I2CHID_QK_SRC}" ]]; then
+    echo "[i2c-hid-quirks-confine] FAIL - ${I2CHID_QK_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${I2CHID_QK_OWNER}" ]]; then
+    echo "[i2c-hid-quirks-confine] FAIL: ${I2CHID_QK_OWNER} not built" >&2
+    exit 1
+fi
+i2chid_qk_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${I2CHID_QK_OWNER}" "${sym}"; then
+        echo "[i2c-hid-quirks-confine] FAIL: quirks.o does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  check would then pass vacuously, so it fails instead." >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${I2CHID_QK_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[i2c-hid-quirks-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/i2c_hid/quirks.o relocate against ${sym}:${strays}" >&2
+        echo "  The quirk table and its row count are reachable only through" >&2
+        echo "  i2c_hid_quirk_lookup / i2c_hid_quirk_count. See" >&2
+        echo "  src/kernel/core/drivers/i2c_hid/quirks.pdx §2." >&2
+        exit 1
+    fi
+}
+i2chid_qk_confine_one '_i2c_hid_quirk_table'
+i2chid_qk_confine_one '_i2c_hid_quirk_count'
+i2chid_qk_confine_one '_i2c_hid_quirk_consumers'
+echo "[i2c-hid-quirks-confine] table, count and consumer latch confined"
+
+i2chid_qk_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${I2CHID_QK_SRC}"; then
+        echo "[i2c-hid-quirks-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  THE QUIRK LOOKUP TAKES THE PACKED (vendor << 16 | product) KEY" >&2
+        echo "  DESCRIPTOR.PDX ALREADY STORES, NOTHING ELSE. A caller that" >&2
+        echo "  supplies (vendor, product) as two arguments could look up a" >&2
+        echo "  device whose descriptor has not been parsed -- exactly what §2" >&2
+        echo "  of descriptor.pdx exists to prevent. If a signature legitimately" >&2
+        echo "  changed, §1 of quirks.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+i2chid_qk_pin_one 'pub let i2c_hid_quirk_lookup : (u64) -> u64'
+i2chid_qk_pin_one 'pub let i2c_hid_quirk_count : () -> u64'
+i2chid_qk_pin_one 'pub let i2c_hid_quirks_consumed : () -> u64'
+echo "[i2c-hid-quirks-confine] lookup, count and consumed arities pinned"
+
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
