@@ -1295,6 +1295,128 @@ echo "[gpio-pin-confine] resolvers take no caller-supplied pin"
 echo "[gpio-pin-confine] pad driver and interrupt-register helpers take no"
 echo "[gpio-pin-confine] caller-supplied pin, community or pad"
 
+# =============================================================================
+# R31.M1-001/002/003 (#1089/#1090/#1091): THE EMBEDDED-CONTROLLER PATH.
+#
+# Three private tables, each with exactly one legitimate writer, and the
+# arity pins that make "act on a controller other than the one my
+# capability names" unexpressible rather than merely refused.
+#
+# WHY CONFINEMENT MATTERS MORE HERE THAN ANYWHERE ELSE IN THIS FILE.
+# The embedded controller owns battery charging, thermal and fan control,
+# the lid switch and keyboard power. A stray write outside the range
+# firmware declared can change a charge threshold or a fan curve that
+# PERSISTS ACROSS A REBOOT, and the register space outside that range is
+# vendor-undocumented -- there is no specification saying what does not
+# happen. A second writer to _ec_access_state could widen the extent
+# every transaction is confined to; a second writer to _ec_query_table
+# could forge a subscription to another machine's controller, or a
+# delivery count that hides a starved subscriber.
+EC_CONFINE_OK=1
+ec_confine_one() {
+    local sym="$1" owner="${BUILD_DIR}/$2" strays=""
+    if ! obj_relocs_against "${owner}" "${sym}"; then
+        echo "[ec-confine] FAIL - owner $2 does not reference ${sym}" >&2
+        echo "  A confinement assertion that names a symbol its owner does not" >&2
+        echo "  use is vacuous; it would pass after the storage was deleted." >&2
+        EC_CONFINE_OK=0
+        return
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${owner}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[ec-confine] FAIL - objects other than $2 relocate against" >&2
+        echo "  ${sym}:${strays}" >&2
+        EC_CONFINE_OK=0
+    fi
+}
+# The subscription rows. core/acpi/ec_route.pdx walks them on every
+# query and must do so through the exported selectors -- this assertion
+# is what makes that a build fact rather than a convention, and the
+# router was written to satisfy it rather than the other way round.
+ec_confine_one '_ec_query_table'  'core/cap/kind_ec_query.o'
+# The transaction gate's binding and counters.
+ec_confine_one '_ec_access_state' 'core/drivers/ec/ec_access.o'
+# The router's own accounting.
+ec_confine_one '_ec_route_state'  'core/acpi/ec_route.o'
+if [[ "${EC_CONFINE_OK}" -ne 1 ]]; then
+    echo "  See src/kernel/core/cap/kind_ec_query.pdx and" >&2
+    echo "  src/kernel/core/drivers/ec/ec_access.pdx for why each of these has" >&2
+    echo "  exactly one legitimate writer." >&2
+    exit 1
+fi
+echo "[ec-confine] subscription rows, transaction gate and router state confined"
+
+# THE ARITIES. Every one of these takes a capability slot, a row id, or
+# a value that can only select within the row it was given -- and never
+# a controller address, a base or a length from the caller.
+#
+# ec_access_bind is the load-bearing one. A base or length parameter
+# would let a caller declare an extent the capability does not name, and
+# every range refusal in ec_access_audit would then be enforcing the
+# caller's claim rather than the kernel's grant -- the entire confinement
+# property inverted, with no symptom until a write lands outside the
+# region on a machine whose firmware declared a smaller one.
+#
+# ec_query_row_target is the other. It returns an endpoint IDENTITY and
+# takes no pointer, which is what lets the router fan out across the
+# subscription rows without an address into the table crossing a module
+# boundary. Widening it to hand back a row address would satisfy every
+# other check here and quietly void the confinement assertion above.
+EC_QUERY_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_ec_query.pdx"
+EC_ACCESS_SRC="${REPO_ROOT}/src/kernel/core/drivers/ec/ec_access.pdx"
+ec_pin_one() {
+    local src="$1" decl="$2"
+    if ! grep -qF -- "${decl}" "${src}"; then
+        echo "[ec-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "  The embedded-controller path takes its controller address, its" >&2
+        echo "  base and its extent from the capability, never from a caller. An" >&2
+        echo "  extra parameter on any of these makes 'transact with a controller" >&2
+        echo "  other than the one my capability names', or 'declare an extent" >&2
+        echo "  wider than the one I was granted', expressible -- and on this" >&2
+        echo "  device an out-of-range write can change a charge threshold that" >&2
+        echo "  survives the reboot. If a signature legitimately changed, the" >&2
+        echo "  confinement argument in the module header must be rewritten" >&2
+        echo "  first." >&2
+        exit 1
+    fi
+}
+ec_pin_one "${EC_ACCESS_SRC}" 'pub let ec_access_bind : (u64) -> u64'
+ec_pin_one "${EC_ACCESS_SRC}" 'pub let ec_access_base : () -> u64'
+ec_pin_one "${EC_ACCESS_SRC}" 'pub let ec_access_len : () -> u64'
+ec_pin_one "${EC_ACCESS_SRC}" 'pub let ec_access_arbitrated : () -> u64'
+ec_pin_one "${EC_QUERY_SRC}"  'pub let ec_query_row_addr : (u64) -> u64'
+ec_pin_one "${EC_QUERY_SRC}"  'pub let ec_query_row_target : (u64, u64, u64) -> u64'
+ec_pin_one "${EC_QUERY_SRC}"  'pub let ec_query_row_narrow : (u64, u64) -> u64'
+echo "[ec-confine] bind, extent and routing-selector arities pinned"
+
+# THE MONOTONE BITMAP. ec_query_row_narrow is the ONLY function in the
+# tree that mutates a notify bitmap, and it can only clear a bit. A
+# widening counterpart would make the bitmap a preference dressed as a
+# boundary: a holder could give up reach and take it back later, so the
+# set of events a subscription can receive would no longer be bounded by
+# what the mint gate proved its minter held.
+#
+# This is a grep for the ABSENCE of a symbol, which is a weaker check
+# than the arity pins above and is worth having anyway: the natural name
+# for the mutant is the one being searched for, and a contributor adding
+# it gets told why it must not exist at the moment of adding it rather
+# than in review.
+if grep -qE 'ec_query_row_(widen|subscribe|set_bit)' "${EC_QUERY_SRC}"; then
+    echo "[ec-confine] FAIL - a widening primitive was added to the notify" >&2
+    echo "  bitmap. The bitmap starts full and only ever narrows; see" >&2
+    echo "  src/kernel/core/cap/kind_ec_query.pdx" >&2
+    echo "  THE NOTIFY BITMAP STARTS FULL AND ONLY EVER NARROWS." >&2
+    exit 1
+fi
+echo "[ec-confine] notify bitmap has no widening primitive"
+
+
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
 if [[ ${#OBJECTS[@]} -eq 0 ]]; then

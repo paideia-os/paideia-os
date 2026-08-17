@@ -1985,6 +1985,162 @@ rotates the starting session so all ten complete an episode. See
 
 ---
 
+## `KIND_EC_QUERY = 0x156` — landed by R31.M1-002 (#1090)
+
+Full design: `design/drivers/embedded-controller-kernel-path.md`.
+
+### Catalog reconciliation
+
+The R31 catalog named this kind and said nothing else about it;
+`design/acpi/crash-isolation.md` recorded it as "a *planned* R31 kind"
+and `design/roadmap/next-wave-synthesis.md` listed the tail as
+`{ec_addr, notify_bitmap}`. Both are honoured. The tail is those two
+fields plus the inherited endpoint identity and a delivery counter, and
+the name was checked against `tools/lint-no-kernel-aml.sh` before it was
+committed to — `ec_query` matches none of `\baml`, `\bdsdt`, `\bssdt`,
+`\bacpica`, `\_SB_`, `\_SB.`, in code or in `justification:` strings.
+That check was made rather than assumed, because #1569 records
+`KIND_AML_SESSION` meeting exactly this collision at push time.
+
+### Derivation — over `KIND_IPC_ENDPOINT`, in two halves
+
+```
+KIND_IPC_ENDPOINT (5)          KIND_OP_REGION (0x150, space 0x03)
+    + RIGHT_MINT                          + RIGHT_MINT
+   "where you are told"            "which controller, and that
+          \                          firmware declared it"
+           \                            /
+            +------ both required -----+
+                        |
+                 KIND_EC_QUERY (0x156)
+       ec_addr and endpoint_id both INHERITED
+```
+
+The kind half is **empty on its own** — every endpoint in the machine is
+a `KIND_IPC_ENDPOINT`, the shell's stdout included — which is the #1075
+lesson's second instance and the reason the gate has a second half at
+all. That half is a second capability argument rather than a registry
+lookup: `region_slot` must be a live `KIND_OP_REGION` carrying
+`RIGHT_MINT`, over `OPREG_SPACE_EC (0x03)`, with a declared length in
+1..256. Its two failure classes stay distinct — `MINT_BAD_REGION` for
+"that is not a region capability", `MINT_BAD_SPACE` for "it is one, over
+the wrong space or of an impossible size" — because the fixes differ.
+
+Neither `ec_addr` nor `endpoint_id` is an argument. Both are read from
+the parents, the discipline `acpi_evt_cap_mint` uses for the GSI: a
+subscription stamped with controller A's address while its region
+capability names controller B would pass both halves and then misreport,
+for its whole life, which machine's events it received.
+
+### Tail encoding — row indirection
+
+| table | rows | fields |
+|---|---|---|
+| `_ec_query_table` | 8 × 64 B | `[+0]` hdr `{parent_slot:8, region_slot:8, region_row:16, in_use:8}`, `[+8]` `ec_addr`, `[+16..+40]` `notify_bitmap` (256 bits, one per query byte), `[+48]` `endpoint_id`, `[+56]` `delivered` |
+
+`target_ptr` holds the `row_id`. Stride 64 is a power of two so the index
+is a `shl 6` — paideia-as has no `mul`. Eight rows because a subscription
+is per-**process**, not per-event-source; fan-out across the 256 query
+bytes is the bitmap's job.
+
+**The bitmap starts full and only ever narrows.** `ec_query_row_narrow`
+clears one bit; there is no primitive that sets one, and `tools/build.sh`
+greps for the natural names of a widening mutant. Starting full is not a
+weakening: the gate already proved the minter holds a region capability
+over the controller's whole EmbeddedControl space, so the child begins
+with no more than its parent. Taking the mask as a mint argument is not
+expressible — 256 bits plus four other arguments is eight registers and
+SysV has six — and every workaround loses `_Qxx` values real firmware
+uses or hands a raw pointer across the confinement boundary.
+
+### Rights — `R_EC_QUERY_ALL = 0x41A`
+
+| bit | right | authorises |
+|---|---|---|
+| 0x002 | WRITE | narrow the notify bitmap. A WRITE right for an operation that can only remove reach, because the row is mutated and an OBSERVE-only holder must not be able to silence a subscription somebody else depends on. |
+| 0x008 | INVOKE | interrogate the routing filter. Separate from OBSERVE because which events a holder watches for is a statement about the holder, not about the capability. |
+| 0x010 | REVOKE | tear the subscription down. |
+| 0x400 | OBSERVE | read controller address, endpoint identity, region row, delivery count. |
+
+`RIGHT_MINT (0x200)` is **deliberately absent**: this kind is a leaf of
+the lattice, and a MINT bit no gate accepts as a parent right would be a
+rights bit that looks like authority and confers none. Requests naming it
+are refused (`MINT_BAD_RIGHTS`), never silently stripped.
+
+### Ops (`op_arg[7:0]`) and required right
+
+| op | name | right |
+|---|---|---|
+| 0 | `QUERY_ADDR` | OBSERVE |
+| 1 | `QUERY_ENDPOINT` | OBSERVE |
+| 2 | `QUERY_DELIVERED` | OBSERVE |
+| 3 | `QUERY_WANTS` (query byte in `op_arg[15:8]`) | INVOKE |
+| 4 | `UNSUBSCRIBE` (query byte in `op_arg[15:8]`) | WRITE |
+| 5 | `QUERY_REGION` | OBSERVE |
+
+No op takes a controller address. The query byte in `[15:8]` is a value,
+not an authority: it selects a bit of this row's own bitmap and can reach
+no other row. There is no "deliver an event" op — delivery copies a
+record into the shared stream, which a three-register invocation cannot
+express without a destination pointer.
+
+### The routing selector
+
+`ec_query_row_target(row_id, ec_addr, query_byte)` returns the endpoint
+identity or 0, and `ec_query_row_covers(row_id, ec_addr)` returns
+whether the row names the controller at all. `core/acpi/ec_route.pdx`
+fans out through those two and never touches `_ec_query_table`, which is
+what lets the confinement assertion in `tools/build.sh` survive contact
+with its first consumer. Both arities are pinned.
+
+### Revoke
+
+`ec_query_cap_revoke` frees the row, then clears the descriptor with
+`cap_mint_write(slot, 0, 0, 0)` (#1579) so the owner column's
+unconditional clear (#1587) lands on the teardown path too. The free
+scrubs the endpoint identity, the controller address **and** the bitmap:
+a row reused without scrubbing the bitmap would hand the next holder a
+subscription silently missing whatever the previous holder unsubscribed
+from, which presents as a device that works for one process and not the
+next. **No cascade** — nothing derives from a subscription, and an empty
+cascade call would be a hook that looks maintained and is not. Added to
+`cap_revoke_slot`'s per-kind dispatch in `core/cap/owner.pdx`, because a
+tail-table kind left off that list leaks its row.
+
+### Not loader-seedable
+
+Deliberately absent from `KIND_SEEDABLE_TABLE`. #1597 refuses a kind
+defined by its derivation, and this is the strongest case for that rule
+so far: both parents are load-bearing, one supplies the controller
+address the row records, and a sidecar entry would create a subscription
+to an address taken from untrusted image bytes with no region capability
+behind it.
+
+### Failure taxonomy — `0xFFFFFE00..0F`
+
+Disjoint from `KIND_FW_SESSION` (`0xFFFFFE10..1F`) and the owner column
+(`0xFFFFFE2B..2F`); the whole `0xFFFFFFxx` page is exhausted.
+
+`OK 0`, `TAIL_ENOSPC ..0F`, `TAIL_BAD_ARG ..0E`, `MINT_BAD_PARENT ..0D`,
+`MINT_BAD_RIGHTS ..0C`, `MINT_BAD_ARG ..0B`, `MINT_ENOSPC ..0A`,
+`MINT_BAD_REGION ..09`, `MINT_BAD_SPACE ..08`, `MINT_BAD_EID ..07`,
+`REVOKE_BAD_SLOT ..06`, `REVOKE_WRONG_KIND ..05`, `REVOKE_ALREADY ..04`,
+`NARROW_BAD_ARG ..03`, `DECODE_BAD` all-ones.
+
+### Boot witness
+
+`tests/kernel/cap/ec_query_synth.pdx`, fingerprint
+`R31 KIND_EC_QUERY OK`, cap slots 200..211. Stages cover both halves of
+the gate in both directions, the leaf-rights refusal, the bitmap starting
+full and narrowing by exactly one bit across a word boundary, the three
+separable authority classes in the handler, row exhaustion, and revoke
+including the wrong-kind refusal. Mutation-tested: dropping the second
+half's kind check gives `line=12`, accepting the wrong space `line=13`,
+admitting `RIGHT_MINT` `line=14`, over-clearing the bitmap `line=17`.
+
+
+---
+
 ## Change log
 
 | Date | Round | Issue | Change |
@@ -2020,3 +2176,4 @@ rotates the starting session so all ten complete an episode. See
 | 2026-08-15 | R30.M5 | #1074 | Landed the **interrupt-driven I²C transfer engine**, closing R30.M5. **Path choice is "both", and the shape of "both" is the whole design**: two engines is not a performance question, it is a drift question — a NACK decoding one way on one path and another on the other, depending on which boot phase a caller ran in. So (a) the error handling is **not duplicated, it is called**: both engines decode aborts through the same `dw_xfer_check_abort`, resolve rights through the same `i2c_xfer_resolve`, retarget through the same `i2c_xfer_set_target` and check the same wedge latch, and the witness asserts the same armed abort yields the same code through `i2c_xfer_write` and `i2c_xfer_irq_write`; (b) the interrupt engine has **one implementation and only its caller varies** — `dw_i2c_isr_body` *is* the engine, called by a trampoline when a vector is bound and by `dw_irq_wait` from thread context when none is (today, and early boot forever), so the boot path cannot diverge from the interrupt path because it is the same function; (c) the polled engine stays for bring-up and SMBus as **distinct entry points, not a mode flag**, since a hidden flag is exactly how one call comes to behave two ways. **FSM state ownership is a baton, not a lock.** `_dw_irq_ctx[ctrl]` (128 B, cache-line aligned, `objdump -r`-confined) has exactly ONE field written by both contexts — `state`, written only by LOCK-prefixed CAS/xchg — and every other field has one writer at a time, chosen by that word: thread in `SETUP`, ISR in `ARMED`/`RUNNING`, the `CLOSING` winner in `CLOSING`, thread again once terminal. Publish is `CAS(SETUP→ARMED)` with the **software arm strictly before the hardware arm** (the `IC_INTR_MASK` write), so the first interrupt cannot find an unpublished row; return is field stores then `atomic_store(state, DONE|ABORT)`, TSO-ordered, so a thread that has seen `DONE` has seen everything that produced it. **Termination is an exclusive claim** through a distinct `CLOSING` state, because the ISR on a STOP_DET and the thread on an exhausted budget can decide simultaneously and a single CAS would publish before the outcome was written — the caller would be told "timed out" about a transfer that completed. Two concurrent service routines are excluded by a gate the loser **declines rather than spins on**, which is sound because the source is a level and is the only exclusion an ISR may use. **TX_EMPTY is a level, not an event** (`TXFLR <= IC_TX_TL`, and bring-up sets `IC_TX_TL = 0`), so it is true forever once the FIFO drains: a driver that leaves it unmasked completes correctly and takes an interrupt per EOI until the STOP lands, with nothing in final state recording it. Masked at ONE point — `dwi_isr_tx_masked`, the instant the command carrying `DW_CMD_STOP` is accepted, the earliest moment with nothing left to send — and the POSITION is recorded (`masked_at`) so the witness asserts *which* command, since masking at the first byte leaves an identical final mask and is wrong. Measured by a **level-triggered delivery pump** over a model extended to compute `IC_INTR_STAT = raw & mask`, hold TX_EMPTY from enable, follow RX_FULL with the queue, and **arm a commanded STOP as a countdown rather than reporting it instantly** — with a zero-length interval the storm cannot exist. A one-byte write costs exactly two service events; sub-test U puts the mask back by hand and asserts the same measurement exceeds ten, because *a ceiling nothing can breach proves nothing*. **Address NACK and data NACK stay distinct** and the data NACK reports `pushed − IC_TXFLR − 1` acknowledged bytes read at the abort — not the number pushed, since the core flushes the FIFO and the NACKed byte never landed; a caller assuming "all of it" would leave a device holding a half-applied multi-byte register write. Making that testable forced two model corrections of things `dw_regs.pdx` had asserted in prose since #1072 without modelling: an abort can now let N commands through first, and an abort **clears `IC_STATUS.TFNF`** with `IC_CLR_TX_ABRT` restoring it. **`dw_isr.pdx` is one function** so `objdump -r` can bound it: new `[dw-isr-allowlist]` with eleven targets and a vacuity guard, **separate from** `[sci-isr-allowlist]` and neither widening the other; two fixed bursts (8/8) so cost does not grow with transfer length. **The polled engine also gained the claim**: until #1074 two CPUs could interleave `IC_DATA_CMD` writes into one FIFO under one `IC_TAR` — one device's bytes under another's address, no error anywhere — an R18-SMP exposure nothing had closed. The claim is a **single global cell** because the seam has one binding; per-controller would let two controllers repoint it under each other. Also fixed: `dw_io_trace_append` reserves with `lock xadd`, since the ISR shares the seam and a read-modify-write loses one record and *aliases* another, which is the exact corruption that makes an ordering assertion say the opposite of the truth. New band `I2C_IRQ_*` `0xFFFFFFE0..E6`, closing the gap between `DMA_*` and `MSIX_*`; only THREE codes are new (`BUSY`, `NOT_OWNER`, `BAD_STATE`/`BAD_IDX`) because everything else reuses the polled taxonomy — the completion timeout is `I2C_XFER_TIMEOUT_STOP`, which is exactly right since the terminal states are STOP_DET or abort. Four interrupt entry points added to the signature pin set. Vector allocation, IDT install and EOI belong to R30.M6's `KIND_HW_MSIX_VECTOR` binding; the routine is written so binding one **adds a caller, not a code path**. Boot witness sub-tests S..X — second fingerprint `R30 LPSS I2C IRQ OK`. **Closes R30.M5.** |
 | 2026-08-15 | R30.M6 | #1075/#1076 | Landed `KIND_GPIO_LINE = 0x154` — derived over `KIND_DEVICE` with a two-part gate (kind + RIGHT_MINT, then the inherited identity must resolve to a probed pad controller). Row-indirection tail via `_gpio_line_table` encoding `{parent_slot:u8, pin:u16 absolute, pad_index:u16 community-relative, community:u8}` plus an inherited `controller_id`. Rights `R_GPIO_LINE_ALL = 0x41F`, with `CONFIG` split from `WRITE`. Community/pad mapping DERIVED at mint by `lpss_gpio_resolve_pin`; six resolver signatures arity-pinned and `lpss_gpio_pad_off` confined, so `gpio_line_pad_off_of_slot` is the only capability-to-pad-address route. Duplicate `(controller, pin)` refused; out-of-range and unmapped pins refused with distinct codes, never clamped. Two-phase controller cascade via `lpss_gpio_release`. Driver half in `core/drivers/gpio/{lpss_gpio,gpio_io}.pdx` with `design/drivers/lpss-gpio-controller.md`. Witnesses `R30 LPSS GPIO OK` + `R30 KIND_GPIO OK`. Opens R30.M6. |
 | 2026-08-16 | R30.M8 | #1569/#1083/#1084 | Landed `KIND_FW_SESSION = 0x155`, **renamed from the catalog's `KIND_AML_SESSION` by #1569** before any code existed against the old name — capabilities live in `src/kernel/core/cap/` and `tools/lint-no-kernel-aml.sh` refuses any identifier beginning `aml` there, so the catalog name and the file's address were in direct contradiction; the lint was left alone, and the new name is the more accurate one since what is arbitrated is an evaluation *session* against a *firmware-supplied* object. Derived over `KIND_IPC_ENDPOINT` (base slot 5) with a two-part gate whose first half is **emptier than any previous kind's** — every endpoint in the system is a `KIND_IPC_ENDPOINT`, the shell's stdout included — so the second half requires the parent's **inherited** endpoint id to be registered in `_fw_ep_registry` for the requested op-region domain, the `KIND_GPIO_LINE` (#1075) shape. **Two tables, not one**, because a capability names a session and arbitration is about the object (N:1): `_fw_object_table` (8 × 128 B) carries the claim, depth, refcount and the whole 64-byte scope path; `_fw_session_table` (16 × 16 B) carries the object index. Putting the claim in the session row would give every session its own, so every holder would claim successfully, observe that it held it, and write concurrently with all the others — a failure with **no symptom on the claiming side**, surfacing as a firmware object with interleaved half-updates; `fw_object_alloc` therefore finds first and allocates second, and the witness asserts ten sessions leave one object row. The **path is stored whole, not hashed**, and compared length-first then bytewise: a collision merges two arbitration domains, and a comparison stopping at a shared prefix or a NUL would make `\_SB.PCI0.LPCB.EC0` and `\_SB.PCI0.LPCB.EC0X` the same object — the fixture's two paths share 17 bytes and differ in the 18th for exactly that reason. Rights `R_FW_SESSION_ALL = 0x41B`; the claim requires `WRITE` because its whole effect is to exclude other writers, while `WRITE` and the claim stay separate bits so a consistent-snapshot reader can hold one without the other. Claim is recursive for the same session, **refused** (`CLAIM_HELD`, no queue) for a different one, and released only at depth 1→0; `holder` stores `row + 1` because row 0 is legitimate and a raw id would make 'row 0 holds it' and 'nobody holds it' the same bit pattern. Revoke releases a held claim at any depth — a claim held by a dead session excludes every other writer forever — and frees the object row at refcount 0. Both mint and revoke go through `cap_mint_write`, adding no second descriptor writer (#1579). **New failure band `0xFFFFFE10..1F`**: the `0xFFFFFFxx` band is exhausted at two free runs of eight, and splitting across them would have made the taxonomy discontiguous for no reason but scarcity while leaving the next kind worse off. **#1084 is sections G–H of the same witness**: ten evaluators interleaved at operation granularity, asserting linearizability *defined before it is claimed* — (L1) mutual exclusion checked between every pair of adjacent steps rather than at the end, since every episode terminates with an UNCLAIM and the quiescent final state is consistent with any amount of overlap; (L2) no lost updates, the object's value equalling the completed-write count; (L3) non-vacuity, asserted as exact step and blocked-step totals because a schedule that silently stopped contending would still clear a floor. Each episode is five separate steps (CLAIM/READ/BUMP/WRITE/UNCLAIM) so another session can be scheduled between the read and the write, and a session proceeds on **its own successful claim** rather than on the object's holder field — modelling it the other way would build the property under test into the harness. Phase A's 14-step schedule is hand-derived from the two failure modes (two sessions both observing the object free; a release landing between another session's check and its use); Phase B rotates the starting session each pass, without which session 0 would win every pass and the other nine would never complete an episode. Boot witness `tests/kernel/cap/fw_session_cap_synth.pdx` (A..I) — fingerprint `R30 KIND_FW_SESSION OK`. Closes R30.M8. |
+| 2026-08-17 | R31.M1 | #1089/#1090/#1091 | Landed `KIND_EC_QUERY = 0x156` — the right to be told that ONE embedded controller raised ONE of a named set of query events — plus the kernel's transaction gate (`core/drivers/ec/ec_access.pdx`) and query router (`core/acpi/ec_route.pdx`). Derives over `KIND_IPC_ENDPOINT` in **two halves** for the second time in the tree, because the kind half admits every endpoint in the machine; the second half is a second capability argument, a live `KIND_OP_REGION` over `OPREG_SPACE_EC` with a declared length in 1..256, and both `ec_addr` and `endpoint_id` are inherited rather than argued. Row indirection via `_ec_query_table` (8 x 64 B) carrying a 256-bit notify bitmap that **starts full and only ever narrows** — there is no widening primitive and `tools/build.sh` greps for one. Rights `R_EC_QUERY_ALL = 0x41A`, `RIGHT_MINT` deliberately excluded (leaf). Band `0xFFFFFE00..0F`. Added to `cap_revoke_slot`'s per-kind dispatch; NOT added to `KIND_SEEDABLE_TABLE`, per #1597's rule against seeding a kind defined by its derivation. `acpi_evt_offer` gained its **third source**, `ACPI_EVT_SRC_EC_QUERY = 3` — the extension its own R30.M4 justification anticipated when it put `NEEDS_ACK` in a field of its own; a query is not an acknowledging source, so `flags` stays 0. Three boot fingerprints (`R31 KIND_EC_QUERY OK`, `R31 EC ACCESS OK`, `R31 EC QUERY ROUTE OK`), eight mutants each caught with its own tag. **#1091's decoder half was already done** in ring 3 (R30.M7 / #1080) and was not rebuilt — `design/acpi/no-aml-in-kernel.md` forbids it in the kernel, and what was missing was the routing. **This path is NOT arbitrated against SMM**: the Global Lock is inert in production because #1580 has not plumbed the FACS address or the PM1 control port, and `ec_access_arbitrated()` is pinned at 0 by the boot witness so the commit that closes #1580 breaks the pin and must rewrite the claim. See `design/drivers/embedded-controller-kernel-path.md` §0. |

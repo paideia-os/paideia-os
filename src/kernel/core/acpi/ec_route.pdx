@@ -1,0 +1,380 @@
+// src/kernel/core/acpi/ec_route.pdx — R31.M1-003 (#1091)
+//
+// Routing a decoded embedded-controller query to the subscriptions that
+// asked for it.
+//
+// =============================================================================
+// WHAT #1091 ASKED FOR, AND WHAT WAS ALREADY THERE
+// =============================================================================
+//
+// The issue's deliverable reads "`_Qxx` query byte decoder; dispatch into
+// acpi_event_channel". Half of that shipped in R30.M7 (#1080/#1081) and
+// is not reimplemented here.
+//
+// THE DECODER EXISTS AND IT IS NOT KERNEL CODE. `src/user/aml/aml_ec.pdx`
+// issues the QR_EC handshake, reads the query byte, builds the four-
+// character `_Qxx` name from it, resolves that name exactly in the
+// controller's own scope, and invokes the method — with the transaction
+// claim released across the dispatch, the episode bounded at depth 4,
+// query byte 0 treated as "nothing pending" rather than as a method
+// name, and a missing method counted rather than latched as a fault.
+// design/acpi/embedded-controller.md §4 and §9 are the argument for all
+// of that, and `tools/verify-aml-parser.sh` pins the signatures.
+//
+// It lives in ring 3 because selecting a control method from a byte IS
+// firmware-bytecode evaluation, and `design/acpi/no-aml-in-kernel.md`
+// forbids that in ring 0 down to the token level. Rebuilding any part of
+// it here would be a duplicate of a mechanism whose whole design
+// rationale is that it is not here.
+//
+// WHAT WAS MISSING IS THE OTHER HALF: nothing carried a decoded query
+// anywhere. `aml_ec_query_pump` returned a status to a caller that did
+// not exist, and no subscriber in the machine could learn that the lid
+// had closed. That gap is what this module closes.
+//
+// =============================================================================
+// THE SHAPE, AND WHY IT MIRRORS acpi_evt_notify
+// =============================================================================
+//
+// `acpi_evt_notify` (core/acpi/evt_stream.pdx) is the kernel-side landing
+// point for a firmware `Notify()` that the supervisor forwards from ring
+// 3. It exists, it is witnessed by a synthetic fixture, and no transport
+// calls it yet, because the kernel→userspace event transport is a
+// pre-existing gap recorded in `design/kernel/r30-m4-sci-gpe-path.md`.
+//
+// `ec_route_query` is its sibling and has deliberately the same status:
+// it is the landing point for a decoded query byte, it is witnessed the
+// same way, and the same missing transport is what stands between it and
+// production. THIS MODULE DOES NOT WIDEN THAT GAP AND DOES NOT PRETEND
+// TO CLOSE IT. What it removes is a different absence — before it, even
+// with the transport in place there was nowhere for a query to go.
+//
+// =============================================================================
+// THE FAN-OUT IS THE CAPABILITY TABLE, NOT A LIST IN THIS FILE
+// =============================================================================
+//
+// Which subscribers hear about a query is decided entirely by
+// `core/cap/kind_ec_query.pdx`'s rows: a row is a recipient iff it is
+// live, iff it names this controller, and iff its notify bitmap still
+// has this query byte set. This module holds no policy and no table of
+// its own beyond counters — it walks row ids 0..7 and asks.
+//
+// It asks through `ec_query_row_target`, which returns the endpoint
+// identity or zero, rather than reading `_ec_query_table`. That is not
+// style: `tools/build.sh` asserts that no object other than
+// `kind_ec_query.o` relocates against that array, and a router that
+// indexed it directly would either break the build or force the
+// assertion to be weakened. Confinement survives contact with its first
+// consumer, which is the only test of a confinement that means anything.
+//
+// =============================================================================
+// FOUR OUTCOMES, COUNTED SEPARATELY, BECAUSE THEY HAVE DIFFERENT FIXES
+// =============================================================================
+//
+//   routed      an offer was accepted, and the row's delivery counter
+//               moved. The normal case.
+//   filtered    a live subscription names this controller and has
+//               unsubscribed from this query byte. THE SYSTEM IS WORKING
+//               AS CONFIGURED.
+//   unrouted    no live subscription names this controller at all. A
+//               missing mint — somebody has to create the capability.
+//   refused     a matching subscription existed and `acpi_evt_offer`
+//               said no: the stream is full, or nothing is bound to it.
+//               A BACKPRESSURE OR WIRING FAULT, and neither of the two
+//               above.
+//
+// Folding any pair of those into one counter would send an operator
+// looking for the wrong thing. "The lid does nothing" has three
+// completely different causes and this is the only place that can tell
+// them apart.
+//
+// =============================================================================
+// QUERY ZERO IS NOT A QUERY, AND THE CHECK IS MADE TWICE ON PURPOSE
+// =============================================================================
+//
+// `QR_EC` returning 0 means no query is pending. `aml_ec_query_pump`
+// already refuses to dispatch `_Q00` for it (design/acpi/
+// embedded-controller.md §9), and this module refuses to ROUTE it, with
+// its own code and its own counter.
+//
+// The second check is not redundant with the first, because the two
+// guard different callers. The pump's check protects the interpreter
+// from invoking a method firmware may have defined for something else.
+// This one protects the STREAM from a routing path that is reachable
+// from anywhere the transport eventually lands — and a byte of 0 arriving
+// here means the caller did not honour the pump's contract, which is a
+// condition worth counting rather than silently doing nothing about.
+//
+// =============================================================================
+// NO PORT I/O, NO INTERRUPT CONTEXT
+// =============================================================================
+//
+// This module contains no `in`/`out` — `tools/build.sh` asserts that port
+// I/O under `core/acpi/` is confined to `gpe_io.o`, and nothing here
+// needs a register. It is also not reachable from the SCI ISR and is not
+// added to `SCI_ISR_ALLOWED`: routing consults the capability table and
+// the stream, which is bounded but is not interrupt work, and the
+// deferral path that already exists (ISR → ring → `acpi_evt_pump` → task
+// context) is where a caller belongs.
+
+module EcRoute = structure {
+
+  // ==========================================================================
+  // Return codes — 0xFFFFFDE0..EF, a band disjoint from every other in
+  // tree (registry_v2 owns 0xFFFFFD0x, and the 0xFFFFFD2x/4x/5x/6x/8x/Ax
+  // blocks are taken; 0xFFFFFDEx is free). Disjointness is what lets a
+  // caller that threads a code up through the stream and the capability
+  // layer still name the gate that refused it.
+  //
+  // A SUCCESSFUL ROUTE RETURNS A COUNT, NOT A CODE. Zero rows routed is
+  // a legitimate success — nobody was subscribed — so the caller must be
+  // able to tell it apart from a refusal, which is what putting the
+  // refusals up at 0xFFFFFDEx and the counts down at 0..8 achieves
+  // without a second return channel.
+  // ==========================================================================
+
+  pub let EC_ROUTE_OK          : u64 = 0
+  pub let EC_ROUTE_BAD_BYTE    : u64 = 0xFFFFFDEF   // query byte >= 256
+  pub let EC_ROUTE_ZERO        : u64 = 0xFFFFFDEE   // query byte == 0
+  pub let EC_ROUTE_BAD_ADDR    : u64 = 0xFFFFFDED   // controller address
+                                                    // outside the EC space
+
+  // The 256-byte EmbeddedControl space (ACPI 6.5 §12.2), which is also
+  // the domain of the query byte.
+  pub let EC_ROUTE_SPACE_MAX : u64 = 256
+
+  // Rows to walk. Mirrors EC_QUERY_MAX in core/cap/kind_ec_query.pdx.
+  // Stated as its own constant so the loop bound is local: a future
+  // change to the table size must be made in both places deliberately
+  // rather than silently truncating the fan-out here, and the witness
+  // asserts a subscription in the LAST row is reachable, which is what
+  // makes a stale bound fail rather than merely under-deliver.
+  pub let EC_ROUTE_ROWS : u64 = 8
+
+  // ==========================================================================
+  // Counters.
+  //
+  //   +0  routed      offers accepted
+  //   +8  filtered    live subscription, unsubscribed from this byte
+  //   +16 unrouted    queries with no subscription for the controller
+  //   +24 refused     matching subscription, offer refused by the stream
+  //   +32 zero        query byte 0 presented for routing
+  //   +40 bad         malformed query byte or controller address
+  //   +48 last_query  the last query byte routing was attempted for
+  //   +56 last_addr   the controller that byte came from
+  // ==========================================================================
+
+  pub let mut _ec_route_state : [u64; 8] = uninit @align(64)
+
+  pub let EC_ROUTE_ST_ROUTED     : u64 = 0
+  pub let EC_ROUTE_ST_FILTERED   : u64 = 1
+  pub let EC_ROUTE_ST_UNROUTED   : u64 = 2
+  pub let EC_ROUTE_ST_REFUSED    : u64 = 3
+  pub let EC_ROUTE_ST_ZERO       : u64 = 4
+  pub let EC_ROUTE_ST_BAD        : u64 = 5
+  pub let EC_ROUTE_ST_LAST_QUERY : u64 = 6
+  pub let EC_ROUTE_ST_LAST_ADDR  : u64 = 7
+
+  // ==========================================================================
+  // ec_route_reset() -> ()
+  // ==========================================================================
+
+  pub let ec_route_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R31.M1-003 (#1091): zero all eight counters. Separate from ec_query_table_reset because the two answer different questions and are cleared at different times: the subscription table is authority state that survives a diagnostic sweep, and these are observations about a window. A single reset covering both would make it impossible to sample a routing episode without destroying the capabilities it routed to. Leaf, a fixed-length store run. Labels prefixed ec_route_r_ per reserved-label discipline.",
+      block: {
+        lea r10, [rip + _ec_route_state];
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rax;
+        mov [r10 + 48], rax;
+        mov [r10 + 56], rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // ec_route_stat(index) -> value
+  // ==========================================================================
+
+  pub let ec_route_stat : (u64) -> u64 !{mem} @{} =
+    fn (index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R31.M1-003 (#1091): bounds-checked counter read; an index >= 8 returns 0 rather than reading past the array. Zero is safe as the out-of-range answer here for the reason acpi_evt_peek's zero is safe: this is an observation channel with no authority behind it, and a caller that asks for a counter that does not exist has learned nothing it could act on. Leaf. Labels prefixed ec_route_s_ per reserved-label discipline.",
+      block: {
+        cmp rdi, 8;
+        jae ec_route_s_zero;
+        lea r10, [rip + _ec_route_state];
+        mov r8, rdi;
+        shl r8, 3;
+        add r8, r10;
+        mov rax, [r8 + 0];
+        ret;
+      ec_route_s_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // ec_route_query(ec_addr, query_byte) -> rows_routed | EC_ROUTE_*
+  //
+  // THE LANDING POINT. Offer one decoded query to every subscription
+  // that asked for it.
+  // ==========================================================================
+
+  pub let ec_route_query : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (ec_addr: u64, query_byte: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R31.M1-003 (#1091): route one decoded embedded-controller query byte to every subscription that still wants it, and return how many the stream accepted. Gates before any walk, in order: (1) query_byte >= 256 -> EC_ROUTE_BAD_BYTE, counted in `bad`; the query byte is one byte on the wire and a wider value is a caller defect, not an event. (2) query_byte == 0 -> EC_ROUTE_ZERO, counted in `zero` and NOTHING ROUTED: QR_EC returning zero means no query is pending, and design/acpi/embedded-controller.md sec 9 refuses to invoke a handler for it in ring 3 for the same reason this refuses to route it. The check is deliberately made in both places because the two guard different callers -- the ring-3 one protects the interpreter from invoking a method firmware defined for something else, this one protects the stream from a caller that did not honour that contract, and a byte of zero arriving here is a condition worth counting rather than silently dropping. (3) ec_addr >= 256 -> EC_ROUTE_BAD_ADDR, counted in `bad`; the EmbeddedControl space is 256 bytes and an address outside it can match no legitimately minted row, so admitting it would let a caller walk the whole table on a value the capability layer already made unrepresentable. The walk is then a BOUNDED loop over EC_ROUTE_ROWS row ids, and every row is asked twice through two different exported selectors: ec_query_row_covers answers 'is this a subscription to this controller', and ec_query_row_target answers 'and does it still want this byte'. Asking twice is what makes `filtered` distinguishable from `unrouted` -- a live subscriber that unsubscribed is the system working as configured, and no subscriber at all is a missing capability, and an operator chasing 'the lid does nothing' needs those apart. Neither selector hands back an address into _ec_query_table, which is what lets tools/build.sh keep asserting that only kind_ec_query.o relocates against it. On a match, acpi_evt_offer(3, endpoint_id, ec_addr, query_byte, row_id) -- source 3 is ACPI_EVT_SRC_EC_QUERY, and the payload carries the controller and the byte so a subscriber can discriminate without a side channel. Acceptance bumps `routed` and the ROW'S OWN delivery counter; refusal bumps `refused` and does NOT bump the row, because a record the stream dropped was not delivered and recording it as delivered would break the only accounting that can detect a subscriber that is being starved. `unrouted` is bumped ONCE PER QUERY and not once per row: it means 'this controller has no subscriber', which is a property of the query, and counting it eight times would make one unrouted lid event look like a storm. Five pushes (rbx, r12, r13, r14, r15): rbx = row index, r12 = ec_addr, r13 = query_byte, r14 = accepted count, r15 = 1 once any row covered this controller. Entry rsp%16 == 8 and five pushes return it to 0 at every one of the three nested calls. Labels prefixed ec_route_q_ per reserved-label discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                    // ec_addr
+        mov r13, rsi;                    // query_byte
+
+        lea r10, [rip + _ec_route_state];
+        mov [r10 + 48], r13;             // last_query
+        mov [r10 + 56], r12;             // last_addr
+
+        // ---- (1) a byte that fits in a byte ----
+        mov r11, 256;                    // EC_ROUTE_SPACE_MAX
+        cmp r13, r11;
+        jae ec_route_q_bad;
+
+        // ---- (2) query zero is not a query ----
+        cmp r13, 0;
+        je  ec_route_q_zero;
+
+        // ---- (3) an address the EC space can hold ----
+        mov r11, 256;
+        cmp r12, r11;
+        jae ec_route_q_bad;
+
+        xor rbx, rbx;                    // row index
+        xor r14, r14;                    // accepted
+        xor r15, r15;                    // any row covered this controller
+
+      ec_route_q_next:
+        mov r11, 8;                      // EC_ROUTE_ROWS
+        cmp rbx, r11;
+        jae ec_route_q_done;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        call ec_query_row_covers;
+        cmp rax, 0;
+        je  ec_route_q_step;
+
+        mov r15, 1;                      // this controller has a subscriber
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        call ec_query_row_target;
+        cmp rax, 0;
+        je  ec_route_q_filtered;
+
+        // A recipient. Offer the record.
+        mov rdi, 3;                      // ACPI_EVT_SRC_EC_QUERY
+        mov rsi, rax;                    // endpoint identity
+        mov rdx, r12;                    // a0 = controller address
+        mov rcx, r13;                    // a1 = query byte
+        mov r8,  rbx;                    // a2 = subscription row
+        call acpi_evt_offer;
+        cmp rax, 0;
+        je  ec_route_q_refused;
+
+        add r14, 1;
+        lea r10, [rip + _ec_route_state];
+        mov rax, [r10 + 0];
+        add rax, 1;
+        mov [r10 + 0], rax;              // routed
+
+        mov rdi, rbx;
+        call ec_query_row_note_delivered;
+        jmp ec_route_q_step;
+
+      ec_route_q_refused:
+        lea r10, [rip + _ec_route_state];
+        mov rax, [r10 + 24];
+        add rax, 1;
+        mov [r10 + 24], rax;             // refused
+        jmp ec_route_q_step;
+
+      ec_route_q_filtered:
+        lea r10, [rip + _ec_route_state];
+        mov rax, [r10 + 8];
+        add rax, 1;
+        mov [r10 + 8], rax;              // filtered
+
+      ec_route_q_step:
+        add rbx, 1;
+        jmp ec_route_q_next;
+
+      ec_route_q_done:
+        cmp r15, 0;
+        jne ec_route_q_out;
+        lea r10, [rip + _ec_route_state];
+        mov rax, [r10 + 16];
+        add rax, 1;
+        mov [r10 + 16], rax;             // unrouted, once per query
+
+      ec_route_q_out:
+        mov rax, r14;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ec_route_q_zero:
+        lea r10, [rip + _ec_route_state];
+        mov rax, [r10 + 32];
+        add rax, 1;
+        mov [r10 + 32], rax;
+        mov rax, 0xFFFFFDEE;             // EC_ROUTE_ZERO
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ec_route_q_bad:
+        lea r10, [rip + _ec_route_state];
+        mov rax, [r10 + 40];
+        add rax, 1;
+        mov [r10 + 40], rax;
+        mov r11, 256;
+        cmp r13, r11;
+        jae ec_route_q_bad_byte;
+        mov rax, 0xFFFFFDED;             // EC_ROUTE_BAD_ADDR
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ec_route_q_bad_byte:
+        mov rax, 0xFFFFFDEF;             // EC_ROUTE_BAD_BYTE
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

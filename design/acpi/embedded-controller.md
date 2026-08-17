@@ -328,6 +328,29 @@ because the property still holds, not because it was relaxed to fit. An
 implementation that acquires the lock and leaks it on the timeout path
 still fails the first equation, exactly as it was going to.
 
+### THE LOCK IS INERT IN A REAL BOOT — #1580
+
+Recorded here in R31.M1 because §7 as written above reads as though the
+protection is live, and it is not.
+
+`src/kernel/acpi/fadt.pdx` declares `FADT_OFFSET_FIRMWARE_CTRL` and never
+dereferences it, so the FACS address is never resolved and the lock word
+at FACS+0x10 has no address. The acpi_supervisor wire schema has no FACS
+field, so nothing could carry that address to this bubble. The PM1
+control port is parsed into `fadt_info` and then dropped, so `GBL_RLS`
+has nowhere to go. **Only the corpus attaches a lock.**
+
+Everything below §7 remains true of the protocol and false of the
+machine. `#1580` tracks the plumbing; R31.M1 declined to take it, on the
+grounds that a half-plumbed lock reads as wired and is still inert, which
+is the failure mode #1580 exists to stop recurring.
+
+The kernel side of the EC path states the same gap in a form a build can
+check: `ec_access_arbitrated()` is pinned at 0 by a boot witness, so the
+commit that closes #1580 breaks the pin and cannot land without rewriting
+every claim that the path is protected. See
+`design/drivers/embedded-controller-kernel-path.md` §0.
+
 ### A refused acquire refuses the transaction
 
 `aml_ec_xact` honours a failed acquire with `AML_EC_XACT_FAIL`. A refusal
@@ -459,6 +482,8 @@ and what the existing #1065 assertions continue to prove.
 | `_REG` notification to the table | needs the supervisor's session plumbing | with the transport |
 | EC ports discovered from `_CRS` | `aml_resource.pdx` decodes them; nothing wires the decode to `aml_ec_attach` yet | the supervisor, with the transport |
 | kernel→userspace event transport | pre-existing gap (§8) | `design/kernel/r30-m4-sci-gpe-path.md` |
+| SMM arbitration in a real boot | the protocol landed; the FACS address and the PM1 control port are still unplumbed | **#1580**, and §7 above |
+| a caller for `aml_ec_query_pump` | R31.M1 built the kernel-side landing point a decoded query routes into (`ec_route_query`), so a query now has somewhere to go; what is still absent is the transport that would call the pump | `design/drivers/embedded-controller-kernel-path.md` §5–6 |
 | A boot fingerprint | this milestone adds no kernel code, so no mode can reach it; the corpus is the witness and it runs in the pre-push matrix | n/a |
 
 The last row is deliberate. `tools/verify-fingerprint-coverage.sh` now
@@ -479,3 +504,7 @@ the pre-push matrix.
   contract this opens.
 - `src/user/aml/aml_ec.pdx` — the implementation.
 - `tests/user/aml/aml_harness.c` — the witnesses.
+- `design/drivers/embedded-controller-kernel-path.md` — the KERNEL half:
+  `KIND_EC_QUERY` (who may subscribe), the transaction gate and its
+  sealed audit record, and the routing of a decoded query into the
+  platform event stream. Read its §0 before relying on §7 above.
