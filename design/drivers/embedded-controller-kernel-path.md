@@ -328,6 +328,22 @@ widen** the transport gap and does not pretend to close it. What it
 removes is a different absence: before it, even with a transport in
 place, a decoded query had nowhere to go.
 
+### What R31.M1-004/005 (#1092/#1093) added on top of this
+
+A query that has somewhere to go still had no **meaning**: nothing in the
+tree could say that `0x2B` is a lid transition and `0x20` is the power
+button, so "route AC insertion to power policy" was inexpressible rather
+than merely unimplemented. `src/kernel/core/acpi/ec_event.pdx` supplies a
+monotone, authority-gated, per-controller byte→class table; `a2` of a
+source-3 record now carries the class rather than the subscription row;
+and a hot-key burst can no longer evict a power-button press from the
+tail-drop ring.
+
+`design/drivers/embedded-controller-events.md` is that design in full —
+including §1, which states plainly that **nothing consumes any of it**,
+and §0, which records that `power_policy_channel` was a name in a roadmap
+document and was deliberately not created.
+
 ---
 
 ## 7. Mutation results
@@ -360,6 +376,10 @@ arbitrated" is not prose — a change that contradicts it fails the build.
 - `design/acpi/embedded-controller.md` — the ring-3 half; §2 for why this
   device gets more care than the rest of R30, §4 for the reentrancy
   decision, §6.1 for the three in-bubble range checks, §9 for query zero.
+- `design/drivers/embedded-controller-events.md` — R31.M1-004/005: what a
+  query byte means, why `power_policy_channel` was not created, the
+  hot-key/power-button priority inversion, and the plain statement that
+  nothing consumes any of it.
 - `design/acpi/global-lock.md` — the protocol #1580 must reach.
 - `design/acpi/no-aml-in-kernel.md` — why the interpreter is not here.
 - `design/kernel/r30-m4-sci-gpe-path.md` — the deferral path and the

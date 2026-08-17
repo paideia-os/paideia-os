@@ -484,6 +484,8 @@ and what the existing #1065 assertions continue to prove.
 | kernel→userspace event transport | pre-existing gap (§8) | `design/kernel/r30-m4-sci-gpe-path.md` |
 | SMM arbitration in a real boot | the protocol landed; the FACS address and the PM1 control port are still unplumbed | **#1580**, and §7 above |
 | a caller for `aml_ec_query_pump` | R31.M1 built the kernel-side landing point a decoded query routes into (`ec_route_query`), so a query now has somewhere to go; what is still absent is the transport that would call the pump | `design/drivers/embedded-controller-kernel-path.md` §5–6 |
+| a meaning for each `_Qxx` byte in a real boot | R31.M1-004 (#1092) built the table, the authority gate and the monotonicity invariant; nothing in a real boot installs an entry, because deriving "0x2B is the lid" means evaluating the method's body and that is ring-3 work with no caller yet | `design/drivers/embedded-controller-events.md` §2 |
+| a consumer that ACTS on a lid close or a power press | none exists anywhere; the routing, classification, admission and per-class loss accounting are all witnessed by a boot fixture and read by nothing else | `design/drivers/embedded-controller-events.md` §1 |
 | A boot fingerprint | this milestone adds no kernel code, so no mode can reach it; the corpus is the witness and it runs in the pre-push matrix | n/a |
 
 The last row is deliberate. `tools/verify-fingerprint-coverage.sh` now

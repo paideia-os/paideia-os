@@ -1296,9 +1296,9 @@ echo "[gpio-pin-confine] pad driver and interrupt-register helpers take no"
 echo "[gpio-pin-confine] caller-supplied pin, community or pad"
 
 # =============================================================================
-# R31.M1-001/002/003 (#1089/#1090/#1091): THE EMBEDDED-CONTROLLER PATH.
+# R31.M1-001/002/003/004/005 (#1089..#1093): THE EMBEDDED-CONTROLLER PATH.
 #
-# Three private tables, each with exactly one legitimate writer, and the
+# Six private tables, each with exactly one legitimate writer, and the
 # arity pins that make "act on a controller other than the one my
 # capability names" unexpressible rather than merely refused.
 #
@@ -1343,6 +1343,17 @@ ec_confine_one '_ec_query_table'  'core/cap/kind_ec_query.o'
 ec_confine_one '_ec_access_state' 'core/drivers/ec/ec_access.o'
 # The router's own accounting.
 ec_confine_one '_ec_route_state'  'core/acpi/ec_route.o'
+# R31.M1-004/005 (#1092/#1093): the byte-to-class meaning table, its
+# binding, and the per-class counters. The map is the most consequential
+# of the four to confine: it is what decides whether an event may be shed
+# under pressure and which counter a loss lands in, so a second writer
+# could reclassify the power button as a droppable hot-key with no
+# capability involved and no counter moving. core/acpi/ec_route.o and
+# core/cap/kind_ec_query.o both READ it, and both do so through
+# ec_event_class_of, which is what keeps this assertion satisfiable.
+ec_confine_one '_ec_evt_map'      'core/acpi/ec_event.o'
+ec_confine_one '_ec_evt_owner'    'core/acpi/ec_event.o'
+ec_confine_one '_ec_evt_stats'    'core/acpi/ec_event.o'
 if [[ "${EC_CONFINE_OK}" -ne 1 ]]; then
     echo "  See src/kernel/core/cap/kind_ec_query.pdx and" >&2
     echo "  src/kernel/core/drivers/ec/ec_access.pdx for why each of these has" >&2
@@ -1367,8 +1378,19 @@ echo "[ec-confine] subscription rows, transaction gate and router state confined
 # subscription rows without an address into the table crossing a module
 # boundary. Widening it to hand back a row address would satisfy every
 # other check here and quietly void the confinement assertion above.
+#
+# R31.M1-004 (#1092) adds ec_event_map_bind, which is ec_access_bind's
+# twin and load-bearing for the same reason: it takes ONE capability slot
+# and inherits the controller address from the region row behind it. A
+# second parameter would let a caller attach one machine's event meanings
+# to a controller the capability never named, and every classification
+# thereafter would be confidently wrong -- a lid event labelled as a
+# hot-key is then shed under load, which is the one drop this path is
+# built to make impossible.
 EC_QUERY_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_ec_query.pdx"
 EC_ACCESS_SRC="${REPO_ROOT}/src/kernel/core/drivers/ec/ec_access.pdx"
+EC_EVENT_SRC="${REPO_ROOT}/src/kernel/core/acpi/ec_event.pdx"
+EVT_STREAM_SRC="${REPO_ROOT}/src/kernel/core/acpi/evt_stream.pdx"
 ec_pin_one() {
     local src="$1" decl="$2"
     if ! grep -qF -- "${decl}" "${src}"; then
@@ -1393,7 +1415,21 @@ ec_pin_one "${EC_ACCESS_SRC}" 'pub let ec_access_arbitrated : () -> u64'
 ec_pin_one "${EC_QUERY_SRC}"  'pub let ec_query_row_addr : (u64) -> u64'
 ec_pin_one "${EC_QUERY_SRC}"  'pub let ec_query_row_target : (u64, u64, u64) -> u64'
 ec_pin_one "${EC_QUERY_SRC}"  'pub let ec_query_row_narrow : (u64, u64) -> u64'
-echo "[ec-confine] bind, extent and routing-selector arities pinned"
+ec_pin_one "${EC_EVENT_SRC}"  'pub let ec_event_map_bind : (u64) -> u64'
+ec_pin_one "${EC_EVENT_SRC}"  'pub let ec_event_class_of : (u64, u64) -> u64'
+ec_pin_one "${EC_EVENT_SRC}"  'pub let ec_event_admit : (u64) -> u64'
+ec_pin_one "${EC_QUERY_SRC}"  'pub let ec_query_row_class : (u64, u64) -> u64'
+# acpi_evt_offer's arity, pinned here because R31.M1-005 (#1093) made the
+# meaning of its fifth argument load-bearing for the class of a platform
+# event. It has five call sites, every one of them setting argument
+# registers by hand, and NOTHING in this file checked its shape before
+# now: a sixth parameter added without touching all five would leave a
+# call site passing whatever it happened to leave in r9 as an event class,
+# which is a silent-failure surface rather than a build failure. #1093
+# declined to add that sixth parameter for exactly this reason and pinned
+# the arity so the next attempt is loud instead.
+ec_pin_one "${EVT_STREAM_SRC}" 'pub let acpi_evt_offer : (u64, u64, u64, u64, u64) -> u64'
+echo "[ec-confine] bind, extent, routing-selector and offer arities pinned"
 
 # THE MONOTONE BITMAP. ec_query_row_narrow is the ONLY function in the
 # tree that mutates a notify bitmap, and it can only clear a bit. A
@@ -1415,6 +1451,32 @@ if grep -qE 'ec_query_row_(widen|subscribe|set_bit)' "${EC_QUERY_SRC}"; then
     exit 1
 fi
 echo "[ec-confine] notify bitmap has no widening primitive"
+
+# THE MONOTONE MEANING TABLE — the notify bitmap's mirror image. That one
+# starts FULL and only narrows; this one starts EMPTY and only fills, and
+# an entry that has a meaning cannot acquire a different one while the map
+# is bound. ec_event_map_set is the only per-entry writer and it REFUSES a
+# change of meaning; the only wholesale clears are ec_event_reset and
+# ec_event_map_unbind, neither of which is a per-entry operation.
+#
+# What a demotion primitive would cost: every downstream decision on this
+# path is taken from the class -- whether the event may be shed under
+# pressure, which counter a loss lands in, what a subscriber does when it
+# arrives -- so a byte silently remapped from POWER to HOTKEY turns a
+# power-button press into a droppable Fn key, and there is no symptom
+# until somebody's machine will not turn off.
+#
+# The same weaker-than-a-pin grep, for the same reason: the natural name
+# for the mutant is the one being searched for.
+if grep -qE 'ec_event_(remap|unmap|map_clear|map_override|map_force)' "${EC_EVENT_SRC}"; then
+    echo "[ec-confine] FAIL - a demotion primitive was added to the query-byte" >&2
+    echo "  meaning table. It starts empty and only ever fills, and an installed" >&2
+    echo "  meaning cannot change while the map is bound; see" >&2
+    echo "  src/kernel/core/acpi/ec_event.pdx §3" >&2
+    echo "  A BYTE THAT MEANS POWER MUST NOT LATER MEAN HOTKEY." >&2
+    exit 1
+fi
+echo "[ec-confine] query-byte meaning table has no demotion primitive"
 
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )

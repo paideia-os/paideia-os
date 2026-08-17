@@ -138,6 +138,7 @@ This section covers **twelve rounds**, ~230 issues, ~80 milestones, targeting ex
 
 **IPC schemas.**
 - `power_policy_channel : Channel(PowerPolicySchema)` — bidirectional; `power_policy` server publishes profile (balanced/perf/save), consumers (drivers) subscribe.
+  - **R31.M1 (#1092) did NOT create this channel, deliberately.** Platform events from the embedded controller — AC presence, lid, power button, hot-keys — travel the existing `acpi_evt_offer` path with `ACPI_EVT_SRC_EC_QUERY` and a class in the record, because a second channel carrying a subset of the same events would break the stream's gapless-sequence property, which is the only thing that makes a lost platform event localisable. See `design/drivers/embedded-controller-events.md` §0. If a `power_policy` *server* is ever written, it should be a consumer of that stream, not a second transport.
 - `thermal_channel : Channel(ThermalSchema)` — stream `{trip_crossed, zone_temp_read}`; effect row `!{thermal_read, thermal_trip}`.
 - `battery_channel : Channel(BatterySchema)` — stream `{state_changed, low_warning}` + RPC `read_state`.
 - `backlight_channel : Channel(BacklightSchema)` — RPC `{get, set, get_range}`; **critical**: the backlight cap is granted to the compositor, **not** to arbitrary clients. Compositor is the only surface that decides what "50%" means to the user.
