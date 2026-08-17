@@ -337,14 +337,19 @@ case "${EXPECTED}" in
         # `qemu` exits with ACPI shutdown handshake — is deferred to
         # a later issue that lands the ACPI shutdown path; here we
         # assert the observable init side of the chain.
+        #
+        # R31.M5-001 (#1106) bumped this from 12s to 15s: the backlight
+        # witness adds one more cluster (KIND_BACKLIGHT OK + BACKLIGHT
+        # SCALE OK) plus its debug-print pass, which slid the tail of
+        # the sequence past the previous 12s bound.
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/r17/shell-shutdown.golden"
-        TIMEOUT=12
+        TIMEOUT=15
         UART_RX_MODE=1
         : "${INJECT_STRING:=exit\n}"
         : "${INJECT_WAIT_FOR:=SHELL START}"
         : "${INJECT_DELAY:=0.3}"
-        : "${INJECT_HOLD:=10}"
+        : "${INJECT_HOLD:=13}"
         EXPECTED=""
         ;;
     boot_smp)

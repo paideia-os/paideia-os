@@ -1918,6 +1918,92 @@ fi
 echo "[cooling-confine] no static-identity-mutating primitive"
 
 # ---------------------------------------------------------------------------
+# R31.M5-001 (#1106): THE BACKLIGHT PATH.
+#
+# Same shape as the cooling, battery and thermal-zone checks above. Two
+# claims:
+#
+# (a) _backlight_table is the only place in the kernel where a
+#     brightness_max lives. A second writer could raise or lower it
+#     with no capability involved and no refusal recorded, and every
+#     future policy decision for that panel would then be taken
+#     against a range the firmware never advertised.
+#     _backlight_stats is confined for the weaker but adjacent reason
+#     ec_event's, thermal_zone's, battery's and cooling's counters
+#     are: they are the only evidence that a panel's reports are
+#     being refused as implausible, and evidence a second object can
+#     write is not evidence.
+#
+# (b) Arity pins. The static identity (brightness_max, backend,
+#     index) comes from the ROW, so the slot-arity-one resolvers
+#     take a capability and nothing else. `max_of_slot(slot, scale)`
+#     is how the advertised range of a panel silently widens or
+#     shrinks; refused by the pinned signature.
+#     backlight_report_install pins at ARITY TWO: a third argument
+#     would be a caller-supplied brightness_max or index reaching a
+#     row §1 declares set-once at mint.
+BACKLIGHT_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_backlight.pdx"
+if [[ ! -f "${BACKLIGHT_SRC}" ]]; then
+    echo "[backlight-confine] FAIL - ${BACKLIGHT_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_backlight_table' 'core/cap/kind_backlight.o'
+ec_confine_one '_backlight_stats' 'core/cap/kind_backlight.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/cap/kind_backlight.pdx §1 for why the" >&2
+    echo "  row table has exactly one writer." >&2
+    exit 1
+fi
+echo "[backlight-confine] backlight rows and controller counters confined"
+
+bl_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${BACKLIGHT_SRC}"; then
+        echo "[backlight-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A BACKLIGHT BRIGHTNESS_MAX, BACKEND AND INDEX COME FROM THE" >&2
+        echo "  CAPABILITY'S OWN ROW AND NEVER FROM A CALLER. An extra" >&2
+        echo "  parameter on any of these makes 'report against a panel other" >&2
+        echo "  than the one my capability names' expressible, and the two" >&2
+        echo "  ways that goes wrong are a panel silently pinned at maximum" >&2
+        echo "  intensity and one dropped to unreadable dimness. If a" >&2
+        echo "  signature legitimately changed, the confinement argument in" >&2
+        echo "  src/kernel/core/cap/kind_backlight.pdx §1 must be rewritten" >&2
+        echo "  first." >&2
+        exit 1
+    fi
+}
+bl_pin_one 'pub let backlight_max_of_slot : (u64) -> u64'
+bl_pin_one 'pub let backlight_current_of_slot : (u64) -> u64'
+bl_pin_one 'pub let backlight_backend_of_slot : (u64) -> u64'
+bl_pin_one 'pub let backlight_row_of_slot : (u64) -> u64'
+bl_pin_one 'pub let backlight_row_max : (u64) -> u64'
+bl_pin_one 'pub let backlight_report_install : (u64, u64) -> u64'
+bl_pin_one 'pub let backlight_backend_valid : (u64) -> u64'
+echo "[backlight-confine] static-identity resolvers, report installer and backend validator arities pinned"
+
+# A BRIGHTNESS_MAX THAT CAN BE CHANGED IS NOT A CONTROL SURFACE. The
+# natural names for the mutant are searched for so a contributor adding
+# one gets told why it must not exist at the moment of adding it rather
+# than in review — the same shape as the cooling static-identity-mutant
+# grep.
+if grep -qE 'backlight_(set_max|max_set|raise_max|lower_max|max_override|set_min|min_set|set_backend|backend_set|set_index)' "${BACKLIGHT_SRC}"; then
+    echo "[backlight-confine] FAIL - a static-identity-mutating primitive was" >&2
+    echo "  added to the backlight kind." >&2
+    echo "" >&2
+    echo "  brightness_min, brightness_max, backend and index are set once," >&2
+    echo "  by the mint, and there is no primitive that changes them; see" >&2
+    echo "  src/kernel/core/cap/kind_backlight.pdx §1." >&2
+    echo "  A BRIGHTNESS_MAX THAT CAN BE RAISED WOULD WIDEN A PANEL'S" >&2
+    echo "  ADVERTISED RANGE PAST WHAT THE FIRMWARE APPROVED; ONE THAT" >&2
+    echo "  CAN BE LOWERED WOULD MAKE THE PANEL'S USABLE PEAK BRIGHTNESS" >&2
+    echo "  UNREACHABLE." >&2
+    exit 1
+fi
+echo "[backlight-confine] no static-identity-mutating primitive"
+
+# ---------------------------------------------------------------------------
 # R31.M3-002 (#1100): BATTERY CHANNEL SCHEMA ARITY PINS.
 #
 # The schema has no storage of its own -- it is pure pack/unpack -- so
