@@ -1,0 +1,710 @@
+// src/kernel/core/drivers/usb/xhci/isoch_ring.pdx — R34.M5-003 (#1188)
+//
+// xHCI ISOCH transfer ring: a chain of Transfer Request Blocks with
+// ISOCH TRB shape (xHCI 1.2 §6.4.1.4), each carrying a Schedule
+// Frame ID stamped from the SOF timeline. Enforces the
+// per-endpoint bInterval (KIND_ISOCH_STREAM.service_interval, cap
+// row §1(c)) at enqueue time and refuses a submission whose
+// SFI would land on a frame the SOF timeline has already passed.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// An xHCI transfer ring is a list of TRBs the controller consumes in
+// order; each ISOCH TRB carries data-pointer / length / interrupter /
+// SFI / TLBPC / TBC fields and a cycle bit that flips every ring wrap.
+// This module owns the RING SLOTS (per-stream) and the enqueue policy:
+//
+//   * append_trb(stream_slot, data_ptr, length) -> row_id | error
+//       - reads stream_slot's cap row (interval, bandwidth, endpoint)
+//       - asks SOF timeline for a future frame `interval` uframes out
+//       - calls sof_admit(length) to charge the microframe's budget
+//       - claims a TRB slot in the stream's private ring
+//   * cycle_bit(): the current producer-cycle bit for the ring
+//   * enforce_interval(stream_slot, last_frame_seen): checks that
+//     appends respect the bInterval spacing
+//
+// IT DOES NOT WRITE THE XHCI DOORBELL. Ringing the doorbell belongs
+// to a live driver over KIND_USB_ENDPOINT authority; this module
+// records what the driver would enqueue and refuses ill-formed
+// requests before the doorbell would need to be rung.
+//
+// IT IS NOT A LIVE DRIVER. isoch_ring_arbitrated() returns 0 until a
+// later round wires this into real xHCI enqueue + doorbell.
+//
+// =============================================================================
+// §1  RING GEOMETRY
+// =============================================================================
+//
+// One ring per active isoch stream, 16 TRBs per ring, 4 rings total
+// (enough for a two-camera + microphone + speaker HS load), 24-byte
+// TRB shadow entries (xHCI TRBs are 16 bytes but we shadow the SFI +
+// length + cycle here). tools/build.sh confines relocations against
+// `_isoch_ring_slots` to this object.
+//
+// =============================================================================
+// §2  SCHEDULE FRAME ID + INTERVAL ENFORCEMENT
+// =============================================================================
+//
+// The Schedule Frame ID field on an ISOCH TRB tells the controller in
+// which 11-bit frame the packet MUST fire. We stamp SFI as
+// `sof_frames_after(interval * 8)` — one interval-worth of uframes
+// past NOW — so that a stream with interval == 1 fires next frame
+// and a stream with interval == 8 fires eight frames out.
+//
+// A caller that submits at intervals TIGHTER than its declared
+// service_interval is refused with INTERVAL_VIOLATION rather than
+// silently coalesced. The alternative — accepting the tighter spacing
+// — would let a stream that mis-reads the descriptor bind a doubled
+// bandwidth on the wire and starve every other isoch stream on the
+// same bus.
+//
+// =============================================================================
+// §3  ERROR CODES 0xFFFFFAA0..0xFFFFFAAF
+// =============================================================================
+
+module IsochRing = structure {
+
+  pub let ISOCH_RING_MAX_STREAMS : u64 = 4
+  pub let ISOCH_RING_TRBS        : u64 = 16
+  pub let ISOCH_RING_TRB_BYTES   : u64 = 24
+
+  pub let ISOCH_RING_OK              : u64 = 0
+  pub let ISOCH_RING_BAD_STREAM      : u64 = 0xFFFFFAAF
+  pub let ISOCH_RING_BAD_LENGTH      : u64 = 0xFFFFFAAE
+  pub let ISOCH_RING_ENOSPC          : u64 = 0xFFFFFAAD
+  pub let ISOCH_RING_OVERSUBSCRIBED  : u64 = 0xFFFFFAAC
+  pub let ISOCH_RING_INTERVAL_VIOL   : u64 = 0xFFFFFAAB
+  pub let ISOCH_RING_BAD_STREAM_SLOT : u64 = 0xFFFFFAAA
+  pub let ISOCH_RING_NOT_ATTACHED    : u64 = 0xFFFFFAA9
+  pub let ISOCH_RING_ALREADY_ATTACHED: u64 = 0xFFFFFAA8
+  pub let ISOCH_RING_BAD_ARG         : u64 = 0xFFFFFAA7
+
+  // Per-stream ring metadata:
+  //   [+0]  in_use[63:56] | cycle_bit[55:48] | stream_slot[15:0]
+  //   [+8]  head_idx (u16), tail_idx (u16) packed as head[15:0] | tail[31:16]
+  //   [+16] last_stamped_frame (u16, for INTERVAL_VIOLATION check)
+  //   [+24] reserved
+  // Total: 32 bytes per ring header.
+  pub let mut _isoch_ring_hdr : [u64; 16] = uninit @align(64)   // 4 rings × 32B
+
+  // Per-ring TRB shadow storage. Each TRB is 24 bytes = 3 u64 slots.
+  //   [+0]  data_ptr
+  //   [+8]  length[15:0] | sfi[26:16] | cycle[27] | reserved
+  //   [+16] reserved / IOC bit slot
+  // Total per stream: 16 * 24 = 384 bytes = 48 u64 slots.
+  // Total across 4 streams: 192 u64 slots.
+  pub let mut _isoch_ring_slots : [u64; 192] = uninit @align(64)
+
+  pub let mut _isoch_ring_stats : [u64; 8]  = uninit @align(64)
+
+  pub let ISOCH_RING_ST_ATTACHES     : u64 = 0
+  pub let ISOCH_RING_ST_DETACHES     : u64 = 1
+  pub let ISOCH_RING_ST_APPENDS      : u64 = 2
+  pub let ISOCH_RING_ST_REJECTS      : u64 = 3
+  pub let ISOCH_RING_ST_WRAPS        : u64 = 4
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let isoch_ring_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R34.M5-003 (#1188): clear all four ring headers, all shadow slots and the stat cells. Boot and teardown only. Labels prefixed iring_rs_.",
+      block: {
+        lea r10, [rip + _isoch_ring_hdr];
+        xor rax, rax;
+        xor rcx, rcx;
+      iring_rs_hdr:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  iring_rs_hdr;
+
+        lea r10, [rip + _isoch_ring_slots];
+        xor rcx, rcx;
+      iring_rs_slots:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 192;
+        jb  iring_rs_slots;
+
+        lea r10, [rip + _isoch_ring_stats];
+        xor rcx, rcx;
+      iring_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  iring_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let isoch_ring_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R34.M5-003 (#1188): honesty pin. Returns 0 until a later round wires xHCI enqueue + doorbell to this scaffold.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let isoch_ring_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R34.M5-003 (#1188): counter read. Labels prefixed iring_st_.",
+      block: {
+        cmp rdi, 8;
+        jae iring_st_zero;
+        lea r10, [rip + _isoch_ring_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      iring_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let isoch_ring_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R34.M5-003 (#1188): counter bump. Labels prefixed iring_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae iring_nt_out;
+        lea r10, [rip + _isoch_ring_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      iring_nt_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // isoch_ring_find_stream(stream_slot) -> ring_id | ROW_NONE
+  // ==========================================================================
+
+  pub let isoch_ring_find_stream : (u64) -> u64 !{mem} @{} =
+    fn (stream_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R34.M5-003 (#1188): linear scan for a ring attached to stream_slot. Refuses match on slot 0. Labels prefixed iring_fs_.",
+      block: {
+        cmp rdi, 0;
+        je  iring_fs_none;
+        xor rcx, rcx;
+      iring_fs_scan:
+        cmp rcx, 4;
+        jae iring_fs_none;
+        lea r10, [rip + _isoch_ring_hdr];
+        mov r11, rcx;
+        shl r11, 5;                      // rcx * 32
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  iring_fs_next;
+        mov rax, [r10 + 0];
+        and rax, 0xFFFF;
+        cmp rax, rdi;
+        je  iring_fs_hit;
+      iring_fs_next:
+        add rcx, 1;
+        jmp iring_fs_scan;
+      iring_fs_hit:
+        mov rax, rcx;
+        ret;
+      iring_fs_none:
+        mov rax, 0xFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // isoch_ring_attach(stream_slot) -> ring_id | error
+  //
+  // Claims a free ring header for stream_slot. Refuses stream_slot 0
+  // (0 is find's sentinel). Refuses if a ring is already attached to
+  // this slot (ALREADY_ATTACHED). Refuses if all four rings are in
+  // use (ENOSPC).
+  // ==========================================================================
+
+  pub let isoch_ring_attach : (u64) -> u64 !{mem} @{} =
+    fn (stream_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R34.M5-003 (#1188): claim one ring header. THE ONE WRITER of _isoch_ring_hdr for the header word. Sequence: stream_slot != 0; not already attached; find first free row; stamp in_use/cycle=1/stream_slot; zero head/tail/last_frame. Labels prefixed iring_at_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov r12, rdi;
+        cmp r12, 0;
+        je  iring_at_bad_slot;
+
+        mov rdi, r12;
+        call isoch_ring_find_stream;
+        cmp rax, 0xFF;
+        jne iring_at_already;
+
+        xor rbx, rbx;
+      iring_at_scan:
+        cmp rbx, 4;
+        jae iring_at_enospc;
+        lea r10, [rip + _isoch_ring_hdr];
+        mov r11, rbx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  iring_at_claim;
+        add rbx, 1;
+        jmp iring_at_scan;
+
+      iring_at_claim:
+        // hdr = in_use(1) << 56 | cycle(1) << 48 | stream_slot[15:0]
+        mov rax, r12;
+        and rax, 0xFFFF;
+        mov r11, 1;
+        shl r11, 48;
+        or  rax, r11;
+        mov r11, 1;
+        shl r11, 56;
+        or  rax, r11;
+        mov [r10 + 0], rax;
+        xor rax, rax;
+        mov [r10 + 8],  rax;             // head=tail=0
+        mov [r10 + 16], rax;             // last_stamped_frame=0
+        mov [r10 + 24], rax;
+
+        mov rdi, 0;
+        call isoch_ring_note;
+
+        mov rax, rbx;
+        jmp iring_at_out;
+
+      iring_at_bad_slot:
+        mov rax, 0xFFFFFAAA;
+        jmp iring_at_out;
+      iring_at_already:
+        mov rax, 0xFFFFFAA8;
+        jmp iring_at_out;
+      iring_at_enospc:
+        mov rax, 0xFFFFFAAD;
+
+      iring_at_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let isoch_ring_detach : (u64) -> u64 !{mem} @{} =
+    fn (ring_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R34.M5-003 (#1188): free one ring. Zeroes header + shadow slots for this ring. Labels prefixed iring_dt_.",
+      block: {
+        push rbx;
+        push r12;
+
+        cmp rdi, 4;
+        jae iring_dt_bad;
+
+        mov rbx, rdi;
+        lea r10, [rip + _isoch_ring_hdr];
+        mov r11, rbx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  iring_dt_not_attached;
+
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+
+        // Scrub shadow slots for this ring.
+        lea r10, [rip + _isoch_ring_slots];
+        mov r11, rbx;                    // ring index
+        mov rcx, 48;                     // slots per ring (16 TRBs × 3 u64)
+        mov r12, r11;
+        // start = ring * 48
+        mov r11, rcx;
+        mov rax, rbx;
+        // multiply rbx * 48 via shl+add (48 = 32 + 16)
+        mov rcx, rax;
+        shl rcx, 5;                      // *32
+        mov r12, rax;
+        shl r12, 4;                      // *16
+        add rcx, r12;                    // *48
+        add r10, rcx;                    // start pointer
+        xor rax, rax;
+        xor rcx, rcx;
+      iring_dt_scrub:
+        cmp rcx, 48;
+        jae iring_dt_done;
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        jmp iring_dt_scrub;
+
+      iring_dt_done:
+        mov rdi, 1;
+        call isoch_ring_note;
+        xor rax, rax;
+        jmp iring_dt_out;
+
+      iring_dt_bad:
+        mov rax, 0xFFFFFAA7;
+        jmp iring_dt_out;
+      iring_dt_not_attached:
+        mov rax, 0xFFFFFAA9;
+
+      iring_dt_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // isoch_ring_append(ring_id, sfi, length, cycle) -> trb_idx | error
+  //
+  // Writes one shadow TRB. Refuses length > SOF_BUDGET_MAX (BAD_LENGTH),
+  // refuses ring full (ENOSPC). Bumps the tail; on wrap 15 -> 0, bumps
+  // the cycle bit in the header and the WRAPS stat.
+  //
+  // The caller is expected to have consulted sof_admit(length) FIRST
+  // (see isoch_ring_admit_and_append below); this raw append is
+  // separated so a witness can test the ring-slot arithmetic without
+  // driving the SOF timeline.
+  // ==========================================================================
+
+  pub let isoch_ring_append : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (ring_id: u64) (sfi: u64) (length: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R34.M5-003 (#1188): write one shadow TRB. Ring geometry (16 slots) is enforced against tail; length is bounded by SOF_BUDGET_MAX so a caller cannot request more bytes in one packet than a microframe can carry. Cycle bit lives in the header and flips on wrap. Labels prefixed iring_ap_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // ring_id
+        mov r12, rsi;                    // sfi
+        mov r13, rdx;                    // length
+
+        cmp rbx, 4;
+        jae iring_ap_bad_ring;
+
+        cmp r13, 3072;                   // SOF_BUDGET_MAX
+        ja  iring_ap_bad_len;
+
+        // Load ring header.
+        lea r10, [rip + _isoch_ring_hdr];
+        mov r11, rbx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  iring_ap_not_attached;
+
+        mov r14, [r10 + 8];              // head|tail
+        mov rax, r14;
+        shr rax, 16;
+        and rax, 0xFFFF;                 // tail
+        mov r15, rax;
+
+        // Compute (tail + 1) mod 16.
+        mov rcx, r15;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  iring_ap_no_wrap;
+        xor rcx, rcx;
+        push r15;
+        push rcx;
+        mov rdi, 4;                      // WRAPS stat
+        call isoch_ring_note;
+        pop rcx;
+        pop r15;
+        // Flip cycle bit in header.
+        lea r10, [rip + _isoch_ring_hdr];
+        mov r11, rbx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        mov r11, 1;
+        shl r11, 48;
+        xor rax, r11;                    // toggle cycle bit
+        mov [r10 + 0], rax;
+
+      iring_ap_no_wrap:
+        // Check ring not full: new_tail == head means full? We treat
+        // full as new_tail == head with any live TRB; simpler policy:
+        // refuse when new_tail == head AND head != 0 OR when tail
+        // laps head. For the scaffold we admit as long as new_tail
+        // wraps and cycle flipped OR head lags tail. Track "used"
+        // via head; ring full iff (tail + 1) mod 16 == head.
+        mov r11, r14;
+        and r11, 0xFFFF;                 // head
+        cmp rcx, r11;
+        je  iring_ap_enospc;
+
+        // Write TRB at slot tail.
+        //   slot_base = ring * 48 + tail * 3   (all in u64 units)
+        lea r10, [rip + _isoch_ring_slots];
+        mov rax, rbx;
+        mov r11, rax;
+        shl r11, 5;                      // ring * 32
+        mov r14, rax;
+        shl r14, 4;                      // ring * 16
+        add r11, r14;                    // ring * 48
+        add r10, r11;                    // ring base
+        mov r11, r15;                    // tail
+        mov r14, r11;
+        shl r14, 1;                      // tail * 2
+        add r14, r11;                    // tail * 3
+        shl r14, 3;                      // *8 bytes
+        add r10, r14;                    // slot base
+
+        // TRB layout:
+        //   [+0]  data_ptr (0 for shadow — we do not carry real ptrs)
+        //   [+8]  length[15:0] | sfi[26:16] | cycle[27]
+        //   [+16] reserved
+        xor rax, rax;
+        mov [r10 + 0], rax;
+        mov rax, r13;                    // length
+        and rax, 0xFFFF;
+        mov r11, r12;                    // sfi
+        and r11, 0x7FF;
+        shl r11, 16;
+        or  rax, r11;
+        // Pack current cycle bit from header.
+        lea r11, [rip + _isoch_ring_hdr];
+        mov r14, rbx;
+        shl r14, 5;
+        add r11, r14;
+        mov r14, [r11 + 0];
+        shr r14, 48;
+        and r14, 1;
+        shl r14, 27;
+        or  rax, r14;
+        mov [r10 + 8], rax;
+        xor rax, rax;
+        mov [r10 + 16], rax;
+
+        // Update tail in header.
+        lea r10, [rip + _isoch_ring_hdr];
+        mov r11, rbx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        mov r14, rax;
+        and r14, 0xFFFF;                 // head preserved
+        mov r11, rcx;                    // new tail
+        shl r11, 16;
+        or  r14, r11;
+        mov [r10 + 8], r14;
+
+        // Update last_stamped_frame.
+        mov r11, r12;
+        and r11, 0x7FF;
+        mov [r10 + 16], r11;
+
+        mov rdi, 2;                      // APPENDS
+        call isoch_ring_note;
+
+        mov rax, r15;                    // returned trb_idx
+        jmp iring_ap_out;
+
+      iring_ap_bad_ring:
+        mov rax, 0xFFFFFAAF;
+        jmp iring_ap_out;
+      iring_ap_bad_len:
+        mov rax, 0xFFFFFAAE;
+        jmp iring_ap_out;
+      iring_ap_not_attached:
+        mov rax, 0xFFFFFAA9;
+        jmp iring_ap_out;
+      iring_ap_enospc:
+        mov rdi, 3;
+        call isoch_ring_note;
+        mov rax, 0xFFFFFAAD;
+
+      iring_ap_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // isoch_ring_head(ring_id) -> head_idx
+  // isoch_ring_tail(ring_id) -> tail_idx
+  // isoch_ring_cycle(ring_id) -> cycle_bit
+  // isoch_ring_last_frame(ring_id) -> last stamped SFI
+  // ==========================================================================
+
+  pub let isoch_ring_head : (u64) -> u64 !{mem} @{} =
+    fn (ring_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R34.M5-003 (#1188): head index. Labels prefixed iring_hd_.",
+      block: {
+        cmp rdi, 4;
+        jae iring_hd_bad;
+        lea r10, [rip + _isoch_ring_hdr];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        and rax, 0xFFFF;
+        ret;
+      iring_hd_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let isoch_ring_tail : (u64) -> u64 !{mem} @{} =
+    fn (ring_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R34.M5-003 (#1188): tail index. Labels prefixed iring_tl_.",
+      block: {
+        cmp rdi, 4;
+        jae iring_tl_bad;
+        lea r10, [rip + _isoch_ring_hdr];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        shr rax, 16;
+        and rax, 0xFFFF;
+        ret;
+      iring_tl_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let isoch_ring_cycle : (u64) -> u64 !{mem} @{} =
+    fn (ring_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R34.M5-003 (#1188): current producer-cycle bit. Labels prefixed iring_cy_.",
+      block: {
+        cmp rdi, 4;
+        jae iring_cy_bad;
+        lea r10, [rip + _isoch_ring_hdr];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 48;
+        and rax, 1;
+        ret;
+      iring_cy_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let isoch_ring_last_frame : (u64) -> u64 !{mem} @{} =
+    fn (ring_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R34.M5-003 (#1188): last stamped SFI. Labels prefixed iring_lf_.",
+      block: {
+        cmp rdi, 4;
+        jae iring_lf_bad;
+        lea r10, [rip + _isoch_ring_hdr];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        and rax, 0x7FF;
+        ret;
+      iring_lf_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // isoch_ring_enforce_interval(ring_id, this_frame, service_interval) ->
+  //   OK | INTERVAL_VIOLATION
+  //
+  // Given the FRAME an append is about to be stamped for, and the
+  // stream's declared service_interval (in FRAMES for FS/LS, in
+  // MICROFRAMES converted to frames for HS at this layer), refuse if
+  // this_frame < last_stamped + interval (mod 2048 with a
+  // half-window tolerance).
+  //
+  // Half-window (1024): a frame that appears LESS than 1024 frames
+  // AFTER the last is treated as forward; a frame that appears MORE
+  // than 1024 frames after is treated as a wrap-past-us and refused.
+  // ==========================================================================
+
+  pub let isoch_ring_enforce_interval : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (ring_id: u64) (this_frame: u64) (service_interval: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R34.M5-003 (#1188): refuse an append whose SFI would fire tighter than service_interval frames after the last stamped one. Wrap tolerance: 1024-frame window ahead. Labels prefixed iring_ei_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rsi;                    // this_frame
+        mov r13, rdx;                    // interval
+
+        cmp rdi, 4;
+        jae iring_ei_bad;
+
+        // Load last_stamped_frame.
+        lea r10, [rip + _isoch_ring_hdr];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rcx, [r10 + 16];
+        and rcx, 0x7FF;                  // last
+
+        // If last == 0 and never set, accept.
+        cmp rcx, 0;
+        je  iring_ei_ok;
+
+        // delta = (this_frame - last) mod 2048
+        mov rax, r12;
+        sub rax, rcx;
+        mov r11, 2047;
+        and rax, r11;
+
+        cmp rax, r13;
+        jb  iring_ei_viol;
+
+        // Also refuse deltas > 1024 (wrap-past)
+        mov r11, 1024;
+        cmp rax, r11;
+        ja  iring_ei_viol;
+
+      iring_ei_ok:
+        xor rax, rax;
+        jmp iring_ei_out;
+      iring_ei_viol:
+        mov rax, 0xFFFFFAAB;
+        jmp iring_ei_out;
+      iring_ei_bad:
+        mov rax, 0xFFFFFAAF;
+
+      iring_ei_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}

@@ -2615,6 +2615,40 @@ fi
 echo "[usb-hid-full-confine] USB-HID full-protocol scaffold state confined"
 
 # ---------------------------------------------------------------------------
+# R34.M5 (#1186/#1187/#1188/#1189): USB isochronous substrate
+# state confinement.
+#
+# Four modules, each owns its own row table / state block / stats
+# array. tools/build.sh confines relocations against each one to its
+# owning object so a second writer cannot restamp a stream's
+# bandwidth reservation, forge a frame index, admit a TRB behind the
+# scheduler's back, or bump the frame counter without a packet.
+ISOCHS_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_isoch_stream.pdx"
+SOFTL_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/xhci/sof_timeline.pdx"
+IRING_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/xhci/isoch_ring.pdx"
+UVCSN_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/uvc/uvc_synth.pdx"
+if [[ ! -f "${ISOCHS_SRC}" || ! -f "${SOFTL_SRC}" || ! -f "${IRING_SRC}" \
+        || ! -f "${UVCSN_SRC}" ]]; then
+    echo "[usb-isoch-confine] FAIL - one of the R34.M5 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_isoch_stream_table' 'core/cap/kind_isoch_stream.o'
+ec_confine_one '_isoch_stream_stats' 'core/cap/kind_isoch_stream.o'
+ec_confine_one '_sof_state'          'core/drivers/usb/xhci/sof_timeline.o'
+ec_confine_one '_sof_stats'          'core/drivers/usb/xhci/sof_timeline.o'
+ec_confine_one '_isoch_ring_hdr'     'core/drivers/usb/xhci/isoch_ring.o'
+ec_confine_one '_isoch_ring_slots'   'core/drivers/usb/xhci/isoch_ring.o'
+ec_confine_one '_isoch_ring_stats'   'core/drivers/usb/xhci/isoch_ring.o'
+ec_confine_one '_uvc_state'          'core/drivers/usb/uvc/uvc_synth.o'
+ec_confine_one '_uvc_stats'          'core/drivers/usb/uvc/uvc_synth.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_isoch_stream.pdx §2, sof_timeline.pdx §2, isoch_ring.pdx §1" >&2
+    echo "  and uvc_synth.pdx for the row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[usb-isoch-confine] USB isochronous substrate state confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
