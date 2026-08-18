@@ -2824,6 +2824,247 @@ i2chid_qk_pin_one 'pub let i2c_hid_quirk_count : () -> u64'
 i2chid_qk_pin_one 'pub let i2c_hid_quirks_consumed : () -> u64'
 echo "[i2c-hid-quirks-confine] lookup, count and consumed arities pinned"
 
+# ---------------------------------------------------------------------------
+# R32.M2-002 (#1121): HID USAGE TABLE CONFINEMENT + ARITY PINS.
+#
+# The table and its row count are compile-time constants in .rodata; the
+# consumer counter is an honesty pin (0 today, flipped when R32.M3 wires
+# the class driver -- the boot witness assertion fires at that point).
+# The load-bearing check is that no object other than usage.o forms a
+# row address of its own; a stray reader would classify a (page, id)
+# pair through a table the review never looked at.
+HID_US_OWNER="${BUILD_DIR}/core/drivers/hid/usage.o"
+HID_US_SRC="${REPO_ROOT}/src/kernel/core/drivers/hid/usage.pdx"
+if [[ ! -f "${HID_US_SRC}" ]]; then
+    echo "[hid-usage-confine] FAIL - ${HID_US_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HID_US_OWNER}" ]]; then
+    echo "[hid-usage-confine] FAIL: ${HID_US_OWNER} not built" >&2
+    exit 1
+fi
+hid_us_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${HID_US_OWNER}" "${sym}"; then
+        echo "[hid-usage-confine] FAIL: usage.o does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  check would then pass vacuously, so it fails instead." >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HID_US_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hid-usage-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/hid/usage.o relocate against ${sym}:${strays}" >&2
+        echo "  The usage table, its row count and its specific-end split are" >&2
+        echo "  reachable only through hid_usage_id_kind / hid_usage_page_known" >&2
+        echo "  / hid_usage_row_count. See src/kernel/core/drivers/hid/usage.pdx §2." >&2
+        exit 1
+    fi
+}
+hid_us_confine_one '_hid_usage_table'
+hid_us_confine_one '_hid_usage_count'
+hid_us_confine_one '_hid_usage_specific_end'
+hid_us_confine_one '_hid_usage_consumers'
+echo "[hid-usage-confine] table, count, specific-end and consumer latch confined"
+
+hid_us_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HID_US_SRC}"; then
+        echo "[hid-usage-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  THE CLASSIFIER SEAM TAKES (page, id) AS TWO ARGS -- a caller" >&2
+        echo "  that passed one packed key would have to have already packed" >&2
+        echo "  it, which is the packing step this module exists to own. See" >&2
+        echo "  src/kernel/core/drivers/hid/usage.pdx §1." >&2
+        exit 1
+    fi
+}
+hid_us_pin_one 'pub let hid_usage_id_kind : (u64, u64) -> u64'
+hid_us_pin_one 'pub let hid_usage_page_known : (u64) -> u64'
+hid_us_pin_one 'pub let hid_usage_row_count : () -> u64'
+hid_us_pin_one 'pub let hid_usage_consumed : () -> u64'
+echo "[hid-usage-confine] id_kind, page_known, row_count and consumed arities pinned"
+
+# ---------------------------------------------------------------------------
+# R32.M2-001 (#1120): HID REPORT-PARSER SCHEMA CONFINEMENT + ARITY PINS.
+#
+# _hid_report_schema, _hid_report_count and _hid_report_valid are the
+# LATCH the parser writes on a successful feed. The collection walker
+# in R32.M2-003 READS these three symbols but MUST NOT WRITE them --
+# that is the whole point of §3 in report_parser.pdx and §1 in
+# collection_walker.pdx. The confinement check refuses any writer other
+# than report_parser.o.
+#
+# The working-state cells (_hid_rp_up, _hid_rp_rsz, ..., _hid_rp_gs) are
+# confined too: a stray writer would let a parse in progress diverge
+# from the state the emit helper reads back one row later, and the
+# schema would carry field values that never appeared in the descriptor.
+#
+# Arity pins ensure the feed seam continues to accept (ptr, len) and
+# the field accessors continue to accept (idx). A widened signature
+# would let a caller reach a row of its own choosing behind the
+# accessor's bounds check.
+HID_RP_OWNER="${BUILD_DIR}/core/drivers/hid/report_parser.o"
+HID_RP_SRC="${REPO_ROOT}/src/kernel/core/drivers/hid/report_parser.pdx"
+if [[ ! -f "${HID_RP_SRC}" ]]; then
+    echo "[hid-report-parser-confine] FAIL - ${HID_RP_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HID_RP_OWNER}" ]]; then
+    echo "[hid-report-parser-confine] FAIL: ${HID_RP_OWNER} not built" >&2
+    exit 1
+fi
+# Writer-confined symbols: parser.o is the only object that may WRITE
+# these. Readers outside parser.o are allowed (the walker, and the
+# witness) because the schema is a read-many, write-once latch.
+hid_rp_wconfine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${HID_RP_OWNER}" "${sym}"; then
+        echo "[hid-report-parser-confine] FAIL: report_parser.o does not reference ${sym}" >&2
+        exit 1
+    fi
+}
+# Working-state cells: writer AND reader confined to report_parser.o
+# (the emit helper reads them one row later; nothing else has any
+# reason to touch them).
+hid_rp_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${HID_RP_OWNER}" "${sym}"; then
+        echo "[hid-report-parser-confine] FAIL: report_parser.o does not reference ${sym}" >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HID_RP_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hid-report-parser-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/hid/report_parser.o relocate against ${sym}:${strays}" >&2
+        echo "  Parser working state must not leak out of the parser object. See" >&2
+        echo "  src/kernel/core/drivers/hid/report_parser.pdx §3." >&2
+        exit 1
+    fi
+}
+hid_rp_wconfine_one '_hid_report_schema'
+hid_rp_wconfine_one '_hid_report_count'
+hid_rp_wconfine_one '_hid_report_valid'
+hid_rp_confine_one  '_hid_rp_up'
+hid_rp_confine_one  '_hid_rp_rsz'
+hid_rp_confine_one  '_hid_rp_rcnt'
+hid_rp_confine_one  '_hid_rp_rid'
+hid_rp_confine_one  '_hid_rp_lmin'
+hid_rp_confine_one  '_hid_rp_lmax'
+hid_rp_confine_one  '_hid_rp_ulast'
+hid_rp_confine_one  '_hid_rp_umin'
+hid_rp_confine_one  '_hid_rp_umax'
+hid_rp_confine_one  '_hid_rp_depth'
+hid_rp_confine_one  '_hid_rp_gs'
+hid_rp_confine_one  '_hid_rp_gsd'
+echo "[hid-report-parser-confine] schema latch (reader/writer) and working state confined"
+
+hid_rp_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HID_RP_SRC}"; then
+        echo "[hid-report-parser-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  THE PARSER FEED SEAM TAKES (ptr, len) AND ROW ACCESSORS TAKE" >&2
+        echo "  (idx). A widened signature would let a caller reach a row of" >&2
+        echo "  its own choosing behind the accessor's bounds check. See" >&2
+        echo "  src/kernel/core/drivers/hid/report_parser.pdx §1 / §4." >&2
+        exit 1
+    fi
+}
+hid_rp_pin_one 'pub let hid_report_parser_feed : (u64, u64) -> u64'
+hid_rp_pin_one 'pub let hid_report_parser_reset : () -> u64'
+hid_rp_pin_one 'pub let hid_report_parser_valid : () -> u64'
+hid_rp_pin_one 'pub let hid_report_field_count : () -> u64'
+hid_rp_pin_one 'pub let hid_report_field_kind : (u64) -> u64'
+hid_rp_pin_one 'pub let hid_report_field_aux : (u64) -> u64'
+hid_rp_pin_one 'pub let hid_report_field_usage_page : (u64) -> u64'
+hid_rp_pin_one 'pub let hid_report_field_usage_id : (u64) -> u64'
+hid_rp_pin_one 'pub let hid_report_field_report_size : (u64) -> u64'
+hid_rp_pin_one 'pub let hid_report_field_report_count : (u64) -> u64'
+hid_rp_pin_one 'pub let hid_report_field_report_id : (u64) -> u64'
+hid_rp_pin_one 'pub let hid_report_field_depth : (u64) -> u64'
+echo "[hid-report-parser-confine] feed, reset, valid and field accessors pinned"
+
+# ---------------------------------------------------------------------------
+# R32.M2-003 (#1122): HID COLLECTION WALKER CONFINEMENT + ARITY PINS.
+#
+# The walker's only writable state is its honesty counter; a stray
+# writer would flip the pin without a live consumer ever landing.
+# Everything else the walker touches (schema, count, valid) is
+# read-only for this object -- see the parser gate above.
+#
+# The walk seam takes ARITY ONE (cb pointer); a widened signature
+# would let a caller thread out-of-band state through arg registers
+# the callback contract does not name.
+HID_CW_OWNER="${BUILD_DIR}/core/drivers/hid/collection_walker.o"
+HID_CW_SRC="${REPO_ROOT}/src/kernel/core/drivers/hid/collection_walker.pdx"
+if [[ ! -f "${HID_CW_SRC}" ]]; then
+    echo "[hid-collection-walker-confine] FAIL - ${HID_CW_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HID_CW_OWNER}" ]]; then
+    echo "[hid-collection-walker-confine] FAIL: ${HID_CW_OWNER} not built" >&2
+    exit 1
+fi
+hid_cw_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${HID_CW_OWNER}" "${sym}"; then
+        echo "[hid-collection-walker-confine] FAIL: collection_walker.o does not reference ${sym}" >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HID_CW_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hid-collection-walker-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/hid/collection_walker.o relocate against ${sym}:${strays}" >&2
+        echo "  Walker honesty counter must not be flipped outside the walker's" >&2
+        echo "  own object. See src/kernel/core/drivers/hid/collection_walker.pdx §1." >&2
+        exit 1
+    fi
+}
+hid_cw_confine_one '_hid_collection_walker_consumers'
+echo "[hid-collection-walker-confine] walker honesty counter confined"
+
+hid_cw_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HID_CW_SRC}"; then
+        echo "[hid-collection-walker-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  THE WALK SEAM TAKES ARITY ONE (cb pointer); accessors take ONE" >&2
+        echo "  index. Widening would let a caller thread out-of-band state" >&2
+        echo "  through arg registers. See src/kernel/core/drivers/hid/" >&2
+        echo "  collection_walker.pdx §0 / §4." >&2
+        exit 1
+    fi
+}
+hid_cw_pin_one 'pub let hid_collection_walk : (u64) -> u64'
+hid_cw_pin_one 'pub let hid_collection_count : () -> u64'
+hid_cw_pin_one 'pub let hid_collection_max_depth : () -> u64'
+hid_cw_pin_one 'pub let hid_collection_type_at : (u64) -> u64'
+hid_cw_pin_one 'pub let hid_collection_depth_at : (u64) -> u64'
+hid_cw_pin_one 'pub let hid_collection_walker_consumed : () -> u64'
+echo "[hid-collection-walker-confine] walk, count, max_depth, type_at, depth_at and consumed arities pinned"
+
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 

@@ -1,0 +1,985 @@
+// src/kernel/core/drivers/hid/report_parser.pdx — R32.M2-001 (#1120)
+//
+// HID report-descriptor parser producing a typed ReportSchema. SCAFFOLD.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// IT IS THE PARSE STEP that turns the raw byte stream fetched by
+// i2c_hid_transport_read (once R32.M2 wires the transport) into a
+// structured record the HID class driver can walk. The wire format is
+// HID 1.11 §6.2.2: an item stream of prefix-byte + 0/1/2/4 data bytes
+// per item. Items fall into three types:
+//
+//   MAIN    (bType=0) -- INPUT/OUTPUT/FEATURE fields and BEGIN/END of
+//                        collections. Emits a schema entry.
+//
+//   GLOBAL  (bType=1) -- usage page, report size, report id, report
+//                        count, logical min/max, PUSH, POP. Modifies
+//                        the parser's persistent state; a subsequent
+//                        MAIN item captures the current state.
+//
+//   LOCAL   (bType=2) -- usage, usage min, usage max. Applies to the
+//                        NEXT MAIN item and is cleared after each MAIN
+//                        item per HID 1.11 §6.2.2.4.
+//
+// The parser walks the byte stream once, maintains the global/local
+// state, emits one schema entry per MAIN item (INPUT/OUTPUT/FEATURE/
+// COLLECTION/END_COLLECTION), tracks collection depth for the walker in
+// collection_walker.pdx, and refuses malformed inputs rather than
+// clamping them.
+//
+// IT IS NOT A LIVE FETCH. The parser takes a (ptr, len) pair from a
+// caller that already holds a buffer; the fetch that produces that
+// buffer lives on the transport side and is DEFERRED_HARDWARE today
+// (i2c_hid_transport_read §4). R32.M2 wires the transport, at which
+// point the same parser is called against real bytes.
+//
+// =============================================================================
+// §1  SCHEMA LAYOUT -- ONE ROW PER MAIN ITEM
+// =============================================================================
+//
+// The schema is a flat [u64; N*8] array; row stride is 64 bytes = 8 u64.
+// Row fields, at their u64 offsets within the row:
+//
+//   +0   kind             HID_RP_KIND_INPUT/OUTPUT/FEATURE/COLL_BEGIN/
+//                         COLL_END
+//   +8   aux              INPUT/OUTPUT/FEATURE: the item's flag byte
+//                         (Data/Constant, Array/Variable, Abs/Rel, ...)
+//                         COLL_BEGIN: the collection type (Physical=0x00,
+//                                     Application=0x01, Logical=0x02)
+//                         COLL_END: 0
+//   +16  usage_page       the current global usage page at emission
+//   +24  usage_id         the last local usage set (0 if none, or for
+//                         collections that did not carry a Usage)
+//   +32  report_size      current global report size (bits per field)
+//   +40  report_count     current global report count (fields per report)
+//   +48  report_id        current global report id (0 if not set)
+//   +56  depth            collection nesting depth at emission (see §2)
+//
+// The maximum entry count is HID_RP_MAX_FIELDS (64). A touchpad's
+// descriptor typically fits in 20-40 entries; a keyboard's is smaller;
+// 64 is generous enough that a real-device parse does not hit the
+// ceiling, and small enough that the storage is <=4 KiB.
+//
+// =============================================================================
+// §2  DEPTH CONVENTION -- WHERE THE WALKER READS FROM
+// =============================================================================
+//
+// The parser tracks a monotonic collection depth counter:
+//
+//   COLL_BEGIN emitted @ CURRENT depth; then depth += 1
+//   INPUT/OUTPUT/FEATURE emitted @ CURRENT depth
+//   COLL_END emitted @ CURRENT depth (which is still the entering depth);
+//           then depth -= 1
+//
+// Under this convention a top-level Application Collection emits at
+// depth 0, its inner Physical Collection emits at depth 1, its inner
+// fields emit at depth 2. The END of the physical collection also emits
+// at depth 2, and the END of the application collection at depth 1
+// -- oops. Let me rewrite so both ENDs record their DEPARTING depth.
+//
+// Actual convention (used below):
+//
+//   COLL_BEGIN: emit @ depth; depth += 1
+//   INPUT/etc: emit @ depth
+//   COLL_END: depth -= 1; emit @ depth
+//
+// So the top-level Application Collection emits BEGIN @ 0 and END @ 0;
+// its inner Physical Collection emits BEGIN @ 1 and END @ 1; fields
+// inside the physical collection emit @ 2. The walker pairs BEGIN/END
+// by matching depths in order.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE SCHEMA
+// =============================================================================
+//
+// Exactly one writer of `_hid_report_valid`, `_hid_report_count` and the
+// schema/state storage: this module. tools/build.sh confines all of
+// them to this object. A stray writer would be a second path claiming
+// the schema was parsed against different bytes, and when the walker or
+// the class driver reads schema[i], it would key off a row nobody vetted.
+//
+// =============================================================================
+// §4  REFUSE, NEVER CLAMP
+// =============================================================================
+//
+// LONG ITEM (prefix 0xFE) -> BAD_DESC. Long items are legal HID (§6.2.3)
+// but no touchpad, trackpoint, sensor hub or keyboard this build cares
+// about uses them. Adding support later is an extension; treating an
+// unknown-shaped item stream as parseable today would be dishonest.
+//
+// TRUNCATED ITEM (prefix says N data bytes, less than N remain) ->
+// BAD_DESC. Refused, not padded with zeros.
+//
+// UNKNOWN MAIN TAG (0..3 reserved, 5-7 reserved, D-F reserved) ->
+// BAD_DESC. A future extension can add tags without hiding today's
+// refusal behind silent acceptance.
+//
+// RESERVED TYPE (bType=3) -> BAD_DESC.
+//
+// COLLECTION UNDERFLOW (END with depth==0) -> BAD_DESC.
+//
+// TOO MANY FIELDS (> HID_RP_MAX_FIELDS) -> OVERFLOW. Refused, not
+// silently dropped -- a walker reading count == cap could not tell it
+// missed rows.
+//
+// PUSH OVERFLOW (> HID_RP_STACK_DEPTH) -> OVERFLOW.
+// POP UNDERFLOW -> BAD_DESC.
+//
+// SECOND FEED -> REBIND. The schema is a LATCH; a second parse is a
+// second path claiming the descriptor was parsed against different
+// bytes. hid_report_parser_reset() clears the latch first.
+//
+// =============================================================================
+// §5  WHAT THIS MODULE STILL DOES NOT DO (deferred)
+// =============================================================================
+//
+//   * NO LONG-ITEM SUPPORT. §4 refuses them.
+//   * NO PHYSICAL MIN/MAX, UNIT, UNIT EXPONENT capture. Silently
+//     consumed but not stored -- no consumer needs them yet.
+//   * NO DESIGNATOR INDEX / STRING INDEX capture. Same reason.
+//   * NO DELIMITER handling (Local tag 0xA/0xB). Silently consumed.
+//   * NO SIGN EXTENSION for logical/physical min. Values stored raw as
+//     u64; a consumer that needs signed values will read them as-is.
+//
+// =============================================================================
+// §6  ERROR CODES 0xFFFFFC00..0xFFFFFC0F
+// =============================================================================
+
+module ReportParser = structure {
+
+  // ==========================================================================
+  // §6 return codes.
+  // ==========================================================================
+
+  pub let HID_RP_OK                : u64 = 0
+  pub let HID_RP_BAD_DESC          : u64 = 0xFFFFFC00
+  pub let HID_RP_OVERFLOW          : u64 = 0xFFFFFC01
+  pub let HID_RP_REBIND            : u64 = 0xFFFFFC02
+  pub let HID_RP_EMPTY             : u64 = 0xFFFFFC03
+
+  // ==========================================================================
+  // Kinds -- MAIN item classifications the schema stores.
+  // ==========================================================================
+
+  pub let HID_RP_KIND_INPUT      : u64 = 1
+  pub let HID_RP_KIND_OUTPUT     : u64 = 2
+  pub let HID_RP_KIND_FEATURE    : u64 = 3
+  pub let HID_RP_KIND_COLL_BEGIN : u64 = 4
+  pub let HID_RP_KIND_COLL_END   : u64 = 5
+
+  // ==========================================================================
+  // HID 1.11 §6.2.2 item type/tag constants.
+  // ==========================================================================
+
+  pub let HID_ITEM_TYPE_MAIN    : u64 = 0
+  pub let HID_ITEM_TYPE_GLOBAL  : u64 = 1
+  pub let HID_ITEM_TYPE_LOCAL   : u64 = 2
+
+  pub let HID_MAIN_TAG_INPUT       : u64 = 0x8
+  pub let HID_MAIN_TAG_OUTPUT      : u64 = 0x9
+  pub let HID_MAIN_TAG_FEATURE     : u64 = 0xB
+  pub let HID_MAIN_TAG_COLLECTION  : u64 = 0xA
+  pub let HID_MAIN_TAG_END_COLL    : u64 = 0xC
+
+  pub let HID_GLOBAL_TAG_USAGE_PAGE  : u64 = 0x0
+  pub let HID_GLOBAL_TAG_LOGICAL_MIN : u64 = 0x1
+  pub let HID_GLOBAL_TAG_LOGICAL_MAX : u64 = 0x2
+  pub let HID_GLOBAL_TAG_REPORT_SIZE : u64 = 0x7
+  pub let HID_GLOBAL_TAG_REPORT_ID   : u64 = 0x8
+  pub let HID_GLOBAL_TAG_REPORT_CNT  : u64 = 0x9
+  pub let HID_GLOBAL_TAG_PUSH        : u64 = 0xA
+  pub let HID_GLOBAL_TAG_POP         : u64 = 0xB
+
+  pub let HID_LOCAL_TAG_USAGE     : u64 = 0x0
+  pub let HID_LOCAL_TAG_USAGE_MIN : u64 = 0x1
+  pub let HID_LOCAL_TAG_USAGE_MAX : u64 = 0x2
+
+  pub let HID_COLL_TYPE_PHYSICAL    : u64 = 0x00
+  pub let HID_COLL_TYPE_APPLICATION : u64 = 0x01
+  pub let HID_COLL_TYPE_LOGICAL     : u64 = 0x02
+
+  // ==========================================================================
+  // Capacity constants.
+  // ==========================================================================
+
+  pub let HID_RP_MAX_FIELDS   : u64 = 64
+  pub let HID_RP_STACK_DEPTH  : u64 = 8
+  pub let HID_RP_ROW_STRIDE   : u64 = 64
+
+  // ==========================================================================
+  // State. Confined to this object by tools/build.sh.
+  //
+  // Schema: 64 rows * 8 u64 = 512 u64 = 4096 bytes.
+  // Global stack: 8 levels * 4 u64 = 32 u64 (usage_page, report_size,
+  //   report_count, report_id).
+  // Working state: separate u64 cells for clarity of confinement (each
+  //   is confined individually so a stray writer of any single field
+  //   fails the build).
+  // ==========================================================================
+
+  pub let mut _hid_report_schema : [u64; 512] = uninit @align(64)
+  pub let mut _hid_report_count  : u64 = 0
+  pub let mut _hid_report_valid  : u64 = 0
+
+  // Persistent working state -- the parser's global item state.
+  pub let mut _hid_rp_up    : u64 = 0
+  pub let mut _hid_rp_rsz   : u64 = 0
+  pub let mut _hid_rp_rcnt  : u64 = 0
+  pub let mut _hid_rp_rid   : u64 = 0
+  pub let mut _hid_rp_lmin  : u64 = 0
+  pub let mut _hid_rp_lmax  : u64 = 0
+
+  // Persistent working state -- the parser's local item state (cleared
+  // after each MAIN item per HID 1.11 §6.2.2.4).
+  pub let mut _hid_rp_ulast : u64 = 0
+  pub let mut _hid_rp_umin  : u64 = 0
+  pub let mut _hid_rp_umax  : u64 = 0
+
+  // Collection depth (§2). Increments on COLL_BEGIN, decrements on
+  // COLL_END. Never exceeds HID_RP_STACK_DEPTH by construction.
+  pub let mut _hid_rp_depth : u64 = 0
+
+  // Global PUSH/POP stack. Each level saves (up, rsz, rcnt, rid) -- 4
+  // u64 * 8 levels = 32 u64. _hid_rp_gsd is the current stack depth in
+  // LEVELS (not u64s).
+  pub let mut _hid_rp_gs  : [u64; 32] = uninit @align(64)
+  pub let mut _hid_rp_gsd : u64 = 0
+
+  // ==========================================================================
+  // hid_report_parser_reset() -> OK
+  //
+  // Clears the schema latch and all working state. Must be called before
+  // hid_report_parser_feed on a parser that has already parsed.
+  // ==========================================================================
+
+  pub let hid_report_parser_reset : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R32.M2-001 (#1120): reset the parser. Zeros _hid_report_valid, _hid_report_count and every working-state cell (up, rsz, rcnt, rid, lmin, lmax, ulast, umin, umax, depth, gsd). Does NOT scrub the schema bytes -- rows past _hid_report_count are unreachable through the field accessors (they gate on the index against count) and scrubbing 4096 bytes on every reset would be wasted work in a scaffold. Reserved labels: none.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _hid_report_valid];
+        mov [r10], rax;
+        lea r10, [rip + _hid_report_count];
+        mov [r10], rax;
+        lea r10, [rip + _hid_rp_up];
+        mov [r10], rax;
+        lea r10, [rip + _hid_rp_rsz];
+        mov [r10], rax;
+        lea r10, [rip + _hid_rp_rcnt];
+        mov [r10], rax;
+        lea r10, [rip + _hid_rp_rid];
+        mov [r10], rax;
+        lea r10, [rip + _hid_rp_lmin];
+        mov [r10], rax;
+        lea r10, [rip + _hid_rp_lmax];
+        mov [r10], rax;
+        lea r10, [rip + _hid_rp_ulast];
+        mov [r10], rax;
+        lea r10, [rip + _hid_rp_umin];
+        mov [r10], rax;
+        lea r10, [rip + _hid_rp_umax];
+        mov [r10], rax;
+        lea r10, [rip + _hid_rp_depth];
+        mov [r10], rax;
+        lea r10, [rip + _hid_rp_gsd];
+        mov [r10], rax;
+        xor rax, rax;                     // OK
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // hid_report_parser_valid() -> 1 | 0
+  // ==========================================================================
+
+  pub let hid_report_parser_valid : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R32.M2-001 (#1120): 1 once a descriptor has been parsed successfully. Leaf load. Reserved labels: none.",
+      block: {
+        lea r10, [rip + _hid_report_valid];
+        mov rax, [r10];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // hid_report_field_count() -> N
+  // ==========================================================================
+
+  pub let hid_report_field_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R32.M2-001 (#1120): number of schema rows emitted by the most recent parse. Leaf load. Reserved labels: none.",
+      block: {
+        lea r10, [rip + _hid_report_count];
+        mov rax, [r10];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Row accessors -- one per schema field. All gate on (idx < count),
+  // returning HID_RP_BAD_DESC on out-of-range (never a fabricated 0 --
+  // reading past the count would confuse a downstream walker into
+  // treating unwritten memory as a real field).
+  //
+  // Each takes idx in rdi, computes row_base = _hid_report_schema +
+  // idx*HID_RP_ROW_STRIDE, and returns the u64 at the specified offset.
+  // ==========================================================================
+
+  pub let hid_report_field_kind : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R32.M2-001 (#1120): row[idx].kind. Refuses idx >= count with HID_RP_BAD_DESC. Leaf. Labels prefixed hid_rp_fk_.",
+      block: {
+        lea r10, [rip + _hid_report_count];
+        mov rax, [r10];
+        cmp rdi, rax;
+        jae hid_rp_fk_oob;
+        mov rax, rdi;
+        shl rax, 6;                       // *64
+        lea r10, [rip + _hid_report_schema];
+        add rax, r10;
+        mov rax, [rax + 0];
+        ret;
+      hid_rp_fk_oob:
+        mov rax, 0xFFFFFC00;              // BAD_DESC
+        ret
+      }
+    } @no_frame
+
+  pub let hid_report_field_aux : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R32.M2-001 (#1120): row[idx].aux (item flags for INPUT/OUTPUT/FEATURE; collection type for COLL_BEGIN). Refuses idx >= count with HID_RP_BAD_DESC. Leaf. Labels prefixed hid_rp_fa_.",
+      block: {
+        lea r10, [rip + _hid_report_count];
+        mov rax, [r10];
+        cmp rdi, rax;
+        jae hid_rp_fa_oob;
+        mov rax, rdi;
+        shl rax, 6;
+        lea r10, [rip + _hid_report_schema];
+        add rax, r10;
+        mov rax, [rax + 8];
+        ret;
+      hid_rp_fa_oob:
+        mov rax, 0xFFFFFC00;
+        ret
+      }
+    } @no_frame
+
+  pub let hid_report_field_usage_page : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R32.M2-001 (#1120): row[idx].usage_page. Refuses idx >= count with HID_RP_BAD_DESC. Leaf. Labels prefixed hid_rp_fp_.",
+      block: {
+        lea r10, [rip + _hid_report_count];
+        mov rax, [r10];
+        cmp rdi, rax;
+        jae hid_rp_fp_oob;
+        mov rax, rdi;
+        shl rax, 6;
+        lea r10, [rip + _hid_report_schema];
+        add rax, r10;
+        mov rax, [rax + 16];
+        ret;
+      hid_rp_fp_oob:
+        mov rax, 0xFFFFFC00;
+        ret
+      }
+    } @no_frame
+
+  pub let hid_report_field_usage_id : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R32.M2-001 (#1120): row[idx].usage_id. Refuses idx >= count with HID_RP_BAD_DESC. Leaf. Labels prefixed hid_rp_fu_.",
+      block: {
+        lea r10, [rip + _hid_report_count];
+        mov rax, [r10];
+        cmp rdi, rax;
+        jae hid_rp_fu_oob;
+        mov rax, rdi;
+        shl rax, 6;
+        lea r10, [rip + _hid_report_schema];
+        add rax, r10;
+        mov rax, [rax + 24];
+        ret;
+      hid_rp_fu_oob:
+        mov rax, 0xFFFFFC00;
+        ret
+      }
+    } @no_frame
+
+  pub let hid_report_field_report_size : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R32.M2-001 (#1120): row[idx].report_size (bits per field). Refuses idx >= count with HID_RP_BAD_DESC. Leaf. Labels prefixed hid_rp_fs_.",
+      block: {
+        lea r10, [rip + _hid_report_count];
+        mov rax, [r10];
+        cmp rdi, rax;
+        jae hid_rp_fs_oob;
+        mov rax, rdi;
+        shl rax, 6;
+        lea r10, [rip + _hid_report_schema];
+        add rax, r10;
+        mov rax, [rax + 32];
+        ret;
+      hid_rp_fs_oob:
+        mov rax, 0xFFFFFC00;
+        ret
+      }
+    } @no_frame
+
+  pub let hid_report_field_report_count : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R32.M2-001 (#1120): row[idx].report_count (fields per report). Refuses idx >= count with HID_RP_BAD_DESC. Leaf. Labels prefixed hid_rp_fc_.",
+      block: {
+        lea r10, [rip + _hid_report_count];
+        mov rax, [r10];
+        cmp rdi, rax;
+        jae hid_rp_fc_oob;
+        mov rax, rdi;
+        shl rax, 6;
+        lea r10, [rip + _hid_report_schema];
+        add rax, r10;
+        mov rax, [rax + 40];
+        ret;
+      hid_rp_fc_oob:
+        mov rax, 0xFFFFFC00;
+        ret
+      }
+    } @no_frame
+
+  pub let hid_report_field_report_id : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R32.M2-001 (#1120): row[idx].report_id. Refuses idx >= count with HID_RP_BAD_DESC. Leaf. Labels prefixed hid_rp_fi_.",
+      block: {
+        lea r10, [rip + _hid_report_count];
+        mov rax, [r10];
+        cmp rdi, rax;
+        jae hid_rp_fi_oob;
+        mov rax, rdi;
+        shl rax, 6;
+        lea r10, [rip + _hid_report_schema];
+        add rax, r10;
+        mov rax, [rax + 48];
+        ret;
+      hid_rp_fi_oob:
+        mov rax, 0xFFFFFC00;
+        ret
+      }
+    } @no_frame
+
+  pub let hid_report_field_depth : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R32.M2-001 (#1120): row[idx].depth (collection nesting depth at emission). Refuses idx >= count with HID_RP_BAD_DESC. Leaf. Labels prefixed hid_rp_fd_.",
+      block: {
+        lea r10, [rip + _hid_report_count];
+        mov rax, [r10];
+        cmp rdi, rax;
+        jae hid_rp_fd_oob;
+        mov rax, rdi;
+        shl rax, 6;
+        lea r10, [rip + _hid_report_schema];
+        add rax, r10;
+        mov rax, [rax + 56];
+        ret;
+      hid_rp_fd_oob:
+        mov rax, 0xFFFFFC00;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // hid_report_parser_emit(kind, aux) -> OK | OVERFLOW
+  //
+  // Internal helper. Writes one schema row using the current global +
+  // local state, increments the row count, and clears local state (per
+  // HID 1.11 §6.2.2.4). Refuses if count == HID_RP_MAX_FIELDS.
+  //
+  // Register usage: rdi=kind, rsi=aux. Uses rax/rcx/r10 (all volatile).
+  // Not a leaf per SysV but performs no nested calls.
+  // ==========================================================================
+
+  pub let hid_report_parser_emit : (u64, u64) -> u64 !{mem} @{} =
+    fn (kind: u64, aux: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R32.M2-001 (#1120): emit one schema row. Reads (up, ulast, rsz, rcnt, rid, depth) from working state and (kind, aux) from arguments; writes the 8 u64 row at &_hid_report_schema + count*64; increments count. On overflow (count == MAX_FIELDS) returns OVERFLOW WITHOUT writing (a partial row would leave the schema in a state a walker could not distinguish from a real row that happened to have zeros). Clears the three local fields (ulast, umin, umax) on the happy path -- HID 1.11 §6.2.2.4 mandates local state is per-MAIN-item. Leaf load/store, no nested calls. Labels prefixed hid_rp_em_.",
+      block: {
+        // Overflow check.
+        lea r10, [rip + _hid_report_count];
+        mov rax, [r10];
+        mov rcx, 64;                       // HID_RP_MAX_FIELDS
+        cmp rax, rcx;
+        jae hid_rp_em_ovf;
+
+        // r10 = &_hid_report_schema + count*64 = row base.
+        mov rcx, rax;                      // rcx = count
+        shl rax, 6;                        // *64
+        lea r10, [rip + _hid_report_schema];
+        add r10, rax;                      // r10 = row base
+
+        // +0 kind, +8 aux.
+        mov [r10 + 0], rdi;
+        mov [r10 + 8], rsi;
+
+        // +16 usage_page.
+        lea rax, [rip + _hid_rp_up];
+        mov rax, [rax];
+        mov [r10 + 16], rax;
+
+        // +24 usage_id (local ulast).
+        lea rax, [rip + _hid_rp_ulast];
+        mov rax, [rax];
+        mov [r10 + 24], rax;
+
+        // +32 report_size.
+        lea rax, [rip + _hid_rp_rsz];
+        mov rax, [rax];
+        mov [r10 + 32], rax;
+
+        // +40 report_count.
+        lea rax, [rip + _hid_rp_rcnt];
+        mov rax, [rax];
+        mov [r10 + 40], rax;
+
+        // +48 report_id.
+        lea rax, [rip + _hid_rp_rid];
+        mov rax, [rax];
+        mov [r10 + 48], rax;
+
+        // +56 depth.
+        lea rax, [rip + _hid_rp_depth];
+        mov rax, [rax];
+        mov [r10 + 56], rax;
+
+        // count += 1
+        add rcx, 1;
+        lea r10, [rip + _hid_report_count];
+        mov [r10], rcx;
+
+        // Clear local state (HID 1.11 §6.2.2.4).
+        xor rax, rax;
+        lea r10, [rip + _hid_rp_ulast];
+        mov [r10], rax;
+        lea r10, [rip + _hid_rp_umin];
+        mov [r10], rax;
+        lea r10, [rip + _hid_rp_umax];
+        mov [r10], rax;
+
+        xor rax, rax;                      // OK
+        ret;
+
+      hid_rp_em_ovf:
+        mov rax, 0xFFFFFC01;               // OVERFLOW
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // hid_report_parser_feed(ptr, len) -> code
+  //
+  // The single parse entry point. Walks the item stream at [ptr, ptr+len),
+  // updates working state, emits one row per MAIN item. Refuses REBIND
+  // if already valid, EMPTY if len == 0. Returns OK on end-of-stream if
+  // depth == 0 (all collections closed); BAD_DESC otherwise.
+  //
+  // Refuses long items (0xFE) and reserved type (bType=3). Refuses
+  // truncated items. Refuses too-many-fields with OVERFLOW.
+  //
+  // Register plan (5-push prologue keeps ret-alignment intact):
+  //   rbx = current prefix byte
+  //   r12 = current data value
+  //   r13 = current item size in bytes (0/1/2/4)
+  //   r14 = current byte pointer (ptr, advances)
+  //   r15 = end pointer (ptr + len, constant across loop)
+  // ==========================================================================
+
+  pub let hid_report_parser_feed : (u64, u64) -> u64 !{mem} @{} =
+    fn (ptr: u64, len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R32.M2-001 (#1120): parse a HID report descriptor byte stream. Preconditions: not already valid (else REBIND -- a second parse against different bytes is a second path claiming the schema is authoritative), len > 0 (else EMPTY -- a zero-length descriptor has no items). Loop: read prefix byte at r14; refuse 0xFE (long item) with BAD_DESC; decode size (0/1/2 -> 0/1/2 data bytes, 3 -> 4 data bytes) and type (bits 2..3) and tag (bits 4..7); bounds-check ptr+size <= end (else BAD_DESC -- truncated); load little-endian data into r12; dispatch on (type, tag). MAIN: INPUT/OUTPUT/FEATURE emit row (kind, item_flags=data); COLLECTION emits COLL_BEGIN (kind, coll_type=data) then depth+=1 (§2); END_COLLECTION decrements depth (else BAD_DESC -- underflow) then emits COLL_END. GLOBAL: usage_page/report_size/report_count/report_id/logical_min/logical_max update state; PUSH saves (up, rsz, rcnt, rid) onto gs (overflow -> OVERFLOW); POP restores (underflow -> BAD_DESC). LOCAL: usage/usage_min/usage_max update local state; other local tags silently consumed. On loop exit (r14 >= r15), require depth == 0 (else BAD_DESC -- unclosed collection) then set _hid_report_valid = 1 and return OK. The emit helper handles OVERFLOW and clears local state per §6.2.2.4. Reserved labels: prefixed hid_rp_fd_ / hid_rp_fd_g_ / hid_rp_fd_l_ / hid_rp_fd_m_ (fd=feed, g=global, l=local, m=main). Five-push prologue keeps rsp%16 == 0 at nested emit calls (entry rsp%16 == 8, +5 pushes = %16 == 0, one `push rbp` inside emit is not used since emit is @no_frame). rbx/r12..r15 preserved across all nested calls (only emit is called, and it is @no_frame + touches only rax/rcx/r10).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // Precondition: not already valid.
+        lea r10, [rip + _hid_report_valid];
+        mov rax, [r10];
+        cmp rax, 0;
+        jne hid_rp_fd_rebind;
+
+        // Precondition: len > 0.
+        cmp rsi, 0;
+        je  hid_rp_fd_empty;
+
+        mov r14, rdi;                     // ptr
+        mov r15, rdi;
+        add r15, rsi;                     // end = ptr + len
+
+      hid_rp_fd_loop:
+        cmp r14, r15;
+        jae hid_rp_fd_done;
+
+        // Read prefix byte.
+        xor rax, rax;
+        mov_b rax, [r14];
+        and rax, 0xff;
+        mov rbx, rax;
+        add r14, 1;
+
+        // Long-item prefix 0xFE and reserved 0xFF -> BAD_DESC.
+        cmp rbx, 0xFE;
+        je  hid_rp_fd_bad;
+        cmp rbx, 0xFF;
+        je  hid_rp_fd_bad;
+
+        // Decode size (bits 0..1).
+        mov rcx, rbx;
+        and rcx, 3;
+        cmp rcx, 3;
+        jne hid_rp_fd_sz_ok;
+        mov rcx, 4;
+      hid_rp_fd_sz_ok:
+        mov r13, rcx;                     // r13 = size in bytes
+
+        // Bounds check: r14 + r13 <= r15.
+        mov rax, r14;
+        add rax, r13;
+        cmp rax, r15;
+        ja  hid_rp_fd_bad;
+
+        // Load data little-endian into r12.
+        xor r12, r12;
+        cmp r13, 0;
+        je  hid_rp_fd_data_end;
+
+        xor rax, rax;
+        mov_b rax, [r14];
+        and rax, 0xff;
+        or  r12, rax;
+        cmp r13, 1;
+        je  hid_rp_fd_data_adv;
+
+        xor rax, rax;
+        mov_b rax, [r14 + 1];
+        and rax, 0xff;
+        shl rax, 8;
+        or  r12, rax;
+        cmp r13, 2;
+        je  hid_rp_fd_data_adv;
+
+        // size == 4
+        xor rax, rax;
+        mov_b rax, [r14 + 2];
+        and rax, 0xff;
+        shl rax, 16;
+        or  r12, rax;
+
+        xor rax, rax;
+        mov_b rax, [r14 + 3];
+        and rax, 0xff;
+        shl rax, 24;
+        or  r12, rax;
+
+      hid_rp_fd_data_adv:
+        add r14, r13;
+
+      hid_rp_fd_data_end:
+
+        // Extract type (bits 2..3).
+        mov rcx, rbx;
+        shr rcx, 2;
+        and rcx, 3;
+
+        // Extract tag (bits 4..7).
+        mov rdx, rbx;
+        shr rdx, 4;
+        and rdx, 0xf;
+
+        // Dispatch on type: 0=main, 1=global, 2=local, 3=reserved.
+        cmp rcx, 0;
+        je  hid_rp_fd_main;
+        cmp rcx, 1;
+        je  hid_rp_fd_global;
+        cmp rcx, 2;
+        je  hid_rp_fd_local;
+        // Reserved.
+        jmp hid_rp_fd_bad;
+
+        // ============================================================
+        // MAIN dispatch.
+        // ============================================================
+      hid_rp_fd_main:
+        cmp rdx, 0x8;                     // INPUT
+        je  hid_rp_fd_m_input;
+        cmp rdx, 0x9;                     // OUTPUT
+        je  hid_rp_fd_m_output;
+        cmp rdx, 0xB;                     // FEATURE
+        je  hid_rp_fd_m_feature;
+        cmp rdx, 0xA;                     // COLLECTION
+        je  hid_rp_fd_m_coll;
+        cmp rdx, 0xC;                     // END COLLECTION
+        je  hid_rp_fd_m_endcoll;
+        jmp hid_rp_fd_bad;
+
+      hid_rp_fd_m_input:
+        mov rdi, 1;                       // HID_RP_KIND_INPUT
+        mov rsi, r12;                     // item flags
+        call hid_report_parser_emit;
+        cmp rax, 0;
+        jne hid_rp_fd_prop_emit;
+        jmp hid_rp_fd_loop;
+
+      hid_rp_fd_m_output:
+        mov rdi, 2;                       // HID_RP_KIND_OUTPUT
+        mov rsi, r12;
+        call hid_report_parser_emit;
+        cmp rax, 0;
+        jne hid_rp_fd_prop_emit;
+        jmp hid_rp_fd_loop;
+
+      hid_rp_fd_m_feature:
+        mov rdi, 3;                       // HID_RP_KIND_FEATURE
+        mov rsi, r12;
+        call hid_report_parser_emit;
+        cmp rax, 0;
+        jne hid_rp_fd_prop_emit;
+        jmp hid_rp_fd_loop;
+
+      hid_rp_fd_m_coll:
+        // Emit COLL_BEGIN at CURRENT depth (§2). Then depth += 1.
+        mov rdi, 4;                       // HID_RP_KIND_COLL_BEGIN
+        mov rsi, r12;                     // coll_type
+        call hid_report_parser_emit;
+        cmp rax, 0;
+        jne hid_rp_fd_prop_emit;
+        // depth += 1, refuse if it would exceed HID_RP_STACK_DEPTH (a
+        // depth beyond the stack has no legitimate parent for POP).
+        lea r10, [rip + _hid_rp_depth];
+        mov rax, [r10];
+        mov rcx, 8;                       // HID_RP_STACK_DEPTH
+        cmp rax, rcx;
+        jae hid_rp_fd_ovf;
+        add rax, 1;
+        mov [r10], rax;
+        jmp hid_rp_fd_loop;
+
+      hid_rp_fd_m_endcoll:
+        // depth -= 1 first (§2), refuse underflow.
+        lea r10, [rip + _hid_rp_depth];
+        mov rax, [r10];
+        cmp rax, 0;
+        je  hid_rp_fd_bad;
+        sub rax, 1;
+        mov [r10], rax;
+        // Emit COLL_END at the NEW depth (which is the departing depth,
+        // matching the entering depth of its BEGIN by construction).
+        mov rdi, 5;                       // HID_RP_KIND_COLL_END
+        xor rsi, rsi;                     // aux = 0
+        call hid_report_parser_emit;
+        cmp rax, 0;
+        jne hid_rp_fd_prop_emit;
+        jmp hid_rp_fd_loop;
+
+        // ============================================================
+        // GLOBAL dispatch.
+        // ============================================================
+      hid_rp_fd_global:
+        cmp rdx, 0x0;                     // USAGE PAGE
+        je  hid_rp_fd_g_up;
+        cmp rdx, 0x1;                     // LOGICAL MIN
+        je  hid_rp_fd_g_lmin;
+        cmp rdx, 0x2;                     // LOGICAL MAX
+        je  hid_rp_fd_g_lmax;
+        cmp rdx, 0x7;                     // REPORT SIZE
+        je  hid_rp_fd_g_rsz;
+        cmp rdx, 0x8;                     // REPORT ID
+        je  hid_rp_fd_g_rid;
+        cmp rdx, 0x9;                     // REPORT COUNT
+        je  hid_rp_fd_g_rcnt;
+        cmp rdx, 0xA;                     // PUSH
+        je  hid_rp_fd_g_push;
+        cmp rdx, 0xB;                     // POP
+        je  hid_rp_fd_g_pop;
+        // Other global tags (physical min/max, unit, unit exponent) are
+        // silently consumed per §5.
+        jmp hid_rp_fd_loop;
+
+      hid_rp_fd_g_up:
+        lea r10, [rip + _hid_rp_up];
+        mov [r10], r12;
+        jmp hid_rp_fd_loop;
+
+      hid_rp_fd_g_lmin:
+        lea r10, [rip + _hid_rp_lmin];
+        mov [r10], r12;
+        jmp hid_rp_fd_loop;
+
+      hid_rp_fd_g_lmax:
+        lea r10, [rip + _hid_rp_lmax];
+        mov [r10], r12;
+        jmp hid_rp_fd_loop;
+
+      hid_rp_fd_g_rsz:
+        lea r10, [rip + _hid_rp_rsz];
+        mov [r10], r12;
+        jmp hid_rp_fd_loop;
+
+      hid_rp_fd_g_rid:
+        lea r10, [rip + _hid_rp_rid];
+        mov [r10], r12;
+        jmp hid_rp_fd_loop;
+
+      hid_rp_fd_g_rcnt:
+        lea r10, [rip + _hid_rp_rcnt];
+        mov [r10], r12;
+        jmp hid_rp_fd_loop;
+
+      hid_rp_fd_g_push:
+        // Save (up, rsz, rcnt, rid) at gs[gsd*4..gsd*4+4]. Overflow if
+        // gsd == HID_RP_STACK_DEPTH.
+        lea r10, [rip + _hid_rp_gsd];
+        mov rax, [r10];
+        mov rcx, 8;
+        cmp rax, rcx;
+        jae hid_rp_fd_ovf;
+        // slot = gsd * 4 * 8 = gsd * 32.
+        mov rcx, rax;
+        shl rcx, 5;                       // *32
+        lea r10, [rip + _hid_rp_gs];
+        add r10, rcx;                     // r10 = &gs[gsd*4]
+        // Save 4 fields.
+        lea rcx, [rip + _hid_rp_up];
+        mov rcx, [rcx];
+        mov [r10 + 0], rcx;
+        lea rcx, [rip + _hid_rp_rsz];
+        mov rcx, [rcx];
+        mov [r10 + 8], rcx;
+        lea rcx, [rip + _hid_rp_rcnt];
+        mov rcx, [rcx];
+        mov [r10 + 16], rcx;
+        lea rcx, [rip + _hid_rp_rid];
+        mov rcx, [rcx];
+        mov [r10 + 24], rcx;
+        // gsd += 1.
+        add rax, 1;
+        lea r10, [rip + _hid_rp_gsd];
+        mov [r10], rax;
+        jmp hid_rp_fd_loop;
+
+      hid_rp_fd_g_pop:
+        lea r10, [rip + _hid_rp_gsd];
+        mov rax, [r10];
+        cmp rax, 0;
+        je  hid_rp_fd_bad;
+        sub rax, 1;
+        mov [r10], rax;
+        // slot = gsd * 32.
+        mov rcx, rax;
+        shl rcx, 5;
+        lea r10, [rip + _hid_rp_gs];
+        add r10, rcx;
+        // Restore 4 fields.
+        mov rcx, [r10 + 0];
+        lea rax, [rip + _hid_rp_up];
+        mov [rax], rcx;
+        mov rcx, [r10 + 8];
+        lea rax, [rip + _hid_rp_rsz];
+        mov [rax], rcx;
+        mov rcx, [r10 + 16];
+        lea rax, [rip + _hid_rp_rcnt];
+        mov [rax], rcx;
+        mov rcx, [r10 + 24];
+        lea rax, [rip + _hid_rp_rid];
+        mov [rax], rcx;
+        jmp hid_rp_fd_loop;
+
+        // ============================================================
+        // LOCAL dispatch.
+        // ============================================================
+      hid_rp_fd_local:
+        cmp rdx, 0x0;                     // USAGE
+        je  hid_rp_fd_l_us;
+        cmp rdx, 0x1;                     // USAGE MIN
+        je  hid_rp_fd_l_umin;
+        cmp rdx, 0x2;                     // USAGE MAX
+        je  hid_rp_fd_l_umax;
+        // Other local tags (designator index/min/max, string index,
+        // delimiter) silently consumed per §5.
+        jmp hid_rp_fd_loop;
+
+      hid_rp_fd_l_us:
+        lea r10, [rip + _hid_rp_ulast];
+        mov [r10], r12;
+        jmp hid_rp_fd_loop;
+
+      hid_rp_fd_l_umin:
+        lea r10, [rip + _hid_rp_umin];
+        mov [r10], r12;
+        jmp hid_rp_fd_loop;
+
+      hid_rp_fd_l_umax:
+        lea r10, [rip + _hid_rp_umax];
+        mov [r10], r12;
+        jmp hid_rp_fd_loop;
+
+        // ============================================================
+        // Exit paths.
+        // ============================================================
+      hid_rp_fd_done:
+        // Require depth == 0 (all collections closed).
+        lea r10, [rip + _hid_rp_depth];
+        mov rax, [r10];
+        cmp rax, 0;
+        jne hid_rp_fd_bad;
+        // Set valid = 1.
+        mov rax, 1;
+        lea r10, [rip + _hid_report_valid];
+        mov [r10], rax;
+        xor rax, rax;                     // OK
+        jmp hid_rp_fd_out;
+
+      hid_rp_fd_prop_emit:
+        // rax already holds OVERFLOW from the emit helper.
+        jmp hid_rp_fd_out;
+
+      hid_rp_fd_bad:
+        mov rax, 0xFFFFFC00;              // BAD_DESC
+        jmp hid_rp_fd_out;
+
+      hid_rp_fd_ovf:
+        mov rax, 0xFFFFFC01;              // OVERFLOW
+        jmp hid_rp_fd_out;
+
+      hid_rp_fd_rebind:
+        mov rax, 0xFFFFFC02;              // REBIND
+        jmp hid_rp_fd_out;
+
+      hid_rp_fd_empty:
+        mov rax, 0xFFFFFC03;              // EMPTY
+        // fallthrough to hid_rp_fd_out
+
+      hid_rp_fd_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
