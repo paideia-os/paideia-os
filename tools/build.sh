@@ -4462,6 +4462,261 @@ cqch_pin_one 'pub let codec_q_pack_get_pins_reply : (u64) -> u64'
 cqch_pin_one 'pub let codec_q_pack_set_ack : (u64) -> u64'
 echo "[codec-query-schema] request / reply packer arities pinned"
 
+# ---------------------------------------------------------------------------
+# R33.M4-001 (#1152): ALC287 VENDOR INIT STATE + ARITY PINS.
+#
+# _hda_alc287_init_stats holds every counter and the bind LATCH for the
+# vendor coefficient application. A second writer would let another
+# module claim the coefficient set was applied while the codec never
+# received the twelve verbs, or forge a latch that lets a second apply
+# silently re-run and drift the codec's analog chain. Arity pins hold
+# the six seams to their single-argument shape: widening apply() to
+# accept a caller-supplied table would let a stray helper inject
+# arbitrary coefficients into the codec's analog path.
+HDA_AI_OWNER="${BUILD_DIR}/core/drivers/hda/alc287_init.o"
+HDA_AI_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/alc287_init.pdx"
+if [[ ! -f "${HDA_AI_SRC}" ]]; then
+    echo "[hda-alc287-init-confine] FAIL - ${HDA_AI_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_AI_OWNER}" ]]; then
+    echo "[hda-alc287-init-confine] FAIL: ${HDA_AI_OWNER} not built" >&2
+    exit 1
+fi
+hda_ai_confine_one() {
+    local sym="$1" strays=""
+    if ! obj_relocs_against "${HDA_AI_OWNER}" "${sym}"; then
+        echo "[hda-alc287-init-confine] FAIL: alc287_init.o does not reference ${sym}" >&2
+        exit 1
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_AI_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-alc287-init-confine] FAIL - strays for ${sym}:${strays}" >&2
+        echo "  Only alc287_init.o may write the vendor init counters + latch." >&2
+        echo "  See src/kernel/core/drivers/hda/alc287_init.pdx §2." >&2
+        exit 1
+    fi
+}
+hda_ai_confine_one '_hda_alc287_init_stats'
+echo "[hda-alc287-init-confine] init counters + latch confined"
+
+hda_ai_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_AI_SRC}"; then
+        echo "[hda-alc287-init-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  THE ALC287 INIT SEAMS TAKE ONLY (codec_addr) AND NO TABLE." >&2
+        echo "  A widened apply() would let a stray helper inject arbitrary" >&2
+        echo "  coefficients into the codec's analog path -- exactly what" >&2
+        echo "  the vendor wrapper exists to stop (§0). If a signature" >&2
+        echo "  legitimately changed, §0/§1/§3 of alc287_init.pdx must be" >&2
+        echo "  rewritten first." >&2
+        exit 1
+    fi
+}
+hda_ai_pin_one 'pub let hda_alc287_init_apply : (u64) -> u64'
+hda_ai_pin_one 'pub let hda_alc287_init_bound : () -> u64'
+hda_ai_pin_one 'pub let hda_alc287_init_reset : () -> u64'
+hda_ai_pin_one 'pub let hda_alc287_init_arbitrated : () -> u64'
+hda_ai_pin_one 'pub let hda_alc287_init_stat : (u64) -> u64'
+echo "[hda-alc287-init-confine] apply/bound/reset/arbitrated/stat arities pinned"
+
+# ---------------------------------------------------------------------------
+# R33.M4-002 (#1153): ALC287 HP/SPK PATH STATE + ARITY PINS.
+#
+# _hda_alc287_hp_spk_stats holds the counters, the bind latch AND the
+# current jack-state cell. A second writer would let another module
+# claim the codec is muted while its speaker is running. Arity pins
+# hold auto_switch to a single jack-state argument (a widened seam
+# with codec_addr would let a caller mute a codec they do not own,
+# instead of reading from the latch which by construction belongs to
+# the bound codec).
+HDA_HS_OWNER="${BUILD_DIR}/core/drivers/hda/alc287_hp_spk.o"
+HDA_HS_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/alc287_hp_spk.pdx"
+if [[ ! -f "${HDA_HS_SRC}" ]]; then
+    echo "[hda-alc287-hs-confine] FAIL - ${HDA_HS_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_HS_OWNER}" ]]; then
+    echo "[hda-alc287-hs-confine] FAIL: ${HDA_HS_OWNER} not built" >&2
+    exit 1
+fi
+hda_hs_confine_one() {
+    local sym="$1" strays=""
+    if ! obj_relocs_against "${HDA_HS_OWNER}" "${sym}"; then
+        echo "[hda-alc287-hs-confine] FAIL: alc287_hp_spk.o does not reference ${sym}" >&2
+        exit 1
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_HS_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-alc287-hs-confine] FAIL - strays for ${sym}:${strays}" >&2
+        echo "  Only alc287_hp_spk.o may write the HP/SPK counters + latches." >&2
+        echo "  See src/kernel/core/drivers/hda/alc287_hp_spk.pdx §2." >&2
+        exit 1
+    fi
+}
+hda_hs_confine_one '_hda_alc287_hp_spk_stats'
+echo "[hda-alc287-hs-confine] HP/SPK counters + latches confined"
+
+hda_hs_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_HS_SRC}"; then
+        echo "[hda-alc287-hs-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  ALC287 HP/SPK SEAMS: bind takes (codec_addr); auto_switch" >&2
+        echo "  takes (jack_state) and reads codec_addr from the latch." >&2
+        echo "  A widened auto_switch would let a caller mute a codec they" >&2
+        echo "  do not own. If a signature legitimately changed, §0/§1/§3" >&2
+        echo "  of alc287_hp_spk.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+hda_hs_pin_one 'pub let hda_alc287_hp_spk_bind : (u64) -> u64'
+hda_hs_pin_one 'pub let hda_alc287_hp_spk_auto_switch : (u64) -> u64'
+hda_hs_pin_one 'pub let hda_alc287_hp_spk_bound : () -> u64'
+hda_hs_pin_one 'pub let hda_alc287_hp_spk_reset : () -> u64'
+hda_hs_pin_one 'pub let hda_alc287_hp_spk_arbitrated : () -> u64'
+hda_hs_pin_one 'pub let hda_alc287_hp_spk_stat : (u64) -> u64'
+echo "[hda-alc287-hs-confine] bind/auto_switch/read-seams arities pinned"
+
+# ---------------------------------------------------------------------------
+# R33.M4-003 (#1154): ALC287 MIC PATH STATE + ARITY PINS.
+#
+# _hda_alc287_mic_stats holds counters, latch, active-input and nc-
+# enabled cells. Arity pins hold select() to (which) and nc_enable()
+# to () -- a widened select taking (codec_addr, which) would let a
+# caller re-target the ADC selector to a codec they do not own.
+HDA_MC_OWNER="${BUILD_DIR}/core/drivers/hda/alc287_mic.o"
+HDA_MC_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/alc287_mic.pdx"
+if [[ ! -f "${HDA_MC_SRC}" ]]; then
+    echo "[hda-alc287-mc-confine] FAIL - ${HDA_MC_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_MC_OWNER}" ]]; then
+    echo "[hda-alc287-mc-confine] FAIL: ${HDA_MC_OWNER} not built" >&2
+    exit 1
+fi
+hda_mc_confine_one() {
+    local sym="$1" strays=""
+    if ! obj_relocs_against "${HDA_MC_OWNER}" "${sym}"; then
+        echo "[hda-alc287-mc-confine] FAIL: alc287_mic.o does not reference ${sym}" >&2
+        exit 1
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_MC_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-alc287-mc-confine] FAIL - strays for ${sym}:${strays}" >&2
+        echo "  Only alc287_mic.o may write the mic counters + latches." >&2
+        echo "  See src/kernel/core/drivers/hda/alc287_mic.pdx §2." >&2
+        exit 1
+    fi
+}
+hda_mc_confine_one '_hda_alc287_mic_stats'
+echo "[hda-alc287-mc-confine] mic counters + latches confined"
+
+hda_mc_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_MC_SRC}"; then
+        echo "[hda-alc287-mc-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  ALC287 MIC SEAMS: bind takes (codec_addr); select takes" >&2
+        echo "  (which) and reads codec_addr from the latch; nc_enable" >&2
+        echo "  takes nothing. If a signature legitimately changed," >&2
+        echo "  §0/§1/§3 of alc287_mic.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+hda_mc_pin_one 'pub let hda_alc287_mic_bind : (u64) -> u64'
+hda_mc_pin_one 'pub let hda_alc287_mic_select : (u64) -> u64'
+hda_mc_pin_one 'pub let hda_alc287_mic_nc_enable : () -> u64'
+hda_mc_pin_one 'pub let hda_alc287_mic_bound : () -> u64'
+hda_mc_pin_one 'pub let hda_alc287_mic_reset : () -> u64'
+hda_mc_pin_one 'pub let hda_alc287_mic_arbitrated : () -> u64'
+hda_mc_pin_one 'pub let hda_alc287_mic_stat : (u64) -> u64'
+echo "[hda-alc287-mc-confine] bind/select/nc_enable/read-seams arities pinned"
+
+# ---------------------------------------------------------------------------
+# R33.M4-004 (#1155): ALC287 JACK STATE + ARITY PINS.
+#
+# _hda_alc287_jack_stats holds counters, armed latch, and cached jack
+# state. Arity pins hold isr() to (tag, subtag) and publish() to
+# (state) -- a widened isr accepting codec_addr would let a caller
+# fabricate a jack event against a codec they do not own; a publish()
+# with codec_addr would let a caller inject events into the (future)
+# jack_channel for arbitrary codecs.
+HDA_JK_OWNER="${BUILD_DIR}/core/drivers/hda/alc287_jack.o"
+HDA_JK_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/alc287_jack.pdx"
+if [[ ! -f "${HDA_JK_SRC}" ]]; then
+    echo "[hda-alc287-jk-confine] FAIL - ${HDA_JK_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_JK_OWNER}" ]]; then
+    echo "[hda-alc287-jk-confine] FAIL: ${HDA_JK_OWNER} not built" >&2
+    exit 1
+fi
+hda_jk_confine_one() {
+    local sym="$1" strays=""
+    if ! obj_relocs_against "${HDA_JK_OWNER}" "${sym}"; then
+        echo "[hda-alc287-jk-confine] FAIL: alc287_jack.o does not reference ${sym}" >&2
+        exit 1
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_JK_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-alc287-jk-confine] FAIL - strays for ${sym}:${strays}" >&2
+        echo "  Only alc287_jack.o may write the jack counters + latches." >&2
+        echo "  See src/kernel/core/drivers/hda/alc287_jack.pdx §2." >&2
+        exit 1
+    fi
+}
+hda_jk_confine_one '_hda_alc287_jack_stats'
+echo "[hda-alc287-jk-confine] jack counters + latches confined"
+
+hda_jk_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_JK_SRC}"; then
+        echo "[hda-alc287-jk-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  ALC287 JACK SEAMS: arm takes (codec_addr); isr takes" >&2
+        echo "  (tag, subtag); publish takes (state). A widened seam" >&2
+        echo "  would let a caller fabricate a jack event against a" >&2
+        echo "  codec they do not own. If a signature legitimately" >&2
+        echo "  changed, §0/§1/§3 of alc287_jack.pdx must be rewritten" >&2
+        echo "  first." >&2
+        exit 1
+    fi
+}
+hda_jk_pin_one 'pub let hda_alc287_jack_arm : (u64) -> u64'
+hda_jk_pin_one 'pub let hda_alc287_jack_isr : (u64, u64) -> u64'
+hda_jk_pin_one 'pub let hda_alc287_jack_publish : (u64) -> u64'
+hda_jk_pin_one 'pub let hda_alc287_jack_armed : () -> u64'
+hda_jk_pin_one 'pub let hda_alc287_jack_reset : () -> u64'
+hda_jk_pin_one 'pub let hda_alc287_jack_arbitrated : () -> u64'
+hda_jk_pin_one 'pub let hda_alc287_jack_stat : (u64) -> u64'
+echo "[hda-alc287-jk-confine] arm/isr/publish/read-seams arities pinned"
+
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
