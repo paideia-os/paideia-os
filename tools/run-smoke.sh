@@ -349,9 +349,19 @@ case "${EXPECTED}" in
         # push the tail of the sequence far enough that COOLING SCALE OK
         # was landing after the previous 15s window closed on slower
         # runners.
+        #
+        # R32.M3-001/002 (#1125/#1126) bumped 17s -> 22s: the KIND_HID_
+        # DEVICE and KIND_HID_EVENT witnesses each drive twelve stages
+        # of mint / revoke / dispatch through cap_mint_write (which
+        # emits an audit record per call) and end with a debug_print
+        # KV-line pass, and the added instructions push the tail past
+        # the previous 17s window on slower runners. The bump keeps the
+        # smoke bound proportional to the ADDED work rather than to any
+        # unrelated slowdown -- 5 seconds is roughly two witnesses'
+        # worth of the same shape the R31.M5 backlight bump measured.
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/r17/shell-shutdown.golden"
-        TIMEOUT=17
+        TIMEOUT=22
         UART_RX_MODE=1
         : "${INJECT_STRING:=exit\n}"
         : "${INJECT_WAIT_FOR:=SHELL START}"

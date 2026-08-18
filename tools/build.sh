@@ -2016,6 +2016,170 @@ fi
 echo "[backlight-confine] no static-identity-mutating primitive"
 
 # ---------------------------------------------------------------------------
+# R32.M3-001 (#1125): THE HID DEVICE PATH.
+#
+# Same shape as the backlight / cooling / battery / thermal-zone checks
+# above. Two claims:
+#
+# (a) _hid_device_table is the only place in the kernel where a HID
+#     device's report_id_count and identity (vendor:product,
+#     transport) live. A second writer could raise the report count
+#     or restamp the identity with no capability involved and no
+#     refusal recorded, and every future report_install for that
+#     device would then be recorded against a shape the class driver
+#     never proved. _hid_device_stats is confined for the weaker but
+#     adjacent reason ec_event's, thermal_zone's, battery's,
+#     cooling's and backlight's counters are: they are the only
+#     evidence that reports have been installed at all, and evidence
+#     a second object can write is not evidence.
+#
+# (b) Arity pins. The static identity (transport, vendor, product,
+#     rid_count) comes from the ROW, so the slot-arity-one resolvers
+#     take a capability and nothing else. `transport_of_slot(slot,
+#     assumed)` reads as a convenience and is a way to make a
+#     touchpad answer to a subscription filtered on USB by
+#     arithmetic; refused by the pinned signature.
+#     hid_device_report_install pins at ARITY ONE: a second argument
+#     would be a report byte or a pointer to one, and either is a way
+#     to feed the class driver's next parse from an address of the
+#     caller's choosing (§3).
+HID_DEVICE_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_hid_device.pdx"
+if [[ ! -f "${HID_DEVICE_SRC}" ]]; then
+    echo "[hid-device-confine] FAIL - ${HID_DEVICE_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_hid_device_table' 'core/cap/kind_hid_device.o'
+ec_confine_one '_hid_device_stats' 'core/cap/kind_hid_device.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/cap/kind_hid_device.pdx §1 for why the" >&2
+    echo "  row table has exactly one writer." >&2
+    exit 1
+fi
+echo "[hid-device-confine] HID device rows and counter confined"
+
+hidd_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HID_DEVICE_SRC}"; then
+        echo "[hid-device-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A HID DEVICE'S REPORT_ID_COUNT, TRANSPORT, VENDOR AND PRODUCT" >&2
+        echo "  COME FROM THE CAPABILITY'S OWN ROW AND NEVER FROM A CALLER." >&2
+        echo "  An extra parameter on any of these makes 'report against a" >&2
+        echo "  device other than the one my capability names' expressible," >&2
+        echo "  and the two ways that goes wrong are a touchpad silently" >&2
+        echo "  answering to a keyboard subscription and a keyboard silently" >&2
+        echo "  answering to a touchpad subscription. If a signature" >&2
+        echo "  legitimately changed, the confinement argument in" >&2
+        echo "  src/kernel/core/cap/kind_hid_device.pdx §1 must be" >&2
+        echo "  rewritten first." >&2
+        exit 1
+    fi
+}
+hidd_pin_one 'pub let hid_device_rid_count_of_slot : (u64) -> u64'
+hidd_pin_one 'pub let hid_device_vendor_of_slot : (u64) -> u64'
+hidd_pin_one 'pub let hid_device_product_of_slot : (u64) -> u64'
+hidd_pin_one 'pub let hid_device_transport_of_slot : (u64) -> u64'
+hidd_pin_one 'pub let hid_device_row_of_slot : (u64) -> u64'
+hidd_pin_one 'pub let hid_device_row_rid_count : (u64) -> u64'
+hidd_pin_one 'pub let hid_device_report_install : (u64) -> u64'
+hidd_pin_one 'pub let hid_device_transport_valid : (u64) -> u64'
+echo "[hid-device-confine] static-identity resolvers, report installer and transport validator arities pinned"
+
+# A REPORT_ID_COUNT THAT CAN BE CHANGED IS NOT A DEVICE IDENTITY. The
+# natural names for the mutant are searched for so a contributor adding
+# one gets told why it must not exist at the moment of adding it rather
+# than in review.
+if grep -qE 'hid_device_(set_rid_count|rid_count_set|raise_rid_count|set_transport|transport_set|set_vendor|vendor_set|set_product|product_set|set_index|index_set)' "${HID_DEVICE_SRC}"; then
+    echo "[hid-device-confine] FAIL - a static-identity-mutating primitive" >&2
+    echo "  was added to the HID device kind." >&2
+    echo "" >&2
+    echo "  index, transport, vendor_id, product_id and report_id_count are" >&2
+    echo "  set once, by the mint, and there is no primitive that changes" >&2
+    echo "  them; see src/kernel/core/cap/kind_hid_device.pdx §1." >&2
+    echo "  A REPORT_ID_COUNT THAT CAN BE RAISED WOULD LET A CLASS DRIVER" >&2
+    echo "  READ PAST THE BUFFER ANY LEGITIMATE PARSER SIZED; ONE THAT CAN" >&2
+    echo "  BE LOWERED WOULD LET A LEGITIMATE REPORT ID BECOME UNREACHABLE" >&2
+    echo "  AND ITS DATA NEVER ROUTED." >&2
+    exit 1
+fi
+echo "[hid-device-confine] no static-identity-mutating primitive"
+
+# ---------------------------------------------------------------------------
+# R32.M3-002 (#1126): THE HID EVENT PATH.
+#
+# Same shape as the HID device path above. Two claims:
+#
+# (a) _hid_event_table is the only place in the kernel where a
+#     subscription's (endpoint_id, event_type_mask, subscriber_pid)
+#     triple lives. A second writer could install a subscription
+#     with no gate involved and no audit record, and every future
+#     router delivery would then be one made against a subscription
+#     the derivation lattice never blessed.
+#     _hid_event_stats is confined for the sibling reason.
+#
+# (b) Arity pins. The static identity (endpoint, mask, pid) comes
+#     from the ROW at mint, so the slot-arity-one resolvers take a
+#     capability and nothing else. `mask_of_slot(slot, assumed)`
+#     reads as a convenience and is a way to make a router think
+#     one subscription wants events it never asked for.
+HID_EVENT_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_hid_event.pdx"
+if [[ ! -f "${HID_EVENT_SRC}" ]]; then
+    echo "[hid-event-confine] FAIL - ${HID_EVENT_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_hid_event_table' 'core/cap/kind_hid_event.o'
+ec_confine_one '_hid_event_stats' 'core/cap/kind_hid_event.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/cap/kind_hid_event.pdx §1 for why the row" >&2
+    echo "  table has exactly one writer." >&2
+    exit 1
+fi
+echo "[hid-event-confine] HID event rows and counter confined"
+
+hide_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HID_EVENT_SRC}"; then
+        echo "[hid-event-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A SUBSCRIPTION'S ENDPOINT, MASK AND PID COME FROM THE" >&2
+        echo "  CAPABILITY'S OWN ROW AND NEVER FROM A CALLER. An extra" >&2
+        echo "  parameter on any of these makes 'route my subscription as" >&2
+        echo "  if it were somebody else's' expressible, and the two ways" >&2
+        echo "  that goes wrong are silent event misdelivery and silent" >&2
+        echo "  event drop. If a signature legitimately changed, the" >&2
+        echo "  confinement argument in src/kernel/core/cap/" >&2
+        echo "  kind_hid_event.pdx §1 must be rewritten first." >&2
+        exit 1
+    fi
+}
+hide_pin_one 'pub let hid_event_channel_of_slot : (u64) -> u64'
+hide_pin_one 'pub let hid_event_mask_of_slot : (u64) -> u64'
+hide_pin_one 'pub let hid_event_pid_of_slot : (u64) -> u64'
+hide_pin_one 'pub let hid_event_row_of_slot : (u64) -> u64'
+hide_pin_one 'pub let hid_event_row_mask : (u64) -> u64'
+hide_pin_one 'pub let hid_event_mask_valid : (u64) -> u64'
+echo "[hid-event-confine] static-identity resolvers and mask validator arities pinned"
+
+# A MASK THAT CAN BE CHANGED IS NOT A SUBSCRIPTION. §3 states the
+# discipline explicitly; these are the names a future "let a subscriber
+# add a class after the fact" change would be given.
+if grep -qE 'hid_event_(set_mask|mask_set|widen_mask|narrow_mask|mask_add|mask_remove|set_pid|pid_set|set_channel|channel_set)' "${HID_EVENT_SRC}"; then
+    echo "[hid-event-confine] FAIL - a static-identity-mutating primitive" >&2
+    echo "  was added to the HID event kind." >&2
+    echo "" >&2
+    echo "  event_type_mask, subscriber_pid and event_channel_key are set" >&2
+    echo "  once, by the mint, and there is no primitive that changes" >&2
+    echo "  them; see src/kernel/core/cap/kind_hid_event.pdx §3." >&2
+    echo "  A MASK THAT CAN BE WIDENED WOULD LET A SUBSCRIBER GAIN REACH" >&2
+    echo "  AT RUNTIME NO GATE VALIDATED; NARROWING IS EXPRESSIBLE BY" >&2
+    echo "  REVOKING AND MINTING A FRESH ROW." >&2
+    exit 1
+fi
+echo "[hid-event-confine] no static-identity-mutating primitive"
+
+# ---------------------------------------------------------------------------
 # R31.M3-002 (#1100): BATTERY CHANNEL SCHEMA ARITY PINS.
 #
 # The schema has no storage of its own -- it is pure pack/unpack -- so
