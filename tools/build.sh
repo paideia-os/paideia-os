@@ -2184,6 +2184,153 @@ fi
 echo "[audio-ctrl-confine] no static-identity-mutating primitive"
 
 # ---------------------------------------------------------------------------
+# R33.M3-001 (#1147) + R33.M3-005 (#1151): THE PCM STREAM PATH.
+#
+# Same shape as the audio-controller check above. Two claims:
+#
+# (a) _pcm_stream_table is the only place in the kernel where a PCM
+#     stream's audio_clock_slot, ring_bo_key, sample_format, sample_rate,
+#     channels and position live. A second writer could restamp
+#     audio_clock_slot with no capability involved and no refusal
+#     recorded, and every future presentation-time computation would
+#     then be relative to a clock the mint never approved. This is
+#     what LINEAR means for this kind. _pcm_stream_stats is confined
+#     for the sibling reason (only evidence that mints, xclock refusals
+#     and position advances happened at all).
+#
+# (b) Arity pins. The static identity comes FROM the ROW, so the
+#     slot-arity-one resolvers take a capability and nothing else.
+#     position_advance pins at ARITY TWO: a third argument would be a
+#     caller-supplied clock or ring reaching a §1-set-once field.
+PCM_STREAM_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_pcm_stream.pdx"
+if [[ ! -f "${PCM_STREAM_SRC}" ]]; then
+    echo "[pcm-stream-confine] FAIL - ${PCM_STREAM_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_pcm_stream_table' 'core/cap/kind_pcm_stream.o'
+ec_confine_one '_pcm_stream_stats' 'core/cap/kind_pcm_stream.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/cap/kind_pcm_stream.pdx §1 for why the" >&2
+    echo "  row table has exactly one writer." >&2
+    exit 1
+fi
+echo "[pcm-stream-confine] pcm stream rows and counter confined"
+
+pcm_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${PCM_STREAM_SRC}"; then
+        echo "[pcm-stream-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A PCM STREAM'S audio_clock_slot, ring_bo_key, sample_format," >&2
+        echo "  sample_rate AND channels COME FROM THE CAPABILITY'S OWN ROW" >&2
+        echo "  AND NEVER FROM A CALLER. An extra parameter on any of these" >&2
+        echo "  makes 'advance a stream against a clock other than the one" >&2
+        echo "  my capability names' expressible, and the two ways that goes" >&2
+        echo "  wrong are two producers on one ring at two different clocks." >&2
+        echo "  If a signature legitimately changed, the LINEAR discipline" >&2
+        echo "  in src/kernel/core/cap/kind_pcm_stream.pdx §1 must be" >&2
+        echo "  rewritten first." >&2
+        exit 1
+    fi
+}
+pcm_pin_one 'pub let pcm_stream_clock_of_slot : (u64) -> u64'
+pcm_pin_one 'pub let pcm_stream_ring_of_slot : (u64) -> u64'
+pcm_pin_one 'pub let pcm_stream_position_of_slot : (u64) -> u64'
+pcm_pin_one 'pub let pcm_stream_row_of_slot : (u64) -> u64'
+pcm_pin_one 'pub let pcm_stream_position_advance : (u64, u64) -> u64'
+pcm_pin_one 'pub let pcm_stream_find_conflicting_ring_clock : (u64, u64) -> u64'
+echo "[pcm-stream-confine] LINEAR resolvers, position advancer and xclock invariant scanner arities pinned"
+
+# The natural names for a mutant that would break LINEAR are searched
+# for so a contributor gets told why they must not exist at the moment
+# of adding them.
+if grep -qE 'pcm_stream_(set_clock|clock_set|reparent|set_ring|ring_set|set_format|set_rate|set_channels)' "${PCM_STREAM_SRC}"; then
+    echo "[pcm-stream-confine] FAIL - a static-identity-mutating primitive" >&2
+    echo "  was added to the PCM stream kind." >&2
+    echo "" >&2
+    echo "  audio_clock_slot, ring_bo_key, sample_format, sample_rate and" >&2
+    echo "  channels are set once, by the mint, and there is no primitive" >&2
+    echo "  that changes them; see src/kernel/core/cap/kind_pcm_stream.pdx" >&2
+    echo "  §1." >&2
+    exit 1
+fi
+echo "[pcm-stream-confine] no LINEAR-breaking primitive"
+
+# ---------------------------------------------------------------------------
+# R33.M3-003 (#1149): THE AUDIO CLOCK PATH.
+#
+# Same shape. Two claims: (a) _audio_clock_table is the only place a
+# clock's clock_source and nominal_hz live, plus its running current_hz
+# and samples_produced. (b) Slot-arity-one resolvers and the report
+# installer (arity three: cap + new_current_hz + samples_delta) pin so
+# a caller cannot smuggle a clock source or a nominal rate through the
+# path.
+AUDIO_CLOCK_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_audio_clock.pdx"
+if [[ ! -f "${AUDIO_CLOCK_SRC}" ]]; then
+    echo "[audio-clock-confine] FAIL - ${AUDIO_CLOCK_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_audio_clock_table' 'core/cap/kind_audio_clock.o'
+ec_confine_one '_audio_clock_stats' 'core/cap/kind_audio_clock.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/cap/kind_audio_clock.pdx §1 for why the" >&2
+    echo "  row table has exactly one writer." >&2
+    exit 1
+fi
+echo "[audio-clock-confine] audio clock rows and counter confined"
+
+aclk_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${AUDIO_CLOCK_SRC}"; then
+        echo "[audio-clock-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        exit 1
+    fi
+}
+aclk_pin_one 'pub let audio_clock_source_of_slot : (u64) -> u64'
+aclk_pin_one 'pub let audio_clock_nominal_of_slot : (u64) -> u64'
+aclk_pin_one 'pub let audio_clock_current_of_slot : (u64) -> u64'
+aclk_pin_one 'pub let audio_clock_samples_of_slot : (u64) -> u64'
+aclk_pin_one 'pub let audio_clock_row_of_slot : (u64) -> u64'
+aclk_pin_one 'pub let audio_clock_report_install : (u64, u64, u64) -> u64'
+aclk_pin_one 'pub let audio_clock_source_valid : (u64) -> u64'
+aclk_pin_one 'pub let audio_clock_hz_valid : (u64) -> u64'
+echo "[audio-clock-confine] static-identity resolvers, report installer and validator arities pinned"
+
+if grep -qE 'audio_clock_(set_source|source_set|set_nominal|nominal_set|set_key|key_set)' "${AUDIO_CLOCK_SRC}"; then
+    echo "[audio-clock-confine] FAIL - a static-identity-mutating primitive" >&2
+    echo "  was added to the audio clock kind." >&2
+    exit 1
+fi
+echo "[audio-clock-confine] no static-identity-mutating primitive"
+
+# ---------------------------------------------------------------------------
+# R33.M3-002 (#1148): THE HDA BDL PATH.
+#
+# Confine the five state cells (_hda_bdl_bound / _pa / _entries / _cbl /
+# _shadow) and the counters. tools/build.sh confines relocations against
+# all of them to core/drivers/hda/bdl.o so a stray writer cannot restamp
+# the BDL parameters or shadow entries.
+HDA_BDL_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/bdl.pdx"
+if [[ ! -f "${HDA_BDL_SRC}" ]]; then
+    echo "[hda-bdl-confine] FAIL - ${HDA_BDL_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_hda_bdl_bound' 'core/drivers/hda/bdl.o'
+ec_confine_one '_hda_bdl_pa' 'core/drivers/hda/bdl.o'
+ec_confine_one '_hda_bdl_entries' 'core/drivers/hda/bdl.o'
+ec_confine_one '_hda_bdl_cbl' 'core/drivers/hda/bdl.o'
+ec_confine_one '_hda_bdl_shadow' 'core/drivers/hda/bdl.o'
+ec_confine_one '_hda_bdl_stats' 'core/drivers/hda/bdl.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/drivers/hda/bdl.pdx §2 for why the BDL" >&2
+    echo "  parameters and shadow entries have exactly one writer." >&2
+    exit 1
+fi
+echo "[hda-bdl-confine] hda BDL state confined"
+
+# ---------------------------------------------------------------------------
 # R32.M3-002 (#1126): THE HID EVENT PATH.
 #
 # Same shape as the HID device path above. Two claims:
