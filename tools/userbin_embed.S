@@ -49,3 +49,10 @@ _acpi_supervisor_bin_start:
 .global _acpi_supervisor_bin_end
 _acpi_supervisor_bin_end:
 .balign 4096
+# R33.M5-004 (#1160): audio_supervisor userspace image.
+.global _audio_supervisor_bin_start
+_audio_supervisor_bin_start:
+.incbin "build/user/audio_supervisor.elf"
+.global _audio_supervisor_bin_end
+_audio_supervisor_bin_end:
+.balign 4096

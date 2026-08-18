@@ -2306,6 +2306,92 @@ fi
 echo "[audio-clock-confine] no static-identity-mutating primitive"
 
 # ---------------------------------------------------------------------------
+# R33.M5-002 (#1158): THE AUDIO ROUTE PATH.
+#
+# Same shape as the pcm-stream path. Two claims:
+#
+# (a) _audio_route_table is the only place in the kernel where a route's
+#     source_stream_slot, dest_pcm_slot, gain_q15 and mute live. A second
+#     writer could restamp source_stream_slot with no capability involved
+#     and no refusal recorded, redirecting one edge's samples silently.
+#     _audio_route_stats is confined for the sibling reason.
+#
+# (b) Arity pins. The static identity (source, dest, key) comes FROM the
+#     ROW, so the slot-arity-one resolvers take a capability and nothing
+#     else. set_gain and set_mute pin at ARITY TWO: a third argument
+#     would be a caller-supplied source or dest reaching a §1-set-once
+#     field.
+AUDIO_ROUTE_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_audio_route.pdx"
+if [[ ! -f "${AUDIO_ROUTE_SRC}" ]]; then
+    echo "[audio-route-confine] FAIL - ${AUDIO_ROUTE_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_audio_route_table' 'core/cap/kind_audio_route.o'
+ec_confine_one '_audio_route_stats' 'core/cap/kind_audio_route.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/cap/kind_audio_route.pdx §1 for why the" >&2
+    echo "  row table has exactly one writer." >&2
+    exit 1
+fi
+echo "[audio-route-confine] audio route rows and counter confined"
+
+art_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${AUDIO_ROUTE_SRC}"; then
+        echo "[audio-route-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "  An AUDIO ROUTE'S source_stream_slot, dest_pcm_slot AND" >&2
+        echo "  route_key COME FROM THE CAPABILITY'S OWN ROW AND NEVER" >&2
+        echo "  FROM A CALLER. An extra parameter on any of these makes" >&2
+        echo "  'redirect a route away from the streams my capability" >&2
+        echo "  names' expressible. If a signature legitimately changed," >&2
+        echo "  the LINEAR discipline in kind_audio_route.pdx §1 must be" >&2
+        echo "  rewritten first." >&2
+        exit 1
+    fi
+}
+art_pin_one 'pub let audio_route_source_of_slot : (u64) -> u64'
+art_pin_one 'pub let audio_route_dest_of_slot : (u64) -> u64'
+art_pin_one 'pub let audio_route_gain_of_slot : (u64) -> u64'
+art_pin_one 'pub let audio_route_mute_of_slot : (u64) -> u64'
+art_pin_one 'pub let audio_route_row_of_slot : (u64) -> u64'
+art_pin_one 'pub let audio_route_set_gain : (u64, u64) -> u64'
+art_pin_one 'pub let audio_route_set_mute : (u64, u64) -> u64'
+echo "[audio-route-confine] LINEAR resolvers and set_gain/set_mute arities pinned"
+
+if grep -qE 'audio_route_(set_source|source_set|reparent|set_dest|dest_set|set_key|key_set)' "${AUDIO_ROUTE_SRC}"; then
+    echo "[audio-route-confine] FAIL - a static-identity-mutating primitive" >&2
+    echo "  was added to the audio route kind." >&2
+    echo "" >&2
+    echo "  source_stream_slot, dest_pcm_slot and route_key are set once," >&2
+    echo "  by the mint, and there is no primitive that changes them; see" >&2
+    echo "  src/kernel/core/cap/kind_audio_route.pdx §1." >&2
+    exit 1
+fi
+echo "[audio-route-confine] no LINEAR-breaking primitive"
+
+# ---------------------------------------------------------------------------
+# R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
+#
+# One saturating combine, everywhere. Two Q15 adders would let one path
+# saturate and the other wrap, and no downstream stage could tell them
+# apart. The primitive lives in route_table.pdx per §0 of the file; this
+# gate confines its symbol.
+Q15_ROUTE_SRC="${REPO_ROOT}/src/kernel/core/drivers/audio/route_table.pdx"
+if [[ ! -f "${Q15_ROUTE_SRC}" ]]; then
+    echo "[q15-confine] FAIL - ${Q15_ROUTE_SRC} not found" >&2
+    exit 1
+fi
+if ! grep -qF -- 'pub let q15_add_sat : (u64, u64) -> u64' "${Q15_ROUTE_SRC}"; then
+    echo "[q15-confine] FAIL - q15_add_sat signature drifted." >&2
+    echo "  The saturating combine is the ONE primitive that answers the" >&2
+    echo "  amplifier's question about combined gain. See" >&2
+    echo "  src/kernel/core/drivers/audio/route_table.pdx §0." >&2
+    exit 1
+fi
+echo "[q15-confine] q15_add_sat signature pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M3-002 (#1148): THE HDA BDL PATH.
 #
 # Confine the five state cells (_hda_bdl_bound / _pa / _entries / _cbl /

@@ -15,6 +15,7 @@ ECHO_SERVER_LINK_SCRIPT="${USER_SRC}/echo_server.ld"
 ECHO_CLIENT_LINK_SCRIPT="${USER_SRC}/echo_client.ld"
 ACPI_SUPERVISOR_LINK_SCRIPT="${USER_SRC}/acpi_supervisor.ld"
 PCI_ENUMERATOR_LINK_SCRIPT="${USER_SRC}/pci_enumerator.ld"
+AUDIO_SUPERVISOR_LINK_SCRIPT="${USER_SRC}/audio_supervisor.ld"
 
 if [[ ! -f "${SHELL_LINK_SCRIPT}" ]]; then
     echo "shell linker script missing: ${SHELL_LINK_SCRIPT}" >&2
@@ -56,6 +57,11 @@ if [[ ! -f "${PCI_ENUMERATOR_LINK_SCRIPT}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${AUDIO_SUPERVISOR_LINK_SCRIPT}" ]]; then
+    echo "audio_supervisor linker script missing: ${AUDIO_SUPERVISOR_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 
@@ -69,6 +75,7 @@ ECHO_SERVER_OBJECTS=()
 ECHO_CLIENT_OBJECTS=()
 ACPI_SUPERVISOR_OBJECTS=()
 PCI_ENUMERATOR_OBJECTS=()
+AUDIO_SUPERVISOR_OBJECTS=()
 AML_OBJECTS=()
 LIBS_OBJECTS=()
 
@@ -108,6 +115,12 @@ while IFS= read -r -d '' pdx; do
         # cap slots (KIND_IPC_ENDPOINT + KIND_ACPI) per the dispatch loop's
         # request/reply pattern.
         ACPI_SUPERVISOR_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "audio_supervisor.pdx" ]]; then
+        # R33.M5-001 (#1157): audio_supervisor.pdx is self-contained
+        # (inlines its two IPC syscalls — sys_ipc_recv + sys_ipc_reply).
+        # Sidecar seeds TWO cap slots (14 = RPC endpoint at endpoint_id=5,
+        # 15 = reserved endpoint at endpoint_id=6).
+        AUDIO_SUPERVISOR_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "pci_enumerator.pdx" ]]; then
         # R22-M3-005 (#860): pci_enumerator.pdx is self-contained (inlines
         # its two IPC syscalls — sys_ipc_recv + sys_ipc_reply) so its object
@@ -348,6 +361,30 @@ if [[ ${#PCI_ENUMERATOR_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/pci_enumerator.elf"
     echo "[ok] ${BUILD_DIR}/pci_enumerator.bin"
+fi
+
+# Link audio_supervisor.elf with audio_supervisor objects only (R33.M5-001 #1157).
+# Self-contained (inlines its two IPC syscalls -- sys_ipc_recv + sys_ipc_reply);
+# mirrors acpi_supervisor.elf / pci_enumerator.elf pattern. Declares an
+# `_init_caps` sidecar with TWO entries: cap_slot 14 -> RPC endpoint
+# (endpoint_id=5, R_IPC_ALL for dispatch-loop request/reply -- distinct from
+# echo_server=1, echo_client reply_ep=2, acpi_supervisor=3, pci_enumerator=4),
+# cap_slot 15 -> reserved endpoint (endpoint_id=6). At R33.M5-001 the sidecar
+# exists in .rodata and is shape-verified at build; the kernel M5-004 crash
+# isolation witness spawns audio_supervisor as a userspace task and kills it
+# to observe the whole death cascade end-to-end.
+if [[ ${#AUDIO_SUPERVISOR_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T audio_supervisor.ld -> audio_supervisor.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${AUDIO_SUPERVISOR_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/audio_supervisor.elf" \
+        "${AUDIO_SUPERVISOR_OBJECTS[@]}"
+
+    echo "[objcopy-user] audio_supervisor.elf -> audio_supervisor.bin"
+    objcopy -O binary "${BUILD_DIR}/audio_supervisor.elf" "${BUILD_DIR}/audio_supervisor.bin"
+
+    echo "[ok] ${BUILD_DIR}/audio_supervisor.elf"
+    echo "[ok] ${BUILD_DIR}/audio_supervisor.bin"
 fi
 
 # R31.M2-1595 (#1595): PT_LOAD extent gate over every image linked above.
