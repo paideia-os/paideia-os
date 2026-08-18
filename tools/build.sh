@@ -3065,6 +3065,148 @@ hid_cw_pin_one 'pub let hid_collection_depth_at : (u64) -> u64'
 hid_cw_pin_one 'pub let hid_collection_walker_consumed : () -> u64'
 echo "[hid-collection-walker-confine] walk, count, max_depth, type_at, depth_at and consumed arities pinned"
 
+# ---------------------------------------------------------------------------
+# R32.M2-004 (#1123): HID FIELD EXTRACTOR CONFINEMENT + ARITY PINS.
+#
+# The extractor's only writable state is its honesty counter; a stray
+# writer would flip the pin without a live consumer ever landing. The
+# extractor consults NO parser state at its own arity (§0 of
+# field_extract.pdx) -- byte/bit offsets within a report are DERIVED
+# from a schema walk in the class driver R32.M3 will land, and threading
+# the schema into the extractor would let a caller reach a field the
+# walk never traversed.
+#
+# The three seams take (report_ptr, report_len, bit_offset, bit_width)
+# or (report_ptr, report_len, byte_offset, index); a widened signature
+# would let a caller thread out-of-band state through arg registers the
+# gates never validated.
+HID_FE_OWNER="${BUILD_DIR}/core/drivers/hid/field_extract.o"
+HID_FE_SRC="${REPO_ROOT}/src/kernel/core/drivers/hid/field_extract.pdx"
+if [[ ! -f "${HID_FE_SRC}" ]]; then
+    echo "[hid-field-extract-confine] FAIL - ${HID_FE_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HID_FE_OWNER}" ]]; then
+    echo "[hid-field-extract-confine] FAIL: ${HID_FE_OWNER} not built" >&2
+    exit 1
+fi
+hid_fe_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${HID_FE_OWNER}" "${sym}"; then
+        echo "[hid-field-extract-confine] FAIL: field_extract.o does not reference ${sym}" >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HID_FE_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hid-field-extract-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/hid/field_extract.o relocate against ${sym}:${strays}" >&2
+        echo "  Extractor honesty counter must not be flipped outside the" >&2
+        echo "  extractor's own object. See src/kernel/core/drivers/hid/" >&2
+        echo "  field_extract.pdx §2." >&2
+        exit 1
+    fi
+}
+hid_fe_confine_one '_hid_field_extract_consumers'
+echo "[hid-field-extract-confine] extractor honesty counter confined"
+
+hid_fe_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HID_FE_SRC}"; then
+        echo "[hid-field-extract-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  THE EXTRACT SEAMS TAKE (report_ptr, report_len, bit_offset," >&2
+        echo "  bit_width) or (report_ptr, report_len, byte_offset, index)." >&2
+        echo "  Widening would let a caller thread out-of-band state through" >&2
+        echo "  arg registers the gates never validated. See" >&2
+        echo "  src/kernel/core/drivers/hid/field_extract.pdx §0 / §3." >&2
+        exit 1
+    fi
+}
+hid_fe_pin_one 'pub let hid_field_extract_bits : (u64, u64, u64, u64) -> u64'
+hid_fe_pin_one 'pub let hid_field_extract_signed : (u64, u64, u64, u64) -> u64'
+hid_fe_pin_one 'pub let hid_field_extract_array : (u64, u64, u64, u64) -> u64'
+hid_fe_pin_one 'pub let hid_field_extract_consumed : () -> u64'
+echo "[hid-field-extract-confine] bits, signed, array and consumed arities pinned"
+
+# ---------------------------------------------------------------------------
+# R32.M2-005 (#1124): HID REPORT-IO CONFINEMENT + ARITY PINS.
+#
+# The GET/SET_REPORT dispatch counters are the ONE state this module
+# writes; a stray writer would count a round-trip that never issued,
+# and the boot witness assertion (get_deferred/set_deferred moved by
+# exactly 1) would advance without the transport having been asked.
+# tools/build.sh confines both stats arrays to this object.
+#
+# The dispatch seams take (report_type, report_id) or
+# (report_type, report_id, byte); a widened signature would let a
+# caller reach a report-type / id combination the module's gates
+# (BAD_TYPE, BAD_ID) never validated.
+HID_RI_OWNER="${BUILD_DIR}/core/drivers/hid/report_io.o"
+HID_RI_SRC="${REPO_ROOT}/src/kernel/core/drivers/hid/report_io.pdx"
+if [[ ! -f "${HID_RI_SRC}" ]]; then
+    echo "[hid-report-io-confine] FAIL - ${HID_RI_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HID_RI_OWNER}" ]]; then
+    echo "[hid-report-io-confine] FAIL: ${HID_RI_OWNER} not built" >&2
+    exit 1
+fi
+hid_ri_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${HID_RI_OWNER}" "${sym}"; then
+        echo "[hid-report-io-confine] FAIL: report_io.o does not reference ${sym}" >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HID_RI_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hid-report-io-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/hid/report_io.o relocate against ${sym}:${strays}" >&2
+        echo "  Only hid_report_get / hid_report_set may count round-trips." >&2
+        echo "  See src/kernel/core/drivers/hid/report_io.pdx §1." >&2
+        exit 1
+    fi
+}
+hid_ri_confine_one '_hid_report_get_stats'
+hid_ri_confine_one '_hid_report_set_stats'
+echo "[hid-report-io-confine] get/set round-trip stats confined"
+
+hid_ri_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HID_RI_SRC}"; then
+        echo "[hid-report-io-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  THE GET_REPORT SEAM TAKES (report_type, report_id) AND THE" >&2
+        echo "  SET_REPORT SEAM TAKES (report_type, report_id, byte). A" >&2
+        echo "  widened signature would let a caller reach a report-type / id" >&2
+        echo "  combination the module's gates never validated. See" >&2
+        echo "  src/kernel/core/drivers/hid/report_io.pdx §0 / §2." >&2
+        exit 1
+    fi
+}
+hid_ri_pin_one 'pub let hid_report_get : (u64, u64) -> u64'
+hid_ri_pin_one 'pub let hid_report_set : (u64, u64, u64) -> u64'
+hid_ri_pin_one 'pub let hid_report_get_arbitrated : () -> u64'
+hid_ri_pin_one 'pub let hid_report_set_arbitrated : () -> u64'
+hid_ri_pin_one 'pub let hid_report_get_count : () -> u64'
+hid_ri_pin_one 'pub let hid_report_set_count : () -> u64'
+hid_ri_pin_one 'pub let hid_report_get_deferred : () -> u64'
+hid_ri_pin_one 'pub let hid_report_set_deferred : () -> u64'
+echo "[hid-report-io-confine] get, set, arbitrated, count and deferred arities pinned"
+
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
