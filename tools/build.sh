@@ -2682,6 +2682,38 @@ fi
 echo "[usb-fp-confine] USB fingerprint sensor substrate state confined"
 
 # ---------------------------------------------------------------------------
+# R35.M1 (#1195/#1196/#1197/#1198): PCIe hotplug substrate state
+# confinement.
+#
+# Four modules, each owns its own row table / stats array.
+# tools/build.sh confines relocations against each one to its owning
+# object so a second writer cannot restamp a subscription's endpoint
+# identity, forge an event count behind the ISR's back, or bump the
+# retrain-success counter without a retrain sequence.
+PHE_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_pcie_hotplug_event.pdx"
+PHI_SRC="${REPO_ROOT}/src/kernel/core/drivers/pcie/hotplug_isr.pdx"
+PHC_SRC="${REPO_ROOT}/src/kernel/core/ipc/pcie_hotplug_channel.pdx"
+PLR_SRC="${REPO_ROOT}/src/kernel/core/drivers/pcie/link_retrain.pdx"
+if [[ ! -f "${PHE_SRC}" || ! -f "${PHI_SRC}" || ! -f "${PHC_SRC}" \
+        || ! -f "${PLR_SRC}" ]]; then
+    echo "[pcie-hp-confine] FAIL - one of the R35.M1 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_pcie_hp_evt_table'          'core/cap/kind_pcie_hotplug_event.o'
+ec_confine_one '_pcie_hp_evt_stats'          'core/cap/kind_pcie_hotplug_event.o'
+ec_confine_one '_pcie_hotplug_isr_stats'     'core/drivers/pcie/hotplug_isr.o'
+ec_confine_one '_pcie_hotplug_channel_subs'  'core/ipc/pcie_hotplug_channel.o'
+ec_confine_one '_pcie_hotplug_channel_stats' 'core/ipc/pcie_hotplug_channel.o'
+ec_confine_one '_pcie_link_retrain_stats'    'core/drivers/pcie/link_retrain.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_pcie_hotplug_event.pdx §3, hotplug_isr.pdx §3," >&2
+    echo "  pcie_hotplug_channel.pdx §2 and link_retrain.pdx §2 for" >&2
+    echo "  the row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[pcie-hp-confine] PCIe hotplug substrate state confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
