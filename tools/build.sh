@@ -2106,6 +2106,84 @@ fi
 echo "[hid-device-confine] no static-identity-mutating primitive"
 
 # ---------------------------------------------------------------------------
+# R33.M1-005 (#1141): THE AUDIO CONTROLLER PATH.
+#
+# Same shape as the backlight / hid-device checks above. Two claims:
+#
+# (a) _audio_controller_table is the only place in the kernel where an
+#     HDA controller's bar_handle, corb_size and rirb_size live. A
+#     second writer could restamp them with no capability involved and
+#     no refusal recorded, and every future GET_PARAMETER by the
+#     discovery driver would then address a BAR window nobody proved.
+#     _audio_ctrl_stats is confined for the weaker but adjacent reason
+#     ec_event's / thermal_zone's / hid_device's counters are: they are
+#     the only evidence that reports have been installed at all.
+#
+# (b) Arity pins. The static identity (bar_handle, ring shapes) comes
+#     from the ROW, so the slot-arity-one resolvers take a capability
+#     and nothing else. `bar_of_slot(slot, default_bar)` reads as a
+#     convenience and is a way to widen a controller's advertised BAR.
+#     audio_ctrl_report_install pins at ARITY TWO: a third argument
+#     would be a caller-supplied bar_handle or ring shape reaching a
+#     row §1 declares set-once at mint.
+AUDIO_CTRL_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_audio_controller.pdx"
+if [[ ! -f "${AUDIO_CTRL_SRC}" ]]; then
+    echo "[audio-ctrl-confine] FAIL - ${AUDIO_CTRL_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_audio_controller_table' 'core/cap/kind_audio_controller.o'
+ec_confine_one '_audio_ctrl_stats' 'core/cap/kind_audio_controller.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/cap/kind_audio_controller.pdx §1 for why the" >&2
+    echo "  row table has exactly one writer." >&2
+    exit 1
+fi
+echo "[audio-ctrl-confine] audio controller rows and counter confined"
+
+ac_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${AUDIO_CTRL_SRC}"; then
+        echo "[audio-ctrl-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  AN HDA CONTROLLER'S BAR_HANDLE, CORB_SIZE AND RIRB_SIZE COME" >&2
+        echo "  FROM THE CAPABILITY'S OWN ROW AND NEVER FROM A CALLER. An" >&2
+        echo "  extra parameter on any of these makes 'report against a" >&2
+        echo "  controller other than the one my capability names'" >&2
+        echo "  expressible, and the two ways that goes wrong are one" >&2
+        echo "  driver's DMA reaching another driver's BAR window. If a" >&2
+        echo "  signature legitimately changed, the confinement argument in" >&2
+        echo "  src/kernel/core/cap/kind_audio_controller.pdx §1 must be" >&2
+        echo "  rewritten first." >&2
+        exit 1
+    fi
+}
+ac_pin_one 'pub let audio_ctrl_bar_of_slot : (u64) -> u64'
+ac_pin_one 'pub let audio_ctrl_codecs_of_slot : (u64) -> u64'
+ac_pin_one 'pub let audio_ctrl_reports_of_slot : (u64) -> u64'
+ac_pin_one 'pub let audio_ctrl_row_of_slot : (u64) -> u64'
+ac_pin_one 'pub let audio_ctrl_row_bar : (u64) -> u64'
+ac_pin_one 'pub let audio_ctrl_report_install : (u64, u64) -> u64'
+ac_pin_one 'pub let audio_ctrl_corb_size_valid : (u64) -> u64'
+ac_pin_one 'pub let audio_ctrl_rirb_size_valid : (u64) -> u64'
+echo "[audio-ctrl-confine] static-identity resolvers, report installer and ring-size validator arities pinned"
+
+# A BAR_HANDLE OR RING SHAPE THAT CAN BE CHANGED IS NOT A CONTROLLER
+# IDENTITY. The natural names for the mutant are searched for so a
+# contributor adding one gets told why it must not exist at the moment
+# of adding it rather than in review.
+if grep -qE 'audio_ctrl_(set_bar|bar_set|raise_bar|set_corbsz|corbsz_set|set_rirbsz|rirbsz_set|set_key|key_set)' "${AUDIO_CTRL_SRC}"; then
+    echo "[audio-ctrl-confine] FAIL - a static-identity-mutating primitive" >&2
+    echo "  was added to the audio controller kind." >&2
+    echo "" >&2
+    echo "  hda_key, bar_handle, corb_size and rirb_size are set once, by" >&2
+    echo "  the mint, and there is no primitive that changes them; see" >&2
+    echo "  src/kernel/core/cap/kind_audio_controller.pdx §1." >&2
+    exit 1
+fi
+echo "[audio-ctrl-confine] no static-identity-mutating primitive"
+
+# ---------------------------------------------------------------------------
 # R32.M3-002 (#1126): THE HID EVENT PATH.
 #
 # Same shape as the HID device path above. Two claims:
@@ -3933,6 +4011,70 @@ hda_rb_pin_one 'pub let hda_rirb_consume : (u64) -> u64'
 hda_rb_pin_one 'pub let hda_rirb_solicited : () -> u64'
 hda_rb_pin_one 'pub let hda_rirb_unsolicited : () -> u64'
 echo "[hda-rirb-confine] init, consume, arbitrated and accessor arities pinned"
+
+# ---------------------------------------------------------------------------
+# R33.M2-001 (#1142): HDA CODEC DISCOVERY SCAFFOLD STATE + ARITY PINS.
+#
+# Same shape as [hda-corb-confine]. One symbol to confine
+# (_hda_codec_disc_stats); the discovery driver uses no bind latch of
+# its own -- it gates on hda_corb_bound() && hda_rirb_bound().
+HDA_CD_OWNER="${BUILD_DIR}/core/drivers/hda/codec_discovery.o"
+HDA_CD_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/codec_discovery.pdx"
+if [[ ! -f "${HDA_CD_SRC}" ]]; then
+    echo "[hda-codec-disc-confine] FAIL - ${HDA_CD_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_CD_OWNER}" ]]; then
+    echo "[hda-codec-disc-confine] FAIL: ${HDA_CD_OWNER} not built" >&2
+    exit 1
+fi
+hda_cd_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${HDA_CD_OWNER}" "${sym}"; then
+        echo "[hda-codec-disc-confine] FAIL: codec_discovery.o does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  check would then pass vacuously, so it fails instead." >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_CD_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-codec-disc-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/hda/codec_discovery.o relocate against ${sym}:${strays}" >&2
+        echo "  Only the discovery seams may write the codec-disc counters. See" >&2
+        echo "  src/kernel/core/drivers/hda/codec_discovery.pdx §2." >&2
+        exit 1
+    fi
+}
+hda_cd_confine_one '_hda_codec_disc_stats'
+echo "[hda-codec-disc-confine] codec discovery stats confined"
+
+hda_cd_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_CD_SRC}"; then
+        echo "[hda-codec-disc-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  THE HDA CODEC DISCOVERY SEAMS TAKE ONLY WIRE-FIELD ARGUMENTS." >&2
+        echo "  Widening verb_encode to accept a pre-packed u32 or the driver" >&2
+        echo "  probes to accept a raw verb would bypass the §1 field" >&2
+        echo "  validator. If a signature legitimately changed, §0/§1/§3 of" >&2
+        echo "  codec_discovery.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+hda_cd_pin_one 'pub let hda_codec_verb_encode : (u64, u64, u64, u64) -> u64'
+hda_cd_pin_one 'pub let hda_codec_get_parameter : (u64, u64, u64) -> u64'
+hda_cd_pin_one 'pub let hda_codec_walk_function_groups : (u64) -> u64'
+hda_cd_pin_one 'pub let hda_codec_walk_widgets : (u64, u64) -> u64'
+hda_cd_pin_one 'pub let hda_codec_discovery_probe_all : () -> u64'
+hda_cd_pin_one 'pub let hda_codec_discovery_arbitrated : () -> u64'
+echo "[hda-codec-disc-confine] encoder, probe seams and honesty pin arities pinned"
 
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
