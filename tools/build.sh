@@ -2524,6 +2524,65 @@ fi
 echo "[usb-composite-confine] composite bind + interface parser state confined"
 
 # ---------------------------------------------------------------------------
+# R34.M3 (#1176/#1178/#1179): KIND_MSC_LUN + KIND_SCSI_DEVICE +
+# KIND_USB_URB row-table confinement, mirroring the R34.M2 pair.
+MSCLUN_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_msc_lun.pdx"
+SCSID_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_scsi_device.pdx"
+USBURB_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_usb_urb.pdx"
+if [[ ! -f "${MSCLUN_SRC}" || ! -f "${SCSID_SRC}" || ! -f "${USBURB_SRC}" ]]; then
+    echo "[usb-msc-confine] FAIL - one of the R34.M3 kind sources missing" >&2
+    exit 1
+fi
+ec_confine_one '_msc_lun_table'     'core/cap/kind_msc_lun.o'
+ec_confine_one '_msc_lun_stats'     'core/cap/kind_msc_lun.o'
+ec_confine_one '_scsi_device_table' 'core/cap/kind_scsi_device.o'
+ec_confine_one '_scsi_device_stats' 'core/cap/kind_scsi_device.o'
+ec_confine_one '_usb_urb_table'     'core/cap/kind_usb_urb.o'
+ec_confine_one '_usb_urb_stats'     'core/cap/kind_usb_urb.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/cap/kind_msc_lun.pdx §1, kind_scsi_device.pdx §1" >&2
+    echo "  and kind_usb_urb.pdx §1 for the row-table one-writer discipline." >&2
+    exit 1
+fi
+echo "[usb-msc-confine] MSC LUN + SCSI device + USB URB rows and counters confined"
+
+# Static-identity-mutating primitive refusal, same shape as
+# usb-if-ep-confine.
+if grep -qE 'msc_lun_(set_num|num_set|set_key|key_set)' "${MSCLUN_SRC}"; then
+    echo "[msc-lun-confine] FAIL - static-identity-mutating primitive added" >&2
+    exit 1
+fi
+if grep -qE 'scsi_device_(set_type|set_blksz|set_blkcnt|set_key|key_set)' "${SCSID_SRC}"; then
+    echo "[scsi-device-confine] FAIL - static-identity-mutating primitive added" >&2
+    exit 1
+fi
+if grep -qE 'usb_urb_(set_dir|set_len|set_timeout|set_key|key_set)' "${USBURB_SRC}"; then
+    echo "[usb-urb-confine] FAIL - static-identity-mutating primitive added" >&2
+    exit 1
+fi
+echo "[usb-msc-confine] no static-identity-mutating primitive"
+
+# ---------------------------------------------------------------------------
+# R34.M3 (#1176/#1177/#1178): BOT / UAS / SCSI-cmd stat-cell confinement.
+# Each scaffold module holds one .bss stats array and NOTHING else that any
+# other object may touch — the honesty pin lives in the same object.
+BOT_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/msc/bot.pdx"
+UAS_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/msc/uas.pdx"
+SCMD_SRC="${REPO_ROOT}/src/kernel/core/drivers/scsi/scsi_cmd.pdx"
+if [[ ! -f "${BOT_SRC}" || ! -f "${UAS_SRC}" || ! -f "${SCMD_SRC}" ]]; then
+    echo "[usb-msc-drivers-confine] FAIL - BOT/UAS/scsi_cmd source missing" >&2
+    exit 1
+fi
+ec_confine_one '_bot_stats'      'core/drivers/usb/msc/bot.o'
+ec_confine_one '_uas_stats'      'core/drivers/usb/msc/uas.o'
+ec_confine_one '_scsi_cmd_stats' 'core/drivers/scsi/scsi_cmd.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See bot.pdx, uas.pdx, scsi_cmd.pdx for the one-writer discipline." >&2
+    exit 1
+fi
+echo "[usb-msc-drivers-confine] BOT/UAS/scsi_cmd stat cells confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
