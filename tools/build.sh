@@ -2180,6 +2180,124 @@ fi
 echo "[hid-event-confine] no static-identity-mutating primitive"
 
 # ---------------------------------------------------------------------------
+# R32.M3-003 (#1127): HID EVENT STREAM FANOUT.
+#
+# Same shape as the HID device / HID event checks above. Two claims:
+#
+# (a) _hid_evt_stream_subs, _hid_evt_stream_delivered,
+#     _hid_evt_stream_stats and _hid_evt_stream_seq are the only place
+#     in the kernel where the fanout's subscriber table, per-subscriber
+#     delivery counts and monotone offer sequence live. A second writer
+#     could forge a subscriber (a delivery to a slot no capability
+#     names) or a delivery count (evidence a subscriber received events
+#     it never was matched for), and every future R32.M4 router
+#     accounting record would then be recorded against a fanout the
+#     subscribe gate never blessed. Confinement here is what makes the
+#     subscribe/unsubscribe primitives the ONLY path in.
+#
+# (b) Arity pins. The subscriber's mask, endpoint and pid come from
+#     the KIND_HID_EVENT ROW at mint, so publish() takes only the
+#     event class bit and an opaque payload -- never a caller-supplied
+#     'this slot only' filter, which would let a producer force a
+#     delivery to happen only when the subscriber's mask matched
+#     something the producer chose rather than what the subscription
+#     recorded. subscribe/unsubscribe likewise take one slot and
+#     nothing else.
+HID_STREAM_SRC="${REPO_ROOT}/src/kernel/core/drivers/hid/event_stream.pdx"
+if [[ ! -f "${HID_STREAM_SRC}" ]]; then
+    echo "[hid-stream-confine] FAIL - ${HID_STREAM_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_hid_evt_stream_subs'      'core/drivers/hid/event_stream.o'
+ec_confine_one '_hid_evt_stream_delivered' 'core/drivers/hid/event_stream.o'
+ec_confine_one '_hid_evt_stream_stats'     'core/drivers/hid/event_stream.o'
+ec_confine_one '_hid_evt_stream_seq'       'core/drivers/hid/event_stream.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/drivers/hid/event_stream.pdx §2 for why the" >&2
+    echo "  subscriber table, per-subscriber deliveries, stats and seq have" >&2
+    echo "  exactly one writer." >&2
+    exit 1
+fi
+echo "[hid-stream-confine] HID event stream subscriber table, deliveries, stats and seq confined"
+
+hes_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HID_STREAM_SRC}"; then
+        echo "[hid-stream-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A HID EVENT STREAM SUBSCRIBER'S MASK COMES FROM THE" >&2
+        echo "  KIND_HID_EVENT ROW AND NEVER FROM A CALLER. An extra" >&2
+        echo "  parameter on publish() would let a producer force a" >&2
+        echo "  fanout to happen only when the subscriber's mask matched" >&2
+        echo "  something the producer chose rather than what the" >&2
+        echo "  subscription recorded, and the silent misdeliveries and" >&2
+        echo "  silent drops that would produce have no other refusal." >&2
+        echo "  If a signature legitimately changed, the confinement" >&2
+        echo "  argument in src/kernel/core/drivers/hid/event_stream.pdx" >&2
+        echo "  §2 must be rewritten first." >&2
+        exit 1
+    fi
+}
+hes_pin_one 'pub let hid_event_stream_subscribe : (u64) -> u64'
+hes_pin_one 'pub let hid_event_stream_unsubscribe : (u64) -> u64'
+hes_pin_one 'pub let hid_event_stream_publish : (u64, u64) -> u64'
+hes_pin_one 'pub let hid_event_stream_delivered_by : (u64) -> u64'
+hes_pin_one 'pub let hid_event_stream_sub_count : () -> u64'
+hes_pin_one 'pub let hid_event_stream_seq : () -> u64'
+echo "[hid-stream-confine] subscribe / unsubscribe / publish / delivered_by / sub_count / seq arities pinned"
+
+# ---------------------------------------------------------------------------
+# R32.M3-004 (#1128): HID EVENT STREAM CHANNEL SCHEMA ARITY PINS.
+#
+# The schema has no storage of its own -- it is pure pack/unpack -- so
+# there is no _table to confine. What there IS to defend is the arity of
+# every packer and unpacker. A third parameter on pack_kbd_press is a
+# caller-supplied modifier bitmap that lets a producer smuggle receiver-
+# side state (shift/ctrl/alt) into the wire; a third parameter on
+# pack_mouse_move is a scroll delta that reads as a convenience and
+# quietly widens the event class into SCROLL (which is a separate event
+# type if it is added at all -- see §3). Neither is expressible against
+# a pinned signature.
+HESCH_SRC="${REPO_ROOT}/src/kernel/core/ipc/hid_event_stream_channel.pdx"
+if [[ ! -f "${HESCH_SRC}" ]]; then
+    echo "[hid-stream-schema-confine] FAIL - ${HESCH_SRC} not found" >&2
+    exit 1
+fi
+hesch_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HESCH_SRC}"; then
+        echo "[hid-stream-schema-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A HID EVENT STREAM CHANNEL FIELD IS DECIDED BY THE SCHEMA" >&2
+        echo "  AND NEVER BY A CALLER. An extra parameter on any packer or" >&2
+        echo "  unpacker makes 'pack a field my subscriber does not know" >&2
+        echo "  about' or 'extract a bit range my packer never wrote to'" >&2
+        echo "  expressible, and both ways that goes wrong silently reads or" >&2
+        echo "  writes the wrong bits (a scancode becomes a modifier state," >&2
+        echo "  a mouse dy becomes a scroll axis). If a signature" >&2
+        echo "  legitimately changed, the schema doc" >&2
+        echo "  design/ipc/hid-event-stream-session.md §3 must be rewritten" >&2
+        echo "  first." >&2
+        exit 1
+    fi
+}
+hesch_pin_one 'pub let hid_event_stream_ch_ev_valid : (u64) -> u64'
+hesch_pin_one 'pub let hid_event_stream_ch_type : (u64) -> u64'
+hesch_pin_one 'pub let hid_event_stream_ch_payload_reserved_ok : (u64) -> u64'
+hesch_pin_one 'pub let hid_event_stream_ch_pack_kbd_press : (u64) -> u64'
+hesch_pin_one 'pub let hid_event_stream_ch_pack_kbd_release : (u64) -> u64'
+hesch_pin_one 'pub let hid_event_stream_ch_kbd_scancode : (u64) -> u64'
+hesch_pin_one 'pub let hid_event_stream_ch_pack_mouse_move : (u64, u64) -> u64'
+hesch_pin_one 'pub let hid_event_stream_ch_mouse_dx : (u64) -> u64'
+hesch_pin_one 'pub let hid_event_stream_ch_mouse_dy : (u64) -> u64'
+hesch_pin_one 'pub let hid_event_stream_ch_pack_mouse_click : (u64, u64) -> u64'
+hesch_pin_one 'pub let hid_event_stream_ch_click_button : (u64) -> u64'
+hesch_pin_one 'pub let hid_event_stream_ch_click_edge : (u64) -> u64'
+echo "[hid-stream-schema-confine] event validator, type extractor, reserved-bits gate, four packers and five unpackers arities pinned"
+
+# ---------------------------------------------------------------------------
 # R31.M3-002 (#1100): BATTERY CHANNEL SCHEMA ARITY PINS.
 #
 # The schema has no storage of its own -- it is pure pack/unpack -- so
