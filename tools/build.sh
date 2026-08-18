@@ -3659,6 +3659,281 @@ hid_ri_pin_one 'pub let hid_report_get_deferred : () -> u64'
 hid_ri_pin_one 'pub let hid_report_set_deferred : () -> u64'
 echo "[hid-report-io-confine] get, set, arbitrated, count and deferred arities pinned"
 
+# ---------------------------------------------------------------------------
+# R33.M1-001 (#1137): HDA CONTROLLER SCAFFOLD STATE + ARITY PINS.
+#
+# Same shape as [i2c-hid-transport-confine]: a bind latch, a stashed
+# opaque BAR handle, and the stats counters, each with exactly one
+# legitimate writer (hda_controller_bind for the latch; the read/write
+# seams for counters). The load-bearing symbol is _hda_controller_bar:
+# a stray writer would be a second path stashing a BAR handle no
+# capability named, and when R33.M2 plumbs pci_enumerate_all through
+# this frame, the spuriously-set handle would let register I/O reach
+# a window the capability did not authorise.
+HDA_CT_OWNER="${BUILD_DIR}/core/drivers/hda/controller.o"
+HDA_CT_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/controller.pdx"
+if [[ ! -f "${HDA_CT_SRC}" ]]; then
+    echo "[hda-controller-confine] FAIL - ${HDA_CT_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_CT_OWNER}" ]]; then
+    echo "[hda-controller-confine] FAIL: ${HDA_CT_OWNER} not built" >&2
+    exit 1
+fi
+hda_ct_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${HDA_CT_OWNER}" "${sym}"; then
+        echo "[hda-controller-confine] FAIL: controller.o does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  check would then pass vacuously, so it fails instead." >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_CT_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-controller-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/hda/controller.o relocate against ${sym}:${strays}" >&2
+        echo "  Only hda_controller_bind may write the bind latch, and only" >&2
+        echo "  the read/write seams may write the stats counters. See" >&2
+        echo "  src/kernel/core/drivers/hda/controller.pdx §2." >&2
+        exit 1
+    fi
+}
+hda_ct_confine_one '_hda_controller_bound'
+hda_ct_confine_one '_hda_controller_bar'
+hda_ct_confine_one '_hda_controller_stats'
+echo "[hda-controller-confine] bind latch, BAR handle and stats confined"
+
+hda_ct_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_CT_SRC}"; then
+        echo "[hda-controller-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  AN HDA CONTROLLER BIND TAKES THE OPAQUE BAR HANDLE, NOTHING" >&2
+        echo "  ELSE. An extra parameter on bind is how a caller-supplied" >&2
+        echo "  controller EXTENT would reach the register path when R33.M2" >&2
+        echo "  wires it -- exactly what §2 of ec_access.pdx exists to" >&2
+        echo "  prevent. If a signature legitimately changed, §0/§2/§4 of" >&2
+        echo "  controller.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+hda_ct_pin_one 'pub let hda_controller_bind : (u64) -> u64'
+hda_ct_pin_one 'pub let hda_controller_bound : () -> u64'
+hda_ct_pin_one 'pub let hda_controller_bar : () -> u64'
+hda_ct_pin_one 'pub let hda_controller_arbitrated : () -> u64'
+hda_ct_pin_one 'pub let hda_controller_read : (u64) -> u64'
+hda_ct_pin_one 'pub let hda_controller_write : (u64, u64) -> u64'
+hda_ct_pin_one 'pub let hda_controller_reads : () -> u64'
+hda_ct_pin_one 'pub let hda_controller_writes : () -> u64'
+echo "[hda-controller-confine] bind, seams and accessor arities pinned"
+
+# ---------------------------------------------------------------------------
+# R33.M1-002 (#1138): HDA RESET SCAFFOLD STATE + ARITY PINS.
+#
+# One symbol to confine (_hda_reset_stats). The reset seams are arity
+# ZERO -- both the register (GCTL) and the value (CRST bit) are
+# spec-enumerated and a caller-supplied argument would let arbitrary
+# bits reach GCTL.
+HDA_RS_OWNER="${BUILD_DIR}/core/drivers/hda/reset.o"
+HDA_RS_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/reset.pdx"
+if [[ ! -f "${HDA_RS_SRC}" ]]; then
+    echo "[hda-reset-confine] FAIL - ${HDA_RS_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_RS_OWNER}" ]]; then
+    echo "[hda-reset-confine] FAIL: ${HDA_RS_OWNER} not built" >&2
+    exit 1
+fi
+hda_rs_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${HDA_RS_OWNER}" "${sym}"; then
+        echo "[hda-reset-confine] FAIL: reset.o does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  check would then pass vacuously, so it fails instead." >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_RS_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-reset-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/hda/reset.o relocate against ${sym}:${strays}" >&2
+        echo "  Only the arm/release seams may write the reset counters. See" >&2
+        echo "  src/kernel/core/drivers/hda/reset.pdx §1." >&2
+        exit 1
+    fi
+}
+hda_rs_confine_one '_hda_reset_stats'
+echo "[hda-reset-confine] reset stats confined"
+
+hda_rs_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_RS_SRC}"; then
+        echo "[hda-reset-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  THE HDA RESET SEAMS TAKE NO CALLER ARGUMENT. Widening either" >&2
+        echo "  arm or release to accept a GCTL value would let arbitrary" >&2
+        echo "  bits (FCNTRL, UNSOL) be flipped on a reset call, and the" >&2
+        echo "  reset sequence only writes the CRST bit. If a signature" >&2
+        echo "  legitimately changed, §0/§2/§3 of reset.pdx must be" >&2
+        echo "  rewritten first." >&2
+        exit 1
+    fi
+}
+hda_rs_pin_one 'pub let hda_reset_arbitrated : () -> u64'
+hda_rs_pin_one 'pub let hda_reset_arm : () -> u64'
+hda_rs_pin_one 'pub let hda_reset_release : () -> u64'
+hda_rs_pin_one 'pub let hda_reset_arm_count : () -> u64'
+hda_rs_pin_one 'pub let hda_reset_release_count : () -> u64'
+echo "[hda-reset-confine] arm, release, arbitrated and count arities pinned"
+
+# ---------------------------------------------------------------------------
+# R33.M1-003 (#1139): HDA CORB SCAFFOLD STATE + ARITY PINS.
+#
+# Same shape as [hda-controller-confine]: init latch, stashed ring
+# parameters and stats -- each with exactly one legitimate writer
+# (hda_corb_init for the latch/params; hda_corb_submit for stats).
+HDA_CB_OWNER="${BUILD_DIR}/core/drivers/hda/corb.o"
+HDA_CB_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/corb.pdx"
+if [[ ! -f "${HDA_CB_SRC}" ]]; then
+    echo "[hda-corb-confine] FAIL - ${HDA_CB_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_CB_OWNER}" ]]; then
+    echo "[hda-corb-confine] FAIL: ${HDA_CB_OWNER} not built" >&2
+    exit 1
+fi
+hda_cb_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${HDA_CB_OWNER}" "${sym}"; then
+        echo "[hda-corb-confine] FAIL: corb.o does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  check would then pass vacuously, so it fails instead." >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_CB_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-corb-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/hda/corb.o relocate against ${sym}:${strays}" >&2
+        echo "  Only hda_corb_init may write the init latch. See" >&2
+        echo "  src/kernel/core/drivers/hda/corb.pdx §2." >&2
+        exit 1
+    fi
+}
+hda_cb_confine_one '_hda_corb_bound'
+hda_cb_confine_one '_hda_corb_ring_pa'
+hda_cb_confine_one '_hda_corb_size_code'
+hda_cb_confine_one '_hda_corb_stats'
+echo "[hda-corb-confine] init latch, ring params and stats confined"
+
+hda_cb_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_CB_SRC}"; then
+        echo "[hda-corb-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  THE HDA CORB INIT SEAM TAKES THE RING PHYSICAL ADDRESS AND" >&2
+        echo "  THE ENUMERATED SIZE CODE, NOTHING ELSE. A caller-supplied" >&2
+        echo "  virtual address would be a way to reach memory no capability" >&2
+        echo "  named -- exactly what §2 of ec_access.pdx exists to prevent." >&2
+        echo "  If a signature legitimately changed, §0/§1/§3 of corb.pdx" >&2
+        echo "  must be rewritten first." >&2
+        exit 1
+    fi
+}
+hda_cb_pin_one 'pub let hda_corb_init : (u64, u64) -> u64'
+hda_cb_pin_one 'pub let hda_corb_bound : () -> u64'
+hda_cb_pin_one 'pub let hda_corb_ring_pa : () -> u64'
+hda_cb_pin_one 'pub let hda_corb_size_code : () -> u64'
+hda_cb_pin_one 'pub let hda_corb_arbitrated : () -> u64'
+hda_cb_pin_one 'pub let hda_corb_submit : (u64) -> u64'
+hda_cb_pin_one 'pub let hda_corb_submits : () -> u64'
+echo "[hda-corb-confine] init, submit, arbitrated and accessor arities pinned"
+
+# ---------------------------------------------------------------------------
+# R33.M1-004 (#1140): HDA RIRB SCAFFOLD STATE + ARITY PINS.
+#
+# Same shape as [hda-corb-confine].
+HDA_RB_OWNER="${BUILD_DIR}/core/drivers/hda/rirb.o"
+HDA_RB_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/rirb.pdx"
+if [[ ! -f "${HDA_RB_SRC}" ]]; then
+    echo "[hda-rirb-confine] FAIL - ${HDA_RB_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_RB_OWNER}" ]]; then
+    echo "[hda-rirb-confine] FAIL: ${HDA_RB_OWNER} not built" >&2
+    exit 1
+fi
+hda_rb_confine_one() {
+    local sym="$1"
+    if ! obj_relocs_against "${HDA_RB_OWNER}" "${sym}"; then
+        echo "[hda-rirb-confine] FAIL: rirb.o does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  check would then pass vacuously, so it fails instead." >&2
+        exit 1
+    fi
+    local strays=""
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_RB_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-rirb-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/hda/rirb.o relocate against ${sym}:${strays}" >&2
+        echo "  Only hda_rirb_init may write the init latch. See" >&2
+        echo "  src/kernel/core/drivers/hda/rirb.pdx §2." >&2
+        exit 1
+    fi
+}
+hda_rb_confine_one '_hda_rirb_bound'
+hda_rb_confine_one '_hda_rirb_ring_pa'
+hda_rb_confine_one '_hda_rirb_size_code'
+hda_rb_confine_one '_hda_rirb_stats'
+echo "[hda-rirb-confine] init latch, ring params and stats confined"
+
+hda_rb_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_RB_SRC}"; then
+        echo "[hda-rirb-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  THE HDA RIRB INIT SEAM TAKES THE RING PHYSICAL ADDRESS AND" >&2
+        echo "  THE ENUMERATED SIZE CODE, NOTHING ELSE. Same reasoning as" >&2
+        echo "  corb.pdx §0. If a signature legitimately changed, §0/§1/§3" >&2
+        echo "  of rirb.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+hda_rb_pin_one 'pub let hda_rirb_init : (u64, u64) -> u64'
+hda_rb_pin_one 'pub let hda_rirb_bound : () -> u64'
+hda_rb_pin_one 'pub let hda_rirb_ring_pa : () -> u64'
+hda_rb_pin_one 'pub let hda_rirb_size_code : () -> u64'
+hda_rb_pin_one 'pub let hda_rirb_arbitrated : () -> u64'
+hda_rb_pin_one 'pub let hda_rirb_consume : (u64) -> u64'
+hda_rb_pin_one 'pub let hda_rirb_solicited : () -> u64'
+hda_rb_pin_one 'pub let hda_rirb_unsolicited : () -> u64'
+echo "[hda-rirb-confine] init, consume, arbitrated and accessor arities pinned"
+
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
