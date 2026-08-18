@@ -2583,6 +2583,38 @@ fi
 echo "[usb-msc-drivers-confine] BOT/UAS/scsi_cmd stat cells confined"
 
 # ---------------------------------------------------------------------------
+# R34.M4 (#1181/#1182/#1183/#1184/#1185): USB-HID full-protocol
+# scaffold state confinement.
+#
+# Each of the five modules holds one .bss stats array; composite_hid
+# additionally owns a routing table. Every one of them is the ONE
+# WRITER for its own state — a stray writer would let a second path
+# bump a counter or add a route without passing this scaffold's gates,
+# and no downstream stage could tell the two apart.
+HCLS_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/hid/usb_hid_class.pdx"
+KBDF_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/hid/kbd_full.pdx"
+MUSF_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/hid/mouse_full.pdx"
+GPAD_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/hid/gamepad.pdx"
+CHID_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/hid/composite_hid.pdx"
+if [[ ! -f "${HCLS_SRC}" || ! -f "${KBDF_SRC}" || ! -f "${MUSF_SRC}" \
+        || ! -f "${GPAD_SRC}" || ! -f "${CHID_SRC}" ]]; then
+    echo "[usb-hid-full-confine] FAIL - one of the R34.M4 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_hid_class_stats'       'core/drivers/usb/hid/usb_hid_class.o'
+ec_confine_one '_kbd_full_stats'        'core/drivers/usb/hid/kbd_full.o'
+ec_confine_one '_mouse_full_stats'      'core/drivers/usb/hid/mouse_full.o'
+ec_confine_one '_gamepad_stats'         'core/drivers/usb/hid/gamepad.o'
+ec_confine_one '_composite_hid_table'   'core/drivers/usb/hid/composite_hid.o'
+ec_confine_one '_composite_hid_stats'   'core/drivers/usb/hid/composite_hid.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See usb_hid_class.pdx §3, kbd_full.pdx, mouse_full.pdx, gamepad.pdx" >&2
+    echo "  and composite_hid.pdx §1 for the row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[usb-hid-full-confine] USB-HID full-protocol scaffold state confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
