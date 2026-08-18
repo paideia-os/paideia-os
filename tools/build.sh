@@ -2714,6 +2714,45 @@ fi
 echo "[pcie-hp-confine] PCIe hotplug substrate state confined"
 
 # ---------------------------------------------------------------------------
+# R35.M2 (#1200/#1201/#1202/#1203/#1204): Thunderbolt 4 / USB4 substrate
+# state confinement.
+#
+# Five modules, each owns its own row table / stats array.
+# tools/build.sh confines relocations against each one to its owning
+# object so a second writer cannot restamp a domain's route identity,
+# forge a CM descriptor behind the ring's back, or claim a router
+# discovery that no walker performed.
+TBD_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_tb_domain.pdx"
+TNP_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/nhi_probe.pdx"
+TCM_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/cm_rings.pdx"
+TRW_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/router_walk.pdx"
+TTC_SRC="${REPO_ROOT}/src/kernel/core/ipc/tb_topology_channel.pdx"
+if [[ ! -f "${TBD_SRC}" || ! -f "${TNP_SRC}" || ! -f "${TCM_SRC}" \
+        || ! -f "${TRW_SRC}" || ! -f "${TTC_SRC}" ]]; then
+    echo "[tb-confine] FAIL - one of the R35.M2 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_tb_domain_table'      'core/cap/kind_tb_domain.o'
+ec_confine_one '_tb_domain_stats'      'core/cap/kind_tb_domain.o'
+ec_confine_one '_tb_nhi_probe_stats'   'core/drivers/tb/nhi_probe.o'
+ec_confine_one '_tb_cm_tx_ring'        'core/drivers/tb/cm_rings.o'
+ec_confine_one '_tb_cm_rx_ring'        'core/drivers/tb/cm_rings.o'
+ec_confine_one '_tb_cm_tx_idx'         'core/drivers/tb/cm_rings.o'
+ec_confine_one '_tb_cm_rx_idx'         'core/drivers/tb/cm_rings.o'
+ec_confine_one '_tb_cm_rings_stats'    'core/drivers/tb/cm_rings.o'
+ec_confine_one '_tb_router_table'      'core/drivers/tb/router_walk.o'
+ec_confine_one '_tb_router_walk_stats' 'core/drivers/tb/router_walk.o'
+ec_confine_one '_tb_topology_subs'     'core/ipc/tb_topology_channel.o'
+ec_confine_one '_tb_topology_stats'    'core/ipc/tb_topology_channel.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_tb_domain.pdx §3, nhi_probe.pdx §2, cm_rings.pdx §3," >&2
+    echo "  router_walk.pdx §3 and tb_topology_channel.pdx §2 for" >&2
+    echo "  the row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[tb-confine] Thunderbolt 4 substrate state confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

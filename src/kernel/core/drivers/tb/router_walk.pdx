@@ -1,0 +1,650 @@
+// src/kernel/core/drivers/tb/router_walk.pdx — R35.M2-002 (#1202)
+//
+// TB4 router discovery + topology walk scaffold. Per USB4 §5, a
+// domain is a tree of routers reached by a hop sequence encoded as
+// 5-bit adapter ordinals concatenated into the route_id (12 hops
+// max, 60 bits used out of the 64-bit route field though we cap at
+// 24 bits like KIND_TB_DOMAIN). This scaffold walks the tree
+// depth-first, records each router's adapter roster (upstream,
+// downstream, lane, protocol, hostif), and emits a topology event
+// per discovered router.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the DECODE half of the CM discovery path. The CM_TX side
+// (cm_rings.pdx) submits READ_ROUTER_CONFIG control packets; the
+// CM_RX side receives the responses; this scaffold parses those
+// responses into a router row with an adapter roster and pushes a
+// discovery event onto tb_topology_channel.
+//
+// IT DOES NOT SEND CONTROL PACKETS ITSELF. tb_router_walk_step
+// consumes a caller-supplied (route_id, response_word) pair — the
+// witness synthesises those; a live driver drives them from the
+// cm_rings RX dequeue.
+//
+// IT DOES NOT MINT KIND_TB_DOMAIN. The domain capability lives one
+// layer up in the CM supervisor; this scaffold records the ROUTER
+// TREE within a domain the supervisor already established.
+//
+// tb_router_walk_arbitrated() returns 0 until the seam is wired.
+//
+// =============================================================================
+// §1  ADAPTER TYPE ORDINALS (USB4 §5.3)
+// =============================================================================
+//
+//   0  Undefined
+//   1  Lane adapter (upstream lane 0/1, downstream lane 0/1)
+//   2  Protocol adapter (PCIe up/down, DP in/out, USB3 up/down)
+//   3  Host interface adapter (the CM side)
+//
+// A router presents at least ONE lane adapter (its upstream) plus
+// zero or more protocol adapters plus one hostif adapter (only if
+// the router is the CM root). The scaffold refuses adapter_count > 64
+// (BAD_ADAPTER) as USB4 caps adapter count at 64 per router.
+//
+// =============================================================================
+// §2  ROUTE DEPTH
+// =============================================================================
+//
+// 5 bits per hop, 12 hops max = 60 bits. Our route_id field is
+// capped at 24 bits (same as KIND_TB_DOMAIN.route_id); the depth is
+// decoded as ceil(log2(route_id + 1) / 5), computed here as a byte-
+// wise scan of the 5-bit hop slots. A route_id of 0 is the ROOT
+// (depth 0); every other value has depth 1..12.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _tb_router_table and _tb_router_walk_stats are written only by
+// helpers in this module. tools/build.sh confines relocations
+// against both symbols to `core/drivers/tb/router_walk.o`.
+//
+// =============================================================================
+// §4  ERROR CODES 0xFFFFF9C0..0xFFFFF9CF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent free bands: tb_domain 0xFFFFF9F0..FF,
+// tb_nhi_probe 0xFFFFF9E0..EF, tb_cm_rings 0xFFFFF9D0..DF,
+// tb_topology_channel 0xFFFFF9B0..BF).
+
+module RouterWalk = structure {
+
+  // Adapter type ordinals (§1).
+  pub let TB_ADAP_UNDEFINED  : u64 = 0
+  pub let TB_ADAP_LANE       : u64 = 1
+  pub let TB_ADAP_PROTOCOL   : u64 = 2
+  pub let TB_ADAP_HOSTIF     : u64 = 3
+  pub let TB_ADAP_TYPE_MAX   : u64 = 3
+
+  // Adapter count cap (§1).
+  pub let TB_ADAP_COUNT_MAX : u64 = 64
+
+  // Route depth cap (§2). USB4 §5 says 12 hops.
+  pub let TB_ROUTE_DEPTH_MAX : u64 = 12
+  pub let TB_ROUTE_HOP_BITS  : u64 = 5
+
+  // Router table size (this scaffold's live routers within one
+  // domain — small enough for a witness that walks 4 or so).
+  pub let TB_ROUTER_MAX : u64 = 8
+
+  // Failure taxonomy — 0xFFFFF9C0..0xFFFFF9CF.
+  pub let TB_RW_OK          : u64 = 0
+  pub let TB_RW_BAD_ARG     : u64 = 0xFFFFF9CF
+  pub let TB_RW_BAD_ROUTE   : u64 = 0xFFFFF9CE
+  pub let TB_RW_BAD_DEPTH   : u64 = 0xFFFFF9CD
+  pub let TB_RW_BAD_ADAPTER : u64 = 0xFFFFF9CC
+  pub let TB_RW_BAD_TYPE    : u64 = 0xFFFFF9CB
+  pub let TB_RW_ENOSPC      : u64 = 0xFFFFF9CA
+  pub let TB_RW_DUP_ROUTE   : u64 = 0xFFFFF9C9
+  pub let TB_RW_NOT_FOUND   : u64 = 0xFFFFF9C8
+
+  pub let TB_RW_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let TB_RW_ROW_NONE   : u64 = 0xFF
+
+  // 8 router rows × 32 bytes.
+  //   [+0]  header (in_use[63:56])
+  //   [+8]  route_id[23:0] | reserved
+  //   [+16] parent_route_id[23:0] | adapter_count[31:24] | depth[39:32]
+  //         | reserved[63:40]
+  //   [+24] reserved (zero)
+  pub let TB_ROUTER_ROW_BYTES : u64 = 32
+  pub let mut _tb_router_table      : [u64; 32] = uninit @align(64)
+  pub let mut _tb_router_walk_stats : [u64; 8]  = uninit @align(64)
+
+  pub let TB_RW_ST_DISCOVERED : u64 = 0
+  pub let TB_RW_ST_DEPARTED   : u64 = 1
+  pub let TB_RW_ST_REJECTS    : u64 = 2
+  pub let TB_RW_ST_DUPES      : u64 = 3
+  pub let TB_RW_ST_ENOSPC     : u64 = 4
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let tb_router_walk_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1202): clear router table + stats. Labels prefixed trw_rs_.",
+      block: {
+        lea r10, [rip + _tb_router_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      trw_rs_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  trw_rs_rows;
+
+        lea r10, [rip + _tb_router_walk_stats];
+        xor rcx, rcx;
+      trw_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  trw_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let tb_router_walk_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M2-002 (#1202): honesty pin. Returns 0 until wired to a real CM RX dequeue seam.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let tb_router_walk_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1202): counter read. Labels prefixed trw_st_.",
+      block: {
+        cmp rdi, 8;
+        jae trw_st_zero;
+        lea r10, [rip + _tb_router_walk_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      trw_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let tb_router_walk_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1202): counter bump. Labels prefixed trw_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae trw_nt_out;
+        lea r10, [rip + _tb_router_walk_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      trw_nt_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Depth decode.
+  //
+  // route_id 0 -> depth 0. Otherwise scan 5-bit hop slots low-to-
+  // high; the depth is the number of non-zero slots up to and
+  // including the highest set slot. A route of 0x000001 has depth 1;
+  // 0x000021 has depth 2 (two 5-bit slots both set); 0x100000 has
+  // depth 4 (five bits per hop × 4 = 20-bit prefix).
+  // ==========================================================================
+
+  pub let tb_router_depth : (u64) -> u64 !{} @{} =
+    fn (route_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M2-002 (#1202): route depth = position of highest non-zero 5-bit hop slot + 1. Route 0 -> depth 0. Refuses route > 0xFFFFFF (BAD_ROUTE). Labels prefixed trw_dp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;
+        mov r10, 0xFFFFFF;
+        cmp rbx, r10;
+        ja  trw_dp_bad;
+
+        cmp rbx, 0;
+        je  trw_dp_zero;
+
+        // Scan slots.
+        xor r12, r12;                    // slot index
+        xor r13, r13;                    // highest occupied + 1
+      trw_dp_scan:
+        cmp r12, 12;
+        jae trw_dp_done;
+        mov r10, rbx;
+        mov r11, r12;
+        // r11 = slot * 5, encoded via (slot << 2) + slot to sidestep
+        // imul r64, imm which paideia-as does not emit.
+        shl r11, 2;
+        add r11, r12;
+        mov rcx, r11;
+        shr r10, cl;
+        and r10, 0x1F;
+        cmp r10, 0;
+        je  trw_dp_skip;
+        mov r13, r12;
+        add r13, 1;
+      trw_dp_skip:
+        add r12, 1;
+        jmp trw_dp_scan;
+
+      trw_dp_done:
+        mov rax, r13;
+        jmp trw_dp_out;
+      trw_dp_zero:
+        xor rax, rax;
+        jmp trw_dp_out;
+      trw_dp_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+
+      trw_dp_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Parent-route decode.
+  //
+  // Parent of route_id r is r with its highest non-zero 5-bit slot
+  // cleared. Parent of route 0 is route 0 (self). Parent of a
+  // single-hop route is 0.
+  // ==========================================================================
+
+  pub let tb_router_parent_route : (u64) -> u64 !{} @{} =
+    fn (route_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M2-002 (#1202): clear highest non-zero 5-bit slot. Refuses route > 0xFFFFFF. Labels prefixed trw_pr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;
+        mov r10, 0xFFFFFF;
+        cmp rbx, r10;
+        ja  trw_pr_bad;
+
+        cmp rbx, 0;
+        je  trw_pr_zero;
+
+        // Find highest occupied slot.
+        mov r12, 11;                     // start at top
+      trw_pr_scan:
+        mov r10, rbx;
+        mov r11, r12;
+        // r11 = slot * 5, encoded via (slot << 2) + slot.
+        shl r11, 2;
+        add r11, r12;
+        mov rcx, r11;
+        shr r10, cl;
+        and r10, 0x1F;
+        cmp r10, 0;
+        jne trw_pr_hit;
+        cmp r12, 0;
+        je  trw_pr_zero;
+        sub r12, 1;
+        jmp trw_pr_scan;
+
+      trw_pr_hit:
+        // Clear slot r12. rcx = r12 * 5, same encoding as above.
+        mov rax, 0x1F;
+        mov rcx, r12;
+        shl rcx, 2;
+        add rcx, r12;
+        shl rax, cl;
+        not rax;
+        and rbx, rax;
+        mov rax, rbx;
+        jmp trw_pr_out;
+
+      trw_pr_zero:
+        xor rax, rax;
+        jmp trw_pr_out;
+      trw_pr_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+
+      trw_pr_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Adapter type check.
+  // ==========================================================================
+
+  pub let tb_router_adapter_type_valid : (u64) -> u64 !{} @{} =
+    fn (t: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M2-002 (#1202): 1 iff t in [0, 3]. Labels prefixed trw_at_.",
+      block: {
+        cmp rdi, 3;
+        ja  trw_at_no;
+        mov rax, 1;
+        ret;
+      trw_at_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Router table.
+  //
+  // Find, insert, remove, count.
+  // ==========================================================================
+
+  pub let tb_router_find : (u64) -> u64 !{mem} @{} =
+    fn (route_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1202): return row_id holding route_id, or ROW_NONE. Labels prefixed trw_fd_.",
+      block: {
+        xor rcx, rcx;
+      trw_fd_scan:
+        cmp rcx, 8;
+        jae trw_fd_none;
+        lea r10, [rip + _tb_router_table];
+        mov r11, rcx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  trw_fd_next;
+        mov rax, [r10 + 8];
+        and rax, 0xFFFFFF;
+        cmp rax, rdi;
+        je  trw_fd_hit;
+      trw_fd_next:
+        add rcx, 1;
+        jmp trw_fd_scan;
+      trw_fd_hit:
+        mov rax, rcx;
+        ret;
+      trw_fd_none:
+        mov rax, 0xFF;
+        ret
+      }
+    } @no_frame
+
+  pub let tb_router_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1202): count live rows. Labels prefixed trw_ct_.",
+      block: {
+        xor rax, rax;
+        xor rcx, rcx;
+      trw_ct_scan:
+        cmp rcx, 8;
+        jae trw_ct_out;
+        lea r10, [rip + _tb_router_table];
+        mov r11, rcx;
+        shl r11, 5;
+        add r10, r11;
+        mov r11, [r10 + 0];
+        shr r11, 56;
+        cmp r11, 0;
+        je  trw_ct_next;
+        add rax, 1;
+      trw_ct_next:
+        add rcx, 1;
+        jmp trw_ct_scan;
+      trw_ct_out:
+        ret
+      }
+    } @no_frame
+
+  pub let tb_router_row_adapter_count : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1202): adapter_count for a row. Labels prefixed trw_ac_.",
+      block: {
+        cmp rdi, 8;
+        jae trw_ac_bad;
+        lea r10, [rip + _tb_router_table];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  trw_ac_bad;
+        mov rax, [r10 + 16];
+        shr rax, 24;
+        and rax, 0xFF;
+        ret;
+      trw_ac_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let tb_router_row_depth : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1202): depth for a row. Labels prefixed trw_rd_.",
+      block: {
+        cmp rdi, 8;
+        jae trw_rd_bad;
+        lea r10, [rip + _tb_router_table];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  trw_rd_bad;
+        mov rax, [r10 + 16];
+        shr rax, 32;
+        and rax, 0xFF;
+        ret;
+      trw_rd_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // tb_router_walk_step(route_id, parent_route_id, adapter_count)
+  //   -> row_id | err
+  //
+  // The DECODE half. A caller (test or live CM RX consumer) passes
+  // the fields distilled from a Router Config Response, and we
+  // record the router and emit a topology event.
+  // ==========================================================================
+
+  pub let tb_router_walk_step : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (route_id: u64) (parent_route_id: u64) (adapter_count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1202): record one discovered router. Refuses route > 0xFFFFFF, depth > 12, adapter_count > 64. Refuses DUP_ROUTE if already present. Refuses ENOSPC if no free row. Emits tb_topology_channel router_appeared on success. Labels prefixed trw_st2_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // route_id
+        mov r12, rsi;                    // parent_route_id
+        mov r13, rdx;                    // adapter_count
+
+        mov r10, 0xFFFFFF;
+        cmp rbx, r10;
+        ja  trw_st2_bad_route;
+        cmp r12, r10;
+        ja  trw_st2_bad_route;
+        cmp r13, 64;
+        ja  trw_st2_bad_adapter;
+
+        // Depth.
+        mov rdi, rbx;
+        call tb_router_depth;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  trw_st2_bad_route;
+        cmp rax, 12;
+        ja  trw_st2_bad_depth;
+        mov r14, rax;                    // depth
+
+        // Dup check.
+        mov rdi, rbx;
+        call tb_router_find;
+        cmp rax, 0xFF;
+        jne trw_st2_dup;
+
+        // Free scan.
+        xor r15, r15;
+      trw_st2_scan:
+        cmp r15, 8;
+        jae trw_st2_enospc;
+        lea r10, [rip + _tb_router_table];
+        mov r11, r15;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  trw_st2_claim;
+        add r15, 1;
+        jmp trw_st2_scan;
+
+      trw_st2_claim:
+        // Row storage.
+        mov rax, 1;
+        shl rax, 56;
+        mov [r10 + 0], rax;              // header: in_use
+        mov rax, rbx;
+        and rax, 0xFFFFFF;
+        mov [r10 + 8], rax;              // route_id
+        // word 1: parent[23:0] | adapter_count[31:24] | depth[39:32]
+        mov rax, r12;
+        and rax, 0xFFFFFF;
+        mov r11, r13;
+        and r11, 0xFF;
+        shl r11, 24;
+        or  rax, r11;
+        mov r11, r14;
+        and r11, 0xFF;
+        shl r11, 32;
+        or  rax, r11;
+        mov [r10 + 16], rax;
+        xor rax, rax;
+        mov [r10 + 24], rax;
+
+        mov rdi, 0;                      // DISCOVERED
+        call tb_router_walk_note;
+
+        // Emit topology event.
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        call tb_topology_router_appeared;
+
+        mov rax, r15;
+        jmp trw_st2_out;
+
+      trw_st2_bad_route:
+        mov rdi, 2;
+        call tb_router_walk_note;
+        mov rax, 0xFFFFF9CE;
+        jmp trw_st2_out;
+      trw_st2_bad_depth:
+        mov rdi, 2;
+        call tb_router_walk_note;
+        mov rax, 0xFFFFF9CD;
+        jmp trw_st2_out;
+      trw_st2_bad_adapter:
+        mov rdi, 2;
+        call tb_router_walk_note;
+        mov rax, 0xFFFFF9CC;
+        jmp trw_st2_out;
+      trw_st2_dup:
+        mov rdi, 3;                      // DUPES
+        call tb_router_walk_note;
+        mov rax, 0xFFFFF9C9;
+        jmp trw_st2_out;
+      trw_st2_enospc:
+        mov rdi, 4;                      // ENOSPC
+        call tb_router_walk_note;
+        mov rax, 0xFFFFF9CA;
+
+      trw_st2_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // tb_router_walk_remove(route_id) -> OK | NOT_FOUND
+  pub let tb_router_walk_remove : (u64) -> u64 !{mem} @{} =
+    fn (route_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1202): remove one router by route_id. Emits tb_topology_router_departed on success. Labels prefixed trw_rm_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;
+        mov r10, 0xFFFFFF;
+        cmp rbx, r10;
+        ja  trw_rm_notfound;
+
+        mov rdi, rbx;
+        call tb_router_find;
+        cmp rax, 0xFF;
+        je  trw_rm_notfound;
+        mov r12, rax;                    // row_id
+
+        lea r10, [rip + _tb_router_table];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+
+        mov rdi, 1;                      // DEPARTED
+        call tb_router_walk_note;
+
+        mov rdi, rbx;
+        call tb_topology_router_departed;
+
+        xor rax, rax;
+        jmp trw_rm_out;
+
+      trw_rm_notfound:
+        mov rdi, 2;
+        call tb_router_walk_note;
+        mov rax, 0xFFFFF9C8;
+
+      trw_rm_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

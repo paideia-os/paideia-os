@@ -1,0 +1,614 @@
+// src/kernel/core/drivers/tb/cm_rings.pdx — R35.M2-002 (#1201)
+//
+// TB4 Connection Manager (CM) TX + RX ring scaffold. Per USB4 §11.6,
+// the host-side NHI exposes DMA rings whose descriptors carry
+// control-packet PDF (Protocol Descriptor Format), packet length,
+// and a buffer physical address. TX submits control packets to the
+// domain routers; RX receives their responses.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the DESCRIPTOR + INDEX bookkeeping side of the host-driven
+// CM path. USB4 §11.6.4 defines the ring descriptor layout and the
+// producer / consumer index registers the driver writes to advance
+// them. This scaffold owns:
+//
+//   * A pack/unpack pair for a two-u64 ring descriptor.
+//   * A pair of tiny synthetic ring queues (TX and RX) whose
+//     producer and consumer indices exercise the wrap and refuse
+//     rules.
+//
+// IT DOES NOT ISSUE DMA. The RING_TX_PROD / RING_RX_CONS index MMIO
+// writes are seams; today the scaffold ADVANCES its local indices
+// so the router_walk fixture can enqueue a READ_ROUTER_CONFIG and
+// see its own descriptor come back through the RX path.
+//
+// IT DOES NOT ALLOCATE DMA-MAPPED BUFFERS. Descriptors accept a
+// buf_pa argument that the caller supplies; a live driver mints a
+// KIND_DMA_DOMAIN entry over the buffer before submitting.
+//
+// tb_cm_rings_arbitrated() returns 0 until that binding lands.
+//
+// =============================================================================
+// §1  DESCRIPTOR LAYOUT (USB4 §11.6.4, condensed)
+// =============================================================================
+//
+// One descriptor = two u64 words.
+//
+//   word 0: pdf[7:0] | length[23:8] | reserved[31:24] | flags[63:32]
+//   word 1: buf_pa   (64-bit physical address)
+//
+// PDF encodings the CM cares about:
+//   0x1  Read Router Config
+//   0x2  Router Config Response
+//   0x3  Notification (unsolicited)
+//
+// Length is bytes; capped at 4096 (one page). Longer control packets
+// need scatter-gather, which this scaffold refuses (BAD_LEN).
+//
+// =============================================================================
+// §2  RING INDEX RULES (USB4 §11.6.5)
+// =============================================================================
+//
+// Two indices per ring: producer (host writes, hardware reads) and
+// consumer (hardware writes, host reads). The ring is FULL when
+// (prod + 1) mod N == cons; EMPTY when prod == cons. The scaffold's
+// synthetic rings are 8 slots each (power of two so the modulo is a
+// mask).
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _tb_cm_tx_ring, _tb_cm_rx_ring, _tb_cm_tx_idx, _tb_cm_rx_idx and
+// _tb_cm_rings_stats are written only by helpers in this module.
+// tools/build.sh confines relocations against each symbol to
+// `core/drivers/tb/cm_rings.o`.
+//
+// =============================================================================
+// §4  ERROR CODES 0xFFFFF9D0..0xFFFFF9DF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent free bands: tb_domain 0xFFFFF9F0..FF,
+// tb_nhi_probe 0xFFFFF9E0..EF, tb_router_walk 0xFFFFF9C0..CF,
+// tb_topology_channel 0xFFFFF9B0..BF).
+
+module CmRings = structure {
+
+  // PDF ordinals (§1).
+  pub let TB_PDF_READ_ROUTER_CONFIG : u64 = 0x1
+  pub let TB_PDF_ROUTER_CONFIG_RESP : u64 = 0x2
+  pub let TB_PDF_NOTIFICATION       : u64 = 0x3
+  pub let TB_PDF_MAX                : u64 = 0x3
+
+  // Descriptor length cap (§1).
+  pub let TB_CM_DESC_LEN_MAX : u64 = 4096
+
+  // Ring size (§2). Power of two; index mask = SIZE - 1.
+  pub let TB_CM_RING_SIZE : u64 = 8
+  pub let TB_CM_RING_MASK : u64 = 7
+
+  // Failure taxonomy — 0xFFFFF9D0..0xFFFFF9DF.
+  pub let TB_CM_OK           : u64 = 0
+  pub let TB_CM_BAD_ARG      : u64 = 0xFFFFF9DF
+  pub let TB_CM_BAD_PDF      : u64 = 0xFFFFF9DE
+  pub let TB_CM_BAD_LEN      : u64 = 0xFFFFF9DD
+  pub let TB_CM_BAD_BUF      : u64 = 0xFFFFF9DC
+  pub let TB_CM_TX_FULL      : u64 = 0xFFFFF9DB
+  pub let TB_CM_RX_EMPTY     : u64 = 0xFFFFF9DA
+  pub let TB_CM_BAD_INDEX    : u64 = 0xFFFFF9D9
+
+  pub let TB_CM_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // Ring storage: 8 slots × 2 u64 words = 16 u64 per ring.
+  pub let mut _tb_cm_tx_ring     : [u64; 16] = uninit @align(64)
+  pub let mut _tb_cm_rx_ring     : [u64; 16] = uninit @align(64)
+  // Index cells: [0] = producer, [1] = consumer.
+  pub let mut _tb_cm_tx_idx      : [u64; 2]  = uninit @align(16)
+  pub let mut _tb_cm_rx_idx      : [u64; 2]  = uninit @align(16)
+  pub let mut _tb_cm_rings_stats : [u64; 8]  = uninit @align(64)
+
+  pub let TB_CM_ST_TX_SUBMITS : u64 = 0
+  pub let TB_CM_ST_RX_RECVS   : u64 = 1
+  pub let TB_CM_ST_TX_FULL    : u64 = 2
+  pub let TB_CM_ST_RX_EMPTY   : u64 = 3
+  pub let TB_CM_ST_REJECTS    : u64 = 4
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let tb_cm_rings_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1201): clear TX ring, RX ring, indices and stats. Labels prefixed tcm_rs_.",
+      block: {
+        xor rax, rax;
+        xor rcx, rcx;
+        lea r10, [rip + _tb_cm_tx_ring];
+      tcm_rs_tx:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  tcm_rs_tx;
+
+        xor rcx, rcx;
+        lea r10, [rip + _tb_cm_rx_ring];
+      tcm_rs_rx:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  tcm_rs_rx;
+
+        lea r10, [rip + _tb_cm_tx_idx];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+        lea r10, [rip + _tb_cm_rx_idx];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+
+        xor rcx, rcx;
+        lea r10, [rip + _tb_cm_rings_stats];
+      tcm_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  tcm_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let tb_cm_rings_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M2-002 (#1201): honesty pin. Returns 0 until a later round binds this against real NHI DMA rings.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let tb_cm_rings_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1201): counter read. Labels prefixed tcm_st_.",
+      block: {
+        cmp rdi, 8;
+        jae tcm_st_zero;
+        lea r10, [rip + _tb_cm_rings_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      tcm_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let tb_cm_rings_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1201): counter bump. Labels prefixed tcm_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae tcm_nt_out;
+        lea r10, [rip + _tb_cm_rings_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      tcm_nt_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Descriptor pack / unpack.
+  //
+  //   word 0: pdf[7:0] | length[23:8] | reserved[31:24] | flags[63:32]
+  // ==========================================================================
+
+  pub let tb_cm_desc_pack : (u64, u64, u64) -> u64 !{} @{} =
+    fn (pdf: u64) (length: u64) (flags: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M2-002 (#1201): pack descriptor word 0. Refuses pdf > TB_PDF_MAX; length > 4096; flags > 0xFFFFFFFF. Labels prefixed tcm_dp_.",
+      block: {
+        cmp rdi, 3;                      // TB_PDF_MAX
+        ja  tcm_dp_bad;
+        mov r10, 4096;
+        cmp rsi, r10;
+        ja  tcm_dp_bad;
+        mov r10, 0xFFFFFFFF;
+        cmp rdx, r10;
+        ja  tcm_dp_bad;
+
+        mov rax, rdi;
+        and rax, 0xFF;
+        mov r10, rsi;
+        and r10, 0xFFFF;
+        shl r10, 8;
+        or  rax, r10;
+        mov r10, rdx;
+        and r10, 0xFFFFFFFF;
+        shl r10, 32;
+        or  rax, r10;
+        ret;
+      tcm_dp_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let tb_cm_desc_pdf : (u64) -> u64 !{} @{} =
+    fn (word0: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M2-002 (#1201): extract pdf from word0[7:0]. Labels prefixed tcm_dpf_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFF;
+        ret
+      }
+    } @no_frame
+
+  pub let tb_cm_desc_length : (u64) -> u64 !{} @{} =
+    fn (word0: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M2-002 (#1201): extract length from word0[23:8]. Labels prefixed tcm_dl_.",
+      block: {
+        mov rax, rdi;
+        shr rax, 8;
+        and rax, 0xFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let tb_cm_desc_flags : (u64) -> u64 !{} @{} =
+    fn (word0: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M2-002 (#1201): extract flags from word0[63:32]. Labels prefixed tcm_df_.",
+      block: {
+        mov rax, rdi;
+        shr rax, 32;
+        and rax, 0xFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Index accessors — the RING_TX_PROD / RING_RX_CONS registers,
+  // seamed to local storage today.
+  // ==========================================================================
+
+  pub let tb_cm_tx_prod : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1201): read TX producer index.",
+      block: {
+        lea r10, [rip + _tb_cm_tx_idx];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let tb_cm_tx_cons : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1201): read TX consumer index.",
+      block: {
+        lea r10, [rip + _tb_cm_tx_idx];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let tb_cm_rx_prod : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1201): read RX producer index.",
+      block: {
+        lea r10, [rip + _tb_cm_rx_idx];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let tb_cm_rx_cons : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1201): read RX consumer index.",
+      block: {
+        lea r10, [rip + _tb_cm_rx_idx];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // tb_cm_tx_submit(pdf, length, flags, buf_pa) -> OK | err
+  //
+  // Enqueue one descriptor on the TX ring.
+  // ==========================================================================
+
+  pub let tb_cm_tx_submit : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (pdf: u64) (length: u64) (flags: u64) (buf_pa: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1201): enqueue TX descriptor. Refuses bad pdf/length; refuses buf_pa==0 (BAD_BUF). TX_FULL if (prod+1) & MASK == cons. Bumps TX_SUBMITS on success. Labels prefixed tcm_ts_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // pdf
+        mov r12, rsi;                    // length
+        mov r13, rdx;                    // flags
+        mov r14, rcx;                    // buf_pa
+
+        cmp r14, 0;
+        je  tcm_ts_bad_buf;
+
+        // Check full.
+        call tb_cm_tx_prod;
+        mov r15, rax;                    // prod
+        push r15;
+        sub rsp, 8;
+        call tb_cm_tx_cons;
+        add rsp, 8;
+        pop r15;
+        mov r10, r15;
+        add r10, 1;
+        and r10, 7;                      // (prod + 1) & MASK
+        cmp r10, rax;
+        je  tcm_ts_full;
+
+        // Pack descriptor.
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        call tb_cm_desc_pack;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  tcm_ts_bad_desc;
+        mov rbx, rax;                    // word0
+
+        // Write into TX ring at slot r15.
+        lea r10, [rip + _tb_cm_tx_ring];
+        mov r11, r15;
+        shl r11, 4;                      // 2 u64 = 16 bytes per slot
+        add r10, r11;
+        mov [r10 + 0], rbx;              // word0
+        mov [r10 + 8], r14;              // buf_pa
+
+        // Advance producer.
+        mov r10, r15;
+        add r10, 1;
+        and r10, 7;
+        lea r11, [rip + _tb_cm_tx_idx];
+        mov [r11 + 0], r10;
+
+        mov rdi, 0;                      // TX_SUBMITS
+        call tb_cm_rings_note;
+
+        xor rax, rax;
+        jmp tcm_ts_out;
+
+      tcm_ts_full:
+        mov rdi, 2;                      // TX_FULL
+        call tb_cm_rings_note;
+        mov rax, 0xFFFFF9DB;
+        jmp tcm_ts_out;
+      tcm_ts_bad_desc:
+        mov rdi, 4;                      // REJECTS
+        call tb_cm_rings_note;
+        mov rax, 0xFFFFF9DE;             // BAD_PDF (or LEN — same band)
+        jmp tcm_ts_out;
+      tcm_ts_bad_buf:
+        mov rdi, 4;
+        call tb_cm_rings_note;
+        mov rax, 0xFFFFF9DC;
+
+      tcm_ts_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tb_cm_rx_inject(pdf, length, flags, buf_pa) -> OK | err
+  //
+  // The RX side is normally written by the hardware. The scaffold
+  // exposes an inject entry so a witness can simulate a router
+  // response landing.
+  // ==========================================================================
+
+  pub let tb_cm_rx_inject : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (pdf: u64) (length: u64) (flags: u64) (buf_pa: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1201): inject one RX descriptor as if the NHI hardware wrote it. Bumps RX producer. Labels prefixed tcm_ri_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+        mov r13, rdx;
+        mov r14, rcx;
+
+        cmp r14, 0;
+        je  tcm_ri_bad_buf;
+
+        call tb_cm_rx_prod;
+        mov r15, rax;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        call tb_cm_desc_pack;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  tcm_ri_bad_desc;
+        mov rbx, rax;
+
+        lea r10, [rip + _tb_cm_rx_ring];
+        mov r11, r15;
+        shl r11, 4;
+        add r10, r11;
+        mov [r10 + 0], rbx;
+        mov [r10 + 8], r14;
+
+        mov r10, r15;
+        add r10, 1;
+        and r10, 7;
+        lea r11, [rip + _tb_cm_rx_idx];
+        mov [r11 + 0], r10;
+
+        xor rax, rax;
+        jmp tcm_ri_out;
+
+      tcm_ri_bad_desc:
+        mov rdi, 4;
+        call tb_cm_rings_note;
+        mov rax, 0xFFFFF9DE;
+        jmp tcm_ri_out;
+      tcm_ri_bad_buf:
+        mov rdi, 4;
+        call tb_cm_rings_note;
+        mov rax, 0xFFFFF9DC;
+
+      tcm_ri_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tb_cm_rx_dequeue() -> word0 | RX_EMPTY
+  //
+  // Consume one RX descriptor. Returns the packed word0 so the
+  // caller can decode pdf / length / flags; buf_pa is discarded here
+  // (a live driver reads it separately via tb_cm_rx_peek_buf).
+  // ==========================================================================
+
+  pub let tb_cm_rx_peek_buf : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1201): read buf_pa at RX slot. Labels prefixed tcm_pb_.",
+      block: {
+        cmp rdi, 8;
+        jae tcm_pb_bad;
+        lea r10, [rip + _tb_cm_rx_ring];
+        mov r11, rdi;
+        shl r11, 4;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        ret;
+      tcm_pb_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let tb_cm_rx_dequeue : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1201): dequeue one RX descriptor word0. RX_EMPTY if prod == cons. Bumps RX_RECVS on success. Labels prefixed tcm_dq_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        call tb_cm_rx_prod;
+        mov r12, rax;                    // prod
+        call tb_cm_rx_cons;
+        mov r13, rax;                    // cons
+
+        cmp r12, r13;
+        je  tcm_dq_empty;
+
+        lea r10, [rip + _tb_cm_rx_ring];
+        mov r11, r13;
+        shl r11, 4;
+        add r10, r11;
+        mov rbx, [r10 + 0];              // word0
+
+        // Advance consumer.
+        mov r10, r13;
+        add r10, 1;
+        and r10, 7;
+        lea r11, [rip + _tb_cm_rx_idx];
+        mov [r11 + 8], r10;
+
+        mov rdi, 1;                      // RX_RECVS
+        call tb_cm_rings_note;
+
+        mov rax, rbx;
+        jmp tcm_dq_out;
+
+      tcm_dq_empty:
+        mov rdi, 3;                      // RX_EMPTY
+        call tb_cm_rings_note;
+        mov rax, 0xFFFFF9DA;
+
+      tcm_dq_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // Peek most-recent TX slot's word0 (for tests). Returns
+  // ring[(prod - 1) & MASK].word0; DECODE_BAD if ring empty.
+  pub let tb_cm_tx_last : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M2-002 (#1201): word0 of most-recently submitted TX descriptor. Labels prefixed tcm_tl_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        call tb_cm_tx_prod;
+        mov r12, rax;
+        call tb_cm_tx_cons;
+        mov r13, rax;
+
+        cmp r12, r13;
+        je  tcm_tl_bad;
+
+        mov r10, r12;
+        sub r10, 1;
+        and r10, 7;
+        lea r11, [rip + _tb_cm_tx_ring];
+        mov rax, r10;
+        shl rax, 4;
+        add r11, rax;
+        mov rax, [r11 + 0];
+        jmp tcm_tl_out;
+
+      tcm_tl_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+
+      tcm_tl_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
