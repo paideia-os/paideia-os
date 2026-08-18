@@ -4076,6 +4076,245 @@ hda_cd_pin_one 'pub let hda_codec_discovery_probe_all : () -> u64'
 hda_cd_pin_one 'pub let hda_codec_discovery_arbitrated : () -> u64'
 echo "[hda-codec-disc-confine] encoder, probe seams and honesty pin arities pinned"
 
+# ---------------------------------------------------------------------------
+# R33.M2-002 (#1143): HDA WIDGET GRAPH TYPED-RECORD STATE + ARITY PINS.
+#
+# _hda_widget_graph_rows and _hda_widget_graph_count are the only place
+# in the kernel where a codec's widget-node table lives; a second writer
+# would let another module invent a widget the codec never advertised
+# (row_type / connections list are the wire-face for the graph, and a
+# forged row would misroute an audio path). Same shape as the four
+# R33.M1 confinements.
+HDA_WG_OWNER="${BUILD_DIR}/core/drivers/hda/widget_graph.o"
+HDA_WG_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/widget_graph.pdx"
+if [[ ! -f "${HDA_WG_SRC}" ]]; then
+    echo "[hda-widget-graph-confine] FAIL - ${HDA_WG_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_WG_OWNER}" ]]; then
+    echo "[hda-widget-graph-confine] FAIL: ${HDA_WG_OWNER} not built" >&2
+    exit 1
+fi
+hda_wg_confine_one() {
+    local sym="$1" strays=""
+    if ! obj_relocs_against "${HDA_WG_OWNER}" "${sym}"; then
+        echo "[hda-widget-graph-confine] FAIL: widget_graph.o does not reference ${sym}" >&2
+        echo "  The symbol was renamed or the module was gutted; the confinement" >&2
+        echo "  assertion below would then pass vacuously." >&2
+        exit 1
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_WG_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-widget-graph-confine] FAIL - objects other than" >&2
+        echo "  core/drivers/hda/widget_graph.o relocate against ${sym}:${strays}" >&2
+        echo "  Only hda_widget_graph_add / append_conn may write the table." >&2
+        echo "  See src/kernel/core/drivers/hda/widget_graph.pdx §2." >&2
+        exit 1
+    fi
+}
+hda_wg_confine_one '_hda_widget_graph_rows'
+hda_wg_confine_one '_hda_widget_graph_count'
+hda_wg_confine_one '_hda_widget_graph_stats'
+echo "[hda-widget-graph-confine] rows, count and stats confined"
+
+hda_wg_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_WG_SRC}"; then
+        echo "[hda-widget-graph-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  THE WIDGET GRAPH SEAMS TAKE ONLY THE FIELDS THE RECORD" >&2
+        echo "  DECLARES. A widened 'add' or 'append' would let a caller" >&2
+        echo "  claim a connections_len append_conn never advanced, or a" >&2
+        echo "  connection slot outside the row. If a signature legitimately" >&2
+        echo "  changed, §0/§1/§3 of widget_graph.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+hda_wg_pin_one 'pub let hda_widget_graph_add : (u64, u64, u64) -> u64'
+hda_wg_pin_one 'pub let hda_widget_graph_append_conn : (u64, u64) -> u64'
+hda_wg_pin_one 'pub let hda_widget_graph_row_codec : (u64) -> u64'
+hda_wg_pin_one 'pub let hda_widget_graph_row_node : (u64) -> u64'
+hda_wg_pin_one 'pub let hda_widget_graph_row_type : (u64) -> u64'
+hda_wg_pin_one 'pub let hda_widget_graph_row_conn_len : (u64) -> u64'
+hda_wg_pin_one 'pub let hda_widget_graph_row_conn : (u64, u64) -> u64'
+hda_wg_pin_one 'pub let hda_widget_graph_arbitrated : () -> u64'
+echo "[hda-widget-graph-confine] add, append and read-seam arities pinned"
+
+# ---------------------------------------------------------------------------
+# R33.M2-003 (#1144): HDA PIN CONFIG DECODER STATE + ARITY PINS.
+#
+# One symbol to confine (_hda_pin_cfg_stats). The nine field getters are
+# pure -- no state escapes -- but each has a FIXED SIGNATURE (arity ONE:
+# the 32-bit register value). A widened signature would let a caller
+# supply a "field mask" the getter used, defeating the whole point of
+# per-field accessors.
+HDA_PC_OWNER="${BUILD_DIR}/core/drivers/hda/pin_config.o"
+HDA_PC_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/pin_config.pdx"
+if [[ ! -f "${HDA_PC_SRC}" ]]; then
+    echo "[hda-pin-cfg-confine] FAIL - ${HDA_PC_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_PC_OWNER}" ]]; then
+    echo "[hda-pin-cfg-confine] FAIL: ${HDA_PC_OWNER} not built" >&2
+    exit 1
+fi
+hda_pc_confine_one() {
+    local sym="$1" strays=""
+    if ! obj_relocs_against "${HDA_PC_OWNER}" "${sym}"; then
+        echo "[hda-pin-cfg-confine] FAIL: pin_config.o does not reference ${sym}" >&2
+        exit 1
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_PC_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-pin-cfg-confine] FAIL - strays for ${sym}:${strays}" >&2
+        exit 1
+    fi
+}
+hda_pc_confine_one '_hda_pin_cfg_stats'
+echo "[hda-pin-cfg-confine] pin cfg stats confined"
+
+hda_pc_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_PC_SRC}"; then
+        echo "[hda-pin-cfg-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  EVERY PIN CFG GETTER TAKES ONE 32-BIT REGISTER VALUE AND" >&2
+        echo "  NOTHING ELSE. A widened signature would let a caller pull" >&2
+        echo "  bits from where they named -- exactly the class of confusion" >&2
+        echo "  per-field accessors exist to stop (§0). If a signature" >&2
+        echo "  legitimately changed, §1/§3 of pin_config.pdx must be" >&2
+        echo "  rewritten first." >&2
+        exit 1
+    fi
+}
+hda_pc_pin_one 'pub let hda_pin_cfg_conn : (u64) -> u64'
+hda_pc_pin_one 'pub let hda_pin_cfg_gross_loc : (u64) -> u64'
+hda_pc_pin_one 'pub let hda_pin_cfg_geom_loc : (u64) -> u64'
+hda_pc_pin_one 'pub let hda_pin_cfg_device : (u64) -> u64'
+hda_pc_pin_one 'pub let hda_pin_cfg_ctype : (u64) -> u64'
+hda_pc_pin_one 'pub let hda_pin_cfg_color : (u64) -> u64'
+hda_pc_pin_one 'pub let hda_pin_cfg_misc : (u64) -> u64'
+hda_pc_pin_one 'pub let hda_pin_cfg_assoc : (u64) -> u64'
+hda_pc_pin_one 'pub let hda_pin_cfg_seq : (u64) -> u64'
+hda_pc_pin_one 'pub let hda_pin_cfg_arbitrated : () -> u64'
+echo "[hda-pin-cfg-confine] nine field-getter arities and honesty pin pinned"
+
+# ---------------------------------------------------------------------------
+# R33.M2-004 (#1145): HDA VERB HELPER STATE + ARITY PINS.
+#
+# _hda_verb_stats is the only writer of the per-verb send counters.
+# The per-verb wrappers take (codec_addr, node_id) + at most one payload
+# argument, mirroring their spec-defined verb shape. Widening any of
+# them to accept a raw verb id or a raw payload word would bypass the
+# per-verb payload-width validation each wrapper embeds.
+HDA_VB_OWNER="${BUILD_DIR}/core/drivers/hda/verbs.o"
+HDA_VB_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/verbs.pdx"
+if [[ ! -f "${HDA_VB_SRC}" ]]; then
+    echo "[hda-verbs-confine] FAIL - ${HDA_VB_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_VB_OWNER}" ]]; then
+    echo "[hda-verbs-confine] FAIL: ${HDA_VB_OWNER} not built" >&2
+    exit 1
+fi
+hda_vb_confine_one() {
+    local sym="$1" strays=""
+    if ! obj_relocs_against "${HDA_VB_OWNER}" "${sym}"; then
+        echo "[hda-verbs-confine] FAIL: verbs.o does not reference ${sym}" >&2
+        exit 1
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_VB_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-verbs-confine] FAIL - strays for ${sym}:${strays}" >&2
+        exit 1
+    fi
+}
+hda_vb_confine_one '_hda_verb_stats'
+echo "[hda-verbs-confine] verb stats confined"
+
+hda_vb_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_VB_SRC}"; then
+        echo "[hda-verbs-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  EVERY VERB WRAPPER TAKES (codec_addr, node_id) PLUS AT MOST" >&2
+        echo "  ONE PAYLOAD ARGUMENT, MATCHING THE VERB'S SPEC SHAPE. A" >&2
+        echo "  widened signature would bypass the per-verb payload-width" >&2
+        echo "  validation each wrapper embeds. If a signature legitimately" >&2
+        echo "  changed, §0/§1/§3 of verbs.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+hda_vb_pin_one 'pub let hda_verb_pack_short : (u64, u64, u64, u64) -> u64'
+hda_vb_pin_one 'pub let hda_verb_send_long : (u64, u64, u64, u64) -> u64'
+hda_vb_pin_one 'pub let hda_verb_send_short : (u64, u64, u64, u64) -> u64'
+hda_vb_pin_one 'pub let hda_verb_get_pin_ctl : (u64, u64) -> u64'
+hda_vb_pin_one 'pub let hda_verb_set_pin_ctl : (u64, u64, u64) -> u64'
+hda_vb_pin_one 'pub let hda_verb_get_eapd : (u64, u64) -> u64'
+hda_vb_pin_one 'pub let hda_verb_set_eapd : (u64, u64, u64) -> u64'
+hda_vb_pin_one 'pub let hda_verb_get_power_state : (u64, u64) -> u64'
+hda_vb_pin_one 'pub let hda_verb_set_power_state : (u64, u64, u64) -> u64'
+hda_vb_pin_one 'pub let hda_verb_get_amp_gain : (u64, u64, u64) -> u64'
+hda_vb_pin_one 'pub let hda_verb_set_amp_gain : (u64, u64, u64) -> u64'
+hda_vb_pin_one 'pub let hda_verb_arbitrated : () -> u64'
+echo "[hda-verbs-confine] pack, send, per-verb wrapper and honesty pin arities pinned"
+
+# ---------------------------------------------------------------------------
+# R33.M2-005 (#1146): CODEC_QUERY_CHANNEL SCHEMA ARITY PINS.
+#
+# No stateful confinement here (the schema is pure pack/unpack); the
+# packers are arity-pinned so a widened signature cannot smuggle a
+# session-authority field onto the wire that the audio server holds
+# through its own capability set instead.
+CQCH_SRC="${REPO_ROOT}/src/kernel/core/ipc/codec_query_channel.pdx"
+if [[ ! -f "${CQCH_SRC}" ]]; then
+    echo "[codec-query-schema] FAIL - ${CQCH_SRC} not found" >&2
+    exit 1
+fi
+cqch_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${CQCH_SRC}"; then
+        echo "[codec-query-schema] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  THE CODEC QUERY SCHEMA PACKERS TAKE ONLY THE FIELDS THE" >&2
+        echo "  WIRE CARRIES. A widened signature would let a session-" >&2
+        echo "  authority field the audio server holds through its own" >&2
+        echo "  capability set be smuggled onto the wire. If a signature" >&2
+        echo "  legitimately changed, §0/§1/§3 of codec_query_channel.pdx" >&2
+        echo "  and design/ipc/codec-query-channel-schema.md must be" >&2
+        echo "  rewritten first." >&2
+        exit 1
+    fi
+}
+cqch_pin_one 'pub let codec_q_pack_get_widgets_req : (u64) -> u64'
+cqch_pin_one 'pub let codec_q_pack_get_pins_req : (u64) -> u64'
+cqch_pin_one 'pub let codec_q_pack_set_pin_ctl_req : (u64, u64, u64) -> u64'
+cqch_pin_one 'pub let codec_q_pack_set_gain_req : (u64, u64, u64, u64) -> u64'
+cqch_pin_one 'pub let codec_q_pack_set_mute_req : (u64, u64, u64, u64) -> u64'
+cqch_pin_one 'pub let codec_q_pack_get_widgets_reply : (u64) -> u64'
+cqch_pin_one 'pub let codec_q_pack_get_pins_reply : (u64) -> u64'
+cqch_pin_one 'pub let codec_q_pack_set_ack : (u64) -> u64'
+echo "[codec-query-schema] request / reply packer arities pinned"
+
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
