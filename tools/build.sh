@@ -4803,6 +4803,271 @@ hda_jk_pin_one 'pub let hda_alc287_jack_arbitrated : () -> u64'
 hda_jk_pin_one 'pub let hda_alc287_jack_stat : (u64) -> u64'
 echo "[hda-alc287-jk-confine] arm/isr/publish/read-seams arities pinned"
 
+# ---------------------------------------------------------------------------
+# R33.M6-001 (#1162): SOF DSP FIRMWARE LOADER STATE + ARITY PINS.
+#
+# _hda_sof_loader_{bound, fw_ptr, fw_len, stage, verified, stats} together
+# constitute the whole handshake latch. Arity pins hold bind to
+# (fw_ptr, fw_len) and advance to zero args -- a widened bind accepting
+# a caller-chosen STAGE would let a helper skip verify by claiming
+# BASE_FW_ENTERED without ever having crossed STAGE 0's gate; a
+# widened advance would collapse the one-way stage machine into
+# something callers could jump.
+HDA_SL_OWNER="${BUILD_DIR}/core/drivers/hda/sof_loader.o"
+HDA_SL_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/sof_loader.pdx"
+if [[ ! -f "${HDA_SL_SRC}" ]]; then
+    echo "[hda-sof-loader-confine] FAIL - ${HDA_SL_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_SL_OWNER}" ]]; then
+    echo "[hda-sof-loader-confine] FAIL: ${HDA_SL_OWNER} not built" >&2
+    exit 1
+fi
+hda_sl_confine_one() {
+    local sym="$1" strays=""
+    if ! obj_relocs_against "${HDA_SL_OWNER}" "${sym}"; then
+        echo "[hda-sof-loader-confine] FAIL: sof_loader.o does not reference ${sym}" >&2
+        exit 1
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_SL_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-sof-loader-confine] FAIL - strays for ${sym}:${strays}" >&2
+        echo "  Only sof_loader.o may write the handshake latches." >&2
+        echo "  See src/kernel/core/drivers/hda/sof_loader.pdx §2." >&2
+        exit 1
+    fi
+}
+hda_sl_confine_one '_hda_sof_loader_bound'
+hda_sl_confine_one '_hda_sof_loader_fw_ptr'
+hda_sl_confine_one '_hda_sof_loader_fw_len'
+hda_sl_confine_one '_hda_sof_loader_stage'
+hda_sl_confine_one '_hda_sof_loader_verified'
+hda_sl_confine_one '_hda_sof_loader_stats'
+echo "[hda-sof-loader-confine] SOF loader latches + stats confined"
+
+hda_sl_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_SL_SRC}"; then
+        echo "[hda-sof-loader-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  SOF LOADER SEAMS: bind takes (fw_ptr, fw_len);" >&2
+        echo "  advance takes zero args; mark_verified takes zero" >&2
+        echo "  args. A widened bind accepting a caller-chosen STAGE" >&2
+        echo "  would let a helper skip verify by claiming a stage" >&2
+        echo "  the DSP never reached. If a signature legitimately" >&2
+        echo "  changed, §0 of sof_loader.pdx must be rewritten" >&2
+        echo "  first." >&2
+        exit 1
+    fi
+}
+hda_sl_pin_one 'pub let hda_sof_loader_bind : (u64, u64) -> u64'
+hda_sl_pin_one 'pub let hda_sof_loader_advance : () -> u64'
+hda_sl_pin_one 'pub let hda_sof_loader_mark_verified : () -> u64'
+hda_sl_pin_one 'pub let hda_sof_loader_bound : () -> u64'
+hda_sl_pin_one 'pub let hda_sof_loader_ready : () -> u64'
+hda_sl_pin_one 'pub let hda_sof_loader_stage : () -> u64'
+hda_sl_pin_one 'pub let hda_sof_loader_reset : () -> u64'
+hda_sl_pin_one 'pub let hda_sof_loader_arbitrated : () -> u64'
+echo "[hda-sof-loader-confine] handshake seam arities pinned"
+
+# ---------------------------------------------------------------------------
+# R33.M6-002 (#1163): SOF TOPOLOGY PARSER STATE + ARITY PINS.
+#
+# _hda_sof_topology_stats is the only mutable state the parser owns
+# (the parser is pure decode over caller-supplied bytes). Arity pins
+# hold parse_header to (buf_ptr, buf_len) -- a caller-supplied COUNT
+# would let a helper claim more tuples than the header names, which
+# is exactly the confusion the header exists to prevent.
+HDA_ST_OWNER="${BUILD_DIR}/core/drivers/hda/sof_topology.o"
+HDA_ST_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/sof_topology.pdx"
+if [[ ! -f "${HDA_ST_SRC}" ]]; then
+    echo "[hda-sof-topology-confine] FAIL - ${HDA_ST_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_ST_OWNER}" ]]; then
+    echo "[hda-sof-topology-confine] FAIL: ${HDA_ST_OWNER} not built" >&2
+    exit 1
+fi
+hda_st_confine_one() {
+    local sym="$1" strays=""
+    if ! obj_relocs_against "${HDA_ST_OWNER}" "${sym}"; then
+        echo "[hda-sof-topology-confine] FAIL: sof_topology.o does not reference ${sym}" >&2
+        exit 1
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_ST_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-sof-topology-confine] FAIL - strays for ${sym}:${strays}" >&2
+        echo "  Only sof_topology.o may write the parser counters." >&2
+        echo "  See src/kernel/core/drivers/hda/sof_topology.pdx §2." >&2
+        exit 1
+    fi
+}
+hda_st_confine_one '_hda_sof_topology_stats'
+echo "[hda-sof-topology-confine] SOF topology stats confined"
+
+hda_st_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_ST_SRC}"; then
+        echo "[hda-sof-topology-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  SOF TOPOLOGY SEAMS: parse_header takes (buf_ptr," >&2
+        echo "  buf_len); tuple_type / tuple_size take (buf_ptr," >&2
+        echo "  buf_len, tup_index). A widened parse_header accepting" >&2
+        echo "  a caller-supplied COUNT would let a helper claim more" >&2
+        echo "  tuples than the header names. If a signature" >&2
+        echo "  legitimately changed, §0 of sof_topology.pdx must be" >&2
+        echo "  rewritten first." >&2
+        exit 1
+    fi
+}
+hda_st_pin_one 'pub let hda_sof_topology_parse_header : (u64, u64) -> u64'
+hda_st_pin_one 'pub let hda_sof_topology_count : (u64) -> u64'
+hda_st_pin_one 'pub let hda_sof_topology_tuple_type : (u64, u64, u64) -> u64'
+hda_st_pin_one 'pub let hda_sof_topology_tuple_size : (u64, u64, u64) -> u64'
+echo "[hda-sof-topology-confine] parser seam arities pinned"
+
+# ---------------------------------------------------------------------------
+# R33.M6-003 (#1164): SOF EFFECT PIPELINE STATE + ARITY PINS.
+#
+# _hda_sof_effects_pipeline holds the eight slot cells and
+# _hda_sof_effects_stats the counters. Arity pins hold attach to
+# (slot, kind) and detach to (slot) -- a widened attach accepting a
+# caller-supplied EFFECT PARAMETER blob would let a helper install
+# an arbitrary payload on the codec's analog path, exactly what the
+# vendor wrapper exists to stop.
+HDA_SFX_OWNER="${BUILD_DIR}/core/drivers/hda/sof_effects.o"
+HDA_SFX_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/sof_effects.pdx"
+if [[ ! -f "${HDA_SFX_SRC}" ]]; then
+    echo "[hda-sof-effects-confine] FAIL - ${HDA_SFX_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_SFX_OWNER}" ]]; then
+    echo "[hda-sof-effects-confine] FAIL: ${HDA_SFX_OWNER} not built" >&2
+    exit 1
+fi
+hda_sfx_confine_one() {
+    local sym="$1" strays=""
+    if ! obj_relocs_against "${HDA_SFX_OWNER}" "${sym}"; then
+        echo "[hda-sof-effects-confine] FAIL: sof_effects.o does not reference ${sym}" >&2
+        exit 1
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_SFX_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-sof-effects-confine] FAIL - strays for ${sym}:${strays}" >&2
+        echo "  Only sof_effects.o may write the pipeline table." >&2
+        echo "  See src/kernel/core/drivers/hda/sof_effects.pdx §2." >&2
+        exit 1
+    fi
+}
+hda_sfx_confine_one '_hda_sof_effects_pipeline'
+hda_sfx_confine_one '_hda_sof_effects_stats'
+echo "[hda-sof-effects-confine] SOF effects pipeline + stats confined"
+
+hda_sfx_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_SFX_SRC}"; then
+        echo "[hda-sof-effects-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  SOF EFFECTS SEAMS: attach takes (slot, kind); detach" >&2
+        echo "  takes (slot). A widened attach accepting a caller-" >&2
+        echo "  supplied parameter blob would let a helper install an" >&2
+        echo "  arbitrary payload on the codec's analog path. If a" >&2
+        echo "  signature legitimately changed, §0 of sof_effects.pdx" >&2
+        echo "  must be rewritten first." >&2
+        exit 1
+    fi
+}
+hda_sfx_pin_one 'pub let hda_sof_effects_attach : (u64, u64) -> u64'
+hda_sfx_pin_one 'pub let hda_sof_effects_detach : (u64) -> u64'
+hda_sfx_pin_one 'pub let hda_sof_effects_slot_kind : (u64) -> u64'
+hda_sfx_pin_one 'pub let hda_sof_effects_clear : () -> u64'
+hda_sfx_pin_one 'pub let hda_sof_effects_arbitrated : () -> u64'
+echo "[hda-sof-effects-confine] pipeline seam arities pinned"
+
+# ---------------------------------------------------------------------------
+# R33.M6-004 (#1165): SOF DUAL-SIG VERIFY STATE + ARITY PINS.
+#
+# _hda_sof_verify_stats holds the DUAL verdict counters and
+# _hda_sof_verify_arm_tmp is the one-word scratch cell across arm 1's
+# and arm 2's calls into driver_sig_verify_algo. Arity pins hold
+# verify_dual to (fw_ptr, fw_len, paideia_sig, paideia_pk,
+# vendor_sig, vendor_pk) -- widening the seam to accept a signature
+# LENGTH would let a caller mint a shorter buffer than the algorithm
+# demands, which is exactly what the underlying gate 5 in
+# sig_verify.pdx exists to catch; the length is fixed at 3309 per
+# ML-DSA-65 FIPS 204 §5.4.
+HDA_SV_OWNER="${BUILD_DIR}/core/drivers/hda/sof_verify.o"
+HDA_SV_SRC="${REPO_ROOT}/src/kernel/core/drivers/hda/sof_verify.pdx"
+if [[ ! -f "${HDA_SV_SRC}" ]]; then
+    echo "[hda-sof-verify-confine] FAIL - ${HDA_SV_SRC} not found" >&2
+    exit 1
+fi
+if [[ ! -f "${HDA_SV_OWNER}" ]]; then
+    echo "[hda-sof-verify-confine] FAIL: ${HDA_SV_OWNER} not built" >&2
+    exit 1
+fi
+hda_sv_confine_one() {
+    local sym="$1" strays=""
+    if ! obj_relocs_against "${HDA_SV_OWNER}" "${sym}"; then
+        echo "[hda-sof-verify-confine] FAIL: sof_verify.o does not reference ${sym}" >&2
+        exit 1
+    fi
+    for o in "${OBJECTS[@]}"; do
+        [[ "${o}" == "${HDA_SV_OWNER}" ]] && continue
+        if obj_relocs_against "${o}" "${sym}"; then
+            strays="${strays} ${o#"${BUILD_DIR}"/}"
+        fi
+    done
+    if [[ -n "${strays}" ]]; then
+        echo "[hda-sof-verify-confine] FAIL - strays for ${sym}:${strays}" >&2
+        echo "  Only sof_verify.o may write the dual-sig stats." >&2
+        echo "  See src/kernel/core/drivers/hda/sof_verify.pdx §2." >&2
+        exit 1
+    fi
+}
+hda_sv_confine_one '_hda_sof_verify_stats'
+hda_sv_confine_one '_hda_sof_verify_arm_tmp'
+echo "[hda-sof-verify-confine] SOF verify stats + tmp confined"
+
+hda_sv_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${HDA_SV_SRC}"; then
+        echo "[hda-sof-verify-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  SOF VERIFY SEAM: verify_dual takes (fw_ptr, fw_len," >&2
+        echo "  paideia_sig, paideia_pk, vendor_sig, vendor_pk)." >&2
+        echo "  Widening to accept a signature LENGTH would let a" >&2
+        echo "  caller mint a shorter buffer than ML-DSA-65 demands." >&2
+        echo "  Both signature buffers are 3309 bytes per FIPS 204" >&2
+        echo "  §5.4. If a signature legitimately changed, §0 of" >&2
+        echo "  sof_verify.pdx must be rewritten first." >&2
+        exit 1
+    fi
+}
+hda_sv_pin_one 'pub let hda_sof_verify_dual : (u64, u64, u64, u64, u64, u64) -> u64'
+hda_sv_pin_one 'pub let hda_sof_verify_dual_is_ok : (u64) -> u64'
+hda_sv_pin_one 'pub let hda_sof_verify_arbitrated : () -> u64'
+echo "[hda-sof-verify-confine] dual-sig seam arities pinned"
+
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
