@@ -2649,6 +2649,39 @@ fi
 echo "[usb-isoch-confine] USB isochronous substrate state confined"
 
 # ---------------------------------------------------------------------------
+# R34.M6 (#1191/#1192/#1193/#1194): USB fingerprint sensor substrate
+# state confinement.
+#
+# Five modules, each owns its own row table / state block / stats
+# array. tools/build.sh confines relocations against each one to its
+# owning object so a second writer cannot restamp a sensor's vendor
+# id or type, forge a template count behind the class driver's back,
+# or bump a vendor-protocol stats cell without going through the
+# scaffold's own gates.
+FPSN_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_fp_sensor.pdx"
+FPCL_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/fp/fp_class.pdx"
+FPCC_SRC="${REPO_ROOT}/src/kernel/core/ipc/fp_capture_channel.pdx"
+FPGX_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/fp/goodix.pdx"
+FPSY_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/fp/synaptics.pdx"
+if [[ ! -f "${FPSN_SRC}" || ! -f "${FPCL_SRC}" || ! -f "${FPCC_SRC}" \
+        || ! -f "${FPGX_SRC}" || ! -f "${FPSY_SRC}" ]]; then
+    echo "[usb-fp-confine] FAIL - one of the R34.M6 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_fp_sensor_table'  'core/cap/kind_fp_sensor.o'
+ec_confine_one '_fp_sensor_stats'  'core/cap/kind_fp_sensor.o'
+ec_confine_one '_fp_class_state'   'core/drivers/usb/fp/fp_class.o'
+ec_confine_one '_fp_class_stats'   'core/drivers/usb/fp/fp_class.o'
+ec_confine_one '_goodix_stats'     'core/drivers/usb/fp/goodix.o'
+ec_confine_one '_synaptics_stats'  'core/drivers/usb/fp/synaptics.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_fp_sensor.pdx §3, fp_class.pdx §3, goodix.pdx and" >&2
+    echo "  synaptics.pdx for the row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[usb-fp-confine] USB fingerprint sensor substrate state confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
