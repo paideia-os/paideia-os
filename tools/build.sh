@@ -2298,6 +2298,176 @@ hesch_pin_one 'pub let hid_event_stream_ch_click_edge : (u64) -> u64'
 echo "[hid-stream-schema-confine] event validator, type extractor, reserved-bits gate, four packers and five unpackers arities pinned"
 
 # ---------------------------------------------------------------------------
+# R32.M5-001 (#1133): THE SENSOR CHANNEL CAPABILITY.
+#
+# Same shape as the HID event path. Two claims:
+#
+# (a) _sensor_channel_table is the only place in the kernel where a
+#     sensor subscription's (endpoint_id, sensor_type, rate_hz,
+#     subscriber_pid) tuple lives. A second writer could install a
+#     subscription with no gate involved and no audit record, and every
+#     future sensor-hub delivery would then be one made against a
+#     subscription the derivation lattice never blessed.
+#     _sensor_channel_stats is confined for the sibling reason.
+#
+# (b) Arity pins. The static identity (endpoint, type, rate, pid) comes
+#     from the ROW at mint, so the slot-arity-one resolvers take a
+#     capability and nothing else. `rate_of_slot(slot, assumed)` reads
+#     as a convenience and is a way to make a driver think one
+#     subscription wants samples faster than the mint approved.
+SENSOR_CHANNEL_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_sensor_channel.pdx"
+if [[ ! -f "${SENSOR_CHANNEL_SRC}" ]]; then
+    echo "[sensor-channel-confine] FAIL - ${SENSOR_CHANNEL_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_sensor_channel_table' 'core/cap/kind_sensor_channel.o'
+ec_confine_one '_sensor_channel_stats' 'core/cap/kind_sensor_channel.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/cap/kind_sensor_channel.pdx §1 for why the" >&2
+    echo "  row table has exactly one writer." >&2
+    exit 1
+fi
+echo "[sensor-channel-confine] sensor channel rows and counter confined"
+
+sench_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${SENSOR_CHANNEL_SRC}"; then
+        echo "[sensor-channel-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A SENSOR SUBSCRIPTION'S ENDPOINT, TYPE, RATE AND PID COME" >&2
+        echo "  FROM THE CAPABILITY'S OWN ROW AND NEVER FROM A CALLER. An" >&2
+        echo "  extra parameter on any of these makes 'route my subscription" >&2
+        echo "  as if it were somebody else's' expressible, and the two ways" >&2
+        echo "  that goes wrong are silent sample misdelivery and silent" >&2
+        echo "  rate-budget overrun. If a signature legitimately changed," >&2
+        echo "  the confinement argument in src/kernel/core/cap/" >&2
+        echo "  kind_sensor_channel.pdx §1 must be rewritten first." >&2
+        exit 1
+    fi
+}
+sench_pin_one 'pub let sensor_channel_channel_of_slot : (u64) -> u64'
+sench_pin_one 'pub let sensor_channel_type_of_slot : (u64) -> u64'
+sench_pin_one 'pub let sensor_channel_rate_of_slot : (u64) -> u64'
+sench_pin_one 'pub let sensor_channel_pid_of_slot : (u64) -> u64'
+sench_pin_one 'pub let sensor_channel_row_of_slot : (u64) -> u64'
+sench_pin_one 'pub let sensor_channel_sample_note : (u64) -> u64'
+sench_pin_one 'pub let sensor_channel_type_valid : (u64) -> u64'
+sench_pin_one 'pub let sensor_channel_rate_valid : (u64) -> u64'
+echo "[sensor-channel-confine] static-identity resolvers and validators arities pinned"
+
+# A TYPE, RATE, PID OR ENDPOINT THAT CAN BE CHANGED IS NOT A
+# SUBSCRIPTION. §3 states the discipline explicitly; these are the
+# names a future "let a subscriber change class or rate after the fact"
+# change would be given.
+if grep -qE 'sensor_channel_(set_type|type_set|set_rate|rate_set|widen_rate|raise_rate|set_pid|pid_set|set_channel|channel_set)' "${SENSOR_CHANNEL_SRC}"; then
+    echo "[sensor-channel-confine] FAIL - a static-identity-mutating primitive" >&2
+    echo "  was added to the sensor channel kind." >&2
+    echo "" >&2
+    echo "  sensor_type, rate_hz, subscriber_pid and event_channel_key are" >&2
+    echo "  set once, by the mint, and there is no primitive that changes" >&2
+    echo "  them; see src/kernel/core/cap/kind_sensor_channel.pdx §3." >&2
+    echo "  A RATE THAT CAN BE RAISED WOULD LET A SUBSCRIBER GAIN A SHARE" >&2
+    echo "  OF THE DRIVER'S SAMPLE BUDGET NO GATE VALIDATED; rate changes" >&2
+    echo "  are expressible by revoking and minting a fresh row." >&2
+    exit 1
+fi
+echo "[sensor-channel-confine] no static-identity-mutating primitive"
+
+# ---------------------------------------------------------------------------
+# R32.M5-002 (#1134): SENSOR HUB DRIVER STATE + ARITY PINS.
+#
+# Two symbols to confine (same shape as backlight_pwm):
+#
+#   _sensor_hub_bound  -- the one flag that says the scaffold has been bound
+#   _sensor_hub_stats  -- the counters
+SENSOR_HUB_SRC="${REPO_ROOT}/src/kernel/core/drivers/sensor_hub.pdx"
+if [[ ! -f "${SENSOR_HUB_SRC}" ]]; then
+    echo "[sensor-hub-confine] FAIL - ${SENSOR_HUB_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_sensor_hub_bound' 'core/drivers/sensor_hub.o'
+ec_confine_one '_sensor_hub_stats' 'core/drivers/sensor_hub.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/drivers/sensor_hub.pdx §2 for why the bind" >&2
+    echo "  flag and stats have exactly one writer." >&2
+    exit 1
+fi
+echo "[sensor-hub-confine] bind flag and stats confined"
+
+shub_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${SENSOR_HUB_SRC}"; then
+        echo "[sensor-hub-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  THE THREE MOUNT SEAMS TAKE A SAMPLE AND NOTHING ELSE. An" >&2
+        echo "  extra parameter on any of them lets a caller choose which" >&2
+        echo "  sensor type this publish counts against, and one call" >&2
+        echo "  publishing under two names would let a subscriber count" >&2
+        echo "  against a rate budget for a class it never asked about." >&2
+        echo "  The bind seam is arity ZERO on purpose (§2/§4): a real" >&2
+        echo "  bind takes an MMIO / I²C-HID capability, and leaving the" >&2
+        echo "  seam empty stops a caller pretending a capability is there." >&2
+        exit 1
+    fi
+}
+shub_pin_one 'pub let sensor_hub_bind : () -> u64'
+shub_pin_one 'pub let sensor_hub_sample_als : (u64) -> u64'
+shub_pin_one 'pub let sensor_hub_sample_accel : (u64) -> u64'
+shub_pin_one 'pub let sensor_hub_sample_gyro : (u64) -> u64'
+shub_pin_one 'pub let sensor_hub_arbitrated : () -> u64'
+echo "[sensor-hub-confine] bind arity zero, three mount seams arity one, honesty pin arity zero"
+
+# ---------------------------------------------------------------------------
+# R32.M5-003 (#1135): SENSOR READ CHANNEL SCHEMA ARITY PINS.
+#
+# The schema has no storage of its own -- pure pack/unpack -- so there
+# is no _table to confine. What there IS to defend is the arity of every
+# packer and unpacker. A third parameter on pack_subscribe is a caller-
+# supplied option that widens the sample budget; a fourth on
+# pack_sample_word1 is a caller-supplied fourth axis (magnetometer)
+# that quietly widens the sensor into a class no subscriber asked
+# about. Neither is expressible against a pinned signature.
+SRCH_SRC="${REPO_ROOT}/src/kernel/core/ipc/sensor_read_channel.pdx"
+if [[ ! -f "${SRCH_SRC}" ]]; then
+    echo "[sensor-schema-confine] FAIL - ${SRCH_SRC} not found" >&2
+    exit 1
+fi
+srch_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${SRCH_SRC}"; then
+        echo "[sensor-schema-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A SENSOR READ CHANNEL FIELD IS DECIDED BY THE SCHEMA AND" >&2
+        echo "  NEVER BY A CALLER. An extra parameter on any packer or" >&2
+        echo "  unpacker makes 'pack a field my subscriber does not know" >&2
+        echo "  about' or 'extract a bit range my packer never wrote to'" >&2
+        echo "  expressible, and both ways that goes wrong silently reads" >&2
+        echo "  or writes the wrong bits (a rate becomes an option tag, a" >&2
+        echo "  z-axis becomes a fourth-sensor field). If a signature" >&2
+        echo "  legitimately changed, the schema doc" >&2
+        echo "  design/ipc/sensor-read-channel-schema.md §3 must be" >&2
+        echo "  rewritten first." >&2
+        exit 1
+    fi
+}
+srch_pin_one 'pub let sensor_read_ch_ev_valid : (u64) -> u64'
+srch_pin_one 'pub let sensor_read_ch_type : (u64) -> u64'
+srch_pin_one 'pub let sensor_read_ch_pack_subscribe : (u64, u64) -> u64'
+srch_pin_one 'pub let sensor_read_ch_sub_type : (u64) -> u64'
+srch_pin_one 'pub let sensor_read_ch_sub_rate : (u64) -> u64'
+srch_pin_one 'pub let sensor_read_ch_pack_unsubscribe : () -> u64'
+srch_pin_one 'pub let sensor_read_ch_pack_sample_word0 : (u64) -> u64'
+srch_pin_one 'pub let sensor_read_ch_pack_sample_word1 : (u64, u64, u64) -> u64'
+srch_pin_one 'pub let sensor_read_ch_sample_ts : (u64) -> u64'
+srch_pin_one 'pub let sensor_read_ch_sample_x : (u64) -> u64'
+srch_pin_one 'pub let sensor_read_ch_sample_y : (u64) -> u64'
+srch_pin_one 'pub let sensor_read_ch_sample_z : (u64) -> u64'
+echo "[sensor-schema-confine] event validator, subscribe pair, unsubscribe zero, two sample packers and four sample unpackers arities pinned"
+
+# ---------------------------------------------------------------------------
 # R31.M3-002 (#1100): BATTERY CHANNEL SCHEMA ARITY PINS.
 #
 # The schema has no storage of its own -- it is pure pack/unpack -- so
