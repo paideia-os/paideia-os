@@ -2371,6 +2371,112 @@ fi
 echo "[audio-route-confine] no LINEAR-breaking primitive"
 
 # ---------------------------------------------------------------------------
+# R34.M1-003 (#1169): THE USB DEVICE + USB HUB PATH.
+#
+# Two claims per kind:
+#
+# (a) _usb_device_table is the only place in the kernel where a USB
+#     device's (address, speed) live; _usb_hub_table is the only place
+#     where a hub's (port_count, tt_supported, tier) live. A second
+#     writer could restamp any of those with no capability involved
+#     and no refusal recorded.
+#
+# (b) Arity pins. The static identity comes FROM THE ROW, so the
+#     slot-arity-one resolvers take a capability and nothing else.
+USBD_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_usb_device.pdx"
+if [[ ! -f "${USBD_SRC}" ]]; then
+    echo "[usb-device-confine] FAIL - ${USBD_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_usb_device_table' 'core/cap/kind_usb_device.o'
+ec_confine_one '_usb_device_stats' 'core/cap/kind_usb_device.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/cap/kind_usb_device.pdx §1 for why the" >&2
+    echo "  row table has exactly one writer." >&2
+    exit 1
+fi
+echo "[usb-device-confine] USB device rows and counters confined"
+
+usbd_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${USBD_SRC}"; then
+        echo "[usb-device-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        exit 1
+    fi
+}
+usbd_pin_one 'pub let usb_device_key_of_slot : (u64) -> u64'
+usbd_pin_one 'pub let usb_device_address_of_slot : (u64) -> u64'
+usbd_pin_one 'pub let usb_device_speed_of_slot : (u64) -> u64'
+usbd_pin_one 'pub let usb_device_row_of_slot : (u64) -> u64'
+usbd_pin_one 'pub let usb_device_address_valid : (u64) -> u64'
+usbd_pin_one 'pub let usb_device_speed_valid : (u64) -> u64'
+echo "[usb-device-confine] static-identity resolvers and validator arities pinned"
+
+if grep -qE 'usb_device_(set_address|address_set|set_speed|speed_set|set_key|key_set)' "${USBD_SRC}"; then
+    echo "[usb-device-confine] FAIL - a static-identity-mutating primitive" >&2
+    echo "  was added to the USB device kind." >&2
+    exit 1
+fi
+echo "[usb-device-confine] no static-identity-mutating primitive"
+
+USBH_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_usb_hub.pdx"
+if [[ ! -f "${USBH_SRC}" ]]; then
+    echo "[usb-hub-confine] FAIL - ${USBH_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_usb_hub_table' 'core/cap/kind_usb_hub.o'
+ec_confine_one '_usb_hub_stats' 'core/cap/kind_usb_hub.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/cap/kind_usb_hub.pdx §1 for why the" >&2
+    echo "  row table has exactly one writer." >&2
+    exit 1
+fi
+echo "[usb-hub-confine] USB hub rows and counters confined"
+
+usbh_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${USBH_SRC}"; then
+        echo "[usb-hub-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        exit 1
+    fi
+}
+usbh_pin_one 'pub let usb_hub_port_count_of_slot : (u64) -> u64'
+usbh_pin_one 'pub let usb_hub_tt_of_slot : (u64) -> u64'
+usbh_pin_one 'pub let usb_hub_tier_of_slot : (u64) -> u64'
+usbh_pin_one 'pub let usb_hub_row_of_slot : (u64) -> u64'
+usbh_pin_one 'pub let usb_hub_port_count_valid : (u64) -> u64'
+usbh_pin_one 'pub let usb_hub_tier_valid : (u64) -> u64'
+usbh_pin_one 'pub let usb_hub_tt_valid : (u64) -> u64'
+echo "[usb-hub-confine] static-identity resolvers and validator arities pinned"
+
+if grep -qE 'usb_hub_(set_ports|ports_set|set_tier|tier_set|set_tt|tt_set|set_key|key_set)' "${USBH_SRC}"; then
+    echo "[usb-hub-confine] FAIL - a static-identity-mutating primitive" >&2
+    echo "  was added to the USB hub kind." >&2
+    exit 1
+fi
+echo "[usb-hub-confine] no static-identity-mutating primitive"
+
+# Hub driver + FSM state confinement.
+HUB_DRV_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/hub_driver.pdx"
+HUB_FSM_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/hub_fsm.pdx"
+if [[ ! -f "${HUB_DRV_SRC}" || ! -f "${HUB_FSM_SRC}" ]]; then
+    echo "[hub-drivers-confine] FAIL - hub_driver.pdx or hub_fsm.pdx not found" >&2
+    exit 1
+fi
+ec_confine_one '_hub_driver_bound' 'core/drivers/usb/hub_driver.o'
+ec_confine_one '_hub_driver_stats' 'core/drivers/usb/hub_driver.o'
+ec_confine_one '_hub_fsm_state'    'core/drivers/usb/hub_fsm.o'
+ec_confine_one '_hub_fsm_stats'    'core/drivers/usb/hub_fsm.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/drivers/usb/hub_driver.pdx §2 and" >&2
+    echo "  hub_fsm.pdx §1 for why these cells have one writer." >&2
+    exit 1
+fi
+echo "[hub-drivers-confine] hub driver + FSM state confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
