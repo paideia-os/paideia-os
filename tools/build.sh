@@ -2477,6 +2477,53 @@ fi
 echo "[hub-drivers-confine] hub driver + FSM state confined"
 
 # ---------------------------------------------------------------------------
+# R34.M2 (#1172/#1175): KIND_USB_INTERFACE + KIND_USB_ENDPOINT confinement.
+USBIF_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_usb_interface.pdx"
+USBEP_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_usb_endpoint.pdx"
+if [[ ! -f "${USBIF_SRC}" || ! -f "${USBEP_SRC}" ]]; then
+    echo "[usb-if-ep-confine] FAIL - USB interface/endpoint kind source missing" >&2
+    exit 1
+fi
+ec_confine_one '_usb_interface_table' 'core/cap/kind_usb_interface.o'
+ec_confine_one '_usb_interface_stats' 'core/cap/kind_usb_interface.o'
+ec_confine_one '_usb_endpoint_table'  'core/cap/kind_usb_endpoint.o'
+ec_confine_one '_usb_endpoint_stats'  'core/cap/kind_usb_endpoint.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/cap/kind_usb_interface.pdx §1 and" >&2
+    echo "  kind_usb_endpoint.pdx §2 for the row-table one-writer discipline." >&2
+    exit 1
+fi
+echo "[usb-if-ep-confine] USB interface + endpoint rows and counters confined"
+
+if grep -qE 'usb_interface_(set_ifnum|set_alt|set_class|set_key|key_set)' "${USBIF_SRC}"; then
+    echo "[usb-if-confine] FAIL - static-identity-mutating primitive added" >&2
+    exit 1
+fi
+if grep -qE 'usb_endpoint_(set_epnum|set_type|set_dir|set_maxpacket|set_key|key_set)' "${USBEP_SRC}"; then
+    echo "[usb-ep-confine] FAIL - static-identity-mutating primitive added" >&2
+    exit 1
+fi
+echo "[usb-if-ep-confine] no static-identity-mutating primitive"
+
+# ---------------------------------------------------------------------------
+# R34.M2 (#1173/#1174): composite bind + interface parser state confinement.
+CBIND_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/composite_bind.pdx"
+IFPARSE_SRC="${REPO_ROOT}/src/kernel/core/drivers/usb/interface_parser.pdx"
+if [[ ! -f "${CBIND_SRC}" || ! -f "${IFPARSE_SRC}" ]]; then
+    echo "[usb-composite-confine] FAIL - composite_bind.pdx or interface_parser.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_composite_bind_table' 'core/drivers/usb/composite_bind.o'
+ec_confine_one '_composite_bind_stats' 'core/drivers/usb/composite_bind.o'
+ec_confine_one '_ifparser_stats'       'core/drivers/usb/interface_parser.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See composite_bind.pdx §2 and interface_parser.pdx §2 for the" >&2
+    echo "  row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[usb-composite-confine] composite bind + interface parser state confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
