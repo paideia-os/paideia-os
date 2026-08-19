@@ -3438,6 +3438,29 @@ fi
 echo "[gpu-m6-confine] R37.M6 (GPU submission substrate) confined"
 
 # ---------------------------------------------------------------------------
+# R37.M7 (#1283): GPU sync-primitive substrate --
+# GT fence + interrupt path (gt_fence).
+#
+# One module opens R37.M7 (post-R37.M6).  It owns its own state
+# (per-engine last_signaled_seqno + pending waiter record); tools/build.sh
+# confines relocations against each so a second writer cannot forge a
+# fence advance, drift a waiter slot, or release a blocked task against
+# a seqno the CS has not actually reached.
+GTF_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/gt_fence.pdx"
+if [[ ! -f "${GTF_SRC}" ]]; then
+    echo "[gpu-m7-confine] FAIL - ${GTF_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_gtf_engines'      'core/drivers/gpu/gt_fence.o'
+ec_confine_one '_gtf_stats'        'core/drivers/gpu/gt_fence.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See gt_fence.pdx §3 for the per-engine record + counter" >&2
+    echo "  one-writer discipline." >&2
+    exit 1
+fi
+echo "[gpu-m7-confine] R37.M7 (GPU sync-primitive substrate) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

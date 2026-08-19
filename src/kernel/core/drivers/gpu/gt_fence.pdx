@@ -1,0 +1,711 @@
+// src/kernel/core/drivers/gpu/gt_fence.pdx — R37.M7-003 (#1283)
+//
+// Iris Xe (Gen12) Graphics Timeline (GT) fence — the seqno-and-interrupt
+// substrate the CS uses to publish batch-buffer completion, and the KMD
+// uses to release blocked waiters once the CS has reached a fence value.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the CANONICAL GT-FENCE BOOKKEEPING SITE for the Xe1 engines.
+// Every seqno the CS reaches (whether emitted at the end of a batch by
+// batch_builder's MI_STORE_DWORD_IMM + interrupt, or forged by an
+// out-of-band synchronisation point) lands here. A second bookkeeping
+// site would let one path claim seqno S was reached while the other
+// still saw the engine idle, and the two would race the wake of a
+// blocked waiter against a stale fence value.
+//
+// It is ALSO the ONE SITE that enforces the SINGLE-WAITER-PER-ENGINE
+// discipline.  Per Xe1 bspec §21.7 there is one CS_SEQNO address per
+// engine and one GT_IIR bit per engine; a second concurrent wait on
+// the same engine (from a second caller) would either overwrite the
+// pending_seqno silently or trip the ISR's own duplicate-clear refusal,
+// and the KMD would have no local record of which waiter the ISR
+// released.  The scheduler above is responsible for choosing which
+// caller owns the engine's fence slot; this module refuses the second
+// with GTF_WAIT_BUSY.
+//
+// IT DOES NOT WRITE MMIO OUTSIDE gmmio_write32.  The CS_SEQNO stamp
+// and the GT_IIR set/clear both flow through gmmio_write32 so the
+// audit gate (gpu_reg_audit) can see them.  The register offsets this
+// module pokes (GTF_REG_GT_IIR, GTF_REG_CS_SEQNO_0..3) all fall inside
+// the gpu_reg_audit whitelist range.
+//
+// IT DOES NOT ADVANCE THE KIND_GPU_SUBMIT FSM ON COMPLETION.  When the
+// ISR observes CS_SEQNO_N has crossed a pending waiter's seqno it
+// clears the waiter slot and increments the completion counter; the
+// SUBMIT FSM transition (SUBMITTED -> DONE) is the CALLER'S
+// responsibility, exactly as the gsub_finish / kgsub_row_transition
+// split in guc_submit.pdx — so this module remains decoupled from
+// KIND_GPU_SUBMIT's row layout.
+//
+// IT DOES NOT BLOCK A TASK.  Blocking primitives (park on wait-queue,
+// wake on ISR) live above this module; gtf_wait REGISTERS a waiter and
+// returns.  A caller who wants to block does so on its own condition
+// after calling gtf_wait; gtf_isr clears the waiter slot and
+// increments the unblock counter so the waker above knows a wake is
+// due.  A second concurrent wait on the same engine (which is what
+// the scheduler above must serialise) is refused, not queued.
+//
+// =============================================================================
+// §1  ENGINE MODEL
+// =============================================================================
+//
+// Four engines match the Xe1 tile (RCS=0, BCS=1, VCS=2, VECS=3).  Per
+// engine we track:
+//
+//   last_signaled_seqno  monotonically non-decreasing seqno the ISR
+//                        has observed as reached on this engine
+//   pending_seqno        seqno a registered waiter is blocked on, or 0
+//   pending_flag         non-zero iff a waiter is currently registered
+//                        (single-waiter discipline trip)
+//
+// The single-waiter rule: gtf_wait refuses (GTF_WAIT_BUSY) if
+// pending_flag is already set; gtf_isr clears pending_flag whenever
+// pending_seqno <= last_signaled after an update.
+//
+// =============================================================================
+// §2  MMIO LAYOUT
+// =============================================================================
+//
+// GT interrupt-identity register and per-engine CS_SEQNO_ADDR sit in
+// the GT block; the offsets here mirror the bspec-declared window (Xe1
+// bspec §21.7, GT interrupt block at 0x44300).  All offsets are u32-
+// aligned and inside gpu_reg_audit's whitelist for the GT block.
+//
+//   GTF_REG_GT_IIR       : 0x44308  (u32; bit N == engine N pending)
+//   GTF_REG_CS_SEQNO_0   : 0x44310  (u32; engine 0 last posted seqno)
+//   GTF_REG_CS_SEQNO_1   : 0x44314  (u32; engine 1 last posted seqno)
+//   GTF_REG_CS_SEQNO_2   : 0x44318  (u32; engine 2 last posted seqno)
+//   GTF_REG_CS_SEQNO_3   : 0x4431C  (u32; engine 3 last posted seqno)
+//
+// GT_IIR is write-1-to-clear per bspec — the ISR reads it, decides
+// which engine bits are hot, then writes back the mask with only the
+// bits it has serviced set (which clears exactly those bits and
+// leaves any bit set between the read and write untouched, on real
+// hardware).  In the synthetic backing gmmio_write32 assigns the
+// register outright; the ISR is called serially from thread context
+// in the boot witness, so the RMW window is closed by construction.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _gtf_engines and _gtf_stats are written only by helpers in this
+// module.  tools/build.sh confines relocations against each to
+// core/drivers/gpu/gt_fence.o.  A second writer would let a stale
+// last_signaled_seqno linger past a real GT interrupt, or forge a
+// waiter clear against a seqno the CS has not actually reached — the
+// two silent-corruption fingerprints this file exists to make
+// impossible.
+//
+// =============================================================================
+// §4  FAILURE TAXONOMY 0xFFFFF530..0xFFFFF53F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: batch_builder
+// 0xFFFFF540..4F; adjacent free band below: available for future
+// R37.M7 modules).
+//
+//   GTF_OK              : 0            (registered waiter or ISR done)
+//   GTF_REACHED         : 1            (gtf_wait short-circuit)
+//   GTF_BAD_ENGINE      : 0xFFFFF53F
+//   GTF_BAD_SEQNO       : 0xFFFFF53E   (seqno == 0)
+//   GTF_WAIT_BUSY       : 0xFFFFF53D   (single-waiter trip)
+//   GTF_MMIO_NOT_BOUND  : 0xFFFFF53C
+//   GTF_MMIO_REFUSED    : 0xFFFFF53B
+
+module GtFence = structure {
+
+  // §1: engine capacity.
+  pub let GTF_ENGINES : u64 = 4
+
+  // §2: register offsets (inside the gpu_reg_audit whitelist range).
+  pub let GTF_REG_GT_IIR     : u64 = 0x44308
+  pub let GTF_REG_CS_SEQNO_0 : u64 = 0x44310
+  pub let GTF_REG_CS_SEQNO_1 : u64 = 0x44314
+  pub let GTF_REG_CS_SEQNO_2 : u64 = 0x44318
+  pub let GTF_REG_CS_SEQNO_3 : u64 = 0x4431C
+
+  // Return codes.
+  pub let GTF_OK      : u64 = 0
+  pub let GTF_REACHED : u64 = 1
+
+  // Failure taxonomy -- 0xFFFFF530..0xFFFFF53F.
+  pub let GTF_BAD_ENGINE      : u64 = 0xFFFFF53F
+  pub let GTF_BAD_SEQNO       : u64 = 0xFFFFF53E
+  pub let GTF_WAIT_BUSY       : u64 = 0xFFFFF53D
+  pub let GTF_MMIO_NOT_BOUND  : u64 = 0xFFFFF53C
+  pub let GTF_MMIO_REFUSED    : u64 = 0xFFFFF53B
+
+  pub let GTF_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // §1: per-engine record -- 32 bytes.
+  //   [+0]  last_signaled_seqno (u64)
+  //   [+8]  pending_seqno (u64; 0 iff no waiter)
+  //   [+16] pending_flag[7:0]   (u64; 0xFF iff waiter registered)
+  //   [+24] reserved
+  //
+  // Four engines * 32 B = 128 B as [u64; 16].
+  pub let mut _gtf_engines : [u64; 16] = uninit @align(64)
+
+  // Counters.
+  pub let mut _gtf_stats : [u64; 8] = uninit @align(64)
+
+  pub let GTF_ST_SIGNALS   : u64 = 0
+  pub let GTF_ST_WAITS     : u64 = 1
+  pub let GTF_ST_REACHED   : u64 = 2
+  pub let GTF_ST_UNBLOCKS  : u64 = 3
+  pub let GTF_ST_ISR_RUNS  : u64 = 4
+  pub let GTF_ST_REFUSED   : u64 = 5
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let gt_fence_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M7-003 (#1283): clear per-engine records + counters. Boot and teardown only. Labels prefixed gtf_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _gtf_engines];
+        xor rcx, rcx;
+      gtf_rs_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  gtf_rs_rows;
+
+        lea r10, [rip + _gtf_stats];
+        xor rcx, rcx;
+      gtf_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  gtf_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Counters.
+  // ==========================================================================
+
+  pub let gtf_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M7-003 (#1283): counter bump. Labels prefixed gtf_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae gtf_nt_out;
+        lea r10, [rip + _gtf_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      gtf_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let gtf_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M7-003 (#1283): counter read. Labels prefixed gtf_stt_.",
+      block: {
+        cmp rdi, 8;
+        jae gtf_stt_zero;
+        lea r10, [rip + _gtf_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      gtf_stt_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Validators.
+  // ==========================================================================
+
+  pub let gtf_engine_valid : (u64) -> u64 !{} @{} =
+    fn (e: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M7-003 (#1283): 1 iff e < GTF_ENGINES (4). Labels prefixed gtf_ev_.",
+      block: {
+        cmp rdi, 4;
+        jae gtf_ev_no;
+        mov rax, 1;
+        ret;
+      gtf_ev_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Accessors.
+  // ==========================================================================
+
+  pub let gtf_signaled : (u64) -> u64 !{mem} @{} =
+    fn (engine: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M7-003 (#1283): last signaled seqno on engine, or 0 on bad engine. Labels prefixed gtf_sg_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call gtf_engine_valid;
+        cmp rax, 0;
+        je  gtf_sg_bad;
+        lea r10, [rip + _gtf_engines];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        jmp gtf_sg_out;
+      gtf_sg_bad:
+        xor rax, rax;
+      gtf_sg_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let gtf_pending : (u64) -> u64 !{mem} @{} =
+    fn (engine: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M7-003 (#1283): 1 iff engine has a registered waiter. Labels prefixed gtf_pn_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call gtf_engine_valid;
+        cmp rax, 0;
+        je  gtf_pn_no;
+        lea r10, [rip + _gtf_engines];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        and rax, 0xFF;
+        cmp rax, 0;
+        je  gtf_pn_no;
+        mov rax, 1;
+        jmp gtf_pn_out;
+      gtf_pn_no:
+        xor rax, rax;
+      gtf_pn_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let gtf_pending_seqno : (u64) -> u64 !{mem} @{} =
+    fn (engine: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M7-003 (#1283): pending waiter's seqno, or 0 if no waiter / bad engine. Labels prefixed gtf_ps_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call gtf_engine_valid;
+        cmp rax, 0;
+        je  gtf_ps_no;
+        lea r10, [rip + _gtf_engines];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        and rax, 0xFF;
+        cmp rax, 0;
+        je  gtf_ps_no;
+        mov rax, [r10 + 8];
+        jmp gtf_ps_out;
+      gtf_ps_no:
+        xor rax, rax;
+      gtf_ps_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let gtf_reached : (u64, u64) -> u64 !{mem} @{} =
+    fn (engine: u64) (seqno: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M7-003 (#1283): 1 iff seqno <= last_signaled on engine. Bad engine or seqno==0 -> 0. Labels prefixed gtf_rc_.",
+      block: {
+        push r12;
+        push r13;
+        mov r12, rdi;
+        mov r13, rsi;
+        cmp r13, 0;
+        je  gtf_rc_no;
+        mov rdi, r12;
+        call gtf_engine_valid;
+        cmp rax, 0;
+        je  gtf_rc_no;
+        lea r10, [rip + _gtf_engines];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        cmp rax, r13;
+        jb  gtf_rc_no;
+        mov rax, 1;
+        jmp gtf_rc_out;
+      gtf_rc_no:
+        xor rax, rax;
+      gtf_rc_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gtf_signal(engine, seqno) — CS-side stamp path.
+  //
+  // Simulates the CS reaching an MI_STORE_DWORD_IMM: stamps CS_SEQNO_N
+  // to seqno and sets bit N in GT_IIR (edge for the ISR).  DOES NOT
+  // advance last_signaled_seqno; that is the ISR's job (gtf_isr).
+  // Refuses:
+  //   BAD_ENGINE       engine >= GTF_ENGINES
+  //   BAD_SEQNO        seqno == 0
+  //   MMIO_NOT_BOUND   MMIO BAR unbound
+  //   MMIO_REFUSED     a scratch write refused
+  // ==========================================================================
+
+  pub let gtf_signal : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (engine: u64) (seqno: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R37.M7-003 (#1283): stamp CS_SEQNO_N and set GT_IIR bit N through gmmio_write32. Every register touch goes through the audit gate. Labels prefixed gtf_s_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // engine
+        mov r13, rsi;                    // seqno
+
+        mov rdi, r12;
+        call gtf_engine_valid;
+        cmp rax, 0;
+        je  gtf_s_bad_engine;
+
+        cmp r13, 0;
+        je  gtf_s_bad_seqno;
+
+        call gmmio_is_bound;
+        cmp rax, 0;
+        je  gtf_s_mmio;
+
+        // CS_SEQNO_N = seqno.
+        mov rdi, 0x44310;
+        mov r14, r12;
+        shl r14, 2;                      // engine * 4
+        add rdi, r14;
+        mov rsi, r13;
+        mov r14, 0xFFFFFFFF;
+        and rsi, r14;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne gtf_s_mmio_refused;
+
+        // RMW GT_IIR: iir |= (1 << engine).
+        mov rdi, 0x44308;
+        call gmmio_read32;
+        mov r11, 0xFFFFF6A0;
+        cmp rax, r11;
+        jae gtf_s_mmio_refused;
+        mov rbx, rax;                    // iir
+        mov rax, 1;
+        mov rcx, r12;
+        shl rax, cl;
+        or  rbx, rax;
+        mov rdi, 0x44308;
+        mov rsi, rbx;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne gtf_s_mmio_refused;
+
+        mov rdi, 0;                      // SIGNALS
+        call gtf_note;
+
+        xor rax, rax;
+        jmp gtf_s_out;
+
+      gtf_s_bad_engine:
+        mov rdi, 5;                      // REFUSED
+        call gtf_note;
+        mov rax, 0xFFFFF53F;
+        jmp gtf_s_out;
+      gtf_s_bad_seqno:
+        mov rdi, 5;
+        call gtf_note;
+        mov rax, 0xFFFFF53E;
+        jmp gtf_s_out;
+      gtf_s_mmio:
+        mov rdi, 5;
+        call gtf_note;
+        mov rax, 0xFFFFF53C;
+        jmp gtf_s_out;
+      gtf_s_mmio_refused:
+        mov rdi, 5;
+        call gtf_note;
+        mov rax, 0xFFFFF53B;
+
+      gtf_s_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gtf_wait(engine, seqno) — KMD-side wait registration.
+  //
+  // If seqno <= last_signaled the wait is trivially satisfied and the
+  // helper returns GTF_REACHED (== 1) WITHOUT registering a waiter --
+  // the caller has no need to block.  Otherwise the helper registers a
+  // waiter and returns GTF_OK (== 0); the caller blocks on its own
+  // condition and is released when gtf_isr sees CS_SEQNO_N cross the
+  // pending seqno and clears the waiter slot.
+  //
+  // Refuses:
+  //   BAD_ENGINE       engine >= GTF_ENGINES
+  //   BAD_SEQNO        seqno == 0
+  //   WAIT_BUSY        engine already has a registered waiter
+  // ==========================================================================
+
+  pub let gtf_wait : (u64, u64) -> u64 !{mem} @{} =
+    fn (engine: u64) (seqno: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M7-003 (#1283): register a waiter for (engine, seqno) OR short-circuit if already reached. THE ONE WRITER of per-engine pending_seqno / pending_flag (positive edge). Labels prefixed gtf_w_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;                    // engine
+        mov r13, rsi;                    // seqno
+
+        mov rdi, r12;
+        call gtf_engine_valid;
+        cmp rax, 0;
+        je  gtf_w_bad_engine;
+
+        cmp r13, 0;
+        je  gtf_w_bad_seqno;
+
+        lea r10, [rip + _gtf_engines];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rbx, r10;                    // engine record base
+
+        // Short-circuit: already reached.
+        mov rax, [rbx + 0];
+        cmp rax, r13;
+        jae gtf_w_short;
+
+        // Single-waiter trip.
+        mov rax, [rbx + 16];
+        and rax, 0xFF;
+        cmp rax, 0;
+        jne gtf_w_busy;
+
+        // Register waiter.
+        mov [rbx + 8], r13;
+        mov rax, 0xFF;
+        mov [rbx + 16], rax;
+
+        mov rdi, 1;                      // WAITS
+        call gtf_note;
+
+        xor rax, rax;
+        jmp gtf_w_out;
+
+      gtf_w_short:
+        mov rdi, 2;                      // REACHED short-circuit counter
+        call gtf_note;
+        mov rax, 1;
+        jmp gtf_w_out;
+      gtf_w_bad_engine:
+        mov rdi, 5;
+        call gtf_note;
+        mov rax, 0xFFFFF53F;
+        jmp gtf_w_out;
+      gtf_w_bad_seqno:
+        mov rdi, 5;
+        call gtf_note;
+        mov rax, 0xFFFFF53E;
+        jmp gtf_w_out;
+      gtf_w_busy:
+        mov rdi, 5;
+        call gtf_note;
+        mov rax, 0xFFFFF53D;
+
+      gtf_w_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gtf_isr() — GT interrupt service.
+  //
+  // Reads GT_IIR; for each engine bit set, reads CS_SEQNO_N, advances
+  // last_signaled_seqno if the new seqno strictly exceeds the current,
+  // and clears the bit in GT_IIR via a write-1-to-clear.  If the
+  // engine has a registered waiter whose pending_seqno <= new
+  // last_signaled, the waiter slot is cleared and the UNBLOCKS counter
+  // is bumped -- the wake-up side is the caller's responsibility.
+  //
+  // Refuses:
+  //   MMIO_NOT_BOUND   MMIO BAR unbound
+  //   MMIO_REFUSED     a scratch read/write refused
+  //
+  // Returns 0 on a clean pass (whether or not any bit was hot).
+  // ==========================================================================
+
+  pub let gtf_isr : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R37.M7-003 (#1283): read GT_IIR, for each hot engine bit advance last_signaled + release waiter, then write-1-to-clear the serviced bits. THE ONE WRITER of per-engine last_signaled_seqno and (negative-edge) pending_seqno / pending_flag. Labels prefixed gtf_i_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        call gmmio_is_bound;
+        cmp rax, 0;
+        je  gtf_i_mmio;
+
+        mov rdi, 0;                      // ISR_RUNS
+        call gtf_note;
+
+        // r14 = iir
+        mov rdi, 0x44308;
+        call gmmio_read32;
+        mov r11, 0xFFFFF6A0;
+        cmp rax, r11;
+        jae gtf_i_mmio_refused;
+        mov r14, rax;
+
+        // r15 = serviced mask (bits we clear at the end)
+        xor r15, r15;
+
+        // rbx = engine counter (0..3)
+        xor rbx, rbx;
+
+      gtf_i_loop:
+        cmp rbx, 4;
+        jae gtf_i_done;
+
+        // bit = 1 << rbx
+        mov r12, 1;
+        mov rcx, rbx;
+        shl r12, cl;
+
+        // if (iir & bit) == 0 -> next
+        mov rax, r14;
+        and rax, r12;
+        cmp rax, 0;
+        je  gtf_i_next;
+
+        // Read CS_SEQNO_N.
+        mov rdi, 0x44310;
+        mov rax, rbx;
+        shl rax, 2;
+        add rdi, rax;
+        call gmmio_read32;
+        mov r11, 0xFFFFF6A0;
+        cmp rax, r11;
+        jae gtf_i_mmio_refused;
+        mov r13, rax;                    // new seqno
+
+        // r10 = engine record base
+        lea r10, [rip + _gtf_engines];
+        mov rax, rbx;
+        shl rax, 5;
+        add r10, rax;
+
+        // last = [r10 + 0]; if new > last: last = new
+        mov rax, [r10 + 0];
+        cmp r13, rax;
+        jbe gtf_i_check_waiter;
+        mov [r10 + 0], r13;
+
+      gtf_i_check_waiter:
+        // if pending_flag != 0 && pending_seqno <= last: clear waiter
+        mov rax, [r10 + 16];
+        and rax, 0xFF;
+        cmp rax, 0;
+        je  gtf_i_serviced;
+        mov rax, [r10 + 8];              // pending_seqno
+        mov rcx, [r10 + 0];              // last (possibly updated)
+        cmp rcx, rax;
+        jb  gtf_i_serviced;
+        // Release waiter.
+        xor rax, rax;
+        mov [r10 + 8], rax;
+        mov [r10 + 16], rax;
+        mov rdi, 3;                      // UNBLOCKS
+        call gtf_note;
+
+      gtf_i_serviced:
+        // Mark bit as serviced so we clear it in GT_IIR.
+        or  r15, r12;
+
+      gtf_i_next:
+        add rbx, 1;
+        jmp gtf_i_loop;
+
+      gtf_i_done:
+        // Write-1-to-clear: iir_new = iir_old & ~serviced.  On real HW
+        // W1C would take the serviced mask directly; on the synthetic
+        // backing gmmio_write32 assigns outright, so we compose the
+        // post-service value explicitly.
+        cmp r15, 0;
+        je  gtf_i_ok;
+        not r15;                         // ~serviced (in low bits, high bits irrelevant)
+        and r14, r15;
+        mov rdi, 0x44308;
+        mov rsi, r14;
+        mov rax, 0xFFFFFFFF;
+        and rsi, rax;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne gtf_i_mmio_refused;
+
+      gtf_i_ok:
+        xor rax, rax;
+        jmp gtf_i_out;
+
+      gtf_i_mmio:
+        mov rdi, 5;
+        call gtf_note;
+        mov rax, 0xFFFFF53C;
+        jmp gtf_i_out;
+      gtf_i_mmio_refused:
+        mov rdi, 5;
+        call gtf_note;
+        mov rax, 0xFFFFF53B;
+
+      gtf_i_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
