@@ -1,0 +1,1124 @@
+// src/kernel/core/drivers/tb/topology_diff.pdx — R35.M7-003 (#1225)
+//
+// TB4 TOPOLOGY DIFF ON HOT-PLUG.
+//
+// The graph model (topology_graph.pdx, R35.M7-001) tracks the CURRENT
+// wiring of routers and links. When a dock is inserted or a downstream
+// cable is unplugged, that graph shifts: a set of routers appears, a
+// set disappears, and a set of edges is created or destroyed. A
+// compositor deciding where a newly-visible display belongs, and a
+// security-policy engine deciding whether the new subgraph is trusted,
+// both need the SHAPE of the change — not just the current state.
+//
+// This module computes that shape. It snapshots the graph, and on
+// demand computes the four-way delta (added / removed routers, added /
+// removed edges) between the current graph and the snapshot. The
+// diff is emitted through the existing tb_topology_channel router-
+// event fanout so subscribers registered there — compositor, policy
+// engine — see one event per change without needing a new schema.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the SNAPSHOT + DELTA + EMIT layer above topology_graph. It:
+//
+//   1. SNAPSHOT — td_snapshot() copies the live graph's router and
+//      edge tables into private snapshot buffers. Callers snapshot
+//      whenever a "graph consistent" moment holds — typically after
+//      a router_walk pass completes and before the next hot-plug
+//      event is consumed.
+//
+//   2. COMPUTE — td_compute_diff() populates four result arrays:
+//        added_routers[]     — route_ids present now but not in snap
+//        removed_routers[]   — route_ids in snap but not now
+//        added_edges[]       — edges present now but not in snap
+//        removed_edges[]     — edges in snap but not now
+//      Each array is capacity-bounded; if a real diff overflows,
+//      TD_ENOSPC is returned and the counters are pinned to the caps.
+//
+//   3. QUERY — td_diff_{added,removed}_{router,edge}_count() +
+//      td_diff_{added,removed}_{router,edge}(i) accessors let a
+//      consumer read the arrays without pointer traffic.
+//
+//   4. EMIT — td_emit_diff() drives tb_topology_router_appeared /
+//      tb_topology_router_departed once per (added/removed) router,
+//      hitting the same subscriber fanout the walker uses.
+//
+// IT DOES NOT MUTATE THE GRAPH. Snapshot/compute/emit read from
+// topology_graph via its accessors; they do not add or remove
+// vertices or edges. A caller that wants "collapse the removed
+// subgraph after emit" does so by calling tg_router_remove /
+// tg_edge_remove itself.
+//
+// IT DOES NOT INVENT A NEW WIRE SCHEMA FOR EDGES. tb_topology_channel
+// carries router_appeared/departed and tunnel_established/torn; there
+// is no edge event. This module bumps an internal counter per edge
+// diff entry and leaves the wire question to the R35.M8 edge-schema
+// work (deferred). Compositors and policy engines that need per-edge
+// detail read td_diff_added_edge(i) directly against the same
+// endpoint they subscribed on.
+//
+// td_arbitrated() returns 0 until a live tb_topology channel client
+// is bound as td_emit_diff's caller.
+//
+// =============================================================================
+// §1  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _td_snap_routers, _td_snap_edges, _td_snap_flag, _td_diff_added_rt,
+// _td_diff_removed_rt, _td_diff_added_ed, _td_diff_removed_ed,
+// _tpd_diff_counts and _tpd_stats are written only by helpers in this
+// module. tools/build.sh confines relocations against each symbol to
+// `core/drivers/tb/topology_diff.o`.
+//
+// =============================================================================
+// §2  ERROR CODES 0xFFFFF860..0xFFFFF86F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent free bands: route_arith 0xFFFFF870..7F,
+// topology_graph 0xFFFFF880..8F).
+
+module TopologyDiff = structure {
+
+  pub let TD_ROUTER_CAP : u64 = 32
+  pub let TD_EDGE_CAP   : u64 = 128
+
+  // Failure taxonomy — 0xFFFFF860..0xFFFFF86F.
+  pub let TD_OK           : u64 = 0
+  pub let TD_BAD_ARG      : u64 = 0xFFFFF86F
+  pub let TD_ENOSPC       : u64 = 0xFFFFF86E
+  pub let TD_NO_SNAPSHOT  : u64 = 0xFFFFF86D
+  pub let TD_BAD_INDEX    : u64 = 0xFFFFF86C
+  pub let TD_NO_DIFF      : u64 = 0xFFFFF86B
+
+  pub let TD_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // Snapshot: parallel to topology_graph's row layout.
+  //   _td_snap_routers[i] = route_id (0 = empty)
+  //   _td_snap_edges[i]   = 3 u64 packed: side_a, side_b, in_use flag
+  //     Actually simpler: mirror as (in_use, side_a, side_b, 0) 4-u64
+  //     rows so accessors match topology_graph's shape.
+  pub let mut _td_snap_routers : [u64; 32]  = uninit @align(64)   // route_id per slot
+  pub let mut _td_snap_edges   : [u64; 384] = uninit @align(64)   // 128 rows × 3 u64
+  pub let mut _td_snap_flag    : [u64; 1]   = uninit @align(8)    // 0/1
+
+  // Diff outputs.
+  pub let mut _td_diff_added_rt   : [u64; 32]  = uninit @align(64)
+  pub let mut _td_diff_removed_rt : [u64; 32]  = uninit @align(64)
+  // Each diff-edge entry: 2 u64 (side_a, side_b).
+  pub let mut _td_diff_added_ed   : [u64; 256] = uninit @align(64)
+  pub let mut _td_diff_removed_ed : [u64; 256] = uninit @align(64)
+
+  // Counts:
+  //   [0] added_routers_count
+  //   [1] removed_routers_count
+  //   [2] added_edges_count
+  //   [3] removed_edges_count
+  //   [4] diff-valid flag
+  pub let mut _tpd_diff_counts : [u64; 8] = uninit @align(64)
+
+  pub let mut _tpd_stats : [u64; 8] = uninit @align(64)
+
+  pub let TD_ST_SNAPSHOTS  : u64 = 0
+  pub let TD_ST_DIFFS      : u64 = 1
+  pub let TD_ST_EMITS      : u64 = 2
+  pub let TD_ST_OVERFLOWS  : u64 = 3
+  pub let TD_ST_REJECTS    : u64 = 4
+
+  pub let TD_CNT_ADD_RT : u64 = 0
+  pub let TD_CNT_RM_RT  : u64 = 1
+  pub let TD_CNT_ADD_ED : u64 = 2
+  pub let TD_CNT_RM_ED  : u64 = 3
+  pub let TD_CNT_VALID  : u64 = 4
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let td_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): clear snapshot, diff, counts, stats. Labels prefixed tdr_.",
+      block: {
+        xor rax, rax;
+        xor rcx, rcx;
+        lea r10, [rip + _td_snap_routers];
+      tdr_sr:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  tdr_sr;
+
+        xor rcx, rcx;
+        lea r10, [rip + _td_snap_edges];
+      tdr_se:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 384;
+        jb  tdr_se;
+
+        lea r10, [rip + _td_snap_flag];
+        mov [r10 + 0], rax;
+
+        xor rcx, rcx;
+        lea r10, [rip + _td_diff_added_rt];
+      tdr_ar:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  tdr_ar;
+
+        xor rcx, rcx;
+        lea r10, [rip + _td_diff_removed_rt];
+      tdr_rr:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  tdr_rr;
+
+        xor rcx, rcx;
+        lea r10, [rip + _td_diff_added_ed];
+      tdr_ae:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 256;
+        jb  tdr_ae;
+
+        xor rcx, rcx;
+        lea r10, [rip + _td_diff_removed_ed];
+      tdr_re:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 256;
+        jb  tdr_re;
+
+        xor rcx, rcx;
+        lea r10, [rip + _tpd_diff_counts];
+      tdr_c:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  tdr_c;
+
+        xor rcx, rcx;
+        lea r10, [rip + _tpd_stats];
+      tdr_s:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  tdr_s;
+        ret
+      }
+    } @no_frame
+
+  pub let td_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M7-003 (#1225): honesty pin. Returns 0 until a live tb_topology channel client is bound as td_emit_diff's caller.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let tpd_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): counter read.",
+      block: {
+        cmp rdi, 8;
+        jae tdst_zero;
+        lea r10, [rip + _tpd_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      tdst_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let tpd_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): counter bump. Labels prefixed tdn_.",
+      block: {
+        cmp rdi, 8;
+        jae tdn_out;
+        lea r10, [rip + _tpd_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      tdn_out:
+        ret
+      }
+    } @no_frame
+
+  pub let td_snap_flag : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): read snapshot-valid flag.",
+      block: {
+        lea r10, [rip + _td_snap_flag];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // td_snapshot — copy graph's current routers and edges into private
+  // snapshot buffers. Overwrites any prior snapshot. Never fails: the
+  // snapshot capacity equals topology_graph's capacity.
+  // ==========================================================================
+
+  pub let td_snapshot : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): mirror current topology_graph state. Labels prefixed tds_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        // Wipe snapshot arrays first.
+        xor rax, rax;
+        lea r10, [rip + _td_snap_routers];
+        xor rcx, rcx;
+      tds_wr:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  tds_wr;
+        lea r10, [rip + _td_snap_edges];
+        xor rcx, rcx;
+      tds_we:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 384;
+        jb  tds_we;
+
+        // Copy routers: for each row 0..31, if in_use, store route_id.
+        xor rbx, rbx;
+      tds_r_scan:
+        cmp rbx, 32;
+        jae tds_r_done;
+        mov rdi, rbx;
+        call tg_router_row_in_use;
+        cmp rax, 0;
+        je  tds_r_next;
+        mov rdi, rbx;
+        call tg_router_row_route;
+        lea r10, [rip + _td_snap_routers];
+        mov [r10 + rbx * 8], rax;
+      tds_r_next:
+        add rbx, 1;
+        jmp tds_r_scan;
+      tds_r_done:
+
+        // Copy edges: 3 u64 per row (side_a, side_b, in_use).
+        xor rbx, rbx;
+      tds_e_scan:
+        cmp rbx, 128;
+        jae tds_e_done;
+        mov rdi, rbx;
+        call tg_edge_row_in_use;
+        cmp rax, 0;
+        je  tds_e_next;
+
+        lea r10, [rip + _td_snap_edges];
+        mov r11, rbx;
+        // offset = rbx * 3 * 8 = rbx * 24 = (rbx << 4) + (rbx << 3)
+        mov r12, rbx;
+        shl r12, 4;
+        mov r13, rbx;
+        shl r13, 3;
+        add r12, r13;
+        add r10, r12;
+
+        mov rdi, rbx;
+        call tg_edge_row_side_a;
+        lea r12, [rip + _td_snap_edges];
+        mov r11, rbx;
+        mov r13, rbx;
+        shl r11, 4;
+        shl r13, 3;
+        add r11, r13;
+        add r12, r11;
+        mov [r12 + 0], rax;
+
+        mov rdi, rbx;
+        call tg_edge_row_side_b;
+        lea r12, [rip + _td_snap_edges];
+        mov r11, rbx;
+        mov r13, rbx;
+        shl r11, 4;
+        shl r13, 3;
+        add r11, r13;
+        add r12, r11;
+        mov [r12 + 8], rax;
+
+        mov rax, 1;
+        lea r12, [rip + _td_snap_edges];
+        mov r11, rbx;
+        mov r13, rbx;
+        shl r11, 4;
+        shl r13, 3;
+        add r11, r13;
+        add r12, r11;
+        mov [r12 + 16], rax;
+
+      tds_e_next:
+        add rbx, 1;
+        jmp tds_e_scan;
+      tds_e_done:
+
+        // Set snapshot flag; invalidate any prior diff.
+        mov rax, 1;
+        lea r10, [rip + _td_snap_flag];
+        mov [r10 + 0], rax;
+        xor rax, rax;
+        lea r10, [rip + _tpd_diff_counts];
+        mov [r10 + 32], rax;             // VALID = 0
+
+        mov rdi, 0;                      // SNAPSHOTS
+        call tpd_note;
+        xor rax, rax;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Snapshot accessors (for the diff computer to consult).
+  // ==========================================================================
+
+  pub let td_snap_router_at : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): route_id at snapshot slot; 0 = empty.",
+      block: {
+        cmp rdi, 32;
+        jae tdsra_zero;
+        lea r10, [rip + _td_snap_routers];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      tdsra_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let td_snap_edge_in_use : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): snapshot edge in-use flag.",
+      block: {
+        push rbx;
+        cmp rdi, 128;
+        jae tdsei_no;
+        mov rbx, rdi;
+        lea r10, [rip + _td_snap_edges];
+        mov r11, rbx;
+        mov rcx, rbx;
+        shl r11, 4;
+        shl rcx, 3;
+        add r11, rcx;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        pop rbx;
+        ret;
+      tdsei_no:
+        xor rax, rax;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+
+  pub let td_snap_edge_side_a : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): snapshot edge side_a.",
+      block: {
+        push rbx;
+        cmp rdi, 128;
+        jae tdssa_zero;
+        mov rbx, rdi;
+        lea r10, [rip + _td_snap_edges];
+        mov r11, rbx;
+        mov rcx, rbx;
+        shl r11, 4;
+        shl rcx, 3;
+        add r11, rcx;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        pop rbx;
+        ret;
+      tdssa_zero:
+        xor rax, rax;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+
+  pub let td_snap_edge_side_b : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): snapshot edge side_b.",
+      block: {
+        push rbx;
+        cmp rdi, 128;
+        jae tdssb_zero;
+        mov rbx, rdi;
+        lea r10, [rip + _td_snap_edges];
+        mov r11, rbx;
+        mov rcx, rbx;
+        shl r11, 4;
+        shl rcx, 3;
+        add r11, rcx;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        pop rbx;
+        ret;
+      tdssb_zero:
+        xor rax, rax;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+
+  // Return 1 if route_id (must be non-zero) is present in snapshot.
+  pub let td_snap_has_router : (u64) -> u64 !{mem} @{} =
+    fn (route_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): membership check on snapshot routers.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;
+        cmp rbx, 0;
+        je  tdshr_no;
+        xor r12, r12;
+      tdshr_scan:
+        cmp r12, 32;
+        jae tdshr_no;
+        lea r10, [rip + _td_snap_routers];
+        mov rax, [r10 + r12 * 8];
+        cmp rax, rbx;
+        je  tdshr_yes;
+        add r12, 1;
+        jmp tdshr_scan;
+      tdshr_yes:
+        mov rax, 1;
+        pop r12;
+        pop rbx;
+        ret;
+      tdshr_no:
+        xor rax, rax;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // Return 1 if the (side_a, side_b) edge is present in snapshot,
+  // matching either orientation.
+  pub let td_snap_has_edge : (u64, u64) -> u64 !{mem} @{} =
+    fn (side_a: u64) (side_b: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): membership check on snapshot edges (bidirectional).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                    // A
+        mov r12, rsi;                    // B
+        xor r13, r13;
+      tdshe_scan:
+        cmp r13, 128;
+        jae tdshe_no;
+        // in_use?
+        mov rdi, r13;
+        call td_snap_edge_in_use;
+        cmp rax, 0;
+        je  tdshe_next;
+        mov rdi, r13;
+        call td_snap_edge_side_a;
+        mov r14, rax;
+        mov rdi, r13;
+        call td_snap_edge_side_b;
+        // same orientation
+        cmp r14, rbx;
+        jne tdshe_try_swap;
+        cmp rax, r12;
+        je  tdshe_yes;
+      tdshe_try_swap:
+        cmp r14, r12;
+        jne tdshe_next;
+        cmp rax, rbx;
+        je  tdshe_yes;
+      tdshe_next:
+        add r13, 1;
+        jmp tdshe_scan;
+      tdshe_yes:
+        mov rax, 1;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      tdshe_no:
+        xor rax, rax;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // td_compute_diff — populate the four diff arrays and their counts.
+  //
+  // Refuses NO_SNAPSHOT if no snapshot has been taken yet. Returns
+  // ENOSPC if any diff array overflows (its count is pinned to the
+  // cap; other arrays complete normally).
+  // ==========================================================================
+
+  pub let td_compute_diff : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): compute four-way delta between current graph and snapshot. Labels prefixed tdcd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        call td_snap_flag;
+        cmp rax, 0;
+        je  tdcd_nosnap;
+
+        // Wipe diff arrays and counts.
+        xor rax, rax;
+        xor rcx, rcx;
+        lea r10, [rip + _td_diff_added_rt];
+      tdcd_wa:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  tdcd_wa;
+        xor rcx, rcx;
+        lea r10, [rip + _td_diff_removed_rt];
+      tdcd_wb:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  tdcd_wb;
+        xor rcx, rcx;
+        lea r10, [rip + _td_diff_added_ed];
+      tdcd_wc:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 256;
+        jb  tdcd_wc;
+        xor rcx, rcx;
+        lea r10, [rip + _td_diff_removed_ed];
+      tdcd_wd:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 256;
+        jb  tdcd_wd;
+        xor rcx, rcx;
+        lea r10, [rip + _tpd_diff_counts];
+      tdcd_wcnt:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  tdcd_wcnt;
+
+        xor r14, r14;                    // overflow flag
+
+        // Added routers: for each row in graph, if in_use and route_id
+        // not in snapshot, record.
+        xor rbx, rbx;                    // row iterator
+        xor r12, r12;                    // added count
+      tdcd_ar_scan:
+        cmp rbx, 32;
+        jae tdcd_ar_done;
+        mov rdi, rbx;
+        call tg_router_row_in_use;
+        cmp rax, 0;
+        je  tdcd_ar_next;
+        mov rdi, rbx;
+        call tg_router_row_route;
+        mov r13, rax;
+        mov rdi, r13;
+        call td_snap_has_router;
+        cmp rax, 0;
+        jne tdcd_ar_next;
+        cmp r12, 32;
+        jae tdcd_ar_overflow;
+        lea r10, [rip + _td_diff_added_rt];
+        mov [r10 + r12 * 8], r13;
+        add r12, 1;
+        jmp tdcd_ar_next;
+      tdcd_ar_overflow:
+        mov r14, 1;
+      tdcd_ar_next:
+        add rbx, 1;
+        jmp tdcd_ar_scan;
+      tdcd_ar_done:
+        lea r10, [rip + _tpd_diff_counts];
+        mov [r10 + 0], r12;
+
+        // Removed routers: for each snapshot slot with a route_id,
+        // if not in current graph, record.
+        xor rbx, rbx;
+        xor r12, r12;
+      tdcd_rr_scan:
+        cmp rbx, 32;
+        jae tdcd_rr_done;
+        mov rdi, rbx;
+        call td_snap_router_at;
+        cmp rax, 0;
+        je  tdcd_rr_next;
+        mov r13, rax;
+        mov rdi, r13;
+        call tg_router_find;
+        cmp rax, 0xFF;
+        jne tdcd_rr_next;
+        cmp r12, 32;
+        jae tdcd_rr_overflow;
+        lea r10, [rip + _td_diff_removed_rt];
+        mov [r10 + r12 * 8], r13;
+        add r12, 1;
+        jmp tdcd_rr_next;
+      tdcd_rr_overflow:
+        mov r14, 1;
+      tdcd_rr_next:
+        add rbx, 1;
+        jmp tdcd_rr_scan;
+      tdcd_rr_done:
+        lea r10, [rip + _tpd_diff_counts];
+        mov [r10 + 8], r12;
+
+        // Added edges: for each in-use edge row now, if not in snap,
+        // record 2 u64 (side_a, side_b).
+        xor rbx, rbx;
+        xor r12, r12;
+      tdcd_ae_scan:
+        cmp rbx, 128;
+        jae tdcd_ae_done;
+        mov rdi, rbx;
+        call tg_edge_row_in_use;
+        cmp rax, 0;
+        je  tdcd_ae_next;
+        mov rdi, rbx;
+        call tg_edge_row_side_a;
+        push rax;                        // save side_a
+        mov rdi, rbx;
+        call tg_edge_row_side_b;
+        mov r13, rax;                    // side_b
+        pop rax;                         // side_a
+        push rax;
+        push r13;
+        mov rdi, rax;
+        mov rsi, r13;
+        call td_snap_has_edge;
+        pop r13;
+        pop rcx;                         // side_a into rcx
+        cmp rax, 0;
+        jne tdcd_ae_next;
+        cmp r12, 128;
+        jae tdcd_ae_overflow;
+        lea r10, [rip + _td_diff_added_ed];
+        mov r11, r12;
+        shl r11, 4;                      // 2 u64 per entry
+        add r10, r11;
+        mov [r10 + 0], rcx;              // side_a
+        mov [r10 + 8], r13;              // side_b
+        add r12, 1;
+        jmp tdcd_ae_next;
+      tdcd_ae_overflow:
+        mov r14, 1;
+      tdcd_ae_next:
+        add rbx, 1;
+        jmp tdcd_ae_scan;
+      tdcd_ae_done:
+        lea r10, [rip + _tpd_diff_counts];
+        mov [r10 + 16], r12;
+
+        // Removed edges: for each in-use snapshot edge slot, if not
+        // in current graph, record.
+        xor rbx, rbx;
+        xor r12, r12;
+      tdcd_re_scan:
+        cmp rbx, 128;
+        jae tdcd_re_done;
+        mov rdi, rbx;
+        call td_snap_edge_in_use;
+        cmp rax, 0;
+        je  tdcd_re_next;
+        mov rdi, rbx;
+        call td_snap_edge_side_a;
+        push rax;                        // side_a
+        mov rdi, rbx;
+        call td_snap_edge_side_b;
+        mov r13, rax;                    // side_b
+        pop rax;                         // side_a
+        // Check membership in current graph.
+        // Extract router_a, port_a from packed side_a.
+        push rax;
+        push r13;
+        mov r11, rax;
+        and r11, 0xFFFFFF;               // router_a
+        mov rcx, rax;
+        shr rcx, 24;
+        and rcx, 0xFF;                   // port_a
+        mov rdi, r11;
+        mov rsi, rcx;
+        call tg_edge_find;
+        pop r13;
+        pop rcx;                         // side_a
+        cmp rax, 0xFF;
+        jne tdcd_re_next_present;
+        // Not found: this edge was removed.
+        cmp r12, 128;
+        jae tdcd_re_overflow;
+        lea r10, [rip + _td_diff_removed_ed];
+        mov r11, r12;
+        shl r11, 4;
+        add r10, r11;
+        mov [r10 + 0], rcx;
+        mov [r10 + 8], r13;
+        add r12, 1;
+        jmp tdcd_re_next;
+      tdcd_re_next_present:
+        // Present under some row_id; still need to confirm both sides
+        // match (the neighboring endpoint could have changed).
+        mov r11, r13;
+        and r11, 0xFFFFFF;
+        mov rcx, r13;
+        shr rcx, 24;
+        and rcx, 0xFF;
+        push r13;
+        mov rdi, r11;
+        mov rsi, rcx;
+        call tg_edge_find;
+        pop r13;
+        cmp rax, 0xFF;
+        je  tdcd_re_missing_b;
+        jmp tdcd_re_next;
+      tdcd_re_missing_b:
+        // side_b not present in current graph — treat edge as removed.
+        // Recover side_a from snapshot again.
+        push r13;
+        mov rdi, rbx;
+        call td_snap_edge_side_a;
+        mov rcx, rax;
+        pop r13;
+        cmp r12, 128;
+        jae tdcd_re_overflow;
+        lea r10, [rip + _td_diff_removed_ed];
+        mov r11, r12;
+        shl r11, 4;
+        add r10, r11;
+        mov [r10 + 0], rcx;
+        mov [r10 + 8], r13;
+        add r12, 1;
+        jmp tdcd_re_next;
+      tdcd_re_overflow:
+        mov r14, 1;
+      tdcd_re_next:
+        add rbx, 1;
+        jmp tdcd_re_scan;
+      tdcd_re_done:
+        lea r10, [rip + _tpd_diff_counts];
+        mov [r10 + 24], r12;
+
+        // Mark diff valid.
+        mov rax, 1;
+        lea r10, [rip + _tpd_diff_counts];
+        mov [r10 + 32], rax;
+
+        mov rdi, 1;                      // DIFFS
+        call tpd_note;
+
+        cmp r14, 0;
+        je  tdcd_ok;
+        // Overflow.
+        mov rdi, 3;                      // OVERFLOWS
+        call tpd_note;
+        mov rax, 0xFFFFF86E;
+        jmp tdcd_out;
+
+      tdcd_ok:
+        xor rax, rax;
+        jmp tdcd_out;
+      tdcd_nosnap:
+        mov rdi, 4;                      // REJECTS
+        call tpd_note;
+        mov rax, 0xFFFFF86D;
+
+      tdcd_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Diff accessors.
+  // ==========================================================================
+
+  pub let td_diff_valid : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): 1 iff a diff has been computed since last snapshot.",
+      block: {
+        lea r10, [rip + _tpd_diff_counts];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let td_diff_added_router_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): added-routers count.",
+      block: {
+        lea r10, [rip + _tpd_diff_counts];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let td_diff_removed_router_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): removed-routers count.",
+      block: {
+        lea r10, [rip + _tpd_diff_counts];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let td_diff_added_edge_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): added-edges count.",
+      block: {
+        lea r10, [rip + _tpd_diff_counts];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let td_diff_removed_edge_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): removed-edges count.",
+      block: {
+        lea r10, [rip + _tpd_diff_counts];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let td_diff_added_router : (u64) -> u64 !{mem} @{} =
+    fn (i: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): added-router[i], or DECODE_BAD if out of range.",
+      block: {
+        cmp rdi, 32;
+        jae tddar_bad;
+        lea r10, [rip + _td_diff_added_rt];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      tddar_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let td_diff_removed_router : (u64) -> u64 !{mem} @{} =
+    fn (i: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): removed-router[i], or DECODE_BAD.",
+      block: {
+        cmp rdi, 32;
+        jae tddrr_bad;
+        lea r10, [rip + _td_diff_removed_rt];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      tddrr_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let td_diff_added_edge_side_a : (u64) -> u64 !{mem} @{} =
+    fn (i: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): added-edge[i] side_a.",
+      block: {
+        cmp rdi, 128;
+        jae tddaesa_bad;
+        lea r10, [rip + _td_diff_added_ed];
+        mov r11, rdi;
+        shl r11, 4;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        ret;
+      tddaesa_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let td_diff_added_edge_side_b : (u64) -> u64 !{mem} @{} =
+    fn (i: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): added-edge[i] side_b.",
+      block: {
+        cmp rdi, 128;
+        jae tddaesb_bad;
+        lea r10, [rip + _td_diff_added_ed];
+        mov r11, rdi;
+        shl r11, 4;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        ret;
+      tddaesb_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let td_diff_removed_edge_side_a : (u64) -> u64 !{mem} @{} =
+    fn (i: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): removed-edge[i] side_a.",
+      block: {
+        cmp rdi, 128;
+        jae tddresa_bad;
+        lea r10, [rip + _td_diff_removed_ed];
+        mov r11, rdi;
+        shl r11, 4;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        ret;
+      tddresa_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let td_diff_removed_edge_side_b : (u64) -> u64 !{mem} @{} =
+    fn (i: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): removed-edge[i] side_b.",
+      block: {
+        cmp rdi, 128;
+        jae tddresb_bad;
+        lea r10, [rip + _td_diff_removed_ed];
+        mov r11, rdi;
+        shl r11, 4;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        ret;
+      tddresb_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // td_emit_diff — drive tb_topology_router_appeared / _departed for
+  // every added / removed router. Edges are counted but not emitted
+  // to the wire (§0.4).
+  //
+  // Refuses NO_DIFF if td_compute_diff has not been called since the
+  // last snapshot.
+  // ==========================================================================
+
+  pub let td_emit_diff : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M7-003 (#1225): fanout added/removed routers through tb_topology_channel. Labels prefixed tded_.",
+      block: {
+        push rbx;
+        push r12;
+
+        call td_diff_valid;
+        cmp rax, 0;
+        je  tded_nodiff;
+
+        // Added routers.
+        xor rbx, rbx;
+        call td_diff_added_router_count;
+        mov r12, rax;
+      tded_a_scan:
+        cmp rbx, r12;
+        jae tded_a_done;
+        mov rdi, rbx;
+        call td_diff_added_router;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  tded_a_next;
+        // route_id in rax; publish with parent=0, adapter_count=0.
+        mov rdi, rax;
+        xor rsi, rsi;
+        xor rdx, rdx;
+        call tb_topology_router_appeared;
+      tded_a_next:
+        add rbx, 1;
+        jmp tded_a_scan;
+      tded_a_done:
+
+        // Removed routers.
+        xor rbx, rbx;
+        call td_diff_removed_router_count;
+        mov r12, rax;
+      tded_r_scan:
+        cmp rbx, r12;
+        jae tded_r_done;
+        mov rdi, rbx;
+        call td_diff_removed_router;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  tded_r_next;
+        mov rdi, rax;
+        call tb_topology_router_departed;
+      tded_r_next:
+        add rbx, 1;
+        jmp tded_r_scan;
+      tded_r_done:
+
+        mov rdi, 2;                      // EMITS
+        call tpd_note;
+        xor rax, rax;
+        jmp tded_out;
+
+      tded_nodiff:
+        mov rdi, 4;                      // REJECTS
+        call tpd_note;
+        mov rax, 0xFFFFF86B;
+
+      tded_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

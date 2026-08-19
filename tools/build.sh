@@ -2901,6 +2901,44 @@ fi
 echo "[sw-cm-confine] software-CM substrate state confined"
 
 # ---------------------------------------------------------------------------
+# R35.M7 (#1223/#1224/#1225): TB4 topology graph substrate state
+# confinement.
+#
+# Three modules: topology graph vertex+edge ADT, route-string arithmetic
+# (pure functions + stats), snapshot/diff on hot-plug. Each owns its own
+# row tables / stats / snapshot buffers; tools/build.sh confines
+# relocations against each to its owning object so a second writer
+# cannot forge a router vertex, restamp an edge's endpoints, or rewrite
+# the snapshot buffers behind td_snapshot's back.
+TGR_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/topology_graph.pdx"
+RAR_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/route_arith.pdx"
+TDF_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/topology_diff.pdx"
+if [[ ! -f "${TGR_SRC}" || ! -f "${RAR_SRC}" || ! -f "${TDF_SRC}" ]]; then
+    echo "[tb-topo-confine] FAIL - one of the R35.M7 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_tg_routers'         'core/drivers/tb/topology_graph.o'
+ec_confine_one '_tg_edges'           'core/drivers/tb/topology_graph.o'
+ec_confine_one '_tg_stats'           'core/drivers/tb/topology_graph.o'
+ec_confine_one '_ra_stats'           'core/drivers/tb/route_arith.o'
+ec_confine_one '_td_snap_routers'    'core/drivers/tb/topology_diff.o'
+ec_confine_one '_td_snap_edges'      'core/drivers/tb/topology_diff.o'
+ec_confine_one '_td_snap_flag'       'core/drivers/tb/topology_diff.o'
+ec_confine_one '_td_diff_added_rt'   'core/drivers/tb/topology_diff.o'
+ec_confine_one '_td_diff_removed_rt' 'core/drivers/tb/topology_diff.o'
+ec_confine_one '_td_diff_added_ed'   'core/drivers/tb/topology_diff.o'
+ec_confine_one '_td_diff_removed_ed' 'core/drivers/tb/topology_diff.o'
+ec_confine_one '_tpd_diff_counts'    'core/drivers/tb/topology_diff.o'
+ec_confine_one '_tpd_stats'          'core/drivers/tb/topology_diff.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See topology_graph.pdx §1, route_arith.pdx §1 and" >&2
+    echo "  topology_diff.pdx §1 for the table/counter/snapshot" >&2
+    echo "  one-writer discipline." >&2
+    exit 1
+fi
+echo "[tb-topo-confine] TB4 topology graph substrate state confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
