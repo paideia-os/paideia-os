@@ -3262,6 +3262,43 @@ fi
 echo "[gpu-m1-confine] R37.M1 (Iris Xe GPU execution substrate) confined"
 
 # ---------------------------------------------------------------------------
+# R37.M2 (#1257/#1258/#1259): Iris Xe GuC firmware substrate —
+# dual-signature admission (guc_verify), WOPCM upload FSM (guc_load),
+# and post-load handshake + version + feature negotiation (guc_hs).
+#
+# Three modules open R37.M2 (post-r37-M1). Each owns its own state;
+# tools/build.sh confines relocations against each to its owning
+# object so a second writer cannot forge a "verified" flag, restamp a
+# WOPCM window, or fake a GuC handshake row.
+GUCV_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/guc_verify.pdx"
+GUCL_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/guc_load.pdx"
+GUCHS_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/guc_hs.pdx"
+if [[ ! -f "${GUCV_SRC}" || ! -f "${GUCL_SRC}" \
+        || ! -f "${GUCHS_SRC}" ]]; then
+    echo "[guc-m2-confine] FAIL - one of the R37.M2 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_gucv_blob_ptr'          'core/drivers/gpu/guc_verify.o'
+ec_confine_one '_gucv_blob_len'          'core/drivers/gpu/guc_verify.o'
+ec_confine_one '_gucv_verified'          'core/drivers/gpu/guc_verify.o'
+ec_confine_one '_gucv_stats'             'core/drivers/gpu/guc_verify.o'
+ec_confine_one '_gucl_wopcm_base'        'core/drivers/gpu/guc_load.o'
+ec_confine_one '_gucl_wopcm_size'        'core/drivers/gpu/guc_load.o'
+ec_confine_one '_gucl_loaded'            'core/drivers/gpu/guc_load.o'
+ec_confine_one '_gucl_stats'             'core/drivers/gpu/guc_load.o'
+ec_confine_one '_guchs_ready'            'core/drivers/gpu/guc_hs.o'
+ec_confine_one '_guchs_version'          'core/drivers/gpu/guc_hs.o'
+ec_confine_one '_guchs_features_enabled' 'core/drivers/gpu/guc_hs.o'
+ec_confine_one '_guchs_stats'            'core/drivers/gpu/guc_hs.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See guc_verify.pdx §2, guc_load.pdx §3 and" >&2
+    echo "  guc_hs.pdx §3 for the row/counter one-writer" >&2
+    echo "  discipline." >&2
+    exit 1
+fi
+echo "[guc-m2-confine] R37.M2 (Iris Xe GuC firmware substrate) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

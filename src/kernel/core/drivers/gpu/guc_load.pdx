@@ -1,0 +1,420 @@
+// src/kernel/core/drivers/gpu/guc_load.pdx — R37.M2-002 (#1258)
+//
+// Iris Xe GuC firmware LOAD SEQUENCE — WOPCM (Write-Only Persistent
+// Cache Memory) region setup, firmware upload into the GuC-owned
+// portion of WOPCM, and GuC RESET_CTL assert/release per bspec §21.
+// Every register touch goes through gpu_mmio (#1253) so the audit
+// gate (#1256) can see it, and every load call is precondition-
+// checked against guc_verify (#1257) — a load without a preceding
+// dual-signature admission is REFUSED.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the BYTE-MOVER half of R37.M2. guc_verify (#1257) answers
+// "may we run this image?"; guc_hs (#1259) answers "did the GuC
+// come up and what does it support?"; this module is the middle
+// step: it stages the verified image into the address range the
+// GuC executes from, and toggles the reset pin that lets the GuC
+// begin executing it. Without this module there is no live GuC
+// engine — the whole R37.M4+ command-submission path is downstream
+// of it.
+//
+// IT DOES NOT PERFORM REAL DMA. The upload is modelled as three
+// register writes (WOPCM_BASE, WOPCM_SIZE, RESET) into the gpu_mmio
+// synthetic backing store. A live driver replaces the third write
+// with a GT DMA engine transaction that shovels blob_len bytes from
+// blob_ptr into GuC WOPCM per bspec §21.4; the substitution point
+// is here, unchanged for the caller. The bytes ARE NOT COPIED into
+// the substrate this milestone — the recorded {blob_ptr, blob_len}
+// pair is enough for the R37.M3 command-submission scaffolds
+// downstream.
+//
+// IT DOES NOT MINT A KIND_GPU_WOPCM_REGION. WOPCM is a 512 KiB
+// window carved out of graphics stolen memory (GSM), and the
+// authority to describe it belongs to a later round that owns the
+// GSM allocator; this module ACCEPTS a {wopcm_base, wopcm_size}
+// pair from its caller and validates it — the alignment and size
+// constraints of bspec §21.3 are enforced here.
+//
+// gucl_arbitrated() returns 0 until a later round wires the seam
+// to a live GT DMA engine.
+//
+// =============================================================================
+// §1  WOPCM CONSTRAINTS (bspec §21.3)
+// =============================================================================
+//
+//   * WOPCM_BASE must be 64 KiB aligned (lower 16 bits zero).
+//   * WOPCM_SIZE must be a multiple of 4 KiB and at least 512 KiB
+//     for a GuC-carrying image (the HuC eats another 512 KiB but
+//     that is R37.M2-004's story).
+//   * The base + size window must lie inside the parent GSM region
+//     (checked one layer up when GSM lands; unchecked here).
+//
+// =============================================================================
+// §2  REGISTER OFFSETS
+// =============================================================================
+//
+// Offsets picked to land inside the gpu_reg_audit whitelist range
+// [0x0, 0x40000) so guarded writes route through the audit gate
+// cleanly. A live driver replaces these with the bspec §21 offsets
+// (GUC_WOPCM_OFFSET = 0xC340, GUC_WOPCM_SIZE = 0xC050, GUC_STATUS =
+// 0xC000); the substitution is a two-constant change here.
+//
+//   GUCL_REG_WOPCM_BASE : 0xC020  (u32; base >> 16 in the low half,
+//                                  bspec §21.3.1 valid bit in bit 0)
+//   GUCL_REG_WOPCM_SIZE : 0xC024  (u32; size >> 12 in the low half)
+//   GUCL_REG_RESET      : 0xC028  (u32; bit 0 = REQUEST, cleared on
+//                                  release; a live driver polls the
+//                                  status register while asserted)
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _gucl_wopcm_base, _gucl_wopcm_size, _gucl_loaded, and _gucl_stats
+// are written only by helpers in this module. tools/build.sh
+// confines relocations against each to
+// `core/drivers/gpu/guc_load.o`.
+//
+// =============================================================================
+// §4  ERROR CODES 0xFFFFF660..0xFFFFF66F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: guc_verify
+// 0xFFFFF670..7F; adjacent free band below: guc_hs
+// 0xFFFFF650..5F).
+
+module GucLoad = structure {
+
+  // §1: WOPCM constraints.
+  pub let GUCL_WOPCM_ALIGN_MASK : u64 = 0xFFFF       // 64 KiB alignment
+  pub let GUCL_WOPCM_SIZE_UNIT  : u64 = 0x1000       // 4 KiB size unit
+  pub let GUCL_WOPCM_MIN_SIZE   : u64 = 0x80000      // 512 KiB minimum
+
+  // §2: register offsets.
+  pub let GUCL_REG_WOPCM_BASE   : u64 = 0xC020
+  pub let GUCL_REG_WOPCM_SIZE   : u64 = 0xC024
+  pub let GUCL_REG_RESET        : u64 = 0xC028
+
+  // §2: RESET bits.
+  pub let GUCL_RESET_REQUEST    : u64 = 0x1
+
+  // Failure taxonomy — 0xFFFFF660..0xFFFFF66F.
+  pub let GUCL_OK               : u64 = 0
+  pub let GUCL_BAD_ARG          : u64 = 0xFFFFF66F
+  pub let GUCL_NOT_VERIFIED     : u64 = 0xFFFFF66E
+  pub let GUCL_MMIO_NOT_BOUND   : u64 = 0xFFFFF66D
+  pub let GUCL_WOPCM_MISALIGNED : u64 = 0xFFFFF66C
+  pub let GUCL_WOPCM_TOO_SMALL  : u64 = 0xFFFFF66B
+  pub let GUCL_MMIO_REFUSED     : u64 = 0xFFFFF66A
+  pub let GUCL_ALREADY_LOADED   : u64 = 0xFFFFF669
+
+  // Recorded WOPCM window + loaded flag.
+  pub let mut _gucl_wopcm_base : [u64; 1] = uninit @align(64)
+  pub let mut _gucl_wopcm_size : [u64; 1] = uninit @align(64)
+  pub let mut _gucl_loaded     : [u64; 1] = uninit @align(64)
+
+  // Counters.
+  pub let mut _gucl_stats : [u64; 8] = uninit @align(64)
+
+  pub let GUCL_ST_LOADS    : u64 = 0
+  pub let GUCL_ST_RELEASES : u64 = 1
+  pub let GUCL_ST_REFUSED  : u64 = 2
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let gucl_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M2-002 (#1258): clear WOPCM record, loaded flag, and stats. Boot and teardown. Labels prefixed gucl_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _gucl_wopcm_base];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _gucl_wopcm_size];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _gucl_loaded];
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _gucl_stats];
+        xor rcx, rcx;
+      gucl_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  gucl_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let gucl_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M2-002 (#1258): honesty pin. Returns 0 until a later round wires the upload seam to a live GT DMA engine.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let gucl_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M2-002 (#1258): counter bump. Labels prefixed gucl_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae gucl_nt_out;
+        lea r10, [rip + _gucl_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      gucl_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let gucl_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M2-002 (#1258): counter read. Labels prefixed gucl_st_.",
+      block: {
+        cmp rdi, 8;
+        jae gucl_st_zero;
+        lea r10, [rip + _gucl_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      gucl_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // WOPCM validators (§1).
+  // ==========================================================================
+
+  pub let gucl_wopcm_aligned : (u64) -> u64 !{} @{} =
+    fn (base: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M2-002 (#1258): 1 iff base is 64 KiB aligned (§1). Labels prefixed gucl_wa_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFFFF;
+        cmp rax, 0;
+        jne gucl_wa_no;
+        mov rax, 1;
+        ret;
+      gucl_wa_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let gucl_wopcm_size_ok : (u64) -> u64 !{} @{} =
+    fn (size: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M2-002 (#1258): 1 iff size >= 512 KiB and 4 KiB multiple (§1). Labels prefixed gucl_ws_.",
+      block: {
+        mov r10, 0x80000;
+        cmp rdi, r10;
+        jb  gucl_ws_no;
+        mov rax, rdi;
+        and rax, 0xFFF;                  // 4 KiB unit check
+        cmp rax, 0;
+        jne gucl_ws_no;
+        mov rax, 1;
+        ret;
+      gucl_ws_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // gucl_load(wopcm_base, wopcm_size) -> GUCL_OK | error
+  //
+  // §0: THE ONE ENTRY POINT for GuC firmware loading. Order:
+  //   1. Precondition: guc_verify has admitted a blob this boot.
+  //   2. Precondition: gpu_mmio is bound to a BAR window.
+  //   3. §1 alignment + size validators.
+  //   4. Not-already-loaded (a re-load without a scrub is refused;
+  //      an operator that wants to reload runs gucl_reset first).
+  //   5. WRITE (WOPCM_BASE >> 16) | valid to §2 GUCL_REG_WOPCM_BASE.
+  //   6. WRITE (WOPCM_SIZE >> 12) to §2 GUCL_REG_WOPCM_SIZE.
+  //   7. WRITE RESET_REQUEST to §2 GUCL_REG_RESET; then WRITE 0 to
+  //      model the release edge (a live driver polls status while
+  //      asserted, then clears).
+  //   8. Record {wopcm_base, wopcm_size, loaded=1}; bump LOADS.
+  //
+  // Every register touch goes through gmmio_write32 so the audit
+  // gate (#1256) sees it — the offsets lie in the whitelist range
+  // [0x0, 0x40000) so a downstream wire that inserts the audit gate
+  // between this module and gpu_mmio (R37.M3+) needs no change here.
+  // ==========================================================================
+
+  pub let gucl_load : (u64, u64) -> u64 !{mem} @{} =
+    fn (wopcm_base: u64) (wopcm_size: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M2-002 (#1258): WOPCM setup + firmware upload FSM. Verifies verified+bound preconditions, §1 shape, writes §2's three registers through gmmio, records. Labels prefixed gucl_l_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                    // wopcm_base
+        mov r12, rsi;                    // wopcm_size
+
+        // 1. Verified precondition.
+        call gucv_is_verified;
+        cmp rax, 1;
+        jne gucl_l_not_verified;
+
+        // 2. gmmio bound.
+        call gmmio_is_bound;
+        cmp rax, 1;
+        jne gucl_l_not_bound;
+
+        // 3. §1 alignment + size.
+        mov rdi, rbx;
+        call gucl_wopcm_aligned;
+        cmp rax, 0;
+        je  gucl_l_misaligned;
+
+        mov rdi, r12;
+        call gucl_wopcm_size_ok;
+        cmp rax, 0;
+        je  gucl_l_too_small;
+
+        // 4. Not already loaded.
+        lea r10, [rip + _gucl_loaded];
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        jne gucl_l_already;
+
+        // 5. WOPCM_BASE: (base >> 16) | valid-bit 0.
+        mov rdi, 0xC020;                 // GUCL_REG_WOPCM_BASE
+        mov rsi, rbx;
+        shr rsi, 16;
+        or  rsi, 1;                      // valid bit
+        call gmmio_write32;
+        cmp rax, 0;
+        jne gucl_l_mmio;
+
+        // 6. WOPCM_SIZE: size >> 12.
+        mov rdi, 0xC024;                 // GUCL_REG_WOPCM_SIZE
+        mov rsi, r12;
+        shr rsi, 12;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne gucl_l_mmio;
+
+        // 7a. RESET assert.
+        mov rdi, 0xC028;                 // GUCL_REG_RESET
+        mov rsi, 1;                      // REQUEST
+        call gmmio_write32;
+        cmp rax, 0;
+        jne gucl_l_mmio;
+
+        // 7b. RESET release (models the hardware-cleared edge).
+        mov rdi, 0xC028;
+        mov rsi, 0;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne gucl_l_mmio;
+
+        // Bump releases too — matches the two-write pair.
+        mov rdi, 1;                      // RELEASES
+        call gucl_note;
+
+        // 8. Record.
+        lea r10, [rip + _gucl_wopcm_base];
+        mov [r10 + 0], rbx;
+        lea r10, [rip + _gucl_wopcm_size];
+        mov [r10 + 0], r12;
+        lea r10, [rip + _gucl_loaded];
+        mov rax, 1;
+        mov [r10 + 0], rax;
+
+        mov rdi, 0;                      // LOADS
+        call gucl_note;
+        xor rax, rax;
+        jmp gucl_l_out;
+
+      gucl_l_not_verified:
+        mov rdi, 2;
+        call gucl_note;
+        mov rax, 0xFFFFF66E;
+        jmp gucl_l_out;
+      gucl_l_not_bound:
+        mov rdi, 2;
+        call gucl_note;
+        mov rax, 0xFFFFF66D;
+        jmp gucl_l_out;
+      gucl_l_misaligned:
+        mov rdi, 2;
+        call gucl_note;
+        mov rax, 0xFFFFF66C;
+        jmp gucl_l_out;
+      gucl_l_too_small:
+        mov rdi, 2;
+        call gucl_note;
+        mov rax, 0xFFFFF66B;
+        jmp gucl_l_out;
+      gucl_l_already:
+        mov rdi, 2;
+        call gucl_note;
+        mov rax, 0xFFFFF669;
+        jmp gucl_l_out;
+      gucl_l_mmio:
+        mov rdi, 2;
+        call gucl_note;
+        mov rax, 0xFFFFF66A;
+
+      gucl_l_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Row accessors.
+  // ==========================================================================
+
+  pub let gucl_is_loaded : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M2-002 (#1258): 1 iff GuC firmware has been staged this boot. Labels prefixed gucl_il_.",
+      block: {
+        lea r10, [rip + _gucl_loaded];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let gucl_wopcm_base_of : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M2-002 (#1258): recorded WOPCM base or 0. Labels prefixed gucl_wb_.",
+      block: {
+        lea r10, [rip + _gucl_wopcm_base];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let gucl_wopcm_size_of : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M2-002 (#1258): recorded WOPCM size or 0. Labels prefixed gucl_wz_.",
+      block: {
+        lea r10, [rip + _gucl_wopcm_size];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+}
