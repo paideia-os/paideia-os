@@ -49,10 +49,26 @@ mkdir -p "${BUILD_DIR}"
 # (missing or unreadable object) reports "no reference", which every
 # caller already handles -- owner checks fail loudly on it because they
 # stat the file first.
+# #1612: cache raw objdump output per object. 219 confinement gates each
+# stray-loop over ~800 objects, and every gate was re-running objdump on
+# the same file. First call for an object runs objdump; subsequent calls
+# grep the cached string. Same suffix-boundary regex, same discipline;
+# gate phase drops from ~20min to seconds. __ERR__ sentinel encodes
+# non-zero objdump exits (owner checks stat the file first, so this only
+# fires on legitimately-missing objects and the caller still handles it).
+declare -A __OBJDUMP_RELOC_CACHE
 obj_relocs_against() {
-    local out
-    out="$(objdump -r "$1" 2>/dev/null)" || return 1
-    grep -qE -- "$2([^a-zA-Z0-9_]|\$)" <<< "${out}"
+    local obj="$1" sym="$2"
+    if [[ -z "${__OBJDUMP_RELOC_CACHE[$obj]+set}" ]]; then
+        if ! __OBJDUMP_RELOC_CACHE[$obj]="$(objdump -r "$obj" 2>/dev/null)"; then
+            __OBJDUMP_RELOC_CACHE[$obj]='__ERR__'
+        fi
+    fi
+    [[ "${__OBJDUMP_RELOC_CACHE[$obj]}" == '__ERR__' ]] && return 1
+    # Bash-native pattern match (no fork per call). Preserves the
+    # suffix-boundary discipline that guards against R35.M9-style
+    # `_dpaux_stats` vs `_backlight_dpaux_stats` collisions.
+    [[ "${__OBJDUMP_RELOC_CACHE[$obj]}" =~ (^|[^a-zA-Z0-9_])${sym}([^a-zA-Z0-9_]|$) ]]
 }
 
 # R20-M4-004 (#822): "No AML in kernel" guardrail. Refuses the build
