@@ -2971,6 +2971,41 @@ fi
 echo "[tb-provisioner-confine] TB4 tunnel provisioner state confined"
 
 # ---------------------------------------------------------------------------
+# R35.M9 (#1229/#1230/#1231): TB4 DP-tunnel bridge to R36 confinement.
+#
+# Three modules: DP-tunnel virtual DDI shim (per-tunnel row table
+# associating tunnel_slot / ddi_index / mst_stream_id, plus placeholder
+# ddi_appeared / ddi_removed events R36's KIND_DISPLAY_OUTPUT will
+# consume), DP AUX pass-through (16-slot in-flight ring with
+# ACK/NACK/DEFER response arbitration per DP 2.1 §2.4 / USB4 §10.6),
+# and DP-adapter hot-plug bridge (filters tb_topology_channel events,
+# drops non-DP, emits placeholder _dp_output_event records into a
+# 16-slot recent-emissions ring). Each owns its own row / ring / stats;
+# tools/build.sh confines relocations against each to its owning
+# object so a second writer cannot forge a DDI mapping, restamp an AUX
+# slot, or fabricate a display hot-plug event.
+DPDDI_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/dp_ddi_shim.pdx"
+DPAUX_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/dp_aux_passthru.pdx"
+DPHP_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/dp_hotplug_bridge.pdx"
+if [[ ! -f "${DPDDI_SRC}" || ! -f "${DPAUX_SRC}" || ! -f "${DPHP_SRC}" ]]; then
+    echo "[tb-dp-bridge-confine] FAIL - one of the R35.M9 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_dpddi_rows'  'core/drivers/tb/dp_ddi_shim.o'
+ec_confine_one '_dpddi_stats' 'core/drivers/tb/dp_ddi_shim.o'
+ec_confine_one '_dpaux_pt_ring'  'core/drivers/tb/dp_aux_passthru.o'
+ec_confine_one '_dpaux_pt_stats' 'core/drivers/tb/dp_aux_passthru.o'
+ec_confine_one '_dphp_events' 'core/drivers/tb/dp_hotplug_bridge.o'
+ec_confine_one '_dphp_stats'  'core/drivers/tb/dp_hotplug_bridge.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See dp_ddi_shim.pdx §1, dp_aux_passthru.pdx §1 and" >&2
+    echo "  dp_hotplug_bridge.pdx §1 for the table/ring/counter" >&2
+    echo "  one-writer discipline." >&2
+    exit 1
+fi
+echo "[tb-dp-bridge-confine] TB4 DP-tunnel bridge state confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
