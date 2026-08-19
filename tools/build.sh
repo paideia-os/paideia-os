@@ -2753,6 +2753,42 @@ fi
 echo "[tb-confine] Thunderbolt 4 substrate state confined"
 
 # ---------------------------------------------------------------------------
+# R35.M3 (#1205/#1206/#1207/#1208/#1209): Thunderbolt 4 tunnel-establishment
+# + KIND_TB_ROUTE + route-teardown state confinement.
+#
+# Five modules, each owns its own row table / stats array (and, for the
+# DP / USB3 scaffolds, a fixed-capacity resource-slot table).
+# tools/build.sh confines relocations against each one to its owning
+# object so a second writer cannot restamp a route's identity, forge a
+# DDI holder, or double-release a virtual xHCI port behind the
+# sequencer's back.
+TBR_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_tb_route.pdx"
+TPT_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/pcie_tunnel.pdx"
+TDP_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/dp_tunnel.pdx"
+TU3_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/usb3_tunnel.pdx"
+TTD_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/route_teardown.pdx"
+if [[ ! -f "${TBR_SRC}" || ! -f "${TPT_SRC}" || ! -f "${TDP_SRC}" \
+        || ! -f "${TU3_SRC}" || ! -f "${TTD_SRC}" ]]; then
+    echo "[tb3-confine] FAIL - one of the R35.M3 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_tb_route_table'         'core/cap/kind_tb_route.o'
+ec_confine_one '_tb_route_stats'         'core/cap/kind_tb_route.o'
+ec_confine_one '_pcie_tunnel_stats'      'core/drivers/tb/pcie_tunnel.o'
+ec_confine_one '_dp_tunnel_stats'        'core/drivers/tb/dp_tunnel.o'
+ec_confine_one '_dp_tunnel_ddi_tab'      'core/drivers/tb/dp_tunnel.o'
+ec_confine_one '_usb3_tunnel_stats'      'core/drivers/tb/usb3_tunnel.o'
+ec_confine_one '_usb3_tunnel_port_tab'   'core/drivers/tb/usb3_tunnel.o'
+ec_confine_one '_route_teardown_stats'   'core/drivers/tb/route_teardown.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_tb_route.pdx §3, pcie_tunnel.pdx §2," >&2
+    echo "  dp_tunnel.pdx §3, usb3_tunnel.pdx §3 and route_teardown.pdx §3" >&2
+    echo "  for the row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[tb3-confine] Thunderbolt 4 tunnel substrate state confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

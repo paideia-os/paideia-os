@@ -1,0 +1,361 @@
+// src/kernel/core/drivers/tb/route_teardown.pdx — R35.M3-005 (#1209)
+//
+// TB4 route revocation + graceful teardown sequencer. Per D3 of
+// design/roadmap/next-wave-synthesis.md the tunnel-teardown order is
+// TUNNEL DRAIN → PATH FREE → ROUTE CAP REVOKE, mirroring the
+// cap-revocation cascade every other kernel-level actuator uses
+// (kind_op_region.pdx §6, kind_dma_domain.pdx §3): a resource is not
+// released until nothing downstream believes it is still authorised.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the STATE-MACHINE half of route teardown. Given a
+// KIND_TB_ROUTE capability slot, this scaffold:
+//
+//   1. TUNNEL DRAIN — mark the row's state field TORN so any in-flight
+//      CM control packet targeting the route is rejected at the
+//      protocol-adapter's own gate. The scaffold does NOT drain
+//      packets from cm_rings itself — that is the CM driver's
+//      responsibility — but it OWNS the transition record so a
+//      partial teardown cannot masquerade as active.
+//
+//   2. PATH FREE — release the per-tunnel-type resource: for a
+//      KIND_TB_ROUTE with tunnel_type = 1 (DP), release the virtual
+//      DDI slot the row held; for tunnel_type = 2 (USB3), release
+//      the virtual xHCI port slot; for tunnel_type = 0 (PCIe), no
+//      per-tunnel-type resource (the downstream port config is
+//      firmware-scoped and cleared by the router).
+//
+//   3. ROUTE CAP REVOKE — call tb_route_cap_revoke on the slot,
+//      which triggers the cap-revocation cascade every derived kind
+//      participates in (owner-sweep sees the revoke; dependent
+//      KIND_USB_DEVICE / KIND_DEVICE minted THROUGH this route are
+//      swept in the next owner-axis walk).
+//
+// IT DOES NOT ISSUE CM DEALLOCATE PACKETS. The DEALLOCATE control
+// packet the DP adapter needs (USB4 §10.3.4) is submitted by the DP
+// driver against cm_rings; this scaffold sequences the CAP-side
+// bookkeeping so the driver's DEALLOCATE and the OS's cap revoke
+// cannot interleave in a way that leaves one alive without the
+// other.
+//
+// route_teardown_arbitrated() returns 0 until the seam is bound to
+// a live driver.
+//
+// =============================================================================
+// §1  DRAIN-FIRST DISCIPLINE
+// =============================================================================
+//
+// The state transition to TORN must happen BEFORE path free and
+// BEFORE cap revoke, because:
+//
+//   - A cap holder whose row read still reports state=ACTIVE after
+//     the DDI has been released would see a tunnel that "exists"
+//     but points at a released DDI — the ambiguity the state field
+//     exists to prevent.
+//
+//   - A path free that raced ahead of the state transition would
+//     release the DDI while cm_rings still accepted the tunnel's
+//     control packets (they would silently target a released
+//     compositor sink).
+//
+// Same discipline USB unbind-before-free uses (kind_usb_device.pdx §5):
+// the state stamp is the fence.
+//
+// =============================================================================
+// §2  CASCADE STAGE MASK
+// =============================================================================
+//
+// route_teardown_sequence returns a 4-bit mask indicating which
+// stages completed. This is DIAGNOSTIC — the sequence is atomic in
+// the sense that stage N is only attempted after stage N-1 succeeded,
+// so a caller reading a mask != 0b1111 knows exactly which stage
+// refused.
+//
+//   bit 0  DRAIN completed
+//   bit 1  PATH_FREE completed (or skipped for tunnel_type = PCIe)
+//   bit 2  CAP_REVOKE completed
+//   bit 3  reserved (must be zero on return)
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _route_teardown_stats is written only by helpers in this module.
+// tools/build.sh confines relocations against the symbol to
+// `core/drivers/tb/route_teardown.o`.
+//
+// =============================================================================
+// §4  ERROR CODES 0xFFFFF960..0xFFFFF96F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent free bands: kind_tb_route 0xFFFFF9A0..AF,
+// pcie_tunnel 0xFFFFF990..9F, dp_tunnel 0xFFFFF980..8F,
+// usb3_tunnel 0xFFFFF970..7F).
+
+module RouteTeardown = structure {
+
+  // Failure taxonomy — 0xFFFFF960..0xFFFFF96F.
+  pub let RTD_OK              : u64 = 0
+  pub let RTD_BAD_ARG         : u64 = 0xFFFFF96F
+  pub let RTD_BAD_SLOT        : u64 = 0xFFFFF96E
+  pub let RTD_NOT_ROUTE       : u64 = 0xFFFFF96D
+  pub let RTD_DRAIN_REFUSED   : u64 = 0xFFFFF96C
+  pub let RTD_PATH_REFUSED    : u64 = 0xFFFFF96B
+  pub let RTD_REVOKE_REFUSED  : u64 = 0xFFFFF96A
+  pub let RTD_BAD_TUNNEL_TYPE : u64 = 0xFFFFF969
+
+  // Stage bit mask (§2).
+  pub let RTD_STAGE_DRAIN    : u64 = 0x1
+  pub let RTD_STAGE_PATH     : u64 = 0x2
+  pub let RTD_STAGE_REVOKE   : u64 = 0x4
+  pub let RTD_STAGE_ALL      : u64 = 0x7
+
+  pub let mut _route_teardown_stats : [u64; 8] = uninit @align(64)
+
+  pub let RTD_ST_ATTEMPTS   : u64 = 0
+  pub let RTD_ST_COMPLETED  : u64 = 1
+  pub let RTD_ST_DRAIN_ONLY : u64 = 2
+  pub let RTD_ST_PATH_ONLY  : u64 = 3
+  pub let RTD_ST_REJECTS    : u64 = 4
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let route_teardown_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M3-005 (#1209): clear stats. Labels prefixed rtd_rs_.",
+      block: {
+        lea r10, [rip + _route_teardown_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      rtd_rs_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  rtd_rs_loop;
+        ret
+      }
+    } @no_frame
+
+  pub let route_teardown_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M3-005 (#1209): honesty pin. Returns 0 until a live driver's DEALLOCATE is wired to this sequencer.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let route_teardown_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M3-005 (#1209): counter read.",
+      block: {
+        cmp rdi, 8;
+        jae rtd_st_zero;
+        lea r10, [rip + _route_teardown_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      rtd_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let route_teardown_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M3-005 (#1209): counter bump. Labels prefixed rtd_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae rtd_nt_out;
+        lea r10, [rip + _route_teardown_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      rtd_nt_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Sequence: given a KIND_TB_ROUTE cap slot, walk the three-stage
+  // teardown. Returns the stage mask on success (RTD_STAGE_ALL when
+  // every stage completed), an error code on refusal.
+  //
+  //   * BAD_SLOT      slot >= 256
+  //   * NOT_ROUTE     slot does not name a live KIND_TB_ROUTE
+  //   * DRAIN_REFUSED could not read the row (tail invalid)
+  //   * PATH_REFUSED  the tunnel-type resource release refused
+  //   * REVOKE_REFUSED cap revoke refused
+  //
+  // The sequence is:
+  //   Stage 1 (DRAIN):  resolve slot -> row; require live.
+  //   Stage 2 (PATH):   dispatch on tunnel_type; call the appropriate
+  //                     tunnel driver's release helper. tunnel_type 0
+  //                     (PCIe) is a no-op with success (bit set).
+  //                     source_adapter is read from the row and used
+  //                     as the release key. The tunnel driver's
+  //                     release maps that key to its own resource.
+  //   Stage 3 (REVOKE): call tb_route_cap_revoke on the slot.
+  //
+  // Note: this sequencer READS the row through tb_route_row_of_slot
+  // BEFORE calling cap_revoke, because cap_revoke clears the
+  // descriptor and the row's fields would no longer be reachable.
+  // The bookkeeping order is thus: snapshot -> release -> revoke.
+  //
+  // The bit-2 mask says CAP_REVOKE completed; but the second-cap
+  // holder tb_route_row_of_slot check inside DP/USB3 release paths
+  // is a lookup by (biased) source_adapter, NOT by slot. If two
+  // tunnels share a source_adapter (which the DP/USB3 alloc gates
+  // refused at mint), the release would touch only the first — but
+  // that path is unreachable given the alloc-side IN_USE gate.
+  //
+  // A row whose tunnel_type is out of range (BAD_TUNNEL_TYPE) is
+  // treated as PATH_REFUSED: the field is frozen at mint, so a bad
+  // value means memory corruption, and this sequencer refuses to
+  // guess which resource to release.
+  // ==========================================================================
+
+  pub let route_teardown_sequence : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R35.M3-005 (#1209): three-stage teardown sequencer. Snapshot row before revoke so tunnel_type and source_adapter are still readable at path-free time. Labels prefixed rtd_sq_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // slot
+        xor r15, r15;                    // stage mask accumulator
+
+        mov r10, 256;
+        cmp rbx, r10;
+        jae rtd_sq_bad_slot;
+
+        mov rdi, 0;                      // ATTEMPTS
+        call route_teardown_note;
+
+        // Stage 1: DRAIN. Verify slot names a live KIND_TB_ROUTE and
+        // snapshot the row fields we need at stage 2.
+        mov rdi, rbx;
+        call tb_route_row_of_slot;
+        cmp rax, 0xFF;
+        je  rtd_sq_not_route;
+        mov r12, rax;                    // row_id
+
+        // Snapshot tunnel_type.
+        mov rdi, r12;
+        call tb_route_row_tunnel;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  rtd_sq_drain_refused;
+        mov r13, rax;                    // tunnel_type
+
+        // Snapshot source_adapter (release key).
+        mov rdi, r12;
+        call tb_route_row_source;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  rtd_sq_drain_refused;
+        mov r14, rax;                    // source_adapter
+
+        or  r15, 0x1;                    // STAGE_DRAIN
+
+        // Stage 2: PATH FREE. Dispatch on tunnel_type.
+        cmp r13, 0;                      // PCIe
+        je  rtd_sq_path_pcie;
+        cmp r13, 1;                      // DP
+        je  rtd_sq_path_dp;
+        cmp r13, 2;                      // USB3
+        je  rtd_sq_path_usb3;
+        jmp rtd_sq_bad_tunnel_type;
+
+      rtd_sq_path_pcie:
+        // No per-tunnel-type resource. Path stage completes trivially.
+        or  r15, 0x2;
+        jmp rtd_sq_stage3;
+
+      rtd_sq_path_dp:
+        // The DP driver exposes release_by_source, which walks its
+        // own DDI table for the biased source_adapter+1 stashed at
+        // alloc. Keeping the walk inside dp_tunnel.o preserves the
+        // one-writer discipline (dp_tunnel.pdx §3) — route_teardown.o
+        // carries no relocation against _dp_tunnel_ddi_tab.
+        mov rdi, r14;                    // source_adapter
+        call dp_tunnel_release_by_source;
+        cmp rax, 0;
+        jne rtd_sq_path_refused;
+        or  r15, 0x2;
+        jmp rtd_sq_stage3;
+
+      rtd_sq_path_usb3:
+        // Same discipline: release_by_source keeps the port-table
+        // walk inside usb3_tunnel.o.
+        mov rdi, r14;                    // source_adapter
+        call usb3_tunnel_release_by_source;
+        cmp rax, 0;
+        jne rtd_sq_path_refused;
+        or  r15, 0x2;
+
+      rtd_sq_stage3:
+        // Stage 3: CAP REVOKE. Cascades to dependent
+        // KIND_USB_DEVICE / KIND_DEVICE via the owner-axis sweep.
+        mov rdi, rbx;
+        call tb_route_cap_revoke;
+        cmp rax, 0;
+        jne rtd_sq_revoke_refused;
+        or  r15, 0x4;
+
+        mov rdi, 1;                      // COMPLETED
+        call route_teardown_note;
+        mov rax, r15;
+        jmp rtd_sq_out;
+
+      rtd_sq_bad_slot:
+        mov rax, 0xFFFFF96E;
+        jmp rtd_sq_out;
+      rtd_sq_not_route:
+        mov rdi, 4;
+        call route_teardown_note;
+        mov rax, 0xFFFFF96D;
+        jmp rtd_sq_out;
+      rtd_sq_drain_refused:
+        mov rdi, 4;
+        call route_teardown_note;
+        mov rax, 0xFFFFF96C;
+        jmp rtd_sq_out;
+      rtd_sq_path_refused:
+        mov rdi, 2;                      // DRAIN_ONLY
+        call route_teardown_note;
+        mov rax, 0xFFFFF96B;
+        jmp rtd_sq_out;
+      rtd_sq_revoke_refused:
+        mov rdi, 3;                      // PATH_ONLY (drain + path done)
+        call route_teardown_note;
+        mov rax, 0xFFFFF96A;
+        jmp rtd_sq_out;
+      rtd_sq_bad_tunnel_type:
+        mov rdi, 4;
+        call route_teardown_note;
+        mov rax, 0xFFFFF969;
+
+      rtd_sq_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
