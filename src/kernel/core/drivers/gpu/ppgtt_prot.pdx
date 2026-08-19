@@ -1,0 +1,428 @@
+// src/kernel/core/drivers/gpu/ppgtt_prot.pdx — R37.M4-004 (#1270)
+//
+// PPGTT protection-bit composer and range-invalidate helper.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the CANONICAL PTE FLAG COMPOSER for the Iris Xe (Gen12) PPGTT.
+// Every consumer that writes a PTE -- the walker for a first-touch
+// bind, the bind gate on a re-prot, the debug remap -- routes through
+// this module.  Two flag-composers would let one path set NX while the
+// other set X, and a shader load would race the JIT compiler.
+//
+// It also exposes the RANGE INVALIDATE arithmetic that the driver
+// hands off to the R37.M1 MMIO owner as a (base, count) tuple.  This
+// module DOES NOT write MMIO; the R37.M1 owner is the sole writer of
+// the flush register.
+//
+// IT DOES NOT MAINTAIN THE PTE TABLE.  Consumers hand it the current
+// PTE and receive a rewritten one.  The physical PPGTT frames live
+// under the KIND_MEMORY authority the caller of ppgtt_bind held.
+//
+// =============================================================================
+// §1  THE PPGTT PTE BIT LAYOUT (INTEL VOL 3 §4.5, XE1 EXTENSIONS)
+// =============================================================================
+//
+//   bit  0  PRESENT
+//   bit  1  RW (0 = read-only, 1 = read/write)
+//   bit  2  U  (user; always 1 for PPGTT since the GPU is "user"-mode)
+//   bit  3  PWT (page write-through, MOCS bit 0)
+//   bit  4  PCD (page cache-disable, MOCS bit 1)
+//   bit  5  A  (accessed)
+//   bit  6  D  (dirty)
+//   bit  7  PS (page-size; 0 for 4 KiB)
+//   bit  9  PAT (MOCS bit 2)
+//   bit 63  NX (execute-disable; inverted for the R_EXECUTE ordinal)
+//
+// The physical frame occupies bits [51:12] (M=52 for the T14 G4
+// physical-address width).  Bits [62:52] are reserved zero.
+//
+// =============================================================================
+// §2  THE THREE ORDINALS THE BIND GATE HANDS US
+// =============================================================================
+//
+//   PPP_PROT_RO (0)  read-only shader constant, texture atlas
+//   PPP_PROT_RW (1)  scan-out, staging, compositor overlay
+//   PPP_PROT_RX (2)  binary shader program (rare, only for JIT stage)
+//
+// The mapping to PTE bits is:
+//
+//   RO -> P=1 RW=0 U=1 NX=1
+//   RW -> P=1 RW=1 U=1 NX=1
+//   RX -> P=1 RW=0 U=1 NX=0
+//
+// The R_MINT bit is DELIBERATELY REFUSED by the bind gate one layer up;
+// this module composes the bits, it does not check rights.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE COUNTERS
+// =============================================================================
+//
+// _ppp_stats is written only by helpers in this module.  tools/build.sh
+// confines relocations against it to core/drivers/gpu/ppgtt_prot.o.
+//
+// =============================================================================
+// §4  FAILURE TAXONOMY 0xFFFFF5C0..0xFFFFF5CF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent free bands above: ppgtt_bind
+// 0xFFFFF5D0..DF; adjacent free band below: gtt_scanout
+// 0xFFFFF5B0..BF).
+
+module PpgttProt = structure {
+
+  // §2: protection ordinals.
+  pub let PPP_PROT_RO : u64 = 0
+  pub let PPP_PROT_RW : u64 = 1
+  pub let PPP_PROT_RX : u64 = 2
+  pub let PPP_PROT_MAX: u64 = 2
+
+  // §1: PTE bit masks.
+  pub let PPP_PTE_PRESENT : u64 = 0x0000000000000001
+  pub let PPP_PTE_RW      : u64 = 0x0000000000000002
+  pub let PPP_PTE_U       : u64 = 0x0000000000000004
+  pub let PPP_PTE_PWT     : u64 = 0x0000000000000008
+  pub let PPP_PTE_PCD     : u64 = 0x0000000000000010
+  pub let PPP_PTE_A       : u64 = 0x0000000000000020
+  pub let PPP_PTE_D       : u64 = 0x0000000000000040
+  pub let PPP_PTE_PS      : u64 = 0x0000000000000080
+  pub let PPP_PTE_PAT     : u64 = 0x0000000000000200
+  pub let PPP_PTE_NX      : u64 = 0x8000000000000000
+
+  // §1: physical frame mask [51:12].
+  pub let PPP_PA_SHIFT : u64 = 12
+
+  // Failure taxonomy -- 0xFFFFF5C0..0xFFFFF5CF.
+  pub let PPP_OK           : u64 = 0
+  pub let PPP_BAD_PROT     : u64 = 0xFFFFF5CF
+  pub let PPP_BAD_FRAME    : u64 = 0xFFFFF5CE
+  pub let PPP_BAD_MOCS     : u64 = 0xFFFFF5CD
+  pub let PPP_BAD_ARG      : u64 = 0xFFFFF5CC
+  pub let PPP_BAD_RANGE    : u64 = 0xFFFFF5CB
+
+  pub let PPP_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+
+  pub let mut _ppp_stats : [u64; 8] = uninit @align(64)
+
+  pub let PPP_ST_RO         : u64 = 0
+  pub let PPP_ST_RW         : u64 = 1
+  pub let PPP_ST_RX         : u64 = 2
+  pub let PPP_ST_INVALIDATE : u64 = 3
+  pub let PPP_ST_REFUSED    : u64 = 4
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let ppgtt_prot_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-004 (#1270): clear PPGTT prot counters. Boot and teardown only. Labels prefixed ppp_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _ppp_stats];
+        xor rcx, rcx;
+      ppp_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  ppp_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let ppp_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-004 (#1270): counter bump. Labels prefixed ppp_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae ppp_nt_out;
+        lea r10, [rip + _ppp_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      ppp_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let ppp_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-004 (#1270): counter read. Labels prefixed ppp_stt_.",
+      block: {
+        cmp rdi, 8;
+        jae ppp_stt_zero;
+        lea r10, [rip + _ppp_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      ppp_stt_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Validators.
+  // ==========================================================================
+
+  pub let ppp_prot_valid : (u64) -> u64 !{} @{} =
+    fn (p: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M4-004 (#1270): 1 iff p <= PPP_PROT_MAX (2). Labels prefixed ppp_pv_.",
+      block: {
+        cmp rdi, 2;
+        ja  ppp_pv_no;
+        mov rax, 1;
+        ret;
+      ppp_pv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let ppp_frame_valid : (u64) -> u64 !{} @{} =
+    fn (frame_pa: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M4-004 (#1270): 1 iff frame_pa is 4K-aligned AND fits [51:12] (M=52 T14 G4). Labels prefixed ppp_fv_.",
+      block: {
+        mov r10, 0xFFF;
+        and r10, rdi;
+        cmp r10, 0;
+        jne ppp_fv_no;
+        mov r10, 1;
+        shl r10, 52;
+        cmp rdi, r10;
+        jae ppp_fv_no;
+        mov rax, 1;
+        ret;
+      ppp_fv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let ppp_mocs_valid : (u64) -> u64 !{} @{} =
+    fn (mocs: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M4-004 (#1270): 1 iff mocs in [0, 7] (three-bit index into PWT/PCD/PAT). Labels prefixed ppp_mv_.",
+      block: {
+        cmp rdi, 7;
+        ja  ppp_mv_no;
+        mov rax, 1;
+        ret;
+      ppp_mv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // ppp_compose(prot, frame_pa, mocs) -> pte | error
+  //
+  // Compose one 4 KiB-page PTE from a bind-gate prot ordinal, a
+  // physical frame address, and a MOCS index.  Present bit always set;
+  // U bit always set; PS bit always clear (4 KiB pages).  RW and NX
+  // follow §2's mapping; MOCS bits map to PWT (bit 3), PCD (bit 4),
+  // PAT (bit 9).
+  // ==========================================================================
+
+  pub let ppp_compose : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (prot: u64) (frame_pa: u64) (mocs: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-004 (#1270): compose a 4K PPGTT PTE from prot/frame_pa/mocs. Labels prefixed ppp_c_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // prot
+        mov r13, rsi;                    // frame_pa
+        mov r14, rdx;                    // mocs
+
+        mov rdi, r12;
+        call ppp_prot_valid;
+        cmp rax, 0;
+        je  ppp_c_bad_prot;
+
+        mov rdi, r13;
+        call ppp_frame_valid;
+        cmp rax, 0;
+        je  ppp_c_bad_frame;
+
+        mov rdi, r14;
+        call ppp_mocs_valid;
+        cmp rax, 0;
+        je  ppp_c_bad_mocs;
+
+        // Base = PRESENT | U | frame_pa.
+        mov rbx, r13;
+        or  rbx, 0x1;                    // PRESENT
+        or  rbx, 0x4;                    // U
+
+        // Prot-driven RW / NX.
+        cmp r12, 1;                      // RW
+        je  ppp_c_rw;
+        cmp r12, 2;                      // RX
+        je  ppp_c_rx;
+        // RO: no RW, keep NX.
+        or  rbx, 0x8000000000000000;
+        mov rdi, 0;                      // ST_RO
+        jmp ppp_c_after_prot;
+      ppp_c_rw:
+        or  rbx, 0x2;                    // RW
+        or  rbx, 0x8000000000000000;     // NX
+        mov rdi, 1;                      // ST_RW
+        jmp ppp_c_after_prot;
+      ppp_c_rx:
+        // Clear NX (leave it out); no RW.
+        mov rdi, 2;                      // ST_RX
+
+      ppp_c_after_prot:
+        push rdi;
+        call ppp_note;
+        pop rdi;
+
+        // MOCS -> PWT (bit 3, from bit 0), PCD (bit 4, from bit 1), PAT (bit 9, from bit 2).
+        mov rax, r14;
+        and rax, 0x1;
+        shl rax, 3;
+        or  rbx, rax;
+        mov rax, r14;
+        and rax, 0x2;
+        shl rax, 3;
+        or  rbx, rax;
+        mov rax, r14;
+        and rax, 0x4;
+        shl rax, 7;
+        or  rbx, rax;
+
+        mov rax, rbx;
+        jmp ppp_c_out;
+
+      ppp_c_bad_prot:
+        mov rdi, 4;                      // REFUSED
+        call ppp_note;
+        mov rax, 0xFFFFF5CF;
+        jmp ppp_c_out;
+      ppp_c_bad_frame:
+        mov rdi, 4;
+        call ppp_note;
+        mov rax, 0xFFFFF5CE;
+        jmp ppp_c_out;
+      ppp_c_bad_mocs:
+        mov rdi, 4;
+        call ppp_note;
+        mov rax, 0xFFFFF5CD;
+
+      ppp_c_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ppp_extract_prot(pte) -> prot | DECODE_BAD
+  //
+  // Read a live PTE back into a bind-gate prot ordinal.  Used by the
+  // debug walker and by ppgtt_bind re-prot to compare "what did the
+  // caller ask for" against "what did we install."
+  // ==========================================================================
+
+  pub let ppp_extract_prot : (u64) -> u64 !{} @{} =
+    fn (pte: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M4-004 (#1270): PTE flag bits -> prot ordinal. PRESENT must be set. Labels prefixed ppp_ep_.",
+      block: {
+        mov r10, rdi;
+        and r10, 0x1;                    // PRESENT
+        cmp r10, 0;
+        je  ppp_ep_bad;
+
+        mov r10, rdi;
+        and r10, 0x2;                    // RW
+        mov r11, rdi;
+        shr r11, 63;                     // NX
+
+        cmp r10, 0;
+        jne ppp_ep_rw;
+        cmp r11, 0;
+        je  ppp_ep_rx;
+        mov rax, 0;                      // RO
+        ret;
+      ppp_ep_rw:
+        mov rax, 1;
+        ret;
+      ppp_ep_rx:
+        mov rax, 2;
+        ret;
+      ppp_ep_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // ppp_range_invalidate(va, span, page_count_out_ptr) -> OK | error
+  //
+  // Compute how many 4 KiB pages a [va, va+span) range covers and stash
+  // the count at *page_count_out_ptr.  The R37.M1 MMIO owner reads that
+  // count and emits one flush-per-page (or a single "flush all" if the
+  // count exceeds the shootdown-window threshold).  This module does
+  // NOT touch MMIO.
+  // ==========================================================================
+
+  pub let ppp_range_invalidate : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (va: u64) (span: u64) (page_count_out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-004 (#1270): compute page count spanning [va, va+span) and stash at *page_count_out_ptr. Refuses on unaligned va/span or null out ptr. Labels prefixed ppp_ri_.",
+      block: {
+        // va aligned?
+        mov r10, 0xFFF;
+        and r10, rdi;
+        cmp r10, 0;
+        jne ppp_ri_bad;
+
+        // span > 0 and aligned?
+        cmp rsi, 0;
+        je  ppp_ri_bad;
+        mov r10, 0xFFF;
+        and r10, rsi;
+        cmp r10, 0;
+        jne ppp_ri_bad;
+
+        // out ptr non-zero?
+        cmp rdx, 0;
+        je  ppp_ri_bad;
+
+        // page_count = span >> 12
+        mov rax, rsi;
+        shr rax, 12;
+        mov [rdx], rax;
+
+        push rdi;
+        mov rdi, 3;                      // INVALIDATE
+        call ppp_note;
+        pop rdi;
+
+        xor rax, rax;
+        ret;
+
+      ppp_ri_bad:
+        push rdi;
+        mov rdi, 4;
+        call ppp_note;
+        pop rdi;
+        mov rax, 0xFFFFF5CB;
+        ret
+      }
+    }
+}

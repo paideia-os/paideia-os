@@ -3335,6 +3335,45 @@ fi
 echo "[gpu-m3-confine] R37.M3 (GPU BO substrate) confined"
 
 # ---------------------------------------------------------------------------
+# R37.M4 (#1267/#1268/#1269/#1270/#1271): GPU virtual-memory substrate --
+# KIND_GPU_VM (kind_gpu_vm), PPGTT walker (ppgtt_walker), PPGTT bind
+# (ppgtt_bind), PPGTT prot composer (ppgtt_prot), GTT scan-out mappings
+# (gtt_scanout).
+#
+# Five modules open R37.M4 (post-r37-M3).  Each owns its own state;
+# tools/build.sh confines relocations against each to its owning object
+# so a second writer cannot forge a GPU VM row, restamp a walker
+# session, drift a bind counter, restamp a prot counter, or ship a
+# stray GTT scan-out mapping.
+KGVM_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_gpu_vm.pdx"
+PPTW_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/ppgtt_walker.pdx"
+PPGB_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/ppgtt_bind.pdx"
+PPP_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/ppgtt_prot.pdx"
+GTTS_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/gtt_scanout.pdx"
+if [[ ! -f "${KGVM_SRC}" || ! -f "${PPTW_SRC}" \
+        || ! -f "${PPGB_SRC}" || ! -f "${PPP_SRC}" \
+        || ! -f "${GTTS_SRC}" ]]; then
+    echo "[gpu-m4-confine] FAIL - one of the R37.M4 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_gpu_vm_table'      'core/cap/kind_gpu_vm.o'
+ec_confine_one '_gpu_vm_stats'      'core/cap/kind_gpu_vm.o'
+ec_confine_one '_pptw_sessions'     'core/drivers/gpu/ppgtt_walker.o'
+ec_confine_one '_pptw_stats'        'core/drivers/gpu/ppgtt_walker.o'
+ec_confine_one '_ppgb_table'        'core/drivers/gpu/ppgtt_bind.o'
+ec_confine_one '_ppgb_stats'        'core/drivers/gpu/ppgtt_bind.o'
+ec_confine_one '_ppp_stats'         'core/drivers/gpu/ppgtt_prot.o'
+ec_confine_one '_gtts_table'        'core/drivers/gpu/gtt_scanout.o'
+ec_confine_one '_gtts_stats'        'core/drivers/gpu/gtt_scanout.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_gpu_vm.pdx §2, ppgtt_walker.pdx §4, ppgtt_bind.pdx §3," >&2
+    echo "  ppgtt_prot.pdx §3 and gtt_scanout.pdx §4 for the" >&2
+    echo "  row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[gpu-m4-confine] R37.M4 (GPU virtual-memory substrate) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

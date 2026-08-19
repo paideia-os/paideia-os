@@ -1,0 +1,649 @@
+// src/kernel/core/drivers/gpu/ppgtt_bind.pdx — R37.M4-003 (#1269)
+//
+// PPGTT bind / unbind: record the (KIND_GPU_VM, KIND_GPU_BO, virtual
+// address, span) 4-tuples the walker resolves against.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the DECISION SITE for "does a virtual address in this GPU VM
+// name a BO the caller may reach."  The walker (ppgtt_walker.pdx)
+// consumes bindings recorded here; the submit path (R37.M5) refuses
+// any command buffer that references a va with no live binding in
+// this table.  Two binding tables would let one path claim a va is
+// live while another treated it as unmapped, and the two would drift.
+//
+// IT DOES NOT ALLOCATE PAGE-TABLE FRAMES and it does not walk the
+// physical PPGTT.  A bind here is a KIND-LEVEL bookkeeping entry;
+// installing the actual PTEs is the walker's job at first use.
+//
+// IT DOES NOT VALIDATE CAPABILITY RIGHTS.  The bind gate assumes the
+// caller was routed through a KIND_GPU_VM handler that already
+// verified INVOKE/WRITE.  This module refuses only KIND MISMATCH
+// (wrong row_id ranges) and SPAN OVERLAP.
+//
+// =============================================================================
+// §1  ROW LAYOUT — 32 BYTES EXACTLY
+// =============================================================================
+//
+//   [+0]  in_use[63:56] | vm_row_id[15:8] | bo_row_id[23:16]
+//                        | prot[31:24]
+//   [+8]  va      (u64, 4K-aligned)
+//   [+16] span    (u64, in bytes, multiple of 4 KiB)
+//   [+24] pad
+//
+// prot is the PPGTT protection ordinal (ppgtt_prot.pdx §1); at bind
+// time the caller stamps RW / RO / RX and the walker later composes
+// the PTE flag word from it.  16 bindings per boot (256 rows / 32 B),
+// enough for compositor + three overlay planes + two textures +
+// cursor + eight shader constants.
+//
+// =============================================================================
+// §2  CONCURRENCY-SAFETY DISCIPLINE
+// =============================================================================
+//
+// Bind and unbind run in the R37.M5 submit-side critical section
+// (which is a per-endpoint mutex).  Within that critical section the
+// scan is single-threaded, so the "no two bindings share va-range"
+// invariant is enforceable by a linear overlap scan.  A cross-VM
+// scan is out of scope by design: two different VMs may bind
+// overlapping vas because their page tables are physically distinct.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _ppgb_table and _ppgb_stats are written only by helpers in this
+// module.  tools/build.sh confines relocations against each to
+// core/drivers/gpu/ppgtt_bind.o.
+//
+// =============================================================================
+// §4  FAILURE TAXONOMY 0xFFFFF5D0..0xFFFFF5DF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent free bands above: ppgtt_walker
+// 0xFFFFF5E0..EF, kind_gpu_vm 0xFFFFF5F0..FF; adjacent free bands
+// below: ppgtt_prot 0xFFFFF5C0..CF, gtt_scanout 0xFFFFF5B0..BF).
+
+module PpgttBind = structure {
+
+  // Protection ordinals -- mirror ppgtt_prot.pdx PPP_PROT_*.
+  pub let PPGB_PROT_RO : u64 = 0
+  pub let PPGB_PROT_RW : u64 = 1
+  pub let PPGB_PROT_RX : u64 = 2
+  pub let PPGB_PROT_MAX: u64 = 2
+
+  // Failure taxonomy -- 0xFFFFF5D0..0xFFFFF5DF.
+  pub let PPGB_OK               : u64 = 0
+  pub let PPGB_BAD_VM           : u64 = 0xFFFFF5DF
+  pub let PPGB_BAD_BO           : u64 = 0xFFFFF5DE
+  pub let PPGB_BAD_VA           : u64 = 0xFFFFF5DD
+  pub let PPGB_BAD_SPAN         : u64 = 0xFFFFF5DC
+  pub let PPGB_BAD_PROT         : u64 = 0xFFFFF5DB
+  pub let PPGB_OVERLAP          : u64 = 0xFFFFF5DA
+  pub let PPGB_ENOSPC           : u64 = 0xFFFFF5D9
+  pub let PPGB_BAD_ID           : u64 = 0xFFFFF5D8
+  pub let PPGB_UNBIND_ALREADY   : u64 = 0xFFFFF5D7
+  pub let PPGB_BAD_ARG          : u64 = 0xFFFFF5D6
+
+  pub let PPGB_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let PPGB_NONE       : u64 = 0xFF
+
+  // 16 bindings * 32 bytes = 512 bytes as [u64; 64].
+  pub let PPGB_MAX      : u64 = 16
+  pub let PPGB_ROW_BYTES: u64 = 32
+
+  pub let mut _ppgb_table : [u64; 64] = uninit @align(64)
+  pub let mut _ppgb_stats : [u64; 8]  = uninit @align(64)
+
+  pub let PPGB_ST_BINDS    : u64 = 0
+  pub let PPGB_ST_UNBINDS  : u64 = 1
+  pub let PPGB_ST_OVERLAPS : u64 = 2
+  pub let PPGB_ST_REFUSED  : u64 = 3
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let ppgtt_bind_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-003 (#1269): clear PPGTT bind table + counters. Boot and teardown only. Labels prefixed ppgb_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _ppgb_table];
+        xor rcx, rcx;
+      ppgb_rs_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 64;
+        jb  ppgb_rs_rows;
+
+        lea r10, [rip + _ppgb_stats];
+        xor rcx, rcx;
+      ppgb_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  ppgb_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Counters.
+  // ==========================================================================
+
+  pub let ppgb_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-003 (#1269): counter bump. Labels prefixed ppgb_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae ppgb_nt_out;
+        lea r10, [rip + _ppgb_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      ppgb_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let ppgb_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-003 (#1269): counter read. Labels prefixed ppgb_st_.",
+      block: {
+        cmp rdi, 8;
+        jae ppgb_st_zero;
+        lea r10, [rip + _ppgb_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      ppgb_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Validators.
+  // ==========================================================================
+
+  pub let ppgb_prot_valid : (u64) -> u64 !{} @{} =
+    fn (p: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M4-003 (#1269): 1 iff p <= PPGB_PROT_MAX (2). Labels prefixed ppgb_pv_.",
+      block: {
+        cmp rdi, 2;
+        ja  ppgb_pv_no;
+        mov rax, 1;
+        ret;
+      ppgb_pv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let ppgb_va_valid : (u64) -> u64 !{} @{} =
+    fn (va: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M4-003 (#1269): 1 iff va < (1 << 48) AND (va & 0xFFF) == 0. Labels prefixed ppgb_vv_.",
+      block: {
+        mov r10, 1;
+        shl r10, 48;
+        cmp rdi, r10;
+        jae ppgb_vv_no;
+        mov r10, 0xFFF;
+        and r10, rdi;
+        cmp r10, 0;
+        jne ppgb_vv_no;
+        mov rax, 1;
+        ret;
+      ppgb_vv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let ppgb_span_valid : (u64) -> u64 !{} @{} =
+    fn (span: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M4-003 (#1269): 1 iff span > 0 AND (span & 0xFFF) == 0. Labels prefixed ppgb_sv_.",
+      block: {
+        cmp rdi, 0;
+        je  ppgb_sv_no;
+        mov r10, 0xFFF;
+        and r10, rdi;
+        cmp r10, 0;
+        jne ppgb_sv_no;
+        mov rax, 1;
+        ret;
+      ppgb_sv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // ppgb_overlap(vm_row_id, va, span) -> 1 iff ANY live row of that VM
+  // overlaps [va, va+span).  Linear scan over 16 rows.
+  // ==========================================================================
+
+  pub let ppgb_overlap : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (vm_row_id: u64) (va: u64) (span: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-003 (#1269): overlap detector for one VM's bindings. [va, va+span) vs [v', v'+s'). Labels prefixed ppgb_ov_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                    // vm_row_id
+        mov r13, rsi;                    // va
+        mov r14, rdx;                    // span
+        mov r15, r13;
+        add r15, r14;                    // end = va + span
+
+        xor rbx, rbx;
+      ppgb_ov_scan:
+        cmp rbx, 16;
+        jae ppgb_ov_no;
+
+        lea r10, [rip + _ppgb_table];
+        mov r11, rbx;
+        shl r11, 5;
+        add r10, r11;
+
+        mov rax, [r10 + 0];
+        mov r11, rax;
+        shr r11, 56;
+        cmp r11, 0;
+        je  ppgb_ov_next;
+
+        // Same VM?
+        shr rax, 8;
+        and rax, 0xFF;
+        cmp rax, r12;
+        jne ppgb_ov_next;
+
+        mov rax, [r10 + 8];              // other.va
+        mov r11, [r10 + 16];             // other.span
+        mov rcx, rax;
+        add rcx, r11;                    // other.end
+
+        // Overlap iff (va < other.end) AND (r15 > other.va).
+        cmp r13, rcx;
+        jae ppgb_ov_next;
+        cmp r15, rax;
+        jbe ppgb_ov_next;
+
+        mov rax, 1;
+        jmp ppgb_ov_out;
+
+      ppgb_ov_next:
+        add rbx, 1;
+        jmp ppgb_ov_scan;
+      ppgb_ov_no:
+        xor rax, rax;
+
+      ppgb_ov_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ppgb_bind(vm_row_id, bo_row_id, va, span, prot) -> binding_id | error
+  //
+  // Records one binding.  THE ONE WRITER of _ppgb_table.  Refuses:
+  //   BAD_VM      vm_row_id > 0xFF
+  //   BAD_BO      bo_row_id > 0xFF
+  //   BAD_VA      va not aligned / out of 48-bit
+  //   BAD_SPAN    span 0 or not aligned
+  //   BAD_PROT    prot > PROT_MAX
+  //   OVERLAP     another live binding of this VM covers any of [va, va+span)
+  //   ENOSPC      16 rows already claimed
+  // ==========================================================================
+
+  pub let ppgb_bind : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (vm_row_id: u64) (bo_row_id: u64) (va: u64) (span: u64) (prot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-003 (#1269): record one PPGTT binding. THE ONE WRITER of _ppgb_table. Labels prefixed ppgb_b_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+
+        mov r12, rdi;                    // vm_row_id
+        mov r13, rsi;                    // bo_row_id
+        mov r14, rdx;                    // va
+        mov r15, rcx;                    // span
+        mov rbp, r8;                     // prot
+
+        cmp r12, 0xFF;
+        ja  ppgb_b_bad_vm;
+        cmp r13, 0xFF;
+        ja  ppgb_b_bad_bo;
+
+        mov rdi, r14;
+        call ppgb_va_valid;
+        cmp rax, 0;
+        je  ppgb_b_bad_va;
+
+        mov rdi, r15;
+        call ppgb_span_valid;
+        cmp rax, 0;
+        je  ppgb_b_bad_span;
+
+        mov rdi, rbp;
+        call ppgb_prot_valid;
+        cmp rax, 0;
+        je  ppgb_b_bad_prot;
+
+        mov rdi, r12;
+        mov rsi, r14;
+        mov rdx, r15;
+        call ppgb_overlap;
+        cmp rax, 0;
+        jne ppgb_b_overlap;
+
+        // Scan for free row.
+        xor rbx, rbx;
+      ppgb_b_scan:
+        cmp rbx, 16;
+        jae ppgb_b_enospc;
+        lea r10, [rip + _ppgb_table];
+        mov r11, rbx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  ppgb_b_claim;
+        add rbx, 1;
+        jmp ppgb_b_scan;
+
+      ppgb_b_claim:
+        // hdr = in_use=1 | vm[15:8] | bo[23:16] | prot[31:24]
+        mov rax, r12;
+        and rax, 0xFF;
+        shl rax, 8;
+        mov r11, r13;
+        and r11, 0xFF;
+        shl r11, 16;
+        or  rax, r11;
+        mov r11, rbp;
+        and r11, 0xFF;
+        shl r11, 24;
+        or  rax, r11;
+        mov r11, 1;
+        shl r11, 56;
+        or  rax, r11;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  r14;
+        mov [r10 + 16], r15;
+        xor rax, rax;
+        mov [r10 + 24], rax;
+
+        mov rdi, 0;                      // BINDS
+        call ppgb_note;
+
+        mov rax, rbx;
+        jmp ppgb_b_out;
+
+      ppgb_b_bad_vm:
+        mov rdi, 3;
+        call ppgb_note;
+        mov rax, 0xFFFFF5DF;
+        jmp ppgb_b_out;
+      ppgb_b_bad_bo:
+        mov rdi, 3;
+        call ppgb_note;
+        mov rax, 0xFFFFF5DE;
+        jmp ppgb_b_out;
+      ppgb_b_bad_va:
+        mov rdi, 3;
+        call ppgb_note;
+        mov rax, 0xFFFFF5DD;
+        jmp ppgb_b_out;
+      ppgb_b_bad_span:
+        mov rdi, 3;
+        call ppgb_note;
+        mov rax, 0xFFFFF5DC;
+        jmp ppgb_b_out;
+      ppgb_b_bad_prot:
+        mov rdi, 3;
+        call ppgb_note;
+        mov rax, 0xFFFFF5DB;
+        jmp ppgb_b_out;
+      ppgb_b_overlap:
+        mov rdi, 2;                      // OVERLAPS
+        call ppgb_note;
+        mov rax, 0xFFFFF5DA;
+        jmp ppgb_b_out;
+      ppgb_b_enospc:
+        mov rdi, 3;
+        call ppgb_note;
+        mov rax, 0xFFFFF5D9;
+
+      ppgb_b_out:
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let ppgb_unbind : (u64) -> u64 !{mem} @{} =
+    fn (binding_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-003 (#1269): release one PPGTT binding. Labels prefixed ppgb_u_.",
+      block: {
+        cmp rdi, 16;
+        jae ppgb_u_bad_id;
+        lea r10, [rip + _ppgb_table];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  ppgb_u_already;
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+
+        push rdi;
+        mov rdi, 1;                      // UNBINDS
+        call ppgb_note;
+        pop rdi;
+
+        xor rax, rax;
+        ret;
+      ppgb_u_bad_id:
+        push rdi;
+        mov rdi, 3;
+        call ppgb_note;
+        pop rdi;
+        mov rax, 0xFFFFF5D8;
+        ret;
+      ppgb_u_already:
+        push rdi;
+        mov rdi, 3;
+        call ppgb_note;
+        pop rdi;
+        mov rax, 0xFFFFF5D7;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Row accessors.
+  // ==========================================================================
+
+  pub let ppgb_binding_valid : (u64) -> u64 !{mem} @{} =
+    fn (bid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-003 (#1269): 1 iff binding is live. Labels prefixed ppgb_bv_.",
+      block: {
+        cmp rdi, 16;
+        jae ppgb_bv_no;
+        lea r10, [rip + _ppgb_table];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  ppgb_bv_no;
+        mov rax, 1;
+        ret;
+      ppgb_bv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let ppgb_binding_vm : (u64) -> u64 !{mem} @{} =
+    fn (bid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-003 (#1269): vm_row_id. Labels prefixed ppgb_bvm_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call ppgb_binding_valid;
+        cmp rax, 0;
+        je  ppgb_bvm_bad;
+        lea r10, [rip + _ppgb_table];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 8;
+        and rax, 0xFF;
+        jmp ppgb_bvm_out;
+      ppgb_bvm_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      ppgb_bvm_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let ppgb_binding_bo : (u64) -> u64 !{mem} @{} =
+    fn (bid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-003 (#1269): bo_row_id. Labels prefixed ppgb_bbo_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call ppgb_binding_valid;
+        cmp rax, 0;
+        je  ppgb_bbo_bad;
+        lea r10, [rip + _ppgb_table];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 16;
+        and rax, 0xFF;
+        jmp ppgb_bbo_out;
+      ppgb_bbo_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      ppgb_bbo_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let ppgb_binding_va : (u64) -> u64 !{mem} @{} =
+    fn (bid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-003 (#1269): va. Labels prefixed ppgb_bva_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call ppgb_binding_valid;
+        cmp rax, 0;
+        je  ppgb_bva_bad;
+        lea r10, [rip + _ppgb_table];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        jmp ppgb_bva_out;
+      ppgb_bva_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      ppgb_bva_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let ppgb_binding_span : (u64) -> u64 !{mem} @{} =
+    fn (bid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-003 (#1269): span. Labels prefixed ppgb_bsp_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call ppgb_binding_valid;
+        cmp rax, 0;
+        je  ppgb_bsp_bad;
+        lea r10, [rip + _ppgb_table];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        jmp ppgb_bsp_out;
+      ppgb_bsp_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      ppgb_bsp_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let ppgb_binding_prot : (u64) -> u64 !{mem} @{} =
+    fn (bid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-003 (#1269): protection ordinal. Labels prefixed ppgb_bp_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call ppgb_binding_valid;
+        cmp rax, 0;
+        je  ppgb_bp_bad;
+        lea r10, [rip + _ppgb_table];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 24;
+        and rax, 0xFF;
+        jmp ppgb_bp_out;
+      ppgb_bp_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      ppgb_bp_out:
+        pop r12;
+        ret
+      }
+    }
+}

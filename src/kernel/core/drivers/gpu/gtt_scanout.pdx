@@ -1,0 +1,615 @@
+// src/kernel/core/drivers/gpu/gtt_scanout.pdx — R37.M4-005 (#1271)
+//
+// Global GTT (GGTT) for scanout buffers -- single-level page table
+// shared by CPU-side scan-out mapping and the display engine.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// The Iris Xe display engine (which the R36 substrate drives) fetches
+// scan-out pixels through the GLOBAL GTT -- a single-level 4 KiB-page
+// table that maps GTT virtual addresses to physical frames.  Unlike
+// the PPGTT this module IS a single-level table (no PML4 / PDPT / PD
+// levels), because the display engine's fetch address is a straight
+// index into a fixed-width table programmed at MMIO offset the display
+// engine's DPLC block owns.
+//
+// It is the DECISION SITE for "does this GTT address name a BO the
+// display engine may fetch."  The compositor's plane commit (R36.M4)
+// asks this module to map a BO into GTT and receives a GTT VA to
+// program into the plane's SURFACE register.  A second GTT would let
+// one display engine fetch from a table another compositor did not
+// program, and the two would tear on scan-out.
+//
+// IT DOES NOT ALLOCATE THE UNDERLYING PAGE-TABLE FRAMES; the R37.M1
+// MMIO substrate owns the GTT bar mapping and this module records the
+// bookkeeping.  IT DOES NOT WRITE MMIO; the R37.M1 owner takes the
+// (gtt_index, frame_pa) tuple this module produces and issues the
+// write.
+//
+// =============================================================================
+// §1  GTT PTE LAYOUT (INTEL VOL 3 §5.6, XE1)
+// =============================================================================
+//
+// The GTT is a single-level table.  Each entry is 8 bytes wide.  For a
+// 4 KiB page the entry is:
+//
+//   bit  0        VALID
+//   bit  1        CACHEABLE (LLC)
+//   bits [11: 3]  reserved zero (small-page)
+//   bits [51:12]  physical frame address
+//   bits [63:52]  reserved zero
+//
+// SCAN-OUT ONLY: this module composes GTT entries with the SCAN-OUT
+// discipline (VALID=1, CACHEABLE=0 to avoid coherency traffic on the
+// display fetch path).  Non-scan-out GTT mappings live under a
+// separate future module.
+//
+// =============================================================================
+// §2  THE BOOKKEEPING TABLE
+// =============================================================================
+//
+// One entry per scan-out mapping:
+//
+//   [+0]  in_use[63:56] | bo_row_id[15:8]
+//   [+8]  gtt_index (u32) -- physical GTT entry number
+//   [+16] frame_pa  (u64) -- backing frame the display engine fetches
+//   [+24] pad
+//
+// GTT INDEX is a u32 -- the actual on-hardware GTT is up to 4 GiB on
+// Xe1 (2^20 entries * 4 KiB pages).  8 mapping slots per boot -- the
+// panel takes at most 4 scan-out surfaces on double-buffered rotation
+// (primary + overlay + cursor + one staging) times two frames of
+// simultaneous validity during flip.
+//
+// =============================================================================
+// §3  AUDIT ON WRITE
+// =============================================================================
+//
+// Every gtts_map / gtts_unmap emits an audit tuple through
+// drv_audit_emit so an operator investigating a scan-out tear has a
+// timestamped log of which BOs were mapped to which GTT indices.  The
+// audit is the SAME entry point the R37.M3 BO substrate uses, so the
+// operator's grep pattern is unchanged.
+//
+// =============================================================================
+// §4  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _gtts_table and _gtts_stats are written only by helpers in this
+// module.  tools/build.sh confines relocations against each to
+// core/drivers/gpu/gtt_scanout.o.
+//
+// =============================================================================
+// §5  FAILURE TAXONOMY 0xFFFFF5B0..0xFFFFF5BF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent free bands above: ppgtt_prot
+// 0xFFFFF5C0..CF, ppgtt_bind 0xFFFFF5D0..DF, ppgtt_walker
+// 0xFFFFF5E0..EF, kind_gpu_vm 0xFFFFF5F0..FF).
+
+module GttScanout = structure {
+
+  // §1: PTE bit masks.
+  pub let GTTS_PTE_VALID     : u64 = 0x1
+  pub let GTTS_PTE_CACHEABLE : u64 = 0x2
+  pub let GTTS_PA_SHIFT      : u64 = 12
+
+  // Failure taxonomy -- 0xFFFFF5B0..0xFFFFF5BF.
+  pub let GTTS_OK            : u64 = 0
+  pub let GTTS_BAD_BO        : u64 = 0xFFFFF5BF
+  pub let GTTS_BAD_INDEX     : u64 = 0xFFFFF5BE
+  pub let GTTS_BAD_FRAME     : u64 = 0xFFFFF5BD
+  pub let GTTS_BAD_ARG       : u64 = 0xFFFFF5BC
+  pub let GTTS_ENOSPC        : u64 = 0xFFFFF5BB
+  pub let GTTS_INDEX_IN_USE  : u64 = 0xFFFFF5BA
+  pub let GTTS_BAD_ID        : u64 = 0xFFFFF5B9
+  pub let GTTS_UNMAP_ALREADY : u64 = 0xFFFFF5B8
+
+  pub let GTTS_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let GTTS_NONE       : u64 = 0xFF
+
+  // 8 mappings * 32 bytes = 256 bytes as [u64; 32].
+  pub let GTTS_MAX       : u64 = 8
+  pub let GTTS_ROW_BYTES : u64 = 32
+
+  // Hardware GTT index ceiling for Xe1 -- 2^20 entries (4 GiB / 4 KiB).
+  pub let GTTS_INDEX_MAX : u64 = 0x100000
+
+  pub let mut _gtts_table : [u64; 32] = uninit @align(64)
+  pub let mut _gtts_stats : [u64; 8]  = uninit @align(64)
+
+  pub let GTTS_ST_MAPS    : u64 = 0
+  pub let GTTS_ST_UNMAPS  : u64 = 1
+  pub let GTTS_ST_REFUSED : u64 = 2
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let gtt_scanout_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-005 (#1271): clear GTT scan-out mapping table + counters. Boot and teardown only. Labels prefixed gtts_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _gtts_table];
+        xor rcx, rcx;
+      gtts_rs_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  gtts_rs_rows;
+
+        lea r10, [rip + _gtts_stats];
+        xor rcx, rcx;
+      gtts_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  gtts_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Counters.
+  // ==========================================================================
+
+  pub let gtts_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-005 (#1271): counter bump. Labels prefixed gtts_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae gtts_nt_out;
+        lea r10, [rip + _gtts_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      gtts_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let gtts_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-005 (#1271): counter read. Labels prefixed gtts_st_.",
+      block: {
+        cmp rdi, 8;
+        jae gtts_st_zero;
+        lea r10, [rip + _gtts_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      gtts_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Validators.
+  // ==========================================================================
+
+  pub let gtts_index_valid : (u64) -> u64 !{} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M4-005 (#1271): 1 iff idx < GTTS_INDEX_MAX. Labels prefixed gtts_iv_.",
+      block: {
+        mov r10, 0x100000;
+        cmp rdi, r10;
+        jae gtts_iv_no;
+        mov rax, 1;
+        ret;
+      gtts_iv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let gtts_frame_valid : (u64) -> u64 !{} @{} =
+    fn (pa: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M4-005 (#1271): 1 iff pa is 4K-aligned AND fits [51:12]. Labels prefixed gtts_fv_.",
+      block: {
+        mov r10, 0xFFF;
+        and r10, rdi;
+        cmp r10, 0;
+        jne gtts_fv_no;
+        mov r10, 1;
+        shl r10, 52;
+        cmp rdi, r10;
+        jae gtts_fv_no;
+        mov rax, 1;
+        ret;
+      gtts_fv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // gtts_pte_compose(frame_pa) -> pte
+  //
+  // Scan-out discipline: VALID=1, CACHEABLE=0.  Consumers that want a
+  // cacheable mapping use a future non-scan-out helper; this module
+  // will not compose one.
+  // ==========================================================================
+
+  pub let gtts_pte_compose : (u64) -> u64 !{} @{} =
+    fn (frame_pa: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M4-005 (#1271): scan-out GTT PTE = VALID | frame_pa. Refuses bad frame. Labels prefixed gtts_pc_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+
+        call gtts_frame_valid;
+        cmp rax, 0;
+        je  gtts_pc_bad;
+
+        mov rax, r12;
+        or  rax, 0x1;                    // VALID
+        jmp gtts_pc_out;
+      gtts_pc_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      gtts_pc_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gtts_find_by_index(gtt_index) -> mapping_id | NONE
+  // ==========================================================================
+
+  pub let gtts_find_by_index : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-005 (#1271): mapping id holding this GTT index, or NONE. Labels prefixed gtts_fi_.",
+      block: {
+        xor rcx, rcx;
+      gtts_fi_scan:
+        cmp rcx, 8;
+        jae gtts_fi_none;
+        lea r10, [rip + _gtts_table];
+        mov r11, rcx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  gtts_fi_next;
+        mov rax, [r10 + 8];
+        cmp rax, rdi;
+        je  gtts_fi_hit;
+      gtts_fi_next:
+        add rcx, 1;
+        jmp gtts_fi_scan;
+      gtts_fi_hit:
+        mov rax, rcx;
+        ret;
+      gtts_fi_none:
+        mov rax, 0xFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // gtts_map_inner(bo_row_id, gtt_index, frame_pa) -> mapping_id | error
+  //
+  // Records one BO-to-GTT-index scan-out mapping.  THE ONE WRITER of
+  // _gtts_table.  Refuses if the GTT index is already in use by a
+  // different live mapping (INDEX_IN_USE).
+  // ==========================================================================
+
+  pub let gtts_map_inner : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (bo_row_id: u64) (gtt_index: u64) (frame_pa: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-005 (#1271): record one scan-out GTT mapping. Labels prefixed gtts_m_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // bo_row_id
+        mov r13, rsi;                    // gtt_index
+        mov r14, rdx;                    // frame_pa
+
+        cmp r12, 0xFF;
+        ja  gtts_m_bad_bo;
+
+        mov rdi, r13;
+        call gtts_index_valid;
+        cmp rax, 0;
+        je  gtts_m_bad_index;
+
+        mov rdi, r14;
+        call gtts_frame_valid;
+        cmp rax, 0;
+        je  gtts_m_bad_frame;
+
+        mov rdi, r13;
+        call gtts_find_by_index;
+        cmp rax, 0xFF;
+        jne gtts_m_in_use;
+
+        xor rbx, rbx;
+      gtts_m_scan:
+        cmp rbx, 8;
+        jae gtts_m_enospc;
+        lea r10, [rip + _gtts_table];
+        mov r11, rbx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  gtts_m_claim;
+        add rbx, 1;
+        jmp gtts_m_scan;
+
+      gtts_m_claim:
+        // hdr = in_use=1 | bo_row_id[15:8].
+        mov rax, r12;
+        and rax, 0xFF;
+        shl rax, 8;
+        mov r11, 1;
+        shl r11, 56;
+        or  rax, r11;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  r13;
+        mov [r10 + 16], r14;
+        xor rax, rax;
+        mov [r10 + 24], rax;
+
+        mov rdi, 0;                      // MAPS
+        call gtts_note;
+
+        mov rax, rbx;
+        jmp gtts_m_out;
+
+      gtts_m_bad_bo:
+        mov rdi, 2;
+        call gtts_note;
+        mov rax, 0xFFFFF5BF;
+        jmp gtts_m_out;
+      gtts_m_bad_index:
+        mov rdi, 2;
+        call gtts_note;
+        mov rax, 0xFFFFF5BE;
+        jmp gtts_m_out;
+      gtts_m_bad_frame:
+        mov rdi, 2;
+        call gtts_note;
+        mov rax, 0xFFFFF5BD;
+        jmp gtts_m_out;
+      gtts_m_in_use:
+        mov rdi, 2;
+        call gtts_note;
+        mov rax, 0xFFFFF5BA;
+        jmp gtts_m_out;
+      gtts_m_enospc:
+        mov rdi, 2;
+        call gtts_note;
+        mov rax, 0xFFFFF5BB;
+
+      gtts_m_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let gtts_map : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (bo_row_id: u64) (gtt_index: u64) (frame_pa: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R37.M4-005 (#1271): audited scan-out map. §3.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;
+        mov r13, rsi;
+        mov r14, rdx;
+
+        call gtts_map_inner;
+        mov r15, rax;
+
+        mov rdi, 1;                      // op ordinal (MAP)
+        mov rsi, 0x175;                  // subsystem tag: GPU VM tree
+        mov rdx, r12;
+        mov rcx, r13;
+        mov r8,  r15;
+        call drv_audit_emit;
+
+        mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  pub let gtts_unmap_inner : (u64) -> u64 !{mem} @{} =
+    fn (mapping_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-005 (#1271): release one scan-out GTT mapping. Labels prefixed gtts_u_.",
+      block: {
+        cmp rdi, 8;
+        jae gtts_u_bad_id;
+        lea r10, [rip + _gtts_table];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  gtts_u_already;
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+
+        push rdi;
+        mov rdi, 1;                      // UNMAPS
+        call gtts_note;
+        pop rdi;
+
+        xor rax, rax;
+        ret;
+      gtts_u_bad_id:
+        push rdi;
+        mov rdi, 2;
+        call gtts_note;
+        pop rdi;
+        mov rax, 0xFFFFF5B9;
+        ret;
+      gtts_u_already:
+        push rdi;
+        mov rdi, 2;
+        call gtts_note;
+        pop rdi;
+        mov rax, 0xFFFFF5B8;
+        ret
+      }
+    }
+
+  pub let gtts_unmap : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (mapping_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R37.M4-005 (#1271): audited scan-out unmap.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+
+        call gtts_unmap_inner;
+        mov r13, rax;
+
+        mov rdi, 2;                      // op ordinal (UNMAP)
+        mov rsi, 0x175;
+        mov rdx, r12;
+        mov rcx, r12;
+        mov r8,  r13;
+        call drv_audit_emit;
+
+        mov rax, r13;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Row accessors.
+  // ==========================================================================
+
+  pub let gtts_mapping_valid : (u64) -> u64 !{mem} @{} =
+    fn (mid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-005 (#1271): 1 iff mapping is live. Labels prefixed gtts_mv_.",
+      block: {
+        cmp rdi, 8;
+        jae gtts_mv_no;
+        lea r10, [rip + _gtts_table];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  gtts_mv_no;
+        mov rax, 1;
+        ret;
+      gtts_mv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let gtts_mapping_bo : (u64) -> u64 !{mem} @{} =
+    fn (mid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-005 (#1271): bo_row_id. Labels prefixed gtts_mb_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call gtts_mapping_valid;
+        cmp rax, 0;
+        je  gtts_mb_bad;
+        lea r10, [rip + _gtts_table];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 8;
+        and rax, 0xFF;
+        jmp gtts_mb_out;
+      gtts_mb_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      gtts_mb_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let gtts_mapping_index : (u64) -> u64 !{mem} @{} =
+    fn (mid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-005 (#1271): gtt_index. Labels prefixed gtts_mi_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call gtts_mapping_valid;
+        cmp rax, 0;
+        je  gtts_mi_bad;
+        lea r10, [rip + _gtts_table];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        jmp gtts_mi_out;
+      gtts_mi_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      gtts_mi_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let gtts_mapping_frame : (u64) -> u64 !{mem} @{} =
+    fn (mid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-005 (#1271): frame_pa. Labels prefixed gtts_mf_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call gtts_mapping_valid;
+        cmp rax, 0;
+        je  gtts_mf_bad;
+        lea r10, [rip + _gtts_table];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        jmp gtts_mf_out;
+      gtts_mf_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      gtts_mf_out:
+        pop r12;
+        ret
+      }
+    }
+}

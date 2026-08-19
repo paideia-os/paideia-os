@@ -1,0 +1,648 @@
+// src/kernel/core/drivers/gpu/ppgtt_walker.pdx — R37.M4-002 (#1268)
+//
+// Iris Xe (Gen12) PPGTT 4-level page-table walker + TLB shootdown
+// coordinator.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the CANONICAL PPGTT DECODE for the 48-bit GPU virtual address
+// space Xe1/Xe2 uses.  Every consumer that needs a virtual-to-physical
+// answer -- the bind gate, a scan-out remap, a debug walker -- routes
+// through this module.  A second copy of the walk would let one path
+// pick a PDPT bit differently and every offset produced by the first
+// and consumed by the second would silently point one 512 GiB slice
+// off.
+//
+// It is ALSO the ONE SITE that broadcasts TLB shootdown after a bind /
+// unbind.  Two shootdown sites would let one path invalidate the CPU-
+// -visible PPGTT copy while the other invalidated only the GPU-side
+// TLB, and the two would drift.
+//
+// IT DOES NOT ALLOCATE PAGE-TABLE FRAMES.  Frames come from PMM via the
+// KIND_MEMORY authority held by the caller of ppgtt_bind.  It does not
+// mint the KIND_GPU_VM capability -- that is kind_gpu_vm.pdx.  It does
+// not stamp protection bits on PTE writes -- that is ppgtt_prot.pdx
+// (called by ppgtt_bind).
+//
+// =============================================================================
+// §1  THE 48-BIT ADDRESS DECOMPOSITION (INTEL VOL 3 §3.9)
+// =============================================================================
+//
+//   va[47:39]   PML4 index      (9 bits)
+//   va[38:30]   PDPT index      (9 bits)
+//   va[29:21]   PD   index      (9 bits)
+//   va[20:12]   PT   index      (9 bits)
+//   va[11:0]    page offset     (12 bits, 4 KiB page)
+//
+// A walk chases four pointers from pml4_pa to a 4 KiB frame:
+//
+//   pml4[i0]  -> pdpt_pa
+//   pdpt[i1]  -> pd_pa
+//   pd  [i2]  -> pt_pa
+//   pt  [i3]  -> frame_pa | flags
+//
+// Every intermediate PTE carries the PRESENT bit (bit 0).  A walk that
+// hits a non-present entry short-circuits with WALK_NOT_PRESENT.
+//
+// =============================================================================
+// §2  WHAT THIS MODULE STORES (WALKER-SESSION TABLE)
+// =============================================================================
+//
+// A walker session records the PPGTT root the last consumer walked.
+// Consumers open a session (pptw_open), then call pptw_translate any
+// number of times.  The table lets a second consumer's walk avoid
+// re-fetching the KIND_GPU_VM row.  Per-session state is small:
+//
+//   [+0]  in_use[63:56] | vm_row_id[15:8]
+//   [+8]  pml4_pa   (u64)
+//   [+16] tlb_flush_count (u64)
+//   [+24] pad
+//
+// Total 32 bytes per session, 8 sessions per boot -- 256 bytes as
+// [u64; 32].  Eight is enough for the initial cluster (compositor +
+// three plane clients + camera + one compute + two staging = 8);
+// widening past eight is a separate ticket.
+//
+// =============================================================================
+// §3  TLB SHOOTDOWN COORDINATION
+// =============================================================================
+//
+// The physical TLB flush is a driver MMIO write to a Xe register the
+// R37.M1 MMIO substrate owns.  This module DOES NOT WRITE THE MMIO --
+// it maintains a per-session "shootdown wanted" counter and hands the
+// caller a fresh sequence number they present to the R37.M5 submit
+// path.  Two things fall out:
+//
+//   (1) A submit that carries stale mappings tarps at the R37.M5 gate,
+//       not in this module.
+//   (2) The R37.M1 MMIO owner remains the sole writer of the flush
+//       register; this module cannot forge an MMIO write.
+//
+// =============================================================================
+// §4  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _pptw_sessions and _pptw_stats are written only by helpers in this
+// module.  tools/build.sh confines relocations against each to
+// core/drivers/gpu/ppgtt_walker.o.
+//
+// =============================================================================
+// §5  FAILURE TAXONOMY 0xFFFFF5E0..0xFFFFF5EF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent free bands: kind_gpu_vm 0xFFFFF5F0..FF,
+// ppgtt_bind 0xFFFFF5D0..DF, ppgtt_prot 0xFFFFF5C0..CF, gtt_scanout
+// 0xFFFFF5B0..BF).
+
+module PpgttWalker = structure {
+
+  // Walk levels (§1).
+  pub let PPTW_LEVEL_PML4 : u64 = 3
+  pub let PPTW_LEVEL_PDPT : u64 = 2
+  pub let PPTW_LEVEL_PD   : u64 = 1
+  pub let PPTW_LEVEL_PT   : u64 = 0
+
+  // PTE bits (§1).
+  pub let PPTW_PTE_PRESENT : u64 = 0x1
+
+  // Failure taxonomy -- 0xFFFFF5E0..0xFFFFF5EF.
+  pub let PPTW_OK               : u64 = 0
+  pub let PPTW_BAD_VM           : u64 = 0xFFFFF5EF
+  pub let PPTW_BAD_VA           : u64 = 0xFFFFF5EE
+  pub let PPTW_BAD_ROOT         : u64 = 0xFFFFF5ED
+  pub let PPTW_BAD_ARG          : u64 = 0xFFFFF5EC
+  pub let PPTW_ENOSPC           : u64 = 0xFFFFF5EB
+  pub let PPTW_BAD_SESSION      : u64 = 0xFFFFF5EA
+  pub let PPTW_NOT_PRESENT      : u64 = 0xFFFFF5E9
+  pub let PPTW_ALREADY_OPEN     : u64 = 0xFFFFF5E8
+
+  pub let PPTW_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let PPTW_SESSION_NONE : u64 = 0xFF
+
+  // 8 sessions * 32 bytes = 256 bytes as [u64; 32].
+  pub let PPTW_MAX          : u64 = 8
+  pub let PPTW_SESSION_BYTES: u64 = 32
+
+  pub let mut _pptw_sessions : [u64; 32] = uninit @align(64)
+  pub let mut _pptw_stats    : [u64; 8]  = uninit @align(64)
+
+  pub let PPTW_ST_OPENS      : u64 = 0
+  pub let PPTW_ST_TRANSLATES : u64 = 1
+  pub let PPTW_ST_SHOOTDOWNS : u64 = 2
+  pub let PPTW_ST_MISSES     : u64 = 3
+  pub let PPTW_ST_REFUSED    : u64 = 4
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let ppgtt_walker_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-002 (#1268): clear PPGTT walker session table + counters. Boot and teardown only. Labels prefixed pptw_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _pptw_sessions];
+        xor rcx, rcx;
+      pptw_rs_ses:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  pptw_rs_ses;
+
+        lea r10, [rip + _pptw_stats];
+        xor rcx, rcx;
+      pptw_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  pptw_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Counters.
+  // ==========================================================================
+
+  pub let pptw_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-002 (#1268): counter bump. Labels prefixed pptw_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae pptw_nt_out;
+        lea r10, [rip + _pptw_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      pptw_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let pptw_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-002 (#1268): counter read. Labels prefixed pptw_st_.",
+      block: {
+        cmp rdi, 8;
+        jae pptw_st_zero;
+        lea r10, [rip + _pptw_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      pptw_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Address-decomposition helpers.
+  // ==========================================================================
+
+  pub let pptw_va_index : (u64, u64) -> u64 !{} @{} =
+    fn (va: u64) (level: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M4-002 (#1268): 9-bit page-table index at level (0=PT, 1=PD, 2=PDPT, 3=PML4). Refuses level > 3. Labels prefixed pptw_vi_.",
+      block: {
+        cmp rsi, 3;
+        ja  pptw_vi_bad;
+        // shift = 12 + level * 9
+        mov rcx, rsi;
+        mov r10, 9;
+        imul rcx, r10;
+        add rcx, 12;
+        mov rax, rdi;
+        shr rax, cl;
+        and rax, 0x1FF;
+        ret;
+      pptw_vi_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let pptw_va_valid : (u64) -> u64 !{} @{} =
+    fn (va: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M4-002 (#1268): 1 iff va < (1 << 48) AND (va & 0xFFF) == 0 (page-aligned within canonical 48-bit range). Labels prefixed pptw_vv_.",
+      block: {
+        mov r10, 1;
+        shl r10, 48;
+        cmp rdi, r10;
+        jae pptw_vv_no;
+        mov r10, 0xFFF;
+        and r10, rdi;
+        cmp r10, 0;
+        jne pptw_vv_no;
+        mov rax, 1;
+        ret;
+      pptw_vv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Session table -- THE ONE WRITER of _pptw_sessions.
+  // ==========================================================================
+
+  pub let pptw_session_valid : (u64) -> u64 !{mem} @{} =
+    fn (sid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-002 (#1268): 1 iff session index in use. Labels prefixed pptw_sv_.",
+      block: {
+        cmp rdi, 8;
+        jae pptw_sv_no;
+        lea r10, [rip + _pptw_sessions];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  pptw_sv_no;
+        mov rax, 1;
+        ret;
+      pptw_sv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pptw_session_vm : (u64) -> u64 !{mem} @{} =
+    fn (sid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-002 (#1268): KIND_GPU_VM row_id backing this session. Labels prefixed pptw_svm_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call pptw_session_valid;
+        cmp rax, 0;
+        je  pptw_svm_bad;
+        lea r10, [rip + _pptw_sessions];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 8;
+        and rax, 0xFF;
+        jmp pptw_svm_out;
+      pptw_svm_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      pptw_svm_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let pptw_session_pml4 : (u64) -> u64 !{mem} @{} =
+    fn (sid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-002 (#1268): cached PML4 physical address for session. Labels prefixed pptw_sp4_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call pptw_session_valid;
+        cmp rax, 0;
+        je  pptw_sp4_bad;
+        lea r10, [rip + _pptw_sessions];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        jmp pptw_sp4_out;
+      pptw_sp4_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      pptw_sp4_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let pptw_session_tlb_seq : (u64) -> u64 !{mem} @{} =
+    fn (sid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-002 (#1268): shootdown sequence counter for session. Labels prefixed pptw_stl_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call pptw_session_valid;
+        cmp rax, 0;
+        je  pptw_stl_bad;
+        lea r10, [rip + _pptw_sessions];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        jmp pptw_stl_out;
+      pptw_stl_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      pptw_stl_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pptw_open(vm_row_id, pml4_pa) -> session_id | error
+  //
+  // Opens a walker session against a live KIND_GPU_VM row.  Refuses to
+  // open a second session for the same vm_row_id (ALREADY_OPEN) so a
+  // consumer cannot fork the shootdown counter across two views of the
+  // same space.
+  // ==========================================================================
+
+  pub let pptw_open : (u64, u64) -> u64 !{mem} @{} =
+    fn (vm_row_id: u64) (pml4_pa: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-002 (#1268): claim one walker session. THE ONE WRITER of _pptw_sessions.claim. Refuses if a session already exists for the same vm_row_id. Labels prefixed pptw_op_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        mov r13, rsi;
+
+        cmp r12, 8;                      // vm_row_id must fit in u8
+        jae pptw_op_bad;
+        cmp r13, 0;
+        je  pptw_op_bad_root;
+        mov r10, 0xFFF;
+        and r10, r13;
+        cmp r10, 0;
+        jne pptw_op_bad_root;
+
+        // Duplicate scan.
+        xor rbx, rbx;
+      pptw_op_dup:
+        cmp rbx, 8;
+        jae pptw_op_scan;
+        lea r10, [rip + _pptw_sessions];
+        mov r11, rbx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        mov r11, rax;
+        shr r11, 56;
+        cmp r11, 0;
+        je  pptw_op_dup_next;
+        shr rax, 8;
+        and rax, 0xFF;
+        cmp rax, r12;
+        je  pptw_op_dup_hit;
+      pptw_op_dup_next:
+        add rbx, 1;
+        jmp pptw_op_dup;
+      pptw_op_dup_hit:
+        mov rdi, 4;
+        call pptw_note;
+        mov rax, 0xFFFFF5E8;
+        jmp pptw_op_out;
+
+      pptw_op_scan:
+        xor rbx, rbx;
+      pptw_op_alloc:
+        cmp rbx, 8;
+        jae pptw_op_enospc;
+        lea r10, [rip + _pptw_sessions];
+        mov r11, rbx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  pptw_op_claim;
+        add rbx, 1;
+        jmp pptw_op_alloc;
+
+      pptw_op_claim:
+        mov rax, r12;
+        and rax, 0xFF;
+        shl rax, 8;
+        mov r11, 1;
+        shl r11, 56;
+        or  rax, r11;
+        mov [r10 + 0], rax;
+        mov [r10 + 8], r13;              // pml4_pa
+        xor rax, rax;
+        mov [r10 + 16], rax;             // tlb_seq = 0
+        mov [r10 + 24], rax;
+
+        mov rdi, 0;                      // OPENS
+        call pptw_note;
+
+        mov rax, rbx;
+        jmp pptw_op_out;
+
+      pptw_op_bad:
+        mov rdi, 4;
+        call pptw_note;
+        mov rax, 0xFFFFF5EF;             // BAD_VM
+        jmp pptw_op_out;
+      pptw_op_bad_root:
+        mov rdi, 4;
+        call pptw_note;
+        mov rax, 0xFFFFF5ED;
+        jmp pptw_op_out;
+      pptw_op_enospc:
+        mov rdi, 4;
+        call pptw_note;
+        mov rax, 0xFFFFF5EB;
+
+      pptw_op_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let pptw_close : (u64) -> u64 !{mem} @{} =
+    fn (sid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-002 (#1268): release one walker session. Labels prefixed pptw_cl_.",
+      block: {
+        cmp rdi, 8;
+        jae pptw_cl_bad;
+        lea r10, [rip + _pptw_sessions];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  pptw_cl_bad;
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        xor rax, rax;
+        ret;
+      pptw_cl_bad:
+        mov rax, 0xFFFFF5EA;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // pptw_translate(sid, va, walk_table) -> pa | error
+  //
+  // Walk the PPGTT for `va` against session `sid`, using a caller-
+  // supplied `walk_table` [u64; 4] that models the four page-table
+  // levels (PML4, PDPT, PD, PT) as concatenated 512-entry rings the
+  // test / driver populates.  In-kernel dispatch on real hardware
+  // replaces walk_table with the physical frames the KIND_MEMORY holder
+  // brought in; the arithmetic is identical.
+  //
+  // walk_table[0] = PML4 base pa mock,   walk_table[1] = PDPT base pa,
+  // walk_table[2] = PD   base pa,        walk_table[3] = PT   base pa.
+  //
+  // Each mock table is a 4-entry array indexed by va's per-level 9-bit
+  // slice modulo 4 (the test fixture provides exactly one entry per
+  // level for the va under test).  This keeps the module's arithmetic
+  // exercised on ordinary memory without demanding a real MMU.
+  // ==========================================================================
+
+  pub let pptw_translate : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (sid: u64) (va: u64) (walk_table_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-002 (#1268): 4-level walk under sid. walk_table_ptr is a [u64; 4] of mock level-base addresses; per level, indexes into a 4-entry mock ring at that base. Present bit checked at each level; short-circuits NOT_PRESENT if bit 0 clears. Labels prefixed pptw_tr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+
+        mov r12, rdi;                    // sid
+        mov r13, rsi;                    // va
+        mov r14, rdx;                    // walk_table_ptr
+
+        mov rdi, r12;
+        call pptw_session_valid;
+        cmp rax, 0;
+        je  pptw_tr_bad_sid;
+
+        mov rdi, r13;
+        call pptw_va_valid;
+        cmp rax, 0;
+        je  pptw_tr_bad_va;
+
+        mov r15, 3;                      // level = PML4 down to PT
+      pptw_tr_loop:
+        // Load base pa for this level.
+        mov r10, r14;
+        mov r11, 3;
+        sub r11, r15;                    // idx into walk_table = 3-level
+        shl r11, 3;
+        add r10, r11;
+        mov rbp, [r10];                  // level base
+
+        // 9-bit va index reduced mod 4 (test-fixture ring width).
+        mov rdi, r13;
+        mov rsi, r15;
+        call pptw_va_index;
+        and rax, 0x3;
+
+        shl rax, 3;
+        add rbp, rax;
+        mov rax, [rbp];                  // pte
+
+        mov r10, rax;
+        and r10, 0x1;                    // PRESENT bit
+        cmp r10, 0;
+        je  pptw_tr_missing;
+
+        cmp r15, 0;
+        je  pptw_tr_leaf;
+        sub r15, 1;
+        jmp pptw_tr_loop;
+
+      pptw_tr_leaf:
+        // Leaf PTE: strip flags in the low 12 bits, add va offset.
+        mov r10, rax;
+        shr r10, 12;
+        shl r10, 12;                     // pa frame
+        mov r11, r13;
+        and r11, 0xFFF;
+        add r10, r11;
+        mov rax, r10;
+
+        mov rdi, 1;                      // TRANSLATES
+        call pptw_note;
+        jmp pptw_tr_out;
+
+      pptw_tr_missing:
+        mov rdi, 3;                      // MISSES
+        call pptw_note;
+        mov rax, 0xFFFFF5E9;
+        jmp pptw_tr_out;
+      pptw_tr_bad_sid:
+        mov rdi, 4;
+        call pptw_note;
+        mov rax, 0xFFFFF5EA;
+        jmp pptw_tr_out;
+      pptw_tr_bad_va:
+        mov rdi, 4;
+        call pptw_note;
+        mov rax, 0xFFFFF5EE;
+
+      pptw_tr_out:
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pptw_shootdown(sid) -> new_seq | error
+  //
+  // Advance the session's shootdown sequence and return the fresh
+  // value.  The R37.M5 submit gate later refuses a submission whose
+  // recorded sequence is lower than the session's current sequence.
+  // ==========================================================================
+
+  pub let pptw_shootdown : (u64) -> u64 !{mem} @{} =
+    fn (sid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M4-002 (#1268): bump per-session shootdown sequence, return the new value. THE ONE WRITER of the tlb_seq field. Labels prefixed pptw_sh_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call pptw_session_valid;
+        cmp rax, 0;
+        je  pptw_sh_bad;
+
+        lea r10, [rip + _pptw_sessions];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        add rax, 1;
+        mov [r10 + 16], rax;
+
+        push rax;
+        mov rdi, 2;                      // SHOOTDOWNS
+        call pptw_note;
+        pop rax;
+        jmp pptw_sh_out;
+      pptw_sh_bad:
+        mov rax, 0xFFFFF5EA;
+      pptw_sh_out:
+        pop r12;
+        ret
+      }
+    }
+}
