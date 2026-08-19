@@ -3078,6 +3078,44 @@ fi
 echo "[dpy-confine] R36.M1 (Iris Xe display substrate) confined"
 
 # ---------------------------------------------------------------------------
+# R36.M2 (#1239/#1240/#1241/#1242/#1243): display output substrate
+# (KIND_DISPLAY_OUTPUT + topology + EDID + topo channel + HPD).
+#
+# Four modules extend the R36.M1 lattice with the output side. Each
+# owns its own state; tools/build.sh confines relocations against
+# each to its owning object so a second writer cannot forge an output
+# row, restamp a DDI wire type, invent an EDID hash, or fabricate an
+# HPD debounce transition. display_topology_channel is pure packer
+# discipline — no state to confine — but its symbol signatures are
+# pinned in situ.
+DPO_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_display_output.pdx"
+DTOPO_SRC="${REPO_ROOT}/src/kernel/core/drivers/dpy/topology.pdx"
+EDID_SRC="${REPO_ROOT}/src/kernel/core/drivers/dpy/edid.pdx"
+DTC_SRC="${REPO_ROOT}/src/kernel/core/ipc/display_topology_channel.pdx"
+HPD_SRC="${REPO_ROOT}/src/kernel/core/drivers/dpy/hpd_isr.pdx"
+if [[ ! -f "${DPO_SRC}" || ! -f "${DTOPO_SRC}" || ! -f "${EDID_SRC}" \
+        || ! -f "${DTC_SRC}" || ! -f "${HPD_SRC}" ]]; then
+    echo "[dpy-m2-confine] FAIL - one of the R36.M2 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_display_output_table' 'core/cap/kind_display_output.o'
+ec_confine_one '_display_output_stats' 'core/cap/kind_display_output.o'
+ec_confine_one '_dtopo_paths'          'core/drivers/dpy/topology.o'
+ec_confine_one '_dtopo_stats'          'core/drivers/dpy/topology.o'
+ec_confine_one '_edid_state'           'core/drivers/dpy/edid.o'
+ec_confine_one '_edid_stats'           'core/drivers/dpy/edid.o'
+ec_confine_one '_hpd_state'            'core/drivers/dpy/hpd_isr.o'
+ec_confine_one '_hpd_stats'            'core/drivers/dpy/hpd_isr.o'
+ec_confine_one '_hpd_bound'            'core/drivers/dpy/hpd_isr.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_display_output.pdx §3, topology.pdx §4, edid.pdx" >&2
+    echo "  §5 and hpd_isr.pdx §2 for the row/counter one-writer" >&2
+    echo "  discipline." >&2
+    exit 1
+fi
+echo "[dpy-m2-confine] R36.M2 (display output substrate) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
