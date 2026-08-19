@@ -1,0 +1,479 @@
+// src/kernel/core/drivers/gpu/ctx_priority.pdx — R37.M5-004 (#1275)
+//
+// Iris Xe (Gen12) context priority + preemption points.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the CANONICAL PRIORITY / PREEMPTION SITE for the Xe1
+// submission scheduler.  Every submit-path decision that involves
+// "which of two contexts wins the engine" routes through this
+// module.  A second priority comparator would let one path prefer
+// context A over B while another preferred B over A, and a display
+// compositor would flicker on the loser.
+//
+// It is ALSO the ONE SITE that stamps preemption-point ordinals into
+// the batch stream.  Per bspec Xe1 §6.3, a preemptible batch is a
+// sequence of MI_ARB_ON_OFF regions bracketed by MI_ARB_CHECK
+// instructions; a second stamper would let one path arm mid-batch
+// preemption while another disabled it, and a high-priority
+// submission would be delayed by an in-flight low-priority batch.
+//
+// IT DOES NOT WRITE MMIO.  The R37.M1 owner is the sole writer of
+// the arbitration-mode registers -- this module computes the ordinal
+// and the ordering, and hands the R37.M1 owner a (engine_id, mode)
+// tuple.  It does NOT submit LRC (that is execlists.pdx / GuC), and
+// it does NOT mint KIND_GPU_CONTEXT.
+//
+// =============================================================================
+// §1  PRIORITY LEVELS (BSPEC XE1 §6.1)
+// =============================================================================
+//
+// The scheduler exposes a single-byte priority ordinal 0..255 that
+// maps onto four coarse buckets the GPU actually distinguishes:
+//
+//   IDLE     [0..63]     idle-time compute
+//   NORMAL   [64..127]   render / general submission
+//   HIGH     [128..191]  interactive (compositor, input)
+//   URGENT   [192..255]  scan-out, display flip, VR reprojection
+//
+// The buckets are what the arbitration mask consults; the byte-level
+// ordinal is what the scheduler uses to break ties within a bucket
+// (higher wins).  Fine-grained 256 levels give operators a smooth
+// dial without changing the register wiring.
+//
+// =============================================================================
+// §2  PREEMPTION POINTS (BSPEC XE1 §6.3)
+// =============================================================================
+//
+// A preemption point in a batch is a pair of instructions:
+//
+//   MI_ARB_ON       -- arbitration allowed after this instruction
+//   MI_ARB_CHECK    -- arbitration decision point (may preempt)
+//
+// A submission with preemption enabled inserts these pairs at
+// specific opcodes:
+//
+//   after PIPE_CONTROL with CS_STALL      (draining pipe is a natural point)
+//   after MI_BATCH_BUFFER_START            (entering a nested batch)
+//   after 3DSTATE_URB_HS / DS / GS / PS    (URB reallocation is natural)
+//
+// A batch marked NON-PREEMPTIBLE (typically a scan-out flip that
+// must complete atomically) omits the pairs and holds the engine
+// through completion.
+//
+// This module computes the preemption ordinal from a batch descriptor
+// (kind, priority bucket, non-preemptible flag) and returns one of:
+//
+//   CTXPRI_PREEMPT_NEVER   never insert MI_ARB_CHECK
+//   CTXPRI_PREEMPT_MILD    every 64 KiB of batch
+//   CTXPRI_PREEMPT_NORMAL  every 8 KiB of batch (default)
+//   CTXPRI_PREEMPT_HEAVY   every PIPE_CONTROL (URGENT wins ASAP)
+//
+// =============================================================================
+// §3  ONE WRITER OF THE COUNTERS
+// =============================================================================
+//
+// _ctxpri_stats is written only by helpers in this module.
+// tools/build.sh confines relocations against it to
+// core/drivers/gpu/ctx_priority.o.
+//
+// =============================================================================
+// §4  FAILURE TAXONOMY 0xFFFFF570..0xFFFFF57F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used bands: execlists 0xFFFFF580..8F,
+// lrc 0xFFFFF590..9F).
+
+module CtxPriority = structure {
+
+  // §1: priority buckets.
+  pub let CTXPRI_BUCKET_IDLE   : u64 = 0
+  pub let CTXPRI_BUCKET_NORMAL : u64 = 1
+  pub let CTXPRI_BUCKET_HIGH   : u64 = 2
+  pub let CTXPRI_BUCKET_URGENT : u64 = 3
+  pub let CTXPRI_BUCKET_MAX    : u64 = 3
+
+  // §1: bucket thresholds.
+  pub let CTXPRI_BREAK_IDLE_NORMAL   : u64 = 64
+  pub let CTXPRI_BREAK_NORMAL_HIGH   : u64 = 128
+  pub let CTXPRI_BREAK_HIGH_URGENT   : u64 = 192
+
+  // §2: preemption ordinals.
+  pub let CTXPRI_PREEMPT_NEVER  : u64 = 0
+  pub let CTXPRI_PREEMPT_MILD   : u64 = 1
+  pub let CTXPRI_PREEMPT_NORMAL : u64 = 2
+  pub let CTXPRI_PREEMPT_HEAVY  : u64 = 3
+  pub let CTXPRI_PREEMPT_MAX    : u64 = 3
+
+  // Comparison outcomes.
+  pub let CTXPRI_CMP_LT : u64 = 0
+  pub let CTXPRI_CMP_EQ : u64 = 1
+  pub let CTXPRI_CMP_GT : u64 = 2
+
+  // Failure taxonomy -- 0xFFFFF570..0xFFFFF57F.
+  pub let CTXPRI_OK              : u64 = 0
+  pub let CTXPRI_BAD_PRIORITY    : u64 = 0xFFFFF57F
+  pub let CTXPRI_BAD_BUCKET      : u64 = 0xFFFFF57E
+  pub let CTXPRI_BAD_MODE        : u64 = 0xFFFFF57D
+  pub let CTXPRI_BAD_ARG         : u64 = 0xFFFFF57C
+
+  pub let CTXPRI_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+
+  pub let mut _ctxpri_stats : [u64; 8] = uninit @align(64)
+
+  pub let CTXPRI_ST_COMPARES   : u64 = 0
+  pub let CTXPRI_ST_BUCKETS    : u64 = 1
+  pub let CTXPRI_ST_PREEMPTS   : u64 = 2
+  pub let CTXPRI_ST_NONPREEMPT : u64 = 3
+  pub let CTXPRI_ST_REFUSED    : u64 = 4
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let ctx_priority_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-004 (#1275): clear priority counters. Boot and teardown only. Labels prefixed ctxpri_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _ctxpri_stats];
+        xor rcx, rcx;
+      ctxpri_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  ctxpri_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let ctxpri_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-004 (#1275): counter bump. Labels prefixed ctxpri_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae ctxpri_nt_out;
+        lea r10, [rip + _ctxpri_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      ctxpri_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let ctxpri_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-004 (#1275): counter read. Labels prefixed ctxpri_stt_.",
+      block: {
+        cmp rdi, 8;
+        jae ctxpri_stt_zero;
+        lea r10, [rip + _ctxpri_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      ctxpri_stt_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Validators.
+  // ==========================================================================
+
+  pub let ctxpri_priority_valid : (u64) -> u64 !{} @{} =
+    fn (p: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M5-004 (#1275): 1 iff p <= 0xFF (fits u8). Labels prefixed ctxpri_pv_.",
+      block: {
+        cmp rdi, 0xFF;
+        ja  ctxpri_pv_no;
+        mov rax, 1;
+        ret;
+      ctxpri_pv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let ctxpri_bucket_valid : (u64) -> u64 !{} @{} =
+    fn (b: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M5-004 (#1275): 1 iff b <= 3. Labels prefixed ctxpri_bv_.",
+      block: {
+        cmp rdi, 3;
+        ja  ctxpri_bv_no;
+        mov rax, 1;
+        ret;
+      ctxpri_bv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let ctxpri_mode_valid : (u64) -> u64 !{} @{} =
+    fn (m: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M5-004 (#1275): 1 iff m <= 3. Labels prefixed ctxpri_mv_.",
+      block: {
+        cmp rdi, 3;
+        ja  ctxpri_mv_no;
+        mov rax, 1;
+        ret;
+      ctxpri_mv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // ctxpri_to_bucket(priority) -> bucket | DECODE_BAD
+  //
+  // Map a byte-level priority to its coarse bucket per §1.
+  // ==========================================================================
+
+  pub let ctxpri_to_bucket : (u64) -> u64 !{mem} @{} =
+    fn (priority: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-004 (#1275): byte-level priority -> coarse bucket. Labels prefixed ctxpri_tb_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call ctxpri_priority_valid;
+        cmp rax, 0;
+        je  ctxpri_tb_bad;
+
+        push rdi;
+        mov rdi, 1;                      // BUCKETS counter
+        call ctxpri_note;
+        pop rdi;
+
+        mov rdi, r12;
+        cmp rdi, 192;
+        jae ctxpri_tb_urgent;
+        cmp rdi, 128;
+        jae ctxpri_tb_high;
+        cmp rdi, 64;
+        jae ctxpri_tb_normal;
+        xor rax, rax;                    // IDLE
+        jmp ctxpri_tb_out;
+      ctxpri_tb_normal:
+        mov rax, 1;
+        jmp ctxpri_tb_out;
+      ctxpri_tb_high:
+        mov rax, 2;
+        jmp ctxpri_tb_out;
+      ctxpri_tb_urgent:
+        mov rax, 3;
+        jmp ctxpri_tb_out;
+      ctxpri_tb_bad:
+        push rdi;
+        mov rdi, 4;                      // REFUSED
+        call ctxpri_note;
+        pop rdi;
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      ctxpri_tb_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ctxpri_compare(a, b) -> LT | EQ | GT
+  //
+  // Compare two byte-level priorities in the scheduler's sense --
+  // higher priority wins.  Returns CTXPRI_CMP_GT if a > b, LT if a < b,
+  // EQ if equal.  Refuses either side out-of-range with BAD_PRIORITY.
+  // ==========================================================================
+
+  pub let ctxpri_compare : (u64, u64) -> u64 !{mem} @{} =
+    fn (a: u64) (b: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-004 (#1275): compare two priorities. Higher wins. Labels prefixed ctxpri_cm_.",
+      block: {
+        push r12;
+        push r13;
+        mov r12, rdi;
+        mov r13, rsi;
+
+        mov rdi, r12;
+        call ctxpri_priority_valid;
+        cmp rax, 0;
+        je  ctxpri_cm_bad;
+        mov rdi, r13;
+        call ctxpri_priority_valid;
+        cmp rax, 0;
+        je  ctxpri_cm_bad;
+
+        mov rdi, 0;                      // COMPARES
+        call ctxpri_note;
+
+        cmp r12, r13;
+        ja  ctxpri_cm_gt;
+        jb  ctxpri_cm_lt;
+        mov rax, 1;
+        jmp ctxpri_cm_out;
+      ctxpri_cm_gt:
+        mov rax, 2;
+        jmp ctxpri_cm_out;
+      ctxpri_cm_lt:
+        xor rax, rax;
+        jmp ctxpri_cm_out;
+      ctxpri_cm_bad:
+        mov rdi, 4;
+        call ctxpri_note;
+        mov rax, 0xFFFFF57F;
+      ctxpri_cm_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ctxpri_preempt_mode(priority, non_preemptible_flag) -> mode | error
+  //
+  // Compute the preemption ordinal per §2.
+  //
+  //   non_preemptible_flag != 0 -> CTXPRI_PREEMPT_NEVER
+  //   URGENT bucket             -> CTXPRI_PREEMPT_HEAVY
+  //   HIGH bucket               -> CTXPRI_PREEMPT_NORMAL
+  //   NORMAL bucket             -> CTXPRI_PREEMPT_NORMAL
+  //   IDLE bucket               -> CTXPRI_PREEMPT_MILD
+  // ==========================================================================
+
+  pub let ctxpri_preempt_mode : (u64, u64) -> u64 !{mem} @{} =
+    fn (priority: u64) (non_preemptible: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-004 (#1275): compute preemption mode from priority + non-preemptible flag. Labels prefixed ctxpri_pm_.",
+      block: {
+        push r12;
+        push r13;
+        mov r12, rdi;
+        mov r13, rsi;
+
+        mov rdi, r12;
+        call ctxpri_priority_valid;
+        cmp rax, 0;
+        je  ctxpri_pm_bad_priority;
+
+        cmp r13, 0;
+        jne ctxpri_pm_never;
+
+        mov rdi, r12;
+        call ctxpri_to_bucket;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ctxpri_pm_bad_priority;
+
+        cmp rax, 3;
+        je  ctxpri_pm_heavy;
+        cmp rax, 2;
+        je  ctxpri_pm_normal;
+        cmp rax, 1;
+        je  ctxpri_pm_normal;
+        // IDLE bucket
+        mov rax, 1;                      // MILD
+        jmp ctxpri_pm_out_note;
+
+      ctxpri_pm_heavy:
+        mov rax, 3;
+        jmp ctxpri_pm_out_note;
+      ctxpri_pm_normal:
+        mov rax, 2;
+        jmp ctxpri_pm_out_note;
+      ctxpri_pm_never:
+        push rdi;
+        mov rdi, 3;                      // NONPREEMPT counter
+        call ctxpri_note;
+        pop rdi;
+        xor rax, rax;
+        jmp ctxpri_pm_out;
+
+      ctxpri_pm_out_note:
+        push rax;
+        mov rdi, 2;                      // PREEMPTS counter
+        call ctxpri_note;
+        pop rax;
+        jmp ctxpri_pm_out;
+
+      ctxpri_pm_bad_priority:
+        push rdi;
+        mov rdi, 4;
+        call ctxpri_note;
+        pop rdi;
+        mov rax, 0xFFFFF57F;
+
+      ctxpri_pm_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ctxpri_should_preempt(inflight_priority, new_priority) -> 1 | 0 | error
+  //
+  // The core preemption decision.  Preemption fires iff the arriving
+  // submission's bucket is STRICTLY GREATER than the in-flight
+  // submission's bucket -- byte-level ties within the same bucket
+  // do NOT preempt (they wait for the current batch to complete or
+  // for a natural MI_ARB_CHECK point).  Same-bucket byte-level
+  // ordering is a scheduling hint, not a preempt trigger.
+  // ==========================================================================
+
+  pub let ctxpri_should_preempt : (u64, u64) -> u64 !{mem} @{} =
+    fn (inflight: u64) (new: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-004 (#1275): preempt iff arriving bucket > in-flight bucket. Labels prefixed ctxpri_sp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        mov r13, rsi;
+
+        mov rdi, r12;
+        call ctxpri_priority_valid;
+        cmp rax, 0;
+        je  ctxpri_sp_bad;
+        mov rdi, r13;
+        call ctxpri_priority_valid;
+        cmp rax, 0;
+        je  ctxpri_sp_bad;
+
+        mov rdi, r12;
+        call ctxpri_to_bucket;
+        mov rbx, rax;                    // in-flight bucket
+
+        mov rdi, r13;
+        call ctxpri_to_bucket;
+        // rax = new bucket
+
+        cmp rax, rbx;
+        ja  ctxpri_sp_yes;
+        xor rax, rax;
+        jmp ctxpri_sp_out;
+      ctxpri_sp_yes:
+        mov rax, 1;
+        jmp ctxpri_sp_out;
+      ctxpri_sp_bad:
+        mov rdi, 4;
+        call ctxpri_note;
+        mov rax, 0xFFFFF57F;
+
+      ctxpri_sp_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

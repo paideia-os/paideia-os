@@ -3374,6 +3374,40 @@ fi
 echo "[gpu-m4-confine] R37.M4 (GPU virtual-memory substrate) confined"
 
 # ---------------------------------------------------------------------------
+# R37.M5 (#1272/#1273/#1274/#1275): GPU submission-context substrate --
+# KIND_GPU_CONTEXT (kind_gpu_context), Logical Ring Context (lrc),
+# execlists submission (execlists), context priority + preemption
+# (ctx_priority).
+#
+# Four modules open R37.M5 (post-r37-M4).  Each owns its own state;
+# tools/build.sh confines relocations against each to its owning object
+# so a second writer cannot forge a GPU CONTEXT row, restamp an LRC
+# reservation, drift an ELSP inflight count, or restamp a priority
+# counter.
+KGCTX_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_gpu_context.pdx"
+LRC_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/lrc.pdx"
+EXL_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/execlists.pdx"
+CTXPRI_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/ctx_priority.pdx"
+if [[ ! -f "${KGCTX_SRC}" || ! -f "${LRC_SRC}" \
+        || ! -f "${EXL_SRC}" || ! -f "${CTXPRI_SRC}" ]]; then
+    echo "[gpu-m5-confine] FAIL - one of the R37.M5 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_gpu_ctx_table'    'core/cap/kind_gpu_context.o'
+ec_confine_one '_gpu_ctx_stats'    'core/cap/kind_gpu_context.o'
+ec_confine_one '_lrc_table'        'core/drivers/gpu/lrc.o'
+ec_confine_one '_lrc_stats'        'core/drivers/gpu/lrc.o'
+ec_confine_one '_exl_engines'      'core/drivers/gpu/execlists.o'
+ec_confine_one '_exl_stats'        'core/drivers/gpu/execlists.o'
+ec_confine_one '_ctxpri_stats'     'core/drivers/gpu/ctx_priority.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_gpu_context.pdx §2, lrc.pdx §3, execlists.pdx §3," >&2
+    echo "  ctx_priority.pdx §3 for the row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[gpu-m5-confine] R37.M5 (GPU submission-context substrate) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

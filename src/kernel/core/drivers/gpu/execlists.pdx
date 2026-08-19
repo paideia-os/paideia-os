@@ -1,0 +1,660 @@
+// src/kernel/core/drivers/gpu/execlists.pdx — R37.M5-003 (#1274)
+//
+// Iris Xe (Gen12) execlists submission path — kernel-drivable fallback
+// when GuC firmware submission is unavailable or has been disabled.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the CANONICAL EXECLISTS BOOKKEEPING SITE for the Xe1 engines.
+// Every submission that bypasses GuC (either because GuC firmware
+// failed to load or because the operator disabled it) lands here.
+// The GPU exposes a per-engine Execlist Submission Port (ELSP) with
+// two entries (ELEMENT0 and ELEMENT1); a submission writes an LRC
+// descriptor into each slot and the GPU dequeues them in order.  A
+// second bookkeeping site would let one path claim ELSP was idle
+// while the other saw it busy, and the two would race a HEAD/TAIL
+// update against a fresh submission.
+//
+// It is ALSO the ONE SITE that tracks per-engine idle/busy state
+// under execlists mode.  Two idle trackers would let one path submit
+// while the other believed the engine was quiescing, and the LRC
+// swap would drop the pending submission.
+//
+// IT DOES NOT WRITE MMIO.  The R37.M1 MMIO owner is the sole writer
+// of the ELSP registers -- this module maintains the queue state and
+// hands the R37.M1 owner a (engine_id, elsp_addr, element_lo,
+// element_hi) 4-tuple to actually poke into the hardware.
+//
+// IT DOES NOT DECIDE WHICH LRC TO SUBMIT.  The submit scheduler
+// (outside this module) picks the LRC based on ctx_priority (see
+// ctx_priority.pdx) and hands the resulting lrc_id + ctx_row_id to
+// this module.
+//
+// =============================================================================
+// §1  THE ELSP CONTRACT (BSPEC XE1 §5.2)
+// =============================================================================
+//
+// Each engine exposes:
+//
+//   ELSP_ELEMENT0    64-bit descriptor of the primary submission
+//   ELSP_ELEMENT1    64-bit descriptor of the pending submission
+//                    (loads after ELEMENT0 completes)
+//   EXECLIST_STATUS  read-only status word
+//
+// A submission is:
+//
+//   descriptor[63:12]  LRC physical address (page-aligned)
+//   descriptor[11:8]   engine class (mirrors kind_gpu_context)
+//   descriptor[7:4]    context id (matches ctx_row_id)
+//   descriptor[3:0]    valid | mode (bit 0 = valid)
+//
+// The GPU processes ELEMENT0 first, then ELEMENT1 if valid.  A
+// preempt or context-switch fires an interrupt the R37.M1 owner
+// consumes and forwards to this module through exl_note_completion.
+//
+// =============================================================================
+// §2  IDLE / BUSY TRACKING
+// =============================================================================
+//
+// Per engine we track:
+//
+//   busy_flag       1 iff ELSP holds at least one non-completed element
+//   inflight_count  0, 1, or 2
+//   last_lrc_lo     descriptor last written to ELEMENT0 (for debug)
+//   last_lrc_hi     descriptor last written to ELEMENT1 (for debug)
+//
+// A submission increments inflight_count and sets busy_flag; a
+// completion decrements inflight_count and clears busy_flag when it
+// reaches zero.  Refusing a third submission while inflight_count
+// == 2 is the DELIBERATE ELSP saturation gate -- the GPU has no
+// third slot and a third write would silently overwrite ELEMENT1.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _exl_engines and _exl_stats are written only by helpers in this
+// module.  tools/build.sh confines relocations against each to
+// core/drivers/gpu/execlists.o.
+//
+// =============================================================================
+// §4  FAILURE TAXONOMY 0xFFFFF580..0xFFFFF58F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used bands: lrc 0xFFFFF590..9F,
+// ctx_priority 0xFFFFF570..7F).
+
+module Execlists = structure {
+
+  // §1: engine ordinals (mirror kind_gpu_context / lrc).
+  pub let EXL_ENGINE_RENDER  : u64 = 0
+  pub let EXL_ENGINE_BLITTER : u64 = 1
+  pub let EXL_ENGINE_VIDEO   : u64 = 2
+  pub let EXL_ENGINE_MAX     : u64 = 2
+  pub let EXL_ENGINES        : u64 = 3
+
+  // §1: descriptor field shifts / masks.
+  pub let EXL_DESC_VALID_BIT : u64 = 0x1
+  pub let EXL_DESC_MODE_MASK : u64 = 0xF
+  pub let EXL_DESC_CTX_SHIFT : u64 = 4
+  pub let EXL_DESC_ENG_SHIFT : u64 = 8
+  pub let EXL_DESC_PA_SHIFT  : u64 = 12
+
+  // Failure taxonomy -- 0xFFFFF580..0xFFFFF58F.
+  pub let EXL_OK           : u64 = 0
+  pub let EXL_BAD_ENGINE   : u64 = 0xFFFFF58F
+  pub let EXL_BAD_LRC      : u64 = 0xFFFFF58E
+  pub let EXL_BAD_CTX      : u64 = 0xFFFFF58D
+  pub let EXL_SATURATED    : u64 = 0xFFFFF58C     // ELSP already holds 2
+  pub let EXL_IDLE         : u64 = 0xFFFFF58B     // completion with nothing in-flight
+  pub let EXL_BAD_ARG      : u64 = 0xFFFFF58A
+  pub let EXL_NOT_READY    : u64 = 0xFFFFF589     // engine not initialized
+
+  pub let EXL_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // §2: per-engine record -- 32 bytes.
+  //   [+0]  busy_flag[7:0] | inflight[15:8] | init_flag[23:16]
+  //   [+8]  last_lrc_lo (ELEMENT0)
+  //   [+16] last_lrc_hi (ELEMENT1)
+  //   [+24] submit_count (u64)
+  //
+  // Three engines * 32 B = 96 B as [u64; 12].
+  pub let mut _exl_engines : [u64; 12] = uninit @align(64)
+  pub let mut _exl_stats   : [u64; 8]  = uninit @align(64)
+
+  pub let EXL_ST_SUBMITS   : u64 = 0
+  pub let EXL_ST_COMPLETES : u64 = 1
+  pub let EXL_ST_REFUSED   : u64 = 2
+  pub let EXL_ST_SATURATED : u64 = 3
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let execlists_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-003 (#1274): clear per-engine execlists records + counters. Boot and teardown only. Labels prefixed exl_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _exl_engines];
+        xor rcx, rcx;
+      exl_rs_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 12;
+        jb  exl_rs_rows;
+
+        lea r10, [rip + _exl_stats];
+        xor rcx, rcx;
+      exl_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  exl_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Counters.
+  // ==========================================================================
+
+  pub let exl_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-003 (#1274): counter bump. Labels prefixed exl_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae exl_nt_out;
+        lea r10, [rip + _exl_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      exl_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let exl_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-003 (#1274): counter read. Labels prefixed exl_stt_.",
+      block: {
+        cmp rdi, 8;
+        jae exl_stt_zero;
+        lea r10, [rip + _exl_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      exl_stt_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Validators.
+  // ==========================================================================
+
+  pub let exl_engine_valid : (u64) -> u64 !{} @{} =
+    fn (e: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M5-003 (#1274): 1 iff e in {0,1,2}. Labels prefixed exl_ev_.",
+      block: {
+        cmp rdi, 2;
+        ja  exl_ev_no;
+        mov rax, 1;
+        ret;
+      exl_ev_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Engine init: enable the execlists path for one engine.  A submit
+  // to an uninitialized engine returns EXL_NOT_READY.
+  // ==========================================================================
+
+  pub let exl_engine_init : (u64) -> u64 !{mem} @{} =
+    fn (engine_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-003 (#1274): mark engine as execlists-ready. Labels prefixed exl_ei_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call exl_engine_valid;
+        cmp rax, 0;
+        je  exl_ei_bad_engine;
+
+        lea r10, [rip + _exl_engines];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        mov r11, 0xFF0000;
+        or  rax, r11;                    // set init_flag[23:16] to 0xFF
+        mov [r10 + 0], rax;
+
+        xor rax, rax;
+        jmp exl_ei_out;
+
+      exl_ei_bad_engine:
+        mov rdi, 2;
+        call exl_note;
+        mov rax, 0xFFFFF58F;
+      exl_ei_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let exl_engine_ready : (u64) -> u64 !{mem} @{} =
+    fn (engine_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-003 (#1274): 1 iff engine initialized. Labels prefixed exl_er_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call exl_engine_valid;
+        cmp rax, 0;
+        je  exl_er_no;
+
+        lea r10, [rip + _exl_engines];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 16;
+        and rax, 0xFF;
+        cmp rax, 0;
+        je  exl_er_no;
+        mov rax, 1;
+        jmp exl_er_out;
+
+      exl_er_no:
+        xor rax, rax;
+      exl_er_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // exl_descriptor_pack(lrc_pa, engine_id, ctx_row_id) -> descriptor
+  //
+  // Pack an ELSP descriptor per §1.  A caller-facing helper that
+  // ownership of the (LRC, engine, context) mapping the submit path
+  // will wire into ELEMENT0 / ELEMENT1.
+  // ==========================================================================
+
+  pub let exl_descriptor_pack : (u64, u64, u64) -> u64 !{} @{} =
+    fn (lrc_pa: u64) (engine_id: u64) (ctx_row_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M5-003 (#1274): pack ELSP descriptor. Refuses lrc_pa unaligned, engine > 2, ctx > 0xF. Labels prefixed exl_dp_.",
+      block: {
+        // lrc_pa 4K-aligned?
+        mov r10, 0xFFF;
+        and r10, rdi;
+        cmp r10, 0;
+        jne exl_dp_bad;
+        // lrc_pa fits [63:12]?
+        cmp rdi, 0;
+        je  exl_dp_bad;
+        // engine <= 2?
+        cmp rsi, 2;
+        ja  exl_dp_bad;
+        // ctx_row_id fits 4 bits (matches EXL_DESC_CTX)?
+        cmp rdx, 0xF;
+        ja  exl_dp_bad;
+
+        mov rax, rdi;                    // lrc_pa already in [63:12] slot
+        mov r10, rsi;
+        and r10, 0xF;
+        shl r10, 8;
+        or  rax, r10;
+        mov r10, rdx;
+        and r10, 0xF;
+        shl r10, 4;
+        or  rax, r10;
+        or  rax, 0x1;                    // VALID bit
+        ret;
+      exl_dp_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // exl_submit(engine_id, descriptor) -> slot (0 or 1) | error
+  //
+  // Enqueue one submission on the given engine's ELSP.  THE ONE WRITER
+  // of the engine's inflight / busy / last_lrc fields.  Refuses:
+  //   BAD_ENGINE     engine_id > 2
+  //   BAD_ARG        descriptor == DECODE_BAD or valid bit unset
+  //   NOT_READY      engine not initialized
+  //   SATURATED      inflight_count already 2
+  // ==========================================================================
+
+  pub let exl_submit : (u64, u64) -> u64 !{mem} @{} =
+    fn (engine_id: u64) (descriptor: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-003 (#1274): enqueue one submission on engine ELSP. THE ONE WRITER of per-engine inflight / busy / last_lrc. Labels prefixed exl_s_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;                    // engine_id
+        mov r13, rsi;                    // descriptor
+
+        mov rdi, r12;
+        call exl_engine_valid;
+        cmp rax, 0;
+        je  exl_s_bad_engine;
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp r13, r10;
+        je  exl_s_bad_arg;
+        mov r10, r13;
+        and r10, 0x1;                    // VALID bit
+        cmp r10, 0;
+        je  exl_s_bad_arg;
+
+        mov rdi, r12;
+        call exl_engine_ready;
+        cmp rax, 0;
+        je  exl_s_not_ready;
+
+        lea r10, [rip + _exl_engines];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rbx, r10;                    // engine record base
+
+        // inflight_count[15:8]
+        mov rax, [rbx + 0];
+        mov r11, rax;
+        shr r11, 8;
+        and r11, 0xFF;
+        cmp r11, 2;
+        jae exl_s_saturated;
+
+        // Slot decision: 0 iff inflight == 0, else 1.
+        cmp r11, 0;
+        je  exl_s_slot0;
+        // slot1 -- store into last_lrc_hi.
+        mov [rbx + 16], r13;
+        mov rax, 1;
+        jmp exl_s_bump;
+      exl_s_slot0:
+        mov [rbx + 8], r13;
+        xor rax, rax;
+
+      exl_s_bump:
+        push rax;                        // preserve slot value
+        // inflight_count += 1
+        mov rax, [rbx + 0];
+        mov r10, rax;
+        shr r10, 8;
+        and r10, 0xFF;
+        add r10, 1;
+        mov r11, 0xFF00;
+        not r11;
+        and rax, r11;
+        and r10, 0xFF;
+        shl r10, 8;
+        or  rax, r10;
+        // busy_flag = 1
+        or  rax, 0xFF;
+        mov [rbx + 0], rax;
+        // submit_count += 1
+        mov rax, [rbx + 24];
+        add rax, 1;
+        mov [rbx + 24], rax;
+        // global counter
+        mov rdi, 0;                      // SUBMITS
+        call exl_note;
+        pop rax;                         // slot
+        jmp exl_s_out;
+
+      exl_s_bad_engine:
+        mov rdi, 2;
+        call exl_note;
+        mov rax, 0xFFFFF58F;
+        jmp exl_s_out;
+      exl_s_bad_arg:
+        mov rdi, 2;
+        call exl_note;
+        mov rax, 0xFFFFF58A;
+        jmp exl_s_out;
+      exl_s_not_ready:
+        mov rdi, 2;
+        call exl_note;
+        mov rax, 0xFFFFF589;
+        jmp exl_s_out;
+      exl_s_saturated:
+        mov rdi, 3;                      // SATURATED
+        call exl_note;
+        mov rax, 0xFFFFF58C;
+
+      exl_s_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // exl_note_completion(engine_id) -> OK | error
+  //
+  // The R37.M1 MMIO owner routes an ELSP completion interrupt here.
+  // Decrements inflight_count and clears busy_flag when it reaches
+  // zero.  Refuses IDLE if there was nothing in-flight (a stray
+  // interrupt fingerprint).
+  // ==========================================================================
+
+  pub let exl_note_completion : (u64) -> u64 !{mem} @{} =
+    fn (engine_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-003 (#1274): consume one ELSP completion. Labels prefixed exl_nc_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov r12, rdi;
+
+        mov rdi, r12;
+        call exl_engine_valid;
+        cmp rax, 0;
+        je  exl_nc_bad_engine;
+
+        lea r10, [rip + _exl_engines];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rbx, r10;
+
+        mov rax, [rbx + 0];
+        mov r10, rax;
+        shr r10, 8;
+        and r10, 0xFF;
+        cmp r10, 0;
+        je  exl_nc_idle;
+
+        sub r10, 1;
+        mov r11, 0xFF00;
+        not r11;
+        and rax, r11;
+        and r10, 0xFF;
+        shl r10, 8;
+        or  rax, r10;
+        // busy_flag = (inflight > 0) ? 0xFF : 0
+        cmp r10, 0;
+        jne exl_nc_still_busy;
+        mov r11, 0xFF;
+        not r11;
+        and rax, r11;
+        jmp exl_nc_store;
+      exl_nc_still_busy:
+        or  rax, 0xFF;
+      exl_nc_store:
+        mov [rbx + 0], rax;
+
+        mov rdi, 1;                      // COMPLETES
+        call exl_note;
+
+        xor rax, rax;
+        jmp exl_nc_out;
+
+      exl_nc_bad_engine:
+        mov rdi, 2;
+        call exl_note;
+        mov rax, 0xFFFFF58F;
+        jmp exl_nc_out;
+      exl_nc_idle:
+        mov rdi, 2;
+        call exl_note;
+        mov rax, 0xFFFFF58B;
+
+      exl_nc_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Row accessors.
+  // ==========================================================================
+
+  pub let exl_engine_busy : (u64) -> u64 !{mem} @{} =
+    fn (engine_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-003 (#1274): 1 iff engine has in-flight submission(s). Labels prefixed exl_eb_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call exl_engine_valid;
+        cmp rax, 0;
+        je  exl_eb_no;
+        lea r10, [rip + _exl_engines];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        and rax, 0xFF;
+        cmp rax, 0;
+        je  exl_eb_no;
+        mov rax, 1;
+        jmp exl_eb_out;
+      exl_eb_no:
+        xor rax, rax;
+      exl_eb_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let exl_engine_inflight : (u64) -> u64 !{mem} @{} =
+    fn (engine_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-003 (#1274): inflight count 0..2. Labels prefixed exl_ei2_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call exl_engine_valid;
+        cmp rax, 0;
+        je  exl_ei2_bad;
+        lea r10, [rip + _exl_engines];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 8;
+        and rax, 0xFF;
+        jmp exl_ei2_out;
+      exl_ei2_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      exl_ei2_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let exl_engine_last_lo : (u64) -> u64 !{mem} @{} =
+    fn (engine_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-003 (#1274): ELEMENT0 last descriptor. Labels prefixed exl_ell_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call exl_engine_valid;
+        cmp rax, 0;
+        je  exl_ell_bad;
+        lea r10, [rip + _exl_engines];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        jmp exl_ell_out;
+      exl_ell_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      exl_ell_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let exl_engine_last_hi : (u64) -> u64 !{mem} @{} =
+    fn (engine_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-003 (#1274): ELEMENT1 last descriptor. Labels prefixed exl_elh_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call exl_engine_valid;
+        cmp rax, 0;
+        je  exl_elh_bad;
+        lea r10, [rip + _exl_engines];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        jmp exl_elh_out;
+      exl_elh_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      exl_elh_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let exl_engine_submits : (u64) -> u64 !{mem} @{} =
+    fn (engine_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M5-003 (#1274): per-engine submit count. Labels prefixed exl_es_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call exl_engine_valid;
+        cmp rax, 0;
+        je  exl_es_bad;
+        lea r10, [rip + _exl_engines];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 24];
+        jmp exl_es_out;
+      exl_es_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      exl_es_out:
+        pop r12;
+        ret
+      }
+    }
+}
