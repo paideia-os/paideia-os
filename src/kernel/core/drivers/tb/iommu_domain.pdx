@@ -1,0 +1,639 @@
+// src/kernel/core/drivers/tb/iommu_domain.pdx — R35.M4-004 (#1213)
+//
+// TB4 per-dock IOMMU domain allocator. Per D3 of
+// design/roadmap/next-wave-synthesis.md the DMA-domain per-device
+// isolation invariant is the property R35.M4 turns into structure:
+// every dock gets its OWN Intel VT-d Domain-ID / AMD-Vi domain, and
+// the domain maps only the tunnel-path endpoints (PCIe / DP / USB3)
+// that the KIND_TB_ROUTE lattice records. Nothing else in host memory
+// is reachable by the dock's bus master.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the DOMAIN-ALLOCATION BOOKKEEPING half of the IOMMU
+// integration. It:
+//
+//   * Allocates one IOMMU domain per dock from a fixed-capacity table
+//     (16 domains — a machine with more than sixteen simultaneously
+//     attached TB4 docks is a case the operator has bigger questions
+//     about than domain exhaustion). The domain_id number is what
+//     kind_dma_attestation.pdx stores on its row.
+//   * Tracks per-domain state (UNALLOCATED / ALLOCATED / MAPPED /
+//     UNMAPPED). MAPPED is set only after the KIND_TB_ROUTE lattice
+//     for the dock is stable — the tunnel-path endpoints are what
+//     the domain's page-table entries authorise.
+//   * Refuses double-allocation of the same domain_id (IN_USE) and
+//     double-release (NOT_HELD).
+//
+// IT DOES NOT WRITE VT-d ROOT / CONTEXT / SECOND-LEVEL PAGE TABLES.
+// That is the driver's responsibility once R36's IOMMU driver
+// scaffold lands; this module owns the DOMAIN-ID SPACE and the
+// per-dock ↔ domain-id association. The mapping opcodes will call
+// iommu_domain_mark_mapped when they complete successfully.
+//
+// IT DOES NOT DEFEND AGAINST BUS-LEVEL SPOOFING. A malicious device
+// that forges another dock's PCIe requester-ID would defeat the
+// domain-per-dock property; that class of attack is the platform's
+// responsibility (VT-d ACS enforcement, ATS translation-request
+// isolation). This module trusts the requester-ID lookup to be
+// honest.
+//
+// iommu_domain_arbitrated() returns 0 until a live VT-d driver binds
+// this scaffold against real remap register writes.
+//
+// =============================================================================
+// §1  DOMAIN STATE MACHINE
+// =============================================================================
+//
+//   0 UNALLOCATED   the domain slot is free
+//   1 ALLOCATED     iommu_domain_alloc gave the domain to a dock, but
+//                   no consent has been granted yet — the domain is
+//                   claimed but its page-tables are empty (default
+//                   deny)
+//   2 MAPPED        consent granted, the driver walked the KIND_TB_
+//                   ROUTE lattice for this dock and installed the
+//                   tunnel-path mappings
+//   3 UNMAPPED      consent revoked, the driver walked and TORE DOWN
+//                   the mappings; the domain slot is not yet freed,
+//                   because a revoke that raced with an in-flight DMA
+//                   still needs a domain-id to reject on
+//
+// State transitions form a monotone lattice with one deliberate
+// non-monotone case: UNMAPPED -> UNALLOCATED is the release path
+// iommu_domain_release drives once the driver confirms every DMA is
+// quiesced. Every other transition is refused BAD_TRANSITION.
+//
+// =============================================================================
+// §2  DEFAULT-DENY
+// =============================================================================
+//
+// A freshly-allocated domain is EMPTY. The dock cannot reach ANY host
+// memory until iommu_domain_mark_mapped is called, and the caller of
+// mark_mapped is the driver that walked the KIND_TB_ROUTE lattice
+// under a GRANTED attestation. There is no primitive in this module
+// that unblocks the dock in any other order — a domain that never
+// reaches MAPPED reports zero mappings for the dock's whole
+// attachment.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _iommu_domain_table is written only by helpers in this module.
+// tools/build.sh confines relocations against the symbol to
+// `core/drivers/tb/iommu_domain.o`.
+//
+// =============================================================================
+// §4  ERROR CODES 0xFFFFF920..0xFFFFF92F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent free bands: consent_dialog
+// 0xFFFFF930..3F, dma_consent_channel 0xFFFFF940..4F,
+// kind_dma_attestation 0xFFFFF950..5F, consent_revoke
+// 0xFFFFF910..1F).
+
+module IommuDomain = structure {
+
+  // Domain state ordinals (§1).
+  pub let IOMMU_DOM_STATE_UNALLOCATED : u64 = 0
+  pub let IOMMU_DOM_STATE_ALLOCATED   : u64 = 1
+  pub let IOMMU_DOM_STATE_MAPPED      : u64 = 2
+  pub let IOMMU_DOM_STATE_UNMAPPED    : u64 = 3
+  pub let IOMMU_DOM_STATE_MAX         : u64 = 3
+
+  // Domain table: 16 entries of 32 bytes.
+  //   [+0]  header (in_use[63:56] | state[15:8])
+  //   [+8]  dock_id
+  //   [+16] mapped_count (u64; number of live tunnel-path mappings)
+  //   [+24] reserved
+  pub let IOMMU_DOM_MAX       : u64 = 16
+  pub let IOMMU_DOM_ROW_BYTES : u64 = 32
+
+  pub let mut _iommu_domain_table : [u64; 64] = uninit @align(64)
+  pub let mut _iommu_domain_stats : [u64; 8]  = uninit @align(64)
+
+  pub let IOMMU_DOM_ST_ALLOCATED : u64 = 0
+  pub let IOMMU_DOM_ST_MAPPED    : u64 = 1
+  pub let IOMMU_DOM_ST_UNMAPPED  : u64 = 2
+  pub let IOMMU_DOM_ST_RELEASED  : u64 = 3
+  pub let IOMMU_DOM_ST_REJECTS   : u64 = 4
+
+  // Failure taxonomy — 0xFFFFF920..0xFFFFF92F.
+  pub let IOMMU_DOM_OK              : u64 = 0
+  pub let IOMMU_DOM_BAD_ARG         : u64 = 0xFFFFF92F
+  pub let IOMMU_DOM_BAD_DOMAIN_ID   : u64 = 0xFFFFF92E
+  pub let IOMMU_DOM_BAD_DOCK        : u64 = 0xFFFFF92D
+  pub let IOMMU_DOM_BAD_STATE       : u64 = 0xFFFFF92C
+  pub let IOMMU_DOM_BAD_TRANSITION  : u64 = 0xFFFFF92B
+  pub let IOMMU_DOM_ENOSPC          : u64 = 0xFFFFF92A
+  pub let IOMMU_DOM_IN_USE          : u64 = 0xFFFFF929
+  pub let IOMMU_DOM_NOT_HELD        : u64 = 0xFFFFF928
+  pub let IOMMU_DOM_NOT_MAPPED      : u64 = 0xFFFFF927
+
+  pub let IOMMU_DOM_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let IOMMU_DOM_ROW_NONE   : u64 = 0xFF
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let iommu_domain_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M4-004 (#1213): clear domain table + stats. Labels prefixed idm_rs_.",
+      block: {
+        lea r10, [rip + _iommu_domain_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      idm_rs_tab:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 64;
+        jb  idm_rs_tab;
+
+        lea r10, [rip + _iommu_domain_stats];
+        xor rcx, rcx;
+      idm_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  idm_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let iommu_domain_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M4-004 (#1213): honesty pin. Returns 0 until a live VT-d driver binds this scaffold against real remap register writes.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let idm_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M4-004 (#1213): counter bump. Labels prefixed idm_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae idm_nt_out;
+        lea r10, [rip + _iommu_domain_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      idm_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let idm_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M4-004 (#1213): counter read.",
+      block: {
+        cmp rdi, 8;
+        jae idm_st_zero;
+        lea r10, [rip + _iommu_domain_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      idm_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Validators.
+  // ==========================================================================
+
+  pub let idm_dock_valid : (u64) -> u64 !{} @{} =
+    fn (d: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M4-004 (#1213): 1 iff d non-zero and fits in u16.",
+      block: {
+        cmp rdi, 0;
+        je  idm_dv_no;
+        mov r10, 0xFFFF;
+        cmp rdi, r10;
+        ja  idm_dv_no;
+        mov rax, 1;
+        ret;
+      idm_dv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let idm_domain_id_valid : (u64) -> u64 !{} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M4-004 (#1213): 1 iff id < IOMMU_DOM_MAX (=16).",
+      block: {
+        cmp rdi, 16;
+        jae idm_iv_no;
+        mov rax, 1;
+        ret;
+      idm_iv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Lookups.
+  // ==========================================================================
+
+  pub let iommu_domain_find_by_dock : (u64) -> u64 !{mem} @{} =
+    fn (dock_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M4-004 (#1213): return domain_id (row idx) holding this dock, or ROW_NONE. Labels prefixed idm_fd_.",
+      block: {
+        mov rdi, rdi;
+        push rbx;
+        push r12;
+
+        mov r12, rdi;
+        mov rdi, r12;
+        call idm_dock_valid;
+        cmp rax, 0;
+        je  idm_fd_none;
+
+        xor rbx, rbx;
+      idm_fd_scan:
+        cmp rbx, 16;
+        jae idm_fd_none;
+        lea r10, [rip + _iommu_domain_table];
+        mov r11, rbx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  idm_fd_next;
+        mov rax, [r10 + 8];
+        cmp rax, r12;
+        je  idm_fd_hit;
+      idm_fd_next:
+        add rbx, 1;
+        jmp idm_fd_scan;
+      idm_fd_hit:
+        mov rax, rbx;
+        jmp idm_fd_out;
+      idm_fd_none:
+        mov rax, 0xFF;
+      idm_fd_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let iommu_domain_state_of : (u64) -> u64 !{mem} @{} =
+    fn (domain_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M4-004 (#1213): state ordinal (0..3), or DECODE_BAD. Labels prefixed idm_so_.",
+      block: {
+        cmp rdi, 16;
+        jae idm_so_bad;
+        lea r10, [rip + _iommu_domain_table];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  idm_so_free;
+        mov rax, [r10 + 0];
+        shr rax, 8;
+        and rax, 0xFF;
+        ret;
+      idm_so_free:
+        xor rax, rax;
+        ret;
+      idm_so_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let iommu_domain_dock_of : (u64) -> u64 !{mem} @{} =
+    fn (domain_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M4-004 (#1213): dock_id for domain, or DECODE_BAD. Labels prefixed idm_do_.",
+      block: {
+        cmp rdi, 16;
+        jae idm_do_bad;
+        lea r10, [rip + _iommu_domain_table];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  idm_do_bad;
+        mov rax, [r10 + 8];
+        ret;
+      idm_do_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let iommu_domain_mapped_count : (u64) -> u64 !{mem} @{} =
+    fn (domain_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M4-004 (#1213): live mapping count. Labels prefixed idm_mc_.",
+      block: {
+        cmp rdi, 16;
+        jae idm_mc_bad;
+        lea r10, [rip + _iommu_domain_table];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  idm_mc_bad;
+        mov rax, [r10 + 16];
+        ret;
+      idm_mc_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Allocation. Given a dock_id, claim one free domain slot and return
+  // its domain_id (row idx). Refuses if the dock already holds a
+  // domain (IN_USE) or the table is full (ENOSPC).
+  // ==========================================================================
+
+  pub let iommu_domain_alloc : (u64) -> u64 !{mem} @{} =
+    fn (dock_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M4-004 (#1213): allocate one domain for dock_id. Initial state = ALLOCATED (default-deny — no mappings). Labels prefixed idm_al_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov r12, rdi;                    // dock_id
+
+        mov rdi, r12;
+        call idm_dock_valid;
+        cmp rax, 0;
+        je  idm_al_bad_dock;
+
+        // Check for existing.
+        mov rdi, r12;
+        call iommu_domain_find_by_dock;
+        cmp rax, 0xFF;
+        jne idm_al_in_use;
+
+        xor rbx, rbx;
+      idm_al_scan:
+        cmp rbx, 16;
+        jae idm_al_enospc;
+        lea r10, [rip + _iommu_domain_table];
+        mov r11, rbx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  idm_al_claim;
+        add rbx, 1;
+        jmp idm_al_scan;
+
+      idm_al_claim:
+        // hdr: in_use=1 | state=ALLOCATED (1) in byte [15:8].
+        mov rax, 1;
+        shl rax, 56;
+        mov r11, 1;                      // ALLOCATED
+        shl r11, 8;
+        or  rax, r11;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  r12;
+        xor rax, rax;
+        mov [r10 + 16], rax;             // mapped_count = 0
+        mov [r10 + 24], rax;
+
+        mov rdi, 0;                      // ALLOCATED
+        call idm_note;
+
+        mov rax, rbx;                    // domain_id = row idx
+        jmp idm_al_out;
+
+      idm_al_enospc:
+        mov rdi, 4;
+        call idm_note;
+        mov rax, 0xFFFFF92A;
+        jmp idm_al_out;
+      idm_al_in_use:
+        mov rdi, 4;
+        call idm_note;
+        mov rax, 0xFFFFF929;
+        jmp idm_al_out;
+      idm_al_bad_dock:
+        mov rdi, 4;
+        call idm_note;
+        mov rax, 0xFFFFF92D;
+
+      idm_al_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // State transitions. Each one refuses any transition that would
+  // violate the monotone lattice (§1).
+  // ==========================================================================
+
+  pub let iommu_domain_mark_mapped : (u64) -> u64 !{mem} @{} =
+    fn (domain_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M4-004 (#1213): ALLOCATED -> MAPPED. Increments mapped_count as a witness that at least one tunnel-path endpoint is now reachable. Labels prefixed idm_mm_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov r12, rdi;
+
+        cmp r12, 16;
+        jae idm_mm_bad;
+
+        lea r10, [rip + _iommu_domain_table];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  idm_mm_not_held;
+
+        mov rax, [r10 + 0];
+        shr rax, 8;
+        and rax, 0xFF;
+        cmp rax, 1;                      // must be ALLOCATED
+        jne idm_mm_bad_trans;
+
+        // Set state = MAPPED (2), keep in_use bit + parent_slot region.
+        mov rax, [r10 + 0];
+        mov r11, 0xFF00FFFFFFFFFFFF;
+        and rax, r11;
+        mov r11, 2;                      // MAPPED
+        shl r11, 8;
+        or  rax, r11;
+        mov [r10 + 0], rax;
+
+        mov rax, [r10 + 16];
+        add rax, 1;
+        mov [r10 + 16], rax;
+
+        mov rdi, 1;                      // MAPPED
+        call idm_note;
+        xor rax, rax;
+        jmp idm_mm_out;
+
+      idm_mm_bad:
+        mov rax, 0xFFFFF92E;
+        jmp idm_mm_out;
+      idm_mm_not_held:
+        mov rax, 0xFFFFF928;
+        jmp idm_mm_out;
+      idm_mm_bad_trans:
+        mov rax, 0xFFFFF92B;
+
+      idm_mm_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let iommu_domain_mark_unmapped : (u64) -> u64 !{mem} @{} =
+    fn (domain_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M4-004 (#1213): MAPPED -> UNMAPPED. Called by consent_revoke as the final IOMMU step. Zeroes mapped_count as the witness of teardown completion. Idempotent for UNMAPPED (returns OK). Labels prefixed idm_mu_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov r12, rdi;
+
+        cmp r12, 16;
+        jae idm_mu_bad;
+
+        lea r10, [rip + _iommu_domain_table];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  idm_mu_not_held;
+
+        mov rax, [r10 + 0];
+        shr rax, 8;
+        and rax, 0xFF;
+        cmp rax, 3;                      // already UNMAPPED
+        je  idm_mu_ok;
+        cmp rax, 2;                      // must be MAPPED to transition
+        jne idm_mu_bad_trans;
+
+        // Set state = UNMAPPED (3).
+        mov rax, [r10 + 0];
+        mov r11, 0xFF00FFFFFFFFFFFF;
+        and rax, r11;
+        mov r11, 3;
+        shl r11, 8;
+        or  rax, r11;
+        mov [r10 + 0], rax;
+
+        xor rax, rax;
+        mov [r10 + 16], rax;             // mapped_count = 0
+
+        mov rdi, 2;                      // UNMAPPED
+        call idm_note;
+
+      idm_mu_ok:
+        xor rax, rax;
+        jmp idm_mu_out;
+
+      idm_mu_bad:
+        mov rax, 0xFFFFF92E;
+        jmp idm_mu_out;
+      idm_mu_not_held:
+        mov rax, 0xFFFFF928;
+        jmp idm_mu_out;
+      idm_mu_bad_trans:
+        mov rax, 0xFFFFF92B;
+
+      idm_mu_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let iommu_domain_release : (u64) -> u64 !{mem} @{} =
+    fn (domain_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M4-004 (#1213): UNMAPPED -> UNALLOCATED. Frees the slot. Refuses release for anything but UNMAPPED — a MAPPED domain that could be released without unmap first would leak the mappings. Labels prefixed idm_rl_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov r12, rdi;
+
+        cmp r12, 16;
+        jae idm_rl_bad;
+
+        lea r10, [rip + _iommu_domain_table];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  idm_rl_not_held;
+
+        mov rax, [r10 + 0];
+        shr rax, 8;
+        and rax, 0xFF;
+        cmp rax, 3;                      // must be UNMAPPED
+        jne idm_rl_bad_trans;
+
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+
+        mov rdi, 3;                      // RELEASED
+        call idm_note;
+        xor rax, rax;
+        jmp idm_rl_out;
+
+      idm_rl_bad:
+        mov rax, 0xFFFFF92E;
+        jmp idm_rl_out;
+      idm_rl_not_held:
+        mov rax, 0xFFFFF928;
+        jmp idm_rl_out;
+      idm_rl_bad_trans:
+        mov rax, 0xFFFFF92B;
+
+      idm_rl_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

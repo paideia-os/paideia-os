@@ -1,0 +1,506 @@
+// src/kernel/core/drivers/tb/consent_revoke.pdx — R35.M4-005 (#1214)
+//
+// TB4 consent-revocation cascade sequencer. Per D3 of
+// design/roadmap/next-wave-synthesis.md, when a user revokes DMA
+// consent for a dock — through the compositor consent-dialog, an
+// explicit revoke button, or a policy timeout — every capability
+// downstream of the KIND_DMA_ATTESTATION anchor must be swept, and
+// the IOMMU domain must be unmapped as the FINAL step so no
+// downstream KIND_TB_ROUTE reference is left pointing at a live
+// mapping.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the STATE-MACHINE half of consent revocation, and the walker
+// of the cap-revocation cascade the R29.M5 IOMMU-domain machinery
+// established (kind_dma_domain.pdx §3, kind_op_region.pdx §6). Given
+// a KIND_DMA_ATTESTATION cap slot, this scaffold:
+//
+//   1. ATTESTATION STATE — mark the row's consent_state field
+//      REVOKED via dma_attest_row_set_revoked. Idempotent — a second
+//      revoke of the same attestation is a no-op.
+//
+//   2. TB ROUTE CASCADE — walk the KIND_TB_ROUTE table and revoke
+//      every route whose dock is this attestation's dock. For each
+//      route, drive route_teardown_sequence (which itself cascades
+//      to dependent KIND_USB_DEVICE / KIND_TB_DOMAIN through the
+//      owner-axis sweep).
+//
+//   3. IOMMU UNMAP — mark the dock's IOMMU domain UNMAPPED via
+//      iommu_domain_mark_unmapped, then release it via
+//      iommu_domain_release. This is the LAST step because a domain
+//      unmap that ran BEFORE the tunnel teardown would leave live
+//      tunnels pointing at a released mapping — the exact class of
+//      race D3 exists to preclude.
+//
+// IT DOES NOT ISSUE VT-D INVALIDATION PACKETS. That is the driver's
+// responsibility once R36's IOMMU driver scaffold lands; this
+// sequencer owns the CAP-SIDE bookkeeping so the driver's INVALIDATE
+// and the OS's cap sweep cannot interleave in a way that leaves one
+// alive without the other.
+//
+// consent_revoke_arbitrated() returns 0 until a live driver's
+// INVALIDATE completion is wired to this sequencer.
+//
+// =============================================================================
+// §1  ATTESTATION-STATE-FIRST DISCIPLINE
+// =============================================================================
+//
+// The consent_state transition to REVOKED must happen BEFORE the TB
+// route walk and BEFORE the IOMMU unmap, because:
+//
+//   * A cap holder whose row read still reports GRANTED after the
+//     tunnels have been torn would see an attestation that
+//     "authorises" a dock whose reach has already been withdrawn —
+//     the ambiguity the state field exists to prevent.
+//
+//   * A route walk that raced ahead of the state transition would
+//     let a supervisor observing a route being torn but the
+//     attestation still GRANTED conclude the teardown was a
+//     kernel-side transient and race to re-mint routes against the
+//     same (still-GRANTED) attestation — exactly the class of race
+//     the monotone lattice on consent_state precludes.
+//
+// Same discipline route_teardown.pdx uses (§1 of route_teardown.pdx):
+// the state stamp is the fence.
+//
+// =============================================================================
+// §2  CASCADE STAGE MASK
+// =============================================================================
+//
+// consent_revoke_sequence returns a 4-bit mask indicating which
+// stages completed. This is DIAGNOSTIC — the sequence is atomic in
+// the sense that stage N is only attempted after stage N-1 succeeded,
+// so a caller reading a mask != 0b1111 knows exactly which stage
+// refused.
+//
+//   bit 0  ATTESTATION_STATE_REVOKED
+//   bit 1  TB_ROUTE_CASCADE completed (may include zero routes; the
+//          walk always runs even if there are no matching routes,
+//          because "the walker executed" is what the bit records)
+//   bit 2  IOMMU_UNMAP completed
+//   bit 3  IOMMU_RELEASE completed
+//
+// =============================================================================
+// §3  IDEMPOTENCE
+// =============================================================================
+//
+// A repeated revoke of the same attestation cap is a NO-OP:
+//
+//   * dma_attest_row_set_revoked returns OK for an already-REVOKED
+//     row.
+//   * The TB route walk finds zero matching routes (the previous
+//     revoke tore them all down) and completes trivially.
+//   * iommu_domain_mark_unmapped returns OK for an already-UNMAPPED
+//     domain.
+//   * iommu_domain_release refuses UNALLOCATED with BAD_TRANSITION
+//     — the last is intentional: releasing the same domain twice
+//     would let the same domain_id be reused for a different dock
+//     while a race-observing supervisor still holds a stale
+//     reference. The idempotence extends to the SEQUENCE, not to
+//     the release primitive itself.
+//
+// The sequencer detects the idempotent case by checking the
+// attestation's state BEFORE calling dma_attest_row_set_revoked; if
+// it is already REVOKED, the sequencer returns a mask with only bits
+// 0..2 set (skipping RELEASE) and reports IDEMPOTENT.
+//
+// =============================================================================
+// §4  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _consent_revoke_stats is written only by helpers in this module.
+// tools/build.sh confines relocations against the symbol to
+// `core/drivers/tb/consent_revoke.o`.
+//
+// =============================================================================
+// §5  ERROR CODES 0xFFFFF910..0xFFFFF91F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent free bands: iommu_domain
+// 0xFFFFF920..2F, consent_dialog 0xFFFFF930..3F,
+// dma_consent_channel 0xFFFFF940..4F, kind_dma_attestation
+// 0xFFFFF950..5F).
+
+module ConsentRevoke = structure {
+
+  // Failure taxonomy — 0xFFFFF910..0xFFFFF91F.
+  pub let CRV_OK              : u64 = 0
+  pub let CRV_BAD_ARG         : u64 = 0xFFFFF91F
+  pub let CRV_BAD_SLOT        : u64 = 0xFFFFF91E
+  pub let CRV_NOT_ATTEST      : u64 = 0xFFFFF91D
+  pub let CRV_STATE_REFUSED   : u64 = 0xFFFFF91C
+  pub let CRV_ROUTE_REFUSED   : u64 = 0xFFFFF91B
+  pub let CRV_UNMAP_REFUSED   : u64 = 0xFFFFF91A
+  pub let CRV_RELEASE_REFUSED : u64 = 0xFFFFF919
+  pub let CRV_NO_DOMAIN       : u64 = 0xFFFFF918
+
+  // Stage bit mask (§2).
+  pub let CRV_STAGE_STATE   : u64 = 0x1
+  pub let CRV_STAGE_ROUTE   : u64 = 0x2
+  pub let CRV_STAGE_UNMAP   : u64 = 0x4
+  pub let CRV_STAGE_RELEASE : u64 = 0x8
+  pub let CRV_STAGE_ALL     : u64 = 0xF
+  pub let CRV_STAGE_IDEMPOT : u64 = 0x7   // §3 — no RELEASE on repeat
+
+  pub let mut _consent_revoke_stats : [u64; 8] = uninit @align(64)
+
+  pub let CRV_ST_ATTEMPTS    : u64 = 0
+  pub let CRV_ST_COMPLETED   : u64 = 1
+  pub let CRV_ST_IDEMPOTENT  : u64 = 2
+  pub let CRV_ST_ROUTE_HITS  : u64 = 3
+  pub let CRV_ST_REJECTS     : u64 = 4
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let consent_revoke_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M4-005 (#1214): clear stats. Labels prefixed crv_rs_.",
+      block: {
+        lea r10, [rip + _consent_revoke_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      crv_rs_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  crv_rs_loop;
+        ret
+      }
+    } @no_frame
+
+  pub let consent_revoke_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M4-005 (#1214): honesty pin. Returns 0 until wired to a live VT-d INVALIDATE completion path.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let consent_revoke_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M4-005 (#1214): counter read.",
+      block: {
+        cmp rdi, 8;
+        jae crv_st_zero;
+        lea r10, [rip + _consent_revoke_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      crv_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let consent_revoke_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M4-005 (#1214): counter bump. Labels prefixed crv_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae crv_nt_out;
+        lea r10, [rip + _consent_revoke_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      crv_nt_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // TB Route cascade walker.
+  //
+  // For each row in _tb_route_table whose route_key names a route
+  // owned by this dock, call route_teardown_sequence on the
+  // route's cap slot. The mapping from dock_id to route ownership
+  // is: the tb_route's source_adapter is treated as the dock's
+  // adapter, per the KIND_TB_ROUTE §1 discipline. A future refinement
+  // may add an explicit dock_id field to kind_tb_route rows; today
+  // the source_adapter is the anchor.
+  //
+  // This walker does not itself relocate against _tb_route_table
+  // — it uses the tb_route_row_of_slot / tb_route_row_source
+  // accessors — so the one-writer discipline of kind_tb_route.pdx
+  // is preserved (consent_revoke.o carries no relocation against
+  // _tb_route_table).
+  //
+  // Returns the number of routes torn down (used by the stats
+  // counter and by the sequencer's ROUTE_HITS bump). This walker
+  // scans up to 8 slots starting at a caller-supplied base, giving
+  // the fixture a bounded and inspectable walk without a
+  // hard-coded slot range.
+  // ==========================================================================
+
+  pub let consent_revoke_walk_routes : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (dock_source_adapter: u64) (slot_base: u64) (slot_count: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R35.M4-005 (#1214): walk cap_table slots [slot_base, slot_base+slot_count) and tear down every KIND_TB_ROUTE whose source_adapter matches the dock. Returns count of teardowns. Labels prefixed crv_wr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                    // dock_source_adapter
+        mov r13, rsi;                    // slot_base
+        mov r14, rdx;                    // slot_count
+        xor r15, r15;                    // hits
+
+        // Cap slot_count.
+        mov r10, 32;
+        cmp r14, r10;
+        jbe crv_wr_ok_cap;
+        mov r14, r10;
+      crv_wr_ok_cap:
+
+        xor rbx, rbx;
+      crv_wr_scan:
+        cmp rbx, r14;
+        jae crv_wr_done;
+
+        mov rax, r13;
+        add rax, rbx;                    // slot
+        cmp rax, 256;
+        jae crv_wr_next;
+
+        push rax;
+        mov rdi, rax;
+        call tb_route_row_of_slot;
+        mov r10, rax;
+        pop rax;
+        cmp r10, 0xFF;
+        je  crv_wr_next;
+
+        push rax;
+        mov rdi, r10;
+        call tb_route_row_source;
+        mov r11, rax;
+        pop rax;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp r11, r10;
+        je  crv_wr_next;
+        cmp r11, r12;
+        jne crv_wr_next;
+
+        // Teardown this route.
+        mov rdi, rax;                    // slot
+        call route_teardown_sequence;
+        cmp rax, 0x7;                    // STAGE_ALL for teardown
+        jne crv_wr_next;
+        add r15, 1;
+
+      crv_wr_next:
+        add rbx, 1;
+        jmp crv_wr_scan;
+
+      crv_wr_done:
+        mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Sequence: given a KIND_DMA_ATTESTATION cap slot, walk the four-
+  // stage revoke cascade. Args:
+  //   slot        cap slot naming a KIND_DMA_ATTESTATION
+  //   route_base  cap slot range base for the KIND_TB_ROUTE walk
+  //   route_count number of slots to scan (capped at 32)
+  //
+  // Returns the stage mask on success (STAGE_ALL when every stage
+  // completed; STAGE_IDEMPOT when the attestation was already
+  // REVOKED and the release was correctly skipped), an error code
+  // on refusal.
+  //
+  //   * BAD_SLOT         slot >= 256
+  //   * NOT_ATTEST       slot does not name a live KIND_DMA_ATTESTATION
+  //   * STATE_REFUSED    dma_attest_row_set_revoked refused
+  //   * ROUTE_REFUSED    the route walker refused
+  //   * UNMAP_REFUSED    iommu_domain_mark_unmapped refused
+  //   * RELEASE_REFUSED  iommu_domain_release refused
+  //   * NO_DOMAIN        the attestation names an unmapped iommu domain
+  // ==========================================================================
+
+  pub let consent_revoke_sequence : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (slot: u64) (route_base: u64) (route_count: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R35.M4-005 (#1214): four-stage revoke cascade. Snapshot row fields (dock_id, source_adapter proxy) BEFORE state transition so subsequent stages have identity to walk against. Labels prefixed crv_sq_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+
+        mov rbx, rdi;                    // slot
+        mov r12, rsi;                    // route_base
+        mov r13, rdx;                    // route_count
+        xor r15, r15;                    // stage mask
+
+        mov r10, 256;
+        cmp rbx, r10;
+        jae crv_sq_bad_slot;
+
+        mov rdi, 0;                      // ATTEMPTS
+        call consent_revoke_note;
+
+        // Resolve slot -> row_id.
+        mov rdi, rbx;
+        call dma_attest_row_of_slot;
+        cmp rax, 0xFF;
+        je  crv_sq_not_attest;
+        mov r14, rax;                    // row_id
+
+        // Snapshot dock (used both for IOMMU lookup and as the
+        // route-walk key). We treat dock_id as the source_adapter
+        // for the route match since kind_tb_route today anchors on
+        // source_adapter — see §0 of this module.
+        mov rdi, r14;
+        call dma_attest_row_dock;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  crv_sq_state_refused;
+        mov rbp, rax;                    // dock_id (also source_adapter proxy)
+
+        // Idempotent-check: is the attestation already REVOKED?
+        mov rdi, r14;
+        call dma_attest_row_state;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  crv_sq_state_refused;
+        cmp rax, 2;                      // REVOKED
+        je  crv_sq_idempotent;
+
+        // Stage 1: STATE.
+        mov rdi, r14;
+        call dma_attest_row_set_revoked;
+        cmp rax, 0;
+        jne crv_sq_state_refused;
+        or  r15, 0x1;
+
+        // Stage 2: TB ROUTE CASCADE.
+        mov rdi, rbp;                    // dock_id as source_adapter
+        mov rsi, r12;
+        mov rdx, r13;
+        call consent_revoke_walk_routes;
+        // rax = hit count. Even zero counts as completion.
+        mov rdi, 3;                      // ROUTE_HITS
+        cmp rax, 0;
+        je  crv_sq_route_ok;
+        call consent_revoke_note;
+      crv_sq_route_ok:
+        or  r15, 0x2;
+
+        // Stage 3: IOMMU UNMAP. Look up the domain by dock_id
+        // via iommu_domain_find_by_dock.
+        mov rdi, rbp;
+        call iommu_domain_find_by_dock;
+        cmp rax, 0xFF;
+        je  crv_sq_no_domain;
+
+        push rax;
+        mov rdi, rax;
+        call iommu_domain_mark_unmapped;
+        mov r11, rax;
+        pop rax;
+        cmp r11, 0;
+        jne crv_sq_unmap_refused;
+        or  r15, 0x4;
+
+        // Stage 4: IOMMU RELEASE.
+        mov rdi, rax;
+        call iommu_domain_release;
+        cmp rax, 0;
+        jne crv_sq_release_refused;
+        or  r15, 0x8;
+
+        mov rdi, 1;                      // COMPLETED
+        call consent_revoke_note;
+        mov rax, r15;
+        jmp crv_sq_out;
+
+      crv_sq_idempotent:
+        // Even for idempotent, we walk the routes (should find zero)
+        // and try to unmap the IOMMU (if still mapped). This makes
+        // the sequencer safe against partial-teardown states.
+        or  r15, 0x1;
+
+        mov rdi, rbp;
+        mov rsi, r12;
+        mov rdx, r13;
+        call consent_revoke_walk_routes;
+        or  r15, 0x2;
+
+        mov rdi, rbp;
+        call iommu_domain_find_by_dock;
+        cmp rax, 0xFF;
+        je  crv_sq_idempot_done;
+
+        mov rdi, rax;
+        call iommu_domain_mark_unmapped;
+        // OK for idempotent — mark_unmapped returns OK for already-UNMAPPED.
+        cmp rax, 0;
+        jne crv_sq_idempot_done;
+        or  r15, 0x4;
+
+      crv_sq_idempot_done:
+        mov rdi, 2;                      // IDEMPOTENT
+        call consent_revoke_note;
+        mov rax, r15;
+        jmp crv_sq_out;
+
+      crv_sq_bad_slot:
+        mov rax, 0xFFFFF91E;
+        jmp crv_sq_out;
+      crv_sq_not_attest:
+        mov rdi, 4;
+        call consent_revoke_note;
+        mov rax, 0xFFFFF91D;
+        jmp crv_sq_out;
+      crv_sq_state_refused:
+        mov rdi, 4;
+        call consent_revoke_note;
+        mov rax, 0xFFFFF91C;
+        jmp crv_sq_out;
+      crv_sq_no_domain:
+        mov rdi, 4;
+        call consent_revoke_note;
+        mov rax, 0xFFFFF918;
+        jmp crv_sq_out;
+      crv_sq_unmap_refused:
+        mov rdi, 4;
+        call consent_revoke_note;
+        mov rax, 0xFFFFF91A;
+        jmp crv_sq_out;
+      crv_sq_release_refused:
+        mov rdi, 4;
+        call consent_revoke_note;
+        mov rax, 0xFFFFF919;
+
+      crv_sq_out:
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

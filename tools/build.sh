@@ -2789,6 +2789,44 @@ fi
 echo "[tb3-confine] Thunderbolt 4 tunnel substrate state confined"
 
 # ---------------------------------------------------------------------------
+# R35.M4 (#1210/#1211/#1212/#1213/#1214): DMA attestation + IOMMU consent
+# for Thunderbolt security state confinement.
+#
+# Five modules. Each owns its own row table / stats array; tools/build.sh
+# confines relocations against each to its owning object so a second writer
+# cannot forge a consent decision, restamp an IOMMU domain's identity, or
+# rewrite an audit ring behind the sequencer's back.
+DAT_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_dma_attestation.pdx"
+DCC_SRC="${REPO_ROOT}/src/kernel/core/ipc/dma_consent_channel.pdx"
+CDG_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/consent_dialog.pdx"
+IDM_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/iommu_domain.pdx"
+CRV_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/consent_revoke.pdx"
+if [[ ! -f "${DAT_SRC}" || ! -f "${DCC_SRC}" || ! -f "${CDG_SRC}" \
+        || ! -f "${IDM_SRC}" || ! -f "${CRV_SRC}" ]]; then
+    echo "[dma-consent-confine] FAIL - one of the R35.M4 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_dma_attest_table'         'core/cap/kind_dma_attestation.o'
+ec_confine_one '_dma_attest_stats'         'core/cap/kind_dma_attestation.o'
+ec_confine_one '_dma_consent_reqs'         'core/ipc/dma_consent_channel.o'
+ec_confine_one '_dma_consent_stats'        'core/ipc/dma_consent_channel.o'
+ec_confine_one '_dma_consent_seq'          'core/ipc/dma_consent_channel.o'
+ec_confine_one '_consent_dialog_audit'     'core/drivers/tb/consent_dialog.o'
+ec_confine_one '_consent_dialog_head'      'core/drivers/tb/consent_dialog.o'
+ec_confine_one '_consent_dialog_policy'    'core/drivers/tb/consent_dialog.o'
+ec_confine_one '_consent_dialog_stats'     'core/drivers/tb/consent_dialog.o'
+ec_confine_one '_iommu_domain_table'       'core/drivers/tb/iommu_domain.o'
+ec_confine_one '_iommu_domain_stats'       'core/drivers/tb/iommu_domain.o'
+ec_confine_one '_consent_revoke_stats'     'core/drivers/tb/consent_revoke.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_dma_attestation.pdx §4, dma_consent_channel.pdx §2," >&2
+    echo "  consent_dialog.pdx §2, iommu_domain.pdx §3 and consent_revoke.pdx §4" >&2
+    echo "  for the row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[dma-consent-confine] DMA attestation + IOMMU consent state confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
