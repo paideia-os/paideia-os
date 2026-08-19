@@ -200,10 +200,24 @@ EOF
 as --64 -o "${AP_TRAMP_OFF_OBJ}" "${AP_TRAMP_OFF_SRC}"
 
 OBJECTS=()
+# Incremental build (#1611): skip paideia-as when the .o is not older than
+# any of its dependencies. Dependencies are the .pdx source, this script
+# itself (compiler-command flags may have changed), and the paideia-as
+# binary (submodule bump). Set NO_INCREMENTAL=1 to force a full rebuild.
+# The link step + all confinement gates still run every invocation, so
+# cross-object collisions remain caught.
 while IFS= read -r -d '' pdx; do
     rel="${pdx#"${KERNEL_SRC}"/}"
     obj="${BUILD_DIR}/${rel%.pdx}.o"
     mkdir -p "$(dirname "${obj}")"
+    if [[ -z "${NO_INCREMENTAL:-}" \
+          && -f "${obj}" \
+          && ! "${pdx}" -nt "${obj}" \
+          && ! "${BASH_SOURCE[0]}" -nt "${obj}" \
+          && ! "${PAIDEIA_AS}" -nt "${obj}" ]]; then
+        OBJECTS+=("${obj}")
+        continue
+    fi
     echo "[build] paideia-as ${rel} -> ${obj#"${BUILD_DIR}"/}"
     "${PAIDEIA_AS}" build --emit elf64 "${pdx}" -o "${obj}"
     OBJECTS+=("${obj}")
@@ -221,6 +235,14 @@ if [[ -d "${TESTS_KERNEL_DIR}" ]]; then
         rel="${pdx#"${REPO_ROOT}"/}"
         obj="${BUILD_DIR}/${rel%.pdx}.o"
         mkdir -p "$(dirname "${obj}")"
+        if [[ -z "${NO_INCREMENTAL:-}" \
+              && -f "${obj}" \
+              && ! "${pdx}" -nt "${obj}" \
+              && ! "${BASH_SOURCE[0]}" -nt "${obj}" \
+              && ! "${PAIDEIA_AS}" -nt "${obj}" ]]; then
+            OBJECTS+=("${obj}")
+            continue
+        fi
         echo "[build] paideia-as ${rel} -> ${obj#"${BUILD_DIR}"/}"
         "${PAIDEIA_AS}" build --emit elf64 "${pdx}" -o "${obj}"
         OBJECTS+=("${obj}")
