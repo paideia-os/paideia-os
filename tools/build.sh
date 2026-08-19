@@ -2939,6 +2939,38 @@ fi
 echo "[tb-topo-confine] TB4 topology graph substrate state confined"
 
 # ---------------------------------------------------------------------------
+# R35.M8 (#1226/#1227/#1228): TB4 tunnel provisioner state confinement.
+#
+# Three modules: per-link bandwidth arbitration (per-KIND_TB_DOMAIN
+# reservation table + per-type + aggregate ceilings), multi-host
+# contention scaffold (first-claim-wins over a downstream-adapter claim
+# table, R43+ ships the live wiring), and tunnel priority policy
+# (compile-time DP > PCIe > USB3 order with per-dock overrides). Each
+# owns its own row tables / stats; tools/build.sh confines relocations
+# against each to its owning object so a second writer cannot forge a
+# reservation, restamp a host claim, or rewrite the priority table.
+TAR_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/tunnel_arbiter.pdx"
+MHC_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/multi_host_contend.pdx"
+TPR_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/tunnel_priority.pdx"
+if [[ ! -f "${TAR_SRC}" || ! -f "${MHC_SRC}" || ! -f "${TPR_SRC}" ]]; then
+    echo "[tb-provisioner-confine] FAIL - one of the R35.M8 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_tarb_domains'     'core/drivers/tb/tunnel_arbiter.o'
+ec_confine_one '_tarb_stats'       'core/drivers/tb/tunnel_arbiter.o'
+ec_confine_one '_mhc_claims'       'core/drivers/tb/multi_host_contend.o'
+ec_confine_one '_mhc_stats'        'core/drivers/tb/multi_host_contend.o'
+ec_confine_one '_tpri_overrides'   'core/drivers/tb/tunnel_priority.o'
+ec_confine_one '_tpri_stats'       'core/drivers/tb/tunnel_priority.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See tunnel_arbiter.pdx §1, multi_host_contend.pdx §1 and" >&2
+    echo "  tunnel_priority.pdx §1 for the table/counter one-writer" >&2
+    echo "  discipline." >&2
+    exit 1
+fi
+echo "[tb-provisioner-confine] TB4 tunnel provisioner state confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

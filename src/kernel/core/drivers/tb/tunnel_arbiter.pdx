@@ -1,0 +1,759 @@
+// src/kernel/core/drivers/tb/tunnel_arbiter.pdx — R35.M8-001 (#1226)
+//
+// TB4 PER-LINK BANDWIDTH ARBITRATION.
+//
+// A USB4 40 Gbps aggregate link carries several classes of tunnel in
+// parallel — DP main-link, PCIe path, USB3 tunnel — and each class
+// consumes a fraction of the same 40 Gbps budget. The tunnel scaffolds
+// (dp_tunnel.pdx / pcie_tunnel.pdx / usb3_tunnel.pdx) shape-check
+// individual requests but say nothing about whether the LINK can
+// afford yet another one: a DP HBR3 x4 tunnel at 25.92 Gbps plus a
+// second DP tunnel at 25 Gbps would over-subscribe the same link, and
+// today nothing refuses the second request.
+//
+// This module is the ARBITER between those requests. It carries one
+// reservation record per KIND_TB_DOMAIN (per active TB4 downstream
+// link), tracks Gbps consumed per tunnel type, and refuses an
+// establishment request when the remainder is smaller than the
+// requested budget. Callers holding a KIND_TB_DOMAIN present its
+// domain_id when they ask; the arbiter never reads the domain
+// capability directly (it records STRUCTURE, not authority).
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the ACCOUNTING half of the tunnel-establishment protocol. It:
+//
+//   1. RESERVE — tarb_reserve(domain, tunnel_type, gbps) records a
+//      pending reservation against the domain's per-type budget.
+//      Refuses EXCEEDS_TYPE_CAP if requested > 32 Gbps (DP), > 32 Gbps
+//      (PCIe) or > 10 Gbps (USB3), and EXCEEDS_TOTAL if the sum across
+//      types on that domain would exceed 40 Gbps.
+//
+//   2. RELEASE — tarb_release(domain, tunnel_type, gbps) undoes a
+//      prior reservation. Refuses UNDERFLOW if the requested release
+//      exceeds the currently-reserved figure (a symmetry check
+//      against a caller that miscounts).
+//
+//   3. QUERY — tarb_used(domain, tunnel_type) and
+//      tarb_total_used(domain) let a caller ask what a domain
+//      currently owes before submitting a reservation.
+//
+// IT DOES NOT INSTALL THE TUNNEL. Reservation is a PROMISE; the actual
+// dp_tunnel_ddi_alloc / pcie_tunnel_path_alloc / usb3_tunnel_port_alloc
+// calls are the callers' responsibility. A caller that reserves and
+// then fails to establish MUST release the reservation itself.
+//
+// IT DOES NOT MODEL PER-CLASS QoS. The three per-type caps are hard
+// ceilings; there is no notion of "priority tenant may exceed cap".
+// Priority-driven preemption belongs to tunnel_priority.pdx (R35.M8-003).
+//
+// IT DOES NOT COUNT AUX / SIDEBAND TRAFFIC. USB4 §6 reserves a small
+// fraction of the aggregate for management traffic; this module treats
+// the full 40 Gbps as tunnelable. A future refinement subtracts a
+// fixed overhead.
+//
+// tarb_arbitrated() returns 0 until a live tunnel driver binds this
+// module against real reservation requests.
+//
+// =============================================================================
+// §1  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _tarb_domains and _tarb_stats are written only by helpers in this
+// module. tools/build.sh confines relocations against each symbol to
+// `core/drivers/tb/tunnel_arbiter.o`.
+//
+// =============================================================================
+// §2  ERROR CODES 0xFFFFF850..0xFFFFF85F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent free bands: multi_host_contend 0xFFFFF840..
+// 4F, topology_diff 0xFFFFF860..6F).
+
+module TunnelArbiter = structure {
+
+  // Row / capacity constants.
+  pub let TARB_DOMAIN_MAX     : u64 = 4
+  pub let TARB_ROW_U64        : u64 = 8            // 8 u64s per row (64 bytes)
+
+  // Aggregate + per-type caps (Gbps).
+  pub let TARB_TOTAL_GBPS     : u64 = 40
+  pub let TARB_DP_CAP_GBPS    : u64 = 32
+  pub let TARB_PCIE_CAP_GBPS  : u64 = 32
+  pub let TARB_USB3_CAP_GBPS  : u64 = 10
+
+  // Tunnel type ordinals — mirror kind_tb_route.pdx.
+  pub let TARB_TT_PCIE : u64 = 0
+  pub let TARB_TT_DP   : u64 = 1
+  pub let TARB_TT_USB3 : u64 = 2
+  pub let TARB_TT_MAX  : u64 = 2
+
+  // Failure taxonomy — 0xFFFFF850..0xFFFFF85F.
+  pub let TARB_OK              : u64 = 0
+  pub let TARB_BAD_ARG         : u64 = 0xFFFFF85F
+  pub let TARB_BAD_TYPE        : u64 = 0xFFFFF85E
+  pub let TARB_BAD_DOMAIN      : u64 = 0xFFFFF85D
+  pub let TARB_EXCEEDS_TOTAL   : u64 = 0xFFFFF85C
+  pub let TARB_EXCEEDS_TYPE_CAP: u64 = 0xFFFFF85B
+  pub let TARB_UNDERFLOW       : u64 = 0xFFFFF85A
+  pub let TARB_NOT_FOUND       : u64 = 0xFFFFF859
+  pub let TARB_ENOSPC          : u64 = 0xFFFFF858
+
+  pub let TARB_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let TARB_ROW_NONE   : u64 = 0xFF
+
+  // Domain row (8 u64s, 64 bytes):
+  //   [+0]  in_use  (0/1)
+  //   [+8]  domain_id
+  //   [+16] pcie_gbps (currently reserved for tunnel_type=0)
+  //   [+24] dp_gbps   (currently reserved for tunnel_type=1)
+  //   [+32] usb3_gbps (currently reserved for tunnel_type=2)
+  //   [+40] reserved
+  //   [+48] reserved
+  //   [+56] reserved
+  pub let mut _tarb_domains : [u64; 32] = uninit @align(64)   // 4 rows × 8 u64
+
+  pub let mut _tarb_stats : [u64; 8] = uninit @align(64)
+
+  pub let TARB_ST_RESERVES  : u64 = 0
+  pub let TARB_ST_RELEASES  : u64 = 1
+  pub let TARB_ST_REJECTS   : u64 = 2
+  pub let TARB_ST_ALLOCS    : u64 = 3              // new-row allocations
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let tarb_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M8-001 (#1226): clear domain rows + stats. Labels prefixed tarb_rs_.",
+      block: {
+        xor rax, rax;
+        xor rcx, rcx;
+        lea r10, [rip + _tarb_domains];
+      tarb_rs_d:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  tarb_rs_d;
+
+        xor rcx, rcx;
+        lea r10, [rip + _tarb_stats];
+      tarb_rs_s:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  tarb_rs_s;
+        ret
+      }
+    } @no_frame
+
+  pub let tarb_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M8-001 (#1226): honesty pin. Returns 0 until a live tunnel driver binds this against real reservation requests.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let tarb_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M8-001 (#1226): counter read.",
+      block: {
+        cmp rdi, 8;
+        jae tarb_st_zero;
+        lea r10, [rip + _tarb_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      tarb_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let tarb_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M8-001 (#1226): counter bump. Labels prefixed tarb_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae tarb_nt_out;
+        lea r10, [rip + _tarb_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      tarb_nt_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Row helpers. Rows are 8 u64s wide; slot offset = slot * 64 bytes
+  // = slot * 8 * 8. We compute the byte offset explicitly to avoid
+  // imul r64, imm which paideia-as does not emit.
+  // ==========================================================================
+
+  // Return byte offset of row `slot` inside _tarb_domains. slot in [0, 4).
+  pub let tarb_row_off : (u64) -> u64 !{} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M8-001 (#1226): row byte offset. slot * 64 = slot << 6.",
+      block: {
+        mov rax, rdi;
+        shl rax, 6;
+        ret
+      }
+    } @no_frame
+
+  pub let tarb_row_in_use : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M8-001 (#1226): read row.in_use.",
+      block: {
+        cmp rdi, 4;
+        jae tarb_ri_zero;
+        push rbx;
+        mov rbx, rdi;
+        shl rbx, 6;
+        lea r10, [rip + _tarb_domains];
+        add r10, rbx;
+        mov rax, [r10 + 0];
+        pop rbx;
+        ret;
+      tarb_ri_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let tarb_row_domain : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M8-001 (#1226): read row.domain_id.",
+      block: {
+        cmp rdi, 4;
+        jae tarb_rd_zero;
+        push rbx;
+        mov rbx, rdi;
+        shl rbx, 6;
+        lea r10, [rip + _tarb_domains];
+        add r10, rbx;
+        mov rax, [r10 + 8];
+        pop rbx;
+        ret;
+      tarb_rd_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // Read a per-type reserved figure. type in {0,1,2} maps to byte
+  // offsets {16, 24, 32}. Returns 0 for out-of-range slot or type.
+  pub let tarb_row_used : (u64, u64) -> u64 !{mem} @{} =
+    fn (slot: u64) (tt: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M8-001 (#1226): read row per-type reserved gbps.",
+      block: {
+        push rbx;
+        push r12;
+
+        cmp rdi, 4;
+        jae tarb_ru_zero;
+        cmp rsi, 2;
+        ja  tarb_ru_zero;
+
+        mov rbx, rdi;
+        shl rbx, 6;
+        lea r10, [rip + _tarb_domains];
+        add r10, rbx;
+
+        // per-type offset = 16 + tt * 8
+        mov r12, rsi;
+        shl r12, 3;
+        add r12, 16;
+        add r10, r12;
+        mov rax, [r10 + 0];
+        pop r12;
+        pop rbx;
+        ret;
+      tarb_ru_zero:
+        xor rax, rax;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Find a domain row by domain_id. Returns row_id (0..3) or ROW_NONE.
+  // ==========================================================================
+
+  pub let tarb_domain_find : (u64) -> u64 !{mem} @{} =
+    fn (domain_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M8-001 (#1226): linear scan of _tarb_domains for domain_id. Labels prefixed tarb_df_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                    // domain_id
+        xor r12, r12;                    // slot iterator
+
+      tarb_df_scan:
+        cmp r12, 4;
+        jae tarb_df_none;
+        mov rdi, r12;
+        call tarb_row_in_use;
+        cmp rax, 0;
+        je  tarb_df_next;
+        mov rdi, r12;
+        call tarb_row_domain;
+        cmp rax, rbx;
+        je  tarb_df_hit;
+      tarb_df_next:
+        add r12, 1;
+        jmp tarb_df_scan;
+
+      tarb_df_hit:
+        mov rax, r12;
+        pop r12;
+        pop rbx;
+        ret;
+      tarb_df_none:
+        mov rax, 0xFF;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // Find-or-allocate a domain row. Returns row_id on success,
+  // ENOSPC when the table is full. Newly-allocated rows have all
+  // per-type reservations set to 0.
+  pub let tarb_domain_ensure : (u64) -> u64 !{mem} @{} =
+    fn (domain_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M8-001 (#1226): find-or-allocate domain row. Labels prefixed tarb_de_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // domain_id
+
+        mov rdi, rbx;
+        call tarb_domain_find;
+        cmp rax, 0xFF;
+        jne tarb_de_hit;
+
+        // Scan for free slot.
+        xor r12, r12;
+      tarb_de_scan:
+        cmp r12, 4;
+        jae tarb_de_full;
+        mov rdi, r12;
+        call tarb_row_in_use;
+        cmp rax, 0;
+        je  tarb_de_free;
+        add r12, 1;
+        jmp tarb_de_scan;
+
+      tarb_de_free:
+        // Stamp the row.
+        mov r13, r12;
+        shl r13, 6;
+        lea r10, [rip + _tarb_domains];
+        add r10, r13;
+        mov rax, 1;
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rbx;
+        xor rax, rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rax;
+        mov [r10 + 48], rax;
+        mov [r10 + 56], rax;
+
+        mov rdi, 3;                      // ALLOCS
+        call tarb_note;
+
+        mov rax, r12;
+        jmp tarb_de_out;
+
+      tarb_de_hit:
+        // rax already row_id
+        jmp tarb_de_out;
+      tarb_de_full:
+        mov rax, 0xFFFFF858;             // ENOSPC
+
+      tarb_de_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tarb_reserve — record a per-type reservation.
+  //
+  // Sequence:
+  //   1. tunnel_type in {0, 1, 2}     (BAD_TYPE)
+  //   2. gbps > 0                     (BAD_ARG)
+  //   3. per-type cap check           (EXCEEDS_TYPE_CAP)
+  //   4. find-or-allocate row         (ENOSPC or BAD_DOMAIN)
+  //   5. per-type sum + gbps <= cap   (EXCEEDS_TYPE_CAP)
+  //   6. total + gbps <= 40 Gbps      (EXCEEDS_TOTAL)
+  //   7. commit                       (bump reserves)
+  // ==========================================================================
+
+  pub let tarb_reserve : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (domain_id: u64) (tunnel_type: u64) (gbps: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M8-001 (#1226): reserve bandwidth for a tunnel. Labels prefixed tarb_rv_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // domain_id
+        mov r12, rsi;                    // tunnel_type
+        mov r13, rdx;                    // gbps
+
+        // 1. tunnel_type in {0, 1, 2}
+        cmp r12, 2;
+        ja  tarb_rv_bad_type;
+
+        // 2. gbps > 0
+        cmp r13, 0;
+        je  tarb_rv_bad_arg;
+
+        // 3. per-type cap on the REQUEST itself.
+        //    per-type caps: PCIe=32, DP=32, USB3=10.
+        cmp r12, 2;                      // USB3
+        je  tarb_rv_req_cap_usb3;
+        // PCIe or DP — 32 Gbps
+        cmp r13, 32;
+        ja  tarb_rv_type_cap;
+        jmp tarb_rv_req_cap_done;
+      tarb_rv_req_cap_usb3:
+        cmp r13, 10;
+        ja  tarb_rv_type_cap;
+      tarb_rv_req_cap_done:
+
+        // 4. Find-or-allocate row.
+        mov rdi, rbx;
+        call tarb_domain_ensure;
+        mov r10, 0xFFFFF858;             // ENOSPC
+        cmp rax, r10;
+        je  tarb_rv_out_bad;             // rax is already ENOSPC
+        cmp rax, 4;
+        jae tarb_rv_bad_domain;
+        mov r14, rax;                    // slot
+
+        // 5. per-type sum + gbps <= per-type cap.
+        mov rdi, r14;
+        mov rsi, r12;
+        call tarb_row_used;
+        mov r15, rax;
+        add r15, r13;
+        // Overflow-safe here since figures are small.
+
+        cmp r12, 2;
+        je  tarb_rv_sum_cap_usb3;
+        // PCIe or DP — 32 Gbps
+        cmp r15, 32;
+        ja  tarb_rv_type_cap;
+        jmp tarb_rv_sum_cap_done;
+      tarb_rv_sum_cap_usb3:
+        cmp r15, 10;
+        ja  tarb_rv_type_cap;
+      tarb_rv_sum_cap_done:
+
+        // 6. total + gbps <= 40. Compute current total across the 3 slots.
+        push r14;
+        push r15;
+        mov rdi, r14;
+        mov rsi, 0;
+        call tarb_row_used;
+        mov r15, rax;
+        mov rdi, r14;
+        mov rsi, 1;
+        call tarb_row_used;
+        add r15, rax;
+        mov rdi, r14;
+        mov rsi, 2;
+        call tarb_row_used;
+        add r15, rax;
+        add r15, r13;
+        pop rax;                         // discard saved r15
+        pop r14;
+        cmp r15, 40;
+        ja  tarb_rv_exceeds_total;
+
+        // 7. Commit. offset = 16 + tt * 8.
+        mov rax, r14;
+        shl rax, 6;
+        lea r10, [rip + _tarb_domains];
+        add r10, rax;
+        mov rax, r12;
+        shl rax, 3;
+        add rax, 16;
+        add r10, rax;
+        mov rcx, [r10 + 0];
+        add rcx, r13;
+        mov [r10 + 0], rcx;
+
+        mov rdi, 0;                      // RESERVES
+        call tarb_note;
+        xor rax, rax;
+        jmp tarb_rv_out;
+
+      tarb_rv_bad_type:
+        mov rdi, 2;                      // REJECTS
+        call tarb_note;
+        mov rax, 0xFFFFF85E;
+        jmp tarb_rv_out;
+      tarb_rv_bad_arg:
+        mov rdi, 2;
+        call tarb_note;
+        mov rax, 0xFFFFF85F;
+        jmp tarb_rv_out;
+      tarb_rv_type_cap:
+        mov rdi, 2;
+        call tarb_note;
+        mov rax, 0xFFFFF85B;
+        jmp tarb_rv_out;
+      tarb_rv_bad_domain:
+        mov rdi, 2;
+        call tarb_note;
+        mov rax, 0xFFFFF85D;
+        jmp tarb_rv_out;
+      tarb_rv_out_bad:
+        // rax already carries the error (ENOSPC).
+        push rax;
+        mov rdi, 2;
+        call tarb_note;
+        pop rax;
+        jmp tarb_rv_out;
+      tarb_rv_exceeds_total:
+        mov rdi, 2;
+        call tarb_note;
+        mov rax, 0xFFFFF85C;
+
+      tarb_rv_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tarb_release — undo a reservation.
+  //
+  // Sequence:
+  //   1. tunnel_type in {0, 1, 2}
+  //   2. gbps > 0
+  //   3. Domain row must exist  (NOT_FOUND)
+  //   4. Currently-reserved >= gbps  (UNDERFLOW)
+  //   5. Subtract
+  // ==========================================================================
+
+  pub let tarb_release : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (domain_id: u64) (tunnel_type: u64) (gbps: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M8-001 (#1226): release bandwidth. Labels prefixed tarb_rl_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                    // domain_id
+        mov r12, rsi;                    // tunnel_type
+        mov r13, rdx;                    // gbps
+
+        cmp r12, 2;
+        ja  tarb_rl_bad_type;
+        cmp r13, 0;
+        je  tarb_rl_bad_arg;
+
+        mov rdi, rbx;
+        call tarb_domain_find;
+        cmp rax, 0xFF;
+        je  tarb_rl_not_found;
+        mov r14, rax;                    // slot
+
+        mov rdi, r14;
+        mov rsi, r12;
+        call tarb_row_used;
+        cmp rax, r13;
+        jb  tarb_rl_underflow;
+
+        // Commit.
+        push rax;
+        mov rax, r14;
+        shl rax, 6;
+        lea r10, [rip + _tarb_domains];
+        add r10, rax;
+        mov rax, r12;
+        shl rax, 3;
+        add rax, 16;
+        add r10, rax;
+        pop rcx;                         // current
+        sub rcx, r13;
+        mov [r10 + 0], rcx;
+
+        mov rdi, 1;                      // RELEASES
+        call tarb_note;
+        xor rax, rax;
+        jmp tarb_rl_out;
+
+      tarb_rl_bad_type:
+        mov rdi, 2;
+        call tarb_note;
+        mov rax, 0xFFFFF85E;
+        jmp tarb_rl_out;
+      tarb_rl_bad_arg:
+        mov rdi, 2;
+        call tarb_note;
+        mov rax, 0xFFFFF85F;
+        jmp tarb_rl_out;
+      tarb_rl_not_found:
+        mov rdi, 2;
+        call tarb_note;
+        mov rax, 0xFFFFF859;
+        jmp tarb_rl_out;
+      tarb_rl_underflow:
+        mov rdi, 2;
+        call tarb_note;
+        mov rax, 0xFFFFF85A;
+
+      tarb_rl_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Queries.
+  // ==========================================================================
+
+  // tarb_used(domain, tt) — currently-reserved gbps for that type on
+  // that domain. Returns 0 if the domain has no row, or if tt is out
+  // of range.
+  pub let tarb_used : (u64, u64) -> u64 !{mem} @{} =
+    fn (domain_id: u64) (tunnel_type: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M8-001 (#1226): query per-type reservation.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+
+        cmp r12, 2;
+        ja  tarb_us_zero;
+
+        mov rdi, rbx;
+        call tarb_domain_find;
+        cmp rax, 0xFF;
+        je  tarb_us_zero;
+
+        mov rdi, rax;
+        mov rsi, r12;
+        call tarb_row_used;
+        pop r12;
+        pop rbx;
+        ret;
+      tarb_us_zero:
+        xor rax, rax;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // tarb_total_used(domain) — sum of PCIe + DP + USB3 reserved on
+  // that domain. Returns 0 if the domain has no row.
+  pub let tarb_total_used : (u64) -> u64 !{mem} @{} =
+    fn (domain_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M8-001 (#1226): sum reserved bandwidth on a domain.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;
+
+        mov rdi, rbx;
+        call tarb_domain_find;
+        cmp rax, 0xFF;
+        je  tarb_tu_zero;
+        mov r12, rax;                    // slot
+
+        mov rdi, r12;
+        mov rsi, 0;
+        call tarb_row_used;
+        mov r13, rax;
+        mov rdi, r12;
+        mov rsi, 1;
+        call tarb_row_used;
+        add r13, rax;
+        mov rdi, r12;
+        mov rsi, 2;
+        call tarb_row_used;
+        add r13, rax;
+        mov rax, r13;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      tarb_tu_zero:
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // Per-type cap accessor (rodata-shaped query).
+  pub let tarb_type_cap : (u64) -> u64 !{} @{} =
+    fn (tunnel_type: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M8-001 (#1226): per-type Gbps ceiling.",
+      block: {
+        cmp rdi, 2;
+        je  tarb_tc_usb3;
+        cmp rdi, 2;
+        ja  tarb_tc_bad;
+        mov rax, 32;                     // PCIe/DP
+        ret;
+      tarb_tc_usb3:
+        mov rax, 10;
+        ret;
+      tarb_tc_bad:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+}
