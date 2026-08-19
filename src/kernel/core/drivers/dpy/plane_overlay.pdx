@@ -1,0 +1,584 @@
+// src/kernel/core/drivers/dpy/plane_overlay.pdx — R36.M4-003 (#1251)
+//
+// Overlay-plane composition for Intel Iris Xe. Consumes a
+// KIND_DISPLAY_PLANE row with plane_type == DPP_TYPE_OVERLAY and
+// resolves it to a per-plane binding: memory row, z-order (1..15), YUV
+// pixel format (NV12 / YUYV / P010), the subsampled Y-plane and
+// UV-plane strides (derived from format + width), and an alpha-blend
+// factor (0..255).
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// The class-specific half of the plane lattice for the overlay role.
+// kind_display_plane.pdx holds the row and does the generic mint/revoke
+// gates; this module rejects a row whose class-specific fields do not
+// match the overlay role, records a binding decision in per-plane
+// state, and returns DEFERRED_HARDWARE where a live driver would ARM
+// the plane.
+//
+// It DOES NOT TOUCH REAL MMIO. The subsampled-stride register writes
+// happen through the atomic_commit seam which is arbitrated=0 this
+// milestone. plovr_arbitrated() returns 0 until a later round binds the
+// seam against a live window.
+//
+// =============================================================================
+// §1  THE OVERLAY-ROLE GATES
+// =============================================================================
+//
+//   (a) plane_type == DPP_TYPE_OVERLAY (WRONG_TYPE)
+//   (b) zorder     in [1, 15] (BAD_ZORDER); primary occupies 0 and Xe1
+//       supports up to fifteen overlay planes per pipe (the sixteenth
+//       ordinal is reserved for the compositor's system UI overlay)
+//   (c) format     in {NV12, YUYV, P010} (BAD_FORMAT); XRGB/RGBA belong
+//       to primary and cursor, and overlays that scanned RGB would
+//       waste the pipe's chroma-upsampler
+//   (d) alpha      in [0, 255] (BAD_ALPHA); u8-quantised blend factor
+//       per bspec §14, 0 = fully transparent overlay, 255 = opaque
+//
+// =============================================================================
+// §2  SUBSAMPLED STRIDE MATH
+// =============================================================================
+//
+// The Y and UV plane strides are FUNCTIONS OF WIDTH AND FORMAT, and
+// the register block programs them separately. Getting them wrong on
+// hardware wedges the plane's fetch scheduler; deriving them in one
+// place is what stops each caller from picking a different rule.
+//
+//   NV12 (4:2:0):
+//     Y stride  = align_up(width, 64)
+//     UV stride = align_up(width, 64)          (interleaved UV in one
+//                                               chroma plane at half
+//                                               vertical resolution)
+//   YUYV (4:2:2 packed):
+//     Y stride  = align_up(width * 2, 64)      (packed YUYV, 2 bytes/px)
+//     UV stride = 0                            (no separate chroma plane)
+//   P010 (4:2:0 10-bit):
+//     Y stride  = align_up(width * 2, 64)      (10 bits packed to u16)
+//     UV stride = align_up(width * 2, 64)
+//
+// The align_up-to-64 rule is the plane fetch scheduler's cache-line
+// alignment; the same rule the primary uses. Callers may not override.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _plane_overlay_state is written only by helpers in this module.
+// tools/build.sh confines relocations against the symbol to
+// `core/drivers/dpy/plane_overlay.o`.
+//
+// =============================================================================
+// §4  ERROR CODES 0xFFFFF6C0..0xFFFFF6CF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used bands above: plane_primary
+// 0xFFFFF6D0..DF; adjacent free bands below: plane_cursor
+// 0xFFFFF6B0..BF).
+
+module PlaneOverlay = structure {
+
+  // YUV format ordinals accepted by overlay (mirroring kind_display_plane).
+  pub let PLOVR_FORMAT_NV12 : u64 = 1
+  pub let PLOVR_FORMAT_YUYV : u64 = 2
+  pub let PLOVR_FORMAT_P010 : u64 = 4
+
+  pub let PLOVR_STRIDE_ALIGN : u64 = 64
+
+  pub let PLOVR_ZORDER_MIN : u64 = 1
+  pub let PLOVR_ZORDER_MAX : u64 = 15
+
+  // Number of overlay plane slots tracked (Xe1: up to 15 per pipe,
+  // sized to 16 for headroom).
+  pub let PLOVR_MAX : u64 = 16
+
+  // Per-plane binding state, 8 u64 slots per plane * 16 planes = 128 u64s.
+  //   [+0]  bound         0 = fresh, 1 = a bind ran
+  //   [+8]  plane_slot    KIND_DISPLAY_PLANE cap slot
+  //   [+16] memory_slot   KIND_MEMORY row bound
+  //   [+24] format        YUV format ordinal
+  //   [+32] y_stride      derived Y stride
+  //   [+40] uv_stride     derived UV stride
+  //   [+48] alpha         blend factor
+  //   [+56] zorder        z-order
+  pub let mut _plane_overlay_state : [u64; 128] = uninit @align(64)
+  pub let mut _plane_overlay_stats : [u64; 8]   = uninit @align(64)
+
+  pub let PLOVR_ST_BINDS   : u64 = 0
+  pub let PLOVR_ST_REFUSED : u64 = 1
+
+  // Failure taxonomy — 0xFFFFF6C0..0xFFFFF6CF.
+  pub let PLOVR_OK                : u64 = 0
+  pub let PLOVR_BAD_ARG           : u64 = 0xFFFFF6CF
+  pub let PLOVR_BAD_SLOT          : u64 = 0xFFFFF6CE
+  pub let PLOVR_WRONG_TYPE        : u64 = 0xFFFFF6CD
+  pub let PLOVR_BAD_ZORDER        : u64 = 0xFFFFF6CC
+  pub let PLOVR_BAD_FORMAT        : u64 = 0xFFFFF6CB
+  pub let PLOVR_BAD_ALPHA         : u64 = 0xFFFFF6CA
+  pub let PLOVR_NO_PLANE_ROW      : u64 = 0xFFFFF6C9
+  pub let PLOVR_DEFERRED_HARDWARE : u64 = 0xFFFFF6C8
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let plane_overlay_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M4-003 (#1251): clear per-plane binding state and stats. Boot and teardown. Labels prefixed plovr_rs_.",
+      block: {
+        lea r10, [rip + _plane_overlay_state];
+        xor rax, rax;
+        xor rcx, rcx;
+      plovr_rs_state:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 128;
+        jb  plovr_rs_state;
+
+        lea r10, [rip + _plane_overlay_stats];
+        xor rcx, rcx;
+      plovr_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  plovr_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let plovr_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R36.M4-003 (#1251): honesty pin. Returns 0 until a later round binds the atomic_commit seam against a live MMIO window.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let plovr_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M4-003 (#1251): counter bump. Labels prefixed plovr_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae plovr_nt_out;
+        lea r10, [rip + _plane_overlay_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      plovr_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let plovr_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M4-003 (#1251): counter read. Labels prefixed plovr_st_.",
+      block: {
+        cmp rdi, 8;
+        jae plovr_st_zero;
+        lea r10, [rip + _plane_overlay_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      plovr_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Validators (§1).
+  // ==========================================================================
+
+  pub let plovr_slot_valid : (u64) -> u64 !{} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R36.M4-003 (#1251): 1 iff slot < PLOVR_MAX (16). Labels prefixed plovr_sv_.",
+      block: {
+        cmp rdi, 16;
+        jae plovr_sv_no;
+        mov rax, 1;
+        ret;
+      plovr_sv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let plovr_zorder_valid : (u64) -> u64 !{} @{} =
+    fn (z: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R36.M4-003 (#1251): 1 iff 1 <= z <= 15. Labels prefixed plovr_zv_.",
+      block: {
+        cmp rdi, 1;
+        jb  plovr_zv_no;
+        cmp rdi, 15;
+        ja  plovr_zv_no;
+        mov rax, 1;
+        ret;
+      plovr_zv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let plovr_format_valid : (u64) -> u64 !{} @{} =
+    fn (f: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R36.M4-003 (#1251): 1 iff f in {NV12(1), YUYV(2), P010(4)}. Labels prefixed plovr_fv_.",
+      block: {
+        cmp rdi, 1;
+        je  plovr_fv_yes;
+        cmp rdi, 2;
+        je  plovr_fv_yes;
+        cmp rdi, 4;
+        je  plovr_fv_yes;
+        xor rax, rax;
+        ret;
+      plovr_fv_yes:
+        mov rax, 1;
+        ret
+      }
+    } @no_frame
+
+  pub let plovr_alpha_valid : (u64) -> u64 !{} @{} =
+    fn (a: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R36.M4-003 (#1251): 1 iff a <= 0xFF. Labels prefixed plovr_av_.",
+      block: {
+        cmp rdi, 0xFF;
+        ja  plovr_av_no;
+        mov rax, 1;
+        ret;
+      plovr_av_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Stride math (§2).
+  //
+  //   align_up_64(x) = (x + 63) & ~63
+  // ==========================================================================
+
+  pub let plovr_align_up_64 : (u64) -> u64 !{} @{} =
+    fn (x: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R36.M4-003 (#1251): (x + 63) & ~63. Labels prefixed plovr_au_.",
+      block: {
+        mov rax, rdi;
+        add rax, 63;
+        mov r10, 0xFFFFFFFFFFFFFFC0;
+        and rax, r10;
+        ret
+      }
+    } @no_frame
+
+  pub let plovr_y_stride : (u64, u64) -> u64 !{} @{} =
+    fn (width: u64) (format: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R36.M4-003 (#1251): §2. NV12 -> align_up_64(width); YUYV / P010 -> align_up_64(width*2). Labels prefixed plovr_ys_.",
+      block: {
+        cmp rsi, 1;                      // NV12
+        je  plovr_ys_nv12;
+        // YUYV or P010: width * 2 aligned 64.
+        mov rax, rdi;
+        shl rax, 1;
+        mov rdi, rax;
+        call plovr_align_up_64;
+        ret;
+      plovr_ys_nv12:
+        mov rdi, rdi;
+        call plovr_align_up_64;
+        ret
+      }
+    }
+
+  pub let plovr_uv_stride : (u64, u64) -> u64 !{} @{} =
+    fn (width: u64) (format: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R36.M4-003 (#1251): §2. NV12 -> align_up_64(width); YUYV -> 0 (packed); P010 -> align_up_64(width*2). Labels prefixed plovr_us_.",
+      block: {
+        cmp rsi, 2;                      // YUYV: no UV plane
+        je  plovr_us_yuyv;
+        cmp rsi, 1;                      // NV12
+        je  plovr_us_nv12;
+        // P010: width * 2 aligned 64.
+        mov rax, rdi;
+        shl rax, 1;
+        mov rdi, rax;
+        call plovr_align_up_64;
+        ret;
+      plovr_us_nv12:
+        mov rdi, rdi;
+        call plovr_align_up_64;
+        ret;
+      plovr_us_yuyv:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Binding. plane_overlay_bind(overlay_slot, plane_slot, alpha)
+  // ==========================================================================
+
+  pub let plane_overlay_bind : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (overlay_slot: u64) (plane_slot: u64) (alpha: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R36.M4-003 (#1251): bind KIND_DISPLAY_PLANE (overlay) at overlay_slot. Enforces §1 gates, derives §2 subsampled strides, records the binding, returns DEFERRED_HARDWARE while the seam is unbound. Register plan: rbx=overlay_slot, r12=plane_slot, r13=alpha, r14=row_id, r15=format, rbp scratch for zorder / memory_slot / strides across the two-stride derivation which uses the stack rather than more callee-save registers so the register plan stays flat. Labels prefixed plovr_bd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+
+        mov rbx, rdi;                    // overlay_slot
+        mov r12, rsi;                    // plane_slot
+        mov r13, rdx;                    // alpha
+
+        mov rdi, rbx;
+        call plovr_slot_valid;
+        cmp rax, 0;
+        je  plovr_bd_bad_slot;
+
+        mov rdi, r13;
+        call plovr_alpha_valid;
+        cmp rax, 0;
+        je  plovr_bd_bad_alpha;
+
+        // Resolve plane_slot -> row_id (validates live KIND_DISPLAY_PLANE).
+        mov rdi, r12;
+        call dpp_row_of_slot;
+        mov r11, 0xFF;
+        cmp rax, r11;
+        je  plovr_bd_no_row;
+        mov r14, rax;                    // row_id
+
+        // Type must be OVERLAY.
+        mov rdi, r14;
+        call dpp_row_type;
+        cmp rax, 1;                      // DPP_TYPE_OVERLAY
+        jne plovr_bd_wrong_type;
+
+        // Z-order in [1, 15].
+        mov rdi, r14;
+        call dpp_row_zorder;
+        mov rbp, rax;                    // zorder (stashed for stamp)
+        mov rdi, rbp;
+        call plovr_zorder_valid;
+        cmp rax, 0;
+        je  plovr_bd_bad_zorder;
+
+        // Format must be NV12 / YUYV / P010.
+        mov rdi, r14;
+        call dpp_row_format;
+        mov r15, rax;                    // format
+        mov rdi, r15;
+        call plovr_format_valid;
+        cmp rax, 0;
+        je  plovr_bd_bad_format;
+
+        // Derive width, then y_stride and uv_stride from (width, format).
+        // Push zorder + width so both survive across three helper calls.
+        mov rdi, r14;
+        call dpp_row_width;
+        push rax;                        // [rsp+0]  = width
+        push rbp;                        // [rsp+8]  = zorder
+
+        // y_stride
+        mov rdi, [rsp + 0];              // width
+        mov rsi, r15;                    // format
+        call plovr_y_stride;
+        push rax;                        // [rsp+0]  = y_stride
+                                         // [rsp+8]  = zorder
+                                         // [rsp+16] = width
+
+        // uv_stride
+        mov rdi, [rsp + 16];             // width
+        mov rsi, r15;                    // format
+        call plovr_uv_stride;
+        mov rbp, rax;                    // uv_stride
+                                         // stack: [rsp+0]=y_stride,
+                                         //        [rsp+8]=zorder,
+                                         //        [rsp+16]=width
+
+        // memory_slot
+        mov rdi, r14;
+        call dpp_row_memory;
+        mov r14, rax;                    // memory_slot (row_id no longer needed)
+
+        // Stamp per-plane state at offset overlay_slot * 64.
+        lea r10, [rip + _plane_overlay_state];
+        mov r11, rbx;
+        shl r11, 6;
+        add r10, r11;
+
+        mov rax, 1;
+        mov [r10 + 0],  rax;             // bound
+        mov [r10 + 8],  r12;             // plane_slot
+        mov [r10 + 16], r14;             // memory_slot
+        mov [r10 + 24], r15;             // format
+        mov rax, [rsp + 0];              // y_stride
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rbp;             // uv_stride
+        mov [r10 + 48], r13;             // alpha
+        mov rax, [rsp + 8];              // zorder
+        mov [r10 + 56], rax;
+
+        add rsp, 24;                     // drop y_stride / zorder / width
+
+        mov rdi, 0;                      // PLOVR_ST_BINDS
+        call plovr_note;
+
+        mov rax, 0xFFFFF6C8;             // DEFERRED_HARDWARE
+        jmp plovr_bd_out;
+
+      plovr_bd_bad_slot:
+        mov rdi, 1;
+        call plovr_note;
+        mov rax, 0xFFFFF6CE;
+        jmp plovr_bd_out;
+      plovr_bd_bad_alpha:
+        mov rdi, 1;
+        call plovr_note;
+        mov rax, 0xFFFFF6CA;
+        jmp plovr_bd_out;
+      plovr_bd_no_row:
+        mov rdi, 1;
+        call plovr_note;
+        mov rax, 0xFFFFF6C9;
+        jmp plovr_bd_out;
+      plovr_bd_wrong_type:
+        mov rdi, 1;
+        call plovr_note;
+        mov rax, 0xFFFFF6CD;
+        jmp plovr_bd_out;
+      plovr_bd_bad_zorder:
+        mov rdi, 1;
+        call plovr_note;
+        mov rax, 0xFFFFF6CC;
+        jmp plovr_bd_out;
+      plovr_bd_bad_format:
+        mov rdi, 1;
+        call plovr_note;
+        mov rax, 0xFFFFF6CB;
+
+      plovr_bd_out:
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Row accessors — read the recorded binding for one overlay slot.
+  // ==========================================================================
+
+  pub let plovr_bound : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M4-003 (#1251): 1 iff slot has a recorded bind. Labels prefixed plovr_bnd_.",
+      block: {
+        cmp rdi, 16;
+        jae plovr_bnd_no;
+        lea r10, [rip + _plane_overlay_state];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        ret;
+      plovr_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let plovr_format_of : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M4-003 (#1251): bound format ordinal. Labels prefixed plovr_fo_.",
+      block: {
+        cmp rdi, 16;
+        jae plovr_fo_no;
+        lea r10, [rip + _plane_overlay_state];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 24];
+        ret;
+      plovr_fo_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let plovr_y_stride_of : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M4-003 (#1251): bound Y stride. Labels prefixed plovr_yo_.",
+      block: {
+        cmp rdi, 16;
+        jae plovr_yo_no;
+        lea r10, [rip + _plane_overlay_state];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 32];
+        ret;
+      plovr_yo_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let plovr_uv_stride_of : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M4-003 (#1251): bound UV stride. Labels prefixed plovr_uo_.",
+      block: {
+        cmp rdi, 16;
+        jae plovr_uo_no;
+        lea r10, [rip + _plane_overlay_state];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 40];
+        ret;
+      plovr_uo_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let plovr_zorder_of : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M4-003 (#1251): bound z-order. Labels prefixed plovr_zo_.",
+      block: {
+        cmp rdi, 16;
+        jae plovr_zo_no;
+        lea r10, [rip + _plane_overlay_state];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 56];
+        ret;
+      plovr_zo_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+}

@@ -3153,6 +3153,39 @@ fi
 echo "[dpy-m3-confine] R36.M3 (display modeset substrate) confined"
 
 # ---------------------------------------------------------------------------
+# R36.M4 (#1249/#1250/#1251/#1252): display plane substrate
+# (KIND_DISPLAY_PLANE + plane_primary + plane_overlay + plane_cursor).
+#
+# Four modules extend the R36.M3 lattice with per-role plane authority.
+# Each owns its own state; tools/build.sh confines relocations against
+# each to its owning object so a second writer cannot forge a plane row
+# or restamp a per-pipe binding.
+DPP_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_display_plane.pdx"
+PLPRI_SRC="${REPO_ROOT}/src/kernel/core/drivers/dpy/plane_primary.pdx"
+PLOVR_SRC="${REPO_ROOT}/src/kernel/core/drivers/dpy/plane_overlay.pdx"
+PLCUR_SRC="${REPO_ROOT}/src/kernel/core/drivers/dpy/plane_cursor.pdx"
+if [[ ! -f "${DPP_SRC}" || ! -f "${PLPRI_SRC}" \
+        || ! -f "${PLOVR_SRC}" || ! -f "${PLCUR_SRC}" ]]; then
+    echo "[dpy-m4-confine] FAIL - one of the R36.M4 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_display_plane_table' 'core/cap/kind_display_plane.o'
+ec_confine_one '_display_plane_stats' 'core/cap/kind_display_plane.o'
+ec_confine_one '_plane_primary_state' 'core/drivers/dpy/plane_primary.o'
+ec_confine_one '_plane_primary_stats' 'core/drivers/dpy/plane_primary.o'
+ec_confine_one '_plane_overlay_state' 'core/drivers/dpy/plane_overlay.o'
+ec_confine_one '_plane_overlay_stats' 'core/drivers/dpy/plane_overlay.o'
+ec_confine_one '_plane_cursor_state'  'core/drivers/dpy/plane_cursor.o'
+ec_confine_one '_plane_cursor_stats'  'core/drivers/dpy/plane_cursor.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_display_plane.pdx §3, plane_primary.pdx §2," >&2
+    echo "  plane_overlay.pdx §3 and plane_cursor.pdx §3 for the" >&2
+    echo "  row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[dpy-m4-confine] R36.M4 (display plane substrate) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
