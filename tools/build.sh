@@ -3299,6 +3299,42 @@ fi
 echo "[guc-m2-confine] R37.M2 (Iris Xe GuC firmware substrate) confined"
 
 # ---------------------------------------------------------------------------
+# R37.M3 (#1262/#1263/#1264/#1265/#1266): GPU BO substrate --
+# KIND_GPU_BO (kind_gpu_bo), slab allocator (bo_alloc), tiling encoders
+# (tiling), cache-policy classifier (cache_policy), and RPC schema
+# (gpu_bo_alloc_channel).
+#
+# Five modules open R37.M3 (post-r37-M2). Each owns its own state;
+# tools/build.sh confines relocations against each to its owning
+# object so a second writer cannot forge a BO row, restamp a slab
+# claim, tally a tiling counter, restamp a cache-policy counter, or
+# ship a synthetic channel event.
+KGB_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_gpu_bo.pdx"
+BOA_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/bo_alloc.pdx"
+TIL_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/tiling.pdx"
+CPOL_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/cache_policy.pdx"
+BOC_SRC="${REPO_ROOT}/src/kernel/core/ipc/gpu_bo_alloc_channel.pdx"
+if [[ ! -f "${KGB_SRC}" || ! -f "${BOA_SRC}" \
+        || ! -f "${TIL_SRC}" || ! -f "${CPOL_SRC}" \
+        || ! -f "${BOC_SRC}" ]]; then
+    echo "[gpu-m3-confine] FAIL - one of the R37.M3 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_gpu_bo_table'         'core/cap/kind_gpu_bo.o'
+ec_confine_one '_gpu_bo_stats'         'core/cap/kind_gpu_bo.o'
+ec_confine_one '_bo_alloc_pool'        'core/drivers/gpu/bo_alloc.o'
+ec_confine_one '_bo_alloc_stats'       'core/drivers/gpu/bo_alloc.o'
+ec_confine_one '_tiling_stats'         'core/drivers/gpu/tiling.o'
+ec_confine_one '_cache_policy_stats'   'core/drivers/gpu/cache_policy.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_gpu_bo.pdx §2, bo_alloc.pdx §2, tiling.pdx §3," >&2
+    echo "  cache_policy.pdx §3 and gpu_bo_alloc_channel.pdx §3 for the" >&2
+    echo "  row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[gpu-m3-confine] R37.M3 (GPU BO substrate) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

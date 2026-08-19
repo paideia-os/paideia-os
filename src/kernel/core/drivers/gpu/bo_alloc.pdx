@@ -1,0 +1,557 @@
+// src/kernel/core/drivers/gpu/bo_alloc.pdx — R37.M3-002 (#1263)
+//
+// GPU Buffer Object slab allocator.
+//
+// Six size classes (4K, 16K, 64K, 256K, 1M, 4M), each with a private
+// free list. Backing is the KIND_MEMORY page-frame pool: the allocator
+// does not itself walk PMM, it records the (memory_slot, offset,
+// class) triples handed out and answers alloc/free against a slab
+// pool per class.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the DECISION SITE for "which size-class does this request
+// land in, and is there a free slab of that class." It is NOT the
+// allocator of the underlying page frames (that is PMM, and KIND_
+// MEMORY carries the authority) and it does not mint the
+// KIND_GPU_BO capability itself -- gpu_bo_alloc_channel.pdx is the
+// RPC entry point that composes:
+//
+//   pool_alloc(class)         [this module]
+//     -> memory_slot bytes    [KIND_MEMORY held by caller]
+//        gpu_bo_cap_mint      [kind_gpu_bo.pdx]
+//        -> KIND_GPU_BO cap
+//
+// SIZE CLASSES (all powers of two):
+//   0: 4 KiB      -- cursor-sized planes / SGX shader constants
+//   1: 16 KiB     -- overlay scanout for handheld panels
+//   2: 64 KiB     -- primary scanout at 720p
+//   3: 256 KiB    -- primary scanout at 1080p
+//   4: 1 MiB      -- primary scanout at 4K UHD (packed)
+//   5: 4 MiB      -- 4K UHD YUV444 / HDR staging
+//
+// A request larger than 4 MiB is REFUSED (BAD_SIZE); a request of 0
+// is REFUSED (BAD_SIZE). A request between class boundaries rounds
+// UP to the smallest class that fits it -- a caller asking for 5 KiB
+// gets a 16 KiB slab, not a 4 KiB slab that would overflow.
+//
+// =============================================================================
+// §1  PER-CLASS FREE LISTS
+// =============================================================================
+//
+// Each class has BOA_CLASS_MAX (8) slab slots. A live slab records:
+//   [+0] in_use[63:56] | class[7:0]
+//   [+8] memory_slot   (KIND_MEMORY row that backs it)
+//   [+16] size_bytes   (the class size, cached for O(1) lookup)
+//   [+24] pad
+//
+// Total 32 bytes per slab, 8 slabs per class, 6 classes = 1536 bytes
+// as [u64; 192]. Per-class capacity of 8 is enough for boot bring-up
+// (three primary planes + three overlays + cursor + one staging = 8);
+// scaling past that is a separate ticket that widens the table.
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _bo_alloc_pool and _bo_alloc_stats are written only by helpers in
+// this module. tools/build.sh confines relocations against each to
+// core/drivers/gpu/bo_alloc.o.
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFF630..0xFFFFF63F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: kind_gpu_bo
+// 0xFFFFF640..4F; adjacent free band below: tiling
+// 0xFFFFF620..2F).
+
+module BoAlloc = structure {
+
+  // Class ordinals (§0).
+  pub let BOA_CLASS_4K    : u64 = 0
+  pub let BOA_CLASS_16K   : u64 = 1
+  pub let BOA_CLASS_64K   : u64 = 2
+  pub let BOA_CLASS_256K  : u64 = 3
+  pub let BOA_CLASS_1M    : u64 = 4
+  pub let BOA_CLASS_4M    : u64 = 5
+  pub let BOA_CLASS_COUNT : u64 = 6
+
+  // Class sizes.
+  pub let BOA_SIZE_4K   : u64 = 0x1000
+  pub let BOA_SIZE_16K  : u64 = 0x4000
+  pub let BOA_SIZE_64K  : u64 = 0x10000
+  pub let BOA_SIZE_256K : u64 = 0x40000
+  pub let BOA_SIZE_1M   : u64 = 0x100000
+  pub let BOA_SIZE_4M   : u64 = 0x400000
+
+  // Per-class slab capacity.
+  pub let BOA_CLASS_MAX  : u64 = 8
+  pub let BOA_SLAB_BYTES : u64 = 32
+  pub let BOA_POOL_ROWS  : u64 = 48                    // 6 * 8
+
+  // Failure taxonomy -- 0xFFFFF630..0xFFFFF63F.
+  pub let BOA_OK              : u64 = 0
+  pub let BOA_BAD_ARG         : u64 = 0xFFFFF63F
+  pub let BOA_BAD_SIZE        : u64 = 0xFFFFF63E
+  pub let BOA_BAD_CLASS       : u64 = 0xFFFFF63D
+  pub let BOA_ENOSPC          : u64 = 0xFFFFF63C
+  pub let BOA_FREE_ALREADY    : u64 = 0xFFFFF63B
+  pub let BOA_BAD_SLAB_ID     : u64 = 0xFFFFF63A
+  pub let BOA_NO_MEMORY       : u64 = 0xFFFFF639
+
+  pub let BOA_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let BOA_SLAB_NONE  : u64 = 0xFF
+
+  // Pool: BOA_POOL_ROWS * BOA_SLAB_BYTES = 1536 bytes = [u64; 192].
+  pub let mut _bo_alloc_pool  : [u64; 192] = uninit @align(64)
+  pub let mut _bo_alloc_stats : [u64; 8]   = uninit @align(64)
+
+  pub let BOA_ST_ALLOCS   : u64 = 0
+  pub let BOA_ST_FREES    : u64 = 1
+  pub let BOA_ST_ENOSPC   : u64 = 2
+  pub let BOA_ST_REFUSED  : u64 = 3
+  pub let BOA_ST_ROUND_UP : u64 = 4
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let bo_alloc_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M3-002 (#1263): clear pool and stats. Boot and teardown only. Labels prefixed boa_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _bo_alloc_pool];
+        xor rcx, rcx;
+      boa_rs_pool:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 192;
+        jb  boa_rs_pool;
+
+        lea r10, [rip + _bo_alloc_stats];
+        xor rcx, rcx;
+      boa_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  boa_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Class validators + size-to-class rounding.
+  // ==========================================================================
+
+  pub let boa_class_valid : (u64) -> u64 !{} @{} =
+    fn (c: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M3-002 (#1263): 1 iff c < BOA_CLASS_COUNT (6). Labels prefixed boa_cv_.",
+      block: {
+        cmp rdi, 6;
+        jae boa_cv_no;
+        mov rax, 1;
+        ret;
+      boa_cv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let boa_class_size : (u64) -> u64 !{} @{} =
+    fn (c: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M3-002 (#1263): class ordinal -> byte width. Refuses BAD_CLASS on out-of-range. Labels prefixed boa_cs_.",
+      block: {
+        cmp rdi, 0;
+        je  boa_cs_4k;
+        cmp rdi, 1;
+        je  boa_cs_16k;
+        cmp rdi, 2;
+        je  boa_cs_64k;
+        cmp rdi, 3;
+        je  boa_cs_256k;
+        cmp rdi, 4;
+        je  boa_cs_1m;
+        cmp rdi, 5;
+        je  boa_cs_4m;
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret;
+      boa_cs_4k:
+        mov rax, 0x1000;
+        ret;
+      boa_cs_16k:
+        mov rax, 0x4000;
+        ret;
+      boa_cs_64k:
+        mov rax, 0x10000;
+        ret;
+      boa_cs_256k:
+        mov rax, 0x40000;
+        ret;
+      boa_cs_1m:
+        mov rax, 0x100000;
+        ret;
+      boa_cs_4m:
+        mov rax, 0x400000;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // boa_size_to_class(size_bytes) -> class ordinal | DECODE_BAD
+  //
+  // Round-up-to-fit: 0 -> BAD_SIZE, > 4 MiB -> BAD_SIZE, otherwise the
+  // smallest class whose byte width is >= size. Bumps ROUND_UP when
+  // size is strictly less than the chosen class's width.
+  // ==========================================================================
+
+  pub let boa_size_to_class : (u64) -> u64 !{mem} @{} =
+    fn (size: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M3-002 (#1263): size -> smallest class that fits. 0 or >4M refused. Labels prefixed boa_sc_.",
+      block: {
+        cmp rdi, 0;
+        je  boa_sc_bad;
+        mov r10, 0x400000;               // 4 MiB
+        cmp rdi, r10;
+        ja  boa_sc_bad;
+
+        mov r10, 0x1000;                 // 4 KiB
+        cmp rdi, r10;
+        jbe boa_sc_ret0;
+        mov r10, 0x4000;                 // 16 KiB
+        cmp rdi, r10;
+        jbe boa_sc_ret1;
+        mov r10, 0x10000;                // 64 KiB
+        cmp rdi, r10;
+        jbe boa_sc_ret2;
+        mov r10, 0x40000;                // 256 KiB
+        cmp rdi, r10;
+        jbe boa_sc_ret3;
+        mov r10, 0x100000;               // 1 MiB
+        cmp rdi, r10;
+        jbe boa_sc_ret4;
+        // 4 MiB path
+        mov rax, 5;
+        ret;
+
+      boa_sc_ret0:
+        xor rax, rax;
+        ret;
+      boa_sc_ret1:
+        mov rax, 1;
+        ret;
+      boa_sc_ret2:
+        mov rax, 2;
+        ret;
+      boa_sc_ret3:
+        mov rax, 3;
+        ret;
+      boa_sc_ret4:
+        mov rax, 4;
+        ret;
+      boa_sc_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Counters.
+  // ==========================================================================
+
+  pub let boa_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M3-002 (#1263): counter bump. Labels prefixed boa_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae boa_nt_out;
+        lea r10, [rip + _bo_alloc_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      boa_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let boa_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M3-002 (#1263): counter read. Labels prefixed boa_st_.",
+      block: {
+        cmp rdi, 8;
+        jae boa_st_zero;
+        lea r10, [rip + _bo_alloc_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      boa_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // boa_alloc(class, memory_slot) -> slab_id | error
+  //
+  // Claim one slab of the requested class from the class's free list.
+  // Returns the slab_id (0..47) or:
+  //   BAD_CLASS  if class not in [0, 6)
+  //   ENOSPC     if the class's 8 slots are all in use
+  //   NO_MEMORY  if memory_slot is 0 (structural refusal; the channel
+  //              layer performs the KIND_MEMORY validation)
+  //
+  // slab_id encoding: class * BOA_CLASS_MAX + local_index. Callers
+  // reconstruct class via floor-divide, but this module offers
+  // boa_slab_class and boa_slab_memory accessors for lookup.
+  // ==========================================================================
+
+  pub let boa_alloc : (u64, u64) -> u64 !{mem} @{} =
+    fn (class: u64) (memory_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M3-002 (#1263): claim one slab of `class` backed by `memory_slot`. ONE WRITER of _bo_alloc_pool. Labels prefixed boa_a_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // class
+        mov r13, rsi;                    // memory_slot
+
+        cmp r12, 6;
+        jae boa_a_bad_class;
+
+        cmp r13, 0;
+        je  boa_a_no_memory;
+
+        // class_size for cached width.
+        mov rdi, r12;
+        call boa_class_size;
+        mov r14, rax;                    // class_size
+
+        // scan slots [class*8 .. class*8+8).
+        mov rbx, r12;
+        shl rbx, 3;                      // rbx = class * 8 = start_slot
+        mov rcx, rbx;
+        add rcx, 8;                      // end (exclusive)
+      boa_a_scan:
+        cmp rbx, rcx;
+        jae boa_a_enospc;
+
+        lea r10, [rip + _bo_alloc_pool];
+        mov r11, rbx;
+        shl r11, 5;                      // slab_bytes = 32
+        add r10, r11;
+
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  boa_a_claim;
+
+        add rbx, 1;
+        jmp boa_a_scan;
+
+      boa_a_claim:
+        mov rax, r12;
+        and rax, 0xFF;
+        mov r11, 1;
+        shl r11, 56;
+        or  rax, r11;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  r13;
+        mov [r10 + 16], r14;
+        xor rax, rax;
+        mov [r10 + 24], rax;
+
+        mov rdi, 0;                      // ALLOCS
+        call boa_note;
+
+        mov rax, rbx;
+        jmp boa_a_out;
+
+      boa_a_bad_class:
+        mov rdi, 3;
+        call boa_note;
+        mov rax, 0xFFFFF63D;
+        jmp boa_a_out;
+      boa_a_no_memory:
+        mov rdi, 3;
+        call boa_note;
+        mov rax, 0xFFFFF639;
+        jmp boa_a_out;
+      boa_a_enospc:
+        mov rdi, 2;
+        call boa_note;
+        mov rax, 0xFFFFF63C;
+
+      boa_a_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // boa_free(slab_id) -> OK | error
+  // ==========================================================================
+
+  pub let boa_free : (u64) -> u64 !{mem} @{} =
+    fn (slab_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M3-002 (#1263): release one slab. ONE WRITER. Labels prefixed boa_f_.",
+      block: {
+        cmp rdi, 48;
+        jae boa_f_bad_id;
+
+        lea r10, [rip + _bo_alloc_pool];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  boa_f_already;
+
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+
+        push rdi;
+        mov rdi, 1;                      // FREES
+        call boa_note;
+        pop rdi;
+
+        xor rax, rax;
+        ret;
+
+      boa_f_bad_id:
+        push rdi;
+        mov rdi, 3;
+        call boa_note;
+        pop rdi;
+        mov rax, 0xFFFFF63A;
+        ret;
+      boa_f_already:
+        push rdi;
+        mov rdi, 3;
+        call boa_note;
+        pop rdi;
+        mov rax, 0xFFFFF63B;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Row accessors.
+  // ==========================================================================
+
+  pub let boa_slab_valid : (u64) -> u64 !{mem} @{} =
+    fn (slab_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M3-002 (#1263): 1 iff slab in use. Labels prefixed boa_sv_.",
+      block: {
+        cmp rdi, 48;
+        jae boa_sv_no;
+        lea r10, [rip + _bo_alloc_pool];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  boa_sv_no;
+        mov rax, 1;
+        ret;
+      boa_sv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let boa_slab_class : (u64) -> u64 !{mem} @{} =
+    fn (slab_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M3-002 (#1263): slab -> class ordinal or DECODE_BAD. Labels prefixed boa_slc_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call boa_slab_valid;
+        cmp rax, 0;
+        je  boa_slc_bad;
+        lea r10, [rip + _bo_alloc_pool];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        and rax, 0xFF;
+        jmp boa_slc_out;
+      boa_slc_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      boa_slc_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let boa_slab_memory : (u64) -> u64 !{mem} @{} =
+    fn (slab_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M3-002 (#1263): slab -> memory_slot or DECODE_BAD. Labels prefixed boa_slm_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call boa_slab_valid;
+        cmp rax, 0;
+        je  boa_slm_bad;
+        lea r10, [rip + _bo_alloc_pool];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        jmp boa_slm_out;
+      boa_slm_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      boa_slm_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let boa_slab_size : (u64) -> u64 !{mem} @{} =
+    fn (slab_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M3-002 (#1263): slab -> cached size_bytes or DECODE_BAD. Labels prefixed boa_sls_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call boa_slab_valid;
+        cmp rax, 0;
+        je  boa_sls_bad;
+        lea r10, [rip + _bo_alloc_pool];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        jmp boa_sls_out;
+      boa_sls_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      boa_sls_out:
+        pop r12;
+        ret
+      }
+    }
+}
