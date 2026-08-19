@@ -1,0 +1,471 @@
+// src/kernel/core/drivers/dpy/atomic_commit.pdx — R36.M3-003 (#1246)
+//
+// Two-phase atomic commit for Intel Iris Xe display pipes. Programs
+// the plane / pipe registers in a WRITE phase (double-buffered, no
+// visible transition), then ARMS the sequence in a single ARM write
+// (GEN_CTL bit) so the transition takes effect on the next VBLANK.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the ATOMIC-COMMIT half of an Iris Xe modeset. A modeset that
+// writes SP_STRIDE, SP_LINOFF, SP_TILEOFF and PIPESRC one by one and
+// takes effect between writes produces tears: the panel scans a
+// half-programmed pipe for one frame. Real hardware avoids this by
+// double-buffering the plane / pipe register bank behind an ARM bit
+// on the GEN_CTL register: writes to the staged bank take no effect
+// until the ARM latches them at the next VBLANK.
+//
+// This module DOES NOT TOUCH REAL MMIO. Writes go through a seam whose
+// default backing is caller-supplied register snapshots. bspec §14
+// (SP_STRIDE, SP_LINOFF, SP_TILEOFF, PIPESRC, GEN_CTL) is where the
+// concrete offsets live; this scaffold's staging and arm arithmetic
+// match those offsets, so a later round can bind the seam to a live
+// window with no changes here.
+//
+// IT DOES NOT DECIDE WHICH REGISTERS TO WRITE. That is the atomic
+// modeset transaction's authority (a future round wires the
+// KIND_MODESET_TXN row's mode + plane list into the concrete
+// register values); this scaffold's job is the WRITE-then-ARM
+// ordering discipline itself.
+//
+// acom_arbitrated() returns 0 until a later round binds the seam
+// against a live MMIO window.
+//
+// =============================================================================
+// §1  THE TWO PHASES
+// =============================================================================
+//
+//   PHASE 1 (WRITE):  program SP_STRIDE, SP_LINOFF, SP_TILEOFF, PIPESRC
+//                     into the STAGING BANK through the seam. No
+//                     transition visible.
+//   PHASE 2 (ARM):    write GEN_CTL with the ARM bit set. The next
+//                     VBLANK latches the staging bank into the active
+//                     bank atomically.
+//
+// A caller that reaches ARM without having called WRITE first is
+// refused ACOM_BAD_STATE — the row's `staged` flag distinguishes.
+// A caller that WRITES twice without ARM merely overwrites the
+// staging bank (the second WRITE wins), which matches real
+// hardware behaviour.
+//
+// =============================================================================
+// §2  SAFETY ON BAD STATE
+// =============================================================================
+//
+// bspec §14 lists register values whose write while a pipe is
+// programmed at a rate incompatible with them wedges the display
+// engine into a state only a power-well cycle can recover. This
+// scaffold refuses to enter ARM with any of the following:
+//
+//   * stride == 0                (SP_STRIDE_MIN)
+//   * horizontal / vertical == 0 (SP_ACTIVE_MIN via PIPESRC)
+//   * stride not multiple of 64  (SP_STRIDE_ALIGN — cache-line
+//                                 alignment required by the plane
+//                                 fetch scheduler)
+//
+// These are BAD_STAGE refusals, thrown in acom_stage_write, before any
+// seam write.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _atomic_commit_state is written only by helpers in this module.
+// tools/build.sh confines relocations against the symbol to
+// `core/drivers/dpy/atomic_commit.o`.
+//
+// =============================================================================
+// §4  ERROR CODES 0xFFFFF700..0xFFFFF70F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used bands above: modeset_channel
+// 0xFFFFF710..1F; adjacent free bands below: mode_enum
+// 0xFFFFF6F0..FF).
+
+module AtomicCommit = structure {
+
+  // Register offsets from bspec §14. Written/read through the seam.
+  pub let ACOM_REG_SP_STRIDE  : u64 = 0x70188
+  pub let ACOM_REG_SP_LINOFF  : u64 = 0x70184
+  pub let ACOM_REG_SP_TILEOFF : u64 = 0x701A4
+  pub let ACOM_REG_PIPESRC    : u64 = 0x6001C
+  pub let ACOM_REG_GEN_CTL    : u64 = 0x70180
+
+  pub let ACOM_ARM_BIT        : u64 = 0x80000000    // GEN_CTL bit 31
+
+  pub let ACOM_STRIDE_ALIGN   : u64 = 64
+  pub let ACOM_STRIDE_MIN     : u64 = 64
+
+  // Number of pipes tracked. Iris Xe has three pipes (A/B/C); pipe D
+  // exists on Xe2 but the T14 G4 (Xe1) tops out at three. Sized to
+  // four for headroom, refused above four.
+  pub let ACOM_PIPE_COUNT     : u64 = 4
+
+  // Per-pipe staging state, 8 u64 slots per pipe * 4 pipes = 32 u64s.
+  //   [+0]  staged      0 = fresh, 1 = staged (WRITE ran)
+  //   [+8]  stride      staged SP_STRIDE
+  //   [+16] linoff      staged SP_LINOFF
+  //   [+24] tileoff     staged SP_TILEOFF
+  //   [+32] pipesrc     staged PIPESRC
+  //   [+40] arm_ticks   monotonic tick of last ARM (0 = never)
+  //   [+48] reserved
+  //   [+56] reserved
+  pub let mut _atomic_commit_state : [u64; 32] = uninit @align(64)
+  pub let mut _atomic_commit_stats : [u64; 8]  = uninit @align(64)
+
+  pub let ACOM_ST_WRITES  : u64 = 0
+  pub let ACOM_ST_ARMS    : u64 = 1
+  pub let ACOM_ST_REFUSED : u64 = 2
+
+  // Failure taxonomy — 0xFFFFF700..0xFFFFF70F.
+  pub let ACOM_OK                : u64 = 0
+  pub let ACOM_BAD_ARG           : u64 = 0xFFFFF70F
+  pub let ACOM_BAD_PIPE          : u64 = 0xFFFFF70E
+  pub let ACOM_BAD_STAGE         : u64 = 0xFFFFF70D
+  pub let ACOM_BAD_STATE         : u64 = 0xFFFFF70C
+  pub let ACOM_NOT_STAGED        : u64 = 0xFFFFF70B
+  pub let ACOM_DEFERRED_HARDWARE : u64 = 0xFFFFF70A
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let atomic_commit_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M3-003 (#1246): clear per-pipe staging state and stats. Boot and teardown. Labels prefixed acom_rs_.",
+      block: {
+        lea r10, [rip + _atomic_commit_state];
+        xor rax, rax;
+        xor rcx, rcx;
+      acom_rs_state:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  acom_rs_state;
+
+        lea r10, [rip + _atomic_commit_stats];
+        xor rcx, rcx;
+      acom_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  acom_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let acom_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R36.M3-003 (#1246): honesty pin. Returns 0 until a later round binds the seam against a live MMIO window.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let acom_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M3-003 (#1246): counter bump. Labels prefixed acom_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae acom_nt_out;
+        lea r10, [rip + _atomic_commit_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      acom_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let acom_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M3-003 (#1246): counter read. Labels prefixed acom_st_.",
+      block: {
+        cmp rdi, 8;
+        jae acom_st_zero;
+        lea r10, [rip + _atomic_commit_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      acom_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Validators.
+  // ==========================================================================
+
+  pub let acom_pipe_valid : (u64) -> u64 !{} @{} =
+    fn (pipe: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R36.M3-003 (#1246): 1 iff pipe < ACOM_PIPE_COUNT (4). Labels prefixed acom_pv_.",
+      block: {
+        cmp rdi, 4;
+        jae acom_pv_no;
+        mov rax, 1;
+        ret;
+      acom_pv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let acom_stride_valid : (u64) -> u64 !{} @{} =
+    fn (stride: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R36.M3-003 (#1246): 1 iff stride >= 64 and (stride % 64) == 0 — bspec §14 alignment. Labels prefixed acom_sv_.",
+      block: {
+        cmp rdi, 64;
+        jb  acom_sv_no;
+        mov rax, rdi;
+        mov r10, 63;
+        and rax, r10;
+        cmp rax, 0;
+        jne acom_sv_no;
+        mov rax, 1;
+        ret;
+      acom_sv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let acom_pipesrc_valid : (u64) -> u64 !{} @{} =
+    fn (ps: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R36.M3-003 (#1246): 1 iff PIPESRC's high 16 and low 16 (v and h) are both non-zero. Labels prefixed acom_ppv_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFFFF;
+        cmp rax, 0;
+        je  acom_ppv_no;
+        mov rax, rdi;
+        shr rax, 16;
+        and rax, 0xFFFF;
+        cmp rax, 0;
+        je  acom_ppv_no;
+        mov rax, 1;
+        ret;
+      acom_ppv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Phase 1: acom_stage_write(pipe, stride, linoff, tileoff, pipesrc)
+  //
+  // Programs the staging bank for `pipe`. Returns 0 on success, or
+  // one of ACOM_BAD_PIPE / ACOM_BAD_STAGE. Bumps ACOM_ST_WRITES.
+  // Does NOT emit a seam write yet (seam is arbitrated=0 this
+  // milestone); the values are stashed in _atomic_commit_state so
+  // the arm phase has them to write.
+  // ==========================================================================
+
+  pub let acom_stage_write : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (pipe: u64) (stride: u64) (linoff: u64) (tileoff: u64) (pipesrc: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M3-003 (#1246): phase-1 stage write for one pipe. Gates: pipe valid; stride >= 64 && aligned 64; pipesrc h/v both non-zero. Stashes the staged tuple and sets staged=1. Labels prefixed acom_sw_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+
+        mov rbx, rdi;                    // pipe
+        mov r12, rsi;                    // stride
+        mov r13, rdx;                    // linoff
+        mov r14, rcx;                    // tileoff
+        mov r15, r8;                     // pipesrc
+
+        mov rdi, rbx;
+        call acom_pipe_valid;
+        cmp rax, 0;
+        je  acom_sw_bad_pipe;
+
+        mov rdi, r12;
+        call acom_stride_valid;
+        cmp rax, 0;
+        je  acom_sw_bad_stage;
+
+        mov rdi, r15;
+        call acom_pipesrc_valid;
+        cmp rax, 0;
+        je  acom_sw_bad_stage;
+
+        // Write into _atomic_commit_state[pipe*8 .. pipe*8+7].
+        lea r10, [rip + _atomic_commit_state];
+        mov rbp, rbx;
+        shl rbp, 6;                      // pipe * 64 bytes = pipe * 8 * 8
+        add r10, rbp;
+
+        mov rax, 1;
+        mov [r10 + 0],  rax;             // staged
+        mov [r10 + 8],  r12;             // stride
+        mov [r10 + 16], r13;             // linoff
+        mov [r10 + 24], r14;             // tileoff
+        mov [r10 + 32], r15;             // pipesrc
+
+        mov rdi, 0;                      // ACOM_ST_WRITES
+        call acom_note;
+
+        xor rax, rax;
+        jmp acom_sw_out;
+
+      acom_sw_bad_pipe:
+        mov rdi, 2;                      // REFUSED
+        call acom_note;
+        mov rax, 0xFFFFF70E;
+        jmp acom_sw_out;
+      acom_sw_bad_stage:
+        mov rdi, 2;
+        call acom_note;
+        mov rax, 0xFFFFF70D;
+
+      acom_sw_out:
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Phase 2: acom_arm(pipe, now_ticks)
+  //
+  // Latches the previously-staged bank for `pipe`. Refuses NOT_STAGED
+  // if no prior WRITE. Bumps ACOM_ST_ARMS. Because acom_arbitrated()
+  // is 0 this milestone, the actual GEN_CTL write is deferred and
+  // ACOM_DEFERRED_HARDWARE is returned as the honesty signal.
+  // ==========================================================================
+
+  pub let acom_arm : (u64, u64) -> u64 !{mem} @{} =
+    fn (pipe: u64) (now_ticks: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M3-003 (#1246): phase-2 arm. Gates: pipe valid; staged==1 (previous WRITE ran). Stamps arm_ticks. Returns DEFERRED_HARDWARE while the seam is unbound (honesty pin, not an error). Labels prefixed acom_ar_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // pipe
+        mov r12, rsi;                    // now_ticks
+
+        mov rdi, rbx;
+        call acom_pipe_valid;
+        cmp rax, 0;
+        je  acom_ar_bad_pipe;
+
+        lea r10, [rip + _atomic_commit_state];
+        mov r13, rbx;
+        shl r13, 6;
+        add r10, r13;
+
+        mov rax, [r10 + 0];
+        cmp rax, 1;
+        jne acom_ar_not_staged;
+
+        mov [r10 + 40], r12;             // arm_ticks
+        xor rax, rax;
+        mov [r10 + 0],  rax;             // consume staged flag
+
+        mov rdi, 1;                      // ACOM_ST_ARMS
+        call acom_note;
+
+        mov rax, 0xFFFFF70A;             // DEFERRED_HARDWARE
+        jmp acom_ar_out;
+
+      acom_ar_bad_pipe:
+        mov rdi, 2;
+        call acom_note;
+        mov rax, 0xFFFFF70E;
+        jmp acom_ar_out;
+      acom_ar_not_staged:
+        mov rdi, 2;
+        call acom_note;
+        mov rax, 0xFFFFF70B;
+
+      acom_ar_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Row accessors — read the staged bank for one pipe (0 when not
+  // staged, previous ARM tick for arm_ticks).
+  // ==========================================================================
+
+  pub let acom_staged : (u64) -> u64 !{mem} @{} =
+    fn (pipe: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M3-003 (#1246): 1 iff pipe has a staged write pending. Labels prefixed acom_sg_.",
+      block: {
+        cmp rdi, 4;
+        jae acom_sg_no;
+        lea r10, [rip + _atomic_commit_state];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        ret;
+      acom_sg_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let acom_stride_of : (u64) -> u64 !{mem} @{} =
+    fn (pipe: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M3-003 (#1246): staged stride. Labels prefixed acom_sto_.",
+      block: {
+        cmp rdi, 4;
+        jae acom_sto_no;
+        lea r10, [rip + _atomic_commit_state];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        ret;
+      acom_sto_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let acom_arm_ticks : (u64) -> u64 !{mem} @{} =
+    fn (pipe: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R36.M3-003 (#1246): monotonic tick of last ARM (0 if never). Labels prefixed acom_at_.",
+      block: {
+        cmp rdi, 4;
+        jae acom_at_no;
+        lea r10, [rip + _atomic_commit_state];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 40];
+        ret;
+      acom_at_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+}

@@ -3116,6 +3116,43 @@ fi
 echo "[dpy-m2-confine] R36.M2 (display output substrate) confined"
 
 # ---------------------------------------------------------------------------
+# R36.M3 (#1244/#1245/#1246/#1247/#1248): display modeset substrate
+# (KIND_MODESET_TXN + KIND_DISPLAY_MODE + modeset_channel FSM +
+# atomic_commit + mode_enum).
+#
+# Five modules extend the R36.M2 lattice with atomic modeset. Each
+# owns its own state; tools/build.sh confines relocations against
+# each to its owning object so a second writer cannot forge a
+# modeset-transaction row, restamp a mode timing, or fabricate an
+# atomic-commit staging bank. modeset_channel is pure FSM discipline
+# (a rodata transition table + packers) — no writable state to
+# confine — but its transition-table symbol is pinned in situ.
+MTX_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_modeset_txn.pdx"
+DPM_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_display_mode.pdx"
+MCH_SRC="${REPO_ROOT}/src/kernel/core/ipc/modeset_channel.pdx"
+ACOM_SRC="${REPO_ROOT}/src/kernel/core/drivers/dpy/atomic_commit.pdx"
+MENUM_SRC="${REPO_ROOT}/src/kernel/core/drivers/dpy/mode_enum.pdx"
+if [[ ! -f "${MTX_SRC}" || ! -f "${DPM_SRC}" || ! -f "${MCH_SRC}" \
+        || ! -f "${ACOM_SRC}" || ! -f "${MENUM_SRC}" ]]; then
+    echo "[dpy-m3-confine] FAIL - one of the R36.M3 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_modeset_txn_table'    'core/cap/kind_modeset_txn.o'
+ec_confine_one '_modeset_txn_stats'    'core/cap/kind_modeset_txn.o'
+ec_confine_one '_display_mode_table'   'core/cap/kind_display_mode.o'
+ec_confine_one '_display_mode_stats'   'core/cap/kind_display_mode.o'
+ec_confine_one '_atomic_commit_state'  'core/drivers/dpy/atomic_commit.o'
+ec_confine_one '_atomic_commit_stats'  'core/drivers/dpy/atomic_commit.o'
+ec_confine_one '_menum_stats'          'core/drivers/dpy/mode_enum.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_modeset_txn.pdx §3, kind_display_mode.pdx §3," >&2
+    echo "  atomic_commit.pdx §3 and mode_enum.pdx §2 for the" >&2
+    echo "  row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[dpy-m3-confine] R36.M3 (display modeset substrate) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
