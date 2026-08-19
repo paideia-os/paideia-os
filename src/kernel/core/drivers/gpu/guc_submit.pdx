@@ -1,0 +1,631 @@
+// src/kernel/core/drivers/gpu/guc_submit.pdx — R37.M6-002 (#1277)
+//
+// Iris Xe (Gen12) GuC-mediated submission path — the doorbell-and-queue
+// substrate the KMD uses once guc_hs (#1259) reported the firmware is
+// live and speaks H2G / G2H.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the CANONICAL GuC SUBMISSION BOOKKEEPING SITE for the Xe1
+// engines.  Every submission that flows through GuC (which is every
+// submission after handshake succeeds; execlists.pdx is the fallback
+// when handshake fails or the operator disabled GuC) lands here.  A
+// second bookkeeping site would let one path claim a queue was idle
+// while the other saw it busy, and the two would race a doorbell
+// against a fresh submission.
+//
+// It is ALSO the ONE SITE that enforces SINGLE-ISSUER DISCIPLINE per
+// queue.  Every KIND_GPU_CONTEXT names a queue on the engine it binds;
+// per bspec Xe1 §21.5 a queue may hold at most one outstanding submit
+// (the GuC serializes command completion within a queue and reflects
+// completion through the CTB response ring).  A second submit against
+// a queue whose in-flight submit has not completed would either
+// overwrite the doorbell payload silently or trip the GuC's own
+// duplicate-submit refusal, and the KMD would have no local record
+// of which submit the GuC accepted.
+//
+// IT DOES NOT WRITE MMIO DIRECTLY OUTSIDE gmmio_write32.  The H2G
+// doorbell write goes through gmmio_write32 so the audit gate
+// (gpu_reg_audit) can see it.  The scratch registers this module pokes
+// (GUCSUB_REG_H2G_DBELL, GUCSUB_REG_H2G_TAIL_0..2) all fall inside the
+// gpu_reg_audit whitelist range.
+//
+// IT DOES NOT DECIDE WHICH SUBMIT WINS A QUEUE.  Priority + preemption
+// decisions live in ctx_priority.pdx; this module accepts an already-
+// decided (queue_id, submit_row_id) tuple and rejects (SUBMIT_BUSY) a
+// second submit on a busy queue.  The scheduler above chooses to wait,
+// preempt, or drop.
+//
+// IT DOES NOT ADVANCE THE KIND_GPU_SUBMIT FSM.  The submit-state
+// transition (PENDING -> SUBMITTED, SUBMITTED -> DONE / FAULTED) is
+// kind_gpu_submit's kgsub_row_transition, and this module CALLS that
+// transition after a successful start / finish.
+//
+// =============================================================================
+// §1  QUEUE MODEL
+// =============================================================================
+//
+// One queue per KIND_GPU_CONTEXT row (there are at most KGCTX_MAX = 8
+// contexts alive at once; guc_submit tracks GUCSUB_QUEUES = 8 queues).
+// A queue's queue_id is the ctx_row_id it names, so a caller that
+// already has the context row can reach the queue with no lookup.
+//
+// Per queue we track:
+//
+//   inflight_flag   1 iff a submit is in flight on this queue
+//   inflight_row    the KIND_GPU_SUBMIT row_id of the in-flight submit,
+//                   or GUCSUB_NO_ROW when the queue is idle
+//   submit_count    cumulative submits accepted on this queue
+//   complete_count  cumulative completions on this queue
+//
+// The single-issuer rule: gsub_start refuses (GUCSUB_QUEUE_BUSY) if
+// inflight_flag is already set; gsub_finish refuses (GUCSUB_QUEUE_IDLE)
+// if inflight_flag is unset.
+//
+// =============================================================================
+// §2  H2G DOORBELL LAYOUT
+// =============================================================================
+//
+// The KMD pokes GUCSUB_REG_H2G_TAIL_0..2 with three descriptor words
+// (queue_id, submit_row_id, sequence) and then rings the doorbell by
+// writing a non-zero token to GUCSUB_REG_H2G_DBELL.  A live driver
+// replaces these offsets with the bspec-declared H2G mailbox
+// (SOFT_SCRATCH_0..15 = 0xC180..0xC1BC per Intel GuC firmware header
+// layout); the substitution point is the four `GUCSUB_REG_H2G_*`
+// constants below.
+//
+//   GUCSUB_REG_H2G_TAIL_0  : 0xC180  (queue_id | in-flight bit)
+//   GUCSUB_REG_H2G_TAIL_1  : 0xC184  (submit_row_id)
+//   GUCSUB_REG_H2G_TAIL_2  : 0xC188  (sequence number)
+//   GUCSUB_REG_H2G_DBELL   : 0xC1BC  (non-zero token rings the bell)
+//
+// The doorbell token GUCSUB_DBELL_TOKEN mirrors the SLPC init token
+// discipline in guc_hs — a non-zero sentinel the GuC treats as
+// "process the tail".
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _gsub_queues, _gsub_seq, and _gsub_stats are written only by helpers
+// in this module.  tools/build.sh confines relocations against each to
+// core/drivers/gpu/guc_submit.o.
+//
+// =============================================================================
+// §4  FAILURE TAXONOMY 0xFFFFF550..0xFFFFF55F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: kind_gpu_submit
+// 0xFFFFF560..6F; adjacent free band below: batch_builder
+// 0xFFFFF540..4F).
+
+module GucSubmit = structure {
+
+  // §1: queue capacity.
+  pub let GUCSUB_QUEUES     : u64 = 8
+  pub let GUCSUB_NO_ROW     : u64 = 0xFF
+
+  // §2: register offsets (inside the gpu_reg_audit whitelist range).
+  pub let GUCSUB_REG_H2G_TAIL_0 : u64 = 0xC180
+  pub let GUCSUB_REG_H2G_TAIL_1 : u64 = 0xC184
+  pub let GUCSUB_REG_H2G_TAIL_2 : u64 = 0xC188
+  pub let GUCSUB_REG_H2G_DBELL  : u64 = 0xC1BC
+
+  // §2: doorbell token — non-zero sentinel.
+  pub let GUCSUB_DBELL_TOKEN : u64 = 0xD00B5E11
+
+  // Failure taxonomy -- 0xFFFFF550..0xFFFFF55F.
+  pub let GUCSUB_OK              : u64 = 0
+  pub let GUCSUB_BAD_QUEUE       : u64 = 0xFFFFF55F
+  pub let GUCSUB_BAD_ROW         : u64 = 0xFFFFF55E
+  pub let GUCSUB_QUEUE_BUSY      : u64 = 0xFFFFF55D    // single-issuer trip
+  pub let GUCSUB_QUEUE_IDLE      : u64 = 0xFFFFF55C    // finish on idle queue
+  pub let GUCSUB_MMIO_NOT_BOUND  : u64 = 0xFFFFF55B
+  pub let GUCSUB_MMIO_REFUSED    : u64 = 0xFFFFF55A
+  pub let GUCSUB_BAD_ARG         : u64 = 0xFFFFF559
+
+  pub let GUCSUB_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // §1: per-queue record -- 32 bytes.
+  //   [+0]  inflight_flag[7:0] | inflight_row[15:8]
+  //   [+8]  submit_count (u64)
+  //   [+16] complete_count (u64)
+  //   [+24] reserved
+  //
+  // Eight queues * 32 B = 256 B as [u64; 32].
+  pub let mut _gsub_queues : [u64; 32] = uninit @align(64)
+
+  // Monotonic sequence counter -- one u64.
+  pub let mut _gsub_seq : [u64; 1] = uninit @align(64)
+
+  // Counters.
+  pub let mut _gsub_stats : [u64; 8] = uninit @align(64)
+
+  pub let GUCSUB_ST_STARTS   : u64 = 0
+  pub let GUCSUB_ST_FINISHES : u64 = 1
+  pub let GUCSUB_ST_REFUSED  : u64 = 2
+  pub let GUCSUB_ST_DBELLS   : u64 = 3
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let guc_submit_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-002 (#1277): clear per-queue records + counters. Boot and teardown only. Labels prefixed gsub_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _gsub_queues];
+        xor rcx, rcx;
+      gsub_rs_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  gsub_rs_rows;
+
+        lea r10, [rip + _gsub_seq];
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _gsub_stats];
+        xor rcx, rcx;
+      gsub_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  gsub_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Counters.
+  // ==========================================================================
+
+  pub let gsub_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-002 (#1277): counter bump. Labels prefixed gsub_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae gsub_nt_out;
+        lea r10, [rip + _gsub_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      gsub_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let gsub_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-002 (#1277): counter read. Labels prefixed gsub_stt_.",
+      block: {
+        cmp rdi, 8;
+        jae gsub_stt_zero;
+        lea r10, [rip + _gsub_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      gsub_stt_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Validators.
+  // ==========================================================================
+
+  pub let gsub_queue_valid : (u64) -> u64 !{} @{} =
+    fn (q: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M6-002 (#1277): 1 iff q < GUCSUB_QUEUES (8). Labels prefixed gsub_qv_.",
+      block: {
+        cmp rdi, 8;
+        jae gsub_qv_no;
+        mov rax, 1;
+        ret;
+      gsub_qv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Queue accessors.
+  // ==========================================================================
+
+  pub let gsub_queue_busy : (u64) -> u64 !{mem} @{} =
+    fn (queue_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-002 (#1277): 1 iff queue has an in-flight submit. Labels prefixed gsub_qb_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call gsub_queue_valid;
+        cmp rax, 0;
+        je  gsub_qb_no;
+        lea r10, [rip + _gsub_queues];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        and rax, 0xFF;
+        cmp rax, 0;
+        je  gsub_qb_no;
+        mov rax, 1;
+        jmp gsub_qb_out;
+      gsub_qb_no:
+        xor rax, rax;
+      gsub_qb_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let gsub_queue_inflight_row : (u64) -> u64 !{mem} @{} =
+    fn (queue_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-002 (#1277): in-flight KIND_GPU_SUBMIT row_id, or NO_ROW. Labels prefixed gsub_qir_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call gsub_queue_valid;
+        cmp rax, 0;
+        je  gsub_qir_none;
+        lea r10, [rip + _gsub_queues];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        // Check inflight_flag first; if unset, return NO_ROW.
+        mov r11, rax;
+        and r11, 0xFF;
+        cmp r11, 0;
+        je  gsub_qir_none;
+        shr rax, 8;
+        and rax, 0xFF;
+        jmp gsub_qir_out;
+      gsub_qir_none:
+        mov rax, 0xFF;
+      gsub_qir_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let gsub_queue_submits : (u64) -> u64 !{mem} @{} =
+    fn (queue_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-002 (#1277): cumulative submits on queue. Labels prefixed gsub_qs_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call gsub_queue_valid;
+        cmp rax, 0;
+        je  gsub_qs_bad;
+        lea r10, [rip + _gsub_queues];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        jmp gsub_qs_out;
+      gsub_qs_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      gsub_qs_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let gsub_queue_completes : (u64) -> u64 !{mem} @{} =
+    fn (queue_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-002 (#1277): cumulative completions on queue. Labels prefixed gsub_qc_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call gsub_queue_valid;
+        cmp rax, 0;
+        je  gsub_qc_bad;
+        lea r10, [rip + _gsub_queues];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        jmp gsub_qc_out;
+      gsub_qc_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      gsub_qc_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let gsub_seq_read : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-002 (#1277): current monotonic sequence. Labels prefixed gsub_sr_.",
+      block: {
+        lea r10, [rip + _gsub_seq];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // gsub_ring_doorbell(queue_id, submit_row_id, seq) — pokes the H2G tail
+  // registers and the doorbell.  Every register touch is a gmmio_write32
+  // so the audit gate sees it.  Refuses if the MMIO BAR is not bound
+  // (a boot ordering fingerprint).
+  // ==========================================================================
+
+  pub let gsub_ring_doorbell : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (queue_id: u64) (submit_row_id: u64) (seq: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R37.M6-002 (#1277): pack (queue_id, submit_row_id, seq) into H2G tail scratch registers and ring the doorbell. Every register touch goes through gmmio_write32 so the audit gate can see it. Labels prefixed gsub_rd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;
+        mov r13, rsi;
+        mov r14, rdx;
+
+        call gmmio_is_bound;
+        cmp rax, 0;
+        je  gsub_rd_mmio;
+
+        // TAIL_0: queue_id | in-flight sentinel (bit 31)
+        mov rdi, 0xC180;
+        mov rsi, r12;
+        and rsi, 0xFF;
+        mov r11, 0x80000000;
+        or  rsi, r11;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne gsub_rd_mmio_refused;
+
+        // TAIL_1: submit_row_id
+        mov rdi, 0xC184;
+        mov rsi, r13;
+        and rsi, 0xFF;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne gsub_rd_mmio_refused;
+
+        // TAIL_2: seq
+        mov rdi, 0xC188;
+        mov rsi, r14;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne gsub_rd_mmio_refused;
+
+        // Doorbell: non-zero token.
+        mov rdi, 0xC1BC;
+        mov rsi, 0xD00B5E11;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne gsub_rd_mmio_refused;
+
+        mov rdi, 3;                      // DBELLS counter
+        call gsub_note;
+
+        xor rax, rax;
+        jmp gsub_rd_out;
+
+      gsub_rd_mmio:
+        mov rax, 0xFFFFF55B;
+        jmp gsub_rd_out;
+      gsub_rd_mmio_refused:
+        mov rax, 0xFFFFF55A;
+
+      gsub_rd_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gsub_start(queue_id, submit_row_id) — claim the queue for one
+  // submit.  THE ONE WRITER of a queue's inflight_flag / inflight_row
+  // fields (positive edge).  Refuses:
+  //   BAD_QUEUE      queue_id >= GUCSUB_QUEUES
+  //   BAD_ROW        submit_row_id >= 0xFF (row-id byte overflow)
+  //   QUEUE_BUSY     queue already has an in-flight submit
+  //   MMIO_*         MMIO BAR unbound or a scratch write refused
+  //
+  // On success, allocates a fresh sequence, rings the doorbell, and
+  // stamps (inflight_flag=1, inflight_row=submit_row_id, submit_count+=1).
+  // The KIND_GPU_SUBMIT FSM transition to SUBMITTED is the CALLER'S
+  // responsibility (kgsub_row_transition) so this module remains
+  // decoupled from kind_gpu_submit's row layout.
+  // ==========================================================================
+
+  pub let gsub_start : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (queue_id: u64) (submit_row_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R37.M6-002 (#1277): enforce single-issuer discipline, ring the doorbell, mark queue busy. THE ONE WRITER of per-queue inflight_flag / inflight_row (positive edge). Labels prefixed gsub_s_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // queue_id
+        mov r13, rsi;                    // submit_row_id
+
+        mov rdi, r12;
+        call gsub_queue_valid;
+        cmp rax, 0;
+        je  gsub_s_bad_queue;
+
+        cmp r13, 0xFF;
+        jae gsub_s_bad_row;
+
+        lea r10, [rip + _gsub_queues];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rbx, r10;                    // queue record base
+
+        // Single-issuer trip: inflight_flag[7:0]
+        mov rax, [rbx + 0];
+        and rax, 0xFF;
+        cmp rax, 0;
+        jne gsub_s_busy;
+
+        // Fresh sequence.
+        lea r10, [rip + _gsub_seq];
+        mov rax, [r10 + 0];
+        add rax, 1;
+        mov [r10 + 0], rax;
+        mov r14, rax;                    // stashed seq
+
+        // Ring the doorbell.  This is the ONE call site that pokes
+        // the H2G scratch registers; if MMIO refuses, we do NOT
+        // stamp the queue busy (fail atomically).
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r14;
+        call gsub_ring_doorbell;
+        cmp rax, 0;
+        jne gsub_s_dbell_fail;
+
+        // Stamp inflight_flag=1, inflight_row=submit_row_id.
+        mov rax, r13;
+        and rax, 0xFF;
+        shl rax, 8;
+        or  rax, 0xFF;                   // inflight_flag = 0xFF (sentinel)
+        mov [rbx + 0], rax;
+
+        // submit_count += 1
+        mov rax, [rbx + 8];
+        add rax, 1;
+        mov [rbx + 8], rax;
+
+        mov rdi, 0;                      // STARTS
+        call gsub_note;
+
+        xor rax, rax;
+        jmp gsub_s_out;
+
+      gsub_s_bad_queue:
+        mov rdi, 2;
+        call gsub_note;
+        mov rax, 0xFFFFF55F;
+        jmp gsub_s_out;
+      gsub_s_bad_row:
+        mov rdi, 2;
+        call gsub_note;
+        mov rax, 0xFFFFF55E;
+        jmp gsub_s_out;
+      gsub_s_busy:
+        mov rdi, 2;
+        call gsub_note;
+        mov rax, 0xFFFFF55D;
+        jmp gsub_s_out;
+      gsub_s_dbell_fail:
+        // rax already holds MMIO_NOT_BOUND or MMIO_REFUSED — propagate.
+        mov r14, rax;
+        mov rdi, 2;
+        call gsub_note;
+        mov rax, r14;
+
+      gsub_s_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gsub_finish(queue_id) — consume the completion for a queue's
+  // in-flight submit.  THE ONE WRITER of a queue's inflight_flag /
+  // inflight_row fields (negative edge).  Refuses:
+  //   BAD_QUEUE      queue_id >= GUCSUB_QUEUES
+  //   QUEUE_IDLE     nothing in flight on the queue
+  //
+  // Returns the KIND_GPU_SUBMIT row_id that just completed, so the
+  // caller can advance its FSM to DONE / FAULTED and free.  The
+  // KIND_GPU_SUBMIT FSM transition is the CALLER'S responsibility.
+  // ==========================================================================
+
+  pub let gsub_finish : (u64) -> u64 !{mem} @{} =
+    fn (queue_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-002 (#1277): consume one completion from a queue. THE ONE WRITER of per-queue inflight_flag / inflight_row (negative edge). Returns the completed row_id. Labels prefixed gsub_f_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+
+        mov rdi, r12;
+        call gsub_queue_valid;
+        cmp rax, 0;
+        je  gsub_f_bad_queue;
+
+        lea r10, [rip + _gsub_queues];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rbx, r10;
+
+        mov rax, [rbx + 0];
+        mov r10, rax;
+        and r10, 0xFF;
+        cmp r10, 0;
+        je  gsub_f_idle;
+
+        // Snapshot in-flight row_id before clearing.
+        mov r13, rax;
+        shr r13, 8;
+        and r13, 0xFF;
+
+        // Clear inflight_flag and inflight_row atomically.
+        xor rax, rax;
+        mov [rbx + 0], rax;
+
+        // complete_count += 1
+        mov rax, [rbx + 16];
+        add rax, 1;
+        mov [rbx + 16], rax;
+
+        mov rdi, 1;                      // FINISHES
+        call gsub_note;
+
+        mov rax, r13;
+        jmp gsub_f_out;
+
+      gsub_f_bad_queue:
+        mov rdi, 2;
+        call gsub_note;
+        mov rax, 0xFFFFF55F;
+        jmp gsub_f_out;
+      gsub_f_idle:
+        mov rdi, 2;
+        call gsub_note;
+        mov rax, 0xFFFFF55C;
+
+      gsub_f_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

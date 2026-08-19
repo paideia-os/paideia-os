@@ -3408,6 +3408,36 @@ fi
 echo "[gpu-m5-confine] R37.M5 (GPU submission-context substrate) confined"
 
 # ---------------------------------------------------------------------------
+# R37.M6 (#1276/#1277/#1279): GPU submission substrate --
+# KIND_GPU_SUBMIT (kind_gpu_submit), GuC-mediated submission
+# (guc_submit), batch buffer builder (batch_builder).
+#
+# Three modules open R37.M6 (post-R37.M5).  Each owns its own state;
+# tools/build.sh confines relocations against each to its owning object
+# so a second writer cannot forge a GPU SUBMIT row, drift a queue's
+# single-issuer inflight flag, or restamp the batch builder cursor.
+KGSUB_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_gpu_submit.pdx"
+GSUB_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/guc_submit.pdx"
+BAT_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/batch_builder.pdx"
+if [[ ! -f "${KGSUB_SRC}" || ! -f "${GSUB_SRC}" || ! -f "${BAT_SRC}" ]]; then
+    echo "[gpu-m6-confine] FAIL - one of the R37.M6 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_gpu_submit_table' 'core/cap/kind_gpu_submit.o'
+ec_confine_one '_gpu_submit_stats' 'core/cap/kind_gpu_submit.o'
+ec_confine_one '_gsub_queues'      'core/drivers/gpu/guc_submit.o'
+ec_confine_one '_gsub_seq'         'core/drivers/gpu/guc_submit.o'
+ec_confine_one '_gsub_stats'       'core/drivers/gpu/guc_submit.o'
+ec_confine_one '_bat_builder'      'core/drivers/gpu/batch_builder.o'
+ec_confine_one '_bat_stats'        'core/drivers/gpu/batch_builder.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_gpu_submit.pdx §2, guc_submit.pdx §3," >&2
+    echo "  batch_builder.pdx §3 for the row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[gpu-m6-confine] R37.M6 (GPU submission substrate) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

@@ -1,0 +1,619 @@
+// src/kernel/core/drivers/gpu/batch_builder.pdx — R37.M6-003 (#1279)
+//
+// Iris Xe (Gen12) batch buffer builder — the cursor-and-emit substrate
+// that stamps MI_* and PIPE_CONTROL opcodes into a KIND_GPU_BO-backed
+// batch buffer.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the CANONICAL BATCH-BUFFER EMISSION SITE for the Xe1 command
+// stream.  Every command word a batch carries -- MI_NOOP, MI_STORE_
+// DWORD_IMM, MI_BATCH_BUFFER_START, MI_BATCH_BUFFER_END, PIPE_CONTROL
+// -- is written through this module.  A second emitter would let one
+// path stamp an unaligned dword or forget to increment the cursor, and
+// the GPU would either fault on an unaligned fetch or race a stale
+// tail write.
+//
+// It is ALSO the ONE SITE that bounds-checks a batch buffer against
+// its declared size (from the KIND_GPU_BO the caller of bat_builder_
+// begin held).  Per bspec Xe1 §5.3 a batch that overruns its buffer
+// leaves the tail of the write in an adjacent object -- the classic
+// silent-corruption fingerprint the audit gate cannot see.  A second
+// bounds checker would let one path clip and the other truncate, and
+// the two would drift silently through submission cycles.
+//
+// IT DOES NOT SUBMIT THE BATCH.  Submission (queue arbitration,
+// doorbell) is guc_submit.pdx.  This module produces the batch bytes
+// the KIND_GPU_SUBMIT row references; the submit-path caller is
+// responsible for ensuring MI_BATCH_BUFFER_END is stamped before the
+// doorbell rings.
+//
+// IT DOES NOT ALLOCATE THE BATCH BO.  The BO comes from bo_alloc
+// under KIND_GPU_BO authority the caller holds; this module records
+// the (bo_backing_ptr, capacity_bytes) tuple at begin and refuses
+// writes past capacity.
+//
+// IT DOES NOT WRITE MMIO.  MI_* and PIPE_CONTROL are memory writes to
+// the batch buffer, not register writes; nothing here touches the GPU
+// MMIO window.
+//
+// =============================================================================
+// §1  SUPPORTED OPCODES (BSPEC XE1 §5.3, §5.4)
+// =============================================================================
+//
+//   MI_NOOP                    0x00000000   (u32; one dword)
+//   MI_STORE_DWORD_IMM         0x20000000   (u32; four dwords total:
+//                                            header, addr_lo, addr_hi, value)
+//   MI_BATCH_BUFFER_START      0x31800001   (u32; three dwords total:
+//                                            header, addr_lo, addr_hi)
+//   MI_BATCH_BUFFER_END        0x05000000   (u32; one dword)
+//   PIPE_CONTROL               0x7A000004   (u32; six dwords total:
+//                                            header+flags, addr_lo,
+//                                            addr_hi, imm_lo, imm_hi,
+//                                            aux)
+//
+// PIPE_CONTROL header carries the flush-flags mask in bits [27:12]:
+//
+//   BAT_PC_CS_STALL                    (1 << 20)
+//   BAT_PC_DC_FLUSH                    (1 << 5)
+//   BAT_PC_RENDER_TARGET_CACHE_FLUSH   (1 << 12)
+//
+// The header field bits [15:0] carry the "dword count minus 2" (per
+// bspec) — for PIPE_CONTROL that is 4.
+//
+// =============================================================================
+// §2  BUILDER STATE
+// =============================================================================
+//
+// A builder session tracks:
+//
+//   backing_ptr     the KIND_GPU_BO's backing kernel address
+//   capacity_bytes  the KIND_GPU_BO's declared size
+//   cursor          current byte offset into the batch (0..capacity)
+//   active          1 iff a session is live
+//
+// Only ONE session may be live at a time -- there is exactly one
+// builder in the system.  A second concurrent session would let two
+// callers stamp into the same or overlapping backing, and the GPU
+// would fetch a torn header.  bat_builder_begin refuses (BAT_BUSY) if
+// active is already set; bat_builder_end clears active.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _bat_builder and _bat_stats are written only by helpers in this
+// module.  tools/build.sh confines relocations against each to
+// core/drivers/gpu/batch_builder.o.
+//
+// =============================================================================
+// §4  FAILURE TAXONOMY 0xFFFFF540..0xFFFFF54F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: guc_submit
+// 0xFFFFF550..5F; adjacent free band below: available for future
+// R37.M6 modules).
+
+module BatchBuilder = structure {
+
+  // §1: opcode constants.
+  pub let BAT_MI_NOOP             : u64 = 0x00000000
+  pub let BAT_MI_STORE_DWORD_IMM  : u64 = 0x20000000
+  pub let BAT_MI_BATCH_BUFFER_START : u64 = 0x31800001
+  pub let BAT_MI_BATCH_BUFFER_END : u64 = 0x05000000
+  pub let BAT_PIPE_CONTROL        : u64 = 0x7A000004
+
+  // §1: PIPE_CONTROL flush-flag bits.
+  pub let BAT_PC_CS_STALL                  : u64 = 0x00100000  // 1 << 20
+  pub let BAT_PC_DC_FLUSH                  : u64 = 0x00000020  // 1 << 5
+  pub let BAT_PC_RENDER_TARGET_CACHE_FLUSH : u64 = 0x00001000  // 1 << 12
+  pub let BAT_PC_FLAG_MASK                 : u64 = 0x0FFFF000
+
+  // §1: opcode extents in bytes.
+  pub let BAT_MI_NOOP_BYTES         : u64 = 4
+  pub let BAT_MI_STORE_DWORD_IMM_BYTES : u64 = 16
+  pub let BAT_MI_BATCH_START_BYTES  : u64 = 12
+  pub let BAT_MI_BATCH_END_BYTES    : u64 = 4
+  pub let BAT_PIPE_CONTROL_BYTES    : u64 = 24
+
+  // Failure taxonomy -- 0xFFFFF540..0xFFFFF54F.
+  pub let BAT_OK              : u64 = 0
+  pub let BAT_BAD_ARG         : u64 = 0xFFFFF54F
+  pub let BAT_BUSY            : u64 = 0xFFFFF54E    // second concurrent begin
+  pub let BAT_IDLE            : u64 = 0xFFFFF54D    // emit / end without begin
+  pub let BAT_OVERFLOW        : u64 = 0xFFFFF54C    // cursor + n > capacity
+  pub let BAT_MISALIGNED      : u64 = 0xFFFFF54B    // cursor not 4-byte aligned
+  pub let BAT_BAD_FLAGS       : u64 = 0xFFFFF54A    // PIPE_CONTROL flags outside mask
+  pub let BAT_BAD_OPCODE      : u64 = 0xFFFFF549
+
+  pub let BAT_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // §2: builder record -- 32 bytes.
+  //   [+0]  active_flag[7:0] | reserved[63:8]
+  //   [+8]  backing_ptr (u64)
+  //   [+16] capacity_bytes (u64)
+  //   [+24] cursor (u64; byte offset)
+  pub let mut _bat_builder : [u64; 4] = uninit @align(64)
+
+  // Counters.
+  pub let mut _bat_stats : [u64; 8] = uninit @align(64)
+
+  pub let BAT_ST_BEGINS        : u64 = 0
+  pub let BAT_ST_ENDS          : u64 = 1
+  pub let BAT_ST_APPENDS       : u64 = 2
+  pub let BAT_ST_REFUSED       : u64 = 3
+  pub let BAT_ST_OVERFLOWS     : u64 = 4
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let batch_builder_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-003 (#1279): clear builder record + counters. Boot and teardown only. Labels prefixed bat_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _bat_builder];
+        xor rcx, rcx;
+      bat_rs_rec:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  bat_rs_rec;
+
+        lea r10, [rip + _bat_stats];
+        xor rcx, rcx;
+      bat_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  bat_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Counters.
+  // ==========================================================================
+
+  pub let bat_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-003 (#1279): counter bump. Labels prefixed bat_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae bat_nt_out;
+        lea r10, [rip + _bat_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      bat_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let bat_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-003 (#1279): counter read. Labels prefixed bat_stt_.",
+      block: {
+        cmp rdi, 8;
+        jae bat_stt_zero;
+        lea r10, [rip + _bat_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      bat_stt_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Accessors.
+  // ==========================================================================
+
+  pub let bat_active : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-003 (#1279): 1 iff a session is live. Labels prefixed bat_a_.",
+      block: {
+        lea r10, [rip + _bat_builder];
+        mov rax, [r10 + 0];
+        and rax, 0xFF;
+        cmp rax, 0;
+        je  bat_a_no;
+        mov rax, 1;
+        ret;
+      bat_a_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let bat_cursor : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-003 (#1279): current byte offset. Labels prefixed bat_c_.",
+      block: {
+        lea r10, [rip + _bat_builder];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let bat_capacity : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-003 (#1279): declared batch capacity. Labels prefixed bat_cap_.",
+      block: {
+        lea r10, [rip + _bat_builder];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let bat_backing : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-003 (#1279): backing pointer. Labels prefixed bat_bk_.",
+      block: {
+        lea r10, [rip + _bat_builder];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // batch_builder_begin(backing_ptr, capacity_bytes) — open a session.
+  // Refuses:
+  //   BAT_BUSY       another session is live
+  //   BAT_BAD_ARG    backing_ptr == 0, capacity < 4, or capacity not
+  //                  multiple of 4
+  // ==========================================================================
+
+  pub let batch_builder_begin : (u64, u64) -> u64 !{mem} @{} =
+    fn (backing_ptr: u64) (capacity_bytes: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-003 (#1279): open a builder session. THE ONE WRITER of _bat_builder (positive edge). Labels prefixed bat_bg_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        mov r13, rsi;
+
+        // BUSY?
+        call bat_active;
+        cmp rax, 0;
+        jne bat_bg_busy;
+
+        // Argument validation.
+        cmp r12, 0;
+        je  bat_bg_bad;
+        cmp r13, 4;
+        jb  bat_bg_bad;
+        mov rax, r13;
+        and rax, 0x3;
+        cmp rax, 0;
+        jne bat_bg_bad;
+
+        lea r10, [rip + _bat_builder];
+        mov rax, 0xFF;                   // active_flag
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  r12;
+        mov [r10 + 16], r13;
+        xor rax, rax;
+        mov [r10 + 24], rax;             // cursor = 0
+
+        mov rdi, 0;                      // BEGINS
+        call bat_note;
+
+        xor rax, rax;
+        jmp bat_bg_out;
+
+      bat_bg_busy:
+        mov rdi, 3;
+        call bat_note;
+        mov rax, 0xFFFFF54E;
+        jmp bat_bg_out;
+      bat_bg_bad:
+        mov rdi, 3;
+        call bat_note;
+        mov rax, 0xFFFFF54F;
+
+      bat_bg_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // batch_builder_end() — close a session. Refuses BAT_IDLE if no
+  // session is live.  Returns the final cursor value on success so the
+  // caller can record the batch length.
+  // ==========================================================================
+
+  pub let batch_builder_end : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-003 (#1279): close a builder session. THE ONE WRITER of _bat_builder (negative edge). Labels prefixed bat_e_.",
+      block: {
+        push r12;
+
+        call bat_active;
+        cmp rax, 0;
+        je  bat_e_idle;
+
+        // Snapshot cursor.
+        lea r10, [rip + _bat_builder];
+        mov r12, [r10 + 24];
+
+        // Scrub.
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+
+        mov rdi, 1;                      // ENDS
+        call bat_note;
+
+        mov rax, r12;
+        jmp bat_e_out;
+
+      bat_e_idle:
+        mov rdi, 3;
+        call bat_note;
+        mov rax, 0xFFFFF54D;
+
+      bat_e_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // bat_append_dword(dword) — the ONE WRITER of the backing buffer.
+  // Refuses:
+  //   BAT_IDLE       no session live
+  //   BAT_MISALIGNED cursor not 4-byte aligned (defensive; should not
+  //                  happen given begin validates capacity)
+  //   BAT_OVERFLOW   cursor + 4 > capacity
+  // On success bumps cursor by 4 and returns OK.
+  // ==========================================================================
+
+  pub let bat_append_dword : (u64) -> u64 !{mem} @{} =
+    fn (dword: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-003 (#1279): store one dword at (backing + cursor); bump cursor. THE ONE WRITER of the backing buffer. Labels prefixed bat_ad_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov r12, rdi;                    // dword
+
+        call bat_active;
+        cmp rax, 0;
+        je  bat_ad_idle;
+
+        lea rbx, [rip + _bat_builder];
+
+        mov rax, [rbx + 24];             // cursor
+        // Alignment.
+        mov r10, rax;
+        and r10, 0x3;
+        cmp r10, 0;
+        jne bat_ad_misaligned;
+        // Overflow: cursor + 4 <= capacity
+        mov r10, rax;
+        add r10, 4;
+        mov r11, [rbx + 16];             // capacity
+        cmp r10, r11;
+        ja  bat_ad_overflow;
+
+        // Store at backing + cursor (low 32 bits of r12).
+        mov r10, [rbx + 8];              // backing_ptr
+        add r10, rax;                    // + cursor
+        mov [r10 + 0], r12d;
+
+        // Bump cursor by 4.
+        mov rax, [rbx + 24];
+        add rax, 4;
+        mov [rbx + 24], rax;
+
+        mov rdi, 2;                      // APPENDS
+        call bat_note;
+
+        xor rax, rax;
+        jmp bat_ad_out;
+
+      bat_ad_idle:
+        mov rdi, 3;
+        call bat_note;
+        mov rax, 0xFFFFF54D;
+        jmp bat_ad_out;
+      bat_ad_misaligned:
+        mov rdi, 3;
+        call bat_note;
+        mov rax, 0xFFFFF54B;
+        jmp bat_ad_out;
+      bat_ad_overflow:
+        mov rdi, 4;                      // OVERFLOWS
+        call bat_note;
+        mov rax, 0xFFFFF54C;
+
+      bat_ad_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Emit helpers -- one per opcode.  Each returns OK or the underlying
+  // bat_append_dword failure code.
+  // ==========================================================================
+
+  pub let bat_emit_noop : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-003 (#1279): MI_NOOP (one dword). Labels prefixed bat_en_.",
+      block: {
+        mov rdi, 0x00000000;
+        call bat_append_dword;
+        ret
+      }
+    }
+
+  pub let bat_emit_batch_end : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-003 (#1279): MI_BATCH_BUFFER_END (one dword). Labels prefixed bat_ee_.",
+      block: {
+        mov rdi, 0x05000000;
+        call bat_append_dword;
+        ret
+      }
+    }
+
+  pub let bat_emit_store_dword_imm : (u64, u64) -> u64 !{mem} @{} =
+    fn (address: u64) (value: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-003 (#1279): MI_STORE_DWORD_IMM (four dwords: header, addr_lo, addr_hi, value). Labels prefixed bat_es_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        mov r13, rsi;
+
+        // Header.
+        mov rdi, 0x20000000;
+        call bat_append_dword;
+        cmp rax, 0;
+        jne bat_es_out;
+        // addr_lo
+        mov rdi, r12;
+        and rdi, 0xFFFFFFFF;
+        call bat_append_dword;
+        cmp rax, 0;
+        jne bat_es_out;
+        // addr_hi
+        mov rdi, r12;
+        shr rdi, 32;
+        and rdi, 0xFFFFFFFF;
+        call bat_append_dword;
+        cmp rax, 0;
+        jne bat_es_out;
+        // value
+        mov rdi, r13;
+        and rdi, 0xFFFFFFFF;
+        call bat_append_dword;
+
+      bat_es_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  pub let bat_emit_batch_start : (u64) -> u64 !{mem} @{} =
+    fn (target_addr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-003 (#1279): MI_BATCH_BUFFER_START (three dwords: header, addr_lo, addr_hi). Labels prefixed bat_ebs_.",
+      block: {
+        push r12;
+
+        mov r12, rdi;
+
+        mov rdi, 0x31800001;
+        call bat_append_dword;
+        cmp rax, 0;
+        jne bat_ebs_out;
+        mov rdi, r12;
+        and rdi, 0xFFFFFFFF;
+        call bat_append_dword;
+        cmp rax, 0;
+        jne bat_ebs_out;
+        mov rdi, r12;
+        shr rdi, 32;
+        and rdi, 0xFFFFFFFF;
+        call bat_append_dword;
+
+      bat_ebs_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // PIPE_CONTROL: header carries the flush-flags mask in bits [27:12].
+  // Refuses BAD_FLAGS if `flags` carries any bit outside BAT_PC_FLAG_MASK.
+  // Six dwords total: header+flags, addr_lo, addr_hi, imm_lo, imm_hi, aux.
+  //
+  // The address / immediate operands are 0 for the R37.M6 scope (no
+  // post-sync writeback consumer yet); the shape is fixed so a future
+  // consumer can turn the operands on without changing the emit
+  // arity.
+  pub let bat_emit_pipe_control : (u64) -> u64 !{mem} @{} =
+    fn (flags: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M6-003 (#1279): PIPE_CONTROL (six dwords). flags must be a subset of BAT_PC_FLAG_MASK = 0x0FFFF000. Labels prefixed bat_epc_.",
+      block: {
+        push r12;
+
+        mov r12, rdi;
+
+        // Validate flags subset.
+        mov rax, r12;
+        mov r10, 0x0FFFF000;
+        and rax, r10;
+        cmp rax, r12;
+        jne bat_epc_bad_flags;
+
+        // header = 0x7A000004 | flags
+        mov rdi, 0x7A000004;
+        or  rdi, r12;
+        call bat_append_dword;
+        cmp rax, 0;
+        jne bat_epc_out;
+        // addr_lo = 0
+        mov rdi, 0;
+        call bat_append_dword;
+        cmp rax, 0;
+        jne bat_epc_out;
+        // addr_hi = 0
+        mov rdi, 0;
+        call bat_append_dword;
+        cmp rax, 0;
+        jne bat_epc_out;
+        // imm_lo = 0
+        mov rdi, 0;
+        call bat_append_dword;
+        cmp rax, 0;
+        jne bat_epc_out;
+        // imm_hi = 0
+        mov rdi, 0;
+        call bat_append_dword;
+        cmp rax, 0;
+        jne bat_epc_out;
+        // aux = 0
+        mov rdi, 0;
+        call bat_append_dword;
+        jmp bat_epc_out;
+
+      bat_epc_bad_flags:
+        mov rdi, 3;
+        call bat_note;
+        mov rax, 0xFFFFF54A;
+
+      bat_epc_out:
+        pop r12;
+        ret
+      }
+    }
+}
