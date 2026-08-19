@@ -2827,6 +2827,41 @@ fi
 echo "[dma-consent-confine] DMA attestation + IOMMU consent state confined"
 
 # ---------------------------------------------------------------------------
+# R35.M5 (#1215/#1216/#1217/#1218): TB4 security policy substrate state
+# confinement.
+#
+# Four modules extend the R35.M1..M4 substrate with the security-policy
+# layer: cascade validation harness, per-dock security level policy,
+# trusted-device enrollment, external-DMA active indicator. Each owns
+# its own row table / stats / counter; tools/build.sh confines
+# relocations against each to its owning object so a second writer
+# cannot forge a policy decision, restamp a trust-table row, or bump
+# the DMA-active counter behind the publish seam's back.
+CHR_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/cascade_harness.pdx"
+SEC_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/security_policy.pdx"
+TDV_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/trusted_device.pdx"
+DAI_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/dma_active_indicator.pdx"
+if [[ ! -f "${CHR_SRC}" || ! -f "${SEC_SRC}" || ! -f "${TDV_SRC}" \
+        || ! -f "${DAI_SRC}" ]]; then
+    echo "[tb-security-confine] FAIL - one of the R35.M5 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_cascade_harness_stats'      'core/drivers/tb/cascade_harness.o'
+ec_confine_one '_tb_security_policy_table'   'core/drivers/tb/security_policy.o'
+ec_confine_one '_tb_security_policy_stats'   'core/drivers/tb/security_policy.o'
+ec_confine_one '_tb_trusted_device_table'    'core/drivers/tb/trusted_device.o'
+ec_confine_one '_tb_trusted_device_stats'    'core/drivers/tb/trusted_device.o'
+ec_confine_one '_tb_dma_active_counter'      'core/drivers/tb/dma_active_indicator.o'
+ec_confine_one '_tb_dma_active_stats'        'core/drivers/tb/dma_active_indicator.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See cascade_harness.pdx §3, security_policy.pdx §2," >&2
+    echo "  trusted_device.pdx §3 and dma_active_indicator.pdx §3 for" >&2
+    echo "  the table/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[tb-security-confine] TB4 security policy substrate state confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

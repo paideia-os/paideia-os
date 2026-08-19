@@ -1,0 +1,542 @@
+// src/kernel/core/drivers/tb/trusted_device.pdx — R35.M5-003 (#1217)
+//
+// TB4 trusted-device enrollment: a per-boot table of dock fingerprints
+// the operator has previously accepted, so a re-attach of the SAME
+// dock (same UUID + firmware version) can skip the consent dialog if
+// the operator marked it always_trust at enrollment. Per D3 of
+// design/roadmap/next-wave-synthesis.md, the fingerprint is CRC32 of
+// (UUID_lo || UUID_hi || fw_version) — a value stable across boots
+// for a given dock but distinct across firmware upgrades (a firmware
+// change re-runs consent, because a dock that reflashed itself is a
+// dock whose behaviour the operator has not seen).
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the FINGERPRINT + TRUST-TABLE half of the enrollment
+// machinery. It:
+//
+//   1. FINGERPRINT — trusted_device_fingerprint(uuid_lo, uuid_hi,
+//      fw_version) computes CRC32 over the twelve input bytes.
+//      Reflection-free CRC32 with polynomial 0x04C11DB7 (Ethernet
+//      polynomial, identical to what Linux drivers/thunderbolt uses).
+//      Deterministic: same inputs -> same output on every boot.
+//
+//   2. TRUST TABLE — a 32-slot per-boot table of enrolled
+//      fingerprints. Row header records in_use + always_trust flag;
+//      row body records the fingerprint + the three source values so
+//      forensics can be run after the fact.
+//
+//   3. ENROLL — trusted_device_enroll(uuid_lo, uuid_hi, fw_version,
+//      always_trust) computes the fingerprint and installs a row.
+//      Refuses IN_USE if the fingerprint is already enrolled;
+//      refuses ENOSPC if the table is full.
+//
+//   4. LOOKUP — trusted_device_lookup(fingerprint) returns the row
+//      id of an enrollment matching the fingerprint, or ROW_NONE.
+//      The consent-dialog decision logic reads always_trust off the
+//      row: if 1, the dialog SKIPS the operator prompt and moves
+//      the attestation directly to GRANTED.
+//
+//   5. FORGET — trusted_device_forget(row_id) clears the row so a
+//      future attach of the same dock demands fresh consent.
+//
+// IT DOES NOT PERSIST TO /etc/tb/trusted.conf. Persistence is
+// deferred to R42's ring-3 supervisor: this module ships as
+// PER-BOOT trust only, which matches the security posture of the
+// R35.M5 milestone (SECURE level, which is a machine-wide policy,
+// explicitly bypasses enrollment). The operator today re-enrolls on
+// every boot; R42 replaces that with an atomic-write journal.
+//
+// IT DOES NOT ITSELF READ /etc/tb/trusted.conf ON BOOT. Same
+// deferral: the boot-time trusted-set is empty. R42 will populate
+// it before the first tb_route_cap_mint runs.
+//
+// trusted_device_arbitrated() returns 0 until the ring-3 supervisor's
+// trust-table replay is bound.
+//
+// =============================================================================
+// §1  FIRMWARE-VERSION SENSITIVITY
+// =============================================================================
+//
+// A firmware upgrade CHANGES the fingerprint, so a dock the operator
+// previously trusted will be treated as fresh after its firmware
+// update. This is the correct behaviour: the whole reason the
+// fingerprint mixes in firmware_version is that a dock that
+// reflashed itself is a dock whose behaviour the operator has not
+// seen. The alternative -- hash only the UUID -- is what Linux
+// boltd did until CVE-2019-14899 taught the industry that firmware
+// is the security boundary, not the physical device.
+//
+// =============================================================================
+// §2  CRC32 IS FINE HERE
+// =============================================================================
+//
+// CRC32 is not cryptographic. That is fine: the fingerprint's job is
+// to give a stable-across-boots handle on (UUID, firmware) tuples,
+// not to defend against a forged fingerprint. A dock forging its
+// UUID + firmware version to a value colliding with a previously
+// trusted dock would still have to talk USB4 with the correct
+// protocol at every layer to actually USE the tunnel, and the R35.M4
+// KIND_DMA_ATTESTATION machinery rejects such a dock at consent time
+// (its true UUID is what the CM ring reads). The fingerprint is a
+// KEY, not a certificate.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _tb_trusted_device_table and _tb_trusted_device_stats are written
+// only by helpers in this module. tools/build.sh confines relocations
+// against each symbol to `core/drivers/tb/trusted_device.o`.
+//
+// =============================================================================
+// §4  ERROR CODES 0xFFFFF8E0..0xFFFFF8EF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent free bands: dma_active_indicator
+// 0xFFFFF8D0..DF, security_policy 0xFFFFF8F0..FF, cascade_harness
+// 0xFFFFF900..0F, consent_revoke 0xFFFFF910..1F).
+
+module TrustedDevice = structure {
+
+  // Failure taxonomy — 0xFFFFF8E0..0xFFFFF8EF.
+  pub let TDEV_OK           : u64 = 0
+  pub let TDEV_BAD_ARG      : u64 = 0xFFFFF8EF
+  pub let TDEV_BAD_ROW      : u64 = 0xFFFFF8EE
+  pub let TDEV_IN_USE       : u64 = 0xFFFFF8ED
+  pub let TDEV_ENOSPC       : u64 = 0xFFFFF8EC
+  pub let TDEV_NOT_HELD     : u64 = 0xFFFFF8EB
+
+  // Table: 32 entries of 32 bytes.
+  //   [+0]  header (in_use[63:56] | always_trust[7:0])
+  //   [+8]  fingerprint (u32 in low, zero-extended)
+  //   [+16] uuid_lo
+  //   [+24] uuid_hi (top 32 bits) | fw_version (bottom 32 bits)
+  pub let TDEV_MAX       : u64 = 32
+  pub let TDEV_ROW_BYTES : u64 = 32
+
+  pub let mut _tb_trusted_device_table : [u64; 128] = uninit @align(64)
+  pub let mut _tb_trusted_device_stats : [u64; 8]   = uninit @align(64)
+
+  pub let TDEV_ST_ENROLLED : u64 = 0
+  pub let TDEV_ST_LOOKUPS  : u64 = 1
+  pub let TDEV_ST_HITS     : u64 = 2
+  pub let TDEV_ST_FORGETS  : u64 = 3
+  pub let TDEV_ST_REJECTS  : u64 = 4
+
+  pub let TDEV_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let TDEV_ROW_NONE   : u64 = 0xFF
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let trusted_device_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M5-003 (#1217): clear table + stats. Labels prefixed td_rs_.",
+      block: {
+        lea r10, [rip + _tb_trusted_device_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      td_rs_tab:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 128;
+        jb  td_rs_tab;
+
+        lea r10, [rip + _tb_trusted_device_stats];
+        xor rcx, rcx;
+      td_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  td_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let trusted_device_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M5-003 (#1217): honesty pin. Returns 0 until R42's ring-3 supervisor replays the persisted trust set into this table.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let td_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M5-003 (#1217): counter read.",
+      block: {
+        cmp rdi, 8;
+        jae td_st_zero;
+        lea r10, [rip + _tb_trusted_device_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      td_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let td_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M5-003 (#1217): counter bump. Labels prefixed td_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae td_nt_out;
+        lea r10, [rip + _tb_trusted_device_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      td_nt_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // CRC32 primitive. Polynomial 0x04C11DB7, reflection-free
+  // (matches the Ethernet FCS convention). Bit-by-bit implementation
+  // — 96 bits at 12 bytes -> 12 iterations of the outer loop -> 96
+  // shift/xor pairs. Fine for enrollment cost.
+  //
+  // Input order (least-significant byte first for each u64 in turn):
+  //   uuid_lo bytes 0..7 | uuid_hi bytes 0..7 | fw_version bytes 0..3
+  // The 32-bit fw_version is fed as its low four bytes.
+  //
+  // Returns a 32-bit CRC in the low half of rax.
+  // ==========================================================================
+
+  pub let td_crc32_u8 : (u64, u64) -> u64 !{} @{} =
+    fn (crc: u64) (b: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M5-003 (#1217): mix one byte into a running CRC32. Standard bit-by-bit MSB-first shift with polynomial 0x04C11DB7. Labels prefixed td_c8_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // crc
+        mov r12, rsi;                    // byte
+        and r12, 0xFF;
+        shl r12, 24;
+        xor rbx, r12;                    // crc ^= byte << 24
+        mov r13, 8;
+      td_c8_loop:
+        mov rax, rbx;
+        shr rax, 31;
+        and rax, 1;
+        cmp rax, 0;
+        je  td_c8_shift;
+        shl rbx, 1;
+        mov r10, 0x04C11DB7;
+        xor rbx, r10;
+        jmp td_c8_cont;
+      td_c8_shift:
+        shl rbx, 1;
+      td_c8_cont:
+        mov r10, 0xFFFFFFFF;
+        and rbx, r10;
+        sub r13, 1;
+        cmp r13, 0;
+        jne td_c8_loop;
+
+        mov rax, rbx;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let trusted_device_fingerprint : (u64, u64, u64) -> u64 !{} @{} =
+    fn (uuid_lo: u64) (uuid_hi: u64) (fw_version: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M5-003 (#1217): CRC32 over (uuid_lo | uuid_hi | fw_version_lo32). Initial value 0xFFFFFFFF, no final XOR (matches boltd's usage of the same primitive). Labels prefixed td_fp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // uuid_lo
+        mov r12, rsi;                    // uuid_hi
+        mov r13, rdx;                    // fw_version
+        mov r14, 0xFFFFFFFF;             // running crc
+        xor r15, r15;                    // byte iter
+
+        // First 8 bytes: uuid_lo, byte 0..7 (LSB first).
+      td_fp_lo:
+        mov rcx, r15;
+        shl rcx, 3;                      // cl = r15 * 8
+        mov rsi, rbx;
+        shr rsi, cl;
+        and rsi, 0xFF;
+        mov rdi, r14;
+        call td_crc32_u8;
+        mov r14, rax;
+        add r15, 1;
+        cmp r15, 8;
+        jb  td_fp_lo;
+
+        // Next 8 bytes: uuid_hi.
+        xor r15, r15;
+      td_fp_hi:
+        mov rcx, r15;
+        shl rcx, 3;
+        mov rsi, r12;
+        shr rsi, cl;
+        and rsi, 0xFF;
+        mov rdi, r14;
+        call td_crc32_u8;
+        mov r14, rax;
+        add r15, 1;
+        cmp r15, 8;
+        jb  td_fp_hi;
+
+        // Next 4 bytes: fw_version low 32.
+        xor r15, r15;
+      td_fp_fw:
+        mov rcx, r15;
+        shl rcx, 3;
+        mov rsi, r13;
+        shr rsi, cl;
+        and rsi, 0xFF;
+        mov rdi, r14;
+        call td_crc32_u8;
+        mov r14, rax;
+        add r15, 1;
+        cmp r15, 4;
+        jb  td_fp_fw;
+
+        mov rax, r14;
+        mov r10, 0xFFFFFFFF;
+        and rax, r10;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Lookup by fingerprint. Returns row_id or ROW_NONE.
+  // ==========================================================================
+
+  pub let trusted_device_lookup : (u64) -> u64 !{mem} @{} =
+    fn (fingerprint: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M5-003 (#1217): scan for matching fingerprint. Labels prefixed td_lk_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov r12, rdi;                    // fingerprint
+        mov r10, 0xFFFFFFFF;
+        and r12, r10;                    // force to 32 bits
+
+        mov rdi, 1;                      // LOOKUPS
+        call td_note;
+
+        xor rbx, rbx;
+      td_lk_scan:
+        cmp rbx, 32;
+        jae td_lk_none;
+        lea r10, [rip + _tb_trusted_device_table];
+        mov r11, rbx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  td_lk_next;
+        mov rax, [r10 + 8];
+        cmp rax, r12;
+        je  td_lk_hit;
+      td_lk_next:
+        add rbx, 1;
+        jmp td_lk_scan;
+      td_lk_hit:
+        mov rdi, 2;                      // HITS
+        call td_note;
+        mov rax, rbx;
+        jmp td_lk_out;
+      td_lk_none:
+        mov rax, 0xFF;
+      td_lk_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let trusted_device_always_trust : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M5-003 (#1217): always_trust flag for row, or DECODE_BAD. Labels prefixed td_at_.",
+      block: {
+        cmp rdi, 32;
+        jae td_at_bad;
+        lea r10, [rip + _tb_trusted_device_table];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  td_at_bad;
+        mov rax, [r10 + 0];
+        and rax, 0xFF;
+        ret;
+      td_at_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // ENROLL. Computes fingerprint, refuses IN_USE if already known,
+  // installs a new row otherwise. Returns row_id on success.
+  // ==========================================================================
+
+  pub let trusted_device_enroll : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (uuid_lo: u64) (uuid_hi: u64) (fw_version: u64) (always_trust: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M5-003 (#1217): compute fingerprint, refuse duplicate, install new row. Labels prefixed td_en_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // uuid_lo
+        mov r12, rsi;                    // uuid_hi
+        mov r13, rdx;                    // fw_version
+        mov r14, rcx;                    // always_trust
+
+        // Compute fingerprint.
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        call trusted_device_fingerprint;
+        mov r15, rax;                    // fingerprint
+
+        // Refuse duplicate.
+        mov rdi, r15;
+        call trusted_device_lookup;
+        cmp rax, 0xFF;
+        jne td_en_dup;
+
+        // Find empty slot.
+        xor rax, rax;
+      td_en_alloc:
+        cmp rax, 32;
+        jae td_en_enospc;
+        lea r10, [rip + _tb_trusted_device_table];
+        mov r11, rax;
+        shl r11, 5;
+        add r10, r11;
+        mov rcx, [r10 + 0];
+        shr rcx, 56;
+        cmp rcx, 0;
+        je  td_en_write;
+        add rax, 1;
+        jmp td_en_alloc;
+
+      td_en_write:
+        mov r8, rax;                     // row_id
+        // Header: in_use=1[63:56] | always_trust[7:0]
+        mov rcx, 1;
+        shl rcx, 56;
+        mov r9, r14;
+        and r9, 1;
+        or  rcx, r9;
+        mov [r10 + 0], rcx;
+        mov [r10 + 8], r15;              // fingerprint
+        mov [r10 + 16], rbx;             // uuid_lo
+        // Row +24: uuid_hi (top 32) | fw_version (bottom 32)
+        mov rcx, r12;
+        shl rcx, 32;
+        mov r9, r13;
+        mov r11, 0xFFFFFFFF;
+        and r9, r11;
+        or  rcx, r9;
+        mov [r10 + 24], rcx;
+
+        mov rdi, 0;                      // ENROLLED
+        call td_note;
+        mov rax, r8;
+        jmp td_en_out;
+
+      td_en_dup:
+        mov rdi, 4;
+        call td_note;
+        mov rax, 0xFFFFF8ED;
+        jmp td_en_out;
+      td_en_enospc:
+        mov rdi, 4;
+        call td_note;
+        mov rax, 0xFFFFF8EC;
+
+      td_en_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // FORGET. Clear a row so a future attach demands fresh consent.
+  // ==========================================================================
+
+  pub let trusted_device_forget : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M5-003 (#1217): clear the row header + fields. Labels prefixed td_fg_.",
+      block: {
+        cmp rdi, 32;
+        jae td_fg_bad;
+        lea r10, [rip + _tb_trusted_device_table];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  td_fg_free;
+        xor rax, rax;
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov rdi, 3;                      // FORGETS
+        call td_note;
+        xor rax, rax;
+        ret;
+      td_fg_free:
+        mov rdi, 4;
+        call td_note;
+        mov rax, 0xFFFFF8EB;
+        ret;
+      td_fg_bad:
+        mov rdi, 4;
+        call td_note;
+        mov rax, 0xFFFFF8EE;
+        ret
+      }
+    }
+}
