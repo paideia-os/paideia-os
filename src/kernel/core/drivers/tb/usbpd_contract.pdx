@@ -1,0 +1,953 @@
+// src/kernel/core/drivers/tb/usbpd_contract.pdx — R35.M10-002 (#1233)
+//
+// USB POWER DELIVERY CONTRACT NEGOTIATION (BASIC PROFILES).
+//
+// USB PD 3.1 §6.4 pins the contract handshake between a Source (a TB4
+// dock's power supply) and a Sink (the host or a downstream device):
+//
+//     SRC -> SRC_CAP -> SNK
+//     SNK -> REQUEST -> SRC
+//     SRC -> ACCEPT | REJECT -> SNK
+//     SRC -> PS_RDY -> SNK          (only after ACCEPT)
+//
+// A dock advertises which fixed PDOs (Power Data Objects) it can
+// supply; the sink picks one; the source either accepts (and later
+// signals PS_RDY once the rails are stable) or rejects (bad profile,
+// or a wattage cap the source's OCP setting will not clear).
+//
+// This module is the PER-PORT STATE MACHINE that carries a contract
+// through the four transitions above, with a WATTAGE CAP that refuses
+// any profile above PDC_MAX_WATTAGE (100 W by default). The cap is a
+// SAFETY invariant, not a nominal one: a T14 G4 whose sink circuit
+// tops out at 65 W has no way to represent "20 V/5 A" without a fire
+// risk; the contract must be refused BEFORE the source turns on the
+// rail.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the PER-PORT PD STATE MACHINE + PROFILE ARBITRATION half of
+// USB PD 3.1 contract negotiation. It:
+//
+//   1. SRC_CAP — pdc_src_cap(port, cap_bitmap) records the profiles a
+//      source has advertised on the port. cap_bitmap is a bitmask over
+//      the five PDC_PROFILE_* ordinals. Refuses BAD_PORT, BAD_PROFILE
+//      (cap_bitmap has bits outside [0, 4]), BAD_STATE (port not IDLE
+//      or already ADVERTISED). Transitions port to ADVERTISED.
+//
+//   2. REQUEST — pdc_request(port, profile) records a sink's request
+//      for a specific profile. Refuses BAD_PORT, BAD_PROFILE (profile
+//      not in [0, 4]), BAD_STATE (port not ADVERTISED), UNADVERTISED
+//      (profile not set in cap_bitmap), WATTAGE_CAP (profile wattage
+//      exceeds PDC_MAX_WATTAGE). Transitions port to REQUESTED.
+//
+//   3. ACCEPT — pdc_accept(port) records source acceptance of the
+//      pending request. Refuses BAD_PORT, BAD_STATE (port not
+//      REQUESTED). Transitions port to ACCEPTED.
+//
+//   4. REJECT — pdc_reject(port) records source rejection of the
+//      pending request. Refuses BAD_PORT, BAD_STATE (port not
+//      REQUESTED). Transitions port to REJECTED and clears the
+//      pending profile so a fresh REQUEST can arrive.
+//
+//   5. PS_RDY — pdc_ps_rdy(port) records that the source's rail is
+//      stable after ACCEPT. Refuses BAD_PORT, BAD_STATE (port not
+//      ACCEPTED). Transitions port to READY.
+//
+//   6. QUERY — pdc_port_state(port), pdc_port_profile(port),
+//      pdc_port_wattage(port), pdc_port_cap(port) read individual
+//      fields. pdc_active_count() returns the number of ports whose
+//      state != IDLE.
+//
+// IT DOES NOT SEND PD MESSAGES OVER CC. That is a live TypeC PD
+// controller's job (the T14 G4 uses an integrated FUSB302B-family
+// PD PHY behind a PCH SIO block); this scaffold records the state
+// transitions the messages would drive, and refuses transitions
+// that the spec's grammar rejects.
+//
+// IT DOES NOT TIME PS_RDY. PD 3.1 §7.5.7 gives tSrcTransition ≤ 550
+// ms after ACCEPT before PS_RDY must be sent; the timer belongs to
+// the live PD stack. This scaffold only refuses PS_RDY sent from a
+// state that is not ACCEPTED.
+//
+// IT DOES NOT NEGOTIATE PPS BEYOND THE PROFILE ORDINAL. PPS is a
+// range profile (3.3–21 V, per-mA); the scaffold treats it as a
+// single ordinal (PDC_PROFILE_PPS = 4) with the wattage set to the
+// max the PPS APDO could deliver at cap. A live driver would carry
+// the fine-grained (V, mA) tuple; the scaffold caps it at 60 W
+// (20 V × 3 A).
+//
+// pdc_arbitrated() returns 0 until a live PD stack binds this scaffold
+// against real PD packet traffic.
+//
+// =============================================================================
+// §1  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _pdc_states and _pdc_stats are written only by helpers in this
+// module. tools/build.sh confines relocations against each symbol to
+// `core/drivers/tb/usbpd_contract.o`.
+//
+// =============================================================================
+// §2  ERROR CODES 0xFFFFF7E0..0xFFFFF7EF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent free bands: usb3_xhci_ext 0xFFFFF7F0..FF,
+// dp_altmode 0xFFFFF7D0..DF).
+
+module UsbpdContract = structure {
+
+  // Port capacity + slot geometry.
+  pub let PDC_PORT_MAX     : u64 = 4               // per-tunnel per-host
+  pub let PDC_PORT_U64     : u64 = 8               // 8 u64s per port row
+
+  // Profile ordinals.
+  pub let PDC_PROFILE_5V3A  : u64 = 0              // 15 W  (fixed 5 V @ 3 A)
+  pub let PDC_PROFILE_9V3A  : u64 = 1              // 27 W  (fixed 9 V @ 3 A)
+  pub let PDC_PROFILE_15V3A : u64 = 2              // 45 W  (fixed 15 V @ 3 A)
+  pub let PDC_PROFILE_20V3A : u64 = 3              // 60 W  (fixed 20 V @ 3 A)
+  pub let PDC_PROFILE_PPS   : u64 = 4              // ≤60 W (PPS APDO, capped)
+  pub let PDC_PROFILE_MAX   : u64 = 4
+
+  // Wattage lookup (mirrors PDO ordinals above).
+  pub let PDC_W_5V3A  : u64 = 15
+  pub let PDC_W_9V3A  : u64 = 27
+  pub let PDC_W_15V3A : u64 = 45
+  pub let PDC_W_20V3A : u64 = 60
+  pub let PDC_W_PPS   : u64 = 60                   // conservative PPS cap
+
+  // Safety cap on any accepted profile's advertised wattage. 100 W is
+  // the historical USB PD 2.0 ceiling; every PD 3.1 profile the T14
+  // G4 accepts today lives below it. A future EPR (Extended Power
+  // Range, up to 240 W) profile arriving on the wire without a raised
+  // cap is REFUSED by design.
+  pub let PDC_MAX_WATTAGE : u64 = 100
+
+  // State ordinals.
+  pub let PDC_STATE_IDLE       : u64 = 0
+  pub let PDC_STATE_ADVERTISED : u64 = 1
+  pub let PDC_STATE_REQUESTED  : u64 = 2
+  pub let PDC_STATE_ACCEPTED   : u64 = 3
+  pub let PDC_STATE_REJECTED   : u64 = 4
+  pub let PDC_STATE_READY      : u64 = 5
+
+  // Failure taxonomy — 0xFFFFF7E0..0xFFFFF7EF.
+  pub let PDC_OK              : u64 = 0
+  pub let PDC_BAD_ARG         : u64 = 0xFFFFF7EF
+  pub let PDC_BAD_PORT        : u64 = 0xFFFFF7EE
+  pub let PDC_BAD_PROFILE     : u64 = 0xFFFFF7ED
+  pub let PDC_BAD_STATE       : u64 = 0xFFFFF7EC
+  pub let PDC_UNADVERTISED    : u64 = 0xFFFFF7EB
+  pub let PDC_WATTAGE_CAP     : u64 = 0xFFFFF7EA
+
+  pub let PDC_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // Port row (8 u64s, 64 bytes):
+  //   [+0]  in_use    (0/1)  — 1 once any transition has fired
+  //   [+8]  state
+  //   [+16] cap_bitmap        (bit i set iff profile i advertised)
+  //   [+24] pending_profile   (profile arg to last REQUEST)
+  //   [+32] accepted_profile  (profile that reached READY, else 0xFF)
+  //   [+40] wattage           (of accepted_profile at READY, else 0)
+  //   [+48] reserved
+  //   [+56] reserved
+  pub let mut _pdc_states : [u64; 32] = uninit @align(64)   // 4 ports × 8 u64
+  pub let mut _pdc_stats  : [u64; 8]  = uninit @align(64)
+
+  pub let PDC_ST_ADVERTISES : u64 = 0
+  pub let PDC_ST_REQUESTS   : u64 = 1
+  pub let PDC_ST_ACCEPTS    : u64 = 2
+  pub let PDC_ST_REJECTS    : u64 = 3
+  pub let PDC_ST_PS_RDYS    : u64 = 4
+  pub let PDC_ST_REFUSES    : u64 = 5
+
+  pub let PDC_PROFILE_NONE : u64 = 0xFF
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let pdc_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): clear ports + stats. Labels prefixed pdc_rs_.",
+      block: {
+        xor rax, rax;
+        xor rcx, rcx;
+        lea r10, [rip + _pdc_states];
+      pdc_rs_p:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  pdc_rs_p;
+
+        xor rcx, rcx;
+        lea r10, [rip + _pdc_stats];
+      pdc_rs_s:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  pdc_rs_s;
+        ret
+      }
+    } @no_frame
+
+  pub let pdc_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M10-002 (#1233): honesty pin. Returns 0 until a live PD stack binds this against real PD packet traffic.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pdc_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): counter read.",
+      block: {
+        cmp rdi, 8;
+        jae pdc_st_zero;
+        lea r10, [rip + _pdc_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      pdc_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pdc_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): counter bump. Labels prefixed pdc_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae pdc_nt_out;
+        lea r10, [rip + _pdc_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      pdc_nt_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Port accessors. Port byte offset = port * 64 = port << 6.
+  // ==========================================================================
+
+  pub let pdc_port_in_use : (u64) -> u64 !{mem} @{} =
+    fn (port: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): read port.in_use.",
+      block: {
+        cmp rdi, 4;
+        jae pdc_pi_zero;
+        push rbx;
+        mov rbx, rdi;
+        shl rbx, 6;
+        lea r10, [rip + _pdc_states];
+        add r10, rbx;
+        mov rax, [r10 + 0];
+        pop rbx;
+        ret;
+      pdc_pi_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pdc_port_state : (u64) -> u64 !{mem} @{} =
+    fn (port: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): read port.state.",
+      block: {
+        cmp rdi, 4;
+        jae pdc_ps_zero;
+        push rbx;
+        mov rbx, rdi;
+        shl rbx, 6;
+        lea r10, [rip + _pdc_states];
+        add r10, rbx;
+        mov rax, [r10 + 8];
+        pop rbx;
+        ret;
+      pdc_ps_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pdc_port_cap : (u64) -> u64 !{mem} @{} =
+    fn (port: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): read port.cap_bitmap.",
+      block: {
+        cmp rdi, 4;
+        jae pdc_pc_zero;
+        push rbx;
+        mov rbx, rdi;
+        shl rbx, 6;
+        lea r10, [rip + _pdc_states];
+        add r10, rbx;
+        mov rax, [r10 + 16];
+        pop rbx;
+        ret;
+      pdc_pc_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pdc_port_pending : (u64) -> u64 !{mem} @{} =
+    fn (port: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): read port.pending_profile.",
+      block: {
+        cmp rdi, 4;
+        jae pdc_pp_zero;
+        push rbx;
+        mov rbx, rdi;
+        shl rbx, 6;
+        lea r10, [rip + _pdc_states];
+        add r10, rbx;
+        mov rax, [r10 + 24];
+        pop rbx;
+        ret;
+      pdc_pp_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pdc_port_profile : (u64) -> u64 !{mem} @{} =
+    fn (port: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): read port.accepted_profile.",
+      block: {
+        cmp rdi, 4;
+        jae pdc_pa_zero;
+        push rbx;
+        mov rbx, rdi;
+        shl rbx, 6;
+        lea r10, [rip + _pdc_states];
+        add r10, rbx;
+        mov rax, [r10 + 32];
+        pop rbx;
+        ret;
+      pdc_pa_zero:
+        mov rax, 0xFF;
+        ret
+      }
+    } @no_frame
+
+  pub let pdc_port_wattage : (u64) -> u64 !{mem} @{} =
+    fn (port: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): read port.wattage.",
+      block: {
+        cmp rdi, 4;
+        jae pdc_pw_zero;
+        push rbx;
+        mov rbx, rdi;
+        shl rbx, 6;
+        lea r10, [rip + _pdc_states];
+        add r10, rbx;
+        mov rax, [r10 + 40];
+        pop rbx;
+        ret;
+      pdc_pw_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Validators.
+  // ==========================================================================
+
+  pub let pdc_port_valid : (u64) -> u64 !{} @{} =
+    fn (p: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M10-002 (#1233): 1 iff p in [0, 3].",
+      block: {
+        cmp rdi, 3;
+        ja  pdc_pv_no;
+        mov rax, 1;
+        ret;
+      pdc_pv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pdc_profile_valid : (u64) -> u64 !{} @{} =
+    fn (pr: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M10-002 (#1233): 1 iff pr in [0, 4].",
+      block: {
+        cmp rdi, 4;
+        ja  pdc_pfv_no;
+        mov rax, 1;
+        ret;
+      pdc_pfv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pdc_cap_bitmap_valid : (u64) -> u64 !{} @{} =
+    fn (bm: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M10-002 (#1233): 1 iff bm has no bits above bit 4.",
+      block: {
+        // Only bits [0..4] permitted → mask 0x1F. bm & ~0x1F must be 0.
+        mov rax, rdi;
+        mov r10, 0x1F;
+        not r10;
+        and rax, r10;
+        cmp rax, 0;
+        jne pdc_bv_no;
+        // Also require at least one bit set (a zero cap advertises
+        // nothing and is a caller error).
+        cmp rdi, 0;
+        je  pdc_bv_no;
+        mov rax, 1;
+        ret;
+      pdc_bv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // pdc_profile_wattage(profile) — return wattage of a valid profile,
+  // or 0 on out-of-range.
+  // ==========================================================================
+
+  pub let pdc_profile_wattage : (u64) -> u64 !{} @{} =
+    fn (profile: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R35.M10-002 (#1233): PDO ordinal → wattage.",
+      block: {
+        cmp rdi, 0;
+        je  pdc_pw_5v;
+        cmp rdi, 1;
+        je  pdc_pw_9v;
+        cmp rdi, 2;
+        je  pdc_pw_15v;
+        cmp rdi, 3;
+        je  pdc_pw_20v;
+        cmp rdi, 4;
+        je  pdc_pw_pps;
+        xor rax, rax;
+        ret;
+      pdc_pw_5v:
+        mov rax, 15;
+        ret;
+      pdc_pw_9v:
+        mov rax, 27;
+        ret;
+      pdc_pw_15v:
+        mov rax, 45;
+        ret;
+      pdc_pw_20v:
+        mov rax, 60;
+        ret;
+      pdc_pw_pps:
+        mov rax, 60;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Store helpers for individual port fields.
+  // ==========================================================================
+
+  pub let pdc_set_state : (u64, u64) -> () !{mem} @{} =
+    fn (port: u64) (state: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): write port.state + set in_use=1. Labels prefixed pdc_ss_.",
+      block: {
+        cmp rdi, 4;
+        jae pdc_ss_out;
+        push rbx;
+        mov rbx, rdi;
+        shl rbx, 6;
+        lea r10, [rip + _pdc_states];
+        add r10, rbx;
+        mov rax, 1;
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rsi;
+        pop rbx;
+      pdc_ss_out:
+        ret
+      }
+    } @no_frame
+
+  pub let pdc_set_cap : (u64, u64) -> () !{mem} @{} =
+    fn (port: u64) (bitmap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): write port.cap_bitmap. Labels prefixed pdc_sc_.",
+      block: {
+        cmp rdi, 4;
+        jae pdc_sc_out;
+        push rbx;
+        mov rbx, rdi;
+        shl rbx, 6;
+        lea r10, [rip + _pdc_states];
+        add r10, rbx;
+        mov [r10 + 16], rsi;
+        pop rbx;
+      pdc_sc_out:
+        ret
+      }
+    } @no_frame
+
+  pub let pdc_set_pending : (u64, u64) -> () !{mem} @{} =
+    fn (port: u64) (profile: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): write port.pending_profile. Labels prefixed pdc_sp_.",
+      block: {
+        cmp rdi, 4;
+        jae pdc_sp_out;
+        push rbx;
+        mov rbx, rdi;
+        shl rbx, 6;
+        lea r10, [rip + _pdc_states];
+        add r10, rbx;
+        mov [r10 + 24], rsi;
+        pop rbx;
+      pdc_sp_out:
+        ret
+      }
+    } @no_frame
+
+  pub let pdc_set_profile : (u64, u64) -> () !{mem} @{} =
+    fn (port: u64) (profile: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): write port.accepted_profile. Labels prefixed pdc_sa_.",
+      block: {
+        cmp rdi, 4;
+        jae pdc_sa_out;
+        push rbx;
+        mov rbx, rdi;
+        shl rbx, 6;
+        lea r10, [rip + _pdc_states];
+        add r10, rbx;
+        mov [r10 + 32], rsi;
+        pop rbx;
+      pdc_sa_out:
+        ret
+      }
+    } @no_frame
+
+  pub let pdc_set_wattage : (u64, u64) -> () !{mem} @{} =
+    fn (port: u64) (w: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): write port.wattage. Labels prefixed pdc_sw_.",
+      block: {
+        cmp rdi, 4;
+        jae pdc_sw_out;
+        push rbx;
+        mov rbx, rdi;
+        shl rbx, 6;
+        lea r10, [rip + _pdc_states];
+        add r10, rbx;
+        mov [r10 + 40], rsi;
+        pop rbx;
+      pdc_sw_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // pdc_src_cap(port, cap_bitmap) — SRC_CAP transition.
+  //
+  // Preconditions: port in [0, 3], cap_bitmap fits [0..4] and nonzero,
+  // port state == IDLE. Postcondition: port state = ADVERTISED, cap
+  // recorded, pending/accepted cleared.
+  // ==========================================================================
+
+  pub let pdc_src_cap : (u64, u64) -> u64 !{mem} @{} =
+    fn (port: u64) (cap_bitmap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): SRC advertises capabilities. Labels prefixed pdc_sca_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+
+        mov rdi, rbx;
+        call pdc_port_valid;
+        cmp rax, 0;
+        je  pdc_sca_bad_port;
+
+        mov rdi, r12;
+        call pdc_cap_bitmap_valid;
+        cmp rax, 0;
+        je  pdc_sca_bad_profile;
+
+        mov rdi, rbx;
+        call pdc_port_state;
+        cmp rax, 0;                      // must be IDLE
+        jne pdc_sca_bad_state;
+
+        // Commit.
+        mov rdi, rbx;
+        mov rsi, 1;                      // ADVERTISED
+        call pdc_set_state;
+        mov rdi, rbx;
+        mov rsi, r12;
+        call pdc_set_cap;
+        mov rdi, rbx;
+        mov rsi, 0xFF;                   // pending_profile = NONE
+        call pdc_set_pending;
+        mov rdi, rbx;
+        mov rsi, 0xFF;                   // accepted_profile = NONE
+        call pdc_set_profile;
+        mov rdi, rbx;
+        mov rsi, 0;                      // wattage = 0
+        call pdc_set_wattage;
+
+        mov rdi, 0;                      // ADVERTISES
+        call pdc_note;
+        xor rax, rax;
+        jmp pdc_sca_out;
+
+      pdc_sca_bad_port:
+        mov rdi, 5;                      // REFUSES
+        call pdc_note;
+        mov rax, 0xFFFFF7EE;
+        jmp pdc_sca_out;
+      pdc_sca_bad_profile:
+        mov rdi, 5;
+        call pdc_note;
+        mov rax, 0xFFFFF7ED;
+        jmp pdc_sca_out;
+      pdc_sca_bad_state:
+        mov rdi, 5;
+        call pdc_note;
+        mov rax, 0xFFFFF7EC;
+
+      pdc_sca_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdc_request(port, profile) — sink requests a specific profile.
+  //
+  // Sequence:
+  //   1. port in [0, 3]                    (BAD_PORT)
+  //   2. profile in [0, 4]                 (BAD_PROFILE)
+  //   3. port state == ADVERTISED          (BAD_STATE)
+  //   4. profile bit set in cap_bitmap     (UNADVERTISED)
+  //   5. profile wattage <= PDC_MAX_WATTAGE (WATTAGE_CAP)
+  //   6. commit; state -> REQUESTED; pending = profile.
+  // ==========================================================================
+
+  pub let pdc_request : (u64, u64) -> u64 !{mem} @{} =
+    fn (port: u64) (profile: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): sink requests a PDO. Labels prefixed pdc_rq_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+
+        mov rdi, rbx;
+        call pdc_port_valid;
+        cmp rax, 0;
+        je  pdc_rq_bad_port;
+
+        mov rdi, r12;
+        call pdc_profile_valid;
+        cmp rax, 0;
+        je  pdc_rq_bad_profile;
+
+        mov rdi, rbx;
+        call pdc_port_state;
+        cmp rax, 1;                      // must be ADVERTISED
+        jne pdc_rq_bad_state;
+
+        // Test bit `profile` in cap_bitmap.
+        mov rdi, rbx;
+        call pdc_port_cap;
+        mov r13, rax;                    // cap
+        mov rcx, r12;                    // shift = profile
+        mov rax, 1;
+        shl rax, cl;                     // bit mask
+        and rax, r13;
+        cmp rax, 0;
+        je  pdc_rq_unadv;
+
+        mov rdi, r12;
+        call pdc_profile_wattage;
+        mov r14, rax;
+        cmp r14, 100;                    // PDC_MAX_WATTAGE
+        ja  pdc_rq_watt;
+
+        // Commit.
+        mov rdi, rbx;
+        mov rsi, 2;                      // REQUESTED
+        call pdc_set_state;
+        mov rdi, rbx;
+        mov rsi, r12;
+        call pdc_set_pending;
+
+        mov rdi, 1;                      // REQUESTS
+        call pdc_note;
+        xor rax, rax;
+        jmp pdc_rq_out;
+
+      pdc_rq_bad_port:
+        mov rdi, 5;
+        call pdc_note;
+        mov rax, 0xFFFFF7EE;
+        jmp pdc_rq_out;
+      pdc_rq_bad_profile:
+        mov rdi, 5;
+        call pdc_note;
+        mov rax, 0xFFFFF7ED;
+        jmp pdc_rq_out;
+      pdc_rq_bad_state:
+        mov rdi, 5;
+        call pdc_note;
+        mov rax, 0xFFFFF7EC;
+        jmp pdc_rq_out;
+      pdc_rq_unadv:
+        mov rdi, 5;
+        call pdc_note;
+        mov rax, 0xFFFFF7EB;
+        jmp pdc_rq_out;
+      pdc_rq_watt:
+        mov rdi, 5;
+        call pdc_note;
+        mov rax, 0xFFFFF7EA;
+
+      pdc_rq_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdc_accept(port) — SRC accepts the pending request.
+  // Sequence: port valid; state == REQUESTED. Postcondition:
+  //   state = ACCEPTED.
+  // ==========================================================================
+
+  pub let pdc_accept : (u64) -> u64 !{mem} @{} =
+    fn (port: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): SRC accept. Labels prefixed pdc_ac_.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;
+
+        mov rdi, rbx;
+        call pdc_port_valid;
+        cmp rax, 0;
+        je  pdc_ac_bad_port;
+
+        mov rdi, rbx;
+        call pdc_port_state;
+        cmp rax, 2;                      // REQUESTED
+        jne pdc_ac_bad_state;
+
+        mov rdi, rbx;
+        mov rsi, 3;                      // ACCEPTED
+        call pdc_set_state;
+        mov rdi, 2;                      // ACCEPTS
+        call pdc_note;
+        xor rax, rax;
+        jmp pdc_ac_out;
+
+      pdc_ac_bad_port:
+        mov rdi, 5;
+        call pdc_note;
+        mov rax, 0xFFFFF7EE;
+        jmp pdc_ac_out;
+      pdc_ac_bad_state:
+        mov rdi, 5;
+        call pdc_note;
+        mov rax, 0xFFFFF7EC;
+
+      pdc_ac_out:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdc_reject(port) — SRC rejects the pending request.
+  // Sequence: port valid; state == REQUESTED. Postcondition:
+  //   state = REJECTED; pending_profile cleared.
+  // ==========================================================================
+
+  pub let pdc_reject : (u64) -> u64 !{mem} @{} =
+    fn (port: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): SRC reject. Labels prefixed pdc_rj_.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;
+
+        mov rdi, rbx;
+        call pdc_port_valid;
+        cmp rax, 0;
+        je  pdc_rj_bad_port;
+
+        mov rdi, rbx;
+        call pdc_port_state;
+        cmp rax, 2;                      // REQUESTED
+        jne pdc_rj_bad_state;
+
+        mov rdi, rbx;
+        mov rsi, 4;                      // REJECTED
+        call pdc_set_state;
+        mov rdi, rbx;
+        mov rsi, 0xFF;                   // clear pending
+        call pdc_set_pending;
+        mov rdi, 3;                      // REJECTS
+        call pdc_note;
+        xor rax, rax;
+        jmp pdc_rj_out;
+
+      pdc_rj_bad_port:
+        mov rdi, 5;
+        call pdc_note;
+        mov rax, 0xFFFFF7EE;
+        jmp pdc_rj_out;
+      pdc_rj_bad_state:
+        mov rdi, 5;
+        call pdc_note;
+        mov rax, 0xFFFFF7EC;
+
+      pdc_rj_out:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdc_ps_rdy(port) — SRC signals PS_RDY (rail stable) after ACCEPT.
+  //
+  // Sequence: port valid; state == ACCEPTED. Postcondition:
+  //   state = READY; accepted_profile = pending_profile;
+  //   wattage = pdc_profile_wattage(pending_profile).
+  // ==========================================================================
+
+  pub let pdc_ps_rdy : (u64) -> u64 !{mem} @{} =
+    fn (port: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): SRC PS_RDY. Labels prefixed pdc_pr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;
+
+        mov rdi, rbx;
+        call pdc_port_valid;
+        cmp rax, 0;
+        je  pdc_pr_bad_port;
+
+        mov rdi, rbx;
+        call pdc_port_state;
+        cmp rax, 3;                      // ACCEPTED
+        jne pdc_pr_bad_state;
+
+        mov rdi, rbx;
+        call pdc_port_pending;
+        mov r12, rax;
+
+        mov rdi, r12;
+        call pdc_profile_wattage;
+        mov r13, rax;
+
+        mov rdi, rbx;
+        mov rsi, 5;                      // READY
+        call pdc_set_state;
+        mov rdi, rbx;
+        mov rsi, r12;
+        call pdc_set_profile;
+        mov rdi, rbx;
+        mov rsi, r13;
+        call pdc_set_wattage;
+
+        mov rdi, 4;                      // PS_RDYS
+        call pdc_note;
+        xor rax, rax;
+        jmp pdc_pr_out;
+
+      pdc_pr_bad_port:
+        mov rdi, 5;
+        call pdc_note;
+        mov rax, 0xFFFFF7EE;
+        jmp pdc_pr_out;
+      pdc_pr_bad_state:
+        mov rdi, 5;
+        call pdc_note;
+        mov rax, 0xFFFFF7EC;
+
+      pdc_pr_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdc_active_count — number of ports whose state != IDLE.
+  // ==========================================================================
+
+  pub let pdc_active_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R35.M10-002 (#1233): count non-IDLE ports.",
+      block: {
+        push rbx;
+        push r12;
+
+        xor rbx, rbx;
+        xor r12, r12;
+      pdc_ac_it:
+        cmp r12, 4;
+        jae pdc_ac_done;
+        mov rdi, r12;
+        call pdc_port_state;
+        cmp rax, 0;
+        je  pdc_ac_next;
+        add rbx, 1;
+      pdc_ac_next:
+        add r12, 1;
+        jmp pdc_ac_it;
+      pdc_ac_done:
+        mov rax, rbx;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

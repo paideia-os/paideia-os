@@ -3006,6 +3006,41 @@ fi
 echo "[tb-dp-bridge-confine] TB4 DP-tunnel bridge state confined"
 
 # ---------------------------------------------------------------------------
+# R35.M10 (#1232/#1233/#1234): closing r35-thunderbolt with USB3 virtual
+# xHCI extension, USB-PD contract negotiation, and DP alt-mode SVDMs.
+#
+# Three modules: USB3-tunnel xHCI extension (per-tunnel (base, count)
+# port-range table with placeholder port_added / port_removed events
+# R34's USB supervisor will fan out), USB-PD contract negotiator
+# (per-port PD 3.1 §6.4 state machine SRC_CAP -> REQUEST -> ACCEPT ->
+# PS_RDY with a 100 W safety cap), and DP alt-mode SVDM FSM (per-port
+# Enter/Configure/Exit against SVID 0xFF01 with pin assignments A..F).
+# Each owns its own row / port table + stats; tools/build.sh confines
+# relocations against each to its owning object so a second writer
+# cannot forge a port mapping, restamp a PD state, or fabricate a DP
+# alt-mode session.
+U3XE_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/usb3_xhci_ext.pdx"
+PDC_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/usbpd_contract.pdx"
+DPAM_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/dp_altmode.pdx"
+if [[ ! -f "${U3XE_SRC}" || ! -f "${PDC_SRC}" || ! -f "${DPAM_SRC}" ]]; then
+    echo "[tb-m10-confine] FAIL - one of the R35.M10 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_u3xe_ports'  'core/drivers/tb/usb3_xhci_ext.o'
+ec_confine_one '_u3xe_stats'  'core/drivers/tb/usb3_xhci_ext.o'
+ec_confine_one '_pdc_states'  'core/drivers/tb/usbpd_contract.o'
+ec_confine_one '_pdc_stats'   'core/drivers/tb/usbpd_contract.o'
+ec_confine_one '_dpam_ports'  'core/drivers/tb/dp_altmode.o'
+ec_confine_one '_dpam_stats'  'core/drivers/tb/dp_altmode.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See usb3_xhci_ext.pdx §1, usbpd_contract.pdx §1 and" >&2
+    echo "  dp_altmode.pdx §1 for the table/counter one-writer" >&2
+    echo "  discipline." >&2
+    exit 1
+fi
+echo "[tb-m10-confine] R35.M10 (USB3 xHCI ext + USB-PD + DP alt-mode) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
