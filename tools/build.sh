@@ -2862,6 +2862,45 @@ fi
 echo "[tb-security-confine] TB4 security policy substrate state confined"
 
 # ---------------------------------------------------------------------------
+# R35.M6 (#1219/#1220/#1221/#1222): software-CM substrate state confinement.
+#
+# Four modules: three-tier FSM (path/port/tunnel), host-driven command
+# queue, event demultiplexer, firmware-CM interop handshake. Each owns
+# its own tier tables / ring / stats / state cells; tools/build.sh
+# confines relocations against each to its owning object so a second
+# writer cannot forge an FSM transition, restamp a queued command's
+# seq_tag, rewrite the demux's last-event cell, or forge the interop
+# mode-latch.
+SFM_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/sw_cm_fsm.pdx"
+SCQ_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/sw_cm_cmdq.pdx"
+SEM_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/sw_cm_evtmux.pdx"
+SIO_SRC="${REPO_ROOT}/src/kernel/core/drivers/tb/sw_cm_fw_interop.pdx"
+if [[ ! -f "${SFM_SRC}" || ! -f "${SCQ_SRC}" || ! -f "${SEM_SRC}" \
+        || ! -f "${SIO_SRC}" ]]; then
+    echo "[sw-cm-confine] FAIL - one of the R35.M6 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_sw_cm_path_states'         'core/drivers/tb/sw_cm_fsm.o'
+ec_confine_one '_sw_cm_port_states'         'core/drivers/tb/sw_cm_fsm.o'
+ec_confine_one '_sw_cm_tunnel_states'       'core/drivers/tb/sw_cm_fsm.o'
+ec_confine_one '_sw_cm_fsm_stats'           'core/drivers/tb/sw_cm_fsm.o'
+ec_confine_one '_sw_cm_cmdq_ring'           'core/drivers/tb/sw_cm_cmdq.o'
+ec_confine_one '_sw_cm_cmdq_idx'            'core/drivers/tb/sw_cm_cmdq.o'
+ec_confine_one '_sw_cm_cmdq_seq'            'core/drivers/tb/sw_cm_cmdq.o'
+ec_confine_one '_sw_cm_cmdq_stats'          'core/drivers/tb/sw_cm_cmdq.o'
+ec_confine_one '_sw_cm_evtmux_stats'        'core/drivers/tb/sw_cm_evtmux.o'
+ec_confine_one '_sw_cm_evtmux_last'         'core/drivers/tb/sw_cm_evtmux.o'
+ec_confine_one '_sw_cm_fw_interop_state'    'core/drivers/tb/sw_cm_fw_interop.o'
+ec_confine_one '_sw_cm_fw_interop_stats'    'core/drivers/tb/sw_cm_fw_interop.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See sw_cm_fsm.pdx §2, sw_cm_cmdq.pdx §1," >&2
+    echo "  sw_cm_evtmux.pdx §1 and sw_cm_fw_interop.pdx §1 for" >&2
+    echo "  the table/ring/state one-writer discipline." >&2
+    exit 1
+fi
+echo "[sw-cm-confine] software-CM substrate state confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
