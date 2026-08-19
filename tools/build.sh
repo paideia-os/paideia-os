@@ -3041,6 +3041,43 @@ fi
 echo "[tb-m10-confine] R35.M10 (USB3 xHCI ext + USB-PD + DP alt-mode) confined"
 
 # ---------------------------------------------------------------------------
+# R36.M1 (#1235/#1236/#1237/#1238): Iris Xe display substrate state
+# confinement.
+#
+# Four modules extend the prior lattice with the display engine:
+# KIND_DISPLAY_ENGINE (row table + stats), iris_xe_probe scaffold
+# (stats), pwr_wells driver (well-state + cdclk + stats), and
+# dpclk_config PLL driver (pll-state + stats). Each owns its own
+# state; tools/build.sh confines relocations against each to its
+# owning object so a second writer cannot forge a power-well
+# transition, restamp the CDCLK setpoint, or claim a PLL lock the
+# hardware never asserted.
+DPE_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_display_engine.pdx"
+IXP_SRC="${REPO_ROOT}/src/kernel/core/drivers/dpy/iris_xe_probe.pdx"
+PWR_SRC="${REPO_ROOT}/src/kernel/core/drivers/dpy/pwr_wells.pdx"
+DPCLK_SRC="${REPO_ROOT}/src/kernel/core/drivers/dpy/dpclk_config.pdx"
+if [[ ! -f "${DPE_SRC}" || ! -f "${IXP_SRC}" || ! -f "${PWR_SRC}" \
+        || ! -f "${DPCLK_SRC}" ]]; then
+    echo "[dpy-confine] FAIL - one of the R36.M1 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_display_engine_table' 'core/cap/kind_display_engine.o'
+ec_confine_one '_display_engine_stats' 'core/cap/kind_display_engine.o'
+ec_confine_one '_ixp_probe_stats'      'core/drivers/dpy/iris_xe_probe.o'
+ec_confine_one '_pwr_well_state'       'core/drivers/dpy/pwr_wells.o'
+ec_confine_one '_pwr_cdclk_khz'        'core/drivers/dpy/pwr_wells.o'
+ec_confine_one '_pwr_wells_stats'      'core/drivers/dpy/pwr_wells.o'
+ec_confine_one '_dpclk_pll_state'      'core/drivers/dpy/dpclk_config.o'
+ec_confine_one '_dpclk_pll_stats'      'core/drivers/dpy/dpclk_config.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_display_engine.pdx §3, iris_xe_probe.pdx §2," >&2
+    echo "  pwr_wells.pdx §3 and dpclk_config.pdx §3 for the row/" >&2
+    echo "  counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[dpy-confine] R36.M1 (Iris Xe display substrate) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
