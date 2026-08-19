@@ -1,0 +1,525 @@
+// src/kernel/core/drivers/gpu/gpu_reg_audit.pdx — R37.M1-004 (#1256)
+//
+// GPU MMIO poke audit + register-safety-region enforcement. Sits
+// BETWEEN R37 callers and gpu_mmio.pdx (#1253) for every security-
+// sensitive register write; refuses writes to prohibited ranges
+// (security engine, fuses, HuC authentication, GT die-id) and records
+// every accepted write to a 256-entry ring so an operator can see
+// which caller stamped which register with which value.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the AUTHORITY GATE for the GPU MMIO window. gpu_mmio.pdx
+// (#1253) knows how to write a u32 to a BAR0 offset; this module
+// knows WHICH offsets a caller is allowed to write. Every R37 module
+// past this milestone (reset, forcewake, GT PM, GEM/GTT/PPGTT,
+// GuC/HuC, command submission) calls graud_write_guarded rather than
+// gmmio_write32 directly for a security-sensitive register — and the
+// same audit ring gives a live driver a bounded trace it can dump on
+// a fault.
+//
+// IT DOES NOT DECIDE MEANING. Whether writing 0x1 to GDRST is a
+// full-GPU reset request or a debugging poke is not this module's
+// authority; it only decides whether the register is on the writable
+// whitelist. Meaning belongs to gpu_reset.pdx (#1255) — which itself
+// funnels through gpu_mmio.
+//
+// IT DOES NOT REPLACE gmmio_write32. Callers that write to plainly
+// safe registers (e.g. staging buffers in the GTT) may still call
+// gmmio_write32 directly. This gate exists for the small set of
+// security-sensitive registers where a mistaken write is a
+// safety-argument-shattering event.
+//
+// graud_arbitrated() returns 0 until a later round binds the audit
+// path to a live consumer (typically a KIND_AUDIT_STREAM under R37.M4
+// scheduling supervision).
+//
+// =============================================================================
+// §1  WHITELIST: WHAT MAY BE WRITTEN THROUGH THIS GATE
+// =============================================================================
+//
+// Every accept range is [lo, hi) — half-open. Multiple ranges compose
+// disjunctively; a write matches the first range that contains it.
+//
+//   GT / display-engine registers:
+//     [0x00000000, 0x00040000)  — general MMIO shadow (safe for the
+//                                 duration of scaffolding; R37.M4 will
+//                                 narrow this once the specific ranges
+//                                 are enumerated).
+//     [0x00046000, 0x00048000)  — CDCLK / PWR window mirror from
+//                                 R36.M1 pwr_wells.
+//
+//   Command-streamer / reset registers:
+//     [0x00009000, 0x00009800)  — GT reset + PM (GDRST + neighbourhood).
+//     [0x00000D00, 0x00000D80)  — RESET_CTL block (per-engine reset).
+//
+// =============================================================================
+// §2  DENYLIST: WHAT MAY NEVER BE WRITTEN THROUGH THIS GATE
+// =============================================================================
+//
+// Ranges enumerated even though the whitelist above already excludes
+// them, because a mistaken widening of a whitelist range MUST NOT
+// silently open a hole here. The denylist is checked FIRST.
+//
+//   FUSE_STRAP           [0x00042014, 0x00042018) — factory fuses; a
+//                        write here bricks the part on some SKUs.
+//   HUC_AUTH             [0x000C0224, 0x000C0228) — HuC authentication
+//                        result; forging a "success" breaks the HuC
+//                        trust chain.
+//   HUC_STATUS2          [0x000D3B94, 0x000D3B98) — HuC firmware
+//                        signature status; same argument.
+//   DIE_ID / MFG         [0x00009120, 0x00009130) — GT die-id / mfg
+//                        strap; a change here forges a different part.
+//   PAVP_CTL             [0x00068800, 0x00068804) — protected-audio-
+//                        video-path control; a wrong write can leak
+//                        protected content.
+//
+// =============================================================================
+// §3  AUDIT RING
+// =============================================================================
+//
+// 256 entries; each entry is 4 u64:
+//   [+0]  seq          monotonic, starts at 1
+//   [+8]  offset       the BAR0 offset written
+//   [+16] val          the u32 written (low 32 bits)
+//   [+24] flags        outcome sentinel (0 = accept, 1 = deny)
+//
+// Head index is the next slot to write; count is min(seq, 256). A
+// wraparound overwrites the oldest entry — a caller that needs to
+// consume the ring atomically drains it faster than the producer
+// wraps, and the sequence numbers make gaps detectable.
+//
+// =============================================================================
+// §4  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _graud_ring, _graud_head, _graud_seq, and _graud_stats are written
+// only by helpers in this module. tools/build.sh confines relocations
+// against each to `core/drivers/gpu/gpu_reg_audit.o`.
+//
+// =============================================================================
+// §5  ERROR CODES 0xFFFFF680..0xFFFFF68F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: gpu_reset
+// 0xFFFFF690..9F; adjacent free band below: available for future R37
+// modules).
+
+module GpuRegAudit = structure {
+
+  // §3: ring shape.
+  pub let GRAUD_RING_CAP    : u64 = 256
+  pub let GRAUD_RING_SLOTS  : u64 = 1024        // 256 * 4 u64
+
+  // §3: entry flags.
+  pub let GRAUD_FLAG_ACCEPT : u64 = 0
+  pub let GRAUD_FLAG_DENY   : u64 = 1
+
+  // Failure taxonomy — 0xFFFFF680..0xFFFFF68F.
+  pub let GRAUD_OK          : u64 = 0
+  pub let GRAUD_BAD_ARG     : u64 = 0xFFFFF68F
+  pub let GRAUD_DENIED      : u64 = 0xFFFFF68E
+  pub let GRAUD_NOT_BOUND   : u64 = 0xFFFFF68D
+  pub let GRAUD_MMIO_REFUSED: u64 = 0xFFFFF68C
+
+  // §3: audit ring (256 entries * 4 u64 = 1024 u64).
+  pub let mut _graud_ring : [u64; 1024] = uninit @align(64)
+  pub let mut _graud_head : [u64; 1] = uninit @align(64)
+  pub let mut _graud_seq  : [u64; 1] = uninit @align(64)
+
+  // Counters.
+  pub let mut _graud_stats : [u64; 8] = uninit @align(64)
+
+  pub let GRAUD_ST_ACCEPTS : u64 = 0
+  pub let GRAUD_ST_DENIES  : u64 = 1
+  pub let GRAUD_ST_REFUSED : u64 = 2
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let graud_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-004 (#1256): clear audit ring, head, seq, and stats. Boot and teardown. Labels prefixed graud_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _graud_ring];
+        xor rcx, rcx;
+      graud_rs_ring:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 1024;
+        jb  graud_rs_ring;
+
+        lea r10, [rip + _graud_head];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _graud_seq];
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _graud_stats];
+        xor rcx, rcx;
+      graud_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  graud_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let graud_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M1-004 (#1256): honesty pin. Returns 0 until a later round binds this to a live consumer (KIND_AUDIT_STREAM under R37.M4).",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let graud_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-004 (#1256): counter bump. Labels prefixed graud_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae graud_nt_out;
+        lea r10, [rip + _graud_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      graud_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let graud_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-004 (#1256): counter read. Labels prefixed graud_st_.",
+      block: {
+        cmp rdi, 8;
+        jae graud_st_zero;
+        lea r10, [rip + _graud_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      graud_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Denylist (§2). Checked FIRST — a widened whitelist never opens
+  // a denied range. Returns 1 iff offset is on the denylist.
+  // ==========================================================================
+
+  pub let graud_is_denied : (u64) -> u64 !{} @{} =
+    fn (offset: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M1-004 (#1256): §2 denylist match. Labels prefixed graud_dn_.",
+      block: {
+        // FUSE_STRAP [0x42014, 0x42018)
+        mov r10, 0x42014;
+        cmp rdi, r10;
+        jb  graud_dn_next1;
+        mov r10, 0x42018;
+        cmp rdi, r10;
+        jb  graud_dn_yes;
+
+      graud_dn_next1:
+        // HUC_AUTH [0xC0224, 0xC0228)
+        mov r10, 0xC0224;
+        cmp rdi, r10;
+        jb  graud_dn_next2;
+        mov r10, 0xC0228;
+        cmp rdi, r10;
+        jb  graud_dn_yes;
+
+      graud_dn_next2:
+        // HUC_STATUS2 [0xD3B94, 0xD3B98)
+        mov r10, 0xD3B94;
+        cmp rdi, r10;
+        jb  graud_dn_next3;
+        mov r10, 0xD3B98;
+        cmp rdi, r10;
+        jb  graud_dn_yes;
+
+      graud_dn_next3:
+        // DIE_ID / MFG [0x9120, 0x9130)
+        mov r10, 0x9120;
+        cmp rdi, r10;
+        jb  graud_dn_next4;
+        mov r10, 0x9130;
+        cmp rdi, r10;
+        jb  graud_dn_yes;
+
+      graud_dn_next4:
+        // PAVP_CTL [0x68800, 0x68804)
+        mov r10, 0x68800;
+        cmp rdi, r10;
+        jb  graud_dn_no;
+        mov r10, 0x68804;
+        cmp rdi, r10;
+        jb  graud_dn_yes;
+
+      graud_dn_no:
+        xor rax, rax;
+        ret;
+      graud_dn_yes:
+        mov rax, 1;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Whitelist (§1). Returns 1 iff offset falls in one of the accept
+  // ranges. Denylist is NOT re-checked here — graud_write_guarded
+  // checks the denylist first.
+  // ==========================================================================
+
+  pub let graud_is_safe : (u64) -> u64 !{} @{} =
+    fn (offset: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M1-004 (#1256): §1 whitelist match. Labels prefixed graud_sf_.",
+      block: {
+        // GT reset + PM  [0x9000, 0x9800)
+        mov r10, 0x9000;
+        cmp rdi, r10;
+        jb  graud_sf_next1;
+        mov r10, 0x9800;
+        cmp rdi, r10;
+        jb  graud_sf_yes;
+
+      graud_sf_next1:
+        // RESET_CTL block  [0xD00, 0xD80)
+        mov r10, 0xD00;
+        cmp rdi, r10;
+        jb  graud_sf_next2;
+        mov r10, 0xD80;
+        cmp rdi, r10;
+        jb  graud_sf_yes;
+
+      graud_sf_next2:
+        // CDCLK / PWR mirror  [0x46000, 0x48000)
+        mov r10, 0x46000;
+        cmp rdi, r10;
+        jb  graud_sf_next3;
+        mov r10, 0x48000;
+        cmp rdi, r10;
+        jb  graud_sf_yes;
+
+      graud_sf_next3:
+        // General MMIO shadow  [0x0, 0x40000). Placed LAST so
+        // narrower ranges above take precedence in the search
+        // (they are all disjoint from this one anyway per §1;
+        // the ordering matters only as documentation).
+        mov r10, 0x40000;
+        cmp rdi, r10;
+        jae graud_sf_no;
+        mov rax, 1;
+        ret;
+
+      graud_sf_no:
+        xor rax, rax;
+        ret;
+      graud_sf_yes:
+        mov rax, 1;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // graud_ring_push(offset, val, flags)
+  //
+  // Push one entry into the audit ring. Bumps seq; head wraps mod
+  // GRAUD_RING_CAP.
+  // ==========================================================================
+
+  pub let graud_ring_push : (u64, u64, u64) -> () !{mem} @{} =
+    fn (offset: u64) (val: u64) (flags: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-004 (#1256): push one audit record. §3 layout. Labels prefixed graud_rp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                    // offset
+        mov r12, rsi;                    // val
+        mov r13, rdx;                    // flags
+
+        // Bump sequence.
+        lea r10, [rip + _graud_seq];
+        mov rax, [r10 + 0];
+        add rax, 1;
+        mov [r10 + 0], rax;
+        mov r14, rax;                    // new seq
+
+        // Head slot and advance.
+        lea r10, [rip + _graud_head];
+        mov rax, [r10 + 0];
+        mov rcx, rax;                    // slot
+        add rax, 1;
+        cmp rax, 256;
+        jb  graud_rp_store_head;
+        xor rax, rax;
+      graud_rp_store_head:
+        mov [r10 + 0], rax;
+
+        // Slot address: _graud_ring + slot*32.
+        lea r10, [rip + _graud_ring];
+        shl rcx, 5;                      // *32
+        add r10, rcx;
+
+        mov [r10 + 0],  r14;             // seq
+        mov [r10 + 8],  rbx;             // offset
+        mov [r10 + 16], r12;             // val
+        mov [r10 + 24], r13;             // flags
+
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // graud_write_guarded(offset, val)
+  //
+  // §0: THE ONE ENTRY POINT for a security-sensitive GPU register
+  // write. Denylist first, whitelist second, then funnel through
+  // gmmio_write32. Every outcome records to the audit ring so a
+  // caller that saw DENIED sees a corresponding ring entry too.
+  // ==========================================================================
+
+  pub let graud_write_guarded : (u64, u64) -> u64 !{mem} @{} =
+    fn (offset: u64) (val: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-004 (#1256): audited write. §2 denylist first, §1 whitelist second, gmmio_write32 third, ring push always. Labels prefixed graud_wg_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                    // offset
+        mov r12, rsi;                    // val
+
+        // Denylist.
+        mov rdi, rbx;
+        call graud_is_denied;
+        cmp rax, 1;
+        je  graud_wg_deny;
+
+        // Whitelist.
+        mov rdi, rbx;
+        call graud_is_safe;
+        cmp rax, 0;
+        je  graud_wg_deny;
+
+        // Funnel through gmmio.
+        mov rdi, rbx;
+        mov rsi, r12;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne graud_wg_mmio;
+
+        // Record accept.
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0;                      // ACCEPT
+        call graud_ring_push;
+
+        mov rdi, 0;                      // ACCEPTS
+        call graud_note;
+        xor rax, rax;
+        jmp graud_wg_out;
+
+      graud_wg_deny:
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 1;                      // DENY
+        call graud_ring_push;
+
+        mov rdi, 1;                      // DENIES
+        call graud_note;
+        mov rax, 0xFFFFF68E;
+        jmp graud_wg_out;
+
+      graud_wg_mmio:
+        // MMIO refused (typically NOT_BOUND) — record deny for the
+        // trace, propagate MMIO_REFUSED to caller.
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 1;
+        call graud_ring_push;
+
+        mov rdi, 2;                      // REFUSED
+        call graud_note;
+        mov rax, 0xFFFFF68C;
+
+      graud_wg_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Row accessors.
+  // ==========================================================================
+
+  pub let graud_head_of : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-004 (#1256): current head index. Labels prefixed graud_ho_.",
+      block: {
+        lea r10, [rip + _graud_head];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let graud_seq_of : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-004 (#1256): current monotonic sequence. Labels prefixed graud_so_.",
+      block: {
+        lea r10, [rip + _graud_seq];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  // Read one field from a ring entry by slot (0..255) and field
+  // ordinal (0=seq, 1=offset, 2=val, 3=flags). Out-of-range returns
+  // 0 — callers gate by graud_seq_of first.
+  pub let graud_entry_field : (u64, u64) -> u64 !{mem} @{} =
+    fn (slot: u64) (field: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-004 (#1256): ring field read. Labels prefixed graud_ef_.",
+      block: {
+        cmp rdi, 256;
+        jae graud_ef_zero;
+        cmp rsi, 4;
+        jae graud_ef_zero;
+        lea r10, [rip + _graud_ring];
+        mov rax, rdi;
+        shl rax, 5;                      // slot * 32
+        add r10, rax;
+        mov rax, rsi;
+        shl rax, 3;                      // field * 8
+        add r10, rax;
+        mov rax, [r10 + 0];
+        ret;
+      graud_ef_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+}

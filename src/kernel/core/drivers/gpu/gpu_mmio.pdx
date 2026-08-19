@@ -1,0 +1,498 @@
+// src/kernel/core/drivers/gpu/gpu_mmio.pdx — R37.M1-001 (#1253)
+//
+// Iris Xe GPU MMIO substrate. Opens R37 (GPU execution engine) by
+// recording the BAR0 extent an earlier R36.M1 iris_xe_probe filtered
+// (16 MB, 16 MB aligned per bspec §14) and offering the two-word
+// {read32, write32} accessors every register touch in R37 will pass
+// through. Real reads and writes stay behind a synthetic seam this
+// milestone — arbitrated() returns 0 until a later round binds the
+// seam against a KIND_OP_REGION over the live BAR0 window.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the ACCESSOR half of GPU register bring-up. Every subsequent
+// R37 module (reset, forcewake — R37.M1-002 landed under #1254 —, GT
+// power management, GEM/GTT/PPGTT, GuC/HuC, command submission) reads
+// and writes MMIO through EXACTLY this pair. Concentrating access here
+// is what lets the audit gate (R37.M1-004 / #1256) mediate every
+// register touch without changing the callers.
+//
+// IT DOES NOT MINT A KIND_OP_REGION. The window will be minted through
+// the memory authority the boot path already holds; recording the
+// {base, length} here lets a later round containment-check that mint
+// without asking iris_xe_probe again.
+//
+// IT DOES NOT TOUCH REAL MMIO. read32/write32 route to a synthetic
+// backing store while the seam is unbound. A later round wires the
+// seam to the live BAR0 window; until then gmmio_arbitrated() pins
+// the honesty gate at 0.
+//
+// IT DOES NOT WHITELIST OFFSETS. That authority lives in
+// gpu_reg_audit.pdx (#1256), which sits BETWEEN callers and this
+// module for every security-sensitive write. This module owns
+// alignment (u32-aligned offset) and range-check (offset < bar_len);
+// meaning belongs to the audit gate above it.
+//
+// =============================================================================
+// §1  BAR0 SHAPE (bspec §14, mirrored from iris_xe_probe §1)
+// =============================================================================
+//
+//   * Length: 16 MB minimum — the display engine + GT register block.
+//   * Alignment: 16 MB (the same PCIe BAR the probe already accepted).
+//   * All accessors are 32-bit — Intel GT registers are u32 rows
+//     regardless of adjacent grouping. A 64-bit register is TWO 32-bit
+//     accesses in the caller's own order.
+//
+// =============================================================================
+// §2  SYNTHETIC BACKING STORE (this milestone only)
+// =============================================================================
+//
+// A 128-slot u32 backing store (allocated as 32 u64s at .bss) receives
+// every write and services every read while the seam is unbound. The
+// address it maps into is (offset / 4) % 128; a caller MAY use it as a
+// scratch space in a witness but MUST NOT read meaning into a read
+// whose corresponding write did not happen on this boot — that is the
+// job of a live driver, and gmmio_arbitrated() flags that this module
+// is not one yet.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _gmmio_bar_base, _gmmio_bar_len, _gmmio_bound, _gmmio_synth_ram
+// and _gmmio_stats are written only by helpers in this module.
+// tools/build.sh confines relocations against each to
+// `core/drivers/gpu/gpu_mmio.o`.
+//
+// =============================================================================
+// §4  ERROR CODES 0xFFFFF6A0..0xFFFFF6AF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used bands above: plane_cursor
+// 0xFFFFF6B0..BF; adjacent free bands below: gpu_reset
+// 0xFFFFF690..9F).
+
+module GpuMmio = structure {
+
+  // §1: BAR0 shape.
+  pub let GMMIO_BAR0_MIN_LEN   : u64 = 0x1000000        // 16 MB
+  pub let GMMIO_BAR0_ALIGN_MASK: u64 = 0xFFFFFF
+
+  // §2: backing-store shape.
+  pub let GMMIO_SYNTH_SLOTS    : u64 = 128              // 128 u32 lanes
+
+  // Failure taxonomy — 0xFFFFF6A0..0xFFFFF6AF.
+  pub let GMMIO_OK             : u64 = 0
+  pub let GMMIO_BAD_ARG        : u64 = 0xFFFFF6AF
+  pub let GMMIO_BAD_BAR        : u64 = 0xFFFFF6AE
+  pub let GMMIO_MISALIGNED     : u64 = 0xFFFFF6AD
+  pub let GMMIO_TOO_SMALL      : u64 = 0xFFFFF6AC
+  pub let GMMIO_NOT_BOUND      : u64 = 0xFFFFF6AB
+  pub let GMMIO_OUT_OF_RANGE   : u64 = 0xFFFFF6AA
+  pub let GMMIO_UNALIGNED_OFF  : u64 = 0xFFFFF6A9
+
+  // Recorded BAR0 window.
+  pub let mut _gmmio_bar_base : [u64; 1] = uninit @align(64)
+  pub let mut _gmmio_bar_len  : [u64; 1] = uninit @align(64)
+  pub let mut _gmmio_bound    : [u64; 1] = uninit @align(64)
+
+  // §2: synthetic 128-lane u32 backing store, one u32 per u64 slot.
+  pub let mut _gmmio_synth_ram : [u64; 128] = uninit @align(64)
+
+  // Counters.
+  pub let mut _gmmio_stats : [u64; 8] = uninit @align(64)
+
+  pub let GMMIO_ST_READS   : u64 = 0
+  pub let GMMIO_ST_WRITES  : u64 = 1
+  pub let GMMIO_ST_REFUSED : u64 = 2
+  pub let GMMIO_ST_BINDS   : u64 = 3
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let gmmio_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-001 (#1253): clear BAR record, bind flag, synth backing store, and stats. Boot and teardown. Labels prefixed gmmio_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _gmmio_bar_base];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _gmmio_bar_len];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _gmmio_bound];
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _gmmio_synth_ram];
+        xor rcx, rcx;
+      gmmio_rs_ram:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 128;
+        jb  gmmio_rs_ram;
+
+        lea r10, [rip + _gmmio_stats];
+        xor rcx, rcx;
+      gmmio_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  gmmio_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let gmmio_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M1-001 (#1253): honesty pin. Returns 0 until a later round binds this against a live BAR0 KIND_OP_REGION.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let gmmio_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-001 (#1253): counter bump. Labels prefixed gmmio_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae gmmio_nt_out;
+        lea r10, [rip + _gmmio_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      gmmio_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let gmmio_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-001 (#1253): counter read. Labels prefixed gmmio_st_.",
+      block: {
+        cmp rdi, 8;
+        jae gmmio_st_zero;
+        lea r10, [rip + _gmmio_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      gmmio_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Validators.
+  // ==========================================================================
+
+  pub let gmmio_bar_aligned : (u64) -> u64 !{} @{} =
+    fn (bar_base: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M1-001 (#1253): 1 iff bar_base is 16 MB aligned (§1). Labels prefixed gmmio_ba_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFFFFFF;
+        cmp rax, 0;
+        jne gmmio_ba_no;
+        mov rax, 1;
+        ret;
+      gmmio_ba_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let gmmio_bar_len_ok : (u64) -> u64 !{} @{} =
+    fn (bar_len: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M1-001 (#1253): 1 iff bar_len >= 16 MB (§1). Labels prefixed gmmio_bl_.",
+      block: {
+        mov r10, 0x1000000;
+        cmp rdi, r10;
+        jb  gmmio_bl_no;
+        mov rax, 1;
+        ret;
+      gmmio_bl_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // gmmio_bind(bar_base, bar_len)
+  //
+  // Record a BAR0 window (typically the one iris_xe_probe just
+  // accepted). Validates §1's alignment + length; refuses a zero base.
+  // Idempotent under the SAME window; a second bind with a different
+  // pair refuses BAD_BAR so a caller cannot silently switch which BAR
+  // the seam addresses.
+  // ==========================================================================
+
+  pub let gmmio_bind : (u64, u64) -> u64 !{mem} @{} =
+    fn (bar_base: u64) (bar_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-001 (#1253): bind BAR0 window. §1 validators; idempotent under identity, refuses BAD_BAR on a swap. Labels prefixed gmmio_bd_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                    // bar_base
+        mov r12, rsi;                    // bar_len
+
+        cmp rbx, 0;
+        je  gmmio_bd_bad_bar;
+
+        mov rdi, rbx;
+        call gmmio_bar_aligned;
+        cmp rax, 0;
+        je  gmmio_bd_misaligned;
+
+        mov rdi, r12;
+        call gmmio_bar_len_ok;
+        cmp rax, 0;
+        je  gmmio_bd_too_small;
+
+        // If already bound, refuse a swap.
+        lea r10, [rip + _gmmio_bound];
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        je  gmmio_bd_do;
+
+        lea r10, [rip + _gmmio_bar_base];
+        mov rax, [r10 + 0];
+        cmp rax, rbx;
+        jne gmmio_bd_bad_bar;
+        lea r10, [rip + _gmmio_bar_len];
+        mov rax, [r10 + 0];
+        cmp rax, r12;
+        jne gmmio_bd_bad_bar;
+        xor rax, rax;                    // idempotent OK
+        jmp gmmio_bd_out;
+
+      gmmio_bd_do:
+        lea r10, [rip + _gmmio_bar_base];
+        mov [r10 + 0], rbx;
+        lea r10, [rip + _gmmio_bar_len];
+        mov [r10 + 0], r12;
+        lea r10, [rip + _gmmio_bound];
+        mov rax, 1;
+        mov [r10 + 0], rax;
+
+        mov rdi, 3;                      // BINDS
+        call gmmio_note;
+        xor rax, rax;
+        jmp gmmio_bd_out;
+
+      gmmio_bd_bad_bar:
+        mov rdi, 2;
+        call gmmio_note;
+        mov rax, 0xFFFFF6AE;
+        jmp gmmio_bd_out;
+      gmmio_bd_misaligned:
+        mov rdi, 2;
+        call gmmio_note;
+        mov rax, 0xFFFFF6AD;
+        jmp gmmio_bd_out;
+      gmmio_bd_too_small:
+        mov rdi, 2;
+        call gmmio_note;
+        mov rax, 0xFFFFF6AC;
+
+      gmmio_bd_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gmmio_offset_ok(offset)
+  //
+  // Bind + range + alignment gate. u32-aligned; offset < bar_len.
+  // Returns:  0  OK
+  //           NOT_BOUND / OUT_OF_RANGE / UNALIGNED_OFF on refusal.
+  // ==========================================================================
+
+  pub let gmmio_offset_ok : (u64) -> u64 !{mem} @{} =
+    fn (offset: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-001 (#1253): bind + range + u32-alignment gate. Labels prefixed gmmio_oo_.",
+      block: {
+        lea r10, [rip + _gmmio_bound];
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        je  gmmio_oo_not_bound;
+
+        // u32-aligned: offset & 3 == 0.
+        mov rax, rdi;
+        and rax, 3;
+        cmp rax, 0;
+        jne gmmio_oo_unaligned;
+
+        // offset < bar_len.
+        lea r10, [rip + _gmmio_bar_len];
+        mov rax, [r10 + 0];
+        cmp rdi, rax;
+        jae gmmio_oo_out_of_range;
+
+        xor rax, rax;
+        ret;
+      gmmio_oo_not_bound:
+        mov rax, 0xFFFFF6AB;
+        ret;
+      gmmio_oo_unaligned:
+        mov rax, 0xFFFFF6A9;
+        ret;
+      gmmio_oo_out_of_range:
+        mov rax, 0xFFFFF6AA;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // gmmio_write32(offset, val)
+  //
+  // §0: THE ONE WRITER of a GPU register in this kernel. The audit
+  // gate (#1256) calls THIS; every module in R37 that touches MMIO
+  // funnels through here.
+  //
+  // Writes route to the synthetic backing store while the seam is
+  // unbound (§2). Returns OK on success, or the offset_ok refusal.
+  // ==========================================================================
+
+  pub let gmmio_write32 : (u64, u64) -> u64 !{mem} @{} =
+    fn (offset: u64) (val: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-001 (#1253): u32 write to the recorded BAR0 window. Synthetic backing while arbitrated=0. Labels prefixed gmmio_w_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                    // offset
+        mov r12, rsi;                    // val
+
+        mov rdi, rbx;
+        call gmmio_offset_ok;
+        cmp rax, 0;
+        jne gmmio_w_refuse;
+
+        // slot = (offset / 4) % 128.
+        mov rax, rbx;
+        shr rax, 2;
+        and rax, 0x7F;
+        lea r10, [rip + _gmmio_synth_ram];
+        mov rcx, r12;
+        mov rdx, 0xFFFFFFFF;
+        and rcx, rdx;
+        mov [r10 + rax * 8], rcx;
+
+        mov rdi, 1;                      // WRITES
+        call gmmio_note;
+        xor rax, rax;
+        jmp gmmio_w_out;
+
+      gmmio_w_refuse:
+        mov rbx, rax;
+        mov rdi, 2;
+        call gmmio_note;
+        mov rax, rbx;
+
+      gmmio_w_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gmmio_read32(offset) -> val | error-sentinel
+  //
+  // Returns the u32 in the low 32 bits; the high 32 bits are 0 on
+  // success. On refusal returns the offset_ok error code (guaranteed
+  // to be in 0xFFFFF6A0..0xFFFFF6AF, which is representable as u64
+  // and unambiguous with a synthetic u32 value the caller wrote).
+  // ==========================================================================
+
+  pub let gmmio_read32 : (u64) -> u64 !{mem} @{} =
+    fn (offset: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-001 (#1253): u32 read from the recorded BAR0 window. Synthetic backing while arbitrated=0. Labels prefixed gmmio_r_.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                    // offset
+
+        mov rdi, rbx;
+        call gmmio_offset_ok;
+        cmp rax, 0;
+        jne gmmio_r_refuse;
+
+        mov rax, rbx;
+        shr rax, 2;
+        and rax, 0x7F;
+        lea r10, [rip + _gmmio_synth_ram];
+        mov rax, [r10 + rax * 8];
+        and rax, 0xFFFFFFFF;
+
+        push rax;
+        mov rdi, 0;                      // READS
+        call gmmio_note;
+        pop rax;
+        jmp gmmio_r_out;
+
+      gmmio_r_refuse:
+        push rax;
+        mov rdi, 2;
+        call gmmio_note;
+        pop rax;
+
+      gmmio_r_out:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Row accessors.
+  // ==========================================================================
+
+  pub let gmmio_bar_base_of : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-001 (#1253): recorded BAR0 base or 0. Labels prefixed gmmio_bbo_.",
+      block: {
+        lea r10, [rip + _gmmio_bar_base];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let gmmio_bar_len_of : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-001 (#1253): recorded BAR0 length or 0. Labels prefixed gmmio_blo_.",
+      block: {
+        lea r10, [rip + _gmmio_bar_len];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let gmmio_is_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-001 (#1253): 1 iff a bind has been recorded. Labels prefixed gmmio_ib_.",
+      block: {
+        lea r10, [rip + _gmmio_bound];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+}

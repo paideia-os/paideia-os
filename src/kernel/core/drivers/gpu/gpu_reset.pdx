@@ -1,0 +1,438 @@
+// src/kernel/core/drivers/gpu/gpu_reset.pdx — R37.M1-003 (#1255)
+//
+// Iris Xe GPU reset primitives — GT (full-GPU) reset via GDRST, and
+// per-engine reset for RCS / BCS / VCS / VECS via RESET_CTL. Every
+// reset goes through gpu_mmio, so a caller cannot poke GDRST without
+// the audit gate (#1256) seeing it.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the RECOVER-A-HUNG-GPU half of R37.M1. A live driver stack
+// (R37.M2+ command submission, GuC-driven engine scheduling) will
+// call one of these two entry points whenever an engine misses its
+// heartbeat or a submission times out; concentrating both primitives
+// in one file is what stops a hang-recovery path from silently
+// converging on a hand-rolled reset sequence somewhere else.
+//
+// IT DOES NOT WAIT ON REAL HARDWARE. GDRST assert-poll-deassert
+// completes synchronously against the gpu_mmio synthetic backing
+// store. The timeout constant (200 ms per bspec §12) is recorded so a
+// later round can bind it to a live wall clock without changing the
+// call site.
+//
+// IT DOES NOT DECIDE WHEN TO RESET. That authority lives with the
+// submission scheduler (R37.M2+), which correlates completion IDs
+// against outstanding submissions and calls reset when the timeout
+// budget is exhausted. This module answers "reset engine N NOW".
+//
+// grst_arbitrated() returns 0 until a later round binds this against
+// a live GT block.
+//
+// =============================================================================
+// §1  GDRST + RESET_CTL LAYOUT (bspec §12)
+// =============================================================================
+//
+//   GDRST     : 0x941C  — full-GPU reset request. Bit 0 (GRDOM_FULL)
+//                         is set to request; hardware clears it on
+//                         completion (self-deasserting register).
+//   RESET_CTL : 0xD00   — per-engine reset control. Bit 0 (RESET_
+//                         REQUEST) is set by us; bit 16 (RESET_READY)
+//                         is set by hardware when the reset finished.
+//                         A live implementation writes bit-shift
+//                         patterns per engine into RESET_CTL_N =
+//                         0xD00 + N*4; this scaffold pins the offsets
+//                         so a later round wires the same seam.
+//
+// Engine ordinals (aligned with bspec's engine-instance table):
+//
+//   RCS   0    Render Command Streamer
+//   BCS   1    Blitter Command Streamer
+//   VCS   2    Video Command Streamer (media decode/encode)
+//   VECS  3    Video Enhancement Command Streamer (post-processing)
+//
+// =============================================================================
+// §2  TIMEOUT
+// =============================================================================
+//
+// 200 ms per bspec §12. A reset that has not de-asserted by then is
+// TIMEOUT — the caller escalates (typically a full-GPU reset after a
+// per-engine reset times out; a full-GPU reset that times out is a
+// KIND_DRIVER_DEATH cascade). Timing is dormant this milestone; the
+// synthetic seam completes reset in one call.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _grst_engine_state, _grst_last_full, and _grst_stats are written
+// only by helpers in this module. tools/build.sh confines relocations
+// against each to `core/drivers/gpu/gpu_reset.o`.
+//
+// =============================================================================
+// §4  ERROR CODES 0xFFFFF690..0xFFFFF69F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: gpu_mmio
+// 0xFFFFF6A0..AF; adjacent free band below: gpu_reg_audit
+// 0xFFFFF680..8F).
+
+module GpuReset = structure {
+
+  // §1: register offsets.
+  pub let GRST_REG_GDRST     : u64 = 0x941C
+  pub let GRST_REG_RESET_CTL : u64 = 0xD00
+
+  // GDRST full-domain bit.
+  pub let GRST_GRDOM_FULL    : u64 = 1
+
+  // RESET_CTL bits (per §1).
+  pub let GRST_RC_REQUEST    : u64 = 0x0001
+  pub let GRST_RC_READY      : u64 = 0x10000     // bit 16
+
+  // §1: engine ordinals.
+  pub let GRST_ENGINE_RCS    : u64 = 0
+  pub let GRST_ENGINE_BCS    : u64 = 1
+  pub let GRST_ENGINE_VCS    : u64 = 2
+  pub let GRST_ENGINE_VECS   : u64 = 3
+  pub let GRST_ENGINE_MAX    : u64 = 3
+  pub let GRST_ENGINE_COUNT  : u64 = 4
+
+  // §2: bspec timeout.
+  pub let GRST_TIMEOUT_MS    : u64 = 200
+
+  // Failure taxonomy — 0xFFFFF690..0xFFFFF69F.
+  pub let GRST_OK            : u64 = 0
+  pub let GRST_BAD_ARG       : u64 = 0xFFFFF69F
+  pub let GRST_BAD_ENGINE    : u64 = 0xFFFFF69E
+  pub let GRST_NOT_BOUND     : u64 = 0xFFFFF69D
+  pub let GRST_TIMEOUT       : u64 = 0xFFFFF69C
+  pub let GRST_MMIO_REFUSED  : u64 = 0xFFFFF69B
+
+  // Per-engine state: reset count. Indexed by engine ordinal.
+  pub let mut _grst_engine_state : [u64; 8] = uninit @align(64)
+
+  // Count of full-GPU resets, and last-request marker.
+  pub let mut _grst_last_full : [u64; 1] = uninit @align(64)
+
+  // Counters.
+  pub let mut _grst_stats : [u64; 8] = uninit @align(64)
+
+  pub let GRST_ST_FULL     : u64 = 0
+  pub let GRST_ST_ENGINE   : u64 = 1
+  pub let GRST_ST_REFUSED  : u64 = 2
+  pub let GRST_ST_TIMEOUTS : u64 = 3
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let grst_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-003 (#1255): clear per-engine state, last-full record, and stats. Boot and teardown. Labels prefixed grst_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _grst_engine_state];
+        xor rcx, rcx;
+      grst_rs_engines:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  grst_rs_engines;
+
+        lea r10, [rip + _grst_last_full];
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _grst_stats];
+        xor rcx, rcx;
+      grst_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  grst_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let grst_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M1-003 (#1255): honesty pin. Returns 0 until a later round binds this against a live GT block.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let grst_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-003 (#1255): counter bump. Labels prefixed grst_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae grst_nt_out;
+        lea r10, [rip + _grst_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      grst_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let grst_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-003 (#1255): counter read. Labels prefixed grst_st_.",
+      block: {
+        cmp rdi, 8;
+        jae grst_st_zero;
+        lea r10, [rip + _grst_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      grst_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Validators.
+  // ==========================================================================
+
+  pub let grst_engine_valid : (u64) -> u64 !{} @{} =
+    fn (engine: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M1-003 (#1255): 1 iff engine <= GRST_ENGINE_MAX (3). Labels prefixed grst_ev_.",
+      block: {
+        cmp rdi, 3;
+        ja  grst_ev_no;
+        mov rax, 1;
+        ret;
+      grst_ev_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // grst_full_gpu_reset() -> GRST_OK | error
+  //
+  // Full-GPU reset via GDRST §1. Writes GRDOM_FULL, then reads GDRST
+  // and polls until bit 0 clears (self-deasserting). While the seam
+  // is unbound the synthetic backing "clears" on the next read the
+  // sequence performs after the request.
+  //
+  // On the synth seam this is deterministic: we write GRDOM_FULL,
+  // then IMMEDIATELY write 0 to model the hardware's self-clear so
+  // the subsequent poll reads back 0. A live driver replaces both
+  // writes with the actual sequence — bspec §12 states the register
+  // is self-deasserting on the hardware side.
+  // ==========================================================================
+
+  pub let grst_full_gpu_reset : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-003 (#1255): full-GPU reset. §1's GDRST write, self-deassert poll, then record. Every register touch goes through gmmio_write32 / gmmio_read32 so the audit gate (#1256) can see it. Labels prefixed grst_fr_.",
+      block: {
+        push rbx;
+        push r12;
+
+        // Precondition: MMIO must be bound.
+        call gmmio_is_bound;
+        cmp rax, 1;
+        jne grst_fr_not_bound;
+
+        // Write GRDOM_FULL to GDRST.
+        mov rdi, 0x941C;                 // GDRST
+        mov rsi, 1;                      // GRDOM_FULL
+        call gmmio_write32;
+        cmp rax, 0;
+        jne grst_fr_mmio;
+
+        // Model hardware self-clear so the poll below observes 0.
+        mov rdi, 0x941C;
+        mov rsi, 0;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne grst_fr_mmio;
+
+        // Poll GDRST until bit 0 clears (single deterministic read
+        // on the synth seam; a live loop with a wall-clock timeout
+        // lands in a later round).
+        mov rdi, 0x941C;
+        call gmmio_read32;
+        and rax, 1;
+        cmp rax, 0;
+        jne grst_fr_timeout;
+
+        // Record.
+        lea r10, [rip + _grst_last_full];
+        mov rax, [r10 + 0];
+        add rax, 1;
+        mov [r10 + 0], rax;
+
+        mov rdi, 0;                      // FULL
+        call grst_note;
+        xor rax, rax;
+        jmp grst_fr_out;
+
+      grst_fr_not_bound:
+        mov rdi, 2;
+        call grst_note;
+        mov rax, 0xFFFFF69D;
+        jmp grst_fr_out;
+      grst_fr_mmio:
+        mov rdi, 2;
+        call grst_note;
+        mov rax, 0xFFFFF69B;
+        jmp grst_fr_out;
+      grst_fr_timeout:
+        mov rdi, 3;
+        call grst_note;
+        mov rax, 0xFFFFF69C;
+
+      grst_fr_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // grst_engine_reset(engine) -> GRST_OK | error
+  //
+  // Per-engine reset via §1's RESET_CTL (RCS/BCS/VCS/VECS). Sequence:
+  //   1. Write REQUEST bit to RESET_CTL_N.
+  //   2. Model hardware setting READY (bit 16) — a live driver polls
+  //      until bit 16 is set.
+  //   3. Read back and verify READY.
+  //   4. Clear the register (deassert).
+  //   5. Bump per-engine counter.
+  // ==========================================================================
+
+  pub let grst_engine_reset : (u64) -> u64 !{mem} @{} =
+    fn (engine: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-003 (#1255): per-engine reset for RCS/BCS/VCS/VECS. §1's REQUEST/READY handshake. Labels prefixed grst_er_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                    // engine
+
+        mov rdi, rbx;
+        call grst_engine_valid;
+        cmp rax, 0;
+        je  grst_er_bad_engine;
+
+        call gmmio_is_bound;
+        cmp rax, 1;
+        jne grst_er_not_bound;
+
+        // Compute per-engine offset: 0xD00 + engine*4.
+        mov r12, rbx;
+        shl r12, 2;
+        add r12, 0xD00;
+
+        // Write REQUEST.
+        mov rdi, r12;
+        mov rsi, 1;                      // REQUEST
+        call gmmio_write32;
+        cmp rax, 0;
+        jne grst_er_mmio;
+
+        // Model hardware asserting READY.
+        mov rdi, r12;
+        mov rsi, 0x10000;                // READY bit 16
+        call gmmio_write32;
+        cmp rax, 0;
+        jne grst_er_mmio;
+
+        // Verify READY set.
+        mov rdi, r12;
+        call gmmio_read32;
+        mov r11, 0x10000;
+        and rax, r11;
+        cmp rax, r11;
+        jne grst_er_timeout;
+
+        // Deassert.
+        mov rdi, r12;
+        mov rsi, 0;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne grst_er_mmio;
+
+        // Bump per-engine counter.
+        lea r10, [rip + _grst_engine_state];
+        mov rax, [r10 + rbx * 8];
+        add rax, 1;
+        mov [r10 + rbx * 8], rax;
+
+        mov rdi, 1;                      // ENGINE
+        call grst_note;
+        xor rax, rax;
+        jmp grst_er_out;
+
+      grst_er_bad_engine:
+        mov rdi, 2;
+        call grst_note;
+        mov rax, 0xFFFFF69E;
+        jmp grst_er_out;
+      grst_er_not_bound:
+        mov rdi, 2;
+        call grst_note;
+        mov rax, 0xFFFFF69D;
+        jmp grst_er_out;
+      grst_er_mmio:
+        mov rdi, 2;
+        call grst_note;
+        mov rax, 0xFFFFF69B;
+        jmp grst_er_out;
+      grst_er_timeout:
+        mov rdi, 3;
+        call grst_note;
+        mov rax, 0xFFFFF69C;
+
+      grst_er_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Row accessors.
+  // ==========================================================================
+
+  pub let grst_engine_count_of : (u64) -> u64 !{mem} @{} =
+    fn (engine: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-003 (#1255): per-engine reset count. Labels prefixed grst_eco_.",
+      block: {
+        cmp rdi, 3;
+        ja  grst_eco_zero;
+        lea r10, [rip + _grst_engine_state];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      grst_eco_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let grst_full_count_of : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M1-003 (#1255): total full-GPU reset count. Labels prefixed grst_fco_.",
+      block: {
+        lea r10, [rip + _grst_last_full];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+}

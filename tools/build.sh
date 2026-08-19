@@ -3208,6 +3208,44 @@ fi
 echo "[dpy-m4-confine] R36.M4 (display plane substrate) confined"
 
 # ---------------------------------------------------------------------------
+# R37.M1 (#1253/#1255/#1256): Iris Xe GPU execution substrate — MMIO
+# accessors (gpu_mmio), reset primitives (gpu_reset), and register
+# audit + safety-region enforcement (gpu_reg_audit).
+#
+# Three modules open R37 (post-r36-display-substrate). Each owns its
+# own state; tools/build.sh confines relocations against each to its
+# owning object so a second writer cannot forge a BAR-window
+# recording, restamp an engine reset count, or slip an audit-ring
+# entry past the guarded-write funnel.
+GMMIO_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/gpu_mmio.pdx"
+GRST_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/gpu_reset.pdx"
+GRAUD_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/gpu_reg_audit.pdx"
+if [[ ! -f "${GMMIO_SRC}" || ! -f "${GRST_SRC}" \
+        || ! -f "${GRAUD_SRC}" ]]; then
+    echo "[gpu-m1-confine] FAIL - one of the R37.M1 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_gmmio_bar_base'    'core/drivers/gpu/gpu_mmio.o'
+ec_confine_one '_gmmio_bar_len'     'core/drivers/gpu/gpu_mmio.o'
+ec_confine_one '_gmmio_bound'       'core/drivers/gpu/gpu_mmio.o'
+ec_confine_one '_gmmio_synth_ram'   'core/drivers/gpu/gpu_mmio.o'
+ec_confine_one '_gmmio_stats'       'core/drivers/gpu/gpu_mmio.o'
+ec_confine_one '_grst_engine_state' 'core/drivers/gpu/gpu_reset.o'
+ec_confine_one '_grst_last_full'    'core/drivers/gpu/gpu_reset.o'
+ec_confine_one '_grst_stats'        'core/drivers/gpu/gpu_reset.o'
+ec_confine_one '_graud_ring'        'core/drivers/gpu/gpu_reg_audit.o'
+ec_confine_one '_graud_head'        'core/drivers/gpu/gpu_reg_audit.o'
+ec_confine_one '_graud_seq'         'core/drivers/gpu/gpu_reg_audit.o'
+ec_confine_one '_graud_stats'       'core/drivers/gpu/gpu_reg_audit.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See gpu_mmio.pdx §3, gpu_reset.pdx §3 and" >&2
+    echo "  gpu_reg_audit.pdx §4 for the row/counter one-writer" >&2
+    echo "  discipline." >&2
+    exit 1
+fi
+echo "[gpu-m1-confine] R37.M1 (Iris Xe GPU execution substrate) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
