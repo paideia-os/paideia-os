@@ -3616,6 +3616,43 @@ fi
 echo "[wifi-m3-confine] R38.M3 (WiFi capability layer) confined"
 
 # ---------------------------------------------------------------------------
+# R38.M4 (#1304/#1305/#1306/#1308): net80211 class driver --
+# mgmt frame encode/decode (net80211_mgmt), association state machine
+# (net80211_assoc), MLME + PMF (net80211_mlme), regulatory-domain gate
+# (net80211_regdom).
+#
+# Four modules open R38.M4 (post-R38.M3 close).  Each owns its own
+# state cells + counters; tools/build.sh confines relocations against
+# each to its owning object so a second writer cannot silently forge
+# a staged mgmt frame, retire an assoc transition, promote a PMF
+# mode, retire an SA Query, or forge a regdom binding.
+NMG_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/net80211_mgmt.pdx"
+NAS_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/net80211_assoc.pdx"
+NML_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/net80211_mlme.pdx"
+NRD_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/net80211_regdom.pdx"
+if [[ ! -f "${NMG_SRC}" || ! -f "${NAS_SRC}" \
+        || ! -f "${NML_SRC}" || ! -f "${NRD_SRC}" ]]; then
+    echo "[net80211-m4-confine] FAIL - one of the R38.M4 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_nmg_frame'    'core/drivers/wifi/net80211_mgmt.o'
+ec_confine_one '_nmg_pos'      'core/drivers/wifi/net80211_mgmt.o'
+ec_confine_one '_nmg_stats'    'core/drivers/wifi/net80211_mgmt.o'
+ec_confine_one '_nas_state'    'core/drivers/wifi/net80211_assoc.o'
+ec_confine_one '_nas_stats'    'core/drivers/wifi/net80211_assoc.o'
+ec_confine_one '_nml_state'    'core/drivers/wifi/net80211_mlme.o'
+ec_confine_one '_nml_stats'    'core/drivers/wifi/net80211_mlme.o'
+ec_confine_one '_nrd_state'    'core/drivers/wifi/net80211_regdom.o'
+ec_confine_one '_nrd_stats'    'core/drivers/wifi/net80211_regdom.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See net80211_mgmt.pdx §3, net80211_assoc.pdx §2," >&2
+    echo "  net80211_mlme.pdx §3 and net80211_regdom.pdx §3 for the" >&2
+    echo "  per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[net80211-m4-confine] R38.M4 (net80211 class driver) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

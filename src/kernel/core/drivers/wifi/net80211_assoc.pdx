@@ -1,0 +1,487 @@
+// src/kernel/core/drivers/wifi/net80211_assoc.pdx — R38.M4-002 (#1305)
+//
+// 802.11 ASSOCIATION state machine for the net80211 class driver.
+// Advances the station through the canonical bring-up sequence:
+//
+//     UNAUTH --auth_req--> AUTH --assoc_req--> ASSOC --assoc_resp--> CONNECTED
+//
+// A CONNECTED station can also REASSOCIATE (roam) to a new AP,
+// stepping back through ASSOC and forward to CONNECTED again with a
+// new BSSID pinned into _nas_bssid.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the STATE-TRANSITION half of the class driver.  R38.M4-001
+// stages the mgmt frames; this module decides which transitions those
+// frames drive.  Every state change goes through `nas_step(event)`
+// so the transition table is one function's business.
+//
+// IT DOES NOT INITIATE WIRE TRAFFIC.  A live path calls nas_step
+// AFTER the mgmt encoder has staged a frame and BEFORE tx_dma has
+// enqueued it -- the pin says "state MOVES on receipt of the wire
+// event", and the caller composes that with the wire itself.
+//
+// IT DOES NOT VALIDATE CRYPTOGRAPHIC ASSOCIATION.  The 4-way WPA3-SAE
+// handshake is R38.M6+; here the transition to CONNECTED represents
+// "MAC layer says associated", not "keys installed".
+//
+// nas_arbitrated() returns 0 until R38.M4-003 composes this with a
+// live PMF-protected mgmt path (a REQUIRED-PMF station cannot ever
+// admit an unprotected deauth to reach UNAUTH).
+//
+// =============================================================================
+// §1  STATE + BSSID
+// =============================================================================
+//
+// _nas_state[0]  current state (0=UNAUTH, 1=AUTH, 2=ASSOC, 3=CONNECTED)
+// _nas_state[1]  current BSSID (low 48 bits of AP MAC; 0 iff UNAUTH)
+//
+// The BSSID is set once on the UNAUTH -> AUTH transition (via
+// nas_set_target_bssid before nas_step(AUTH_REQ)) and preserved
+// through AUTH / ASSOC / CONNECTED.  A REASSOC_REQ replaces it
+// atomically as part of that transition.
+//
+// A DEAUTH or TIMEOUT event drops the station to UNAUTH and clears
+// the BSSID -- a stale BSSID left over past a deauth is a
+// re-connection attempt to a peer that already rejected us.
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// `_nas_state` and `_nas_stats` are written only by helpers in this
+// module.  tools/build.sh confines relocations against both symbols
+// to `core/drivers/wifi/net80211_assoc.o` so a second writer cannot
+// bypass the transition table.
+//
+// =============================================================================
+// §3  ERROR CODES 0xFFFFF410..0xFFFFF41F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: net80211_mgmt
+// 0xFFFFF420..2F, R38.M4-001; adjacent free band below: net80211_mlme
+// 0xFFFFF400..0F, R38.M4-003).
+
+module Net80211Assoc = structure {
+
+  // §1: canonical state ids.
+  pub let NAS_STATE_UNAUTH     : u64 = 0
+  pub let NAS_STATE_AUTH       : u64 = 1
+  pub let NAS_STATE_ASSOC      : u64 = 2
+  pub let NAS_STATE_CONNECTED  : u64 = 3
+
+  // Events accepted by nas_step.
+  pub let NAS_EV_AUTH_REQ      : u64 = 0
+  pub let NAS_EV_AUTH_FAIL     : u64 = 1
+  pub let NAS_EV_ASSOC_REQ     : u64 = 2
+  pub let NAS_EV_ASSOC_RESP    : u64 = 3
+  pub let NAS_EV_REASSOC_RESP  : u64 = 4    // completion side of reassoc
+  pub let NAS_EV_DEAUTH        : u64 = 5
+  pub let NAS_EV_TIMEOUT       : u64 = 6
+
+  pub let NAS_EV_MAX           : u64 = 6
+
+  // BSSID sentinel.
+  pub let NAS_BSSID_NONE       : u64 = 0
+
+  // Failure taxonomy 0xFFFFF410..0xFFFFF41F.
+  pub let NAS_OK                   : u64 = 0
+  pub let NAS_BAD_ARG              : u64 = 0xFFFFF41F
+  pub let NAS_BAD_EVENT            : u64 = 0xFFFFF41E
+  pub let NAS_INVALID_TRANSITION   : u64 = 0xFFFFF41D
+  pub let NAS_BAD_BSSID            : u64 = 0xFFFFF41C
+  pub let NAS_NO_BSSID             : u64 = 0xFFFFF41B     // AUTH without set_target_bssid
+  pub let NAS_NOT_CONNECTED        : u64 = 0xFFFFF41A     // reassoc from wrong state
+  pub let NAS_ALREADY_CONNECTED    : u64 = 0xFFFFF419
+
+  // §2: state cell layout.
+  //   [0] current state
+  //   [1] current BSSID (low 48 bits)
+  //   [2] pending target BSSID (set by nas_set_target_bssid; consumed
+  //       on AUTH_REQ)
+  pub let mut _nas_state : [u64; 4] = uninit @align(64)
+  pub let mut _nas_stats : [u64; 8] = uninit @align(64)
+
+  // Stat slot indices.
+  pub let NAS_STAT_STEPS           : u64 = 0
+  pub let NAS_STAT_ADMITS          : u64 = 1
+  pub let NAS_STAT_REFUSED         : u64 = 2
+  pub let NAS_STAT_DEAUTHS         : u64 = 3
+  pub let NAS_STAT_REASSOCS        : u64 = 4
+  pub let NAS_STAT_CONNECTS        : u64 = 5
+
+  // ==========================================================================
+  // Reset — clears state to UNAUTH, no BSSID.  Boot + teardown.
+  // ==========================================================================
+
+  pub let nas_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M4-002 (#1305): clear state + stats. Labels prefixed nas_rs_.",
+      block: {
+        lea r10, [rip + _nas_state];
+        xor rax, rax;
+        xor rcx, rcx;
+      nas_rs_st:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  nas_rs_st;
+
+        lea r10, [rip + _nas_stats];
+        xor rcx, rcx;
+      nas_rs_ct:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  nas_rs_ct;
+        ret
+      }
+    } @no_frame
+
+  pub let nas_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R38.M4-002 (#1305): honesty pin. Returns 0 until R38.M4-003 composes this against live PMF-protected mgmt.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let nas_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M4-002 (#1305): counter bump. Labels prefixed nas_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae nas_nt_out;
+        lea r10, [rip + _nas_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      nas_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let nas_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M4-002 (#1305): counter read. Labels prefixed nas_st_.",
+      block: {
+        cmp rdi, 8;
+        jae nas_st_zero;
+        lea r10, [rip + _nas_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      nas_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let nas_state : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M4-002 (#1305): read current state.",
+      block: {
+        lea r10, [rip + _nas_state];
+        mov rax, [r10];
+        ret
+      }
+    } @no_frame
+
+  pub let nas_bssid : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M4-002 (#1305): read current BSSID (low 48 bits).",
+      block: {
+        lea r10, [rip + _nas_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // nas_set_target_bssid(bssid) -> NAS_OK | NAS_BAD_BSSID | NAS_ALREADY_CONNECTED
+  //
+  // Stages the AP MAC to use on the next AUTH_REQ.  Refuses:
+  //   * bssid == 0 (BAD_BSSID -- zero is the "no BSSID" sentinel)
+  //   * bssid has bits above 48 set (BAD_BSSID -- MAC is 48 bits)
+  //   * current state is CONNECTED (ALREADY_CONNECTED -- use reassoc)
+  // ==========================================================================
+
+  pub let nas_set_target_bssid : (u64) -> u64 !{mem} @{} =
+    fn (bssid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M4-002 (#1305): stash target BSSID for next AUTH. Labels prefixed nas_tb_.",
+      block: {
+        cmp rdi, 0;
+        je  nas_tb_bad;
+        mov r11, 0x0000FFFFFFFFFFFF;
+        cmp rdi, r11;
+        ja  nas_tb_bad;
+
+        lea r10, [rip + _nas_state];
+        mov rax, [r10];
+        cmp rax, 3;                       // CONNECTED
+        je  nas_tb_conn;
+
+        // Stash at _nas_state[2] (pending target).
+        mov [r10 + 16], rdi;
+        xor rax, rax;
+        ret;
+
+      nas_tb_bad:
+        mov rdi, 2;
+        call nas_note;
+        mov rax, 0xFFFFF41C;              // NAS_BAD_BSSID
+        ret;
+      nas_tb_conn:
+        mov rdi, 2;
+        call nas_note;
+        mov rax, 0xFFFFF419;              // NAS_ALREADY_CONNECTED
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nas_step(event) -> NAS_OK | error
+  //
+  // Transition table -- one entry per legal (state, event) pair.
+  //
+  //   UNAUTH + AUTH_REQ       -> AUTH (requires pending target BSSID)
+  //   UNAUTH + DEAUTH         -> UNAUTH (idempotent; no counter bump)
+  //   AUTH   + ASSOC_REQ      -> ASSOC
+  //   AUTH   + AUTH_FAIL      -> UNAUTH (clears BSSID)
+  //   AUTH   + DEAUTH         -> UNAUTH (clears BSSID)
+  //   AUTH   + TIMEOUT        -> UNAUTH (clears BSSID)
+  //   ASSOC  + ASSOC_RESP     -> CONNECTED
+  //   ASSOC  + REASSOC_RESP   -> CONNECTED (completes a roam)
+  //   ASSOC  + DEAUTH         -> UNAUTH (clears BSSID)
+  //   ASSOC  + TIMEOUT        -> AUTH (falls back one step)
+  //   CONNECTED + DEAUTH      -> UNAUTH (clears BSSID)
+  //   CONNECTED + TIMEOUT     -> UNAUTH (clears BSSID)
+  //
+  // Every other pair -> NAS_INVALID_TRANSITION.  Unknown event id
+  // -> NAS_BAD_EVENT.  Bumps STEPS on entry; ADMITS on OK.  DEAUTH
+  // additionally bumps DEAUTHS; a UNAUTH->AUTH move bumps neither
+  // DEAUTHS nor CONNECTS; a *->CONNECTED move bumps CONNECTS.
+  // ==========================================================================
+
+  pub let nas_step : (u64) -> u64 !{mem} @{} =
+    fn (event: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M4-002 (#1305): the transition table. Labels prefixed nas_sp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        mov rbx, rdi;                     // event
+
+        mov rdi, 0;                       // STEPS
+        call nas_note;
+
+        // Event in range?
+        cmp rbx, 6;                       // NAS_EV_MAX
+        ja  nas_sp_bad_ev;
+
+        // Load current state.
+        lea r10, [rip + _nas_state];
+        mov r12, [r10];                   // current state
+        mov r13, [r10 + 8];               // current bssid
+
+        // -- UNAUTH (0) --------------------------------------------
+        cmp r12, 0;
+        jne nas_sp_not_unauth;
+        // AUTH_REQ?
+        cmp rbx, 0;                       // NAS_EV_AUTH_REQ
+        je  nas_sp_uauth_authreq;
+        // DEAUTH is idempotent from UNAUTH.
+        cmp rbx, 5;                       // NAS_EV_DEAUTH
+        je  nas_sp_ok_no_change;
+        jmp nas_sp_bad_trans;
+
+      nas_sp_uauth_authreq:
+        // Pending BSSID must be set.
+        lea r10, [rip + _nas_state];
+        mov rax, [r10 + 16];
+        cmp rax, 0;
+        je  nas_sp_no_bssid;
+        // Move to AUTH, commit pending BSSID as active.
+        mov [r10 + 8], rax;
+        xor rcx, rcx;
+        mov [r10 + 16], rcx;              // clear pending
+        mov rcx, 1;                       // AUTH
+        mov [r10], rcx;
+        jmp nas_sp_admit;
+
+        // -- AUTH (1) ----------------------------------------------
+      nas_sp_not_unauth:
+        cmp r12, 1;
+        jne nas_sp_not_auth;
+        cmp rbx, 2;                       // ASSOC_REQ
+        je  nas_sp_auth_assoc;
+        cmp rbx, 1;                       // AUTH_FAIL
+        je  nas_sp_drop_unauth;
+        cmp rbx, 5;                       // DEAUTH
+        je  nas_sp_drop_unauth_deauth;
+        cmp rbx, 6;                       // TIMEOUT
+        je  nas_sp_drop_unauth;
+        jmp nas_sp_bad_trans;
+
+      nas_sp_auth_assoc:
+        lea r10, [rip + _nas_state];
+        mov rcx, 2;                       // ASSOC
+        mov [r10], rcx;
+        jmp nas_sp_admit;
+
+        // -- ASSOC (2) ---------------------------------------------
+      nas_sp_not_auth:
+        cmp r12, 2;
+        jne nas_sp_not_assoc;
+        cmp rbx, 3;                       // ASSOC_RESP
+        je  nas_sp_to_connected;
+        cmp rbx, 4;                       // REASSOC_RESP
+        je  nas_sp_to_connected;
+        cmp rbx, 5;                       // DEAUTH
+        je  nas_sp_drop_unauth_deauth;
+        cmp rbx, 6;                       // TIMEOUT
+        je  nas_sp_assoc_timeout;
+        jmp nas_sp_bad_trans;
+
+      nas_sp_to_connected:
+        lea r10, [rip + _nas_state];
+        mov rcx, 3;                       // CONNECTED
+        mov [r10], rcx;
+        mov rdi, 5;                       // CONNECTS
+        call nas_note;
+        jmp nas_sp_admit;
+
+      nas_sp_assoc_timeout:
+        // Fall back to AUTH (retry assoc).
+        lea r10, [rip + _nas_state];
+        mov rcx, 1;                       // AUTH
+        mov [r10], rcx;
+        jmp nas_sp_admit;
+
+        // -- CONNECTED (3) -----------------------------------------
+      nas_sp_not_assoc:
+        cmp r12, 3;
+        jne nas_sp_bad_trans;
+        cmp rbx, 5;                       // DEAUTH
+        je  nas_sp_drop_unauth_deauth;
+        cmp rbx, 6;                       // TIMEOUT
+        je  nas_sp_drop_unauth;
+        jmp nas_sp_bad_trans;
+
+      nas_sp_drop_unauth_deauth:
+        mov rdi, 3;                       // DEAUTHS
+        call nas_note;
+        // fallthrough
+      nas_sp_drop_unauth:
+        lea r10, [rip + _nas_state];
+        xor rcx, rcx;
+        mov [r10], rcx;                   // state = UNAUTH
+        mov [r10 + 8], rcx;               // clear bssid
+        mov [r10 + 16], rcx;              // clear pending
+        jmp nas_sp_admit;
+
+      nas_sp_ok_no_change:
+        // No state write; still count as admit.
+      nas_sp_admit:
+        mov rdi, 1;                       // ADMITS
+        call nas_note;
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      nas_sp_bad_ev:
+        mov rdi, 2;
+        call nas_note;
+        mov rax, 0xFFFFF41E;              // NAS_BAD_EVENT
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      nas_sp_bad_trans:
+        mov rdi, 2;
+        call nas_note;
+        mov rax, 0xFFFFF41D;              // NAS_INVALID_TRANSITION
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      nas_sp_no_bssid:
+        mov rdi, 2;
+        call nas_note;
+        mov rax, 0xFFFFF41B;              // NAS_NO_BSSID
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nas_reassoc(new_bssid) -> NAS_OK | error
+  //
+  // Roaming helper.  Refuses:
+  //   * new_bssid invalid (BAD_BSSID)
+  //   * not currently CONNECTED (NOT_CONNECTED)
+  //
+  // On admission: pins new_bssid into _nas_state[1] AND drops state
+  // to ASSOC so the caller must drive a REASSOC_RESP to return to
+  // CONNECTED.  Bumps REASSOCS on admission.
+  // ==========================================================================
+
+  pub let nas_reassoc : (u64) -> u64 !{mem} @{} =
+    fn (new_bssid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M4-002 (#1305): begin reassoc to new BSSID. Labels prefixed nas_rr_.",
+      block: {
+        cmp rdi, 0;
+        je  nas_rr_bad_bssid;
+        mov r11, 0x0000FFFFFFFFFFFF;
+        cmp rdi, r11;
+        ja  nas_rr_bad_bssid;
+
+        push rbx;
+        mov rbx, rdi;
+
+        lea r10, [rip + _nas_state];
+        mov rax, [r10];
+        cmp rax, 3;                       // CONNECTED
+        jne nas_rr_not_conn_pop;
+
+        mov [r10 + 8], rbx;               // new BSSID pinned
+        mov rax, 2;                       // -> ASSOC (pending resp)
+        mov [r10], rax;
+
+        mov rdi, 4;                       // REASSOCS
+        call nas_note;
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      nas_rr_not_conn_pop:
+        mov rdi, 2;
+        call nas_note;
+        mov rax, 0xFFFFF41A;              // NAS_NOT_CONNECTED
+        pop rbx;
+        ret;
+
+      nas_rr_bad_bssid:
+        mov rdi, 2;
+        call nas_note;
+        mov rax, 0xFFFFF41C;              // NAS_BAD_BSSID
+        ret
+      }
+    }
+}
