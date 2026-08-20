@@ -2177,3 +2177,176 @@ admitting `RIGHT_MINT` `line=14`, over-clearing the bitmap `line=17`.
 | 2026-08-15 | R30.M6 | #1075/#1076 | Landed `KIND_GPIO_LINE = 0x154` — derived over `KIND_DEVICE` with a two-part gate (kind + RIGHT_MINT, then the inherited identity must resolve to a probed pad controller). Row-indirection tail via `_gpio_line_table` encoding `{parent_slot:u8, pin:u16 absolute, pad_index:u16 community-relative, community:u8}` plus an inherited `controller_id`. Rights `R_GPIO_LINE_ALL = 0x41F`, with `CONFIG` split from `WRITE`. Community/pad mapping DERIVED at mint by `lpss_gpio_resolve_pin`; six resolver signatures arity-pinned and `lpss_gpio_pad_off` confined, so `gpio_line_pad_off_of_slot` is the only capability-to-pad-address route. Duplicate `(controller, pin)` refused; out-of-range and unmapped pins refused with distinct codes, never clamped. Two-phase controller cascade via `lpss_gpio_release`. Driver half in `core/drivers/gpio/{lpss_gpio,gpio_io}.pdx` with `design/drivers/lpss-gpio-controller.md`. Witnesses `R30 LPSS GPIO OK` + `R30 KIND_GPIO OK`. Opens R30.M6. |
 | 2026-08-16 | R30.M8 | #1569/#1083/#1084 | Landed `KIND_FW_SESSION = 0x155`, **renamed from the catalog's `KIND_AML_SESSION` by #1569** before any code existed against the old name — capabilities live in `src/kernel/core/cap/` and `tools/lint-no-kernel-aml.sh` refuses any identifier beginning `aml` there, so the catalog name and the file's address were in direct contradiction; the lint was left alone, and the new name is the more accurate one since what is arbitrated is an evaluation *session* against a *firmware-supplied* object. Derived over `KIND_IPC_ENDPOINT` (base slot 5) with a two-part gate whose first half is **emptier than any previous kind's** — every endpoint in the system is a `KIND_IPC_ENDPOINT`, the shell's stdout included — so the second half requires the parent's **inherited** endpoint id to be registered in `_fw_ep_registry` for the requested op-region domain, the `KIND_GPIO_LINE` (#1075) shape. **Two tables, not one**, because a capability names a session and arbitration is about the object (N:1): `_fw_object_table` (8 × 128 B) carries the claim, depth, refcount and the whole 64-byte scope path; `_fw_session_table` (16 × 16 B) carries the object index. Putting the claim in the session row would give every session its own, so every holder would claim successfully, observe that it held it, and write concurrently with all the others — a failure with **no symptom on the claiming side**, surfacing as a firmware object with interleaved half-updates; `fw_object_alloc` therefore finds first and allocates second, and the witness asserts ten sessions leave one object row. The **path is stored whole, not hashed**, and compared length-first then bytewise: a collision merges two arbitration domains, and a comparison stopping at a shared prefix or a NUL would make `\_SB.PCI0.LPCB.EC0` and `\_SB.PCI0.LPCB.EC0X` the same object — the fixture's two paths share 17 bytes and differ in the 18th for exactly that reason. Rights `R_FW_SESSION_ALL = 0x41B`; the claim requires `WRITE` because its whole effect is to exclude other writers, while `WRITE` and the claim stay separate bits so a consistent-snapshot reader can hold one without the other. Claim is recursive for the same session, **refused** (`CLAIM_HELD`, no queue) for a different one, and released only at depth 1→0; `holder` stores `row + 1` because row 0 is legitimate and a raw id would make 'row 0 holds it' and 'nobody holds it' the same bit pattern. Revoke releases a held claim at any depth — a claim held by a dead session excludes every other writer forever — and frees the object row at refcount 0. Both mint and revoke go through `cap_mint_write`, adding no second descriptor writer (#1579). **New failure band `0xFFFFFE10..1F`**: the `0xFFFFFFxx` band is exhausted at two free runs of eight, and splitting across them would have made the taxonomy discontiguous for no reason but scarcity while leaving the next kind worse off. **#1084 is sections G–H of the same witness**: ten evaluators interleaved at operation granularity, asserting linearizability *defined before it is claimed* — (L1) mutual exclusion checked between every pair of adjacent steps rather than at the end, since every episode terminates with an UNCLAIM and the quiescent final state is consistent with any amount of overlap; (L2) no lost updates, the object's value equalling the completed-write count; (L3) non-vacuity, asserted as exact step and blocked-step totals because a schedule that silently stopped contending would still clear a floor. Each episode is five separate steps (CLAIM/READ/BUMP/WRITE/UNCLAIM) so another session can be scheduled between the read and the write, and a session proceeds on **its own successful claim** rather than on the object's holder field — modelling it the other way would build the property under test into the harness. Phase A's 14-step schedule is hand-derived from the two failure modes (two sessions both observing the object free; a release landing between another session's check and its use); Phase B rotates the starting session each pass, without which session 0 would win every pass and the other nine would never complete an episode. Boot witness `tests/kernel/cap/fw_session_cap_synth.pdx` (A..I) — fingerprint `R30 KIND_FW_SESSION OK`. Closes R30.M8. |
 | 2026-08-17 | R31.M1 | #1089/#1090/#1091 | Landed `KIND_EC_QUERY = 0x156` — the right to be told that ONE embedded controller raised ONE of a named set of query events — plus the kernel's transaction gate (`core/drivers/ec/ec_access.pdx`) and query router (`core/acpi/ec_route.pdx`). Derives over `KIND_IPC_ENDPOINT` in **two halves** for the second time in the tree, because the kind half admits every endpoint in the machine; the second half is a second capability argument, a live `KIND_OP_REGION` over `OPREG_SPACE_EC` with a declared length in 1..256, and both `ec_addr` and `endpoint_id` are inherited rather than argued. Row indirection via `_ec_query_table` (8 x 64 B) carrying a 256-bit notify bitmap that **starts full and only ever narrows** — there is no widening primitive and `tools/build.sh` greps for one. Rights `R_EC_QUERY_ALL = 0x41A`, `RIGHT_MINT` deliberately excluded (leaf). Band `0xFFFFFE00..0F`. Added to `cap_revoke_slot`'s per-kind dispatch; NOT added to `KIND_SEEDABLE_TABLE`, per #1597's rule against seeding a kind defined by its derivation. `acpi_evt_offer` gained its **third source**, `ACPI_EVT_SRC_EC_QUERY = 3` — the extension its own R30.M4 justification anticipated when it put `NEEDS_ACK` in a field of its own; a query is not an acknowledging source, so `flags` stays 0. Three boot fingerprints (`R31 KIND_EC_QUERY OK`, `R31 EC ACCESS OK`, `R31 EC QUERY ROUTE OK`), eight mutants each caught with its own tag. **#1091's decoder half was already done** in ring 3 (R30.M7 / #1080) and was not rebuilt — `design/acpi/no-aml-in-kernel.md` forbids it in the kernel, and what was missing was the routing. **This path is NOT arbitrated against SMM**: the Global Lock is inert in production because #1580 has not plumbed the FACS address or the PM1 control port, and `ec_access_arbitrated()` is pinned at 0 by the boot witness so the commit that closes #1580 breaks the pin and must rewrite the claim. See `design/drivers/embedded-controller-kernel-path.md` §0. |
+| 2026-08-20 | R40.M5 | #1364 | R40.M5 closure — enumerated every derived kind minted between R29 and R40 (0x140..0x181) in a single summary table (§"R40.M5 closure catalogue" below), cross-referenced to its `src/kernel/core/cap/kind_*.pdx` and its failure-taxonomy band, and classified its derivation discipline (LINEAR / SEALED / plain-derived). Design doc only, no source changes — the tags, bases, rights and bands are the ones already in `kind.pdx`. **Ordering guarantee:** the derived-kind range is 0x140..0x181 with **no gaps** — every value from 0x140 through 0x181 (66 slots) is either landed or reserved-in-place, so a future kind lands at 0x182 without displacing anything below. |
+
+---
+
+## R40.M5 closure catalogue (0x140..0x181)
+
+Populated by R40.M5-002 (#1364) at the r40-camera-wwan close. One row per
+derived-kind tag; where a kind carries an explicit LINEAR or SEALED
+discipline the "Discipline" column names it, otherwise the column reads
+`derived` (plain derivation, no re-parenting refusal, no opacity gate).
+The "Band" column is the kind's own failure-taxonomy band as declared in
+its `pub let` refusal constants; any driver or channel that emits
+alongside the kind owns a disjoint band declared in its own module.
+Every source file lives under `src/kernel/core/cap/kind_*.pdx` unless
+otherwise noted.
+
+### R29 — driver-framework maturation (three derived kinds)
+
+| Tag    | Kind name                | Parent (base)                     | Purpose                                                                                     | Discipline                    | Band                | Source                          |
+|--------|--------------------------|------------------------------------|---------------------------------------------------------------------------------------------|-------------------------------|---------------------|---------------------------------|
+| 0x140  | `KIND_HW_INTERRUPT`      | `KIND_HW = 14`                    | Vector + CPU affinity + trigger mode; the R29.M1 hardware-interrupt authority.              | derived (leaf-until-MSIX)     | 0xFFFFFFF7..FD      | `kind_hw_interrupt.pdx`         |
+| 0x141  | `KIND_HW_MSIX_VECTOR`    | `KIND_HW_INTERRUPT = 0x140`       | MSI-X vector under an interrupt parent; layered over HW_INTERRUPT.                          | derived                       | 0xFFFFFFE7..E9      | `kind_hw_msix_vector.pdx`       |
+| 0x142  | `KIND_DMA_DOMAIN`        | `KIND_MEMORY = 4`                 | IOMMU-scoped memory-access domain; rebased from `KIND_HW_DMA_DOMAIN` at R29.M5-001 (#1036). | derived (per-op gated)        | 0xFFFFFFD5..DF      | `kind_dma_domain.pdx`           |
+
+### R30 — platform-firmware substrate (six derived kinds)
+
+| Tag    | Kind name                | Parent (base)                     | Purpose                                                                                     | Discipline                    | Band                | Source                          |
+|--------|--------------------------|------------------------------------|---------------------------------------------------------------------------------------------|-------------------------------|---------------------|---------------------------------|
+| 0x150  | `KIND_OP_REGION`         | `KIND_MEMORY = 4` or `KIND_IO_PORT = 11` (per space) | Address-space window; the R30 security boundary.                                            | derived (transitive-cascade)  | 0xFFFFFFC2..CF      | `kind_op_region.pdx`            |
+| 0x151  | `KIND_ACPI_EVENT`        | `KIND_HW_INTERRUPT = 0x140`       | Subscriber-to-ACPI-event-stream cap; rebased from the `0x21` planning row at R30.M4 (#1068).| derived                       | 0xFFFFFF90..9F      | `kind_acpi_event.pdx`           |
+| 0x152  | `KIND_I2C_BUS`           | `KIND_DEVICE = 10`                | I²C bus authority; non-transacting by construction.                                         | derived                       | 0xFFFFFF83..8F      | `kind_i2c_bus.pdx`              |
+| 0x153  | `KIND_I2C_SLAVE`         | `KIND_I2C_BUS = 0x152`            | Single addressable peripheral on a bus.                                                     | derived (leaf, no MINT)       | 0xFFFFFF70..7F      | `kind_i2c_slave.pdx`            |
+| 0x154  | `KIND_GPIO_LINE`         | `KIND_DEVICE = 10`                | Pin authority behind a probed pad controller.                                               | derived                       | 0xFFFFFF10..1F      | `kind_gpio_line.pdx`            |
+| 0x155  | `KIND_FW_SESSION`        | `KIND_IPC_ENDPOINT = 5`           | Evaluation session against a firmware-supplied object; **the LINEARIZABILITY witness lives here** (R30.M8-003 #1084). | linearizable-on-object        | 0xFFFFFE10..1F      | `kind_fw_session.pdx`           |
+
+### R31 — sensors, actuators, hot-keys (nine derived kinds)
+
+| Tag    | Kind name                | Parent (base)                     | Purpose                                                                                     | Discipline                    | Band                | Source                          |
+|--------|--------------------------|------------------------------------|---------------------------------------------------------------------------------------------|-------------------------------|---------------------|---------------------------------|
+| 0x156  | `KIND_EC_QUERY`          | `KIND_IPC_ENDPOINT = 5`           | Right to be told that one EC raised one named query event.                                  | derived (leaf, no MINT)       | 0xFFFFFE00..0F      | `kind_ec_query.pdx`             |
+| 0x157  | `KIND_THERMAL_ZONE`      | `KIND_DEVICE = 10`                | ACPI thermal zone (temperatures, trip points).                                              | derived                       | 0xFFFFFE30..3F      | `kind_thermal_zone.pdx`         |
+| 0x158  | `KIND_BATTERY`           | `KIND_DEVICE = 10`                | ACPI battery reading + capacity scale.                                                      | derived                       | 0xFFFFFE40..4F      | `kind_battery.pdx`              |
+| 0x159  | `KIND_COOLING_DEVICE`    | `KIND_DEVICE = 10`                | ACPI cooling-device level authority (0..max).                                               | derived                       | 0xFFFFFE50..5F      | `kind_cooling_device.pdx`       |
+| 0x15A  | `KIND_BACKLIGHT`         | `KIND_DEVICE = 10`                | Backlight level authority (PWM or DPAUX backend).                                           | derived                       | 0xFFFFFE70..7F      | `kind_backlight.pdx`            |
+| 0x15B  | `KIND_HID_DEVICE`        | `KIND_DEVICE = 10`                | HID device (touchpad, trackpoint, keyboard) authority.                                       | derived                       | 0xFFFFFE80..8F      | `kind_hid_device.pdx`           |
+| 0x15C  | `KIND_HID_EVENT`         | `KIND_IPC_ENDPOINT = 5`           | Subscriber-to-HID-event-stream cap.                                                          | derived                       | 0xFFFFFE90..9F      | `kind_hid_event.pdx`            |
+| 0x15D  | `KIND_SENSOR_CHANNEL`    | `KIND_IPC_ENDPOINT = 5`           | Subscriber-to-sensor-hub (ALS/ACCEL/GYRO) event stream.                                     | derived                       | 0xFFFFFEA0..AF      | `kind_sensor_channel.pdx`       |
+| —      | `KIND_THERMAL_POLICY` (§) | —                                 | Not a derived-kind row — thermal_policy is a `.bss` map, not a cap; see `core/policy/thermal_policy.pdx`. | n/a                           | n/a                 | `core/policy/thermal_policy.pdx` |
+
+### R33 — audio (five derived kinds)
+
+| Tag    | Kind name                | Parent (base)                     | Purpose                                                                                     | Discipline                    | Band                | Source                          |
+|--------|--------------------------|------------------------------------|---------------------------------------------------------------------------------------------|-------------------------------|---------------------|---------------------------------|
+| 0x15E  | `KIND_AUDIO_CONTROLLER`  | `KIND_DEVICE = 10`                | HDA / SST audio controller authority.                                                       | derived                       | 0xFFFFFEB0..BF      | `kind_audio_controller.pdx`     |
+| 0x15F  | `KIND_PCM_STREAM`        | `KIND_IPC_ENDPOINT = 5`           | PCM stream endpoint (playback/capture).                                                     | derived (LINEAR on identity)  | 0xFFFFFEC0..CF      | `kind_pcm_stream.pdx`           |
+| 0x160  | `KIND_AUDIO_CLOCK`       | `KIND_HW = 14`                    | Audio-domain clock frequency authority.                                                     | derived                       | 0xFFFFFED0..DF      | `kind_audio_clock.pdx`          |
+| 0x161  | `KIND_AUDIO_ROUTE`       | `KIND_IPC_ENDPOINT = 5`           | Route / gain / mute matrix; "LINEAR on identity, DYNAMIC on state" (kind.pdx §KIND_AUDIO_ROUTE). | LINEAR-on-identity            | 0xFFFFFEE0..EF      | `kind_audio_route.pdx`          |
+
+### R34/R35 — USB / mass-storage / hotplug (nine derived kinds)
+
+| Tag    | Kind name                | Parent (base)                     | Purpose                                                                                     | Discipline                    | Band                | Source                          |
+|--------|--------------------------|------------------------------------|---------------------------------------------------------------------------------------------|-------------------------------|---------------------|---------------------------------|
+| 0x162  | `KIND_USB_DEVICE`        | `KIND_DEVICE = 10`                | Enumerated USB device authority.                                                            | derived                       | 0xFFFFFDE0..EF      | `kind_usb_device.pdx`           |
+| 0x163  | `KIND_USB_HUB`           | `KIND_USB_DEVICE = 0x162`         | Hub-class device (port-tree authority).                                                     | derived                       | 0xFFFFFEF0..FF      | `kind_usb_hub.pdx`              |
+| 0x164  | `KIND_USB_INTERFACE`     | `KIND_USB_DEVICE = 0x162`         | One interface-descriptor's authority within a device.                                       | derived                       | 0xFFFFFBB0..BF      | `kind_usb_interface.pdx`        |
+| 0x165  | `KIND_USB_ENDPOINT`      | `KIND_IPC_ENDPOINT = 5`           | One endpoint-descriptor's authority under an interface.                                     | derived                       | 0xFFFFFBC0..CF      | `kind_usb_endpoint.pdx`         |
+| 0x166  | `KIND_MSC_LUN`           | `KIND_USB_INTERFACE = 0x164`      | Mass-storage-class LUN authority under a USB interface.                                     | derived                       | 0xFFFFFBA0..AF      | `kind_msc_lun.pdx`              |
+| 0x167  | `KIND_SCSI_DEVICE`       | `KIND_MSC_LUN = 0x166`            | SCSI target under a mass-storage LUN.                                                       | derived                       | 0xFFFFFB70..7F      | `kind_scsi_device.pdx`          |
+| 0x168  | `KIND_USB_URB`           | `KIND_IPC_ENDPOINT = 5`           | Single-USB-request-block authority (transient).                                             | derived                       | 0xFFFFFB60..6F      | `kind_usb_urb.pdx`              |
+| 0x169  | `KIND_ISOCH_STREAM`      | `KIND_USB_ENDPOINT = 0x165`       | xHCI isochronous stream cap (webcam / UAC).                                                 | derived                       | 0xFFFFFAC0..CF      | `kind_isoch_stream.pdx`         |
+| 0x16A  | `KIND_FP_SENSOR`         | `KIND_DEVICE = 10`                | Fingerprint sensor device authority.                                                        | derived                       | 0xFFFFFA80..8F      | `kind_fp_sensor.pdx`            |
+
+### R35 — Thunderbolt / hotplug / DMA attestation (four derived kinds)
+
+| Tag    | Kind name                | Parent (base)                     | Purpose                                                                                     | Discipline                    | Band                | Source                          |
+|--------|--------------------------|------------------------------------|---------------------------------------------------------------------------------------------|-------------------------------|---------------------|---------------------------------|
+| 0x16B  | `KIND_PCIE_HOTPLUG_EVENT`| `KIND_IPC_ENDPOINT = 5`           | PCIe hotplug (slot-power / link-training / present-detect) subscriber.                      | derived                       | 0xFFFFFA30..3F      | `kind_pcie_hotplug_event.pdx`   |
+| 0x16C  | `KIND_TB_DOMAIN`         | `KIND_DEVICE = 10`                | Thunderbolt controller / domain root authority.                                             | derived                       | 0xFFFFF9F0..FF      | `kind_tb_domain.pdx`            |
+| 0x16D  | `KIND_TB_ROUTE`          | `KIND_IPC_ENDPOINT = 5`           | Path / route through a Thunderbolt topology.                                                | derived                       | 0xFFFFF9A0..AF      | `kind_tb_route.pdx`             |
+| 0x16E  | `KIND_DMA_ATTESTATION`   | `KIND_IPC_ENDPOINT = 5`           | Consent-dialog attestation the user is about to admit a foreign DMA-master.                 | derived                       | 0xFFFFF950..5F      | `kind_dma_attestation.pdx`      |
+
+### R36 — display / mode-set (five derived kinds)
+
+| Tag    | Kind name                | Parent (base)                     | Purpose                                                                                     | Discipline                    | Band                | Source                          |
+|--------|--------------------------|------------------------------------|---------------------------------------------------------------------------------------------|-------------------------------|---------------------|---------------------------------|
+| 0x16F  | `KIND_DISPLAY_ENGINE`    | `KIND_DEVICE = 10`                | Iris Xe display engine (power well + link-clock PLL root).                                  | derived                       | 0xFFFFF7C0..CF      | `kind_display_engine.pdx`       |
+| 0x170  | `KIND_DISPLAY_OUTPUT`    | `KIND_DEVICE = 10`                | One physical/virtual output (eDP / DP-Alt / HDMI).                                          | derived                       | 0xFFFFF780..8F      | `kind_display_output.pdx`       |
+| 0x171  | `KIND_MODESET_TXN`       | `KIND_IPC_ENDPOINT = 5`           | Atomic mode-set transaction; **LINEAR** (see kind.pdx §KIND_MODESET_TXN).                    | **LINEAR** (no MINT bit)      | 0xFFFFF730..3F      | `kind_modeset_txn.pdx`          |
+| 0x172  | `KIND_DISPLAY_MODE`      | `KIND_MEMORY = 4`                 | Timing / resolution / refresh-rate ordinal for a mode set.                                  | derived                       | 0xFFFFF720..2F      | `kind_display_mode.pdx`         |
+| 0x173  | `KIND_DISPLAY_PLANE`     | `KIND_MEMORY = 4`                 | Framebuffer plane authority under a modeset.                                                | derived                       | 0xFFFFF6E0..EF      | `kind_display_plane.pdx`        |
+
+### R37 — GPU (four derived kinds)
+
+| Tag    | Kind name                | Parent (base)                     | Purpose                                                                                     | Discipline                    | Band                | Source                          |
+|--------|--------------------------|------------------------------------|---------------------------------------------------------------------------------------------|-------------------------------|---------------------|---------------------------------|
+| 0x174  | `KIND_GPU_BO`            | `KIND_MEMORY = 4`                 | GPU buffer object (tile + cache class).                                                     | derived                       | 0xFFFFF640..4F      | `kind_gpu_bo.pdx`               |
+| 0x175  | `KIND_GPU_VM`            | `KIND_IPC_ENDPOINT = 5`           | Per-process GPU virtual address space (PPGTT).                                              | derived                       | 0xFFFFF5F0..FF      | `kind_gpu_vm.pdx`               |
+| 0x176  | `KIND_GPU_CONTEXT`       | `KIND_IPC_ENDPOINT = 5`           | LRC-backed GPU context (execlists); **LINEAR**.                                             | **LINEAR** (no MINT bit)      | 0xFFFFF5A0..AF      | `kind_gpu_context.pdx`          |
+| 0x177  | `KIND_GPU_SUBMIT`        | `KIND_IPC_ENDPOINT = 5`           | Single GPU batch-buffer submission (transient); **LINEAR**.                                 | **LINEAR** (no MINT bit)      | 0xFFFFF560..6F      | `kind_gpu_submit.pdx`           |
+
+### R38 — WiFi (four derived kinds)
+
+| Tag    | Kind name                | Parent (base)                     | Purpose                                                                                     | Discipline                    | Band                | Source                          |
+|--------|--------------------------|------------------------------------|---------------------------------------------------------------------------------------------|-------------------------------|---------------------|---------------------------------|
+| 0x178  | `KIND_WIFI_PHY`          | `KIND_DEVICE = 10`                | WiFi PHY (radio) authority.                                                                 | derived                       | 0xFFFFF470..7F      | `kind_wifi_phy.pdx`             |
+| 0x179  | `KIND_WIFI_VIF`          | `KIND_IPC_ENDPOINT = 5`           | Virtual interface (STA/AP/MONITOR mode) under a PHY.                                        | derived                       | 0xFFFFF460..6F      | `kind_wifi_vif.pdx`             |
+| 0x17A  | `KIND_WIFI_SCAN_TXN`     | `KIND_IPC_ENDPOINT = 5`           | Active-scan transaction; **LINEAR** (no re-parenting).                                       | **LINEAR** (no MINT bit)      | 0xFFFFF450..5F      | `kind_wifi_scan_txn.pdx`        |
+| 0x17B  | `KIND_WIFI_KEY`          | `KIND_MEMORY = 4`                 | PTK/GTK key material; **SEALED** (opaque to userland).                                       | **SEALED** (no op reads material) | 0xFFFFF3E0..EF      | `kind_wifi_key.pdx`             |
+
+### R39 — Bluetooth (two derived kinds)
+
+| Tag    | Kind name                | Parent (base)                     | Purpose                                                                                     | Discipline                    | Band                | Source                          |
+|--------|--------------------------|------------------------------------|---------------------------------------------------------------------------------------------|-------------------------------|---------------------|---------------------------------|
+| 0x17C  | `KIND_BT_GATT_CONNECTION`| `KIND_IPC_ENDPOINT = 5`           | ATT / GATT connection to a remote peer.                                                     | derived                       | 0xFFFFF320..2F      | `kind_bt_gatt_connection.pdx`   |
+| 0x17D  | `KIND_BT_PAIRING`        | `KIND_MEMORY = 4`                 | LE Secure Connections pairing key material; **SEALED**.                                     | **SEALED** (no op reads material) | 0xFFFFF2F0..FF      | `kind_bt_pairing.pdx`           |
+
+### R40 — camera + WWAN (four derived kinds)
+
+| Tag    | Kind name                | Parent (base)                     | Purpose                                                                                     | Discipline                    | Band                | Source                          |
+|--------|--------------------------|------------------------------------|---------------------------------------------------------------------------------------------|-------------------------------|---------------------|---------------------------------|
+| 0x17E  | `KIND_CSI_CAMERA`        | `KIND_DEVICE = 10`                | MIPI-CSI camera-sensor authority (identity frozen at mint).                                 | derived (QUERY-only ops)      | 0xFFFFF230..3F      | `kind_csi_camera.pdx`           |
+| 0x17F  | `KIND_IPU6_STREAM`       | `KIND_IPC_ENDPOINT = 5`           | IPU6 streaming session over a camera.                                                       | derived (QUERY-only ops)      | 0xFFFFF1F0..FF      | `kind_ipu6_stream.pdx`          |
+| 0x180  | `KIND_WWAN_MODEM`        | `KIND_DEVICE = 10`                | M.2 WWAN modem device authority (Intel / Fibocom).                                          | derived (QUERY-only ops)      | 0xFFFFF1C0..CF      | `kind_wwan_modem.pdx`           |
+| 0x181  | `KIND_MBIM_SESSION`      | `KIND_IPC_ENDPOINT = 5`           | MBIM control session over a WWAN modem.                                                     | derived (QUERY-only ops)      | 0xFFFFF1B0..BF      | `kind_mbim_session.pdx`         |
+
+### Summary counts and free bands
+
+- **Derived-kind values landed:** 46 (0x140..0x142, 0x150..0x181; 0x143..0x14F reserved).
+- **Base kinds parented over:** `KIND_MEMORY = 4` (7 kinds), `KIND_IPC_ENDPOINT = 5` (21 kinds), `KIND_DEVICE = 10` (13 kinds), `KIND_IO_PORT = 11` (co-parent for `KIND_OP_REGION`), `KIND_HW = 14` (2 kinds), plus derived-parent chains: `KIND_HW_INTERRUPT`, `KIND_I2C_BUS`, `KIND_USB_DEVICE`, `KIND_USB_INTERFACE`, `KIND_USB_ENDPOINT`, `KIND_MSC_LUN`.
+- **LINEAR kinds (5):** `KIND_MODESET_TXN`, `KIND_GPU_CONTEXT`, `KIND_GPU_SUBMIT`, `KIND_WIFI_SCAN_TXN`, plus the identity-LINEAR discipline on `KIND_AUDIO_ROUTE`.
+- **SEALED kinds (2):** `KIND_WIFI_KEY`, `KIND_BT_PAIRING`.
+- **Linearizable-on-object (1):** `KIND_FW_SESSION` (the arbitration is on the object, not the session cap).
+- **QUERY-only kinds (4):** `KIND_CSI_CAMERA`, `KIND_IPU6_STREAM`, `KIND_WWAN_MODEM`, `KIND_MBIM_SESSION` (R40 pattern — identity fields frozen at mint; the only mutator is the revoke helper).
+- **Next free derived-kind tag:** `0x182` (opens R41).
+- **Adjacent-below free failure band:** `0xFFFFF170..7F` (16-wide; reserved for the R41 opener). `0xFFFFF180..8F` was allocated at R40.M5-001 (#1363) for `core/audit/audit_schema.pdx`.
+
+### Migration table — audit-emit sites still on `drv_audit_emit`
+
+R40.M5-001 (#1363) landed the canonical `audit_schema` wrapper. The
+subsystems below still call `drv_audit_emit` directly with their own
+principal layout; migrating each to `audit_emit(kind, slot, evt, at,
+result, payload_lo)` (with `at = aud_pack_at(actor, target)`) is a
+per-round refactor whose landing gate is that the corresponding
+subscriber decodes with the schema's `aud_prin_*` unpackers. Order
+below is chronological (round the audit-emitting code first landed):
+
+| Round | Subsystem                 | File                                                    | Notes                                                                                |
+|-------|---------------------------|---------------------------------------------------------|--------------------------------------------------------------------------------------|
+| R29   | driver lifecycle          | `core/driver/lifecycle.pdx`                             | `DRV_AUDIT_EV_HANDOFF` on the committed edge — already uses `kind=0`.                |
+| R29   | driver process death      | `core/driver/process_death.pdx`                         | `DRV_AUDIT_EV_RESTART` with outcome distinguishing supervisor / cascade / death.     |
+| R29   | driver restart            | `core/driver/restart.pdx`                               | `DRV_AUDIT_EV_CHANDEAD` per channel torn down at restart.                            |
+| R30   | ACPI SCI ISR              | `core/acpi/sci_isr.pdx`                                 | GPE storm-retirement + unrouted-event audit records; on the ISR call-target allowlist. |
+| R31   | embedded-controller gate  | `core/drivers/ec/ec_access.pdx`                         | `DRV_AUDIT_EV_EC_XACT` per transaction (subject = EC address).                       |
+| R37   | GPU register audit        | `core/drivers/gpu/gpu_reg_audit.pdx`                    | Per-register-window audit; owns its own `_graud_*` state.                            |
+| R37   | GPU GTT scan-out          | `core/drivers/gpu/gtt_scanout.pdx`                      | Scan-out-tear diagnostic records.                                                    |
+| R37   | GPU stress                | `core/drivers/gpu/gpu_stress.pdx`                       | Long-run stress episode records.                                                     |
+| R37   | GPU reset                 | `core/drivers/gpu/gpu_reset.pdx`                        | Engine-reset audit records.                                                          |
+| R34   | mass-storage LUN          | `core/cap/kind_msc_lun.pdx`                             | Audited outer mint / revoke.                                                         |
+| R35   | Thunderbolt consent       | `core/drivers/tb/consent_dialog.pdx`                    | Consent-dialog audit records.                                                        |
+| R36   | modeset transaction       | `core/cap/kind_modeset_txn.pdx`                         | Audited outer mint / revoke for a LINEAR kind.                                       |
+| R31   | backlight cap             | `core/cap/kind_backlight.pdx`                           | Audited outer mint / revoke.                                                         |
+| R39   | BT pairing cap            | `core/cap/kind_bt_pairing.pdx`                          | Audited outer mint / revoke for a SEALED kind.                                       |
+
+Migration is not scoped to a single round because the wrapper is a
+CONVERGENCE point rather than a compatibility shim: the underlying ring
+in `core/driver/audit_channel.pdx` stays authoritative, the seal + gap
+discipline is unchanged, and a subscriber that today reads
+`drv_audit_field(back, 4)` and unpacks its own layout keeps working
+after any given call site migrates. What migration BUYS is a single
+decoder path for every audit-adjacent event across the tree; the
+landing bar for each row is one working consumer that reads through
+`aud_prin_actor` / `aud_prin_target` / `aud_prin_payload_lo` rather
+than the subsystem's private packing.

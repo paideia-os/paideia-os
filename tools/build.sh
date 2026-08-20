@@ -4026,6 +4026,58 @@ fi
 echo "[r40-m4-confine] R40.M4 (WWAN M.2 modem + KIND_WWAN_MODEM + KIND_MBIM_SESSION + MBIM) confined"
 
 # ---------------------------------------------------------------------------
+# R40.M5-001 (#1363): AUDIT SCHEMA ARITY PINS.
+#
+# audit_schema.pdx is the canonical audit-event row shape and its
+# packers/unpackers -- a schema module with no .bss storage of its own
+# (the underlying ring stays audit_channel.pdx's _drv_audit_ring), so
+# there is no _table to confine.  What there IS to defend is the arity
+# of every packer, unpacker, validator and the audit_emit wrapper.  A
+# fourth parameter on aud_pack_at is a caller-supplied width that reads
+# a different bit range from the composed principal; a seventh parameter
+# on audit_emit is a caller-supplied side-channel that quietly emits a
+# second record.  Neither is expressible against a pinned signature.
+AUDS_SRC="${REPO_ROOT}/src/kernel/core/audit/audit_schema.pdx"
+if [[ ! -f "${AUDS_SRC}" ]]; then
+    echo "[audit-schema-confine] FAIL - ${AUDS_SRC} not found" >&2
+    exit 1
+fi
+auds_pin_one() {
+    local decl="$1"
+    if ! grep -qF -- "${decl}" "${AUDS_SRC}"; then
+        echo "[audit-schema-confine] FAIL - expected declaration not found:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  AN AUDIT SCHEMA FIELD IS DECIDED BY THE SCHEMA AND NEVER BY" >&2
+        echo "  A CALLER. An extra parameter on any packer, unpacker or" >&2
+        echo "  audit_emit makes 'pack a field my subscriber does not know" >&2
+        echo "  about' or 'emit a second record with a caller-supplied" >&2
+        echo "  layout' expressible, and both ways that goes wrong silently" >&2
+        echo "  reads or writes the wrong bits (an actor becomes a target;" >&2
+        echo "  a payload_lo becomes a fabricated timestamp)." >&2
+        echo "  If a signature legitimately changed, the schema doc" >&2
+        echo "  src/kernel/core/audit/audit_schema.pdx §1/§2 must be" >&2
+        echo "  rewritten first." >&2
+        exit 1
+    fi
+}
+auds_pin_one 'pub let aud_ev_valid : (u64) -> u64'
+auds_pin_one 'pub let aud_ev_is_cap : (u64) -> u64'
+auds_pin_one 'pub let aud_field_valid : (u64) -> u64'
+auds_pin_one 'pub let aud_kind_valid : (u64) -> u64'
+auds_pin_one 'pub let aud_pack_at : (u64, u64) -> u64'
+auds_pin_one 'pub let aud_unpack_actor : (u64) -> u64'
+auds_pin_one 'pub let aud_unpack_target : (u64) -> u64'
+auds_pin_one 'pub let aud_pack_payload : (u64, u64) -> u64'
+auds_pin_one 'pub let aud_unpack_payload_lo : (u64) -> u64'
+auds_pin_one 'pub let aud_pack_principal : (u64, u64) -> u64'
+auds_pin_one 'pub let aud_prin_actor : (u64) -> u64'
+auds_pin_one 'pub let aud_prin_target : (u64) -> u64'
+auds_pin_one 'pub let aud_prin_payload_lo : (u64) -> u64'
+auds_pin_one 'pub let audit_emit : (u64, u64, u64, u64, u64, u64) -> u64'
+echo "[audit-schema-confine] four validators, three pack/unpack pairs and audit_emit wrapper arities pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
