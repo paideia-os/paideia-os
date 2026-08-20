@@ -3783,6 +3783,37 @@ fi
 echo "[r39-m3-confine] R39.M3 (BT GATT connection + server + channel) confined"
 
 # ---------------------------------------------------------------------------
+# R39.M4 (#1335/#1336/#1337): Bluetooth LE Secure Connections pairing --
+# KIND_BT_PAIRING (SEALED) + le_sc pairing driver + bt_pairing_channel
+# schema.
+#
+# Three modules open R39.M4 (post-R39.M3 close).  Each owns its own
+# state cells + counters; tools/build.sh confines relocations against
+# each to its owning object so a second writer cannot silently forge a
+# pairing row, promote an FSM edge, or forge a consent-broker record.
+KBTP_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_bt_pairing.pdx"
+LESC_SRC="${REPO_ROOT}/src/kernel/core/drivers/bt/le_sc.pdx"
+BPC_SRC="${REPO_ROOT}/src/kernel/core/ipc/bt_pairing_channel.pdx"
+if [[ ! -f "${KBTP_SRC}" || ! -f "${LESC_SRC}" || ! -f "${BPC_SRC}" ]]; then
+    echo "[r39-m4-confine] FAIL - one of the R39.M4 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_bt_pairing_table' 'core/cap/kind_bt_pairing.o'
+ec_confine_one '_bt_pairing_stats' 'core/cap/kind_bt_pairing.o'
+ec_confine_one '_lesc_sessions'    'core/drivers/bt/le_sc.o'
+ec_confine_one '_lesc_stats'       'core/drivers/bt/le_sc.o'
+ec_confine_one '_lesc_init'        'core/drivers/bt/le_sc.o'
+ec_confine_one '_bpc_sessions'     'core/ipc/bt_pairing_channel.o'
+ec_confine_one '_bpc_stats'        'core/ipc/bt_pairing_channel.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_bt_pairing.pdx §2 (SEALED row), le_sc.pdx §1," >&2
+    echo "  and bt_pairing_channel.pdx §2 for the per-module" >&2
+    echo "  one-writer discipline." >&2
+    exit 1
+fi
+echo "[r39-m4-confine] R39.M4 (BT LE SC pairing + KIND_BT_PAIRING + channel) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
