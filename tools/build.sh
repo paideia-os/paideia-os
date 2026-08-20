@@ -3753,6 +3753,36 @@ fi
 echo "[r38-m7-confine] R38.M7 (HE-MCS + rate control + roaming + rekey) confined"
 
 # ---------------------------------------------------------------------------
+# R39.M3 (#1332/#1333/#1334): Bluetooth GATT substrate --
+# KIND_BT_GATT_CONNECTION (kind_bt_gatt_connection), GATT server +
+# client + ATT PDU codec (gatt), bt_gatt_channel schema
+# (bt_gatt_channel).
+#
+# Three modules open the R39 tree in this witness ordering.  Each owns
+# its own state; tools/build.sh confines relocations against each to
+# its owning object so a second writer cannot forge a GATT CONNECTION
+# row, restamp an attribute-table entry, drift the discovery walker
+# cursor, or forge an RPC-channel counter.
+KBGC_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_bt_gatt_connection.pdx"
+GATT_SRC="${REPO_ROOT}/src/kernel/core/drivers/bt/gatt.pdx"
+BTGC_SRC="${REPO_ROOT}/src/kernel/core/ipc/bt_gatt_channel.pdx"
+if [[ ! -f "${KBGC_SRC}" || ! -f "${GATT_SRC}" || ! -f "${BTGC_SRC}" ]]; then
+    echo "[r39-m3-confine] FAIL - one of the R39.M3 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_bt_gatt_conn_table' 'core/cap/kind_bt_gatt_connection.o'
+ec_confine_one '_bt_gatt_conn_stats' 'core/cap/kind_bt_gatt_connection.o'
+ec_confine_one '_gatt_attrs'         'core/drivers/bt/gatt.o'
+ec_confine_one '_gatt_disc'          'core/drivers/bt/gatt.o'
+ec_confine_one '_gatt_stats'         'core/drivers/bt/gatt.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_bt_gatt_connection.pdx §2, gatt.pdx §3" >&2
+    echo "  for the row / attribute-table / walker one-writer discipline." >&2
+    exit 1
+fi
+echo "[r39-m3-confine] R39.M3 (BT GATT connection + server + channel) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
