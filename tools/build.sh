@@ -3689,6 +3689,34 @@ fi
 echo "[r38-m5-confine] R38.M5 (WPA3-SAE + 4-way + WIFI_KEY + replay) confined"
 
 # ---------------------------------------------------------------------------
+# R38.M6 (#1314/#1315/#1316): regulatory-domain composition -- country-code
+# loader + periodic hint schema + geo-hint discovery.
+#
+# Three modules open R38.M6 (post-R38.M5 close).  Each owns its own
+# state cells + counters; tools/build.sh confines relocations against
+# each to its owning object so a second writer cannot silently forge
+# a country code, promote a hint source, or forge a GNSS lock.
+RDL_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/regdom_loader.pdx"
+RDC_SRC="${REPO_ROOT}/src/kernel/core/ipc/regdomain_channel.pdx"
+GH_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/geo_hint.pdx"
+if [[ ! -f "${RDL_SRC}" || ! -f "${RDC_SRC}" || ! -f "${GH_SRC}" ]]; then
+    echo "[r38-m6-confine] FAIL - one of the R38.M6 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_rdl_state'      'core/drivers/wifi/regdom_loader.o'
+ec_confine_one '_rdl_stats'      'core/drivers/wifi/regdom_loader.o'
+ec_confine_one '_gh_state'       'core/drivers/wifi/geo_hint.o'
+ec_confine_one '_gh_stats'       'core/drivers/wifi/geo_hint.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See regdom_loader.pdx §3 and geo_hint.pdx §3 for the per-" >&2
+    echo "  module one-writer discipline.  regdomain_channel.pdx is" >&2
+    echo "  a pure schema module (no .bss state) and carries no" >&2
+    echo "  confinement entry." >&2
+    exit 1
+fi
+echo "[r38-m6-confine] R38.M6 (regdom loader + channel + geo-hint) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
