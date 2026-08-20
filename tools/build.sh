@@ -3845,6 +3845,39 @@ fi
 echo "[r39-m5-confine] R39.M5 (BT A2DP + bridge + retx) confined"
 
 # ---------------------------------------------------------------------------
+# R39.M6 (#1343/#1344/#1345): Bluetooth profiles that close r39-bluetooth --
+# HFP call audio (hfp), BT HID over L2CAP (bt_hid), and LE Audio
+# scaffolding (le_audio).
+#
+# Three modules close the R39 tree.  Each owns its own state cells +
+# counters; tools/build.sh confines relocations against each to its
+# owning object so a second writer cannot silently forge a session row,
+# promote an FSM edge, forge a bind row that misroutes keystrokes to
+# the wrong subscriber, or drift the LC3 frame-length contract.
+HFP_SRC="${REPO_ROOT}/src/kernel/core/drivers/bt/hfp.pdx"
+BTHID_SRC="${REPO_ROOT}/src/kernel/core/drivers/bt/bt_hid.pdx"
+LEAU_SRC="${REPO_ROOT}/src/kernel/core/drivers/bt/le_audio.pdx"
+if [[ ! -f "${HFP_SRC}" || ! -f "${BTHID_SRC}" || ! -f "${LEAU_SRC}" ]]; then
+    echo "[r39-m6-confine] FAIL - one of the R39.M6 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_hfp_sessions'   'core/drivers/bt/hfp.o'
+ec_confine_one '_hfp_stats'      'core/drivers/bt/hfp.o'
+ec_confine_one '_hfp_init'       'core/drivers/bt/hfp.o'
+ec_confine_one '_bthid_rows'     'core/drivers/bt/bt_hid.o'
+ec_confine_one '_bthid_stats'    'core/drivers/bt/bt_hid.o'
+ec_confine_one '_bthid_init'     'core/drivers/bt/bt_hid.o'
+ec_confine_one '_leau_rows'      'core/drivers/bt/le_audio.o'
+ec_confine_one '_leau_stats'     'core/drivers/bt/le_audio.o'
+ec_confine_one '_leau_init'      'core/drivers/bt/le_audio.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See hfp.pdx §4, bt_hid.pdx §2, and le_audio.pdx §5" >&2
+    echo "  for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[r39-m6-confine] R39.M6 (BT HFP + HID + LE Audio scaffolding) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

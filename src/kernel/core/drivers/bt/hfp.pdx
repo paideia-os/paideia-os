@@ -1,0 +1,939 @@
+// src/kernel/core/drivers/bt/hfp.pdx — R39.M6-001 (#1343)
+//
+// Bluetooth Hands-Free Profile (HFP 1.8) — call audio path.
+//
+// HFP is the profile a phone (Audio Gateway, "AG") uses to hand a call's
+// microphone + earpiece audio to a headset / car-kit (Hands Free unit,
+// "HF").  It has two conceptually distinct pipes:
+//
+//   * SCO / eSCO synchronous audio link (voice frames)
+//   * an RFCOMM data channel carrying AT commands
+//
+// This module is the CANONICAL BOOKKEEPING SITE for both pipes on a
+// per-session basis: which local SEP is bound to which KIND_PCM_STREAM
+// (R33), which codec the SCO link is using, which call state the RFCOMM
+// side has moved through, and which AT verb was last dispatched against
+// the session.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It IS the FSM + wiring table that says: "the SCO link on session s is
+// currently in ACTIVE call state, encoding voice frames with mSBC at
+// 16 kHz, and every frame decoded on it should be pushed into
+// KIND_PCM_STREAM slot p".  A second table would let one path answer a
+// call and the other path continue to route incoming SCO frames into a
+// stream nobody had activated.
+//
+// It is NOT the SCO transport.  eSCO packet reassembly and the
+// controller-side SCO ring live under the R39.M2 HCI transport; this
+// module accepts already-reassembled SCO frames as (payload_ptr,
+// payload_len) pairs.
+//
+// It is NOT the codec implementation.  `hfp_sco_frame` returns the
+// sample count the frame contract denotes (60 for CVSD/8 kHz per T2/T3
+// packet; 120 for mSBC/16 kHz per T2 mSBC packet); the actual PCM
+// synthesis lives in the userland codec supervisor (R35).
+//
+// It is NOT the RFCOMM transport.  AT text framing, credit-based flow
+// control and multiplexer semantics belong to core/drivers/bt/rfcomm.pdx
+// (deferred).  This module accepts already-decoded AT VERBS as
+// enumerated ordinals (`HFP_AT_ANSWER` etc).
+//
+// It is NOT the ring driver of KIND_PCM_STREAM.  The pcm_slot is
+// recorded here; the R33 audio graph does the ring bookkeeping.
+//
+// =============================================================================
+// §1  SESSION TABLE
+// =============================================================================
+//
+// HFP_SESSION_MAX = 2 — a typical laptop holds one live call at a time;
+// the second slot lets a call handover (e.g. answer while the first
+// session is being torn down) run without evicting the first.  Fixed
+// cap is deliberate at R39.M6.
+//
+// Per-session row (8 u64, 64 bytes; row_id r lives at word offset r*8):
+//
+//   [+0]   active(bit 0) | codec(bits 8..15) | call_state(bits 16..23) |
+//          direction(bit 24)
+//   [+8]   pcm_stream_slot           (cap slot of KIND_PCM_STREAM)
+//   [+16]  sample_rate_hz            (8000 for CVSD, 16000 for mSBC)
+//   [+24]  last_at_verb              (ordinal from §3)
+//   [+32]  frames_seen               (running SCO frame counter)
+//   [+40]  bytes_seen                (running SCO byte counter)
+//   [+48]  session_id                (opaque AT-transaction label)
+//   [+56]  reserved
+//
+// direction bit: 0 = INBOUND (peer -> local), 1 = OUTBOUND (local ->
+// peer).  Both peers of an HFP call run simultaneously in each
+// direction; this bit records the LOCAL side's push direction so the
+// bridge into KIND_PCM_STREAM knows whether to decode or encode.
+//
+// =============================================================================
+// §2  CODECS (HFP 1.8 §5.7)
+// =============================================================================
+//
+//   HFP_CODEC_CVSD = 1   narrowband, 8 kHz, mandatory
+//   HFP_CODEC_MSBC = 2   wideband,  16 kHz, optional but widely supported
+//
+// Any other codec ordinal is refused with HFP_BAD_CODEC.
+//
+// =============================================================================
+// §3  CALL FSM + AT VERBS
+// =============================================================================
+//
+//   HFP_STATE_IDLE     (0)
+//   HFP_STATE_RINGING  (1)  peer signalled an incoming call (AT +CIEV)
+//   HFP_STATE_ACTIVE   (2)  answered
+//   HFP_STATE_HELD     (3)  put on hold
+//   HFP_STATE_CLOSING  (4)  transient before IDLE
+//
+// AT verbs handled at R39.M6 (`hfp_at_command`):
+//
+//   HFP_AT_ANSWER   (1)  ATA           — RINGING  -> ACTIVE
+//   HFP_AT_HANGUP   (2)  AT+CHUP       — any live -> CLOSING -> IDLE
+//   HFP_AT_DIAL     (3)  ATD<num>      — IDLE     -> RINGING (outbound)
+//   HFP_AT_DTMF     (4)  AT+VTS=<c>    — ACTIVE   -> ACTIVE (side effect)
+//
+// Any verb ordinal outside {1..4} returns HFP_BAD_VERB.  Any edge the
+// FSM does not permit returns HFP_BAD_STATE.
+//
+// =============================================================================
+// §4  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _hfp_sessions, _hfp_stats and _hfp_init are written only by helpers in
+// this module.  tools/build.sh confines relocations against each to
+// core/drivers/bt/hfp.o so a second writer cannot silently promote an
+// FSM edge or bridge a session onto a KIND_PCM_STREAM slot no one had
+// activated.
+//
+// =============================================================================
+// §5  FAILURE TAXONOMY 0xFFFFF290..0xFFFFF29F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: a2dp_rtx
+// 0xFFFFF2A0..0x2AF; adjacent free band below: bt_hid 0xFFFFF280..0x28F).
+
+module Hfp = structure {
+
+  // §2 codecs.
+  pub let HFP_CODEC_CVSD : u64 = 1
+  pub let HFP_CODEC_MSBC : u64 = 2
+
+  // §3 call FSM states.
+  pub let HFP_STATE_IDLE    : u64 = 0
+  pub let HFP_STATE_RINGING : u64 = 1
+  pub let HFP_STATE_ACTIVE  : u64 = 2
+  pub let HFP_STATE_HELD    : u64 = 3
+  pub let HFP_STATE_CLOSING : u64 = 4
+  pub let HFP_STATE_MAX     : u64 = 4
+
+  // §3 AT verbs.
+  pub let HFP_AT_ANSWER : u64 = 1
+  pub let HFP_AT_HANGUP : u64 = 2
+  pub let HFP_AT_DIAL   : u64 = 3
+  pub let HFP_AT_DTMF   : u64 = 4
+  pub let HFP_AT_MIN    : u64 = 1
+  pub let HFP_AT_MAX    : u64 = 4
+
+  // Direction bits.
+  pub let HFP_DIR_INBOUND  : u64 = 0
+  pub let HFP_DIR_OUTBOUND : u64 = 1
+
+  // §1 sizing.
+  pub let HFP_SESSION_MAX : u64 = 2
+  pub let HFP_ROW_WORDS   : u64 = 8
+  pub let HFP_ROW_NONE    : u64 = 0xFF
+
+  // Column offsets (byte offsets).
+  pub let HFP_COL_META         : u64 = 0
+  pub let HFP_COL_PCM_SLOT     : u64 = 8
+  pub let HFP_COL_SR_HZ        : u64 = 16
+  pub let HFP_COL_LAST_VERB    : u64 = 24
+  pub let HFP_COL_FRAMES       : u64 = 32
+  pub let HFP_COL_BYTES        : u64 = 40
+  pub let HFP_COL_SESSION_ID   : u64 = 48
+
+  // SCO frame contract: T2 CVSD = 60 bytes (60 8-bit PCM samples at
+  // 8 kHz); T2 mSBC = 60 bytes carrying 120 samples at 16 kHz.
+  pub let HFP_SCO_FRAME_BYTES        : u64 = 60
+  pub let HFP_CVSD_SAMPLES_PER_FRAME : u64 = 60
+  pub let HFP_MSBC_SAMPLES_PER_FRAME : u64 = 120
+
+  // §5 failure taxonomy 0xFFFFF290..0xFFFFF29F.
+  pub let HFP_OK                : u64 = 0
+  pub let HFP_BAD_ARG           : u64 = 0xFFFFF29F
+  pub let HFP_BAD_SESSION       : u64 = 0xFFFFF29E
+  pub let HFP_ENOSPC            : u64 = 0xFFFFF29D
+  pub let HFP_BAD_CODEC         : u64 = 0xFFFFF29C
+  pub let HFP_BAD_STATE         : u64 = 0xFFFFF29B
+  pub let HFP_BAD_VERB          : u64 = 0xFFFFF29A
+  pub let HFP_BAD_RATE          : u64 = 0xFFFFF299
+  pub let HFP_BAD_DIRECTION     : u64 = 0xFFFFF298
+  pub let HFP_BAD_PCM           : u64 = 0xFFFFF297
+  pub let HFP_NOT_INITIALIZED   : u64 = 0xFFFFF296
+  pub let HFP_SESSION_IN_USE    : u64 = 0xFFFFF295
+  pub let HFP_DUP_SESSION       : u64 = 0xFFFFF294
+  pub let HFP_BAD_FRAME         : u64 = 0xFFFFF293
+  pub let HFP_STATE_MISMATCH    : u64 = 0xFFFFF292
+  pub let HFP_REFUSED           : u64 = 0xFFFFF291
+
+  // §4 state cells.  2 rows * 8 u64s = 16 u64s.
+  pub let mut _hfp_sessions : [u64; 16] = uninit @align(64)
+  pub let mut _hfp_stats    : [u64;  8] = uninit @align(64)
+  pub let mut _hfp_init     : u64       = 0
+
+  // Counter ordinals.
+  pub let HFP_ST_OPENS      : u64 = 0
+  pub let HFP_ST_CLOSES     : u64 = 1
+  pub let HFP_ST_ANSWERS    : u64 = 2
+  pub let HFP_ST_HANGUPS    : u64 = 3
+  pub let HFP_ST_DIALS      : u64 = 4
+  pub let HFP_ST_DTMFS      : u64 = 5
+  pub let HFP_ST_FRAMES     : u64 = 6
+  pub let HFP_ST_REFUSED    : u64 = 7
+
+  // ==========================================================================
+  // Reset + init.
+  // ==========================================================================
+
+  pub let hfp_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M6-001 (#1343): clear session table + counters + init flag. Labels prefixed hfp_rs_.",
+      block: {
+        lea r10, [rip + _hfp_sessions];
+        xor rax, rax;
+        xor rcx, rcx;
+      hfp_rs_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  hfp_rs_rows;
+
+        lea r10, [rip + _hfp_stats];
+        xor rcx, rcx;
+      hfp_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  hfp_rs_stats;
+
+        lea r10, [rip + _hfp_init];
+        xor rax, rax;
+        mov [r10], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let hfp_init : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M6-001 (#1343): mark module initialised.  Idempotent. Labels prefixed hfp_in_.",
+      block: {
+        call hfp_reset;
+        lea r10, [rip + _hfp_init];
+        mov rax, 1;
+        mov [r10], rax;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Counters.
+  // ==========================================================================
+
+  pub let hfp_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M6-001 (#1343): counter bump. Labels prefixed hfp_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae hfp_nt_out;
+        lea r10, [rip + _hfp_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      hfp_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let hfp_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M6-001 (#1343): counter read. Labels prefixed hfp_st_.",
+      block: {
+        cmp rdi, 8;
+        jae hfp_st_zero;
+        lea r10, [rip + _hfp_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      hfp_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Validators.
+  // ==========================================================================
+
+  pub let hfp_codec_valid : (u64) -> u64 !{} @{} =
+    fn (c: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M6-001 (#1343): 1 iff codec is CVSD (1) or mSBC (2). Labels prefixed hfp_cv_.",
+      block: {
+        cmp rdi, 1;
+        je  hfp_cv_yes;
+        cmp rdi, 2;
+        je  hfp_cv_yes;
+        xor rax, rax;
+        ret;
+      hfp_cv_yes:
+        mov rax, 1;
+        ret
+      }
+    } @no_frame
+
+  pub let hfp_verb_valid : (u64) -> u64 !{} @{} =
+    fn (v: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M6-001 (#1343): 1 iff v in {1..4}. Labels prefixed hfp_vv_.",
+      block: {
+        cmp rdi, 1;
+        jb  hfp_vv_no;
+        cmp rdi, 4;
+        ja  hfp_vv_no;
+        mov rax, 1;
+        ret;
+      hfp_vv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let hfp_state_valid : (u64) -> u64 !{} @{} =
+    fn (s: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M6-001 (#1343): 1 iff s <= CLOSING (4). Labels prefixed hfp_sv_.",
+      block: {
+        cmp rdi, 4;
+        ja  hfp_sv_no;
+        mov rax, 1;
+        ret;
+      hfp_sv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let hfp_dir_valid : (u64) -> u64 !{} @{} =
+    fn (d: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M6-001 (#1343): 1 iff d in {0,1}. Labels prefixed hfp_dv_.",
+      block: {
+        cmp rdi, 1;
+        ja  hfp_dv_no;
+        mov rax, 1;
+        ret;
+      hfp_dv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let hfp_rate_valid : (u64, u64) -> u64 !{} @{} =
+    fn (codec: u64) (hz: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M6-001 (#1343): 1 iff (codec,hz) matches CVSD/8000 or mSBC/16000. Labels prefixed hfp_rv_.",
+      block: {
+        cmp rdi, 1;
+        jne hfp_rv_try_msbc;
+        mov r10, 8000;
+        cmp rsi, r10;
+        jne hfp_rv_no;
+        mov rax, 1;
+        ret;
+      hfp_rv_try_msbc:
+        cmp rdi, 2;
+        jne hfp_rv_no;
+        mov r10, 16000;
+        cmp rsi, r10;
+        jne hfp_rv_no;
+        mov rax, 1;
+        ret;
+      hfp_rv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Row accessors.  row_id r lives at word offset r*8 in _hfp_sessions.
+  // ==========================================================================
+
+  pub let hfp_session_in_use : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M6-001 (#1343): 1 iff row_id<MAX and META bit 0 set. Labels prefixed hfp_iu_.",
+      block: {
+        cmp rdi, 2;
+        jae hfp_iu_no;
+        lea r10, [rip + _hfp_sessions];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        and rax, 0x1;
+        cmp rax, 0;
+        je  hfp_iu_no;
+        mov rax, 1;
+        ret;
+      hfp_iu_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let hfp_session_state : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M6-001 (#1343): call_state of a live session, or 0xFF..FF if absent. Labels prefixed hfp_ss_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call hfp_session_in_use;
+        cmp rax, 0;
+        je  hfp_ss_bad;
+        lea r10, [rip + _hfp_sessions];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 16;
+        and rax, 0xFF;
+        jmp hfp_ss_out;
+      hfp_ss_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      hfp_ss_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let hfp_session_codec : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M6-001 (#1343): codec of a live session. Labels prefixed hfp_sc_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call hfp_session_in_use;
+        cmp rax, 0;
+        je  hfp_sc_bad;
+        lea r10, [rip + _hfp_sessions];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 8;
+        and rax, 0xFF;
+        jmp hfp_sc_out;
+      hfp_sc_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      hfp_sc_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let hfp_session_pcm : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M6-001 (#1343): pcm_stream_slot of a live session. Labels prefixed hfp_sp_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call hfp_session_in_use;
+        cmp rax, 0;
+        je  hfp_sp_bad;
+        lea r10, [rip + _hfp_sessions];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        jmp hfp_sp_out;
+      hfp_sp_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      hfp_sp_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let hfp_session_frames : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M6-001 (#1343): frames_seen counter of a live session. Labels prefixed hfp_sf_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call hfp_session_in_use;
+        cmp rax, 0;
+        je  hfp_sf_bad;
+        lea r10, [rip + _hfp_sessions];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 32];
+        jmp hfp_sf_out;
+      hfp_sf_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      hfp_sf_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // hfp_find_session(session_id) -> row_id | HFP_ROW_NONE.
+  // ==========================================================================
+
+  pub let hfp_find_session : (u64) -> u64 !{mem} @{} =
+    fn (session_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M6-001 (#1343): linear scan of _hfp_sessions for first row whose session_id matches. Labels prefixed hfp_fs_.",
+      block: {
+        push rbx;
+        push r12;
+        mov r12, rdi;
+        xor rbx, rbx;
+      hfp_fs_scan:
+        cmp rbx, 2;
+        jae hfp_fs_none;
+        lea r10, [rip + _hfp_sessions];
+        mov r11, rbx;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        and rax, 0x1;
+        cmp rax, 0;
+        je  hfp_fs_next;
+        mov rax, [r10 + 48];
+        cmp rax, r12;
+        je  hfp_fs_hit;
+      hfp_fs_next:
+        add rbx, 1;
+        jmp hfp_fs_scan;
+      hfp_fs_hit:
+        mov rax, rbx;
+        jmp hfp_fs_out;
+      hfp_fs_none:
+        mov rax, 0xFF;
+      hfp_fs_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // hfp_session_open(codec, pcm_slot, sample_rate, direction, session_id)
+  //   -- claim one session row.  Refuses NOT_INITIALIZED / BAD_CODEC /
+  //   BAD_RATE / BAD_DIRECTION / DUP_SESSION / ENOSPC.  Returns row_id.
+  //   ONE WRITER of the positive edge of _hfp_sessions.
+  // ==========================================================================
+
+  pub let hfp_session_open : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (codec: u64) (pcm_slot: u64) (sample_rate: u64) (direction: u64) (session_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M6-001 (#1343): claim one HFP session row.  THE ONE WRITER of the positive edge of _hfp_sessions.  Refuses NOT_INITIALIZED / BAD_CODEC / BAD_RATE / BAD_DIRECTION / DUP_SESSION / ENOSPC. Labels prefixed hfp_op_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                    // codec
+        mov r13, rsi;                    // pcm_slot
+        mov r14, rdx;                    // sample_rate
+        mov r15, rcx;                    // direction
+        // session_id in r8; preserve via stack.
+        push r8;
+
+        // Init check.
+        lea r10, [rip + _hfp_init];
+        mov rax, [r10];
+        cmp rax, 0;
+        je  hfp_op_notinit;
+
+        // Codec check.
+        mov rdi, r12;
+        call hfp_codec_valid;
+        cmp rax, 0;
+        je  hfp_op_bad_codec;
+
+        // Direction check.
+        mov rdi, r15;
+        call hfp_dir_valid;
+        cmp rax, 0;
+        je  hfp_op_bad_dir;
+
+        // Rate must match codec.
+        mov rdi, r12;
+        mov rsi, r14;
+        call hfp_rate_valid;
+        cmp rax, 0;
+        je  hfp_op_bad_rate;
+
+        // Duplicate session_id.
+        mov rdi, [rsp + 0];
+        call hfp_find_session;
+        mov r11, 0xFF;
+        cmp rax, r11;
+        jne hfp_op_dup;
+
+        // Free-row scan.
+        xor rbx, rbx;
+      hfp_op_scan:
+        cmp rbx, 2;
+        jae hfp_op_enospc;
+        lea r10, [rip + _hfp_sessions];
+        mov r11, rbx;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        and rax, 0x1;
+        cmp rax, 0;
+        je  hfp_op_hit;
+        add rbx, 1;
+        jmp hfp_op_scan;
+
+      hfp_op_hit:
+        // META: active | codec | call_state=IDLE | direction.
+        mov rax, r12;
+        shl rax, 8;
+        or  rax, 0x1;
+        mov r11, r15;
+        shl r11, 24;
+        or  rax, r11;
+        mov [r10 + 0], rax;
+        mov [r10 + 8],  r13;             // pcm_slot
+        mov [r10 + 16], r14;             // sample_rate
+        xor rax, rax;
+        mov [r10 + 24], rax;             // last_at_verb
+        mov [r10 + 32], rax;             // frames_seen
+        mov [r10 + 40], rax;             // bytes_seen
+        mov rax, [rsp + 0];
+        mov [r10 + 48], rax;             // session_id
+        xor rax, rax;
+        mov [r10 + 56], rax;
+
+        mov rdi, 0;                      // OPENS counter
+        call hfp_note;
+        mov rax, rbx;
+        jmp hfp_op_out;
+
+      hfp_op_notinit:
+        mov rax, 0xFFFFF296;
+        jmp hfp_op_bump;
+      hfp_op_bad_codec:
+        mov rax, 0xFFFFF29C;
+        jmp hfp_op_bump;
+      hfp_op_bad_dir:
+        mov rax, 0xFFFFF298;
+        jmp hfp_op_bump;
+      hfp_op_bad_rate:
+        mov rax, 0xFFFFF299;
+        jmp hfp_op_bump;
+      hfp_op_dup:
+        mov rax, 0xFFFFF294;
+        jmp hfp_op_bump;
+      hfp_op_enospc:
+        mov rax, 0xFFFFF29D;
+      hfp_op_bump:
+        push rax;
+        mov rdi, 7;
+        call hfp_note;
+        pop rax;
+      hfp_op_out:
+        add rsp, 8;                      // restore r8 slot
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // hfp_session_close(row) -- release a session row.  Refuses BAD_SESSION.
+  // ==========================================================================
+
+  pub let hfp_session_close : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M6-001 (#1343): release one HFP session row.  Labels prefixed hfp_cl_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call hfp_session_in_use;
+        cmp rax, 0;
+        je  hfp_cl_bad;
+
+        lea r10, [rip + _hfp_sessions];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rax;
+        mov [r10 + 48], rax;
+        mov [r10 + 56], rax;
+
+        mov rdi, 1;                      // CLOSES counter
+        call hfp_note;
+        xor rax, rax;
+        jmp hfp_cl_out;
+
+      hfp_cl_bad:
+        mov rax, 0xFFFFF29E;
+        push rax;
+        mov rdi, 7;
+        call hfp_note;
+        pop rax;
+      hfp_cl_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // hfp_at_command(row_id, verb) -- dispatch one AT verb against a
+  // session.  Enforces the §3 FSM; refuses BAD_SESSION / BAD_VERB /
+  // BAD_STATE.  Records `last_at_verb` on success.
+  // ==========================================================================
+
+  pub let hfp_at_command : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (verb: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M6-001 (#1343): dispatch one AT verb against a session; §3 FSM.  Refuses BAD_SESSION / BAD_VERB / BAD_STATE. Labels prefixed hfp_at_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;                    // row_id
+        mov r13, rsi;                    // verb
+
+        mov rdi, r12;
+        call hfp_session_in_use;
+        cmp rax, 0;
+        je  hfp_at_bad_sess;
+
+        mov rdi, r13;
+        call hfp_verb_valid;
+        cmp rax, 0;
+        je  hfp_at_bad_verb;
+
+        mov rdi, r12;
+        call hfp_session_state;
+        mov rbx, rax;                    // current state
+
+        // Verb dispatch on §3.
+        cmp r13, 1;                      // ANSWER
+        je  hfp_at_answer;
+        cmp r13, 2;                      // HANGUP
+        je  hfp_at_hangup;
+        cmp r13, 3;                      // DIAL
+        je  hfp_at_dial;
+        // DTMF (4) — legal only in ACTIVE.
+        cmp rbx, 2;
+        jne hfp_at_bad_state;
+        // side-effect only; no state change.
+        mov rdi, 5;                      // DTMFS counter
+        call hfp_note;
+        jmp hfp_at_latch;
+
+      hfp_at_answer:
+        // RINGING -> ACTIVE.
+        cmp rbx, 1;
+        jne hfp_at_bad_state;
+        mov r10, 2;
+        call hfp_set_state_r10;
+        mov rdi, 2;                      // ANSWERS
+        call hfp_note;
+        jmp hfp_at_latch;
+
+      hfp_at_hangup:
+        // Any of RINGING(1)/ACTIVE(2)/HELD(3) -> CLOSING(4) -> IDLE(0).
+        cmp rbx, 1;
+        jb  hfp_at_bad_state;
+        cmp rbx, 3;
+        ja  hfp_at_bad_state;
+        mov r10, 4;
+        call hfp_set_state_r10;
+        mov r10, 0;
+        call hfp_set_state_r10;
+        mov rdi, 3;                      // HANGUPS
+        call hfp_note;
+        jmp hfp_at_latch;
+
+      hfp_at_dial:
+        // IDLE -> RINGING (outbound half of the call).
+        cmp rbx, 0;
+        jne hfp_at_bad_state;
+        mov r10, 1;
+        call hfp_set_state_r10;
+        mov rdi, 4;                      // DIALS
+        call hfp_note;
+        jmp hfp_at_latch;
+
+      hfp_at_latch:
+        lea r10, [rip + _hfp_sessions];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov [r10 + 24], r13;             // last_at_verb
+        xor rax, rax;
+        jmp hfp_at_out;
+
+      hfp_at_bad_sess:
+        mov rax, 0xFFFFF29E;
+        jmp hfp_at_bump;
+      hfp_at_bad_verb:
+        mov rax, 0xFFFFF29A;
+        jmp hfp_at_bump;
+      hfp_at_bad_state:
+        mov rax, 0xFFFFF29B;
+      hfp_at_bump:
+        push rax;
+        mov rdi, 7;                      // REFUSED
+        call hfp_note;
+        pop rax;
+      hfp_at_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // Local FSM helper — set call_state on session r12 to r10.
+  pub let hfp_set_state_r10 : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M6-001 (#1343): rewrite call_state bits (16..23) of _hfp_sessions[r12] to r10; called from hfp_at_command only. Labels prefixed hfp_ss2_.",
+      block: {
+        push rbx;
+        push r11;
+        lea r11, [rip + _hfp_sessions];
+        mov rbx, r12;
+        shl rbx, 6;
+        add r11, rbx;
+        mov rax, [r11 + 0];
+        mov rbx, 0xFFFFFFFFFF00FFFF;      // clear bits 16..23
+        and rax, rbx;
+        mov rbx, r10;
+        shl rbx, 16;
+        or  rax, rbx;
+        mov [r11 + 0], rax;
+        pop r11;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // hfp_sco_frame(row_id, frame_len)  --  one SCO packet arrived; return
+  // the sample-count the codec contract denotes for it.  Advances
+  // frames_seen and bytes_seen; refuses BAD_SESSION / BAD_FRAME /
+  // BAD_STATE (must be ACTIVE for SCO to flow per HFP §5).
+  // ==========================================================================
+
+  pub let hfp_sco_frame : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (frame_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M6-001 (#1343): SCO frame contract.  Refuses BAD_SESSION / BAD_FRAME / BAD_STATE.  Returns samples-per-frame (60 for CVSD, 120 for mSBC); advances frames_seen + bytes_seen. Labels prefixed hfp_sf2_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        mov r13, rsi;
+
+        mov rdi, r12;
+        call hfp_session_in_use;
+        cmp rax, 0;
+        je  hfp_sf2_bad_sess;
+
+        // State must be ACTIVE.
+        mov rdi, r12;
+        call hfp_session_state;
+        cmp rax, 2;
+        jne hfp_sf2_bad_state;
+
+        // frame_len must equal HFP_SCO_FRAME_BYTES (60).
+        mov r10, 60;
+        cmp r13, r10;
+        jne hfp_sf2_bad_frame;
+
+        // Compute samples-per-frame from codec.
+        lea r10, [rip + _hfp_sessions];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 8;
+        and rax, 0xFF;
+        mov rbx, 60;                     // CVSD default
+        cmp rax, 2;                      // mSBC?
+        jne hfp_sf2_have;
+        mov rbx, 120;
+      hfp_sf2_have:
+        // Advance counters.
+        mov rax, [r10 + 32];
+        add rax, 1;
+        mov [r10 + 32], rax;
+        mov rax, [r10 + 40];
+        add rax, r13;
+        mov [r10 + 40], rax;
+
+        mov rdi, 6;                      // FRAMES counter
+        call hfp_note;
+        mov rax, rbx;
+        jmp hfp_sf2_out;
+
+      hfp_sf2_bad_sess:
+        mov rax, 0xFFFFF29E;
+        jmp hfp_sf2_bump;
+      hfp_sf2_bad_state:
+        mov rax, 0xFFFFF29B;
+        jmp hfp_sf2_bump;
+      hfp_sf2_bad_frame:
+        mov rax, 0xFFFFF293;
+      hfp_sf2_bump:
+        push rax;
+        mov rdi, 7;
+        call hfp_note;
+        pop rax;
+      hfp_sf2_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
