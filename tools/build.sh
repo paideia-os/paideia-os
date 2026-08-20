@@ -4303,6 +4303,72 @@ semterm_pin_one "${RSET_SRC}" 'pub let rs_seal : () -> u64'
 echo "[semterm-m2-confine] engine / sources / resultset entry-point arities pinned"
 
 # ---------------------------------------------------------------------------
+# R41.M3-001/002/003 (#1371/#1372/#1373): SEMTERM CHART-COMPOSITION LAYER
+# CONFINEMENT.
+#
+# Three modules open R41.M3 on top of the R41.M2 engine / sources /
+# resultset stack: plot (text-mode cell buffer + glyph primitives),
+# layout (grid pane arena + splits), palette (default RGB + ANSI SGR
+# mapping + colorblind-safe series + xterm-256 extended formula).
+# Each owns its own state cells; a second writer against any of them
+# would let a caller:
+#   - overwrite a canvas cell without going through plt_put (plot
+#     confinement) so a caller could paint a glyph the compositor
+#     never emitted,
+#   - forge a pane rectangle so a chart draws outside its allotted
+#     region (layout confinement),
+#   - substitute a palette entry so an ANSI SGR ordinal resolves to
+#     a color the module never installed (palette confinement).
+PLT_SRC="${REPO_ROOT}/src/kernel/core/semterm/plot.pdx"
+LAY_SRC="${REPO_ROOT}/src/kernel/core/semterm/layout.pdx"
+PAL_SRC="${REPO_ROOT}/src/kernel/core/semterm/palette.pdx"
+if [[ ! -f "${PLT_SRC}" || ! -f "${LAY_SRC}" || ! -f "${PAL_SRC}" ]]; then
+    echo "[semterm-m3-confine] FAIL - one of the R41.M3 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_plt_buf'      'core/semterm/plot.o'
+ec_confine_one '_plt_state'    'core/semterm/plot.o'
+ec_confine_one '_lay_arena'    'core/semterm/layout.o'
+ec_confine_one '_lay_state'    'core/semterm/layout.o'
+ec_confine_one '_pal_default'  'core/semterm/palette.o'
+ec_confine_one '_pal_ansi_fg'  'core/semterm/palette.o'
+ec_confine_one '_pal_ansi_bg'  'core/semterm/palette.o'
+ec_confine_one '_pal_series'   'core/semterm/palette.o'
+ec_confine_one '_pal_state'    'core/semterm/palette.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/semterm/plot.pdx §2, layout.pdx §2, and" >&2
+    echo "  palette.pdx §3 for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[semterm-m3-confine] R41.M3 (plot + layout + palette) state confined"
+
+# ARITY PINS for the M3 entry points. Same rationale as the M1/M2 pins
+# above: a widening on any of these makes "paint a cell the compositor
+# never authored", "carve a pane the layout never allocated", or
+# "resolve an SGR ordinal the palette never installed" expressible in
+# a call site the confinement gate cannot see.
+semterm_pin_one "${PLT_SRC}" 'pub let plt_put : (u64, u64, u64, u64) -> u64'
+semterm_pin_one "${PLT_SRC}" 'pub let plt_get : (u64, u64) -> u64'
+semterm_pin_one "${PLT_SRC}" 'pub let plt_bar : (u64, u64, u64) -> u64'
+semterm_pin_one "${PLT_SRC}" 'pub let plt_line : (u64, u64, u64) -> u64'
+semterm_pin_one "${PLT_SRC}" 'pub let plt_dot : (u64, u64) -> u64'
+semterm_pin_one "${PLT_SRC}" 'pub let plt_heatmap : (u64, u64, u64) -> u64'
+semterm_pin_one "${PLT_SRC}" 'pub let plt_sparkline : (u64, u64, u64) -> u64'
+semterm_pin_one "${LAY_SRC}" 'pub let lay_root : (u64, u64) -> u64'
+semterm_pin_one "${LAY_SRC}" 'pub let lay_split_h : (u64, u64, u64) -> u64'
+semterm_pin_one "${LAY_SRC}" 'pub let lay_split_v : (u64, u64, u64) -> u64'
+semterm_pin_one "${LAY_SRC}" 'pub let lay_pane_r0 : (u64) -> u64'
+semterm_pin_one "${LAY_SRC}" 'pub let lay_pane_c0 : (u64) -> u64'
+semterm_pin_one "${LAY_SRC}" 'pub let lay_pane_rows : (u64) -> u64'
+semterm_pin_one "${LAY_SRC}" 'pub let lay_pane_cols : (u64) -> u64'
+semterm_pin_one "${PAL_SRC}" 'pub let pal_default_rgb : (u64) -> u64'
+semterm_pin_one "${PAL_SRC}" 'pub let pal_ansi_fg : (u64) -> u64'
+semterm_pin_one "${PAL_SRC}" 'pub let pal_ansi_bg : (u64) -> u64'
+semterm_pin_one "${PAL_SRC}" 'pub let pal_series_color : (u64) -> u64'
+semterm_pin_one "${PAL_SRC}" 'pub let pal_extended : (u64) -> u64'
+echo "[semterm-m3-confine] plot / layout / palette entry-point arities pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
