@@ -3878,6 +3878,41 @@ fi
 echo "[r39-m6-confine] R39.M6 (BT HFP + HID + LE Audio scaffolding) confined"
 
 # ---------------------------------------------------------------------------
+# R40.M1 (#1347/#1348/#1349): Intel IPU6 camera bring-up scaffold --
+# PCI probe (ipu6_probe), dual-sig firmware verify (ipu6_verify), and
+# firmware upload + BOOT_READY handshake (ipu6_load).
+#
+# Three modules open the R40 tree.  Each owns its own state cells +
+# counters; tools/build.sh confines relocations against each to its
+# owning object so a second writer cannot silently forge a probe
+# match, admit a mis-signed firmware bundle, or leave the CPU_HALT
+# bit inconsistent with the loaded flag.
+IPP_SRC="${REPO_ROOT}/src/kernel/core/drivers/cam/ipu6_probe.pdx"
+IPV_SRC="${REPO_ROOT}/src/kernel/core/drivers/cam/ipu6_verify.pdx"
+IPL_SRC="${REPO_ROOT}/src/kernel/core/drivers/cam/ipu6_load.pdx"
+if [[ ! -f "${IPP_SRC}" || ! -f "${IPV_SRC}" || ! -f "${IPL_SRC}" ]]; then
+    echo "[r40-m1-confine] FAIL - one of the R40.M1 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_ipp_probe_stats' 'core/drivers/cam/ipu6_probe.o'
+ec_confine_one '_ipv_blob_ptr'    'core/drivers/cam/ipu6_verify.o'
+ec_confine_one '_ipv_blob_len'    'core/drivers/cam/ipu6_verify.o'
+ec_confine_one '_ipv_verified'    'core/drivers/cam/ipu6_verify.o'
+ec_confine_one '_ipv_code_off'    'core/drivers/cam/ipu6_verify.o'
+ec_confine_one '_ipv_code_len'    'core/drivers/cam/ipu6_verify.o'
+ec_confine_one '_ipv_stats'       'core/drivers/cam/ipu6_verify.o'
+ec_confine_one '_ipl_ctrl'        'core/drivers/cam/ipu6_load.o'
+ec_confine_one '_ipl_loaded'      'core/drivers/cam/ipu6_load.o'
+ec_confine_one '_ipl_ready_iters' 'core/drivers/cam/ipu6_load.o'
+ec_confine_one '_ipl_stats'       'core/drivers/cam/ipu6_load.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See ipu6_probe.pdx §3, ipu6_verify.pdx §2, and ipu6_load.pdx §3" >&2
+    echo "  for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[r40-m1-confine] R40.M1 (IPU6 probe + verify + load) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
