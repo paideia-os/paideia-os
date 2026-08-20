@@ -3986,6 +3986,46 @@ fi
 echo "[r40-m3-confine] R40.M3 (IPU6 pipeline + KIND_IPU6_STREAM + camera capture channel) confined"
 
 # ---------------------------------------------------------------------------
+# R40.M4 (#1359/#1360/#1361/#1362): WWAN M.2 modem + MBIM.
+#
+# Four modules open R40.M4: the KIND_WWAN_MODEM capability
+# (kind_wwan_modem), the KIND_MBIM_SESSION capability (kind_mbim_session),
+# the M.2 WWAN probe + power-gating driver (wwan_probe), and the MBIM
+# control / notification substrate (mbim).  Each owns its own state
+# cells + counters; tools/build.sh confines relocations against each
+# to its owning object so a second writer cannot silently forge a
+# modem row, restamp a session's FSM state, admit a spurious M.2
+# vendor, or drop the modem into an intermediate power state nobody
+# validated.
+KWWM_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_wwan_modem.pdx"
+KMBS_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_mbim_session.pdx"
+WWP_SRC="${REPO_ROOT}/src/kernel/core/drivers/wwan/wwan_probe.pdx"
+MBIM_SRC="${REPO_ROOT}/src/kernel/core/drivers/wwan/mbim.pdx"
+if [[ ! -f "${KWWM_SRC}" || ! -f "${KMBS_SRC}" || ! -f "${WWP_SRC}" || ! -f "${MBIM_SRC}" ]]; then
+    echo "[r40-m4-confine] FAIL - one of the R40.M4 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_wwan_modem_table'   'core/cap/kind_wwan_modem.o'
+ec_confine_one '_wwan_modem_stats'   'core/cap/kind_wwan_modem.o'
+ec_confine_one '_mbim_session_table' 'core/cap/kind_mbim_session.o'
+ec_confine_one '_mbim_session_stats' 'core/cap/kind_mbim_session.o'
+ec_confine_one '_wwp_probes'         'core/drivers/wwan/wwan_probe.o'
+ec_confine_one '_wwp_probe_count'    'core/drivers/wwan/wwan_probe.o'
+ec_confine_one '_wwp_probe_stats'    'core/drivers/wwan/wwan_probe.o'
+ec_confine_one '_wwp_pwr_last'       'core/drivers/wwan/wwan_probe.o'
+ec_confine_one '_mbim_ctrl_state'    'core/drivers/wwan/mbim.o'
+ec_confine_one '_mbim_notif_last'    'core/drivers/wwan/mbim.o'
+ec_confine_one '_mbim_signal'        'core/drivers/wwan/mbim.o'
+ec_confine_one '_mbim_stats'         'core/drivers/wwan/mbim.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_wwan_modem.pdx §1 (row table), kind_mbim_session.pdx §1," >&2
+    echo "  wwan_probe.pdx §4, and mbim.pdx §2 for the per-module one-writer" >&2
+    echo "  discipline." >&2
+    exit 1
+fi
+echo "[r40-m4-confine] R40.M4 (WWAN M.2 modem + KIND_WWAN_MODEM + KIND_MBIM_SESSION + MBIM) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
