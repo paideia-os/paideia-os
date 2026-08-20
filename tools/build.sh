@@ -3579,6 +3579,43 @@ fi
 echo "[wifi-m2-confine] R38.M2 (AX211 WiFi transport plumbing) confined"
 
 # ---------------------------------------------------------------------------
+# R38.M3 (#1299/#1300/#1301/#1302/#1303): WiFi capability layer --
+# KIND_WIFI_PHY (kind_wifi_phy), KIND_WIFI_VIF (kind_wifi_vif),
+# KIND_WIFI_SCAN_TXN (kind_wifi_scan_txn, LINEAR),
+# wifi_control_channel and wifi_data_channel.
+#
+# Five modules open R38.M3 (post-R38.M2 close).  Each cap kind owns
+# its own row table + counters; tools/build.sh confines relocations
+# against each to its owning object so a second writer cannot forge
+# a PHY row, restamp a VIF's MAC or mode, drift a scan's state or
+# result count, or bypass the LINEAR triple-check by rewriting the
+# frozen linear_flag byte.  The two channels have no private state
+# (schema only) and take no confinement.
+KWPHY_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_wifi_phy.pdx"
+KWVIF_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_wifi_vif.pdx"
+KWSCN_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_wifi_scan_txn.pdx"
+WCC_SRC="${REPO_ROOT}/src/kernel/core/ipc/wifi_control_channel.pdx"
+WDC_SRC="${REPO_ROOT}/src/kernel/core/ipc/wifi_data_channel.pdx"
+if [[ ! -f "${KWPHY_SRC}" || ! -f "${KWVIF_SRC}" || ! -f "${KWSCN_SRC}" \
+        || ! -f "${WCC_SRC}" || ! -f "${WDC_SRC}" ]]; then
+    echo "[wifi-m3-confine] FAIL - one of the R38.M3 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_wifi_phy_table'  'core/cap/kind_wifi_phy.o'
+ec_confine_one '_wifi_phy_stats'  'core/cap/kind_wifi_phy.o'
+ec_confine_one '_wifi_vif_table'  'core/cap/kind_wifi_vif.o'
+ec_confine_one '_wifi_vif_stats'  'core/cap/kind_wifi_vif.o'
+ec_confine_one '_wifi_scan_table' 'core/cap/kind_wifi_scan_txn.o'
+ec_confine_one '_wifi_scan_stats' 'core/cap/kind_wifi_scan_txn.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_wifi_phy.pdx §1, kind_wifi_vif.pdx §1 and" >&2
+    echo "  kind_wifi_scan_txn.pdx §3 for the row/counter one-writer" >&2
+    echo "  discipline (linear_flag freeze for KIND_WIFI_SCAN_TXN)." >&2
+    exit 1
+fi
+echo "[wifi-m3-confine] R38.M3 (WiFi capability layer) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
