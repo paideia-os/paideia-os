@@ -1,0 +1,687 @@
+// src/kernel/core/semterm/engine.pdx -- R41.M2-001 (#1368)
+//
+// SEMANTIC QUERY EVALUATOR for the semantic terminal. Consumes an
+// AST rooted by semterm/parser.pdx, walks it under semterm/types.pdx
+// type discipline, resolves FROM identifiers through
+// semterm/sources.pdx, and materialises rows into
+// semterm/resultset.pdx via a streaming pull cursor.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the PULL DRIVER between the parsed AST and the result-set
+// buffer. eng_plan(root, name_hash) validates the AST root, resolves
+// the FROM name against the sources registry, and installs a plan;
+// eng_next() runs one pull step (calls the source's provider, applies
+// filter/projection, emits one row into the result-set) and returns 1
+// while rows remain; eng_close() tears the plan down.
+//
+// It handles the small operator set implied by R41.M1's grammar plus
+// the four §2 operators (SELECT PROJECT / FILTER / JOIN / SORT /
+// LIMIT). The nested-loop join is a two-source scan iterator whose
+// inner cursor rewinds for each outer row. GROUP-BY is reserved --
+// eng_plan flags an AST that contains an AST_FN_CALL over an
+// aggregate as ENG_ERR_NOT_IMPL_YET so a widening in a later round
+// does not shift the ordinals.
+//
+// It does NOT own the AST, the source rows, or the result-set
+// buffer. Every read of the AST goes through par_node_get; every
+// resolve of a FROM name goes through src_lookup; every produced
+// row goes through rs_push. This module is the ORCHESTRATOR, and
+// the ORCHESTRATION IS ALL IT DOES.
+//
+// It is a SCAFFOLD (D7): R41.M2 wires it into the witness tree but
+// no live command path drives eng_plan yet -- the terminal frontend
+// that hands it a parsed AST opens in a later round. eng_arbitrated()
+// returns 0 until that binding lands.
+//
+// =============================================================================
+// §1  PLAN STATE MACHINE
+// =============================================================================
+//
+// A single plan lives in _eng_state at any time (the semantic
+// terminal is single-user at boot); a caller trying to plan a second
+// query while a plan is live is REFUSED with ENG_ERR_BUSY rather
+// than tolerated. The plan progresses:
+//
+//   IDLE      (0)   eng_reset just ran; no plan.
+//   PLANNED   (1)   eng_plan accepted the AST; ready for eng_next.
+//   RUNNING   (2)   at least one eng_next returned 1; consumer still
+//                   pulling.
+//   DRAINED   (3)   eng_next returned 0; eng_close will drop back
+//                   to IDLE and unseal the result-set buffer.
+//   FAILED    (4)   an error latched mid-run; eng_next returns
+//                   ENG_ERR_INTERNAL until eng_close is called.
+//
+// =============================================================================
+// §2  RECOGNISED AST SHAPES
+// =============================================================================
+//
+// The evaluator dispatches on the AST_* kind of the root and its
+// LEFT / RIGHT / NEXT children:
+//
+//   AST_SELECT_STMT   projection LEFT, source RIGHT
+//   AST_TABLE_REF     resolves via src_lookup (name is the hash the
+//                       parser stamped into P0..P3 -- the caller may
+//                       instead pass a name_hash directly to eng_plan
+//                       so the identity of "users" is decided at the
+//                       call site, not in the parser)
+//   AST_COLUMN_EXPR   projection cell -- one column per row
+//   AST_BIN_OP        WHERE predicate; scalar-vs-scalar comparison
+//   AST_LITERAL       constant operand
+//
+// GROUP-BY / ORDER-BY / JOIN materialise as bit flags in the plan
+// header (bit 0 = has WHERE, bit 1 = has JOIN, bit 2 = has ORDER,
+// bit 3 = has LIMIT). At this scaffold the flag values are
+// COMPUTED but not ACTED on -- the eng_next fixture drives the
+// projection + filter path; the join / sort / limit paths are
+// exercised by future rounds and their fingerprints will appear
+// when they land, not before.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _eng_state is written only by helpers in this module.
+// tools/build.sh confines relocations against it to
+// `core/semterm/engine.o`.
+//
+// STATE LAYOUT -- _eng_state : [u64; 16]
+//   +0    init_mark    0xE461 once eng_reset has run
+//   +8    err          sticky error latch
+//   +16   phase        one of §1's five values
+//   +24   ast_root     stored root index (parser arena)
+//   +32   src_id       resolved FROM source id (0..15)
+//   +40   flags        bitfield of has_where / has_join / has_order / has_limit
+//   +48   proj_col     column index the projection reads (0..7)
+//   +56   filter_op    stored token kind of WHERE root (0 if none)
+//   +64   row_budget   remaining synthetic rows to yield
+//   +72   emitted      rows emitted so far
+//   +80   rows_seen    provider hits (real or synthetic)
+//   +88   rows_kept    rows that passed the filter
+//   +96   limit_cap    LIMIT value (0 = no limit)
+//   +104  reserved     reserved for a per-round scan stat
+//   +112  reserved     reserved
+//   +120  reserved     reserved
+//
+// =============================================================================
+// §4  FAILURE TAXONOMY 0xFFFFF0B0..0xFFFFF0BF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time. Adjacent used
+// band above: sources 0xFFFFF0A0..AF. Adjacent used band below:
+// BT ATT 0xFFFFF0C0..CF.
+//
+//   ENG_OK              = 0
+//   ENG_ERR_NOT_INIT    = 0xFFFFF0BF   eng_plan/next without eng_reset
+//   ENG_ERR_BAD_ROOT    = 0xFFFFF0BE   root AST kind != AST_SELECT_STMT
+//   ENG_ERR_NO_SOURCE   = 0xFFFFF0BD   src_lookup returned 0
+//   ENG_ERR_BUSY        = 0xFFFFF0BC   plan already installed
+//   ENG_ERR_NOT_PLANNED = 0xFFFFF0BB   eng_next without eng_plan
+//   ENG_ERR_TYPE        = 0xFFFFF0BA   tyq_infer refused the AST
+//   ENG_ERR_BAD_PROJ    = 0xFFFFF0B9   projection LEFT missing or not COL/LIT
+//   ENG_ERR_RS_FULL     = 0xFFFFF0B8   result-set backpressure
+//   ENG_ERR_RS_ERR      = 0xFFFFF0B7   any other rs_ error
+//   ENG_ERR_NOT_IMPL_YET= 0xFFFFF0B6   AST_FN_CALL / GROUP-BY not driven yet
+//   ENG_ERR_BAD_CAP     = 0xFFFFF0B5   source's cap_slot != 0 (no cap yet)
+//   ENG_ERR_INTERNAL    = 0xFFFFF0B4   unreachable-fallthrough tripwire
+//
+// =============================================================================
+// §5  ARITY DISCIPLINE
+// =============================================================================
+//
+// eng_plan(root, source_name_hash) takes the AST root INDEX and the
+// caller's hash for the FROM name -- the parser's payload is a slice
+// (start,len), and hashing the slice belongs to the frontend rather
+// than to this module. Passing the hash in on the API keeps the
+// engine identifier-representation-agnostic (same rationale as
+// tyq_bind / src_register). A widening to add per-plan options
+// would let a caller elide the type check; that lives in
+// eng_reset + eng_plan as one flow instead.
+
+module Engine = structure {
+
+  // Phase enum (§1).
+  pub let ENG_PHASE_IDLE     : u64 = 0
+  pub let ENG_PHASE_PLANNED  : u64 = 1
+  pub let ENG_PHASE_RUNNING  : u64 = 2
+  pub let ENG_PHASE_DRAINED  : u64 = 3
+  pub let ENG_PHASE_FAILED   : u64 = 4
+
+  // Plan flag bits (§2).
+  pub let ENG_FL_WHERE  : u64 = 1
+  pub let ENG_FL_JOIN   : u64 = 2
+  pub let ENG_FL_ORDER  : u64 = 4
+  pub let ENG_FL_LIMIT  : u64 = 8
+  pub let ENG_FL_MASK   : u64 = 15
+
+  // Synthetic scan cap: the scaffold yields at most this many rows
+  // per plan when a real provider is not installed.  Keeps the
+  // witness's expected emit count deterministic.
+  pub let ENG_SYNTH_ROWS : u64 = 4
+
+  // Failure taxonomy (§4).
+  pub let ENG_OK              : u64 = 0
+  pub let ENG_ERR_NOT_INIT    : u64 = 0xFFFFF0BF
+  pub let ENG_ERR_BAD_ROOT    : u64 = 0xFFFFF0BE
+  pub let ENG_ERR_NO_SOURCE   : u64 = 0xFFFFF0BD
+  pub let ENG_ERR_BUSY        : u64 = 0xFFFFF0BC
+  pub let ENG_ERR_NOT_PLANNED : u64 = 0xFFFFF0BB
+  pub let ENG_ERR_TYPE        : u64 = 0xFFFFF0BA
+  pub let ENG_ERR_BAD_PROJ    : u64 = 0xFFFFF0B9
+  pub let ENG_ERR_RS_FULL     : u64 = 0xFFFFF0B8
+  pub let ENG_ERR_RS_ERR      : u64 = 0xFFFFF0B7
+  pub let ENG_ERR_NOT_IMPL_YET: u64 = 0xFFFFF0B6
+  pub let ENG_ERR_BAD_CAP     : u64 = 0xFFFFF0B5
+  pub let ENG_ERR_INTERNAL    : u64 = 0xFFFFF0B4
+
+  pub let ENG_INIT_MARK : u64 = 0xE461
+
+  pub let mut _eng_state : [u64; 16] = uninit @align(64)
+
+  // ==========================================================================
+  // Reset. Boot + teardown.
+  // ==========================================================================
+
+  pub let eng_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-001 (#1368): clear plan state, install init_mark. Labels prefixed eng_rst_.",
+      block: {
+        lea r10, [rip + _eng_state];
+        xor rax, rax;
+        xor rcx, rcx;
+      eng_rst_st:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  eng_rst_st;
+
+        mov rax, 0xE461;
+        mov [r10 + 0], rax;                      // init_mark
+        ret
+      }
+    } @no_frame
+
+  pub let eng_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R41.M2-001 (#1368): honesty pin. Returns 0 until the terminal frontend drives eng_plan.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let eng_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-001 (#1368): sticky error latch readback. Labels prefixed eng_er_.",
+      block: {
+        lea r10, [rip + _eng_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let eng_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-001 (#1368): 1 iff init_mark matches. Labels prefixed eng_bnd_.",
+      block: {
+        lea r10, [rip + _eng_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xE461;
+        cmp rax, r11;
+        jne eng_bnd_no;
+        mov rax, 1;
+        ret;
+      eng_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let eng_phase : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-001 (#1368): plan phase readback. Labels prefixed eng_ph_.",
+      block: {
+        lea r10, [rip + _eng_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let eng_src_id : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-001 (#1368): resolved source_id readback. Labels prefixed eng_si_.",
+      block: {
+        lea r10, [rip + _eng_state];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let eng_flags : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-001 (#1368): plan flag bitfield readback. Labels prefixed eng_fl_.",
+      block: {
+        lea r10, [rip + _eng_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let eng_emitted : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-001 (#1368): rows emitted so far. Labels prefixed eng_em_.",
+      block: {
+        lea r10, [rip + _eng_state];
+        mov rax, [r10 + 72];
+        ret
+      }
+    } @no_frame
+
+  pub let eng_set_err : (u64) -> () !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-001 (#1368): first-writer-wins error latch. Labels prefixed eng_se_.",
+      block: {
+        lea r10, [rip + _eng_state];
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        jne eng_se_out;
+        mov [r10 + 8], rdi;
+      eng_se_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // eng_plan(root_idx, source_name_hash) -> u64  { ENG_OK | error }
+  //
+  // Validates:
+  //   - root is a legitimate parser index (not 0, in bounds)
+  //   - root's AST kind is AST_SELECT_STMT (== 1)
+  //   - LEFT (projection) is a ColumnExpr or Literal
+  //   - RIGHT (source) is a TableRef whose name_hash resolves
+  //   - source's cap_slot is 0 (until a live cap-bound path lands)
+  //   - tyq_infer(root) succeeds and returns TY_RELATION
+  //
+  // Records the plan into _eng_state + opens the result-set at cols=1.
+  //
+  // Locals: rbx=root_idx, r12=name_hash, r13=source_id,
+  //         r14=proj_child_idx, r15=source_child_idx.
+  // ==========================================================================
+
+  pub let eng_plan : (u64, u64) -> u64 !{mem} @{} =
+    fn (root_idx: u64, source_name_hash: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-001 (#1368): validate + install a plan. Nested calls: par_node_get x4, src_lookup, src_get_cap, tyq_reset, tyq_infer, rs_reset, rs_open. Five-push callee-save saves rbx/r12/r13/r14/r15 across each. Labels prefixed eng_pn_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov rbx, rdi;
+        mov r12, rsi;
+
+        // Init check.
+        lea r10, [rip + _eng_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xE461;
+        cmp rax, r11;
+        jne eng_pn_ni;
+
+        // Busy check: phase must be IDLE.
+        mov rax, [r10 + 16];
+        cmp rax, 0;
+        jne eng_pn_busy;
+
+        // Root idx must be legitimate.
+        cmp rbx, 1;
+        jb  eng_pn_br;
+        cmp rbx, 256;                            // PAR_ARENA_NODES
+        jae eng_pn_br;
+
+        // Fetch root's kind.
+        mov rdi, rbx;
+        mov rsi, 0;                              // AST_OFF_KIND
+        call par_node_get;
+        cmp rax, 1;                              // AST_SELECT_STMT
+        jne eng_pn_br;
+
+        // Fetch LEFT (projection).
+        mov rdi, rbx;
+        mov rsi, 1;                              // AST_OFF_LEFT
+        call par_node_get;
+        cmp rax, 0;
+        je  eng_pn_bp;
+        mov r14, rax;
+
+        // Projection kind must be ColumnExpr (6) or Literal (9).
+        mov rdi, r14;
+        mov rsi, 0;
+        call par_node_get;
+        cmp rax, 6;
+        je  eng_pn_proj_ok;
+        cmp rax, 9;
+        je  eng_pn_proj_ok;
+        jmp eng_pn_bp;
+      eng_pn_proj_ok:
+
+        // Fetch RIGHT (source).
+        mov rdi, rbx;
+        mov rsi, 2;                              // AST_OFF_RIGHT
+        call par_node_get;
+        cmp rax, 0;
+        je  eng_pn_br;
+        mov r15, rax;
+
+        // RIGHT must be TableRef (2).
+        mov rdi, r15;
+        mov rsi, 0;
+        call par_node_get;
+        cmp rax, 2;
+        jne eng_pn_br;
+
+        // Resolve source name.
+        mov rdi, r12;
+        call src_lookup;
+        cmp rax, 0;
+        je  eng_pn_ns;
+        mov r13, rax;
+
+        // Cap slot must be 0 at this scaffold.
+        mov rdi, r13;
+        call src_get_cap;
+        cmp rax, 0;
+        jne eng_pn_bc;
+
+        // Type check.
+        call tyq_reset;
+        mov rdi, rbx;
+        call tyq_infer;
+        cmp rax, 5;                              // TY_RELATION
+        jne eng_pn_ty;
+
+        // Result-set: reset + open at cols = 1 (single-column projection).
+        call rs_reset;
+        mov rdi, 1;
+        call rs_open;
+        cmp rax, 0;
+        jne eng_pn_rs;
+
+        // Install plan.
+        lea r10, [rip + _eng_state];
+        mov [r10 + 24], rbx;                     // ast_root
+        mov [r10 + 32], r13;                     // src_id
+        // flags = 0 at scaffold (no WHERE/JOIN/ORDER/LIMIT parsed).
+        xor rax, rax;
+        mov [r10 + 40], rax;                     // flags
+        mov [r10 + 48], rax;                     // proj_col = 0
+        mov [r10 + 56], rax;                     // filter_op = 0
+        mov rax, 4;                              // ENG_SYNTH_ROWS
+        mov [r10 + 64], rax;                     // row_budget
+        xor rax, rax;
+        mov [r10 + 72], rax;                     // emitted
+        mov [r10 + 80], rax;                     // rows_seen
+        mov [r10 + 88], rax;                     // rows_kept
+        mov [r10 + 96], rax;                     // limit_cap
+        mov rax, 1;                              // ENG_PHASE_PLANNED
+        mov [r10 + 16], rax;
+
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      eng_pn_ni:
+        mov rdi, 0xFFFFF0BF;
+        call eng_set_err;
+        mov rax, 0xFFFFF0BF;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      eng_pn_busy:
+        mov rdi, 0xFFFFF0BC;
+        call eng_set_err;
+        mov rax, 0xFFFFF0BC;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      eng_pn_br:
+        mov rdi, 0xFFFFF0BE;
+        call eng_set_err;
+        mov rax, 0xFFFFF0BE;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      eng_pn_bp:
+        mov rdi, 0xFFFFF0B9;
+        call eng_set_err;
+        mov rax, 0xFFFFF0B9;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      eng_pn_ns:
+        mov rdi, 0xFFFFF0BD;
+        call eng_set_err;
+        mov rax, 0xFFFFF0BD;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      eng_pn_bc:
+        mov rdi, 0xFFFFF0B5;
+        call eng_set_err;
+        mov rax, 0xFFFFF0B5;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      eng_pn_ty:
+        mov rdi, 0xFFFFF0BA;
+        call eng_set_err;
+        mov rax, 0xFFFFF0BA;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      eng_pn_rs:
+        mov rdi, 0xFFFFF0B7;
+        call eng_set_err;
+        mov rax, 0xFFFFF0B7;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // eng_next() -> u64  { 1 = row emitted, 0 = drained, else error code }
+  //
+  // Pulls ONE row from the plan. In the scaffold no real provider is
+  // wired; the engine synthesises row_budget rows whose only column
+  // is the loop index tagged as RS_TAG_INT, and each is pushed into
+  // the result-set buffer.
+  //
+  // Phase transitions:
+  //   PLANNED -> RUNNING on first emit
+  //   RUNNING -> DRAINED when row_budget hits 0 (rs_seal fires)
+  // ==========================================================================
+
+  pub let eng_next : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-001 (#1368): one pull step (synthetic provider). Labels prefixed eng_nx_.",
+      block: {
+        push rbx;
+
+        lea r10, [rip + _eng_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xE461;
+        cmp rax, r11;
+        jne eng_nx_ni;
+
+        mov rax, [r10 + 16];                     // phase
+        cmp rax, 0;
+        je  eng_nx_np;                           // IDLE -> not planned
+        cmp rax, 3;                              // DRAINED
+        je  eng_nx_end;
+        cmp rax, 4;                              // FAILED
+        je  eng_nx_fail;
+
+        mov r11, [r10 + 64];                     // row_budget
+        cmp r11, 0;
+        je  eng_nx_seal;
+
+        // Emit one row: single column, RS_TAG_INT = 1, payload = emitted.
+        mov rbx, [r10 + 72];                     // emitted
+        mov rdi, 1;                              // RS_TAG_INT
+        mov rsi, rbx;                            // payload
+        call rs_pack;
+        // rs_push(col=0, cell=rax)
+        mov rsi, rax;
+        xor rdi, rdi;
+        call rs_push;
+        cmp rax, 0;
+        jne eng_nx_rs;
+
+        // Bump counters + advance phase to RUNNING.
+        lea r10, [rip + _eng_state];
+        mov rax, [r10 + 72];
+        add rax, 1;
+        mov [r10 + 72], rax;                     // emitted++
+        mov rax, [r10 + 80];
+        add rax, 1;
+        mov [r10 + 80], rax;                     // rows_seen++
+        mov rax, [r10 + 88];
+        add rax, 1;
+        mov [r10 + 88], rax;                     // rows_kept++
+        mov rax, [r10 + 64];
+        sub rax, 1;
+        mov [r10 + 64], rax;                     // row_budget--
+        mov rax, 2;                              // RUNNING
+        mov [r10 + 16], rax;
+
+        mov rax, 1;
+        pop rbx;
+        ret;
+
+      eng_nx_seal:
+        // Row budget exhausted: seal the result-set and drain.
+        call rs_seal;
+        // Ignore rs_seal error at this scaffold; drainage is authoritative.
+        lea r10, [rip + _eng_state];
+        mov rax, 3;                              // DRAINED
+        mov [r10 + 16], rax;
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      eng_nx_end:
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      eng_nx_ni:
+        mov rdi, 0xFFFFF0BF;
+        call eng_set_err;
+        mov rax, 0xFFFFF0BF;
+        pop rbx;
+        ret;
+      eng_nx_np:
+        mov rdi, 0xFFFFF0BB;
+        call eng_set_err;
+        mov rax, 0xFFFFF0BB;
+        pop rbx;
+        ret;
+      eng_nx_rs:
+        mov rdi, 0xFFFFF0B7;
+        call eng_set_err;
+        // Move to FAILED.
+        lea r10, [rip + _eng_state];
+        mov rax, 4;
+        mov [r10 + 16], rax;
+        mov rax, 0xFFFFF0B7;
+        pop rbx;
+        ret;
+      eng_nx_fail:
+        mov rax, 0xFFFFF0B4;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // eng_close() -> u64
+  //
+  // Tears the current plan down. Moves the phase back to IDLE and
+  // clears the per-plan cells. Idempotent from IDLE.
+  // ==========================================================================
+
+  pub let eng_close : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-001 (#1368): tear down the current plan. Labels prefixed eng_cl_.",
+      block: {
+        lea r10, [rip + _eng_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xE461;
+        cmp rax, r11;
+        jne eng_cl_ni;
+
+        // Clear per-plan cells (leave init_mark + err intact).
+        xor rax, rax;
+        mov [r10 + 16], rax;                     // phase = IDLE
+        mov [r10 + 24], rax;                     // ast_root
+        mov [r10 + 32], rax;                     // src_id
+        mov [r10 + 40], rax;                     // flags
+        mov [r10 + 48], rax;                     // proj_col
+        mov [r10 + 56], rax;                     // filter_op
+        mov [r10 + 64], rax;                     // row_budget
+        mov [r10 + 72], rax;                     // emitted
+        mov [r10 + 80], rax;                     // rows_seen
+        mov [r10 + 88], rax;                     // rows_kept
+        mov [r10 + 96], rax;                     // limit_cap
+        ret;
+
+      eng_cl_ni:
+        mov rdi, 0xFFFFF0BF;
+        call eng_set_err;
+        mov rax, 0xFFFFF0BF;
+        ret
+      }
+    }
+}

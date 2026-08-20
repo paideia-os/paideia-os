@@ -4247,6 +4247,62 @@ semterm_pin_one "${TYQ_SRC}" 'pub let tyq_effect_union : (u64, u64) -> u64'
 echo "[semterm-confine] lexer / parser / types entry-point arities pinned"
 
 # ---------------------------------------------------------------------------
+# R41.M2-001/002/003 (#1368/#1369/#1370): SEMTERM QUERY-ORCHESTRATION LAYER
+# CONFINEMENT.
+#
+# Three modules open R41.M2 on top of the R41.M1 lexer / parser /
+# types stack: engine (evaluator + plan state machine), sources
+# (typed data-source registry), resultset (streaming pull buffer).
+# Each owns its own state cells; a second writer against any of them
+# would let a caller:
+#   - install a plan without going through eng_plan (engine
+#     confinement) so a caller could smuggle a source_id that
+#     src_lookup never returned into eng_next's dispatch,
+#   - overwrite a source row so a FROM name resolves to a schema the
+#     registrar never installed (sources confinement),
+#   - forge a result-set row so a consumer downstream sees a value
+#     the engine never emitted (resultset confinement).
+ENG_SRC="${REPO_ROOT}/src/kernel/core/semterm/engine.pdx"
+SRC_SRC="${REPO_ROOT}/src/kernel/core/semterm/sources.pdx"
+RSET_SRC="${REPO_ROOT}/src/kernel/core/semterm/resultset.pdx"
+if [[ ! -f "${ENG_SRC}" || ! -f "${SRC_SRC}" || ! -f "${RSET_SRC}" ]]; then
+    echo "[semterm-m2-confine] FAIL - one of the R41.M2 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_eng_state'  'core/semterm/engine.o'
+ec_confine_one '_src_table'  'core/semterm/sources.o'
+ec_confine_one '_src_state'  'core/semterm/sources.o'
+ec_confine_one '_rs_buf'     'core/semterm/resultset.o'
+ec_confine_one '_rs_state'   'core/semterm/resultset.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/semterm/engine.pdx §3, sources.pdx §2, and" >&2
+    echo "  resultset.pdx §2 for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[semterm-m2-confine] R41.M2 (engine + sources + resultset) state confined"
+
+# ARITY PINS for the M2 entry points. Same rationale as the M1 pins
+# above: a widening on any of these makes "install a plan the engine
+# never validated", "fabricate a source row the registrar never
+# accepted", or "push a cell into a row the producer never opened"
+# expressible in a call site the confinement gate cannot see.
+semterm_pin_one "${ENG_SRC}"  'pub let eng_plan : (u64, u64) -> u64'
+semterm_pin_one "${ENG_SRC}"  'pub let eng_next : () -> u64'
+semterm_pin_one "${ENG_SRC}"  'pub let eng_close : () -> u64'
+semterm_pin_one "${SRC_SRC}"  'pub let src_register : (u64, u64, u64, u64) -> u64'
+semterm_pin_one "${SRC_SRC}"  'pub let src_lookup : (u64) -> u64'
+semterm_pin_one "${SRC_SRC}"  'pub let src_get_schema : (u64) -> u64'
+semterm_pin_one "${SRC_SRC}"  'pub let src_get_provider : (u64) -> u64'
+semterm_pin_one "${SRC_SRC}"  'pub let src_get_cap : (u64) -> u64'
+semterm_pin_one "${RSET_SRC}" 'pub let rs_open : (u64) -> u64'
+semterm_pin_one "${RSET_SRC}" 'pub let rs_push : (u64, u64) -> u64'
+semterm_pin_one "${RSET_SRC}" 'pub let rs_next : () -> u64'
+semterm_pin_one "${RSET_SRC}" 'pub let rs_get : (u64, u64) -> u64'
+semterm_pin_one "${RSET_SRC}" 'pub let rs_pack : (u64, u64) -> u64'
+semterm_pin_one "${RSET_SRC}" 'pub let rs_seal : () -> u64'
+echo "[semterm-m2-confine] engine / sources / resultset entry-point arities pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

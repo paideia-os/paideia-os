@@ -1,0 +1,646 @@
+// src/kernel/core/semterm/resultset.pdx -- R41.M2-003 (#1370)
+//
+// RESULT-SET REPRESENTATION and streaming buffer for the semantic
+// terminal. The engine (semterm/engine.pdx) pushes one column value
+// at a time into the current row; the caller (a terminal frontend,
+// or a witness) pulls tuples via a small cursor.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the SHARED BOUNDED BUFFER that decouples the engine's push
+// cadence from the frontend's pull cadence. The buffer is a fixed
+// 256-row x 8-col table of tagged u64 cells; every value carries its
+// tag in the high byte and its 56-bit payload in the low bits (§1).
+//
+// The producer walks the table row-by-row; rs_push(col, tagged)
+// stores one cell in the current row's column and, on the final
+// column of a row, advances the producer's row cursor. When 256 rows
+// have been pushed the producer is REFUSED with RS_ERR_FULL. In a
+// live pipeline the caller re-drives after the consumer drains; the
+// per-request cap keeps the boot-time witness bounded.
+//
+// The consumer holds a {row_idx, col_idx, more_bit} cursor. rs_more()
+// reports the more_bit (producer not sealed); rs_next() advances one
+// row; rs_get(row, col) reads a cell.
+//
+// It does NOT own the values it stores. TEXT tags carry a 56-bit
+// slice reference (start<<28 | len) into an input buffer the caller
+// owns; INT and BOOL tags carry the value in place. The result-set
+// module never dereferences a text slice -- a formatter downstream
+// does, against the same input buffer.
+//
+// It is a SCAFFOLD (D7): R41.M2 wires it into the witness tree but
+// no live query drives it; rs_arbitrated() returns 0 until a later
+// round hooks the terminal frontend into rs_open / rs_next.
+//
+// =============================================================================
+// §1  TAGGED VALUE ENCODING
+// =============================================================================
+//
+// A cell is a single u64. The tag is the high byte (bits 56..63) and
+// the payload is the low 56 bits (0..55).
+//
+//   RS_TAG_NULL  (0)   payload ignored; the cell is absent
+//   RS_TAG_INT   (1)   payload = signed 56-bit integer (sign-extend on read)
+//   RS_TAG_TEXT  (2)   payload = start<<28 | len; caller owns the buffer
+//   RS_TAG_BOOL  (3)   payload = 0 (false) | 1 (true)
+//
+// A caller-supplied tag outside [0..3] is refused with RS_ERR_BAD_TAG
+// rather than silently masked. Widening the tag range in a later
+// round means adding a value to this enum, not slipping one through
+// the payload path.
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _rs_buf, _rs_state are written only by helpers in this module.
+// tools/build.sh confines relocations against each to
+// `core/semterm/resultset.o`.
+//
+// STATE LAYOUT -- _rs_state : [u64; 8]
+//   +0   prod_row    producer's next-write row index (0..256)
+//   +8   cons_row    consumer's next-read row index  (0..prod_row)
+//   +16  cols        columns per row committed at rs_open (1..8)
+//   +24  more_bit    1 while producer may still push; 0 once rs_seal ran
+//   +32  err         sticky error latch (first-writer-wins)
+//   +40  init_mark   0x59E7 once rs_reset has run
+//   +48  opened      1 while rs_open has been called and rs_reset has not
+//   +56  reserved    reserved (kept for a future prod_col scratch)
+//
+// BUFFER LAYOUT -- _rs_buf : [u64; 2048]  (= 256 rows * 8 cols)
+//   cell(row, col) = _rs_buf[row * 8 + col]
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFF090..0xFFFFF09F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time. Adjacent used
+// band above: sources 0xFFFFF0A0..AF (R41.M2-002). Adjacent free band
+// below: 0xFFFFF080..8F (unused).
+//
+//   RS_OK             = 0
+//   RS_ERR_NOT_INIT   = 0xFFFFF09F   rs_open/push/next without rs_reset
+//   RS_ERR_FULL       = 0xFFFFF09E   producer would exceed 256 rows
+//   RS_ERR_EMPTY      = 0xFFFFF09D   consumer past prod_row with more_bit clear
+//   RS_ERR_BAD_COL    = 0xFFFFF09C   col index outside [0, cols)
+//   RS_ERR_BAD_ROW    = 0xFFFFF09B   row index outside [0, prod_row)
+//   RS_ERR_BAD_TAG    = 0xFFFFF09A   tag outside [0, 3]
+//   RS_ERR_NOT_OPEN   = 0xFFFFF099   push/seal before rs_open
+//   RS_ERR_BAD_COLS   = 0xFFFFF098   rs_open with cols outside [1, 8]
+//   RS_ERR_INTERNAL   = 0xFFFFF097   unreachable-fallthrough tripwire
+//
+// =============================================================================
+// §4  ARITY DISCIPLINE
+// =============================================================================
+//
+// rs_push is (col, tagged_value) -- the producer's ROW is a state
+// property (prod_row), never a caller argument, so a caller cannot
+// smuggle a fabricated row into the buffer. Advancing prod_row is a
+// side effect of pushing the last column of a row, which the module
+// alone decides.
+
+module Resultset = structure {
+
+  // Tag enum (§1).
+  pub let RS_TAG_NULL  : u64 = 0
+  pub let RS_TAG_INT   : u64 = 1
+  pub let RS_TAG_TEXT  : u64 = 2
+  pub let RS_TAG_BOOL  : u64 = 3
+  pub let RS_TAG_MAX   : u64 = 3
+
+  // Buffer geometry (§2).
+  pub let RS_MAX_ROWS  : u64 = 256
+  pub let RS_MAX_COLS  : u64 = 8
+  pub let RS_BUF_WORDS : u64 = 2048           // 256 * 8
+
+  // Failure taxonomy (§3).
+  pub let RS_OK             : u64 = 0
+  pub let RS_ERR_NOT_INIT   : u64 = 0xFFFFF09F
+  pub let RS_ERR_FULL       : u64 = 0xFFFFF09E
+  pub let RS_ERR_EMPTY      : u64 = 0xFFFFF09D
+  pub let RS_ERR_BAD_COL    : u64 = 0xFFFFF09C
+  pub let RS_ERR_BAD_ROW    : u64 = 0xFFFFF09B
+  pub let RS_ERR_BAD_TAG    : u64 = 0xFFFFF09A
+  pub let RS_ERR_NOT_OPEN   : u64 = 0xFFFFF099
+  pub let RS_ERR_BAD_COLS   : u64 = 0xFFFFF098
+  pub let RS_ERR_INTERNAL   : u64 = 0xFFFFF097
+
+  pub let RS_INIT_MARK : u64 = 0x59E7
+
+  pub let mut _rs_buf   : [u64; 2048] = uninit @align(64)
+  pub let mut _rs_state : [u64; 8]    = uninit @align(64)
+
+  // ==========================================================================
+  // Reset. Boot + teardown.
+  // ==========================================================================
+
+  pub let rs_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-003 (#1370): clear buffer + state, install init_mark. Labels prefixed rs_rst_.",
+      block: {
+        lea r10, [rip + _rs_buf];
+        xor rax, rax;
+        xor rcx, rcx;
+      rs_rst_buf:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 2048;
+        jb  rs_rst_buf;
+
+        lea r10, [rip + _rs_state];
+        xor rcx, rcx;
+      rs_rst_st:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  rs_rst_st;
+
+        mov rax, 0x59E7;
+        mov [r10 + 40], rax;                    // init_mark
+        ret
+      }
+    } @no_frame
+
+  pub let rs_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R41.M2-003 (#1370): honesty pin. Returns 0 until a later round drives rs_open/next from a live query.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let rs_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-003 (#1370): sticky error latch readback. Labels prefixed rs_er_.",
+      block: {
+        lea r10, [rip + _rs_state];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let rs_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-003 (#1370): 1 iff init_mark matches. Labels prefixed rs_bnd_.",
+      block: {
+        lea r10, [rip + _rs_state];
+        mov rax, [r10 + 40];
+        mov r11, 0x59E7;
+        cmp rax, r11;
+        jne rs_bnd_no;
+        mov rax, 1;
+        ret;
+      rs_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let rs_set_err : (u64) -> () !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-003 (#1370): first-writer-wins error latch. Labels prefixed rs_se_.",
+      block: {
+        lea r10, [rip + _rs_state];
+        mov rax, [r10 + 32];
+        cmp rax, 0;
+        jne rs_se_out;
+        mov [r10 + 32], rdi;
+      rs_se_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Readback: rs_prod_row / rs_cons_row / rs_cols / rs_more / rs_opened.
+  // ==========================================================================
+
+  pub let rs_prod_row : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-003 (#1370): producer's next-write row index. Labels prefixed rs_pr_.",
+      block: {
+        lea r10, [rip + _rs_state];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let rs_cons_row : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-003 (#1370): consumer's next-read row index. Labels prefixed rs_cr_.",
+      block: {
+        lea r10, [rip + _rs_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let rs_cols : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-003 (#1370): committed column count. Labels prefixed rs_cl_.",
+      block: {
+        lea r10, [rip + _rs_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let rs_more : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-003 (#1370): more_bit readback. Labels prefixed rs_mb_.",
+      block: {
+        lea r10, [rip + _rs_state];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let rs_opened : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-003 (#1370): 1 iff rs_open has run and rs_reset has not. Labels prefixed rs_op_.",
+      block: {
+        lea r10, [rip + _rs_state];
+        mov rax, [r10 + 48];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // rs_pack(tag, payload) -> u64
+  // rs_tag(cell) -> u64
+  // rs_payload(cell) -> u64  (zero-extended)
+  //
+  // Pure primitives. rs_pack refuses tag > RS_TAG_MAX (returns 0 and
+  // latches RS_ERR_BAD_TAG).
+  // ==========================================================================
+
+  pub let rs_pack : (u64, u64) -> u64 !{mem} @{} =
+    fn (tag: u64, payload: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-003 (#1370): tag << 56 | (payload & 56-bit mask). Labels prefixed rs_pk_.",
+      block: {
+        cmp rdi, 3;                              // RS_TAG_MAX
+        ja  rs_pk_bad;
+        mov rax, rdi;
+        shl rax, 56;
+        // 56-bit payload mask: 0x00FFFFFFFFFFFFFF via 64-bit constant load.
+        mov r11, 0x00FFFFFFFFFFFFFF;
+        mov r10, rsi;
+        and r10, r11;
+        or  rax, r10;
+        ret;
+      rs_pk_bad:
+        mov rdi, 0xFFFFF09A;
+        call rs_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let rs_tag : (u64) -> u64 !{} @{} =
+    fn (cell: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R41.M2-003 (#1370): high-byte tag extractor.",
+      block: {
+        mov rax, rdi;
+        shr rax, 56;
+        ret
+      }
+    } @no_frame
+
+  pub let rs_payload : (u64) -> u64 !{} @{} =
+    fn (cell: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R41.M2-003 (#1370): low-56 payload extractor.",
+      block: {
+        mov r11, 0x00FFFFFFFFFFFFFF;
+        mov rax, rdi;
+        and rax, r11;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // rs_open(cols) -> u64
+  //
+  // Commits the per-row width. Refused if cols not in [1, 8] or if
+  // rs_reset has not run. Must be called once before any rs_push /
+  // rs_seal / rs_next.
+  // ==========================================================================
+
+  pub let rs_open : (u64) -> u64 !{mem} @{} =
+    fn (cols: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-003 (#1370): open a new stream, set cols + more_bit. Labels prefixed rs_opn_.",
+      block: {
+        lea r10, [rip + _rs_state];
+        mov rax, [r10 + 40];
+        mov r11, 0x59E7;
+        cmp rax, r11;
+        jne rs_opn_ni;
+
+        cmp rdi, 1;
+        jb  rs_opn_bc;
+        cmp rdi, 8;
+        ja  rs_opn_bc;
+
+        mov [r10 + 16], rdi;                     // cols
+        mov rax, 1;
+        mov [r10 + 24], rax;                     // more_bit = 1
+        mov [r10 + 48], rax;                     // opened = 1
+        xor rax, rax;
+        ret;
+
+      rs_opn_ni:
+        mov rdi, 0xFFFFF09F;
+        call rs_set_err;
+        mov rax, 0xFFFFF09F;
+        ret;
+      rs_opn_bc:
+        mov rdi, 0xFFFFF098;
+        call rs_set_err;
+        mov rax, 0xFFFFF098;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rs_push(col, cell) -> u64
+  //
+  // Store cell at (prod_row, col). When col == cols - 1, advance
+  // prod_row. Refuses if the buffer is full (256 rows already
+  // committed), if col out of range, if the cell's tag is out of
+  // range, if not opened, or if not init.
+  //
+  // Locals: rbx = col, r12 = cell, r13 = prod_row, r14 = cols.
+  // ==========================================================================
+
+  pub let rs_push : (u64, u64) -> u64 !{mem} @{} =
+    fn (col: u64, cell: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-003 (#1370): store one cell; advance prod_row on last column. Labels prefixed rs_ph_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        mov rbx, rdi;                            // col
+        mov r12, rsi;                            // cell
+
+        lea r10, [rip + _rs_state];
+        mov rax, [r10 + 40];
+        mov r11, 0x59E7;
+        cmp rax, r11;
+        jne rs_ph_ni;
+
+        mov rax, [r10 + 48];                     // opened
+        cmp rax, 1;
+        jne rs_ph_no;
+
+        mov r14, [r10 + 16];                     // cols
+        cmp rbx, r14;
+        jae rs_ph_bc;
+
+        // Tag range check.
+        mov rax, r12;
+        shr rax, 56;
+        cmp rax, 3;                              // RS_TAG_MAX
+        ja  rs_ph_bt;
+
+        mov r13, [r10 + 0];                      // prod_row
+        cmp r13, 256;
+        jae rs_ph_full;
+
+        // Store cell at _rs_buf[prod_row * 8 + col].
+        lea r10, [rip + _rs_buf];
+        mov r8, r13;
+        shl r8, 3;                               // row * 8
+        add r8, rbx;                             // + col
+        mov [r10 + r8 * 8], r12;
+
+        // Advance row on last column.
+        mov rax, rbx;
+        add rax, 1;
+        cmp rax, r14;
+        jne rs_ph_out;
+        lea r10, [rip + _rs_state];
+        mov rax, r13;
+        add rax, 1;
+        mov [r10 + 0], rax;                      // prod_row++
+      rs_ph_out:
+        xor rax, rax;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rs_ph_ni:
+        mov rdi, 0xFFFFF09F;
+        call rs_set_err;
+        mov rax, 0xFFFFF09F;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      rs_ph_no:
+        mov rdi, 0xFFFFF099;
+        call rs_set_err;
+        mov rax, 0xFFFFF099;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      rs_ph_bc:
+        mov rdi, 0xFFFFF09C;
+        call rs_set_err;
+        mov rax, 0xFFFFF09C;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      rs_ph_bt:
+        mov rdi, 0xFFFFF09A;
+        call rs_set_err;
+        mov rax, 0xFFFFF09A;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      rs_ph_full:
+        mov rdi, 0xFFFFF09E;
+        call rs_set_err;
+        mov rax, 0xFFFFF09E;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rs_seal() -> u64
+  //
+  // Producer signals end-of-stream. Clears more_bit; consumer's
+  // rs_next returns RS_ERR_EMPTY once it catches up.
+  // ==========================================================================
+
+  pub let rs_seal : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-003 (#1370): clear more_bit. Labels prefixed rs_sl_.",
+      block: {
+        lea r10, [rip + _rs_state];
+        mov rax, [r10 + 40];
+        mov r11, 0x59E7;
+        cmp rax, r11;
+        jne rs_sl_ni;
+
+        mov rax, [r10 + 48];
+        cmp rax, 1;
+        jne rs_sl_no;
+
+        xor rax, rax;
+        mov [r10 + 24], rax;                     // more_bit = 0
+        ret;
+
+      rs_sl_ni:
+        mov rdi, 0xFFFFF09F;
+        call rs_set_err;
+        mov rax, 0xFFFFF09F;
+        ret;
+      rs_sl_no:
+        mov rdi, 0xFFFFF099;
+        call rs_set_err;
+        mov rax, 0xFFFFF099;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rs_next() -> u64  { 1 = row available, 0 = end, else error code }
+  //
+  // Advances the consumer cursor. Returns 1 if cons_row < prod_row
+  // after any pending advance (a row is available at the CURRENT
+  // cons_row already; rs_next bumps cons_row for the NEXT call). Use
+  // rs_get(cons_row - 1, col) after a successful rs_next to read the
+  // just-consumed row.
+  //
+  // Returns 0 iff cons_row == prod_row AND more_bit == 0 (drained
+  // and sealed). Returns RS_ERR_EMPTY if cons_row == prod_row AND
+  // more_bit == 1 (backpressure the consumer -- producer has not
+  // pushed the next row yet).
+  // ==========================================================================
+
+  pub let rs_next : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-003 (#1370): advance consumer cursor. Labels prefixed rs_nx_.",
+      block: {
+        lea r10, [rip + _rs_state];
+        mov rax, [r10 + 40];
+        mov r11, 0x59E7;
+        cmp rax, r11;
+        jne rs_nx_ni;
+
+        mov r8, [r10 + 0];                       // prod_row
+        mov r9, [r10 + 8];                       // cons_row
+        cmp r9, r8;
+        jb  rs_nx_have;
+        // cons_row == prod_row.
+        mov rax, [r10 + 24];                     // more_bit
+        cmp rax, 0;
+        je  rs_nx_end;
+        // more_bit set -> backpressure.
+        mov rdi, 0xFFFFF09D;
+        call rs_set_err;
+        mov rax, 0xFFFFF09D;
+        ret;
+
+      rs_nx_have:
+        // Bump cons_row.
+        mov rax, r9;
+        add rax, 1;
+        mov [r10 + 8], rax;
+        mov rax, 1;
+        ret;
+
+      rs_nx_end:
+        xor rax, rax;
+        ret;
+
+      rs_nx_ni:
+        mov rdi, 0xFFFFF09F;
+        call rs_set_err;
+        mov rax, 0xFFFFF09F;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rs_get(row, col) -> cell  (0 on out-of-range, err latched)
+  //
+  // Random-access read. Refused if row >= prod_row or col >= cols.
+  // ==========================================================================
+
+  pub let rs_get : (u64, u64) -> u64 !{mem} @{} =
+    fn (row: u64, col: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M2-003 (#1370): read cell at (row, col) after bounds. Labels prefixed rs_gt_.",
+      block: {
+        lea r10, [rip + _rs_state];
+        mov rax, [r10 + 40];
+        mov r11, 0x59E7;
+        cmp rax, r11;
+        jne rs_gt_ni;
+
+        mov r8, [r10 + 0];                       // prod_row
+        cmp rdi, r8;
+        jae rs_gt_br;
+        mov r9, [r10 + 16];                      // cols
+        cmp rsi, r9;
+        jae rs_gt_bc;
+
+        lea r10, [rip + _rs_buf];
+        mov r8, rdi;
+        shl r8, 3;
+        add r8, rsi;
+        mov rax, [r10 + r8 * 8];
+        ret;
+
+      rs_gt_ni:
+        mov rdi, 0xFFFFF09F;
+        call rs_set_err;
+        xor rax, rax;
+        ret;
+      rs_gt_br:
+        mov rdi, 0xFFFFF09B;
+        call rs_set_err;
+        xor rax, rax;
+        ret;
+      rs_gt_bc:
+        mov rdi, 0xFFFFF09C;
+        call rs_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+}
