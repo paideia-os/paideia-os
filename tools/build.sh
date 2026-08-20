@@ -3753,6 +3753,44 @@ fi
 echo "[r38-m7-confine] R38.M7 (HE-MCS + rate control + roaming + rekey) confined"
 
 # ---------------------------------------------------------------------------
+# R39.M1 (#1323/#1324/#1325/#1326): Bluetooth HCI substrate over CNVi --
+# KIND_BT_ADAPTER (kind_bt_adapter), KIND_BT_HCI_CHANNEL
+# (kind_bt_hci_channel), HCI transport over CNVi (hci_cnvi), and the
+# bt_hci_channel schema (bt_hci_channel).
+#
+# Four modules open the R39 tree at the substrate layer; each owns its
+# own state; tools/build.sh confines relocations against each to its
+# owning object so a second writer cannot forge an ADAPTER row, drift a
+# channel row, restamp a TX/RX ring slot, or forge a session-schema
+# counter.
+KBA_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_bt_adapter.pdx"
+KBHC_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_bt_hci_channel.pdx"
+HCI_SRC="${REPO_ROOT}/src/kernel/core/drivers/bt/hci_cnvi.pdx"
+BHC_SRC="${REPO_ROOT}/src/kernel/core/ipc/bt_hci_channel.pdx"
+if [[ ! -f "${KBA_SRC}" || ! -f "${KBHC_SRC}" || ! -f "${HCI_SRC}" || ! -f "${BHC_SRC}" ]]; then
+    echo "[r39-m1-confine] FAIL - one of the R39.M1 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_bt_adapter_table'  'core/cap/kind_bt_adapter.o'
+ec_confine_one '_bt_adapter_stats'  'core/cap/kind_bt_adapter.o'
+ec_confine_one '_bt_hci_chan_table' 'core/cap/kind_bt_hci_channel.o'
+ec_confine_one '_bt_hci_chan_stats' 'core/cap/kind_bt_hci_channel.o'
+ec_confine_one '_hci_tx_ring'       'core/drivers/bt/hci_cnvi.o'
+ec_confine_one '_hci_rx_ring'       'core/drivers/bt/hci_cnvi.o'
+ec_confine_one '_hci_indices'       'core/drivers/bt/hci_cnvi.o'
+ec_confine_one '_hci_stats'         'core/drivers/bt/hci_cnvi.o'
+ec_confine_one '_hci_arbitrated'    'core/drivers/bt/hci_cnvi.o'
+ec_confine_one '_bhc_sessions'      'core/ipc/bt_hci_channel.o'
+ec_confine_one '_bhc_stats'         'core/ipc/bt_hci_channel.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_bt_adapter.pdx §2, kind_bt_hci_channel.pdx §3," >&2
+    echo "  hci_cnvi.pdx §3, and bt_hci_channel.pdx §2 for the" >&2
+    echo "  per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[r39-m1-confine] R39.M1 (BT adapter + HCI channel + CNVi transport + schema) confined"
+
+# ---------------------------------------------------------------------------
 # R39.M3 (#1332/#1333/#1334): Bluetooth GATT substrate --
 # KIND_BT_GATT_CONNECTION (kind_bt_gatt_connection), GATT server +
 # client + ATT PDU codec (gatt), bt_gatt_channel schema
