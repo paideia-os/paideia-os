@@ -1,0 +1,1092 @@
+// src/kernel/core/drivers/bt/att.pdx — R39.M3-001 (#1331)
+//
+// Bluetooth ATT — the Attribute Protocol (BT Core §3.3 / §3.4) that
+// carries every GATT request over L2CAP fixed CID 0x0004.  This module
+// owns the ATT PDU wire-level codec for the opcodes gatt.pdx does not
+// already handle (Error Response 0x01, Exchange MTU Req/Rsp 0x02/0x03,
+// Find Info Req/Rsp 0x04/0x05, Write Response 0x13), the current-MTU
+// bookkeeping (default 23, negotiated up to 517), and the server-side
+// dispatcher that reads an inbound PDU, delegates to gatt.pdx's
+// attribute database, and packs the matching response PDU.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// ATT (BT §3.3) sits atop L2CAP fixed CID 0x0004 and is the wire the
+// GATT layer above (drivers/bt/gatt.pdx, R39.M3-002) speaks.  The
+// division of labour between the two files is deliberate: gatt.pdx owns
+// the ATTRIBUTE DATABASE (handle -> type -> permissions -> value) plus
+// the ATT PDU codec for the four opcodes it needed during R39.M3-002
+// bring-up (Read Req 0x0A, Read Rsp 0x0B, Write Req 0x12, Notification
+// 0x1B, Indication 0x1D).  This module (R39.M3-001, filed after
+// gatt.pdx landed because the ATT protocol layer itself was missing)
+// closes the ATT opcode set with the pack/unpack helpers gatt.pdx did
+// not yet need, and adds the SERVER-SIDE DISPATCHER that reads an
+// inbound request opcode, hands the arguments to gatt.pdx, and packs
+// the matching response.
+//
+// It is NOT the L2CAP surface.  L2CAP CID 0x0004 registration and
+// per-frame RX dispatch live in drivers/bt/l2cap_fixed.pdx; this module
+// produces / consumes PDU BYTES the L2CAP layer carries.
+//
+// It is NOT the attribute database.  Rows live in drivers/bt/gatt.pdx.
+// This module holds NO attribute state -- only the current MTU and the
+// dispatch counters.  Every attribute-table read/write goes through
+// gatt.pdx so there is exactly ONE canonical database (gatt.pdx §0 is
+// firm on that).
+//
+// It IS NOT the security gate.  ATT §3.4.8 defines "insufficient
+// authentication" (error 0x05) and "insufficient encryption" (0x0F);
+// this milestone does not consult the connection's security_level.
+// A future milestone will thread security_level into att_server_dispatch
+// so a request that reaches an authenticated-required attribute over an
+// unencrypted connection maps to an INSUFF_AUTH Error Response instead
+// of running the read/write.  At R39.M3 all attributes are dispatched
+// under the same gate gatt.pdx enforces (the row's permission bitmask),
+// and the Error Response mapping only distinguishes NOT_FOUND from
+// NOT_PERM.
+//
+// =============================================================================
+// §1  ATT OPCODE SET (BT §3.4)
+// =============================================================================
+//
+//   ATT_OP_ERROR_RSP              0x01   Error Response
+//   ATT_OP_EXCH_MTU_REQ           0x02   Exchange MTU Request
+//   ATT_OP_EXCH_MTU_RSP           0x03   Exchange MTU Response
+//   ATT_OP_FIND_INFO_REQ          0x04   Find Information Request
+//   ATT_OP_FIND_INFO_RSP          0x05   Find Information Response
+//   ATT_OP_READ_REQ               0x0A   Read Request                (gatt.pdx)
+//   ATT_OP_READ_RSP               0x0B   Read Response               (gatt.pdx)
+//   ATT_OP_WRITE_REQ              0x12   Write Request               (gatt.pdx)
+//   ATT_OP_WRITE_RSP              0x13   Write Response
+//   ATT_OP_HANDLE_VALUE_NOTIFY    0x1B   Handle Value Notification   (gatt.pdx)
+//   ATT_OP_HANDLE_VALUE_INDICATE  0x1D   Handle Value Indication     (gatt.pdx)
+//
+// Little-endian on the wire (BT §3.3.2 is unambiguous).  The pack
+// helpers gatt.pdx exposes for the five opcodes above are the ONLY
+// packers for those opcodes in the tree; this module's dispatch path
+// calls them directly rather than duplicating the byte layout.
+//
+// =============================================================================
+// §2  ATT ERROR CODES (BT §3.4.1.1)
+// =============================================================================
+//
+//   ATT_ERR_INVALID_HANDLE     0x01
+//   ATT_ERR_READ_NOT_PERM      0x02
+//   ATT_ERR_WRITE_NOT_PERM     0x03
+//   ATT_ERR_INVALID_PDU        0x04
+//   ATT_ERR_INSUFF_AUTH        0x05     (not consulted at R39.M3 -- see §0)
+//   ATT_ERR_REQ_NOT_SUPP       0x06
+//   ATT_ERR_ATTR_NOT_FOUND     0x0A
+//
+// An Error Response carries the request opcode (so the peer can match
+// the failure to the request in flight), the handle that failed, and
+// the numeric error.
+//
+// =============================================================================
+// §3  MTU (BT §3.2.9 / §3.4.2)
+// =============================================================================
+//
+//   ATT_MTU_DEFAULT  = 23    (LE mandatory minimum -- always usable)
+//   ATT_MTU_MAX      = 517   (LE upper bound -- clamp for negotiation)
+//
+// Exchange MTU (op 0x02 / 0x03) negotiates upward.  The peer's Request
+// proposes an MTU; the local MTU is min(proposed, ATT_MTU_MAX); the
+// Response returns the local MTU; the effective MTU for the connection
+// is min(local_after_response, peer_proposed).  This module stores the
+// local half in _att_mtu and updates it under att_set_mtu.
+//
+// =============================================================================
+// §4  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _att_mtu, _att_stats, and _att_init are written only by helpers in
+// this module.  tools/build.sh confines relocations against each to
+// core/drivers/bt/att.o.
+//
+// =============================================================================
+// §5  FAILURE TAXONOMY 0xFFFFF0C0..0xFFFFF0CF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: bt_l2cap_channel schema
+// 0xFFFFF0D0..DF; adjacent free band below: unassigned 0xFFFFF0B0..BF).
+
+module Att = structure {
+
+  // §1: opcodes.
+  pub let ATT_OP_ERROR_RSP             : u64 = 0x01
+  pub let ATT_OP_EXCH_MTU_REQ          : u64 = 0x02
+  pub let ATT_OP_EXCH_MTU_RSP          : u64 = 0x03
+  pub let ATT_OP_FIND_INFO_REQ         : u64 = 0x04
+  pub let ATT_OP_FIND_INFO_RSP         : u64 = 0x05
+  pub let ATT_OP_READ_REQ              : u64 = 0x0A
+  pub let ATT_OP_READ_RSP              : u64 = 0x0B
+  pub let ATT_OP_WRITE_REQ             : u64 = 0x12
+  pub let ATT_OP_WRITE_RSP             : u64 = 0x13
+  pub let ATT_OP_HANDLE_VALUE_NOTIFY   : u64 = 0x1B
+  pub let ATT_OP_HANDLE_VALUE_INDICATE : u64 = 0x1D
+
+  // §2: error codes.
+  pub let ATT_ERR_INVALID_HANDLE : u64 = 0x01
+  pub let ATT_ERR_READ_NOT_PERM  : u64 = 0x02
+  pub let ATT_ERR_WRITE_NOT_PERM : u64 = 0x03
+  pub let ATT_ERR_INVALID_PDU    : u64 = 0x04
+  pub let ATT_ERR_INSUFF_AUTH    : u64 = 0x05
+  pub let ATT_ERR_REQ_NOT_SUPP   : u64 = 0x06
+  pub let ATT_ERR_ATTR_NOT_FOUND : u64 = 0x0A
+
+  // §3: MTU bounds.
+  pub let ATT_MTU_DEFAULT : u64 = 23
+  pub let ATT_MTU_MAX     : u64 = 517
+
+  // Find-Information Response format byte (BT §3.4.3.2).
+  //   0x01 => list of (handle, 16-bit UUID) tuples.
+  //   0x02 => list of (handle, 128-bit UUID) tuples (not supported at R39.M3).
+  pub let ATT_FIND_INFO_FMT_16 : u64 = 0x01
+
+  // §5: failure taxonomy 0xFFFFF0C0..0xFFFFF0CF.
+  pub let ATT_OK              : u64 = 0
+  pub let ATT_BAD_ARG         : u64 = 0xFFFFF0CF
+  pub let ATT_BAD_OPCODE      : u64 = 0xFFFFF0CE
+  pub let ATT_BAD_HANDLE      : u64 = 0xFFFFF0CD
+  pub let ATT_BAD_MTU         : u64 = 0xFFFFF0CC
+  pub let ATT_NOT_INIT        : u64 = 0xFFFFF0CB
+  pub let ATT_UNKNOWN_OP      : u64 = 0xFFFFF0CA
+  pub let ATT_PERM_DENIED     : u64 = 0xFFFFF0C9
+  pub let ATT_ATTR_NOT_FOUND  : u64 = 0xFFFFF0C8
+  pub let ATT_PACK_FAIL       : u64 = 0xFFFFF0C7
+  pub let ATT_BAD_UUID        : u64 = 0xFFFFF0C6
+  pub let ATT_ALREADY_INIT    : u64 = 0xFFFFF0C5
+  pub let ATT_UNUSED_A        : u64 = 0xFFFFF0C4
+  pub let ATT_UNUSED_B        : u64 = 0xFFFFF0C3
+  pub let ATT_UNUSED_C        : u64 = 0xFFFFF0C2
+  pub let ATT_UNUSED_D        : u64 = 0xFFFFF0C1
+  pub let ATT_UNUSED_E        : u64 = 0xFFFFF0C0
+
+  // On-wire sentinel a pack helper returns when its arguments would not
+  // fit the PDU shape.  Disjoint from every legal PDU (opcode 0xFF is
+  // reserved by BT §3.4).
+  pub let ATT_PACK_SENTINEL : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // §4: state cells.  Confined to core/drivers/bt/att.o by tools/build.sh.
+  pub let mut _att_mtu   : u64      = 0
+  pub let mut _att_stats : [u64; 8] = uninit @align(64)
+  pub let mut _att_init  : u64      = 0
+
+  // Counter ordinals inside _att_stats.
+  pub let ATT_ST_REQS         : u64 = 0
+  pub let ATT_ST_RSPS         : u64 = 1
+  pub let ATT_ST_ERRS         : u64 = 2
+  pub let ATT_ST_NOTIFIES     : u64 = 3
+  pub let ATT_ST_INDICATES    : u64 = 4
+  pub let ATT_ST_MTU_UPDATES  : u64 = 5
+  pub let ATT_ST_REFUSED      : u64 = 6
+  pub let ATT_ST_UNKNOWN_OPS  : u64 = 7
+
+  // ==========================================================================
+  // att_init -- reset MTU to the default and clear counters.  MUST run
+  // before any dispatch op; a dispatch against an uninitialised MTU is
+  // refused with ATT_NOT_INIT.
+  // ==========================================================================
+
+  pub let att_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M3-001 (#1331): reset MTU to 23 (BT §3.4.2 mandatory minimum), clear counters, set init flag. Labels prefixed att_i_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _att_stats];
+        xor rcx, rcx;
+      att_i_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  att_i_stats;
+
+        lea r10, [rip + _att_mtu];
+        mov rax, 23;
+        mov [r10], rax;
+
+        lea r10, [rip + _att_init];
+        mov rax, 1;
+        mov [r10], rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Counters.
+  // ==========================================================================
+
+  pub let att_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M3-001 (#1331): counter bump. Labels prefixed att_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae att_nt_out;
+        lea r10, [rip + _att_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      att_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let att_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M3-001 (#1331): counter read. Labels prefixed att_stt_.",
+      block: {
+        cmp rdi, 8;
+        jae att_stt_zero;
+        lea r10, [rip + _att_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      att_stt_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // att_opcode(pdu) -- extract the opcode byte (bits [7:0]) from any
+  // PDU.  Never fails; a subscriber that receives a PDU with an
+  // opcode byte outside the ATT set (any of the reserved / bearer-
+  // signalling opcodes) still gets a defined answer, which
+  // att_server_dispatch converts to an Error Response.
+  // ==========================================================================
+
+  pub let att_opcode : (u64) -> u64 !{} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): opcode byte extractor. Labels prefixed att_op_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // att_mtu -- current negotiated MTU.
+  // ==========================================================================
+
+  pub let att_mtu : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M3-001 (#1331): current MTU cell read. Labels prefixed att_m_.",
+      block: {
+        lea r10, [rip + _att_mtu];
+        mov rax, [r10];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // att_set_mtu(proposed) -> negotiated | ATT_BAD_MTU | ATT_NOT_INIT
+  //
+  // Negotiates the LOCAL half of the ATT MTU per BT §3.4.2.
+  // Refuses if proposed < 23 (below LE mandatory minimum).
+  // Clamps to ATT_MTU_MAX.  Bumps ATT_ST_MTU_UPDATES.
+  //
+  // THE ONE WRITER of _att_mtu after att_init.
+  // ==========================================================================
+
+  pub let att_set_mtu : (u64) -> u64 !{mem} @{} =
+    fn (proposed: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M3-001 (#1331): negotiate MTU. Refuses < 23 (BT §3.4.2). Clamps to 517 (BT §3.2.9 upper bound). Labels prefixed att_sm_.",
+      block: {
+        lea r10, [rip + _att_init];
+        mov rax, [r10];
+        cmp rax, 0;
+        je  att_sm_notinit;
+
+        cmp rdi, 23;
+        jb  att_sm_bad;
+
+        mov rax, rdi;
+        mov r10, 517;
+        cmp rax, r10;
+        jbe att_sm_store;
+        mov rax, r10;
+      att_sm_store:
+        lea r10, [rip + _att_mtu];
+        mov [r10], rax;
+
+        push rax;
+        mov rdi, 5;                     // ATT_ST_MTU_UPDATES
+        call att_note;
+        pop rax;
+        ret;
+
+      att_sm_notinit:
+        mov rax, 0xFFFFF0CB;            // ATT_NOT_INIT
+        ret;
+      att_sm_bad:
+        mov rax, 0xFFFFF0CC;            // ATT_BAD_MTU
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Error Response codec (BT §3.4.1.1).
+  //
+  //   pack_error_rsp(req_op, handle, err_code) -> u64
+  //     [7:0]    opcode = 0x01
+  //     [15:8]   req_op   (opcode of the request that failed)
+  //     [31:16]  handle   (attribute handle that failed, or 0)
+  //     [39:32]  err_code (BT §3.4.1.1)
+  //     [63:40]  zero
+  //
+  // Unpackers refuse ATT_BAD_OPCODE if the payload's opcode byte is not
+  // 0x01.
+  // ==========================================================================
+
+  pub let att_pack_error_rsp : (u64, u64, u64) -> u64 !{} @{} =
+    fn (req_op: u64) (handle: u64) (err_code: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): pack Error Response. Refuses ATT_PACK_SENTINEL if req_op or err_code do not fit a byte. handle 0 is legal (some errors have no handle). Labels prefixed att_per_.",
+      block: {
+        mov r10, 0xFF;
+        cmp rdi, r10;
+        ja  att_per_bad;
+        cmp rdx, r10;
+        ja  att_per_bad;
+        mov r10, 0xFFFF;
+        cmp rsi, r10;
+        ja  att_per_bad;
+
+        mov rax, 0x01;
+        mov r10, rdi;
+        and r10, 0xFF;
+        shl r10, 8;
+        or  rax, r10;
+        mov r10, rsi;
+        and r10, 0xFFFF;
+        shl r10, 16;
+        or  rax, r10;
+        mov r10, rdx;
+        and r10, 0xFF;
+        shl r10, 32;
+        or  rax, r10;
+        ret;
+      att_per_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let att_unpack_error_op : (u64) -> u64 !{} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): unpack Error Response req_op field. Refuses ATT_BAD_OPCODE if opcode byte != 0x01. Labels prefixed att_ueo_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFF;
+        cmp rax, 0x01;
+        jne att_ueo_bad;
+        mov rax, rdi;
+        shr rax, 8;
+        and rax, 0xFF;
+        ret;
+      att_ueo_bad:
+        mov rax, 0xFFFFF0CE;
+        ret
+      }
+    } @no_frame
+
+  pub let att_unpack_error_handle : (u64) -> u64 !{} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): unpack Error Response handle field. Labels prefixed att_ueh_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFF;
+        cmp rax, 0x01;
+        jne att_ueh_bad;
+        mov rax, rdi;
+        shr rax, 16;
+        and rax, 0xFFFF;
+        ret;
+      att_ueh_bad:
+        mov rax, 0xFFFFF0CE;
+        ret
+      }
+    } @no_frame
+
+  pub let att_unpack_error_code : (u64) -> u64 !{} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): unpack Error Response err_code field. Labels prefixed att_uec_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFF;
+        cmp rax, 0x01;
+        jne att_uec_bad;
+        mov rax, rdi;
+        shr rax, 32;
+        and rax, 0xFF;
+        ret;
+      att_uec_bad:
+        mov rax, 0xFFFFF0CE;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Exchange MTU (BT §3.4.2).
+  //
+  //   pack_exch_mtu_req(client_rx_mtu) -> u64
+  //     [7:0]   opcode = 0x02
+  //     [23:8]  client_rx_mtu (u16)
+  //
+  //   pack_exch_mtu_rsp(server_rx_mtu) -> u64
+  //     [7:0]   opcode = 0x03
+  //     [23:8]  server_rx_mtu (u16)
+  //
+  // Unpackers refuse ATT_BAD_OPCODE on opcode mismatch.
+  // ==========================================================================
+
+  pub let att_pack_exch_mtu_req : (u64) -> u64 !{} @{} =
+    fn (mtu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): pack Exchange MTU Request. Refuses ATT_PACK_SENTINEL if mtu does not fit u16. Labels prefixed att_pmq_.",
+      block: {
+        mov r10, 0xFFFF;
+        cmp rdi, r10;
+        ja  att_pmq_bad;
+        mov rax, 0x02;
+        mov r10, rdi;
+        and r10, 0xFFFF;
+        shl r10, 8;
+        or  rax, r10;
+        ret;
+      att_pmq_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let att_pack_exch_mtu_rsp : (u64) -> u64 !{} @{} =
+    fn (mtu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): pack Exchange MTU Response. Refuses ATT_PACK_SENTINEL if mtu does not fit u16. Labels prefixed att_pms_.",
+      block: {
+        mov r10, 0xFFFF;
+        cmp rdi, r10;
+        ja  att_pms_bad;
+        mov rax, 0x03;
+        mov r10, rdi;
+        and r10, 0xFFFF;
+        shl r10, 8;
+        or  rax, r10;
+        ret;
+      att_pms_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let att_unpack_exch_mtu_req : (u64) -> u64 !{} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): unpack Exchange MTU Request. Refuses ATT_BAD_OPCODE if opcode byte != 0x02. Labels prefixed att_umq_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFF;
+        cmp rax, 0x02;
+        jne att_umq_bad;
+        mov rax, rdi;
+        shr rax, 8;
+        and rax, 0xFFFF;
+        ret;
+      att_umq_bad:
+        mov rax, 0xFFFFF0CE;
+        ret
+      }
+    } @no_frame
+
+  pub let att_unpack_exch_mtu_rsp : (u64) -> u64 !{} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): unpack Exchange MTU Response. Refuses ATT_BAD_OPCODE if opcode byte != 0x03. Labels prefixed att_ums_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFF;
+        cmp rax, 0x03;
+        jne att_ums_bad;
+        mov rax, rdi;
+        shr rax, 8;
+        and rax, 0xFFFF;
+        ret;
+      att_ums_bad:
+        mov rax, 0xFFFFF0CE;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Find Information (BT §3.4.3.1 / §3.4.3.2).
+  //
+  //   pack_find_info_req(start_h, end_h) -> u64
+  //     [7:0]    opcode = 0x04
+  //     [23:8]   start_handle (u16)
+  //     [39:24]  end_handle   (u16)
+  //
+  //   pack_find_info_rsp_16(handle, uuid16) -> u64
+  //     [7:0]    opcode = 0x05
+  //     [15:8]   format = 0x01
+  //     [31:16]  handle (u16)
+  //     [47:32]  uuid16 (u16)
+  //
+  // Only the 16-bit-UUID format is supported at R39.M3 (see §0); a
+  // 128-bit-UUID Find Info Response would overflow the u64 return
+  // vehicle.  Unpackers refuse ATT_BAD_OPCODE on opcode mismatch.
+  // ==========================================================================
+
+  pub let att_pack_find_info_req : (u64, u64) -> u64 !{} @{} =
+    fn (start_h: u64) (end_h: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): pack Find Information Request. Refuses ATT_PACK_SENTINEL if handles are 0 or don't fit u16 or if start>end. Labels prefixed att_pfq_.",
+      block: {
+        mov r10, 0xFFFF;
+        cmp rdi, r10;
+        ja  att_pfq_bad;
+        cmp rsi, r10;
+        ja  att_pfq_bad;
+        cmp rdi, 0;
+        je  att_pfq_bad;
+        cmp rsi, 0;
+        je  att_pfq_bad;
+        cmp rdi, rsi;
+        ja  att_pfq_bad;
+
+        mov rax, 0x04;
+        mov r10, rdi;
+        and r10, 0xFFFF;
+        shl r10, 8;
+        or  rax, r10;
+        mov r10, rsi;
+        and r10, 0xFFFF;
+        shl r10, 24;
+        or  rax, r10;
+        ret;
+      att_pfq_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let att_unpack_find_info_start : (u64) -> u64 !{} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): unpack Find Info Req start_handle. Labels prefixed att_ufs_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFF;
+        cmp rax, 0x04;
+        jne att_ufs_bad;
+        mov rax, rdi;
+        shr rax, 8;
+        and rax, 0xFFFF;
+        ret;
+      att_ufs_bad:
+        mov rax, 0xFFFFF0CE;
+        ret
+      }
+    } @no_frame
+
+  pub let att_unpack_find_info_end : (u64) -> u64 !{} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): unpack Find Info Req end_handle. Labels prefixed att_ufe_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFF;
+        cmp rax, 0x04;
+        jne att_ufe_bad;
+        mov rax, rdi;
+        shr rax, 24;
+        and rax, 0xFFFF;
+        ret;
+      att_ufe_bad:
+        mov rax, 0xFFFFF0CE;
+        ret
+      }
+    } @no_frame
+
+  pub let att_pack_find_info_rsp_16 : (u64, u64) -> u64 !{} @{} =
+    fn (handle: u64) (uuid16: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): pack Find Info Response (format 0x01, 16-bit UUID). Refuses ATT_PACK_SENTINEL if handle is 0 or handle/uuid don't fit u16. Labels prefixed att_pfr_.",
+      block: {
+        mov r10, 0xFFFF;
+        cmp rdi, r10;
+        ja  att_pfr_bad;
+        cmp rsi, r10;
+        ja  att_pfr_bad;
+        cmp rdi, 0;
+        je  att_pfr_bad;
+
+        mov rax, 0x05;
+        mov r10, 0x01;
+        shl r10, 8;
+        or  rax, r10;
+        mov r10, rdi;
+        and r10, 0xFFFF;
+        shl r10, 16;
+        or  rax, r10;
+        mov r10, rsi;
+        and r10, 0xFFFF;
+        shl r10, 32;
+        or  rax, r10;
+        ret;
+      att_pfr_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  pub let att_unpack_find_info_rsp_format : (u64) -> u64 !{} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): unpack Find Info Response format byte. Labels prefixed att_ufrf_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFF;
+        cmp rax, 0x05;
+        jne att_ufrf_bad;
+        mov rax, rdi;
+        shr rax, 8;
+        and rax, 0xFF;
+        ret;
+      att_ufrf_bad:
+        mov rax, 0xFFFFF0CE;
+        ret
+      }
+    } @no_frame
+
+  pub let att_unpack_find_info_rsp_handle : (u64) -> u64 !{} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): unpack Find Info Response handle. Labels prefixed att_ufrh_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFF;
+        cmp rax, 0x05;
+        jne att_ufrh_bad;
+        mov rax, rdi;
+        shr rax, 16;
+        and rax, 0xFFFF;
+        ret;
+      att_ufrh_bad:
+        mov rax, 0xFFFFF0CE;
+        ret
+      }
+    } @no_frame
+
+  pub let att_unpack_find_info_rsp_uuid : (u64) -> u64 !{} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): unpack Find Info Response uuid16. Labels prefixed att_ufru_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFF;
+        cmp rax, 0x05;
+        jne att_ufru_bad;
+        mov rax, rdi;
+        shr rax, 32;
+        and rax, 0xFFFF;
+        ret;
+      att_ufru_bad:
+        mov rax, 0xFFFFF0CE;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Write Response (BT §3.4.5.2).  The Write Response carries no
+  // payload; it is exactly the opcode byte 0x13.  The unpacker's job
+  // is to assert the opcode.
+  // ==========================================================================
+
+  pub let att_pack_write_rsp : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): pack Write Response (opcode 0x13, no payload). Labels prefixed att_pwr_.",
+      block: {
+        mov rax, 0x13;
+        ret
+      }
+    } @no_frame
+
+  pub let att_unpack_write_rsp : (u64) -> u64 !{} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): validate Write Response. Refuses ATT_BAD_OPCODE if opcode byte != 0x13. Labels prefixed att_uwr_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFF;
+        cmp rax, 0x13;
+        jne att_uwr_bad;
+        xor rax, rax;
+        ret;
+      att_uwr_bad:
+        mov rax, 0xFFFFF0CE;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Server-side notification / indication wrappers.  Delegate the pack
+  // to gatt.pdx (the shape is identical) but bump ATT counters so the
+  // dispatch surface's tally reflects every server-emitted PDU.
+  // ==========================================================================
+
+  pub let att_notify : (u64, u64) -> u64 !{mem} @{} =
+    fn (handle: u64) (value_lo: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M3-001 (#1331): pack Handle Value Notification via gatt_pack_notify; bump ATT_ST_NOTIFIES. Labels prefixed att_no_.",
+      block: {
+        push r12;
+        call gatt_pack_notify;
+        mov r12, rax;
+        mov rdi, 3;                     // ATT_ST_NOTIFIES
+        call att_note;
+        mov rax, r12;
+        pop r12;
+        ret
+      }
+    }
+
+  pub let att_indicate : (u64, u64) -> u64 !{mem} @{} =
+    fn (handle: u64) (value_lo: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M3-001 (#1331): pack Handle Value Indication via gatt_pack_indicate; bump ATT_ST_INDICATES. Labels prefixed att_in_.",
+      block: {
+        push r12;
+        call gatt_pack_indicate;
+        mov r12, rax;
+        mov rdi, 4;                     // ATT_ST_INDICATES
+        call att_note;
+        mov rax, r12;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // att_server_dispatch(pdu) -> response_pdu
+  //
+  // Reads the opcode byte and executes the matching server-side path
+  // against gatt.pdx's attribute database, returning the response PDU
+  // ready for the L2CAP layer to carry.  Never returns a raw failure
+  // code: every refuse maps to a well-formed Error Response so the
+  // peer can match failure to request.
+  //
+  // Supported request opcodes:
+  //   0x02 EXCH_MTU_REQ  ->  negotiate MTU, return EXCH_MTU_RSP with the
+  //                          post-negotiation local MTU.
+  //   0x0A READ_REQ      ->  read the attribute; on success return
+  //                          READ_RSP with the value; on missing handle
+  //                          return Error(INVALID_HANDLE); on missing
+  //                          read permission return Error(READ_NOT_PERM).
+  //   0x12 WRITE_REQ     ->  write the attribute; on success return
+  //                          WRITE_RSP (opcode 0x13); on missing handle
+  //                          return Error(INVALID_HANDLE); on missing
+  //                          write permission return Error(WRITE_NOT_PERM).
+  //   any other          ->  Error(REQ_NOT_SUPP) with the original opcode.
+  //
+  // Bumps ATT_ST_REQS unconditionally, plus one of ATT_ST_RSPS /
+  // ATT_ST_ERRS / ATT_ST_UNKNOWN_OPS / ATT_ST_MTU_UPDATES on the
+  // outcome side.
+  //
+  // Runs against gatt.pdx's live database and MUST be called only after
+  // both att_init and gatt_reset have run at boot; a dispatch before
+  // att_init returns an Error Response with err_code 0 and req_op 0.
+  // ==========================================================================
+
+  pub let att_server_dispatch : (u64) -> u64 !{mem} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M3-001 (#1331): opcode-directed server dispatch. Delegates read to gatt_find_by_handle + gatt_attr_perm + gatt_attr_value; delegates write to gatt_find_by_handle + gatt_attr_perm + gatt_write; maps every refuse to a well-formed Error Response. Labels prefixed att_sd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                    // save PDU
+
+        lea r10, [rip + _att_init];
+        mov rax, [r10];
+        cmp rax, 0;
+        je  att_sd_notinit;
+
+        mov rdi, 0;                      // ATT_ST_REQS
+        call att_note;
+
+        // Opcode dispatch.
+        mov rax, r12;
+        and rax, 0xFF;
+        cmp rax, 0x02;
+        je  att_sd_do_mtu;
+        cmp rax, 0x0A;
+        je  att_sd_do_read;
+        cmp rax, 0x12;
+        je  att_sd_do_write;
+        jmp att_sd_unknown;
+
+      // ---- Exchange MTU Request -------------------------------------------
+      att_sd_do_mtu:
+        mov rdi, r12;
+        call att_unpack_exch_mtu_req;
+        mov r10, 0xFFFFF0CE;
+        cmp rax, r10;
+        je  att_sd_invalid_pdu;
+        // Clamp proposed to [23, 517].
+        cmp rax, 23;
+        jae att_sd_mtu_set;
+        mov rax, 23;                     // floor at LE minimum
+      att_sd_mtu_set:
+        mov rdi, rax;
+        call att_set_mtu;
+        // att_set_mtu returns negotiated local MTU (>= 23) on success.
+        mov rdi, rax;
+        call att_pack_exch_mtu_rsp;
+        mov r13, rax;
+        mov rdi, 1;                      // ATT_ST_RSPS
+        call att_note;
+        mov rax, r13;
+        jmp att_sd_out;
+
+      // ---- Read Request ---------------------------------------------------
+      att_sd_do_read:
+        mov rdi, r12;
+        call att_unpack_read_req_local;
+        mov r13, rax;                    // handle
+        mov r10, 0xFFFFF0CE;
+        cmp rax, r10;
+        je  att_sd_invalid_pdu;
+
+        mov rdi, r13;
+        call gatt_find_by_handle;
+        cmp rax, 0xFF;
+        je  att_sd_read_nofound;
+        mov r14, rax;                    // row_id
+
+        mov rdi, r14;
+        call gatt_attr_perm;
+        mov r10, 0x01;                   // GATT_PERM_READ
+        and rax, r10;
+        cmp rax, 0;
+        je  att_sd_read_denied;
+
+        mov rdi, r14;
+        call gatt_attr_value;
+        mov r15, rax;                    // value
+
+        mov rdi, r15;
+        call gatt_pack_read_rsp;
+        mov r13, rax;
+        mov rdi, 1;                      // ATT_ST_RSPS
+        call att_note;
+        mov rax, r13;
+        jmp att_sd_out;
+
+      att_sd_read_nofound:
+        // Error(req_op=0x0A, handle=r13, err=INVALID_HANDLE)
+        mov rdi, 0x0A;
+        mov rsi, r13;
+        mov rdx, 0x01;                   // ATT_ERR_INVALID_HANDLE
+        call att_pack_error_rsp;
+        mov r13, rax;
+        mov rdi, 2;                      // ATT_ST_ERRS
+        call att_note;
+        mov rax, r13;
+        jmp att_sd_out;
+
+      att_sd_read_denied:
+        mov rdi, 0x0A;
+        mov rsi, r13;
+        mov rdx, 0x02;                   // ATT_ERR_READ_NOT_PERM
+        call att_pack_error_rsp;
+        mov r13, rax;
+        mov rdi, 2;
+        call att_note;
+        mov rax, r13;
+        jmp att_sd_out;
+
+      // ---- Write Request --------------------------------------------------
+      att_sd_do_write:
+        mov rdi, r12;
+        call att_unpack_write_handle_local;
+        mov r13, rax;                    // handle
+        mov r10, 0xFFFFF0CE;
+        cmp rax, r10;
+        je  att_sd_invalid_pdu;
+
+        mov rdi, r12;
+        call att_unpack_write_value_local;
+        mov r14, rax;                    // value_lo
+
+        mov rdi, r13;
+        call gatt_find_by_handle;
+        cmp rax, 0xFF;
+        je  att_sd_write_nofound;
+        mov r15, rax;                    // row_id
+
+        mov rdi, r15;
+        call gatt_attr_perm;
+        mov r10, 0x02;                   // GATT_PERM_WRITE
+        and rax, r10;
+        cmp rax, 0;
+        je  att_sd_write_denied;
+
+        // Perform the write.  gatt_write re-checks perms; both checks
+        // agree by construction (we just verified WRITE on the same
+        // row), so we ignore its return and pack Write Rsp on success.
+        mov rdi, r13;
+        mov rsi, r14;
+        call gatt_write;
+
+        call att_pack_write_rsp;
+        mov r13, rax;
+        mov rdi, 1;
+        call att_note;
+        mov rax, r13;
+        jmp att_sd_out;
+
+      att_sd_write_nofound:
+        mov rdi, 0x12;
+        mov rsi, r13;
+        mov rdx, 0x01;                   // ATT_ERR_INVALID_HANDLE
+        call att_pack_error_rsp;
+        mov r13, rax;
+        mov rdi, 2;
+        call att_note;
+        mov rax, r13;
+        jmp att_sd_out;
+
+      att_sd_write_denied:
+        mov rdi, 0x12;
+        mov rsi, r13;
+        mov rdx, 0x03;                   // ATT_ERR_WRITE_NOT_PERM
+        call att_pack_error_rsp;
+        mov r13, rax;
+        mov rdi, 2;
+        call att_note;
+        mov rax, r13;
+        jmp att_sd_out;
+
+      // ---- Unknown / unsupported opcode -----------------------------------
+      att_sd_unknown:
+        mov rdi, 7;                      // ATT_ST_UNKNOWN_OPS
+        call att_note;
+        // Error(req_op=original, handle=0, err=REQ_NOT_SUPP)
+        mov rax, r12;
+        and rax, 0xFF;
+        mov rdi, rax;
+        mov rsi, 0;
+        mov rdx, 0x06;                   // ATT_ERR_REQ_NOT_SUPP
+        call att_pack_error_rsp;
+        mov r13, rax;
+        mov rdi, 2;
+        call att_note;
+        mov rax, r13;
+        jmp att_sd_out;
+
+      // ---- Malformed request PDU (unpack refused it) ----------------------
+      att_sd_invalid_pdu:
+        mov rax, r12;
+        and rax, 0xFF;
+        mov rdi, rax;
+        mov rsi, 0;
+        mov rdx, 0x04;                   // ATT_ERR_INVALID_PDU
+        call att_pack_error_rsp;
+        mov r13, rax;
+        mov rdi, 6;                      // ATT_ST_REFUSED
+        call att_note;
+        mov rax, r13;
+        jmp att_sd_out;
+
+      // ---- Uninitialised ---------------------------------------------------
+      att_sd_notinit:
+        mov rdi, 0;
+        mov rsi, 0;
+        mov rdx, 0;
+        call att_pack_error_rsp;
+        mov r13, rax;
+        mov rdi, 6;
+        call att_note;
+        mov rax, r13;
+
+      att_sd_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Local shims around the gatt.pdx unpackers.  They exist so the
+  // dispatch call graph is expressible without gatt.pdx re-imports at
+  // the top of this file; each is a bare tail-call and adds no logic.
+  // ==========================================================================
+
+  pub let att_unpack_read_req_local : (u64) -> u64 !{} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): shim for gatt_unpack_read_req; matches the ATT_BAD_OPCODE convention (gatt returns the same 0xFFFFF31B on mismatch, which we do NOT rewrite -- dispatch checks against 0xFFFFF0CE only for pack sentinels; the read-req unpack failure path in dispatch checks against gatt's own sentinel via gatt_unpack_read_req directly). Labels prefixed att_urrl_.",
+      block: {
+        call gatt_unpack_read_req;
+        // Rewrite gatt's ATT_BAD_OPCODE sentinel to the ATT one so the
+        // dispatch code can compare against a single value.
+        mov r11, 0xFFFFF31B;
+        cmp rax, r11;
+        jne att_urrl_out;
+        mov rax, 0xFFFFF0CE;
+      att_urrl_out:
+        ret
+      }
+    }
+
+  pub let att_unpack_write_handle_local : (u64) -> u64 !{} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): shim for gatt_unpack_write_handle with the same sentinel rewrite. Labels prefixed att_uwhl_.",
+      block: {
+        call gatt_unpack_write_handle;
+        mov r11, 0xFFFFF31B;
+        cmp rax, r11;
+        jne att_uwhl_out;
+        mov rax, 0xFFFFF0CE;
+      att_uwhl_out:
+        ret
+      }
+    }
+
+  pub let att_unpack_write_value_local : (u64) -> u64 !{} @{} =
+    fn (pdu: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R39.M3-001 (#1331): shim for gatt_unpack_write_value with the same sentinel rewrite. Labels prefixed att_uwvl_.",
+      block: {
+        call gatt_unpack_write_value;
+        mov r11, 0xFFFFF31B;
+        cmp rax, r11;
+        jne att_uwvl_out;
+        mov rax, 0xFFFFF0CE;
+      att_uwvl_out:
+        ret
+      }
+    }
+}

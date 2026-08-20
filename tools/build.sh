@@ -3829,6 +3829,30 @@ fi
 echo "[r39-m2-confine] R39.M2 (BT L2CAP channel + fixed + dynamic + schema) confined"
 
 # ---------------------------------------------------------------------------
+# R39.M3-001 (#1331): Bluetooth ATT (Attribute Protocol) codec + server
+# dispatcher over the R39.M3-002 gatt.pdx attribute database.
+#
+# One module lands the ATT wire layer BETWEEN R39.M2 (L2CAP) and
+# R39.M3-002 (GATT).  It owns the current MTU cell and the dispatch
+# counters; tools/build.sh confines relocations against each to its
+# owning object so a second writer cannot silently retune the MTU under
+# a live connection or forge the dispatch counter tally.
+ATT_SRC="${REPO_ROOT}/src/kernel/core/drivers/bt/att.pdx"
+if [[ ! -f "${ATT_SRC}" ]]; then
+    echo "[r39-m3-001-confine] FAIL - att.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_att_mtu'   'core/drivers/bt/att.o'
+ec_confine_one '_att_stats' 'core/drivers/bt/att.o'
+ec_confine_one '_att_init'  'core/drivers/bt/att.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See att.pdx §4 for the MTU / counters / init-flag" >&2
+    echo "  one-writer discipline." >&2
+    exit 1
+fi
+echo "[r39-m3-001-confine] R39.M3-001 (BT ATT codec + server dispatch) confined"
+
+# ---------------------------------------------------------------------------
 # R39.M3 (#1332/#1333/#1334): Bluetooth GATT substrate --
 # KIND_BT_GATT_CONNECTION (kind_bt_gatt_connection), GATT server +
 # client + ATT PDU codec (gatt), bt_gatt_channel schema
