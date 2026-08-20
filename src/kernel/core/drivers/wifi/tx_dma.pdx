@@ -1,0 +1,511 @@
+// src/kernel/core/drivers/wifi/tx_dma.pdx — R38.M2-002 (#1295)
+//
+// Intel AX211 TX-side DMA path.  Composes the two other R38.M2
+// halves into ONE ENQUEUE ENTRY POINT:
+//
+//   caller -> wtxd_enqueue(buf_pa, buf_len, flags)
+//     -> dma_domain.wdd_check(buf_pa, buf_len)   [D1.b refuse-gate]
+//     -> ctxt_info.wctx_index_get(TX_HEAD/TAIL)  [head/tail read]
+//     -> ctxt_info.wctx_tx_is_full(head, tail)   [ring capacity]
+//     -> ctxt_info.wctx_tx_slot_write            [stamp TFD]
+//     -> ctxt_info.wctx_index_set(TX_HEAD, ...)  [bump head]
+//     -> wtxd_doorbell_write(head)               [HBUS_TARG_WRPTR]
+//
+// Every refuse-gate returns its own error code so a caller can tell
+// "the domain refused" from "the ring was full" from "the buffer PA
+// was zero" without decoding a shared sentinel.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the ENQUEUE + DOORBELL half of R38.M2.  ctxt_info owns the
+// TX ring storage and the head/tail counters; dma_domain owns the
+// buffer-inside-window refuse-gate; this module owns the composition
+// of the two into a single call the wifi stack can invoke.
+//
+// IT DOES NOT INITIATE REAL DMA.  A live AX211 driver rings the
+// HBUS_TARG_WRPTR CSR (offset 0x460) which the on-chip DMA engine
+// polls; when it sees a new TFD it fetches the bytes and delivers a
+// completion via the RX-status ring.  This scaffold models the
+// doorbell as a single u64 seam whose value is the last written
+// pointer; a live driver replaces wtxd_doorbell_write with an MMIO
+// store to the CSR without changing the enqueue signature.
+//
+// IT DOES NOT WAIT FOR COMPLETION.  Completion is a separate seam
+// (wtxd_completion_note) the RX-side handler will drive at R38.M3.
+// This milestone tracks in-flight slots via a 256-bit bitmap so the
+// completion path has a place to clear a bit and the enqueue path
+// has a place to consult "is this slot already outstanding".
+//
+// wtxd_arbitrated() returns 0 until R38.M3 wires this against a live
+// HBUS_TARG_WRPTR store and a real RX completion interrupt.
+//
+// =============================================================================
+// §1  IN-FLIGHT BITMAP
+// =============================================================================
+//
+// _wtxd_inflight is a 256-bit bitmap (4 * u64) with bit N tracking
+// slot N.  wtxd_enqueue sets the bit before writing the doorbell;
+// wtxd_completion_note clears it.  The bitmap is checked ONLY as an
+// invariant: a caller that submits into an already-in-flight slot
+// (bit already set) is a caller whose head/tail bookkeeping is
+// broken.  The check refuses with WTXD_SLOT_BUSY rather than
+// silently overwriting the outstanding descriptor.
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _wtxd_doorbell, _wtxd_inflight and _wtxd_stats are written only by
+// helpers in this module.  tools/build.sh confines relocations
+// against each symbol to `core/drivers/wifi/tx_dma.o` so a second
+// writer cannot forge a doorbell ring or an in-flight completion.
+//
+// =============================================================================
+// §3  ERROR CODES 0xFFFFF490..0xFFFFF49F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every
+// other kind/driver band (adjacent used band above: ctxt_info
+// 0xFFFFF4A0..AF, R38.M2-001; adjacent free band below: dma_domain
+// 0xFFFFF480..8F, R38.M2-005).
+
+module TxDma = structure {
+
+  // §0: doorbell CSR offset a live driver would write (documented,
+  // not consulted here -- the scaffold writes into _wtxd_doorbell).
+  pub let WTXD_HBUS_TARG_WRPTR : u64 = 0x00000460
+
+  // §1: bitmap geometry.
+  pub let WTXD_INFLIGHT_WORDS  : u64 = 4              // 256 bits / 64
+
+  // Failure taxonomy — 0xFFFFF490..0xFFFFF49F.
+  pub let WTXD_OK               : u64 = 0
+  pub let WTXD_BAD_ARG          : u64 = 0xFFFFF49F
+  pub let WTXD_BAD_PA           : u64 = 0xFFFFF49E    // buf_pa == 0
+  pub let WTXD_BAD_LEN          : u64 = 0xFFFFF49D    // buf_len == 0
+  pub let WTXD_RING_FULL        : u64 = 0xFFFFF49C
+  pub let WTXD_DOMAIN_REFUSED   : u64 = 0xFFFFF49B    // dma_domain said no
+  pub let WTXD_SLOT_BUSY        : u64 = 0xFFFFF49A
+  pub let WTXD_BAD_SLOT         : u64 = 0xFFFFF499
+  pub let WTXD_NOT_INFLIGHT     : u64 = 0xFFFFF498
+
+  // §2: the writers.
+  pub let mut _wtxd_doorbell : [u64; 1] = uninit @align(64)
+  pub let mut _wtxd_inflight : [u64; 4] = uninit @align(64)
+  pub let mut _wtxd_stats    : [u64; 8] = uninit @align(64)
+
+  // Stat slot indices.
+  pub let WTXD_STAT_ENQUEUES     : u64 = 0
+  pub let WTXD_STAT_ADMITS       : u64 = 1
+  pub let WTXD_STAT_REFUSED      : u64 = 2
+  pub let WTXD_STAT_DOMAIN_REFS  : u64 = 3
+  pub let WTXD_STAT_RING_FULLS   : u64 = 4
+  pub let WTXD_STAT_COMPLETIONS  : u64 = 5
+  pub let WTXD_STAT_DOORBELLS    : u64 = 6
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let wtxd_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M2-002 (#1295): clear doorbell, in-flight bitmap, stats. Labels prefixed wtxd_rs_.",
+      block: {
+        lea r10, [rip + _wtxd_doorbell];
+        xor rax, rax;
+        mov [r10], rax;
+
+        lea r10, [rip + _wtxd_inflight];
+        xor rcx, rcx;
+      wtxd_rs_if:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  wtxd_rs_if;
+
+        lea r10, [rip + _wtxd_stats];
+        xor rcx, rcx;
+      wtxd_rs_st:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  wtxd_rs_st;
+        ret
+      }
+    } @no_frame
+
+  pub let wtxd_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R38.M2-002 (#1295): honesty pin. Returns 0 until R38.M3 wires this against a live HBUS_TARG_WRPTR store + RX completion IRQ.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let wtxd_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M2-002 (#1295): counter bump. Labels prefixed wtxd_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae wtxd_nt_out;
+        lea r10, [rip + _wtxd_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      wtxd_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let wtxd_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M2-002 (#1295): counter read. Labels prefixed wtxd_st_.",
+      block: {
+        cmp rdi, 8;
+        jae wtxd_st_zero;
+        lea r10, [rip + _wtxd_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      wtxd_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Doorbell seam.
+  // ==========================================================================
+
+  pub let wtxd_doorbell_write : (u64) -> () !{mem} @{} =
+    fn (val: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M2-002 (#1295): store to the doorbell seam. A live driver replaces this with a HBUS_TARG_WRPTR MMIO write. Labels prefixed wtxd_dw_.",
+      block: {
+        lea r10, [rip + _wtxd_doorbell];
+        mov [r10], rdi;
+
+        mov rdi, 6;                       // WTXD_STAT_DOORBELLS
+        call wtxd_note;
+        ret
+      }
+    }
+
+  pub let wtxd_doorbell_read : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M2-002 (#1295): read last-written doorbell value.",
+      block: {
+        lea r10, [rip + _wtxd_doorbell];
+        mov rax, [r10];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // In-flight bitmap helpers.
+  // ==========================================================================
+
+  pub let wtxd_inflight_test : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M2-002 (#1295): 1 iff bit slot is set in _wtxd_inflight. Labels prefixed wtxd_it_.",
+      block: {
+        cmp rdi, 256;
+        jae wtxd_it_zero;
+        // word = slot / 64, bit = slot & 63.
+        mov rax, rdi;
+        shr rax, 6;                       // word
+        mov rcx, rdi;
+        and rcx, 63;                      // bit
+        lea r10, [rip + _wtxd_inflight];
+        mov rdx, [r10 + rax * 8];
+        mov r11, 1;
+        shl r11, cl;
+        and rdx, r11;
+        cmp rdx, 0;
+        je  wtxd_it_zero;
+        mov rax, 1;
+        ret;
+      wtxd_it_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let wtxd_inflight_set : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M2-002 (#1295): set bit slot in _wtxd_inflight. OOR is a no-op (caller has already been refused above). Labels prefixed wtxd_is_.",
+      block: {
+        cmp rdi, 256;
+        jae wtxd_is_out;
+        mov rax, rdi;
+        shr rax, 6;
+        mov rcx, rdi;
+        and rcx, 63;
+        lea r10, [rip + _wtxd_inflight];
+        mov rdx, [r10 + rax * 8];
+        mov r11, 1;
+        shl r11, cl;
+        or  rdx, r11;
+        mov [r10 + rax * 8], rdx;
+      wtxd_is_out:
+        ret
+      }
+    } @no_frame
+
+  pub let wtxd_inflight_clear : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M2-002 (#1295): clear bit slot in _wtxd_inflight. OOR is a no-op. Labels prefixed wtxd_ic_.",
+      block: {
+        cmp rdi, 256;
+        jae wtxd_ic_out;
+        mov rax, rdi;
+        shr rax, 6;
+        mov rcx, rdi;
+        and rcx, 63;
+        lea r10, [rip + _wtxd_inflight];
+        mov rdx, [r10 + rax * 8];
+        mov r11, 1;
+        shl r11, cl;
+        not r11;
+        and rdx, r11;
+        mov [r10 + rax * 8], rdx;
+      wtxd_ic_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // wtxd_enqueue(buf_pa, buf_len, flags) -> WTXD_OK | error
+  //
+  // Composes the refuse-gates + ring bookkeeping + doorbell.  Order:
+  //   1. buf_pa != 0                                   -> WTXD_BAD_PA
+  //   2. buf_len != 0                                  -> WTXD_BAD_LEN
+  //   3. dma_domain.wdd_check(buf_pa, buf_len) == OK   -> WTXD_DOMAIN_REFUSED
+  //   4. tx ring not full                              -> WTXD_RING_FULL
+  //   5. slot bit not already set                      -> WTXD_SLOT_BUSY
+  //   6. ctxt_info.wctx_tx_slot_write(slot, buf_pa,
+  //         (flags << 32) | (buf_len & 0xFFFFFFFF))    (single writer)
+  //   7. ctxt_info.wctx_index_set(TX_HEAD, head + 1)
+  //   8. wtxd_inflight_set(slot)
+  //   9. wtxd_doorbell_write(head + 1)
+  //
+  // Returns 0 on admission.  Bumps ENQUEUES on entry, ADMITS on OK,
+  // REFUSED on any refusal, and specific counters
+  // (DOMAIN_REFS, RING_FULLS) for the two most operationally
+  // interesting refusals.
+  // ==========================================================================
+
+  pub let wtxd_enqueue : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (buf_pa: u64) (buf_len: u64) (flags: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M2-002 (#1295): the one enqueue. Composes dma_domain refuse-gate, ctxt_info ring bookkeeping, doorbell. Labels prefixed wtxd_eq_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                     // buf_pa
+        mov r12, rsi;                     // buf_len
+        mov r13, rdx;                     // flags
+
+        mov rdi, 0;                       // WTXD_STAT_ENQUEUES
+        call wtxd_note;
+
+        // 1. buf_pa != 0.
+        cmp rbx, 0;
+        je  wtxd_eq_bad_pa;
+
+        // 2. buf_len != 0.
+        cmp r12, 0;
+        je  wtxd_eq_bad_len;
+
+        // 3. dma_domain refuse-gate.
+        mov rdi, rbx;
+        mov rsi, r12;
+        call wdd_check;
+        cmp rax, 0;
+        jne wtxd_eq_domain;
+
+        // 4. head/tail + full?
+        mov rdi, 0;                       // WCTX_IDX_TX_HEAD
+        call wctx_index_get;
+        mov r14, rax;                     // head
+        mov rdi, 1;                       // WCTX_IDX_TX_TAIL
+        call wctx_index_get;
+        mov r15, rax;                     // tail
+
+        mov rdi, r14;
+        mov rsi, r15;
+        call wctx_tx_is_full;
+        cmp rax, 0;
+        jne wtxd_eq_full;
+
+        // 5. slot = head % 256.  slot busy?
+        mov rax, r14;
+        and rax, 0xFF;                    // slot
+        push rax;                         // save slot for later
+        mov rdi, rax;
+        call wtxd_inflight_test;
+        cmp rax, 0;
+        jne wtxd_eq_busy_pop;
+
+        pop rax;                          // slot
+        push rax;                         // keep for step 8
+
+        // 6. stamp the TFD.
+        //    word 0 = buf_pa
+        //    word 1 = (flags << 32) | (buf_len & 0xFFFFFFFF)
+        mov rdi, rax;                     // slot
+        mov rsi, rbx;                     // tfd_addr
+        mov rdx, r13;                     // flags
+        shl rdx, 32;
+        mov rcx, r12;
+        mov r11, 0xFFFFFFFF;
+        and rcx, r11;
+        or  rdx, rcx;                     // packed len | flags
+        call wctx_tx_slot_write;
+        cmp rax, 0;
+        jne wtxd_eq_ring_err_pop;
+
+        // 7. bump head.
+        mov rdi, 0;                       // TX_HEAD
+        mov rsi, r14;
+        add rsi, 1;
+        call wctx_index_set;
+        cmp rax, 0;
+        jne wtxd_eq_ring_err_pop;
+
+        // 8. bitmap set.
+        pop rax;                          // slot
+        mov rdi, rax;
+        call wtxd_inflight_set;
+
+        // 9. doorbell.
+        mov rdi, r14;
+        add rdi, 1;
+        call wtxd_doorbell_write;
+
+        mov rdi, 1;                       // WTXD_STAT_ADMITS
+        call wtxd_note;
+        xor rax, rax;
+        jmp wtxd_eq_out;
+
+      wtxd_eq_bad_pa:
+        mov rdi, 2;                       // REFUSED
+        call wtxd_note;
+        mov rax, 0xFFFFF49E;              // WTXD_BAD_PA
+        jmp wtxd_eq_out;
+      wtxd_eq_bad_len:
+        mov rdi, 2;
+        call wtxd_note;
+        mov rax, 0xFFFFF49D;              // WTXD_BAD_LEN
+        jmp wtxd_eq_out;
+      wtxd_eq_domain:
+        mov rdi, 3;                       // WTXD_STAT_DOMAIN_REFS
+        call wtxd_note;
+        mov rdi, 2;
+        call wtxd_note;
+        mov rax, 0xFFFFF49B;              // WTXD_DOMAIN_REFUSED
+        jmp wtxd_eq_out;
+      wtxd_eq_full:
+        mov rdi, 4;                       // WTXD_STAT_RING_FULLS
+        call wtxd_note;
+        mov rdi, 2;
+        call wtxd_note;
+        mov rax, 0xFFFFF49C;              // WTXD_RING_FULL
+        jmp wtxd_eq_out;
+      wtxd_eq_busy_pop:
+        add rsp, 8;                       // discard saved slot
+        mov rdi, 2;
+        call wtxd_note;
+        mov rax, 0xFFFFF49A;              // WTXD_SLOT_BUSY
+        jmp wtxd_eq_out;
+      wtxd_eq_ring_err_pop:
+        add rsp, 8;                       // discard saved slot
+        mov rdi, 2;
+        call wtxd_note;
+        // Whatever ctxt_info returned; do not translate -- caller
+        // reads the raw code from the ctxt_info band.
+        // rax already carries the ctxt_info error.
+
+      wtxd_eq_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // wtxd_completion_note(slot) -> WTXD_OK | error
+  //
+  // The RX-status ring handler (R38.M3) will call this once per
+  // completion.  Refuses slot out of range and refuses "not
+  // in flight" so a spurious completion cannot silently retire an
+  // idle slot.  Bumps COMPLETIONS on admission.
+  // ==========================================================================
+
+  pub let wtxd_completion_note : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M2-002 (#1295): RX-side completion. Refuses OOR + spurious. Labels prefixed wtxd_cn_.",
+      block: {
+        cmp rdi, 256;
+        jae wtxd_cn_bad_slot;
+
+        push rbx;
+        mov rbx, rdi;
+
+        mov rdi, rbx;
+        call wtxd_inflight_test;
+        cmp rax, 0;
+        je  wtxd_cn_not_infl_pop;
+
+        mov rdi, rbx;
+        call wtxd_inflight_clear;
+
+        // Advance tail by 1 (retire one slot).  R38.M3 will replace
+        // this with a monotone tail bump per completion index.
+        mov rdi, 1;                       // WCTX_IDX_TX_TAIL
+        call wctx_index_get;
+        mov r10, rax;
+        mov rdi, 1;
+        mov rsi, r10;
+        add rsi, 1;
+        call wctx_index_set;
+
+        mov rdi, 5;                       // WTXD_STAT_COMPLETIONS
+        call wtxd_note;
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      wtxd_cn_not_infl_pop:
+        pop rbx;
+        mov rdi, 2;                       // REFUSED
+        call wtxd_note;
+        mov rax, 0xFFFFF498;              // WTXD_NOT_INFLIGHT
+        ret;
+
+      wtxd_cn_bad_slot:
+        mov rdi, 2;
+        call wtxd_note;
+        mov rax, 0xFFFFF499;              // WTXD_BAD_SLOT
+        ret
+      }
+    }
+}

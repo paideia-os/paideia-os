@@ -3545,6 +3545,40 @@ fi
 echo "[wifi-m1-confine] R38.M1 (AX211 WiFi bring-up substrate) confined"
 
 # ---------------------------------------------------------------------------
+# R38.M2 (#1294/#1295/#1298): AX211 WiFi transport plumbing --
+# CTXT_INFO structure + TX/RX ring backing stores (ctxt_info), TX
+# DMA enqueue + doorbell + completion tracking (tx_dma), and the
+# per-driver DMA-domain refuse-gate (dma_domain) enforcing D1.b.
+#
+# Three modules open R38.M2 (post-R38.M1 close).  Each owns its own
+# state; tools/build.sh confines relocations against each to its
+# owning object so a second writer cannot forge a ring slot, a
+# doorbell ring, an in-flight completion, or a domain binding.
+WCTX_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/ctxt_info.pdx"
+WTXD_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/tx_dma.pdx"
+WDD_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/dma_domain.pdx"
+if [[ ! -f "${WCTX_SRC}" || ! -f "${WTXD_SRC}" || ! -f "${WDD_SRC}" ]]; then
+    echo "[wifi-m2-confine] FAIL - one of the R38.M2 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_wctx_info'       'core/drivers/wifi/ctxt_info.o'
+ec_confine_one '_wctx_tx_ring'    'core/drivers/wifi/ctxt_info.o'
+ec_confine_one '_wctx_rx_ring'    'core/drivers/wifi/ctxt_info.o'
+ec_confine_one '_wctx_indices'    'core/drivers/wifi/ctxt_info.o'
+ec_confine_one '_wctx_stats'      'core/drivers/wifi/ctxt_info.o'
+ec_confine_one '_wtxd_doorbell'   'core/drivers/wifi/tx_dma.o'
+ec_confine_one '_wtxd_inflight'   'core/drivers/wifi/tx_dma.o'
+ec_confine_one '_wtxd_stats'      'core/drivers/wifi/tx_dma.o'
+ec_confine_one '_wdd_state'       'core/drivers/wifi/dma_domain.o'
+ec_confine_one '_wdd_stats'       'core/drivers/wifi/dma_domain.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See ctxt_info.pdx §3, tx_dma.pdx §2 and dma_domain.pdx §3" >&2
+    echo "  for the row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[wifi-m2-confine] R38.M2 (AX211 WiFi transport plumbing) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
