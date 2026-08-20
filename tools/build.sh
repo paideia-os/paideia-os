@@ -3461,6 +3461,48 @@ fi
 echo "[gpu-m7-confine] R37.M7 (GPU sync-primitive substrate) confined"
 
 # ---------------------------------------------------------------------------
+# R37.M8 (#1285/#1286/#1287/#1288): GPU video-decode enablement --
+# HuC firmware loader (huc_load), VCS video engine substrate
+# (vcs_engine), HEVC frame plumbing scaffold (hevc_frame), and the
+# 100k no-op batch stress rig (gpu_stress).
+#
+# Four modules close R37.M8 (post-R37.M7).  Each owns its own state;
+# tools/build.sh confines relocations against each to its owning
+# object so a second writer cannot forge a HuC acceptance flag,
+# restamp the VCS wake / inflight record, dirty the HEVC frame ring,
+# or drift the stress rig's snapshot bookkeeping.
+HUCL_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/huc_load.pdx"
+VCS_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/vcs_engine.pdx"
+HEVC_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/hevc_frame.pdx"
+STRESS_SRC="${REPO_ROOT}/src/kernel/core/drivers/gpu/gpu_stress.pdx"
+if [[ ! -f "${HUCL_SRC}" || ! -f "${VCS_SRC}" \
+        || ! -f "${HEVC_SRC}" || ! -f "${STRESS_SRC}" ]]; then
+    echo "[gpu-m8-confine] FAIL - one of the R37.M8 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_hucl_blob_ptr'      'core/drivers/gpu/huc_load.o'
+ec_confine_one '_hucl_blob_len'      'core/drivers/gpu/huc_load.o'
+ec_confine_one '_hucl_wopcm_base'    'core/drivers/gpu/huc_load.o'
+ec_confine_one '_hucl_wopcm_size'    'core/drivers/gpu/huc_load.o'
+ec_confine_one '_hucl_accepted'      'core/drivers/gpu/huc_load.o'
+ec_confine_one '_hucl_stats'         'core/drivers/gpu/huc_load.o'
+ec_confine_one '_vcs_state'          'core/drivers/gpu/vcs_engine.o'
+ec_confine_one '_vcs_stats'          'core/drivers/gpu/vcs_engine.o'
+ec_confine_one '_hevc_ring'          'core/drivers/gpu/hevc_frame.o'
+ec_confine_one '_hevc_head'          'core/drivers/gpu/hevc_frame.o'
+ec_confine_one '_hevc_admitted'      'core/drivers/gpu/hevc_frame.o'
+ec_confine_one '_hevc_stats'         'core/drivers/gpu/hevc_frame.o'
+ec_confine_one '_stress_backing'     'core/drivers/gpu/gpu_stress.o'
+ec_confine_one '_stress_last'        'core/drivers/gpu/gpu_stress.o'
+ec_confine_one '_stress_stats'       'core/drivers/gpu/gpu_stress.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See huc_load.pdx §4, vcs_engine.pdx §3, hevc_frame.pdx §3," >&2
+    echo "  gpu_stress.pdx §2 for the row/counter one-writer discipline." >&2
+    exit 1
+fi
+echo "[gpu-m8-confine] R37.M8 (GPU video-decode enablement) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

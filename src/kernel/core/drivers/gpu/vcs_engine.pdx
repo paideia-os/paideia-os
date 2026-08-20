@@ -1,0 +1,669 @@
+// src/kernel/core/drivers/gpu/vcs_engine.pdx — R37.M8-002 (#1286)
+//
+// Iris Xe (Gen12) Video Command Streamer (VCS) engine substrate --
+// the wake-path + LRC reservation + submission-queue wiring for the
+// video-decode engine.  Engine ID = 2 in the RCS/BCS/VCS/VECS
+// lineup already referenced by R37.M5's lrc.pdx (§1: RCS=64 KiB,
+// BCS=16 KiB, VCS=32 KiB).
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the ENGINE-LEVEL SURFACE PREP for VCS.  The RCS (render)
+// path is exercised end-to-end through R37.M5's LRC + R37.M6's
+// execlists/guc_submit substrates; VCS uses the SAME per-engine
+// LRC size (32 KiB) and the SAME submission substrate but wants its
+// own wake path, its own inflight bookkeeping, and refuses commands
+// whose class requires HuC offload until hucl_accepted() returns 1.
+//
+// A future R44+ media round consumes this surface: HEVC / VP9 / AV1
+// decode pipelines call vcs_submit with a KIND_GPU_SUBMIT row whose
+// batch buffer carries the codec-specific MI opcodes.  This module
+// records the wake state + inflight submit count and refuses a
+// second concurrent submit on the single VCS queue (single-issuer
+// discipline mirrored from guc_submit.pdx §1).
+//
+// IT DOES NOT DECODE ANY FRAME.  HEVC-specific plumbing lives in
+// hevc_frame.pdx (R37.M8-003); this module is engine-generic.
+//
+// IT DOES NOT MINT KIND_VIDEO_STREAM.  That kind belongs to a later
+// media round; this module records {woken, inflight_row_id,
+// submit_count, hevc_frames_seen} in .bss and answers vcs_woken() /
+// vcs_inflight() to whatever consumer arrives.
+//
+// IT DOES NOT WRITE MMIO OUTSIDE gmmio_write32.  The wake sequence
+// pokes VCS_RING_CTL and VCS_MI_MODE through gmmio_write32 so the
+// audit gate (gpu_reg_audit) can see them.
+//
+// vcs_arbitrated() returns 0 until a live media round wires this to
+// a real decode consumer.
+//
+// =============================================================================
+// §1  ENGINE IDENTITY
+// =============================================================================
+//
+//   VCS_ENGINE_ID  : 2  (matches gt_fence.pdx §1 and lrc.pdx §1)
+//   VCS_LRC_BYTES  : 0x8000 (32 KiB) — bspec Xe1 §3.4 media size.
+//
+// The one queue this engine owns aligns with guc_submit.pdx §1's
+// per-context queue-id encoding: the VCS queue occupies slot
+// VCS_QUEUE_ID (chosen inside guc_submit's 8-queue window; see
+// vcs_engine_bind for the boot wiring).
+//
+// =============================================================================
+// §2  REGISTER OFFSETS
+// =============================================================================
+//
+// Offsets picked to land inside the gpu_reg_audit whitelist range
+// [0x0, 0x40000).  A live driver replaces these with the bspec Xe1
+// §5.5 VCS register block base (0x12000 for the VCS0 engine); the
+// substitution is a two-constant change here.
+//
+//   VCS_REG_RING_CTL : 0xC080  (u32; bit 0 = ENABLE, bit 1 = VALID)
+//   VCS_REG_MI_MODE  : 0xC084  (u32; bit 0 = STOP_RING, cleared to wake)
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _vcs_state and _vcs_stats are written only by helpers in this
+// module.  tools/build.sh confines relocations against each to
+// core/drivers/gpu/vcs_engine.o.
+//
+// =============================================================================
+// §4  FAILURE TAXONOMY 0xFFFFF510..0xFFFFF51F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: huc_load
+// 0xFFFFF520..2F; adjacent free band below: hevc_frame
+// 0xFFFFF500..0F, R37.M8-003).
+
+module VcsEngine = structure {
+
+  // §1: engine identity.
+  pub let VCS_ENGINE_ID   : u64 = 2
+  pub let VCS_LRC_BYTES   : u64 = 0x8000
+  pub let VCS_QUEUE_ID    : u64 = 2
+
+  // §2: register offsets.
+  pub let VCS_REG_RING_CTL : u64 = 0xC080
+  pub let VCS_REG_MI_MODE  : u64 = 0xC084
+
+  // §2: bits.
+  pub let VCS_RING_ENABLE  : u64 = 0x1
+  pub let VCS_RING_VALID   : u64 = 0x2
+  pub let VCS_MI_STOP_RING : u64 = 0x1
+
+  // Failure taxonomy -- 0xFFFFF510..0xFFFFF51F.
+  pub let VCS_OK              : u64 = 0
+  pub let VCS_BAD_ARG         : u64 = 0xFFFFF51F
+  pub let VCS_MMIO_NOT_BOUND  : u64 = 0xFFFFF51E
+  pub let VCS_MMIO_REFUSED    : u64 = 0xFFFFF51D
+  pub let VCS_NOT_WOKEN       : u64 = 0xFFFFF51C
+  pub let VCS_ALREADY_WOKEN   : u64 = 0xFFFFF51B
+  pub let VCS_QUEUE_BUSY      : u64 = 0xFFFFF51A
+  pub let VCS_QUEUE_IDLE      : u64 = 0xFFFFF519
+  pub let VCS_HUC_NOT_READY   : u64 = 0xFFFFF518
+  pub let VCS_LRC_NOT_BOUND   : u64 = 0xFFFFF517
+
+  // §3: engine record -- 8 slots (64 bytes, one cache line).
+  //   [+0]  woken_flag[7:0] | reserved
+  //   [+8]  lrc_pa (physical address of the LRC region)
+  //   [+16] lrc_bytes (must be VCS_LRC_BYTES)
+  //   [+24] inflight_flag[7:0] | inflight_row[15:8]
+  //   [+32] submit_count (u64)
+  //   [+40] complete_count (u64)
+  //   [+48] wake_seq (u64; monotonic wake counter)
+  //   [+56] reserved
+  pub let mut _vcs_state : [u64; 8] = uninit @align(64)
+
+  // Counters.
+  pub let mut _vcs_stats : [u64; 8] = uninit @align(64)
+
+  pub let VCS_ST_WAKES    : u64 = 0
+  pub let VCS_ST_SLEEPS   : u64 = 1
+  pub let VCS_ST_SUBMITS  : u64 = 2
+  pub let VCS_ST_COMPLETES: u64 = 3
+  pub let VCS_ST_REFUSED  : u64 = 4
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let vcs_engine_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-002 (#1286): clear engine record + counters. Boot and teardown only. Labels prefixed vcs_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _vcs_state];
+        xor rcx, rcx;
+      vcs_rs_state:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  vcs_rs_state;
+
+        lea r10, [rip + _vcs_stats];
+        xor rcx, rcx;
+      vcs_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  vcs_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let vcs_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M8-002 (#1286): honesty pin. Returns 0 until a media round wires this to a real decode consumer.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let vcs_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-002 (#1286): counter bump. Labels prefixed vcs_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae vcs_nt_out;
+        lea r10, [rip + _vcs_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      vcs_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let vcs_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-002 (#1286): counter read. Labels prefixed vcs_stt_.",
+      block: {
+        cmp rdi, 8;
+        jae vcs_stt_zero;
+        lea r10, [rip + _vcs_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      vcs_stt_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Accessors.
+  // ==========================================================================
+
+  pub let vcs_woken : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-002 (#1286): 1 iff VCS engine has been woken this boot. Labels prefixed vcs_wk_.",
+      block: {
+        lea r10, [rip + _vcs_state];
+        mov rax, [r10 + 0];
+        and rax, 0xFF;
+        cmp rax, 0;
+        je  vcs_wk_no;
+        mov rax, 1;
+        ret;
+      vcs_wk_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let vcs_lrc_pa : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-002 (#1286): recorded LRC physical address or 0. Labels prefixed vcs_lp_.",
+      block: {
+        lea r10, [rip + _vcs_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let vcs_inflight : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-002 (#1286): 1 iff queue has an in-flight submit. Labels prefixed vcs_if_.",
+      block: {
+        lea r10, [rip + _vcs_state];
+        mov rax, [r10 + 24];
+        and rax, 0xFF;
+        cmp rax, 0;
+        je  vcs_if_no;
+        mov rax, 1;
+        ret;
+      vcs_if_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let vcs_submit_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-002 (#1286): cumulative submits. Labels prefixed vcs_sc_.",
+      block: {
+        lea r10, [rip + _vcs_state];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let vcs_complete_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-002 (#1286): cumulative completions. Labels prefixed vcs_cc_.",
+      block: {
+        lea r10, [rip + _vcs_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let vcs_wake_seq : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-002 (#1286): monotonic wake counter. Labels prefixed vcs_wq_.",
+      block: {
+        lea r10, [rip + _vcs_state];
+        mov rax, [r10 + 48];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // vcs_bind_lrc(lrc_pa, lrc_bytes) — record the LRC region backing
+  // the VCS engine.  Refuses:
+  //   BAD_ARG        lrc_pa == 0 or lrc_bytes != VCS_LRC_BYTES
+  //   ALREADY_WOKEN  engine already woken — rebind requires a reset
+  //
+  // The LRC region itself is allocated by the caller (holder of
+  // KIND_MEMORY authority) exactly as R37.M5's lrc.pdx does for
+  // RCS.  This module records the tuple and refuses vcs_wake until
+  // a bind has landed.
+  // ==========================================================================
+
+  pub let vcs_bind_lrc : (u64, u64) -> u64 !{mem} @{} =
+    fn (lrc_pa: u64) (lrc_bytes: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-002 (#1286): record the LRC region backing the VCS engine. THE ONE WRITER of _vcs_state[+8/+16]. Labels prefixed vcs_bl_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        mov r13, rsi;
+
+        // Rebind refused if already woken.
+        call vcs_woken;
+        cmp rax, 1;
+        je  vcs_bl_already;
+
+        cmp r12, 0;
+        je  vcs_bl_bad;
+        mov r11, 0x8000;
+        cmp r13, r11;
+        jne vcs_bl_bad;
+
+        lea r10, [rip + _vcs_state];
+        mov [r10 + 8],  r12;
+        mov [r10 + 16], r13;
+
+        xor rax, rax;
+        jmp vcs_bl_out;
+
+      vcs_bl_bad:
+        mov rdi, 4;
+        call vcs_note;
+        mov rax, 0xFFFFF51F;
+        jmp vcs_bl_out;
+      vcs_bl_already:
+        mov rdi, 4;
+        call vcs_note;
+        mov rax, 0xFFFFF51B;
+
+      vcs_bl_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // vcs_wake() — bring the VCS engine out of reset.  Refuses:
+  //   MMIO_NOT_BOUND   MMIO BAR unbound
+  //   LRC_NOT_BOUND    vcs_bind_lrc has not landed
+  //   ALREADY_WOKEN    engine already woken
+  //   MMIO_REFUSED     a scratch write refused
+  //
+  // Writes:
+  //   VCS_REG_RING_CTL <- ENABLE | VALID   (start ring)
+  //   VCS_REG_MI_MODE  <- 0                (clear STOP_RING sentinel)
+  //
+  // THE ONE WRITER of _vcs_state[+0] (positive edge) and
+  // _vcs_state[+48] (monotonic wake_seq bump).
+  // ==========================================================================
+
+  pub let vcs_wake : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R37.M8-002 (#1286): wake the VCS engine — write ENABLE|VALID to RING_CTL and clear STOP_RING in MI_MODE. THE ONE WRITER of _vcs_state[+0] positive edge + _vcs_state[+48] monotonic bump. Labels prefixed vcs_w_.",
+      block: {
+        push rbx;
+
+        call gmmio_is_bound;
+        cmp rax, 1;
+        jne vcs_w_mmio;
+
+        // LRC bind required (lrc_pa != 0).
+        lea r10, [rip + _vcs_state];
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        je  vcs_w_no_lrc;
+
+        // Already woken?
+        mov rax, [r10 + 0];
+        and rax, 0xFF;
+        cmp rax, 0;
+        jne vcs_w_already;
+
+        mov rbx, r10;                    // engine record base
+
+        // RING_CTL <- ENABLE | VALID.
+        mov rdi, 0xC080;
+        mov rsi, 3;                      // ENABLE | VALID
+        call gmmio_write32;
+        cmp rax, 0;
+        jne vcs_w_mmio_refused;
+
+        // MI_MODE <- 0 (clear STOP_RING).
+        mov rdi, 0xC084;
+        mov rsi, 0;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne vcs_w_mmio_refused;
+
+        // Stamp woken_flag = 0xFF.
+        mov rax, 0xFF;
+        mov [rbx + 0], rax;
+
+        // Bump wake_seq.
+        mov rax, [rbx + 48];
+        add rax, 1;
+        mov [rbx + 48], rax;
+
+        mov rdi, 0;                      // WAKES
+        call vcs_note;
+
+        xor rax, rax;
+        jmp vcs_w_out;
+
+      vcs_w_mmio:
+        mov rdi, 4;
+        call vcs_note;
+        mov rax, 0xFFFFF51E;
+        jmp vcs_w_out;
+      vcs_w_no_lrc:
+        mov rdi, 4;
+        call vcs_note;
+        mov rax, 0xFFFFF517;
+        jmp vcs_w_out;
+      vcs_w_already:
+        mov rdi, 4;
+        call vcs_note;
+        mov rax, 0xFFFFF51B;
+        jmp vcs_w_out;
+      vcs_w_mmio_refused:
+        mov rdi, 4;
+        call vcs_note;
+        mov rax, 0xFFFFF51D;
+
+      vcs_w_out:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // vcs_sleep() — return the VCS engine to reset.  Refuses:
+  //   MMIO_NOT_BOUND   MMIO BAR unbound
+  //   NOT_WOKEN        engine not currently woken
+  //   MMIO_REFUSED     a scratch write refused
+  //   QUEUE_BUSY       a submit is still in flight (drain first)
+  //
+  // Writes:
+  //   VCS_REG_MI_MODE  <- STOP_RING
+  //   VCS_REG_RING_CTL <- 0
+  // ==========================================================================
+
+  pub let vcs_sleep : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R37.M8-002 (#1286): return the VCS engine to reset. THE ONE WRITER of _vcs_state[+0] negative edge. Labels prefixed vcs_sl_.",
+      block: {
+        push rbx;
+
+        call gmmio_is_bound;
+        cmp rax, 1;
+        jne vcs_sl_mmio;
+
+        lea rbx, [rip + _vcs_state];
+        mov rax, [rbx + 0];
+        and rax, 0xFF;
+        cmp rax, 0;
+        je  vcs_sl_not_woken;
+
+        // Drain: refuse if any submit in flight.
+        mov rax, [rbx + 24];
+        and rax, 0xFF;
+        cmp rax, 0;
+        jne vcs_sl_busy;
+
+        mov rdi, 0xC084;
+        mov rsi, 1;                      // STOP_RING
+        call gmmio_write32;
+        cmp rax, 0;
+        jne vcs_sl_mmio_refused;
+
+        mov rdi, 0xC080;
+        mov rsi, 0;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne vcs_sl_mmio_refused;
+
+        xor rax, rax;
+        mov [rbx + 0], rax;
+
+        mov rdi, 1;                      // SLEEPS
+        call vcs_note;
+
+        xor rax, rax;
+        jmp vcs_sl_out;
+
+      vcs_sl_mmio:
+        mov rdi, 4;
+        call vcs_note;
+        mov rax, 0xFFFFF51E;
+        jmp vcs_sl_out;
+      vcs_sl_not_woken:
+        mov rdi, 4;
+        call vcs_note;
+        mov rax, 0xFFFFF51C;
+        jmp vcs_sl_out;
+      vcs_sl_busy:
+        mov rdi, 4;
+        call vcs_note;
+        mov rax, 0xFFFFF51A;
+        jmp vcs_sl_out;
+      vcs_sl_mmio_refused:
+        mov rdi, 4;
+        call vcs_note;
+        mov rax, 0xFFFFF51D;
+
+      vcs_sl_out:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // vcs_submit_begin(submit_row_id) — claim the VCS queue for one
+  // submit.  THE ONE WRITER of _vcs_state[+24] positive edge.
+  // Refuses:
+  //   NOT_WOKEN        engine has not been woken
+  //   QUEUE_BUSY       another submit is in flight
+  //   BAD_ARG          submit_row_id >= 0xFF
+  //   HUC_NOT_READY    hucl_accepted() == 0
+  //
+  // The HuC-ready gate is the safe default: any video codec beyond
+  // the trivial (M-JPEG) needs HuC offload, and refusing HuC-absent
+  // submissions is closer-to-correct than accepting one that would
+  // fault mid-decode.  A future consumer whose codec does not want
+  // HuC (M-JPEG-only path) can add a class field to submit and
+  // gate on that.
+  // ==========================================================================
+
+  pub let vcs_submit_begin : (u64) -> u64 !{mem} @{} =
+    fn (submit_row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-002 (#1286): claim VCS queue for one submit. THE ONE WRITER of _vcs_state[+24] positive edge + _vcs_state[+32] bump. Labels prefixed vcs_sb_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov r12, rdi;                    // submit_row_id
+
+        cmp r12, 0xFF;
+        jae vcs_sb_bad;
+
+        // Woken?
+        lea rbx, [rip + _vcs_state];
+        mov rax, [rbx + 0];
+        and rax, 0xFF;
+        cmp rax, 0;
+        je  vcs_sb_not_woken;
+
+        // HuC accepted?
+        call hucl_accepted;
+        cmp rax, 1;
+        jne vcs_sb_huc;
+
+        // Busy?
+        mov rax, [rbx + 24];
+        and rax, 0xFF;
+        cmp rax, 0;
+        jne vcs_sb_busy;
+
+        // Stamp inflight_flag=0xFF | inflight_row.
+        mov rax, r12;
+        and rax, 0xFF;
+        shl rax, 8;
+        or  rax, 0xFF;
+        mov [rbx + 24], rax;
+
+        // submit_count += 1.
+        mov rax, [rbx + 32];
+        add rax, 1;
+        mov [rbx + 32], rax;
+
+        mov rdi, 2;                      // SUBMITS
+        call vcs_note;
+
+        xor rax, rax;
+        jmp vcs_sb_out;
+
+      vcs_sb_bad:
+        mov rdi, 4;
+        call vcs_note;
+        mov rax, 0xFFFFF51F;
+        jmp vcs_sb_out;
+      vcs_sb_not_woken:
+        mov rdi, 4;
+        call vcs_note;
+        mov rax, 0xFFFFF51C;
+        jmp vcs_sb_out;
+      vcs_sb_huc:
+        mov rdi, 4;
+        call vcs_note;
+        mov rax, 0xFFFFF518;
+        jmp vcs_sb_out;
+      vcs_sb_busy:
+        mov rdi, 4;
+        call vcs_note;
+        mov rax, 0xFFFFF51A;
+
+      vcs_sb_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // vcs_submit_finish() — consume the completion for the in-flight
+  // submit.  THE ONE WRITER of _vcs_state[+24] negative edge.
+  // Refuses:
+  //   QUEUE_IDLE       nothing in flight.
+  //
+  // Returns the completed submit_row_id on success.
+  // ==========================================================================
+
+  pub let vcs_submit_finish : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-002 (#1286): consume one completion. THE ONE WRITER of _vcs_state[+24] negative edge + _vcs_state[+40] bump. Labels prefixed vcs_sf_.",
+      block: {
+        push rbx;
+        push r12;
+
+        lea rbx, [rip + _vcs_state];
+        mov rax, [rbx + 24];
+        mov r10, rax;
+        and r10, 0xFF;
+        cmp r10, 0;
+        je  vcs_sf_idle;
+
+        // Snapshot submit_row_id.
+        mov r12, rax;
+        shr r12, 8;
+        and r12, 0xFF;
+
+        // Clear.
+        xor rax, rax;
+        mov [rbx + 24], rax;
+
+        // complete_count += 1.
+        mov rax, [rbx + 40];
+        add rax, 1;
+        mov [rbx + 40], rax;
+
+        mov rdi, 3;                      // COMPLETES
+        call vcs_note;
+
+        mov rax, r12;
+        jmp vcs_sf_out;
+
+      vcs_sf_idle:
+        mov rdi, 4;
+        call vcs_note;
+        mov rax, 0xFFFFF519;
+
+      vcs_sf_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

@@ -1,0 +1,595 @@
+// src/kernel/core/drivers/gpu/huc_load.pdx — R37.M8-001 (#1285)
+//
+// Iris Xe HuC firmware DUAL-SIGNATURE VERIFY + LOAD SEQUENCE.  Same
+// discipline as R37.M2's guc_verify + guc_load pair, condensed into
+// one module because the HuC image has one authoring pipeline: a
+// vendor RSA-2048 slot and a paideia Dilithium-2 re-sign slot are
+// both required, then the byte range is staged into the HuC-owned
+// portion of WOPCM and the HUC_STATUS.HUC_ACCEPTED handshake bit is
+// asserted.  Every register touch goes through gpu_mmio (#1253) so
+// the audit gate (#1256) can see it.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the FIRMWARE-SIDE HALF of R37.M8's video-decode enablement.
+// The VCS engine substrate (vcs_engine.pdx, R37.M8-002) is what a
+// caller drives once HuC has been accepted; HuC itself is the
+// vendor-signed offload firmware Intel ships to accelerate media
+// pipelines through the video engine.  Without this module there is
+// no live HuC — the VCS scaffold refuses commands whose class
+// requires HuC offload.
+//
+// IT DOES NOT PERFORM REAL RSA-2048 OR DILITHIUM-2 SIGNATURE
+// ARITHMETIC.  Both signature slots are checked STRUCTURALLY this
+// milestone: the slot is present in the blob and its payload is
+// non-empty.  The real cryptographic verifier lands under
+// KIND_HASH_SESSION (R32 wave-2 scope).  Substituting the real
+// verifier at that seam does not change any caller: the signature
+// stays the same and the "fails closed on either miss" semantic is
+// preserved — the byte pattern the check accepts narrows from "any
+// non-zero" to "algebraically valid", and every existing refusal
+// path stays intact.
+//
+// IT DOES NOT PERFORM REAL DMA.  The upload is modelled as three
+// register writes (HUC_WOPCM_BASE, HUC_WOPCM_SIZE, HUC_CTL) into
+// the gpu_mmio synthetic backing store.  A live driver replaces
+// the third write with a GT DMA engine transaction that shovels the
+// verified body from blob_ptr into HuC WOPCM per bspec §21.6; the
+// substitution point is here, unchanged for the caller.
+//
+// IT DOES NOT MINT A KIND_HUC_SESSION.  The consumer-facing kind
+// belongs to a later media round; this module records
+// {blob_ptr, blob_len, wopcm_base, wopcm_size, accepted} in .bss
+// and answers hucl_accepted() to the VCS scaffold.
+//
+// hucl_arbitrated() returns 0 until R32 wave-2 binds the seam to a
+// live KIND_HASH_SESSION verifier.
+//
+// =============================================================================
+// §1  BLOB HEADER LAYOUT
+// =============================================================================
+//
+//   Offset  Field                Size  Notes
+//   ----------------------------------------------------------------------
+//   0x00    magic                u32   'HUCF' (LE: 0x46435548)
+//   0x04    body_size            u32   bytes of firmware body past the
+//                                      header (informational this
+//                                      milestone).
+//   0x08    vendor_sig[0..8)     u64   RSA-2048 signature slot (word 0)
+//   0x10    vendor_sig[8..16)    u64   (word 1). BOTH-zero -> REFUSED.
+//   0x18    paideia_sig[0..8)    u64   Dilithium-2 re-sign slot (w 0)
+//   0x20    paideia_sig[8..16)   u64   (word 1). BOTH-zero -> REFUSED.
+//   0x28    body...              u32×N HuC firmware body (opaque).
+//
+// Header size = 0x28 (40 bytes).  A blob shorter than the header is
+// REFUSED as TOO_SMALL.
+//
+// =============================================================================
+// §2  WOPCM CONSTRAINTS FOR HUC (bspec §21.6)
+// =============================================================================
+//
+//   * HUCL_WOPCM_BASE must be 64 KiB aligned (lower 16 bits zero).
+//   * HUCL_WOPCM_SIZE must be a multiple of 4 KiB and at least
+//     512 KiB.  HuC eats its own 512 KiB slice past the GuC's.
+//   * The base + size window must lie inside the parent GSM region
+//     (checked one layer up when GSM lands; unchecked here).
+//
+// =============================================================================
+// §3  REGISTER OFFSETS
+// =============================================================================
+//
+// Offsets picked to land inside the gpu_reg_audit whitelist range
+// [0x0, 0x40000) so guarded writes route through the audit gate
+// cleanly.  A live driver replaces these with the bspec §21.6
+// offsets (HUC_WOPCM_OFFSET = 0xD4D0, HUC_WOPCM_SIZE = 0xD4D4,
+// HUC_STATUS = 0xD44C); the substitution is a three-constant change
+// here.
+//
+//   HUCL_REG_WOPCM_BASE : 0xC060  (u32; base >> 16 in the low half,
+//                                  bit 0 = valid)
+//   HUCL_REG_WOPCM_SIZE : 0xC064  (u32; size >> 12 in the low half)
+//   HUCL_REG_HUC_CTL    : 0xC068  (u32; bit 0 = KICK, cleared on
+//                                  release; a live driver polls
+//                                  HUC_STATUS.HUC_ACCEPTED while
+//                                  asserted)
+//   HUCL_REG_HUC_STATUS : 0xC06C  (u32; bit 0 = HUC_ACCEPTED)
+//
+// =============================================================================
+// §4  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _hucl_blob_ptr, _hucl_blob_len, _hucl_wopcm_base, _hucl_wopcm_size,
+// _hucl_accepted, _hucl_stats are written only by helpers in this
+// module.  tools/build.sh confines relocations against each to
+// core/drivers/gpu/huc_load.o.
+//
+// =============================================================================
+// §5  FAILURE TAXONOMY 0xFFFFF520..0xFFFFF52F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: gt_fence
+// 0xFFFFF530..3F; adjacent free band below: vcs_engine
+// 0xFFFFF510..1F, R37.M8-002).
+
+module HucLoad = structure {
+
+  // §1: header layout.
+  pub let HUCL_MAGIC          : u64 = 0x46435548           // 'HUCF' LE
+  pub let HUCL_HDR_SIZE       : u64 = 0x28
+
+  // §2: WOPCM constraints.
+  pub let HUCL_WOPCM_ALIGN_MASK : u64 = 0xFFFF             // 64 KiB
+  pub let HUCL_WOPCM_SIZE_UNIT  : u64 = 0x1000             // 4 KiB
+  pub let HUCL_WOPCM_MIN_SIZE   : u64 = 0x80000            // 512 KiB
+
+  // §3: register offsets.
+  pub let HUCL_REG_WOPCM_BASE : u64 = 0xC060
+  pub let HUCL_REG_WOPCM_SIZE : u64 = 0xC064
+  pub let HUCL_REG_HUC_CTL    : u64 = 0xC068
+  pub let HUCL_REG_HUC_STATUS : u64 = 0xC06C
+
+  // §3: HUC_CTL / HUC_STATUS bits.
+  pub let HUCL_CTL_KICK       : u64 = 0x1
+  pub let HUCL_STATUS_ACCEPT  : u64 = 0x1
+
+  // Failure taxonomy -- 0xFFFFF520..0xFFFFF52F.
+  pub let HUCL_OK               : u64 = 0
+  pub let HUCL_BAD_ARG          : u64 = 0xFFFFF52F
+  pub let HUCL_TOO_SMALL        : u64 = 0xFFFFF52E
+  pub let HUCL_BAD_MAGIC        : u64 = 0xFFFFF52D
+  pub let HUCL_BAD_VENDOR_SIG   : u64 = 0xFFFFF52C
+  pub let HUCL_BAD_PAIDEIA_SIG  : u64 = 0xFFFFF52B
+  pub let HUCL_NULL_BLOB        : u64 = 0xFFFFF52A
+  pub let HUCL_MMIO_NOT_BOUND   : u64 = 0xFFFFF529
+  pub let HUCL_WOPCM_MISALIGNED : u64 = 0xFFFFF528
+  pub let HUCL_WOPCM_TOO_SMALL  : u64 = 0xFFFFF527
+  pub let HUCL_MMIO_REFUSED     : u64 = 0xFFFFF526
+  pub let HUCL_ALREADY_LOADED   : u64 = 0xFFFFF525
+  pub let HUCL_NOT_ACCEPTED     : u64 = 0xFFFFF524
+
+  // Recorded blob + WOPCM + acceptance flag.
+  pub let mut _hucl_blob_ptr   : [u64; 1] = uninit @align(64)
+  pub let mut _hucl_blob_len   : [u64; 1] = uninit @align(64)
+  pub let mut _hucl_wopcm_base : [u64; 1] = uninit @align(64)
+  pub let mut _hucl_wopcm_size : [u64; 1] = uninit @align(64)
+  pub let mut _hucl_accepted   : [u64; 1] = uninit @align(64)
+
+  // Counters.
+  pub let mut _hucl_stats : [u64; 8] = uninit @align(64)
+
+  pub let HUCL_ST_LOADS        : u64 = 0
+  pub let HUCL_ST_ACCEPTS      : u64 = 1
+  pub let HUCL_ST_VENDOR_MISS  : u64 = 2
+  pub let HUCL_ST_PAIDEIA_MISS : u64 = 3
+  pub let HUCL_ST_REFUSED      : u64 = 4
+
+  // ==========================================================================
+  // Reset.
+  // ==========================================================================
+
+  pub let huc_load_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-001 (#1285): clear blob record, WOPCM record, acceptance flag, and stats. Boot and teardown only. Labels prefixed hucl_rs_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _hucl_blob_ptr];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _hucl_blob_len];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _hucl_wopcm_base];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _hucl_wopcm_size];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _hucl_accepted];
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _hucl_stats];
+        xor rcx, rcx;
+      hucl_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  hucl_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let hucl_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M8-001 (#1285): honesty pin. Returns 0 until R32 wave-2 KIND_HASH_SESSION binds this to a live RSA-2048 + Dilithium-2 verifier.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let hucl_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-001 (#1285): counter bump. Labels prefixed hucl_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae hucl_nt_out;
+        lea r10, [rip + _hucl_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      hucl_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let hucl_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-001 (#1285): counter read. Labels prefixed hucl_stt_.",
+      block: {
+        cmp rdi, 8;
+        jae hucl_stt_zero;
+        lea r10, [rip + _hucl_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      hucl_stt_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Signature verifiers (§1).  Structural-only this milestone; both
+  // slots are checked.  Callers reach these through hucl_load, which
+  // fails closed on either miss.
+  // ==========================================================================
+
+  pub let hucl_verify_vendor : (u64) -> u64 !{mem} @{} =
+    fn (blob_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-001 (#1285): vendor (RSA-2048) sig slot check. §1 offsets. Labels prefixed hucl_vv_.",
+      block: {
+        mov rax, [rdi + 8];              // vendor_sig[0]
+        mov rcx, [rdi + 16];             // vendor_sig[1]
+        or  rax, rcx;
+        cmp rax, 0;
+        je  hucl_vv_bad;
+        xor rax, rax;
+        ret;
+      hucl_vv_bad:
+        mov rax, 0xFFFFF52C;             // BAD_VENDOR_SIG
+        ret
+      }
+    } @no_frame
+
+  pub let hucl_verify_paideia : (u64) -> u64 !{mem} @{} =
+    fn (blob_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-001 (#1285): paideia (Dilithium-2) re-sign slot check. §1 offsets. Labels prefixed hucl_vp_.",
+      block: {
+        mov rax, [rdi + 24];             // paideia_sig[0]
+        mov rcx, [rdi + 32];             // paideia_sig[1]
+        or  rax, rcx;
+        cmp rax, 0;
+        je  hucl_vp_bad;
+        xor rax, rax;
+        ret;
+      hucl_vp_bad:
+        mov rax, 0xFFFFF52B;             // BAD_PAIDEIA_SIG
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // WOPCM validators (§2).
+  // ==========================================================================
+
+  pub let hucl_wopcm_aligned : (u64) -> u64 !{} @{} =
+    fn (base: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M8-001 (#1285): 1 iff base is 64 KiB aligned. Labels prefixed hucl_wa_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFFFF;
+        cmp rax, 0;
+        jne hucl_wa_no;
+        mov rax, 1;
+        ret;
+      hucl_wa_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let hucl_wopcm_size_ok : (u64) -> u64 !{} @{} =
+    fn (size: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R37.M8-001 (#1285): 1 iff size >= 512 KiB and 4 KiB multiple. Labels prefixed hucl_ws_.",
+      block: {
+        mov r10, 0x80000;
+        cmp rdi, r10;
+        jb  hucl_ws_no;
+        mov rax, rdi;
+        and rax, 0xFFF;
+        cmp rax, 0;
+        jne hucl_ws_no;
+        mov rax, 1;
+        ret;
+      hucl_ws_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // hucl_load(blob_ptr, blob_len, wopcm_base, wopcm_size) -> HUCL_OK | error
+  //
+  // §0: THE ONE ENTRY POINT for HuC firmware admission + upload.  Order:
+  //   1. NULL blob refused (NULL_BLOB).
+  //   2. Undersized blob refused (TOO_SMALL).
+  //   3. Wrong magic refused (BAD_MAGIC).
+  //   4. Vendor sig slot empty refused (BAD_VENDOR_SIG).
+  //   5. Paideia sig slot empty refused (BAD_PAIDEIA_SIG).
+  //   6. Not already loaded (ALREADY_LOADED).
+  //   7. gpu_mmio bound (MMIO_NOT_BOUND).
+  //   8. WOPCM alignment / size (WOPCM_MISALIGNED / WOPCM_TOO_SMALL).
+  //   9. WRITE (wopcm_base >> 16) | valid to HUCL_REG_WOPCM_BASE.
+  //  10. WRITE (wopcm_size >> 12) to HUCL_REG_WOPCM_SIZE.
+  //  11. WRITE HUCL_CTL_KICK to HUCL_REG_HUC_CTL; then WRITE
+  //      HUCL_STATUS_ACCEPT to HUCL_REG_HUC_STATUS (models the
+  //      hardware-asserted edge; a live driver polls).
+  //  12. Record {blob_ptr, blob_len, wopcm_base, wopcm_size,
+  //      accepted=1}; bump LOADS + ACCEPTS.
+  //
+  // Both signature checks ALWAYS run before any register touch.
+  // Neither short-circuits on the other's success — the failure
+  // taxonomy tells the caller which half refused.  A second call
+  // with an ALREADY-ACCEPTED image is refused as ALREADY_LOADED;
+  // an operator that wants to reload runs huc_load_reset first
+  // (matches gucl_load's discipline).
+  // ==========================================================================
+
+  pub let hucl_load : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (blob_ptr: u64) (blob_len: u64) (wopcm_base: u64) (wopcm_size: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R37.M8-001 (#1285): DUAL-SIGNATURE verify + WOPCM upload + HUC_ACCEPTED handshake. §1-§3. Fails closed on either signature miss. Every register touch through gmmio_write32. Labels prefixed hucl_l_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // blob_ptr
+        mov r12, rsi;                    // blob_len
+        mov r13, rdx;                    // wopcm_base
+        mov r14, rcx;                    // wopcm_size
+
+        // 1. NULL blob.
+        cmp rbx, 0;
+        je  hucl_l_null;
+
+        // 2. Undersized.
+        cmp r12, 0x28;
+        jb  hucl_l_too_small;
+
+        // 3. Magic.
+        mov eax, [rbx + 0];
+        mov r15d, 0x46435548;            // 'HUCF' LE
+        cmp eax, r15d;
+        jne hucl_l_bad_magic;
+
+        // 4. Vendor sig.
+        mov rdi, rbx;
+        call hucl_verify_vendor;
+        cmp rax, 0;
+        jne hucl_l_vendor_bad;
+
+        // 5. Paideia sig.
+        mov rdi, rbx;
+        call hucl_verify_paideia;
+        cmp rax, 0;
+        jne hucl_l_paideia_bad;
+
+        // 6. Not already loaded.
+        lea r10, [rip + _hucl_accepted];
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        jne hucl_l_already;
+
+        // 7. gmmio bound.
+        call gmmio_is_bound;
+        cmp rax, 1;
+        jne hucl_l_not_bound;
+
+        // 8. WOPCM alignment + size.
+        mov rdi, r13;
+        call hucl_wopcm_aligned;
+        cmp rax, 0;
+        je  hucl_l_misaligned;
+
+        mov rdi, r14;
+        call hucl_wopcm_size_ok;
+        cmp rax, 0;
+        je  hucl_l_too_small_wopcm;
+
+        // 9. WOPCM_BASE: (base >> 16) | valid.
+        mov rdi, 0xC060;                 // HUCL_REG_WOPCM_BASE
+        mov rsi, r13;
+        shr rsi, 16;
+        or  rsi, 1;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne hucl_l_mmio;
+
+        // 10. WOPCM_SIZE: size >> 12.
+        mov rdi, 0xC064;                 // HUCL_REG_WOPCM_SIZE
+        mov rsi, r14;
+        shr rsi, 12;
+        call gmmio_write32;
+        cmp rax, 0;
+        jne hucl_l_mmio;
+
+        // 11a. KICK.
+        mov rdi, 0xC068;                 // HUCL_REG_HUC_CTL
+        mov rsi, 1;                      // KICK
+        call gmmio_write32;
+        cmp rax, 0;
+        jne hucl_l_mmio;
+
+        // 11b. HUC_ACCEPTED assertion (models the hardware-latched
+        //      edge; a live driver polls HUC_STATUS until this bit
+        //      is set by the HuC ROM).  On the synthetic backing,
+        //      the KMD writes the bit itself so the assertion
+        //      hucl_accepted() reports below can be tested.
+        mov rdi, 0xC06C;                 // HUCL_REG_HUC_STATUS
+        mov rsi, 1;                      // HUC_ACCEPTED
+        call gmmio_write32;
+        cmp rax, 0;
+        jne hucl_l_mmio;
+
+        // 12. Record.
+        lea r10, [rip + _hucl_blob_ptr];
+        mov [r10 + 0], rbx;
+        lea r10, [rip + _hucl_blob_len];
+        mov [r10 + 0], r12;
+        lea r10, [rip + _hucl_wopcm_base];
+        mov [r10 + 0], r13;
+        lea r10, [rip + _hucl_wopcm_size];
+        mov [r10 + 0], r14;
+        lea r10, [rip + _hucl_accepted];
+        mov rax, 1;
+        mov [r10 + 0], rax;
+
+        mov rdi, 0;                      // LOADS
+        call hucl_note;
+        mov rdi, 1;                      // ACCEPTS
+        call hucl_note;
+        xor rax, rax;
+        jmp hucl_l_out;
+
+      hucl_l_null:
+        mov rdi, 4;
+        call hucl_note;
+        mov rax, 0xFFFFF52A;
+        jmp hucl_l_out;
+      hucl_l_too_small:
+        mov rdi, 4;
+        call hucl_note;
+        mov rax, 0xFFFFF52E;
+        jmp hucl_l_out;
+      hucl_l_bad_magic:
+        mov rdi, 4;
+        call hucl_note;
+        mov rax, 0xFFFFF52D;
+        jmp hucl_l_out;
+      hucl_l_vendor_bad:
+        mov rdi, 2;                      // VENDOR_MISS
+        call hucl_note;
+        mov rdi, 4;
+        call hucl_note;
+        mov rax, 0xFFFFF52C;
+        jmp hucl_l_out;
+      hucl_l_paideia_bad:
+        mov rdi, 3;                      // PAIDEIA_MISS
+        call hucl_note;
+        mov rdi, 4;
+        call hucl_note;
+        mov rax, 0xFFFFF52B;
+        jmp hucl_l_out;
+      hucl_l_already:
+        mov rdi, 4;
+        call hucl_note;
+        mov rax, 0xFFFFF525;
+        jmp hucl_l_out;
+      hucl_l_not_bound:
+        mov rdi, 4;
+        call hucl_note;
+        mov rax, 0xFFFFF529;
+        jmp hucl_l_out;
+      hucl_l_misaligned:
+        mov rdi, 4;
+        call hucl_note;
+        mov rax, 0xFFFFF528;
+        jmp hucl_l_out;
+      hucl_l_too_small_wopcm:
+        mov rdi, 4;
+        call hucl_note;
+        mov rax, 0xFFFFF527;
+        jmp hucl_l_out;
+      hucl_l_mmio:
+        mov rdi, 4;
+        call hucl_note;
+        mov rax, 0xFFFFF526;
+
+      hucl_l_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Row accessors.
+  // ==========================================================================
+
+  pub let hucl_accepted : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-001 (#1285): 1 iff HuC has been accepted this boot. Labels prefixed hucl_ac_.",
+      block: {
+        lea r10, [rip + _hucl_accepted];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let hucl_blob_ptr_of : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-001 (#1285): recorded blob pointer or 0. Labels prefixed hucl_bp_.",
+      block: {
+        lea r10, [rip + _hucl_blob_ptr];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let hucl_blob_len_of : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-001 (#1285): recorded blob length or 0. Labels prefixed hucl_bl_.",
+      block: {
+        lea r10, [rip + _hucl_blob_len];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let hucl_wopcm_base_of : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-001 (#1285): recorded WOPCM base or 0. Labels prefixed hucl_wb_.",
+      block: {
+        lea r10, [rip + _hucl_wopcm_base];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let hucl_wopcm_size_of : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R37.M8-001 (#1285): recorded WOPCM size or 0. Labels prefixed hucl_wz_.",
+      block: {
+        lea r10, [rip + _hucl_wopcm_size];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+}
