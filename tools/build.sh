@@ -3791,6 +3791,44 @@ fi
 echo "[r39-m1-confine] R39.M1 (BT adapter + HCI channel + CNVi transport + schema) confined"
 
 # ---------------------------------------------------------------------------
+# R39.M2 (#1327/#1328/#1329/#1330): Bluetooth L2CAP substrate --
+# KIND_BT_L2CAP_CHANNEL (kind_bt_l2cap_channel), L2CAP fixed channels
+# (l2cap_fixed), L2CAP dynamic channels with LE CBFC (l2cap_dyn), and
+# the bt_l2cap_channel schema (bt_l2cap_channel).
+#
+# Four modules open the L2CAP layer above R39.M1's HCI substrate;
+# each owns its own state; tools/build.sh confines relocations against
+# each to its owning object so a second writer cannot forge an L2CAP
+# CHANNEL row, restamp a fixed-CID handler binding, drift a dynamic
+# session's credit balance, or forge a schema counter.
+KBL2C_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_bt_l2cap_channel.pdx"
+LFX_SRC="${REPO_ROOT}/src/kernel/core/drivers/bt/l2cap_fixed.pdx"
+LDYN_SRC="${REPO_ROOT}/src/kernel/core/drivers/bt/l2cap_dyn.pdx"
+BL2C_SRC="${REPO_ROOT}/src/kernel/core/ipc/bt_l2cap_channel.pdx"
+if [[ ! -f "${KBL2C_SRC}" || ! -f "${LFX_SRC}" || ! -f "${LDYN_SRC}" || ! -f "${BL2C_SRC}" ]]; then
+    echo "[r39-m2-confine] FAIL - one of the R39.M2 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_bt_l2cap_chan_table' 'core/cap/kind_bt_l2cap_channel.o'
+ec_confine_one '_bt_l2cap_chan_stats' 'core/cap/kind_bt_l2cap_channel.o'
+ec_confine_one '_lfx_channels'        'core/drivers/bt/l2cap_fixed.o'
+ec_confine_one '_lfx_stats'           'core/drivers/bt/l2cap_fixed.o'
+ec_confine_one '_lfx_init'            'core/drivers/bt/l2cap_fixed.o'
+ec_confine_one '_ldyn_sessions'       'core/drivers/bt/l2cap_dyn.o'
+ec_confine_one '_ldyn_stats'          'core/drivers/bt/l2cap_dyn.o'
+ec_confine_one '_ldyn_init'           'core/drivers/bt/l2cap_dyn.o'
+ec_confine_one '_ldyn_next_cid'       'core/drivers/bt/l2cap_dyn.o'
+ec_confine_one '_bl2c_sessions'       'core/ipc/bt_l2cap_channel.o'
+ec_confine_one '_bl2c_stats'          'core/ipc/bt_l2cap_channel.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_bt_l2cap_channel.pdx §2, l2cap_fixed.pdx §2," >&2
+    echo "  l2cap_dyn.pdx §2, and bt_l2cap_channel.pdx §1 for the" >&2
+    echo "  per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[r39-m2-confine] R39.M2 (BT L2CAP channel + fixed + dynamic + schema) confined"
+
+# ---------------------------------------------------------------------------
 # R39.M3 (#1332/#1333/#1334): Bluetooth GATT substrate --
 # KIND_BT_GATT_CONNECTION (kind_bt_gatt_connection), GATT server +
 # client + ATT PDU codec (gatt), bt_gatt_channel schema
