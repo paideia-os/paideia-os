@@ -4078,6 +4078,75 @@ auds_pin_one 'pub let audit_emit : (u64, u64, u64, u64, u64, u64) -> u64'
 echo "[audit-schema-confine] four validators, three pack/unpack pairs and audit_emit wrapper arities pinned"
 
 # ---------------------------------------------------------------------------
+# R41.M1-001/002/003 (#1365/#1366/#1367): SEMTERM CORE CONFINEMENT.
+#
+# semantic-term-core is the shared backend behind the R41 framebuffer
+# terminal and (later) the R44 GUI terminal. Three modules open R41.M1:
+# lexer, parser, and query-type-system. Each owns its own state cells;
+# tools/build.sh confines relocations against each to its owning object
+# so a second writer cannot silently:
+#   - forge a token record so a parser sees a keyword the lexer never
+#     produced (lexer confinement),
+#   - back-write an arena cell so a type checker walks a node shape the
+#     recogniser never emitted (parser confinement),
+#   - shadow a binding so an environment lookup returns a type the
+#     bind path never installed (types confinement).
+LEX_SRC="${REPO_ROOT}/src/kernel/core/semterm/lexer.pdx"
+PAR_SRC="${REPO_ROOT}/src/kernel/core/semterm/parser.pdx"
+TYQ_SRC="${REPO_ROOT}/src/kernel/core/semterm/types.pdx"
+if [[ ! -f "${LEX_SRC}" || ! -f "${PAR_SRC}" || ! -f "${TYQ_SRC}" ]]; then
+    echo "[semterm-confine] FAIL - one of the R41.M1 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_lex_state'    'core/semterm/lexer.o'
+ec_confine_one '_lex_stats'    'core/semterm/lexer.o'
+ec_confine_one '_par_arena'    'core/semterm/parser.o'
+ec_confine_one '_par_state'    'core/semterm/parser.o'
+ec_confine_one '_tyq_env'      'core/semterm/types.o'
+ec_confine_one '_tyq_types'    'core/semterm/types.o'
+ec_confine_one '_tyq_effects'  'core/semterm/types.o'
+ec_confine_one '_tyq_state'    'core/semterm/types.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/semterm/lexer.pdx §2, parser.pdx §2, and" >&2
+    echo "  types.pdx §4 for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[semterm-confine] R41.M1 (lexer + parser + types) state confined"
+
+# ARITY PINS. Every entry point takes only the caller-visible arguments
+# its contract names. A widening on any of these makes "install a
+# fabricated token in the state without going through the scanner",
+# "wire the arena into a shape the recogniser never produced", or
+# "shadow a binding so the checker walks a different environment"
+# expressible in a call site the confinement gate above cannot see.
+semterm_pin_one() {
+    local src="$1" decl="$2"
+    if ! grep -qF -- "${decl}" "${src}"; then
+        echo "[semterm-confine] FAIL - expected declaration not found in ${src}:" >&2
+        echo "    ${decl}" >&2
+        echo "" >&2
+        echo "  A SEMTERM CORE ENTRY POINT'S ARITY IS DECIDED BY THE MODULE" >&2
+        echo "  AND NEVER BY A CALLER. See the module's §4 arity discipline" >&2
+        echo "  note for why a widening voids the confinement argument." >&2
+        exit 1
+    fi
+}
+semterm_pin_one "${LEX_SRC}" 'pub let lex_bind : (u64, u64) -> u64'
+semterm_pin_one "${LEX_SRC}" 'pub let lex_next : () -> u64'
+semterm_pin_one "${LEX_SRC}" 'pub let lex_tok_kind : () -> u64'
+semterm_pin_one "${LEX_SRC}" 'pub let lex_kw_match : (u64, u64) -> u64'
+semterm_pin_one "${PAR_SRC}" 'pub let par_alloc : (u64) -> u64'
+semterm_pin_one "${PAR_SRC}" 'pub let par_node_set : (u64, u64, u64) -> u64'
+semterm_pin_one "${PAR_SRC}" 'pub let par_node_get : (u64, u64) -> u64'
+semterm_pin_one "${PAR_SRC}" 'pub let par_expect : (u64) -> u64'
+semterm_pin_one "${PAR_SRC}" 'pub let par_parse_select : () -> u64'
+semterm_pin_one "${TYQ_SRC}" 'pub let tyq_bind : (u64, u64) -> u64'
+semterm_pin_one "${TYQ_SRC}" 'pub let tyq_lookup : (u64) -> u64'
+semterm_pin_one "${TYQ_SRC}" 'pub let tyq_infer : (u64) -> u64'
+semterm_pin_one "${TYQ_SRC}" 'pub let tyq_effect_union : (u64, u64) -> u64'
+echo "[semterm-confine] lexer / parser / types entry-point arities pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

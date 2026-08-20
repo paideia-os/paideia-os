@@ -1,0 +1,829 @@
+// src/kernel/core/semterm/parser.pdx -- R41.M1-002 (#1366)
+//
+// Recursive-descent PARSER for the semantic terminal command grammar.
+// Consumes tokens from the lexer's cursor (semterm/lexer.pdx) and
+// produces a typed AST in a per-session arena.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the SHAPE-BUILDER on top of the token cursor. par_parse_query
+// drives the lexer one lex_next call at a time, and each recognised
+// production allocates one AST node in the shared arena and returns
+// its index. Nodes carry a kind tag (§1), a small fixed payload, and
+// LEFT / RIGHT child indices; larger productions (SELECT / JOIN /
+// WHERE) chain a linked list off a HEAD child so the arena stays
+// homogeneous 32-byte cells with no per-kind allocation policy.
+//
+// It does NOT type-check anything -- that is R41.M1-003 / types.pdx.
+// It does NOT decode literal values into their runtime representation;
+// a Literal node carries a (start, len) slice back into the input
+// buffer, and the caller decodes when it materialises the value.
+//
+// The parser is a SCAFFOLD in the D7 sense: R41.M1 wires it into the
+// witness tree but no live command path calls it yet. par_arbitrated()
+// returns 0 until a later round binds it into the terminal frontend.
+//
+// =============================================================================
+// §1  AST NODE UNION
+// =============================================================================
+//
+//   AST_NONE           (0)   sentinel (index 0 is reserved -- a legitimate
+//                             child of 0 means "absent")
+//   AST_SELECT_STMT    (1)   SELECT ... FROM ... [WHERE ...] [ORDER ...] [LIMIT ...]
+//                             LEFT  = first ColumnExpr in projection list
+//                             RIGHT = first TableRef in FROM list
+//                             plus AUX cells for WHERE / ORDER / LIMIT heads
+//   AST_TABLE_REF      (2)   IDENT [AS IDENT]
+//                             P0 = ident_start, P1 = ident_len
+//                             P2 = alias_start, P3 = alias_len   (0 if none)
+//   AST_JOIN_EXPR      (3)   JOIN TableRef ON BinOp
+//                             LEFT = TableRef, RIGHT = ON BinOp (or 0)
+//   AST_WHERE_CLAUSE   (4)   WHERE Expr
+//                             LEFT = predicate Expr
+//   AST_ORDER_CLAUSE   (5)   ORDER BY ColumnExpr [ASC|DESC]
+//                             LEFT = ColumnExpr, P0 = direction (0=ASC 1=DESC)
+//   AST_COLUMN_EXPR    (6)   IDENT [DOT IDENT]  (Table.Column form)
+//                             P0 = qualifier_start, P1 = qualifier_len (0 if none)
+//                             P2 = column_start,    P3 = column_len
+//   AST_BIN_OP         (7)   Expr <op> Expr
+//                             LEFT / RIGHT = operands, P0 = op_tok_kind
+//   AST_FN_CALL        (8)   IDENT LPAREN [Expr,...] RPAREN
+//                             LEFT = first ArgExpr, P0 = name_start, P1 = name_len
+//   AST_LITERAL        (9)   INTLIT | STRLIT
+//                             P0 = tok_kind (18=INTLIT 19=STRLIT)
+//                             P2 = value_start, P3 = value_len
+//
+// Every node record has the same layout regardless of kind:
+//
+//   node[0]  kind    (u64)
+//   node[1]  LEFT    (arena index)
+//   node[2]  RIGHT   (arena index)
+//   node[3]  NEXT    (arena index -- list link, 0 = end)
+//   node[4]  P0      (u64 payload)
+//   node[5]  P1      (u64 payload)
+//   node[6]  P2      (u64 payload)
+//   node[7]  P3      (u64 payload)
+//
+// Node width = 64 bytes. Arena capacity PAR_ARENA_NODES = 256 nodes =
+// 16 KiB. A single query bigger than 256 nodes is rejected with
+// PAR_ERR_ARENA_FULL rather than allowed to trample the arena.
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _par_arena and _par_state are written only by helpers in this module.
+// tools/build.sh confines relocations against each to
+// `core/semterm/parser.o`.
+//
+// STATE LAYOUT -- _par_state : [u64; 8]
+//   +0   next        next free arena index (starts at 1; 0 is reserved)
+//   +8   err         sticky error code
+//   +16  root        root node index (0 until par_parse_query completes)
+//   +24  init_mark   0xC0DE once par_reset has run
+//   +32..+56  reserved for R41.M2 counters (not used at this milestone)
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFF160..0xFFFFF16F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint. Adjacent used band above: lexer
+// 0xFFFFF170..7F. Adjacent free band below: types 0xFFFFF150..5F.
+//
+//   PAR_OK              = 0
+//   PAR_ERR_UNEXPECTED  = 0xFFFFF16F   expected one token kind, saw another
+//   PAR_ERR_ARENA_FULL  = 0xFFFFF16E   node arena exhausted
+//   PAR_ERR_NOT_INIT    = 0xFFFFF16D   par_alloc without par_reset
+//   PAR_ERR_LEX         = 0xFFFFF16C   lexer latched an error mid-parse
+//   PAR_ERR_BAD_NODE    = 0xFFFFF16B   par_node_field on out-of-range index
+//   PAR_ERR_INTERNAL    = 0xFFFFF16A   unreachable-fallthrough tripwire
+//
+// =============================================================================
+// §4  ARITY DISCIPLINE
+// =============================================================================
+//
+// par_alloc takes ONE argument (kind). Every other payload cell is set
+// through par_node_set(idx, off, val), which validates idx < next and
+// off < 8. A widening of par_alloc to accept caller-supplied children
+// would let a caller wire the arena into a shape the recogniser never
+// produced.
+
+module Parser = structure {
+
+  // AST node kinds (§1).
+  pub let AST_NONE         : u64 = 0
+  pub let AST_SELECT_STMT  : u64 = 1
+  pub let AST_TABLE_REF    : u64 = 2
+  pub let AST_JOIN_EXPR    : u64 = 3
+  pub let AST_WHERE_CLAUSE : u64 = 4
+  pub let AST_ORDER_CLAUSE : u64 = 5
+  pub let AST_COLUMN_EXPR  : u64 = 6
+  pub let AST_BIN_OP       : u64 = 7
+  pub let AST_FN_CALL      : u64 = 8
+  pub let AST_LITERAL      : u64 = 9
+  pub let AST_KIND_MAX     : u64 = 9
+
+  // Node record offsets (words; node stride = 8 words = 64 bytes).
+  pub let AST_OFF_KIND   : u64 = 0
+  pub let AST_OFF_LEFT   : u64 = 1
+  pub let AST_OFF_RIGHT  : u64 = 2
+  pub let AST_OFF_NEXT   : u64 = 3
+  pub let AST_OFF_P0     : u64 = 4
+  pub let AST_OFF_P1     : u64 = 5
+  pub let AST_OFF_P2     : u64 = 6
+  pub let AST_OFF_P3     : u64 = 7
+  pub let AST_OFF_MAX    : u64 = 7
+
+  pub let PAR_ARENA_NODES : u64 = 256
+  pub let PAR_ARENA_WORDS : u64 = 2048             // 256 * 8
+
+  // Failure taxonomy (§3).
+  pub let PAR_OK              : u64 = 0
+  pub let PAR_ERR_UNEXPECTED  : u64 = 0xFFFFF16F
+  pub let PAR_ERR_ARENA_FULL  : u64 = 0xFFFFF16E
+  pub let PAR_ERR_NOT_INIT    : u64 = 0xFFFFF16D
+  pub let PAR_ERR_LEX         : u64 = 0xFFFFF16C
+  pub let PAR_ERR_BAD_NODE    : u64 = 0xFFFFF16B
+  pub let PAR_ERR_INTERNAL    : u64 = 0xFFFFF16A
+
+  pub let PAR_INIT_MARK  : u64 = 0xC0DE
+
+  pub let mut _par_arena : [u64; 2048] = uninit @align(64)
+  pub let mut _par_state : [u64; 8]    = uninit @align(64)
+
+  // ==========================================================================
+  // Reset. Boot + teardown. Clears arena and state.
+  // ==========================================================================
+
+  pub let par_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M1-002 (#1366): clear arena + state, install init_mark, set next=1 (index 0 reserved). Labels prefixed par_rs_.",
+      block: {
+        lea r10, [rip + _par_arena];
+        xor rax, rax;
+        xor rcx, rcx;
+      par_rs_ar:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 2048;
+        jb  par_rs_ar;
+
+        lea r10, [rip + _par_state];
+        xor rcx, rcx;
+      par_rs_st:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  par_rs_st;
+
+        // next = 1 (0 reserved).
+        mov rax, 1;
+        mov [r10 + 0], rax;
+        // init_mark.
+        mov rax, 0xC0DE;
+        mov [r10 + 24], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let par_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R41.M1-002 (#1366): honesty pin. Returns 0 until the terminal frontend drives par_parse_query.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let par_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M1-002 (#1366): sticky error latch readback. Labels prefixed par_er_.",
+      block: {
+        lea r10, [rip + _par_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let par_next_idx : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M1-002 (#1366): current arena high-water mark. Labels prefixed par_nx_.",
+      block: {
+        lea r10, [rip + _par_state];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let par_capacity : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R41.M1-002 (#1366): arena capacity constant.",
+      block: {
+        mov rax, 256;
+        ret
+      }
+    } @no_frame
+
+  pub let par_root : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M1-002 (#1366): root index (0 until par_parse_query completes). Labels prefixed par_rt_.",
+      block: {
+        lea r10, [rip + _par_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let par_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M1-002 (#1366): 1 iff init_mark matches. Labels prefixed par_bd_.",
+      block: {
+        lea r10, [rip + _par_state];
+        mov rax, [r10 + 24];
+        mov r11, 0xC0DE;
+        cmp rax, r11;
+        jne par_bd_no;
+        mov rax, 1;
+        ret;
+      par_bd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let par_set_err : (u64) -> () !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M1-002 (#1366): first-writer-wins error latch. Labels prefixed par_se_.",
+      block: {
+        lea r10, [rip + _par_state];
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        jne par_se_out;
+        mov [r10 + 8], rdi;
+      par_se_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // par_alloc(kind) -> arena_idx | 0 (on error, err latched)
+  //
+  // Bumps _par_state[next] by one, returns the newly allocated index.
+  // Refuses if init_mark unset (PAR_ERR_NOT_INIT) or arena full
+  // (PAR_ERR_ARENA_FULL).
+  // ==========================================================================
+
+  pub let par_alloc : (u64) -> u64 !{mem} @{} =
+    fn (kind: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M1-002 (#1366): allocate one node, install kind, return index. Labels prefixed par_al_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;                   // kind
+
+        lea r10, [rip + _par_state];
+        mov rax, [r10 + 24];
+        mov r11, 0xC0DE;
+        cmp rax, r11;
+        jne par_al_not_init;
+
+        mov rax, [r10 + 0];             // next
+        cmp rax, 256;                   // PAR_ARENA_NODES
+        jae par_al_full;
+
+        mov r11, rax;
+        add r11, 1;
+        mov [r10 + 0], r11;             // next++
+
+        // Zero the eight cells of node[rax].
+        lea r10, [rip + _par_arena];
+        mov r8, rax;
+        shl r8, 3;                      // node_word_index = idx * 8
+        mov r11, 0;
+      par_al_zero:
+        cmp r11, 8;
+        jae par_al_kind;
+        mov r9, r8;
+        add r9, r11;
+        mov [r10 + r9 * 8], r11;        // temporarily writes r11 (= 0) -- correct.
+        add r11, 1;
+        jmp par_al_zero;
+      par_al_kind:
+        // Install kind at offset 0.
+        mov [r10 + r8 * 8], rbx;
+        // Return the arena index.
+        pop rbx;
+        ret;
+
+      par_al_not_init:
+        mov rdi, 0xFFFFF16D;
+        call par_set_err;
+        xor rax, rax;
+        pop rbx;
+        ret;
+      par_al_full:
+        mov rdi, 0xFFFFF16E;
+        call par_set_err;
+        xor rax, rax;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // par_node_set(idx, off, val) -> u64 { PAR_OK | PAR_ERR_BAD_NODE }
+  //
+  // Writes val to node[idx][off]. Validates both bounds.
+  // ==========================================================================
+
+  pub let par_node_set : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (idx: u64, off: u64, val: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M1-002 (#1366): store into arena node cell after bounds check. Labels prefixed par_ns_.",
+      block: {
+        // Bounds: idx in [1, next), off in [0, 7].
+        cmp rdi, 1;
+        jb  par_ns_bad;
+        lea r10, [rip + _par_state];
+        mov rax, [r10 + 0];
+        cmp rdi, rax;
+        jae par_ns_bad;
+        cmp rsi, 7;
+        ja  par_ns_bad;
+
+        lea r10, [rip + _par_arena];
+        mov r8, rdi;
+        shl r8, 3;                      // idx * 8 words
+        add r8, rsi;
+        mov [r10 + r8 * 8], rdx;
+        xor rax, rax;
+        ret;
+      par_ns_bad:
+        mov rdi, 0xFFFFF16B;
+        call par_set_err;
+        mov rax, 0xFFFFF16B;
+        ret
+      }
+    }
+
+  pub let par_node_get : (u64, u64) -> u64 !{mem} @{} =
+    fn (idx: u64, off: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M1-002 (#1366): read arena node cell after bounds check; returns 0 on out-of-range. Labels prefixed par_ng_.",
+      block: {
+        cmp rdi, 1;
+        jb  par_ng_bad;
+        lea r10, [rip + _par_state];
+        mov rax, [r10 + 0];
+        cmp rdi, rax;
+        jae par_ng_bad;
+        cmp rsi, 7;
+        ja  par_ng_bad;
+
+        lea r10, [rip + _par_arena];
+        mov r8, rdi;
+        shl r8, 3;
+        add r8, rsi;
+        mov rax, [r10 + r8 * 8];
+        ret;
+      par_ng_bad:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // par_expect(tok_expected) -> u64  { PAR_OK | PAR_ERR_UNEXPECTED }
+  //
+  // Advances the lexer one token (lex_next) and checks it equals the
+  // expected kind. If the lexer latched an error, translates to
+  // PAR_ERR_LEX. Otherwise if the token does not match, latches
+  // PAR_ERR_UNEXPECTED.
+  // ==========================================================================
+
+  pub let par_expect : (u64) -> u64 !{mem} @{} =
+    fn (expected: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M1-002 (#1366): expectation-check driver. Labels prefixed par_ex_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+
+        call lex_next;
+        // Sample the lexer's err latch first.
+        call lex_err;
+        cmp rax, 0;
+        jne par_ex_lex_err;
+
+        call lex_tok_kind;
+        cmp rax, rbx;
+        jne par_ex_mismatch;
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      par_ex_lex_err:
+        mov rdi, 0xFFFFF16C;
+        call par_set_err;
+        mov rax, 0xFFFFF16C;
+        pop rbx;
+        ret;
+      par_ex_mismatch:
+        mov rdi, 0xFFFFF16F;
+        call par_set_err;
+        mov rax, 0xFFFFF16F;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // par_parse_column_ref() -> arena_idx | 0
+  //
+  // Parses one COLUMN_EXPR = IDENT [ DOT IDENT ]. The caller has NOT yet
+  // consumed the leading IDENT; this function calls lex_next to fetch it.
+  // ==========================================================================
+
+  pub let par_parse_column_ref : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M1-002 (#1366): parse a Column reference (possibly qualified). Labels prefixed par_pc_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // First IDENT.
+        mov rdi, 17;                    // TOK_IDENT
+        call par_expect;
+        cmp rax, 0;
+        jne par_pc_fail;
+        call lex_tok_start;
+        mov r12, rax;
+        call lex_tok_len;
+        mov r13, rax;
+
+        // Allocate the ColumnExpr node.
+        mov rdi, 6;                     // AST_COLUMN_EXPR
+        call par_alloc;
+        cmp rax, 0;
+        je  par_pc_fail;
+        mov rbx, rax;                   // node idx
+
+        // We defer writing until we know whether a DOT follows.
+        // Peek at next lex_next -- we need to know what comes next.
+        // The paideia-as lexer has no "peek" API so we lex the next
+        // token, and if it is not DOT we save (start,len) as the column
+        // rather than the qualifier.
+        call lex_next;
+        call lex_err;
+        cmp rax, 0;
+        jne par_pc_lexerr;
+        call lex_tok_kind;
+        cmp rax, 32;                    // TOK_DOT
+        je  par_pc_qual;
+
+        // No DOT: the first IDENT was the column.
+        // Column at P2/P3; qualifier at 0/0.
+        mov rdi, rbx;
+        mov rsi, 6;                     // P2
+        mov rdx, r12;                   // column_start
+        call par_node_set;
+        cmp rax, 0;
+        jne par_pc_fail;
+
+        mov rdi, rbx;
+        mov rsi, 7;                     // P3
+        mov rdx, r13;                   // column_len
+        call par_node_set;
+        cmp rax, 0;
+        jne par_pc_fail;
+
+        // The consumed token (in _lex_state[tok_kind]) is the NEXT parser
+        // token -- for this scaffold, that is left for the caller to
+        // handle via a subsequent lex-consuming call. Since the parser
+        // is a scaffold, the caller inspects _lex_state directly.
+        mov rax, rbx;
+        jmp par_pc_out;
+
+      par_pc_qual:
+        // The IDENT before DOT was the qualifier; now consume second IDENT.
+        mov rdi, rbx;
+        mov rsi, 4;                     // P0 = qualifier_start
+        mov rdx, r12;
+        call par_node_set;
+        cmp rax, 0;
+        jne par_pc_fail;
+        mov rdi, rbx;
+        mov rsi, 5;                     // P1 = qualifier_len
+        mov rdx, r13;
+        call par_node_set;
+        cmp rax, 0;
+        jne par_pc_fail;
+
+        mov rdi, 17;                    // TOK_IDENT (after DOT)
+        call par_expect;
+        cmp rax, 0;
+        jne par_pc_fail;
+        call lex_tok_start;
+        mov r14, rax;
+        call lex_tok_len;
+        mov r15, rax;
+
+        mov rdi, rbx;
+        mov rsi, 6;
+        mov rdx, r14;
+        call par_node_set;
+        cmp rax, 0;
+        jne par_pc_fail;
+        mov rdi, rbx;
+        mov rsi, 7;
+        mov rdx, r15;
+        call par_node_set;
+        cmp rax, 0;
+        jne par_pc_fail;
+
+        mov rax, rbx;
+        jmp par_pc_out;
+
+      par_pc_lexerr:
+        mov rdi, 0xFFFFF16C;
+        call par_set_err;
+      par_pc_fail:
+        xor rax, rax;
+      par_pc_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // par_parse_literal() -> arena_idx | 0
+  //
+  // Called AFTER lex_next has produced an INTLIT or STRLIT token.
+  // Reads _lex_state fields (no additional lex_next), packages them.
+  // ==========================================================================
+
+  pub let par_parse_literal : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M1-002 (#1366): package the current literal token. Labels prefixed par_pl_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        call lex_tok_kind;
+        mov rbx, rax;
+        cmp rbx, 18;                    // TOK_INTLIT
+        je  par_pl_ok;
+        cmp rbx, 19;                    // TOK_STRLIT
+        je  par_pl_ok;
+        mov rdi, 0xFFFFF16F;
+        call par_set_err;
+        xor rax, rax;
+        jmp par_pl_out;
+      par_pl_ok:
+        call lex_tok_start;
+        mov r12, rax;
+        call lex_tok_len;
+        mov r13, rax;
+
+        mov rdi, 9;                     // AST_LITERAL
+        call par_alloc;
+        cmp rax, 0;
+        je  par_pl_fail;
+        push rax;
+        mov rdi, rax;
+        mov rsi, 4;                     // P0 = tok_kind
+        mov rdx, rbx;
+        call par_node_set;
+        cmp rax, 0;
+        jne par_pl_fail_stk;
+        pop rax;
+        push rax;
+        mov rdi, rax;
+        mov rsi, 6;                     // P2 = value_start
+        mov rdx, r12;
+        call par_node_set;
+        cmp rax, 0;
+        jne par_pl_fail_stk;
+        pop rax;
+        push rax;
+        mov rdi, rax;
+        mov rsi, 7;                     // P3 = value_len
+        mov rdx, r13;
+        call par_node_set;
+        cmp rax, 0;
+        jne par_pl_fail_stk;
+        pop rax;
+        jmp par_pl_out;
+
+      par_pl_fail_stk:
+        pop rax;
+      par_pl_fail:
+        xor rax, rax;
+      par_pl_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // par_parse_table_ref() -> arena_idx | 0
+  //
+  // Parses one TABLE_REF = IDENT [AS IDENT]. Same one-token-lookahead
+  // pattern as par_parse_column_ref.
+  // ==========================================================================
+
+  pub let par_parse_table_ref : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M1-002 (#1366): parse one table reference. Labels prefixed par_pt_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rdi, 17;                    // TOK_IDENT
+        call par_expect;
+        cmp rax, 0;
+        jne par_pt_fail;
+        call lex_tok_start;
+        mov r12, rax;
+        call lex_tok_len;
+        mov r13, rax;
+
+        mov rdi, 2;                     // AST_TABLE_REF
+        call par_alloc;
+        cmp rax, 0;
+        je  par_pt_fail;
+        mov rbx, rax;
+
+        mov rdi, rbx;
+        mov rsi, 4;
+        mov rdx, r12;
+        call par_node_set;
+        cmp rax, 0;
+        jne par_pt_fail;
+        mov rdi, rbx;
+        mov rsi, 5;
+        mov rdx, r13;
+        call par_node_set;
+        cmp rax, 0;
+        jne par_pt_fail;
+
+        // Optional AS IDENT.
+        call lex_next;
+        call lex_err;
+        cmp rax, 0;
+        jne par_pt_lexerr;
+        call lex_tok_kind;
+        cmp rax, 8;                     // TOK_KW_AS
+        jne par_pt_no_alias;
+
+        mov rdi, 17;                    // TOK_IDENT for the alias
+        call par_expect;
+        cmp rax, 0;
+        jne par_pt_fail;
+        call lex_tok_start;
+        mov r14, rax;
+        call lex_tok_len;
+        mov r15, rax;
+
+        mov rdi, rbx;
+        mov rsi, 6;
+        mov rdx, r14;
+        call par_node_set;
+        cmp rax, 0;
+        jne par_pt_fail;
+        mov rdi, rbx;
+        mov rsi, 7;
+        mov rdx, r15;
+        call par_node_set;
+        cmp rax, 0;
+        jne par_pt_fail;
+
+      par_pt_no_alias:
+        mov rax, rbx;
+        jmp par_pt_out;
+
+      par_pt_lexerr:
+        mov rdi, 0xFFFFF16C;
+        call par_set_err;
+      par_pt_fail:
+        xor rax, rax;
+      par_pt_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // par_parse_select() -> arena_idx | 0
+  //
+  // Parses a minimal SELECT column_ref FROM table_ref [SEMI].
+  // A production grammar has more grammar but this scaffold exercises
+  // the recogniser end-to-end and demonstrates the arena wiring; the
+  // fuller grammar (multiple columns / WHERE / ORDER / LIMIT) will land
+  // in R41.M2 when the terminal frontend needs it.
+  // ==========================================================================
+
+  pub let par_parse_select : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M1-002 (#1366): minimal SELECT ... FROM ... recogniser. Labels prefixed par_ps_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rdi, 1;                     // TOK_KW_SELECT
+        call par_expect;
+        cmp rax, 0;
+        jne par_ps_fail;
+
+        // Allocate the SelectStmt.
+        mov rdi, 1;                     // AST_SELECT_STMT
+        call par_alloc;
+        cmp rax, 0;
+        je  par_ps_fail;
+        mov rbx, rax;
+
+        // Projection: one ColumnExpr for this scaffold.
+        call par_parse_column_ref;
+        cmp rax, 0;
+        je  par_ps_fail;
+        mov r12, rax;                   // ColumnExpr idx
+
+        // LEFT = projection head.
+        mov rdi, rbx;
+        mov rsi, 1;                     // LEFT
+        mov rdx, r12;
+        call par_node_set;
+        cmp rax, 0;
+        jne par_ps_fail;
+
+        // par_parse_column_ref advanced one token past the ident; that
+        // token is now in _lex_state and MUST be TOK_KW_FROM.
+        call lex_tok_kind;
+        cmp rax, 2;                     // TOK_KW_FROM
+        jne par_ps_expect_from_fail;
+
+        // TableRef.
+        call par_parse_table_ref;
+        cmp rax, 0;
+        je  par_ps_fail;
+        mov r13, rax;
+
+        mov rdi, rbx;
+        mov rsi, 2;                     // RIGHT
+        mov rdx, r13;
+        call par_node_set;
+        cmp rax, 0;
+        jne par_ps_fail;
+
+        // Record root.
+        lea r10, [rip + _par_state];
+        mov [r10 + 16], rbx;
+
+        mov rax, rbx;
+        jmp par_ps_out;
+
+      par_ps_expect_from_fail:
+        mov rdi, 0xFFFFF16F;
+        call par_set_err;
+      par_ps_fail:
+        xor rax, rax;
+      par_ps_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
