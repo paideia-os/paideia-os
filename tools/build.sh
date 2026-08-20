@@ -3814,6 +3814,37 @@ fi
 echo "[r39-m4-confine] R39.M4 (BT LE SC pairing + KIND_BT_PAIRING + channel) confined"
 
 # ---------------------------------------------------------------------------
+# R39.M5 (#1339/#1340/#1341): Bluetooth A2DP -- profile + audio-graph
+# bridge + retransmission/resync.
+#
+# Three modules open R39.M5.  Each owns its own state cells + counters;
+# tools/build.sh confines relocations against each to its owning object
+# so a second writer cannot silently forge an SEP row, promote an FSM
+# edge, forge a bridge record, or hide a dropped ACL packet.
+A2DP_SRC="${REPO_ROOT}/src/kernel/core/drivers/bt/a2dp.pdx"
+A2DB_SRC="${REPO_ROOT}/src/kernel/core/drivers/bt/a2dp_bridge.pdx"
+A2RTX_SRC="${REPO_ROOT}/src/kernel/core/drivers/bt/a2dp_rtx.pdx"
+if [[ ! -f "${A2DP_SRC}" || ! -f "${A2DB_SRC}" || ! -f "${A2RTX_SRC}" ]]; then
+    echo "[r39-m5-confine] FAIL - one of the R39.M5 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_a2dp_seps'      'core/drivers/bt/a2dp.o'
+ec_confine_one '_a2dp_stats'     'core/drivers/bt/a2dp.o'
+ec_confine_one '_a2dp_init'      'core/drivers/bt/a2dp.o'
+ec_confine_one '_a2db_bridges'   'core/drivers/bt/a2dp_bridge.o'
+ec_confine_one '_a2db_stats'     'core/drivers/bt/a2dp_bridge.o'
+ec_confine_one '_a2db_init'      'core/drivers/bt/a2dp_bridge.o'
+ec_confine_one '_a2rtx_rows'     'core/drivers/bt/a2dp_rtx.o'
+ec_confine_one '_a2rtx_stats'    'core/drivers/bt/a2dp_rtx.o'
+ec_confine_one '_a2rtx_init'     'core/drivers/bt/a2dp_rtx.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See a2dp.pdx §4, a2dp_bridge.pdx §2, and a2dp_rtx.pdx §2" >&2
+    echo "  for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[r39-m5-confine] R39.M5 (BT A2DP + bridge + retx) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

@@ -1,0 +1,709 @@
+// src/kernel/core/drivers/bt/a2dp_rtx.pdx — R39.M5-003 (#1341)
+//
+// A2DP retransmission + resync policy.  For each A2DP SEP that has a
+// live bridge (a2dp_bridge.pdx), maintain a small drift + retransmit
+// bookkeeping row that the L2CAP transport (R39.M2) and the audio
+// bridge consult on packet loss and clock skew:
+//
+//   * ACL retransmit-count per SEP (bounded, so a broken link cannot
+//     stall the audio graph forever);
+//   * timestamp drift (last_epoch delta) with a 20 ms resync threshold;
+//   * underrun drain policy for stalled consumers.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the CANONICAL DRIFT + RETX BOOKKEEPING SITE for A2DP bridges.
+// Every bridge record in a2dp_bridge.pdx has at most one matching
+// row here (keyed by sep_id); the row holds the running retransmit
+// count, the last-observed frame epoch, and a resync-request flag.
+// A second table would let one path see the link as within-budget and
+// the other as blown, and the L2CAP transport would happily drop
+// packets the audio bridge was still counting on.
+//
+// It is NOT the retransmission mechanism.  ACL retransmit is a
+// controller-side property (BT §4E.5); this module RECORDS the count
+// and enforces the CEILING (A2RTX_RETX_MAX_PER_SEP).  When the ceiling
+// is exceeded, `a2rtx_note_loss` returns A2RTX_EXCEEDED and the caller
+// (the L2CAP transport) is expected to tear down the stream.
+//
+// It is NOT the wallclock.  The bridge's last_frame_epoch is a MONOTONIC
+// ORDINAL (a running sample count); the RESYNC threshold is expressed
+// in samples, not milliseconds.  20 ms at 48 kHz is 960 samples; at
+// 44.1 kHz it is 882.  A2RTX_RESYNC_SAMPLES rounds up to 1024 to make
+// the arithmetic exact for the SBC / AAC frame sizes.
+//
+// It is NOT the drain-policy scheduler.  On underrun the row records
+// the observation and returns A2RTX_UNDERRUN_DRAIN; the audio bridge
+// consumer decides whether to insert silence or advance the ring.
+//
+// =============================================================================
+// §1  RETX ROW TABLE
+// =============================================================================
+//
+// A2RTX_ROW_MAX = 2 (one per bridge; matches A2DB_BRIDGE_MAX).  Fixed
+// cap is deliberate at R39.M5.
+//
+// Per-row (4 u64, 32 bytes; row_id r lives at word offset r*4):
+//
+//   [+0]   active(bit 0) | resync_req(bit 1) | sep_id(bits 8..15)
+//   [+8]   retx_count                (monotonic, capped at
+//                                     A2RTX_RETX_MAX_PER_SEP)
+//   [+16]  last_observed_epoch       (u64; from a2db_row_epoch)
+//   [+24]  underrun_count
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _a2rtx_rows and _a2rtx_stats are written only by helpers in this
+// module.  tools/build.sh confines relocations against each to
+// core/drivers/bt/a2dp_rtx.o.
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFF2A0..0xFFFFF2AF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: a2dp_bridge
+// 0xFFFFF2B0..0x2BF; free band below at request time).
+
+module A2dpRtx = structure {
+
+  // §1: sizing.
+  pub let A2RTX_ROW_MAX   : u64 = 2
+  pub let A2RTX_ROW_WORDS : u64 = 4
+  pub let A2RTX_ROW_NONE  : u64 = 0xFF
+
+  // Retransmit ceiling per SEP.  Beyond this a bridge is torn down.
+  // Chosen to keep an A2DP session up over one dropped burst but not a
+  // sustained loss episode.
+  pub let A2RTX_RETX_MAX_PER_SEP : u64 = 8
+
+  // Drift threshold: 1024 samples (~= 21.3 ms at 48 kHz; ~= 23.2 ms at
+  // 44.1 kHz).  A drift above this samples-count triggers resync_req.
+  pub let A2RTX_RESYNC_SAMPLES : u64 = 1024
+
+  // Underrun ceiling: after N observations the drain policy stops
+  // recording (the audio bridge should already have escalated).
+  pub let A2RTX_UNDERRUN_MAX : u64 = 16
+
+  // Column offsets (byte offsets).
+  pub let A2RTX_COL_META         : u64 = 0
+  pub let A2RTX_COL_RETX         : u64 = 8
+  pub let A2RTX_COL_EPOCH        : u64 = 16
+  pub let A2RTX_COL_UNDERRUN     : u64 = 24
+
+  // §3: failure taxonomy 0xFFFFF2A0..0xFFFFF2AF.
+  pub let A2RTX_OK                : u64 = 0
+  pub let A2RTX_BAD_ARG           : u64 = 0xFFFFF2AF
+  pub let A2RTX_BAD_ROW           : u64 = 0xFFFFF2AE
+  pub let A2RTX_BAD_SEP           : u64 = 0xFFFFF2AD
+  pub let A2RTX_ENOSPC            : u64 = 0xFFFFF2AC
+  pub let A2RTX_ROW_IN_USE        : u64 = 0xFFFFF2AB
+  pub let A2RTX_EXCEEDED          : u64 = 0xFFFFF2AA
+  pub let A2RTX_UNDERRUN_DRAIN    : u64 = 0xFFFFF2A9
+  pub let A2RTX_UNDERRUN_CAPPED   : u64 = 0xFFFFF2A8
+  pub let A2RTX_NO_BRIDGE         : u64 = 0xFFFFF2A7
+  pub let A2RTX_BAD_EPOCH         : u64 = 0xFFFFF2A6
+  pub let A2RTX_NOT_INITIALIZED   : u64 = 0xFFFFF2A5
+  pub let A2RTX_BAD_STATE         : u64 = 0xFFFFF2A4
+  pub let A2RTX_REFUSED           : u64 = 0xFFFFF2A1
+
+  // §2: state cells.  2 rows * 4 u64s = 8 u64s.
+  pub let mut _a2rtx_rows  : [u64; 8] = uninit @align(64)
+  pub let mut _a2rtx_stats : [u64; 8] = uninit @align(64)
+  pub let mut _a2rtx_init  : u64      = 0
+
+  // Counter ordinals.
+  pub let A2RTX_ST_ROWS_INSTALLED : u64 = 0
+  pub let A2RTX_ST_LOSSES         : u64 = 1
+  pub let A2RTX_ST_EXCEEDED       : u64 = 2
+  pub let A2RTX_ST_RESYNCS        : u64 = 3
+  pub let A2RTX_ST_UNDERRUNS      : u64 = 4
+  pub let A2RTX_ST_DRAIN          : u64 = 5
+  pub let A2RTX_ST_CAPPED         : u64 = 6
+  pub let A2RTX_ST_REFUSED        : u64 = 7
+
+  // ==========================================================================
+  // Reset + init.
+  // ==========================================================================
+
+  pub let a2rtx_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): clear retx table + counters + init flag. Labels prefixed a2rtx_rs_.",
+      block: {
+        lea r10, [rip + _a2rtx_rows];
+        xor rax, rax;
+        xor rcx, rcx;
+      a2rtx_rs_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  a2rtx_rs_rows;
+
+        lea r10, [rip + _a2rtx_stats];
+        xor rcx, rcx;
+      a2rtx_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  a2rtx_rs_stats;
+
+        lea r10, [rip + _a2rtx_init];
+        xor rax, rax;
+        mov [r10], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let a2rtx_init : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): mark module initialised.  Idempotent. Labels prefixed a2rtx_in_.",
+      block: {
+        call a2rtx_reset;
+        lea r10, [rip + _a2rtx_init];
+        mov rax, 1;
+        mov [r10], rax;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Counters.
+  // ==========================================================================
+
+  pub let a2rtx_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): counter bump. Labels prefixed a2rtx_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae a2rtx_nt_out;
+        lea r10, [rip + _a2rtx_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      a2rtx_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let a2rtx_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): counter read. Labels prefixed a2rtx_st_.",
+      block: {
+        cmp rdi, 8;
+        jae a2rtx_st_zero;
+        lea r10, [rip + _a2rtx_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      a2rtx_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Row accessors.  row_id r lives at word offset r*4 in _a2rtx_rows.
+  // ==========================================================================
+
+  pub let a2rtx_row_in_use : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): 1 iff row_id<MAX and META bit 0 set. Labels prefixed a2rtx_iu_.",
+      block: {
+        cmp rdi, 2;
+        jae a2rtx_iu_no;
+        lea r10, [rip + _a2rtx_rows];
+        mov r11, rdi;
+        shl r11, 5;                     // row_id * 32 bytes
+        add r10, r11;
+        mov rax, [r10 + 0];
+        and rax, 0x1;
+        cmp rax, 0;
+        je  a2rtx_iu_no;
+        mov rax, 1;
+        ret;
+      a2rtx_iu_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let a2rtx_row_retx : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): retx_count of a live row. Labels prefixed a2rtx_rr_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call a2rtx_row_in_use;
+        cmp rax, 0;
+        je  a2rtx_rr_bad;
+        lea r10, [rip + _a2rtx_rows];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        jmp a2rtx_rr_out;
+      a2rtx_rr_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      a2rtx_rr_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let a2rtx_row_epoch : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): last_observed_epoch of a live row. Labels prefixed a2rtx_re_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call a2rtx_row_in_use;
+        cmp rax, 0;
+        je  a2rtx_re_bad;
+        lea r10, [rip + _a2rtx_rows];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        jmp a2rtx_re_out;
+      a2rtx_re_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      a2rtx_re_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let a2rtx_row_underrun : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): underrun_count of a live row. Labels prefixed a2rtx_ru_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call a2rtx_row_in_use;
+        cmp rax, 0;
+        je  a2rtx_ru_bad;
+        lea r10, [rip + _a2rtx_rows];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 24];
+        jmp a2rtx_ru_out;
+      a2rtx_ru_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      a2rtx_ru_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let a2rtx_row_resync_req : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): resync_req bit of a live row. Labels prefixed a2rtx_rq_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call a2rtx_row_in_use;
+        cmp rax, 0;
+        je  a2rtx_rq_bad;
+        lea r10, [rip + _a2rtx_rows];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 1;
+        and rax, 0x1;
+        jmp a2rtx_rq_out;
+      a2rtx_rq_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      a2rtx_rq_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // a2rtx_find_sep(sep_id) -- linear scan.
+  // ==========================================================================
+
+  pub let a2rtx_find_sep : (u64) -> u64 !{mem} @{} =
+    fn (sep_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): linear scan of _a2rtx_rows for first live row whose sep_id matches. Labels prefixed a2rtx_fs_.",
+      block: {
+        push rbx;
+        push r12;
+        mov r12, rdi;
+        xor rbx, rbx;
+      a2rtx_fs_scan:
+        cmp rbx, 2;
+        jae a2rtx_fs_none;
+        lea r10, [rip + _a2rtx_rows];
+        mov r11, rbx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        mov r11, rax;
+        and r11, 0x1;
+        cmp r11, 0;
+        je  a2rtx_fs_next;
+        shr rax, 8;
+        and rax, 0xFF;
+        cmp rax, r12;
+        je  a2rtx_fs_hit;
+      a2rtx_fs_next:
+        add rbx, 1;
+        jmp a2rtx_fs_scan;
+      a2rtx_fs_hit:
+        mov rax, rbx;
+        jmp a2rtx_fs_out;
+      a2rtx_fs_none:
+        mov rax, 0xFF;
+      a2rtx_fs_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // a2rtx_install(sep_id) -- claim a retx row for the given SEP.
+  // Refuses NOT_INITIALIZED, ROW_IN_USE (duplicate SEP), ENOSPC.
+  // Returns row_id on success.  ONE WRITER of the positive edge.
+  // ==========================================================================
+
+  pub let a2rtx_install : (u64) -> u64 !{mem} @{} =
+    fn (sep_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): claim one retx row for a bridge sep_id.  THE ONE WRITER of the positive edge of _a2rtx_rows.  Refuses NOT_INITIALIZED / ROW_IN_USE / ENOSPC. Labels prefixed a2rtx_is_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov r12, rdi;
+
+        lea r10, [rip + _a2rtx_init];
+        mov rax, [r10];
+        cmp rax, 0;
+        je  a2rtx_is_notinit;
+
+        mov rdi, r12;
+        call a2rtx_find_sep;
+        mov r11, 0xFF;
+        cmp rax, r11;
+        jne a2rtx_is_dup;
+
+        xor rbx, rbx;
+      a2rtx_is_scan:
+        cmp rbx, 2;
+        jae a2rtx_is_enospc;
+        lea r10, [rip + _a2rtx_rows];
+        mov r11, rbx;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        and rax, 0x1;
+        cmp rax, 0;
+        je  a2rtx_is_hit;
+        add rbx, 1;
+        jmp a2rtx_is_scan;
+
+      a2rtx_is_hit:
+        // META: active(bit 0) | sep_id(bits 8..15).
+        mov rax, r12;
+        and rax, 0xFF;
+        shl rax, 8;
+        or  rax, 0x1;
+        mov [r10 + 0], rax;
+        xor rax, rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+
+        mov rdi, 0;                     // ROWS_INSTALLED counter
+        call a2rtx_note;
+        mov rax, rbx;
+        jmp a2rtx_is_out;
+
+      a2rtx_is_notinit:
+        mov rax, 0xFFFFF2A5;
+        jmp a2rtx_is_bump;
+      a2rtx_is_dup:
+        mov rax, 0xFFFFF2AB;
+        jmp a2rtx_is_bump;
+      a2rtx_is_enospc:
+        mov rax, 0xFFFFF2AC;
+      a2rtx_is_bump:
+        push rax;
+        mov rdi, 7;
+        call a2rtx_note;
+        pop rax;
+      a2rtx_is_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // a2rtx_release(row_id) -- release a retx row.  ONE WRITER of the
+  // negative edge.
+  // ==========================================================================
+
+  pub let a2rtx_release : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): release one retx row. Labels prefixed a2rtx_rl_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call a2rtx_row_in_use;
+        cmp rax, 0;
+        je  a2rtx_rl_bad;
+
+        lea r10, [rip + _a2rtx_rows];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        xor rax, rax;
+        jmp a2rtx_rl_out;
+
+      a2rtx_rl_bad:
+        mov rax, 0xFFFFF2AE;
+      a2rtx_rl_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // a2rtx_note_loss(row_id) -- L2CAP observed a packet loss on this
+  // SEP.  Bumps retx_count; returns A2RTX_EXCEEDED when the ceiling is
+  // reached (the caller SHOULD tear down the stream on that reply).
+  // ==========================================================================
+
+  pub let a2rtx_note_loss : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): observe one ACL loss; bump retx_count. Returns EXCEEDED once retx_count > A2RTX_RETX_MAX_PER_SEP.  Labels prefixed a2rtx_nl_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call a2rtx_row_in_use;
+        cmp rax, 0;
+        je  a2rtx_nl_bad;
+
+        lea r10, [rip + _a2rtx_rows];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        add rax, 1;
+        mov [r10 + 8], rax;
+
+        mov rdi, 1;                     // LOSSES counter
+        call a2rtx_note;
+
+        mov rax, [r10 + 8];
+        mov r11, 8;                     // A2RTX_RETX_MAX_PER_SEP
+        cmp rax, r11;
+        ja  a2rtx_nl_exceeded;
+        xor rax, rax;
+        jmp a2rtx_nl_out;
+
+      a2rtx_nl_exceeded:
+        mov rdi, 2;
+        call a2rtx_note;
+        mov rax, 0xFFFFF2AA;             // EXCEEDED
+        jmp a2rtx_nl_out;
+
+      a2rtx_nl_bad:
+        mov rax, 0xFFFFF2AE;
+      a2rtx_nl_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // a2rtx_check_drift(row_id, current_epoch) -- called by the audio
+  // bridge after every frame.  If |current - last_observed| >
+  // A2RTX_RESYNC_SAMPLES, set resync_req and return
+  // A2RTX_UNDERRUN_DRAIN (the caller re-anchors its clock).
+  // Otherwise, update last_observed_epoch and return OK.
+  // ==========================================================================
+
+  pub let a2rtx_check_drift : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (current_epoch: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): drift check + resync-request latch.  Refuses BAD_ROW.  Labels prefixed a2rtx_cd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        mov r13, rsi;
+
+        mov rdi, r12;
+        call a2rtx_row_in_use;
+        cmp rax, 0;
+        je  a2rtx_cd_bad;
+
+        lea r10, [rip + _a2rtx_rows];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+
+        // Compute unsigned |current - last|.
+        mov rax, r13;
+        mov r11, [r10 + 16];
+        cmp rax, r11;
+        jae a2rtx_cd_sub_forward;
+        // current < last (wrap or reordered): drift = last - current.
+        mov rax, r11;
+        sub rax, r13;
+        jmp a2rtx_cd_have_drift;
+      a2rtx_cd_sub_forward:
+        sub rax, r11;                    // drift = current - last
+
+      a2rtx_cd_have_drift:
+        mov rbx, rax;                    // drift value
+
+        // If this is the first observation (last==0), don't fire
+        // resync; just latch.
+        mov r11, [r10 + 16];
+        cmp r11, 0;
+        je  a2rtx_cd_latch;
+
+        mov r11, 1024;                   // A2RTX_RESYNC_SAMPLES
+        cmp rbx, r11;
+        ja  a2rtx_cd_resync;
+
+      a2rtx_cd_latch:
+        mov [r10 + 16], r13;             // update last_observed_epoch
+        xor rax, rax;
+        jmp a2rtx_cd_out;
+
+      a2rtx_cd_resync:
+        // Set resync_req bit.
+        mov rax, [r10 + 0];
+        or  rax, 0x2;
+        mov [r10 + 0], rax;
+        mov [r10 + 16], r13;             // anchor to current
+        mov rdi, 3;                     // RESYNCS counter
+        call a2rtx_note;
+        mov rax, 0xFFFFF2A9;             // UNDERRUN_DRAIN as a marker
+        jmp a2rtx_cd_out;
+
+      a2rtx_cd_bad:
+        mov rax, 0xFFFFF2AE;
+      a2rtx_cd_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // a2rtx_clear_resync(row_id) -- caller has re-anchored its clock;
+  // clear the resync_req bit.
+  // ==========================================================================
+
+  pub let a2rtx_clear_resync : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): clear resync_req.  Labels prefixed a2rtx_cr_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call a2rtx_row_in_use;
+        cmp rax, 0;
+        je  a2rtx_cr_bad;
+        lea r10, [rip + _a2rtx_rows];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        mov r11, 0xFFFFFFFFFFFFFFFD;    // ~0x2
+        and rax, r11;
+        mov [r10 + 0], rax;
+        xor rax, rax;
+        jmp a2rtx_cr_out;
+      a2rtx_cr_bad:
+        mov rax, 0xFFFFF2AE;
+      a2rtx_cr_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // a2rtx_note_underrun(row_id) -- caller observed a consumer-side
+  // starvation.  Bumps underrun_count; returns A2RTX_UNDERRUN_CAPPED
+  // once A2RTX_UNDERRUN_MAX is reached (the caller stops reporting).
+  // ==========================================================================
+
+  pub let a2rtx_note_underrun : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R39.M5-003 (#1341): observe one consumer starvation.  Labels prefixed a2rtx_nu_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call a2rtx_row_in_use;
+        cmp rax, 0;
+        je  a2rtx_nu_bad;
+
+        lea r10, [rip + _a2rtx_rows];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 24];
+        add rax, 1;
+        mov [r10 + 24], rax;
+        mov rdi, 4;
+        call a2rtx_note;
+
+        mov rax, [r10 + 24];
+        mov r11, 16;
+        cmp rax, r11;
+        jae a2rtx_nu_capped;
+
+        mov rdi, 5;
+        call a2rtx_note;
+        mov rax, 0xFFFFF2A9;             // DRAIN
+        jmp a2rtx_nu_out;
+
+      a2rtx_nu_capped:
+        mov rdi, 6;
+        call a2rtx_note;
+        mov rax, 0xFFFFF2A8;             // CAPPED
+        jmp a2rtx_nu_out;
+
+      a2rtx_nu_bad:
+        mov rax, 0xFFFFF2AE;
+      a2rtx_nu_out:
+        pop r12;
+        ret
+      }
+    }
+}
