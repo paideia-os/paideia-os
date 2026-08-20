@@ -1,0 +1,625 @@
+// src/kernel/core/drivers/wifi/rate_control.pdx — R38.M7-002 (#1319)
+//
+// PER-driven adaptive rate control per {peer, MCS}.  Tracks packet-
+// error-rate over a rolling window of RC2_WINDOW packets per peer;
+// steps DOWN a rung on PER > 20%, steps UP on PER < 5%.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the DECISION half of the rate ladder.  The RATE TABLE lives
+// in he_mcs.pdx (R38.M7-001) and answers "how fast does (mcs, bw, gi,
+// nss) run"; this module answers "which MCS should peer P run".
+// A live path composes:
+//
+//   rate_control.rc2_report(peer, mcs, ok?)    // observed outcome
+//   rate_control.rc2_decide(peer)              // -> next MCS
+//   he_mcs.hem_rate_lookup(next, ...)           // -> peak Mbps
+//   ...radio driver programs the AX211 rate register
+//
+// IT DOES NOT PROGRAM THE PHY.  A live path replaces the (kept)
+// rc2_arbitrated() = 0 pin with a real rate write once the AX211
+// MAC/PHY binding lands.
+//
+// IT DOES NOT KNOW ABOUT MU-MIMO GROUPS.  Group scheduling lives in
+// he_mcs.pdx (the metadata rows); rate control is per-peer.
+//
+// =============================================================================
+// §1  ROWS
+// =============================================================================
+//
+// One row per peer, up to RC2_PEERS_MAX live peers.  Row layout
+// (32 bytes each -- 4 u64 cells):
+//
+//   [+0]  in_use[7:0] | peer_id[63:8]
+//   [+8]  current_mcs (0..11)
+//   [+16] window[63:0] = ring of 64 bits (1=ok, 0=err); LSB is newest.
+//   [+24] samples in window (u64, saturates at RC2_WINDOW)
+//
+// PER (per mille) = 1000 * err_count / samples.  Thresholds are
+// specified as per-mille so the arithmetic never needs floats:
+//   RC2_UP_PER_PMILLE   =  50   (< 5% PER -> step up)
+//   RC2_DOWN_PER_PMILLE = 200   (> 20% PER -> step down)
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// `_rc2_table` and `_rc2_stats` are written only by helpers in this
+// module.  tools/build.sh confines relocations against both symbols
+// to `core/drivers/wifi/rate_control.o` so a second writer cannot
+// silently promote a peer's MCS.
+//
+// =============================================================================
+// §3  ERROR CODES 0xFFFFF350..0xFFFFF35F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: roaming
+// 0xFFFFF340..4F; adjacent free band below: he_mcs 0xFFFFF360..6F).
+//
+// Note: prefix rc2_ because rc_ is reserved by replay_counter (R38.M5-004).
+
+module RateControl = structure {
+
+  pub let RC2_PEERS_MAX        : u64 = 8
+  pub let RC2_WINDOW           : u64 = 64
+  pub let RC2_ROW_BYTES        : u64 = 32
+  pub let RC2_MCS_MAX          : u64 = 11
+  pub let RC2_UP_PER_PMILLE    : u64 = 50
+  pub let RC2_DOWN_PER_PMILLE  : u64 = 200
+
+  // §3: failure taxonomy 0xFFFFF350..0xFFFFF35F.
+  pub let RC2_OK               : u64 = 0
+  pub let RC2_BAD_ARG          : u64 = 0xFFFFF35F
+  pub let RC2_BAD_PEER         : u64 = 0xFFFFF35E
+  pub let RC2_BAD_MCS          : u64 = 0xFFFFF35D
+  pub let RC2_ENOSPC           : u64 = 0xFFFFF35C
+  pub let RC2_NOT_TRACKED      : u64 = 0xFFFFF35B
+  pub let RC2_ALREADY          : u64 = 0xFFFFF35A
+  pub let RC2_INSUFFICIENT     : u64 = 0xFFFFF359     // < 8 samples -> hold
+
+  pub let RC2_HOLD             : u64 = 0             // sentinel MCS delta
+  pub let RC2_STEP_UP          : u64 = 1
+  pub let RC2_STEP_DOWN        : u64 = 2
+
+  pub let mut _rc2_table : [u64; 32] = uninit @align(64)  // 8 peers * 4 u64
+  pub let mut _rc2_stats : [u64; 8]  = uninit @align(64)
+
+  pub let RC2_STAT_ADMITS      : u64 = 0
+  pub let RC2_STAT_ADMITS_REFUSED : u64 = 1
+  pub let RC2_STAT_REPORTS     : u64 = 2
+  pub let RC2_STAT_REPORTS_REFUSED : u64 = 3
+  pub let RC2_STAT_DECIDES     : u64 = 4
+  pub let RC2_STAT_STEP_UPS    : u64 = 5
+  pub let RC2_STAT_STEP_DOWNS  : u64 = 6
+  pub let RC2_STAT_RESETS      : u64 = 7
+
+  // ==========================================================================
+  // Reset -- scrub table + counters.  Boot + teardown.
+  // ==========================================================================
+
+  pub let rc2_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-002 (#1319): clear _rc2_table + _rc2_stats. Labels prefixed rc2_rs_.",
+      block: {
+        lea r10, [rip + _rc2_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      rc2_rs_row:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  rc2_rs_row;
+
+        lea r10, [rip + _rc2_stats];
+        xor rcx, rcx;
+      rc2_rs_ct:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  rc2_rs_ct;
+        ret
+      }
+    } @no_frame
+
+  pub let rc2_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R38.M7-002 (#1319): honesty pin. Returns 0 until a real MAC/PHY binding programs the AX211 rate register from rc2_decide.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let rc2_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-002 (#1319): counter bump. Labels prefixed rc2_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae rc2_nt_out;
+        lea r10, [rip + _rc2_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      rc2_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let rc2_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-002 (#1319): counter read.",
+      block: {
+        cmp rdi, 8;
+        jae rc2_st_zero;
+        lea r10, [rip + _rc2_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      rc2_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // rc2_lookup(peer_id) -> row_idx (0..7) | 0xFF not found
+  // ==========================================================================
+
+  pub let rc2_lookup : (u64) -> u64 !{mem} @{} =
+    fn (peer_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-002 (#1319): find row index by peer_id. Labels prefixed rc2_lu_.",
+      block: {
+        xor rcx, rcx;
+      rc2_lu_scan:
+        cmp rcx, 8;
+        jae rc2_lu_miss;
+        lea r10, [rip + _rc2_table];
+        mov r11, rcx;
+        shl r11, 5;
+        add r10, r11;
+        mov r8, [r10];                    // in_use|peer_id
+        mov r11, r8;
+        and r11, 0xFF;
+        cmp r11, 0;
+        je  rc2_lu_next;
+        mov r9, r8;
+        shr r9, 8;
+        cmp r9, rdi;
+        je  rc2_lu_hit;
+      rc2_lu_next:
+        add rcx, 1;
+        jmp rc2_lu_scan;
+      rc2_lu_hit:
+        mov rax, rcx;
+        ret;
+      rc2_lu_miss:
+        mov rax, 0xFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // rc2_admit(peer_id, initial_mcs) -> RC2_OK | error
+  //
+  // Register a peer with an initial MCS.  Refuses on invalid mcs,
+  // duplicate peer_id, or no free slot.
+  // ==========================================================================
+
+  pub let rc2_admit : (u64, u64) -> u64 !{mem} @{} =
+    fn (peer_id: u64, initial_mcs: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-002 (#1319): admit peer into rate-tracking table. Labels prefixed rc2_ad_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                     // peer_id
+        mov r12, rsi;                     // initial_mcs
+
+        cmp r12, 11;
+        ja  rc2_ad_badmcs;
+
+        // Duplicate check.
+        mov rdi, rbx;
+        call rc2_lookup;
+        cmp rax, 0xFF;
+        jne rc2_ad_dupe;
+
+        // Find free slot.
+        xor rcx, rcx;
+      rc2_ad_scan:
+        cmp rcx, 8;
+        jae rc2_ad_nospc;
+        lea r10, [rip + _rc2_table];
+        mov r11, rcx;
+        shl r11, 5;
+        add r10, r11;
+        mov r8, [r10];
+        mov r11, r8;
+        and r11, 0xFF;
+        cmp r11, 0;
+        je  rc2_ad_free;
+        add rcx, 1;
+        jmp rc2_ad_scan;
+      rc2_ad_free:
+        // Install: in_use=1, peer_id = rbx, mcs = r12, window = 0, samples = 0.
+        // r10 already points at the free row from the scan.
+        mov r9, rbx;
+        shl r9, 8;
+        or  r9, 1;
+        mov [r10],      r9;
+        mov [r10 + 8],  r12;
+        xor r9, r9;
+        mov [r10 + 16], r9;
+        mov [r10 + 24], r9;
+
+        mov rdi, 0;                       // ADMITS
+        call rc2_note;
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rc2_ad_badmcs:
+        mov rdi, 1;                       // ADMITS_REFUSED
+        call rc2_note;
+        mov rax, 0xFFFFF35D;              // BAD_MCS
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      rc2_ad_dupe:
+        mov rdi, 1;
+        call rc2_note;
+        mov rax, 0xFFFFF35A;              // ALREADY
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      rc2_ad_nospc:
+        mov rdi, 1;
+        call rc2_note;
+        mov rax, 0xFFFFF35C;              // ENOSPC
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rc2_report(peer_id, mcs, ok) -> RC2_OK | error
+  //
+  // Record one packet outcome.  ok != 0 records a success, 0 a
+  // failure.  If mcs differs from current_mcs (a stale sample from a
+  // recent step), the row's current_mcs is refreshed to match.
+  //
+  // The window is a 64-bit ring: samples[63:0] where bit 0 is oldest
+  // and bit 63 is newest.  On each report we shift LEFT by 1 (drop
+  // bit 63, insert new sample into bit 0).  Sample count saturates
+  // at RC2_WINDOW.
+  // ==========================================================================
+
+  pub let rc2_report : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (peer_id: u64, mcs: u64, ok: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-002 (#1319): record one packet outcome. Labels prefixed rc2_rp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                     // peer_id
+        mov r12, rsi;                     // mcs
+        mov r13, rdx;                     // ok
+
+        cmp r12, 11;
+        ja  rc2_rp_badmcs;
+
+        mov rdi, rbx;
+        call rc2_lookup;
+        cmp rax, 0xFF;
+        je  rc2_rp_notracked;
+
+        mov r14, rax;                     // row idx
+        lea r10, [rip + _rc2_table];
+        mov r15, r14;
+        shl r15, 5;
+        add r10, r15;                     // r10 now points at row base
+
+        // Update current_mcs to caller's mcs (tracks step transitions).
+        mov [r10 + 8], r12;
+
+        // Shift window left by 1 (append to bit 0).
+        mov rax, [r10 + 16];
+        shl rax, 1;
+        cmp r13, 0;
+        je  rc2_rp_wr;
+        or  rax, 1;
+      rc2_rp_wr:
+        mov [r10 + 16], rax;
+
+        // Bump samples (saturate at RC2_WINDOW).
+        mov rax, [r10 + 24];
+        cmp rax, 64;
+        jae rc2_rp_sat;
+        add rax, 1;
+        mov [r10 + 24], rax;
+      rc2_rp_sat:
+
+        mov rdi, 2;                       // REPORTS
+        call rc2_note;
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rc2_rp_badmcs:
+        mov rdi, 3;                       // REPORTS_REFUSED
+        call rc2_note;
+        mov rax, 0xFFFFF35D;              // BAD_MCS
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      rc2_rp_notracked:
+        mov rdi, 3;
+        call rc2_note;
+        mov rax, 0xFFFFF35B;              // NOT_TRACKED
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rc2_per_pmille(peer_id) -> per_mille | 0xFFFF...F  on error
+  //
+  // Compute PER (per mille) from the current window.  Returns 1000
+  // only when 100% loss.  Returns RC2_NOT_TRACKED for an unknown peer.
+  // A caller that wants to distinguish "no samples" from "no loss"
+  // must consult rc2_samples() alongside this.
+  // ==========================================================================
+
+  pub let rc2_per_pmille : (u64) -> u64 !{mem} @{} =
+    fn (peer_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-002 (#1319): compute PER per mille from ring. Labels prefixed rc2_pp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;
+        mov rdi, rbx;
+        call rc2_lookup;
+        cmp rax, 0xFF;
+        je  rc2_pp_ntr;
+
+        mov r12, rax;
+        lea r10, [rip + _rc2_table];
+        mov r13, r12;
+        shl r13, 5;
+        add r10, r13;                     // r10 -> row base
+
+        mov rax, [r10 + 24];              // samples
+        cmp rax, 0;
+        je  rc2_pp_zero;                   // no samples -> report 0
+
+        // popcount of window bits (ok count).
+        mov r8, [r10 + 16];               // window
+        xor rcx, rcx;                     // ok count
+      rc2_pp_pop:
+        cmp r8, 0;
+        je  rc2_pp_done;
+        mov r9, r8;
+        and r9, 1;
+        add rcx, r9;
+        shr r8, 1;
+        jmp rc2_pp_pop;
+      rc2_pp_done:
+        // samples - ok = err.
+        mov r9, [r10 + 24];
+        sub r9, rcx;                      // err
+        // per_mille = 1000 * err / samples
+        mov rax, r9;
+        imul rax, rax, 1000;
+        mov rcx, [r10 + 24];
+        xor rdx, rdx;
+        div rcx;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rc2_pp_zero:
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      rc2_pp_ntr:
+        mov rax, 0xFFFFF35B;              // NOT_TRACKED
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let rc2_current_mcs : (u64) -> u64 !{mem} @{} =
+    fn (peer_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-002 (#1319): read current MCS. Labels prefixed rc2_cm_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+        mov rdi, rbx;
+        call rc2_lookup;
+        cmp rax, 0xFF;
+        je  rc2_cm_ntr;
+        lea r10, [rip + _rc2_table];
+        mov r11, rax;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        pop rbx;
+        ret;
+      rc2_cm_ntr:
+        mov rax, 0xFFFFF35B;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let rc2_samples : (u64) -> u64 !{mem} @{} =
+    fn (peer_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-002 (#1319): read samples in window. Labels prefixed rc2_sm_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+        mov rdi, rbx;
+        call rc2_lookup;
+        cmp rax, 0xFF;
+        je  rc2_sm_ntr;
+        lea r10, [rip + _rc2_table];
+        mov r11, rax;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 24];
+        pop rbx;
+        ret;
+      rc2_sm_ntr:
+        xor rax, rax;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rc2_decide(peer_id) -> next_mcs (0..11) | RC2_NOT_TRACKED
+  //
+  // Adaptive rung: PER > 200 pmille -> step down (mcs-1 if > 0),
+  // PER < 50 pmille -> step up (mcs+1 if < 11), else hold.  A row
+  // with < 8 samples HOLDS unconditionally (insufficient data).
+  //
+  // Bumps the appropriate counter (RC2_STAT_STEP_UPS /
+  // RC2_STAT_STEP_DOWNS) when a change happens; nothing when a hold.
+  // rc2_decide DOES NOT WRITE the row: a live rung transition is
+  // committed by the next rc2_report call, which refreshes current_mcs.
+  // ==========================================================================
+
+  pub let rc2_decide : (u64) -> u64 !{mem} @{} =
+    fn (peer_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-002 (#1319): rung decision. Labels prefixed rc2_dc_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;
+        mov rdi, rbx;
+        call rc2_lookup;
+        cmp rax, 0xFF;
+        je  rc2_dc_ntr;
+        mov r12, rax;
+
+        lea r10, [rip + _rc2_table];
+        mov r13, r12;
+        shl r13, 5;
+        add r10, r13;                     // r10 -> row base
+        mov r14, [r10 + 8];               // current mcs
+        mov rax, [r10 + 24];              // samples
+        cmp rax, 8;
+        jb  rc2_dc_hold;
+
+        mov rdi, 4;                       // DECIDES
+        call rc2_note;
+
+        mov rdi, rbx;
+        call rc2_per_pmille;
+        // rax = PER per mille.
+
+        cmp rax, 200;
+        ja  rc2_dc_down;
+        cmp rax, 50;
+        jb  rc2_dc_up;
+
+      rc2_dc_hold_pass:
+        mov rax, r14;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rc2_dc_hold:
+        mov rax, r14;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rc2_dc_up:
+        mov rax, r14;
+        cmp rax, 11;
+        jae rc2_dc_hold_pass;
+        add rax, 1;
+        mov rdi, 5;                       // STEP_UPS
+        push rax;
+        call rc2_note;
+        pop rax;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rc2_dc_down:
+        mov rax, r14;
+        cmp rax, 0;
+        je  rc2_dc_hold_pass;
+        sub rax, 1;
+        mov rdi, 6;                       // STEP_DOWNS
+        push rax;
+        call rc2_note;
+        pop rax;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rc2_dc_ntr:
+        mov rax, 0xFFFFF35B;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

@@ -1,0 +1,682 @@
+// src/kernel/core/drivers/wifi/roaming.pdx — R38.M7-003 (#1320)
+//
+// SCAN-WHILE-CONNECTED + candidate scoring + reassoc trigger.  A
+// station on channel N periodically scans off-channel between beacons
+// to accumulate a list of candidate APs; when a candidate outperforms
+// the current AP by a margin, roaming triggers a reassociation
+// through net80211_assoc.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the SCAN CADENCE + CANDIDATE SELECTOR half of a mobile
+// station's roaming loop.  A live path composes:
+//
+//   roaming.rm_off_channel_tick()          // schedule off-channel scan
+//   roaming.rm_candidate_report(bssid,     // record beacon/probe hit
+//                               rssi_dbm,
+//                               load_pmille,
+//                               speed_mbps)
+//   roaming.rm_decide()                    // -> best_bssid | none
+//   roaming.rm_trigger_reassoc()           // -> net80211_assoc.nas_step(REASSOC)
+//
+// IT DOES NOT SCAN.  Actual off-channel dwell + probe transmission
+// lives in the AX211 CTRL / SCAN_TXN plumbing (R38.M3, KIND_WIFI_SCAN_TXN)
+// and the class driver above it.  This module RECORDS candidates
+// that plumbing feeds it and DECIDES whether to move.
+//
+// IT DOES NOT REASSOCIATE.  The reassoc path is net80211_assoc.pdx
+// (R38.M4-002) and its NAS_EV_REASSOC_RESP handler; this module's
+// rm_trigger_reassoc drives that FSM one event forward and reports
+// the result.  A live path binds the current + target BSSIDs via
+// nas_set_target_bssid before calling; the honesty pin
+// rm_arbitrated() = 0 stays until the class driver wires that
+// composition and admits nas_step under a real arbiter.
+//
+// =============================================================================
+// §1  CANDIDATE ROWS
+// =============================================================================
+//
+// Fixed-size candidate table; oldest evicts on ENOSPC-replace.  Row
+// (24 bytes = 3 u64):
+//
+//   [+0]  in_use[7:0] | age[15:8] | bssid[63:16]
+//   [+8]  rssi_dbm    (signed 8-bit in low byte; -127..0)
+//   [+16] load_pmille (0..1000) | speed_mbps (upper 32 bits)
+//
+// RM_CANDIDATES_MAX = 8 concurrent live candidates.
+//
+// =============================================================================
+// §2  SCORING
+// =============================================================================
+//
+// A weighted score in unitless integer space:
+//
+//   score = (rssi_bonus * W_RSSI) + (speed_mbps * W_SPEED) - (load_pmille * W_LOAD)
+//
+// where rssi_bonus = 127 + rssi_dbm (0 for weakest, 127 for stronger).
+// Weights (compile-time):
+//   RM_W_RSSI  = 4
+//   RM_W_SPEED = 2
+//   RM_W_LOAD  = 1
+//
+// A caller comparing two candidates picks the higher score.  A roam
+// is worth triggering only when best_score exceeds current_score by
+// RM_MARGIN units to avoid ping-pong.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// `_rm_state`, `_rm_table` and `_rm_stats` are written only by
+// helpers in this module.  tools/build.sh confines relocations
+// against every symbol to `core/drivers/wifi/roaming.o` so a second
+// writer cannot silently forge a candidate score or trigger a
+// spurious reassoc.
+//
+// =============================================================================
+// §4  ERROR CODES 0xFFFFF340..0xFFFFF34F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: rekey 0xFFFFF330..3F;
+// adjacent free band below: rate_control 0xFFFFF350..5F).
+
+module Roaming = structure {
+
+  pub let RM_CANDIDATES_MAX    : u64 = 8
+  pub let RM_ROW_BYTES         : u64 = 24
+  pub let RM_ROW_NONE          : u64 = 0xFF
+
+  pub let RM_W_RSSI            : u64 = 4
+  pub let RM_W_SPEED           : u64 = 2
+  pub let RM_W_LOAD            : u64 = 1
+  pub let RM_MARGIN            : u64 = 32
+
+  pub let RM_BSSID_NONE        : u64 = 0
+
+  // §4: failure taxonomy 0xFFFFF340..0xFFFFF34F.
+  pub let RM_OK                : u64 = 0
+  pub let RM_BAD_ARG           : u64 = 0xFFFFF34F
+  pub let RM_BAD_BSSID         : u64 = 0xFFFFF34E
+  pub let RM_BAD_RSSI          : u64 = 0xFFFFF34D
+  pub let RM_BAD_LOAD          : u64 = 0xFFFFF34C
+  pub let RM_ENOSPC            : u64 = 0xFFFFF34B
+  pub let RM_NO_CANDIDATE      : u64 = 0xFFFFF34A
+  pub let RM_NOT_CONNECTED     : u64 = 0xFFFFF349
+  pub let RM_MARGIN_NOT_MET    : u64 = 0xFFFFF348
+
+  // State cells:
+  //   [0] current_bssid
+  //   [1] current_rssi_dbm (encoded as u64; low byte is signed)
+  //   [2] current_load_pmille
+  //   [3] current_speed_mbps
+  //   [4] off_channel_ticks
+  //   [5] scans_scheduled
+  //   [6] last_decision_bssid
+  //   [7] last_decision_score
+  pub let mut _rm_state : [u64; 8]  = uninit @align(64)
+  pub let mut _rm_table : [u64; 24] = uninit @align(64)   // 8 rows * 3 u64
+  pub let mut _rm_stats : [u64; 8]  = uninit @align(64)
+
+  pub let RM_STAT_TICKS        : u64 = 0
+  pub let RM_STAT_REPORTS      : u64 = 1
+  pub let RM_STAT_REPORTS_REFUSED : u64 = 2
+  pub let RM_STAT_DECIDES      : u64 = 3
+  pub let RM_STAT_TRIGGERS     : u64 = 4
+  pub let RM_STAT_TRIGGERS_REFUSED : u64 = 5
+  pub let RM_STAT_EVICTS       : u64 = 6
+
+  // ==========================================================================
+  // Reset -- scrub state + table + counters.  Boot + teardown.
+  // ==========================================================================
+
+  pub let rm_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-003 (#1320): clear _rm_state + _rm_table + _rm_stats. Labels prefixed rm_rs_.",
+      block: {
+        lea r10, [rip + _rm_state];
+        xor rax, rax;
+        xor rcx, rcx;
+      rm_rs_st:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  rm_rs_st;
+
+        lea r10, [rip + _rm_table];
+        xor rcx, rcx;
+      rm_rs_tb:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 24;
+        jb  rm_rs_tb;
+
+        lea r10, [rip + _rm_stats];
+        xor rcx, rcx;
+      rm_rs_ct:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  rm_rs_ct;
+        ret
+      }
+    } @no_frame
+
+  pub let rm_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R38.M7-003 (#1320): honesty pin. Returns 0 until the class driver composes rm_trigger_reassoc with a nas_set_target_bssid + nas_step under a real arbiter.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let rm_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-003 (#1320): counter bump. Labels prefixed rm_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae rm_nt_out;
+        lea r10, [rip + _rm_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      rm_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let rm_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-003 (#1320): counter read.",
+      block: {
+        cmp rdi, 8;
+        jae rm_st_zero;
+        lea r10, [rip + _rm_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      rm_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // rm_bind_current(bssid, rssi_dbm, load_pmille, speed_mbps)
+  //   -> RM_OK | error
+  //
+  // Latch the currently associated AP so rm_decide has something to
+  // compare against.  Refuses zero BSSID (RM_BAD_BSSID).  Does not
+  // touch the candidate table.
+  // ==========================================================================
+
+  pub let rm_bind_current : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (bssid: u64, rssi_dbm: u64, load_pmille: u64, speed_mbps: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-003 (#1320): latch current AP metrics. Labels prefixed rm_bc_.",
+      block: {
+        cmp rdi, 0;
+        je  rm_bc_bad;
+        cmp rdx, 1000;
+        ja  rm_bc_badload;
+        lea r10, [rip + _rm_state];
+        mov [r10],      rdi;
+        mov [r10 + 8],  rsi;
+        mov [r10 + 16], rdx;
+        mov [r10 + 24], rcx;
+        xor rax, rax;
+        ret;
+      rm_bc_bad:
+        mov rax, 0xFFFFF34E;
+        ret;
+      rm_bc_badload:
+        mov rax, 0xFFFFF34C;
+        ret
+      }
+    } @no_frame
+
+  pub let rm_current_bssid : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-003 (#1320): read latched current BSSID.",
+      block: {
+        lea r10, [rip + _rm_state];
+        mov rax, [r10];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // rm_off_channel_tick() -> RM_OK
+  //
+  // Schedule an off-channel scan window.  A live path drives this
+  // once per beacon interval when link margin is thin.  In this
+  // module the tick just bumps two counters -- the actual scan
+  // request lands in KIND_WIFI_SCAN_TXN (R38.M3).
+  // ==========================================================================
+
+  pub let rm_off_channel_tick : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-003 (#1320): scan cadence bump. Labels prefixed rm_ot_.",
+      block: {
+        lea r10, [rip + _rm_state];
+        mov rax, [r10 + 32];
+        add rax, 1;
+        mov [r10 + 32], rax;
+        mov rax, [r10 + 40];
+        add rax, 1;
+        mov [r10 + 40], rax;
+        mov rdi, 0;                       // TICKS
+        push rax;
+        call rm_note;
+        pop rax;
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // rm_candidate_report(bssid, rssi_dbm, load_pmille, speed_mbps)
+  //   -> RM_OK | error
+  //
+  // Record a beacon/probe-response hit.  If bssid already present in
+  // the table, replace its row; else find a free slot; else evict
+  // the row with the highest age (oldest).  Bumps age on every
+  // other live row so oldest can be identified next time.
+  // ==========================================================================
+
+  pub let rm_candidate_report : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (bssid: u64, rssi_dbm: u64, load_pmille: u64, speed_mbps: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-003 (#1320): insert/replace candidate. Labels prefixed rm_cr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                     // bssid
+        mov r12, rsi;                     // rssi
+        mov r13, rdx;                     // load
+        mov r14, rcx;                     // speed
+
+        cmp rbx, 0;
+        je  rm_cr_bad;
+        cmp r13, 1000;
+        ja  rm_cr_badload;
+
+        // Scan: find existing row for bssid, else free slot, else oldest.
+        xor rcx, rcx;
+        mov r8, 8;                        // free-slot sentinel
+        mov r9, 8;                        // oldest-slot sentinel
+        mov r11, 0;                       // oldest age seen
+      rm_cr_scan:
+        cmp rcx, 8;
+        jae rm_cr_scan_done;
+        lea r10, [rip + _rm_table];
+        mov rax, rcx;
+        imul rax, rax, 24;                // row byte offset
+        add r10, rax;
+        mov r15, [r10];                   // packed cell 0
+        mov rdx, r15;
+        and rdx, 0xFF;                    // in_use
+        cmp rdx, 0;
+        je  rm_cr_free;
+
+        // Bump age (byte 1) unless it's about to be replaced.
+        mov rdx, r15;
+        shr rdx, 8;
+        and rdx, 0xFF;                    // age
+        mov rsi, r15;
+        shr rsi, 16;                      // bssid
+        cmp rsi, rbx;
+        je  rm_cr_replace;
+        // Track oldest.
+        cmp rdx, r11;
+        jbe rm_cr_agebump;
+        mov r11, rdx;
+        mov r9,  rcx;
+      rm_cr_agebump:
+        // Bump age (saturate at 255).
+        cmp rdx, 255;
+        jae rm_cr_next;
+        add rdx, 1;
+        shl rdx, 8;
+        mov rsi, r15;
+        mov rax, 0xFFFFFFFFFFFF00FF;
+        and rsi, rax;
+        or  rsi, rdx;
+        mov [r10], rsi;
+      rm_cr_next:
+        add rcx, 1;
+        jmp rm_cr_scan;
+      rm_cr_free:
+        cmp r8, 8;
+        jne rm_cr_next;
+        mov r8, rcx;
+        jmp rm_cr_next;
+      rm_cr_replace:
+        // Reset age=0 for the replaced row.
+        mov r8, rcx;
+      rm_cr_scan_done:
+
+        cmp r8, 8;
+        jne rm_cr_install;
+        // No free slot; evict oldest.
+        cmp r9, 8;
+        je  rm_cr_nospc;
+        mov r8, r9;
+        mov rdi, 6;                       // EVICTS
+        call rm_note;
+
+      rm_cr_install:
+        lea r10, [rip + _rm_table];
+        mov rax, r8;
+        imul rax, rax, 24;
+        add r10, rax;
+        // Packed: in_use=1 | age=0 | bssid.
+        mov r15, rbx;
+        shl r15, 16;
+        or  r15, 1;                       // in_use bit
+        mov [r10],      r15;
+        mov [r10 + 8],  r12;
+        // Pack load (low 32) | speed (high 32).
+        mov r15, r14;
+        shl r15, 32;
+        or  r15, r13;
+        mov [r10 + 16], r15;
+
+        mov rdi, 1;                       // REPORTS
+        call rm_note;
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rm_cr_bad:
+        mov rdi, 2;                       // REPORTS_REFUSED
+        call rm_note;
+        mov rax, 0xFFFFF34E;              // BAD_BSSID
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      rm_cr_badload:
+        mov rdi, 2;
+        call rm_note;
+        mov rax, 0xFFFFF34C;              // BAD_LOAD
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      rm_cr_nospc:
+        mov rdi, 2;
+        call rm_note;
+        mov rax, 0xFFFFF34B;              // ENOSPC
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rm_score(rssi_dbm, load_pmille, speed_mbps) -> unitless score
+  //
+  //   score = (127 + rssi_dbm) * W_RSSI + speed * W_SPEED - load * W_LOAD
+  //
+  // Any negative intermediate is clamped to 0.  Score is always u64.
+  // ==========================================================================
+
+  pub let rm_score : (u64, u64, u64) -> u64 !{} @{} =
+    fn (rssi_dbm: u64, load_pmille: u64, speed_mbps: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R38.M7-003 (#1320): weighted score. Labels prefixed rm_sc_.",
+      block: {
+        push rbx;
+        // rssi bonus = 127 + rssi_dbm interpreted as signed byte.
+        // For simplicity treat rssi_dbm as u64 already in "bonus"
+        // form: caller passes 0..127.  A caller with a signed dBm
+        // biases before calling.
+        mov rax, rdi;
+        imul rax, rax, 4;                 // * W_RSSI
+        mov rbx, rax;
+
+        mov rax, rdx;
+        imul rax, rax, 2;                 // * W_SPEED
+        add rbx, rax;
+
+        mov rax, rsi;                     // * W_LOAD = 1
+        cmp rbx, rax;
+        jae rm_sc_ok;
+        xor rbx, rbx;
+        jmp rm_sc_out;
+      rm_sc_ok:
+        sub rbx, rax;
+      rm_sc_out:
+        mov rax, rbx;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // rm_decide() -> best_bssid (or RM_BSSID_NONE) | RM_NOT_CONNECTED
+  //
+  // Compare best candidate against current.  Returns:
+  //   * RM_NOT_CONNECTED if no current BSSID bound
+  //   * RM_BSSID_NONE (0) if no candidate beats current + RM_MARGIN
+  //   * best BSSID otherwise
+  //
+  // Also updates _rm_state[6/7] with (last_decision_bssid, best_score)
+  // for external inspection.
+  // ==========================================================================
+
+  pub let rm_decide : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-003 (#1320): decision loop. Labels prefixed rm_dc_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        lea r10, [rip + _rm_state];
+        mov rax, [r10];
+        cmp rax, 0;
+        je  rm_dc_notc;
+
+        mov rdi, 3;                       // DECIDES
+        call rm_note;
+
+        // Compute current score.
+        lea r10, [rip + _rm_state];
+        mov rdi, [r10 + 8];               // rssi
+        mov rsi, [r10 + 16];              // load
+        mov rdx, [r10 + 24];              // speed
+        call rm_score;
+        mov r15, rax;                     // current score
+
+        xor r13, r13;                     // best score
+        xor r14, r14;                     // best bssid
+
+        xor rcx, rcx;
+      rm_dc_scan:
+        cmp rcx, 8;
+        jae rm_dc_scan_done;
+        lea r10, [rip + _rm_table];
+        mov rax, rcx;
+        imul rax, rax, 24;
+        add r10, rax;
+        mov r8, [r10];
+        mov r11, r8;
+        and r11, 0xFF;
+        cmp r11, 0;
+        je  rm_dc_next;
+
+        // Extract bssid, rssi, load, speed.
+        mov r9, r8;
+        shr r9, 16;                       // bssid
+        mov r11, [r10 + 8];               // rssi
+        mov rbx, [r10 + 16];              // packed load|speed
+        mov rdx, rbx;
+        shr rdx, 32;                      // speed
+        mov r10, 0xFFFFFFFF;
+        and rbx, r10;                     // load
+
+        // Compute score.
+        push rcx;
+        push rax;
+        push r13;
+        push r14;
+        push r15;
+        push r9;
+        mov rdi, r11;
+        mov rsi, rbx;
+        // rdx already holds speed
+        call rm_score;
+        mov r12, rax;
+        pop r9;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop rax;
+        pop rcx;
+
+        // Compare vs best.
+        cmp r12, r13;
+        jbe rm_dc_next;
+        mov r13, r12;
+        mov r14, r9;
+
+      rm_dc_next:
+        add rcx, 1;
+        jmp rm_dc_scan;
+      rm_dc_scan_done:
+
+        lea r10, [rip + _rm_state];
+        mov [r10 + 48], r14;              // last_decision_bssid
+        mov [r10 + 56], r13;              // last_decision_score
+
+        // Margin gate: r13 must exceed r15 by RM_MARGIN.
+        cmp r14, 0;
+        je  rm_dc_none;
+        mov rax, r15;
+        add rax, 32;                      // RM_MARGIN
+        cmp r13, rax;
+        jbe rm_dc_none;
+
+        mov rax, r14;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rm_dc_none:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rm_dc_notc:
+        mov rax, 0xFFFFF349;              // NOT_CONNECTED
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rm_trigger_reassoc(target_bssid) -> RM_OK | error
+  //
+  // Drive net80211_assoc through a REASSOC event.  The caller supplies
+  // the target BSSID (typically the return of rm_decide) and this
+  // module reports the outcome.  A LIVE composition binds the target
+  // via nas_set_target_bssid + nas_step(NAS_EV_REASSOC_RESP); this
+  // scaffold's only externally-visible effect is:
+  //   * bump RM_STAT_TRIGGERS on RM_OK
+  //   * bump RM_STAT_TRIGGERS_REFUSED on any error
+  //
+  // Refuses:
+  //   * target == 0                   -> RM_BAD_BSSID
+  //   * target == current_bssid       -> RM_MARGIN_NOT_MET (no-op)
+  //   * no current binding            -> RM_NOT_CONNECTED
+  // ==========================================================================
+
+  pub let rm_trigger_reassoc : (u64) -> u64 !{mem} @{} =
+    fn (target_bssid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-003 (#1320): drive reassoc trigger. Labels prefixed rm_tr_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+
+        cmp rbx, 0;
+        je  rm_tr_bad;
+
+        lea r10, [rip + _rm_state];
+        mov rax, [r10];
+        cmp rax, 0;
+        je  rm_tr_notc;
+        cmp rax, rbx;
+        je  rm_tr_same;
+
+        mov rdi, 4;                       // TRIGGERS
+        call rm_note;
+
+        // Would call nas_set_target_bssid(rbx) + nas_step(NAS_EV_REASSOC_RESP)
+        // here in a live path.  Honesty pin remains 0 until that
+        // composition is admitted.
+
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      rm_tr_bad:
+        mov rdi, 5;                       // TRIGGERS_REFUSED
+        call rm_note;
+        mov rax, 0xFFFFF34E;              // BAD_BSSID
+        pop rbx;
+        ret;
+      rm_tr_notc:
+        mov rdi, 5;
+        call rm_note;
+        mov rax, 0xFFFFF349;              // NOT_CONNECTED
+        pop rbx;
+        ret;
+      rm_tr_same:
+        mov rdi, 5;
+        call rm_note;
+        mov rax, 0xFFFFF348;              // MARGIN_NOT_MET
+        pop rbx;
+        ret
+      }
+    }
+}

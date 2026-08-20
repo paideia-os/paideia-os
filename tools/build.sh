@@ -3717,6 +3717,42 @@ fi
 echo "[r38-m6-confine] R38.M6 (regdom loader + channel + geo-hint) confined"
 
 # ---------------------------------------------------------------------------
+# R38.M7 (#1318/#1319/#1320/#1321): WiFi feature composition -- HE-MCS
+# rate table + MU-MIMO metadata, PER-driven rate control, scan-while-
+# connected roaming, PTK/GTK rekey rotation.
+#
+# Four modules open R38.M7 (post-R38.M6 close).  Each owns its own
+# state cells + counters; tools/build.sh confines relocations against
+# each to its owning object so a second writer cannot silently
+# promote a rate, force a step transition, forge a roaming candidate,
+# or drive a rekey rotation past its slot-transition window.
+HEM_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/he_mcs.pdx"
+RC2_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/rate_control.pdx"
+RM_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/roaming.pdx"
+RK_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/rekey.pdx"
+if [[ ! -f "${HEM_SRC}" || ! -f "${RC2_SRC}" || ! -f "${RM_SRC}" || ! -f "${RK_SRC}" ]]; then
+    echo "[r38-m7-confine] FAIL - one of the R38.M7 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_hem_state'      'core/drivers/wifi/he_mcs.o'
+ec_confine_one '_hem_groups'     'core/drivers/wifi/he_mcs.o'
+ec_confine_one '_hem_users'      'core/drivers/wifi/he_mcs.o'
+ec_confine_one '_hem_stats'      'core/drivers/wifi/he_mcs.o'
+ec_confine_one '_rc2_table'      'core/drivers/wifi/rate_control.o'
+ec_confine_one '_rc2_stats'      'core/drivers/wifi/rate_control.o'
+ec_confine_one '_rm_state'       'core/drivers/wifi/roaming.o'
+ec_confine_one '_rm_table'       'core/drivers/wifi/roaming.o'
+ec_confine_one '_rm_stats'       'core/drivers/wifi/roaming.o'
+ec_confine_one '_rk_state'       'core/drivers/wifi/rekey.o'
+ec_confine_one '_rk_stats'       'core/drivers/wifi/rekey.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See he_mcs.pdx §3, rate_control.pdx §2, roaming.pdx §3" >&2
+    echo "  and rekey.pdx §2 for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[r38-m7-confine] R38.M7 (HE-MCS + rate control + roaming + rekey) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

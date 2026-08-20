@@ -1,0 +1,572 @@
+// src/kernel/core/drivers/wifi/rekey.pdx — R38.M7-004 (#1321)
+//
+// PTK / GTK REKEY HANDLING.  Detects when an AP re-initiates the
+// 4-way handshake (or the group key handshake) on an already-active
+// session, drives the new 4-way exchange via wpa_4way, and rotates
+// the KIND_WIFI_KEY slot -- retaining the old key briefly for
+// in-flight decrypt.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the REKEY POLICY that sits above wpa_4way and coordinates
+// with the KIND_WIFI_KEY slot manager.  A live path composes:
+//
+//   ...RX EAPOL msg1 on active session -> rekey.rk_trigger()
+//   rekey.rk_arm(next_pmk_slot, crypto_ep_slot)  -> w4h_arm
+//   ...wpa_4way progresses to W4H_DONE
+//   rekey.rk_rotate(new_key_slot)              -> retire old slot
+//
+// IT DOES NOT DERIVE KEYS.  wpa_4way owns the 4-way FSM (M1..M4) and
+// key derivation; this module drives that FSM through one rekey
+// cycle and manages the slot-transition window.
+//
+// IT DOES NOT DECRYPT.  The KRACK-safe replay counter policy
+// (replay_counter.pdx, R38.M5-004) refuses installing the same key
+// again with reset PN; rekey.pdx composes with that policy by
+// installing to a NEW slot rather than reinstalling the old one.
+//
+// =============================================================================
+// §1  STATE
+// =============================================================================
+//
+//   RK_STATE_IDLE       = 0    (no rekey in flight)
+//   RK_STATE_TRIGGERED  = 1    (msg1 seen; rk_arm pending)
+//   RK_STATE_ARMED      = 2    (w4h_arm called; awaiting W4H_DONE)
+//   RK_STATE_ROTATING   = 3    (W4H_DONE observed; slot rotation window)
+//   RK_STATE_DONE       = 4    (rotation committed; old slot retired)
+//   RK_STATE_FAILED     = 5    (verify failure or bad transition)
+//
+// State cell [+0].  Additional cells:
+//   [+8]   current_pmk_slot
+//   [+16]  current_key_slot
+//   [+24]  next_pmk_slot
+//   [+32]  next_key_slot
+//   [+40]  retired_slot (old key, kept for a short in-flight window)
+//   [+48]  rotate_count (monotonic per session)
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// `_rk_state` and `_rk_stats` are written only by helpers in this
+// module.  tools/build.sh confines relocations against both symbols
+// to `core/drivers/wifi/rekey.o` so a second writer cannot silently
+// forge a rotation or leave a retired slot live.
+//
+// =============================================================================
+// §3  ERROR CODES 0xFFFFF330..0xFFFFF33F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: available for future
+// R38.M7+ modules; adjacent free band below: roaming 0xFFFFF340..4F).
+
+module Rekey = structure {
+
+  // §1: state ordinals.
+  pub let RK_STATE_IDLE        : u64 = 0
+  pub let RK_STATE_TRIGGERED   : u64 = 1
+  pub let RK_STATE_ARMED       : u64 = 2
+  pub let RK_STATE_ROTATING    : u64 = 3
+  pub let RK_STATE_DONE        : u64 = 4
+  pub let RK_STATE_FAILED      : u64 = 5
+  pub let RK_STATE_MAX         : u64 = 5
+
+  pub let RK_SLOT_NONE         : u64 = 0
+
+  // §3: failure taxonomy 0xFFFFF330..0xFFFFF33F.
+  pub let RK_OK                : u64 = 0
+  pub let RK_BAD_ARG           : u64 = 0xFFFFF33F
+  pub let RK_BAD_STATE         : u64 = 0xFFFFF33E
+  pub let RK_NO_SESSION        : u64 = 0xFFFFF33D
+  pub let RK_ALREADY           : u64 = 0xFFFFF33C
+  pub let RK_ZERO_SLOT         : u64 = 0xFFFFF33B
+  pub let RK_ARM_FAILED        : u64 = 0xFFFFF33A
+  pub let RK_VERIFY_FAILED     : u64 = 0xFFFFF339
+  pub let RK_ROTATE_INFLIGHT   : u64 = 0xFFFFF338
+
+  // §1: state cell layout.
+  pub let mut _rk_state : [u64; 8] = uninit @align(64)
+  pub let mut _rk_stats : [u64; 8] = uninit @align(64)
+
+  pub let RK_STAT_TRIGGERS     : u64 = 0
+  pub let RK_STAT_TRIGGERS_REFUSED : u64 = 1
+  pub let RK_STAT_ARMS         : u64 = 2
+  pub let RK_STAT_ROTATES      : u64 = 3
+  pub let RK_STAT_RETIRES      : u64 = 4
+  pub let RK_STAT_FAILURES     : u64 = 5
+  pub let RK_STAT_RESETS       : u64 = 6
+
+  // ==========================================================================
+  // Reset -- scrub state + counters.  Boot + teardown.
+  // ==========================================================================
+
+  pub let rk_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-004 (#1321): clear _rk_state + _rk_stats. Labels prefixed rk_rs_.",
+      block: {
+        lea r10, [rip + _rk_state];
+        xor rax, rax;
+        xor rcx, rcx;
+      rk_rs_st:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  rk_rs_st;
+
+        lea r10, [rip + _rk_stats];
+        xor rcx, rcx;
+      rk_rs_ct:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  rk_rs_ct;
+
+        lea r10, [rip + _rk_stats];
+        mov rax, [r10 + 48];              // RESETS slot
+        add rax, 1;
+        mov [r10 + 48], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let rk_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R38.M7-004 (#1321): honesty pin. Returns 0 until a live class driver composes rk_trigger against an EAPOL msg1 RX path and gates KIND_WIFI_KEY rotations through the KRACK-safe replay policy.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let rk_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-004 (#1321): counter bump. Labels prefixed rk_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae rk_nt_out;
+        lea r10, [rip + _rk_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      rk_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let rk_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-004 (#1321): counter read.",
+      block: {
+        cmp rdi, 8;
+        jae rk_st_zero;
+        lea r10, [rip + _rk_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      rk_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let rk_state_get : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-004 (#1321): read state.",
+      block: {
+        lea r10, [rip + _rk_state];
+        mov rax, [r10];
+        ret
+      }
+    } @no_frame
+
+  pub let rk_current_key_slot : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-004 (#1321): read current key slot.",
+      block: {
+        lea r10, [rip + _rk_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let rk_retired_slot : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-004 (#1321): read retired key slot (in-flight decrypt).",
+      block: {
+        lea r10, [rip + _rk_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let rk_rotate_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-004 (#1321): monotonic rotation count.",
+      block: {
+        lea r10, [rip + _rk_state];
+        mov rax, [r10 + 48];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // rk_bind_session(current_pmk_slot, current_key_slot) -> RK_OK | err
+  //
+  // Latch the active session's PMK and KEY slots.  This is the seed
+  // for a subsequent rekey.  Refuses zero slots -- an active session
+  // MUST have both.  Refuses non-IDLE state.
+  // ==========================================================================
+
+  pub let rk_bind_session : (u64, u64) -> u64 !{mem} @{} =
+    fn (current_pmk_slot: u64, current_key_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-004 (#1321): latch active session slots. Labels prefixed rk_bs_.",
+      block: {
+        cmp rdi, 0;
+        je  rk_bs_zero;
+        cmp rsi, 0;
+        je  rk_bs_zero;
+        lea r10, [rip + _rk_state];
+        mov rax, [r10];
+        cmp rax, 0;
+        jne rk_bs_badst;
+        mov [r10 + 8],  rdi;
+        mov [r10 + 16], rsi;
+        xor rax, rax;
+        ret;
+      rk_bs_zero:
+        mov rax, 0xFFFFF33B;              // ZERO_SLOT
+        ret;
+      rk_bs_badst:
+        mov rax, 0xFFFFF33E;              // BAD_STATE
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // rk_trigger() -> RK_OK | err
+  //
+  // A LIVE detector on the EAPOL RX path calls this when it sees a
+  // fresh msg1 arrive on an active session.  Refuses:
+  //   * no session bound        -> RK_NO_SESSION
+  //   * state != IDLE           -> RK_ALREADY (rekey already in flight)
+  //
+  // Transitions state IDLE -> TRIGGERED.
+  // ==========================================================================
+
+  pub let rk_trigger : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-004 (#1321): trigger detection. Labels prefixed rk_tr_.",
+      block: {
+        push rbx;
+        lea r10, [rip + _rk_state];
+        mov rax, [r10 + 8];               // current PMK slot
+        cmp rax, 0;
+        je  rk_tr_nosess;
+        mov rax, [r10 + 16];              // current key slot
+        cmp rax, 0;
+        je  rk_tr_nosess;
+        mov rax, [r10];                   // state
+        cmp rax, 0;
+        jne rk_tr_already;
+
+        mov rax, 1;                       // TRIGGERED
+        mov [r10], rax;
+        mov rdi, 0;                       // TRIGGERS
+        call rk_note;
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      rk_tr_nosess:
+        mov rdi, 1;                       // TRIGGERS_REFUSED
+        call rk_note;
+        mov rax, 0xFFFFF33D;              // NO_SESSION
+        pop rbx;
+        ret;
+      rk_tr_already:
+        mov rdi, 1;
+        call rk_note;
+        mov rax, 0xFFFFF33C;              // ALREADY
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rk_arm(next_pmk_slot, crypto_ep_slot) -> RK_OK | err
+  //
+  // Drive wpa_4way's w4h_arm for the fresh handshake.  Refuses:
+  //   * state != TRIGGERED      -> RK_BAD_STATE
+  //   * next_pmk_slot == 0      -> RK_ZERO_SLOT
+  //   * next_pmk_slot == current-> RK_ALREADY (must be fresh slot)
+  //   * w4h_arm returns != 0    -> RK_ARM_FAILED
+  //
+  // Transitions state TRIGGERED -> ARMED and stores next_pmk_slot.
+  // The caller wires crypto_ep_slot's meaning per wpa_4way §4; this
+  // module composes rather than re-interprets.
+  // ==========================================================================
+
+  pub let rk_arm : (u64, u64) -> u64 !{mem} @{} =
+    fn (next_pmk_slot: u64, crypto_ep_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-004 (#1321): arm fresh 4-way. Labels prefixed rk_ar_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                     // next pmk slot
+        mov r12, rsi;                     // crypto ep
+
+        lea r10, [rip + _rk_state];
+        mov rax, [r10];
+        cmp rax, 1;                       // TRIGGERED
+        jne rk_ar_badst;
+
+        cmp rbx, 0;
+        je  rk_ar_zero;
+        mov rax, [r10 + 8];               // current pmk
+        cmp rax, rbx;
+        je  rk_ar_same;
+
+        // Compose with wpa_4way.
+        mov rdi, rbx;
+        mov rsi, r12;
+        call w4h_arm;
+        cmp rax, 0;
+        jne rk_ar_armfail;
+
+        lea r10, [rip + _rk_state];
+        mov [r10 + 24], rbx;              // next pmk slot
+        mov rax, 2;                       // ARMED
+        mov [r10], rax;
+        mov rdi, 2;                       // ARMS
+        call rk_note;
+        xor rax, rax;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rk_ar_badst:
+        mov rdi, 5;                       // FAILURES
+        call rk_note;
+        mov rax, 0xFFFFF33E;              // BAD_STATE
+        pop r12;
+        pop rbx;
+        ret;
+      rk_ar_zero:
+        mov rdi, 5;
+        call rk_note;
+        mov rax, 0xFFFFF33B;              // ZERO_SLOT
+        pop r12;
+        pop rbx;
+        ret;
+      rk_ar_same:
+        mov rdi, 5;
+        call rk_note;
+        mov rax, 0xFFFFF33C;              // ALREADY
+        pop r12;
+        pop rbx;
+        ret;
+      rk_ar_armfail:
+        lea r10, [rip + _rk_state];
+        mov r9, 5;                        // FAILED
+        mov [r10], r9;
+        mov rdi, 5;
+        call rk_note;
+        mov rax, 0xFFFFF33A;              // ARM_FAILED
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rk_verify_done() -> RK_OK | err
+  //
+  // Confirm wpa_4way reached W4H_DONE.  Refuses:
+  //   * state != ARMED          -> RK_BAD_STATE
+  //   * w4h_state_get != W4H_DONE -> RK_VERIFY_FAILED
+  //
+  // Transitions ARMED -> ROTATING.
+  // ==========================================================================
+
+  pub let rk_verify_done : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-004 (#1321): verify 4-way completed. Labels prefixed rk_vd_.",
+      block: {
+        push rbx;
+        lea r10, [rip + _rk_state];
+        mov rax, [r10];
+        cmp rax, 2;                       // ARMED
+        jne rk_vd_badst;
+
+        call w4h_state_get;
+        cmp rax, 4;                       // W4H_DONE
+        jne rk_vd_verf;
+
+        lea r10, [rip + _rk_state];
+        mov rax, 3;                       // ROTATING
+        mov [r10], rax;
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      rk_vd_badst:
+        mov rdi, 5;
+        call rk_note;
+        mov rax, 0xFFFFF33E;
+        pop rbx;
+        ret;
+      rk_vd_verf:
+        lea r10, [rip + _rk_state];
+        mov r9, 5;                        // FAILED
+        mov [r10], r9;
+        mov rdi, 5;
+        call rk_note;
+        mov rax, 0xFFFFF339;              // VERIFY_FAILED
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rk_rotate(new_key_slot) -> RK_OK | err
+  //
+  // Commit the slot rotation.  Refuses:
+  //   * state != ROTATING       -> RK_BAD_STATE
+  //   * new_key_slot == 0       -> RK_ZERO_SLOT
+  //   * new_key_slot == current -> RK_ALREADY
+  //   * retired_slot non-zero   -> RK_ROTATE_INFLIGHT (finish prior rotation)
+  //
+  // Effects:
+  //   retired_slot <- current_key_slot   (kept for in-flight decrypt)
+  //   current_key_slot <- new_key_slot
+  //   current_pmk_slot <- next_pmk_slot  (from rk_arm)
+  //   rotate_count += 1
+  //   state <- DONE
+  //   note ROTATES
+  // ==========================================================================
+
+  pub let rk_rotate : (u64) -> u64 !{mem} @{} =
+    fn (new_key_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-004 (#1321): commit slot rotation. Labels prefixed rk_rt_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+        lea r10, [rip + _rk_state];
+        mov rax, [r10];
+        cmp rax, 3;                       // ROTATING
+        jne rk_rt_badst;
+        cmp rbx, 0;
+        je  rk_rt_zero;
+        mov rax, [r10 + 16];              // current key
+        cmp rax, rbx;
+        je  rk_rt_same;
+        mov rax, [r10 + 40];              // retired
+        cmp rax, 0;
+        jne rk_rt_infl;
+
+        // Commit.
+        mov rax, [r10 + 16];
+        mov [r10 + 40], rax;              // retire current
+        mov [r10 + 16], rbx;              // install new
+        mov rax, [r10 + 24];
+        mov [r10 + 8], rax;               // next pmk becomes current
+        mov rax, [r10 + 48];
+        add rax, 1;
+        mov [r10 + 48], rax;              // rotate_count
+        mov rax, 4;                       // DONE
+        mov [r10], rax;
+
+        mov rdi, 3;                       // ROTATES
+        call rk_note;
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      rk_rt_badst:
+        mov rdi, 5;
+        call rk_note;
+        mov rax, 0xFFFFF33E;
+        pop rbx;
+        ret;
+      rk_rt_zero:
+        mov rdi, 5;
+        call rk_note;
+        mov rax, 0xFFFFF33B;
+        pop rbx;
+        ret;
+      rk_rt_same:
+        mov rdi, 5;
+        call rk_note;
+        mov rax, 0xFFFFF33C;
+        pop rbx;
+        ret;
+      rk_rt_infl:
+        mov rdi, 5;
+        call rk_note;
+        mov rax, 0xFFFFF338;              // ROTATE_INFLIGHT
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rk_retire_old() -> RK_OK | err
+  //
+  // Drop the retired slot after the in-flight decrypt window closes.
+  // A live caller schedules this after a bounded interval (or after
+  // a bounded packet count) has elapsed.  Refuses:
+  //   * retired_slot == 0       -> RK_ALREADY (nothing to retire)
+  //
+  // Transitions state DONE -> IDLE if state was DONE; otherwise
+  // leaves state alone (a retire during a fresh trigger is legal).
+  // ==========================================================================
+
+  pub let rk_retire_old : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M7-004 (#1321): drop retired key. Labels prefixed rk_rr_.",
+      block: {
+        push rbx;
+        lea r10, [rip + _rk_state];
+        mov rax, [r10 + 40];
+        cmp rax, 0;
+        je  rk_rr_none;
+        xor rax, rax;
+        mov [r10 + 40], rax;
+        mov rax, [r10];
+        cmp rax, 4;                       // DONE
+        jne rk_rr_note;
+        xor rax, rax;
+        mov [r10], rax;                   // -> IDLE
+      rk_rr_note:
+        mov rdi, 4;                       // RETIRES
+        call rk_note;
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      rk_rr_none:
+        mov rdi, 5;
+        call rk_note;
+        mov rax, 0xFFFFF33C;              // ALREADY (nothing to retire)
+        pop rbx;
+        ret
+      }
+    }
+}
