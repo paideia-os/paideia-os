@@ -1,0 +1,448 @@
+// src/kernel/core/drivers/cam/csi_phy.pdx — R40.M2-002 (#1351)
+//
+// MIPI-CSI D-PHY 2.5 receiver PHY init + lane configuration scaffold.
+// The IPU6 (R40.M1) sits upstream of a MIPI-CSI receiver that carries
+// D-PHY clock+data lanes to the image sensor.  This module models the
+// D-PHY bring-up state machine: lane count selection (1 / 2 / 4),
+// escape-mode handshake settle, HS-RX enable, and data-rate setpoint
+// programming (bps per lane).
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the SEQUENCER + RECORD half of MIPI-CSI D-PHY bring-up.  It
+// records the requested lane count, the requested data-rate setpoint
+// (Gbps per lane, scaled to integer bps), and drives a small synthetic
+// CTRL bank whose slots model the PHY registers (per MIPI Alliance
+// D-PHY 2.5 §5.9 and §6.3 "PHY-Protocol Interface Timing Parameters").
+//
+// IT DOES NOT PROGRAM REAL D-PHY BLOCKS.  A live driver replaces the
+// synthetic CTRL_LANE_MASK / CTRL_HSRX_ENABLE / CTRL_DATA_RATE writes
+// with the platform's actual receiver register bank (IPU6 CSI2_HOST
+// window; the substitution point is the CTRL bank base pointer here,
+// which does not need to change for the caller).
+//
+// IT DOES NOT MOVE PIXELS.  Streaming is R40.M4 work; this module
+// leaves the receiver in "clock lane in LP-11, data lanes at HS
+// standby" -- a state a live sensor would then advertise itself
+// against by driving its start-of-frame short packet.
+//
+// mcsi_arbitrated() returns 0 until a later round wires the CTRL
+// bank to a live IPU6 CSI2_HOST BAR window.
+//
+// =============================================================================
+// §1  CTRL REGISTER MAP (synthetic; MIPI D-PHY 2.5 names)
+// =============================================================================
+//
+//   [0]  CTRL_LANE_MASK    bit N set iff lane N is active
+//   [1]  CTRL_HSRX_ENABLE  bit 0 = 1 when HS-RX has been enabled
+//   [2]  CTRL_DATA_RATE    bps per lane (u32); MIPI D-PHY 2.5 sets
+//                          a nominal 1.5 Gbps ceiling for the base
+//                          profile (MCSI_DATA_RATE_DEFAULT).
+//   [3]  CTRL_ESC_SETTLED  bit 0 = 1 once escape-mode settle done
+//   [4]  CTRL_INIT_SEQ     init sequence counter (bumped per init)
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _mcsi_ctrl, _mcsi_state, and _mcsi_stats are written only by helpers
+// in this module.  tools/build.sh confines relocations against each
+// to `core/drivers/cam/csi_phy.o`.
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFF220..0xFFFFF22F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: KIND_CSI_CAMERA
+// 0xFFFFF230..3F, R40.M2-001; adjacent free band below: sensor_enum
+// 0xFFFFF210..1F, R40.M2-003).
+
+module CsiPhy = structure {
+
+  // §1: CTRL bank slot indices.
+  pub let MCSI_CTRL_LANE_MASK   : u64 = 0
+  pub let MCSI_CTRL_HSRX_ENABLE : u64 = 1
+  pub let MCSI_CTRL_DATA_RATE   : u64 = 2
+  pub let MCSI_CTRL_ESC_SETTLED : u64 = 3
+  pub let MCSI_CTRL_INIT_SEQ    : u64 = 4
+
+  // Accepted lane-count values (MIPI D-PHY §5.1: 1, 2, 4 lanes).
+  pub let MCSI_LANES_MAX : u64 = 4
+
+  // Data-rate setpoint bounds (bps per lane).  D-PHY 2.5 tops at
+  // 4.5 Gbps in ALP mode; the base profile T14 G4 boards use is
+  // 1.5 Gbps.  Refuse a rate that is either zero or above the D-PHY
+  // 2.5 ceiling.
+  pub let MCSI_DATA_RATE_DEFAULT : u64 = 1500000000       // 1.5 Gbps
+  pub let MCSI_DATA_RATE_MAX     : u64 = 4500000000       // 4.5 Gbps
+
+  // Failure taxonomy — 0xFFFFF220..0xFFFFF22F.
+  pub let MCSI_OK               : u64 = 0
+  pub let MCSI_BAD_ARG          : u64 = 0xFFFFF22F
+  pub let MCSI_BAD_LANES        : u64 = 0xFFFFF22E
+  pub let MCSI_BAD_RATE         : u64 = 0xFFFFF22D
+  pub let MCSI_ESC_TIMEOUT      : u64 = 0xFFFFF22C
+  pub let MCSI_HSRX_STUCK       : u64 = 0xFFFFF22B
+  pub let MCSI_ALREADY_INITED   : u64 = 0xFFFFF22A
+  pub let MCSI_NOT_INITED       : u64 = 0xFFFFF229
+
+  // Bounded escape-settle poll (MIPI D-PHY §6.4: 100 ns typ, 2 us max).
+  pub let MCSI_ESC_MAX_ITERS    : u64 = 0x10000
+
+  // §1: synthetic CTRL bank (5 u64 slots) + init flag.
+  pub let mut _mcsi_ctrl  : [u64; 8] = uninit @align(64)
+  pub let mut _mcsi_state : [u64; 1] = uninit @align(64)
+
+  // Counters.
+  pub let mut _mcsi_stats : [u64; 8] = uninit @align(64)
+
+  pub let MCSI_ST_INITS     : u64 = 0
+  pub let MCSI_ST_TIMEOUTS  : u64 = 1
+  pub let MCSI_ST_REFUSED   : u64 = 2
+  pub let MCSI_ST_TEARDOWNS : u64 = 3
+
+  // ==========================================================================
+  // Reset.  Zeros the CTRL bank, clears init flag, zeros stats.
+  // ==========================================================================
+
+  pub let mcsi_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R40.M2-002 (#1351): clear CTRL bank, init flag, and stats. Boot + teardown. Labels prefixed mcsi_rs_.",
+      block: {
+        lea r10, [rip + _mcsi_ctrl];
+        xor rax, rax;
+        xor rcx, rcx;
+      mcsi_rs_ctrl:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  mcsi_rs_ctrl;
+
+        lea r10, [rip + _mcsi_state];
+        xor rax, rax;
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _mcsi_stats];
+        xor rcx, rcx;
+      mcsi_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  mcsi_rs_stats;
+        ret
+      }
+    } @no_frame
+
+  pub let mcsi_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R40.M2-002 (#1351): honesty pin. Returns 0 until a later round wires this against a live IPU6 CSI2_HOST BAR.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let mcsi_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R40.M2-002 (#1351): counter bump. Labels prefixed mcsi_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae mcsi_nt_out;
+        lea r10, [rip + _mcsi_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      mcsi_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let mcsi_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R40.M2-002 (#1351): counter read. Labels prefixed mcsi_st_.",
+      block: {
+        cmp rdi, 8;
+        jae mcsi_st_zero;
+        lea r10, [rip + _mcsi_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      mcsi_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Validators.
+  // ==========================================================================
+
+  pub let mcsi_lanes_valid : (u64) -> u64 !{} @{} =
+    fn (lanes: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R40.M2-002 (#1351): 1 iff lanes in {1, 2, 4}. Labels prefixed mcsi_lv_.",
+      block: {
+        cmp rdi, 1;
+        je  mcsi_lv_yes;
+        cmp rdi, 2;
+        je  mcsi_lv_yes;
+        cmp rdi, 4;
+        je  mcsi_lv_yes;
+        xor rax, rax;
+        ret;
+      mcsi_lv_yes:
+        mov rax, 1;
+        ret
+      }
+    } @no_frame
+
+  pub let mcsi_rate_valid : (u64) -> u64 !{} @{} =
+    fn (rate: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R40.M2-002 (#1351): 1 iff rate in (0, MCSI_DATA_RATE_MAX]. Labels prefixed mcsi_rv_.",
+      block: {
+        cmp rdi, 0;
+        je  mcsi_rv_no;
+        mov r10, 4500000000;
+        cmp rdi, r10;
+        ja  mcsi_rv_no;
+        mov rax, 1;
+        ret;
+      mcsi_rv_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // CTRL accessors (witness surface).
+  //
+  //   mcsi_ctrl_read(slot)                -> u64
+  //   mcsi_ctrl_stamp_esc_settled()       -> ()  witness surface: pre-writes
+  //                                              CTRL_ESC_SETTLED bit 0
+  //   mcsi_is_inited()                    -> u64 1 iff init flag set
+  // ==========================================================================
+
+  pub let mcsi_ctrl_read : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R40.M2-002 (#1351): read a CTRL bank slot; bounds refuse with 0. Labels prefixed mcsi_cr_.",
+      block: {
+        cmp rdi, 8;
+        jae mcsi_cr_zero;
+        lea r10, [rip + _mcsi_ctrl];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      mcsi_cr_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let mcsi_ctrl_stamp_esc_settled : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R40.M2-002 (#1351): witness surface -- stamp CTRL_ESC_SETTLED. Labels prefixed mcsi_se_.",
+      block: {
+        lea r10, [rip + _mcsi_ctrl];
+        mov rax, [r10 + 24];             // CTRL_ESC_SETTLED
+        or  rax, 1;
+        mov [r10 + 24], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let mcsi_is_inited : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R40.M2-002 (#1351): 1 iff PHY init has succeeded this boot. Labels prefixed mcsi_ii_.",
+      block: {
+        lea r10, [rip + _mcsi_state];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // mcsi_phy_init(lanes, rate) -> MCSI_OK | error
+  //
+  // §0: THE ONE ENTRY POINT for MIPI-CSI D-PHY bring-up.  Order:
+  //   1. Refuse ALREADY_INITED (a re-init without teardown is refused;
+  //      an operator that wants to change lanes runs mcsi_phy_teardown
+  //      first).
+  //   2. Validate lanes / rate.
+  //   3. Program CTRL_LANE_MASK = (1 << lanes) - 1.
+  //   4. Poll CTRL_ESC_SETTLED with bounded wait (§6.4 in MIPI D-PHY).
+  //   5. Program CTRL_DATA_RATE = rate; verify echo.
+  //   6. Program CTRL_HSRX_ENABLE; verify echo.
+  //   7. Bump CTRL_INIT_SEQ, set init flag, bump INITS.
+  // ==========================================================================
+
+  pub let mcsi_phy_init : (u64, u64) -> u64 !{mem} @{} =
+    fn (lanes: u64) (rate: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R40.M2-002 (#1351): MIPI-CSI D-PHY bring-up FSM. Refuses already-inited, validates lanes and rate, programs CTRL bank, polls ESC_SETTLED with bounded wait, sets init flag. Labels prefixed mcsi_i_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // lanes
+        mov r12, rsi;                    // rate
+
+        // 1. Not-already-inited.
+        lea r10, [rip + _mcsi_state];
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        jne mcsi_i_already;
+
+        // 2. Validators.
+        mov rdi, rbx;
+        call mcsi_lanes_valid;
+        cmp rax, 0;
+        je  mcsi_i_bad_lanes;
+
+        mov rdi, r12;
+        call mcsi_rate_valid;
+        cmp rax, 0;
+        je  mcsi_i_bad_rate;
+
+        // 3. Lane mask = (1 << lanes) - 1.
+        mov rcx, rbx;
+        mov rax, 1;
+        shl rax, cl;
+        sub rax, 1;
+        lea r10, [rip + _mcsi_ctrl];
+        mov [r10 + 0], rax;              // CTRL_LANE_MASK
+
+        // 4. Poll CTRL_ESC_SETTLED.
+        xor r13, r13;                    // iteration counter
+      mcsi_i_poll:
+        lea r10, [rip + _mcsi_ctrl];
+        mov rax, [r10 + 24];             // CTRL_ESC_SETTLED
+        mov rcx, rax;
+        and rcx, 1;
+        cmp rcx, 0;
+        jne mcsi_i_settled;
+        add r13, 1;
+        mov r10, 0x10000;                // MCSI_ESC_MAX_ITERS
+        cmp r13, r10;
+        jb  mcsi_i_poll;
+
+        // Timeout: refuse.
+        jmp mcsi_i_timeout;
+
+      mcsi_i_settled:
+        // 5. Program data rate.
+        lea r10, [rip + _mcsi_ctrl];
+        mov [r10 + 16], r12;             // CTRL_DATA_RATE
+        mov rax, [r10 + 16];
+        cmp rax, r12;
+        jne mcsi_i_hsrx_stuck;
+
+        // 6. Program HSRX enable.
+        mov rax, 1;
+        mov [r10 + 8], rax;              // CTRL_HSRX_ENABLE
+        mov rax, [r10 + 8];
+        cmp rax, 1;
+        jne mcsi_i_hsrx_stuck;
+
+        // 7. Bump init seq, set init flag.
+        mov rax, [r10 + 32];             // CTRL_INIT_SEQ
+        add rax, 1;
+        mov [r10 + 32], rax;
+
+        lea r10, [rip + _mcsi_state];
+        mov rax, 1;
+        mov [r10 + 0], rax;
+
+        mov rdi, 0;                      // INITS
+        call mcsi_note;
+        xor rax, rax;
+        jmp mcsi_i_out;
+
+      mcsi_i_bad_lanes:
+        mov rdi, 2;
+        call mcsi_note;
+        mov rax, 0xFFFFF22E;
+        jmp mcsi_i_out;
+      mcsi_i_bad_rate:
+        mov rdi, 2;
+        call mcsi_note;
+        mov rax, 0xFFFFF22D;
+        jmp mcsi_i_out;
+      mcsi_i_already:
+        mov rdi, 2;
+        call mcsi_note;
+        mov rax, 0xFFFFF22A;
+        jmp mcsi_i_out;
+      mcsi_i_timeout:
+        mov rdi, 1;                      // TIMEOUTS
+        call mcsi_note;
+        mov rdi, 2;
+        call mcsi_note;
+        mov rax, 0xFFFFF22C;
+        jmp mcsi_i_out;
+      mcsi_i_hsrx_stuck:
+        mov rdi, 2;
+        call mcsi_note;
+        mov rax, 0xFFFFF22B;
+
+      mcsi_i_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mcsi_phy_teardown() -> MCSI_OK | MCSI_NOT_INITED
+  //
+  // Clear HSRX_ENABLE, clear lane mask, clear init flag.  Leaves the
+  // init sequence counter in place so a witness can see the driver
+  // brought the PHY up and down at least once.
+  // ==========================================================================
+
+  pub let mcsi_phy_teardown : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R40.M2-002 (#1351): tear down PHY -- clear HSRX/lane/init flag. Refuses NOT_INITED if init flag is clear. One push rbx to keep SysV rsp%16==0 at the mcsi_note call. Labels prefixed mcsi_td_.",
+      block: {
+        push rbx;
+
+        lea r10, [rip + _mcsi_state];
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        je  mcsi_td_not_inited;
+
+        lea r10, [rip + _mcsi_ctrl];
+        xor rax, rax;
+        mov [r10 + 0], rax;              // CTRL_LANE_MASK
+        mov [r10 + 8], rax;              // CTRL_HSRX_ENABLE
+
+        lea r10, [rip + _mcsi_state];
+        xor rax, rax;
+        mov [r10 + 0], rax;
+
+        mov rdi, 3;                      // TEARDOWNS
+        call mcsi_note;
+
+        xor rax, rax;
+        jmp mcsi_td_out;
+
+      mcsi_td_not_inited:
+        mov rax, 0xFFFFF229;
+
+      mcsi_td_out:
+        pop rbx;
+        ret
+      }
+    }
+}

@@ -3913,6 +3913,45 @@ fi
 echo "[r40-m1-confine] R40.M1 (IPU6 probe + verify + load) confined"
 
 # ---------------------------------------------------------------------------
+# R40.M2 (#1351/#1352/#1353/#1354): MIPI-CSI + KIND_CSI_CAMERA + sensor
+# enumeration + per-sensor init sequences.
+#
+# Four modules open R40.M2: the KIND_CSI_CAMERA capability (kind_csi_camera),
+# the MIPI-CSI D-PHY receiver init driver (csi_phy), the sensor _CID
+# enumeration driver (sensor_enum), and the per-sensor init sequence driver
+# (sensor_init).  Each owns its own state cells + counters; tools/build.sh
+# confines relocations against each to its owning object so a second writer
+# cannot silently forge a camera row, bring the PHY up under a stale lane
+# mask, bind a spurious _CID to a driver, or program a sensor into a mode
+# nobody asked for.
+KCCAM_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_csi_camera.pdx"
+MCSI_SRC="${REPO_ROOT}/src/kernel/core/drivers/cam/csi_phy.pdx"
+SEN_SRC="${REPO_ROOT}/src/kernel/core/drivers/cam/sensor_enum.pdx"
+SINIT_SRC="${REPO_ROOT}/src/kernel/core/drivers/cam/sensor_init.pdx"
+if [[ ! -f "${KCCAM_SRC}" || ! -f "${MCSI_SRC}" || ! -f "${SEN_SRC}" || ! -f "${SINIT_SRC}" ]]; then
+    echo "[r40-m2-confine] FAIL - one of the R40.M2 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_csi_camera_table' 'core/cap/kind_csi_camera.o'
+ec_confine_one '_csi_camera_stats' 'core/cap/kind_csi_camera.o'
+ec_confine_one '_mcsi_ctrl'        'core/drivers/cam/csi_phy.o'
+ec_confine_one '_mcsi_state'       'core/drivers/cam/csi_phy.o'
+ec_confine_one '_mcsi_stats'       'core/drivers/cam/csi_phy.o'
+ec_confine_one '_sen_bind_table'   'core/drivers/cam/sensor_enum.o'
+ec_confine_one '_sen_bind_count'   'core/drivers/cam/sensor_enum.o'
+ec_confine_one '_sen_stats'        'core/drivers/cam/sensor_enum.o'
+ec_confine_one '_sinit_ctrl'       'core/drivers/cam/sensor_init.o'
+ec_confine_one '_sinit_state'      'core/drivers/cam/sensor_init.o'
+ec_confine_one '_sinit_stats'      'core/drivers/cam/sensor_init.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_csi_camera.pdx §2 (row table), csi_phy.pdx §2," >&2
+    echo "  sensor_enum.pdx §1, and sensor_init.pdx §2 for the" >&2
+    echo "  per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[r40-m2-confine] R40.M2 (MIPI-CSI + KIND_CSI_CAMERA + sensor enum + sensor init) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
