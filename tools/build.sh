@@ -3503,6 +3503,48 @@ fi
 echo "[gpu-m8-confine] R37.M8 (GPU video-decode enablement) confined"
 
 # ---------------------------------------------------------------------------
+# R38.M1 (#1289/#1291/#1292/#1293): AX211 WiFi bring-up substrate --
+# PCI probe + BAR mapping (ax211_probe), UMAC/MVM firmware
+# dual-signature verifier (fw_verify), firmware load handshake +
+# INIT_ALIVE notification (fw_load), and firmware version
+# compatibility matrix (fw_compat).
+#
+# Four modules open R38.M1 (post-R37 close).  Each owns its own
+# state; tools/build.sh confines relocations against each to its
+# owning object so a second writer cannot forge a probe stat, a
+# verified bundle record, a CSR bank snapshot, or a compat counter.
+AXP_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/ax211_probe.pdx"
+WFV_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/fw_verify.pdx"
+WFL_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/fw_load.pdx"
+WCM_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/fw_compat.pdx"
+if [[ ! -f "${AXP_SRC}" || ! -f "${WFV_SRC}" \
+        || ! -f "${WFL_SRC}" || ! -f "${WCM_SRC}" ]]; then
+    echo "[wifi-m1-confine] FAIL - one of the R38.M1 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_axp_probe_stats' 'core/drivers/wifi/ax211_probe.o'
+ec_confine_one '_wfv_blob_ptr'    'core/drivers/wifi/fw_verify.o'
+ec_confine_one '_wfv_blob_len'    'core/drivers/wifi/fw_verify.o'
+ec_confine_one '_wfv_verified'    'core/drivers/wifi/fw_verify.o'
+ec_confine_one '_wfv_umac_off'    'core/drivers/wifi/fw_verify.o'
+ec_confine_one '_wfv_umac_len'    'core/drivers/wifi/fw_verify.o'
+ec_confine_one '_wfv_mvm_off'     'core/drivers/wifi/fw_verify.o'
+ec_confine_one '_wfv_mvm_len'     'core/drivers/wifi/fw_verify.o'
+ec_confine_one '_wfv_stats'       'core/drivers/wifi/fw_verify.o'
+ec_confine_one '_wfl_csr'         'core/drivers/wifi/fw_load.o'
+ec_confine_one '_wfl_loaded'      'core/drivers/wifi/fw_load.o'
+ec_confine_one '_wfl_alive_iters' 'core/drivers/wifi/fw_load.o'
+ec_confine_one '_wfl_stats'       'core/drivers/wifi/fw_load.o'
+ec_confine_one '_wcm_stats'       'core/drivers/wifi/fw_compat.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See ax211_probe.pdx §3, fw_verify.pdx §2, fw_load.pdx §3," >&2
+    echo "  and fw_compat.pdx §2 for the row/counter one-writer" >&2
+    echo "  discipline." >&2
+    exit 1
+fi
+echo "[wifi-m1-confine] R38.M1 (AX211 WiFi bring-up substrate) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
