@@ -3952,6 +3952,40 @@ fi
 echo "[r40-m2-confine] R40.M2 (MIPI-CSI + KIND_CSI_CAMERA + sensor enum + sensor init) confined"
 
 # ---------------------------------------------------------------------------
+# R40.M3 (#1355/#1356/#1357): IPU6 imaging pipeline + KIND_IPU6_STREAM +
+# camera capture channel.
+#
+# Three modules open R40.M3: the IPU6 pipeline stage scaffold
+# (ipu6_pipeline), the KIND_IPU6_STREAM capability (kind_ipu6_stream),
+# and the camera_capture_channel session schema (camera_capture_channel).
+# Each owns its own state cells + counters; tools/build.sh confines
+# relocations against each to its owning object so a second writer
+# cannot silently forge a stream row, restamp the pipeline CTRL bank
+# or advance the session FSM out from under the ring-3 supervisor.
+KIPU6S_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_ipu6_stream.pdx"
+IPP2_SRC="${REPO_ROOT}/src/kernel/core/drivers/cam/ipu6_pipeline.pdx"
+CCC_SRC="${REPO_ROOT}/src/kernel/core/ipc/camera_capture_channel.pdx"
+if [[ ! -f "${KIPU6S_SRC}" || ! -f "${IPP2_SRC}" || ! -f "${CCC_SRC}" ]]; then
+    echo "[r40-m3-confine] FAIL - one of the R40.M3 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_ipu6_stream_table' 'core/cap/kind_ipu6_stream.o'
+ec_confine_one '_ipu6_stream_stats' 'core/cap/kind_ipu6_stream.o'
+ec_confine_one '_ipp2_ctrl'         'core/drivers/cam/ipu6_pipeline.o'
+ec_confine_one '_ipp2_state'        'core/drivers/cam/ipu6_pipeline.o'
+ec_confine_one '_ipp2_stage_counts' 'core/drivers/cam/ipu6_pipeline.o'
+ec_confine_one '_ipp2_stats'        'core/drivers/cam/ipu6_pipeline.o'
+ec_confine_one '_ccc_state'         'core/ipc/camera_capture_channel.o'
+ec_confine_one '_ccc_stats'         'core/ipc/camera_capture_channel.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_ipu6_stream.pdx §2 (row table), ipu6_pipeline.pdx §2," >&2
+    echo "  and camera_capture_channel.pdx §1 (session cell) for the" >&2
+    echo "  per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[r40-m3-confine] R40.M3 (IPU6 pipeline + KIND_IPU6_STREAM + camera capture channel) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
