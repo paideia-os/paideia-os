@@ -1,0 +1,565 @@
+// src/kernel/core/drivers/wifi/wpa_4way.pdx — R38.M5-003 (#1311)
+//
+// WPA 4-way handshake state machine per 802.11-2020 §12.7 / IEEE
+// Std 802.1X-2010 §7.  Runs after WPA3 SAE has established the PMK
+// (the ACCEPTED terminal of wpa3_sae.pdx), and derives the PTK from
+// (PMK, ANonce, SNonce) plus AA + SPA MACs; installs the GTK the AP
+// distributes in message 3.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the FOUR-MESSAGE STATE MACHINE.  A live path composes: SAE
+// completed (wpa3_sae.pdx SAE_ACCEPTED) yields PMK; this module
+// walks the four messages against the FSM; each transition that
+// requires a KEY DERIVATION (M2: PTK from PMK+nonces; M3: GTK
+// install) is DELEGATED to the R32 crypto server through a
+// KIND_CRYPTO_ENDPOINT (represented here by the crypto_ep_slot the
+// caller passes in).
+//
+// IT DOES NOT COMPUTE THE PTK.  PBKDF2 + PRF-384 + SHA-256 live in
+// R32 (crypto server).  Here the derivation is a REQUEST the FSM
+// files against the crypto endpoint slot -- the returned ptk_slot is
+// a KIND_WIFI_KEY (sealed) reference the FSM records for later.
+//
+// IT DOES NOT COMPUTE THE MIC.  Same argument: MIC verification on
+// M3 (received) and MIC computation on M2/M4 (sent) is R32's
+// business; here the FSM checks that a caller-supplied `mic_ok` byte
+// is non-zero and refuses M4_INSTALL if the M3 MIC did not verify.
+//
+// The four states + refuse-taxonomy is what the module OWNS.
+//
+// =============================================================================
+// §1  STATES  (802.11-2020 §12.7.6.2)
+// =============================================================================
+//
+//   W4H_INIT       (0) -- no handshake in flight.  Set by reset.
+//   W4H_AWAIT_M1   (1) -- SAE completed; PMK is live; awaiting M1 from AP.
+//   W4H_AWAIT_M3   (2) -- M1 received, M2 sent + PTK derived; awaiting M3.
+//   W4H_AWAIT_M4   (3) -- M3 received + verified; awaiting M4 send confirm.
+//   W4H_DONE       (4) -- M4 sent; PTK + GTK installed.  Link ENCRYPTED.
+//   W4H_FAILED     (5) -- MIC verify failed / bad transition; reset req'd.
+//
+// Legal transitions:
+//   INIT      + arm(pmk_slot, crypto_ep)   -> AWAIT_M1
+//   AWAIT_M1  + m1_recv(anonce)            -> AWAIT_M3 (delegates PTK
+//                                             derive to crypto_ep)
+//   AWAIT_M3  + m3_recv(mic_ok, gtk_slot)  -> AWAIT_M4 (delegates GTK
+//                                             install to crypto_ep)
+//   AWAIT_M4  + m4_sent()                  -> DONE
+//   any state + fail()                     -> FAILED
+//   any state + reset()                    -> INIT
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// `_w4h_state` and `_w4h_stats` are written only by helpers in this
+// module.  tools/build.sh confines relocations against both symbols
+// to `core/drivers/wifi/wpa_4way.o` so a second writer cannot
+// silently forge a message admission.
+//
+// =============================================================================
+// §3  ERROR CODES 0xFFFFF3C0..0xFFFFF3CF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time from every other
+// kind/driver band (adjacent used band above: wpa3_sae
+// 0xFFFFF3D0..DF; adjacent free band below: replay_counter
+// 0xFFFFF3B0..BF).
+
+module Wpa4way = structure {
+
+  // §1 states.
+  pub let W4H_INIT       : u64 = 0
+  pub let W4H_AWAIT_M1   : u64 = 1
+  pub let W4H_AWAIT_M3   : u64 = 2
+  pub let W4H_AWAIT_M4   : u64 = 3
+  pub let W4H_DONE       : u64 = 4
+  pub let W4H_FAILED     : u64 = 5
+  pub let W4H_STATE_MAX  : u64 = 5
+
+  // Failure taxonomy 0xFFFFF3C0..0xFFFFF3CF.
+  pub let W4H_OK                    : u64 = 0
+  pub let W4H_BAD_ARG               : u64 = 0xFFFFF3CF
+  pub let W4H_BAD_STATE             : u64 = 0xFFFFF3CE
+  pub let W4H_ZERO_PMK              : u64 = 0xFFFFF3CD
+  pub let W4H_ZERO_CRYPTO_EP        : u64 = 0xFFFFF3CC
+  pub let W4H_ZERO_ANONCE           : u64 = 0xFFFFF3CB
+  pub let W4H_ZERO_SNONCE           : u64 = 0xFFFFF3CA
+  pub let W4H_ZERO_GTK              : u64 = 0xFFFFF3C9
+  pub let W4H_MIC_FAILED            : u64 = 0xFFFFF3C8
+  pub let W4H_INVALID_TRANSITION    : u64 = 0xFFFFF3C7
+  pub let W4H_PMK_NOT_ARMED         : u64 = 0xFFFFF3C6
+  pub let W4H_BUSY                  : u64 = 0xFFFFF3C5    // arm while != INIT
+
+  // §2: state cell layout.
+  //   [0] state
+  //   [1] pmk_slot            (KIND_WIFI_KEY -- PMK from SAE)
+  //   [2] crypto_ep_slot      (KIND_CRYPTO_ENDPOINT reference; today
+  //                            an honesty pin for the R32 endpoint
+  //                            derivation will delegate to)
+  //   [3] anonce              (received in M1)
+  //   [4] snonce              (chosen locally for M2)
+  //   [5] ptk_slot            (KIND_WIFI_KEY -- PTK derived after M2)
+  //   [6] gtk_slot            (KIND_WIFI_KEY -- GTK installed after M3)
+  //   [7] mic_ok              (byte flag; M3 MIC verification result)
+  pub let mut _w4h_state : [u64; 8] = uninit @align(64)
+  pub let mut _w4h_stats : [u64; 8] = uninit @align(64)
+
+  pub let W4H_STAT_ARMS         : u64 = 0
+  pub let W4H_STAT_M1_RECVS     : u64 = 1
+  pub let W4H_STAT_M3_RECVS     : u64 = 2
+  pub let W4H_STAT_M4_SENDS     : u64 = 3
+  pub let W4H_STAT_REFUSED      : u64 = 4
+  pub let W4H_STAT_MIC_FAILS    : u64 = 5
+  pub let W4H_STAT_RESETS       : u64 = 6
+  pub let W4H_STAT_TRANSITIONS  : u64 = 7
+
+  // Sentinel nonces the driver picks locally; a real path draws from
+  // an entropy source.  The unit test supplies its own values.
+  pub let W4H_LOCAL_SNONCE_STUB : u64 = 0xDEADBEEF01234567
+
+  // ==========================================================================
+  // Reset -- state INIT, all fields cleared.  Boot + teardown + retry.
+  // ==========================================================================
+
+  pub let w4h_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M5-003 (#1311): clear state + stats. Labels prefixed w4h_rs_.",
+      block: {
+        lea r10, [rip + _w4h_state];
+        xor rax, rax;
+        xor rcx, rcx;
+      w4h_rs_st:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  w4h_rs_st;
+
+        lea r10, [rip + _w4h_stats];
+        xor rcx, rcx;
+      w4h_rs_ct:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  w4h_rs_ct;
+        ret
+      }
+    } @no_frame
+
+  pub let w4h_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R38.M5-003 (#1311): honesty pin. Returns 0 until R32 KIND_CRYPTO_ENDPOINT wires real PTK/GTK derivation behind w4h_m1_recv / w4h_m3_recv.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let w4h_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M5-003 (#1311): counter bump. Labels prefixed w4h_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae w4h_nt_out;
+        lea r10, [rip + _w4h_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      w4h_nt_out:
+        ret
+      }
+    } @no_frame
+
+  pub let w4h_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M5-003 (#1311): counter read. Labels prefixed w4h_st_.",
+      block: {
+        cmp rdi, 8;
+        jae w4h_st_zero;
+        lea r10, [rip + _w4h_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      w4h_st_zero:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Getters.
+  // ==========================================================================
+
+  pub let w4h_state_get : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M5-003 (#1311): read state.",
+      block: {
+        lea r10, [rip + _w4h_state];
+        mov rax, [r10];
+        ret
+      }
+    } @no_frame
+
+  pub let w4h_pmk_slot : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M5-003 (#1311): read pmk_slot.",
+      block: {
+        lea r10, [rip + _w4h_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let w4h_crypto_ep : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M5-003 (#1311): read crypto_ep_slot.",
+      block: {
+        lea r10, [rip + _w4h_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let w4h_anonce : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M5-003 (#1311): read ANonce.",
+      block: {
+        lea r10, [rip + _w4h_state];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let w4h_snonce : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M5-003 (#1311): read SNonce.",
+      block: {
+        lea r10, [rip + _w4h_state];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let w4h_ptk_slot : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M5-003 (#1311): read ptk_slot (KIND_WIFI_KEY sealed).",
+      block: {
+        lea r10, [rip + _w4h_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let w4h_gtk_slot : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M5-003 (#1311): read gtk_slot (KIND_WIFI_KEY sealed).",
+      block: {
+        lea r10, [rip + _w4h_state];
+        mov rax, [r10 + 48];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // w4h_arm(pmk_slot, crypto_ep_slot) -> W4H_OK | error
+  //
+  // Called by an SAE-ACCEPTED path.  Stores the sealed PMK reference
+  // and the crypto endpoint; sets state = AWAIT_M1.
+  //
+  // Refuses:
+  //   * pmk_slot == 0        -> W4H_ZERO_PMK
+  //   * crypto_ep_slot == 0  -> W4H_ZERO_CRYPTO_EP
+  //   * state != INIT        -> W4H_BUSY  (caller must reset)
+  // ==========================================================================
+
+  pub let w4h_arm : (u64, u64) -> u64 !{mem} @{} =
+    fn (pmk_slot: u64) (crypto_ep_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M5-003 (#1311): arm handshake with PMK + crypto endpoint (INIT -> AWAIT_M1). Labels prefixed w4h_arm_.",
+      block: {
+        cmp rdi, 0;
+        je  w4h_arm_zero_pmk;
+        cmp rsi, 0;
+        je  w4h_arm_zero_ep;
+
+        lea r10, [rip + _w4h_state];
+        mov rax, [r10];
+        cmp rax, 0;
+        jne w4h_arm_busy;
+
+        mov [r10 + 8], rdi;               // pmk_slot
+        mov [r10 + 16], rsi;              // crypto_ep_slot
+        mov rax, 1;                       // AWAIT_M1
+        mov [r10], rax;
+
+        push rdi;
+        push rsi;
+        mov rdi, 0;                       // ARMS
+        call w4h_note;
+        mov rdi, 7;                       // TRANSITIONS
+        call w4h_note;
+        pop rsi;
+        pop rdi;
+        xor rax, rax;
+        ret;
+
+      w4h_arm_zero_pmk:
+        mov rdi, 4;
+        call w4h_note;
+        mov rax, 0xFFFFF3CD;              // ZERO_PMK
+        ret;
+      w4h_arm_zero_ep:
+        mov rdi, 4;
+        call w4h_note;
+        mov rax, 0xFFFFF3CC;              // ZERO_CRYPTO_EP
+        ret;
+      w4h_arm_busy:
+        mov rdi, 4;
+        call w4h_note;
+        mov rax, 0xFFFFF3C5;              // BUSY
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // w4h_m1_recv(anonce, snonce, ptk_slot) -> W4H_OK | error
+  //
+  // AP -> STA message 1 carries the ANonce.  The STA picks its own
+  // SNonce and DELEGATES the PTK derivation to the crypto server;
+  // the derivation returns a KIND_WIFI_KEY reference (ptk_slot) that
+  // this FSM records.  Sending M2 (which carries SNonce + SPA-MIC)
+  // is the driver's business above; this FSM only transitions.
+  //
+  // Refuses:
+  //   * state != AWAIT_M1     -> W4H_INVALID_TRANSITION
+  //   * pmk_slot == 0         -> W4H_PMK_NOT_ARMED
+  //   * anonce == 0           -> W4H_ZERO_ANONCE
+  //   * snonce == 0           -> W4H_ZERO_SNONCE
+  //   * ptk_slot == 0         -> W4H_ZERO_PMK (reused: zero key slot)
+  // ==========================================================================
+
+  pub let w4h_m1_recv : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (anonce: u64) (snonce: u64) (ptk_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M5-003 (#1311): admit M1 + record PTK derived by R32 (AWAIT_M1 -> AWAIT_M3). Labels prefixed w4h_m1_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+        mov r13, rdx;
+
+        lea r10, [rip + _w4h_state];
+        mov rax, [r10];
+        cmp rax, 1;                       // AWAIT_M1?
+        jne w4h_m1_bad_state;
+
+        mov rax, [r10 + 8];               // pmk_slot
+        cmp rax, 0;
+        je  w4h_m1_no_pmk;
+
+        cmp rbx, 0;
+        je  w4h_m1_zero_a;
+        cmp r12, 0;
+        je  w4h_m1_zero_s;
+        cmp r13, 0;
+        je  w4h_m1_zero_ptk;
+
+        mov [r10 + 24], rbx;              // anonce
+        mov [r10 + 32], r12;              // snonce
+        mov [r10 + 40], r13;              // ptk_slot
+        mov rax, 2;                       // AWAIT_M3
+        mov [r10], rax;
+
+        mov rdi, 1;                       // M1_RECVS
+        call w4h_note;
+        mov rdi, 7;                       // TRANSITIONS
+        call w4h_note;
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      w4h_m1_bad_state:
+        mov rdi, 4;
+        call w4h_note;
+        mov rax, 0xFFFFF3C7;              // INVALID_TRANSITION
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      w4h_m1_no_pmk:
+        mov rdi, 4;
+        call w4h_note;
+        mov rax, 0xFFFFF3C6;              // PMK_NOT_ARMED
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      w4h_m1_zero_a:
+        mov rdi, 4;
+        call w4h_note;
+        mov rax, 0xFFFFF3CB;              // ZERO_ANONCE
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      w4h_m1_zero_s:
+        mov rdi, 4;
+        call w4h_note;
+        mov rax, 0xFFFFF3CA;              // ZERO_SNONCE
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      w4h_m1_zero_ptk:
+        mov rdi, 4;
+        call w4h_note;
+        mov rax, 0xFFFFF3CD;              // ZERO_PMK (reuse: zero key)
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // w4h_m3_recv(mic_ok, gtk_slot) -> W4H_OK | error
+  //
+  // AP -> STA message 3 carries the GTK the AP wants installed for
+  // group traffic, MIC-protected with the KCK derived from the PTK.
+  //
+  // The MIC verification is R32's business; this FSM checks the
+  // caller-supplied `mic_ok` byte.  MIC failure -> FAILED (not
+  // AWAIT_M4), and W4H_MIC_FAILED is returned.
+  //
+  // Refuses:
+  //   * state != AWAIT_M3     -> W4H_INVALID_TRANSITION
+  //   * gtk_slot == 0         -> W4H_ZERO_GTK
+  //   * mic_ok == 0           -> W4H_MIC_FAILED (state -> FAILED)
+  // ==========================================================================
+
+  pub let w4h_m3_recv : (u64, u64) -> u64 !{mem} @{} =
+    fn (mic_ok: u64) (gtk_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M5-003 (#1311): admit M3 + install GTK (AWAIT_M3 -> AWAIT_M4). MIC failure trips to FAILED. Labels prefixed w4h_m3_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+
+        lea r10, [rip + _w4h_state];
+        mov rax, [r10];
+        cmp rax, 2;                       // AWAIT_M3?
+        jne w4h_m3_bad_state;
+
+        cmp r12, 0;
+        je  w4h_m3_zero_gtk;
+
+        cmp rbx, 0;
+        je  w4h_m3_mic_fail;
+
+        // MIC ok + GTK non-zero: install + advance.
+        mov [r10 + 48], r12;              // gtk_slot
+        mov rax, 1;
+        mov [r10 + 56], rax;              // mic_ok byte
+        mov rax, 3;                       // AWAIT_M4
+        mov [r10], rax;
+
+        mov rdi, 2;                       // M3_RECVS
+        call w4h_note;
+        mov rdi, 7;                       // TRANSITIONS
+        call w4h_note;
+        xor rax, rax;
+        pop r12;
+        pop rbx;
+        ret;
+
+      w4h_m3_bad_state:
+        mov rdi, 4;
+        call w4h_note;
+        mov rax, 0xFFFFF3C7;
+        pop r12;
+        pop rbx;
+        ret;
+      w4h_m3_zero_gtk:
+        mov rdi, 4;
+        call w4h_note;
+        mov rax, 0xFFFFF3C9;
+        pop r12;
+        pop rbx;
+        ret;
+      w4h_m3_mic_fail:
+        // Transition to FAILED.
+        lea r10, [rip + _w4h_state];
+        mov rax, 5;                       // FAILED
+        mov [r10], rax;
+        mov rdi, 5;                       // MIC_FAILS
+        call w4h_note;
+        mov rdi, 4;                       // REFUSED
+        call w4h_note;
+        mov rdi, 7;                       // TRANSITIONS
+        call w4h_note;
+        mov rax, 0xFFFFF3C8;              // MIC_FAILED
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // w4h_m4_sent() -> W4H_OK | error
+  //
+  // STA -> AP message 4 confirms M3 received + GTK installed.  Sending
+  // it is the driver's business above; this FSM only transitions.
+  //
+  // Refuses:
+  //   * state != AWAIT_M4     -> W4H_INVALID_TRANSITION
+  // ==========================================================================
+
+  pub let w4h_m4_sent : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R38.M5-003 (#1311): note M4 sent (AWAIT_M4 -> DONE). Labels prefixed w4h_m4_.",
+      block: {
+        lea r10, [rip + _w4h_state];
+        mov rax, [r10];
+        cmp rax, 3;                       // AWAIT_M4?
+        jne w4h_m4_bad_state;
+
+        mov rax, 4;                       // DONE
+        mov [r10], rax;
+
+        mov rdi, 3;                       // M4_SENDS
+        call w4h_note;
+        mov rdi, 7;                       // TRANSITIONS
+        call w4h_note;
+        xor rax, rax;
+        ret;
+
+      w4h_m4_bad_state:
+        mov rdi, 4;
+        call w4h_note;
+        mov rax, 0xFFFFF3C7;              // INVALID_TRANSITION
+        ret
+      }
+    }
+}

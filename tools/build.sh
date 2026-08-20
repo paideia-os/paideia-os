@@ -3653,6 +3653,42 @@ fi
 echo "[net80211-m4-confine] R38.M4 (net80211 class driver) confined"
 
 # ---------------------------------------------------------------------------
+# R38.M5 (#1309/#1310/#1311/#1312/#1313): WPA3-SAE + 4-way handshake +
+# KIND_WIFI_KEY (SEALED) + KRACK-safe replay counter + wpa_supplicant
+# channel schema.
+#
+# Five modules open R38.M5 (post-R38.M4 close).  Each owns its own
+# state cells + counters; tools/build.sh confines relocations against
+# each to its owning object so a second writer cannot silently forge
+# a key row, promote an SAE transition, admit a 4-way message, reset
+# a replay counter, or repack an RPC.
+KWKEY_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_wifi_key.pdx"
+SAE_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/wpa3_sae.pdx"
+W4H_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/wpa_4way.pdx"
+RC_SRC="${REPO_ROOT}/src/kernel/core/drivers/wifi/replay_counter.pdx"
+WSC_SRC="${REPO_ROOT}/src/kernel/core/ipc/wpa_supplicant_channel.pdx"
+if [[ ! -f "${KWKEY_SRC}" || ! -f "${SAE_SRC}" || ! -f "${W4H_SRC}" \
+        || ! -f "${RC_SRC}" || ! -f "${WSC_SRC}" ]]; then
+    echo "[r38-m5-confine] FAIL - one of the R38.M5 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_wifi_key_table' 'core/cap/kind_wifi_key.o'
+ec_confine_one '_wifi_key_stats' 'core/cap/kind_wifi_key.o'
+ec_confine_one '_sae_state'      'core/drivers/wifi/wpa3_sae.o'
+ec_confine_one '_sae_stats'      'core/drivers/wifi/wpa3_sae.o'
+ec_confine_one '_w4h_state'      'core/drivers/wifi/wpa_4way.o'
+ec_confine_one '_w4h_stats'      'core/drivers/wifi/wpa_4way.o'
+ec_confine_one '_rc_table'       'core/drivers/wifi/replay_counter.o'
+ec_confine_one '_rc_stats'       'core/drivers/wifi/replay_counter.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_wifi_key.pdx §2 (SEALED row), wpa3_sae.pdx §2," >&2
+    echo "  wpa_4way.pdx §2, and replay_counter.pdx §2 for the per-" >&2
+    echo "  module one-writer discipline." >&2
+    exit 1
+fi
+echo "[r38-m5-confine] R38.M5 (WPA3-SAE + 4-way + WIFI_KEY + replay) confined"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
