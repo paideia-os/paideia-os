@@ -5681,6 +5681,26 @@ fi
 echo "[elevate-broker-confine] elevate-broker seam counters confined"
 
 # ---------------------------------------------------------------------------
+# R48b substrate-prep (#1628): svc.audit-journal registration seam +
+# UEJ_KIND_TOOL_* event constants for tool journalling.
+#
+# Same shape as the elevate-broker seam. _audit_journal_broker_stats
+# has exactly one writer so the record of tool install/remove/invoke/
+# error events cannot be silently drifted.
+R48B_AJB_SRC="${REPO_ROOT}/src/kernel/core/ipc/audit_journal_broker.pdx"
+if [[ ! -f "${R48B_AJB_SRC}" ]]; then
+    echo "[audit-journal-confine] FAIL - ${R48B_AJB_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_audit_journal_broker_stats' 'core/ipc/audit_journal_broker.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See ipc/audit_journal_broker.pdx §SCOPE for the counter" >&2
+    echo "  one-writer discipline." >&2
+    exit 1
+fi
+echo "[audit-journal-confine] audit-journal seam counters confined"
+
+# ---------------------------------------------------------------------------
 # G1.M1-005 (#1431) + G1.M3-005 (#1441): P1 INVARIANT ENFORCEMENT.
 #
 # Refuses the build if any source file:
