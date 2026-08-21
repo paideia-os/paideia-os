@@ -1,0 +1,697 @@
+// src/kernel/core/drivers/vello/vello_pipeline.pdx -- G4.M2 substrate
+//
+// G4.M2-001 (#1480): GPU-side path stroking compute pipeline.
+// G4.M2-002 (#1481): GPU-side path filling compute pipeline.
+// G4.M2-003 (#1482): per-tile scanline blend compute pipeline.
+//
+// =============================================================================
+// SECTION 0  WHAT THIS DRIVER IS AND WHAT IT IS NOT
+// =============================================================================
+//
+// It is the SEAM the vello_render_channel calls when a client
+// invokes submit_render. It records one in-flight submission per
+// renderer (submit_id + scene_row + target_bo_slot + status +
+// enqueued_at) and delegates the actual compute dispatch to the
+// paideia-as @wgsl_module lowering when it lands (v0.30 gap
+// #1475). Kernel side is the submission ring + pipeline-selector
+// logic.
+//
+// It is NOT the CPU fallback (that lives in
+// vello_cpu_fallback.pdx) and NOT the effects (gradient/blur/path)
+// pass -- those are chained AFTER the base stroke+fill+blend on
+// the same submission.
+//
+// =============================================================================
+// SECTION 1  PIPELINE STAGES
+// =============================================================================
+//
+// A Vello render submission proceeds through three fixed stages
+// PLUS optional effects passes:
+//
+//   STROKE  : per-path stroke expansion (parametric width). Reads
+//             the scene's path IR; writes stroked edge records into
+//             a per-submission intermediate buffer.
+//   FILL    : per-path fill winding (both even-odd and non-zero
+//             rules supported; the scene records the choice per
+//             path in a 1-bit tag on the CLOSE opcode).
+//   BLEND   : per-tile scanline blend. The tile grid comes from
+//             the renderer row's tile_size + coarsening_level.
+//
+// Each stage is expressed as an idempotent state cell -- BLEND may
+// re-run for tile coarsening or for partial repaint without
+// re-running STROKE and FILL, saving work when only the compositor
+// z-order changes.
+//
+// =============================================================================
+// SECTION 2  FAILURE TAXONOMY 0xFFFFED80..0xFFFFED8F
+// =============================================================================
+
+module VelloPipeline = structure {
+
+  pub let VP_OK              : u64 = 0
+  pub let VP_ERR_BAD_REND    : u64 = 0xFFFFED8F
+  pub let VP_ERR_BAD_SCENE   : u64 = 0xFFFFED8E
+  pub let VP_ERR_BAD_BO      : u64 = 0xFFFFED8D
+  pub let VP_ERR_NO_ROOM     : u64 = 0xFFFFED8C
+  pub let VP_ERR_BAD_STAGE   : u64 = 0xFFFFED8B
+  pub let VP_ERR_TIMEOUT     : u64 = 0xFFFFED8A
+  pub let VP_ERR_BAD_ID      : u64 = 0xFFFFED89
+  pub let VP_ERR_NOT_READY   : u64 = 0xFFFFED88
+
+  // Stage ordinals.
+  pub let VP_ST_STROKE : u64 = 0
+  pub let VP_ST_FILL   : u64 = 1
+  pub let VP_ST_BLEND  : u64 = 2
+  pub let VP_ST_MAX    : u64 = 2
+
+  // Winding rules.
+  pub let VP_WIND_EVEN_ODD : u64 = 0
+  pub let VP_WIND_NON_ZERO : u64 = 1
+
+  // Submission status.
+  pub let VP_SUB_FREE      : u64 = 0
+  pub let VP_SUB_QUEUED    : u64 = 1
+  pub let VP_SUB_RUNNING   : u64 = 2
+  pub let VP_SUB_COMPLETE  : u64 = 3
+  pub let VP_SUB_FAILED    : u64 = 4
+
+  // Submission ring: 16 slots. Each row 5 u64 = 40 bytes.
+  //   [+0]  submit_id (u64)
+  //   [+8]  header: status[63:56] | stage[55:48] | winding[47:40]
+  //                | renderer_row[15:8] | scene_row[23:16]
+  //                | target_bo_slot[39:24]
+  //   [+16] enqueued_at_ns
+  //   [+24] completed_at_ns
+  //   [+32] stroke_edges_out (u64) -- per-stage tally
+  pub let mut _vp_ring    : [u64; 80] = uninit @align(64)
+  pub let mut _vp_stats   : [u64; 8]  = uninit @align(64)
+  pub let mut _vp_next_id : u64       = uninit @align(8)
+
+  pub let VP_STA_SUBMITS   : u64 = 0
+  pub let VP_STA_STROKES   : u64 = 1
+  pub let VP_STA_FILLS     : u64 = 2
+  pub let VP_STA_BLENDS    : u64 = 3
+  pub let VP_STA_COMPLETES : u64 = 4
+  pub let VP_STA_AWAITS    : u64 = 5
+  pub let VP_STA_REFUSED   : u64 = 6
+
+  pub let vp_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G4.M2-001..003 (#1480-1482): clear ring + counters + submit_id.",
+      block: {
+        lea r10, [rip + _vp_ring];
+        xor rax, rax;
+        xor rcx, rcx;
+      vp_rs_ring:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 80;
+        jb  vp_rs_ring;
+
+        lea r10, [rip + _vp_stats];
+        xor rcx, rcx;
+      vp_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  vp_rs_stats;
+
+        lea r10, [rip + _vp_next_id];
+        xor rax, rax;
+        mov [r10], rax;
+        ret
+      }
+    }
+
+  pub let vp_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G4.M2 counter bump.",
+      block: {
+        cmp rdi, 8;
+        jae vp_nt_out;
+        lea r10, [rip + _vp_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      vp_nt_out:
+        ret
+      }
+    }
+
+  pub let vp_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G4.M2 counter read.",
+      block: {
+        cmp rdi, 8;
+        jae vp_st_zero;
+        lea r10, [rip + _vp_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      vp_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let vp_next_id : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G4.M2-001 (#1480): monotone submit_id allocator. Never returns 0.",
+      block: {
+        lea r10, [rip + _vp_next_id];
+        mov rax, [r10];
+        add rax, 1;
+        mov [r10], rax;
+        ret
+      }
+    }
+
+  pub let vp_stage_valid : (u64) -> u64 !{} @{} =
+    fn (s: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "G4.M2 stage bounds.",
+      block: {
+        mov r10, 2;
+        cmp rdi, r10;
+        ja  vp_sv_no;
+        mov rax, 1;
+        ret;
+      vp_sv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let vp_wind_valid : (u64) -> u64 !{} @{} =
+    fn (w: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "G4.M2-002 (#1481): 1 iff w in {0, 1}.",
+      block: {
+        mov r10, 1;
+        cmp rdi, r10;
+        ja  vp_wv_no;
+        mov rax, 1;
+        ret;
+      vp_wv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // vp_submit(renderer_row, scene_row, target_bo_slot) -> submit_id | err
+  // =========================================================================
+  pub let vp_submit : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (renderer_row: u64) (scene_row: u64) (target_bo_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "G4.M2-001..003 (#1480-1482): claim a ring row, record intent, mark QUEUED. Advances the renderer's dispatch_cursor. Five callee-save pushes (odd) keep rsp aligned across calls.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;
+        mov r13, rsi;
+        mov r14, rdx;
+
+        // Validate renderer row + scene row.
+        mov rdi, r12;
+        call vr_tail_valid;
+        cmp rax, 0;
+        je  vp_sm_bad_rend;
+
+        mov rdi, r13;
+        call vs_tail_valid;
+        cmp rax, 0;
+        je  vp_sm_bad_scene;
+
+        // Scan for a FREE ring row.
+        xor rbx, rbx;
+      vp_sm_scan:
+        cmp rbx, 16;
+        jae vp_sm_no_room;
+        lea r10, [rip + _vp_ring];
+        mov r11, rbx;
+        imul r11, r11, 40;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        shr rax, 56;
+        cmp rax, 0;
+        je  vp_sm_claim;
+        add rbx, 1;
+        jmp vp_sm_scan;
+
+      vp_sm_claim:
+        call vp_next_id;
+        mov r15, rax;                     // submit_id
+        mov [r10 + 0], r15;
+
+        // Pack header: status=QUEUED, stage=STROKE, winding=NZ,
+        // renderer_row[15:8], scene_row[23:16], bo_slot[39:24].
+        xor rcx, rcx;
+        mov rax, 1;
+        shl rax, 56;
+        or  rcx, rax;                     // status = QUEUED
+        // stage=0 (STROKE) already zero.
+        mov rax, 1;
+        shl rax, 40;
+        or  rcx, rax;                     // winding = NZ (default)
+        mov rax, r12;
+        and rax, 0xFF;
+        shl rax, 8;
+        or  rcx, rax;
+        mov rax, r13;
+        and rax, 0xFF;
+        shl rax, 16;
+        or  rcx, rax;
+        mov rax, r14;
+        and rax, 0xFFFF;
+        shl rax, 24;
+        or  rcx, rax;
+        mov [r10 + 8], rcx;
+
+        call hpet_now_ns;
+        mov r11, r10;
+        mov [r11 + 16], rax;
+        xor rax, rax;
+        mov [r11 + 24], rax;
+        mov [r11 + 32], rax;
+
+        // Advance the renderer's dispatch_cursor.
+        mov rdi, r12;
+        call vr_row_advance_cursor;
+
+        mov rdi, 0;
+        call vp_note;                     // submits
+
+        mov rax, r15;
+        jmp vp_sm_out;
+
+      vp_sm_bad_rend:
+        mov rdi, 6;
+        call vp_note;
+        mov rax, 0xFFFFED8F;
+        jmp vp_sm_out;
+      vp_sm_bad_scene:
+        mov rdi, 6;
+        call vp_note;
+        mov rax, 0xFFFFED8E;
+        jmp vp_sm_out;
+      vp_sm_no_room:
+        mov rdi, 6;
+        call vp_note;
+        mov rax, 0xFFFFED8C;
+
+      vp_sm_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let vp_find_by_id : (u64) -> u64 !{mem} @{} =
+    fn (submit_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G4.M2-001 (#1480): ring row for this submit_id or 0xFF.",
+      block: {
+        cmp rdi, 0;
+        je  vp_fi_none;
+        xor rcx, rcx;
+      vp_fi_scan:
+        cmp rcx, 16;
+        jae vp_fi_none;
+        lea r10, [rip + _vp_ring];
+        mov r11, rcx;
+        imul r11, r11, 40;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        cmp rax, rdi;
+        je  vp_fi_hit;
+        add rcx, 1;
+        jmp vp_fi_scan;
+      vp_fi_hit:
+        mov rax, rcx;
+        ret;
+      vp_fi_none:
+        mov rax, 0xFF;
+        ret
+      }
+    }
+
+  pub let vp_row_status : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G4.M2-001 (#1480): status field.",
+      block: {
+        cmp rdi, 16;
+        jae vp_rs_bad;
+        lea r10, [rip + _vp_ring];
+        mov r11, rdi;
+        imul r11, r11, 40;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        shr rax, 56;
+        and rax, 0xFF;
+        ret;
+      vp_rs_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  pub let vp_row_stage : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G4.M2 stage field.",
+      block: {
+        cmp rdi, 16;
+        jae vp_rst_bad;
+        lea r10, [rip + _vp_ring];
+        mov r11, rdi;
+        imul r11, r11, 40;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        shr rax, 48;
+        and rax, 0xFF;
+        ret;
+      vp_rst_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // Rewrite status field.
+  pub let vp_row_set_status : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (new_status: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G4.M2 rewrite status[63:56].",
+      block: {
+        cmp rdi, 16;
+        jae vp_ss_bad;
+        mov r10, 4;
+        cmp rsi, r10;
+        ja  vp_ss_bad;
+        lea r10, [rip + _vp_ring];
+        mov r11, rdi;
+        imul r11, r11, 40;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        mov r11, 0xFF;
+        shl r11, 56;
+        not r11;
+        and rax, r11;
+        mov r11, rsi;
+        and r11, 0xFF;
+        shl r11, 56;
+        or  rax, r11;
+        mov [r10 + 8], rax;
+        xor rax, rax;
+        ret;
+      vp_ss_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  pub let vp_row_set_stage : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (new_stage: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G4.M2 rewrite stage[55:48].",
+      block: {
+        cmp rdi, 16;
+        jae vp_sst_bad;
+        mov r10, 2;
+        cmp rsi, r10;
+        ja  vp_sst_bad;
+        lea r10, [rip + _vp_ring];
+        mov r11, rdi;
+        imul r11, r11, 40;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        mov r11, 0xFF;
+        shl r11, 48;
+        not r11;
+        and rax, r11;
+        mov r11, rsi;
+        and r11, 0xFF;
+        shl r11, 48;
+        or  rax, r11;
+        mov [r10 + 8], rax;
+        xor rax, rax;
+        ret;
+      vp_sst_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // vp_run_stroke(row_id) -> edges_out | err
+  //
+  // Advance the submission from STROKE (stage 0) after emitting the
+  // stroked edge count. The kernel side records the count; the
+  // paideia-as @wgsl_module lowering runs the actual compute shader.
+  // Anti-aliasing is expressed as a 4x subsample cost multiplier on
+  // the edge count.
+  // =========================================================================
+  pub let vp_run_stroke : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G4.M2-001 (#1480): STROKE stage. Reads scene_row's path count, records 4*paths in the row's stroke_edges_out cell (AA subsample cost model), advances stage. Three callee-save pushes (odd) keep rsp % 16 == 0 at each nested call: entry is 8, +3*8=24, 8+24 mod 16 = 0.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        call vp_row_stage;
+        cmp rax, 0;                       // must be STROKE
+        jne vp_st_bad_stage;
+
+        lea r10, [rip + _vp_ring];
+        mov r11, r12;
+        imul r11, r11, 40;
+        add r10, r11;
+        // scene_row from header[23:16].
+        mov rax, [r10 + 8];
+        shr rax, 16;
+        and rax, 0xFF;
+        mov rbx, rax;
+
+        mov rdi, rbx;
+        call vs_row_paths;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  vp_st_bad_stage;
+
+        // AA cost model: 4x edge multiplier per path.
+        shl rax, 2;
+
+        lea r10, [rip + _vp_ring];
+        mov r11, r12;
+        imul r11, r11, 40;
+        add r10, r11;
+        mov [r10 + 32], rax;
+        mov rbx, rax;                     // save edges for return
+
+        // Advance stage 0 -> 1.
+        mov rdi, r12;
+        mov rsi, 1;
+        call vp_row_set_stage;
+
+        mov rdi, 1;
+        call vp_note;                     // strokes
+
+        mov rax, rbx;
+        jmp vp_st_out;
+
+      vp_st_bad_stage:
+        mov rdi, 6;
+        call vp_note;
+        mov rax, 0xFFFFED8B;
+
+      vp_st_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // vp_run_fill(row_id, winding) -> ok | err
+  // =========================================================================
+  pub let vp_run_fill : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (winding: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G4.M2-002 (#1481): FILL stage, tagged with winding rule (even-odd or non-zero). Advances stage 1 -> 2.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        mov r13, rsi;
+
+        mov rdi, r13;
+        call vp_wind_valid;
+        cmp rax, 0;
+        je  vp_fl_bad_stage;
+
+        mov rdi, r12;
+        call vp_row_stage;
+        cmp rax, 1;
+        jne vp_fl_bad_stage;
+
+        // Rewrite winding field on the row.
+        lea r10, [rip + _vp_ring];
+        mov r11, r12;
+        imul r11, r11, 40;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        mov r11, 0xFF;
+        shl r11, 40;
+        not r11;
+        and rax, r11;
+        mov r11, r13;
+        and r11, 0xFF;
+        shl r11, 40;
+        or  rax, r11;
+        mov [r10 + 8], rax;
+
+        // Advance stage 1 -> 2.
+        mov rdi, r12;
+        mov rsi, 2;
+        call vp_row_set_stage;
+
+        mov rdi, 2;
+        call vp_note;                     // fills
+
+        xor rax, rax;
+        jmp vp_fl_out;
+
+      vp_fl_bad_stage:
+        mov rdi, 6;
+        call vp_note;
+        mov rax, 0xFFFFED8B;
+
+      vp_fl_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // vp_run_blend(row_id) -> ok | err
+  //
+  // Per-tile scanline blend. Marks the submission COMPLETE.
+  // =========================================================================
+  pub let vp_run_blend : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "G4.M2-003 (#1482): BLEND stage. Records completion timestamp, transitions status QUEUED->COMPLETE. Three pushes (odd) keep rsp aligned.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        call vp_row_stage;
+        cmp rax, 2;
+        jne vp_bl_bad_stage;
+
+        mov rdi, r12;
+        mov rsi, 3;                       // VP_SUB_COMPLETE
+        call vp_row_set_status;
+
+        call hpet_now_ns;
+        lea r10, [rip + _vp_ring];
+        mov r11, r12;
+        imul r11, r11, 40;
+        add r10, r11;
+        mov [r10 + 24], rax;
+
+        mov rdi, 3;
+        call vp_note;                     // blends
+        mov rdi, 4;
+        call vp_note;                     // completes
+
+        xor rax, rax;
+        jmp vp_bl_out;
+
+      vp_bl_bad_stage:
+        mov rdi, 6;
+        call vp_note;
+        mov rax, 0xFFFFED8B;
+
+      vp_bl_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // vp_await(submit_id, timeout_ns) -> ok | err
+  //
+  // Kernel-side is a state check: returns OK iff the submission
+  // reached COMPLETE; the paideia-as GPU wait primitive is bypassed
+  // in this substrate.
+  // =========================================================================
+  pub let vp_await : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (submit_id: u64) (timeout_ns: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "G4.M1-004 (#1478): resolve submit_id to a row, return OK on COMPLETE. TIMEOUT (0xFFFFEDE5 from VRC map) on any other status.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        mov r13, rsi;
+
+        mov rdi, r12;
+        call vp_find_by_id;
+        cmp rax, 0xFF;
+        je  vp_aw_bad_id;
+
+        mov rdi, rax;
+        call vp_row_status;
+        cmp rax, 3;                       // VP_SUB_COMPLETE
+        jne vp_aw_timeout;
+
+        mov rdi, 5;
+        call vp_note;                     // awaits
+
+        xor rax, rax;
+        jmp vp_aw_out;
+
+      vp_aw_bad_id:
+        mov rdi, 6;
+        call vp_note;
+        mov rax, 0xFFFFED89;
+        jmp vp_aw_out;
+      vp_aw_timeout:
+        mov rdi, 6;
+        call vp_note;
+        mov rax, 0xFFFFED8A;
+
+      vp_aw_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
