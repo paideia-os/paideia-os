@@ -4369,6 +4369,79 @@ semterm_pin_one "${PAL_SRC}" 'pub let pal_extended : (u64) -> u64'
 echo "[semterm-m3-confine] plot / layout / palette entry-point arities pinned"
 
 # ---------------------------------------------------------------------------
+# R41.M4-001/002/003 (#1374/#1375/#1376): SEMTERM FRAMEBUFFER FRONTEND
+# CONFINEMENT.
+#
+# Three modules open R41.M4 on top of the R41.M3 chart-composition layer:
+# fb_frontend (cursor + render-prepare + synthetic HID input queue),
+# line_editor (readline-analog insertion buffer + kill/yank + 32-slot
+# history + completion hook), and pager (page arithmetic + navigation +
+# search hook). Each owns its own state cells; a second writer against
+# any of them would let a caller:
+#   - park the terminal cursor at a coordinate sfb_cursor_set never
+#     stored (fb_frontend confinement), so a downstream blitter would
+#     draw a cursor overlay the frontend never authorised,
+#   - insert a byte into the line buffer without going through
+#     led_insert (line_editor confinement), skipping the printable-ASCII
+#     check that keeps control bytes off the visible line,
+#   - forge the pager's current_page or quit flag (pager confinement)
+#     so a downstream formatter walks rs_get against a range the pager
+#     never navigated to.
+SFB_SRC="${REPO_ROOT}/src/kernel/core/semterm/fb_frontend.pdx"
+LED_SRC="${REPO_ROOT}/src/kernel/core/semterm/line_editor.pdx"
+PGR_SRC="${REPO_ROOT}/src/kernel/core/semterm/pager.pdx"
+if [[ ! -f "${SFB_SRC}" || ! -f "${LED_SRC}" || ! -f "${PGR_SRC}" ]]; then
+    echo "[semterm-m4-confine] FAIL - one of the R41.M4 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_sfb_state'       'core/semterm/fb_frontend.o'
+ec_confine_one '_sfb_input_q'     'core/semterm/fb_frontend.o'
+ec_confine_one '_led_buf'         'core/semterm/line_editor.o'
+ec_confine_one '_led_kill'        'core/semterm/line_editor.o'
+ec_confine_one '_led_hist'        'core/semterm/line_editor.o'
+ec_confine_one '_led_hist_lens'   'core/semterm/line_editor.o'
+ec_confine_one '_led_state'       'core/semterm/line_editor.o'
+ec_confine_one '_pgr_state'       'core/semterm/pager.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/semterm/fb_frontend.pdx §2, line_editor.pdx §3," >&2
+    echo "  and pager.pdx §2 for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[semterm-m4-confine] R41.M4 (fb_frontend + line_editor + pager) state confined"
+
+# ARITY PINS for the M4 entry points. Same rationale as the M3 pins
+# above: a widening on any of these makes "park a cursor coordinate
+# never authored", "smuggle a control byte through led_insert", or
+# "reach a page pgr_next_page never advanced to" expressible in a call
+# site the confinement gate cannot see.
+semterm_pin_one "${SFB_SRC}" 'pub let sfb_cursor_set : (u64, u64) -> u64'
+semterm_pin_one "${SFB_SRC}" 'pub let sfb_cursor_style_set : (u64) -> u64'
+semterm_pin_one "${SFB_SRC}" 'pub let sfb_render_prepare : (u64, u64) -> u64'
+semterm_pin_one "${SFB_SRC}" 'pub let sfb_input_push : (u64) -> u64'
+semterm_pin_one "${SFB_SRC}" 'pub let sfb_input_pop : () -> u64'
+semterm_pin_one "${LED_SRC}" 'pub let led_insert : (u64) -> u64'
+semterm_pin_one "${LED_SRC}" 'pub let led_backspace : () -> u64'
+semterm_pin_one "${LED_SRC}" 'pub let led_delete : () -> u64'
+semterm_pin_one "${LED_SRC}" 'pub let led_left : () -> u64'
+semterm_pin_one "${LED_SRC}" 'pub let led_right : () -> u64'
+semterm_pin_one "${LED_SRC}" 'pub let led_home : () -> u64'
+semterm_pin_one "${LED_SRC}" 'pub let led_end : () -> u64'
+semterm_pin_one "${LED_SRC}" 'pub let led_kill_line : () -> u64'
+semterm_pin_one "${LED_SRC}" 'pub let led_yank : () -> u64'
+semterm_pin_one "${LED_SRC}" 'pub let led_history_push : () -> u64'
+semterm_pin_one "${LED_SRC}" 'pub let led_history_up : () -> u64'
+semterm_pin_one "${LED_SRC}" 'pub let led_history_down : () -> u64'
+semterm_pin_one "${LED_SRC}" 'pub let led_get_at : (u64) -> u64'
+semterm_pin_one "${PGR_SRC}" 'pub let pgr_open : (u64, u64) -> u64'
+semterm_pin_one "${PGR_SRC}" 'pub let pgr_next_page : () -> u64'
+semterm_pin_one "${PGR_SRC}" 'pub let pgr_prev_page : () -> u64'
+semterm_pin_one "${PGR_SRC}" 'pub let pgr_quit : () -> u64'
+semterm_pin_one "${PGR_SRC}" 'pub let pgr_search_set : (u64) -> u64'
+semterm_pin_one "${PGR_SRC}" 'pub let pgr_page_start : () -> u64'
+semterm_pin_one "${PGR_SRC}" 'pub let pgr_page_end : () -> u64'
+echo "[semterm-m4-confine] fb_frontend / line_editor / pager entry-point arities pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
