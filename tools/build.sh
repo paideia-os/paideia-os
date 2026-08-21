@@ -4899,6 +4899,82 @@ semterm_pin_one "${GTH_SRC}" 'pub let gth_persist_flush : () -> u64'
 echo "[semterm-r44-confine] gui_shell / gui_layout / gui_theme entry-point arities pinned"
 
 # ---------------------------------------------------------------------------
+# R44.M2-001/002/003 (#1403/#1404/#1405): SEMTERM GUI VELLO / CHARTS /
+# SCROLL CONFINEMENT.
+#
+# Three modules open R44.M2 on top of the R44.M1 GUI scaffold: gui_vello
+# (four-layer scene composition + subpixel-aware glyph atlas + result-
+# route flow), gui_charts (bar/line/scatter/heatmap chart records +
+# palette-series bindings + stroke attributes + emit_path counters),
+# and gui_scroll (Q22.10 sub-pixel offset + ease-out cubic animation +
+# reproject_glyph). Each owns its own state cells; a second writer
+# against any of them would let a caller:
+#   - forge a layer's visibility or opacity (gui_vello confinement),
+#     so a downstream compositor paints against a scene no setter
+#     ever validated -- bypassing the VEL_ERR_BAD_OPACITY refusal
+#     band -- or bump result_pending outside of vel_route_result,
+#     letting vel_submit_frame flush a stale row_count;
+#   - forge a chart's kind or rectangle (gui_charts confinement),
+#     turning a HEATMAP record into a BAR one the emitter walks with
+#     the wrong glyph primitive, or shift chart_count so cha_chart_new
+#     hands out a slot cha_series_add already references;
+#   - forge the scroll offset or animation cursors (gui_scroll
+#     confinement), so scr_reproject_glyph reports a position the
+#     animation curve never computed -- bypassing the ease-out
+#     guarantee that keeps glyphs stable across frames.
+GVL_SRC="${REPO_ROOT}/src/kernel/core/semterm/gui_vello.pdx"
+GCH_SRC="${REPO_ROOT}/src/kernel/core/semterm/gui_charts.pdx"
+GSC_SRC="${REPO_ROOT}/src/kernel/core/semterm/gui_scroll.pdx"
+if [[ ! -f "${GVL_SRC}" || ! -f "${GCH_SRC}" || ! -f "${GSC_SRC}" ]]; then
+    echo "[semterm-r44m2-confine] FAIL - one of the R44.M2 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_vel_state'   'core/semterm/gui_vello.o'
+ec_confine_one '_vel_layers'  'core/semterm/gui_vello.o'
+ec_confine_one '_vel_atlas'   'core/semterm/gui_vello.o'
+ec_confine_one '_cha_state'   'core/semterm/gui_charts.o'
+ec_confine_one '_cha_charts'  'core/semterm/gui_charts.o'
+ec_confine_one '_cha_series'  'core/semterm/gui_charts.o'
+ec_confine_one '_scr_state'   'core/semterm/gui_scroll.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/semterm/gui_vello.pdx §4, gui_charts.pdx §3," >&2
+    echo "  and gui_scroll.pdx §3 for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[semterm-r44m2-confine] R44.M2 (gui_vello + gui_charts + gui_scroll) state confined"
+
+# ARITY PINS for the R44.M2 entry points. Same rationale as the R41 /
+# R44.M1 pins above: a widening on any of these makes "flush a frame
+# no resultset routed", "smuggle a stroke config into a chart record
+# the setter never validated", or "animate to an offset the ease-out
+# curve never computed" expressible in a call site the confinement
+# gate cannot see.
+semterm_pin_one "${GVL_SRC}" 'pub let vel_layer_show : (u64, u64) -> u64'
+semterm_pin_one "${GVL_SRC}" 'pub let vel_layer_set_opacity : (u64, u64) -> u64'
+semterm_pin_one "${GVL_SRC}" 'pub let vel_layer_visible : (u64) -> u64'
+semterm_pin_one "${GVL_SRC}" 'pub let vel_layer_opacity : (u64) -> u64'
+semterm_pin_one "${GVL_SRC}" 'pub let vel_subpx_set : (u64) -> u64'
+semterm_pin_one "${GVL_SRC}" 'pub let vel_atlas_add_glyph : (u64) -> u64'
+semterm_pin_one "${GVL_SRC}" 'pub let vel_atlas_glyph_at : (u64) -> u64'
+semterm_pin_one "${GVL_SRC}" 'pub let vel_route_result : (u64) -> u64'
+semterm_pin_one "${GVL_SRC}" 'pub let vel_submit_frame : () -> u64'
+semterm_pin_one "${GCH_SRC}" 'pub let cha_chart_new : (u64, u64, u64, u64, u64) -> u64'
+semterm_pin_one "${GCH_SRC}" 'pub let cha_chart_field : (u64, u64) -> u64'
+semterm_pin_one "${GCH_SRC}" 'pub let cha_series_add : (u64, u64) -> u64'
+semterm_pin_one "${GCH_SRC}" 'pub let cha_series_chart : (u64) -> u64'
+semterm_pin_one "${GCH_SRC}" 'pub let cha_series_palette : (u64) -> u64'
+semterm_pin_one "${GCH_SRC}" 'pub let cha_aa_set : (u64) -> u64'
+semterm_pin_one "${GCH_SRC}" 'pub let cha_cap_set : (u64) -> u64'
+semterm_pin_one "${GCH_SRC}" 'pub let cha_join_set : (u64) -> u64'
+semterm_pin_one "${GCH_SRC}" 'pub let cha_emit_path : (u64) -> u64'
+semterm_pin_one "${GSC_SRC}" 'pub let scr_viewport_set : (u64) -> u64'
+semterm_pin_one "${GSC_SRC}" 'pub let scr_content_set : (u64) -> u64'
+semterm_pin_one "${GSC_SRC}" 'pub let scr_scroll_to : (u64, u64) -> u64'
+semterm_pin_one "${GSC_SRC}" 'pub let scr_animate_step : (u64) -> u64'
+semterm_pin_one "${GSC_SRC}" 'pub let scr_reproject_glyph : (u64) -> u64'
+echo "[semterm-r44m2-confine] gui_vello / gui_charts / gui_scroll entry-point arities pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
