@@ -4442,6 +4442,57 @@ semterm_pin_one "${PGR_SRC}" 'pub let pgr_page_end : () -> u64'
 echo "[semterm-m4-confine] fb_frontend / line_editor / pager entry-point arities pinned"
 
 # ---------------------------------------------------------------------------
+# R41.M5-001/002 (#1377/#1378): SEMTERM RECOVERY + SESSION LOG
+# CONFINEMENT.
+#
+# Two modules close R41 on top of the R41.M4 framebuffer frontend:
+# recovery (armed flag + safectl (KIND, cap-slot) bind + RO-by-default
+# verb union) and session_log (per-attach session id + 64-slot
+# execution ring + audit-forward honesty pin). Each owns its own
+# state cells; a second writer against any of them would let a caller:
+#   - forge the recovery armed flag or the safectl bind (recovery
+#     confinement) so a downstream verb dispatcher walks against a
+#     safectl channel the boot cmdline never authorised,
+#   - park the recovery ro flag at 0 (recovery confinement) so an
+#     UPDATE_* verb sneaks through the RO default without the widening
+#     ceremony rec_set_ro(0) records,
+#   - append a session_log record with an active_session_id the
+#     attach path never issued (session_log confinement) so a
+#     downstream audit forwarder emits an event attributed to a
+#     session that never existed.
+REC_SRC="${REPO_ROOT}/src/kernel/core/semterm/recovery.pdx"
+SLOG_SRC="${REPO_ROOT}/src/kernel/core/semterm/session_log.pdx"
+if [[ ! -f "${REC_SRC}" || ! -f "${SLOG_SRC}" ]]; then
+    echo "[semterm-m5-confine] FAIL - one of the R41.M5 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_rec_state'   'core/semterm/recovery.o'
+ec_confine_one '_slog_state'  'core/semterm/session_log.o'
+ec_confine_one '_slog_ring'   'core/semterm/session_log.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/semterm/recovery.pdx §2 and session_log.pdx §3" >&2
+    echo "  for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[semterm-m5-confine] R41.M5 (recovery + session_log) state confined"
+
+# ARITY PINS for the M5 entry points. Same rationale as the M4 pins
+# above: a widening on any of these makes "arm recovery without a
+# cmdline parser", "widen ro without the ceremony", "record a session
+# id the attach path never issued", or "read a field the packer never
+# produced" expressible in a call site the confinement gate cannot see.
+semterm_pin_one "${REC_SRC}"  'pub let rec_arm : () -> u64'
+semterm_pin_one "${REC_SRC}"  'pub let rec_safectl_bind : (u64, u64) -> u64'
+semterm_pin_one "${REC_SRC}"  'pub let rec_set_ro : (u64) -> u64'
+semterm_pin_one "${REC_SRC}"  'pub let rec_verb : (u64) -> u64'
+semterm_pin_one "${SLOG_SRC}" 'pub let slog_attach : () -> u64'
+semterm_pin_one "${SLOG_SRC}" 'pub let slog_detach : () -> u64'
+semterm_pin_one "${SLOG_SRC}" 'pub let slog_record : (u64, u64, u64) -> u64'
+semterm_pin_one "${SLOG_SRC}" 'pub let slog_get : (u64, u64) -> u64'
+semterm_pin_one "${SLOG_SRC}" 'pub let slog_audit_forward : () -> u64'
+echo "[semterm-m5-confine] recovery / session_log entry-point arities pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

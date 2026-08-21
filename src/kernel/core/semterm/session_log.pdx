@@ -1,0 +1,576 @@
+// src/kernel/core/semterm/session_log.pdx -- R41.M5-002 (#1378)
+//
+// SEMTERM SESSION LOG. A per-frontend-attach ring of executed queries
+// with their result-row count and duration in ticks, plus the seam a
+// live audit forwarder will use to bridge each record into the R40.M5
+// audit schema (audit_schema.pdx) as a SEMTERM_QUERY_EXEC event.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the QUERY-EXECUTION LEDGER for the semantic terminal. Every
+// fb-frontend attach starts a NEW session (slog_attach yields a new
+// session_id and stores it as active_session_id); every query the
+// engine executes appends a (session_id, query_hash, result_count,
+// duration_ticks) row to a 64-slot ring; slog_detach clears the active
+// session so a subsequent attach starts a fresh id.
+//
+// It does NOT hash queries. slog_record accepts an opaque u64 the
+// caller (semterm/engine.pdx in a later round) computes -- keeping
+// the hash function out of this module means a widening (FNV-1a to
+// SipHash, say) does not rewrite ring layout.
+//
+// It does NOT measure durations. slog_record accepts an opaque u64
+// the caller subtracts across kread_tsc bookends -- keeping the tick
+// source out of this module means the audit forwarder can bridge a
+// virtualised clock without teaching the log a new primitive.
+//
+// It does NOT call audit_emit. slog_audit_forward() is the honesty
+// pin: it returns 0 today, and a widening will replace the body with
+// the audit_emit call (six-arg, AUD_EV_SEMTERM_QUERY_EXEC = 100 per
+// §1) once audit_schema's event union is extended to include the new
+// tag. Keeping the seam in this module means the widening is one edit.
+//
+// It is a SCAFFOLD (D7): R41.M5 wires it into the witness tree but no
+// live query engine drives it; slog_arbitrated() returns 0 until a
+// later round hooks slog_attach / slog_record into the engine.
+//
+// =============================================================================
+// §1  AUDIT EVENT TAG (deferred)
+// =============================================================================
+//
+// SLOG_EV_SEMTERM_QUERY_EXEC = 100
+//
+// The event tag the audit forwarder will pass to audit_emit as its
+// event_type. It is DEFINED HERE (not in audit_schema) because
+// audit_schema's union today covers events 1..12 (AUD_EV_MINT ..
+// AUD_EV_MBIM) and widening the union is a separate change with its
+// own witness -- extending it prematurely would let a subscriber
+// unpack a field the packer never produced. The constant is picked
+// from the reserved SLOG range 100..127 so a future audit_schema
+// widening can add SEMTERM_QUERY_EXEC at 100 without renumbering any
+// event 1..12 and without colliding with a driver-side event another
+// widening might add at 13..99.
+//
+// =============================================================================
+// §2  RING GEOMETRY
+// =============================================================================
+//
+// SLOG_RING_ENTRIES = 64
+// SLOG_ROW_WORDS    = 4  (session_id, query_hash, result_count, duration_ticks)
+//
+// The ring is a strict single-writer bounded log:
+//   entry(i) = _slog_ring[i * 4 .. i * 4 + 3]
+//     +0   session_id
+//     +8   query_hash
+//     +16  result_count
+//     +24  duration_ticks
+//
+// Once full, slog_record OVERWRITES the oldest entry (a durable-store
+// sink is what the R40 audit schema is for; the ring only keeps enough
+// history for a subscriber that missed a delivery to catch up on the
+// last SLOG_RING_ENTRIES-1 executions). log_head is the next write
+// index and wraps at SLOG_RING_ENTRIES; log_count saturates at
+// SLOG_RING_ENTRIES. exec_count is a monotone total across all rounds
+// so a subscriber can tell whether it fell behind by more than a full
+// ring.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _slog_ring and _slog_state are written only by helpers in this
+// module. tools/build.sh confines relocations against each to
+// `core/semterm/session_log.o`.
+//
+// STATE LAYOUT -- _slog_state : [u64; 8]
+//   +0    init_mark             0x510C once slog_reset has run
+//   +8    err                   sticky error latch (first-writer-wins)
+//   +16   active_session_id     0 = no active session
+//   +24   next_session_id       monotonic id counter (starts at 1)
+//   +32   log_head              next write index (0..SLOG_RING_ENTRIES)
+//   +40   log_count             live entry count (0..SLOG_RING_ENTRIES)
+//   +48   exec_count            monotone total across all rounds
+//   +56   total_duration_ticks  running sum of duration_ticks
+//
+// =============================================================================
+// §4  FAILURE TAXONOMY 0xFFFFF010..0xFFFFF01F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time. Adjacent used
+// band above: recovery 0xFFFFF020..2F (R41.M5-001). Adjacent free
+// band below: 0xFFFFF000..0F (unassigned).
+//
+//   SLOG_OK                  = 0
+//   SLOG_ERR_NOT_INIT        = 0xFFFFF01F   accessor before slog_reset
+//   SLOG_ERR_NO_SESSION      = 0xFFFFF01E   record without an active session
+//   SLOG_ERR_ALREADY_ACTIVE  = 0xFFFFF01D   attach without detach
+//   SLOG_ERR_BAD_IDX         = 0xFFFFF01C   get: idx >= log_count
+//   SLOG_ERR_BAD_FIELD       = 0xFFFFF01B   get: field > 3
+//   SLOG_ERR_DETACH_EMPTY    = 0xFFFFF01A   detach without prior attach
+//   SLOG_ERR_INTERNAL        = 0xFFFFF019   unreachable-fallthrough tripwire
+//
+// =============================================================================
+// §5  ARITY DISCIPLINE
+// =============================================================================
+//
+// slog_record is (query_hash, result_count, duration_ticks) -- three
+// caller-visible arguments. slog_get is (idx, field). Every session-
+// scoped entry point is (). A widening (a per-source cap slot, a
+// running latency histogram) is a widening of these arities, and
+// tools/build.sh pins the signatures.
+
+module SessionLog = structure {
+
+  // Event tag reserved for the audit-forwarder widening (§1).
+  pub let SLOG_EV_SEMTERM_QUERY_EXEC : u64 = 100
+
+  // Ring geometry (§2).
+  pub let SLOG_RING_ENTRIES : u64 = 64
+  pub let SLOG_ROW_WORDS    : u64 = 4
+  pub let SLOG_RING_WORDS   : u64 = 256              // 64 * 4
+
+  // Row field ordinals (§2).
+  pub let SLOG_F_SESSION_ID    : u64 = 0
+  pub let SLOG_F_QUERY_HASH    : u64 = 1
+  pub let SLOG_F_RESULT_COUNT  : u64 = 2
+  pub let SLOG_F_DURATION      : u64 = 3
+  pub let SLOG_F_MAX           : u64 = 3
+
+  // Failure taxonomy (§4).
+  pub let SLOG_OK                 : u64 = 0
+  pub let SLOG_ERR_NOT_INIT       : u64 = 0xFFFFF01F
+  pub let SLOG_ERR_NO_SESSION     : u64 = 0xFFFFF01E
+  pub let SLOG_ERR_ALREADY_ACTIVE : u64 = 0xFFFFF01D
+  pub let SLOG_ERR_BAD_IDX        : u64 = 0xFFFFF01C
+  pub let SLOG_ERR_BAD_FIELD      : u64 = 0xFFFFF01B
+  pub let SLOG_ERR_DETACH_EMPTY   : u64 = 0xFFFFF01A
+  pub let SLOG_ERR_INTERNAL       : u64 = 0xFFFFF019
+
+  pub let SLOG_INIT_MARK : u64 = 0x510C
+
+  pub let mut _slog_ring  : [u64; 256] = uninit @align(64)
+  pub let mut _slog_state : [u64; 8]   = uninit @align(64)
+
+  // ==========================================================================
+  // Reset. Boot + teardown. next_session_id is primed to 1 so
+  // slog_attach's first yield is a non-zero id (0 is the "no session"
+  // sentinel active_session_id carries).
+  // ==========================================================================
+
+  pub let slog_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M5-002 (#1378): clear ring + state, install init_mark, prime next_session_id = 1. Labels prefixed slog_rst_.",
+      block: {
+        // Clear the ring.
+        lea r10, [rip + _slog_ring];
+        xor rax, rax;
+        xor rcx, rcx;
+      slog_rst_r:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 256;
+        jb  slog_rst_r;
+
+        // Clear state.
+        lea r10, [rip + _slog_state];
+        xor rcx, rcx;
+      slog_rst_st:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  slog_rst_st;
+
+        mov rax, 0x510C;
+        mov [r10 + 0], rax;                      // init_mark
+        mov rax, 1;
+        mov [r10 + 24], rax;                     // next_session_id = 1
+        ret
+      }
+    } @no_frame
+
+  pub let slog_arbitrated : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R41.M5-002 (#1378): honesty pin. Returns 0 until a live engine drives slog_record and a live audit forwarder consumes slog_audit_forward.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let slog_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M5-002 (#1378): 1 iff init_mark matches. Labels prefixed slog_bnd_.",
+      block: {
+        lea r10, [rip + _slog_state];
+        mov rax, [r10 + 0];
+        mov r11, 0x510C;
+        cmp rax, r11;
+        jne slog_bnd_no;
+        mov rax, 1;
+        ret;
+      slog_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let slog_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M5-002 (#1378): sticky error latch readback. Labels prefixed slog_er_.",
+      block: {
+        lea r10, [rip + _slog_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let slog_set_err : (u64) -> () !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M5-002 (#1378): first-writer-wins error latch. Labels prefixed slog_se_.",
+      block: {
+        lea r10, [rip + _slog_state];
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        jne slog_se_out;
+        mov [r10 + 8], rdi;
+      slog_se_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Field readbacks.
+  // ==========================================================================
+
+  pub let slog_active : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M5-002 (#1378): active_session_id field.",
+      block: {
+        lea r10, [rip + _slog_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let slog_next_session_id : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M5-002 (#1378): next_session_id field (peek).",
+      block: {
+        lea r10, [rip + _slog_state];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let slog_len : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M5-002 (#1378): log_count field.",
+      block: {
+        lea r10, [rip + _slog_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let slog_exec_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M5-002 (#1378): exec_count field.",
+      block: {
+        lea r10, [rip + _slog_state];
+        mov rax, [r10 + 48];
+        ret
+      }
+    } @no_frame
+
+  pub let slog_total_duration : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M5-002 (#1378): total_duration_ticks field.",
+      block: {
+        lea r10, [rip + _slog_state];
+        mov rax, [r10 + 56];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // slog_attach() -> u64
+  //
+  // Start a new session. Returns the new session_id (>= 1) on success;
+  // returns the failure code on refusal. Refuses:
+  //   - not init                     SLOG_ERR_NOT_INIT
+  //   - already active                SLOG_ERR_ALREADY_ACTIVE
+  //
+  // The returned session_id is the value stored in active_session_id
+  // AND in every slog_record entry until slog_detach.
+  // ==========================================================================
+
+  pub let slog_attach : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M5-002 (#1378): allocate a new session_id and store it as active. Labels prefixed slog_at_.",
+      block: {
+        lea r10, [rip + _slog_state];
+        mov rax, [r10 + 0];
+        mov r11, 0x510C;
+        cmp rax, r11;
+        jne slog_at_ni;
+
+        mov rax, [r10 + 16];                     // active_session_id
+        cmp rax, 0;
+        jne slog_at_aa;
+
+        mov rax, [r10 + 24];                     // next_session_id
+        mov [r10 + 16], rax;                     // active = next
+        mov r8, rax;                             // save for return
+        add rax, 1;
+        mov [r10 + 24], rax;                     // next++
+        mov rax, r8;                             // return session_id
+        ret;
+
+      slog_at_ni:
+        mov rdi, 0xFFFFF01F;
+        call slog_set_err;
+        mov rax, 0xFFFFF01F;
+        ret;
+      slog_at_aa:
+        mov rdi, 0xFFFFF01D;
+        call slog_set_err;
+        mov rax, 0xFFFFF01D;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // slog_detach() -> u64
+  //
+  // Clear the active session. Refuses:
+  //   - not init                     SLOG_ERR_NOT_INIT
+  //   - no active session             SLOG_ERR_DETACH_EMPTY
+  // ==========================================================================
+
+  pub let slog_detach : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M5-002 (#1378): clear active_session_id. Labels prefixed slog_dt_.",
+      block: {
+        lea r10, [rip + _slog_state];
+        mov rax, [r10 + 0];
+        mov r11, 0x510C;
+        cmp rax, r11;
+        jne slog_dt_ni;
+
+        mov rax, [r10 + 16];                     // active_session_id
+        cmp rax, 0;
+        je  slog_dt_de;
+
+        xor rax, rax;
+        mov [r10 + 16], rax;                     // active = 0
+        ret;
+
+      slog_dt_ni:
+        mov rdi, 0xFFFFF01F;
+        call slog_set_err;
+        mov rax, 0xFFFFF01F;
+        ret;
+      slog_dt_de:
+        mov rdi, 0xFFFFF01A;
+        call slog_set_err;
+        mov rax, 0xFFFFF01A;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // slog_record(query_hash, result_count, duration_ticks) -> u64
+  //
+  // Append one execution record. Refuses:
+  //   - not init                     SLOG_ERR_NOT_INIT
+  //   - no active session             SLOG_ERR_NO_SESSION
+  //
+  // Writes entry at log_head, bumps log_head modulo SLOG_RING_ENTRIES,
+  // saturates log_count at SLOG_RING_ENTRIES, bumps exec_count
+  // unconditionally, and adds duration_ticks to total_duration_ticks.
+  // The first entry in the ring is the OLDEST live entry once the
+  // ring has wrapped -- slog_get(idx, field) reads by chronological
+  // idx (0 = oldest live entry, log_count - 1 = newest).
+  // ==========================================================================
+
+  pub let slog_record : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (query_hash: u64, result_count: u64, duration_ticks: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M5-002 (#1378): append one record at log_head, wrap, bump counters. Labels prefixed slog_rec_.",
+      block: {
+        lea r10, [rip + _slog_state];
+        mov rax, [r10 + 0];
+        mov r11, 0x510C;
+        cmp rax, r11;
+        jne slog_rec_ni;
+
+        mov rax, [r10 + 16];                     // active_session_id
+        cmp rax, 0;
+        je  slog_rec_ns;
+        mov r8, rax;                             // r8 = active_session_id
+
+        mov r9, [r10 + 32];                      // log_head
+        // base = _slog_ring + (log_head * 4) * 8 = _slog_ring + log_head * 32
+        lea r11, [rip + _slog_ring];
+        mov rax, r9;
+        shl rax, 5;                              // * 32
+        add r11, rax;                            // r11 = entry base
+
+        mov [r11 + 0],  r8;                      // session_id
+        mov [r11 + 8],  rdi;                     // query_hash
+        mov [r11 + 16], rsi;                     // result_count
+        mov [r11 + 24], rdx;                     // duration_ticks
+
+        // Advance log_head modulo SLOG_RING_ENTRIES (64).
+        add r9, 1;
+        cmp r9, 64;
+        jb  slog_rec_nowrap;
+        xor r9, r9;
+      slog_rec_nowrap:
+        mov [r10 + 32], r9;
+
+        // Saturate log_count at SLOG_RING_ENTRIES.
+        mov rax, [r10 + 40];                     // log_count
+        cmp rax, 64;
+        jae slog_rec_saturated;
+        add rax, 1;
+        mov [r10 + 40], rax;
+      slog_rec_saturated:
+
+        // exec_count++.
+        mov rax, [r10 + 48];
+        add rax, 1;
+        mov [r10 + 48], rax;
+
+        // total_duration_ticks += duration_ticks.
+        mov rax, [r10 + 56];
+        add rax, rdx;
+        mov [r10 + 56], rax;
+
+        xor rax, rax;
+        ret;
+
+      slog_rec_ni:
+        mov rdi, 0xFFFFF01F;
+        call slog_set_err;
+        mov rax, 0xFFFFF01F;
+        ret;
+      slog_rec_ns:
+        mov rdi, 0xFFFFF01E;
+        call slog_set_err;
+        mov rax, 0xFFFFF01E;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // slog_get(idx, field) -> u64
+  //
+  // Read one field of one live entry. idx is chronological (0 =
+  // oldest live, log_count - 1 = newest). field is one of SLOG_F_*.
+  // Refuses:
+  //   - not init                     SLOG_ERR_NOT_INIT
+  //   - idx >= log_count              SLOG_ERR_BAD_IDX
+  //   - field > 3                     SLOG_ERR_BAD_FIELD
+  //
+  // Physical index = (log_head - log_count + idx) mod SLOG_RING_ENTRIES.
+  // When log_count < SLOG_RING_ENTRIES the ring has not wrapped and
+  // log_head == log_count, so physical == idx. Once saturated the
+  // formula yields the correct oldest-first mapping.
+  // ==========================================================================
+
+  pub let slog_get : (u64, u64) -> u64 !{mem} @{} =
+    fn (idx: u64, field: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R41.M5-002 (#1378): read one field of one live entry, oldest-first. Labels prefixed slog_g_.",
+      block: {
+        lea r10, [rip + _slog_state];
+        mov rax, [r10 + 0];
+        mov r11, 0x510C;
+        cmp rax, r11;
+        jne slog_g_ni;
+
+        mov rax, [r10 + 40];                     // log_count
+        cmp rdi, rax;
+        jae slog_g_bi;
+
+        cmp rsi, 3;
+        ja  slog_g_bf;
+
+        // physical = (log_head - log_count + idx) mod 64
+        // Do it in unsigned arithmetic that stays non-negative:
+        // physical = (log_head + SLOG_RING_ENTRIES - log_count + idx) mod 64
+        mov r8, [r10 + 32];                      // log_head
+        add r8, 64;
+        sub r8, rax;                             // - log_count
+        add r8, rdi;                             // + idx
+        // r8 mod 64
+        and r8, 63;
+
+        // entry_base = _slog_ring + physical * 32
+        lea r11, [rip + _slog_ring];
+        mov rax, r8;
+        shl rax, 5;
+        add r11, rax;
+
+        // field_offset = field * 8
+        mov rax, rsi;
+        shl rax, 3;
+        add r11, rax;
+
+        mov rax, [r11];
+        ret;
+
+      slog_g_ni:
+        mov rdi, 0xFFFFF01F;
+        call slog_set_err;
+        xor rax, rax;
+        ret;
+      slog_g_bi:
+        mov rdi, 0xFFFFF01C;
+        call slog_set_err;
+        xor rax, rax;
+        ret;
+      slog_g_bf:
+        mov rdi, 0xFFFFF01B;
+        call slog_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // slog_audit_forward() -> u64
+  //
+  // Honesty pin. Returns 0 unconditionally today. When the audit
+  // forwarder widening lands, this body walks the ring's tail and
+  // calls audit_emit(0, active_session_id, SLOG_EV_SEMTERM_QUERY_EXEC,
+  // aud_pack_at(actor, target), SLOG_OK, query_hash) for every entry
+  // the previous walk did not cover; the entry-count counter it
+  // returns is the audit-schema widening's landing gate.
+  // ==========================================================================
+
+  pub let slog_audit_forward : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R41.M5-002 (#1378): honesty pin for the audit-schema forwarder. Returns 0 until audit_schema is widened with SLOG_EV_SEMTERM_QUERY_EXEC = 100.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+}
