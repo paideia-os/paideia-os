@@ -5660,6 +5660,27 @@ fi
 echo "[r48b-confine] R48b (KIND_PDXFS_FILE + KIND_PDXFS_TXN + KIND_ELEVATE_CHANNEL) confined"
 
 # ---------------------------------------------------------------------------
+# R48b substrate-prep (#1627): svc.elevate-broker registration seam.
+#
+# The kernel-side seam that reserves the well-known service name and
+# provides a stub RPC dispatch. Full daemon body arrives later. The
+# counter table _elevate_broker_stats has exactly one writer here so
+# stray increments cannot silently drift the record of what the broker
+# has done.
+R48B_ELVB_SRC="${REPO_ROOT}/src/kernel/core/ipc/elevate_broker.pdx"
+if [[ ! -f "${R48B_ELVB_SRC}" ]]; then
+    echo "[elevate-broker-confine] FAIL - ${R48B_ELVB_SRC} not found" >&2
+    exit 1
+fi
+ec_confine_one '_elevate_broker_stats' 'core/ipc/elevate_broker.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See ipc/elevate_broker.pdx §SCOPE for the counter one-writer" >&2
+    echo "  discipline." >&2
+    exit 1
+fi
+echo "[elevate-broker-confine] elevate-broker seam counters confined"
+
+# ---------------------------------------------------------------------------
 # G1.M1-005 (#1431) + G1.M3-005 (#1441): P1 INVARIANT ENFORCEMENT.
 #
 # Refuses the build if any source file:
