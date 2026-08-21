@@ -178,6 +178,23 @@ echo "[cap-descriptor-confine] tools/verify-cap-descriptor.sh"
     exit 1
 }
 
+# R31.M1 / #1608: active-mutation markers must not survive into a
+# committed source tree. The power-button-inversion incident that
+# motivated the ticket is the canonical shape — a mutation left in
+# production code, looking legitimate at a glance, that a grep for
+# any of six unmistakable marker strings would have caught. Runs
+# alongside the other pre-assembler gates because a marker's failure
+# mode is silent: it prints nothing at runtime, ships as if it were
+# the real thing, and is only discovered by someone else's incident.
+# Self-test hook lives in tools/verify-mutation-marker.sh; the tree
+# currently carries zero markers by design, so the normal path is
+# silent success.
+echo "[mutation-marker] tools/verify-mutation-marker.sh"
+"${REPO_ROOT}/tools/verify-mutation-marker.sh" || {
+    echo "[FAIL] active mutation marker in source tree (#1608 gate)" >&2
+    exit 1
+}
+
 echo "[build-user] ensuring build/user/shell.bin (R15-M1-007 embed prerequisite)"
 "${REPO_ROOT}/tools/build-user.sh"
 
