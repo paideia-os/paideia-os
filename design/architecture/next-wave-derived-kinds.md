@@ -2310,15 +2310,47 @@ otherwise noted.
 | 0x189  | `KIND_VK_SURFACE`        | `KIND_IPC_ENDPOINT = 5`           | G3 opener: one Vulkan WSI surface — the RPC endpoint through which a client asks the compositor for a swapchain over ONE named `KIND_DISPLAY_OUTPUT`. Row tail: `{surface_key:u64, endpoint_id:u16, output_slot:u16, fmt:u16, extent_w:u16, extent_h:u16, scale_num:u16, scale_den:u16, flags:u32}`. Fractional scale (`scale_num`, `scale_den`) lives on the surface — not on the swapchain — because a compositor deciding between direct-scanout and composited paths needs the scale before it hands out swapchain images (P3 acceptance). R_MINT is PRESENT because `KIND_VK_SWAPCHAIN_IMAGE` derives from a `KIND_VK_SURFACE`. | derived (QUERY-only ops) | 0xFFFFEE10..1F | `kind_vk_surface.pdx` |
 | 0x18A  | `KIND_VK_SWAPCHAIN_IMAGE`| `KIND_GPU_BO = 0x174` (over `KIND_MEMORY = 4`)       | G3.M2: one LINEAR swapchain image carrying the two `KIND_DISPLAY_TIMELINE` slots the explicit-sync present cycle needs — `gpu_timeline_slot` signalled on ACQUIRE (image ready for the app to render into) and `display_timeline_slot` signalled on PRESENT (image scanned out for the app to wait on) — plus VK_KHR_present_id (`present_id`) and presentation-timing (`target_pts`). State field records `{FREE, ACQUIRED, RENDERING, QUEUED, PRESENTED, DISCARDED}`; the maintenance1 release-on-discard path transitions to `DISCARDED` when a MAILBOX present drops a pending frame. Present modes {FIFO=0, MAILBOX=1, IMMEDIATE=2, FIFO_RELAXED=3} recorded per-image so a resize under load can carry two modes across the rotation. R_MINT absent — LINEAR leaf. | derived LINEAR (QUERY-only ops; state transitions through `vksi_row_set_state`) | 0xFFFFEE00..0F | `kind_vk_swapchain_image.pdx` |
 
+### R48b substrate-prep — user-management + tool substrate kinds
+
+Landed as part of the R48b substrate-prep block that unblocks every
+R49/R50 tool (design/tooling/r49-r50-plan.md §5). The user-management
+kind (`KIND_USER = 0x190`) landed with R48.M1 (#1517–#1520); the three
+kinds below land the tool-side substrate.
+
+| Value  | Name                     | Base                              | Purpose (short)                                                                                                                                    | Discipline                    | Failure band        | File                            |
+|-------:|--------------------------|-----------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------|:------------------------------|:--------------------|---------------------------------|
+| 0x190  | `KIND_USER`              | `KIND_HW = 14`                    | R48.M1 (#1517–#1520): one PaideiaOS user identity — SHA3-256 fp of an ML-DSA-65 pk, plus quota + delegation edge. Revoke cascades through the whole descendant chain of delegated users. | derived (mint gate + cascade) | 0xFFFFED30..3F      | `kind_user.pdx`                 |
+| 0x191  | `KIND_ELEVATE_CHANNEL`   | `KIND_IPC_ENDPOINT = 5`           | R48b (#1626): one in-flight elevation request handled by `svc.elevate-broker`. Row tail: `{request_id, requester_pid, target_cap_kind, target_cap_rights, expire_ns, state, broker_endpoint_id}`. Deriving over KIND_IPC_ENDPOINT lets the mint gate refuse a channel whose parent is not addressable. `R_MINT` ABSENT — leaf authority. | derived (QUERY-only ops) | 0xFFFFEC00..0F | `kind_elevate_channel.pdx`      |
+| 0x192  | *reserved*               | —                                 | `KIND_PACKAGE` — reserved for the pkg-tooling authority when R49 lands (design/tooling/r49-r50-plan.md §5).                                        | —                             | —                   | —                               |
+| 0x193  | *reserved*               | —                                 | `KIND_SHELL` — reserved for the interactive-shell session cap when R50 lands.                                                                     | —                             | —                   | —                               |
+| 0x194  | *reserved*               | —                                 | `KIND_TERMINAL_SESSION` — reserved for the terminal-session cap when R50 lands.                                                                   | —                             | —                   | —                               |
+| 0x195  | `KIND_PDXFS_FILE`        | `KIND_MEMORY = 4` (= `KIND_PAGE`) | R48b (#1623): one file (or file-shaped object) in PdxFS v1. Row tail: `{inode_no, byte_len, mode_bits, created_ns, mtime_ns, refcount}` (48 B). Derives over KIND_MEMORY for the same reason as KIND_DMA_DOMAIN: an FS object is a page-shaped thing whose reach cannot widen beyond the parent's memory authority. R_MINT PRESENT (snapshot-viewer children). | derived (QUERY-only ops) | 0xFFFFEC20..2F | `kind_pdxfs_file.pdx`           |
+| 0x196  | `KIND_PDXFS_TXN`         | `KIND_MEMORY = 4` (= `KIND_PAGE`) | R48b (#1624): one in-flight PdxFS transaction — the grouping unit for pkg/cp/mv/rm. Row tail: `{txn_id, snap_gen, wal_off, bytes_touched, expire_ns, state, mode}` (48 B). State ∈ {OPEN, COMMITTED, ABORTED, EXPIRED}; mode ∈ {CREATE, MODIFY, DELETE}. Threads through cow_write / wal / journal_fence / journal_csum so the walker knows which WAL group a write belongs to. | derived (QUERY-only ops) | 0xFFFFEC10..1F | `kind_pdxfs_txn.pdx`            |
+
+**Ordinal allocation policy at R48b.** The R48b block is a *reserved
+band*: `0x190`–`0x196` are landed here (three by R48b, one earlier at
+R48.M1); `0x192`–`0x194` are held for the future package / shell /
+terminal-session kinds so the userspace-tool derivation lattice reads
+as one contiguous region. A later round that needs to add another
+tool-substrate kind picks the next free ordinal in the reserved band
+(`0x197`+) rather than jumping to a new decade — the point is a
+readable derived-kind map, not micro-optimising the dispatch chain.
+
+The R48b block also bumps the audit schema's `aud_kind_valid` upper
+bound from `0x18F` to `0x196` (the pre-R48b bound had silently missed
+`KIND_USER = 0x190` because no audit-emit site currently references
+it, but a future one would be refused as an invalid kind). See
+`core/audit/audit_schema.pdx` §aud_kind_valid.
+
 ### Summary counts and free bands
 
-- **Derived-kind values landed:** 54 (0x140..0x142, 0x150..0x186, 0x188..0x18A; 0x143..0x14F reserved; 0x187 KIND_VMD_ENDPOINT).
+- **Derived-kind values landed:** 58 (0x140..0x142, 0x150..0x186, 0x188..0x18A, 0x18B..0x18F, 0x190..0x191, 0x195..0x196; 0x143..0x14F, 0x187, 0x192..0x194 reserved).
 - **Base kinds parented over:** `KIND_MEMORY = 4` (8 kinds), `KIND_IPC_ENDPOINT = 5` (22 kinds), `KIND_DEVICE = 10` (13 kinds), `KIND_IO_PORT = 11` (co-parent for `KIND_OP_REGION`), `KIND_HW = 14` (2 kinds), plus derived-parent chains: `KIND_HW_INTERRUPT`, `KIND_I2C_BUS`, `KIND_USB_DEVICE`, `KIND_USB_INTERFACE`, `KIND_USB_ENDPOINT`, `KIND_MSC_LUN`, `KIND_GPU_BO`, `KIND_DISPLAY_PLANE`, `KIND_DISPLAY_MODE`.
 - **LINEAR kinds (6):** `KIND_MODESET_TXN`, `KIND_GPU_CONTEXT`, `KIND_GPU_SUBMIT`, `KIND_WIFI_SCAN_TXN`, `KIND_SCANOUT_LEASE`, `KIND_VK_SWAPCHAIN_IMAGE`, plus the identity-LINEAR discipline on `KIND_AUDIO_ROUTE`.
 - **SEALED kinds (2):** `KIND_WIFI_KEY`, `KIND_BT_PAIRING`.
 - **Linearizable-on-object (1):** `KIND_FW_SESSION` (the arbitration is on the object, not the session cap).
 - **QUERY-only kinds (4):** `KIND_CSI_CAMERA`, `KIND_IPU6_STREAM`, `KIND_WWAN_MODEM`, `KIND_MBIM_SESSION` (R40 pattern — identity fields frozen at mint; the only mutator is the revoke helper).
-- **Next free derived-kind tag:** `0x18B` (opens G4).
+- **Next free derived-kind tag:** `0x197` (after the R48b reserved band 0x190..0x196 with 0x192..0x194 held).
 - **Adjacent-below free failure band:** `0xFFFFF170..7F` (16-wide; reserved for the R41 opener). `0xFFFFF180..8F` was allocated at R40.M5-001 (#1363) for `core/audit/audit_schema.pdx`.
 
 ### Migration table — audit-emit sites still on `drv_audit_emit`

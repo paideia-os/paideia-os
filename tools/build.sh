@@ -5625,6 +5625,41 @@ fi
 echo "[r48-confine] R48 (KIND_USER + .pdxuser records + identity storage) confined"
 
 # ---------------------------------------------------------------------------
+# R48b substrate-prep (#1623 / #1624 / #1626): one-writer discipline
+# for the three new capability kinds that unblock the R49/R50 tools.
+#
+#   * kind_pdxfs_file      (KIND_PDXFS_FILE     = 0x195, over KIND_MEMORY)
+#   * kind_pdxfs_txn       (KIND_PDXFS_TXN      = 0x196, over KIND_MEMORY)
+#   * kind_elevate_channel (KIND_ELEVATE_CHANNEL = 0x191, over KIND_IPC_ENDPOINT)
+#
+# The three tables (_pdxfs_file_table, _pdxfs_txn_table,
+# _elevate_channel_table) plus their _stats siblings are the only
+# places in the kernel where these authorities live. A second writer
+# would let one supervisor mutate a file authority / transaction state
+# / channel row with no capability involved. Per-module confinement
+# is what makes that unreachable by construction.
+R48B_PFF_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_pdxfs_file.pdx"
+R48B_PXT_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_pdxfs_txn.pdx"
+R48B_ELVC_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_elevate_channel.pdx"
+if [[ ! -f "${R48B_PFF_SRC}" || ! -f "${R48B_PXT_SRC}" || ! -f "${R48B_ELVC_SRC}" ]]; then
+    echo "[r48b-confine] FAIL - one of the R48b substrate KIND source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_pdxfs_file_table'          'core/cap/kind_pdxfs_file.o'
+ec_confine_one '_pdxfs_file_stats'          'core/cap/kind_pdxfs_file.o'
+ec_confine_one '_pdxfs_txn_table'           'core/cap/kind_pdxfs_txn.o'
+ec_confine_one '_pdxfs_txn_stats'           'core/cap/kind_pdxfs_txn.o'
+ec_confine_one '_elevate_channel_table'     'core/cap/kind_elevate_channel.o'
+ec_confine_one '_elevate_channel_stats'     'core/cap/kind_elevate_channel.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_pdxfs_file.pdx §1, kind_pdxfs_txn.pdx §1, and" >&2
+    echo "  kind_elevate_channel.pdx §1 for the per-module one-writer" >&2
+    echo "  discipline." >&2
+    exit 1
+fi
+echo "[r48b-confine] R48b (KIND_PDXFS_FILE + KIND_PDXFS_TXN + KIND_ELEVATE_CHANNEL) confined"
+
+# ---------------------------------------------------------------------------
 # G1.M1-005 (#1431) + G1.M3-005 (#1441): P1 INVARIANT ENFORCEMENT.
 #
 # Refuses the build if any source file:
