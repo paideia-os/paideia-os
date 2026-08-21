@@ -4706,6 +4706,73 @@ semterm_pin_one "${SNP_SRC}" 'pub let snp_prune : () -> u64'
 echo "[pdxfs-snap-confine] R42.M3 entry-point arities pinned"
 
 # ---------------------------------------------------------------------------
+# R42.M4-001 .. R42.M4-003 (#1392..#1394): PDXFS LITE -> V1 UPGRADE + COMPAT.
+#
+# Three modules complete the PdxFS v1 upgrade story:
+#
+#   upgrade_v1.pdx      -- in-place upgrade authority. The scaffold
+#                          swaps the superblock magic + migrates the
+#                          legacy inode + derives the CoW head in ONE
+#                          call whose all-or-nothing property the on-
+#                          disk widening preserves inside a journal
+#                          transaction.
+#   upgrade_dryrun.pdx  -- read-only walk that produces a report
+#                          (blocks_before, blocks_after, free_delta,
+#                          duration) so the caller can decide to
+#                          commit without side effects.
+#   lite_reader.pdx     -- read-only compat mode for legacy volumes:
+#                          the ONE place a write attempt lands is
+#                          lit_write_refuse, which returns LIT_ERR_
+#                          ROFS unconditionally on a live mount.
+#
+# The confinement gate below is why a widening cannot:
+#   - "flip the superblock magic to v1 without running the migration
+#     step" (upgrade_v1 confinement), which would leave a downstream
+#     v1 mount reading legacy inodes it never sanctioned,
+#   - "quiet a dry-run report by planting matching numbers" (upgrade_
+#     dryrun confinement), which would let a commit run against a
+#     volume the pre-flight walk never actually approved,
+#   - "mount a legacy volume in write mode by planting a mounted-latch
+#     value the read API doesn't check" (lite_reader confinement),
+#     which would defeat the whole read-only compat story.
+UPG_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/upgrade_v1.pdx"
+DRY_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/upgrade_dryrun.pdx"
+LIT_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/lite_reader.pdx"
+if [[ ! -f "${UPG_SRC}" || ! -f "${DRY_SRC}" || ! -f "${LIT_SRC}" ]]; then
+    echo "[pdxfs-upg-confine] FAIL - one of the R42.M4 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_upg_sb'      'core/fs/pdxfs/upgrade_v1.o'
+ec_confine_one '_upg_state'   'core/fs/pdxfs/upgrade_v1.o'
+ec_confine_one '_dry_src'     'core/fs/pdxfs/upgrade_dryrun.o'
+ec_confine_one '_dry_state'   'core/fs/pdxfs/upgrade_dryrun.o'
+ec_confine_one '_lit_blocks'  'core/fs/pdxfs/lite_reader.o'
+ec_confine_one '_lit_sb'      'core/fs/pdxfs/lite_reader.o'
+ec_confine_one '_lit_state'   'core/fs/pdxfs/lite_reader.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/fs/pdxfs/{upgrade_v1,upgrade_dryrun,lite_reader}.pdx §2" >&2
+    echo "  for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[pdxfs-upg-confine] R42.M4 (upgrade_v1 + upgrade_dryrun + lite_reader) state confined"
+
+# ARITY PINS for the R42.M4 entry points. A widening on any of these
+# makes "upgrade under an unrecognised precondition set", "dry-run
+# against a volume the caller doesn't own", or "read past the block
+# capacity without a bounds refusal" expressible in a call site the
+# confinement gate cannot see.
+semterm_pin_one "${UPG_SRC}" 'pub let upg_upgrade : () -> u64'
+semterm_pin_one "${UPG_SRC}" 'pub let upg_seed_lite : (u64, u64) -> u64'
+semterm_pin_one "${UPG_SRC}" 'pub let upg_set_journal : (u64) -> u64'
+semterm_pin_one "${DRY_SRC}" 'pub let dry_walk : () -> u64'
+semterm_pin_one "${DRY_SRC}" 'pub let dry_seed : (u64, u64) -> u64'
+semterm_pin_one "${LIT_SRC}" 'pub let lit_mount : () -> u64'
+semterm_pin_one "${LIT_SRC}" 'pub let lit_unmount : () -> u64'
+semterm_pin_one "${LIT_SRC}" 'pub let lit_read : (u64) -> u64'
+semterm_pin_one "${LIT_SRC}" 'pub let lit_write_refuse : (u64, u64) -> u64'
+echo "[pdxfs-upg-confine] R42.M4 entry-point arities pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

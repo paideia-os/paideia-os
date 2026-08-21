@@ -1,0 +1,507 @@
+// src/kernel/core/fs/pdxfs/upgrade_v1.pdx -- R42.M4-001 (#1392)
+//
+// PDXFS LITE -> V1 IN-PLACE UPGRADE.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the AUTHORITY on the ACT OF UPGRADING a legacy PdxFS-lite
+// volume to PdxFS v1 IN PLACE. One upgrade path, one atomic swap of
+// the superblock via the journal, one per-inode migration walk that
+// installs a v1 inode + CoW head for each legacy inode. Every path
+// that turns a lite volume into a v1 volume goes through THIS module,
+// so no caller can rewrite half a superblock and leave the other half
+// pointing at lite geometry.
+//
+// It is a SCAFFOLD (D7). The superblock is a small BSS buffer that
+// carries a magic + version + two inode slots (legacy + v1) + a
+// CoW-head pointer; the on-disk widening replaces it with the actual
+// PdxFS v1 super/root descriptor plus a scan of the legacy inode
+// table. The scaffold's semantic (a refuse-if-not-lite, refuse-if-
+// already-v1, refuse-if-journal-disabled precondition set, followed by
+// an atomic-swap-via-journal step that either both migrates the inode
+// AND swaps the superblock magic or does neither) is the semantic the
+// widening preserves.
+//
+// It does NOT touch pxjr / pxwal / pxjcs directly. Journal enablement
+// is modelled by a scaffold-local flag (upg_set_journal). A widening
+// will replace that flag with a call to the journal fence-record path
+// so the same refusal ("upgrade attempted with journal disabled") is
+// raised at the same site, but the ONE call the widening rewires lives
+// at exactly ONE place in this file.
+//
+// It does NOT persist anything. The superblock and the migration
+// accounting live in BSS. The widening lands the actual block writes
+// behind the same entry point.
+//
+// It does NOT roll back partial upgrades from an external caller. If
+// the upgrade fails a precondition, NOTHING mutates -- rollback would
+// be a lie because there was nothing to roll back. The atomic-swap-
+// via-journal invariant is the whole safety story; a widening's
+// implementation of that step MUST also be all-or-nothing.
+//
+// =============================================================================
+// §1  SUPERBLOCK GEOMETRY
+// =============================================================================
+//
+// _upg_sb is a flat [u64; 8]:
+//   +0    magic          UPG_MAGIC_LITE (pre) or UPG_MAGIC_V1 (post)
+//   +8    version        1 (lite) -> 2 (v1)
+//   +16   legacy_inode   scaffold representation of the sole legacy
+//                        inode (nonzero once upg_seed_lite has fired)
+//   +24   v1_inode       0 pre-upgrade; equal to legacy_inode post
+//   +32   cow_head       0 pre-upgrade; equal to legacy_inode + 0x1000
+//                        post-upgrade (the CoW head is derived from the
+//                        legacy inode's payload address; the constant
+//                        offset stands in for the real allocation).
+//   +40   reserved
+//   +48   reserved
+//   +56   reserved
+//
+// UPG_MAGIC_LITE = 0x504446534C31    "PDFSL1"
+// UPG_MAGIC_V1   = 0x5044465356 3200 "PDFSV2" (32-bit-safe u64 constant)
+//                  = 0x50444653563200
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _upg_sb and _upg_state are written only by helpers in this module.
+// tools/build.sh confines relocations against each to
+// `core/fs/pdxfs/upgrade_v1.o`. A second writer would let a caller
+// "flip the superblock magic to v1 without running the migration
+// step", which would leave a downstream v1 mount reading legacy
+// inodes it never sanctioned.
+//
+// STATE LAYOUT -- _upg_state : [u64; 8]
+//   +0    init_mark          0x4B0A once upg_reset has run
+//   +8    err                sticky error latch
+//   +16   journal_enabled    0/1; upgrade refuses when 0
+//   +24   upgrade_done       0/1; upgrade refuses when 1
+//   +32   inodes_migrated    exactly 1 per successful upgrade
+//   +40   super_swaps        exactly 1 per successful upgrade
+//   +48   reserved
+//   +56   reserved
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFEF40..0xFFFFEF4F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time. Adjacent used band
+// above: snap_prune 0xFFFFEF50..5F (R42.M3-004). Adjacent free band
+// below: upgrade_dryrun 0xFFFFEF30..3F (R42.M4-002).
+//
+//   UPG_OK                    = 0
+//   UPG_ERR_NOT_INIT          = 0xFFFFEF4F   accessor before upg_reset
+//   UPG_ERR_JOURNAL_DISABLED  = 0xFFFFEF4E   upgrade without journal enabled
+//   UPG_ERR_ALREADY_V1        = 0xFFFFEF4D   upgrade re-run on a v1 volume
+//   UPG_ERR_BAD_MAGIC         = 0xFFFFEF4C   source magic not PdxFS-lite
+//   UPG_ERR_NO_SOURCE         = 0xFFFFEF4B   upgrade before seed
+//   UPG_ERR_INTERNAL          = 0xFFFFEF4A   unreachable-fallthrough tripwire
+//
+// Reserved-label discipline: labels prefixed `upg_`.
+
+module UpgradeV1 = structure {
+
+  pub let UPG_MAGIC_LITE          : u64 = 0x504446534C31
+  pub let UPG_MAGIC_V1            : u64 = 0x50444653563200
+
+  pub let UPG_VERSION_LITE        : u64 = 1
+  pub let UPG_VERSION_V1          : u64 = 2
+
+  pub let UPG_COW_HEAD_OFFSET     : u64 = 0x1000
+
+  pub let UPG_OK                  : u64 = 0
+  pub let UPG_ERR_NOT_INIT        : u64 = 0xFFFFEF4F
+  pub let UPG_ERR_JOURNAL_DISABLED: u64 = 0xFFFFEF4E
+  pub let UPG_ERR_ALREADY_V1      : u64 = 0xFFFFEF4D
+  pub let UPG_ERR_BAD_MAGIC       : u64 = 0xFFFFEF4C
+  pub let UPG_ERR_NO_SOURCE       : u64 = 0xFFFFEF4B
+  pub let UPG_ERR_INTERNAL        : u64 = 0xFFFFEF4A
+
+  pub let UPG_INIT_MARK           : u64 = 0x4B0A
+
+  pub let mut _upg_sb    : [u64; 8] = uninit @align(64)
+  pub let mut _upg_state : [u64; 8] = uninit @align(64)
+
+  // ==========================================================================
+  // Reset. Clears sb + state; installs init_mark.
+  // ==========================================================================
+
+  pub let upg_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): clear sb + state, install init_mark. Labels prefixed upg_rst_.",
+      block: {
+        lea r10, [rip + _upg_sb];
+        xor rax, rax;
+        xor rcx, rcx;
+      upg_rst_b:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  upg_rst_b;
+
+        lea r10, [rip + _upg_state];
+        xor rcx, rcx;
+      upg_rst_s:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  upg_rst_s;
+
+        mov rax, 0x4B0A;
+        mov [r10 + 0], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let upg_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): 1 iff init_mark matches. Labels prefixed upg_bnd_.",
+      block: {
+        lea r10, [rip + _upg_state];
+        mov rax, [r10 + 0];
+        mov r11, 0x4B0A;
+        cmp rax, r11;
+        jne upg_bnd_no;
+        mov rax, 1;
+        ret;
+      upg_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let upg_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): sticky error latch readback.",
+      block: {
+        lea r10, [rip + _upg_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let upg_set_err : (u64) -> () !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): first-writer-wins error latch. Labels prefixed upg_se_.",
+      block: {
+        lea r10, [rip + _upg_state];
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        jne upg_se_out;
+        mov [r10 + 8], rdi;
+      upg_se_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Field readbacks.
+  // ==========================================================================
+
+  pub let upg_magic : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): current superblock magic.",
+      block: {
+        lea r10, [rip + _upg_sb];
+        mov rax, [r10 + 0];
+        ret
+      }
+    } @no_frame
+
+  pub let upg_version : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): current superblock version.",
+      block: {
+        lea r10, [rip + _upg_sb];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let upg_legacy_inode : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): legacy_inode field.",
+      block: {
+        lea r10, [rip + _upg_sb];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let upg_v1_inode : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): v1_inode field.",
+      block: {
+        lea r10, [rip + _upg_sb];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let upg_cow_head : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): cow_head field.",
+      block: {
+        lea r10, [rip + _upg_sb];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let upg_journal_enabled : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): journal_enabled field.",
+      block: {
+        lea r10, [rip + _upg_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let upg_is_done : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): upgrade_done field.",
+      block: {
+        lea r10, [rip + _upg_state];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let upg_inodes_migrated : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): inodes_migrated field.",
+      block: {
+        lea r10, [rip + _upg_state];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let upg_super_swaps : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): super_swaps field.",
+      block: {
+        lea r10, [rip + _upg_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Test seeders (scaffold only).
+  //
+  // upg_set_journal(enabled) -- toggle journal-enabled bit.
+  // upg_seed_lite(magic, legacy_inode) -- install a source superblock.
+  // ==========================================================================
+
+  pub let upg_set_journal : (u64) -> u64 !{mem} @{} =
+    fn (enabled: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): toggle journal_enabled. Labels prefixed upg_sj_.",
+      block: {
+        lea r10, [rip + _upg_state];
+        mov rax, [r10 + 0];
+        mov r11, 0x4B0A;
+        cmp rax, r11;
+        jne upg_sj_ni;
+
+        // Normalise to 0/1.
+        cmp rdi, 0;
+        je  upg_sj_off;
+        mov rax, 1;
+        mov [r10 + 16], rax;
+        ret;
+      upg_sj_off:
+        xor rax, rax;
+        mov [r10 + 16], rax;
+        mov rax, 1;
+        ret;
+      upg_sj_ni:
+        mov rdi, 0xFFFFEF4F;
+        call upg_set_err;
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let upg_seed_lite : (u64, u64) -> u64 !{mem} @{} =
+    fn (magic: u64, legacy_inode: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): install a source superblock. Labels prefixed upg_sd_.",
+      block: {
+        lea r10, [rip + _upg_state];
+        mov rax, [r10 + 0];
+        mov r11, 0x4B0A;
+        cmp rax, r11;
+        jne upg_sd_ni;
+
+        lea r11, [rip + _upg_sb];
+        mov [r11 + 0], rdi;                       // magic
+        // version: if magic == LITE -> 1; if magic == V1 -> 2; else 0.
+        mov rax, 0x504446534C31;
+        cmp rdi, rax;
+        je  upg_sd_v_lite;
+        mov rax, 0x50444653563200;
+        cmp rdi, rax;
+        je  upg_sd_v_v1;
+        xor rax, rax;
+        mov [r11 + 8], rax;
+        jmp upg_sd_after_v;
+      upg_sd_v_lite:
+        mov rax, 1;
+        mov [r11 + 8], rax;
+        jmp upg_sd_after_v;
+      upg_sd_v_v1:
+        mov rax, 2;
+        mov [r11 + 8], rax;
+        // Pre-existing v1 seed also parks v1_inode + cow_head so that
+        // the "already v1" refusal is exercisable without a subsequent
+        // upgrade call needing to do partial work.
+        mov [r11 + 24], rsi;
+        mov rax, rsi;
+        add rax, 0x1000;
+        mov [r11 + 32], rax;
+      upg_sd_after_v:
+        mov [r11 + 16], rsi;                      // legacy_inode
+        mov rax, 1;
+        ret;
+
+      upg_sd_ni:
+        mov rdi, 0xFFFFEF4F;
+        call upg_set_err;
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // upg_upgrade() -> u64
+  //
+  // Perform the in-place upgrade. Preconditions checked BEFORE any
+  // mutation:
+  //   - initialised                     UPG_ERR_NOT_INIT
+  //   - superblock seeded (magic != 0)  UPG_ERR_NO_SOURCE
+  //   - magic == UPG_MAGIC_LITE         UPG_ERR_BAD_MAGIC
+  //   - journal_enabled == 1            UPG_ERR_JOURNAL_DISABLED
+  //   - upgrade_done == 0               UPG_ERR_ALREADY_V1
+  //
+  // Effects on success (atomic w.r.t. any downstream reader that goes
+  // through this module -- the scaffold performs them in one call, and
+  // a widening will bracket both writes inside one journal transaction):
+  //   - v1_inode <- legacy_inode
+  //   - cow_head <- legacy_inode + UPG_COW_HEAD_OFFSET
+  //   - inodes_migrated <- 1
+  //   - magic <- UPG_MAGIC_V1
+  //   - version <- 2
+  //   - super_swaps <- 1
+  //   - upgrade_done <- 1
+  //
+  // Returns 1 on success. On refusal returns 0 and latches the error.
+  // ==========================================================================
+
+  pub let upg_upgrade : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M4-001 (#1392): in-place upgrade of PdxFS-lite -> v1. Labels prefixed upg_up_.",
+      block: {
+        lea r10, [rip + _upg_state];
+        mov rax, [r10 + 0];
+        mov r11, 0x4B0A;
+        cmp rax, r11;
+        jne upg_up_ni;
+
+        // upgrade_done first: an "already v1" refusal must precede any
+        // magic inspection so a re-run does not report BAD_MAGIC (which
+        // would mislead: the volume IS v1, that is precisely the reason
+        // to refuse).
+        mov rax, [r10 + 24];
+        cmp rax, 0;
+        jne upg_up_a1;
+
+        lea r11, [rip + _upg_sb];
+        mov rax, [r11 + 0];                       // magic
+        cmp rax, 0;
+        je  upg_up_ns;
+
+        // Already-v1 magic on the source also refuses with ALREADY_V1
+        // (a v1 volume seeded but never marked done still counts as
+        // "already v1" from the upgrade path's point of view).
+        mov r9, 0x50444653563200;
+        cmp rax, r9;
+        je  upg_up_a1;
+
+        // Anything else other than LITE is BAD_MAGIC.
+        mov r9, 0x504446534C31;
+        cmp rax, r9;
+        jne upg_up_bm;
+
+        // Journal enabled?
+        mov rax, [r10 + 16];
+        cmp rax, 0;
+        je  upg_up_jd;
+
+        // All preconditions satisfied. Do the migration + swap.
+        lea r11, [rip + _upg_sb];
+        mov rax, [r11 + 16];                      // legacy_inode
+        mov [r11 + 24], rax;                      // v1_inode <- legacy
+        add rax, 0x1000;
+        mov [r11 + 32], rax;                      // cow_head <- legacy + offset
+
+        // Superblock swap (magic + version).
+        mov rax, 0x50444653563200;
+        mov [r11 + 0], rax;                       // magic <- V1
+        mov rax, 2;
+        mov [r11 + 8], rax;                       // version <- 2
+
+        // State bookkeeping.
+        mov rax, 1;
+        mov [r10 + 24], rax;                      // upgrade_done <- 1
+        mov [r10 + 32], rax;                      // inodes_migrated <- 1
+        mov [r10 + 40], rax;                      // super_swaps <- 1
+        ret;
+
+      upg_up_ni:
+        mov rdi, 0xFFFFEF4F;
+        call upg_set_err;
+        xor rax, rax;
+        ret;
+      upg_up_ns:
+        mov rdi, 0xFFFFEF4B;
+        call upg_set_err;
+        xor rax, rax;
+        ret;
+      upg_up_bm:
+        mov rdi, 0xFFFFEF4C;
+        call upg_set_err;
+        xor rax, rax;
+        ret;
+      upg_up_jd:
+        mov rdi, 0xFFFFEF4E;
+        call upg_set_err;
+        xor rax, rax;
+        ret;
+      upg_up_a1:
+        mov rdi, 0xFFFFEF4D;
+        call upg_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+}
