@@ -4833,6 +4833,72 @@ semterm_pin_one "${DUR_SRC}" 'pub let dur_barrier : (u64) -> u64'
 echo "[pdxfs-r42-close-confine] R42-close entry-point arities pinned"
 
 # ---------------------------------------------------------------------------
+# R44.M1-001/002/003 (#1400/#1401/#1402): SEMTERM GUI SHELL CONFINEMENT.
+#
+# Three modules open R44.M1 on top of the R41.M1..M2 semantic-term core:
+# gui_shell (window shell + four named regions + input event queue),
+# gui_layout (up to 8 tabs, up to 16 panes, nested H/V splits, focus
+# routing), and gui_theme (theme + font + size registry with a
+# session_log-forward persist counter). Each owns its own state cells;
+# a second writer against any of them would let a caller:
+#   - park focus on a region gsh_focus_set never authorised
+#     (gui_shell confinement), so a downstream event pump would
+#     deliver to a region the shell never blessed,
+#   - forge a pane's kind field (gui_layout confinement), turning a
+#     structural SPLIT into a LEAF the focus router walks into, or
+#     shifting pane_alloc_next so gly_pane_split hands out a slot
+#     another tab already owns,
+#   - forge the theme_id / font_id / font_size fields (gui_theme
+#     confinement), so a downstream renderer paints against a
+#     configuration no setter ever validated -- bypassing the
+#     GTH_ERR_BAD_THEME / _BAD_FONT / _BAD_SIZE refusal band.
+GSH_SRC="${REPO_ROOT}/src/kernel/core/semterm/gui_shell.pdx"
+GLY_SRC="${REPO_ROOT}/src/kernel/core/semterm/gui_layout.pdx"
+GTH_SRC="${REPO_ROOT}/src/kernel/core/semterm/gui_theme.pdx"
+if [[ ! -f "${GSH_SRC}" || ! -f "${GLY_SRC}" || ! -f "${GTH_SRC}" ]]; then
+    echo "[semterm-r44-confine] FAIL - one of the R44.M1 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_gsh_state'   'core/semterm/gui_shell.o'
+ec_confine_one '_gsh_regions' 'core/semterm/gui_shell.o'
+ec_confine_one '_gsh_event_q' 'core/semterm/gui_shell.o'
+ec_confine_one '_gly_state'   'core/semterm/gui_layout.o'
+ec_confine_one '_gly_tabs'    'core/semterm/gui_layout.o'
+ec_confine_one '_gly_panes'   'core/semterm/gui_layout.o'
+ec_confine_one '_gth_state'   'core/semterm/gui_theme.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/semterm/gui_shell.pdx §3, gui_layout.pdx §2," >&2
+    echo "  and gui_theme.pdx §3 for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[semterm-r44-confine] R44.M1 (gui_shell + gui_layout + gui_theme) state confined"
+
+# ARITY PINS for the R44.M1 entry points. Same rationale as the R41
+# pins above: a widening on any of these makes "park focus on a
+# region no setter authored", "smuggle a session_hash into a pane
+# gly_pane_split never populated", or "install a theme the enum
+# check never blessed" expressible in a call site the confinement
+# gate cannot see.
+semterm_pin_one "${GSH_SRC}" 'pub let gsh_region_set : (u64, u64, u64, u64, u64) -> u64'
+semterm_pin_one "${GSH_SRC}" 'pub let gsh_region_show : (u64, u64) -> u64'
+semterm_pin_one "${GSH_SRC}" 'pub let gsh_focus_set : (u64) -> u64'
+semterm_pin_one "${GSH_SRC}" 'pub let gsh_event_push : (u64, u64) -> u64'
+semterm_pin_one "${GSH_SRC}" 'pub let gsh_event_pump : () -> u64'
+semterm_pin_one "${GSH_SRC}" 'pub let gsh_region_get : (u64, u64) -> u64'
+semterm_pin_one "${GLY_SRC}" 'pub let gly_tab_new : (u64) -> u64'
+semterm_pin_one "${GLY_SRC}" 'pub let gly_tab_active_set : (u64) -> u64'
+semterm_pin_one "${GLY_SRC}" 'pub let gly_pane_split : (u64, u64) -> u64'
+semterm_pin_one "${GLY_SRC}" 'pub let gly_pane_kind : (u64) -> u64'
+semterm_pin_one "${GLY_SRC}" 'pub let gly_pane_field : (u64, u64) -> u64'
+semterm_pin_one "${GLY_SRC}" 'pub let gly_focus_set : (u64) -> u64'
+semterm_pin_one "${GLY_SRC}" 'pub let gly_focus_next : () -> u64'
+semterm_pin_one "${GTH_SRC}" 'pub let gth_theme_set : (u64) -> u64'
+semterm_pin_one "${GTH_SRC}" 'pub let gth_font_set : (u64) -> u64'
+semterm_pin_one "${GTH_SRC}" 'pub let gth_font_size_set : (u64) -> u64'
+semterm_pin_one "${GTH_SRC}" 'pub let gth_persist_flush : () -> u64'
+echo "[semterm-r44-confine] gui_shell / gui_layout / gui_theme entry-point arities pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
