@@ -5119,6 +5119,61 @@ semterm_pin_one "${GKN_SRC}" 'pub let knv_skip_link_prev : () -> u64'
 echo "[semterm-r44m3-confine] gui_ime / gui_a11y / gui_kbdnav entry-point arities pinned"
 
 # ---------------------------------------------------------------------------
+# R44.M4-001/002 (#1409/#1410): SEMTERM GUI HDR / FEEDBACK
+# CONFINEMENT.
+#
+# Two modules close the R44.M4 milestone on top of the R44.M3
+# accessibility seams: gui_hdr (routes a series index to a 24-bit
+# RGB value picked from the BT.2020 wide-gamut palette when the
+# bound R36 KIND_DISPLAY_OUTPUT reports HDR capability, otherwise
+# defers to R41.M3 palette.pdx) and gui_feedback (subscribes to
+# G9 KIND_PRESENT_FEEDBACK events, latches last_latency against a
+# per-frame budget, and publishes two adaptive flags -- reduced-
+# detail hint the chart engine reads and scroll-freeze hint the
+# smooth-scroll integrator reads).
+# Each owns its own state cells; a second writer against any of
+# them would let a caller:
+#   - forge the HDR-capability flag or the BT.2020 catalogue
+#     (gui_hdr confinement), so hdr_pick_series returns colors from
+#     the wrong catalogue for the bound display -- bypassing the
+#     R36 supervisor's tone-mapping contract -- or scribble a
+#     non-BT.2020 primary into the wide-gamut table, silently
+#     collapsing the delta-E >= 15 floor;
+#   - forge the last_latency scalar or the two adaptive flags
+#     (gui_feedback confinement), so the chart engine reads a
+#     reduced-detail hint the compositor never actually reported,
+#     or the smooth-scroll integrator freezes on a frame that
+#     landed under budget -- bypassing the BAD_TIME / NO_BUDGET
+#     refusal band.
+GHR_SRC="${REPO_ROOT}/src/kernel/core/semterm/gui_hdr.pdx"
+GFB_SRC="${REPO_ROOT}/src/kernel/core/semterm/gui_feedback.pdx"
+if [[ ! -f "${GHR_SRC}" || ! -f "${GFB_SRC}" ]]; then
+    echo "[semterm-r44m4-confine] FAIL - one of the R44.M4 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_hdr_state'         'core/semterm/gui_hdr.o'
+ec_confine_one '_hdr_series_bt2020' 'core/semterm/gui_hdr.o'
+ec_confine_one '_pfb_state'         'core/semterm/gui_feedback.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/semterm/gui_hdr.pdx §2 and" >&2
+    echo "  gui_feedback.pdx §2 for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[semterm-r44m4-confine] R44.M4 (gui_hdr + gui_feedback) state confined"
+
+# ARITY PINS for the R44.M4 entry points. Same rationale as the
+# R41 / R44.M1 / R44.M2 / R44.M3 pins above: a widening on any of
+# these makes "pick a color from a catalogue nobody bound",
+# "publish a latency the compositor never reported", or "freeze
+# scroll on an unrelated event" expressible in a call site the
+# confinement gate cannot see.
+semterm_pin_one "${GHR_SRC}" 'pub let hdr_set_capable : (u64) -> u64'
+semterm_pin_one "${GHR_SRC}" 'pub let hdr_pick_series : (u64) -> u64'
+semterm_pin_one "${GFB_SRC}" 'pub let pfb_set_budget : (u64) -> u64'
+semterm_pin_one "${GFB_SRC}" 'pub let pfb_report : (u64, u64) -> u64'
+echo "[semterm-r44m4-confine] gui_hdr / gui_feedback entry-point arities pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
