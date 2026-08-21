@@ -4,7 +4,7 @@
 # bytes.
 #
 # Usage: tools/run-smoke.sh [MODE | expected_marker | --fingerprint PATTERN]
-#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_child_process', 'boot_r17_shell_shutdown', 'boot_smp', 'boot_r31_spawn_pair', 'boot_panic', 'prod' (mode dispatcher)
+#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_child_process', 'boot_r17_shell_shutdown', 'boot_smp', 'boot_r31_spawn_pair', 'boot_panic', 'boot_release', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
 #     * boot_tick: validates boot_tick fingerprint (with timer TICKs), 5s timeout
@@ -930,6 +930,46 @@ case "${EXPECTED}" in
         TIMEOUT=8
         EXPECTED=""
         ;;
+    boot_release)
+        # R49.M3-001 (#1576): release-mode boot regression gate.
+        #
+        # Rebuilds the kernel with PAIDEIA_BUILD_MODE=release (see
+        # tools/build.sh; regenerates src/kernel/core/config/build_mode.pdx
+        # with _kernel_build_mode = 1), boots under QEMU, and asserts:
+        #
+        #   1. Fingerprint: every line in tests/release/expected-release-
+        #      boot.txt appears in order (banner + copyright + a system-
+        #      ready line). Same contains-in-order semantics every other
+        #      mode uses.
+        #
+        #   2. Line-count budget: the release boot fits in
+        #      RELEASE_LINE_BUDGET lines (default 40). A regression that
+        #      unmuted the witness stream would blow through the budget
+        #      immediately (test mode is ~530 lines).
+        #
+        #   3. Zero R__ / M__-___ identifiers: no line matches
+        #      `\bR[0-9]+\b` or `\bM[0-9]+-[0-9]+\b`. The banner_art
+        #      copyright includes a numeric year (2026) that must not
+        #      match this pattern by construction, and the release
+        #      preamble/ready lines are already free of round tags.
+        #
+        #   4. Zero raw hex TSC timestamps: no line contains a 16-hex-
+        #      digit run followed by `|` (klog's TSC column format). A
+        #      regression that unmuted klog's drain-to-UART would trip
+        #      this immediately.
+        #
+        # Non-vacuousness (R49.M3-001 acceptance criterion): trip any
+        # one of the four gates by re-emitting a raw uart_puts of a
+        # dev message inside the release presentation and observe the
+        # mode fail. See design/kernel/boot-presentation.md §7.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/release/expected-release-boot.txt"
+        TIMEOUT=10
+        EXPECTED=""
+        BUILD_MODE_OVERRIDE=release
+        CHECK_RELEASE_BUDGET=1
+        : "${RELEASE_LINE_BUDGET:=40}"
+        ;;
     prod)
         # prod mode: expects exit code 2 (kernel didn't build)
         # Skip verification, just exit with code 2
@@ -970,9 +1010,22 @@ fi
 # with nothing in the default pre-push matrix exercising them. The
 # main boot_panic mode uses the FULL kernel and covers the panic-
 # emission chain already; no coverage was lost.
-if ! "${REPO_ROOT}/tools/build.sh" >/dev/null 2>&1; then
-    echo "smoke: build failed" >&2
-    exit 2
+# R49.M3-001 (#1576): pass PAIDEIA_BUILD_MODE through when the mode
+# dispatcher sets BUILD_MODE_OVERRIDE (currently only boot_release).
+# Every other mode inherits the caller's environment unchanged, so the
+# 14-mode witness matrix keeps building in TEST mode as before.
+BUILD_MODE_OVERRIDE="${BUILD_MODE_OVERRIDE:-}"
+CHECK_RELEASE_BUDGET="${CHECK_RELEASE_BUDGET:-0}"
+if [[ -n "${BUILD_MODE_OVERRIDE}" ]]; then
+    if ! PAIDEIA_BUILD_MODE="${BUILD_MODE_OVERRIDE}" "${REPO_ROOT}/tools/build.sh" >/dev/null 2>&1; then
+        echo "smoke: build failed (PAIDEIA_BUILD_MODE=${BUILD_MODE_OVERRIDE})" >&2
+        exit 2
+    fi
+else
+    if ! "${REPO_ROOT}/tools/build.sh" >/dev/null 2>&1; then
+        echo "smoke: build failed" >&2
+        exit 2
+    fi
 fi
 KERNEL="${REPO_ROOT}/build/kernel.elf"
 
@@ -1169,6 +1222,34 @@ if [[ ${FINGERPRINT_MODE} -eq 1 ]]; then
     done < "${FINGERPRINT_FILE}"
 
     echo "smoke: fingerprint check passed (all ${line_num} lines found in order)"
+
+    # R49.M3-001 (#1576): release-mode extended assertions. Runs ONLY
+    # for modes that set CHECK_RELEASE_BUDGET (boot_release). All four
+    # gates operate on the SAME serial log the fingerprint check just
+    # ran against.
+    if [[ ${CHECK_RELEASE_BUDGET} -eq 1 ]]; then
+        release_line_count=$(wc -l < "${LOG}")
+        if [[ ${release_line_count} -gt ${RELEASE_LINE_BUDGET} ]]; then
+            echo "smoke: release-mode line budget exceeded (${release_line_count} > ${RELEASE_LINE_BUDGET}); see design/kernel/boot-presentation.md §6" >&2
+            exit 1
+        fi
+        # Zero R__ / M__-___ round or milestone identifiers. Excludes
+        # the banner_art copyright year (four digits, no leading R/M).
+        if grep -Eq '\b(R[0-9]+|M[0-9]+-[0-9]+)\b' "${LOG}"; then
+            echo "smoke: release log contains a round/milestone identifier — regression against R49.M2-002 (#1574)" >&2
+            grep -Enm 3 '\b(R[0-9]+|M[0-9]+-[0-9]+)\b' "${LOG}" >&2 || true
+            exit 1
+        fi
+        # Zero raw hex TSC timestamps. klog's TSC column is 16 hex
+        # digits immediately followed by `|` — no other release-visible
+        # line has that shape.
+        if grep -Eq '[0-9a-f]{16}\|' "${LOG}"; then
+            echo "smoke: release log contains a raw hex TSC timestamp — klog drain unmuted?" >&2
+            grep -Enm 3 '[0-9a-f]{16}\|' "${LOG}" >&2 || true
+            exit 1
+        fi
+        echo "smoke: release-mode gates passed (lines=${release_line_count}, budget=${RELEASE_LINE_BUDGET}, no round/hex tags)"
+    fi
     exit 0
 fi
 

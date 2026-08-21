@@ -1,0 +1,265 @@
+// src/kernel/core/drivers/color/gpu_convert.pdx -- G6.M2-001 (#1514)
+//
+// GPU compute colorspace conversion pipelines. Six named 3x3 RGB->RGB
+// primaries-conversion matrices the compositor uploads to its
+// compute renderer:
+//
+//   sRGB    <-> Rec.2020         (both directions)
+//   Display-P3 <-> Rec.2020      (both directions)
+//   Rec.709 <-> Rec.2020         (both directions)
+//
+// Every conversion goes THROUGH scRGB-linear (drivers/color/scrgb.pdx)
+// -- the compositor never chains primaries conversions directly. This
+// module holds the pre-multiplied 3x3s that go from linear source
+// primaries to linear scRGB (D65) and from linear scRGB back to
+// linear target primaries.
+//
+// This module is NOT the shader (paideia-as v0.31 will bind that);
+// this module is the numeric TABLE the shader loads, in a form the
+// compositor can hash + verify + cache-key against a KIND_COLOR_PROFILE.
+//
+// =============================================================================
+// SECTION 0  UNITS AND FIXED-POINT DISCIPLINE
+// =============================================================================
+//
+// Matrix coefficients are Q0.30 signed fixed-point in one u64 word:
+// bit[63] = sign, bits[62:30] = magnitude MSB (unused for Q0.30),
+// bits[29:0] = fraction. Small integer magnitudes (up to ~2) are
+// representable; the compositor sanitizes any coefficient above the
+// two-magnitude bound at load time. Multiplication happens in the
+// shader; this module is the coefficient table + the (submit_hash)
+// derivation the profile cap keys on.
+//
+// The four coefficient rows for each conversion are 9 u64 words
+// (matrix) + 1 u64 word (submit_hash) = 80 bytes = 10 u64.
+//
+// =============================================================================
+// SECTION 1  FAILURE TAXONOMY 0xFFFFED90..0xFFFFED9F
+// =============================================================================
+
+module GpuConvert = structure {
+
+  // Conversion ordinals.
+  pub let GCV_SRGB_TO_2020    : u64 = 1
+  pub let GCV_2020_TO_SRGB    : u64 = 2
+  pub let GCV_P3_TO_2020      : u64 = 3
+  pub let GCV_2020_TO_P3      : u64 = 4
+  pub let GCV_REC709_TO_2020  : u64 = 5
+  pub let GCV_2020_TO_REC709  : u64 = 6
+  pub let GCV_MAX             : u64 = 6
+
+  pub let GCV_OK              : u64 = 0
+  pub let GCV_BAD_ORD         : u64 = 0xFFFFED9F
+  pub let GCV_BAD_MATRIX      : u64 = 0xFFFFED9E
+  pub let GCV_BAD_SLOT        : u64 = 0xFFFFED9D
+
+  pub let GCV_MATRIX_WORDS    : u64 = 9
+  pub let GCV_ROW_WORDS       : u64 = 10           // 9 matrix + 1 hash
+
+  // Precomputed coefficient tables. Six conversions * 10 u64 = 60.
+  // Confined by tools/build.sh. Coefficients are placeholders in this
+  // structural landing; the shader binding at paideia-as v0.31 will
+  // fill them from the reference-display state -- what this module
+  // guarantees is the shape.
+  pub let mut _gpu_convert_matrices : [u64; 60] = uninit @align(64)
+  pub let mut _gpu_convert_stats    : [u64; 4]  = uninit @align(64)
+
+  pub let GCV_ST_UPLOADS  : u64 = 0
+  pub let GCV_ST_HITS     : u64 = 1
+  pub let GCV_ST_MISSES   : u64 = 2
+  pub let GCV_ST_REFUSED  : u64 = 3
+
+  pub let gcv_stats_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M2-001 (#1514): clear matrix cache + counters.",
+      block: {
+        lea r10, [rip + _gpu_convert_matrices];
+        xor rax, rax;
+        xor rcx, rcx;
+      gcv_rs_mat:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 60;
+        jb  gcv_rs_mat;
+        lea r10, [rip + _gpu_convert_stats];
+        xor rcx, rcx;
+      gcv_rs_stat:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  gcv_rs_stat;
+        ret
+      }
+    }
+
+  pub let gcv_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M2-001 (#1514): counter bump.",
+      block: {
+        cmp rdi, 4;
+        jae gcv_nt_out;
+        lea r10, [rip + _gpu_convert_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      gcv_nt_out:
+        ret
+      }
+    }
+
+  pub let gcv_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M2-001 (#1514): counter read.",
+      block: {
+        cmp rdi, 4;
+        jae gcv_st_zero;
+        lea r10, [rip + _gpu_convert_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      gcv_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let gcv_ord_valid : (u64) -> u64 !{} @{} =
+    fn (o: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "G6.M2-001 (#1514): 1 iff o in [1, 6].",
+      block: {
+        cmp rdi, 0;
+        je  gcv_ov_no;
+        mov r10, 6;
+        cmp rdi, r10;
+        ja  gcv_ov_no;
+        mov rax, 1;
+        ret;
+      gcv_ov_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // gcv_upload(ord, matrix_ptr, hash) -> ok | err.
+  // Copies 9 matrix words + hash from caller-supplied pointer into
+  // the cache slot for `ord`. The caller has already sanitized the
+  // coefficient magnitudes.
+  pub let gcv_upload : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (ord: u64) (mptr: u64) (hash: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M2-001 (#1514): install a conversion matrix into the cache slot for ord. Five-push discipline for rsp%16 == 0 before inner calls.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rdi;
+        mov r13, rsi;
+        mov r14, rdx;
+
+        mov rdi, r12;
+        call gcv_ord_valid;
+        cmp rax, 0;
+        je  gcv_up_bad;
+
+        // Base = matrices + (ord-1) * 10 * 8.
+        mov rax, r12;
+        sub rax, 1;
+        imul rax, rax, 80;
+        lea r10, [rip + _gpu_convert_matrices];
+        add r10, rax;
+
+        xor rbx, rbx;
+      gcv_up_copy:
+        mov rax, [r13 + rbx * 8];
+        mov [r10 + rbx * 8], rax;
+        add rbx, 1;
+        cmp rbx, 9;
+        jb  gcv_up_copy;
+        mov [r10 + 72], r14;                // hash
+
+        mov rdi, 0;
+        call gcv_note;
+        xor rax, rax;
+        jmp gcv_up_out;
+
+      gcv_up_bad:
+        mov rdi, 3;
+        call gcv_note;
+        mov rax, 0xFFFFED9F;
+
+      gcv_up_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // gcv_hash(ord) -> submit_hash | 0 if empty.
+  pub let gcv_hash : (u64) -> u64 !{mem} @{} =
+    fn (ord: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M2-001 (#1514): fetch submit_hash for ord.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        mov rdi, r12;
+        call gcv_ord_valid;
+        cmp rax, 0;
+        je  gcv_ha_zero;
+        mov rax, r12;
+        sub rax, 1;
+        imul rax, rax, 80;
+        lea r10, [rip + _gpu_convert_matrices];
+        add r10, rax;
+        mov rax, [r10 + 72];
+        jmp gcv_ha_out;
+      gcv_ha_zero:
+        xor rax, rax;
+      gcv_ha_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // gcv_coeff(ord, idx) -> coefficient word | 0.
+  pub let gcv_coeff : (u64, u64) -> u64 !{mem} @{} =
+    fn (ord: u64) (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M2-001 (#1514): read one matrix coefficient. Three-push discipline for rsp%16 == 0 before inner call.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        mov r12, rdi;
+        mov r13, rsi;
+        mov rdi, r12;
+        call gcv_ord_valid;
+        cmp rax, 0;
+        je  gcv_co_zero;
+        cmp r13, 9;
+        jae gcv_co_zero;
+        mov rax, r12;
+        sub rax, 1;
+        imul rax, rax, 80;
+        lea r10, [rip + _gpu_convert_matrices];
+        add r10, rax;
+        mov rax, [r10 + r13 * 8];
+        jmp gcv_co_out;
+      gcv_co_zero:
+        xor rax, rax;
+      gcv_co_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
