@@ -5236,6 +5236,52 @@ fi
 echo "[g1-m2-confine] G1.M2 (VRR range + channel + driver) state confined"
 
 # ---------------------------------------------------------------------------
+# G2.M1-001..005 (#1443-#1447) + G2.M2-001..004 (#1448-#1451)
+# + G2.M3-001..004 (#1453-#1456): DIRECT-SCANOUT LEASE + CHANNEL +
+# DRIVER CONFINEMENT.
+#
+# Three modules open G2 on top of G1: kind_scanout_lease (the
+# leased LINEAR authority over KIND_DISPLAY_PLANE, row table +
+# state transitions), scanout_lease_channel (the request_lease /
+# present / release RPC schema, session-typed FSM), and
+# drivers/dpy/scanout (grant policy, format matrix, HDR attach,
+# reserved-plane invariant, expiry sweep, fallback).  Each owns
+# its own state; tools/build.sh confines relocations against each
+# so a second writer cannot forge a lease row, invent a channel
+# counter, or advance a lease state without going through the
+# state-transition selector exported by kind_scanout_lease.pdx.
+#
+# The driver relocates against _scanout_lease_table via the
+# exported sl_row_transition + sl_row_state + sl_row_expiry
+# selectors -- NOT against the table symbol itself -- so its .o
+# stays a valid second writer of the row-state ordinal without
+# being able to reshape the row layout.
+G2_KSL_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_scanout_lease.pdx"
+G2_SLC_SRC="${REPO_ROOT}/src/kernel/core/ipc/scanout_lease_channel.pdx"
+G2_SCN_SRC="${REPO_ROOT}/src/kernel/core/drivers/dpy/scanout.pdx"
+if [[ ! -f "${G2_KSL_SRC}" || ! -f "${G2_SLC_SRC}" || ! -f "${G2_SCN_SRC}" ]]; then
+    echo "[g2-confine] FAIL - one of the G2 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_scanout_lease_table' 'core/cap/kind_scanout_lease.o'
+ec_confine_one '_scanout_lease_stats' 'core/cap/kind_scanout_lease.o'
+ec_confine_one '_slc_stats'           'core/ipc/scanout_lease_channel.o'
+ec_confine_one '_scanout_stats'       'core/drivers/dpy/scanout.o'
+ec_confine_one '_scanout_in_flight'   'core/drivers/dpy/scanout.o'
+ec_confine_one '_scanout_hdr_pending' 'core/drivers/dpy/scanout.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_scanout_lease.pdx §2, scanout_lease_channel.pdx" >&2
+    echo "  §0 and drivers/dpy/scanout.pdx §0 for the row/counter" >&2
+    echo "  one-writer discipline.  The driver reaches the row only" >&2
+    echo "  through sl_row_transition + sl_row_state + sl_row_expiry" >&2
+    echo "  (all exported from kind_scanout_lease.pdx), so the driver" >&2
+    echo "  .o relocates against those selector symbols and NOT" >&2
+    echo "  against _scanout_lease_table itself." >&2
+    exit 1
+fi
+echo "[g2-confine] G2 (scanout lease + channel + driver) state confined"
+
+# ---------------------------------------------------------------------------
 # R47.M1..M5 (#1412/#1413/#1414/#1415/#1416/#1417/#1418/#1419/
 #             #1421/#1422/#1423/#1424): Intel VMD driver substrate --
 # vmd_probe, vmd_endpoint_enum, kind_vmd_endpoint, vmd_root_complex,

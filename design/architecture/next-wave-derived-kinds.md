@@ -2306,16 +2306,17 @@ otherwise noted.
 | 0x184  | `KIND_BT_L2CAP_CHANNEL`  | `KIND_IPC_ENDPOINT = 5`           | Live L2CAP channel (cid, psm, mtu, credits) over an HCI transport slice.                    | derived (QUERY-only ops)      | 0xFFFFF100..0F      | `kind_bt_l2cap_channel.pdx`     |
 | 0x185  | `KIND_DISPLAY_TIMELINE`  | `KIND_HW = 14`                    | G1 opener: drm-syncobj-shaped display timeline, one per (engine, output). Signalled by vblank ISR (G1.M1-003), waited on via `wait_scanout` (G1.M1-004). The primitive that makes P1 (no implicit sync) expressible across the G-round. Rights include `R_DPT_WRITE` (signal authority) but `R_MINT` is ABSENT — leaf kind. | derived (QUERY-only ops; signal helper exposed) | 0xFFFFF6A0..AF | `kind_display_timeline.pdx` |
 | 0x186  | `KIND_VRR_RANGE`         | `KIND_DISPLAY_MODE = 0x172` (over `KIND_MEMORY = 4`) | G1.M2: Variable Refresh Rate range for one output (min_refresh_mhz, max_refresh_mhz, min_frametime_ns). Minted from the DPCD 0x00080 probe cross-checked against the EDID range descriptor (G1.M2-001 #1432). Consumed by adaptive-sync arming on the modeset transaction (G1.M2-004 #1435). Units are mHz throughout to represent fractional-Hz DP §3.5.2.6 ranges without lossy conversion. | derived (QUERY-only ops) | 0xFFFFF670..7F | `kind_vrr_range.pdx` |
+| 0x188  | `KIND_SCANOUT_LEASE`     | `KIND_DISPLAY_PLANE = 0x173` (over `KIND_MEMORY = 4`) | G2 opener: the leased, LINEAR authority to scan out ONE display plane directly for a fullscreen client, without a compositor round-trip. Row tail: `{output_slot:u8, timeline_slot:u8, plane_slot:u16, state:u8, lease_ns_expiry:u64}`. Three states — GRANTED (1), REVOKED (2), EXPIRED (3) — transitioning only out of GRANTED. Mint refuses a zero timeline_slot (P1: implicit sync forbidden), a zero expiry (G2.M3-002 safety-net auto-revoke needs a deadline), and any plane_slot == SL_RESERVED_PLANE_SLOT (P8: pipe 0's primary plane is reserved for the recovery console; refused with SL_MINT_RESERVED = 0xFFFFF615 rather than a generic BAD_PLANE so the operator sees the P8 rule). Rights include neither `R_MINT` — leaf kind — so the direct-scanout tree cannot deepen. The scanout driver (`drivers/dpy/scanout.pdx`) is the ONE other writer of the row table, and only through the `sl_row_transition` selector. | derived (QUERY-only ops; grant/revoke/expiry helpers exposed) | 0xFFFFF611..1D (SHARED with `cache_policy.pdx` 0xFFFFF610/61E/61F markers) | `kind_scanout_lease.pdx` |
 
 ### Summary counts and free bands
 
-- **Derived-kind values landed:** 51 (0x140..0x142, 0x150..0x186; 0x143..0x14F reserved).
+- **Derived-kind values landed:** 52 (0x140..0x142, 0x150..0x186, 0x188; 0x143..0x14F reserved; 0x187 KIND_VMD_ENDPOINT).
 - **Base kinds parented over:** `KIND_MEMORY = 4` (7 kinds), `KIND_IPC_ENDPOINT = 5` (21 kinds), `KIND_DEVICE = 10` (13 kinds), `KIND_IO_PORT = 11` (co-parent for `KIND_OP_REGION`), `KIND_HW = 14` (2 kinds), plus derived-parent chains: `KIND_HW_INTERRUPT`, `KIND_I2C_BUS`, `KIND_USB_DEVICE`, `KIND_USB_INTERFACE`, `KIND_USB_ENDPOINT`, `KIND_MSC_LUN`.
 - **LINEAR kinds (5):** `KIND_MODESET_TXN`, `KIND_GPU_CONTEXT`, `KIND_GPU_SUBMIT`, `KIND_WIFI_SCAN_TXN`, plus the identity-LINEAR discipline on `KIND_AUDIO_ROUTE`.
 - **SEALED kinds (2):** `KIND_WIFI_KEY`, `KIND_BT_PAIRING`.
 - **Linearizable-on-object (1):** `KIND_FW_SESSION` (the arbitration is on the object, not the session cap).
 - **QUERY-only kinds (4):** `KIND_CSI_CAMERA`, `KIND_IPU6_STREAM`, `KIND_WWAN_MODEM`, `KIND_MBIM_SESSION` (R40 pattern — identity fields frozen at mint; the only mutator is the revoke helper).
-- **Next free derived-kind tag:** `0x187` (opens G2).
+- **Next free derived-kind tag:** `0x189` (opens G3).
 - **Adjacent-below free failure band:** `0xFFFFF170..7F` (16-wide; reserved for the R41 opener). `0xFFFFF180..8F` was allocated at R40.M5-001 (#1363) for `core/audit/audit_schema.pdx`.
 
 ### Migration table — audit-emit sites still on `drv_audit_emit`
