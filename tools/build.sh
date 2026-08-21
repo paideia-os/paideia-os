@@ -5337,6 +5337,107 @@ fi
 echo "[g3-confine] G3 (VK surface + swapchain image + channels + drivers) state confined"
 
 # ---------------------------------------------------------------------------
+# G5.M1-001..005 (#1491-#1495) + G5.M2-001..005 (#1496-#1500)
+# + G5.M3-001..004 (#1501-#1504) + G5.M4-001..004 (#1505-#1508):
+# SDF FONT ATLAS + TEXT SHAPE CONFINEMENT.
+#
+# Eight modules open G5 on top of G3 + G4: kind_font_atlas (the on-
+# GPU atlas texture cap over KIND_GPU_BO), kind_text_shape (the
+# immutable shaped-run cap over KIND_MEMORY), drivers/text/sdf (SDF/
+# MSDF generator + format-selection heuristic), drivers/text/shaper
+# (OT-feature engine + BiDi + Indic clustering + hinting), drivers/
+# text/subpixel (fractional-scale sub-pixel positioning + cache
+# invalidation), drivers/text/color_emoji (COLR/CPAL, SBIX, CBDT
+# strike selection), ipc/font_load_channel (load / subset / evict
+# RPC schema), ipc/text_shape_channel (shape / invalidate / features
+# _hash RPC schema).
+G5_KFA_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_font_atlas.pdx"
+G5_KTS_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_text_shape.pdx"
+G5_SDF_SRC="${REPO_ROOT}/src/kernel/core/drivers/text/sdf.pdx"
+G5_SHP_SRC="${REPO_ROOT}/src/kernel/core/drivers/text/shaper.pdx"
+G5_SPX_SRC="${REPO_ROOT}/src/kernel/core/drivers/text/subpixel.pdx"
+G5_CE_SRC="${REPO_ROOT}/src/kernel/core/drivers/text/color_emoji.pdx"
+G5_FLC_SRC="${REPO_ROOT}/src/kernel/core/ipc/font_load_channel.pdx"
+G5_TSC_SRC="${REPO_ROOT}/src/kernel/core/ipc/text_shape_channel.pdx"
+if [[ ! -f "${G5_KFA_SRC}" || ! -f "${G5_KTS_SRC}" || ! -f "${G5_SDF_SRC}" \
+    || ! -f "${G5_SHP_SRC}" || ! -f "${G5_SPX_SRC}" || ! -f "${G5_CE_SRC}" \
+    || ! -f "${G5_FLC_SRC}" || ! -f "${G5_TSC_SRC}" ]]; then
+    echo "[g5-confine] FAIL - one of the G5 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_font_atlas_table'          'core/cap/kind_font_atlas.o'
+ec_confine_one '_font_atlas_stats'          'core/cap/kind_font_atlas.o'
+ec_confine_one '_text_shape_table'          'core/cap/kind_text_shape.o'
+ec_confine_one '_text_shape_stats'          'core/cap/kind_text_shape.o'
+ec_confine_one '_sdf_gen_state'             'core/drivers/text/sdf.o'
+ec_confine_one '_sdf_gen_stats'             'core/drivers/text/sdf.o'
+ec_confine_one '_shaper_state'              'core/drivers/text/shaper.o'
+ec_confine_one '_shaper_stats'              'core/drivers/text/shaper.o'
+ec_confine_one '_subpx_cache'               'core/drivers/text/subpixel.o'
+ec_confine_one '_subpx_stats'               'core/drivers/text/subpixel.o'
+ec_confine_one '_ce_state'                  'core/drivers/text/color_emoji.o'
+ec_confine_one '_ce_stats'                  'core/drivers/text/color_emoji.o'
+ec_confine_one '_flc_stats'                 'core/ipc/font_load_channel.o'
+ec_confine_one '_tsc_stats'                 'core/ipc/text_shape_channel.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_font_atlas.pdx §2, kind_text_shape.pdx §2," >&2
+    echo "  drivers/text/*.pdx section 0, ipc/font_load_channel.pdx §0," >&2
+    echo "  and ipc/text_shape_channel.pdx §0 for the one-writer discipline." >&2
+    exit 1
+fi
+echo "[g5-confine] G5 (font atlas + text shape + drivers + channels) state confined"
+
+# ---------------------------------------------------------------------------
+# G4.M1-001..005 (#1475-#1479) + G4.M2-001..005 (#1480-#1484)
+# + G4.M3-001..003 (#1485-#1487) + G4.M4-001..002 (#1488, #1489):
+# VELLO 2D COMPUTE-RENDER CONFINEMENT.
+#
+# Eight modules open G4 on top of G3 + G5: kind_vello_scene (the
+# encoded 2D scene cap), kind_vello_renderer (the compute renderer
+# cap), vello_render_channel (encode / submit / await RPC),
+# vello_scene_encoder (encoder + upload seam), vello_pipeline
+# (STROKE + FILL + BLEND stages), vello_cpu_fallback (llvmpipe-
+# equivalent + hash gate), vello_effects (gradient / blur / dash /
+# arrow / marker), vello_tiling (coarsening + occupancy).
+G4_KVS_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_vello_scene.pdx"
+G4_KVR_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_vello_renderer.pdx"
+G4_VRC_SRC="${REPO_ROOT}/src/kernel/core/ipc/vello_render_channel.pdx"
+G4_VSE_SRC="${REPO_ROOT}/src/kernel/core/drivers/vello/vello_scene_encoder.pdx"
+G4_VP_SRC="${REPO_ROOT}/src/kernel/core/drivers/vello/vello_pipeline.pdx"
+G4_VCF_SRC="${REPO_ROOT}/src/kernel/core/drivers/vello/vello_cpu_fallback.pdx"
+G4_VE_SRC="${REPO_ROOT}/src/kernel/core/drivers/vello/vello_effects.pdx"
+G4_VT_SRC="${REPO_ROOT}/src/kernel/core/drivers/vello/vello_tiling.pdx"
+if [[ ! -f "${G4_KVS_SRC}" || ! -f "${G4_KVR_SRC}" || ! -f "${G4_VRC_SRC}" \
+    || ! -f "${G4_VSE_SRC}" || ! -f "${G4_VP_SRC}" || ! -f "${G4_VCF_SRC}" \
+    || ! -f "${G4_VE_SRC}" || ! -f "${G4_VT_SRC}" ]]; then
+    echo "[g4-confine] FAIL - one of the G4 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_vello_scene_table'    'core/cap/kind_vello_scene.o'
+ec_confine_one '_vello_scene_stats'    'core/cap/kind_vello_scene.o'
+ec_confine_one '_vello_renderer_table' 'core/cap/kind_vello_renderer.o'
+ec_confine_one '_vello_renderer_stats' 'core/cap/kind_vello_renderer.o'
+ec_confine_one '_vrc_stats'            'core/ipc/vello_render_channel.o'
+ec_confine_one '_vse_state'            'core/drivers/vello/vello_scene_encoder.o'
+ec_confine_one '_vse_stats'            'core/drivers/vello/vello_scene_encoder.o'
+ec_confine_one '_vp_ring'              'core/drivers/vello/vello_pipeline.o'
+ec_confine_one '_vp_stats'             'core/drivers/vello/vello_pipeline.o'
+ec_confine_one '_vp_next_id'           'core/drivers/vello/vello_pipeline.o'
+ec_confine_one '_vcf_state'            'core/drivers/vello/vello_cpu_fallback.o'
+ec_confine_one '_vcf_stats'            'core/drivers/vello/vello_cpu_fallback.o'
+ec_confine_one '_ve_ring'              'core/drivers/vello/vello_effects.o'
+ec_confine_one '_ve_stats'             'core/drivers/vello/vello_effects.o'
+ec_confine_one '_vt_state'             'core/drivers/vello/vello_tiling.o'
+ec_confine_one '_vt_stats'             'core/drivers/vello/vello_tiling.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_vello_scene.pdx §2, kind_vello_renderer.pdx §2," >&2
+    echo "  vello_render_channel.pdx §0, and drivers/vello/*.pdx §0" >&2
+    echo "  for the one-writer discipline." >&2
+    exit 1
+fi
+echo "[g4-confine] G4 (Vello scene + renderer + channel + drivers) state confined"
+
+# ---------------------------------------------------------------------------
 # R47.M1..M5 (#1412/#1413/#1414/#1415/#1416/#1417/#1418/#1419/
 #             #1421/#1422/#1423/#1424): Intel VMD driver substrate --
 # vmd_probe, vmd_endpoint_enum, kind_vmd_endpoint, vmd_root_complex,
