@@ -1,0 +1,705 @@
+// src/kernel/core/fs/pdxfs/snap_prune.pdx -- R42.M3-004 (#1391)
+//
+// PDXFS v1 SNAPSHOT -- RETENTION POLICY + PRUNE.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the AUTHORITY on the delete side of a snapshot's lifecycle.
+// snap_create.pdx is append-only; snap_prune.pdx is the sole path by
+// which a snapshot leaves the chain. Three retention policies:
+//
+//   SNP_POLICY_LAST N       keep the N most-recent snapshots by ts.
+//   SNP_POLICY_DAILY N      keep the N most-recent whose ts is on a
+//                            daily boundary (ts & 1 == 0 in the
+//                            scaffold, replacing "ts % 86400 == 0"
+//                            with an equivalent power-of-two check).
+//   SNP_POLICY_WEEKLY N     keep the N most-recent whose ts is on a
+//                            weekly boundary (ts & 7 == 0 in the
+//                            scaffold, equivalent to "ts % 604800").
+//
+// Every pruned snapshot decrements a scaffold-local refcount total
+// (_snp_state refdec_total) by SNP_EXCLUSIVE_BLOCKS. A widening will
+// call pxrc_dec on the actual exclusive-block list; the counter this
+// module bumps IS that call count on the scaffold. Keeping the
+// accounting local means the R42.M3 witnesses do not have to reset
+// pxrc, and the widening lands as ONE edit here (turning the counter
+// bump into the pxrc_dec loop).
+//
+// It is a SCAFFOLD (D7). The snapshot table is a flat 16-entry ts
+// array in BSS driven by a test-only seeder; a widening replaces it
+// with a scan of snap_create.pdx's chain (or the on-disk snapshot
+// superblock chain after the on-disk widening lands).
+//
+// It does NOT hand deletion decisions to the caller. snp_prune runs
+// the whole retention pass in one call; a two-step API ("preview
+// then commit") would let a caller commit a different set than the
+// preview reported.
+//
+// It does NOT touch snap_create's chain or snap_mount_ro's mounts.
+// A widening will unbind mounts and unregister names when the chain
+// entry goes; the scaffold leaves the coupling for the widening so
+// the module remains self-contained.
+//
+// =============================================================================
+// §1  TABLE GEOMETRY
+// =============================================================================
+//
+// SNP_MAX                = 16      snapshot slot capacity (scaffold).
+// SNP_EXCLUSIVE_BLOCKS   = 4       accounting decrement per prune.
+//
+// _snp_ts is a flat array of SNP_MAX u64s. A slot with value 0 is
+// EMPTY. A slot with any non-zero value holds the snapshot's ts;
+// snp_seed(idx, 0) clears a slot without going through the retention
+// path, and snp_seed(idx, ts) with ts != 0 installs a snapshot.
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _snp_ts and _snp_state are written only by helpers in this module.
+// tools/build.sh confines relocations against each to
+// `core/fs/pdxfs/snap_prune.o`. A second writer would let a caller
+// "quiet a retention decision" by planting a matching ts the pass
+// would then keep -- the whole delete-outside-policy story rests on
+// this table being written HERE and NOWHERE ELSE.
+//
+// STATE LAYOUT -- _snp_state : [u64; 8]
+//   +0    init_mark             0x5B1F once snp_reset has run
+//   +8    err                   sticky error latch
+//   +16   policy_kind           SNP_POLICY_NONE .. WEEKLY
+//   +24   policy_n              N argument for the policy
+//   +32   deleted_total         cumulative snapshots deleted
+//   +40   refdec_total          SNP_EXCLUSIVE_BLOCKS per deletion
+//   +48   live_count            current live slots (recomputed by prune)
+//   +56   last_prune_deleted    slots deleted by the most recent prune
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFEF50..0xFFFFEF5F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time. Adjacent used
+// band above: snap_diff 0xFFFFEF60..6F (R42.M3-003). Adjacent free
+// band below: unassigned.
+//
+//   SNP_OK                   = 0
+//   SNP_ERR_NOT_INIT         = 0xFFFFEF5F   accessor before snp_reset
+//   SNP_ERR_BAD_POLICY       = 0xFFFFEF5E   set_policy kind > WEEKLY
+//   SNP_ERR_BAD_N            = 0xFFFFEF5D   set_policy n > SNP_MAX
+//   SNP_ERR_BAD_IDX          = 0xFFFFEF5C   accessor idx >= SNP_MAX
+//   SNP_ERR_POLICY_UNSET     = 0xFFFFEF5B   prune before set_policy
+//   SNP_ERR_INTERNAL         = 0xFFFFEF5A   unreachable-fallthrough tripwire
+//
+// Reserved-label discipline: labels prefixed `snp_`.
+
+module SnapPrune = structure {
+
+  pub let SNP_MAX               : u64 = 16
+  pub let SNP_EXCLUSIVE_BLOCKS  : u64 = 4
+
+  pub let SNP_POLICY_NONE       : u64 = 0
+  pub let SNP_POLICY_LAST       : u64 = 1
+  pub let SNP_POLICY_DAILY      : u64 = 2
+  pub let SNP_POLICY_WEEKLY     : u64 = 3
+
+  pub let SNP_OK                : u64 = 0
+  pub let SNP_ERR_NOT_INIT      : u64 = 0xFFFFEF5F
+  pub let SNP_ERR_BAD_POLICY    : u64 = 0xFFFFEF5E
+  pub let SNP_ERR_BAD_N         : u64 = 0xFFFFEF5D
+  pub let SNP_ERR_BAD_IDX       : u64 = 0xFFFFEF5C
+  pub let SNP_ERR_POLICY_UNSET  : u64 = 0xFFFFEF5B
+  pub let SNP_ERR_INTERNAL      : u64 = 0xFFFFEF5A
+
+  pub let SNP_INIT_MARK         : u64 = 0x5B1F
+
+  pub let mut _snp_ts    : [u64; 16] = uninit @align(64)
+  pub let mut _snp_state : [u64; 8]  = uninit @align(64)
+
+  // ==========================================================================
+  // Reset. Clears ts + state; installs init_mark. policy_kind stays
+  // SNP_POLICY_NONE until set_policy.
+  // ==========================================================================
+
+  pub let snp_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M3-004 (#1391): clear ts + state, install init_mark. Labels prefixed snp_rst_.",
+      block: {
+        lea r10, [rip + _snp_ts];
+        xor rax, rax;
+        xor rcx, rcx;
+      snp_rst_t:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  snp_rst_t;
+
+        lea r10, [rip + _snp_state];
+        xor rcx, rcx;
+      snp_rst_s:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  snp_rst_s;
+
+        mov rax, 0x5B1F;
+        mov [r10 + 0], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let snp_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M3-004 (#1391): 1 iff init_mark matches. Labels prefixed snp_bnd_.",
+      block: {
+        lea r10, [rip + _snp_state];
+        mov rax, [r10 + 0];
+        mov r11, 0x5B1F;
+        cmp rax, r11;
+        jne snp_bnd_no;
+        mov rax, 1;
+        ret;
+      snp_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let snp_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M3-004 (#1391): sticky error latch readback.",
+      block: {
+        lea r10, [rip + _snp_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let snp_set_err : (u64) -> () !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M3-004 (#1391): first-writer-wins error latch. Labels prefixed snp_se_.",
+      block: {
+        lea r10, [rip + _snp_state];
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        jne snp_se_out;
+        mov [r10 + 8], rdi;
+      snp_se_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Field readbacks.
+  // ==========================================================================
+
+  pub let snp_capacity : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R42.M3-004 (#1391): SNP_MAX as u64.",
+      block: {
+        mov rax, 16;
+        ret
+      }
+    } @no_frame
+
+  pub let snp_exclusive_blocks : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R42.M3-004 (#1391): SNP_EXCLUSIVE_BLOCKS as u64.",
+      block: {
+        mov rax, 4;
+        ret
+      }
+    } @no_frame
+
+  pub let snp_policy_kind : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M3-004 (#1391): policy_kind field.",
+      block: {
+        lea r10, [rip + _snp_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let snp_policy_n : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M3-004 (#1391): policy_n field.",
+      block: {
+        lea r10, [rip + _snp_state];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let snp_deleted_total : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M3-004 (#1391): deleted_total field.",
+      block: {
+        lea r10, [rip + _snp_state];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let snp_refdec_total : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M3-004 (#1391): refdec_total field.",
+      block: {
+        lea r10, [rip + _snp_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let snp_live_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M3-004 (#1391): live_count field.",
+      block: {
+        lea r10, [rip + _snp_state];
+        mov rax, [r10 + 48];
+        ret
+      }
+    } @no_frame
+
+  pub let snp_last_prune_deleted : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M3-004 (#1391): last_prune_deleted field.",
+      block: {
+        lea r10, [rip + _snp_state];
+        mov rax, [r10 + 56];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // snp_ts_at(idx) -> u64
+  //
+  // Read the timestamp at slot idx (0-based). 0 iff the slot is empty.
+  // Refuses:
+  //   - not init                    SNP_ERR_NOT_INIT
+  //   - idx >= SNP_MAX              SNP_ERR_BAD_IDX
+  // ==========================================================================
+
+  pub let snp_ts_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M3-004 (#1391): read ts at slot idx. Labels prefixed snp_ta_.",
+      block: {
+        lea r10, [rip + _snp_state];
+        mov rax, [r10 + 0];
+        mov r11, 0x5B1F;
+        cmp rax, r11;
+        jne snp_ta_ni;
+
+        cmp rdi, 16;
+        jae snp_ta_bi;
+
+        lea r11, [rip + _snp_ts];
+        mov rax, [r11 + rdi * 8];
+        ret;
+
+      snp_ta_ni:
+        mov rdi, 0xFFFFEF5F;
+        call snp_set_err;
+        xor rax, rax;
+        ret;
+      snp_ta_bi:
+        mov rdi, 0xFFFFEF5C;
+        call snp_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // snp_seed(idx, ts) -> u64
+  //
+  // Test seeder. Install ts at slot idx (ts == 0 clears the slot).
+  // Refuses:
+  //   - not init                    SNP_ERR_NOT_INIT
+  //   - idx >= SNP_MAX              SNP_ERR_BAD_IDX
+  // Returns 1 on success.
+  // ==========================================================================
+
+  pub let snp_seed : (u64, u64) -> u64 !{mem} @{} =
+    fn (idx: u64, ts: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M3-004 (#1391): test seeder for snapshot ts table. Labels prefixed snp_sd_.",
+      block: {
+        lea r10, [rip + _snp_state];
+        mov rax, [r10 + 0];
+        mov r11, 0x5B1F;
+        cmp rax, r11;
+        jne snp_sd_ni;
+
+        cmp rdi, 16;
+        jae snp_sd_bi;
+
+        lea r11, [rip + _snp_ts];
+        mov [r11 + rdi * 8], rsi;
+        mov rax, 1;
+        ret;
+
+      snp_sd_ni:
+        mov rdi, 0xFFFFEF5F;
+        call snp_set_err;
+        xor rax, rax;
+        ret;
+      snp_sd_bi:
+        mov rdi, 0xFFFFEF5C;
+        call snp_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // snp_set_policy(kind, n) -> u64
+  //
+  // Install retention policy. Refuses:
+  //   - not init                    SNP_ERR_NOT_INIT
+  //   - kind > SNP_POLICY_WEEKLY    SNP_ERR_BAD_POLICY
+  //   - n > SNP_MAX                 SNP_ERR_BAD_N
+  // Returns 1 on success. kind == SNP_POLICY_NONE (0) with n == 0
+  // deliberately UNsets the policy (subsequent prune refuses with
+  // SNP_ERR_POLICY_UNSET).
+  // ==========================================================================
+
+  pub let snp_set_policy : (u64, u64) -> u64 !{mem} @{} =
+    fn (kind: u64, n: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M3-004 (#1391): install retention policy. Labels prefixed snp_sp_.",
+      block: {
+        lea r10, [rip + _snp_state];
+        mov rax, [r10 + 0];
+        mov r11, 0x5B1F;
+        cmp rax, r11;
+        jne snp_sp_ni;
+
+        mov r11, 3;
+        cmp rdi, r11;
+        ja  snp_sp_bp;
+
+        mov r11, 16;
+        cmp rsi, r11;
+        ja  snp_sp_bn;
+
+        mov [r10 + 16], rdi;                    // policy_kind
+        mov [r10 + 24], rsi;                    // policy_n
+        mov rax, 1;
+        ret;
+
+      snp_sp_ni:
+        mov rdi, 0xFFFFEF5F;
+        call snp_set_err;
+        xor rax, rax;
+        ret;
+      snp_sp_bp:
+        mov rdi, 0xFFFFEF5E;
+        call snp_set_err;
+        xor rax, rax;
+        ret;
+      snp_sp_bn:
+        mov rdi, 0xFFFFEF5D;
+        call snp_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Internal helper: _snp_policy_mask(ts) -> u64
+  //
+  // 1 iff ts is on the current policy's bucket boundary. Undefined
+  // for policy_kind == NONE (caller must guard). policy:
+  //   LAST      always 1 (every slot eligible)
+  //   DAILY     ts & 1 == 0
+  //   WEEKLY    ts & 7 == 0
+  // The bit-mask formulation replaces "ts % 86400 == 0" and "ts %
+  // 604800 == 0" with equivalent power-of-two checks; a widening
+  // reinstates the wall-clock semantics with a DIV.
+  // ==========================================================================
+
+  pub let _snp_policy_mask : (u64) -> u64 !{mem} @{} =
+    fn (ts: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M3-004 (#1391): bucket-boundary mask for current policy. Labels prefixed snp_pm_.",
+      block: {
+        lea r10, [rip + _snp_state];
+        mov rax, [r10 + 16];                    // policy_kind
+        mov r11, 1;
+        cmp rax, r11;
+        je  snp_pm_last;
+        mov r11, 2;
+        cmp rax, r11;
+        je  snp_pm_daily;
+        mov r11, 3;
+        cmp rax, r11;
+        je  snp_pm_weekly;
+
+        // NONE or invalid: return 0.
+        xor rax, rax;
+        ret;
+
+      snp_pm_last:
+        mov rax, 1;
+        ret;
+      snp_pm_daily:
+        mov rax, rdi;
+        and rax, 1;
+        cmp rax, 0;
+        je  snp_pm_yes;
+        xor rax, rax;
+        ret;
+      snp_pm_weekly:
+        mov rax, rdi;
+        and rax, 7;
+        cmp rax, 0;
+        je  snp_pm_yes;
+        xor rax, rax;
+        ret;
+      snp_pm_yes:
+        mov rax, 1;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // snp_prune() -> u64
+  //
+  // Apply the current retention policy. For LAST N: keep the N slots
+  // with the largest ts. For DAILY N / WEEKLY N: consider only slots
+  // whose ts is on the policy's bucket boundary; keep the N largest
+  // of those. Every other live slot is DELETED (ts cleared, live_
+  // count decremented, deleted_total++, refdec_total +=
+  // SNP_EXCLUSIVE_BLOCKS).
+  //
+  // Threshold algorithm: iterate ts values; count how many candidate
+  // ts values exceed each candidate; the N-th largest is the one
+  // with COUNT_GREATER < N (i.e., N-1 or fewer strictly-greater
+  // candidates). Keep slots with ts >= threshold that pass the policy
+  // mask; delete the rest.
+  //
+  // Returns the number of slots deleted by THIS call (also written
+  // to state.last_prune_deleted).
+  //
+  // Refuses:
+  //   - not init                    SNP_ERR_NOT_INIT
+  //   - policy_kind == NONE         SNP_ERR_POLICY_UNSET
+  //
+  // Register plan: 4-push callee-save. rbx = threshold, rbp = idx,
+  // r12 = ts at idx, r13 = deleted counter for this call. Stack
+  // stays 16-aligned across nested calls to _snp_policy_mask.
+  // ==========================================================================
+
+  pub let snp_prune : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M3-004 (#1391): apply retention policy; delete slots outside kept set. Labels prefixed snp_pr_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+
+        lea r10, [rip + _snp_state];
+        mov rax, [r10 + 0];
+        mov r11, 0x5B1F;
+        cmp rax, r11;
+        jne snp_pr_ni;
+
+        mov rax, [r10 + 16];                    // policy_kind
+        cmp rax, 0;
+        je  snp_pr_pu;
+
+        // Compute threshold = N-th largest eligible ts. If fewer than
+        // N eligible ts values exist, threshold = 1 (every eligible
+        // slot is kept). Eligible = (ts != 0) AND policy_mask(ts).
+        //
+        // Threshold discovery: iterate rbp = idx in [0..16); for each
+        // slot ts_i, count how many DISTINCT-position eligible ts_j >
+        // ts_i. The smallest ts_i with count < N is the threshold. If
+        // no ts_i is eligible, threshold stays 0 -- nothing is kept
+        // (except that with no eligible ts values we DELETE nothing
+        // that was eligible; ineligible-but-live slots are always
+        // deleted under a non-LAST policy).
+        //
+        // Simplification: since SNP_MAX = 16, an O(16^2) scan is fine.
+        xor rbx, rbx;                           // threshold = 0
+
+        // Only compute a threshold if policy_n > 0.
+        mov rax, [r10 + 24];                    // policy_n
+        cmp rax, 0;
+        je  snp_pr_after_thresh;
+
+        xor rbp, rbp;                           // rbp = idx_i
+      snp_pr_ti:
+        cmp rbp, 16;
+        jae snp_pr_after_thresh;
+
+        lea r11, [rip + _snp_ts];
+        mov r12, [r11 + rbp * 8];
+        cmp r12, 0;
+        je  snp_pr_ti_next;
+
+        mov rdi, r12;
+        call _snp_policy_mask;
+        cmp rax, 0;
+        je  snp_pr_ti_next;
+
+        // r12 is candidate ts. Count strictly-greater eligible ts.
+        mov rcx, 0;                             // greater_count
+        mov r8, 0;                              // idx_j
+      snp_pr_tj:
+        cmp r8, 16;
+        jae snp_pr_tj_done;
+        lea r11, [rip + _snp_ts];
+        mov r9, [r11 + r8 * 8];
+        cmp r9, 0;
+        je  snp_pr_tj_next;
+        cmp r9, r12;
+        jbe snp_pr_tj_next_maybe_mask;
+        // r9 > r12; check mask.
+        push rcx;
+        push r8;
+        push r12;
+        push r13;
+        mov rdi, r9;
+        call _snp_policy_mask;
+        mov r11, rax;
+        pop r13;
+        pop r12;
+        pop r8;
+        pop rcx;
+        cmp r11, 0;
+        je  snp_pr_tj_next;
+        add rcx, 1;
+      snp_pr_tj_next:
+        add r8, 1;
+        jmp snp_pr_tj;
+      snp_pr_tj_next_maybe_mask:
+        add r8, 1;
+        jmp snp_pr_tj;
+      snp_pr_tj_done:
+        // rcx = number of strictly-greater eligible ts. If rcx <
+        // policy_n, r12 is the (rcx+1)-th largest, so keep it and
+        // consider it as a threshold candidate. Threshold = min ts
+        // among the top-N; equivalently the largest r12 with rcx <
+        // policy_n has the SMALLEST value in the kept set. Take the
+        // MINIMUM such r12 by tracking the smallest r12 seen.
+        lea r10, [rip + _snp_state];
+        mov rax, [r10 + 24];
+        cmp rcx, rax;
+        jae snp_pr_ti_next;
+        // Eligible for kept set. If rbx == 0 or r12 < rbx: rbx = r12.
+        cmp rbx, 0;
+        je  snp_pr_ti_upd;
+        cmp r12, rbx;
+        jae snp_pr_ti_next;
+      snp_pr_ti_upd:
+        mov rbx, r12;
+      snp_pr_ti_next:
+        add rbp, 1;
+        jmp snp_pr_ti;
+
+      snp_pr_after_thresh:
+        // Delete pass. For each live slot: keep iff (ts != 0) AND
+        // policy_mask(ts) AND (ts >= threshold) AND (threshold > 0).
+        // Else delete.
+        lea r10, [rip + _snp_state];
+        xor r13, r13;                           // deleted counter
+        xor rbp, rbp;
+      snp_pr_dp:
+        cmp rbp, 16;
+        jae snp_pr_dp_done;
+
+        lea r11, [rip + _snp_ts];
+        mov r12, [r11 + rbp * 8];
+        cmp r12, 0;
+        je  snp_pr_dp_next;                     // already empty
+
+        // Ineligible ts (mask==0) or ts < threshold or threshold==0
+        // -> delete. threshold==0 means "nothing eligible was found
+        // by the top-N scan", so every live slot is outside policy.
+        mov rdi, r12;
+        call _snp_policy_mask;
+        cmp rax, 0;
+        je  snp_pr_del;
+        cmp rbx, 0;
+        je  snp_pr_del;
+        cmp r12, rbx;
+        jb  snp_pr_del;
+        jmp snp_pr_dp_next;
+
+      snp_pr_del:
+        xor rax, rax;
+        lea r11, [rip + _snp_ts];
+        mov [r11 + rbp * 8], rax;
+        add r13, 1;
+      snp_pr_dp_next:
+        add rbp, 1;
+        jmp snp_pr_dp;
+
+      snp_pr_dp_done:
+        // Recompute live_count.
+        xor rcx, rcx;
+        xor r8, r8;                             // live counter
+      snp_pr_lc:
+        cmp rcx, 16;
+        jae snp_pr_lc_done;
+        lea r11, [rip + _snp_ts];
+        mov rax, [r11 + rcx * 8];
+        cmp rax, 0;
+        je  snp_pr_lc_next;
+        add r8, 1;
+      snp_pr_lc_next:
+        add rcx, 1;
+        jmp snp_pr_lc;
+
+      snp_pr_lc_done:
+        lea r10, [rip + _snp_state];
+        mov [r10 + 48], r8;                     // live_count
+        mov [r10 + 56], r13;                    // last_prune_deleted
+        mov r9, [r10 + 32];
+        add r9, r13;
+        mov [r10 + 32], r9;                     // deleted_total += r13
+        // refdec_total += r13 * SNP_EXCLUSIVE_BLOCKS (== r13 * 4).
+        mov r9, [r10 + 40];
+        mov r11, r13;
+        shl r11, 2;                             // * 4
+        add r9, r11;
+        mov [r10 + 40], r9;
+        mov rax, r13;
+        jmp snp_pr_out;
+
+      snp_pr_ni:
+        mov rdi, 0xFFFFEF5F;
+        call snp_set_err;
+        xor rax, rax;
+        jmp snp_pr_out;
+      snp_pr_pu:
+        mov rdi, 0xFFFFEF5B;
+        call snp_set_err;
+        xor rax, rax;
+
+      snp_pr_out:
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}

@@ -4637,6 +4637,75 @@ semterm_pin_one "${JCS_SRC}" 'pub let jcs_seed_torn : (u64) -> u64'
 echo "[pdxfs-journal-confine] R42.M2 entry-point arities pinned"
 
 # ---------------------------------------------------------------------------
+# R42.M3-001 .. R42.M3-004 (#1388..#1391): PDXFS-v1 SNAPSHOT confinement.
+#
+# Four modules build the snapshot skeleton the eventual NVMe write path
+# (#906) will persist:
+#
+#   snap_create.pdx     -- name registry + chain-head bump + scaffold
+#                          refbump accounting.
+#   snap_mount_ro.pdx   -- name-resolved mounts + read-only latch;
+#                          write_refuse is the ONE path a write against
+#                          a mounted snapshot lands on.
+#   snap_diff.pdx       -- bounded per-block diff walker between two
+#                          snapshots.
+#   snap_prune.pdx      -- retention policy + delete pass + scaffold
+#                          refdec accounting.
+#
+# The confinement gate below is why a widening cannot:
+#   - install a name without an atomic snc_create (snap_create
+#     confinement), which would let a downstream mount bind to a
+#     snapshot the chain-head bump never happened for,
+#   - install a mount without name resolution (snap_mount_ro
+#     confinement), which would let the read path resolve to a slot
+#     whose name the SnapCreate registry never blessed,
+#   - quiet a difference by planting a matching result entry
+#     (snap_diff confinement), which would smuggle a stale block past
+#     a downstream consumer that trusted the diff walker,
+#   - quiet a retention decision by planting a matching ts
+#     (snap_prune confinement), which would preserve a snapshot the
+#     policy would otherwise have deleted.
+SNC_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/snap_create.pdx"
+SNR_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/snap_mount_ro.pdx"
+SND_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/snap_diff.pdx"
+SNP_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/snap_prune.pdx"
+if [[ ! -f "${SNC_SRC}" || ! -f "${SNR_SRC}" || ! -f "${SND_SRC}" || ! -f "${SNP_SRC}" ]]; then
+    echo "[pdxfs-snap-confine] FAIL - one of the R42.M3 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_snc_names'   'core/fs/pdxfs/snap_create.o'
+ec_confine_one '_snc_state'   'core/fs/pdxfs/snap_create.o'
+ec_confine_one '_snr_slots'   'core/fs/pdxfs/snap_mount_ro.o'
+ec_confine_one '_snr_state'   'core/fs/pdxfs/snap_mount_ro.o'
+ec_confine_one '_snd_blocks'  'core/fs/pdxfs/snap_diff.o'
+ec_confine_one '_snd_result'  'core/fs/pdxfs/snap_diff.o'
+ec_confine_one '_snd_state'   'core/fs/pdxfs/snap_diff.o'
+ec_confine_one '_snp_ts'      'core/fs/pdxfs/snap_prune.o'
+ec_confine_one '_snp_state'   'core/fs/pdxfs/snap_prune.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/fs/pdxfs/{snap_create,snap_mount_ro,snap_diff,snap_prune}.pdx §2" >&2
+    echo "  for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[pdxfs-snap-confine] R42.M3 (snap_create + snap_mount_ro + snap_diff + snap_prune) state confined"
+
+# ARITY PINS for the R42.M3 entry points. A widening on any of these
+# makes "install a name without an atomic create", "mount a snapshot
+# with the wrong resolution semantics", "diff between the wrong pair
+# of snapshots", or "prune under an unrecognised policy" expressible
+# in a call site the confinement gate cannot see.
+semterm_pin_one "${SNC_SRC}" 'pub let snc_create : (u64) -> u64'
+semterm_pin_one "${SNC_SRC}" 'pub let snc_lookup : (u64) -> u64'
+semterm_pin_one "${SNR_SRC}" 'pub let snr_mount : (u64) -> u64'
+semterm_pin_one "${SNR_SRC}" 'pub let snr_unmount : (u64) -> u64'
+semterm_pin_one "${SNR_SRC}" 'pub let snr_write_refuse : (u64) -> u64'
+semterm_pin_one "${SND_SRC}" 'pub let snd_diff : (u64, u64, u64) -> u64'
+semterm_pin_one "${SND_SRC}" 'pub let snd_seed : (u64, u64, u64) -> u64'
+semterm_pin_one "${SNP_SRC}" 'pub let snp_set_policy : (u64, u64) -> u64'
+semterm_pin_one "${SNP_SRC}" 'pub let snp_prune : () -> u64'
+echo "[pdxfs-snap-confine] R42.M3 entry-point arities pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
