@@ -5282,6 +5282,61 @@ fi
 echo "[g2-confine] G2 (scanout lease + channel + driver) state confined"
 
 # ---------------------------------------------------------------------------
+# G3.M1-001..005 (#1457-#1461) + G3.M2-001..005 (#1462-#1466)
+# + G3.M3-001..005 (#1467-#1471) + G3.M4-001..002 (#1472, #1473):
+# SWAPCHAIN + PRESENTATION-TIMING CONFINEMENT.
+#
+# Eight modules open G3 on top of G1 + G2: kind_vk_surface (the WSI
+# surface cap), kind_vk_swapchain_image (the LINEAR per-image handle
+# carrying two timelines + present_id + target_pts), vk_surface_channel
+# (create_swapchain / acquire_image / present_image / destroy_swapchain
+# RPC), vk_present_feedback_channel (VK_KHR_present_id + present_wait +
+# maintenance1 discard feedback stream), drivers/vk/icd (ICD registry +
+# VK_paideia_surface extension + SPIR-V magic-word smoke), drivers/vk/
+# swapchain (acquire / present / mode / resize), drivers/vk/features
+# (present_id + present_wait + discard-release + P3 fractional-scale
+# gcd), drivers/vk/bench (acquire->present latency ring + adaptive
+# render policy).
+G3_KVS_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_vk_surface.pdx"
+G3_KVI_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_vk_swapchain_image.pdx"
+G3_VSC_SRC="${REPO_ROOT}/src/kernel/core/ipc/vk_surface_channel.pdx"
+G3_VFC_SRC="${REPO_ROOT}/src/kernel/core/ipc/vk_present_feedback_channel.pdx"
+G3_ICD_SRC="${REPO_ROOT}/src/kernel/core/drivers/vk/icd.pdx"
+G3_SWC_SRC="${REPO_ROOT}/src/kernel/core/drivers/vk/swapchain.pdx"
+G3_VKF_SRC="${REPO_ROOT}/src/kernel/core/drivers/vk/vk_features.pdx"
+G3_VKB_SRC="${REPO_ROOT}/src/kernel/core/drivers/vk/bench.pdx"
+if [[ ! -f "${G3_KVS_SRC}" || ! -f "${G3_KVI_SRC}" || ! -f "${G3_VSC_SRC}" \
+    || ! -f "${G3_VFC_SRC}" || ! -f "${G3_ICD_SRC}" || ! -f "${G3_SWC_SRC}" \
+    || ! -f "${G3_VKF_SRC}" || ! -f "${G3_VKB_SRC}" ]]; then
+    echo "[g3-confine] FAIL - one of the G3 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_vk_surface_table'          'core/cap/kind_vk_surface.o'
+ec_confine_one '_vk_surface_stats'          'core/cap/kind_vk_surface.o'
+ec_confine_one '_vk_swapchain_image_table'  'core/cap/kind_vk_swapchain_image.o'
+ec_confine_one '_vk_swapchain_image_stats'  'core/cap/kind_vk_swapchain_image.o'
+ec_confine_one '_vsc_stats'                 'core/ipc/vk_surface_channel.o'
+ec_confine_one '_vfc_queue'                 'core/ipc/vk_present_feedback_channel.o'
+ec_confine_one '_vfc_cursor'                'core/ipc/vk_present_feedback_channel.o'
+ec_confine_one '_vfc_stats'                 'core/ipc/vk_present_feedback_channel.o'
+ec_confine_one '_vki_icd_table'             'core/drivers/vk/icd.o'
+ec_confine_one '_vki_stats'                 'core/drivers/vk/icd.o'
+ec_confine_one '_vswc_state'                'core/drivers/vk/swapchain.o'
+ec_confine_one '_vswc_stats'                'core/drivers/vk/swapchain.o'
+ec_confine_one '_vkf_present_id'            'core/drivers/vk/vk_features.o'
+ec_confine_one '_vkf_stats'                 'core/drivers/vk/vk_features.o'
+ec_confine_one '_vkb_ring'                  'core/drivers/vk/bench.o'
+ec_confine_one '_vkb_cursor'                'core/drivers/vk/bench.o'
+ec_confine_one '_vkb_stats'                 'core/drivers/vk/bench.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_vk_surface.pdx §2, kind_vk_swapchain_image.pdx §2," >&2
+    echo "  vk_surface_channel.pdx §0, vk_present_feedback_channel.pdx §0," >&2
+    echo "  and drivers/vk/*.pdx section 0 for the one-writer discipline." >&2
+    exit 1
+fi
+echo "[g3-confine] G3 (VK surface + swapchain image + channels + drivers) state confined"
+
+# ---------------------------------------------------------------------------
 # R47.M1..M5 (#1412/#1413/#1414/#1415/#1416/#1417/#1418/#1419/
 #             #1421/#1422/#1423/#1424): Intel VMD driver substrate --
 # vmd_probe, vmd_endpoint_enum, kind_vmd_endpoint, vmd_root_complex,

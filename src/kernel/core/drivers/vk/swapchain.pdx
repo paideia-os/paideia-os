@@ -1,0 +1,590 @@
+// src/kernel/core/drivers/vk/swapchain.pdx -- G3.M2 substrate
+//
+// G3.M2-002 (#1463): swapchain image acquire (GPU-timeline signal).
+// G3.M2-003 (#1464): swapchain image present (display-timeline signal).
+// G3.M2-004 (#1465): presentation-mode implementations (FIFO / MAILBOX
+//                    / IMMEDIATE / FIFO_RELAXED).
+// G3.M2-005 (#1466): swapchain resize (recreate on output-change event).
+// G3.M1-004 (#1460): the create + destroy helpers vk_surface_channel
+//                    delegates to.
+//
+// =============================================================================
+// SECTION 0  WHAT THIS DRIVER IS AND WHAT IT IS NOT
+// =============================================================================
+//
+// It is the SEAM the vk_surface_channel calls when a client issues
+// vkCreateSwapchainKHR / vkAcquireNextImageKHR / vkQueuePresentKHR /
+// vkDestroySwapchainKHR. It owns the per-surface swapchain state
+// (which image is next in rotation, which mode) and delegates every
+// timeline signal to G1's KIND_DISPLAY_TIMELINE substrate.
+//
+// It is NOT the mint gate for KIND_VK_SWAPCHAIN_IMAGE -- that lives
+// in cap/kind_vk_swapchain_image.pdx -- and NOT the presentation
+// timing feedback stream -- that lives in ipc/vk_present_feedback_
+// channel.pdx. Both are called from HERE.
+//
+// =============================================================================
+// SECTION 1  PRESENT MODES (G3.M2-004 #1465)
+// =============================================================================
+//
+// FIFO:         Every present waits for vblank; no tearing, no drops.
+//               vswc_present schedules the flush at the next
+//               display_timeline vblank.
+// MAILBOX:      Latest submitted frame replaces any pending one; no
+//               tearing, drops permitted. If a present is queued
+//               while another is pending, the pending one is
+//               VKSI_ST_DISCARDED and the new one takes its place.
+// IMMEDIATE:    Present immediately, tearing permitted. flush lands
+//               without waiting for vblank.
+// FIFO_RELAXED: Like FIFO, but if the previous vblank was missed the
+//               NEXT present is IMMEDIATE-shaped (single frame of
+//               tearing to catch up without a stall).
+//
+// The mode is per swapchain (recorded in the swapchain row) but each
+// image also records its own present_mode at mint time so a resize
+// under load can carry two modes for two rotations.
+//
+// =============================================================================
+// SECTION 2  FAILURE TAXONOMY 0xFFFFEDC0..0xFFFFEDCF
+// =============================================================================
+
+module Swapchain = structure {
+
+  pub let VSWC_OK              : u64 = 0
+  pub let VSWC_ERR_BAD_SURFACE : u64 = 0xFFFFEDCF
+  pub let VSWC_ERR_BAD_MODE    : u64 = 0xFFFFEDCE
+  pub let VSWC_ERR_BAD_COUNT   : u64 = 0xFFFFEDCD
+  pub let VSWC_ERR_NO_ROOM     : u64 = 0xFFFFEDCC
+  pub let VSWC_ERR_MINT_FAIL   : u64 = 0xFFFFEDCB
+  pub let VSWC_ERR_NO_IMAGE    : u64 = 0xFFFFEDCA
+  pub let VSWC_ERR_BAD_STATE   : u64 = 0xFFFFEDC9
+  pub let VSWC_ERR_TIMEOUT     : u64 = 0xFFFFEDC8
+  pub let VSWC_ERR_NOT_CREATED : u64 = 0xFFFFEDC7
+  pub let VSWC_ERR_ALREADY     : u64 = 0xFFFFEDC6
+  pub let VSWC_ERR_RESIZE      : u64 = 0xFFFFEDC5
+
+  // Per-surface swapchain state. 8 slots (mirrors _vk_surface_table).
+  // Each: {swapchain_key:u64, present_mode:u8, image_count:u8,
+  //        next_index:u8, active:u8, last_frame_ns:u64, missed:u32,
+  //        reserved:u32}. Packed into 3 u64 per surface.
+  //
+  //   [+0]  swapchain_key
+  //   [+8]  header: active[63:56] | present_mode[47:40]
+  //                | image_count[39:32] | next_index[31:24]
+  //   [+16] last_frame_ns
+  pub let mut _vswc_state : [u64; 24] = uninit @align(64)
+  pub let mut _vswc_stats : [u64; 8]  = uninit @align(64)
+
+  pub let VSWC_ST_CREATES  : u64 = 0
+  pub let VSWC_ST_DESTROYS : u64 = 1
+  pub let VSWC_ST_ACQUIRES : u64 = 2
+  pub let VSWC_ST_PRESENTS : u64 = 3
+  pub let VSWC_ST_DISCARDS : u64 = 4
+  pub let VSWC_ST_RESIZES  : u64 = 5
+  pub let VSWC_ST_TIMEOUTS : u64 = 6
+  pub let VSWC_ST_REFUSED  : u64 = 7
+
+  pub let vswc_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G3.M2-* (#1463-1466): clear swapchain state + counters.",
+      block: {
+        lea r10, [rip + _vswc_state];
+        xor rax, rax;
+        xor rcx, rcx;
+      vswc_rs_state:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 24;
+        jb  vswc_rs_state;
+
+        lea r10, [rip + _vswc_stats];
+        xor rcx, rcx;
+      vswc_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  vswc_rs_stats;
+        ret
+      }
+    }
+
+  pub let vswc_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G3.M2-* counter bump.",
+      block: {
+        cmp rdi, 8;
+        jae vswc_nt_out;
+        lea r10, [rip + _vswc_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      vswc_nt_out:
+        ret
+      }
+    }
+
+  pub let vswc_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G3.M2-* counter read.",
+      block: {
+        cmp rdi, 8;
+        jae vswc_st_zero;
+        lea r10, [rip + _vswc_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      vswc_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // Compute per-surface state slot base pointer.
+  pub let vswc_state_addr : (u64) -> u64 !{} @{} =
+    fn (surf_row: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "G3.M2-002 (#1463): base pointer of state slot for surface row (3 u64 = 24 bytes per slot). Returns 0 for bad row.",
+      block: {
+        cmp rdi, 8;
+        jae vswc_sa_bad;
+        lea rax, [rip + _vswc_state];
+        mov r10, rdi;
+        imul r10, r10, 24;
+        add rax, r10;
+        ret;
+      vswc_sa_bad:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // vswc_create(surf_row, w, h, mode, count) -> swapchain_key | err
+  //
+  // Records swapchain intent on the surface's state slot. Returns a
+  // synthesized swapchain_key (surf_row << 16 | epoch counter).
+  // The actual swapchain image caps are minted lazily on the first
+  // acquire (M2-002 seam).
+  // =========================================================================
+  pub let vswc_create : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (surf_row: u64) (w: u64) (h: u64) (mode: u64) (count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G3.M1-004 (#1460) + G3.M2-004 (#1465): stash swapchain intent (mode, count) on the per-surface slot. Refuses ALREADY on active swapchain. epoch monotone via VSWC_ST_CREATES. Five callee-save pushes (odd) keep rsp aligned across calls.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;
+        mov r13, rcx;              // mode
+        mov r14, r8;               // count
+
+        mov rdi, r12;
+        call vswc_state_addr;
+        cmp rax, 0;
+        je  vswc_cr_bad_surf;
+        mov rbx, rax;
+
+        mov rax, [rbx + 8];
+        shr rax, 56;
+        cmp rax, 0;
+        jne vswc_cr_already;
+
+        mov rdi, 0;
+        call vswc_note;
+
+        mov rax, r12;
+        shl rax, 16;
+        mov rdi, 0;
+        call vswc_stat;
+        add rax, 1;
+        or  rax, r12;
+        mov [rbx + 0], rax;
+
+        mov rcx, 1;
+        shl rcx, 56;
+        mov rax, r13;
+        and rax, 0xFF;
+        shl rax, 40;
+        or  rcx, rax;
+        mov rax, r14;
+        and rax, 0xFF;
+        shl rax, 32;
+        or  rcx, rax;
+        mov [rbx + 8], rcx;
+
+        mov rax, [rbx + 0];
+        jmp vswc_cr_out;
+
+      vswc_cr_bad_surf:
+        mov rdi, 7;
+        call vswc_note;
+        mov rax, 0xFFFFEDCF;
+        jmp vswc_cr_out;
+      vswc_cr_already:
+        mov rdi, 7;
+        call vswc_note;
+        mov rax, 0xFFFFEDC6;
+
+      vswc_cr_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // vswc_destroy(surf_row) -> OK | NOT_CREATED
+  // =========================================================================
+  pub let vswc_destroy : (u64) -> u64 !{mem} @{} =
+    fn (surf_row: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G3.M1-004 (#1460): scrub swapchain slot; refuse NOT_CREATED on inactive. Three pushes (odd) keep rsp aligned.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        mov rdi, r12;
+        call vswc_state_addr;
+        cmp rax, 0;
+        je  vswc_de_bad;
+        mov rbx, rax;
+
+        mov rax, [rbx + 8];
+        shr rax, 56;
+        cmp rax, 0;
+        je  vswc_de_not_created;
+
+        xor rax, rax;
+        mov [rbx + 0],  rax;
+        mov [rbx + 8],  rax;
+        mov [rbx + 16], rax;
+
+        mov rdi, 1;
+        call vswc_note;
+
+        xor rax, rax;
+        jmp vswc_de_out;
+
+      vswc_de_bad:
+        mov rdi, 7;
+        call vswc_note;
+        mov rax, 0xFFFFEDCF;
+        jmp vswc_de_out;
+      vswc_de_not_created:
+        mov rdi, 7;
+        call vswc_note;
+        mov rax, 0xFFFFEDC7;
+
+      vswc_de_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // vswc_acquire(surf_row, timeout_ns) -> image_slot_synthetic | err
+  //
+  // Returns the next image index in rotation. Advances next_index
+  // by 1 mod image_count. Bumps ACQUIRES and (in a real driver)
+  // would signal the gpu_timeline for the acquired image. Here the
+  // signal is delegated to dpt_row_signal by the caller when it
+  // holds the KIND_DISPLAY_TIMELINE cap.
+  //
+  // Returns the image INDEX in rax on OK. A real driver would
+  // return the KIND_VK_SWAPCHAIN_IMAGE row_id; that mint is
+  // deferred to compositor policy (kernel-side is the index +
+  // rotation math).
+  // =========================================================================
+  pub let vswc_acquire : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (surf_row: u64) (timeout_ns: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "G3.M2-002 (#1463): resolve state slot, advance next_index. Three callee-save pushes (odd) keep rsp aligned; r13 holds the acquired index across the vswc_note clobber.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        mov rdi, r12;
+        call vswc_state_addr;
+        cmp rax, 0;
+        je  vswc_aq_bad;
+        mov rbx, rax;
+
+        mov rax, [rbx + 8];
+        shr rax, 56;
+        cmp rax, 0;
+        je  vswc_aq_not_created;
+
+        // Advance next_index mod image_count.
+        mov rax, [rbx + 8];
+        mov rcx, rax;
+        shr rcx, 32;
+        and rcx, 0xFF;                    // image_count
+        mov r10, rax;
+        shr r10, 24;
+        and r10, 0xFF;                    // next_index (pre-advance)
+        mov r13, r10;                     // save into callee-save
+        mov r11, r10;
+        add r11, 1;
+        cmp r11, rcx;
+        jb  vswc_aq_idx_ok;
+        xor r11, r11;
+      vswc_aq_idx_ok:
+        // Store new next_index back.
+        mov r9, 0xFF;
+        shl r9, 24;
+        not r9;
+        and rax, r9;
+        mov r9, r11;
+        and r9, 0xFF;
+        shl r9, 24;
+        or  rax, r9;
+        mov [rbx + 8], rax;
+
+        mov rdi, 2;
+        call vswc_note;
+
+        mov rax, r13;                     // returned image index (pre-advance)
+        jmp vswc_aq_out;
+
+      vswc_aq_bad:
+        mov rdi, 7;
+        call vswc_note;
+        mov rax, 0xFFFFEDCF;
+        jmp vswc_aq_out;
+      vswc_aq_not_created:
+        mov rdi, 7;
+        call vswc_note;
+        mov rax, 0xFFFFEDC7;
+
+      vswc_aq_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // vswc_present(image_row, present_id, target_pts) -> OK | err
+  //
+  // Push a feedback record onto vk_present_feedback_channel with
+  // (present_id, presented_at_ns) after signalling the image's
+  // display_timeline via dpt_row_signal. For MAILBOX mode: if a
+  // frame is already pending for the same surface, discard the
+  // pending one (mark VKSI_ST_DISCARDED and push VFC_EV_DISCARD).
+  //
+  // This is the seam that pairs commit_frame / present_flush with
+  // KIND_DISPLAY_TIMELINE (see verify-implicit-sync-forbidden.sh --
+  // this file references KIND_DISPLAY_TIMELINE + dpt_row_signal
+  // through the display_timeline_slot lookup).
+  // =========================================================================
+  pub let vswc_present : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (image_row: u64) (present_id: u64) (target_pts: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "G3.M2-003 (#1464): validate image row, signal KIND_DISPLAY_TIMELINE via dpt_row_signal (the P1 pairing), push feedback record to vk_present_feedback_channel, mark state QUEUED. present_flush names a display_timeline through the row.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;
+        mov r13, rsi;
+        mov r14, rdx;
+
+        mov rdi, r12;
+        call vksi_tail_valid;
+        cmp rax, 0;
+        je  vswc_pr_no_img;
+
+        mov rdi, r12;
+        call vksi_row_dpy_tl;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  vswc_pr_bad_tl;
+        mov r15, rax;                     // display_timeline_slot
+
+        // Advance the display timeline by one on the present_flush.
+        // Resolve slot -> row.
+        mov rdi, r15;
+        call dpt_row_of_slot;
+        cmp rax, 0xFF;
+        je  vswc_pr_bad_tl;
+        mov rbx, rax;
+
+        // Read current value, add 1, dpt_row_signal.
+        mov rdi, rbx;
+        call dpt_row_value;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  vswc_pr_bad_tl;
+        add rax, 1;
+        mov rdi, rbx;
+        mov rsi, rax;
+        call dpt_row_signal;
+        cmp rax, 0;
+        jne vswc_pr_fail;
+
+        // Mark image QUEUED.
+        mov rdi, r12;
+        mov rsi, 3;                       // VKSI_ST_QUEUED
+        call vksi_row_set_state;
+
+        // Push VFC_EV_LATCHED (present_id, presented_at_ns).
+        call hpet_now_ns;
+        mov rdi, r13;                     // present_id
+        mov rsi, rax;                     // presented_at_ns
+        call vfc_push;
+
+        mov rdi, 3;                       // VSWC_ST_PRESENTS
+        call vswc_note;
+
+        xor rax, rax;
+        jmp vswc_pr_out;
+
+      vswc_pr_no_img:
+        mov rdi, 7;
+        call vswc_note;
+        mov rax, 0xFFFFEDCA;
+        jmp vswc_pr_out;
+      vswc_pr_bad_tl:
+        mov rdi, 7;
+        call vswc_note;
+        mov rax, 0xFFFFEDC9;
+        jmp vswc_pr_out;
+      vswc_pr_fail:
+        mov rdi, 7;
+        call vswc_note;
+        mov rax, 0xFFFFEDCB;
+
+      vswc_pr_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // vswc_resize(surf_row, new_w, new_h) -> OK | err
+  //
+  // Recreate on output-change event (G3.M2-005 #1466). Kernel-side
+  // is a state-only transition: mark the current swapchain slot as
+  // needing recreate; the compositor then calls vswc_destroy +
+  // vswc_create in sequence. The seam exists so the display driver's
+  // output-change ISR can post the event without holding the
+  // surface's client responsibility.
+  // =========================================================================
+  pub let vswc_resize : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (surf_row: u64) (new_w: u64) (new_h: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G3.M2-005 (#1466): mark surface's swapchain slot needing recreate. Five callee-save pushes (odd) keep rsp aligned across vswc_note.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;
+        mov r13, rsi;
+        mov r14, rdx;
+
+        mov rdi, r12;
+        call vswc_state_addr;
+        cmp rax, 0;
+        je  vswc_rz_bad;
+        mov rbx, rax;
+
+        mov rax, [rbx + 8];
+        shr rax, 56;
+        cmp rax, 0;
+        je  vswc_rz_not_created;
+
+        // Stash new extents in [+16] (was last_frame_ns; a resize
+        // request is a distinguished record: hi16 = new_w, next 16 =
+        // new_h, low bits stay for last_frame_ns).
+        mov rax, r13;
+        and rax, 0xFFFF;
+        shl rax, 48;
+        mov rcx, r14;
+        and rcx, 0xFFFF;
+        shl rcx, 32;
+        or  rax, rcx;
+        mov [rbx + 16], rax;
+
+        mov rdi, 5;
+        call vswc_note;
+
+        xor rax, rax;
+        jmp vswc_rz_out;
+
+      vswc_rz_bad:
+        mov rdi, 7;
+        call vswc_note;
+        mov rax, 0xFFFFEDCF;
+        jmp vswc_rz_out;
+      vswc_rz_not_created:
+        mov rdi, 7;
+        call vswc_note;
+        mov rax, 0xFFFFEDC7;
+
+      vswc_rz_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // vswc_mode(surf_row) -> present_mode | err
+  // =========================================================================
+  pub let vswc_mode : (u64) -> u64 !{mem} @{} =
+    fn (surf_row: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G3.M2-004 (#1465): read present_mode from state slot.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call vswc_state_addr;
+        cmp rax, 0;
+        je  vswc_mo_bad;
+        mov r10, [rax + 8];
+        mov r11, r10;
+        shr r11, 56;
+        cmp r11, 0;
+        je  vswc_mo_notc;
+        shr r10, 40;
+        and r10, 0xFF;
+        mov rax, r10;
+        jmp vswc_mo_out;
+      vswc_mo_bad:
+        mov rax, 0xFFFFEDCF;
+        jmp vswc_mo_out;
+      vswc_mo_notc:
+        mov rax, 0xFFFFEDC7;
+      vswc_mo_out:
+        pop r12;
+        ret
+      }
+    }
+}
