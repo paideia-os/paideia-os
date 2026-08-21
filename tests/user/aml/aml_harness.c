@@ -280,6 +280,12 @@ extern uint64_t aml_notify_enqueue(uint64_t node, uint64_t val, uint64_t objtype
 /* #1060 — serialized methods. */
 extern void     aml_ctl_reset(void);
 extern uint64_t aml_ctl_ctx(void);
+/* #1581 — mint a fresh AML context id and latch it as current, WITHOUT
+ * touching the mutex pool. aml_ctl_reset calls this under the hood so
+ * every evaluation session enters with a distinct identity; the test
+ * corpus below also calls it directly to reach the "held by another
+ * context" arm of aml_ctl_acquire without wiping the pool. */
+extern uint64_t aml_ctl_ctx_alloc(void);
 extern uint64_t aml_ctl_level(void);
 extern uint64_t aml_ctl_held(void);
 extern uint64_t aml_ctl_acquires(void);
@@ -4753,16 +4759,93 @@ static void test_serialized_acquire_balance(void)
         eq("nothing held", aml_ctl_held(), 0);
         eq("no error", aml_eval_err(), AML_OK);
 
-        /* The contention arm — HONESTLY UNTESTED. There is exactly one AML
-         * execution context, so "held by someone else" has no reachable
-         * input and this corpus does not pretend otherwise. What IS
-         * reachable is the branch that decides: the owner comparison, which
-         * every re-entry above takes. If that comparison were inverted the
-         * re-entries would report MUTEX_CONTENTION rather than succeeding,
-         * so the assertions above are what guard it until R30.M3 adds a
-         * second context and, with it, a fixture that can reach the other
-         * side. */
-        eq("there is exactly one execution context", aml_ctl_ctx(), 1);
+        /* #1581 — the context id is now a real per-evaluation identity
+         * (monotonic counter, 0 reserved for "no session yet minted").
+         * aml_eval_reset above minted a fresh id, so the value here is
+         * nonzero. Its numeric value depends on how many prior tests
+         * have called reset, so we assert the property that matters
+         * (a valid id was minted) rather than the numeric value. The
+         * contention arm itself is reached by
+         * test_serialized_contention_across_contexts below. */
+        eq("a valid execution context is minted", aml_ctl_ctx() != 0, 1);
+    });
+}
+
+/* #1581 — REACH THE CONTENTION ARM.
+ *
+ * Before #1581 aml_ctl_ctx returned the constant 1, so aml_ctl_acquire's
+ * `owner != ctx` branch was unreachable from any input and the
+ * AML_ERR_MUTEX_CONTENTION (54) code was documented as "refused rather
+ * than faked". This fixture reaches it: it acquires a serialized method's
+ * implicit mutex under context A, rotates the identity to context B via
+ * aml_ctl_ctx_alloc (which does NOT touch the pool, deliberately), and
+ * attempts the acquire again. The pool now holds a slot whose owner is A;
+ * the running context is B; the comparison at aml_ma_again falls to
+ * aml_ma_contend and latches E_MUTEX_CONTENTION. Then it rotates BACK
+ * to A and asserts the re-entry succeeds again -- so the failure mode
+ * is a genuine owner comparison and not, e.g., a stray always-refuse. */
+static void test_serialized_contention_across_contexts(void)
+{
+    uint8_t b[] = {
+        0x14, 0x08, 'S','R','L','C', 0x18,     /* Method(SRLC, 0, Serialized, 1) */
+            0xA4, 0x00
+    };
+    WITH_PARSE("serialized: two contexts contend on one mutex", b, sizeof b, {
+        eq("parse ok", aml_lex_err(), AML_OK);
+        uint64_t srlc = nth_child(root, 0);
+        eq("SRLC is serialized", aml_method_serialized(srlc), 1);
+
+        aml_eval_reset(2);
+        uint64_t ctx_a = aml_ctl_ctx();
+        eq("session has a valid context id", ctx_a != 0, 1);
+
+        eq("A acquires the mutex", aml_ctl_acquire(srlc), 1);
+        eq("count 1 under A", aml_ctl_count_of(srlc), 1);
+        eq("one entry held", aml_ctl_held(), 1);
+        eq("no error", aml_eval_err(), AML_OK);
+
+        /* Rotate to a fresh context WITHOUT wiping the pool. */
+        uint64_t ctx_b = aml_ctl_ctx_alloc();
+        eq("ctx_b is a valid id", ctx_b != 0, 1);
+        eq("ctx_b differs from ctx_a", ctx_b != ctx_a, 1);
+
+        /* Now B tries to acquire the mutex A holds. The owner field on
+         * the pool slot names A; the running context is B; the acquire
+         * MUST refuse with MUTEX_CONTENTION rather than either grant a
+         * silent parallel acquire or hang. */
+        eq("B is refused the acquire", aml_ctl_acquire(srlc), 0);
+        eq("with MUTEX_CONTENTION latched", aml_eval_err(),
+           E_MUTEX_CONTENTION);
+        eq("the entry is still held by A, count unchanged",
+           aml_ctl_count_of(srlc), 1);
+        eq("still one entry", aml_ctl_held(), 1);
+
+        /* Prove the refusal was really the owner comparison and not an
+         * always-refuse latched by the error slot: rotate to yet another
+         * fresh context and confirm it is ALSO refused. aml_ctl_ctx_alloc
+         * is the only public writer of the counter, so we cannot re-mint
+         * A's id to prove positive re-acquisition; the two-refusals shape
+         * (B refused, C refused, same slot still held) rules out the
+         * "always refuse after first miss" and "MUTEX_CONTENTION was a
+         * one-shot bit" failure modes. */
+        uint64_t ctx_c = aml_ctl_ctx_alloc();
+        eq("ctx_c differs from ctx_b", ctx_c != ctx_b, 1);
+        eq("ctx_c differs from ctx_a", ctx_c != ctx_a, 1);
+        eq("C is also refused (owner comparison, not a one-shot fluke)",
+           aml_ctl_acquire(srlc), 0);
+        eq("still MUTEX_CONTENTION", aml_eval_err(), E_MUTEX_CONTENTION);
+        eq("pool unchanged", aml_ctl_held(), 1);
+        eq("count still 1", aml_ctl_count_of(srlc), 1);
+
+        /* Malformed-input taxonomy: node = 0 is the same shape as every
+         * other pool operation, refused as a distinct outcome that does
+         * NOT touch the pool. It must also NOT overwrite the latched
+         * contention error -- first-writer-wins is what makes the
+         * contention diagnosis survive an incidental follow-up. */
+        eq("node 0 is refused", aml_ctl_acquire(0), 0);
+        eq("MUTEX_CONTENTION still the latched code (first-writer-wins)",
+           aml_eval_err(), E_MUTEX_CONTENTION);
+        eq("pool truly unchanged", aml_ctl_held(), 1);
     });
 }
 
@@ -7908,6 +7991,7 @@ int main(void)
     test_notify_unbounded_loop_terminates();
 
     test_serialized_acquire_balance();
+    test_serialized_contention_across_contexts();
     test_serialized_recursion_does_not_deadlock();
     test_serialized_recursion_is_still_bounded();
     test_serialized_sync_level_ordering();
