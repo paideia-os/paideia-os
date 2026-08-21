@@ -5174,6 +5174,86 @@ semterm_pin_one "${GFB_SRC}" 'pub let pfb_report : (u64, u64) -> u64'
 echo "[semterm-r44m4-confine] gui_hdr / gui_feedback entry-point arities pinned"
 
 # ---------------------------------------------------------------------------
+# G1.M1-001..004 (#1427-#1430): DISPLAY TIMELINE + SYNC CHANNEL + DRIVER
+# CONFINEMENT.
+#
+# Three modules open G1.M1 on top of the R36/R37 display + GPU substrate:
+# kind_display_timeline (the drm-syncobj-shaped cap), display_sync_channel
+# (the wait_scanout / present_flush RPC schema), and drivers/dpy/timeline
+# (the vblank signal seam + the wait primitive). Each owns its own state;
+# tools/build.sh confines relocations against each so a second writer
+# cannot forge a timeline row, invent a channel counter, or advance a
+# scanout value the vblank ISR never latched.
+G1_KDT_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_display_timeline.pdx"
+G1_DSC_SRC="${REPO_ROOT}/src/kernel/core/ipc/display_sync_channel.pdx"
+G1_TLD_SRC="${REPO_ROOT}/src/kernel/core/drivers/dpy/timeline.pdx"
+if [[ ! -f "${G1_KDT_SRC}" || ! -f "${G1_DSC_SRC}" || ! -f "${G1_TLD_SRC}" ]]; then
+    echo "[g1-m1-confine] FAIL - one of the G1.M1 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_display_timeline_table' 'core/cap/kind_display_timeline.o'
+ec_confine_one '_display_timeline_stats' 'core/cap/kind_display_timeline.o'
+ec_confine_one '_dsc_stats'              'core/ipc/display_sync_channel.o'
+ec_confine_one '_dpy_timeline_stats'     'core/drivers/dpy/timeline.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_display_timeline.pdx §2, display_sync_channel.pdx" >&2
+    echo "  §0 and drivers/dpy/timeline.pdx §0 for the row/counter" >&2
+    echo "  one-writer discipline. The driver reaches the row only" >&2
+    echo "  through dpt_find_by_engine_output + dpt_row_signal (both" >&2
+    echo "  exported from kind_display_timeline.pdx), so the driver .o" >&2
+    echo "  relocates against those selector symbols and NOT against" >&2
+    echo "  _display_timeline_table itself." >&2
+    exit 1
+fi
+echo "[g1-m1-confine] G1.M1 (display timeline + sync channel + driver) state confined"
+
+# ---------------------------------------------------------------------------
+# G1.M2-001..004 (#1432-#1435): VRR RANGE + VRR CHANNEL + VRR DRIVER
+# CONFINEMENT.
+#
+# Three modules open G1.M2 on top of G1.M1: kind_vrr_range (the VRR
+# range capability), vrr_channel (the get_range / enable / disable RPC
+# schema), and drivers/dpy/vrr (the DPCD/EDID probe + adaptive-sync
+# arming).
+G1_KVR_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_vrr_range.pdx"
+G1_VRC_SRC="${REPO_ROOT}/src/kernel/core/ipc/vrr_channel.pdx"
+G1_VDR_SRC="${REPO_ROOT}/src/kernel/core/drivers/dpy/vrr.pdx"
+if [[ ! -f "${G1_KVR_SRC}" || ! -f "${G1_VRC_SRC}" || ! -f "${G1_VDR_SRC}" ]]; then
+    echo "[g1-m2-confine] FAIL - one of the G1.M2 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_vrr_range_table' 'core/cap/kind_vrr_range.o'
+ec_confine_one '_vrr_range_stats' 'core/cap/kind_vrr_range.o'
+ec_confine_one '_vrc_stats'       'core/ipc/vrr_channel.o'
+ec_confine_one '_vrr_armed_bits'  'core/drivers/dpy/vrr.o'
+ec_confine_one '_vrr_probe_stats' 'core/drivers/dpy/vrr.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_vrr_range.pdx §2, vrr_channel.pdx §0 and" >&2
+    echo "  drivers/dpy/vrr.pdx §3 for the row/counter/arming" >&2
+    echo "  one-writer discipline." >&2
+    exit 1
+fi
+echo "[g1-m2-confine] G1.M2 (VRR range + channel + driver) state confined"
+
+# ---------------------------------------------------------------------------
+# G1.M1-005 (#1431) + G1.M3-005 (#1441): P1 INVARIANT ENFORCEMENT.
+#
+# Refuses the build if any source file:
+#   (a) contains a forbidden legacy-DRM implicit-sync symbol
+#       (commit_frame_no_sync / present_now_implicit / drmModePageFlip /
+#       atomic_commit_nofence), or
+#   (b) defines a `commit_frame` or `present_flush` symbol without also
+#       referencing KIND_DISPLAY_TIMELINE / dpt_row_signal /
+#       dpy_timeline_wait_le in the same file.
+#
+# See tools/verify-implicit-sync-forbidden.sh for the argument.
+echo "[implicit-sync-forbidden] tools/verify-implicit-sync-forbidden.sh"
+"${REPO_ROOT}/tools/verify-implicit-sync-forbidden.sh" || {
+    echo "[FAIL] P1 invariant enforcement failed" >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

@@ -2301,16 +2301,21 @@ otherwise noted.
 | 0x17F  | `KIND_IPU6_STREAM`       | `KIND_IPC_ENDPOINT = 5`           | IPU6 streaming session over a camera.                                                       | derived (QUERY-only ops)      | 0xFFFFF1F0..FF      | `kind_ipu6_stream.pdx`          |
 | 0x180  | `KIND_WWAN_MODEM`        | `KIND_DEVICE = 10`                | M.2 WWAN modem device authority (Intel / Fibocom).                                          | derived (QUERY-only ops)      | 0xFFFFF1C0..CF      | `kind_wwan_modem.pdx`           |
 | 0x181  | `KIND_MBIM_SESSION`      | `KIND_IPC_ENDPOINT = 5`           | MBIM control session over a WWAN modem.                                                     | derived (QUERY-only ops)      | 0xFFFFF1B0..BF      | `kind_mbim_session.pdx`         |
+| 0x182  | `KIND_BT_ADAPTER`        | `KIND_DEVICE = 10`                | Bluetooth adapter on CNVi bus (R39.M1).                                                     | derived (QUERY + STATE ops)   | 0xFFFFF140..4F      | `kind_bt_adapter.pdx`           |
+| 0x183  | `KIND_BT_HCI_CHANNEL`    | `KIND_IPC_ENDPOINT = 5`           | HCI transport channel (CMD/EVT/ACL/SCO) bound to one adapter.                               | derived (QUERY-only ops)      | 0xFFFFF130..3F      | `kind_bt_hci_channel.pdx`       |
+| 0x184  | `KIND_BT_L2CAP_CHANNEL`  | `KIND_IPC_ENDPOINT = 5`           | Live L2CAP channel (cid, psm, mtu, credits) over an HCI transport slice.                    | derived (QUERY-only ops)      | 0xFFFFF100..0F      | `kind_bt_l2cap_channel.pdx`     |
+| 0x185  | `KIND_DISPLAY_TIMELINE`  | `KIND_HW = 14`                    | G1 opener: drm-syncobj-shaped display timeline, one per (engine, output). Signalled by vblank ISR (G1.M1-003), waited on via `wait_scanout` (G1.M1-004). The primitive that makes P1 (no implicit sync) expressible across the G-round. Rights include `R_DPT_WRITE` (signal authority) but `R_MINT` is ABSENT — leaf kind. | derived (QUERY-only ops; signal helper exposed) | 0xFFFFF6A0..AF | `kind_display_timeline.pdx` |
+| 0x186  | `KIND_VRR_RANGE`         | `KIND_DISPLAY_MODE = 0x172` (over `KIND_MEMORY = 4`) | G1.M2: Variable Refresh Rate range for one output (min_refresh_mhz, max_refresh_mhz, min_frametime_ns). Minted from the DPCD 0x00080 probe cross-checked against the EDID range descriptor (G1.M2-001 #1432). Consumed by adaptive-sync arming on the modeset transaction (G1.M2-004 #1435). Units are mHz throughout to represent fractional-Hz DP §3.5.2.6 ranges without lossy conversion. | derived (QUERY-only ops) | 0xFFFFF670..7F | `kind_vrr_range.pdx` |
 
 ### Summary counts and free bands
 
-- **Derived-kind values landed:** 46 (0x140..0x142, 0x150..0x181; 0x143..0x14F reserved).
+- **Derived-kind values landed:** 51 (0x140..0x142, 0x150..0x186; 0x143..0x14F reserved).
 - **Base kinds parented over:** `KIND_MEMORY = 4` (7 kinds), `KIND_IPC_ENDPOINT = 5` (21 kinds), `KIND_DEVICE = 10` (13 kinds), `KIND_IO_PORT = 11` (co-parent for `KIND_OP_REGION`), `KIND_HW = 14` (2 kinds), plus derived-parent chains: `KIND_HW_INTERRUPT`, `KIND_I2C_BUS`, `KIND_USB_DEVICE`, `KIND_USB_INTERFACE`, `KIND_USB_ENDPOINT`, `KIND_MSC_LUN`.
 - **LINEAR kinds (5):** `KIND_MODESET_TXN`, `KIND_GPU_CONTEXT`, `KIND_GPU_SUBMIT`, `KIND_WIFI_SCAN_TXN`, plus the identity-LINEAR discipline on `KIND_AUDIO_ROUTE`.
 - **SEALED kinds (2):** `KIND_WIFI_KEY`, `KIND_BT_PAIRING`.
 - **Linearizable-on-object (1):** `KIND_FW_SESSION` (the arbitration is on the object, not the session cap).
 - **QUERY-only kinds (4):** `KIND_CSI_CAMERA`, `KIND_IPU6_STREAM`, `KIND_WWAN_MODEM`, `KIND_MBIM_SESSION` (R40 pattern — identity fields frozen at mint; the only mutator is the revoke helper).
-- **Next free derived-kind tag:** `0x182` (opens R41).
+- **Next free derived-kind tag:** `0x187` (opens G2).
 - **Adjacent-below free failure band:** `0xFFFFF170..7F` (16-wide; reserved for the R41 opener). `0xFFFFF180..8F` was allocated at R40.M5-001 (#1363) for `core/audit/audit_schema.pdx`.
 
 ### Migration table — audit-emit sites still on `drv_audit_emit`
