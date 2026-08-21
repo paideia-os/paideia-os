@@ -662,6 +662,39 @@ None (R20 ran under QEMU + synthetic fixtures). `design/hardware/quirks.md` seed
 
 ---
 
+## R20b (Userspace-Server Substrate — unblocks #1015) — CLOSED 2026-08-21
+
+R20b delivered the userspace-server plumbing that the R20.M4 `acpi_supervisor` deferral (#820) needed: KIND_IPC_ENDPOINT tail formalization + 128-slot endpoint table + 128 × 4 KiB payload arena, the 32-row `svc.<name> → endpoint_id` broker, the 8-byte packed IPC header + KPTI-safe user↔kernel payload bounce, the three server-model syscalls (`sys_ipc_recv`, `sys_ipc_send` / `sys_ipc_reply`, `sys_svc_lookup`), and the loader hook (`loader_seed_caps`) that seeds an image's declared InitCap sidecar into its cap_table before first schedule. See `design/round-retrospectives/r20b-closure.md` for the full write-up.
+
+### Issues Implemented (11 total across 4 milestones, all in the #1552–#1562 range)
+
+- **M1** (#1552, #1553, #1554) — KIND_IPC_ENDPOINT tail (`src/kernel/core/cap/kind_endpoint.pdx`; direction + rights refinement); endpoint table + payload arena (`ipc/endpoint_table.pdx` + `ipc/payload_arena.pdx`; 128 × 48 B + 128 × 4 KiB @align(4096)); svc broker (`ipc/svc_broker.pdx`; 32 × 48 B with `svc_register` + `svc_lookup` + `SVC_LOOKUP_NONE` sentinel).
+- **M2** (#1555, #1556, #1557) — 8-byte packed header + `frame_encode`/`_decode`/accessors (`ipc/frame.pdx`; `FRAME_MAX_PAYLOAD=4088`); pending-msg primitives (`endpoint_write_pending`/`_take_pending`/`_is_full` — `pending_hdr@+24` doubles as full/empty discriminator via `ver >= 1` invariant); KPTI-safe payload bounce (`ipc/user_bounce.pdx`; fuses `user_read_bytes_via_walk`/`_write_bytes_via_walk` with the M2-002 pending primitives; POSIX short-read on recv).
+- **M3** (#1558, #1559, #1560) — `sys_ipc_recv` sysno 40 (`handlers/sys_ipc_recv.pdx`; drain-or-block-and-retry, WAITING_IPC scaffolding in NEW `sched/state.pdx`); `sys_ipc_send` sysno 42 + `sys_ipc_reply` sysno 41 (`handlers/sys_ipc_send.pdx` + `handlers/sys_ipc_reply.pdx`; sched_wake via canonical primitive, bit-7 reply-gate); `sys_svc_lookup` sysno 43 (`handlers/sys_svc_lookup.pdx`; name-walk → broker row → cap mint with `-EINVAL/-EFAULT/-ENOENT/-ENOSPC` taxonomy). TOTAL_CHECKS in `tools/verify-syscall-dispatch.sh` bumped 15 → 19.
+- **M4** (#1561, #1562) — InitCap sidecar format + validator (`loader/init_caps.pdx` + `design/loader/init-caps-sidecar.md`; 16-byte record `slot:u16, kind:u16, rights:u32, target_ptr:u64`); `loader_seed_caps` hook wired into `elf_lite_load` (`loader/seed_caps.pdx` + `ELF_CAP_SEED_FAILED=0xFFFFFFF9` sentinel; fail-fast — validator failure aborts the load before any mint).
+
+### Cross-Repo Escalations to paideia-as (R20b)
+
+**None.** paideia-as pin unchanged across R20b — every mnemonic (rdmsr/wrmsr/rep_movsb/mov_b/mov_w/imul/div + the KPTI walker call graph) was pre-existing in the substrate.
+
+### Observable Proof
+
+- Kernel builds clean under `tools/build.sh`.
+- `tests/r17/shell-shutdown.golden` asserts all 11 R20b fingerprints as an ordered subsequence between the R20 close markers and `INIT ENTERED RING3`:
+  - `R20b ENDPOINT CAP OK`, `R20b ENDPOINT ALLOC OK`, `R20b BROKER OK`, `R20b FRAME HDR OK`, `R20b PENDING MSG OK`, `R20b IPC BOUNCE OK`, `R20b SYS IPC RECV OK`, `R20b SYS IPC SEND OK`, `R20b SVC LOOKUP OK`, `R20b INIT CAPS FMT OK`, `R20b LOADER SEED OK`.
+- Full pre-push smoke matrix (14 modes) green at R20b close (boot_r8_only, boot_r10..r12 + denial, boot_r14b × 4, boot_r17_shell × 4, boot_smp).
+- Round-close witness for R20b.M5 (echo-server end-to-end RPC, closure commit `d69ab95`) and post-close M6 sub-issues (`7138ab0` loader phase-2 ELF-symbol walker, `42a58f4` dispatch cap_slot lookup, `9fb86a3` same-endpoint request/reply race) landed subsequently. #820 (acpi_supervisor userspace server) and #860 (pci_enumerator) both landed on top of the R20b substrate (`ca9a289`, `2461f1d`).
+
+### R20b Debt Carried Forward
+
+**None.** #1015 discharged in `d69ab95`. #820 and #860 landed on top. The single global `cap_table` per `cap/table.pdx` (the `task_ptr` argument threaded through `loader_seed_caps` for the eventual per-task cap_table split) is a known R21+ item tracked independently of R20b, not a debt of this round.
+
+**None regress R20b acceptance.**
+
+**Next Round:** R21 (already closed 2026-08-10 — this closure is a backfill).
+
+---
+
 ## R21 (FPU/XSAVE + Interrupt Controller Completion + Timing) — CLOSED 2026-08-10
 
 R21 delivered the FPU/SIMD substrate (XSAVE probe + enable + eager save/restore + AVX2/AVX-512 gating + YMM-preservation fixture), the interrupt-controller substrate (IOAPIC MMIO + programming + reroute, PCIe ECAM + MSI + MSI-X + per-CPU vector pool), and the timing substrate (HPET monotonic-time + TSC-vs-PM_TMR calibration + x2APIC probe). Pillar 6 target met: every SIMD-executing kernel path preserves YMM state across context switches, every PCIe device can be programmed to raise a per-CPU MSI/MSI-X vector, and the kernel has a wall-clock-quality nanosecond source not derived from the (variable-frequency) TSC. See `design/round-retrospectives/r21-closure.md` for the full write-up.
