@@ -5591,6 +5591,40 @@ fi
 echo "[r47-confine] R47 (VMD probe + enum + cap + root complex + msix + hotplug + nvme bridge + nvme isolation + iommu domain + iommu switch + bios-off + config channel) confined"
 
 # ---------------------------------------------------------------------------
+# R48.M1..M3 (#1517-#1530): user-management substrate one-writer discipline.
+#
+# Three modules open R48: kind_user (the KIND_USER capability + row table
+# + cascade revocation), pdxuser (the .pdxuser record parser/writer + sig
+# verification seam + revoked-fingerprint blacklist), identity (the
+# .identity/ subtree layout + user_sk.enc format + seal/unseal seams +
+# in-memory user_sk lifetime + no-back-door diagnostics).
+#
+# The three tables (_user_table, _pdxuser_blacklist, _identity_sk_slot)
+# are the only places in the kernel where user identity state lives; a
+# second writer of any of them would let one supervisor read a user's
+# authority (or the revoked-blacklist) with no capability involved. Per-
+# module confinement is what makes that unreachable by construction.
+R48_KU_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_user.pdx"
+R48_PU_SRC="${REPO_ROOT}/src/kernel/user/pdxuser.pdx"
+R48_ID_SRC="${REPO_ROOT}/src/kernel/user/identity.pdx"
+if [[ ! -f "${R48_KU_SRC}" || ! -f "${R48_PU_SRC}" || ! -f "${R48_ID_SRC}" ]]; then
+    echo "[r48-confine] FAIL - one of the R48 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_user_table'           'core/cap/kind_user.o'
+ec_confine_one '_user_stats'           'core/cap/kind_user.o'
+ec_confine_one '_pdxuser_blacklist'    'user/pdxuser.o'
+ec_confine_one '_pdxuser_stats'        'user/pdxuser.o'
+ec_confine_one '_identity_sk_slot'     'user/identity.o'
+ec_confine_one '_identity_stats'       'user/identity.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_user.pdx §1, pdxuser.pdx §4, identity.pdx §4 for" >&2
+    echo "  the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[r48-confine] R48 (KIND_USER + .pdxuser records + identity storage) confined"
+
+# ---------------------------------------------------------------------------
 # G1.M1-005 (#1431) + G1.M3-005 (#1441): P1 INVARIANT ENFORCEMENT.
 #
 # Refuses the build if any source file:

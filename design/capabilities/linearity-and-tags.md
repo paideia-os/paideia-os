@@ -195,6 +195,42 @@ Slot 14 was previously reserved (documented as "fault" in the paideia-os kernel 
 
 **No conflict with slot 15.** Slot 15 (`KIND_RESERVED`) remains reserved for confidential-computing / TDX per CAP-Q9 open issue. It is currently also used as the runtime base for the `KIND_DMESG` derived kind (logging-m9-001, tag `0x16`) — see `src/kernel/core/cap/kind.pdx` — that derivation pattern is orthogonal to the D6 slot-14 promotion.
 
+### 3.1b `KIND_USER` over `KIND_HW` (R48.M1-001, #1517)
+
+**`KIND_USER = 0x190`** is the runtime witness for one PaideiaOS user identity — a signing-key fingerprint (SHA3-256 of an ML-DSA-65 `user_pk`, 32 bytes), a `quota_bytes` ceiling, a `created_ns` timestamp, and (for a non-founder) the fingerprint of the parent user whose delegation signed this account into existence. A user in PaideiaOS is **not** a uid/gid integer; it is a capability, and revoking that capability is what removes the user (`design/user/model.md` §1, §7).
+
+**Base:** slot 14 (`KIND_HW`). This is not "a user is hardware"; it is that **founder holds `KIND_HW` alongside every other root capability at first-boot** (`design/user/model.md` §3.2), so a mint gate that demands `parent.kind == KIND_HW && rights & RIGHT_MINT` naturally restricts KIND_USER minting to founder + supervisor. No ordinary user holds `KIND_HW` with `RIGHT_MINT`.
+
+**Tail encoding (per #1518):**
+
+| Field | Width | Purpose |
+|---|---|---|
+| `user_key` | u64 | `pk_fingerprint[0..8]` — uniqueness key |
+| `pk_fp_ext[3]` | 3 × u64 | `pk_fingerprint[8..32]` — completes the 32-byte SHA3-256 fingerprint |
+| `quota_bytes` | u64 | Home-subtree quota, ≤ `USER_QUOTA_MAX = 1 TiB` |
+| `created_ns` | u64 | Wall-clock timestamp at mint |
+| `delegated_by_key` | u64 | Parent's `user_key`, or 0 for founder |
+
+Storage lives in `_user_table` (16 rows × 64 bytes) confined by `tools/build.sh` to `core/cap/kind_user.o` (the one-writer discipline every derived-kind table in this tree observes).
+
+**Rights bitmask (`R_USER_ALL = 0x619`):**
+
+| Right | Bit | Meaning |
+|---|---|---|
+| `R_USER_READ` | `0x001` | Read the row's static identity |
+| `R_USER_INVOKE` | `0x008` | Query fingerprint / quota / created / parent |
+| `R_USER_REVOKE` | `0x010` | Revoke this user + cascade descendants |
+| `R_USER_MINT` | `0x200` | Delegate a sub-user under this identity |
+| `R_USER_OBSERVE` | `0x400` | Debug print |
+
+`R_USER_MINT` is present so alice may create `alice_work` as a sub-user under herself (`design/user/model.md` §4.3). Cascade revocation is what makes that safe.
+
+**Cascade revocation invariant (#1520):** `user_cap_revoke_cascade(row_id)` walks `_user_table` depth-first; for every live row whose `delegated_by_key` equals THIS row's `user_key`, it recurses first, then frees THIS row. Revoking founder in a `founder → alice → alice_work` chain frees all three in the same operation, no scavenger left behind. `tests/kernel/cap/kind_user_synth.pdx` pins the two-derivation-deep case so a flat-scan implementation that only frees direct children fails to close the invariant.
+
+**Dispatch:** `cap_invoke_dispatch` compares the full u64 kind field (`cmp rcx, 0x190; je call_kind_user`), so the KIND_USER handler coexists with the slot-14 KIND_HW fallthrough.
+
+**Loader-seedable:** **no.** A sidecar-seeded user identity would let a boot image assert an ML-DSA-65 fingerprint no ceremony ever signed — exactly the "capability laundering hole" `design/user/model.md` §8's no-back-door rule refuses.
+
 ### 3.2 Derived kinds in the type system
 
 A derived kind is a refinement of a base kind expressed purely in the paideia-as type system. Example:
