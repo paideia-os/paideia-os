@@ -34,7 +34,22 @@ cat << 'EOF'
 // The _klog_files array maps ordinals back to name-string pointers for
 // reverse lookup during panic dump (future: higher-level name rendering).
 //
-// Audit: paideia-os#696 (two-phase witness plan)
+// STALENESS DISCIPLINE (#1605):
+// Ordinals in this file SHIFT whenever a .pdx is added, removed, or
+// renamed under src/kernel/. Regenerate this file with
+//   bash tools/gen-file-ids.sh > src/kernel/core/klog/file_ids.pdx
+// as part of any such change. The build gate
+//   tools/verify-file-id-hardcodes.sh   (wired from tools/build.sh)
+// refuses to build if any call site holds a numeric literal paired
+// with a `// FILE_ID_*` comment whose ordinal has drifted from this
+// table. The preferred, drift-proof form at call sites is symbolic:
+//   mov rsi, FILE_ID_core_fs_vfs_open   // resolves through the linker
+// Numeric literals paired with `// FILE_ID_*` comments remain legal but
+// are what the gate polices; bare literals with no comment are not
+// policed (they cannot be checked without the naming intent).
+//
+// Audit: paideia-os#696 (two-phase witness plan) + paideia-os#1605
+// (regenerate + gate hardcoded ordinals)
 
 module FileIds = structure {
 
