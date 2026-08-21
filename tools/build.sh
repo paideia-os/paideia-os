@@ -157,6 +157,27 @@ echo "[init-handoff] tools/verify-init-handoff.sh"
     exit 1
 }
 
+# R31.M1 / #1579: cap_mint_write is the SOLE non-zero writer of a
+# descriptor's target_ptr field (+16). A stray write at +16 retargets a
+# LIVE capability without changing its kind or rights, so every
+# downstream kind-check keeps passing and the corruption presents
+# arbitrarily far from the write — the exact "wrong bytes at the
+# object end" defect shape R31 exists to close. Zero-clearing writes
+# (revoke / free paths) are allowed anywhere, because a descriptor
+# whose target_ptr is zero is a REVOKED descriptor. Test-fixture
+# seeders that deliberately bypass the mint path (their justifications
+# say why) carry an on-line annotation.
+#
+# Source-level, so it joins the other pre-assembler gates: a stray +16
+# writer must fail at the point it is introduced, not after 800 objects
+# have been assembled against two different beliefs about who mints
+# capabilities.
+echo "[cap-descriptor-confine] tools/verify-cap-descriptor.sh"
+"${REPO_ROOT}/tools/verify-cap-descriptor.sh" || {
+    echo "[FAIL] stray target_ptr writer (#1579 gate)" >&2
+    exit 1
+}
+
 echo "[build-user] ensuring build/user/shell.bin (R15-M1-007 embed prerequisite)"
 "${REPO_ROOT}/tools/build-user.sh"
 
