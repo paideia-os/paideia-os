@@ -51,10 +51,11 @@ and, at the original site, a single `call witness_<name>;`.
 
 paideia-as emits **no frame prologue for an `unsafe`-bodied lambda**.
 `emit_visit_lambda.rs` short-circuits on `body_is_unsafe` before it ever
-consults `@no_frame`, so every hand-written assembly function in this
-kernel is emitted exactly as written, with no `push rbp; mov rbp, rsp` and
-no matching epilogue. (`@no_frame` is therefore a no-op on all 513 of its
-uses in this tree — filed as #1606.)
+consults `is_lambda_no_frame`, so every hand-written assembly function in
+this kernel is emitted exactly as written, with no `push rbp; mov rbp, rsp`
+and no matching epilogue. (The former `@no_frame` annotation was a no-op
+on all 3173 of its uses in this tree; #1606 removed every one and
+tools/verify-no-frame-forbidden.sh refuses any reintroduction.)
 
 The consequence is that an `unsafe` function's body runs at whatever
 `rsp % 16` its caller's `call` produced. `boot_continue_after_ring3`'s is
