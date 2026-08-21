@@ -4773,6 +4773,66 @@ semterm_pin_one "${LIT_SRC}" 'pub let lit_write_refuse : (u64, u64) -> u64'
 echo "[pdxfs-upg-confine] R42.M4 entry-point arities pinned"
 
 # ---------------------------------------------------------------------------
+# R42.M4-004 (#1395) + R42.M5-001 (#1396) + R42.M5-002 (#1397): the R42
+# PDXFS v1 closing quartet's STATE + ARITY confinement.
+#
+#   fs_channel.pdx     -- the RPC schema. No state cells; the confinement
+#                         is arity-only: a widening that adds a fifth
+#                         parameter to a packer is how a caller-supplied
+#                         ceiling reaches the wire.
+#   nvme_write.pdx     -- the FS-side batcher. _nvw_sq is the SQ (64
+#                         entries * 4 u64), _nvw_state is the counter
+#                         block. A second writer would let a caller
+#                         "acknowledge a completion for a cid the CoW
+#                         walker never submitted" (which would leave the
+#                         block-layout bookkeeping ahead of what the
+#                         device holds), or "resize the SQ under a live
+#                         batch" (which would truncate pending entries
+#                         no caller re-enqueued).
+#   durability.pdx     -- the fsync + barrier sequencer. _dur_lvl is
+#                         the per-fd level table, _dur_state the
+#                         counters. A second writer would let a caller
+#                         "downgrade an fd's level from SYNC to NONE
+#                         without going through dur_set_level", losing
+#                         a durability guarantee on a crash.
+FSC_SRC="${REPO_ROOT}/src/kernel/core/ipc/fs_channel.pdx"
+NVW_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/nvme_write.pdx"
+DUR_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/durability.pdx"
+if [[ ! -f "${FSC_SRC}" || ! -f "${NVW_SRC}" || ! -f "${DUR_SRC}" ]]; then
+    echo "[pdxfs-r42-close-confine] FAIL - one of the R42-close source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_nvw_sq'      'core/fs/pdxfs/nvme_write.o'
+ec_confine_one '_nvw_state'   'core/fs/pdxfs/nvme_write.o'
+ec_confine_one '_dur_lvl'     'core/fs/pdxfs/durability.o'
+ec_confine_one '_dur_state'   'core/fs/pdxfs/durability.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/fs/pdxfs/{nvme_write,durability}.pdx §2/§3" >&2
+    echo "  for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[pdxfs-r42-close-confine] R42 (fs_channel + nvme_write + durability) state confined"
+
+# ARITY PINS for the R42-close entry points. A widening on any of these
+# makes "smuggle a ceiling into the schema", "acknowledge a completion
+# for a cid the walker never named", or "set a per-fd level with the
+# level in the fd position" expressible in a call site the confinement
+# gate cannot see.
+semterm_pin_one "${FSC_SRC}" 'pub let fsc_pack_open_request : (u64, u64) -> u64'
+semterm_pin_one "${FSC_SRC}" 'pub let fsc_pack_open_reply : (u64) -> u64'
+semterm_pin_one "${FSC_SRC}" 'pub let fsc_pack_fd_len : (u64, u64) -> u64'
+semterm_pin_one "${FSC_SRC}" 'pub let fsc_pack_path : (u64) -> u64'
+semterm_pin_one "${FSC_SRC}" 'pub let fsc_pack_two_paths : (u64, u64) -> u64'
+semterm_pin_one "${FSC_SRC}" 'pub let fsc_pack_stat_reply : (u64, u64) -> u64'
+semterm_pin_one "${NVW_SRC}" 'pub let nvw_submit : (u64, u64) -> u64'
+semterm_pin_one "${NVW_SRC}" 'pub let nvw_batch_flush : () -> u64'
+semterm_pin_one "${NVW_SRC}" 'pub let nvw_completion : (u64) -> u64'
+semterm_pin_one "${DUR_SRC}" 'pub let dur_set_level : (u64, u64) -> u64'
+semterm_pin_one "${DUR_SRC}" 'pub let dur_fsync : (u64) -> u64'
+semterm_pin_one "${DUR_SRC}" 'pub let dur_barrier : (u64) -> u64'
+echo "[pdxfs-r42-close-confine] R42-close entry-point arities pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

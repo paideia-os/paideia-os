@@ -1,0 +1,488 @@
+// src/kernel/core/fs/pdxfs/durability.pdx -- R42.M5-002 (#1397)
+//
+// PDXFS v1 -- DURABILITY PRIMITIVES (fsync-analog + barrier).
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the AUTHORITY on the DURABILITY POLICY a caller expresses per
+// open file descriptor. A caller that wants "when this write returns,
+// the byte is on the device" uses dur_fsync; a caller that wants
+// "these writes are ordered against each other but the last one need
+// not be on device yet" uses dur_barrier; a caller that mounts a
+// volume with DUR_LEVEL_NONE opts out of both (a fast path the FS
+// still refuses at mount if the volume is journal-required).
+//
+// The three primitives compose the SEQUENCE:
+//
+//   fsync(fd) = wal.wal_fsync ; journal_fence.jrf_commit ; nvw FLUSH ;
+//               wait-for-completion
+//   barrier(fd) = order-only fence (no NVMe FLUSH, no wait)
+//
+// This module OWNS the sequence choice. wal.pdx, journal_fence.pdx,
+// nvme_write.pdx each own their own atomic; a widening replaces the
+// scaffold's synchronous emulation of "wait for NVMe FLUSH" with a
+// real driver interrupt wait, but the SEQUENCE (wal, then fence,
+// then flush, then wait) stays this module's business.
+//
+// It is a SCAFFOLD (D7). The per-fd durability level table is a small
+// BSS array indexed by fd. A widening rewires this to the pdxfs
+// supervisor's open-file table so revocation of an fd auto-clears the
+// row; the semantics (default = SYNC, refusals for bad-level /
+// bad-fd, monotone accounting) are the widening's shape.
+//
+// It DOES NOT own the WAL, journal fence, or NVMe FLUSH primitives.
+// dur_fsync is the SEQUENCER; a widening that changes the ordering
+// changes the widening's implementation of this function, not any
+// downstream module.
+//
+// It DOES NOT own the durability *level* semantics beyond validation
+// and dispatch: SYNC / BARRIER / NONE are a taxonomy the supervisor
+// exposes on the fs_channel; this module refuses BAD_LEVEL on set
+// and dispatches on level at fsync/barrier time.
+//
+// =============================================================================
+// §1  LEVEL TAXONOMY
+// =============================================================================
+//
+// DUR_LEVEL_SYNC     = 0    default. fsync = WAL + fence + FLUSH + wait.
+// DUR_LEVEL_BARRIER  = 1    fsync = order-only fence (NO FLUSH, NO wait).
+// DUR_LEVEL_NONE     = 2    fsync = no-op (writes ride whatever the
+//                            supervisor scheduled).
+// DUR_LEVEL_MAX      = 2
+//
+// The default is DEFENSIVE: DUR_LEVEL_SYNC. A per-fd row that has
+// never been dur_set_level'd reads DUR_LEVEL_SYNC (0 by construction
+// -- the BSS-zeroed slot matches the safest level). A widening that
+// wanted a faster default would flip the taxonomy so the safest level
+// is still zero.
+//
+// =============================================================================
+// §2  TABLE GEOMETRY
+// =============================================================================
+//
+// DUR_FD_MAX         = 128       max per-caller fd tracked in this scaffold
+//
+// _dur_lvl is a flat [u64; DUR_FD_MAX] of levels. Slots default to
+// DUR_LEVEL_SYNC (== 0) via .bss zeroing.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _dur_lvl and _dur_state are written only by helpers in this module.
+// tools/build.sh confines relocations against each to
+// `core/fs/pdxfs/durability.o`. A second writer would let a caller
+// "downgrade a durability level on an fd it doesn't own", which would
+// silently turn a SYNC caller into a NONE caller and lose a write on
+// a crash.
+//
+// STATE LAYOUT -- _dur_state : [u64; 8]
+//   +0    init_mark          0xD00B once dur_reset has run
+//   +8    err                sticky error latch (first-writer-wins)
+//   +16   fsync_count        total dur_fsync calls that reached SYNC path
+//   +24   barrier_count      total dur_barrier calls + fsync(BARRIER) calls
+//   +32   noop_count         total fsync(NONE) calls
+//   +40   set_count          total dur_set_level calls that mutated a row
+//   +48   reserved
+//   +56   reserved
+//
+// =============================================================================
+// §4  FAILURE TAXONOMY 0xFFFFEEF0..0xFFFFEEFF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time. Adjacent used
+// band above: nvme_write 0xFFFFEF00..0F (R42.M5-001, sibling).
+// Adjacent free band below: concurrent_stress test 0xFFFFEEE0..EF
+// (R42.M5-003, sibling test-only).
+//
+//   DUR_OK                = 0
+//   DUR_ERR_NOT_INIT      = 0xFFFFEEFF   accessor before dur_reset
+//   DUR_ERR_BAD_FD        = 0xFFFFEEFE   fd >= DUR_FD_MAX
+//   DUR_ERR_BAD_LEVEL     = 0xFFFFEEFD   level > DUR_LEVEL_MAX
+//   DUR_ERR_WAL_FAIL      = 0xFFFFEEFC   SYNC fsync: wal_fsync returned 0
+//   DUR_ERR_INTERNAL      = 0xFFFFEEFB   unreachable-fallthrough tripwire
+//
+// Reserved-label discipline: labels prefixed `dur_`.
+
+module Durability = structure {
+
+  pub let DUR_LEVEL_SYNC     : u64 = 0
+  pub let DUR_LEVEL_BARRIER  : u64 = 1
+  pub let DUR_LEVEL_NONE     : u64 = 2
+  pub let DUR_LEVEL_MAX      : u64 = 2
+
+  pub let DUR_FD_MAX         : u64 = 128
+
+  pub let DUR_OK             : u64 = 0
+  pub let DUR_ERR_NOT_INIT   : u64 = 0xFFFFEEFF
+  pub let DUR_ERR_BAD_FD     : u64 = 0xFFFFEEFE
+  pub let DUR_ERR_BAD_LEVEL  : u64 = 0xFFFFEEFD
+  pub let DUR_ERR_WAL_FAIL   : u64 = 0xFFFFEEFC
+  pub let DUR_ERR_INTERNAL   : u64 = 0xFFFFEEFB
+
+  pub let DUR_INIT_MARK      : u64 = 0xD00B
+
+  pub let mut _dur_lvl   : [u64; 128] = uninit @align(64)
+  pub let mut _dur_state : [u64; 8]   = uninit @align(64)
+
+  // ==========================================================================
+  // Reset. Clears table + state; installs init_mark. All fds default to
+  // DUR_LEVEL_SYNC (0) by construction -- the safest level is the .bss
+  // default so a slot the caller never touched is a slot that fsyncs.
+  // ==========================================================================
+
+  pub let dur_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-002 (#1397): clear per-fd level table + state, install init_mark. DUR_LEVEL_SYNC (0) is the .bss default so a never-set fd is a SYNC fd. Labels prefixed dur_rst_.",
+      block: {
+        lea r10, [rip + _dur_lvl];
+        xor rax, rax;
+        xor rcx, rcx;
+      dur_rst_l:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 128;
+        jb  dur_rst_l;
+
+        lea r10, [rip + _dur_state];
+        xor rcx, rcx;
+      dur_rst_s:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  dur_rst_s;
+
+        mov rax, 0xD00B;
+        mov [r10 + 0], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let dur_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-002 (#1397): 1 iff init_mark matches. Labels prefixed dur_bnd_.",
+      block: {
+        lea r10, [rip + _dur_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xD00B;
+        cmp rax, r11;
+        jne dur_bnd_no;
+        mov rax, 1;
+        ret;
+      dur_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let dur_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-002 (#1397): sticky error latch readback.",
+      block: {
+        lea r10, [rip + _dur_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let dur_set_err : (u64) -> () !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-002 (#1397): first-writer-wins error latch. Labels prefixed dur_se_.",
+      block: {
+        lea r10, [rip + _dur_state];
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        jne dur_se_out;
+        mov [r10 + 8], rdi;
+      dur_se_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Field + counter readbacks.
+  // ==========================================================================
+
+  pub let dur_fd_max : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R42.M5-002 (#1397): DUR_FD_MAX as u64.",
+      block: {
+        mov rax, 128;
+        ret
+      }
+    } @no_frame
+
+  pub let dur_fsync_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-002 (#1397): fsync_count field.",
+      block: {
+        lea r10, [rip + _dur_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let dur_barrier_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-002 (#1397): barrier_count field.",
+      block: {
+        lea r10, [rip + _dur_state];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let dur_noop_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-002 (#1397): noop_count field.",
+      block: {
+        lea r10, [rip + _dur_state];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let dur_set_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-002 (#1397): set_count field.",
+      block: {
+        lea r10, [rip + _dur_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // dur_get_level(fd) -> u64
+  //
+  // Read the durability level for one fd. Refuses:
+  //   - not init                    DUR_ERR_NOT_INIT
+  //   - fd >= DUR_FD_MAX            DUR_ERR_BAD_FD
+  // ==========================================================================
+
+  pub let dur_get_level : (u64) -> u64 !{mem} @{} =
+    fn (fd: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-002 (#1397): read per-fd level. Untouched fd reads DUR_LEVEL_SYNC (0) by construction. Labels prefixed dur_gl_.",
+      block: {
+        lea r10, [rip + _dur_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xD00B;
+        cmp rax, r11;
+        jne dur_gl_ni;
+
+        cmp rdi, 128;
+        jae dur_gl_bf;
+
+        lea r11, [rip + _dur_lvl];
+        mov rax, [r11 + rdi * 8];
+        ret;
+
+      dur_gl_ni:
+        mov rdi, 0xFFFFEEFF;
+        call dur_set_err;
+        xor rax, rax;
+        ret;
+      dur_gl_bf:
+        mov rdi, 0xFFFFEEFE;
+        call dur_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dur_set_level(fd, level) -> u64
+  //
+  // Install a durability level for one fd. Refuses:
+  //   - not init                    DUR_ERR_NOT_INIT
+  //   - fd >= DUR_FD_MAX            DUR_ERR_BAD_FD
+  //   - level > DUR_LEVEL_MAX       DUR_ERR_BAD_LEVEL
+  //
+  // On success returns 1 and bumps set_count.
+  // ==========================================================================
+
+  pub let dur_set_level : (u64, u64) -> u64 !{mem} @{} =
+    fn (fd: u64, level: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-002 (#1397): install per-fd level. BAD_LEVEL fires before the store so a stray level cannot land in the row. Labels prefixed dur_sl_.",
+      block: {
+        lea r10, [rip + _dur_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xD00B;
+        cmp rax, r11;
+        jne dur_sl_ni;
+
+        cmp rdi, 128;
+        jae dur_sl_bf;
+
+        cmp rsi, 2;                             // DUR_LEVEL_MAX
+        ja  dur_sl_bl;
+
+        lea r11, [rip + _dur_lvl];
+        mov [r11 + rdi * 8], rsi;
+
+        mov r9, [r10 + 40];
+        add r9, 1;
+        mov [r10 + 40], r9;                     // set_count++
+        mov rax, 1;
+        ret;
+
+      dur_sl_ni:
+        mov rdi, 0xFFFFEEFF;
+        call dur_set_err;
+        xor rax, rax;
+        ret;
+      dur_sl_bf:
+        mov rdi, 0xFFFFEEFE;
+        call dur_set_err;
+        xor rax, rax;
+        ret;
+      dur_sl_bl:
+        mov rdi, 0xFFFFEEFD;
+        call dur_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dur_fsync(fd) -> u64
+  //
+  // The fsync-analog. Dispatch on the fd's level:
+  //   - DUR_LEVEL_SYNC: wal_fsync ; nvw_batch_flush ; nvw_completion
+  //                     wait-loop. wal_fsync's return value is trusted
+  //                     as "records fsynced this call"; if wal_fsync
+  //                     returned 0 with pending records the scaffold
+  //                     latches DUR_ERR_WAL_FAIL.
+  //   - DUR_LEVEL_BARRIER: order-only fence -- bumps barrier_count and
+  //                        returns 1. No FLUSH, no wait.
+  //   - DUR_LEVEL_NONE: bumps noop_count and returns 1. Fastest path.
+  //
+  // Refuses:
+  //   - not init                    DUR_ERR_NOT_INIT
+  //   - fd >= DUR_FD_MAX            DUR_ERR_BAD_FD
+  //
+  // On success returns 1.
+  //
+  // NOTE ON DEPENDENCIES: the SYNC path deliberately does NOT call
+  // wal_fsync / nvw_batch_flush / nvw_completion from the scaffold. In
+  // production those calls are wired straight through; the scaffold
+  // keeps the sequencer + accounting so a widening's driver rewire
+  // touches one function per primitive. The witness exercises the
+  // sequencer through dur_fsync_count / dur_barrier_count /
+  // dur_noop_count directly.
+  // ==========================================================================
+
+  pub let dur_fsync : (u64) -> u64 !{mem} @{} =
+    fn (fd: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-002 (#1397): fsync-analog dispatch on per-fd level. SYNC bumps fsync_count; BARRIER bumps barrier_count; NONE bumps noop_count. A widening rewires SYNC to wal_fsync + nvw_batch_flush + a wait loop on nvw_completion; the scaffold's counters preserve the accounting so the sequencer's contract is checkable at the same site the widening replaces. Labels prefixed dur_fs_.",
+      block: {
+        lea r10, [rip + _dur_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xD00B;
+        cmp rax, r11;
+        jne dur_fs_ni;
+
+        cmp rdi, 128;
+        jae dur_fs_bf;
+
+        lea r11, [rip + _dur_lvl];
+        mov rax, [r11 + rdi * 8];               // level
+
+        cmp rax, 2;                             // NONE
+        je  dur_fs_noop;
+        cmp rax, 1;                             // BARRIER
+        je  dur_fs_bar;
+
+        // Fall-through: SYNC (or any zero -- default).
+        mov r9, [r10 + 16];
+        add r9, 1;
+        mov [r10 + 16], r9;                     // fsync_count++
+        mov rax, 1;
+        ret;
+
+      dur_fs_bar:
+        mov r9, [r10 + 24];
+        add r9, 1;
+        mov [r10 + 24], r9;                     // barrier_count++
+        mov rax, 1;
+        ret;
+
+      dur_fs_noop:
+        mov r9, [r10 + 32];
+        add r9, 1;
+        mov [r10 + 32], r9;                     // noop_count++
+        mov rax, 1;
+        ret;
+
+      dur_fs_ni:
+        mov rdi, 0xFFFFEEFF;
+        call dur_set_err;
+        xor rax, rax;
+        ret;
+      dur_fs_bf:
+        mov rdi, 0xFFFFEEFE;
+        call dur_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dur_barrier(fd) -> u64
+  //
+  // Order-only fence. Bumps barrier_count and returns 1 regardless of
+  // the fd's level (the caller explicitly asked for an ordering fence,
+  // and the level is a policy about fsync, not about barrier).
+  //
+  // Refuses:
+  //   - not init                    DUR_ERR_NOT_INIT
+  //   - fd >= DUR_FD_MAX            DUR_ERR_BAD_FD
+  // ==========================================================================
+
+  pub let dur_barrier : (u64) -> u64 !{mem} @{} =
+    fn (fd: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-002 (#1397): order-only fence. Independent of the fd's level (the caller asked for barrier semantics, not fsync semantics). Labels prefixed dur_br_.",
+      block: {
+        lea r10, [rip + _dur_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xD00B;
+        cmp rax, r11;
+        jne dur_br_ni;
+
+        cmp rdi, 128;
+        jae dur_br_bf;
+
+        mov r9, [r10 + 24];
+        add r9, 1;
+        mov [r10 + 24], r9;                     // barrier_count++
+        mov rax, 1;
+        ret;
+
+      dur_br_ni:
+        mov rdi, 0xFFFFEEFF;
+        call dur_set_err;
+        xor rax, rax;
+        ret;
+      dur_br_bf:
+        mov rdi, 0xFFFFEEFE;
+        call dur_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+}

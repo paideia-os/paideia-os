@@ -1,0 +1,716 @@
+// src/kernel/core/fs/pdxfs/nvme_write.pdx -- R42.M5-001 (#1396)
+//
+// PDXFS v1 -- NVMe WRITE PATH INTEGRATION.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the AUTHORITY on how a PdxFS v1 block write leaves the CoW
+// walker and reaches the NVMe kernel driver: every logical write from
+// cow_write.pdx / refcount.pdx / wal.pdx that must land on device
+// crosses THIS module, so no caller can hand-roll a submission that
+// bypasses the WAL fsync + refcount gates the sibling modules maintain.
+//
+// It is a SCAFFOLD (D7). Submission Queue entries are accumulated in a
+// small BSS ring; a batch is "flushed" by a call that moves entries
+// from the pending band into the submitted band and bumps the
+// submit_count. Completions are modelled by a per-cid ack that moves
+// entries out of the submitted band into the completed band. The
+// widening replaces the pending/submitted bands with a real NVMe SQ /
+// CQ pair and the ack with the driver interrupt handler that reads
+// the CQE, freeing the cid.
+//
+// It DOES NOT own the NVMe driver. The driver interface exists per
+// #906; this module carries the FS-side batching + accounting so a
+// widening's swap-in of the actual doorbell write and the actual
+// interrupt-driven CQE walk touches ONE line in nvw_batch_flush and
+// ONE line in nvw_completion respectively.
+//
+// It DOES NOT own the WAL invariant. wal.pdx is the authority on
+// write-ahead ordering; a caller that submits a block write here
+// before the corresponding record is fsynced through wal_fsync is a
+// caller that will (once the driver is real) tear on a crash. That
+// invariant is enforced at THE CALL SITE (cow_write's write pass)
+// rather than duplicated here: this module is the plumbing, wal.pdx
+// is the discipline.
+//
+// It DOES NOT own durability policy. durability.pdx (#1397) is the
+// authority on the FLUSH-and-fence sequence a caller executes when it
+// wants ordered persistence; this module's nvw_completion is the
+// atomic that a FLUSH-wait spins on.
+//
+// =============================================================================
+// §1  QUEUE GEOMETRY
+// =============================================================================
+//
+// NVW_SQ_DEPTH        = 64      max pending + submitted entries
+// NVW_ENTRY_WORDS     = 4       per-entry footprint in u64s
+//
+// _nvw_sq is a flat [u64; NVW_SQ_DEPTH * NVW_ENTRY_WORDS]. Entry(i)
+// starts at _nvw_sq[i * 4]:
+//
+//   +0    cid              command id (>= 1); 0 = free slot
+//   +8    lba              linear block address the write targets
+//   +16   len              payload length in bytes (>= 1)
+//   +24   status           0 = pending, 1 = submitted, 2 = completed
+//
+// batch_head is the next-write index for nvw_submit (also the
+// pending count until nvw_batch_flush moves them). A batch_flush
+// walks [0..batch_head), stamps status = 1 (submitted), records the
+// number in submitted_count, and leaves batch_head untouched (the
+// entries stay in the SQ until completion frees them).
+//
+// A widening will replace the flat status field with the real NVMe
+// CQE phase-tag protocol; the FS-side plumbing here uses the
+// simplest possible watermark scheme so the semantic (pending ->
+// submitted -> completed) is expressible without a driver.
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _nvw_sq and _nvw_state are written only by helpers in this module.
+// tools/build.sh confines relocations against each to
+// `core/fs/pdxfs/nvme_write.o`. A second writer would let a caller
+// "submit a block write to the driver without recording the CoW
+// walker's guard" or "acknowledge a completion for a cid the walker
+// never submitted", either of which would let the block-layout
+// bookkeeping drift out of sync with what the device actually holds.
+//
+// STATE LAYOUT -- _nvw_state : [u64; 8]
+//   +0    init_mark          0xF11E once nvw_reset has run
+//   +8    err                sticky error latch (first-writer-wins)
+//   +16   batch_head         next-write index into the SQ (pending count)
+//   +24   next_cid           next command id nvw_submit will hand out
+//   +32   submit_count       total nvw_submit calls that succeeded
+//   +40   flush_count        total nvw_batch_flush calls that moved entries
+//   +48   flushed_total      cumulative entries moved pending -> submitted
+//   +56   completion_count   total nvw_completion calls that succeeded
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFEF00..0xFFFFEF0F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time. Adjacent used
+// band above: fs_channel 0xFFFFEF10..1F (R42.M4-004, sibling).
+// Adjacent free band below: durability 0xFFFFEEF0..FF (R42.M5-002,
+// sibling).
+//
+//   NVW_OK              = 0
+//   NVW_ERR_NOT_INIT    = 0xFFFFEF0F   accessor before nvw_reset
+//   NVW_ERR_SQ_FULL     = 0xFFFFEF0E   submit when batch_head == SQ_DEPTH
+//   NVW_ERR_BAD_LEN     = 0xFFFFEF0D   submit with len == 0
+//   NVW_ERR_BAD_CID     = 0xFFFFEF0C   completion with cid not in SQ
+//   NVW_ERR_ALREADY_DONE= 0xFFFFEF0B   completion of a cid already completed
+//   NVW_ERR_NOT_SUBMIT  = 0xFFFFEF0A   completion of a cid still pending
+//   NVW_ERR_INTERNAL    = 0xFFFFEF09   unreachable-fallthrough tripwire
+//
+// Reserved-label discipline: labels prefixed `nvw_`.
+
+module NvmeWrite = structure {
+
+  pub let NVW_SQ_DEPTH        : u64 = 64
+  pub let NVW_ENTRY_WORDS     : u64 = 4
+
+  pub let NVW_STATUS_PENDING    : u64 = 0
+  pub let NVW_STATUS_SUBMITTED  : u64 = 1
+  pub let NVW_STATUS_COMPLETED  : u64 = 2
+
+  pub let NVW_OK              : u64 = 0
+  pub let NVW_ERR_NOT_INIT    : u64 = 0xFFFFEF0F
+  pub let NVW_ERR_SQ_FULL     : u64 = 0xFFFFEF0E
+  pub let NVW_ERR_BAD_LEN     : u64 = 0xFFFFEF0D
+  pub let NVW_ERR_BAD_CID     : u64 = 0xFFFFEF0C
+  pub let NVW_ERR_ALREADY_DONE: u64 = 0xFFFFEF0B
+  pub let NVW_ERR_NOT_SUBMIT  : u64 = 0xFFFFEF0A
+  pub let NVW_ERR_INTERNAL    : u64 = 0xFFFFEF09
+
+  pub let NVW_INIT_MARK       : u64 = 0xF11E
+
+  // 64 entries * 4 u64 = 256 u64. Aligned so a per-entry load starts
+  // on a cache line that the widening's real driver can DMA into.
+  pub let mut _nvw_sq    : [u64; 256] = uninit @align(64)
+  pub let mut _nvw_state : [u64; 8]   = uninit @align(64)
+
+  // ==========================================================================
+  // Reset. Clears queue + state; installs init_mark and primes next_cid = 1.
+  // A cid of 0 would collide with the "free slot" sentinel in the entry.
+  // ==========================================================================
+
+  pub let nvw_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): clear SQ + state, install init_mark, prime next_cid to 1 (0 is the free-slot sentinel in _nvw_sq entries). Labels prefixed nvw_rst_.",
+      block: {
+        lea r10, [rip + _nvw_sq];
+        xor rax, rax;
+        xor rcx, rcx;
+      nvw_rst_q:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 256;
+        jb  nvw_rst_q;
+
+        lea r10, [rip + _nvw_state];
+        xor rcx, rcx;
+      nvw_rst_s:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  nvw_rst_s;
+
+        mov rax, 0xF11E;
+        mov [r10 + 0], rax;
+        mov rax, 1;
+        mov [r10 + 24], rax;                    // next_cid := 1
+        ret
+      }
+    } @no_frame
+
+  pub let nvw_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): 1 iff init_mark matches. Labels prefixed nvw_bnd_.",
+      block: {
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xF11E;
+        cmp rax, r11;
+        jne nvw_bnd_no;
+        mov rax, 1;
+        ret;
+      nvw_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let nvw_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): sticky error latch readback.",
+      block: {
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let nvw_set_err : (u64) -> () !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): first-writer-wins error latch. Labels prefixed nvw_se_.",
+      block: {
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        jne nvw_se_out;
+        mov [r10 + 8], rdi;
+      nvw_se_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Field readbacks.
+  // ==========================================================================
+
+  pub let nvw_depth : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R42.M5-001 (#1396): NVW_SQ_DEPTH as u64.",
+      block: {
+        mov rax, 64;
+        ret
+      }
+    } @no_frame
+
+  pub let nvw_batch_head : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): batch_head (pending count).",
+      block: {
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let nvw_next_cid : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): next_cid field.",
+      block: {
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let nvw_submit_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): submit_count field.",
+      block: {
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let nvw_flush_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): flush_count field.",
+      block: {
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let nvw_flushed_total : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): flushed_total field.",
+      block: {
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 48];
+        ret
+      }
+    } @no_frame
+
+  pub let nvw_completion_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): completion_count field.",
+      block: {
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 56];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Per-entry accessors. Refuse on:
+  //   - not init                    NVW_ERR_NOT_INIT
+  //   - idx >= batch_head           NVW_ERR_BAD_CID (positional; caller passed
+  //                                                    an entry idx past pending
+  //                                                    count).
+  // ==========================================================================
+
+  pub let nvw_cid_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): read cid of entry idx. Labels prefixed nvw_ca_.",
+      block: {
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xF11E;
+        cmp rax, r11;
+        jne nvw_ca_ni;
+        mov rax, [r10 + 16];
+        cmp rdi, rax;
+        jae nvw_ca_bi;
+
+        mov rax, rdi;
+        shl rax, 2;                             // idx * 4
+        lea r11, [rip + _nvw_sq];
+        mov rax, [r11 + rax * 8];               // +0 cid
+        ret;
+
+      nvw_ca_ni:
+        mov rdi, 0xFFFFEF0F;
+        call nvw_set_err;
+        xor rax, rax;
+        ret;
+      nvw_ca_bi:
+        mov rdi, 0xFFFFEF0C;
+        call nvw_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let nvw_lba_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): read lba of entry idx. Labels prefixed nvw_la_.",
+      block: {
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xF11E;
+        cmp rax, r11;
+        jne nvw_la_ni;
+        mov rax, [r10 + 16];
+        cmp rdi, rax;
+        jae nvw_la_bi;
+
+        mov rax, rdi;
+        shl rax, 2;
+        add rax, 1;                             // +1 (u64) = +8 = lba
+        lea r11, [rip + _nvw_sq];
+        mov rax, [r11 + rax * 8];
+        ret;
+
+      nvw_la_ni:
+        mov rdi, 0xFFFFEF0F;
+        call nvw_set_err;
+        xor rax, rax;
+        ret;
+      nvw_la_bi:
+        mov rdi, 0xFFFFEF0C;
+        call nvw_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let nvw_len_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): read len of entry idx. Labels prefixed nvw_na_.",
+      block: {
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xF11E;
+        cmp rax, r11;
+        jne nvw_na_ni;
+        mov rax, [r10 + 16];
+        cmp rdi, rax;
+        jae nvw_na_bi;
+
+        mov rax, rdi;
+        shl rax, 2;
+        add rax, 2;                             // +2 u64 = len
+        lea r11, [rip + _nvw_sq];
+        mov rax, [r11 + rax * 8];
+        ret;
+
+      nvw_na_ni:
+        mov rdi, 0xFFFFEF0F;
+        call nvw_set_err;
+        xor rax, rax;
+        ret;
+      nvw_na_bi:
+        mov rdi, 0xFFFFEF0C;
+        call nvw_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let nvw_status_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): read status of entry idx. Labels prefixed nvw_sa_.",
+      block: {
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xF11E;
+        cmp rax, r11;
+        jne nvw_sa_ni;
+        mov rax, [r10 + 16];
+        cmp rdi, rax;
+        jae nvw_sa_bi;
+
+        mov rax, rdi;
+        shl rax, 2;
+        add rax, 3;                             // +3 u64 = status
+        lea r11, [rip + _nvw_sq];
+        mov rax, [r11 + rax * 8];
+        ret;
+
+      nvw_sa_ni:
+        mov rdi, 0xFFFFEF0F;
+        call nvw_set_err;
+        xor rax, rax;
+        ret;
+      nvw_sa_bi:
+        mov rdi, 0xFFFFEF0C;
+        call nvw_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvw_submit(lba, len) -> u64
+  //
+  // Enqueue one write in the pending band. Assigns a fresh cid
+  // (next_cid++), stamps status = 0 (pending). Returns the assigned
+  // cid on success (>= 1).
+  //
+  // Refuses:
+  //   - not init                    NVW_ERR_NOT_INIT
+  //   - len == 0                    NVW_ERR_BAD_LEN
+  //   - batch_head == NVW_SQ_DEPTH  NVW_ERR_SQ_FULL
+  //
+  // A caller that hits SQ_FULL must call nvw_batch_flush (to move the
+  // pending band into the submitted band and free the pending count)
+  // and then await completions (to actually free entry slots). The
+  // scaffold does not coalesce completed slots into batch_head; a
+  // widening's real SQ head pointer will reclaim them.
+  // ==========================================================================
+
+  pub let nvw_submit : (u64, u64) -> u64 !{mem} @{} =
+    fn (lba: u64, len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): enqueue one pending write. Assigns next_cid (>= 1 because 0 is the free-slot sentinel), stamps status = PENDING (0). SQ_FULL is refused rather than overwritten because an in-place overwrite would drop a write the CoW walker's guard has already accounted for. Labels prefixed nvw_sb_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xF11E;
+        cmp rax, r11;
+        jne nvw_sb_ni;
+
+        cmp rsi, 0;
+        je  nvw_sb_bl;
+
+        mov rbx, [r10 + 16];                    // batch_head
+        mov r11, 64;                            // NVW_SQ_DEPTH
+        cmp rbx, r11;
+        jae nvw_sb_full;
+
+        mov r12, [r10 + 24];                    // next_cid
+
+        // r13 = idx * 4 (u64 offset for entry base)
+        mov rax, rbx;
+        shl rax, 2;
+        mov r13, rax;
+
+        lea r11, [rip + _nvw_sq];
+        mov [r11 + r13 * 8], r12;               // +0 cid
+        add r13, 1;
+        mov [r11 + r13 * 8], rdi;               // +8 lba
+        add r13, 1;
+        mov [r11 + r13 * 8], rsi;               // +16 len
+        add r13, 1;
+        xor rax, rax;
+        mov [r11 + r13 * 8], rax;               // +24 status = PENDING
+
+        // batch_head++, next_cid++, submit_count++.
+        add rbx, 1;
+        mov [r10 + 16], rbx;
+        add r12, 1;
+        mov [r10 + 24], r12;
+        mov r9, [r10 + 32];
+        add r9, 1;
+        mov [r10 + 32], r9;
+
+        // Return the cid we just used (r12 - 1).
+        mov rax, r12;
+        sub rax, 1;
+        jmp nvw_sb_out;
+
+      nvw_sb_ni:
+        mov rdi, 0xFFFFEF0F;
+        call nvw_set_err;
+        xor rax, rax;
+        jmp nvw_sb_out;
+      nvw_sb_bl:
+        mov rdi, 0xFFFFEF0D;
+        call nvw_set_err;
+        xor rax, rax;
+        jmp nvw_sb_out;
+      nvw_sb_full:
+        mov rdi, 0xFFFFEF0E;
+        call nvw_set_err;
+        xor rax, rax;
+
+      nvw_sb_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvw_batch_flush() -> u64
+  //
+  // Move every pending entry to the submitted band. Walks
+  // [0..batch_head), stamps status = 1 (SUBMITTED) on every entry
+  // currently PENDING (0), leaves entries already SUBMITTED (1) or
+  // COMPLETED (2) alone. Bumps flush_count once per call (even if
+  // zero entries move; the flush attempt is itself an event), and
+  // adds the number moved to flushed_total. Returns the number of
+  // entries newly submitted.
+  //
+  // A widening replaces this with the doorbell write; the FS-side
+  // batching is the same.
+  //
+  // Refuses:
+  //   - not init                    NVW_ERR_NOT_INIT
+  // ==========================================================================
+
+  pub let nvw_batch_flush : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): flush the pending band into the submitted band. flush_count bumps regardless of the moved count so a caller polling flush_count sees every doorbell attempt; flushed_total accumulates only the actually-moved count. A widening will replace the walk with a single MMIO write to the SQ tail doorbell. Labels prefixed nvw_bf_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xF11E;
+        cmp rax, r11;
+        jne nvw_bf_ni;
+
+        // flush_count++
+        mov r9, [r10 + 40];
+        add r9, 1;
+        mov [r10 + 40], r9;
+
+        mov r12, [r10 + 16];                    // batch_head
+        xor rbx, rbx;                           // i = 0
+        xor r13, r13;                           // newly-submitted counter
+
+      nvw_bf_top:
+        cmp rbx, r12;
+        jae nvw_bf_done;
+
+        // status offset = i * 4 + 3
+        mov rax, rbx;
+        shl rax, 2;
+        add rax, 3;
+        lea r11, [rip + _nvw_sq];
+        mov r8, [r11 + rax * 8];
+        cmp r8, 0;                              // only PENDING moves
+        jne nvw_bf_next;
+
+        mov r8, 1;                              // SUBMITTED
+        mov [r11 + rax * 8], r8;
+        add r13, 1;
+
+      nvw_bf_next:
+        add rbx, 1;
+        jmp nvw_bf_top;
+
+      nvw_bf_done:
+        lea r10, [rip + _nvw_state];
+        mov r9, [r10 + 48];
+        add r9, r13;
+        mov [r10 + 48], r9;                     // flushed_total += r13
+        mov rax, r13;
+        jmp nvw_bf_out;
+
+      nvw_bf_ni:
+        mov rdi, 0xFFFFEF0F;
+        call nvw_set_err;
+        xor rax, rax;
+
+      nvw_bf_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvw_completion(cid) -> u64
+  //
+  // Acknowledge completion of one command. Walks [0..batch_head)
+  // searching for entry.cid == cid. Refuses:
+  //   - not init                    NVW_ERR_NOT_INIT
+  //   - cid not present             NVW_ERR_BAD_CID
+  //   - entry status == COMPLETED   NVW_ERR_ALREADY_DONE
+  //   - entry status == PENDING     NVW_ERR_NOT_SUBMIT (completion
+  //                                                       before flush is
+  //                                                       impossible in
+  //                                                       hardware; refuse
+  //                                                       the caller who
+  //                                                       fakes one).
+  // On success: stamps status = COMPLETED, bumps completion_count.
+  // Returns 1.
+  //
+  // A widening replaces the linear search with the CQE walk; the
+  // ACK semantics are the same.
+  // ==========================================================================
+
+  pub let nvw_completion : (u64) -> u64 !{mem} @{} =
+    fn (cid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396): acknowledge one completion. The linear search is a scaffold artefact; the widening's real driver reads the phase-tagged CQE. The ALREADY_DONE + NOT_SUBMIT refusals keep the state machine honest: a caller that acks the same cid twice or that acks a cid still in the pending band exposes a divergence with the underlying NVMe protocol. Labels prefixed nvw_co_.",
+      block: {
+        push rbx;
+        push r12;
+
+        lea r10, [rip + _nvw_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xF11E;
+        cmp rax, r11;
+        jne nvw_co_ni;
+
+        mov r12, [r10 + 16];                    // batch_head
+        xor rbx, rbx;                           // i = 0
+
+      nvw_co_top:
+        cmp rbx, r12;
+        jae nvw_co_bc;
+
+        // cid offset = i * 4 + 0
+        mov rax, rbx;
+        shl rax, 2;
+        lea r11, [rip + _nvw_sq];
+        mov r8, [r11 + rax * 8];
+        cmp r8, rdi;
+        je  nvw_co_hit;
+
+        add rbx, 1;
+        jmp nvw_co_top;
+
+      nvw_co_hit:
+        // status offset = i * 4 + 3
+        add rax, 3;
+        mov r8, [r11 + rax * 8];
+        cmp r8, 2;
+        je  nvw_co_ad;
+        cmp r8, 0;
+        je  nvw_co_ns;
+
+        // status == SUBMITTED. Mark COMPLETED and bump counter.
+        mov r8, 2;
+        mov [r11 + rax * 8], r8;
+        lea r10, [rip + _nvw_state];
+        mov r9, [r10 + 56];
+        add r9, 1;
+        mov [r10 + 56], r9;
+        mov rax, 1;
+        jmp nvw_co_out;
+
+      nvw_co_ni:
+        mov rdi, 0xFFFFEF0F;
+        call nvw_set_err;
+        xor rax, rax;
+        jmp nvw_co_out;
+      nvw_co_bc:
+        mov rdi, 0xFFFFEF0C;
+        call nvw_set_err;
+        xor rax, rax;
+        jmp nvw_co_out;
+      nvw_co_ad:
+        mov rdi, 0xFFFFEF0B;
+        call nvw_set_err;
+        xor rax, rax;
+        jmp nvw_co_out;
+      nvw_co_ns:
+        mov rdi, 0xFFFFEF0A;
+        call nvw_set_err;
+        xor rax, rax;
+
+      nvw_co_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
