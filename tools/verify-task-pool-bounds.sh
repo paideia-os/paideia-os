@@ -351,6 +351,7 @@ STANDALONE_SLABS = [
     ("src/kernel/boot/witness/r20b_ipc.pdx", "_sys_ipc_send_witness_fake_tcb"),
     ("tests/kernel/driver/death_witness.pdx", "_pdw_tcb"),
     ("tests/kernel/driver/death_witness.pdx", "_pdw_client"),
+    ("tests/kernel/driver/death_witness.pdx", "_pdw_ghost_slab"),
 ]
 
 file_cache = {}
