@@ -1,0 +1,570 @@
+// src/kernel/core/fs/pdxfs/cow_read.pdx -- R42.M1-002 (#1381)
+//
+// PDXFS v1 CoW WALKER -- READ PATH (snapshot chain walk).
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the READ HALF of the copy-on-write walker. Every PdxFS read
+// resolves a logical LBA to a physical block by walking the snapshot
+// chain from newest to oldest and returning the physical block the
+// most-recently-added mapping names. A per-LBA cache short-circuits
+// subsequent reads.
+//
+// It is a SCAFFOLD (D7). The scaffold models the chain as a flat log
+// of (snapshot_id, lba, phys_blk) triples ordered by insertion; a walk
+// visits the top of the log first, so the newest mapping wins. An
+// on-disk chain (per-snapshot block table pages) is a widening -- the
+// walk semantics do not change.
+//
+// It does NOT allocate blocks. cow_write.pdx owns block allocation and
+// calls pxcr_snapshot_map to register a new mapping.
+//
+// It does NOT delete mappings. cow_gc.pdx retires unreferenced physical
+// blocks; a stale (lba, phys) triple in an old snapshot remains until
+// pxcr_reset. The refcount table is the source of truth for whether a
+// physical block is live.
+//
+// =============================================================================
+// §1  CHAIN GEOMETRY
+// =============================================================================
+//
+// PXCR_MAX_SNAPSHOTS   = 8       number of snapshot_id values the scaffold
+//                                 recognises via pxcr_snapshot_push.
+// PXCR_MAX_ENTRIES     = 128     total mappings across all snapshots.
+// PXCR_CACHE_ENTRIES   = 16      lba -> phys mappings the last-successful
+//                                 read caches for subsequent hits.
+// PXCR_DEV_EXTENT      = 4096    logical LBAs the scaffold accepts.
+//
+// _pxcr_chain layout (128 entries * 3 u64):
+//   entry(i) = _pxcr_chain[i * 3 .. i * 3 + 2]
+//     +0  snapshot_id
+//     +8  lba
+//     +16 phys_blk
+//
+// _pxcr_cache layout (16 entries * 2 u64):
+//   entry(i) = _pxcr_cache[i * 2 .. i * 2 + 1]
+//     +0  lba
+//     +8  phys_blk
+// A cache slot with lba == 0xFFFFFFFFFFFFFFFF is empty. The cache is a
+// direct-mapped ring: idx = lba & (PXCR_CACHE_ENTRIES - 1).
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _pxcr_chain, _pxcr_cache and _pxcr_state are written only by helpers
+// in this module. tools/build.sh confines relocations against each to
+// `core/fs/pdxfs/cow_read.o`.
+//
+// STATE LAYOUT -- _pxcr_state : [u64; 8]
+//   +0    init_mark          0xC024 once pxcr_reset has run
+//   +8    err                sticky error latch
+//   +16   snapshot_top       highest snapshot_id pushed (0 = none)
+//   +24   snapshot_count     number of pxcr_snapshot_push calls
+//   +32   chain_len          number of live entries in _pxcr_chain
+//   +40   walk_count         total pxcr_read calls that walked
+//   +48   cache_hits         reads served from _pxcr_cache
+//   +56   cache_misses       reads that had to walk (and cached the result)
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFEFF0..0xFFFFEFFF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time. Adjacent used band
+// above: refcount 0xFFFFF000..0F (R42.M1-001). Adjacent used band
+// below: cow_write 0xFFFFEFE0..EF (R42.M1-003).
+//
+//   PXCR_OK                 = 0
+//   PXCR_ERR_NOT_INIT       = 0xFFFFEFFF   accessor before pxcr_reset
+//   PXCR_ERR_CHAIN_FULL     = 0xFFFFEFFE   pxcr_snapshot_map: _pxcr_chain full
+//   PXCR_ERR_SNAP_FULL      = 0xFFFFEFFD   pxcr_snapshot_push: already at MAX
+//   PXCR_ERR_OUT_OF_EXTENT  = 0xFFFFEFFC   lba >= PXCR_DEV_EXTENT
+//   PXCR_ERR_NOT_FOUND      = 0xFFFFEFFB   pxcr_read: no mapping for lba
+//   PXCR_ERR_BAD_SNAPSHOT   = 0xFFFFEFFA   pxcr_snapshot_map: unknown snap
+//   PXCR_ERR_INTERNAL       = 0xFFFFEFF9   unreachable-fallthrough tripwire
+//
+// Reserved-label discipline: labels prefixed `pxcr_`.
+
+module CowRead = structure {
+
+  pub let PXCR_MAX_SNAPSHOTS  : u64 = 8
+  pub let PXCR_MAX_ENTRIES    : u64 = 128
+  pub let PXCR_CACHE_ENTRIES  : u64 = 16
+  pub let PXCR_DEV_EXTENT     : u64 = 4096
+
+  pub let PXCR_OK                 : u64 = 0
+  pub let PXCR_ERR_NOT_INIT       : u64 = 0xFFFFEFFF
+  pub let PXCR_ERR_CHAIN_FULL     : u64 = 0xFFFFEFFE
+  pub let PXCR_ERR_SNAP_FULL      : u64 = 0xFFFFEFFD
+  pub let PXCR_ERR_OUT_OF_EXTENT  : u64 = 0xFFFFEFFC
+  pub let PXCR_ERR_NOT_FOUND      : u64 = 0xFFFFEFFB
+  pub let PXCR_ERR_BAD_SNAPSHOT   : u64 = 0xFFFFEFFA
+  pub let PXCR_ERR_INTERNAL       : u64 = 0xFFFFEFF9
+
+  pub let PXCR_INIT_MARK  : u64 = 0xC024
+  pub let PXCR_CACHE_EMPTY: u64 = 0xFFFFFFFFFFFFFFFF
+
+  // 128 entries * 3 u64 = 384.
+  pub let mut _pxcr_chain : [u64; 384] = uninit @align(64)
+  // 16 entries * 2 u64 = 32.
+  pub let mut _pxcr_cache : [u64; 32]  = uninit @align(64)
+  pub let mut _pxcr_state : [u64; 8]   = uninit @align(64)
+
+  // ==========================================================================
+  // Reset. Clears chain (all zeroes), cache (all lba slots := EMPTY), and
+  // state; installs init_mark.
+  // ==========================================================================
+
+  pub let pxcr_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-002 (#1381): clear chain + cache + state, install init_mark. Labels prefixed pxcr_rst_.",
+      block: {
+        lea r10, [rip + _pxcr_chain];
+        xor rax, rax;
+        xor rcx, rcx;
+      pxcr_rst_ch:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 384;
+        jb  pxcr_rst_ch;
+
+        // Cache: even-indexed slots (lba) := EMPTY; odd (phys) := 0.
+        lea r10, [rip + _pxcr_cache];
+        xor rcx, rcx;
+        mov r9, 0xFFFFFFFFFFFFFFFF;
+      pxcr_rst_cy:
+        mov [r10 + rcx * 8], r9;
+        add rcx, 1;
+        xor rax, rax;
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  pxcr_rst_cy;
+
+        lea r10, [rip + _pxcr_state];
+        xor rax, rax;
+        xor rcx, rcx;
+      pxcr_rst_st:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  pxcr_rst_st;
+
+        mov rax, 0xC024;
+        mov [r10 + 0], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pxcr_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-002 (#1381): 1 iff init_mark matches. Labels prefixed pxcr_bnd_.",
+      block: {
+        lea r10, [rip + _pxcr_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC024;
+        cmp rax, r11;
+        jne pxcr_bnd_no;
+        mov rax, 1;
+        ret;
+      pxcr_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pxcr_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-002 (#1381): sticky error latch readback.",
+      block: {
+        lea r10, [rip + _pxcr_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let pxcr_set_err : (u64) -> () !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-002 (#1381): first-writer-wins error latch. Labels prefixed pxcr_se_.",
+      block: {
+        lea r10, [rip + _pxcr_state];
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        jne pxcr_se_out;
+        mov [r10 + 8], rdi;
+      pxcr_se_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Field readbacks.
+  // ==========================================================================
+
+  pub let pxcr_snapshot_top : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-002 (#1381): snapshot_top field.",
+      block: {
+        lea r10, [rip + _pxcr_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let pxcr_snapshot_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-002 (#1381): snapshot_count field.",
+      block: {
+        lea r10, [rip + _pxcr_state];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let pxcr_chain_len : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-002 (#1381): chain_len field.",
+      block: {
+        lea r10, [rip + _pxcr_state];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let pxcr_walk_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-002 (#1381): walk_count field.",
+      block: {
+        lea r10, [rip + _pxcr_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let pxcr_cache_hits : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-002 (#1381): cache_hits field.",
+      block: {
+        lea r10, [rip + _pxcr_state];
+        mov rax, [r10 + 48];
+        ret
+      }
+    } @no_frame
+
+  pub let pxcr_cache_misses : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-002 (#1381): cache_misses field.",
+      block: {
+        lea r10, [rip + _pxcr_state];
+        mov rax, [r10 + 56];
+        ret
+      }
+    } @no_frame
+
+  pub let pxcr_dev_extent : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R42.M1-002 (#1381): PXCR_DEV_EXTENT constant.",
+      block: {
+        mov rax, 4096;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // pxcr_snapshot_push() -> u64
+  //
+  // Add a new snapshot generation. Returns the new snapshot_id (>= 1).
+  // Refuses:
+  //   - not init                    PXCR_ERR_NOT_INIT
+  //   - snapshot_top == MAX         PXCR_ERR_SNAP_FULL
+  // ==========================================================================
+
+  pub let pxcr_snapshot_push : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-002 (#1381): allocate next snapshot_id. Labels prefixed pxcr_sp_.",
+      block: {
+        lea r10, [rip + _pxcr_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC024;
+        cmp rax, r11;
+        jne pxcr_sp_ni;
+
+        mov rax, [r10 + 16];                    // snapshot_top
+        cmp rax, 8;
+        jae pxcr_sp_full;
+
+        add rax, 1;
+        mov [r10 + 16], rax;                    // top := top + 1
+
+        mov r9, [r10 + 24];                     // snapshot_count
+        add r9, 1;
+        mov [r10 + 24], r9;
+        ret;
+
+      pxcr_sp_ni:
+        mov rdi, 0xFFFFEFFF;
+        call pxcr_set_err;
+        xor rax, rax;
+        ret;
+      pxcr_sp_full:
+        mov rdi, 0xFFFFEFFD;
+        call pxcr_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pxcr_snapshot_map(snapshot_id, lba, phys_blk) -> u64
+  //
+  // Append (snapshot_id, lba, phys_blk) to the chain log. Refuses:
+  //   - not init                    PXCR_ERR_NOT_INIT
+  //   - snapshot_id > snapshot_top  PXCR_ERR_BAD_SNAPSHOT
+  //   - snapshot_id == 0            PXCR_ERR_BAD_SNAPSHOT
+  //   - lba >= PXCR_DEV_EXTENT      PXCR_ERR_OUT_OF_EXTENT
+  //   - chain_len == MAX_ENTRIES    PXCR_ERR_CHAIN_FULL
+  //
+  // Also invalidates the cache slot for `lba` so a subsequent read
+  // walks and sees the new mapping.
+  // ==========================================================================
+
+  pub let pxcr_snapshot_map : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (snapshot_id: u64, lba: u64, phys_blk: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-002 (#1381): append a chain entry and invalidate its cache slot. Labels prefixed pxcr_m_.",
+      block: {
+        lea r10, [rip + _pxcr_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC024;
+        cmp rax, r11;
+        jne pxcr_m_ni;
+
+        // snapshot_id in [1..snapshot_top]
+        cmp rdi, 0;
+        je  pxcr_m_bs;
+        mov rax, [r10 + 16];                    // snapshot_top
+        cmp rdi, rax;
+        ja  pxcr_m_bs;
+
+        // lba < PXCR_DEV_EXTENT
+        cmp rsi, 4096;
+        jae pxcr_m_oe;
+
+        // chain_len < MAX_ENTRIES
+        mov rax, [r10 + 32];                    // chain_len
+        cmp rax, 128;
+        jae pxcr_m_cf;
+
+        // Append. entry_off = chain_len * 3 * 8 = chain_len * 24.
+        lea r11, [rip + _pxcr_chain];
+        mov r9, rax;
+        shl r9, 3;                              // * 8
+        mov r8, rax;
+        shl r8, 4;                              // * 16
+        add r9, r8;                             // r9 = chain_len * 24
+        add r11, r9;                            // r11 = entry base
+
+        mov [r11 + 0],  rdi;                    // snapshot_id
+        mov [r11 + 8],  rsi;                    // lba
+        mov [r11 + 16], rdx;                    // phys_blk
+
+        // chain_len += 1
+        add rax, 1;
+        mov [r10 + 32], rax;
+
+        // Invalidate cache slot for `lba`: idx = lba & 15.
+        lea r11, [rip + _pxcr_cache];
+        mov r8, rsi;
+        and r8, 15;
+        shl r8, 4;                              // * 16 (two u64 per slot)
+        add r11, r8;
+        mov r9, 0xFFFFFFFFFFFFFFFF;
+        mov [r11 + 0], r9;
+        xor rax, rax;
+        mov [r11 + 8], rax;
+
+        xor rax, rax;
+        ret;
+
+      pxcr_m_ni:
+        mov rdi, 0xFFFFEFFF;
+        call pxcr_set_err;
+        mov rax, 0xFFFFEFFF;
+        ret;
+      pxcr_m_bs:
+        mov rdi, 0xFFFFEFFA;
+        call pxcr_set_err;
+        mov rax, 0xFFFFEFFA;
+        ret;
+      pxcr_m_oe:
+        mov rdi, 0xFFFFEFFC;
+        call pxcr_set_err;
+        mov rax, 0xFFFFEFFC;
+        ret;
+      pxcr_m_cf:
+        mov rdi, 0xFFFFEFFE;
+        call pxcr_set_err;
+        mov rax, 0xFFFFEFFE;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pxcr_cache_get(lba) -> u64
+  //
+  // Peek at the direct-mapped cache slot for `lba`. Returns phys_blk
+  // on hit, or PXCR_CACHE_EMPTY (0xFFFF..FF) on miss. Does NOT walk
+  // the chain and does NOT bump counters.
+  // ==========================================================================
+
+  pub let pxcr_cache_get : (u64) -> u64 !{mem} @{} =
+    fn (lba: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-002 (#1381): peek at a direct-mapped cache slot. Labels prefixed pxcr_cg_.",
+      block: {
+        lea r10, [rip + _pxcr_cache];
+        mov r8, rdi;
+        and r8, 15;
+        shl r8, 4;
+        add r10, r8;
+
+        mov rax, [r10 + 0];                    // slot lba
+        cmp rax, rdi;
+        jne pxcr_cg_ms;
+        mov rax, [r10 + 8];                    // phys
+        ret;
+      pxcr_cg_ms:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // pxcr_read(lba) -> u64
+  //
+  // Resolve `lba` -> phys_blk by walking the chain log from newest to
+  // oldest and returning the first matching entry's phys_blk. On a
+  // cache hit, returns the cached phys and bumps cache_hits. On a
+  // walk hit, caches the result and bumps cache_misses + walk_count.
+  //
+  // Refuses:
+  //   - not init                    PXCR_ERR_NOT_INIT
+  //   - lba >= PXCR_DEV_EXTENT      PXCR_ERR_OUT_OF_EXTENT
+  //   - no matching entry           PXCR_ERR_NOT_FOUND
+  //
+  // The walk direction (top -> bottom) is what makes "the newest
+  // snapshot wins" true: pxcr_snapshot_map is append-only, so a later
+  // remap of the same lba sits above the older one.
+  // ==========================================================================
+
+  pub let pxcr_read : (u64) -> u64 !{mem} @{} =
+    fn (lba: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-002 (#1381): cache-check then top-down chain walk. Labels prefixed pxcr_r_.",
+      block: {
+        lea r10, [rip + _pxcr_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC024;
+        cmp rax, r11;
+        jne pxcr_r_ni;
+
+        cmp rdi, 4096;
+        jae pxcr_r_oe;
+
+        // Cache probe.
+        lea r11, [rip + _pxcr_cache];
+        mov r8, rdi;
+        and r8, 15;
+        shl r8, 4;
+        add r11, r8;
+
+        mov rax, [r11 + 0];
+        cmp rax, rdi;
+        jne pxcr_r_miss;
+        // Hit. Bump cache_hits.
+        mov r9, [r10 + 48];
+        add r9, 1;
+        mov [r10 + 48], r9;
+        mov rax, [r11 + 8];
+        ret;
+
+      pxcr_r_miss:
+        // Walk chain from top-1 down.
+        mov r8, [r10 + 32];                    // chain_len
+        cmp r8, 0;
+        je  pxcr_r_nf;
+
+        lea r11, [rip + _pxcr_chain];
+        // Bump walk_count regardless of outcome.
+        mov r9, [r10 + 40];
+        add r9, 1;
+        mov [r10 + 40], r9;
+
+      pxcr_r_top:
+        cmp r8, 0;
+        je  pxcr_r_nf;
+        sub r8, 1;                             // r8 = current entry idx
+
+        // entry_base = _pxcr_chain + r8 * 24
+        mov rax, r8;
+        shl rax, 3;                            // * 8
+        mov r9, r8;
+        shl r9, 4;                             // * 16
+        add rax, r9;                           // rax = r8 * 24
+        mov r9, r11;
+        add r9, rax;                           // r9 = entry base
+
+        mov rax, [r9 + 8];                     // lba field
+        cmp rax, rdi;
+        jne pxcr_r_top;
+
+        // Hit. Cache + return.
+        mov rax, [r9 + 16];                    // phys
+
+        // Cache write: idx = lba & 15
+        lea r9, [rip + _pxcr_cache];
+        mov r8, rdi;
+        and r8, 15;
+        shl r8, 4;
+        add r9, r8;
+        mov [r9 + 0], rdi;                     // lba
+        mov [r9 + 8], rax;                     // phys
+
+        // Bump cache_misses.
+        mov r9, [r10 + 56];
+        add r9, 1;
+        mov [r10 + 56], r9;
+        ret;
+
+      pxcr_r_ni:
+        mov rdi, 0xFFFFEFFF;
+        call pxcr_set_err;
+        mov rax, 0xFFFFEFFF;
+        ret;
+      pxcr_r_oe:
+        mov rdi, 0xFFFFEFFC;
+        call pxcr_set_err;
+        mov rax, 0xFFFFEFFC;
+        ret;
+      pxcr_r_nf:
+        mov rdi, 0xFFFFEFFB;
+        call pxcr_set_err;
+        mov rax, 0xFFFFEFFB;
+        ret
+      }
+    }
+}

@@ -1,0 +1,495 @@
+// src/kernel/core/fs/pdxfs/cow_gc.pdx -- R42.M1-004 (#1383)
+//
+// PDXFS v1 CoW WALKER -- GARBAGE COLLECTION PASS.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the AUTHORITY on retiring physical blocks whose refcount has
+// dropped to zero. A gc pass scans the refcount table (via
+// pxrc_zero_count) and moves each zero-refcount block onto an internal
+// free list (_pxgc_free_list) for a future pxcw_alloc_block widening
+// to consume.
+//
+// Two verbs:
+//
+//   pxgc_scan()     count zero-refcount blocks; record total; no I/O.
+//   pxgc_release()  same scan, but each hit is threaded onto the free
+//                   list. Safe to run at any time -- idempotent (a
+//                   block already on the free list is skipped via the
+//                   presence check).
+//
+// It is a SCAFFOLD (D7). The free list is a compact array of block
+// ids the scaffold holds in BSS; a widening will emit a persistent
+// on-disk free-space log the mount replays.
+//
+// It does NOT reclaim block 0. Block 0 is the CoW-write bootstrap
+// slot (see cow_write.pdx §1); freeing it would break the SHARED-path
+// invariant that every fresh lba starts pointing at a live block.
+//
+// It is CONCURRENCY-SAFE in the R42 sense: the pass reads pxrc_get
+// once per block and appends to the free list before advancing --
+// a concurrent pxrc_inc between scan and release is impossible under
+// the single-mount lock the FS holds. Multi-mount concurrency is
+// governed by the same lock discipline pdxfs_lite documents.
+//
+// =============================================================================
+// §1  FREE LIST GEOMETRY
+// =============================================================================
+//
+// PXGC_FREE_MAX = 4096   maximum block ids the scaffold parks.
+//
+// _pxgc_free_list is a compact array: entries [0..free_head) are live
+// block ids the allocator may recycle; entries at or above free_head
+// are undefined. A duplicate-suppression scan is O(free_head) per
+// insert; total gc pass is O(PXRC_DEVICE_BLOCKS * free_head) in the
+// worst case, which the scaffold accepts.
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _pxgc_free_list and _pxgc_state are written only by helpers in this
+// module. tools/build.sh confines relocations against each to
+// `core/fs/pdxfs/cow_gc.o`.
+//
+// STATE LAYOUT -- _pxgc_state : [u64; 8]
+//   +0    init_mark          0xC64C once pxgc_reset has run
+//   +8    err                sticky error latch
+//   +16   scan_count         number of pxgc_scan calls
+//   +24   release_count      number of pxgc_release calls
+//   +32   last_zero_seen     zero-refcount blocks seen by last pass
+//   +40   last_released      blocks appended to free list by last release
+//   +48   total_released     total blocks appended since reset
+//   +56   free_head          next-write index into _pxgc_free_list
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFEFD0..0xFFFFEFDF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time. Adjacent used band
+// above: cow_write 0xFFFFEFE0..EF (R42.M1-003). Adjacent free band
+// below: 0xFFFFEFC0..CF (unassigned).
+//
+//   PXGC_OK              = 0
+//   PXGC_ERR_NOT_INIT    = 0xFFFFEFDF   accessor before pxgc_reset
+//   PXGC_ERR_FREE_FULL   = 0xFFFFEFDE   free_head == PXGC_FREE_MAX
+//   PXGC_ERR_BAD_IDX     = 0xFFFFEFDD   pxgc_free_at: idx >= free_head
+//   PXGC_ERR_REFCOUNT    = 0xFFFFEFDC   pxrc_get returned an error code
+//   PXGC_ERR_INTERNAL    = 0xFFFFEFDB   unreachable-fallthrough tripwire
+//
+// Reserved-label discipline: labels prefixed `pxgc_`.
+
+module CowGc = structure {
+
+  pub let PXGC_FREE_MAX      : u64 = 4096
+  pub let PXGC_RESERVED_BLK  : u64 = 0
+
+  pub let PXGC_OK             : u64 = 0
+  pub let PXGC_ERR_NOT_INIT   : u64 = 0xFFFFEFDF
+  pub let PXGC_ERR_FREE_FULL  : u64 = 0xFFFFEFDE
+  pub let PXGC_ERR_BAD_IDX    : u64 = 0xFFFFEFDD
+  pub let PXGC_ERR_REFCOUNT   : u64 = 0xFFFFEFDC
+  pub let PXGC_ERR_INTERNAL   : u64 = 0xFFFFEFDB
+
+  pub let PXGC_INIT_MARK : u64 = 0xC64C
+
+  pub let mut _pxgc_free_list : [u64; 4096] = uninit @align(64)
+  pub let mut _pxgc_state     : [u64; 8]    = uninit @align(64)
+
+  // ==========================================================================
+  // Reset. Clears free list + state; installs init_mark.
+  // ==========================================================================
+
+  pub let pxgc_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-004 (#1383): clear free list + state, install init_mark. Labels prefixed pxgc_rst_.",
+      block: {
+        lea r10, [rip + _pxgc_free_list];
+        xor rax, rax;
+        xor rcx, rcx;
+      pxgc_rst_f:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4096;
+        jb  pxgc_rst_f;
+
+        lea r10, [rip + _pxgc_state];
+        xor rcx, rcx;
+      pxgc_rst_s:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  pxgc_rst_s;
+
+        mov rax, 0xC64C;
+        mov [r10 + 0], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pxgc_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-004 (#1383): 1 iff init_mark matches. Labels prefixed pxgc_bnd_.",
+      block: {
+        lea r10, [rip + _pxgc_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC64C;
+        cmp rax, r11;
+        jne pxgc_bnd_no;
+        mov rax, 1;
+        ret;
+      pxgc_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pxgc_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-004 (#1383): sticky error latch readback.",
+      block: {
+        lea r10, [rip + _pxgc_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let pxgc_set_err : (u64) -> () !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-004 (#1383): first-writer-wins error latch. Labels prefixed pxgc_se_.",
+      block: {
+        lea r10, [rip + _pxgc_state];
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        jne pxgc_se_out;
+        mov [r10 + 8], rdi;
+      pxgc_se_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Field readbacks.
+  // ==========================================================================
+
+  pub let pxgc_scan_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-004 (#1383): scan_count field.",
+      block: {
+        lea r10, [rip + _pxgc_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let pxgc_release_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-004 (#1383): release_count field.",
+      block: {
+        lea r10, [rip + _pxgc_state];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let pxgc_last_zero_seen : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-004 (#1383): last_zero_seen field.",
+      block: {
+        lea r10, [rip + _pxgc_state];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let pxgc_last_released : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-004 (#1383): last_released field.",
+      block: {
+        lea r10, [rip + _pxgc_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let pxgc_total_released : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-004 (#1383): total_released field.",
+      block: {
+        lea r10, [rip + _pxgc_state];
+        mov rax, [r10 + 48];
+        ret
+      }
+    } @no_frame
+
+  pub let pxgc_free_head : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-004 (#1383): free_head field.",
+      block: {
+        lea r10, [rip + _pxgc_state];
+        mov rax, [r10 + 56];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // pxgc_free_at(idx) -> u64
+  //
+  // Read one free-list entry. Refuses:
+  //   - not init                    PXGC_ERR_NOT_INIT
+  //   - idx >= free_head            PXGC_ERR_BAD_IDX
+  // ==========================================================================
+
+  pub let pxgc_free_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-004 (#1383): read one free-list slot. Labels prefixed pxgc_fa_.",
+      block: {
+        lea r10, [rip + _pxgc_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC64C;
+        cmp rax, r11;
+        jne pxgc_fa_ni;
+
+        mov rax, [r10 + 56];                    // free_head
+        cmp rdi, rax;
+        jae pxgc_fa_bi;
+
+        lea r11, [rip + _pxgc_free_list];
+        mov rax, [r11 + rdi * 8];
+        ret;
+
+      pxgc_fa_ni:
+        mov rdi, 0xFFFFEFDF;
+        call pxgc_set_err;
+        xor rax, rax;
+        ret;
+      pxgc_fa_bi:
+        mov rdi, 0xFFFFEFDD;
+        call pxgc_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pxgc_scan() -> u64
+  //
+  // Count zero-refcount blocks across [1..PXRC_DEVICE_BLOCKS). Records
+  // the total in state.last_zero_seen and returns it. Refuses only
+  // when not init.
+  // ==========================================================================
+
+  pub let pxgc_scan : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-004 (#1383): scan [1..PXRC_DEVICE_BLOCKS) counting refcount==0. Labels prefixed pxgc_s_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        sub rsp, 8;
+
+        lea r10, [rip + _pxgc_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC64C;
+        cmp rax, r11;
+        jne pxgc_s_ni;
+
+        // scan_count++
+        mov r9, [r10 + 16];
+        add r9, 1;
+        mov [r10 + 16], r9;
+
+        mov rbx, 1;                             // rbx = blk cursor (skip 0)
+        xor r12, r12;                           // r12 = zero count
+      pxgc_s_top:
+        mov r13, 4096;                          // PXRC_DEVICE_BLOCKS
+        cmp rbx, r13;
+        jae pxgc_s_done;
+
+        mov rdi, rbx;
+        call pxrc_get;
+
+        // A refcount value that is >= 0xFFFFF000 signals a pxrc error.
+        mov r11, 0xFFFFF000;
+        cmp rax, r11;
+        jae pxgc_s_rc;
+
+        cmp rax, 0;
+        jne pxgc_s_skip;
+        add r12, 1;
+      pxgc_s_skip:
+        add rbx, 1;
+        jmp pxgc_s_top;
+
+      pxgc_s_done:
+        lea r10, [rip + _pxgc_state];
+        mov [r10 + 32], r12;                    // last_zero_seen
+        mov rax, r12;
+        jmp pxgc_s_out;
+
+      pxgc_s_ni:
+        mov rdi, 0xFFFFEFDF;
+        call pxgc_set_err;
+        xor rax, rax;
+        jmp pxgc_s_out;
+      pxgc_s_rc:
+        mov rdi, 0xFFFFEFDC;
+        call pxgc_set_err;
+        xor rax, rax;
+
+      pxgc_s_out:
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pxgc_release() -> u64
+  //
+  // Same scan as pxgc_scan, but each zero-refcount block is appended
+  // to _pxgc_free_list (skipping duplicates already parked). Returns
+  // the number of blocks newly appended by THIS pass; last_released
+  // records the same value; total_released accumulates across passes.
+  //
+  // Refuses:
+  //   - not init                    PXGC_ERR_NOT_INIT
+  //   - free list full mid-pass     PXGC_ERR_FREE_FULL (partial progress
+  //                                  is preserved -- free_head has
+  //                                  advanced up to the failure block).
+  //   - pxrc_get returned error     PXGC_ERR_REFCOUNT (same partial-
+  //                                  progress semantic).
+  //
+  // Register plan: 4-push callee-save + 8 pad. rbx = blk cursor,
+  // rbp = zero count, r12 = free_head snapshot, r13 = duplicate scan
+  // inner cursor.
+  // ==========================================================================
+
+  pub let pxgc_release : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-004 (#1383): scan + park zero-refcount blocks. Labels prefixed pxgc_r_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+
+        lea r10, [rip + _pxgc_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC64C;
+        cmp rax, r11;
+        jne pxgc_r_ni;
+
+        // release_count++
+        mov r9, [r10 + 24];
+        add r9, 1;
+        mov [r10 + 24], r9;
+
+        mov rbx, 1;                             // blk cursor
+        xor rbp, rbp;                           // newly appended
+      pxgc_r_top:
+        mov r11, 4096;
+        cmp rbx, r11;
+        jae pxgc_r_done;
+
+        mov rdi, rbx;
+        call pxrc_get;
+
+        mov r11, 0xFFFFF000;
+        cmp rax, r11;
+        jae pxgc_r_rc;
+
+        cmp rax, 0;
+        jne pxgc_r_skip;
+
+        // Duplicate check: walk [0..free_head) for rbx.
+        lea r10, [rip + _pxgc_state];
+        mov r12, [r10 + 56];                    // free_head
+        xor r13, r13;                           // scan cursor
+        lea r11, [rip + _pxgc_free_list];
+      pxgc_r_dup:
+        cmp r13, r12;
+        jae pxgc_r_ins;
+        mov rax, [r11 + r13 * 8];
+        cmp rax, rbx;
+        je  pxgc_r_skip;
+        add r13, 1;
+        jmp pxgc_r_dup;
+
+      pxgc_r_ins:
+        // free_head must be < PXGC_FREE_MAX.
+        mov r11, 4096;
+        cmp r12, r11;
+        jae pxgc_r_full;
+
+        lea r11, [rip + _pxgc_free_list];
+        mov [r11 + r12 * 8], rbx;
+        add r12, 1;
+        mov [r10 + 56], r12;                    // free_head := new
+        add rbp, 1;                             // newly appended++
+
+      pxgc_r_skip:
+        add rbx, 1;
+        jmp pxgc_r_top;
+
+      pxgc_r_done:
+        lea r10, [rip + _pxgc_state];
+        mov [r10 + 40], rbp;                    // last_released
+        mov r9, [r10 + 48];
+        add r9, rbp;
+        mov [r10 + 48], r9;                     // total_released += rbp
+        mov rax, rbp;
+        jmp pxgc_r_out;
+
+      pxgc_r_ni:
+        mov rdi, 0xFFFFEFDF;
+        call pxgc_set_err;
+        xor rax, rax;
+        jmp pxgc_r_out;
+      pxgc_r_full:
+        // Preserve partial progress.
+        lea r10, [rip + _pxgc_state];
+        mov [r10 + 40], rbp;
+        mov r9, [r10 + 48];
+        add r9, rbp;
+        mov [r10 + 48], r9;
+        mov rdi, 0xFFFFEFDE;
+        call pxgc_set_err;
+        mov rax, 0xFFFFEFDE;
+        jmp pxgc_r_out;
+      pxgc_r_rc:
+        lea r10, [rip + _pxgc_state];
+        mov [r10 + 40], rbp;
+        mov r9, [r10 + 48];
+        add r9, rbp;
+        mov [r10 + 48], r9;
+        mov rdi, 0xFFFFEFDC;
+        call pxgc_set_err;
+        mov rax, 0xFFFFEFDC;
+
+      pxgc_r_out:
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}

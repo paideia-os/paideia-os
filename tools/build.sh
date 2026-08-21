@@ -4493,6 +4493,73 @@ semterm_pin_one "${SLOG_SRC}" 'pub let slog_audit_forward : () -> u64'
 echo "[semterm-m5-confine] recovery / session_log entry-point arities pinned"
 
 # ---------------------------------------------------------------------------
+# R42.M1-001..004 (#1380..#1383): PDXFS-v1 CoW WALKER CONFINEMENT.
+#
+# Four modules deliver the PdxFS-v1 copy-on-write skeleton:
+#   refcount.pdx  -- per-block 16-bit reference count table + counters.
+#   cow_read.pdx  -- snapshot-chain walk log + direct-mapped LBA cache.
+#   cow_write.pdx -- physical block payload store + bump allocator +
+#                    SHARED/UNIQUE write dispatch.
+#   cow_gc.pdx    -- free list + scan/release with duplicate suppression.
+#
+# Each owns its own state cells; a second writer against any of them would
+# let a caller:
+#   - forge a refcount cell (refcount confinement) so a SHARED-vs-UNIQUE
+#     dispatch in cow_write picks the wrong branch, silently overwriting
+#     a snapshot's block in place,
+#   - append a chain entry (cow_read confinement) so pxcr_read returns
+#     a phys_blk cow_write never allocated,
+#   - bump next_free_block (cow_write confinement) so pxcw_alloc_block
+#     hands out a block the free list also parks,
+#   - grow free_head (cow_gc confinement) so pxgc_free_at returns a
+#     block id that was never actually released.
+PXRC_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/refcount.pdx"
+PXCR_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/cow_read.pdx"
+PXCW_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/cow_write.pdx"
+PXGC_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/cow_gc.pdx"
+if [[ ! -f "${PXRC_SRC}" || ! -f "${PXCR_SRC}" || ! -f "${PXCW_SRC}" || ! -f "${PXGC_SRC}" ]]; then
+    echo "[pdxfs-cow-confine] FAIL - one of the R42.M1 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_pxrc_tab'        'core/fs/pdxfs/refcount.o'
+ec_confine_one '_pxrc_state'      'core/fs/pdxfs/refcount.o'
+ec_confine_one '_pxcr_chain'      'core/fs/pdxfs/cow_read.o'
+ec_confine_one '_pxcr_cache'      'core/fs/pdxfs/cow_read.o'
+ec_confine_one '_pxcr_state'      'core/fs/pdxfs/cow_read.o'
+ec_confine_one '_pxcw_blocks'     'core/fs/pdxfs/cow_write.o'
+ec_confine_one '_pxcw_state'      'core/fs/pdxfs/cow_write.o'
+ec_confine_one '_pxgc_free_list'  'core/fs/pdxfs/cow_gc.o'
+ec_confine_one '_pxgc_state'      'core/fs/pdxfs/cow_gc.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/fs/pdxfs/{refcount,cow_read,cow_write,cow_gc}.pdx §2" >&2
+    echo "  for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[pdxfs-cow-confine] R42.M1 (refcount + cow_read + cow_write + cow_gc) state confined"
+
+# ARITY PINS for the R42.M1 entry points. Same rationale as R41.M5:
+# a widening on any of these makes "bump a refcount without recording
+# the inc", "map an lba across the wrong snapshot", "write past a
+# READ_MISS", or "park a block already on the free list" expressible
+# in a call site the confinement gate cannot see.
+semterm_pin_one "${PXRC_SRC}" 'pub let pxrc_get : (u64) -> u64'
+semterm_pin_one "${PXRC_SRC}" 'pub let pxrc_inc : (u64) -> u64'
+semterm_pin_one "${PXRC_SRC}" 'pub let pxrc_dec : (u64) -> u64'
+semterm_pin_one "${PXRC_SRC}" 'pub let pxrc_zero_count : () -> u64'
+semterm_pin_one "${PXRC_SRC}" 'pub let pxrc_release_zero_blocks : () -> u64'
+semterm_pin_one "${PXCR_SRC}" 'pub let pxcr_snapshot_push : () -> u64'
+semterm_pin_one "${PXCR_SRC}" 'pub let pxcr_snapshot_map : (u64, u64, u64) -> u64'
+semterm_pin_one "${PXCR_SRC}" 'pub let pxcr_read : (u64) -> u64'
+semterm_pin_one "${PXCR_SRC}" 'pub let pxcr_cache_get : (u64) -> u64'
+semterm_pin_one "${PXCW_SRC}" 'pub let pxcw_alloc_block : () -> u64'
+semterm_pin_one "${PXCW_SRC}" 'pub let pxcw_write : (u64, u64, u64) -> u64'
+semterm_pin_one "${PXCW_SRC}" 'pub let pxcw_block_read : (u64) -> u64'
+semterm_pin_one "${PXGC_SRC}" 'pub let pxgc_scan : () -> u64'
+semterm_pin_one "${PXGC_SRC}" 'pub let pxgc_release : () -> u64'
+semterm_pin_one "${PXGC_SRC}" 'pub let pxgc_free_at : (u64) -> u64'
+echo "[pdxfs-cow-confine] R42.M1 entry-point arities pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

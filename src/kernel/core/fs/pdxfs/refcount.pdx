@@ -1,0 +1,475 @@
+// src/kernel/core/fs/pdxfs/refcount.pdx -- R42.M1-001 (#1380)
+//
+// PDXFS v1 CoW WALKER -- PER-BLOCK REFERENCE COUNT TABLE.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the AUTHORITY on how many snapshots (or live block-table entries)
+// currently reference each physical block on a PdxFS volume. The three
+// PdxFS-CoW consumers all rely on it:
+//
+//   cow_read.pdx  -- takes no dependency on the refcount table today,
+//                    but a future walker will consult it to short-circuit
+//                    a chain walk when a block is known unique.
+//   cow_write.pdx -- calls pxrc_get to decide whether the target block
+//                    is SHARED (>1) and must be copied, or UNIQUE (==1)
+//                    and may be overwritten in place.
+//   cow_gc.pdx    -- scans the table for zero-refcount blocks and returns
+//                    them to the free list.
+//
+// It is a SCAFFOLD (D7). The table lives in a single BSS-backed byte
+// region -- an on-disk backing store is a widening the NVMe write path
+// (#906) unblocks. The table's semantics (per-block 16-bit count,
+// inc/dec, zero-scan) are the ones the on-disk backing will preserve.
+//
+// It does NOT know about snapshots. A caller that maps snapshots to
+// blocks (semantically: cow_write for the current snapshot) is
+// responsible for calling pxrc_inc / pxrc_dec on the right blocks in
+// the right order -- this module is a passive counter store.
+//
+// It does NOT free blocks. cow_gc.pdx owns the free-list linkage; this
+// module only reports zero-refcount blocks via pxrc_zero_count.
+//
+// =============================================================================
+// §1  TABLE GEOMETRY
+// =============================================================================
+//
+// PXRC_DEVICE_BLOCKS = 4096       max blocks tracked in this scaffold
+// PXRC_COUNT_MAX     = 0xFFFF     per-block 16-bit ceiling
+//
+// The scaffold stores one u64 per block (32 KiB of BSS). The u64 is
+// SEMANTICALLY a u16: pxrc_inc caps at PXRC_COUNT_MAX (sticky overflow
+// latch), pxrc_dec refuses to go below 0 (sticky underflow latch). An
+// on-disk backing widening will pack four 16-bit counts per u64 (8 KiB
+// for 4096 blocks) -- keeping the runtime shape as u64-per-block today
+// means the pack/unpack widening is one edit, not a rewrite of every
+// call site.
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _pxrc_tab and _pxrc_state are written only by helpers in this module.
+// tools/build.sh confines relocations against each to
+// `core/fs/pdxfs/refcount.o`.
+//
+// STATE LAYOUT -- _pxrc_state : [u64; 8]
+//   +0    init_mark        0xC0DE once pxrc_reset has run
+//   +8    err              sticky error latch (first-writer-wins)
+//   +16   inc_count        total pxrc_inc calls that mutated a cell
+//   +24   dec_count        total pxrc_dec calls that mutated a cell
+//   +32   overflow_count   inc calls refused because count == COUNT_MAX
+//   +40   underflow_count  dec calls refused because count == 0
+//   +48   last_zero_scan   last value returned by pxrc_zero_count
+//   +56   reserved
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFF000..0xFFFFF00F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time. Adjacent used band
+// above: session_log 0xFFFFF010..1F (R41.M5-002). Adjacent free band
+// below: cow_gc 0xFFFFEFD0..DF (R42.M1-004).
+//
+//   PXRC_OK                = 0
+//   PXRC_ERR_NOT_INIT      = 0xFFFFF00F   accessor before pxrc_reset
+//   PXRC_ERR_BAD_BLK       = 0xFFFFF00E   blk >= PXRC_DEVICE_BLOCKS
+//   PXRC_ERR_OVERFLOW      = 0xFFFFF00D   inc when count == COUNT_MAX
+//   PXRC_ERR_UNDERFLOW     = 0xFFFFF00C   dec when count == 0
+//   PXRC_ERR_INTERNAL      = 0xFFFFF00B   unreachable-fallthrough tripwire
+//
+// Reserved-label discipline: labels prefixed `pxrc_`.
+
+module Refcount = structure {
+
+  pub let PXRC_DEVICE_BLOCKS : u64 = 4096
+  pub let PXRC_COUNT_MAX     : u64 = 0xFFFF
+
+  pub let PXRC_OK             : u64 = 0
+  pub let PXRC_ERR_NOT_INIT   : u64 = 0xFFFFF00F
+  pub let PXRC_ERR_BAD_BLK    : u64 = 0xFFFFF00E
+  pub let PXRC_ERR_OVERFLOW   : u64 = 0xFFFFF00D
+  pub let PXRC_ERR_UNDERFLOW  : u64 = 0xFFFFF00C
+  pub let PXRC_ERR_INTERNAL   : u64 = 0xFFFFF00B
+
+  pub let PXRC_INIT_MARK : u64 = 0xC0DE
+
+  pub let mut _pxrc_tab   : [u64; 4096] = uninit @align(64)
+  pub let mut _pxrc_state : [u64; 8]    = uninit @align(64)
+
+  // ==========================================================================
+  // Reset. Boot + teardown. Clears table and state; installs init_mark.
+  // ==========================================================================
+
+  pub let pxrc_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-001 (#1380): clear table + state, install init_mark. Labels prefixed pxrc_rst_.",
+      block: {
+        lea r10, [rip + _pxrc_tab];
+        xor rax, rax;
+        xor rcx, rcx;
+      pxrc_rst_t:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4096;
+        jb  pxrc_rst_t;
+
+        lea r10, [rip + _pxrc_state];
+        xor rcx, rcx;
+      pxrc_rst_s:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  pxrc_rst_s;
+
+        mov rax, 0xC0DE;
+        mov [r10 + 0], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pxrc_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-001 (#1380): 1 iff init_mark matches. Labels prefixed pxrc_bnd_.",
+      block: {
+        lea r10, [rip + _pxrc_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC0DE;
+        cmp rax, r11;
+        jne pxrc_bnd_no;
+        mov rax, 1;
+        ret;
+      pxrc_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pxrc_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-001 (#1380): sticky error latch readback. Labels prefixed pxrc_er_.",
+      block: {
+        lea r10, [rip + _pxrc_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let pxrc_set_err : (u64) -> () !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-001 (#1380): first-writer-wins error latch. Labels prefixed pxrc_se_.",
+      block: {
+        lea r10, [rip + _pxrc_state];
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        jne pxrc_se_out;
+        mov [r10 + 8], rdi;
+      pxrc_se_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Counter readbacks.
+  // ==========================================================================
+
+  pub let pxrc_capacity : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R42.M1-001 (#1380): PXRC_DEVICE_BLOCKS as u64.",
+      block: {
+        mov rax, 4096;
+        ret
+      }
+    } @no_frame
+
+  pub let pxrc_inc_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-001 (#1380): inc_count field.",
+      block: {
+        lea r10, [rip + _pxrc_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let pxrc_dec_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-001 (#1380): dec_count field.",
+      block: {
+        lea r10, [rip + _pxrc_state];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let pxrc_overflow_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-001 (#1380): overflow_count field.",
+      block: {
+        lea r10, [rip + _pxrc_state];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let pxrc_underflow_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-001 (#1380): underflow_count field.",
+      block: {
+        lea r10, [rip + _pxrc_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let pxrc_last_zero_scan : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-001 (#1380): last_zero_scan field.",
+      block: {
+        lea r10, [rip + _pxrc_state];
+        mov rax, [r10 + 48];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // pxrc_get(blk) -> u64
+  //
+  // Read one block's refcount. Refuses:
+  //   - not init                     PXRC_ERR_NOT_INIT
+  //   - blk >= PXRC_DEVICE_BLOCKS    PXRC_ERR_BAD_BLK
+  // ==========================================================================
+
+  pub let pxrc_get : (u64) -> u64 !{mem} @{} =
+    fn (blk: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-001 (#1380): read one refcount cell. Labels prefixed pxrc_g_.",
+      block: {
+        lea r10, [rip + _pxrc_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC0DE;
+        cmp rax, r11;
+        jne pxrc_g_ni;
+
+        cmp rdi, 4096;
+        jae pxrc_g_bb;
+
+        lea r11, [rip + _pxrc_tab];
+        mov rax, [r11 + rdi * 8];
+        ret;
+
+      pxrc_g_ni:
+        mov rdi, 0xFFFFF00F;
+        call pxrc_set_err;
+        xor rax, rax;
+        ret;
+      pxrc_g_bb:
+        mov rdi, 0xFFFFF00E;
+        call pxrc_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pxrc_inc(blk) -> u64
+  //
+  // Bump one block's refcount by 1. Refuses:
+  //   - not init                     PXRC_ERR_NOT_INIT
+  //   - blk >= PXRC_DEVICE_BLOCKS    PXRC_ERR_BAD_BLK
+  //   - current == PXRC_COUNT_MAX    PXRC_ERR_OVERFLOW
+  // On success returns the new count.
+  // ==========================================================================
+
+  pub let pxrc_inc : (u64) -> u64 !{mem} @{} =
+    fn (blk: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-001 (#1380): bump one refcount cell with 16-bit ceiling. Labels prefixed pxrc_i_.",
+      block: {
+        lea r10, [rip + _pxrc_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC0DE;
+        cmp rax, r11;
+        jne pxrc_i_ni;
+
+        cmp rdi, 4096;
+        jae pxrc_i_bb;
+
+        lea r11, [rip + _pxrc_tab];
+        mov rax, [r11 + rdi * 8];
+        mov r9, 0xFFFF;
+        cmp rax, r9;
+        jae pxrc_i_ov;
+
+        add rax, 1;
+        mov [r11 + rdi * 8], rax;
+
+        mov r9, [r10 + 16];
+        add r9, 1;
+        mov [r10 + 16], r9;
+        ret;
+
+      pxrc_i_ni:
+        mov rdi, 0xFFFFF00F;
+        call pxrc_set_err;
+        xor rax, rax;
+        ret;
+      pxrc_i_bb:
+        mov rdi, 0xFFFFF00E;
+        call pxrc_set_err;
+        xor rax, rax;
+        ret;
+      pxrc_i_ov:
+        mov r9, [r10 + 32];
+        add r9, 1;
+        mov [r10 + 32], r9;
+        mov rdi, 0xFFFFF00D;
+        call pxrc_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pxrc_dec(blk) -> u64
+  //
+  // Drop one block's refcount by 1. Refuses:
+  //   - not init                     PXRC_ERR_NOT_INIT
+  //   - blk >= PXRC_DEVICE_BLOCKS    PXRC_ERR_BAD_BLK
+  //   - current == 0                 PXRC_ERR_UNDERFLOW
+  // On success returns the new count (may be zero -- caller is
+  // responsible for handing the block to cow_gc).
+  // ==========================================================================
+
+  pub let pxrc_dec : (u64) -> u64 !{mem} @{} =
+    fn (blk: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-001 (#1380): drop one refcount cell with 0 floor. Labels prefixed pxrc_d_.",
+      block: {
+        lea r10, [rip + _pxrc_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC0DE;
+        cmp rax, r11;
+        jne pxrc_d_ni;
+
+        cmp rdi, 4096;
+        jae pxrc_d_bb;
+
+        lea r11, [rip + _pxrc_tab];
+        mov rax, [r11 + rdi * 8];
+        cmp rax, 0;
+        je  pxrc_d_uf;
+
+        sub rax, 1;
+        mov [r11 + rdi * 8], rax;
+
+        mov r9, [r10 + 24];
+        add r9, 1;
+        mov [r10 + 24], r9;
+        ret;
+
+      pxrc_d_ni:
+        mov rdi, 0xFFFFF00F;
+        call pxrc_set_err;
+        xor rax, rax;
+        ret;
+      pxrc_d_bb:
+        mov rdi, 0xFFFFF00E;
+        call pxrc_set_err;
+        xor rax, rax;
+        ret;
+      pxrc_d_uf:
+        mov r9, [r10 + 40];
+        add r9, 1;
+        mov [r10 + 40], r9;
+        mov rdi, 0xFFFFF00C;
+        call pxrc_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pxrc_zero_count() -> u64
+  //
+  // Count how many table cells currently hold refcount == 0. Records
+  // the result in state.last_zero_scan; a subsequent cow_gc pass reads
+  // that field to know how many blocks to visit. Refuses only when
+  // not init (returns 0).
+  //
+  // Scaffold semantics: block 0 is included in the scan (a real volume
+  // reserves block 0 for the superblock and would exclude it; the
+  // scaffold does not have a superblock yet and callers must be aware
+  // that a fresh volume yields PXRC_DEVICE_BLOCKS zeroes).
+  // ==========================================================================
+
+  pub let pxrc_zero_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-001 (#1380): count zero-refcount blocks. Labels prefixed pxrc_z_.",
+      block: {
+        lea r10, [rip + _pxrc_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC0DE;
+        cmp rax, r11;
+        jne pxrc_z_ni;
+
+        lea r11, [rip + _pxrc_tab];
+        xor rcx, rcx;                             // rcx = blk index
+        xor r8, r8;                               // r8  = zero count
+      pxrc_z_top:
+        cmp rcx, 4096;
+        jae pxrc_z_done;
+        mov rax, [r11 + rcx * 8];
+        cmp rax, 0;
+        jne pxrc_z_skip;
+        add r8, 1;
+      pxrc_z_skip:
+        add rcx, 1;
+        jmp pxrc_z_top;
+
+      pxrc_z_done:
+        mov [r10 + 48], r8;
+        mov rax, r8;
+        ret;
+
+      pxrc_z_ni:
+        mov rdi, 0xFFFFF00F;
+        call pxrc_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pxrc_release_zero_blocks() -> u64
+  //
+  // Honesty pin. Returns the same value pxrc_zero_count returns and
+  // updates last_zero_scan the same way. cow_gc.pdx owns the free-list
+  // linkage; this function stands in as a NAMED SEAM the gc pass calls
+  // so a widening (invoke a caller-supplied callback per zero block)
+  // is one edit here instead of a rewrite of gc.
+  // ==========================================================================
+
+  pub let pxrc_release_zero_blocks : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-001 (#1380): honesty pin for cow_gc. Delegates to pxrc_zero_count; a widening will invoke a callback per zero block.",
+      block: {
+        call pxrc_zero_count;
+        ret
+      }
+    } @no_frame
+}

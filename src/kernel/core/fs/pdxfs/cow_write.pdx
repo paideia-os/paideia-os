@@ -1,0 +1,537 @@
+// src/kernel/core/fs/pdxfs/cow_write.pdx -- R42.M1-003 (#1382)
+//
+// PDXFS v1 CoW WALKER -- WRITE PATH (allocate + copy + link).
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the WRITE HALF of the copy-on-write walker. On a write to a
+// logical LBA the module resolves the current physical block via
+// pxcr_read; if the refcount of that block is > 1 (SHARED across
+// snapshots) it allocates a fresh physical block, copies the
+// contents, and links the new block into the current snapshot's
+// chain via pxcr_snapshot_map. If refcount == 1 (UNIQUE) the block
+// is overwritten in place.
+//
+// It is a SCAFFOLD (D7). The block payload is a single u64 per
+// physical block held in _pxcw_blocks. An on-disk backing widening
+// (NVMe write path, #906) preserves the semantic: alloc-then-copy on
+// SHARED, in-place on UNIQUE.
+//
+// It does NOT own the free list. cow_gc.pdx recovers physical blocks
+// whose refcount drops to zero and returns them via its own free-list
+// linkage; this module never recycles blocks -- pxcw_alloc_block is a
+// monotonic bump allocator over PXCW_DEVICE_BLOCKS. A widening will
+// consult the gc free list before bumping.
+//
+// It does NOT hash-verify writes. Verification is a widening -- a
+// blake2s (or equivalent) digest per block written into a sidecar
+// table -- deliberately deferred so the CoW invariant lands first
+// and hash-check refusals are a separate story with their own witness.
+//
+// =============================================================================
+// §1  BLOCK GEOMETRY
+// =============================================================================
+//
+// PXCW_DEVICE_BLOCKS = 4096       physical blocks the scaffold owns.
+// PXCW_BOOTSTRAP_BLK = 0          the block every fresh LBA resolves to
+//                                  before any pxcw_write; refcount 1 by
+//                                  convention. The witness primes this in
+//                                  pxcw_reset.
+//
+// _pxcw_blocks layout: one u64 payload per block. mov [addr], val is the
+// scaffold's "write"; memcpy semantics for a single word.
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _pxcw_blocks and _pxcw_state are written only by helpers in this
+// module. tools/build.sh confines relocations against each to
+// `core/fs/pdxfs/cow_write.o`.
+//
+// STATE LAYOUT -- _pxcw_state : [u64; 8]
+//   +0    init_mark        0xC1DE once pxcw_reset has run
+//   +8    err              sticky error latch
+//   +16   next_free_block  monotonic bump allocator cursor (starts at 1)
+//   +24   write_count      total pxcw_write calls (both paths)
+//   +32   cow_dupes        writes that took the SHARED path (allocate + copy)
+//   +40   fast_paths       writes that took the UNIQUE path (in place)
+//   +48   alloc_count      total pxcw_alloc_block calls
+//   +56   reserved
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFEFE0..0xFFFFEFEF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time. Adjacent used band
+// above: cow_read 0xFFFFEFF0..FF (R42.M1-002). Adjacent used band
+// below: cow_gc 0xFFFFEFD0..DF (R42.M1-004).
+//
+//   PXCW_OK                = 0
+//   PXCW_ERR_NOT_INIT      = 0xFFFFEFEF   accessor before pxcw_reset
+//   PXCW_ERR_OUT_OF_EXTENT = 0xFFFFEFEE   lba/blk >= PXCW_DEVICE_BLOCKS
+//   PXCW_ERR_OOS           = 0xFFFFEFED   pxcw_alloc_block: bump cursor MAX
+//   PXCW_ERR_READ_MISS     = 0xFFFFEFEC   pxcr_read returned NOT_FOUND
+//   PXCW_ERR_BAD_SNAPSHOT  = 0xFFFFEFEB   snapshot_id == 0 or > snapshot_top
+//   PXCW_ERR_MAP_FAIL      = 0xFFFFEFEA   pxcr_snapshot_map refused
+//   PXCW_ERR_REFCOUNT_FAIL = 0xFFFFEFE9   pxrc_inc/pxrc_dec refused
+//   PXCW_ERR_INTERNAL      = 0xFFFFEFE8   unreachable-fallthrough tripwire
+//
+// Reserved-label discipline: labels prefixed `pxcw_`.
+
+module CowWrite = structure {
+
+  pub let PXCW_DEVICE_BLOCKS  : u64 = 4096
+  pub let PXCW_BOOTSTRAP_BLK  : u64 = 0
+
+  pub let PXCW_OK                : u64 = 0
+  pub let PXCW_ERR_NOT_INIT      : u64 = 0xFFFFEFEF
+  pub let PXCW_ERR_OUT_OF_EXTENT : u64 = 0xFFFFEFEE
+  pub let PXCW_ERR_OOS           : u64 = 0xFFFFEFED
+  pub let PXCW_ERR_READ_MISS     : u64 = 0xFFFFEFEC
+  pub let PXCW_ERR_BAD_SNAPSHOT  : u64 = 0xFFFFEFEB
+  pub let PXCW_ERR_MAP_FAIL      : u64 = 0xFFFFEFEA
+  pub let PXCW_ERR_REFCOUNT_FAIL : u64 = 0xFFFFEFE9
+  pub let PXCW_ERR_INTERNAL      : u64 = 0xFFFFEFE8
+
+  pub let PXCW_INIT_MARK : u64 = 0xC1DE
+
+  pub let mut _pxcw_blocks : [u64; 4096] = uninit @align(64)
+  pub let mut _pxcw_state  : [u64; 8]    = uninit @align(64)
+
+  // ==========================================================================
+  // Reset. Clears block payload storage, state; installs init_mark and
+  // primes next_free_block = 1 (block 0 is the shared bootstrap block
+  // every fresh lba resolves to).
+  // ==========================================================================
+
+  pub let pxcw_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-003 (#1382): clear blocks + state, install init_mark, prime next_free_block. Labels prefixed pxcw_rst_.",
+      block: {
+        lea r10, [rip + _pxcw_blocks];
+        xor rax, rax;
+        xor rcx, rcx;
+      pxcw_rst_b:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4096;
+        jb  pxcw_rst_b;
+
+        lea r10, [rip + _pxcw_state];
+        xor rcx, rcx;
+      pxcw_rst_s:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  pxcw_rst_s;
+
+        mov rax, 0xC1DE;
+        mov [r10 + 0], rax;
+        mov rax, 1;
+        mov [r10 + 16], rax;                    // next_free_block := 1
+        ret
+      }
+    } @no_frame
+
+  pub let pxcw_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-003 (#1382): 1 iff init_mark matches. Labels prefixed pxcw_bnd_.",
+      block: {
+        lea r10, [rip + _pxcw_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC1DE;
+        cmp rax, r11;
+        jne pxcw_bnd_no;
+        mov rax, 1;
+        ret;
+      pxcw_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let pxcw_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-003 (#1382): sticky error latch readback.",
+      block: {
+        lea r10, [rip + _pxcw_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let pxcw_set_err : (u64) -> () !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-003 (#1382): first-writer-wins error latch. Labels prefixed pxcw_se_.",
+      block: {
+        lea r10, [rip + _pxcw_state];
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        jne pxcw_se_out;
+        mov [r10 + 8], rdi;
+      pxcw_se_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Field readbacks.
+  // ==========================================================================
+
+  pub let pxcw_next_free : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-003 (#1382): next_free_block field.",
+      block: {
+        lea r10, [rip + _pxcw_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let pxcw_write_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-003 (#1382): write_count field.",
+      block: {
+        lea r10, [rip + _pxcw_state];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let pxcw_cow_dupes : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-003 (#1382): cow_dupes field.",
+      block: {
+        lea r10, [rip + _pxcw_state];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let pxcw_fast_paths : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-003 (#1382): fast_paths field.",
+      block: {
+        lea r10, [rip + _pxcw_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let pxcw_alloc_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-003 (#1382): alloc_count field.",
+      block: {
+        lea r10, [rip + _pxcw_state];
+        mov rax, [r10 + 48];
+        ret
+      }
+    } @no_frame
+
+  pub let pxcw_block_read : (u64) -> u64 !{mem} @{} =
+    fn (blk: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-003 (#1382): read a single block payload word. Refuses on out-of-extent. Labels prefixed pxcw_br_.",
+      block: {
+        lea r10, [rip + _pxcw_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC1DE;
+        cmp rax, r11;
+        jne pxcw_br_ni;
+
+        cmp rdi, 4096;
+        jae pxcw_br_oe;
+
+        lea r11, [rip + _pxcw_blocks];
+        mov rax, [r11 + rdi * 8];
+        ret;
+
+      pxcw_br_ni:
+        mov rdi, 0xFFFFEFEF;
+        call pxcw_set_err;
+        xor rax, rax;
+        ret;
+      pxcw_br_oe:
+        mov rdi, 0xFFFFEFEE;
+        call pxcw_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pxcw_alloc_block() -> u64
+  //
+  // Bump-allocate a fresh physical block. Returns the new block id
+  // (>= 1). Refuses:
+  //   - not init                    PXCW_ERR_NOT_INIT
+  //   - next_free_block == MAX      PXCW_ERR_OOS
+  //
+  // The allocator NEVER recycles. cow_gc.pdx maintains a free list a
+  // widening will consult before this cursor bump; today the two paths
+  // are independent so the CoW invariant is provable in isolation.
+  // ==========================================================================
+
+  pub let pxcw_alloc_block : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-003 (#1382): bump-allocate a physical block. Labels prefixed pxcw_a_.",
+      block: {
+        lea r10, [rip + _pxcw_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC1DE;
+        cmp rax, r11;
+        jne pxcw_a_ni;
+
+        mov rax, [r10 + 16];                    // next_free_block
+        cmp rax, 4096;
+        jae pxcw_a_oos;
+
+        mov r8, rax;                            // return value
+        add rax, 1;
+        mov [r10 + 16], rax;
+
+        // alloc_count++
+        mov r9, [r10 + 48];
+        add r9, 1;
+        mov [r10 + 48], r9;
+
+        mov rax, r8;
+        ret;
+
+      pxcw_a_ni:
+        mov rdi, 0xFFFFEFEF;
+        call pxcw_set_err;
+        xor rax, rax;
+        ret;
+      pxcw_a_oos:
+        mov rdi, 0xFFFFEFED;
+        call pxcw_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pxcw_write(snapshot_id, lba, payload) -> u64
+  //
+  // Write `payload` to the physical block backing `lba` in
+  // `snapshot_id`. Two paths:
+  //
+  //   SHARED  (pxrc_get(cur_blk) > 1):
+  //     alloc new_blk via pxcw_alloc_block
+  //     copy payload from cur_blk into new_blk (single word)
+  //     pxrc_dec(cur_blk); pxrc_inc(new_blk)
+  //     pxcr_snapshot_map(snapshot_id, lba, new_blk)
+  //     write payload into new_blk
+  //     bump cow_dupes.
+  //
+  //   UNIQUE  (pxrc_get(cur_blk) == 1):
+  //     write payload into cur_blk in place
+  //     bump fast_paths.
+  //
+  // Refuses:
+  //   - not init                    PXCW_ERR_NOT_INIT
+  //   - lba >= PXCW_DEVICE_BLOCKS   PXCW_ERR_OUT_OF_EXTENT
+  //   - snapshot_id == 0            PXCW_ERR_BAD_SNAPSHOT
+  //   - pxcr_read failure           PXCW_ERR_READ_MISS
+  //   - alloc failure               PXCW_ERR_OOS
+  //   - pxrc_inc/dec failure        PXCW_ERR_REFCOUNT_FAIL
+  //   - pxcr_snapshot_map failure   PXCW_ERR_MAP_FAIL
+  //
+  // Register plan: 6-push callee-save prologue (rbx = snapshot_id,
+  // rbp = lba, r12 = payload, r13 = cur_blk, r14 = new_blk, r15 =
+  // refcount cache). sub rsp, 8 keeps %16 == 0 across nested calls.
+  // ==========================================================================
+
+  pub let pxcw_write : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (snapshot_id: u64, lba: u64, payload: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M1-003 (#1382): decide SHARED vs UNIQUE via pxrc_get; on SHARED alloc + copy + refcount adjust + snapshot_map; on UNIQUE overwrite in place. Labels prefixed pxcw_w_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                           // snapshot_id
+        mov rbp, rsi;                           // lba
+        mov r12, rdx;                           // payload
+
+        // Init check.
+        lea r10, [rip + _pxcw_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xC1DE;
+        cmp rax, r11;
+        jne pxcw_w_ni;
+
+        // snapshot_id != 0
+        cmp rbx, 0;
+        je  pxcw_w_bs;
+
+        // lba < PXCW_DEVICE_BLOCKS
+        cmp rbp, 4096;
+        jae pxcw_w_oe;
+
+        // Resolve current block. rdi = lba.
+        mov rdi, rbp;
+        call pxcr_read;
+
+        // pxcr_read returns error codes in the 0xFFFFEFF0..FF band.
+        // Any value >= 0xFFFFF000 is treated as failure (matches the
+        // taxonomy used repo-wide: only counts, block ids and payloads
+        // live below that ceiling).
+        mov r11, 0xFFFFEFF0;
+        cmp rax, r11;
+        jae pxcw_w_rm;
+
+        mov r13, rax;                           // cur_blk
+
+        // Refcount of cur_blk.
+        mov rdi, r13;
+        call pxrc_get;
+        mov r11, 0xFFFFF000;
+        cmp rax, r11;
+        jae pxcw_w_rf;
+        mov r15, rax;                           // rc
+
+        // SHARED path: rc > 1.
+        cmp r15, 1;
+        ja  pxcw_w_shared;
+
+        // ------------------ UNIQUE path ------------------
+        // Overwrite cur_blk in place.
+        lea r11, [rip + _pxcw_blocks];
+        mov [r11 + r13 * 8], r12;
+
+        // fast_paths++
+        mov r9, [r10 + 40];
+        add r9, 1;
+        mov [r10 + 40], r9;
+
+        // write_count++
+        mov r9, [r10 + 24];
+        add r9, 1;
+        mov [r10 + 24], r9;
+
+        xor rax, rax;
+        jmp pxcw_w_out;
+
+      pxcw_w_shared:
+        // ------------------ SHARED path ------------------
+        call pxcw_alloc_block;
+        mov r11, 0xFFFFF000;
+        cmp rax, r11;
+        jae pxcw_w_oos;
+        mov r14, rax;                           // new_blk
+
+        // Copy contents of cur_blk into new_blk. The write below
+        // supersedes it, but the copy MATERIALISES the CoW invariant:
+        // a subsequent partial-write widening (payload smaller than
+        // block) will need the intact original bytes.
+        lea r11, [rip + _pxcw_blocks];
+        mov r9, [r11 + r13 * 8];
+        mov [r11 + r14 * 8], r9;
+
+        // pxrc_dec(cur_blk)
+        mov rdi, r13;
+        call pxrc_dec;
+        mov r11, 0xFFFFF000;
+        cmp rax, r11;
+        jae pxcw_w_rf;
+
+        // pxrc_inc(new_blk)
+        mov rdi, r14;
+        call pxrc_inc;
+        mov r11, 0xFFFFF000;
+        cmp rax, r11;
+        jae pxcw_w_rf;
+
+        // pxcr_snapshot_map(snapshot_id, lba, new_blk)
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r14;
+        call pxcr_snapshot_map;
+        cmp rax, 0;
+        jne pxcw_w_mf;
+
+        // Write payload into new_blk (overwrites the copied word).
+        lea r11, [rip + _pxcw_blocks];
+        mov [r11 + r14 * 8], r12;
+
+        // cow_dupes++
+        lea r10, [rip + _pxcw_state];
+        mov r9, [r10 + 32];
+        add r9, 1;
+        mov [r10 + 32], r9;
+
+        // write_count++
+        mov r9, [r10 + 24];
+        add r9, 1;
+        mov [r10 + 24], r9;
+
+        xor rax, rax;
+        jmp pxcw_w_out;
+
+      pxcw_w_ni:
+        mov rdi, 0xFFFFEFEF;
+        call pxcw_set_err;
+        mov rax, 0xFFFFEFEF;
+        jmp pxcw_w_out;
+      pxcw_w_bs:
+        mov rdi, 0xFFFFEFEB;
+        call pxcw_set_err;
+        mov rax, 0xFFFFEFEB;
+        jmp pxcw_w_out;
+      pxcw_w_oe:
+        mov rdi, 0xFFFFEFEE;
+        call pxcw_set_err;
+        mov rax, 0xFFFFEFEE;
+        jmp pxcw_w_out;
+      pxcw_w_rm:
+        mov rdi, 0xFFFFEFEC;
+        call pxcw_set_err;
+        mov rax, 0xFFFFEFEC;
+        jmp pxcw_w_out;
+      pxcw_w_oos:
+        mov rdi, 0xFFFFEFED;
+        call pxcw_set_err;
+        mov rax, 0xFFFFEFED;
+        jmp pxcw_w_out;
+      pxcw_w_rf:
+        mov rdi, 0xFFFFEFE9;
+        call pxcw_set_err;
+        mov rax, 0xFFFFEFE9;
+        jmp pxcw_w_out;
+      pxcw_w_mf:
+        mov rdi, 0xFFFFEFEA;
+        call pxcw_set_err;
+        mov rax, 0xFFFFEFEA;
+
+      pxcw_w_out:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
