@@ -4975,6 +4975,83 @@ semterm_pin_one "${GSC_SRC}" 'pub let scr_reproject_glyph : (u64) -> u64'
 echo "[semterm-r44m2-confine] gui_vello / gui_charts / gui_scroll entry-point arities pinned"
 
 # ---------------------------------------------------------------------------
+# R44.M3-001/002/003 (#1406/#1407/#1408): SEMTERM GUI IME / A11Y /
+# KBDNAV CONFINEMENT.
+#
+# Three modules close the R44.M3 accessibility axis on top of the
+# R44.M2 rendering seams: gui_ime (G11 IME binding -- composing code
+# points route into a bounded pre-edit buffer, ime_commit moves the
+# run into a committed counter and bumps a notify_pending flag the
+# editor pump drains), gui_a11y (G10 accessibility tree -- rooted
+# node pool with role/name/value/parent/depth and a publish_pending
+# counter the AT bridge drains) and gui_kbdnav (G10 keyboard
+# navigation -- Tab / F6 focus routing, arrow-key within-panel
+# navigation, focus-ring visibility flag, skip-link hits counter).
+# Each owns its own state cells; a second writer against any of them
+# would let a caller:
+#   - forge the pre-edit buffer or commit counter (gui_ime
+#     confinement), so a downstream editor pump reads a run the IME
+#     never actually composed -- bypassing the NOTHING_TO_COMMIT
+#     refusal -- or bump notify_pending outside of ime_commit,
+#     letting the editor treat an empty pre-edit as a committed run;
+#   - forge the a11y tree's node pool or root_installed flag
+#     (gui_a11y confinement), so the AT bridge walks a forest or
+#     encounters a node whose parent index dangles past node_count,
+#     bypassing the HAS_ROOT / NO_ROOT / BAD_PARENT refusal band;
+#   - forge the focus_panel / focus_widget / widgets_per_panel
+#     entries (gui_kbdnav confinement), so the Vello backend paints
+#     the focus ring on a widget the router never actually focused,
+#     or divides by zero in the modular cycling arithmetic against a
+#     zero-widget panel -- bypassing the BAD_COUNT refusal.
+GIM_SRC="${REPO_ROOT}/src/kernel/core/semterm/gui_ime.pdx"
+GAY_SRC="${REPO_ROOT}/src/kernel/core/semterm/gui_a11y.pdx"
+GKN_SRC="${REPO_ROOT}/src/kernel/core/semterm/gui_kbdnav.pdx"
+if [[ ! -f "${GIM_SRC}" || ! -f "${GAY_SRC}" || ! -f "${GKN_SRC}" ]]; then
+    echo "[semterm-r44m3-confine] FAIL - one of the R44.M3 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_ime_state'   'core/semterm/gui_ime.o'
+ec_confine_one '_ime_preedit' 'core/semterm/gui_ime.o'
+ec_confine_one '_a11_state'   'core/semterm/gui_a11y.o'
+ec_confine_one '_a11_nodes'   'core/semterm/gui_a11y.o'
+ec_confine_one '_knv_state'   'core/semterm/gui_kbdnav.o'
+ec_confine_one '_knv_widgets' 'core/semterm/gui_kbdnav.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/semterm/gui_ime.pdx §3, gui_a11y.pdx §4," >&2
+    echo "  and gui_kbdnav.pdx §5 for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[semterm-r44m3-confine] R44.M3 (gui_ime + gui_a11y + gui_kbdnav) state confined"
+
+# ARITY PINS for the R44.M3 entry points. Same rationale as the
+# R41 / R44.M1 / R44.M2 pins above: a widening on any of these makes
+# "smuggle an extra byte into a commit the IME never actually
+# emitted", "graft a subtree under a parent id the caller minted from
+# nowhere", or "advance focus without touching the panel counters"
+# expressible in a call site the confinement gate cannot see.
+semterm_pin_one "${GIM_SRC}" 'pub let ime_preedit_push : (u64) -> u64'
+semterm_pin_one "${GIM_SRC}" 'pub let ime_preedit_pop : () -> u64'
+semterm_pin_one "${GIM_SRC}" 'pub let ime_preedit_clear : () -> u64'
+semterm_pin_one "${GIM_SRC}" 'pub let ime_preedit_at : (u64) -> u64'
+semterm_pin_one "${GIM_SRC}" 'pub let ime_commit : () -> u64'
+semterm_pin_one "${GIM_SRC}" 'pub let ime_notify_ack : () -> u64'
+semterm_pin_one "${GAY_SRC}" 'pub let a11_root_add : (u64, u64, u64) -> u64'
+semterm_pin_one "${GAY_SRC}" 'pub let a11_child_add : (u64, u64, u64, u64) -> u64'
+semterm_pin_one "${GAY_SRC}" 'pub let a11_node_field : (u64, u64) -> u64'
+semterm_pin_one "${GAY_SRC}" 'pub let a11_publish_flush : () -> u64'
+semterm_pin_one "${GKN_SRC}" 'pub let knv_widgets_set : (u64, u64) -> u64'
+semterm_pin_one "${GKN_SRC}" 'pub let knv_widgets_get : (u64) -> u64'
+semterm_pin_one "${GKN_SRC}" 'pub let knv_ring_show : (u64) -> u64'
+semterm_pin_one "${GKN_SRC}" 'pub let knv_next_widget : () -> u64'
+semterm_pin_one "${GKN_SRC}" 'pub let knv_prev_widget : () -> u64'
+semterm_pin_one "${GKN_SRC}" 'pub let knv_next_panel : () -> u64'
+semterm_pin_one "${GKN_SRC}" 'pub let knv_prev_panel : () -> u64'
+semterm_pin_one "${GKN_SRC}" 'pub let knv_arrow : (u64) -> u64'
+semterm_pin_one "${GKN_SRC}" 'pub let knv_skip_link_next : () -> u64'
+semterm_pin_one "${GKN_SRC}" 'pub let knv_skip_link_prev : () -> u64'
+echo "[semterm-r44m3-confine] gui_ime / gui_a11y / gui_kbdnav entry-point arities pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path
