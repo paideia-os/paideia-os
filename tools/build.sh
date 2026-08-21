@@ -5236,6 +5236,74 @@ fi
 echo "[g1-m2-confine] G1.M2 (VRR range + channel + driver) state confined"
 
 # ---------------------------------------------------------------------------
+# R47.M1..M5 (#1412/#1413/#1414/#1415/#1416/#1417/#1418/#1419/
+#             #1421/#1422/#1423/#1424): Intel VMD driver substrate --
+# vmd_probe, vmd_endpoint_enum, kind_vmd_endpoint, vmd_root_complex,
+# vmd_msix_remap, vmd_hotplug, vmd_nvme_bridge, vmd_nvme_isolation,
+# vmd_iommu_domain, vmd_iommu_switch, vmd_bios_off_fallback, and the
+# vmd_config_channel schema.
+#
+# Twelve modules open R47 across four bands (0xFFFFFBD0..FF for M1,
+# 0xFFFFFD10..1F + 0xFFFFFD30..3F + 0xFFFFFD70..7F for M2, 0xFFFFFD90..9F
+# for M3, 0xFFFFFDD0..DF for M4/M5).  Each owns its own state cells;
+# tools/build.sh confines relocations against each so a second writer
+# cannot forge a probe count, a child endpoint row, an aperture stat,
+# an MSI-X translation, a hotplug counter, an NVMe binding, a QP
+# owner, an IOMMU domain assignment, an active-domain cell, a
+# fallback tally, or a config-channel session.
+VMDP_SRC="${REPO_ROOT}/src/kernel/core/drivers/vmd/probe.pdx"
+VMDE_SRC="${REPO_ROOT}/src/kernel/core/drivers/vmd/endpoint_enum.pdx"
+VMDK_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_vmd_endpoint.pdx"
+VMDR_SRC="${REPO_ROOT}/src/kernel/core/drivers/vmd/root_complex.pdx"
+VMDM_SRC="${REPO_ROOT}/src/kernel/core/drivers/vmd/msix_remap.pdx"
+VMDH_SRC="${REPO_ROOT}/src/kernel/core/drivers/vmd/hotplug.pdx"
+VMDNB_SRC="${REPO_ROOT}/src/kernel/core/drivers/vmd/nvme_bridge.pdx"
+VMDNI_SRC="${REPO_ROOT}/src/kernel/core/drivers/vmd/nvme_isolation.pdx"
+VMDID_SRC="${REPO_ROOT}/src/kernel/core/drivers/vmd/iommu_domain.pdx"
+VMDIS_SRC="${REPO_ROOT}/src/kernel/core/drivers/vmd/iommu_switch.pdx"
+VMDBF_SRC="${REPO_ROOT}/src/kernel/core/drivers/vmd/bios_off_fallback.pdx"
+VMDCC_SRC="${REPO_ROOT}/src/kernel/core/ipc/vmd_config_channel.pdx"
+if [[ ! -f "${VMDP_SRC}" || ! -f "${VMDE_SRC}" || ! -f "${VMDK_SRC}" \
+    || ! -f "${VMDR_SRC}" || ! -f "${VMDM_SRC}" || ! -f "${VMDH_SRC}" \
+    || ! -f "${VMDNB_SRC}" || ! -f "${VMDNI_SRC}" \
+    || ! -f "${VMDID_SRC}" || ! -f "${VMDIS_SRC}" \
+    || ! -f "${VMDBF_SRC}" || ! -f "${VMDCC_SRC}" ]]; then
+    echo "[r47-confine] FAIL - one of the R47 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_vmd_probe_stats'          'core/drivers/vmd/probe.o'
+ec_confine_one '_vmd_enum_children'        'core/drivers/vmd/endpoint_enum.o'
+ec_confine_one '_vmd_enum_stats'           'core/drivers/vmd/endpoint_enum.o'
+ec_confine_one '_vmd_endpoint_table'       'core/cap/kind_vmd_endpoint.o'
+ec_confine_one '_vmd_endpoint_stats'       'core/cap/kind_vmd_endpoint.o'
+ec_confine_one '_vmd_root_stats'           'core/drivers/vmd/root_complex.o'
+ec_confine_one '_vmd_msix_map'             'core/drivers/vmd/msix_remap.o'
+ec_confine_one '_vmd_msix_stats'           'core/drivers/vmd/msix_remap.o'
+ec_confine_one '_vmd_hotplug_stats'        'core/drivers/vmd/hotplug.o'
+ec_confine_one '_vmd_nvme_bindings'        'core/drivers/vmd/nvme_bridge.o'
+ec_confine_one '_vmd_nvme_stats'           'core/drivers/vmd/nvme_bridge.o'
+ec_confine_one '_vmd_qp_owners'            'core/drivers/vmd/nvme_isolation.o'
+ec_confine_one '_vmd_iso_stats'            'core/drivers/vmd/nvme_isolation.o'
+ec_confine_one '_vmd_iommu_owners'         'core/drivers/vmd/iommu_domain.o'
+ec_confine_one '_vmd_iommu_stats'          'core/drivers/vmd/iommu_domain.o'
+ec_confine_one '_vmd_iommu_active'         'core/drivers/vmd/iommu_switch.o'
+ec_confine_one '_vmd_switch_stats'         'core/drivers/vmd/iommu_switch.o'
+ec_confine_one '_vmd_fallback_stats'       'core/drivers/vmd/bios_off_fallback.o'
+ec_confine_one '_vcc_sessions'             'core/ipc/vmd_config_channel.o'
+ec_confine_one '_vcc_stats'                'core/ipc/vmd_config_channel.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See vmd/probe.pdx §2, endpoint_enum.pdx §1," >&2
+    echo "  kind_vmd_endpoint.pdx §1, root_complex.pdx §2," >&2
+    echo "  msix_remap.pdx §1, hotplug.pdx §1, nvme_bridge.pdx §1," >&2
+    echo "  nvme_isolation.pdx §1, iommu_domain.pdx §1," >&2
+    echo "  iommu_switch.pdx §1, bios_off_fallback.pdx §0," >&2
+    echo "  and vmd_config_channel.pdx §1 for the per-module" >&2
+    echo "  one-writer discipline." >&2
+    exit 1
+fi
+echo "[r47-confine] R47 (VMD probe + enum + cap + root complex + msix + hotplug + nvme bridge + nvme isolation + iommu domain + iommu switch + bios-off + config channel) confined"
+
+# ---------------------------------------------------------------------------
 # G1.M1-005 (#1431) + G1.M3-005 (#1441): P1 INVARIANT ENFORCEMENT.
 #
 # Refuses the build if any source file:
