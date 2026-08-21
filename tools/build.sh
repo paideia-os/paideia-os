@@ -4560,6 +4560,83 @@ semterm_pin_one "${PXGC_SRC}" 'pub let pxgc_free_at : (u64) -> u64'
 echo "[pdxfs-cow-confine] R42.M1 entry-point arities pinned"
 
 # ---------------------------------------------------------------------------
+# R42.M2-001..004 (#1384..#1387): PDXFS-v1 JOURNAL CONFINEMENT.
+#
+# Four modules deliver the PdxFS-v1 journal skeleton above the R42.M1
+# CoW walker:
+#   wal.pdx            -- ring buffer of tx records + write-ahead
+#                          invariant refusal on wal_block_write before
+#                          the covering wal_fsync.
+#   journal_fence.pdx  -- commit table naming WAL seqs; refuses commit
+#                          without a preceding fence (no-fence) and
+#                          duplicate commits (already).
+#   journal_replay.pdx -- mount-time classification of WAL records into
+#                          APPLIED/DISCARDED via jfn_is_committed.
+#   journal_csum.pdx   -- CRC32C-style expected table + tear-detection
+#                          refusal on jcs_check_replay_eligible.
+#
+# Each owns its own state cells. A second writer against any of them
+# would let a caller:
+#   - stuff a WAL record without observing the fsync gate (wal
+#     confinement), which would silently break the write-ahead
+#     invariant every callee below assumes,
+#   - plant a commit marker without the fence pair (journal_fence
+#     confinement), which would let a crash-window tx graduate to
+#     APPLIED at replay time with no barrier having actually run,
+#   - flip a classification back to APPLIED after the fence table
+#     said otherwise (journal_replay confinement), which would let
+#     the mount path re-apply uncommitted block writes,
+#   - quiet a torn record by planting a matching expected checksum
+#     (journal_csum confinement), which would smuggle a torn block
+#     past the tear-detection refusal.
+WAL_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/wal.pdx"
+JFN_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/journal_fence.pdx"
+JRP_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/journal_replay.pdx"
+JCS_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/journal_csum.pdx"
+if [[ ! -f "${WAL_SRC}" || ! -f "${JFN_SRC}" || ! -f "${JRP_SRC}" || ! -f "${JCS_SRC}" ]]; then
+    echo "[pdxfs-journal-confine] FAIL - one of the R42.M2 source files missing" >&2
+    exit 1
+fi
+ec_confine_one '_wal_ring'         'core/fs/pdxfs/wal.o'
+ec_confine_one '_wal_state'        'core/fs/pdxfs/wal.o'
+ec_confine_one '_jfn_commits'      'core/fs/pdxfs/journal_fence.o'
+ec_confine_one '_jfn_state'        'core/fs/pdxfs/journal_fence.o'
+ec_confine_one '_jrp_state_at'     'core/fs/pdxfs/journal_replay.o'
+ec_confine_one '_jrp_state'        'core/fs/pdxfs/journal_replay.o'
+ec_confine_one '_jcs_expected'     'core/fs/pdxfs/journal_csum.o'
+ec_confine_one '_jcs_state'        'core/fs/pdxfs/journal_csum.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/fs/pdxfs/{wal,journal_fence,journal_replay,journal_csum}.pdx §2" >&2
+    echo "  for the per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[pdxfs-journal-confine] R42.M2 (wal + journal_fence + journal_replay + journal_csum) state confined"
+
+# ARITY PINS for the R42.M2 entry points. Same rationale as R42.M1:
+# a widening on any of these makes "append without observing the
+# gate", "commit without a fence covering the tx", "reclassify a
+# record without consulting the commit table", or "verify without
+# recompute" expressible in a call site the confinement gate
+# cannot see.
+semterm_pin_one "${WAL_SRC}" 'pub let wal_append : (u64, u64) -> u64'
+semterm_pin_one "${WAL_SRC}" 'pub let wal_fsync : () -> u64'
+semterm_pin_one "${WAL_SRC}" 'pub let wal_block_write : (u64) -> u64'
+semterm_pin_one "${WAL_SRC}" 'pub let wal_seq_at : (u64) -> u64'
+semterm_pin_one "${WAL_SRC}" 'pub let wal_checksum_at : (u64) -> u64'
+semterm_pin_one "${JFN_SRC}" 'pub let jfn_fence : () -> u64'
+semterm_pin_one "${JFN_SRC}" 'pub let jfn_commit : (u64) -> u64'
+semterm_pin_one "${JFN_SRC}" 'pub let jfn_is_committed : (u64) -> u64'
+semterm_pin_one "${JFN_SRC}" 'pub let jfn_commit_seq_at : (u64) -> u64'
+semterm_pin_one "${JRP_SRC}" 'pub let jrp_scan_from : (u64) -> u64'
+semterm_pin_one "${JRP_SRC}" 'pub let jrp_replay : (u64) -> u64'
+semterm_pin_one "${JRP_SRC}" 'pub let jrp_state_at : (u64) -> u64'
+semterm_pin_one "${JCS_SRC}" 'pub let jcs_recompute : () -> u64'
+semterm_pin_one "${JCS_SRC}" 'pub let jcs_verify : (u64) -> u64'
+semterm_pin_one "${JCS_SRC}" 'pub let jcs_check_replay_eligible : (u64) -> u64'
+semterm_pin_one "${JCS_SRC}" 'pub let jcs_seed_torn : (u64) -> u64'
+echo "[pdxfs-journal-confine] R42.M2 entry-point arities pinned"
+
+# ---------------------------------------------------------------------------
 # R33.M5-003 (#1159): THE Q15 SAT-ADDER SINGLETON.
 #
 # One saturating combine, everywhere. Two Q15 adders would let one path

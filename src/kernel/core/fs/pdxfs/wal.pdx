@@ -1,0 +1,688 @@
+// src/kernel/core/fs/pdxfs/wal.pdx -- R42.M2-001 (#1384)
+//
+// PDXFS v1 JOURNAL -- WRITE-AHEAD LOG (RING BUFFER OF TX RECORDS).
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the AUTHORITY on the WRITE-AHEAD invariant: every logical block
+// write against a PdxFS volume MUST be preceded by an in-log record that
+// names the transaction (seq), sizes its payload, links to the previous
+// transaction (prev_seq), carries a checksum for tear detection, and is
+// fsync'd to durable storage before the corresponding block-write is
+// permitted to leave the module.
+//
+// It is the RING BUFFER the three sibling journal modules read:
+//
+//   journal_fence.pdx  -- reads (seq, head) to determine which records
+//                          may participate in a commit fence.
+//   journal_replay.pdx -- walks records from a checkpoint on mount and
+//                          re-applies each one the fence table names.
+//   journal_csum.pdx   -- recomputes the per-record checksum stored
+//                          here to detect torn writes on replay.
+//
+// It is a SCAFFOLD (D7). The ring lives in a single BSS-backed region
+// -- a real WAL is a preallocated on-disk extent the NVMe write path
+// (#906) fsyncs synchronously. The scaffold's semantic (append-then-
+// fsync-then-block-write, with an INVARIANT refusal if the caller
+// tries to write a block ahead of the fsync watermark) is the semantic
+// the on-disk widening preserves.
+//
+// It does NOT commit transactions. journal_fence.pdx is the sole
+// authority on commit records; a WAL record is durable but a
+// transaction is not committed until the fence writes its marker.
+//
+// It does NOT verify checksums. journal_csum.pdx recomputes and
+// compares; this module only STORES the value each append hands it.
+// The formula (seq XOR size XOR prev_seq) is a placeholder the csum
+// widening replaces with CRC32C.
+//
+// It does NOT replay records. journal_replay.pdx walks the ring at
+// mount time; this module owns the ring geometry and provides the
+// per-record accessors the walker consumes.
+//
+// =============================================================================
+// §1  RING GEOMETRY
+// =============================================================================
+//
+// WAL_MAX_RECORDS      = 64        ring capacity (scaffold).
+// WAL_RECORD_WORDS     = 5         per-record footprint in u64s.
+//
+// _wal_ring is a flat array of WAL_MAX_RECORDS * WAL_RECORD_WORDS u64s
+// (2.5 KiB). Entry(i) starts at _wal_ring[i * 5]:
+//
+//   +0    seq          transaction sequence number (>= 1)
+//   +8    size         payload size in bytes (>= 1)
+//   +16   checksum     as supplied by the appender
+//   +24   prev_seq     seq of the immediately preceding record (0 = none)
+//   +32   flags        bit 0 = fsynced, bit 1 = block_written
+//
+// head is the next-write index (also the current record count until we
+// wrap). The scaffold refuses to wrap; a widening replaces the refusal
+// with a checkpoint-driven overwrite.
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _wal_ring and _wal_state are written only by helpers in this module.
+// tools/build.sh confines relocations against each to `core/fs/pdxfs/
+// wal.o`. A second writer would let a caller "record a tx without
+// running the append gate", which would let the block-write path bypass
+// the write-ahead invariant with no symptom until a crash exposed the
+// missing record.
+//
+// STATE LAYOUT -- _wal_state : [u64; 8]
+//   +0    init_mark          0xEA10 once wal_reset has run
+//   +8    err                sticky error latch (first-writer-wins)
+//   +16   head               next-write index into the ring (also count)
+//   +24   next_seq           next sequence id wal_append will hand out
+//   +32   fsync_high_water   head at time of the last wal_fsync call
+//   +40   append_count       total wal_append calls that succeeded
+//   +48   fsync_count        total wal_fsync calls
+//   +56   block_write_count  total wal_block_write calls that succeeded
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFEFC0..0xFFFFEFCF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time. Adjacent used band
+// above: cow_gc 0xFFFFEFD0..DF (R42.M1-004). Adjacent free band below:
+// journal_fence 0xFFFFEFB0..BF (R42.M2-002).
+//
+//   WAL_OK              = 0
+//   WAL_ERR_NOT_INIT    = 0xFFFFEFCF   accessor before wal_reset
+//   WAL_ERR_RING_FULL   = 0xFFFFEFCE   append when head == WAL_MAX
+//   WAL_ERR_BAD_IDX     = 0xFFFFEFCD   accessor: idx >= head
+//   WAL_ERR_INVARIANT   = 0xFFFFEFCC   block_write before matching fsync
+//   WAL_ERR_BAD_SIZE    = 0xFFFFEFCB   append with size == 0
+//   WAL_ERR_INTERNAL    = 0xFFFFEFCA   unreachable-fallthrough tripwire
+//
+// Reserved-label discipline: labels prefixed `wal_`.
+
+module Wal = structure {
+
+  pub let WAL_MAX_RECORDS     : u64 = 64
+  pub let WAL_RECORD_WORDS    : u64 = 5
+
+  pub let WAL_OK              : u64 = 0
+  pub let WAL_ERR_NOT_INIT    : u64 = 0xFFFFEFCF
+  pub let WAL_ERR_RING_FULL   : u64 = 0xFFFFEFCE
+  pub let WAL_ERR_BAD_IDX     : u64 = 0xFFFFEFCD
+  pub let WAL_ERR_INVARIANT   : u64 = 0xFFFFEFCC
+  pub let WAL_ERR_BAD_SIZE    : u64 = 0xFFFFEFCB
+  pub let WAL_ERR_INTERNAL    : u64 = 0xFFFFEFCA
+
+  pub let WAL_INIT_MARK       : u64 = 0xEA10
+
+  pub let mut _wal_ring  : [u64; 320] = uninit @align(64)
+  pub let mut _wal_state : [u64; 8]   = uninit @align(64)
+
+  // ==========================================================================
+  // Reset. Clears ring + state; installs init_mark and primes next_seq = 1.
+  // ==========================================================================
+
+  pub let wal_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): clear ring + state, install init_mark, prime next_seq. Labels prefixed wal_rst_.",
+      block: {
+        lea r10, [rip + _wal_ring];
+        xor rax, rax;
+        xor rcx, rcx;
+      wal_rst_r:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 320;
+        jb  wal_rst_r;
+
+        lea r10, [rip + _wal_state];
+        xor rcx, rcx;
+      wal_rst_s:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  wal_rst_s;
+
+        mov rax, 0xEA10;
+        mov [r10 + 0], rax;
+        mov rax, 1;
+        mov [r10 + 24], rax;                    // next_seq := 1
+        ret
+      }
+    } @no_frame
+
+  pub let wal_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): 1 iff init_mark matches. Labels prefixed wal_bnd_.",
+      block: {
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEA10;
+        cmp rax, r11;
+        jne wal_bnd_no;
+        mov rax, 1;
+        ret;
+      wal_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let wal_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): sticky error latch readback.",
+      block: {
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let wal_set_err : (u64) -> () !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): first-writer-wins error latch. Labels prefixed wal_se_.",
+      block: {
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        jne wal_se_out;
+        mov [r10 + 8], rdi;
+      wal_se_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Field readbacks.
+  // ==========================================================================
+
+  pub let wal_head : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): head field.",
+      block: {
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let wal_next_seq : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): next_seq field.",
+      block: {
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let wal_fsync_high_water : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): fsync_high_water field.",
+      block: {
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let wal_append_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): append_count field.",
+      block: {
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let wal_fsync_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): fsync_count field.",
+      block: {
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 48];
+        ret
+      }
+    } @no_frame
+
+  pub let wal_block_write_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): block_write_count field.",
+      block: {
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 56];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Per-record accessors. Refuse on:
+  //   - not init                    WAL_ERR_NOT_INIT
+  //   - idx >= head                 WAL_ERR_BAD_IDX
+  // ==========================================================================
+
+  pub let wal_seq_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): read seq of record idx. Labels prefixed wal_sa_.",
+      block: {
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEA10;
+        cmp rax, r11;
+        jne wal_sa_ni;
+        mov rax, [r10 + 16];
+        cmp rdi, rax;
+        jae wal_sa_bi;
+
+        mov rax, rdi;
+        shl rax, 2;
+        add rax, rdi;                           // rdi * 5                                // rax = idx * 5
+        lea r11, [rip + _wal_ring];
+        mov rax, [r11 + rax * 8];               // +0 seq
+        ret;
+
+      wal_sa_ni:
+        mov rdi, 0xFFFFEFCF;
+        call wal_set_err;
+        xor rax, rax;
+        ret;
+      wal_sa_bi:
+        mov rdi, 0xFFFFEFCD;
+        call wal_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let wal_size_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): read size of record idx. Labels prefixed wal_za_.",
+      block: {
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEA10;
+        cmp rax, r11;
+        jne wal_za_ni;
+        mov rax, [r10 + 16];
+        cmp rdi, rax;
+        jae wal_za_bi;
+
+        mov rax, rdi;
+        shl rax, 2;
+        add rax, rdi;                           // rdi * 5
+        add rax, 1;                             // +1 (u64) = +8 bytes = size
+        lea r11, [rip + _wal_ring];
+        mov rax, [r11 + rax * 8];
+        ret;
+
+      wal_za_ni:
+        mov rdi, 0xFFFFEFCF;
+        call wal_set_err;
+        xor rax, rax;
+        ret;
+      wal_za_bi:
+        mov rdi, 0xFFFFEFCD;
+        call wal_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let wal_checksum_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): read checksum of record idx. Labels prefixed wal_ca_.",
+      block: {
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEA10;
+        cmp rax, r11;
+        jne wal_ca_ni;
+        mov rax, [r10 + 16];
+        cmp rdi, rax;
+        jae wal_ca_bi;
+
+        mov rax, rdi;
+        shl rax, 2;
+        add rax, rdi;                           // rdi * 5
+        add rax, 2;                             // +2 u64
+        lea r11, [rip + _wal_ring];
+        mov rax, [r11 + rax * 8];
+        ret;
+
+      wal_ca_ni:
+        mov rdi, 0xFFFFEFCF;
+        call wal_set_err;
+        xor rax, rax;
+        ret;
+      wal_ca_bi:
+        mov rdi, 0xFFFFEFCD;
+        call wal_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let wal_prev_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): read prev_seq of record idx. Labels prefixed wal_pa_.",
+      block: {
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEA10;
+        cmp rax, r11;
+        jne wal_pa_ni;
+        mov rax, [r10 + 16];
+        cmp rdi, rax;
+        jae wal_pa_bi;
+
+        mov rax, rdi;
+        shl rax, 2;
+        add rax, rdi;                           // rdi * 5
+        add rax, 3;                             // +3 u64
+        lea r11, [rip + _wal_ring];
+        mov rax, [r11 + rax * 8];
+        ret;
+
+      wal_pa_ni:
+        mov rdi, 0xFFFFEFCF;
+        call wal_set_err;
+        xor rax, rax;
+        ret;
+      wal_pa_bi:
+        mov rdi, 0xFFFFEFCD;
+        call wal_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let wal_flags_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): read flags of record idx. Labels prefixed wal_fa_.",
+      block: {
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEA10;
+        cmp rax, r11;
+        jne wal_fa_ni;
+        mov rax, [r10 + 16];
+        cmp rdi, rax;
+        jae wal_fa_bi;
+
+        mov rax, rdi;
+        shl rax, 2;
+        add rax, rdi;                           // rdi * 5
+        add rax, 4;                             // +4 u64
+        lea r11, [rip + _wal_ring];
+        mov rax, [r11 + rax * 8];
+        ret;
+
+      wal_fa_ni:
+        mov rdi, 0xFFFFEFCF;
+        call wal_set_err;
+        xor rax, rax;
+        ret;
+      wal_fa_bi:
+        mov rdi, 0xFFFFEFCD;
+        call wal_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // wal_append(size, prev_seq) -> u64
+  //
+  // Append one record to the ring. Assigns a fresh seq (next_seq++),
+  // records size + prev_seq, seeds a placeholder checksum
+  // (seq XOR size XOR prev_seq -- csum widening rewrites), zero flags.
+  // Returns the assigned seq id on success.
+  //
+  // Refuses:
+  //   - not init                    WAL_ERR_NOT_INIT
+  //   - size == 0                   WAL_ERR_BAD_SIZE
+  //   - head == WAL_MAX_RECORDS     WAL_ERR_RING_FULL
+  // ==========================================================================
+
+  pub let wal_append : (u64, u64) -> u64 !{mem} @{} =
+    fn (size: u64, prev_seq: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): append tx record. Labels prefixed wal_ap_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEA10;
+        cmp rax, r11;
+        jne wal_ap_ni;
+
+        cmp rdi, 0;
+        je  wal_ap_bs;
+
+        mov rbx, [r10 + 16];                    // head
+        mov r11, 64;                            // WAL_MAX_RECORDS
+        cmp rbx, r11;
+        jae wal_ap_full;
+
+        mov r12, [r10 + 24];                    // next_seq
+
+        // r13 = idx * 5 (u64 offset base for entry)
+        mov rax, rbx;
+        shl rax, 2;
+        add rax, rbx;                           // rbx * 5
+        mov r13, rax;
+
+        // Compute checksum = seq XOR size XOR prev_seq.
+        mov r14, r12;
+        xor r14, rdi;                           // ^ size
+        xor r14, rsi;                           // ^ prev_seq
+
+        lea r11, [rip + _wal_ring];
+        mov [r11 + r13 * 8], r12;               // +0 seq
+        add r13, 1;
+        mov [r11 + r13 * 8], rdi;               // +8 size
+        add r13, 1;
+        mov [r11 + r13 * 8], r14;               // +16 checksum
+        add r13, 1;
+        mov [r11 + r13 * 8], rsi;               // +24 prev_seq
+        add r13, 1;
+        xor rax, rax;
+        mov [r11 + r13 * 8], rax;               // +32 flags = 0
+
+        // head++, next_seq++, append_count++.
+        add rbx, 1;
+        mov [r10 + 16], rbx;
+        add r12, 1;
+        mov [r10 + 24], r12;
+        mov r9, [r10 + 40];
+        add r9, 1;
+        mov [r10 + 40], r9;
+
+        // Return the seq id we just used (r12 - 1).
+        mov rax, r12;
+        sub rax, 1;
+        jmp wal_ap_out;
+
+      wal_ap_ni:
+        mov rdi, 0xFFFFEFCF;
+        call wal_set_err;
+        xor rax, rax;
+        jmp wal_ap_out;
+      wal_ap_bs:
+        mov rdi, 0xFFFFEFCB;
+        call wal_set_err;
+        xor rax, rax;
+        jmp wal_ap_out;
+      wal_ap_full:
+        mov rdi, 0xFFFFEFCE;
+        call wal_set_err;
+        xor rax, rax;
+
+      wal_ap_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // wal_fsync() -> u64
+  //
+  // Declare every record in [fsync_high_water..head) durable. Marks
+  // each such record's flags bit 0 (fsynced). Returns the number of
+  // records newly fsynced (0 if none pending).
+  //
+  // Refuses:
+  //   - not init                    WAL_ERR_NOT_INIT
+  // ==========================================================================
+
+  pub let wal_fsync : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): fsync ring [hw..head). Labels prefixed wal_fs_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEA10;
+        cmp rax, r11;
+        jne wal_fs_ni;
+
+        // fsync_count++
+        mov r9, [r10 + 48];
+        add r9, 1;
+        mov [r10 + 48], r9;
+
+        mov rbx, [r10 + 32];                    // hw
+        mov r12, [r10 + 16];                    // head
+        xor r13, r13;                           // newly-fsynced
+      wal_fs_top:
+        cmp rbx, r12;
+        jae wal_fs_done;
+
+        // Set bit 0 in flags of record rbx.
+        mov rax, rbx;
+        shl rax, 2;
+        add rax, rbx;                           // rbx * 5
+        add rax, 4;
+        lea r11, [rip + _wal_ring];
+        mov r8, [r11 + rax * 8];
+        or  r8, 1;
+        mov [r11 + rax * 8], r8;
+
+        add r13, 1;
+        add rbx, 1;
+        jmp wal_fs_top;
+
+      wal_fs_done:
+        lea r10, [rip + _wal_state];
+        mov [r10 + 32], r12;                    // hw := head
+        mov rax, r13;
+        jmp wal_fs_out;
+
+      wal_fs_ni:
+        mov rdi, 0xFFFFEFCF;
+        call wal_set_err;
+        xor rax, rax;
+
+      wal_fs_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // wal_block_write(idx) -> u64
+  //
+  // Model a block-write against record idx. Refuses if that record has
+  // not been fsynced (write-ahead invariant). Sets flags bit 1
+  // (block_written) and bumps block_write_count on success. Returns 1.
+  //
+  // Refuses:
+  //   - not init                    WAL_ERR_NOT_INIT
+  //   - idx >= head                 WAL_ERR_BAD_IDX
+  //   - record flags bit 0 clear    WAL_ERR_INVARIANT
+  // ==========================================================================
+
+  pub let wal_block_write : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-001 (#1384): model a block-write behind write-ahead invariant. Labels prefixed wal_bw_.",
+      block: {
+        lea r10, [rip + _wal_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEA10;
+        cmp rax, r11;
+        jne wal_bw_ni;
+
+        mov rax, [r10 + 16];                    // head
+        cmp rdi, rax;
+        jae wal_bw_bi;
+
+        // Compute flags offset = idx * 5 + 4.
+        mov rax, rdi;
+        shl rax, 2;
+        add rax, rdi;                           // rdi * 5
+        add rax, 4;
+        lea r11, [rip + _wal_ring];
+        mov r8, [r11 + rax * 8];
+        mov r9, r8;
+        and r9, 1;                              // bit 0 = fsynced
+        cmp r9, 0;
+        je  wal_bw_inv;
+
+        or  r8, 2;                              // bit 1 = block_written
+        mov [r11 + rax * 8], r8;
+
+        mov r9, [r10 + 56];
+        add r9, 1;
+        mov [r10 + 56], r9;                     // block_write_count++
+        mov rax, 1;
+        ret;
+
+      wal_bw_ni:
+        mov rdi, 0xFFFFEFCF;
+        call wal_set_err;
+        xor rax, rax;
+        ret;
+      wal_bw_bi:
+        mov rdi, 0xFFFFEFCD;
+        call wal_set_err;
+        xor rax, rax;
+        ret;
+      wal_bw_inv:
+        mov rdi, 0xFFFFEFCC;
+        call wal_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+}

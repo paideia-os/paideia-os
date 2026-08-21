@@ -1,0 +1,594 @@
+// src/kernel/core/fs/pdxfs/journal_csum.pdx -- R42.M2-004 (#1387)
+//
+// PDXFS v1 JOURNAL -- CRC32C CHECKSUM + TEAR DETECTION.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the AUTHORITY on WAL-record INTEGRITY. On every mount the
+// journal_replay walker must know whether a WAL record's payload
+// crossed a sector boundary and left a partial (torn) write behind.
+// This module answers that question:
+//
+//   jcs_recompute()                 -- recomputes the expected checksum
+//                                       for every WAL record and caches
+//                                       it in _jcs_expected. The formula
+//                                       is CRC32C in a real widening; a
+//                                       simpler mixing function (seq
+//                                       XOR size XOR prev_seq XOR
+//                                       0xC33C_5AA5) is used here to
+//                                       give the scaffold a distinct
+//                                       result-space from wal_append's
+//                                       placeholder.
+//   jcs_verify(idx)                 -- 1 iff wal_checksum_at(idx)
+//                                       matches _jcs_expected[idx].
+//   jcs_seed_torn(idx)              -- corrupt the expected value at
+//                                       idx so verify returns 0. The
+//                                       real widening does not need
+//                                       this because torn writes are
+//                                       physical; here we seed one to
+//                                       exercise the refusal.
+//   jcs_check_replay_eligible(idx)  -- OK (0) if the record verifies;
+//                                       JCS_ERR_TORN if not.
+//
+// It is a SCAFFOLD (D7). The expected table is a parallel array to
+// the WAL; a widening will compute the CRC as records are appended
+// and compare after the read.
+//
+// It does NOT read the WAL payload. WAL records in this round carry
+// only their header; jcs uses the same header fields (seq, size,
+// prev_seq) that wal.pdx uses for its placeholder. The formula is
+// deliberately DISJOINT from wal.pdx's XOR-only placeholder so a bug
+// that leaves wal.pdx's value in _jcs_expected fails the verify.
+//
+// It does NOT own the classification. journal_replay.pdx classifies
+// records into APPLIED/DISCARDED; this module answers only "is the
+// record physically readable" -- a widening will refuse APPLIED for
+// any record jcs_check_replay_eligible refuses first.
+//
+// =============================================================================
+// §1  TABLE GEOMETRY
+// =============================================================================
+//
+// JCS_MAX_RECORDS      = 64        table capacity (mirrors WAL_MAX).
+// JCS_MIX_CONST        = 0xC33C_5AA5_C33C_5AA5   nonzero disjoint
+//                                                 mixer versus wal's
+//                                                 XOR-only formula.
+//
+// _jcs_expected is a flat array of JCS_MAX_RECORDS u64s. A slot with
+// value 0xFFFFFFFFFFFFFFFF is a sentinel for "recompute has not run
+// for this slot". jcs_reset seeds every slot with the sentinel; a
+// subsequent jcs_recompute overwrites [0..wal_head) with computed
+// values.
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _jcs_expected and _jcs_state are written only by helpers in this
+// module. tools/build.sh confines relocations against each to
+// `core/fs/pdxfs/journal_csum.o`. A second writer would let a caller
+// "quiet a torn record" by planting a matching expected value the
+// verify would then accept -- the whole tear-detection story rests
+// on this table being computed HERE and NOWHERE ELSE.
+//
+// STATE LAYOUT -- _jcs_state : [u64; 8]
+//   +0    init_mark          0xEC5C once jcs_reset has run
+//   +8    err                sticky error latch
+//   +16   recompute_count    total jcs_recompute calls
+//   +24   verify_count       total jcs_verify calls
+//   +32   torn_count         verifies that returned 0 (torn)
+//   +40   seed_torn_count    calls to jcs_seed_torn (test-only entry)
+//   +48   last_computed_hi   last computed value (upper accessor)
+//   +56   reserved
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFEF90..0xFFFFEF9F
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time. Adjacent used band
+// above: journal_replay 0xFFFFEFA0..AF (R42.M2-003). Adjacent free
+// band below: unassigned.
+//
+//   JCS_OK              = 0
+//   JCS_ERR_NOT_INIT    = 0xFFFFEF9F   accessor before jcs_reset
+//   JCS_ERR_TORN        = 0xFFFFEF9E   check_replay_eligible: mismatch
+//   JCS_ERR_BAD_IDX     = 0xFFFFEF9D   accessor: idx >= JCS_MAX_RECORDS
+//   JCS_ERR_STALE       = 0xFFFFEF9C   verify: recompute has not filled
+//                                       this slot
+//   JCS_ERR_INTERNAL    = 0xFFFFEF9B   unreachable-fallthrough tripwire
+//
+// Reserved-label discipline: labels prefixed `jcs_`.
+
+module JournalCsum = structure {
+
+  pub let JCS_MAX_RECORDS      : u64 = 64
+  pub let JCS_SENTINEL         : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let JCS_MIX_CONST        : u64 = 0xC33C5AA5C33C5AA5
+
+  pub let JCS_OK               : u64 = 0
+  pub let JCS_ERR_NOT_INIT     : u64 = 0xFFFFEF9F
+  pub let JCS_ERR_TORN         : u64 = 0xFFFFEF9E
+  pub let JCS_ERR_BAD_IDX      : u64 = 0xFFFFEF9D
+  pub let JCS_ERR_STALE        : u64 = 0xFFFFEF9C
+  pub let JCS_ERR_INTERNAL     : u64 = 0xFFFFEF9B
+
+  pub let JCS_INIT_MARK        : u64 = 0xEC5C
+
+  pub let mut _jcs_expected : [u64; 64] = uninit @align(64)
+  pub let mut _jcs_state    : [u64; 8]  = uninit @align(64)
+
+  // ==========================================================================
+  // Reset. Seeds every expected slot with the sentinel; clears state;
+  // installs init_mark.
+  // ==========================================================================
+
+  pub let jcs_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-004 (#1387): seed expected table with sentinel, clear state, install init_mark. Labels prefixed jcs_rst_.",
+      block: {
+        lea r10, [rip + _jcs_expected];
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        xor rcx, rcx;
+      jcs_rst_e:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 64;
+        jb  jcs_rst_e;
+
+        lea r10, [rip + _jcs_state];
+        xor rax, rax;
+        xor rcx, rcx;
+      jcs_rst_s:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  jcs_rst_s;
+
+        mov rax, 0xEC5C;
+        mov [r10 + 0], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let jcs_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-004 (#1387): 1 iff init_mark matches. Labels prefixed jcs_bnd_.",
+      block: {
+        lea r10, [rip + _jcs_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEC5C;
+        cmp rax, r11;
+        jne jcs_bnd_no;
+        mov rax, 1;
+        ret;
+      jcs_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let jcs_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-004 (#1387): sticky error latch readback.",
+      block: {
+        lea r10, [rip + _jcs_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let jcs_set_err : (u64) -> () !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-004 (#1387): first-writer-wins error latch. Labels prefixed jcs_se_.",
+      block: {
+        lea r10, [rip + _jcs_state];
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        jne jcs_se_out;
+        mov [r10 + 8], rdi;
+      jcs_se_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Field readbacks.
+  // ==========================================================================
+
+  pub let jcs_recompute_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-004 (#1387): recompute_count field.",
+      block: {
+        lea r10, [rip + _jcs_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let jcs_verify_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-004 (#1387): verify_count field.",
+      block: {
+        lea r10, [rip + _jcs_state];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let jcs_torn_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-004 (#1387): torn_count field.",
+      block: {
+        lea r10, [rip + _jcs_state];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let jcs_seed_torn_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-004 (#1387): seed_torn_count field.",
+      block: {
+        lea r10, [rip + _jcs_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let jcs_expected_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-004 (#1387): read expected checksum at idx. Labels prefixed jcs_ea_.",
+      block: {
+        lea r10, [rip + _jcs_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEC5C;
+        cmp rax, r11;
+        jne jcs_ea_ni;
+
+        mov r11, 64;
+        cmp rdi, r11;
+        jae jcs_ea_bi;
+
+        lea r11, [rip + _jcs_expected];
+        mov rax, [r11 + rdi * 8];
+        ret;
+
+      jcs_ea_ni:
+        mov rdi, 0xFFFFEF9F;
+        call jcs_set_err;
+        xor rax, rax;
+        ret;
+      jcs_ea_bi:
+        mov rdi, 0xFFFFEF9D;
+        call jcs_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // jcs_recompute() -> u64
+  //
+  // Recompute the expected checksum for every WAL record in
+  // [0..wal_head). Overwrites _jcs_expected[idx] for each. Returns
+  // the number of slots recomputed. Slots idx >= wal_head are left
+  // as-is (sentinel after reset, or a stale value from a prior
+  // recompute run at a higher head).
+  //
+  // Formula:   seq XOR size XOR prev_seq XOR JCS_MIX_CONST
+  //
+  // Refuses:
+  //   - not init                    JCS_ERR_NOT_INIT
+  //
+  // Register plan: 4-push callee-save + 8 pad. rbx = idx, rbp = seq,
+  // r12 = size, r13 = prev_seq.
+  // ==========================================================================
+
+  pub let jcs_recompute : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-004 (#1387): recompute expected checksums over WAL. Labels prefixed jcs_rc_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+
+        lea r10, [rip + _jcs_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEC5C;
+        cmp rax, r11;
+        jne jcs_rc_ni;
+
+        // recompute_count++
+        mov r9, [r10 + 16];
+        add r9, 1;
+        mov [r10 + 16], r9;
+
+        xor rbx, rbx;                           // idx cursor
+      jcs_rc_top:
+        call wal_head;
+        mov r9, rax;
+        cmp rbx, r9;
+        jae jcs_rc_done;
+
+        mov rdi, rbx;
+        call wal_seq_at;
+        mov rbp, rax;
+
+        mov rdi, rbx;
+        call wal_size_at;
+        mov r12, rax;
+
+        mov rdi, rbx;
+        call wal_prev_at;
+        mov r13, rax;
+
+        mov rax, rbp;
+        xor rax, r12;
+        xor rax, r13;
+        mov r11, 0xC33C5AA5C33C5AA5;
+        xor rax, r11;
+
+        // Store into _jcs_expected[rbx] and update last_computed_hi.
+        lea r11, [rip + _jcs_expected];
+        mov [r11 + rbx * 8], rax;
+        lea r10, [rip + _jcs_state];
+        mov [r10 + 48], rax;                    // last_computed_hi
+
+        add rbx, 1;
+        jmp jcs_rc_top;
+
+      jcs_rc_done:
+        mov rax, rbx;                           // count recomputed
+        jmp jcs_rc_out;
+
+      jcs_rc_ni:
+        mov rdi, 0xFFFFEF9F;
+        call jcs_set_err;
+        xor rax, rax;
+
+      jcs_rc_out:
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // jcs_verify(idx) -> u64
+  //
+  // 1 iff wal_checksum_at(idx) matches _jcs_expected[idx] AND the
+  // expected value is not the sentinel. Bumps verify_count; bumps
+  // torn_count when the return is 0 for a real (non-stale) mismatch.
+  //
+  // Refuses:
+  //   - not init                    JCS_ERR_NOT_INIT
+  //   - idx >= JCS_MAX_RECORDS      JCS_ERR_BAD_IDX
+  //   - expected slot == sentinel   JCS_ERR_STALE
+  // ==========================================================================
+
+  pub let jcs_verify : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-004 (#1387): verify wal_checksum_at against expected. Labels prefixed jcs_v_.",
+      block: {
+        push rbx;
+
+        lea r10, [rip + _jcs_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEC5C;
+        cmp rax, r11;
+        jne jcs_v_ni;
+
+        mov r11, 64;
+        cmp rdi, r11;
+        jae jcs_v_bi;
+
+        mov rbx, rdi;                           // idx
+
+        // verify_count++
+        mov r9, [r10 + 24];
+        add r9, 1;
+        mov [r10 + 24], r9;
+
+        lea r11, [rip + _jcs_expected];
+        mov r8, [r11 + rbx * 8];
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp r8, r11;
+        je  jcs_v_stale;
+
+        mov rdi, rbx;
+        call wal_checksum_at;
+        // Re-fetch expected: r8 is scratch and did not survive call.
+        lea r11, [rip + _jcs_expected];
+        mov r8, [r11 + rbx * 8];
+        cmp rax, r8;
+        je  jcs_v_ok;
+
+        // Mismatch: torn_count++.
+        lea r10, [rip + _jcs_state];
+        mov r9, [r10 + 32];
+        add r9, 1;
+        mov [r10 + 32], r9;
+        xor rax, rax;
+        jmp jcs_v_out;
+
+      jcs_v_ok:
+        mov rax, 1;
+        jmp jcs_v_out;
+
+      jcs_v_ni:
+        mov rdi, 0xFFFFEF9F;
+        call jcs_set_err;
+        xor rax, rax;
+        jmp jcs_v_out;
+      jcs_v_bi:
+        mov rdi, 0xFFFFEF9D;
+        call jcs_set_err;
+        xor rax, rax;
+        jmp jcs_v_out;
+      jcs_v_stale:
+        mov rdi, 0xFFFFEF9C;
+        call jcs_set_err;
+        xor rax, rax;
+
+      jcs_v_out:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // jcs_check_replay_eligible(idx) -> u64
+  //
+  // 0 (JCS_OK) if the record verifies; JCS_ERR_TORN if it does not.
+  // This is the entry the mount path calls before letting a record
+  // graduate to APPLIED.
+  //
+  // Refuses:
+  //   - not init                    JCS_ERR_NOT_INIT
+  //   - idx >= JCS_MAX_RECORDS      JCS_ERR_BAD_IDX
+  //   - expected slot == sentinel   JCS_ERR_STALE
+  //   - checksum mismatch           JCS_ERR_TORN
+  // ==========================================================================
+
+  pub let jcs_check_replay_eligible : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-004 (#1387): refuse torn records. Labels prefixed jcs_cre_.",
+      block: {
+        push rbx;
+
+        lea r10, [rip + _jcs_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEC5C;
+        cmp rax, r11;
+        jne jcs_cre_ni;
+
+        mov r11, 64;
+        cmp rdi, r11;
+        jae jcs_cre_bi;
+
+        mov rbx, rdi;
+
+        lea r11, [rip + _jcs_expected];
+        mov r8, [r11 + rbx * 8];
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp r8, r11;
+        je  jcs_cre_stale;
+
+        mov rdi, rbx;
+        call jcs_verify;
+        cmp rax, 0;
+        je  jcs_cre_torn;
+
+        xor rax, rax;                           // JCS_OK
+        jmp jcs_cre_out;
+
+      jcs_cre_torn:
+        mov rdi, 0xFFFFEF9E;
+        call jcs_set_err;
+        mov rax, 0xFFFFEF9E;
+        jmp jcs_cre_out;
+      jcs_cre_ni:
+        mov rdi, 0xFFFFEF9F;
+        call jcs_set_err;
+        xor rax, rax;
+        jmp jcs_cre_out;
+      jcs_cre_bi:
+        mov rdi, 0xFFFFEF9D;
+        call jcs_set_err;
+        xor rax, rax;
+        jmp jcs_cre_out;
+      jcs_cre_stale:
+        mov rdi, 0xFFFFEF9C;
+        call jcs_set_err;
+        xor rax, rax;
+
+      jcs_cre_out:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // jcs_seed_torn(idx) -> u64
+  //
+  // Test-only entry: corrupt _jcs_expected[idx] so a subsequent
+  // verify reports torn. In a real widening, physical tears are the
+  // ONLY source of a mismatch and this entry does not exist; the
+  // scaffold uses it in the boot witness to prove the refusal path.
+  //
+  // The corruption is XOR with 1 (flips the low bit), so calling it
+  // twice restores the original value -- itself a small invariant.
+  //
+  // Refuses:
+  //   - not init                    JCS_ERR_NOT_INIT
+  //   - idx >= JCS_MAX_RECORDS      JCS_ERR_BAD_IDX
+  //   - expected slot == sentinel   JCS_ERR_STALE
+  // ==========================================================================
+
+  pub let jcs_seed_torn : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-004 (#1387): corrupt expected[idx] for tear-detection witness. Labels prefixed jcs_st_.",
+      block: {
+        lea r10, [rip + _jcs_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEC5C;
+        cmp rax, r11;
+        jne jcs_st_ni;
+
+        mov r11, 64;
+        cmp rdi, r11;
+        jae jcs_st_bi;
+
+        lea r11, [rip + _jcs_expected];
+        mov r8, [r11 + rdi * 8];
+        mov r9, 0xFFFFFFFFFFFFFFFF;
+        cmp r8, r9;
+        je  jcs_st_stale;
+
+        xor r8, 1;
+        mov [r11 + rdi * 8], r8;
+
+        // seed_torn_count++
+        mov r9, [r10 + 40];
+        add r9, 1;
+        mov [r10 + 40], r9;
+
+        mov rax, 1;
+        ret;
+
+      jcs_st_ni:
+        mov rdi, 0xFFFFEF9F;
+        call jcs_set_err;
+        xor rax, rax;
+        ret;
+      jcs_st_bi:
+        mov rdi, 0xFFFFEF9D;
+        call jcs_set_err;
+        xor rax, rax;
+        ret;
+      jcs_st_stale:
+        mov rdi, 0xFFFFEF9C;
+        call jcs_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+}

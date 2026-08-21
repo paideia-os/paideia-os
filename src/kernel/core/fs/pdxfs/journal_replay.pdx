@@ -1,0 +1,478 @@
+// src/kernel/core/fs/pdxfs/journal_replay.pdx -- R42.M2-003 (#1386)
+//
+// PDXFS v1 JOURNAL -- REPLAY ON MOUNT.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the AUTHORITY on mount-time recovery: given a checkpoint index
+// (the WAL position at which the last successful mount completed), it
+// walks every WAL record from checkpoint..head and IDEMPOTENTLY assigns
+// one of three outcomes to each:
+//
+//   APPLIED    (state = 1) -- the record's tx has a commit marker in
+//                              the fence table; the mount path may
+//                              re-apply its block writes.
+//   DISCARDED  (state = 2) -- no commit marker exists; the tx never
+//                              observed durable, so its block writes
+//                              (if any reached disk) must be forgotten.
+//   PENDING    (state = 0) -- the record has not yet been visited.
+//
+// The scaffold does NOT actually re-issue block writes; a real walker
+// hands each APPLIED record to cow_write.pdx. The scaffold's semantic
+// is CLASSIFICATION -- the counts + per-record state the mount path
+// consumes.
+//
+// It is IDEMPOTENT. jrp_replay may be called any number of times with
+// the same WAL + commit table and produce the same classification.
+// A widening runs it once at mount, but the idempotency is a property
+// the on-disk widening preserves.
+//
+// It is a SCAFFOLD (D7). The state table is a parallel array to the
+// WAL ring; a widening streams the classification into the mount path
+// rather than materialising it.
+//
+// It does NOT own the WAL or the commit table. wal.pdx §1 owns the
+// ring; journal_fence.pdx §1 owns the commit table. This module reads
+// both via their public accessors and writes only its own state array.
+//
+// It does NOT verify checksums. journal_csum.pdx enforces the tear-
+// detection refusal; this module refuses to CALL jrp_replay on a
+// checkpoint past head (a bad-checkpoint refusal), but a widening
+// will consult jcs_check_replay_eligible before assigning APPLIED.
+//
+// =============================================================================
+// §1  STATE TABLE GEOMETRY
+// =============================================================================
+//
+// JRP_MAX_RECORDS      = 64        table capacity (mirrors WAL_MAX).
+//
+// _jrp_state_at is a flat array of JRP_MAX_RECORDS u64s. Each slot
+// mirrors the WAL record at the same index; jrp_reset zeros the array
+// (all PENDING) and jrp_replay writes APPLIED or DISCARDED into
+// [checkpoint..head).
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _jrp_state_at and _jrp_state are written only by helpers in this
+// module. tools/build.sh confines relocations against each to
+// `core/fs/pdxfs/journal_replay.o`. A second writer would let a caller
+// "mark a record APPLIED without observing a commit", which would let
+// the mount path re-apply block writes for an uncommitted tx.
+//
+// STATE LAYOUT -- _jrp_state : [u64; 8]
+//   +0    init_mark          0xEA9E once jrp_reset has run
+//   +8    err                sticky error latch
+//   +16   scan_count         total jrp_scan_from calls
+//   +24   replay_count       total jrp_replay calls
+//   +32   last_applied       APPLIED records classified by the last replay
+//   +40   last_discarded     DISCARDED records classified by the last replay
+//   +48   last_checkpoint    checkpoint index the last replay was given
+//   +56   last_replayed_seq  seq of the highest APPLIED record from last replay
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFEFA0..0xFFFFEFAF
+// =============================================================================
+//
+// Sixteen-wide, verified disjoint at repo-grep time. Adjacent used band
+// above: journal_fence 0xFFFFEFB0..BF (R42.M2-002). Adjacent free band
+// below: journal_csum 0xFFFFEF90..9F (R42.M2-004).
+//
+//   JRP_OK               = 0
+//   JRP_ERR_NOT_INIT     = 0xFFFFEFAF   accessor before jrp_reset
+//   JRP_ERR_BAD_CHECK    = 0xFFFFEFAE   checkpoint > wal_head
+//   JRP_ERR_BAD_IDX      = 0xFFFFEFAD   accessor: idx >= JRP_MAX_RECORDS
+//   JRP_ERR_INTERNAL     = 0xFFFFEFAC   unreachable-fallthrough tripwire
+//
+//   JRP_STATE_PENDING    = 0
+//   JRP_STATE_APPLIED    = 1
+//   JRP_STATE_DISCARDED  = 2
+//
+// Reserved-label discipline: labels prefixed `jrp_`.
+
+module JournalReplay = structure {
+
+  pub let JRP_MAX_RECORDS      : u64 = 64
+
+  pub let JRP_OK               : u64 = 0
+  pub let JRP_ERR_NOT_INIT     : u64 = 0xFFFFEFAF
+  pub let JRP_ERR_BAD_CHECK    : u64 = 0xFFFFEFAE
+  pub let JRP_ERR_BAD_IDX      : u64 = 0xFFFFEFAD
+  pub let JRP_ERR_INTERNAL     : u64 = 0xFFFFEFAC
+
+  pub let JRP_STATE_PENDING    : u64 = 0
+  pub let JRP_STATE_APPLIED    : u64 = 1
+  pub let JRP_STATE_DISCARDED  : u64 = 2
+
+  pub let JRP_INIT_MARK        : u64 = 0xEA9E
+
+  pub let mut _jrp_state_at : [u64; 64] = uninit @align(64)
+  pub let mut _jrp_state    : [u64; 8]  = uninit @align(64)
+
+  // ==========================================================================
+  // Reset. Clears state table + counters; installs init_mark.
+  // ==========================================================================
+
+  pub let jrp_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-003 (#1386): clear state table + counters, install init_mark. Labels prefixed jrp_rst_.",
+      block: {
+        lea r10, [rip + _jrp_state_at];
+        xor rax, rax;
+        xor rcx, rcx;
+      jrp_rst_a:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 64;
+        jb  jrp_rst_a;
+
+        lea r10, [rip + _jrp_state];
+        xor rcx, rcx;
+      jrp_rst_s:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  jrp_rst_s;
+
+        mov rax, 0xEA9E;
+        mov [r10 + 0], rax;
+        ret
+      }
+    } @no_frame
+
+  pub let jrp_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-003 (#1386): 1 iff init_mark matches. Labels prefixed jrp_bnd_.",
+      block: {
+        lea r10, [rip + _jrp_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEA9E;
+        cmp rax, r11;
+        jne jrp_bnd_no;
+        mov rax, 1;
+        ret;
+      jrp_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    } @no_frame
+
+  pub let jrp_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-003 (#1386): sticky error latch readback.",
+      block: {
+        lea r10, [rip + _jrp_state];
+        mov rax, [r10 + 8];
+        ret
+      }
+    } @no_frame
+
+  pub let jrp_set_err : (u64) -> () !{mem} @{} =
+    fn (code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-003 (#1386): first-writer-wins error latch. Labels prefixed jrp_se_.",
+      block: {
+        lea r10, [rip + _jrp_state];
+        mov rax, [r10 + 8];
+        cmp rax, 0;
+        jne jrp_se_out;
+        mov [r10 + 8], rdi;
+      jrp_se_out:
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // Field readbacks.
+  // ==========================================================================
+
+  pub let jrp_scan_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-003 (#1386): scan_count field.",
+      block: {
+        lea r10, [rip + _jrp_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    } @no_frame
+
+  pub let jrp_replay_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-003 (#1386): replay_count field.",
+      block: {
+        lea r10, [rip + _jrp_state];
+        mov rax, [r10 + 24];
+        ret
+      }
+    } @no_frame
+
+  pub let jrp_last_applied : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-003 (#1386): last_applied field.",
+      block: {
+        lea r10, [rip + _jrp_state];
+        mov rax, [r10 + 32];
+        ret
+      }
+    } @no_frame
+
+  pub let jrp_last_discarded : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-003 (#1386): last_discarded field.",
+      block: {
+        lea r10, [rip + _jrp_state];
+        mov rax, [r10 + 40];
+        ret
+      }
+    } @no_frame
+
+  pub let jrp_last_checkpoint : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-003 (#1386): last_checkpoint field.",
+      block: {
+        lea r10, [rip + _jrp_state];
+        mov rax, [r10 + 48];
+        ret
+      }
+    } @no_frame
+
+  pub let jrp_last_replayed_seq : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-003 (#1386): last_replayed_seq field.",
+      block: {
+        lea r10, [rip + _jrp_state];
+        mov rax, [r10 + 56];
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // jrp_state_at(idx) -> u64
+  //
+  // Read the classification (PENDING/APPLIED/DISCARDED) at position
+  // idx. Refuses:
+  //   - not init                    JRP_ERR_NOT_INIT
+  //   - idx >= JRP_MAX_RECORDS      JRP_ERR_BAD_IDX
+  // ==========================================================================
+
+  pub let jrp_state_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-003 (#1386): read classification at idx. Labels prefixed jrp_sa_.",
+      block: {
+        lea r10, [rip + _jrp_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEA9E;
+        cmp rax, r11;
+        jne jrp_sa_ni;
+
+        mov r11, 64;
+        cmp rdi, r11;
+        jae jrp_sa_bi;
+
+        lea r11, [rip + _jrp_state_at];
+        mov rax, [r11 + rdi * 8];
+        ret;
+
+      jrp_sa_ni:
+        mov rdi, 0xFFFFEFAF;
+        call jrp_set_err;
+        xor rax, rax;
+        ret;
+      jrp_sa_bi:
+        mov rdi, 0xFFFFEFAD;
+        call jrp_set_err;
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // jrp_scan_from(checkpoint) -> u64
+  //
+  // Count records the walker WOULD visit. Returns wal_head - checkpoint
+  // (or 0 if checkpoint == head). No classification is performed; this
+  // is the pre-flight the mount path uses for sizing.
+  //
+  // Refuses:
+  //   - not init                    JRP_ERR_NOT_INIT
+  //   - checkpoint > wal_head       JRP_ERR_BAD_CHECK
+  // ==========================================================================
+
+  pub let jrp_scan_from : (u64) -> u64 !{mem} @{} =
+    fn (checkpoint: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-003 (#1386): pre-flight scan count. Labels prefixed jrp_sf_.",
+      block: {
+        push rbx;
+
+        lea r10, [rip + _jrp_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEA9E;
+        cmp rax, r11;
+        jne jrp_sf_ni;
+
+        mov rbx, rdi;                           // checkpoint
+
+        // scan_count++
+        mov r9, [r10 + 16];
+        add r9, 1;
+        mov [r10 + 16], r9;
+
+        call wal_head;
+        cmp rbx, rax;
+        ja  jrp_sf_bc;
+
+        sub rax, rbx;                           // head - checkpoint
+        jmp jrp_sf_out;
+
+      jrp_sf_ni:
+        mov rdi, 0xFFFFEFAF;
+        call jrp_set_err;
+        xor rax, rax;
+        jmp jrp_sf_out;
+      jrp_sf_bc:
+        mov rdi, 0xFFFFEFAE;
+        call jrp_set_err;
+        xor rax, rax;
+
+      jrp_sf_out:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // jrp_replay(checkpoint) -> u64
+  //
+  // Walk [checkpoint..wal_head) and classify each record. Refuses on
+  // checkpoint > head (BAD_CHECK) or not init (NOT_INIT). Idempotent:
+  // running twice on the same WAL + commit table yields the same table.
+  //
+  // For each WAL index idx in the range:
+  //   - fetch seq = wal_seq_at(idx)
+  //   - if jfn_is_committed(seq) -> _jrp_state_at[idx] = APPLIED
+  //     applied++; last_replayed_seq = max(prev, seq)
+  //   - else                     -> _jrp_state_at[idx] = DISCARDED
+  //     discarded++
+  //
+  // Records outside [checkpoint..head) are left PENDING by this call
+  // (idempotency: a prior call may have written APPLIED/DISCARDED into
+  // [0..checkpoint), which this call must preserve).
+  //
+  // Returns the number of applied records.
+  //
+  // Register plan: 4-push callee-save + 8 pad. rbx = idx cursor,
+  // rbp = applied, r12 = discarded, r13 = last_replayed_seq.
+  // ==========================================================================
+
+  pub let jrp_replay : (u64) -> u64 !{mem} @{} =
+    fn (checkpoint: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42.M2-003 (#1386): classify [checkpoint..head). Labels prefixed jrp_r_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+
+        lea r10, [rip + _jrp_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xEA9E;
+        cmp rax, r11;
+        jne jrp_r_ni;
+
+        mov rbx, rdi;                           // checkpoint
+
+        call wal_head;
+        mov r9, rax;                            // head
+        cmp rbx, r9;
+        ja  jrp_r_bc;
+
+        // replay_count++, last_checkpoint := checkpoint.
+        lea r10, [rip + _jrp_state];
+        mov r8, [r10 + 24];
+        add r8, 1;
+        mov [r10 + 24], r8;
+        mov [r10 + 48], rbx;
+
+        xor rbp, rbp;                           // applied
+        xor r12, r12;                           // discarded
+        xor r13, r13;                           // last_replayed_seq
+
+      jrp_r_top:
+        call wal_head;
+        mov r9, rax;
+        cmp rbx, r9;
+        jae jrp_r_done;
+
+        mov rdi, rbx;
+        call wal_seq_at;
+        mov rdi, rax;                           // rdi = seq (arg to next call)
+
+        call jfn_is_committed;
+        cmp rax, 0;
+        je  jrp_r_disc;
+
+        // APPLIED. Re-fetch seq for last_replayed_seq update.
+        mov rax, 1;
+        lea r11, [rip + _jrp_state_at];
+        mov [r11 + rbx * 8], rax;
+        add rbp, 1;
+        mov rdi, rbx;
+        call wal_seq_at;
+        cmp rax, r13;
+        jbe jrp_r_no_bump;
+        mov r13, rax;
+      jrp_r_no_bump:
+        add rbx, 1;
+        jmp jrp_r_top;
+
+      jrp_r_disc:
+        // DISCARDED.
+        mov rax, 2;
+        lea r11, [rip + _jrp_state_at];
+        mov [r11 + rbx * 8], rax;
+        add r12, 1;
+        add rbx, 1;
+        jmp jrp_r_top;
+
+      jrp_r_done:
+        lea r10, [rip + _jrp_state];
+        mov [r10 + 32], rbp;                    // last_applied
+        mov [r10 + 40], r12;                    // last_discarded
+        mov [r10 + 56], r13;                    // last_replayed_seq
+        mov rax, rbp;
+        jmp jrp_r_out;
+
+      jrp_r_ni:
+        mov rdi, 0xFFFFEFAF;
+        call jrp_set_err;
+        xor rax, rax;
+        jmp jrp_r_out;
+      jrp_r_bc:
+        mov rdi, 0xFFFFEFAE;
+        call jrp_set_err;
+        xor rax, rax;
+
+      jrp_r_out:
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
