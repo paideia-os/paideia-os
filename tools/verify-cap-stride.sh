@@ -70,10 +70,17 @@
 #          every one of the 151 V-form dereferences in the tree does.
 #
 #        C and Z sites — the base names a CONSTANT slot, so +24 is
-#          "slot n+1", which kernel_main legitimately does when it seeds
-#          a run of descriptors. These are bounds-checked only: each
-#          offset must be 8-byte aligned and `base + offset` must land
-#          inside cap_table. See WHAT IT DOES NOT PROVE.
+#          "slot n+1", which the R29 witnesses legitimately do when
+#          they seed a run of descriptors. Each offset must be 8-byte
+#          aligned and `base + offset` must land inside cap_table, and
+#          (#1593) any offset past +16 requires the BASE line to carry
+#          an annotation `[cap-stride-ok: <reason>]`. Without the
+#          annotation, past-+16 on a constant-slot base is the same
+#          "next descriptor's kind by accident" shape #1591 caught for
+#          V sites — the alignment-plus-bounds check alone could not
+#          tell "slot n+1's kind, deliberately" from "past the end of
+#          slot n, by mistake". The 12 legitimate seeds in
+#          src/kernel/boot/witness/r29_*.pdx carry the annotation.
 #
 #      A register-indexed dereference (`[rax + rcx*8]`) through a
 #      tracked base is refused for every form, because its offset is not
@@ -364,11 +371,25 @@ offset_hits = 0          # constant dereferences inspected — half 5's vacuity 
 annotated   = 0
 inspected_V = 0
 bad_offsets = []
+# #1593: C/Z past-+16 sweep — legitimate multi-slot descriptor-seeding
+# runs annotate the base line once; unannotated bases must not reach
+# past the +0/+8/+16 fields of the descriptor they name, because a
+# constant-base past-+16 write is "slot n+1's kind, deliberately or by
+# mistake" and the alignment-plus-bounds check half 5 used to apply
+# cannot tell those apart. The base annotation gates the whole
+# straight-line run (no per-line annotations needed for the 12 witness
+# seeds in this tree).
+cz_seed_bases = 0        # C/Z bases annotated with [cap-stride-ok: …]
+cz_past16     = 0        # C/Z dereferences past +16 (seed-run or not)
 
 for rel, i, reg, form, cbase in sites:
     lines, raw = filelines[rel]
     tracked = {reg}
     derefed = False
+    base_annotated = form != "V" and bool(
+        OKANN.search(raw[i] if i < len(raw) else ""))
+    if base_annotated:
+        cz_seed_bases += 1
     for j in range(i + 1, min(len(lines), i + WINDOW)):
         l = lines[j]
         if not l.strip():
@@ -421,6 +442,23 @@ for rel, i, reg, form, cbase in sites:
                         rel, j + 1, form,
                         f"offset +{off} from a base at byte {cbase} addresses byte "
                         f"{absolute}, past the end of cap_table ({TABLE_BYTES} bytes)"))
+                elif off > 16:
+                    # #1593: past-+16 on a constant-slot base reaches the
+                    # NEXT descriptor's fields. Legitimate only for a
+                    # deliberate multi-slot seed / read-back / clean, in
+                    # which case the base is annotated once and the
+                    # whole run is exempt.
+                    cz_past16 += 1
+                    if not base_annotated:
+                        bad_offsets.append((
+                            rel, j + 1, form,
+                            f"STRAY C/Z REACH: +{off} on a constant-slot "
+                            f"descriptor base reaches past the +0/+8/+16 "
+                            f"fields of the slot the site named — the same "
+                            f"'writes the next descriptor by accident' "
+                            f"shape #1591 caught for V sites. Annotate the "
+                            f"base with [cap-stride-ok: <reason>] if this "
+                            f"is a deliberate multi-slot run"))
 
         mm = MOVREG.match(l)
         if mm:
@@ -485,6 +523,23 @@ if inspected_V < MIN_V_DEREFS or offset_hits < MIN_DEREFS:
          "  update the walk here and re-baseline these floors in the same",
          "  commit.")
 
+# #1593: C/Z past-+16 vacuity floor. Both the annotated-seed set and
+# the past-+16 dereference count must be non-empty — otherwise this
+# section is passing on a scan that found no C/Z multi-slot runs to
+# inspect, and the extension is silently disarmed. Current tree: 12
+# annotated seed bases, 79 past-+16 dereferences reached from them.
+MIN_CZ_SEEDS, MIN_CZ_PAST16 = 12, 60
+if cz_seed_bases < MIN_CZ_SEEDS or cz_past16 < MIN_CZ_PAST16:
+    fail(f"vacuous C/Z half — {cz_seed_bases} annotated seed bases "
+         f"(min {MIN_CZ_SEEDS}), {cz_past16} past-+16 dereferences "
+         f"(min {MIN_CZ_PAST16}).",
+         "  The #1593 extension exists so a constant-slot descriptor base",
+         "  cannot silently reach into the NEXT descriptor's kind. Its",
+         "  correctness argument is empty without at least the tree's own",
+         "  legitimate multi-slot seed runs to police. If the witness idiom",
+         "  changed, re-annotate the base sites and re-baseline these floors",
+         "  in the same commit.")
+
 # Vacuity guard. Current tree: V=71, C=30, Z=35, total 136.
 MIN_V, MIN_C, MIN_TOTAL = 60, 20, 120
 total = nV + nC + nZ
@@ -508,4 +563,6 @@ print(f"{TAG} struct, storage and constants agree on 24 bytes; "
       f"{total} sites pinned (V={nV} C={nC} Z={nZ}); "
       f"{offset_hits} dereferences bounded ({inspected_V} of them pinned to "
       f"+0/+8/+16), {annotated} annotated")
+print(f"{TAG} C/Z half confined ({cz_seed_bases} annotated seeds, "
+      f"{cz_past16} past-+16 dereferences bounded)")
 PYEOF
