@@ -370,10 +370,6 @@ _audit_bridge_witness_scratch: .zero 4096
 .align 8
 init_boot_fail_msg: .ascii "INIT BOOT FAIL\n\0"
 
-.global init_boot_returned_msg
-.align 8
-init_boot_returned_msg: .ascii "INIT BOOT RETURNED\n\0"
-
 # R15-M2-005-followup (#651): enter_userland_initial relocation success witness message
 .global enter_reloc_ok_msg
 .align 8
@@ -401,77 +397,6 @@ ud_panic_witness_msg: .ascii "UD PANIC WITNESS\n\0"
 .global m5_walk_ok_msg
 .align 8
 m5_walk_ok_msg: .ascii "M5 STACK WALK OK\n\0"
-
-# R15-M2-006b (#652): Ring-3 witness start message
-.global ring3_start_msg
-.align 8
-ring3_start_msg: .ascii "R15 RING3 START\n\0"
-
-# R15-M2-006b (#652): Debug message after saving RSP
-.global ring3_saved_rsp_msg
-.align 8
-ring3_saved_rsp_msg: .ascii "R15 SAVED RSP\n\0"
-
-
-# R15-M2-006b (#652): Debug message before creating PML4
-.global ring3_create_pml4_msg
-.align 8
-ring3_create_pml4_msg: .ascii "R15 CREATE PML4\n\0"
-
-# R15-M2-006b (#652): Debug message after aspace_create
-.global ring3_aspace_done_msg
-.align 8
-ring3_aspace_done_msg: .ascii "R15 ASPACE DONE\n\0"
-
-# R15-M2-006b (#652): Debug message before phys_alloc
-.global ring3_phys_alloc_msg
-.align 8
-ring3_phys_alloc_msg: .ascii "R15 PHYS ALLOC\n\0"
-
-# R15-M2-006b (#652): Debug message after phys_alloc
-.global ring3_phys_done_msg
-.align 8
-ring3_phys_done_msg: .ascii "R15 PHYS DONE\n\0"
-
-# R15-M2-006b (#652): Debug message before calculating VA
-.global ring3_calc_va_msg
-.align 8
-ring3_calc_va_msg: .ascii "R15 CALC VA\n\0"
-
-# R15-M2-006b (#652): Debug message before writing hlt
-.global ring3_write_hlt_msg
-.align 8
-ring3_write_hlt_msg: .ascii "R15 WRITE HLT\n\0"
-
-# R15-M2-006b (#652): Debug message after writing hlt byte
-.global ring3_wrote_hlt_msg
-.align 8
-ring3_wrote_hlt_msg: .ascii "R15 WROTE HLT\n\0"
-
-# R15-M2-006b (#652): Debug message before aspace_map
-.global ring3_aspace_map_msg
-.align 8
-ring3_aspace_map_msg: .ascii "R15 ASPACE MAP\n\0"
-
-# R15-M2-006b (#652): Debug message before user_stack_alloc
-.global ring3_stack_alloc_msg
-.align 8
-ring3_stack_alloc_msg: .ascii "R15 STACK ALLOC\n\0"
-
-# R15-M2-006b (#652): Debug message after user_stack_alloc
-.global ring3_stack_done_msg
-.align 8
-ring3_stack_done_msg: .ascii "R15 STACK DONE\n\0"
-
-# R15-M2-006b (#652): Debug message before entering ring-3
-.global ring3_enter_msg
-.align 8
-ring3_enter_msg: .ascii "R15 ENTER RING3\n\0"
-
-# R15-M2-006b (#652): Debug message if enter_userland_initial returns
-.global ring3_returned_msg
-.align 8
-ring3_returned_msg: .ascii "R15 RETURNED FROM RING3\n\0"
 
 # R14-M3-007c (#650): #UD witness failure message (armed but not fired).
 .global ud_witness_fail_msg
@@ -685,20 +610,6 @@ ocreat_ok_msg: .ascii "R16 OCREAT OK\n\0"
 .global ocreat_fail_msg
 .align 8
 ocreat_fail_msg: .ascii "OCREAT FAIL\n\0"
-
-# TEMP DEBUG (#664 diagnosis, to be removed): per-sub-test fail markers
-.global ocreat_debug_a_msg
-.align 8
-ocreat_debug_a_msg: .ascii "OCREAT DEBUG FAIL A\n\0"
-
-.global ocreat_debug_b_msg
-.align 8
-ocreat_debug_b_msg: .ascii "OCREAT DEBUG FAIL B\n\0"
-
-.global ocreat_debug_c_msg
-.align 8
-ocreat_debug_c_msg: .ascii "OCREAT DEBUG FAIL C\n\0"
-
 
 # R16-M1-008 (#577): vfs_read/vfs_write witness success + failure messages
 .global vfs_rw_ok_msg
@@ -2318,10 +2229,6 @@ lpss_i2c_fail_msg: .ascii "R30 LPSS I2C FAIL\n\0"
 .global lpss_i2c_irq_ok_msg
 .align 8
 lpss_i2c_irq_ok_msg: .ascii "R30 LPSS I2C IRQ OK\n\0"
-
-.global lpss_i2c_irq_fail_msg
-.align 8
-lpss_i2c_irq_fail_msg: .ascii "R30 LPSS I2C IRQ FAIL\n\0"
 
 # ---------------------------------------------------------------------------
 # R30.M6-001 (#1075) / R30.M6-002 (#1076): pad-controller witness markers.
