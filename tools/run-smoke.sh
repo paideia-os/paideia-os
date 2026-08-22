@@ -859,11 +859,11 @@ case "${EXPECTED}" in
         # cap_owner column.
         #
         # Fingerprint contract (contains-in-order):
-        #   R31 SVC ORDER OK             lookup before register is -ENOENT;
+        #   SVC ORDER OK                 lookup before register is -ENOENT;
         #                                after register it resolves to the
         #                                registered endpoint.
-        #   R31 BOOT SPAWN OK            both tasks created and enqueued.
-        #   R31 SPAWN OWNER OK           cap_owner[slot] == pack(pid, gen)
+        #   BOOT SPAWN OK                both tasks created and enqueued.
+        #   SPAWN OWNER OK               cap_owner[slot] == pack(pid, gen)
         #                                for each spawned task's own cap.
         #   R31 ECHO CLIENT RING3 OK     printed BY the client, in ring 3.
         #   R31 ECHO SERVER RING3 OK     printed BY the server, in ring 3.
