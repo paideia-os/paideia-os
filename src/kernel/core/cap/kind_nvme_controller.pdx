@@ -1,0 +1,1629 @@
+// src/kernel/core/cap/kind_nvme_controller.pdx -- R51.M1-001 (#1633),
+// R51.M1-002 (#1634), R51.M1-003 (#1635), R51.M1-004 (#1636),
+// R51.M1-005 (#1637), R51.M1-006 (#1638).
+//
+// KIND_NVME_CONTROLLER = 0x198, derived over KIND_DEVICE (= 10).
+//
+// The runtime authority for ONE NVMe controller function: the right to
+// program its BAR0 register set, allocate its admin queues, drive the
+// CC.EN reset/enable cycle, submit admin commands (IDENTIFY,
+// SET_FEATURES, CREATE_IO_*, DELETE_IO_*), and eventually mint the
+// per-namespace KIND_NVME_NAMESPACE + KIND_BLKDEV children.  This
+// module lands M1 (mint gate + PCI probe wire + admin queue bring-up +
+// IDENTIFY + SET_FEATURES + revoke cascade); M2 (#1639+) is the
+// per-namespace derivation.
+//
+// =============================================================================
+// SECTION 0  WHY DERIVED OVER KIND_DEVICE
+// =============================================================================
+//
+// An NVMe controller is a PCI function -- a device, in the R22 sense
+// that KIND_PCI_DEV (0x30) authorises reach to.  The parent derivation
+// therefore consults `cap_table[parent_slot].kind == KIND_PCI_DEV
+// (0x30)` and `rights & RIGHT_MINT (0x200)`, matching the R24 §2.4
+// derivation graph in design/hardware/nvme-and-disk-substrate.md.
+//
+// This kind's own runtime base is KIND_DEVICE (10) because a controller
+// cap authorises MMIO + admin-queue programming -- the classic
+// device-authority shape used by every other bus-mastering derived
+// kind (KIND_AUDIO_CONTROLLER 0x15E, KIND_USB_DEVICE, etc.).  The LAM
+// kind-hint on a KIND_NVME_CONTROLLER descriptor reads slot 10.
+//
+// Splitting controller-authority (this kind) from namespace-authority
+// (KIND_NVME_NAMESPACE = 0x199, M2) and block-device-authority
+// (KIND_BLKDEV = 0x42, R24 extended in R51) is what makes the R29.M5
+// discipline expressible: the driver process that CAN reset the
+// controller is not the process that CAN read/write blocks on any one
+// namespace.  A mounter receives KIND_BLKDEV without ever holding
+// controller reset authority.
+//
+// =============================================================================
+// SECTION 1  TAIL ENCODING
+// =============================================================================
+//
+// Row layout (64 bytes, eight u64 words):
+//
+//   [+0]   header: in_use[63:56] | state[15:8] | ctrl_idx[7:0]
+//   [+8]   bar0_pa           (u64)  -- controller BAR0 physical base
+//   [+16]  admin_ctx_pa      (u64)  -- ptr to admin queue ctx; 0 pre-bring-up
+//   [+24]  mdts              (u64, low 8 bits)   -- IDENTIFY[+77]
+//   [+32]  oncs              (u64, low 16 bits)  -- IDENTIFY[+520]
+//   [+40]  nn                (u64, low 32 bits)  -- IDENTIFY[+516]
+//   [+48]  num_io_queues     (u64)               -- SET_FEATURES(FID=0x07) ack
+//   [+56]  reserved          (u64)
+//
+// State byte values (in header bits [15:8]):
+//   NVMEC_STATE_MINTED       = 1   -- cap minted, admin queue not up
+//   NVMEC_STATE_ENABLED      = 2   -- CC.EN=1, CSTS.RDY observed
+//   NVMEC_STATE_IDENTIFIED   = 3   -- IDENTIFY(controller) parsed into row
+//   NVMEC_STATE_NEGOTIATED   = 4   -- SET_FEATURES(FID=0x07) acked
+//
+// ctrl_idx (bits [7:0]) is the index into _nvme_devices[] (the R24
+// probe's record array) so a KIND_NVME_CONTROLLER row can look up its
+// original PCI seg/bus/dev/fn + cap_msix_off without recomputing.
+//
+// Row-addressed capacity: 8 rows x 64 bytes = 512 bytes.  Matches
+// BLK_CAP_CTRL_MAX (blkdev_cap.pdx) and NVME_MAX_DEVS (probe.pdx).
+// A ninth controller on a single machine exceeds every consumer +
+// workstation to date; if hit at R52+ the ceiling widens together with
+// _nvme_devices and _nvme_controller_table.
+//
+// =============================================================================
+// SECTION 2  RIGHTS
+// =============================================================================
+//
+// Per design/hardware/nvme-and-disk-substrate.md §6.2:
+//
+//   R_NVMEC_MMIO     (0x001) -- BAR0 accessors (nvme_reg_u32/u64)
+//   R_NVMEC_RESET    (0x002) -- CC.EN toggle + NSSR
+//   R_NVMEC_ADMIN    (0x004) -- admin-queue command submission
+//   R_NVMEC_INVOKE   (0x008) -- QUERY ops (row_bar0/state/mdts/nn/oncs/nqs)
+//   R_NVMEC_REVOKE   (0x010) -- teardown the row (cascades to children)
+//   R_NVMEC_MINT_NS  (0x200) -- mint downstream KIND_NVME_NAMESPACE
+//   R_NVMEC_OBSERVE  (0x400) -- debug printer
+//   R_NVMEC_ALL      (0x61F)
+//
+// The MINT_NS right is what enforces "controller cap is not a
+// namespace cap" -- an NVMe supervisor process holding
+// KIND_NVME_CONTROLLER without R_NVMEC_MINT_NS cannot open namespaces.
+// The R51 boot-time policy grants MINT_NS to the supervisor; a
+// downstream FS mounter receives only the derived KIND_BLKDEV.
+//
+// =============================================================================
+// SECTION 3  FAILURE TAXONOMY  0xFFFFEC40..0xFFFFEC4F
+// =============================================================================
+//
+// Sixteen wide, disjoint from every previous R48b / R30-PREP band:
+//   KIND_ELEVATE_CHANNEL   0xFFFFEC00..0xFFFFEC0F
+//   KIND_PDXFS_TXN         0xFFFFEC10..0xFFFFEC1F
+//   KIND_PDXFS_FILE        0xFFFFEC20..0xFFFFEC2F
+//   KIND_TTY               0xFFFFEC30..0xFFFFEC3F
+//   KIND_NVME_CONTROLLER   0xFFFFEC40..0xFFFFEC4F   (this file)
+//
+// =============================================================================
+// SECTION 4  paideia-as encoder-gap posture (v0.22.x)
+// =============================================================================
+//
+//   G1: sized stores via mov_b / mov_w / mov_d for sub-8-byte fields.
+//   G4: full-register compares (zero-extend loads via prior xor).
+//
+// r11 scratch only for imm32-sized constants.  All KIND / rights /
+// state constants fit imm32 (< 0x7FFFFFFF).  Labels prefixed
+// `nvmec_` / `nvmecw_` per reserved-label discipline.
+
+module KindNvmeController = structure {
+
+  pub let KIND_NVME_CONTROLLER      : u64 = 0x198
+  pub let KIND_NVME_CONTROLLER_BASE : u64 = 10         // = KIND_DEVICE
+
+  pub let R_NVMEC_MMIO     : u64 = 0x001
+  pub let R_NVMEC_RESET    : u64 = 0x002
+  pub let R_NVMEC_ADMIN    : u64 = 0x004
+  pub let R_NVMEC_INVOKE   : u64 = 0x008
+  pub let R_NVMEC_REVOKE   : u64 = 0x010
+  pub let R_NVMEC_MINT_NS  : u64 = 0x200
+  pub let R_NVMEC_OBSERVE  : u64 = 0x400
+  pub let R_NVMEC_ALL      : u64 = 0x61F
+
+  pub let NVMEC_STATE_MINTED     : u64 = 1
+  pub let NVMEC_STATE_ENABLED    : u64 = 2
+  pub let NVMEC_STATE_IDENTIFIED : u64 = 3
+  pub let NVMEC_STATE_NEGOTIATED : u64 = 4
+  pub let NVMEC_STATE_MAX        : u64 = 4
+
+  // Ops.  Every op ARITY ONE -- op_arg high bits refused (matches
+  // KIND_TTY / KIND_PDXFS_TXN discipline).
+  pub let NVMEC_OP_QUERY_BAR0     : u64 = 0
+  pub let NVMEC_OP_QUERY_STATE    : u64 = 1
+  pub let NVMEC_OP_QUERY_MDTS     : u64 = 2
+  pub let NVMEC_OP_QUERY_ONCS     : u64 = 3
+  pub let NVMEC_OP_QUERY_NN       : u64 = 4
+  pub let NVMEC_OP_QUERY_NQS      : u64 = 5
+  pub let NVMEC_OP_QUERY_CTRL_IDX : u64 = 6
+  pub let NVMEC_OP_DEBUG_PRINT    : u64 = 7
+  pub let NVMEC_OP_MAX            : u64 = 7
+
+  pub let NVMEC_OK              : u64 = 0
+  pub let NVMEC_TAIL_ENOSPC     : u64 = 0xFFFFEC4F
+  pub let NVMEC_TAIL_BAD_ARG    : u64 = 0xFFFFEC4E
+  pub let NVMEC_MINT_BAD_PARENT : u64 = 0xFFFFEC4D
+  pub let NVMEC_MINT_BAD_RIGHTS : u64 = 0xFFFFEC4C
+  pub let NVMEC_MINT_BAD_IDX    : u64 = 0xFFFFEC4B
+  pub let NVMEC_MINT_BAD_BAR0   : u64 = 0xFFFFEC4A
+  pub let NVMEC_BAD_SLOT        : u64 = 0xFFFFEC49
+  pub let NVMEC_WRONG_KIND      : u64 = 0xFFFFEC48
+  pub let NVMEC_REVOKE_ALREADY  : u64 = 0xFFFFEC47
+  pub let NVMEC_BRINGUP_FAILED  : u64 = 0xFFFFEC46
+  pub let NVMEC_IDENTIFY_FAILED : u64 = 0xFFFFEC45
+  pub let NVMEC_NEGOTIATE_FAILED: u64 = 0xFFFFEC44
+  pub let NVMEC_BAD_TRANSITION  : u64 = 0xFFFFEC43
+  pub let NVMEC_PROBE_ENOSPC    : u64 = 0xFFFFEC42
+
+  pub let NVMEC_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let NVMEC_ROW_NONE   : u64 = 0xFF
+
+  // Ceiling.  Matches BLK_CAP_CTRL_MAX (blkdev_cap.pdx) and
+  // NVME_MAX_DEVS (nvme/probe.pdx).
+  pub let NVMEC_MAX        : u64 = 8
+  pub let NVMEC_ROW_BYTES  : u64 = 64
+  // 8 rows * 64 bytes = 512 bytes = 64 u64.
+  pub let mut _nvme_controller_table : [u64; 64] = uninit @align(64)
+  pub let mut _nvme_controller_stats : [u64; 16] = uninit @align(64)
+
+  pub let NVMEC_ST_MINTS       : u64 = 0
+  pub let NVMEC_ST_REVOKES     : u64 = 1
+  pub let NVMEC_ST_QUERIES     : u64 = 2
+  pub let NVMEC_ST_REFUSED     : u64 = 3
+  pub let NVMEC_ST_PROBES      : u64 = 4
+  pub let NVMEC_ST_BRINGUPS    : u64 = 5
+  pub let NVMEC_ST_IDENTIFIES  : u64 = 6
+  pub let NVMEC_ST_NEGOTIATES  : u64 = 7
+  pub let NVMEC_ST_MAX         : u64 = 16
+
+  pub let nvmec_dbg_msg : [u8; 15] = "NVME CTRL ROW\0\0"
+
+  // ==========================================================================
+  // nvme_ctrl_table_reset() -> ()
+  //
+  // Clear every row and every counter.  Boot and teardown only.  Two
+  // separate loops (rows / stats) mirror kind_tty's shape: the arrays
+  // have different lengths and one loop over the total would encode
+  // their .bss adjacency as a fact code depends on.
+  // ==========================================================================
+  pub let nvme_ctrl_table_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-001 (#1633): clear every row and every counter. Boot and teardown only. Labels prefixed nvmec_rs_.",
+      block: {
+        lea r10, [rip + _nvme_controller_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      nvmec_rs_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 64;
+        jb  nvmec_rs_rows;
+
+        lea r10, [rip + _nvme_controller_stats];
+        xor rcx, rcx;
+      nvmec_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  nvmec_rs_stats;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-001 (#1633): bounded increment; out-of-range no-op. Labels prefixed nvmec_nt_.",
+      block: {
+        cmp rdi, 16;
+        jae nvmec_nt_out;
+        lea r10, [rip + _nvme_controller_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      nvmec_nt_out:
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-001 (#1633): bounded read; out-of-range returns 0. Labels prefixed nvmec_st_.",
+      block: {
+        cmp rdi, 16;
+        jae nvmec_st_zero;
+        lea r10, [rip + _nvme_controller_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      nvmec_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_rights_valid : (u64) -> u64 !{} @{} =
+    fn (rights: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R51.M1-001 (#1633): subset test against R_NVMEC_ALL = 0x61F. Labels prefixed nvmec_rv_.",
+      block: {
+        mov rax, rdi;
+        mov r10, 0x61F;
+        and rax, r10;
+        cmp rax, rdi;
+        jne nvmec_rv_no;
+        mov rax, 1;
+        ret;
+      nvmec_rv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_idx_valid : (u64) -> u64 !{} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R51.M1-001 (#1633): 1 iff idx < NVMEC_MAX = 8. Matches NVME_MAX_DEVS and BLK_CAP_CTRL_MAX. Labels prefixed nvmec_iv_.",
+      block: {
+        cmp rdi, 8;
+        jae nvmec_iv_no;
+        mov rax, 1;
+        ret;
+      nvmec_iv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_ctrl_check_parent_pci_dev(parent_slot) -> 1 | 0
+  //
+  // Derivation gate.  parent.kind == KIND_PCI_DEV (0x30) AND rights
+  // carry RIGHT_MINT (0x200).  Per design/hardware/nvme-and-disk-
+  // substrate.md §2.4: a driver process holds a KIND_PCI_DEV for the
+  // NVMe function; deriving KIND_NVME_CONTROLLER over it is what
+  // acquires reset authority for that function.  The kind check
+  // discriminates the class of the parent (PCI vs. any other device
+  // family) and MINT authorises the derivation.
+  // ==========================================================================
+  pub let nvme_ctrl_check_parent_pci_dev : (u64) -> u64 !{mem} @{cap} =
+    fn (parent_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R51.M1-001 (#1633): derivation gate. Bounds-check parent_slot < 256; descriptor at cap_table + slot*24 (stride 24 per cap/mint.pdx); require kind ([+0]) == KIND_PCI_DEV (0x30) AND (rights & RIGHT_MINT 0x200) != 0. Same shape as kind_battery / kind_thermal_zone (which check kind == 10 KIND_DEVICE) but tighter: an NVMe controller derivation MUST come from a PCI descriptor, not any KIND_DEVICE; a network card cannot mint an NVMe controller cap. Pure read. Labels prefixed nvmec_cpp_.",
+      block: {
+        mov r11, 256;
+        cmp rdi, r11;
+        jae nvmec_cpp_no;
+
+        mov rax, cap_table;
+        mov r8, rdi;
+        shl r8, 3;
+        mov r9, rdi;
+        shl r9, 4;
+        add r8, r9;
+        add rax, r8;
+
+        mov r10, [rax + 0];
+        mov r11, 0x30;                   // KIND_PCI_DEV
+        cmp r10, r11;
+        jne nvmec_cpp_no;
+
+        mov r10, [rax + 8];
+        mov r11, 0x200;                  // RIGHT_MINT
+        and r10, r11;
+        cmp r10, 0;
+        je  nvmec_cpp_no;
+
+        mov rax, 1;
+        ret;
+
+      nvmec_cpp_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // hdr layout: in_use[63:56] | state[15:8] | ctrl_idx[7:0].
+  // Callers pack via nvme_ctrl_hdr_pack(ctrl_idx, state).
+  pub let nvme_ctrl_hdr_pack : (u64, u64) -> u64 !{} @{} =
+    fn (ctrl_idx: u64) (state: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R51.M1-001 (#1633): canonical header encoder. Validates ctrl_idx in [0..NVMEC_MAX-1] and state in [1..4]. Bits [63:56] MUST leave this function zero (in_use is set by tail_alloc under the same write that claims the row). Labels prefixed nvmec_hp_.",
+      block: {
+        cmp rdi, 8;                      // NVMEC_MAX
+        jae nvmec_hp_bad;
+        cmp rsi, 1;
+        jb  nvmec_hp_bad;
+        mov r10, 4;                      // NVMEC_STATE_MAX
+        cmp rsi, r10;
+        ja  nvmec_hp_bad;
+        mov rax, rdi;                    // ctrl_idx in [7:0]
+        mov r11, rsi;
+        shl r11, 8;
+        or  rax, r11;                    // state in [15:8]
+        ret;
+      nvmec_hp_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // tail_alloc(hdr, bar0_pa) -> row_id | NVMEC_TAIL_*.
+  // Sets admin_ctx_pa / mdts / oncs / nn / num_io_queues / reserved
+  // to 0 -- populated by the bring-up + identify + set_features
+  // wrappers as they land.
+  pub let nvme_ctrl_tail_alloc : (u64, u64) -> u64 !{mem} @{} =
+    fn (hdr: u64) (bar0_pa: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-001 (#1633): claim one controller row. THE ONLY WRITER of _nvme_controller_table; tools/build.sh confines it via ec_confine_one. Gates: hdr in_use pre-set -> BAD_ARG (pre-set in_use would hand back a row the free scan skips forever); hdr reserved [55:16] non-zero -> BAD_ARG; bar0_pa == 0 -> MINT_BAD_BAR0 (a controller with no MMIO base is not addressable). Low-first scan over 8 rows of 64 bytes.  Four callee-save pushes leave rsp%16 == 0. Labels prefixed nvmec_ta_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // hdr
+        mov r13, rsi;                    // bar0_pa
+
+        // hdr in_use pre-set?
+        mov rax, r12;
+        shr rax, 56;
+        cmp rax, 0;
+        jne nvmec_ta_bad;
+
+        // hdr reserved [55:16]?
+        mov rax, r12;
+        shr rax, 16;
+        mov r10, 0xFFFFFFFFFF;           // 40 bits: [55:16]
+        and rax, r10;
+        cmp rax, 0;
+        jne nvmec_ta_bad;
+
+        // bar0_pa != 0.
+        cmp r13, 0;
+        je  nvmec_ta_bad_bar0;
+
+        xor rbx, rbx;                    // row_id
+      nvmec_ta_scan:
+        cmp rbx, 8;                      // NVMEC_MAX
+        jae nvmec_ta_enospc;
+
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, rbx;
+        shl r11, 6;                      // row * 64
+        add r10, r11;
+
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  nvmec_ta_claim;
+
+        add rbx, 1;
+        jmp nvmec_ta_scan;
+
+      nvmec_ta_claim:
+        mov rax, r12;
+        mov r11, 1;
+        shl r11, 56;
+        or  rax, r11;
+        mov [r10 + 0],  rax;             // header + in_use
+        mov [r10 + 8],  r13;             // bar0_pa
+        xor rax, rax;
+        mov [r10 + 16], rax;             // admin_ctx_pa = 0
+        mov [r10 + 24], rax;             // mdts = 0
+        mov [r10 + 32], rax;             // oncs = 0
+        mov [r10 + 40], rax;             // nn = 0
+        mov [r10 + 48], rax;             // num_io_queues = 0
+        mov [r10 + 56], rax;             // reserved = 0
+        mov rax, rbx;
+        jmp nvmec_ta_out;
+
+      nvmec_ta_enospc:
+        mov rax, 0xFFFFEC4F;             // NVMEC_TAIL_ENOSPC
+        jmp nvmec_ta_out;
+      nvmec_ta_bad_bar0:
+        mov rax, 0xFFFFEC4A;             // NVMEC_MINT_BAD_BAR0
+        jmp nvmec_ta_out;
+      nvmec_ta_bad:
+        mov rax, 0xFFFFEC4E;             // NVMEC_TAIL_BAD_ARG
+
+      nvmec_ta_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_tail_valid : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-001 (#1633): 1 iff row_id < NVMEC_MAX and in_use byte set. Labels prefixed nvmec_tv_.",
+      block: {
+        cmp rdi, 8;
+        jae nvmec_tv_no;
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  nvmec_tv_no;
+        mov rax, 1;
+        ret;
+      nvmec_tv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_tail_free : (u64) -> () !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-001 (#1633): scrub row (all eight words). Labels prefixed nvmec_tf_.",
+      block: {
+        cmp rdi, 8;
+        jae nvmec_tf_out;
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rax;
+        mov [r10 + 48], rax;
+        mov [r10 + 56], rax;
+      nvmec_tf_out:
+        ret
+      }
+    }
+
+  // -------------------------------------------------------------------
+  // Row accessors.  Each returns NVMEC_DECODE_BAD when the row is not
+  // live.  Shape mirrors pdxfs_txn_row_* / tty_row_* one-for-one so a
+  // regression in one member of the family surfaces the same way in
+  // the others.
+  // -------------------------------------------------------------------
+
+  pub let nvme_ctrl_row_bar0 : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-001 (#1633): bar0_pa, or NVMEC_DECODE_BAD. Labels prefixed nvmec_rb_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_rb_bad;
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        jmp nvmec_rb_out;
+      nvmec_rb_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      nvmec_rb_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_row_state : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-001 (#1633): state byte, or NVMEC_DECODE_BAD. Labels prefixed nvmec_rst_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_rst_bad;
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 8;
+        and rax, 0xFF;
+        jmp nvmec_rst_out;
+      nvmec_rst_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      nvmec_rst_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_row_ctrl_idx : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-001 (#1633): ctrl_idx, or NVMEC_DECODE_BAD. Labels prefixed nvmec_rci_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_rci_bad;
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        and rax, 0xFF;
+        jmp nvmec_rci_out;
+      nvmec_rci_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      nvmec_rci_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_row_mdts : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-004 (#1636): mdts, or NVMEC_DECODE_BAD. Labels prefixed nvmec_rmd_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_rmd_bad;
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 24];
+        jmp nvmec_rmd_out;
+      nvmec_rmd_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      nvmec_rmd_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_row_oncs : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-004 (#1636): oncs, or NVMEC_DECODE_BAD. Labels prefixed nvmec_rnc_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_rnc_bad;
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 32];
+        jmp nvmec_rnc_out;
+      nvmec_rnc_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      nvmec_rnc_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_row_nn : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-004 (#1636): nn (number of namespaces), or NVMEC_DECODE_BAD. Labels prefixed nvmec_rnn_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_rnn_bad;
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 40];
+        jmp nvmec_rnn_out;
+      nvmec_rnn_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      nvmec_rnn_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_row_num_io_queues : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-005 (#1637): num_io_queues negotiated, or NVMEC_DECODE_BAD. Labels prefixed nvmec_rnq_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_rnq_bad;
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 48];
+        jmp nvmec_rnq_out;
+      nvmec_rnq_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      nvmec_rnq_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_row_admin_ctx : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-003 (#1635): admin_ctx_pa, or NVMEC_DECODE_BAD. Zero return distinguishes 'no bring-up performed' from 'row alive'. Labels prefixed nvmec_rac_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_rac_bad;
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        jmp nvmec_rac_out;
+      nvmec_rac_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      nvmec_rac_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // -------------------------------------------------------------------
+  // Row mutators.  Internal.  Each is bounds-checked; no-op on bad
+  // slot.  Kept internal to this module -- the only writers are the
+  // bring-up + identify + set_features wrappers below.
+  // -------------------------------------------------------------------
+
+  // Advance state field with strict monotonic gate.  Refuses to move
+  // backwards or past NVMEC_STATE_MAX.  Returns NVMEC_OK / _BAD_TRANSITION.
+  pub let nvme_ctrl_row_state_set : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (new_state: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-003 (#1635): monotonic state advance. tail_valid gate; new_state must be current+1 (linear pipeline MINTED -> ENABLED -> IDENTIFIED -> NEGOTIATED). Two callee-save pushes leave rsp%16 == 0. Labels prefixed nvmec_rss_.",
+      block: {
+        push r12;
+        push r13;
+        mov r12, rdi;
+        mov r13, rsi;
+
+        mov rdi, r12;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_rss_bad;
+
+        // Range check new_state in [2..4] (never re-enter MINTED).
+        cmp r13, 2;
+        jb  nvmec_rss_no;
+        mov r10, 4;                      // NVMEC_STATE_MAX
+        cmp r13, r10;
+        ja  nvmec_rss_no;
+
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+
+        mov rax, [r10 + 0];
+        mov rcx, rax;
+        shr rcx, 8;
+        and rcx, 0xFF;                   // current state
+
+        // Enforce new == current + 1.
+        mov r11, rcx;
+        add r11, 1;
+        cmp r13, r11;
+        jne nvmec_rss_no;
+
+        // Clear state byte (bits [15:8]) and OR in new_state << 8.
+        mov r11, 0xFFFFFFFFFFFF00FF;
+        and rax, r11;
+        mov r11, r13;
+        shl r11, 8;
+        or  rax, r11;
+        mov [r10 + 0], rax;
+        xor rax, rax;                    // NVMEC_OK
+        jmp nvmec_rss_out;
+
+      nvmec_rss_no:
+        mov rax, 0xFFFFEC43;             // NVMEC_BAD_TRANSITION
+        jmp nvmec_rss_out;
+      nvmec_rss_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;     // NVMEC_DECODE_BAD
+
+      nvmec_rss_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_row_admin_ctx_set : (u64, u64) -> () !{mem} @{} =
+    fn (row_id: u64) (admin_ctx_pa: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-003 (#1635): stamp admin_ctx_pa on a live row. tail_valid gate; no-op on dead slot. Labels prefixed nvmec_rac_s_.",
+      block: {
+        push r12;
+        push r13;
+        mov r12, rdi;
+        mov r13, rsi;
+        mov rdi, r12;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_rac_s_out;
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov [r10 + 16], r13;
+      nvmec_rac_s_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_row_mdts_set : (u64, u64) -> () !{mem} @{} =
+    fn (row_id: u64) (mdts: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-004 (#1636): stamp mdts on a live row. Labels prefixed nvmec_rmd_s_.",
+      block: {
+        push r12;
+        push r13;
+        mov r12, rdi;
+        mov r13, rsi;
+        mov rdi, r12;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_rmd_s_out;
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov [r10 + 24], r13;
+      nvmec_rmd_s_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_row_oncs_set : (u64, u64) -> () !{mem} @{} =
+    fn (row_id: u64) (oncs: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-004 (#1636): stamp oncs on a live row. Labels prefixed nvmec_rnc_s_.",
+      block: {
+        push r12;
+        push r13;
+        mov r12, rdi;
+        mov r13, rsi;
+        mov rdi, r12;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_rnc_s_out;
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov [r10 + 32], r13;
+      nvmec_rnc_s_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_row_nn_set : (u64, u64) -> () !{mem} @{} =
+    fn (row_id: u64) (nn: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-004 (#1636): stamp nn on a live row. Labels prefixed nvmec_rnn_s_.",
+      block: {
+        push r12;
+        push r13;
+        mov r12, rdi;
+        mov r13, rsi;
+        mov rdi, r12;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_rnn_s_out;
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov [r10 + 40], r13;
+      nvmec_rnn_s_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  pub let nvme_ctrl_row_num_io_queues_set : (u64, u64) -> () !{mem} @{} =
+    fn (row_id: u64) (nqs: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-005 (#1637): stamp num_io_queues on a live row. Labels prefixed nvmec_rnq_s_.",
+      block: {
+        push r12;
+        push r13;
+        mov r12, rdi;
+        mov r13, rsi;
+        mov rdi, r12;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_rnq_s_out;
+        lea r10, [rip + _nvme_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov [r10 + 48], r13;
+      nvmec_rnq_s_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // Slot -> row_id, gated on the descriptor being a live
+  // KIND_NVME_CONTROLLER.  Kind constant 0x198 staged in r11 (fits
+  // imm32; no r11-imm64 issue).
+  pub let nvme_ctrl_row_of_slot : (u64) -> u64 !{mem} @{cap} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R51.M1-001 (#1633): slot -> row_id gated on KIND_NVME_CONTROLLER. Labels prefixed nvmec_ros_.",
+      block: {
+        push r12;
+
+        mov r11, 256;
+        cmp rdi, r11;
+        jae nvmec_ros_none;
+
+        mov rax, cap_table;
+        mov r8, rdi;
+        shl r8, 3;
+        mov r9, rdi;
+        shl r9, 4;
+        add r8, r9;
+        add rax, r8;
+
+        mov r10, [rax + 0];
+        mov r11, 0x198;                  // KIND_NVME_CONTROLLER
+        cmp r10, r11;
+        jne nvmec_ros_none;
+
+        mov r12, [rax + 16];
+        mov r10, 0xFFFF;
+        and r12, r10;
+
+        mov rdi, r12;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_ros_none;
+
+        mov rax, r12;
+        jmp nvmec_ros_out;
+
+      nvmec_ros_none:
+        mov rax, 0xFF;                   // NVMEC_ROW_NONE
+      nvmec_ros_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_ctrl_cap_revoke(row_id) -> u64
+  //
+  // R51.M1-006 (#1638): Controller-cap revoke.  Scrubs the row and
+  // bumps REVOKES; distinguishes never-existed (BAD_SLOT) from
+  // already-gone (REVOKE_ALREADY).
+  //
+  // REVOKE CASCADE POSTURE.  Per design/hardware/nvme-and-disk-
+  // substrate.md §7 M1-006, revoking a controller must tear down every
+  // downstream KIND_NVME_NAMESPACE row + every KIND_BLKDEV row citing
+  // this controller.  The cascade primitive lives here as the ONLY
+  // path that scrubs a controller row, so a child-revoke sweep can be
+  // added without changing callers.  At M1 close, no KIND_NVME_NAMESPACE
+  // rows exist (M2 lands #1639+); the cascade is a no-op sweep whose
+  // structural shape mirrors i2c_bus_revoke's slave cascade, and M2
+  // widens it to walk _nvme_namespace_table.
+  // ==========================================================================
+  pub let nvme_ctrl_cap_revoke : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M1-001 (#1633) + R51.M1-006 (#1638): scrub row + bump REVOKES; distinguishes never-existed (BAD_SLOT) from already-gone (REVOKE_ALREADY). Cascade to KIND_NVME_NAMESPACE rows is a no-op at M1 (no such rows exist yet) and widens at M2 with the namespace table walker. Two callee-save pushes leave rsp%16 == 0. Labels prefixed nvmec_cr_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        cmp r12, 8;
+        jae nvmec_cr_bad_slot;
+
+        mov rdi, r12;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_cr_already;
+
+        // M2 hook: sweep _nvme_namespace_table for rows whose parent
+        // is this controller row and revoke each.  Skipped at M1
+        // because that table does not yet exist.
+
+        mov rdi, r12;
+        call nvme_ctrl_tail_free;
+        mov rdi, 1;                      // NVMEC_ST_REVOKES
+        call nvme_ctrl_note;
+        xor rax, rax;
+        jmp nvmec_cr_out;
+
+      nvmec_cr_bad_slot:
+        mov rax, 0xFFFFEC49;             // NVMEC_BAD_SLOT
+        jmp nvmec_cr_out;
+      nvmec_cr_already:
+        mov rax, 0xFFFFEC47;             // NVMEC_REVOKE_ALREADY
+
+      nvmec_cr_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_ctrl_cap_mint_inner(parent_slot, rights, ctrl_idx, bar0_pa)
+  //   -> row_id | NVMEC_MINT_BAD_*
+  //
+  // R51.M1-001 (#1633): the KIND_NVME_CONTROLLER mint walker.
+  // Gates in order:
+  //   (1) parent gate (KIND_PCI_DEV + RIGHT_MINT);
+  //   (2) rights subset;
+  //   (3) ctrl_idx bound;
+  //   (4) hdr_pack (ctrl_idx, state=MINTED);
+  //   (5) tail_alloc(hdr, bar0_pa).
+  // Five callee-save pushes + sub rsp, 8 = 48 bytes; post-prologue
+  // rsp%16 == 0 for every nested call.
+  // ==========================================================================
+  pub let nvme_ctrl_cap_mint_inner : (u64, u64, u64, u64) -> u64 !{mem} @{cap} =
+    fn (parent_slot: u64) (rights: u64) (ctrl_idx: u64) (bar0_pa: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R51.M1-001 (#1633): the KIND_NVME_CONTROLLER mint walker. Gate sequence: parent (KIND_PCI_DEV + RIGHT_MINT), rights subset, ctrl_idx bound, hdr_pack (ctrl_idx, state=MINTED), tail_alloc (hdr, bar0_pa). Five callee-save pushes + sub rsp, 8 = 48 bytes: post-prologue rsp%16 == 0 for every nested call. Refusal paths bump NVMEC_ST_REFUSED. Labels prefixed nvmec_mi_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov r12, rdi;                    // parent_slot
+        mov r13, rsi;                    // rights
+        mov rbx, rdx;                    // ctrl_idx
+        mov r14, rcx;                    // bar0_pa
+
+        // (1) Parent gate.
+        mov rdi, r12;
+        call nvme_ctrl_check_parent_pci_dev;
+        cmp rax, 0;
+        je  nvmec_mi_bad_parent;
+
+        // (2) Rights subset.
+        mov rdi, r13;
+        call nvme_ctrl_rights_valid;
+        cmp rax, 0;
+        je  nvmec_mi_bad_rights;
+
+        // (3) ctrl_idx bound.
+        mov rdi, rbx;
+        call nvme_ctrl_idx_valid;
+        cmp rax, 0;
+        je  nvmec_mi_bad_idx;
+
+        // (4) Pack header with state = MINTED (1).
+        mov rdi, rbx;                    // ctrl_idx
+        mov rsi, 1;                      // NVMEC_STATE_MINTED
+        call nvme_ctrl_hdr_pack;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvmec_mi_bad_idx;
+
+        // (5) tail_alloc (hdr, bar0_pa).
+        mov rdi, rax;                    // hdr
+        mov rsi, r14;                    // bar0_pa
+        call nvme_ctrl_tail_alloc;
+        mov r10, 8;                      // NVMEC_MAX
+        cmp rax, r10;
+        jae nvmec_mi_alloc_fail;
+
+        push rax;
+        mov rdi, 0;                      // NVMEC_ST_MINTS
+        call nvme_ctrl_note;
+        pop rax;
+        jmp nvmec_mi_out;
+
+      nvmec_mi_alloc_fail:
+        jmp nvmec_mi_refused;
+      nvmec_mi_bad_parent:
+        mov rax, 0xFFFFEC4D;             // NVMEC_MINT_BAD_PARENT
+        jmp nvmec_mi_refused;
+      nvmec_mi_bad_rights:
+        mov rax, 0xFFFFEC4C;             // NVMEC_MINT_BAD_RIGHTS
+        jmp nvmec_mi_refused;
+      nvmec_mi_bad_idx:
+        mov rax, 0xFFFFEC4B;             // NVMEC_MINT_BAD_IDX
+
+      nvmec_mi_refused:
+        push rax;
+        mov rdi, 3;                      // NVMEC_ST_REFUSED
+        call nvme_ctrl_note;
+        pop rax;
+
+      nvmec_mi_out:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_ctrl_probe_and_mint(parent_slot, rights) -> u64
+  //
+  // R51.M1-002 (#1634): the PCI probe hook.  Walks the R24 probe
+  // results (_nvme_devices, indexed by ctrl_idx) and mints one
+  // KIND_NVME_CONTROLLER row per discovered controller.  Reads
+  // _nvme_device_count (published by nvme_probe) and, per index,
+  // extracts bar0_pa from _nvme_devices[i] @+8.
+  //
+  // Returns rax = number of rows minted (0..NVMEC_MAX).  A caller-
+  // supplied parent_slot must be a KIND_PCI_DEV descriptor with
+  // RIGHT_MINT -- the mint gate refuses otherwise.  Under BIOS/-kernel
+  // boot (MCFG absent -> _nvme_device_count == 0) the walk drains
+  // immediately and returns 0.  This is the SAME dormant-at-boot
+  // posture as R24's nvme_probe itself.
+  //
+  // Six callee-save pushes leave rsp%16 == 0 at every nested call.
+  // ==========================================================================
+  pub let nvme_ctrl_probe_and_mint : (u64, u64) -> u64 !{mem} @{cap} =
+    fn (parent_slot: u64) (rights: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R51.M1-002 (#1634): the PCI probe hook. Iterates i in [0, _nvme_device_count) reading bar0_pa from _nvme_devices[i] + 8 (u64 field per nvme/probe.pdx layout), calling nvme_ctrl_cap_mint_inner(parent_slot, rights, i, bar0_pa) for each. Preserves parent_slot in rbx and rights in r12 across every nested call. r13 = i (loop cursor), r14 = probe count (cached once), r15 = mint success counter, rbp = scratch. Six callee-save pushes = 48 B; entry rsp%16==8 -> post-prologue 56, sub rsp,8 -> 64, %16==0 (aligned). Bumps NVMEC_ST_PROBES once per successful mint. Labels prefixed nvmec_pm_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // parent_slot
+        mov r12, rsi;                    // rights
+
+        xor r13, r13;                    // i = 0
+        mov r14, [rip + _nvme_device_count];
+        xor r15, r15;                    // minted count
+
+      nvmec_pm_loop:
+        cmp r13, r14;
+        jae nvmec_pm_done;
+
+        // Overflow guard: cap at NVMEC_MAX (8).  Should be impossible
+        // since NVMEC_MAX == NVME_MAX_DEVS, but the belt-and-braces
+        // check catches drift.
+        cmp r13, 8;
+        jae nvmec_pm_done;
+
+        // rbp = &_nvme_devices[i] = base + (i << 5).
+        mov rax, r13;
+        shl rax, 5;
+        lea rbp, [rip + _nvme_devices];
+        add rbp, rax;
+
+        // bar0_pa (u64 @+8) into rcx (4th mint arg).
+        mov rcx, [rbp + 8];
+
+        mov rdi, rbx;                    // parent_slot
+        mov rsi, r12;                    // rights
+        mov rdx, r13;                    // ctrl_idx = i
+        // rcx already = bar0_pa
+        call nvme_ctrl_cap_mint_inner;
+
+        // Success iff rax < NVMEC_MAX.
+        mov r10, 8;
+        cmp rax, r10;
+        jae nvmec_pm_next;
+
+        add r15, 1;
+        mov rdi, 4;                      // NVMEC_ST_PROBES
+        call nvme_ctrl_note;
+
+      nvmec_pm_next:
+        add r13, 1;
+        jmp nvmec_pm_loop;
+
+      nvmec_pm_done:
+        mov rax, r15;
+
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_ctrl_bring_up(row_id) -> u64
+  //
+  // R51.M1-003 (#1635): admin queue allocation + CC.EN bring-up on a
+  // MINTED controller.  Calls:
+  //   nvme_admin_queue_init(bar0, &_nvme_admin_ctx)  -- programs
+  //     DSTRD/sq_pa/cq_pa/cq_phase into the shared boot-line ctx
+  //   nvme_reset(bar0)                                -- runs the
+  //     disable / AQA / ASQ / ACQ / enable / RDY poll cycle
+  // Then stamps admin_ctx_pa = &_nvme_admin_ctx and advances state to
+  // ENABLED.
+  //
+  // AT M1 THE SUBSTRATE USES THE SHARED _nvme_admin_ctx across all
+  // controllers.  A second call for a second row would clobber the
+  // first controller's ctx; per-row ctx allocation via KIND_DMA_DOMAIN
+  // lands at R51.M3 when the I/O queue path is wired.  Since M1 is the
+  // controller-cap round and BIOS/-kernel boot yields zero controllers,
+  // the shared-ctx posture is safe for the substrate's actual runtime.
+  //
+  // Returns NVMEC_OK on success, NVMEC_BRINGUP_FAILED on any
+  // nvme_reset failure (timeout / CFS), or NVMEC_DECODE_BAD on a bad
+  // row_id.
+  //
+  // Register plan (3-push callee-save):
+  //   rbx = row_id, r12 = bar0, r13 = ctx ptr scratch
+  //   3 pushes + sub rsp, 8 = 32 B; entry rsp%16==8 -> post-prologue
+  //   40, %16==0 (aligned).
+  // ==========================================================================
+  pub let nvme_ctrl_bring_up : (u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (row_id: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R51.M1-003 (#1635): admin queue allocation + CC.EN bring-up. Reads bar0_pa from the row, calls nvme_admin_queue_init to populate _nvme_admin_ctx, then nvme_reset to run the CC.EN cycle. On success stamps admin_ctx_pa and advances state MINTED -> ENABLED. Under BIOS/-kernel boot no controller is discovered so this path is dormant; it lands under UEFI/OVMF where a live bar0 exists. Three callee-save pushes + sub rsp,8 = 32 bytes; post-prologue rsp%16 == 0 for every nested call. Labels prefixed nvmec_bu_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // row_id
+
+        // Guard row_id valid.
+        mov rdi, rbx;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_bu_bad;
+
+        // Guard current state == MINTED.
+        mov rdi, rbx;
+        call nvme_ctrl_row_state;
+        cmp rax, 1;                      // NVMEC_STATE_MINTED
+        jne nvmec_bu_trans;
+
+        // Load bar0_pa.
+        mov rdi, rbx;
+        call nvme_ctrl_row_bar0;
+        mov r12, rax;                    // r12 = bar0
+
+        // nvme_admin_queue_init(bar0, &_nvme_admin_ctx).
+        lea r13, [rip + _nvme_admin_ctx];
+        mov rdi, r12;
+        mov rsi, r13;
+        call nvme_admin_queue_init;
+
+        // nvme_reset(bar0).  On success returns NVME_RESET_OK (0).
+        mov rdi, r12;
+        call nvme_reset;
+        cmp rax, 0;
+        jne nvmec_bu_reset_fail;
+
+        // Stamp admin_ctx_pa and _nvme_current_bar0 for the io_queue
+        // dispatch path (io_queue.pdx uses the global _nvme_current_bar0
+        // to name which controller to ring on).
+        lea r13, [rip + _nvme_admin_ctx];
+        mov rdi, rbx;
+        mov rsi, r13;
+        call nvme_ctrl_row_admin_ctx_set;
+
+        lea r10, [rip + _nvme_current_bar0];
+        mov [r10], r12;
+
+        // Advance state.
+        mov rdi, rbx;
+        mov rsi, 2;                      // NVMEC_STATE_ENABLED
+        call nvme_ctrl_row_state_set;
+
+        mov rdi, 5;                      // NVMEC_ST_BRINGUPS
+        call nvme_ctrl_note;
+
+        xor rax, rax;                    // NVMEC_OK
+        jmp nvmec_bu_out;
+
+      nvmec_bu_reset_fail:
+        mov rax, 0xFFFFEC46;             // NVMEC_BRINGUP_FAILED
+        jmp nvmec_bu_out;
+      nvmec_bu_trans:
+        mov rax, 0xFFFFEC43;             // NVMEC_BAD_TRANSITION
+        jmp nvmec_bu_out;
+      nvmec_bu_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;     // NVMEC_DECODE_BAD
+
+      nvmec_bu_out:
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_ctrl_identify(row_id) -> u64
+  //
+  // R51.M1-004 (#1636): IDENTIFY controller (CNS=0x01) round trip.
+  // Delegates to nvme_identify_ctrl_submit_and_parse (defined in
+  // src/kernel/core/drivers/nvme/identify_ctrl.pdx) which builds the
+  // SQE, submits it via nvme_admin_submit_poll, and returns a packed
+  // {mdts:u8, oncs:u16, nn:u32} triple (see identify_ctrl.pdx for the
+  // pack layout).  On success caches MDTS/ONCS/NN into the row and
+  // advances state ENABLED -> IDENTIFIED.
+  //
+  // Returns NVMEC_OK on success, NVMEC_IDENTIFY_FAILED if the admin
+  // command returned non-zero status or timed out, NVMEC_BAD_TRANSITION
+  // if the row is not in state ENABLED, NVMEC_DECODE_BAD on a bad row.
+  //
+  // Register plan (4-push callee-save):
+  //   rbx = row_id, r12 = bar0, r13 = packed identify triple
+  //   4 pushes = 32 B; post-prologue rsp%16 == 0.
+  // ==========================================================================
+  pub let nvme_ctrl_identify : (u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (row_id: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R51.M1-004 (#1636): IDENTIFY(controller) round trip and row cache. Reads bar0/admin_ctx from row; calls nvme_identify_ctrl_submit_and_parse; on success sets mdts (bits [7:0]), oncs (bits [23:8]), nn (bits [55:24]) into the row and advances state to IDENTIFIED. Failure paths return NVMEC_IDENTIFY_FAILED / _BAD_TRANSITION / _DECODE_BAD. Four callee-save pushes leave rsp%16 == 0. Labels prefixed nvmec_id_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;
+
+        mov rdi, rbx;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_id_bad;
+
+        mov rdi, rbx;
+        call nvme_ctrl_row_state;
+        cmp rax, 2;                      // NVMEC_STATE_ENABLED
+        jne nvmec_id_trans;
+
+        mov rdi, rbx;
+        call nvme_ctrl_row_bar0;
+        mov r12, rax;
+
+        // nvme_identify_ctrl_submit_and_parse(bar0) -> packed triple
+        // OR NVME_IDCTRL_FAILED (sentinel = 0xFFFFFFFFFFFFFFFF).
+        mov rdi, r12;
+        call nvme_identify_ctrl_submit_and_parse;
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvmec_id_fail;
+
+        mov r13, rax;                    // packed triple
+
+        // Unpack + stash.
+        mov r14, r13;
+        and r14, 0xFF;                   // mdts
+        mov rdi, rbx;
+        mov rsi, r14;
+        call nvme_ctrl_row_mdts_set;
+
+        mov r14, r13;
+        shr r14, 8;
+        and r14, 0xFFFF;                 // oncs (16 bits)
+        mov rdi, rbx;
+        mov rsi, r14;
+        call nvme_ctrl_row_oncs_set;
+
+        mov r14, r13;
+        shr r14, 24;
+        mov r10, 0xFFFFFFFF;
+        and r14, r10;                    // nn (32 bits)
+        mov rdi, rbx;
+        mov rsi, r14;
+        call nvme_ctrl_row_nn_set;
+
+        // Advance state ENABLED -> IDENTIFIED.
+        mov rdi, rbx;
+        mov rsi, 3;                      // NVMEC_STATE_IDENTIFIED
+        call nvme_ctrl_row_state_set;
+
+        mov rdi, 6;                      // NVMEC_ST_IDENTIFIES
+        call nvme_ctrl_note;
+
+        xor rax, rax;
+        jmp nvmec_id_out;
+
+      nvmec_id_fail:
+        mov rax, 0xFFFFEC45;             // NVMEC_IDENTIFY_FAILED
+        jmp nvmec_id_out;
+      nvmec_id_trans:
+        mov rax, 0xFFFFEC43;             // NVMEC_BAD_TRANSITION
+        jmp nvmec_id_out;
+      nvmec_id_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+
+      nvmec_id_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_ctrl_negotiate_queues(row_id, requested) -> u64
+  //
+  // R51.M1-005 (#1637): SET_FEATURES(FID=0x07) queue-count
+  // negotiation.  Delegates to nvme_set_features_num_queues_submit
+  // (defined in src/kernel/core/drivers/nvme/set_features.pdx) which
+  // encodes the request into CDW11 as (NCQR << 16) | NSQR (both 0-
+  // based; NVMe §5.21.1.7), submits, and returns the completion's
+  // CDW0 = (NCQ_alloc << 16) | NSQ_alloc.
+  //
+  // Caches the min(NSQ_alloc + 1, NCQ_alloc + 1) into num_io_queues
+  // and advances state IDENTIFIED -> NEGOTIATED.
+  //
+  // Returns NVMEC_OK on success, NVMEC_NEGOTIATE_FAILED on submit
+  // failure, NVMEC_BAD_TRANSITION if the row is not in state
+  // IDENTIFIED, NVMEC_DECODE_BAD on a bad row.
+  //
+  // Register plan (4-push callee-save):
+  //   rbx = row_id, r12 = requested count, r13 = ack triple
+  //   4 pushes = 32 B; post-prologue rsp%16 == 0.
+  // ==========================================================================
+  pub let nvme_ctrl_negotiate_queues : (u64, u64) -> u64 !{sysreg, mem} @{boot, cap} =
+    fn (row_id: u64) (requested: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot, cap},
+      justification: "R51.M1-005 (#1637): SET_FEATURES(FID=0x07) queue-count negotiation. Reads bar0 from row; calls nvme_set_features_num_queues_submit(bar0, requested) which returns the 32-bit CDW0 with (NCQ_alloc << 16) | NSQ_alloc, or NVME_SET_FEATURES_FAILED (sentinel = 0xFFFFFFFFFFFFFFFF). Takes min(nsq_alloc+1, ncq_alloc+1) as num_io_queues (NVMe §5.21.1.7: 0-based counts). Advances state IDENTIFIED -> NEGOTIATED. Four callee-save pushes leave rsp%16 == 0. Labels prefixed nvmec_nq_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                    // row_id
+        mov r12, rsi;                    // requested
+
+        mov rdi, rbx;
+        call nvme_ctrl_tail_valid;
+        cmp rax, 0;
+        je  nvmec_nq_bad;
+
+        mov rdi, rbx;
+        call nvme_ctrl_row_state;
+        cmp rax, 3;                      // NVMEC_STATE_IDENTIFIED
+        jne nvmec_nq_trans;
+
+        mov rdi, rbx;
+        call nvme_ctrl_row_bar0;
+        mov r14, rax;                    // bar0
+
+        mov rdi, r14;
+        mov rsi, r12;
+        call nvme_set_features_num_queues_submit;
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvmec_nq_fail;
+
+        mov r13, rax;                    // packed (NCQ<<16)|NSQ, both 0-based
+
+        // nsq_alloc = (r13 & 0xFFFF) + 1
+        mov rax, r13;
+        and rax, 0xFFFF;
+        add rax, 1;
+        mov r10, rax;                    // r10 = nsq count
+
+        // ncq_alloc = ((r13 >> 16) & 0xFFFF) + 1
+        mov rax, r13;
+        shr rax, 16;
+        and rax, 0xFFFF;
+        add rax, 1;
+        mov r11, rax;                    // r11 = ncq count
+
+        // min(r10, r11).
+        cmp r10, r11;
+        jbe nvmec_nq_take_r10;
+        mov r10, r11;
+      nvmec_nq_take_r10:
+
+        mov rdi, rbx;
+        mov rsi, r10;
+        call nvme_ctrl_row_num_io_queues_set;
+
+        mov rdi, rbx;
+        mov rsi, 4;                      // NVMEC_STATE_NEGOTIATED
+        call nvme_ctrl_row_state_set;
+
+        mov rdi, 7;                      // NVMEC_ST_NEGOTIATES
+        call nvme_ctrl_note;
+
+        xor rax, rax;
+        jmp nvmec_nq_out;
+
+      nvmec_nq_fail:
+        mov rax, 0xFFFFEC44;             // NVMEC_NEGOTIATE_FAILED
+        jmp nvmec_nq_out;
+      nvmec_nq_trans:
+        mov rax, 0xFFFFEC43;
+        jmp nvmec_nq_out;
+      nvmec_nq_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+
+      nvmec_nq_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // cap_handler_nvme_controller(rights, target_ptr, op_arg) -> u64
+  //
+  // KIND_NVME_CONTROLLER dispatch.  All ops arity-ONE
+  // (op_arg[63:8] REFUSED).  QUERY ops need R_NVMEC_INVOKE (0x008);
+  // DEBUG_PRINT needs R_NVMEC_OBSERVE (0x400).
+  //
+  //   NVMEC_OP_QUERY_BAR0     -> bar0_pa
+  //   NVMEC_OP_QUERY_STATE    -> state byte
+  //   NVMEC_OP_QUERY_MDTS     -> mdts
+  //   NVMEC_OP_QUERY_ONCS     -> oncs
+  //   NVMEC_OP_QUERY_NN       -> nn
+  //   NVMEC_OP_QUERY_NQS      -> num_io_queues
+  //   NVMEC_OP_QUERY_CTRL_IDX -> ctrl_idx
+  //   NVMEC_OP_DEBUG_PRINT    -> 0 (observability only)
+  // ==========================================================================
+  pub let cap_handler_nvme_controller : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (rights: u64) (target_ptr: u64) (op_arg: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R51.M1-001 (#1633): KIND_NVME_CONTROLLER dispatch. QUERY ops need R_NVMEC_INVOKE; DEBUG_PRINT needs R_NVMEC_OBSERVE. op_arg[63:8] refused. Five callee-save pushes leave rsp%16 == 0. Labels prefixed nvmec_hn_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push rbp;
+
+        mov r12, rdi;                    // rights
+        mov r13, rsi;                    // target_ptr
+        mov r10, 0xFFFF;
+        and r13, r10;                    // row_id (low 16)
+        mov r14, rdx;                    // op_arg
+
+        mov r10, r14;
+        and r10, 0xFF;
+        mov rbp, r10;                    // op
+        mov r11, r14;
+        shr r11, 8;
+        cmp r11, 0;
+        jne nvmec_hn_res;                // reserved bits set
+
+        cmp rbp, 7;                      // NVMEC_OP_MAX
+        ja  nvmec_hn_unsup;
+
+        cmp rbp, 7;                      // DEBUG_PRINT
+        je  nvmec_hn_dbg;
+
+        // Ops 0..6 need R_NVMEC_INVOKE.
+        mov r10, r12;
+        and r10, 0x008;
+        cmp r10, 0;
+        je  nvmec_hn_denied;
+
+        mov rdi, r13;
+        cmp rbp, 0;
+        je  nvmec_hn_bar0;
+        cmp rbp, 1;
+        je  nvmec_hn_state;
+        cmp rbp, 2;
+        je  nvmec_hn_mdts;
+        cmp rbp, 3;
+        je  nvmec_hn_oncs;
+        cmp rbp, 4;
+        je  nvmec_hn_nn;
+        cmp rbp, 5;
+        je  nvmec_hn_nqs;
+        // rbp == 6 (CTRL_IDX)
+        call nvme_ctrl_row_ctrl_idx;
+        jmp nvmec_hn_count;
+
+      nvmec_hn_bar0:
+        call nvme_ctrl_row_bar0;
+        jmp nvmec_hn_count;
+      nvmec_hn_state:
+        call nvme_ctrl_row_state;
+        jmp nvmec_hn_count;
+      nvmec_hn_mdts:
+        call nvme_ctrl_row_mdts;
+        jmp nvmec_hn_count;
+      nvmec_hn_oncs:
+        call nvme_ctrl_row_oncs;
+        jmp nvmec_hn_count;
+      nvmec_hn_nn:
+        call nvme_ctrl_row_nn;
+        jmp nvmec_hn_count;
+      nvmec_hn_nqs:
+        call nvme_ctrl_row_num_io_queues;
+        jmp nvmec_hn_count;
+
+      nvmec_hn_dbg:
+        mov r10, r12;
+        and r10, 0x400;
+        cmp r10, 0;
+        je  nvmec_hn_denied;
+        xor rax, rax;
+        jmp nvmec_hn_out;
+
+      nvmec_hn_count:
+        push rax;
+        mov rdi, 2;                      // NVMEC_ST_QUERIES
+        call nvme_ctrl_note;
+        pop rax;
+        jmp nvmec_hn_out;
+
+      nvmec_hn_res:
+        mov rax, 0xFFFFEC4E;             // NVMEC_TAIL_BAD_ARG
+        jmp nvmec_hn_out;
+      nvmec_hn_denied:
+        mov rax, 0xFFFFFFFFFFFFFFFD;
+        jmp nvmec_hn_out;
+      nvmec_hn_unsup:
+        mov rax, 0xFFFFFFFFFFFFFFFC;
+
+      nvmec_hn_out:
+        pop rbp;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

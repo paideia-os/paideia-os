@@ -5685,6 +5685,33 @@ fi
 echo "[r30-prep-confine] R30-PREP (KIND_TTY) confined"
 
 # ---------------------------------------------------------------------------
+# R51.M1-001 (#1633): one-writer discipline for KIND_NVME_CONTROLLER.
+#
+#   * kind_nvme_controller (KIND_NVME_CONTROLLER = 0x198, over KIND_DEVICE)
+#
+# _nvme_controller_table + _nvme_controller_stats are the only places
+# in the kernel where NVMe-controller authority lives.  A second writer
+# would let one supervisor mutate a controller row (change bar0_pa,
+# forge a state transition, silently expand MDTS) with no capability
+# involved.  Per-module confinement is what makes that unreachable by
+# construction; the sole writer is nvme_ctrl_tail_alloc / _tail_free,
+# gated by nvme_ctrl_cap_mint_inner and nvme_ctrl_cap_revoke.
+R51_NVMEC_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_nvme_controller.pdx"
+if [[ ! -f "${R51_NVMEC_SRC}" ]]; then
+    echo "[r51-m1-confine] FAIL - kind_nvme_controller.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_nvme_controller_table' 'core/cap/kind_nvme_controller.o'
+ec_confine_one '_nvme_controller_stats' 'core/cap/kind_nvme_controller.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_nvme_controller.pdx §1 for the per-module one-writer" >&2
+    echo "  discipline (the sole writers are nvme_ctrl_tail_alloc + " >&2
+    echo "  nvme_ctrl_tail_free + nvme_ctrl_note + nvme_ctrl_table_reset)." >&2
+    exit 1
+fi
+echo "[r51-m1-confine] R51.M1 (KIND_NVME_CONTROLLER) confined"
+
+# ---------------------------------------------------------------------------
 # R42-PREP-008 (#1630): one-writer discipline for the PdxFS userspace
 # directory iterator cursor table.
 #
