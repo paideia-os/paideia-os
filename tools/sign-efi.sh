@@ -33,8 +33,8 @@
 #   * A distinguishable "unsigned" vs "signed" state: an .efi that has
 #     not been through this tool has no .pdxsgn/.pdxpk/.pdxsig sections
 #     at all; the kernel-side verify sees "no section" and logs
-#     "R28 EFI UNSIGNED (R33-gate off)". A signed image has the three
-#     sections + magic and logs "R28 EFI SIGNATURE OK".
+#     "EFI UNSIGNED (enforcement off)". A signed image has the three
+#     sections + magic and logs "EFI SIGNATURE OK".
 #
 # -----------------------------------------------------------------------------
 # Section layout (fixed VMAs — kernel-side verify_self.pdx hardcodes these)

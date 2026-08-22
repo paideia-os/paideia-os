@@ -51,7 +51,7 @@
 #   *.pdx  — `let NAME : [u8; N] = "..."`      (string literal form)
 #   *.pdx  — `let NAME : [u8; N] = [ 0xNNu8, ... ]`  (byte-array form;
 #            src/kernel/boot/verify_self.pdx uses this, and the #1578
-#            sweep that missed `R28 EFI SIGNATURE OK` missed it for
+#            sweep that missed `EFI SIGNATURE OK` missed it for
 #            exactly this reason)
 #
 # A VACUITY GUARD fires if the extractor finds implausibly few markers
@@ -125,7 +125,7 @@ ALLOWLIST = {
     # single-marker grep with no golden file, and per
     # design/roadmap/r19-t14-g4-boot-guide.md §4 it stops at the pre-EBS
     # hello banner, before verify_self runs at all.
-    "R28 EFI SIGNATURE OK":
+    "EFI SIGNATURE OK":
         "UEFI-only path; the 14-mode matrix boots via -kernel, and the "
         "opt-in OVMF fixture stops at the pre-EBS banner (R19.M5).",
 

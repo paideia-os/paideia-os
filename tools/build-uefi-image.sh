@@ -97,7 +97,7 @@ SIGNED_STUB_EFI="${BUILD_UEFI_DIR}/uefi_stub.signed.efi"
 NO_SIGN="${NO_SIGN:-0}"
 
 if [[ "${NO_SIGN}" == "1" ]]; then
-    echo "[build-uefi-image] WARN: NO_SIGN=1 — using unsigned stub; kernel will log 'R28 EFI UNSIGNED (R33-gate off)'" >&2
+    echo "[build-uefi-image] WARN: NO_SIGN=1 — using unsigned stub; kernel will log 'EFI UNSIGNED (enforcement off)'" >&2
     SIGNED_STUB_EFI="${STUB_EFI}"
 else
     echo "[build-uefi-image] sign-efi.sh -> ${SIGNED_STUB_EFI##*/}"
