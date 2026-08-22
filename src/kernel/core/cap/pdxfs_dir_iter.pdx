@@ -1,0 +1,388 @@
+// src/kernel/core/cap/pdxfs_dir_iter.pdx -- R42-PREP-008 (#1630)
+//
+// PdxFS userspace directory iterator -- kernel-side substrate.
+//
+// One-line rationale: ls, cp -r, rm -r, and shell tab completion all
+// need to enumerate directory contents through a per-open cursor over a
+// held KIND_PDXFS_FILE cap whose mode nibble marks it as DIR.  This
+// module lands the substrate that sys_pdxfs_open + sys_pdxfs_dir_readnext
+// (src/kernel/core/syscall/handlers/sys_pdxfs_open.pdx and
+// sys_pdxfs_dir_readnext.pdx) delegate to:
+//
+//   * PdxFsDirEntry -- the frozen 128-byte kernel-visible entry record.
+//   * _pdxfs_dir_cursor[row_id] -- per-open cursor, reset on open.
+//   * pdxfs_dir_readnext -- writes the current stub entry into the
+//     caller-provided kernel-side scratch, advances the cursor.
+//
+// =============================================================================
+// SECTION 0  WHY KIND_PDXFS_FILE (NOT A NEW KIND_PDXFS_DIR)
+// =============================================================================
+//
+// design/user/pdxfs-kinds.md §3.1 explicitly schedules KIND_PDXFS_DIR
+// as R49.M1 work.  It also names the interim posture this iterator
+// enshrines: "Tools may hold a plain KIND_PDXFS_FILE whose mode_bits
+// mark it as a directory, and inspect the mode via PFF_OP_QUERY_MODE.
+// This works for read-only enumeration; write operations that mutate
+// the entry table (mkdir, rm -r) need the refined kind."
+//
+// The consumers of this substrate (ls.M2, cp -r WALK, rm -r WALK, shell
+// tab completion) are all READ-ONLY enumerations, so the interim path
+// is what the R42-PREP-008 issue asks for.  Adding KIND_PDXFS_DIR now
+// would pull the R49.M1 allocation forward and re-key the derivation
+// gate; deferring it keeps the R48b ordinal band intact.  The follow-
+// up cost is a search-and-replace when KIND_PDXFS_DIR lands: every
+// syscall entry-point in this module keeps its ABI, only the cap kind
+// stamp changes.
+//
+// =============================================================================
+// SECTION 1  PdxFsDirEntry -- FROZEN LAYOUT
+// =============================================================================
+//
+// Kernel-visible directory entry.  128 bytes, 16-byte aligned so the
+// user-side struct copies cleanly through user_write_bytes_via_walk
+// under KPTI.  This is the FROZEN kernel/user boundary for R42-PREP-008
+// -- a widening (larger name buffer, extra fields) requires bumping
+// PDXFS_DIR_ENTRY_SIZE and every witness/dispatch scratch that pins it.
+//
+//   [+0]   inode     u64   -- FS inode number; 0 is a legal sentinel
+//                            OUTSIDE this record (readnext returns 0
+//                            AS RC to mean EOD; the inode field itself
+//                            has no reserved value).
+//   [+8]   kind      u64   -- one of PDXFS_ENT_KIND_*.  A widening
+//                            (new file-type nibble) is a value-space
+//                            extension, not a struct extension.
+//   [+16]  name_len  u64   -- bytes in the name buffer.  0 is legal
+//                            (unnamed root sentinel per PdxFS v1
+//                            convention).  Ceiling is PDXFS_DIR_NAME_MAX.
+//   [+24]  name      u8[104] -- fixed-size buffer.  NOT NUL-terminated
+//                              by contract; consumers rely on name_len.
+//                              Bytes past name_len are UNDEFINED (the
+//                              stub zero-fills them, but user code
+//                              must not depend on this).
+//
+// The semantic-pipe schema PdxFsDirEntry described in
+// design/tooling/r49-r50-plan.md §4.4 is WIDER (adds mtime, owner cap
+// ref, cap tail hash, schema id).  That schema is the userspace
+// libpdx-semantic-pipe adornment layer, built on top of this record --
+// ls.M3 will map from this record to that schema.  Keeping the kernel
+// record narrow means the syscall boundary does not have to carry
+// crypto-length hashes or cap references across the trust barrier.
+//
+// =============================================================================
+// SECTION 2  CURSOR TABLE
+// =============================================================================
+//
+// _pdxfs_dir_cursor is a [u8; 16] parallel to _pdxfs_file_table (which
+// is PFF_MAX = 16 rows wide).  Each row's cursor lives in the SAME
+// index slot as the row itself.  sys_pdxfs_open resets cursor[row_id]
+// to 0 immediately after minting; sys_pdxfs_dir_readnext reads
+// cursor[row_id], writes stub[cursor], then increments.
+//
+// One writer discipline: the cursor table is written only by
+// pdxfs_dir_iter_reset (bulk zero), pdxfs_dir_cursor_reset (per-slot
+// zero), and pdxfs_dir_readnext (per-slot increment).  All three live
+// in this file, so tools/build.sh's ec_confine_one gate confines
+// _pdxfs_dir_cursor to pdxfs_dir_iter.o (see build.sh §R42-PREP-008
+// confinement block).
+//
+// =============================================================================
+// SECTION 3  STUB ENTRY SET
+// =============================================================================
+//
+// Three fixed entries covering the canonical POSIX directory shape:
+//
+//   [0] inode=1, kind=DIR,  name="."         (self)
+//   [1] inode=2, kind=DIR,  name=".."        (parent)
+//   [2] inode=3, kind=FILE, name="hello.pdx" (stub file)
+//
+// Real backing (a scan over the PdxFS CoW walker's inode table) lands
+// with R42.M5+ when the FS-level "read directory" primitive materializes;
+// until then this stub gives ls.M3 real symbols to consume so downstream
+// tool witnesses can wire up.
+//
+// The stub is EMITTED IN CODE by pdxfs_dir_readnext rather than declared
+// as a data blob because paideia-as does not yet accept a mixed-numeric
+// [u8; N] literal that spans hundreds of bytes without every position
+// being written by hand (see kind_pdxfs_file.pdx §PDXFS FILE ROW for the
+// small-string precedent).  A three-way dispatch on cursor plus a fixed
+// number of zeroed-tail stores is legible and avoids maintaining a
+// separate .rodata table whose bytes have to be audited against these
+// field values.
+
+module PdxfsDirIter = structure {
+
+  // ============================================================================
+  // Frozen layout constants.
+  // ============================================================================
+
+  pub let PDXFS_DIR_ENTRY_SIZE : u64 = 128
+  pub let PDXFS_DIR_NAME_MAX   : u64 = 104        // 128 - 24 (header)
+
+  // Kind values -- mirror the PdxFS file-type nibble at kind_pdxfs_file.pdx
+  // §mode_bits.  Kept as a separate enum so consumers do not have to
+  // learn the nibble bit-layout; kernel translates before writing.
+  pub let PDXFS_ENT_KIND_FILE    : u64 = 1
+  pub let PDXFS_ENT_KIND_DIR     : u64 = 2
+  pub let PDXFS_ENT_KIND_SYMLINK : u64 = 3
+  pub let PDXFS_ENT_KIND_SPECIAL : u64 = 4
+
+  // Byte offsets into a PdxFsDirEntry.  Callers use these rather than
+  // magic numbers so a layout bump is a search-and-replace on named
+  // constants.
+  pub let PDXFS_DIR_ENT_OFF_INODE    : u64 = 0
+  pub let PDXFS_DIR_ENT_OFF_KIND     : u64 = 8
+  pub let PDXFS_DIR_ENT_OFF_NAME_LEN : u64 = 16
+  pub let PDXFS_DIR_ENT_OFF_NAME     : u64 = 24
+
+  // Stub set size -- pinned so a witness can compare EOD at exactly
+  // this position.  A future round replaces the stub with a live scan
+  // and this constant becomes advisory.
+  pub let PDXFS_DIR_STUB_COUNT : u64 = 3
+
+  // Sentinel row_id used by pdxfs_dir_cursor_reset to signal "out of
+  // range" (mirrors PFF_ROW_NONE).  Callers must not pass this.
+  pub let PDXFS_DIR_ROW_NONE : u64 = 0xFF
+
+  // Result codes for pdxfs_dir_readnext.  Two positive success codes
+  // (matches the syscall shape); PDXFS_DIR_ERR_ROW is a distinct code
+  // so a dispatch-layer -EBADF translation is one instruction.
+  pub let PDXFS_DIR_RC_ENTRY : u64 = 1            // one entry written
+  pub let PDXFS_DIR_RC_EOD   : u64 = 0            // end of directory
+  pub let PDXFS_DIR_ERR_ROW  : u64 = 0xFFFFFFFFFFFFFFFF   // row_id invalid
+
+  // ============================================================================
+  // Cursor table -- one u8 per row_id.  16 slots, aligned to 8 so the
+  // reset loop can bulk-clear via 8-byte stores.
+  // ============================================================================
+
+  pub let mut _pdxfs_dir_cursor : [u8; 16] = uninit @align(8)
+
+  // ==========================================================================
+  // pdxfs_dir_iter_reset() -> ()
+  //
+  // Clear the cursor table.  Called once at boot alongside
+  // pdxfs_file_table_reset so a re-mint of a row_id starts at cursor 0
+  // even if the previous holder had advanced past the EOD sentinel.
+  // ==========================================================================
+
+  pub let pdxfs_dir_iter_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42-PREP-008 (#1630): clear the 16-byte cursor table via two u64 stores. Boot and teardown only. Two stores rather than a 16-iteration byte loop because the array is a fixed 16 bytes and @align(8) guarantees the two stores are aligned. Labels prefixed pdi_rs_.",
+      block: {
+        lea r10, [rip + _pdxfs_dir_cursor];
+        xor rax, rax;
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_dir_cursor_reset(row_id) -> 1 | 0
+  //
+  // Reset cursor[row_id] to 0.  Returns 1 on success, 0 if row_id is
+  // out of range.  Called from sys_pdxfs_open after a successful mint
+  // so the caller sees a fresh iterator regardless of whether the row
+  // was reused.
+  // ==========================================================================
+
+  pub let pdxfs_dir_cursor_reset : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42-PREP-008 (#1630): store 0 into _pdxfs_dir_cursor[row_id]. Bounds-check row_id < PFF_MAX (= 16) via unsigned compare with jae; out-of-range answers 0 so a stray call cannot corrupt an adjacent byte. Byte store via mov_b matches the array's u8 element type (kind_fw_session.pdx §copy precedent). Labels prefixed pdi_cr_.",
+      block: {
+        cmp rdi, 16;
+        jae pdi_cr_no;
+        lea r10, [rip + _pdxfs_dir_cursor];
+        xor rax, rax;
+        mov_b [r10 + rdi], rax;
+        mov rax, 1;
+        ret;
+      pdi_cr_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_dir_cursor_read(row_id) -> cursor | PDXFS_DIR_ROW_NONE
+  //
+  // Pure read; used by the witness to introspect cursor advancement
+  // without invoking the read path.
+  // ==========================================================================
+
+  pub let pdxfs_dir_cursor_read : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42-PREP-008 (#1630): read _pdxfs_dir_cursor[row_id] as a u8, zero-extended into rax. Bounds-check row_id < PFF_MAX (= 16); out-of-range answers PDXFS_DIR_ROW_NONE (0xFF) which is distinguishable from any legal cursor value (which is always <= PDXFS_DIR_STUB_COUNT = 3). Byte read via 'xor rax, rax; mov_b rax, [ptr]' per the paideia-as byte-read discipline (avoids partial-register write dependency). Labels prefixed pdi_cd_.",
+      block: {
+        cmp rdi, 16;
+        jae pdi_cd_no;
+        lea r10, [rip + _pdxfs_dir_cursor];
+        xor rax, rax;
+        mov_b rax, [r10 + rdi];
+        ret;
+      pdi_cd_no:
+        mov rax, 0xFF;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_dir_entry_zero(kbuf_ptr) -> ()
+  //
+  // Zero all 128 bytes of the caller's scratch.  Called at the top of
+  // each readnext-body-emit path so the name tail past name_len is
+  // deterministic (all-zero) regardless of what the scratch previously
+  // held.  Sixteen u64 stores.
+  // ==========================================================================
+
+  pub let pdxfs_dir_entry_zero : (u64) -> () !{mem} @{} =
+    fn (kbuf_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42-PREP-008 (#1630): 16 u64 zero-stores into kbuf_ptr[0..127]. Counted loop over rcx = word index (single shift-add per iteration; unsigned jb terminator). Callers pass a kernel VA aligned to 8; the syscall dispatch layer pins alignment via lea over a static [u8;128] @align(8) scratch. Leaf function, no callee-save writes. Labels prefixed pdi_ez_.",
+      block: {
+        xor rcx, rcx;
+        xor rax, rax;
+      pdi_ez_loop:
+        mov [rdi + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  pdi_ez_loop;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_dir_readnext(row_id, kbuf_ptr) -> 1 | 0 | PDXFS_DIR_ERR_ROW
+  //
+  // Emit one PDXFS_DIR_ENTRY_SIZE-byte entry into kbuf_ptr from the
+  // three-entry stub set, then increment the cursor.  Returns:
+  //   1                   -- one entry written
+  //   0                   -- end of directory (cursor was at STUB_COUNT)
+  //   PDXFS_DIR_ERR_ROW   -- row_id out of range
+  //
+  // ARGUMENTS
+  //   rdi = row_id       (must be < PFF_MAX; caller has already
+  //                       resolved a KIND_PDXFS_FILE cap slot to a
+  //                       row_id via pdxfs_file_row_of_slot)
+  //   rsi = kbuf_ptr     (kernel VA of a PDXFS_DIR_ENTRY_SIZE-byte
+  //                       aligned scratch; the dispatch layer owns the
+  //                       user-side copy after this returns 1)
+  //
+  // The dir/regular-file distinction is DELIBERATELY NOT checked here.
+  // The syscall layer checks it via pdxfs_file_row_mode -- keeping the
+  // check at the syscall layer means this primitive is reusable when a
+  // future KIND_PDXFS_DIR refinement gets its own row_of_slot helper.
+  //
+  // STUB SET (see §3):
+  //   cursor 0 -> {inode=1, kind=DIR,  name_len=1, name="."}
+  //   cursor 1 -> {inode=2, kind=DIR,  name_len=2, name=".."}
+  //   cursor 2 -> {inode=3, kind=FILE, name_len=9, name="hello.pdx"}
+  //   cursor 3+ -> EOD (return 0)
+  // ==========================================================================
+
+  pub let pdxfs_dir_readnext : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (kbuf_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R42-PREP-008 (#1630): three-way emit on cursor, then advance. Sequence: (1) row_id < 16 else PDXFS_DIR_ERR_ROW. (2) cursor = _pdxfs_dir_cursor[row_id] via 'xor rax, rax; mov_b rax, [ptr]' (byte-read discipline). (3) cursor >= 3 -> return 0 (EOD). (4) pdxfs_dir_entry_zero(kbuf_ptr) to make the name tail deterministic across ABI users. (5) Dispatch on cursor: 0/1/2 each writes {inode@+0, kind@+8, name_len@+16} as three u64 stores and inlines the 1..9-byte name as one u64 store at +24 (all three names fit in the first u64 of the name buffer -- 'hello.pdx' is exactly 9 bytes so the store is 9 name bytes at +24..+32 followed by a zero-tail already written by the zero-fill). (6) cursor += 1; store back via mov_b. (7) return 1. Register plan: three callee-save pushes (r12=row_id, r13=cursor, r14=kbuf_ptr) hold live values across the pdxfs_dir_entry_zero call whose caller-save clobber covers rax/rcx/rdx/rsi/rdi/r8-r11. Byte constants: '.' == 0x2E, '..' as LE u16 == 0x2E2E, 'hello.pdx' as LE u64 == 0x7864702E6F6C6C65 (name[0..7]='hello.pd', name[8]='x' handled by a separate u16 store 'x\\0' == 0x0078 at +32). Labels prefixed pdi_rn_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                        // r12 = row_id
+        mov r14, rsi;                        // r14 = kbuf_ptr
+
+        // (1) Bounds-check row_id.
+        cmp r12, 16;
+        jae pdi_rn_bad_row;
+
+        // (2) Load cursor as u8 zero-extended into rax.
+        lea r10, [rip + _pdxfs_dir_cursor];
+        xor rax, rax;
+        mov_b rax, [r10 + r12];
+        mov r13, rax;                        // r13 = cursor
+        cmp r13, 3;                          // PDXFS_DIR_STUB_COUNT
+        jae pdi_rn_eod;
+
+        // (4) Zero-fill the caller's 128-byte scratch first.
+        mov rdi, r14;
+        call pdxfs_dir_entry_zero;
+
+        // (5) Dispatch on cursor.
+        cmp r13, 0;
+        je  pdi_rn_emit_dot;
+        cmp r13, 1;
+        je  pdi_rn_emit_dotdot;
+        // Fall-through: cursor == 2 -> hello.pdx.
+
+      pdi_rn_emit_hello:
+        // inode = 3, kind = FILE (1), name_len = 9, name = "hello.pdx"
+        mov rax, 3;
+        mov [r14 + 0],  rax;
+        mov rax, 1;
+        mov [r14 + 8],  rax;
+        mov rax, 9;
+        mov [r14 + 16], rax;
+        // "hello.pd" as LE u64 at +24: bytes h=0x68 e=0x65 l=0x6C l=0x6C
+        //                                    o=0x6F .=0x2E p=0x70 d=0x64
+        mov r11, 0x64702E6F6C6C6568;
+        mov [r14 + 24], r11;
+        // 'x' as one byte at +32, then trailing zero already in place
+        // from pdxfs_dir_entry_zero.
+        mov rax, 0x78;
+        mov_b [r14 + 32], rax;
+        jmp pdi_rn_emit_done;
+
+      pdi_rn_emit_dot:
+        // inode = 1, kind = DIR (2), name_len = 1, name = "."
+        mov rax, 1;
+        mov [r14 + 0],  rax;
+        mov rax, 2;
+        mov [r14 + 8],  rax;
+        mov rax, 1;
+        mov [r14 + 16], rax;
+        mov rax, 0x2E;                       // '.'
+        mov_b [r14 + 24], rax;
+        jmp pdi_rn_emit_done;
+
+      pdi_rn_emit_dotdot:
+        // inode = 2, kind = DIR (2), name_len = 2, name = ".."
+        mov rax, 2;
+        mov [r14 + 0],  rax;
+        mov rax, 2;
+        mov [r14 + 8],  rax;
+        mov rax, 2;
+        mov [r14 + 16], rax;
+        mov rax, 0x2E;                       // '.' at +24
+        mov_b [r14 + 24], rax;
+        mov rax, 0x2E;                       // '.' at +25
+        mov_b [r14 + 25], rax;
+
+      pdi_rn_emit_done:
+        // (6) cursor += 1; store back via mov_b.
+        add r13, 1;
+        lea r10, [rip + _pdxfs_dir_cursor];
+        mov_b [r10 + r12], r13;
+
+        // (7) Return 1.
+        mov rax, 1;
+        jmp pdi_rn_out;
+
+      pdi_rn_eod:
+        xor rax, rax;
+        jmp pdi_rn_out;
+
+      pdi_rn_bad_row:
+        mov rax, 0xFFFFFFFFFFFFFFFF;         // PDXFS_DIR_ERR_ROW
+
+      pdi_rn_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}

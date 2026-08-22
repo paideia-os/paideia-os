@@ -73,11 +73,27 @@ same substrate:
 |:-------------------------|:-------|:--------------------------|:----------|:--------------------------------------|:---------------------------------------------------------------------------------------------------|
 | `KIND_PDXFS_FILE`        | 0x195  | `KIND_MEMORY = 4`         | R48b (#1623) | `core/cap/kind_pdxfs_file.pdx`     | One file authority.  Row: `{inode_no, byte_len, mode_bits, created_ns, mtime_ns, refcount}`.       |
 | `KIND_PDXFS_TXN`         | 0x196  | `KIND_MEMORY = 4`         | R48b (#1624) | `core/cap/kind_pdxfs_txn.pdx`      | One in-flight transaction — the grouping unit for pkg / cp / mv / rm.                              |
+| `KIND_TTY`               | 0x197  | `KIND_IPC_ENDPOINT = 5`   | R30-PREP (#1631) | `core/cap/kind_tty.pdx`         | One TTY sink — the shell / cat / ls output authority.  Row: `{tty_id, rows, cols, bytes_written, reserved}`. |
 
-Both kinds derive over `KIND_MEMORY` for the same reason `KIND_DMA_
-DOMAIN` (#1036) does: an FS object is a page-shaped thing whose reach
-cannot widen beyond the parent's memory authority.  Row layouts, mint
-gates, failure taxonomies, and witnesses are the module's §0 material.
+The two `KIND_PDXFS_*` kinds derive over `KIND_MEMORY` for the same
+reason `KIND_DMA_DOMAIN` (#1036) does: an FS object is a page-shaped
+thing whose reach cannot widen beyond the parent's memory authority.
+Row layouts, mint gates, failure taxonomies, and witnesses are the
+module's §0 material.
+
+`KIND_TTY` is not a PdxFS kind but is listed here for the same reason
+`KIND_ELEVATE_CHANNEL` (0x191) would be if this were the full R48b
+substrate view: the R49 tools (shell, cat, ls) depend on it, and
+tracking every kind those tools reach into keeps the coverage audit
+whole.  It derives over `KIND_IPC_ENDPOINT` (see §0 of the module):
+the client-server shape a shell/cat/ls process actually holds is an
+endpoint, not a memory or device authority.  ls.M2 had provisionally
+used ordinal 0x196 (colliding with `KIND_PDXFS_TXN`); R30-PREP settles
+the ordinal at 0x197 and lands the mint gate + query interface.  The
+write path from userspace through this KIND into
+`src/kernel/core/tty/write.pdx` is a follow-up at R49.M1 (the current
+dispatch shape has no `(buf, len)` payload slot; a syscall wire will
+pump bytes once the write op is defined).
 
 ---
 
@@ -104,6 +120,44 @@ derivation over KIND_PDXFS_FILE`).
 mark it as a directory, and inspect the mode via `PFF_OP_QUERY_MODE`.
 This works for read-only enumeration; write operations that mutate the
 entry table (`mkdir`, `rm -r`) need the refined kind.
+
+**Interim iterator landed at R42-PREP-008 (#1630).** The read-only
+enumeration path is now backed by two syscalls plus a kernel-side
+cursor table:
+
+* `sys_pdxfs_open(parent_slot, mode_flags)` — sysno 71 —
+  mints a `KIND_PDXFS_FILE` cap over a `KIND_MEMORY` parent (mount
+  root cap) and resets the per-row iteration cursor.  See
+  `src/kernel/core/syscall/handlers/sys_pdxfs_open.pdx` §Contract.
+  Returns a cap slot in `[0..256)` on success, negative-errno u64 on
+  failure (`SYS_PDXFS_OPEN_EINVAL` for `mode_flags > 0xFFFF`,
+  `SYS_PDXFS_OPEN_ENFILE` for cap-table exhaustion, `PFF_MINT_*`
+  sentinels propagated verbatim from `pdxfs_file_cap_mint_inner`).
+* `sys_pdxfs_dir_readnext(dir_cap_slot, user_buf_va)` — sysno 72 —
+  emits one `PdxFsDirEntry` (128-byte kernel-visible record) into the
+  caller's user buffer via a KPTI-safe bounce.  Returns `1` on
+  entry, `0` on end-of-directory, `-EBADF` on cap gate failure,
+  `-EFAULT` on user-pointer walker failure.  See
+  `src/kernel/core/syscall/handlers/sys_pdxfs_dir_readnext.pdx`.
+
+The kernel-visible entry layout is 128 bytes: `{u64 inode, u64 kind,
+u64 name_len, u8 name[104]}`.  The wider semantic-pipe schema
+`PdxFsDirEntry` described in
+`design/tooling/r49-r50-plan.md` §4.4 (with `mtime`, owner cap ref,
+cap tail hash, schema id) is a userspace `libpdx-semantic-pipe`
+adornment layer that `ls.M3` builds on top of this record.
+
+The stub `readnext` returns three fixed entries per open — `.`, `..`,
+and `hello.pdx` — so `ls.M3` witnesses have real symbols to consume.
+Real backing (a scan over the CoW walker's inode table) lands with
+R42.M5+ when the FS-level "read directory" primitive materializes;
+until then this substrate exists so `Runner::runner_ls` can leave the
+STUB state without waiting on the walker refactor.
+
+Consumers unblocked by this landing: `ls.M2`, `cp -r` walk, `rm -r`
+walk, shell path completion.  The follow-up `KIND_PDXFS_DIR`
+refinement above will replace the `KIND_PDXFS_FILE` cap the two
+syscalls currently mint; the ABI stays put.
 
 ### 3.2 Symlink authority
 
@@ -162,7 +216,8 @@ mistake the absence for a gap.
 When R49/R50 (or a later round) adds one of §3's kinds:
 
 1. **Register the numeric tag** in `src/kernel/core/cap/kind.pdx`, in
-   the R48b reserved band (`0x197`+).  Update
+   the R48b reserved band (`0x198`+ — `0x197` is `KIND_TTY` per R30-
+   PREP #1631).  Update
    `design/architecture/next-wave-derived-kinds.md` §"R48b substrate-
    prep" in the same commit.
 2. **Land the module** under `src/kernel/core/cap/kind_pdxfs_<name>.pdx`

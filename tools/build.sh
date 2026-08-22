@@ -5660,6 +5660,58 @@ fi
 echo "[r48b-confine] R48b (KIND_PDXFS_FILE + KIND_PDXFS_TXN + KIND_ELEVATE_CHANNEL) confined"
 
 # ---------------------------------------------------------------------------
+# R30-PREP (#1631): one-writer discipline for KIND_TTY.
+#
+#   * kind_tty (KIND_TTY = 0x197, over KIND_IPC_ENDPOINT)
+#
+# _tty_table + _tty_stats are the only places in the kernel where TTY
+# sink authority lives.  A second writer would let one supervisor
+# mutate a sink row (change advertised dimensions, forge a bytes-
+# written total) with no capability involved.  Per-module confinement
+# is what makes that unreachable by construction; the sole writer is
+# tty_tail_alloc, gated by tty_cap_mint_inner (kind_tty.pdx §1).
+R30_TTY_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_tty.pdx"
+if [[ ! -f "${R30_TTY_SRC}" ]]; then
+    echo "[r30-prep-confine] FAIL - kind_tty.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_tty_table'   'core/cap/kind_tty.o'
+ec_confine_one '_tty_stats'   'core/cap/kind_tty.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_tty.pdx §1 for the per-module one-writer" >&2
+    echo "  discipline." >&2
+    exit 1
+fi
+echo "[r30-prep-confine] R30-PREP (KIND_TTY) confined"
+
+# ---------------------------------------------------------------------------
+# R42-PREP-008 (#1630): one-writer discipline for the PdxFS userspace
+# directory iterator cursor table.
+#
+#   * pdxfs_dir_iter (KIND_PDXFS_FILE-shaped dir cap, cursor table for
+#                     sys_pdxfs_dir_readnext)
+#
+# _pdxfs_dir_cursor is a per-row_id cursor byte array parallel to
+# _pdxfs_file_table.  The only writers are pdxfs_dir_iter_reset (bulk
+# zero at boot), pdxfs_dir_cursor_reset (per-slot zero on open) and
+# pdxfs_dir_readnext (per-slot increment on advance), all in one file.
+# A second writer would let one caller advance / rewind another
+# caller's iterator with no capability check.  Per-module confinement
+# is what makes that unreachable by construction.
+R42_PDI_SRC="${REPO_ROOT}/src/kernel/core/cap/pdxfs_dir_iter.pdx"
+if [[ ! -f "${R42_PDI_SRC}" ]]; then
+    echo "[r42-prep-008-confine] FAIL - pdxfs_dir_iter.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_pdxfs_dir_cursor' 'core/cap/pdxfs_dir_iter.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See pdxfs_dir_iter.pdx §2 for the per-module one-writer" >&2
+    echo "  discipline." >&2
+    exit 1
+fi
+echo "[r42-prep-008-confine] R42-PREP-008 (pdxfs_dir_iter) confined"
+
+# ---------------------------------------------------------------------------
 # R48b substrate-prep (#1627): svc.elevate-broker registration seam.
 #
 # The kernel-side seam that reserves the well-known service name and
