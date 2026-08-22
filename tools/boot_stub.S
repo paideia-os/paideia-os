@@ -167,19 +167,19 @@ hi_va_msg:
 .global cr0_wp_ok_msg
 .align 8
 cr0_wp_ok_msg:
-    .ascii "R14B CR0 WP OK\n\0"
+    .ascii "CR0 WP OK\n\0"
 
 # R14b-M5-008 (#660): pf_handler CoW fast-flip witness success message
 .global pf_flip_ok_msg
 .align 8
 pf_flip_ok_msg:
-    .ascii "R14B PF FLIP OK\n\0"
+    .ascii "PF FLIP OK\n\0"
 
 # R14b-M5-008 (#660): pf_handler CoW fast-flip witness failure message
 .global pf_flip_fail_msg
 .align 8
 pf_flip_fail_msg:
-    .ascii "R14B PF FLIP FAIL\n\0"
+    .ascii "PF FLIP FAIL\n\0"
 
 # R14.M4-009 (#505): KPTI structural witness success message
 .global kpti_ok_msg
@@ -247,11 +247,11 @@ elf_load_fail_msg: .ascii "ELF LOAD FAIL\n\0"
 # that unblocks #671 (SC+ execve dispatcher) and reverts #678 (shell-bypass).
 .global child_hello_embed_ok_msg
 .align 8
-child_hello_embed_ok_msg: .ascii "R15 CHILD HELLO EMBED OK\n\0"
+child_hello_embed_ok_msg: .ascii "CHILD HELLO EMBED OK\n\0"
 
 .global child_hello_embed_fail_msg
 .align 8
-child_hello_embed_fail_msg: .ascii "R15 CHILD HELLO EMBED FAIL\n\0"
+child_hello_embed_fail_msg: .ascii "CHILD HELLO EMBED FAIL\n\0"
 
 # #723 (revert of #678): init is the initial ring-3 task; init forks+execs
 # its children (shell, child_hello) via sys_execve. The shell-bypass shortcut
@@ -272,11 +272,11 @@ child_hello_seed_name: .ascii "child_hello\0"
 
 .global bin_seed_ok_msg
 .align 8
-bin_seed_ok_msg: .ascii "R17 BIN CHILD HELLO SEED OK\n\0"
+bin_seed_ok_msg: .ascii "BIN CHILD HELLO SEED OK\n\0"
 
 .global bin_seed_fail_msg
 .align 8
-bin_seed_fail_msg: .ascii "R17 BIN CHILD HELLO SEED FAIL\n\0"
+bin_seed_fail_msg: .ascii "BIN CHILD HELLO SEED FAIL\n\0"
 
 # R17-M5-636 (paideia-os #636): /bin/sh tmpfs seed strings + markers.
 # See design/kernel/r17-m5-636-shell-binary-seed.md.
@@ -286,11 +286,11 @@ sh_seed_name: .ascii "sh\0"
 
 .global bin_sh_seed_ok_msg
 .align 8
-bin_sh_seed_ok_msg: .ascii "R17 BIN SH SEED OK\n\0"
+bin_sh_seed_ok_msg: .ascii "BIN SH SEED OK\n\0"
 
 .global bin_sh_seed_fail_msg
 .align 8
-bin_sh_seed_fail_msg: .ascii "R17 BIN SH SEED FAIL\n\0"
+bin_sh_seed_fail_msg: .ascii "BIN SH SEED FAIL\n\0"
 
 # R17.M5 #638 (paideia-os): /bin/true tmpfs seed strings + markers.
 # /bin/true is a trivial 2-syscall self-contained user binary
@@ -304,21 +304,21 @@ true_seed_name: .ascii "true\0"
 
 .global bin_true_seed_ok_msg
 .align 8
-bin_true_seed_ok_msg: .ascii "R17 BIN TRUE SEED OK\n\0"
+bin_true_seed_ok_msg: .ascii "BIN TRUE SEED OK\n\0"
 
 .global bin_true_seed_fail_msg
 .align 8
-bin_true_seed_fail_msg: .ascii "R17 BIN TRUE SEED FAIL\n\0"
+bin_true_seed_fail_msg: .ascii "BIN TRUE SEED FAIL\n\0"
 
 # logging-m9-001 (#708): KIND_DMESG cap witness strings and markers.
 # See design/kernel/kernel-logging-substrate.md §12.10 + §14 Q6.
 .global dmesg_cap_ok_msg
 .align 8
-dmesg_cap_ok_msg: .ascii "R18 DMESG CAP OK\n\0"
+dmesg_cap_ok_msg: .ascii "DMESG CAP OK\n\0"
 
 .global dmesg_cap_fail_msg
 .align 8
-dmesg_cap_fail_msg: .ascii "R18 DMESG CAP FAIL\n\0"
+dmesg_cap_fail_msg: .ascii "DMESG CAP FAIL\n\0"
 
 # Scratch buffer the DMESG cap witness copies ring bytes into for OP_READ_TAIL.
 .global _dmesg_cap_witness_scratch
@@ -328,11 +328,11 @@ _dmesg_cap_witness_scratch: .zero 512
 # logging-m9-002 (#709): sys_dmesg witness strings and markers.
 .global sys_dmesg_ok_msg
 .align 8
-sys_dmesg_ok_msg: .ascii "R18 SYS DMESG OK\n\0"
+sys_dmesg_ok_msg: .ascii "SYS DMESG OK\n\0"
 
 .global sys_dmesg_fail_msg
 .align 8
-sys_dmesg_fail_msg: .ascii "R18 SYS DMESG FAIL\n\0"
+sys_dmesg_fail_msg: .ascii "SYS DMESG FAIL\n\0"
 
 # logging-m9-003 (#710): audit-log bridge witness — paths, tag, markers.
 .global system_dir_name
@@ -349,11 +349,11 @@ audit_log_name: .ascii "log.pdaudit\0"
 
 .global audit_bridge_ok_msg
 .align 8
-audit_bridge_ok_msg: .ascii "R18 AUDIT BRIDGE OK\n\0"
+audit_bridge_ok_msg: .ascii "AUDIT BRIDGE OK\n\0"
 
 .global audit_bridge_fail_msg
 .align 8
-audit_bridge_fail_msg: .ascii "R18 AUDIT BRIDGE FAIL\n\0"
+audit_bridge_fail_msg: .ascii "AUDIT BRIDGE FAIL\n\0"
 
 # Tag emitted during the ERROR-level test line to make it grep-recognizable
 # in the audit log after flush.
@@ -401,12 +401,12 @@ m5_walk_ok_msg: .ascii "M5 STACK WALK OK\n\0"
 # R14-M3-007c (#650): #UD witness failure message (armed but not fired).
 .global ud_witness_fail_msg
 .align 8
-ud_witness_fail_msg: .ascii "R14 UD FAIL\n\0"
+ud_witness_fail_msg: .ascii "UD FAIL\n\0"
 
 # R15-M2-006b (#652): Ring-3 witness failure message (setup failed)
 .global ring3_fail_msg
 .align 8
-ring3_fail_msg: .ascii "R15 RING3 FAIL\n\0"
+ring3_fail_msg: .ascii "RING3 FAIL\n\0"
 
 
 # M2-001 (#687): klog_ring_write witness success message
@@ -458,127 +458,127 @@ phys_free_fail_msg: .ascii "PHYS FREE ROUNDTRIP FAIL\n\0"
 # R15-M5-007 (#549): fd_table witness success message
 .global fd_witness_ok_msg
 .align 8
-fd_witness_ok_msg: .ascii "R15 FD TABLE OK\n\0"
+fd_witness_ok_msg: .ascii "FD TABLE OK\n\0"
 
 # R15-M5-007 (#549): fd_table witness failure message
 .global fd_witness_fail_msg
 .align 8
-fd_witness_fail_msg: .ascii "R15 FD TABLE FAIL\n\0"
+fd_witness_fail_msg: .ascii "FD TABLE FAIL\n\0"
 
 # R15-M5-006 (#548): task_new witness success message
 .global task_new_witness_ok_msg
 .align 8
-task_new_witness_ok_msg: .ascii "R15 TASK NEW OK\n\0"
+task_new_witness_ok_msg: .ascii "TASK NEW OK\n\0"
 
 # R15-M5-006 (#548): task_new witness failure message
 .global task_new_witness_fail_msg
 .align 8
-task_new_witness_fail_msg: .ascii "R15 TASK NEW FAIL\n\0"
+task_new_witness_fail_msg: .ascii "TASK NEW FAIL\n\0"
 
 # R15-M5-008 (#550): task_free witness success message
 .global task_free_witness_ok_msg
 .align 8
-task_free_witness_ok_msg: .ascii "R15 TASK FREE OK\n\0"
+task_free_witness_ok_msg: .ascii "TASK FREE OK\n\0"
 
 # R15-M5-008 (#550): task_free witness failure message
 .global task_free_witness_fail_msg
 .align 8
-task_free_witness_fail_msg: .ascii "R15 TASK FREE FAIL\n\0"
+task_free_witness_fail_msg: .ascii "TASK FREE FAIL\n\0"
 
 # R15-M5-009 (#551): task pool witness — 3-task success message
 .global pool_witness_ok_msg
 .align 8
-pool_witness_ok_msg: .ascii "R15 TASK pool ok pids=1,2,3\n\0"
+pool_witness_ok_msg: .ascii "TASK pool ok pids=1,2,3\n\0"
 
 # R15-M5-009 (#551): task pool witness — failure message
 .global pool_witness_fail_msg
 .align 8
-pool_witness_fail_msg: .ascii "R15 TASK pool FAIL\n\0"
+pool_witness_fail_msg: .ascii "TASK pool FAIL\n\0"
 
 # R15-M6-006 (#557): sys_exit witness success message
 .global sys_exit_witness_ok_msg
 .align 8
-sys_exit_witness_ok_msg: .ascii "R15 SYS EXIT OK\n\0"
+sys_exit_witness_ok_msg: .ascii "SYS EXIT OK\n\0"
 
 # R15-M6-006 (#557): sys_exit witness failure message
 .global sys_exit_witness_fail_msg
 .align 8
-sys_exit_witness_fail_msg: .ascii "R15 SYS EXIT FAIL\n\0"
+sys_exit_witness_fail_msg: .ascii "SYS EXIT FAIL\n\0"
 
 # R15-M6-005 (#556): sys_wait witness success message
 .global sys_wait_witness_ok_msg
 .align 8
-sys_wait_witness_ok_msg: .ascii "R15 SYS WAIT OK\n\0"
+sys_wait_witness_ok_msg: .ascii "SYS WAIT OK\n\0"
 
 # R15-M6-005 (#556): sys_wait witness failure message
 .global sys_wait_witness_fail_msg
 .align 8
-sys_wait_witness_fail_msg: .ascii "R15 SYS WAIT FAIL\n\0"
+sys_wait_witness_fail_msg: .ascii "SYS WAIT FAIL\n\0"
 
 # R15-M6-004 (#555): sys_execve witness success message
 .global sys_execve_witness_ok_msg
 .align 8
-sys_execve_witness_ok_msg: .ascii "R15 SYS EXECVE OK\n\0"
+sys_execve_witness_ok_msg: .ascii "SYS EXECVE OK\n\0"
 
 # R15-M6-004 (#555): sys_execve witness failure message
 .global sys_execve_witness_fail_msg
 .align 8
-sys_execve_witness_fail_msg: .ascii "R15 SYS EXECVE FAIL\n\0"
+sys_execve_witness_fail_msg: .ascii "SYS EXECVE FAIL\n\0"
 
 # R15-M6-007 (#558): orphan_adoption witness success message
 .global orphan_adoption_witness_ok_msg
 .align 8
-orphan_adoption_witness_ok_msg: .ascii "R15 ORPHAN ADOPT OK\n\0"
+orphan_adoption_witness_ok_msg: .ascii "ORPHAN ADOPT OK\n\0"
 
 # R15-M6-007 (#558): orphan_adoption witness failure message
 .global orphan_adoption_witness_fail_msg
 .align 8
-orphan_adoption_witness_fail_msg: .ascii "R15 ORPHAN ADOPT FAIL\n\0"
+orphan_adoption_witness_fail_msg: .ascii "ORPHAN ADOPT FAIL\n\0"
 
 # R15-M6-003 (#554): sys_fork witness success + failure messages
 .global sys_fork_witness_ok_msg
 .align 8
-sys_fork_witness_ok_msg: .ascii "R15 SYS FORK OK\n\0"
+sys_fork_witness_ok_msg: .ascii "SYS FORK OK\n\0"
 
 .global sys_fork_witness_fail_msg
 .align 8
-sys_fork_witness_fail_msg: .ascii "R15 SYS FORK FAIL\n\0"
+sys_fork_witness_fail_msg: .ascii "SYS FORK FAIL\n\0"
 
 # R16-M1-002 (#571): vnode_pool witness success + failure messages
 .global vnode_pool_ok_msg
 .align 8
-vnode_pool_ok_msg: .ascii "R16 VNODE POOL OK\n\0"
+vnode_pool_ok_msg: .ascii "VNODE POOL OK\n\0"
 
 .global vnode_pool_fail_msg
 .align 8
-vnode_pool_fail_msg: .ascii "R16 VNODE POOL FAIL\n\0"
+vnode_pool_fail_msg: .ascii "VNODE POOL FAIL\n\0"
 
 # R16-M1-003 (#572): vops dispatch witness success + failure messages
 .global vops_ok_msg
 .align 8
-vops_ok_msg: .ascii "R16 VOPS OK\n\0"
+vops_ok_msg: .ascii "VOPS OK\n\0"
 
 .global vops_fail_msg
 .align 8
-vops_fail_msg: .ascii "R16 VOPS FAIL\n\0"
+vops_fail_msg: .ascii "VOPS FAIL\n\0"
 
 # R16-M1-004 (#573): path_resolve witness success + failure messages
 .global path_resolve_ok_msg
 .align 8
-path_resolve_ok_msg: .ascii "R16 PATH RESOLVE OK\n\0"
+path_resolve_ok_msg: .ascii "PATH RESOLVE OK\n\0"
 
 .global path_resolve_fail_msg
 .align 8
-path_resolve_fail_msg: .ascii "R16 PATH RESOLVE FAIL\n\0"
+path_resolve_fail_msg: .ascii "PATH RESOLVE FAIL\n\0"
 
 # R16-M1-005 (#574): mount_table witness success + failure messages
 .global mount_table_ok_msg
 .align 8
-mount_table_ok_msg: .ascii "R16 MOUNT TABLE OK\n\0"
+mount_table_ok_msg: .ascii "MOUNT TABLE OK\n\0"
 
 .global mount_table_fail_msg
 .align 8
-mount_table_fail_msg: .ascii "R16 MOUNT TABLE FAIL\n\0"
+mount_table_fail_msg: .ascii "MOUNT TABLE FAIL\n\0"
 
 # R17-M0-665 Phase 3: mount_witness sub-test E message
 .global mount_witness_e_fail_msg
@@ -588,24 +588,24 @@ mount_witness_e_fail_msg: .ascii "MOUNT WITNESS E FAIL\n\0"
 # R16-M1-006 (#575): vfs_open witness success + failure messages
 .global vfs_open_ok_msg
 .align 8
-vfs_open_ok_msg: .ascii "R16 VFS OPEN OK\n\0"
+vfs_open_ok_msg: .ascii "VFS OPEN OK\n\0"
 
 .global vfs_open_fail_msg
 .align 8
-vfs_open_fail_msg: .ascii "R16 VFS OPEN FAIL\n\0"
+vfs_open_fail_msg: .ascii "VFS OPEN FAIL\n\0"
 
 .global vfs_close_ok_msg
 .align 8
-vfs_close_ok_msg: .ascii "R16 VFS CLOSE OK\n\0"
+vfs_close_ok_msg: .ascii "VFS CLOSE OK\n\0"
 
 .global vfs_close_fail_msg
 .align 8
-vfs_close_fail_msg: .ascii "R16 VFS CLOSE FAIL\n\0"
+vfs_close_fail_msg: .ascii "VFS CLOSE FAIL\n\0"
 
 # #664 verification: vfs_open O_CREAT witness success + failure messages
 .global ocreat_ok_msg
 .align 8
-ocreat_ok_msg: .ascii "R16 OCREAT OK\n\0"
+ocreat_ok_msg: .ascii "OCREAT OK\n\0"
 
 .global ocreat_fail_msg
 .align 8
@@ -614,11 +614,11 @@ ocreat_fail_msg: .ascii "OCREAT FAIL\n\0"
 # R16-M1-008 (#577): vfs_read/vfs_write witness success + failure messages
 .global vfs_rw_ok_msg
 .align 8
-vfs_rw_ok_msg: .ascii "R16 VFS READ WRITE OK\n\0"
+vfs_rw_ok_msg: .ascii "VFS READ WRITE OK\n\0"
 
 .global vfs_rw_fail_msg
 .align 8
-vfs_rw_fail_msg: .ascii "R16 VFS READ WRITE FAIL\n\0"
+vfs_rw_fail_msg: .ascii "VFS READ WRITE FAIL\n\0"
 
 # R16-M1-001 (#578): VFS integration checkpoint message (all R16.M1 witnesses pass)
 .global vfs_ok_msg
@@ -628,20 +628,20 @@ vfs_ok_msg: .ascii "VFS OK\n\0"
 # R16-M2-001 (#579): tmpfs inode pool witness success + failure messages
 .global tmpfs_inode_pool_ok_msg
 .align 8
-tmpfs_inode_pool_ok_msg: .ascii "R16 TMPFS INODE POOL OK\n\0"
+tmpfs_inode_pool_ok_msg: .ascii "TMPFS INODE POOL OK\n\0"
 
 .global tmpfs_inode_pool_fail_msg
 .align 8
-tmpfs_inode_pool_fail_msg: .ascii "R16 TMPFS INODE POOL FAIL\n\0"
+tmpfs_inode_pool_fail_msg: .ascii "TMPFS INODE POOL FAIL\n\0"
 
 # R16-M2-002 (#580): tmpfs_init witness success + failure messages
 .global tmpfs_init_ok_msg
 .align 8
-tmpfs_init_ok_msg: .ascii "R16 TMPFS INIT OK\n\0"
+tmpfs_init_ok_msg: .ascii "TMPFS INIT OK\n\0"
 
 .global tmpfs_init_fail_msg
 .align 8
-tmpfs_init_fail_msg: .ascii "R16 TMPFS INIT FAIL\n\0"
+tmpfs_init_fail_msg: .ascii "TMPFS INIT FAIL\n\0"
 
 # R16-M2-003 (#581): tmpfs_lookup witness name strings
 .global witness_name_tmp
@@ -659,20 +659,20 @@ witness_name_any: .ascii "x\0"
 # R16-M2-003 (#581): tmpfs_lookup witness success + failure messages
 .global tmpfs_lookup_ok_msg
 .align 8
-tmpfs_lookup_ok_msg: .ascii "R16 TMPFS LOOKUP OK\n\0"
+tmpfs_lookup_ok_msg: .ascii "TMPFS LOOKUP OK\n\0"
 
 .global tmpfs_lookup_fail_msg
 .align 8
-tmpfs_lookup_fail_msg: .ascii "R16 TMPFS LOOKUP FAIL\n\0"
+tmpfs_lookup_fail_msg: .ascii "TMPFS LOOKUP FAIL\n\0"
 
 # R16-M2-004 (#582): tmpfs_create witness success + failure messages
 .global tmpfs_create_ok_msg
 .align 8
-tmpfs_create_ok_msg: .ascii "R16 TMPFS CREATE OK\n\0"
+tmpfs_create_ok_msg: .ascii "TMPFS CREATE OK\n\0"
 
 .global tmpfs_create_fail_msg
 .align 8
-tmpfs_create_fail_msg: .ascii "R16 TMPFS CREATE FAIL\n\0"
+tmpfs_create_fail_msg: .ascii "TMPFS CREATE FAIL\n\0"
 
 # R16-M2-005 (#583): tmpfs_write witness — 100-byte source buffer
 .global tmpfs_write_src_buf
@@ -685,11 +685,11 @@ tmpfs_write_src_buf:
 # R16-M2-005 (#583): tmpfs_write witness success + failure messages
 .global tmpfs_write_ok_msg
 .align 8
-tmpfs_write_ok_msg: .ascii "R16 TMPFS WRITE OK\n\0"
+tmpfs_write_ok_msg: .ascii "TMPFS WRITE OK\n\0"
 
 .global tmpfs_write_fail_msg
 .align 8
-tmpfs_write_fail_msg: .ascii "R16 TMPFS WRITE FAIL\n\0"
+tmpfs_write_fail_msg: .ascii "TMPFS WRITE FAIL\n\0"
 
 # R16-M2-006 (#584): tmpfs_read witness — 128-byte destination buffer
 # (16 u64 slots; covers the 100-byte read from /tmp/x plus tail slack)
@@ -703,120 +703,120 @@ tmpfs_read_dst_buf:
 # R16-M2-006 (#584): tmpfs_read witness success + failure messages
 .global tmpfs_read_ok_msg
 .align 8
-tmpfs_read_ok_msg: .ascii "R16 TMPFS READ OK\n\0"
+tmpfs_read_ok_msg: .ascii "TMPFS READ OK\n\0"
 
 .global tmpfs_read_fail_msg
 .align 8
-tmpfs_read_fail_msg: .ascii "R16 TMPFS READ FAIL\n\0"
+tmpfs_read_fail_msg: .ascii "TMPFS READ FAIL\n\0"
 
 # R16-M2-007 (#585): tmpfs_unlink witness success + failure messages
 .global tmpfs_unlink_ok_msg
 .align 8
-tmpfs_unlink_ok_msg: .ascii "R16 TMPFS UNLINK OK\n\0"
+tmpfs_unlink_ok_msg: .ascii "TMPFS UNLINK OK\n\0"
 
 .global tmpfs_unlink_fail_msg
 .align 8
-tmpfs_unlink_fail_msg: .ascii "R16 TMPFS UNLINK FAIL\n\0"
+tmpfs_unlink_fail_msg: .ascii "TMPFS UNLINK FAIL\n\0"
 
 # R16-M2-008 (#586): tmpfs vops table wire-up witness success + failure + name
 .global tmpfs_vops_ok_msg
 .align 8
-tmpfs_vops_ok_msg: .ascii "R16 TMPFS VOPS OK\n\0"
+tmpfs_vops_ok_msg: .ascii "TMPFS VOPS OK\n\0"
 
 .global tmpfs_vops_fail_msg
 .align 8
-tmpfs_vops_fail_msg: .ascii "R16 TMPFS VOPS FAIL\n\0"
+tmpfs_vops_fail_msg: .ascii "TMPFS VOPS FAIL\n\0"
 
 # R16-M3-001 (#587): sys_open witness success message
 .global sys_open_ok_msg
 .align 8
-sys_open_ok_msg: .ascii "R16 SYS OPEN OK\n\0"
+sys_open_ok_msg: .ascii "SYS OPEN OK\n\0"
 
 # R16-M3-001 (#587): sys_open witness failure message
 .global sys_open_fail_msg
 .align 8
-sys_open_fail_msg: .ascii "R16 SYS OPEN FAIL\n\0"
+sys_open_fail_msg: .ascii "SYS OPEN FAIL\n\0"
 
 # R16-M3-002 (#588): sys_close witness success message
 .global sys_close_ok_msg
 .align 8
-sys_close_ok_msg: .ascii "R16 SYS CLOSE OK\n\0"
+sys_close_ok_msg: .ascii "SYS CLOSE OK\n\0"
 
 # R16-M3-002 (#588): sys_close witness failure message
 .global sys_close_fail_msg
 .align 8
-sys_close_fail_msg: .ascii "R16 SYS CLOSE FAIL\n\0"
+sys_close_fail_msg: .ascii "SYS CLOSE FAIL\n\0"
 
 # R16-M3-003 (#589): sys_read witness success message
 .global sys_read_ok_msg
 .align 8
-sys_read_ok_msg: .ascii "R16 SYS READ OK\n\0"
+sys_read_ok_msg: .ascii "SYS READ OK\n\0"
 
 # R16-M3-003 (#589): sys_read witness failure message
 .global sys_read_fail_msg
 .align 8
-sys_read_fail_msg: .ascii "R16 SYS READ FAIL\n\0"
+sys_read_fail_msg: .ascii "SYS READ FAIL\n\0"
 
 # R16-M3-004 (#590): sys_write witness success message
 .global sys_write_ok_msg
 .align 8
-sys_write_ok_msg: .ascii "R16 SYS WRITE OK\n\0"
+sys_write_ok_msg: .ascii "SYS WRITE OK\n\0"
 
 # R16-M3-004 (#590): sys_write witness failure message
 .global sys_write_fail_msg
 .align 8
-sys_write_fail_msg: .ascii "R16 SYS WRITE FAIL\n\0"
+sys_write_fail_msg: .ascii "SYS WRITE FAIL\n\0"
 
 # R16-M3-005 (#591): sys_dup2 witness success message
 .global sys_dup2_ok_msg
 .align 8
-sys_dup2_ok_msg: .ascii "R16 SYS DUP2 OK\n\0"
+sys_dup2_ok_msg: .ascii "SYS DUP2 OK\n\0"
 
 # R16-M3-005 (#591): sys_dup2 witness failure message
 .global sys_dup2_fail_msg
 .align 8
-sys_dup2_fail_msg: .ascii "R16 SYS DUP2 FAIL\n\0"
+sys_dup2_fail_msg: .ascii "SYS DUP2 FAIL\n\0"
 
 # R16-M3-006 (#592): fd_inherit witness success message
 .global fd_inherit_ok_msg
 .align 8
-fd_inherit_ok_msg: .ascii "R16 FD INHERIT OK\n\0"
+fd_inherit_ok_msg: .ascii "FD INHERIT OK\n\0"
 
 # R16-M3-006 (#592): fd_inherit witness failure message
 .global fd_inherit_fail_msg
 .align 8
-fd_inherit_fail_msg: .ascii "R16 FD INHERIT FAIL\n\0"
+fd_inherit_fail_msg: .ascii "FD INHERIT FAIL\n\0"
 
 # R16-M3-007 (#593): fd_cloexec witness success message
 .global fd_cloexec_ok_msg
 .align 8
-fd_cloexec_ok_msg: .ascii "R16 FD CLOEXEC OK\n\0"
+fd_cloexec_ok_msg: .ascii "FD CLOEXEC OK\n\0"
 
 # R16-M3-007 (#593): fd_cloexec witness failure message
 .global fd_cloexec_fail_msg
 .align 8
-fd_cloexec_fail_msg: .ascii "R16 FD CLOEXEC FAIL\n\0"
+fd_cloexec_fail_msg: .ascii "FD CLOEXEC FAIL\n\0"
 
 # Debug messages for fd_cloexec witness
 .global fd_cloexec_fail_setup
 .align 8
-fd_cloexec_fail_setup: .ascii "R16 FD CLOEXEC FAIL (setup)\n\0"
+fd_cloexec_fail_setup: .ascii "FD CLOEXEC FAIL (setup)\n\0"
 
 .global fd_cloexec_fail_execve
 .align 8
-fd_cloexec_fail_execve: .ascii "R16 FD CLOEXEC FAIL (execve)\n\0"
+fd_cloexec_fail_execve: .ascii "FD CLOEXEC FAIL (execve)\n\0"
 
 .global fd_cloexec_fail_sub_a
 .align 8
-fd_cloexec_fail_sub_a: .ascii "R16 FD CLOEXEC FAIL (sub-test A)\n\0"
+fd_cloexec_fail_sub_a: .ascii "FD CLOEXEC FAIL (sub-test A)\n\0"
 
 .global fd_cloexec_fail_sub_b
 .align 8
-fd_cloexec_fail_sub_b: .ascii "R16 FD CLOEXEC FAIL (sub-test B)\n\0"
+fd_cloexec_fail_sub_b: .ascii "FD CLOEXEC FAIL (sub-test B)\n\0"
 
 .global fd_cloexec_fail_sub_c
 .align 8
-fd_cloexec_fail_sub_c: .ascii "R16 FD CLOEXEC FAIL (sub-test C)\n\0"
+fd_cloexec_fail_sub_c: .ascii "FD CLOEXEC FAIL (sub-test C)\n\0"
 
 # R16-M3-008 (#594): FD OK — milestone closure marker
 .global fd_ok_msg
@@ -826,92 +826,92 @@ fd_ok_msg: .ascii "FD OK\n\0"
 # R16-M4-001 (#595): uart_rx_init witness success message
 .global uart_rx_init_ok_msg
 .align 8
-uart_rx_init_ok_msg: .ascii "R16 UART RX INIT OK\n\0"
+uart_rx_init_ok_msg: .ascii "UART RX INIT OK\n\0"
 
 # R16-M4-001 (#595): uart_rx_init witness failure message
 .global uart_rx_init_fail_msg
 .align 8
-uart_rx_init_fail_msg: .ascii "R16 UART RX INIT FAIL\n\0"
+uart_rx_init_fail_msg: .ascii "UART RX INIT FAIL\n\0"
 
 # R17-M0-665 Phase 1: vnode_cache_or_alloc witness success message
 .global vcache_witness_ok_msg
 .align 8
-vcache_witness_ok_msg: .ascii "R17 VCACHE OK\n\0"
+vcache_witness_ok_msg: .ascii "VCACHE OK\n\0"
 
 # R17-M0-665 Phase 1: vnode_cache_or_alloc witness failure message
 .global vcache_witness_fail_msg
 .align 8
-vcache_witness_fail_msg: .ascii "R17 VCACHE FAIL\n\0"
+vcache_witness_fail_msg: .ascii "VCACHE FAIL\n\0"
 
 # R17-M0-665 Phase 2: backend_registry witness success message
 .global backend_reg_ok_msg
 .align 8
-backend_reg_ok_msg: .ascii "R17 BACKEND REG OK\n\0"
+backend_reg_ok_msg: .ascii "BACKEND REG OK\n\0"
 
 # R17-M0-665 Phase 2: backend_registry witness failure message
 .global backend_reg_fail_msg
 .align 8
-backend_reg_fail_msg: .ascii "R17 BACKEND REG FAIL\n\0"
+backend_reg_fail_msg: .ascii "BACKEND REG FAIL\n\0"
 
 # R17-M0-665 Phase 0: word-store landmine microbench success message
 .global _wsl_ok_msg
 .align 8
-_wsl_ok_msg: .ascii "R17 WORD STORE OK\n\0"
+_wsl_ok_msg: .ascii "WORD STORE OK\n\0"
 
 # R17-M0-665 Phase 0: word-store landmine microbench failure message
 .global _wsl_fail_msg
 .align 8
-_wsl_fail_msg: .ascii "R17 WORD STORE FAIL\n\0"
+_wsl_fail_msg: .ascii "WORD STORE FAIL\n\0"
 
 # R16-M4-002 (#596): uart_rx_ring witness success message
 .global uart_rx_ring_ok_msg
 .align 8
-uart_rx_ring_ok_msg: .ascii "R16 UART RX RING OK\n\0"
+uart_rx_ring_ok_msg: .ascii "UART RX RING OK\n\0"
 
 # R16-M4-002 (#596): uart_rx_ring witness failure message
 .global uart_rx_ring_fail_msg
 .align 8
-uart_rx_ring_fail_msg: .ascii "R16 UART RX RING FAIL\n\0"
+uart_rx_ring_fail_msg: .ascii "UART RX RING FAIL\n\0"
 
 # R16-M4-003 (#597): uart_rx_isr witness success message
 .global uart_rx_isr_ok_msg
 .align 8
-uart_rx_isr_ok_msg: .ascii "R16 UART RX ISR OK\n\0"
+uart_rx_isr_ok_msg: .ascii "UART RX ISR OK\n\0"
 
 # R16-M4-003 (#597): uart_rx_isr witness failure message
 .global uart_rx_isr_fail_msg
 .align 8
-uart_rx_isr_fail_msg: .ascii "R16 UART RX ISR FAIL\n\0"
+uart_rx_isr_fail_msg: .ascii "UART RX ISR FAIL\n\0"
 
 # R16-M4-004 (#598): idt vector 0x24 witness success message
 .global idt_vec24_ok_msg
 .align 8
-idt_vec24_ok_msg: .ascii "R16 IDT VEC24 OK\n\0"
+idt_vec24_ok_msg: .ascii "IDT VEC24 OK\n\0"
 
 # R16-M4-004 (#598): idt vector 0x24 witness failure message
 .global idt_vec24_fail_msg
 .align 8
-idt_vec24_fail_msg: .ascii "R16 IDT VEC24 FAIL\n\0"
+idt_vec24_fail_msg: .ascii "IDT VEC24 FAIL\n\0"
 
 # R16-M4-005 (#599): ioapic irq4 witness success message
 .global ioapic_irq4_ok_msg
 .align 8
-ioapic_irq4_ok_msg: .ascii "R16 IOAPIC IRQ4 OK\n\0"
+ioapic_irq4_ok_msg: .ascii "IOAPIC IRQ4 OK\n\0"
 
 # R16-M4-005 (#599): ioapic irq4 witness failure message
 .global ioapic_irq4_fail_msg
 .align 8
-ioapic_irq4_fail_msg: .ascii "R16 IOAPIC IRQ4 FAIL\n\0"
+ioapic_irq4_fail_msg: .ascii "IOAPIC IRQ4 FAIL\n\0"
 
 # R16-M4-006 (#600): uart_rx_notify witness success message
 .global uart_rx_notify_ok_msg
 .align 8
-uart_rx_notify_ok_msg: .ascii "R16 UART RX NOTIFY OK\n\0"
+uart_rx_notify_ok_msg: .ascii "UART RX NOTIFY OK\n\0"
 
 # R16-M4-006 (#600): uart_rx_notify witness failure message
 .global uart_rx_notify_fail_msg
 .align 8
-uart_rx_notify_fail_msg: .ascii "R16 UART RX NOTIFY FAIL\n\0"
+uart_rx_notify_fail_msg: .ascii "UART RX NOTIFY FAIL\n\0"
 
 # R16-M4-007 (#601): uart_rx_smoke witness prefix (fingerprint AC)
 .global uart_rx_smoke_prefix_msg
@@ -921,87 +921,87 @@ uart_rx_smoke_prefix_msg: .ascii "UART RX: \0"
 # R16-M4-007 (#601): uart_rx_smoke witness failure message
 .global uart_rx_smoke_fail_msg
 .align 8
-uart_rx_smoke_fail_msg: .ascii "R16 UART RX SMOKE FAIL\n\0"
+uart_rx_smoke_fail_msg: .ascii "UART RX SMOKE FAIL\n\0"
 
 # R16-M5-001 (#602): tty_init witness success message
 .global tty_ok_msg
 .align 8
-tty_ok_msg: .ascii "R16 TTY VNODE OK\n\0"
+tty_ok_msg: .ascii "TTY VNODE OK\n\0"
 
 # R16-M5-001 (#602): tty_init witness failure message
 .global tty_fail_msg
 .align 8
-tty_fail_msg: .ascii "R16 TTY VNODE FAIL\n\0"
+tty_fail_msg: .ascii "TTY VNODE FAIL\n\0"
 
 # R16-M5-002 (#603): tty_vops_init witness success message
 .global tty_vops_ok_msg
 .align 8
-tty_vops_ok_msg: .ascii "R16 TTY VOPS OK\n\0"
+tty_vops_ok_msg: .ascii "TTY VOPS OK\n\0"
 
 # R16-M5-002 (#603): tty_vops_init witness failure message
 .global tty_vops_fail_msg
 .align 8
-tty_vops_fail_msg: .ascii "R16 TTY VOPS FAIL\n\0"
+tty_vops_fail_msg: .ascii "TTY VOPS FAIL\n\0"
 
 # R16-M5-003 (#604): tty_line_buffer witness success message
 .global tty_line_ok_msg
 .align 8
-tty_line_ok_msg: .ascii "R16 TTY LINE OK\n\0"
+tty_line_ok_msg: .ascii "TTY LINE OK\n\0"
 
 # R16-M5-003 (#604): tty_line_buffer witness failure message
 .global tty_line_fail_msg
 .align 8
-tty_line_fail_msg: .ascii "R16 TTY LINE FAIL\n\0"
+tty_line_fail_msg: .ascii "TTY LINE FAIL\n\0"
 
 # R16-M5-004 (#605): tty_process_input witness success message
 .global tty_input_ok_msg
 .align 8
-tty_input_ok_msg: .ascii "R16 TTY INPUT OK\n\0"
+tty_input_ok_msg: .ascii "TTY INPUT OK\n\0"
 
 # R16-M5-004 (#605): tty_process_input witness failure message
 .global tty_input_fail_msg
 .align 8
-tty_input_fail_msg: .ascii "R16 TTY INPUT FAIL\n\0"
+tty_input_fail_msg: .ascii "TTY INPUT FAIL\n\0"
 
 # R16-M5-005 (#606): tty_read witness success message
 .global tty_read_ok_msg
 .align 8
-tty_read_ok_msg: .ascii "R16 TTY READ OK\n\0"
+tty_read_ok_msg: .ascii "TTY READ OK\n\0"
 
 # R16-M5-005 (#606): tty_read witness failure message
 .global tty_read_fail_msg
 .align 8
-tty_read_fail_msg: .ascii "R16 TTY READ FAIL\n\0"
+tty_read_fail_msg: .ascii "TTY READ FAIL\n\0"
 
 # R17-M5 (#748): tty_stdin_bridge witness success message
 .global tty_stdin_bridge_ok_msg
 .align 8
-tty_stdin_bridge_ok_msg: .ascii "R17 TTY STDIN BRIDGE OK\n\0"
+tty_stdin_bridge_ok_msg: .ascii "TTY STDIN BRIDGE OK\n\0"
 
 # R17-M5 (#748): tty_stdin_bridge witness failure message
 .global tty_stdin_bridge_fail_msg
 .align 8
-tty_stdin_bridge_fail_msg: .ascii "R17 TTY STDIN BRIDGE FAIL\n\0"
+tty_stdin_bridge_fail_msg: .ascii "TTY STDIN BRIDGE FAIL\n\0"
 
 # R16-M5-006 (#607): tty_write witness success message
 .global tty_write_ok_msg
 .align 8
-tty_write_ok_msg: .ascii "R16 TTY WRITE OK\n\0"
+tty_write_ok_msg: .ascii "TTY WRITE OK\n\0"
 
 # R16-M5-006 (#607): tty_write witness failure message
 .global tty_write_fail_msg
 .align 8
-tty_write_fail_msg: .ascii "R16 TTY WRITE FAIL\n\0"
+tty_write_fail_msg: .ascii "TTY WRITE FAIL\n\0"
 
 # R16-M5-007 (#608): tty_connect_init witness success message
 .global tty_connect_ok_msg
 .align 8
-tty_connect_ok_msg: .ascii "R16 TTY CONNECT OK\n\0"
+tty_connect_ok_msg: .ascii "TTY CONNECT OK\n\0"
 
 # R16-M5-007 (#608): tty_connect_init witness failure message
 .global tty_connect_fail_msg
 .align 8
-tty_connect_fail_msg: .ascii "R16 TTY CONNECT FAIL\n\0"
+tty_connect_fail_msg: .ascii "TTY CONNECT FAIL\n\0"
 
 # R16-M5-009 (#609): tty_smoke integration witness success message
 .global tty_smoke_ok_msg
@@ -1031,12 +1031,12 @@ libc_test_fail_msg: .ascii "LIBC TEST FAIL\n\0"
 # R17-M2-005 (#620): init_bootstrap witness success message
 .global init_load_ok_msg
 .align 8
-init_load_ok_msg: .ascii "R17 INIT LOAD OK\n\0"
+init_load_ok_msg: .ascii "INIT LOAD OK\n\0"
 
 # R17-M2-005 (#620): init_bootstrap witness failure message
 .global init_load_fail_msg
 .align 8
-init_load_fail_msg: .ascii "R17 INIT LOAD FAIL\n\0"
+init_load_fail_msg: .ascii "INIT LOAD FAIL\n\0"
 
 .global tmpfs_vops_witness_name_tmp
 .align 8
@@ -1086,51 +1086,51 @@ witness_path_tmp_x: .ascii "/tmp/x\0"
 # R15-M7-001 (#562): idle-task witness success message
 .global idle_witness_ok_msg
 .align 8
-idle_witness_ok_msg: .ascii "R15 IDLE TASK OK\n\0"
+idle_witness_ok_msg: .ascii "IDLE TASK OK\n\0"
 
 # R15-M7-001 (#562): idle-task witness failure message
 .global idle_witness_fail_msg
 .align 8
-idle_witness_fail_msg: .ascii "R15 IDLE TASK FAIL\n\0"
+idle_witness_fail_msg: .ascii "IDLE TASK FAIL\n\0"
 
 # R15-M7-002 (#563): runqueue witness success message
 .global runq_witness_ok_msg
 .align 8
-runq_witness_ok_msg: .ascii "R15 RUNQUEUE OK\n\0"
+runq_witness_ok_msg: .ascii "RUNQUEUE OK\n\0"
 
 # R15-M7-002 (#563): runqueue witness failure message
 .global runq_witness_fail_msg
 .align 8
-runq_witness_fail_msg: .ascii "R15 RUNQUEUE FAIL\n\0"
+runq_witness_fail_msg: .ascii "RUNQUEUE FAIL\n\0"
 
 # R15-M7-003 (#564): sched_switch witness success message
 .global sched_switch_witness_ok_msg
 .align 8
-sched_switch_witness_ok_msg: .ascii "R15 SCHED SWITCH OK\n\0"
+sched_switch_witness_ok_msg: .ascii "SCHED SWITCH OK\n\0"
 
 # R15-M7-003 (#564): sched_switch witness failure message
 .global sched_switch_witness_fail_msg
 .align 8
-sched_switch_witness_fail_msg: .ascii "R15 SCHED SWITCH FAIL\n\0"
+sched_switch_witness_fail_msg: .ascii "SCHED SWITCH FAIL\n\0"
 
 # R15-M7-006 (#567): sched_block/sched_wake witness success message
 .global block_wake_witness_ok_msg
 .align 8
-block_wake_witness_ok_msg: .ascii "R15 BLOCK WAKE OK\n\0"
+block_wake_witness_ok_msg: .ascii "BLOCK WAKE OK\n\0"
 
 # R15-M7-006 (#567): sched_block/sched_wake witness failure message
 .global block_wake_witness_fail_msg
 .align 8
-block_wake_witness_fail_msg: .ascii "R15 BLOCK WAKE FAIL\n\0"
+block_wake_witness_fail_msg: .ascii "BLOCK WAKE FAIL\n\0"
 
 # R15-M7-566 (#566): timer-preempt witness success/failure messages
 .global preempt_witness_ok_msg
 .align 8
-preempt_witness_ok_msg: .ascii "R15 PREEMPT OK\n\0"
+preempt_witness_ok_msg: .ascii "PREEMPT OK\n\0"
 
 .global preempt_witness_fail_msg
 .align 8
-preempt_witness_fail_msg: .ascii "R15 PREEMPT FAIL\n\0"
+preempt_witness_fail_msg: .ascii "PREEMPT FAIL\n\0"
 
 # R15-M6-004 (#555): sys_execve witness — bad-ELF payload for sub-test B.
 # 64 bytes; first 4 bytes deliberately NOT \x7fELF, so elf_lite_load
@@ -1148,56 +1148,56 @@ _bad_elf_stub_end:
 # R15-M6-008 (#559): frame_meta refcount witness success message
 .global frame_meta_ok_msg
 .align 8
-frame_meta_ok_msg: .ascii "R15 FRAME META OK\n\0"
+frame_meta_ok_msg: .ascii "FRAME META OK\n\0"
 
 # R15-M6-008 (#559): frame_meta refcount witness failure message
 .global frame_meta_fail_msg
 .align 8
-frame_meta_fail_msg: .ascii "R15 FRAME META FAIL\n\0"
+frame_meta_fail_msg: .ascii "FRAME META FAIL\n\0"
 
 # R15-M6-001 (#552): aspace_clone_cow witness markers (6 rodata strings)
 .global clone_cow_empty_ok_msg
 .align 8
-clone_cow_empty_ok_msg: .ascii "R15 CLONE COW EMPTY OK\n\0"
+clone_cow_empty_ok_msg: .ascii "CLONE COW EMPTY OK\n\0"
 
 .global clone_cow_empty_fail_msg
 .align 8
-clone_cow_empty_fail_msg: .ascii "R15 CLONE COW EMPTY FAIL\n\0"
+clone_cow_empty_fail_msg: .ascii "CLONE COW EMPTY FAIL\n\0"
 
 .global clone_cow_1page_ok_msg
 .align 8
-clone_cow_1page_ok_msg: .ascii "R15 CLONE COW 1PAGE OK\n\0"
+clone_cow_1page_ok_msg: .ascii "CLONE COW 1PAGE OK\n\0"
 
 .global clone_cow_1page_fail_msg
 .align 8
-clone_cow_1page_fail_msg: .ascii "R15 CLONE COW 1PAGE FAIL\n\0"
+clone_cow_1page_fail_msg: .ascii "CLONE COW 1PAGE FAIL\n\0"
 
 .global clone_cow_multi_ok_msg
 .align 8
-clone_cow_multi_ok_msg: .ascii "R15 CLONE COW MULTI OK\n\0"
+clone_cow_multi_ok_msg: .ascii "CLONE COW MULTI OK\n\0"
 
 .global clone_cow_multi_fail_msg
 .align 8
-clone_cow_multi_fail_msg: .ascii "R15 CLONE COW MULTI FAIL\n\0"
+clone_cow_multi_fail_msg: .ascii "CLONE COW MULTI FAIL\n\0"
 
 # R16-M0-D11a: aspace_teardown leak-plug witness messages.
 .global aspace_teardown_ok_msg
 .align 8
-aspace_teardown_ok_msg: .ascii "R16 M0 D11A TEARDOWN OK\n\0"
+aspace_teardown_ok_msg: .ascii "M0 D11A TEARDOWN OK\n\0"
 
 .global aspace_teardown_fail_msg
 .align 8
-aspace_teardown_fail_msg: .ascii "R16 M0 D11A TEARDOWN FAIL\n\0"
+aspace_teardown_fail_msg: .ascii "M0 D11A TEARDOWN FAIL\n\0"
 
 
 # R15-M4-007 (#541): user_ptr_ok witness messages
 .global user_ptr_ok_msg
 .align 8
-user_ptr_ok_msg: .ascii "R15 USER PTR OK\n\0"
+user_ptr_ok_msg: .ascii "USER PTR OK\n\0"
 
 .global user_ptr_fail_msg
 .align 8
-user_ptr_fail_msg: .ascii "R15 USER PTR FAIL\n\0"
+user_ptr_fail_msg: .ascii "USER PTR FAIL\n\0"
 
 # M0-001 (#681): u64_to_hex and u64_to_dec leaf helpers witness messages
 .global logp_hex_ok_msg
@@ -1313,11 +1313,11 @@ k_line: .ascii "line\0"
 # substrate foundation. See design/ipc/userspace-server-substrate.md §3.1.
 .global endpoint_cap_ok_msg
 .align 8
-endpoint_cap_ok_msg: .ascii "R20b ENDPOINT CAP OK\n\0"
+endpoint_cap_ok_msg: .ascii "ENDPOINT CAP OK\n\0"
 
 .global endpoint_cap_fail_msg
 .align 8
-endpoint_cap_fail_msg: .ascii "R20b ENDPOINT CAP FAIL\n\0"
+endpoint_cap_fail_msg: .ascii "ENDPOINT CAP FAIL\n\0"
 
 
 # R29.M0-001 (#1017): KIND_HW base-kind witness fingerprints — promotes
@@ -1334,11 +1334,11 @@ endpoint_cap_fail_msg: .ascii "R20b ENDPOINT CAP FAIL\n\0"
 #   - design/roadmap/next-wave-synthesis.md §10 D6
 .global kind_hw_ok_msg
 .align 8
-kind_hw_ok_msg: .ascii "R29 KIND_HW OK\n\0"
+kind_hw_ok_msg: .ascii "KIND_HW OK\n\0"
 
 .global kind_hw_fail_msg
 .align 8
-kind_hw_fail_msg: .ascii "R29 KIND_HW FAIL\n\0"
+kind_hw_fail_msg: .ascii "KIND_HW FAIL\n\0"
 
 
 # R29.M1-001..003 (#1019/#1020/#1021): KIND_HW_INTERRUPT derived-kind
@@ -1352,11 +1352,11 @@ kind_hw_fail_msg: .ascii "R29 KIND_HW FAIL\n\0"
 #   - design/roadmap/next-wave-softarch.md §3 R29 (tail spec)
 .global kind_hw_int_ok_msg
 .align 8
-kind_hw_int_ok_msg: .ascii "R29 KIND_INTERRUPT OK\n\0"
+kind_hw_int_ok_msg: .ascii "KIND_INTERRUPT OK\n\0"
 
 .global kind_hw_int_fail_msg
 .align 8
-kind_hw_int_fail_msg: .ascii "R29 KIND_INTERRUPT FAIL\n\0"
+kind_hw_int_fail_msg: .ascii "KIND_INTERRUPT FAIL\n\0"
 
 
 # R29.M1-004 (#1022): KIND_HW_MSIX_VECTOR derived-kind witness
@@ -1374,11 +1374,11 @@ kind_hw_int_fail_msg: .ascii "R29 KIND_INTERRUPT FAIL\n\0"
 #   - design/architecture/next-wave-derived-kinds.md §KIND_HW_MSIX_VECTOR
 .global kind_hw_msix_ok_msg
 .align 8
-kind_hw_msix_ok_msg: .ascii "R29 KIND_MSIX_VECTOR OK\n\0"
+kind_hw_msix_ok_msg: .ascii "KIND_MSIX_VECTOR OK\n\0"
 
 .global kind_hw_msix_fail_msg
 .align 8
-kind_hw_msix_fail_msg: .ascii "R29 KIND_MSIX_VECTOR FAIL\n\0"
+kind_hw_msix_fail_msg: .ascii "KIND_MSIX_VECTOR FAIL\n\0"
 
 
 # R29.M5-001 (#1036) + R29.M5-002 (#1037): KIND_DMA_DOMAIN derived-kind
@@ -1400,11 +1400,11 @@ kind_hw_msix_fail_msg: .ascii "R29 KIND_MSIX_VECTOR FAIL\n\0"
 #   - design/architecture/next-wave-derived-kinds.md §KIND_DMA_DOMAIN
 .global kind_dma_domain_ok_msg
 .align 8
-kind_dma_domain_ok_msg: .ascii "R29 KIND_DMA_DOMAIN OK\n\0"
+kind_dma_domain_ok_msg: .ascii "KIND_DMA_DOMAIN OK\n\0"
 
 .global kind_dma_domain_fail_msg
 .align 8
-kind_dma_domain_fail_msg: .ascii "R29 KIND_DMA_DOMAIN FAIL\n\0"
+kind_dma_domain_fail_msg: .ascii "KIND_DMA_DOMAIN FAIL\n\0"
 
 
 # R30.M3-001 (#1061): KIND_OP_REGION witness fingerprints — the address-
@@ -1422,11 +1422,11 @@ kind_dma_domain_fail_msg: .ascii "R29 KIND_DMA_DOMAIN FAIL\n\0"
 #   - design/architecture/next-wave-derived-kinds.md §KIND_OP_REGION
 .global kind_op_region_ok_msg
 .align 8
-kind_op_region_ok_msg: .ascii "R30 KIND_OP_REGION OK\n\0"
+kind_op_region_ok_msg: .ascii "KIND_OP_REGION OK\n\0"
 
 .global kind_op_region_fail_msg
 .align 8
-kind_op_region_fail_msg: .ascii "R30 KIND_OP_REGION FAIL\n\0"
+kind_op_region_fail_msg: .ascii "KIND_OP_REGION FAIL\n\0"
 
 
 # R29.M2-001 (#1023): driver lifecycle FSM witness fingerprints — opens
@@ -1463,20 +1463,20 @@ kind_op_region_fail_msg: .ascii "R30 KIND_OP_REGION FAIL\n\0"
 #   - design/drivers/blob-policy.md §2.5 / §2.6
 .global dma_domain_switch_ok_msg
 .align 8
-dma_domain_switch_ok_msg: .ascii "R29 DMA DOMAIN SWITCH OK\n\0"
+dma_domain_switch_ok_msg: .ascii "DMA DOMAIN SWITCH OK\n\0"
 
 .global dma_domain_switch_fail_msg
 .align 8
-dma_domain_switch_fail_msg: .ascii "R29 DMA DOMAIN SWITCH FAIL\n\0"
+dma_domain_switch_fail_msg: .ascii "DMA DOMAIN SWITCH FAIL\n\0"
 
 
 .global driver_lifecycle_ok_msg
 .align 8
-driver_lifecycle_ok_msg: .ascii "R29 LIFECYCLE FSM OK\n\0"
+driver_lifecycle_ok_msg: .ascii "LIFECYCLE FSM OK\n\0"
 
 .global driver_lifecycle_fail_msg
 .align 8
-driver_lifecycle_fail_msg: .ascii "R29 LIFECYCLE FSM FAIL\n\0"
+driver_lifecycle_fail_msg: .ascii "LIFECYCLE FSM FAIL\n\0"
 
 
 # R29.M2-004 (#1026): driver lifecycle FSM fuzz witness fingerprints.
@@ -1495,11 +1495,11 @@ driver_lifecycle_fail_msg: .ascii "R29 LIFECYCLE FSM FAIL\n\0"
 #   - design/ipc/driver-lifecycle-schema.md §6 (kernel-side coupling)
 .global driver_lifecycle_fuzz_ok_msg
 .align 8
-driver_lifecycle_fuzz_ok_msg: .ascii "R29 LIFECYCLE FUZZ OK\n\0"
+driver_lifecycle_fuzz_ok_msg: .ascii "LIFECYCLE FUZZ OK\n\0"
 
 .global driver_lifecycle_fuzz_fail_msg
 .align 8
-driver_lifecycle_fuzz_fail_msg: .ascii "R29 LIFECYCLE FUZZ FAIL\n\0"
+driver_lifecycle_fuzz_fail_msg: .ascii "LIFECYCLE FUZZ FAIL\n\0"
 
 
 # R29.M3-001 (#1028) + R29.M3-002 (#1029): driver registry v2 witness —
@@ -1539,11 +1539,11 @@ registry_shadow_name: .ascii "drivers.pdxreg.new\0"
 
 .global registry_v2_ok_msg
 .align 8
-registry_v2_ok_msg: .ascii "R29 REGISTRY V2 OK\n\0"
+registry_v2_ok_msg: .ascii "REGISTRY V2 OK\n\0"
 
 .global registry_v2_fail_msg
 .align 8
-registry_v2_fail_msg: .ascii "R29 REGISTRY V2 FAIL\n\0"
+registry_v2_fail_msg: .ascii "REGISTRY V2 FAIL\n\0"
 
 
 # R29.M3-003 (#1030) + R29.M3-004 (#1031): registry lookup / hot-reload /
@@ -1567,11 +1567,11 @@ registry_v2_fail_msg: .ascii "R29 REGISTRY V2 FAIL\n\0"
 #   - src/kernel/boot/kernel_main.pdx §registry_lookup_witness
 .global registry_lookup_ok_msg
 .align 8
-registry_lookup_ok_msg: .ascii "R29 REGISTRY LOOKUP OK\n\0"
+registry_lookup_ok_msg: .ascii "REGISTRY LOOKUP OK\n\0"
 
 .global registry_lookup_fail_msg
 .align 8
-registry_lookup_fail_msg: .ascii "R29 REGISTRY LOOKUP FAIL\n\0"
+registry_lookup_fail_msg: .ascii "REGISTRY LOOKUP FAIL\n\0"
 
 
 # R29.M4-001/002 (#1032/#1033): pinned keyring + driver-artifact
@@ -1595,11 +1595,11 @@ registry_lookup_fail_msg: .ascii "R29 REGISTRY LOOKUP FAIL\n\0"
 #   - src/kernel/boot/kernel_main.pdx §sig_keyring_witness
 .global sig_keyring_ok_msg
 .align 8
-sig_keyring_ok_msg: .ascii "R29 SIG KEYRING OK\n\0"
+sig_keyring_ok_msg: .ascii "SIG KEYRING OK\n\0"
 
 .global sig_keyring_fail_msg
 .align 8
-sig_keyring_fail_msg: .ascii "R29 SIG KEYRING FAIL\n\0"
+sig_keyring_fail_msg: .ascii "SIG KEYRING FAIL\n\0"
 
 
 # R29.M4-003/004 (#1034/#1035): blob-driver DUAL-SIGNATURE enforcement
@@ -1634,11 +1634,11 @@ sig_keyring_fail_msg: .ascii "R29 SIG KEYRING FAIL\n\0"
 #   - src/kernel/boot/kernel_main.pdx §blob_dualsig_witness
 .global blob_dualsig_ok_msg
 .align 8
-blob_dualsig_ok_msg: .ascii "R29 BLOB DUALSIG OK\n\0"
+blob_dualsig_ok_msg: .ascii "BLOB DUALSIG OK\n\0"
 
 .global blob_dualsig_fail_msg
 .align 8
-blob_dualsig_fail_msg: .ascii "R29 BLOB DUALSIG FAIL\n\0"
+blob_dualsig_fail_msg: .ascii "BLOB DUALSIG FAIL\n\0"
 
 
 # R29.M6-001..004 (#1040/#1041/#1042/#1043): driver_audit_channel —
@@ -1665,11 +1665,11 @@ blob_dualsig_fail_msg: .ascii "R29 BLOB DUALSIG FAIL\n\0"
 #   - src/kernel/boot/kernel_main.pdx §drv_audit_witness
 .global drv_audit_ok_msg
 .align 8
-drv_audit_ok_msg: .ascii "R29 DRIVER AUDIT OK\n\0"
+drv_audit_ok_msg: .ascii "DRIVER AUDIT OK\n\0"
 
 .global drv_audit_fail_msg
 .align 8
-drv_audit_fail_msg: .ascii "R29 DRIVER AUDIT FAIL\n\0"
+drv_audit_fail_msg: .ascii "DRIVER AUDIT FAIL\n\0"
 
 
 # R29.M7-001/004/005 (#1044/#1047/#1048): cascade-restart witness
@@ -1685,11 +1685,11 @@ drv_audit_fail_msg: .ascii "R29 DRIVER AUDIT FAIL\n\0"
 #   - src/kernel/boot/kernel_main.pdx §r29_cascade_restart_witness
 .global r29_restart_ok_msg
 .align 8
-r29_restart_ok_msg: .ascii "R29 CASCADE RESTART OK\n\0"
+r29_restart_ok_msg: .ascii "CASCADE RESTART OK\n\0"
 
 .global r29_restart_fail_msg
 .align 8
-r29_restart_fail_msg: .ascii "R29 CASCADE RESTART FAIL\n\0"
+r29_restart_fail_msg: .ascii "CASCADE RESTART FAIL\n\0"
 
 .global r29_restart_wit_name
 .align 8
@@ -1712,11 +1712,11 @@ r29_restart_wit_name: .ascii "restart-witness\0"
 #   - src/kernel/boot/kernel_main.pdx §r29_chaos_witness
 .global r29_chaos_ok_msg
 .align 8
-r29_chaos_ok_msg: .ascii "R29 CHAOS OK\n\0"
+r29_chaos_ok_msg: .ascii "CHAOS OK\n\0"
 
 .global r29_chaos_fail_msg
 .align 8
-r29_chaos_fail_msg: .ascii "R29 CHAOS FAIL\n\0"
+r29_chaos_fail_msg: .ascii "CHAOS FAIL\n\0"
 
 .global r29_chaos_k_role
 .align 8
@@ -1738,11 +1738,11 @@ r29_chaos_k_phase: .ascii "phase\0"
 # src/kernel/core/ipc/payload_arena.pdx.
 .global endpoint_alloc_ok_msg
 .align 8
-endpoint_alloc_ok_msg: .ascii "R20b ENDPOINT ALLOC OK\n\0"
+endpoint_alloc_ok_msg: .ascii "ENDPOINT ALLOC OK\n\0"
 
 .global endpoint_alloc_fail_msg
 .align 8
-endpoint_alloc_fail_msg: .ascii "R20b ENDPOINT ALLOC FAIL\n\0"
+endpoint_alloc_fail_msg: .ascii "ENDPOINT ALLOC FAIL\n\0"
 
 
 # R20b.M1-003 (#1554): svc_broker table + register/lookup witness
@@ -1752,11 +1752,11 @@ endpoint_alloc_fail_msg: .ascii "R20b ENDPOINT ALLOC FAIL\n\0"
 # src/kernel/core/ipc/svc_broker.pdx.
 .global broker_ok_msg
 .align 8
-broker_ok_msg: .ascii "R20b BROKER OK\n\0"
+broker_ok_msg: .ascii "BROKER OK\n\0"
 
 .global broker_fail_msg
 .align 8
-broker_fail_msg: .ascii "R20b BROKER FAIL\n\0"
+broker_fail_msg: .ascii "BROKER FAIL\n\0"
 
 
 # R20b.M2-001 (#1555): 8-byte frame header + frame_encode/frame_decode
@@ -1768,11 +1768,11 @@ broker_fail_msg: .ascii "R20b BROKER FAIL\n\0"
 # buf-not-modified property. See src/kernel/core/ipc/frame.pdx.
 .global frame_hdr_ok_msg
 .align 8
-frame_hdr_ok_msg: .ascii "R20b FRAME HDR OK\n\0"
+frame_hdr_ok_msg: .ascii "FRAME HDR OK\n\0"
 
 .global frame_hdr_fail_msg
 .align 8
-frame_hdr_fail_msg: .ascii "R20b FRAME HDR FAIL\n\0"
+frame_hdr_fail_msg: .ascii "FRAME HDR FAIL\n\0"
 
 
 # R20b.M2-002 (#1556): pending-msg primitives witness fingerprints —
@@ -1783,11 +1783,11 @@ frame_hdr_fail_msg: .ascii "R20b FRAME HDR FAIL\n\0"
 # See src/kernel/core/ipc/endpoint_table.pdx (M2-002 helpers).
 .global pending_msg_ok_msg
 .align 8
-pending_msg_ok_msg: .ascii "R20b PENDING MSG OK\n\0"
+pending_msg_ok_msg: .ascii "PENDING MSG OK\n\0"
 
 .global pending_msg_fail_msg
 .align 8
-pending_msg_fail_msg: .ascii "R20b PENDING MSG FAIL\n\0"
+pending_msg_fail_msg: .ascii "PENDING MSG FAIL\n\0"
 
 
 # R20b.M2-003 (#1557): KPTI-safe user<->kernel payload bounce witness
@@ -1799,11 +1799,11 @@ pending_msg_fail_msg: .ascii "R20b PENDING MSG FAIL\n\0"
 # See src/kernel/core/ipc/user_bounce.pdx.
 .global ipc_bounce_ok_msg
 .align 8
-ipc_bounce_ok_msg: .ascii "R20b IPC BOUNCE OK\n\0"
+ipc_bounce_ok_msg: .ascii "IPC BOUNCE OK\n\0"
 
 .global ipc_bounce_fail_msg
 .align 8
-ipc_bounce_fail_msg: .ascii "R20b IPC BOUNCE FAIL\n\0"
+ipc_bounce_fail_msg: .ascii "IPC BOUNCE FAIL\n\0"
 
 
 # R20b.M3-001 (#1558): sys_ipc_recv syscall witness fingerprints — first
@@ -1815,11 +1815,11 @@ ipc_bounce_fail_msg: .ascii "R20b IPC BOUNCE FAIL\n\0"
 # src/kernel/core/syscall/dispatch.pdx (sysno 40 dispatch shim).
 .global sys_ipc_recv_ok_msg
 .align 8
-sys_ipc_recv_ok_msg: .ascii "R20b SYS IPC RECV OK\n\0"
+sys_ipc_recv_ok_msg: .ascii "SYS IPC RECV OK\n\0"
 
 .global sys_ipc_recv_fail_msg
 .align 8
-sys_ipc_recv_fail_msg: .ascii "R20b SYS IPC RECV FAIL\n\0"
+sys_ipc_recv_fail_msg: .ascii "SYS IPC RECV FAIL\n\0"
 
 
 # R20b.M3-002 (#1559): sys_ipc_send / sys_ipc_reply syscall witness
@@ -1833,11 +1833,11 @@ sys_ipc_recv_fail_msg: .ascii "R20b SYS IPC RECV FAIL\n\0"
 # src/kernel/core/syscall/dispatch.pdx (sysno 41/42 dispatch shims).
 .global sys_ipc_send_ok_msg
 .align 8
-sys_ipc_send_ok_msg: .ascii "R20b SYS IPC SEND OK\n\0"
+sys_ipc_send_ok_msg: .ascii "SYS IPC SEND OK\n\0"
 
 .global sys_ipc_send_fail_msg
 .align 8
-sys_ipc_send_fail_msg: .ascii "R20b SYS IPC SEND FAIL\n\0"
+sys_ipc_send_fail_msg: .ascii "SYS IPC SEND FAIL\n\0"
 
 
 # R20b.M3-003 (#1560): sys_svc_lookup syscall witness fingerprints — fourth
@@ -1850,11 +1850,11 @@ sys_ipc_send_fail_msg: .ascii "R20b SYS IPC SEND FAIL\n\0"
 # and src/kernel/core/syscall/dispatch.pdx (sysno 43 dispatch shim).
 .global sys_svc_lookup_ok_msg
 .align 8
-sys_svc_lookup_ok_msg: .ascii "R20b SVC LOOKUP OK\n\0"
+sys_svc_lookup_ok_msg: .ascii "SVC LOOKUP OK\n\0"
 
 .global sys_svc_lookup_fail_msg
 .align 8
-sys_svc_lookup_fail_msg: .ascii "R20b SVC LOOKUP FAIL\n\0"
+sys_svc_lookup_fail_msg: .ascii "SVC LOOKUP FAIL\n\0"
 
 
 # R20b.M6-002 (#1565): dispatch cap_slot lookup witness fingerprints —
@@ -1866,11 +1866,11 @@ sys_svc_lookup_fail_msg: .ascii "R20b SVC LOOKUP FAIL\n\0"
 # kind / insufficient-rights slots.
 .global sys_ipc_cap_slot_ok_msg
 .align 8
-sys_ipc_cap_slot_ok_msg: .ascii "R20b IPC CAP SLOT OK\n\0"
+sys_ipc_cap_slot_ok_msg: .ascii "IPC CAP SLOT OK\n\0"
 
 .global sys_ipc_cap_slot_fail_msg
 .align 8
-sys_ipc_cap_slot_fail_msg: .ascii "R20b IPC CAP SLOT FAIL\n\0"
+sys_ipc_cap_slot_fail_msg: .ascii "IPC CAP SLOT FAIL\n\0"
 
 
 # R20b.M4-001 (#1561): InitCap sidecar format + validator witness fingerprints
@@ -1883,11 +1883,11 @@ sys_ipc_cap_slot_fail_msg: .ascii "R20b IPC CAP SLOT FAIL\n\0"
 # design/loader/init-caps-sidecar.md §§1..4.
 .global init_caps_ok_msg
 .align 8
-init_caps_ok_msg: .ascii "R20b INIT CAPS FMT OK\n\0"
+init_caps_ok_msg: .ascii "INIT CAPS FMT OK\n\0"
 
 .global init_caps_fail_msg
 .align 8
-init_caps_fail_msg: .ascii "R20b INIT CAPS FMT FAIL\n\0"
+init_caps_fail_msg: .ascii "INIT CAPS FMT FAIL\n\0"
 
 
 # R20b.M4-002 (#1562): loader_seed_caps hook witness fingerprints — closes
@@ -1903,11 +1903,11 @@ init_caps_fail_msg: .ascii "R20b INIT CAPS FMT FAIL\n\0"
 # §6.2 for the hook signature.
 .global loader_seed_ok_msg
 .align 8
-loader_seed_ok_msg: .ascii "R20b LOADER SEED OK\n\0"
+loader_seed_ok_msg: .ascii "LOADER SEED OK\n\0"
 
 .global loader_seed_fail_msg
 .align 8
-loader_seed_fail_msg: .ascii "R20b LOADER SEED FAIL\n\0"
+loader_seed_fail_msg: .ascii "LOADER SEED FAIL\n\0"
 
 
 # R20b.M6-001 (#1564): loader phase-2 ELF-symbol walker witness fingerprints
@@ -1924,11 +1924,11 @@ loader_seed_fail_msg: .ascii "R20b LOADER SEED FAIL\n\0"
 # design/loader/init-caps-sidecar.md §5 for the phase-1 -> phase-2 contract.
 .global loader_symtab_seed_ok_msg
 .align 8
-loader_symtab_seed_ok_msg: .ascii "R20b LOADER SYMTAB SEED OK\n\0"
+loader_symtab_seed_ok_msg: .ascii "LOADER SYMTAB SEED OK\n\0"
 
 .global loader_symtab_seed_fail_msg
 .align 8
-loader_symtab_seed_fail_msg: .ascii "R20b LOADER SYMTAB SEED FAIL\n\0"
+loader_symtab_seed_fail_msg: .ascii "LOADER SYMTAB SEED FAIL\n\0"
 
 
 # R20b.M5-001 (#1563): echo-server closure witness fingerprints — closes
@@ -1951,11 +1951,11 @@ loader_symtab_seed_fail_msg: .ascii "R20b LOADER SYMTAB SEED FAIL\n\0"
 # design/ipc/userspace-server-substrate.md §7.
 .global echo_roundtrip_ok_msg
 .align 8
-echo_roundtrip_ok_msg: .ascii "R20b ECHO ROUNDTRIP OK\n\0"
+echo_roundtrip_ok_msg: .ascii "ECHO ROUNDTRIP OK\n\0"
 
 .global echo_roundtrip_fail_msg
 .align 8
-echo_roundtrip_fail_msg: .ascii "R20b ECHO ROUNDTRIP FAIL\n\0"
+echo_roundtrip_fail_msg: .ascii "ECHO ROUNDTRIP FAIL\n\0"
 
 # R20b.M6-003 (#1566): dual-endpoint RPC roundtrip witness fingerprints —
 # closes R20b.M6 (substrate hardening; unblocks #820 acpi_supervisor +
@@ -1976,11 +1976,11 @@ echo_roundtrip_fail_msg: .ascii "R20b ECHO ROUNDTRIP FAIL\n\0"
 # §4.4 "Deferred" paragraph.
 .global rpc_roundtrip_ok_msg
 .align 8
-rpc_roundtrip_ok_msg: .ascii "R20b RPC ROUNDTRIP OK\n\0"
+rpc_roundtrip_ok_msg: .ascii "RPC ROUNDTRIP OK\n\0"
 
 .global rpc_roundtrip_fail_msg
 .align 8
-rpc_roundtrip_fail_msg: .ascii "R20b RPC ROUNDTRIP FAIL\n\0"
+rpc_roundtrip_fail_msg: .ascii "RPC ROUNDTRIP FAIL\n\0"
 
 # R20-M4-002 (#820): ACPI supervisor RPC witness fingerprints.
 # Closes #820 (userspace acpi_supervisor server — accepts KIND_ACPI +
@@ -1994,15 +1994,15 @@ rpc_roundtrip_fail_msg: .ascii "R20b RPC ROUNDTRIP FAIL\n\0"
 # src/user/acpi_supervisor.pdx exists as the target shape but the
 # spawn wires up post-R20b per §4.4 Deferred).
 #
-# Success marker: "R20b ACPI RPC OK\n" — asserted by boot_r20b_acpi_rpc.
-# Failure marker: "R20b ACPI RPC FAIL\n" + line=<stage> KV.
+# Success marker: "ACPI RPC OK\n" — asserted by boot_r20b_acpi_rpc.
+# Failure marker: "ACPI RPC FAIL\n" + line=<stage> KV.
 .global acpi_rpc_ok_msg
 .align 8
-acpi_rpc_ok_msg: .ascii "R20b ACPI RPC OK\n\0"
+acpi_rpc_ok_msg: .ascii "ACPI RPC OK\n\0"
 
 .global acpi_rpc_fail_msg
 .align 8
-acpi_rpc_fail_msg: .ascii "R20b ACPI RPC FAIL\n\0"
+acpi_rpc_fail_msg: .ascii "ACPI RPC FAIL\n\0"
 
 # R22-M3-005 (#860): PCI enumerator RPC witness fingerprints.
 # Closes #860 (userspace pci_enumerator server — walks tree via
@@ -2015,15 +2015,15 @@ acpi_rpc_fail_msg: .ascii "R20b ACPI RPC FAIL\n\0"
 # userspace binary at src/user/pci_enumerator.pdx exists as the target
 # shape but the spawn wires up post-R22 per §4.4 Deferred).
 #
-# Success marker: "R20b PCI RPC OK\n" — asserted by boot_r20b_pci_rpc.
-# Failure marker: "R20b PCI RPC FAIL\n" + line=<stage> KV.
+# Success marker: "PCI RPC OK\n" — asserted by boot_r20b_pci_rpc.
+# Failure marker: "PCI RPC FAIL\n" + line=<stage> KV.
 .global pci_rpc_ok_msg
 .align 8
-pci_rpc_ok_msg: .ascii "R20b PCI RPC OK\n\0"
+pci_rpc_ok_msg: .ascii "PCI RPC OK\n\0"
 
 .global pci_rpc_fail_msg
 .align 8
-pci_rpc_fail_msg: .ascii "R20b PCI RPC FAIL\n\0"
+pci_rpc_fail_msg: .ascii "PCI RPC FAIL\n\0"
 
 # svc.<name> string for the R20b.M5-001 (#1563) echo witness — used both
 # as the broker key (svc_register 3rd-arg scan at kernel VA) AND as the
@@ -2096,11 +2096,11 @@ pdpt: .skip 4096
 #   - src/kernel/core/acpi/sci_route.pdx (SCI_INT -> RTE)
 .global gpe_dispatch_ok_msg
 .section .rodata
-gpe_dispatch_ok_msg: .ascii "R30 GPE DISPATCH OK\n\0"
+gpe_dispatch_ok_msg: .ascii "GPE DISPATCH OK\n\0"
 
 .global gpe_dispatch_fail_msg
 .section .rodata
-gpe_dispatch_fail_msg: .ascii "R30 GPE DISPATCH FAIL\n\0"
+gpe_dispatch_fail_msg: .ascii "GPE DISPATCH FAIL\n\0"
 
 # ---------------------------------------------------------------------------
 # R30.M4-003 (#1068) / R30.M4-004 (#1069): ACPI event stream + routing
@@ -2120,11 +2120,11 @@ gpe_dispatch_fail_msg: .ascii "R30 GPE DISPATCH FAIL\n\0"
 #   - src/kernel/core/acpi/sci_arm.pdx        (readiness-gated unmask)
 .global evt_route_ok_msg
 .section .rodata
-evt_route_ok_msg: .ascii "R30 ACPI EVENT ROUTE OK\n\0"
+evt_route_ok_msg: .ascii "ACPI EVENT ROUTE OK\n\0"
 
 .global evt_route_fail_msg
 .section .rodata
-evt_route_fail_msg: .ascii "R30 ACPI EVENT ROUTE FAIL\n\0"
+evt_route_fail_msg: .ascii "ACPI EVENT ROUTE FAIL\n\0"
 
 
 # R30.M5-001 (#1070) / R30.M5-002 (#1071): I²C capability-pair witness
@@ -2146,11 +2146,11 @@ evt_route_fail_msg: .ascii "R30 ACPI EVENT ROUTE FAIL\n\0"
 #   - design/architecture/next-wave-derived-kinds.md §KIND_I2C_BUS
 .global kind_i2c_ok_msg
 .align 8
-kind_i2c_ok_msg: .ascii "R30 KIND_I2C OK\n\0"
+kind_i2c_ok_msg: .ascii "KIND_I2C OK\n\0"
 
 .global kind_i2c_fail_msg
 .align 8
-kind_i2c_fail_msg: .ascii "R30 KIND_I2C FAIL\n\0"
+kind_i2c_fail_msg: .ascii "KIND_I2C FAIL\n\0"
 
 # ---------------------------------------------------------------------------
 # R30.M5-003 (#1072) / R30.M5-004 (#1073): LPSS I²C controller + transfer
@@ -2185,11 +2185,11 @@ kind_i2c_fail_msg: .ascii "R30 KIND_I2C FAIL\n\0"
 #   - design/drivers/i2c-transfer-schema.md
 .global lpss_i2c_ok_msg
 .align 8
-lpss_i2c_ok_msg: .ascii "R30 LPSS I2C OK\n\0"
+lpss_i2c_ok_msg: .ascii "LPSS I2C OK\n\0"
 
 .global lpss_i2c_fail_msg
 .align 8
-lpss_i2c_fail_msg: .ascii "R30 LPSS I2C FAIL\n\0"
+lpss_i2c_fail_msg: .ascii "LPSS I2C FAIL\n\0"
 
 # ---------------------------------------------------------------------------
 # R30.M5-005 (#1074): interrupt-driven transfer engine marker.
@@ -2228,7 +2228,7 @@ lpss_i2c_fail_msg: .ascii "R30 LPSS I2C FAIL\n\0"
 #   - design/drivers/lpss-i2c-controller.md
 .global lpss_i2c_irq_ok_msg
 .align 8
-lpss_i2c_irq_ok_msg: .ascii "R30 LPSS I2C IRQ OK\n\0"
+lpss_i2c_irq_ok_msg: .ascii "LPSS I2C IRQ OK\n\0"
 
 # ---------------------------------------------------------------------------
 # R30.M6-001 (#1075) / R30.M6-002 (#1076): pad-controller witness markers.
@@ -2282,19 +2282,19 @@ lpss_i2c_irq_ok_msg: .ascii "R30 LPSS I2C IRQ OK\n\0"
 #   - design/architecture/next-wave-derived-kinds.md §KIND_GPIO_LINE
 .global lpss_gpio_ok_msg
 .align 8
-lpss_gpio_ok_msg: .ascii "R30 LPSS GPIO OK\n\0"
+lpss_gpio_ok_msg: .ascii "LPSS GPIO OK\n\0"
 
 .global lpss_gpio_fail_msg
 .align 8
-lpss_gpio_fail_msg: .ascii "R30 LPSS GPIO FAIL\n\0"
+lpss_gpio_fail_msg: .ascii "LPSS GPIO FAIL\n\0"
 
 .global kind_gpio_ok_msg
 .align 8
-kind_gpio_ok_msg: .ascii "R30 KIND_GPIO OK\n\0"
+kind_gpio_ok_msg: .ascii "KIND_GPIO OK\n\0"
 
 .global kind_gpio_fail_msg
 .align 8
-kind_gpio_fail_msg: .ascii "R30 KIND_GPIO FAIL\n\0"
+kind_gpio_fail_msg: .ascii "KIND_GPIO FAIL\n\0"
 
 #   R31 DEATH CASCADE OK — emitted by
 #       tests/kernel/driver/death_witness.pdx §death_witness,
@@ -2325,11 +2325,11 @@ kind_gpio_fail_msg: .ascii "R30 KIND_GPIO FAIL\n\0"
 #           once.
 .global death_witness_ok_msg
 .align 8
-death_witness_ok_msg: .ascii "R31 DEATH CASCADE OK\n\0"
+death_witness_ok_msg: .ascii "DEATH CASCADE OK\n\0"
 
 .global death_witness_fail_msg
 .align 8
-death_witness_fail_msg: .ascii "R31 DEATH CASCADE FAIL\n\0"
+death_witness_fail_msg: .ascii "DEATH CASCADE FAIL\n\0"
 
 #   R31 OWNER SWEEP OK — emitted by
 #       tests/kernel/cap/owner_sweep_synth.pdx §owner_sweep_witness,
@@ -2370,11 +2370,11 @@ death_witness_fail_msg: .ascii "R31 DEATH CASCADE FAIL\n\0"
 #           worse than the leak being fixed.
 .global owner_sweep_ok_msg
 .align 8
-owner_sweep_ok_msg: .ascii "R31 OWNER SWEEP OK\n\0"
+owner_sweep_ok_msg: .ascii "OWNER SWEEP OK\n\0"
 
 .global owner_sweep_fail_msg
 .align 8
-owner_sweep_fail_msg: .ascii "R31 OWNER SWEEP FAIL\n\0"
+owner_sweep_fail_msg: .ascii "OWNER SWEEP FAIL\n\0"
 
 #   R31 TASK POOL BOUNDS OK — emitted by
 #       tests/kernel/sched/task_pool_bounds.pdx §task_pool_bounds_witness,
@@ -2402,11 +2402,11 @@ owner_sweep_fail_msg: .ascii "R31 OWNER SWEEP FAIL\n\0"
 #           restores exactly the entries it forced.
 .global task_pool_bounds_ok_msg
 .align 8
-task_pool_bounds_ok_msg: .ascii "R31 TASK POOL BOUNDS OK\n\0"
+task_pool_bounds_ok_msg: .ascii "TASK POOL BOUNDS OK\n\0"
 
 .global task_pool_bounds_fail_msg
 .align 8
-task_pool_bounds_fail_msg: .ascii "R31 TASK POOL BOUNDS FAIL\n\0"
+task_pool_bounds_fail_msg: .ascii "TASK POOL BOUNDS FAIL\n\0"
 
 #   R30 GPIO PAD OK   — emitted by
 #       tests/kernel/drivers/gpio/gpio_pad_synth.pdx §gpio_pad_witness,
@@ -2432,8 +2432,8 @@ task_pool_bounds_fail_msg: .ascii "R31 TASK POOL BOUNDS FAIL\n\0"
 #           a fight on a net something else is driving.
 .global gpio_pad_ok_msg
 .align 8
-gpio_pad_ok_msg: .ascii "R30 GPIO PAD OK\n\0"
+gpio_pad_ok_msg: .ascii "GPIO PAD OK\n\0"
 
 .global gpio_pad_fail_msg
 .align 8
-gpio_pad_fail_msg: .ascii "R30 GPIO PAD FAIL\n\0"
+gpio_pad_fail_msg: .ascii "GPIO PAD FAIL\n\0"
