@@ -1,0 +1,478 @@
+// src/kernel/core/cap/nvme_io_queues.pdx -- R51.M3-001 (#1645).
+//
+// Per-controller / per-CPU NVMe I/O queue-pair substrate.  This file is
+// NOT a KIND cap: it carries no KIND tag of its own.  I/O pairs are
+// shared infrastructure consulted by KIND_NVME_CONTROLLER (0x198, which
+// owns the admin queue and triggers bring-up) and by the KIND_BLKDEV /
+// KIND_NVME_NAMESPACE dispatch route (which submits READ/WRITE).  See
+// design/hardware/nvme-io-queues.md §1 for the file-split rationale.
+//
+// R51.M3-001 (this commit) lands the skeleton: the per-controller/
+// per-CPU pair table, its row accessors, and the MSI-X vector batch
+// allocator/revoker (§3.1, §4).  R51.M3-002..006 (#1646-#1650, separate
+// commits) land CREATE_IO_CQ/SQ, PRP-backed submit, completion drain,
+// round-robin pick, and the QEMU witness -- none of that is in this
+// file yet.
+//
+// =============================================================================
+// SECTION 1  PAIR-TABLE TAIL ENCODING (design/hardware/nvme-io-queues.md §2.1)
+// =============================================================================
+//
+// Indexed directly (no tail-alloc scan -- there is no mint/derivation
+// gate on this table; capacity is fixed and the index is computable
+// from (ctrl_row_id, cpu_idx)):
+//
+//   _nvme_io_pair_table[ctrl_row_id * NVME_IO_MAX_CPUS + cpu_idx]
+//
+// Row layout (64 bytes, eight u64 words):
+//
+//   [+0]   header:    in_use[63:56] | state[15:8] | qid[7:0]
+//   [+8]   sq_pa                 (u64)   physical addr of SQ page
+//   [+16]  cq_pa                 (u64)   physical addr of CQ page
+//   [+24]  doorbells             (u64)   sq_tdbl_off[31:0] | cq_hdbl_off[31:16] | dstrd[7:0]
+//   [+32]  cursors               (u64)   sq_tail[47:32] | cq_head[31:16] | cq_phase[7:0]
+//   [+40]  msix_row_id           (u64)   row_id in _hw_msix_vector_table
+//   [+48]  owning_cpu            (u64)   cpu_idx, or 0xFF if unbound
+//   [+56]  reserved              (u64)
+//
+// State byte values (header bits [15:8]):
+//   NVME_IOP_STATE_FREE      = 0   slot never used or teardown complete
+//   NVME_IOP_STATE_MSIX      = 1   MSI-X vector minted, no CQ yet
+//   NVME_IOP_STATE_CQ_LIVE   = 2   CREATE_IO_CQ acked           (#1646)
+//   NVME_IOP_STATE_SQ_LIVE   = 3   CREATE_IO_SQ acked; usable   (#1646)
+//   NVME_IOP_STATE_QUIESCED  = 4   reserved, R51.M4 queue-reset path
+//
+// qid (bits [7:0]) = cpu_idx + 1 (admin queue is qid=0 by convention).
+//
+// Capacity: NVMEC_MAX (8, kind_nvme_controller.pdx) * NVME_IO_MAX_CPUS
+// (8) * 64 B = 4 KiB -- one .bss page, zero-init preserving the
+// in_use=0 / state=FREE invariant across boots.  This commit does NOT
+// wire a build.sh one-writer confinement check for this table; the
+// sole writers are nvme_io_msix_alloc_for_ctrl, nvme_io_msix_revoke_for_ctrl,
+// and nvme_iop_pair_table_reset below.
+//
+// =============================================================================
+// SECTION 2  FAILURE TAXONOMY  0xFFFFEC50..0xFFFFEC5F
+// =============================================================================
+//
+// One band past KIND_NVME_CONTROLLER's 0xFFFFEC40..0xFFFFEC4F.  This
+// commit's functions return only NVMEIO_MSIX_ENOSPC / NVMEIO_MSIX_EPARENT;
+// the remaining codes are declared here (whole-module taxonomy, per the
+// kind_nvme_controller.pdx precedent of declaring the full band up
+// front) for #1646-#1650 to consume without a second failure-code file.
+//
+// =============================================================================
+// SECTION 3  paideia-as encoder-gap posture (v0.22.x)
+// =============================================================================
+//
+//   G1: sized loads via xor <reg>,<reg>; mov_b <reg>,[mem] for
+//       sub-8-byte fields (zero-extension is NOT automatic on mov_b --
+//       the destination must be cleared first).  No mov_b store is
+//       needed in this commit: the header word is packed in a GPR and
+//       committed with one 8-byte mov.
+//   G4: full-register compares (values are zero-extended via the mov_b
+//       idiom above before any cmp).
+//
+// r10/r11 used freely as scratch.  All constants in this file fit
+// imm32 (KIND-adjacent state/error values < 0x100000000); the two
+// full-imm64 sentinels (NVMEIO_DECODE_BAD, all-ones) are loaded via a
+// plain `mov reg, imm64` -- that opcode form (unlike cmp/and/add)
+// accepts a full 64-bit immediate, matching NVMEC_DECODE_BAD's
+// existing use in kind_nvme_controller.pdx.
+//
+// Labels prefixed per function (reserved-label discipline, `loop`/`if`
+// etc. are keywords):
+//   nvme_iopa_  -> nvme_iop_row_addr
+//   nvme_iops_  -> nvme_iop_row_state
+//   nvme_iomr_  -> nvme_iop_row_msix_row_id
+//   nvme_ioq_   -> nvme_iop_row_qid
+//   nvme_iotr_  -> nvme_iop_pair_table_reset
+//   nvme_iom_   -> nvme_io_msix_alloc_for_ctrl
+//   nvme_iov_   -> nvme_io_msix_revoke_for_ctrl
+
+module NvmeIoQueues = structure {
+
+  pub let NVME_IO_MAX_CPUS      : u64 = 8
+  pub let NVME_IO_PAIR_ROW_BYTES: u64 = 64
+  pub let NVME_IO_PAIR_ROWS     : u64 = 64     // NVMEC_MAX (8) * NVME_IO_MAX_CPUS (8)
+  pub let NVME_IO_PAIR_WORDS    : u64 = 512    // NVME_IO_PAIR_ROWS * 8 u64-words/row
+
+  pub let NVME_IOP_STATE_FREE     : u64 = 0
+  pub let NVME_IOP_STATE_MSIX     : u64 = 1
+  pub let NVME_IOP_STATE_CQ_LIVE  : u64 = 2
+  pub let NVME_IOP_STATE_SQ_LIVE  : u64 = 3
+  pub let NVME_IOP_STATE_QUIESCED : u64 = 4
+
+  pub let NVMEIO_OK             : u64 = 0
+  pub let NVMEIO_MSIX_ENOSPC    : u64 = 0xFFFFEC50
+  pub let NVMEIO_MSIX_EPARENT   : u64 = 0xFFFFEC51
+  pub let NVMEIO_CQ_FAILED      : u64 = 0xFFFFEC52
+  pub let NVMEIO_SQ_FAILED      : u64 = 0xFFFFEC53
+  pub let NVMEIO_STATE_BAD      : u64 = 0xFFFFEC54
+  pub let NVMEIO_SUBMIT_ENOROOM : u64 = 0xFFFFEC55
+  pub let NVMEIO_SUBMIT_TIMEOUT : u64 = 0xFFFFEC56
+  pub let NVMEIO_SUBMIT_CQE_ERR : u64 = 0xFFFFEC57
+  pub let NVMEIO_PICK_NONE      : u64 = 0xFFFFEC58
+  pub let NVMEIO_BAD_ARG        : u64 = 0xFFFFEC59
+  pub let NVMEIO_BAD_OP         : u64 = 0xFFFFEC5A
+
+  pub let NVMEIO_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+
+  pub let mut _nvme_io_pair_table : [u64; 512] = uninit @align(64)
+
+  // ==========================================================================
+  // nvme_iop_row_addr(ctrl_row_id, cpu_idx) -> u64
+  //
+  // Address of the pair row, or NVMEIO_DECODE_BAD if either index is
+  // out of range.  ctrl_row_id < 8 (NVMEC_MAX); cpu_idx < 8
+  // (NVME_IO_MAX_CPUS).  Row index = ctrl_row_id * 8 + cpu_idx; row
+  // address = &_nvme_io_pair_table + index * 64.
+  // ==========================================================================
+  pub let nvme_iop_row_addr : (u64, u64) -> u64 !{mem} @{} =
+    fn (ctrl_row_id: u64) (cpu_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M3-001 (#1645): compute the pair-table row address for (ctrl_row_id, cpu_idx). Bounds-check both indices against 8 (NVMEC_MAX, NVME_IO_MAX_CPUS) before any arithmetic. Index = ctrl_row_id*8 + cpu_idx; address = &_nvme_io_pair_table + index*64 (shl 3 then shl 6, matching the shl-3/shl-6 idiom used throughout kind_nvme_controller.pdx / kind_nvme_namespace.pdx for row addressing). Pure; no writes. Labels prefixed nvme_iopa_.",
+      block: {
+        cmp rdi, 8;                       // NVMEC_MAX
+        jae nvme_iopa_bad;
+        cmp rsi, 8;                       // NVME_IO_MAX_CPUS
+        jae nvme_iopa_bad;
+
+        mov r10, rdi;
+        shl r10, 3;                       // ctrl_row_id * 8
+        add r10, rsi;                     // + cpu_idx
+        shl r10, 6;                       // * 64 (row bytes)
+        lea rax, [rip + _nvme_io_pair_table];
+        add rax, r10;
+        ret;
+
+      nvme_iopa_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_iop_row_state(ctrl_row_id, cpu_idx) -> u64
+  //
+  // State byte (header bits [15:8]), or NVMEIO_DECODE_BAD.
+  // ==========================================================================
+  pub let nvme_iop_row_state : (u64, u64) -> u64 !{mem} @{} =
+    fn (ctrl_row_id: u64) (cpu_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M3-001 (#1645): read the state byte (header [15:8], i.e. byte offset +1) out of the pair row for (ctrl_row_id, cpu_idx). Zero-push leaf that pads the stack (sub rsp,8) before the nested nvme_iop_row_addr call to satisfy SysV 16-byte alignment (entry rsp%16==8, 0 pushes -> 8, pad restores 0), then restores it (add rsp,8) before reading the byte. G1 workaround: xor rax,rax then mov_b rax,[addr+1] to zero-extend explicitly -- mov_b does not zero-extend on its own. Labels prefixed nvme_iops_.",
+      block: {
+        sub rsp, 8;
+        call nvme_iop_row_addr;
+        add rsp, 8;
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvme_iops_bad;
+
+        mov r10, rax;
+        xor rax, rax;
+        mov_b rax, [r10 + 1];             // state byte, zero-extended
+        ret;
+
+      nvme_iops_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_iop_row_qid(ctrl_row_id, cpu_idx) -> u64
+  //
+  // qid byte (header bits [7:0], i.e. byte offset +0), or NVMEIO_DECODE_BAD.
+  // ==========================================================================
+  pub let nvme_iop_row_qid : (u64, u64) -> u64 !{mem} @{} =
+    fn (ctrl_row_id: u64) (cpu_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M3-001 (#1645): read the qid byte (header [7:0], byte offset +0) out of the pair row. Same zero-push + pad shape as nvme_iop_row_state; same G1 zero-extension idiom. Labels prefixed nvme_ioq_.",
+      block: {
+        sub rsp, 8;
+        call nvme_iop_row_addr;
+        add rsp, 8;
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvme_ioq_bad;
+
+        mov r10, rax;
+        xor rax, rax;
+        mov_b rax, [r10 + 0];             // qid byte, zero-extended
+        ret;
+
+      nvme_ioq_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_iop_row_msix_row_id(ctrl_row_id, cpu_idx) -> u64
+  //
+  // msix_row_id field (+40, full u64), or NVMEIO_DECODE_BAD.
+  // ==========================================================================
+  pub let nvme_iop_row_msix_row_id : (u64, u64) -> u64 !{mem} @{} =
+    fn (ctrl_row_id: u64) (cpu_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M3-001 (#1645): read the msix_row_id field (+40, full 8-byte word -- no G1 sizing needed) out of the pair row. Same zero-push + pad shape as the sibling accessors. Labels prefixed nvme_iomr_.",
+      block: {
+        sub rsp, 8;
+        call nvme_iop_row_addr;
+        add rsp, 8;
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvme_iomr_bad;
+
+        mov rax, [rax + 40];
+        ret;
+
+      nvme_iomr_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_iop_pair_table_reset() -> ()
+  //
+  // Clear every row of _nvme_io_pair_table.  Boot and teardown only.
+  // Mirrors nvme_ctrl_table_reset (kind_nvme_controller.pdx).
+  // ==========================================================================
+  pub let nvme_iop_pair_table_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M3-001 (#1645): zero all 512 u64 words (64 rows * 8 words/row = 4 KiB) of _nvme_io_pair_table. Leaf, no nested call, no alignment concern. Labels prefixed nvme_iotr_.",
+      block: {
+        lea r10, [rip + _nvme_io_pair_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      nvme_iotr_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 512;                     // NVME_IO_PAIR_WORDS
+        jb  nvme_iotr_loop;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_io_msix_alloc_for_ctrl(ctrl_row_id, hw_int_parent_slot,
+  //                              slot_base, ncpu) -> u64
+  //
+  // design/hardware/nvme-io-queues.md §3.1, §4.  For cpu_idx in
+  // 0..min(ncpu, NVME_IO_MAX_CPUS): mint a KIND_HW_MSIX_VECTOR at
+  // cap_table[slot_base + cpu_idx] via msix_cap_mint, table_offset =
+  // cpu_idx*16, msix_data = cpu_idx.  On success, stamp the pair row's
+  // msix_row_id (+40) from the freshly-minted descriptor's target_ptr
+  // low 16 bits, pack the header (qid = cpu_idx+1, state = MSIX,
+  // in_use = 1). On any mint failure, roll back every prior mint
+  // (msix_cap_revoke + pair row reset to FREE) and return
+  // NVMEIO_MSIX_EPARENT (mint's parent-gate refusal, MSIX_MINT_BAD_PARENT
+  // = 0xFFFFFFED) or NVMEIO_MSIX_ENOSPC (every other mint failure:
+  // MSIX_MINT_BAD_RIGHTS/ENOSPC/BAD_ARG -- the two NVMEIO_MSIX_* codes
+  // this commit defines do not have a one-to-one slot for all four
+  // underlying causes, so the non-parent causes collapse to ENOSPC,
+  // the "cannot proceed" catch-all).
+  // ==========================================================================
+  pub let nvme_io_msix_alloc_for_ctrl : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (ctrl_row_id: u64) (hw_int_parent_slot: u64) (slot_base: u64) (ncpu: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R51.M3-001 (#1645): batch MSI-X vector allocator, one KIND_HW_MSIX_VECTOR per CPU. Five-push callee-save prologue (rbx=ctrl_row_id, r12=cpu_idx, r13=ncpu clamped to NVME_IO_MAX_CPUS, r14=slot_base, r15=hw_int_parent_slot) = 40 B; entry rsp%16==8 -> 48, %16==0 -- matches design doc §3.1's stated register plan and leaves rsp%16==0 at the msix_cap_mint call site with zero padding. Per iteration: pack msix_cap_mint's 5 args (slot=slot_base+cpu_idx, parent_slot, rights=R_MSIX_ALL=0x218, table_offset=cpu_idx*16, msix_data=cpu_idx), call it. Non-zero return -> classify (BAD_PARENT=0xFFFFFFED -> NVMEIO_MSIX_EPARENT; anything else -> NVMEIO_MSIX_ENOSPC), then roll back every already-minted vector in [0, cpu_idx) via msix_cap_revoke + reset that pair row to FREE, and return the classified code. Zero return -> re-read cap_table[slot].target_ptr (24-byte descriptor stride: slot*8 + slot*16) low 16 bits for the freshly-allocated row_id, stamp pair row +40 (msix_row_id) and +0 (header = in_use<<56 | MSIX<<8 | qid, qid=cpu_idx+1), advance cpu_idx. All registers rax/r9/r10/r11/rdi/rsi/rdx/rcx/r8 are caller-save scratch across the calls; msix_cap_mint/msix_cap_revoke preserve rbx/r12-r15 per SysV so the loop state survives. Returns 0 (NVMEIO_OK) once every cpu_idx in range is minted.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;                         // 5 pushes -> rsp%16 == 0
+
+        mov rbx, rdi;                      // ctrl_row_id
+        mov r15, rsi;                      // hw_int_parent_slot
+        mov r14, rdx;                      // slot_base
+        mov r13, rcx;                      // ncpu (to be clamped)
+
+        mov r10, 8;                        // NVME_IO_MAX_CPUS
+        cmp r13, r10;
+        jbe nvme_iom_ncpu_ok;
+        mov r13, r10;
+      nvme_iom_ncpu_ok:
+
+        xor r12, r12;                      // cpu_idx = 0
+
+      nvme_iom_loop:
+        cmp r12, r13;
+        jae nvme_iom_done;
+
+        mov rdi, r14;
+        add rdi, r12;                      // slot = slot_base + cpu_idx
+        mov rsi, r15;                      // parent_slot
+        mov rdx, 0x218;                    // R_MSIX_ALL
+        mov rcx, r12;
+        shl rcx, 4;                        // table_offset = cpu_idx * 16
+        mov r8, r12;                       // msix_data = cpu_idx
+        call msix_cap_mint;
+
+        cmp rax, 0;
+        jne nvme_iom_fail;
+
+        // Success: re-read cap_table[slot].target_ptr[15:0] -> row_id.
+        mov r9, r14;
+        add r9, r12;                       // slot
+        mov r10, cap_table;
+        mov r11, r9;
+        shl r11, 3;
+        add r10, r11;
+        mov r11, r9;
+        shl r11, 4;
+        add r10, r11;                      // r10 = &cap_table[slot]
+        mov r9, [r10 + 16];                // target_ptr
+        and r9, 0xFFFF;                    // row_id
+
+        // pair_row = &_nvme_io_pair_table + (ctrl_row_id*8 + cpu_idx)*64
+        mov r10, rbx;
+        shl r10, 3;
+        add r10, r12;
+        shl r10, 6;
+        lea r11, [rip + _nvme_io_pair_table];
+        add r11, r10;
+
+        mov [r11 + 40], r9;                // msix_row_id
+
+        mov r10, r12;
+        add r10, 1;                        // qid = cpu_idx + 1
+        mov r9, 1;
+        shl r9, 8;
+        or  r10, r9;                       // | state(MSIX=1) << 8
+        mov r9, 1;
+        shl r9, 56;
+        or  r10, r9;                       // | in_use = 1
+        mov [r11 + 0], r10;                // header
+
+        add r12, 1;
+        jmp nvme_iom_loop;
+
+      nvme_iom_fail:
+        mov r10, 0xFFFFFFED;               // MSIX_MINT_BAD_PARENT
+        cmp rax, r10;
+        je  nvme_iom_err_eparent;
+        mov r15, 0xFFFFEC50;               // NVMEIO_MSIX_ENOSPC
+        jmp nvme_iom_rollback;
+      nvme_iom_err_eparent:
+        mov r15, 0xFFFFEC51;               // NVMEIO_MSIX_EPARENT
+
+      nvme_iom_rollback:
+        // r15 (hw_int_parent_slot, no longer needed) now stashes the
+        // classified error code across the rollback loop below. r13
+        // (ncpu, no longer needed) is reused as the rollback cursor k.
+        xor r13, r13;                      // k = 0
+      nvme_iom_rb_loop:
+        cmp r13, r12;
+        jae nvme_iom_rb_done;
+
+        mov rdi, r14;
+        add rdi, r13;                      // slot = slot_base + k
+        call msix_cap_revoke;
+
+        mov r10, rbx;
+        shl r10, 3;
+        add r10, r13;
+        shl r10, 6;
+        lea r11, [rip + _nvme_io_pair_table];
+        add r11, r10;
+        xor r9, r9;
+        mov [r11 + 0], r9;                 // header -> FREE
+        mov [r11 + 40], r9;                // msix_row_id -> 0
+
+        add r13, 1;
+        jmp nvme_iom_rb_loop;
+
+      nvme_iom_rb_done:
+        mov rax, r15;
+        jmp nvme_iom_out;
+
+      nvme_iom_done:
+        xor rax, rax;                      // NVMEIO_OK
+
+      nvme_iom_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_io_msix_revoke_for_ctrl(ctrl_row_id, slot_base, ncpu) -> u64
+  //
+  // Cleanup path, companion to nvme_io_msix_alloc_for_ctrl.  For
+  // cpu_idx in 0..min(ncpu, NVME_IO_MAX_CPUS): revoke the
+  // KIND_HW_MSIX_VECTOR cap at cap_table[slot_base + cpu_idx]
+  // (msix_cap_revoke is idempotent -- MSIX_REVOKE_ALREADY on an
+  // already-clear slot is not an error here) and reset that pair row
+  // to FREE (header = 0, msix_row_id = 0) unconditionally.  Always
+  // returns 0: revoke is a best-effort scrub, not a state machine the
+  // caller needs to inspect per-CPU (design/hardware/nvme-io-queues.md
+  // §5 commit 1 witness stage 14 asserts a plain 0 return).
+  // ==========================================================================
+  pub let nvme_io_msix_revoke_for_ctrl : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (ctrl_row_id: u64) (slot_base: u64) (ncpu: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R51.M3-001 (#1645): revoke every MSI-X vector nvme_io_msix_alloc_for_ctrl minted for this controller and scrub the matching pair rows. Four-push callee-save prologue (rbx=ctrl_row_id, r12=cpu_idx, r13=ncpu clamped, r14=slot_base) = 32 B; entry rsp%16==8 -> 40 (%16==8), so a sub rsp,8 pad is added before the loop's msix_cap_revoke call and undone before the final ret, per the k=4 row of the SysV alignment table (design/hardware/nvme-io-queues.md §7.4). Per iteration: msix_cap_revoke(slot_base+cpu_idx) (idempotent; return value ignored -- an already-clear slot is not a fault in a cleanup path), then unconditionally zero the pair row's header (+0) and msix_row_id (+40). Always returns NVMEIO_OK (0).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;                        // 4 pushes -> rsp%16==8; pad to 0
+
+        mov rbx, rdi;                      // ctrl_row_id
+        mov r14, rsi;                      // slot_base
+        mov r13, rdx;                      // ncpu (to be clamped)
+
+        mov r10, 8;                        // NVME_IO_MAX_CPUS
+        cmp r13, r10;
+        jbe nvme_iov_ncpu_ok;
+        mov r13, r10;
+      nvme_iov_ncpu_ok:
+
+        xor r12, r12;                      // cpu_idx = 0
+
+      nvme_iov_loop:
+        cmp r12, r13;
+        jae nvme_iov_done;
+
+        mov rdi, r14;
+        add rdi, r12;                      // slot = slot_base + cpu_idx
+        call msix_cap_revoke;
+
+        mov r10, rbx;
+        shl r10, 3;
+        add r10, r12;
+        shl r10, 6;
+        lea r11, [rip + _nvme_io_pair_table];
+        add r11, r10;
+        xor r9, r9;
+        mov [r11 + 0], r9;                 // header -> FREE
+        mov [r11 + 40], r9;                // msix_row_id -> 0
+
+        add r12, 1;
+        jmp nvme_iov_loop;
+
+      nvme_iov_done:
+        xor rax, rax;                      // NVMEIO_OK
+
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
