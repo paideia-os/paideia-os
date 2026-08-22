@@ -5712,6 +5712,36 @@ fi
 echo "[r51-m1-confine] R51.M1 (KIND_NVME_CONTROLLER) confined"
 
 # ---------------------------------------------------------------------------
+# R51.M2-001 (#1639): one-writer discipline for KIND_NVME_NAMESPACE.
+#
+#   * kind_nvme_namespace (KIND_NVME_NAMESPACE = 0x199, over KIND_MEMORY,
+#                          dual-kind with KIND_BLKDEV = 0x42)
+#
+# _nvme_namespace_table + _nvme_namespace_stats are the only places
+# in the kernel where NVMe-namespace authority lives.  A second writer
+# would let one supervisor mutate a namespace row (change nsid,
+# rewrite block_count, forge a family byte so a KIND_BLKDEV consumer
+# reads AHCI geometry from what is really an NVMe row) with no
+# capability involved.  Per-module confinement is what makes that
+# unreachable by construction; the sole writers are
+# nvme_ns_tail_alloc / _tail_free / _note / _table_reset (all in
+# kind_nvme_namespace.pdx §1).
+R51_NVMEN_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_nvme_namespace.pdx"
+if [[ ! -f "${R51_NVMEN_SRC}" ]]; then
+    echo "[r51-m2-confine] FAIL - kind_nvme_namespace.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_nvme_namespace_table' 'core/cap/kind_nvme_namespace.o'
+ec_confine_one '_nvme_namespace_stats' 'core/cap/kind_nvme_namespace.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_nvme_namespace.pdx §1 for the per-module one-writer" >&2
+    echo "  discipline (the sole writers are nvme_ns_tail_alloc + " >&2
+    echo "  nvme_ns_tail_free + nvme_ns_note + nvme_ns_table_reset)." >&2
+    exit 1
+fi
+echo "[r51-m2-confine] R51.M2 (KIND_NVME_NAMESPACE) confined"
+
+# ---------------------------------------------------------------------------
 # R42-PREP-008 (#1630): one-writer discipline for the PdxFS userspace
 # directory iterator cursor table.
 #
