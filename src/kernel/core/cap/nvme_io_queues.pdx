@@ -11,14 +11,22 @@
 // per-CPU pair table, its row accessors, and the MSI-X vector batch
 // allocator/revoker (§3.1, §4).
 //
-// R51.M3-002 (this commit, #1646) lands CREATE_IO_CQ + CREATE_IO_SQ:
+// R51.M3-002 (#1646, landed) lands CREATE_IO_CQ + CREATE_IO_SQ:
 // nvme_io_create_pair (one (ctrl_row_id, cpu_idx) pair) and
 // nvme_io_bring_up_all (loop over cpu_idx, all-or-nothing rollback),
 // plus the NVMEC_OP_BRING_UP_IO wiring on kind_nvme_controller.pdx's
-// dispatch handler (design §3.2, §3.6).  R51.M3-003..006 (#1647-#1650,
-// separate commits) land PRP-backed submit, completion drain,
-// round-robin pick, and the QEMU witness -- none of that is in this
-// file yet.
+// dispatch handler (design §3.2, §3.6).
+//
+// R51.M3-003 (this commit, #1647) lands nvme_io_submit_rw (design §3.3)
+// -- one entry point for BOTH BDEV_OP_READ_LBA and BDEV_OP_WRITE_LBA,
+// distinguished by the opcode arg -- plus its two decomposed helpers
+// (nvme_iox_sqe_submit: SQE build + PRP encode + doorbell ring;
+// nvme_iod_completion_drain: phase-tag poll + CQ doorbell) and the new
+// cap/cap_handler_blkdev.pdx dispatcher that calls into it.
+// nvme_io_pick_pair (round-robin fallback) is #1649's file-scope, not
+// this commit's -- nvme_io_submit_rw calls it by name on the
+// assumption a sibling commit lands it; see the file-header gap note
+// below.  R51.M3-005/006 (#1649/#1650) still land after this commit.
 //
 // Design-doc gaps resolved in this commit (see justification blocks
 // below for the in-context rationale):
@@ -39,8 +47,40 @@
 //     (non-overlapping; sufficient for every realistic DSTRD per
 //     doorbell.pdx's own commodity-hardware assumption). No consumer
 //     reads this field yet -- doorbell.pdx's nvme_ring_sq/nvme_ring_cq
-//     (the future submit path, #1647) re-derive DSTRD from BAR0.CAP
+//     (the submit path, #1647) re-derive DSTRD from BAR0.CAP
 //     statelessly and don't need it.
+//   - §5 commit 3 speced landing a "fast-path only" nvme_io_pick_pair
+//     alongside submit_rw, with the round-robin fallback deferred to
+//     commit 5 (#1649).  The R51.M3-003 issue text this commit
+//     implements instead reserves ALL of nvme_io_pick_pair for a
+//     sibling #1649 agent running concurrently on this same file.
+//     nvme_io_submit_rw therefore calls nvme_io_pick_pair(ctrl_row_id)
+//     by name without defining it here; the two commits are expected
+//     to land independently and merge (via git pull --rebase) before
+//     either build is exercised together.
+//   - §3.3's SQE-builder decomposition ("two 6-push helpers") is named
+//     nvme_iox_sqe_submit here (not nvme_ios_*, which is reserved for
+//     nvme_io_submit_rw's own labels per §7.1's prefix table) to avoid
+//     a label collision between the outer function and its helper.
+//   - §3.3 step 3's "NVMEIO_SUBMIT_CQE_ERR with a distinguishing status
+//     of 0xE001 / 0xE002" and the preamble's "bad opcode returns
+//     NVMEIO_SUBMIT_CQE_ERR with bytes=0xEEEE" are implemented as
+//     nvme_io_submit_rw literally returning 0xE001 / 0xE002 / 0xEEEE
+//     (not the NVMEIO_SUBMIT_CQE_ERR constant) for those three specific
+//     validation failures, matching the literal "bytes = <value>"
+//     phrasing; a real non-zero CQE completion status instead returns
+//     the fixed NVMEIO_SUBMIT_CQE_ERR (0xFFFFEC57) sentinel rather than
+//     passing the raw controller status through (the design's "bytes =
+//     status_field" note is honored one level up: cap_handler_blkdev
+//     writes nvme_io_submit_rw's raw return into the descriptor page's
+//     status_out field regardless of which of these paths fired).
+//   - §4.4's msix_tail_valid revalidation-on-every-submit (guarding the
+//     "MSI-X vector revoked but pair still SQ_LIVE" race) is NOT
+//     implemented in this commit -- out of #1647's assigned scope.
+//     The state re-check against NVME_IOP_STATE_SQ_LIVE (step 2) still
+//     runs; only the deeper msix_row_id liveness cross-check is
+//     deferred (no issue currently tracks it -- flagged here for
+//     R51.M4 triage).
 //
 // =============================================================================
 // SECTION 1  PAIR-TABLE TAIL ENCODING (design/hardware/nvme-io-queues.md §2.1)
@@ -119,6 +159,9 @@
 //   nvme_iov_   -> nvme_io_msix_revoke_for_ctrl
 //   nvme_ioc_   -> nvme_io_create_pair       (#1646)
 //   nvme_iob_   -> nvme_io_bring_up_all      (#1646)
+//   nvme_ios_   -> nvme_io_submit_rw         (#1647)
+//   nvme_iox_   -> nvme_iox_sqe_submit       (#1647, submit_rw's SQE-build helper)
+//   nvme_iod_   -> nvme_io_completion_drain  (#1647)
 
 module NvmeIoQueues = structure {
 
@@ -866,6 +909,502 @@ module NvmeIoQueues = structure {
 
       nvme_iob_out:
         add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_iox_sqe_submit(pair_row, bar0, packed_nsid_op, lba,
+  //                      packed_nb_bytelen, dma_iova) -> u64
+  //
+  // design/hardware/nvme-io-queues.md §3.3 steps 4-6 (SQE build, PRP
+  // encode, doorbell ring).  Private helper for nvme_io_submit_rw --
+  // NOT part of the public API surface (no `pub`), but paideia-as does
+  // not gate visibility so it is reachable by name like everything
+  // else in this module; the design doc's own §3.3 posture note calls
+  // for exactly this decomposition ("two 6-push helpers").
+  //
+  // Packed args (arity-6 ceiling forces two u64s to each carry a pair
+  // of logical fields):
+  //   packed_nsid_op    = nsid[31:0] | (opcode[7:0] << 32)
+  //   packed_nb_bytelen = nblocks[15:0] | (byte_len[47:0] << 16)
+  //
+  // Returns the CID used (== the old sq_tail value, 0..63) on success,
+  // or NVMEIO_DECODE_BAD (0xFFFFFFFFFFFFFFFF) if PRP encoding failed
+  // (nvme_prp_encode_small / _large returned non-zero).
+  //
+  // sqe_addr is deliberately recomputed from `pair_row` (rbx, callee-
+  // save) after every nested call rather than cached across calls --
+  // every other value this function touches (qid, sq_pa, sq_tail) is
+  // similarly re-derived on demand instead of spilled to the stack,
+  // since pair_row's fields are not mutated until the final doorbell-
+  // ring step.  Six callee-save pushes (rbx=pair_row, rbp=bar0,
+  // r12=packed_nsid_op, r13=lba, r14=packed_nb_bytelen, r15=dma_iova)
+  // + sub rsp,8 pad = 56 B; entry rsp%16==8 -> 64, %16==0.
+  // ==========================================================================
+  let nvme_iox_sqe_submit : (u64, u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (pair_row: u64) (bar0: u64) (packed_nsid_op: u64) (lba: u64) (packed_nb_bytelen: u64) (dma_iova: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R51.M3-003 (#1647): build one NVMe READ/WRITE SQE at the pair's current sq_tail slot, encode its PRP1/PRP2 (small <=2-page path via nvme_prp_encode_small, falling back to a PRP-list page via nvme_prp_list_alloc + nvme_prp_encode_large on NVME_PRP_ERR_TOO_LARGE), advance sq_tail (mod 64) in the row's cursors word (+32, preserving cq_head/cq_phase), and ring SQyTDBL via nvme_ring_sq(bar0, qid, new_sq_tail). Six callee-save pushes (rbx=pair_row, rbp=bar0, r12=packed_nsid_op, r13=lba, r14=packed_nb_bytelen, r15=dma_iova) + sub rsp,8 pad = 56 B; entry rsp%16==8 -> 64, %16==0 -- every nested call (nvme_prp_encode_small/_large, nvme_prp_list_alloc, nvme_ring_sq) executes at rsp%16==0. sqe_addr = sq_pa(+8) + sq_tail*64 is recomputed via rbx after every nested call rather than cached in a caller-save register (rbx itself is the only value that must survive the calls, and it is callee-save). dword0 (OPC|CID<<16) and NSID (u32@+4) are stored via mov_d (G1: plain `mov [mem], r32`-shaped stores widen to 8 bytes). CDW10/CDW11 (u32@+40/+44) split lba's low/high 32 bits; CDW12 (u32@+48) = (nblocks-1)&0xFFFF, NLB is 0-based per NVMe §4.2. The old sq_tail value (== CID, since CID is assigned as the rolling sq_tail per design §3.3 step 5) is stashed at [rsp+0] (the alignment-pad slot, reused as genuine scratch) across the final nvme_ring_sq call so it survives to become this function's return value. Returns NVMEIO_DECODE_BAD (0xFFFFFFFFFFFFFFFF) if both PRP encode paths fail. Labels prefixed nvme_iox_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                     // pair_row
+        mov rbp, rsi;                     // bar0
+        mov r12, rdx;                     // packed_nsid_op
+        mov r13, rcx;                     // lba
+        mov r14, r8;                      // packed_nb_bytelen
+        mov r15, r9;                      // dma_iova
+
+        // ---- zero the 64-byte SQE at sq_pa + sq_tail*64 ----
+        mov r10, [rbx + 32];              // cursors
+        shr r10, 32;
+        and r10, 0xFFFF;                  // sq_tail
+        mov r11, [rbx + 8];               // sq_pa
+        shl r10, 6;
+        add r10, r11;                     // r10 = sqe_addr
+
+        xor rax, rax;
+        xor rcx, rcx;
+      nvme_iox_zero_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  nvme_iox_zero_loop;
+
+        // ---- dword0 = opcode | (cid << 16); cid == sq_tail ----
+        mov r11, [rbx + 32];
+        shr r11, 32;
+        and r11, 0xFFFF;                  // sq_tail == cid
+        mov rax, r12;
+        shr rax, 32;
+        and rax, 0xFF;                    // opcode
+        mov rcx, r11;
+        shl rcx, 16;
+        or  rax, rcx;
+        mov_d [r10 + 0], rax;
+
+        // ---- NSID (u32 @+4) ----
+        mov rax, r12;
+        mov r11, 0xFFFFFFFF;
+        and rax, r11;
+        mov_d [r10 + 4], rax;
+
+        // ---- CDW10/CDW11 (lba) ----
+        mov rax, r13;
+        mov r11, 0xFFFFFFFF;
+        and rax, r11;
+        mov_d [r10 + 40], rax;            // CDW10 = lba[31:0]
+        mov rax, r13;
+        shr rax, 32;
+        mov_d [r10 + 44], rax;            // CDW11 = lba[63:32]
+
+        // ---- CDW12 = (nblocks - 1) & 0xFFFF ----
+        mov rax, r14;
+        and rax, 0xFFFF;                  // nblocks
+        sub rax, 1;
+        and rax, 0xFFFF;
+        mov_d [r10 + 48], rax;
+
+        // ---- PRP encode (small path) ----
+        mov rdi, r10;                     // sqe_ptr
+        mov rsi, r15;                     // dma_iova
+        mov rdx, r14;
+        shr rdx, 16;                      // byte_len
+        call nvme_prp_encode_small;
+
+        cmp rax, 0;
+        je  nvme_iox_prp_ok;
+        cmp rax, 0x1002;                  // NVME_PRP_ERR_TOO_LARGE
+        jne nvme_iox_fail;
+
+        // ---- PRP encode (large path: allocate a PRP-list page) ----
+        call nvme_prp_list_alloc;         // rax = list_pa (never fails: round-robin bump)
+        mov r8, rax;                      // stash list_pa
+
+        mov r10, [rbx + 32];              // recompute sqe_addr (r10 clobbered by the calls above)
+        shr r10, 32;
+        and r10, 0xFFFF;
+        mov r11, [rbx + 8];
+        shl r10, 6;
+        add r10, r11;
+
+        mov rdi, r10;                     // sqe_ptr
+        mov rsi, r15;                     // dma_iova
+        mov rdx, r14;
+        shr rdx, 16;                      // byte_len
+        mov rcx, r8;                      // list_pa
+        call nvme_prp_encode_large;
+
+        cmp rax, 0;
+        jne nvme_iox_fail;
+
+      nvme_iox_prp_ok:
+        // ---- advance sq_tail (mod 64); rebuild cursors; stash cid ----
+        mov r10, [rbx + 32];              // cursors (old)
+        mov r11, r10;
+        shr r11, 32;
+        and r11, 0xFFFF;                  // old sq_tail == cid
+        mov [rsp + 0], r11;               // stash cid across nvme_ring_sq below
+
+        mov rax, r11;
+        add rax, 1;
+        and rax, 0x3F;                    // new sq_tail (NVME_IO_QUEUE_ENTRIES=64)
+
+        mov r9, 0xFFFFFFFF;
+        and r10, r9;                      // low32 (cq_head|cq_phase) preserved
+        mov rcx, rax;
+        shl rcx, 32;
+        or  r10, rcx;                     // new cursors
+        mov [rbx + 32], r10;              // write back
+
+        xor rcx, rcx;
+        mov_b rcx, [rbx + 0];             // qid, zero-extended
+
+        mov rdi, rbp;                     // bar0
+        mov rsi, rcx;                     // qid
+        mov rdx, rax;                     // new_sq_tail
+        call nvme_ring_sq;
+
+        mov rax, [rsp + 0];               // rax = cid (return value)
+        jmp nvme_iox_out;
+
+      nvme_iox_fail:
+        mov rax, 0xFFFFFFFFFFFFFFFF;      // NVMEIO_DECODE_BAD
+
+      nvme_iox_out:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_io_completion_drain(pair_row, bar0, expected_cid, spin_max) -> u64
+  //
+  // design/hardware/nvme-io-queues.md §2.4, §3.3 step 7.  Polls the
+  // pair's CQ at cq_head until a CQE with a matching Phase Tag AND a
+  // matching CID appears, or spin_max iterations are exhausted.
+  //
+  // Returns:
+  //   NVMEIO_DECODE_BAD (0xFFFFFFFFFFFFFFFF) on timeout (caller maps to
+  //     NVMEIO_SUBMIT_TIMEOUT);
+  //   else the matched CQE's status field with the Phase Tag bit
+  //     masked out (status & 0xFFFE) -- 0 means OK, matching the R24
+  //     `(status & 0xFFFE) == 0` success convention already used
+  //     throughout drivers/nvme/*.pdx.
+  // ==========================================================================
+  pub let nvme_io_completion_drain : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (pair_row: u64) (bar0: u64) (expected_cid: u64) (spin_max: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R51.M3-003 (#1647): phase-tag completion poll, structurally identical to drivers/nvme/queue.pdx nvme_admin_submit_poll's poll half and drivers/nvme/irq.pdx's drain, adapted to read cq_head/cq_phase/sq_tail out of the pair row's packed cursors word (+32: sq_tail[63:32] | cq_head[31:16] | cq_phase[7:0]) instead of a dedicated ctx struct. Four callee-save pushes (rbx=pair_row, r12=bar0, r13=expected_cid, r14=spin_max-as-counter) + sub rsp,8 pad = 40 B; entry rsp%16==8 -> 48, %16==0 (aligned for the terminal nvme_ring_cq call). Per iteration: compute cqe_addr = cq_pa(+16) + cq_head*16; read status u16 @+14 (zero-extended); phase = status & 1; if phase != the row's cq_phase -> not ready (decrement r14, loop; spin_max exhausted -> return NVMEIO_DECODE_BAD as a timeout sentinel). If phase matches, read CID u16 @+12; if it does not equal expected_cid -> also not-ready (single-outstanding-command invariant means a mismatch here should not occur in practice, but the check is cheap and matches design step 7's literal 'until CID matches'). On a full match: stash the raw status (masked to exclude phase, i.e. & 0xFFFE) at [rsp+0] before touching any more registers; recompute cq_head/cq_phase fresh from a reloaded cursors word, advance cq_head mod 64 (NVME_IO_QUEUE_ENTRIES=64), toggle cq_phase only on wrap (new cq_head == 0), rebuild cursors preserving sq_tail (bits[63:32]), write back, ring CQyHDBL via nvme_ring_cq(bar0, qid, new_cq_head), then reload the stashed status field as the return value. Reserved labels: nvme_iod_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                     // pair_row
+        mov r12, rsi;                     // bar0
+        mov r13, rdx;                     // expected_cid
+        mov r14, rcx;                     // spin_max (counter)
+
+      nvme_iod_poll_loop:
+        cmp r14, 0;
+        je  nvme_iod_timeout;
+
+        mov r10, [rbx + 16];              // cq_pa
+        mov r11, [rbx + 32];              // cursors
+        mov rax, r11;
+        shr rax, 16;
+        and rax, 0xFFFF;                  // cq_head
+        mov rcx, rax;
+        shl rcx, 4;
+        add r10, rcx;                     // r10 = cqe_addr
+
+        xor rax, rax;
+        mov_w rax, [r10 + 14];            // status (includes phase bit0)
+        mov rdx, rax;
+        and rdx, 1;                       // phase bit
+
+        mov rcx, r11;
+        and rcx, 0xFF;                    // expected cq_phase
+
+        cmp rdx, rcx;
+        jne nvme_iod_not_ready;
+
+        xor rcx, rcx;
+        mov_w rcx, [r10 + 12];            // cid field
+        cmp rcx, r13;
+        jne nvme_iod_not_ready;
+
+        // ---- matched: stash status_field, then advance the CQ ----
+        mov rdx, rax;
+        and rdx, 0xFFFE;                  // status_field (phase bit cleared)
+        mov [rsp + 0], rdx;
+
+        mov r11, [rbx + 32];              // reload cursors (fresh)
+        mov r10, r11;
+        shr r10, 16;
+        and r10, 0xFFFF;                  // old cq_head
+        mov r9, r10;
+        add r9, 1;
+        and r9, 0x3F;                     // new cq_head (mod 64)
+
+        mov r8, r11;
+        and r8, 0xFF;                     // old cq_phase
+        cmp r9, 0;
+        jne nvme_iod_no_wrap;
+        xor r8, 1;                        // toggle phase on wrap
+      nvme_iod_no_wrap:
+
+        mov rcx, r11;
+        mov rdx, 0xFFFFFFFF00000000;
+        and rcx, rdx;                     // keep sq_tail bits only
+        mov rdx, r9;
+        shl rdx, 16;
+        or  rcx, rdx;                     // | new cq_head
+        or  rcx, r8;                      // | new cq_phase
+        mov [rbx + 32], rcx;              // write back
+
+        xor rax, rax;
+        mov_b rax, [rbx + 0];             // qid, zero-extended
+
+        mov rdi, r12;                     // bar0
+        mov rsi, rax;                     // qid
+        mov rdx, r9;                      // new cq_head
+        call nvme_ring_cq;
+
+        mov rax, [rsp + 0];               // status_field
+        jmp nvme_iod_out;
+
+      nvme_iod_not_ready:
+        sub r14, 1;
+        jmp nvme_iod_poll_loop;
+
+      nvme_iod_timeout:
+        mov rax, 0xFFFFFFFFFFFFFFFF;      // NVMEIO_DECODE_BAD (timeout sentinel)
+
+      nvme_iod_out:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_io_submit_rw(ctrl_row_id, ns_row, opcode, lba, nblocks, dma_iova) -> u64
+  //
+  // design/hardware/nvme-io-queues.md §3.3.  One entry point for both
+  // BDEV_OP_READ_LBA (opcode=2, NVMe OPC) and BDEV_OP_WRITE_LBA
+  // (opcode=1) -- #1647 lands the full path; #1648's witness exercises
+  // the WRITE side of the same code.
+  //
+  // Returns bytes transferred (nblocks * lba_size) on success; else one
+  // of NVMEIO_STATE_BAD / NVMEIO_SUBMIT_ENOROOM / NVMEIO_SUBMIT_TIMEOUT
+  // / NVMEIO_SUBMIT_CQE_ERR / NVMEIO_PICK_NONE, or the literal
+  // 0xE001 / 0xE002 / 0xEEEE sentinels for the three validation
+  // failures the design doc calls out by exact value (see file-header
+  // gap note).
+  // ==========================================================================
+  pub let nvme_io_submit_rw : (u64, u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (ctrl_row_id: u64) (ns_row: u64) (opcode: u64) (lba: u64) (nblocks: u64) (dma_iova: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R51.M3-003 (#1647): validate + pick a live pair + build/submit an SQE + drain its completion for one READ or WRITE. Six callee-save pushes (rbx=ctrl_row_id, rbp=ns_row, r12=opcode, r13=lba, r14=nblocks, r15=dma_iova) + sub rsp,40 = 88 B; entry rsp%16==8 -> 96, %16==0. The sub rsp,40 gives five 8-byte scratch slots ([rsp+0]=pair_row, [rsp+8]=bar0, [rsp+16]=lba_size, [rsp+24]=nsid, [rsp+32] unused) that survive the run of nested calls (nvme_io_pick_pair, nvme_ctrl_row_bar0, nvme_ns_row_lba_size, nvme_ns_row_nsid, nvme_ns_row_block_count, nvme_ctrl_row_mdts) because all six callee-save registers are already committed to the six input args -- pair_row/bar0/lba_size/nsid have nowhere else to live across that many calls, so they spill to the stack instead (block_count and mdts are consumed immediately after their own call and never need to survive a further call, so they stay in caller-save scratch). Sequence: (1) validate opcode in {1,2} else return 0xEEEE; (2) nvme_io_pick_pair(ctrl_row_id) -> pair_row, NVMEIO_PICK_NONE (0xFFFFEC58) forwarded verbatim on failure; (3) re-check pair_row's state byte (+1) == NVME_IOP_STATE_SQ_LIVE else NVMEIO_STATE_BAD; (4) bar0 via nvme_ctrl_row_bar0, DECODE_BAD -> NVMEIO_STATE_BAD; (5) lba_size via nvme_ns_row_lba_size; (6) nsid via nvme_ns_row_nsid; (7) block_count via nvme_ns_row_block_count, bound-check lba+nblocks <= block_count else return the literal 0xE001; (8) mdts via nvme_ctrl_row_mdts, mdts_bytes = 1 << (12+mdts), bound-check nblocks*lba_size (via imul, matching the fb_glyph.pdx / vk/bench.pdx imul precedent) <= mdts_bytes else return the literal 0xE002; (9) pack packed_nsid_op = nsid | (opcode<<32) and packed_nb_bytelen = nblocks | (byte_len<<16), call nvme_iox_sqe_submit(pair_row, bar0, packed_nsid_op, lba, packed_nb_bytelen, dma_iova) -> cid or NVMEIO_DECODE_BAD (mapped to NVMEIO_SUBMIT_ENOROOM, the closest-fit 'cannot submit' code -- see file-header gap note); (10) nvme_io_completion_drain(pair_row, bar0, cid, 50000000 /* NVME_SYNC_SPIN_MAX, drivers/nvme/sync.pdx */) -> NVMEIO_DECODE_BAD mapped to NVMEIO_SUBMIT_TIMEOUT, non-zero mapped to NVMEIO_SUBMIT_CQE_ERR, zero -> success, return nblocks*lba_size. Every sentinel comparison against a value with bit 31/63 set is staged through `mov r10, <imm>; cmp reg, r10` (imm32 cmp operands sign-extend). Labels prefixed nvme_ios_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 40;
+
+        mov rbx, rdi;                     // ctrl_row_id
+        mov rbp, rsi;                     // ns_row
+        mov r12, rdx;                     // opcode
+        mov r13, rcx;                     // lba
+        mov r14, r8;                      // nblocks
+        mov r15, r9;                      // dma_iova
+
+        // ---- validate opcode ----
+        cmp r12, 1;
+        je  nvme_ios_op_ok;
+        cmp r12, 2;
+        je  nvme_ios_op_ok;
+        mov rax, 0xEEEE;
+        jmp nvme_ios_out;
+      nvme_ios_op_ok:
+
+        // ---- pick a pair ----
+        mov rdi, rbx;
+        call nvme_io_pick_pair;
+        mov r10, 0xFFFFEC58;              // NVMEIO_PICK_NONE
+        cmp rax, r10;
+        je  nvme_ios_pick_fail;
+        mov [rsp + 0], rax;               // pair_row
+
+        // ---- state recheck ----
+        mov r10, [rsp + 0];
+        xor rax, rax;
+        mov_b rax, [r10 + 1];
+        cmp rax, 3;                       // NVME_IOP_STATE_SQ_LIVE
+        jne nvme_ios_bad_state;
+
+        // ---- bar0 ----
+        mov rdi, rbx;
+        call nvme_ctrl_row_bar0;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvme_ios_bad_state;
+        mov [rsp + 8], rax;               // bar0
+
+        // ---- lba_size ----
+        mov rdi, rbp;
+        call nvme_ns_row_lba_size;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvme_ios_bad_state;
+        mov [rsp + 16], rax;              // lba_size
+
+        // ---- nsid ----
+        mov rdi, rbp;
+        call nvme_ns_row_nsid;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvme_ios_bad_state;
+        mov [rsp + 24], rax;              // nsid
+
+        // ---- block_count bound check ----
+        mov rdi, rbp;
+        call nvme_ns_row_block_count;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvme_ios_bad_state;
+        mov r11, r13;
+        add r11, r14;                     // lba + nblocks
+        cmp r11, rax;
+        ja  nvme_ios_lba_oob;
+
+        // ---- mdts bound check ----
+        mov rdi, rbx;
+        call nvme_ctrl_row_mdts;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvme_ios_bad_state;
+        mov rcx, rax;
+        add rcx, 12;                      // shift = 12 + mdts
+        mov rax, 1;
+        shl rax, cl;                      // mdts_bytes
+        mov r10, rax;
+
+        mov rax, r14;                     // nblocks
+        mov rcx, [rsp + 16];              // lba_size
+        imul rax, rcx;                    // byte_len
+        cmp rax, r10;
+        ja  nvme_ios_mdts_oob;
+
+        mov r9, rax;                      // byte_len (stash, no call yet)
+
+        // ---- build packed helper args ----
+        mov rax, [rsp + 24];              // nsid
+        mov r10, 0xFFFFFFFF;
+        and rax, r10;
+        mov rcx, r12;                     // opcode
+        shl rcx, 32;
+        or  rax, rcx;                     // packed_nsid_op
+        mov r8, rax;
+
+        mov rax, r14;                     // nblocks
+        and rax, 0xFFFF;
+        mov rcx, r9;                      // byte_len
+        shl rcx, 16;
+        or  rax, rcx;                     // packed_nb_bytelen
+        mov r11, rax;
+
+        mov rdi, [rsp + 0];               // pair_row
+        mov rsi, [rsp + 8];               // bar0
+        mov rdx, r8;                      // packed_nsid_op
+        mov rcx, r13;                     // lba
+        mov r8, r11;                      // packed_nb_bytelen
+        mov r9, r15;                      // dma_iova
+        call nvme_iox_sqe_submit;
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvme_ios_submit_fail;
+        mov r8, rax;                      // cid
+
+        // ---- drain ----
+        mov rdi, [rsp + 0];               // pair_row
+        mov rsi, [rsp + 8];               // bar0
+        mov rdx, r8;                      // expected_cid
+        mov rcx, 50000000;                // NVME_SYNC_SPIN_MAX (drivers/nvme/sync.pdx)
+        call nvme_io_completion_drain;
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvme_ios_timeout;
+
+        cmp rax, 0;
+        jne nvme_ios_cqe_err;
+
+        // ---- success: bytes = nblocks * lba_size ----
+        mov rax, r14;
+        mov rcx, [rsp + 16];
+        imul rax, rcx;
+        jmp nvme_ios_out;
+
+      nvme_ios_pick_fail:
+        mov rax, 0xFFFFEC58;              // NVMEIO_PICK_NONE
+        jmp nvme_ios_out;
+
+      nvme_ios_bad_state:
+        mov rax, 0xFFFFEC54;              // NVMEIO_STATE_BAD
+        jmp nvme_ios_out;
+
+      nvme_ios_lba_oob:
+        mov rax, 0xE001;
+        jmp nvme_ios_out;
+
+      nvme_ios_mdts_oob:
+        mov rax, 0xE002;
+        jmp nvme_ios_out;
+
+      nvme_ios_submit_fail:
+        mov rax, 0xFFFFEC55;              // NVMEIO_SUBMIT_ENOROOM
+        jmp nvme_ios_out;
+
+      nvme_ios_timeout:
+        mov rax, 0xFFFFEC56;              // NVMEIO_SUBMIT_TIMEOUT
+        jmp nvme_ios_out;
+
+      nvme_ios_cqe_err:
+        mov rax, 0xFFFFEC57;              // NVMEIO_SUBMIT_CQE_ERR
+
+      nvme_ios_out:
+        add rsp, 40;
         pop r15;
         pop r14;
         pop r13;
