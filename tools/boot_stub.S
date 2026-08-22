@@ -113,7 +113,7 @@ _pml4_addr:
 # Emitted via uart_puts (RAW), never klog_s1 — the klog formatter prefixes
 # every line with "TSC|cpu|level|SUBSYS|", which would shred the art.
 # banner_msg below is deliberately left byte-identical: the literal line
-# "PaideiaOS R8" is asserted in 21 expected/golden files, and goldens are
+# "PaideiaOS" is asserted in 20 expected/golden files, and goldens are
 # ordered-subsequence checks, so the art is ADDED around it rather than
 # replacing it.
 .global banner_art
@@ -132,10 +132,12 @@ banner_art:
     .ascii "\0"
 
 # B3-004: Banner string for kernel startup message
+# #1761: round provenance stripped from runtime output per
+# design/policy/output-provenance-strip.md.
 .global banner_msg
 .align 8
 banner_msg:
-    .ascii "PaideiaOS R8\n\0"
+    .ascii "PaideiaOS\n\0"
 
 # B5-005: Capability system smoke test message
 .global cap_ok_msg
