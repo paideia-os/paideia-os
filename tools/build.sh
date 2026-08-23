@@ -5816,13 +5816,23 @@ echo "[r52-m2-confine] R52.M2 (superblock_write) confined"
 # loop) are all single-writer state confined to this one module -- a
 # second writer could race a region-zero write mid-submission or corrupt
 # the superblock scratch between mkfs_sb_populate and sb_write.
+#
+# _mkfs_layout_row / _mkfs_sb_scratch additionally list the two boot
+# witnesses that drive mkfs.pdx's in-memory halves directly (#1691's
+# mkfs_probe_witness_synth.o, #1690's mkfs_mount_refuse_witness_synth.o)
+# as owners: both call mkfs_layout_compute/mkfs_sb_populate themselves
+# (no live BDEV attached under any current smoke invocation -- see each
+# witness's own header) and therefore legitimately relocate against
+# these two symbols too. _mkfs_zero_buf/_mkfs_zero_desc stay confined to
+# mkfs.o alone -- #1690's witness owns its own local all-zero itable-row
+# buffer instead of reaching into mkfs.o's.
 R52_MKFS_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/mkfs.pdx"
 if [[ ! -f "${R52_MKFS_SRC}" ]]; then
     echo "[r52-m2-confine] FAIL - mkfs.pdx missing" >&2
     exit 1
 fi
-ec_confine_one '_mkfs_layout_row' 'core/fs/pdxfs/mkfs.o tests/kernel/fs/pdxfs/mkfs_probe_witness_synth.o'
-ec_confine_one '_mkfs_sb_scratch' 'core/fs/pdxfs/mkfs.o tests/kernel/fs/pdxfs/mkfs_probe_witness_synth.o'
+ec_confine_one '_mkfs_layout_row' 'core/fs/pdxfs/mkfs.o tests/kernel/fs/pdxfs/mkfs_probe_witness_synth.o tests/kernel/fs/pdxfs/mkfs_mount_refuse_witness_synth.o'
+ec_confine_one '_mkfs_sb_scratch' 'core/fs/pdxfs/mkfs.o tests/kernel/fs/pdxfs/mkfs_probe_witness_synth.o tests/kernel/fs/pdxfs/mkfs_mount_refuse_witness_synth.o'
 ec_confine_one '_mkfs_zero_buf'   'core/fs/pdxfs/mkfs.o'
 ec_confine_one '_mkfs_zero_desc'  'core/fs/pdxfs/mkfs.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then
