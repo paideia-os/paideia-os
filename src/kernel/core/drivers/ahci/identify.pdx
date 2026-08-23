@@ -1,0 +1,623 @@
+// src/kernel/core/drivers/ahci/identify.pdx -- R51.M5-005 (#1661).
+//
+// IDENTIFY DEVICE (ATA opcode 0xEC via H2D Register FIS 0x27) submit +
+// parse.  Design authority: design/hardware/ahci-substrate.md (commit
+// 9f59498) §2.4 (per-port DMA layout), §2.5 (FIS discipline), §2.6
+// (IDENTIFY DEVICE parsing), §7 #1661.
+//
+// This file lands:
+//   - a per-port 512 B IDENTIFY response buffer pool (the data buffer
+//     a PRDT entry points at -- distinct from drivers/ahci/cmd_alloc.pdx's
+//     Command List / Command Table pools, which hold no room for the
+//     actual DMA'd payload);
+//   - a per-port 32 B parsed-result scratch pool (`_ahci_identify_scratch`
+//     -- the exact structure design's §1 NVMe-parallel table names:
+//     "populates sector_size / LBA48 / block_count into
+//     `_ahci_identify_scratch` fields the port mint reads") plus its
+//     field accessors;
+//   - `ahci_identify_parse`, which decodes the 512 B response per §2.6;
+//   - `ahci_identify_device_submit`, which builds the command header +
+//     Command FIS + PRDT entry, rings the doorbell, polls to
+//     completion, checks the D2H status byte, and calls the parser.
+//
+// =============================================================================
+// SECTION 0  WHY A SEPARATE DATA-BUFFER POOL (not cmd_alloc.pdx's pools)
+// =============================================================================
+//
+// drivers/ahci/cmd_alloc.pdx (R51.M6-001, #1663) allocates the Command
+// List (32 command headers) and the Command Table (H2D FIS slot + PRDT
+// *entries*) per port.  A PRDT entry's DBA/DBAU field is a pointer to
+// the ACTUAL DATA BUFFER the device DMAs the 512 B IDENTIFY response
+// into -- a region cmd_alloc.pdx never reserved (its own SECTION 1
+// deliberately scopes the Command Table to "header + PRDT capacity",
+// not payload space, matching real AHCI hardware's Command
+// Table/PRDT-vs-data-buffer separation). This file therefore owns its
+// own per-port 512 B pool (`_ahci_identify_buf_pool`), following the
+// same "static per-port pool, port indexed" precedent cmd_alloc.pdx's
+// own SECTION 0 establishes for exactly this reason (no `dma_domain_map`
+// primitive exists yet to carve a page on demand).
+//
+// =============================================================================
+// SECTION 0b  INDEXING BY row_id, NOT port_slot -- A LANDED #1660 GAP
+// =============================================================================
+//
+// DESIGN-DOC / IMPLEMENTATION GAP (flagged to softarch/debugger review,
+// see final report): cap/kind_ahci_port.pdx's own SECTION 1 documents
+// `port_slot` as "assigned equal to the row_id at mint (0..AHCIP_MAX-1)",
+// and drivers/ahci/cmd_alloc.pdx's `ahci_port_cmd_regions_prepare`
+// derives its pool index from `ahci_port_row_port_slot(port_row_id)`
+// on the strength of that documented invariant. The LANDED
+// `ahci_port_cap_mint_inner` (#1660) does NOT honor it: step (7) packs
+// the header via `xor rdi, rdi; // port_slot = 0 placeholder` --
+// literally zero for EVERY row, unconditionally, never the row_id.
+// Consequently EVERY port's `ahci_port_row_port_slot` reads back 0,
+// which means cmd_alloc.pdx's CL/CT pool slot is 0 for every port too
+// -- a real cross-port aliasing bug for any multi-port controller
+// (harmless only because the R51 witness posture mints exactly one
+// port). This file does NOT repeat that mistake: every pool this file
+// owns (`_ahci_identify_buf_pool`, `_ahci_identify_scratch`) is indexed
+// by `row_id` directly (bound 0..AHCIP_MAX-1, the same range
+// port_slot was supposed to occupy), not by the broken
+// `ahci_port_row_port_slot` accessor. `drivers/ahci/port.pdx`'s own
+// per-port FIS-receive-area pool follows the same row_id-indexed
+// posture for the same reason -- see that file's header. Fixing
+// `ahci_port_cap_mint_inner` itself is out of scope for this issue
+// (#1660 is a landed, separately-owned file) and is flagged in the
+// final report rather than patched here.
+//
+// =============================================================================
+// SECTION 1  IDENTIFY DEVICE RESPONSE FIELDS (design §2.6, SATA-IO 3.5 §7.16)
+// =============================================================================
+//
+//   Word 60/61 (bytes 120/122): LBA28 total sectors (u32) -- read as a
+//     floor only; M5 does not persist this.
+//   Word 83 (byte 166): bit 10 = LBA48 supported. M5 REFUSES
+//     (AHCIP_MINT_NO_LBA48) if clear.
+//   Word 100..103 (bytes 200/202/204/206): LBA48 total sectors (u64).
+//   Word 106 (byte 212): bit 12 = "logical sector > 512 B"; if clear,
+//     sector_size = 512.
+//   Word 117/118 (bytes 234/236): words-per-logical-sector (u32); if
+//     word 106 bit 12 is set, sector_size = that value * 2 (bytes).
+//   Word 169 (byte 338): bit 0 = DRAT (Deterministic Read After TRIM).
+//     Stashed but not acted on at M5 (M6 gates TRIM on it).
+//
+// =============================================================================
+// SECTION 2  FAILURE TAXONOMY -- reusing the #1660 band, per task scope
+// =============================================================================
+//
+// The task's own scope note names "Failure band: 0xFFFFEC80..EC98
+// (port + overflow band from #1660)" for this issue -- but every code
+// in that ENTIRE range (0xFFFFEC80..EC84 design-allocated +
+// 0xFFFFEC90..EC98 #1660's own spillover) is already claimed by
+// kind_ahci_port.pdx's landed mint/tail/revoke apparatus (see that
+// file's SECTION 3). Two of those codes were pre-reserved BY DESIGN
+// for this exact issue and are consumed here / by
+// drivers/ahci/port.pdx unchanged:
+//
+//   AHCIP_MINT_BAD_SIG   0xFFFFEC81  -- SIG != 0x00000101 (port.pdx)
+//   AHCIP_MINT_NO_LBA48  0xFFFFEC82  -- word 83 bit 10 clear (this file)
+//
+// DESIGN-DOC GAP (flagged to softarch/debugger review, see final
+// report): design §6 never allocated codes for "IDENTIFY submit
+// timed out" / "task-file error during IDENTIFY" -- every M6 code
+// design pre-names (AHCIIO_SUBMIT_*, 0xFFFFECA2..A5) is explicitly
+// earmarked for the ONGOING R/W path (#1664/#1665), not port bring-up.
+// Per the overflow-band precedent kind_ahci_port.pdx's own SECTION 3
+// already sets (claim from the still-open 0xFFFFEC99..EC9F remainder,
+// document why), this file's sibling drivers/ahci/port.pdx claims
+// THREE of those seven remaining codes for bring-up + IDENTIFY-submit
+// failures (0xFFFFEC99..EC9B); this file uses two more
+// (0xFFFFEC9C..EC9D) for the IDENTIFY-submit-specific timeout / TFERR
+// paths, leaving 0xFFFFEC9E..EC9F (2 codes) plus the entire untouched
+// 0xFFFFECA0..ECAF band for M6, consistent with kind_ahci_port.pdx's
+// own stated intent ("for M6 (I/O submit + TFERR + hot-plug)") even
+// though M5-005 turned out to need a few of the codes that comment
+// assumed would stay unclaimed until M6.
+//
+//   AHCIP_IDENTIFY_SUBMIT_TIMEOUT  0xFFFFEC9C  -- CI bit0 never cleared
+//   AHCIP_IDENTIFY_TFERR           0xFFFFEC9D  -- PxIS.TFES or D2H ERR
+//
+// =============================================================================
+// SECTION 3  paideia-as encoder-gap posture (v0.22.x)
+// =============================================================================
+//
+//   G1: `mov_w` zero-extending loads for every IDENTIFY word field (all
+//       naturally 2-byte aligned within the 512 B buffer); `mov_b`
+//       (with a preceding `xor`, per this issue's own constraint) for
+//       the single D2H status-byte read in ahci_identify_device_submit.
+//   G4: full-register compares throughout; bit masks (0x0400, 0x1000,
+//       0x40000000, 1) all fit imm32 and are staged via `mov r10, imm;
+//       and/cmp` for clarity even where a plain `and rax, imm32` would
+//       also be safe (none of these masks have bit 31 set except
+//       AHCI_PXIS_TFES, which is staged in r10 defensively).
+//   r11/r10 imm64 staging: 0xFFFFEC9C/9D/82 and the 0xFFFFFFFFFFFFFFFF
+//       decode-bad sentinel are only ever `mov r64, imm64` TARGETS
+//       (never a `cmp`/`or` operand needing r10-staging) except where
+//       explicitly staged below for a register-register compare
+//       against a value already carrying that sentinel.
+//   Arity: `ahci_identify_parse` (2 args), `ahci_identify_device_submit`
+//       (1 arg), every accessor (1 arg) -- all well under 6.
+//   No imul: pool index arithmetic uses `shl` only (row_id*512 -> shl 9,
+//       row_id*32 -> shl 5).
+//   Reserved-label discipline: labels prefixed `ahci_id_`, per this
+//       issue's own scope note and design §8.2 (this is also the one
+//       prefix assignment in the task's scope note that does NOT
+//       collide with any landed file's labels -- see port.pdx's header
+//       for the `ahci_pr_`/`ahci_pt_` substitution it had to make).
+//       `loop`, `if`, `port`, `reset`, `enum` never appear bare.
+//
+// =============================================================================
+
+module AhciIdentify = structure {
+
+  pub let AHCI_IDENTIFY_OPCODE   : u64 = 0xEC   // IDENTIFY DEVICE
+  pub let AHCI_IDENTIFY_BUF_BYTES: u64 = 512
+
+  pub let AHCIP_IDENTIFY_SUBMIT_TIMEOUT : u64 = 0xFFFFEC9C
+  pub let AHCIP_IDENTIFY_TFERR          : u64 = 0xFFFFEC9D
+
+  // 32 ports * 512 B = 16384 B = 2048 u64 words. Indexed by row_id
+  // (SECTION 0b) -- NOT by the currently-broken port_slot accessor.
+  pub let mut _ahci_identify_buf_pool : [u64; 2048] = uninit @align(4096)
+
+  // 32 ports * 32 B (4 u64 words: sector_size/block_count/lba48_ok/drat)
+  // = 1024 B = 128 u64 words. Indexed by row_id.
+  pub let mut _ahci_identify_scratch : [u64; 128] = uninit @align(64)
+
+  // ==========================================================================
+  // ahci_id_buf_phys(row_id) -> phys | 0xFFFFFFFFFFFFFFFF
+  //
+  // IDENTIFY response data-buffer base for this row (the address a
+  // PRDT entry's DBA/DBAU points at). Leaf; no nested calls.
+  // ==========================================================================
+  pub let ahci_id_buf_phys : (u64) -> u64 !{} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R51.M5-005 (#1661): IDENTIFY data-buffer base = &_ahci_identify_buf_pool + row_id * AHCI_IDENTIFY_BUF_BYTES (512, power of two -> shl 9). Bound: row_id < 32 (AHCIP_MAX), else the shared decode-bad sentinel. Leaf.",
+      block: {
+        mov r10, 32;
+        cmp rdi, r10;
+        jae ahci_id_bufp_bad;
+
+        lea rax, [rip + _ahci_identify_buf_pool];
+        mov r10, rdi;
+        shl r10, 9;                      // row_id * 512
+        add rax, r10;
+        ret;
+
+      ahci_id_bufp_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_id_scratch_base(row_id) -> phys | 0xFFFFFFFFFFFFFFFF
+  // ==========================================================================
+  pub let ahci_id_scratch_base : (u64) -> u64 !{} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R51.M5-005 (#1661): parsed-result scratch base = &_ahci_identify_scratch + row_id * 32 (shl 5). Bound: row_id < 32. Leaf.",
+      block: {
+        mov r10, 32;
+        cmp rdi, r10;
+        jae ahci_id_scb_bad;
+
+        lea rax, [rip + _ahci_identify_scratch];
+        mov r10, rdi;
+        shl r10, 5;                      // row_id * 32
+        add rax, r10;
+        ret;
+
+      ahci_id_scb_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_id_scratch_sector_size / _block_count / _lba48_ok / _drat (row_id)
+  //   -> value | 0xFFFFFFFFFFFFFFFF
+  //
+  // Field accessors over the scratch row ahci_identify_parse populates:
+  // [+0] sector_size, [+8] block_count, [+16] lba48_ok, [+24] drat.
+  // ==========================================================================
+  pub let ahci_id_scratch_sector_size : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M5-005 (#1661): sector_size field, or decode-bad. One push (r12, padding) for the one nested ahci_id_scratch_base call.",
+      block: {
+        push r12;
+        call ahci_id_scratch_base;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahci_id_scss_bad;
+        mov rax, [rax + 0];
+        jmp ahci_id_scss_out;
+      ahci_id_scss_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      ahci_id_scss_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let ahci_id_scratch_block_count : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M5-005 (#1661): block_count field, or decode-bad.",
+      block: {
+        push r12;
+        call ahci_id_scratch_base;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahci_id_scbc_bad;
+        mov rax, [rax + 8];
+        jmp ahci_id_scbc_out;
+      ahci_id_scbc_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      ahci_id_scbc_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let ahci_id_scratch_lba48_ok : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M5-005 (#1661): lba48_ok field (0/1), or decode-bad.",
+      block: {
+        push r12;
+        call ahci_id_scratch_base;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahci_id_sclo_bad;
+        mov rax, [rax + 16];
+        jmp ahci_id_sclo_out;
+      ahci_id_sclo_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      ahci_id_sclo_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let ahci_id_scratch_drat : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M5-005 (#1661): drat field (0/1), or decode-bad.",
+      block: {
+        push r12;
+        call ahci_id_scratch_base;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahci_id_scdr_bad;
+        mov rax, [rax + 24];
+        jmp ahci_id_scdr_out;
+      ahci_id_scdr_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      ahci_id_scdr_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_identify_parse(identify_buf_va, scratch_va) -> u64
+  //
+  // Decode the 512 B IDENTIFY DEVICE response at identify_buf_va
+  // (SECTION 1) and write the four scratch words at scratch_va (the
+  // caller passes ahci_id_scratch_base(row_id)'s result -- this
+  // function stays row-agnostic and pure over the two addresses it is
+  // given, mirroring the rest of this file's "pass an address, not an
+  // index" convention). Returns AHCIP_OK (0), or AHCIP_MINT_NO_LBA48
+  // (0xFFFFEC82) if word 83 bit 10 (LBA48 support) is clear -- per
+  // design §2.6, M5 asserts LBA48 support and refuses otherwise.
+  // ==========================================================================
+  pub let ahci_identify_parse : (u64, u64) -> u64 !{mem} @{} =
+    fn (identify_buf_va: u64) (scratch_va: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R51.M5-005 (#1661). IDENTIFY DEVICE response parser (design §2.6). Two callee-save pushes (rbx=identify_buf_va, r12=scratch_va) -- no nested calls in this function, so alignment is irrelevant, but the pushes keep the two addresses out of the way of the scratch arithmetic below. Body: (1) word 83 (byte 166) bit 10 -> lba48_ok (0/1), stored at [scratch+16]. (2) word 169 (byte 338) bit 0 -> drat, stored at [scratch+24]. (3) word 106 (byte 212) bit 12: clear -> sector_size=512; set -> sector_size = (word117 | word118<<16) * 2 (bytes 234/236, combined via two mov_w zero-extending loads + shl 16 + or, then shl 1). Stored at [scratch+0]. (4) words 100..103 (bytes 200/202/204/206) combined via mov_w + shl{16,32,48} + or into a single u64 -> block_count, stored at [scratch+8]. (5) Gate: if lba48_ok == 0, return AHCIP_MINT_NO_LBA48 (0xFFFFEC82) -- scratch is still fully populated even on this refusal path, so a caller inspecting the fields after a refused mint sees real (if unsupported) data rather than stale/zeroed state. (6) Else return 0 (AHCIP_OK). Every mov_w load zero-extends per the established fd_inherit.pdx/create.pdx precedent (no xor prefix needed for mov_w, unlike mov_b). Labels prefixed ahci_id_ps_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                    // identify_buf_va
+        mov r12, rsi;                    // scratch_va
+
+        // (1) word 83 (byte 166) bit 10 -> lba48_ok.
+        mov_w rax, [rbx + 166];
+        mov r10, 0x0400;                 // bit 10
+        and rax, r10;
+        cmp rax, 0;
+        je  ahci_id_ps_no_lba48;
+        mov rax, 1;
+        jmp ahci_id_ps_lba48_done;
+      ahci_id_ps_no_lba48:
+        xor rax, rax;
+      ahci_id_ps_lba48_done:
+        mov [r12 + 16], rax;             // lba48_ok
+
+        // (2) word 169 (byte 338) bit 0 -> drat.
+        mov_w rax, [rbx + 338];
+        and rax, 1;
+        mov [r12 + 24], rax;             // drat
+
+        // (3) word 106 (byte 212) bit 12 -> sector_size.
+        mov_w rax, [rbx + 212];
+        mov r10, 0x1000;                 // bit 12
+        and rax, r10;
+        cmp rax, 0;
+        je  ahci_id_ps_sect512;
+
+        mov_w rax, [rbx + 234];          // word 117 (low 16)
+        mov_w r10, [rbx + 236];          // word 118
+        shl r10, 16;
+        or  rax, r10;
+        shl rax, 1;                      // words -> bytes
+        jmp ahci_id_ps_sect_done;
+
+      ahci_id_ps_sect512:
+        mov rax, 512;
+
+      ahci_id_ps_sect_done:
+        mov [r12 + 0], rax;              // sector_size
+
+        // (4) words 100..103 -> block_count (u64).
+        mov_w rax, [rbx + 200];          // word 100
+        mov_w r10, [rbx + 202];          // word 101
+        shl r10, 16;
+        or  rax, r10;
+        mov_w r10, [rbx + 204];          // word 102
+        shl r10, 32;
+        or  rax, r10;
+        mov_w r10, [rbx + 206];          // word 103
+        shl r10, 48;
+        or  rax, r10;
+        mov [r12 + 8], rax;              // block_count
+
+        // (5) Gate on lba48_ok.
+        mov rax, [r12 + 16];
+        cmp rax, 0;
+        je  ahci_id_ps_bad_lba;
+
+        xor rax, rax;                    // AHCIP_OK
+        jmp ahci_id_ps_out;
+
+      ahci_id_ps_bad_lba:
+        mov rax, 0xFFFFEC82;             // AHCIP_MINT_NO_LBA48
+
+      ahci_id_ps_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_identify_device_submit(row_id) -> u64
+  //
+  // Build + ring + poll one IDENTIFY DEVICE command through slot 0 of
+  // the given port's already-programmed Command List/Table (design §7
+  // #1661's own step-by-step: "populate slot 0 Command Header (PRDTL=1,
+  // CFL=5 dwords, W=0), slot 0 Command Table (Command FIS from
+  // ahci_fis_h2d_build(.., 0xEC, 0, 0, 0), PRDT[0] pointing at 512 B
+  // identify buffer), write CI=1 for slot 0, poll CI & 1 == 0 OR
+  // IS.TFES set"). On success, parses the response via
+  // ahci_identify_parse and returns its result (AHCIP_OK or
+  // AHCIP_MINT_NO_LBA48); on any submit-path failure, returns
+  // AHCIP_BRINGUP_BAD_ROW / AHCIP_IDENTIFY_SUBMIT_TIMEOUT /
+  // AHCIP_IDENTIFY_TFERR (SECTION 2).
+  //
+  // PRECONDITION (enforced by the caller, drivers/ahci/port.pdx's
+  // ahci_port_bring_up_and_identify): the port has already been idled,
+  // its CL/CT regions bound (cmd_alloc.pdx's
+  // ahci_port_cmd_regions_prepare) and programmed (ahci_port_program --
+  // CLB/CLBU/FB/FBU written, FRE=1, ST=1). This function does not
+  // re-check FRE/ST -- design's own per-issue split places port state
+  // sequencing in port.pdx and command submission here, matching the
+  // NVMe split (nvme_admin_queue_init vs. nvme_reset in R24).
+  //
+  // Command Header layout (AHCI 1.3.1 §4.2.2 -- 32 B, slot 0 at cl_va+0):
+  //   DW0 (+0)  bits[4:0]=CFL(5), bit5=A(0), bit6=W(0), bit7=P(0),
+  //             bit8=R(0), bit9=B(0), bit10=C(0), bit11=rsvd,
+  //             bits[15:12]=PMP(0), bits[31:16]=PRDTL(1)
+  //             = 0x00010005
+  //   DW1 (+4)  PRDBC = 0 (host-initialized)
+  //   DW2 (+8)  CTBA  = ct_va low 32
+  //   DW3 (+12) CTBAU = ct_va high 32
+  //   DW4..7 (+16..31) reserved = 0
+  //
+  // PRDT entry (AHCI 1.3.1 §4.2.3.3 -- 16 B, at ct_va+128 per
+  // cmd_alloc.pdx's AHCI_CT_HDR_BYTES=128):
+  //   +0  DBA  = databuf_va low 32
+  //   +4  DBAU = databuf_va high 32
+  //   +8  reserved = 0
+  //   +12 bits[21:0]=DBC(511), bit31=I(0) -- 512 B transfer, no IRQ
+  //       (M5 polls; MSI-X consumption is dormant per design §2.3)
+  // ==========================================================================
+  pub let ahci_identify_device_submit : (u64) -> u64 !{sysreg, mem} @{cap} =
+    fn (row_id: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { cap },
+      justification: "R51.M5-005 (#1661). IDENTIFY DEVICE submit + poll + parse. Six callee-save pushes (rbx=row_id, r12=abar_pa, r13=port_index, r14=cl_va-then-deadline, r15=ct_va, rbp=databuf_va) + sub rsp,8 = 64 B; entry rsp%16==8 -> 64, %16==0 for every nested call. Sequence: (1) ahci_port_tail_valid(rbx) else AHCIP_BRINGUP_BAD_ROW (0xFFFFEC9B, drivers/ahci/port.pdx's constant -- shared bad-row sentinel for this issue's own new bring-up/identify paths). (2) port_index = ahci_port_row_port_index(rbx) -> r13. (3) parent_ctrl_row = ahci_port_row_parent(rbx); abar_pa = ahci_ctrl_row_abar(parent_ctrl_row) -> r12, DECODE_BAD -> bad_row. (4) cl_va = ahci_port_row_cl_phys(rbx) -> r14, ct_va = ahci_port_row_ct_phys(rbx) -> r15 -- DECODE_BAD or 0 (unbound, cmd_alloc.pdx's own '0 until bound' posture) both -> bad_row. (5) databuf_va = ahci_id_buf_phys(rbx) -> rbp (row_id-indexed per SECTION 0b, decode-bad sentinel guarded). (6) ahci_fis_h2d_build(r15+0, 0xEC, 0, 0, 0) -- Command FIS at the Command Table's FIS slot. (7) Write the 32 B Command Header at r14+0 per the layout table above: mov_d [r14+0],0x00010005; mov_d [r14+4],0 (PRDBC); mov_d [r14+8],r15 (CTBA lo, mov_d truncates to 32 bits per abar_reg_u32_set's own established idiom); mov rax,r15; shr rax,32; mov_d [r14+12],rax (CTBAU); xor rax,rax; mov [r14+16],rax; mov [r14+24],rax (reserved). (8) Write the PRDT entry at r15+128: mov_d [r15+128+0],rbp (DBA lo); mov rax,rbp; shr rax,32; mov_d [r15+128+4],rax (DBAU); mov_d [r15+128+8],0 (reserved); mov_d [r15+128+12],511 (DBC=511,I=0). (9) Ring the doorbell: ahci_port_reg_u32_set(r12,r13,0x38,1) -- CI, slot 0. (10) Compute a 1 s TSC-bounded deadline into r14 (cl_va is no longer needed past step 7 -- repurposed exactly as drivers/ahci/reset.pdx's ahci_hba_reset repurposes registers post-use). (11) Poll ahci_id_sb_poll: read CI (0x38) via ahci_port_reg_u32(r12,r13,..); bit0 clear -> ahci_id_sb_done. Else read port IS (0x10); AHCI_PXIS_TFES (0x40000000, staged via r10) set -> ahci_id_sb_tferr. Else rdtsc-reconstruct now, compare against r14 (deadline); >= -> ahci_id_sb_timeout (AHCIP_IDENTIFY_SUBMIT_TIMEOUT, 0xFFFFEC9C); else loop. (12) ahci_id_sb_done: fb_va = ahci_port_fb_phys(rbx) (drivers/ahci/port.pdx, row_id-indexed) -> r15 (ct_va no longer needed post step 8, repurposed). Read the D2H status byte at fb_va+0x42 via `xor rax,rax; mov_b rax,[r15+0x42]` (this issue's own byte-read constraint: xor-then-mov_b, never `test`). Bit 0 (ERR) set -> ahci_id_sb_tferr (AHCIP_IDENTIFY_TFERR, 0xFFFFEC9D). (13) Else: scratch_va = ahci_id_scratch_base(rbx) -> r13 (port_index no longer needed, repurposed); call ahci_identify_parse(rbp, r13) -> rax (0 or AHCIP_MINT_NO_LBA48) -- this IS the function's own return value, forwarded unchanged. Every sentinel compare against a bit31/63-set constant (0xFFFFFFFFFFFFFFFF, 0xFFFFEC9B/9C/9D) is either a plain `mov r64,imm64` target or staged via r10 before a register-register or register-immediate compare, per G4/design §8.5. Labels prefixed ahci_id_sb_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // row_id
+
+        // (1) Row must be live.
+        mov rdi, rbx;
+        call ahci_port_tail_valid;
+        cmp rax, 0;
+        je  ahci_id_sb_bad_row;
+
+        // (2) port_index.
+        mov rdi, rbx;
+        call ahci_port_row_port_index;
+        mov r13, rax;                    // port_index
+
+        // (3) abar_pa via parent controller row.
+        mov rdi, rbx;
+        call ahci_port_row_parent;
+        mov rdi, rax;
+        call ahci_ctrl_row_abar;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahci_id_sb_bad_row;
+        mov r12, rax;                    // abar_pa
+
+        // (4) cl_va / ct_va (bound by drivers/ahci/port.pdx's earlier
+        // ahci_port_cmd_regions_prepare call).
+        mov rdi, rbx;
+        call ahci_port_row_cl_phys;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahci_id_sb_bad_row;
+        cmp rax, 0;
+        je  ahci_id_sb_bad_row;
+        mov r14, rax;                    // cl_va
+
+        mov rdi, rbx;
+        call ahci_port_row_ct_phys;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahci_id_sb_bad_row;
+        cmp rax, 0;
+        je  ahci_id_sb_bad_row;
+        mov r15, rax;                    // ct_va
+
+        // (5) databuf_va.
+        mov rdi, rbx;
+        call ahci_id_buf_phys;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahci_id_sb_bad_row;
+        mov rbp, rax;                    // databuf_va
+
+        // (6) Command FIS at ct_va + 0.
+        mov rdi, r15;
+        mov rsi, 0xEC;                   // IDENTIFY DEVICE
+        mov rdx, 0;                      // lba48
+        mov rcx, 0;                      // count
+        mov r8,  0;                      // device
+        call ahci_fis_h2d_build;
+
+        // (7) Command Header at cl_va + 0.
+        mov rax, 0x00010005;             // PRDTL=1, CFL=5
+        mov_d [r14 + 0], rax;
+        xor rax, rax;
+        mov_d [r14 + 4], rax;            // PRDBC = 0
+        mov_d [r14 + 8], r15;            // CTBA (low 32 of ct_va)
+        mov rax, r15;
+        shr rax, 32;
+        mov_d [r14 + 12], rax;           // CTBAU
+        xor rax, rax;
+        mov [r14 + 16], rax;
+        mov [r14 + 24], rax;
+
+        // (8) PRDT[0] at ct_va + 128.
+        mov_d [r15 + 128 + 0], rbp;      // DBA (low 32 of databuf_va)
+        mov rax, rbp;
+        shr rax, 32;
+        mov_d [r15 + 128 + 4], rax;      // DBAU
+        xor rax, rax;
+        mov_d [r15 + 128 + 8], rax;      // reserved
+        mov rax, 511;                    // DBC = 512 - 1, I = 0
+        mov_d [r15 + 128 + 12], rax;
+
+        // (9) Ring CI (slot 0).
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x38;                   // AHCI_PORT_REG_CI
+        mov rcx, 1;
+        call ahci_port_reg_u32_set;
+
+        // (10) 1 s TSC-bounded deadline (r14 = cl_va, no longer needed).
+        mov rdi, 1000000000;
+        call tsc_ns_to_ticks;
+        mov r14, rax;
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        add r14, rax;                    // deadline
+
+      ahci_id_sb_poll:
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x38;                   // AHCI_PORT_REG_CI
+        call ahci_port_reg_u32;
+        mov r10, 1;
+        and rax, r10;
+        cmp rax, 0;
+        je  ahci_id_sb_done;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x10;                   // AHCI_PORT_REG_IS
+        call ahci_port_reg_u32;
+        mov r10, 0x40000000;             // AHCI_PXIS_TFES
+        and rax, r10;
+        cmp rax, 0;
+        jne ahci_id_sb_tferr;
+
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        cmp rax, r14;
+        jae ahci_id_sb_timeout;
+        jmp ahci_id_sb_poll;
+
+      ahci_id_sb_done:
+        // (12) D2H status byte at fb_va + 0x42 (r15 = ct_va, no longer needed).
+        mov rdi, rbx;
+        call ahci_port_fb_phys;
+        mov r15, rax;                    // fb_va
+
+        xor rax, rax;
+        mov_b rax, [r15 + 0x42];
+        mov r10, 1;
+        and rax, r10;
+        cmp rax, 0;
+        jne ahci_id_sb_tferr;
+
+        // (13) Parse (r13 = port_index, no longer needed).
+        mov rdi, rbx;
+        call ahci_id_scratch_base;
+        mov r13, rax;                    // scratch_va
+
+        mov rdi, rbp;                    // databuf_va
+        mov rsi, r13;                    // scratch_va
+        call ahci_identify_parse;
+        jmp ahci_id_sb_out;
+
+      ahci_id_sb_timeout:
+        mov rax, 0xFFFFEC9C;             // AHCIP_IDENTIFY_SUBMIT_TIMEOUT
+        jmp ahci_id_sb_out;
+
+      ahci_id_sb_tferr:
+        mov rax, 0xFFFFEC9D;             // AHCIP_IDENTIFY_TFERR
+        jmp ahci_id_sb_out;
+
+      ahci_id_sb_bad_row:
+        mov rax, 0xFFFFEC9B;             // AHCIP_BRINGUP_BAD_ROW (drivers/ahci/port.pdx)
+
+      ahci_id_sb_out:
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

@@ -1,0 +1,619 @@
+// src/kernel/core/drivers/ahci/port.pdx -- R51.M5-005 (#1661).
+//
+// Per-port bring-up: idle -> bind Command List/Table -> program CLB/
+// CLBU/FB/FBU -> FRE=1/ST=1 -> SIG check -> IDENTIFY DEVICE. Design
+// authority: design/hardware/ahci-substrate.md (commit 9f59498) §2.1
+// (per-port register layout), §2.2 (bring-up order), §2.4 (per-port
+// DMA layout), §7 #1661 (this issue's own per-function spec).
+//
+// This file lands:
+//   - `ahci_port_idle` -- AHCI 1.3.1 §10.3.1's mandatory quiesce
+//     sequence (ST=0/wait CR=0, FRE=0/wait FR=0) that MUST precede any
+//     (re)write of CLB/CLBU or FB/FBU.
+//   - a per-port FIS-receive-area pool + `ahci_port_fb_phys` (the one
+//     per-port DMA region drivers/ahci/cmd_alloc.pdx's #1663 pass did
+//     NOT allocate -- that file owns only the Command List / Command
+//     Table pools).
+//   - `ahci_port_program` -- writes CLB/CLBU/FB/FBU, then FRE=1 (wait
+//     FR=1), then ST=1 (wait CR=1), per AHCI 1.3.1 §10.1.2's ordering
+//     requirement (FRE before ST).
+//   - `ahci_port_read_sig` / `ahci_port_sig_classify` -- the SIG check
+//     this issue's scope names ("Port SIG check to identify SATA vs
+//     SATAPI").
+//   - `ahci_port_bring_up_and_identify` -- the top-level per-port
+//     orchestrator design §7 #1661 describes (there, as
+//     `ahci_port_bring_up_and_identify`, living in cap/kind_ahci_port.pdx
+//     "analogue of nvme_ctrl_bring_up"); this implementation keeps it
+//     in THIS file instead -- see SECTION 0b for why.
+//
+// =============================================================================
+// SECTION 0  RESERVED-LABEL PREFIX -- `ahci_pt_`, NOT `ahci_pr_`
+// =============================================================================
+//
+// The task's own scope note assigns this file the label prefix
+// `ahci_pr_`. That prefix is ALREADY LIVE: drivers/ahci/probe.pdx
+// (R51.M5-002, #1658, landed) uses `ahci_pr_` for its own labels
+// (`ahci_pr_loop` / `ahci_pr_next` / `ahci_pr_done`) -- confirmed by
+// grepping the landed file before writing this one. Reusing it here
+// would either silently collide (if this assembler resolves labels as
+// link-wide symbols, which every other file's "one unique prefix per
+// file" discipline strongly implies) or, at best, be needlessly
+// confusing. This file uses `ahci_pt_` instead -- design/hardware/
+// ahci-substrate.md §8.2's OWN assignment for this exact file, which
+// does not collide with anything landed. Flagged for the task's own
+// scope-note correction (softarch/debugger review, final report);
+// drivers/ahci/fis.pdx and drivers/ahci/identify.pdx keep the task's
+// assigned `ahci_fis_`-family / `ahci_id_` prefixes unchanged since
+// fis.pdx never needs one (no labels) and `ahci_id_` was free.
+//
+// =============================================================================
+// SECTION 0b  ORCHESTRATOR LIVES HERE, NOT IN cap/kind_ahci_port.pdx
+// =============================================================================
+//
+// design §7 #1661 places `ahci_port_bring_up_and_identify` in
+// cap/kind_ahci_port.pdx. This issue's own task scope, however, names
+// exactly three new files to CREATE (port.pdx, fis.pdx, identify.pdx)
+// and does not ask for a functional addition to kind_ahci_port.pdx
+// beyond what a state-transition mutator requires (see that file's own
+// new `ahci_port_row_state_set`, added here for the same reason
+// drivers/ahci/reset.pdx added `ahci_ctrl_row_port_map_set` to
+// kind_ahci_controller.pdx at #1659 -- "one file owns all writes to
+// this table" survives by having the CAP file add only the minimal
+// mutator a driver-split orchestrator needs). Keeping the orchestrator
+// itself in the driver split (a) matches this issue's stated file
+// scope exactly, (b) keeps kind_ahci_port.pdx's already-large body
+// (~1839 lines even before this issue) from growing further ahead of
+// the god-file-refactor directive, and (c) mirrors drivers/ahci/
+// reset.pdx's OWN precedent -- `ahci_ctrl_bring_up`, the controller's
+// analogous top-level orchestrator, likewise lives in the driver split
+// (reset.pdx), not in kind_ahci_controller.pdx. Flagged as a documented
+// deviation from the design doc's literal file placement, not a
+// functional gap.
+//
+// =============================================================================
+// SECTION 1  BRING-UP ORDER (design §2.2, §7 #1661; AHCI 1.3.1 §10.1.1/10.3.1)
+// =============================================================================
+//
+//   1. Idle the port (ST=0/wait CR=0, FRE=0/wait FR=0) -- MUST precede
+//      any CLB/CLBU or FB/FBU write (AHCI 1.3.1 §10.1.2).
+//   2. Bind the Command List / Command Table regions onto the row
+//      (drivers/ahci/cmd_alloc.pdx's ahci_port_cmd_regions_prepare --
+//      that file's own SECTION 0b explicitly names #1661 as the caller
+//      it was written to be invoked by, "as ITS step 2 once its own
+//      step 1 (idle) has run").
+//   3. Program CLB/CLBU/FB/FBU, FRE=1 (wait FR=1), ST=1 (wait CR=1).
+//   4. Read SIG; classify SATA vs SATAPI; refuse (AHCIP_MINT_BAD_SIG)
+//      if not a plain SATA disk (M5 has no IDENTIFY PACKET DEVICE path
+//      for ATAPI).
+//   5. Submit IDENTIFY DEVICE (drivers/ahci/identify.pdx's
+//      ahci_identify_device_submit) and parse the response.
+//   6. Advance the row state MINTED -> IDENTIFIED
+//      (cap/kind_ahci_port.pdx's ahci_port_row_state_set, new in this
+//      issue).
+//
+// =============================================================================
+// SECTION 2  FAILURE TAXONOMY -- see drivers/ahci/identify.pdx SECTION 2
+// for the full accounting of why this issue's new codes sit at
+// 0xFFFFEC99..EC9D rather than the (fully-spent) 0xFFFFEC80..EC98
+// band the task's own scope note names.
+// =============================================================================
+//
+//   AHCIP_BRINGUP_IDLE_TIMEOUT     0xFFFFEC99  -- CR or FR never cleared
+//   AHCIP_BRINGUP_PROGRAM_TIMEOUT  0xFFFFEC9A  -- FR or CR never asserted
+//   AHCIP_BRINGUP_BAD_ROW          0xFFFFEC9B  -- row not live / regions unbound
+//
+// AHCIP_MINT_BAD_SIG (0xFFFFEC81) and AHCIP_MINT_NO_LBA48 (0xFFFFEC82)
+// are landed constants (cap/kind_ahci_port.pdx, #1660) design §6
+// pre-reserved for exactly this issue; reused here and in
+// identify.pdx respectively, not redefined.
+//
+// =============================================================================
+// SECTION 3  paideia-as encoder-gap posture (v0.22.x)
+// =============================================================================
+//
+//   G1: all per-port MMIO access routes through
+//       drivers/ahci/regs.pdx's ahci_port_reg_u32(_set) (this issue's
+//       own extension to that file), which itself delegates to
+//       abar_reg_u32(_set)'s `mov_d` sized store -- no direct sub-8-byte
+//       MMIO access in this file.
+//   G4: full-register compares (PxCMD.ST/FRE/FR/CR bit tests via
+//       `and`/`cmp`, never `test`) throughout, mirroring
+//       drivers/ahci/reset.pdx's own posture.
+//   r10/r11 imm64 staging: every failure-taxonomy constant this file
+//       returns is a plain `mov r64, imm64` TARGET (never a `cmp`/`or`
+//       operand), so no staging is required for them, matching
+//       drivers/ahci/reset.pdx's own documented carve-out (design
+//       §8.5). The one exception -- comparing a raw SIG register
+//       value against AHCI_SIG_ATA/AHCI_SIG_ATAPI in
+//       ahci_port_sig_classify -- stages both constants via `mov r10,
+//       imm; cmp rdi, r10` even though AHCI_SIG_ATA (0x101) would fit
+//       a plain imm32 cmp, for a single consistent idiom across both
+//       branches.
+//   No `imul`: the one pool-index multiply this file needs (row_id *
+//       256 for the FIS-receive-area pool) is a power of two -> `shl 8`.
+//   Reserved-label discipline: labels prefixed `ahci_pt_` (SECTION 0).
+//       `loop`, `if`, `port`, `reset`, `enum` never appear bare.
+//
+// =============================================================================
+
+module AhciPort = structure {
+
+  pub let AHCIP_BRINGUP_IDLE_TIMEOUT    : u64 = 0xFFFFEC99
+  pub let AHCIP_BRINGUP_PROGRAM_TIMEOUT : u64 = 0xFFFFEC9A
+  pub let AHCIP_BRINGUP_BAD_ROW         : u64 = 0xFFFFEC9B
+
+  pub let AHCI_PORT_FB_BYTES : u64 = 256
+
+  // 32 ports * 256 B = 8192 B = 1024 u64 words. Indexed by row_id, NOT
+  // by the currently-broken ahci_port_row_port_slot accessor -- see
+  // drivers/ahci/identify.pdx's SECTION 0b for the full writeup of why.
+  pub let mut _ahci_port_fb_pool : [u64; 1024] = uninit @align(4096)
+
+  // ==========================================================================
+  // ahci_port_fb_phys(row_id) -> phys | 0xFFFFFFFFFFFFFFFF
+  //
+  // FIS-receive-area base for this row (the address ahci_port_program
+  // writes into FB/FBU, and drivers/ahci/identify.pdx reads the D2H
+  // status byte out of at +0x42). Leaf; no nested calls.
+  // ==========================================================================
+  pub let ahci_port_fb_phys : (u64) -> u64 !{} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R51.M5-005 (#1661): FIS-receive-area base = &_ahci_port_fb_pool + row_id * AHCI_PORT_FB_BYTES (256, power of two -> shl 8). Bound: row_id < 32 (AHCIP_MAX), else the shared decode-bad sentinel. Leaf. Labels prefixed ahci_pt_fbp_.",
+      block: {
+        mov r10, 32;
+        cmp rdi, r10;
+        jae ahci_pt_fbp_bad;
+
+        lea rax, [rip + _ahci_port_fb_pool];
+        mov r10, rdi;
+        shl r10, 8;                      // row_id * 256
+        add rax, r10;
+        ret;
+
+      ahci_pt_fbp_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_port_idle(abar_pa, port_index) -> u64
+  //
+  // AHCI 1.3.1 §10.3.1 quiesce: clear ST, poll CR==0 (bounded 100 ms);
+  // clear FRE, poll FR==0 (bounded 100 ms). MUST run before any
+  // CLB/CLBU or FB/FBU (re)write.
+  // ==========================================================================
+  pub let ahci_port_idle : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (abar_pa: u64) (port_index: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R51.M5-005 (#1661). Port idle/quiesce per AHCI 1.3.1 §10.3.1. Three callee-save pushes (rbx=abar_pa, r12=port_index, r13=deadline) = 24 B; entry rsp%16==8 -> 32, %16==0 already (mirrors drivers/ahci/reset.pdx's ahci_ctrl_bring_up 3-push-no-pad shape). Body: (1) rbx=abar_pa, r12=port_index. (2) Read CMD (0x18) via ahci_port_reg_u32; `mov r10, AHCI_PXCMD_ST (1); not r10; and rax, r10` clears bit 0; write back via ahci_port_reg_u32_set. (3) Compute a 100 ms TSC-bounded deadline into r13 (tsc_ns_to_ticks(100_000_000) + rdtsc-reconstruct). (4) Poll ahci_pt_idle_cr_poll: read CMD; `and rax, AHCI_PXCMD_CR (0x4000)`; zero -> proceed; else rdtsc-reconstruct now, compare against r13, >= -> timeout, else loop. (5) Clear CMD.FRE (bit 4) via the same not-mask idiom, write back. (6) Fresh 100 ms deadline into r13. (7) Poll ahci_pt_idle_fr_poll on CMD.FR (bit 14) == 0, same shape. (8) Success: xor rax,rax. Timeout: mov rax, 0xFFFFEC99 (AHCIP_BRINGUP_IDLE_TIMEOUT). Every PxCMD bit test is and/cmp, never test, per G4. Labels prefixed ahci_pt_idle_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // abar_pa
+        mov r12, rsi;                    // port_index
+
+        // Clear CMD.ST.
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x18;                   // AHCI_PORT_REG_CMD
+        call ahci_port_reg_u32;
+
+        mov r10, 0x00000001;             // AHCI_PXCMD_ST
+        not r10;
+        and rax, r10;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x18;
+        mov rcx, rax;
+        call ahci_port_reg_u32_set;
+
+        // Poll CMD.CR == 0, bounded 100 ms.
+        mov rdi, 100000000;
+        call tsc_ns_to_ticks;
+        mov r13, rax;
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        add r13, rax;                    // deadline
+
+      ahci_pt_idle_cr_poll:
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x18;
+        call ahci_port_reg_u32;
+        mov r10, 0x00008000;             // AHCI_PXCMD_CR
+        and rax, r10;
+        cmp rax, 0;
+        je  ahci_pt_idle_cr_done;
+
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        cmp rax, r13;
+        jae ahci_pt_idle_timeout;
+        jmp ahci_pt_idle_cr_poll;
+
+      ahci_pt_idle_cr_done:
+        // Clear CMD.FRE.
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x18;
+        call ahci_port_reg_u32;
+
+        mov r10, 0x00000010;             // AHCI_PXCMD_FRE
+        not r10;
+        and rax, r10;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x18;
+        mov rcx, rax;
+        call ahci_port_reg_u32_set;
+
+        // Poll CMD.FR == 0, bounded 100 ms (fresh deadline).
+        mov rdi, 100000000;
+        call tsc_ns_to_ticks;
+        mov r13, rax;
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        add r13, rax;
+
+      ahci_pt_idle_fr_poll:
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x18;
+        call ahci_port_reg_u32;
+        mov r10, 0x00004000;             // AHCI_PXCMD_FR
+        and rax, r10;
+        cmp rax, 0;
+        je  ahci_pt_idle_done;
+
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        cmp rax, r13;
+        jae ahci_pt_idle_timeout;
+        jmp ahci_pt_idle_fr_poll;
+
+      ahci_pt_idle_done:
+        xor rax, rax;
+        jmp ahci_pt_idle_out;
+
+      ahci_pt_idle_timeout:
+        mov rax, 0xFFFFEC99;             // AHCIP_BRINGUP_IDLE_TIMEOUT
+
+      ahci_pt_idle_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_port_program(abar_pa, port_index, clb_va, fb_va) -> u64
+  //
+  // Write CLB/CLBU/FB/FBU, set FRE=1 (wait FR=1), then ST=1 (wait
+  // CR=1) -- AHCI 1.3.1 §10.1.2 requires FRE before ST.
+  // ==========================================================================
+  pub let ahci_port_program : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (abar_pa: u64) (port_index: u64) (clb_va: u64) (fb_va: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R51.M5-005 (#1661). Port program: CLB/CLBU/FB/FBU write, then FRE=1/wait FR=1, then ST=1/wait CR=1 (AHCI 1.3.1 §10.1.2 ordering). Five callee-save pushes (rbx=abar_pa, r12=port_index, r13=clb_va, r14=fb_va, r15=deadline) = 40 B; entry rsp%16==8 -> 48, %16==0 already. Body: (1) CLB/CLBU: ahci_port_reg_u32_set(rbx,r12,0x00,r13) -- low 32 of clb_va, truncated by the G1 mov_d store; then mov rax,r13; shr rax,32; ahci_port_reg_u32_set(rbx,r12,0x04,rax) for CLBU. (2) FB/FBU: same pattern at offsets 0x08/0x0C with r14 (fb_va). (3) Read CMD (0x18); `or rax, AHCI_PXCMD_FRE (0x10)`; write back. (4) 100 ms TSC-bounded poll on CMD.FR (0x4000) != 0 -> proceed; timeout -> AHCIP_BRINGUP_PROGRAM_TIMEOUT (0xFFFFEC9A). (5) Read CMD; `or rax, AHCI_PXCMD_ST (0x1)`; write back. (6) Fresh 100 ms poll on CMD.CR (0x8000) != 0 -> success; timeout -> same code. Labels prefixed ahci_pt_prog_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // abar_pa
+        mov r12, rsi;                    // port_index
+        mov r13, rdx;                    // clb_va
+        mov r14, rcx;                    // fb_va
+
+        // CLB (low 32 of clb_va; truncated by the underlying mov_d store).
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x00;                   // AHCI_PORT_REG_CLB
+        mov rcx, r13;
+        call ahci_port_reg_u32_set;
+
+        // CLBU (high 32 of clb_va).
+        mov rax, r13;
+        shr rax, 32;
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x04;                   // AHCI_PORT_REG_CLBU
+        mov rcx, rax;
+        call ahci_port_reg_u32_set;
+
+        // FB.
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x08;                   // AHCI_PORT_REG_FB
+        mov rcx, r14;
+        call ahci_port_reg_u32_set;
+
+        // FBU.
+        mov rax, r14;
+        shr rax, 32;
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x0C;                   // AHCI_PORT_REG_FBU
+        mov rcx, rax;
+        call ahci_port_reg_u32_set;
+
+        // CMD.FRE = 1.
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x18;                   // AHCI_PORT_REG_CMD
+        call ahci_port_reg_u32;
+        mov r10, 0x00000010;             // AHCI_PXCMD_FRE
+        or  rax, r10;
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x18;
+        mov rcx, rax;
+        call ahci_port_reg_u32_set;
+
+        // Poll CMD.FR == 1, bounded 100 ms.
+        mov rdi, 100000000;
+        call tsc_ns_to_ticks;
+        mov r15, rax;
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        add r15, rax;
+
+      ahci_pt_prog_fr_poll:
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x18;
+        call ahci_port_reg_u32;
+        mov r10, 0x00004000;             // AHCI_PXCMD_FR
+        and rax, r10;
+        cmp rax, 0;
+        jne ahci_pt_prog_fr_done;
+
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        cmp rax, r15;
+        jae ahci_pt_prog_timeout;
+        jmp ahci_pt_prog_fr_poll;
+
+      ahci_pt_prog_fr_done:
+        // CMD.ST = 1.
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x18;
+        call ahci_port_reg_u32;
+        mov r10, 0x00000001;             // AHCI_PXCMD_ST
+        or  rax, r10;
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x18;
+        mov rcx, rax;
+        call ahci_port_reg_u32_set;
+
+        // Poll CMD.CR == 1, bounded 100 ms.
+        mov rdi, 100000000;
+        call tsc_ns_to_ticks;
+        mov r15, rax;
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        add r15, rax;
+
+      ahci_pt_prog_cr_poll:
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 0x18;
+        call ahci_port_reg_u32;
+        mov r10, 0x00008000;             // AHCI_PXCMD_CR
+        and rax, r10;
+        cmp rax, 0;
+        jne ahci_pt_prog_done;
+
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        cmp rax, r15;
+        jae ahci_pt_prog_timeout;
+        jmp ahci_pt_prog_cr_poll;
+
+      ahci_pt_prog_done:
+        xor rax, rax;
+        jmp ahci_pt_prog_out;
+
+      ahci_pt_prog_timeout:
+        mov rax, 0xFFFFEC9A;             // AHCIP_BRINGUP_PROGRAM_TIMEOUT
+
+      ahci_pt_prog_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_port_read_sig(abar_pa, port_index) -> u64 (zero-extended u32 SIG)
+  // ==========================================================================
+  pub let ahci_port_read_sig : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (abar_pa: u64) (port_index: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R51.M5-005 (#1661): raw SIG register read (offset 0x24). One padding push (r12) for the single nested call -- rdi/rsi (abar_pa/port_index) pass through unchanged, only rdx (reg_off) is set. Labels prefixed ahci_pt_rsig_ (none needed -- straight-line, listed for prefix-completeness only).",
+      block: {
+        push r12;
+        mov rdx, 0x24;                   // AHCI_PORT_REG_SIG
+        call ahci_port_reg_u32;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_port_sig_classify(sig) -> 0 (unknown/none) | 1 (ATA) | 2 (ATAPI)
+  //
+  // This issue's own scope note: "Port SIG check to identify SATA vs
+  // SATAPI". M5 only has an IDENTIFY DEVICE path (ATA); a caller sees
+  // 2 (ATAPI) and refuses with AHCIP_MINT_BAD_SIG same as 0 (unknown)
+  // -- IDENTIFY PACKET DEVICE is out of scope at M5 -- but the
+  // classification is distinct so a future ATAPI pass has a real
+  // signal to branch on instead of re-deriving it.
+  // ==========================================================================
+  pub let ahci_port_sig_classify : (u64) -> u64 !{} @{} =
+    fn (sig: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R51.M5-005 (#1661): classify a raw SIG value. Leaf, no nested calls. Both comparison constants staged via `mov r10, imm; cmp rdi, r10` for a uniform idiom (AHCI_SIG_ATA fits imm32 directly, AHCI_SIG_ATAPI (0xEB140101) is loaded as a full 64-bit immediate -- no sign-extension hazard either way since both are `mov r64, imm64` loads, never `cmp`/`or` immediate operands). Returns 1 (ATA/SATA disk), 2 (ATAPI), or 0 (anything else -- enclosure services, port multiplier, no device). Labels prefixed ahci_pt_sigc_.",
+      block: {
+        mov r10, 0x00000101;             // AHCI_SIG_ATA
+        cmp rdi, r10;
+        je  ahci_pt_sigc_ata;
+
+        mov r10, 0xEB140101;             // AHCI_SIG_ATAPI
+        cmp rdi, r10;
+        je  ahci_pt_sigc_atapi;
+
+        xor rax, rax;
+        ret;
+
+      ahci_pt_sigc_ata:
+        mov rax, 1;
+        ret;
+
+      ahci_pt_sigc_atapi:
+        mov rax, 2;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_port_bring_up_and_identify(row_id) -> u64
+  //
+  // Top-level per-port orchestrator (SECTION 0b explains its placement
+  // here rather than cap/kind_ahci_port.pdx). Sequences SECTION 1's
+  // six steps; returns AHCIP_OK (0) on full success, or the first
+  // error encountered.
+  // ==========================================================================
+  pub let ahci_port_bring_up_and_identify : (u64) -> u64 !{sysreg, mem} @{cap} =
+    fn (row_id: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { cap },
+      justification: "R51.M5-005 (#1661). Per-port bring-up + IDENTIFY orchestrator. Five callee-save pushes (rbx=row_id, r12=port_index, r13=abar_pa, r14=clb_va, r15=fb_va) = 40 B; entry rsp%16==8 -> 48, %16==0 already (no pad needed). Sequence (SECTION 1): (1) ahci_port_tail_valid(rbx) else AHCIP_BRINGUP_BAD_ROW (0xFFFFEC9B). (2) port_index = ahci_port_row_port_index(rbx) -> r12. (3) abar_pa via ahci_port_row_parent(rbx) then ahci_ctrl_row_abar -> r13, DECODE_BAD -> bad_row. (4) ahci_port_idle(r13,r12) -> propagate nonzero (AHCIP_BRINGUP_IDLE_TIMEOUT). (5) ahci_port_cmd_regions_prepare(rbx) (drivers/ahci/cmd_alloc.pdx, #1663) -> propagate nonzero (binds cl_iova/ct_iova onto the row -- this is the call cmd_alloc.pdx's own SECTION 0b names #1661 as the intended caller of). (6) clb_va = ahci_port_row_cl_phys(rbx) -> r14 (now populated by step 5); fb_va = ahci_port_fb_phys(rbx) -> r15. (7) ahci_port_program(r13,r12,r14,r15) -> propagate nonzero (AHCIP_BRINGUP_PROGRAM_TIMEOUT). (8) sig = ahci_port_read_sig(r13,r12); classify = ahci_port_sig_classify(sig); classify != 1 -> AHCIP_MINT_BAD_SIG (0xFFFFEC81, landed #1660 constant, design-reserved for this issue). (9) ahci_identify_device_submit(rbx) (drivers/ahci/identify.pdx) -> propagate nonzero (AHCIP_MINT_NO_LBA48 / AHCIP_IDENTIFY_SUBMIT_TIMEOUT / AHCIP_IDENTIFY_TFERR / AHCIP_BRINGUP_BAD_ROW). (10) ahci_port_row_state_set(rbx, 2) [AHCIP_STATE_IDENTIFIED] (cap/kind_ahci_port.pdx, new in this issue) -> propagate nonzero. (11) xor rax,rax (AHCIP_OK); return. Every DECODE_BAD / sentinel compare stages the imm64 via r10 first per G4/design §8.5. Labels prefixed ahci_pt_bu_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // row_id
+
+        // (1) Row must be live.
+        mov rdi, rbx;
+        call ahci_port_tail_valid;
+        cmp rax, 0;
+        je  ahci_pt_bu_bad_row;
+
+        // (2) port_index.
+        mov rdi, rbx;
+        call ahci_port_row_port_index;
+        mov r12, rax;                    // port_index
+
+        // (3) abar_pa.
+        mov rdi, rbx;
+        call ahci_port_row_parent;
+        mov rdi, rax;
+        call ahci_ctrl_row_abar;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahci_pt_bu_bad_row;
+        mov r13, rax;                    // abar_pa
+
+        // (4) Idle.
+        mov rdi, r13;
+        mov rsi, r12;
+        call ahci_port_idle;
+        cmp rax, 0;
+        jne ahci_pt_bu_out;
+
+        // (5) Bind CL/CT regions (drivers/ahci/cmd_alloc.pdx).
+        mov rdi, rbx;
+        call ahci_port_cmd_regions_prepare;
+        cmp rax, 0;
+        jne ahci_pt_bu_out;
+
+        // (6) Resolve clb_va / fb_va.
+        mov rdi, rbx;
+        call ahci_port_row_cl_phys;
+        mov r14, rax;                    // clb_va
+
+        mov rdi, rbx;
+        call ahci_port_fb_phys;
+        mov r15, rax;                    // fb_va
+
+        // (7) Program.
+        mov rdi, r13;
+        mov rsi, r12;
+        mov rdx, r14;
+        mov rcx, r15;
+        call ahci_port_program;
+        cmp rax, 0;
+        jne ahci_pt_bu_out;
+
+        // (8) SIG check.
+        mov rdi, r13;
+        mov rsi, r12;
+        call ahci_port_read_sig;
+        mov rdi, rax;
+        call ahci_port_sig_classify;
+        cmp rax, 1;
+        jne ahci_pt_bu_bad_sig;
+
+        // (9) IDENTIFY DEVICE (drivers/ahci/identify.pdx).
+        mov rdi, rbx;
+        call ahci_identify_device_submit;
+        cmp rax, 0;
+        jne ahci_pt_bu_out;
+
+        // (10) Advance state MINTED -> IDENTIFIED.
+        mov rdi, rbx;
+        mov rsi, 2;                      // AHCIP_STATE_IDENTIFIED
+        call ahci_port_row_state_set;
+        cmp rax, 0;
+        jne ahci_pt_bu_out;
+
+        xor rax, rax;                    // AHCIP_OK
+        jmp ahci_pt_bu_out;
+
+      ahci_pt_bu_bad_sig:
+        mov rax, 0xFFFFEC81;             // AHCIP_MINT_BAD_SIG
+        jmp ahci_pt_bu_out;
+
+      ahci_pt_bu_bad_row:
+        mov rax, 0xFFFFEC9B;             // AHCIP_BRINGUP_BAD_ROW
+
+      ahci_pt_bu_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
