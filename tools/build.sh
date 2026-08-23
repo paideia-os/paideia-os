@@ -6248,6 +6248,45 @@ fi
 echo "[r52-m8-confine] R52.M8-004 (umount_block) confined"
 
 # ---------------------------------------------------------------------------
+# R53.M2-005 (#1740): confinement for the PDXFS-on-block vops table.
+#
+# `_pdxfs_block_vops` is the shared 7-slot function-pointer table backend_
+# registry.pdx dispatches backend_type==5 to. It is the single source of
+# truth for what an fd bound to a PDXFS-on-block volume reaches on any
+# vops surface op (read/write/open/close/lookup/create/unlink). A second
+# writer against it would let a caller re-point any one of those seven
+# slots to an attacker-chosen body -- exactly the kind of pivot the
+# ec_confine gate exists to make unrepresentable at build time.
+#
+# Three .o files legitimately relocate against `_pdxfs_block_vops` today:
+#   1. core/fs/pdxfs/vops_block.o     -- defines the storage + populator
+#                                        + 7 stubs (R52.M5-005 / #1707).
+#   2. core/fs/pdxfs/block_vops.o     -- this milestone's accessor shim
+#                                        (`pdxfs_block_vops_ptr`,
+#                                        R53.M2-005 / #1740).
+#   3. core/fs/backend_registry.o     -- the R53.M2-006 (#1741) dispatch
+#                                        arm's raw rip-relative lea.
+# A future refactor moving backend_registry to `call pdxfs_block_vops_ptr`
+# shrinks the owner set to the first two (block_vops.o alone stays as
+# the address hand-out point once vops_block.o's populator has run at
+# boot). See block_vops.pdx's own header §Confinement + reference
+# discipline for the shape and rationale.
+R53_BLOCKVOPS_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/block_vops.pdx"
+R53_VOPSBLOCK_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/vops_block.pdx"
+if [[ ! -f "${R53_BLOCKVOPS_SRC}" || ! -f "${R53_VOPSBLOCK_SRC}" ]]; then
+    echo "[r53-m2-005-confine] FAIL - block_vops.pdx or vops_block.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_pdxfs_block_vops' 'core/fs/pdxfs/vops_block.o core/fs/pdxfs/block_vops.o core/fs/backend_registry.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/fs/pdxfs/block_vops.pdx §Confinement + reference" >&2
+    echo "  discipline for the three-owner set (vops_block.o definer +" >&2
+    echo "  block_vops.o accessor + backend_registry.o dispatch arm)." >&2
+    exit 1
+fi
+echo "[r53-m2-005-confine] R53.M2-005 (_pdxfs_block_vops) confined"
+
+# ---------------------------------------------------------------------------
 # R52.M7-005 (#1719): one-writer discipline for the single-block-ahead
 # read-prefetch primitive.
 #
