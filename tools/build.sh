@@ -5659,6 +5659,7 @@ ec_confine_one '_pdxfs_file_table'          'core/cap/kind_pdxfs_file.o'
 ec_confine_one '_pdxfs_file_stats'          'core/cap/kind_pdxfs_file.o'
 ec_confine_one '_pdxfs_txn_table'           'core/cap/kind_pdxfs_txn.o'
 ec_confine_one '_pdxfs_txn_stats'           'core/cap/kind_pdxfs_txn.o'
+ec_confine_one '_pxt_commit_scratch'        'core/cap/kind_pdxfs_txn.o'
 ec_confine_one '_elevate_channel_table'     'core/cap/kind_elevate_channel.o'
 ec_confine_one '_elevate_channel_stats'     'core/cap/kind_elevate_channel.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then
