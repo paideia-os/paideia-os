@@ -1,0 +1,1031 @@
+// src/kernel/core/cap/kind_ahci_controller.pdx -- R51.M5-001 (#1657).
+//
+// KIND_AHCI_CONTROLLER = 0x19A, derived over KIND_DEVICE (= 10).
+//
+// The runtime authority for ONE AHCI HBA function: the right to program
+// its ABAR (BAR5) register set, drive the GHC.AE/GHC.HR reset cycle,
+// enumerate PI (ports implemented), and eventually mint the per-port
+// KIND_AHCI_PORT + dual-kind KIND_BLKDEV children.  Design authority:
+// design/hardware/ahci-substrate.md (commit 9f59498), the AHCI-specific
+// delta over the NVMe-parallel structure §1 lays out.
+//
+// This file lands ONLY R51.M5-001 (#1657): mint gate, row table, the
+// three-state machine, row accessors, a revoke stub (cascade widens at
+// M5-004/#1660 once KIND_AHCI_PORT exists), stats, and the QUERY_ABAR /
+// QUERY_STATE / QUERY_PORT_MAP / QUERY_CTRL_IDX / DEBUG_PRINT op
+// dispatcher.  PCI probe (M5-002/#1658) and HBA reset + PI enumeration
+// (M5-003/#1659) land in THIS SAME FILE as follow-up commits per
+// design/hardware/ahci-substrate.md §3's file-touch table; this pass
+// does not add ahci_ctrl_probe_and_mint or ahci_ctrl_bring_up.
+//
+// =============================================================================
+// SECTION 0  WHY DERIVED OVER KIND_DEVICE
+// =============================================================================
+//
+// An AHCI HBA function is a PCI function -- a device, in the R22 sense
+// that KIND_PCI_DEV (0x30) authorises reach to.  The parent derivation
+// therefore consults `cap_table[parent_slot].kind == KIND_PCI_DEV
+// (0x30)` and `rights & RIGHT_MINT (0x200)`, matching R51.M1's
+// nvme_ctrl_check_parent_pci_dev gate one-for-one (design §1 row 3).
+//
+// This kind's own runtime base is KIND_DEVICE (10) because a controller
+// cap authorises MMIO + reset-cycle programming -- the same
+// device-authority shape KIND_NVME_CONTROLLER (0x198) uses.  The LAM
+// kind-hint on a KIND_AHCI_CONTROLLER descriptor reads slot 10.
+//
+// Splitting controller-authority (this kind) from port-authority
+// (KIND_AHCI_PORT = 0x19B, M5-004) and block-device-authority
+// (KIND_BLKDEV = 0x42, R24 extended in R51) mirrors the NVMe split: the
+// driver process that CAN reset the HBA is not the process that CAN
+// read/write blocks on any one port.  A mounter receives KIND_BLKDEV
+// without ever holding controller reset authority.
+//
+// =============================================================================
+// SECTION 1  TAIL ENCODING
+// =============================================================================
+//
+// Row layout (64 bytes, eight u64 words):
+//
+//   [+0]   header: in_use[63:56] | state[15:8] | ctrl_idx[7:0]
+//   [+8]   abar_pa           (u64)  -- controller ABAR (BAR5) physical base
+//   [+16]  port_map          (u64, low 32 bits) -- PI bitmap; 0 pre-bring-up,
+//                                stamped by ahci_ctrl_bring_up (M5-003/#1659)
+//   [+24]  reserved          (u64)
+//   [+32]  reserved          (u64)
+//   [+40]  reserved          (u64)
+//   [+48]  msix_vec_slot     (u64)  -- reserved for the shared MSI-X vector
+//                                slot design §2.3 describes; 0 at M5-001
+//                                (no mint-gate arg yet -- see SECTION 5 gap
+//                                note). A future issue either adds a setter
+//                                here or extends the mint-gate arity via a
+//                                params_ptr, per design §8.1's overflow rule.
+//   [+56]  reserved          (u64)
+//
+// State byte values (in header bits [15:8]) -- design §2.2's three-state
+// controller pipeline (NOT four-state like KIND_NVME_CONTROLLER):
+//   AHCIC_STATE_MINTED         = 1   -- row alive, HBA not touched
+//   AHCIC_STATE_RESET_DONE     = 2   -- GHC.AE=1, GHC.HR polled clear (M5-003)
+//   AHCIC_STATE_PI_ENUMERATED  = 3   -- PI read, port_map stashed (M5-003)
+//
+// ctrl_idx (bits [7:0]) is the index into _ahci_devices[] (the M5-002
+// probe's record array, not yet populated at M5-001) so a
+// KIND_AHCI_CONTROLLER row can look up its original PCI seg/bus/dev/fn
+// without recomputing.  Same shape as KIND_NVME_CONTROLLER's ctrl_idx.
+//
+// Row-addressed capacity: 4 rows x 64 bytes = 256 bytes = 32 u64 words.
+// AHCIC_MAX = 4 per design §2.2's slot-ceiling note (matches parent
+// design/hardware/nvme-and-disk-substrate.md §6/§7's "4 slots").  A
+// fifth AHCI HBA on one machine exceeds every consumer + workstation to
+// date; if hit, the ceiling widens together with _ahci_devices (M5-002)
+// under the R48b substrate-prep discipline.
+//
+// =============================================================================
+// SECTION 2  RIGHTS
+// =============================================================================
+//
+// design/hardware/ahci-substrate.md §7 (#1657's own issue text) states:
+//
+//   R_AHCIC_MMIO       | R_AHCIC_RESET | R_AHCIC_ENUM_PORTS |
+//   R_AHCIC_MINT_PORT = 0x0F  (per parent design's §6.2, matching the
+//   parent doc's design/hardware/nvme-and-disk-substrate.md:781 literal
+//   "R_AHCIC_MMIO | R_AHCIC_RESET | R_AHCIC_ENUM_PORTS | R_AHCIC_MINT_PORT
+//   = 0x0F"), "extended with R_AHCIC_INVOKE = 0x008, R_AHCIC_REVOKE =
+//   0x010, R_AHCIC_OBSERVE = 0x400, R_AHCIC_ALL = 0x41F".
+//
+// DESIGN-DOC GAP (flagged to softarch/debugger review, see final report):
+// R_AHCIC_MINT_PORT is separately forward-referenced with its literal
+// bit value at design §7 #1660 ("rights & R_AHCIC_MINT_PORT (0x008)"),
+// so 0x008 for MINT_PORT is a FIXED, already-consumed-by-a-later-issue
+// constant that this file must not move.  But the SAME section's text
+// also assigns R_AHCIC_INVOKE = 0x008 -- an exact collision with
+// MINT_PORT on the same bit -- and the stated R_AHCIC_ALL = 0x41F
+// (bits 0,1,2,3,4,10) has no room for a distinct seventh right bit
+// anyway, so the literal ALL cannot fit MMIO+RESET+ENUM_PORTS+
+// MINT_PORT+INVOKE+REVOKE+OBSERVE as seven DISTINCT bits.  Collapsing
+// INVOKE onto MINT_PORT's bit would be a silent privilege escalation
+// (any QUERY-capable holder could also mint downstream ports), which
+// KIND_NVME_CONTROLLER's design deliberately avoids by keeping
+// R_NVMEC_INVOKE (0x008) and R_NVMEC_MINT_NS (0x200) on separate bits.
+// Resolution taken here: keep R_AHCIC_MINT_PORT = 0x008 exactly (fixed
+// per the #1660 forward-reference) and move R_AHCIC_INVOKE to the next
+// unclaimed bit (0x020), yielding R_AHCIC_ALL = 0x43F instead of the
+// literal 0x41F.  This preserves every OTHER stated bit value
+// (MMIO=0x001, RESET=0x002, ENUM_PORTS=0x004, MINT_PORT=0x008,
+// REVOKE=0x010, OBSERVE=0x400) unchanged.  Flag for design-doc
+// correction: design/hardware/ahci-substrate.md §7 #1657's rights list
+// should be amended to R_AHCIC_INVOKE = 0x020, R_AHCIC_ALL = 0x43F.
+//
+//   R_AHCIC_MMIO       (0x001) -- ABAR accessors (abar_reg_u32/_set, M5-003+)
+//   R_AHCIC_RESET      (0x002) -- GHC.AE/GHC.HR toggle (M5-003)
+//   R_AHCIC_ENUM_PORTS (0x004) -- PI enumeration (M5-003)
+//   R_AHCIC_MINT_PORT  (0x008) -- mint downstream KIND_AHCI_PORT (M5-004)
+//   R_AHCIC_REVOKE     (0x010) -- teardown the row (cascades to children)
+//   R_AHCIC_INVOKE     (0x020) -- QUERY ops (row_abar/state/port_map/ctrl_idx)
+//   R_AHCIC_OBSERVE    (0x400) -- debug printer
+//   R_AHCIC_ALL        (0x43F)
+//
+// =============================================================================
+// SECTION 3  FAILURE TAXONOMY  0xFFFFEC80..0xFFFFEC8F
+// =============================================================================
+//
+// Sixteen wide, disjoint from every landed R48b..R51.M4 band (fully
+// allocated through 0xFFFFEC7F).  Per design §6, BOTH
+// KIND_AHCI_CONTROLLER and KIND_AHCI_PORT share this one band; the
+// AHCIC_* (controller-side) constants are claimed here, the AHCIP_*
+// (port-side) constants are claimed by kind_ahci_port.pdx at M5-004
+// (#1660):
+//
+//   KIND_NVME_CONTROLLER   0xFFFFEC40..0xFFFFEC4F
+//   KIND_NVME_NAMESPACE    0xFFFFEC50..0xFFFFEC5F
+//   BDEV_ERR_*             0xFFFFEC60..0xFFFFEC6F (extended to ..63 at M5-006)
+//   (R48b..R51.M4 bands)   0xFFFFEC00..0xFFFFEC7F
+//   KIND_AHCI (ctrl+port)  0xFFFFEC80..0xFFFFEC8F  (this file: 0xEC85..0xEC8F)
+//
+// AHCIC_RESET_TIMEOUT (0xFFFFEC86) is claimed here as a constant but is
+// unused by any function THIS pass lands -- ahci_ctrl_bring_up (M5-003)
+// is its only caller-to-be.  Same "claim now, consume later" pattern as
+// KIND_NVME_CONTROLLER's NVMEC_WRONG_KIND, which that file's own M1
+// commit defined but never referenced.
+//
+// =============================================================================
+// SECTION 4  paideia-as encoder-gap posture (v0.22.x)
+// =============================================================================
+//
+//   G1: sized stores via mov_b / mov_w / mov_d for sub-8-byte fields --
+//       not needed in THIS file (only full-u64 header packing here; the
+//       20-byte FIS builder that needs mov_b lands in drivers/ahci/fis.pdx
+//       at M5-005).
+//   G4: full-register compares (zero-extend loads via prior xor / and)
+//       -- used throughout the state-byte and header decode paths.
+//
+// r10/r11 scratch only for imm32-sized constants; every KIND / rights /
+// state constant here fits imm32 EXCEPT the 0xFFFFEC8* failure codes,
+// which exceed 0x7FFFFFFF and are staged via `mov r10, <imm64>` before
+// any cmp/mov-to-memory, per design §8.5.  Labels prefixed `ahcic_`.
+// `loop`, `if`, `port`, `reset`, `enum` are reserved keywords and never
+// appear bare in a label (design §8.2).
+
+module KindAhciController = structure {
+
+  pub let KIND_AHCI_CONTROLLER      : u64 = 0x19A
+  pub let KIND_AHCI_CONTROLLER_BASE : u64 = 10         // = KIND_DEVICE
+
+  pub let R_AHCIC_MMIO       : u64 = 0x001
+  pub let R_AHCIC_RESET      : u64 = 0x002
+  pub let R_AHCIC_ENUM_PORTS : u64 = 0x004
+  pub let R_AHCIC_MINT_PORT  : u64 = 0x008
+  pub let R_AHCIC_REVOKE     : u64 = 0x010
+  pub let R_AHCIC_INVOKE     : u64 = 0x020
+  pub let R_AHCIC_OBSERVE    : u64 = 0x400
+  pub let R_AHCIC_ALL        : u64 = 0x43F
+
+  pub let AHCIC_STATE_MINTED        : u64 = 1
+  pub let AHCIC_STATE_RESET_DONE    : u64 = 2
+  pub let AHCIC_STATE_PI_ENUMERATED : u64 = 3
+  pub let AHCIC_STATE_MAX           : u64 = 3
+
+  // Ops.  Every op ARITY ONE -- op_arg high bits refused (matches
+  // KIND_NVME_CONTROLLER / KIND_TTY / KIND_PDXFS_TXN discipline).
+  pub let AHCIC_OP_QUERY_ABAR     : u64 = 0
+  pub let AHCIC_OP_QUERY_STATE    : u64 = 1
+  pub let AHCIC_OP_QUERY_PORT_MAP : u64 = 2
+  pub let AHCIC_OP_QUERY_CTRL_IDX : u64 = 3
+  pub let AHCIC_OP_DEBUG_PRINT    : u64 = 4
+  pub let AHCIC_OP_MAX            : u64 = 4
+
+  pub let AHCIC_OK              : u64 = 0
+  pub let AHCIC_TAIL_ENOSPC     : u64 = 0xFFFFEC8F
+  pub let AHCIC_TAIL_BAD_ARG    : u64 = 0xFFFFEC8E
+  pub let AHCIC_MINT_BAD_PARENT : u64 = 0xFFFFEC8D
+  pub let AHCIC_MINT_BAD_RIGHTS : u64 = 0xFFFFEC8C
+  pub let AHCIC_MINT_BAD_IDX    : u64 = 0xFFFFEC8B
+  pub let AHCIC_MINT_BAD_ABAR   : u64 = 0xFFFFEC8A
+  pub let AHCIC_BAD_SLOT        : u64 = 0xFFFFEC89
+  pub let AHCIC_WRONG_KIND      : u64 = 0xFFFFEC88
+  pub let AHCIC_REVOKE_ALREADY  : u64 = 0xFFFFEC87
+  pub let AHCIC_RESET_TIMEOUT   : u64 = 0xFFFFEC86
+  pub let AHCIC_BAD_TRANSITION  : u64 = 0xFFFFEC85
+
+  pub let AHCIC_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let AHCIC_ROW_NONE   : u64 = 0xFF
+
+  // Ceiling.  Matches design/hardware/ahci-substrate.md §2.2's slot
+  // ceiling (AHCIC_MAX = 4) and the parent design's "4 slots" (§7).
+  pub let AHCIC_MAX        : u64 = 4
+  pub let AHCIC_ROW_BYTES  : u64 = 64
+  // 4 rows * 64 bytes = 256 bytes = 32 u64.
+  pub let mut _ahci_controller_table : [u64; 32] = uninit @align(64)
+  pub let mut _ahci_controller_stats : [u64; 16] = uninit @align(64)
+
+  pub let AHCIC_ST_MINTS      : u64 = 0
+  pub let AHCIC_ST_REVOKES    : u64 = 1
+  pub let AHCIC_ST_QUERIES    : u64 = 2
+  pub let AHCIC_ST_REFUSED    : u64 = 3
+  pub let AHCIC_ST_PROBES     : u64 = 4
+  pub let AHCIC_ST_BRINGUPS   : u64 = 5
+  pub let AHCIC_ST_MAX        : u64 = 16
+
+  pub let ahcic_dbg_msg : [u8; 15] = "AHCI CTRL ROW\0\0"
+
+  // ==========================================================================
+  // ahci_ctrl_table_reset() -> ()
+  //
+  // Clear every row and every counter.  Boot and teardown only.  Two
+  // separate loops (rows / stats) mirror nvme_ctrl_table_reset's shape:
+  // the arrays have different lengths and one loop over the total would
+  // encode their .bss adjacency as a fact code depends on.
+  // ==========================================================================
+  pub let ahci_ctrl_table_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M5-001 (#1657): clear every row and every counter. Boot and teardown only. Labels prefixed ahcic_rs_.",
+      block: {
+        lea r10, [rip + _ahci_controller_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      ahcic_rs_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  ahcic_rs_rows;
+
+        lea r10, [rip + _ahci_controller_stats];
+        xor rcx, rcx;
+      ahcic_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  ahcic_rs_stats;
+        ret
+      }
+    }
+
+  pub let ahci_ctrl_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M5-001 (#1657): bounded increment; out-of-range no-op. Labels prefixed ahcic_nt_.",
+      block: {
+        cmp rdi, 16;
+        jae ahcic_nt_out;
+        lea r10, [rip + _ahci_controller_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      ahcic_nt_out:
+        ret
+      }
+    }
+
+  pub let ahci_ctrl_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M5-001 (#1657): bounded read; out-of-range returns 0. Labels prefixed ahcic_st_.",
+      block: {
+        cmp rdi, 16;
+        jae ahcic_st_zero;
+        lea r10, [rip + _ahci_controller_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      ahcic_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let ahci_ctrl_rights_valid : (u64) -> u64 !{} @{} =
+    fn (rights: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R51.M5-001 (#1657): subset test against R_AHCIC_ALL = 0x43F. Labels prefixed ahcic_rv_.",
+      block: {
+        mov rax, rdi;
+        mov r10, 0x43F;
+        and rax, r10;
+        cmp rax, rdi;
+        jne ahcic_rv_no;
+        mov rax, 1;
+        ret;
+      ahcic_rv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let ahci_ctrl_idx_valid : (u64) -> u64 !{} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R51.M5-001 (#1657): 1 iff idx < AHCIC_MAX = 4. Matches the design's 4-slot ceiling. Labels prefixed ahcic_iv_.",
+      block: {
+        cmp rdi, 4;
+        jae ahcic_iv_no;
+        mov rax, 1;
+        ret;
+      ahcic_iv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_ctrl_check_parent_pci_dev(parent_slot) -> 1 | 0
+  //
+  // Derivation gate.  parent.kind == KIND_PCI_DEV (0x30) AND rights
+  // carry RIGHT_MINT (0x200).  Per design/hardware/ahci-substrate.md §1
+  // (parent-derivation row): identical shape and identical constants to
+  // nvme_ctrl_check_parent_pci_dev -- a driver process holds a
+  // KIND_PCI_DEV for the AHCI function; deriving KIND_AHCI_CONTROLLER
+  // over it is what acquires reset authority for that function.
+  // ==========================================================================
+  pub let ahci_ctrl_check_parent_pci_dev : (u64) -> u64 !{mem} @{cap} =
+    fn (parent_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R51.M5-001 (#1657): derivation gate. Bounds-check parent_slot < 256; descriptor at cap_table + slot*24 (stride 24 per cap/mint.pdx); require kind ([+0]) == KIND_PCI_DEV (0x30) AND (rights & RIGHT_MINT 0x200) != 0. Identical shape and constants to nvme_ctrl_check_parent_pci_dev (design §1: 'same shape, identical constants'). Pure read. Labels prefixed ahcic_cpp_.",
+      block: {
+        mov r11, 256;
+        cmp rdi, r11;
+        jae ahcic_cpp_no;
+
+        mov rax, cap_table;
+        mov r8, rdi;
+        shl r8, 3;
+        mov r9, rdi;
+        shl r9, 4;
+        add r8, r9;
+        add rax, r8;
+
+        mov r10, [rax + 0];
+        mov r11, 0x30;                   // KIND_PCI_DEV
+        cmp r10, r11;
+        jne ahcic_cpp_no;
+
+        mov r10, [rax + 8];
+        mov r11, 0x200;                  // RIGHT_MINT
+        and r10, r11;
+        cmp r10, 0;
+        je  ahcic_cpp_no;
+
+        mov rax, 1;
+        ret;
+
+      ahcic_cpp_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // hdr layout: in_use[63:56] | state[15:8] | ctrl_idx[7:0].
+  // Callers pack via ahci_ctrl_hdr_pack(ctrl_idx, state).
+  pub let ahci_ctrl_hdr_pack : (u64, u64) -> u64 !{} @{} =
+    fn (ctrl_idx: u64) (state: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R51.M5-001 (#1657): canonical header encoder. Validates ctrl_idx in [0..AHCIC_MAX-1] and state in [1..3]. Bits [63:56] MUST leave this function zero (in_use is set by tail_alloc under the same write that claims the row). Labels prefixed ahcic_hp_.",
+      block: {
+        cmp rdi, 4;                      // AHCIC_MAX
+        jae ahcic_hp_bad;
+        cmp rsi, 1;
+        jb  ahcic_hp_bad;
+        mov r10, 3;                      // AHCIC_STATE_MAX
+        cmp rsi, r10;
+        ja  ahcic_hp_bad;
+        mov rax, rdi;                    // ctrl_idx in [7:0]
+        mov r11, rsi;
+        shl r11, 8;
+        or  rax, r11;                    // state in [15:8]
+        ret;
+      ahcic_hp_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // tail_alloc(hdr, abar_pa) -> row_id | AHCIC_TAIL_*.
+  // Sets port_map / reserved / msix_vec_slot to 0 -- port_map populated
+  // by ahci_ctrl_bring_up (M5-003/#1659) as it lands.
+  pub let ahci_ctrl_tail_alloc : (u64, u64) -> u64 !{mem} @{} =
+    fn (hdr: u64) (abar_pa: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M5-001 (#1657): claim one controller row. THE ONLY WRITER of _ahci_controller_table. Gates: hdr in_use pre-set -> BAD_ARG (pre-set in_use would hand back a row the free scan skips forever); hdr reserved [55:16] non-zero -> BAD_ARG; abar_pa == 0 -> MINT_BAD_ABAR (a controller with no MMIO base is not addressable). Low-first scan over 4 rows of 64 bytes. Four callee-save pushes leave rsp%16 == 0. Labels prefixed ahcic_ta_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // hdr
+        mov r13, rsi;                    // abar_pa
+
+        // hdr in_use pre-set?
+        mov rax, r12;
+        shr rax, 56;
+        cmp rax, 0;
+        jne ahcic_ta_bad;
+
+        // hdr reserved [55:16]?
+        mov rax, r12;
+        shr rax, 16;
+        mov r10, 0xFFFFFFFFFF;           // 40 bits: [55:16]
+        and rax, r10;
+        cmp rax, 0;
+        jne ahcic_ta_bad;
+
+        // abar_pa != 0.
+        cmp r13, 0;
+        je  ahcic_ta_bad_abar;
+
+        xor rbx, rbx;                    // row_id
+      ahcic_ta_scan:
+        cmp rbx, 4;                      // AHCIC_MAX
+        jae ahcic_ta_enospc;
+
+        lea r10, [rip + _ahci_controller_table];
+        mov r11, rbx;
+        shl r11, 6;                      // row * 64
+        add r10, r11;
+
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  ahcic_ta_claim;
+
+        add rbx, 1;
+        jmp ahcic_ta_scan;
+
+      ahcic_ta_claim:
+        mov rax, r12;
+        mov r11, 1;
+        shl r11, 56;
+        or  rax, r11;
+        mov [r10 + 0],  rax;             // header + in_use
+        mov [r10 + 8],  r13;             // abar_pa
+        xor rax, rax;
+        mov [r10 + 16], rax;             // port_map = 0
+        mov [r10 + 24], rax;             // reserved = 0
+        mov [r10 + 32], rax;             // reserved = 0
+        mov [r10 + 40], rax;             // reserved = 0
+        mov [r10 + 48], rax;             // msix_vec_slot = 0
+        mov [r10 + 56], rax;             // reserved = 0
+        mov rax, rbx;
+        jmp ahcic_ta_out;
+
+      ahcic_ta_enospc:
+        mov rax, 0xFFFFEC8F;             // AHCIC_TAIL_ENOSPC
+        jmp ahcic_ta_out;
+      ahcic_ta_bad_abar:
+        mov rax, 0xFFFFEC8A;             // AHCIC_MINT_BAD_ABAR
+        jmp ahcic_ta_out;
+      ahcic_ta_bad:
+        mov rax, 0xFFFFEC8E;             // AHCIC_TAIL_BAD_ARG
+
+      ahcic_ta_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let ahci_ctrl_tail_valid : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M5-001 (#1657): 1 iff row_id < AHCIC_MAX and in_use byte set. Labels prefixed ahcic_tv_.",
+      block: {
+        cmp rdi, 4;
+        jae ahcic_tv_no;
+        lea r10, [rip + _ahci_controller_table];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  ahcic_tv_no;
+        mov rax, 1;
+        ret;
+      ahcic_tv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let ahci_ctrl_tail_free : (u64) -> () !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M5-001 (#1657): scrub row (all eight words). Labels prefixed ahcic_tf_.",
+      block: {
+        cmp rdi, 4;
+        jae ahcic_tf_out;
+        lea r10, [rip + _ahci_controller_table];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rax;
+        mov [r10 + 48], rax;
+        mov [r10 + 56], rax;
+      ahcic_tf_out:
+        ret
+      }
+    }
+
+  // -------------------------------------------------------------------
+  // Row accessors.  Each returns AHCIC_DECODE_BAD when the row is not
+  // live.  Shape mirrors nvme_ctrl_row_* one-for-one so a regression in
+  // one member of the family surfaces the same way in the others.
+  // -------------------------------------------------------------------
+
+  pub let ahci_ctrl_row_abar : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M5-001 (#1657): abar_pa, or AHCIC_DECODE_BAD. Labels prefixed ahcic_ra_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call ahci_ctrl_tail_valid;
+        cmp rax, 0;
+        je  ahcic_ra_bad;
+        lea r10, [rip + _ahci_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        jmp ahcic_ra_out;
+      ahcic_ra_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      ahcic_ra_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let ahci_ctrl_row_state : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M5-001 (#1657): state byte, or AHCIC_DECODE_BAD. Labels prefixed ahcic_rst_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call ahci_ctrl_tail_valid;
+        cmp rax, 0;
+        je  ahcic_rst_bad;
+        lea r10, [rip + _ahci_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 8;
+        and rax, 0xFF;
+        jmp ahcic_rst_out;
+      ahcic_rst_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      ahcic_rst_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let ahci_ctrl_row_ctrl_idx : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M5-001 (#1657): ctrl_idx, or AHCIC_DECODE_BAD. Labels prefixed ahcic_rci_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call ahci_ctrl_tail_valid;
+        cmp rax, 0;
+        je  ahcic_rci_bad;
+        lea r10, [rip + _ahci_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        and rax, 0xFF;
+        jmp ahcic_rci_out;
+      ahcic_rci_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      ahcic_rci_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let ahci_ctrl_row_port_map : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M5-001 (#1657): port_map (PI bitmap), or AHCIC_DECODE_BAD. Zero return distinguishes 'no PI enumeration performed yet' from 'row alive'. Labels prefixed ahcic_rpm_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call ahci_ctrl_tail_valid;
+        cmp rax, 0;
+        je  ahcic_rpm_bad;
+        lea r10, [rip + _ahci_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        jmp ahcic_rpm_out;
+      ahcic_rpm_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      ahcic_rpm_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // -------------------------------------------------------------------
+  // Row mutators.  Internal.  Bounds-checked; no-op / DECODE_BAD on a
+  // dead slot.  ahci_ctrl_row_state_set is the ONLY mutator this pass
+  // lands (the state machine, per design §2.2, is explicitly part of
+  // #1657's scope); port_map's setter is added by ahci_ctrl_bring_up's
+  // own commit (M5-003/#1659), which owns the PI-enumeration write.
+  // -------------------------------------------------------------------
+
+  // Advance state field with strict monotonic gate.  Refuses to move
+  // backwards or past AHCIC_STATE_MAX.  Returns AHCIC_OK / _BAD_TRANSITION.
+  pub let ahci_ctrl_row_state_set : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (new_state: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M5-001 (#1657): monotonic state advance. tail_valid gate; new_state must be current+1 (linear pipeline MINTED -> RESET_DONE -> PI_ENUMERATED). Matches nvme_ctrl_row_state_set's shape exactly (design §2.2: 'same shape as nvme_ctrl_row_state_set'). Two callee-save pushes leave rsp%16 == 0. Labels prefixed ahcic_rss_.",
+      block: {
+        push r12;
+        push r13;
+        mov r12, rdi;
+        mov r13, rsi;
+
+        mov rdi, r12;
+        call ahci_ctrl_tail_valid;
+        cmp rax, 0;
+        je  ahcic_rss_bad;
+
+        // Range check new_state in [2..3] (never re-enter MINTED).
+        cmp r13, 2;
+        jb  ahcic_rss_no;
+        mov r10, 3;                      // AHCIC_STATE_MAX
+        cmp r13, r10;
+        ja  ahcic_rss_no;
+
+        lea r10, [rip + _ahci_controller_table];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;
+
+        mov rax, [r10 + 0];
+        mov rcx, rax;
+        shr rcx, 8;
+        and rcx, 0xFF;                   // current state
+
+        // Enforce new == current + 1.
+        mov r11, rcx;
+        add r11, 1;
+        cmp r13, r11;
+        jne ahcic_rss_no;
+
+        // Clear state byte (bits [15:8]) and OR in new_state << 8.
+        mov r11, 0xFFFFFFFFFFFF00FF;
+        and rax, r11;
+        mov r11, r13;
+        shl r11, 8;
+        or  rax, r11;
+        mov [r10 + 0], rax;
+        xor rax, rax;                    // AHCIC_OK
+        jmp ahcic_rss_out;
+
+      ahcic_rss_no:
+        mov rax, 0xFFFFEC85;             // AHCIC_BAD_TRANSITION
+        jmp ahcic_rss_out;
+      ahcic_rss_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;     // AHCIC_DECODE_BAD
+
+      ahcic_rss_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // Slot -> row_id, gated on the descriptor being a live
+  // KIND_AHCI_CONTROLLER.  Kind constant 0x19A staged in r11 (fits
+  // imm32; no r11-imm64 issue).
+  pub let ahci_ctrl_row_of_slot : (u64) -> u64 !{mem} @{cap} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R51.M5-001 (#1657): slot -> row_id gated on KIND_AHCI_CONTROLLER. Labels prefixed ahcic_ros_.",
+      block: {
+        push r12;
+
+        mov r11, 256;
+        cmp rdi, r11;
+        jae ahcic_ros_none;
+
+        mov rax, cap_table;
+        mov r8, rdi;
+        shl r8, 3;
+        mov r9, rdi;
+        shl r9, 4;
+        add r8, r9;
+        add rax, r8;
+
+        mov r10, [rax + 0];
+        mov r11, 0x19A;                  // KIND_AHCI_CONTROLLER
+        cmp r10, r11;
+        jne ahcic_ros_none;
+
+        mov r12, [rax + 16];
+        mov r10, 0xFFFF;
+        and r12, r10;
+
+        mov rdi, r12;
+        call ahci_ctrl_tail_valid;
+        cmp rax, 0;
+        je  ahcic_ros_none;
+
+        mov rax, r12;
+        jmp ahcic_ros_out;
+
+      ahcic_ros_none:
+        mov rax, 0xFF;                   // AHCIC_ROW_NONE
+      ahcic_ros_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_ctrl_cap_revoke(row_id) -> u64
+  //
+  // R51.M5-001 (#1657): Controller-cap revoke STUB.  Scrubs the row and
+  // bumps REVOKES; distinguishes never-existed (BAD_SLOT) from
+  // already-gone (REVOKE_ALREADY).
+  //
+  // REVOKE CASCADE POSTURE.  Per design/hardware/ahci-substrate.md §7
+  // #1657 ("revoke primitive (cascade stub -- M5-004 widens)"), this
+  // pass does NOT cascade to KIND_AHCI_PORT rows -- no such kind exists
+  // yet (M5-004/#1660 lands kind_ahci_port.pdx).  The cascade call site
+  // is added at M5-006/#1662 (ahci_port_cascade_revoke_by_ctrl), mirroring
+  // nvme_ctrl_cap_revoke's own evolution (M1-001 lands the scrub-only
+  // stub; M2-005/#1643 wires nvme_ns_cascade_revoke_by_ctrl on top).
+  // ==========================================================================
+  pub let ahci_ctrl_cap_revoke : (u64) -> u64 !{mem} @{cap} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R51.M5-001 (#1657): scrub row + bump REVOKES; distinguishes never-existed (BAD_SLOT) from already-gone (REVOKE_ALREADY). Cascade to KIND_AHCI_PORT rows is NOT wired here -- M5-004/#1660 creates that kind; M5-006/#1662 wires the cascade call, matching nvme_ctrl_cap_revoke's own M1 -> M2-005 evolution. Two callee-save pushes leave rsp%16 == 0. Labels prefixed ahcic_cr_.",
+      block: {
+        push r12;
+        push r13;
+
+        mov r12, rdi;
+        cmp r12, 4;
+        jae ahcic_cr_bad_slot;
+
+        mov rdi, r12;
+        call ahci_ctrl_tail_valid;
+        cmp rax, 0;
+        je  ahcic_cr_already;
+
+        mov rdi, r12;
+        call ahci_ctrl_tail_free;
+        mov rdi, 1;                      // AHCIC_ST_REVOKES
+        call ahci_ctrl_note;
+        xor rax, rax;
+        jmp ahcic_cr_out;
+
+      ahcic_cr_bad_slot:
+        mov rax, 0xFFFFEC89;             // AHCIC_BAD_SLOT
+        jmp ahcic_cr_out;
+      ahcic_cr_already:
+        mov rax, 0xFFFFEC87;             // AHCIC_REVOKE_ALREADY
+
+      ahcic_cr_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_ctrl_cap_mint_inner(parent_slot, rights, ctrl_idx, abar_pa)
+  //   -> row_id | AHCIC_MINT_BAD_*
+  //
+  // R51.M5-001 (#1657): the KIND_AHCI_CONTROLLER mint walker.  Gates in
+  // order:
+  //   (1) parent gate (KIND_PCI_DEV + RIGHT_MINT);
+  //   (2) rights subset;
+  //   (3) ctrl_idx bound;
+  //   (4) hdr_pack (ctrl_idx, state=MINTED);
+  //   (5) tail_alloc(hdr, abar_pa).
+  // Five callee-save pushes + sub rsp, 8 = 48 bytes; post-prologue
+  // rsp%16 == 0 for every nested call.  Matches
+  // nvme_ctrl_cap_mint_inner's exact 4-arg shape (design §1: "same
+  // shape, identical constants").
+  // ==========================================================================
+  pub let ahci_ctrl_cap_mint_inner : (u64, u64, u64, u64) -> u64 !{mem} @{cap} =
+    fn (parent_slot: u64) (rights: u64) (ctrl_idx: u64) (abar_pa: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R51.M5-001 (#1657): the KIND_AHCI_CONTROLLER mint walker. Gate sequence: parent (KIND_PCI_DEV + RIGHT_MINT), rights subset, ctrl_idx bound, hdr_pack (ctrl_idx, state=MINTED), tail_alloc (hdr, abar_pa). Five callee-save pushes + sub rsp, 8 = 48 bytes: post-prologue rsp%16 == 0 for every nested call. Refusal paths bump AHCIC_ST_REFUSED. Labels prefixed ahcic_mi_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov r12, rdi;                    // parent_slot
+        mov r13, rsi;                    // rights
+        mov rbx, rdx;                    // ctrl_idx
+        mov r14, rcx;                    // abar_pa
+
+        // (1) Parent gate.
+        mov rdi, r12;
+        call ahci_ctrl_check_parent_pci_dev;
+        cmp rax, 0;
+        je  ahcic_mi_bad_parent;
+
+        // (2) Rights subset.
+        mov rdi, r13;
+        call ahci_ctrl_rights_valid;
+        cmp rax, 0;
+        je  ahcic_mi_bad_rights;
+
+        // (3) ctrl_idx bound.
+        mov rdi, rbx;
+        call ahci_ctrl_idx_valid;
+        cmp rax, 0;
+        je  ahcic_mi_bad_idx;
+
+        // (4) Pack header with state = MINTED (1).
+        mov rdi, rbx;                    // ctrl_idx
+        mov rsi, 1;                      // AHCIC_STATE_MINTED
+        call ahci_ctrl_hdr_pack;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahcic_mi_bad_idx;
+
+        // (5) tail_alloc (hdr, abar_pa).
+        mov rdi, rax;                    // hdr
+        mov rsi, r14;                    // abar_pa
+        call ahci_ctrl_tail_alloc;
+        mov r10, 4;                      // AHCIC_MAX
+        cmp rax, r10;
+        jae ahcic_mi_alloc_fail;
+
+        push rax;
+        mov rdi, 0;                      // AHCIC_ST_MINTS
+        call ahci_ctrl_note;
+        pop rax;
+        jmp ahcic_mi_out;
+
+      ahcic_mi_alloc_fail:
+        jmp ahcic_mi_refused;
+      ahcic_mi_bad_parent:
+        mov rax, 0xFFFFEC8D;             // AHCIC_MINT_BAD_PARENT
+        jmp ahcic_mi_refused;
+      ahcic_mi_bad_rights:
+        mov rax, 0xFFFFEC8C;             // AHCIC_MINT_BAD_RIGHTS
+        jmp ahcic_mi_refused;
+      ahcic_mi_bad_idx:
+        mov rax, 0xFFFFEC8B;             // AHCIC_MINT_BAD_IDX
+
+      ahcic_mi_refused:
+        push rax;
+        mov rdi, 3;                      // AHCIC_ST_REFUSED
+        call ahci_ctrl_note;
+        pop rax;
+
+      ahcic_mi_out:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // cap_handler_ahci_controller(rights, target_ptr, op_arg) -> u64
+  //
+  // KIND_AHCI_CONTROLLER dispatch.  All ops arity-ONE (op_arg[63:8]
+  // REFUSED).  QUERY ops need R_AHCIC_INVOKE (0x020); DEBUG_PRINT needs
+  // R_AHCIC_OBSERVE (0x400).
+  //
+  //   AHCIC_OP_QUERY_ABAR     -> abar_pa
+  //   AHCIC_OP_QUERY_STATE    -> state byte
+  //   AHCIC_OP_QUERY_PORT_MAP -> port_map (PI bitmap; 0 pre-M5-003)
+  //   AHCIC_OP_QUERY_CTRL_IDX -> ctrl_idx
+  //   AHCIC_OP_DEBUG_PRINT    -> 0 (observability only)
+  //
+  // NOT WIRED INTO cap_invoke_dispatch (invoke.pdx) OR kind.pdx AT THIS
+  // PASS.  design/hardware/ahci-substrate.md §3's file-touch table does
+  // not list invoke.pdx / kind.pdx among the R51.M5 changes (contrast:
+  // KIND_NVME_CONTROLLER's dispatch-table entry landed in the SAME
+  // commit as its whole M1 milestone, since M1 was landed as one
+  // commit; M5 is deliberately serialised into six commits per design
+  // §7). This is flagged as a design-doc gap in the implementation
+  // report: some M5 issue (most likely M5-006/#1662, when the whole
+  // AHCI family is dispatch-ready) needs to add
+  //   mov r9, 0x19A; cmp rcx, r9; je call_kind_ahci_controller;
+  // to invoke.pdx, and a documentation block to kind.pdx, mirroring the
+  // KIND_NVME_CONTROLLER entries at invoke.pdx:1056-1063 and
+  // kind.pdx:2640+. Until that lands, this handler function exists and
+  // compiles but is unreachable from cap_invoke.
+  // ==========================================================================
+  pub let cap_handler_ahci_controller : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (rights: u64) (target_ptr: u64) (op_arg: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R51.M5-001 (#1657): KIND_AHCI_CONTROLLER dispatch. QUERY ops need R_AHCIC_INVOKE; DEBUG_PRINT needs R_AHCIC_OBSERVE. Ops 0..4 are arity ONE (op_arg[63:8] refused). Five callee-save pushes leave rsp%16 == 0. Labels prefixed ahcic_hn_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push rbp;
+
+        mov r12, rdi;                    // rights
+        mov r13, rsi;                    // target_ptr
+        mov r10, 0xFFFF;
+        and r13, r10;                    // row_id (low 16)
+        mov r14, rdx;                    // op_arg
+
+        mov r10, r14;
+        and r10, 0xFF;
+        mov rbp, r10;                    // op
+
+        mov r11, r14;
+        shr r11, 8;
+        cmp r11, 0;
+        jne ahcic_hn_res;                // reserved bits set
+
+        cmp rbp, 4;                      // ops 0..4 valid
+        ja  ahcic_hn_unsup;
+
+        cmp rbp, 4;                      // DEBUG_PRINT
+        je  ahcic_hn_dbg;
+
+        // Ops 0..3 need R_AHCIC_INVOKE.
+        mov r10, r12;
+        and r10, 0x020;
+        cmp r10, 0;
+        je  ahcic_hn_denied;
+
+        mov rdi, r13;
+        cmp rbp, 0;
+        je  ahcic_hn_abar;
+        cmp rbp, 1;
+        je  ahcic_hn_state;
+        cmp rbp, 2;
+        je  ahcic_hn_port_map;
+        // rbp == 3 (CTRL_IDX)
+        call ahci_ctrl_row_ctrl_idx;
+        jmp ahcic_hn_count;
+
+      ahcic_hn_abar:
+        call ahci_ctrl_row_abar;
+        jmp ahcic_hn_count;
+      ahcic_hn_state:
+        call ahci_ctrl_row_state;
+        jmp ahcic_hn_count;
+      ahcic_hn_port_map:
+        call ahci_ctrl_row_port_map;
+        jmp ahcic_hn_count;
+
+      ahcic_hn_dbg:
+        mov r10, r12;
+        and r10, 0x400;
+        cmp r10, 0;
+        je  ahcic_hn_denied;
+        xor rax, rax;
+        jmp ahcic_hn_out;
+
+      ahcic_hn_count:
+        push rax;
+        mov rdi, 2;                      // AHCIC_ST_QUERIES
+        call ahci_ctrl_note;
+        pop rax;
+        jmp ahcic_hn_out;
+
+      ahcic_hn_res:
+        mov rax, 0xFFFFEC8E;             // AHCIC_TAIL_BAD_ARG
+        jmp ahcic_hn_out;
+      ahcic_hn_denied:
+        mov rax, 0xFFFFFFFFFFFFFFFD;
+        jmp ahcic_hn_out;
+      ahcic_hn_unsup:
+        mov rax, 0xFFFFFFFFFFFFFFFC;
+
+      ahcic_hn_out:
+        pop rbp;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
