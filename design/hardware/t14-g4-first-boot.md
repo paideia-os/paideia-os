@@ -28,6 +28,9 @@ attached serial console, running the R28 MVP image
   recipes this doc's §5 pulls from (#1003).
 - `tools/run-smoke-hw.sh` — the fingerprint verifier this doc's §6
   hands off to (#1002).
+- `tools/hw-smoke-r51-nvme-t14g4.md` — R51.M8-006 (#1680) unified BDEV
+  HW witness; extends this doc's §6.1 with the mount+write+flush+
+  unmount+remount+read sequence against the internal NVMe device.
 
 **Non-goals.** Booting from internal NVMe (deferred to R25+ when the
 driver-attach path wires probe→identify→io_queues→mount into
@@ -201,6 +204,29 @@ $                                    <-- shell prompt (interactive)
 
 The `$ ` prompt is the R28.M2 acceptance witness: kernel booted +
 INIT ran + fork'd shell reached its read loop.
+
+### 6.1 R51.M8-006 extension: unified BDEV path on internal NVMe
+
+**Status: UNSEEDED, `gated:hardware`** (#1680, closing R51.M8). Once
+the `$ ` prompt is reached, the R51 closing witness drives one more
+step against the T14 G4's internal NVMe device before the boot
+recipe's acceptance surface is considered complete for R51:
+
+```
+$ ... mount+write+flush+unmount+remount+read sequence (see below) ...
+T14 G4 HW BDEV OK
+```
+
+This is the R51.M8-003 (#1677) sequence — mount, snapshot digest,
+write 32 journaled records with the six-step FLUSH barrier order,
+clean unmount, remount, WAL replay, snapshot digest compare — run
+interactively by the operator at the shell prompt rather than emitted
+automatically by the boot log. See `tools/hw-smoke-r51-nvme-t14g4.md`
+for the full procedure, the fingerprint fields (superblock digest,
+itable digest, WAL-head LBA, `mount_gen`, `blkdev_row_family`), and the
+promotion checklist. No expected values are recorded here or there
+until a real capture seeds them — recording an invented value would be
+worse than recording none.
 
 ---
 
@@ -397,6 +423,8 @@ After a clean run per §5–7:
 - `design/hardware/quirks.md §2` — T14 G4 quirks rows.
 - `design/security/pe-secure-boot-signing.md` — why R28.M1 ships
   unsigned + deferred #1001 signing.
+- `tools/hw-smoke-r51-nvme-t14g4.md` — R51.M8-006 #1680, §6.1's
+  unified BDEV HW witness (closes R51.M8).
 
 ---
 

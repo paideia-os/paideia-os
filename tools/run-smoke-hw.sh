@@ -101,6 +101,17 @@
 #            interactive tails. See tools/hw-smoke-fingerprints.md §5
 #            for the per-subsystem breakdown.
 #
+#   r51_m8_bdev
+#          — R51.M8-006 (#1680) closing HW witness for the unified
+#            BDEV path. Additionally gated by PAIDEIA_R51_M8_HW=1 (on
+#            top of the script-wide PAIDEIA_HW_SMOKE=1) because this
+#            mode drives a real mount+write+flush+unmount+remount+read
+#            cycle against the T14 G4's internal NVMe scratch volume —
+#            an operator running plain `boot`/`all` should never
+#            trigger it by accident. Fingerprint file:
+#            tests/hw/r51-nvme-t14g4.golden. Full recipe:
+#            tools/hw-smoke-r51-nvme-t14g4.md.
+#
 # ---------------------------------------------------------------------
 # Exit codes
 # ---------------------------------------------------------------------
@@ -120,6 +131,10 @@
 # ---------------------------------------------------------------------
 #
 #   PAIDEIA_HW_SMOKE          — must be "1" to run at all (safety gate).
+#   PAIDEIA_R51_M8_HW         — must ALSO be "1" to run the `r51_m8_bdev`
+#                               mode (see above; an extra gate on top of
+#                               PAIDEIA_HW_SMOKE for this one mode since
+#                               it writes to the internal NVMe volume).
 #   PAIDEIA_HW_SERIAL_DEV     — tty device path (default /dev/ttyUSB0).
 #   PAIDEIA_HW_SMOKE_TIMEOUT  — capture window in seconds (default per
 #                               mode: boot=45, pdxfs=60, net=60, all=180).
@@ -165,6 +180,13 @@ Modes:
           capture window; no interactive tail. Concatenates the
           boot / pdxfs-mount / net-probe-reset / usb-probe-reset
           lines from tools/hw-smoke-fingerprints.md §5.
+  r51_m8_bdev
+          R51.M8-006 #1680 closing HW witness: unified BDEV path
+          (mount+write+flush+unmount+remount+read) against the T14
+          G4's internal NVMe scratch volume. Requires BOTH
+          PAIDEIA_HW_SMOKE=1 and PAIDEIA_R51_M8_HW=1. Fingerprint:
+          tests/hw/r51-nvme-t14g4.golden. Recipe:
+          tools/hw-smoke-r51-nvme-t14g4.md.
 
 Guard:
   Refuses to run without PAIDEIA_HW_SMOKE=1 exported. This prevents
@@ -195,6 +217,7 @@ See also:
   design/hardware/t14-g4-first-boot.md       — cold-power-to-shell walkthrough.
   tools/nvme-hw-smoke.md                     — GDB-driven NVMe HW witness (#908).
   tools/xhci-keyboard-smoke.md               — HID Boot Keyboard HW witness.
+  tools/hw-smoke-r51-nvme-t14g4.md            — R51.M8-006 unified BDEV HW witness (#1680).
 
 Exit codes:
   0=pass  1=fingerprint mismatch  2=no serial adapter  3=gate not set
@@ -267,6 +290,30 @@ case "${MODE}" in
         # type at the prompt during the capture window.
         FINGERPRINT_FILE="${REPO_ROOT}/tests/hw/expected-hw-r28-composite.txt"
         DEFAULT_TIMEOUT=240
+        ;;
+    r51_m8_bdev)
+        # R51.M8-006 (#1680) closing HW witness. Additional gate on
+        # top of the script-wide PAIDEIA_HW_SMOKE=1: this mode drives
+        # a real mount+write+flush+unmount+remount+read cycle against
+        # the T14 G4's internal NVMe scratch volume (see
+        # tools/hw-smoke-r51-nvme-t14g4.md), so an operator running
+        # the plain `boot`/`all` modes should never trigger it by
+        # accident.
+        if [[ "${PAIDEIA_R51_M8_HW:-0}" != "1" ]]; then
+            cat >&2 <<'MSG'
+run-smoke-hw[r51_m8_bdev]: this mode additionally requires PAIDEIA_R51_M8_HW=1.
+
+This mode drives a real mount+write+flush+unmount+remount+read cycle
+against the T14 G4's internal NVMe scratch volume (data loss on that
+volume is expected — do not point it at a partition you want to keep).
+See tools/hw-smoke-r51-nvme-t14g4.md for the full recipe. Re-run with:
+
+    PAIDEIA_HW_SMOKE=1 PAIDEIA_R51_M8_HW=1 tools/run-smoke-hw.sh r51_m8_bdev
+MSG
+            exit 3
+        fi
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/hw/r51-nvme-t14g4.golden"
+        DEFAULT_TIMEOUT=120
         ;;
     all)
         # `all` recurses into the four sub-modes in order, sharing the
