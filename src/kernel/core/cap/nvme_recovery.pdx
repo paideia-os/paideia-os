@@ -1,0 +1,783 @@
+// src/kernel/core/cap/nvme_recovery.pdx -- R51.M4-005 (#1655).
+//
+// design/hardware/nvme-oncs-reliability.md (commit 1682a41) §3.1 (per-CID
+// deadline table), §3.2 (per-queue strike counter), §3.6 (watchdog
+// periodic-tick hook), §5.5 (watchdog + 3-strike queue reset), §4.4 (M4
+// failure band -- NVMEREL_WD_TIMEOUT_INJECT 0xFFFFEC79 / NVMEREL_QRESET_FAILED
+// 0xFFFFEC7A, both already declared in nvme_reliability.pdx's whole-module
+// taxonomy; this file reuses them by literal value, matching the existing
+// cross-file convention of not re-declaring a `pub let` constant that
+// already exists elsewhere in the flat symbol namespace -- see
+// nvme_reliability.pdx / nvme_admin_events.pdx, which likewise reference
+// NVMEIO_PICK_NONE etc. by literal + comment rather than importing it).
+//
+// This file owns the third and last file of R51.M4's three-way split
+// (design §1): the per-CID deadline table, the 1 Hz wheel-tick scanner,
+// synthetic-timeout CQE injection, and 3-strike queue-reset. §5.6
+// (Controller Fatal Status + NSSR, #1656) is a *separate*, not-yet-landed
+// commit that will extend this same file -- nothing here defines
+// nvme_cfs_scan_all / nvme_nssr_fire; the watchdog's own "CFS check
+// first" gate (§5.5, "Every watchdog tick reads CSTS.CFS first... if
+// set, the timeout injection is skipped") is satisfied here with a
+// direct CSTS MMIO read via the existing R24 nvme_reg_u32 accessor
+// (drivers/nvme/regs.pdx NVME_REG_CSTS=0x1C, NVME_CSTS_CFS=0x2) rather
+// than by calling into #1656's not-yet-existing nvme_cfs_scan_all --
+// #1656 is free to layer its own richer CFS-recovery path on top of the
+// same register without touching anything this commit lands.
+//
+// =============================================================================
+// SECTION 0  DEADLINE-TABLE ADDRESSING (design §3.1) -- CROSS-FILE DATA
+//            SYMBOL REFERENCE, NOT A NEW PATTERN
+// =============================================================================
+//
+// This file's stamp/clear helpers need to turn a `pair_row` address
+// (returned by nvme_io_pick_pair / nvme_iop_row_addr, both in
+// nvme_io_queues.pdx) into a row index into `_nvme_inflight_deadline`
+// (owned by *this* file). The clean way to do that without threading
+// ctrl_row_id/cpu_idx through every submit-site call (nvme_io_completion_
+// drain, in particular, receives neither) is `row_index = (pair_row -
+// &_nvme_io_pair_table) >> 6` -- pair_row is always exactly
+// `&_nvme_io_pair_table + (ctrl_row_id*8+cpu_idx)*64`, so this recovers
+// the identical `ctrl_row_id*8+cpu_idx` composite index the pair table
+// itself uses, purely from the pointer, with no cross-file *function*
+// call needed for the reverse mapping.
+//
+// This requires a cross-file *data* symbol reference (`lea r10, [rip +
+// _nvme_io_pair_table]` from a file that does not define that symbol).
+// That is an already-established, working pattern in this codebase --
+// not a new risk introduced here: `_nvme_current_bar0` (defined `pub
+// let mut` in drivers/nvme/io_queue.pdx) is read/written directly via
+// `[rip + _nvme_current_bar0]` from kind_nvme_controller.pdx,
+// drivers/nvme/dispatch.pdx, drivers/nvme/mdts.pdx, and
+// drivers/nvme/irq.pdx -- four other files, none of which define it.
+// `_tsc_hz` (defined `pub let mut` in core/time/tsc.pdx) is read the
+// same way by this file's own nvme_wd_stamp_deadline (see §3 below).
+// Both precedents confirm `pub let mut` bindings are ordinary global
+// symbols regardless of whether they hold code or data, resolved
+// file-flat the same way `pub let` functions already are throughout
+// this module family (nvme_reliability.pdx / nvme_admin_events.pdx call
+// nvme_ctrl_row_oncs / nvme_io_pick_pair / etc. by bare name with no
+// import statement -- this codebase has none).
+//
+// Deadline-table layout (design §3.1, exact): `_nvme_inflight_deadline
+// : [u64; 4096]` (NVMEC_MAX=8 * NVME_IO_MAX_CPUS=8 * NVME_IO_QUEUE_ENTRIES
+// =64 = 4096 entries, 32 KiB, @align(64), zero-init). Indexed as
+// `[(ctrl_row_id*8+cpu_idx)*64 + cid]` == `[row_index*64 + cid]` ==
+// `[(pair_row - table_base)/64 * 64 + cid]`. A zero entry means "no
+// in-flight command at this CID" (see design §3.1: a valid deadline is
+// always a large nonzero TSC-tick count).
+//
+// =============================================================================
+// SECTION 1  DEADLINE MATH -- WHY tsc_ns_to_ticks(30_000_000_000) IS NOT
+//            USED (DESIGN-DOC GAP)
+// =============================================================================
+//
+// design §3.1's pseudocode computes the 30 s deadline via `mov r11,
+// <ticks_for_30s> // computed once via tsc_ns_to_ticks(30_000_000_000)`.
+// core/time/tsc.pdx's own tsc_ns_to_ticks docstring says its two-operand
+// `imul rax, rcx` (ns * tsc_hz) is "safe for ns <= 2^63 / tsc_hz ~= 3
+// seconds at 3 GHz" -- ns=30_000_000_000 at a realistic tsc_hz (~1-5 GHz)
+// overflows that bound by roughly an order of magnitude (30e9 * 3e9 =
+// 9e19 > 2^64), silently wrapping the truncated 64-bit product and
+// yielding a garbage tick count. This file does NOT call
+// tsc_ns_to_ticks for the 30 s (or 60 s re-strike) constant; instead it
+// computes `ticks = _tsc_hz * 30` (or `* 60`) directly -- multiplying a
+// small factor (30, 60) by tsc_hz (order 1e9-1e10) cannot overflow u64,
+// and is exact (no rounding through an ns intermediate at all). The 1 Hz
+// scan *period* (§3.6) is a different, much smaller conversion
+// (ns=1_000_000_000) that sits comfortably inside tsc_ns_to_ticks's own
+// safe bound, so nvme_recovery_init still calls tsc_ns_to_ticks for that
+// one value, matching design §3.6 verbatim. Flagged here for the
+// design doc's next revision (parent: design/hardware/nvme-oncs-
+// reliability.md §3.1).
+//
+// =============================================================================
+// SECTION 2  QUEUE-RESET vs. nvme_io_create_pair'S MSIX PRECONDITION
+//            (DESIGN-DOC GAP)
+// =============================================================================
+//
+// design §5.5 says nvme_queue_reset "state -> QUIESCED (M3 §2.1 reserved
+// value 4); zero the SQ/CQ buffers; recreate CQ+SQ via nvme_io_create_pair
+// (M3)". But nvme_io_create_pair (nvme_io_queues.pdx, #1646, already
+// landed) unconditionally requires the pair row's state byte to be
+// NVME_IOP_STATE_MSIX (1) on entry ("require the pair row's state byte
+// (+1) == NVME_IOP_STATE_MSIX ... any failure here ... returns
+// NVMEIO_STATE_BAD") -- calling it with state=QUIESCED(4) would always
+// fail immediately. This file resolves the gap by sequencing:
+// delete SQ+CQ (best-effort) -> zero both physical pages -> state ->
+// QUIESCED with cq_pa/doorbells/cursors row fields zeroed -> state ->
+// MSIX (satisfying create_pair's precondition; msix_row_id at +40 is
+// never touched, so it survives untouched per design's own note) ->
+// call nvme_io_create_pair. On success the pair naturally lands back at
+// SQ_LIVE (create_pair's own success path) and this file stamps
+// strikes=0 / last_reset_tsc; on failure this file forces state back to
+// QUIESCED itself (overriding nvme_io_create_pair's own SQ-create-
+// failure rollback, which reverts to MSIX -- not QUIESCED -- since that
+// function has no notion of the M4 reset flow), matching design's
+// stated final contract ("On failure returns NVMEREL_QRESET_FAILED and
+// leaves state at QUIESCED for the CFS path to escalate"). Flagged here
+// for the design doc's next revision.
+//
+// =============================================================================
+// SECTION 3  NVMEREL_WD_TIMEOUT_INJECT IS DECLARED BUT NOT RETURNED
+//            (DESIGN-DOC GAP)
+// =============================================================================
+//
+// design §4.4 documents NVMEREL_WD_TIMEOUT_INJECT (0xFFFFEC79) as "what
+// nvme_io_completion_drain returns for a watchdog-synthesized
+// completion". Because every I/O submit path in this kernel is
+// synchronous (submit, then spin-drain, in the same call --
+// nvme_io_submit_rw / _flush / _trim never return to their caller
+// without first calling nvme_io_completion_drain to exhaustion), by the
+// time a 30 s deadline could ever actually elapse the original caller's
+// own local spin (spin_max = NVME_SYNC_SPIN_MAX = 50_000_000 iterations,
+// drivers/nvme/sync.pdx) has already exhausted and returned
+// NVMEIO_SUBMIT_TIMEOUT on its own, long before the watchdog's 1 Hz scan
+// could observe the entry as overdue. There is therefore no live
+// "nvme_io_completion_drain still spinning when the watchdog fires"
+// scenario in this architecture for nvme_io_completion_drain itself to
+// special-case -- nvme_watchdog_inject_timeout (§5 below) writes the
+// synthetic CQE and updates bookkeeping directly rather than being
+// observed indirectly via nvme_io_completion_drain's return value.
+// NVMEREL_WD_TIMEOUT_INJECT remains declared (nvme_reliability.pdx) for
+// a future async (non-blocking-submit) I/O path per design's own R52+
+// inheritance note; this commit does not return it from anywhere.
+// Flagged for the design doc's next revision.
+//
+// =============================================================================
+// SECTION 4  paideia-as encoder-gap posture (v0.22.x)
+// =============================================================================
+//
+//   G1: sized loads via `xor <reg>,<reg>; mov_b <reg>,[mem]` for the
+//       qid / state byte reads (base+immediate-displacement only, so
+//       G1's `[reg+reg]` restriction never applies in this file).
+//   G4: every sentinel compare against a value with bit 31/63 set is
+//       staged through `mov r10, <imm>; cmp reg, r10` (NVMEC_DECODE_BAD
+//       / NVMEIO_DECODE_BAD, both 0xFFFFFFFFFFFFFFFF) -- identical
+//       posture to nvme_reliability.pdx / nvme_admin_events.pdx /
+//       nvme_io_queues.pdx.
+//   No `test` instruction anywhere; every zero-check is `cmp reg, 0`.
+//   r10/r11 (and, where noted, r8/r9/rcx/rdx) used freely as caller-save
+//   scratch across this file's leaf helpers; every function that makes a
+//   nested `call` re-derives any sentinel/mask constant fresh
+//   immediately before the compare that consumes it, never assuming a
+//   caller-save register survives a call.
+//
+// Reserved-label discipline (`loop`/`if`/etc. are keywords): every label
+// in this file is prefixed `nvme_wd`:
+//   nvme_wdri_  -> nvme_recovery_init
+//   nvme_wdsc_  -> nvme_watchdog_scan_all
+//   nvme_wdi_   -> nvme_watchdog_inject_timeout
+//   nvme_wdqr_  -> nvme_queue_reset
+//   (nvme_wd_stamp_deadline / nvme_wd_clear_deadline are straight-line
+//    leaves with no internal branches, hence no labels of their own.)
+
+module NvmeRecovery = structure {
+
+  // ============================================================================
+  // §3.1 -- per-CID watchdog deadline table. 8 (NVMEC_MAX) * 8
+  // (NVME_IO_MAX_CPUS) * 64 (NVME_IO_QUEUE_ENTRIES) = 4096 u64 entries,
+  // 32 KiB, zero-init (0 == "no in-flight command at this CID").
+  // ============================================================================
+  pub let mut _nvme_inflight_deadline : [u64; 4096] = uninit @align(64)
+
+  // §3.6 -- watchdog periodic-tick bookkeeping. Both zero-init;
+  // nvme_recovery_init seeds _nvme_watchdog_period (idempotently) and
+  // nvme_watchdog_scan_all advances _nvme_watchdog_last_tick on every
+  // tick it actually acts on.
+  pub let mut _nvme_watchdog_last_tick : u64 = 0
+  pub let mut _nvme_watchdog_period    : u64 = 0
+
+  // ==========================================================================
+  // nvme_recovery_init(ctrl_row_id) -> u64
+  //
+  // design §3.6. Idempotently seeds _nvme_watchdog_period =
+  // tsc_ns_to_ticks(1_000_000_000) (1 Hz cadence; this 1 s conversion
+  // sits well inside tsc_ns_to_ticks's own ~3 s-at-3GHz safe bound, per
+  // this file's header §1 note) and _nvme_watchdog_last_tick = now, the
+  // first time any controller brings up the reliability path. A second
+  // (or Nth) controller's own bring-up calling this again is a no-op
+  // (period already nonzero) -- the watchdog scan is global across all
+  // controllers, not per-controller state, so re-seeding on every
+  // bring-up would incorrectly reset the cadence clock. ctrl_row_id is
+  // bounds-checked (< NVMEC_MAX = 8) but otherwise only used to reject
+  // an obviously-bad call; no per-controller state is written here.
+  //
+  // Returns 0 on success (including the already-initialized no-op case)
+  // or NVMEC_DECODE_BAD (0xFFFFFFFFFFFFFFFF) if ctrl_row_id is out of
+  // range.
+  // ==========================================================================
+  pub let nvme_recovery_init : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (ctrl_row_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R51.M4-005 (#1655): idempotent watchdog cadence seed. No callee-save registers are needed (ctrl_row_id, rdi, is only read once for the bounds check and never needed again); a single `sub rsp, 8` gives the one nested call to tsc_ns_to_ticks the required rsp%16==0 alignment (entry rsp%16==8, no pushes, so `sub rsp,8` alone reaches 16, %16==0). Body: (1) reject ctrl_row_id >= 8 (NVMEC_MAX) with NVMEC_DECODE_BAD; (2) if _nvme_watchdog_period is already nonzero, this is a later controller's bring-up re-calling the same init -- return 0 immediately without touching either global (idempotent); (3) else call tsc_ns_to_ticks(1_000_000_000) and stash the result in _nvme_watchdog_period, then rdtsc-reconstruct (shl rdx,32; or rax,rdx, the standard idiom throughout this kernel) 'now' into _nvme_watchdog_last_tick, and return 0. Reserved labels: nvme_wdri_.",
+      block: {
+        sub rsp, 8;
+
+        cmp rdi, 8;                       // NVMEC_MAX
+        jae nvme_wdri_bad;
+
+        mov r10, [rip + _nvme_watchdog_period];
+        cmp r10, 0;
+        jne nvme_wdri_already;
+
+        mov rdi, 1000000000;              // 1 s in ns
+        call tsc_ns_to_ticks;
+        mov [rip + _nvme_watchdog_period], rax;
+
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        mov [rip + _nvme_watchdog_last_tick], rax;
+
+      nvme_wdri_already:
+        xor rax, rax;
+        jmp nvme_wdri_out;
+
+      nvme_wdri_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;      // NVMEC_DECODE_BAD
+
+      nvme_wdri_out:
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_wd_stamp_deadline(pair_row, cid) -> ()
+  //
+  // design §3.1 write cadence. Called by nvme_io_submit_rw (M3, patched
+  // this commit), nvme_io_submit_flush (#1651, patched this commit), and
+  // nvme_io_submit_trim (#1652, patched this commit) immediately after
+  // each has computed the CID it just submitted. Stamps
+  // now + (tsc_hz * 30) into the deadline-table slot for (pair_row's
+  // implicit ctrl_row_id/cpu_idx, cid) -- see this file's header §0 for
+  // the row_index derivation and §1 for why the 30 s constant is
+  // computed as a direct multiply rather than via tsc_ns_to_ticks.
+  //
+  // Pure leaf: no nested call, so no callee-save registers and no stack
+  // alignment concern. Every register it touches (rax/rcx/rdx/r8/r9/
+  // r10/r11) is caller-save scratch; callers rely on nothing surviving
+  // across this call except whatever they hold in a callee-save
+  // register (rbx/rbp/r12-r15), which this function never touches.
+  // ==========================================================================
+  pub let nvme_wd_stamp_deadline : (u64, u64) -> () !{mem, sysreg} @{} =
+    fn (pair_row: u64) (cid: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R51.M4-005 (#1655): stamp a 30 s watchdog deadline for one (pair_row, cid). row_index = (pair_row - &_nvme_io_pair_table) >> 6 (cross-file data-symbol reference, established pattern -- see file header §0); entry_addr = &_nvme_inflight_deadline + row_index*512 + cid*8 (512 = 64 cids * 8 B/entry, matching the pair table's own 64-byte row stride one-for-one in row count). deadline = rdtsc-reconstructed 'now' + (_tsc_hz * 30) (direct multiply, not tsc_ns_to_ticks -- see file header §1 for the overflow reasoning). Leaf; no callee-save pushes, no alignment concern (no nested call).",
+      block: {
+        lea r10, [rip + _nvme_io_pair_table];
+        mov r11, rdi;                     // pair_row
+        sub r11, r10;
+        shr r11, 6;                       // row_index = ctrl_row_id*8+cpu_idx
+        shl r11, 9;                       // * 512 (deadline-table row stride)
+
+        lea r10, [rip + _nvme_inflight_deadline];
+        add r11, r10;
+
+        mov r10, rsi;                     // cid
+        shl r10, 3;
+        add r11, r10;                     // entry_addr
+
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;                     // now (ticks)
+
+        mov rcx, [rip + _tsc_hz];
+        mov r9, 30;
+        imul r9, rcx;                     // ticks_for_30s = tsc_hz * 30
+        add rax, r9;                      // deadline = now + 30s
+
+        mov [r11 + 0], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_wd_clear_deadline(pair_row, cid) -> ()
+  //
+  // design §3.1: "nvme_io_completion_drain (M3, patched at M4) zeroes
+  // the entry when it consumes the matching CQE." Called from
+  // nvme_io_completion_drain's match branch (this commit's patch to
+  // nvme_io_queues.pdx) and from nvme_watchdog_inject_timeout (this
+  // file, §5 below) once it has finished synthesising a timeout CQE for
+  // the same (pair_row, cid). Same addressing derivation as
+  // nvme_wd_stamp_deadline; stores 0 instead of a deadline.
+  // ==========================================================================
+  pub let nvme_wd_clear_deadline : (u64, u64) -> () !{mem} @{} =
+    fn (pair_row: u64) (cid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M4-005 (#1655): zero the deadline-table entry for (pair_row, cid). Identical row_index/entry_addr derivation to nvme_wd_stamp_deadline (see that function's justification and file header §0); stores 0 rather than computing a deadline. Leaf; no callee-save pushes, no alignment concern.",
+      block: {
+        lea r10, [rip + _nvme_io_pair_table];
+        mov r11, rdi;                     // pair_row
+        sub r11, r10;
+        shr r11, 6;                       // row_index
+        shl r11, 9;                       // * 512
+
+        lea r10, [rip + _nvme_inflight_deadline];
+        add r11, r10;
+
+        mov r10, rsi;                     // cid
+        shl r10, 3;
+        add r11, r10;                     // entry_addr
+
+        xor rax, rax;
+        mov [r11 + 0], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_watchdog_scan_all() -> u64
+  //
+  // design §5.5. Called by the wheel tick (design §3.6) once per
+  // scheduler/timer interrupt; this commit does NOT wire that
+  // registration -- core/timer/wheel.pdx is, as of this landing, a
+  // Phase-6 stub (stub_wheel_init / stub_wheel_add / stub_wheel_fire,
+  // all no-ops with no callback-list structure of any kind) with no
+  // mechanism to register a callback against at all. nvme_watchdog_
+  // scan_all is implemented and exported here, ready to be invoked
+  // once wheel.pdx grows real per-tick callback dispatch; flagged for
+  // whichever future ticket lands that infrastructure (out of #1655's
+  // file list per the task scope). Until then, nothing calls this
+  // function automatically.
+  //
+  // No-ops (returns 0 without scanning) unless
+  // (rdtsc_now - _nvme_watchdog_last_tick) >= _nvme_watchdog_period,
+  // matching design's stated cadence gate. When it does scan, it walks
+  // the full 4096-entry deadline table once (a flat scan, not a nested
+  // ctrl_row x cpu_idx x cid loop -- see file header note on how the
+  // three indices decompose from one flat i64 offset), and for every
+  // nonzero, overdue entry: re-checks CSTS.CFS for that entry's
+  // controller (skipping injection, per design's "CFS check first",
+  // if set) and otherwise calls nvme_watchdog_inject_timeout. Returns
+  // the count of timeouts actually injected.
+  // ==========================================================================
+  pub let nvme_watchdog_scan_all : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R51.M4-005 (#1655): 1 Hz-gated flat scan over _nvme_inflight_deadline (4096 entries). Six-push callee-save prologue (rbx=idx, rbp=now, r12=timeout_count, r13=ctrl_row_id-this-iter, r14=cpu_idx-this-iter, r15=cid-this-iter) + sub rsp,8 = 56 B; entry rsp%16==8 -> 64, %16==0, so every nested call (nvme_ctrl_row_bar0, nvme_reg_u32, nvme_watchdog_inject_timeout) executes at rsp%16==0. Body: (1) rdtsc-reconstruct 'now'; if now - _nvme_watchdog_last_tick < _nvme_watchdog_period, return 0 (no-op) without touching last_tick. (2) Else stamp _nvme_watchdog_last_tick = now, stash now in rbp, zero rbx (idx) and r12 (timeout_count). (3) Loop idx = 0..4095: load deadline; 0 -> not in flight, skip; deadline >= now (jbe, i.e. now <= deadline) -> not yet overdue, skip. Overdue: decompose ctrl_row_id = idx>>9, cpu_idx = (idx>>6)&7, cid = idx&63 (exact per the deadline table's ctrl*512+cpu*64+cid packing -- see file header §0). Re-derive bar0 via nvme_ctrl_row_bar0(ctrl_row_id); NVMEC_DECODE_BAD (no controller info) -> inject anyway (conservative default, cannot gate on CFS without a bar0); else read CSTS via nvme_reg_u32(bar0, 0x1C) and mask NVME_CSTS_CFS (bit 1) -- set -> skip this entry entirely (design: 'the timeout injection is skipped for the affected controller' while CFS-recovery, #1656, is expected to synthesize its own abort CQEs). Otherwise call nvme_watchdog_inject_timeout(ctrl_row_id, cpu_idx, cid) and increment timeout_count. (4) Return timeout_count. Every sentinel compare against NVMEC_DECODE_BAD (0xFFFFFFFFFFFFFFFF) is staged through `mov r10,<imm>; cmp reg,r10` per this file's G4 posture. Reserved labels: nvme_wdsc_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;                     // now (ticks)
+
+        mov r10, [rip + _nvme_watchdog_last_tick];
+        mov r11, [rip + _nvme_watchdog_period];
+        mov rcx, rax;
+        sub rcx, r10;                     // elapsed
+        cmp rcx, r11;
+        jb  nvme_wdsc_noop;
+
+        mov [rip + _nvme_watchdog_last_tick], rax;
+        mov rbp, rax;                     // now (stashed across the scan)
+
+        xor rbx, rbx;                      // idx = 0
+        xor r12, r12;                      // timeout_count = 0
+
+      nvme_wdsc_loop:
+        cmp rbx, 4096;
+        jae nvme_wdsc_done;
+
+        lea r10, [rip + _nvme_inflight_deadline];
+        mov r11, [r10 + rbx * 8];
+        cmp r11, 0;
+        je  nvme_wdsc_next;
+
+        cmp rbp, r11;
+        jbe nvme_wdsc_next;                // now <= deadline: not yet overdue
+
+        mov r13, rbx;
+        shr r13, 9;                        // ctrl_row_id = idx / 512
+        mov r14, rbx;
+        shr r14, 6;
+        and r14, 7;                        // cpu_idx = (idx/64) & 7
+        mov r15, rbx;
+        and r15, 63;                       // cid = idx & 63
+
+        mov rdi, r13;
+        call nvme_ctrl_row_bar0;
+        mov r10, 0xFFFFFFFFFFFFFFFF;       // NVMEC_DECODE_BAD
+        cmp rax, r10;
+        je  nvme_wdsc_inject;              // no bar0 -> can't gate on CFS, inject anyway
+
+        mov rdi, rax;                      // bar0
+        mov rsi, 0x1C;                     // NVME_REG_CSTS
+        call nvme_reg_u32;
+        mov r10, 2;                        // NVME_CSTS_CFS
+        and rax, r10;
+        cmp rax, 0;
+        jne nvme_wdsc_next;                // CFS set -> skip injection for this controller
+
+      nvme_wdsc_inject:
+        mov rdi, r13;                      // ctrl_row_id
+        mov rsi, r14;                      // cpu_idx
+        mov rdx, r15;                      // cid
+        call nvme_watchdog_inject_timeout;
+        add r12, 1;
+
+      nvme_wdsc_next:
+        add rbx, 1;
+        jmp nvme_wdsc_loop;
+
+      nvme_wdsc_done:
+        mov rax, r12;
+        jmp nvme_wdsc_out;
+
+      nvme_wdsc_noop:
+        xor rax, rax;
+
+      nvme_wdsc_out:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_watchdog_inject_timeout(ctrl_row_id, cpu_idx, cid) -> ()  (private)
+  //
+  // design §5.5. Writes a synthetic CQE at the pair's cq_pa + cq_head*16
+  // with SCT=0x3, SC=0x83 per design's literal values, phase-tag set to
+  // the pair row's own *expected* cq_phase (design's CAREFUL note: NOT
+  // the observed device value -- there is nothing to observe here, we
+  // are fabricating the entry), CID = the timed-out cid. Advances
+  // cq_head/cq_phase and rings CQyHDBL exactly as nvme_io_completion_
+  // drain's own match branch does, so a real late completion from the
+  // device (design's race note) lands on a CQ state consistent with
+  // what we just told the controller we'd consumed. Clears the deadline
+  // entry, then updates the pair row's strike counter (+56, design
+  // §3.2): strikes < 3 after incrementing -> store and done; strikes
+  // reaching 3 with no prior reset (last_reset_tsc == 0) -> attempt
+  // nvme_queue_reset; strikes reaching 3 again within 60 s of the last
+  // successful reset -> escalate by forcing state -> QUIESCED directly
+  // (design: "escalates to controller-fatal (delegated to §5.6)" --
+  // #1656 is not landed, so this commit's escalation is exactly the
+  // QUIESCED-and-stop action a failed reset would also produce; #1656's
+  // CFS/NSSR path picks up from there); otherwise (strikes reaching 3,
+  // last reset older than 60 s) -> attempt nvme_queue_reset again.
+  // ==========================================================================
+  let nvme_watchdog_inject_timeout : (u64, u64, u64) -> () !{mem, sysreg} @{cap} =
+    fn (ctrl_row_id: u64) (cpu_idx: u64) (cid: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R51.M4-005 (#1655): synthesize one timeout CQE + strike-counter update for (ctrl_row_id, cpu_idx, cid). Five-push callee-save prologue (rbx=ctrl_row_id, rbp=cpu_idx, r12=cid, r13=pair_row, r14=bar0) = 40 B; entry rsp%16==8 -> 48, %16==0 -- no pad needed, every nested call (nvme_iop_row_addr, nvme_ctrl_row_bar0, nvme_ring_cq, nvme_wd_clear_deadline, nvme_queue_reset) executes at rsp%16==0. Body: (1) pair_row via nvme_iop_row_addr(ctrl_row_id, cpu_idx); NVMEIO_DECODE_BAD -> return (should not happen -- indices are the scanner's own valid decomposition). (2) bar0 via nvme_ctrl_row_bar0(ctrl_row_id); DECODE_BAD -> return (cannot ring a doorbell without it). (3) Read cursors (+32): old cq_head = bits[31:16], old cq_phase = bits[7:0]. cqe_addr = cq_pa(+16) + cq_head*16. Zero DW0/DW1 (qword @+0). Build the second qword (@+8): bits[63:48]=status_field=(cq_phase | (0x83<<1) | (0x3<<9)) = (cq_phase | 0x706), bits[47:32]=cid&0xFFFF, bits[31:0]=0 (SQ head/SQ id, unused by this kernel's own drain path) -- a single 8-byte store, avoiding any mov_w partial-write hazard. (4) new_cq_head=(old+1)&0x3F; toggle cq_phase (xor 1) only if new_cq_head==0 (wrap); rebuild cursors preserving sq_tail (bits[63:32]); write back. (5) qid via the G1 xor+mov_b idiom on pair_row+0; nvme_ring_cq(bar0, qid, new_cq_head). (6) nvme_wd_clear_deadline(pair_row, cid). (7) Strike update at pair_row+56: old = bits[15:0] strikes | bits[63:16] last_reset_tsc<<16 (design §3.2 packing). new_strikes = old_strikes+1; store_val = (old & 0xFFFFFFFFFFFF0000) | new_strikes, written back unconditionally first. If new_strikes < 3, done. Else: old_last_reset = old & 0xFFFFFFFFFFFF0000; if zero (never reset), go straight to nvme_queue_reset; else compute elapsed = now - old_last_reset (both already tick-scale, old_last_reset's low 16 bits are lost per the packing -- negligible against a 60 s-scale test per design) and ticks_60s = _tsc_hz*60 (direct multiply, not tsc_ns_to_ticks -- see file header §1); elapsed < ticks_60s -> escalate (force state -> QUIESCED via the standard mask-bits[15:8]-then-OR idiom, matching nvme_io_create_pair's own header-rewrite shape) and return; else call nvme_queue_reset(ctrl_row_id, cpu_idx) -- its own success path re-stamps strikes=0/last_reset_tsc and its own failure path re-forces QUIESCED, so this function does not need to inspect its return value. Reserved labels: nvme_wdi_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                      // ctrl_row_id
+        mov rbp, rsi;                      // cpu_idx
+        mov r12, rdx;                      // cid
+
+        mov rdi, rbx;
+        mov rsi, rbp;
+        call nvme_iop_row_addr;
+        mov r10, 0xFFFFFFFFFFFFFFFF;       // NVMEIO_DECODE_BAD
+        cmp rax, r10;
+        je  nvme_wdi_out;
+        mov r13, rax;                       // pair_row
+
+        mov rdi, rbx;
+        call nvme_ctrl_row_bar0;
+        mov r10, 0xFFFFFFFFFFFFFFFF;        // NVMEC_DECODE_BAD
+        cmp rax, r10;
+        je  nvme_wdi_out;
+        mov r14, rax;                       // bar0
+
+        // ---- synthesize the timeout CQE ----
+        mov r10, [r13 + 32];                // cursors (old)
+        mov rax, r10;
+        shr rax, 16;
+        and rax, 0xFFFF;                    // cq_head (old)
+        mov rcx, r10;
+        and rcx, 0xFF;                      // cq_phase (old, expected)
+
+        mov r11, [r13 + 16];                 // cq_pa
+        mov r9, rax;
+        shl r9, 4;
+        add r9, r11;                          // cqe_addr = cq_pa + cq_head*16
+
+        xor r8, r8;
+        mov [r9 + 0], r8;                     // DW0/DW1 zero
+
+        mov r8, rcx;                          // cq_phase bit
+        mov rdx, 0x706;                       // (SC=0x83 << 1) | (SCT=0x3 << 9)
+        or  r8, rdx;                          // status_field
+        shl r8, 48;
+        mov rdx, r12;                         // cid
+        and rdx, 0xFFFF;
+        shl rdx, 32;
+        or  r8, rdx;
+        mov [r9 + 8], r8;                      // CID + status_field packed
+
+        // ---- advance cq_head/cq_phase; rebuild + write back cursors ----
+        mov rdx, rax;                         // old cq_head
+        add rdx, 1;
+        and rdx, 0x3F;                        // new cq_head (NVME_IO_QUEUE_ENTRIES=64)
+
+        cmp rdx, 0;
+        jne nvme_wdi_no_wrap;
+        xor rcx, 1;                           // toggle phase on wrap
+      nvme_wdi_no_wrap:
+
+        mov r8, r10;                          // old cursors
+        mov r9, 0xFFFFFFFF00000000;
+        and r8, r9;                           // keep sq_tail bits only
+        mov r9, rdx;
+        shl r9, 16;
+        or  r8, r9;                           // | new cq_head
+        or  r8, rcx;                          // | new cq_phase
+        mov [r13 + 32], r8;                   // write back cursors
+
+        xor rcx, rcx;
+        mov_b rcx, [r13 + 0];                 // qid, zero-extended
+
+        mov rdi, r14;                         // bar0
+        mov rsi, rcx;                         // qid
+        call nvme_ring_cq;                    // rdx already holds new_cq_head
+
+        // ---- clear the deadline entry ----
+        mov rdi, r13;                         // pair_row
+        mov rsi, r12;                         // cid
+        call nvme_wd_clear_deadline;
+
+        // ---- strike counter (+56) ----
+        mov rax, [r13 + 56];                  // strikes_and_last (old)
+        mov r10, rax;
+        and r10, 0xFFFF;                      // old strikes
+        add r10, 1;                           // new strikes (tentative)
+
+        mov r11, rax;
+        mov rcx, 0xFFFFFFFFFFFF0000;
+        and r11, rcx;                          // old_last_reset (bits[63:16], still shifted)
+
+        mov r9, r11;
+        or  r9, r10;                           // store_val = old_last_reset | new_strikes
+        mov [r13 + 56], r9;
+
+        cmp r10, 3;
+        jb  nvme_wdi_out;                       // strikes < 3: done
+
+        cmp r11, 0;
+        je  nvme_wdi_do_reset;                  // never reset before -> attempt reset
+
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;                            // now
+        mov rcx, [rip + _tsc_hz];
+        mov r9, 60;
+        imul r9, rcx;                             // ticks_60s = tsc_hz * 60
+        mov r10, rax;
+        sub r10, r11;                              // elapsed = now - old_last_reset
+        cmp r10, r9;
+        jb  nvme_wdi_escalate;                     // elapsed < 60s -> escalate, skip reset
+
+      nvme_wdi_do_reset:
+        mov rdi, rbx;                               // ctrl_row_id
+        mov rsi, rbp;                               // cpu_idx
+        call nvme_queue_reset;                       // side effects applied internally
+        jmp nvme_wdi_out;
+
+      nvme_wdi_escalate:
+        mov rax, [r13 + 0];
+        mov r10, 0xFFFFFFFFFFFF00FF;
+        and rax, r10;
+        mov r10, 4;                                  // NVME_IOP_STATE_QUIESCED
+        shl r10, 8;
+        or  rax, r10;
+        mov [r13 + 0], rax;
+
+      nvme_wdi_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_queue_reset(ctrl_row_id, cpu_idx) -> u64  (private)
+  //
+  // design §5.5 (register plan named literally "ctrl_row_id, cpu_idx"),
+  // reconciled with nvme_io_create_pair's MSIX precondition per this
+  // file's header §2. DELETE_IO_SQ + DELETE_IO_CQ (best-effort, R24
+  // drivers/nvme/io_queue.pdx), zero both physical pages, force the pair
+  // row through QUIESCED (design's stated on-the-wire state) and then
+  // MSIX (satisfying nvme_io_create_pair's own precondition) before
+  // calling nvme_io_create_pair to rebuild both queues. msix_row_id
+  // (+40) is never touched by any step here, so it survives untouched
+  // exactly as design requires. On success: strikes=0 / last_reset_tsc
+  // stamped (state is already SQ_LIVE, nvme_io_create_pair's own
+  // success terminus). On failure: state forced back to QUIESCED
+  // (overriding nvme_io_create_pair's own MSIX-revert-on-SQ-failure
+  // path, which has no notion of this M4 reset flow).
+  //
+  // Returns 0 on success or NVMEREL_QRESET_FAILED (0xFFFFEC7A) on any
+  // failure (bad row, bad pair address, or nvme_io_create_pair itself
+  // failing).
+  // ==========================================================================
+  let nvme_queue_reset : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (ctrl_row_id: u64) (cpu_idx: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R51.M4-005 (#1655): delete + recreate one (ctrl_row_id, cpu_idx) IO pair, per this file's header §2 reconciliation with nvme_io_create_pair's MSIX precondition. Six-push callee-save prologue (rbx=ctrl_row_id, rbp=cpu_idx, r12=bar0, r13=admin_ctx, r14=pair_row, r15=qid) + sub rsp,24 = 72 B; entry rsp%16==8 -> 80, %16==0 -- every nested call executes at rsp%16==0. The sub rsp,24 gives three 8-byte scratch slots ([rsp+0]=sq_pa, [rsp+8]=cq_pa, [rsp+16] unused/pad) that survive nvme_delete_io_sq/nvme_delete_io_cq (both caller-save-register-clobbering calls) because all six callee-save registers are already committed to ctrl_row_id/cpu_idx/bar0/admin_ctx/pair_row/qid by the time sq_pa/cq_pa need to survive those two calls -- same register-exhaustion shape as nvme_io_submit_trim's own stack-spill precedent (nvme_reliability.pdx). Body: (1) bar0 via nvme_ctrl_row_bar0(ctrl_row_id), admin_ctx via nvme_ctrl_row_admin_ctx(ctrl_row_id), pair_row via nvme_iop_row_addr(ctrl_row_id, cpu_idx) -- any DECODE_BAD -> NVMEREL_QRESET_FAILED. (2) qid via the G1 xor+mov_b idiom on pair_row+0; cache sq_pa(+8)/cq_pa(+16) to the stack scratch slots before they get zeroed below. (3) nvme_delete_io_sq(bar0, admin_ctx, qid) then nvme_delete_io_cq(bar0, admin_ctx, qid) -- both best-effort, return ignored (matches nvme_io_bring_up_all's own rollback-teardown precedent). (4) Zero both cached physical pages (512 qwords each, plain loops, no nested call mid-loop). (5) Force pair row header state -> QUIESCED (mask bits[15:8], OR in 4<<8, preserving in_use/qid -- the standard header-rewrite idiom this whole module family uses) and zero cq_pa/sq_pa/doorbells/cursors (+8/+16/+24/+32) -- msix_row_id (+40) untouched. (6) Force state -> MSIX (same mask-then-OR idiom, OR in 1<<8) so nvme_io_create_pair's own precondition passes. (7) call nvme_io_create_pair(ctrl_row_id, cpu_idx); non-zero -> force state back to QUIESCED (mask-then-OR, 4<<8) and return NVMEREL_QRESET_FAILED (0xFFFFEC7A); zero -> rdtsc-reconstruct 'now', pack (now with its low 16 bits shifted off) into pair_row+56 (strikes=0 in the low 16 bits, last_reset_tsc in bits[63:16], per design §3.2) and return 0. Reserved labels: nvme_wdqr_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 24;
+
+        mov rbx, rdi;                       // ctrl_row_id
+        mov rbp, rsi;                       // cpu_idx
+
+        mov rdi, rbx;
+        call nvme_ctrl_row_bar0;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvme_wdqr_fail;
+        mov r12, rax;                        // bar0
+
+        mov rdi, rbx;
+        call nvme_ctrl_row_admin_ctx;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvme_wdqr_fail;
+        mov r13, rax;                        // admin_ctx
+
+        mov rdi, rbx;
+        mov rsi, rbp;
+        call nvme_iop_row_addr;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvme_wdqr_fail;
+        mov r14, rax;                        // pair_row
+
+        xor r15, r15;
+        mov_b r15, [r14 + 0];                // qid, zero-extended
+
+        mov rax, [r14 + 8];                  // sq_pa
+        mov [rsp + 0], rax;
+        mov rax, [r14 + 16];                 // cq_pa
+        mov [rsp + 8], rax;
+
+        // ---- delete SQ then CQ (best-effort, NVMe §5.7 ordering) ----
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r15;
+        call nvme_delete_io_sq;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r15;
+        call nvme_delete_io_cq;
+
+        // ---- zero SQ physical page (4 KiB = 512 u64 words) ----
+        mov r10, [rsp + 0];                  // sq_pa
+        xor rax, rax;
+        xor rcx, rcx;
+      nvme_wdqr_zsq_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 512;
+        jb  nvme_wdqr_zsq_loop;
+
+        // ---- zero CQ physical page ----
+        mov r10, [rsp + 8];                  // cq_pa
+        xor rax, rax;
+        xor rcx, rcx;
+      nvme_wdqr_zcq_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 512;
+        jb  nvme_wdqr_zcq_loop;
+
+        // ---- state -> QUIESCED; zero row-side cq_pa/sq_pa/doorbells/cursors ----
+        mov rax, [r14 + 0];
+        mov r10, 0xFFFFFFFFFFFF00FF;
+        and rax, r10;
+        mov r10, 4;                          // NVME_IOP_STATE_QUIESCED
+        shl r10, 8;
+        or  rax, r10;
+        mov [r14 + 0], rax;
+
+        xor rax, rax;
+        mov [r14 + 8],  rax;
+        mov [r14 + 16], rax;
+        mov [r14 + 24], rax;
+        mov [r14 + 32], rax;
+
+        // ---- state -> MSIX (satisfies nvme_io_create_pair's precondition) ----
+        mov rax, [r14 + 0];
+        mov r10, 0xFFFFFFFFFFFF00FF;
+        and rax, r10;
+        mov r10, 1;                           // NVME_IOP_STATE_MSIX
+        shl r10, 8;
+        or  rax, r10;
+        mov [r14 + 0], rax;
+
+        // ---- recreate CQ+SQ ----
+        mov rdi, rbx;
+        mov rsi, rbp;
+        call nvme_io_create_pair;
+
+        cmp rax, 0;
+        jne nvme_wdqr_recreate_failed;
+
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;                          // now
+        shr rax, 16;
+        shl rax, 16;                           // strikes=0, last_reset_tsc in bits[63:16]
+        mov [r14 + 56], rax;
+
+        xor rax, rax;                          // success
+        jmp nvme_wdqr_out;
+
+      nvme_wdqr_recreate_failed:
+        mov rax, [r14 + 0];
+        mov r10, 0xFFFFFFFFFFFF00FF;
+        and rax, r10;
+        mov r10, 4;                            // NVME_IOP_STATE_QUIESCED
+        shl r10, 8;
+        or  rax, r10;
+        mov [r14 + 0], rax;
+
+        mov rax, 0xFFFFEC7A;                   // NVMEREL_QRESET_FAILED
+        jmp nvme_wdqr_out;
+
+      nvme_wdqr_fail:
+        mov rax, 0xFFFFEC7A;                   // NVMEREL_QRESET_FAILED
+
+      nvme_wdqr_out:
+        add rsp, 24;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
