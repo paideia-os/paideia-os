@@ -289,7 +289,7 @@ Recovery is idempotent: replaying a range whose in-place writes already happened
 
 ### 4.4 Wiring KIND_PDXFS_TXN mutating ops to the journal
 
-Today, `kind_pdxfs_txn.pdx`'s `PXT_OP_CREATE` / `PXT_OP_RENAME` / `PXT_OP_UNLINK` handlers bump a per-op counter and return `PXT_STUB_OK`. R52.M6 replaces the STUB body with a real walker invocation:
+Under R42-PREP-007, `kind_pdxfs_txn.pdx`'s `PXT_OP_CREATE` / `PXT_OP_RENAME` / `PXT_OP_UNLINK` handlers bumped a per-op counter and returned `PXT_STUB_OK`. R52.M6 replaces each STUB body with a real walker invocation:
 
 - **PXT_OP_CREATE.** Payload: parent_dir_inode + name + mode. Walker: allocate a fresh inode number from the inode-table free list; construct a fresh inode record; write `JOP_INODE_WRITE` for the fresh inode + `JOP_DENTRY_ADD` for the parent-directory entry + `JOP_BITMAP_SET` for the inode-table bit (if a new inode-table block is needed). All records join the txn_id from the cap-handler's row.
 - **PXT_OP_RENAME.** Payload: old_dir_inode + old_name + new_dir_inode + new_name. Walker: `JOP_DENTRY_DEL(old)` + `JOP_DENTRY_ADD(new)`. Atomicity comes from both records being in the same txn — either both replay or neither does.
@@ -297,11 +297,11 @@ Today, `kind_pdxfs_txn.pdx`'s `PXT_OP_CREATE` / `PXT_OP_RENAME` / `PXT_OP_UNLINK
 
 `PXT_OP_COMMIT` becomes: write `JOP_COMMIT` to the journal + BD_OP_FLUSH + transition the row state from OPEN to COMMITTED. `PXT_OP_ABORT` becomes: write `JOP_ABORT` to the journal + BD_OP_FLUSH + transition to ABORTED. The R48b state transition helper `pdxfs_txn_row_transition` is preserved; the new work happens before it.
 
-The `PXT_STUB_OK` (`0xFFFFEBFB`) sentinel is retired at R52.M6-CLOSE; every mutating op now returns `PXT_OK` on success or a real errno on failure. Tools that were pattern-matching on `PXT_STUB_OK` (per `libpdx-cap`) fall through the `PXT_OK` arm cleanly (both are non-error).
+The `PXT_STUB_OK` (`0xFFFFEBFB`) sentinel is RETIRED at R52.M6-006 (#1714); the constant is dropped from `kind_pdxfs_txn.pdx` and every mutating op now returns `PXT_OK` on success or a real errno on failure. Tools that were pattern-matching on `PXT_STUB_OK` (per `libpdx-cap`) fall through the `PXT_OK` arm cleanly (both are non-error).
 
 ### 4.5 Interaction with existing tooling
 
-- **`pkg install`** currently writes to tmpfs and calls `PXT_OP_CREATE` for each file, getting `PXT_STUB_OK`. R52.M6 makes those calls real; the R49-scheduled `pkg install pkg` self-install is the M8 round-trip smoke (§7.8).
+- **`pkg install`** previously wrote to tmpfs and called `PXT_OP_CREATE` for each file, receiving `PXT_STUB_OK`. R52.M6 makes those calls real (they now return `PXT_OK` on success or a real errno on failure — the STUB sentinel was retired at #1714); the R49-scheduled `pkg install pkg` self-install is the M8 round-trip smoke (§7.8).
 - **`cp` / `mv` / `rm` / `mkdir`** from R50 will begin returning real journaled mutations once M6 lands. R50's per-tool witnesses gain a "surviving reboot" line item (`design/tooling/r49-r50-plan.md` §5's per-tool M8 gets a smoke assertion that a file created before reboot is present after reboot).
 - **`mkfs.pdxfs`** is a new userspace tool that lands in R52.M2 (not R49/R50). It formats a raw block device: writes the superblock, zeroes the allocator bitmap, initialises the inode table (inode 0 sentinel + inode 1 root directory), sets journal checkpoint = journal_lba. `mkfs.pdxfs --upgrade` reads an R25 lite-format superblock (`"PDXL"`) and rewrites it to `"PDXB"` with a fresh journal region carved from the tail; this is the migration path for any early-bring-up volumes formatted before R52.
 
