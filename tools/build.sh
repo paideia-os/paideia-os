@@ -5665,6 +5665,8 @@ ec_confine_one '_pxt_create_ctx'            'core/cap/kind_pdxfs_txn.o'
 ec_confine_one '_pdxfs_txn_create_name'     'core/cap/kind_pdxfs_txn.o'
 ec_confine_one '_pdxfs_txn_inode_scratch'   'core/cap/kind_pdxfs_txn.o'
 ec_confine_one '_pdxfs_txn_jrec_scratch'    'core/cap/kind_pdxfs_txn.o'
+ec_confine_one '_pxt_rename_ctx'            'core/cap/kind_pdxfs_txn.o'
+ec_confine_one '_pdxfs_txn_rename_stage'    'core/cap/kind_pdxfs_txn.o'
 ec_confine_one '_elevate_channel_table'     'core/cap/kind_elevate_channel.o'
 ec_confine_one '_elevate_channel_stats'     'core/cap/kind_elevate_channel.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then
