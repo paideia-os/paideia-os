@@ -6109,6 +6109,28 @@ fi
 echo "[r52-m5-confine] R52.M5-004 (probe) confined"
 
 # ---------------------------------------------------------------------------
+# R52.M5-005 (#1707): one-writer discipline for the MOUNT_BACKEND_
+# PDXFS_BLOCK mount entry point's scratch row.
+#
+#   * mount_block (mount_pdxfs_block, src/kernel/core/fs/pdxfs/
+#     mount_block.pdx)
+#
+# _mpb_scratch is confined to this module alone -- it is written only
+# by mount_pdxfs_block itself (the sole function in this file).
+R52_MOUNTBLK_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/mount_block.pdx"
+if [[ ! -f "${R52_MOUNTBLK_SRC}" ]]; then
+    echo "[r52-m5-confine] FAIL - mount_block.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_mpb_scratch' 'core/fs/pdxfs/mount_block.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See mount_block.pdx for the per-module one-writer discipline" >&2
+    echo "  (the sole writer is mount_pdxfs_block)." >&2
+    exit 1
+fi
+echo "[r52-m5-confine] R52.M5-005 (mount_block) confined"
+
+# ---------------------------------------------------------------------------
 # R42-PREP-008 (#1630): one-writer discipline for the PdxFS userspace
 # directory iterator cursor table.
 #
