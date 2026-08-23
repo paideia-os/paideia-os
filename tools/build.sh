@@ -4640,6 +4640,11 @@ ec_confine_one '_pxrc_state'      'core/fs/pdxfs/refcount.o'
 ec_confine_one '_pxcr_chain'      'core/fs/pdxfs/cow_read.o'
 ec_confine_one '_pxcr_cache'      'core/fs/pdxfs/cow_read.o'
 ec_confine_one '_pxcr_state'      'core/fs/pdxfs/cow_read.o'
+# M7-003 (#1717): _pxcr_bdev_desc is the shared BDEV descriptor page
+# stamped by pxcr_bdev_read_lba before every cap_invoke(BDEV_OP_READ_LBA);
+# a second writer would let a caller race the descriptor between stamp and
+# submit and steer a read against an arbitrary LBA / buffer.
+ec_confine_one '_pxcr_bdev_desc'  'core/fs/pdxfs/cow_read.o'
 ec_confine_one '_pxcw_blocks'     'core/fs/pdxfs/cow_write.o'
 ec_confine_one '_pxcw_state'      'core/fs/pdxfs/cow_write.o'
 ec_confine_one '_pxgc_free_list'  'core/fs/pdxfs/cow_gc.o'
@@ -6142,6 +6147,43 @@ if [[ "${EC_CONFINE_OK}" != "1" ]]; then
     exit 1
 fi
 echo "[r52-m5-confine] R52.M5-005 (mount_block) confined"
+
+# ---------------------------------------------------------------------------
+# R52.M7-005 (#1719): one-writer discipline for the single-block-ahead
+# read-prefetch primitive.
+#
+#   * block_cache_prefetch (block_cache_prefetch_next + scratch/desc/stats,
+#     src/kernel/core/fs/pdxfs/block_cache_prefetch.pdx)
+#
+# The prefetch primitive owns three tables:
+#   _bcp_scratch : 4-KiB landing zone for the speculatively-read LBA n+1.
+#   _bcp_desc    : the READ_LBA descriptor page (4-KiB aligned; op_arg pack
+#                  target).
+#   _bcp_stats   : sticky attempts / skipped_overflow / skipped_bad_slot /
+#                  io_ok / io_refused counters, invariant
+#                  attempts = sum(the-four-sinks).
+#
+# All three are single-writer state confined to this one module. A second
+# writer against any of them would let a caller either forge the scratch
+# contents (silently defeating the cache-insert dirty=0 invariant a future
+# cow_read.pdx wire depends on), forge the descriptor mid-issue (redirect
+# the DMA landing), or drift the sticky counters (breaking the plan's M7
+# hit-ratio witness's per-run tallying).
+BCP_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/block_cache_prefetch.pdx"
+if [[ ! -f "${BCP_SRC}" ]]; then
+    echo "[r52-m7-005-confine] FAIL - block_cache_prefetch.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_bcp_scratch' 'core/fs/pdxfs/block_cache_prefetch.o'
+ec_confine_one '_bcp_desc'    'core/fs/pdxfs/block_cache_prefetch.o'
+ec_confine_one '_bcp_stats'   'core/fs/pdxfs/block_cache_prefetch.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See block_cache_prefetch.pdx §Storage for the per-module" >&2
+    echo "  one-writer discipline (the sole writer of every cell is" >&2
+    echo "  block_cache_prefetch_next itself)." >&2
+    exit 1
+fi
+echo "[r52-m7-005-confine] R52.M7-005 (block_cache_prefetch) confined"
 
 # ---------------------------------------------------------------------------
 # R42-PREP-008 (#1630): one-writer discipline for the PdxFS userspace

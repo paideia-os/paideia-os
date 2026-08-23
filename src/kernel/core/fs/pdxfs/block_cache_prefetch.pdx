@@ -1,0 +1,366 @@
+// src/kernel/core/fs/pdxfs/block_cache_prefetch.pdx
+//
+// PDXFS BLOCK CACHE -- SINGLE-BLOCK-AHEAD READ PREFETCH.
+//
+// Design authority: design/filesystem/r52-implementation-plan.md
+//   * §2.7 (R52.M7 block-cache pipeline)
+//   * failure-taxonomy sub-slice 0xFFFFED40..ED47 (M7 cache/prefetch band):
+//     PREFETCH_QUEUE_FULL = ED45, PREFETCH_LBA_OOB = ED46
+//
+// -----------------------------------------------------------------------------
+// Scope
+// -----------------------------------------------------------------------------
+//
+// One primitive: `block_cache_prefetch_next(bdev_cap, vol_slot, lba)`.
+// On a cache-miss for LBA n, the caller invokes this helper to speculatively
+// pull LBA n+1 into a resident 4-KiB scratch block via a single
+// `BDEV_OP_READ_LBA(n+1)`. The read is silent-skip on any refusal: bad
+// vol_slot, LBA+1 wrap (integer overflow), BDEV device error, or the
+// substrate-mode `NVMEIO_PICK_NONE` "no live SQ pair" status
+// (routed through `bbjw_check`, the same predicate every other FS-level
+// BDEV reader uses).
+//
+// STANDALONE SHAPE (option (b) in the task brief). This landing pre-dates
+// `block_cache.pdx` and its `cow_read.pdx` wiring. The prefetch primitive
+// stands on its own -- it owns the scratch buffer and the descriptor page,
+// issues the read, and reports the outcome via the sticky counters below.
+// Once the block cache lands, a follow-up patch inserts one call site in
+// `cow_read.pdx`'s cache-miss path:
+//
+//   1. gate on `block_cache_lookup(vol_slot, lba+1) == 0` (not already cached);
+//   2. call `block_cache_prefetch_next(bdev_cap, vol_slot, lba)`;
+//   3. on `BCP_OK` (0), hand `bcp_scratch_ptr()` to `block_cache_insert(
+//      vol_slot, lba+1, ptr, dirty=0)`;
+//   4. on any non-zero return, drop silently -- do NOT propagate to the
+//      primary read's caller.
+//
+// The `vol_slot` parameter is preserved in the ABI as a forward-compatibility
+// hook for the block cache's per-volume slot addressing (§5.1). This
+// module only uses it to bounds-check `vol_slot < BCP_MAX_VOL_SLOTS`; the
+// scratch buffer is one 4-KiB block globally, matching journal_ondisk.pdx's
+// own single-active-writer simplification for the same R52 pre-M7 period
+// (see journal_ondisk.pdx module header gap 5).
+//
+// -----------------------------------------------------------------------------
+// Calling convention (design/hardware/nvme-io-queues.md §3.5,
+// src/kernel/core/cap/cap_handler_blkdev.pdx header + src/kernel/core/
+// cap/invoke.pdx)
+// -----------------------------------------------------------------------------
+//
+// `cap_invoke(slot, op_arg) -> u64` (rdi=slot, rsi=op_arg). `op_arg` packs:
+//   bits [7:0]    op_code        BDEV_OP_READ_LBA = 3
+//   bits [11:8]   reserved       MUST be 0 (guaranteed by @align(4096))
+//   bits [63:12]  page_number    descriptor-page address
+// Descriptor page layout (same as sb_read/jnl_bdev_read_block):
+//   +0    lba        (u64)   the LBA to read
+//   +8    nblocks    (u64)   always 1 for this primitive
+//   +16   dma_iova   (u64)   destination buffer for the read
+//   +24   status_out (u64)   raw driver return, written back by handler
+//
+// The result is routed through `bbjw_check` (bdev_barrier.pdx), which
+// treats BDEV_ERR_OK(0) and NVMEIO_PICK_NONE(0xFFFFEC58, the substrate-
+// mode "no live SQ pair" status) as the acceptable set. Any other status
+// is a refusal; prefetch reports it via `_bcp_stats.io_refused` and
+// returns BCP_PREFETCH_QUEUE_FULL (the "prefetch dropped" sentinel per
+// the M7 reserved band). This mirrors inode_table.pdx's / allocator.pdx's
+// / journal_ondisk.pdx's established idiom for the same tolerance.
+//
+// -----------------------------------------------------------------------------
+// Storage (one-writer discipline; confined in tools/build.sh)
+// -----------------------------------------------------------------------------
+//
+// `_bcp_scratch` : [u64; 512] @align(4096)
+//    4-KiB landing zone for the speculatively-read LBA n+1. Overwritten
+//    on every call. Accessible to the eventual `cow_read.pdx` wire via
+//    `bcp_scratch_ptr()`.
+// `_bcp_desc`    : [u64; 4]   @align(4096)
+//    READ_LBA descriptor page. Must itself be 4-KiB aligned so the op_arg
+//    OR of the 3-bit op_code into the low 12 bits does not corrupt the
+//    packed page number (cap_handler_blkdev.pdx's own header comment).
+// `_bcp_stats`   : [u64; 8]   @align(64)
+//    Sticky observability counters (BSS-zeroed at load; no explicit init):
+//      [+0]  attempts          every entry to block_cache_prefetch_next
+//      [+8]  skipped_overflow  lba+1 wrapped to 0 (integer overflow)
+//      [+16] skipped_bad_slot  vol_slot >= BCP_MAX_VOL_SLOTS
+//      [+24] io_ok             BDEV read succeeded, scratch filled
+//      [+32] io_refused        BDEV/bbjw returned non-OK (silent drop)
+//      [+40..56] reserved
+// Invariant: attempts == skipped_overflow + skipped_bad_slot
+//                       + io_ok + io_refused.
+//
+// -----------------------------------------------------------------------------
+// Failure taxonomy -- M7 sub-slice 0xFFFFED40..ED47 (see plan doc)
+// -----------------------------------------------------------------------------
+//
+//   BCP_OK                     = 0
+//   BCP_PREFETCH_QUEUE_FULL     = 0xFFFFED45   BDEV/bbjw refusal or
+//                                              substrate has no live queue;
+//                                              caller drops silently
+//   BCP_PREFETCH_LBA_OOB        = 0xFFFFED46   lba+1 wrapped to 0, or
+//                                              vol_slot >= BCP_MAX_VOL_SLOTS
+//
+// Both codes name "the caller must drop the prefetch"; neither propagates
+// to the primary read. `_bcp_stats.io_refused` and .skipped_* tell what
+// specifically happened for observability. The plan's M7 band names two
+// more slots (`CACHE_INVALIDATE_DIRTY`, `CACHE_GEN_TORN`, etc.) that
+// belong to the block cache itself, not this prefetch primitive; they
+// are NOT declared here.
+//
+// -----------------------------------------------------------------------------
+// Arity discipline (design/filesystem/r52-implementation-plan.md §3.5,
+// paideia-as arity <= 6)
+// -----------------------------------------------------------------------------
+//
+// `block_cache_prefetch_next(bdev_cap, vol_slot, lba) -> u64`, arity 3.
+// The `vol_slot` field is currently only bounds-checked; a widening once
+// the block cache lands can add per-vol-slot scratch or per-vol-slot rate
+// limiting without an ABI change (the argument is already in the
+// signature). Accessors are all arity 0 or 1.
+//
+// -----------------------------------------------------------------------------
+// Register discipline
+// -----------------------------------------------------------------------------
+//
+// `block_cache_prefetch_next` issues nested `cap_invoke` + `bbjw_check`
+// calls. Uniform 5-push callee-save prologue (rbx/r12/r13/r14/r15) lands
+// rsp%16==0 (entry rsp%16==8 + 5*8 = 48, %16==0) matching sb_read /
+// jnl_bdev_read_block. Register roles inside:
+//   rbx = bdev_cap (consumed by cap_invoke)
+//   r12 = &_bcp_desc (kept live across the nested calls -- caller-save
+//                     r10/r11 cannot survive)
+//   r13 = lba_plus_one (computed once, stamped into descriptor)
+//   r14 = &_bcp_scratch (kept live so dma_iova stamping does not need a
+//                        second lea)
+//   r15 = unused-but-pushed for pattern uniformity
+// Every stats-write reloads the counter block via a fresh `lea rip +
+// _bcp_stats` (caller-save r10 cannot survive cap_invoke either); this is
+// the same reload-before-use idiom journal_append uses for its per-vol-slot
+// row base.
+//
+// The accessor helpers (bcp_scratch_ptr / bcp_attempts / ...) are leaf,
+// caller-save only (rax/r10), no push needed. No `test` instruction
+// anywhere; every branch uses `cmp reg,imm`/`cmp reg,reg` +
+// `je`/`jne`/`ja`/`jae`. Every label is prefixed per function (bcp_pn_
+// for prefetch_next; the accessors are all straight-line and label-free).
+
+module BlockCachePrefetch = structure {
+
+  // ============================================================================
+  // Constants.
+  // ============================================================================
+
+  pub let BCP_OK                    : u64 = 0
+  pub let BCP_PREFETCH_QUEUE_FULL   : u64 = 0xFFFFED45
+  pub let BCP_PREFETCH_LBA_OOB      : u64 = 0xFFFFED46
+  pub let BCP_MAX_VOL_SLOTS         : u64 = 16
+
+  // ============================================================================
+  // Storage.
+  // ============================================================================
+
+  // 512 qwords = 4096 bytes: the landing zone for the just-read LBA n+1.
+  pub let mut _bcp_scratch : [u64; 512] = uninit @align(4096)
+
+  // 4 qwords: {lba, nblocks, dma_iova, status_out}. Must be 4-KiB aligned
+  // so op_arg OR of op_code into low 12 bits does not corrupt page_number.
+  pub let mut _bcp_desc    : [u64; 4]   = uninit @align(4096)
+
+  // 8 qwords: {attempts, skipped_overflow, skipped_bad_slot, io_ok,
+  //            io_refused, reserved x3}. BSS-zeroed at load; no explicit
+  // reset needed (this module has no init_mark discipline -- the primitive
+  // is stateless per-call, and stats start at 0 by construction).
+  pub let mut _bcp_stats   : [u64; 8]   = uninit @align(64)
+
+  // ============================================================================
+  // bcp_scratch_ptr() -> u64
+  //   Returns &_bcp_scratch, the pointer at which a successful call to
+  //   block_cache_prefetch_next left the just-read LBA n+1 payload.
+  //   Intended for the eventual cow_read.pdx wire that hands this pointer
+  //   to block_cache_insert(vol_slot, lba+1, ptr, dirty=0). Leaf, no push.
+  // ============================================================================
+
+  pub let bcp_scratch_ptr : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "M7 prefetch scratch accessor. Leaf, caller-save only (rax). lea rip-relative to _bcp_scratch, return in rax. No test instruction; no branches, no label prefix needed.",
+      block: {
+        lea rax, [rip + _bcp_scratch];
+        ret
+      }
+    }
+
+  // ============================================================================
+  // Observability counter readbacks.
+  //
+  // Each returns the current sticky value of one _bcp_stats field. Leaf,
+  // caller-save only, no push needed. Invariant across the block:
+  //   attempts == skipped_overflow + skipped_bad_slot + io_ok + io_refused.
+  // ============================================================================
+
+  pub let bcp_attempts : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "M7 prefetch attempts counter. Leaf, caller-save only (r10, rax). Return [_bcp_stats+0].",
+      block: {
+        lea r10, [rip + _bcp_stats];
+        mov rax, [r10 + 0];
+        ret
+      }
+    }
+
+  pub let bcp_skipped_overflow : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "M7 prefetch skipped-overflow counter (lba+1 wrapped). Leaf, caller-save only. Return [_bcp_stats+8].",
+      block: {
+        lea r10, [rip + _bcp_stats];
+        mov rax, [r10 + 8];
+        ret
+      }
+    }
+
+  pub let bcp_skipped_bad_slot : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "M7 prefetch skipped-bad-slot counter (vol_slot out of range). Leaf, caller-save only. Return [_bcp_stats+16].",
+      block: {
+        lea r10, [rip + _bcp_stats];
+        mov rax, [r10 + 16];
+        ret
+      }
+    }
+
+  pub let bcp_io_ok : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "M7 prefetch io-ok counter (BDEV read succeeded). Leaf, caller-save only. Return [_bcp_stats+24].",
+      block: {
+        lea r10, [rip + _bcp_stats];
+        mov rax, [r10 + 24];
+        ret
+      }
+    }
+
+  pub let bcp_io_refused : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "M7 prefetch io-refused counter (BDEV/bbjw returned non-OK; silent drop). Leaf, caller-save only. Return [_bcp_stats+32].",
+      block: {
+        lea r10, [rip + _bcp_stats];
+        mov rax, [r10 + 32];
+        ret
+      }
+    }
+
+  // ============================================================================
+  // block_cache_prefetch_next(bdev_cap, vol_slot, lba) -> u64
+  //
+  //   Issues a single-block speculative BDEV_OP_READ_LBA against LBA n+1
+  //   into the resident 4-KiB scratch buffer (&_bcp_scratch), silent-skip
+  //   on any refusal per the M7 plan doc.
+  //
+  //   Return codes (all "caller drops silently"; none propagates to the
+  //   primary read):
+  //     BCP_OK                    = 0            scratch buffer holds
+  //                                                the just-read LBA n+1
+  //     BCP_PREFETCH_LBA_OOB      = 0xFFFFED46   vol_slot out of range,
+  //                                                or lba+1 wrapped to 0
+  //     BCP_PREFETCH_QUEUE_FULL   = 0xFFFFED45   BDEV/bbjw refusal
+  //                                                (device error, or the
+  //                                                substrate-mode
+  //                                                NVMEIO_PICK_NONE
+  //                                                "no live SQ pair"
+  //                                                status)
+  //
+  //   Every entry bumps _bcp_stats.attempts once; then exactly one of
+  //   .skipped_overflow / .skipped_bad_slot / .io_ok / .io_refused is
+  //   bumped in the corresponding branch, preserving the invariant
+  //   attempts = sum(the-four-sinks).
+  // ============================================================================
+
+  pub let block_cache_prefetch_next : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (bdev_cap: u64) (vol_slot: u64) (lba: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "M7 prefetch entry. 5-push callee-save prologue (rbx/r12/r13/r14/r15) lands rsp%16==0 (entry rsp%16==8 + 40 = 48, %16==0) for the nested cap_invoke + bbjw_check calls, matching sb_read / jnl_bdev_read_block. Register roles held across every nested call: rbx=bdev_cap, r12=&_bcp_desc, r13=lba+1 (stamped into descriptor lba field, then unused), r14=&_bcp_scratch (dma_iova destination); r15 unused-but-pushed for pattern uniformity. Body: (1) rbx=bdev_cap (rdi). (2) Bump _bcp_stats[+0] (attempts) via a fresh lea rip+_bcp_stats;mov rax,[r10+0];add rax,1;mov [r10+0],rax -- caller-save r10 is fine here since no call has happened yet. (3) Bound-check vol_slot<BCP_MAX_VOL_SLOTS(16, staged via r11 for the cmp): jae bcp_pn_bad_slot. (4) Compute lba+1: mov r13,rdx;add r13,1;cmp r13,0;je bcp_pn_overflow -- integer overflow detection: if lba was 0xFFFFFFFFFFFFFFFF, add+1 wraps to 0. (5) Stamp descriptor: lea r12,[rip+_bcp_desc]; [r12+0]=r13 (lba+1), [r12+8]=1 (nblocks), lea r14,[rip+_bcp_scratch]; [r12+16]=r14 (dma_iova), [r12+24]=0 (status_out, zero via xor rax,rax). (6) Invoke: rdi=rbx; rsi=r12; mov r10,3; or rsi,r10 (BDEV_OP_READ_LBA, op_arg pack -- r12's low 12 bits guaranteed zero by @align(4096), the proven op_arg-packing idiom throughout this codebase); call cap_invoke. (7) Barrier check: rdi=rax; call bbjw_check; cmp rax,0; jne bcp_pn_io_refused (the same NVMEIO_PICK_NONE-tolerant predicate inode_table.pdx / allocator.pdx / journal_ondisk.pdx already route their cap_invoke results through). (8) Success: lea r10,[rip+_bcp_stats]; bump [r10+24] (io_ok); xor eax,eax; jmp bcp_pn_done. (9) bcp_pn_bad_slot: lea r10,[rip+_bcp_stats]; bump [r10+16] (skipped_bad_slot); mov rax,0xFFFFED46 (BCP_PREFETCH_LBA_OOB); jmp bcp_pn_done. (10) bcp_pn_overflow: lea r10,[rip+_bcp_stats]; bump [r10+8] (skipped_overflow); mov rax,0xFFFFED46; jmp bcp_pn_done. (11) bcp_pn_io_refused: lea r10,[rip+_bcp_stats]; bump [r10+32] (io_refused); mov rax,0xFFFFED45 (BCP_PREFETCH_QUEUE_FULL). bcp_pn_done: 5-pop epilogue + ret. No test instruction; no mov_b (every access is whole-qword; no byte-granularity fields in this module). Reserved labels: bcp_pn_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+
+        lea r10, [rip + _bcp_stats];
+        mov rax, [r10 + 0];
+        add rax, 1;
+        mov [r10 + 0], rax;
+
+        mov r11, 16;
+        cmp rsi, r11;
+        jae bcp_pn_bad_slot;
+
+        mov r13, rdx;
+        add r13, 1;
+        cmp r13, 0;
+        je  bcp_pn_overflow;
+
+        lea r12, [rip + _bcp_desc];
+        mov [r12 + 0], r13;
+        mov rax, 1;
+        mov [r12 + 8], rax;
+        lea r14, [rip + _bcp_scratch];
+        mov [r12 + 16], r14;
+        xor rax, rax;
+        mov [r12 + 24], rax;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov r10, 3;
+        or  rsi, r10;
+        call cap_invoke;
+        mov rdi, rax;
+        call bbjw_check;
+        cmp rax, 0;
+        jne bcp_pn_io_refused;
+
+        lea r10, [rip + _bcp_stats];
+        mov rax, [r10 + 24];
+        add rax, 1;
+        mov [r10 + 24], rax;
+        xor eax, eax;
+        jmp bcp_pn_done;
+
+      bcp_pn_bad_slot:
+        lea r10, [rip + _bcp_stats];
+        mov rax, [r10 + 16];
+        add rax, 1;
+        mov [r10 + 16], rax;
+        mov rax, 0xFFFFED46;
+        jmp bcp_pn_done;
+
+      bcp_pn_overflow:
+        lea r10, [rip + _bcp_stats];
+        mov rax, [r10 + 8];
+        add rax, 1;
+        mov [r10 + 8], rax;
+        mov rax, 0xFFFFED46;
+        jmp bcp_pn_done;
+
+      bcp_pn_io_refused:
+        lea r10, [rip + _bcp_stats];
+        mov rax, [r10 + 32];
+        add rax, 1;
+        mov [r10 + 32], rax;
+        mov rax, 0xFFFFED45;
+
+      bcp_pn_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
