@@ -1,0 +1,1641 @@
+// src/kernel/core/fs/pdxfs/journal_ondisk.pdx -- R52.M5-002 (#1704)
+//
+// PDXFS-ON-BLOCK v1 -- JBNL JOURNAL: BLOCK LAYOUT, RECORD ENCODERS,
+// RING WRITER (journal_append), COLD-BOOT WALKER (journal_replay).
+//
+// Design authority: design/filesystem/r52-implementation-plan.md §2.5
+// (R52.M5, step 2: "#1704 -- journal_ondisk.pdx: JBNL block layout
+// (§2.4) with record encoders for all 9 op codes ... Relocate the M3
+// BITMAP_SET/BITMAP_CLEAR encoders here.") and
+// design/filesystem/volume-fs-substrate.md §2.4 ("Journal region --
+// write-ahead log ring") + §4.3 ("Recovery on mount").
+//
+// Scope note: the calling task additionally asked this single file to
+// host BOTH the writer (journal_append) and a walker (journal_replay)
+// that "replaces the in-memory scaffold" -- the plan itself splits the
+// walker into a separate #1705 rewrite of journal_replay.pdx (a
+// DIFFERENT file, the existing R42 BSS-classification scaffold). This
+// landing does NOT touch journal_replay.pdx; it adds a NEW on-disk
+// walker named `journal_replay` inside THIS module, scoped to exactly
+// what §4.3 describes: cold-boot head discovery, backward walk to
+// checkpoint, forward CSUM-verified walk with per-record classification
+// into APPLIED/DISCARDED counts. It does NOT re-issue the classified
+// writes into the data region (inode table / allocator / CoW tree) --
+// that cross-module wiring is explicitly out of scope here and belongs
+// to a future landing once cow_write/inode_table/allocator all expose
+// the write-application entry points it would call. This mirrors the
+// EXISTING journal_replay.pdx scaffold's own documented boundary
+// ("does NOT actually re-issue block writes... hands each APPLIED
+// record to cow_write.pdx" -- a widening's job, not the classifier's).
+// #1705 remains open to decide whether journal_replay.pdx becomes a
+// thin wrapper over this module's `journal_replay` or is retired in
+// its favour; flagged for softarch.
+//
+// -----------------------------------------------------------------------------
+// Design-doc gaps flagged (see final report to main / softarch)
+// -----------------------------------------------------------------------------
+//
+// 1. JOP_BLOCK_WRITE cannot physically fit in one JBNL block. §2.4's
+//    own numbers: a journal block has 4056 bytes of records area
+//    (4096 - 32-byte header - 8-byte csum footer). A JOP_BLOCK_WRITE
+//    record is record_hdr(8) + txn_id(8) + lba(8) + block_data(4096)
+//    = 4120 bytes -- 64 bytes LARGER than the entire records area of
+//    ANY block, before even considering any other record sharing that
+//    block. This is a hard mathematical impossibility given the format
+//    as specified, not an implementation shortcoming. `journal_append`
+//    (below) enforces `record_len <= JNL_RECORDS_AREA_SIZE` (4056) as
+//    a hard precondition and refuses otherwise -- meaning a
+//    JOP_BLOCK_WRITE record built by `journal_encode_block_write` can
+//    be ENCODED (pure serialization, no size gate) but can never be
+//    legally APPENDED to the ring as currently specified. Flagged
+//    prominently for softarch: a follow-up must either (a) let a
+//    record span multiple journal blocks with an explicit continuation
+//    flag, (b) widen the per-block records area / shrink the header,
+//    or (c) change JOP_BLOCK_WRITE to reference an out-of-band block
+//    write rather than embedding the full 4096-B payload inline
+//    (contradicting §4.3's "recovery does not need to walk the CoW
+//    tree to reconstruct what was written" rationale, which assumed
+//    inline embedding). No new failure code was available to name this
+//    precisely (see gap 3); `journal_append` reuses `JNL_CSUM_BAD`.
+//
+// 2. Field widening for 8-byte-record-start alignment. §2.4 says
+//    "variable-length, 8-byte aligned" for records generally, but
+//    several payloads name sub-word fields (`mode:u8`,
+//    `name_len:u32`) that would misalign the FOLLOWING field if
+//    stored at their literal width. This module widens every such
+//    field to a full u64 (low bits meaningful, matching the
+//    inode-table / superblock precedent of storing "byte" fields as
+//    whole qwords when the ISA has no reason not to). For
+//    `JOP_DENTRY_ADD`/`JOP_DENTRY_DEL`'s variable-length `name[]`
+//    field, this module additionally zero-pads the name bytes up to
+//    the next 8-byte boundary and folds that padding into the
+//    encoder's own returned record length, so every record this
+//    module ever appends starts 8-byte aligned relative to the block
+//    -- preserving §2.4's own stated invariant. The walker
+//    (`journal_replay`) does NOT need to know about this padding
+//    scheme explicitly: it trusts `payload_len` from `record_hdr`
+//    verbatim (which already includes the padding) to size and skip
+//    each record, so encoder and walker stay in lockstep by
+//    construction.
+//
+// 3. Failure-band reuse. Per the task's stated band
+//    (0xFFFFED20..ED27, 8 slots), only FOUR belong to this module by
+//    name: `JNL_MAGIC_BAD` (ED20), `JNL_CSUM_BAD` (ED21),
+//    `JNL_CHECKPOINT_BEYOND_HEAD` (ED22), `JNL_SEQ_OUT_OF_ORDER`
+//    (ED23). The other four (`VOL_MOUNT_KEY_MISMATCH` ED24,
+//    `VOL_REGISTRY_FULL` ED25, `MOUNT_ROOT_AMBIGUOUS` ED26,
+//    `MOUNT_BACKEND_UNKNOWN` ED27) belong to the not-yet-landed
+//    `volume_registry.pdx`/`probe.pdx`/`mount.pdx` widenings (#1706/
+//    #1707) and are NOT declared here. Within this module's own four
+//    codes, none precisely names "write-time record too large" or
+//    "bad vol_slot" or "too many concurrently open txns during
+//    replay" -- this module reuses `JNL_CSUM_BAD` for all of these,
+//    on the rationale that every one of them means "this journal
+//    artifact cannot be trusted/completed as a valid JBNL write or
+//    read", the same broad class CSUM failures signal. This mirrors
+//    the repo's own established precedent of reusing an
+//    already-frozen, semantically-adjacent code across module/
+//    milestone boundaries rather than inventing a ninth slot in an
+//    already-frozen band (see e.g. inode_table.pdx's repeated reuse
+//    of allocator.pdx's `ALLOC_BITMAP_TORN` for generic BDEV I/O
+//    failure, and alloc_wal.pdx's own note that "this issue's
+//    design-doc line item does not name a ninth" for the M3 band).
+//
+// 4. CRC32C is a REAL implementation, not the R42 `journal_csum.pdx`
+//    placeholder. The plan's line item says "CRC32C helper reused
+//    from R42's journal_csum.pdx" -- but that module's own header
+//    admits its formula "is CRC32C in a real widening; a simpler
+//    mixing function... is used here", and it operates over WAL
+//    HEADER FIELDS (seq/size/prev_seq), never over a byte buffer. It
+//    cannot compute a checksum over 4088 bytes of block content. This
+//    module implements the real, standard reflected CRC32C
+//    (Castagnoli, poly 0x82F63B78) as a byte-serial, branchless
+//    bit-mix loop (`jnl_crc32c_range`), following the proven
+//    byte-loop idiom from `src/kernel/acpi/checksum.pdx`
+//    (`acpi_checksum_ok`: `xor rcx,rcx; mov_b rcx,[rdi]` per-byte,
+//    explicit zero-extension). `jnl_block_csum_compute` computes it
+//    over bytes `[0,4088)` and then continues the SAME running crc
+//    state over the 8 bytes of the `seq` field again, per the
+//    design doc's literal text ("CRC32C of bytes [0, 4088) ‖ seq") --
+//    even though `seq` (offset 8..16) already lies inside `[0,4088)`
+//    once, so this doubles its weight in the checksum. This reads as
+//    intentional defense-in-depth in the design doc rather than a
+//    typo, and is implemented literally; flagged in case softarch
+//    intended something else.
+//
+// 5. Single active journal writer/walker assumption. `journal_append`
+//    and `journal_replay` share one resident 4-KiB staging buffer
+//    (`_journal_stage_blk`) and one BDEV descriptor page
+//    (`_journal_io_desc`) -- safe because R52 mounts the root volume
+//    only (design/filesystem/volume-fs-substrate.md §3.4: "Non-root
+//    volumes are mounted lazily... R52 root-only is enough for
+//    smoke") and replay always completes before any writer activity
+//    begins at boot. A future multi-volume writer needs per-vol-slot
+//    staging buffers; per-vol-slot BOOKKEEPING (head/off/rcnt/seq/
+//    prev/checkpoint) is already implemented via the 16-row
+//    `_journal_vol_state` table the plan itself named
+//    ("Head pointer maintained in a per-volume `_journal_head
+//    [vol_slot]` field"), so only the I/O buffer sharing remains a
+//    known M5 simplification.
+//
+// 6. `journal_replay`'s per-record classification tracks at most 16
+//    concurrently OPEN txns (matching `KIND_PDXFS_TXN`'s own 16-row
+//    cap). A write-class record (`JOP_BLOCK_WRITE`/`_INODE_WRITE`/
+//    `_BITMAP_SET`/`_BITMAP_CLEAR`/`_DENTRY_ADD`/`_DENTRY_DEL`) whose
+//    txn_id has no open BEGIN in the replay range's tracking table
+//    (e.g. its BEGIN landed before checkpoint) is tallied into a
+//    separate `orphan_count` stat and NOT counted toward applied or
+//    discarded -- a known, documented simplification rather than a
+//    silent miscount.
+//
+// 7. `journal_append` durability sequencing issues 2x BDEV_OP_WRITE_LBA
+//    + 1x BDEV_OP_FLUSH per record appended (write payload, flush,
+//    recompute+write csum), not batched across multiple records
+//    sharing a block. This directly implements §4.2's barrier rule
+//    ("Every journal write is followed by BD_OP_FLUSH before its
+//    checksum word is written") in the most literal, safest way at
+//    the cost of throughput; batching per-COMMIT rather than
+//    per-record is a follow-up once R52.M6's op-arm callers exist.
+//    This module is also the FIRST FS-level caller of
+//    `BDEV_OP_FLUSH` via `cap_invoke` -- every prior R52.M2-M4 module
+//    (superblock_write.pdx, mkfs.pdx, inode_table.pdx) explicitly
+//    deferred it.
+//
+// 8. This module does not itself gate `vol_slot` against a live
+//    `KIND_VOLUME` row -- that authority lives in `volume_registry.pdx`
+//    (#1706, not yet landed). Callers are trusted to pass a valid
+//    slot, mirroring alloc_wal.pdx's own "trust the caller" posture
+//    during this same pre-widening period.
+//
+// -----------------------------------------------------------------------------
+// JBNL block layout (volume-fs-substrate.md §2.4)
+// -----------------------------------------------------------------------------
+//
+//   +0     record_magic  u32 LE   0x4A424E4C ("JBNL")
+//   +4     record_count  u32 LE   records packed into this block
+//   +8     seq           u64 LE   seq of the FIRST record in this block
+//   +16    prev_lba      u64 LE   LBA of the previous block in the chain
+//                                 (JNL_SENTINEL_LBA if none)
+//   +24    checkpoint    u64 LE   oldest journal block a replay must read
+//   +32    records[]     packed   sequential records (see below)
+//   +4088  csum          u64 LE   CRC32C([0,4088)) continued over seq
+//   total  4096
+//
+// Record layout (each record 8-byte aligned relative to the block):
+//
+//   +0     record_hdr    u64 LE   op[7:0] | flags[15:8] | payload_len[47:16]
+//   +8     txn_id        u64 LE   KIND_PDXFS_TXN row's txn_id
+//   +16    payload       u8[N]    op-specific (N = payload_len)
+//
+// -----------------------------------------------------------------------------
+// Arity discipline (design/filesystem/r52-implementation-plan.md §5.1,
+// task constraint: paideia-as arity <= 6)
+// -----------------------------------------------------------------------------
+//
+// Every encoder is `(..., out_ptr) -> u64` (pure formatter writing into
+// a caller-supplied buffer, returning the encoded length) rather than
+// the plan's illustrative "ring-addressing" signature -- the SAME
+// out-ptr collapse alloc_wal.pdx already proved for BITMAP_SET/CLEAR,
+// generalised to all 9 ops. Ring addressing (which block, which
+// offset, when to roll/flush) is `journal_append`'s job alone, so no
+// encoder ever needs a "journal writer ctx" pointer. Max encoder arity
+// is 6 (`journal_encode_dentry_add`). `journal_append` itself is
+// 6-arg (`bdev_cap, vol_slot, journal_lba, journal_bcount, record_ptr,
+// record_len`) and `journal_replay` is 5-arg (`bdev_cap, vol_slot,
+// journal_lba, journal_bcount, checkpoint_lba`). All at or under 6.
+//
+// -----------------------------------------------------------------------------
+// Register discipline
+// -----------------------------------------------------------------------------
+//
+// Any function that touches a callee-saved register (rbx/rbp/r12-r15)
+// pushes it in its prologue and pops it in its epilogue, even if the
+// function has no nested `call` -- the ABI obligation is to the
+// function's OWN caller, independent of whether a nested call occurs.
+// Functions restricted to caller-save registers (rax/rcx/rdx/rsi/rdi/
+// r8-r11) need no prologue at all (leaf, no-frame, matching
+// acpi_checksum_ok's and alloc_wal.pdx's own precedent). Even push
+// counts get a `sub rsp, 8` alignment pad before any nested call
+// (matching cap_handler_blkdev.pdx's documented "six callee-save
+// pushes + sub rsp,8 pad" idiom); odd push counts need no pad
+// (matching sb_read/sb_write's 5-push precedent).
+//
+// -----------------------------------------------------------------------------
+// mov_b / no-test / label-prefix discipline
+// -----------------------------------------------------------------------------
+//
+// `mov_b` (with explicit `xor reg,reg` zero-extension first) is used
+// ONLY for the CRC32C byte loop and the DENTRY name-byte copy/pad
+// loops, matching acpi/checksum.pdx's and sys_execve_shim.pdx's proven
+// idiom. `mov_d` is used for the two u32 header fields (magic,
+// record_count) to avoid clobbering the adjacent u32 field, matching
+// mkfs.pdx/superblock.pdx's proven idiom. No `test` instruction
+// anywhere; every branch uses `cmp reg,imm`/`cmp reg,reg` +
+// `je`/`jne`/`ja`/`jb`/`jae`/`jbe`. Every label is prefixed per
+// function (`jar_`, `jnlc_`, `jbcc_`, `jebs_`/`jebc_` [relocated from
+// alloc_wal_*], `jebw_`, `jeiw_`, `jeda_`, `jedd_`, `jec_`, `jea_`,
+// `jbw_`, `jbr_`, `jbf_`, `japp_`, `jrep_`, `jhl_`, `jwsc_`) -- no
+// collisions with any other module's reserved prefixes.
+//
+// -----------------------------------------------------------------------------
+// Failure taxonomy -- 0xFFFFED20..ED23 (this module's slice of the
+// 8-wide R52.M5 band 0xFFFFED20..ED27; ED24..ED27 reserved for
+// volume_registry.pdx/probe.pdx/mount.pdx, #1706/#1707, not declared
+// here)
+// -----------------------------------------------------------------------------
+//
+//   JNL_OK                     = 0
+//   JNL_MAGIC_BAD               = 0xFFFFED20   replay: block magic mismatch
+//                                               within the confirmed chain
+//   JNL_CSUM_BAD                = 0xFFFFED21   replay: CRC32C mismatch;
+//                                               ALSO reused by
+//                                               journal_append for bad
+//                                               vol_slot / record-too-large
+//                                               / BDEV I/O failure (gap 3)
+//   JNL_CHECKPOINT_BEYOND_HEAD  = 0xFFFFED22   replay: backward walk from
+//                                               head did not reach
+//                                               checkpoint within
+//                                               journal_bcount steps
+//   JNL_SEQ_OUT_OF_ORDER        = 0xFFFFED23   replay: forward-walked
+//                                               block's seq did not
+//                                               strictly increase
+
+module JournalOndisk = structure {
+
+  // ============================================================================
+  // JOP_* op codes (design/filesystem/volume-fs-substrate.md §2.4).
+  // ============================================================================
+
+  // NOTE: prefixed JNL_OP_* rather than the design doc's bare JOP_*
+  // spelling -- src/kernel/core/cap/bdev_barrier.pdx (#1676, R51.M8)
+  // already declares `pub let JOP_ABORT : u64 = 0` and
+  // `pub let JOP_COMMIT : u64 = 1` for its own (unrelated, numerically
+  // different) barrier-sequence discriminant. Reusing those bare names
+  // here for the JBNL op-code table (values 8/9 per §2.4) would collide
+  // at link time. This module's own code never references these
+  // constants symbolically anyway (every op-code use below is the
+  // literal 1..9 immediate, matching the rest of this codebase's
+  // convention of literal immediates in the instruction stream); they
+  // are declared here purely for external callers/documentation.
+  pub let JNL_OP_BEGIN         : u64 = 1
+  pub let JNL_OP_BLOCK_WRITE    : u64 = 2
+  pub let JNL_OP_INODE_WRITE     : u64 = 3
+  pub let JNL_OP_BITMAP_SET       : u64 = 4
+  pub let JNL_OP_BITMAP_CLEAR      : u64 = 5
+  pub let JNL_OP_DENTRY_ADD          : u64 = 6
+  pub let JNL_OP_DENTRY_DEL            : u64 = 7
+  pub let JNL_OP_COMMIT                  : u64 = 8
+  pub let JNL_OP_ABORT                     : u64 = 9
+
+  // ============================================================================
+  // JBNL block/record geometry constants.
+  // ============================================================================
+
+  pub let JNL_MAGIC              : u64 = 0x4A424E4C   // "JBNL"
+  pub let JNL_BLOCK_SIZE          : u64 = 4096
+  pub let JNL_HEADER_SIZE           : u64 = 32
+  pub let JNL_RECORDS_AREA_SIZE       : u64 = 4056
+  pub let JNL_CSUM_AREA_SIZE            : u64 = 4088   // bytes [0,4088)
+  pub let JNL_CSUM_OFFSET                 : u64 = 4088
+  pub let JNL_DEFAULT_BCOUNT                : u64 = 1024
+  pub let JNL_RECORD_HDR_TXN_SIZE             : u64 = 16   // record_hdr+txn_id
+
+  pub let JNL_SENTINEL_LBA : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ============================================================================
+  // Failure taxonomy -- 0xFFFFED20..ED23 (this module's slice; see header).
+  // ============================================================================
+
+  // JNL_MAGIC_BAD (0xFFFFED20) / JNL_CSUM_BAD (0xFFFFED21) /
+  // JNL_CHECKPOINT_BEYOND_HEAD (0xFFFFED22) / JNL_SEQ_OUT_OF_ORDER
+  // (0xFFFFED23) are declared as `pub let` constants in
+  // src/kernel/core/cap/kind_volume.pdx (#1703), which landed first
+  // and claims the whole M5 band; its own header comment says
+  // "#1704/#1705 import these names rather than re-deriving them" --
+  // so they are deliberately NOT redeclared here (a second `pub let`
+  // of the same name would collide at link time). Every use below is
+  // the literal hex value with an inline comment naming the constant,
+  // matching this codebase's own established idiom for reusing an
+  // already-frozen code across module boundaries (e.g. inode_table.pdx
+  // reusing allocator.pdx's ALLOC_BITMAP_TORN by literal, not by
+  // importing the symbol).
+  pub let JNL_OK : u64 = 0
+
+  // ============================================================================
+  // Storage.
+  // ============================================================================
+
+  // Per-vol-slot writer state, 16 rows x 8 qwords (64 B/row):
+  //   [+0] head_lba (0 = unset -- journal_lba is always > 0 in any real
+  //        layout per mkfs.pdx, so 0 is a safe "never written" sentinel)
+  //   [+8] off (bytes used in the current head block, 32..4088)
+  //   [+16] rcnt (record_count of the current head block)
+  //   [+24] block_seq (seq stamped into the current head block's header)
+  //   [+32] next_seq (monotonic next record seq to hand out)
+  //   [+40] prev_lba (current head block's own chain-back pointer;
+  //         JNL_SENTINEL_LBA if none)
+  //   [+48] checkpoint (checkpoint LBA stamped into every header this
+  //         vol_slot writes)
+  //   [+56] reserved
+  pub let mut _journal_vol_state : [u64; 128] = uninit @align(64)
+
+  // Shared resident staging block + its BDEV descriptor page. Shared
+  // between journal_append and journal_replay under the single-active-
+  // volume assumption (gap 5).
+  pub let mut _journal_stage_blk : [u64; 512] = uninit @align(4096)
+  pub let mut _journal_io_desc   : [u64; 4]   = uninit @align(4096)
+
+  // Replay scratch: 16-slot open-txn tracking table + stats row.
+  //   _journal_replay_txn_id[i]    : txn_id, or JNL_SENTINEL_LBA if free
+  //   _journal_replay_txn_count[i] : buffered-record count for that txn
+  //   _journal_replay_stats:
+  //     [+0]  applied_total
+  //     [+8]  discarded_total
+  //     [+16] blocks_visited
+  //     [+24] head_lba (discovered head; also scan-phase "best_lba" scratch)
+  //     [+32] last_err
+  //     [+40] orphan_count
+  //     [+48] scratch (scan-phase best_seq; forward-phase prev_seq)
+  //     [+56] scratch (scan-phase found_any; forward-phase have_prev_seq)
+  pub let mut _journal_replay_txn_id    : [u64; 16] = uninit @align(64)
+  pub let mut _journal_replay_txn_count : [u64; 16] = uninit @align(64)
+  pub let mut _journal_replay_stats     : [u64; 8]  = uninit @align(64)
+
+  // ============================================================================
+  // journal_advance_ring(cur_lba, journal_lba, journal_bcount) -> u64
+  //   Next LBA in the ring, wrapping to journal_lba at the end. Leaf,
+  //   caller-save only, no push needed.
+  // ============================================================================
+
+  pub let journal_advance_ring : (u64, u64, u64) -> u64 !{} @{} =
+    fn (cur_lba: u64) (journal_lba: u64) (journal_bcount: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Leaf. next=cur_lba+1; end=journal_lba+journal_bcount; if next>=end, wrap to journal_lba, else next. Caller-save only (rax/r10), no push needed. No test instruction. Reserved labels: jar_.",
+      block: {
+        mov rax, rdi;
+        add rax, 1;
+        mov r10, rsi;
+        add r10, rdx;
+        cmp rax, r10;
+        jb  jar_done;
+        mov rax, rsi;
+      jar_done:
+        ret
+      }
+    }
+
+  // ============================================================================
+  // jnl_crc32c_range(base, len, seed) -> u64
+  //   Real reflected CRC32C (Castagnoli, poly 0x82F63B78), branchless
+  //   per-bit mix (mask = -(crc&1); crc = (crc>>1) ^ (mask & poly)),
+  //   over [base, base+len). Returns the RAW (non-finalized) crc state
+  //   so a caller can chain a second range with the returned seed. Leaf,
+  //   caller-save only (rax/rcx/rdx/rsi/rdi/r8/r9/r10), no push needed.
+  //   Byte load via xor+mov_b matches acpi/checksum.pdx's proven idiom.
+  // ============================================================================
+
+  pub let jnl_crc32c_range : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (base: u64) (len: u64) (seed: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Real byte-serial reflected CRC32C. rax=crc(seeded from rdx), r8=poly constant materialized once, rdi=byte cursor, rsi=bytes remaining. Per byte: zero-extend load via xor rcx,rcx;mov_b rcx,[rdi] (acpi/checksum.pdx idiom); crc^=byte (only touches low 8 bits, matching the algorithm). Then 8x unrolled (no inner branch) branchless bit-mix: r9=crc&1; r10=0; r10-=r9 (mask, all-1s or 0); r10&=poly; crc>>=1; crc^=r10. Loop bound via cmp rsi,0;jne (len==0 short-circuits to done with rax=seed unchanged, a defensible no-op range). Returns the RAW (non-XORed) crc so jnl_block_csum_compute can chain two ranges before the single final XOR. No test instruction. Reserved labels: jnlc_.",
+      block: {
+        mov rax, rdx;
+        mov r8, 0x82F63B78;
+        cmp rsi, 0;
+        je  jnlc_done;
+      jnlc_loop:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+        xor rax, rcx;
+
+        mov r9, rax; and r9, 1; xor r10, r10; sub r10, r9; and r10, r8; shr rax, 1; xor rax, r10;
+        mov r9, rax; and r9, 1; xor r10, r10; sub r10, r9; and r10, r8; shr rax, 1; xor rax, r10;
+        mov r9, rax; and r9, 1; xor r10, r10; sub r10, r9; and r10, r8; shr rax, 1; xor rax, r10;
+        mov r9, rax; and r9, 1; xor r10, r10; sub r10, r9; and r10, r8; shr rax, 1; xor rax, r10;
+        mov r9, rax; and r9, 1; xor r10, r10; sub r10, r9; and r10, r8; shr rax, 1; xor rax, r10;
+        mov r9, rax; and r9, 1; xor r10, r10; sub r10, r9; and r10, r8; shr rax, 1; xor rax, r10;
+        mov r9, rax; and r9, 1; xor r10, r10; sub r10, r9; and r10, r8; shr rax, 1; xor rax, r10;
+        mov r9, rax; and r9, 1; xor r10, r10; sub r10, r9; and r10, r8; shr rax, 1; xor rax, r10;
+
+        add rdi, 1;
+        sub rsi, 1;
+        cmp rsi, 0;
+        jne jnlc_loop;
+      jnlc_done:
+        ret
+      }
+    }
+
+  // ============================================================================
+  // jnl_block_csum_compute(block_ptr) -> u64
+  //   CRC32C over [block_ptr,block_ptr+4088) continued over the 8 bytes
+  //   of the seq field (block_ptr+8..+16) again, per the design doc's
+  //   literal text (gap 4). 2-push (rbx,r12) + sub rsp,8 pad for the
+  //   two nested jnl_crc32c_range calls.
+  // ============================================================================
+
+  pub let jnl_block_csum_compute : (u64) -> u64 !{mem} @{} =
+    fn (block_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). 2-push (rbx,r12) + sub rsp,8 pad lands rsp%16==0 for the two nested jnl_crc32c_range calls (entry rsp%16==8 + 16(pushes) + 8(pad) = 32, %16==0). rbx=block_ptr. First call: crc32c_range(rbx,4088,0xFFFFFFFF) -> r12=partial. Second call: crc32c_range(rbx+8,8,r12) -> rax=partial2 (continues over the seq field bytes a second time, gap 4). Final: rax ^= 0xFFFFFFFF (materialized in r10 first) per the standard CRC32C final-XOR step. No test instruction. Reserved labels: jbcc_ (unused -- straight-line, no branches).",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+
+        mov rdi, rbx;
+        mov rsi, 4088;
+        mov rdx, 0xFFFFFFFF;
+        call jnl_crc32c_range;
+        mov r12, rax;
+
+        mov rdi, rbx;
+        add rdi, 8;
+        mov rsi, 8;
+        mov rdx, r12;
+        call jnl_crc32c_range;
+
+        mov r10, 0xFFFFFFFF;
+        xor rax, r10;
+
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // Record encoders. Every encoder is a pure formatter: writes one
+  // record into the caller-supplied out_ptr and returns its encoded
+  // length in bytes. Ring addressing is journal_append's job alone
+  // (see header arity-discipline note). All restricted to caller-save
+  // registers only -- no push/pop needed anywhere below.
+  // ============================================================================
+
+  // journal_encode_begin(txn_id, mode, snap_gen, out_ptr) -> u64
+  //   JOP_BEGIN. payload {mode:u64(widened), snap_gen:u64} = 16 B.
+  //   record = 32 B.
+  pub let journal_encode_begin : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (txn_id: u64) (mode: u64) (snap_gen: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Leaf, caller-save only. record_hdr = op(1) | payload_len(16)<<16 via mov rax,16;shl rax,16;or rax,1. Stores record_hdr,txn_id,mode,snap_gen at out_ptr+0/8/16/24. Returns 32. No test instruction. Reserved labels: none needed (straight-line).",
+      block: {
+        mov rax, 16;
+        shl rax, 16;
+        or  rax, 1;
+        mov [rcx + 0], rax;
+        mov [rcx + 8], rdi;
+        mov [rcx + 16], rsi;
+        mov [rcx + 24], rdx;
+        mov rax, 32;
+        ret
+      }
+    }
+
+  // journal_encode_block_write(txn_id, lba, block_data_ptr, out_ptr) -> u64
+  //   JOP_BLOCK_WRITE. payload {lba:u64, block_data:u8[4096]} = 4104 B.
+  //   record = 4120 B. NOTE (gap 1): this record can never legally be
+  //   appended via journal_append (4120 > JNL_RECORDS_AREA_SIZE 4056);
+  //   this encoder still produces a byte-correct serialization.
+  pub let journal_encode_block_write : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (txn_id: u64) (lba: u64) (block_data_ptr: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Leaf, caller-save only (rax/rcx/rdi/rsi/rdx/r8/r9/r10). record_hdr = op(2)|payload_len(4104)<<16. Stores record_hdr/txn_id/lba at out_ptr+0/8/16, then a 512-qword copy loop from block_data_ptr(rdx) to out_ptr+24 (r8=dest base, r9=index, r10=scratch). Returns 4120. See module header gap 1 for why this record can never be appended as-is. No test instruction. Reserved labels: jebw_.",
+      block: {
+        mov rax, 4104;
+        shl rax, 16;
+        or  rax, 2;
+        mov [rcx + 0], rax;
+        mov [rcx + 8], rdi;
+        mov [rcx + 16], rsi;
+
+        mov r8, rcx;
+        add r8, 24;
+        xor r9, r9;
+      jebw_copy:
+        mov r10, [rdx + r9 * 8];
+        mov [r8 + r9 * 8], r10;
+        add r9, 1;
+        cmp r9, 512;
+        jne jebw_copy;
+
+        mov rax, 4120;
+        ret
+      }
+    }
+
+  // journal_encode_inode_write(txn_id, inode_no, inode_bytes_ptr, out_ptr) -> u64
+  //   JOP_INODE_WRITE. payload {inode_no:u64, inode_bytes:u8[128]} = 136 B.
+  //   record = 152 B.
+  pub let journal_encode_inode_write : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (txn_id: u64) (inode_no: u64) (inode_bytes_ptr: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Leaf, caller-save only. record_hdr = op(3)|payload_len(136)<<16. Stores record_hdr/txn_id/inode_no at out_ptr+0/8/16, then a 16-qword copy loop from inode_bytes_ptr(rdx) to out_ptr+24 (r8=dest base, r9=index, r10=scratch), matching inode_table.pdx's own 16-qword splice idiom. Returns 152. No test instruction. Reserved labels: jeiw_.",
+      block: {
+        mov rax, 136;
+        shl rax, 16;
+        or  rax, 3;
+        mov [rcx + 0], rax;
+        mov [rcx + 8], rdi;
+        mov [rcx + 16], rsi;
+
+        mov r8, rcx;
+        add r8, 24;
+        xor r9, r9;
+      jeiw_copy:
+        mov r10, [rdx + r9 * 8];
+        mov [r8 + r9 * 8], r10;
+        add r9, 1;
+        cmp r9, 16;
+        jne jeiw_copy;
+
+        mov rax, 152;
+        ret
+      }
+    }
+
+  // journal_encode_bitmap_set(txn_id, bit_no, out_ptr) -> u64
+  //   JOP_BITMAP_SET. Relocated verbatim from alloc_wal.pdx's
+  //   alloc_wal_encode_bitmap_set (#1693), per the plan's own
+  //   instruction ("Relocate the M3 BITMAP_SET/BITMAP_CLEAR encoders
+  //   here"), renamed to this module's journal_encode_* convention.
+  pub let journal_encode_bitmap_set : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (txn_id: u64) (bit_no: u64) (out_ptr: u64) -> unsafe {
+      effects: { mem }, capabilities: {},
+      justification: "R52.M5-002 (#1704), relocated from alloc_wal.pdx's alloc_wal_encode_bitmap_set (#1693) verbatim (op/body unchanged, function+module renamed). Leaf. record_hdr = op(4)|payload_len(8)<<16. Stores record_hdr/txn_id/bit_no at out_ptr+0/8/16. Returns 24. No test instruction. Reserved labels: none needed.",
+      block: {
+        mov r10, 8;
+        shl r10, 16;
+        mov rax, 4;
+        or rax, r10;
+        mov [rdx + 0], rax;
+        mov [rdx + 8], rdi;
+        mov [rdx + 16], rsi;
+        mov rax, 24;
+        ret
+      }
+    }
+
+  // journal_encode_bitmap_clear(txn_id, bit_no, out_ptr) -> u64
+  //   JOP_BITMAP_CLEAR. Relocated verbatim from alloc_wal.pdx's
+  //   alloc_wal_encode_bitmap_clear (#1693).
+  pub let journal_encode_bitmap_clear : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (txn_id: u64) (bit_no: u64) (out_ptr: u64) -> unsafe {
+      effects: { mem }, capabilities: {},
+      justification: "R52.M5-002 (#1704), relocated from alloc_wal.pdx's alloc_wal_encode_bitmap_clear (#1693) verbatim. Leaf. record_hdr = op(5)|payload_len(8)<<16. Same body as journal_encode_bitmap_set except op=5. Returns 24. No test instruction. Reserved labels: none needed.",
+      block: {
+        mov r10, 8;
+        shl r10, 16;
+        mov rax, 5;
+        or rax, r10;
+        mov [rdx + 0], rax;
+        mov [rdx + 8], rdi;
+        mov [rdx + 16], rsi;
+        mov rax, 24;
+        ret
+      }
+    }
+
+  // journal_encode_dentry_add(txn_id, dir_inode, name_ptr, name_len, target_inode, out_ptr) -> u64
+  //   JOP_DENTRY_ADD. payload {dir_inode:u64, name_len:u64(widened),
+  //   name[]:u8 (zero-padded to 8B), target_inode:u64}. Arity 6 (ceiling).
+  pub let journal_encode_dentry_add : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (txn_id: u64) (dir_inode: u64) (name_ptr: u64) (name_len: u64) (target_inode: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Leaf, caller-save only (see gap 2 for the padding rationale). r10=padded_name_len=(name_len+7)&~8 via mov rax,rcx;add rax,7;mov r11,0xFFFFFFFFFFFFFFF8;and rax,r11;mov r10,rax (two-step mov-then-and idiom for a full-width mask, cap_handler_blkdev.pdx precedent). r11=pad_count=r10-rcx (computed before rcx is consumed as the copy-loop counter). record_hdr packed via rax=r10;add rax,24;shl rax,16;or rax,6 (payload_len=24+padded_name_len, op=6). Stores record_hdr/txn_id/dir_inode/name_len(raw) at r9+0/8/16/24. rdi repurposed as dest cursor (=out_ptr+32; txn_id's job in rdi is done by this point). Byte-copy loop (rdx=src cursor, rdi=dest cursor, rcx=remaining, matching acpi/checksum.pdx's proven xor+mov_b idiom) copies name_len raw bytes, then a second loop zero-pads r11 more bytes. rdi now points exactly at out_ptr+32+padded_name_len (the two loops together advance it by exactly padded_name_len bytes) -- store target_inode(r8) there. Return rax=r10+40 (r10=padded_name_len untouched since header packing). No test instruction. Reserved labels: jeda_.",
+      block: {
+        mov rax, rcx;
+        add rax, 7;
+        mov r11, 0xFFFFFFFFFFFFFFF8;
+        and rax, r11;
+        mov r10, rax;
+
+        mov r11, r10;
+        sub r11, rcx;
+
+        mov rax, r10;
+        add rax, 24;
+        shl rax, 16;
+        or  rax, 6;
+        mov [r9 + 0], rax;
+        mov [r9 + 8], rdi;
+        mov [r9 + 16], rsi;
+        mov [r9 + 24], rcx;
+
+        mov rdi, r9;
+        add rdi, 32;
+
+        cmp rcx, 0;
+        je jeda_name_done;
+      jeda_copy:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        mov_b [rdi], rax;
+        add rdx, 1;
+        add rdi, 1;
+        sub rcx, 1;
+        cmp rcx, 0;
+        jne jeda_copy;
+      jeda_name_done:
+
+        cmp r11, 0;
+        je jeda_pad_done;
+      jeda_pad:
+        xor rax, rax;
+        mov_b [rdi], rax;
+        add rdi, 1;
+        sub r11, 1;
+        cmp r11, 0;
+        jne jeda_pad;
+      jeda_pad_done:
+
+        mov [rdi + 0], r8;
+
+        mov rax, r10;
+        add rax, 40;
+        ret
+      }
+    }
+
+  // journal_encode_dentry_del(txn_id, dir_inode, name_ptr, name_len, out_ptr) -> u64
+  //   JOP_DENTRY_DEL. payload {dir_inode:u64, name_len:u64(widened),
+  //   name[]:u8 (zero-padded to 8B)}. Arity 5.
+  pub let journal_encode_dentry_del : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (txn_id: u64) (dir_inode: u64) (name_ptr: u64) (name_len: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Same shape as journal_encode_dentry_add minus the target_inode field/arg (op=7, payload_len=16+padded_name_len). r10=padded_name_len, r11=pad_count computed the same way. Stores record_hdr/txn_id/dir_inode/name_len at r8+0/8/16/24 (out_ptr is the 5th arg, r8). rdi repurposed as dest cursor=out_ptr+32. Same copy-then-pad loop pair (rdx src cursor, rdi dest cursor, rcx remaining). Return rax=r10+32. No test instruction. Reserved labels: jedd_.",
+      block: {
+        mov rax, rcx;
+        add rax, 7;
+        mov r11, 0xFFFFFFFFFFFFFFF8;
+        and rax, r11;
+        mov r10, rax;
+
+        mov r11, r10;
+        sub r11, rcx;
+
+        mov rax, r10;
+        add rax, 16;
+        shl rax, 16;
+        or  rax, 7;
+        mov [r8 + 0], rax;
+        mov [r8 + 8], rdi;
+        mov [r8 + 16], rsi;
+        mov [r8 + 24], rcx;
+
+        mov rdi, r8;
+        add rdi, 32;
+
+        cmp rcx, 0;
+        je jedd_name_done;
+      jedd_copy:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        mov_b [rdi], rax;
+        add rdx, 1;
+        add rdi, 1;
+        sub rcx, 1;
+        cmp rcx, 0;
+        jne jedd_copy;
+      jedd_name_done:
+
+        cmp r11, 0;
+        je jedd_pad_done;
+      jedd_pad:
+        xor rax, rax;
+        mov_b [rdi], rax;
+        add rdi, 1;
+        sub r11, 1;
+        cmp r11, 0;
+        jne jedd_pad;
+      jedd_pad_done:
+
+        mov rax, r10;
+        add rax, 32;
+        ret
+      }
+    }
+
+  // journal_encode_commit(txn_id, final_content_hash, out_ptr) -> u64
+  //   JOP_COMMIT. payload {final_content_hash:u64} = 8 B. record = 24 B.
+  pub let journal_encode_commit : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (txn_id: u64) (final_content_hash: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Leaf, caller-save only. record_hdr = op(8)|payload_len(8)<<16. Stores record_hdr/txn_id/final_content_hash at out_ptr+0/8/16. Returns 24. No test instruction. Reserved labels: jec_ (unused -- straight-line).",
+      block: {
+        mov r10, 8;
+        shl r10, 16;
+        mov rax, 8;
+        or  rax, r10;
+        mov [rdx + 0], rax;
+        mov [rdx + 8], rdi;
+        mov [rdx + 16], rsi;
+        mov rax, 24;
+        ret
+      }
+    }
+
+  // journal_encode_abort(txn_id, out_ptr) -> u64
+  //   JOP_ABORT. payload empty. record = 16 B.
+  pub let journal_encode_abort : (u64, u64) -> u64 !{mem} @{} =
+    fn (txn_id: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Leaf, caller-save only. record_hdr = op(9), payload_len=0 (no shift needed). Stores record_hdr/txn_id at out_ptr+0/8. Returns 16. No test instruction. Reserved labels: jea_ (unused -- straight-line).",
+      block: {
+        mov rax, 9;
+        mov [rsi + 0], rax;
+        mov [rsi + 8], rdi;
+        mov rax, 16;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // Low-level BDEV I/O helpers, shared by journal_append and
+  // journal_replay via _journal_io_desc. Same descriptor-page protocol
+  // as superblock_read.pdx/superblock_write.pdx: op_arg packs the
+  // op_code into the low 12 bits of the (4-KiB-aligned) descriptor
+  // page address.
+  // ============================================================================
+
+  // jnl_bdev_write_block(bdev_cap, lba, buf_ptr) -> u64
+  pub let jnl_bdev_write_block : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (bdev_cap: u64) (lba: u64) (buf_ptr: u64) -> unsafe {
+      effects: { mem, sysreg }, capabilities: { cap },
+      justification: "R52.M5-002 (#1704). 5-push callee-save prologue (rbx/r12/r13/r14/r15, sb_write pattern) lands rsp%16==0 for the nested cap_invoke call. rbx=bdev_cap, r13=lba, r14=buf_ptr, r12=&_journal_io_desc, r15 unused (pattern uniformity). Stamps [r12+0]=lba,[r12+8]=nblocks=1,[r12+16]=dma_iova=buf_ptr,[r12+24]=status_out=0. rdi=rbx; rsi=r12 OR'd with op_code 4 (BDEV_OP_WRITE_LBA); call cap_invoke. Any nonzero result maps to the single generic JNL_CSUM_BAD (reused, gap 3). No test instruction. Reserved labels: jbw_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+        mov r13, rsi;
+        mov r14, rdx;
+
+        lea r12, [rip + _journal_io_desc];
+        mov [r12 + 0], r13;
+        mov rax, 1;
+        mov [r12 + 8], rax;
+        mov [r12 + 16], r14;
+        xor rax, rax;
+        mov [r12 + 24], rax;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov r10, 4;
+        or  rsi, r10;
+        call cap_invoke;
+        cmp rax, 0;
+        jne jbw_err;
+
+        xor eax, eax;
+        jmp jbw_done;
+
+      jbw_err:
+        mov rax, 0xFFFFED21;
+
+      jbw_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // jnl_bdev_read_block(bdev_cap, lba, buf_ptr) -> u64
+  pub let jnl_bdev_read_block : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (bdev_cap: u64) (lba: u64) (buf_ptr: u64) -> unsafe {
+      effects: { mem, sysreg }, capabilities: { cap },
+      justification: "R52.M5-002 (#1704). Same shape as jnl_bdev_write_block, op_code 3 (BDEV_OP_READ_LBA), dma_iova=buf_ptr is the DESTINATION here. Any nonzero cap_invoke result maps to JNL_CSUM_BAD (reused, gap 3). No test instruction. Reserved labels: jbr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+        mov r13, rsi;
+        mov r14, rdx;
+
+        lea r12, [rip + _journal_io_desc];
+        mov [r12 + 0], r13;
+        mov rax, 1;
+        mov [r12 + 8], rax;
+        mov [r12 + 16], r14;
+        xor rax, rax;
+        mov [r12 + 24], rax;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov r10, 3;
+        or  rsi, r10;
+        call cap_invoke;
+        cmp rax, 0;
+        jne jbr_err;
+
+        xor eax, eax;
+        jmp jbr_done;
+
+      jbr_err:
+        mov rax, 0xFFFFED21;
+
+      jbr_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // jnl_bdev_flush(bdev_cap) -> u64
+  pub let jnl_bdev_flush : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (bdev_cap: u64) -> unsafe {
+      effects: { mem, sysreg }, capabilities: { cap },
+      justification: "R52.M5-002 (#1704). 5-push callee-save prologue (rbx/r12/r13/r14/r15, pattern uniformity with jnl_bdev_write_block/_read_block) lands rsp%16==0 for the nested cap_invoke call. rbx=bdev_cap, r12=&_journal_io_desc (lba/nblocks/dma_iova/status_out all zeroed -- FLUSH's descriptor fields are not consumed for addressing, only status_out is written back). rdi=rbx; rsi=r12 OR'd with op_code 5 (BDEV_OP_FLUSH); call cap_invoke. This is the first FS-level BDEV_OP_FLUSH caller in the kernel (module header gap 7). Any nonzero result maps to JNL_CSUM_BAD (reused, gap 3). No test instruction. Reserved labels: jbf_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+
+        lea r12, [rip + _journal_io_desc];
+        xor rax, rax;
+        mov [r12 + 0], rax;
+        mov [r12 + 8], rax;
+        mov [r12 + 16], rax;
+        mov [r12 + 24], rax;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov r10, 5;
+        or  rsi, r10;
+        call cap_invoke;
+        cmp rax, 0;
+        jne jbf_err;
+
+        xor eax, eax;
+        jmp jbf_done;
+
+      jbf_err:
+        mov rax, 0xFFFFED21;
+
+      jbf_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // journal_head_lba(vol_slot) -> u64
+  //   Current in-memory head LBA for vol_slot (0 if unset/out-of-range).
+  // ============================================================================
+
+  pub let journal_head_lba : (u64) -> u64 !{mem} @{} =
+    fn (vol_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Leaf, caller-save only. Bound-check vol_slot<16 else return 0 (matches head_lba's own 'unset' sentinel). row_base = &_journal_vol_state + vol_slot*64 via r10=vol_slot;shl r10,6;lea r11,[rip+_journal_vol_state];add r11,r10. Returns [row_base+0]. No test instruction. Reserved labels: jhl_.",
+      block: {
+        mov r10, 16;
+        cmp rdi, r10;
+        jae jhl_bad;
+
+        mov r10, rdi;
+        shl r10, 6;
+        lea r11, [rip + _journal_vol_state];
+        add r11, r10;
+        mov rax, [r11 + 0];
+        ret;
+
+      jhl_bad:
+        xor eax, eax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // journal_writer_set_checkpoint(vol_slot, checkpoint_lba) -> ()
+  //   Sets the checkpoint LBA a mount path stamps into every header this
+  //   vol_slot's writer produces (defaults to journal_lba on first
+  //   touch if never called explicitly).
+  // ============================================================================
+
+  pub let journal_writer_set_checkpoint : (u64, u64) -> () !{mem} @{} =
+    fn (vol_slot: u64) (checkpoint_lba: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Leaf, caller-save only. Bound-check vol_slot<16 else no-op. row_base computed the same way as journal_head_lba. Stores checkpoint_lba at [row_base+48]. No test instruction. Reserved labels: jwsc_.",
+      block: {
+        mov r10, 16;
+        cmp rdi, r10;
+        jae jwsc_done;
+
+        mov r10, rdi;
+        shl r10, 6;
+        lea r11, [rip + _journal_vol_state];
+        add r11, r10;
+        mov [r11 + 48], rsi;
+
+      jwsc_done:
+        ret
+      }
+    }
+
+  // ============================================================================
+  // journal_append(bdev_cap, vol_slot, journal_lba, journal_bcount,
+  //                 record_ptr, record_len) -> u64
+  //
+  //   Appends one pre-encoded record (built by one of the
+  //   journal_encode_* functions above) into vol_slot's journal ring.
+  //   Lazily initializes per-vol-slot state on first touch (head_lba==0
+  //   sentinel). Rolls to the next ring block when the record would not
+  //   fit in the current block's records area. Durability sequencing
+  //   per §4.2 (module header gap 7): write payload -> FLUSH -> compute
+  //   + write csum.
+  //
+  //   Precondition (module header gap 1): record_len <=
+  //   JNL_RECORDS_AREA_SIZE (4056). A JOP_BLOCK_WRITE record (4120 B)
+  //   always violates this and is always refused.
+  //
+  //   Returns 0 (JNL_OK) on success, else JNL_CSUM_BAD (reused, gap 3)
+  //   for a bad vol_slot, an oversized record, or a BDEV I/O failure.
+  // ============================================================================
+
+  pub let journal_append : (u64, u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (bdev_cap: u64) (vol_slot: u64) (journal_lba: u64) (journal_bcount: u64) (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: { mem, sysreg }, capabilities: { cap },
+      justification: "R52.M5-002 (#1704). 6-push callee-save prologue (rbx/rbp/r12/r13/r14/r15) + sub rsp,8 pad (cap_handler_blkdev.pdx's documented six-push+pad idiom) lands rsp%16==0 for every nested call. rbx=bdev_cap, rbp=vol_slot, r12=journal_lba, r13=journal_bcount, r14=record_ptr, r15=record_len -- all six preserved verbatim across every nested call for the whole function body. row_base (r11, caller-save) is recomputed via r10=rbp;shl r10,6;lea r11,[rip+_journal_vol_state];add r11,r10 immediately before EVERY use rather than cached across a nested call, since r11 is caller-save and would otherwise be silently clobbered by journal_advance_ring/jnl_bdev_write_block/jnl_bdev_flush/jnl_block_csum_compute. Body: (1) bound-check vol_slot<16 and record_len<=4056, else japp_bad (JNL_CSUM_BAD reused, gaps 1/3). (2) if [row+0]==0 (first touch): seed head_lba=journal_lba, off=32, rcnt=0, block_seq=0, next_seq=0, prev_lba=SENTINEL, checkpoint=journal_lba. (3) if off+record_len>4088: roll -- prev_lba:=old head_lba; head_lba:=journal_advance_ring(old head_lba,journal_lba,journal_bcount); off:=32; rcnt:=0; block_seq:=next_seq (snapshot). (4) if off==32 (fresh block from either (2) or (3)): zero the 512-qword stage buffer. (5) qwords=record_len/8 (exact, xor-then-div idiom, mkfs.pdx precedent) copy loop from record_ptr into stage_blk+off. (6) off+=record_len; rcnt+=1; next_seq+=1, all stored back. (7) stamp stage_blk header: magic (mov_d), record_count=rcnt (mov_d), seq=block_seq, prev_lba, checkpoint. (8) jnl_bdev_write_block(bdev_cap,head_lba,&stage_blk) [payload write] -> jne japp_err. (9) jnl_bdev_flush(bdev_cap) -> jne japp_err (the barrier between payload and csum, §4.2). (10) jnl_block_csum_compute(&stage_blk) -> stamp stage_blk+4088. (11) jnl_bdev_write_block again [csum write] -> jne japp_err. (12) xor eax,eax; success. japp_bad/japp_err both set rax=0xFFFFED21 (JNL_CSUM_BAD, reused per gap 3). No test instruction. Reserved labels: japp_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+        mov r12, rdx;
+        mov r13, rcx;
+        mov r14, r8;
+        mov r15, r9;
+
+        mov r10, 16;
+        cmp rbp, r10;
+        jae japp_bad;
+
+        mov r10, 4056;
+        cmp r15, r10;
+        ja  japp_bad;
+
+        mov r10, rbp;
+        shl r10, 6;
+        lea r11, [rip + _journal_vol_state];
+        add r11, r10;
+
+        mov rax, [r11 + 0];
+        cmp rax, 0;
+        jne japp_have_head;
+
+        mov [r11 + 0], r12;
+        mov rax, 32;
+        mov [r11 + 8], rax;
+        xor rax, rax;
+        mov [r11 + 16], rax;
+        mov [r11 + 24], rax;
+        mov [r11 + 32], rax;
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        mov [r11 + 40], rax;
+        mov [r11 + 48], r12;
+
+      japp_have_head:
+        mov r10, rbp;
+        shl r10, 6;
+        lea r11, [rip + _journal_vol_state];
+        add r11, r10;
+
+        mov rax, [r11 + 8];
+        mov r10, r15;
+        add r10, rax;
+        mov rcx, 4088;
+        cmp r10, rcx;
+        jbe japp_no_roll;
+
+        mov rax, [r11 + 0];
+        mov [r11 + 40], rax;
+        mov rdi, rax;
+        mov rsi, r12;
+        mov rdx, r13;
+        call journal_advance_ring;
+
+        mov r10, rbp;
+        shl r10, 6;
+        lea r11, [rip + _journal_vol_state];
+        add r11, r10;
+
+        mov [r11 + 0], rax;
+        mov rax, 32;
+        mov [r11 + 8], rax;
+        xor rax, rax;
+        mov [r11 + 16], rax;
+        mov rax, [r11 + 32];
+        mov [r11 + 24], rax;
+
+      japp_no_roll:
+        mov r10, rbp;
+        shl r10, 6;
+        lea r11, [rip + _journal_vol_state];
+        add r11, r10;
+
+        mov rax, [r11 + 8];
+        cmp rax, 32;
+        jne japp_skip_zero;
+
+        lea r10, [rip + _journal_stage_blk];
+        xor rcx, rcx;
+      japp_zero_loop:
+        xor rax, rax;
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 512;
+        jne japp_zero_loop;
+
+      japp_skip_zero:
+        mov r10, rbp;
+        shl r10, 6;
+        lea r11, [rip + _journal_vol_state];
+        add r11, r10;
+
+        mov rax, [r11 + 8];
+        lea r10, [rip + _journal_stage_blk];
+        add r10, rax;
+
+        mov rax, r15;
+        xor rdx, rdx;
+        mov r9, 8;
+        div r9;
+        mov rcx, rax;
+
+        xor r9, r9;
+        cmp rcx, 0;
+        je japp_copy_done;
+      japp_copy_loop:
+        mov rax, [r14 + r9 * 8];
+        mov [r10 + r9 * 8], rax;
+        add r9, 1;
+        cmp r9, rcx;
+        jne japp_copy_loop;
+      japp_copy_done:
+
+        mov r10, rbp;
+        shl r10, 6;
+        lea r11, [rip + _journal_vol_state];
+        add r11, r10;
+
+        mov rax, [r11 + 8];
+        add rax, r15;
+        mov [r11 + 8], rax;
+        mov rax, [r11 + 16];
+        add rax, 1;
+        mov [r11 + 16], rax;
+        mov rax, [r11 + 32];
+        add rax, 1;
+        mov [r11 + 32], rax;
+
+        mov r10, rbp;
+        shl r10, 6;
+        lea r11, [rip + _journal_vol_state];
+        add r11, r10;
+
+        lea r10, [rip + _journal_stage_blk];
+        mov rax, 0x4A424E4C;
+        mov_d [r10 + 0], rax;
+        mov rax, [r11 + 16];
+        mov_d [r10 + 4], rax;
+        mov rax, [r11 + 24];
+        mov [r10 + 8], rax;
+        mov rax, [r11 + 40];
+        mov [r10 + 16], rax;
+        mov rax, [r11 + 48];
+        mov [r10 + 24], rax;
+
+        mov rdi, rbx;
+        mov r10, rbp;
+        shl r10, 6;
+        lea r11, [rip + _journal_vol_state];
+        add r11, r10;
+        mov rsi, [r11 + 0];
+        lea rdx, [rip + _journal_stage_blk];
+        call jnl_bdev_write_block;
+        cmp rax, 0;
+        jne japp_err;
+
+        mov rdi, rbx;
+        call jnl_bdev_flush;
+        cmp rax, 0;
+        jne japp_err;
+
+        lea rdi, [rip + _journal_stage_blk];
+        call jnl_block_csum_compute;
+        lea r10, [rip + _journal_stage_blk];
+        mov [r10 + 4088], rax;
+
+        mov rdi, rbx;
+        mov r10, rbp;
+        shl r10, 6;
+        lea r11, [rip + _journal_vol_state];
+        add r11, r10;
+        mov rsi, [r11 + 0];
+        lea rdx, [rip + _journal_stage_blk];
+        call jnl_bdev_write_block;
+        cmp rax, 0;
+        jne japp_err;
+
+        xor eax, eax;
+        jmp japp_done;
+
+      japp_bad:
+        mov rax, 0xFFFFED21;
+        jmp japp_done;
+
+      japp_err:
+        mov rax, 0xFFFFED21;
+
+      japp_done:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // journal_replay_applied_count / _discarded_count / _blocks_visited /
+  // _head_lba / _err / _orphan_count -- readback accessors over
+  // _journal_replay_stats, populated by journal_replay below.
+  // ============================================================================
+
+  pub let journal_replay_applied_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Leaf field readback: _journal_replay_stats[+0].",
+      block: { lea r10, [rip + _journal_replay_stats]; mov rax, [r10 + 0]; ret }
+    }
+
+  pub let journal_replay_discarded_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Leaf field readback: _journal_replay_stats[+8].",
+      block: { lea r10, [rip + _journal_replay_stats]; mov rax, [r10 + 8]; ret }
+    }
+
+  pub let journal_replay_blocks_visited : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Leaf field readback: _journal_replay_stats[+16].",
+      block: { lea r10, [rip + _journal_replay_stats]; mov rax, [r10 + 16]; ret }
+    }
+
+  pub let journal_replay_head_lba : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Leaf field readback: _journal_replay_stats[+24].",
+      block: { lea r10, [rip + _journal_replay_stats]; mov rax, [r10 + 24]; ret }
+    }
+
+  pub let journal_replay_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Leaf field readback: _journal_replay_stats[+32].",
+      block: { lea r10, [rip + _journal_replay_stats]; mov rax, [r10 + 32]; ret }
+    }
+
+  pub let journal_replay_orphan_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-002 (#1704). Leaf field readback: _journal_replay_stats[+40] (module header gap 6).",
+      block: { lea r10, [rip + _journal_replay_stats]; mov rax, [r10 + 40]; ret }
+    }
+
+  // ============================================================================
+  // journal_replay(bdev_cap, vol_slot, journal_lba, journal_bcount,
+  //                 checkpoint_lba) -> u64
+  //
+  //   Cold-boot JBNL walker per §4.3: (1) clears its own scratch state
+  //   (idempotent across calls); (2) scans every block in
+  //   [journal_lba, journal_lba+journal_bcount) for the highest-seq
+  //   valid-magic block (the "head"); (3) walks backward via prev_lba
+  //   from head to checkpoint_lba, bounded by journal_bcount steps
+  //   (JNL_CHECKPOINT_BEYOND_HEAD if never reached); (4) walks forward
+  //   from checkpoint_lba to head via journal_advance_ring,
+  //   CSUM-verifying and seq-order-checking each block (truncating the
+  //   replay range, not hard-failing, on the first violation -- a torn
+  //   write at the head is expected and normal); (5) classifies every
+  //   record by op into a 16-slot open-txn table (module header gap 6),
+  //   folding JOP_COMMIT's buffered count into applied_total and
+  //   JOP_ABORT's (or any still-open-at-end-of-range txn's) into
+  //   discarded_total. Does NOT re-issue the classified writes (module
+  //   header top note). Returns applied_total (0 if the journal was
+  //   never written, or vol_slot is unused per module header gap 5).
+  // ============================================================================
+
+  pub let journal_replay : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (bdev_cap: u64) (vol_slot: u64) (journal_lba: u64) (journal_bcount: u64) (checkpoint_lba: u64) -> unsafe {
+      effects: { mem, sysreg }, capabilities: { cap },
+      justification: "R52.M5-002 (#1704). 6-push callee-save prologue (rbx/rbp/r12/r13/r14/r15) + sub rsp,8 pad. rbx=bdev_cap, r12=journal_lba, r13=journal_bcount, r14=checkpoint_lba (reused later as per-block record cursor once dead), r15=lba cursor (scan then forward-walk), rbp=steps/blocks_visited counter (reused across phases). vol_slot(rsi) intentionally not preserved -- unused per module header gap 5. Phase 0: clear _journal_replay_txn_id (to JNL_SENTINEL_LBA)/_txn_count(0)/_stats(0) via three 16/16/8-iteration loops. Phase 1 (head discovery): linear scan r15=journal_lba..journal_lba+journal_bcount-1, jnl_bdev_read_block each; on magic match compare seq against stats[+48] (best_seq scratch)/stats[+56] (found_any flag), tracking the highest into stats[+24] (head_lba). Phase 2: if found_any==0, return 0 (nothing to replay). Phase 3 (backward walk): r15=head_lba, rbp=0; loop while r15!=checkpoint_lba: read block, prev_lba=[+16]; SENTINEL or rbp>=journal_bcount -> jrep_back_fail (stats[+32]=JNL_CHECKPOINT_BEYOND_HEAD, return it); else r15=prev_lba, rbp+=1. Phase 4 (forward walk): r15=checkpoint_lba, rbp=0 (repurposed as blocks_visited), stats[+56]=0 (have_prev_seq); loop: read block; magic mismatch -> jrep_fwd_magic_bad (truncate, stats[+32]=JNL_MAGIC_BAD); jnl_block_csum_compute mismatch -> jrep_fwd_csum_bad (truncate, JNL_CSUM_BAD); seq<=prev (when have_prev_seq) -> jrep_fwd_seq_bad (truncate, JNL_SEQ_OUT_OF_ORDER); else update prev_seq/have_prev_seq and process every record: decode op=record_hdr&0xFF, txn_id=[+8] into rdx (both read once before the op dispatch, neither touched by any branch); op==1 (BEGIN) scans _journal_replay_txn_id (index in rsi, all scratch caller-save -- see reasoning in-body) for an existing/free slot, claims a free one; op in {2,3,4,5,6,7} (write-class) finds the open txn and increments its count, or bumps stats[+40] (orphan_count, gap 6) if not found; op==8 (COMMIT) finds+folds count into stats[+0] (applied_total) and frees the slot; op==9 (ABORT) folds into stats[+8] (discarded_total) and frees the slot; shared epilogue jrep_op_next reloads record_hdr fresh (payload_len was never cached in a register that survives the dispatch, deliberately, to keep every op branch free to use any caller-save register) to compute total_len=16+payload_len and advance the record cursor r14, then loops. After all records: rbp+=1 (blocks_visited); if r15==stats[+24] (head_lba) -> jrep_fwd_done (success, reached head); else journal_advance_ring(r15,r12,r13)->r15, safety-cap rbp>=journal_bcount+1 -> jrep_fwd_done (best-effort stop). jrep_fwd_done: store rbp into stats[+16], sweep every still-open txn-table slot into stats[+8] (discarded_total, gap 6's end-of-range rule), load stats[+0] into rax, done. All early-exit paths (nothing-to-replay, checkpoint-beyond-head) converge on the shared jrep_epilogue label with rax already set. No test instruction; mov_d for the magic/record_count u32 fields. Reserved labels: jrep_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+        mov r12, rdx;
+        mov r13, rcx;
+        mov r14, r8;
+
+        lea r10, [rip + _journal_replay_txn_id];
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        xor rcx, rcx;
+      jrep_clear_txn:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jne jrep_clear_txn;
+
+        lea r10, [rip + _journal_replay_txn_count];
+        xor rax, rax;
+        xor rcx, rcx;
+      jrep_clear_cnt:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jne jrep_clear_cnt;
+
+        lea r10, [rip + _journal_replay_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      jrep_clear_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jne jrep_clear_stats;
+
+        mov r15, r12;
+      jrep_scan_loop:
+        mov r10, r12;
+        add r10, r13;
+        cmp r15, r10;
+        jae jrep_scan_done;
+
+        mov rdi, rbx;
+        mov rsi, r15;
+        lea rdx, [rip + _journal_stage_blk];
+        call jnl_bdev_read_block;
+        cmp rax, 0;
+        jne jrep_scan_next;
+
+        lea r10, [rip + _journal_stage_blk];
+        mov_d rax, [r10 + 0];
+        mov r11, 0x4A424E4C;
+        cmp rax, r11;
+        jne jrep_scan_next;
+
+        mov rax, [r10 + 8];
+        lea r11, [rip + _journal_replay_stats];
+        mov rcx, [r11 + 56];
+        cmp rcx, 0;
+        jne jrep_scan_have_best;
+
+        mov [r11 + 24], r15;
+        mov [r11 + 48], rax;
+        mov rcx, 1;
+        mov [r11 + 56], rcx;
+        jmp jrep_scan_next;
+
+      jrep_scan_have_best:
+        mov rcx, [r11 + 48];
+        cmp rax, rcx;
+        jbe jrep_scan_next;
+        mov [r11 + 24], r15;
+        mov [r11 + 48], rax;
+
+      jrep_scan_next:
+        add r15, 1;
+        jmp jrep_scan_loop;
+
+      jrep_scan_done:
+        lea r10, [rip + _journal_replay_stats];
+        mov rax, [r10 + 56];
+        cmp rax, 0;
+        jne jrep_have_head;
+
+        xor eax, eax;
+        jmp jrep_epilogue;
+
+      jrep_have_head:
+        lea r10, [rip + _journal_replay_stats];
+        mov r15, [r10 + 24];
+        xor rbp, rbp;
+
+      jrep_back_loop:
+        cmp r15, r14;
+        je jrep_back_reached;
+
+        mov rdi, rbx;
+        mov rsi, r15;
+        lea rdx, [rip + _journal_stage_blk];
+        call jnl_bdev_read_block;
+        cmp rax, 0;
+        jne jrep_back_fail;
+
+        lea r10, [rip + _journal_stage_blk];
+        mov rax, [r10 + 16];
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je jrep_back_fail;
+
+        mov r15, rax;
+        add rbp, 1;
+        cmp rbp, r13;
+        jae jrep_back_fail;
+        jmp jrep_back_loop;
+
+      jrep_back_fail:
+        lea r10, [rip + _journal_replay_stats];
+        mov rax, 0xFFFFED22;
+        mov [r10 + 32], rax;
+        jmp jrep_epilogue;
+
+      jrep_back_reached:
+        mov r15, r14;
+        xor rbp, rbp;
+        lea r10, [rip + _journal_replay_stats];
+        xor rax, rax;
+        mov [r10 + 56], rax;
+
+      jrep_fwd_loop:
+        mov rdi, rbx;
+        mov rsi, r15;
+        lea rdx, [rip + _journal_stage_blk];
+        call jnl_bdev_read_block;
+        cmp rax, 0;
+        jne jrep_fwd_done;
+
+        lea r10, [rip + _journal_stage_blk];
+        mov_d rax, [r10 + 0];
+        mov r11, 0x4A424E4C;
+        cmp rax, r11;
+        jne jrep_fwd_magic_bad;
+
+        lea rdi, [rip + _journal_stage_blk];
+        call jnl_block_csum_compute;
+        lea r10, [rip + _journal_stage_blk];
+        mov rcx, [r10 + 4088];
+        cmp rax, rcx;
+        jne jrep_fwd_csum_bad;
+
+        lea r10, [rip + _journal_stage_blk];
+        mov rax, [r10 + 8];
+        lea r11, [rip + _journal_replay_stats];
+        mov rcx, [r11 + 56];
+        cmp rcx, 0;
+        je jrep_fwd_seq_ok;
+        mov rcx, [r11 + 48];
+        cmp rax, rcx;
+        jbe jrep_fwd_seq_bad;
+
+      jrep_fwd_seq_ok:
+        lea r11, [rip + _journal_replay_stats];
+        mov [r11 + 48], rax;
+        mov rcx, 1;
+        mov [r11 + 56], rcx;
+
+        lea r10, [rip + _journal_stage_blk];
+        mov_d rcx, [r10 + 4];
+        lea r14, [r10 + 32];
+        xor r8, r8;
+
+      jrep_rec_loop:
+        cmp r8, rcx;
+        jae jrep_rec_done;
+
+        mov rax, [r14 + 0];
+        mov r9, rax;
+        and r9, 0xFF;
+        mov rdx, [r14 + 8];
+
+        cmp r9, 1;
+        je jrep_op_begin;
+        cmp r9, 8;
+        je jrep_op_commit;
+        cmp r9, 9;
+        je jrep_op_abort;
+        jmp jrep_op_write;
+
+      jrep_op_begin:
+        lea r10, [rip + _journal_replay_txn_id];
+        xor rsi, rsi;
+      jrep_begin_scan:
+        cmp rsi, 16;
+        jae jrep_op_next;
+        mov r9, [r10 + rsi * 8];
+        cmp r9, rdx;
+        je jrep_op_next;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp r9, r11;
+        jne jrep_begin_scan_next;
+        mov [r10 + rsi * 8], rdx;
+        lea r11, [rip + _journal_replay_txn_count];
+        xor r9, r9;
+        mov [r11 + rsi * 8], r9;
+        jmp jrep_op_next;
+      jrep_begin_scan_next:
+        add rsi, 1;
+        jmp jrep_begin_scan;
+
+      jrep_op_write:
+        lea r10, [rip + _journal_replay_txn_id];
+        xor rsi, rsi;
+      jrep_write_scan:
+        cmp rsi, 16;
+        jae jrep_write_orphan;
+        mov r9, [r10 + rsi * 8];
+        cmp r9, rdx;
+        je jrep_write_found;
+        add rsi, 1;
+        jmp jrep_write_scan;
+      jrep_write_found:
+        lea r11, [rip + _journal_replay_txn_count];
+        mov r9, [r11 + rsi * 8];
+        add r9, 1;
+        mov [r11 + rsi * 8], r9;
+        jmp jrep_op_next;
+      jrep_write_orphan:
+        lea r10, [rip + _journal_replay_stats];
+        mov r9, [r10 + 40];
+        add r9, 1;
+        mov [r10 + 40], r9;
+        jmp jrep_op_next;
+
+      jrep_op_commit:
+        lea r10, [rip + _journal_replay_txn_id];
+        xor rsi, rsi;
+      jrep_commit_scan:
+        cmp rsi, 16;
+        jae jrep_op_next;
+        mov r9, [r10 + rsi * 8];
+        cmp r9, rdx;
+        je jrep_commit_found;
+        add rsi, 1;
+        jmp jrep_commit_scan;
+      jrep_commit_found:
+        lea r11, [rip + _journal_replay_txn_count];
+        mov r9, [r11 + rsi * 8];
+        lea r10, [rip + _journal_replay_stats];
+        mov rax, [r10 + 0];
+        add rax, r9;
+        mov [r10 + 0], rax;
+        lea r10, [rip + _journal_replay_txn_id];
+        mov r9, 0xFFFFFFFFFFFFFFFF;
+        mov [r10 + rsi * 8], r9;
+        jmp jrep_op_next;
+
+      jrep_op_abort:
+        lea r10, [rip + _journal_replay_txn_id];
+        xor rsi, rsi;
+      jrep_abort_scan:
+        cmp rsi, 16;
+        jae jrep_op_next;
+        mov r9, [r10 + rsi * 8];
+        cmp r9, rdx;
+        je jrep_abort_found;
+        add rsi, 1;
+        jmp jrep_abort_scan;
+      jrep_abort_found:
+        lea r11, [rip + _journal_replay_txn_count];
+        mov r9, [r11 + rsi * 8];
+        lea r10, [rip + _journal_replay_stats];
+        mov rax, [r10 + 8];
+        add rax, r9;
+        mov [r10 + 8], rax;
+        lea r10, [rip + _journal_replay_txn_id];
+        mov r9, 0xFFFFFFFFFFFFFFFF;
+        mov [r10 + rsi * 8], r9;
+        jmp jrep_op_next;
+
+      jrep_op_next:
+        mov rax, [r14 + 0];
+        shr rax, 16;
+        mov r10, 0xFFFFFFFF;
+        and rax, r10;
+        add rax, 16;
+        add r14, rax;
+
+        add r8, 1;
+        jmp jrep_rec_loop;
+
+      jrep_rec_done:
+        add rbp, 1;
+
+        lea r10, [rip + _journal_replay_stats];
+        mov rax, [r10 + 24];
+        cmp r15, rax;
+        je jrep_fwd_done;
+
+        mov rdi, r15;
+        mov rsi, r12;
+        mov rdx, r13;
+        call journal_advance_ring;
+        mov r15, rax;
+
+        mov r10, r13;
+        add r10, 1;
+        cmp rbp, r10;
+        jae jrep_fwd_done;
+
+        jmp jrep_fwd_loop;
+
+      jrep_fwd_magic_bad:
+        lea r10, [rip + _journal_replay_stats];
+        mov rax, 0xFFFFED20;
+        mov [r10 + 32], rax;
+        jmp jrep_fwd_done;
+
+      jrep_fwd_csum_bad:
+        lea r10, [rip + _journal_replay_stats];
+        mov rax, 0xFFFFED21;
+        mov [r10 + 32], rax;
+        jmp jrep_fwd_done;
+
+      jrep_fwd_seq_bad:
+        lea r10, [rip + _journal_replay_stats];
+        mov rax, 0xFFFFED23;
+        mov [r10 + 32], rax;
+        jmp jrep_fwd_done;
+
+      jrep_fwd_done:
+        lea r10, [rip + _journal_replay_stats];
+        mov [r10 + 16], rbp;
+
+        lea r10, [rip + _journal_replay_txn_id];
+        xor rsi, rsi;
+      jrep_sweep_loop:
+        cmp rsi, 16;
+        jae jrep_sweep_done;
+        lea r10, [rip + _journal_replay_txn_id];
+        mov r9, [r10 + rsi * 8];
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        cmp r9, rax;
+        je jrep_sweep_next;
+
+        lea r11, [rip + _journal_replay_txn_count];
+        mov rdx, [r11 + rsi * 8];
+        lea r10, [rip + _journal_replay_stats];
+        mov rax, [r10 + 8];
+        add rax, rdx;
+        mov [r10 + 8], rax;
+
+      jrep_sweep_next:
+        add rsi, 1;
+        jmp jrep_sweep_loop;
+
+      jrep_sweep_done:
+        lea r10, [rip + _journal_replay_stats];
+        mov rax, [r10 + 0];
+
+      jrep_epilogue:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}

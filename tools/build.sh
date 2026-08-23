@@ -6025,6 +6025,43 @@ fi
 echo "[r52-m5-confine] R52.M5-001 (KIND_SIG_KEY) confined"
 
 # ---------------------------------------------------------------------------
+# R52.M5-002 (#1704): one-writer discipline for the on-disk JBNL journal
+# ring's writer/walker state.
+#
+#   * journal_ondisk (src/kernel/core/fs/pdxfs/journal_ondisk.pdx)
+#
+# _journal_vol_state (16-row per-vol-slot writer bookkeeping: head_lba/
+# off/rcnt/block_seq/next_seq/prev_lba/checkpoint), _journal_stage_blk
+# (the one resident 4-KiB journal block staged by journal_append and
+# reused by journal_replay) and _journal_io_desc (their shared
+# BDEV_OP_READ_LBA/WRITE_LBA/FLUSH descriptor page), plus
+# _journal_replay_txn_id / _journal_replay_txn_count / _journal_replay_stats
+# (the cold-boot walker's open-txn classification scratch) are all
+# single-writer state confined to this one module -- a second writer
+# could race the resident staging block mid-append/mid-replay (a torn
+# journal write or a corrupted replay classification), or forge a
+# vol_slot's head/checkpoint bookkeeping and silently desynchronize the
+# ring from what is actually durable on disk.
+R52_JNL_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/journal_ondisk.pdx"
+if [[ ! -f "${R52_JNL_SRC}" ]]; then
+    echo "[r52-m5-confine] FAIL - journal_ondisk.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_journal_vol_state'        'core/fs/pdxfs/journal_ondisk.o'
+ec_confine_one '_journal_stage_blk'        'core/fs/pdxfs/journal_ondisk.o'
+ec_confine_one '_journal_io_desc'          'core/fs/pdxfs/journal_ondisk.o'
+ec_confine_one '_journal_replay_txn_id'    'core/fs/pdxfs/journal_ondisk.o'
+ec_confine_one '_journal_replay_txn_count' 'core/fs/pdxfs/journal_ondisk.o'
+ec_confine_one '_journal_replay_stats'     'core/fs/pdxfs/journal_ondisk.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See journal_ondisk.pdx §Storage for the per-module one-writer" >&2
+    echo "  discipline (the sole writers are journal_append, journal_replay," >&2
+    echo "  and their journal_writer_set_checkpoint / jnl_bdev_* helpers)." >&2
+    exit 1
+fi
+echo "[r52-m5-confine] R52.M5-002 (journal_ondisk) confined"
+
+# ---------------------------------------------------------------------------
 # R42-PREP-008 (#1630): one-writer discipline for the PdxFS userspace
 # directory iterator cursor table.
 #
