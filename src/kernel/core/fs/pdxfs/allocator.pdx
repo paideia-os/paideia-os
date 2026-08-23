@@ -1,0 +1,726 @@
+// src/kernel/core/fs/pdxfs/allocator.pdx -- R52.M3-001 (#1692)
+//
+// PDXFS-ON-BLOCK v1 -- BITMAP BLOCK ALLOCATOR SKELETON.
+//
+// Design authority: design/filesystem/r52-implementation-plan.md §2.3
+// (R52.M3, step 1: "#1692 -- allocator.pdx: bitmap read/write/scan,
+// alloc_hint : u64, LIFO free stack of size 16"); on-disk region layout
+// per design/filesystem/volume-fs-substrate.md §2.2 ("Block allocator
+// -- bitmap, not extents") and §2.1's superblock field table (alloc_lba
+// @+56, alloc_bcount @+64, data_lba @+88).
+//
+// -----------------------------------------------------------------------------
+// Scope
+// -----------------------------------------------------------------------------
+//
+// Lands the two core mutating primitives named by this issue:
+//
+//   alloc_block(bdev_cap: u64, alloc_hint: u64) -> u64
+//     Returns an absolute data-region LBA on success, or one of
+//     ALLOC_EXHAUSTED / ALLOC_BITMAP_TORN on failure.
+//
+//   free_block(bdev_cap: u64, lba: u64) -> u64
+//     Returns 0 on success, or one of FREE_BAD_BIT / FREE_DOUBLE /
+//     ALLOC_BITMAP_TORN / FREE_STACK_FULL.
+//
+// plus the supporting state this pair needs: a single resident 4-KiB
+// bitmap block (`_alloc_bm_buf`), a 16-entry LIFO free stack
+// (`_alloc_free_stack`), and `alloc_init(sb_ptr)` to seed the three
+// region fields (`alloc_lba`, `alloc_bcount`, `data_lba`) from the
+// superblock accessors #1682 (`superblock.pdx`) already landed.
+//
+// `alloc_scan_on_mount` (multi-bitmap-block mount-time hint seeding)
+// and the `BITMAP_SET`/`BITMAP_CLEAR` WAL encoders are the NEXT two
+// issues in this milestone (#1694, #1693) and are deliberately not
+// landed here -- see "Design-doc gaps flagged" below.
+//
+// -----------------------------------------------------------------------------
+// Design-doc gaps flagged (see final report to main / softarch)
+// -----------------------------------------------------------------------------
+//
+// 1. Signature shape. §2.3 names `alloc_block(vol_slot) -> lba | err`
+//    and `free_block(vol_slot, lba) -> err` against a per-volume slot
+//    table that does not exist yet (the volume registry is R52.M5,
+//    `#1707`). This landing instead threads the caller-supplied
+//    `bdev_cap` directly (exactly as `superblock_read.pdx`/
+//    `superblock_write.pdx` already do) and an explicit `alloc_hint`
+//    argument for `alloc_block` rather than a hidden per-slot hint
+//    field, since no per-slot table exists to hold one yet. This is
+//    the same "no cross-module vol_slot registry precedent" posture
+//    `superblock.pdx`'s own header flags for its design-doc gap.
+//    `alloc_init`/module-global state fills the single-volume role a
+//    `vol_slot` table would occupy once M5 lands; a follow-up at M5
+//    can widen these globals into a per-slot array without touching
+//    the bit-scan/free-stack logic itself.
+//
+// 2. Single resident bitmap block. Per §2.3's own guidance ("Cache the
+//    current bitmap block in a 4 KiB scratch buffer per volume; only
+//    one bitmap block loaded at a time"), this module models exactly
+//    ONE 4-KiB bitmap block (32768 bits, i.e. up to 128 MiB of data
+//    blocks) rather than iterating across the full `alloc_bcount`
+//    span a large volume may reserve (up to 8192 blocks for 1 TiB,
+//    per #1694's own scope line). Multi-block bitmap-region iteration
+//    is `alloc_scan_on_mount`'s job (#1694, landing next in this
+//    milestone) -- extending `alloc_bm_ensure_loaded` to select among
+//    multiple resident-block slots at that point does not require
+//    reshaping `alloc_block`/`free_block`'s bit-index arithmetic below.
+//
+// 3. `alloc_init` precondition. `alloc_block`/`free_block` assume
+//    `alloc_init(sb_ptr)` has already run in this boot (populating
+//    `_alloc_state`'s `alloc_lba`/`alloc_bcount`/`data_lba` fields and
+//    zeroing `bm_loaded_flag` + the free-stack count). No frozen M3
+//    sentinel exists for "not initialized" (§4's 8-code table for this
+//    band is fully allocated to the scan/free/fsck concerns below), so
+//    this is an undocumented-in-band precondition rather than a
+//    checked one -- exactly the same posture `bdev_barrier.pdx` avoids
+//    via its own `MOUNTW_BARRIER_NOT_INIT` check, which this module
+//    could adopt at M4+ if a spare band slot becomes available.
+//
+// 4. `FREE_STACK_FULL` ordering. `free_block` clears the bitmap bit and
+//    durably writes it back BEFORE attempting to push the freed `lba`
+//    onto the LIFO hint stack. A full stack (16 entries already
+//    pending reuse) does not undo the already-committed free -- it
+//    only means this particular `lba` will not be preferentially
+//    reused by a subsequent `alloc_block` call (it remains discoverable
+//    by the ordinary linear bitmap scan). `free_block` still returns
+//    `FREE_STACK_FULL` in that case so a caller can observe the
+//    degraded-hint condition, even though the free itself succeeded.
+//    Flagged since this is a "soft" failure return over a state that
+//    is otherwise fully consistent -- softarch should confirm this
+//    reporting convention before M4 callers start depending on it.
+//
+// -----------------------------------------------------------------------------
+// Bitmap layout
+// -----------------------------------------------------------------------------
+//
+// Bit i (0 <= i < 32768) in `_alloc_bm_buf` corresponds to data block i
+// past `data_lba`: physical LBA = data_lba + i. `1` = allocated,
+// `0` = free. Word/bit decomposition mirrors the proven idiom in
+// `pdxfs_lite/alloc.pdx` (`extent_alloc`/`extent_free`):
+//
+//   word_index = (bit_index >> 6) << 3      (byte offset of the qword)
+//   bit_pos    = bit_index & 63
+//   bit        = (word >> bit_pos) & 1
+//
+// -----------------------------------------------------------------------------
+// Storage (single-writer per field; the writers are named per §Storage
+// convention this tree already uses -- superblock_read.pdx, mkfs.pdx)
+// -----------------------------------------------------------------------------
+//
+// `_alloc_state`       : [u64; 8] @align(8)
+//   +0  init_mark        ALLOC_INIT_MARK once alloc_init has run
+//   +8  alloc_lba        cached from sb_alloc_lba (superblock.pdx, #1682)
+//   +16 alloc_bcount     cached from sb_alloc_bcount (informational at
+//                        this landing -- see gap 2 above; not yet used
+//                        to select among multiple bitmap blocks)
+//   +24 data_lba         cached from sb_data_lba
+//   +32 bm_loaded_flag   0 = _alloc_bm_buf stale, 1 = holds alloc_lba's
+//                        block
+//   +40/+48/+56 reserved, not yet assigned
+//
+// `_alloc_bm_buf`  : [u64; 512] @align(4096) -- the one resident 4-KiB
+//                    bitmap block (32768 bits).
+// `_alloc_bm_desc` : [u64; 4]   @align(4096) -- the BDEV_OP_READ_LBA
+//                    descriptor page used by `alloc_bm_ensure_loaded`
+//                    (writes go through `bdev_barrier_write`, which
+//                    owns its own descriptor page internally).
+//
+// `_alloc_free_stack`       : [u64; 16] @align(64) -- LIFO of recently
+//                             freed LBAs, reused preferentially by
+//                             `alloc_block` for CoW-write locality
+//                             (design/filesystem/volume-fs-substrate.md
+//                             §2.2).
+// `_alloc_free_stack_state` : [u64; 2] @align(8) -- +0 count (0..16).
+//
+// All five tables are written only by helpers in this file; confined
+// at build time via `tools/build.sh` `ec_confine_one`.
+//
+// -----------------------------------------------------------------------------
+// Durable writes -- bdev_barrier.pdx (#1676)
+// -----------------------------------------------------------------------------
+//
+// Every bitmap-block WRITE goes through `bdev_barrier_write` (records
+// the (op_code=4, lba) submission event before issuing `cap_invoke`),
+// per this issue's explicit scope. Per §2.3's own R51-gate note, M3
+// does NOT issue a `BDEV_OP_FLUSH` after these writes -- durability
+// across a crash is the journal's job (R52.M5, WAL replay), not this
+// milestone's; `bdev_barrier_write`'s own submission record is enough
+// to prove ordering once a caller wires FLUSH at M5. Every WRITE and
+// the one READ this module issues has its `cap_invoke`-forwarded
+// result checked via `BdevBarrier.bbjw_check` (0 = BDEV_ERR_OK,
+// 0xFFFFEC58 = NVMEIO_PICK_NONE, both acceptable per that function's
+// own header note) -- the same acceptable-status predicate
+// `bdev_barrier_journaled_write` already uses, reused here rather than
+// re-declaring an equivalent check.
+//
+// -----------------------------------------------------------------------------
+// Failure taxonomy -- 0xFFFFED10..ED17 (M3 sub-slice; see
+// design/filesystem/r52-implementation-plan.md §4/§7.2)
+// -----------------------------------------------------------------------------
+//
+// All 8 M3 band codes are frozen here (the plan names the full set for
+// the milestone's 5 issues up front); this landing WIRES the four
+// reachable from `alloc_block`/`free_block` and freezes the other four
+// as constants-only ahead of the issues that wire them (#1694, #1695),
+// matching the precedent `superblock_fmt.pdx` set for the M1 band:
+//
+//   ALLOC_EXHAUSTED         = 0xFFFFED10  wired: alloc_block's linear
+//                                         scan reaches bit 32768
+//                                         without finding a free bit.
+//   ALLOC_BITMAP_TORN       = 0xFFFFED11  wired: the bitmap block's
+//                                         READ (alloc_bm_ensure_loaded)
+//                                         or WRITE (bdev_barrier_write)
+//                                         did not report an acceptable
+//                                         status per bbjw_check.
+//   ALLOC_HINT_STALE        = 0xFFFFED12  reserved for #1694
+//                                         (alloc_scan_on_mount).
+//   FREE_BAD_BIT            = 0xFFFFED13  wired: free_block's lba is
+//                                         outside [data_lba,
+//                                         data_lba + 32768).
+//   FREE_DOUBLE             = 0xFFFFED14  wired: free_block's target
+//                                         bit is already clear.
+//   FREE_STACK_FULL         = 0xFFFFED15  wired: free_block's LIFO
+//                                         hint-stack push finds 16
+//                                         entries already pending (see
+//                                         gap 4 above).
+//   ALLOC_SCAN_UNTERMINATED = 0xFFFFED16  reserved for #1694.
+//   FSCK_BITMAP_MISMATCH    = 0xFFFFED17  reserved for #1695
+//                                         (tools/pdxfsck).
+//
+// -----------------------------------------------------------------------------
+// Arity discipline (design/filesystem/r52-implementation-plan.md §3.5)
+// -----------------------------------------------------------------------------
+//
+// `alloc_init(sb_ptr)` = 1. `alloc_bm_ensure_loaded(bdev_cap)` = 1.
+// `alloc_bit_test/_set/_clear(bit_index)` = 1 each.
+// `alloc_free_stack_count()` = 0, `alloc_free_stack_pop()` = 0,
+// `alloc_free_stack_push(lba)` = 1. `alloc_block(bdev_cap, alloc_hint)`
+// = 2. `free_block(bdev_cap, lba)` = 2. Every arity sits far under the
+// paideia-as ceiling of 6.
+//
+// -----------------------------------------------------------------------------
+// Register discipline
+// -----------------------------------------------------------------------------
+//
+// This file mixes push-counts by actual need rather than forcing a
+// single uniform shape (the same posture `bdev_barrier.pdx` takes
+// across its own functions -- 0/1/4-plus-pad/6-plus-pad depending on
+// how many live values a function must hold across its nested calls):
+//   - `alloc_bit_test/_set/_clear`, `alloc_free_stack_count/_pop/_push`
+//     are leaves (no nested `call`); no push needed.
+//   - `alloc_init`: 1 push (rbx = sb_ptr, reloaded before each of the
+//     3 `sb_*` accessor calls). Entry rsp%16==8 + 8 = 16, %16==0.
+//   - `alloc_bm_ensure_loaded`: 1 push (rbx = bdev_cap). Same shape.
+//   - `alloc_block`/`free_block`: 5 pushes (rbx/r12/r13/r14/r15,
+//     matching the uniform 5-push shape `superblock.pdx`/
+//     `superblock_read.pdx` use for this exact "several nested calls,
+//     a handful of live values" shape). Entry rsp%16==8 + 40 = 48,
+//     %16==0, no extra `sub rsp, 8` needed.
+//
+// -----------------------------------------------------------------------------
+// mov_b / no-test / label-prefix discipline
+// -----------------------------------------------------------------------------
+//
+// No byte-granularity access anywhere in this module -- the bitmap is
+// manipulated one qword at a time (word_index/bit_pos arithmetic, same
+// as `pdxfs_lite/alloc.pdx`), so no `mov_b` is needed (mirroring
+// `superblock.pdx`'s own "no mov_b needed" note for a similarly
+// whole-qword-only module). No `test` instruction anywhere; every
+// zero/nonzero and ordering check uses `cmp reg, imm`/`cmp reg, reg` +
+// `je`/`jne`/`jb`/`jae`. Every label in this file is prefixed with its
+// owning function's abbreviation under the `alloc_` family
+// (`alloc_bl_` for `alloc_block`, `alloc_fb_` for `free_block`,
+// `alloc_bel_` for `alloc_bm_ensure_loaded`), per the reserved-label
+// discipline (`alloc`/`free` themselves are reserved and never used
+// bare as a label).
+
+module Allocator = structure {
+
+  // ============================================================================
+  // M3 failure taxonomy -- 0xFFFFED10..ED17 (full band frozen; see header).
+  // ============================================================================
+
+  pub let ALLOC_EXHAUSTED         : u64 = 0xFFFFED10
+  pub let ALLOC_BITMAP_TORN       : u64 = 0xFFFFED11
+  pub let ALLOC_HINT_STALE        : u64 = 0xFFFFED12   // reserved for #1694
+  pub let FREE_BAD_BIT            : u64 = 0xFFFFED13
+  pub let FREE_DOUBLE             : u64 = 0xFFFFED14
+  pub let FREE_STACK_FULL         : u64 = 0xFFFFED15
+  pub let ALLOC_SCAN_UNTERMINATED : u64 = 0xFFFFED16   // reserved for #1694
+  pub let FSCK_BITMAP_MISMATCH    : u64 = 0xFFFFED17   // reserved for #1695
+
+  // ============================================================================
+  // Geometry / misc constants.
+  // ============================================================================
+
+  pub let ALLOC_BITMAP_BITS    : u64 = 32768   // 4096 B * 8 bits -- one resident block
+  pub let ALLOC_FREE_STACK_CAP : u64 = 16
+  pub let ALLOC_INIT_MARK      : u64 = 0xA110C
+
+  // ============================================================================
+  // Storage.
+  // ============================================================================
+
+  pub let mut _alloc_state : [u64; 8] = uninit @align(8)
+
+  pub let mut _alloc_bm_buf  : [u64; 512] = uninit @align(4096)
+  pub let mut _alloc_bm_desc : [u64; 4]   = uninit @align(4096)
+
+  pub let mut _alloc_free_stack       : [u64; 16] = uninit @align(64)
+  pub let mut _alloc_free_stack_state : [u64; 2]  = uninit @align(8)
+
+  // ============================================================================
+  // alloc_init(sb_ptr: u64) -> u64
+  //   Seeds alloc_lba/alloc_bcount/data_lba from the #1682 superblock
+  //   accessors, marks the resident bitmap block stale, empties the
+  //   free stack, and installs ALLOC_INIT_MARK. Always returns 0.
+  // ============================================================================
+  pub let alloc_init : (u64) -> u64 !{mem} @{} =
+    fn (sb_ptr: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R52.M3-001 (#1692). 1-push prologue (rbx = sb_ptr) lands rsp%16==0 for the 3 nested sb_* accessor calls (entry rsp%16==8 + 8 = 16). rbx is reloaded into rdi before each call since rdi is caller-save. Body: (1) rbx=sb_ptr. (2) rdi=rbx; call sb_alloc_lba; r10=rax. (3) rdi=rbx; call sb_alloc_bcount; r11=rax. (4) rdi=rbx; call sb_data_lba (rax holds data_lba, needed only once, stored immediately -- no register pressure issue). (5) Stamp _alloc_state: [+8]=r10 (alloc_lba), [+16]=r11 (alloc_bcount), [+24]=rax (data_lba), [+32]=0 (bm_loaded_flag), [+0]=ALLOC_INIT_MARK. (6) Zero _alloc_free_stack_state[+0] (count). (7) xor eax,eax; pop rbx; ret. Reserved labels: none needed (straight-line body). Cross-module calls to sb_alloc_lba/sb_alloc_bcount/sb_data_lba (superblock.pdx, module Superblock) follow the same flat-symbol-namespace convention superblock_read.pdx already uses to call sb_validate_magic et al.",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+
+        mov rdi, rbx;
+        call sb_alloc_lba;
+        mov r10, rax;
+
+        mov rdi, rbx;
+        call sb_alloc_bcount;
+        mov r11, rax;
+
+        mov rdi, rbx;
+        call sb_data_lba;
+
+        lea r9, [rip + _alloc_state];
+        mov [r9 + 8], r10;
+        mov [r9 + 16], r11;
+        mov [r9 + 24], rax;
+        xor rax, rax;
+        mov [r9 + 32], rax;
+        mov r10, 0xA110C;
+        mov [r9 + 0], r10;
+
+        lea r9, [rip + _alloc_free_stack_state];
+        xor rax, rax;
+        mov [r9 + 0], rax;
+
+        xor eax, eax;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // alloc_bm_ensure_loaded(bdev_cap: u64) -> u64
+  //   If the resident block already holds alloc_lba's bitmap block
+  //   (bm_loaded_flag == 1), no-op (returns 0). Else issues a single
+  //   BDEV_OP_READ_LBA(alloc_lba, 1 block) into _alloc_bm_buf. Returns
+  //   0 on success, ALLOC_BITMAP_TORN if the read's forwarded status
+  //   was not acceptable per BdevBarrier.bbjw_check.
+  // ============================================================================
+  pub let alloc_bm_ensure_loaded : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (bdev_cap: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { cap },
+      justification: "R52.M3-001 (#1692). 1-push prologue (rbx = bdev_cap) lands rsp%16==0 for the nested cap_invoke + bbjw_check calls (entry rsp%16==8 + 8 = 16). Body: (1) rbx=bdev_cap. (2) r10=&_alloc_state; rax=[r10+32] (bm_loaded_flag); cmp rax,0; jne ok (already resident). (3) r11=&_alloc_bm_desc; stamp [+0]=alloc_lba ([r10+8]), [+8]=1 (nblocks), [+16]=&_alloc_bm_buf, [+24]=0 (status_out) -- same descriptor-staging idiom as superblock_read.pdx's sb_read. (4) rdi=rbx; rsi=r11 OR'd with BDEV_OP_READ_LBA(3) via r9 (r11's low 12 bits are guaranteed zero by @align(4096)); call cap_invoke. (5) rdi=rax; call bbjw_check (BdevBarrier module -- 0 accepts BDEV_ERR_OK or NVMEIO_PICK_NONE, reused rather than re-declaring an equivalent predicate); cmp rax,0; jne bad. (6) mark bm_loaded_flag=1; xor eax,eax; jmp done. bad: mov rax,0xFFFFED11 (ALLOC_BITMAP_TORN); jmp done. ok: xor eax,eax. done: pop rbx; ret. Reserved labels: alloc_bel_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+
+        lea r10, [rip + _alloc_state];
+        mov rax, [r10 + 32];
+        cmp rax, 0;
+        jne alloc_bel_ok;
+
+        lea r11, [rip + _alloc_bm_desc];
+        mov rax, [r10 + 8];
+        mov [r11 + 0], rax;
+        mov rax, 1;
+        mov [r11 + 8], rax;
+        lea rax, [rip + _alloc_bm_buf];
+        mov [r11 + 16], rax;
+        xor rax, rax;
+        mov [r11 + 24], rax;
+
+        mov rdi, rbx;
+        mov rsi, r11;
+        mov r9, 3;
+        or rsi, r9;
+        call cap_invoke;
+
+        mov rdi, rax;
+        call bbjw_check;
+        cmp rax, 0;
+        jne alloc_bel_bad;
+
+        lea r10, [rip + _alloc_state];
+        mov rax, 1;
+        mov [r10 + 32], rax;
+        xor eax, eax;
+        jmp alloc_bel_done;
+
+      alloc_bel_bad:
+        mov rax, 0xFFFFED11;
+        jmp alloc_bel_done;
+
+      alloc_bel_ok:
+        xor eax, eax;
+
+      alloc_bel_done:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // alloc_bit_test(bit_index: u64) -> u64   (0 or 1)
+  // ============================================================================
+  pub let alloc_bit_test : (u64) -> u64 !{mem} @{} =
+    fn (bit_index: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R52.M3-001 (#1692). Leaf (no nested call, no push needed). word_addr = &_alloc_bm_buf + ((bit_index >> 6) << 3); bit_pos = bit_index & 63; bit = (word >> bit_pos) & 1. Same decomposition as pdxfs_lite/alloc.pdx's extent_alloc scan step. `and rcx,63` is a safe imm32 (bit31 clear, no sign-extension hazard). Reserved labels: none (straight-line).",
+      block: {
+        mov r8, rdi;
+        shr r8, 6;
+        shl r8, 3;
+        lea r9, [rip + _alloc_bm_buf];
+        add r9, r8;
+        mov r10, [r9];
+        mov rcx, rdi;
+        and rcx, 63;
+        shr r10, cl;
+        and r10, 1;
+        mov rax, r10;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // alloc_bit_set(bit_index: u64) -> ()
+  // ============================================================================
+  pub let alloc_bit_set : (u64) -> () !{mem} @{} =
+    fn (bit_index: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R52.M3-001 (#1692). Leaf. word |= (1 << bit_pos), same addressing as alloc_bit_test. `mov r10,1; shl r10,cl` materialises the mask (proven idiom, pdxfs_lite/alloc.pdx). Reserved labels: none.",
+      block: {
+        mov r8, rdi;
+        shr r8, 6;
+        shl r8, 3;
+        lea r9, [rip + _alloc_bm_buf];
+        add r9, r8;
+        mov rcx, rdi;
+        and rcx, 63;
+        mov r10, 1;
+        shl r10, cl;
+        mov r11, [r9];
+        or r11, r10;
+        mov [r9], r11;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // alloc_bit_clear(bit_index: u64) -> ()
+  // ============================================================================
+  pub let alloc_bit_clear : (u64) -> () !{mem} @{} =
+    fn (bit_index: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R52.M3-001 (#1692). Leaf. word &= ~(1 << bit_pos); the invert is `mov r8,0xFFFFFFFFFFFFFFFF; xor r11,r8` (materialise all-ones then XOR to invert the single-bit mask) -- the exact idiom pdxfs_lite/alloc.pdx's extent_free already proves for this same operation. Reserved labels: none.",
+      block: {
+        mov r8, rdi;
+        shr r8, 6;
+        shl r8, 3;
+        lea r9, [rip + _alloc_bm_buf];
+        add r9, r8;
+        mov rcx, rdi;
+        and rcx, 63;
+        mov r10, 1;
+        shl r10, cl;
+        mov r8, 0xFFFFFFFFFFFFFFFF;
+        xor r10, r8;
+        mov r11, [r9];
+        and r11, r10;
+        mov [r9], r11;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // alloc_free_stack_count() -> u64
+  // ============================================================================
+  pub let alloc_free_stack_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R52.M3-001 (#1692). Leaf readback of _alloc_free_stack_state[+0].",
+      block: {
+        lea r10, [rip + _alloc_free_stack_state];
+        mov rax, [r10 + 0];
+        ret
+      }
+    }
+
+  // ============================================================================
+  // alloc_free_stack_pop() -> u64
+  //   Precondition: alloc_free_stack_count() > 0 (checked by callers --
+  //   alloc_block only calls this after observing a nonzero count).
+  // ============================================================================
+  pub let alloc_free_stack_pop : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R52.M3-001 (#1692). Leaf. rcx=count; index=count-1; rax=stack[index]; store decremented count; return rax. Order matters: the element is read at the OLD count-1 index before the count is overwritten.",
+      block: {
+        lea r10, [rip + _alloc_free_stack_state];
+        mov rcx, [r10 + 0];
+        sub rcx, 1;
+        lea r9, [rip + _alloc_free_stack];
+        mov rax, [r9 + rcx * 8];
+        mov [r10 + 0], rcx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // alloc_free_stack_push(lba: u64) -> u64
+  //   0 on success, FREE_STACK_FULL if 16 entries are already pending.
+  // ============================================================================
+  pub let alloc_free_stack_push : (u64) -> u64 !{mem} @{} =
+    fn (lba: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R52.M3-001 (#1692). Leaf. rax=count; cmp rax,16 (ALLOC_FREE_STACK_CAP); jae full; stack[count]=lba; count+=1; return 0. full: return FREE_STACK_FULL. Reserved labels: alloc_fsp_.",
+      block: {
+        lea r10, [rip + _alloc_free_stack_state];
+        mov rax, [r10 + 0];
+        cmp rax, 16;
+        jae alloc_fsp_full;
+
+        lea r9, [rip + _alloc_free_stack];
+        mov [r9 + rax * 8], rdi;
+        add rax, 1;
+        mov [r10 + 0], rax;
+        xor eax, eax;
+        ret;
+
+      alloc_fsp_full:
+        mov rax, 0xFFFFED15;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // alloc_block(bdev_cap: u64, alloc_hint: u64) -> u64
+  //
+  //   1. If the free stack is non-empty, pop the most-recently-freed
+  //      lba and re-allocate it (CoW-write locality preference, per
+  //      volume-fs-substrate.md §2.2).
+  //   2. Else linear-scan the resident bitmap block starting at
+  //      alloc_hint (clamped to [0, 32768) -- an out-of-range hint
+  //      wraps to 0; no second wraparound pass in this skeleton, see
+  //      header gap 2) for the first clear bit, set it, and return
+  //      data_lba + bit_index.
+  //
+  //   Every path durably writes the modified bitmap block back via
+  //   bdev_barrier_write before returning a successful lba.
+  // ============================================================================
+  pub let alloc_block : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (bdev_cap: u64) (alloc_hint: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { cap },
+      justification: "R52.M3-001 (#1692). 5-push prologue (rbx=bdev_cap, r12=alloc_hint, r13=data_lba, r14=working bit-index/candidate, r15=unused-but-pushed for pattern uniformity with superblock.pdx/superblock_read.pdx) lands rsp%16==0 (entry rsp%16==8 + 40 = 48) for every nested call below. Body: (1) rbx=bdev_cap(rdi), r12=alloc_hint(rsi). (2) r13=[_alloc_state+24] (data_lba). (3) call alloc_free_stack_count; cmp rax,0; je scan path. (4) Reuse path: call alloc_free_stack_pop -> r14=candidate lba. rdi=rbx; call alloc_bm_ensure_loaded; cmp rax,0; jne torn. rax=r14-r13 (bit_index); rdi=rax; call alloc_bit_set. rdi=rbx; rsi=[_alloc_state+8] (alloc_lba); rdx=1; rcx=&_alloc_bm_buf; call bdev_barrier_write; rdi=rax; call bbjw_check; cmp rax,0; jne torn. rax=r14 (candidate lba); return. (5) Scan path: rdi=rbx; call alloc_bm_ensure_loaded; cmp rax,0; jne torn. r14=r12 clamped to 0 if >=32768. Loop: cmp r14,32768 (ALLOC_BITMAP_BITS, safe direct imm per pdxfs_lite/alloc.pdx precedent); jae exhausted. rdi=r14; call alloc_bit_test; cmp rax,0; jne next (bit set = allocated). Found: rdi=r14; call alloc_bit_set. rdi=rbx; rsi=[_alloc_state+8]; rdx=1; rcx=&_alloc_bm_buf; call bdev_barrier_write; rdi=rax; call bbjw_check; cmp rax,0; jne torn. rax=r13+r14 (data_lba+bit_index); return. next: r14+=1; loop. exhausted: rax=ALLOC_EXHAUSTED. torn: rax=ALLOC_BITMAP_TORN. Reserved labels: alloc_bl_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+
+        lea r10, [rip + _alloc_state];
+        mov r13, [r10 + 24];
+
+        call alloc_free_stack_count;
+        cmp rax, 0;
+        je alloc_bl_scan;
+
+        // ---- reuse-from-free-stack path ----
+        call alloc_free_stack_pop;
+        mov r14, rax;
+
+        mov rdi, rbx;
+        call alloc_bm_ensure_loaded;
+        cmp rax, 0;
+        jne alloc_bl_torn;
+
+        mov rax, r14;
+        sub rax, r13;
+        mov rdi, rax;
+        call alloc_bit_set;
+
+        mov rdi, rbx;
+        lea r10, [rip + _alloc_state];
+        mov rsi, [r10 + 8];
+        mov rdx, 1;
+        lea rcx, [rip + _alloc_bm_buf];
+        call bdev_barrier_write;
+        mov rdi, rax;
+        call bbjw_check;
+        cmp rax, 0;
+        jne alloc_bl_torn;
+
+        mov rax, r14;
+        jmp alloc_bl_done;
+
+        // ---- linear-scan path ----
+      alloc_bl_scan:
+        mov rdi, rbx;
+        call alloc_bm_ensure_loaded;
+        cmp rax, 0;
+        jne alloc_bl_torn;
+
+        mov r14, r12;
+        cmp r14, 32768;
+        jb alloc_bl_scan_top;
+        xor r14, r14;
+
+      alloc_bl_scan_top:
+        cmp r14, 32768;
+        jae alloc_bl_exhausted;
+
+        mov rdi, r14;
+        call alloc_bit_test;
+        cmp rax, 0;
+        jne alloc_bl_scan_next;
+
+        mov rdi, r14;
+        call alloc_bit_set;
+
+        mov rdi, rbx;
+        lea r10, [rip + _alloc_state];
+        mov rsi, [r10 + 8];
+        mov rdx, 1;
+        lea rcx, [rip + _alloc_bm_buf];
+        call bdev_barrier_write;
+        mov rdi, rax;
+        call bbjw_check;
+        cmp rax, 0;
+        jne alloc_bl_torn;
+
+        mov rax, r13;
+        add rax, r14;
+        jmp alloc_bl_done;
+
+      alloc_bl_scan_next:
+        add r14, 1;
+        jmp alloc_bl_scan_top;
+
+      alloc_bl_exhausted:
+        mov rax, 0xFFFFED10;
+        jmp alloc_bl_done;
+
+      alloc_bl_torn:
+        mov rax, 0xFFFFED11;
+
+      alloc_bl_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // free_block(bdev_cap: u64, lba: u64) -> u64
+  //
+  //   Bounds-checks lba against [data_lba, data_lba + 32768), refuses
+  //   a double-free (bit already clear), clears the bit, durably
+  //   writes the bitmap block back, then pushes lba onto the LIFO free
+  //   stack (see header gap 4 for FREE_STACK_FULL's post-hoc posture).
+  // ============================================================================
+  pub let free_block : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (bdev_cap: u64) (lba: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { cap },
+      justification: "R52.M3-001 (#1692). 5-push prologue (rbx=bdev_cap, r12=lba, r13=data_lba, r14=bit_index, r15=unused-but-pushed for pattern uniformity) lands rsp%16==0 (entry rsp%16==8 + 40 = 48). Body: (1) rbx=bdev_cap(rdi), r12=lba(rsi). (2) r13=[_alloc_state+24] (data_lba). (3) cmp r12,r13; jb bad_bit (lba < data_lba, unsigned jb catches underflow). (4) r14=r12-r13 (bit_index); cmp r14,32768; jae bad_bit. (5) rdi=rbx; call alloc_bm_ensure_loaded; cmp rax,0; jne torn. (6) rdi=r14; call alloc_bit_test; cmp rax,0; je double (bit already clear). (7) rdi=r14; call alloc_bit_clear. (8) rdi=rbx; rsi=[_alloc_state+8] (alloc_lba); rdx=1; rcx=&_alloc_bm_buf; call bdev_barrier_write; rdi=rax; call bbjw_check; cmp rax,0; jne torn. (9) rdi=r12 (lba); call alloc_free_stack_push -- rax forwarded verbatim (0 or FREE_STACK_FULL) as this function's own return value. bad_bit: rax=FREE_BAD_BIT. double: rax=FREE_DOUBLE. torn: rax=ALLOC_BITMAP_TORN. Reserved labels: alloc_fb_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+
+        lea r10, [rip + _alloc_state];
+        mov r13, [r10 + 24];
+
+        cmp r12, r13;
+        jb alloc_fb_bad_bit;
+
+        mov r14, r12;
+        sub r14, r13;
+        cmp r14, 32768;
+        jae alloc_fb_bad_bit;
+
+        mov rdi, rbx;
+        call alloc_bm_ensure_loaded;
+        cmp rax, 0;
+        jne alloc_fb_torn;
+
+        mov rdi, r14;
+        call alloc_bit_test;
+        cmp rax, 0;
+        je alloc_fb_double;
+
+        mov rdi, r14;
+        call alloc_bit_clear;
+
+        mov rdi, rbx;
+        lea r10, [rip + _alloc_state];
+        mov rsi, [r10 + 8];
+        mov rdx, 1;
+        lea rcx, [rip + _alloc_bm_buf];
+        call bdev_barrier_write;
+        mov rdi, rax;
+        call bbjw_check;
+        cmp rax, 0;
+        jne alloc_fb_torn;
+
+        mov rdi, r12;
+        call alloc_free_stack_push;
+        jmp alloc_fb_done;
+
+      alloc_fb_bad_bit:
+        mov rax, 0xFFFFED13;
+        jmp alloc_fb_done;
+
+      alloc_fb_double:
+        mov rax, 0xFFFFED14;
+        jmp alloc_fb_done;
+
+      alloc_fb_torn:
+        mov rax, 0xFFFFED11;
+
+      alloc_fb_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

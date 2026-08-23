@@ -5875,6 +5875,38 @@ fi
 echo "[r52-m2-confine] R52.M2 (mkfs_upgrade) confined"
 
 # ---------------------------------------------------------------------------
+# R52.M3-001 (#1692): one-writer discipline for the bitmap block
+# allocator's scratch state.
+#
+#   * allocator (src/kernel/core/fs/pdxfs/allocator.pdx)
+#
+# _alloc_state (init_mark/alloc_lba/alloc_bcount/data_lba/bm_loaded_flag),
+# _alloc_bm_buf (the one resident 4-KiB bitmap block) and _alloc_bm_desc
+# (its BDEV_OP_READ_LBA descriptor page), and _alloc_free_stack /
+# _alloc_free_stack_state (the 16-entry LIFO free-block hint stack) are
+# all single-writer state confined to this one module -- a second writer
+# could race the resident bitmap block mid-scan/mid-writeback (torn
+# alloc/free), or corrupt the free-stack count between a push and a pop.
+R52_ALLOC_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/allocator.pdx"
+if [[ ! -f "${R52_ALLOC_SRC}" ]]; then
+    echo "[r52-m3-confine] FAIL - allocator.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_alloc_state'            'core/fs/pdxfs/allocator.o'
+ec_confine_one '_alloc_bm_buf'           'core/fs/pdxfs/allocator.o'
+ec_confine_one '_alloc_bm_desc'          'core/fs/pdxfs/allocator.o'
+ec_confine_one '_alloc_free_stack'       'core/fs/pdxfs/allocator.o'
+ec_confine_one '_alloc_free_stack_state' 'core/fs/pdxfs/allocator.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See allocator.pdx §Storage for the per-module one-writer" >&2
+    echo "  discipline (the sole writers are alloc_init, alloc_block," >&2
+    echo "  free_block, and their alloc_bm_*/alloc_bit_*/alloc_free_stack_*" >&2
+    echo "  helpers)." >&2
+    exit 1
+fi
+echo "[r52-m3-confine] R52.M3 (allocator) confined"
+
+# ---------------------------------------------------------------------------
 # R42-PREP-008 (#1630): one-writer discipline for the PdxFS userspace
 # directory iterator cursor table.
 #
