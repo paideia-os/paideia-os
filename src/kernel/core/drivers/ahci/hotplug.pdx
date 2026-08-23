@@ -1,0 +1,695 @@
+// src/kernel/core/drivers/ahci/hotplug.pdx -- R51.M6-006 (#1668).
+//
+// AHCI port hot-plug staging: PxIS.PCS/PRCS detect + SSTS.DET debounce,
+// dispatching to the present/absent transitions design/hardware/nvme-
+// ahci-tail-milestones.md (commit 2d6ab82) §2.M6 #1668 names. Substrate
+// anchor design/hardware/ahci-substrate.md §3.7 (hot-plug). Depends on
+// #1663..#1667 (all landed) -- every in-flight AHCI I/O op must survive
+// a mid-transfer revoke, which is exactly what #1662's cascade
+// (ahci_port_cap_revoke -> ahci_port_cascade_revoke_blkdev) already
+// guarantees.
+//
+// =============================================================================
+// SECTION 0  STATE MACHINE (design §2.M6 #1668, substrate §3.7)
+// =============================================================================
+//
+//   1. Read PxIS; capture PCS (present change) + PRCS (phy-ready
+//      change); clear both by writing the captured bits back (W1C).
+//   2. Read SSTS.DET:
+//        0x3 (present, phy established)     -> present transition.
+//        0x0 (no device)                    -> absent transition.
+//        0x1 (present, phy not established) -> debounce: bounded poll,
+//                                               re-classify on settle.
+//        other                              -> degrade + log; NO
+//                                               revoke fires until DET
+//                                               settles.
+//   3. SERR debounce: once DET has settled on a present/absent
+//      terminal transition, write ~0 to PxSERR to clear every error
+//      bit; otherwise the port stays interrupt-storming (design's own
+//      wording). NOT written for the "still degenerate" / degraded
+//      outcome -- design: "no revoke fires until DET settles", and by
+//      the same logic SERR is left alone so the raw bits remain
+//      observable for diagnosis.
+//
+// Present transition: re-run bring-up (idle -> bind CL/CT -> program
+// -> SIG check -> IDENTIFY DEVICE), either on an already-live row
+// (reconnect without remint, ahci_hp_present_transition_existing) or by
+// minting a fresh KIND_AHCI_PORT + dual KIND_BLKDEV pair first
+// (ahci_hp_mint_and_bring_up, new device -- SECTION 0b explains the
+// slot-ownership split).
+//
+// Absent transition: ahci_port_cap_revoke (#1662, already landed) --
+// the cascade already tears down the dual-kind KIND_BLKDEV child and
+// every open op on it. No new revoke logic is needed here; this file
+// only wraps that call with the hot-plug-specific REVOKE_ALREADY
+// remap and stats.
+//
+// =============================================================================
+// SECTION 0a  NOT YET WIRED TO AN INTERRUPT (DESIGN-DOC GAP)
+// =============================================================================
+//
+// design §2.M6 #1668 describes this file's top-level entry point as
+// extending "ahci/irq.pdx (M5 landed)" -- an IRQ dispatcher that reads
+// the HBA's global IS register (regs.pdx's AHCI_REG_IS) and hands each
+// set port bit off to a per-port service routine. Grepping this tree
+// at this commit finds no such file: drivers/ahci/ has no irq.pdx, and
+// nothing calls ahci_hba_reset / ahci_ctrl_bring_up / ahci_ctrl_probe_
+// and_mint / ahci_port_dual_kind_mint autonomously anywhere in the
+// kernel (confirmed by inspection; regs.pdx's own SECTION header
+// already documents this whole driver tree as "dormant at boot" until
+// a driver-attach path invokes it). This file's ahci_hp_service_row is
+// therefore, like every other M5/M6 AHCI entry point, reachable today
+// only via direct call (test harness / GDB script) -- it is written to
+// be the IRQ-dispatch target a future ahci/irq.pdx hands a set PCS/PRCS
+// port index off to, exactly the role design assigns it. Flagged for
+// softarch/debugger review; not a functional gap in what THIS issue
+// was asked to build (the state machine + transitions), only in the
+// interrupt plumbing that would drive it in a running system.
+//
+// =============================================================================
+// SECTION 0b  PRESENT-TRANSITION MINT REQUIRES CALLER-OWNED SLOTS
+//             (DESIGN-DOC GAP)
+// =============================================================================
+//
+// design's prose describes the present transition minting "a fresh
+// KIND_AHCI_PORT row" autonomously. ahci_port_dual_kind_mint (#1662,
+// kind_ahci_port.pdx) -- the ONLY mint path that exists -- takes
+// port_slot/blk_slot (cap-table slots in SOME cspace) and parent_slot
+// (a live KIND_AHCI_CONTROLLER slot) as caller-supplied arguments; it
+// has no notion of a kernel-autonomous/supervisor cspace to allocate
+// those from on its own, and none exists anywhere in this tree (the
+// PCIe hot-plug substrate's own established idiom -- cap/kind_pcie_
+// hotplug_event.pdx -- is the same shape: the kernel ISR publishes an
+// event, a RING-3 SUPERVISOR holding its own cspace decides what to
+// mint next). `ahci_hp_mint_and_bring_up` below therefore keeps
+// EXACTLY ahci_port_dual_kind_mint's own 6-argument, caller-supplied-
+// slot contract rather than inventing a slot source that does not
+// exist -- it is a thin, arity-compliant composition of two already-
+// landed calls (ahci_port_dual_kind_mint then ahci_port_bring_up_and_
+// identify), not a new capability-allocation mechanism. The decision
+// of WHICH present-transition function to call (this one, for "no
+// live row yet", vs ahci_hp_present_transition_existing, for "row
+// already live, just re-identify") is made by whatever caller also
+// owns the port_slot/blk_slot/parent_slot triple -- i.e. by the same
+// party design already expects to hold those slots for the initial,
+// non-hot-plug mint. Flagged for softarch/debugger review, same class
+// of gap as reliability.pdx SECTION 2 and port.pdx SECTION 0b.
+//
+// =============================================================================
+// SECTION 0c  DEBOUNCE IS A BOUNDED POLL, NOT A KIND_TIMER ONE-SHOT
+// =============================================================================
+//
+// design's prose: "arm a 50 ms one-shot timer via KIND_TIMER, re-poll
+// on expiry". No KIND_TIMER integration point exists anywhere in this
+// driver tree, and every other bounded wait in the AHCI driver (ahci_
+// port_idle's CR/FR polls, ahci_flush's completion poll, reliability.
+// pdx's TRIM poll) is a TSC-bounded busy poll via tsc_ns_to_ticks +
+// rdtsc, never a scheduled callback. ahci_hp_debounce_wait_settle
+// follows that same established idiom: a single bounded poll on DET
+// != 0x1, bounded at 500 ms -- matching design's OWN failure
+// description for AHCIHP_DEBOUNCE_TIMEOUT verbatim ("DET stuck at 0x1
+// after 500 ms"), not the 50 ms re-arm figure from the state-machine
+// prose (which describes a re-poll CADENCE for a callback-based
+// design this driver tree has no mechanism to implement; the 500 ms
+// FAILURE bound is the behavior actually specified and testable here).
+//
+// =============================================================================
+// SECTION 1  DEGRADED-PORT TRACKING
+// =============================================================================
+//
+// "other" DET encodings (design: "SERR bits are logged, port marked
+// degraded, no revoke fires until DET settles") are tracked in a
+// hotplug.pdx-local per-port-index flag array (_ahci_hp_degraded),
+// NOT as a new AHCIP_STATE_* enum value on the KIND_AHCI_PORT row
+// (kind_ahci_port.pdx's AHCIP_STATE_MINTED/IDENTIFIED pair is left
+// untouched by this issue) -- "degraded" is a hot-plug-transient
+// notion keyed on the physical port_index, meaningful whether or not
+// a cap row currently exists for that port, so it does not belong on
+// the row's own state byte.
+//
+// =============================================================================
+// SECTION 2  FAILURE TAXONOMY (extends the M6 band, design §7)
+// =============================================================================
+//
+//   AHCIHP_DEBOUNCE_TIMEOUT  0xFFFFECB5 -- design-named. DET stuck at
+//                              0x1 (present, phy not established) for
+//                              the full 500 ms bound.
+//   AHCIHP_MINT_FAILED       0xFFFFECB6 -- design-named. present
+//                              transition (new device) could not
+//                              mint -- ahci_port_dual_kind_mint
+//                              refused for any reason (most commonly
+//                              AHCIP_TAIL_ENOSPC / table-full, per
+//                              design's own parenthetical, but this
+//                              wrapper collapses every dual_kind_mint
+//                              refusal reason to this one code exactly
+//                              as design specifies a single named code
+//                              for this outcome -- unlike reliability.
+//                              pdx's FLUSH/TRIM paths, where design did
+//                              NOT name new codes and instructed
+//                              verbatim propagation of the richer
+//                              underlying ones).
+//   AHCIHP_REVOKE_ALREADY    0xFFFFECB7 -- design-named. absent
+//                              transition found the row already gone
+//                              (kind_ahci_port.pdx's own AHCIP_REVOKE_
+//                              ALREADY, 0xFFFFEC97, remapped to this
+//                              M6-band alias).
+//
+// Every other failure this file's calls can surface (AHCIP_BAD_SLOT,
+// any AHCIP_BRINGUP_*/AHCIP_MINT_BAD_*/AHCIP_IDENTIFY_* code from
+// ahci_port_bring_up_and_identify, any AHCIIO_*/AHCIREL_* code -- none
+// of those calls are made on this file's hot paths, but the mint/
+// bring-up composition can still surface them) is propagated verbatim,
+// matching reliability.pdx's own precedent for codes it does not own.
+//
+// =============================================================================
+// SECTION 3  paideia-as encoder-gap posture (v0.22.x)
+// =============================================================================
+//
+//   G1: every register access routes through drivers/ahci/regs.pdx's
+//       ahci_port_reg_u32(_set), which itself uses mov_d sized stores
+//       -- no direct sub-8-byte MMIO access in this file.
+//   G4: every sentinel comparison against a value with bit 31 (or 63)
+//       set (AHCIHP_DEBOUNCE_TIMEOUT, AHCIP_REVOKE_ALREADY, AHCIP_MAX
+//       ceiling checks reused from dual_kind_mint's own idiom) is
+//       staged through `mov r10, imm64; cmp reg, r10` rather than
+//       `cmp reg, imm` directly. Every failure-taxonomy constant this
+//       file RETURNS (never compares) is a plain `mov r64, imm64`
+//       target, matching port.pdx's documented carve-out.
+//   No `test`: every flag/bit check is `and reg, mask; cmp reg, 0;
+//       jne/je`.
+//   Every memory operand touching the note/stat/degraded arrays is
+//       `[base + index*8]` at 8-byte (u64) granularity -- never a
+//       byte-sized `mov_b [reg+reg]` -- so the SIB "must be written
+//       [reg + reg*1]" gap never arises in this file.
+//   Arity: every function here takes at most 6 args
+//       (ahci_hp_mint_and_bring_up, mirroring ahci_port_dual_kind_
+//       mint's own already-P0276-compliant 6-arg shape exactly);
+//       ahci_hp_service_row is 3 args.
+//
+// Reserved-label discipline: every label in this file is prefixed
+// `ahci_hp_` (this issue's own task text) -- no collision with `loop`,
+// `if`, `port`, `reset`, or any other paideia-as keyword.
+
+module Hotplug = structure {
+
+  pub let AHCIHP_DEBOUNCE_TIMEOUT : u64 = 0xFFFFECB5
+  pub let AHCIHP_MINT_FAILED      : u64 = 0xFFFFECB6
+  pub let AHCIHP_REVOKE_ALREADY   : u64 = 0xFFFFECB7
+
+  // ==========================================================================
+  // Stats table + degraded-port flags (SECTION 1).
+  // ==========================================================================
+
+  pub let mut _ahci_hp_stats    : [u64; 4]  = uninit @align(64)
+  pub let mut _ahci_hp_degraded : [u64; 32] = uninit @align(64)
+
+  pub let AHCIHP_ST_PRESENT   : u64 = 0
+  pub let AHCIHP_ST_ABSENT    : u64 = 1
+  pub let AHCIHP_ST_DEBOUNCES : u64 = 2
+  pub let AHCIHP_ST_DEGRADED  : u64 = 3
+  pub let AHCIHP_ST_MAX       : u64 = 4
+
+  pub let ahci_hp_dbg_msg : [u8; 16] = "AHCI HOTPLUG\0\0\0\0"
+
+  // ==========================================================================
+  // ahci_hp_table_reset() -> ()
+  //
+  // Clear every stat counter and every degraded flag. Boot and
+  // teardown only, mirrors kind_ahci_port.pdx's ahci_port_table_reset
+  // shape one-for-one.
+  // ==========================================================================
+  pub let ahci_hp_table_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M6-006 (#1668): clear every stat counter and degraded flag. Boot and teardown only. Labels prefixed ahci_hp_rs_.",
+      block: {
+        lea r10, [rip + _ahci_hp_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      ahci_hp_rs_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  ahci_hp_rs_stats;
+
+        lea r10, [rip + _ahci_hp_degraded];
+        xor rcx, rcx;
+      ahci_hp_rs_degraded:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  ahci_hp_rs_degraded;
+        ret
+      }
+    }
+
+  pub let ahci_hp_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M6-006 (#1668): bounded increment; out-of-range no-op. Mirrors ahci_port_note (kind_ahci_port.pdx) exactly. Labels prefixed ahci_hp_nt_.",
+      block: {
+        cmp rdi, 4;
+        jae ahci_hp_nt_out;
+        lea r10, [rip + _ahci_hp_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      ahci_hp_nt_out:
+        ret
+      }
+    }
+
+  pub let ahci_hp_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M6-006 (#1668): bounded read; out-of-range returns 0. Labels prefixed ahci_hp_st_.",
+      block: {
+        cmp rdi, 4;
+        jae ahci_hp_st_zero;
+        lea r10, [rip + _ahci_hp_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      ahci_hp_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_hp_degraded_set(port_index, val) -> ()  /  ahci_hp_degraded_get(port_index) -> u64
+  //
+  // Bounded (< 32) per-port-index degraded flag, independent of
+  // whether a KIND_AHCI_PORT row currently exists for the port
+  // (SECTION 1).
+  // ==========================================================================
+  pub let ahci_hp_degraded_set : (u64, u64) -> () !{mem} @{} =
+    fn (port_index: u64) (val: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M6-006 (#1668): bounded write; out-of-range no-op. Labels prefixed ahci_hp_ds_.",
+      block: {
+        cmp rdi, 32;
+        jae ahci_hp_ds_out;
+        lea r10, [rip + _ahci_hp_degraded];
+        mov [r10 + rdi * 8], rsi;
+      ahci_hp_ds_out:
+        ret
+      }
+    }
+
+  pub let ahci_hp_degraded_get : (u64) -> u64 !{mem} @{} =
+    fn (port_index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M6-006 (#1668): bounded read; out-of-range returns 0. Labels prefixed ahci_hp_dg_.",
+      block: {
+        cmp rdi, 32;
+        jae ahci_hp_dg_zero;
+        lea r10, [rip + _ahci_hp_degraded];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      ahci_hp_dg_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_hp_read_and_clear_is(abar_pa, port_index) -> u64
+  //
+  // Read PxIS; extract PCS|PRCS; if either is set, write EXACTLY those
+  // bits back (W1C) so only the hot-plug-relevant bits clear -- any
+  // OTHER pending PxIS cause (none is consumed by this driver today,
+  // but a future consumer should not have its own pending bit stolen
+  // by an unrelated hot-plug poll) is left untouched. Returns the
+  // masked (pre-clear) bits: 0 if neither fired.
+  // ==========================================================================
+  pub let ahci_hp_read_and_clear_is : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (abar_pa: u64) (port_index: u64) -> unsafe {
+      effects: { sysreg, mem }, capabilities: { boot },
+      justification: "R51.M6-006 (#1668): read PxIS (offset 0x10), mask to PCS(0x40)|PRCS(0x400000), and write only those bits back to clear them (W1C, AHCI 1.3.1 §3.3.8) -- skipped entirely if neither bit is set, so a spurious poll never issues an MMIO write. Three callee-save pushes (r12=abar_pa, r13=port_index, r14=masked result) leave rsp%16==0 (entry 8 -> 8+24=32, %16==0) for both nested calls. Labels prefixed ahci_hp_ric_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                    // abar_pa
+        mov r13, rsi;                    // port_index
+
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x10;                   // AHCI_PORT_REG_IS
+        call ahci_port_reg_u32;
+
+        mov r10, 0x00000040;             // AHCI_PXIS_PCS
+        mov r11, 0x00400000;             // AHCI_PXIS_PRCS
+        or  r10, r11;
+        and rax, r10;
+        mov r14, rax;                    // masked change bits
+
+        cmp r14, 0;
+        je  ahci_hp_ric_done;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, 0x10;                   // AHCI_PORT_REG_IS
+        mov rcx, r14;
+        call ahci_port_reg_u32_set;
+
+      ahci_hp_ric_done:
+        mov rax, r14;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_hp_read_det(abar_pa, port_index) -> u64
+  //
+  // Raw SSTS.DET (bits [3:0]) -- the authority the state machine
+  // classifies on. rdi/rsi (abar_pa/port_index) pass through unchanged
+  // into the delegate call; one padding push for alignment, mirroring
+  // drivers/ahci/port.pdx's ahci_port_read_sig exactly.
+  // ==========================================================================
+  pub let ahci_hp_read_det : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (abar_pa: u64) (port_index: u64) -> unsafe {
+      effects: { sysreg, mem }, capabilities: { boot },
+      justification: "R51.M6-006 (#1668): raw SSTS.DET read (offset 0x28), masked to [3:0]. One padding push (r12) for the single nested call; rdi/rsi pass through unchanged. Labels prefixed ahci_hp_rd_ (none needed -- straight-line).",
+      block: {
+        push r12;
+        mov rdx, 0x28;                   // AHCI_PORT_REG_SSTS
+        call ahci_port_reg_u32;
+        mov r10, 0xF;                    // AHCI_PXSSTS_DET_MASK
+        and rax, r10;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_hp_serr_clear(abar_pa, port_index) -> ()
+  //
+  // Write AHCI_PXSERR_CLEAR_ALL (~0) to PxSERR once a hot-plug
+  // transition has settled (design §2.M6 #1668 SERR-debounce step).
+  // ==========================================================================
+  pub let ahci_hp_serr_clear : (u64, u64) -> () !{sysreg, mem} @{boot} =
+    fn (abar_pa: u64) (port_index: u64) -> unsafe {
+      effects: { sysreg, mem }, capabilities: { boot },
+      justification: "R51.M6-006 (#1668): write-1-to-clear every PxSERR bit (offset 0x30) -- design's own debounce note: skip this and the port interrupt-storms. One padding push (r12); rdi/rsi (abar_pa/port_index) pass through unchanged. Labels prefixed ahci_hp_sc_ (none needed -- straight-line).",
+      block: {
+        push r12;
+        mov rdx, 0x30;                   // AHCI_PORT_REG_SERR
+        mov rcx, 0xFFFFFFFF;             // AHCI_PXSERR_CLEAR_ALL
+        call ahci_port_reg_u32_set;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_hp_debounce_wait_settle(abar_pa, port_index) -> u64
+  //
+  // TSC-bounded poll (500 ms, SECTION 0c) while DET == PRESENT_NOPHY
+  // (0x1). Returns the settled DET value (0/2/3/...) once it changes,
+  // or AHCIHP_DEBOUNCE_TIMEOUT if DET is still 0x1 after the bound.
+  // ==========================================================================
+  pub let ahci_hp_debounce_wait_settle : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (abar_pa: u64) (port_index: u64) -> unsafe {
+      effects: { sysreg, mem }, capabilities: { boot },
+      justification: "R51.M6-006 (#1668): 500 ms TSC-bounded poll on SSTS.DET != PRESENT_NOPHY(0x1), matching drivers/ahci/port.pdx's ahci_port_idle poll shape one-for-one. Three callee-save pushes (rbx=abar_pa, r12=port_index, r13=deadline) = 24 B; entry rsp%16==8 -> 32, %16==0 already (no pad, mirrors ahci_port_idle). Body: (1) rbx/r12 = args. (2) tsc_ns_to_ticks(500_000_000) + rdtsc-reconstruct -> deadline in r13. (3) Poll ahci_hp_db_poll: ahci_hp_read_det(rbx,r12); != 1 -> settled (rax already holds the settled DET value, propagated through unchanged since cmp does not modify it); else rdtsc-reconstruct now, >= r13 -> AHCIHP_DEBOUNCE_TIMEOUT (0xFFFFECB5, staged via r10 per G4 since it is a plain mov target here, not a cmp operand), else loop. Labels prefixed ahci_hp_db_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // abar_pa
+        mov r12, rsi;                    // port_index
+
+        mov rdi, 500000000;              // 500 ms bound (design: AHCIHP_DEBOUNCE_TIMEOUT)
+        call tsc_ns_to_ticks;
+        mov r13, rax;
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        add r13, rax;                    // deadline
+
+      ahci_hp_db_poll:
+        mov rdi, rbx;
+        mov rsi, r12;
+        call ahci_hp_read_det;
+        cmp rax, 1;                      // AHCI_PXSSTS_DET_PRESENT_NOPHY
+        jne ahci_hp_db_settled;
+
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        cmp rax, r13;
+        jae ahci_hp_db_timeout;
+        jmp ahci_hp_db_poll;
+
+      ahci_hp_db_settled:
+        jmp ahci_hp_db_out;
+
+      ahci_hp_db_timeout:
+        mov rax, 0xFFFFECB5;             // AHCIHP_DEBOUNCE_TIMEOUT
+
+      ahci_hp_db_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_hp_absent_transition(port_row_id) -> u64
+  //
+  // Wraps ahci_port_cap_revoke (#1662, already landed and already
+  // cascades to the dual-kind KIND_BLKDEV child + every open op),
+  // remapping its AHCIP_REVOKE_ALREADY to this file's own M6-band
+  // alias per design §2.M6 #1668's own failure-code naming.
+  // ==========================================================================
+  pub let ahci_hp_absent_transition : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (port_row_id: u64) -> unsafe {
+      effects: { mem, sysreg }, capabilities: { cap },
+      justification: "R51.M6-006 (#1668): call ahci_port_cap_revoke(port_row_id) (kind_ahci_port.pdx, #1662) -- already cascades to the dual-kind KIND_BLKDEV child and every open op. Remap AHCIP_REVOKE_ALREADY (0xFFFFEC97) to AHCIHP_REVOKE_ALREADY (0xFFFFECB7, staged via r10 per G4); every other return (0 success, or AHCIP_BAD_SLOT 0xFFFFEC96) propagates verbatim. One padding push (r12) for alignment; rdi (port_row_id) passes through unchanged. Labels prefixed ahci_hp_at_.",
+      block: {
+        push r12;
+
+        call ahci_port_cap_revoke;
+
+        mov r10, 0xFFFFEC97;             // AHCIP_REVOKE_ALREADY
+        cmp rax, r10;
+        jne ahci_hp_at_out;
+        mov rax, 0xFFFFECB7;             // AHCIHP_REVOKE_ALREADY
+
+      ahci_hp_at_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_hp_present_transition_existing(port_row_id) -> u64
+  //
+  // Reconnect-without-remint: the row is already live (it survived the
+  // blip -- e.g. a settle from DEBOUNCE straight back to PRESENT_PHY
+  // without ever passing through DET_NONE). Just re-run bring-up +
+  // IDENTIFY (idle/bind/program/SIG/IDENTIFY are all idempotent
+  // register operations per AHCI 1.3.1 §10.1/§10.3, so re-running them
+  // on an already-IDENTIFIED row is safe).
+  // ==========================================================================
+  pub let ahci_hp_present_transition_existing : (u64) -> u64 !{sysreg, mem} @{cap} =
+    fn (port_row_id: u64) -> unsafe {
+      effects: { sysreg, mem }, capabilities: { cap },
+      justification: "R51.M6-006 (#1668): thin passthrough to ahci_port_bring_up_and_identify (drivers/ahci/port.pdx, #1661) for a row that is already live. One padding push (r12); rdi (port_row_id) passes through unchanged. Labels prefixed ahci_hp_pe_ (none needed -- straight-line).",
+      block: {
+        push r12;
+        call ahci_port_bring_up_and_identify;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_hp_mint_and_bring_up(port_slot, blk_slot, parent_slot,
+  //                           port_rights, blk_rights, params_ptr) -> u64
+  //
+  // New device, no live row: mint a fresh KIND_AHCI_PORT + dual
+  // KIND_BLKDEV pair (ahci_port_dual_kind_mint, #1662), then bring the
+  // new row up + IDENTIFY it (ahci_port_bring_up_and_identify, #1661).
+  // If bring-up fails AFTER a successful mint, cascade-revoke the
+  // half-initialized row before returning so no port row leaks
+  // (design's own witness assertion: "no leaked port row"). SECTION 0b
+  // explains why this keeps ahci_port_dual_kind_mint's own caller-
+  // supplied-slot argument shape verbatim rather than inventing a
+  // slot source.
+  // ==========================================================================
+  pub let ahci_hp_mint_and_bring_up : (u64, u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (port_slot: u64) (blk_slot: u64) (parent_slot: u64) (port_rights: u64) (blk_rights: u64) (params_ptr: u64) -> unsafe {
+      effects: { mem, sysreg }, capabilities: { cap },
+      justification: "R51.M6-006 (#1668): compose ahci_port_dual_kind_mint (kind_ahci_port.pdx, #1662) then ahci_port_bring_up_and_identify (drivers/ahci/port.pdx, #1661). Three callee-save pushes (rbx=unused padding, r12=row_id, r13=bring-up failure code stashed across the cleanup revoke) leave rsp%16==0 (entry 8 -> 8+24=32, %16==0). Body: (1) call ahci_port_dual_kind_mint -- args already in rdi..r9, untouched. (2) `mov r10, 32 (AHCIP_MAX); cmp rax, r10; jae` -- any dual_kind_mint refusal (huge 0xFFFFEC8x/9x sentinel) is unsigned->= 32, a bare row_id (0..31) is not; refusal -> AHCIHP_MINT_FAILED (0xFFFFECB6), matching design's own single named code for this outcome (this wrapper deliberately collapses every dual_kind_mint refusal reason to it, unlike reliability.pdx's FLUSH/TRIM paths where design named no new code and instructed verbatim propagation instead). (3) row_id -> r12. (4) ahci_port_bring_up_and_identify(r12); success (0) -> return row_id; failure -> stash the failure code in r13, ahci_port_cap_revoke(r12) to scrub the half-initialized row (design: 'no leaked port row'), restore the stashed code into rax, propagate it verbatim (bring-up's own AHCIP_BRINGUP_*/AHCIP_MINT_BAD_*/AHCIP_IDENTIFY_* codes are richer than a single collapsed code, so -- unlike the mint-refusal case above -- these propagate through unchanged, matching reliability.pdx's own precedent for codes it does not own). Labels prefixed ahci_hp_mb_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        call ahci_port_dual_kind_mint;   // args already in rdi..r9
+
+        mov r10, 32;                     // AHCIP_MAX
+        cmp rax, r10;
+        jae ahci_hp_mb_mint_failed;
+
+        mov r12, rax;                    // row_id
+
+        mov rdi, r12;
+        call ahci_port_bring_up_and_identify;
+        cmp rax, 0;
+        je  ahci_hp_mb_ok;
+
+        mov r13, rax;                    // stash bring-up's own failure code
+        mov rdi, r12;
+        call ahci_port_cap_revoke;       // scrub the half-initialized row
+        mov rax, r13;                    // propagate the original failure
+        jmp ahci_hp_mb_out;
+
+      ahci_hp_mb_mint_failed:
+        mov rax, 0xFFFFECB6;             // AHCIHP_MINT_FAILED
+        jmp ahci_hp_mb_out;
+
+      ahci_hp_mb_ok:
+        mov rax, r12;                    // success: the new row_id
+
+      ahci_hp_mb_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_hp_service_row(port_row_id, abar_pa, port_index) -> u64
+  //
+  // Top-level orchestrator (SECTION 0a: the intended callee of a
+  // future ahci/irq.pdx PCS/PRCS dispatch) for a port that ALREADY has
+  // a row_id -- i.e. the reconnect-without-remint case, and the
+  // absent-transition case. A caller detecting DET==3 with NO existing
+  // row (a genuinely new device) calls ahci_hp_mint_and_bring_up
+  // directly instead (SECTION 0b: that path needs cap-table slots this
+  // function's 3-arg signature has no room for).
+  //
+  // Sequence (SECTION 0): read+clear PxIS.PCS/PRCS; read SSTS.DET;
+  // classify into present / absent / debounce / degraded; on a
+  // terminal present/absent outcome, run the transition then clear
+  // PxSERR; on "still degenerate after debounce settles" or an
+  // unrecognized DET encoding, mark the port degraded and log --
+  // neither revokes nor clears SERR (design: "no revoke fires until
+  // DET settles").
+  // ==========================================================================
+  pub let ahci_hp_service_row : (u64, u64, u64) -> u64 !{sysreg, mem} @{cap} =
+    fn (port_row_id: u64) (abar_pa: u64) (port_index: u64) -> unsafe {
+      effects: { sysreg, mem }, capabilities: { cap },
+      justification: "R51.M6-006 (#1668): the hot-plug state-machine orchestrator (SECTION 0). Five callee-save pushes (rbx=port_row_id, r12=abar_pa, r13=port_index, r14=transition result stashed across the settle-time SERR clear, r15=unused padding) leave rsp%16==0 (entry 8 -> 8+40=48, %16==0). Body: (1) ahci_hp_read_and_clear_is(r12,r13) -- result unused for branching (SSTS.DET is the classification authority; this call's only job is to stop the port re-signalling a stale PCS/PRCS bit). (2) ahci_hp_read_det(r12,r13) -> rax. (3) rax==3 (PRESENT_PHY) -> present path; rax==0 (NONE) -> absent path; rax==1 (PRESENT_NOPHY) -> debounce path; else -> degrade path. (4) Debounce path: bump AHCIHP_ST_DEBOUNCES, call ahci_hp_debounce_wait_settle(r12,r13); AHCIHP_DEBOUNCE_TIMEOUT (staged via r10 per G4) propagates straight out; settled==3 -> present path; settled==0 -> absent path; anything else falls through to the degrade path. (5) Present path: clear any prior degraded flag, bump AHCIHP_ST_PRESENT, call ahci_hp_present_transition_existing(rbx), stash the result in r14, call ahci_hp_serr_clear(r12,r13) (settle), restore rax from r14. (6) Absent path: same shape, ahci_hp_absent_transition(rbx) in place of the present call. (7) Degrade path: set the port's degraded flag, bump AHCIHP_ST_DEGRADED, return 0 -- no revoke, no SERR clear, per design. Labels prefixed ahci_hp_sr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // port_row_id
+        mov r12, rsi;                    // abar_pa
+        mov r13, rdx;                    // port_index
+
+        // (1) Read + W1C PxIS.PCS/PRCS.
+        mov rdi, r12;
+        mov rsi, r13;
+        call ahci_hp_read_and_clear_is;
+
+        // (2) Read SSTS.DET -- the classification authority.
+        mov rdi, r12;
+        mov rsi, r13;
+        call ahci_hp_read_det;
+
+        cmp rax, 3;                      // AHCI_PXSSTS_DET_PRESENT_PHY
+        je  ahci_hp_sr_present;
+        cmp rax, 0;                      // AHCI_PXSSTS_DET_NONE
+        je  ahci_hp_sr_absent;
+        cmp rax, 1;                      // AHCI_PXSSTS_DET_PRESENT_NOPHY
+        je  ahci_hp_sr_debounce;
+        jmp ahci_hp_sr_degrade;
+
+      ahci_hp_sr_debounce:
+        mov rdi, 2;                      // AHCIHP_ST_DEBOUNCES
+        call ahci_hp_note;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        call ahci_hp_debounce_wait_settle;
+
+        mov r10, 0xFFFFECB5;             // AHCIHP_DEBOUNCE_TIMEOUT
+        cmp rax, r10;
+        je  ahci_hp_sr_out;
+
+        cmp rax, 3;
+        je  ahci_hp_sr_present;
+        cmp rax, 0;
+        je  ahci_hp_sr_absent;
+        // fall through: settled on a still-degenerate DET encoding.
+
+      ahci_hp_sr_degrade:
+        mov rdi, r13;
+        mov rsi, 1;
+        call ahci_hp_degraded_set;
+        mov rdi, 3;                      // AHCIHP_ST_DEGRADED
+        call ahci_hp_note;
+        xor rax, rax;
+        jmp ahci_hp_sr_out;
+
+      ahci_hp_sr_present:
+        mov rdi, r13;
+        xor rsi, rsi;
+        call ahci_hp_degraded_set;
+        mov rdi, 0;                      // AHCIHP_ST_PRESENT
+        call ahci_hp_note;
+
+        mov rdi, rbx;
+        call ahci_hp_present_transition_existing;
+        mov r14, rax;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        call ahci_hp_serr_clear;
+
+        mov rax, r14;
+        jmp ahci_hp_sr_out;
+
+      ahci_hp_sr_absent:
+        mov rdi, r13;
+        xor rsi, rsi;
+        call ahci_hp_degraded_set;
+        mov rdi, 1;                      // AHCIHP_ST_ABSENT
+        call ahci_hp_note;
+
+        mov rdi, rbx;
+        call ahci_hp_absent_transition;
+        mov r14, rax;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        call ahci_hp_serr_clear;
+
+        mov rax, r14;
+
+      ahci_hp_sr_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
