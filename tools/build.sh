@@ -5677,6 +5677,11 @@ ec_confine_one '_pdxfs_txn_unlink_stage'    'core/cap/kind_pdxfs_txn.o'
 # M6 real-body ops boot witness's stage counter (only mutable static
 # in the fixture; the fingerprint and staged-name rodata are read-only).
 ec_confine_one '_pxor_stage'                'tests/kernel/pdxfs_txn/pdxfs_txn_ops_real_synth.o'
+# M8-003 (#1723) pkg-install boot witness's stage counter (only
+# mutable static in the fixture; the fingerprint and staged-name
+# rodata are read-only). Mirrors the _pxor_stage confinement above
+# one-for-one, one witness later in the same M8 subsystem.
+ec_confine_one '_pkgi_stage'                'boot/witness/pdxfs_pkg_install_smoke.o'
 ec_confine_one '_elevate_channel_table'     'core/cap/kind_elevate_channel.o'
 ec_confine_one '_elevate_channel_stats'     'core/cap/kind_elevate_channel.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then
@@ -6179,6 +6184,29 @@ if [[ "${EC_CONFINE_OK}" != "1" ]]; then
     exit 1
 fi
 echo "[r52-m5-confine] R52.M5-005 (mount_block) confined"
+
+# ---------------------------------------------------------------------------
+# R52.M8-004 (#1724): one-writer discipline for the clean-umount entry
+# point's scratch row.
+#
+#   * umount_block (umount_pdxfs_block, src/kernel/core/fs/pdxfs/
+#     umount_block.pdx)
+#
+# _umb_scratch is confined to this module alone -- it is written only
+# by umount_pdxfs_block itself (the sole function in this file). Same
+# shape as mount_block.pdx's _mpb_scratch confinement above.
+R52_UMOUNTBLK_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/umount_block.pdx"
+if [[ ! -f "${R52_UMOUNTBLK_SRC}" ]]; then
+    echo "[r52-m8-confine] FAIL - umount_block.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_umb_scratch' 'core/fs/pdxfs/umount_block.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See umount_block.pdx for the per-module one-writer discipline" >&2
+    echo "  (the sole writer is umount_pdxfs_block)." >&2
+    exit 1
+fi
+echo "[r52-m8-confine] R52.M8-004 (umount_block) confined"
 
 # ---------------------------------------------------------------------------
 # R52.M7-005 (#1719): one-writer discipline for the single-block-ahead
