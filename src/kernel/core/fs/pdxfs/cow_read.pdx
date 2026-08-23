@@ -84,6 +84,10 @@
 //   PXCR_ERR_NOT_FOUND      = 0xFFFFEFFB   pxcr_read: no mapping for lba
 //   PXCR_ERR_BAD_SNAPSHOT   = 0xFFFFEFFA   pxcr_snapshot_map: unknown snap
 //   PXCR_ERR_INTERNAL       = 0xFFFFEFF9   unreachable-fallthrough tripwire
+//   PXCR_ERR_BDEV_IO        = 0xFFFFEFF8   pxcr_bdev_read_lba: bbjw_check-rejected
+//                                          cap_invoke(BDEV_OP_READ_LBA) result
+//                                          (NVMEIO_PICK_NONE is accepted, not
+//                                          this code -- see the M7-003 helper).
 //
 // Reserved-label discipline: labels prefixed `pxcr_`.
 
@@ -102,6 +106,7 @@ module CowRead = structure {
   pub let PXCR_ERR_NOT_FOUND      : u64 = 0xFFFFEFFB
   pub let PXCR_ERR_BAD_SNAPSHOT   : u64 = 0xFFFFEFFA
   pub let PXCR_ERR_INTERNAL       : u64 = 0xFFFFEFF9
+  pub let PXCR_ERR_BDEV_IO        : u64 = 0xFFFFEFF8
 
   pub let PXCR_INIT_MARK  : u64 = 0xC024
   pub let PXCR_CACHE_EMPTY: u64 = 0xFFFFFFFFFFFFFFFF
@@ -111,6 +116,15 @@ module CowRead = structure {
   // 16 entries * 2 u64 = 32.
   pub let mut _pxcr_cache : [u64; 32]  = uninit @align(64)
   pub let mut _pxcr_state : [u64; 8]   = uninit @align(64)
+
+  // M7-003 (#1717): BDEV descriptor for the cache-mediated read helper
+  // pxcr_bdev_read_lba below. Shared across every read on the single-
+  // active-volume assumption (matches _journal_io_desc / _sb_read_desc /
+  // _itable_desc / _alloc_bm_desc / _bdw_write_desc / _mkfs_zero_desc).
+  // 4 quadwords = 32 B (lba / nblocks / dma_iova / status_out); @align(4096)
+  // so the low 12 bits are zero for op-code OR-packing per cap_handler_blkdev's
+  // descriptor-page discipline.
+  pub let mut _pxcr_bdev_desc : [u64; 4] = uninit @align(4096)
 
   // ==========================================================================
   // Reset. Clears chain (all zeroes), cache (all lba slots := EMPTY), and
@@ -564,6 +578,154 @@ module CowRead = structure {
         mov rdi, 0xFFFFEFFB;
         call pxcr_set_err;
         mov rax, 0xFFFFEFFB;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pxcr_bdev_read_lba(vol_slot, bdev_cap, lba, buf_ptr) -> u64
+  //
+  // M7-003 (#1717): cache-mediated LBA read helper. This is the wiring
+  // point named in design/filesystem/volume-fs-substrate.md §2.5 / §5.3
+  // ("Wire cache into cow_read.pdx + cow_write.pdx"): the R42 scaffold
+  // pxcr_read above resolves lba -> phys_blk from the chain log; this
+  // helper is the block-payload sibling that fills a 512 B buffer at
+  // buf_ptr from either the per-volume block cache (fast path) or the
+  // block device (slow path, followed by a cache insert so subsequent
+  // reads short-circuit).
+  //
+  // Fast path (cache hit):
+  //   1. block_cache_lookup(vol_slot, lba) returns a non-zero slot
+  //      pointer whose 512-byte data area lives at slot_ptr + 16
+  //      (BC_DATA_OFFSET, block_cache.pdx). Copy 512 B (64 quadwords)
+  //      from slot_ptr+16 into buf_ptr. Return 0.
+  //
+  // Slow path (cache miss):
+  //   2. block_cache_lookup returns 0 (miss sentinel).
+  //   3. Stamp _pxcr_bdev_desc: [+0]=lba, [+8]=nblocks=1, [+16]=buf_ptr
+  //      (dma_iova destination), [+24]=status_out=0.
+  //   4. cap_invoke(bdev_cap, &_pxcr_bdev_desc | BDEV_OP_READ_LBA(3)).
+  //   5. Route the raw result through bbjw_check (bdev_barrier.pdx):
+  //      accepts BDEV_ERR_OK(0) and NVMEIO_PICK_NONE(0xFFFFEC58), rejects
+  //      anything else. This matches the substrate-tolerance posture
+  //      inode_table.itable_ensure_block_loaded and allocator.pdx already
+  //      take -- the SQ-live-none case is a smoke-boot condition, not an
+  //      I/O failure.
+  //   6a. bbjw_check reject -> PXCR_ERR_BDEV_IO (0xFFFFEFF8), sticky.
+  //   6b. bbjw_check accept AND raw cap_invoke result == 0 (true OK, the
+  //       driver actually filled the buffer) -> block_cache_insert(vol_slot,
+  //       lba, buf_ptr). Insert failure is non-fatal on the read path
+  //       (caller already has valid data); ignore its return.
+  //   6c. bbjw_check accept AND raw cap_invoke result == NVMEIO_PICK_NONE
+  //       -> return 0 WITHOUT block_cache_insert, because buf_ptr contents
+  //       are undefined (the driver never populated it). Caller sees the
+  //       same "soft success, buffer stale" contract every other bbjw_check-
+  //       gated substrate call site produces.
+  //
+  // Register plan: 6-push callee-save prologue (rbx=vol_slot, rbp=bdev_cap,
+  // r12=lba, r13=buf_ptr, r14=slot_ptr / desc_ptr scratch, r15=saved raw
+  // cap_invoke result across the nested bbjw_check call) + sub rsp,8 pad
+  // (6*8=48, entry rsp%16==8 -> 56 -> +8 = 64, %16==0) keep rsp%16==0
+  // across every nested call. Labels prefixed pxcr_brl_.
+  // ==========================================================================
+
+  pub let pxcr_bdev_read_lba : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (vol_slot: u64, bdev_cap: u64, lba: u64, buf_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "M7-003 (#1717): cache-mediated LBA read helper. See the section header above for the six-step body; register plan is documented there. Six callee-save pushes (rbx=vol_slot, rbp=bdev_cap, r12=lba, r13=buf_ptr, r14=slot_ptr / desc_ptr scratch, r15=saved raw cap_invoke result) + sub rsp,8 pad leave rsp%16==0 across every nested call (entry rsp%16==8, 6*8=48 -> 56, +8 -> 64, %16==0). block_cache_lookup / cap_invoke / bbjw_check / block_cache_insert are all nested. Miss sentinel from block_cache_lookup is 0 (no BSS lives at address 0 in the kernel image). NVMEIO_PICK_NONE distinction preserved by stashing cap_invoke's raw rax in r15 (callee-save) before bbjw_check clobbers rax; on accept, r15==0 gates the cache_insert. Labels prefixed pxcr_brl_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                          // vol_slot
+        mov rbp, rsi;                          // bdev_cap
+        mov r12, rdx;                          // lba
+        mov r13, rcx;                          // buf_ptr
+
+        // Cache probe. block_cache_lookup(vol_slot, lba) -> slot data ptr
+        // on hit, 0 on miss.
+        mov rdi, rbx;
+        mov rsi, r12;
+        call block_cache_lookup;
+        cmp rax, 0;
+        je  pxcr_brl_miss;
+
+        // Hit: memcpy 512 B (64 quadwords) from slot_ptr + BC_DATA_OFFSET
+        // (16) into buf_ptr. BC_DATA_OFFSET is folded into the effective
+        // address so the loop uses a bare [base + idx*8].
+        mov r14, rax;                          // slot ptr (metadata base)
+        add r14, 16;                           // BC_DATA_OFFSET -> data area
+        xor rcx, rcx;
+      pxcr_brl_hcp:
+        mov rax, [r14 + rcx * 8];
+        mov [r13 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 64;
+        jb  pxcr_brl_hcp;
+
+        xor eax, eax;
+        jmp pxcr_brl_out;
+
+      pxcr_brl_miss:
+        // Stamp descriptor page.
+        lea r14, [rip + _pxcr_bdev_desc];
+        mov [r14 + 0], r12;                    // lba
+        mov rax, 1;
+        mov [r14 + 8], rax;                    // nblocks
+        mov [r14 + 16], r13;                   // dma_iova = buf_ptr
+        xor rax, rax;
+        mov [r14 + 24], rax;                   // status_out
+
+        // cap_invoke(bdev_cap, desc | BDEV_OP_READ_LBA(3)).
+        mov rdi, rbp;
+        mov rsi, r14;
+        mov r10, 3;
+        or  rsi, r10;
+        call cap_invoke;
+        mov r15, rax;                          // save raw result
+
+        mov rdi, rax;
+        call bbjw_check;
+        cmp rax, 0;
+        jne pxcr_brl_err;
+
+        // bbjw_check accepted. If raw result was 0 (true OK) the driver
+        // filled the buffer; populate the cache. If raw result was
+        // NVMEIO_PICK_NONE, skip the insert (buffer stale) but still
+        // return 0 to match the codebase-wide substrate-tolerance
+        // contract.
+        cmp r15, 0;
+        jne pxcr_brl_ok_noins;
+
+        mov rdi, rbx;                          // vol_slot
+        mov rsi, r12;                          // lba
+        mov rdx, r13;                          // buf_ptr
+        call block_cache_insert;
+        // block_cache_insert's return is ignored: cache-insert failure is
+        // non-fatal on the read path (caller already has valid bytes).
+
+      pxcr_brl_ok_noins:
+        xor eax, eax;
+        jmp pxcr_brl_out;
+
+      pxcr_brl_err:
+        mov rdi, 0xFFFFEFF8;                   // PXCR_ERR_BDEV_IO
+        call pxcr_set_err;
+        mov rax, 0xFFFFEFF8;
+
+      pxcr_brl_out:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
         ret
       }
     }
