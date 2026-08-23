@@ -6366,6 +6366,45 @@ fi
 echo "[r53-m3-001-confine] R53.M3-001 (_root_volume_uuid + _valid) confined"
 
 # ---------------------------------------------------------------------------
+# R53.M5-006 (#1759): milestone close-out for the volume-lifecycle
+# confinement requirement -- design/tooling/volume-lifecycle-mechanism.md
+# §9.M5 names this as "confine _pdxb_volume_table and any new _*_stats".
+#
+# `_pdxb_volume_table` is the design-doc shorthand for the KIND_VOLUME
+# row-table lineage that lives under the pdxb (PdxFS-block v1) volume
+# umbrella.  In the landed code that lineage is realised as four
+# per-module single-writer state cells, ALL ALREADY CONFINED by the
+# R52.M5 blocks earlier in this file:
+#
+#   * _volume_table          -- kind_volume.pdx        (R52.M5-001 #1703)
+#   * _volume_stats          -- kind_volume.pdx        (R52.M5-001 #1703)
+#   * _volume_registry_stats -- volume_registry.pdx    (R52.M5-004 #1706)
+#   * _pdxfs_probe_stats     -- probe.pdx              (R52.M5-004 #1706)
+#
+# The R53 M5 siblings (#1754 audit_schema AUD_EV_* additions +
+# aud_kind_valid ceiling bump, #1755 sys_mount real emit, #1756 probe
+# emit, #1757 boot-fallback fingerprint, #1758 AHCI probe parity) do
+# NOT introduce a new `_*_stats` or `_*_table` symbol.  #1758 grows
+# _pdxfs_probe_stats from [u64;4] to [u64;8] to add family-aware scan
+# indices (PBP_ST_SCANNED_NVME=3, PBP_ST_SCANNED_AHCI=4), but the
+# confined SYMBOL name and its sole writer (pdxfs_probe_note in
+# probe.pdx) do not change -- the existing R52.M5-004 confine still
+# holds after the array widening.  #1754's aud_kind_valid ceiling
+# bump (0x1A3 -> 0x1A5, admitting KIND_PDXFS_MOUNT_TABLE 0x1A5) and
+# AUD_EV_MOUNT..AUD_EV_REPLAY_TRUNCATED additions touch audit_schema.pdx
+# alone; that file owns no confined state.
+#
+# This close-out block is documentation-only -- a re-assertion of the
+# above ec_confine_one calls would be vacuous (the same symbol against
+# the same owner) and would clutter the build log with redundant
+# `[r53-m5-006-confine]` OK lines.  A future R53 sibling that
+# introduces a NEW `_pdxb_*` table or stats symbol (or any other
+# single-writer state cell tied to the volume-lifecycle path) MUST
+# add its own ec_confine_one block here, matching the R52.M5-001 /
+# R52.M5-004 posture above, rather than piggy-backing on this note.
+echo "[r53-m5-006-confine] R53.M5-006 close-out -- pdxb volume-table lineage discharged by R52.M5-001/M5-004 confines"
+
+# ---------------------------------------------------------------------------
 # R52.M7-005 (#1719): one-writer discipline for the single-block-ahead
 # read-prefetch primitive.
 #
