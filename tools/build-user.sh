@@ -16,6 +16,7 @@ ECHO_CLIENT_LINK_SCRIPT="${USER_SRC}/echo_client.ld"
 ACPI_SUPERVISOR_LINK_SCRIPT="${USER_SRC}/acpi_supervisor.ld"
 PCI_ENUMERATOR_LINK_SCRIPT="${USER_SRC}/pci_enumerator.ld"
 AUDIO_SUPERVISOR_LINK_SCRIPT="${USER_SRC}/audio_supervisor.ld"
+ELEVATE_BROKER_DAEMON_LINK_SCRIPT="${USER_SRC}/elevate_broker_daemon.ld"
 
 if [[ ! -f "${SHELL_LINK_SCRIPT}" ]]; then
     echo "shell linker script missing: ${SHELL_LINK_SCRIPT}" >&2
@@ -62,6 +63,11 @@ if [[ ! -f "${AUDIO_SUPERVISOR_LINK_SCRIPT}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${ELEVATE_BROKER_DAEMON_LINK_SCRIPT}" ]]; then
+    echo "elevate_broker_daemon linker script missing: ${ELEVATE_BROKER_DAEMON_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 
@@ -76,6 +82,7 @@ ECHO_CLIENT_OBJECTS=()
 ACPI_SUPERVISOR_OBJECTS=()
 PCI_ENUMERATOR_OBJECTS=()
 AUDIO_SUPERVISOR_OBJECTS=()
+ELEVATE_BROKER_DAEMON_OBJECTS=()
 AML_OBJECTS=()
 LIBS_OBJECTS=()
 
@@ -121,6 +128,15 @@ while IFS= read -r -d '' pdx; do
         # Sidecar seeds TWO cap slots (14 = RPC endpoint at endpoint_id=5,
         # 15 = reserved endpoint at endpoint_id=6).
         AUDIO_SUPERVISOR_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "elevate_broker_daemon.pdx" ]]; then
+        # R48-PREP-005.M2 (design/services/svc-elevate-broker-registration.md):
+        # elevate_broker_daemon.pdx is self-contained (inlines its two IPC
+        # syscalls + sys_debug_puts) so its object goes to its own set only
+        # — no library pull-in. Sidecar seeds ONE cap slot (16, chosen as
+        # the next free absolute slot per design/capabilities/loader-
+        # seeded-slot-allocation.md §3 — the design doc's own draft named
+        # slot 8, which collides with acpi_supervisor's live slot).
+        ELEVATE_BROKER_DAEMON_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "pci_enumerator.pdx" ]]; then
         # R22-M3-005 (#860): pci_enumerator.pdx is self-contained (inlines
         # its two IPC syscalls — sys_ipc_recv + sys_ipc_reply) so its object
@@ -385,6 +401,32 @@ if [[ ${#AUDIO_SUPERVISOR_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/audio_supervisor.elf"
     echo "[ok] ${BUILD_DIR}/audio_supervisor.bin"
+fi
+
+# Link elevate_broker_daemon.elf with elevate_broker_daemon objects only
+# (R48-PREP-005.M2, design/services/svc-elevate-broker-registration.md §4.M2).
+# Self-contained (inlines sys_ipc_recv/sys_ipc_reply/sys_debug_puts); mirrors
+# echo_server.elf / acpi_supervisor.elf pattern. Declares an `_init_caps`
+# sidecar with ONE entry: cap_slot 16 -> RPC endpoint (endpoint_id=16 =
+# ELEVATE_BROKER_ENDPOINT_ID, R_IPC_ALL). Unlike acpi_supervisor / pci_
+# enumerator / audio_supervisor (still kernel-witness-driven at this round),
+# this binary is spawned as a REAL ring-3 task by init's third fork+exec
+# cycle (src/user/init.pdx) and embedded into tmpfs at /bin/
+# elevate_broker_daemon by the kernel's tmpfs seed block (src/kernel/boot/
+# witness/bin_seeds.pdx), mirroring how /bin/sh and /bin/child_hello are
+# seeded + execve'd.
+if [[ ${#ELEVATE_BROKER_DAEMON_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T elevate_broker_daemon.ld -> elevate_broker_daemon.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${ELEVATE_BROKER_DAEMON_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/elevate_broker_daemon.elf" \
+        "${ELEVATE_BROKER_DAEMON_OBJECTS[@]}"
+
+    echo "[objcopy-user] elevate_broker_daemon.elf -> elevate_broker_daemon.bin"
+    objcopy -O binary "${BUILD_DIR}/elevate_broker_daemon.elf" "${BUILD_DIR}/elevate_broker_daemon.bin"
+
+    echo "[ok] ${BUILD_DIR}/elevate_broker_daemon.elf"
+    echo "[ok] ${BUILD_DIR}/elevate_broker_daemon.bin"
 fi
 
 # R31.M2-1595 (#1595): PT_LOAD extent gate over every image linked above.

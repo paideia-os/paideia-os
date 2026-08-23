@@ -5,6 +5,7 @@
 # R20b.M5-001 (#1563): Embed echo_server (R20b userspace-server closure witness).
 # R20b.M6-003 (#1566): Embed echo_client (dual-endpoint RPC target-shape).
 # R30.M9-002 (#1086):  Embed acpi_supervisor (userspace ACPICA bubble target).
+# R48-PREP-005.M2:     Embed elevate_broker_daemon (svc.elevate-broker drainer).
 .section .rodata.userbin, "a", @progbits
 .balign 4096
 .global _shell_bin_start
@@ -55,4 +56,11 @@ _audio_supervisor_bin_start:
 .incbin "build/user/audio_supervisor.elf"
 .global _audio_supervisor_bin_end
 _audio_supervisor_bin_end:
+.balign 4096
+# R48-PREP-005.M2: elevate_broker_daemon userspace image.
+.global _elevate_broker_daemon_bin_start
+_elevate_broker_daemon_bin_start:
+.incbin "build/user/elevate_broker_daemon.elf"
+.global _elevate_broker_daemon_bin_end
+_elevate_broker_daemon_bin_end:
 .balign 4096

@@ -310,6 +310,22 @@ bin_true_seed_ok_msg: .ascii "BIN TRUE SEED OK\n\0"
 .align 8
 bin_true_seed_fail_msg: .ascii "BIN TRUE SEED FAIL\n\0"
 
+# R48-PREP-005.M2 (design/services/svc-elevate-broker-registration.md
+# §4.M2): /bin/elevate_broker_daemon tmpfs seed strings + markers.
+# Mirrors bin_true_seed's pattern (which mirrors bin_sh_seed / D10a's
+# bin_child_hello_seed).
+.global elevate_broker_daemon_seed_name
+.align 8
+elevate_broker_daemon_seed_name: .ascii "elevate_broker_daemon\0"
+
+.global bin_elevate_broker_daemon_seed_ok_msg
+.align 8
+bin_elevate_broker_daemon_seed_ok_msg: .ascii "BIN ELEVATE BROKER DAEMON SEED OK\n\0"
+
+.global bin_elevate_broker_daemon_seed_fail_msg
+.align 8
+bin_elevate_broker_daemon_seed_fail_msg: .ascii "BIN ELEVATE BROKER DAEMON SEED FAIL\n\0"
+
 # logging-m9-001 (#708): KIND_DMESG cap witness strings and markers.
 # See design/kernel/kernel-logging-substrate.md §12.10 + §14 Q6.
 .global dmesg_cap_ok_msg
