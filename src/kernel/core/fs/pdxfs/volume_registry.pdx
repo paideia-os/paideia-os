@@ -1,0 +1,436 @@
+// src/kernel/core/fs/pdxfs/volume_registry.pdx -- R52.M5-004 (#1706)
+//
+// PDXFS-ON-BLOCK v1 -- VOLUME REGISTRY (uuid -> KIND_VOLUME row lookup
+// + probe-time insertion).
+//
+// -----------------------------------------------------------------------------
+// Scope
+// -----------------------------------------------------------------------------
+//
+// Per design/filesystem/r52-implementation-plan.md §2.5 step 4 (#1706)
+// and design/filesystem/volume-fs-substrate.md §3.4: "The volume
+// registry is a 16-row table (`_pdxfs_volume_table`) ... each row:
+// {uuid[16], device_slot:u16, superblock_summary:{...}, mount_slot:u16,
+// refcount:u32}."
+//
+// `kind_volume.pdx` (#1703, already landed) is the module that OWNS
+// that 16-row table (`_volume_table` there) plus the row-level
+// primitives (`volume_tail_alloc`/`_tail_valid`/`_tail_free`, per-field
+// `volume_row_*` getters, and the `volume_row_*_set` setters that
+// module's own header explicitly reserves for "#1706/#1707 to populate
+// superblock-derived fields post-mint" -- see kind_volume.pdx's file
+// header, section "WHY KIND_VOLUME DERIVES OVER KIND_MEMORY" /
+// "TAIL ENCODING". This file does NOT re-declare that storage (a
+// second `_volume_table` would violate the one-writer-per-table
+// discipline `tools/build.sh`'s `ec_confine_one` already enforces
+// against `kind_volume.o`) -- it is the thin "uuid -> row_id" lookup
+// + probe-time-insertion LAYER on top of that storage, exactly the
+// role `journal_ondisk.pdx`'s own header (#1704, §8) anticipates:
+// "This module does not itself gate vol_slot against a live
+// KIND_VOLUME row -- that authority lives in volume_registry.pdx
+// (#1706, not yet landed)." The authority in question is
+// `volume_tail_valid`, already exported by kind_volume.pdx; this file
+// adds the UUID-indexed lookup kind_volume.pdx's own row shape has no
+// primitive for (its accessors are all row_id-keyed, not uuid-keyed).
+//
+// Design-doc note (flagged, mirroring this codebase's convention of
+// calling out design-vs-landed-implementation gaps explicitly rather
+// than silently reconciling them): the substrate doc's row sketch
+// above names `device_slot`, a nested `superblock_summary` (itable_lba/
+// alloc_lba/journal_lba/data_lba/root_inode/mount_gen), `mount_slot`,
+// and `refcount`. The row `kind_volume.pdx` actually landed at #1703
+// carries `device_slot`, `mount_slot`, `root_inode`, `mount_gen`,
+// `inode_count`, `free_blocks`, `sig_key_slot` -- root_inode and
+// mount_gen are the only two superblock-summary fields it persists
+// (itable_lba/alloc_lba/journal_lba/data_lba are re-read from a live
+// superblock buffer by whichever M5+/M7 module needs them, not cached
+// on the volume row; #1707/M7 may revisit this if a cache-miss-free
+// fast path turns out to need them resident). There is no `refcount`
+// field on the landed row. `volume_row_populate` below stamps exactly
+// the two fields the landed row actually has setters for
+// (`volume_row_root_inode_set` / `volume_row_mount_gen_set`); it takes
+// the FULL validated superblock buffer pointer as its second argument
+// (not a narrower "summary" struct) so a future round that needs more
+// fields can read them without this function's signature changing.
+//
+// This file also does NOT verify the volume's ML-DSA-65 signature
+// against a loaded `KIND_SIG_KEY` (`design/filesystem/
+// volume-fs-substrate.md` §3.1 step 4 / §6.4's "Volume mount
+// cross-checks superblock.sig_key_hash == KIND_SIG_KEY.key_hash").
+// design/filesystem/r52-implementation-plan.md §2.5's own
+// implementation-order text for #1706 narrows the milestone to
+// "iterate every live KIND_BLKDEV, BD_OP_READ_LBA(0), magic gate,
+// register" -- no sig-verify step -- and reserves
+// `VOL_MOUNT_KEY_MISMATCH` (kind_volume.pdx, 0xFFFFED24) for
+// "#1706/#1707" without assigning it a call site here. Sig
+// cross-checking is a MOUNT-time act per §6.4's own wording ("Volume
+// mount cross-checks..."), i.e. #1707 (`mount.pdx`'s
+// `MOUNT_BACKEND_PDXFS_BLOCK` arm), not a probe-time act; flagged here
+// (mirroring superblock.pdx's own design-doc-gap-note style) so #1707
+// does not assume this file already closed that gate.
+//
+// -----------------------------------------------------------------------------
+// Idempotency (design/filesystem/volume-fs-substrate.md §3.1)
+// -----------------------------------------------------------------------------
+//
+// "The probe module is idempotent: probing a device twice at the same
+// mount_gen finds the existing row rather than duplicating it."
+// `volume_registry_register` implements exactly this: it always
+// `volume_registry_find`s by uuid first, and returns the EXISTING
+// row_id unchanged (no re-populate, no re-insert) on a hit. A volume
+// whose on-disk `mount_gen` advanced between two probes of the same
+// uuid is not re-synced by this call -- that is a live-remount
+// concern for a later round (flagged, not a #1706 gap: no caller in
+// this milestone re-probes a live row).
+//
+// -----------------------------------------------------------------------------
+// Arity discipline (design/filesystem/r52-implementation-plan.md §5.1)
+// -----------------------------------------------------------------------------
+//
+// §5.1's table names this exact hazard: "probe.pdx | volume_row_populate
+// | Would be 6+ if superblock summary passed as fields | Pass
+// superblock_summary_ptr (arity 2 total with vol_slot)." `volume_row_populate`
+// below is exactly `(vol_slot, sb_ptr) -> ()`, arity 2. `volume_registry_find`
+// is arity 2 (uuid_lo, uuid_hi). `volume_registry_insert` is arity 3
+// (device_slot, uuid_lo, uuid_hi) -- one below kind_volume.pdx's own
+// `volume_tail_alloc` arity (3) plus nothing extra, since it forwards
+// straight through. `volume_registry_register`, the top-level entry
+// `probe.pdx` calls, is arity 4 (device_slot, uuid_lo, uuid_hi, sb_ptr)
+// -- comfortably under the ceiling.
+//
+// -----------------------------------------------------------------------------
+// Register discipline
+// -----------------------------------------------------------------------------
+//
+// Every function below that issues a nested `call` pushes exactly the
+// callee-save registers it needs to keep its own arguments alive
+// across those calls, per journal_ondisk.pdx's documented rule: odd
+// push counts land rsp%16==0 with no pad (SysV-entry rsp%16==8, N
+// pushes -> (8*(N+1))%16); even push counts take an explicit
+// `sub rsp, 8` pad. `volume_registry_note` / `volume_registry_stat`
+// are leaves (no nested call, only caller-save scratch) and need no
+// prologue at all, matching `volume_note`/`volume_stat`'s own shape in
+// kind_volume.pdx.
+//
+// -----------------------------------------------------------------------------
+// mov_b / no-test / label-prefix discipline
+// -----------------------------------------------------------------------------
+//
+// No byte-granularity access anywhere in this file (every field
+// touched is a whole qword: uuid halves, row_id, sb_ptr fields via the
+// `sb_*` accessors). No `test` instruction; every branch uses
+// `cmp reg, imm` / `cmp reg, reg` + `je`/`jne`/`jae`. Every label is
+// prefixed `vreg_<fn>_` (`vreg_fnd_`, `vreg_ins_`, `vreg_reg_`) --
+// distinct from `kind_volume.pdx`'s own `vol_*` prefixes and from
+// every other module's reserved prefixes (grep audit 2026-08-23: no
+// `vreg_` hits anywhere in `src/kernel/`).
+//
+// -----------------------------------------------------------------------------
+// Failure taxonomy
+// -----------------------------------------------------------------------------
+//
+// This file declares no NEW failure codes -- every non-zero /
+// non-row-id return it can produce is forwarded verbatim from
+// `kind_volume.pdx` (`VOL_TAIL_BAD_ARG` 0xFFFFED22, `VOL_REGISTRY_FULL`
+// 0xFFFFED25, both already in the R52.M5 band
+// 0xFFFFED20..ED27). `VOL_ROW_NONE` (0xFF) is the "no such uuid" /
+// "not a live row" sentinel `volume_registry_find` returns, matching
+// `kind_volume.pdx`'s own `VOL_ROW_NONE` constant value (re-stated
+// here as a literal per this codebase's "constants are re-declared,
+// not cross-file-imported" convention -- see superblock.pdx's header
+// note on the same point).
+
+module VolumeRegistry = structure {
+
+  // ============================================================================
+  // Stats. 0 = LOOKUPS, 1 = HITS, 2 = INSERTS, 3 = REFUSED.
+  // ============================================================================
+
+  pub let mut _volume_registry_stats : [u64; 4] = uninit @align(64)
+
+  pub let VREG_ST_LOOKUPS : u64 = 0
+  pub let VREG_ST_HITS    : u64 = 1
+  pub let VREG_ST_INSERTS : u64 = 2
+  pub let VREG_ST_REFUSED : u64 = 3
+  pub let VREG_ST_MAX     : u64 = 4
+
+  pub let VREG_ROW_NONE : u64 = 0xFF   // re-stated from kind_volume.pdx's VOL_ROW_NONE
+  pub let VREG_MAX       : u64 = 16    // re-stated from kind_volume.pdx's VOL_MAX
+
+  pub let volume_registry_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-004 (#1706): bounded increment; out-of-range no-op. Leaf, mirrors kind_volume.pdx's volume_note. Labels: none needed (single branch).",
+      block: {
+        cmp rdi, 4;
+        jae vreg_nt_out;
+        lea r10, [rip + _volume_registry_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      vreg_nt_out:
+        ret
+      }
+    }
+
+  pub let volume_registry_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-004 (#1706): bounded read; out-of-range returns 0. Leaf, mirrors kind_volume.pdx's volume_stat.",
+      block: {
+        cmp rdi, 4;
+        jae vreg_st_zero;
+        lea r10, [rip + _volume_registry_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      vreg_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // volume_registry_find(uuid_lo, uuid_hi) -> row_id | VREG_ROW_NONE (0xFF)
+  //
+  // Linear low-first scan over the 16 KIND_VOLUME rows (kind_volume.pdx's
+  // _volume_table, reached only through its own exported accessors --
+  // this function never touches that table's memory directly). A row
+  // must be tail_valid (in_use) AND match both uuid halves to count.
+  // 3-push prologue (rbx=uuid_lo, r12=uuid_hi, r13=row_id) lands
+  // rsp%16==0 with no pad (odd push count).
+  // ==========================================================================
+  pub let volume_registry_find : (u64, u64) -> u64 !{mem} @{} =
+    fn (uuid_lo: u64) (uuid_hi: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-004 (#1706): uuid -> row_id lookup over kind_volume.pdx's 16-row table via its own exported accessors (volume_tail_valid / volume_row_uuid_lo / volume_row_uuid_hi) -- no direct _volume_table access from this file. 3-push prologue (rbx=uuid_lo, r12=uuid_hi, r13=row_id) lands rsp%16==0 (odd count, no pad), needed because each loop iteration issues up to three nested calls. Body: bump VREG_ST_LOOKUPS once at entry; xor r13,r13 (row_id=0); loop top: cmp r13,16; jae miss. rdi=r13; call volume_tail_valid; cmp rax,0; je next (dead row, skip). rdi=r13; call volume_row_uuid_lo; cmp rax,rbx; jne next. rdi=r13; call volume_row_uuid_hi; cmp rax,r12; jne next. Match: bump VREG_ST_HITS, mov rax,r13, jmp out. next: add r13,1; jmp loop top. miss: mov rax,0xFF (VREG_ROW_NONE). Reserved labels: vreg_fnd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // uuid_lo
+        mov r12, rsi;                    // uuid_hi
+
+        mov rdi, 0;                      // VREG_ST_LOOKUPS
+        call volume_registry_note;
+
+        xor r13, r13;                    // row_id = 0
+
+      vreg_fnd_top:
+        cmp r13, 16;
+        jae vreg_fnd_miss;
+
+        mov rdi, r13;
+        call volume_tail_valid;
+        cmp rax, 0;
+        je vreg_fnd_next;
+
+        mov rdi, r13;
+        call volume_row_uuid_lo;
+        cmp rax, rbx;
+        jne vreg_fnd_next;
+
+        mov rdi, r13;
+        call volume_row_uuid_hi;
+        cmp rax, r12;
+        jne vreg_fnd_next;
+
+        mov rdi, 1;                      // VREG_ST_HITS
+        call volume_registry_note;
+        mov rax, r13;
+        jmp vreg_fnd_out;
+
+      vreg_fnd_next:
+        add r13, 1;
+        jmp vreg_fnd_top;
+
+      vreg_fnd_miss:
+        mov rax, 0xFF;                   // VREG_ROW_NONE
+
+      vreg_fnd_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // volume_registry_insert(device_slot, uuid_lo, uuid_hi)
+  //   -> row_id | VOL_TAIL_BAD_ARG (0xFFFFED22) | VOL_REGISTRY_FULL (0xFFFFED25)
+  //
+  // Direct kernel-trusted registration -- NOT the user-facing
+  // volume_cap_mint_inner ceremony (that path requires a caller-held
+  // KIND_MEMORY parent cap with RIGHT_MINT, which a boot-time device
+  // walker does not hold on anyone's behalf). Packs the row header via
+  // volume_hdr_pack(device_slot, mount_slot=0xFFFF -- "not yet
+  // mounted", matching kind_volume.pdx's own documented sentinel) then
+  // claims a row via volume_tail_alloc, both already-exported
+  // kind_volume.pdx primitives. This mirrors §3.4's own framing: probe
+  // populates the registry; a mount slot is installed later,
+  // independently, by #1707 -- "mount is an authoritative act, not an
+  // implicit side effect of probe."
+  //
+  // 2-push prologue (rbx=uuid_lo, r12=uuid_hi) + sub rsp,8 pad (even
+  // count) -- device_slot is consumed once by volume_hdr_pack and not
+  // needed again.
+  // ==========================================================================
+  pub let volume_registry_insert : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (device_slot: u64) (uuid_lo: u64) (uuid_hi: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-004 (#1706): kernel-trusted row claim, bypassing the cap-mint ceremony (no caller-held parent cap exists at probe time). 2-push prologue (rbx=uuid_lo, r12=uuid_hi) + sub rsp,8 pad lands rsp%16==0 (even count). Body: rbx=uuid_lo(rsi), r12=uuid_hi(rdx), rdi=device_slot(rdi, unmodified) then rsi=0xFFFF (mount_slot sentinel); call volume_hdr_pack. Bad-pack detection: volume_hdr_pack's own header documents 'Bits [63:56] MUST leave this function zero' on success and returns all-ones (0xFFFFFFFFFFFFFFFF) on failure -- so mov r10,rax; shr r10,56; cmp r10,0; jne bad is a cheaper, immediate-safe test than comparing against the full sentinel (device_slot is a cap_table slot < 256 in every real caller, so this path is defensive, not expected to fire). Else rdi=rax(hdr), rsi=rbx(uuid_lo), rdx=r12(uuid_hi); call volume_tail_alloc; forward its return verbatim (row_id < 16, or VOL_TAIL_BAD_ARG/VOL_REGISTRY_FULL). Bump VREG_ST_INSERTS on a row_id result, VREG_ST_REFUSED otherwise. Reserved labels: vreg_ins_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rsi;                    // uuid_lo
+        mov r12, rdx;                    // uuid_hi
+
+        mov rsi, 0xFFFF;                 // mount_slot = unmounted
+        call volume_hdr_pack;
+
+        mov r10, rax;
+        shr r10, 56;
+        cmp r10, 0;
+        jne vreg_ins_bad_pack;
+
+        mov rdi, rax;                    // hdr
+        mov rsi, rbx;                    // uuid_lo
+        mov rdx, r12;                    // uuid_hi
+        call volume_tail_alloc;
+
+        mov r10, 16;                     // VOL_MAX
+        cmp rax, r10;
+        jae vreg_ins_refused;
+
+        mov r10, rax;
+        mov rdi, 2;                      // VREG_ST_INSERTS
+        call volume_registry_note;
+        mov rax, r10;
+        jmp vreg_ins_out;
+
+      vreg_ins_bad_pack:
+        mov rax, 0xFFFFED22;             // VOL_TAIL_BAD_ARG
+
+      vreg_ins_refused:
+        mov r10, rax;
+        mov rdi, 3;                      // VREG_ST_REFUSED
+        call volume_registry_note;
+        mov rax, r10;
+
+      vreg_ins_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // volume_row_populate(vol_slot, sb_ptr) -> ()
+  //
+  // Stamps the superblock-derived fields the landed KIND_VOLUME row
+  // actually has setters for (root_inode, mount_gen -- see this file's
+  // header design-doc note on why inode_count/free_blocks/sig_key_slot
+  // stay at their mint-time defaults here). sb_ptr is a validated
+  // superblock buffer (e.g. sb_read's return), read via superblock.pdx's
+  // own accessors -- never dereferenced directly here.
+  //
+  // 2-push prologue (rbx=vol_slot, r12=sb_ptr) + sub rsp,8 pad.
+  // Silent no-op on a dead vol_slot (the row-setters themselves are
+  // tail_valid-gated; this function does not duplicate that check).
+  // ==========================================================================
+  pub let volume_row_populate : (u64, u64) -> () !{mem} @{} =
+    fn (vol_slot: u64) (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-004 (#1706): stamp root_inode + mount_gen from a validated superblock buffer onto a KIND_VOLUME row. 2-push prologue (rbx=vol_slot, r12=sb_ptr) + sub rsp,8 pad lands rsp%16==0 (even count). Body: rbx=vol_slot(rdi), r12=sb_ptr(rsi). rdi=r12; call sb_root_inode; rdi=rbx, rsi=rax; call volume_row_root_inode_set (tail_valid-gated internally; dead row is a no-op, matching kind_volume.pdx's own documented setter contract). rdi=r12; call sb_mount_gen; rdi=rbx, rsi=rax; call volume_row_mount_gen_set. No return value. Reserved labels: none (straight-line, no branches).",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // vol_slot
+        mov r12, rsi;                    // sb_ptr
+
+        mov rdi, r12;
+        call sb_root_inode;
+        mov rdi, rbx;
+        mov rsi, rax;
+        call volume_row_root_inode_set;
+
+        mov rdi, r12;
+        call sb_mount_gen;
+        mov rdi, rbx;
+        mov rsi, rax;
+        call volume_row_mount_gen_set;
+
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // volume_registry_register(device_slot, uuid_lo, uuid_hi, sb_ptr)
+  //   -> row_id | VOL_TAIL_BAD_ARG | VOL_REGISTRY_FULL
+  //
+  // The single entry point probe.pdx calls per validated device.
+  // Idempotent (design/filesystem/volume-fs-substrate.md §3.1): a
+  // uuid already present in the registry returns its existing row_id
+  // unchanged, no re-insert, no re-populate. A new uuid is inserted
+  // then populated from sb_ptr in one call.
+  //
+  // 4-push prologue (rbx=device_slot, r12=uuid_lo, r13=uuid_hi,
+  // r14=sb_ptr) + sub rsp,8 pad (even count).
+  // ==========================================================================
+  pub let volume_registry_register : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (device_slot: u64) (uuid_lo: u64) (uuid_hi: u64) (sb_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M5-004 (#1706): top-level probe-time registration entry point. 4-push prologue (rbx=device_slot, r12=uuid_lo, r13=uuid_hi, r14=sb_ptr) + sub rsp,8 pad lands rsp%16==0 (even count). Body: save all four args (all SysV arg regs are caller-save and would not survive the first nested call). rdi=r12, rsi=r13; call volume_registry_find. cmp rax,0xFF (VREG_ROW_NONE); jne hit (existing row -- return as-is, idempotent no-op per module header). Else: rdi=rbx, rsi=r12, rdx=r13; call volume_registry_insert. mov r10,16 (VOL_MAX); cmp rax,r10; jae done (forward VOL_TAIL_BAD_ARG/VOL_REGISTRY_FULL verbatim -- no populate on a failed insert). row_id (rax) is moved into r12 -- device_slot/uuid_lo, both dead by this point, is no longer needed in rbx/r12, so this reuses r12 rather than pushing a fifth callee-save register; rdi=r12, rsi=r14; call volume_row_populate; mov rax,r12 (restore the return value after the call). hit: fall through to done with rax already holding the row_id/result. Reserved labels: vreg_reg_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // device_slot
+        mov r12, rsi;                    // uuid_lo
+        mov r13, rdx;                    // uuid_hi
+        mov r14, rcx;                    // sb_ptr
+
+        mov rdi, r12;
+        mov rsi, r13;
+        call volume_registry_find;
+        mov r10, 0xFF;                   // VREG_ROW_NONE
+        cmp rax, r10;
+        jne vreg_reg_done;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        call volume_registry_insert;
+
+        mov r10, 16;                     // VOL_MAX
+        cmp rax, r10;
+        jae vreg_reg_done;
+
+        mov r12, rax;                    // row_id (device_slot/uuid_lo in rbx/r12 are
+                                          // dead by this point -- reuse r12, no extra push)
+        mov rdi, r12;
+        mov rsi, r14;
+        call volume_row_populate;
+        mov rax, r12;
+
+      vreg_reg_done:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

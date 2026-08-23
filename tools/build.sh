@@ -6062,6 +6062,53 @@ fi
 echo "[r52-m5-confine] R52.M5-002 (journal_ondisk) confined"
 
 # ---------------------------------------------------------------------------
+# R52.M5-004 (#1706): one-writer discipline for the volume registry's
+# own observability counters.
+#
+#   * volume_registry (uuid -> KIND_VOLUME row_id lookup + probe-time
+#     insertion, src/kernel/core/fs/pdxfs/volume_registry.pdx)
+#
+# _volume_registry_stats is confined to this module alone -- it does
+# NOT re-declare kind_volume.pdx's own _volume_table/_volume_stats
+# (this file only calls that module's exported accessors/setters, it
+# never touches that table's memory directly; see volume_registry.pdx
+# §Scope). The sole writer of this counter block is volume_registry_note.
+R52_VREG_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/volume_registry.pdx"
+if [[ ! -f "${R52_VREG_SRC}" ]]; then
+    echo "[r52-m5-confine] FAIL - volume_registry.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_volume_registry_stats' 'core/fs/pdxfs/volume_registry.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See volume_registry.pdx for the per-module one-writer" >&2
+    echo "  discipline (the sole writer is volume_registry_note)." >&2
+    exit 1
+fi
+echo "[r52-m5-confine] R52.M5-004 (volume_registry) confined"
+
+# ---------------------------------------------------------------------------
+# R52.M5-004 (#1706): one-writer discipline for the volume-probe
+# walker's own observability counters.
+#
+#   * probe (iterate every live KIND_BLKDEV, validate + register,
+#     src/kernel/core/fs/pdxfs/probe.pdx)
+#
+# _pdxfs_probe_stats is confined to this module alone. The sole writer
+# is pdxfs_probe_note.
+R52_PROBE_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/probe.pdx"
+if [[ ! -f "${R52_PROBE_SRC}" ]]; then
+    echo "[r52-m5-confine] FAIL - probe.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_pdxfs_probe_stats' 'core/fs/pdxfs/probe.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See probe.pdx for the per-module one-writer discipline" >&2
+    echo "  (the sole writer is pdxfs_probe_note)." >&2
+    exit 1
+fi
+echo "[r52-m5-confine] R52.M5-004 (probe) confined"
+
+# ---------------------------------------------------------------------------
 # R42-PREP-008 (#1630): one-writer discipline for the PdxFS userspace
 # directory iterator cursor table.
 #
