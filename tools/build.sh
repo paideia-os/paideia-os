@@ -5907,6 +5907,69 @@ fi
 echo "[r52-m3-confine] R52.M3 (allocator) confined"
 
 # ---------------------------------------------------------------------------
+# R52.M4-002 (#1698): one-writer discipline for the inode table's
+# resident-block scratch state.
+#
+#   * inode_table (src/kernel/core/fs/pdxfs/inode_table.pdx)
+#
+# _itable_state (init_mark/itable_lba/itable_bcount/loaded_block_idx),
+# _itable_blk_buf (the one resident 4-KiB inode-table block) and
+# _itable_desc (its BDEV_OP_READ_LBA descriptor page), and
+# _itable_row_scratch / _itable_alloc_scratch (the 128-byte row copies
+# inode_read/inode_alloc_fresh hand back to callers or splice into a
+# fresh row before inode_write) are all single-writer state confined to
+# this one module -- a second writer could race the resident inode-table
+# block mid-read/mid-splice/mid-writeback (torn inode read/write), or
+# hand a caller a row-scratch pointer whose contents another writer
+# overwrites before the caller is done with it.
+R52_ITABLE_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/inode_table.pdx"
+if [[ ! -f "${R52_ITABLE_SRC}" ]]; then
+    echo "[r52-m4-confine] FAIL - inode_table.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_itable_state'         'core/fs/pdxfs/inode_table.o'
+ec_confine_one '_itable_blk_buf'       'core/fs/pdxfs/inode_table.o'
+ec_confine_one '_itable_desc'          'core/fs/pdxfs/inode_table.o'
+ec_confine_one '_itable_row_scratch'   'core/fs/pdxfs/inode_table.o'
+ec_confine_one '_itable_alloc_scratch' 'core/fs/pdxfs/inode_table.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See inode_table.pdx §Storage for the per-module one-writer" >&2
+    echo "  discipline (the sole writers are itable_init," >&2
+    echo "  itable_ensure_block_loaded, inode_read, inode_write," >&2
+    echo "  inode_alloc_fresh, and inode_scrub_slot)." >&2
+    exit 1
+fi
+echo "[r52-m4-confine] R52.M4-002 (inode_table) confined"
+
+# ---------------------------------------------------------------------------
+# R52.M4-003 (#1699): one-writer discipline for KIND_INODE_HANDLE.
+#
+#   * kind_inode_handle (KIND_INODE_HANDLE = 0x1A2, over KIND_PDXFS_FILE)
+#
+# _inode_handle_table + _inode_handle_stats are the only places in the
+# kernel where inode-handle authority lives. A second writer would let
+# one caller mutate a handle row (change inode_lba, forge a vol_slot,
+# silently bump cached_gen) with no capability involved. Per-module
+# confinement is what makes that unreachable by construction; the sole
+# writers are inode_handle_tail_alloc / _tail_free / _row_cached_gen_set
+# / _note / _table_reset (all in kind_inode_handle.pdx).
+R52_INDH_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_inode_handle.pdx"
+if [[ ! -f "${R52_INDH_SRC}" ]]; then
+    echo "[r52-m4-confine] FAIL - kind_inode_handle.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_inode_handle_table' 'core/cap/kind_inode_handle.o'
+ec_confine_one '_inode_handle_stats' 'core/cap/kind_inode_handle.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_inode_handle.pdx §1 for the per-module one-writer" >&2
+    echo "  discipline (the sole writers are inode_handle_tail_alloc + " >&2
+    echo "  inode_handle_tail_free + inode_handle_note + " >&2
+    echo "  inode_handle_table_reset)." >&2
+    exit 1
+fi
+echo "[r52-m4-confine] R52.M4 (KIND_INODE_HANDLE) confined"
+
+# ---------------------------------------------------------------------------
 # R42-PREP-008 (#1630): one-writer discipline for the PdxFS userspace
 # directory iterator cursor table.
 #
