@@ -4894,7 +4894,8 @@ echo "[pdxfs-upg-confine] R42.M4 entry-point arities pinned"
 #                         is arity-only: a widening that adds a fifth
 #                         parameter to a packer is how a caller-supplied
 #                         ceiling reaches the wire.
-#   nvme_write.pdx     -- the FS-side batcher. _nvw_sq is the SQ (64
+#   bdev_write.pdx     -- the FS-side batcher (renamed from nvme_write.pdx
+#                         at R51.M7-005 / #1673). _nvw_sq is the SQ (64
 #                         entries * 4 u64), _nvw_state is the counter
 #                         block. A second writer would let a caller
 #                         "acknowledge a completion for a cid the CoW
@@ -4910,22 +4911,22 @@ echo "[pdxfs-upg-confine] R42.M4 entry-point arities pinned"
 #                         without going through dur_set_level", losing
 #                         a durability guarantee on a crash.
 FSC_SRC="${REPO_ROOT}/src/kernel/core/ipc/fs_channel.pdx"
-NVW_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/nvme_write.pdx"
+NVW_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/bdev_write.pdx"
 DUR_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/durability.pdx"
 if [[ ! -f "${FSC_SRC}" || ! -f "${NVW_SRC}" || ! -f "${DUR_SRC}" ]]; then
     echo "[pdxfs-r42-close-confine] FAIL - one of the R42-close source files missing" >&2
     exit 1
 fi
-ec_confine_one '_nvw_sq'      'core/fs/pdxfs/nvme_write.o'
-ec_confine_one '_nvw_state'   'core/fs/pdxfs/nvme_write.o'
+ec_confine_one '_nvw_sq'      'core/fs/pdxfs/bdev_write.o'
+ec_confine_one '_nvw_state'   'core/fs/pdxfs/bdev_write.o'
 ec_confine_one '_dur_lvl'     'core/fs/pdxfs/durability.o'
 ec_confine_one '_dur_state'   'core/fs/pdxfs/durability.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then
-    echo "  See src/kernel/core/fs/pdxfs/{nvme_write,durability}.pdx §2/§3" >&2
+    echo "  See src/kernel/core/fs/pdxfs/{bdev_write,durability}.pdx §2/§3" >&2
     echo "  for the per-module one-writer discipline." >&2
     exit 1
 fi
-echo "[pdxfs-r42-close-confine] R42 (fs_channel + nvme_write + durability) state confined"
+echo "[pdxfs-r42-close-confine] R42 (fs_channel + bdev_write + durability) state confined"
 
 # ARITY PINS for the R42-close entry points. A widening on any of these
 # makes "smuggle a ceiling into the schema", "acknowledge a completion
