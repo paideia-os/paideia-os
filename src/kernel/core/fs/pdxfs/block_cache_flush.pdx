@@ -1,0 +1,438 @@
+// src/kernel/core/fs/pdxfs/block_cache_flush.pdx -- R52.M7-004 (#1718)
+//
+// PDXFS-ON-BLOCK v1 -- WRITE-BACK TICK + BD_OP_FLUSH CADENCE (N=32).
+//
+// -----------------------------------------------------------------------------
+// Scope
+// -----------------------------------------------------------------------------
+//
+// Per design/filesystem/volume-fs-substrate.md §5.3
+// ("Data-region blocks: write-back. After JOP_COMMIT has been fsynced,
+// in-place data-region writes go to the cache and are flushed by the
+// writeback pass on a periodic tick or on cache pressure. The writeback
+// pass issues BD_OP_FLUSH after every N=32 writes to bound the crash-
+// loss window.") and §7.M7 ("R52.M7-004 Land write-back tick +
+// BD_OP_FLUSH cadence (every 32 writes)").
+//
+// This file implements the CADENCE HALF of the write-back pass: a
+// monotonic write counter bumped every time the tick entry point fires,
+// and a "once every N=32" gate that (a) drains the block cache's dirty
+// slots via `block_cache_flush_all` and (b) issues `BD_OP_FLUSH` on the
+// mounted-root PdxFS-block volume's underlying bdev via `jnl_bdev_flush`
+// so the bdev's own write cache commits to media. Together those two
+// steps bound the crash-loss window to at most 32 writes' worth of
+// dirty data-region blocks, which is what §5.3's "bound the crash-loss
+// window" language asks for.
+//
+// -----------------------------------------------------------------------------
+// Sibling coordination -- #1715 (block_cache.pdx) + #1717 (cow_read/cow_write)
+// -----------------------------------------------------------------------------
+//
+// The task brief that landed this file explicitly names two sibling
+// milestones in-flight:
+//
+//   * #1715 -- `block_cache.pdx`: 256-slot per-volume CLOCK cache pool.
+//     Provides the `block_cache_flush_all()` and `block_cache_mark_
+//     dirty(vol_slot, lba)` primitives this file's tick body invokes.
+//   * #1717 -- rewire `cow_read.pdx`/`cow_write.pdx` through the new
+//     block cache (retires the R42 `_pxcw_blocks` scaffold ring).
+//
+// This file is deliberately CADENCE-ONLY: it OWNS the write counter
+// and the every-32-writes gate, and it INVOKES `block_cache_flush_all`
+// by symbol (link-time-resolved once #1715 lands). It does NOT touch
+// `block_cache.pdx`'s own tables (`_block_cache_slots` / `_stats` /
+// `_hand` per the R52 implementation plan §7.M7), and it does NOT edit
+// `cow_write.pdx` to install the `block_cache_flush_tick` call site --
+// that wiring belongs to #1715 (calling `block_cache_flush_tick` from
+// inside `block_cache_mark_dirty`, the "one-shot bump + tick check"
+// the task brief describes) or, equivalently, to #1717's cow_write
+// rewrite (whose write path is what ultimately calls `mark_dirty`).
+// Either wiring is one line -- `call block_cache_flush_tick;` -- with
+// no argument marshalling, exactly because this file's entry point is
+// arity 0.
+//
+// Explicit dependency ordering: this file cannot link cleanly until
+// `block_cache.pdx` exposes `block_cache_flush_all` as a public symbol.
+// A build attempt with this file present but #1715 not yet landed will
+// fail at link with an unresolved reference to `block_cache_flush_all`
+// -- the coordinator (main / this repo's loop shape) is expected to
+// land #1715 first, then this file, or land them in one build round.
+// The tick's OTHER two calls (`volume_row_device_slot` in
+// `core/cap/kind_volume.pdx` #1703, `jnl_bdev_flush` in
+// `core/fs/pdxfs/journal_ondisk.pdx` #1704) are already landed on main
+// as of the commit this file is authored against and need no wait.
+//
+// -----------------------------------------------------------------------------
+// Mount-root resolution -- mirrors pdxfs_txn_commit_wal (#1712)
+// -----------------------------------------------------------------------------
+//
+// The tick's BD_OP_FLUSH step needs to know WHICH bdev to flush. R52.M7
+// mounts a single root PdxFS-block volume at `_mount_table
+// [MOUNT_ROOT_SLOT=0]`; the tick resolves that vol_slot the same way
+// `pdxfs_txn_commit_wal` (`src/kernel/core/cap/kind_pdxfs_txn.pdx`
+// #1712) and the ABORT / CREATE / RENAME / UNLINK arms (#1713/#1709/
+// #1710/#1711) all do:
+//
+//   1. Load the packed root-slot qword from `_mount_table + 0`.
+//   2. Extract `backend_type` = bits [32,40); refuse (silent no-op)
+//      unless it equals `MOUNT_BACKEND_PDXFS_BLOCK` (5).
+//   3. Extract `vol_slot` = bits [48,64).
+//   4. `volume_row_device_slot(vol_slot)` -> `bdev_cap` (or
+//      `VOL_DECODE_BAD` = 0xFFFFFFFFFFFFFFFF for a dead row -- also
+//      treated as a silent no-op, matching pdxfs_txn_commit_wal's own
+//      posture).
+//
+// A tick call before the root is mounted is a success no-op: nothing
+// to flush, no error to raise. This matches pdxfs_txn_commit_wal's
+// documented "no-mount-is-not-an-error" arm. The counter is still
+// bumped (the write happened at the caller's layer whether or not the
+// bdev is available), which keeps the every-32-writes cadence steady
+// across mount / unmount events without a discontinuity.
+//
+// -----------------------------------------------------------------------------
+// Failure taxonomy -- none new; forwards flush_all + jnl_bdev_flush errors
+// -----------------------------------------------------------------------------
+//
+// This file declares NO new failure codes. `block_cache_flush_tick`
+// returns:
+//   * 0 (BCF_OK)                   -- success, whether or not the tick
+//                                     fired (per §5.3 the cadence is
+//                                     opportunistic; a caller cannot
+//                                     tell "flushed this call" from
+//                                     "skipped this call" from the
+//                                     return code alone -- the tick
+//                                     count accessor is the observation
+//                                     surface for that).
+//   * `block_cache_flush_all` error -- forwarded verbatim (whatever
+//                                     that returns on partial-flush
+//                                     failure; the #1715 header will
+//                                     freeze that band).
+//   * `jnl_bdev_flush` error       -- forwarded verbatim (typically
+//                                     JNL_CSUM_BAD = 0xFFFFED21,
+//                                     which journal_ondisk.pdx reuses
+//                                     for every bdev-I/O failure per
+//                                     its own header gap 3).
+//
+// Whichever failing call's code is returned is ALSO latched into
+// `_block_cache_flush_stats[+16]` (last_flush_err) as a
+// sticky-last-write field so a boot witness can observe "did the last
+// flush succeed" without instrumenting every tick site. This matches
+// cow_write.pdx's own last-error latching idiom on `_pxcw_state[+8]`
+// (but sticky-last-write rather than first-writer-wins, since the tick
+// interval is short and the more useful observation is "is the CURRENT
+// state clean" rather than "what was the FIRST failure ever seen").
+//
+// -----------------------------------------------------------------------------
+// Arity discipline
+// -----------------------------------------------------------------------------
+//
+// Every entry point in this file is arity 0 or 1. `block_cache_flush_
+// tick`, `block_cache_flush_reset`, `block_cache_write_count`, and the
+// three flush-stat accessors are all arity 0. All well under the
+// codebase's arity-6 ceiling.
+//
+// -----------------------------------------------------------------------------
+// Register discipline
+// -----------------------------------------------------------------------------
+//
+// `block_cache_flush_tick` issues nested calls (`block_cache_flush_all`,
+// `volume_row_device_slot`, `jnl_bdev_flush`) but keeps ZERO callee-
+// save state alive across them (every value it needs at each step is
+// re-derived from either the just-returned `rax`, or from a fresh
+// `lea` of `_mount_table` / `_block_cache_write_count`), so it needs
+// no `push rbx`/`push r12..r15` prologue at all -- only a `sub rsp, 8`
+// alignment pad to land `rsp % 16 == 0` for the SysV ABI call
+// convention (SysV-entry `rsp % 16 == 8` per the retaddr, +8 pad =>
+// 0). This mirrors volume_registry.pdx's leaf-shape idiom for stat
+// accessors, extended here to the one call-chain entry point that
+// still has no cross-call state.
+//
+// The four leaf accessors (`block_cache_flush_reset`,
+// `block_cache_write_count`, `block_cache_flush_tick_count`,
+// `block_cache_flush_last_err`) issue no nested call and touch only
+// caller-save registers (`rax`/`r10`), so they need no prologue at
+// all, matching journal_ondisk.pdx's `journal_head_lba` / `journal_
+// checkpoint_lba` shape.
+//
+// -----------------------------------------------------------------------------
+// mov_b / no-test / label-prefix discipline
+// -----------------------------------------------------------------------------
+//
+// No byte-granularity access anywhere in this file (every field
+// touched is a whole qword). No `test` instruction; every branch uses
+// `cmp reg, imm` / `cmp reg, reg` + `je`/`jne`. Every label is
+// prefixed `bcft_` (block_cache_flush_tick) -- distinct from every
+// other module's reserved prefixes (grep audit against src/kernel/ at
+// authoring time: no `bcft_` hits anywhere else, no `_block_cache_`
+// hits anywhere else -- both symbols and label prefix are this file's
+// alone). The auxiliary reset/accessor functions are straight-line
+// leaves with no labels needed.
+
+module BlockCacheFlush = structure {
+
+  // ============================================================================
+  // Public constants.
+  // ============================================================================
+
+  pub let BCF_OK              : u64 = 0
+
+  // Every-N-writes cadence. Frozen at 32 per volume-fs-substrate.md
+  // §5.3 ("The writeback pass issues BD_OP_FLUSH after every N=32
+  // writes to bound the crash-loss window."). Declared here for
+  // external documentation / cross-file grep; the tick body itself
+  // uses the literal immediate `31` (i.e. `and r11, 31` = `and r11,
+  // BCF_FLUSH_CADENCE - 1`) in the instruction stream, matching
+  // journal_ondisk.pdx's convention of literal immediates for frozen
+  // constants (see its own header on `JNL_MAGIC` / `JNL_BLOCK_SIZE`).
+  // A cadence change (e.g. to 64) is a two-place edit: this constant
+  // and the `and r11, 31` mask in `block_cache_flush_tick` below.
+  pub let BCF_FLUSH_CADENCE   : u64 = 32
+
+  // ============================================================================
+  // Storage.
+  //
+  // Two BSS symbols, each with its own one-writer confinement rule in
+  // tools/build.sh:
+  //
+  //   _block_cache_write_count : monotonic counter of tick invocations
+  //                              (semantically: writes observed at the
+  //                              cache layer). Bumped ONCE per
+  //                              `block_cache_flush_tick` call.
+  //
+  //   _block_cache_flush_stats : auxiliary observability. Layout:
+  //     [+0]  tick_count       (bumped when the every-32 gate fires,
+  //                             whether or not the resulting flush
+  //                             succeeded or was skipped due to no
+  //                             mounted root)
+  //     [+8]  flush_ok_count   (bumped when both `block_cache_flush_
+  //                             all` and the mounted-root path's
+  //                             `jnl_bdev_flush` returned 0; also
+  //                             bumped when the mounted-root path
+  //                             short-circuited on no-mount, since a
+  //                             no-op flush is "OK, nothing to do")
+  //     [+16] last_flush_err   (sticky-last-write; 0 = clean, else
+  //                             the failing call's own error code
+  //                             verbatim -- see failure taxonomy above)
+  //     [+24] reserved
+  //
+  // Sole writers: `block_cache_flush_reset` (bulk zero at boot / test
+  // setup) and `block_cache_flush_tick` (per-call bump + latch). The
+  // four leaf accessors are read-only. tools/build.sh's ec_confine_one
+  // gate refuses any relocation against either symbol from an object
+  // other than core/fs/pdxfs/block_cache_flush.o.
+  // ============================================================================
+
+  pub let mut _block_cache_write_count : [u64; 1] = uninit @align(64)
+  pub let mut _block_cache_flush_stats : [u64; 4] = uninit @align(32)
+
+  // ============================================================================
+  // block_cache_flush_reset() -> ()
+  //
+  // Zero both BSS blocks. Idempotent (safe to call twice). Leaf, no
+  // callee-save. Intended for boot init and for any test that wants a
+  // clean counter/latch state before driving the tick.
+  // ============================================================================
+
+  pub let block_cache_flush_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M7-004 (#1718): zero _block_cache_write_count (1 qword) and _block_cache_flush_stats (4 qwords). Leaf, caller-save only. Two straight-line stores + four straight-line stores; no loop needed at these sizes. No test instruction. No labels.",
+      block: {
+        xor rax, rax;
+
+        lea r10, [rip + _block_cache_write_count];
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _block_cache_flush_stats];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+
+        ret
+      }
+    }
+
+  // ============================================================================
+  // block_cache_flush_tick() -> u64
+  //
+  // The write-back cadence entry point. Called on every observed
+  // data-region write at the cache layer (per the task brief: from
+  // inside `block_cache_mark_dirty`, or equivalently from
+  // `cow_write.pdx`'s write path once #1717 has wired that walker
+  // through the block cache). Semantics:
+  //
+  //   1. Bump `_block_cache_write_count[0]` (unconditional).
+  //   2. If the bumped counter is NOT a multiple of BCF_FLUSH_CADENCE
+  //      (32), return 0 immediately -- fast path, no I/O.
+  //   3. Otherwise (the every-32 gate fires):
+  //      a. Bump `_block_cache_flush_stats[+0]` (tick_count).
+  //      b. `block_cache_flush_all()` -- write every dirty cache slot
+  //         to its owning bdev. On non-zero return, latch into
+  //         last_flush_err and forward the error verbatim.
+  //      c. Resolve the mounted root PdxFS-block volume via
+  //         `_mount_table[MOUNT_ROOT_SLOT]` -> vol_slot ->
+  //         `volume_row_device_slot(vol_slot)` -> bdev_cap. If nothing
+  //         is mounted at the root, or the row is dead, this is a
+  //         success no-op (flush_ok_count still bumps; nothing to
+  //         flush to, no error to raise).
+  //      d. `jnl_bdev_flush(bdev_cap)` -- BD_OP_FLUSH the bdev's own
+  //         write cache. On non-zero return, latch into last_flush_err
+  //         and forward the error verbatim.
+  //      e. On success, bump flush_ok_count and return 0.
+  //
+  // Register plan: no callee-save (no cross-call state); `sub rsp, 8`
+  // pad to land rsp%16==0 for the nested cap-invoking calls. Labels
+  // prefixed bcft_.
+  // ============================================================================
+
+  pub let block_cache_flush_tick : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R52.M7-004 (#1718): monotonic bump of _block_cache_write_count[0]; every-32 gate via `and r11, 31; jne bcft_ok` (fast path). On gate-fire: tick_count bump, `call block_cache_flush_all` (#1715 dep), mounted-root resolve via _mount_table[MOUNT_ROOT_SLOT=0] + `call volume_row_device_slot` mirroring pdxfs_txn_commit_wal (#1712) one-for-one, `call jnl_bdev_flush` for BD_OP_FLUSH. Success path bumps flush_ok_count. Any non-zero return from block_cache_flush_all or jnl_bdev_flush is latched sticky-last-write into last_flush_err and forwarded verbatim. `sub rsp, 8` alignment pad for the nested calls (no callee-save needed). Labels prefixed bcft_.",
+      block: {
+        sub rsp, 8;
+
+        // --- (1) Bump the monotonic write counter. -------------------------
+        lea r10, [rip + _block_cache_write_count];
+        mov rax, [r10 + 0];
+        add rax, 1;
+        mov [r10 + 0], rax;
+
+        // --- (2) Fast path: (counter & 31) != 0 => skip flush. -------------
+        mov r11, rax;
+        and r11, 31;
+        jne bcft_ok;
+
+        // --- (3a) tick_count++ ---------------------------------------------
+        lea r10, [rip + _block_cache_flush_stats];
+        mov r11, [r10 + 0];
+        add r11, 1;
+        mov [r10 + 0], r11;
+
+        // --- (3b) Drain dirty cache slots. ---------------------------------
+        // block_cache_flush_all is provided by block_cache.pdx (#1715).
+        call block_cache_flush_all;
+        cmp rax, 0;
+        jne bcft_err;
+
+        // --- (3c) Resolve the mounted root PdxFS-block volume. -------------
+        // Mirrors pdxfs_txn_commit_wal (#1712) one-for-one: packed
+        // qword at _mount_table+0 (MOUNT_ROOT_SLOT=0); backend at
+        // bits [32,40), vol_slot at bits [48,64).
+        lea r10, [rip + _mount_table];
+        mov rax, [r10 + 0];
+        mov r11, rax;
+        shr r11, 32;
+        and r11, 0xFF;
+        cmp r11, 5;                       // MOUNT_BACKEND_PDXFS_BLOCK
+        jne bcft_flush_none;              // no root mounted -> success no-op
+
+        shr rax, 48;
+        and rax, 0xFFFF;                  // vol_slot
+        mov rdi, rax;
+        call volume_row_device_slot;
+        mov r11, 0xFFFFFFFFFFFFFFFF;      // VOL_DECODE_BAD
+        cmp rax, r11;
+        je  bcft_flush_none;              // dead volume row -> success no-op
+
+        // --- (3d) BD_OP_FLUSH the bdev's own write cache. ------------------
+        mov rdi, rax;
+        call jnl_bdev_flush;
+        cmp rax, 0;
+        jne bcft_err;
+
+        // --- (3e) Success with I/O actually issued: flush_ok_count++. ------
+        lea r10, [rip + _block_cache_flush_stats];
+        mov r11, [r10 + 8];
+        add r11, 1;
+        mov [r10 + 8], r11;
+        xor eax, eax;
+        jmp bcft_out;
+
+      bcft_flush_none:
+        // Nothing mounted at the root (or dead row): success no-op.
+        // flush_ok_count still bumps -- a no-op flush is "OK, nothing
+        // to do", matching pdxfs_txn_commit_wal's no-mount arm.
+        lea r10, [rip + _block_cache_flush_stats];
+        mov r11, [r10 + 8];
+        add r11, 1;
+        mov [r10 + 8], r11;
+        xor eax, eax;
+        jmp bcft_out;
+
+      bcft_ok:
+        // Fast path (counter not at cadence boundary): no I/O, no stats.
+        xor eax, eax;
+        jmp bcft_out;
+
+      bcft_err:
+        // rax already holds the failing call's own error code. Latch
+        // sticky-last-write into last_flush_err and forward verbatim.
+        lea r10, [rip + _block_cache_flush_stats];
+        mov [r10 + 16], rax;
+
+      bcft_out:
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // Read-only accessors. All leaves, no callee-save, no nested call.
+  // ============================================================================
+
+  // Monotonic write count -- number of times block_cache_flush_tick
+  // has been invoked since the last reset.
+  pub let block_cache_write_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M7-004 (#1718): read _block_cache_write_count[0]. Leaf, caller-save only, no test, no labels.",
+      block: {
+        lea r10, [rip + _block_cache_write_count];
+        mov rax, [r10 + 0];
+        ret
+      }
+    }
+
+  // Number of times the every-32 gate has fired since the last reset.
+  // Equals floor(write_count / 32) at all steady-state moments.
+  pub let block_cache_flush_tick_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M7-004 (#1718): read _block_cache_flush_stats[+0]. Leaf.",
+      block: {
+        lea r10, [rip + _block_cache_flush_stats];
+        mov rax, [r10 + 0];
+        ret
+      }
+    }
+
+  // Number of tick-fires that completed either the full flush chain
+  // (both block_cache_flush_all + jnl_bdev_flush returned 0) OR the
+  // no-mount short-circuit (nothing to flush is OK).
+  pub let block_cache_flush_ok_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M7-004 (#1718): read _block_cache_flush_stats[+8]. Leaf.",
+      block: {
+        lea r10, [rip + _block_cache_flush_stats];
+        mov rax, [r10 + 8];
+        ret
+      }
+    }
+
+  // Last flush error (sticky-last-write). 0 = last flush chain
+  // succeeded (or nothing to flush); non-zero = the code the failing
+  // call in the most recent tick-fire returned verbatim.
+  pub let block_cache_flush_last_err : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R52.M7-004 (#1718): read _block_cache_flush_stats[+16]. Leaf.",
+      block: {
+        lea r10, [rip + _block_cache_flush_stats];
+        mov rax, [r10 + 16];
+        ret
+      }
+    }
+}
