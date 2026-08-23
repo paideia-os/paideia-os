@@ -7,17 +7,28 @@
 #
 # Leading flags (R53.M4-001 #1748):
 #   --with-disk           Attach an emulated NVMe drive backed by a
-#                         persistent raw image at
-#                         ${REPO_ROOT}/tests/qemu/disks/pdxb-root.img
-#                         (overridable via NVME_IMG env). Reuses the
-#                         NVMe attach machinery landed by #1721 for
-#                         NVME_MODE=1 — the flag is the recommended
-#                         entrypoint; NVME_MODE=1 env stays supported
-#                         as the byte-for-byte legacy tempfile path.
-#   --wipe                Force re-provisioning (zero-fill) of the
+#                         persistent raw image at the DISK_IMAGE_PATH
+#                         resolved by the R53.M4-002 #1749 image
+#                         lifecycle block (default:
+#                         ${CLAUDE_JOB_DIR}/tmp/pdxb-smoke.img when
+#                         CLAUDE_JOB_DIR is set, else
+#                         /tmp/paideia-pdxb-smoke.img — overridable
+#                         via DISK_IMAGE_PATH env). Missing images are
+#                         mkfs'd through tools/mkfs-pdxb.sh (R53.M1-002
+#                         #1731) before QEMU launch.
+#   --wipe                Force re-mkfs (mkfs-pdxb.sh --force) of the
 #                         backing image even when it already exists.
 #                         No-op unless --with-disk is also passed.
-#                         Default: keep existing image contents.
+#                         Default: keep existing image contents so a
+#                         cross-invocation write → reboot → read-verify
+#                         progression can compose (R53.M4-005 round-
+#                         trip smoke).
+#
+# Backward compat: legacy NVME_MODE=1 env (R52.M8-001 #1721) still
+# selects the tempfile-based raw-zero-fill path used by
+# boot_r52_pdxfs_mkfs_nvme — it is independent of --with-disk /
+# --wipe. Every legacy invocation without the new flags launches
+# QEMU byte-for-byte as before.
 #
 #   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_child_process', 'boot_r17_shell_shutdown', 'boot_smp', 'boot_r31_spawn_pair', 'boot_panic', 'boot_release', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
@@ -80,7 +91,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 # Legacy NVME_MODE=1 env stays supported (see NVMe attach block
 # below) — it takes the tempfile path unchanged.
 WITH_DISK=0
-WIPE=0
+WIPE_DISK=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --with-disk)
@@ -88,7 +99,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --wipe)
-            WIPE=1
+            WIPE_DISK=1
             shift
             ;;
         --fingerprint|--)
@@ -1387,6 +1398,10 @@ if [[ ${UART_RX_MODE} -eq 1 ]]; then
     ) > "${FIFO_IN}" &
     WRITER_PID=$!
 
+    # R53.M4-001/002 (#1748/#1749): --with-disk splices the NVMe drive
+    # into the UART-RX QEMU launch too (DISK_ARGS is empty when the
+    # flag is not set, so the launch shape is byte-for-byte identical
+    # for every legacy interactive-shell mode).
     timeout ${TIMEOUT} qemu-system-x86_64 \
         -kernel "${KERNEL}" \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
@@ -1396,6 +1411,7 @@ if [[ ${UART_RX_MODE} -eq 1 ]]; then
         -no-reboot \
         -no-shutdown \
         -m 32M \
+        "${DISK_ARGS[@]}" \
         >/dev/null 2>&1
     QEMU_RC=$?
 
@@ -1426,75 +1442,47 @@ else
         CPU_ARGS=(-cpu "${QEMU_CPU}")
     fi
     # R52.M8-001 (#1721): opt-in NVMe drive attach for boot_r52_pdxfs_
-    # mkfs_nvme. Provisions a raw-format image, exposes it as an
-    # emulated NVMe namespace (`-drive file=<img>,if=none,id=nvme0,
-    # format=raw -device nvme,drive=nvme0,serial=deadbeef`), and (in
-    # the legacy tempfile path only) unlinks the image after QEMU
-    # exits. Empty NVME_MODE (default 0) leaves NVME_ARGS unset,
-    # preserving every legacy mode's QEMU launch byte-for-byte.
+    # mkfs_nvme. Provisions a per-invocation raw-format tempfile of
+    # NVME_IMG_SIZE_MB (default 16) MiB, exposes it as an emulated
+    # NVMe namespace (`-drive file=<tmpfile>,if=none,id=nvme0,format=
+    # raw -device nvme,drive=nvme0,serial=deadbeef`), and unlinks the
+    # tempfile after QEMU exits. Empty NVME_MODE (default 0) leaves
+    # NVME_ARGS unset, preserving every legacy mode's QEMU launch
+    # byte-for-byte.
     #
-    # R53.M4-001 (#1748): --with-disk is the flag-based entrypoint on
-    # top of the same NVMe attach machinery. It routes to a persistent
-    # image at ${REPO_ROOT}/tests/qemu/disks/pdxb-root.img (override
-    # via NVME_IMG env) instead of a per-invocation tempfile, so the
-    # image survives across runs and mkfs → mount → reboot → read-back
-    # progressions can compose (R53.M4-002+ / boot_r53_first_mount).
-    # --wipe forces re-provisioning even when the image already exists;
-    # without --wipe, an existing image's contents are kept verbatim.
-    # Follow-on tickets (R53.M4-002 #1749) layer mkfs-pdxb.sh on top
-    # of the WIPE branch so a wiped image comes up with a fresh PDXB
-    # superblock rather than raw zeros.
+    # R53.M4-001 (#1748) note: --with-disk / --wipe do NOT route
+    # through this legacy path — they go through the separate DISK_ARGS
+    # block above (R53.M4-002 #1749) which delegates to mkfs-pdxb.sh
+    # instead of raw zero-fill. This block is the boot_r52_pdxfs_mkfs_
+    # nvme entrypoint only (NVME_MODE=1 either from the mode dispatcher
+    # or as an env override).
     NVME_ARGS=()
     NVME_CLEANUP=""
-    if [[ ${WITH_DISK} -eq 1 ]]; then
-        NVME_MODE=1
-    fi
     if [[ ${NVME_MODE} -eq 1 ]]; then
-        # Path selection:
-        #   --with-disk           → persistent path (default under
-        #                           tests/qemu/disks/; NVME_IMG env
-        #                           overrides). No cleanup.
-        #   NVME_MODE=1 env only  → per-invocation tempfile, cleaned
-        #                           up after QEMU exits (legacy #1721
-        #                           behavior, byte-for-byte preserved).
-        NVME_PERSIST=0
-        if [[ ${WITH_DISK} -eq 1 ]]; then
-            NVME_PERSIST=1
-            if [[ -z "${NVME_IMG}" ]]; then
-                NVME_IMG="${REPO_ROOT}/tests/qemu/disks/pdxb-root.img"
-            fi
-            mkdir -p "$(dirname "${NVME_IMG}")"
-        elif [[ -z "${NVME_IMG}" ]]; then
+        if [[ -z "${NVME_IMG}" ]]; then
             NVME_IMG="$(mktemp -t paideia-pdxfs-smoke-XXXXXX.img)"
             NVME_CLEANUP="${NVME_IMG}"
         fi
-        # Provisioning gate:
-        #   - Legacy tempfile path (NVME_PERSIST=0)         → always dd
-        #     (preserves #1721 byte-for-byte behavior for the mktemp
-        #     case AND the env-supplied-NVME_IMG case).
-        #   - --with-disk with missing image                → dd (first
-        #     run bootstraps the persistent image).
-        #   - --with-disk --wipe                            → dd
-        #     (explicit re-provision even if image exists).
-        #   - --with-disk, image exists, no --wipe          → skip dd
-        #     (keep existing contents — the whole point of persistence).
-        if [[ ${NVME_PERSIST} -eq 0 || ${WIPE} -eq 1 || ! -f "${NVME_IMG}" ]]; then
-            # dd is used (vs. truncate) so the file is zero-filled up
-            # front — an emulated NVMe namespace reads back defined
-            # zeros from every unwritten LBA and mkfs writes have a
-            # determinate target.
-            dd if=/dev/zero of="${NVME_IMG}" bs=1M count="${NVME_IMG_SIZE_MB}" \
-                status=none 2>/dev/null || {
-                echo "smoke: failed to provision NVMe backing image ${NVME_IMG}" >&2
-                [[ -n "${NVME_CLEANUP}" ]] && rm -f "${NVME_CLEANUP}"
-                exit 1
-            }
-        fi
+        # Provision the backing file. dd is used (vs. truncate) so the
+        # file is zero-filled up front — an emulated NVMe namespace
+        # reads back defined zeros from every unwritten LBA and mkfs
+        # writes have a determinate target.
+        dd if=/dev/zero of="${NVME_IMG}" bs=1M count="${NVME_IMG_SIZE_MB}" \
+            status=none 2>/dev/null || {
+            echo "smoke: failed to provision NVMe backing image ${NVME_IMG}" >&2
+            [[ -n "${NVME_CLEANUP}" ]] && rm -f "${NVME_CLEANUP}"
+            exit 1
+        }
         NVME_ARGS=(
             -drive "file=${NVME_IMG},if=none,id=nvme0,format=raw"
             -device "nvme,drive=nvme0,serial=deadbeef"
         )
     fi
+    # R53.M4-001/002 (#1748/#1749): --with-disk splices the NVMe drive
+    # into the standard QEMU launch. DISK_ARGS is empty when the flag
+    # is not set, so every legacy mode's launch shape is preserved
+    # byte-for-byte. Sits alongside (not instead of) NVME_ARGS so
+    # boot_r52_pdxfs_mkfs_nvme's env-driven tempfile path is unchanged.
     timeout ${TIMEOUT} qemu-system-x86_64 \
         -kernel "${KERNEL}" \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
@@ -1506,6 +1494,7 @@ else
         "${CPU_ARGS[@]}" \
         "${SMP_ARGS[@]}" \
         "${NVME_ARGS[@]}" \
+        "${DISK_ARGS[@]}" \
         >/dev/null 2>&1
     QEMU_RC=$?
     if [[ -n "${NVME_CLEANUP}" ]]; then
