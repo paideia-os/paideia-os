@@ -1,0 +1,438 @@
+// src/kernel/core/drivers/ahci/cmd_alloc.pdx -- R51.M6-001 (#1663).
+//
+// Per-port Command List + Command Table + PRDT region allocation --
+// the AHCI equivalent of drivers/nvme/prp.pdx's PRP encoding and
+// drivers/nvme/io_queue.pdx's per-CPU CQ/SQ buffer pools.  Design
+// authority: design/hardware/nvme-and-disk-substrate.md §3.5
+// (command header + Command Table + PRDT layout) and
+// design/hardware/nvme-ahci-tail-milestones.md (commit 2d6ab82)
+// §2.M6 #1663 (this issue's own scope text) + §6 (encoder caveats)
+// + §7 (failure-code band).
+//
+// This file lands ONLY R51.M6-001 (#1663): static per-port region
+// pools for the Command List (1 KiB/port) and Command Table (header
+// + fixed PRDT capacity, per port), address-computation accessors,
+// and a row-bind path that persists the computed addresses onto the
+// owning KIND_AHCI_PORT row.  Building an H2D Register FIS, filling
+// PRDT entries with real scatter-gather addresses, ringing CI, and
+// everything else that actually SUBMITS a command is M6-002/#1664
+// (`io_submit.pdx`) and out of scope here, matching that file's own
+// stated dependency ("Upstream: #1663 (needs a bound Command Table +
+// PRDT region)").
+//
+// =============================================================================
+// SECTION 0  WHY STATIC POOLS, NOT A PER-OP KIND_DMA_DOMAIN MAP
+// =============================================================================
+//
+// design/hardware/nvme-and-disk-substrate.md §5.2 narrates a dynamic
+// map-per-op lifecycle: `dma_domain_map(domain_slot, page_slot,
+// iova_hint) -> iova` called once per scatter-gather page, per op.
+// DESIGN-DOC GAP (flagged to softarch/debugger review, see final
+// report): no such function exists anywhere in this tree today --
+// `cap/kind_dma_domain.pdx` lands mint/revoke/tail-alloc for the
+// KIND_DMA_DOMAIN capability itself (R29.M5) but no `dma_domain_map`
+// / `dma_domain_unmap` entry point that turns a page handle into an
+// IOVA. Every LANDED NVMe region allocator this driver family has
+// (`drivers/nvme/prp.pdx`, `drivers/nvme/io_queue.pdx`) instead uses
+// fixed-size `.bss` pools sized at compile time, indexed by a small
+// integer (queue id / cpu idx), with physical addresses recovered
+// via the VA/PA identity-map inheritance `prp.pdx`'s own header
+// documents (high-half KERNEL_VMA_BASE aliasing PML4[256] over
+// PDPT[0..3], so a `lea reg, [rip + _pool]` VA equals its PA once
+// bits 47..63 are masked).  This file follows that ACTUAL, landed
+// precedent -- one static pool row per port index (0..AHCIP_MAX-1),
+// exactly mirroring `_nvme_io_cq_buffers` / `_nvme_io_sq_buffers` --
+// rather than fabricate a call to a function that does not exist.
+// When a real `dma_domain_map` primitive lands, retrofitting this
+// file to route its two pool-base `lea`s through it is a bounded,
+// mechanical change (the row-bind interface below does not change).
+//
+// =============================================================================
+// SECTION 0b  WHY `ahci_port_cmd_regions_bind` DOES NOT TOUCH ABAR MMIO
+// =============================================================================
+//
+// design/hardware/nvme-ahci-tail-milestones.md §2.M6 #1663 narrates:
+// "add ahci_port_cmd_regions_bind(port_row_id, cl_phys, ct_phys) that
+// programs CLB/CLBU (via M5's already-mapped ABAR MMIO cap)" as an
+// EXTENSION of `drivers/ahci/port.pdx`.  DESIGN-DOC GAP (flagged to
+// softarch/debugger review, see final report): at the time this
+// issue was AUTHORED, `drivers/ahci/port.pdx` did not exist and no
+// ABAR MMIO accessor was callable anywhere.  Both facts partially
+// changed WHILE this issue was being implemented: R51.M5-003/#1659
+// landed concurrently (commit 711066b) and added `drivers/ahci/
+// regs.pdx` (`abar_reg_u32` / `abar_reg_u32_set`, Generic Host
+// Control register accessors only -- CAP/GHC/IS/PI/VS at offsets
+// 0x00..0x10 from abar_pa) and `drivers/ahci/reset.pdx`
+// (`ahci_hba_reset`, `ahci_pi_enumerate`, `ahci_ctrl_bring_up`).
+// `drivers/ahci/port.pdx` (M5-005/#1661, per-port bring-up +
+// IDENTIFY DEVICE) STILL does not exist -- #1661 is pending, not
+// landed.
+//
+// This still blocks writing CLB/CLBU here, for a DIFFERENT and more
+// fundamental reason than "the primitive doesn't exist": AHCI 1.3.1
+// requires a port be IDLED before its CLB/CLBU (or FB/FBU) are
+// (re)programmed -- substrate §3.4's own bring-up order is explicit:
+// "1. Clear ST, wait CR==0, clear FRE, wait FR==0 (idle port). 2.
+// Allocate ... write CLB/FB." Idling a port means touching its
+// per-port CMD/TFD registers (the 0x100 + 0x80xN block, substrate
+// §3.2/§3.4) -- registers `regs.pdx` explicitly does NOT cover (its
+// own header: "Generic Host Control register accessors" only) and
+// which belong to the not-yet-landed per-port bring-up orchestrator
+// (#1661). A freshly-reset HBA's ports are not guaranteed idle --
+// firmware (BIOS/UEFI) may have already started a port in AHCI mode
+// before hand-off, and `ahci_ctrl_bring_up` (#1659) only resets the
+// HBA + enumerates PI; it does not idle any individual port. Writing
+// CLB/CLBU to a port that might still be running (CMD.ST=1) is
+// undefined per spec and unsafe on real hardware, even though QEMU's
+// emulation would likely tolerate it. This function therefore still
+// defers the actual MMIO store to whichever future commit lands BOTH
+// the per-port idle-gate and a bring-up orchestrator that can
+// sequence idle -> bind -> CLB/CLBU-write -> FRE/ST correctly --
+// most likely #1661 itself, calling this file's `ahci_port_cmd_
+// regions_prepare` (or `_bind`) as ITS step 2 once its own step 1
+// (idle) has run.
+//
+// Resolution taken here, following the honest-sentinel precedent
+// `drivers/backlight_pwm.pdx` sets for exactly this situation (a
+// real capability gate + real bookkeeping, but NO fabricated store
+// against hardware whose safe-to-write precondition this file cannot
+// itself establish): `ahci_port_cmd_regions_bind` performs the REAL,
+// LANDABLE, SAFE half of its job -- validating the target port row
+// and persisting `cl_phys`/`ct_phys` onto it (the two words
+// `kind_ahci_port.pdx` SECTION 1 reserved for exactly this, per that
+// file's own comment, now repurposed by this issue) -- and
+// explicitly does NOT claim to have written CLB/CLBU to the HBA. A
+// caller that treated this function's success as "the HBA now knows
+// about this region" would be inventing a claim this module does not
+// carry.
+//
+// This is also why this file does NOT extend `drivers/ahci/port.pdx`
+// as design §5.1's file-touch table names it: that file still does
+// not exist. `ahci_port_cmd_regions_bind` (and its convenience
+// wrapper `ahci_port_cmd_regions_prepare`) live here, already `pub`,
+// so the future M5-005/#1661 bring-up orchestrator can call them
+// directly once it lands -- no port.pdx-side signature changes
+// anticipated, and #1661 gains a documented, tested region-bind step
+// for free rather than having to duplicate one.
+//
+// =============================================================================
+// SECTION 1  REGION LAYOUT
+// =============================================================================
+//
+// Per port (indexed 0..AHCIP_MAX-1, AHCIP_MAX = 32 per
+// `kind_ahci_port.pdx`):
+//
+//   Command List   -- AHCI_CL_BYTES = 1024 (1 KiB: 32 command headers
+//                      x 32 B).  Design §3.5 requires 256 B alignment;
+//                      pool base is 4096-aligned and each port's slot
+//                      is a multiple of 1024, so every port's Command
+//                      List is both 256 B- and 1024 B-aligned.
+//   Command Table  -- AHCI_CT_BYTES = 1152: AHCI_CT_HDR_BYTES (128 --
+//                      H2D Register FIS slot + ATAPI slot + reserved,
+//                      design §3.5) + AHCI_PRDT_MAX_ENTRIES (64) x
+//                      AHCI_PRDT_ENTRY_BYTES (16) = 1024 B of PRDT
+//                      capacity.  Design §3.5 requires 128 B
+//                      alignment; 1152 is an exact multiple of 128,
+//                      so every port's Command Table stays 128 B-
+//                      aligned against a 4096-aligned pool base.
+//
+// AHCI_PRDT_MAX_ENTRIES = 64 is THIS ISSUE'S OWN POLICY CHOICE, not a
+// design-doc number -- design §3.5 allows up to 65535 PRDT entries
+// per op, which no static per-port allocation can reserve space for
+// wholesale.  64 entries at up to 4 MiB each covers single-op
+// transfers well past any transfer size R51.M6-002/003 is expected
+// to issue; if a future pass needs more, design's own M6-001 text
+// anticipates exactly this ("a cmd_alloc_v2.pdx swap-in point is
+// documented in ahci/cmd_alloc.pdx's header") -- this comment IS
+// that swap-in point.  M6-002/#1664 and M6-003/#1665 (io_submit.pdx)
+// must clamp PRDTL to AHCI_PRDT_MAX_ENTRIES and return
+// AHCIIO_SUBMIT_PRDT_OVERFLOW (design's own §7's own #1664 code) for
+// any op whose scatter-gather list exceeds it.
+//
+// R51.M6 binds ONE Command Table per port (not per command slot) --
+// design §2.M6 #1663's own "Slot layout" note: "the H2D FIS is
+// re-written per submission, and the PRDT that follows is treated as
+// overwrite-per-op." Consequently one pool row per port (not per
+// port x slot) is exactly what M6 needs; a wider `cmd_alloc_v2.pdx`
+// would add the per-slot dimension if a future round wants deeper
+// queueing.
+//
+// =============================================================================
+// SECTION 2  FAILURE TAXONOMY  0xFFFFECA0..0xFFFFECA1
+// =============================================================================
+//
+// design/hardware/nvme-ahci-tail-milestones.md §7 claims
+// 0xFFFFECA0..0xFFFFECAF for "AHCIIO (cmd alloc + I/O submit),
+// M6-001, M6-002, M6-003"; this file claims the first two codes
+// design §2.M6 #1663 itself names, leaving 0xFFFFECA2..0xFFFFECAF
+// for M6-002/M6-003's `io_submit.pdx` (design already names
+// AHCIIO_SUBMIT_NO_SLOT=0xFFFFECA2, _TIMEOUT=0xFFFFECA3,
+// _TFD_ERR=0xFFFFECA4, _PRDT_OVERFLOW=0xFFFFECA5 for that file):
+//
+//   AHCIIO_CMD_ALLOC_NOMEM   0xFFFFECA0 -- port_slot out of range
+//                              (bound: 0 <= port_slot < AHCIP_MAX) for
+//                              either pool.
+//   AHCIIO_CMD_BIND_BAD_ROW  0xFFFFECA1 -- bind/prepare called against
+//                              a port_row_id that is not a live
+//                              KIND_AHCI_PORT row.
+//
+// =============================================================================
+// SECTION 3  paideia-as encoder-gap posture (v0.22.x)
+// =============================================================================
+//
+//   G4: full-register compares -- `AHCIIO_CMD_ALLOC_NOMEM` and
+//       `AHCIIO_CMD_BIND_BAD_ROW` both exceed 0x7FFFFFFF (bit 31 set,
+//       bit 63 clear), so an imm32 `cmp` operand would sign-extend to
+//       the wrong 64-bit value.  Every COMPARISON against one of
+//       these sentinels stages it via `mov r10, <imm64>; cmp reg,
+//       r10` first (design §6.4).  Plain `mov rax, <sentinel>` to SET
+//       a return value needs no staging -- `mov r64, imm64` is a
+//       full 8-byte-immediate encoding with no sign-extension step
+//       (precedent: `kind_ahci_port.pdx`'s `ahcip_ta_enospc` /
+//       `ahcip_ta_bad` labels do exactly this).
+//   Arity: every function here is <= 3 args, comfortably under the
+//       SysV 6-register ceiling (design §6.1).
+//   No `imul` with an immediate multiplier: AHCI_CL_BYTES (1024) is a
+//       power of two (`shl reg, 10`); AHCI_CT_BYTES (1152) is
+//       decomposed as 1024 + 128 = (port_slot << 10) + (port_slot <<
+//       7), added together -- the same "sidestep imul" idiom
+//       `drivers/tb/route_arith.pdx` documents for its own slot*5
+//       computation, chosen defensively even though `imul reg, reg,
+//       imm8` has a landed precedent elsewhere (`drivers/vk/
+//       bench.pdx`) -- shift+add has zero encoder-gap exposure.
+//   Reserved-label discipline: labels prefixed `acla_` (cl_phys),
+//       `acta_` (ct_phys), `acpa_` (prdt_phys), `acrb_` (regions_bind),
+//       `acrp_` (regions_prepare) -- none collide with `loop`, `if`,
+//       `port`, `reset`, or any other paideia-as keyword.
+//
+// =============================================================================
+
+module CmdAlloc = structure {
+
+  pub let AHCIIO_CMD_ALLOC_NOMEM  : u64 = 0xFFFFECA0
+  pub let AHCIIO_CMD_BIND_BAD_ROW : u64 = 0xFFFFECA1
+
+  // Mirror of kind_ahci_port.pdx's AHCIP_MAX. Kept as a local literal
+  // (no cross-file constant import exists in this tree's convention --
+  // every existing multi-file constant reference is a hardcoded
+  // immediate with a comment, e.g. kind_ahci_port.pdx's own
+  // `mov r11, 0x19A; // KIND_AHCI_CONTROLLER`); if AHCIP_MAX ever
+  // changes, this file's copy (and its two pool sizes below) must
+  // change with it -- flagged in the final report as a maintenance
+  // coupling for softarch to track.
+  pub let AHCI_CMD_ALLOC_MAX_PORTS : u64 = 32
+
+  pub let AHCI_CL_BYTES         : u64 = 1024
+  pub let AHCI_CT_HDR_BYTES     : u64 = 128
+  pub let AHCI_PRDT_ENTRY_BYTES : u64 = 16
+  pub let AHCI_PRDT_MAX_ENTRIES : u64 = 64
+  pub let AHCI_CT_BYTES         : u64 = 1152   // 128 + 64*16
+
+  // 32 ports * 1024 B = 32768 B = 4096 u64 words.
+  pub let mut _ahci_cmd_list_pool  : [u64; 4096] = uninit @align(4096)
+  // 32 ports * 1152 B = 36864 B = 4608 u64 words.
+  pub let mut _ahci_cmd_table_pool : [u64; 4608] = uninit @align(4096)
+
+  // ==========================================================================
+  // ahci_cmd_alloc_cl_phys(port_slot) -> phys | AHCIIO_CMD_ALLOC_NOMEM
+  //
+  // Command List region base for this port slot. Pure address
+  // computation (lea + shift); no memory read/write, so effects {}.
+  // ==========================================================================
+  pub let ahci_cmd_alloc_cl_phys : (u64) -> u64 !{} @{} =
+    fn (port_slot: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R51.M6-001 (#1663): Command List region base = &_ahci_cmd_list_pool + port_slot * AHCI_CL_BYTES (1024, power of two -> shl 10). Bound: port_slot < AHCI_CMD_ALLOC_MAX_PORTS (32), else AHCIIO_CMD_ALLOC_NOMEM. Leaf; no push needed (no nested call). Labels prefixed acla_.",
+      block: {
+        cmp rdi, 32;
+        jae acla_bad;
+
+        lea rax, [rip + _ahci_cmd_list_pool];
+        mov r10, rdi;
+        shl r10, 10;                    // port_slot * AHCI_CL_BYTES (1024)
+        add rax, r10;
+        ret;
+
+      acla_bad:
+        mov rax, 0xFFFFECA0;            // AHCIIO_CMD_ALLOC_NOMEM
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_cmd_alloc_ct_phys(port_slot) -> phys | AHCIIO_CMD_ALLOC_NOMEM
+  //
+  // Command Table region base for this port slot (header + PRDT
+  // capacity, SECTION 1). AHCI_CT_BYTES (1152) is not a power of two:
+  // decomposed as (port_slot << 10) + (port_slot << 7) = port_slot *
+  // 1024 + port_slot * 128 = port_slot * 1152, sidestepping imul per
+  // SECTION 3.
+  // ==========================================================================
+  pub let ahci_cmd_alloc_ct_phys : (u64) -> u64 !{} @{} =
+    fn (port_slot: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R51.M6-001 (#1663): Command Table region base = &_ahci_cmd_table_pool + port_slot * AHCI_CT_BYTES (1152 = 1024 + 128, computed via two shifts + add to avoid imul). Bound: port_slot < AHCI_CMD_ALLOC_MAX_PORTS (32), else AHCIIO_CMD_ALLOC_NOMEM. Leaf; no push needed. Labels prefixed acta_.",
+      block: {
+        cmp rdi, 32;
+        jae acta_bad;
+
+        lea rax, [rip + _ahci_cmd_table_pool];
+        mov r10, rdi;
+        shl r10, 10;                    // port_slot * 1024
+        mov r11, rdi;
+        shl r11, 7;                     // port_slot * 128
+        add r10, r11;                   // port_slot * AHCI_CT_BYTES (1152)
+        add rax, r10;
+        ret;
+
+      acta_bad:
+        mov rax, 0xFFFFECA0;            // AHCIIO_CMD_ALLOC_NOMEM
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_cmd_alloc_prdt_phys(port_slot) -> phys | AHCIIO_CMD_ALLOC_NOMEM
+  //
+  // PRDT region base = Command Table base + AHCI_CT_HDR_BYTES (128) --
+  // design §3.5's Command Table layout places the PRDT immediately
+  // after the 128 B header (FIS + ATAPI + reserved). One callee-save
+  // push purely for call-site alignment (entry rsp%16==8; one push ->
+  // 0 before the nested call), matching the padding-via-preserved-
+  // register idiom `kind_ahci_port.pdx`'s ahci_port_ctrl_row_valid
+  // already uses.
+  // ==========================================================================
+  pub let ahci_cmd_alloc_prdt_phys : (u64) -> u64 !{} @{} =
+    fn (port_slot: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R51.M6-001 (#1663): PRDT region base = ahci_cmd_alloc_ct_phys(port_slot) + AHCI_CT_HDR_BYTES (128), or the same AHCIIO_CMD_ALLOC_NOMEM the ct_phys call itself would return. One push (r12, unused after the call -- purely for 16-byte call-site alignment) leaves rsp%16==0 before the nested call. Labels prefixed acpa_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        mov rdi, r12;
+        call ahci_cmd_alloc_ct_phys;
+        mov r10, 0xFFFFECA0;            // AHCIIO_CMD_ALLOC_NOMEM
+        cmp rax, r10;
+        je  acpa_out;
+        add rax, 128;                    // AHCI_CT_HDR_BYTES
+      acpa_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_port_cmd_regions_bind(port_row_id, cl_phys, ct_phys) -> u64
+  //
+  // Persist cl_phys/ct_phys onto a live KIND_AHCI_PORT row (the two
+  // words that row's layout reserves for exactly this -- see
+  // kind_ahci_port.pdx's updated SECTION 1). Does NOT program CLB/
+  // CLBU against the HBA's ABAR MMIO region -- SECTION 0b explains
+  // why that half of the design text's description cannot land yet.
+  // Returns AHCIP_OK (0) on success, AHCIIO_CMD_BIND_BAD_ROW
+  // (0xFFFFECA1) if port_row_id does not name a live row.
+  // ==========================================================================
+  pub let ahci_port_cmd_regions_bind : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (port_row_id: u64) (cl_phys: u64) (ct_phys: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M6-001 (#1663): validate port_row_id via ahci_port_tail_valid (kind_ahci_port.pdx, #1660); on success, persist cl_phys/ct_phys via ahci_port_row_set_cmd_regions. On an invalid row, returns AHCIIO_CMD_BIND_BAD_ROW without calling the setter. Three callee-save pushes (r12=port_row_id, r13=cl_phys, r14=ct_phys) leave rsp%16==0 (entry 8, 3*8=24, 8+24=32) before each nested call. Labels prefixed acrb_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                   // port_row_id
+        mov r13, rsi;                   // cl_phys
+        mov r14, rdx;                   // ct_phys
+
+        mov rdi, r12;
+        call ahci_port_tail_valid;
+        cmp rax, 0;
+        je  acrb_bad_row;
+
+        mov rdi, r12;
+        mov rsi, r13;
+        mov rdx, r14;
+        call ahci_port_row_set_cmd_regions;
+        jmp acrb_out;
+
+      acrb_bad_row:
+        mov rax, 0xFFFFECA1;            // AHCIIO_CMD_BIND_BAD_ROW
+
+      acrb_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ahci_port_cmd_regions_prepare(port_row_id) -> u64
+  //
+  // Convenience entry point for a future bring-up orchestrator (the
+  // eventual M5-005/#1661 caller): derive port_slot from the row,
+  // allocate its Command List + Command Table regions, and bind them
+  // onto the row -- one call in place of the four-step sequence a
+  // caller would otherwise hand-assemble. Returns AHCIP_OK (0) on
+  // success, or the first failure encountered
+  // (AHCIIO_CMD_BIND_BAD_ROW for an invalid row or an alloc-range
+  // failure, AHCIIO_CMD_ALLOC_NOMEM surfaced only if a bound port_slot
+  // somehow exceeds AHCI_CMD_ALLOC_MAX_PORTS -- unreachable in
+  // practice since ahci_port_row_port_slot's byte-sized field can
+  // never exceed kind_ahci_port.pdx's own AHCIP_MAX ceiling, but
+  // checked here rather than assumed).
+  // ==========================================================================
+  pub let ahci_port_cmd_regions_prepare : (u64) -> u64 !{mem} @{} =
+    fn (port_row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M6-001 (#1663): port_slot = ahci_port_row_port_slot(port_row_id); AHCIP_DECODE_BAD (all-ones) -> AHCIIO_CMD_BIND_BAD_ROW. cl_phys = ahci_cmd_alloc_cl_phys(port_slot); AHCIIO_CMD_ALLOC_NOMEM propagated as-is. ct_phys = ahci_cmd_alloc_ct_phys(port_slot); same. Finally ahci_port_cmd_regions_bind(port_row_id, cl_phys, ct_phys). Four callee-save pushes (rbx=port_row_id, r12=port_slot, r13=cl_phys, r14=ct_phys) + sub rsp,8 pad = 40 B: entry rsp%16==8, 4*8=32 -> 40, %16==8, pad -> 48, %16==0. Every sentinel compare stages the imm64 via r10 first (SECTION 3, G4). Labels prefixed acrp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                   // port_row_id
+
+        mov rdi, rbx;
+        call ahci_port_row_port_slot;
+        mov r10, 0xFFFFFFFFFFFFFFFF;     // AHCIP_DECODE_BAD
+        cmp rax, r10;
+        je  acrp_bad;
+        mov r12, rax;                   // port_slot
+
+        mov rdi, r12;
+        call ahci_cmd_alloc_cl_phys;
+        mov r10, 0xFFFFECA0;             // AHCIIO_CMD_ALLOC_NOMEM
+        cmp rax, r10;
+        je  acrp_bad;
+        mov r13, rax;                   // cl_phys
+
+        mov rdi, r12;
+        call ahci_cmd_alloc_ct_phys;
+        mov r10, 0xFFFFECA0;
+        cmp rax, r10;
+        je  acrp_bad;
+        mov r14, rax;                   // ct_phys
+
+        mov rdi, rbx;
+        mov rsi, r13;
+        mov rdx, r14;
+        call ahci_port_cmd_regions_bind;
+        jmp acrp_out;
+
+      acrp_bad:
+        mov rax, 0xFFFFECA1;             // AHCIIO_CMD_BIND_BAD_ROW
+
+      acrp_out:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
