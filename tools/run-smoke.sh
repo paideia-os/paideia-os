@@ -3,7 +3,22 @@
 # configurable timeout, captures serial output, and asserts deterministic
 # bytes.
 #
-# Usage: tools/run-smoke.sh [MODE | expected_marker | --fingerprint PATTERN]
+# Usage: tools/run-smoke.sh [--with-disk] [--wipe] [MODE | expected_marker | --fingerprint PATTERN]
+#
+# Leading flags (R53.M4-001 #1748):
+#   --with-disk           Attach an emulated NVMe drive backed by a
+#                         persistent raw image at
+#                         ${REPO_ROOT}/tests/qemu/disks/pdxb-root.img
+#                         (overridable via NVME_IMG env). Reuses the
+#                         NVMe attach machinery landed by #1721 for
+#                         NVME_MODE=1 — the flag is the recommended
+#                         entrypoint; NVME_MODE=1 env stays supported
+#                         as the byte-for-byte legacy tempfile path.
+#   --wipe                Force re-provisioning (zero-fill) of the
+#                         backing image even when it already exists.
+#                         No-op unless --with-disk is also passed.
+#                         Default: keep existing image contents.
+#
 #   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_child_process', 'boot_r17_shell_shutdown', 'boot_smp', 'boot_r31_spawn_pair', 'boot_panic', 'boot_release', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
@@ -48,6 +63,51 @@
 set -uo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+# R53.M4-001 (#1748): leading flag parser for --with-disk / --wipe.
+#
+# Runs BEFORE `EXPECTED="${1:-}"` so the positional MODE / marker /
+# --fingerprint slot is preserved once recognized flags are shifted
+# off. Only `--with-disk` and `--wipe` are consumed here — any other
+# leading double-dash token is either the existing `--fingerprint`
+# form (handled after the mode dispatcher — kept intact) or an
+# unknown flag (surfaced as an error). Bare positional args (mode
+# names, expected markers) terminate the loop untouched.
+#
+# Backward compat: legacy invocations without either flag walk out of
+# the loop with $@ unchanged, so `EXPECTED="${1:-}"` and every
+# downstream `${2:-}` reference behave byte-for-byte as before.
+# Legacy NVME_MODE=1 env stays supported (see NVMe attach block
+# below) — it takes the tempfile path unchanged.
+WITH_DISK=0
+WIPE=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --with-disk)
+            WITH_DISK=1
+            shift
+            ;;
+        --wipe)
+            WIPE=1
+            shift
+            ;;
+        --fingerprint|--)
+            # --fingerprint is handled by the existing post-dispatcher
+            # parser (kept for backward compat). `--` terminates flag
+            # parsing explicitly. Either way, stop consuming here.
+            break
+            ;;
+        --*)
+            echo "smoke: unknown flag $1" >&2
+            echo "usage: $(basename "$0") [--with-disk] [--wipe] [MODE | marker | --fingerprint PATTERN]" >&2
+            exit 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
 EXPECTED="${1:-}"
 FINGERPRINT_MODE=0
 FINGERPRINT_FILE=""
@@ -1023,6 +1083,83 @@ case "${EXPECTED}" in
         NVME_MODE=1
         EXPECTED=""
         ;;
+    boot_r53_round_trip)
+        # R53.M4-005 (#1752): two-phase orchestrator meta-mode.
+        #
+        # Sequences the fresh-disk write pass and the preserved-disk
+        # read-back pass into a single invocation, giving pre-push a
+        # one-shot green/red on "reboot preserves state" instead of
+        # asking the operator (or the hook) to script the phase pair.
+        #
+        # The subordinate phase modes + goldens land in sibling #1751
+        # (R53.M4-004); the --with-disk / --wipe flag parsing they rely
+        # on lands in #1748 (R53.M4-001). This meta-mode owns only the
+        # orchestration: it does NOT itself build, launch QEMU, or
+        # inspect a fingerprint — the two recursive self-invocations do
+        # all of that.
+        #
+        # Ordering + disk lifecycle:
+        #
+        #   1. Phase 1 is invoked with `--wipe`, so the image-lifecycle
+        #      block (added by #1749) deletes any stale image and calls
+        #      `tools/mkfs-pdxb.sh` to produce a fresh PDXB superblock
+        #      before QEMU launches. The phase-1 boot witness writes
+        #      /test-file (deterministic 4 KiB pattern) and issues a
+        #      clean umount; its golden asserts the write + umount chain.
+        #
+        #   2. Phase 2 is invoked WITHOUT `--wipe`. Because the image is
+        #      a plain host file and this script never passes `-snapshot`
+        #      to QEMU (see design/tooling/volume-lifecycle-mechanism.md
+        #      §2.1), the mutations from phase 1 survive. The phase-2
+        #      boot witness re-mounts, reads /test-file back, and emits
+        #      a hash line; its golden asserts the hash matches the one
+        #      the phase-1 witness recorded.
+        #
+        #   3. Combined pass = both phase-mode invocations exited with
+        #      rc ∈ {0, 33}, which means both fingerprint checks
+        #      succeeded (each phase runs its own contains-in-order
+        #      check against its own golden). Phase 2 is guarded on
+        #      phase 1 clean exit per §7.4 — a failed phase 1 aborts
+        #      immediately without launching a second QEMU that would
+        #      only fail on an image the write pass never finished.
+        #
+        # Exit-code guard: rc 0 = normal success, rc 33 = kernel graceful
+        # clean exit (isa-debug-exit byte 0x10 → (0x10 << 1) | 1 = 33).
+        # Both are treated as clean by every fingerprint mode in this
+        # script; the meta-mode uses the same set so it agrees with
+        # what the underlying phase modes consider "green".
+        #
+        # See design/tooling/volume-lifecycle-mechanism.md §7.4 for the
+        # two-phase closure specification.
+
+        # Phase 1: wipe -> mkfs -> write /test-file -> clean umount.
+        # `--wipe` is required (not just recommended) so the round-trip
+        # starts from a determinate empty superblock every time,
+        # independent of whatever a previous session may have left in
+        # tests/qemu/disks/pdxb-root.img.
+        "$0" --with-disk --wipe boot_r53_round_trip_phase1
+        _r53_phase1_rc=$?
+        if [[ ${_r53_phase1_rc} -ne 0 && ${_r53_phase1_rc} -ne 33 ]]; then
+            echo "smoke: boot_r53_round_trip PHASE1 FAILED (rc=${_r53_phase1_rc})" >&2
+            exit ${_r53_phase1_rc}
+        fi
+
+        # Phase 2: preserve disk -> reboot -> read back /test-file.
+        # No `--wipe` — the disk image from phase 1 is exactly what this
+        # pass reads back. If phase 2 fails, the image is left on disk
+        # for post-mortem (matches the `--with-disk` non-ephemeral
+        # posture — the developer can re-launch phase 2 by hand to
+        # observe the re-mount without redoing the write pass).
+        "$0" --with-disk boot_r53_round_trip_phase2
+        _r53_phase2_rc=$?
+        if [[ ${_r53_phase2_rc} -ne 0 && ${_r53_phase2_rc} -ne 33 ]]; then
+            echo "smoke: boot_r53_round_trip PHASE2 FAILED (rc=${_r53_phase2_rc})" >&2
+            exit ${_r53_phase2_rc}
+        fi
+
+        echo "smoke: boot_r53_round_trip meta-mode passed (phase1+phase2 clean)"
+        exit 0
+        ;;
     prod)
         # prod mode: expects exit code 2 (kernel didn't build)
         # Skip verification, just exit with code 2
@@ -1084,6 +1221,86 @@ KERNEL="${REPO_ROOT}/build/kernel.elf"
 
 LOG="/tmp/paideia-os-smoke.log"
 rm -f "${LOG}"
+
+# R53.M4-002 (#1749): PDXB disk-image lifecycle. When --with-disk is
+# set (WITH_DISK=1 — flag parser owned by sibling R53.M4-001 #1748),
+# materialise the backing image before launching QEMU:
+#
+#   - image absent             → mkfs
+#   - --wipe (WIPE_DISK=1)     → unconditional re-mkfs (delegated via
+#                                mkfs-pdxb.sh --force)
+#   - image present, no --wipe → use as-is (re-boot path)
+#
+# Delegates to tools/mkfs-pdxb.sh (R53.M1-002 #1731) which owns the
+# actual dd + mkfs-pdxb binary invocation + layout. Its exit-3
+# signal (the mkfs-pdxb binary from R53.M1-001 #1730 is not built
+# yet) fails the smoke cleanly with a pointer at the missing
+# dependency rather than launching QEMU against a zero-byte or
+# absent image.
+#
+# All three knobs are read as `${VAR:-default}` so this block is a
+# no-op (DISK_ARGS empty; every legacy mode's launch shape preserved
+# byte-for-byte) whenever the caller did not set WITH_DISK=1. When
+# #1748 lands its leading-flag parser it will populate WITH_DISK /
+# WIPE_DISK / DISK_IMAGE_PATH before this point; the defaults here
+# are the fallback for direct env-driven callers and for the pre-
+# #1748 transition window.
+#
+# Default image path: per-job scratch under ${CLAUDE_JOB_DIR}/tmp so
+# parallel Claude jobs cannot stomp each other's image, else a
+# stable /tmp path for developer shells. Size default matches the
+# design doc's 128 MiB floor (§2.1); PDXB_IMAGE_SIZE_MIB env
+# override still wins (mkfs-pdxb.sh reads the same var).
+WITH_DISK="${WITH_DISK:-0}"
+WIPE_DISK="${WIPE_DISK:-0}"
+if [[ -n "${CLAUDE_JOB_DIR:-}" ]]; then
+    DISK_IMAGE_PATH="${DISK_IMAGE_PATH:-${CLAUDE_JOB_DIR}/tmp/pdxb-smoke.img}"
+else
+    DISK_IMAGE_PATH="${DISK_IMAGE_PATH:-/tmp/paideia-pdxb-smoke.img}"
+fi
+DISK_IMAGE_SIZE_MIB="${DISK_IMAGE_SIZE_MIB:-${PDXB_IMAGE_SIZE_MIB:-128}}"
+DISK_ARGS=()
+if [[ ${WITH_DISK} -eq 1 ]]; then
+    mkfs_needed=0
+    if [[ ${WIPE_DISK} -eq 1 ]]; then
+        mkfs_needed=1
+    elif [[ ! -f "${DISK_IMAGE_PATH}" ]]; then
+        mkfs_needed=1
+    fi
+    if [[ ${mkfs_needed} -eq 1 ]]; then
+        mkdir -p -- "$(dirname -- "${DISK_IMAGE_PATH}")"
+        mkfs_flags=()
+        if [[ ${WIPE_DISK} -eq 1 ]]; then
+            mkfs_flags+=(--force)
+        fi
+        mkfs_stderr="$(mktemp -t paideia-mkfs-stderr-XXXXXX)"
+        PDXB_IMAGE_SIZE_MIB="${DISK_IMAGE_SIZE_MIB}" \
+            "${REPO_ROOT}/tools/mkfs-pdxb.sh" "${mkfs_flags[@]}" \
+            "${DISK_IMAGE_PATH}" >/dev/null 2>"${mkfs_stderr}"
+        mkfs_rc=$?
+        if [[ ${mkfs_rc} -ne 0 ]]; then
+            if [[ ${mkfs_rc} -eq 3 ]]; then
+                echo "smoke: --with-disk requested but mkfs-pdxb binary is not built yet" >&2
+                echo "smoke: land R53.M1-001 (#1730 — src/tools/mkfs-pdxb/main.pdx) then re-run 'bash tools/build.sh'" >&2
+            else
+                echo "smoke: tools/mkfs-pdxb.sh failed (rc=${mkfs_rc})" >&2
+            fi
+            [[ -s "${mkfs_stderr}" ]] && cat "${mkfs_stderr}" >&2
+            rm -f "${mkfs_stderr}"
+            exit 1
+        fi
+        rm -f "${mkfs_stderr}"
+    fi
+    # NVMe topology (§2.1 of design/tooling/volume-lifecycle-mechanism.md):
+    # if=none decouples the drive from the default IDE bus; the nvme
+    # device binds it explicitly. serial=PDXB0001 is grep-stable across
+    # boots. logical/physical_block_size=4096 matches PDXB v1 (R52
+    # §2.6) — the R52 mount refuses if geom.lba_size != 4096.
+    DISK_ARGS=(
+        -drive "file=${DISK_IMAGE_PATH},if=none,id=nvme0,format=raw"
+        -device "nvme,drive=nvme0,serial=PDXB0001,logical_block_size=4096,physical_block_size=4096"
+    )
+fi
 
 if [[ ${UART_RX_MODE} -eq 1 ]]; then
     # R16.M4-666 (#666) end-to-end UART RX real-IRQ smoke.
@@ -1209,30 +1426,70 @@ else
         CPU_ARGS=(-cpu "${QEMU_CPU}")
     fi
     # R52.M8-001 (#1721): opt-in NVMe drive attach for boot_r52_pdxfs_
-    # mkfs_nvme. Provisions a per-invocation raw-format tempfile of
-    # NVME_IMG_SIZE_MB (default 16) MiB, exposes it as an emulated
-    # NVMe namespace (`-drive file=<tmpfile>,if=none,id=nvme0,format=
-    # raw -device nvme,drive=nvme0,serial=deadbeef`), and unlinks the
-    # tempfile after QEMU exits. Empty NVME_MODE (default 0) leaves
-    # NVME_ARGS unset, preserving every legacy mode's QEMU launch
-    # byte-for-byte.
+    # mkfs_nvme. Provisions a raw-format image, exposes it as an
+    # emulated NVMe namespace (`-drive file=<img>,if=none,id=nvme0,
+    # format=raw -device nvme,drive=nvme0,serial=deadbeef`), and (in
+    # the legacy tempfile path only) unlinks the image after QEMU
+    # exits. Empty NVME_MODE (default 0) leaves NVME_ARGS unset,
+    # preserving every legacy mode's QEMU launch byte-for-byte.
+    #
+    # R53.M4-001 (#1748): --with-disk is the flag-based entrypoint on
+    # top of the same NVMe attach machinery. It routes to a persistent
+    # image at ${REPO_ROOT}/tests/qemu/disks/pdxb-root.img (override
+    # via NVME_IMG env) instead of a per-invocation tempfile, so the
+    # image survives across runs and mkfs → mount → reboot → read-back
+    # progressions can compose (R53.M4-002+ / boot_r53_first_mount).
+    # --wipe forces re-provisioning even when the image already exists;
+    # without --wipe, an existing image's contents are kept verbatim.
+    # Follow-on tickets (R53.M4-002 #1749) layer mkfs-pdxb.sh on top
+    # of the WIPE branch so a wiped image comes up with a fresh PDXB
+    # superblock rather than raw zeros.
     NVME_ARGS=()
     NVME_CLEANUP=""
+    if [[ ${WITH_DISK} -eq 1 ]]; then
+        NVME_MODE=1
+    fi
     if [[ ${NVME_MODE} -eq 1 ]]; then
-        if [[ -z "${NVME_IMG}" ]]; then
+        # Path selection:
+        #   --with-disk           → persistent path (default under
+        #                           tests/qemu/disks/; NVME_IMG env
+        #                           overrides). No cleanup.
+        #   NVME_MODE=1 env only  → per-invocation tempfile, cleaned
+        #                           up after QEMU exits (legacy #1721
+        #                           behavior, byte-for-byte preserved).
+        NVME_PERSIST=0
+        if [[ ${WITH_DISK} -eq 1 ]]; then
+            NVME_PERSIST=1
+            if [[ -z "${NVME_IMG}" ]]; then
+                NVME_IMG="${REPO_ROOT}/tests/qemu/disks/pdxb-root.img"
+            fi
+            mkdir -p "$(dirname "${NVME_IMG}")"
+        elif [[ -z "${NVME_IMG}" ]]; then
             NVME_IMG="$(mktemp -t paideia-pdxfs-smoke-XXXXXX.img)"
             NVME_CLEANUP="${NVME_IMG}"
         fi
-        # Provision the backing file. dd is used (vs. truncate) so the
-        # file is zero-filled up front — an emulated NVMe namespace
-        # reads back defined zeros from every unwritten LBA and mkfs
-        # writes have a determinate target.
-        dd if=/dev/zero of="${NVME_IMG}" bs=1M count="${NVME_IMG_SIZE_MB}" \
-            status=none 2>/dev/null || {
-            echo "smoke: failed to provision NVMe backing image ${NVME_IMG}" >&2
-            [[ -n "${NVME_CLEANUP}" ]] && rm -f "${NVME_CLEANUP}"
-            exit 1
-        }
+        # Provisioning gate:
+        #   - Legacy tempfile path (NVME_PERSIST=0)         → always dd
+        #     (preserves #1721 byte-for-byte behavior for the mktemp
+        #     case AND the env-supplied-NVME_IMG case).
+        #   - --with-disk with missing image                → dd (first
+        #     run bootstraps the persistent image).
+        #   - --with-disk --wipe                            → dd
+        #     (explicit re-provision even if image exists).
+        #   - --with-disk, image exists, no --wipe          → skip dd
+        #     (keep existing contents — the whole point of persistence).
+        if [[ ${NVME_PERSIST} -eq 0 || ${WIPE} -eq 1 || ! -f "${NVME_IMG}" ]]; then
+            # dd is used (vs. truncate) so the file is zero-filled up
+            # front — an emulated NVMe namespace reads back defined
+            # zeros from every unwritten LBA and mkfs writes have a
+            # determinate target.
+            dd if=/dev/zero of="${NVME_IMG}" bs=1M count="${NVME_IMG_SIZE_MB}" \
+                status=none 2>/dev/null || {
+                echo "smoke: failed to provision NVMe backing image ${NVME_IMG}" >&2
+                [[ -n "${NVME_CLEANUP}" ]] && rm -f "${NVME_CLEANUP}"
+                exit 1
+            }
+        fi
         NVME_ARGS=(
             -drive "file=${NVME_IMG},if=none,id=nvme0,format=raw"
             -device "nvme,drive=nvme0,serial=deadbeef"
