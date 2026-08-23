@@ -97,9 +97,16 @@ SECTIONS
             } :data_high
 
     .bss (NOLOAD) : ALIGN(4K) {
+                /* #1567: exported so entry.pdx's _start can explicitly
+                 * rep-stosq-zero this region before any kernel code
+                 * touches it, rather than depending on the -kernel boot
+                 * chain (QEMU / SeaBIOS) to have zero-filled this NOBITS
+                 * PT_LOAD's tail. See boot/zero_bss.pdx. */
+                _bss_start = .;
                 *(COMMON)
                 *(.bss .bss.*)
                 . = ALIGN(4K);
+                _bss_end = .;
             } :bss_high
 
     /DISCARD/ : {
