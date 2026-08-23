@@ -5834,6 +5834,37 @@ fi
 echo "[r52-m2-confine] R52.M2 (mkfs) confined"
 
 # ---------------------------------------------------------------------------
+# R52.M2-004 (#1689): one-writer discipline for mkfs.pdxfs --upgrade's
+# scratch state.
+#
+#   * mkfs_upgrade (src/kernel/core/fs/pdxfs/mkfs_upgrade.pdx)
+#
+# _mkfs_up_read_buf/_mkfs_up_read_desc (the raw LBA-0 read staged
+# against a possibly-PDXL volume), _mkfs_up_layout_row (the 9-field
+# region-layout result seeded from the preserved PDXL itable/alloc
+# fields), and _mkfs_up_sb_scratch (the new PDXB superblock built
+# before sb_write persists it) are all single-writer state confined to
+# this one module -- a second writer could race the descriptor page
+# mid-submission or corrupt the superblock scratch between
+# mkfs_up_sb_populate and sb_write.
+R52_MKFS_UP_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/mkfs_upgrade.pdx"
+if [[ ! -f "${R52_MKFS_UP_SRC}" ]]; then
+    echo "[r52-m2-confine] FAIL - mkfs_upgrade.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_mkfs_up_read_buf'   'core/fs/pdxfs/mkfs_upgrade.o'
+ec_confine_one '_mkfs_up_read_desc'  'core/fs/pdxfs/mkfs_upgrade.o'
+ec_confine_one '_mkfs_up_layout_row' 'core/fs/pdxfs/mkfs_upgrade.o'
+ec_confine_one '_mkfs_up_sb_scratch' 'core/fs/pdxfs/mkfs_upgrade.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See mkfs_upgrade.pdx §Storage for the per-module one-writer" >&2
+    echo "  discipline (the sole writers are mkfs_up_layout_compute," >&2
+    echo "  mkfs_up_sb_populate, and mkfs_upgrade_from_pdxl)." >&2
+    exit 1
+fi
+echo "[r52-m2-confine] R52.M2 (mkfs_upgrade) confined"
+
+# ---------------------------------------------------------------------------
 # R42-PREP-008 (#1630): one-writer discipline for the PdxFS userspace
 # directory iterator cursor table.
 #
