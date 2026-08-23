@@ -5768,6 +5768,32 @@ fi
 echo "[r52-m2-confine] R52.M2 (superblock_read) confined"
 
 # ---------------------------------------------------------------------------
+# R52.M2-002 (#1687): one-writer discipline for the PdxFS-on-block
+# superblock-write scratch state.
+#
+#   * superblock_write (src/kernel/core/fs/pdxfs/superblock_write.pdx)
+#
+# _sb_write_desc (the BDEV_OP_WRITE_LBA descriptor page) is the only
+# place `sb_write` stages a device write. A second writer could race the
+# descriptor page mid-submission (corrupting lba/nblocks/dma_iova between
+# the stamp and the cap_invoke), corrupting a signed-superblock write in
+# flight. No `_sb_write_buf` exists here -- unlike sb_read, sb_write
+# never owns the superblock bytes (dma_iova points at the caller-supplied
+# sb_block_ptr directly, see superblock_write.pdx §Storage).
+R52_SBWR_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/superblock_write.pdx"
+if [[ ! -f "${R52_SBWR_SRC}" ]]; then
+    echo "[r52-m2-confine] FAIL - superblock_write.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_sb_write_desc' 'core/fs/pdxfs/superblock_write.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See superblock_write.pdx §Storage for the per-module one-writer" >&2
+    echo "  discipline (the sole writer is sb_write)." >&2
+    exit 1
+fi
+echo "[r52-m2-confine] R52.M2 (superblock_write) confined"
+
+# ---------------------------------------------------------------------------
 # R42-PREP-008 (#1630): one-writer discipline for the PdxFS userspace
 # directory iterator cursor table.
 #
