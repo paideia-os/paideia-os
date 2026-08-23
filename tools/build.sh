@@ -6087,6 +6087,38 @@ fi
 echo "[r52-m7-confine] R52.M7-002 (KIND_BLOCK_CACHE handle) confined"
 
 # ---------------------------------------------------------------------------
+# R53-PREP-001 (#1728): one-writer discipline for KIND_PDXFS_MOUNT_TABLE.
+#
+#   * kind_pdxfs_mount_table (KIND_PDXFS_MOUNT_TABLE = 0x1A5, over KIND_MEMORY)
+#
+# _kind_pmt_table + _kind_pmt_stats are the only places in the kernel
+# where the KIND_PDXFS_MOUNT_TABLE HANDLE authority lives (the kernel-
+# owned view over core/fs/mount.pdx's _mount_table[]).  A second writer
+# would let one caller mutate the row (forge a mount_slot_count, silently
+# rebind the table_row_addr away from the real _mount_table[], corrupt
+# one of the reserved words) with no capability involved.  Per-module
+# confinement is what makes that unreachable by construction; the sole
+# writers are pmt_tail_alloc / pmt_tail_free / pmt_note / pmt_table_reset
+# (all in kind_pdxfs_mount_table.pdx).  Names carry the `_kind_pmt_`
+# prefix to stay disjoint from mount.pdx's own `_mount_table` (the
+# observed target, not this cap's authority row) and from every prior
+# `_kind_*_table` sibling.
+R53_KPMT_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_pdxfs_mount_table.pdx"
+if [[ ! -f "${R53_KPMT_SRC}" ]]; then
+    echo "[r53-prep-confine] FAIL - kind_pdxfs_mount_table.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_kind_pmt_table' 'core/cap/kind_pdxfs_mount_table.o'
+ec_confine_one '_kind_pmt_stats' 'core/cap/kind_pdxfs_mount_table.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_pdxfs_mount_table.pdx SECTION 1 for the per-module" >&2
+    echo "  one-writer discipline (the sole writers are pmt_tail_alloc + " >&2
+    echo "  pmt_tail_free + pmt_note + pmt_table_reset)." >&2
+    exit 1
+fi
+echo "[r53-prep-confine] R53-PREP-001 (KIND_PDXFS_MOUNT_TABLE handle) confined"
+
+# ---------------------------------------------------------------------------
 # R52.M5-002 (#1704): one-writer discipline for the on-disk JBNL journal
 # ring's writer/walker state.
 #
