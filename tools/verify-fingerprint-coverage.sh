@@ -167,6 +167,28 @@ ALLOWLIST = {
         "tests/kernel/mm/uefi_physmap_synthetic.pdx — UEFI physmap synth, no default mode",
     "XSAVE SYNTH OK":
         "tests/kernel/cpu/xsave_synth.pdx — needs QEMU_CPU=max (PAIDEIA_R21_YMM opt-in)",
+
+    # src/tools/mkfs-pdxb/main.pdx — userspace mkfs-pdxb binary's
+    # success line (#1730). Not reachable from any QEMU boot mode: the
+    # kernel does not exec mkfs-pdxb, and no host-tools build target is
+    # wired yet (#1730 flagged as follow-up). Becomes assertable when a
+    # host-tools build target lands and a host-side test invokes the
+    # binary (see the Python layout test #1735 as the eventual driver).
+    "MKFS PDXB OK":
+        "userspace mkfs-pdxb binary success line; no boot mode execs it "
+        "and no host-tools build target is wired yet (#1730 follow-up).",
+
+    # src/kernel/boot/witness/pdxfs_reboot_verify_smoke.pdx — LIVE arm's
+    # first-boot branch (SB_FLAG_CLEAN not set post-mkfs, #1725). The
+    # default 14-mode matrix boots substrate (no live NVMe), so mount
+    # refuses and the witness lands on the SUBSTRATE fingerprint that
+    # IS in the golden. This FIRST branch only fires in phase-1 of the
+    # opt-in two-phase LIVE mode (boot_r53_round_trip_phase1, #1751),
+    # where the disk is freshly mkfs'd and mounted for the first time.
+    "PDXFS REBOOT VERIFY FIRST OK":
+        "LIVE first-boot arm: mount succeeds and sb_flags bit 0 CLEAR. "
+        "Default modes take the SUBSTRATE arm; assertable via "
+        "boot_r53_round_trip_phase1 opt-in (PAIDEIA_R53_DISK=1, #1751).",
 }
 
 # Below these counts the extractor has stopped matching rather than the
