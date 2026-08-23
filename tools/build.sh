@@ -5689,6 +5689,13 @@ ec_confine_one '_pkgi_stage'                'boot/witness/pdxfs_pkg_install_smok
 # the sole writer inside the witness function itself, and no other
 # .pdx even references the symbol name (grep audit 2026-08-23).
 ec_confine_one '_pms_stage'                 'boot/witness/pdxfs_mkfs_smoke.o'
+# R53.M3-006 (#1747) no-disk fallback boot witness's stage counter
+# (only mutable static in the fixture; the OK/FAIL tag arrays and the
+# count-key rodata are read-only). Same posture as _pkgi_stage /
+# _pms_stage: pdxbnd_fail_stage / wit_pdxb_no_disk_fallback are the
+# sole writers inside the witness function itself, and no other .pdx
+# references the symbol name.
+ec_confine_one '_pdxbnd_stage'              'boot/witness/pdxb_no_disk_witness.o'
 ec_confine_one '_elevate_channel_table'     'core/cap/kind_elevate_channel.o'
 ec_confine_one '_elevate_channel_stats'     'core/cap/kind_elevate_channel.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then
