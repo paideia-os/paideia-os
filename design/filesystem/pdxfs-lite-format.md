@@ -8,6 +8,8 @@
 
 **Successor:** PdxFS v1 (R40, CoW-PQ) — one-way migration tool documented in §7.
 
+**Related (added 2026-08-22, issue #1684):** the R25 superblock frozen in §1 below (magic `"PDXL"`) is distinct from — but the direct ancestor of — the R52 block-backed superblock (magic `"PDXB"`) frozen in `design/filesystem/volume-fs-substrate.md` §2.1. See §9 for the full cross-reference, including the concrete implementation files.
+
 ---
 
 ## 0. Decisions summary
@@ -326,4 +328,5 @@ Fixture generation (for R25.M2): a host-side `mkfs.pdxfs-lite` binary that mater
 - `design/filesystem/cow-design.md` — R40 successor format overview.
 - `design/filesystem/phase1-bootfs.md` — pre-R16 stopgap (superseded by tmpfs at R16, superseded here at R25 for persistence).
 - `src/kernel/core/fs/vnode.pdx` — VFS entry point that PdxFS-lite will register with at R25.M2.
+- `design/filesystem/volume-fs-substrate.md` §2.1 (R52, added 2026-08-22, issue #1684) — the frozen block-backed successor superblock (PdxFS-on-block v1, magic `"PDXB"`) that supersedes this document's §1 `"PDXL"` layout for the real volume filesystem; §2.2–§2.4 there cover the bitmap allocator, 128-B inode table, and journal region built on top of it. Concrete implementation: `src/kernel/core/fs/pdxfs/superblock_fmt.pdx` (landed `1d8b16c`) and `src/kernel/core/fs/pdxfs/superblock.pdx` (landed `39e5ebe`).
 - `src/kernel/core/drivers/nvme/sync.pdx` — `nvme_read_blocking` used by `pdxfs_lite_read_superblock`.

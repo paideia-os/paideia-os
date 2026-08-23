@@ -14,6 +14,9 @@
 - `design/kernel/memory-model.md` — CoW emerges from substructural lattice + page-fault handler (MEM-Q6); page-size derived kinds.
 - `design/security/pq-trust-root.md` — SLH-DSA-128s (boot), Ed25519+ML-DSA-65 (operational), ML-KEM-1024 (KEK), algorithm catalog.
 
+**Downstream realisation (added 2026-08-22, issue #1684):**
+- `design/filesystem/volume-fs-substrate.md` §2 (R52) — the frozen on-disk superblock layout for the block-backed realisation of this document's CoW design: PdxFS-on-block v1, magic `"PDXB"`. §2.1 has the full field table (magic/version/UUID/region LBAs/signed-inode-tail); §2.2–§2.4 cover the block allocator, inode table, and journal region this document's B-epsilon + HAMT + Merkle design ultimately writes through. Concrete implementation: `src/kernel/core/fs/pdxfs/superblock_fmt.pdx` (field layout + constants, landed `1d8b16c`) and `src/kernel/core/fs/pdxfs/superblock.pdx` (read/validate/mount logic, landed `39e5ebe`).
+
 ---
 
 ## 0. Decisions summary
@@ -120,6 +123,8 @@
    │   round-robin  │   - SLH-DSA-128s signature over the above              │
    └──────────────┴─────────────────────────────────────────────────────────┘
 ```
+
+**Note:** the "Superblock chain" box above is realised on real block storage as the frozen PdxFS-on-block v1 superblock (magic `"PDXB"`) specified in `design/filesystem/volume-fs-substrate.md` §2.1 — see the "Downstream realisation" cross-reference at the top of this document.
 
 ---
 
