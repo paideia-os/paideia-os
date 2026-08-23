@@ -5794,6 +5794,36 @@ fi
 echo "[r52-m2-confine] R52.M2 (superblock_write) confined"
 
 # ---------------------------------------------------------------------------
+# R52.M2-003 (#1688): one-writer discipline for the mkfs.pdxfs tool's
+# scratch state.
+#
+#   * mkfs (src/kernel/core/fs/pdxfs/mkfs.pdx)
+#
+# _mkfs_layout_row (the 9-field region-layout result), _mkfs_sb_scratch
+# (the in-memory superblock built before sb_write persists it),
+# _mkfs_zero_buf (the shared all-zero WRITE_LBA source buffer), and
+# _mkfs_zero_desc (the WRITE_LBA descriptor page used by the region-zero
+# loop) are all single-writer state confined to this one module -- a
+# second writer could race a region-zero write mid-submission or corrupt
+# the superblock scratch between mkfs_sb_populate and sb_write.
+R52_MKFS_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/mkfs.pdx"
+if [[ ! -f "${R52_MKFS_SRC}" ]]; then
+    echo "[r52-m2-confine] FAIL - mkfs.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_mkfs_layout_row' 'core/fs/pdxfs/mkfs.o'
+ec_confine_one '_mkfs_sb_scratch' 'core/fs/pdxfs/mkfs.o'
+ec_confine_one '_mkfs_zero_buf'   'core/fs/pdxfs/mkfs.o'
+ec_confine_one '_mkfs_zero_desc'  'core/fs/pdxfs/mkfs.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See mkfs.pdx §Storage for the per-module one-writer" >&2
+    echo "  discipline (the sole writers are mkfs_layout_compute," >&2
+    echo "  mkfs_sb_populate, and mkfs_zero_region)." >&2
+    exit 1
+fi
+echo "[r52-m2-confine] R52.M2 (mkfs) confined"
+
+# ---------------------------------------------------------------------------
 # R42-PREP-008 (#1630): one-writer discipline for the PdxFS userspace
 # directory iterator cursor table.
 #
