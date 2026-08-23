@@ -5669,6 +5669,9 @@ ec_confine_one '_pxt_rename_ctx'            'core/cap/kind_pdxfs_txn.o'
 ec_confine_one '_pdxfs_txn_rename_stage'    'core/cap/kind_pdxfs_txn.o'
 ec_confine_one '_pxt_unlink_ctx'            'core/cap/kind_pdxfs_txn.o'
 ec_confine_one '_pdxfs_txn_unlink_stage'    'core/cap/kind_pdxfs_txn.o'
+# M6 real-body ops boot witness's stage counter (only mutable static
+# in the fixture; the fingerprint and staged-name rodata are read-only).
+ec_confine_one '_pxor_stage'                'tests/kernel/pdxfs_txn/pdxfs_txn_ops_real_synth.o'
 ec_confine_one '_elevate_channel_table'     'core/cap/kind_elevate_channel.o'
 ec_confine_one '_elevate_channel_stats'     'core/cap/kind_elevate_channel.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then
