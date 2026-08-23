@@ -5696,6 +5696,13 @@ ec_confine_one '_pms_stage'                 'boot/witness/pdxfs_mkfs_smoke.o'
 # sole writers inside the witness function itself, and no other .pdx
 # references the symbol name.
 ec_confine_one '_pdxbnd_stage'              'boot/witness/pdxb_no_disk_witness.o'
+# R53.M5-005 (#1758) AHCI-parity PDXB probe boot witness's stage
+# counter (only mutable static in the fixture; the OK/FAIL tag
+# arrays and the count-key rodata are read-only). Same posture as
+# _pdxbnd_stage / _pkgi_stage / _pms_stage: pdxbap_fail_stage /
+# wit_pdxb_ahci_probe are the sole writers inside the witness
+# function itself, and no other .pdx references the symbol name.
+ec_confine_one '_pdxbap_stage'              'boot/witness/pdxb_ahci_probe.o'
 ec_confine_one '_elevate_channel_table'     'core/cap/kind_elevate_channel.o'
 ec_confine_one '_elevate_channel_stats'     'core/cap/kind_elevate_channel.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then
