@@ -1094,6 +1094,114 @@ case "${EXPECTED}" in
         NVME_MODE=1
         EXPECTED=""
         ;;
+    boot_r53_round_trip_phase1)
+        # R53.M4-004 (#1751): phase-1 subordinate mode of the two-
+        # phase round-trip smoke. Requires --with-disk.
+        #
+        # Sequence (host-side + kernel-side):
+        #
+        #   * Host-side (via the --with-disk / --wipe pipeline the
+        #     leading-flag parser R53.M4-001 #1748 + image-lifecycle
+        #     block R53.M4-002 #1749 already own): the caller passes
+        #     --wipe so tools/mkfs-pdxb.sh materialises a fresh PDXB
+        #     superblock at ${DISK_IMAGE_PATH} before QEMU launches.
+        #     The two-phase orchestrator meta-mode (sibling
+        #     boot_r53_round_trip #1752) invokes THIS mode with
+        #     "--with-disk --wipe" for exactly that reason; a manual
+        #     caller that omits --wipe against a stale image gets
+        #     whatever prior state the file already carried (no
+        #     defensive re-wipe here).
+        #
+        #   * Kernel-side (single QEMU boot against the freshly-mkfs'd
+        #     device): the standard boot chain fires the M8 witnesses
+        #     in order — pdxfs_mkfs_smoke_witness (M8-001 #1721),
+        #     pdxfs_boot_mount_smoke (M8-002 #1722, PDXFS BOOT MOUNT
+        #     OK + PDXB PROBE OK from probe.pdx), pdxfs_pkg_install_
+        #     witness (M8-003 #1723), pdxfs_umount_smoke_witness
+        #     (M8-004 #1724, which stamps PDXB_SB_FLAG_CLEAN_UNMOUNT
+        #     on the persisted superblock). Terminal witness
+        #     pdxfs_round_trip_phased (this issue's own body in src/
+        #     kernel/boot/witness/pdxfs_round_trip_phased.pdx)
+        #     branches on the just-observed sb_flags bit 0 and emits
+        #     "ROUND TRIP PHASE1 OK" for phase 1 (bit CLEAR, per
+        #     that witness's header — the phase 1 disk arrives with
+        #     bit 0 in the not-yet-cleanly-umounted state its
+        #     discriminator treats as PHASE1).
+        #
+        # Golden: tests/r53/round-trip-phase1.golden pins the six
+        # LIVE-arm ordered lines (PDXFS MKFS SMOKE OK / PDXB PROBE
+        # OK / PDXFS BOOT MOUNT OK / PDXFS PKG INSTALL OK / PDXFS
+        # UMOUNT CLEAN OK / ROUND TRIP PHASE1 OK). Substrate boots
+        # (no --with-disk) fail the golden at the first LIVE line
+        # because the mkfs_smoke witness stays on its SUBSTRATE arm
+        # under NVMEIO_PICK_NONE — the [[ ${WITH_DISK} -eq 0 ]]
+        # guard below refuses that upfront to give the operator a
+        # clean "requires --with-disk" diagnostic instead of an
+        # inscrutable fingerprint miss.
+        #
+        # Timeout budget: 25 s accommodates the full M8 witness
+        # cluster on a slow host without the boot chain racing
+        # against timeout; matches the design doc's §7.3 TIMEOUT=30
+        # ceiling for the meta-mode split across two phases.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r53/round-trip-phase1.golden"
+        TIMEOUT=25
+        EXPECTED=""
+        if [[ ${WITH_DISK} -eq 0 ]]; then
+            echo "smoke: boot_r53_round_trip_phase1 requires --with-disk" >&2
+            exit 2
+        fi
+        ;;
+    boot_r53_round_trip_phase2)
+        # R53.M4-004 (#1751): phase-2 subordinate mode of the two-
+        # phase round-trip smoke. Requires --with-disk; does NOT wipe.
+        #
+        # Sequence (host-side + kernel-side):
+        #
+        #   * Host-side: the caller passes --with-disk WITHOUT --wipe,
+        #     so the image-lifecycle block reuses the exact bytes the
+        #     phase-1 kernel left after clean umount (per §2.1 of
+        #     design/tooling/volume-lifecycle-mechanism.md: no
+        #     -snapshot ever, host file mutations persist). The two-
+        #     phase orchestrator meta-mode (sibling boot_r53_round_
+        #     trip #1752) invokes THIS mode second, guarded on
+        #     phase 1's clean exit.
+        #
+        #   * Kernel-side: the standard boot chain fires the same M8
+        #     witnesses against the persisted superblock. pdxfs_boot_
+        #     mount_smoke re-mounts the volume (PDXFS BOOT MOUNT OK
+        #     + PDXB PROBE OK), pdxfs_reboot_verify_smoke (M8-005
+        #     #1725) drives the sig-verify walk and emits "PDXFS
+        #     REBOOT VERIFY OK" for the bit-SET arm (the phase-1
+        #     umount stamped PDXB_SB_FLAG_CLEAN_UNMOUNT before this
+        #     boot). The terminal witness pdxfs_round_trip_phased
+        #     branches on the observed sb_flags bit 0 and emits
+        #     "ROUND TRIP PHASE2 OK" for phase 2 (bit SET — the
+        #     persisted-volume-from-clean-umount discriminator).
+        #
+        # Golden: tests/r53/round-trip-phase2.golden pins the four
+        # LIVE-arm ordered lines (PDXB PROBE OK / PDXFS BOOT MOUNT
+        # OK / PDXFS REBOOT VERIFY OK / ROUND TRIP PHASE2 OK). No
+        # MKFS / PKG INSTALL / UMOUNT lines — those are phase 1
+        # concerns, and the contains-in-order check pins only what
+        # the phase 2 pass is expected to demonstrate (the reboot +
+        # remount + verify path, not the write path). The M8
+        # witnesses that DO emit those lines (M8-001, M8-003,
+        # M8-004) still fire in this boot too — the smoke check's
+        # contains-in-order semantic ignores extra unpinned lines.
+        #
+        # Timeout budget matches phase 1 (25 s) — the read-back +
+        # sig-verify walk fits well inside it on any host that
+        # completes phase 1 in time.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r53/round-trip-phase2.golden"
+        TIMEOUT=25
+        EXPECTED=""
+        if [[ ${WITH_DISK} -eq 0 ]]; then
+            echo "smoke: boot_r53_round_trip_phase2 requires --with-disk" >&2
+            exit 2
+        fi
+        ;;
     boot_r53_round_trip)
         # R53.M4-005 (#1752): two-phase orchestrator meta-mode.
         #
@@ -1170,6 +1278,48 @@ case "${EXPECTED}" in
 
         echo "smoke: boot_r53_round_trip meta-mode passed (phase1+phase2 clean)"
         exit 0
+        ;;
+    boot_r53_first_mount)
+        # R53.M4-003 (#1750): first PDXB volume-mount smoke on a
+        # QEMU-attached NVMe device the sibling R53.M4-001 (#1748)
+        # --with-disk flag parser + R53.M4-002 (#1749) image-lifecycle
+        # block already wire up.
+        #
+        # Requires --with-disk (design/tooling/volume-lifecycle-
+        # mechanism.md §7.3): without a live NVMe device the LIVE-arm
+        # fingerprints the golden pins (PDXB PROBE OK, PDXB VOLUME
+        # MOUNTED, PDXFS BOOT MOUNT OK, PDXB ROOT SELECTED) never
+        # appear — the same probe/mount/root_select witnesses take
+        # their SUBSTRATE arms and emit different strings the golden
+        # would then fail. The WITH_DISK gate exits 2 (mirroring
+        # `prod` mode's "kernel didn't build" conventional exit for
+        # smokes that structurally cannot run) with a diagnostic
+        # pointing at the missing flag, matching sibling
+        # boot_r53_round_trip_phase{1,2} one-for-one.
+        #
+        # Golden: tests/r53/first-mount.golden pins the five ordered
+        # fingerprints the LIVE arm produces. Terminal closer line
+        # "FIRST MOUNT OK" is emitted by pdxfs_first_mount_witness
+        # (src/kernel/boot/witness/pdxfs_first_mount.pdx, wired into
+        # r30_platform.pdx immediately after pdxb_root_select_
+        # fingerprint_call and before pdxfs_round_trip_final_call).
+        # The four upstream fingerprints already exist: probe.pdx
+        # (#1706 + R53.M3-005 #1746 hook), mount_block.pdx (#1707 +
+        # R53.M3-005 hook), pdxfs_boot_mount_smoke.pdx (#1722 LIVE
+        # arm), root_select.pdx (#1744 + R53.M3-005 hook LIVE arm).
+        #
+        # Timeout: 15s — matches the design doc's §7.3 shape; the
+        # mount + inode-read round-trip is bounded by an in-memory
+        # volume registry walk plus one nested block-cache read
+        # (§4.2 step 3), all comfortably under the timer budget.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r53/first-mount.golden"
+        TIMEOUT=15
+        EXPECTED=""
+        if [[ ${WITH_DISK} -eq 0 ]]; then
+            echo "smoke: boot_r53_first_mount requires --with-disk" >&2
+            exit 2
+        fi
         ;;
     prod)
         # prod mode: expects exit code 2 (kernel didn't build)
