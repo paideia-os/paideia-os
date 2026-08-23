@@ -5742,6 +5742,32 @@ fi
 echo "[r51-m2-confine] R51.M2 (KIND_NVME_NAMESPACE) confined"
 
 # ---------------------------------------------------------------------------
+# R52.M2-001 (#1686): one-writer discipline for the PdxFS-on-block
+# superblock-read scratch state.
+#
+#   * superblock_read (src/kernel/core/fs/pdxfs/superblock_read.pdx)
+#
+# _sb_read_buf (the 4-KiB landing zone for the just-read LBA-0 block) and
+# _sb_read_desc (the BDEV_OP_READ_LBA descriptor page) are the only
+# places `sb_read` stages a device read. A second writer could race the
+# descriptor page mid-submission (corrupting lba/nblocks/dma_iova between
+# the stamp and the cap_invoke) or read a stale/partially-written buffer
+# out from under sb_read's own validators.
+R52_SBRD_SRC="${REPO_ROOT}/src/kernel/core/fs/pdxfs/superblock_read.pdx"
+if [[ ! -f "${R52_SBRD_SRC}" ]]; then
+    echo "[r52-m2-confine] FAIL - superblock_read.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_sb_read_buf'  'core/fs/pdxfs/superblock_read.o'
+ec_confine_one '_sb_read_desc' 'core/fs/pdxfs/superblock_read.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See superblock_read.pdx §Storage for the per-module one-writer" >&2
+    echo "  discipline (the sole writer is sb_read)." >&2
+    exit 1
+fi
+echo "[r52-m2-confine] R52.M2 (superblock_read) confined"
+
+# ---------------------------------------------------------------------------
 # R42-PREP-008 (#1630): one-writer discipline for the PdxFS userspace
 # directory iterator cursor table.
 #
