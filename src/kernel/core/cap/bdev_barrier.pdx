@@ -1,0 +1,770 @@
+// src/kernel/core/cap/bdev_barrier.pdx -- R51.M8-002 (#1676)
+//
+// JOURNALED WRITE + FLUSH BARRIER ORDER.
+//
+// Design authority: design/hardware/nvme-ahci-tail-milestones.md
+// (commit 2d6ab82) §2.M8 #1676; substrate anchor §5.4 (softarch
+// companion) for the WAL durability rule PdxFS v1 already carries at
+// R42, wired here through the unified R51 BDEV_OP_* wire landed by
+// M6/M7.
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the AUTHORITY on the R51-side six-step barrier order a
+// journaled write must issue against a KIND_BLKDEV cap:
+//
+//   1. BDEV_OP_WRITE_LBA  -- journal-block payload
+//   2. BDEV_OP_FLUSH
+//   3. BDEV_OP_WRITE_LBA  -- journal-block CSUM word
+//   4. BDEV_OP_FLUSH
+//   5. BDEV_OP_WRITE_LBA  -- data-region blocks the record commits
+//   6. BDEV_OP_FLUSH      -- only on JOP_COMMIT; a JOP_ABORT frees
+//                             without this final flush
+//
+// It is a per-cap EVENT RING recording (op_code, lba, ts) at
+// SUBMISSION time (§1), plus a STATE-MACHINE WALKER (bbar_assert_
+// order) that a test harness (or this module's own witness, see
+// tests/kernel/nvme/bdev_barrier_synth.pdx) uses to prove the ring
+// matches the six-step pattern above, per record.
+//
+// It DOES NOT duplicate fs/pdxfs/bdev_write.pdx.  That file is R42's
+// own BSS-modelled NVMe-SQ scaffold (`nvw_*` -- R42.M5-001, #1396),
+// load-bearing today for durability.pdx's pending/submitted/completed
+// accounting; R51.M7-005 (#1673, not yet landed at this commit) is
+// the issue that rewrites ITS internals to call cap_invoke and adds
+// an explicit `bdev_flush`.  This module does not touch that file --
+// rewriting a load-bearing R42 scaffold is out of #1676's scope and
+// would risk durability.pdx regressing.  Instead this module gives
+// R51 its OWN thin wrapper directly over cap_invoke (bdev_barrier_
+// write / bdev_barrier_flush / bdev_barrier_journaled_write), proving
+// the ordering invariant at the layer R51 actually owns today.  Once
+// #1673 lands, a follow-up can fold this module's event-ring into the
+// real `bdev_write.pdx` / `bdev_flush` call sites without changing
+// the ring or state-machine logic below.
+//
+// It DOES NOT validate op success against real media.  Reaching the
+// AHCI/NVMe backend's own success path is M6-M8's other issues'
+// concern (M6-002..M6-004 for AHCI wire-up, M8-004/M8-006 for the
+// real hardware round-trip).  This module's own acceptance test
+// (bdev_barrier_write / _flush, SECTION 2) only refuses a genuine
+// DISPATCH-level failure (BDEV_ERR_BAD_ARG/BAD_ROW/BAD_FAMILY,
+// INVOKE_DENIED) -- anything else (including NVMEIO_PICK_NONE, the
+// expected substrate-mode "no live SQ pair" outcome every other R51.M3+
+// witness accepts, e.g. kind_nvme_reliability_synth.pdx) is treated as
+// "the op reached the driver", which is all the ordering invariant
+// needs.
+//
+// =============================================================================
+// §1  RING GEOMETRY
+// =============================================================================
+//
+// BBAR_MAX_EVENTS  = 64      ring capacity (8 six-step records + margin)
+// BBAR_ENTRY_WORDS = 3       per-event footprint in u64s
+//
+// _bbar_ring is a flat [u64; BBAR_MAX_EVENTS * BBAR_ENTRY_WORDS].
+// Entry(i) starts at _bbar_ring[i * 3]:
+//
+//   +0  op_code   BDEV_OP_WRITE_LBA (4) or BDEV_OP_FLUSH (5)
+//   +8  lba       the LBA the WRITE targeted (0 for a FLUSH event)
+//   +16 ts        rdtsc-combined timestamp at submission
+//
+// head is the next-write index (also the event count until reset).
+// The ring refuses to wrap -- a caller that needs more than
+// BBAR_MAX_EVENTS events across one witness run must call bbar_reset
+// between batches, exactly as wal.pdx's own ring refuses rather than
+// silently overwriting an unread record.
+//
+// =============================================================================
+// §2  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// _bbar_ring and _bbar_state are written only by helpers in this
+// module.  A second writer would let a caller record an event without
+// it corresponding to a real cap_invoke submission (or vice versa),
+// which would make bbar_assert_order's state-machine walk prove
+// nothing about the actual call sequence.
+//
+// STATE LAYOUT -- _bbar_state : [u64; 4]
+//   +0   init_mark   0xBBA2 once bbar_reset has run
+//   +16  head        next-write index into the ring (also event count)
+//
+// (+8/+24 reserved, zeroed by bbar_reset, not yet assigned a field --
+// mirrors wal.pdx's own state layout stride so a future sticky-error
+// latch can land at +8 without a layout change.)
+//
+// =============================================================================
+// §3  FAILURE TAXONOMY 0xFFFFECE3, 0xFFFFECE5, 0xFFFFECE6, 0xFFFFECE9
+// =============================================================================
+//
+// Claimed from the MOUNTW band (0xFFFFECE0..0xFFFFECEF, design
+// §7 file-layout table: "MOUNTW (mount/journal/remount/hot-remove
+// witnesses), M8-001..M8-003, M8-005").  0xFFFFECE0/E1/E2 are
+// claimed by R51.M8-001 (#1675, blkdev_cap_request.pdx, landed
+// alongside this commit) as MOUNTW_BAD_BDEV_ID/_ATTEST_MISSING/
+// _ELEVATE_REFUSED; 0xFFFFECE7/E8 are also claimed by that same file
+// as MOUNTW_INDEX_BAD_ARG/_INDEX_ENOSPC (extra codes it added within
+// the band); 0xFFFFECE4 is reserved for R51.M8-003 (#1677).  This
+// file claims exactly the M8-002 slot the design doc names
+// (0xFFFFECE3) plus three ring-bookkeeping slots from the band's
+// remaining free slots (0xFFFFECE5, 0xFFFFECE6, 0xFFFFECE9):
+//
+//   MOUNTW_BARRIER_VIOLATION  = 0xFFFFECE3   design-named (§2.M8 #1676):
+//                                the ordering-check finds a WRITE
+//                                without a preceding FLUSH where one
+//                                was required, or a FLUSH recorded
+//                                before its paired WRITE.
+//   MOUNTW_BARRIER_NOT_INIT   = 0xFFFFECE5   ring accessor/record
+//                                before bbar_reset.
+//   MOUNTW_BARRIER_RING_FULL  = 0xFFFFECE6   bbar_record when
+//                                head == BBAR_MAX_EVENTS.
+//   MOUNTW_BARRIER_BAD_IDX    = 0xFFFFECE9   accessor idx >= head, or
+//                                bbar_assert_order's requested range
+//                                exceeds head. (0xFFFFECE7/E8 are
+//                                already claimed by blkdev_cap_
+//                                request.pdx's MOUNTW_INDEX_BAD_ARG/
+//                                _INDEX_ENOSPC within this same band.)
+//
+// Reserved-label discipline (`loop`/`if` etc. are keywords): every
+// label in this file is prefixed `bbar_`.
+//
+// =============================================================================
+// paideia-as encoder-gap posture (v0.22.x)
+// =============================================================================
+//
+//   G4: every sentinel comparison against a value with bit 31/63 set
+//       is staged through `mov r10, <imm64>; cmp reg, r10` rather than
+//       `cmp reg, <imm>` directly (imm32 cmp operands sign-extend).
+//   No `imul` with an immediate multiplier passed as a bare literal to
+//       a two-operand form where the destination is not first loaded
+//       with the multiplicand: every `imul` here is the accepted
+//       register-register form (`imul rax, r14`), one operand loaded
+//       from an immediate via `mov` first -- same posture cap/nvme_
+//       reliability.pdx and drivers/ahci/io_submit.pdx already use.
+//   Every array index into `[base + index*8]` is a WORD index (never
+//       a byte displacement folded in alongside the scale) -- this
+//       assembler's addressing mode is `[base + index*scale]` with no
+//       extra compile-time displacement term, so a field at byte
+//       offset +8/+16 is reached by adding 1/2 to the word index
+//       before scaling, exactly as wal.pdx's own per-field accessors
+//       do (wal_size_at, wal_checksum_at, etc.).
+
+module BdevBarrier = structure {
+
+  pub let BBAR_MAX_EVENTS  : u64 = 64
+  pub let BBAR_ENTRY_WORDS : u64 = 3
+
+  pub let JOP_ABORT  : u64 = 0
+  pub let JOP_COMMIT : u64 = 1
+
+  pub let MOUNTW_BARRIER_VIOLATION : u64 = 0xFFFFECE3
+  pub let MOUNTW_BARRIER_NOT_INIT  : u64 = 0xFFFFECE5
+  pub let MOUNTW_BARRIER_RING_FULL : u64 = 0xFFFFECE6
+  pub let MOUNTW_BARRIER_BAD_IDX   : u64 = 0xFFFFECE9
+
+  pub let BBAR_INIT_MARK : u64 = 0xBBA2
+
+  pub let mut _bbar_ring  : [u64; 192] = uninit @align(64)
+  pub let mut _bbar_state : [u64; 4]   = uninit @align(64)
+
+  // Per-call scratch descriptor page (design's op-arg encoding, §3.5
+  // of nvme-io-queues.md: bits[63:12] must be the page-aligned address
+  // of a +0 lba / +8 nblocks / +16 dma_iova / +24 status_out page).
+  // Reused across every bdev_barrier_write/_flush call in this module
+  // because every caller in this tree drives the barrier sequence
+  // synchronously (one op fully returns before the next is issued) --
+  // same reuse posture as kind_nvme_reliability_synth.pdx's own
+  // `_nrelw_desc_page`.
+  pub let mut _bbar_desc_page : [u64; 4] = uninit @align(4096)
+
+  // ==========================================================================
+  // bbar_reset() -- clear ring + state; install init_mark.
+  // ==========================================================================
+  pub let bbar_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M8-002 (#1676): clear the 192-word ring and 4-word state, then install BBAR_INIT_MARK. Leaf; no callee-save needed (rax/rcx are the only registers touched). Labels prefixed bbar_rst_.",
+      block: {
+        lea r10, [rip + _bbar_ring];
+        xor rax, rax;
+        xor rcx, rcx;
+      bbar_rst_r:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 192;
+        jb  bbar_rst_r;
+
+        lea r10, [rip + _bbar_state];
+        xor rcx, rcx;
+      bbar_rst_s:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  bbar_rst_s;
+
+        mov rax, 0xBBA2;
+        mov [r10 + 0], rax;
+        ret
+      }
+    }
+
+  pub let bbar_bound : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M8-002 (#1676): 1 iff init_mark matches. Labels prefixed bbar_bnd_.",
+      block: {
+        lea r10, [rip + _bbar_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xBBA2;
+        cmp rax, r11;
+        jne bbar_bnd_no;
+        mov rax, 1;
+        ret;
+      bbar_bnd_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let bbar_head : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M8-002 (#1676): head field readback (also the current event count).",
+      block: {
+        lea r10, [rip + _bbar_state];
+        mov rax, [r10 + 16];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Per-event accessors. Refuse on:
+  //   - not init          MOUNTW_BARRIER_NOT_INIT
+  //   - idx >= head       MOUNTW_BARRIER_BAD_IDX
+  // ==========================================================================
+
+  pub let bbar_op_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M8-002 (#1676): read op_code of event idx. Labels prefixed bbar_opa_.",
+      block: {
+        lea r10, [rip + _bbar_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xBBA2;
+        cmp rax, r11;
+        jne bbar_opa_ni;
+        mov rax, [r10 + 16];
+        cmp rdi, rax;
+        jae bbar_opa_bi;
+
+        mov rax, rdi;
+        shl rax, 1;
+        add rax, rdi;                    // idx * 3
+        lea r11, [rip + _bbar_ring];
+        mov rax, [r11 + rax * 8];        // +0 op_code
+        ret;
+
+      bbar_opa_ni:
+        mov rax, 0xFFFFECE5;
+        ret;
+      bbar_opa_bi:
+        mov rax, 0xFFFFECE9;
+        ret
+      }
+    }
+
+  pub let bbar_lba_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M8-002 (#1676): read lba of event idx. Labels prefixed bbar_la_.",
+      block: {
+        lea r10, [rip + _bbar_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xBBA2;
+        cmp rax, r11;
+        jne bbar_la_ni;
+        mov rax, [r10 + 16];
+        cmp rdi, rax;
+        jae bbar_la_bi;
+
+        mov rax, rdi;
+        shl rax, 1;
+        add rax, rdi;                    // idx * 3
+        add rax, 1;                      // +1 word = +8 B = lba
+        lea r11, [rip + _bbar_ring];
+        mov rax, [r11 + rax * 8];
+        ret;
+
+      bbar_la_ni:
+        mov rax, 0xFFFFECE5;
+        ret;
+      bbar_la_bi:
+        mov rax, 0xFFFFECE9;
+        ret
+      }
+    }
+
+  pub let bbar_ts_at : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M8-002 (#1676): read ts of event idx. Labels prefixed bbar_ta_.",
+      block: {
+        lea r10, [rip + _bbar_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xBBA2;
+        cmp rax, r11;
+        jne bbar_ta_ni;
+        mov rax, [r10 + 16];
+        cmp rdi, rax;
+        jae bbar_ta_bi;
+
+        mov rax, rdi;
+        shl rax, 1;
+        add rax, rdi;                    // idx * 3
+        add rax, 2;                      // +2 word = +16 B = ts
+        lea r11, [rip + _bbar_ring];
+        mov rax, [r11 + rax * 8];
+        ret;
+
+      bbar_ta_ni:
+        mov rax, 0xFFFFECE5;
+        ret;
+      bbar_ta_bi:
+        mov rax, 0xFFFFECE9;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // bbar_record(op_code, lba) -> u64
+  //
+  // Append one submission event (op_code, lba, rdtsc-now) at head;
+  // returns the assigned event index on success (>= 0). rdtsc only
+  // writes EDX:EAX, so rdi (op_code) and rsi (lba) survive it
+  // untouched -- no callee-save prologue needed; every other register
+  // this leaf touches (rax/rcx/rdx/r8/r9/r10/r11) is caller-save
+  // scratch.
+  //
+  // Refuses:
+  //   - not init                    MOUNTW_BARRIER_NOT_INIT
+  //   - head == BBAR_MAX_EVENTS     MOUNTW_BARRIER_RING_FULL
+  // ==========================================================================
+  pub let bbar_record : (u64, u64) -> u64 !{mem} @{} =
+    fn (op_code: u64) (lba: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M8-002 (#1676): append one submission event. rdi=op_code/rsi=lba survive rdtsc (which clobbers only EDX:EAX) so no callee-save push is needed anywhere in this leaf. r8=head, r9=ts, r10=scratch pointer, r11=scratch word-index -- all caller-save. word_index_base = head*3 computed via shl+add (idx*2 + idx = idx*3), then +1/+2 for the lba/ts fields per this file's G-note on addressing (index-only scaling, no folded displacement). Labels prefixed bbar_rec_.",
+      block: {
+        lea r10, [rip + _bbar_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xBBA2;
+        cmp rax, r11;
+        jne bbar_rec_ni;
+
+        mov r8, [r10 + 16];              // head
+        mov r11, 64;                     // BBAR_MAX_EVENTS
+        cmp r8, r11;
+        jae bbar_rec_full;
+
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        mov r9, rax;                     // ts
+
+        mov rax, r8;
+        shl rax, 1;
+        add rax, r8;                     // word_index_base = head * 3
+        lea r10, [rip + _bbar_ring];
+
+        mov [r10 + rax * 8], rdi;        // +0 op_code
+        mov r11, rax;
+        add r11, 1;
+        mov [r10 + r11 * 8], rsi;        // +1 word = +8 B lba
+        mov r11, rax;
+        add r11, 2;
+        mov [r10 + r11 * 8], r9;         // +2 word = +16 B ts
+
+        lea r10, [rip + _bbar_state];
+        mov rax, r8;
+        add rax, 1;
+        mov [r10 + 16], rax;             // head++
+        mov rax, r8;                     // return assigned idx (old head)
+        ret;
+
+      bbar_rec_ni:
+        mov rax, 0xFFFFECE5;             // MOUNTW_BARRIER_NOT_INIT
+        ret;
+      bbar_rec_full:
+        mov rax, 0xFFFFECE6;             // MOUNTW_BARRIER_RING_FULL
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // bbar_assert_order(start_idx, num_records) -> u64
+  //
+  // State-machine walk over [start_idx .. start_idx + num_records*6).
+  // Every group of 6 consecutive events must read
+  // WRITE,FLUSH,WRITE,FLUSH,WRITE,FLUSH (op_code 4 at even offsets,
+  // 5 at odd offsets within the group) -- design §2.M8 #1676's six-
+  // step barrier order. Also asserts ts is non-decreasing across the
+  // 6 events of each group, so a FLUSH's own recorded submission time
+  // is never earlier than the WRITE immediately preceding it -- the
+  // literal "FLUSH cannot complete before WRITE" invariant, given
+  // that every bdev_barrier_write/_flush call is a synchronous,
+  // sequential cap_invoke (submission order IS completion order for
+  // a single caller with no concurrent overlapping ops).
+  //
+  // Returns 0 on a clean walk; MOUNTW_BARRIER_VIOLATION on the first
+  // op_code or ts mismatch; MOUNTW_BARRIER_BAD_IDX if the requested
+  // range exceeds head; MOUNTW_BARRIER_NOT_INIT before bbar_reset.
+  // ==========================================================================
+  pub let bbar_assert_order : (u64, u64) -> u64 !{mem} @{} =
+    fn (start_idx: u64) (num_records: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R51.M8-002 (#1676): six-step barrier state-machine walk. Five callee-save pushes (rbx=head, r12=start_idx, r13=num_records, r14=rec loop counter, r15=this-group base event index) hold their values across the nested rec/j loop without spilling to the stack. This function makes no nested `call` of its own, so the strict call-site rsp%16==0 alignment convention this file's sibling functions justify does not apply here -- the pushes exist purely for register preservation across the loop, not for callee-alignment. Inner scratch (rax/rcx/rdx/r8/r9/r10/r11) is all caller-save and unused by the outer loop's five held values, so no additional preservation is needed across the inner j=0..5 walk. rcx=j, r8=prev_ts (sentinel-free: skipped on j==0 via the rcx==0 branch rather than an initial sentinel value), r9=this-event's word index, r10=ring base pointer, rdx=this-event's op_code, rax=scratch/this-event's ts. Bound check up front: start_idx + num_records*6 must not exceed head, else MOUNTW_BARRIER_BAD_IDX before any event is read. Labels prefixed bbar_ord_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        lea r10, [rip + _bbar_state];
+        mov rax, [r10 + 0];
+        mov r11, 0xBBA2;
+        cmp rax, r11;
+        jne bbar_ord_ni;
+
+        mov rbx, [r10 + 16];             // head
+        mov r12, rdi;                    // start_idx
+        mov r13, rsi;                    // num_records
+
+        mov rax, r13;
+        mov r14, 6;
+        imul rax, r14;                   // num_records * 6
+        add rax, r12;                    // + start_idx
+        cmp rax, rbx;
+        ja  bbar_ord_bi;
+
+        xor r14, r14;                    // rec = 0
+      bbar_ord_rec_top:
+        cmp r14, r13;
+        jae bbar_ord_pass;
+
+        mov rax, r14;
+        mov r15, 6;
+        imul rax, r15;
+        add rax, r12;                    // base = start_idx + rec*6
+        mov r15, rax;                    // base (held across inner loop)
+
+        mov rcx, 0;                      // j = 0
+        xor r8, r8;                      // prev_ts (unread while j==0)
+      bbar_ord_j_top:
+        cmp rcx, 6;
+        jae bbar_ord_j_done;
+
+        mov rax, r15;
+        add rax, rcx;                    // event_idx = base + j
+        mov r9, rax;
+        shl r9, 1;
+        add r9, rax;                     // word index = event_idx * 3
+
+        lea r10, [rip + _bbar_ring];
+        mov rdx, [r10 + r9 * 8];         // op_code at event_idx
+
+        mov rax, rcx;
+        and rax, 1;
+        cmp rax, 0;
+        je  bbar_ord_expect_write;
+        mov r11, 5;                      // odd j -> expect FLUSH
+        jmp bbar_ord_expect_done;
+      bbar_ord_expect_write:
+        mov r11, 4;                      // even j -> expect WRITE
+      bbar_ord_expect_done:
+        cmp rdx, r11;
+        jne bbar_ord_violation;
+
+        mov r11, r9;
+        add r11, 2;                      // ts word index
+        lea r10, [rip + _bbar_ring];
+        mov rax, [r10 + r11 * 8];        // ts at event_idx
+
+        cmp rcx, 0;
+        je  bbar_ord_skip_ts;
+        cmp rax, r8;
+        jb  bbar_ord_violation;          // ts decreased vs prior event
+      bbar_ord_skip_ts:
+        mov r8, rax;                     // prev_ts = this ts
+
+        add rcx, 1;
+        jmp bbar_ord_j_top;
+
+      bbar_ord_j_done:
+        add r14, 1;
+        jmp bbar_ord_rec_top;
+
+      bbar_ord_pass:
+        xor rax, rax;
+        jmp bbar_ord_out;
+
+      bbar_ord_violation:
+        mov rax, 0xFFFFECE3;             // MOUNTW_BARRIER_VIOLATION
+        jmp bbar_ord_out;
+
+      bbar_ord_ni:
+        mov rax, 0xFFFFECE5;             // MOUNTW_BARRIER_NOT_INIT
+        jmp bbar_ord_out;
+
+      bbar_ord_bi:
+        mov rax, 0xFFFFECE9;             // MOUNTW_BARRIER_BAD_IDX
+
+      bbar_ord_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 2  cap_invoke wrappers with submission-time recording
+  // ==========================================================================
+
+  // ==========================================================================
+  // bdev_barrier_write(cap_slot, lba, nblocks, dma_iova) -> u64
+  //
+  // Record a BDEV_OP_WRITE_LBA submission event, then cap_invoke it.
+  // Returns cap_invoke's raw result (a byte count, BDEV_ERR_OK, or one
+  // of the driver's own failure sentinels -- see §0 for why this
+  // module does not further interpret it).
+  // ==========================================================================
+  pub let bdev_barrier_write : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (cap_slot: u64) (lba: u64) (nblocks: u64) (dma_iova: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R51.M8-002 (#1676): record (op_code=4, lba) via bbar_record BEFORE invoking (design's own 'records every op at submission'), then build the descriptor page (+0 lba/+8 nblocks/+16 dma_iova/+24 status_out=0) and cap_invoke(cap_slot, desc_page_addr | BDEV_OP_WRITE_LBA(4)). Four callee-save pushes (rbx=cap_slot, r12=lba, r13=nblocks, r14=dma_iova) + sub rsp,8 leave rsp%16==0 (entry rsp%16==8, 4*8=32 -> 40, 40 mod 16==8 -> sub rsp,8 -> 48, %16==0) so both nested calls (bbar_record, cap_invoke) execute at rsp%16==0. Labels prefixed bbar_bw_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // cap_slot
+        mov r12, rsi;                    // lba
+        mov r13, rdx;                    // nblocks
+        mov r14, rcx;                    // dma_iova
+
+        mov rdi, 4;                      // BDEV_OP_WRITE_LBA
+        mov rsi, r12;                     // lba
+        call bbar_record;
+
+        lea r10, [rip + _bbar_desc_page];
+        mov [r10 + 0], r12;              // lba
+        mov [r10 + 8], r13;              // nblocks
+        mov [r10 + 16], r14;             // dma_iova
+        xor rax, rax;
+        mov [r10 + 24], rax;             // status_out = 0
+
+        mov rdi, rbx;                    // cap_slot
+        mov rsi, r10;                    // desc_page_addr (4 KiB aligned)
+        mov r11, 4;                      // BDEV_OP_WRITE_LBA
+        or  rsi, r11;
+        call cap_invoke;
+
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // bdev_barrier_flush(cap_slot) -> u64
+  //
+  // Record a BDEV_OP_FLUSH submission event (lba=0, no LBA is
+  // meaningful for a flush), then cap_invoke it.
+  // ==========================================================================
+  pub let bdev_barrier_flush : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (cap_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R51.M8-002 (#1676): record (op_code=5, lba=0) via bbar_record BEFORE invoking, then cap_invoke(cap_slot, desc_page_addr | BDEV_OP_FLUSH(5)) -- FLUSH still needs a page-aligned desc_page_addr because cap_handler_blkdev's hblk_op_flush(_ahci) writes status_out at desc_page_addr+24 unconditionally. One callee-save push (rbx=cap_slot) leaves rsp%16==0 (entry rsp%16==8, 1*8=16, 16 mod 16==0) with no pad needed, so both nested calls execute at rsp%16==0. Labels prefixed bbar_bf_.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                    // cap_slot
+
+        mov rdi, 5;                      // BDEV_OP_FLUSH
+        xor rsi, rsi;                    // lba = 0 (not meaningful for FLUSH)
+        call bbar_record;
+
+        lea r10, [rip + _bbar_desc_page];
+        xor rax, rax;
+        mov [r10 + 24], rax;             // status_out = 0
+
+        mov rdi, rbx;                    // cap_slot
+        mov rsi, r10;
+        mov r11, 5;                      // BDEV_OP_FLUSH
+        or  rsi, r11;
+        call cap_invoke;
+
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // bdev_barrier_journaled_write(cap_slot, journal_lba, data_lba,
+  //                              data_nblocks, dma_iova, jop) -> u64
+  //
+  // Drives the design's six-step (or four-step, JOP_ABORT) barrier
+  // sequence for one journaled record:
+  //   1. WRITE journal_lba (1 block)          -- journal payload
+  //   2. FLUSH
+  //   3. WRITE journal_lba+1 (1 block)         -- journal CSUM word
+  //   4. FLUSH
+  //   5. WRITE data_lba..data_lba+data_nblocks -- data-region blocks
+  //   6. FLUSH                                 -- only if jop == JOP_COMMIT
+  //
+  // csum_lba is journal_lba+1 rather than a seventh argument: folding
+  // it keeps this function's arity at 6, fitting SysV's six-register
+  // argument budget without a stack-passed argument (a caller wanting
+  // a non-adjacent CSUM block should stage its own write via
+  // bdev_barrier_write directly instead of this helper).
+  //
+  // Returns 0 if every step's cap_invoke result was BDEV_ERR_OK(0) or
+  // NVMEIO_PICK_NONE(0xFFFFEC58) -- the two acceptable outcomes per
+  // §0 -- else MOUNTW_BARRIER_VIOLATION on the first unacceptable
+  // result (a dispatch-level refusal means the op never reached the
+  // driver, which the ordering proof cannot paper over).
+  // ==========================================================================
+  pub let bdev_barrier_journaled_write : (u64, u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (cap_slot: u64) (journal_lba: u64) (data_lba: u64) (data_nblocks: u64) (dma_iova: u64) (jop: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R51.M8-002 (#1676): drive the six-step (or four-step, JOP_ABORT) barrier sequence via bdev_barrier_write/_flush. Six callee-save pushes (rbx=cap_slot, rbp=journal_lba, r12=data_lba, r13=data_nblocks, r14=dma_iova, r15=jop) + sub rsp,8 leave rsp%16==0 (entry rsp%16==8, 6*8=48 -> 56, 56 mod 16==8 -> sub rsp,8 -> 64, %16==0), matching cap_handler_blkdev's own six-push+pad shape, so every nested call (bdev_barrier_write x2-3, bdev_barrier_flush x2-3) executes at rsp%16==0. Each step's cap_invoke-forwarded result is checked in rax against 0 and 0xFFFFEC58 (staged via r10 per this file's G4 posture); the first unacceptable result short-circuits to bbjw_violation rather than continuing the sequence (issuing step N+1 after step N was refused by the dispatcher would itself be a false ordering proof). Labels prefixed bbjw_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // cap_slot
+        mov rbp, rsi;                    // journal_lba
+        mov r12, rdx;                    // data_lba
+        mov r13, rcx;                    // data_nblocks
+        mov r14, r8;                     // dma_iova
+        mov r15, r9;                     // jop
+
+        // ---- step 1: WRITE journal payload (1 block) ----
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, 1;
+        mov rcx, r14;
+        call bdev_barrier_write;
+        mov rdi, rax;
+        call bbjw_check;
+        cmp rax, 0;
+        jne bbjw_violation;
+
+        // ---- step 2: FLUSH ----
+        mov rdi, rbx;
+        call bdev_barrier_flush;
+        mov rdi, rax;
+        call bbjw_check;
+        cmp rax, 0;
+        jne bbjw_violation;
+
+        // ---- step 3: WRITE journal CSUM word (journal_lba + 1) ----
+        mov rdi, rbx;
+        mov rsi, rbp;
+        add rsi, 1;
+        mov rdx, 1;
+        mov rcx, r14;
+        call bdev_barrier_write;
+        mov rdi, rax;
+        call bbjw_check;
+        cmp rax, 0;
+        jne bbjw_violation;
+
+        // ---- step 4: FLUSH ----
+        mov rdi, rbx;
+        call bdev_barrier_flush;
+        mov rdi, rax;
+        call bbjw_check;
+        cmp rax, 0;
+        jne bbjw_violation;
+
+        // ---- step 5: WRITE data-region blocks ----
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        mov rcx, r14;
+        call bdev_barrier_write;
+        mov rdi, rax;
+        call bbjw_check;
+        cmp rax, 0;
+        jne bbjw_violation;
+
+        // ---- step 6: FLUSH, only if JOP_COMMIT ----
+        cmp r15, 1;
+        jne bbjw_no_final_flush;
+        mov rdi, rbx;
+        call bdev_barrier_flush;
+        mov rdi, rax;
+        call bbjw_check;
+        cmp rax, 0;
+        jne bbjw_violation;
+      bbjw_no_final_flush:
+
+        xor rax, rax;
+        jmp bbjw_out;
+
+      bbjw_violation:
+        mov rax, 0xFFFFECE3;             // MOUNTW_BARRIER_VIOLATION
+
+      bbjw_out:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // bbjw_check(status) -> u64
+  //
+  // 0 iff status is BDEV_ERR_OK(0) or NVMEIO_PICK_NONE(0xFFFFEC58);
+  // else 1. Every call site in bdev_barrier_journaled_write executes
+  // `mov rdi, rax` (copying the preceding bdev_barrier_write/_flush
+  // result into the argument register) immediately before `call
+  // bbjw_check`, per the standard SysV first-argument convention.
+  // ==========================================================================
+  pub let bbjw_check : (u64) -> u64 !{} @{} =
+    fn (status: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R51.M8-002 (#1676): acceptable-status predicate for bdev_barrier_journaled_write. 0 (BDEV_ERR_OK) or 0xFFFFEC58 (NVMEIO_PICK_NONE, staged via r10 per G4) -> return 0; else 1. Leaf, no callee-save needed. Labels prefixed bbjw_c_.",
+      block: {
+        cmp rdi, 0;
+        je  bbjw_c_ok;
+        mov r10, 0xFFFFEC58;             // NVMEIO_PICK_NONE
+        cmp rdi, r10;
+        je  bbjw_c_ok;
+        mov rax, 1;
+        ret;
+      bbjw_c_ok:
+        xor rax, rax;
+        ret
+      }
+    }
+}
