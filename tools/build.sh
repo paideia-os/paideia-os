@@ -6248,6 +6248,38 @@ fi
 echo "[r52-m8-confine] R52.M8-004 (umount_block) confined"
 
 # ---------------------------------------------------------------------------
+# R53.M2-003 (#1738): one-writer discipline for the sys_umount path
+# copy scratch.
+#
+#   * sys_umount (sys_umount_body + sys_umount_shim,
+#     src/kernel/core/syscall/sys_umount.pdx)
+#
+# _sys_umount_path_scratch is the 256-byte kernel landing zone the
+# shim KPTI-copies the caller's mount-point path into before calling
+# the body.  The shim writes it via user_read_bytes_via_walk; the
+# body reads it via path_resolve on the in-file call chain.  Both
+# references live in one .o (core/syscall/sys_umount.o), matching
+# _execve_path_scratch's own single-owner posture at sys_execve_
+# shim.pdx and _dispatch_open_path_scratch's at dispatch.pdx.  A
+# second writer against it would let one caller's in-flight path
+# copy be overwritten by another's mid-scan -- the mount-point path
+# gate would then see whichever bytes lost the race, silently
+# umounting the wrong volume.
+R53_SYSUMOUNT_SRC="${REPO_ROOT}/src/kernel/core/syscall/sys_umount.pdx"
+if [[ ! -f "${R53_SYSUMOUNT_SRC}" ]]; then
+    echo "[r53-m2-003-confine] FAIL - sys_umount.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_sys_umount_path_scratch' 'core/syscall/sys_umount.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See sys_umount.pdx for the per-module one-writer discipline" >&2
+    echo "  (the sole writer is sys_umount_shim; the sole reader is" >&2
+    echo "  path_resolve via sys_umount_body's in-file call chain)." >&2
+    exit 1
+fi
+echo "[r53-m2-003-confine] R53.M2-003 (sys_umount) confined"
+
+# ---------------------------------------------------------------------------
 # R53.M2-005 (#1740): confinement for the PDXFS-on-block vops table.
 #
 # `_pdxfs_block_vops` is the shared 7-slot function-pointer table backend_

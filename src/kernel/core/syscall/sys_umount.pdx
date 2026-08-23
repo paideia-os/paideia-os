@@ -1,0 +1,555 @@
+// src/kernel/core/syscall/sys_umount.pdx -- R53.M2-003 (#1738)
+//
+// sys_umount body + dispatch shim -- the ring-3-facing counterpart to
+// sys_mount (sibling #1737 at R53.M2-002).  Composes the R16 mount-
+// table shape (core/fs/mount.pdx §_mount_table) with R52.M8-004's
+// clean-umount primitive (core/fs/pdxfs/umount_block.pdx §umount_
+// pdxfs_block, #1724) into one syscall body that (a) resolves a user-
+// supplied mount-point path back to a _mount_table slot, and (b)
+// either sets MOUNT_FLAG_PENDING_UNMOUNT for the lazy path (draining
+// the slot's fresh resolves via path_resolve's own path_pending_scan
+// arm at core/fs/path.pdx L119) or immediately drives the block-
+// backend teardown (block-cache flush + checkpoint advance + clean-
+// unmount superblock stamp + final BD_OP_FLUSH + row clear).
+//
+// -----------------------------------------------------------------------------
+// Scope
+// -----------------------------------------------------------------------------
+//
+// design/tooling/volume-lifecycle-mechanism.md §M2 (R53.M2-003 line
+// "New src/kernel/core/syscall/sys_umount.pdx (body + dispatch shim)"
+// at line 1048 of that plan).  This is a NEW file in the syscall
+// directory (not under handlers/) matching the same "body + shim in
+// one file" shape sibling #1737 uses for sys_mount.pdx.  Syscall ID
+// 74 is claimed here (73 = sys_mount, 74 = sys_umount) with the
+// dispatch bounds widening and cmp/je case-arm added by sibling
+// #1736 at dispatch.pdx (R53.M2-001).
+//
+// -----------------------------------------------------------------------------
+// Failure taxonomy (0xFFFFED68..6F range, per the parent task brief)
+// -----------------------------------------------------------------------------
+//
+//   0                        success -- either lazy flag set or backend
+//                                       teardown returned 0.
+//   0xFFFFED68 EBADFLAGS     flags contains bits outside UMOUNT_LAZY
+//                            (0x1).  Rejected BEFORE any table touch so
+//                            a malformed flag word is a distinct failure
+//                            from a malformed path.
+//   0xFFFFED69 EBADPATH      mount_point_ptr == 0, OR mount_point_len == 0,
+//                            OR mount_point_len > SYS_UMOUNT_PATH_MAX (256).
+//                            Also the shim's return code when the len
+//                            fails its own (0, 255] pre-copy gate.
+//   0xFFFFED6A ENOENT        path_resolve returned 0 (unresolvable) OR
+//                            PATH_LOOKUP_PENDING_UNMOUNT (anchor already
+//                            in teardown -- ENOENT-shaped to the caller
+//                            because from their perspective the mount
+//                            has stopped serving fresh lookups).  Also
+//                            mount_root_vnode() returning 0 (no root
+//                            mounted yet -- the ring-3 caller reached
+//                            us before init).
+//   0xFFFFED6B ENOTMOUNT     path resolved to a live vnode idx that no
+//                            _mount_table entry claims as either its
+//                            mountpoint_vnode_idx or its root_vnode_idx.
+//                            The caller passed a path to a regular
+//                            directory that just happens to exist.
+//   0xFFFFED6C EROOT         mount_slot == 0 (the pinned root mount).
+//                            Root umount is refused at R53 per
+//                            volume-lifecycle-mechanism.md §M2 ("Root
+//                            umount refused at R53"); a future round
+//                            wiring pivot-root / switch-root will lift
+//                            this and add the checkpoint-hand-off shape.
+//   0xFFFFED6D EPENDING      the lazy path was called on a slot that
+//                            already carries MOUNT_FLAG_PENDING_UNMOUNT.
+//                            Distinct from success so a caller
+//                            polling the drain window can see a repeat
+//                            call as an error rather than a silent
+//                            re-arm (which would race with the
+//                            finaliser).
+//   0xFFFFED6E EFAULT        shim-side: user_ptr_ok / user_read_bytes_
+//                            via_walk failure copying the path from the
+//                            caller's user VA into the kernel scratch.
+//   0xFFFFED6F reserved      future-proofing headroom within the M2 sub-
+//                            band; will be assigned by whichever M2/M3
+//                            follow-on first needs a distinct code.
+//
+// A callee sentinel returned verbatim from umount_pdxfs_block (0xFFFF,
+// 0xFFFFED27, or any ED0*/ED2* forwarded from block_cache_flush_all /
+// sb_read / sb_write / jnl_bdev_flush) is passed through unchanged in
+// the immediate branch -- see umount_block.pdx §Failure taxonomy.
+// The sys_umount body does NOT rewrite those codes into its own ED68..
+// 6F band; forwarding preserves the substrate diagnosis for an operator
+// or the smoke witness reading the return.
+//
+// -----------------------------------------------------------------------------
+// Path resolution -> mount_slot lookup
+// -----------------------------------------------------------------------------
+//
+// _mount_table entries pack five fields per u64 (mount.pdx §2):
+//   [ 0, 16)  mountpoint_vnode_idx (u16)
+//   [16, 32)  root_vnode_idx       (u16)
+//   [32, 40)  backend_type         (u8)
+//   [40, 48)  flags                (u8)
+//
+// After path_resolve returns the vnode idx for the caller's mount-
+// point path, this function walks the 8-slot table looking for an
+// entry whose mountpoint_vnode_idx OR root_vnode_idx matches (both
+// are acceptable because a caller may pass EITHER the mountpoint dir
+// path OR the mounted-fs root dir path -- from the ring-3 UX view
+// they are the same directory, and mount_lookup at mount.pdx L301
+// already treats both as valid inputs to its own idempotent
+// traversal).  First match wins.  Missing slots (backend_type == 0)
+// are skipped without touching the vnode-idx bytes.
+//
+// The scan is the shim/body counterpart of mount_lookup, but returns
+// the SLOT INDEX rather than the traversed root vnode idx; a shared
+// helper would need to return both values and no other caller yet
+// needs the slot index, so the walk is inlined here.
+//
+// -----------------------------------------------------------------------------
+// MOUNT_FLAG_PENDING_UNMOUNT bit set (lazy path)
+// -----------------------------------------------------------------------------
+//
+// mount.pdx §Flag bits pins MOUNT_FLAG_PENDING_UNMOUNT at value 0x04
+// within the flags byte at bits [40, 48) of the packed entry.  The
+// lazy branch reads the entry qword, checks whether bit 42 (0x04 <<
+// 40) is already set (EPENDING if so), ORs the bit in, and writes the
+// updated qword back.  path.pdx's path_pending_scan arm (L119) sees
+// the flag on the next fresh resolve anchored at this mount's root
+// vnode and returns PATH_LOOKUP_PENDING_UNMOUNT, draining new opens
+// while in-flight handles complete normally -- exactly the semantics
+// design/tooling/volume-tooling-ux.md §9.0 (issue #1729) specifies.
+//
+// A follow-up round wires the drain finaliser (a periodic tick that
+// polls each PENDING slot's live-cap refcount and calls umount_pdxfs_
+// block once the refcount reaches zero).  This function does NOT
+// spawn the finaliser: it merely arms the flag and returns.
+//
+// -----------------------------------------------------------------------------
+// Audit emission -- deferred to sibling #1755 (R53.M5-002)
+// -----------------------------------------------------------------------------
+//
+// design/tooling/volume-lifecycle-mechanism.md §M5 splits the audit
+// wiring into a distinct milestone.  R53.M5-001 (#1754) extends
+// audit_schema.pdx with AUD_EV_MOUNT / AUD_EV_UMOUNT / etc; R53.M5-
+// 002 (#1755) then adds the audit_emit calls at the two success
+// converge points below (marked with `// AUD_UMOUNT emission hook`
+// comments).  We do NOT reference AUD_EV_UMOUNT here because the
+// symbol lands with #1754, not with this issue; a forward reference
+// would fail to link if #1754 slips.  Sibling #1755 lands as a
+// three-line edit adding the emit call at each hook site.
+//
+// -----------------------------------------------------------------------------
+// Concurrency
+// -----------------------------------------------------------------------------
+//
+// At R53 there is at most one caller in flight against sys_umount
+// (the ring-3 umount tool is single-writer; no self-race).  The scan
+// itself is racy against another process's sys_mount claiming a free
+// slot mid-walk, but a concurrent sys_mount can only WRITE to a slot
+// whose backend_type is zero (empty), so a slot the scan matches is
+// by definition an occupied slot that cannot be re-claimed under our
+// feet.  A concurrent sys_umount on the same slot is idempotent for
+// the lazy path (EPENDING on the second caller) and forwards the
+// callee error for the immediate path (block_cache_flush_all sees a
+// slot with no dirty pages the second time; sb_write sees a
+// superblock already flagged CLEAN).  A future SMP-aware round will
+// lift both concerns; the substrate-mode boot witnesses this file
+// unblocks all run serially per volume-lifecycle-mechanism.md §M2.
+//
+// -----------------------------------------------------------------------------
+// Register discipline
+// -----------------------------------------------------------------------------
+//
+// Both the body and the shim use a 5-push callee-save prologue
+// (rbx/r12/r13/r14/r15).  Entry rsp %16 == 8 (SysV) + 5*8 == 48 → rsp
+// %16 == 0 at every nested call; no additional sub rsp,8 needed.
+// The body's r15 push is technically only load-bearing for the
+// target vnode idx across path_resolve's rax clobber; a 4-push
+// prologue would land rsp %16 == 8 and force an extra pad.  Same
+// posture umount_block.pdx §Register discipline documents for the
+// same reason.
+//
+// -----------------------------------------------------------------------------
+// Label discipline
+// -----------------------------------------------------------------------------
+//
+// Body labels: syu_ prefix (audit against src/kernel/ at authoring
+// time: no other syu_ hits).  Shim labels: syus_ prefix (same audit:
+// no other syus_ hits).  Both prefixes are this file's alone.  No
+// test instruction anywhere; every branch is `cmp reg, imm` / `cmp
+// reg, reg` + je/jne/jae/ja.  Sentinels with bit 63 set (KERNEL_VMA_
+// BASE, PATH_LOOKUP_PENDING_UNMOUNT) that are COMPARED against `rax`
+// stage through r10 first; assignments via `mov rax, imm` are
+// unsigned-safe as bare movabs.
+
+module SysUmount = structure {
+
+  // ==========================================================================
+  // Public flag: bit 0 selects the lazy path (drain then finalise) vs. the
+  // immediate path (block-backend teardown right now).
+  // ==========================================================================
+  pub let UMOUNT_LAZY                    : u64 = 0x1
+
+  // ==========================================================================
+  // Failure sentinels in the 0xFFFFED68..6F band, per the parent task's
+  // "Failure codes 0xFFFFED68..6F range" allocation.  See §Failure taxonomy
+  // in the file header for the per-code semantics.
+  // ==========================================================================
+  pub let SYS_UMOUNT_ERR_EBADFLAGS       : u64 = 0xFFFFED68
+  pub let SYS_UMOUNT_ERR_EBADPATH        : u64 = 0xFFFFED69
+  pub let SYS_UMOUNT_ERR_ENOENT          : u64 = 0xFFFFED6A
+  pub let SYS_UMOUNT_ERR_ENOTMOUNT       : u64 = 0xFFFFED6B
+  pub let SYS_UMOUNT_ERR_EROOT           : u64 = 0xFFFFED6C
+  pub let SYS_UMOUNT_ERR_EPENDING        : u64 = 0xFFFFED6D
+  pub let SYS_UMOUNT_ERR_EFAULT          : u64 = 0xFFFFED6E
+  // 0xFFFFED6F reserved for future M2/M3 use.
+
+  // Path buffer cap.  Matches _dispatch_open_path_scratch (dispatch.pdx
+  // L84 DISPATCH_PATH_MAX) and _execve_path_scratch (sys_execve_shim.pdx
+  // EXECVE_PATH_MAX): every path scratch in the syscall layer holds one
+  // POSIX PATH_MAX-shaped ceiling so a caller pattern proven against one
+  // syscall transfers verbatim to another.
+  pub let SYS_UMOUNT_PATH_MAX            : u64 = 256
+
+  // ==========================================================================
+  // Kernel-owned scratch storage (.bss).  Confined via ec_confine_one at
+  // tools/build.sh -- the sole writer/reader is this file (shim writes it
+  // via user_read_bytes_via_walk; body reads it via path_resolve on the
+  // in-file call chain).  Same shape as _execve_path_scratch (sys_execve_
+  // shim.pdx) and _dispatch_open_path_scratch (dispatch.pdx).
+  // ==========================================================================
+  pub let mut _sys_umount_path_scratch   : [u8; 256] = uninit @align(8)
+
+  // ==========================================================================
+  // sys_umount_body(mount_point_ptr, mount_point_len, flags) -> u64
+  //
+  //   rdi = mount_point_ptr   (KERNEL VA of a NUL-terminated path -- the
+  //                            shim has already KPTI-copied it out of the
+  //                            caller's user VA and appended a NUL at
+  //                            [ptr + mount_point_len].  A witness-side
+  //                            caller passing a kernel-VA path directly
+  //                            bypasses the shim and is likewise
+  //                            supported.)
+  //   rsi = mount_point_len   (byte count, excluding the trailing NUL;
+  //                            (0, 256] -- 0 or > 256 refused as EBADPATH.)
+  //   rdx = flags             (bit 0 = UMOUNT_LAZY; other bits reserved
+  //                            and refused as EBADFLAGS.)
+  //   -> rax = 0 on success, or one of the ED68..6E sentinels above, or
+  //           a callee sentinel forwarded verbatim from umount_pdxfs_
+  //           block on the immediate branch.
+  //
+  // Sequence:
+  //   (1) flags gate: bits above 0 must be zero.  `mov r10, rdx; shr r10,
+  //       1; cmp r10, 0; jne syu_bad_flags` catches every non-LAZY bit
+  //       set (bit 0 shifts out; anything left is a rejected bit).
+  //   (2) path arg gate: ptr != 0, len in (0, 256].  Zero-length paths
+  //       are refused because path_resolve on an empty string returns 0
+  //       (ENOENT) and we would waste the scan work.
+  //   (3) mount_root_vnode() -> root idx.  Zero means bootstrap has not
+  //       yet installed a root mount; refuse as ENOENT (this cannot fire
+  //       on a live boot but keeps the substrate-mode witness path total).
+  //   (4) path_resolve(mount_point_ptr, root, cwd=0).  Zero = ENOENT.
+  //       PATH_LOOKUP_PENDING_UNMOUNT surfaces here when the caller
+  //       named a path anchored at a mount already in its drain window;
+  //       we map it to ENOENT because from the caller's view the mount
+  //       is no longer serving fresh lookups (and re-entering the lazy
+  //       branch would land on EPENDING one step later anyway).
+  //   (5) Linear scan _mount_table[0..8].  Skip empty slots (backend_
+  //       type == 0).  For an occupied slot, first-match on either
+  //       mountpoint_vnode_idx (bits [ 0,16)) or root_vnode_idx (bits
+  //       [16,32)) equalling the resolved target vnode idx.
+  //   (6) No match -> ENOTMOUNT.
+  //   (7) Match on slot 0 -> EROOT (root umount refused at R53).
+  //   (8) flags & UMOUNT_LAZY: read the entry, check whether MOUNT_FLAG_
+  //       PENDING_UNMOUNT (bit 42, i.e. 0x04 << 40) is already set --
+  //       EPENDING if so.  Else OR the bit in, write the entry back,
+  //       jump to the success hook (AUD_UMOUNT emit lands here at
+  //       #1755).
+  //   (9) Immediate branch: call umount_pdxfs_block(mount_slot).  Any
+  //       non-zero return is forwarded verbatim to the caller as the
+  //       body's rax return; zero converges on the success hook.
+  //
+  // Register plan:
+  //   rbx      root vnode idx (r) -> mount slot (w, post-scan)
+  //   r12      mount_point_ptr (saved for the path_resolve call)
+  //   r13      mount_point_len (saved -- length not used inside the body
+  //            but preserved verbatim for the future audit-record payload
+  //            #1755 will read)
+  //   r14      flags (saved for the branch selection)
+  //   r15      resolved target vnode idx (needed across the scan)
+  //
+  //   During the scan: rcx = slot idx (caller-save; scan is inline so
+  //   no save needed), r10/r11 = extraction scratch.  After the match,
+  //   rbx is overwritten with the slot idx (root vnode idx is no
+  //   longer needed at that point).
+  // ==========================================================================
+  pub let sys_umount_body : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (mount_point_ptr: u64) (mount_point_len: u64) (flags: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap},
+      justification: "R53.M2-003 (#1738): sys_umount body -- ring-3 counterpart to R52.M8-004's umount_pdxfs_block.  Composes mount_root_vnode + path_resolve + a linear _mount_table scan into a single body that resolves a mount-point path back to a slot index, then either arms MOUNT_FLAG_PENDING_UNMOUNT for the lazy path (drained by path.pdx's own path_pending_scan) or drives umount_pdxfs_block for the immediate teardown.  Sibling #1737 delivers sys_mount at the same seam and #1736 widens dispatch to accept sysno 74.  5-push callee-save prologue (rbx/r12/r13/r14/r15) lands rsp%16==0 at every nested call (SysV entry rsp%16==8 + 40 = 48, %16==0 -- no additional pad needed).  rbx dual-purpose: root vnode idx until path_resolve returns, then mount slot idx once the scan finds one.  r15 holds the resolved target vnode idx across the scan (path_resolve's rax result survives the two shr/and extractions per slot).  Flags gate uses shr-and-test (mov r10, rdx; shr r10, 1; cmp r10, 0) rather than `test rdx, ~0x1` per this codebase's no-test discipline and the imm64 tax of a movabs mask.  Scan pattern mirrors mount.pdx §mount's own free-slot scan and mount_lookup's two-field match (mountpoint_vnode_idx at bits [0,16) OR root_vnode_idx at bits [16,32)) -- first match wins.  Root refusal is a slot-0 cmp AFTER the scan so a caller passing a nonsense path sees ENOTMOUNT rather than EROOT (the more specific diagnosis).  Lazy branch reads the entry qword, checks bit 42 (MOUNT_FLAG_PENDING_UNMOUNT staged as 0x040000000000), rejects a re-arm with EPENDING, OR-in on a fresh call, writes the qword back atomically (single u64 store -- concurrent path_resolve either sees the pre-write flags byte or the post-write byte, never a torn pair).  Immediate branch forwards umount_pdxfs_block's return verbatim so an operator reading rax gets the substrate diagnosis (ED08 sb_write refused, ED09 sb_read refused, ED21 jnl_bdev_flush refused, ED27 dead-row -- all defined in umount_block.pdx's own header) rather than a rewritten ED68..6E code.  Effects {mem, sysreg} matches umount_pdxfs_block's own posture (block-cache writes + jnl_bdev_flush's sysreg through cap_invoke); capabilities {cap} matches for the same reason.  No user pointers -- the shim has already KPTI-copied the path into kernel scratch and NUL-terminated it -- so no user_ptr_ok gate and no KPTI bounce inside the body.  Audit emission (AUD_UMOUNT) is deferred to sibling #1755 at R53.M5-002 per volume-lifecycle-mechanism.md §M5 milestone split; the two success converge points are marked with `// AUD_UMOUNT emission hook` comments for the drop-in landing.  Labels prefixed syu_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                                // mount_point_ptr
+        mov r13, rsi;                                // mount_point_len
+        mov r14, rdx;                                // flags
+
+        // -------- (1) Flags gate: only UMOUNT_LAZY (bit 0) is legal. --------
+        mov r10, r14;
+        shr r10, 1;
+        cmp r10, 0;
+        jne syu_bad_flags;
+
+        // -------- (2) Path arg gate: ptr != 0, len in (0, 256]. -------------
+        cmp r12, 0;
+        je  syu_bad_path;
+        cmp r13, 0;
+        je  syu_bad_path;
+        mov r10, 256;                                // SYS_UMOUNT_PATH_MAX
+        cmp r13, r10;
+        ja  syu_bad_path;
+
+        // -------- (3) mount_root_vnode() -> anchor. -------------------------
+        call mount_root_vnode;
+        cmp rax, 0;
+        je  syu_enoent;
+        mov rbx, rax;                                // rbx = root vnode idx
+
+        // -------- (4) path_resolve(mount_point_ptr, root, cwd=0). -----------
+        mov rdi, r12;                                // path_ptr
+        mov rsi, rbx;                                // root_vnode_idx
+        xor rdx, rdx;                                // cwd_vnode_idx = 0
+        call path_resolve;
+        cmp rax, 0;
+        je  syu_enoent;
+        mov r10, 0xFFFFED48;                         // PATH_LOOKUP_PENDING_UNMOUNT
+        cmp rax, r10;
+        je  syu_enoent;
+        mov r15, rax;                                // r15 = target vnode idx
+
+        // -------- (5) Linear scan _mount_table[0..8]. -----------------------
+        lea r11, [rip + _mount_table];
+        xor rcx, rcx;                                // rcx = slot idx
+      syu_scan:
+        cmp rcx, 8;                                  // MOUNT_MAX
+        jae syu_notmount;
+        mov rax, [r11 + rcx * 8];                    // entry qword
+        // Skip empty slots (backend_type byte at bits [32, 40) == 0).
+        mov r10, rax;
+        shr r10, 32;
+        and r10, 0xFF;
+        cmp r10, 0;                                  // MOUNT_BACKEND_NONE
+        je  syu_scan_next;
+        // Match mountpoint_vnode_idx (bits [ 0, 16)).
+        mov r10, rax;
+        and r10, 0xFFFF;
+        cmp r10, r15;
+        je  syu_slot_found;
+        // Match root_vnode_idx (bits [16, 32)).
+        mov r10, rax;
+        shr r10, 16;
+        and r10, 0xFFFF;
+        cmp r10, r15;
+        je  syu_slot_found;
+      syu_scan_next:
+        add rcx, 1;
+        jmp syu_scan;
+
+      syu_slot_found:
+        // rcx = matched slot idx.  r15 (target vnode idx) is dead from
+        // here on; rbx (root vnode idx) is likewise dead.  Overwrite
+        // rbx with the slot idx so it survives umount_pdxfs_block's
+        // caller-save clobber on the immediate branch.
+        mov rbx, rcx;                                // rbx = mount_slot
+
+        // -------- (7) Root refusal (slot 0 is pinned). ---------------------
+        cmp rbx, 0;                                  // MOUNT_ROOT_SLOT
+        je  syu_root_refused;
+
+        // -------- (8) Branch on UMOUNT_LAZY. -------------------------------
+        mov r10, r14;
+        and r10, 1;                                  // UMOUNT_LAZY
+        cmp r10, 0;
+        je  syu_immediate;
+
+        // ---- Lazy path: OR MOUNT_FLAG_PENDING_UNMOUNT into the entry. ----
+        lea r11, [rip + _mount_table];
+        mov rax, [r11 + rbx * 8];                    // reload entry qword
+        // Check whether bit 42 (MOUNT_FLAG_PENDING_UNMOUNT << flags_shift)
+        // is already set.  Extract flags byte at bits [40, 48) into r10.
+        mov r10, rax;
+        shr r10, 40;
+        and r10, 0xFF;
+        mov r9, r10;
+        and r9, 0x04;                                // MOUNT_FLAG_PENDING_UNMOUNT
+        cmp r9, 0;
+        jne syu_already_pending;
+        // OR the flag in and store the qword back atomically.
+        mov r10, 0x040000000000;                     // MOUNT_FLAG_PENDING_UNMOUNT << 40
+        or  rax, r10;
+        mov [r11 + rbx * 8], rax;
+        // AUD_UMOUNT emission hook -- sibling #1755 (R53.M5-002) lands
+        // audit_emit(kind, slot=rbx, evt=AUD_EV_UMOUNT, at, result=0,
+        // payload={clean=0}) here for the lazy branch.  Reg plan pins
+        // rbx = mount_slot at the emit site.
+        xor rax, rax;
+        jmp syu_done;
+
+      syu_immediate:
+        // ---- Immediate path: drive R52.M8-004's clean-umount primitive. --
+        mov rdi, rbx;                                // mount_slot
+        call umount_pdxfs_block;
+        cmp rax, 0;
+        jne syu_done;                                // forward callee error verbatim
+        // AUD_UMOUNT emission hook -- sibling #1755 lands the immediate-
+        // branch emit here with payload={clean=1}.  rbx = mount_slot.
+        xor rax, rax;
+        jmp syu_done;
+
+      syu_bad_flags:
+        mov rax, 0xFFFFED68;                         // SYS_UMOUNT_ERR_EBADFLAGS
+        jmp syu_done;
+
+      syu_bad_path:
+        mov rax, 0xFFFFED69;                         // SYS_UMOUNT_ERR_EBADPATH
+        jmp syu_done;
+
+      syu_enoent:
+        mov rax, 0xFFFFED6A;                         // SYS_UMOUNT_ERR_ENOENT
+        jmp syu_done;
+
+      syu_notmount:
+        mov rax, 0xFFFFED6B;                         // SYS_UMOUNT_ERR_ENOTMOUNT
+        jmp syu_done;
+
+      syu_root_refused:
+        mov rax, 0xFFFFED6C;                         // SYS_UMOUNT_ERR_EROOT
+        jmp syu_done;
+
+      syu_already_pending:
+        mov rax, 0xFFFFED6D;                         // SYS_UMOUNT_ERR_EPENDING
+
+      syu_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_umount_shim(current, path_va, path_len, flags) -> u64
+  //
+  //   rdi = current  (task_struct*, unused at R53.M2 but present for ABI
+  //                   parity with sys_execve_shim / sys_open dispatch --
+  //                   a future round wiring the audit record's actor
+  //                   field from the caller's TCB reads it from here.)
+  //   rsi = path_va  (user VA of the mount-point path -- byte-copied into
+  //                   _sys_umount_path_scratch via user_read_bytes_via_
+  //                   walk under strict-KPTI, matching sys_execve_shim's
+  //                   Phase 3 D10d posture at sys_execve_shim.pdx L136.)
+  //   rdx = path_len (byte count of the path, EXCLUDING any trailing NUL
+  //                   the caller may have appended; the shim writes the
+  //                   NUL itself at scratch[path_len] so path_resolve's
+  //                   own end-of-string detection fires.  Refused as
+  //                   EBADPATH if 0 or > 255 -- 255 leaves one byte for
+  //                   the shim-written NUL within the 256-byte scratch.)
+  //   rcx = flags    (forwarded verbatim to the body.)
+  //   -> rax = whatever sys_umount_body returns, or ED68..6E on shim-
+  //           side gate failure.
+  //
+  // Sequence:
+  //   (1) path_len in (0, 255] gate.
+  //   (2) user_ptr_ok(path_va, path_len) -- reject kernel pointers.
+  //   (3) user_read_bytes_via_walk(_sys_umount_path_scratch, path_va,
+  //       path_len) -- KPTI-safe per-byte 4-level PML4 walk.
+  //   (4) Write NUL at scratch[path_len] so path_resolve terminates.
+  //   (5) Call sys_umount_body(scratch, path_len, flags); forward rax
+  //       verbatim.
+  //
+  // Register plan (identical shape to sys_execve_shim's 5-push prologue):
+  //   rbx      unused-but-pushed for prologue-count parity (5 pushes
+  //            land rsp%16==0 at nested calls; a 4-push prologue would
+  //            require an extra sub rsp,8).
+  //   r12      path_va (saved across user_ptr_ok, then consumed by
+  //            user_read_bytes_via_walk).
+  //   r13      path_len (saved for the NUL-write and the body call).
+  //   r14      flags (saved for the body call).
+  //   r15      _sys_umount_path_scratch base VA (lea'd once, used at
+  //            the NUL-write and the body call).
+  // ==========================================================================
+  pub let sys_umount_shim : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (current: u64) (path_va: u64) (path_len: u64) (flags: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap},
+      justification: "R53.M2-003 (#1738): sys_umount dispatch shim.  Bridges the SC+ userland umount(path, path_len, flags) shape to sys_umount_body's kernel-VA contract by KPTI-copying the mount-point path from the caller's user VA into _sys_umount_path_scratch and NUL-terminating it before calling the body.  Mirrors sys_execve_shim's Phase 3 D10d posture (sys_execve_shim.pdx L136) -- user_ptr_ok gate followed by user_read_bytes_via_walk's per-byte 4-level PML4 walk -- so a caller pattern proven against execve transfers verbatim here.  5-push callee-save prologue (rbx/r12/r13/r14/r15) lands rsp%16==0 at every nested call (entry rsp%16==8 + 40 = 48, %16==0).  rbx pushed for parity only.  path_len in (0, 255] because scratch is 256 bytes and the shim writes an explicit NUL at scratch[path_len] so path_resolve's own end-of-string detection fires -- a caller passing path_len==256 would leave no room for the NUL and the body's path walk would read past the buffer.  The `current` arg (rdi) is unused at R53.M2 but present for ABI parity with sys_execve_shim; a future audit-record round wiring the actor field reads it from here.  Body call at the tail uses tail-shaped rax return -- whatever the body returns (0 or ED68..6E or a forwarded ED27/ED08 from umount_pdxfs_block) is the shim's rax return, so the ring-3 caller sees a single-source diagnosis without the shim inserting a re-mapping layer.  Effects {mem, sysreg} inherits from user_read_bytes_via_walk's {mem} plus the body's {mem, sysreg}; capabilities {cap} inherits from the body.  Labels prefixed syus_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rsi;                                // path_va
+        mov r13, rdx;                                // path_len
+        mov r14, rcx;                                // flags
+
+        // -------- (1) path_len in (0, 255] gate. -------------------------
+        cmp r13, 0;
+        je  syus_bad_path;
+        mov r10, 255;                                // SYS_UMOUNT_PATH_MAX - 1
+        cmp r13, r10;
+        ja  syus_bad_path;
+
+        // -------- (2) user_ptr_ok(path_va, path_len). --------------------
+        mov rdi, r12;
+        mov rsi, r13;
+        call user_ptr_ok;                            // 0 = OK, nonzero = fault
+        cmp rax, 0;
+        jne syus_efault;
+
+        // -------- (3) KPTI-safe byte copy into kernel scratch. -----------
+        // user_read_bytes_via_walk(kernel_dst=rdi, user_va=rsi, len=rdx).
+        lea rdi, [rip + _sys_umount_path_scratch];
+        mov rsi, r12;
+        mov rdx, r13;
+        call user_read_bytes_via_walk;               // 0 = OK, -EFAULT on fault
+        cmp rax, 0;
+        jne syus_efault;
+
+        // -------- (4) NUL-terminate at scratch[path_len]. ----------------
+        lea r15, [rip + _sys_umount_path_scratch];
+        xor rcx, rcx;
+        mov_b [r15 + r13 * 1], rcx;
+
+        // -------- (5) Tail-call the body; its rax is our rax. ------------
+        mov rdi, r15;                                // scratch base
+        mov rsi, r13;                                // path_len
+        mov rdx, r14;                                // flags
+        call sys_umount_body;
+        jmp syus_done;
+
+      syus_bad_path:
+        mov rax, 0xFFFFED69;                         // SYS_UMOUNT_ERR_EBADPATH
+        jmp syus_done;
+
+      syus_efault:
+        mov rax, 0xFFFFED6E;                         // SYS_UMOUNT_ERR_EFAULT
+
+      syus_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
