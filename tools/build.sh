@@ -6326,6 +6326,46 @@ fi
 echo "[r53-m2-005-confine] R53.M2-005 (_pdxfs_block_vops) confined"
 
 # ---------------------------------------------------------------------------
+# R53.M3-001 (#1742): confinement for the root-volume UUID hint slot in
+# the factored boot handoff record.
+#
+# `_root_volume_uuid` is the 16-byte slot future R11-plus multiboot
+# loader paths will populate with the UUID of the volume to mount at
+# slot 0; `_root_volume_uuid_valid` is its companion validity flag
+# (0 = ignore, 1 = binding). Together they steer step 1 of the pdxb
+# probe root-selection order (design/tooling/volume-lifecycle-
+# mechanism.md §4.4).
+#
+# The pair is written exclusively by handoff_set_root_uuid and read
+# exclusively via handoff_root_uuid_ptr, both defined in boot/handoff.
+# pdx. A second writer against either slot would let an unrelated
+# module -- a witness, a driver init, an audit stream -- forge the
+# loader hint and steer the probe to mount an attacker-nominated
+# volume as root, which is exactly the pivot the accessor-shim
+# arrangement exists to make unrepresentable.
+#
+# Owner is boot/handoff.o alone: the accessor + setter live there,
+# and no other .o should ever name either symbol. The three
+# `_init_handoff_*` slots in the same module are NOT confined via
+# ec_confine_one -- their store + load sites intentionally live in
+# boot/kernel_main.o, and the stronger five-halves gate at tools/
+# verify-init-handoff.sh polices the split.
+R53_HANDOFF_SRC="${REPO_ROOT}/src/kernel/boot/handoff.pdx"
+if [[ ! -f "${R53_HANDOFF_SRC}" ]]; then
+    echo "[r53-m3-001-confine] FAIL - boot/handoff.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_root_volume_uuid'       'boot/handoff.o'
+ec_confine_one '_root_volume_uuid_valid' 'boot/handoff.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/boot/handoff.pdx for the accessor-shim discipline" >&2
+    echo "  (handoff_root_uuid_ptr / handoff_set_root_uuid are the API; the" >&2
+    echo "  raw symbols must not be named outside this module's .o)." >&2
+    exit 1
+fi
+echo "[r53-m3-001-confine] R53.M3-001 (_root_volume_uuid + _valid) confined"
+
+# ---------------------------------------------------------------------------
 # R52.M7-005 (#1719): one-writer discipline for the single-block-ahead
 # read-prefetch primitive.
 #

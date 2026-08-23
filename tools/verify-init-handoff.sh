@@ -30,7 +30,10 @@
 #
 # WHAT REPLACED IT
 #
-# Three .bss slots in kernel_main.pdx:
+# Three .bss slots. R53.M3-001 (#1742) split their DECLARATIONS out to
+# src/kernel/boot/handoff.pdx (module Handoff, the single owning module
+# for the kernel-side boot handoff record); the store, load and poison
+# sites remained in src/kernel/boot/kernel_main.pdx unchanged:
 #
 #     _init_handoff_task        init task slab pointer
 #     _init_handoff_entry_rip   ELF e_entry (user VA)
@@ -38,6 +41,13 @@
 #
 # written once, immediately after the setup block that computes them, and
 # read once, immediately before `call enter_userland_initial`.
+#
+# The split changes the shape of the confinement check but not its
+# strength: this gate now runs against TWO owner files rather than one
+# -- OWNER_DECL for the declarations (and NOTHING ELSE), OWNER_ACCESS
+# for the two access sites and the register poison. A reference from
+# any third file still fails; a store or load appearing in OWNER_DECL
+# still fails; a declaration appearing in OWNER_ACCESS still fails.
 #
 # WHY THIS GATE EXISTS AT ALL
 #
@@ -52,28 +62,34 @@
 #
 # FIVE HALVES
 #
-#   1. DECLARATION. Each slot is declared exactly once, in
-#      src/kernel/boot/kernel_main.pdx, as `pub let mut <sym> : u64 = 0`.
-#      Zero-init is load-bearing: both ends check for zero.
+#   1. DECLARATION. Each slot is declared exactly once, in OWNER_DECL
+#      (src/kernel/boot/handoff.pdx), as `pub let mut <sym> : u64 = 0`.
+#      Zero-init is load-bearing: both ends check for zero. Additionally,
+#      OWNER_DECL must NOT name the symbol on any other line -- the
+#      declaration file is storage-only, so a store or load creeping in
+#      here would smuggle a second access site under the split-owner
+#      exemption HALF 2 grants it.
 #
-#   2. CONFINEMENT. Each symbol is named in exactly one file — the file
-#      that declares it. A reference from any other file fails, named by
-#      file and line, whether it is code or a comment. Prose that names
-#      the slot from another module is the first step toward code that
-#      reads it, and there is no cost to routing such prose through the
-#      symbol-free phrase "init's ring-3 handoff".
+#   2. CONFINEMENT. Each symbol is named in exactly two files -- OWNER_
+#      DECL (declaration) and OWNER_ACCESS (store + load + poison). A
+#      reference from any other file fails, named by file and line,
+#      whether it is code or a comment. Prose that names the slot from
+#      another module is the first step toward code that reads it, and
+#      there is no cost to routing such prose through the symbol-free
+#      phrase "init's ring-3 handoff".
 #
-#   3. TWO ACCESSES. Within kernel_main.pdx each symbol has exactly two
-#      code references (comments stripped): one store `mov [rip + S], rN`
-#      and one load `mov rN, [rip + S]`. Not two stores, not a load in a
-#      loop, not a third site "just reading it for a log line".
+#   3. TWO ACCESSES. Within OWNER_ACCESS (src/kernel/boot/kernel_main.pdx)
+#      each symbol has exactly two code references (comments stripped):
+#      one store `mov [rip + S], rN` and one load `mov rN, [rip + S]`.
+#      Not two stores, not a load in a loop, not a third site "just
+#      reading it for a log line".
 #
-#   4. THE SPAN. Every store precedes every load, and all six witness
-#      calls lie strictly between them. This is what makes the gate about
-#      the actual hazard rather than about tidiness: if a future edit
-#      moved the store to after the witnesses, or moved a witness call
-#      outside the span, the arrangement would still have two accesses
-#      and would no longer be protecting anything.
+#   4. THE SPAN. Within OWNER_ACCESS, every store precedes every load,
+#      and all six witness calls lie strictly between them. This is what
+#      makes the gate about the actual hazard rather than about tidiness:
+#      if a future edit moved the store to after the witnesses, or moved
+#      a witness call outside the span, the arrangement would still have
+#      two accesses and would no longer be protecting anything.
 #
 #   5. THE REGISTER PATH IS DEAD. r12/r13/r14 are poisoned with a
 #      non-canonical constant between the store and the first witness
@@ -121,7 +137,13 @@ ROOT = sys.argv[1]
 TAG  = "[init-handoff]"
 fails = []
 
-OWNER = "src/kernel/boot/kernel_main.pdx"
+# R53.M3-001 (#1742): the storage was factored out of kernel_main.pdx
+# into its own module (boot/handoff.pdx). Declaration site and access
+# site are now different files; every half below is written against
+# the pair, and HALF 2 admits both as exemptions from the foreign-
+# reference ban.
+OWNER_DECL   = "src/kernel/boot/handoff.pdx"
+OWNER_ACCESS = "src/kernel/boot/kernel_main.pdx"
 SYMS  = ["_init_handoff_task", "_init_handoff_entry_rip", "_init_handoff_user_rsp"]
 
 # The six calls the handoff has to survive. Named explicitly rather than
@@ -148,26 +170,44 @@ def strip_comment(line):
     return line.split("//")[0]
 
 
-owner_path = os.path.join(ROOT, OWNER)
+access_path = os.path.join(ROOT, OWNER_ACCESS)
+decl_path   = os.path.join(ROOT, OWNER_DECL)
 try:
-    owner_raw = open(owner_path, encoding="utf-8").read().split("\n")
+    owner_raw = open(access_path, encoding="utf-8").read().split("\n")
 except OSError as e:
-    print(f"{TAG} FAIL — cannot read {OWNER}: {e}", file=sys.stderr)
+    print(f"{TAG} FAIL — cannot read {OWNER_ACCESS}: {e}", file=sys.stderr)
+    sys.exit(1)
+try:
+    decl_raw = open(decl_path, encoding="utf-8").read().split("\n")
+except OSError as e:
+    print(f"{TAG} FAIL — cannot read {OWNER_DECL}: {e}", file=sys.stderr)
     sys.exit(1)
 owner_code = [strip_comment(l) for l in owner_raw]
+decl_code  = [strip_comment(l) for l in decl_raw]
 
 # ---------------------------------------------------------------------------
-# HALF 1 — the declarations.
+# HALF 1 — the declarations (in OWNER_DECL, and nothing else in that file
+# may name the symbol -- otherwise HALF 2's split-owner exemption would
+# let a second access site hide there).
 # ---------------------------------------------------------------------------
 for sym in SYMS:
     decl = re.compile(r"^\s*pub let mut\s+" + sym + r"\s*:\s*u64\s*=\s*0\s*$")
-    hits = [i + 1 for i, l in enumerate(owner_code) if decl.match(l)]
+    hits = [i + 1 for i, l in enumerate(decl_code) if decl.match(l)]
     if len(hits) != 1:
-        fail(f"`{sym}` must be declared exactly once in {OWNER} as "
+        fail(f"`{sym}` must be declared exactly once in {OWNER_DECL} as "
              f"`pub let mut {sym} : u64 = 0` — found {len(hits)}.",
              "  Zero-init is not incidental: the setup block refuses to store a",
              "  zero task slab or entry point, and the ring-3 entry refuses to",
              "  iretq on one, so zero is the agreed 'never written' value.")
+    stray = [i + 1 for i, l in enumerate(decl_code)
+             if sym in l and not decl.match(l)]
+    if stray:
+        fail(f"`{sym}` referenced in {OWNER_DECL} outside its declaration:",
+             *[f"    line {n}: {decl_code[n-1].strip()}" for n in stray],
+             f"  {OWNER_DECL} is the storage-only owner; a store, load, or",
+             "  comment naming the symbol here would smuggle a second access",
+             "  site under HALF 2's split-owner exemption. Route prose through",
+             "  the symbol-free phrase 'init's ring-3 handoff'.")
 
 # A fourth slot would be outside everything below.
 extra = set()
@@ -179,7 +219,7 @@ for sub in ("src", "tests"):
                 continue
             for l in open(os.path.join(root, fn), encoding="utf-8",
                           errors="replace"):
-                for m in re.finditer(r"_init_handoff_[A-Za-z0-9_]*", l):
+                for m in re.finditer(r"_init_handoff_[A-Za-z0-9_]+", l):
                     if m.group(0) not in SYMS:
                         extra.add(m.group(0))
 if extra:
@@ -189,8 +229,9 @@ if extra:
          "  in the same commit that introduces it, or do not add it.")
 
 # ---------------------------------------------------------------------------
-# HALF 2 — confinement to one file.
+# HALF 2 — confinement to the two owner files (OWNER_DECL + OWNER_ACCESS).
 # ---------------------------------------------------------------------------
+EXEMPT = {OWNER_DECL, OWNER_ACCESS, "tools/verify-init-handoff.sh"}
 foreign = []
 for sub in ("src", "tests", "tools"):
     base = os.path.join(ROOT, sub)
@@ -199,7 +240,7 @@ for sub in ("src", "tests", "tools"):
         for fn in sorted(files):
             path = os.path.join(root, fn)
             rel  = os.path.relpath(path, ROOT)
-            if rel == OWNER or rel == "tools/verify-init-handoff.sh":
+            if rel in EXEMPT:
                 continue
             if not fn.endswith((".pdx", ".S", ".ld", ".c", ".h")):
                 continue
@@ -212,14 +253,17 @@ for sub in ("src", "tests", "tools"):
                     if sym in l:
                         foreign.append((rel, i + 1, sym))
 if foreign:
-    fail("the handoff slots are named outside the file that owns them:",
+    fail("the handoff slots are named outside their two owner files:",
          *[f"    {r}:{n} — {s}" for r, n, s in foreign],
          "  These three slots exist to carry state across six witness calls",
          "  into five modules WITHOUT any of those modules being able to reach",
          "  it. A .bss global that half the boot path can name is not an",
          "  improvement on the register convention it replaced — it is the same",
          "  unenforced coupling with a wider reachable set. Refer to it in prose",
-         "  as 'init's ring-3 handoff'; do not name the symbol.")
+         "  as 'init's ring-3 handoff'; do not name the symbol.",
+         f"  Owner files: {OWNER_DECL} (declaration only) and {OWNER_ACCESS}",
+         "  (store + load + poison). Any other file that names one of these",
+         "  symbols is a bug, whether the reference is code or a comment.")
 
 # ---------------------------------------------------------------------------
 # HALF 3 — exactly one store and one load, per symbol.
@@ -236,8 +280,8 @@ for sym in SYMS:
               and not re.match(r"^\s*pub let mut\s+" + sym + r"\b", l)]
     stores[sym], loads[sym] = s_hits, l_hits
     if len(s_hits) != 1 or len(l_hits) != 1:
-        fail(f"`{sym}` must have exactly one store and one load in {OWNER} — "
-             f"found {len(s_hits)} store(s) at lines "
+        fail(f"`{sym}` must have exactly one store and one load in "
+             f"{OWNER_ACCESS} — found {len(s_hits)} store(s) at lines "
              f"{[i + 1 for i in s_hits]} and {len(l_hits)} load(s) at lines "
              f"{[i + 1 for i in l_hits]}.",
              "  Expected forms, and only these:",
@@ -247,7 +291,7 @@ for sym in SYMS:
              "  global. A second writer is how the read site stops being able",
              "  to say which write it observes.")
     if other:
-        fail(f"`{sym}` referenced in {OWNER} outside its store and load:",
+        fail(f"`{sym}` referenced in {OWNER_ACCESS} outside its store and load:",
              *[f"    line {i + 1}: {owner_code[i].strip()}" for i in other])
 
 if any(len(stores[s]) != 1 or len(loads[s]) != 1 for s in SYMS):
@@ -281,7 +325,7 @@ for name in WITNESS_CALLS:
             outside.append((name, i + 1))
 
 if missing:
-    fail(f"vacuous span — witness call(s) not found in {OWNER}: {missing}.",
+    fail(f"vacuous span — witness call(s) not found in {OWNER_ACCESS}: {missing}.",
          "  This gate exists to police a handoff that crosses these six calls.",
          "  If one was renamed or removed, update WITNESS_CALLS here in the",
          "  same commit; a span that crosses nothing proves nothing.")
@@ -349,7 +393,8 @@ if fails:
             print(d, file=sys.stderr)
     sys.exit(1)
 
-print(f"{TAG} 3 slots declared once in {OWNER}, named in no other file; "
+print(f"{TAG} 3 slots declared once in {OWNER_DECL}, accessed only in "
+      f"{OWNER_ACCESS}, named in no other file; "
       f"written at lines {sorted(stores[s][0] + 1 for s in SYMS)}, "
       f"read at lines {sorted(loads[s][0] + 1 for s in SYMS)}; "
       f"{len(WITNESS_CALLS)} witness calls span the gap; "
