@@ -1,0 +1,818 @@
+// src/kernel/core/fs/pdxfs/block_cache.pdx -- R52.M7-001 (#1715)
+//
+// PDXFS-ON-BLOCK v1 -- CLOCK BLOCK CACHE (256 slots, per-instance).
+//
+// Design authority: design/filesystem/r52-implementation-plan.md §2.7
+// (R52.M7, step 1: "#1715 -- block_cache.pdx: 256-slot CLOCK cache in
+// front of the raw bdev with per-slot (vol_slot, lba) tags and a
+// ref/dirty pair; write-back on eviction, flush-all on unmount").
+//
+// -----------------------------------------------------------------------------
+// Scope
+// -----------------------------------------------------------------------------
+//
+//   block_cache_init() -> u64
+//     Zeroes all state (slots, hand, stats). Always returns 0. Every
+//     slot lands with meta=0 (valid=0, ref=0, dirty=0, tag_vol_slot=0)
+//     and tag_lba=0; empty slots are indistinguishable from an
+//     unpopulated cache entry, which is the correct starting shape
+//     for CLOCK (see "Slot layout" below).
+//
+//   block_cache_lookup(vol_slot: u64, lba: u64) -> u64
+//     Scans the 256 slots for a valid entry whose (tag_vol_slot,
+//     tag_lba) match. On hit: sets the slot's ref_bit (CLOCK's
+//     "recently touched" mark), bumps _block_cache_stats[0] (hits),
+//     returns the slot pointer (caller reads data via
+//     slot_ptr + BC_DATA_OFFSET). On miss: bumps
+//     _block_cache_stats[1] (misses), returns 0. A hit's returned
+//     pointer stays valid until the next `block_cache_insert` call
+//     touching this slot (single-writer, single-threaded R52 boot
+//     path -- see gap 5 for the concurrency posture).
+//
+//   block_cache_insert(vol_slot: u64, lba: u64, data_ptr: u64) -> u64
+//     Reserves a slot for (vol_slot, lba) via the CLOCK hand: advances
+//     the hand until it lands on a slot whose ref_bit is 0. Slots
+//     visited along the way with ref_bit==1 have their ref_bit cleared
+//     and the hand advances (this is the whole CLOCK approximation to
+//     LRU). If the reserved slot is valid AND dirty, its 512 bytes
+//     are first written back to the bdev (BDEV_OP_WRITE_LBA via
+//     cap_invoke, bdev_cap resolved through Volume.volume_row_
+//     device_slot on the OLD tag_vol_slot -- see gap 1 below); a
+//     write-back failure short-circuits the insert with the reused
+//     ALLOC_BITMAP_TORN code (see gap 2). On success the caller-
+//     supplied 512-byte payload is copied into the slot, the tag is
+//     rewritten (valid=1, ref=1, dirty=0, tag_vol_slot=NEW vol_slot),
+//     tag_lba=NEW lba, and _block_cache_stats[2] (evictions) is
+//     bumped whenever the slot was previously valid. This function
+//     does NOT itself check whether (vol_slot, lba) is already
+//     resident -- callers must lookup first (miss -> insert); a
+//     duplicate insert produces a duplicate cache entry, which is a
+//     documented cost of keeping the API's arity at 3 (see gap 3).
+//
+//   block_cache_mark_dirty(slot_ptr: u64) -> ()
+//     Sets the slot's dirty_bit (bit 17 of meta_word). Caller is
+//     trusted to hand a pointer this module itself returned from
+//     block_cache_lookup or block_cache_insert -- no bounds check
+//     (the pointer is treated as authoritative in the same way
+//     inode_table.pdx trusts its inode-row-scratch pointer's
+//     caller). Silent no-op if the slot is somehow invalid (valid=0
+//     defends against the caller passing a stale pointer whose slot
+//     has since been evicted -- the mark would be lost on the next
+//     eviction anyway).
+//
+//   block_cache_flush_all() -> u64
+//     Iterates every slot; each valid+dirty one is written back
+//     (same descriptor-page protocol as the eviction write-back),
+//     dirty_bit cleared, _block_cache_stats[3] (writebacks) bumped.
+//     Returns 0 on all-success; the reused ALLOC_BITMAP_TORN
+//     (0xFFFFED11) on any failure -- the flush continues past a
+//     failure (best-effort) so no dirty slot is skipped by a
+//     transient failure earlier in the walk, mirroring
+//     journal_ondisk.pdx's own "record every op, forward first
+//     unacceptable status" posture for the barrier-sequenced writer.
+//
+//   block_cache_stats() -> u64
+//     Returns &_block_cache_stats. Caller reads:
+//       [+0]  hits
+//       [+8]  misses
+//       [+16] evictions
+//       [+24] writebacks
+//     Pointer-return chosen over four separate scalar getters to
+//     keep this module's public-symbol count at seven (one per
+//     documented API entry), matching the same "one pointer instead
+//     of one scalar per field" collapse the mkfs/superblock/allocator
+//     row-accessor families already use where the field group is
+//     read together.
+//
+// -----------------------------------------------------------------------------
+// Design-doc gaps flagged (see final report to main / softarch)
+// -----------------------------------------------------------------------------
+//
+// 1. vol_slot -> bdev_cap resolution goes through
+//    Volume.volume_row_device_slot (kind_volume.pdx, #1703). The task
+//    brief specifies the slot's tag as `{tag_vol_slot: u16, tag_lba:
+//    u64, ref_bit: u8, dirty_bit: u8, data[512]}` -- carrying vol_slot,
+//    NOT bdev_cap. But the eviction write-back needs a bdev_cap to hand
+//    to cap_invoke. The resolution path this module implements --
+//    `volume_row_device_slot(slot.tag_vol_slot) -> device_slot,
+//    treated as bdev_cap` -- mirrors the same chain kind_pdxfs_txn.pdx
+//    already uses at every op-arm entry ("MOUNT_ROOT_SLOT -> KIND_VOLUME
+//    row_id -> volume_row_device_slot -> bdev_cap"). If the resolution
+//    returns VOL_DECODE_BAD (0xFFFFFFFFFFFFFFFF -- the sentinel
+//    volume_row_device_slot's own header documents), the eviction
+//    write-back is refused with the reused ALLOC_BITMAP_TORN code
+//    rather than silently dropping the dirty data; flagged for
+//    softarch to confirm this is the right escalation (the alternative
+//    -- "log + drop" -- would let the cache advance past a lost
+//    write, which corrupts the volume silently, and is not what
+//    #1715's brief describes).
+//
+// 2. Failure code reuse. The task brief names no failure band for
+//    R52.M7 (0xFFFFED30..? is not yet allocated by any landed module
+//    per §7.2's frozen table). This module reuses allocator.pdx's own
+//    ALLOC_BITMAP_TORN (0xFFFFED11, M3's band) for every write-back
+//    failure and every VOL_DECODE_BAD escalation, restated as the
+//    literal `0xFFFFED11` per this codebase's no-cross-module-
+//    constant-import convention (see inode_table.pdx / journal_ondisk.
+//    pdx / mkfs_upgrade.pdx which all reuse an already-frozen,
+//    semantically-adjacent code across module/milestone boundaries
+//    rather than inventing a new slot in an already-frozen band).
+//    Softarch should confirm this reading is the intended one.
+//
+// 3. block_cache_insert does NOT deduplicate. Two consecutive inserts
+//    with identical (vol_slot, lba) create TWO cache entries -- the
+//    older becomes CLOCK-evictable, the newer answers the next
+//    lookup. Callers are trusted to lookup first (this is the
+//    standard read-through pattern: lookup returns slot_ptr on hit,
+//    caller uses it; on miss, caller reads from bdev and calls
+//    insert). Adding an "if already present, overwrite" branch would
+//    require a full O(256) scan on every insert AND either a
+//    ref-preserving overwrite policy or a separate free-list --
+//    kept out of this landing to preserve the "CLOCK is the only
+//    replacement policy" invariant §2.7's brief calls for. Flagged
+//    for softarch: if the caller shape changes to make dedup
+//    valuable, the follow-up is a single scan-and-overwrite branch
+//    at the top of block_cache_insert.
+//
+// 4. Single active cache instance. §2.7's brief itself says "cache
+//    is per-instance (only one instance in tree for now)". The one-
+//    writer statics below (_block_cache_slots, _block_cache_hand,
+//    _block_cache_stats, _block_cache_io_desc, _block_cache_io_
+//    scratch) are all singletons confined at build-time via tools/
+//    build.sh ec_confine_one (mirroring inode_table.pdx / journal_
+//    ondisk.pdx). A future per-instance widening threads a
+//    cache_ctx pointer through every entry point without touching
+//    the slot-layout / CLOCK / write-back logic below.
+//
+// 5. Single-threaded R52 boot path. The whole R52 mount path runs
+//    single-writer, single-threaded (design/filesystem/volume-fs-
+//    substrate.md §3.4: "R52 root-only is enough for smoke"), so
+//    lookup's returned slot_ptr staying valid until the caller's
+//    next insert requires no cross-thread invalidation. A future
+//    concurrent widening (R53+) needs either a per-slot generation
+//    counter (return (ptr, gen), caller re-validates) or a
+//    slot-lock table; flagged, not implemented here.
+//
+// 6. Write-back uses a 4-KiB-aligned scratch buffer (_block_cache_io_
+//    scratch) rather than pointing the descriptor's dma_iova
+//    directly at the slot's data field. Packed 528-byte slots do
+//    NOT sit at 4-KiB boundaries (slot i starts at i*528, not a
+//    multiple of 4096 for any i>0), and BDEV_OP_WRITE_LBA's PRP
+//    encoding demands page-aligned DMA. The scratch-and-copy adds
+//    one 512-byte memcpy per write-back, which is the same cost
+//    inode_table.pdx already pays for its own _itable_row_scratch
+//    (128-byte splice) and journal_ondisk.pdx pays for its
+//    _journal_stage_blk (4-KiB stage). Softarch: if this cost
+//    matters, the alternative is aligning every slot to 4 KiB
+//    (256 * 4 KiB = 1 MiB, 7.6x the task's stated 135168 B) -- a
+//    footprint trade the task explicitly refused.
+//
+// -----------------------------------------------------------------------------
+// Slot layout (528 B/slot, packed; 256 slots -> 135168 B total)
+// -----------------------------------------------------------------------------
+//
+//   Offset  Size  Field         Notes
+//   ------  ----  ------------  ------------------------------------------------
+//   0       8     meta_word     bits [15:0]  = tag_vol_slot (u16)
+//                                bit  16      = ref_bit
+//                                bit  17      = dirty_bit
+//                                bit  63      = valid (populated flag)
+//                                All other bits reserved zero.
+//   8       8     tag_lba       full u64
+//   16      512   data          8-byte-aligned, 64 qwords (one bdev sector)
+//   Total   528
+//
+// Rationale for the packed meta_word: the task's stated tag {tag_vol_
+// slot: u16, tag_lba: u64, ref_bit: u8, dirty_bit: u8} = 12 bytes,
+// but the stated per-slot geometry `16 + 512 = 528` reserves 16 bytes
+// for the tag half. Packing all four fields into two u64s (one meta,
+// one lba) keeps every access whole-qword (matching this codebase's
+// whole-qword-only load posture -- no mov_b anywhere in this module)
+// while filling the 16-byte tag exactly. The valid bit is at bit 63
+// so a plain `test` would be a sign-bit check -- we still use
+// `cmp reg,0; je/jne` per this codebase's no-test-instruction rule.
+//
+// -----------------------------------------------------------------------------
+// CLOCK invariant
+// -----------------------------------------------------------------------------
+//
+// The hand walks in one direction (0 -> 255 -> wrap to 0), each
+// invocation of the eviction loop makes at most 2 * 256 = 512 slot
+// visits: at most one full sweep clears every ref_bit, the second
+// sweep is guaranteed to find a ref=0 slot (either an original
+// ref=0 or one cleared during the first sweep). The empty-slot case
+// (valid=0) has ref=0 by construction (init zeros everything), so
+// a fresh cache picks a slot on its very first visit. The eviction
+// loop terminates because the ref-clear pass is finite; a caller
+// that never inserts + never marks dirty sees the hand return to 0
+// after 256 hops with no state change (idempotent). Reserved-label
+// prefix for the eviction loop: `bce_` (block_cache_evict).
+//
+// -----------------------------------------------------------------------------
+// Arity discipline (design/filesystem/r52-implementation-plan.md §5.1)
+// -----------------------------------------------------------------------------
+//
+// block_cache_init() = 0. block_cache_lookup(vol_slot, lba) = 2.
+// block_cache_insert(vol_slot, lba, data_ptr) = 3. block_cache_mark_
+// dirty(slot_ptr) = 1. block_cache_flush_all() = 0. block_cache_
+// stats() = 0. bc_slot_ptr(idx) = 1 (leaf helper). bc_writeback_slot
+// (slot_ptr) = 1 (helper -- reads bdev_cap out of the slot's own
+// tag_vol_slot, no caller-supplied bdev_cap needed). Every arity
+// sits far under the paideia-as ceiling of 6.
+//
+// -----------------------------------------------------------------------------
+// Register discipline
+// -----------------------------------------------------------------------------
+//
+// block_cache_init:  1 push (rbx=loop counter). Entry rsp%16==8 +
+//   8 = 16, %16==0. No nested call anyway (leaf), but rbx is used
+//   for the zero-loop counter so the ABI push is obligatory.
+// block_cache_lookup: 3 pushes (rbx=vol_slot, r12=lba, r13=hit-slot-
+//   ptr or 0). Entry rsp%16==8 + 24 = 32, %16==0. No nested call --
+//   pure whole-qword scan.
+// bc_slot_ptr:       0 pushes (leaf, caller-save-only rax/rcx/r10).
+// bc_writeback_slot: 5 pushes (rbx=slot_ptr, r12=bdev_cap, r13=lba,
+//   r14/r15=unused-but-pushed for pattern uniformity with inode_
+//   table.pdx's write helpers). Entry rsp%16==8 + 40 = 48, %16==0
+//   for the nested volume_row_device_slot + cap_invoke + bbjw_check.
+// block_cache_insert: 5 pushes (rbx=vol_slot, r12=lba, r13=data_ptr,
+//   r14=victim slot_ptr, r15=old-valid flag). Entry rsp%16==8 + 40
+//   = 48, %16==0 for the nested bc_writeback_slot call -- 5 pushes
+//   are odd-count already-aligned, no pad needed, matching inode_
+//   table.pdx's inode_write shape.
+// block_cache_mark_dirty: 0 pushes (leaf, caller-save only). No
+//   nested call; single meta_word read + or + write.
+// block_cache_flush_all: 5 pushes (rbx=slot index cursor, r12=slot_
+//   ptr, r13=meta_word cache, r14=accumulator for aggregate error,
+//   r15=unused). Entry rsp%16==8 + 40 = 48, %16==0 for nested
+//   bc_writeback_slot -- same odd-count already-aligned shape.
+// block_cache_stats: 0 pushes (leaf, one lea + ret).
+//
+// -----------------------------------------------------------------------------
+// mov_b / no-test / label-prefix discipline
+// -----------------------------------------------------------------------------
+//
+// No byte-granularity memory access anywhere in this module -- every
+// slot field is packed into a full u64 and read/written whole-qword,
+// same posture as inode_table.pdx / allocator.pdx. No test
+// instruction; every zero/nonzero check is cmp reg,0 (or cmp reg,imm)
+// + je/jne/jb/jae. Label prefixes: `bci_` (init), `bcl_` (lookup),
+// `bce_` (insert's eviction loop), `bcw_` (writeback helper),
+// `bcf_` (flush_all), `bcsp_` (slot-ptr helper) -- distinct from
+// every other pdxfs module's prefixes (checked against alloc_*,
+// itable_*, jbnl_*/jnl_*/japp_/jrep_/jbw_/jbr_/jbf_, sb_*, mkfs_*).
+
+module BlockCache = structure {
+
+  // ============================================================================
+  // Geometry / packing constants.
+  // ============================================================================
+
+  pub let BC_SLOT_COUNT       : u64 = 256
+  pub let BC_SLOT_BYTES       : u64 = 528
+  pub let BC_DATA_OFFSET      : u64 = 16
+  pub let BC_DATA_QWORDS      : u64 = 64
+  pub let BC_DATA_BYTES       : u64 = 512
+
+  // Meta-word bit layout (see header "Slot layout").
+  pub let BC_META_VOLSLOT_MASK   : u64 = 0xFFFF
+  pub let BC_META_REF_BIT_SHIFT   : u64 = 16
+  pub let BC_META_DIRTY_BIT_SHIFT : u64 = 17
+  pub let BC_META_VALID_BIT_SHIFT : u64 = 63
+
+  // Stats offsets (in bytes into _block_cache_stats).
+  pub let BC_STATS_HITS       : u64 = 0
+  pub let BC_STATS_MISSES     : u64 = 8
+  pub let BC_STATS_EVICTIONS  : u64 = 16
+  pub let BC_STATS_WRITEBACKS : u64 = 24
+
+  // Reused failure code (see header gap 2).
+  pub let BC_WRITEBACK_ERR : u64 = 0xFFFFED11   // ALLOC_BITMAP_TORN (reused)
+
+  // ============================================================================
+  // Storage.  256 slots * 66 qwords/slot = 16896 qwords = 135168 B.
+  // ============================================================================
+
+  pub let mut _block_cache_slots      : [u64; 16896] = uninit @align(64)
+  pub let mut _block_cache_hand       : [u64; 1]     = uninit @align(8)
+  pub let mut _block_cache_stats      : [u64; 4]     = uninit @align(8)
+  pub let mut _block_cache_io_desc    : [u64; 4]     = uninit @align(4096)
+  pub let mut _block_cache_io_scratch : [u64; 512]   = uninit @align(4096)
+
+  // ============================================================================
+  // bc_slot_ptr(idx: u64) -> u64
+  //   Returns &_block_cache_slots + idx * 528. Leaf; caller-save only.
+  //   idx * 528 computed as (idx << 9) + (idx << 4) = 512*idx + 16*idx.
+  //   No imul required (same decomposition posture as ipc/endpoint_
+  //   table.pdx's "no imul required, matches the multiply-by-24
+  //   pattern in cap/verify.pdx").
+  // ============================================================================
+  pub let bc_slot_ptr : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R52.M7-001 (#1715). Leaf, caller-save only (rax/rcx/r10/r11). idx*528 via (idx<<9)+(idx<<4) -- no imul required (matches endpoint_table.pdx's multiply-by-48 decomposition posture). rip-relative lea of _block_cache_slots, then add computed byte offset. No test instruction; no branches. Reserved labels: bcsp_ (unused, straight-line).",
+      block: {
+        mov rcx, rdi;
+        shl rcx, 9;
+        mov r10, rdi;
+        shl r10, 4;
+        add rcx, r10;
+        lea rax, [rip + _block_cache_slots];
+        add rax, rcx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // block_cache_init() -> u64
+  //   Zeroes every slot's meta+lba+data, the CLOCK hand, and every stats
+  //   counter.  Always returns 0.
+  // ============================================================================
+  pub let block_cache_init : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R52.M7-001 (#1715). 1-push prologue (rbx=zero-loop counter) lands rsp%16==0 (entry rsp%16==8 + 8 = 16). No nested call. Body: (1) zero all 16896 qwords of _block_cache_slots via rbx=0..16896 loop (rax=0 constant, xor eax,eax once). (2) zero the hand (_block_cache_hand[0]=0). (3) zero all 4 stats counters. (4) xor eax,eax; pop rbx; ret. No test instruction; no mov_b. Reserved labels: bci_.",
+      block: {
+        push rbx;
+
+        xor rax, rax;
+        lea r10, [rip + _block_cache_slots];
+        xor rbx, rbx;
+
+      bci_slot_top:
+        mov r11, 16896;
+        cmp rbx, r11;
+        jae bci_slot_done;
+        mov [r10 + rbx * 8], rax;
+        add rbx, 1;
+        jmp bci_slot_top;
+
+      bci_slot_done:
+        lea r10, [rip + _block_cache_hand];
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _block_cache_stats];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+
+        xor eax, eax;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // block_cache_lookup(vol_slot: u64, lba: u64) -> u64
+  //   Scans all 256 slots.  Hit: sets ref_bit, bumps hits, returns
+  //   slot_ptr.  Miss: bumps misses, returns 0.
+  // ============================================================================
+  pub let block_cache_lookup : (u64, u64) -> u64 !{mem} @{} =
+    fn (vol_slot: u64) (lba: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R52.M7-001 (#1715). 3-push prologue (rbx=vol_slot, r12=lba, r13=slot index cursor 0..256) lands rsp%16==0 (entry rsp%16==8 + 24 = 32). No nested call -- inlined slot-pointer arithmetic (idx<<9)+(idx<<4) rather than call bc_slot_ptr, to avoid a nested call overhead in the hot lookup path (256 iterations per miss). Body: (1) rbx=vol_slot, r12=lba, r13=0. (2) Loop: cmp r13,256; jae miss. rcx=(r13<<9)+(r13<<4)+&_block_cache_slots -> slot_ptr in r11. meta=[r11+0]; check valid bit via mov rax,meta;shr rax,63;cmp rax,0;je next. Extract tag_vol_slot via meta&0xFFFF; cmp rbx,tag_vs; jne next. tag_lba=[r11+8]; cmp r12,tag_lba; jne next. Hit: meta |= (1<<16) (ref_bit); store back. Bump stats[0]. rax=slot_ptr. Jump done. next: r13+=1; loop. miss: bump stats[1]; xor eax,eax. done: 3-pop epilogue + ret. Reserved labels: bcl_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+        xor r13, r13;
+
+      bcl_loop_top:
+        mov r10, 256;
+        cmp r13, r10;
+        jae bcl_miss;
+
+        mov rcx, r13;
+        shl rcx, 9;
+        mov r10, r13;
+        shl r10, 4;
+        add rcx, r10;
+        lea r11, [rip + _block_cache_slots];
+        add r11, rcx;
+
+        mov rax, [r11 + 0];
+        mov rcx, rax;
+        shr rcx, 63;
+        cmp rcx, 0;
+        je bcl_next;
+
+        mov rcx, rax;
+        mov r10, 0xFFFF;
+        and rcx, r10;
+        cmp rcx, rbx;
+        jne bcl_next;
+
+        mov rcx, [r11 + 8];
+        cmp rcx, r12;
+        jne bcl_next;
+
+        mov r10, 1;
+        shl r10, 16;
+        or rax, r10;
+        mov [r11 + 0], rax;
+
+        lea r10, [rip + _block_cache_stats];
+        mov rax, [r10 + 0];
+        add rax, 1;
+        mov [r10 + 0], rax;
+
+        mov rax, r11;
+        jmp bcl_done;
+
+      bcl_next:
+        add r13, 1;
+        jmp bcl_loop_top;
+
+      bcl_miss:
+        lea r10, [rip + _block_cache_stats];
+        mov rax, [r10 + 8];
+        add rax, 1;
+        mov [r10 + 8], rax;
+        xor eax, eax;
+
+      bcl_done:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // bc_writeback_slot(slot_ptr: u64) -> u64
+  //   Writes back the 512 bytes of a valid+dirty slot to bdev via
+  //   BDEV_OP_WRITE_LBA.  Resolves tag_vol_slot -> device_slot ->
+  //   bdev_cap through Volume.volume_row_device_slot (see header gap 1).
+  //   Returns 0 on success, BC_WRITEBACK_ERR (reused ALLOC_BITMAP_TORN,
+  //   see gap 2) on failure (bad vol_slot, or the bdev write's forwarded
+  //   status was not acceptable per BdevBarrier.bbjw_check).
+  //
+  //   Copies the 512 bytes into _block_cache_io_scratch (4-KiB aligned)
+  //   before the write -- packed 528-byte slots are not page-aligned
+  //   (see gap 6).
+  // ============================================================================
+  pub let bc_writeback_slot : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (slot_ptr: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { cap },
+      justification: "R52.M7-001 (#1715). 5-push prologue (rbx=slot_ptr, r12=bdev_cap, r13=lba, r14/r15=unused-but-pushed for pattern uniformity with inode_table.pdx's inode_write) lands rsp%16==0 (entry rsp%16==8 + 40 = 48) for every nested call below. Body: (1) rbx=slot_ptr. (2) Extract vol_slot: rax=[rbx+0] (meta_word); and rax,0xFFFF (staged via r10 -- safe direct imm); rdi=rax; call volume_row_device_slot. (3) cmp rax,0xFFFFFFFFFFFFFFFF (VOL_DECODE_BAD sentinel, staged via r10); je bad. r12=rax (bdev_cap). (4) r13=[rbx+8] (tag_lba). (5) Copy 64 qwords from &slot+16 into _block_cache_io_scratch via a manual rcx=0..64 loop. (6) Stamp _block_cache_io_desc: [+0]=r13 (lba), [+8]=1 (nblocks), [+16]=&_block_cache_io_scratch, [+24]=0 (status_out). (7) rdi=r12 (bdev_cap); rsi=&_block_cache_io_desc OR'd with BDEV_OP_WRITE_LBA(4) via r10 (desc page @align(4096), low 12 bits zero); call cap_invoke. (8) rdi=rax; call bbjw_check; cmp rax,0; jne bad. (9) xor eax,eax; jmp done. bad: rax=0xFFFFED11 (BC_WRITEBACK_ERR, reused). done: 5-pop epilogue + ret. No test instruction; no mov_b. Reserved labels: bcw_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+
+        mov rax, [rbx + 0];
+        mov r10, 0xFFFF;
+        and rax, r10;
+        mov rdi, rax;
+        call volume_row_device_slot;
+
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je bcw_bad;
+
+        mov r12, rax;
+        mov r13, [rbx + 8];
+
+        mov r10, rbx;
+        add r10, 16;
+        lea r11, [rip + _block_cache_io_scratch];
+        xor rcx, rcx;
+
+      bcw_copy_top:
+        mov rax, 64;
+        cmp rcx, rax;
+        jae bcw_copy_done;
+        mov rax, [r10 + rcx * 8];
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        jmp bcw_copy_top;
+
+      bcw_copy_done:
+        lea r11, [rip + _block_cache_io_desc];
+        mov [r11 + 0], r13;
+        mov rax, 1;
+        mov [r11 + 8], rax;
+        lea rax, [rip + _block_cache_io_scratch];
+        mov [r11 + 16], rax;
+        xor rax, rax;
+        mov [r11 + 24], rax;
+
+        mov rdi, r12;
+        mov rsi, r11;
+        mov r10, 4;
+        or rsi, r10;
+        call cap_invoke;
+
+        mov rdi, rax;
+        call bbjw_check;
+        cmp rax, 0;
+        jne bcw_bad;
+
+        xor eax, eax;
+        jmp bcw_done;
+
+      bcw_bad:
+        mov rax, 0xFFFFED11;
+
+      bcw_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // block_cache_insert(vol_slot: u64, lba: u64, data_ptr: u64) -> u64
+  //   CLOCK-evicts one slot (writing it back first if valid+dirty),
+  //   then copies 512 bytes of data_ptr into that slot's data area,
+  //   stamps the tag (valid=1, ref=1, dirty=0, tag_vol_slot=vol_slot),
+  //   tag_lba=lba.  Returns 0 on success; the reused ALLOC_BITMAP_TORN
+  //   on write-back failure.
+  // ============================================================================
+  pub let block_cache_insert : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (vol_slot: u64) (lba: u64) (data_ptr: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { cap },
+      justification: "R52.M7-001 (#1715). 5-push prologue (rbx=vol_slot, r12=lba, r13=data_ptr, r14=victim slot_ptr, r15=old-valid flag saved across bc_writeback_slot) lands rsp%16==0 for every nested call (entry rsp%16==8 + 40 = 48, %16==0 -- 5 pushes are odd-count already-aligned, no sub rsp,8 pad needed, matching inode_table.pdx's inode_write / inode_alloc_fresh / inode_scrub_slot 5-push shape). Body: (1) rbx=vol_slot, r12=lba, r13=data_ptr. (2) CLOCK eviction loop: hand=[_block_cache_hand+0]; loop over at most 512 hops (2 * 256). rcx=(hand<<9)+(hand<<4)+&_block_cache_slots -> slot_ptr. meta=[slot+0]. Check ref_bit (meta>>16)&1: if 0, this is the victim -- break. If 1, clear ref_bit (meta &= ~(1<<16) via xor 0xFF..FF instead of unavailable `not`); store back. advance hand ((hand+1) mod 256, computed as hand+1 then cmp>=256; if so hand=0); store back. Continue. (3) After the loop: r14=victim slot_ptr, hand advanced to next and re-stored. Re-load meta (its ref bit may have been cleared during a sweep pass). Save old valid bit (r15=(meta>>63)&1). Compute old dirty bit into rcx. (4) If victim was valid AND dirty: rdi=r14; call bc_writeback_slot; cmp rax,0; jne bad (propagate the writeback failure verbatim). Bump stats[3] (writebacks). (5) If victim was valid (regardless of dirty), bump stats[2] (evictions). (6) Copy 64 qwords from r13 (data_ptr) into r14+16 (slot data area) via manual rcx=0..64 loop. (7) Stamp new tag: meta=(1<<63) | (1<<16) | (vol_slot & 0xFFFF) -- valid=1, ref=1, dirty=0. Store to [r14+0]. Store r12 (lba) to [r14+8]. (8) xor eax,eax; jmp done. bad: rax=0xFFFFED11 (from bc_writeback_slot). done: 5-pop epilogue + ret. Reserved labels: bce_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+        mov r13, rdx;
+
+        lea r10, [rip + _block_cache_hand];
+        mov r8, [r10 + 0];
+
+        xor r9, r9;
+
+      bce_evict_top:
+        mov rax, 512;
+        cmp r9, rax;
+        jae bce_evict_done;
+
+        mov rcx, r8;
+        shl rcx, 9;
+        mov r10, r8;
+        shl r10, 4;
+        add rcx, r10;
+        lea r14, [rip + _block_cache_slots];
+        add r14, rcx;
+
+        mov rax, [r14 + 0];
+        mov rcx, rax;
+        shr rcx, 16;
+        and rcx, 1;
+        cmp rcx, 0;
+        je bce_evict_done;
+
+        mov r10, 1;
+        shl r10, 16;
+        xor r10, 0xFFFFFFFFFFFFFFFF;
+        and rax, r10;
+        mov [r14 + 0], rax;
+
+        add r8, 1;
+        mov rax, 256;
+        cmp r8, rax;
+        jb bce_no_wrap;
+        xor r8, r8;
+
+      bce_no_wrap:
+        add r9, 1;
+        jmp bce_evict_top;
+
+      bce_evict_done:
+        add r8, 1;
+        mov rax, 256;
+        cmp r8, rax;
+        jb bce_hand_no_wrap;
+        xor r8, r8;
+
+      bce_hand_no_wrap:
+        lea r10, [rip + _block_cache_hand];
+        mov [r10 + 0], r8;
+
+        mov rax, [r14 + 0];
+        mov r15, rax;
+        shr r15, 63;
+
+        mov rcx, rax;
+        shr rcx, 17;
+        and rcx, 1;
+
+        cmp r15, 0;
+        je bce_no_writeback;
+        cmp rcx, 0;
+        je bce_no_writeback;
+
+        mov rdi, r14;
+        call bc_writeback_slot;
+        cmp rax, 0;
+        jne bce_bad;
+
+        lea r10, [rip + _block_cache_stats];
+        mov rax, [r10 + 24];
+        add rax, 1;
+        mov [r10 + 24], rax;
+
+      bce_no_writeback:
+        cmp r15, 0;
+        je bce_no_eviction_bump;
+        lea r10, [rip + _block_cache_stats];
+        mov rax, [r10 + 16];
+        add rax, 1;
+        mov [r10 + 16], rax;
+
+      bce_no_eviction_bump:
+        mov r10, r14;
+        add r10, 16;
+        xor rcx, rcx;
+
+      bce_copy_top:
+        mov rax, 64;
+        cmp rcx, rax;
+        jae bce_copy_done;
+        mov rax, [r13 + rcx * 8];
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        jmp bce_copy_top;
+
+      bce_copy_done:
+        mov rax, 1;
+        shl rax, 63;
+        mov r10, 1;
+        shl r10, 16;
+        or rax, r10;
+        mov r10, 0xFFFF;
+        and rbx, r10;
+        or rax, rbx;
+        mov [r14 + 0], rax;
+        mov [r14 + 8], r12;
+
+        xor eax, eax;
+        jmp bce_done;
+
+      bce_bad:
+        mov rax, 0xFFFFED11;
+
+      bce_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // block_cache_mark_dirty(slot_ptr: u64) -> ()
+  //   Sets the slot's dirty_bit.  Silent no-op if the slot is invalid
+  //   (valid=0) -- defends against a stale pointer whose slot has been
+  //   evicted since the caller obtained the pointer.
+  // ============================================================================
+  pub let block_cache_mark_dirty : (u64) -> () !{mem} @{} =
+    fn (slot_ptr: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R52.M7-001 (#1715). Leaf, caller-save only. rdi=slot_ptr. rax=[rdi+0] (meta_word). rcx=rax; shr rcx,63; cmp rcx,0; je out (silent no-op on invalid slot -- see header note on stale-pointer defence). Else set dirty bit: mov r10,1; shl r10,17; or rax,r10; store back. No test instruction; no mov_b; no push (leaf). Reserved labels: bcmd_.",
+      block: {
+        mov rax, [rdi + 0];
+        mov rcx, rax;
+        shr rcx, 63;
+        cmp rcx, 0;
+        je bcmd_out;
+
+        mov r10, 1;
+        shl r10, 17;
+        or rax, r10;
+        mov [rdi + 0], rax;
+
+      bcmd_out:
+        ret
+      }
+    }
+
+  // ============================================================================
+  // block_cache_flush_all() -> u64
+  //   Iterates every slot; writes back every valid+dirty one and clears
+  //   its dirty_bit.  Returns 0 on all-success, BC_WRITEBACK_ERR
+  //   (reused) on any single failure -- but keeps going past a failure
+  //   so no dirty slot is skipped by a transient earlier failure
+  //   (mirrors journal_ondisk.pdx's own barrier-sequenced writer
+  //   posture).
+  // ============================================================================
+  pub let block_cache_flush_all : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { cap },
+      justification: "R52.M7-001 (#1715). 5-push prologue (rbx=slot index cursor, r12=slot_ptr, r13=meta_word cache, r14=aggregate error accumulator, r15=unused-but-pushed for pattern uniformity) lands rsp%16==0 for the nested bc_writeback_slot call (entry rsp%16==8 + 40 = 48, %16==0 -- 5 pushes are odd-count already-aligned, no pad needed, matching inode_table.pdx's inode_scrub_slot shape). Body: (1) rbx=0, r14=0 (aggregate error accumulator). (2) Loop: cmp rbx,256; jae done. rcx=(rbx<<9)+(rbx<<4)+&_block_cache_slots -> r12=slot_ptr. r13=[r12+0] (meta). Check valid: (r13>>63)&1 == 0 -> next. Check dirty: (r13>>17)&1 == 0 -> next. rdi=r12; call bc_writeback_slot. cmp rax,0; je clear (success). Else r14=rax (record error, last-writer-wins across the walk -- acceptable since every code we emit is the same BC_WRITEBACK_ERR value); leave dirty bit set (a future retry can attempt again) and continue. clear: r13 &= ~(1<<17) via xor 0xFF..FF instead of unavailable `not`; [r12+0]=r13. Bump stats[3]. next: rbx+=1; loop. done: rax=r14 (aggregate); 5-pop epilogue + ret. Reserved labels: bcf_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        xor rbx, rbx;
+        xor r14, r14;
+
+      bcf_loop_top:
+        mov rax, 256;
+        cmp rbx, rax;
+        jae bcf_loop_done;
+
+        mov rcx, rbx;
+        shl rcx, 9;
+        mov r10, rbx;
+        shl r10, 4;
+        add rcx, r10;
+        lea r12, [rip + _block_cache_slots];
+        add r12, rcx;
+
+        mov r13, [r12 + 0];
+
+        mov rax, r13;
+        shr rax, 63;
+        cmp rax, 0;
+        je bcf_next;
+
+        mov rax, r13;
+        shr rax, 17;
+        and rax, 1;
+        cmp rax, 0;
+        je bcf_next;
+
+        mov rdi, r12;
+        call bc_writeback_slot;
+        cmp rax, 0;
+        je bcf_clear;
+
+        mov r14, rax;
+        jmp bcf_next;
+
+      bcf_clear:
+        mov r10, 1;
+        shl r10, 17;
+        xor r10, 0xFFFFFFFFFFFFFFFF;
+        and r13, r10;
+        mov [r12 + 0], r13;
+
+        lea r10, [rip + _block_cache_stats];
+        mov rax, [r10 + 24];
+        add rax, 1;
+        mov [r10 + 24], rax;
+
+      bcf_next:
+        add rbx, 1;
+        jmp bcf_loop_top;
+
+      bcf_loop_done:
+        mov rax, r14;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // block_cache_stats() -> u64
+  //   Returns &_block_cache_stats.  Caller reads:
+  //     [+0]  hits         [+8]  misses
+  //     [+16] evictions    [+24] writebacks
+  // ============================================================================
+  pub let block_cache_stats : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R52.M7-001 (#1715). Leaf, caller-save only. Single lea + ret. No push. Reserved labels: none (straight-line).",
+      block: {
+        lea rax, [rip + _block_cache_stats];
+        ret
+      }
+    }
+}

@@ -6043,6 +6043,35 @@ fi
 echo "[r52-m5-confine] R52.M5-001 (KIND_SIG_KEY) confined"
 
 # ---------------------------------------------------------------------------
+# R52.M7-002 (#1716): one-writer discipline for KIND_BLOCK_CACHE.
+#
+#   * kind_block_cache (KIND_BLOCK_CACHE = 0x1A1, over KIND_MEMORY)
+#
+# _block_cache_table + _block_cache_stats are the only places in the
+# kernel where per-volume block-cache handle authority lives. A second
+# writer would let one caller mutate a cache row (forge a cache_id,
+# silently rebind flags, corrupt one of the four observability
+# counters) with no capability involved. Per-module confinement is
+# what makes that unreachable by construction; the sole writers are
+# block_cache_tail_alloc / _tail_free / _note / _table_reset (all in
+# kind_block_cache.pdx).
+R52_BC_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_block_cache.pdx"
+if [[ ! -f "${R52_BC_SRC}" ]]; then
+    echo "[r52-m7-confine] FAIL - kind_block_cache.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_block_cache_table' 'core/cap/kind_block_cache.o'
+ec_confine_one '_block_cache_stats' 'core/cap/kind_block_cache.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_block_cache.pdx SECTION 1 for the per-module one-writer" >&2
+    echo "  discipline (the sole writers are block_cache_tail_alloc + " >&2
+    echo "  block_cache_tail_free + block_cache_note + " >&2
+    echo "  block_cache_table_reset)." >&2
+    exit 1
+fi
+echo "[r52-m7-confine] R52.M7-002 (KIND_BLOCK_CACHE) confined"
+
+# ---------------------------------------------------------------------------
 # R52.M5-002 (#1704): one-writer discipline for the on-disk JBNL journal
 # ring's writer/walker state.
 #
