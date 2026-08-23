@@ -5682,6 +5682,13 @@ ec_confine_one '_pxor_stage'                'tests/kernel/pdxfs_txn/pdxfs_txn_op
 # rodata are read-only). Mirrors the _pxor_stage confinement above
 # one-for-one, one witness later in the same M8 subsystem.
 ec_confine_one '_pkgi_stage'                'boot/witness/pdxfs_pkg_install_smoke.o'
+# M8-001 (#1721) mkfs.pdxfs smoke boot witness's stage counter (only
+# mutable static in the fixture; the three fingerprint arrays are
+# read-only rodata). Same posture as _pkgi_stage: this witness never
+# shares its stage counter with any other module -- pms_fail_stage is
+# the sole writer inside the witness function itself, and no other
+# .pdx even references the symbol name (grep audit 2026-08-23).
+ec_confine_one '_pms_stage'                 'boot/witness/pdxfs_mkfs_smoke.o'
 ec_confine_one '_elevate_channel_table'     'core/cap/kind_elevate_channel.o'
 ec_confine_one '_elevate_channel_stats'     'core/cap/kind_elevate_channel.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then

@@ -72,6 +72,18 @@ SMP_UNORDERED_HELLO=0
 # Empty (default): no `-cpu` flag → qemu64 default. Set to "max" for the
 # widest advertised feature surface — enables XSAVE, AVX2, POPCNT, etc.
 QEMU_CPU=""
+# R52.M8-001 (#1721): NVME_MODE knob attaches a blank raw-format image
+# backing an emulated NVMe controller to QEMU (-drive if=none + -device
+# nvme). MCFG remains ABSENT under -kernel boot (no OVMF), so PCI
+# enumeration still finds zero devices and the boot-witness path stays
+# on the SUBSTRATE arm; the drive attach is what proves the QEMU wiring
+# is in place for the LIVE arm once UEFI/OVMF wire-up lands (#1722-#1726).
+# NVME_IMG defaults to a per-invocation tempfile created below when
+# NVME_MODE=1; NVME_IMG_SIZE_MB defaults to 16 MB (>> mkfs geometry the
+# witness attempts, which is 100 * 4096 B = 400 KB).
+NVME_MODE=0
+NVME_IMG=""
+NVME_IMG_SIZE_MB=16
 # #750 + #757: chardev-pipe injection knobs.
 #
 # Precedence:  caller env  >  mode-branch default  >  global fallback
@@ -970,6 +982,47 @@ case "${EXPECTED}" in
         CHECK_RELEASE_BUDGET=1
         : "${RELEASE_LINE_BUDGET:=40}"
         ;;
+    boot_r52_pdxfs_mkfs_nvme)
+        # R52.M8-001 (#1721): mkfs.pdxfs smoke on a QEMU-attached blank
+        # NVMe device.
+        #
+        # Attaches a per-invocation raw-format tempfile as an emulated
+        # NVMe namespace (see NVME_MODE knob near the top of this file):
+        # `-drive file=<tmpfile>,if=none,id=nvme0,format=raw -device
+        # nvme,drive=nvme0,serial=deadbeef`. Under -kernel boot MCFG
+        # remains absent (see drivers/nvme/probe.pdx's own drain-empty
+        # guard), so `_nvme_device_count` stays 0 and the pdxfs_mkfs_
+        # smoke_witness (src/kernel/boot/witness/pdxfs_mkfs_smoke.pdx)
+        # takes its SUBSTRATE arm: mints a real KIND_NVME_CONTROLLER +
+        # dual-kind KIND_NVME_NAMESPACE/KIND_BLKDEV cap chain, calls
+        # mkfs_run, catches the NVMEIO_PICK_NONE cascade forwarded as
+        # MKFS_ZERO_FAIL, and emits "PDXFS MKFS SMOKE SUBSTRATE OK".
+        #
+        # The drive attach is what proves the QEMU wiring is in place
+        # for the LIVE arm's later landing (sibling issues #1722-#1726
+        # add UEFI/OVMF wire-up + probe + attach ceremony that makes
+        # `_nvme_device_count` > 0 at boot-witness time, at which
+        # point the SUBSTRATE line naturally gives way to the LIVE
+        # "PDXFS MKFS SMOKE OK" line without any change to this mode's
+        # QEMU launch shape).
+        #
+        # Golden: tests/r52/expected-pdxfs-mkfs-nvme.txt pins the same
+        # SUBSTRATE line, anchored by "BLOCK CACHE SUBSTRATE OK" (the
+        # witness immediately before ours in r30_platform.pdx) and
+        # "PDXFS BOOT MOUNT SUBSTRATE OK" (the witness immediately
+        # after). Any regression that reorders or drops the mkfs
+        # witness surfaces as a missing golden line.
+        #
+        # Boots the same tree the default matrix builds; no chardev
+        # injection is needed (the witness fires early during
+        # boot_continue_after_ring3 -> witness_r30_platform, well
+        # before shell/init would reach any interactive prompt).
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r52/expected-pdxfs-mkfs-nvme.txt"
+        TIMEOUT=20
+        NVME_MODE=1
+        EXPECTED=""
+        ;;
     prod)
         # prod mode: expects exit code 2 (kernel didn't build)
         # Skip verification, just exit with code 2
@@ -1155,6 +1208,36 @@ else
     if [[ -n "${QEMU_CPU}" ]]; then
         CPU_ARGS=(-cpu "${QEMU_CPU}")
     fi
+    # R52.M8-001 (#1721): opt-in NVMe drive attach for boot_r52_pdxfs_
+    # mkfs_nvme. Provisions a per-invocation raw-format tempfile of
+    # NVME_IMG_SIZE_MB (default 16) MiB, exposes it as an emulated
+    # NVMe namespace (`-drive file=<tmpfile>,if=none,id=nvme0,format=
+    # raw -device nvme,drive=nvme0,serial=deadbeef`), and unlinks the
+    # tempfile after QEMU exits. Empty NVME_MODE (default 0) leaves
+    # NVME_ARGS unset, preserving every legacy mode's QEMU launch
+    # byte-for-byte.
+    NVME_ARGS=()
+    NVME_CLEANUP=""
+    if [[ ${NVME_MODE} -eq 1 ]]; then
+        if [[ -z "${NVME_IMG}" ]]; then
+            NVME_IMG="$(mktemp -t paideia-pdxfs-smoke-XXXXXX.img)"
+            NVME_CLEANUP="${NVME_IMG}"
+        fi
+        # Provision the backing file. dd is used (vs. truncate) so the
+        # file is zero-filled up front — an emulated NVMe namespace
+        # reads back defined zeros from every unwritten LBA and mkfs
+        # writes have a determinate target.
+        dd if=/dev/zero of="${NVME_IMG}" bs=1M count="${NVME_IMG_SIZE_MB}" \
+            status=none 2>/dev/null || {
+            echo "smoke: failed to provision NVMe backing image ${NVME_IMG}" >&2
+            [[ -n "${NVME_CLEANUP}" ]] && rm -f "${NVME_CLEANUP}"
+            exit 1
+        }
+        NVME_ARGS=(
+            -drive "file=${NVME_IMG},if=none,id=nvme0,format=raw"
+            -device "nvme,drive=nvme0,serial=deadbeef"
+        )
+    fi
     timeout ${TIMEOUT} qemu-system-x86_64 \
         -kernel "${KERNEL}" \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
@@ -1165,8 +1248,12 @@ else
         -m 32M \
         "${CPU_ARGS[@]}" \
         "${SMP_ARGS[@]}" \
+        "${NVME_ARGS[@]}" \
         >/dev/null 2>&1
     QEMU_RC=$?
+    if [[ -n "${NVME_CLEANUP}" ]]; then
+        rm -f "${NVME_CLEANUP}"
+    fi
 fi
 
 # QEMU exit codes: 124 = timeout (expected for halt+stay-on); 0 = clean; 35 = panic exit
