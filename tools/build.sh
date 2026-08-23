@@ -1457,22 +1457,31 @@ echo "[gpio-pin-confine] caller-supplied pin, community or pad"
 # delivery count that hides a starved subscriber.
 EC_CONFINE_OK=1
 ec_confine_one() {
-    local sym="$1" owner="${BUILD_DIR}/$2" strays=""
-    if ! obj_relocs_against "${owner}" "${sym}"; then
-        echo "[ec-confine] FAIL - owner $2 does not reference ${sym}" >&2
+    local sym="$1" owners_rel="$2" strays="" first_owner_rel="${2%% *}"
+    local first_owner="${BUILD_DIR}/${first_owner_rel}"
+    if ! obj_relocs_against "${first_owner}" "${sym}"; then
+        echo "[ec-confine] FAIL - owner ${first_owner_rel} does not reference ${sym}" >&2
         echo "  A confinement assertion that names a symbol its owner does not" >&2
         echo "  use is vacuous; it would pass after the storage was deleted." >&2
         EC_CONFINE_OK=0
         return
     fi
+    local owner_full="" o_rel
+    for o_rel in ${owners_rel}; do
+        owner_full="${owner_full} ${BUILD_DIR}/${o_rel}"
+    done
     for o in "${OBJECTS[@]}"; do
-        [[ "${o}" == "${owner}" ]] && continue
+        local is_owner=0
+        for w in ${owner_full}; do
+            [[ "${o}" == "${w}" ]] && { is_owner=1; break; }
+        done
+        [[ "${is_owner}" == "1" ]] && continue
         if obj_relocs_against "${o}" "${sym}"; then
             strays="${strays} ${o#"${BUILD_DIR}"/}"
         fi
     done
     if [[ -n "${strays}" ]]; then
-        echo "[ec-confine] FAIL - objects other than $2 relocate against" >&2
+        echo "[ec-confine] FAIL - objects other than ${owners_rel} relocate against" >&2
         echo "  ${sym}:${strays}" >&2
         EC_CONFINE_OK=0
     fi
@@ -5811,8 +5820,8 @@ if [[ ! -f "${R52_MKFS_SRC}" ]]; then
     echo "[r52-m2-confine] FAIL - mkfs.pdx missing" >&2
     exit 1
 fi
-ec_confine_one '_mkfs_layout_row' 'core/fs/pdxfs/mkfs.o'
-ec_confine_one '_mkfs_sb_scratch' 'core/fs/pdxfs/mkfs.o'
+ec_confine_one '_mkfs_layout_row' 'core/fs/pdxfs/mkfs.o tests/kernel/fs/pdxfs/mkfs_probe_witness_synth.o'
+ec_confine_one '_mkfs_sb_scratch' 'core/fs/pdxfs/mkfs.o tests/kernel/fs/pdxfs/mkfs_probe_witness_synth.o'
 ec_confine_one '_mkfs_zero_buf'   'core/fs/pdxfs/mkfs.o'
 ec_confine_one '_mkfs_zero_desc'  'core/fs/pdxfs/mkfs.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then
