@@ -1,0 +1,527 @@
+// src/kernel/core/drivers/ahci/io_submit.pdx -- R51.M6-002 (#1664).
+//
+// AHCI I/O submit: BDEV_OP_READ_LBA end-to-end via READ_DMA_EXT
+// (0x25).  Design authority: design/hardware/nvme-ahci-tail-
+// milestones.md (commit 2d6ab82) §2.M6 #1664; substrate anchor
+// design/hardware/ahci-substrate.md §2.4 (per-port DMA layout),
+// §2.5 (FIS discipline).  Structural analogue: cap/nvme_io_queues.pdx
+// `nvme_io_submit_rw` (R51.M3-003, #1647) -- same 6-arg shape
+// (ctrl_row, ns/port_row, opcode, lba, nblocks, dma_iova), same
+// "validate -> resolve -> build -> ring -> poll -> check" sequence.
+//
+// This function's SYMBOL was landed as a placeholder (unconditional
+// `0xEEEE`) inside cap/kind_ahci_port.pdx by R51.M5-006 (#1662), so
+// that cap_handler_blkdev's family demux would compile before the
+// real I/O submit path existed.  This file REPLACES that placeholder
+// (removed from kind_ahci_port.pdx by this same commit) with the real
+// implementation; cap_handler_blkdev.pdx's `hblk_do_rw_ahci` call site
+// is unchanged (same symbol name, new definition site).
+//
+// This file lands ONLY the READ_LBA path.  WRITE (opcode == 1,
+// R51.M6-003/#1665's own scope per design's own dependency note
+// "parallel with #1665 (they share io_submit.pdx)") is a deliberate,
+// explicit stub here -- `ahci_io_submit_rw` validates the opcode and
+// returns AHCIIO_SUBMIT_WRITE_UNIMPL for opcode == 1 rather than
+// fabricating a write path this issue does not own.  #1665 replaces
+// that stub branch with the real WRITE_DMA_EXT (0x35) wire-up sharing
+// every line below it (H2D FIS builder, PRDT builder, command-header
+// builder, doorbell ring, completion poll, TFD check are all
+// opcode-agnostic already).
+//
+// =============================================================================
+// SECTION 0  WHY THIS FUNCTION DOES NOT PROGRAM CLB/CLBU
+// =============================================================================
+//
+// drivers/ahci/cmd_alloc.pdx SECTION 0b already establishes -- and
+// this file inherits verbatim -- that CLB/CLBU are programmed against
+// the HBA only by a per-port bring-up orchestrator that has first
+// idled the port (AHCI 1.3.1 mandates ST=0/CR=0/FRE=0 before CLB is
+// (re)written).  That orchestrator is R51.M5-005/#1661.  `ahci_io_
+// submit_rw` therefore ASSUMES the port has already reached a state
+// in which CLB/CLBU are live at the HBA -- concretely,
+// `AHCIP_STATE_IDENTIFIED` (kind_ahci_port.pdx's own two-state model:
+// MINTED=1, IDENTIFIED=2, the latter documented there as "reserved
+// for M5-005/#1661 (post-IDENTIFY DEVICE confirm)").  A port cannot
+// complete IDENTIFY DEVICE without a live Command List + Command
+// Table already bound and programmed at the HBA (IDENTIFY DEVICE is
+// itself submitted through slot 0 the same way this file's READ path
+// is), so IDENTIFIED is the correct, and only available, stand-in for
+// the "READY" precondition this issue's own task text names ("assume
+// port is in READY state; add a state check + return
+// AHCIIO_PORT_NOT_READY if not").
+//
+// =============================================================================
+// SECTION 1  WIRE LAYOUT (design §2.M6 #1664, verbatim)
+// =============================================================================
+//
+// H2D Register FIS (fis_type 0x27), written into the port's bound
+// Command Table (`ahci_port_row_ct_phys`) at offset 0 (the CFIS slot,
+// cmd_alloc.pdx AHCI_CT_HDR_BYTES=128 reserves 0..127 for it):
+//
+//   +0  u8  fis_type    = 0x27
+//   +1  u8  C=1,PMP=0   = 0x80
+//   +2  u8  command     = 0x25 (READ_DMA_EXT)
+//   +3  u8  features_lo = 0
+//   +4  u8  lba[7:0]
+//   +5  u8  lba[15:8]
+//   +6  u8  lba[23:16]
+//   +7  u8  device      = 0x40 (LBA mode)
+//   +8  u8  lba[31:24]
+//   +9  u8  lba[39:32]
+//   +10 u8  lba[47:40]
+//   +11 u8  features_hi = 0
+//   +12 u8  count_lo (NSECTOR[7:0])
+//   +13 u8  count_hi (NSECTOR[15:8]; 0 means 65536 sectors, unused here)
+//   +14 u8  icc = 0
+//   +15 u8  control = 0
+//   +16 u32 reserved = 0
+//
+// One PRDT entry (this issue caps every op at a single scatter-gather
+// entry -- see SECTION 2), written at Command Table offset
+// AHCI_CT_HDR_BYTES (128, cmd_alloc.pdx):
+//
+//   +0  u32 DBA  (data base, low 32 bits of dma_iova)
+//   +4  u32 DBAU (data base, high 32 bits)
+//   +8  u32 reserved = 0
+//   +12 u32 DBC[21:0] = byte_count - 1, bit 31 (I, interrupt on
+//                       completion) set -- the only/last entry.
+//
+// Command header (slot 0, at the port's bound Command List --
+// `ahci_port_row_cl_phys`, cmd_alloc.pdx's single-Command-Table-per-
+// port posture means slot 0 is the only slot this driver ever uses):
+//
+//   DW0 = CFL(5, dword count of the 20 B H2D FIS) | W(0, read) |
+//         PRDTL(1)<<16  = 0x00010005
+//   DW1 = PRDBC, cleared to 0 before issue (device writes back)
+//   DW2 = CTBA  (low 32 bits of the Command Table address)
+//   DW3 = CTBAU (high 32 bits)
+//   DW4..DW7 = reserved, cleared to 0
+//
+// Submit: write the header + FIS + PRDT above, `sfence`, then
+// `PxCI |= (1 << 0)` (slot 0) via drivers/ahci/regs.pdx's
+// `ahci_port_reg_u32_set` (R51.M5-005/#1661).  Completion: poll
+// `PxCI` bit 0 until it clears (bounded by AHCI_IO_SPIN_MAX) -- IRQ-
+// driven completion is a future hot-plug/IRQ-drain concern (#1668 has
+// not landed), so polling PxCI directly, exactly as reset.pdx polls
+// GHC.HR, is the only landable completion signal today.  On CI clear,
+// read PxTFD and refuse on BSY(0x80)|DRQ(0x08)|ERR(0x01)
+// (AHCI_PXTFD_BSY / AHCI_PXTFD_DRQ, regs.pdx).
+//
+// =============================================================================
+// SECTION 2  POLICY CHOICES THIS ISSUE OWNS (not design-doc numbers)
+// =============================================================================
+//
+//   - Single PRDT entry per op, capping a transfer at
+//     AHCI_IO_MAX_TRANSFER_BYTES (4 MiB, the 22-bit DBC field's
+//     natural ceiling).  A caller-supplied dma_iova is a single IOVA
+//     (matching nvme_io_submit_rw's own single-dma_iova argument --
+//     multi-page scatter-gather from one arg is impossible without a
+//     real `dma_domain_map` walk, the same DESIGN-DOC GAP cmd_alloc.pdx
+//     SECTION 0 already flags).  nblocks * sector_size exceeding the
+//     cap returns AHCIIO_SUBMIT_PRDT_OVERFLOW (design-named code,
+//     §2.M6 #1664) -- reusing the design's own overflow sentinel for
+//     this single-entry-capacity case rather than inventing a new one,
+//     since both conditions mean "this op's scatter-gather need
+//     exceeds what this driver can currently express."
+//   - Per-port MMIO register access goes through drivers/ahci/regs.pdx's
+//     `ahci_port_reg_u32` / `_set` (R51.M5-005/#1661, landed alongside
+//     this issue) rather than raw `abar_reg_u32(_set)` + hand-rolled
+//     port-base arithmetic -- this file consumes that accessor pair
+//     exactly as any other per-port MMIO caller would.
+//
+// =============================================================================
+// SECTION 3  FAILURE TAXONOMY  0xFFFFECA2..0xFFFFECA9
+// =============================================================================
+//
+// design/hardware/nvme-ahci-tail-milestones.md §2.M6 #1664 names four
+// codes directly; cmd_alloc.pdx's own header reserves the rest of the
+// 0xFFFFECA2..0xFFFFECAF AHCIIO band for this file:
+//
+//   AHCIIO_SUBMIT_NO_SLOT       0xFFFFECA2 -- design-named. Slot 0
+//                                 (the only slot this driver uses) has
+//                                 a command already in flight (PxCI
+//                                 bit 0 already set at submit time).
+//   AHCIIO_SUBMIT_TIMEOUT       0xFFFFECA3 -- design-named. PxCI bit 0
+//                                 never cleared within AHCI_IO_SPIN_MAX
+//                                 iterations.
+//   AHCIIO_SUBMIT_TFD_ERR       0xFFFFECA4 -- design-named. PxTFD had
+//                                 BSY|DRQ|ERR set after CI cleared.
+//   AHCIIO_SUBMIT_PRDT_OVERFLOW 0xFFFFECA5 -- design-named. byte_len
+//                                 (nblocks*sector_size) is 0 or exceeds
+//                                 AHCI_IO_MAX_TRANSFER_BYTES.
+//   AHCIIO_PORT_NOT_READY       0xFFFFECA6 -- new, this issue (task
+//                                 text's own name). port row state !=
+//                                 AHCIP_STATE_IDENTIFIED (SECTION 0).
+//   AHCIIO_SUBMIT_BAD_OPCODE    0xFFFFECA7 -- new, this issue. opcode
+//                                 not in {1 (write), 2 (read)}.
+//   AHCIIO_SUBMIT_WRITE_UNIMPL  0xFFFFECA8 -- new, this issue. opcode
+//                                 == 1 (write); deferred to #1665
+//                                 (SECTION 0 preamble).
+//   AHCIIO_SUBMIT_BAD_ROW       0xFFFFECA9 -- new, this issue. Any
+//                                 DECODE_BAD from a port/ctrl row
+//                                 accessor, or an unbound (zero)
+//                                 cl_phys/ct_phys (cmd_alloc.pdx's
+//                                 ahci_port_cmd_regions_bind never ran
+//                                 for this row).
+//
+// =============================================================================
+// SECTION 4  paideia-as encoder-gap posture (v0.22.x)
+// =============================================================================
+//
+//   G1: every FIS byte field and PRDT/command-header dword field uses
+//       mov_b / mov_d sized stores -- a bare `mov [mem], reg` would
+//       widen to a REX.W 8-byte store and stomp the adjacent field.
+//   G4: every sentinel comparison against a value with bit 31/63 set
+//       (all AHCIIO_* codes, AHCIP_DECODE_BAD) is staged through
+//       `mov r10, <imm64>; cmp reg, r10` rather than `cmp reg, <imm>`
+//       directly.
+//   No `test`: every flag check is `and reg, mask; cmp reg, 0; jne/je`.
+//   Every memory operand in this file is `[base + disp]` (a single
+//       base register plus a compile-time-constant displacement) --
+//       never `[base + index]` -- so the "mov_b [reg+reg] must be
+//       written [reg + reg*1]" SIB gap never arises here.
+//   Arity: `ahci_io_submit_rw` takes exactly 6 args (design §5.2's own
+//       signature), matching the SysV 6-register ceiling with no
+//       stack-passed argument.
+//   No `imul` with an immediate multiplier: `nblocks * sector_size`
+//       uses the register-register `imul rax, r8` form (both operands
+//       are runtime values, not an immediate multiplier), the same
+//       accepted form nvme_io_submit_rw already uses for its own
+//       `nblocks * lba_size` byte-length computation.
+//
+// Reserved-label discipline: every label in this file is prefixed
+// `ahciio_r_` (per this issue's own task text) -- no collision with
+// `loop`, `if`, `port`, `reset`, or any other paideia-as keyword.
+
+module AhciIoSubmit = structure {
+
+  pub let AHCIIO_SUBMIT_NO_SLOT       : u64 = 0xFFFFECA2
+  pub let AHCIIO_SUBMIT_TIMEOUT       : u64 = 0xFFFFECA3
+  pub let AHCIIO_SUBMIT_TFD_ERR       : u64 = 0xFFFFECA4
+  pub let AHCIIO_SUBMIT_PRDT_OVERFLOW : u64 = 0xFFFFECA5
+  pub let AHCIIO_PORT_NOT_READY       : u64 = 0xFFFFECA6
+  pub let AHCIIO_SUBMIT_BAD_OPCODE    : u64 = 0xFFFFECA7
+  pub let AHCIIO_SUBMIT_WRITE_UNIMPL  : u64 = 0xFFFFECA8
+  pub let AHCIIO_SUBMIT_BAD_ROW       : u64 = 0xFFFFECA9
+
+  pub let AHCIIO_OPC_WRITE : u64 = 1
+  pub let AHCIIO_OPC_READ  : u64 = 2
+
+  pub let ATA_CMD_READ_DMA_EXT : u64 = 0x25
+
+  pub let AHCI_IO_MAX_TRANSFER_BYTES : u64 = 0x400000   // 22-bit DBC ceiling
+  pub let AHCI_IO_SPIN_MAX           : u64 = 50000000   // matches nvme_io_submit_rw
+
+  // ==========================================================================
+  // ahci_io_submit_rw(ctrl_row, port_row, opcode, lba, nblocks, dma_iova) -> u64
+  //
+  // design/hardware/nvme-ahci-tail-milestones.md §2.M6 #1664 + design/
+  // hardware/ahci-substrate.md §5.2.  Structural analogue of
+  // nvme_io_submit_rw (cap/nvme_io_queues.pdx, #1647).  Returns bytes
+  // transferred (nblocks * sector_size) on success; else one of the
+  // AHCIIO_* codes in SECTION 3.
+  // ==========================================================================
+  pub let ahci_io_submit_rw : (u64, u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (ctrl_row: u64) (port_row: u64) (opcode: u64) (lba: u64) (nblocks: u64) (dma_iova: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R51.M6-002 (#1664): validate opcode + port readiness, resolve abar_pa/port_index/cl_phys/ct_phys/sector_size, build the H2D Register FIS (0x27, command 0x25 READ_DMA_EXT) + one PRDT entry + command header (slot 0), ring PxCI via ahci_port_reg_u32_set (regs.pdx, #1661), poll for completion via ahci_port_reg_u32, check PxTFD. Six callee-save pushes (rbx=ctrl_row, rbp=port_row, r12=opcode, r13=lba, r14=nblocks, r15=dma_iova) + sub rsp,56 = 104 B; entry rsp%16==8 -> 112, %16==0 -- shape mirrors nvme_io_submit_rw (six args each pinned to a callee-save register leaves no free callee-save slot for the intermediate values, which spill to the stack at [rsp+0]=abar_pa, [rsp+8]=ct_phys, [rsp+16]=cl_phys, [rsp+24]=byte_len, [rsp+32]=port_index, [rsp+40]=spin-poll counter, [rsp+48] unused pad -- all memory-backed because r10/r11/rax are caller-save and cannot be trusted to survive the repeated ahci_port_reg_u32(_set) calls in the poll loop and doorbell ring). Sequence: (1) opcode in {1,2} else AHCIIO_SUBMIT_BAD_OPCODE; (2) opcode==1 (write) -> AHCIIO_SUBMIT_WRITE_UNIMPL (SECTION 0 preamble; #1665 replaces this branch); (3) ahci_port_tail_valid(port_row) else AHCIIO_SUBMIT_BAD_ROW; (4) ahci_port_row_state(port_row) must equal AHCIP_STATE_IDENTIFIED (2) else AHCIIO_PORT_NOT_READY; (5) abar_pa via ahci_ctrl_row_abar(ctrl_row), DECODE_BAD -> AHCIIO_SUBMIT_BAD_ROW, stashed at [rsp+0]; (6) port_index via ahci_port_row_port_index(port_row), stashed at [rsp+32]; (7) cl_phys/ct_phys via ahci_port_row_cl_phys/ahci_port_row_ct_phys(port_row) -- DECODE_BAD or 0 (unbound) both map to AHCIIO_SUBMIT_BAD_ROW, stashed at [rsp+16]/[rsp+8]; (8) sector_size via ahci_port_row_sector_size(port_row), byte_len = nblocks*sector_size via register-register imul, stashed at [rsp+24]; 0 or > AHCI_IO_MAX_TRANSFER_BYTES (4 MiB, the 22-bit DBC ceiling) -> AHCIIO_SUBMIT_PRDT_OVERFLOW; (9) ahci_port_reg_u32(abar_pa, port_index, 0x38) to read PxCI; bit 0 set -> AHCIIO_SUBMIT_NO_SLOT (slot 0 already busy), else the raw value is preserved in r9 for the OR-in at doorbell-ring time; (10) write the 20 B H2D FIS at ct_phys+0 (SECTION 1 byte layout, all mov_b sized stores, lba bytes extracted via mov-then-shr-then-and against a preserved copy of lba so the original is never destroyed); (11) write one PRDT entry at ct_phys+128 (DBA/DBAU from dma_iova, DBC=byte_len-1 with bit 31 (I) set); (12) write the command header at cl_phys+0 (DW0=0x00010005 fixed CFL=5/W=0/PRDTL=1, DW1 PRDBC=0, DW2/DW3=ct_phys low/high, DW4..DW7=0); (13) sfence, then ahci_port_reg_u32_set(abar_pa, port_index, 0x38, raw_ci|1) to ring the doorbell (slot 0); (14) poll loop ahciio_r_poll: ahci_port_reg_u32(abar_pa, port_index, 0x38), bit 0 clear -> proceed, else decrement the [rsp+40] counter and loop, exhausted -> AHCIIO_SUBMIT_TIMEOUT; (15) ahci_port_reg_u32(abar_pa, port_index, 0x20) to read PxTFD; any of BSY(0x80)|DRQ(0x08)|ERR(0x01) set -> AHCIIO_SUBMIT_TFD_ERR; (16) success: return byte_len ([rsp+24]). Every sentinel compare against a bit-31/63-set value is staged via `mov r10, <imm64>; cmp reg, r10` per G4. Labels prefixed ahciio_r_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 56;
+
+        mov rbx, rdi;                     // ctrl_row
+        mov rbp, rsi;                     // port_row
+        mov r12, rdx;                     // opcode
+        mov r13, rcx;                     // lba
+        mov r14, r8;                      // nblocks
+        mov r15, r9;                      // dma_iova
+
+        // ---- (1) validate opcode ----
+        cmp r12, 1;
+        je  ahciio_r_op_known;
+        cmp r12, 2;
+        je  ahciio_r_op_known;
+        mov rax, 0xFFFFECA7;              // AHCIIO_SUBMIT_BAD_OPCODE
+        jmp ahciio_r_out;
+      ahciio_r_op_known:
+
+        // ---- (2) write stub (deferred to #1665) ----
+        cmp r12, 1;
+        jne ahciio_r_is_read;
+        mov rax, 0xFFFFECA8;              // AHCIIO_SUBMIT_WRITE_UNIMPL
+        jmp ahciio_r_out;
+      ahciio_r_is_read:
+
+        // ---- (3) port row liveness ----
+        mov rdi, rbp;
+        call ahci_port_tail_valid;
+        cmp rax, 0;
+        je  ahciio_r_bad_row;
+
+        // ---- (4) port state must be READY (IDENTIFIED) ----
+        mov rdi, rbp;
+        call ahci_port_row_state;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahciio_r_bad_row;
+        cmp rax, 2;                       // AHCIP_STATE_IDENTIFIED
+        jne ahciio_r_not_ready;
+
+        // ---- (5) abar_pa via ctrl_row ----
+        mov rdi, rbx;
+        call ahci_ctrl_row_abar;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahciio_r_bad_row;
+        mov [rsp + 0], rax;               // abar_pa
+
+        // ---- (6) port_index ----
+        mov rdi, rbp;
+        call ahci_port_row_port_index;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahciio_r_bad_row;
+        mov [rsp + 32], rax;              // port_index
+
+        // ---- (7) cl_phys / ct_phys ----
+        mov rdi, rbp;
+        call ahci_port_row_cl_phys;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahciio_r_bad_row;
+        cmp rax, 0;
+        je  ahciio_r_bad_row;             // unbound: cmd_regions_bind never ran
+        mov [rsp + 16], rax;              // cl_phys
+
+        mov rdi, rbp;
+        call ahci_port_row_ct_phys;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahciio_r_bad_row;
+        cmp rax, 0;
+        je  ahciio_r_bad_row;
+        mov [rsp + 8], rax;               // ct_phys
+
+        // ---- (8) sector_size -> byte_len, PRDT overflow gate ----
+        mov rdi, rbp;
+        call ahci_port_row_sector_size;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  ahciio_r_bad_row;
+        mov r8, rax;                      // sector_size
+
+        mov rax, r14;                     // nblocks
+        imul rax, r8;                     // byte_len = nblocks * sector_size
+        cmp rax, 0;
+        je  ahciio_r_prdt_overflow;
+        mov r10, 0x400000;                // AHCI_IO_MAX_TRANSFER_BYTES
+        cmp rax, r10;
+        ja  ahciio_r_prdt_overflow;
+        mov [rsp + 24], rax;              // byte_len
+
+        // ---- (9) slot-0 busy check ----
+        mov rdi, [rsp + 0];               // abar_pa
+        mov rsi, [rsp + 32];              // port_index
+        mov rdx, 0x38;                    // AHCI_PORT_REG_CI (regs.pdx)
+        call ahci_port_reg_u32;
+        mov r10, rax;
+        and r10, 1;
+        cmp r10, 0;
+        jne ahciio_r_no_slot;
+        mov r9, rax;                      // raw CI value (expected 0), preserved to doorbell ring
+
+        // ---- (10) H2D Register FIS at ct_phys+0 ----
+        mov r10, [rsp + 8];               // ct_phys
+
+        mov r11, 0x27;
+        mov_b [r10 + 0], r11;             // fis_type
+
+        mov r11, 0x80;
+        mov_b [r10 + 1], r11;             // C=1, PMP=0
+
+        mov r11, 0x25;
+        mov_b [r10 + 2], r11;             // command = READ_DMA_EXT
+
+        xor r11, r11;
+        mov_b [r10 + 3], r11;             // features_lo
+
+        mov rax, r13;                     // lba (preserved; never shifted directly)
+
+        mov r11, rax;
+        and r11, 0xFF;
+        mov_b [r10 + 4], r11;             // lba[7:0]
+
+        mov r11, rax;
+        shr r11, 8;
+        and r11, 0xFF;
+        mov_b [r10 + 5], r11;             // lba[15:8]
+
+        mov r11, rax;
+        shr r11, 16;
+        and r11, 0xFF;
+        mov_b [r10 + 6], r11;             // lba[23:16]
+
+        mov r11, 0x40;
+        mov_b [r10 + 7], r11;             // device = LBA mode
+
+        mov r11, rax;
+        shr r11, 24;
+        and r11, 0xFF;
+        mov_b [r10 + 8], r11;             // lba[31:24]
+
+        mov r11, rax;
+        shr r11, 32;
+        and r11, 0xFF;
+        mov_b [r10 + 9], r11;             // lba[39:32]
+
+        mov r11, rax;
+        shr r11, 40;
+        and r11, 0xFF;
+        mov_b [r10 + 10], r11;            // lba[47:40]
+
+        xor r11, r11;
+        mov_b [r10 + 11], r11;            // features_hi
+
+        mov r11, r14;                     // nblocks
+        and r11, 0xFF;
+        mov_b [r10 + 12], r11;            // count_lo
+
+        mov r11, r14;
+        shr r11, 8;
+        and r11, 0xFF;
+        mov_b [r10 + 13], r11;            // count_hi
+
+        xor r11, r11;
+        mov_b [r10 + 14], r11;            // icc
+        mov_b [r10 + 15], r11;            // control
+        mov_d [r10 + 16], r11;            // reserved dword
+
+        // ---- (11) PRDT entry at ct_phys+128 ----
+        mov rax, r15;                     // dma_iova
+        mov r11, rax;
+        mov r10, 0xFFFFFFFF;
+        and r11, r10;
+        mov r10, [rsp + 8];               // ct_phys
+        mov_d [r10 + 128 + 0], r11;       // DBA
+
+        mov r11, rax;
+        shr r11, 32;
+        mov_d [r10 + 128 + 4], r11;       // DBAU
+
+        xor r11, r11;
+        mov_d [r10 + 128 + 8], r11;       // reserved
+
+        mov rax, [rsp + 24];              // byte_len
+        sub rax, 1;
+        mov r11, 0x3FFFFF;
+        and rax, r11;
+        mov r11, 0x80000000;
+        or  rax, r11;                     // DBC | I
+        mov_d [r10 + 128 + 12], rax;
+
+        // ---- (12) command header at cl_phys+0 (slot 0) ----
+        mov r10, [rsp + 16];              // cl_phys
+
+        mov r11, 0x10005;                 // CFL=5, W=0, PRDTL=1
+        mov_d [r10 + 0], r11;
+
+        xor r11, r11;
+        mov_d [r10 + 4], r11;             // PRDBC = 0
+
+        mov rax, [rsp + 8];               // ct_phys
+        mov r11, 0xFFFFFFFF;
+        and rax, r11;
+        mov_d [r10 + 8], rax;             // CTBA
+
+        mov rax, [rsp + 8];
+        shr rax, 32;
+        mov_d [r10 + 12], rax;            // CTBAU
+
+        xor rax, rax;
+        mov_d [r10 + 16], rax;
+        mov_d [r10 + 20], rax;
+        mov_d [r10 + 24], rax;
+        mov_d [r10 + 28], rax;            // reserved DW4..DW7
+
+        // ---- (13) publish + ring doorbell ----
+        sfence;
+
+        mov rdi, [rsp + 0];               // abar_pa
+        mov rsi, [rsp + 32];              // port_index
+        mov rdx, 0x38;                    // AHCI_PORT_REG_CI
+        mov rcx, r9;                      // raw CI (0)
+        mov r10, 1;
+        or  rcx, r10;
+        call ahci_port_reg_u32_set;
+
+        // ---- (14) poll for completion ----
+        mov r10, 50000000;                // AHCI_IO_SPIN_MAX
+        mov [rsp + 40], r10;
+      ahciio_r_poll:
+        mov rdi, [rsp + 0];               // abar_pa
+        mov rsi, [rsp + 32];              // port_index
+        mov rdx, 0x38;                    // AHCI_PORT_REG_CI
+        call ahci_port_reg_u32;
+        mov r11, rax;
+        and r11, 1;
+        cmp r11, 0;
+        je  ahciio_r_poll_done;
+        mov r10, [rsp + 40];
+        sub r10, 1;
+        mov [rsp + 40], r10;
+        cmp r10, 0;
+        jne ahciio_r_poll;
+        mov rax, 0xFFFFECA3;              // AHCIIO_SUBMIT_TIMEOUT
+        jmp ahciio_r_out;
+      ahciio_r_poll_done:
+
+        // ---- (15) TFD error check ----
+        mov rdi, [rsp + 0];               // abar_pa
+        mov rsi, [rsp + 32];              // port_index
+        mov rdx, 0x20;                    // AHCI_PORT_REG_TFD
+        call ahci_port_reg_u32;
+        mov r10, rax;
+        and r10, 0x89;                    // BSY(0x80)|DRQ(0x08)|ERR(0x01)
+        cmp r10, 0;
+        jne ahciio_r_tfd_err;
+
+        // ---- (16) success ----
+        mov rax, [rsp + 24];              // byte_len
+        jmp ahciio_r_out;
+
+      ahciio_r_tfd_err:
+        mov rax, 0xFFFFECA4;              // AHCIIO_SUBMIT_TFD_ERR
+        jmp ahciio_r_out;
+
+      ahciio_r_no_slot:
+        mov rax, 0xFFFFECA2;              // AHCIIO_SUBMIT_NO_SLOT
+        jmp ahciio_r_out;
+
+      ahciio_r_not_ready:
+        mov rax, 0xFFFFECA6;              // AHCIIO_PORT_NOT_READY
+        jmp ahciio_r_out;
+
+      ahciio_r_bad_row:
+        mov rax, 0xFFFFECA9;              // AHCIIO_SUBMIT_BAD_ROW
+        jmp ahciio_r_out;
+
+      ahciio_r_prdt_overflow:
+        mov rax, 0xFFFFECA5;              // AHCIIO_SUBMIT_PRDT_OVERFLOW
+
+      ahciio_r_out:
+        add rsp, 56;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
