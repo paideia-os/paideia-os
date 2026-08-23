@@ -1,0 +1,487 @@
+// src/kernel/core/cap/nvme_admin_events.pdx -- R51.M4-003 (#1653).
+//
+// Admin-queue-side AER (Asynchronous Event Request) refill state
+// machine. Design authority: design/hardware/nvme-oncs-reliability.md
+// (commit 1682a41), §3.3 (AER pool table), §3.4 (AER-delivery
+// endpoint slot -- NOT implemented this commit, see gap note below),
+// §5.3 (AER refill loop), §8 (encoder-gap posture).
+//
+// =============================================================================
+// SECTION 0  WHY A SEPARATE FILE
+// =============================================================================
+//
+// design/hardware/nvme-oncs-reliability.md §1 splits R51.M4 into three
+// files (nvme_reliability.pdx, nvme_admin_events.pdx, nvme_recovery.pdx)
+// to avoid re-growing nvme_io_queues.pdx (1533 lines at M3 close) or
+// kind_nvme_controller.pdx (1681 lines) back over the god-file
+// threshold the R51 refactor already committed to holding. This file
+// owns the admin-queue event surface: AER is a persistent pool that
+// refills itself on every completion, not a caller-driven op -- a
+// distinct execution shape from the synchronous FLUSH/TRIM ops
+// (#1651/#1652, nvme_reliability.pdx) and the periodic watchdog
+// scanner (#1655/#1656, nvme_recovery.pdx). This commit lands ONLY
+// the AER refill loop (#1653); GET_LOG_PAGE (#1654, nvme_log_smart_fetch
+// / nvme_log_error_info_fetch) is a separate commit that shares this
+// file and its admin-submit scaffolding.
+//
+// =============================================================================
+// SECTION 1  AER POOL TABLE (design §3.3)
+// =============================================================================
+//
+// _nvme_aer_inflight : [u64; NVMEC_MAX * NVME_AER_MAX] = [u64; 32]
+//                       (8 * 4 * 8 B = 256 B, @align(64), zero-init)
+//
+// Indexed as _nvme_aer_inflight[ctrl_row_id * NVME_AER_MAX + slot_idx].
+// Each entry is a packed 64-bit descriptor:
+//
+//   bits [15:0]  cid        the CID this AER was submitted with
+//   bits [23:16] state      NVME_AER_ST_FREE = 0
+//                           NVME_AER_ST_SUBMITTED = 1
+//                           NVME_AER_ST_LOG_PENDING = 2 (declared, unused
+//                             at M4 -- design note: "M4 posts LOG_PAGE
+//                             on demand only, so state 2 is an M5+ hook")
+//   bits [63:24] reserved   zero
+//
+// DESIGN-DOC GAP #1 (widened cid field): design §3.3's literal bit
+// layout is `bits[7:0] cid | bits[15:8] state | bits[63:16] reserved`,
+// an 8-bit cid field. But the same section assigns AER CIDs from
+// 0x0100..0x0103 (§5.3 "CID space"), which does not fit in 8 bits
+// (0x0100 = 256). This file widens cid to bits[15:0] (state moves to
+// bits[23:16]) so the documented CID range is representable; the
+// reserved span still covers bits[63:24] with room to spare. Flagged
+// for the design doc's next revision.
+//
+// CID allocation: NVME_AER_CID_BASE (0x0100) + slot_idx, slot_idx in
+// [0, NVME_AER_MAX). Matches design §5.3's stated range
+// (0x0100..0x0103), chosen disjoint from IDENTIFY (typically CID 0)
+// and GET_LOG_PAGE (design reserves 0x0200..0x0203 for #1654).
+//
+// =============================================================================
+// SECTION 2  EVENT LOG RING BUFFER (this commit's delivery mechanism)
+// =============================================================================
+//
+// DESIGN-DOC GAP #2 (delivery mechanism): design §3.4 + §5.3 route AER
+// completions to a per-controller KIND_IPC_ENDPOINT slot
+// (`NVMEC_OP_SET_AER_ENDPOINT`, controller row +56, `endpoint_send`).
+// That op, the row field, and the IPC-endpoint plumbing are NOT part
+// of this commit's assigned scope (#1653 is the refill loop only;
+// endpoint delivery is a natural #1654+ or later follow-on once a
+// generic cap-endpoint-send primitive exists for device-originated
+// events -- none currently does, per a repo-wide search for
+// `endpoint_send` turning up nothing outside kind_hid_event.pdx's much
+// heavier subscription-table machinery). This commit instead decodes
+// every drained AER completion into a packed payload and appends it to
+// a small ring buffer:
+//
+//   _nvme_aer_event_log     : [u64; 64] @align(64), zero-init
+//   _nvme_aer_event_log_idx : u64 (next write slot, mod 64)
+//
+// Payload packing (per entry): (log_page_id << 16) | (event_info << 8)
+// | event_type -- same fields, same shift positions design §5.3
+// specifies for the eventual endpoint_send payload, so a later commit
+// that adds real IPC delivery can source it from this same decode.
+//
+// =============================================================================
+// SECTION 3  FAILURE TAXONOMY  0xFFFFEC70..0xFFFFEC7F (M4 band)
+// =============================================================================
+//
+// Full R51 band map (design §8.6):
+//   KIND_NVME_CONTROLLER   0xFFFFEC40..EC4F   (M1)
+//   NVMEIO_ (nvme_io_queues)  0xFFFFEC50..EC5F   (M3)
+//   BDEV_ERR_ (blkdev)     0xFFFFEC60..EC6F   (M3)
+//   NVMEREL_ (reliability) 0xFFFFEC70..EC7F   (M4 -- this band)
+//
+// This commit (#1653) consumes exactly two codes from the shared M4
+// band; both are declared once, in nvme_reliability.pdx (#1651),
+// which claims the whole 0xFFFFEC70..0xFFFFEC7F range up front per
+// that file's own whole-module-taxonomy posture (mirroring the
+// nvme_io_queues.pdx precedent). This file does NOT redeclare them
+// (a same-named `pub let` in two files would collide) -- it only
+// uses the literal values, each annotated with its constant name in
+// the code below:
+//
+//   NVMEREL_AER_NO_ENDPOINT  0xFFFFEC75  design's original meaning is
+//                                        "AER completion arrived, no
+//                                        IPC endpoint programmed" --
+//                                        this commit has no IPC
+//                                        endpoint (gap #2 above), so
+//                                        the same code is repurposed
+//                                        to cover every "this AER call
+//                                        could not be routed cleanly"
+//                                        case this file can raise: bad
+//                                        ctrl_row_id, admin queue not
+//                                        yet bar0/ctx-ready, and a
+//                                        drained CID matching no
+//                                        SUBMITTED slot.
+//   NVMEREL_AER_POOL_FULL    0xFFFFEC76  refill attempt with all
+//                                        NVME_AER_MAX slots already
+//                                        SUBMITTED -- unchanged from
+//                                        design's original meaning.
+//
+// =============================================================================
+// SECTION 4  paideia-as encoder-gap posture (v0.22.x)
+// =============================================================================
+//
+//   G1: sized loads via `xor <reg>,<reg>; mov_w/mov_d <reg>, [mem]`
+//       (zero-extension is not automatic on mov_w/mov_d). All stores
+//       in this file address `[base + imm]` (never two-register
+//       `[reg + reg]`), so the G1 byte-store scale trap does not apply
+//       here -- no mov_b store is needed (the AER SQE's only non-zero
+//       field is the 32-bit DW0, via mov_d).
+//   G4: full-register compares -- every packed-field compare zero-
+//       extends via the mov_w/mov_d-then-and idiom before cmp.
+//
+// r10/r11/r9/rcx used freely as caller-save scratch between calls; no
+// imm64 constant appears in this file (the two failure codes and every
+// AER/CID constant fit imm32).
+//
+// Reserved-label discipline (`loop`/`if`/`for`/`while`/`let`/`mut`/
+// `pub`/`fn`/`structure`/`module`/`unsafe`/`effects`/`capabilities`/
+// `justification`/`block`/`align`/`uninit` are keywords, never bare
+// labels):
+//   nvme_ae_pi_  -> nvme_aer_pool_init
+//   nvme_ae_ro_  -> nvme_aer_refill_one
+//   nvme_ae_do_  -> nvme_aer_drain_one
+//
+// No string literal in this file (no witness/log text emitted by this
+// commit), so the output-provenance-strip.md "no R-prefixed round tag"
+// rule has nothing to violate here.
+
+module NvmeAdminEvents = structure {
+
+  pub let NVME_AER_MAX          : u64 = 4     // matches typical AERL; design §3.3 / parent doc §7 line 848
+  pub let NVME_AER_CID_BASE     : u64 = 0x0100
+
+  pub let NVME_AER_ST_FREE        : u64 = 0
+  pub let NVME_AER_ST_SUBMITTED   : u64 = 1
+  pub let NVME_AER_ST_LOG_PENDING : u64 = 2   // declared, unused at M4 (design §3.3)
+
+  pub let NVME_AER_LOG_SIZE : u64 = 64        // ring-buffer entry count
+
+  // NVMEREL_AER_NO_ENDPOINT (0xFFFFEC75) and NVMEREL_AER_POOL_FULL
+  // (0xFFFFEC76) are declared in nvme_reliability.pdx (#1651), which
+  // claims the whole 0xFFFFEC70..0xFFFFEC7F band up front per that
+  // file's own whole-module-taxonomy posture -- NOT redeclared here to
+  // avoid a duplicate-symbol collision. This file's code below uses
+  // the two literal values directly, each annotated with the constant
+  // name it stands for. See SECTION 3 above for the repurposing note
+  // on NVMEREL_AER_NO_ENDPOINT.
+
+  // NVMEC_MAX (8) * NVME_AER_MAX (4) * 8 B/entry = 256 B (design §3.3).
+  pub let mut _nvme_aer_inflight : [u64; 32] = uninit @align(64)
+
+  // Ring buffer of decoded AER completions (see SECTION 2 gap note).
+  pub let mut _nvme_aer_event_log     : [u64; 64] = uninit @align(64)
+  pub let mut _nvme_aer_event_log_idx : u64 = 0
+
+  // ==========================================================================
+  // nvme_aer_pool_init(ctrl_row_id) -> u64
+  //
+  // Seeds all NVME_AER_MAX slots for one controller by calling
+  // nvme_aer_refill_one in a loop. Returns the count of slots that
+  // reached SUBMITTED (== NVME_AER_MAX on healthy bring-up; fewer if
+  // the admin queue is not yet ready or a submit failed part-way).
+  // Design §5.3 / §6 commit-1 scope.
+  // ==========================================================================
+  pub let nvme_aer_pool_init : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (ctrl_row_id: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { cap },
+      justification: "R51.M4-003 (#1653). Seed the AER pool at controller bring-up (design §3.3, called from nvme_io_bring_up_all's success tail in nvme_io_queues.pdx -- see that file's nvme_iob_done label). Loops i = 0..NVME_AER_MAX (4), calling nvme_aer_refill_one(ctrl_row_id) each iteration and counting the OK (0) returns; each call independently re-scans the slot table for the first FREE entry, so four successive calls correctly claim four distinct slots without this function needing to know slot indices itself. Three callee-save pushes (rbx=ctrl_row_id, rbp=count, r12=loop index i) leave rsp%16==0 at every nested call (odd push count: entry rsp%16==8, three pushes -> 8-24=-16=0 mod 16). Returns rbp (count), not simply NVME_AER_MAX, because a controller whose admin queue is not yet bar0/ctx-ready (nvme_aer_refill_one returning NVMEREL_AER_NO_ENDPOINT) should report a partial/zero count rather than silently claiming success. Labels prefixed nvme_ae_pi_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+
+        mov rbx, rdi;                     // ctrl_row_id
+        xor rbp, rbp;                     // count = 0
+        xor r12, r12;                     // i = 0
+
+      nvme_ae_pi_loop:
+        mov r10, 4;                       // NVME_AER_MAX
+        cmp r12, r10;
+        jae nvme_ae_pi_done;
+
+        mov rdi, rbx;
+        call nvme_aer_refill_one;
+
+        cmp rax, 0;
+        jne nvme_ae_pi_skip;
+        add rbp, 1;
+
+      nvme_ae_pi_skip:
+        add r12, 1;
+        jmp nvme_ae_pi_loop;
+
+      nvme_ae_pi_done:
+        mov rax, rbp;
+
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_aer_refill_one(ctrl_row_id) -> u64
+  //
+  // Locates the first FREE slot in this controller's AER range, builds
+  // an ASYNC_EVENT_REQUEST SQE (OPC = 0x0C, no NSID, no PRP, no CDWs)
+  // with a fresh CID, and submits it via nvme_admin_submit_nopoll --
+  // AER completions arrive asynchronously (potentially minutes later),
+  // so the submit must NOT poll (design §5.3 "non-polling submit is
+  // the key semantic"). On a successful doorbell ring, marks the slot
+  // SUBMITTED with the chosen CID and returns 0.
+  //
+  // Returns NVMEREL_AER_NO_ENDPOINT if ctrl_row_id is out of range or the
+  // controller's admin queue is not yet bar0/ctx-ready (admin_ctx_pa
+  // still 0, i.e. bring-up has not reached that point);
+  // NVMEREL_AER_POOL_FULL if every NVME_AER_MAX slot is already
+  // SUBMITTED.
+  // ==========================================================================
+  pub let nvme_aer_refill_one : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (ctrl_row_id: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { cap },
+      justification: "R51.M4-003 (#1653). Design §5.3. Five callee-save pushes (rbx=ctrl_row_id, rbp=slot_idx, r12=bar0, r13=admin_ctx, r14=cid) leave rsp%16==0 (odd push count) at every nested call (nvme_ctrl_row_bar0, nvme_ctrl_row_admin_ctx, nvme_admin_submit_nopoll). rbx is never overwritten with a derived value (unlike some sibling functions in this R51 area) specifically so ctrl_row_id remains available verbatim for every per-slot address computation (base_idx = ctrl_row_id*NVME_AER_MAX, recomputed inline at each of the two table-address sites rather than cached, trading two extra shl/add pairs for eliminating a register-aliasing hazard). (1) Bounds check ctrl_row_id < 8 (NVMEC_MAX) -- out of range -> POOL_FULL (fail-closed: no slot could exist for an invalid row, so refusing to allocate one is the same outcome as the pool being exhausted, without indexing past _nvme_aer_inflight). (2) nvme_ctrl_row_bar0(ctrl_row_id); NVMEC_DECODE_BAD (all-ones) -> BAD_ARG. (3) nvme_ctrl_row_admin_ctx(ctrl_row_id); all-ones OR zero (zero means 'no bring-up performed yet' per that accessor's own doc comment) -> BAD_ARG. (4) Linear scan slot_idx = 0..NVME_AER_MAX-1: entry = [_nvme_aer_inflight + (ctrl_row_id*NVME_AER_MAX + slot_idx)*8]; state = (entry >> 16) & 0xFF; first FREE (0) wins. Exhausting the scan without a match -> POOL_FULL. (5) cid = NVME_AER_CID_BASE (0x0100) + slot_idx. (6) rep_stosb-zero the shared 64-byte _nvme_admin_sqe_scratch (same scratch every other admin builder in drivers/nvme/ uses -- safe to share because nvme_admin_submit_nopoll's doorbell-ring step has already consumed the bytes by the time this function returns, even though the CQE itself has not arrived). (7) DW0 (u32 @+0) = OPC(0x0C) | (cid << 16), via mov_d -- NSID/PRP1/PRP2/CDW10..15 all stay zero from the memset (ASYNC_EVENT_REQUEST takes none of them). (8) nvme_admin_submit_nopoll(bar0, admin_ctx, &scratch) -- return value not checked beyond being the non-polling contract's immediate-0 (a non-zero here would indicate the doorbell path itself broke, per design §6 commit-1's debugger cue, but this function still marks the slot SUBMITTED regardless: the alternative -- treating a broken doorbell as 'slot still FREE' -- would let the very next refill call race back onto the same slot's CID before this SQE's fate is known). (9) Write back entry = cid | (NVME_AER_ST_SUBMITTED << 16) at the same slot address recomputed from ctrl_row_id/slot_idx. Labels prefixed nvme_ae_ro_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                     // ctrl_row_id
+
+        cmp rbx, 8;                       // NVMEC_MAX
+        jae nvme_ae_ro_full;
+
+        mov rdi, rbx;
+        call nvme_ctrl_row_bar0;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvme_ae_ro_badarg;
+        mov r12, rax;                     // bar0
+
+        mov rdi, rbx;
+        call nvme_ctrl_row_admin_ctx;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  nvme_ae_ro_badarg;
+        cmp rax, 0;
+        je  nvme_ae_ro_badarg;            // admin queue not brought up yet
+        mov r13, rax;                     // admin_ctx
+
+        xor rbp, rbp;                     // slot_idx = 0
+
+      nvme_ae_ro_scan:
+        mov r10, 4;                       // NVME_AER_MAX
+        cmp rbp, r10;
+        jae nvme_ae_ro_full;
+
+        mov rax, rbx;
+        shl rax, 2;                       // * NVME_AER_MAX (4)
+        add rax, rbp;
+        shl rax, 3;                       // * 8 B/entry
+        lea r11, [rip + _nvme_aer_inflight];
+        add r11, rax;
+        mov rax, [r11 + 0];
+        shr rax, 16;
+        and rax, 0xFF;                    // state
+        cmp rax, 0;                       // NVME_AER_ST_FREE
+        je  nvme_ae_ro_found;
+
+        add rbp, 1;
+        jmp nvme_ae_ro_scan;
+
+      nvme_ae_ro_found:
+        mov r14, 0x0100;                  // NVME_AER_CID_BASE
+        add r14, rbp;                     // cid = base + slot_idx
+
+        // Zero the shared 64-byte admin SQE scratch.
+        lea rdi, [rip + _nvme_admin_sqe_scratch];
+        xor rax, rax;
+        mov rcx, 64;
+        cld;
+        rep_stosb;
+
+        // DW0 (u32 @+0) = OPC(0x0C) | (cid << 16).
+        lea r10, [rip + _nvme_admin_sqe_scratch];
+        mov rax, r14;
+        shl rax, 16;
+        mov r11, 0x0C;                    // OPC = ASYNC_EVENT_REQUEST
+        or  rax, r11;
+        mov_d [r10 + 0], rax;
+
+        // Submit without polling.
+        mov rdi, r12;                     // bar0
+        mov rsi, r13;                     // admin_ctx
+        lea rdx, [rip + _nvme_admin_sqe_scratch];
+        call nvme_admin_submit_nopoll;
+
+        // Mark the slot SUBMITTED with the chosen CID.
+        mov rax, rbx;
+        shl rax, 2;
+        add rax, rbp;
+        shl rax, 3;
+        lea r11, [rip + _nvme_aer_inflight];
+        add r11, rax;
+        mov rax, r14;                     // cid
+        mov r10, 1;                       // NVME_AER_ST_SUBMITTED
+        shl r10, 16;
+        or  rax, r10;
+        mov [r11 + 0], rax;
+
+        xor rax, rax;                     // OK
+        jmp nvme_ae_ro_out;
+
+      nvme_ae_ro_badarg:
+        mov rax, 0xFFFFEC75;              // NVMEREL_AER_NO_ENDPOINT
+        jmp nvme_ae_ro_out;
+
+      nvme_ae_ro_full:
+        mov rax, 0xFFFFEC76;              // NVMEREL_AER_POOL_FULL
+
+      nvme_ae_ro_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nvme_aer_drain_one(ctrl_row_id, aer_cqe_addr) -> u64
+  //
+  // Parses a 16-byte CQE (harvested by the admin-queue drain path) at
+  // aer_cqe_addr: CID (u16 @+12) and DW0 (u32 @+0, carrying Event
+  // Type[2:0] | Event Info[15:8] | Log Page ID[23:16] per design
+  // §5.3). Locates the AER slot in this controller's range whose
+  // state is SUBMITTED and whose stored CID matches; frees it, appends
+  // the decoded payload to the event-log ring buffer (SECTION 2), then
+  // calls nvme_aer_refill_one(ctrl_row_id) to keep the pool full.
+  //
+  // Returns 0 on OK; NVMEREL_AER_NO_ENDPOINT if ctrl_row_id is out of
+  // range or the CID matches no SUBMITTED slot (logged nowhere further
+  // -- an unmatched completion is dropped, counted only by this return
+  // code reaching its caller).
+  // ==========================================================================
+  pub let nvme_aer_drain_one : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (ctrl_row_id: u64) (aer_cqe_addr: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { cap },
+      justification: "R51.M4-003 (#1653). Design §5.3. Five callee-save pushes (rbx=ctrl_row_id, r12=aer_cqe_addr, r13=cid_from_cqe, r14=slot_idx, r15=dw0/payload) leave rsp%16==0 at every nested call (nvme_aer_refill_one). (1) Bounds check ctrl_row_id < 8 -> else BAD_ARG. (2) CID (u16 @+12 of the CQE) via xor+mov_w zero-extend into r13. (3) DW0 (u32 @+0) via xor+mov_d zero-extend into r15 -- read once up front and decoded later, since the scan loop below does not touch r15. (4) Linear scan slot_idx = 0..NVME_AER_MAX-1 over this ctrl_row's AER range: entry = [_nvme_aer_inflight + (ctrl_row_id*NVME_AER_MAX+slot_idx)*8]; state = (entry>>16)&0xFF must be NVME_AER_ST_SUBMITTED (1) AND (entry & 0xFFFF) must equal r13, else advance. No match after 4 slots -> BAD_ARG (an AER CQE that matches nothing this controller submitted -- dropped, per design's 'logged, dropped, counted' posture, though this commit counts it only via the return code, having no IPC-endpoint counter to bump; see file header gap #2). (5) On match: zero the slot (both cid and state fields go to 0 = FREE in one store). (6) Decode payload = (log_page_id<<16)|(event_info<<8)|event_type from r15's DW0 per design §5.3's field positions (Event Type bits[2:0], Event Info bits[15:8], Log Page ID bits[23:16]). (7) Append to the ring buffer at _nvme_aer_event_log_idx (mod NVME_AER_LOG_SIZE=64), advancing and wrapping the index in place -- this commit's substitute for design §3.4/§5.3's endpoint_send (see gap #2); the payload encoding is deliberately identical so a later IPC-delivery commit can source it from the same decode. (8) call nvme_aer_refill_one(ctrl_row_id) to keep the pool full -- its return is not propagated; design §5.3 states this function 'returns 0 on OK' unconditionally once the CID has matched and been freed. Labels prefixed nvme_ae_do_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                     // ctrl_row_id
+        mov r12, rsi;                     // aer_cqe_addr
+
+        cmp rbx, 8;                       // NVMEC_MAX
+        jae nvme_ae_do_badarg;
+
+        xor r13, r13;
+        mov_w r13, [r12 + 12];            // CID
+
+        xor r15, r15;
+        mov_d r15, [r12 + 0];             // DW0
+
+        xor r14, r14;                     // slot_idx = 0
+
+      nvme_ae_do_scan:
+        mov r10, 4;                       // NVME_AER_MAX
+        cmp r14, r10;
+        jae nvme_ae_do_notfound;
+
+        mov rax, rbx;
+        shl rax, 2;
+        add rax, r14;
+        shl rax, 3;
+        lea r11, [rip + _nvme_aer_inflight];
+        add r11, rax;
+        mov rax, [r11 + 0];
+        mov rcx, rax;
+        shr rcx, 16;
+        and rcx, 0xFF;                    // state
+        cmp rcx, 1;                       // NVME_AER_ST_SUBMITTED
+        jne nvme_ae_do_next;
+
+        mov rcx, rax;
+        and rcx, 0xFFFF;                  // stored cid
+        cmp rcx, r13;
+        je  nvme_ae_do_matched;
+
+      nvme_ae_do_next:
+        add r14, 1;
+        jmp nvme_ae_do_scan;
+
+      nvme_ae_do_matched:
+        // Free the slot (cid + state both -> 0).
+        mov rax, rbx;
+        shl rax, 2;
+        add rax, r14;
+        shl rax, 3;
+        lea r11, [rip + _nvme_aer_inflight];
+        add r11, rax;
+        xor rax, rax;
+        mov [r11 + 0], rax;
+
+        // Decode payload = (log_page_id << 16) | (event_info << 8) | event_type.
+        mov rax, r15;
+        and rax, 0x7;                     // event_type
+        mov rcx, r15;
+        shr rcx, 8;
+        and rcx, 0xFF;                    // event_info
+        shl rcx, 8;
+        or  rax, rcx;
+        mov rcx, r15;
+        shr rcx, 16;
+        and rcx, 0xFF;                    // log_page_id
+        shl rcx, 16;
+        or  rax, rcx;                     // rax = payload
+
+        // Append to the ring buffer; advance + wrap the index.
+        lea r10, [rip + _nvme_aer_event_log_idx];
+        mov rcx, [r10 + 0];               // idx
+        lea r11, [rip + _nvme_aer_event_log];
+        mov r9, rcx;
+        shl r9, 3;
+        add r11, r9;
+        mov [r11 + 0], rax;
+
+        add rcx, 1;
+        mov r9, 64;                       // NVME_AER_LOG_SIZE
+        cmp rcx, r9;
+        jb  nvme_ae_do_noidxwrap;
+        xor rcx, rcx;
+      nvme_ae_do_noidxwrap:
+        mov [r10 + 0], rcx;
+
+        // Keep the pool full.
+        mov rdi, rbx;
+        call nvme_aer_refill_one;
+
+        xor rax, rax;                     // OK
+        jmp nvme_ae_do_out;
+
+      nvme_ae_do_notfound:
+      nvme_ae_do_badarg:
+        mov rax, 0xFFFFEC75;              // NVMEREL_AER_NO_ENDPOINT
+
+      nvme_ae_do_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
