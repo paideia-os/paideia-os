@@ -5970,6 +5970,61 @@ fi
 echo "[r52-m4-confine] R52.M4 (KIND_INODE_HANDLE) confined"
 
 # ---------------------------------------------------------------------------
+# R52.M5-001 (#1703): one-writer discipline for KIND_VOLUME.
+#
+#   * kind_volume (KIND_VOLUME = 0x1A0, over KIND_MEMORY)
+#
+# _volume_table + _volume_stats are the only places in the kernel where
+# mounted-volume authority lives. A second writer would let one caller
+# mutate a volume row (forge a uuid, silently rebind device_slot,
+# corrupt the sig_key_slot backref) with no capability involved.
+# Per-module confinement is what makes that unreachable by
+# construction; the sole writers are volume_tail_alloc / _tail_free /
+# _row_*_set / _note / _table_reset (all in kind_volume.pdx).
+R52_VOL_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_volume.pdx"
+if [[ ! -f "${R52_VOL_SRC}" ]]; then
+    echo "[r52-m5-confine] FAIL - kind_volume.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_volume_table' 'core/cap/kind_volume.o'
+ec_confine_one '_volume_stats' 'core/cap/kind_volume.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_volume.pdx §1 for the per-module one-writer" >&2
+    echo "  discipline (the sole writers are volume_tail_alloc + " >&2
+    echo "  volume_tail_free + volume_row_*_set + volume_note + " >&2
+    echo "  volume_table_reset)." >&2
+    exit 1
+fi
+echo "[r52-m5-confine] R52.M5-001 (KIND_VOLUME) confined"
+
+# ---------------------------------------------------------------------------
+# R52.M5-001 (#1703): one-writer discipline for KIND_SIG_KEY.
+#
+#   * kind_sig_key (KIND_SIG_KEY = 0x1A3, over KIND_MEMORY)
+#
+# _sig_key_table + _sig_key_stats are the only places in the kernel
+# where signing-key authority lives. A second writer would let one
+# caller forge a key_hash or rebind key_material_lba with no capability
+# involved. Per-module confinement is what makes that unreachable by
+# construction; the sole writers are sig_key_tail_alloc / _tail_free /
+# _row_hash_w*_set / _note / _table_reset (all in kind_sig_key.pdx).
+R52_SIGK_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_sig_key.pdx"
+if [[ ! -f "${R52_SIGK_SRC}" ]]; then
+    echo "[r52-m5-confine] FAIL - kind_sig_key.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_sig_key_table' 'core/cap/kind_sig_key.o'
+ec_confine_one '_sig_key_stats' 'core/cap/kind_sig_key.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_sig_key.pdx §1 for the per-module one-writer" >&2
+    echo "  discipline (the sole writers are sig_key_tail_alloc + " >&2
+    echo "  sig_key_tail_free + sig_key_row_hash_w*_set + sig_key_note + " >&2
+    echo "  sig_key_table_reset)." >&2
+    exit 1
+fi
+echo "[r52-m5-confine] R52.M5-001 (KIND_SIG_KEY) confined"
+
+# ---------------------------------------------------------------------------
 # R42-PREP-008 (#1630): one-writer discipline for the PdxFS userspace
 # directory iterator cursor table.
 #
