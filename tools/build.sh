@@ -6027,11 +6027,15 @@ ec_confine_one '_itable_blk_buf'       'core/fs/pdxfs/inode_table.o'
 ec_confine_one '_itable_desc'          'core/fs/pdxfs/inode_table.o'
 ec_confine_one '_itable_row_scratch'   'core/fs/pdxfs/inode_table.o'
 ec_confine_one '_itable_alloc_scratch' 'core/fs/pdxfs/inode_table.o'
+# R55.M2-002 (#1784): inode_table_write's RMW scratch page. Sole writer
+# is inode_table_write itself (RMW read + splice); no other module in
+# the tree may DMA-target or splice-into this page.
+ec_confine_one '_inode_write_scratch'  'core/fs/pdxfs/inode_table.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then
     echo "  See inode_table.pdx §Storage for the per-module one-writer" >&2
     echo "  discipline (the sole writers are itable_init," >&2
     echo "  itable_ensure_block_loaded, inode_read, inode_write," >&2
-    echo "  inode_alloc_fresh, and inode_scrub_slot)." >&2
+    echo "  inode_alloc_fresh, inode_scrub_slot, and inode_table_write)." >&2
     exit 1
 fi
 echo "[r52-m4-confine] R52.M4-002 (inode_table) confined"

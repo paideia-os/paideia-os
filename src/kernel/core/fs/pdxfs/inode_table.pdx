@@ -1,9 +1,20 @@
 // src/kernel/core/fs/pdxfs/inode_table.pdx -- R52.M4-002 (#1698) +
-//                                              R52.M4-004 (#1700)
+//                                              R52.M4-004 (#1700) +
+//                                              R55.M2-002 (#1784)
 //
 // PDXFS-ON-BLOCK v1 -- INODE TABLE SKELETON: READ / WRITE / ALLOC-FRESH /
 //                       SCRUB / RESOLVE over the fixed 128-B-per-inode
 //                       on-disk slab.
+//
+// R55.M2-002 (#1784) adds inode_table_write(nsid, sb_ptr, ino, inode_ptr)
+// -- an RMW writeback path over bdev_write_at (bdev_write.pdx, #1784)
+// that reads the target 4-KiB inode-table block fresh from the passed
+// superblock pointer, patches one 128-byte slot, and writes the whole
+// page back. Distinct from inode_write above: this path does NOT touch
+// _itable_state's cached lba/bcount, does NOT require itable_init to
+// have run, and takes an nsid + superblock pointer rather than a
+// bdev_cap. See design/filesystem/pdxfs-block-write-e2e.md
+// §Inode-table-write for the full plan.
 //
 // Design authority: design/filesystem/r52-implementation-plan.md §2.4
 // (R52.M4, step 2: "#1698 -- inode_table.pdx: inode_read(vol_slot,
@@ -391,6 +402,29 @@ module InodeTable = structure {
 
   pub let mut _itable_row_scratch   : [u64; 16] = uninit @align(64)
   pub let mut _itable_alloc_scratch : [u64; 16] = uninit @align(64)
+
+  // ============================================================================
+  // R55.M2-002 (#1784): inode_table_write's RMW scratch page.
+  //
+  // inode_table_write reads the target 4-KiB inode-table block into this
+  // page (via nvme_read_blocking, live path only), patches the 128-byte
+  // slot at ino's row_byte_offset with the caller's inode row, and hands
+  // the whole page back to bdev_write_at (bdev_write.pdx, R55.M2-002 /
+  // #1784). Sole writer: inode_table.o (populated only by
+  // inode_table_write's RMW read; consumed only by its splice + write).
+  // Page-aligned per NVMe PRP1 requirement (drivers/nvme/sync.pdx §5.11
+  // -- single-page transfer at M5, so buf_pa must be 4-KiB aligned).
+  //
+  // Distinct from _itable_blk_buf above: that page is owned by the
+  // resident-block cache path (itable_ensure_block_loaded / inode_read /
+  // inode_write / inode_alloc_fresh / inode_scrub_slot, all of which
+  // operate over bdev_barrier_write). _inode_write_scratch is used only
+  // by inode_table_write's bdev_write_at-routed path, and never touches
+  // the resident-block cache -- inode_table_write does NOT stamp
+  // loaded_block_idx or otherwise mutate _itable_state, so a subsequent
+  // itable_ensure_block_loaded on the same block will re-read from disk
+  // (that reread will see the write inode_table_write just committed).
+  pub let mut _inode_write_scratch  : [u64; 512] = uninit @align(4096)
 
   // ============================================================================
   // itable_init(sb_ptr: u64) -> u64
@@ -933,6 +967,206 @@ module InodeTable = structure {
         pop r14;
         pop r13;
         pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // inode_table_write(nsid: u64, sb_ptr: u64, ino: u64, inode_ptr: u64) -> u64
+  //                                                             R55.M2-002 (#1784)
+  //
+  // Writes the 128-byte inode row at `inode_ptr` into the on-disk inode
+  // table at ino's slot (byte offset = (ino % 32) * 128 within the
+  // block at LBA sb_itable_lba(sb_ptr) + (ino / 32)) via a
+  // read-modify-write over bdev_write.pdx's #1784 direct-submit helper
+  // bdev_write_at. Every mutating pdxfs-block op that stamps a fresh
+  // mtime / grows byte_len / rewrites the extent slot needs to durably
+  // persist the inode row afterwards; this is the writeback path #1786
+  // (pdxfs_block_write) will call.
+  //
+  // Distinct from `inode_write` above (R52.M4-002 / #1698): that path
+  // uses bdev_barrier_write (cap_invoke over KIND_BLKDEV) and depends
+  // on itable_init having primed _itable_state's cached itable_lba /
+  // itable_bcount. inode_table_write reads the same fields FRESH from
+  // the passed superblock pointer on every call and does NOT touch
+  // _itable_state -- suitable for callers that hold a superblock
+  // pointer but have not (yet) called itable_init in this boot
+  // (design/filesystem/pdxfs-block-write-e2e.md §Inode-table-write for
+  // the split rationale).
+  //
+  // Signature / arity note. The ticket text names `-> u16`; every other
+  // function in this module returns u64 (0 on success, one of the
+  // 0xFFFFED1* / reused-M3 sentinels on failure), and the u16 spelling
+  // does not fit either sentinel. Landed as `-> u64` per the codebase
+  // convention; the ticket's `u16` is treated as a typo.
+  //
+  // RMW pattern:
+  //   (1) Bounds check: (ino / 32) < sb_itable_bcount(sb_ptr) else
+  //       INODE_INVALID_INDEX (0xFFFFED18).
+  //   (2) Compute target_lba = sb_itable_lba(sb_ptr) + (ino / 32) and
+  //       row_byte_offset = (ino % 32) * 128.
+  //   (3) Substrate branch on _nvme_io_queue_count -- SUBSTRATE (== 0):
+  //       jump to fingerprint emit (no R/W); LIVE (> 0):
+  //       nvme_read_blocking(nsid, target_lba, count=1,
+  //                          buf_pa=&_inode_write_scratch); non-zero
+  //       CQE -> reused ALLOC_BITMAP_TORN (0xFFFFED11, allocator.pdx --
+  //       same reuse posture the file's own gap 4 documents).
+  //   (4) Splice 16 qwords from inode_ptr into &_inode_write_scratch +
+  //       row_byte_offset (the other 31 rows in the block are preserved
+  //       by the RMW read in step 3).
+  //   (5) bdev_write_at(nsid, target_lba, count=1,
+  //                     buf_pa=&_inode_write_scratch) -- non-zero
+  //       forwarded status -> reused ALLOC_BITMAP_TORN. bdev_write_at
+  //       itself will double-check _nvme_io_queue_count (its own
+  //       substrate branch); in LIVE mode we get a real
+  //       nvme_write_blocking CQE round-trip.
+  //   (6) Emit klog_s1_x2(LEVEL_INFO, SUBSYS_FS__, tag_pdxb_inode_
+  //       write_ok, k_ino, ino, k_size, size) exactly once on the
+  //       success path (both SUBSTRATE and LIVE). `size` is loaded
+  //       from [inode_ptr + 16] (byte_len field per the 128-B row
+  //       layout in the file header).
+  //
+  // Failure semantics: bad_index and torn both return WITHOUT emitting
+  // the fingerprint, per ticket "Emit exactly once per successful
+  // write" clause; SUBSTRATE-success emits (nothing was written to
+  // hardware, but the write attempt itself is the wire event
+  // pdxfs_block_write's caller-side wiring will observe).
+  //
+  // Effect row: !{mem, sysreg} (bdev + memory + klog); matches
+  // bdev_write_at and klog_s1_x2's own effect rows.
+  //
+  // Register discipline:
+  //   6-push callee-save prologue (rbx=nsid, rbp=sb_ptr, r12=ino,
+  //   r13=inode_ptr, r14=target_lba, r15=row_byte_offset) + sub rsp,8
+  //   lands rsp%16==0 (entry rsp%16==8 + 48 + 8 = 64) for every nested
+  //   call below (sb_itable_lba, sb_itable_bcount, nvme_read_blocking,
+  //   bdev_write_at, klog_s1_x2). All five callees preserve callee-save
+  //   regs per SysV. Before klog_s1_x2 the caller must push v2 (size)
+  //   at [rsp+8]; the `sub rsp, 8; push size; call; add rsp, 16`
+  //   sandwich bumps rsp by 16 total (aligned) and undoes cleanly.
+  //
+  // No test instruction; no mov_b (byte_len is a full u64 at row+16,
+  // extracted via a whole-qword load). Reserved labels: itw_ (distinct
+  // from inode_write's iw_ and inode_scrub_slot's iss_).
+  // ============================================================================
+  pub let inode_table_write : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (nsid: u64) (sb_ptr: u64) (ino: u64) (inode_ptr: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: {},
+      justification: "R55.M2-002 (#1784). See §Inode-table-write of design/filesystem/pdxfs-block-write-e2e.md for the full plan; short form: RMW over bdev_write_at (#1784) for callers that hold a superblock pointer + row scratch and need immediate durable persistence of one inode row without going through itable_init / _itable_state's cached block. 6-push prologue (rbx=nsid, rbp=sb_ptr, r12=ino, r13=inode_ptr, r14=target_lba, r15=row_byte_offset) + sub rsp,8 lands rsp%16==0 (entry rsp%16==8 + 48 + 8 = 64) for every nested call. Body: (1) rbx=nsid(rdi), rbp=sb_ptr(rsi), r12=ino(rdx), r13=inode_ptr(rcx). (2) Bounds: rdi=rbp; call sb_itable_bcount; rcx=r12; shr rcx,5 (block_idx); cmp rcx,rax; jae bad_index. (3) target_lba: rdi=rbp; call sb_itable_lba; rcx=r12; shr rcx,5; add rax,rcx; r14=rax. (4) row_byte_offset: rax=r12; and rax,31; shl rax,7; r15=rax. (5) Substrate: mov rax,[rip+_nvme_io_queue_count]; cmp rax,0; je itw_emit_fp. (6) LIVE read: rdi=rbx; rsi=r14; rdx=1; lea rcx,[rip+_inode_write_scratch]; call nvme_read_blocking; cmp rax,0; jne torn. (7) Splice 16 qwords from r13 to &_inode_write_scratch+r15 via manual rcx=0..16 loop (no rep movsq precedent in this codebase). (8) LIVE write: rdi=rbx; rsi=r14; rdx=1; lea rcx,[rip+_inode_write_scratch]; call bdev_write_at; cmp rax,0; jne torn. (9) emit_fp: rax = [r13 + 16] (byte_len); klog_s1_x2(LEVEL_INFO=3, SUBSYS_FS__, tag_pdxb_inode_write_ok, k_ino, r12, k_size, size). v2 (size) push convention: `sub rsp, 8; push rax; call klog_s1_x2; add rsp, 16` (rsp already at %16==0 from prologue's sub 8, so sub 8 + push = +16, aligned pre-call; add 16 undoes both). (10) xor eax,eax; jmp done. bad_index: rax=0xFFFFED18; jmp done. torn: rax=0xFFFFED11 (reused ALLOC_BITMAP_TORN per file gap 4). done: add rsp,8; 6-pop epilogue + ret. sb_itable_lba/sb_itable_bcount/nvme_read_blocking/bdev_write_at/klog_s1_x2 all preserve rbx/rbp/r12..r15 per SysV -- the six pushed regs survive every nested call. No test instruction; no mov_b. Reserved labels: itw_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 8;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+        mov r12, rdx;
+        mov r13, rcx;
+
+        // Bounds: block_idx = ino / 32 must be < sb_itable_bcount(sb_ptr).
+        mov rdi, rbp;
+        call sb_itable_bcount;
+        mov rcx, r12;
+        shr rcx, 5;
+        cmp rcx, rax;
+        jae itw_bad_index;
+
+        // target_lba = sb_itable_lba(sb_ptr) + block_idx.
+        mov rdi, rbp;
+        call sb_itable_lba;
+        mov rcx, r12;
+        shr rcx, 5;
+        add rax, rcx;
+        mov r14, rax;
+
+        // row_byte_offset = (ino % 32) * 128.
+        mov rax, r12;
+        and rax, 31;
+        shl rax, 7;
+        mov r15, rax;
+
+        // Substrate branch: skip R/W entirely when no live IO SQ pair.
+        mov rax, [rip + _nvme_io_queue_count];
+        cmp rax, 0;
+        je  itw_emit_fp;
+
+        // LIVE read: RMW step 1 -- pull the target 4-KiB block.
+        mov rdi, rbx;
+        mov rsi, r14;
+        mov rdx, 1;
+        lea rcx, [rip + _inode_write_scratch];
+        call nvme_read_blocking;
+        cmp rax, 0;
+        jne itw_torn;
+
+        // Splice 16 qwords (128 B) from inode_ptr into scratch + row_byte_offset.
+        lea r11, [rip + _inode_write_scratch];
+        add r11, r15;
+        mov rcx, 0;
+
+      itw_splice_top:
+        cmp rcx, 16;
+        jae itw_splice_done;
+        mov rax, [r13 + rcx * 8];
+        mov [r11 + rcx * 8], rax;
+        add rcx, 1;
+        jmp itw_splice_top;
+
+      itw_splice_done:
+        // LIVE write: RMW step 3 -- push the patched page back.
+        mov rdi, rbx;
+        mov rsi, r14;
+        mov rdx, 1;
+        lea rcx, [rip + _inode_write_scratch];
+        call bdev_write_at;
+        cmp rax, 0;
+        jne itw_torn;
+
+      itw_emit_fp:
+        // Load size = byte_len (u64 @ inode_ptr + 16 per 128-B row layout).
+        mov rax, [r13 + 16];
+
+        // klog_s1_x2(LEVEL_INFO=3, SUBSYS_FS__, tag_pdxb_inode_write_ok,
+        //            k_ino, ino, k_size, size).
+        //
+        // rsp%16==0 here (prologue's sub 8 + 6 pushes on entry rsp%16==8
+        // = 8+48+8 = 64). `sub rsp, 8; push size; call; add rsp, 16`
+        // pushes v2 into [rsp+8] as klog_s1_x2 expects and keeps rsp
+        // aligned across the call.
+        mov rdi, 3;                             // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_FS__];
+        lea rdx, [rip + tag_pdxb_inode_write_ok];
+        lea rcx, [rip + k_ino];
+        mov r8, r12;                            // v1 = ino
+        lea r9, [rip + k_size];
+        sub rsp, 8;                             // align pad before v2 push
+        push rax;                               // v2 = size
+        call klog_s1_x2;
+        add rsp, 16;                            // undo push + pad
+
+        xor eax, eax;
+        jmp itw_done;
+
+      itw_bad_index:
+        mov rax, 0xFFFFED18;
+        jmp itw_done;
+
+      itw_torn:
+        mov rax, 0xFFFFED11;
+
+      itw_done:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
         pop rbx;
         ret
       }

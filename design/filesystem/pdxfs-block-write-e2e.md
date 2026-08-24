@@ -1,18 +1,25 @@
 ---
-issue: 1783
+issue: 1783, 1784
 milestone: R55.M2 (pdxfs-block write path end-to-end)
 subsystem: filesystem / pdxfs-on-block v1
 topic: End-to-end write path for a fresh file on a pdxfs-block volume.
-       This landing (§Allocator) proves the extent-run first-fit
-       primitive that pdxfs_block_write (#1784) and its later siblings
-       (inode-table-write #1785, WAL #1786) will thread together into
-       the full write path.
+       Two landings so far: §Allocator (extent-run first-fit) and
+       §Inode-table-write (RMW of a 128-B inode row over bdev_write_at).
+       pdxfs_block_write and later siblings (WAL #1786) will thread
+       these primitives together into the full write path.
 touching:
   - src/kernel/core/fs/pdxfs/allocator.pdx      (extend: alloc_extent_run)
+  - src/kernel/core/fs/pdxfs/inode_table.pdx    (extend: inode_table_write
+                                                 + _inode_write_scratch)
+  - src/kernel/core/fs/pdxfs/bdev_write.pdx     (extend: bdev_write_at)
   - src/kernel/core/klog/keys.pdx               (extend: tag_pdxb_alloc_ok,
                                                  tag_pdxb_alloc_verify_ok,
-                                                 k_start_lba, k_len_lba)
+                                                 k_start_lba, k_len_lba,
+                                                 tag_pdxb_inode_write_ok,
+                                                 k_ino)
+  - tools/build.sh                              (confine _inode_write_scratch)
   - tests/r55/expected-r55-alloc.txt            (2-line spec golden)
+  - tests/r55/expected-r55-inode-write.txt      (1-line spec golden)
   - design/filesystem/pdxfs-block-write-e2e.md  (this doc)
 related:
   - src/kernel/core/fs/pdxfs/allocator.pdx      (alloc_block / free_block —
@@ -29,10 +36,11 @@ related:
 
 The pdxfs-block volume becomes writable in a fixed order of primitives:
 
-1. **§Allocator** (this landing, R55.M2-001 / #1783) — reserve a
-   contiguous run of data blocks and record the reservation on disk.
-2. **§Inode-table-write** (#1785, forward) — populate the inode row
-   with the reserved extent and durably write the row's bearer block.
+1. **§Allocator** (R55.M2-001 / #1783) — reserve a contiguous run of
+   data blocks and record the reservation on disk.
+2. **§Inode-table-write** (R55.M2-002 / #1784) — persist a 128-B inode
+   row into its 4-KiB bearer block via read-modify-write over
+   `bdev_write_at`.
 3. **§WAL** (#1786, forward) — carry the row + bitmap changes through
    the write-ahead log so a crash between (1) and (2) either replays
    both or neither.
@@ -40,9 +48,9 @@ The pdxfs-block volume becomes writable in a fixed order of primitives:
    bitmap-block writes across a burst of allocations into one physical
    write.
 
-Only §Allocator is landed in this doc's first cut. §Inode-table-write /
-§WAL / §Cache sections are added by their own issues; the doc is the
-composition point.
+Landed so far: §Allocator (R55.M2-001) and §Inode-table-write
+(R55.M2-002). §WAL / §Cache sections are added by their own issues;
+the doc is the composition point.
 
 ## §Allocator — extent-run first-fit (#1783)
 
@@ -222,3 +230,194 @@ after `bdev_barrier_write` and the verify loop both succeed.
   cannot express. A widening at M4+ could add an extent-aware
   free-stack; the ceiling-8 posture makes this a low-value optimization
   until the run length is uncapped.
+
+## §Inode-table-write — RMW over bdev_write_at (#1784)
+
+### Signature
+
+```
+inode_table_write(nsid: u64,
+                  sb_ptr: u64,
+                  ino: u64,
+                  inode_ptr: u64) -> u64
+```
+
+- `nsid` — the NVMe namespace id for the target volume. Threaded
+  through to `nvme_read_blocking` (RMW read) and `bdev_write_at`
+  (RMW write) unchanged. The R55 posture is a single-namespace boot
+  (`nsid == 1`); a widening to multi-namespace lands with volume
+  registry (KIND_VOLUME, R52.M5).
+- `sb_ptr` — pointer to the caller-held superblock image. Read (once
+  each) by `sb_itable_lba(sb_ptr)` and `sb_itable_bcount(sb_ptr)`;
+  never mutated. Unlike `inode_write` (R52.M4-002, #1698), this path
+  does NOT consult the cached `_itable_state` fields — the fresh
+  read makes the function safe to call on a boot where `itable_init`
+  has not run.
+- `ino` — inode number (linear index into the on-disk inode table;
+  0 is the permanent invalid-inode sentinel, but the R55 landing
+  refuses only the block-out-of-bounds case — a caller that writes
+  to `ino == 0` gets no error, mirroring `inode_write`'s own
+  header-only guard). Bound-checked against `sb_itable_bcount`.
+- `inode_ptr` — pointer to the caller-owned 128-byte inode row that
+  will be spliced into ino's slot. The caller is responsible for
+  the row's contents (`in_use`, `mtime`, `byte_len`, `extent[0]`,
+  etc.); this function only persists whatever it is handed.
+
+Returns 0 on success, or one of `INODE_INVALID_INDEX` (0xFFFFED18) /
+reused `ALLOC_BITMAP_TORN` (0xFFFFED11 — allocator.pdx's M3 band,
+reused per the file's own gap 4 for every BDEV I/O failure in this
+file).
+
+### Signature note (u16 vs u64)
+
+The ticket text names the return type `-> u16`. Every other function
+in `inode_table.pdx` returns u64, and the two failure sentinels
+(`0xFFFFED18`, `0xFFFFED11`) do not fit in u16. Landed as `-> u64`;
+the ticket's `u16` is treated as a typo. Softarch should confirm
+before any wider caller-side ABI locks it in.
+
+### RMW pattern
+
+The inode row is 128 B; the on-disk inode table packs 32 rows into
+one 4-KiB block. Writing at a byte offset within a block requires
+read-modify-write:
+
+1. Bounds check: `(ino / 32) < sb_itable_bcount(sb_ptr)` else
+   `INODE_INVALID_INDEX`.
+2. Compute the target LBA and in-block byte offset (see LBA math).
+3. **Substrate branch** on `_nvme_io_queue_count`:
+   - `== 0` (every QEMU-TCG `-kernel` boot today): skip both read
+     and write; jump directly to fingerprint emit. Rationale: the
+     same guard `nvw_batch_flush`'s own LIVE-vs-SUBSTRATE split
+     enforces — calling `nvme_read_blocking`/`nvme_write_blocking`
+     with no live sq_pa would DMA into page 0 (boot-critical
+     hazard). The fingerprint still fires so caller-side witnesses
+     that run in substrate posture (which is every witness that
+     runs today) can observe the write attempt.
+   - `> 0` (LIVE): steps 4–6 below.
+4. `nvme_read_blocking(nsid, target_lba, count=1,
+   buf_pa=&_inode_write_scratch)` — pull the full 4-KiB block into
+   the RMW scratch. Non-zero CQE → `ALLOC_BITMAP_TORN`. Preserves
+   the other 31 rows in the block.
+5. Splice 16 qwords (128 B) from `inode_ptr` into
+   `&_inode_write_scratch + row_byte_offset`. Manual loop; no
+   `rep movsq` precedent in this codebase.
+6. `bdev_write_at(nsid, target_lba, count=1,
+   buf_pa=&_inode_write_scratch)` — push the patched page back.
+   Non-zero forwarded status → `ALLOC_BITMAP_TORN`.
+7. Emit fingerprint (see below).
+
+### LBA math
+
+```
+block_idx      = ino / 32                            (safe imm8 shr 5)
+target_lba     = sb_itable_lba(sb_ptr) + block_idx
+slot_in_block  = ino % 32                            (safe imm and 31)
+row_byte_offset = slot_in_block * 128                (safe imm shl 7)
+```
+
+`sb_itable_lba` is read fresh on every call. This matches
+`inode_write` (R52.M4-002)'s own resolver arithmetic (`inode_read` /
+`inode_write` / `inode_scrub_slot` all compute the same block_idx /
+row_byte_offset inline; the public `inode_resolve` symbol exists but
+is not called through — see `inode_table.pdx` "Design-doc gaps" item
+5). The R55 landing mirrors that inline arithmetic rather than
+threading through `inode_resolve` (whose packing loses the
+row_byte_offset).
+
+### Fingerprint (wire — one line per successful call)
+
+Emitted via `klog_s1_x2` inside `inode_table_write` on the success
+path (both LIVE and SUBSTRATE), LEVEL_INFO / SUBSYS_FS__:
+
+```
+pdxb inode write ok [legacy: PDXB INODE WRITE OK] ino=0x0000000000000002 size=0x000000000000000d
+```
+
+- Two k=v pairs: `ino` (from the caller's argument) and `size` (the
+  `byte_len` u64 at row offset +16 per the 128-B layout).
+- Two-in-one bracketed legacy suffix (`[legacy: PDXB INODE WRITE OK]`)
+  matches the R51 Phase C option-B shape `tag_pdxb_bdev_flush_ok` /
+  `tag_pdxb_alloc_ok` already established in this file family.
+- `k_size` reuses the R21 batch-4 XSAVE key (`"size\0"`, `[u8; 5]`);
+  it is a plain generic key with no XSAVE-specific semantics.
+- The tag contains an `OK` token per `verify-fingerprint-coverage.sh`'s
+  `OK_TOK` regex (space before, `]` after — both non-alnum).
+- Byte counts: `tag_pdxb_inode_write_ok` = 49 chars + NUL = 50 bytes;
+  `k_ino` = 3 chars + NUL = 4 bytes.
+
+Golden row at `tests/r55/expected-r55-inode-write.txt` names one line
+as a prefix substring (the `covered_by` check accepts the
+substring-either-way match `marker.startswith(a) or
+a.startswith(marker)`).
+
+Failure paths (bad `ino`, `nvme_read_blocking` non-zero,
+`bdev_write_at` non-zero) return the appropriate sentinel WITHOUT
+emitting the fingerprint.
+
+### bdev_write_at helper (why not extend nvw_submit?)
+
+The ticket text reads "uses `bdev_write` (R54.M1-002)". Two options
+were considered:
+
+**(a)** Add `bdev_write_at(nsid, lba, count, buf_pa) -> u64` in
+`bdev_write.pdx` that directly forwards to `nvme_write_blocking`
+(with a substrate guard on `_nvme_io_queue_count`, mirroring
+`nvw_batch_flush`'s own LIVE-vs-SUBSTRATE branch).
+
+**(b)** Widen `nvw_submit`'s per-entry format from 4 u64s to include
+a caller-supplied `buf_pa`, and iterate `nvw_batch_flush` over that
+new field instead of the hardwired `_nvw_flush_scratch` page.
+
+**(a) picked.** (b) re-opens the `_nvw_sq` scaffold format at a
+moment when no caller yet needs the batching semantic for its RMW
+writes; the sole R55 caller (`inode_table_write`) drives writes
+synchronously (RMW: read, patch, write, emit — all in-line) and the
+batching abstraction would be dead weight. (a) is one leaf function
+(zero prologue-saved registers; direct forward of rdi/rsi/rdx/rcx
+into `nvme_write_blocking`) that mirrors `nvw_batch_flush`'s
+substrate posture without duplicating the accounting `_nvw_state`
+maintains. A widening's async caller orchestration is free to land
+(b) later without disturbing (a) — the two helpers describe distinct
+posture (direct-submit vs accumulated-flush).
+
+### Confined state
+
+- `_inode_write_scratch : [u64; 512] @align(4096)` — 4 KiB RMW
+  scratch page. Sole writer is `inode_table_write` itself (RMW read
+  populates it, splice patches it, write consumes it). Confined at
+  build time via `tools/build.sh`'s `ec_confine_one` to
+  `core/fs/pdxfs/inode_table.o`. Page-aligned per NVMe PRP1's
+  single-page-transfer requirement (drivers/nvme/sync.pdx §5.11).
+
+Distinct from the existing `_itable_blk_buf` above: that page is
+owned by the resident-block cache path (R52.M4-002's
+`itable_ensure_block_loaded` / `inode_read` / `inode_write` /
+`inode_alloc_fresh` / `inode_scrub_slot`, all of which go through
+`bdev_barrier_write`). `_inode_write_scratch` is used only by
+`inode_table_write`'s `bdev_write_at`-routed path, and never touches
+the resident-block cache — `inode_table_write` does NOT stamp
+`loaded_block_idx` or otherwise mutate `_itable_state`, so a
+subsequent `itable_ensure_block_loaded` on the same block will
+re-read from disk (and that reread will see the write
+`inode_table_write` just committed).
+
+### What §Inode-table-write does NOT prove
+
+- **Multi-row batching.** Each call is one 4-KiB read + one 4-KiB
+  write. A caller that stamps N inodes in a burst pays N read-write
+  round-trips, even when all N share a single 4-KiB block. The
+  §Cache milestone (later) will fold identical writes.
+- **Journal ordering.** `bdev_write_at` records nothing in the
+  write-ahead log; a crash between the inode-row write and any
+  companion bitmap / directory write leaves an inconsistency the
+  WAL landing (#1786) will make atomic.
+- **Extent widening.** The caller supplies the full 128-B row; this
+  function does not compute or stamp `extent[i]` slots. Extent
+  orchestration (multi-slot large-file writes) lands in
+  `pdxfs_block_write`.
+- **Row-format validation.** No `in_use` / `refcount` /
+  `content_hash` sanity check on the caller-supplied row. The
+  companion `inode_read` (R52.M4-002) does an `in_use` header check
+  on readback; `inode_table_write` trusts the caller (a wider
+  posture matching `inode_write`'s "splice-copy-then-write" shape).
