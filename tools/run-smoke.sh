@@ -925,6 +925,36 @@ case "${EXPECTED}" in
         echo "smoke: boot_r25_pdxfs_e2e — SKIP (witness not wired at R25.M7; live E2E deferred to R26+ per tools/pdxfs-lite-e2e-smoke.md — chained on #906 nvme_write_blocking + driver-attach)"
         exit 0
         ;;
+    boot_r54_nvme_write)
+        # R54.M1-001 (#1778): opt-in nvme_write_blocking (OPC=0x01)
+        # round-trip witness, gated by PAIDEIA_R54_NVME_WRITE=1.
+        #
+        # The witness at src/kernel/boot/witness/r54_nvme_write.pdx
+        # (symbol r54_nvme_write_witness) is NOT wired into
+        # kernel_main at R54.M1 — same posture as pdxfs_lite_e2e_
+        # witness at R25.M7 close and concurrent_io_witness at
+        # R24.M6 close: symbol existence + build-time link
+        # verification are the R54.M1 acceptance criterion, live
+        # invocation is deferred to R55+ when the driver-attach
+        # ceremony surfaces a real NVMe controller on the default
+        # boot path (blocked on the same #1015 userspace-server
+        # substrate as #820 acpi_supervisor / #860 pci_enumerator).
+        #
+        # Under -kernel the witness itself takes its SKIP branch
+        # (_nvme_io_queue_count == 0 because nvme_probe drains
+        # empty under absent MCFG), but at R54.M1 there is no boot-
+        # path caller wired. This SKIP-echo mode keeps the pre-push
+        # env-gate callable so PAIDEIA_R54_NVME_WRITE=1 does not
+        # abort the push.
+        #
+        # When the driver-attach ceremony wires r54_nvme_write_
+        # witness into kernel_main behind PAIDEIA_R54_NVME_WRITE
+        # gating, this mode flips to FINGERPRINT_MODE=1 against
+        # tests/r54/expected-r54-nvme-write.txt (three lines: probe
+        # banner, "NVME WRITE OK", "NVME READBACK OK").
+        echo "smoke: boot_r54_nvme_write — SKIP (witness not wired at R54.M1; live round-trip deferred to R55+ per design/kernel/nvme-write-blocking.md — chained on driver-attach + real NVMe controller on default boot path)"
+        exit 0
+        ;;
     boot_r31_spawn_pair)
         # R31.M2-1590 (#1590): loader-side multi-task boot spawn — the
         # first time this kernel runs a userspace server as a distinct

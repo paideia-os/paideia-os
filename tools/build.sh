@@ -5806,6 +5806,34 @@ fi
 echo "[r51-m2-confine] R51.M2 (KIND_NVME_NAMESPACE) confined"
 
 # ---------------------------------------------------------------------------
+# R54.M1-001 (#1778): one-writer discipline for the nvme_write_blocking
+# stats counter.
+#
+# _nvme_write_stats is bumped by nvme_write_blocking (src/kernel/core/
+# drivers/nvme/sync.pdx) after a successful SQE-fill + before the busy-
+# wait, and by nothing else. A second writer would let a supervisor forge
+# submission counts (fabricating "we wrote it, honest" evidence GDB /
+# future observers rely on) with no capability involved. The shared read
+# path allocator (_nvme_next_cid + _nvme_requests) is intentionally
+# multi-writer (irq.pdx completes both directions), so this counter is
+# the one write-only surface unique to the write half; confining it
+# preserves the R54.M1 posture that write submissions are a distinct,
+# audit-able event class.
+R54_NVME_SYNC_SRC="${REPO_ROOT}/src/kernel/core/drivers/nvme/sync.pdx"
+if [[ ! -f "${R54_NVME_SYNC_SRC}" ]]; then
+    echo "[r54-m1-confine] FAIL - drivers/nvme/sync.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_nvme_write_stats' 'core/drivers/nvme/sync.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See drivers/nvme/sync.pdx (nvme_write_blocking justification)" >&2
+    echo "  for the sole-writer discipline (bumped once per submission, no" >&2
+    echo "  other module touches it)." >&2
+    exit 1
+fi
+echo "[r54-m1-confine] R54.M1 (nvme_write_blocking stats) confined"
+
+# ---------------------------------------------------------------------------
 # R52.M2-001 (#1686): one-writer discipline for the PdxFS-on-block
 # superblock-read scratch state.
 #
