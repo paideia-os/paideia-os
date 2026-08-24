@@ -133,3 +133,34 @@ directions).
   (mdts.pdx) — R55+ work.
 - Concurrent write throughput (deferred with the M5 bitmap
   allocator to the same #1015 milestone as the userspace half).
+
+## 9. Regression — `PAIDEIA_R54_DISK=1` pre-push gate (#1781)
+
+`.githooks/pre-push` carries an opt-in gate mirroring
+`PAIDEIA_R53_DISK=1`. When set, the hook runs
+`bash tools/run-smoke.sh boot_r54_bdev_round_trip` which drives
+the two-phase orchestrator: phase 1 wipes + mkfs the disk image,
+boots the kernel to write `0xDEADBEEFCAFEBABE` at LBA 16 via
+`nvme_write_blocking` and clean umount; phase 2 boots again
+(image preserved), `nvme_read_blocking`s the same LBA, and
+`cmp`s against the pattern. Distinct from the R53 gate — R53
+exercises the pdxfs write path, R54 exercises the raw block
+submit path.
+
+Off by default so unrelated pushes are not gated on the disk
+posture. Preflight probes `tools/mkfs-pdxb.sh` and skips with a
+guidance line if the paideia-as #1730 binary is not built yet
+(same posture as R53) — the smoke cannot even reach the boot
+phase without a real image, and a hard failure on that state
+would gate every push on a condition that only clears when #1730
+lands.
+
+Fingerprints (contains-in-order, one per phase golden):
+
+- Phase 1: `pdxb bdev round-trip write ok — lba=16 payload=deadbeefcafebabe [legacy: PDXB BDEV WROTE OK]`
+- Phase 2: `pdxb bdev round-trip readback ok — lba=16 match=1 [legacy: PDXB BDEV READBACK OK]`
+
+The `match=1` line is control-flow-gated on the compare succeeding
+(mismatch jumps to a `pdxb bdev round-trip fail` klog tag before
+reaching the ok-tag emit site) — the static `match=1` string is not
+theatre.
