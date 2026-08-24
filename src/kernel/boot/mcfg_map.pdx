@@ -1,0 +1,229 @@
+// src/kernel/boot/mcfg_map.pdx — boot-mmio-mapping step 5
+//
+// platform_map_mcfg_segments: post-ACPI pass that walks the ACPI-discovered
+// PCIe ECAM windows in Mcfg._mcfg_segments and installs kernel-VA mappings
+// via platform_mmio_map before any PCI consumer (pci_enumerate_all,
+// pci_publish_caps, per-driver probe) touches config space.
+//
+// Design memo: design/kernel/boot-mmio-mapping.md (§3 step 5)
+//
+// ==============================================================================
+// Why post-ACPI (Option B in the softarch brief)
+// ==============================================================================
+//
+// The three firmware-fixed windows (HPET / xAPIC / IOAPIC) are constants
+// known at kernel-image link time and pre-mapped by platform_map_early_mmio
+// immediately after pat_init_this_cpu. MCFG bases are ACPI-discovered —
+// they only become available after phase1_acpi_gather (kernel_main.pdx
+// L316) has parsed the XSDT and populated Mcfg._mcfg_segments +
+// Mcfg._mcfg_count. So MCFG cannot ride the "early" manifest; it needs a
+// separate pass that runs after phase1_acpi_gather and before the first
+// PCI config-space touch (pci_enumerate_all at kernel_main.pdx L360).
+//
+// Option A (extend platform_map_early_mmio with an MCFG row) fails on
+// ordering: early runs at L155, phase1_acpi_gather at L316 — the MCFG base
+// is 0 at early-time. Option C (lazy per-first-access map inside
+// pci_config_read_u32) works but scatters the map call across every reader
+// path, defeats the "map at boot before consumers" invariant, and turns
+// the first PCI access on every driver into an aspace_map slowpath. Option
+// B — a single deterministic pass at kernel_main scope — matches the
+// discipline established for HPET/xAPIC/IOAPIC in step 2.
+//
+// ==============================================================================
+// Per-segment size computation
+// ==============================================================================
+//
+//   size_bytes = (end_bus - start_bus + 1) * 256 * 4096
+//              = (end_bus - start_bus + 1) << 20
+//
+// One PCIe bus consumes 32 device × 8 function × 4096-byte config = 1 MiB
+// of ECAM window (PCI Firmware Spec 3.3 §4.1.2). QEMU q35 publishes a
+// single segment covering bus 0..0xFF → 256 MiB at 0xE0000000. Real
+// hardware may segment differently (2-socket EPYC: 2 segments × 128 buses;
+// Ampere Altra Max: 2 segments × 256 buses); the (end - start + 1) form
+// handles every layout uniformly.
+//
+// The full range lands inside the boot huge-page identity map on QEMU q35
+// under -kernel PVH ([0, 4 GiB) covers 0xE0000000..0xF0000000), so the
+// first aspace_map iteration inside platform_mmio_map returns MAP_HUGE
+// and the wrapper takes the identity-VA fallback (returns pa_base
+// unchanged). On UEFI/T14 with an MCFG base outside the identity window
+// the range is mapped genuinely into PML4[321]. Either way the returned
+// VA is stored in the segment record's ioremap slot at record+16, and
+// mcfg_ecam_va_for_segment(seg) hands it back to pci_config_read_u32 /
+// pci_config_write_u32.
+//
+// ==============================================================================
+// Record layout reminder (mcfg.pdx L36 ff. — 24-byte ecam_segment)
+// ==============================================================================
+//
+//   +0  u64 base_pa       — verbatim from MCFG
+//   +8  u16 segment       — verbatim from MCFG
+//   +10 u8  start_bus     — verbatim from MCFG
+//   +11 u8  end_bus       — verbatim from MCFG
+//   +12 u32 _pad          — zero
+//   +16 u64 _pad2         — this pass writes kernel_va here (was
+//                           reserved by mcfg.pdx for "R22 refcount /
+//                           ioremap slot"; step 5 lands the ioremap use)
+//
+// ==============================================================================
+// _mcfg_count == 0 handling
+// ==============================================================================
+//
+// Under `qemu -kernel` PVH boot the boot_env is unavailable; the ACPI
+// discovery path falls back to the legacy EBDA scan (acpi_find_rsdp with
+// env=0). QEMU q35 / i440fx do publish the RSDP under -kernel so the
+// common case populates _mcfg_count with a nonzero N. But on any path
+// where the fallback yields no RSDP (or MCFG is absent from the XSDT),
+// phase1_acpi_gather leaves _mcfg_count=0 — the loop iterates zero times
+// and the fingerprint reports "MCFG MAPPED N=0" cleanly. pci_config_read_u32
+// then falls back to the base_pa slot (which is also 0) and returns the
+// 0xFFFFFFFF absence sentinel per its own contract.
+//
+// ==============================================================================
+// Register discipline
+// ==============================================================================
+//
+// 5-push callee-save prologue (rbx, r12, r13, r14, r15) — from entry
+// rsp%16==8, five pushes land rsp%16==0 for the nested platform_mmio_map
+// and klog_s1_d1 calls. Layout:
+//
+//   rbx = loop index (i, 0.._mcfg_count)
+//   r12 = success count (bumped once per non-zero platform_mmio_map return)
+//   r13 = _mcfg_count (loaded once at entry; loop cap)
+//   r14 = &_mcfg_segments (loaded once via lea)
+//   r15 = current record VA (recomputed each iteration; preserved
+//         across the nested platform_mmio_map call so the post-call
+//         store to record+16 has a stable base)
+//
+// ==============================================================================
+// Instruction floor
+// ==============================================================================
+//
+//   push/pop, mov reg,reg, mov reg,imm32, lea r64,[rip+sym],
+//   mov r64,[rip+sym], mov [reg+imm8],r64, xor / add / sub / shl r64,imm8,
+//   mov_b r64,[reg+imm8] (zero-extend, G4-safe), cmp / je / jae / jne / jmp,
+//   call rel32, ret — all in paideia-as v0.11.0+ baseline (matches
+//   mcfg.pdx and mmio_init.pdx precedent).
+
+module McfgMap = structure {
+
+  // ==========================================================================
+  // platform_map_mcfg_segments — walk _mcfg_segments and install VA mappings
+  // ==========================================================================
+  //
+  // Called from kernel_main_64 immediately after phase1_acpi_gather
+  // (kernel_main.pdx L316) and before pci_enumerate_all (L360). Returns
+  // the count of successful maps (0.._mcfg_count) in rax.
+  //
+  // On each segment: compute size from (end_bus - start_bus + 1) << 20,
+  // call platform_mmio_map(base_pa, size, MMIO_UC=0), store the returned
+  // VA at record+16 (the ioremap slot). Zero-return from platform_mmio_map
+  // is a hard failure — the record's ioremap slot stays 0 and
+  // mcfg_ecam_va_for_segment falls back to base_pa for that segment.
+  //
+  // Fingerprint: klog_s1_d1(INFO, MM__, tag_mcfg_mapped, k_n, count).
+  // ==========================================================================
+  pub let platform_map_mcfg_segments : () -> u64 !{mem, sysreg} @{boot} =
+    fn () -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { boot },
+      justification: "boot-mmio-mapping step 5 (design/kernel/boot-mmio-mapping.md §3 step 5). Post-ACPI pass that walks Mcfg._mcfg_segments[0.._mcfg_count) — the segment records populated by phase1_acpi_gather at kernel_main.pdx L316 — and installs one kernel-VA mapping per segment via platform_mmio_map. Per-segment size = (end_bus - start_bus + 1) << 20 bytes (256 devices × 8 functions × 4096 bytes = 1 MiB per bus per PCI Firmware Spec 3.3 §4.1.2); QEMU q35 single-segment layout yields 256 MiB at 0xE0000000 for bus 0..0xFF, which lands inside the boot huge-page identity map so platform_mmio_map's MAP_HUGE first-iteration branch returns pa_base (identity-VA fallback) rather than mapping every 4-KiB page. On UEFI/T14 with an MCFG base outside [0, 4 GiB) the range is mapped genuinely into PML4[321]. Return value: number of segments successfully mapped (nonzero platform_mmio_map return). Register discipline: 5-push callee-save prologue (rbx=loop index, r12=success count, r13=_mcfg_count loop cap, r14=&_mcfg_segments base, r15=current record VA) — from entry rsp%16==8, five pushes land rsp%16==0 for the nested platform_mmio_map and klog_s1_d1 calls. r15 (current record VA) is preserved across each platform_mmio_map call so the post-call `mov [r15+16], rax` store lands in the right record's ioremap slot. Per iteration: (1) cmp rbx, r13; jae exit_loop. (2) Compute record VA = _mcfg_segments + rbx*24 using the 24 = 8+16 shift trick (rax=rbx*8 + rbx*16 = rbx*24), same pattern as mcfg_ecam_base_for_segment and mcfg_parse_segments. (3) Load base_pa (u64 @ +0) into rdi. (4) Load start_bus / end_bus (u8 @ +10 / +11) via xor+mov_b zero-extend. (5) Compute bus_count = end_bus - start_bus + 1 (u64 arithmetic; unsigned diff is safe because end_bus >= start_bus per MCFG spec — a malformed table with end<start would produce a huge underflowed size but the aspace_map loop bails on failure so the worst case is _mmio_map_stats[2] bump + zero return + fingerprint N < total). (6) size = bus_count << 20 in rsi. (7) rdx = 0 (MMIO_UC). (8) call platform_mmio_map. (9) mov [r15 + 16], rax — write the returned VA (or 0 on failure) into the record's ioremap slot; mcfg_ecam_va_for_segment reads this slot next. (10) cmp rax, 0; je no_incr; add r12, 1. (11) add rbx, 1; jmp loop. On exit: klog_s1_d1(3=INFO, SUBSYS_MM__, tag_mcfg_mapped, k_n, r12=count) — SUBSYS_MM__ parallels the platform_map_early_mmio fingerprint. Return r12 in rax. Under `qemu -kernel` PVH boot where acpi_find_rsdp yields 0 (or MCFG absent from XSDT) phase1_acpi_gather leaves _mcfg_count=0; the loop iterates zero times, r12 stays 0, and the fingerprint reports 'MCFG MAPPED N=0' cleanly. pci_config_read_u32 then falls back to the base_pa slot (also 0 for those segments) and returns the 0xFFFFFFFF absence sentinel per its own contract. Instruction floor: push/pop, mov reg,reg, mov reg,imm32, lea r64,[rip+sym], mov r64,[rip+sym], mov [reg+imm8],r64, xor / add / sub / shl r64,imm8, mov_b r64,[reg+imm8] (zero-extend), cmp / je / jae / jne / jmp, call rel32, ret — all in paideia-as v0.11.0+ baseline (matches mcfg.pdx and mmio_init.pdx precedent).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // rbx = 0 (loop index).
+        xor rbx, rbx;
+
+        // r12 = 0 (success count).
+        xor r12, r12;
+
+        // r13 = _mcfg_count (loaded once).
+        mov r13, [rip + _mcfg_count];
+
+        // r14 = &_mcfg_segments (loaded once).
+        lea r14, [rip + _mcfg_segments];
+
+        // Fast-path skip: if _mcfg_count == 0 (PVH no-MCFG path or
+        // absent-from-XSDT), jump straight to the fingerprint emit with
+        // r12 still 0 so the log shows 'MCFG MAPPED N=0'.
+        cmp r13, 0;
+        je mcfg_map_done;
+
+      mcfg_map_loop:
+        cmp rbx, r13;
+        jae mcfg_map_done;
+
+        // record VA = _mcfg_segments + rbx * 24 (= rbx*8 + rbx*16)
+        mov rax, rbx;
+        shl rax, 3;                              // rbx * 8
+        mov r11, rax;
+        mov rax, rbx;
+        shl rax, 4;                              // rbx * 16
+        add rax, r11;                            // rax = rbx * 24
+        mov r15, r14;
+        add r15, rax;                            // r15 = record VA
+
+        // rdi = base_pa (u64 @ record+0)
+        mov rdi, [r15 + 0];
+
+        // rax = start_bus (u8 @ record+10), zero-extended
+        xor rax, rax;
+        mov_b rax, [r15 + 10];
+        mov rcx, rax;                            // rcx = start_bus
+
+        // rax = end_bus (u8 @ record+11), zero-extended
+        xor rax, rax;
+        mov_b rax, [r15 + 11];
+
+        // bus_count = end_bus - start_bus + 1 (in rax)
+        sub rax, rcx;
+        add rax, 1;
+
+        // size = bus_count << 20 (in rsi)
+        shl rax, 20;
+        mov rsi, rax;
+
+        // cache_type = MMIO_UC = 0
+        xor rdx, rdx;
+
+        // call platform_mmio_map(pa, size, MMIO_UC)
+        call platform_mmio_map;
+
+        // Store returned VA (or 0 on failure) in record+16 (ioremap slot).
+        mov [r15 + 16], rax;
+
+        // Success accounting: bump r12 if platform_mmio_map returned nonzero.
+        cmp rax, 0;
+        je mcfg_map_no_incr;
+        add r12, 1;
+      mcfg_map_no_incr:
+
+        add rbx, 1;
+        jmp mcfg_map_loop;
+
+      mcfg_map_done:
+        // Fingerprint: klog_s1_d1(INFO, MM__, tag_mcfg_mapped, k_n, count).
+        mov rdi, 3;                              // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_MM__];
+        lea rdx, [rip + tag_mcfg_mapped];
+        lea rcx, [rip + k_n];
+        mov r8, r12;                             // v1 = count
+        call klog_s1_d1;
+
+        // Return count in rax.
+        mov rax, r12;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
