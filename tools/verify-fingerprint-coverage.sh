@@ -168,6 +168,15 @@ ALLOWLIST = {
     "XSAVE SYNTH OK":
         "tests/kernel/cpu/xsave_synth.pdx — needs QEMU_CPU=max (PAIDEIA_R21_YMM opt-in)",
 
+    # tests/kernel/nvme/kind_nvme_io_queues_synth.pdx — witness call
+    # gated pending boot-mmio-mapping migration step 6 (memo: design/
+    # kernel/boot-mmio-mapping.md). Real bar0 MMIO under substrate
+    # boot faults; the witness call in witness/r30_platform.pdx is
+    # nop'd until the driver is converted to platform_mmio_map.
+    "KIND_NVME_IO OK":
+        "gated pending boot-mmio-mapping migration step 6 (memo: "
+        "design/kernel/boot-mmio-mapping.md); nop'd in r30_platform.pdx.",
+
     # src/tools/mkfs-pdxb/main.pdx — userspace mkfs-pdxb binary's
     # success line (#1730). Not reachable from any QEMU boot mode: the
     # kernel does not exec mkfs-pdxb, and no host-tools build target is

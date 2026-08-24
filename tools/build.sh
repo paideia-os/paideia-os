@@ -9232,6 +9232,41 @@ hda_sv_pin_one 'pub let hda_sof_verify_dual_is_ok : (u64) -> u64'
 hda_sv_pin_one 'pub let hda_sof_verify_arbitrated : () -> u64'
 echo "[hda-sof-verify-confine] dual-sig seam arities pinned"
 
+# =============================================================================
+# boot-mmio-mapping step 1 + 2 (design/kernel/boot-mmio-mapping.md).
+#
+# The MMIO mapper (src/kernel/core/mm/mmio_map.pdx) owns the higher-half
+# device-MMIO VA window at PML4[321] and its two pieces of module state:
+# a bump-cursor for VA allocation and a four-slot counter array. Both
+# have exactly one legitimate writer (platform_mmio_map itself). A second
+# writer to _mmio_va_next could hand two different callers overlapping
+# VAs — the first-fit collision would be discovered only when the second
+# aspace_map call returned MAP_OVERLAP, i.e. after both drivers already
+# believed they owned the window. A second writer to _mmio_map_stats
+# would let a subsystem forge success or hide a failure the operator
+# would otherwise see in the "PLATFORM MMIO EARLY OK N=<n>" fingerprint.
+#
+# The three mapped-VA slots owned by src/kernel/boot/mmio_init.pdx are
+# populated exactly once by platform_map_early_mmio and (in later memo
+# steps) read by the HPET / xAPIC / IOAPIC drivers through a getter
+# rather than by naming the raw symbol. Until those getters land, the
+# owner list is mmio_init.o alone; the confinement will be relaxed to
+# include the reader modules when each driver conversion (memo §3
+# step 3+) lands.
+ec_confine_one '_mmio_va_next'    'core/mm/mmio_map.o'
+ec_confine_one '_mmio_map_stats'  'core/mm/mmio_map.o'
+ec_confine_one '_hpet_mmio_va'    'boot/mmio_init.o'
+ec_confine_one '_xapic_mmio_va'   'boot/mmio_init.o'
+ec_confine_one '_ioapic_mmio_va'  'boot/mmio_init.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See src/kernel/core/mm/mmio_map.pdx for the single-writer" >&2
+    echo "  discipline on the MMIO VA cursor and its counters, and" >&2
+    echo "  src/kernel/boot/mmio_init.pdx for the three firmware-fixed" >&2
+    echo "  mapped-VA slots." >&2
+    exit 1
+fi
+echo "[mmio-confine] MMIO VA cursor, counters and early-manifest slots confined"
+
 
 OBJECTS=( "${BOOT_STUB_OBJ}" "${USERBIN_OBJ}" "${AP_TRAMP_EMBED_OBJ}" "${AP_TRAMP_OFF_OBJ}" "${OBJECTS[@]}" )
 
