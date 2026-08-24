@@ -9256,8 +9256,8 @@ echo "[hda-sof-verify-confine] dual-sig seam arities pinned"
 ec_confine_one '_mmio_va_next'    'core/mm/mmio_map.o'
 ec_confine_one '_mmio_map_stats'  'core/mm/mmio_map.o'
 ec_confine_one '_hpet_mmio_va'    'boot/mmio_init.o core/time/hpet.o'
-ec_confine_one '_xapic_mmio_va'   'boot/mmio_init.o core/apic/eoi.o core/apic/tpr.o core/apic/self_ipi.o core/apic/lapic_timer.o core/apic/tsc_deadline.o core/apic/init_sipi.o core/apic/ipi.o'
-ec_confine_one '_ioapic_mmio_va'  'boot/mmio_init.o core/apic/ioapic.o core/apic/ioapic_route.o'
+ec_confine_one '_xapic_mmio_va'   'boot/mmio_init.o core/apic/eoi.o core/apic/tpr.o core/apic/self_ipi.o core/apic/lapic_timer.o core/apic/tsc_deadline.o core/apic/init_sipi.o core/apic/ipi.o core/smp/ap_entry.o boot/witness/r17_init_sched.o'
+ec_confine_one '_ioapic_mmio_va'  'boot/mmio_init.o core/apic/ioapic.o core/apic/ioapic_route.o tests/kernel/apic/ioapic_reroute_synth.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then
     echo "  See src/kernel/core/mm/mmio_map.pdx for the single-writer" >&2
     echo "  discipline on the MMIO VA cursor and its counters, and" >&2
