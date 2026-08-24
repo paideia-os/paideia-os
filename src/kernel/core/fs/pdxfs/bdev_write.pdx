@@ -1,5 +1,6 @@
 // src/kernel/core/fs/pdxfs/bdev_write.pdx -- R42.M5-001 (#1396)
 // Renamed from nvme_write.pdx -- R51.M7-005 (#1673)
+// R54.M1-002 (#1779): nvw_batch_flush real submit path over nvme_write_blocking
 //
 // PDXFS v1 -- NVMe WRITE PATH INTEGRATION.
 //
@@ -13,14 +14,37 @@
 // crosses THIS module, so no caller can hand-roll a submission that
 // bypasses the WAL fsync + refcount gates the sibling modules maintain.
 //
-// It is a SCAFFOLD (D7). Submission Queue entries are accumulated in a
-// small BSS ring; a batch is "flushed" by a call that moves entries
-// from the pending band into the submitted band and bumps the
-// submit_count. Completions are modelled by a per-cid ack that moves
-// entries out of the submitted band into the completed band. The
-// widening replaces the pending/submitted bands with a real NVMe SQ /
-// CQ pair and the ack with the driver interrupt handler that reads
-// the CQE, freeing the cid.
+// It is a SCAFFOLD (D7) THAT NOW OWNS A REAL SUBMIT PATH (R54.M1-002 /
+// #1779). Submission Queue entries are accumulated in a small BSS ring
+// by nvw_submit as before. A batch is "flushed" by nvw_batch_flush,
+// which now branches on whether a live NVMe IO SQ pair exists
+// (_nvme_io_queue_count > 0):
+//
+//   - LIVE PATH: for each PENDING entry, calls nvme_write_blocking(nsid=1,
+//     lba, count=1, buf_pa=&_nvw_flush_scratch) directly (drivers/nvme/
+//     sync.pdx, R54.M1-001 / #1778). Marks entry SUBMITTED only when the
+//     call returns status == 0. Status non-zero leaves the entry PENDING
+//     and does not bump submitted_count for it (a subsequent flush will
+//     retry).
+//
+//   - SUBSTRATE PATH (_nvme_io_queue_count == 0, every QEMU-TCG -kernel
+//     boot mode: MCFG absent -> _pci_device_count == 0 -> _nvme_device_
+//     count == 0 even with `-device nvme` per drivers/nvme/probe.pdx's
+//     drain-empty guard): preserves the pre-R54.M1-002 scaffold
+//     behavior (mark PENDING -> SUBMITTED without calling the driver)
+//     so existing witnesses (nvme_write_synth, concurrent_stress_synth,
+//     durability tests) that run in substrate posture stay green.
+//     Calling nvme_write_blocking in substrate mode would stage a DMA
+//     into a zero sq_pa (a boot-critical page hazard) per the R54.M1-
+//     001 witness header's own guard rationale.
+//
+// Completions are still modelled by a per-cid ack (nvw_completion) that
+// moves entries out of the submitted band into the completed band. A
+// widening will replace this with the driver interrupt handler that
+// reads the CQE, freeing the cid; that widening also lands
+// caller-supplied buf_pa into the entry format (extending
+// NVW_ENTRY_WORDS from 4 to a wider stride) so the LIVE PATH stops
+// using _nvw_flush_scratch as a stand-in source page.
 //
 // It DOES NOT own the NVMe driver. The driver interface exists per
 // #906; this module carries the FS-side batching + accounting so a
@@ -146,6 +170,27 @@ module BdevWrite = structure {
   // on a cache line that the widening's real driver can DMA into.
   pub let mut _nvw_sq    : [u64; 256] = uninit @align(64)
   pub let mut _nvw_state : [u64; 8]   = uninit @align(64)
+
+  // ==========================================================================
+  // R54.M1-002 (#1779): flush-time source page for nvme_write_blocking.
+  //
+  // nvw_batch_flush now performs a REAL NVMe Write command per pending SQ
+  // entry when a live IO SQ pair exists (_nvme_io_queue_count > 0). The
+  // scaffold entries stored (cid, lba, len, status) but never captured a
+  // caller-supplied buf_pa -- callers accumulated writes without ever
+  // being asked to name the source page. This BSS is the temporary source
+  // page nvw_batch_flush hands to nvme_write_blocking's PRP1 slot, and it
+  // is populated with zeros at .bss init: a widening that lands
+  // caller-supplied buf_pa into the entry format (extending
+  // NVW_ENTRY_WORDS from 4 to a wider stride) will swap this scratch for
+  // the entry's own buf_pa field and delete this BSS.
+  //
+  // 4 KiB (512 u64), @align(4096) -- PRP1 requires page alignment per
+  // NVMe §4.5.2 (single-page transfer at R54.M1). Single writer: written
+  // only by bdev_write.o (nvw_batch_flush reads its address; the page
+  // stays .bss-zero for the R54.M1-002 landing because the entries do
+  // not yet carry the source data).
+  pub let mut _nvw_flush_scratch : [u64; 512] = uninit @align(4096)
 
   // ==========================================================================
   // R51.M8-005 (#1679): BDEVFS band (0xFFFFECD0..0xFFFFECDF, design/
@@ -654,28 +699,52 @@ module BdevWrite = structure {
   // nvw_batch_flush() -> u64
   //
   // Move every pending entry to the submitted band. Walks
-  // [0..batch_head), stamps status = 1 (SUBMITTED) on every entry
-  // currently PENDING (0), leaves entries already SUBMITTED (1) or
-  // COMPLETED (2) alone. Bumps flush_count once per call (even if
-  // zero entries move; the flush attempt is itself an event), and
-  // adds the number moved to flushed_total. Returns the number of
-  // entries newly submitted.
+  // [0..batch_head) looking for status == PENDING (0). On each hit,
+  // BRANCHES on _nvme_io_queue_count:
   //
-  // A widening replaces this with the doorbell write; the FS-side
-  // batching is the same.
+  //   - LIVE (_nvme_io_queue_count > 0): calls
+  //     nvme_write_blocking(nsid=1, entry.lba, count=1,
+  //                         buf_pa=&_nvw_flush_scratch).
+  //     On status == 0 -> stamps SUBMITTED and bumps newly-submitted.
+  //     On status != 0 -> leaves the entry PENDING (a subsequent flush
+  //                       retries).
+  //
+  //   - SUBSTRATE (_nvme_io_queue_count == 0): stamps SUBMITTED and
+  //     bumps newly-submitted (pre-R54.M1-002 scaffold behavior). This
+  //     avoids DMA into a zero sq_pa hazard when the boot posture has
+  //     no live NVMe controller (every QEMU-TCG -kernel run today).
+  //
+  // Bumps flush_count once per call (even if zero entries move; the
+  // flush attempt is itself an event) and adds newly-submitted to
+  // flushed_total. Returns the number of entries newly submitted.
+  //
+  // Emits the R54.M1-002 fingerprint via klog_s1_x2 at the end of any
+  // flush where newly-submitted > 0. Substrate flushes that moved
+  // entries emit exactly the same fingerprint as live flushes -- the
+  // wire signal is "the flush attempt made progress", not "the driver
+  // is live". A flush that moved zero entries is silent on the wire.
+  //
+  // Effects widened to {sysreg, mem} at R54.M1-002 (#1779) to cover
+  // nvme_write_blocking (drivers/nvme/sync.pdx: !{sysreg, mem} @{})
+  // and klog_s1_x2 (klog/wrappers.pdx: !{sysreg, mem} @{}). Both
+  // existing callers (tests/kernel/fs/pdxfs/nvme_write_synth.pdx and
+  // concurrent_stress_synth.pdx) already declare !{sysreg, mem} on
+  // their own witness effect row, so this widening propagates cleanly.
   //
   // Refuses:
   //   - not init                    NVW_ERR_NOT_INIT
   // ==========================================================================
 
-  pub let nvw_batch_flush : () -> u64 !{mem} @{} =
+  pub let nvw_batch_flush : () -> u64 !{sysreg, mem} @{} =
     fn () -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "R42.M5-001 (#1396): flush the pending band into the submitted band. flush_count bumps regardless of the moved count so a caller polling flush_count sees every doorbell attempt; flushed_total accumulates only the actually-moved count. A widening will replace the walk with a single MMIO write to the SQ tail doorbell. Labels prefixed nvw_bf_.",
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "R42.M5-001 (#1396) + R54.M1-002 (#1779): flush the pending band into the submitted band. flush_count bumps regardless of the moved count so a caller polling flush_count sees every doorbell attempt; flushed_total accumulates only the actually-moved count. R54.M1-002 rewrite: branches on _nvme_io_queue_count -- LIVE calls nvme_write_blocking(nsid=1, entry.lba, count=1, buf_pa=&_nvw_flush_scratch) per PENDING entry and only stamps SUBMITTED on status == 0; SUBSTRATE (no live IO SQ pair, every QEMU-TCG -kernel boot today) preserves the pre-R54.M1-002 stamping so existing substrate witnesses (nvme_write_synth, concurrent_stress_synth) stay green. Substrate-branch rationale mirrors the R54.M1-001 witness's own _nvme_io_queue_count guard -- calling nvme_write_blocking with no live sq_pa would DMA into page 0, a boot-critical hazard. Fingerprint via klog_s1_x2 (tag_pdxb_bdev_flush_ok, k_pending=pending_seen, k_submitted=newly_submitted) fires only when newly_submitted > 0 so zero-move flushes stay silent on the wire. Register plan: 4 pushes (rbx=i, r12=batch_head, r13=newly-submitted, r14=pending_seen) -- 32 B; entry rsp%16==8 -> 40, %16==8 (aligned for nested calls after `sub rsp, 8` scoped around each nvme_write_blocking, and after `push v2` before klog_s1_x2 since 8+8=16 %16==0). Loop reads status @+i*4+3 (u64 stride 4); on PENDING (0): bump pending_seen; check _nvme_io_queue_count; if 0 (substrate) -> stamp SUBMITTED, bump newly-submitted; if !=0 (live) -> load lba @+i*4+1, staged into rsi via a temporary r15 save/restore across the call (r15 is not a prologue-pushed reg here to keep the prologue at 4 pushes -- lba is spilled onto the reserved-stack pad instead). Actually simpler: preserve i and batch_head across the call by keeping them in callee-save rbx/r12 which nvme_write_blocking honours; load lba fresh from _nvw_sq into rsi post-call is not needed if we spill it to a scratch reg beforehand -- we spill (lba, entry_status_offset_in_bytes) into (r15, r11 replacement) but r11 is caller-save; use rbp for entry base + status offset spill (rbp pushed in prologue). Revised prologue: 5 pushes (rbx=i, rbp=status_off, r12=batch_head, r13=newly-submitted, r14=pending_seen) -- 40 B; entry rsp%16==8 -> 48, %16==0. Then `sub rsp, 8` is NOT needed around nvme_write_blocking (rsp%16==0 already). For klog_s1_x2's 7th arg push: 48+8=56, %16==8 -- BAD. So we push a dummy first (add sub rsp, 8), no -- simpler: reduce to 4 pushes and use sub rsp, 8 as an alignment pad around klog_s1_x2 only. Final: 5 pushes; before klog_s1_x2, `sub rsp, 8; push r13(v2); call; add rsp, 16`. Wire cost: 5 pushes + 1 sub + 1 push = 6 stack ops per flush -- negligible. nvme_write_blocking preserves rbx/rbp/r12/r13/r14/r15 per SysV (kernel/core/drivers/nvme/sync.pdx nvme_sy_wr_ prologue pushes all six). klog_s1_x2 preserves rbx/r12/r13/r14/r15 per SysV (rbp is its own frame register but restored). Labels prefixed nvw_bf_.",
       block: {
         push rbx;
+        push rbp;
         push r12;
         push r13;
+        push r14;
 
         lea r10, [rip + _nvw_state];
         mov rax, [r10 + 0];
@@ -691,22 +760,71 @@ module BdevWrite = structure {
         mov r12, [r10 + 16];                    // batch_head
         xor rbx, rbx;                           // i = 0
         xor r13, r13;                           // newly-submitted counter
+        xor r14, r14;                           // pending_seen counter
 
       nvw_bf_top:
         cmp rbx, r12;
         jae nvw_bf_done;
 
-        // status offset = i * 4 + 3
+        // status offset = i * 4 + 3 (u64s)
         mov rax, rbx;
         shl rax, 2;
         add rax, 3;
+        mov rbp, rax;                           // save status u64-offset for post-call reuse
         lea r11, [rip + _nvw_sq];
         mov r8, [r11 + rax * 8];
-        cmp r8, 0;                              // only PENDING moves
+        cmp r8, 0;                              // only PENDING is processed
         jne nvw_bf_next;
 
-        mov r8, 1;                              // SUBMITTED
-        mov [r11 + rax * 8], r8;
+        // PENDING entry: bump pending_seen.
+        add r14, 1;
+
+        // Branch: substrate vs live NVMe IO SQ pair.
+        mov rax, [rip + _nvme_io_queue_count];
+        cmp rax, 0;
+        je  nvw_bf_substrate;
+
+        // -------------------------------------------------------------
+        // LIVE path: nvme_write_blocking(nsid=1, lba, count=1, buf_pa).
+        //
+        // lba is at entry+8 (u64-offset = i*4 + 1).
+        // Register plan: nvme_write_blocking clobbers rax/rcx/rdx/r8/
+        // r9/r10/r11/rdi/rsi (caller-save) but preserves rbx/rbp/r12/
+        // r13/r14/r15 (callee-save). We keep i (rbx), status offset
+        // (rbp), batch_head (r12), counters (r13/r14) across the call.
+        // rsp%16 already == 0 here (5 pushes atop entry rsp%16==8, so
+        // 8+40=48, %16==0), so no `sub rsp, 8` alignment is needed.
+        // -------------------------------------------------------------
+
+        // Load lba: entry_u64_offset = i * 4 + 1
+        mov rax, rbx;
+        shl rax, 2;
+        add rax, 1;
+        lea r11, [rip + _nvw_sq];
+        mov rsi, [r11 + rax * 8];               // rsi = lba
+
+        mov rdi, 1;                             // nsid = 1
+        mov rdx, 1;                             // count = 1 block
+        lea rcx, [rip + _nvw_flush_scratch];    // buf_pa = &_nvw_flush_scratch
+
+        call nvme_write_blocking;
+
+        // rax = CQE status; 0 == success. Non-zero leaves PENDING.
+        cmp rax, 0;
+        jne nvw_bf_next;
+
+        // Success: stamp SUBMITTED via saved offset (rbp).
+        lea r11, [rip + _nvw_sq];
+        mov r8, 1;
+        mov [r11 + rbp * 8], r8;
+        add r13, 1;
+        jmp nvw_bf_next;
+
+      nvw_bf_substrate:
+        // Substrate path: stamp SUBMITTED without a driver call.
+        lea r11, [rip + _nvw_sq];
+        mov r8, 1;
+        mov [r11 + rbp * 8], r8;
         add r13, 1;
 
       nvw_bf_next:
@@ -718,6 +836,37 @@ module BdevWrite = structure {
         mov r9, [r10 + 48];
         add r9, r13;
         mov [r10 + 48], r9;                     // flushed_total += r13
+
+        // -------------------------------------------------------------
+        // Fingerprint. Silent when newly_submitted == 0 (a flush that
+        // moved zero entries is not a wire event).
+        // -------------------------------------------------------------
+        cmp r13, 0;
+        je  nvw_bf_ret;
+
+        // klog_s1_x2(LEVEL_INFO=3, SUBSYS_FS__, tag_pdxb_bdev_flush_ok,
+        //            k_pending, pending_seen, k_submitted, newly_submitted)
+        //
+        // Args: rdi=level, rsi=subsys, rdx=tag, rcx=k1, r8=v1, r9=k2,
+        //       [rsp+8] = v2 (7th arg pushed by caller).
+        //
+        // Alignment: rsp%16==0 here. `sub rsp, 8` -> %16==8, then
+        // `push r13` (v2) -> %16==0 pre-call. Cleanup `add rsp, 16`.
+        // (Equivalent to a single 16-byte allocation with v2 written to
+        // [rsp+0], but the push/sub pair reads more idiomatic against
+        // the wrappers.pdx convention comment.)
+        mov rdi, 3;                             // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_FS__];
+        lea rdx, [rip + tag_pdxb_bdev_flush_ok];
+        lea rcx, [rip + k_pending];
+        mov r8, r14;                            // pending_seen
+        lea r9, [rip + k_submitted];
+        sub rsp, 8;                             // align pad before v2 push
+        push r13;                               // v2 = newly_submitted
+        call klog_s1_x2;
+        add rsp, 16;                            // undo push + pad
+
+      nvw_bf_ret:
         mov rax, r13;
         jmp nvw_bf_out;
 
@@ -727,8 +876,10 @@ module BdevWrite = structure {
         xor rax, rax;
 
       nvw_bf_out:
+        pop r14;
         pop r13;
         pop r12;
+        pop rbp;
         pop rbx;
         ret
       }

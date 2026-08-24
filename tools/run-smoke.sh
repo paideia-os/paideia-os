@@ -955,6 +955,30 @@ case "${EXPECTED}" in
         echo "smoke: boot_r54_nvme_write — SKIP (witness not wired at R54.M1; live round-trip deferred to R55+ per design/kernel/nvme-write-blocking.md — chained on driver-attach + real NVMe controller on default boot path)"
         exit 0
         ;;
+    boot_r54_bdev_flush)
+        # R54.M1-002 (#1779): opt-in nvw_batch_flush live submit path
+        # witness, gated by PAIDEIA_R54_BDEV_FLUSH=1.
+        #
+        # The witness at src/kernel/boot/witness/r54_bdev_flush.pdx
+        # (symbol r54_bdev_flush_witness) is NOT wired into
+        # kernel_main at R54.M1 — same posture as r54_nvme_write /
+        # pdxfs_lite_e2e / concurrent_io / msix_ir_round_robin: symbol
+        # existence + build-time link verification are the R54.M1
+        # acceptance criterion, live invocation is deferred to R55+
+        # when the driver-attach ceremony surfaces a real NVMe
+        # controller on the default boot path.
+        #
+        # Under -kernel, nvw_batch_flush itself takes its substrate
+        # branch (_nvme_io_queue_count == 0), so a wired invocation
+        # would still emit the pdxb bdev flush ok fingerprint but
+        # without touching the driver. The witness is dormant at
+        # R54.M1 to keep the boot-transcript stable across the
+        # substrate/live cutover; when it is wired the fingerprint
+        # golden at tests/r54/expected-r54-bdev-flush.txt already
+        # names the three ordered substrings to check.
+        echo "smoke: boot_r54_bdev_flush — SKIP (witness not wired at R54.M1; live submit path deferred to R55+ per design/kernel/nvme-write-blocking.md — chained on driver-attach + real NVMe controller on default boot path)"
+        exit 0
+        ;;
     boot_r31_spawn_pair)
         # R31.M2-1590 (#1590): loader-side multi-task boot spawn — the
         # first time this kernel runs a userspace server as a distinct

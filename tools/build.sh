@@ -4932,8 +4932,13 @@ if [[ ! -f "${FSC_SRC}" || ! -f "${NVW_SRC}" || ! -f "${DUR_SRC}" ]]; then
     echo "[pdxfs-r42-close-confine] FAIL - one of the R42-close source files missing" >&2
     exit 1
 fi
-ec_confine_one '_nvw_sq'      'core/fs/pdxfs/bdev_write.o'
-ec_confine_one '_nvw_state'   'core/fs/pdxfs/bdev_write.o'
+ec_confine_one '_nvw_sq'             'core/fs/pdxfs/bdev_write.o'
+ec_confine_one '_nvw_state'          'core/fs/pdxfs/bdev_write.o'
+# R54.M1-002 (#1779): 4 KiB flush-time source page for nvme_write_blocking's
+# PRP1 slot when nvw_batch_flush takes its live path (nvme_io_queue_count > 0).
+# Single-writer per bdev_write.pdx §0's "one writer" invariant; a second writer
+# would let a caller stage arbitrary payload behind the FS-side batcher's back.
+ec_confine_one '_nvw_flush_scratch'  'core/fs/pdxfs/bdev_write.o'
 ec_confine_one '_dur_lvl'     'core/fs/pdxfs/durability.o'
 ec_confine_one '_dur_state'   'core/fs/pdxfs/durability.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then
