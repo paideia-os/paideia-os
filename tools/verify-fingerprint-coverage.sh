@@ -138,11 +138,16 @@ ALLOWLIST = {
     #    silent production regression, which is the class this gate is
     #    for. Listed individually rather than exempted by directory so
     #    that a NEW test-side marker still trips the gate.
-    "ACPI HPET OK":   "tests/kernel/acpi/hpet_synth.pdx — ACPI synth fixture, no default mode",
-    "ACPI MADT OK":   "tests/kernel/acpi/madt_synth.pdx — ACPI synth fixture, no default mode",
-    "ACPI MCFG OK":   "tests/kernel/acpi/mcfg_synth.pdx — ACPI synth fixture, no default mode",
-    "ACPI RSDP OK":   "tests/kernel/acpi/rsdp_synth.pdx — ACPI synth fixture, no default mode",
-    "ACPI XSDT OK":   "tests/kernel/acpi/xsdt_synth.pdx — ACPI synth fixture, no default mode",
+    #
+    # #1570 (R49 audit): "ACPI HPET OK", "ACPI MADT OK", "ACPI MCFG OK",
+    # "ACPI RSDP OK", "ACPI XSDT OK" were previously listed here as
+    # "no default mode" alongside "ACPI FADT OK", but their parsers had
+    # the same audit exposure #1066 exposed on the FADT: a witness that
+    # exists but is never invoked. They are now wired inside
+    # src/kernel/boot/witness/r30_platform.pdx (rsdp_synth_witness_call,
+    # acpi_xsdt_synth_witness_call, madt_synth_witness_call,
+    # mcfg_synth_witness_call, hpet_synth_witness_call) and asserted in
+    # tests/r17/shell-shutdown.golden alongside "ACPI FADT OK".
     "ACPI T14G4 OK":  "tests/kernel/acpi/t14_g4_fixture.pdx — T14 G4 hardware fixture",
     "PCI T14G4 OK":   "tests/kernel/pci/t14_g4_fixture.pdx — T14 G4 hardware fixture",
     "MSIX IR ROUND ROBIN OK":
