@@ -1333,6 +1333,157 @@ case "${EXPECTED}" in
         echo "smoke: boot_r53_round_trip meta-mode passed (phase1+phase2 clean)"
         exit 0
         ;;
+    boot_r54_bdev_round_trip_phase1)
+        # R54.M1-003 (#1780): phase-1 subordinate mode of the two-
+        # phase NVMe-block payload round-trip smoke. Requires
+        # --with-disk --wipe.
+        #
+        # Sequence (host-side + kernel-side):
+        #
+        #   * Host-side (via the R53.M4-001 (#1748) --with-disk / --wipe
+        #     pipeline and R53.M4-002 (#1749) image-lifecycle block):
+        #     the caller passes --wipe so tools/mkfs-pdxb.sh
+        #     materialises a fresh PDXB superblock at
+        #     ${DISK_IMAGE_PATH} before QEMU launches. The two-phase
+        #     orchestrator meta-mode (sibling boot_r54_bdev_round_trip)
+        #     invokes THIS mode with "--with-disk --wipe" for exactly
+        #     that reason; a manual caller that omits --wipe against a
+        #     stale image gets whatever prior state the file already
+        #     carried.
+        #
+        #   * Kernel-side (single QEMU boot against the freshly-mkfs'd
+        #     device): the standard boot chain fires every existing
+        #     R52/R53 PdxFS witness through r30_platform.pdx, and
+        #     terminally the R54.M1-003 witness (r54_bdev_round_trip.
+        #     pdx, wired into r30_platform.pdx immediately after
+        #     pdxfs_round_trip_phased_call) branches on sb_flags bit 0
+        #     -- CLEAR (fresh mkfs) -> phase 1 arm: stages
+        #     0xDEADBEEFCAFEBABE into _r54rt_write_scratch, calls
+        #     nvme_write_blocking(nsid=1, lba=16, count=1,
+        #                         buf_pa=&_r54rt_write_scratch),
+        #     emits the R54.M1-003 write-ok tag via klog_s1.
+        #
+        # Golden: tests/r54/expected-r54-bdev-round-trip-phase1.txt
+        # pins the single write-ok fingerprint line (contains-in-order
+        # check). Substrate boots fail the golden because the LIVE-
+        # gate (_nvme_io_queue_count != 0) is CLEAR and the witness
+        # emits its "R54 BDEV ROUND TRIP SUBSTRATE" line (no OK token)
+        # instead of the ok tag -- the [[ ${WITH_DISK} -eq 0 ]] guard
+        # below refuses that upfront to give a clean diagnostic.
+        #
+        # Timeout budget: 25 s matches boot_r53_round_trip_phase{1,2}
+        # -- the whole M8 witness cluster + the R54 round-trip fit in
+        # the same envelope.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r54/expected-r54-bdev-round-trip-phase1.txt"
+        TIMEOUT=25
+        EXPECTED=""
+        if [[ ${WITH_DISK} -eq 0 ]]; then
+            echo "smoke: boot_r54_bdev_round_trip_phase1 requires --with-disk" >&2
+            exit 2
+        fi
+        ;;
+    boot_r54_bdev_round_trip_phase2)
+        # R54.M1-003 (#1780): phase-2 subordinate mode of the two-
+        # phase NVMe-block payload round-trip smoke. Requires
+        # --with-disk; does NOT wipe.
+        #
+        # Sequence (host-side + kernel-side):
+        #
+        #   * Host-side: the caller passes --with-disk WITHOUT --wipe,
+        #     so the image-lifecycle block reuses the exact bytes the
+        #     phase-1 kernel left after clean umount (per §2.1 of
+        #     design/tooling/volume-lifecycle-mechanism.md: no
+        #     -snapshot ever, host file mutations persist). The two-
+        #     phase orchestrator meta-mode (sibling boot_r54_bdev_
+        #     round_trip) invokes THIS mode second, guarded on phase 1's
+        #     clean exit.
+        #
+        #   * Kernel-side: the standard boot chain re-mounts the
+        #     preserved volume. The R54.M1-003 witness branches on
+        #     sb_flags bit 0 -- SET (clean umount preserved) -> phase 2
+        #     arm: zeroes _r54rt_read_scratch[0], calls
+        #     nvme_read_blocking(nsid=1, lba=16, count=1,
+        #                        buf_pa=&_r54rt_read_scratch),
+        #     compares _r54rt_read_scratch[0] against
+        #     0xDEADBEEFCAFEBABE, emits the R54.M1-003 readback-ok tag
+        #     (match=1) via klog_s1 on match. A mismatch takes the
+        #     r54rt_fail_stage arm and emits a fail line instead of
+        #     the ok tag -- the coverage gate stays honest either way.
+        #
+        # Golden: tests/r54/expected-r54-bdev-round-trip-phase2.txt
+        # pins the single readback-ok fingerprint line (contains-in-
+        # order check).
+        #
+        # Timeout budget matches phase 1 (25 s).
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r54/expected-r54-bdev-round-trip-phase2.txt"
+        TIMEOUT=25
+        EXPECTED=""
+        if [[ ${WITH_DISK} -eq 0 ]]; then
+            echo "smoke: boot_r54_bdev_round_trip_phase2 requires --with-disk" >&2
+            exit 2
+        fi
+        ;;
+    boot_r54_bdev_round_trip)
+        # R54.M1-003 (#1780): two-phase orchestrator meta-mode for the
+        # NVMe-block payload round-trip smoke.
+        #
+        # Sequences the fresh-disk write pass and the preserved-disk
+        # read-back pass into a single invocation, giving pre-push a
+        # one-shot green/red on "reboot preserves LBA 16 payload" --
+        # the R54.M1-003 acceptance criterion. Mirrors the shape of
+        # boot_r53_round_trip (R53.M4-005 #1752) exactly: subordinate
+        # phase modes carry the goldens + qemu launch; this meta-mode
+        # owns only the orchestration.
+        #
+        # Ordering + disk lifecycle:
+        #
+        #   1. Phase 1 is invoked with `--wipe`, so the image-lifecycle
+        #      block deletes any stale image and calls
+        #      `tools/mkfs-pdxb.sh` before QEMU launches. The phase-1
+        #      boot witness writes 0xDEADBEEFCAFEBABE to LBA 16 via
+        #      nvme_write_blocking and its golden asserts the write-ok
+        #      tag.
+        #
+        #   2. Phase 2 is invoked WITHOUT `--wipe`. The image is a
+        #      plain host file and this script never passes `-snapshot`
+        #      to QEMU (design/tooling/volume-lifecycle-mechanism.md
+        #      §2.1), so the write from phase 1 survives. The phase-2
+        #      boot witness reads LBA 16, compares, emits the readback-
+        #      ok tag; its golden asserts that tag matches.
+        #
+        #   3. Combined pass = both phase-mode invocations exited with
+        #      rc ∈ {0, 33}, which means both fingerprint checks
+        #      succeeded. Phase 2 is guarded on phase 1's clean exit
+        #      per §7.4 -- a failed phase 1 aborts immediately without
+        #      launching a second QEMU that would only fail on an
+        #      image the write pass never finished.
+        #
+        # Exit-code guard: rc 0 = normal success, rc 33 = kernel
+        # graceful clean exit (isa-debug-exit byte 0x10 -> QEMU exits
+        # (0x10 << 1) | 1 = 33). Both are treated as clean by every
+        # fingerprint mode in this script; matches boot_r53_round_trip.
+
+        # Phase 1: wipe -> mkfs -> write LBA 16.
+        "$0" --with-disk --wipe boot_r54_bdev_round_trip_phase1
+        _r54_phase1_rc=$?
+        if [[ ${_r54_phase1_rc} -ne 0 && ${_r54_phase1_rc} -ne 33 ]]; then
+            echo "smoke: boot_r54_bdev_round_trip PHASE1 FAILED (rc=${_r54_phase1_rc})" >&2
+            exit ${_r54_phase1_rc}
+        fi
+
+        # Phase 2: preserve disk -> reboot -> read LBA 16 back.
+        "$0" --with-disk boot_r54_bdev_round_trip_phase2
+        _r54_phase2_rc=$?
+        if [[ ${_r54_phase2_rc} -ne 0 && ${_r54_phase2_rc} -ne 33 ]]; then
+            echo "smoke: boot_r54_bdev_round_trip PHASE2 FAILED (rc=${_r54_phase2_rc})" >&2
+            exit ${_r54_phase2_rc}
+        fi
+
+        echo "smoke: boot_r54_bdev_round_trip meta-mode passed (phase1+phase2 clean)"
+        exit 0
+        ;;
     boot_r53_first_mount)
         # R53.M4-003 (#1750): first PDXB volume-mount smoke on a
         # QEMU-attached NVMe device the sibling R53.M4-001 (#1748)

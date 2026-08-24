@@ -4939,6 +4939,14 @@ ec_confine_one '_nvw_state'          'core/fs/pdxfs/bdev_write.o'
 # Single-writer per bdev_write.pdx §0's "one writer" invariant; a second writer
 # would let a caller stage arbitrary payload behind the FS-side batcher's back.
 ec_confine_one '_nvw_flush_scratch'  'core/fs/pdxfs/bdev_write.o'
+# R54.M1-003 (#1780): 4 KiB page-aligned source/destination pair for the
+# NVMe-block payload round-trip witness. Single-writer per r54_bdev_round_
+# trip.pdx §"Register plan"; a second writer would let a caller stage a
+# non-deterministic payload behind the witness's back and defeat the
+# round-trip compare in phase 2.
+ec_confine_one '_r54rt_write_scratch' 'boot/witness/r54_bdev_round_trip.o'
+ec_confine_one '_r54rt_read_scratch'  'boot/witness/r54_bdev_round_trip.o'
+ec_confine_one '_r54rt_stage'         'boot/witness/r54_bdev_round_trip.o'
 ec_confine_one '_dur_lvl'     'core/fs/pdxfs/durability.o'
 ec_confine_one '_dur_state'   'core/fs/pdxfs/durability.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then
