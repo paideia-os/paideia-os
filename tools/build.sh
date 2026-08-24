@@ -211,6 +211,16 @@ echo "[file-id-hardcodes] tools/verify-file-id-hardcodes.sh"
     exit 1
 }
 
+# boot-mmio-mapping step 8: refuse raw firmware-fixed MMIO PA literals in
+# instruction operands outside the manifest (mmio_init.pdx). See design/
+# kernel/boot-mmio-mapping.md §3 step 8 for the full argument and
+# tools/verify-no-raw-mmio.sh for the allowlist reasoning.
+echo "[no-raw-mmio] tools/verify-no-raw-mmio.sh"
+"${REPO_ROOT}/tools/verify-no-raw-mmio.sh" || {
+    echo "[FAIL] raw firmware-fixed MMIO literal reintroduced" >&2
+    exit 1
+}
+
 # R41.M4 / #1606: @no_frame is a no-op on unsafe-bodied lambdas because
 # paideia-as::emit_visit_lambda short-circuits on body_is_unsafe before
 # consulting is_lambda_no_frame. Every hand-written asm function in this
