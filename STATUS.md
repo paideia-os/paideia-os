@@ -1087,3 +1087,44 @@ None (R28 ran entirely under QEMU / documentation-and-image-assembly). Four rows
 **MVP arc summary:** R18-R28 landed **~257 issues across 60 milestones over 11 rounds**, **zero cross-repo paideia-as escalations for the final 8 rounds** (R21-R28), **11 rounds tagged** (`r18-closed` through `r27-closed` plus `mvp-v0.1`). The MVP arc is complete; the R28+ hardware bring-up sub-round discharges the live-execution deferrals.
 
 **Next Round:** R29 (xAPIC retirement completion + kernel timer redesign) OR post-R28 hardware bring-up sub-round (driver-attach ceremony + R25 write-side debt + #1015 userspace-server substrate stub). Decision to defer to R29.M1 kickoff per `design/round-retrospectives/r28-closure.md §Preflight for R29+`.
+
+---
+
+## R54 (NVMe write-sync + bdev_write real path) — CLOSED 2026-08-24
+
+R54 delivered the write-path substrate that turns the R51 NVMe driver + R52 PdxFS-on-block layer read-write. Five issues across a single milestone: `nvme_write_blocking(nsid, lba, count, buf_pa) -> u16` one-for-one mirror of `nvme_read_blocking` (OPC=0x01, own `_nvme_write_stats` confined via `ec_confine_one`; dormant witness at `src/kernel/boot/witness/r54_nvme_write.pdx`); `bdev_write` real submit path over `nvme_write_blocking` (widened effect row `!{mem}` → `!{sysreg, mem}`, LIVE branch calls `nvme_write_blocking(nsid=1, entry.lba, count=1, buf_pa=&_nvw_flush_scratch)` with substrate mark-only path gated on `_nvme_io_queue_count != 0`, fingerprint `pdxb bdev flush ok [legacy: BDEV FLUSH OK] pending=<hex> submitted=<hex>` firing 4× per substrate boot); two-phase round-trip witness (`r54_bdev_round_trip.pdx` discriminates on `sb_flags` bit 0, phase-1 writes `0xDEADBEEFCAFEBABE` at LBA 16, phase-2 boot against preserved image reads back and `cmp`s against the pattern with `match=1` control-flow-gated on the compare succeeding, three run-smoke.sh modes mirroring the R53.M4 orchestrator shape); `.githooks/pre-push` `PAIDEIA_R54_DISK=1` opt-in gate (skip-on-missing-mkfs preflight identical to R53); and this closure retro + STATUS.md block + `r54-closed` tag. R25 debt item #1 (`nvme_write_blocking` kernel-side, open since R25 close 2026-04-16) is discharged. See `design/round-retrospectives/r54-closure.md` for the full write-up.
+
+### Issues Implemented (5 total across 1 milestone)
+
+- **M1** (#1778, #1779, #1780, #1781, #1782) — NVMe write-sync + bdev_write real path: #1778 `nvme_write_blocking` primitive; #1779 `bdev_write` real submit path; #1780 two-phase round-trip witness (write LBA 16, unmount, remount, readback); #1781 `PAIDEIA_R54_DISK=1` pre-push gate; #1782 closure retro + STATUS + tag.
+
+### Cross-Repo Escalations to paideia-as (R54)
+
+**None.** `paideia-as` submodule remained pinned throughout R54. **Ninth consecutive round** with zero cross-repo escalations. R54's work was entirely NVMe-driver + fs-block-layer + witness plumbing over existing paideia-as encoders; no new assembly instructions, no elaborator changes.
+
+### Observable Proof
+
+- Kernel builds clean under `tools/build.sh`.
+- Substrate boot reaches SHELL START + `$` prompt; `pdxb bdev flush ok` fingerprint fires 4× with `pending == submitted` (3/1/50/50); new `r54_bdev_round_trip` witness stays correctly silent on substrate.
+- `bash tools/run-smoke.sh --with-disk --wipe boot_r54_bdev_round_trip_phase1` errors cleanly with `mkfs-pdxb binary not built yet` guidance line (expected until paideia-as #1730 lands — same posture as R53.M4 round-trip smoke).
+- Debugger adversarially verified all four implementation diffs (11/11 checks on #1779, 13/13 on #1780) — no defects survived.
+
+### R54 Debt Carried Forward
+
+1. **Full end-to-end `boot_r54_bdev_round_trip` exercise** — blocked by paideia-as #1730 (mkfs-pdxb host tool not built yet). Discharges automatically when #1730 lands.
+2. **Multi-block / PRP-list writes** (mkfs / pkg-install traffic > 4 KiB) — deferred to R55+ (composes with `nvme_io_build_and_submit_one` from mdts.pdx).
+3. **Concurrent write throughput** — deferred to #1015 userspace-server milestone.
+4. **pdxfs-lite mutating ops** (`create.pdx` / `unlink.pdx` / `rename.pdx`) still return `EROFS` — R54 primitive present but call sites need explicit wire-through (target R55+).
+5. **Live SQ pair on real HW** — dormant `r54_nvme_write` witness exists as symbol-existence surface; live exercise is a `gated:hardware` deferral for the R28+ hardware bring-up sub-round.
+
+### Debt Discharged
+
+- **R25 debt item #1** — `nvme_write_blocking` kernel-side (open since R25 close 2026-04-16). Discharged by #1778.
+
+**None regress R54 acceptance.**
+
+### Quirks Discovered on Real Hardware
+
+None (R54 ran entirely under QEMU `-kernel` / documentation). `design/hardware/quirks.md` unchanged.
+
+**Next Round:** R55 (multi-block / PRP-list writes + pdxfs-lite mutating-op wire-through). Zero R54 blockers.
