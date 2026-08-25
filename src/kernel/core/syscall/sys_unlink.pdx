@@ -1,0 +1,340 @@
+// src/kernel/core/syscall/sys_unlink.pdx -- R56.M3-005 (paideia-os #1794)
+//
+// SYS_UNLINK -- ring-3 unlink syscall body (sysno 81).
+//
+// -----------------------------------------------------------------------------
+// Scope
+// -----------------------------------------------------------------------------
+//
+// design/kernel/vfs-metadata-syscalls.md and paideia-os R56.M3 milestone
+// item R56.M3-005:
+//
+//   "New src/kernel/core/syscall/sys_unlink.pdx (body).
+//    rdi = path_va (user VA, NUL-terminated), rsi = path_len (user hint).
+//    Resolve parent directory, extract basename, dispatch through the
+//    R16 vops_unlink slot (VOPS_UNLINK_OFFSET=48). File-only:
+//    directories are refused with -EISDIR (use sys_rmdir instead)."
+//
+// The R56.M3-001 sibling (paideia-os #1790) widened dispatch.pdx's bounds
+// check from 76 -> 82 and added six ENOSYS forward-declaration stubs
+// (dispatch_stat / _getdents / _mkdir / _rmdir / _unlink / _rename). This
+// landing rewrites dispatch_unlink from that stub into a real shim that
+// calls sys_unlink_body defined below.
+//
+// -----------------------------------------------------------------------------
+// Composition
+// -----------------------------------------------------------------------------
+//
+// sys_unlink_body walks the caller-supplied user path into a kernel scratch
+// via user_read_str_via_walk (same helper dispatch_open uses), scans the
+// buffer for the last '/' to split parent_dir from basename, copies the
+// parent-dir prefix into a second scratch, resolves the parent via
+// mount_root_vnode + path_resolve, dispatches through the existing
+// VOPS_UNLINK_OFFSET slot (offset 48) against the parent's ops table, and
+// on success emits the R56.M3-005 fingerprint via klog_s1_x1 with the
+// (path) k=v pair.
+//
+// -----------------------------------------------------------------------------
+// Atomicity discipline (backend layer)
+// -----------------------------------------------------------------------------
+//
+// Backends implementing durable storage (pdxfs_block at R55+) MUST make
+// the dentry-remove + inode-free pair WAL-atomic. The R55 substrate for
+// this (wal_append_write + fsync from src/kernel/core/fs/pdxfs/wal.pdx)
+// is landed; the block-backed unlink adapter registers a single WAL
+// record describing both edits before applying the changes, and a single
+// fsync at commit. tmpfs (in-memory only) has no durability requirement
+// so its adapter mutates the sibling chain in place.  pdxfs_lite delegates
+// to the existing pdxfs_lite_unlink primitive (R25.M6-004 stub -> EROFS
+// until the nvme_write_blocking round lands #906).
+//
+// -----------------------------------------------------------------------------
+// Failure taxonomy
+// -----------------------------------------------------------------------------
+//
+// Linux-style negative-errno u64s so a caller uses `cmp rax, 0; jl err`
+// for a single-branch sign test:
+//
+//   0                            -- success
+//   0xFFFFFFFFFFFFFFF2 (-EFAULT) -- user pointer refused (path VA in the
+//                                    kernel half OR walker fault mid-copy)
+//   0xFFFFFFFFFFFFFFEA (-EINVAL) -- path had no '/' anchor OR the resolved
+//                                    basename length is zero (e.g. trailing
+//                                    slash) OR the caller passed "/" (root)
+//   0xFFFFFFFFFFFFFFFE (-ENOENT) -- parent path did not resolve to a
+//                                    vnode OR the backend adapter returned
+//                                    ENOENT / VOPS_ERR_NOT_SUPPORTED
+//
+// -----------------------------------------------------------------------------
+// Effects / capabilities
+// -----------------------------------------------------------------------------
+//
+// Per the R56.M3-005 task pin:
+//   `!{mem, sysreg} @{cap}`
+//
+// mem: path_resolve + vops_unlink field reads; scratch copies.
+// sysreg: user_read_str_via_walk + klog wire emit.
+// cap: forward-compat placeholder for a R57+ per-mount VOL_RIGHT_UNLINK
+//      gate (mount_table lookup in the syscall layer); no cap op runs
+//      today.
+//
+// -----------------------------------------------------------------------------
+// Reserved-label discipline
+// -----------------------------------------------------------------------------
+//
+// Labels prefixed `sysunl_`.  None of {done, fail, enoent, efault,
+// einval, split} is a paideia-as reserved word today but the prefix
+// follows the sys_stat/sys_umount precedent (sysstat_ / smb_).
+
+module SysUnlink = structure {
+
+  // ==========================================================================
+  // Sentinels
+  // ==========================================================================
+
+  pub let SYS_UNLINK_OK               : u64 = 0
+  pub let SYS_UNLINK_ERR_ENOENT       : u64 = 0xFFFFFFFFFFFFFFFE
+  pub let SYS_UNLINK_ERR_EFAULT       : u64 = 0xFFFFFFFFFFFFFFF2
+  pub let SYS_UNLINK_ERR_EINVAL       : u64 = 0xFFFFFFFFFFFFFFEA
+
+  // Path length cap.  Matches DISPATCH_PATH_MAX, PATH_MAX (path.pdx),
+  // and the sibling SYS_STAT_PATH_MAX.
+  pub let SYS_UNLINK_PATH_MAX         : u64 = 256
+
+  // Sentinel value for VOPS_ERR_NOT_SUPPORTED, treated by the body as
+  // -ENOENT for uniform ring-3 taxonomy (matches sys_stat's decision).
+  pub let SYS_UNLINK_VOPS_NOSUP       : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ==========================================================================
+  // Static storage
+  // ==========================================================================
+
+  // Per-syscall path bounce scratch.  The body copies the caller's user
+  // path into this .bss buffer via user_read_str_via_walk under kernel
+  // CR3 (strict-KPTI has flipped CR3 by dispatch entry).  Single-flow at
+  // R56.M3 (matches the sibling sys_stat / sys_umount scratches).  A
+  // follow-up wave that lands per-TCB unlink scratches (SMP-safe multi-
+  // caller unlink) migrates this field into a per-task slot.
+  pub let mut _sys_unlink_path_scratch   : [u8; 256] = uninit @align(8)
+
+  // Second scratch holding the parent-directory prefix (path up to the
+  // last '/', NUL-terminated).  A dedicated buffer rather than an in-
+  // place NUL splice on _sys_unlink_path_scratch so the trailing NUL of
+  // the leaf name (at basename + basename_len) is preserved for the
+  // vops_unlink adapter's own strlen scan.
+  pub let mut _sys_unlink_parent_scratch : [u8; 256] = uninit @align(8)
+
+  // ==========================================================================
+  // sys_unlink_body(path_va, path_len) -> u64
+  //
+  // SysV: rdi = path_va (user VA, NUL-terminated)
+  //       rsi = path_len (upper-bound hint; walker stops at NUL)
+  //   -> rax = 0 on success, or -EFAULT / -ENOENT / -EINVAL on failure.
+  //
+  // Sequence:
+  //   (1) Cap path_len at SYS_UNLINK_PATH_MAX-1 = 255.  Length 0 is
+  //       widened to cap=1 so the walker sees at least one byte of
+  //       headroom for the NUL-only path case (which then falls through
+  //       to the strlen==0 -> EINVAL rejection).
+  //   (2) user_read_str_via_walk(user_path_va, &path_scratch, cap)
+  //       -> rax = strlen or 0 on fault.  0 (or strlen==0) -> -EFAULT
+  //       (walker fault) resp -EINVAL (empty path).
+  //   (3) Scan path_scratch for the LAST '/' byte.  If none present the
+  //       caller passed a relative path with no anchor -> -EINVAL.  If
+  //       the entire path is "/" (strlen==1, last_slash==0) the caller
+  //       tried to unlink the mount root -> -EINVAL.
+  //   (4) Copy path_scratch[0..last_slash] into parent_scratch and
+  //       NUL-terminate; if last_slash == 0 write "/\0" instead (the
+  //       parent-of-a-top-level-file is the root).
+  //   (5) mount_root_vnode() -> rax = root_idx.  0 -> -ENOENT (no
+  //       mounted root; matches sys_stat's convention).
+  //   (6) path_resolve(&parent_scratch, root_idx, cwd=0)
+  //       -> rax = parent_vnode_idx or 0.  0 -> -ENOENT.
+  //   (7) vnode_slot(parent_vnode_idx) -> &parent_vnode.  Store in r15.
+  //   (8) vops_unlink(&parent_vnode, basename_ptr) -> 0 or errno.  The
+  //       basename_ptr is &path_scratch[last_slash+1] which is already
+  //       NUL-terminated (the original strlen NUL sits at the end of
+  //       the buffer).  Non-zero return maps to -ENOENT (same "backend
+  //       refused" taxonomy sys_stat uses).
+  //   (9) Fingerprint emit: klog_s1_x1(LEVEL_INFO=3, SUBSYS_FS_,
+  //       tag_sys_unlink_ok, k_path, &path_scratch).
+  //  (10) Return 0.
+  //
+  // Register plan (5-push callee-save prologue; entry rsp%16==8 + 40 =
+  // %16==0 at every nested call site; nested callees see %16==8 at entry
+  // per SysV -- matches sys_stat_body's own 5-push discipline):
+  //   rbx = path_va          (dead after step 2; kept for prologue
+  //                            uniformity with sibling bodies)
+  //   r12 = path_len (capped) (dead after step 2)
+  //   r13 = strlen           (from step 2; consumed at step 3)
+  //   r14 = last_slash       (from step 3; consumed at steps 4/8)
+  //   r15 = &parent_vnode    (from step 7; consumed at step 8)
+  // ==========================================================================
+  pub let sys_unlink_body : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (path_va: u64) (path_len: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { cap },
+      justification: "R56.M3-005 (#1794): sys_unlink body -- ring-3 unlink syscall (sysno 81). Walks user path into kernel .bss scratch via user_read_str_via_walk, scans for the last '/' to split parent from basename, copies the parent prefix into a second scratch, resolves the parent via mount_root_vnode + path_resolve, dispatches through the R16 VOPS_UNLINK_OFFSET slot against the parent's ops table (existing dispatcher at offset 48; the per-backend adapters -- _tmpfs_unlink_adapter, _pdxfs_lite_unlink_adapter, _pdxfs_block_unlink_stub -- were landed at R16.M2-008 / R25.M6-004 / R52.M5-005). Emits the R56.M3-005 fingerprint via klog_s1_x1 (tag_sys_unlink_ok + k_path) on the success arm only. 5-push callee-save prologue (rbx=path_va, r12=path_len, r13=strlen, r14=last_slash, r15=&parent_vnode) leaves rsp%16==0 (entry %16==8, minus 40 = %16==0), the SysV pre-CALL invariant. Body: (1) cap path_len at SYS_UNLINK_PATH_MAX-1 = 255, widen 0 -> 1. (2) user_read_str_via_walk(path_va, &scratch, cap) -> strlen; strlen==0 -> EFAULT (walker rejected). (3) Byte-scan scratch[0..strlen) for the LAST '/'; track via r14 sentinel = strlen (== not-found). If r14 == strlen -> EINVAL (no anchor). If strlen == 1 AND scratch[0] == '/' -> EINVAL (root, no basename). (4) If last_slash == 0 write '/'\\0 into parent_scratch (parent-of-top-level-file is root). Else byte-copy path_scratch[0..last_slash) into parent_scratch and NUL-terminate. (5) mount_root_vnode(); rax==0 -> ENOENT. (6) path_resolve(&parent_scratch, root_idx, 0); rax==0 -> ENOENT. (7) vnode_slot -> &parent_vn; save in r15. (8) vops_unlink(&parent_vn, &scratch[last_slash+1]); rax != 0 -> ENOENT. The basename pointer is inside the original path scratch which is still NUL-terminated at position `strlen` so the vops adapter's own name-scanner sees the correct byte string. (9) klog_s1_x1(3, SUBSYS_FS_, tag_sys_unlink_ok, k_path, &scratch). (10) Return 0. All failure arms jmp sysunl_done via distinct labels setting rax to the appropriate sentinel. Labels prefixed sysunl_. No test instruction (unavailable). No mov_b arithmetic on memory operands (encoder gap: paideia-as does not support add/sub reg,[mem]; all scans use temp-register staging). Effects {mem, sysreg} @{cap} match the R56.M3-005 task pin exactly.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // rbx = path_va (unused post-walker)
+        mov r12, rsi;                    // r12 = path_len (raw)
+
+        // ---- (1) Cap path_len at SYS_UNLINK_PATH_MAX-1 = 255 ----
+        mov r10, 255;
+        cmp r12, r10;
+        jbe sysunl_cap_ok;
+        mov r12, r10;
+      sysunl_cap_ok:
+        cmp r12, 0;
+        jne sysunl_len_ok;
+        mov r12, 1;
+      sysunl_len_ok:
+
+        // ---- (2) user_read_str_via_walk(path_va, scratch, cap) ----
+        mov rdi, rbx;                    // arg0 = user path_va
+        lea rsi, [rip + _sys_unlink_path_scratch];
+        mov rdx, r12;                    // arg2 = capped cap
+        call user_read_str_via_walk;     // rax = strlen or 0 on fault
+        cmp rax, 0;
+        je  sysunl_efault;
+        mov r13, rax;                    // r13 = strlen (> 0)
+
+        // ---- (3) Scan for LAST '/' byte ----
+        //   r14 tracks last_slash; sentinel = r13 (strlen) so "not
+        //   found" is detectable after the loop.  rcx = i (0..strlen).
+        mov r14, r13;                    // r14 = strlen (== not-found sentinel)
+        lea r9, [rip + _sys_unlink_path_scratch];
+        xor rcx, rcx;
+      sysunl_scan:
+        cmp rcx, r13;
+        jae sysunl_scan_done;
+        xor r10, r10;
+        mov_b r10, [r9 + rcx*1];
+        cmp r10, 0x2F;                   // '/'
+        jne sysunl_scan_next;
+        mov r14, rcx;                    // last_slash = i
+      sysunl_scan_next:
+        add rcx, 1;
+        jmp sysunl_scan;
+      sysunl_scan_done:
+        // r14 == r13 -> no '/' at all -> EINVAL
+        cmp r14, r13;
+        je  sysunl_einval;
+
+        // Refuse the root "/" case: strlen == 1 AND last_slash == 0
+        // means the only byte was the anchor; there's no basename to
+        // unlink.
+        cmp r13, 1;
+        jne sysunl_leaf_ok;
+        cmp r14, 0;
+        je  sysunl_einval;
+      sysunl_leaf_ok:
+
+        // Refuse trailing-slash paths: last_slash + 1 == strlen means
+        // the basename is empty ("/foo/" has no leaf).
+        mov r10, r14;
+        add r10, 1;
+        cmp r10, r13;
+        je  sysunl_einval;
+
+        // ---- (4) Materialize parent path in _sys_unlink_parent_scratch ----
+        //   Special case: last_slash == 0 -> parent is root, write "/\0".
+        cmp r14, 0;
+        jne sysunl_parent_copy;
+        lea rdi, [rip + _sys_unlink_parent_scratch];
+        mov r10, 0x2F;                   // '/'
+        mov_b [rdi + 0], r10;
+        xor r10, r10;
+        mov_b [rdi + 1], r10;            // NUL
+        jmp sysunl_parent_ready;
+      sysunl_parent_copy:
+        lea r8, [rip + _sys_unlink_path_scratch];
+        lea r9, [rip + _sys_unlink_parent_scratch];
+        xor rcx, rcx;
+      sysunl_copy_top:
+        cmp rcx, r14;
+        jae sysunl_copy_done;
+        xor r10, r10;
+        mov_b r10, [r8 + rcx*1];
+        mov_b [r9 + rcx*1], r10;
+        add rcx, 1;
+        jmp sysunl_copy_top;
+      sysunl_copy_done:
+        // NUL-terminate parent scratch at index last_slash.
+        xor r10, r10;
+        mov_b [r9 + r14*1], r10;
+      sysunl_parent_ready:
+
+        // ---- (5) mount_root_vnode() ----
+        call mount_root_vnode;           // rax = root_vnode_idx
+        cmp rax, 0;
+        je  sysunl_enoent;
+        mov r10, rax;                    // stash root_idx across path_resolve args
+
+        // ---- (6) path_resolve(&parent_scratch, root_idx, cwd=0) ----
+        lea rdi, [rip + _sys_unlink_parent_scratch];
+        mov rsi, r10;                    // arg1 = root_idx
+        xor rdx, rdx;                    // arg2 = cwd = 0
+        call path_resolve;               // rax = parent_vnode_idx or 0
+        cmp rax, 0;
+        je  sysunl_enoent;
+
+        // ---- (7) vnode_slot(parent_idx) -> &parent_vn ----
+        mov rdi, rax;
+        call vnode_slot;                 // rax = &parent_vnode
+        mov r15, rax;                    // r15 = &parent_vnode
+
+        // ---- (8) vops_unlink(&parent_vn, basename_ptr) ----
+        //   basename_ptr = &path_scratch[last_slash + 1].  The path
+        //   buffer is already NUL-terminated at position `strlen`, so
+        //   the vops adapter's own strlen scan sees the correct name.
+        mov rdi, r15;                    // arg0 = &parent_vn
+        lea r10, [rip + _sys_unlink_path_scratch];
+        add r10, r14;
+        add r10, 1;                      // r10 = &scratch[last_slash + 1]
+        mov rsi, r10;                    // arg1 = basename_ptr
+        call vops_unlink;                // rax = 0 or errno
+        cmp rax, 0;
+        jne sysunl_enoent;
+
+        // ---- (9) Fingerprint emit ----
+        //   klog_s1_x1(LEVEL_INFO=3, SUBSYS_FS_, tag_sys_unlink_ok,
+        //              k_path, v1=&_sys_unlink_path_scratch (as hex u64))
+        mov rdi, 3;                                  // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_FS__];
+        lea rdx, [rip + tag_sys_unlink_ok];
+        lea rcx, [rip + k_path];                     // k1 = "path"
+        lea r8,  [rip + _sys_unlink_path_scratch];   // v1 = path buf VA
+        call klog_s1_x1;
+
+        // ---- (10) Success return ----
+        xor rax, rax;                    // SYS_UNLINK_OK = 0
+        jmp sysunl_done;
+
+      sysunl_enoent:
+        mov rax, 0xFFFFFFFFFFFFFFFE;     // -ENOENT
+        jmp sysunl_done;
+
+      sysunl_einval:
+        mov rax, 0xFFFFFFFFFFFFFFEA;     // -EINVAL
+        jmp sysunl_done;
+
+      sysunl_efault:
+        mov rax, 0xFFFFFFFFFFFFFFF2;     // -EFAULT
+
+      sysunl_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

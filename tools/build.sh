@@ -6491,6 +6491,73 @@ fi
 echo "[r56-m3-004-confine] R56.M3-004 (sys_mkdir + sys_rmdir) confined"
 
 # ---------------------------------------------------------------------------
+# R56.M3-005 (#1794): one-writer discipline for the sys_unlink + sys_rename
+# scratches.
+#
+#   * sys_unlink (sys_unlink_body, src/kernel/core/syscall/sys_unlink.pdx)
+#   * sys_rename (sys_rename_body, src/kernel/core/syscall/sys_rename.pdx)
+#
+# Each syscall body owns per-syscall .bss scratches for the KPTI landing
+# zones its user_read_str_via_walk calls fill under kernel CR3, plus (for
+# sys_rename) a derived parent-prefix scratch used to enforce the
+# same-parent gate before the vops_rename dispatch.  Each scratch has
+# exactly one legitimate writer (the sole call site is inside the owning
+# syscall body); a second writer against any slot would let one caller's
+# in-flight path copy be overwritten by another's mid-scan, silently
+# routing the vops_unlink / vops_rename dispatch against the wrong parent
+# or leaf.  Matches _sys_stat_path_scratch / _sys_stat_out_scratch's own
+# per-module posture at R56.M3-002 (sys_stat.pdx).
+R56_SYSUNLINK_SRC="${REPO_ROOT}/src/kernel/core/syscall/sys_unlink.pdx"
+if [[ ! -f "${R56_SYSUNLINK_SRC}" ]]; then
+    echo "[r56-m3-005-confine] FAIL - sys_unlink.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_sys_unlink_path_scratch'   'core/syscall/sys_unlink.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See sys_unlink.pdx §Static storage for the per-module one-writer" >&2
+    echo "  discipline (the sole writer is user_read_str_via_walk called" >&2
+    echo "  from sys_unlink_body; the sole reader is path_resolve on the" >&2
+    echo "  in-file call chain)." >&2
+    exit 1
+fi
+ec_confine_one '_sys_unlink_parent_scratch' 'core/syscall/sys_unlink.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See sys_unlink.pdx §Static storage for the per-module one-writer" >&2
+    echo "  discipline (the sole writer is sys_unlink_body's own parent-copy" >&2
+    echo "  loop; the sole reader is path_resolve on the in-file call chain)." >&2
+    exit 1
+fi
+R56_SYSRENAME_SRC="${REPO_ROOT}/src/kernel/core/syscall/sys_rename.pdx"
+if [[ ! -f "${R56_SYSRENAME_SRC}" ]]; then
+    echo "[r56-m3-005-confine] FAIL - sys_rename.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_sys_rename_old_scratch'    'core/syscall/sys_rename.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See sys_rename.pdx §Static storage for the per-module one-writer" >&2
+    echo "  discipline (the sole writer is user_read_str_via_walk called" >&2
+    echo "  from sys_rename_body on the old path; the sole reader is the" >&2
+    echo "  same-parent gate + vops_rename dispatch on the in-file chain)." >&2
+    exit 1
+fi
+ec_confine_one '_sys_rename_new_scratch'    'core/syscall/sys_rename.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See sys_rename.pdx §Static storage for the per-module one-writer" >&2
+    echo "  discipline (the sole writer is user_read_str_via_walk called" >&2
+    echo "  from sys_rename_body on the new path; the sole reader is the" >&2
+    echo "  same-parent gate + vops_rename dispatch on the in-file chain)." >&2
+    exit 1
+fi
+ec_confine_one '_sys_rename_parent_scratch' 'core/syscall/sys_rename.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See sys_rename.pdx §Static storage for the per-module one-writer" >&2
+    echo "  discipline (the sole writer is sys_rename_body's own parent-copy" >&2
+    echo "  loop; the sole reader is path_resolve on the in-file call chain)." >&2
+    exit 1
+fi
+echo "[r56-m3-005-confine] R56.M3-005 (sys_unlink + sys_rename) confined"
+
+# ---------------------------------------------------------------------------
 # R53.M3-001 (#1742): confinement for the root-volume UUID hint slot in
 # the factored boot handoff record.
 #
