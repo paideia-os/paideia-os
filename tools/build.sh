@@ -6447,6 +6447,50 @@ fi
 echo "[r56-m3-002-confine] R56.M3-002 (sys_stat) confined"
 
 # ---------------------------------------------------------------------------
+# R56.M3-004 (#1793): one-writer discipline for the sys_mkdir / sys_rmdir
+# path scratches.
+#
+#   * sys_mkdir (sys_mkdir_body, src/kernel/core/syscall/sys_mkdir.pdx)
+#   * sys_rmdir (sys_rmdir_body, src/kernel/core/syscall/sys_rmdir.pdx)
+#
+# Each body owns a 256-byte KPTI landing zone the syscall walks the
+# caller's user path into (via user_read_str_via_walk) before splitting
+# in place and handing the parent-path to path_resolve.  Same posture
+# as _sys_stat_path_scratch at R56.M3-002 (see the confinement block
+# above) and _sys_umount_path_scratch at R53.M2-003.  A second writer
+# against either slot would let one caller's in-flight path copy or
+# basename split be overwritten by another's mid-scan -- the resolver
+# would then see whichever bytes lost the race, silently creating or
+# removing a directory bound to the wrong parent.
+R56_SYSMKDIR_SRC="${REPO_ROOT}/src/kernel/core/syscall/sys_mkdir.pdx"
+if [[ ! -f "${R56_SYSMKDIR_SRC}" ]]; then
+    echo "[r56-m3-004-confine] FAIL - sys_mkdir.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_sys_mkdir_path_scratch' 'core/syscall/sys_mkdir.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See sys_mkdir.pdx §Static storage for the per-module one-writer" >&2
+    echo "  discipline (sole writer is user_read_str_via_walk called from" >&2
+    echo "  sys_mkdir_body; sole reader is path_resolve on the in-file" >&2
+    echo "  call chain)." >&2
+    exit 1
+fi
+R56_SYSRMDIR_SRC="${REPO_ROOT}/src/kernel/core/syscall/sys_rmdir.pdx"
+if [[ ! -f "${R56_SYSRMDIR_SRC}" ]]; then
+    echo "[r56-m3-004-confine] FAIL - sys_rmdir.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_sys_rmdir_path_scratch' 'core/syscall/sys_rmdir.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See sys_rmdir.pdx §Static storage for the per-module one-writer" >&2
+    echo "  discipline (sole writer is user_read_str_via_walk called from" >&2
+    echo "  sys_rmdir_body; sole reader is path_resolve on the in-file" >&2
+    echo "  call chain)." >&2
+    exit 1
+fi
+echo "[r56-m3-004-confine] R56.M3-004 (sys_mkdir + sys_rmdir) confined"
+
+# ---------------------------------------------------------------------------
 # R53.M3-001 (#1742): confinement for the root-volume UUID hint slot in
 # the factored boot handoff record.
 #

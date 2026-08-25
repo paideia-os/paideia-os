@@ -1,0 +1,528 @@
+// src/kernel/core/fs/pdxfs/dir.pdx -- R56.M3-004 (#1793)
+//
+// PDXFS-ON-BLOCK v1 -- DIRECTORY DENTRY PACK/UNPACK/APPEND/REMOVE/FIND.
+//
+// -----------------------------------------------------------------------------
+// Scope
+// -----------------------------------------------------------------------------
+//
+// This file lands the five dentry helpers R56's mkdir/rmdir bodies want a
+// stable interface for once the pdxfs-block vnode-to-mount-context bridge
+// exists (R56.M4+; see vops_block.pdx §pdxfs_block_mkdir_stub for the
+// gap statement).  The helpers operate over a caller-supplied in-memory
+// directory-data byte buffer (already read from disk via cow_read /
+// inode_table_read at the caller-side); this module never touches bdev
+// or the inode table itself -- that is the caller's job at the mkdir /
+// rmdir body layer.
+//
+// The five helpers:
+//
+//   dir_dentry_pack(buf_ptr, ino, name_ptr, name_len) -> u64
+//     Writes a 12-byte header + name[name_len] at buf_ptr.  Returns
+//     bytes_written = 12 + name_len.  Same on-disk record shape as the
+//     sys_getdents wire format frozen at R56.M3-003 (sys_getdents.pdx
+//     §Record layout) so a caller that reads a pdxfs-block directory
+//     and hands its bytes to sys_getdents needs no further translation.
+//
+//   dir_dentry_unpack(buf_ptr, out_ino_ptr, out_name_ptr_ptr, out_name_len_ptr) -> u64
+//     Reads a 12-byte header + name at buf_ptr, writes {ino, &name,
+//     name_len} to the caller's output slots, and returns
+//     next_ptr = buf_ptr + 12 + name_len (the address of the next
+//     record).  Callers cursor-walk a dir by calling this repeatedly
+//     and stopping when the returned name_len is 0 (terminator).
+//
+//   dir_find(dir_data_ptr, dir_size, name_ptr, name_len, out_ino_ptr) -> u64
+//     Linear scan for the first dentry whose name matches name_ptr[
+//     0..name_len].  Returns 1 on hit (with *out_ino_ptr = ino) or 0
+//     on miss (out_ino left untouched).  Comparison is byte-exact
+//     (no case folding, no Unicode normalisation -- matches the M4
+//     tmpfs lookup posture).
+//
+//   dir_append(dir_data_ptr, dir_size, ino, name_ptr, name_len) -> u64
+//     Appends a fresh dentry at dir_data_ptr + dir_size and returns
+//     new_size = dir_size + 12 + name_len.  Caller is responsible for
+//     bounds-checking the underlying buffer (dir_size + 12 + name_len
+//     must fit) -- this helper trusts the caller's pre-scan.  A
+//     duplicate-name pre-check is the caller's job too (see dir_find);
+//     appending unconditionally lets a caller batch (find-then-append)
+//     without paying two scans in the common no-duplicate case.
+//
+//   dir_remove(dir_data_ptr, dir_size, name_ptr, name_len) -> u64
+//     Locates the target dentry via a linear scan matching name_ptr[
+//     0..name_len], byte-shifts every tail dentry down by (12 +
+//     target_name_len), and returns new_size = dir_size - (12 +
+//     target_name_len).  If the name is not found, returns dir_size
+//     unchanged (caller distinguishes "removed" via a size-delta check
+//     rather than a sentinel -- there is no "not found" errno slot in
+//     the M4 dentry-band, and callers already hold dir_size prior to
+//     the call).
+//
+// -----------------------------------------------------------------------------
+// Record layout (frozen for the R52+ block-backed dir format)
+// -----------------------------------------------------------------------------
+//
+//   +0   ino:      u64  (inode index; 0 = terminator, non-zero = live)
+//   +8   name_len: u16  (byte count of the name field; 0 = terminator)
+//   +10  type:     u8   (VNODE_TYPE_DIR=2, VNODE_TYPE_REG=1; ignored by
+//                        find/remove -- comparison is name-only)
+//   +11  reserved: u8   (always 0; forward-compat)
+//   +12  name[name_len]  (no NUL terminator; length-tagged)
+//
+// Records are packed contiguously; the terminator dentry (12-byte header
+// with name_len == 0) marks end-of-directory.  This byte-for-byte
+// matches the sys_getdents wire format frozen at R56.M3-003 so a caller
+// that reads a pdxfs-block directory and hands its bytes to a
+// user-space getdents(2) needs no further translation -- the vops_
+// readdir path in a follow-up round is a bulk-copy, not a re-pack.
+//
+// -----------------------------------------------------------------------------
+// Non-scope
+// -----------------------------------------------------------------------------
+//
+// This module does NOT:
+//   - Touch bdev / inode_table / WAL / journal.  The caller reads a
+//     directory's data pages into a caller-owned buffer, calls dir_*
+//     helpers to mutate, and writes back via cow_write + inode_table_
+//     write.  Splitting this way keeps R56's dir helpers testable in
+//     isolation (no NVMe substrate needed for their coverage).
+//   - Enforce a name-length cap.  The caller (sys_mkdir_body / sys_
+//     rmdir_body / a future pdxfs-block dir walker) enforces the
+//     dentry-name field's 240-byte cap (PDXFS_MUT_DIRENT_NAME_MAX per
+//     pdxfs_lite's own posture) before calling pack/append.  This
+//     module trusts the caller.
+//   - Validate the terminator sentinel on every unpack.  A caller
+//     walking a dir uses the returned name_len == 0 as its own stop
+//     condition; if the caller mis-cursor-walks past the terminator,
+//     the helper still returns a well-formed unpack of whatever bytes
+//     follow (which will be whatever the underlying buffer holds).
+//     This is the same posture inode_table's inode_read takes with its
+//     "caller must not walk past itable_bcount" contract.
+//
+// -----------------------------------------------------------------------------
+// Encoder discipline
+// -----------------------------------------------------------------------------
+//
+// paideia-as does NOT support `add reg, [mem]` or `sub reg, [mem]` -- every
+// memory operand is staged through a register first.  Byte / word-sized
+// memory access uses mov_b / mov_w (proven idioms in tmpfs/init.pdx,
+// pdxfs_lite/readdir.pdx, sys_getdents.pdx).  Every function is a leaf
+// or single-nested-call (no cross-function calls out of this module),
+// so alignment discipline is straightforward: entry rsp%16==8; a K-push
+// prologue reaches %16 == (8 - K*8) mod 16, and callee CALL pushes
+// retaddr for another -8 delta so callee-entry %16 == %16_at_call - 8.
+//
+// Reserved-label discipline: labels prefixed by function-abbrev
+// (`dp_` for dir_dentry_pack, `du_` for dir_dentry_unpack,
+// `df_` for dir_find, `da_` for dir_append, `dr_` for dir_remove).
+
+module Dir = structure {
+
+  // ============================================================================
+  // Layout constants (frozen)
+  // ============================================================================
+
+  pub let DIR_HEADER_BYTES     : u64 = 12
+  pub let DIR_HEADER_INO_OFF   : u64 = 0
+  pub let DIR_HEADER_NLEN_OFF  : u64 = 8
+  pub let DIR_HEADER_TYPE_OFF  : u64 = 10
+  pub let DIR_HEADER_RSRV_OFF  : u64 = 11
+  pub let DIR_NAME_OFF         : u64 = 12
+  pub let DIR_NAME_MAX         : u64 = 240   // caller's cap for name field
+
+  // ============================================================================
+  // dir_dentry_pack(buf_ptr: u64, ino: u64, name_ptr: u64, name_len: u64) -> u64
+  //   Writes a fresh dentry at buf_ptr: header at +0..+12, name at
+  //   +12..+12+name_len.  type byte defaults to 0 -- callers that
+  //   care about the type byte (sys_getdents consumers) rewrite
+  //   [buf_ptr + 10] with the real VNODE_TYPE_* value post-pack.
+  //   The rationale for defaulting type=0 here rather than accepting
+  //   a 5th arg: paideia-as function arity would then hit 5, still
+  //   within the 6-limit, but the two current callers (mkdir body's
+  //   append, and dir_append below) both know the child's type via
+  //   the caller-side inode object rather than a separate scalar,
+  //   so keeping the pack surface at 4 args reflects the actual
+  //   call sites' argument geometry.  Returns bytes_written = 12 +
+  //   name_len.
+  //
+  // Register plan (leaf, no callee-save):
+  //   rdi = buf_ptr (dst base; consumed via [rdi+imm] stores)
+  //   rsi = ino
+  //   rdx = name_ptr (src)
+  //   rcx = name_len
+  //   rax = byte counter for the copy loop, then return value
+  //   r8, r9, r10, r11 = scratch
+  // ============================================================================
+  pub let dir_dentry_pack : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (buf_ptr: u64) (ino: u64) (name_ptr: u64) (name_len: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R56.M3-004 (#1793). Leaf function, no callee-save touched. Body: (1) Store ino (u64) at [rdi+0]. (2) Store name_len (u16) at [rdi+8] via mov_w. (3) Store type=0 (u8) at [rdi+10] via mov_b (caller may overwrite post-pack with the real VNODE_TYPE_* value). (4) Store reserved=0 (u8) at [rdi+11] via mov_b. (5) Byte-copy name[0..name_len] from [rsi+i] to [rdi+12+i] via a manual rax=0..rcx loop with mov_b (indexed by rax*1 addressing form proven in tmpfs/init.pdx L52-L112). (6) rax = 12 + name_len; ret. No nested calls -> no alignment concern. No test; no `add reg, [mem]` (all memory access stores or byte-loads).",
+      block: {
+        // Store ino (u64) at [rdi+0].
+        mov [rdi + 0], rsi;
+
+        // Store name_len (u16) at [rdi+8].
+        mov_w [rdi + 8], rcx;
+
+        // Store type=0 (u8) at [rdi+10].
+        xor r8, r8;
+        mov_b [rdi + 10], r8;
+
+        // Store reserved=0 (u8) at [rdi+11].
+        mov_b [rdi + 11], r8;
+
+        // Byte-copy name[0..name_len]: rax = 0..rcx.
+        xor rax, rax;
+
+      dp_copy_top:
+        cmp rax, rcx;
+        jae dp_copy_done;
+        xor r8, r8;
+        mov_b r8, [rdx + rax*1];
+        // Destination cursor = rdi + 12 + rax. Stage rdi + 12 into r9
+        // once (loop-invariant), then index by rax on every iteration.
+        mov r9, rdi;
+        add r9, 12;
+        mov_b [r9 + rax*1], r8;
+        add rax, 1;
+        jmp dp_copy_top;
+
+      dp_copy_done:
+        // rax = 12 + name_len.
+        mov rax, 12;
+        add rax, rcx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // dir_dentry_unpack(buf_ptr: u64, out_ino_ptr: u64, out_name_ptr_ptr: u64,
+  //                   out_name_len_ptr: u64) -> u64
+  //   Reads a header + name at buf_ptr, writes {ino, &name (= buf_ptr+12),
+  //   name_len} to the caller's output slots (each an 8-byte u64 for ino /
+  //   name_ptr / name_len -- the caller may narrow name_len to u16 on its
+  //   side; this helper always stores the u64-widened value for uniformity).
+  //   Returns next_ptr = buf_ptr + 12 + name_len.
+  //
+  // Register plan (leaf):
+  //   rdi = buf_ptr
+  //   rsi = out_ino_ptr
+  //   rdx = out_name_ptr_ptr
+  //   rcx = out_name_len_ptr
+  //   rax = return (next_ptr)
+  //   r8, r9 = scratch
+  // ============================================================================
+  pub let dir_dentry_unpack : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (buf_ptr: u64) (out_ino_ptr: u64) (out_name_ptr_ptr: u64) (out_name_len_ptr: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R56.M3-004 (#1793). Leaf function, no callee-save touched. Body: (1) Load ino = [rdi+0] into r8; store at [rsi]. (2) Load name_len (u16 zero-extended) via mov_w r9, [rdi+8]; store as u64 at [rcx]. (3) Compute name_ptr = rdi + 12; store at [rdx]. (4) rax = rdi + 12 + name_len (next_ptr). ret. No test; no `add reg, [mem]`.",
+      block: {
+        // ino = [rdi+0].
+        mov r8, [rdi + 0];
+        mov [rsi + 0], r8;
+
+        // name_len (u16 zero-extended) = [rdi+8].
+        xor r9, r9;
+        mov_w r9, [rdi + 8];
+        mov [rcx + 0], r9;
+
+        // name_ptr = rdi + 12.
+        mov r8, rdi;
+        add r8, 12;
+        mov [rdx + 0], r8;
+
+        // next_ptr = rdi + 12 + name_len.
+        mov rax, rdi;
+        add rax, 12;
+        add rax, r9;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // dir_find(dir_data_ptr: u64, dir_size: u64, name_ptr: u64,
+  //          name_len: u64, out_ino_ptr: u64) -> u64
+  //   Linear scan for the first dentry matching name_ptr[0..name_len].
+  //   Returns 1 on hit (with *out_ino_ptr = ino) or 0 on miss.
+  //   Stops at the first record whose name_len == 0 (terminator) or
+  //   whose cursor >= dir_size.
+  //
+  // Register plan (leaf-adjacent -- calls no other function):
+  //   Args: rdi=dir_data_ptr, rsi=dir_size, rdx=name_ptr, rcx=name_len, r8=out_ino_ptr
+  //   Locals: r9=cursor, r10=cur_name_len, r11=cur_record_ptr,
+  //           rax=return, r12/r13=byte-compare pair
+  //
+  //   The 5-arg surface uses one callee-save (r12) for the byte-
+  //   compare's src cursor; r13 for the byte-compare's tgt cursor.
+  //   Entry rsp%16==8, 2 pushes -> %16==8; no nested calls so no
+  //   alignment adjustment needed pre-ret (pop restores %16==8, ret
+  //   pops retaddr for %16==0 at caller-post-return per SysV).
+  // ============================================================================
+  pub let dir_find : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dir_data_ptr: u64) (dir_size: u64) (name_ptr: u64) (name_len: u64) (out_ino_ptr: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R56.M3-004 (#1793). Body: 2-push callee-save prologue (r12 for src byte cursor, r13 for tgt byte cursor). No nested calls -- alignment is invariant. Outer walk over dir_data_ptr .. dir_data_ptr + dir_size. Per record: (1) Load cur_name_len (u16 zx) at [cursor+8]; if 0 -> terminator, ret 0. (2) If cur_name_len != name_len -> advance cursor by 12 + cur_name_len, continue. (3) Byte-compare name_ptr[0..name_len] vs [cursor+12..cursor+12+name_len]; if any mismatch -> advance + continue. (4) Match -> ino = [cursor+0]; store at [r8]; ret 1. Reserved labels: df_. No test; no `add reg, [mem]` (all mem reads staged into registers first). Bound-safe: if cursor + 12 > dir_data_ptr + dir_size, treated as terminator (caller's dir_size arg is authoritative).",
+      block: {
+        push r12;
+        push r13;
+
+        // r9 = current cursor offset (0 .. dir_size).
+        xor r9, r9;
+
+      df_top:
+        // Bound: cursor + 12 must fit in dir_size.
+        mov r10, r9;
+        add r10, 12;
+        cmp r10, rsi;
+        ja  df_miss;
+
+        // r11 = &record = dir_data_ptr + cursor.
+        mov r11, rdi;
+        add r11, r9;
+
+        // Load cur_name_len (u16 zx) at [r11+8].
+        xor r10, r10;
+        mov_w r10, [r11 + 8];
+        cmp r10, 0;
+        je  df_miss;                            // terminator
+
+        // If cur_name_len != name_len, skip.
+        cmp r10, rcx;
+        jne df_skip;
+
+        // Byte-compare name_ptr[0..name_len] vs [r11+12..r11+12+name_len].
+        // r12 = src cursor (rdx + i), r13 = tgt cursor base (r11 + 12).
+        xor r12, r12;
+        mov r13, r11;
+        add r13, 12;
+
+      df_cmp_top:
+        cmp r12, rcx;
+        jae df_hit;
+        xor rax, rax;
+        mov_b rax, [rdx + r12*1];
+        xor r10, r10;
+        mov_b r10, [r13 + r12*1];
+        cmp rax, r10;
+        jne df_skip;
+        add r12, 1;
+        jmp df_cmp_top;
+
+      df_hit:
+        // ino at [r11+0].
+        mov rax, [r11 + 0];
+        mov [r8 + 0], rax;
+        mov rax, 1;
+        pop r13;
+        pop r12;
+        ret;
+
+      df_skip:
+        // advance cursor by 12 + cur_name_len (r10 was clobbered in
+        // the compare loop -- reload).
+        xor r10, r10;
+        mov_w r10, [r11 + 8];
+        add r9, 12;
+        add r9, r10;
+        jmp df_top;
+
+      df_miss:
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // dir_append(dir_data_ptr: u64, dir_size: u64, ino: u64,
+  //            name_ptr: u64, name_len: u64) -> u64
+  //   Appends a fresh dentry at dir_data_ptr + dir_size via a single
+  //   dir_dentry_pack call.  Returns new_size = dir_size + 12 +
+  //   name_len.  Caller is responsible for pre-scanning duplicates
+  //   via dir_find; a wrapper (mkdir body) that wants both semantics
+  //   composes them explicitly.
+  //
+  // Register plan (single nested call to dir_dentry_pack):
+  //   Args: rdi=dir_data_ptr, rsi=dir_size, rdx=ino, rcx=name_ptr, r8=name_len
+  //   Prologue: 1 push (rbx = dir_size, for the post-call new_size
+  //   compute).  Entry rsp%16==8 + 8 = 16, %16==0 pre-call; nested
+  //   call sees %16==8 at entry per SysV.
+  // ============================================================================
+  pub let dir_append : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dir_data_ptr: u64) (dir_size: u64) (ino: u64) (name_ptr: u64) (name_len: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R56.M3-004 (#1793). 1-push prologue (rbx = dir_size, needed for post-call new_size compute since dir_dentry_pack returns 12+name_len, not new_size). Body: (1) rbx = rsi (dir_size). (2) rdi += rsi (buf_ptr = dir_data_ptr + dir_size). (3) Shuffle for pack(buf, ino, name_ptr, name_len): rsi = rdx (ino); rdx = rcx (name_ptr); rcx = r8 (name_len). (4) call dir_dentry_pack -> rax = 12 + name_len. (5) rax += rbx -> new_size. (6) pop rbx; ret. Reserved labels: da_ (unused -- straight-line body). Nested call is aligned (entry %16==8 + 8 push = %16==0; callee entry %16==8 per SysV).",
+      block: {
+        push rbx;
+
+        mov rbx, rsi;                            // rbx = dir_size (saved for return)
+
+        // buf_ptr = dir_data_ptr + dir_size.
+        add rdi, rsi;
+
+        // Reg shuffle: pack(buf, ino, name_ptr, name_len).
+        //   rdi already = buf_ptr; rsi := ino; rdx := name_ptr; rcx := name_len.
+        mov rsi, rdx;
+        mov rdx, rcx;
+        mov rcx, r8;
+
+        call dir_dentry_pack;                    // rax = 12 + name_len
+
+        add rax, rbx;                            // new_size = dir_size + 12 + name_len
+
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // dir_remove(dir_data_ptr: u64, dir_size: u64,
+  //            name_ptr: u64, name_len: u64) -> u64
+  //   Locates the target dentry via a byte-exact name-scan, byte-shifts
+  //   every tail dentry down by (12 + target_name_len), and returns
+  //   new_size = dir_size - (12 + target_name_len).  Returns dir_size
+  //   unchanged if the name is not found.
+  //
+  // Register plan (leaf-adjacent):
+  //   Args: rdi=dir_data_ptr, rsi=dir_size, rdx=name_ptr, rcx=name_len
+  //   Prologue: 4-push (rbx=dir_data_ptr, r12=dir_size, r13=match_off,
+  //   r14=match_record_size).  Entry rsp%16==8 + 32 = 40, %16==8. No
+  //   nested calls -- no alignment adjustment needed.
+  // ============================================================================
+  pub let dir_remove : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dir_data_ptr: u64) (dir_size: u64) (name_ptr: u64) (name_len: u64) -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R56.M3-004 (#1793). 4-push prologue (rbx=dir_data_ptr, r12=dir_size, r13=match_off, r14=match_record_size). Body: (1) Save args. (2) Walk records: r9=cursor. Per record: load name_len at [ptr+8]; if 0 (terminator) or bounds exceeded -> not_found path. If name_len != rcx -> advance. Byte-compare via r15 (src cursor) + rax/r10 (byte pair). Match -> r13=cursor, r14=12+cur_name_len, jmp to shift phase. (3) Shift phase: byte-move [rbx+r13+r14+i] to [rbx+r13+i] for i in 0..(r12 - r13 - r14). (4) new_size = r12 - r14 (removed record's total span). ret new_size. (5) not_found: ret dir_size (r12). Reserved labels: dr_. No test; no `add reg, [mem]`. Uses r15 for src byte cursor -- adds a 5th push. Recount: 5-push -> entry %16==8 + 40 = 48, %16==0. Still no nested calls; %16==0 at ret is fine since ret's own pop restores to caller's %16==8.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                            // rbx = dir_data_ptr
+        mov r12, rsi;                            // r12 = dir_size
+
+        // ---- Scan phase: find match cursor into r13, record size into r14 ----
+        xor r9, r9;                              // r9 = cursor
+
+      dr_scan_top:
+        // Bound: cursor + 12 <= dir_size ?
+        mov r10, r9;
+        add r10, 12;
+        cmp r10, r12;
+        ja  dr_notfound;
+
+        mov r11, rbx;
+        add r11, r9;                             // r11 = &record
+
+        // cur_name_len (u16 zx) at [r11+8].
+        xor r10, r10;
+        mov_w r10, [r11 + 8];
+        cmp r10, 0;
+        je  dr_notfound;                         // terminator
+
+        // Skip if cur_name_len != name_len.
+        cmp r10, rcx;
+        jne dr_skip;
+
+        // Byte-compare: r15 = src cursor over the on-disk name;
+        // rax=byte from caller's name_ptr, r10=byte from record.
+        xor r15, r15;
+
+      dr_cmp_top:
+        cmp r15, rcx;
+        jae dr_match;
+        xor rax, rax;
+        mov_b rax, [rdx + r15*1];
+        // Record's name at [r11 + 12 + r15]; stage base in r8.
+        mov r8, r11;
+        add r8, 12;
+        xor r10, r10;
+        mov_b r10, [r8 + r15*1];
+        cmp rax, r10;
+        jne dr_skip;
+        add r15, 1;
+        jmp dr_cmp_top;
+
+      dr_match:
+        mov r13, r9;                             // r13 = match cursor offset
+        // record_size = 12 + name_len. r10 was clobbered in the
+        // compare loop; use rcx directly (caller's name_len == cur
+        // name_len at this point since they matched).
+        mov r14, 12;
+        add r14, rcx;
+        jmp dr_shift;
+
+      dr_skip:
+        // Advance: cursor += 12 + cur_name_len. Reload cur_name_len.
+        xor r10, r10;
+        mov_w r10, [r11 + 8];
+        add r9, 12;
+        add r9, r10;
+        jmp dr_scan_top;
+
+      dr_shift:
+        // Shift phase: byte-move [rbx + r13 + r14 + i] -> [rbx + r13 + i]
+        // for i in 0..(r12 - r13 - r14).  Stage the total shift count
+        // into r15; use r9 as the byte-index counter (dead post-scan).
+        // Encoder gap: paideia-as does NOT support `sub reg, [mem]` --
+        // fold r12/r13/r14 into r15 register-only.
+        mov r15, r12;
+        // r15 -= r13
+        mov r10, r13;
+        sub r15, r10;
+        // r15 -= r14
+        sub r15, r14;
+        // r15 now holds the tail byte count to shift down.
+
+        xor r9, r9;                              // byte index
+
+      dr_shift_top:
+        cmp r9, r15;
+        jae dr_shift_done;
+        // src byte address = rbx + r13 + r14 + r9. Stage rbx + r13 + r14
+        // into r8 once per iteration; add r9 via indexed addressing.
+        mov r8, rbx;
+        add r8, r13;
+        add r8, r14;
+        xor rax, rax;
+        mov_b rax, [r8 + r9*1];
+
+        // dst byte address = rbx + r13 + r9.
+        mov r10, rbx;
+        add r10, r13;
+        mov_b [r10 + r9*1], rax;
+
+        add r9, 1;
+        jmp dr_shift_top;
+
+      dr_shift_done:
+        // new_size = dir_size - record_size = r12 - r14.
+        mov rax, r12;
+        sub rax, r14;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      dr_notfound:
+        // Return dir_size unchanged.
+        mov rax, r12;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
