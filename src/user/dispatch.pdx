@@ -14,6 +14,7 @@ module Dispatch = structure {
   pub let sp_char = " "
   pub let nl_char = "\n"
   pub let bin_prefix = "/bin/\0"
+  pub let usr_bin_prefix = "/usr/bin/\0"
   pub let help_sep = " - \0"
   pub let env_path_msg = "PATH=/bin\n\0"
   pub let echo_desc = "echo text to stdout\0"
@@ -25,6 +26,17 @@ module Dispatch = structure {
   pub let cd_err_rel = "cd: relative paths not supported\n\0"
   pub let cd_err_long = "cd: path too long\n\0"
 
+  // R57.M4-005 (#1801): "shell exec ok" fingerprint, split into three
+  // fixed-length fragments so the emit sequence can sandwich the two
+  // runtime-length fields (argv[0] name, resolved path) between them via
+  // sys_debug_puts (SC+ ID 12). ASCII "--" (not U+2014 em-dash) per
+  // rootfs_seed.pdx L23's 7-bit-ASCII-on-wire note. Wire lengths (NUL
+  // excluded, passed explicitly as sys_debug_puts's rsi): prefix=25,
+  // mid=10, tail=25.
+  pub let sh_exec_ok_prefix = "shell exec ok -- argv[0]=\0"
+  pub let sh_exec_ok_mid = " resolved=\0"
+  pub let sh_exec_ok_tail = " [legacy: SHELL EXEC OK]\n\0"
+
   pub let mut builtin_names : [u64; 8] = uninit @align(8)
   pub let mut builtin_handlers : [u64; 8] = uninit @align(8)
   pub let mut builtin_descs : [u64; 8] = uninit @align(8)
@@ -32,6 +44,12 @@ module Dispatch = structure {
 
   pub let mut child_wait_status : [u64; 1] = uninit @align(8)
   pub let mut resolved_path : [u8; 320] = uninit @align(8)
+  // R57.M4-005 (#1801): sys_stat (SC+ ID 77) result scratch for
+  // resolve_path's PATH-prefix probe. 64 bytes matches the kernel-side
+  // stat struct layout (src/kernel/core/syscall/sys_stat.pdx); contents
+  // are unused beyond the rax==0/!=0 hit/miss signal, so no field
+  // offsets are named here.
+  pub let mut _resolved_stat_scratch : [u64; 8] = uninit @align(8)
   pub let mut _cwd_buf : [u8; 256] = uninit @align(8)
   pub let mut echo_emit_nl : u64 = uninit @align(8)
   pub let mut echo_first_token : u64 = uninit @align(8)
@@ -478,56 +496,213 @@ help_done:
       }
     } @no_frame
 
-  // resolve_path() -> u64
-  // Resolves the program path: if argv[0] contains '/', returns argv[0] unchanged.
-  // Otherwise prepends '/bin/' to argv[0] into the resolved_path .bss slot and returns its address.
-  // Uses memcpy and strlen from string.pdx for copying and length computation.
-  pub let resolve_path : () -> u64 !{mem} @{} =
-    fn () -> unsafe {
+  // rp_build_candidate(prefix_ptr: u64, prefix_len: u64) -> u64
+  // R57.M4-005 (#1801): builds "<prefix><argv[0]-name>\0" into the
+  // resolved_path .bss slot and returns its address. Parameterized
+  // sibling of the original hardcoded-/bin/-prefix build code (same
+  // memcpy+strlen shape, same r8-reload discipline), so resolve_path's
+  // PATH-prefix loop can reuse one code path for every candidate instead
+  // of duplicating the memcpy pair per prefix.
+  pub let rp_build_candidate : (u64, u64) -> u64 !{mem} @{} =
+    fn (prefix_ptr: u64) (prefix_len: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "R17-m3-006 (#626): resolve_path reads argv_buf[0]; if no '/' present prepends '/bin/' into resolved_path .bss slot and returns its address. Otherwise returns argv[0] unchanged. Uses memcpy+strlen from string.pdx; #1248-safe byte loads (xor rax; mov al; cmp rax).",
+      justification: "R57.M4-005 (#1801): rp_build_candidate(prefix_ptr, prefix_len) copies prefix_ptr[0..prefix_len) then argv_buf[0]'s NUL-terminated name into resolved_path, returning &resolved_path. r10 holds prefix_len across the first memcpy call (memcpy clobbers rax/rcx/rdi/rsi/r8, but not r9/r10) so the second copy's destination offset (resolved_path + prefix_len) can be computed via register-register `add rdi, r10` -- no `add reg, [mem]` per this file's encoder-conservatism discipline. Mirrors the WAVE-9 (#1012) r8-reload fix in the original resolve_prepend code: memcpy's `mov r8, rdi` (dst-save for return) clobbers r8, so argv_buf[0]'s pointer is reloaded into r8 fresh before each use; strlen is relied upon to preserve r8 (per its string.pdx impl, which only touches rax/rcx/rdi) so a single reload before `call strlen` suffices to carry the pointer through both the length computation and the subsequent memcpy's src argument.",
+      block: {
+        // rdi = prefix_ptr, rsi = prefix_len (SysV arg registers, per the
+        // curried fn signature above -- same binding memcpy/strlen use).
+        mov r10, rsi;                    // r10 = prefix_len (survives the memcpy call below)
+        mov r9, rdi;                     // r9 = prefix_ptr
+
+        lea rdi, [rip + resolved_path];  // dst = &resolved_path
+        mov rsi, r9;                     // src = prefix_ptr
+        mov rdx, r10;                    // n = prefix_len
+        call memcpy;
+
+        // memcpy clobbers r8 (its impl does `mov r8, rdi` to save dst for
+        // return, per the WAVE-9 (#1012) fix this mirrors). Reload argv[0]
+        // pointer fresh before using r8 again.
+        lea rax, [rip + argv_buf];
+        mov r8, [rax];
+        mov rdi, r8;
+        call strlen;                     // rax = strlen(argv[0]); strlen preserves r8
+        add rax, 1;                      // include NUL terminator
+        mov rdx, rax;                    // n = namelen + 1
+        lea rdi, [rip + resolved_path];
+        add rdi, r10;                    // dst = resolved_path + prefix_len (register-only add)
+        mov rsi, r8;                     // src = argv[0] ptr (preserved by strlen)
+        call memcpy;
+
+        lea rax, [rip + resolved_path];
+        ret
+      }
+    } @no_frame
+
+  // resolve_path() -> u64
+  // R57.M4-005 (#1801): PATH-prefix walk for argv[0] without a '/'.
+  //
+  // Design:
+  //   - If argv[0] contains '/': legacy as-is behavior (return argv[0]
+  //     unchanged), but still emit the "shell exec ok" fingerprint
+  //     (resolved == argv[0] name) so downstream shell smokes observe
+  //     that resolve_path executed on this path too.
+  //   - Otherwise walk a hardcoded PATH prefix list ["/bin/", "/usr/bin/"]
+  //     (mirrors init's PATH=/bin:/usr/bin per the issue). For each
+  //     prefix: build "<prefix><argv[0]>\0" into the resolved_path .bss
+  //     slot via rp_build_candidate, then probe it with sys_stat (SC+ ID
+  //     77, rdi=path, rsi=255, rdx=&_resolved_stat_scratch). rax == 0 ->
+  //     hit: emit the fingerprint and return &resolved_path. rax != 0 ->
+  //     miss: try the next prefix.
+  //   - If every prefix misses, fall through to the legacy /bin/-prepend
+  //     behavior (rebuild resolved_path with bin_prefix, no fingerprint)
+  //     so execve still runs and fails with the same ENOENT-style
+  //     failure mode as before #1801 -- no regression on a genuinely
+  //     missing binary.
+  //
+  //   Deferred: env-passed PATH. init.pdx is NOT touched by this issue --
+  //   sys_execve_shim does not populate envp at M0 (see ls.pdx L7-11's
+  //   header note re sys_execve_shim.pdx §Non-Scope), so there is no
+  //   envp for init to seed a PATH variable into. The two-prefix list
+  //   here is hardcoded and stays that way until execve gains envp
+  //   support.
+  //
+  // Uses memcpy and strlen from string.pdx for copying and length
+  // computation, and inline `mov rax, 77/12; syscall` for sys_stat /
+  // sys_debug_puts (mirrors rootfs_seed.pdx's inline-syscall shape).
+  pub let resolve_path : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "R57.M4-005 (#1801): resolve_path now walks a hardcoded two-entry PATH prefix list (\"/bin/\", \"/usr/bin/\") when argv[0] has no '/', probing each candidate with sys_stat (SC+ ID 77) via rp_build_candidate before committing to it, and falls through to the legacy /bin/-prepend behavior only if both miss (no regression: execve still fails ENOENT-style on a genuinely missing binary). On a hit (or on the as-is '/'-containing path) it emits a 'shell exec ok -- argv[0]=<name> resolved=<path> [legacy: SHELL EXEC OK]' fingerprint via 5 sys_debug_puts calls (SC+ ID 12) so downstream shell smokes can observe resolve_path's decision; the fall-through-to-/bin/ miss path does NOT emit it. Capabilities widen from {} to {fs} (sys_stat is fs-gated, same as sys_open/sys_getdents in ls.pdx) and effects widen from {mem} to {mem, sysreg} (every SYSCALL clobbers rcx/r11 and the debug_puts/stat calls are real SYSCALLs, not just callee calls). envp-based PATH is explicitly deferred -- see the design comment above -- because sys_execve_shim does not pass envp to the child at M0, so init.pdx has nothing to seed. Reserved-label discipline: all internal labels are rp_-prefixed (resolve_scan/resolve_prepend/resolve_asis's bare-word-adjacent names predate this fix; rp_scan/rp_asis/rp_walk_path/rp_hit replace them here) since bare `walk`/`loop`/etc. are paideia-as keywords.",
       block: {
         lea rax, [rip + argv_buf];
         mov r8, [rax];
         mov r9, r8;
-resolve_scan:
+rp_scan:
         xor rax, rax;
         mov al, [r9];
         and rax, 0xff;
         cmp rax, 0;
-        je resolve_prepend;
+        je rp_walk_path;
         cmp rax, 0x2F;
-        je resolve_asis;
+        je rp_asis;
         add r9, 1;
-        jmp resolve_scan;
-resolve_asis:
-        mov rax, r8;
-        ret;
-resolve_prepend:
-        lea rdi, [rip + resolved_path];
-        lea rsi, [rip + bin_prefix];
-        mov rdx, 5;
-        call memcpy;
-        // WAVE-9 FIX (#1012): memcpy clobbers r8 (its impl does `mov r8, rdi` to
-        // save dst for return). Reload argv[0] pointer before using r8 again.
-        // Symptom pre-fix: resolved_path = "/bin//bin//" — first memcpy left r8
-        // = &resolved_path, so strlen(r8)=5, then rep_movsb overlap-copied
-        // "/bin/" onto itself at offset +5. See wave-8 evidence.
+        jmp rp_scan;
+
+rp_asis:
+        // argv[0] already contains '/': legacy as-is behavior, plus the
+        // hit fingerprint (resolved == argv[0] name) so this path is
+        // also observable downstream.
+        lea rdi, [rip + sh_exec_ok_prefix];
+        mov rsi, 25;
+        mov rax, 12;
+        syscall;
+
         lea rax, [rip + argv_buf];
         mov r8, [rax];
         mov rdi, r8;
         call strlen;
-        add rax, 1;
-        mov rdx, rax;
-        lea rdi, [rip + resolved_path];
-        add rdi, 5;
-        // Reload r8 once more (defensive): memcpy will re-clobber it below, but
-        // strlen preserves r8 in current impl. Reload keeps the invariant local
-        // and immune to future memcpy/strlen impl changes.
+        mov rsi, rax;
         lea rax, [rip + argv_buf];
         mov r8, [rax];
-        mov rsi, r8;
-        call memcpy;
+        mov rdi, r8;
+        mov rax, 12;
+        syscall;
+
+        lea rdi, [rip + sh_exec_ok_mid];
+        mov rsi, 10;
+        mov rax, 12;
+        syscall;
+
+        lea rax, [rip + argv_buf];
+        mov r8, [rax];
+        mov rdi, r8;
+        call strlen;
+        mov rsi, rax;
+        lea rax, [rip + argv_buf];
+        mov r8, [rax];
+        mov rdi, r8;
+        mov rax, 12;
+        syscall;
+
+        lea rdi, [rip + sh_exec_ok_tail];
+        mov rsi, 25;
+        mov rax, 12;
+        syscall;
+
+        lea rax, [rip + argv_buf];
+        mov rax, [rax];
+        ret;
+
+rp_walk_path:
+        // No '/' in argv[0]: walk the hardcoded PATH prefix list.
+        lea rdi, [rip + bin_prefix];
+        mov rsi, 5;
+        call rp_build_candidate;
+
+        lea rdi, [rip + resolved_path];
+        mov rsi, 255;
+        lea rdx, [rip + _resolved_stat_scratch];
+        mov rax, 77;
+        syscall;
+        cmp rax, 0;
+        je rp_hit;
+
+        lea rdi, [rip + usr_bin_prefix];
+        mov rsi, 9;
+        call rp_build_candidate;
+
+        lea rdi, [rip + resolved_path];
+        mov rsi, 255;
+        lea rdx, [rip + _resolved_stat_scratch];
+        mov rax, 77;
+        syscall;
+        cmp rax, 0;
+        je rp_hit;
+
+        // Both candidates missed: fall through to the legacy
+        // /bin/-prepend behavior. Do NOT emit the fingerprint here --
+        // only a genuine hit emits it.
+        lea rdi, [rip + bin_prefix];
+        mov rsi, 5;
+        call rp_build_candidate;
+        ret;
+
+rp_hit:
+        // sys_stat succeeded on resolved_path (rax == 0): emit the
+        // fingerprint, then return &resolved_path.
+        lea rdi, [rip + sh_exec_ok_prefix];
+        mov rsi, 25;
+        mov rax, 12;
+        syscall;
+
+        lea rax, [rip + argv_buf];
+        mov r8, [rax];
+        mov rdi, r8;
+        call strlen;
+        mov rsi, rax;
+        lea rax, [rip + argv_buf];
+        mov r8, [rax];
+        mov rdi, r8;
+        mov rax, 12;
+        syscall;
+
+        lea rdi, [rip + sh_exec_ok_mid];
+        mov rsi, 10;
+        mov rax, 12;
+        syscall;
+
+        lea rdi, [rip + resolved_path];
+        mov r8, rdi;
+        call strlen;
+        mov rsi, rax;
+        mov rdi, r8;
+        mov rax, 12;
+        syscall;
+
+        lea rdi, [rip + sh_exec_ok_tail];
+        mov rsi, 25;
+        mov rax, 12;
+        syscall;
+
         lea rax, [rip + resolved_path];
         ret
       }

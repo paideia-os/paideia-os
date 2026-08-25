@@ -21,6 +21,11 @@ PCI_ENUMERATOR_LINK_SCRIPT="${USER_SRC}/pci_enumerator.ld"
 AUDIO_SUPERVISOR_LINK_SCRIPT="${USER_SRC}/audio_supervisor.ld"
 ELEVATE_BROKER_DAEMON_LINK_SCRIPT="${USER_SRC}/elevate_broker_daemon.ld"
 LS_LINK_SCRIPT="${USER_SRC}/ls.ld"
+RM_LINK_SCRIPT="${USER_SRC}/rm.ld"
+MV_LINK_SCRIPT="${USER_SRC}/mv.ld"
+CP_LINK_SCRIPT="${USER_SRC}/cp.ld"
+MKDIR_LINK_SCRIPT="${USER_SRC}/mkdir.ld"
+TOUCH_LINK_SCRIPT="${USER_SRC}/touch.ld"
 
 if [[ ! -f "${SHELL_LINK_SCRIPT}" ]]; then
     echo "shell linker script missing: ${SHELL_LINK_SCRIPT}" >&2
@@ -87,6 +92,31 @@ if [[ ! -f "${LS_LINK_SCRIPT}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${RM_LINK_SCRIPT}" ]]; then
+    echo "rm linker script missing: ${RM_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${MV_LINK_SCRIPT}" ]]; then
+    echo "mv linker script missing: ${MV_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${CP_LINK_SCRIPT}" ]]; then
+    echo "cp linker script missing: ${CP_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${MKDIR_LINK_SCRIPT}" ]]; then
+    echo "mkdir linker script missing: ${MKDIR_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${TOUCH_LINK_SCRIPT}" ]]; then
+    echo "touch linker script missing: ${TOUCH_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 
@@ -106,6 +136,11 @@ PCI_ENUMERATOR_OBJECTS=()
 AUDIO_SUPERVISOR_OBJECTS=()
 ELEVATE_BROKER_DAEMON_OBJECTS=()
 LS_OBJECTS=()
+RM_OBJECTS=()
+MV_OBJECTS=()
+CP_OBJECTS=()
+MKDIR_OBJECTS=()
+TOUCH_OBJECTS=()
 LIBC_OBJECTS=()
 AML_OBJECTS=()
 LIBS_OBJECTS=()
@@ -200,6 +235,33 @@ while IFS= read -r -d '' pdx; do
         # only; the ls.elf link consumes LS_OBJECTS + LIBC_OBJECTS so the
         # wrapper is NOT dragged into shell.elf / init.elf.
         LS_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "rm.pdx" ]]; then
+        # R58.M5 (paideia-os #1806): rm.pdx is self-contained (inlines
+        # sys_unlink/sys_debug_puts/sys_exit) so its object goes to its
+        # own set only -- no library pull-in. Mirrors the true.pdx /
+        # cat.pdx / ps.pdx classification pattern.
+        RM_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "mv.pdx" ]]; then
+        # R58.M5 (paideia-os #1807): mv.pdx is self-contained (inlines
+        # sys_rename/sys_debug_puts/sys_exit) so its object goes to its
+        # own set only -- no library pull-in.
+        MV_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "cp.pdx" ]]; then
+        # R58.M5 (paideia-os #1808): cp.pdx is self-contained (inlines
+        # sys_open/sys_read/sys_write/sys_close/sys_debug_puts/sys_exit,
+        # plus a same-module cp_print_u64_dec helper) so its object goes
+        # to its own set only -- no library pull-in.
+        CP_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "mkdir.pdx" ]]; then
+        # R58.M5 (paideia-os #1809): mkdir.pdx is self-contained (inlines
+        # sys_mkdir/sys_debug_puts/sys_exit) so its object goes to its
+        # own set only -- no library pull-in.
+        MKDIR_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "touch.pdx" ]]; then
+        # R58.M5 (paideia-os #1809): touch.pdx is self-contained (inlines
+        # sys_open/sys_close/sys_debug_puts/sys_exit) so its object goes
+        # to its own set only -- no library pull-in.
+        TOUCH_OBJECTS+=("${obj}")
     elif [[ "${rel}" == libc/* ]]; then
         # R57.M4-001 (#1797): src/user/libc/ -- userspace runtime library
         # for the growing R57 ring-3 surface (ls, cat, mkdir, ...). Each
@@ -564,6 +626,104 @@ if [[ ${#LS_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/ls.elf"
     echo "[ok] ${BUILD_DIR}/ls.bin"
+fi
+
+# Link rm.elf with rm objects only (R58.M5 paideia-os #1806).
+# Self-contained; no libs, no shim -- mirrors true.elf / cat.elf pattern.
+# Inlines sys_unlink (SC+ ID 81) + sys_debug_puts (SC+ ID 12) + sys_exit
+# (SC+ ID 60). No .bss content; the R31.M2-1595 (#1595) contiguity rule
+# is preserved by rm.ld verbatim.
+if [[ ${#RM_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T rm.ld -> rm.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${RM_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/rm.elf" \
+        "${RM_OBJECTS[@]}"
+
+    echo "[objcopy-user] rm.elf -> rm.bin"
+    objcopy -O binary "${BUILD_DIR}/rm.elf" "${BUILD_DIR}/rm.bin"
+
+    echo "[ok] ${BUILD_DIR}/rm.elf"
+    echo "[ok] ${BUILD_DIR}/rm.bin"
+fi
+
+# Link mv.elf with mv objects only (R58.M5 paideia-os #1807).
+# Self-contained; no libs, no shim. Inlines sys_rename (SC+ ID 82, the
+# tree's one four-argument SC+ call reachable from a self-contained
+# binary -- the 4th arg travels in r10 per the raw SYSCALL ABI, not rcx)
+# + sys_debug_puts (SC+ ID 12) + sys_exit (SC+ ID 60). No .bss content;
+# the R31.M2-1595 (#1595) contiguity rule is preserved by mv.ld verbatim.
+if [[ ${#MV_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T mv.ld -> mv.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${MV_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/mv.elf" \
+        "${MV_OBJECTS[@]}"
+
+    echo "[objcopy-user] mv.elf -> mv.bin"
+    objcopy -O binary "${BUILD_DIR}/mv.elf" "${BUILD_DIR}/mv.bin"
+
+    echo "[ok] ${BUILD_DIR}/mv.elf"
+    echo "[ok] ${BUILD_DIR}/mv.bin"
+fi
+
+# Link cp.elf with cp objects only (R58.M5 paideia-os #1808).
+# Self-contained; no libs, no shim. Inlines sys_open/sys_read/sys_write/
+# sys_close/sys_debug_puts/sys_exit plus a same-module cp_print_u64_dec
+# decimal-formatting helper (the one same-module `call` in this binary --
+# not a library pull-in). The 4 KiB cp_buf (uninit @align(8)) lives in
+# .bss; the R31.M2-1595 (#1595) contiguity rule is preserved by cp.ld
+# verbatim.
+if [[ ${#CP_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T cp.ld -> cp.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${CP_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/cp.elf" \
+        "${CP_OBJECTS[@]}"
+
+    echo "[objcopy-user] cp.elf -> cp.bin"
+    objcopy -O binary "${BUILD_DIR}/cp.elf" "${BUILD_DIR}/cp.bin"
+
+    echo "[ok] ${BUILD_DIR}/cp.elf"
+    echo "[ok] ${BUILD_DIR}/cp.bin"
+fi
+
+# Link mkdir.elf with mkdir objects only (R58.M5 paideia-os #1809).
+# Self-contained; no libs, no shim. Inlines sys_mkdir (SC+ ID 79) +
+# sys_debug_puts (SC+ ID 12) + sys_exit (SC+ ID 60). No .bss content;
+# the R31.M2-1595 (#1595) contiguity rule is preserved by mkdir.ld
+# verbatim.
+if [[ ${#MKDIR_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T mkdir.ld -> mkdir.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${MKDIR_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/mkdir.elf" \
+        "${MKDIR_OBJECTS[@]}"
+
+    echo "[objcopy-user] mkdir.elf -> mkdir.bin"
+    objcopy -O binary "${BUILD_DIR}/mkdir.elf" "${BUILD_DIR}/mkdir.bin"
+
+    echo "[ok] ${BUILD_DIR}/mkdir.elf"
+    echo "[ok] ${BUILD_DIR}/mkdir.bin"
+fi
+
+# Link touch.elf with touch objects only (R58.M5 paideia-os #1809).
+# Self-contained; no libs, no shim. Inlines sys_open (SC+ ID 2) +
+# sys_close (SC+ ID 3) + sys_debug_puts (SC+ ID 12) + sys_exit (SC+ ID 60).
+# No .bss content; the R31.M2-1595 (#1595) contiguity rule is preserved
+# by touch.ld verbatim.
+if [[ ${#TOUCH_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T touch.ld -> touch.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${TOUCH_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/touch.elf" \
+        "${TOUCH_OBJECTS[@]}"
+
+    echo "[objcopy-user] touch.elf -> touch.bin"
+    objcopy -O binary "${BUILD_DIR}/touch.elf" "${BUILD_DIR}/touch.bin"
+
+    echo "[ok] ${BUILD_DIR}/touch.elf"
+    echo "[ok] ${BUILD_DIR}/touch.bin"
 fi
 
 # R31.M2-1595 (#1595): PT_LOAD extent gate over every image linked above.

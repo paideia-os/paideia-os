@@ -61,13 +61,16 @@ else
     echo "[FAIL] bin_prefix bytes not found in .rodata"; FAIL=1
 fi
 
-# 4. resolve_path calls memcpy >= 2
-N=$(echo "$RP" | grep -Ec "call.*memcpy" || true)
-if [[ "$N" -ge 2 ]]; then echo "[ok]   resolve_path calls memcpy ($N)"; else echo "[FAIL] resolve_path memcpy count $N < 2"; FAIL=1; fi
+# 4. resolve_path (+ rp_build_candidate helper post-#1801) calls memcpy >= 2
+#    R57.M4-005 (#1801) refactored the memcpy pair into rp_build_candidate
+#    so the PATH walk can reuse the same shape per prefix. Count across both.
+RP_HELPER=$(slice rp_build_candidate || true)
+N=$(echo "$RP $RP_HELPER" | grep -Ec "call.*memcpy" || true)
+if [[ "$N" -ge 2 ]]; then echo "[ok]   resolve_path(+rp_build_candidate) calls memcpy ($N)"; else echo "[FAIL] resolve_path memcpy count $N < 2"; FAIL=1; fi
 
-# 5. resolve_path calls strlen >= 1
-N=$(echo "$RP" | grep -Ec "call.*strlen" || true)
-if [[ "$N" -ge 1 ]]; then echo "[ok]   resolve_path calls strlen ($N)"; else echo "[FAIL] resolve_path strlen count $N < 1"; FAIL=1; fi
+# 5. resolve_path (+ helper) calls strlen >= 1
+N=$(echo "$RP $RP_HELPER" | grep -Ec "call.*strlen" || true)
+if [[ "$N" -ge 1 ]]; then echo "[ok]   resolve_path(+rp_build_candidate) calls strlen ($N)"; else echo "[FAIL] resolve_path strlen count $N < 1"; FAIL=1; fi
 
 # 6. resolve_path contains cmp against 0x2F (/)
 if echo "$RP" | grep -Eq "cmp.*0x2[Ff]\b"; then
