@@ -53,7 +53,18 @@ TIMEOUT_SEC="${PAIDEIA_UEFI_OVMF_TIMEOUT:-30}"
 # push-ret jumps to a stale LMA (kernel.elf is not loaded at that PA
 # under M5) and the CPU stumbles until UEFI's #UD handler fires.
 # Users testing R20+ pass PAIDEIA_UEFI_OVMF_MARKER="UEFI kernel_main entered".
-EXPECTED_MARKER="${PAIDEIA_UEFI_OVMF_MARKER:-paideia boot: entry ok}"
+#
+# The M5 default is single-sourced from tests/expected-r19-ovmf.golden
+# (first line) rather than duplicated as a literal here, so the golden
+# stays the one place that pins the R19.M5-close fingerprint contract.
+GOLDEN_PATH="${REPO_ROOT}/tests/expected-r19-ovmf.golden"
+if [[ -n "${PAIDEIA_UEFI_OVMF_MARKER:-}" ]]; then
+    EXPECTED_MARKER="${PAIDEIA_UEFI_OVMF_MARKER}"
+elif [[ -f "${GOLDEN_PATH}" ]]; then
+    EXPECTED_MARKER="$(head -n1 "${GOLDEN_PATH}")"
+else
+    EXPECTED_MARKER="paideia boot: entry ok"
+fi
 
 # -----------------------------------------------------------------------------
 # Dependency: qemu-system-x86_64.

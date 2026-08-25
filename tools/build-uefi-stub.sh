@@ -89,8 +89,11 @@ if [[ ! -f "${KERNEL_ELF}" ]]; then
     exit 4
 fi
 
+# nm | awk with `exit` inside awk causes SIGPIPE on nm under pipefail;
+# drop the `exit` and let awk drain nm. Multiple matches would still keep
+# the first line only.
 KERNEL_MAIN_UEFI_VA="$(nm --defined-only "${KERNEL_ELF}" \
-    | awk '$3 == "kernel_main_uefi" {print $1; exit}')"
+    | awk '$3 == "kernel_main_uefi" {print $1}' | head -n1)"
 
 if [[ -z "${KERNEL_MAIN_UEFI_VA}" ]]; then
     echo "[build-uefi-stub] FAIL: symbol kernel_main_uefi not found in ${KERNEL_ELF}" >&2

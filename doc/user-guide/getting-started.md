@@ -496,7 +496,78 @@ lands.
 
 ---
 
-## 12. Where to go next
+## 12. UEFI/OVMF path (R19.M5)
+
+Separate from the `-kernel` PVH path used everywhere else in this guide,
+PaideiaOS also ships a paideia-native UEFI PE32+ stub
+(`src/boot/uefi_*.pdx`, frozen at R19.M5 close). It boots as a real EFI
+application under OVMF instead of QEMU's PVH direct-kernel-boot shortcut.
+Full narrative + real-hardware (Thinkpad T14 G4) bring-up steps live in
+`design/roadmap/r19-t14-g4-boot-guide.md`; this section covers only the
+QEMU+OVMF loop.
+
+Build the ESP image (each step re-runs the previous one if its output is
+missing, so `bash tools/build-uefi-image.sh` alone is usually enough
+once `build/kernel.elf` exists):
+
+```sh
+bash tools/build.sh              # → build/kernel.elf
+bash tools/build-uefi-stub.sh    # → build/uefi/uefi_stub.efi
+bash tools/build-uefi-image.sh   # → build/uefi/paideia-esp.img (64 MiB FAT32)
+```
+
+Boot it under QEMU + OVMF:
+
+```sh
+bash tools/run-uefi-ovmf.sh
+```
+
+The script auto-discovers OVMF firmware across distro layouts (Debian's
+split `OVMF_CODE_4M.fd`/`OVMF_VARS_4M.fd`, Fedora's `edk2-ovmf` paths, a
+merged `OVMF.fd`, or `PAIDEIA_UEFI_OVMF_CODE`/`_VARS` overrides for a
+custom edk2 build). If no firmware is found it exits 77 (SKIP) rather
+than failing — install it with:
+
+```sh
+sudo apt install ovmf          # Debian / Ubuntu
+sudo dnf install edk2-ovmf     # Fedora
+sudo pacman -S edk2-ovmf       # Arch
+```
+
+**Current expected fingerprint (R19.M5):** the single line
+`paideia boot: entry ok`, pinned in `tests/expected-r19-ovmf.golden` and
+read by `run-uefi-ovmf.sh` as its default `EXPECTED_MARKER`. This is
+`efi_main`'s `ConOut->OutputString` banner — proof the stub loaded and
+ran under OVMF's boot services. The stub's finalizer then jumps to the
+LMA-resolved `kernel_main_uefi`, but at M5 nothing has loaded
+`kernel.elf` into memory at that physical address (the ESP carries the
+ELF at `/paideia/kernel.elf` for the *future* R20 loader to consume, not
+M5 itself), so the CPU runs off the rails into firmware data and OVMF's
+own exception handler eventually catches a `#UD`/`#GP`/`#PF`. That is
+the correct, fully-expected M5 outcome — not a regression. Once the R20
+ELF loader lands, re-run with the deeper marker:
+
+```sh
+PAIDEIA_UEFI_OVMF_MARKER="UEFI kernel_main entered" bash tools/run-uefi-ovmf.sh
+```
+
+To additionally exercise the R19.M3 TCG2 measured-boot path against a
+software TPM:
+
+```sh
+bash tools/run-uefi-swtpm.sh
+```
+
+This is opt-in in the pre-push hook (`.githooks/pre-push`) behind
+`PAIDEIA_UEFI_OVMF=1` — set it before pushing to gate on the OVMF
+fixture; unset (the default), OVMF is skipped so a host without the
+firmware package installed is never blocked. `run-uefi-swtpm.sh` is not
+hooked into pre-push at all: a known OVMF+swtpm handshake hang on some
+hosts (§6 of the T14 guide) makes it exploratory rather than a gate.
+
+---
+
+## 13. Where to go next
 
 - `design/roadmap/next-wave-synthesis.md` — the full R29–R49 + G1–G6
   substrate roadmap, and the R50+ work that follows.
