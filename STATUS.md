@@ -1128,3 +1128,43 @@ R54 delivered the write-path substrate that turns the R51 NVMe driver + R52 PdxF
 None (R54 ran entirely under QEMU `-kernel` / documentation). `design/hardware/quirks.md` unchanged.
 
 **Next Round:** R55 (multi-block / PRP-list writes + pdxfs-lite mutating-op wire-through). Zero R54 blockers.
+
+---
+
+## R55 (PDXFS-block file write end-to-end) — CLOSED 2026-08-24
+
+R55 threaded the R54.M1 write-sync substrate into a composed persistent-write op on pdxfs-block volumes. Seven issues across a single milestone: `alloc_extent_run` (first-fit contiguous run over single resident bitmap block, cap 8, stamps packed extent u64 at inode+48; paired `tag_pdxb_alloc_ok`/`tag_pdxb_alloc_verify_ok` fingerprints with self-verify via `alloc_bit_test`); `inode_table_write` + `bdev_write_at` (128-B inode RMW via `nvme_read_blocking` + splice + `bdev_write_at`; new `_inode_write_scratch` @align(4096) confined to inode_table.o; substrate gate on `_nvme_io_queue_count`); `wal_append_write` / `wal_fsync_bdev` (64-B WAL records with real CRC32C csum via `jnl_crc32c_range` Castagnoli 0x82F63B78, magic `0x00014C4157584450` reads forward on disk as `"PDXWAL\x01\x00"` per superblock convention, 64 records per 4-KiB scratch, per-vol_row state in `_wal_bdev_state`); `pdxfs_block_write` (composed 14-step end-to-end write threading arg-gate → substrate short-circuit → `sb_read` → `itable_init` → `inode_read` → `alloc_extent_run` → `wal_append_write` → `wal_fsync_bdev` → `bdev_write_at` → inode byte_len update → `inode_table_write` → `klog_s1_x3` emit `tag_pdxb_write_ok ino/offset/len`, sentinels at 0xFFFFED0A/0B in R52.M1 gap after debugger caught ED28/29 collision with kind_pdxfs_txn M6 reservation, 6-push callee-save prologue, substrate short-circuit at top because per-primitive substrate branches are insufficient — `sb_read`/`inode_read`/`alloc_extent_run` reach disk via `cap_invoke`); `boot_r55_write_e2e` two-phase smoke (phase 1 stages `"hello world\n"` and calls `pdxfs_block_write`, phase 2 re-mounts + resolves inode + `nvme_read_blocking` + two-qword memcmp + emits `tag_pdxb_persist_ok`; fingerprint deviation from ticket-spec `payload="hello world\n"` because `verify-fingerprint-coverage.sh`'s `unesc()` collapses `\n` → LF, adopted `bytes=13` status marker with byte-truth enforced by memcmp gate); `PAIDEIA_R55_DISK=1` pre-push gate; and this closure retro + STATUS block + `r55-closed` tag. See `design/round-retrospectives/r55-closure.md` for the full write-up including debt inventory (mount wire-up + multi-block + mtime + build.sh silent-error swallow + unesc ordering bug).
+
+### Issues Implemented (7 total across 1 milestone)
+
+- **M2** (#1783, #1784, #1785, #1786, #1787, #1788, #1789) — PDXFS-block file write end-to-end: #1783 `alloc_extent_run`; #1784 `inode_table_write` + `bdev_write_at`; #1785 `wal_append_write` + `wal_fsync_bdev`; #1786 `pdxfs_block_write` composed end-to-end; #1787 `boot_r55_write_e2e` two-phase smoke + goldens; #1788 `PAIDEIA_R55_DISK=1` pre-push gate; #1789 closure retro + STATUS + tag.
+
+### Cross-Repo Escalations to paideia-as (R55)
+
+**None.** `paideia-as` submodule remained pinned throughout R55. **Tenth consecutive round** with zero cross-repo escalations.
+
+### Observable Proof
+
+- Kernel builds clean under `tools/build.sh`.
+- Substrate boot reaches SHELL START + `$` prompt; all R55.M2 fingerprints present in kernel.elf, silent on substrate (`_nvme_io_queue_count == 0` gate).
+- `bash tools/run-smoke.sh --with-disk --wipe boot_r55_write_e2e_phase1` errors cleanly with `mkfs-pdxb binary not built yet` guidance (expected until paideia-as #1730 lands).
+- Debugger adversarially verified every implementation diff; two catches addressed inline (WAL magic endianness in #1785, sentinel-collision in #1786) plus one build-swallow catch in #1787.
+
+### R55 Debt Carried Forward
+
+1. **Full end-to-end `boot_r55_write_e2e` exercise** — blocked by paideia-as #1730 (`mkfs-pdxb` tool not built).
+2. **Mount wire-up** — `vops_block.pdx` `_pdxfs_block_write_stub` → real body deferred to R55+ pending R52.M8 vnode adapter.
+3. **Multi-block / non-zero-offset writes** — deferred to R56.
+4. **mtime** — no monotonic real-time source in R55; inode byte_len updated but mtime not written.
+5. **Multi-bitmap-block allocation** — `alloc_extent_run` single-block-only (same posture as `alloc_block`).
+6. **pdxfs-lite mutating ops** (`create` / `unlink` / `rename`) still return `EROFS` — R55 unblocks the primitive chain; wiring is R55+ tail.
+7. **build.sh silent-error swallow** — file separately (caught during #1787 landing when M0305 module-name error left kernel.elf stale without failing the build).
+8. **verify-fingerprint-coverage.sh `unesc()` ordering** — collapses `\n` → LF before golden compare; file separately.
+
+**None regress R55 acceptance.**
+
+### Quirks Discovered on Real Hardware
+
+None (R55 ran entirely under QEMU `-kernel` / documentation).
+
+**Next Round:** R56 (cache + prefetch / pdxfs-lite mutating-op wire-through). Zero R55 blockers.
