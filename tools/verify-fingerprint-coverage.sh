@@ -270,6 +270,29 @@ ALLOWLIST = {
     "smp dispatch ok [legacy: SMP DISPATCH OK]":
         "R69.M1-004 witness emits under PAIDEIA_R69_SMP=1 opt-in mode; "
         "not in the 14-mode default matrix.",
+
+    # R87.M1 (#1965/#1966/#1971) AP-side descriptor-table markers.
+    # "ap idt ok" emits from _ap_entry (core/smp/ap_tss.pdx
+    # ap_desc_tables_install) — only reachable when an AP actually
+    # exists, i.e. under an -smp>1 boot. The 14-mode default matrix
+    # boots -smp 1 (no APs), so this never prints there. "ap idt
+    # verify ok" is the BSP-side rollup (boot/witness/r87_ap_idt.pdx);
+    # it deliberately skips its own emit when cpus_ready == 0 (see that
+    # file's own comment) for the identical reason — under -smp 1 no
+    # AP ever ran ap_tss_install, so cpus_ready is always 0 and the
+    # emit is unconditionally skipped. Both are asserted under the
+    # opt-in PAIDEIA_R87_AP_IDT=1 gate (boot_r87_ap_idt,
+    # tests/expected-r87-ap-idt.golden), same posture as the R69
+    # markers immediately above.
+    "ap idt ok [legacy: AP IDT OK]":
+        "R87.M1-003 fingerprint emits only from AP context (no APs "
+        "exist under the default -smp 1 matrix). Asserted under "
+        "PAIDEIA_R87_AP_IDT=1 (tests/expected-r87-ap-idt.golden).",
+    "ap idt verify ok [legacy: AP IDT VERIFY OK]":
+        "R87.M1 (#1971) BSP-side rollup skips its own emit when "
+        "cpus_ready == 0 (always true under the default -smp 1 "
+        "matrix — no APs). Asserted under PAIDEIA_R87_AP_IDT=1 "
+        "(tests/expected-r87-ap-idt.golden).",
 }
 
 # Below these counts the extractor has stopped matching rather than the

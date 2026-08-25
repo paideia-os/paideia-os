@@ -578,6 +578,33 @@ case "${EXPECTED}" in
         SMP_CPU_COUNT=4
         EXPECTED=""
         ;;
+    boot_r87_ap_idt)
+        # R87.M1 (#1965/#1966/#1971): AP-side descriptor-table bring-up
+        # witness. Kernel wire-in (src/kernel/boot/kernel_main.pdx,
+        # immediately after the AP-bring-up busy-wait and before the
+        # IOAPIC/MSI-X witnesses): unconditional call to
+        # witness_r87_ap_idt (src/kernel/boot/witness/r87_ap_idt.pdx),
+        # which reads back each of the 3 per-AP TSS descriptors' busy
+        # bit from the shared Gdt._gdt_new (proof that ap_tss.pdx's
+        # ap_desc_tables_install actually ran lgdt/ltr/lidt on every AP)
+        # and reports the count as a single BSP-observable rollup
+        # fingerprint.
+        #
+        # `-smp 4`: same real ceiling as boot_r69_smp_dispatch above
+        # (Percpu.MAX_CPUS = 4). See witness/r87_ap_idt.pdx's header for
+        # the full honest-scope note — this proves per-CPU descriptor-
+        # table correctness (lgdt/ltr/lidt actually landed on every AP),
+        # not task dispatch or execution-tick fairness; those remain
+        # blocked on the scheduler-global migration
+        # design/kernel/ap-idt-strategy.md documents as this round's
+        # ceiling.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r87-ap-idt.golden"
+        TIMEOUT=10
+        SMP_MODE=1
+        SMP_CPU_COUNT=4
+        EXPECTED=""
+        ;;
     boot_r20b_echo)
         # R20b.M5-001 (#1563): echo-server end-to-end closure witness —
         # closes R20b.M5, the R20b round, and the #1015 userspace-server
