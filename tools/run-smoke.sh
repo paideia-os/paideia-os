@@ -979,6 +979,44 @@ case "${EXPECTED}" in
         echo "smoke: boot_r54_bdev_flush — SKIP (witness not wired at R54.M1; live submit path deferred to R55+ per design/kernel/nvme-write-blocking.md — chained on driver-attach + real NVMe controller on default boot path)"
         exit 0
         ;;
+    boot_r56_meta)
+        # R56.M3-006 (#1795): composite smoke for the VFS-metadata
+        # syscall block (mkdir/rmdir/stat/getdents/unlink/rename,
+        # sysnos 77..82) landed by R56.M3-002..005 (#1791..#1794).
+        #
+        # The witness at src/kernel/boot/witness/r56_meta.pdx (symbol
+        # r56_meta_witness) is NOT wired into kernel_main at R56.M3
+        # — same posture as r54_bdev_flush / r55_write_e2e / pdxfs_
+        # lite_e2e / concurrent_io / msix_ir_round_robin: symbol
+        # existence + build-time link verification are the R56.M3
+        # acceptance criterion, live invocation is deferred to R57
+        # when a ring-3 harness (userspace mkdir(1)/stat(1)/rmdir(1)/
+        # unlink(1)/rename(1) binaries) can exercise the six sysnos
+        # through the syscall trap.
+        #
+        # The deferral is structural, not scheduling: every sys_*_body
+        # in the R56.M3 wave walks its caller-supplied path via
+        # `user_read_str_via_walk` on a user VA, which resolves the
+        # address against the current task's page tables. A kernel-
+        # side call handing the walker a .bss scratch buffer either
+        # returns 0 (walker miss -> EFAULT) or faults on a kernel-
+        # only page. Forging a synthetic user aspace around the call
+        # sequence duplicates the KPTI cr3 dance without benefit
+        # over the ring-3 harness path, so R56.M3-006 lands the
+        # symbol scaffold + fingerprint contract and defers live
+        # invocation.
+        #
+        # The individual per-body fingerprints (sys mkdir ok, sys
+        # stat ok, sys getdents ok, sys rmdir ok, sys unlink ok, sys
+        # rename ok) are already covered by the per-syscall goldens
+        # at tests/r56/expected-r56-{mkdir-rmdir,stat,getdents,unlink-
+        # rename}.txt landed by R56.M3-002..005. The R56.M3-006
+        # composite golden at tests/r56/expected-r56-meta.txt names
+        # the six ordered substrings the future FINGERPRINT_MODE=1
+        # flip will consume once the ring-3 harness lands.
+        echo "smoke: boot_r56_meta — SKIP (witness not wired at R56.M3; live composite deferred to R57+ per src/kernel/boot/witness/r56_meta.pdx module header — chained on ring-3 VFS-metadata userspace harness; each sys_*_body's own fingerprint is covered by the R56.M3-002..005 per-body goldens under tests/r56/)"
+        exit 0
+        ;;
     boot_r31_spawn_pair)
         # R31.M2-1590 (#1590): loader-side multi-task boot spawn — the
         # first time this kernel runs a userspace server as a distinct

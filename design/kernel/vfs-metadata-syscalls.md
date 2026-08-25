@@ -127,6 +127,51 @@ Follow-up landings (#1791..#1795) each:
 3. #1795 additionally lands the R56.M3 boot smoke that
    exercises all six sysnos end-to-end from ring-3.
 
+### 4.1 R56.M3-006 composite-smoke deferral (#1795)
+
+Landed as a **dormant scaffold**:
+
+* `src/kernel/boot/witness/r56_meta.pdx` — symbol
+  `r56_meta_witness` exists (links into `build/kernel.elf`)
+  and returns `77` (SKIP sentinel). NOT wired into
+  `kernel_main` / `r30_platform.pdx`; body does not invoke
+  any `sys_*_body`.
+* `tools/run-smoke.sh` — `boot_r56_meta` mode is a
+  SKIP-echo (matches the R54.M1-002 `boot_r54_bdev_flush`
+  and R55.M2-005 dormant precedents).
+* `tests/r56/expected-r56-meta.txt` — six-line composite
+  golden reserved for the future FINGERPRINT_MODE=1 flip.
+
+**Why deferred.** Every `sys_*_body` in the R56.M3 wave
+walks its caller-supplied path via `user_read_str_via_walk`
+against the current task's page tables. A kernel-side call
+handing that walker a `.bss` scratch buffer either misses
+the mapping (walker returns 0 -> EFAULT) or faults on a
+kernel-only page. Forging a synthetic user aspace around
+the composite call sequence duplicates the KPTI cr3 dance
+without benefit over the natural R57 host: a **ring-3
+harness** (userspace `mkdir(1)` / `stat(1)` / `rmdir(1)` /
+`unlink(1)` / `rename(1)` binaries) that exercises the six
+sysnos through the syscall trap. Landing the composite at
+R56.M3 would conflate two independent verification tiers
+(the syscall wire-up already covered per-body by
+#1791..#1794, and the userspace client that exercises it).
+
+**What is already covered.** Each per-body fingerprint is
+witnessable individually via the R56.M3-002..005 goldens:
+
+* `tests/r56/expected-r56-mkdir-rmdir.txt` — #1793
+* `tests/r56/expected-r56-stat.txt`        — #1792
+* `tests/r56/expected-r56-getdents.txt`    — #1791 (readdir), #1792..
+* `tests/r56/expected-r56-unlink-rename.txt` — #1794
+
+The R56.M3-006 composite golden aggregates these six lines
+in call order so a future ring-3 harness (or an R57 wire-up
+that mints a synthetic user aspace) can flip
+`boot_r56_meta` from SKIP-echo to a real
+`--fingerprint expected-r56-meta.txt` invocation without
+touching the witness scaffold or the golden.
+
 ## 5. Reserved future range
 
 The next free syscall number after this block is **83**. The
