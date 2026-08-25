@@ -6,6 +6,8 @@
 # R20b.M6-003 (#1566): Embed echo_client (dual-endpoint RPC target-shape).
 # R30.M9-002 (#1086):  Embed acpi_supervisor (userspace ACPICA bubble target).
 # R48-PREP-005.M2:     Embed elevate_broker_daemon (svc.elevate-broker drainer).
+# R61.M1-001 (#1820):  Embed ls, cat, ps, rm, mv, cp, mkdir, touch, dmesg
+#                       (R57/R58/R60 tool ELFs, previously build-only).
 .section .rodata.userbin, "a", @progbits
 .balign 4096
 .global _shell_bin_start
@@ -63,4 +65,67 @@ _elevate_broker_daemon_bin_start:
 .incbin "build/user/elevate_broker_daemon.elf"
 .global _elevate_broker_daemon_bin_end
 _elevate_broker_daemon_bin_end:
+.balign 4096
+# R61.M1-001 (#1820): ls userspace image.
+.global _ls_bin_start
+_ls_bin_start:
+.incbin "build/user/ls.elf"
+.global _ls_bin_end
+_ls_bin_end:
+.balign 4096
+# R61.M1-001 (#1820): cat userspace image.
+.global _cat_bin_start
+_cat_bin_start:
+.incbin "build/user/cat.elf"
+.global _cat_bin_end
+_cat_bin_end:
+.balign 4096
+# R61.M1-001 (#1820): ps userspace image.
+.global _ps_bin_start
+_ps_bin_start:
+.incbin "build/user/ps.elf"
+.global _ps_bin_end
+_ps_bin_end:
+.balign 4096
+# R61.M1-001 (#1820): rm userspace image.
+.global _rm_bin_start
+_rm_bin_start:
+.incbin "build/user/rm.elf"
+.global _rm_bin_end
+_rm_bin_end:
+.balign 4096
+# R61.M1-001 (#1820): mv userspace image.
+.global _mv_bin_start
+_mv_bin_start:
+.incbin "build/user/mv.elf"
+.global _mv_bin_end
+_mv_bin_end:
+.balign 4096
+# R61.M1-001 (#1820): cp userspace image.
+.global _cp_bin_start
+_cp_bin_start:
+.incbin "build/user/cp.elf"
+.global _cp_bin_end
+_cp_bin_end:
+.balign 4096
+# R61.M1-001 (#1820): mkdir userspace image.
+.global _mkdir_bin_start
+_mkdir_bin_start:
+.incbin "build/user/mkdir.elf"
+.global _mkdir_bin_end
+_mkdir_bin_end:
+.balign 4096
+# R61.M1-001 (#1820): touch userspace image.
+.global _touch_bin_start
+_touch_bin_start:
+.incbin "build/user/touch.elf"
+.global _touch_bin_end
+_touch_bin_end:
+.balign 4096
+# R61.M1-001 (#1820): dmesg userspace image.
+.global _dmesg_bin_start
+_dmesg_bin_start:
+.incbin "build/user/dmesg.elf"
+.global _dmesg_bin_end
+_dmesg_bin_end:
 .balign 4096

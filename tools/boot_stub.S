@@ -2453,3 +2453,121 @@ gpio_pad_ok_msg: .ascii "GPIO PAD OK\n\0"
 .global gpio_pad_fail_msg
 .align 8
 gpio_pad_fail_msg: .ascii "GPIO PAD FAIL\n\0"
+
+# R61.M1-002/003 (#1821/#1822): tmpfs seed strings for the nine R57/R58/R60
+# tool ELFs (ls, cat, ps, rm, mv, cp, mkdir, touch, dmesg), previously
+# linked into build/user/*.elf but never reaching tmpfs. Mirrors
+# bin_true_seed's name+ok+fail triple. OK messages omit the trailing
+# newline: klog_emit_core (src/kernel/core/klog/emit.pdx step 12) always
+# appends "\n\0" itself, and these are emitted via klog_s1_d1 (one
+# decimal KV, k_bytes=image_len) rather than klog_s1, so the composer
+# appends " bytes=<N>" before that trailing newline -- giving the exact
+# wire line `bin seed ok -- file=/bin/<name> bytes=<N>`. Fail messages
+# are emitted via plain klog_s1 (no KV) for the same reason.
+.global ls_seed_name
+.align 8
+ls_seed_name: .ascii "ls\0"
+
+.global bin_ls_seed_ok_msg
+.align 8
+bin_ls_seed_ok_msg: .ascii "bin seed ok -- file=/bin/ls\0"
+
+.global bin_ls_seed_fail_msg
+.align 8
+bin_ls_seed_fail_msg: .ascii "bin seed fail -- file=/bin/ls\0"
+
+.global cat_seed_name
+.align 8
+cat_seed_name: .ascii "cat\0"
+
+.global bin_cat_seed_ok_msg
+.align 8
+bin_cat_seed_ok_msg: .ascii "bin seed ok -- file=/bin/cat\0"
+
+.global bin_cat_seed_fail_msg
+.align 8
+bin_cat_seed_fail_msg: .ascii "bin seed fail -- file=/bin/cat\0"
+
+.global ps_seed_name
+.align 8
+ps_seed_name: .ascii "ps\0"
+
+.global bin_ps_seed_ok_msg
+.align 8
+bin_ps_seed_ok_msg: .ascii "bin seed ok -- file=/bin/ps\0"
+
+.global bin_ps_seed_fail_msg
+.align 8
+bin_ps_seed_fail_msg: .ascii "bin seed fail -- file=/bin/ps\0"
+
+.global rm_seed_name
+.align 8
+rm_seed_name: .ascii "rm\0"
+
+.global bin_rm_seed_ok_msg
+.align 8
+bin_rm_seed_ok_msg: .ascii "bin seed ok -- file=/bin/rm\0"
+
+.global bin_rm_seed_fail_msg
+.align 8
+bin_rm_seed_fail_msg: .ascii "bin seed fail -- file=/bin/rm\0"
+
+.global mv_seed_name
+.align 8
+mv_seed_name: .ascii "mv\0"
+
+.global bin_mv_seed_ok_msg
+.align 8
+bin_mv_seed_ok_msg: .ascii "bin seed ok -- file=/bin/mv\0"
+
+.global bin_mv_seed_fail_msg
+.align 8
+bin_mv_seed_fail_msg: .ascii "bin seed fail -- file=/bin/mv\0"
+
+.global cp_seed_name
+.align 8
+cp_seed_name: .ascii "cp\0"
+
+.global bin_cp_seed_ok_msg
+.align 8
+bin_cp_seed_ok_msg: .ascii "bin seed ok -- file=/bin/cp\0"
+
+.global bin_cp_seed_fail_msg
+.align 8
+bin_cp_seed_fail_msg: .ascii "bin seed fail -- file=/bin/cp\0"
+
+.global mkdir_seed_name
+.align 8
+mkdir_seed_name: .ascii "mkdir\0"
+
+.global bin_mkdir_seed_ok_msg
+.align 8
+bin_mkdir_seed_ok_msg: .ascii "bin seed ok -- file=/bin/mkdir\0"
+
+.global bin_mkdir_seed_fail_msg
+.align 8
+bin_mkdir_seed_fail_msg: .ascii "bin seed fail -- file=/bin/mkdir\0"
+
+.global touch_seed_name
+.align 8
+touch_seed_name: .ascii "touch\0"
+
+.global bin_touch_seed_ok_msg
+.align 8
+bin_touch_seed_ok_msg: .ascii "bin seed ok -- file=/bin/touch\0"
+
+.global bin_touch_seed_fail_msg
+.align 8
+bin_touch_seed_fail_msg: .ascii "bin seed fail -- file=/bin/touch\0"
+
+.global dmesg_seed_name
+.align 8
+dmesg_seed_name: .ascii "dmesg\0"
+
+.global bin_dmesg_seed_ok_msg
+.align 8
+bin_dmesg_seed_ok_msg: .ascii "bin seed ok -- file=/bin/dmesg\0"
+
+.global bin_dmesg_seed_fail_msg
+.align 8
+bin_dmesg_seed_fail_msg: .ascii "bin seed fail -- file=/bin/dmesg\0"
