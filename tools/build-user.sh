@@ -12,6 +12,7 @@ INIT_LINK_SCRIPT="${USER_SRC}/init.ld"
 CHILD_HELLO_LINK_SCRIPT="${USER_SRC}/child_hello.ld"
 TRUE_LINK_SCRIPT="${USER_SRC}/true.ld"
 CAT_LINK_SCRIPT="${USER_SRC}/cat.ld"
+PS_LINK_SCRIPT="${USER_SRC}/ps.ld"
 ECHO_SERVER_LINK_SCRIPT="${USER_SRC}/echo_server.ld"
 ECHO_CLIENT_LINK_SCRIPT="${USER_SRC}/echo_client.ld"
 ACPI_SUPERVISOR_LINK_SCRIPT="${USER_SRC}/acpi_supervisor.ld"
@@ -42,6 +43,11 @@ fi
 
 if [[ ! -f "${CAT_LINK_SCRIPT}" ]]; then
     echo "cat linker script missing: ${CAT_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${PS_LINK_SCRIPT}" ]]; then
+    echo "ps linker script missing: ${PS_LINK_SCRIPT}" >&2
     exit 1
 fi
 
@@ -90,6 +96,7 @@ INIT_OBJECTS=()
 CHILD_HELLO_OBJECTS=()
 TRUE_OBJECTS=()
 CAT_OBJECTS=()
+PS_OBJECTS=()
 ECHO_SERVER_OBJECTS=()
 ECHO_CLIENT_OBJECTS=()
 ACPI_SUPERVISOR_OBJECTS=()
@@ -126,6 +133,12 @@ while IFS= read -r -d '' pdx; do
         # Same one-file-one-ELF discipline as child_hello / true /
         # echo_server / echo_client / acpi_supervisor / pci_enumerator.
         CAT_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "ps.pdx" ]]; then
+        # R57.M4-003 (paideia-os #1799): ps.pdx is self-contained
+        # (inlines its three syscalls -- sys_write/sys_taskinfo/sys_exit)
+        # so its object goes to its own set only -- no library pull-in.
+        # Mirrors true.pdx / child_hello.pdx classification pattern.
+        PS_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "echo_server.pdx" ]]; then
         # R20b.M5-001 (#1563): echo_server.pdx is self-contained (inlines its
         # four IPC syscalls; same one-file-one-ELF discipline as child_hello /
@@ -338,6 +351,28 @@ if [[ ${#CAT_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/cat.elf"
     echo "[ok] ${BUILD_DIR}/cat.bin"
+fi
+
+# Link ps.elf with ps objects only (R57.M4-003 / paideia-os #1799).
+# Self-contained; no libs, no shim -- mirrors child_hello.elf / true.elf
+# pattern. Inlines sys_write / sys_taskinfo / sys_exit at their call
+# sites; every emit routes through write_bytes so a future pipe or file
+# stdout re-target composes without touching ps itself. See the source
+# header of src/user/ps.pdx for the M0 vs. M1 posture (name-field
+# rendering flips from synthesised `task<pid>` to record[16..32] when
+# task_struct.comm[16] lands at M1).
+if [[ ${#PS_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T ps.ld -> ps.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${PS_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/ps.elf" \
+        "${PS_OBJECTS[@]}"
+
+    echo "[objcopy-user] ps.elf -> ps.bin"
+    objcopy -O binary "${BUILD_DIR}/ps.elf" "${BUILD_DIR}/ps.bin"
+
+    echo "[ok] ${BUILD_DIR}/ps.elf"
+    echo "[ok] ${BUILD_DIR}/ps.bin"
 fi
 
 # Link echo_server.elf with echo_server objects only (R20b.M5-001 #1563).
