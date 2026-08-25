@@ -18,6 +18,7 @@ ACPI_SUPERVISOR_LINK_SCRIPT="${USER_SRC}/acpi_supervisor.ld"
 PCI_ENUMERATOR_LINK_SCRIPT="${USER_SRC}/pci_enumerator.ld"
 AUDIO_SUPERVISOR_LINK_SCRIPT="${USER_SRC}/audio_supervisor.ld"
 ELEVATE_BROKER_DAEMON_LINK_SCRIPT="${USER_SRC}/elevate_broker_daemon.ld"
+LS_LINK_SCRIPT="${USER_SRC}/ls.ld"
 
 if [[ ! -f "${SHELL_LINK_SCRIPT}" ]]; then
     echo "shell linker script missing: ${SHELL_LINK_SCRIPT}" >&2
@@ -74,6 +75,11 @@ if [[ ! -f "${ELEVATE_BROKER_DAEMON_LINK_SCRIPT}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${LS_LINK_SCRIPT}" ]]; then
+    echo "ls linker script missing: ${LS_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 
@@ -90,6 +96,8 @@ ACPI_SUPERVISOR_OBJECTS=()
 PCI_ENUMERATOR_OBJECTS=()
 AUDIO_SUPERVISOR_OBJECTS=()
 ELEVATE_BROKER_DAEMON_OBJECTS=()
+LS_OBJECTS=()
+LIBC_OBJECTS=()
 AML_OBJECTS=()
 LIBS_OBJECTS=()
 
@@ -160,6 +168,26 @@ while IFS= read -r -d '' pdx; do
         # shape byte-for-byte modulo the endpoint_id (4 vs 3) and derived
         # cap kind (0x30 KIND_PCI_DEV vs 0x20 KIND_ACPI).
         PCI_ENUMERATOR_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "ls.pdx" ]]; then
+        # R57.M4-001 (#1797): /bin/ls user binary. Self-contained _start
+        # (inlines its own sys_open / sys_write / sys_close / sys_exit /
+        # sys_debug_puts syscalls -- same discipline as child_hello.pdx /
+        # true.pdx), plus one linker-resolved `call sys_getdents` into the
+        # libc/getdents.pdx wrapper below. Object routes to its own set
+        # only; the ls.elf link consumes LS_OBJECTS + LIBC_OBJECTS so the
+        # wrapper is NOT dragged into shell.elf / init.elf.
+        LS_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == libc/* ]]; then
+        # R57.M4-001 (#1797): src/user/libc/ -- userspace runtime library
+        # for the growing R57 ring-3 surface (ls, cat, mkdir, ...). Each
+        # module here is a thin syscall wrapper (or, later, a runtime
+        # helper) linked ONLY into the binaries that call it. At R57.M4
+        # only ls.elf consumes libc/, so LIBC_OBJECTS is appended to
+        # LS_OBJECTS at link time (below); no libc/*.o falls through to
+        # the shell.elf / init.elf link. A future round with more ring-3
+        # binaries adds per-image consumption without re-linking the
+        # frozen ring-2 substrate.
+        LIBC_OBJECTS+=("${obj}")
     elif [[ "${rel}" == aml/* ]]; then
         # R30.M1-001..005 (#1049-#1053): the userspace AML tokenizer,
         # arena, opcode table, namespace parser, term parser and
@@ -461,6 +489,30 @@ if [[ ${#ELEVATE_BROKER_DAEMON_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/elevate_broker_daemon.elf"
     echo "[ok] ${BUILD_DIR}/elevate_broker_daemon.bin"
+fi
+
+# Link ls.elf with ls.o + libc/*.o (R57.M4-001 #1797).
+# Self-contained inline syscalls in ls.pdx (sys_open / sys_write / sys_close
+# / sys_exit / sys_debug_puts) plus one linker-resolved `call sys_getdents`
+# into libc/getdents.pdx's SC+ ID 78 wrapper. Mirrors the child_hello.elf /
+# true.elf / echo_client.elf single-binary-plus-library shape; the libc/
+# split means LS_OBJECTS + LIBC_OBJECTS ship together into ls.elf while
+# shell.elf / init.elf remain unchanged. No `_init_caps` sidecar (sys_open
+# / sys_getdents are fs-gated but not cap-seeded at this milestone -- ls
+# reaches vops_readdir through fd_get -> vnode_slot, not through a per-task
+# cap slot, so it does not need a KIND_* seed in the loader table).
+if [[ ${#LS_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T ls.ld -> ls.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${LS_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/ls.elf" \
+        "${LS_OBJECTS[@]}" "${LIBC_OBJECTS[@]}"
+
+    echo "[objcopy-user] ls.elf -> ls.bin"
+    objcopy -O binary "${BUILD_DIR}/ls.elf" "${BUILD_DIR}/ls.bin"
+
+    echo "[ok] ${BUILD_DIR}/ls.elf"
+    echo "[ok] ${BUILD_DIR}/ls.bin"
 fi
 
 # R31.M2-1595 (#1595): PT_LOAD extent gate over every image linked above.
