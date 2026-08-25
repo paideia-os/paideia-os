@@ -194,6 +194,21 @@ ALLOWLIST = {
         "LIVE first-boot arm: mount succeeds and sb_flags bit 0 CLEAR. "
         "Default modes take the SUBSTRATE arm; assertable via "
         "boot_r53_round_trip_phase1 opt-in (PAIDEIA_R53_DISK=1, #1751).",
+
+    # src/user/rootfs_seed.pdx — R57.M4-006 (#1802) skip-path
+    # fingerprint. Fires only when init's sys_stat("/etc") returns 0
+    # (i.e., /etc already exists — persistent-FS reboot with a prior
+    # seed). Under the current tmpfs mount, /etc is fresh at every
+    # boot so the work path (files=7) always fires and is asserted in
+    # tests/r17/expected-boot-r17-init.txt. Becomes assertable when
+    # the root mount migrates to pdxfs-block and a two-phase reboot
+    # golden lands (post-R57.M4-006).
+    "rootfs seed ok [legacy: ROOTFS SEED OK] files=0":
+        "R57.M4-006 skip-path: fires only under a persistent root "
+        "mount where /etc already exists from a prior seed. Under "
+        "tmpfs (the current 14-mode matrix) /etc is fresh at boot "
+        "so the work path always wins; the files=7 variant is "
+        "asserted in tests/r17/expected-boot-r17-init.txt.",
 }
 
 # Below these counts the extractor has stopped matching rather than the

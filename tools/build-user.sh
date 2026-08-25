@@ -122,6 +122,14 @@ while IFS= read -r -d '' pdx; do
     # the shim's other 10 wrappers — one .pdx file, one .elf pattern).
     if [[ "${rel}" == "init.pdx" ]]; then
         INIT_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "rootfs_seed.pdx" ]]; then
+        # R57.M4-006 (paideia-os #1802): rootfs_seed.pdx is init-only
+        # (Init._start calls RootfsSeed.rootfs_seed_run once, before
+        # any fork+exec). Inline `syscall` opcodes make the module
+        # self-contained -- no syscall_shim linkage -- so it needs no
+        # LIBS_OBJECTS/SHELL_OBJECTS entry; only INIT_OBJECTS grows.
+        # See design/user/rootfs-seed-inventory.md.
+        INIT_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "child_hello.pdx" ]]; then
         CHILD_HELLO_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "true.pdx" ]]; then
