@@ -26,7 +26,7 @@ PWD=$(slice pwd_builtin)
 HELP=$(slice help_builtin)
 ENV=$(slice env_builtin)
 DP=$(slice dec_parse)
-CWD=$(slice cwd_init)
+CD=$(slice cd_builtin)
 START=$(slice _start)
 SRL=$(slice shell_read_line)
 
@@ -68,9 +68,11 @@ else echo "[ok]   env_builtin present"; fi
 if [[ -z "$(sym_present dec_parse)" ]]; then echo "[FAIL] dec_parse missing"; FAIL=1
 else echo "[ok]   dec_parse present"; fi
 
-# 5. cwd_init present
-if [[ -z "$(sym_present cwd_init)" ]]; then echo "[FAIL] cwd_init missing"; FAIL=1
-else echo "[ok]   cwd_init present"; fi
+# 5. cd_builtin present (R86.M1-006 #1959: retired cwd_init -- every task's
+#    TASK_OFF_CWD is now stamped by the kernel's task_new; cd_builtin is
+#    the userspace mutator via sys_chdir instead)
+if [[ -z "$(sym_present cd_builtin)" ]]; then echo "[FAIL] cd_builtin missing"; FAIL=1
+else echo "[ok]   cd_builtin present"; fi
 
 # 6. builtin_descs .bss size 0x40
 SL=$(echo "$SYMS" | awk '$NF == "builtin_descs" {print}' | head -1)
@@ -86,12 +88,13 @@ elif [[ "$(echo "$SL" | awk '{print $(NF-2)}')" != ".bss" ]]; then echo "[FAIL] 
 elif [[ "$(echo "$SL" | awk '{print $(NF-1)}')" != "0000000000000008" ]]; then echo "[FAIL] echo_emit_nl wrong size"; FAIL=1
 else echo "[ok]   echo_emit_nl in .bss, size 0x8"; fi
 
-# 8. _cwd_buf .bss size 0x100
-SL=$(echo "$SYMS" | awk '$NF == "_cwd_buf" {print}' | head -1)
-if [[ -z "$SL" ]]; then echo "[FAIL] _cwd_buf missing"; FAIL=1
-elif [[ "$(echo "$SL" | awk '{print $(NF-2)}')" != ".bss" ]]; then echo "[FAIL] _cwd_buf not in .bss"; FAIL=1
-elif [[ "$(echo "$SL" | awk '{print $(NF-1)}')" != "0000000000000100" ]]; then echo "[FAIL] _cwd_buf wrong size"; FAIL=1
-else echo "[ok]   _cwd_buf in .bss, size 0x100"; fi
+# 8. _pwd_buf .bss size 0x100 (R86.M1-007 #1960: pwd_builtin's sys_getcwd
+#    echo buffer, replacing the retired _cwd_buf at the same size)
+SL=$(echo "$SYMS" | awk '$NF == "_pwd_buf" {print}' | head -1)
+if [[ -z "$SL" ]]; then echo "[FAIL] _pwd_buf missing"; FAIL=1
+elif [[ "$(echo "$SL" | awk '{print $(NF-2)}')" != ".bss" ]]; then echo "[FAIL] _pwd_buf not in .bss"; FAIL=1
+elif [[ "$(echo "$SL" | awk '{print $(NF-1)}')" != "0000000000000100" ]]; then echo "[FAIL] _pwd_buf wrong size"; FAIL=1
+else echo "[ok]   _pwd_buf in .bss, size 0x100"; fi
 
 # 9. pwd_name rodata bytes 70 77 64 00
 if echo "$RODATA_STREAM" | grep -q "70776400"; then
@@ -141,18 +144,20 @@ else
     echo "[FAIL] dispatch_init missing mov rax,0x6 (builtin_count=6)"; FAIL=1
 fi
 
-# 16. _start calls cwd_init once
-N=$(echo "$START" | grep -Ec "call.*cwd_init" || true)
-if [[ "$N" -eq 1 ]]; then echo "[ok]   _start calls cwd_init once"; else echo "[FAIL] _start cwd_init count $N != 1"; FAIL=1; fi
-
-# 17. cwd_init PC > dispatch_init PC, < shell_read_line PC
-DI_PC=$(sym_pc dispatch_init)
-CWD_PC=$(sym_pc cwd_init)
-SRL_PC=$(sym_pc shell_read_line)
-if [[ -n "$DI_PC" && -n "$CWD_PC" && -n "$SRL_PC" ]] && (( 16#$DI_PC < 16#$CWD_PC )) && (( 16#$CWD_PC < 16#$SRL_PC )); then
-    echo "[ok]   cwd_init PC in correct order ($DI_PC < $CWD_PC < $SRL_PC)"
+# 16. cd_builtin calls sys_chdir (R86.M1-006 #1959: retired the local
+#     _cwd_buf copy + leading-'/' refusal; cd_builtin now mutates
+#     TASK_OFF_CWD through the kernel syscall)
+if echo "$CD" | grep -Eq "call.*<sys_chdir>|call.*sys_chdir"; then
+    echo "[ok]   cd_builtin calls sys_chdir"
 else
-    echo "[FAIL] cwd_init PC ordering wrong (dispatch=$DI_PC cwd=$CWD_PC shell_read_line=$SRL_PC)"; FAIL=1
+    echo "[FAIL] cd_builtin missing sys_chdir call"; FAIL=1
+fi
+
+# 17. cd_builtin calls sys_getcwd (path echo on success)
+if echo "$CD" | grep -Eq "call.*<sys_getcwd>|call.*sys_getcwd"; then
+    echo "[ok]   cd_builtin calls sys_getcwd"
+else
+    echo "[FAIL] cd_builtin missing sys_getcwd call"; FAIL=1
 fi
 
 # 18. echo_builtin references echo_emit_nl
@@ -204,18 +209,19 @@ else
     echo "[FAIL] dec_parse missing shl 0x3"; FAIL=1
 fi
 
-# 25. pwd_builtin references _cwd_buf
-if echo "$PWD" | grep -q "_cwd_buf"; then
-    echo "[ok]   pwd_builtin references _cwd_buf"
+# 25. pwd_builtin references _pwd_buf (R86.M1-007 #1960)
+if echo "$PWD" | grep -q "_pwd_buf"; then
+    echo "[ok]   pwd_builtin references _pwd_buf"
 else
-    echo "[FAIL] pwd_builtin missing _cwd_buf reference"; FAIL=1
+    echo "[FAIL] pwd_builtin missing _pwd_buf reference"; FAIL=1
 fi
 
-# 26. pwd_builtin calls puts_new
-if echo "$PWD" | grep -Eq "call.*<puts_new>|call.*puts_new"; then
-    echo "[ok]   pwd_builtin calls puts_new"
+# 26. pwd_builtin calls sys_getcwd (R86.M1-007 #1960: replaces the retired
+#     puts_new-on-_cwd_buf echo)
+if echo "$PWD" | grep -Eq "call.*<sys_getcwd>|call.*sys_getcwd"; then
+    echo "[ok]   pwd_builtin calls sys_getcwd"
 else
-    echo "[FAIL] pwd_builtin missing puts_new call"; FAIL=1
+    echo "[FAIL] pwd_builtin missing sys_getcwd call"; FAIL=1
 fi
 
 # 27. pwd_builtin calls sys_write
@@ -277,7 +283,7 @@ if [[ "$N" -eq 1 ]]; then echo "[ok]   env_builtin calls sys_write (1)"; else ec
 
 # 35. #1248 hygiene: no cmp al, in new functions
 BAD=0
-for F in pwd_builtin help_builtin env_builtin dec_parse cwd_init; do
+for F in pwd_builtin help_builtin env_builtin dec_parse cd_builtin; do
     N=$(slice "$F" | grep -Ec "cmp[[:space:]]+al," || true)
     [[ "$N" -gt 0 ]] && { echo "[FAIL] #1248 risk: '$F' has $N byte-narrow cmp al,"; BAD=1; }
 done

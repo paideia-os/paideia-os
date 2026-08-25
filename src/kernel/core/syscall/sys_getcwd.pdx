@@ -1,0 +1,304 @@
+// src/kernel/core/syscall/sys_getcwd.pdx -- R86.M1-003 (paideia-os #1956)
+//
+// SYS_GETCWD -- ring-3 getcwd syscall body + dispatch shim (sysno 86).
+//
+// -----------------------------------------------------------------------------
+// Scope
+// -----------------------------------------------------------------------------
+//
+// Read-side counterpart to sys_chdir (sys_chdir.pdx, sysno 85): composes
+// the caller's TASK_OFF_CWD vnode idx into an absolute path string by
+// walking UPWARD through parent_idx links (vfs-layout.md +8) to the mount
+// root, collecting each vnode's component name along the way from the
+// R86.M1-002/003 _vnode_name_table (core/fs/vnode_pool.pdx) that
+// path_resolve's regular_lookup now stamps on every successful lookup.
+//
+// Placed at src/kernel/core/syscall/ (not under handlers/), same
+// convention as sys_chdir.pdx / sys_mountinfo.pdx.
+//
+// -----------------------------------------------------------------------------
+// Why a name table exists at all (see vnode_pool.pdx for the storage)
+// -----------------------------------------------------------------------------
+//
+// vfs-layout.md §2 froze a `name_slot_idx` field at vnode +10 pointing at a
+// design-time "_name_slab (R16.M1-004)" that was never actually built --
+// nothing before this round ever wrote vnode +10. Composing a path requires
+// a name for every ancestor, so this landing adds the missing storage
+// (vnode_pool.pdx's _vnode_name_table, indexed directly by vnode_idx) and
+// wires path.pdx's regular_lookup to stamp it. Every vnode that can ever
+// become a TASK_OFF_CWD value was necessarily produced by a path_resolve
+// regular_lookup (sys_chdir's target always comes from path_resolve), so by
+// construction every vnode this walk encounters has a stamped name.
+//
+// -----------------------------------------------------------------------------
+// Contract
+// -----------------------------------------------------------------------------
+//
+// sys_getcwd_body(user_buf_va, buf_len) -> u64
+//   rdi = user_buf_va   user VA of the destination buffer.
+//   rsi = buf_len       caller-declared capacity in bytes (the REAL,
+//                       uncapped value -- used for the -ERANGE decision;
+//                       see step (7) below).
+//
+//   -> rax = N (> 0)                       bytes written, INCLUDING the
+//                                          trailing NUL (POSIX getcwd(3)
+//                                          convention: N-1 is the string's
+//                                          strlen).
+//            0xFFFFFFFFFFFFFFDE (-ERANGE)  the composed path (+ NUL) does
+//                                          not fit in buf_len bytes, OR the
+//                                          walk exceeded GETCWD_MAX_DEPTH.
+//                                          Nothing is written to the user
+//                                          buffer on this arm.
+//            0xFFFFFFFFFFFFFFFE (-ENOENT)  no mounted root (defensive; not
+//                                          reachable once boot completes).
+//            0xFFFFFFFFFFFFFFF2 (-EFAULT)  user_buf_va refused (either the
+//                                          precise user_ptr_ok gate or the
+//                                          walker's own #741 Layer-2 check).
+//
+// -----------------------------------------------------------------------------
+// Composition
+// -----------------------------------------------------------------------------
+//
+// (A) Walk from the current TASK_OFF_CWD upward via parent_idx (+8) until
+//     reaching mount_root_vnode()'s idx, pushing each visited vnode idx
+//     onto a bounded kernel-side stack (leaf-to-near-root order). Bounded
+//     at GETCWD_MAX_DEPTH=32 (comfortably beyond any depth this kernel's
+//     tmpfs/pdxfs backends can construct at R86) -- exceeding it is
+//     -ERANGE, not a silent truncation.
+// (B) Compose the output string root-to-leaf: a leading '/', then each
+//     stacked component's name (read back from _vnode_name_table) in
+//     REVERSE stack order, '/'-separated. depth==0 (cwd IS root) yields
+//     the bare string "/".
+// (C) Gate the composed length against the caller's buf_len (-ERANGE on
+//     overflow, matching POSIX getcwd(3) semantics) and against
+//     user_ptr_ok, then copy out via user_write_bytes_via_walk.
+// (D) Emit the R86.M1-003 fingerprint via klog_s1_x1 (tag_sys_getcwd_ok +
+//     k_bytes) on the success arm only.
+//
+// -----------------------------------------------------------------------------
+// Effects / capabilities
+// -----------------------------------------------------------------------------
+//
+// `!{mem, sysreg} @{cap}` -- mem covers the parent-chain walk + string
+// composition, sysreg covers user_ptr_ok / user_write_bytes_via_walk, cap
+// is the same forward-compat annotation sys_stat_body/sys_chdir_body carry.
+
+module SysGetcwd = structure {
+
+  // ==========================================================================
+  // Sentinels
+  // ==========================================================================
+  pub let SYS_GETCWD_ERR_EFAULT : u64 = 0xFFFFFFFFFFFFFFF2   // -14
+  pub let SYS_GETCWD_ERR_ENOENT : u64 = 0xFFFFFFFFFFFFFFFE   // -2
+  pub let SYS_GETCWD_ERR_ERANGE : u64 = 0xFFFFFFFFFFFFFFDE   // -34
+
+  pub let SYS_GETCWD_PATH_MAX  : u64 = 256
+  pub let SYS_GETCWD_MAX_DEPTH : u64 = 32
+
+  // Bounded stack of ancestor vnode indices, leaf-to-near-root order.
+  // 32 entries -- see GETCWD_MAX_DEPTH's own rationale above.
+  pub let mut _sys_getcwd_stack : [u64; 32] = uninit @align(8)
+
+  // Composed output string, built root-to-leaf. Same PATH_MAX sizing as
+  // every other per-syscall path scratch in this file group.
+  pub let mut _sys_getcwd_out_scratch : [u8; 256] = uninit @align(8)
+
+  // ==========================================================================
+  // sys_getcwd_body(user_buf_va, buf_len) -> u64
+  //
+  // Register plan (5-push callee-save; entry rsp%16==8, minus 40 = %16==0
+  // at every nested call site -- matches sys_stat_body's own 5-push
+  // discipline):
+  //   rbx = user_buf_va          (survives to the final walker copy)
+  //   r12 = buf_len              (RAW, uncapped caller value -- the
+  //                                -ERANGE decision compares against this,
+  //                                never against SYS_GETCWD_PATH_MAX)
+  //   r13 = root_idx             (survives the whole parent-chain walk)
+  //   r14 = cur                  (walking vnode idx during phase A; dead
+  //                                once the walk reaches root)
+  //   r15 = depth                (stack entry count; also the phase-B
+  //                                reverse-iteration bound)
+  //
+  // Phases B (composition) and the pre-walker gates run with NO nested
+  // calls active except user_ptr_ok / user_write_bytes_via_walk /
+  // klog_s1_x1 at the very end, so r8-r11/rax/rcx/rdx/rdi/rsi are free
+  // scratch throughout composition without disturbing rbx/r12-r15.
+  // ==========================================================================
+  pub let sys_getcwd_body : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (user_buf_va: u64) (buf_len: u64) -> unsafe {
+      effects: { mem, sysreg },
+      capabilities: { cap },
+      justification: "R86.M1-003 (#1956): sys_getcwd body -- ring-3 getcwd syscall (sysno 86). Phase A walks upward from the caller's TASK_OFF_CWD (+160) via each vnode's parent_idx (+8, vfs-layout.md) until reaching mount_root_vnode()'s idx, pushing every visited vnode idx onto _sys_getcwd_stack (leaf-to-near-root order), bounded at GETCWD_MAX_DEPTH=32 (-ERANGE on overflow, not silent truncation). Phase B composes the output string root-to-leaf into _sys_getcwd_out_scratch: a leading '/', then each stacked component's name (read back from core/fs/vnode_pool.pdx's _vnode_name_table, which path_resolve's regular_lookup stamps on every successful lookup as of this same round) in REVERSE stack order, '/'-separated, with a defensive per-byte bound (refuse past index 254, leaving room for the final NUL at 255) that returns -ERANGE rather than overrunning the 256-byte scratch even though no realistic nesting depth reaches it. depth==0 (cwd IS root) yields the bare string '/'. Phase C gates the composed length (content bytes + 1 for NUL) against the CALLER'S buf_len (r12, the raw uncapped value -- not SYS_GETCWD_PATH_MAX, matching POSIX getcwd(3)'s own -ERANGE semantics of 'this specific buffer is too small', not 'the kernel's internal cap was exceeded'); on a fit, user_ptr_ok(user_buf_va, composed_len) gates before user_write_bytes_via_walk copies the scratch out (two-gate discipline mirroring sys_stat_body's own Layer 1 + Layer 2 posture). Phase D emits klog_s1_x1(tag_sys_getcwd_ok, k_bytes, composed_len) on the success arm only, then returns composed_len (bytes including the trailing NUL). 5-push callee-save prologue (rbx=user_buf_va, r12=buf_len RAW, r13=root_idx, r14=cur/walk-cursor, r15=depth) leaves rsp%16==0 (entry rsp%16==8, minus 40 = %16==0), matching sys_stat_body's own 5-push discipline -- every nested call site (mount_root_vnode, vnode_slot inside the walk loop, user_ptr_ok, user_write_bytes_via_walk, klog_s1_x1) sees %16==0 pre-CALL. Phase A's per-iteration scratch (rax/rcx/r8) is reloaded AFTER `call vnode_slot` rather than held across it -- the same ABI-safety discipline vfs_open.pdx's own header comment documents (caller-save registers are not guaranteed to survive a call per SysV, regardless of what the specific callee happens to touch). Phase B's scratch (r9=out_cursor, r10=reverse-iteration index, r11=vidx, plus rax/rcx/rdi/r8 for the per-component byte-copy loop) runs with no nested call active, so no ABI-safety concern applies there. mov_b used for the per-byte name-copy load, preceded by `xor rax, rax` (mov_b does not zero-extend on its own -- same discipline as path.pdx's copy_char loop and vnode_name_set's own copy loop). Labels prefixed gcw_ -- grep audit 2026-08-25: no gcw_ collisions elsewhere in src/kernel/. Effects {mem, sysreg} @{cap} match sys_stat_body/sys_chdir_body's own posture.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        // 5 pushes leave rsp%16==0 (entry %16==8, minus 40 = %16==0) --
+        // matches sys_stat_body's own 5-push discipline; no pad needed.
+
+        mov rbx, rdi;                    // rbx = user_buf_va
+        mov r12, rsi;                    // r12 = buf_len (RAW, uncapped)
+
+        // ---- (1) mount_root_vnode() ----
+        call mount_root_vnode;           // rax = root_idx
+        cmp rax, 0;
+        je  gcw_enoent;
+        mov r13, rax;                    // r13 = root_idx
+
+        // ---- (2) load current cwd from the TCB ----
+        mov rax, [rip + _current_tcb];
+        mov r14, [rax + 160];            // r14 = cur (TASK_OFF_CWD)
+        cmp r14, 0;
+        jne gcw_cwd_ok;
+        mov r14, r13;                    // defensive fallback: treat 0 as root
+      gcw_cwd_ok:
+
+        // ---- (3) Phase A: walk upward, pushing ancestors ----
+        xor r15, r15;                    // r15 = depth
+
+      gcw_walk_top:
+        cmp r14, r13;                    // cur == root_idx?
+        je  gcw_walk_done;
+
+        cmp r15, 32;                     // GETCWD_MAX_DEPTH
+        jae gcw_erange;
+
+        mov rdi, r14;
+        call vnode_slot;                 // rax = &vnode
+        xor rcx, rcx;
+        mov_w rcx, [rax + 8];            // rcx = parent_idx (VNODE_PARENT_IDX_OFFSET=8)
+        cmp rcx, 0xFFFF;                 // VNODE_IDX_NONE -- defensive: detached
+        je  gcw_walk_done;
+
+        lea r8, [rip + _sys_getcwd_stack];
+        mov [r8 + r15*8], r14;           // stack[depth] = cur
+        add r15, 1;
+        mov r14, rcx;                    // cur = parent
+        jmp gcw_walk_top;
+
+      gcw_walk_done:
+        // r15 = depth (ancestor count, EXCLUDING root itself)
+
+        // ---- (4) Phase B: compose the output string root-to-leaf ----
+        lea rdi, [rip + _sys_getcwd_out_scratch];
+        mov rax, 0x2F;                   // '/'
+        mov_b [rdi + 0], rax;
+        mov r9, 1;                       // r9 = out_cursor
+
+        cmp r15, 0;
+        je  gcw_compose_done;            // depth==0 -> bare "/" already written
+
+        mov r10, r15;
+        sub r10, 1;                      // r10 = reverse-iteration index (depth-1 .. 0)
+
+      gcw_compose_top:
+        lea r8, [rip + _sys_getcwd_stack];
+        mov r11, [r8 + r10*8];           // r11 = vidx (near-root-first order)
+
+        lea r8, [rip + _vnode_name_table];
+        mov rax, r11;
+        shl rax, 6;                      // idx * VNODE_NAME_SLOT_BYTES (64)
+        add r8, rax;                     // r8 = name_ptr
+
+        lea rdi, [rip + _sys_getcwd_out_scratch];
+        xor rcx, rcx;                    // rcx = per-component byte index
+
+      gcw_namecopy_top:
+        cmp rcx, 63;                     // NAME_MAX -- defensive component bound
+        jae gcw_namecopy_done;
+        cmp r9, 254;                     // leave room for NUL at 255
+        jae gcw_erange;
+        xor rax, rax;
+        mov_b rax, [r8 + rcx*1];
+        cmp rax, 0;
+        je  gcw_namecopy_done;
+        mov_b [rdi + r9*1], rax;
+        add r9, 1;
+        add rcx, 1;
+        jmp gcw_namecopy_top;
+
+      gcw_namecopy_done:
+        cmp r10, 0;
+        je  gcw_compose_next;            // leaf component -- no trailing '/'
+        cmp r9, 254;
+        jae gcw_erange;
+        mov rax, 0x2F;                   // '/'
+        mov_b [rdi + r9*1], rax;
+        add r9, 1;
+
+      gcw_compose_next:
+        cmp r10, 0;
+        je  gcw_compose_done;
+        sub r10, 1;
+        jmp gcw_compose_top;
+
+      gcw_compose_done:
+        // r9 = content byte count (excludes the NUL written next)
+        lea rdi, [rip + _sys_getcwd_out_scratch];
+        xor rax, rax;
+        mov_b [rdi + r9*1], rax;         // NUL-terminate
+        add r9, 1;                       // r9 = total bytes INCLUDING NUL
+
+        // r9 is caller-save and steps (6)-(8) below each make a nested
+        // call, so composed_len is moved into r13 (callee-save, dead past
+        // phase A/B -- root_idx is no longer needed once the walk is done)
+        // rather than held in r9 across those calls. This is the exact
+        // ABI-safety discipline vfs_open.pdx's own header comment argues
+        // for: a caller-save register is not guaranteed to survive a call
+        // regardless of what the specific callee happens to touch.
+        mov r13, r9;                     // r13 = composed_len (survives calls)
+
+        // ---- (5) -ERANGE gate against the caller's RAW buf_len ----
+        cmp r13, r12;
+        ja  gcw_erange;
+
+        // ---- (6) user_ptr_ok(user_buf_va, composed_len) ----
+        mov rdi, rbx;
+        mov rsi, r13;
+        call user_ptr_ok;                // rax = 0 (OK) or 1 (fault)
+        cmp rax, 0;
+        jne gcw_efault;
+
+        // ---- (7) user_write_bytes_via_walk(user_buf_va, scratch, len) ----
+        mov rdi, rbx;
+        lea rsi, [rip + _sys_getcwd_out_scratch];
+        mov rdx, r13;
+        call user_write_bytes_via_walk;  // rax = 0 or -EFAULT
+        cmp rax, 0;
+        jne gcw_efault;
+
+        // ---- (8) Fingerprint emit ----
+        mov rdi, 3;                              // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_FS__];
+        lea rdx, [rip + tag_sys_getcwd_ok];
+        lea rcx, [rip + k_bytes];
+        mov r8, r13;
+        call klog_s1_x1;
+
+        // ---- (9) Success return: bytes written (incl NUL) ----
+        mov rax, r13;
+        jmp gcw_done;
+
+      gcw_enoent:
+        mov rax, 0xFFFFFFFFFFFFFFFE;     // -ENOENT
+        jmp gcw_done;
+
+      gcw_erange:
+        mov rax, 0xFFFFFFFFFFFFFFDE;     // -ERANGE
+        jmp gcw_done;
+
+      gcw_efault:
+        mov rax, 0xFFFFFFFFFFFFFFF2;     // -EFAULT
+
+      gcw_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

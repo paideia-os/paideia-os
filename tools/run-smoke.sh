@@ -52,6 +52,7 @@
 #     * boot_r17_shell_multi_command: injects 'pwd\ncd /tmp\npwd\nhelp\nexit\n', asserts /tmp + help output + REAPED (R17.M5 #637)
 #     * boot_r17_shell_child_process: injects 'true\nexit\n', asserts TRUE OK from /bin/true + shell-reap chain (R17.M5 #638)
 #     * boot_r17_shell_shutdown: injects 'exit\n', asserts shell exit + init reap + init shutdown (R17.M5 #639)
+#     * boot_r86_relative_path: injects 'mkdir /tmp\ncd /tmp\nmkdir ./sub\ncd ./sub\nmkdir ../peer\npwd\nexit\n', asserts cd/mkdir fingerprints + literal '/tmp/sub' + REAPED (R86.M1-008 #1961)
 #     * boot_smp: validates R18.M1 SMP bring-up fingerprint on -smp 4; BSP wakes 3 APs (APIC IDs 1/2/3), each emits CPU_ID_XX_HELLO; bookended by SMP BRINGUP START / DONE (R18.M1 #764)
 #     * boot_panic: validates M3-003 fake-panic emission chain witness, 8s timeout
 #     * prod: expects exit code 2 (kernel didn't build), skips verification
@@ -450,6 +451,56 @@ case "${EXPECTED}" in
         : "${INJECT_WAIT_FOR:=SHELL START}"
         : "${INJECT_DELAY:=0.3}"
         : "${INJECT_HOLD:=13}"
+        EXPECTED=""
+        ;;
+    boot_r86_relative_path)
+        # R86.M1-008 (paideia-os #1961): relative-path substrate
+        # composite smoke. Real ring-3 exercise of sys_chdir (sysno 85)
+        # + sys_getcwd (sysno 86) + the cwd-threaded sys_mkdir (sysno
+        # 79), through the ACTUAL shell (cd/pwd builtins, R86.M1-006/007
+        # #1959/#1960) and the ACTUAL /bin/mkdir binary (src/user/
+        # mkdir.pdx) -- not a kernel-side boot witness. A kernel-side
+        # witness structurally cannot exercise these bodies: sys_chdir_
+        # body / sys_getcwd_body / sys_mkdir_body all resolve their
+        # path argument via user_read_str_via_walk / user_write_bytes_
+        # via_walk, which validate the pointer against the CURRENT
+        # task's real page tables -- exactly the limitation the R56.M3-
+        # 006 dormant scaffold (src/kernel/boot/witness/r56_meta.pdx)
+        # documents for the sibling VFS-metadata syscalls. Driving the
+        # same syscalls through the real interactive shell (this smoke's
+        # approach, mirroring boot_r17_shell_multi_command) sidesteps
+        # the limitation entirely: the shell IS a real ring-3 task with
+        # a real user aspace.
+        #
+        # Script: `mkdir /tmp` first (nothing seeds /tmp at boot), then
+        # `cd /tmp`, `mkdir ./sub`, `cd ./sub`, `mkdir ../peer`, `pwd`,
+        # `exit`. Every mkdir target after the first contains a '/'
+        # (`./sub`, `../peer`) rather than a bare name -- sys_mkdir's
+        # last-slash parent-path split has a known, pre-existing,
+        # out-of-R86-scope gap that rejects a bare no-slash relative
+        # name (see sys_mkdir.pdx's "no slash found -> ENOENT" branch);
+        # this smoke does not exercise that path.
+        #
+        # Golden asserts, in order: SHELL START, `shell cd ok -- path=`
+        # (cd_builtin's fingerprint after `cd /tmp`, proving sys_chdir
+        # wrote TASK_OFF_CWD), `sys mkdir ok` (the `mkdir ./sub` call,
+        # its parent-path "." resolving against the NEW cwd), a second
+        # `shell cd ok -- path=` (after `cd ./sub`), a second `sys mkdir
+        # ok` (the `mkdir ../peer` call, proving ".." walks back up via
+        # vnode parent_idx to /tmp), the literal ASCII substring
+        # `/tmp/sub` (pwd_builtin's sys_write of the sys_getcwd-composed
+        # path -- the actual end-to-end proof that TASK_OFF_CWD
+        # threading + the R86.M1-002/003 vnode name table + the parent-
+        # chain walk all agree), and REAPED (shell exit unblocking
+        # init's wait4).
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r86-relative-path.golden"
+        TIMEOUT=26
+        UART_RX_MODE=1
+        : "${INJECT_STRING:=mkdir /tmp\ncd /tmp\nmkdir ./sub\ncd ./sub\nmkdir ../peer\npwd\nexit\n}"
+        : "${INJECT_WAIT_FOR:=SHELL START}"
+        : "${INJECT_DELAY:=0.3}"
+        : "${INJECT_HOLD:=20}"
         EXPECTED=""
         ;;
     boot_smp)
