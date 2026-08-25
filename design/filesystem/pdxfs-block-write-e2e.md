@@ -1,13 +1,13 @@
 ---
-issue: 1783, 1784, 1785
+issue: 1783, 1784, 1785, 1786
 milestone: R55.M2 (pdxfs-block write path end-to-end)
 subsystem: filesystem / pdxfs-on-block v1
 topic: End-to-end write path for a fresh file on a pdxfs-block volume.
-       Three landings so far: §Allocator (extent-run first-fit),
+       Four landings so far: §Allocator (extent-run first-fit),
        §Inode-table-write (RMW of a 128-B inode row over bdev_write_at),
-       and §WAL (bdev-backed WAL append + fsync over bdev_write_at).
-       pdxfs_block_write and §Cache will thread these primitives
-       together into the full write path.
+       §WAL (bdev-backed WAL append + fsync over bdev_write_at), and
+       §pdxfs_block_write (composed end-to-end write that threads all
+       three primitives together). §Cache is the next landing.
 touching:
   - src/kernel/core/fs/pdxfs/allocator.pdx      (extend: alloc_extent_run)
   - src/kernel/core/fs/pdxfs/inode_table.pdx    (extend: inode_table_write
@@ -16,6 +16,8 @@ touching:
   - src/kernel/core/fs/pdxfs/wal.pdx            (extend: wal_append_write,
                                                  wal_fsync_bdev, _wal_scratch,
                                                  _wal_bdev_state)
+  - src/kernel/core/fs/pdxfs/cow_write.pdx      (extend: pdxfs_block_write
+                                                 -- composed end-to-end write)
   - src/kernel/core/fs/pdxfs/journal_csum.pdx   (header note: csum choice
                                                  delegated to jnl_crc32c_range)
   - src/kernel/core/klog/keys.pdx               (extend: tag_pdxb_alloc_ok,
@@ -24,7 +26,9 @@ touching:
                                                  tag_pdxb_inode_write_ok,
                                                  k_ino,
                                                  tag_pdxb_wal_fsynced_ok,
-                                                 k_records, k_lba)
+                                                 k_records, k_lba,
+                                                 tag_pdxb_write_ok,
+                                                 k_offset)
   - tools/build.sh                              (confine _inode_write_scratch,
                                                  _wal_scratch, _wal_bdev_state;
                                                  arity-pin wal_append_write /
@@ -32,6 +36,7 @@ touching:
   - tests/r55/expected-r55-alloc.txt            (2-line spec golden)
   - tests/r55/expected-r55-inode-write.txt      (1-line spec golden)
   - tests/r55/expected-r55-wal-fsync.txt        (1-line spec golden)
+  - tests/r55/expected-r55-write-e2e.txt        (1-line spec golden)
   - design/filesystem/pdxfs-block-write-e2e.md  (this doc)
 related:
   - src/kernel/core/fs/pdxfs/allocator.pdx      (alloc_block / free_block —
@@ -57,13 +62,18 @@ The pdxfs-block volume becomes writable in a fixed order of primitives:
    write barrier `bdev_write.pdx` §0 refuses to enforce itself. Every
    `pdxfs_block_write` MUST cross `wal_append_write` + `wal_fsync_bdev`
    before a data-block `bdev_write_at` is permitted.
-4. **§Cache** (later) — the block-cache handle that folds identical
+4. **§pdxfs_block_write** (R55.M2-004 / #1786) — the composed
+   end-to-end write op that threads the three primitives above into
+   one callable that resolves the inode, allocates an extent if
+   needed, crosses the WAL barrier, writes the data block, and
+   persists the mutated inode row.
+5. **§Cache** (later) — the block-cache handle that folds identical
    bitmap-block writes across a burst of allocations into one physical
    write.
 
 Landed so far: §Allocator (R55.M2-001), §Inode-table-write
-(R55.M2-002), and §WAL (R55.M2-003). §Cache is added by its own issue;
-the doc is the composition point.
+(R55.M2-002), §WAL (R55.M2-003), and §pdxfs_block_write (R55.M2-004).
+§Cache is added by its own issue; the doc is the composition point.
 
 ## §Allocator — extent-run first-fit (#1783)
 
@@ -704,3 +714,259 @@ the caller migration completes.
   a dedicated I/O-failure sentinel; not minted here because the
   reuse pattern matches `journal_ondisk.pdx`'s own JNL_CSUM_BAD
   reuse precedent (gap 3).
+
+## §pdxfs_block_write — composed end-to-end write (#1786)
+
+### Signature
+
+```
+pdxfs_block_write(vol_row: u64,
+                  ino:     u64,
+                  offset:  u64,
+                  len:     u64,
+                  in_pa:   u64) -> u64
+```
+
+- `vol_row` — volume row id (0..15). Threaded through both to
+  `volume_row_device_slot` (for `bdev_cap` resolution) and to
+  `wal_append_write` / `wal_fsync_bdev` (for per-vol_row WAL state).
+- `ino` — inode number. Bound-checked downstream by `inode_read`
+  (via `_itable_state.itable_bcount`) and by `inode_table_write`
+  (via `sb_itable_bcount(sb_ptr)`).
+- `offset` — byte offset within the file where the write begins.
+  M2-004 refuses any non-zero value with `PDXB_WRITE_BAD_ARG`; a
+  widening at M2+ (or a distinct issue for random-write) lifts this.
+- `len` — payload byte count, refused unless in the interval
+  (0, 4096]. Single-page, single-LBA write per the M2-004 posture.
+- `in_pa` — physical address of the source page holding `len` bytes.
+  Must be 4-KiB aligned (NVMe PRP1 requirement); this function does
+  not re-check --- the caller is responsible.
+
+Returns 0 on success, else a sentinel. Two new codes are minted in
+the pdxfs-block M2 band (0xFFFFED2*) for arg-gate refusals no
+sub-primitive can produce:
+
+- `PDXB_WRITE_BAD_ARG`  (0xFFFFED0A) — `offset != 0`, `len == 0`, or
+  `len > 4096`.
+- `PDXB_WRITE_BAD_VOL`  (0xFFFFED0B) — `volume_row_device_slot`
+  returned `VOL_DECODE_BAD` (dead row).
+
+Every sub-primitive's own sentinel is forwarded verbatim — sb_read's
+`PDXB_SB_*` band, inode_read's `INODE_*` / reused `ALLOC_BITMAP_TORN`,
+alloc_extent_run's `ALLOC_EXHAUSTED` / `ALLOC_BITMAP_TORN`,
+wal_append_write's `WAL_ERR_*`, wal_fsync_bdev's `WAL_ERR_*`,
+bdev_write_at's forwarded status, inode_table_write's
+`INODE_INVALID_INDEX` / reused `ALLOC_BITMAP_TORN`. No wrapper
+transform: the caller sees the originating band and can decide how
+to widen.
+
+### Composed flow
+
+The ticket names an 11-step flow; the actual body expands it to 15
+numbered steps by breaking out (a) the two arg-gate refusals as
+distinct steps 1 and 2, (b) the substrate short-circuit as a
+distinct step 3, and (c) `sb_read` + `itable_init` as separate
+sub-steps (needed to seed `_itable_state` before `inode_read` will
+pass its own bound check). Step 10 in the ticket (`checkpoint
+advance`) collapses to a no-op for M2-004 (documented below in
+"What §pdxfs_block_write does NOT prove").
+
+1. **Gate `offset == 0`.** Refuse with `PDXB_WRITE_BAD_ARG`
+   otherwise. The M2-004 posture is single-LBA single-page write
+   only.
+2. **Gate `0 < len <= 4096`.** Same refusal code.
+3. **Substrate branch.** If `_nvme_io_queue_count == 0`, jump
+   directly to the fingerprint emit (step 14). No disk-touching
+   primitive is called. Mirrors R55.M2-002 / R55.M2-003's own
+   substrate-emit posture — the fingerprint is the wire event
+   caller-side witnesses observe, whether or not the write reached
+   hardware.
+4. **Resolve `vol_row` → `bdev_cap`** via `volume_row_device_slot`.
+   `VOL_DECODE_BAD` (0xFFFFFFFFFFFFFFFF) → `PDXB_WRITE_BAD_VOL`.
+5. **Read the superblock.** `sb_read(bdev_cap)` returns
+   `&_sb_read_buf` on success or an error sentinel below
+   `KERNEL_VMA_BASE` (0xFFFF800000000000). Sentinels are forwarded
+   verbatim.
+6. **Seed `_itable_state`.** `itable_init(sb_ptr)` stamps
+   `itable_lba` / `itable_bcount` / `loaded_block_idx` /
+   `init_mark`. Always returns 0. Required before `inode_read` will
+   pass its own bound check (a fresh `_itable_state` has
+   `itable_bcount == 0` and refuses every ino).
+7. **Read the inode row.** `inode_read(bdev_cap, ino)` returns
+   `&_itable_row_scratch` on success or an error sentinel below
+   `KERNEL_VMA_BASE`. The pointer is kept in a callee-save register
+   for the remainder of the flow.
+8. **Allocate an extent if slot 0 is empty.** Check `inode_ptr[+48]`
+   (packed extent[0]: `(granted_len << 48) | (start_lba & 0x…FFFF)`).
+   If zero, call `alloc_extent_run(bdev_cap, want_len=1,
+   out_start_lba_ptr=0, out_granted_len_ptr=0, inode_row_ptr)` —
+   the allocator stamps extent[0] in place. Non-zero return →
+   forward. Re-writes over an already-allocated extent skip this
+   step and reuse the existing `start_lba`.
+9. **Compute `data_lba`.** `inode_ptr[+48] & 0x0000_FFFF_FFFF_FFFF`
+   extracts the low-48-bit start LBA. Since `offset == 0` is gated,
+   the write hits `data_lba` directly with no in-block byte offset.
+10. **`wal_append_write(vol_row, data_lba, len, in_pa)`.** Records
+    the pending data-block write into `_wal_scratch`. Silent on the
+    wire. Non-zero → forward.
+11. **`wal_fsync_bdev(vol_row)`.** Flushes `_wal_scratch` via
+    `bdev_write_at`. Emits `tag_pdxb_wal_fsynced_ok` on success and
+    satisfies the WAL-fsync-before-data-write barrier
+    `bdev_write.pdx` §0 refuses to enforce itself. Non-zero →
+    forward.
+12. **`bdev_write_at(nsid=1, data_lba, count=1, in_pa)`.** Writes
+    the caller's payload page. Non-zero → forward.
+13. **Update inode `byte_len`.** `new_size = max(len, byte_len_old)`.
+    Stamped at `inode_ptr[+16]` (the 128-B row's `byte_len` field).
+14. **`inode_table_write(nsid=1, sb_ptr, ino, inode_ptr)`.** RMW
+    persists the mutated row (both the new `byte_len` and the
+    stamped `extent[0]` from step 8) to disk. Emits
+    `tag_pdxb_inode_write_ok` on success. Non-zero → forward.
+15. **Emit `tag_pdxb_write_ok`.** `klog_s1_x3` with three hex KVs:
+    `k_ino=ino`, `k_offset=0`, `k_len=len`. Exactly one emit per
+    successful call, on both the LIVE path (all sub-primitives
+    succeeded) and the SUBSTRATE short-circuit (step 3).
+
+### Substrate posture
+
+Substrate is a top-level short-circuit: when `_nvme_io_queue_count == 0`
+(every QEMU-TCG `-kernel` boot today), steps 4–14 are skipped and the
+fingerprint at step 15 fires directly. Rationale for the outer
+short-circuit rather than delegating to per-primitive substrate
+branches:
+
+- `sb_read`, `inode_read`, and `alloc_extent_run` all issue
+  `cap_invoke(BDEV_OP_*)` — which is NOT substrate-branched in the
+  R55 tree. On substrate posture they would return I/O errors from
+  the underlying KIND_BLKDEV backend rather than a graceful
+  scaffold-success, and the composed op would return a forwarded
+  sentinel instead of the fingerprint.
+- `wal_fsync_bdev` and `bdev_write_at` and `inode_table_write` ARE
+  substrate-branched internally, but they compose downstream of
+  the un-branched I/O primitives above.
+- The outer short-circuit keeps the substrate posture uniform:
+  every caller-side witness sees the composed fingerprint whether or
+  not any disk touch happened, matching R55.M2-002 / R55.M2-003's
+  own posture one-for-one.
+
+### Fingerprint (wire — one line per successful composed op)
+
+Emitted via `klog_s1_x3` inside `pdxfs_block_write` on the success
+path (both LIVE and SUBSTRATE), LEVEL_INFO / SUBSYS_FS__:
+
+```
+pdxb write ok [legacy: PDXB WRITE OK] ino=0x0000000000000002 offset=0x0000000000000000 len=0x000000000000000d
+```
+
+- Three hex k=v pairs: `ino` (caller arg), `offset` (always 0 per
+  the M2-004 gate), `len` (caller arg).
+- Two-in-one bracketed legacy suffix `[legacy: PDXB WRITE OK]`
+  matches the R51 Phase C option-B shape `tag_pdxb_bdev_flush_ok` /
+  `tag_pdxb_alloc_ok` / `tag_pdxb_inode_write_ok` /
+  `tag_pdxb_wal_fsynced_ok` already established in this file family.
+- The tag contains an `OK` token per
+  `verify-fingerprint-coverage.sh`'s `OK_TOK` regex (space before,
+  `]` after — both non-alnum).
+- Byte counts: `tag_pdxb_write_ok` = 37 chars + NUL = 38 bytes;
+  `k_offset` = 6 chars + NUL = 7 bytes. `k_ino` is reused from
+  R55.M2-002; `k_len` is reused from the R7-era generic key block.
+- Sub-primitive fingerprints (`tag_pdxb_alloc_ok`,
+  `tag_pdxb_alloc_verify_ok`, `tag_pdxb_wal_fsynced_ok`,
+  `tag_pdxb_inode_write_ok`) ALSO fire on the LIVE path — those
+  are the wire events R55.M2-001/002/003 already own. The
+  M2-004 golden matches only the composed `tag_pdxb_write_ok`
+  line as a substring; the sub-primitive fingerprints are covered
+  by their own R55.M2 goldens.
+
+Golden fixture at `tests/r55/expected-r55-write-e2e.txt` names one
+line as a prefix substring (the `covered_by` check accepts the
+substring-either-way match `marker.startswith(a) or
+a.startswith(marker)`).
+
+Failure paths (bad arg, bad vol_row, sb_read err, inode_read err,
+alloc err, WAL err, bdev_write err, inode_table_write err) return the
+appropriate sentinel WITHOUT emitting the fingerprint.
+
+### Mount wire-up (DEFERRED to #1787)
+
+`_pdxfs_block_write_stub` in `core/fs/pdxfs/vops_block.pdx` (R52.M5-005
+/ #1707) currently returns `MOUNT_BACKEND_UNKNOWN` (0xFFFFED27). The
+vop signature is `(vn, buf, len, off) -> u64`; the composed op's
+signature is `(vol_row, ino, offset, len, in_pa) -> u64`. The
+translator between them requires a vnode-to-`(vol_row, ino)` mapping
+that has not landed yet (R52.M8 territory in the
+`kind_pdxfs_txn.pdx` family).
+
+M2-004 lands the primitive with a direct-call posture. The M2-005
+smoke (#1787) exercises it directly (not via `sys_write`), and the
+vop-adapter wiring lives in whichever issue lands the
+vnode-to-row-id materialisation path. Documented here (rather than
+adding a placeholder adapter that would corrupt callers on entry
+before the mapping is available) per the ticket's "extra check"
+guidance: "If the mount table's write vop is already a stub, replace
+with pdxfs_block_write. If the mount table doesn't exist yet as a
+vop dispatch surface, DEFER the mount wire-up to #1787 (which is the
+smoke that will exercise it) and document; land the primitive with a
+direct-call posture."
+
+### Register discipline
+
+- 6 callee-save pushes (`rbx=vol_row`, `rbp=ino`, `r12=len`,
+  `r13=in_pa`, `r14=sb_ptr`, `r15=inode_ptr`) + `sub rsp, 8` land
+  `rsp%16==0` for every nested call (entry `rsp%16==8` + 48 + 8 = 64,
+  `%16==0`).
+- Frame `[rsp+0]` = `bdev_cap` spill. No free 7th callee-save
+  register — the 6 registers listed already carry the values that
+  outlive `bdev_cap` (which is dead after step 8 / alloc).
+- Cross-module symbol reference discipline: `_sb_read_buf` and
+  `_itable_row_scratch` are confined via `ec_confine_one` to
+  `superblock_read.o` and `inode_table.o` respectively (see
+  `tools/build.sh`). Cross-module re-`lea` from `cow_write.o` would
+  land as a build-time relocation refusal, so both pointers stay in
+  callee-save registers after their producing calls return —
+  `sb_read`'s return value in `r14`, `inode_read`'s in `r15` —
+  rather than being re-computed by lea.
+- `klog_s1_x3` push convention (per `wrappers.pdx` line 137-146):
+  caller stack is `[rsp+8]=v2`, `[rsp+16]=k3`, `[rsp+24]=v3`
+  (post-return-address push). Caller pushes in reverse (`v3`, `k3`,
+  `v2`) after a leading `sub rsp, 8` alignment pad; the 3 pushes +
+  pad = 32 B keep `rsp%16==0` pre-call. `add rsp, 32` undoes.
+
+### What §pdxfs_block_write does NOT prove
+
+- **Non-zero `offset`.** M2-004 rejects. Random-write is R55+ tail
+  work: the extent-slot math (`data_lba + offset/4096`) is one line
+  but the underlying RMW-into-mid-block path requires either a
+  `bdev_read_at` sibling of `bdev_write_at` (partial-block updates
+  need the whole 4-KiB block resident) or a data-region block cache
+  the §Cache milestone will introduce.
+- **`len > 4096` / multi-LBA writes.** M2-004 rejects. Multi-block
+  writes need the WAL record loop + the multi-block `bdev_write_at`
+  (`count > 1`) already supported by the primitive but not yet
+  exercised by this composition.
+- **Multi-extent files.** Only extent slot 0 is populated. A file
+  exceeding 8 blocks (`ALLOC_EXTENT_RUN_MAX`) needs slot 1..7
+  orchestration and per-slot append semantics; deferred to a
+  distinct issue that lands multi-slot extent walkers.
+- **Real `mtime` field.** M2-004 does not touch the 128-B row's
+  `mtime_ns` field (`+32`). The R55 posture is single-namespace
+  boot without a monotonic real-time source at this file's altitude;
+  a widening that threads a clock source through the inode-write
+  path stamps `mtime` alongside `byte_len`.
+- **Checkpoint advance.** For M2-004, this is a no-op — the WAL is
+  single-record per `pdxfs_block_write` call, and `wal_fsync_bdev`
+  already made the record durable. A multi-record checkpoint chain
+  (with a rolling `checkpoint_lba` distinct from `head_lba`) lands
+  at R56+ when the WAL grows beyond one-shot appends.
+- **Mount-table vop wiring.** DEFERRED to #1787 per the section
+  above.
+- **`vnode`-based caller path.** Callers today must know the
+  `(vol_row, ino)` pair up front. `sys_write` will need the vnode
+  adapter deferred to #1787's own scope; this is not a soft-arch
+  gap in the composed op itself but in the vfs-to-pdxfs bridge.
+- **Idempotency across a crash.** WAL records land on device but no
+  replay walker consumes them yet (R55.M2 §WAL "What §WAL does NOT
+  prove" — replay is R56+). A crash mid-composed-op will leave the
+  inode-row and data-block writes in whatever partial state the
+  step ordering committed; the WAL record is present for a future
+  replayer to resolve.
