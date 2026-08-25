@@ -6405,6 +6405,48 @@ fi
 echo "[r53-m2-005-confine] R53.M2-005 (_pdxfs_block_vops) confined"
 
 # ---------------------------------------------------------------------------
+# R56.M3-002 (#1791): one-writer discipline for the sys_stat path + out
+# scratches.
+#
+#   * sys_stat (sys_stat_body, src/kernel/core/syscall/sys_stat.pdx)
+#
+# `_sys_stat_path_scratch` is the 256-byte KPTI landing zone the body
+# copies the caller's user path into (via user_read_str_via_walk) before
+# handing it to path_resolve.  `_sys_stat_out_scratch` is the 64-byte
+# staging buffer vops_stat's per-backend adapter populates with
+# {ino, size, mtime, mode, nlink, uid, gid, blksize, blocks, reserved};
+# user_write_bytes_via_walk copies it back to the ring-3 caller.  Both
+# references live in one .o (core/syscall/sys_stat.o), matching
+# _sys_umount_path_scratch's own single-owner posture at R53.M2-003
+# (sys_umount.pdx) and _execve_path_scratch's at sys_execve_shim.pdx.
+# A second writer against either slot would let one caller's in-flight
+# path copy or stat readback be overwritten by another's mid-scan --
+# the stat gate would then see whichever bytes lost the race, silently
+# returning metadata for the wrong inode.
+R56_SYSSTAT_SRC="${REPO_ROOT}/src/kernel/core/syscall/sys_stat.pdx"
+if [[ ! -f "${R56_SYSSTAT_SRC}" ]]; then
+    echo "[r56-m3-002-confine] FAIL - sys_stat.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_sys_stat_path_scratch' 'core/syscall/sys_stat.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See sys_stat.pdx §Static storage for the per-module one-writer" >&2
+    echo "  discipline (the sole writer is user_read_str_via_walk called" >&2
+    echo "  from sys_stat_body; the sole reader is path_resolve on the" >&2
+    echo "  in-file call chain)." >&2
+    exit 1
+fi
+ec_confine_one '_sys_stat_out_scratch' 'core/syscall/sys_stat.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See sys_stat.pdx §Static storage for the per-module one-writer" >&2
+    echo "  discipline (the sole writer is vops_stat's per-backend adapter" >&2
+    echo "  called from sys_stat_body; the sole reader is" >&2
+    echo "  user_write_bytes_via_walk on the same in-file call chain)." >&2
+    exit 1
+fi
+echo "[r56-m3-002-confine] R56.M3-002 (sys_stat) confined"
+
+# ---------------------------------------------------------------------------
 # R53.M3-001 (#1742): confinement for the root-volume UUID hint slot in
 # the factored boot handoff record.
 #
