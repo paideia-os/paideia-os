@@ -393,11 +393,13 @@ case "${EXPECTED}" in
         # wait4 returns; shell reprompts. Then `exit` unblocks init's
         # second wait4.
         #
-        # Golden asserts: SHELL START, TRUE OK (proves /bin/true was
-        # tmpfs-seeded, path-resolved, ELF-loaded, ran in ring-3, and
-        # wrote to shell-inherited stdout), REAPED (init reap of the
-        # shell — pid=3, since /bin/true is pid=4 and is reaped by
-        # the shell, not init).
+        # Golden asserts: SHELL START, sys execve argv ok (R62.M1-002/003
+        # #1826/#1829 — proves the shell's argv=["true"], envp=NULL
+        # marshalled through sys_execve_shim before /bin/true's image
+        # loaded), TRUE OK (proves /bin/true was tmpfs-seeded,
+        # path-resolved, ELF-loaded, ran in ring-3, and wrote to
+        # shell-inherited stdout), REAPED (init reap of the shell — pid=3,
+        # since /bin/true is pid=4 and is reaped by the shell, not init).
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/r17/shell-child-process.golden"
         TIMEOUT=15

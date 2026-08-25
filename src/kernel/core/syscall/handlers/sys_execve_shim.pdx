@@ -1,29 +1,47 @@
 // src/kernel/core/syscall/handlers/sys_execve_shim.pdx — R17-M0-671 (#671)
 //   + R17-M0-730 D10b (#730): return-frame rewrite for exec-completes semantics.
-// sys_execve dispatch shim: path→image copy-in + syscall return-frame rewrite.
+//   + R62.M1-002 (#1826): real argv/envp marshalling onto the new image.
+// sys_execve dispatch shim: path→image copy-in + argv/envp marshal +
+// syscall return-frame rewrite.
 //
 // Bridges the SC+ userland ABI shape execve(path, argv, envp) to the
 // kernel-internal sys_execve_body(current, image_ptr, image_len) contract
-// from #555. Full design: design/kernel/r17-m0-671-sys-execve-shim.md and
-// design/kernel/r17-m0-730-d10-execve-complete.md.
+// from #555. Full design: design/kernel/r17-m0-671-sys-execve-shim.md,
+// design/kernel/r17-m0-730-d10-execve-complete.md, and — for the argv/envp
+// register ABI this file now populates — design/user/execve-abi.md.
 //
 // Sequence (all failure paths return sign-extended -errno in rax, rdx=0):
 //   1. user_ptr_ok(path_va, 1)                         — reject kernel ptrs early
 //   2. Byte-copy path into _execve_path_scratch        — bounded 256 B, NUL-terminated
+//   2.5 (#1826) Copy argv[]/envp[] from the CALLER's (old) aspace into
+//      kernel scratch — MUST happen before step 7's aspace swap, since
+//      that is the last point _current_tcb.user_pml4_va still resolves
+//      the caller's own pointers. Up to 16 entries each, 256 B/entry,
+//      best-effort (a read fault truncates the collected count rather
+//      than failing the whole execve).
 //   3. vfs_open(scratch_path, O_RDONLY=0) → vnode_idx  — 0 => -ENOENT
 //   4. Page-sized read loop into _execve_image_scratch — until EOF / short / cap
 //   5. ELF magic check on image[0..4] == "\x7fELF"     — mismatch => -ENOEXEC
 //   6. vfs_close(vnode_idx)                            — best-effort refcount drop
 //   7. sys_execve_body(current, image, image_len)      — commits new aspace in TCB+16
-//   8. (D10b) On body success (rax==0): user_stack_alloc(new_pml4_va, 4)
-//      → new_user_rsp_top; rewrite syscall return frame so sysret enters the
-//      new image:
+//   8. (D10b) On body success (rax==0): user_stack_alloc(new_pml4_va,
+//      EXECVE_USER_STACK_PAGES + EXECVE_ARGV_DATA_PAGES) → new_user_rsp_top
+//      (always the fixed canonical top regardless of size_pages); rewrite
+//      syscall return frame so sysret enters the new image:
 //        [current.kstack_top -  8] = entry_rip (from body's rdx)
 //        [current.kstack_top - 16] = 0x202 (fresh IF=1 rflags)
 //        [current + 104]            = new_user_rsp_top
 //      The syscall_entry epilogue reads these three slots plus TCB+16 (new
 //      user_pml4_va, already committed by body) to construct the sysret
 //      return. See design doc §4 for the exact stack topology.
+//   8.5 (#1826) Marshal the collected argv/envp strings + pointer arrays
+//      into the EXTRA pages reserved below the real stack (see
+//      design/user/execve-abi.md §Layout), then stage argc/argv_ptr_va/
+//      envp_ptr_va into the trampoline-data-page slots
+//      (_execve_out_argc/argv/envp) and set _execve_regs_pending = 1 so
+//      syscall_entry's epilogue (entry.pdx) loads them into rdi/rsi/rdx
+//      instead of the usual #743 zero-out — see entry.pdx's own #1826
+//      addendum.
 
 module SysExecveShim = structure {
   // ==========================================================================
@@ -38,6 +56,21 @@ module SysExecveShim = structure {
   // to phys_alloc(4) is drop-in.
   pub let EXECVE_IMAGE_MAX : u64 = 65536
   pub let EXECVE_PAGE_SIZE : u64 = 4096
+
+  // R62.M1-002 (#1826): argv/envp marshalling caps. Mirrors EXECVE_PATH_MAX's
+  // per-entry cap (256 B/string) and bounds the count at 16 — see
+  // design/user/execve-abi.md §Limits for the rationale (matches the
+  // shell's own tokenizer argv[16] cap in src/user/tokenizer.pdx).
+  pub let EXECVE_ARGV_MAX        : u64 = 16
+  pub let EXECVE_ARGV_ENTRY_CAP  : u64 = 256
+
+  // R62.M1-002 (#1826): extra user pages reserved BELOW the real
+  // EXECVE_USER_STACK_PAGES-page stack for the argv/envp payload — see
+  // design/user/execve-abi.md §Layout. Page 0 = packed argv strings
+  // (EXECVE_ARGV_MAX * EXECVE_ARGV_ENTRY_CAP = 4096 B, exact fit), page 1
+  // = packed envp strings (same shape), page 2 = the two NULL-terminated
+  // pointer arrays (17 * 8 B = 136 B each, well within one page).
+  pub let EXECVE_ARGV_DATA_PAGES : u64 = 3
 
   // Linux errno constants (sign-extended to u64), matching PtrCheck.EFAULT
   // and sys_open.pdx conventions.
@@ -76,14 +109,46 @@ module SysExecveShim = structure {
   pub let mut _execve_path_scratch  : [u8; 256]   = uninit @align(8)
   pub let mut _execve_image_scratch : [u8; 65536] = uninit @align(4096)
 
+  // R62.M1-002 (#1826): argv/envp marshalling scratch. See the Phase 1 /
+  // Phase 3.5 / Phase 9b block comments below for how each is used.
+  //   _execve_argv_va_in / _execve_envp_va_in: the caller's argv_va/envp_va
+  //     (originally rdx/rcx), stashed to memory immediately in Phase 1
+  //     before either register is caller-save-clobbered by a nested call.
+  //   _execve_ptr_scratch: one 8-byte staging cell, reused across both the
+  //     copy-in (holds one argv[i]/envp[i] user pointer) and copy-out
+  //     (holds one pointer-array entry's value before its own
+  //     user_write_bytes_via_walk) phases — sequential, no aliasing.
+  //   _execve_argv_scratch / _execve_envp_scratch: fixed 256 B/entry
+  //     kernel-side copies of up to EXECVE_ARGV_MAX strings each (16*256 =
+  //     4096 B, matches the user-side page each is later copied to
+  //     verbatim in Phase 9b — no repacking needed).
+  //   _execve_argc_scratch / _execve_envc_scratch: entry counts collected
+  //     by the Phase 3.5 loops, consumed by Phase 9b's copy-out and by the
+  //     R62.M1-003 (#1829) fingerprint.
+  pub let mut _execve_argv_va_in    : [u64; 1]  = uninit @align(8)
+  pub let mut _execve_envp_va_in    : [u64; 1]  = uninit @align(8)
+  pub let mut _execve_ptr_scratch   : [u64; 1]  = uninit @align(8)
+  pub let mut _execve_argv_scratch  : [u8; 4096] = uninit @align(8)
+  pub let mut _execve_envp_scratch  : [u8; 4096] = uninit @align(8)
+  pub let mut _execve_argc_scratch  : [u64; 1]  = uninit @align(8)
+  pub let mut _execve_envc_scratch  : [u64; 1]  = uninit @align(8)
+
   // ==========================================================================
   // sys_execve_shim(current, path_va, argv_va, envp_va) -> u64
   //
   // SysV AMD64:
   //   rdi = current   (task_struct*, non-NULL — dispatcher loads _current_tcb)
   //   rsi = path_va   (user VA of NUL-terminated path)
-  //   rdx = argv_va   (IGNORED at R17.M0 — see design §1 Non-Scope)
-  //   rcx = envp_va   (IGNORED at R17.M0 — see design §1 Non-Scope)
+  //   rdx = argv_va   (user VA of a NULL-terminated char* array; 0 = no argv)
+  //   rcx = envp_va   (user VA of a NULL-terminated char* array; 0 = no envp)
+  //
+  // R62.M1-002 (#1826): argv_va/envp_va are now marshalled onto the new
+  // image per the frozen ABI in design/user/execve-abi.md — up to
+  // EXECVE_ARGV_MAX (16) entries each, EXECVE_ARGV_ENTRY_CAP (256) bytes
+  // per string, best-effort (a read fault truncates the collected count
+  // rather than failing the whole execve). On success the new image's
+  // _start receives argc/argv/envp in rdi/rsi/rdx (see entry.pdx's
+  // _execve_regs_pending handoff), NOT on the stack.
   //
   // Returns:
   //   rax = 0 on success (with rdx = ELF e_entry from sys_execve_body)
@@ -93,7 +158,7 @@ module SysExecveShim = structure {
     fn (current: u64) (path_va: u64) (argv_va: u64) (envp_va: u64) -> unsafe {
       effects: {mem, sysreg},
       capabilities: {},
-      justification: "R17-M0-671 (#671): sys_execve dispatch shim. Bridges the SC+ userland execve(path, argv, envp) shape to sys_execve_body(current, image_ptr, image_len) from #555, which cannot accept a path directly (its ABI expects an already-loaded ELF blob). Five-push callee-save prologue (rbx, r12, r13, r14, r15) lands rsp%16==0 for every nested call per SysV AMD64. Register plan: rbx=current (needed for sys_execve_body), r12=path_va (needed only through phase 3 copy, then dead), r13=vnode_idx (set by vfs_open in phase 4, used by vfs_read in phase 5 and vfs_close in phase 7), r14=byte-index / offset / image_len (repurposed across phases 3→5→8), r15=_execve_image_scratch base VA (lea'd once in phase 5, used by phase 6 magic check and phase 8 sys_execve_body call). Phase 2 calls user_ptr_ok(path_va, 1) to reject a kernel-half pointer up front — Phase 1 range check per #541; per-page walk is deferred. Phase 3 byte-copies path bytes from user VA (r12) into _execve_path_scratch via `mov_b rax, [r12 + r14*1]; mov_b [scratch + r14*1], rax` with NUL detection; loop bound = EXECVE_PATH_MAX = 256; overrun => -EFAULT. rax is pre-zeroed (xor rax, rax) before every mov_b load to guarantee upper-bit zero-extension (matches path.pdx and libc_test.pdx convention; the mov_b primitive emits an 8-bit MOV that does NOT movzx, so pre-zeroing is required for the subsequent `cmp rax, 0` byte compare to see only the loaded byte). Phase 4 calls vfs_open(scratch, O_RDONLY=0); a zero return means either path unresolvable or tmpfs backing missing, both surfaced as -ENOENT. Phase 5 is a page-loop calling vfs_read(r13, r15+offset, 4096, offset) at offsets 0, 4096, 8192, ... Each iteration receives EITHER a full-page 4096 return (continue), a short return < 4096 (last chunk, exit loop), a 0 return (EOF at page boundary, exit loop), or the VOPS_ERR_SENTINEL (0xFFFFFFFFFFFFFFFF, error — vfs_close and return -EIO). If offset ever reaches EXECVE_IMAGE_MAX (65536) before EOF, return -E2BIG (with vfs_close). Cross-page reads are structurally prevented by the page-aligned offset schedule: tmpfs_read.pdx §4.7 forbids cross-page but each iteration here fits inside one page by construction. Phase 6 validates ELF magic byte-by-byte at image[0..4]; mismatch => -ENOEXEC. Phase 7 vfs_close(vnode_idx); return value ignored per #576's phase 3.4 discipline (every legal producer-side vnode_idx round-trips safely through vfs_close's decrement). Phase 8 marshals (rbx, r15, r14) into (rdi, rsi, rdx) and calls sys_execve_body — its {rax, rdx} pair propagates verbatim as our return. Alignment for the sys_execve_body call: 5-push prologue + return-address = 48 B = 16 mod 0 aligned, no additional sub rsp,8 needed. All error branches jump to labelled shared exits (fail_efault, fail_enoent, fail_eio_close, fail_ebad_close, fail_e2big_close) that set rax=-errno, rdx=0, and (for the *_close variants) invoke vfs_close(r13) to release the vnode refcount before returning — matches the resource-discipline rule that every successful vfs_open must be paired with a vfs_close on every failure path past phase 4. On path-copy failure (phase 3) the vnode hasn't been opened yet, so no close needed.",
+      justification: "R17-M0-671 (#671): sys_execve dispatch shim. Bridges the SC+ userland execve(path, argv, envp) shape to sys_execve_body(current, image_ptr, image_len) from #555, which cannot accept a path directly (its ABI expects an already-loaded ELF blob). Five-push callee-save prologue (rbx, r12, r13, r14, r15) lands rsp%16==0 for every nested call per SysV AMD64. Register plan: rbx=current (needed for sys_execve_body), r12=path_va (needed only through phase 3 copy, then dead), r13=vnode_idx (set by vfs_open in phase 4, used by vfs_read in phase 5 and vfs_close in phase 7), r14=byte-index / offset / image_len (repurposed across phases 3→5→8), r15=_execve_image_scratch base VA (lea'd once in phase 5, used by phase 6 magic check and phase 8 sys_execve_body call). Phase 2 calls user_ptr_ok(path_va, 1) to reject a kernel-half pointer up front — Phase 1 range check per #541; per-page walk is deferred. Phase 3 byte-copies path bytes from user VA (r12) into _execve_path_scratch via `mov_b rax, [r12 + r14*1]; mov_b [scratch + r14*1], rax` with NUL detection; loop bound = EXECVE_PATH_MAX = 256; overrun => -EFAULT. rax is pre-zeroed (xor rax, rax) before every mov_b load to guarantee upper-bit zero-extension (matches path.pdx and libc_test.pdx convention; the mov_b primitive emits an 8-bit MOV that does NOT movzx, so pre-zeroing is required for the subsequent `cmp rax, 0` byte compare to see only the loaded byte). Phase 4 calls vfs_open(scratch, O_RDONLY=0); a zero return means either path unresolvable or tmpfs backing missing, both surfaced as -ENOENT. Phase 5 is a page-loop calling vfs_read(r13, r15+offset, 4096, offset) at offsets 0, 4096, 8192, ... Each iteration receives EITHER a full-page 4096 return (continue), a short return < 4096 (last chunk, exit loop), a 0 return (EOF at page boundary, exit loop), or the VOPS_ERR_SENTINEL (0xFFFFFFFFFFFFFFFF, error — vfs_close and return -EIO). If offset ever reaches EXECVE_IMAGE_MAX (65536) before EOF, return -E2BIG (with vfs_close). Cross-page reads are structurally prevented by the page-aligned offset schedule: tmpfs_read.pdx §4.7 forbids cross-page but each iteration here fits inside one page by construction. Phase 6 validates ELF magic byte-by-byte at image[0..4]; mismatch => -ENOEXEC. Phase 7 vfs_close(vnode_idx); return value ignored per #576's phase 3.4 discipline (every legal producer-side vnode_idx round-trips safely through vfs_close's decrement). Phase 8 marshals (rbx, r15, r14) into (rdi, rsi, rdx) and calls sys_execve_body — its {rax, rdx} pair propagates verbatim as our return. Alignment for the sys_execve_body call: 5-push prologue + return-address = 48 B = 16 mod 0 aligned, no additional sub rsp,8 needed. All error branches jump to labelled shared exits (fail_efault, fail_enoent, fail_eio_close, fail_ebad_close, fail_e2big_close) that set rax=-errno, rdx=0, and (for the *_close variants) invoke vfs_close(r13) to release the vnode refcount before returning — matches the resource-discipline rule that every successful vfs_open must be paired with a vfs_close on every failure path past phase 4. On path-copy failure (phase 3) the vnode hasn't been opened yet, so no close needed. R62.M1-002 (#1826) addendum: Phase 1 now also stashes argv_va/envp_va (rdx/rcx) to _execve_argv_va_in/_execve_envp_va_in before either register can be caller-save-clobbered. Phase 3.5 (inserted after Phase 3's path copy, before Phase 4's vfs_open, using r13/r14/r15 which are otherwise unused until Phase 4/5) walks each pointer array (user_read_bytes_via_walk for the 8-byte pointer, user_read_str_via_walk for the pointed-to string) up to EXECVE_ARGV_MAX=16 entries, best-effort, recording counts in _execve_argc_scratch/_execve_envc_scratch. This MUST run before Phase 8's sys_execve_body call, since that call's aspace swap tears down the old aspace _current_tcb.user_pml4_va was resolving through. Phase 9b (after Phase 9's user_stack_alloc, now sized EXECVE_USER_STACK_PAGES+EXECVE_ARGV_DATA_PAGES=7 pages so the extra 3 pages land BELOW the unchanged real stack) copies the collected strings verbatim (fixed 256 B stride, no repacking) into the new aspace via user_write_bytes_via_walk, then builds and writes the two NULL-terminated pointer arrays (pure formula: argv_ptr[i] = data_base + i*256, envp_ptr[i] = data_base + 0x1000 + i*256 — no dependency on string content) at data_base+0x2000/+0x2100. Phase 9c stages argc/argv_ptr_va/envp_ptr_va into the trampoline_data.pdx slots and sets _execve_regs_pending=1 so entry.pdx's epilogue delivers them in rdi/rsi/rdx per the frozen ABI (design/user/execve-abi.md) instead of the usual #743 zero-out. Phase 9d emits the R62.M1-003 (#1829) `sys execve argv ok` fingerprint via klog_s1_d2 with the same sub-rsp,8/push-v2/call/add-rsp,16 alignment idiom sys_stat.pdx's own klog_s1_x2 call uses (pre-call rsp%16==0 here too, since every intervening Phase 2-9c call is a balanced call/ret pair off the original 5-push prologue). r12 and r15 (both dead post-Phase-8) are the scratch registers throughout Phase 9b/9c/9d; rbx (current), r13 (TOP) and r14 (entry_rip) survive untouched into the pre-existing (d.1)/(d.2)/(d.3) rewrite.",
       block: {
         // ===== Prologue (5 pushes for rsp%16==0 at nested calls) =====
         push rbx;
@@ -105,7 +170,12 @@ module SysExecveShim = structure {
         // ===== Phase 1: Save args in callee-save regs =====
         mov rbx, rdi;                             // rbx = current
         mov r12, rsi;                             // r12 = path_va
-        // rdx (argv_va), rcx (envp_va) intentionally ignored at R17.M0.
+
+        // R62.M1-002 (#1826): stash argv_va/envp_va to memory IMMEDIATELY —
+        // rdx/rcx are caller-save and Phase 2's `call user_ptr_ok` below
+        // offers no preservation guarantee. Reloaded by Phase 3.5.
+        mov [rip + _execve_argv_va_in], rdx;
+        mov [rip + _execve_envp_va_in], rcx;
 
         // ===== Phase 2: user_ptr_ok(path_va, 1) — reject kernel pointers =====
         mov rdi, r12;                             // arg0 = path_va
@@ -141,6 +211,119 @@ module SysExecveShim = structure {
         je  sys_execve_shim_fail_efault;
 
       sys_execve_shim_copied:
+        // ===== Phase 3.5 (#1826): argv/envp copy-in from the OLD aspace =====
+        // Must happen before sys_execve_body's aspace swap (which tears
+        // down the old aspace's PML4 after committing the new one) —
+        // this is the LAST point _current_tcb.user_pml4_va still resolves
+        // the caller's own argv/envp user pointers. r13/r14/r15 are
+        // unused until Phase 4/5 below, so they're free for this loop;
+        // rbx (current) and r12 (path_va, dead after Phase 3 but harmless
+        // to leave live) are undisturbed.
+        //
+        // Best-effort: a fault reading either the pointer-array itself
+        // (user_read_bytes_via_walk) or an individual string
+        // (user_read_str_via_walk) stops the loop early with whatever
+        // count was collected so far — never fails the execve. A string
+        // fault forces an explicit empty-string NUL at that slot so
+        // downstream Phase 9b packing never reads uninitialised .bss.
+        mov r13, [rip + _execve_argv_va_in];      // r13 = argv_va base (0 = none)
+        xor r14, r14;                              // r14 = i = 0
+        cmp r13, 0;
+        je sys_execve_shim_argv_done;
+
+      sys_execve_shim_argv_loop:
+        mov rax, 16;                               // EXECVE_ARGV_MAX
+        cmp r14, rax;
+        jge sys_execve_shim_argv_done;
+
+        // Read argv[i] = *(argv_va + i*8) into _execve_ptr_scratch.
+        mov rax, r14;
+        shl rax, 3;                                // rax = i*8
+        add rax, r13;                               // rax = &argv_va[i]
+        lea rdi, [rip + _execve_ptr_scratch];       // arg0 = kernel_dst
+        mov rsi, rax;                                // arg1 = user_va
+        mov rdx, 8;                                  // arg2 = len
+        call user_read_bytes_via_walk;               // rax = 0 (ok) or -EFAULT
+        cmp rax, 0;
+        jne sys_execve_shim_argv_done;               // fault: stop, best-effort
+
+        mov r15, [rip + _execve_ptr_scratch];        // r15 = argv[i] (user VA or 0)
+        cmp r15, 0;
+        je sys_execve_shim_argv_done;                // NULL terminator
+
+        // Copy the string into _execve_argv_scratch[i * 256].
+        mov rax, r14;
+        shl rax, 8;                                  // rax = i*256
+        lea rsi, [rip + _execve_argv_scratch];        // arg1 = kernel_dst
+        add rsi, rax;
+        mov rdi, r15;                                 // arg0 = user_va (string ptr)
+        mov rdx, 256;                                 // arg2 = cap
+        call user_read_str_via_walk;                  // rax = strlen or 0 (fault/no NUL)
+        cmp rax, 0;
+        jne sys_execve_shim_argv_next;
+        // Fault or cap-overflow: force an explicit empty string.
+        mov rax, r14;
+        shl rax, 8;
+        lea rdi, [rip + _execve_argv_scratch];
+        add rdi, rax;
+        xor rax, rax;
+        mov_b [rdi], rax;
+
+      sys_execve_shim_argv_next:
+        add r14, 1;
+        jmp sys_execve_shim_argv_loop;
+
+      sys_execve_shim_argv_done:
+        mov [rip + _execve_argc_scratch], r14;
+
+        // ===== envp copy-in (same shape; envp legally may be NULL) =====
+        mov r13, [rip + _execve_envp_va_in];
+        xor r14, r14;
+        cmp r13, 0;
+        je sys_execve_shim_envp_done;
+
+      sys_execve_shim_envp_loop:
+        mov rax, 16;                                 // EXECVE_ARGV_MAX
+        cmp r14, rax;
+        jge sys_execve_shim_envp_done;
+
+        mov rax, r14;
+        shl rax, 3;
+        add rax, r13;
+        lea rdi, [rip + _execve_ptr_scratch];
+        mov rsi, rax;
+        mov rdx, 8;
+        call user_read_bytes_via_walk;
+        cmp rax, 0;
+        jne sys_execve_shim_envp_done;
+
+        mov r15, [rip + _execve_ptr_scratch];
+        cmp r15, 0;
+        je sys_execve_shim_envp_done;
+
+        mov rax, r14;
+        shl rax, 8;
+        lea rsi, [rip + _execve_envp_scratch];
+        add rsi, rax;
+        mov rdi, r15;
+        mov rdx, 256;
+        call user_read_str_via_walk;
+        cmp rax, 0;
+        jne sys_execve_shim_envp_next;
+        mov rax, r14;
+        shl rax, 8;
+        lea rdi, [rip + _execve_envp_scratch];
+        add rdi, rax;
+        xor rax, rax;
+        mov_b [rdi], rax;
+
+      sys_execve_shim_envp_next:
+        add r14, 1;
+        jmp sys_execve_shim_envp_loop;
+
+      sys_execve_shim_envp_done:
+        mov [rip + _execve_envc_scratch], r14;
+
         // ===== Phase 4: vfs_open(scratch_path, O_RDONLY=0) =====
         lea rdi, [rip + _execve_path_scratch];    // arg0 = path_ptr (kernel scratch)
         xor rsi, rsi;                             // arg1 = flags (O_RDONLY = 0)
@@ -275,11 +458,184 @@ module SysExecveShim = structure {
         // so the call site here is %16==8 — no additional pad needed.
         mov r14, rdx;                             // r14 = entry_rip (save)
         mov rdi, [rbx + 16];                      // arg0 = new_pml4_va (VA form)
-        mov rsi, 4;                               // arg1 = EXECVE_USER_STACK_PAGES
-        call user_stack_alloc;                    // rax = user_rsp_top or 0
+        mov rsi, 7;                               // arg1 = EXECVE_USER_STACK_PAGES(4)
+                                                   //   + EXECVE_ARGV_DATA_PAGES(3) = 7
+        call user_stack_alloc;                    // rax = user_rsp_top or 0 (always the
+                                                   // fixed canonical top regardless of
+                                                   // size_pages — see user_stack.pdx)
         cmp rax, 0;
         je  sys_execve_shim_fail_nomem;
-        mov r13, rax;                             // r13 = new user_rsp_top
+        mov r13, rax;                             // r13 = new user_rsp_top (unchanged: TOP)
+
+        // ===== Phase 9b (#1826): marshal argv/envp onto the NEW aspace =====
+        // Layout below the real 4-page stack (which remains at
+        // [TOP-0x4000, TOP), rsp=TOP, exactly as D10b left it): three
+        // extra pages [TOP-0x7000, TOP-0x4000) hold, in order, the packed
+        // argv string bytes (page 0), packed envp string bytes (page 1),
+        // and the two NULL-terminated pointer arrays (page 2) — see
+        // design/user/execve-abi.md §Layout. rbx (current), r13 (TOP),
+        // r14 (entry_rip) all survive this entire phase untouched; r12
+        // and r15 are free (both dead post sys_execve_body) and used as
+        // scratch alongside rax/rcx/rdx/rsi/rdi.
+        mov r12, r13;                              // r12 = TOP
+        mov rax, 0x7000;                           // 7 * 4096
+        sub r12, rax;                              // r12 = data_base = TOP - 0x7000
+
+        // ---- copy argv strings verbatim: page 0 = data_base + i*256 ----
+        xor r15, r15;                              // r15 = i
+      sys_execve_shim_argv_out_loop:
+        mov rax, [rip + _execve_argc_scratch];
+        cmp r15, rax;
+        jge sys_execve_shim_argv_out_done;
+
+        mov rdi, r15;
+        shl rdi, 8;
+        add rdi, r12;                              // rdi = user_va = data_base + i*256
+
+        mov rsi, r15;
+        shl rsi, 8;
+        lea rax, [rip + _execve_argv_scratch];
+        add rsi, rax;                              // rsi = kernel_src
+
+        mov rdx, 256;                               // len
+        call user_write_bytes_via_walk;             // best-effort; rax ignored
+        add r15, 1;
+        jmp sys_execve_shim_argv_out_loop;
+      sys_execve_shim_argv_out_done:
+
+        // ---- copy envp strings verbatim: page 1 = data_base + 0x1000 + i*256 ----
+        xor r15, r15;
+      sys_execve_shim_envp_out_loop:
+        mov rax, [rip + _execve_envc_scratch];
+        cmp r15, rax;
+        jge sys_execve_shim_envp_out_done;
+
+        mov rdi, r15;
+        shl rdi, 8;
+        mov rax, 0x1000;
+        add rdi, rax;
+        add rdi, r12;                               // rdi = data_base + 0x1000 + i*256
+
+        mov rsi, r15;
+        shl rsi, 8;
+        lea rax, [rip + _execve_envp_scratch];
+        add rsi, rax;
+
+        mov rdx, 256;
+        call user_write_bytes_via_walk;
+        add r15, 1;
+        jmp sys_execve_shim_envp_out_loop;
+      sys_execve_shim_envp_out_done:
+
+        // ---- build + write argv pointer array: page 2 = data_base + 0x2000 ----
+        // argv_ptr[i] = data_base + i*256 (page 0 slot i); NULL sentinel
+        // at argv_ptr[argc]. Formula-only — no dependency on actual
+        // string content, so each entry is computed and written directly.
+        xor r15, r15;
+      sys_execve_shim_argv_ptrs_loop:
+        mov rax, [rip + _execve_argc_scratch];
+        cmp r15, rax;
+        jge sys_execve_shim_argv_ptrs_term;
+
+        mov rdx, r15;
+        shl rdx, 8;
+        add rdx, r12;                               // rdx = argv[i] value
+        mov [rip + _execve_ptr_scratch], rdx;
+
+        mov rdi, r15;
+        shl rdi, 3;
+        mov rax, 0x2000;
+        add rdi, rax;
+        add rdi, r12;                               // rdi = data_base + 0x2000 + i*8
+
+        lea rsi, [rip + _execve_ptr_scratch];
+        mov rdx, 8;
+        call user_write_bytes_via_walk;
+        add r15, 1;
+        jmp sys_execve_shim_argv_ptrs_loop;
+      sys_execve_shim_argv_ptrs_term:
+        xor rdx, rdx;
+        mov [rip + _execve_ptr_scratch], rdx;       // NULL sentinel value
+
+        mov rdi, r15;
+        shl rdi, 3;
+        mov rax, 0x2000;
+        add rdi, rax;
+        add rdi, r12;
+
+        lea rsi, [rip + _execve_ptr_scratch];
+        mov rdx, 8;
+        call user_write_bytes_via_walk;
+
+        // ---- build + write envp pointer array: data_base + 0x2000 + 0x100 ----
+        // envp_ptr[i] = data_base + 0x1000 + i*256 (page 1 slot i).
+        xor r15, r15;
+      sys_execve_shim_envp_ptrs_loop:
+        mov rax, [rip + _execve_envc_scratch];
+        cmp r15, rax;
+        jge sys_execve_shim_envp_ptrs_term;
+
+        mov rdx, r15;
+        shl rdx, 8;
+        mov rax, 0x1000;
+        add rdx, rax;
+        add rdx, r12;                               // rdx = envp[i] value
+        mov [rip + _execve_ptr_scratch], rdx;
+
+        mov rdi, r15;
+        shl rdi, 3;
+        mov rax, 0x2100;
+        add rdi, rax;
+        add rdi, r12;                                // rdi = data_base + 0x2100 + i*8
+
+        lea rsi, [rip + _execve_ptr_scratch];
+        mov rdx, 8;
+        call user_write_bytes_via_walk;
+        add r15, 1;
+        jmp sys_execve_shim_envp_ptrs_loop;
+      sys_execve_shim_envp_ptrs_term:
+        xor rdx, rdx;
+        mov [rip + _execve_ptr_scratch], rdx;
+
+        mov rdi, r15;
+        shl rdi, 3;
+        mov rax, 0x2100;
+        add rdi, rax;
+        add rdi, r12;
+
+        lea rsi, [rip + _execve_ptr_scratch];
+        mov rdx, 8;
+        call user_write_bytes_via_walk;
+
+        // ===== Phase 9c (#1826): stage argc/argv_va/envp_va + pending flag =====
+        // Consumed exactly once by entry.pdx's epilogue in place of the
+        // usual #743 zero-out of rdi/rsi/rdx — see trampoline_data.pdx.
+        mov rax, [rip + _execve_argc_scratch];
+        mov [rip + _execve_out_argc], rax;
+
+        mov rax, 0x2000;
+        add rax, r12;                                // rax = argv pointer-array VA
+        mov [rip + _execve_out_argv], rax;
+
+        mov rax, 0x2100;
+        add rax, r12;                                // rax = envp pointer-array VA
+        mov [rip + _execve_out_envp], rax;
+
+        mov rax, 1;
+        mov [rip + _execve_regs_pending], rax;
+
+        // ===== Phase 9d (#1829): argv-populated execve fingerprint =====
+        mov rdi, 3;                                  // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_TASK];
+        lea rdx, [rip + tag_sys_execve_argv_ok];
+        lea rcx, [rip + k_argc];
+        mov r8, [rip + _execve_argc_scratch];
+        lea r9, [rip + k_envc];
+        sub rsp, 8;                                  // #672 alignment pad
+        mov rax, [rip + _execve_envc_scratch];
+        push rax;                                    // 7th arg (v2) per klog_s1_d2
+        call klog_s1_d2;
+        add rsp, 16;
 
         // (d.1) Rewrite [current.kstack_top - 8] with entry_rip. This slot
         //       holds the user RIP that syscall_entry pushed (rcx post-syscall

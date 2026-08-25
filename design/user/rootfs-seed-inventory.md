@@ -137,4 +137,19 @@ so no alignment pad is needed between operations.
 * `src/user/rootfs_seed.pdx` — payload table + seed loop
 * `src/user/init.pdx` — one-line `call rootfs_seed_run` insertion in _start
 * `tools/build-user.sh` — rootfs_seed.o joins INIT_OBJECTS
+
+## Argv posture (R62.M1-006, #1837)
+
+R62 landed real `execve` argc/argv/envp marshalling — see
+`design/user/execve-abi.md` for the frozen register ABI
+(`rdi`=argc, `rsi`=argv, `rdx`=envp at `_start`) and the kernel-side
+copy-in/copy-out mechanics in `sys_execve_shim.pdx`. The seeded tools this
+document tracks (`/bin/ls`, `/bin/cat`, `/bin/rm`, `/bin/mv`, `/bin/cp`,
+`/bin/mkdir`, `/bin/touch`) no longer hardcode their M0 target path(s):
+each now reads `argv[1]` (and `argv[2]` for `mv`/`cp`) and falls back to
+its previous hardcoded default only when the shell invoked it with too
+few arguments (`argc` too small). `/bin/dmesg` takes no path argument and
+is unaffected. `rootfs_seed.pdx` itself is unaffected — it seeds files by
+direct `sys_open`/`sys_write`/`sys_close` from init's own `_start`, never
+via `execve`, so it has no argv posture to update.
 * `design/user/rootfs-seed-inventory.md` — this document
