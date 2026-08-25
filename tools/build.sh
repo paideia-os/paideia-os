@@ -4728,6 +4728,10 @@ if [[ ! -f "${WAL_SRC}" || ! -f "${JFN_SRC}" || ! -f "${JRP_SRC}" || ! -f "${JCS
 fi
 ec_confine_one '_wal_ring'         'core/fs/pdxfs/wal.o'
 ec_confine_one '_wal_state'        'core/fs/pdxfs/wal.o'
+# R55.M2-003 (#1785): bdev-backed WAL scratch + per-vol_row state,
+# owned + written only by wal_append_write / wal_fsync_bdev.
+ec_confine_one '_wal_scratch'      'core/fs/pdxfs/wal.o'
+ec_confine_one '_wal_bdev_state'   'core/fs/pdxfs/wal.o'
 ec_confine_one '_jfn_commits'      'core/fs/pdxfs/journal_fence.o'
 ec_confine_one '_jfn_state'        'core/fs/pdxfs/journal_fence.o'
 ec_confine_one '_jrp_state_at'     'core/fs/pdxfs/journal_replay.o'
@@ -4750,6 +4754,9 @@ echo "[pdxfs-journal-confine] R42.M2 (wal + journal_fence + journal_replay + jou
 semterm_pin_one "${WAL_SRC}" 'pub let wal_append : (u64, u64) -> u64'
 semterm_pin_one "${WAL_SRC}" 'pub let wal_fsync : () -> u64'
 semterm_pin_one "${WAL_SRC}" 'pub let wal_block_write : (u64) -> u64'
+# R55.M2-003 (#1785): bdev-backed WAL entry points.
+semterm_pin_one "${WAL_SRC}" 'pub let wal_append_write : (u64, u64, u64, u64) -> u64'
+semterm_pin_one "${WAL_SRC}" 'pub let wal_fsync_bdev : (u64) -> u64'
 semterm_pin_one "${WAL_SRC}" 'pub let wal_seq_at : (u64) -> u64'
 semterm_pin_one "${WAL_SRC}" 'pub let wal_checksum_at : (u64) -> u64'
 semterm_pin_one "${JFN_SRC}" 'pub let jfn_fence : () -> u64'

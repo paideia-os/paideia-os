@@ -1,25 +1,37 @@
 ---
-issue: 1783, 1784
+issue: 1783, 1784, 1785
 milestone: R55.M2 (pdxfs-block write path end-to-end)
 subsystem: filesystem / pdxfs-on-block v1
 topic: End-to-end write path for a fresh file on a pdxfs-block volume.
-       Two landings so far: §Allocator (extent-run first-fit) and
-       §Inode-table-write (RMW of a 128-B inode row over bdev_write_at).
-       pdxfs_block_write and later siblings (WAL #1786) will thread
-       these primitives together into the full write path.
+       Three landings so far: §Allocator (extent-run first-fit),
+       §Inode-table-write (RMW of a 128-B inode row over bdev_write_at),
+       and §WAL (bdev-backed WAL append + fsync over bdev_write_at).
+       pdxfs_block_write and §Cache will thread these primitives
+       together into the full write path.
 touching:
   - src/kernel/core/fs/pdxfs/allocator.pdx      (extend: alloc_extent_run)
   - src/kernel/core/fs/pdxfs/inode_table.pdx    (extend: inode_table_write
                                                  + _inode_write_scratch)
   - src/kernel/core/fs/pdxfs/bdev_write.pdx     (extend: bdev_write_at)
+  - src/kernel/core/fs/pdxfs/wal.pdx            (extend: wal_append_write,
+                                                 wal_fsync_bdev, _wal_scratch,
+                                                 _wal_bdev_state)
+  - src/kernel/core/fs/pdxfs/journal_csum.pdx   (header note: csum choice
+                                                 delegated to jnl_crc32c_range)
   - src/kernel/core/klog/keys.pdx               (extend: tag_pdxb_alloc_ok,
                                                  tag_pdxb_alloc_verify_ok,
                                                  k_start_lba, k_len_lba,
                                                  tag_pdxb_inode_write_ok,
-                                                 k_ino)
-  - tools/build.sh                              (confine _inode_write_scratch)
+                                                 k_ino,
+                                                 tag_pdxb_wal_fsynced_ok,
+                                                 k_records, k_lba)
+  - tools/build.sh                              (confine _inode_write_scratch,
+                                                 _wal_scratch, _wal_bdev_state;
+                                                 arity-pin wal_append_write /
+                                                 wal_fsync_bdev)
   - tests/r55/expected-r55-alloc.txt            (2-line spec golden)
   - tests/r55/expected-r55-inode-write.txt      (1-line spec golden)
+  - tests/r55/expected-r55-wal-fsync.txt        (1-line spec golden)
   - design/filesystem/pdxfs-block-write-e2e.md  (this doc)
 related:
   - src/kernel/core/fs/pdxfs/allocator.pdx      (alloc_block / free_block —
@@ -41,15 +53,16 @@ The pdxfs-block volume becomes writable in a fixed order of primitives:
 2. **§Inode-table-write** (R55.M2-002 / #1784) — persist a 128-B inode
    row into its 4-KiB bearer block via read-modify-write over
    `bdev_write_at`.
-3. **§WAL** (#1786, forward) — carry the row + bitmap changes through
-   the write-ahead log so a crash between (1) and (2) either replays
-   both or neither.
+3. **§WAL** (R55.M2-003 / #1785) — enforce the WAL-fsync-before-data-
+   write barrier `bdev_write.pdx` §0 refuses to enforce itself. Every
+   `pdxfs_block_write` MUST cross `wal_append_write` + `wal_fsync_bdev`
+   before a data-block `bdev_write_at` is permitted.
 4. **§Cache** (later) — the block-cache handle that folds identical
    bitmap-block writes across a burst of allocations into one physical
    write.
 
-Landed so far: §Allocator (R55.M2-001) and §Inode-table-write
-(R55.M2-002). §WAL / §Cache sections are added by their own issues;
+Landed so far: §Allocator (R55.M2-001), §Inode-table-write
+(R55.M2-002), and §WAL (R55.M2-003). §Cache is added by its own issue;
 the doc is the composition point.
 
 ## §Allocator — extent-run first-fit (#1783)
@@ -421,3 +434,273 @@ re-read from disk (and that reread will see the write
   companion `inode_read` (R52.M4-002) does an `in_use` header check
   on readback; `inode_table_write` trusts the caller (a wider
   posture matching `inode_write`'s "splice-copy-then-write" shape).
+
+## §WAL — append + fsync over bdev_write_at (#1785)
+
+### Signatures
+
+```
+wal_append_write(vol_row: u64,
+                 lba: u64,
+                 len: u64,
+                 payload_pa: u64) -> u64
+
+wal_fsync_bdev(vol_row: u64) -> u64
+```
+
+- `vol_row` — the volume row id (0..15), i.e. the `row_id` returned by
+  `volume_row_of_slot` (kind_volume.pdx §1). It indexes the module-
+  scoped `_wal_bdev_state` table in `wal.pdx`, NOT a raw KIND_VOLUME
+  row pointer, because KIND_VOLUME rows do NOT carry the
+  `wal_head_lba` / `wal_tail_lba` / `wal_bcount` fields the ticket
+  named — those live in `wal.pdx`'s own confined state, indexed by
+  the row id. A widening that migrates the fields onto the KIND_VOLUME
+  row keeps the same integer parameter.
+- `lba` — the target LBA the upcoming data-block write will hit.
+  Recorded verbatim into the WAL record.
+- `len` — payload length in bytes (>= 1). `len == 0` returns
+  `WAL_ERR_BAD_SIZE`.
+- `payload_pa` — the source page physical address the upcoming write
+  will DMA from. Recorded verbatim; the page itself is NOT copied
+  into the WAL record (see "Record layout" below on why).
+
+Return values:
+
+- `wal_append_write` — 0 (`WAL_OK`) on success, else
+  `WAL_ERR_BAD_SIZE` (0xFFFFEFCB, reused for bad `vol_row` and zero
+  `len`) or `WAL_ERR_RING_FULL` (0xFFFFEFCE, `_wal_scratch` full).
+- `wal_fsync_bdev` — 0 on success (including the `rcount == 0`
+  silent no-op path), else `WAL_ERR_BAD_SIZE` or `WAL_ERR_INVARIANT`
+  (0xFFFFEFCC, reused for a `bdev_write_at` failure — the "the WAL is
+  durable at wal_fsync completion" invariant broke).
+
+### Signature note (u16 vs u64)
+
+The ticket text names the return type `-> u16`. Every other function
+in `wal.pdx` (and in the wider pdxfs codebase) returns u64, and the
+failure sentinels (0xFFFFEFC{B,C,E}) do not fit in u16. Landed as
+`-> u64`, matching the R55.M2-002 (`inode_table_write`) precedent
+one-for-one. Softarch should confirm before any wider caller-side ABI
+locks it in.
+
+### Signature note (`wal_fsync` name collision)
+
+The ticket names the fsync entry `wal_fsync(vol_row) -> u16`. The R42
+in-memory-ring scaffold already exports `wal_fsync : () -> u64`
+(wal.pdx line 562, R42.M2-001), and paideia-as has no function
+overloading. Landed as `wal_fsync_bdev` to distinguish the bdev-backed
+substrate from the R42 in-memory ring during the caller migration
+window this landing does not close. The R42 `wal_fsync` stays behind
+its existing callers (journal_fence, journal_replay); the R55
+`wal_fsync_bdev` is what `pdxfs_block_write` (and later CoW-write
+callers) crosses to satisfy the barrier.
+
+### The invariant this landing enforces
+
+Per `bdev_write.pdx` §0 ("It DOES NOT own the WAL invariant.
+wal.pdx is the authority on write-ahead ordering... That invariant is
+enforced at THE CALL SITE (cow_write's write pass) rather than
+duplicated here"), every future `pdxfs_block_write` call MUST:
+
+1. Call `wal_append_write(vol_row, lba, len, payload_pa)` first,
+   describing the upcoming data-block write.
+2. Call `wal_fsync_bdev(vol_row)`, blocking until the WAL record
+   lands on device via `bdev_write_at`.
+3. ONLY THEN call `bdev_write_at(nsid, lba, count, buf_pa)` for the
+   actual data-block write.
+
+`bdev_write.pdx` §0 explicitly refuses to enforce this ordering
+inside `bdev_write_at` itself (a duplicated gate would let a caller
+that bypasses one still bypass the other via the sibling entry
+`bdev_write_sync`); the ordering discipline lives in the caller. This
+landing adds the primitives; the CoW-write caller migration is a
+separate follow-up.
+
+### Record layout (64 bytes = 8 qwords)
+
+```
++0    magic         u64  0x00014C4157584450 (LE storage reads forward on disk as bytes 50 44 58 57 41 4C 01 00 = "PDXWAL\x01\x00"; matches PDXB_SB_MAGIC forward-reading convention)
++8    txn_id        u64  monotonic per-vol_row, bumped per append
++16   lba           u64  target LBA the upcoming data-block write hits
++24   len           u64  payload length in bytes (>= 1)
++32   payload_pa    u64  source page physical address (reference only)
++40   record_type   u64  1 = block_write (only type today)
++48   csum          u64  CRC32C over bytes [+0, +48) (7 qwords),
+                          seed 0xFFFFFFFF, final XOR 0xFFFFFFFF
++56   reserved      u64  0
+```
+
+64-byte records × 64 records = 4096 bytes = one 4-KiB block exactly.
+No page header for the bdev-backed layer (deliberately simpler than
+`journal_ondisk.pdx`'s 4-KiB JBNL block with its 32-B header + 8-B
+CSUM footer): the bdev-backed WAL records only *describe* upcoming
+data-block writes, the payload itself lives at `payload_pa` and is
+written by the caller's later `bdev_write_at` through the
+`pdxfs_block_write` path. Not embedding the 4-KiB payload inline is
+exactly `journal_ondisk.pdx`'s own header gap 1 recommendation (c)
+for `JOP_BLOCK_WRITE` — folding a 4120-B record into a 4056-B records
+area is a "hard mathematical impossibility" that gap flags for
+softarch resolution; this landing takes the reference-not-embed
+resolution as the WAL-layer contract.
+
+### csum choice (CRC32C, not BLAKE3-lite)
+
+Delegates to `jnl_crc32c_range` in `journal_ondisk.pdx` — the
+R42.M5-006-widened REAL CRC32C substrate (Castagnoli, poly
+0x82F63B78, branchless per-bit mix; that module's own header §gap 4:
+"CRC32C is a REAL implementation, not the R42 `journal_csum.pdx`
+placeholder"). `journal_csum.pdx`'s XOR-mix formula is a scaffold
+placeholder that operates on WAL HEADER FIELDS (seq/size/prev_seq),
+never over a byte buffer, and cannot compute a checksum over a 48-B
+record slice.
+
+The R55 WAL calls `jnl_crc32c_range(rec_ptr, 48, 0xFFFFFFFF)` and
+then applies the standard `^ 0xFFFFFFFF` final-XOR. Result: the csum
+matches any external CRC32C computed over the same 48-B slice.
+
+### Per-vol_row state (indexed by vol_row 0..15)
+
+```
+[+0]   head_lba       absolute LBA the next flush targets
+                        (0 = unset — first-touch seeds to
+                         WAL_BDEV_BASE_LBA = 0x40)
+[+8]   reserved       (wal_tail_lba placeholder — unused until
+                        wraparound lands)
+[+16]  rcount         records currently buffered in _wal_scratch
+                        (0..64)
+[+24]  next_txn_id    monotonic txn id handed out by the next
+                        wal_append_write
+[+32]  flush_count    total wal_fsync_bdev calls that reached the
+                        bdev_write_at gate
+[+40]  append_count   total wal_append_write calls that succeeded
+[+48]  reserved       0
+[+56]  reserved       0
+```
+
+16 rows × 64 B = 1024 B = `[u64; 128]`, matching KIND_VOLUME's own
+16-row ceiling (R52.M5-001) and `journal_ondisk.pdx`'s
+`_journal_vol_state` stride one-for-one. First-touch of any vol_row
+seeds `head_lba` to `WAL_BDEV_BASE_LBA` = 0x40 (a scaffold constant
+that matches the golden fingerprint's `lba=0x0000000000000040`
+verbatim). A widening reads the per-volume WAL region base from the
+superblock's `sb_journal_lba` (R52.M5) once callers thread the
+superblock pointer through.
+
+No wraparound: `head_lba` advances monotonically after each successful
+flush. Scaffold assumption; a widening replaces this with real ring
+geometry against `sb_journal_bcount`.
+
+### Substrate branch (inherited from bdev_write_at)
+
+`wal_fsync_bdev` does not itself branch on `_nvme_io_queue_count` —
+the branch lives inside `bdev_write_at` (bdev_write.pdx, R55.M2-002),
+which returns 0 without calling the driver under substrate posture
+(every QEMU-TCG `-kernel` boot today). Same posture as
+`inode_table_write`'s own reliance on `bdev_write_at`'s LIVE-vs-
+SUBSTRATE branch: the fingerprint fires cleanly whether the write
+actually reaches a device or not, so caller-side witnesses that run in
+substrate posture (which is every witness today) observe the flush
+attempt regardless.
+
+### Fingerprint (wire — one line per successful non-empty fsync)
+
+Emitted via `klog_s1_x2` inside `wal_fsync_bdev` on the success
+path, LEVEL_INFO / SUBSYS_FS__:
+
+```
+pdxb wal fsynced [legacy: PDXB WAL OK] records=0x0000000000000001 lba=0x0000000000000040
+```
+
+- Two k=v pairs: `records` (the `rcount` just flushed) and `lba`
+  (the `head_lba` that just landed on device — the pre-increment
+  value; the internal state advances `head_lba` by 1 immediately
+  after emit).
+- Two-in-one bracketed legacy suffix (`[legacy: PDXB WAL OK]`)
+  matches the R51 Phase C option-B shape `tag_pdxb_bdev_flush_ok` /
+  `tag_pdxb_alloc_ok` / `tag_pdxb_inode_write_ok` already established
+  in this file family.
+- The tag contains an `OK` token per `verify-fingerprint-coverage.sh`'s
+  `OK_TOK` regex (space before, `]` after — both non-alnum).
+- Byte counts: `tag_pdxb_wal_fsynced_ok` = 38 chars + NUL = 39 bytes;
+  `k_records` = 7 chars + NUL = 8 bytes; `k_lba` = 3 chars + NUL = 4
+  bytes.
+- Fires exactly once per successful non-empty flush. `wal_append_write`
+  is silent on the wire; a `wal_fsync_bdev` call with `rcount == 0`
+  is also silent (returns success without emitting).
+
+Golden row at `tests/r55/expected-r55-wal-fsync.txt` names one line
+as a prefix substring (the `covered_by` check accepts the
+substring-either-way match `marker.startswith(a) or
+a.startswith(marker)`).
+
+Failure paths (bad `vol_row`, buffer full for `wal_append_write`;
+bdev_write_at failure for `wal_fsync_bdev`) return the appropriate
+sentinel WITHOUT emitting the fingerprint. An I/O failure does NOT
+reset `rcount`, so a subsequent `wal_fsync_bdev` call retries the
+same block (matches `nvw_batch_flush`'s LIVE-path retry semantic).
+
+### Why not extend journal_ondisk.pdx's journal_append?
+
+`journal_ondisk.pdx`'s `journal_append` refuses records >
+`JNL_RECORDS_AREA_SIZE` (4056 bytes) — a hard precondition per that
+file's own §gap 1. `journal_encode_block_write` produces a 4120-byte
+record (record_hdr 8 + txn_id 8 + lba 8 + block_data 4096); it can be
+encoded but never legally appended, and gap 1 explicitly flags this
+for softarch resolution.
+
+The R55 WAL takes gap 1's resolution (c): the WAL record REFERENCES
+the payload rather than embedding it. That makes each record 64 bytes
+(magic + txn_id + lba + len + payload_pa + rtype + csum + reserved),
+so a 4-KiB block holds 64 records with no page header. Independent of
+`journal_append`'s size gate, and independent of `journal_ondisk.pdx`'s
+per-vol-slot `_journal_vol_state` — both substrates coexist during
+the R42 in-memory / R55 bdev-backed transition.
+
+### Confined state
+
+- `_wal_scratch : [u64; 512] @align(4096)` — 4-KiB WAL page. Sole
+  writer is `wal_append_write` (packs records) + `wal_fsync_bdev`
+  (reads to hand to `bdev_write_at`). Confined at build time via
+  `tools/build.sh`'s `ec_confine_one` to `core/fs/pdxfs/wal.o`.
+  Page-aligned per NVMe PRP1's single-page-transfer requirement.
+- `_wal_bdev_state : [u64; 128] @align(64)` — 16-row × 64-byte
+  per-vol_row table (head_lba, rcount, next_txn_id, flush_count,
+  append_count). Sole writer is `wal_append_write` +
+  `wal_fsync_bdev`. Confined at build time via `ec_confine_one`.
+
+Distinct from the R42 `_wal_ring` / `_wal_state` above: those hold
+the in-memory-ring scaffold for the R42.M2 replay path
+(`journal_fence`, `journal_replay`, `journal_csum` reach for them).
+The R55 pair is used only by `wal_append_write` / `wal_fsync_bdev`,
+and never touches the R42 ring — the two substrates coexist until
+the caller migration completes.
+
+### What §WAL does NOT prove
+
+- **Wired caller.** No caller yet crosses the barrier. The primitive
+  lands so `pdxfs_block_write` (and future CoW-write callers) can
+  wire it; that wiring is a separate follow-up matching R55.M2-002's
+  own "primitive without wired caller" posture for `bdev_write_at`.
+- **Replay.** The bdev-backed WAL records land on device but no
+  replay walker consumes them yet. `journal_replay.pdx` reads the
+  R42 in-memory ring; a widening will teach it (or a sibling walker
+  in `journal_ondisk.pdx`) to parse the 64-B record format above.
+- **Wraparound.** `head_lba` advances monotonically; no bounds check
+  against `sb_journal_bcount`, no ring-wrap. A widening adds the
+  bounds and wrap semantics.
+- **Multi-block records.** `_wal_scratch` is one 4-KiB page. A caller
+  that flushes 64 records must fsync before appending the 65th; the
+  append refuses with `WAL_ERR_RING_FULL`. A widening chains multiple
+  scratch pages.
+- **Volume-scoped state on the KIND_VOLUME row.** Per-vol_row state
+  lives in `_wal_bdev_state` (module-scoped, indexed by vol_row); a
+  widening migrates the fields onto the KIND_VOLUME row itself
+  (kind_volume.pdx §1) once the row layout gains WAL slots.
+- **Failure-band uniqueness.** `WAL_ERR_BAD_SIZE` is reused for both
+  bad `vol_row` and zero `len`; `WAL_ERR_INVARIANT` is reused for
+  `bdev_write_at` failure. The R42 wal band (0xFFFFEFC0..CF) has a
+  free slot at 0xFFFFEFCA (`WAL_ERR_INTERNAL`, currently
+  unreachable-fallthrough tripwire) that a follow-up could claim for
+  a dedicated I/O-failure sentinel; not minted here because the
+  reuse pattern matches `journal_ondisk.pdx`'s own JNL_CSUM_BAD
+  reuse precedent (gap 3).
