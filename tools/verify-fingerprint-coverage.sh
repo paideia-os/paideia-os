@@ -248,6 +248,28 @@ ALLOWLIST = {
         "syscall called MOUNT_MAX times per /bin/mount would flood "
         "the ring. Assertable via a one-shot future kernel-side "
         "witness (see keys.pdx §tag_sys_mountinfo_ok comment).",
+
+    # R69 SMP scheduler dispatch markers — emitted only by the
+    # boot_r69_smp_dispatch witness which runs under the opt-in
+    # PAIDEIA_R69_SMP=1 pre-push gate (mirror of the PAIDEIA_UEFI_OVMF=1
+    # allowlist rationale above). The 14-mode default matrix does not
+    # cover PAIDEIA_R69_SMP=1 — it's a dedicated -smp 4 boot that
+    # exercises cross-CPU wake + work-steal + fairness. AP-side IDT
+    # install has not yet landed (~50 rounds of TODO documented in
+    # ap_bringup.pdx / reschedule_ipi.pdx / tsc_deadline.pdx), so the
+    # per-CPU tick histogram is currently runqueue-residency counts,
+    # not execution ticks. See tests/expected-r69-smp.golden for the
+    # honest-scope note.
+    "sched cross-cpu wake ok [legacy: SCHED CROSS CPU WAKE OK]":
+        "R69.M1-002 witness emits under PAIDEIA_R69_SMP=1 opt-in mode; "
+        "not in the 14-mode default matrix. Golden at "
+        "tests/expected-r69-smp.golden asserts via the opt-in gate.",
+    "sched work steal ok [legacy: SCHED WORK STEAL OK]":
+        "R69.M1-003 witness emits under PAIDEIA_R69_SMP=1 opt-in mode; "
+        "not in the 14-mode default matrix.",
+    "smp dispatch ok [legacy: SMP DISPATCH OK]":
+        "R69.M1-004 witness emits under PAIDEIA_R69_SMP=1 opt-in mode; "
+        "not in the 14-mode default matrix.",
 }
 
 # Below these counts the extractor has stopped matching rather than the

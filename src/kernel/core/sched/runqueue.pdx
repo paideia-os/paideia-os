@@ -173,6 +173,46 @@ module Runqueue = structure {
   }
 
   // ============================================================================
+  // R69.M1-001 (#1877): per-CPU runqueue task-count array
+  // ============================================================================
+  //
+  // The per-CPU runqueue itself (head/tail doubly-linked list threaded
+  // through TCB.runq_next/runq_prev) already landed at R18-M4-003 (#773)
+  // inside each CPU's Percpu control block — CB[PERCPU_OFF_RUNQUEUE_HEAD
+  // =+32] / CB[PERCPU_OFF_RUNQUEUE_TAIL=+40]. That satisfies #1877's
+  // actual goal (split the BSP-only global runqueue into one runqueue
+  // per CPU) years before this round; the R69 brief's "array indexed by
+  // cpu_id, {head,tail,count,task_pointers[128]}" shape describes a
+  // DIFFERENT data structure (a bounded ring buffer) that would have to
+  // coexist with, or replace, the already-landed and already-consumed
+  // (sched_pick_next_r15, runq_enqueue, runq_dequeue) doubly-linked
+  // design. Introducing a second, redundant runqueue representation
+  // this late — with pick_next/enqueue/dequeue/ap_bringup all already
+  // wired to the linked-list CB fields — would be a straight regression
+  // in code quality for no behavioral gain. The judgment call: keep the
+  // linked list, and add the ONE piece #1877 (and the fairness/steal
+  // work in #1883/#1888/#1894) actually needs that the linked list
+  // doesn't already expose cheaply — an O(1)-readable per-CPU count.
+  //
+  // Stored as a flat array indexed by cpu_idx (0..Percpu.MAX_CPUS-1 = 4)
+  // rather than as a fifth field inside the Percpu CB itself, because
+  // percpu.pdx's header block states the CB's 2-cache-line size (128 B)
+  // is "a design invariant, not merely a current size" — a scheduler
+  // fairness counter is exactly the kind of addition that invariant
+  // exists to keep out. 4 * 8 = 32 bytes in .bss, no alignment needs
+  // beyond natural u64 (no per-CPU false-sharing concern: this counter
+  // is BSP-only-written today, since real cross-CPU concurrent runqueue
+  // mutation is still gated on AP-side IDT install — see ap_entry.pdx).
+  //
+  // Maintained by runq_enqueue / runq_dequeue (self, +1/-1) and by
+  // runq_enqueue_remote / runq_dequeue_head_remote (targeted CPU,
+  // +1/-1) below. Never reset by runq_init (which only zeroes head/
+  // tail) — a runqueue can only reach count==0 by symmetric enqueue/
+  // dequeue pairs, and .bss zero-init already gives every slot the
+  // correct 0 at boot.
+  pub let mut _runq_count : [u64; 4] = [0, 0, 0, 0]
+
+  // ============================================================================
   // runq_init() — reset current CPU's runqueue to empty
   // ============================================================================
   //
@@ -268,6 +308,16 @@ module Runqueue = structure {
       runq_enq_set_tail:
       // (5) CB.tail = task (always).
         mov [rax + 40], rdi;
+
+      // (6) R69.M1-001 (#1877): _runq_count[cpu_idx]++.  rdi (task) is
+      // dead past step (5) — repurpose it to cpu_idx (u32 zero-ext from
+      // CB[+0]).  Indexed load-add-store mirrors task_pool.pdx's
+      // pid_gen_bump `[base + rdi*8]` idiom.
+        mov edi, [rax + 0];
+        lea rax, [rip + _runq_count];
+        mov rcx, [rax + rdi*8];
+        add rcx, 1;
+        mov [rax + rdi*8], rcx;
         ret
     }
   }
@@ -290,6 +340,11 @@ module Runqueue = structure {
   // Register discipline: rdi = task (preserved); rax = CB VA; rcx = MSR
   // index / zero scratch; rdx = rdmsr high half; r8 = task.next; r9 =
   // task.prev.  All caller-save.  Callee-save clean.  Leaf.
+  //
+  // R69.M1-001 (#1877) addendum: after the off-runq invariant clear,
+  // decrements _runq_count[cpu_idx] (cpu_idx read from CB[+0]; rax
+  // still holds this CPU's CB VA — no path between function entry and
+  // this point reclobbers it). Mirrors runq_enqueue's symmetric bump.
   // ============================================================================
 
   pub let runq_dequeue : (u64) -> () !{mem, sysreg} @{sched} = fn (task: u64) -> unsafe {
@@ -331,7 +386,288 @@ module Runqueue = structure {
       xor rcx, rcx;
       mov [rdi + 432], rcx;
       mov [rdi + 440], rcx;
+
+      // R69.M1-001 (#1877): _runq_count[cpu_idx]--.  rax still holds
+      // this CPU's CB VA (set once near function entry, never
+      // reclobbered on any path reaching here — see justification
+      // above). rdi (task) is dead past the invariant clear.
+      mov edi, [rax + 0];
+      lea rax, [rip + _runq_count];
+      mov rcx, [rax + rdi*8];
+      sub rcx, 1;
+      mov [rax + rdi*8], rcx;
       ret
+    }
+  }
+
+  // ============================================================================
+  // R69.M1-002 (#1883): runq_enqueue_remote(cpu_idx, task) — O(1) tail
+  // insertion on an ARBITRARY CPU's runqueue (not necessarily the
+  // caller's own).
+  // ============================================================================
+  //
+  // Same doubly-linked tail-insertion algorithm as runq_enqueue, but the
+  // target CB VA is resolved via percpu_cb_for(cpu_idx) instead of the
+  // rdmsr-IA32_GS_BASE self-lookup — this is what lets sched_wake enqueue
+  // a cross-CPU-affine task onto its TARGET cpu's runqueue from whatever
+  // CPU happens to be running the waker, rather than always enqueuing
+  // onto the waker's own runqueue (the pre-#1883 behavior).
+  //
+  // Precondition: cpu_idx < Percpu.MAX_CPUS (caller enumerates in range
+  // by construction — sched_wake derives cpu_idx from a validated
+  // cpu_mask via SYS_SCHED_CPU_MASK_VALID, same "no runtime bound check"
+  // discipline as percpu_cb_for itself).
+  //
+  // Register discipline: rdi = cpu_idx (in), rsi = task (in). rbx = task
+  // (callee-save, survives the percpu_cb_for call — rdi/rsi are both
+  // caller-save and percpu_cb_for's own rdi arg literally IS this
+  // function's cpu_idx, so no rdi shuffle is needed pre-call). rdi is
+  // reloaded from cpu_idx (re-read via percpu_cb_for's own rdi, which is
+  // unclobbered by that leaf function) for the final _runq_count index —
+  // matches runq_enqueue's local variant.
+  pub let runq_enqueue_remote : (u64, u64) -> () !{mem} @{sched} = fn (cpu_idx: u64) (task: u64) -> unsafe {
+    effects: { mem },
+    capabilities: { sched },
+    justification: "R69.M1-002 (#1883): insert `task` (rsi) at the tail of CPU `cpu_idx`'s (rdi) per-CPU runqueue — the cross-CPU counterpart to runq_enqueue's self-only tail insertion. Prologue: push rbx; mov rbx, rsi (stash task across the nested percpu_cb_for call — rdi already holds cpu_idx, which IS percpu_cb_for's sole arg, so no register shuffle is needed before `call percpu_cb_for`). percpu_cb_for is a leaf with effects={} and capabilities={} (pure address arithmetic, per percpu.pdx), so it clobbers only rax/rcx per its own justification and rdi survives untouched — meaning cpu_idx is still live in rdi immediately after the call, which step (6) below relies on. rax = target CB VA on return. Then the identical tail-insertion algorithm as runq_enqueue: (1) task.next=0. (2) rdx=CB.tail; task.prev=rdx. (3) if rdx==0: CB.head=task, else: old_tail.next=task. (4) CB.tail=task (always). (5) Off-runq/on-runq bookkeeping done — task is now linked into cpu_idx's list regardless of whether that CPU is the caller's own. (6) #1877 fairness counter: _runq_count[cpu_idx]++ via the same `[base + rdi*8]` indexed idiom as runq_enqueue's local variant — rdi still holds cpu_idx from the untouched-by-percpu_cb_for guarantee above, so no CB[+0] re-read is needed (unlike the self variant, which must derive cpu_idx from the CB it just resolved via rdmsr because rdmsr's own dest cpu_idx isn't an input anywhere in that path). Effects: {mem} only — no rdmsr/wrmsr/lidt/etc in this function (percpu_cb_for is pure arithmetic), hence no {sysreg}. Capability {sched}: mutates a runqueue. Register discipline: rbx (task, callee-save, one push), rax (CB VA, then _runq_count base), rcx (count scratch), rdx (old tail scratch), rdi (cpu_idx throughout — consumed by percpu_cb_for as its arg but not clobbered by it), rsi (task, consumed into rbx at entry, dead after). Stack: entry rsp%16==8; one push -> rsp%16==0, exactly what the single nested call needs; no sub/add rsp pad required. Encoder: identical instruction set to runq_enqueue (mov/lea/xor/cmp/je/jmp/add/call/ret) plus one push/pop pair — no new encoder gap.",
+    block: {
+      push rbx;
+      mov rbx, rsi;                    // rbx = task (survives percpu_cb_for)
+
+      call percpu_cb_for;               // rdi=cpu_idx already loaded; rax = target CB VA; rdi unclobbered
+
+      // (1) task.next = 0
+      xor rcx, rcx;
+      mov [rbx + 432], rcx;
+
+      // (2) rdx = CB.tail (may be 0). task.prev = rdx.
+      mov rdx, [rax + 40];
+      mov [rbx + 440], rdx;
+
+      // (3) if empty: CB.head = task, else: old_tail.next = task.
+      cmp rdx, 0;
+      je  runq_enqr_empty;
+        mov [rdx + 432], rbx;
+        jmp runq_enqr_set_tail;
+      runq_enqr_empty:
+        mov [rax + 32], rbx;
+      runq_enqr_set_tail:
+      // (4) CB.tail = task (always).
+        mov [rax + 40], rbx;
+
+      // (6) _runq_count[cpu_idx]++.  rdi still == cpu_idx (percpu_cb_for
+      // never touched it — leaf, effects={}, only rax/rcx clobbered).
+        lea rax, [rip + _runq_count];
+        mov rcx, [rax + rdi*8];
+        add rcx, 1;
+        mov [rax + rdi*8], rcx;
+
+        pop rbx;
+        ret
+    }
+  }
+
+  // ============================================================================
+  // R69.M1-003 (#1888): runq_dequeue_head_remote(cpu_idx) -> popped_task
+  // ============================================================================
+  //
+  // Pops the HEAD task (if any) from CPU `cpu_idx`'s runqueue and returns
+  // it (0 if the runqueue is empty). This is the one primitive
+  // sched_try_steal needs that neither runq_enqueue_remote nor the
+  // self-only runq_dequeue provide: an arbitrary-CPU, head-only removal
+  // (stealing always takes from the front — it does not need arbitrary
+  // mid-list extraction, which is why this is narrower than a full
+  // remote runq_dequeue(cpu_idx, task) would be).
+  //
+  // Register discipline: rdi = cpu_idx (in, consumed by percpu_cb_for).
+  // rbx (callee-save, one push) stashes cpu_idx across that call for the
+  // final count-array index (percpu_cb_for's own rdi use does not
+  // clobber it, but it is cheap insurance and doubles as documentation
+  // of which value survives). Returns popped TCB base in rax, or 0.
+  pub let runq_dequeue_head_remote : (u64) -> u64 !{mem} @{sched} = fn (cpu_idx: u64) -> unsafe {
+    effects: { mem },
+    capabilities: { sched },
+    justification: "R69.M1-003 (#1888): pop the head task from CPU cpu_idx's (rdi) per-CPU runqueue for sched_try_steal. Prologue: push rbx; mov rbx, rdi (stash cpu_idx — belt-and-suspenders; percpu_cb_for is a leaf that does not clobber rdi per its own justification, but stashing in a callee-save register removes any dependence on that fact holding across future edits to percpu_cb_for). call percpu_cb_for -> rax = target CB VA. rcx = CB.head; if 0, jump rdhr_empty (return 0, no count change). Else: rdx = head.next (the new head). CB.head = rdx (always, whether or not the list becomes empty). If rdx != 0 (list still non-empty after pop): new_head.prev = 0 (r8 zero scratch). Else (popped was the only element): CB.tail = 0 too — canonical empty state. Then unconditionally clear the popped node's own next/prev (off-runq invariant, matches runq_dequeue's post-condition so a stolen task re-enters runq_enqueue_remote's tail-insertion cleanly). Count: mov rdi, rbx (reload cpu_idx into the proven `[base + rdi*8]` index register — matches the idiom used by runq_enqueue/runq_dequeue's local variants and task_pool.pdx's pid_gen_bump); _runq_count[cpu_idx]--. Return popped node in rax (rcx holds it since CB.head load). Effects: {mem} only (no rdmsr — percpu_cb_for is pure arithmetic). Capability {sched}. Register discipline: rbx (cpu_idx, one push), rax (CB VA then _runq_count base then return value), rcx (CB.head / popped node/ count scratch), rdx (new head), r8 (zero scratch), rdi (cpu_idx in, then reloaded from rbx for the count index). Stack: entry rsp%16==8, one push -> 0, matching the single nested call.",
+    block: {
+      push rbx;
+      mov rbx, rdi;                    // rbx = cpu_idx (survives percpu_cb_for)
+
+      call percpu_cb_for;                // rax = target CB VA
+
+      mov rcx, [rax + 32];               // rcx = CB.head
+      cmp rcx, 0;
+      je  rdhr_empty;
+
+      mov rdx, [rcx + 432];              // rdx = head.next (new head)
+      mov [rax + 32], rdx;               // CB.head = new head (possibly 0)
+      cmp rdx, 0;
+      je  rdhr_was_only;
+        xor r8, r8;
+        mov [rdx + 440], r8;             // new_head.prev = 0
+        jmp rdhr_clear_popped;
+      rdhr_was_only:
+        xor r8, r8;
+        mov [rax + 40], r8;              // CB.tail = 0 (list now empty)
+      rdhr_clear_popped:
+        xor r8, r8;
+        mov [rcx + 432], r8;             // popped.next = 0
+        mov [rcx + 440], r8;             // popped.prev = 0
+
+        mov rdi, rbx;                    // rdi = cpu_idx (reload for indexed count decrement)
+        lea rax, [rip + _runq_count];
+        mov r8, [rax + rdi*8];
+        sub r8, 1;
+        mov [rax + rdi*8], r8;
+
+        mov rax, rcx;                     // return popped TCB base
+        pop rbx;
+        ret;
+
+      rdhr_empty:
+        xor rax, rax;
+        pop rbx;
+        ret
+    }
+  }
+
+  // ============================================================================
+  // R69.M1-003 (#1888): sched_try_steal(dst_cpu_idx) -> stolen_count
+  // ============================================================================
+  //
+  // Idle-CPU work-stealing. Scans every OTHER CPU's runqueue count
+  // round-robin starting at (dst_cpu_idx + 1) mod MAX_CPUS, picks the
+  // fullest one, and moves HALF of its tasks (by count, floor-divided —
+  // a sibling with exactly 1 task is left alone: splitting 1 task in
+  // half steals nothing, so that candidate is skipped) onto dst's own
+  // runqueue. Returns the number of tasks actually moved (0 if every
+  // sibling was empty, or the fullest sibling had fewer than 2 tasks).
+  //
+  // HONEST SCOPE (see ap_entry.pdx's wiring comment): the AP idle path
+  // that is supposed to call this before parking (`before hlt, check own
+  // runqueue... steal half from the fullest`) runs at a point in the
+  // boot sequence (ap_bring_up_all, kernel_main.pdx) that is strictly
+  // BEFORE any application task exists (task_new / the r31_spawn witness
+  // both run later, immediately before sti) — so that call site is a
+  // guaranteed no-op today. The mechanism itself is real and is proven
+  // directly by the boot_r69_smp_dispatch witness, which populates
+  // multiple per-CPU runqueues via sched_wake's cross-CPU path (#1883)
+  // and then calls this function exactly as a real idle-balancer would.
+  //
+  // MAX_CPUS=4 inlined per-file (paideia-as does not resolve cross-module
+  // `let` at parse time — same duplication discipline as
+  // sched_affinity.pdx's SYS_SCHED_CPU_MASK_VALID). Mod-4 computed via
+  // `and rax, 3` (power-of-two mask, not `div`) per the mod-64 idiom used
+  // throughout cap/nvme_io_queues.pdx.
+  pub let sched_try_steal : (u64) -> u64 !{mem, sysreg} @{sched} = fn (dst_cpu_idx: u64) -> unsafe {
+    effects: { mem, sysreg },
+    capabilities: { sched },
+    justification: "R69.M1-003 (#1888): idle-CPU work-steal. Phase 0 (added after initial review): only steal into a dst_cpu_idx whose OWN _runq_count is 0 — the brief's own framing ('before hlt, check own runqueue; if empty, scan siblings') makes idleness of the RECIPIENT a precondition, not merely a caller convention; enforcing it inside sched_try_steal itself (rather than trusting every call site to have pre-checked) makes the primitive safe to call unconditionally, which is exactly how ap_entry.pdx's wiring and the boot_r69_smp_dispatch witness both use it. Non-idle dst returns 0 immediately, before the scan/steal machinery runs at all. 4-push callee-save prologue (rbx=dst_cpu_idx, r12=best_count, r13=best_cpu_idx, r14=scan cursor k) = 32B; entry rsp%16==8 -> 40, sub rsp,8 -> 48%16==0 for the nested runq_dequeue_head_remote/runq_enqueue_remote calls in the steal loop (rsp does not move between iterations, so one sub/add pair covers every call in the function, matching the pattern in sched_wake). Phase 1 (scan): r12=best_count=0, r13=best_cpu_idx=0 (dead value if never updated — see below), r14=k=1..3. candidate = (dst_cpu_idx + k) & 3 (mod-4 via power-of-two mask). Skip candidate==dst_cpu_idx defensively (cannot actually occur for k in [1,3] and MAX_CPUS=4, but the guard costs nothing and documents the invariant). Load _runq_count[candidate]; if > best_count (strict, via `cmp;jbe skip`), update best_count/best_cpu_idx. Phase 2 (decide): steal_n = best_count >> 1 (floor half). If steal_n == 0 (covers BOTH 'no sibling had any tasks' AND 'fullest sibling had exactly 1 task'), return 0 immediately — this also makes the Phase-1 best_cpu_idx=0 dead-initial-value harmless, since steal_n==0 short-circuits before best_cpu_idx is ever read. Phase 3 (steal loop): r12 reused as stolen_count=0; loop while stolen_count < steal_n: call runq_dequeue_head_remote(best_cpu_idx) -> rax = popped task or 0; if 0 (source ran dry — should not happen given steal_n <= best_count/2 <= best_count, but defensive against a future concurrent mutator), break early; call runq_enqueue_remote(dst_cpu_idx, popped); stolen_count++. Phase 4 (fingerprint, only if stolen_count>0): stage klog_s1_d3's 3 stack args (v3=stolen_count, k3=&k_stolen, v2=dst_cpu_idx) behind a compensating `sub rsp,8` pad (current depth is already 0 mod16 at this point, same as klog_s1_x3's established call sites e.g. drivers/nvme/identify_ns.pdx, so the pad+3-push=4-unit-even sequence preserves rather than flips alignment), then call klog_s1_d3(LEVEL_INFO=3, SUBSYS_SCHD, tag_sched_work_steal_ok, k_src, best_cpu_idx=r13, k_dst, [stack]=dst_cpu_idx, k_stolen, [stack]=stolen_count) for the `sched work steal ok` fingerprint; unwind the 3 pushes + pad symmetrically. Return stolen_count. Register discipline: rbx=dst_cpu_idx (callee-save, read-only after entry), r12=best_count then reused as stolen_count (both callee-save-preserved across every nested call, klog_s1_d3 included), r13=best_cpu_idx (callee-save, read-only in phases 3-4), r14=scan cursor k (dead after phase 1, not reused). rax/rcx/rdx/rdi/rsi/r8/r9 caller-save scratch throughout. Effects widened mem->mem+sysreg: klog_s1_d3 declares {sysreg,mem} (it reads TSC via the emit-core path), so this function's own effect row must be a superset. Capability {sched} unchanged — klog_s1_d3 needs no capability. Encoder: mov/lea/and/cmp/jbe/je/jmp/add/sub/shr/call/ret — all pre-existing; the mod-4 `and rax,3` and the halving `shr r14,1` are both pre-proven idioms (nvme_io_queues.pdx mod-64 masks; vector_pool.pdx-style bit arithmetic).",
+    block: {
+      push rbx;
+      push r12;
+      push r13;
+      push r14;
+      sub rsp, 8;
+      mov rbx, rdi;                     // rbx = dst_cpu_idx
+
+      // ---- Phase 0: only steal into an IDLE cpu (brief: "before hlt,
+      // check own runqueue; if empty, scan...") — a dst that already has
+      // work of its own is not a stealer. ----
+      lea rax, [rip + _runq_count];
+      mov rcx, [rax + rbx*8];
+      cmp rcx, 0;
+      je  steal_dst_idle;
+        xor rax, rax;
+        add rsp, 8;
+        pop r14; pop r13; pop r12; pop rbx;
+        ret;
+      steal_dst_idle:
+
+      // ---- Phase 1: scan siblings round-robin from dst+1, find fullest ----
+      xor r12, r12;                     // r12 = best_count = 0
+      xor r13, r13;                     // r13 = best_cpu_idx = 0 (dead if never updated)
+      mov r14, 1;                       // r14 = k = 1
+      steal_scan:
+        cmp r14, 4;                     // MAX_CPUS
+        jae steal_scan_done;
+        mov rax, rbx;
+        add rax, r14;
+        and rax, 3;                     // (dst_cpu_idx + k) mod 4
+        cmp rax, rbx;
+        je  steal_scan_next;            // skip self (defensive; unreachable for k in [1,3])
+        lea rcx, [rip + _runq_count];
+        mov rdx, [rcx + rax*8];         // rdx = count[candidate]
+        cmp rdx, r12;
+        jbe steal_scan_next;            // not strictly fuller than current best
+        mov r12, rdx;                   // best_count = candidate's count
+        mov r13, rax;                   // best_cpu_idx = candidate
+      steal_scan_next:
+        add r14, 1;
+        jmp steal_scan;
+      steal_scan_done:
+
+      // ---- Phase 2: decide how many to steal ----
+      mov r14, r12;
+      shr r14, 1;                       // steal_n = best_count / 2 (floor)
+      cmp r14, 0;
+      je  steal_none;
+
+      // ---- Phase 3: move steal_n tasks, head-of-src -> tail-of-dst ----
+      xor r12, r12;                     // r12 = stolen_count = 0 (reused)
+      steal_loop:
+        cmp r12, r14;
+        jae steal_done;
+        mov rdi, r13;                   // src = best_cpu_idx
+        call runq_dequeue_head_remote;   // rax = popped task or 0
+        cmp rax, 0;
+        je  steal_done;                  // source ran dry early (defensive)
+        mov rdi, rbx;                    // dst = dst_cpu_idx
+        mov rsi, rax;                    // task = popped
+        call runq_enqueue_remote;
+        add r12, 1;
+        jmp steal_loop;
+      steal_done:
+        // R69.M1-003 (#1888) fingerprint: only when something actually
+        // moved (the defensive early-break on a dry source can reach
+        // here with r12==0, and that is not an event worth logging).
+        cmp r12, 0;
+        je  steal_done_noemit;
+
+        // sched work steal ok -- src=<r13> dst=<rbx> stolen=<r12>.
+        // Current depth here is rsp%16==0 (prologue 4-push + sub rsp,8,
+        // held constant through the steal loop) — matches the "already
+        // 0 mod16" case, so stage the 3 klog_s1_d3 stack args with the
+        // compensating `sub rsp,8` pad before them (same shape as
+        // klog_s1_x3's call sites elsewhere, e.g. drivers/nvme/
+        // identify_ns.pdx): sub+3push = 4 units (even), preserving 0
+        // mod16 at the call.
+        sub rsp, 8;
+        push r12;                          // v3 = stolen
+        lea rax, [rip + k_stolen];
+        push rax;                          // k3 = k_stolen
+        push rbx;                          // v2 = dst_cpu_idx
+
+        mov rdi, 3;                        // level = LEVEL_INFO
+        lea rsi, [rip + SUBSYS_SCHD];
+        lea rdx, [rip + tag_sched_work_steal_ok];
+        lea rcx, [rip + k_src];
+        mov r8, r13;                        // v1 = src (best_cpu_idx)
+        lea r9, [rip + k_dst];
+        call klog_s1_d3;
+
+        add rsp, 24;                        // pop v3/k3/v2
+        add rsp, 8;                         // undo the pad -> back to rsp%16==0
+
+      steal_done_noemit:
+        mov rax, r12;                    // return stolen_count
+        add rsp, 8;
+        pop r14; pop r13; pop r12; pop rbx;
+        ret;
+
+      steal_none:
+        xor rax, rax;
+        add rsp, 8;
+        pop r14; pop r13; pop r12; pop rbx;
+        ret
     }
   }
 }

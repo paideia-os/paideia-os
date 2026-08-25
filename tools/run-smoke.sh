@@ -490,6 +490,43 @@ case "${EXPECTED}" in
         SMP_UNORDERED_HELLO=1
         EXPECTED=""
         ;;
+    boot_r69_smp_dispatch)
+        # R69.M1 (#1877/#1883/#1888/#1894): SMP scheduler real-dispatch
+        # witness. Kernel wire-in (src/kernel/boot/kernel_main.pdx,
+        # immediately after witness_r33_audio_crash_isolation and before
+        # present_boot_ready/sti): unconditional call to
+        # witness_r69_smp_dispatch (src/kernel/boot/witness/
+        # r69_smp_dispatch.pdx), which exercises cross-CPU sched_wake
+        # dispatch (#1883) and idle-CPU work-steal (#1888) against
+        # synthetic TCBs, then reports the resulting per-CPU runqueue
+        # distribution as the #1894 fairness fingerprint.
+        #
+        # `-smp 4` (NOT `-smp 8` as this round's brief originally asked
+        # for): Percpu.MAX_CPUS is 4 (src/kernel/core/smp/percpu.pdx),
+        # matching ApStacks.N_APS and the hard-coded 3-entry AP list in
+        # ap_list.pdx — the same real ceiling boot_smp already runs
+        # under. There is no live path to more than 4 logical CPUs on
+        # this tree today; requesting -smp 8 here would not exercise any
+        # additional CPU, only leave 4 of the 8 QEMU vCPUs perpetually
+        # unbooted. See witness/r69_smp_dispatch.pdx's header for the
+        # full honest-scope note (this proves runqueue-residency
+        # fairness, not execution-tick fairness — the latter needs
+        # AP-side IDT install, which has never landed, #762).
+        #
+        # This witness runs unconditionally on every boot mode (not just
+        # this one) — it is harmless under -smp 1 (its cross-CPU wake
+        # targets simply resolve to .bss-zero, never-brought-up Percpu
+        # CB slots, and the resulting "IPI" to apic_id 0 lands on the
+        # BSP itself, which has a real vector-0xF1 handler). This mode
+        # exists to run it under the -smp 4 topology it is meant for and
+        # pin its three fingerprints against a golden.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r69-smp.golden"
+        TIMEOUT=10
+        SMP_MODE=1
+        SMP_CPU_COUNT=4
+        EXPECTED=""
+        ;;
     boot_r20b_echo)
         # R20b.M5-001 (#1563): echo-server end-to-end closure witness —
         # closes R20b.M5, the R20b round, and the #1015 userspace-server
