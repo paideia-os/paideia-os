@@ -26,6 +26,7 @@ MV_LINK_SCRIPT="${USER_SRC}/mv.ld"
 CP_LINK_SCRIPT="${USER_SRC}/cp.ld"
 MKDIR_LINK_SCRIPT="${USER_SRC}/mkdir.ld"
 TOUCH_LINK_SCRIPT="${USER_SRC}/touch.ld"
+DMESG_LINK_SCRIPT="${USER_SRC}/dmesg.ld"
 
 if [[ ! -f "${SHELL_LINK_SCRIPT}" ]]; then
     echo "shell linker script missing: ${SHELL_LINK_SCRIPT}" >&2
@@ -117,6 +118,11 @@ if [[ ! -f "${TOUCH_LINK_SCRIPT}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${DMESG_LINK_SCRIPT}" ]]; then
+    echo "dmesg linker script missing: ${DMESG_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
 
@@ -141,6 +147,7 @@ MV_OBJECTS=()
 CP_OBJECTS=()
 MKDIR_OBJECTS=()
 TOUCH_OBJECTS=()
+DMESG_OBJECTS=()
 LIBC_OBJECTS=()
 AML_OBJECTS=()
 LIBS_OBJECTS=()
@@ -262,6 +269,12 @@ while IFS= read -r -d '' pdx; do
         # sys_open/sys_close/sys_debug_puts/sys_exit) so its object goes
         # to its own set only -- no library pull-in.
         TOUCH_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "dmesg.pdx" ]]; then
+        # R60.M7-001 (paideia-os #1816): dmesg.pdx is self-contained (inlines
+        # sys_dmesg/sys_write/sys_debug_puts/sys_exit, plus a same-module
+        # dm_print_u64_dec helper) so its object goes to its own set only --
+        # no library pull-in. Mirrors the cp.pdx classification pattern.
+        DMESG_OBJECTS+=("${obj}")
     elif [[ "${rel}" == libc/* ]]; then
         # R57.M4-001 (#1797): src/user/libc/ -- userspace runtime library
         # for the growing R57 ring-3 surface (ls, cat, mkdir, ...). Each
@@ -724,6 +737,27 @@ if [[ ${#TOUCH_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/touch.elf"
     echo "[ok] ${BUILD_DIR}/touch.bin"
+fi
+
+# Link dmesg.elf with dmesg objects only (R60.M7-001 paideia-os #1816).
+# Self-contained; no libs, no shim. Inlines sys_dmesg (SC+ ID 13) +
+# sys_write (SC+ ID 1) + sys_debug_puts (SC+ ID 12) + sys_exit (SC+ ID 60)
+# plus a same-module dm_print_u64_dec decimal-formatting helper (the one
+# same-module `call` in this binary -- not a library pull-in). The 4 KiB
+# dmesg_buf (uninit @align(8)) lives in .bss; the R31.M2-1595 (#1595)
+# contiguity rule is preserved by dmesg.ld verbatim.
+if [[ ${#DMESG_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T dmesg.ld -> dmesg.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${DMESG_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/dmesg.elf" \
+        "${DMESG_OBJECTS[@]}"
+
+    echo "[objcopy-user] dmesg.elf -> dmesg.bin"
+    objcopy -O binary "${BUILD_DIR}/dmesg.elf" "${BUILD_DIR}/dmesg.bin"
+
+    echo "[ok] ${BUILD_DIR}/dmesg.elf"
+    echo "[ok] ${BUILD_DIR}/dmesg.bin"
 fi
 
 # R31.M2-1595 (#1595): PT_LOAD extent gate over every image linked above.
