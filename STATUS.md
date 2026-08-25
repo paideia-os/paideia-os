@@ -1208,3 +1208,40 @@ R56 widened the syscall surface with six VFS-metadata operations — `stat` / `g
 None (R56 ran entirely under QEMU `-kernel` / documentation).
 
 **Next Round:** R57 (userland tools + shell PATH; exercises R56 metadata syscalls). Zero R56 blockers.
+
+---
+
+## R57 (Userland tools + syscall widening) — PARTIAL CLOSE 2026-08-25
+
+R57 delivered the substrate for POSIX-style userland tools: two new kernel syscalls (`sys_taskinfo` #83 for /bin/ps, `sys_mountinfo` #84 for /bin/mount with dispatch bounds 82→84), two userland binaries (/bin/ls over sys_getdents #1797, /bin/cat over sys_open+read+write #1798), and the init-time rootfs seed loop (#1802). The /bin/ps userland ELF builds after two drive-by fixes (record→ps_record reserved-word rename, trailing @no_frame strip). Two R57 items landed only kernel-side and defer their userland ELF: /bin/mount hit paideia-as P0100 parser gap on trailing @no_frame at module tail (removed from tree, kernel sys_mountinfo callable), and the shell PATH resolver (#1801) + composite smoke (#1803) fully deferred. Twelfth consecutive round with zero paideia-as escalations; two new encoder gaps (P0100, U1606) worked around inline. See `design/round-retrospectives/r57-closure.md` for full write-up including debt inventory.
+
+### Issues Implemented (5 + closure; 3 deferred)
+
+- **M4** (#1790..#1796 preceded as R56 close; #1797, #1798, #1799 kernel side, #1800 kernel side, #1802, #1804 closure) — landed. #1801 shell PATH, #1803 composite smoke, /bin/mount userland, /bin/ps live exercise deferred as R57 debt.
+
+### Cross-Repo Escalations to paideia-as (R57)
+
+**None.** Twelfth consecutive round. Two encoder gaps surfaced (P0100 trailing @no_frame parser rejection, U1606 imm64 mov rejection) both worked around inline.
+
+### Observable Proof
+
+- Kernel builds clean; substrate boot reaches SHELL START + $ prompt.
+- 11 new T-symbols in kernel.elf (sys_stat/getdents/mkdir/rmdir/unlink/rename/taskinfo/mountinfo bodies + task_get_info primitive + dispatch shims).
+- 3 userland ELFs built (ls, cat, ps); init.elf grew to embed rootfs_seed.
+
+### R57 Debt Carried Forward
+
+1. /bin/mount userland ELF — paideia-as P0100 blocked.
+2. /bin/ps live invocation — needs sys_execve argv wiring.
+3. #1801 shell PATH resolver — full deferral.
+4. #1803 composite smoke — full deferral.
+5. Real ELF payloads in rootfs_seed — minimal stubs at present.
+6. paideia-as P0100 parser gap follow-up.
+7. paideia-as U1606 encoder gap follow-up.
+8. R56 debt carried through unchanged.
+
+### Quirks Discovered on Real Hardware
+
+None (R57 ran under QEMU `-kernel`).
+
+**Next Round:** R58 (shell redirects + /bin/rm/mv/cp/mkdir/touch). Zero R57 kernel-side blockers.
