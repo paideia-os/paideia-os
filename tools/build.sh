@@ -4954,6 +4954,16 @@ ec_confine_one '_nvw_flush_scratch'  'core/fs/pdxfs/bdev_write.o'
 ec_confine_one '_r54rt_write_scratch' 'boot/witness/r54_bdev_round_trip.o'
 ec_confine_one '_r54rt_read_scratch'  'boot/witness/r54_bdev_round_trip.o'
 ec_confine_one '_r54rt_stage'         'boot/witness/r54_bdev_round_trip.o'
+# R55.M2-005 (#1787): 4 KiB page-aligned source (phase 1 payload) +
+# destination (phase 2 readback) pair for the pdxfs-block composed
+# write-then-reboot-then-read-back witness. Single-writer per r55_
+# write_e2e.pdx §"Register plan"; a second writer would let a caller
+# stage a non-deterministic payload behind the witness's back and
+# defeat the round-trip compare in phase 2 (same rationale as R54.M1-
+# 003's own _r54rt_*_scratch confinement).
+ec_confine_one '_r55we_payload_scratch'  'boot/witness/r55_write_e2e.o'
+ec_confine_one '_r55we_readback_scratch' 'boot/witness/r55_write_e2e.o'
+ec_confine_one '_r55we_stage'            'boot/witness/r55_write_e2e.o'
 ec_confine_one '_dur_lvl'     'core/fs/pdxfs/durability.o'
 ec_confine_one '_dur_state'   'core/fs/pdxfs/durability.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then
