@@ -209,6 +209,45 @@ ALLOWLIST = {
         "tmpfs (the current 14-mode matrix) /etc is fresh at boot "
         "so the work path always wins; the files=7 variant is "
         "asserted in tests/r17/expected-boot-r17-init.txt.",
+
+    # src/kernel/core/klog/keys.pdx tag_sys_taskinfo_ok -- R57.M4-003
+    # (paideia-os #1799) tag DECLARED but not emitted from any body.
+    # sys_taskinfo_body is a leaf forwarder onto task_get_info; an
+    # iterator syscall called MAX_PIDS (64) times per /bin/ps
+    # invocation would inflate the ring with duplicate 'sys taskinfo
+    # ok' lines for no diagnostic gain (the individual record
+    # contents are already visible on the caller's stdout).  Same
+    # declared-but-unemitted posture the R57.M4-004 mountinfo sibling
+    # takes.  Assertable once a one-shot kernel-side witness that
+    # exercises the syscall end-to-end (kernel-driver call through
+    # dispatch_taskinfo, observing the record on wire) lands and
+    # emits the tag exactly once at witness top -- see
+    # src/kernel/core/klog/keys.pdx L1216 for the future-witness
+    # note.  Allowlist entry lands at R57.M4-004 (#1800) to unblock
+    # the fingerprint-coverage gate after #1799 declared the tag
+    # without a golden.
+    "sys taskinfo ok [legacy: SYS TASKINFO OK]":
+        "R57.M4-003 (#1799) tag declared but not emitted; iterator "
+        "syscall called MAX_PIDS times per /bin/ps would flood the "
+        "ring. Assertable via a one-shot future kernel-side witness "
+        "(see keys.pdx §tag_sys_taskinfo_ok comment).",
+
+    # src/kernel/core/klog/keys.pdx tag_sys_mountinfo_ok -- R57.M4-004
+    # (paideia-os #1800) tag DECLARED but not emitted from any body.
+    # Same rationale as the taskinfo sibling immediately above:
+    # sys_mountinfo_body is a leaf read of _mount_table; an iterator
+    # syscall called MOUNT_MAX (8) times per /bin/mount invocation
+    # would inflate the ring with duplicate 'sys mountinfo ok' lines
+    # for no diagnostic gain (the individual row contents are
+    # already visible on the caller's stdout).  Assertable via a
+    # future one-shot kernel-side witness that exercises the syscall
+    # end-to-end -- see src/kernel/core/klog/keys.pdx §tag_sys_
+    # mountinfo_ok comment for the future-witness posture.
+    "sys mountinfo ok [legacy: SYS MOUNTINFO OK]":
+        "R57.M4-004 (#1800) tag declared but not emitted; iterator "
+        "syscall called MOUNT_MAX times per /bin/mount would flood "
+        "the ring. Assertable via a one-shot future kernel-side "
+        "witness (see keys.pdx §tag_sys_mountinfo_ok comment).",
 }
 
 # Below these counts the extractor has stopped matching rather than the

@@ -13,6 +13,7 @@ CHILD_HELLO_LINK_SCRIPT="${USER_SRC}/child_hello.ld"
 TRUE_LINK_SCRIPT="${USER_SRC}/true.ld"
 CAT_LINK_SCRIPT="${USER_SRC}/cat.ld"
 PS_LINK_SCRIPT="${USER_SRC}/ps.ld"
+MOUNT_LINK_SCRIPT=""  # R57.M4-004 (#1800): /bin/mount userland deferred to R57+ debt (parser gap on trailing @no_frame in module w/ 4 lambdas)
 ECHO_SERVER_LINK_SCRIPT="${USER_SRC}/echo_server.ld"
 ECHO_CLIENT_LINK_SCRIPT="${USER_SRC}/echo_client.ld"
 ACPI_SUPERVISOR_LINK_SCRIPT="${USER_SRC}/acpi_supervisor.ld"
@@ -97,6 +98,7 @@ CHILD_HELLO_OBJECTS=()
 TRUE_OBJECTS=()
 CAT_OBJECTS=()
 PS_OBJECTS=()
+MOUNT_OBJECTS=()
 ECHO_SERVER_OBJECTS=()
 ECHO_CLIENT_OBJECTS=()
 ACPI_SUPERVISOR_OBJECTS=()
@@ -382,6 +384,12 @@ if [[ ${#PS_OBJECTS[@]} -gt 0 ]]; then
     echo "[ok] ${BUILD_DIR}/ps.elf"
     echo "[ok] ${BUILD_DIR}/ps.bin"
 fi
+
+# R57.M4-004 (#1800): /bin/mount userland link deferred to R57+ debt —
+# parser gap P0100 on trailing @no_frame at module tail (mount.pdx line 515)
+# not reproducible on siblings (ps/cat/true) that share the pattern. Kernel-
+# side sys_mountinfo body + dispatch shim are landed and callable; a future
+# fix to the parser or a restructure of mount.pdx unblocks the ELF link.
 
 # Link echo_server.elf with echo_server objects only (R20b.M5-001 #1563).
 # Self-contained (inlines its four IPC syscalls); mirrors child_hello.elf /
