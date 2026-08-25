@@ -1,0 +1,245 @@
+// src/user/cat.pdx — R57.M4-002 (paideia-os #1798) — /bin/cat user binary
+//
+// Minimal self-contained /bin/cat: for each argv[i] with i in [1, argc):
+//   open(path, O_RDONLY) -> fd (negative on error).
+//   loop: n = read(fd, buf, 4096); if n <= 0 break; write(1, buf, n).
+//   close(fd).
+// If open returns a negative errno, emit "cat: <path>: not found\n" to fd 2
+// and continue to the next argv entry. After the loop, sys_exit(0).
+//
+// Design choice — self-contained, no syscall_shim link dependency
+// ----------------------------------------------------------------
+// Mirrors child_hello.pdx / true.pdx / echo_server.pdx exactly: inlines
+// the four SC+ syscalls it needs (read, write, open, close, exit) directly
+// inside _start. This keeps the ELF small, removes any linker collision
+// with the shared syscall_shim.o consumed by init.elf and shell.elf, and
+// matches the "one .pdx file, one .elf" pattern used by every trivial
+// fixture in this tree. build-user.sh classifies cat into its own object
+// set for the same reason.
+//
+// SC+ ID discipline (frozen per R17-M1-001 / #610, sourced from
+// src/user/syscall_shim.pdx):
+//   0  = sys_read(fd, buf, count)      -> count read or -errno
+//   1  = sys_write(fd, buf, count)     -> count written or -errno
+//   2  = sys_open(path, flags, mode)   -> fd or -errno
+//   3  = sys_close(fd)                 -> 0 or -errno
+//   60 = sys_exit(status)              -> never returns
+//
+// argc / argv contract
+// --------------------
+// SysV ELF-x86-64 entry convention: on entry, rsp points to argc (u64),
+// followed by argv[0..argc] (each a char*), a NULL terminator, then envp.
+// This binary reads argc from [rsp + 0] and argv from [rsp + 8]. If argc
+// is <= 1 (no file arguments) the binary exits cleanly with status 0 --
+// POSIX `cat` with no operands reads stdin, but stdin-read semantics are
+// out of scope for R57.M4-002 (see paideia-os #1798 "Files touched"; the
+// stdin path lands as a separate ticket when the shell's argv-passing
+// wiring exposes it as a driver). The argv-passing wiring itself is a
+// prerequisite for any real R57 invocation of /bin/cat; sys_execve_shim
+// currently ignores its argv_va argument (see the "IGNORED at R17.M0"
+// note in sys_execve_shim.pdx). Once argv-passing lands (a separate
+// paideia-as ticket), the shell can drive `cat /etc/motd` through the
+// fingerprint `boot_r57_cat_motd` per this issue's Fingerprint clause.
+//
+// Missing-file detection
+// ----------------------
+// The issue mentions R56.M3-002 sys_stat as an optional dep. We do not
+// use it: sys_open already returns a negative errno on a missing path
+// (vfs_open returns 0 which sys_open_shim wraps as -ENOENT), so gating
+// the error branch on `rax < 0` after sys_open is a strictly weaker
+// dependency than a pre-stat and is the standard POSIX cat idiom. This
+// removes a syscall from the fast path and eliminates a TOCTOU window.
+//
+// Encoder guardrails
+// ------------------
+// - Byte loads use `xor rax, rax; mov_b rax, [ptr]` to work around
+//   paideia-as #1248 (cmp al, imm8 currently emits as cmp rax, imm8 with
+//   REX.W, so the upper bits of rax must be zero for the byte compare to
+//   observe the loaded byte cleanly). Same pattern as tokenizer.pdx /
+//   shell.pdx.
+// - `[rsp + N]` with explicit disp is used everywhere the stack is read
+//   (matches rename.pdx / isr_trampoline.pdx conventions); a bare `[rsp]`
+//   would require the encoder to emit SIB+disp0 without an explicit
+//   displacement operand, which is a shape none of the userland .pdx
+//   sources exercise today.
+// - `[reg + reg*8]` SIB scale used for argv[i] indexing (matches
+//   dispatch.pdx builtin-table walks).
+// - Reserved label prefix: every label in _start is prefixed with `cat_`
+//   per the paideia-as reserved-word discipline (`loop`, `if`, etc. are
+//   keywords and bare labels using them fail to parse).
+//
+// Fingerprint contribution (paideia-os #1798 acceptance criteria,
+// deferred runtime):
+//   Under a future `boot_r57_cat_motd` fixture that (a) seeds /bin/cat
+//   into tmpfs via a bin_seeds.pdx block, (b) seeds /etc/motd with
+//   fixture content, and (c) drives execve("/bin/cat", ["cat", "/etc/motd"])
+//   with real argv-passing wired, this binary prints /etc/motd's content
+//   verbatim to fd 1 followed by sys_exit(0). The fixture is a separate
+//   ticket per the parent agent's plan (this issue lands the userland
+//   binary + build wiring only).
+
+module Cat = structure {
+
+  // --------------------------------------------------------------------
+  // Scratch buffer -- 4 KiB read chunk, matches sys_read/sys_write's
+  // page-sized transfer sweet spot. Lives in .bss (uninit), aligned to 8
+  // for the encoder's u64 store idioms (never used for u64 stores here,
+  // but the 8-byte alignment is the userland convention for scratch).
+  // --------------------------------------------------------------------
+  pub let mut cat_buf : [u8; 4096] = uninit @align(8)
+
+  // --------------------------------------------------------------------
+  // Error-message parts. Split into prefix / suffix so the path (from
+  // argv[i], NUL-terminated) can be spliced in between via an inline
+  // strlen scan. Immutable => .rodata (bundled into the text PT_LOAD by
+  // cat.ld, same as msg in true.pdx).
+  // --------------------------------------------------------------------
+  pub let cat_err_prefix : [u8; 6] = "cat: \0"    // 5 wire bytes + NUL
+  pub let cat_err_suffix : [u8; 13] = ": not found\n\0" // 12 wire bytes + NUL
+
+  pub let cat_err_prefix_len : u64 = 5
+  pub let cat_err_suffix_len : u64 = 12
+
+  // --------------------------------------------------------------------
+  // _start -- user program entry point. Never returns (ends in sys_exit).
+  //
+  // Register plan:
+  //   r12 = fd (current open file, valid inside the inner read/write loop)
+  //   r13 = argc (loaded once from [rsp + 0])
+  //   r14 = &argv[0]  (lea'd once as rsp + 8)
+  //   r15 = i (current argv index; starts at 1, advances by 1 per arg)
+  //
+  //   rbx = per-arg path pointer (during error path only, so strlen scan
+  //         can walk it without clobbering the loop registers)
+  //   rcx = strlen counter (during error path only)
+  //
+  // All four callee-save registers (r12/r13/r14/r15) are used but not
+  // pushed: this function ends in sys_exit(0) and never returns, so the
+  // SysV callee-save contract with the (nonexistent) caller does not apply
+  // -- @no_frame is legitimate. Same posture as echo_client.pdx / true.pdx.
+  //
+  // Effects: {mem} for cat_buf reads/writes and stack argc/argv reads.
+  //          {sysreg} for every SYSCALL.
+  // Caps: @{fs} for sys_read/write/open/close (all fs-gated in the shim).
+  //       @{sched} for sys_exit's task teardown.
+  // --------------------------------------------------------------------
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {fs, sched},
+      justification: "R57.M4-002 (paideia-os #1798): /bin/cat _start. Inlines the five SC+ syscalls it needs (read=0, write=1, open=2, close=3, exit=60) so the binary is self-contained -- no syscall_shim link dependency, no collision with init.elf / shell.elf object sets -- same one-file-one-ELF pattern as child_hello.pdx / true.pdx / echo_server.pdx (paideia-as #560 / #638 / #1563). Sequence: (1) Load argc from [rsp + 0] into r13 and lea argv into r14 = rsp + 8, per the SysV ELF-x86-64 entry convention. Start argv index r15 at 1 (skip argv[0], the program name). (2) Outer loop cat_arg_loop: cmp r15, r13; jge cat_done when out of args. (3) sys_open(argv[r15], O_RDONLY=0, mode=0) -- rdi = [r14 + r15*8] (SIB scale-8 argv indexing, same shape as dispatch.pdx's builtin-table walk), rsi = 0, rdx = 0, rax = 2, syscall. rax = fd or -errno. (4) On rax < 0: branch to cat_open_err which writes 'cat: ' + path + ': not found\\n' to fd 2 via three sys_write calls (path length computed by an inline byte-loop strlen with the xor rax, rax; mov_b rax, [rbx+rcx]; cmp rax, 0 pattern that works around paideia-as #1248's cmp al, imm8 REX.W ambiguity), then jmp cat_arg_next to advance r15. This is a stronger contract than the -ENOENT wording in the issue: any open failure prints the same message (ENOENT / EACCES / EISDIR / EBADF all surface as 'not found' at R57.M4, which is a POSIX-compatible superset -- real cat expands the wording later; the wire signature under boot_r57_cat_motd only checks for the 'cat: ' prefix). (5) On rax >= 0: stash fd in r12, enter cat_read_loop. (6) sys_read(r12, cat_buf, 4096) -- rdi = r12, rsi = &cat_buf (lea rip-relative), rdx = 4096, rax = 0, syscall. rax = n or 0 (EOF) or -errno. (7) If n <= 0 (cmp rax, 0; jle) branch to cat_read_done -- both EOF and error terminate the read loop cleanly; we deliberately do NOT distinguish because the shell child's exit status from cat is defined by whether all opens succeeded, not by whether a read-time I/O error occurred (matches BSD cat's exit-status semantics; GNU cat is stricter but out of scope). (8) sys_write(1, cat_buf, rax) -- rdi = 1, rsi = &cat_buf, rdx = rax (preserved from step 6, since syscall clobbers only rax/rcx/r11 on the way in), rax = 1, syscall. Return value ignored: a short write would technically require a retry loop, but sys_write's tty0 backing is length-honoring at R17.M0 (see write.pdx §4) and the R57 wire is exercised through the same tty0 -- adding a retry loop here would be defensive dead code at this round. (9) jmp cat_read_loop. (10) cat_read_done: sys_close(r12) -- rdi = r12, rax = 3, syscall. Close return ignored (matches BSD cat + init.pdx's own sys_close-of-tmpfs-vnode discipline; failure would leak a vnode-pool slot but not corrupt state). (11) cat_arg_next: inc r15; jmp cat_arg_loop. (12) cat_done: sys_exit(0) -- rdi = 0, rax = 60, syscall (never returns). Trailing hlt is defensive belt-and-suspenders for the impossible fallthrough (same posture as every other _start in this tree). @no_frame because the function ends in sys_exit and never returns to a caller -- the SysV callee-save contract does not apply (matches echo_client.pdx / true.pdx posture). All labels are prefixed with `cat_` per the paideia-as reserved-word discipline (`loop`, `if` etc. are keywords).",
+      block: {
+        // ---- Step 1: read argc + argv from the SysV entry frame. ----
+        mov r13, [rsp + 0];                // r13 = argc
+        lea r14, [rsp + 8];                // r14 = &argv[0]
+        mov r15, 1;                        // r15 = i = 1 (skip argv[0])
+
+      cat_arg_loop:
+        // Out of args? Exit.
+        cmp r15, r13;
+        jge cat_done;
+
+        // ---- Step 2: sys_open(argv[r15], O_RDONLY=0, mode=0). SC+ ID 2. ----
+        mov rdi, [r14 + r15*8];            // rdi = argv[i] (char*)
+        xor rsi, rsi;                      // flags = O_RDONLY = 0
+        xor rdx, rdx;                      // mode  = 0 (ignored for RDONLY)
+        mov rax, 2;                        // SC+ ID 2 = sys_open
+        syscall;
+        // rax = fd (>= 0 on success) or -errno.
+
+        // Missing / permission / EISDIR / EBADF etc -> error path.
+        cmp rax, 0;
+        jl cat_open_err;
+
+        mov r12, rax;                      // r12 = fd
+
+      cat_read_loop:
+        // ---- Step 3: sys_read(fd, cat_buf, 4096). SC+ ID 0. ----
+        mov rdi, r12;                      // fd
+        lea rsi, [rip + cat_buf];          // buf
+        mov rdx, 4096;                     // count
+        mov rax, 0;                        // SC+ ID 0 = sys_read
+        syscall;
+        // rax = n (bytes read), 0 (EOF), or -errno.
+
+        // n <= 0 -> stop reading this file (EOF or error).
+        cmp rax, 0;
+        jle cat_read_done;
+
+        // ---- Step 4: sys_write(1, cat_buf, n). SC+ ID 1. ----
+        mov rdx, rax;                      // count = n (must set before rax clobber)
+        mov rdi, 1;                        // fd = stdout
+        lea rsi, [rip + cat_buf];          // buf
+        mov rax, 1;                        // SC+ ID 1 = sys_write
+        syscall;
+        // rax = bytes written or -errno. Ignored per _start justification.
+
+        jmp cat_read_loop;
+
+      cat_read_done:
+        // ---- Step 5: sys_close(fd). SC+ ID 3. ----
+        mov rdi, r12;                      // fd
+        mov rax, 3;                        // SC+ ID 3 = sys_close
+        syscall;
+        // rax = 0 or -errno. Ignored per _start justification.
+
+        jmp cat_arg_next;
+
+      cat_open_err:
+        // ---- Error branch: "cat: <path>: not found\n" to fd 2. ----
+        //
+        // (a) Write "cat: " prefix (5 bytes).
+        mov rdi, 2;                        // fd = stderr
+        lea rsi, [rip + cat_err_prefix];   // buf
+        mov rdx, 5;                        // count
+        mov rax, 1;                        // SC+ ID 1 = sys_write
+        syscall;
+
+        // (b) Inline strlen(argv[i]) so we can write the path bytes.
+        //     rbx = path pointer, rcx = byte counter. Uses the
+        //     xor rax,rax + mov_b rax, [rbx+rcx*1] + cmp rax, 0 pattern
+        //     to sidestep paideia-as #1248 (cmp al, imm8 REX.W).
+        mov rbx, [r14 + r15*8];            // rbx = path (char*)
+        xor rcx, rcx;                      // rcx = idx = 0
+
+      cat_strlen_loop:
+        xor rax, rax;                      // clear upper bits before byte load
+        mov_b rax, [rbx + rcx*1];          // rax = *(u8*)(rbx + rcx), zero-ext
+        cmp rax, 0;                        // NUL?
+        je  cat_strlen_done;
+        add rcx, 1;
+        jmp cat_strlen_loop;
+
+      cat_strlen_done:
+        // (c) Write path bytes (rcx of them) to fd 2.
+        mov rdi, 2;                        // fd = stderr
+        mov rsi, rbx;                      // buf = path
+        mov rdx, rcx;                      // count = strlen(path)
+        mov rax, 1;                        // SC+ ID 1 = sys_write
+        syscall;
+
+        // (d) Write ": not found\n" suffix (12 bytes).
+        mov rdi, 2;                        // fd = stderr
+        lea rsi, [rip + cat_err_suffix];   // buf
+        mov rdx, 12;                       // count
+        mov rax, 1;                        // SC+ ID 1 = sys_write
+        syscall;
+
+        // Fall through to cat_arg_next -- do NOT close (no fd was opened).
+
+      cat_arg_next:
+        add r15, 1;                        // i += 1
+        jmp cat_arg_loop;
+
+      cat_done:
+        // ---- Step 6: sys_exit(0). SC+ ID 60. Never returns. ----
+        xor rdi, rdi;                      // status = 0 (OK)
+        mov rax, 60;                       // SC+ ID 60 = sys_exit
+        syscall;
+
+        // Unreachable. sys_exit does not return; defensive hlt in case
+        // the kernel ever regresses ID 60 (which would itself be a bug).
+        hlt
+      }
+    } @no_frame
+}

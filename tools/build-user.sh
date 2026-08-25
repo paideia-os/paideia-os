@@ -11,6 +11,7 @@ SHELL_LINK_SCRIPT="${USER_SRC}/link.ld"
 INIT_LINK_SCRIPT="${USER_SRC}/init.ld"
 CHILD_HELLO_LINK_SCRIPT="${USER_SRC}/child_hello.ld"
 TRUE_LINK_SCRIPT="${USER_SRC}/true.ld"
+CAT_LINK_SCRIPT="${USER_SRC}/cat.ld"
 ECHO_SERVER_LINK_SCRIPT="${USER_SRC}/echo_server.ld"
 ECHO_CLIENT_LINK_SCRIPT="${USER_SRC}/echo_client.ld"
 ACPI_SUPERVISOR_LINK_SCRIPT="${USER_SRC}/acpi_supervisor.ld"
@@ -35,6 +36,11 @@ fi
 
 if [[ ! -f "${TRUE_LINK_SCRIPT}" ]]; then
     echo "true linker script missing: ${TRUE_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${CAT_LINK_SCRIPT}" ]]; then
+    echo "cat linker script missing: ${CAT_LINK_SCRIPT}" >&2
     exit 1
 fi
 
@@ -77,6 +83,7 @@ SHELL_OBJECTS=()
 INIT_OBJECTS=()
 CHILD_HELLO_OBJECTS=()
 TRUE_OBJECTS=()
+CAT_OBJECTS=()
 ECHO_SERVER_OBJECTS=()
 ECHO_CLIENT_OBJECTS=()
 ACPI_SUPERVISOR_OBJECTS=()
@@ -104,6 +111,13 @@ while IFS= read -r -d '' pdx; do
         CHILD_HELLO_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "true.pdx" ]]; then
         TRUE_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "cat.pdx" ]]; then
+        # R57.M4-002 (paideia-os #1798): cat.pdx is self-contained
+        # (inlines its five SC+ syscalls -- read/write/open/close/exit)
+        # so its object goes to its own set only -- no library pull-in.
+        # Same one-file-one-ELF discipline as child_hello / true /
+        # echo_server / echo_client / acpi_supervisor / pci_enumerator.
+        CAT_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "echo_server.pdx" ]]; then
         # R20b.M5-001 (#1563): echo_server.pdx is self-contained (inlines its
         # four IPC syscalls; same one-file-one-ELF discipline as child_hello /
@@ -276,6 +290,26 @@ if [[ ${#TRUE_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/true.elf"
     echo "[ok] ${BUILD_DIR}/true.bin"
+fi
+
+# Link cat.elf with cat objects only (R57.M4-002 paideia-os #1798).
+# Self-contained; no libs, no shim -- mirrors true.elf / child_hello.elf
+# pattern. Inlines five SC+ syscalls (read=0, write=1, open=2, close=3,
+# exit=60) directly in _start. The 4 KiB read buffer (cat_buf) lives in
+# .bss; no .data content, so the R31.M2-1595 (#1595) contiguity rule is
+# preserved by cat.ld verbatim.
+if [[ ${#CAT_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T cat.ld -> cat.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${CAT_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/cat.elf" \
+        "${CAT_OBJECTS[@]}"
+
+    echo "[objcopy-user] cat.elf -> cat.bin"
+    objcopy -O binary "${BUILD_DIR}/cat.elf" "${BUILD_DIR}/cat.bin"
+
+    echo "[ok] ${BUILD_DIR}/cat.elf"
+    echo "[ok] ${BUILD_DIR}/cat.bin"
 fi
 
 # Link echo_server.elf with echo_server objects only (R20b.M5-001 #1563).
