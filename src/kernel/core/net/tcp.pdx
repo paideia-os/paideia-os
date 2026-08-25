@@ -1,0 +1,1365 @@
+// src/kernel/core/net/tcp.pdx — R72.M1 (#1923..#1926) TCP substrate
+//
+// Realistic MVP TCP: 11-state machine, plain 3-way handshake (SYN
+// cookies deferred), single-timer RTO retransmit primitive, Reno-lite
+// congestion control. Goal per design/kernel/tcp-substrate.md: enough
+// protocol to survive a loopback connect + echo + orderly close so
+// `curl http://` / `pkg install http://` have a real stream underneath
+// once a userspace TCP/IP client lands. NOT a production TCP: no SACK,
+// no window scaling, no MSS-option negotiation, no 2MSL TIME_WAIT
+// delay, no real congestion-avoidance byte-counting.
+//
+// -----------------------------------------------------------------------------
+// TCB layout (512 bytes, _tcp_tcb_table[64])
+// -----------------------------------------------------------------------------
+//
+//   +0    state                (u64)  0..10, see TCP_ST_* below
+//   +8    local_port           (u64, low 16 bits meaningful)
+//   +16   remote_port          (u64, low 16 bits meaningful)
+//   +24   local_ip             (4 bytes, byte-indexed; rest of qword 0)
+//   +32   remote_ip            (4 bytes, byte-indexed; rest of qword 0)
+//   +40   snd_una
+//   +48   snd_nxt
+//   +56   snd_wnd              (peer's advertised window; informational)
+//   +64   rcv_nxt
+//   +72   rcv_wnd              (our advertised window; const 4096 at MVP)
+//   +80   iss                  (initial send sequence number)
+//   +88   irs                  (initial receive sequence number)
+//   +96   cwnd                 (bytes)
+//   +104  ssthresh             (bytes)
+//   +112  dup_ack_count
+//   +120  rto_deadline         (tick count from _tick_count; single timer)
+//   +128  last_seg_seq         (retransmit replay: seq of last sent segment)
+//   +136  last_seg_len         (retransmit replay: seq-space bytes consumed;
+//                               0 for a pure ACK, 1 for a bare SYN/FIN)
+//   +144  last_seg_flags       (retransmit replay: flags of last sent segment)
+//   +152  backlog_pending_tcb  (LISTENER only: child tcb_idx awaiting
+//                               accept(), or TCP_NONE)
+//   +160  claimed              (child TCB only: 1 once accept() has taken it)
+//   +168  in_use               (0 = free slot, 1 = allocated)
+//   +176  rx_head              (bytes consumed from rx_buf by recv())
+//   +184  rx_tail              (bytes appended to rx_buf by tcp_input)
+//   +192  reserved
+//   +200  mss                  (negotiated MSS; fixed TCP_MSS_DEFAULT — no
+//                               MSS option parsing at MVP)
+//   +208..511  reserved
+//
+// rx_buf / tx_buf are NOT embedded in the 512-byte row — each lives in
+// its own 4 KiB-per-TCB table (_tcp_rx_buf_table / _tcp_tx_buf_table),
+// indexed by tcb_idx*4096. tx_buf is reserved for a future full data-
+// retransmit replay buffer (see §Retransmit honesty note below); the
+// MVP only writes into it defensively-unused.
+//
+// -----------------------------------------------------------------------------
+// Loopback fast path — the architectural decision this round hinges on
+// -----------------------------------------------------------------------------
+//
+// tcp_send_segment compares the segment's local_ip and remote_ip (both
+// 4-byte fields on the TCB). When they are equal (a self-connect, which
+// is the ONLY case boot_r72_tcp_echo exercises — QEMU's e1000e giving a
+// self-addressed frame back to the same NIC as an RX event is not a
+// posture this driver implements, and real loopback interfaces don't
+// exist in this tree today: net/ipv4.pdx defines only _ipv4_my_ip /
+// _ipv4_gw_ip / _ipv4_bcast_ip, no 127.0.0.0/8), tcp_send_segment calls
+// tcp_rx_handle DIRECTLY on the segment it just built, in-process,
+// rather than handing it to ipv4_tx_send / l2_tx_send / the e1000e ring.
+// A non-loopback destination (remote_ip != local_ip) takes the normal
+// ipv4_tx_send(protocol=6, ...) path — the wire path is real, just
+// unexercised by this round's witness.
+//
+// This keeps e1000e.pdx and ipv4.pdx untouched beyond the one proto=6
+// dispatch line ipv4_rx_handle needed anyway (per the round's own "do
+// not modify beyond the dispatch line" instruction), and it means the
+// witness's tcp_connect() calls synchronously complete the ENTIRE 3-way
+// handshake before returning: SYN send loops back into the listener's
+// tcp_rx_handle (allocates a child TCB, sends SYN+ACK), which loops
+// back into the connector's tcp_rx_handle (ESTABLISHED, sends ACK),
+// which loops back into the child's tcp_rx_handle (ESTABLISHED). No
+// scheduler, no interrupt, no async wait — a kernel-side witness can
+// drive the whole state machine from straight-line code. Recursion
+// depth is bounded (<= 4) by the handshake/close shapes themselves.
+//
+// -----------------------------------------------------------------------------
+// Retransmit honesty note (R72.M1-003, #1925)
+// -----------------------------------------------------------------------------
+//
+// Single timer per TCB: rto_deadline = _tick_count + TCP_RTO_TICKS
+// (100 ticks @ the ~100 Hz LAPIC period = ~1 second), set on every
+// segment tcp_send_segment transmits. NO exponential backoff, NO Karn's
+// algorithm RTT sampling (RFC 6298 refinement explicitly deferred).
+// tcp_poll_retransmits() scans all 64 TCBs and re-sends any overdue
+// segment via tcp_retransmit_last. THAT FUNCTION ONLY REPLAYS
+// ZERO-PAYLOAD CONTROL SEGMENTS (SYN/FIN/ACK) correctly — a full data
+// retransmit would need the sent bytes cached in _tcp_tx_buf_table,
+// which this landing declares but does not yet wire tcp_send_segment's
+// payload copy through. Documented, not hidden: a TCB carrying unacked
+// DATA whose RTO fires will re-send a zero-length segment carrying the
+// current flags, which acks/probes but does not recover the lost bytes.
+// tcp_poll_retransmits is NOT wired to the LAPIC timer ISR (int/
+// exceptions.pdx) — that file is out of this round's touched-file list
+// and its hot path is not somewhere to bolt an unrelated 64-TCB scan
+// without a dedicated review. It is exported and callable (a future
+// round's idle-loop or timer-tick hook wires it in); boot_r72_tcp_echo
+// never observes an RTO fire because the loopback path resolves every
+// segment synchronously, well under one tick.
+//
+// -----------------------------------------------------------------------------
+// Congestion control (R72.M1-004, #1926) — Reno-lite
+// -----------------------------------------------------------------------------
+//
+// cwnd starts at 1 MSS, ssthresh starts effectively unbounded (0xFFFF).
+// Slow start: cwnd += MSS per ACK covering new data while cwnd < ssthresh.
+// "Congestion avoidance": cwnd += max(1, MSS/8) per such ACK once
+// cwnd >= ssthresh — a fixed small increment standing in for RFC 5681's
+// per-byte accounting; real AIMD tuning is deferred. Three consecutive
+// duplicate ACKs (same ack value, no new data) halve cwnd (floored at
+// 1 MSS) and set ssthresh = the halved cwnd, then reset the dup count —
+// no fast-retransmit / fast-recovery segment resend at this landing
+// (the brief asks for the cwnd/ssthresh shape, not RFC 5681 in full).
+//
+// -----------------------------------------------------------------------------
+// Reserved-label discipline: `tcp_` prefix throughout, module-local
+// labels further prefixed per function (tcpc_ checksum, tcpb_ build,
+// tfte_/tftl_ find, tss_ send_segment, trh_ rx_handle, tpsg_ process_
+// segment, tap_ accept_pending, tcl_ close, trxm_ retransmit).
+//
+// paideia-as encoder-gap posture (v0.22.x, matches net/udp.pdx):
+//   G1: byte/word stores route via mov_b / mov_w.
+//   G6: [reg+imm] addressing only.
+
+module Tcp = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  pub let TCP_HDR_LEN         : u64 = 20
+  pub let TCP_PROTO           : u64 = 6            // IPv4 protocol number
+  pub let TCP_PORT_ECHO       : u64 = 7            // RFC 862, mirrors udp.pdx
+
+  // 11-state machine (R72.M1-001, #1923).
+  pub let TCP_ST_CLOSED       : u64 = 0
+  pub let TCP_ST_LISTEN       : u64 = 1
+  pub let TCP_ST_SYN_SENT     : u64 = 2
+  pub let TCP_ST_SYN_RCVD     : u64 = 3
+  pub let TCP_ST_ESTABLISHED  : u64 = 4
+  pub let TCP_ST_FIN_WAIT_1   : u64 = 5
+  pub let TCP_ST_FIN_WAIT_2   : u64 = 6
+  pub let TCP_ST_CLOSE_WAIT   : u64 = 7
+  pub let TCP_ST_CLOSING      : u64 = 8
+  pub let TCP_ST_LAST_ACK     : u64 = 9
+  pub let TCP_ST_TIME_WAIT    : u64 = 10
+
+  // TCP flag bits (header byte 13).
+  pub let TCP_FLAG_FIN : u64 = 0x01
+  pub let TCP_FLAG_SYN : u64 = 0x02
+  pub let TCP_FLAG_RST : u64 = 0x04
+  pub let TCP_FLAG_PSH : u64 = 0x08
+  pub let TCP_FLAG_ACK : u64 = 0x10
+  pub let TCP_FLAG_URG : u64 = 0x20
+
+  pub let TCP_TCB_MAX      : u64 = 64
+  pub let TCP_TCB_SIZE     : u64 = 512
+  pub let TCP_BUF_SIZE     : u64 = 4096
+  pub let TCP_MSS_DEFAULT  : u64 = 536
+  pub let TCP_RTO_TICKS    : u64 = 100     // ~1s at the ~100 Hz LAPIC period
+  pub let TCP_NONE         : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // Return codes for tcp_rx_handle (mirrors udp_rx_handle/ipv4_rx_handle
+  // discipline).
+  pub let TCP_RX_OK              : u64 = 0
+  pub let TCP_RX_ERR_MALFORMED   : u64 = 1
+  pub let TCP_RX_DROP_NO_SOCKET  : u64 = 2
+
+  // ============================================================================
+  // .bss — TCB pool + per-TCB RX/TX buffers + scratch + counters
+  // ============================================================================
+
+  pub let mut _tcp_tcb_table      : [u8; 32768]  = uninit @align(8)   // 64 * 512
+  pub let mut _tcp_rx_buf_table   : [u8; 262144] = uninit @align(8)   // 64 * 4096
+  pub let mut _tcp_tx_buf_table   : [u8; 262144] = uninit @align(8)   // 64 * 4096 (reserved; see header note)
+  pub let mut _tcp_tx_scratch     : [u8; 2048]   = uninit @align(8)
+
+  pub let mut _tcp_next_iss             : u64 = 0x10000000
+  pub let mut _tcp_next_ephemeral_port  : u64 = 40000
+
+  pub let mut _tcp_rx_pkts        : u64 = 0
+  pub let mut _tcp_rx_bad_hdr     : u64 = 0
+  pub let mut _tcp_rx_no_socket   : u64 = 0
+  pub let mut _tcp_tx_pkts        : u64 = 0
+  pub let mut _tcp_retransmits    : u64 = 0
+
+  // ============================================================================
+  // tcp_tcb_ptr(tcb_idx) -> row pointer. Pure leaf; exported for
+  // net/tcp_socket.pdx and any external caller. Internal tcp.pdx
+  // functions that need a SECOND live row pointer alongside one already
+  // held across a `call` inline this arithmetic themselves instead of
+  // calling out, to avoid caller-save clobber hazards across a real
+  // call boundary — see tcp_accept_pending / tcp_rx_handle for the
+  // inlined form.
+  // ============================================================================
+
+  pub let tcp_tcb_ptr : (u64) -> u64 !{} @{} =
+    fn (tcb_idx: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R72.M1-001 (#1923): tcb_idx -> &_tcp_tcb_table[tcb_idx*512]. Pure arithmetic leaf (shl 9 == *512; lea rip-relative table base; add) -- no memory touched, no capabilities exercised. rax/rcx caller-save scratch only; no prologue needed.",
+      block: {
+        mov rax, rdi;
+        shl rax, 9;
+        lea rcx, [rip + _tcp_tcb_table];
+        add rax, rcx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_alloc_tcb() -> tcb_idx | TCP_NONE
+  // ============================================================================
+
+  pub let tcp_alloc_tcb : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R72.M1-001 (#1923): linear scan of the 64-entry TCB pool for in_use==0 (offset +168). On a hit, zero the full 512-byte row (64 x 8-byte stores) before stamping defaults, so no field from a prior connection on this slot can leak into the new one -- the same 'zero before reuse' posture cap_mint_write's slab discipline documents elsewhere in this tree. Defaults stamped: in_use=1, backlog_pending_tcb=TCP_NONE, mss=536, cwnd=536 (1 MSS, slow-start floor), ssthresh=0xFFFF (effectively unbounded until a real loss event), rcv_wnd=4096 (fixed advertised window; no per-buffer-occupancy flow control at MVP). Leaf: no nested calls, rax/rcx/rdx/r8/r9/r10 caller-save scratch only, no prologue.",
+      block: {
+        xor rcx, rcx;
+        lea rax, [rip + _tcp_tcb_table];
+
+      tcp_alloc_scan:
+        cmp rcx, 64;
+        jae tcp_alloc_none;
+        mov rdx, rcx;
+        shl rdx, 9;
+        mov r8, [rax + rdx + 168];
+        cmp r8, 0;
+        je tcp_alloc_found;
+        add rcx, 1;
+        jmp tcp_alloc_scan;
+
+      tcp_alloc_found:
+        mov r9, rax;
+        add r9, rdx;                 // r9 = row base
+
+        xor rax, rax;
+        xor r10, r10;
+      tcp_alloc_zero:
+        cmp r10, 512;
+        jae tcp_alloc_zero_done;
+        mov [r9 + r10], rax;
+        add r10, 8;
+        jmp tcp_alloc_zero;
+
+      tcp_alloc_zero_done:
+        mov rax, 1;
+        mov [r9 + 168], rax;              // in_use
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        mov [r9 + 152], rax;              // backlog_pending_tcb = NONE
+        mov rax, 536;
+        mov [r9 + 200], rax;              // mss
+        mov [r9 + 96], rax;               // cwnd = 1 MSS
+        mov rax, 0xFFFF;
+        mov [r9 + 104], rax;              // ssthresh
+        mov rax, 4096;
+        mov [r9 + 72], rax;               // rcv_wnd
+        mov rax, rcx;                     // return idx
+        ret;
+
+      tcp_alloc_none:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_free_tcb(tcb_idx) -> ()
+  // ============================================================================
+
+  pub let tcp_free_tcb : (u64) -> () !{mem} @{} =
+    fn (tcb_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R72.M1-001 (#1923): clear in_use and state for tcb_idx, returning the row to tcp_alloc_tcb's free scan. Does not zero the full row here (tcp_alloc_tcb zeroes on (re)allocation instead) -- avoids a double zero-pass on the common close-then-reuse path. Leaf.",
+      block: {
+        mov rax, rdi;
+        shl rax, 9;
+        lea rcx, [rip + _tcp_tcb_table];
+        add rcx, rax;
+        xor rax, rax;
+        mov [rcx + 168], rax;
+        mov [rcx + 0], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_find_tcb_established(local_port, remote_ip_ptr, remote_port)
+  //   -> tcb_idx | TCP_NONE
+  // ============================================================================
+  //
+  // Matches the 4-tuple (local_port, remote_ip, remote_port) against
+  // every in-use TCB whose state is neither CLOSED nor LISTEN.
+
+  pub let tcp_find_tcb_established : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (local_port: u64, remote_ip_ptr: u64, remote_port: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R72.M1-001 (#1923): linear 4-tuple scan (local_port @+8, remote_port @+16, remote_ip 4 bytes @+32) over in-use, non-CLOSED, non-LISTEN TCBs. 4-push callee-save (rbx=local_port, r12=remote_ip_ptr, r13=remote_port, r14=idx); leaf (no nested calls) so alignment is unconstrained, pushes kept for register-budget clarity matching the sibling find function. Reserved labels: tfte_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+        mov r13, rdx;
+        xor r14, r14;
+        lea rax, [rip + _tcp_tcb_table];
+
+      tfte_scan:
+        cmp r14, 64;
+        jae tfte_none;
+        mov rcx, r14;
+        shl rcx, 9;
+        mov rdx, rax;
+        add rdx, rcx;                    // row ptr
+
+        mov r8, [rdx + 168];
+        cmp r8, 0;
+        je tfte_next;
+        mov r8, [rdx + 0];
+        cmp r8, 0;
+        je tfte_next;                    // CLOSED
+        cmp r8, 1;
+        je tfte_next;                    // LISTEN
+        mov r8, [rdx + 8];
+        cmp r8, rbx;
+        jne tfte_next;
+        mov r8, [rdx + 16];
+        cmp r8, r13;
+        jne tfte_next;
+
+        xor r9, r9; mov_b r9, [rdx + 32]; xor r10, r10; mov_b r10, [r12 + 0]; cmp r9, r10; jne tfte_next;
+        xor r9, r9; mov_b r9, [rdx + 33]; xor r10, r10; mov_b r10, [r12 + 1]; cmp r9, r10; jne tfte_next;
+        xor r9, r9; mov_b r9, [rdx + 34]; xor r10, r10; mov_b r10, [r12 + 2]; cmp r9, r10; jne tfte_next;
+        xor r9, r9; mov_b r9, [rdx + 35]; xor r10, r10; mov_b r10, [r12 + 3]; cmp r9, r10; jne tfte_next;
+
+        mov rax, r14;
+        jmp tfte_done;
+
+      tfte_next:
+        add r14, 1;
+        jmp tfte_scan;
+
+      tfte_none:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+
+      tfte_done:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_find_tcb_listen(local_port) -> tcb_idx | TCP_NONE
+  // ============================================================================
+
+  pub let tcp_find_tcb_listen : (u64) -> u64 !{mem} @{} =
+    fn (local_port: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R72.M1-001 (#1923): linear scan for an in-use TCB in LISTEN (state==1) whose local_port (@+8) matches. Leaf; rax/rcx/rdx/r8 caller-save scratch, rbx one push for the argument (kept across the scan). Reserved labels: tftl_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+        xor rcx, rcx;
+        lea rax, [rip + _tcp_tcb_table];
+
+      tftl_scan:
+        cmp rcx, 64;
+        jae tftl_none;
+        mov rdx, rcx;
+        shl rdx, 9;
+        mov r8, rax;
+        add r8, rdx;
+        mov r9, [r8 + 168];
+        cmp r9, 0;
+        je tftl_next;
+        mov r9, [r8 + 0];
+        cmp r9, 1;
+        jne tftl_next;
+        mov r9, [r8 + 8];
+        cmp r9, rbx;
+        jne tftl_next;
+        mov rax, rcx;
+        jmp tftl_done;
+
+      tftl_next:
+        add rcx, 1;
+        jmp tftl_scan;
+
+      tftl_none:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+
+      tftl_done:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_next_iss() / tcp_next_ephemeral_port() -> u64
+  // ============================================================================
+  //
+  // Monotonically-increasing counters. NOT cryptographically random —
+  // real TCP ISN randomization and SYN cookies (RFC 4987) are
+  // deliberately deferred per the round brief; this satisfies only "a
+  // monotonically-increasing local ISN" and gives every connection a
+  // distinct starting sequence number, which is all the MVP state
+  // machine needs to avoid seq-number collisions across successive
+  // connections in one boot.
+
+  pub let tcp_next_iss : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R72.M1-002 (#1924): monotonic ISN counter, stride 0x10000 per call. SYN-cookie stateless-SYN-defense (RFC 4987) is explicitly deferred -- this is a plain incrementing counter, not a hash of connection identity + time, so it carries none of a cookie's replay/spoof resistance. Documented here rather than silently omitted. Leaf.",
+      block: {
+        mov rax, [rip + _tcp_next_iss];
+        mov rcx, rax;
+        add rcx, 0x10000;
+        mov [rip + _tcp_next_iss], rcx;
+        ret
+      }
+    }
+
+  pub let tcp_next_ephemeral_port : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R72.M1-005 (#1927): monotonic ephemeral local-port counter for sys_connect callers that did not sys_bind first. Starts at 40000; no wraparound handling or reuse check at MVP (a boot exhausting 25000+ ephemeral ports is out of scope for this round's smoke). Leaf.",
+      block: {
+        mov rax, [rip + _tcp_next_ephemeral_port];
+        mov rcx, rax;
+        add rcx, 1;
+        mov [rip + _tcp_next_ephemeral_port], rcx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_checksum(src_ip_ptr, dst_ip_ptr, tcp_pkt_pa, tcp_len) -> u64
+  // ============================================================================
+  //
+  // Ones-complement 16-bit sum over the IPv4 pseudo-header (src_ip[4] +
+  // dst_ip[4] + zero + proto=6 + tcp_len) + the TCP segment (header +
+  // payload). Structural copy of udp_checksum (net/udp.pdx) with the
+  // protocol constant changed 17 -> 6 — the pseudo-header shape is
+  // identical per RFC 793 §3.1 / RFC 768.
+
+  pub let tcp_checksum : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (src_ip: u64, dst_ip: u64, tcp_pkt_pa: u64, tcp_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R72.M1-001 (#1923): TCP pseudo-header + segment ones-complement checksum. Structural copy of net/udp.pdx's udp_checksum with protocol word4 changed from 17 (UDP) to 6 (TCP) -- the RFC 793 pseudo-header (src_ip[4] + dst_ip[4] + zero + protocol + tcp_len) has the identical 12-byte shape RFC 768's UDP pseudo-header does. 5-push callee-save (rbx=src_ip, rbp=dst_ip, r12=tcp_pkt_pa, r13=tcp_len, r14=sum accumulator); leaf beyond the fold loop. Reserved labels: tcpc_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+        mov r12, rdx;
+        mov r13, rcx;
+        xor r14, r14;
+
+        xor rax, rax; mov_b rax, [rbx + 0]; shl rax, 8; xor r10, r10; mov_b r10, [rbx + 1]; or rax, r10; add r14, rax;
+        xor rax, rax; mov_b rax, [rbx + 2]; shl rax, 8; xor r10, r10; mov_b r10, [rbx + 3]; or rax, r10; add r14, rax;
+        xor rax, rax; mov_b rax, [rbp + 0]; shl rax, 8; xor r10, r10; mov_b r10, [rbp + 1]; or rax, r10; add r14, rax;
+        xor rax, rax; mov_b rax, [rbp + 2]; shl rax, 8; xor r10, r10; mov_b r10, [rbp + 3]; or rax, r10; add r14, rax;
+
+        mov rax, 6;                              // protocol = TCP
+        add r14, rax;
+
+        mov rax, r13;
+        and rax, 0xFFFF;
+        add r14, rax;
+
+        xor rcx, rcx;
+
+      tcpc_pair:
+        mov rax, r13;
+        sub rax, rcx;
+        cmp rax, 2;
+        jb tcpc_tail;
+
+        mov rdx, r12;
+        add rdx, rcx;
+        xor rax, rax; mov_b rax, [rdx + 0]; shl rax, 8;
+        xor r10, r10; mov_b r10, [rdx + 1]; or rax, r10;
+        add r14, rax;
+        add rcx, 2;
+        jmp tcpc_pair;
+
+      tcpc_tail:
+        mov rax, r13;
+        sub rax, rcx;
+        cmp rax, 0;
+        je tcpc_fold;
+
+        mov rdx, r12;
+        add rdx, rcx;
+        xor rax, rax; mov_b rax, [rdx + 0]; shl rax, 8;
+        add r14, rax;
+
+      tcpc_fold:
+        mov rax, r14;
+        shr rax, 16;
+        cmp rax, 0;
+        je tcpc_done;
+        mov rcx, r14;
+        and rcx, 0xFFFF;
+        add rcx, rax;
+        mov r14, rcx;
+        jmp tcpc_fold;
+
+      tcpc_done:
+        mov rax, r14;
+        xor rax, 0xFFFF;
+
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_build_header(out_pa, src_port, dst_port, seq, ack, flags_win) -> 20
+  // ============================================================================
+  //
+  // flags_win packs two fields into one u64 arg to keep the call at 6
+  // SysV registers: bits [7:0] = flags, bits [23:8] = advertised window.
+  // No TCP options are emitted (data offset fixed at 5 words / 20 bytes)
+  // — MSS-option negotiation is deferred; every TCB uses TCP_MSS_DEFAULT.
+  // Checksum field is written 0 here; the caller (tcp_send_segment)
+  // computes the real checksum over header+payload afterward and
+  // patches bytes 16..17 directly, since the checksum depends on
+  // payload bytes not yet copied at header-build time.
+
+  pub let tcp_build_header : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (out_pa: u64, src_port: u64, dst_port: u64, seq: u64, ack: u64,
+        flags_win: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R72.M1-001 (#1923): write a 20-byte TCP header (no options; data offset fixed 0x50). flags_win packs flags (bits[7:0]) + advertised window (bits[23:8]) into one arg so the call fits SysV's 6-register limit. Checksum @+16..+17 written 0 -- the real checksum needs the payload bytes tcp_send_segment copies in AFTER this call, so it patches those two bytes itself once the full segment is assembled. 6-push callee-save (rbx=out_pa, rbp=src_port, r12=dst_port, r13=seq, r14=ack, r15=flags_win); leaf, no nested calls. Reserved labels: tcpb_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+        mov r12, rdx;
+        mov r13, rcx;
+        mov r14, r8;
+        mov r15, r9;
+
+        mov rax, rbp; shr rax, 8;  and rax, 0xFF; mov_b [rbx + 0], rax;
+        mov rax, rbp; and rax, 0xFF;              mov_b [rbx + 1], rax;
+
+        mov rax, r12; shr rax, 8;  and rax, 0xFF; mov_b [rbx + 2], rax;
+        mov rax, r12; and rax, 0xFF;              mov_b [rbx + 3], rax;
+
+        mov rax, r13; shr rax, 24; and rax, 0xFF; mov_b [rbx + 4], rax;
+        mov rax, r13; shr rax, 16; and rax, 0xFF; mov_b [rbx + 5], rax;
+        mov rax, r13; shr rax, 8;  and rax, 0xFF; mov_b [rbx + 6], rax;
+        mov rax, r13; and rax, 0xFF;              mov_b [rbx + 7], rax;
+
+        mov rax, r14; shr rax, 24; and rax, 0xFF; mov_b [rbx + 8],  rax;
+        mov rax, r14; shr rax, 16; and rax, 0xFF; mov_b [rbx + 9],  rax;
+        mov rax, r14; shr rax, 8;  and rax, 0xFF; mov_b [rbx + 10], rax;
+        mov rax, r14; and rax, 0xFF;              mov_b [rbx + 11], rax;
+
+        mov rax, 0x50;
+        mov_b [rbx + 12], rax;
+
+        mov rax, r15; and rax, 0xFF;
+        mov_b [rbx + 13], rax;
+
+        mov rax, r15; shr rax, 16; and rax, 0xFF; mov_b [rbx + 14], rax;   // window hi
+        mov rax, r15; shr rax, 8;  and rax, 0xFF; mov_b [rbx + 15], rax;   // window lo
+
+        xor rax, rax;
+        mov_b [rbx + 16], rax;
+        mov_b [rbx + 17], rax;
+        mov_b [rbx + 18], rax;
+        mov_b [rbx + 19], rax;
+
+        mov rax, 20;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_send_segment(tcb_idx, flags, payload_pa, payload_len) -> u64
+  // ============================================================================
+  //
+  // Builds and transmits one segment for tcb_idx: seq = current snd_nxt,
+  // ack = current rcv_nxt, window = fixed 4096. Advances snd_nxt by
+  // payload_len + 1 (if SYN) + 1 (if FIN), records the retransmit replay
+  // fields, arms the single RTO timer, then dispatches via the loopback
+  // fast path (remote_ip == local_ip) or ipv4_tx_send otherwise.
+
+  pub let tcp_send_segment : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (tcb_idx: u64, flags: u64, payload_pa: u64, payload_len: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "R72.M1-002/003 (#1924/#1925): build one TCP segment from tcb_idx's current snd_nxt/rcv_nxt, patch its checksum, advance snd_nxt by the seq-space this segment consumes, record retransmit-replay bookkeeping (last_seg_seq/len/flags + rto_deadline = _tick_count + TCP_RTO_TICKS), then dispatch via the loopback fast path (local_ip==remote_ip -> direct tcp_rx_handle call, bypassing ipv4_tx_send/e1000e entirely -- see module header) or ipv4_tx_send otherwise. 6-push callee-save (rbx=tcb_idx, rbp=tcb_ptr, r12=flags, r13=payload_pa, r14=payload_len, r15=seq_used) + sub rsp,8 pad -- 48+8=56; entry rsp%16==8 -> 64, %16==0 for the nested tcp_build_header/tcp_checksum/tcp_rx_handle/ipv4_tx_send calls. All four incoming args are copied into callee-save registers BEFORE the first nested call so none are lost to a callee's caller-save clobber. Reserved labels: tss_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                        // tcb_idx
+        mov r12, rsi; and r12, 0xFF;         // flags
+        mov r13, rdx;                        // payload_pa
+        mov r14, rcx;                        // payload_len
+
+        mov rax, rbx; shl rax, 9; lea r9, [rip + _tcp_tcb_table]; add rax, r9;
+        mov rbp, rax;                        // tcb_ptr
+        mov r15, [rbp + 48];                 // seq_used = snd_nxt
+
+        // Build header.
+        lea rdi, [rip + _tcp_tx_scratch];
+        mov rsi, [rbp + 8];                  // local_port
+        mov rdx, [rbp + 16];                 // remote_port
+        mov rcx, r15;                        // seq
+        mov r8, [rbp + 64];                  // ack = rcv_nxt
+        mov rax, 4096; shl rax, 8; or rax, r12;
+        mov r9, rax;                          // flags_win
+        call tcp_build_header;
+
+        // Copy payload if any.
+        cmp r14, 0;
+        je tss_no_payload;
+        lea rdi, [rip + _tcp_tx_scratch];
+        add rdi, 20;
+        mov rsi, r13;
+        mov rcx, r14;
+        cld;
+        rep_movsb;
+      tss_no_payload:
+
+        // Compute checksum over the whole segment; patch bytes 16/17.
+        lea rdi, [rbp + 24];
+        lea rsi, [rbp + 32];
+        lea rdx, [rip + _tcp_tx_scratch];
+        mov rcx, r14; add rcx, 20;
+        call tcp_checksum;
+        mov rcx, rax; shr rcx, 8; and rcx, 0xFF;
+        lea rdx, [rip + _tcp_tx_scratch];
+        mov_b [rdx + 16], rcx;
+        mov rcx, rax; and rcx, 0xFF;
+        mov_b [rdx + 17], rcx;
+
+        // Consumed seq-space: payload_len + SYN(1) + FIN(1).
+        mov rax, r14;
+        mov rcx, r12; and rcx, 0x02; cmp rcx, 0; je tss_no_syn_bump;
+        add rax, 1;
+      tss_no_syn_bump:
+        mov rcx, r12; and rcx, 0x01; cmp rcx, 0; je tss_no_fin_bump;
+        add rax, 1;
+      tss_no_fin_bump:
+        mov rcx, r15; add rcx, rax; mov [rbp + 48], rcx;   // snd_nxt += consumed
+        mov [rbp + 128], r15;                              // last_seg_seq
+        mov [rbp + 136], rax;                              // last_seg_len
+        mov rcx, r12; mov [rbp + 144], rcx;                // last_seg_flags
+
+        mov rax, [rip + _tick_count];
+        add rax, 100;
+        mov [rbp + 120], rax;                              // rto_deadline
+
+        // Loopback vs wire.
+        xor rax, rax; mov_b rax, [rbp + 24]; xor rcx, rcx; mov_b rcx, [rbp + 32]; cmp rax, rcx; jne tss_wire;
+        xor rax, rax; mov_b rax, [rbp + 25]; xor rcx, rcx; mov_b rcx, [rbp + 33]; cmp rax, rcx; jne tss_wire;
+        xor rax, rax; mov_b rax, [rbp + 26]; xor rcx, rcx; mov_b rcx, [rbp + 34]; cmp rax, rcx; jne tss_wire;
+        xor rax, rax; mov_b rax, [rbp + 27]; xor rcx, rcx; mov_b rcx, [rbp + 35]; cmp rax, rcx; jne tss_wire;
+
+        lea rdi, [rip + _tcp_tx_scratch];
+        mov rsi, r14; add rsi, 20;
+        lea rdx, [rbp + 24];
+        lea rcx, [rbp + 24];
+        call tcp_rx_handle;
+        jmp tss_done;
+
+      tss_wire:
+        mov rdi, [rip + _e1000e_devices + 8];
+        lea rsi, [rip + _e1000e_tx_ring];
+        mov rdx, 6;
+        lea rcx, [rbp + 32];
+        lea r8, [rip + _tcp_tx_scratch];
+        mov r9, r14; add r9, 20;
+        call ipv4_tx_send;
+
+      tss_done:
+        mov rax, [rip + _tcp_tx_pkts];
+        add rax, 1;
+        mov [rip + _tcp_tx_pkts], rax;
+        xor rax, rax;
+
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_retransmit_last(tcb_idx) -> u64
+  // ============================================================================
+  //
+  // Replays last_seg_seq/last_seg_flags with a ZERO-length payload — a
+  // faithful retransmit for control segments (SYN, SYN|ACK, ACK, FIN)
+  // and a best-effort re-probe (not a real recovery) for a segment that
+  // originally carried data, since the sent bytes are not cached (see
+  // the module header's Retransmit honesty note). Does NOT advance
+  // snd_nxt (this is a REtransmit, not a new segment).
+
+  pub let tcp_retransmit_last : (u64) -> u64 !{sysreg, mem} @{} =
+    fn (tcb_idx: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "R72.M1-003 (#1925): replay the last-sent segment's seq + flags with zero payload, WITHOUT advancing snd_nxt (a retransmit resends already-numbered seq-space, it does not claim new seq-space). Builds the segment directly against last_seg_seq/last_seg_flags rather than calling tcp_send_segment (which always reads CURRENT snd_nxt and always advances it) -- the two functions share the build/checksum/dispatch shape but differ in exactly this one respect, so they are kept as separate bodies rather than one parameterized over 'advance or not' with a bool nobody could read at the call site. Only correct for zero-payload control segments per the module header's honesty note. 6-push callee-save (rbx=tcb_idx, rbp=tcb_ptr, r12=last_seg_flags, r13=last_seg_seq) + sub rsp,8. Reserved labels: trxm_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+        mov rax, rbx; shl rax, 9; lea r9, [rip + _tcp_tcb_table]; add rax, r9;
+        mov rbp, rax;
+        mov r12, [rbp + 144];                // last_seg_flags
+        mov r13, [rbp + 128];                // last_seg_seq
+
+        lea rdi, [rip + _tcp_tx_scratch];
+        mov rsi, [rbp + 8];
+        mov rdx, [rbp + 16];
+        mov rcx, r13;
+        mov r8, [rbp + 64];
+        mov rax, 4096; shl rax, 8; or rax, r12;
+        mov r9, rax;
+        call tcp_build_header;
+
+        lea rdi, [rbp + 24];
+        lea rsi, [rbp + 32];
+        lea rdx, [rip + _tcp_tx_scratch];
+        mov rcx, 20;
+        call tcp_checksum;
+        mov rcx, rax; shr rcx, 8; and rcx, 0xFF;
+        lea rdx, [rip + _tcp_tx_scratch];
+        mov_b [rdx + 16], rcx;
+        mov rcx, rax; and rcx, 0xFF;
+        mov_b [rdx + 17], rcx;
+
+        mov rax, [rip + _tick_count];
+        add rax, 100;
+        mov [rbp + 120], rax;
+
+        xor rax, rax; mov_b rax, [rbp + 24]; xor rcx, rcx; mov_b rcx, [rbp + 32]; cmp rax, rcx; jne trxm_wire;
+        xor rax, rax; mov_b rax, [rbp + 25]; xor rcx, rcx; mov_b rcx, [rbp + 33]; cmp rax, rcx; jne trxm_wire;
+        xor rax, rax; mov_b rax, [rbp + 26]; xor rcx, rcx; mov_b rcx, [rbp + 34]; cmp rax, rcx; jne trxm_wire;
+        xor rax, rax; mov_b rax, [rbp + 27]; xor rcx, rcx; mov_b rcx, [rbp + 35]; cmp rax, rcx; jne trxm_wire;
+
+        lea rdi, [rip + _tcp_tx_scratch];
+        mov rsi, 20;
+        lea rdx, [rbp + 24];
+        lea rcx, [rbp + 24];
+        call tcp_rx_handle;
+        jmp trxm_done;
+
+      trxm_wire:
+        mov rdi, [rip + _e1000e_devices + 8];
+        lea rsi, [rip + _e1000e_tx_ring];
+        mov rdx, 6;
+        lea rcx, [rbp + 32];
+        lea r8, [rip + _tcp_tx_scratch];
+        mov r9, 20;
+        call ipv4_tx_send;
+
+      trxm_done:
+        mov rax, [rip + _tcp_retransmits];
+        add rax, 1;
+        mov [rip + _tcp_retransmits], rax;
+        xor rax, rax;
+
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_poll_retransmits() -> ()
+  // ============================================================================
+  //
+  // Scans all 64 TCBs; any in a state with outstanding unacked seq-space
+  // (snd_una < snd_nxt) whose rto_deadline has passed gets replayed via
+  // tcp_retransmit_last, with a slow-start-restart cwnd/ssthresh cut
+  // (ssthresh = max(cwnd/2, mss), cwnd = 1 MSS). NOT wired to a periodic
+  // caller at this landing — see the module header's Retransmit honesty
+  // note for why and where a future round wires it in.
+
+  pub let tcp_poll_retransmits : () -> () !{sysreg, mem} @{} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "R72.M1-003/004 (#1925/#1926): sweep the 64-entry TCB pool for an overdue single-shot RTO (rto_deadline <= _tick_count) on a TCB with outstanding unacked data (snd_una != snd_nxt), retransmit via tcp_retransmit_last, and apply the slow-start-restart cwnd/ssthresh cut (ssthresh = max(cwnd/2, mss); cwnd = mss) that RFC 5681 §4.1 prescribes after a retransmit timeout. Not wired to any periodic caller yet (see module header). 4-push callee-save (rbx=idx, rbp=now, r12=table base) + sub rsp,8 for the nested tcp_retransmit_last call. Reserved labels: tpr_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        sub rsp, 8;
+
+        mov rbp, [rip + _tick_count];
+        lea r12, [rip + _tcp_tcb_table];
+        xor rbx, rbx;
+
+      tpr_scan:
+        cmp rbx, 64;
+        jae tpr_done;
+
+        mov rax, rbx; shl rax, 9;
+        mov r13, r12; add r13, rax;         // row ptr
+
+        mov rcx, [r13 + 168];
+        cmp rcx, 0;
+        je tpr_next;
+        mov rcx, [r13 + 40];                // snd_una
+        mov rdx, [r13 + 48];                // snd_nxt
+        cmp rcx, rdx;
+        je tpr_next;                        // nothing outstanding
+        mov rcx, [r13 + 120];               // rto_deadline
+        cmp rbp, rcx;
+        jb tpr_next;                        // not yet due
+
+        mov rdi, rbx;
+        call tcp_retransmit_last;
+
+        mov rax, [r13 + 96];                // cwnd
+        mov rcx, [r13 + 200];               // mss
+        mov rdx, rax; shr rdx, 1;
+        cmp rdx, rcx;
+        jae tpr_ssthresh_store;
+        mov rdx, rcx;
+      tpr_ssthresh_store:
+        mov [r13 + 104], rdx;               // ssthresh
+        mov [r13 + 96], rcx;                // cwnd = 1 MSS
+
+      tpr_next:
+        add rbx, 1;
+        jmp tpr_scan;
+
+      tpr_done:
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_rx_handle(pkt_pa, pkt_len, src_ip_ptr, dst_ip_ptr) -> u64
+  // ============================================================================
+  //
+  // Entry point matching ipv4_rx_handle's udp_rx_handle/icmp_rx_handle
+  // calling convention: pkt_pa points at the TCP header (frame_pa + 14 +
+  // 20 for a real wire frame, or _tcp_tx_scratch for the loopback fast
+  // path), pkt_len is the TCP header+payload length, src_ip_ptr/
+  // dst_ip_ptr point at 4-byte IPv4 addresses. Resolves the 4-tuple to
+  // an established TCB first, then to a LISTEN TCB (spawning a fresh
+  // child TCB + SYN|ACK reply on a bare SYN), else drops.
+
+  pub let tcp_rx_handle : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (pkt_pa: u64, pkt_len: u64, src_ip: u64, dst_ip: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "R72.M1-001/002 (#1923/#1924): TCP receive engine. Parses the 20-byte header in place (no scratch copy -- pkt_pa is kept live in a callee-save register and indexed directly), resolves the segment to a TCB via the established 4-tuple lookup first and the LISTEN local_port lookup second, and either dispatches to tcp_process_segment (established match) or spawns a fresh child TCB in SYN_RCVD + replies SYN|ACK (listener match on a bare SYN) or drops (no match, or a non-SYN segment addressed to a listener -- simultaneous-open is out of scope for this MVP). 6-push callee-save (rbx=pkt_pa, rbp=pkt_len UNTIL payload_len is computed and stored, then REPURPOSED as the freshly-allocated child TCB pointer in the listener branch -- pkt_len has no further use past that point; r12=src_ip_ptr, r13=dst_ip_ptr, r14=src_port, r15=dst_port) + `sub rsp,56` for seven 8-byte stack scratch slots (seq/ack/flags/payload_pa/payload_len/listener_idx/child_idx) -- 48+56=104; entry rsp%16==8 -> 112, %16==0 for the nested tcp_find_tcb_established/tcp_find_tcb_listen/tcp_alloc_tcb/tcp_next_iss/tcp_process_segment/tcp_send_segment calls. Two internal TCB-row-pointer computations (listener_ptr, child_ptr) are done via INLINE arithmetic rather than calling tcp_tcb_ptr, specifically to avoid the caller-save-register-clobbered-across-a-call hazard a second live pointer in a caller-save register would create. Reserved labels: trh_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 56;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+        mov r12, rdx;
+        mov r13, rcx;
+
+        cmp rbp, 20;
+        jb trh_malformed;
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + tag_l3_tcp];
+        call klog_s1;
+
+        xor rax, rax; mov_b rax, [rbx + 0]; shl rax, 8; xor rcx, rcx; mov_b rcx, [rbx + 1]; or rax, rcx; mov r14, rax;
+        xor rax, rax; mov_b rax, [rbx + 2]; shl rax, 8; xor rcx, rcx; mov_b rcx, [rbx + 3]; or rax, rcx; mov r15, rax;
+
+        xor rax, rax; mov_b rax, [rbx + 4]; shl rax, 24;
+        xor rcx, rcx; mov_b rcx, [rbx + 5]; shl rcx, 16; or rax, rcx;
+        xor rcx, rcx; mov_b rcx, [rbx + 6]; shl rcx, 8;  or rax, rcx;
+        xor rcx, rcx; mov_b rcx, [rbx + 7];               or rax, rcx;
+        mov [rsp + 0], rax;
+
+        xor rax, rax; mov_b rax, [rbx + 8]; shl rax, 24;
+        xor rcx, rcx; mov_b rcx, [rbx + 9]; shl rcx, 16; or rax, rcx;
+        xor rcx, rcx; mov_b rcx, [rbx + 10]; shl rcx, 8; or rax, rcx;
+        xor rcx, rcx; mov_b rcx, [rbx + 11];              or rax, rcx;
+        mov [rsp + 8], rax;
+
+        xor rax, rax; mov_b rax, [rbx + 12]; shr rax, 4; shl rax, 2;
+        mov rcx, rax;                        // rcx = hdr_len
+
+        cmp rcx, rbp;
+        ja trh_malformed;
+
+        xor rax, rax; mov_b rax, [rbx + 13]; and rax, 0x3F;
+        mov [rsp + 16], rax;
+
+        mov rax, rbx; add rax, rcx; mov [rsp + 24], rax;
+        mov rax, rbp; sub rax, rcx; mov [rsp + 32], rax;
+
+        mov rdi, r15;
+        mov rsi, r12;
+        mov rdx, r14;
+        call tcp_find_tcb_established;
+        cmp rax, 0xFFFFFFFFFFFFFFFF;
+        jne trh_established_found;
+
+        mov rdi, r15;
+        call tcp_find_tcb_listen;
+        cmp rax, 0xFFFFFFFFFFFFFFFF;
+        je trh_no_socket;
+
+        mov [rsp + 40], rax;
+        mov rcx, [rsp + 16];
+        mov rdx, rcx; and rdx, 0x02; cmp rdx, 0; je trh_no_socket;
+        mov rdx, rcx; and rdx, 0x10; cmp rdx, 0; jne trh_no_socket;
+
+        call tcp_alloc_tcb;
+        cmp rax, 0xFFFFFFFFFFFFFFFF;
+        je trh_no_socket;
+        mov [rsp + 48], rax;
+
+        mov rax, [rsp + 48];
+        shl rax, 9;
+        lea rcx, [rip + _tcp_tcb_table];
+        add rax, rcx;
+        mov rbp, rax;                        // rbp REPURPOSED: child tcb_ptr
+
+        mov rax, r15; mov [rbp + 8], rax;
+        mov rax, r14; mov [rbp + 16], rax;
+
+        mov rax, r13;
+        xor rcx, rcx; mov_b rcx, [rax + 0]; mov_b [rbp + 24], rcx;
+        xor rcx, rcx; mov_b rcx, [rax + 1]; mov_b [rbp + 25], rcx;
+        xor rcx, rcx; mov_b rcx, [rax + 2]; mov_b [rbp + 26], rcx;
+        xor rcx, rcx; mov_b rcx, [rax + 3]; mov_b [rbp + 27], rcx;
+
+        mov rax, r12;
+        xor rcx, rcx; mov_b rcx, [rax + 0]; mov_b [rbp + 32], rcx;
+        xor rcx, rcx; mov_b rcx, [rax + 1]; mov_b [rbp + 33], rcx;
+        xor rcx, rcx; mov_b rcx, [rax + 2]; mov_b [rbp + 34], rcx;
+        xor rcx, rcx; mov_b rcx, [rax + 3]; mov_b [rbp + 35], rcx;
+
+        mov rax, [rsp + 0];
+        mov [rbp + 88], rax;
+        add rax, 1;
+        mov [rbp + 64], rax;
+
+        call tcp_next_iss;
+        mov [rbp + 80], rax;
+        mov [rbp + 40], rax;
+        mov [rbp + 48], rax;
+
+        mov rax, 3;
+        mov [rbp + 0], rax;
+        xor rax, rax;
+        mov [rbp + 160], rax;
+
+        mov rax, [rsp + 40];
+        shl rax, 9;
+        lea rcx, [rip + _tcp_tcb_table];
+        add rax, rcx;
+        mov rcx, [rsp + 48];
+        mov [rax + 152], rcx;
+
+        mov rdi, [rsp + 48];
+        mov rsi, 0x12;
+        xor rdx, rdx;
+        xor rcx, rcx;
+        call tcp_send_segment;
+
+        xor rax, rax;
+        jmp trh_done;
+
+      trh_established_found:
+        mov rdi, rax;
+        mov rsi, [rsp + 16];
+        mov rdx, [rsp + 0];
+        mov rcx, [rsp + 8];
+        mov r8, [rsp + 24];
+        mov r9, [rsp + 32];
+        call tcp_process_segment;
+        xor rax, rax;
+        jmp trh_done;
+
+      trh_no_socket:
+        mov rax, [rip + _tcp_rx_no_socket];
+        add rax, 1;
+        mov [rip + _tcp_rx_no_socket], rax;
+        mov rax, 2;
+        jmp trh_done;
+
+      trh_malformed:
+        mov rax, [rip + _tcp_rx_bad_hdr];
+        add rax, 1;
+        mov [rip + _tcp_rx_bad_hdr], rax;
+        mov rax, 1;
+        jmp trh_done;
+
+      trh_done:
+        mov rcx, [rip + _tcp_rx_pkts];
+        add rcx, 1;
+        mov [rip + _tcp_rx_pkts], rcx;
+
+        add rsp, 56;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_process_segment(tcb_idx, flags, seq, ack, payload_pa, payload_len)
+  //   -> u64
+  // ============================================================================
+  //
+  // The 11-state dispatch. tcb_idx already names a resolved, in-use TCB
+  // (tcp_rx_handle did the 4-tuple lookup); this function only advances
+  // that TCB's own state.
+
+  pub let tcp_process_segment : (u64, u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (tcb_idx: u64, flags: u64, seq: u64, ack: u64, payload_pa: u64,
+        payload_len: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "R72.M1-001/002/004 (#1923/#1924/#1926): the 11-state TCP dispatch. 6-push callee-save (rbx=tcb_idx, rbp=tcb_ptr, r12=flags, r13=seq, r14=ack, r15=payload_pa) + sub rsp,24 for three 8-byte stack slots ([rsp+0]=payload_len, [rsp+8]=FIN_WAIT_1's local fin_seen|ack_of_fin_seen bitmask, [rsp+16] reserved) -- 48+24=72; entry rsp%16==8 -> 80, %16==0 for the nested tcp_send_segment/tcp_free_tcb calls. Every piece of per-branch state that must survive a nested `call` lives in a callee-save register or one of these stack slots -- never in a caller-save scratch register (rax/rcx/rdx/r8-r11), which the fin_wait_1 branch's stack-slot bitmask specifically exists to avoid (an earlier draft used r10 for that bitmask and lost it across the ACK-of-FIN's own tcp_send_segment call). Reserved labels: tpsg_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 24;
+
+        mov rbx, rdi;
+        mov r12, rsi; and r12, 0xFF;
+        mov r13, rdx;
+        mov r14, rcx;
+        mov r15, r8;
+        mov [rsp + 0], r9;
+
+        mov rax, rbx; shl rax, 9; lea rcx, [rip + _tcp_tcb_table]; add rax, rcx;
+        mov rbp, rax;
+
+        mov rax, [rbp + 0];
+        cmp rax, 0; je tpsg_done;
+        cmp rax, 1; je tpsg_done;
+        cmp rax, 2; je tpsg_st_syn_sent;
+        cmp rax, 3; je tpsg_st_syn_rcvd;
+        cmp rax, 4; je tpsg_st_established;
+        cmp rax, 5; je tpsg_st_fin_wait1;
+        cmp rax, 6; je tpsg_st_fin_wait2;
+        cmp rax, 7; je tpsg_done;
+        cmp rax, 8; je tpsg_st_closing;
+        cmp rax, 9; je tpsg_st_last_ack;
+        jmp tpsg_done;
+
+      tpsg_st_syn_sent:
+        mov rax, r12; and rax, 0x12; cmp rax, 0x12; jne tpsg_done;
+        mov rax, [rbp + 48];
+        cmp r14, rax; jne tpsg_done;
+        mov [rbp + 88], r13;
+        mov rax, r13; add rax, 1; mov [rbp + 64], rax;
+        mov [rbp + 40], r14;
+        mov rax, 4; mov [rbp + 0], rax;
+        mov rdi, rbx; mov rsi, 0x10; xor rdx, rdx; xor rcx, rcx;
+        call tcp_send_segment;
+        jmp tpsg_done;
+
+      tpsg_st_syn_rcvd:
+        mov rax, r12; and rax, 0x10; cmp rax, 0; je tpsg_done;
+        mov rax, [rbp + 48];
+        cmp r14, rax; jne tpsg_done;
+        mov [rbp + 40], r14;
+        mov rax, 4; mov [rbp + 0], rax;
+        jmp tpsg_done;
+
+      tpsg_st_established:
+        mov rax, r12; and rax, 0x10; cmp rax, 0; je tpsg_est_no_ack;
+        mov rax, [rbp + 40];
+        cmp r14, rax; jbe tpsg_est_dup_or_stale;
+        mov [rbp + 40], r14;
+        xor rax, rax; mov [rbp + 112], rax;
+        mov rax, [rbp + 96]; mov rcx, [rbp + 104];
+        cmp rax, rcx; jae tpsg_est_ca;
+        mov rdx, [rbp + 200]; add rax, rdx; mov [rbp + 96], rax;
+        jmp tpsg_est_ack_done;
+      tpsg_est_ca:
+        mov rdx, [rbp + 200]; shr rdx, 3;
+        cmp rdx, 0; jne tpsg_est_ca_add;
+        mov rdx, 1;
+      tpsg_est_ca_add:
+        add rax, rdx; mov [rbp + 96], rax;
+        jmp tpsg_est_ack_done;
+      tpsg_est_dup_or_stale:
+        cmp r14, rax; jne tpsg_est_ack_done;
+        mov rax, [rbp + 112]; add rax, 1; mov [rbp + 112], rax;
+        cmp rax, 3; jb tpsg_est_ack_done;
+        mov rax, [rbp + 96]; mov rdx, rax; shr rdx, 1;
+        mov rcx, [rbp + 200]; cmp rdx, rcx; jae tpsg_est_halve_store;
+        mov rdx, rcx;
+      tpsg_est_halve_store:
+        mov [rbp + 96], rdx; mov [rbp + 104], rdx;
+        xor rax, rax; mov [rbp + 112], rax;
+      tpsg_est_ack_done:
+      tpsg_est_no_ack:
+
+        mov rax, [rsp + 0];
+        cmp rax, 0; je tpsg_est_no_data;
+        mov rcx, [rbp + 64];
+        cmp r13, rcx; jne tpsg_est_no_data;
+
+        mov rdx, [rbp + 184];
+        mov r8, rbx; shl r8, 12;
+        lea r9, [rip + _tcp_rx_buf_table];
+        add r9, r8;
+        add r9, rdx;
+        mov r8, rdx; add r8, rax; cmp r8, 4096; ja tpsg_est_no_data;
+
+        mov rdi, r9; mov rsi, r15; mov rcx, rax; cld; rep_movsb;
+
+        add rdx, rax; mov [rbp + 184], rdx;
+        mov rcx, [rbp + 64]; add rcx, rax; mov [rbp + 64], rcx;
+
+        mov rcx, [rbp + 8];
+        cmp rcx, 7; jne tpsg_est_ack_only;
+        mov rdi, rbx; mov rsi, 0x18; mov rdx, r15; mov rcx, rax;
+        call tcp_send_segment;
+        jmp tpsg_est_no_data;
+      tpsg_est_ack_only:
+        mov rdi, rbx; mov rsi, 0x10; xor rdx, rdx; xor rcx, rcx;
+        call tcp_send_segment;
+      tpsg_est_no_data:
+
+        mov rax, r12; and rax, 0x01; cmp rax, 0; je tpsg_done;
+        mov rax, [rbp + 64]; add rax, 1; mov [rbp + 64], rax;
+        mov rax, 7; mov [rbp + 0], rax;
+        mov rdi, rbx; mov rsi, 0x10; xor rdx, rdx; xor rcx, rcx;
+        call tcp_send_segment;
+        jmp tpsg_done;
+
+      tpsg_st_fin_wait1:
+        xor rax, rax; mov [rsp + 8], rax;
+
+        mov rax, r12; and rax, 0x01; cmp rax, 0; je tpsg_fw1_no_fin;
+        mov rax, [rbp + 64]; add rax, 1; mov [rbp + 64], rax;
+        mov rdi, rbx; mov rsi, 0x10; xor rdx, rdx; xor rcx, rcx;
+        call tcp_send_segment;
+        mov rax, [rsp + 8]; or rax, 1; mov [rsp + 8], rax;
+      tpsg_fw1_no_fin:
+        mov rax, r12; and rax, 0x10; cmp rax, 0; je tpsg_fw1_no_ack;
+        mov rax, [rbp + 48]; cmp r14, rax; jne tpsg_fw1_no_ack;
+        mov rax, [rsp + 8]; or rax, 2; mov [rsp + 8], rax;
+      tpsg_fw1_no_ack:
+        mov rax, [rsp + 8];
+        cmp rax, 3; jne tpsg_fw1_single;
+        mov rax, 10; mov [rbp + 0], rax;
+        mov rdi, rbx; call tcp_free_tcb;
+        jmp tpsg_done;
+      tpsg_fw1_single:
+        mov rax, [rsp + 8];
+        cmp rax, 2; jne tpsg_fw1_fin_only;
+        mov rax, 6; mov [rbp + 0], rax;
+        jmp tpsg_done;
+      tpsg_fw1_fin_only:
+        mov rax, [rsp + 8];
+        cmp rax, 1; jne tpsg_done;
+        mov rax, 8; mov [rbp + 0], rax;
+        jmp tpsg_done;
+
+      tpsg_st_fin_wait2:
+        mov rax, r12; and rax, 0x01; cmp rax, 0; je tpsg_done;
+        mov rax, [rbp + 64]; add rax, 1; mov [rbp + 64], rax;
+        mov rdi, rbx; mov rsi, 0x10; xor rdx, rdx; xor rcx, rcx;
+        call tcp_send_segment;
+        mov rax, 10; mov [rbp + 0], rax;
+        mov rdi, rbx; call tcp_free_tcb;
+        jmp tpsg_done;
+
+      tpsg_st_closing:
+        mov rax, r12; and rax, 0x10; cmp rax, 0; je tpsg_done;
+        mov rax, [rbp + 48]; cmp r14, rax; jne tpsg_done;
+        mov rax, 10; mov [rbp + 0], rax;
+        mov rdi, rbx; call tcp_free_tcb;
+        jmp tpsg_done;
+
+      tpsg_st_last_ack:
+        mov rax, r12; and rax, 0x10; cmp rax, 0; je tpsg_done;
+        mov rax, [rbp + 48]; cmp r14, rax; jne tpsg_done;
+        xor rax, rax; mov [rbp + 0], rax;
+        mov rdi, rbx; call tcp_free_tcb;
+        jmp tpsg_done;
+
+      tpsg_done:
+        xor rax, rax;
+        add rsp, 24;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_close(tcb_idx) -> u64
+  // ============================================================================
+  //
+  // Active-close driver: from ESTABLISHED sends FIN|ACK and moves to
+  // FIN_WAIT_1; from CLOSE_WAIT (a peer-initiated close the local side
+  // is now finishing) sends FIN|ACK and moves to LAST_ACK. Any other
+  // state is a no-op (already closing, or never opened).
+
+  pub let tcp_close : (u64) -> u64 !{sysreg, mem} @{} =
+    fn (tcb_idx: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "R72.M1-001/002 (#1923/#1924): the local, application-driven half of TCP close -- the RX-driven transitions live in tcp_process_segment. From ESTABLISHED: send FIN|ACK, move to FIN_WAIT_1 (active close). From CLOSE_WAIT (peer already sent its FIN): send FIN|ACK, move to LAST_ACK (finishing a passive close). Any other state is a no-op -- calling close() twice, or on a socket that never connected, must not resend a stray FIN. 1-push callee-save (rbx=tcb_idx): entry rsp%16==8, one push lands rsp%16==0 for the nested tcp_send_segment call directly -- no extra alignment pad needed.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;
+        mov rax, rbx; shl rax, 9; lea rcx, [rip + _tcp_tcb_table]; add rax, rcx;
+        mov rcx, [rax + 0];
+
+        cmp rcx, 4;
+        je tcl_from_established;
+        cmp rcx, 7;
+        je tcl_from_close_wait;
+        jmp tcl_done;
+
+      tcl_from_established:
+        mov rcx, 5;
+        mov [rax + 0], rcx;             // FIN_WAIT_1
+        mov rdi, rbx; mov rsi, 0x11; xor rdx, rdx; xor rcx, rcx;
+        call tcp_send_segment;
+        jmp tcl_done;
+
+      tcl_from_close_wait:
+        mov rcx, 9;
+        mov [rax + 0], rcx;             // LAST_ACK
+        mov rdi, rbx; mov rsi, 0x11; xor rdx, rdx; xor rcx, rcx;
+        call tcp_send_segment;
+
+      tcl_done:
+        xor rax, rax;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_accept_pending(listener_idx) -> child_idx | TCP_NONE
+  // ============================================================================
+  //
+  // Reads the listener TCB's backlog_pending_tcb; if it names a child
+  // TCB that has reached ESTABLISHED, claims it (clears the listener's
+  // backlog slot, sets the child's claimed flag) and returns its index.
+  // Otherwise returns TCP_NONE (still handshaking, or nothing pending).
+  // Pure leaf: no nested calls, so the two live row pointers (listener,
+  // child) can both stay in caller-save scratch registers safely.
+
+  pub let tcp_accept_pending : (u64) -> u64 !{mem} @{} =
+    fn (listener_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R72.M1-005 (#1927): sys_accept's core primitive. Reads the listener row's backlog_pending_tcb (@+152); TCP_NONE means nothing pending yet. Otherwise checks the named child's state (@+0) for ESTABLISHED -- SYN_RCVD means the handshake's final ACK has not landed yet, so accept() must not hand out a socket the connect side does not yet agree is open. On a hit: clears the listener's backlog slot back to TCP_NONE and sets the child's claimed flag (@+160), then returns the child's index. Leaf (no nested calls) -- both row pointers live in plain caller-save scratch registers (rax=listener_ptr, rcx=child_ptr) with no risk of a call clobbering them.",
+      block: {
+        mov rax, rdi;
+        shl rax, 9;
+        lea rcx, [rip + _tcp_tcb_table];
+        add rax, rcx;
+
+        mov rdx, [rax + 152];
+        cmp rdx, 0xFFFFFFFFFFFFFFFF;
+        je tap_none;
+
+        mov rcx, rdx;
+        shl rcx, 9;
+        lea r8, [rip + _tcp_tcb_table];
+        add rcx, r8;
+
+        mov r8, [rcx + 0];
+        cmp r8, 4;
+        jne tap_none;
+
+        mov r9, 0xFFFFFFFFFFFFFFFF;
+        mov [rax + 152], r9;
+        mov r9, 1;
+        mov [rcx + 160], r9;
+
+        mov rax, rdx;
+        ret;
+
+      tap_none:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+}

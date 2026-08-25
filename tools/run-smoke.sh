@@ -53,6 +53,7 @@
 #     * boot_r17_shell_child_process: injects 'true\nexit\n', asserts TRUE OK from /bin/true + shell-reap chain (R17.M5 #638)
 #     * boot_r17_shell_shutdown: injects 'exit\n', asserts shell exit + init reap + init shutdown (R17.M5 #639)
 #     * boot_r86_relative_path: injects 'mkdir /tmp\ncd /tmp\nmkdir ./sub\ncd ./sub\nmkdir ../peer\npwd\nexit\n', asserts cd/mkdir fingerprints + literal '/tmp/sub' + REAPED (R86.M1-008 #1961)
+#     * boot_r72_tcp_echo: validates the R72 TCP substrate boot witness (self-connect handshake + port-7 echo + mutual orderly close), 10s timeout, no special QEMU flags (R72.M1-007 #1929)
 #     * boot_smp: validates R18.M1 SMP bring-up fingerprint on -smp 4; BSP wakes 3 APs (APIC IDs 1/2/3), each emits CPU_ID_XX_HELLO; bookended by SMP BRINGUP START / DONE (R18.M1 #764)
 #     * boot_panic: validates M3-003 fake-panic emission chain witness, 8s timeout
 #     * prod: expects exit code 2 (kernel didn't build), skips verification
@@ -603,6 +604,22 @@ case "${EXPECTED}" in
         TIMEOUT=10
         SMP_MODE=1
         SMP_CPU_COUNT=4
+        EXPECTED=""
+        ;;
+    boot_r72_tcp_echo)
+        # R72.M1-007 (#1929): TCP substrate boot witness. Runs
+        # unconditionally in the default (-smp 1, no --with-disk) boot
+        # path — witness_r72_tcp_echo (boot/witness/r72_tcp_echo.pdx)
+        # drives a self-connect handshake + port-7 echo + mutual
+        # orderly close entirely through net/tcp.pdx's TCB primitives,
+        # with no e1000e device or link required (the loopback fast
+        # path never reaches ipv4_tx_send for a self-addressed
+        # segment). No special QEMU flags needed; this mode exists
+        # only to pin the fingerprint sequence against a dedicated
+        # golden separate from the 14-mode default matrix.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r72-tcp-echo.golden"
+        TIMEOUT=10
         EXPECTED=""
         ;;
     boot_r20b_echo)
