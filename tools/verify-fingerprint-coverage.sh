@@ -293,6 +293,16 @@ ALLOWLIST = {
         "cpus_ready == 0 (always true under the default -smp 1 "
         "matrix — no APs). Asserted under PAIDEIA_R87_AP_IDT=1 "
         "(tests/expected-r87-ap-idt.golden).",
+
+    # R73.M1-001 sys_kill(SIGSTOP/SIGCONT). Kernel-side syscall exists
+    # (sysno 95). Shell tier-2 job-control (paideia-os/shell satellite
+    # repo) is the only real caller; no boot-time witness spawns a task
+    # + kill-STOP + kill-CONT. Assertable via a future one-shot witness
+    # or via PAIDEIA_R73_JOB=1 shell-tape smoke once shell tier 2 lands.
+    "sys kill ok [legacy: SYS KILL OK]":
+        "R73.M1-001 sys_kill body live; shell tier-2 job-control "
+        "(satellite repo paideia-os/shell) is the caller — no kernel-"
+        "side boot witness spawns kill-STOP/CONT sequence.",
 }
 
 # Below these counts the extractor has stopped matching rather than the
