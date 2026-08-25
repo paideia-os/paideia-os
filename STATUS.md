@@ -1168,3 +1168,43 @@ R55 threaded the R54.M1 write-sync substrate into a composed persistent-write op
 None (R55 ran entirely under QEMU `-kernel` / documentation).
 
 **Next Round:** R56 (cache + prefetch / pdxfs-lite mutating-op wire-through). Zero R55 blockers.
+
+---
+
+## R56 (VFS metadata syscalls) — CLOSED 2026-08-24
+
+R56 widened the syscall surface with six VFS-metadata operations — `stat` / `getdents` / `mkdir` / `rmdir` / `unlink` / `rename` — bringing the kernel-side of every POSIX-shape metadata syscall online across the three FS backends. Seven issues in one milestone: dispatch bounds expansion (#1790 — 76→82 with six inline ENOSYS stubs); `sys_stat_body` + `vops_stat` slot 7 with 64-B stat struct across tmpfs/pdxfs_lite/pdxfs-block (#1791); `sys_getdents_body` + `vops_readdir` slot 8 with 12-B header record format (#1792 — surfaced two paideia-as encoder gaps `sub reg, [mem]` / `add reg, [mem]` worked around inline via temp-register staging); `sys_mkdir` + `sys_rmdir` + `vop_mkdir` / `vop_rmdir` slots 9/10 + `src/kernel/core/fs/pdxfs/dir.pdx` dentry helpers (#1793); `sys_unlink` + `sys_rename` with `vop_rename` slot 11, cross-directory rename refused with -EXDEV pending R57 WAL-atomic (#1794); dormant composite smoke scaffold with structural deferral to R57 userland-binary tier (#1795); and this closure retro + STATUS block + `r56-closed` tag. Final vops layout: VOPS_SIZE=96, VOPS_NUM_OPS=12. See `design/round-retrospectives/r56-closure.md` for full write-up.
+
+### Issues Implemented (7 total across 1 milestone)
+
+- **M3** (#1790, #1791, #1792, #1793, #1794, #1795, #1796) — VFS metadata syscall wave: #1790 dispatch bounds 76→82 + 6 inline ENOSYS stubs; #1791 sys_stat + vop_stat per-backend; #1792 sys_getdents + vop_readdir over 3 backends (2 encoder-gap workarounds); #1793 sys_mkdir + sys_rmdir + vop_mkdir/vop_rmdir + dir.pdx helpers; #1794 sys_unlink + sys_rename + vop_rename slot 11; #1795 boot_r56_meta composite smoke (dormant); #1796 closure retro + STATUS + tag.
+
+### Cross-Repo Escalations to paideia-as (R56)
+
+**None.** `paideia-as` submodule remained pinned throughout R56. **Eleventh consecutive round** with zero cross-repo escalations. Two encoder gaps surfaced (both worked around inline).
+
+### Observable Proof
+
+- Kernel builds clean under `tools/build.sh`.
+- Substrate boot reaches SHELL START + `$` prompt after every issue.
+- All six new sys_*_body T-symbols present in kernel.elf.
+- Fingerprints dormant on substrate (no userland caller yet); real exercise via R57.
+
+### R56 Debt Carried Forward
+
+1. **Composite smoke live exercise** — dormant scaffold; R57 userland tier discharges.
+2. **pdxfs-block mkdir/rmdir/rename** — MOUNT_BACKEND_UNKNOWN stubs pending R52.M6 vnode-to-mctx bridge.
+3. **pdxfs_lite mkdir/rmdir** — VOPS_ERR_NOT_SUPPORTED stubs pending writable walker.
+4. **Cross-directory rename** — -EXDEV refused; WAL-atomic deferred to R57.
+5. **mtime** — no monotonic real-time source at R56.
+6. **Encoder gap follow-up** — paideia-as `sub reg, [mem]` / `add reg, [mem]` not supported in phase-3-m2-002 minimum; file separately.
+7. **build.sh silent-error swallow** (carried from R55) — file separately.
+8. **tmpfs rmdir empty-directory gate** — R57+ tightening.
+
+**None regress R56 acceptance.**
+
+### Quirks Discovered on Real Hardware
+
+None (R56 ran entirely under QEMU `-kernel` / documentation).
+
+**Next Round:** R57 (userland tools + shell PATH; exercises R56 metadata syscalls). Zero R56 blockers.
