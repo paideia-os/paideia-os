@@ -317,6 +317,20 @@ ALLOWLIST = {
         "yet — dispatch (R89.M1-002) and the boot witness "
         "(r89_tui_canvas.pdx, R89.M1-005) are later milestone items.",
 
+    # src/kernel/core/tui/canvas_present.pdx — R89.M1-003 (#1990)
+    # TUI_OP_PRESENT real body. tui_present_body is dispatched from
+    # cap_handler_tui_canvas's PRESENT arm, but PRESENT is reachable
+    # only via cap_invoke on a LIVE canvas row, and no row is ever
+    # minted anywhere in the tree at this landing (same reasoning as
+    # the "tui canvas mint ok" entry immediately above: mint has no
+    # caller until the R89.M1-005 boot witness lands). Becomes
+    # assertable once that witness mints a canvas and invokes PRESENT.
+    "tui canvas present ok [legacy: TUI CANVAS PRESENT OK]":
+        "R89.M1-003 (#1990): tui_present_body has no reachable caller "
+        "yet — dispatch requires a live canvas row, and "
+        "kind_tui_canvas_mint_body (R89.M1-001) has no caller until "
+        "the boot witness (r89_tui_canvas.pdx, R89.M1-005) lands.",
+
     # src/kernel/core/cap/kind_tty.pdx tag_tty_read_ok — R66v2.POS-001
     # (#1986). DECLARED but not emitted from any body: TTY_OP_READ is a
     # per-byte, non-blocking poll that an interactive session can invoke
