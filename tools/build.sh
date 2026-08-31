@@ -105,168 +105,64 @@ obj_relocs_against() {
     [[ "${__OBJDUMP_RELOC_CACHE[$obj]}" =~ (^|[^a-zA-Z0-9_])${sym}([^a-zA-Z0-9_]|$) ]]
 }
 
-# R20-M4-004 (#822): "No AML in kernel" guardrail. Refuses the build
-# if any AML-related identifier (aml*, dsdt, ssdt, acpica, \_SB_) has
-# leaked into src/kernel/**. See design/acpi/no-aml-in-kernel.md for
-# the full forbidden set and rationale. Runs first so a violation is
-# reported before any (slower) assembler work.
-echo "[no-aml-lint] tools/lint-no-kernel-aml.sh"
-"${REPO_ROOT}/tools/lint-no-kernel-aml.sh" || {
-    echo "[FAIL] no-AML kernel guardrail tripped (#822)" >&2
-    exit 1
-}
-
-# R49.M3 / #1578: emitted-vs-asserted fingerprint coverage gate. Refuses
-# the build if any "... OK" fingerprint the tree can print is asserted in
-# no expected/golden file. This defect class is invisible by construction
-# — the marker prints whether or not anything checks it — and it has now
-# recurred twice (3212fdb: 2 markers; #1578: 7 more, three of them KPTI).
-# Runs alongside the no-AML lint, before any assembler work, so a new
-# unwitnessed marker fails at the point it is introduced rather than
-# surviving until someone runs another mechanical sweep.
-echo "[fingerprint-coverage] tools/verify-fingerprint-coverage.sh"
-"${REPO_ROOT}/tools/verify-fingerprint-coverage.sh" || {
-    echo "[FAIL] unwitnessed boot fingerprint (#1578 gate)" >&2
-    exit 1
-}
-
-# R31.M1 / #1589: the capability descriptor stride is 24 bytes, and the
-# struct that documents it must not describe a layout nothing implements.
-# `generation` was declared with no storage, and at stride 24 its offset
-# (+24) is the NEXT DESCRIPTOR'S kind — so a contributor following the
-# struct, which is the natural thing to do since the struct is the
-# documentation, would have silently retyped an unrelated capability.
-# Because kind is the first thing every gate checks, the symptom would
-# have appeared arbitrarily far from the write.
+# ---------------------------------------------------------------------------
+# Pre-compile source-only gates (perf #4/#6): run in parallel.
 #
-# Source-level, so it runs beside the other two pre-assembler gates: a
-# stride divergence must fail at the point it is introduced, not after
-# 136 sites have been assembled against two different beliefs about how
-# wide a descriptor is.
-echo "[cap-stride] tools/verify-cap-stride.sh"
-"${REPO_ROOT}/tools/verify-cap-stride.sh" || {
-    echo "[FAIL] capability descriptor stride divergence (#1589 gate)" >&2
-    exit 1
-}
-
-# R31.M2 / #1594: the task pool is addressed by STRIDE and was sized by
-# STRUCT. `_task_pool : [u64; 17792]` is 142336 bytes = 64 * 2224, but
-# task_new strides 4096 per slot and pid_alloc hands out 63 — so the array
-# held 34.75 slots and every pid from 36 up wrote a complete task_struct
-# past its end, into `_task_kernel_stacks`. A TCB aliased onto another
-# task's kernel stack is two writers disagreeing about what the bytes are,
-# one of them a return-address chain.
+# All 9 gates below scan only src/kernel/** and tests/**. None reads any
+# .o. They're independent and can run concurrently — collectively they
+# take 30-60 s serial; running them concurrently caps wall-clock at the
+# slowest single script (~10-15 s). If any fails, the whole batch fails.
 #
-# The literal was wrong; the DEFECT is that the size and the ceiling were
-# independent numbers with no checked relation, so they could disagree and
-# nothing would say so. paideia-as cannot express the relation in the type
-# — an arithmetic array length is not an `ExprLiteral` and degrades to an
-# 8-byte .bss object rather than failing — so it is expressed here.
+# Individual gate rationale kept below the batch (each was previously
+# documented at its call site — combined into one comment block here
+# because the sites no longer exist).
 #
-# Source-level, so it joins the other three pre-assembler gates: a geometry
-# divergence must fail at the point it is introduced, not after the pool has
-# been assembled against two different beliefs about how wide a slot is.
-echo "[task-pool-bounds] tools/verify-task-pool-bounds.sh"
-"${REPO_ROOT}/tools/verify-task-pool-bounds.sh" || {
-    echo "[FAIL] task pool geometry divergence (#1594 gate)" >&2
-    exit 1
-}
+# - #822        no-AML kernel guardrail (design/acpi/no-aml-in-kernel.md)
+# - #1578       fingerprint-coverage: every "OK" marker asserted in a golden
+# - #1589       cap-descriptor stride discipline (`generation` had no storage)
+# - #1594       task-pool geometry (array size ≥ stride × pid ceiling)
+# - #1604       init ring-3 handoff crosses via three .bss slots, not r12-r14
+# - #1579       cap_mint_write is the sole non-zero writer of target_ptr+16
+# - #1608       no active-mutation markers survive to a committed tree
+# - #1605       file-id literal-plus-comment pair matches current ordinals
+# - MMIO step 8 no raw firmware-fixed MMIO PA literals outside manifest
+# - #1606       @no_frame is a no-op on unsafe bodies; forbidden anywhere
+echo "[pre-compile lints] 9 source-only gates in parallel"
+declare -A __PRE_GATE_LABEL
+__PRE_GATE_LABEL[no-aml-lint]="no-AML kernel guardrail tripped (#822)"
+__PRE_GATE_LABEL[fingerprint-coverage]="unwitnessed boot fingerprint (#1578 gate)"
+__PRE_GATE_LABEL[cap-stride]="capability descriptor stride divergence (#1589 gate)"
+__PRE_GATE_LABEL[task-pool-bounds]="task pool geometry divergence (#1594 gate)"
+__PRE_GATE_LABEL[init-handoff]="init ring-3 handoff escaped its two access sites (#1604 gate)"
+__PRE_GATE_LABEL[cap-descriptor-confine]="stray target_ptr writer (#1579 gate)"
+__PRE_GATE_LABEL[mutation-marker]="active mutation marker in source tree (#1608 gate)"
+__PRE_GATE_LABEL[file-id-hardcodes]="file-id literal drift in kernel source tree (#1605 gate)"
+__PRE_GATE_LABEL[no-raw-mmio]="raw firmware-fixed MMIO literal reintroduced"
+__PRE_GATE_LABEL[no-frame-forbidden]="@no_frame reintroduced under src/kernel/** (#1606 gate)"
 
-# R31.M2 / #1604: init's ring-3 handoff (task slab / e_entry / user_rsp)
-# crosses six witness calls into five modules. It used to cross them in
-# r12/r13/r14 on an unenforced callee-save convention — a dependency the
-# verifying debugger broke on purpose with one `mov r13, 0xdeadbeef` and
-# which nothing in the toolchain caught before boot. It now crosses in
-# three .bss slots, and this gate is what keeps that an improvement
-# rather than a lateral move: two accesses, one file, register path
-# poisoned. A global anyone can read would be no better than the
-# register convention it replaced.
-#
-# Source-level, so it joins the other pre-assembler gates: a third
-# accessor must fail at the point it is written, not at the point a
-# ring-3 entry iretqs into a stale value on someone else's machine.
-echo "[init-handoff] tools/verify-init-handoff.sh"
-"${REPO_ROOT}/tools/verify-init-handoff.sh" || {
-    echo "[FAIL] init ring-3 handoff escaped its two access sites (#1604 gate)" >&2
-    exit 1
-}
+declare -A __PRE_GATE_PID
+"${REPO_ROOT}/tools/lint-no-kernel-aml.sh"      & __PRE_GATE_PID[no-aml-lint]=$!
+"${REPO_ROOT}/tools/verify-fingerprint-coverage.sh" & __PRE_GATE_PID[fingerprint-coverage]=$!
+"${REPO_ROOT}/tools/verify-cap-stride.sh"       & __PRE_GATE_PID[cap-stride]=$!
+"${REPO_ROOT}/tools/verify-task-pool-bounds.sh" & __PRE_GATE_PID[task-pool-bounds]=$!
+"${REPO_ROOT}/tools/verify-init-handoff.sh"     & __PRE_GATE_PID[init-handoff]=$!
+"${REPO_ROOT}/tools/verify-cap-descriptor.sh"   & __PRE_GATE_PID[cap-descriptor-confine]=$!
+"${REPO_ROOT}/tools/verify-mutation-marker.sh"  & __PRE_GATE_PID[mutation-marker]=$!
+"${REPO_ROOT}/tools/verify-file-id-hardcodes.sh" & __PRE_GATE_PID[file-id-hardcodes]=$!
+"${REPO_ROOT}/tools/verify-no-raw-mmio.sh"      & __PRE_GATE_PID[no-raw-mmio]=$!
+"${REPO_ROOT}/tools/verify-no-frame-forbidden.sh" & __PRE_GATE_PID[no-frame-forbidden]=$!
 
-# R31.M1 / #1579: cap_mint_write is the SOLE non-zero writer of a
-# descriptor's target_ptr field (+16). A stray write at +16 retargets a
-# LIVE capability without changing its kind or rights, so every
-# downstream kind-check keeps passing and the corruption presents
-# arbitrarily far from the write — the exact "wrong bytes at the
-# object end" defect shape R31 exists to close. Zero-clearing writes
-# (revoke / free paths) are allowed anywhere, because a descriptor
-# whose target_ptr is zero is a REVOKED descriptor. Test-fixture
-# seeders that deliberately bypass the mint path (their justifications
-# say why) carry an on-line annotation.
-#
-# Source-level, so it joins the other pre-assembler gates: a stray +16
-# writer must fail at the point it is introduced, not after 800 objects
-# have been assembled against two different beliefs about who mints
-# capabilities.
-echo "[cap-descriptor-confine] tools/verify-cap-descriptor.sh"
-"${REPO_ROOT}/tools/verify-cap-descriptor.sh" || {
-    echo "[FAIL] stray target_ptr writer (#1579 gate)" >&2
+__PRE_GATE_FAIL=0
+for gate in "${!__PRE_GATE_PID[@]}"; do
+    if ! wait "${__PRE_GATE_PID[$gate]}"; then
+        echo "[FAIL] ${__PRE_GATE_LABEL[$gate]}" >&2
+        __PRE_GATE_FAIL=1
+    fi
+done
+if [[ ${__PRE_GATE_FAIL} -ne 0 ]]; then
     exit 1
-}
-
-# R31.M1 / #1608: active-mutation markers must not survive into a
-# committed source tree. The power-button-inversion incident that
-# motivated the ticket is the canonical shape — a mutation left in
-# production code, looking legitimate at a glance, that a grep for
-# any of six unmistakable marker strings would have caught. Runs
-# alongside the other pre-assembler gates because a marker's failure
-# mode is silent: it prints nothing at runtime, ships as if it were
-# the real thing, and is only discovered by someone else's incident.
-# Self-test hook lives in tools/verify-mutation-marker.sh; the tree
-# currently carries zero markers by design, so the normal path is
-# silent success.
-echo "[mutation-marker] tools/verify-mutation-marker.sh"
-"${REPO_ROOT}/tools/verify-mutation-marker.sh" || {
-    echo "[FAIL] active mutation marker in source tree (#1608 gate)" >&2
-    exit 1
-}
-
-# #1605: file_ids.pdx is regenerated by tools/gen-file-ids.sh and its
-# ordinals shift whenever a .pdx is added, removed, or renamed under
-# src/kernel/. Call sites that pass a FILE_ID as a numeric literal
-# paired with a `// FILE_ID_*` comment are a silent drift trap: the
-# literal keeps assembling but names the wrong file in every panic dump
-# after the shift. This gate scans for the literal-plus-comment pair
-# and refuses the build if any pair disagrees with the current table.
-# Symbolic sites (`mov rsi, FILE_ID_core_fs_vfs_open`) resolve through
-# the linker and cannot drift; they are the preferred form and are
-# not policed by this gate.
-echo "[file-id-hardcodes] tools/verify-file-id-hardcodes.sh"
-"${REPO_ROOT}/tools/verify-file-id-hardcodes.sh" || {
-    echo "[FAIL] file-id literal drift in kernel source tree (#1605 gate)" >&2
-    exit 1
-}
-
-# boot-mmio-mapping step 8: refuse raw firmware-fixed MMIO PA literals in
-# instruction operands outside the manifest (mmio_init.pdx). See design/
-# kernel/boot-mmio-mapping.md §3 step 8 for the full argument and
-# tools/verify-no-raw-mmio.sh for the allowlist reasoning.
-echo "[no-raw-mmio] tools/verify-no-raw-mmio.sh"
-"${REPO_ROOT}/tools/verify-no-raw-mmio.sh" || {
-    echo "[FAIL] raw firmware-fixed MMIO literal reintroduced" >&2
-    exit 1
-}
-
-# R41.M4 / #1606: @no_frame is a no-op on unsafe-bodied lambdas because
-# paideia-as::emit_visit_lambda short-circuits on body_is_unsafe before
-# consulting is_lambda_no_frame. Every hand-written asm function in this
-# kernel is unsafe-bodied, so the annotation documented intent the
-# compiler never enforced. The initial sweep removed 3173 occurrences;
-# this gate refuses any reintroduction. See tools/verify-no-frame-
-# forbidden.sh for the full argument.
-echo "[no-frame-forbidden] tools/verify-no-frame-forbidden.sh"
-"${REPO_ROOT}/tools/verify-no-frame-forbidden.sh" || {
-    echo "[FAIL] @no_frame reintroduced under src/kernel/** (#1606 gate)" >&2
-    exit 1
-}
+fi
+echo "[pre-compile lints] all 9 gates passed"
 
 # R49.M1-002 (#1572): (re)generate the build-mode flag file that the
 # klog + uart emit paths gate on. Default is TEST (0), keeping the 14-
@@ -9642,23 +9538,29 @@ if [[ ${AUDIT_FAIL} -ne 0 ]]; then
 fi
 echo "[audit] R_X86_64_32 relocations clean (all targets low-VA)"
 
-echo "[verify] kernel syscall dispatch alignment"
-"${REPO_ROOT}/tools/verify-syscall-dispatch.sh" "${BUILD_DIR}/kernel.elf" || {
-    echo "[FAIL] syscall dispatch verification failed" >&2
-    exit 1
-}
+# Post-link verify (perf #4): all 3 read only build/kernel.elf. Independent
+# — run in parallel; the whole batch fails if any single gate fails.
+echo "[post-link verify] 3 kernel.elf gates in parallel"
+declare -A __POST_GATE_LABEL
+__POST_GATE_LABEL[syscall-dispatch]="syscall dispatch verification failed"
+__POST_GATE_LABEL[sched-guards]="sched guards verification failed"
+__POST_GATE_LABEL[tty-read-wrapper]="tty_read wrapper verification failed"
 
-echo "[verify] sched_block/sched_wake precondition guards (#663)"
-"${REPO_ROOT}/tools/verify-sched-guards.sh" "${BUILD_DIR}/kernel.elf" || {
-    echo "[FAIL] sched guards verification failed" >&2
-    exit 1
-}
+declare -A __POST_GATE_PID
+"${REPO_ROOT}/tools/verify-syscall-dispatch.sh" "${BUILD_DIR}/kernel.elf" & __POST_GATE_PID[syscall-dispatch]=$!
+"${REPO_ROOT}/tools/verify-sched-guards.sh"     "${BUILD_DIR}/kernel.elf" & __POST_GATE_PID[sched-guards]=$!
+"${REPO_ROOT}/tools/verify-tty-read-wrapper.sh"                            & __POST_GATE_PID[tty-read-wrapper]=$!
 
-echo "[verify] tty_read blocking wrapper real body (#667)"
-"${REPO_ROOT}/tools/verify-tty-read-wrapper.sh" || {
-    echo "[FAIL] tty_read wrapper verification failed" >&2
+__POST_GATE_FAIL=0
+for gate in "${!__POST_GATE_PID[@]}"; do
+    if ! wait "${__POST_GATE_PID[$gate]}"; then
+        echo "[FAIL] ${__POST_GATE_LABEL[$gate]}" >&2
+        __POST_GATE_FAIL=1
+    fi
+done
+if [[ ${__POST_GATE_FAIL} -ne 0 ]]; then
     exit 1
-}
+fi
 
 # Fast-path stamp: touched only after every gate passes above. See
 # the fast-path check at the top of this script for the invariant.
