@@ -260,28 +260,30 @@ cat > "${AP_TRAMP_OFF_SRC}" <<EOF
 EOF
 as --64 -o "${AP_TRAMP_OFF_OBJ}" "${AP_TRAMP_OFF_SRC}"
 
+# Parallel compile (perf #3): dispatch every .pdx → .o through
+# tools/compile-one.sh under xargs -P. Each invocation does its own
+# incremental timestamp check (perf #1611 semantics unchanged: source,
+# script, paideia-as binary mtime all trigger a rebuild). OBJECTS[] is
+# populated by a post-pass find over the (now guaranteed-current) .o
+# tree so link order is deterministic (sort -z).
+#
+# PARALLEL_JOBS overrides nproc. NO_INCREMENTAL forces full rebuild
+# (passed through to compile-one.sh via env).
+export PAIDEIA_AS BUILD_DIR
+export BUILD_SH="${BASH_SOURCE[0]}"
+export NO_INCREMENTAL="${NO_INCREMENTAL:-}"
+PARALLEL_JOBS="${PARALLEL_JOBS:-$(nproc)}"
+
+find "${KERNEL_SRC}" -name '*.pdx' -print0 \
+  | xargs -0 -n1 -P "${PARALLEL_JOBS}" -I{} \
+        "${REPO_ROOT}/tools/compile-one.sh" "{}" "${KERNEL_SRC}"
+
+# Derive OBJECTS[] from the .pdx list (not `find *.o`) so stale objects
+# from deleted sources don't get linked.
 OBJECTS=()
-# Incremental build (#1611): skip paideia-as when the .o is not older than
-# any of its dependencies. Dependencies are the .pdx source, this script
-# itself (compiler-command flags may have changed), and the paideia-as
-# binary (submodule bump). Set NO_INCREMENTAL=1 to force a full rebuild.
-# The link step + all confinement gates still run every invocation, so
-# cross-object collisions remain caught.
 while IFS= read -r -d '' pdx; do
     rel="${pdx#"${KERNEL_SRC}"/}"
-    obj="${BUILD_DIR}/${rel%.pdx}.o"
-    mkdir -p "$(dirname "${obj}")"
-    if [[ -z "${NO_INCREMENTAL:-}" \
-          && -f "${obj}" \
-          && ! "${pdx}" -nt "${obj}" \
-          && ! "${BASH_SOURCE[0]}" -nt "${obj}" \
-          && ! "${PAIDEIA_AS}" -nt "${obj}" ]]; then
-        OBJECTS+=("${obj}")
-        continue
-    fi
-    echo "[build] paideia-as ${rel} -> ${obj#"${BUILD_DIR}"/}"
-    "${PAIDEIA_AS}" build --emit elf64 "${pdx}" -o "${obj}"
-    OBJECTS+=("${obj}")
+    OBJECTS+=("${BUILD_DIR}/${rel%.pdx}.o")
 done < <(find "${KERNEL_SRC}" -name '*.pdx' -print0 | sort -z)
 
 # R18-M5-004 (#778): compile any .pdx fixtures under tests/kernel/ into
@@ -292,25 +294,19 @@ done < <(find "${KERNEL_SRC}" -name '*.pdx' -print0 | sort -z)
 # build/tests/kernel/ to keep the build tree unambiguous.
 TESTS_KERNEL_DIR="${REPO_ROOT}/tests/kernel"
 if [[ -d "${TESTS_KERNEL_DIR}" ]]; then
+    find "${TESTS_KERNEL_DIR}" -name '*.pdx' \
+        -not -path '*/drivers/elaborator/*' -print0 \
+      | xargs -0 -n1 -P "${PARALLEL_JOBS}" -I{} \
+            "${REPO_ROOT}/tools/compile-one.sh" "{}" "${REPO_ROOT}"
+
     while IFS= read -r -d '' pdx; do
         rel="${pdx#"${REPO_ROOT}"/}"
-        obj="${BUILD_DIR}/${rel%.pdx}.o"
-        mkdir -p "$(dirname "${obj}")"
-        if [[ -z "${NO_INCREMENTAL:-}" \
-              && -f "${obj}" \
-              && ! "${pdx}" -nt "${obj}" \
-              && ! "${BASH_SOURCE[0]}" -nt "${obj}" \
-              && ! "${PAIDEIA_AS}" -nt "${obj}" ]]; then
-            OBJECTS+=("${obj}")
-            continue
-        fi
-        echo "[build] paideia-as ${rel} -> ${obj#"${BUILD_DIR}"/}"
-        "${PAIDEIA_AS}" build --emit elf64 "${pdx}" -o "${obj}"
-        OBJECTS+=("${obj}")
+        OBJECTS+=("${BUILD_DIR}/${rel%.pdx}.o")
     done < <(find "${TESTS_KERNEL_DIR}" -name '*.pdx' \
-        -not -path '*/drivers/elaborator/*' \
-        -print0 | sort -z)
+                  -not -path '*/drivers/elaborator/*' -print0 | sort -z)
 fi
+
+# (old sequential tests-kernel while-loop retired by perf #3 above)
 
 # R29-M2-002 (#1024): elaborator negatives under tests/kernel/drivers/
 # elaborator/ are INTENTIONALLY REJECTED by paideia-as. They must never
@@ -348,11 +344,12 @@ printf '%s\n' "${OBJECTS[@]}" \
                 # Value column is "SYM+HEX" or "SYM-HEX"; strip the offset.
                 sym = $3
                 sub(/[-+]0x[0-9a-fA-F]+$/, "", sym)
-                print sym, OBJ
+                if (sym != "") print sym, OBJ
             }
           '\''
     ' _ {} > "${__SYMIDX_TMP}"
 while read -r sym owner; do
+    [[ -z "${sym}" ]] && continue
     __SYM_OWNERS[$sym]+=" ${owner}"
 done < "${__SYMIDX_TMP}"
 rm -f "${__SYMIDX_TMP}"
