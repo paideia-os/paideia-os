@@ -329,15 +329,28 @@ fi
 # lookup + word-membership test on a small string. Every gate keeps its
 # existing contract; only the primitive gets faster.
 #
-# Parallelized via `xargs -P nproc`. The per-object parse writes one
-# `sym owner` line to stdout; the outer read loop populates the assoc
-# array serially (bash arrays aren't concurrency-safe).
+# Parallelized via `xargs -P nproc`. Each per-object parse writes lines
+# to its OWN tempfile (never a shared fd) so writes cannot interleave;
+# the outer read loop then concatenates + populates the assoc array
+# serially (bash arrays aren't concurrency-safe).
+#
+# Historical note: an earlier revision aggregated stdout of all children
+# into one shared file. awk's stdout is block-buffered when the target is
+# a regular file, so 4-8 KB flushes from parallel children interleaved at
+# byte boundaries, producing garbled `sym1 owner1_sym2 owner2` lines that
+# spuriously credited the wrong owner with a real symbol (observed
+# intermittently as false ec-confine failures against _ce_state,
+# _led_buf, _topology_diff_snapshot). Per-child tempfile eliminates the
+# race unconditionally — no reliance on awk buffering mode.
 echo "[symidx] building symbol → owners inverse index (N=${#OBJECTS[@]} objects)"
 declare -A __SYM_OWNERS
-__SYMIDX_TMP="$(mktemp)"
+__SYMIDX_DIR="$(mktemp -d)"
 printf '%s\n' "${OBJECTS[@]}" \
   | xargs -P "$(nproc)" -I{} sh -c '
       obj="$1"
+      out_dir="$2"
+      # Per-child tempfile; ${obj//\//_} makes it unique per object.
+      out="${out_dir}/$(echo "${obj}" | tr / _)"
       objdump -r "$obj" 2>/dev/null \
         | awk -v OBJ="$obj" '\''
             /^[0-9a-f]+[[:space:]]+R_X86_64/ {
@@ -346,8 +359,11 @@ printf '%s\n' "${OBJECTS[@]}" \
                 sub(/[-+]0x[0-9a-fA-F]+$/, "", sym)
                 if (sym != "") print sym, OBJ
             }
-          '\''
-    ' _ {} > "${__SYMIDX_TMP}"
+          '\'' > "${out}"
+    ' _ {} "${__SYMIDX_DIR}"
+__SYMIDX_TMP="$(mktemp)"
+cat "${__SYMIDX_DIR}"/* > "${__SYMIDX_TMP}" 2>/dev/null || true
+rm -rf "${__SYMIDX_DIR}"
 while read -r sym owner; do
     [[ -z "${sym}" ]] && continue
     __SYM_OWNERS[$sym]+=" ${owner}"
