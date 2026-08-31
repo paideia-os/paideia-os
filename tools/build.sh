@@ -424,6 +424,62 @@ fi
 # excludes the whole directory; verification lives in the negatives
 # script rather than the object-emitting build path.
 
+# ---------------------------------------------------------------------------
+# Symbol → owners inverse index (perf #2 — see design/toolchain/build-sh-perf.md).
+#
+# The 30+ `_confine_*` functions below invoke `obj_relocs_against` for
+# every symbol × every object combination — ~688 000 lookups per build
+# against N=910 objects. Even with the objdump-output cache (#1612), a
+# per-call bash-regex scan of the cached string dominates a no-op run.
+#
+# One pass over `objdump -r` per object populates `__SYM_OWNERS[$sym]`
+# with space-separated owner paths. `obj_relocs_against` becomes O(1):
+# lookup + word-membership test on a small string. Every gate keeps its
+# existing contract; only the primitive gets faster.
+#
+# Parallelized via `xargs -P nproc`. The per-object parse writes one
+# `sym owner` line to stdout; the outer read loop populates the assoc
+# array serially (bash arrays aren't concurrency-safe).
+echo "[symidx] building symbol → owners inverse index (N=${#OBJECTS[@]} objects)"
+declare -A __SYM_OWNERS
+__SYMIDX_TMP="$(mktemp)"
+printf '%s\n' "${OBJECTS[@]}" \
+  | xargs -P "$(nproc)" -I{} sh -c '
+      obj="$1"
+      objdump -r "$obj" 2>/dev/null \
+        | awk -v OBJ="$obj" '\''
+            /^[0-9a-f]+[[:space:]]+R_X86_64/ {
+                # Value column is "SYM+HEX" or "SYM-HEX"; strip the offset.
+                sym = $3
+                sub(/[-+]0x[0-9a-fA-F]+$/, "", sym)
+                print sym, OBJ
+            }
+          '\''
+    ' _ {} > "${__SYMIDX_TMP}"
+while read -r sym owner; do
+    __SYM_OWNERS[$sym]+=" ${owner}"
+done < "${__SYMIDX_TMP}"
+rm -f "${__SYMIDX_TMP}"
+echo "[symidx] ${#__SYM_OWNERS[@]} distinct symbols indexed"
+
+# Replaces `obj_relocs_against` for the confinement gates below when
+# the inverse index is populated. Old cache still used as fallback (some
+# call sites happen before OBJECTS[] is fully populated — none today,
+# but defensive).
+obj_relocs_against() {
+    local obj="$1" sym="$2"
+    if [[ -n "${__SYM_OWNERS[$sym]+set}" ]]; then
+        # word-boundary match: owner list is space-prefix/suffix separated
+        [[ "${__SYM_OWNERS[$sym]}" == *" ${obj} "* \
+        || "${__SYM_OWNERS[$sym]}" == "${obj} "* \
+        || "${__SYM_OWNERS[$sym]}" == *" ${obj}" \
+        || "${__SYM_OWNERS[$sym]}" == "${obj}" ]]
+        return
+    fi
+    # Fallback (unindexed symbol → definitely not a reference)
+    return 1
+}
+
 # R30.M3-001 (#1061): OP-REGION ROW-TABLE CONFINEMENT.
 #
 # _op_region_table is the only place in the kernel where a {address
