@@ -20,6 +20,40 @@ fi
 mkdir -p "${BUILD_DIR}"
 
 # ---------------------------------------------------------------------------
+# Whole-build no-op fast-path.
+#
+# A successful full run touches "${BUILD_DIR}/.verified-stamp" as its final
+# act (added at end of script). On next invocation, if kernel.elf exists
+# and every dependency that could invalidate any gate is older than the
+# stamp, print [ok] and exit. The stamp being written *only* after every
+# gate passed means the "no green build without every gate passing"
+# invariant carries across runs.
+#
+# Force a full run via NO_INCREMENTAL=1.
+STAMP="${BUILD_DIR}/.verified-stamp"
+if [[ -z "${NO_INCREMENTAL:-}" && -f "${STAMP}" && -f "${BUILD_DIR}/kernel.elf" ]]; then
+    NEWEST_DEP=$(find \
+        "${KERNEL_SRC}" \
+        "${REPO_ROOT}/tests/kernel" \
+        "${REPO_ROOT}/tools/build.sh" \
+        "${REPO_ROOT}/tools/build-user.sh" \
+        "${REPO_ROOT}/tools/build-image.sh" \
+        "${REPO_ROOT}/tools/build-uefi-image.sh" \
+        "${REPO_ROOT}/tools/build-uefi-stub.sh" \
+        "${REPO_ROOT}"/tools/verify-*.sh \
+        "${REPO_ROOT}"/tools/lint-*.sh \
+        "${REPO_ROOT}"/tools/*.S \
+        "${REPO_ROOT}"/tools/*.ld \
+        "${LINK_SCRIPT}" \
+        "${PAIDEIA_AS}" \
+        -type f -newer "${STAMP}" -print -quit 2>/dev/null)
+    if [[ -z "${NEWEST_DEP}" ]]; then
+        echo "[ok] ${BUILD_DIR}/kernel.elf (no-op, stamp fresh)"
+        exit 0
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # obj_relocs_against OBJ SYM — "does this object relocate against SYM?"
 #
 # Every confinement check below is built on this one question, and the
@@ -9569,5 +9603,9 @@ echo "[verify] tty_read blocking wrapper real body (#667)"
     echo "[FAIL] tty_read wrapper verification failed" >&2
     exit 1
 }
+
+# Fast-path stamp: touched only after every gate passes above. See
+# the fast-path check at the top of this script for the invariant.
+touch "${STAMP}"
 
 echo "[ok] ${BUILD_DIR}/kernel.elf"
