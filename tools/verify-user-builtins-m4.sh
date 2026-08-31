@@ -137,11 +137,12 @@ if [[ -z "$SZ" ]]; then echo "[FAIL] dispatch_init symbol missing"; FAIL=1
 elif ! size_ge "$SZ" 144; then echo "[FAIL] dispatch_init too small (0x$SZ, need >= 0x90)"; FAIL=1
 else echo "[ok]   dispatch_init present, size 0x$SZ"; fi
 
-# 15. dispatch_init writes builtin_count=6 (mov rax,0x6) — #632 bumped 5->6
-if echo "$DI" | grep -Eq "mov[[:space:]]+rax,0x6|mov[[:space:]]+rax,6"; then
-    echo "[ok]   dispatch_init writes builtin_count=6"
+# 15. dispatch_init writes builtin_count=7 (mov rax,0x7) — #632 bumped 5->6,
+# clear builtin bumped 6->7.
+if echo "$DI" | grep -Eq "mov[[:space:]]+rax,0x7|mov[[:space:]]+rax,7"; then
+    echo "[ok]   dispatch_init writes builtin_count=7"
 else
-    echo "[FAIL] dispatch_init missing mov rax,0x6 (builtin_count=6)"; FAIL=1
+    echo "[FAIL] dispatch_init missing mov rax,0x7 (builtin_count=7)"; FAIL=1
 fi
 
 # 16. cd_builtin calls sys_chdir (R86.M1-006 #1959: retired the local
