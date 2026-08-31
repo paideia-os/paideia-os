@@ -66,8 +66,14 @@ is real:
 ```
 mkfs.pdxfs produces a PDXB image on /dev/nvme0
         │  (needs libpdx-volume.pdxb_encode_superblock +
-        │   pdxb_sign_superblock — the latter blocked on
-        │   paideia-as #1730's mldsa65_sign intrinsic gap)
+        │   pdxb_sign_superblock — the latter tracked by
+        │   libpdx-volume #7, which cites the paideia-as
+        │   mldsa65_sign intrinsic; that intrinsic landed
+        │   in paideia-as v0.23.0 and the submodule is now
+        │   pinned at v0.24.0, so this leg is no longer
+        │   blocked — see design/roadmap/rows-4-5-6-
+        │   scoping.md §0.1–§0.3 for the historical phantom
+        │   "paideia-as #1730" citation this replaces)
         ▼
 a valid, signed KIND_VOLUME superblock exists on the device
         │
@@ -184,9 +190,14 @@ conflate:
   execve-site `rdx` loads (§3, R65.M1-002, #1918).
 
 **What is design-only, deferred, and why:**
-- §2 init-time probe + mount (#1916) — deferred; nothing to mount
-  until the R64 tool-repo chain (`mkfs.pdxfs` + `libpdx-volume`, itself
-  blocked on paideia-as #1730) produces a real PDXB image.
+- §2 init-time probe + mount (#1916 closed-deferred; R65v2.M1-001
+  #1979 refiles the impl work) — nothing to mount until the R64 tool-
+  repo chain (`mkfs.pdxfs` + `libpdx-volume`) produces a real PDXB
+  image. The paideia-as prerequisite (`mldsa65_sign` intrinsic) is no
+  longer a blocker: it landed in paideia-as v0.23.0 and the submodule
+  is pinned at v0.24.0. What remains is the satellite tool repos'
+  code itself — see design/roadmap/rows-4-5-6-scoping.md §0.1 for
+  the historical phantom "paideia-as #1730" citation this replaces.
 - §4 shell chdir-on-entry (#1921) — mechanically independent of the
   mount, but deferred to land alongside a `$HOME` that resolves to
   something real; also anticipates the future `sys_chdir` syscall
