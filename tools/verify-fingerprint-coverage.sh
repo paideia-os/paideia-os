@@ -316,6 +316,33 @@ ALLOWLIST = {
         "R89.M1-001 (#1988): kind_tui_canvas_mint_body has no caller "
         "yet — dispatch (R89.M1-002) and the boot witness "
         "(r89_tui_canvas.pdx, R89.M1-005) are later milestone items.",
+
+    # src/kernel/core/cap/kind_tty.pdx tag_tty_read_ok — R66v2.POS-001
+    # (#1986). DECLARED but not emitted from any body: TTY_OP_READ is a
+    # per-byte, non-blocking poll that an interactive session can invoke
+    # hundreds of times a second, and logging one line per call would
+    # flood the ring for no diagnostic gain — same posture as
+    # tag_sys_taskinfo_ok / tag_sys_mountinfo_ok (klog/keys.pdx).
+    # Assertable once a future rate-limited or one-shot boot witness
+    # exercises the op; the boot smoke witness itself is #1987, out of
+    # scope for #1986.
+    "tty read ok [legacy: TTY READ OK] bytes=":
+        "R66v2.POS-001 (#1986): tag declared but not emitted; "
+        "TTY_OP_READ is a per-byte op and logging every call would "
+        "flood the ring. Assertable via a future rate-limited or "
+        "one-shot witness (see kind_tty.pdx tag_tty_read_ok comment).",
+
+    # src/kernel/core/cap/kind_tty.pdx tag_tty_mode_ok — R66v2.POS-001
+    # (#1986). Emitted from cap_handler_tty's TTY_OP_SET_RAW /
+    # TTY_OP_SET_COOKED arms, but cap_handler_tty has no caller in the
+    # default 14-mode matrix yet: the syscall wire from userspace into
+    # KIND_TTY op dispatch, and the boot witness that mints a sink and
+    # invokes these ops, are both later milestone items (the boot smoke
+    # witness is explicitly #1987, out of scope for #1986).
+    "tty mode ok [legacy: TTY MODE OK] mode=":
+        "R66v2.POS-001 (#1986): TTY_OP_SET_RAW/SET_COOKED body has no "
+        "caller yet — the syscall wire and the boot witness (#1987) "
+        "are later milestone items.",
 }
 
 # Below these counts the extractor has stopped matching rather than the
