@@ -5778,6 +5778,35 @@ fi
 echo "[r30-prep-confine] R30-PREP (KIND_TTY) confined"
 
 # ---------------------------------------------------------------------------
+# R89.M1-004 (#1991): one-writer discipline for KIND_TUI_CANVAS's stats
+# table.
+#
+#   * kind_tui_canvas (KIND_TUI_CANVAS = 0x1A6, over KIND_MEMORY)
+#
+# _tui_stats is the only place in the kernel where KIND_TUI_CANVAS
+# mint/revoke/present counters live. A second writer would let one
+# supervisor forge those counters with no capability involved.
+# Per-module confinement is what makes that unreachable by
+# construction; the four sole writers are tui_stats_bump_mints /
+# tui_stats_bump_revokes / tui_stats_bump_presents /
+# tui_stats_bump_refused (kind_tui_canvas.pdx §"Stats bookkeeping") —
+# core/tui/canvas_present.pdx calls tui_stats_bump_presents rather
+# than touching _tui_stats itself. Mirrors _tty_stats's own gate
+# immediately above one-for-one.
+R89_TUI_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_tui_canvas.pdx"
+if [[ ! -f "${R89_TUI_SRC}" ]]; then
+    echo "[r89-m1-004-confine] FAIL - kind_tui_canvas.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_tui_stats'   'core/cap/kind_tui_canvas.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_tui_canvas.pdx §\"Stats bookkeeping\" for the" >&2
+    echo "  per-module one-writer discipline." >&2
+    exit 1
+fi
+echo "[r89-m1-004-confine] R89.M1-004 (KIND_TUI_CANVAS _tui_stats) confined"
+
+# ---------------------------------------------------------------------------
 # R51.M1-001 (#1633): one-writer discipline for KIND_NVME_CONTROLLER.
 #
 #   * kind_nvme_controller (KIND_NVME_CONTROLLER = 0x198, over KIND_DEVICE)
