@@ -99,9 +99,18 @@ Signature `cap_handler_tui_canvas(rights, target_ptr, op_arg) -> u64`
 
 ## Failure taxonomy
 
-A new disjoint 16-wide band, `0xFFFFEC40..0xFFFFEC4F` — the next free
-band after `KIND_TTY`'s `0xFFFFEC30..0xFFFFEC3F`, with the same
+A new disjoint 16-wide band, `0xFFFFEB10..0xFFFFEB1F`, with the same
 named-constant discipline.
+
+Correction (R89.M1-001 landing, #1988): this doc originally proposed
+`0xFFFFEC40..0xFFFFEC4F` as "the next free band after `KIND_TTY`'s
+`0xFFFFEC30..0xFFFFEC3F`". A repo-wide sweep at implementation time
+found that band already belongs to `KIND_NVME_CONTROLLER`
+(`kind_nvme_controller.pdx` §3, `NVMEC_*` constants) — `kind_volume.pdx`
+§3 and `kind_sig_key.pdx` §3 both independently record that the entire
+`0xFFFFEC00..0xFFFFECFF` page was band-claimed end to end as of
+#1699/#1703, well before this doc landed. `0xFFFFEB10..0xFFFFEB1F` is
+verified free (`0xFFFFEB00..0F` belongs to `KIND_SIG_KEY`).
 
 | Sentinel                | Meaning |
 |-------------------------|---------|

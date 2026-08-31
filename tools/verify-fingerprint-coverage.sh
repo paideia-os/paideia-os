@@ -303,6 +303,19 @@ ALLOWLIST = {
         "R73.M1-001 sys_kill body live; shell tier-2 job-control "
         "(satellite repo paideia-os/shell) is the caller — no kernel-"
         "side boot witness spawns kill-STOP/CONT sequence.",
+
+    # src/kernel/core/cap/kind_tui_canvas.pdx — R89.M1-001 (#1988) row +
+    # mint gate landing. kind_tui_canvas_mint_body has no caller
+    # anywhere in the tree at this landing: cap_handler_tui_canvas
+    # (R89.M1-002) and the boot witness that actually mints a canvas
+    # (r89_tui_canvas.pdx, R89.M1-005) are both later milestone items
+    # per design/kernel/kind-tui-canvas.md's implementation-files
+    # table. Becomes assertable once r89_tui_canvas.pdx mints a canvas
+    # at boot.
+    "tui canvas mint ok [legacy: TUI CANVAS MINT OK]":
+        "R89.M1-001 (#1988): kind_tui_canvas_mint_body has no caller "
+        "yet — dispatch (R89.M1-002) and the boot witness "
+        "(r89_tui_canvas.pdx, R89.M1-005) are later milestone items.",
 }
 
 # Below these counts the extractor has stopped matching rather than the
