@@ -305,31 +305,35 @@ ALLOWLIST = {
         "side boot witness spawns kill-STOP/CONT sequence.",
 
     # src/kernel/core/cap/kind_tui_canvas.pdx — R89.M1-001 (#1988) row +
-    # mint gate landing. kind_tui_canvas_mint_body has no caller
-    # anywhere in the tree at this landing: cap_handler_tui_canvas
-    # (R89.M1-002) and the boot witness that actually mints a canvas
-    # (r89_tui_canvas.pdx, R89.M1-005) are both later milestone items
-    # per design/kernel/kind-tui-canvas.md's implementation-files
-    # table. Becomes assertable once r89_tui_canvas.pdx mints a canvas
-    # at boot.
+    # mint gate. R89.M1-005 (#1992, src/kernel/boot/witness/
+    # r89_tui_canvas.pdx) now calls kind_tui_canvas_mint_body at every
+    # boot, so this marker DOES print on every boot — the "no caller
+    # anywhere in the tree" rationale this entry carried through
+    # R89.M1-001..004 no longer holds. It stays allowlisted because no
+    # golden file asserts this specific line yet: the witness's own
+    # fingerprint ("boot tui canvas ok -- ...", all-lowercase, no OK
+    # token) is the assertable signal for this code path instead. Add
+    # a golden line for the literal "tui canvas mint ok" text if a
+    # future mode wants to pin it directly.
     "tui canvas mint ok [legacy: TUI CANVAS MINT OK]":
-        "R89.M1-001 (#1988): kind_tui_canvas_mint_body has no caller "
-        "yet — dispatch (R89.M1-002) and the boot witness "
-        "(r89_tui_canvas.pdx, R89.M1-005) are later milestone items.",
+        "R89.M1-005 (#1992): reachable at every boot via "
+        "r89_tui_canvas.pdx's witness_r89_tui_canvas, but no golden "
+        "file asserts this exact line — the witness's own lowercase "
+        "'boot tui canvas ok --' fingerprint covers this code path.",
 
     # src/kernel/core/tui/canvas_present.pdx — R89.M1-003 (#1990)
-    # TUI_OP_PRESENT real body. tui_present_body is dispatched from
-    # cap_handler_tui_canvas's PRESENT arm, but PRESENT is reachable
-    # only via cap_invoke on a LIVE canvas row, and no row is ever
-    # minted anywhere in the tree at this landing (same reasoning as
-    # the "tui canvas mint ok" entry immediately above: mint has no
-    # caller until the R89.M1-005 boot witness lands). Becomes
-    # assertable once that witness mints a canvas and invokes PRESENT.
+    # TUI_OP_PRESENT real body. Same status change as the "tui canvas
+    # mint ok" entry immediately above: R89.M1-005's boot witness now
+    # invokes PRESENT on every boot (dispatch requires a live canvas
+    # row, which the witness mints first), so "no reachable caller"
+    # is no longer true either. Still allowlisted for the same reason
+    # — no golden line asserts this literal text yet.
     "tui canvas present ok [legacy: TUI CANVAS PRESENT OK]":
-        "R89.M1-003 (#1990): tui_present_body has no reachable caller "
-        "yet — dispatch requires a live canvas row, and "
-        "kind_tui_canvas_mint_body (R89.M1-001) has no caller until "
-        "the boot witness (r89_tui_canvas.pdx, R89.M1-005) lands.",
+        "R89.M1-005 (#1992): reachable at every boot via "
+        "r89_tui_canvas.pdx's witness_r89_tui_canvas (mints a canvas "
+        "then invokes PRESENT), but no golden file asserts this exact "
+        "line — the witness's own lowercase 'boot tui canvas ok --' "
+        "fingerprint covers this code path.",
 
     # src/kernel/core/cap/kind_tty.pdx tag_tty_read_ok — R66v2.POS-001
     # (#1986). DECLARED but not emitted from any body: TTY_OP_READ is a
