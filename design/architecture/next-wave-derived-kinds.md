@@ -2356,12 +2356,19 @@ that then collided with `KIND_PDXFS_MOUNT_TABLE = 0x1A5` (R53-PREP-001
 #1728, landed first). **Fix #2005 (2026-09-01)** renumbered the TCP
 pair — newer landing, smaller footprint — to `KIND_TCP_SOCKET = 0x1AB`
 and `KIND_TCP_LISTENER = 0x1AC`, sitting immediately after the R91-R99
-networking reservation block (0x1A7..0x1AA). `KIND_PDXFS_MOUNT_TABLE`
-kept its original slot at 0x1A5. `0x197`..`0x1A3` are unaudited by
-this pass — a future pass should confirm what (if anything) landed in
-that range. The four rows in the 0x1A7..0x1AA reservation block are
-new reservations from the R91–R99 networking wave; `0x1A9` and `0x1AA`
-are reserved-but-unimplemented (see `design/networking/r91-plan.md`
+networking reservation block (originally 0x1A7..0x1AA). **R100-PREP-001
+(#2007, 2026-09-01)** then reclaimed the first slot in that
+reservation block, `0x1A7`, for `KIND_TLS_TRUST` (a shipped landing
+with a boot witness), superseding the R91.M1-001 `KIND_NIC`
+placeholder that had never advanced beyond "reserved" — the
+reservation had no kind file, no dispatch branch, and no witness, and
+`KIND_TLS_TRUST` was named as the placeholder for this same ordinal
+in `design/networking/r100-user-tools-plan.md §12.3` from the moment
+that plan drafted. `KIND_PDXFS_MOUNT_TABLE` kept its original slot at
+0x1A5. `0x197`..`0x1A3` are unaudited by this pass — a future pass
+should confirm what (if anything) landed in that range. `0x1A8`..
+`0x1AA` remain reserved from the R91–R99 networking wave; `0x1A9` and
+`0x1AA` are reserved-but-unimplemented (see `design/networking/r91-plan.md`
 §11, §12).
 
 | Value  | Name                     | Base                              | Purpose (short)                                                                                     | Discipline                    | Failure band        | File                            |
@@ -2369,7 +2376,7 @@ are reserved-but-unimplemented (see `design/networking/r91-plan.md`
 | 0x1A4  | *(retired — was `KIND_TCP_LISTENER`)* | —              | Vacated by fix#2005 (2026-09-01): `KIND_TCP_LISTENER` moved to 0x1AC to sit adjacent to the relocated `KIND_TCP_SOCKET`. Do not reuse this ordinal until a dedicated audit confirms no stale reference remains. | *(vacated)*                    | —                    | —                                |
 | 0x1A5  | `KIND_PDXFS_MOUNT_TABLE` | `KIND_MEMORY = 4`                 | *(backfill — R53-PREP-001 #1728)* Row-append authority for the mount table. Landed first at 0x1A5; TCP's collision at this ordinal (#1928) was resolved in fix#2005 by moving TCP to 0x1AB/0x1AC. See `core/cap/kind_pdxfs_mount_table.pdx`. | derived                       | *(not audited by this pass)* | `core/cap/kind_pdxfs_mount_table.pdx` |
 | 0x1A6  | `KIND_TUI_CANVAS`        | *(not audited by this pass)*      | *(backfill — R89, #1988-1989, landed/closed; see `design/round-retrospectives/r89-closure.md`)*. Row/discipline detail out of scope for this networking-focused backfill. | *(not audited)*                | *(not audited)*     | `core/cap/kind_tui_canvas.pdx`  |
-| 0x1A7  | `KIND_NIC`               | `KIND_DEVICE = 10`                | R91.M1-001 (new): device-level NIC authority — active backend selector (e1000e / virtio-net / rtl8139), MAC, link state. Root-minted at the single boot-time probe. | derived                       | *(assign at filing)* | `kind_nic.pdx`                  |
+| 0x1A7  | `KIND_TLS_TRUST`         | `KIND_MEMORY = 4`                 | R100-PREP-001 (#2007, landed): one pinned TLS trust anchor (raw Ed25519 public key + algo tag + 16-byte label), consumed by `pdxcurl` once per invocation at TLS 1.3 handshake setup. Derived over `KIND_MEMORY`, same posture as `KIND_SIG_KEY` / `KIND_PDXFS_MOUNT_TABLE`. Immutable-once-minted: `R_TLS_TRUST_READ` (0x001) is the only right; no WRITE/MINT/REVOKE op ever. Dispatched via `cap_invoke_dispatch` (`cap_handler_tls_trust`). Supersedes the earlier R91.M1-001 `KIND_NIC` reservation at this ordinal — that placeholder never landed a kind file, dispatch branch, or witness; a future R91 landing that still wants NIC authority reallocates from the next free tag (0x1AD or above). | derived                       | `0xFFFFEB20..0xFFFFEB27` | `core/cap/kind_tls_trust.pdx` + `core/cap/cap_handler_tls_trust.pdx` |
 | 0x1A8  | `KIND_UDP_SOCKET`        | `KIND_IPC_ENDPOINT = 5`           | R93.M2-001 (new): modern re-registration of UDP-socket authority, superseding the pre-R30-numbering-scheme `KIND_UDP_SOCKET = 0x50` (`core/cap/udp_socket_cap.pdx`, R27.M6). The `0x50` value is retired, not reused — a stale reference to it must fail a build-time check, not silently alias this new meaning. Root-minted, mirrors `KIND_TCP_SOCKET`'s posture. | derived                       | *(assign at filing)* | `net/udp_socket.pdx`            |
 | 0x1A9  | `KIND_PACKET_FILTER`     | `KIND_IPC_ENDPOINT = 5`           | R96.M3-001 (new): **reserved, unimplemented.** Future packet-filter-chain installation authority. Chain semantics (numeric priority 0-999, `Drop` short-circuits, `Accept` continues, tie-break by registration order) are already specified at `design/network/filter-chain.md` — do not re-decide them when this ordinal is implemented. | reserved                       | —                    | —                                |
 | 0x1AA  | `KIND_TLS_CONN`          | `KIND_TCP_SOCKET = 0x1AB`         | R97.M2-001 (new): **reserved, unimplemented.** Future in-kernel PQ-hybrid TLS connection, pending paideia-as gaining the classical bridge primitives (HKDF-SHA256, SHA-256, ECDSA/RSA certificate verification, X25519) a real-Internet TLS 1.3 handshake needs — see `design/networking/r91-plan.md` §11/§13. Until then, TLS lives entirely in user-space per that document's ratification of `design/network/stack.md` NET-D6. Base ordinal reflects fix#2005's TCP renumber. | reserved                       | —                    | —                                |

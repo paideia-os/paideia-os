@@ -6366,6 +6366,37 @@ fi
 echo "[r53-prep-confine] R53-PREP-001 (KIND_PDXFS_MOUNT_TABLE handle) confined"
 
 # ---------------------------------------------------------------------------
+# R100-PREP-001 (#2007): one-writer discipline for KIND_TLS_TRUST.
+#
+#   * kind_tls_trust (KIND_TLS_TRUST = 0x1A7, over KIND_MEMORY)
+#
+# _tls_trust_table + _tls_trust_stats are the only places in the kernel
+# where pinned-TLS-trust-anchor authority lives.  A second writer would
+# let one caller forge a trust anchor's public key or algorithm tag with
+# no capability involved -- and per design/networking/r100-user-tools-
+# plan.md §12.3, this is the single point of authority pdxcurl walks
+# during the TLS 1.3 handshake to validate the server's transcript
+# signature.  Per-module confinement is what makes forging unreachable
+# by construction; the sole writers are tls_trust_tail_alloc + tls_
+# trust_tail_free + tls_trust_note + tls_trust_table_reset (all in
+# kind_tls_trust.pdx).  Mirrors the KIND_SIG_KEY gate a few blocks up
+# one-for-one; same trust-anchor authority discipline.
+R100_TLST_SRC="${REPO_ROOT}/src/kernel/core/cap/kind_tls_trust.pdx"
+if [[ ! -f "${R100_TLST_SRC}" ]]; then
+    echo "[r100-prep-001-confine] FAIL - kind_tls_trust.pdx missing" >&2
+    exit 1
+fi
+ec_confine_one '_tls_trust_table' 'core/cap/kind_tls_trust.o'
+ec_confine_one '_tls_trust_stats' 'core/cap/kind_tls_trust.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See kind_tls_trust.pdx §1 for the per-module one-writer" >&2
+    echo "  discipline (the sole writers are tls_trust_tail_alloc + " >&2
+    echo "  tls_trust_tail_free + tls_trust_note + tls_trust_table_reset)." >&2
+    exit 1
+fi
+echo "[r100-prep-001-confine] R100-PREP-001 (KIND_TLS_TRUST) confined"
+
+# ---------------------------------------------------------------------------
 # R52.M5-002 (#1704): one-writer discipline for the on-disk JBNL journal
 # ring's writer/walker state.
 #

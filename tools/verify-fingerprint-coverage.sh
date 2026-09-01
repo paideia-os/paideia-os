@@ -321,6 +321,23 @@ ALLOWLIST = {
         "file asserts this exact line — the witness's own lowercase "
         "'boot tui canvas ok --' fingerprint covers this code path.",
 
+    # src/kernel/core/cap/kind_tls_trust.pdx — R100-PREP-001 (#2007)
+    # mint-body fingerprint, emitted once per KIND_TLS_TRUST mint from
+    # inside kind_tls_trust_mint_body. Reachable at every boot via
+    # r100_tls_trust.pdx's witness_r100_tls_trust (mints a trust
+    # anchor over a static Ed25519-shaped pubkey buffer). Same "no
+    # golden file asserts this exact line" posture as the KIND_TUI_
+    # CANVAS mint-marker entry immediately above; the witness's own
+    # lowercase "boot tls trust ok --" fingerprint is the assertable
+    # signal for this code path. Add a golden line for the literal
+    # "tls trust mint ok" text if a future mode wants to pin it
+    # directly.
+    "tls trust mint ok [legacy: TLS TRUST MINT OK]":
+        "R100-PREP-001 (#2007): reachable at every boot via "
+        "r100_tls_trust.pdx's witness_r100_tls_trust, but no golden "
+        "file asserts this exact line — the witness's own lowercase "
+        "'boot tls trust ok --' fingerprint covers this code path.",
+
     # src/kernel/core/tui/canvas_present.pdx — R89.M1-003 (#1990)
     # TUI_OP_PRESENT real body. Same status change as the "tui canvas
     # mint ok" entry immediately above: R89.M1-005's boot witness now
