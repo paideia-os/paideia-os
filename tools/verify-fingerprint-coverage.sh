@@ -86,6 +86,13 @@ ALLOWLIST = {
     # -- Section A: production (src/kernel/**) markers on genuinely
     #    unreachable paths. Triaged for #1578.
 
+    # src/kernel/boot/witness/rootfs_seed_policy.pdx (R90-XREPO.011.M1-004 #2119):
+    # policy seed marker fires every boot (witness runs unconditionally) but
+    # no golden asserts it yet; add golden line once the elevate-broker smoke
+    # (R90-XREPO.011.M1-003 #2122) is written and consumes the seeded file.
+    "policy seed ok [legacy: POLICY SEED OK]":
+        "witness fires every boot; assertable golden lands with R90-XREPO.011.M1-003 (#2122) elevate-broker smoke.",
+
     # src/kernel/core/iommu/vtd_fault.pdx — vtd_fault_dispatch's own
     # header says "NOT WIRED AT M4 BOOT", and a tree-wide grep confirms
     # no caller in src/ or tests/. The function is reachable only once
@@ -333,6 +340,31 @@ ALLOWLIST = {
         "which the R100-PREP-001 witness triggers via the same cascade "
         "without a golden line either.",
 
+    # src/kernel/core/sched/wait.pdx -- R90-XREPO.011.M1-001 (paideia-os
+    # #2117) kernel-side sched_wait / sched_wake_kind primitive. Both
+    # markers emit from inside the primitive itself, not from a boot
+    # witness: the parent-issue text names a two-thread park/notify
+    # witness that lands with the sibling elevate-broker dispatch-loop
+    # milestone (R90-XREPO.011.M1-003), which is the first real
+    # consumer of the primitive. At this landing no kernel-side path
+    # invokes the primitive on the default boot cascade (elevate broker
+    # is still the R48b substrate-prep stub, no dispatch loop yet), so
+    # neither marker prints on any golden line. Both retire from this
+    # allowlist when the M1-003 dispatch loop lands its witness and a
+    # golden line pins the fingerprint. Same posture as the R73
+    # `sys kill ok` entry above -- kernel path live, no boot witness
+    # spawns the exercise sequence.
+    "sched wait ok [legacy: SCHED WAIT OK]":
+        "R90-XREPO.011.M1-001 (#2117): sched_wait emits this at entry. "
+        "No boot witness parks a thread on a wait key yet; the elevate-"
+        "broker dispatch loop that first exercises the primitive lands "
+        "with R90-XREPO.011.M1-003.",
+    "sched wake ok [legacy: SCHED WAKE OK]":
+        "R90-XREPO.011.M1-001 (#2117): sched_wake_kind emits this iff "
+        "woken>0. No boot witness fires a notify at a parked thread "
+        "yet; the elevate-broker dispatch loop that first exercises "
+        "the primitive lands with R90-XREPO.011.M1-003.",
+
     # src/kernel/core/cap/kind_tui_canvas.pdx — R89.M1-001 (#1988) row +
     # mint gate. R89.M1-005 (#1992, src/kernel/boot/witness/
     # r89_tui_canvas.pdx) now calls kind_tui_canvas_mint_body at every
@@ -439,6 +471,23 @@ ALLOWLIST = {
         "devfs node ever populates that path in this tree yet, and "
         "backend_id=5 is UNIMPL regardless. Assertable once real "
         "hardware/devfs + R51/R52 pdxfs-block land together.",
+
+    # src/kernel/core/cap/kind_elevate_channel.pdx tag_elvc_expire_set_ok
+    # — R90-XREPO.011.M1-002 (paideia-os #2118). Emitted from
+    # cap_handler_elevate_channel's ELVC_OP_SET_EXPIRE (=8) arm, but
+    # cap_handler_elevate_channel has no caller in the default 14-mode
+    # matrix at this landing: the elevate broker daemon that would drive
+    # the SET_EXPIRE op is R90-XREPO.011.M1-003 (#2119, deferred), and
+    # the consumer witness that exercises the full 100 ms-deadline ->
+    # ELVC_ERR_EXPIRED cycle is R90-XREPO.011.M1-007 (#2122, deferred).
+    # Same posture as the TTY_OP_SET_RAW / SET_COOKED sibling above —
+    # the mutation op body is landed; the caller and boot witness are
+    # separate leaves.
+    "elevate expire set ok [legacy: ELEVATE EXPIRE SET OK]":
+        "R90-XREPO.011.M1-002 (#2118): ELVC_OP_SET_EXPIRE body has no "
+        "caller in this landing — the elevate broker daemon (#2119) "
+        "and the deadline-reaper witness (#2122) are separate leaves. "
+        "Assertable once either lands and drives SET_EXPIRE.",
 }
 
 # Below these counts the extractor has stopped matching rather than the

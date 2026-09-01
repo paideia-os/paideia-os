@@ -1,0 +1,352 @@
+// src/kernel/core/sched/wait.pdx -- R90-XREPO.011.M1-001 (paideia-os #2117)
+//
+// Kernel-side scheduler wait / notify primitive keyed by a
+// (wait_kind, wait_object_ptr) pair.
+//
+// Design authority: design/kernel/sched-wait.md.
+//
+// =============================================================================
+// PURPOSE
+// =============================================================================
+//
+// A kernel-side service (starting with svc.elevate-broker) that owns a
+// channel needs to park a worker thread until a request arrives on that
+// channel, and be woken by a peer task / ISR / cap-op path when a
+// request lands. `sys_wait4` is process-oriented (waits for a child
+// zombie); the target here is a generic "block until something matching
+// this key becomes true" primitive, and the something can be produced
+// from anywhere.
+//
+// The R15-M7-006 (#567) sched_block / sched_wake primitives already
+// carry the machinery this needs -- state transitions, runqueue
+// enqueue/dequeue, IF-safe cross-call ordering, the `already RUNNABLE`
+// early exit that makes wake idempotent. This module composes them into
+// a key-indexed pair: `sched_wait(kind, obj)` records the key and calls
+// sched_block; `sched_wake_kind(kind, obj)` scans for tasks parked on
+// that key and calls sched_wake on each.
+//
+// =============================================================================
+// NAMING NOTE
+// =============================================================================
+//
+// The notify primitive here is `sched_wake_kind`, not `sched_wake`.
+// `sched_wake` (target_tcb) is the lower-level, target-indexed wake in
+// src/kernel/core/sched/wake_block.pdx, called at seven sites across
+// sys_ipc_send / sys_kill / uart_rx_notify / driver_restart /
+// sched_block_witness_helper. Renaming that primitive to make room for a
+// key-indexed wake is a large blast radius for a naming preference;
+// giving the new one a distinct name is the local cost. `sched_wake_
+// kind` is chosen for parity with `sched_wait` (both take the same key).
+//
+// =============================================================================
+// TCB FIELDS
+// =============================================================================
+//
+// Two u64 fields inside the 2224-byte task_struct slab. Both live in
+// the free region above the fd_table + runqueue-link words (fd_table
+// ends at +424; runqueue links at +432 / +440):
+//
+//   TASK_OFF_WAIT_KIND   = 448  (u64) -- SCHED_WAIT_* value, 0 if idle
+//   TASK_OFF_WAIT_OBJECT = 456  (u64) -- opaque per-kind pointer, 0 if idle
+//
+// Both are covered by `task_new`'s existing 278-qword `rep stosq` zero-
+// fill (task_pool.pdx step 5), so every fresh task starts at 0 (==
+// SCHED_WAIT_NONE, no unbound task ever satisfies a real key).
+//
+// Verified clean via grep for `+448` / `+456` against src/kernel/**/*.
+// pdx at landing -- no other consumer of these offsets.
+//
+// =============================================================================
+// RACE POSTURE
+// =============================================================================
+//
+// At R15.M7 the sched substrate has no timer preemption (#565 blocked
+// on #662) and paideia-os today boots -smp 1. `sched_wait`'s (store
+// key, block) sequence and `sched_wake_kind`'s (scan, match, wake)
+// sequence run with interrupts enabled but with no concurrent scheduler
+// to observe an intermediate state. The classic wakeup race is
+// therefore structurally impossible today.
+//
+// When preemption lands, `sched_block`'s own §7.2 deferred cli/popfq
+// window around its state-flip + dequeue steps subsumes this primitive:
+// the wait-key store here happens BEFORE sched_block's state-flip, so
+// a preemption between the two would leave the state RUNNABLE with a
+// bogus wait key set -- harmless because the scan in `sched_wake_kind`
+// filters on state == TASK_STATE_WAITING (2). SMP raises the bar
+// further and needs a per-key spinlock; that is a future round.
+//
+// =============================================================================
+// FINGERPRINT DISCIPLINE
+// =============================================================================
+//
+// Two markers, both emitted from the primitive itself:
+//
+//   sched wait ok [legacy: SCHED WAIT OK] -- kind=<n>
+//     at sched_wait entry, after the key is stored, before sched_block.
+//
+//   sched wake ok [legacy: SCHED WAKE OK] -- kind=<n>
+//     at sched_wake_kind exit, iff woken count > 0. A call that matches
+//     no waiter emits nothing so a busy notify loop cannot flood.
+//
+// Tags declared in src/kernel/core/klog/keys.pdx (tag_sched_wait_ok,
+// tag_sched_wake_ok, k_kind). Both contain a standalone uppercase OK
+// token in their bracketed legacy-alias suffix; the coverage gate at
+// tools/verify-fingerprint-coverage.sh receives allowlist entries
+// alongside this landing, retired when the sibling milestone (R90-
+// XREPO.011.M1-003 elevate-broker dispatch loop) grows a witness.
+
+module SchedWait = structure {
+
+  // ==========================================================================
+  // Wait-kind enum. Values are u64 to keep memops single-instruction.
+  // Grow this table when a new consumer arrives.
+  // ==========================================================================
+
+  pub let SCHED_WAIT_NONE               : u64 = 0
+  pub let SCHED_WAIT_ELEVATE_CHANNEL_RX : u64 = 1
+
+  // ==========================================================================
+  // TCB byte offsets. Written from this file only. Zero-initialised by
+  // task_new (task_pool.pdx step 5, rep_stosq 278 qwords covers both).
+  //
+  // The 6-byte gap at +122..+127 documented in task_pool.pdx's "Adopted
+  // slots" table is too small for a (u64, u64) pair. No 16-byte-aligned
+  // free slot exists below TASK_OFF_CWD (+160). fd_table occupies +168..
+  // +423; runqueue links at +432 / +440. +448..+463 is the next 8-
+  // aligned pair of qwords with no prior consumer.
+  // ==========================================================================
+
+  pub let TASK_OFF_WAIT_KIND    : u64 = 448
+  pub let TASK_OFF_WAIT_OBJECT  : u64 = 456
+
+  // ==========================================================================
+  // sched_wait(kind, obj) -- self-suspend the caller on (kind, obj).
+  // ==========================================================================
+  //
+  // Sequence:
+  //   (0) refuse kind == SCHED_WAIT_NONE (0); a zero key would match
+  //       every fresh task's zero-initialised wait fields and turn a
+  //       stray sched_wake_kind(0, _) into a mass-wake bug.
+  //   (1) store (kind, obj) into the caller's TCB at +448 / +456. Must
+  //       happen BEFORE the fingerprint emit and the sched_block call
+  //       so a race that fires sched_wake_kind between (1) and the
+  //       state-flip inside sched_block still finds a matching TCB;
+  //       the wake path's scan filters on state == TASK_STATE_WAITING
+  //       so an early wake before sched_block flips state is harmless
+  //       (the scan simply skips this task; sched_block then finds the
+  //       state RUNNABLE and its own #663 kassert passes).
+  //   (2) emit the `sched wait ok -- kind=<n>` fingerprint via
+  //       klog_s1_d1. Non-leaf.
+  //   (3) call sched_block. State goes RUNNABLE -> WAITING, runqueue
+  //       dequeue, pick_next, switch. Returns here when some peer
+  //       calls sched_wake_kind matching our key (or, defensively, if
+  //       some other path calls sched_wake on us directly -- our wait
+  //       fields get zeroed in step 4 regardless).
+  //   (4) on resume, zero the wait fields defensively so a subsequent
+  //       sched_wake_kind on the same key does not spuriously re-wake
+  //       us. This mirrors sys_ipc_send's clear-before-wake ordering
+  //       (rx_notify.pdx §3.4).
+  //
+  // Register discipline: entry rsp%16 == 8. 3-push callee-save prologue
+  // (rbx, r12, r13); rbx unused semantically but present to land rsp %
+  // 16 == 0 for the two nested calls (klog_s1_d1, sched_block). r12 =
+  // kind, r13 = obj -- both must outlive klog_s1_d1 (which per SysV
+  // preserves rbx/rbp/r12-r15) and sched_block (whose own justification
+  // preserves the same set via its underlying sched_switch_r15 cli/
+  // popfq window). rax/rcx/rdx/rdi/rsi/r8/r9 caller-save scratch.
+  //
+  // Effects mem+sysreg, capabilities {sched}: mem is the TCB writes;
+  // sysreg is transitive from sched_block's own sysreg effect (its
+  // pick_next reads gs_base via rdmsr). sched is transitive from
+  // sched_block's own @{sched} capability.
+
+  pub let sched_wait : (u64, u64) -> () !{mem, sysreg} @{sched} =
+    fn (kind: u64) (obj: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {sched},
+      justification: "R90-XREPO.011.M1-001 (paideia-os #2117): self-suspend the caller on (kind, obj). Sequence: (0) refuse kind==0 (SCHED_WAIT_NONE sentinel), returning silently -- a zero key would match every fresh task's zero-initialised wait fields and let a subsequent sched_wake_kind(0, _) mass-wake unrelated tasks. (1) store kind/obj into _current_tcb's TASK_OFF_WAIT_KIND (+448) and TASK_OFF_WAIT_OBJECT (+456) BEFORE emitting the fingerprint and before calling sched_block, so a peer that fires sched_wake_kind between our store and sched_block's state-flip still finds this task on scan (the scan filters on state==WAITING(2) so an early wake harmlessly skips us; sched_block's own #663 RUNNABLE kassert then passes as expected on the state-flip). (2) emit `sched wait ok -- kind=<n>` via klog_s1_d1(LEVEL_INFO=3, SUBSYS_SCHD, tag_sched_wait_ok, k_kind, r12=kind). (3) call sched_block -- flips state RUNNABLE -> WAITING (its own step 2), runq_dequeue, sched_pick_next_r15, sched_switch_r15 (§#567 justification). Returns here when a peer calls sched_wake on this TCB (either via sched_wake_kind matching our (kind, obj) key, or defensively any other target-indexed sched_wake call). (4) on resume, zero the wait fields (both u64 at +448 / +456) so a subsequent sched_wake_kind on the same key does not re-wake us -- mirrors uart_rx_notify_wake_if_waiter's clear-before-wake ordering (rx_notify.pdx §3.4). Register discipline: 3-push callee-save prologue (rbx, r12, r13); entry rsp%16==8, 3 pushes land at rsp%16==0 -- the state klog_s1_d1 and sched_block require. rbx unused semantically (present for the alignment). r12=kind, r13=obj (both must outlive the nested calls; SysV preserves rbx/rbp/r12-r15 across every call in this path). rax/rcx/rdx/rdi/rsi/r8/r9 caller-save scratch. Effects mem+sysreg (mem for the TCB writes, sysreg transitive from sched_block's underlying pick_next.gs_base rdmsr); capabilities {sched} transitive from sched_block. Labels prefixed sw_.",
+      block: {
+        // (0) Refuse the SCHED_WAIT_NONE (0) sentinel key.
+        cmp rdi, 0;
+        je  sw_noop;
+
+        push rbx;
+        push r12;
+        push r13;
+
+        mov r12, rdi;                        // r12 = kind (survives every nested call)
+        mov r13, rsi;                        // r13 = obj  (survives every nested call)
+
+        // (1) Store (kind, obj) into current TCB BEFORE the fingerprint
+        //     emit and before sched_block, so a racing sched_wake_kind
+        //     between the store and the state-flip still finds us on
+        //     scan (harmless: it filters state==WAITING and skips us
+        //     until sched_block's step 2 flips the state).
+        mov rax, [rip + _current_tcb];
+        mov [rax + 448], r12;                // TASK_OFF_WAIT_KIND
+        mov [rax + 456], r13;                // TASK_OFF_WAIT_OBJECT
+
+        // (2) Emit `sched wait ok -- kind=<n>` via klog_s1_d1(LEVEL_INFO,
+        //     SUBSYS_SCHD, tag_sched_wait_ok, k_kind, kind).
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_SCHD];
+        lea rdx, [rip + tag_sched_wait_ok];
+        lea rcx, [rip + k_kind];
+        mov r8,  r12;                        // value = kind
+        call klog_s1_d1;
+
+        // (3) sched_block -- self-suspend. RUNNABLE -> WAITING, dequeue,
+        //     pick_next, switch. Returns when a peer wakes us.
+        call sched_block;
+
+        // (4) On resume, zero the wait fields defensively (belt-and-
+        //     braces against a spurious re-wake on the same key).
+        mov rax, [rip + _current_tcb];
+        xor rcx, rcx;
+        mov [rax + 448], rcx;                // TASK_OFF_WAIT_KIND = 0
+        mov [rax + 456], rcx;                // TASK_OFF_WAIT_OBJECT = 0
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      sw_noop:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sched_wake_kind(kind, obj) -> u64 -- wake all tasks parked on
+  //                                       (kind, obj); returns count.
+  // ==========================================================================
+  //
+  // Sequence:
+  //   (0) refuse kind == SCHED_WAIT_NONE (0); returns 0 without scanning.
+  //       Same rationale as sched_wait's step (0): a zero key would
+  //       match every fresh task's zero-initialised wait fields.
+  //   (1) scan pid in [1, PID_MAX=63] via task_slab_of_pid (bounds-
+  //       checked, returns 0 for out-of-range or unallocated). For each
+  //       live slab, filter on:
+  //         (a) state == TASK_STATE_WAITING (2)
+  //         (b) [slab + 448] == kind
+  //         (c) [slab + 456] == obj
+  //       On triple-match: zero the wait fields, then call sched_wake
+  //       (wake_block.pdx) on the target slab. Bump woken counter.
+  //   (2) if woken > 0, emit `sched wake ok -- kind=<n>` fingerprint
+  //       via klog_s1_d1. No emit on the empty-match path so a busy
+  //       notify loop (broker spinning while its queue is briefly
+  //       empty) cannot flood the klog ring.
+  //   (3) return woken count.
+  //
+  // Register discipline: entry rsp%16 == 8. 5-push callee-save prologue
+  // (rbx=scan idx, r12=kind, r13=obj, r14=woken count, r15=matched
+  // slab); 5 pushes = 40 bytes, (8+40)%16 == 0 -- the state every
+  // nested call requires (task_slab_of_pid, sched_wake, klog_s1_d1
+  // all need rsp%16==0 on entry). All five must survive at least one
+  // nested call across the scan loop, so all five are callee-save.
+  //
+  // Iteration bound: PID_MAX = 63 (task_pool.pdx pins this against
+  // MAX_PIDS = 64 minus the reserved pid-0 sentinel). No unbounded
+  // loop; the scan is O(63) worst case.
+  //
+  // Effects mem+sysreg, capabilities {sched}: mem for the TCB field
+  // reads; sysreg is transitive from sched_wake's own sysreg effect
+  // (its runq_enqueue reads gs_base via rdmsr). sched transitive from
+  // sched_wake's @{sched, boot} capability -- the {boot} half is only
+  // needed by the cross-CPU IPI branch, which under -smp 1 never
+  // fires; declaring {sched} alone matches the shape sys_kill.pdx
+  // takes at its own sched_wake call site.
+
+  pub let sched_wake_kind : (u64, u64) -> u64 !{mem, sysreg} @{sched} =
+    fn (kind: u64) (obj: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {sched},
+      justification: "R90-XREPO.011.M1-001 (paideia-os #2117): scan the task pool for tasks parked on (kind, obj) and wake each one. Sequence: (0) refuse kind==0 (SCHED_WAIT_NONE sentinel) with rax=0 return -- a zero key would match every fresh task's zero-initialised wait fields (task_new's rep_stosq covers +448/+456), so a caller passing 0 would mass-wake unrelated tasks. (1) scan pid in [1, PID_MAX=63] via task_slab_of_pid (task_pool.pdx §1594, bounds-checked, returns 0 for out-of-range or unallocated slots so the null-check below covers both). For each live slab, filter on: (a) [slab+8]==TASK_STATE_WAITING(2) via a u32 load matching state.pdx's canonical field width; (b) [slab+448]==kind; (c) [slab+456]==obj. On triple-match, zero both wait fields FIRST (clear-before-wake ordering, mirrors uart_rx_notify_wake_if_waiter §3.4) then call sched_wake(slab) -- flips WAITING->RUNNABLE, runq_enqueue (wake_block.pdx §#567). Bump woken counter (r14). (2) if woken > 0, emit `sched wake ok -- kind=<n>` via klog_s1_d1(LEVEL_INFO=3, SUBSYS_SCHD, tag_sched_wake_ok, k_kind, r12=kind). Deliberately NO emit on the empty-match path so a busy notify loop (broker spinning while its queue is briefly empty) cannot flood the klog ring -- matches the R73 sys_kill / R100 sys_icmp_echo pattern of one-emit-per-successful-op. (3) return woken count in rax. Iteration bound: PID_MAX=63 (task_pool.pdx pins this against MAX_PIDS=64 minus reserved pid-0 sentinel); no unbounded loop. Register discipline: 5-push callee-save prologue (rbx=scan idx, r12=kind, r13=obj, r14=woken count, r15=matched slab); entry rsp%16==8, 5 pushes = 40 bytes lands (8+40)%16==0 -- the state every nested call (task_slab_of_pid, sched_wake, klog_s1_d1) requires. All five callee-save regs must survive at least one nested call across the scan (task_slab_of_pid returns in rax which we then move into r15; sched_wake takes its arg in rdi and per SysV preserves rbx/rbp/r12-r15). Caller-save regs rax/rcx/rdx/rdi/rsi/r8/r9 scratch throughout. Effects mem+sysreg (mem for TCB field reads/writes; sysreg transitive from sched_wake's underlying runq_enqueue.gs_base rdmsr); capabilities {sched} transitive from sched_wake -- the {boot} half of sched_wake's own capability set covers only its cross-CPU IPI branch (which under -smp 1 cannot fire, so a caller with only {sched} suffices, matching sys_kill's own sched_wake call site). Labels prefixed swk_.",
+      block: {
+        // (0) Refuse the SCHED_WAIT_NONE (0) sentinel key.
+        cmp rdi, 0;
+        je  swk_noop;
+
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                        // r12 = kind
+        mov r13, rsi;                        // r13 = obj
+        xor r14, r14;                        // r14 = woken count = 0
+        mov rbx, 1;                          // rbx = scan index (pid starts at 1)
+
+      swk_scan:
+        // Loop guard: PID_MAX+1 = 64 (task_pool.pdx MAX_PIDS bound).
+        cmp rbx, 64;
+        jae swk_scan_done;
+
+        // slab = task_slab_of_pid(pid)
+        mov rdi, rbx;
+        call task_slab_of_pid;               // rax = slab VA or 0
+        cmp rax, 0;
+        je  swk_next;                        // unallocated pid -> skip
+
+        mov r15, rax;                        // r15 = live slab (survives sched_wake call)
+
+        // Filter (a): state == TASK_STATE_WAITING (2). u32 load @ +8.
+        mov ecx, [r15 + 8];
+        cmp ecx, 2;                          // TASK_STATE_WAITING
+        jne swk_next;
+
+        // Filter (b): wait_kind matches.
+        mov rcx, [r15 + 448];
+        cmp rcx, r12;
+        jne swk_next;
+
+        // Filter (c): wait_object matches.
+        mov rcx, [r15 + 456];
+        cmp rcx, r13;
+        jne swk_next;
+
+        // Match. Clear the wait fields BEFORE waking (belt-and-braces
+        // against a spurious re-fire on the same key).
+        xor rcx, rcx;
+        mov [r15 + 448], rcx;
+        mov [r15 + 456], rcx;
+
+        // sched_wake(target=slab) -- flip WAITING -> RUNNABLE, enqueue.
+        mov rdi, r15;
+        call sched_wake;
+
+        add r14, 1;
+
+      swk_next:
+        add rbx, 1;
+        jmp swk_scan;
+
+      swk_scan_done:
+        // (2) Fingerprint iff at least one waiter was woken.
+        cmp r14, 0;
+        je  swk_ret;
+
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_SCHD];
+        lea rdx, [rip + tag_sched_wake_ok];
+        lea rcx, [rip + k_kind];
+        mov r8,  r12;                        // value = kind
+        call klog_s1_d1;
+
+      swk_ret:
+        mov rax, r14;                        // return woken count
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      swk_noop:
+        xor rax, rax;                        // no key, no wakes
+        ret
+      }
+    }
+}
