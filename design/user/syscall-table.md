@@ -86,12 +86,28 @@ preserved by the kernel.
 | 101 | `getsockname` | `fd`, `sockaddr_out` | 0 or `-errno`; R95.M2. |
 | 102 | `poll` | `fds_ptr`, `nfds`, `timeout_ms` | nready or `-errno`; fixed-size `fds` array, no dynamic `nfds` allocation. R95.M3. |
 | 103 | `icmp_echo` | `dst_addr_ptr`, `seq`, `payload_ptr`, `payload_len`, `timeout_ms` | rtt_ns (>=0) or `-errno`; requires R_NET_PRIVILEGED_PROTOCOL (kernel-side check via `cap_check_r_net_privileged_protocol`). Loopback (dst 127.x.x.x or `_ipv4_my_ip`) is synchronous through the ICMP send path; off-box wire dispatch deferred pending real ARP + wait-for-reply plumbing. R100-PREP-003 (paideia-os #2009). |
+| **517** | **`cwd_resolve`** (RESERVED) | `path_ptr`, `path_len_hint`, `abs_out_ptr`, `abs_out_cap` | strlen (excl. NUL) or `-errno`; realpath primitive for the mv/rm/cp satellite consumers. Resolves the caller's path (absolute OR relative — relative anchors at `[_current_tcb + TASK_OFF_CWD]` per `design/user/cwd-semantics.md`) and writes the resulting absolute path back into the caller buffer. Body/dispatch/fingerprint deferred; the CWD resolution policy is frozen (Option A) by paideia-os #2115 (R90-XREPO.010.M1-007). |
+| **527** | **`pdxfs_fault_inject`** (RESERVED) | `class`, `arm`, `arg0`, `arg1` | 0 or `-errno`; arms/disarms a WAL/inode/extent/undo fault class. Body/dispatch land in R90-XREPO.010.M1-005; the sysno is pre-reserved by the mv/rm design docs. |
 
 Syscalls 96–102 are **reserved by `design/networking/r91-plan.md` §17,
 not yet implemented** as of this table's refresh (R90-XREPO.009 covers
 only through 95). They will be materialized in `dispatch.pdx` as each
 round in the R91–R99 networking wave lands the corresponding handler;
 until then they fall through to `-ENOSYS` like any other unlisted number.
+
+Sysnos **517** and **527** are **pre-reserved by the R90-XREPO.010
+wave** (`design/round-retrospectives/r90-xrepo-wave3-plan.md` §2) and
+have **no body** in the tree yet — they fall through to `-ENOSYS`
+until their owning sub-issues land. Sysno 517 (`sys_cwd_resolve`) is
+the mv/rm/cp satellite consumers' realpath primitive; its cwd
+resolution semantics are frozen ahead of the body's landing by
+paideia-os #2115 (R90-XREPO.010.M1-007) — see
+`design/user/cwd-semantics.md` for the invariant every path-resolving
+syscall (§3 of that doc) already obeys and that sysno 517 inherits on
+landing. Sysno 527 (`sys_pdxfs_fault_inject`) lands in
+R90-XREPO.010.M1-005. Both slot numbers were chosen out-of-band
+(above the tightly-packed 0..103 core range) so no future contiguous
+allocation displaces them.
 
 Sysno 103 (`sys_icmp_echo`) is placed one slot above the reserved
 96–102 range rather than at 96 itself: displacing an already-documented
