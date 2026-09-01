@@ -361,6 +361,38 @@ ALLOWLIST = {
         "R66v2.POS-001 (#1986): TTY_OP_SET_RAW/SET_COOKED body has no "
         "caller yet — the syscall wire and the boot witness (#1987) "
         "are later milestone items.",
+
+    # src/user/init.pdx — R65v2.M1-001 (#1979) persistent-home mount
+    # probe. Fires only when init's sys_stat("/var/pdxfs/home.img")
+    # returns 0, i.e. a file-backed pdxfs image already exists at boot.
+    # The default tmpfs-rootfs 14-mode matrix never seeds this file, so
+    # the probe always short-circuits to the tmpfs fallback with no
+    # emission. Even were the file present, backend_id=5 (PDXFS_BLOCK)
+    # is an unconditional UNIMPL stub in sys_mount.pdx (no devfs dev-path
+    # resolver landed yet), so this line cannot fire for real until
+    # R51/R52 lands a persistent pdxfs-block rootfs — see
+    # design/user/persistent-home.md §2/§6 and the R65v2 closure retro
+    # (design/round-retrospectives/r65-closure-v2.md) for the honest
+    # scope note.
+    "init home mount ok [legacy: INIT HOME MOUNT OK] -- src=/var/pdxfs/home.img mp=/home/operator backend=PDXFS_BLOCK":
+        "R65v2.M1-001 (#1979): fires only when /var/pdxfs/home.img "
+        "exists AND sys_mount succeeds; neither holds under the default "
+        "tmpfs-rootfs boot (backend_id=5 is UNIMPL pending a devfs "
+        "dev-path resolver). Assertable once R51/R52 lands a persistent "
+        "pdxfs-block rootfs — see design/user/persistent-home.md §2/§6.",
+
+    # Sibling of the entry immediately above — device-target variant.
+    # Fires only when sys_stat("/dev/nvme0") returns 0 (a real block
+    # device node), which devfs does not provide in this tree yet
+    # (design/user/persistent-home.md §5's "no devfs" gap). Same
+    # backend_id=5 UNIMPL posture applies even were the stat to somehow
+    # succeed.
+    "init home mount ok [legacy: INIT HOME MOUNT OK] -- src=/dev/nvme0 mp=/home/operator backend=PDXFS_BLOCK":
+        "R65v2.M1-001 (#1979) / R65v2.M1-002 device-target path (#1980): "
+        "fires only when /dev/nvme0 exists AND sys_mount succeeds; no "
+        "devfs node ever populates that path in this tree yet, and "
+        "backend_id=5 is UNIMPL regardless. Assertable once real "
+        "hardware/devfs + R51/R52 pdxfs-block land together.",
 }
 
 # Below these counts the extractor has stopped matching rather than the

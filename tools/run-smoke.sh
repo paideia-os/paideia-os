@@ -30,7 +30,7 @@
 # --wipe. Every legacy invocation without the new flags launches
 # QEMU byte-for-byte as before.
 #
-#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_child_process', 'boot_r17_shell_shutdown', 'boot_smp', 'boot_r31_spawn_pair', 'boot_r86_relative_path', 'boot_r64v2_tools', 'boot_panic', 'boot_release', 'prod' (mode dispatcher)
+#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_child_process', 'boot_r17_shell_shutdown', 'boot_smp', 'boot_r31_spawn_pair', 'boot_r86_relative_path', 'boot_r64v2_tools', 'boot_r65_persistent_home', 'boot_panic', 'boot_release', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
 #     * boot_tick: validates boot_tick fingerprint (with timer TICKs), 5s timeout
@@ -54,6 +54,7 @@
 #     * boot_r17_shell_shutdown: injects 'exit\n', asserts shell exit + init reap + init shutdown (R17.M5 #639)
 #     * boot_r86_relative_path: injects 'mkdir /tmp\ncd /tmp\nmkdir ./sub\ncd ./sub\nmkdir ../peer\npwd\nexit\n', asserts cd/mkdir fingerprints + literal '/tmp/sub' + REAPED (R86.M1-008 #1961)
 #     * boot_r64v2_tools: injects 'mkfs.pdxfs --dry-run /tmp/t.img\nexit\n', asserts sys execve argv ok + the mkfs.pdxfs dry-run preview line + REAPED (R64v2, paideia-os#1976/#1977)
+#     * boot_r65_persistent_home: PHASE 1 ONLY (phase 2 deferred to R51/R52). Injects 'mkdir /home\nmkdir /home/operator\nmkfs.pdxfs --dry-run /var/pdxfs/home.img\nmount.pdxfs --dry-run cap:volume:0x0001 /home/operator\ntouch /home/operator/probe.txt\nexit\n', asserts the two mkdir fingerprints + both tools' dry-run preview lines + REAPED, 32s timeout. Opt-in via PAIDEIA_R65_PERSIST=1 (R65v2.M1-004/005, paideia-os#1982/#1983)
 #     * boot_r72_tcp_echo: validates the R72 TCP substrate boot witness (self-connect handshake + port-7 echo + mutual orderly close), 10s timeout, no special QEMU flags (R72.M1-007 #1929)
 #     * boot_smp: validates R18.M1 SMP bring-up fingerprint on -smp 4; BSP wakes 3 APs (APIC IDs 1/2/3), each emits CPU_ID_XX_HELLO; bookended by SMP BRINGUP START / DONE (R18.M1 #764)
 #     * boot_panic: validates M3-003 fake-panic emission chain witness, 8s timeout
@@ -543,6 +544,110 @@ case "${EXPECTED}" in
         : "${INJECT_WAIT_FOR:=SHELL START}"
         : "${INJECT_DELAY:=0.3}"
         : "${INJECT_HOLD:=20}"
+        EXPECTED=""
+        ;;
+    boot_r65_persistent_home)
+        # R65v2.M1-004 (paideia-os #1982): persistent-/home-operator
+        # two-phase smoke, PHASE 1 ONLY. Gated behind PAIDEIA_R65_PERSIST=1
+        # in tools/pre-push (R65v2.M1-005, #1983) — same opt-in shape as
+        # PAIDEIA_R53_DISK for boot_r53_round_trip_phase1, since the real
+        # persistence this smoke's NAME promises depends on hardware
+        # (or R51/R52's pdxfs-block rootfs) this tree does not have yet.
+        #
+        # Real ring-3 exercise, same shape as boot_r64v2_tools /
+        # boot_r86_relative_path: drives /bin/mkfs.pdxfs and
+        # /bin/mount.pdxfs through the ACTUAL interactive shell rather
+        # than a kernel-side witness (sys_execve_shim cannot be exercised
+        # before a shell exists to invoke it — see boot_r64v2_tools's own
+        # comment for why).
+        #
+        # Script: `mkdir /home\nmkdir /home/operator\nmkfs.pdxfs --dry-run
+        # /var/pdxfs/home.img\nmount.pdxfs --dry-run cap:volume:0x0001
+        # /home/operator\ntouch /home/operator/probe.txt\nexit\n`.
+        #
+        #   - `mkdir /home` + `mkdir /home/operator`: neither directory is
+        #     tmpfs-seeded at boot (grep confirms rootfs_seed.pdx /
+        #     bin_seeds.pdx / rootfs_dir_seeds.pdx seed /bin, /etc, /tmp,
+        #     /share, /pkgs, /system, /journal — never /home), so the
+        #     probe-file write below needs a real parent directory first.
+        #     This is plain tmpfs mkdir, unrelated to and not a substitute
+        #     for the pdxfs-block mount attempted next.
+        #     KNOWN GAP (debugger pass, R65v2 closure): both `mkdir`
+        #     invocations currently fail — /bin/mkdir execs and calls
+        #     sys_mkdir (sysno 79) correctly (`shell exec ok --
+        #     argv[0]=mkdir resolved=/bin/mkdir`), but the kernel-side
+        #     sys_mkdir_body never emits its own `sys mkdir ok` klog line
+        #     for these two calls, so vops_mkdir/tmpfs_create is failing
+        #     server-side and /bin/mkdir prints `MKDIR FAIL`. init.pdx's
+        #     own R65v2 probe never mkdirs /home (only sys_stat x2 +
+        #     sys_mount, see init.pdx), so this is not a regression from
+        #     this round's diff — most likely suspect is the 64-slot
+        #     tmpfs inode pool (TMPFS_MAX, core/fs/tmpfs/inode.pdx) being
+        #     exhausted or near-exhausted by the growing boot-seed
+        #     inventory (16+ /bin binaries, /share, /pkgs, /system/*,
+        #     /journal/*, plus boot self-test witness allocations) by the
+        #     time the shell reaches this script. Filed as a follow-up
+        #     for main to raise an issue on; the golden below asserts the
+        #     ACTUAL current wire (MKDIR FAIL x2) rather than the
+        #     aspirational `sys mkdir ok` text so this smoke mode stays a
+        #     real regression signal for R65v2's own in-scope surface
+        #     (init home-mount probe + shell HOME/PATH wiring + the
+        #     mkfs.pdxfs/mount.pdxfs dry-run flow) instead of red on an
+        #     unrelated, pre-existing tmpfs capacity issue.
+        #   - `mkfs.pdxfs --dry-run /var/pdxfs/home.img`: the exact path
+        #     src/user/init.pdx's own R65v2.M1-001 (#1979) boot-time probe
+        #     checks. --dry-run against a TARGET_FILE never opens/writes
+        #     the target, so no /var/pdxfs prerequisite mkdir is needed
+        #     (matches boot_r64v2_tools's own /tmp/t.img precedent).
+        #   - `mount.pdxfs --dry-run cap:volume:0x0001 /home/operator`:
+        #     `cap:volume:0x0001` is a syntactically-valid volume-cap URI
+        #     (volume_cap_parse_slot only checks the "cap:volume:0x" prefix
+        #     + hex digits — see tools/user/mount.pdxfs/src/volume_cap.pdx
+        #     — vol_kind_narrow's own M2 body is a documented passthrough,
+        #     so no real KIND_VOLUME needs to back this slot for the
+        #     dry-run path to reach its preview emit). "/home/operator"
+        #     classifies as MPC_USER_SUBTREE (elevate.pdx's elev_lit_home
+        #     = "/home/") so no elevation stub is hit.
+        #   - `touch /home/operator/probe.txt`: the "probe file" this
+        #     issue's own task text asks for. Under today's tmpfs rootfs
+        #     this write is real but ephemeral — it does NOT survive a
+        #     reboot, which is exactly PHASE 2's assertion and exactly why
+        #     phase 2 is not implemented here (see below).
+        #
+        # Golden asserts, in order: SHELL START, the child_hello reap
+        # (`WAIT: pid=9 status=42` + `REAPED`), two `shell exec ok --
+        # argv[0]=mkdir resolved=/bin/mkdir` + `MKDIR FAIL` pairs (one
+        # per mkdir — see the KNOWN GAP note above for why these fail
+        # rather than emitting `sys mkdir ok`), the mkfs.pdxfs dry-run
+        # preview fragment `PdxFsFormatRecord@0.1 { target:
+        # /var/pdxfs/home.img`, the mount.pdxfs dry-run preview fragment
+        # `PdxFsMountRecord@0.1 { volume: cap:volume:0x0001`, the literal
+        # `result_code: DRY_RUN }` (proves mount.pdxfs's own dry-run gate
+        # fired rather than falling into an elevation/bad-cap/kernel-error
+        # branch), and a final REAPED (shell exit unblocking init's
+        # second wait4).
+        #
+        # PHASE 2 (deferred, NOT implemented by this mode): a second boot
+        # that reads /home/operator/probe.txt back and asserts its
+        # contents survived. Under tmpfs that assertion would correctly
+        # FAIL every time (tmpfs is wiped on every QEMU relaunch — there
+        # is no `--with-disk`-style backing image for tmpfs), which would
+        # make this mode a permanently-red smoke rather than a real
+        # regression signal. Phase 2 becomes a genuine assertion once
+        # R51/R52 lands a real pdxfs-block rootfs (the same milestone
+        # sys_mount.pdx's own backend_id=5 UNIMPL stub is waiting on) and
+        # a `--with-disk`-shaped two-phase harness analogous to
+        # boot_r53_round_trip_phase1/phase2 can be built for it. Tracked
+        # in design/round-retrospectives/r65-closure-v2.md's debt
+        # inventory; see design/user/persistent-home.md §2/§6.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r65v2/expected-persistent-home-phase1.golden"
+        TIMEOUT=32
+        UART_RX_MODE=1
+        : "${INJECT_STRING:=mkdir /home\nmkdir /home/operator\nmkfs.pdxfs --dry-run /var/pdxfs/home.img\nmount.pdxfs --dry-run cap:volume:0x0001 /home/operator\ntouch /home/operator/probe.txt\nexit\n}"
+        : "${INJECT_WAIT_FOR:=SHELL START}"
+        : "${INJECT_DELAY:=0.3}"
+        : "${INJECT_HOLD:=25}"
         EXPECTED=""
         ;;
     boot_smp)
