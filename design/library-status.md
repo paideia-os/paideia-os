@@ -31,7 +31,7 @@ Sort: Priority DESC, then Completion ASC (highest-priority under-built rises fir
 - **libpdx-schema-registry** — completion sweep in progress. See §sweep below.
 - **libpdx-cap** — #18 landed at satellite `f472530` (2026-09-01). Completion 3→4. #20 remains open (externally blocked).
 - **libpdx-elevate** — cascade fully closed 2026-09-01. Kernel: #2117-#2120 leaves at `ede6179`, #2121 policy stamp, #2122 broker dispatch at `2225b18`. Satellite: #18 at `3e54a8e`. Completion 3→4. 0 open issues.
-- **ls** — 10 new ENH issues (#ENH-014..023) being filed for a completion sweep (2026-09-01).
+- **ls** — 10 new ENH issues filed (ls#32..41). Sweep 2026-09-01: 1/10 fully closed (ENH-019 `-F` flag), 9/10 partial-landed with commits (scaffolding + walker arms), blocked on cross-repo deps: #29 (path resolve), #24/#25/#30 (Long/Color/schema-registry wiring), plus new kernel-side gaps flagged in bodies (`sys_ttywinsize`, `sys_pdxfs_openat`, `sys_pdxfs_readlink`, `sys_pdxfs_stat_by_inode`).
 - **libpdx-net** — recommended next; not yet started.
 
 ## libpdx-schema-registry sweep
