@@ -89,7 +89,7 @@ preserved by the kernel.
 | 104 | `pdxfs_txn_commit` | `cap_slot` | 0 or `-errno` / sentinel; commits the KIND_PDXFS_TXN behind `cap_slot` (writes JOP_COMMIT + BD_OP_FLUSH via `pdxfs_txn_commit_wal`, transitions OPEN → COMMITTED via `pdxfs_txn_row_transition`, bumps `PXT_ST_COMMITS`). `-EBADF` on a bad cap slot; underlying journal / transition sentinels forwarded verbatim. Row release + cap-slot clear are DEFERRED to a future `sys_pdxfs_txn_close`. R90-XREPO.010.M1-003 (paideia-os #2111). |
 | 105 | `pdxfs_txn_abort` | `cap_slot` | 0 or `-errno` / sentinel; aborts the KIND_PDXFS_TXN behind `cap_slot` (writes JOP_ABORT via `pdxfs_txn_abort_wal`, transitions OPEN → ABORTED, bumps `PXT_ST_ABORTS`). Per-record undo-body replay DEFERRED to paideia-os #2112 (blocked on this milestone). R90-XREPO.010.M1-003 (paideia-os #2111). |
 | 106 | `pdxfs_stat_by_inode` | `inode_no`, `out_stat_ptr` | 0 or `-errno`; populates a 32-byte record at `out_stat_ptr` with `{mode_bits, size_bytes, mtime_ns, ctime_ns}` for the tmpfs inode `inode_no`. `mode_bits` = `S_IFREG\|0o644` (`0x81A4`) for `VNODE_TYPE_REG`, `S_IFDIR\|0o755` (`0x41ED`) for `VNODE_TYPE_DIR`. `mtime_ns` = `_tick_count * 10_000_000` (matches UEJ convention). `ctime_ns` reserved zero. `-EFAULT` on bad `out_stat_ptr`; `-ENOENT` on OOR `inode_no` or unallocated slot. Blocks 3 of 6 columns in `ls -l` (mode/size/mtime). R90-XREPO.010.M1-002 (paideia-os #2110). |
-| **517** | **`cwd_resolve`** (RESERVED) | `path_ptr`, `path_len_hint`, `abs_out_ptr`, `abs_out_cap` | strlen (excl. NUL) or `-errno`; realpath primitive for the mv/rm/cp satellite consumers. Resolves the caller's path (absolute OR relative — relative anchors at `[_current_tcb + TASK_OFF_CWD]` per `design/user/cwd-semantics.md`) and writes the resulting absolute path back into the caller buffer. Body/dispatch/fingerprint deferred; the CWD resolution policy is frozen (Option A) by paideia-os #2115 (R90-XREPO.010.M1-007). |
+| **517** | **`cwd_resolve`** | `path_ptr`, `abs_out_ptr`, `abs_out_cap` | strlen (excl. NUL) or `-errno`; realpath primitive for the mv/rm/cp satellite consumers. Resolves the caller's path (absolute OR relative — relative anchors at `[_current_tcb + TASK_OFF_CWD]` per `design/user/cwd-semantics.md`) via `mount_root_vnode` + `path_resolve` + a parent-chain walk composing the canonical absolute form (leading `/`, `_vnode_name_table` components joined by `/`), writing the NUL-terminated result to `abs_out_ptr` (up to `abs_out_cap` bytes). Returns strlen (excluding NUL). Body takes KERNEL VAs (dispatch shim does the KPTI bounce for user callers, matching `sys_pdxfs_undo_write`'s split). `-ENOENT` if the path does not resolve or no root mounted; `-ERANGE` if the composed path + NUL exceeds `abs_out_cap` or the parent-chain walk exceeds `SYS_CWD_RESOLVE_MAX_DEPTH=32`; `-EFAULT` (dispatch-shim only) if either user pointer is refused. The `path_len_hint` field the earlier design skeleton proposed was dropped — the walker sizes the path via NUL. R90-XREPO.010.M1-007 (paideia-os #2115). |
 | **527** | **`pdxfs_fault_inject`** | `class` | 0 or `-errno`; arms/disarms a PdxFS fault-injection class. `class` = 0 disarms; 1..4 arm one of `WAL_WRITE_FAIL` / `INODE_ALLOC_FAIL` / `EXTENT_ALLOC_FAIL` / `UNDO_APPEND_FAIL`. Single-shot: the arm is consumed by the next traversal of the named hook site (`wal_append` / `tmpfs_inode_alloc` / `tmpfs_write` pre-`phys_alloc` / `pdxfs_txn_undo_append`). Refused with `-EPERM` when the boot flag `_pdxfs_fault_enabled` is 0 (release-build gate; see `design/kernel/pdxfs-fault-inject.md` §3), refused with `-EINVAL` when class > 4. Dispatch is an explicit early check ahead of the linear switch bounds gate — the sysno sits far above the 0..107 core range, chosen out-of-band by the mv/rm design docs to preserve the tightly-packed low band. R90-XREPO.010.M1-005 (paideia-os #2113). |
 
 Syscalls 96–102 are **reserved by `design/networking/r91-plan.md` §17,
@@ -98,19 +98,15 @@ only through 95). They will be materialized in `dispatch.pdx` as each
 round in the R91–R99 networking wave lands the corresponding handler;
 until then they fall through to `-ENOSYS` like any other unlisted number.
 
-Sysnos **517** and **527** are **pre-reserved by the R90-XREPO.010
-wave** (`design/round-retrospectives/r90-xrepo-wave3-plan.md` §2) and
-have **no body** in the tree yet — they fall through to `-ENOSYS`
-until their owning sub-issues land. Sysno 517 (`sys_cwd_resolve`) is
-the mv/rm/cp satellite consumers' realpath primitive; its cwd
-resolution semantics are frozen ahead of the body's landing by
-paideia-os #2115 (R90-XREPO.010.M1-007) — see
-`design/user/cwd-semantics.md` for the invariant every path-resolving
-syscall (§3 of that doc) already obeys and that sysno 517 inherits on
-landing. Sysno 527 (`sys_pdxfs_fault_inject`) lands in
-R90-XREPO.010.M1-005. Both slot numbers were chosen out-of-band
-(above the tightly-packed 0..103 core range) so no future contiguous
-allocation displaces them.
+Sysnos **517** and **527** are **out-of-band** allocations by the
+R90-XREPO.010 wave (`design/round-retrospectives/r90-xrepo-wave3-plan.md`
+§2). Both slot numbers were chosen above the tightly-packed 0..103 core
+range so no future contiguous allocation displaces them. Sysno 517
+(`sys_cwd_resolve`) is the mv/rm/cp satellite consumers' realpath
+primitive; the cwd resolution semantics are frozen (Option A) by
+`design/user/cwd-semantics.md`, and the body landed with
+R90-XREPO.010.M1-007 (paideia-os #2115). Sysno 527
+(`sys_pdxfs_fault_inject`) landed with R90-XREPO.010.M1-005.
 
 Sysno 103 (`sys_icmp_echo`) is placed one slot above the reserved
 96–102 range rather than at 96 itself: displacing an already-documented

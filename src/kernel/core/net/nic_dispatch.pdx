@@ -1,0 +1,462 @@
+// src/kernel/core/net/nic_dispatch.pdx -- R91.M1-002 (paideia-os #2012)
+//
+// The single-active-NIC dispatch shim. One `_active_nic_kind` global,
+// one probe helper that walks the boot-order candidates and reports
+// the first one that answers, and three cmp/je routers -- one for TX,
+// one for RX poll, one for MAC read -- that fan out over the three
+// NIC kinds KIND_NIC (0x1AD) enumerates (E1000E / VIRTIO / RTL8139).
+//
+// This module owns no ring, drives no controller, mints no capability
+// and is not on any ISR path. It exists so that l2_tx_send /
+// ipv4_tx_send / e1000e_irq_handler's l2_rx_handle callers (R91.M1-003,
+// R91.M1-004) can stop reading e1000e's (bar0, tx_ring_pa) globals
+// directly and start asking "what kind of NIC is active, and what is
+// its send / poll / MAC entry point" -- so that R91.M3 (virtio-net)
+// and R91.M4 (rtl8139) land as new arms in this file rather than as
+// duplicated L2/L3 stacks.
+//
+// =============================================================================
+// SECTION 0  WHY THIS IS A cmp/je CHAIN AND NOT A @jump_table
+// =============================================================================
+//
+// The R91 plan (design/networking/r91-plan.md §4.1) called out
+// paideia-as's `@jump_table` attribute as a candidate for the dispatch
+// layer, with the load-bearing caveat "before committing to it, verify
+// it is actually lowered and not merely forward-declared -- the
+// paideia-as CHANGELOG has a documented history of trait declared,
+// lowering deferred gaps".
+//
+// The verification, done at issue landing:
+//
+//   * PA-R15-009 (paideia-as #964) landed the `@jump_table` PARSER +
+//     AST + P0270/P0271 diagnostics. The v0.15 CHANGELOG bullet is
+//     explicit: "codegen deferred to #1032."
+//   * PA-R15-009b (paideia-as #1032) tracks the codegen synthesis pass
+//     -- rodata table + memory-indirect jmp via the FF 24 SIB primitive
+//     (PA-R15-009a / #1031). Both are listed as in-flight backtracks
+//     against the v0.15 milestone.
+//
+// So at THIS landing, `@jump_table` is a parse-and-diagnose-only
+// attribute: writing `match nic_kind @jump_table { ... }` today either
+// silently emits nothing extra (if the elaborator gates the attribute
+// on codegen readiness) or emits an unresolved-symbol against the
+// jump-table synthesis intrinsic. Neither is a routing primitive we
+// can depend on at boot.
+//
+// The compare chain is the safe substitute:
+//
+//   cmp rdi, 1;   je nd_tx_e1000e;
+//   cmp rdi, 2;   je nd_tx_virtio;
+//   cmp rdi, 3;   je nd_tx_rtl8139;
+//   jmp nd_tx_bad;
+//
+// Three immediate compares, no rodata table, no memory-indirect jump.
+// At three arms the compare chain is not measurably slower than the
+// jump table would be even AFTER the codegen lands -- the jump table's
+// advantage only appears once the arm count exceeds ~8 (see
+// design/toolchain/command-dispatch-pattern.md's density contract:
+// `covered*2 >= range` AND `range <= 256` -- three arms in a range of
+// four is at the low end of what the jump table is worth). Adding a
+// fourth NIC kind is still a one-line insertion into the cmp chain.
+//
+// FUTURE HOIST. When PA-R15-009b lands and the paideia-as smoke suite
+// carries a witness that lowers a match with `@jump_table` to real
+// FF 24 SIB + disp32, a future paideia-os issue may rewrite the four
+// cmp chains here as annotated matches -- but the visible behaviour
+// this file guarantees is unchanged.
+//
+// =============================================================================
+// SECTION 1  WHY EVERY BACKEND ARM RETURNS -ENOSYS TODAY
+// =============================================================================
+//
+// R27 landed e1000e's PCI probe, register accessors, ring init,
+// EEPROM MAC read and IRQ handler shape -- but NOT a uniform
+// (packet_ptr, packet_len) send entry point. Today's TX path is
+// `l2_tx_send`, whose SysV signature is
+// (bar0, tx_ring_pa, dst_mac, ethertype, payload_pa, payload_len).
+// A future R91.M2-004 issue introduces an e1000e-side `e1000e_tx(
+// packet_ptr, packet_len)` adapter that looks up `bar0` and
+// `tx_ring_pa` from `_e1000e_devices[0]` and calls into the ring
+// primitives directly; that adapter is the callee this shim's
+// e1000e arm will call.
+//
+// Neither `virtio_net_probe` nor `virtio_net_tx` / `rx_poll` / `mac`
+// exist in the kernel tree today -- R91.M3 introduces the from-
+// scratch virtio-net driver under `src/kernel/core/drivers/virtio_net/`.
+// The kernel-tree-external `src/drivers/virtio_net/probe.pdx` is a
+// Phase-7-era skeleton retired by R91.M6-001 and is deliberately NOT
+// wired here.
+//
+// The rtl8139 tree does not yet exist -- R91.M4 introduces it under
+// `src/kernel/core/drivers/rtl8139/`.
+//
+// So at this landing, the tx / rx_poll / mac router arms all return
+// the same sentinel -- `NIC_ENOSYS` = 0xFFFFFFFFFFFFFFDA (=  -38 as
+// signed u64, matching the ENOSYS convention `syscall/dispatch.pdx`
+// uses for unwired sysno arms). This is the "future R91.M2-004 issues
+// wire real bodies" posture the issue directive calls for. Each arm
+// has its own labelled slot in the compare chain so that a future
+// wiring is a one-line edit at exactly that slot, without touching
+// the router topology or the sibling arms.
+//
+// The ONE arm that IS live is `nic_dispatch_probe`'s call to
+// `e1000e_probe` (R27-M1-001, drivers/e1000e/probe.pdx). That helper
+// is the only backend-side probe that exists today, and it is what
+// the R91.M5-001 boot sequence needs to distinguish "no NIC" from
+// "e1000e present, mint KIND_NIC with kind=1". virtio-net's and
+// rtl8139's probe arms are labelled fall-throughs today; R91.M3-001
+// and R91.M4-001 replace the `jmp` with a real `call`.
+//
+// =============================================================================
+// SECTION 2  SINGLE ACTIVE NIC PER BOOT
+// =============================================================================
+//
+// design/networking/r91-plan.md §4.1 pins the MVP scope: one active
+// NIC per boot, first-found wins, no multi-NIC bonding or selection.
+// The single global `_active_nic_kind` (u64, .bss, NIC_KIND_NONE = 0
+// at reset) is what this scope shrinks to. A future multi-NIC round
+// promotes this to an array indexed by an `iface_id`, and every
+// caller that reads it today reads through an accessor
+// (`nic_dispatch_active_kind`) so the promotion is a signature change
+// only in this file.
+//
+// `nic_dispatch_probe` is the SINGLE WRITER of `_active_nic_kind`
+// (plus `nic_dispatch_reset` for teardown / bring-up-witness use).
+// tools/build.sh confines relocations against the symbol to
+// `net/nic_dispatch.o`, so no second object can silently mutate it.
+//
+// =============================================================================
+// SECTION 3  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Kind selectors 1..3 fit trivially into a 32-bit immediate, so the
+// compare chain uses `cmp reg, imm` directly. `NIC_ENOSYS` is a full
+// 64-bit constant (0xFFFFFFFFFFFFFFDA sign-extends from -38 as u64)
+// and stages through `mov rax, imm64` -- paideia-as's canonical form
+// for a full-width immediate. No `mov_b` / `mov_w` / `mov_d`
+// anywhere; every value lives in a whole 64-bit register. Every
+// label in this file is prefixed `nd_` (nic-dispatch) per reserved-
+// word discipline (`loop`/`if`/`next` are keywords).
+
+module NicDispatch = structure {
+
+  // ==========================================================================
+  // Kind selectors (mirror of cap/kind_nic.pdx §1). Re-declared here so
+  // consumers of the dispatch shim do not need to cross-reference the
+  // capability module for the enum -- the router's compare chain is the
+  // one place these values are load-bearing at runtime.
+  // ==========================================================================
+
+  pub let NIC_KIND_NONE    : u64 = 0
+  pub let NIC_KIND_E1000E  : u64 = 1
+  pub let NIC_KIND_VIRTIO  : u64 = 2
+  pub let NIC_KIND_RTL8139 : u64 = 3
+  pub let NIC_KIND_MAX     : u64 = 3
+
+  // ==========================================================================
+  // NIC_ENOSYS: the sentinel every unwired backend arm returns. Matches
+  // `syscall/dispatch.pdx`'s ENOSYS convention (-38 as signed u64 =
+  // 0xFFFFFFFFFFFFFFDA). Chosen so a caller that threads a nic_dispatch
+  // return value straight into a syscall reply path (R91.M1-003+) sees
+  // the same ENOSYS it would see from any other unwired sysno.
+  // ==========================================================================
+
+  pub let NIC_ENOSYS : u64 = 0xFFFFFFFFFFFFFFDA
+
+  // ==========================================================================
+  // _active_nic_kind: §2's single global. NIC_KIND_NONE at reset;
+  // nic_dispatch_probe is the sole writer on the discover path,
+  // nic_dispatch_reset is the sole writer on the teardown path.
+  // ==========================================================================
+
+  pub let mut _active_nic_kind : u64 = 0
+
+  // ==========================================================================
+  // nic_dispatch_reset() -> ()
+  //
+  // Clear _active_nic_kind. Boot and teardown only. .bss is already
+  // zero at real boot; this is defensive (mirrors kn_rs_ /
+  // hk_rs_reset shape) and gives a bring-up witness a clean re-scrub
+  // point between two probe passes. Leaf. Labels prefixed nd_rs_.
+  // ==========================================================================
+
+  pub let nic_dispatch_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R91.M1-002 (paideia-os #2012): clear _active_nic_kind. Boot and teardown only. Single-store leaf, no nested calls. .bss is already zero at real boot; this is defensive (mirrors kind_nic.pdx nic_table_reset / hotkey_dispatch.pdx hotkey_dispatch_reset shape) and gives a bring-up witness a clean re-scrub point between two probe passes. Labels prefixed nd_rs_.",
+      block: {
+        xor rax, rax;
+        mov [rip + _active_nic_kind], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nic_dispatch_active_kind() -> u64
+  //
+  // Read the current active-NIC selector. The one accessor R91.M1-003
+  // and R91.M1-004 call-site refactors thread through. Leaf. Labels
+  // prefixed nd_ak_.
+  // ==========================================================================
+
+  pub let nic_dispatch_active_kind : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R91.M1-002 (paideia-os #2012): read _active_nic_kind. §2's single accessor -- reading through the accessor rather than the raw symbol means a future multi-NIC promotion (index by iface_id) is a signature change here alone. Leaf, no nested calls. Labels prefixed nd_ak_.",
+      block: {
+        mov rax, [rip + _active_nic_kind];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nic_dispatch_probe() -> u64
+  //
+  // Walk the boot-order candidates in the order design/networking/
+  // r91-plan.md §4.1 pins -- e1000e first, then virtio-net, then
+  // rtl8139 -- calling each backend's own probe helper and stopping at
+  // the first one that reports a device. On success writes the winning
+  // NIC_KIND_* back to _active_nic_kind and returns it; on no-device
+  // writes NIC_KIND_NONE and returns 0.
+  //
+  // At this landing the ONLY live backend probe is e1000e_probe (R27-
+  // M1-001, drivers/e1000e/probe.pdx), which returns the count of
+  // discovered e1000e / i219 NICs (0..E1000E_MAX_DEVS=2). Any non-zero
+  // return means "an e1000e is here" -- the shim collapses that to
+  // NIC_KIND_E1000E because §2's MVP scope carries one active NIC per
+  // boot; the multi-device selection is R28+ work.
+  //
+  // The virtio-net and rtl8139 arms are labelled fall-throughs today.
+  // R91.M3-001 replaces the `jmp nd_pb_try_rtl8139` at nd_pb_try_virtio
+  // with a real `call virtio_net_probe`, and R91.M4-001 does the same
+  // at nd_pb_try_rtl8139 for rtl8139_probe. Preserving the labels now
+  // keeps those future edits a one-line insertion at the named slot,
+  // without touching the topology.
+  //
+  // No callee-save registers needed -- across the single e1000e_probe
+  // call we do not need any prior state, and the two fall-through arms
+  // do not call anything today. Effects follow the underlying probe:
+  // !{sysreg, mem} @{boot} matches e1000e_probe's declaration one-for-
+  // one, which is why this helper is boot-only. Labels prefixed nd_pb_.
+  // ==========================================================================
+
+  pub let nic_dispatch_probe : () -> u64 !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "R91.M1-002 (paideia-os #2012): boot-order NIC probe. Order pinned by design/networking/r91-plan.md §4.1 (e1000e -> virtio-net -> rtl8139; first-found wins). Calls e1000e_probe (drivers/e1000e/probe.pdx §R27-M1-001) as the one live backend probe; any non-zero return collapses to NIC_KIND_E1000E under §2's single-active-NIC MVP scope. virtio-net and rtl8139 arms are labelled fall-throughs today -- R91.M3-001 replaces `jmp nd_pb_try_rtl8139` at nd_pb_try_virtio with `call virtio_net_probe`, and R91.M4-001 does the same at nd_pb_try_rtl8139 for rtl8139_probe. No-device path writes NIC_KIND_NONE (0) and returns 0. Sole writer of _active_nic_kind on the discover path (nic_dispatch_reset is the sole writer on the teardown path). Effects !{sysreg, mem} @{boot} match e1000e_probe one-for-one. No callee-save pushes needed -- no state to preserve across the single nested call. Labels prefixed nd_pb_.",
+      block: {
+        // ------------------------------------------------------------
+        // Arm 1: e1000e (R27-M1-001, live).
+        // ------------------------------------------------------------
+        call e1000e_probe;
+        cmp rax, 0;
+        je  nd_pb_try_virtio;
+        mov rax, 1;                          // NIC_KIND_E1000E
+        mov [rip + _active_nic_kind], rax;
+        ret;
+
+      nd_pb_try_virtio:
+        // R91.M3-001 replaces this fall-through with:
+        //     call virtio_net_probe;
+        //     cmp rax, 0;
+        //     je  nd_pb_try_rtl8139;
+        //     mov rax, 2;                   // NIC_KIND_VIRTIO
+        //     mov [rip + _active_nic_kind], rax;
+        //     ret;
+        jmp nd_pb_try_rtl8139;
+
+      nd_pb_try_rtl8139:
+        // R91.M4-001 replaces this fall-through with:
+        //     call rtl8139_probe;
+        //     cmp rax, 0;
+        //     je  nd_pb_none;
+        //     mov rax, 3;                   // NIC_KIND_RTL8139
+        //     mov [rip + _active_nic_kind], rax;
+        //     ret;
+        jmp nd_pb_none;
+
+      nd_pb_none:
+        xor rax, rax;                        // NIC_KIND_NONE
+        mov [rip + _active_nic_kind], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nic_dispatch_tx(nic_kind, packet_ptr, packet_len) -> u64
+  //
+  //   rdi = nic_kind (one of NIC_KIND_E1000E / VIRTIO / RTL8139)
+  //   rsi = packet_ptr (physical address of a built L2 frame)
+  //   rdx = packet_len (bytes)
+  //
+  // The compare chain fans out to per-backend TX adapters. At this
+  // landing every arm returns NIC_ENOSYS -- see §1 for why (R27 landed
+  // ring primitives but no uniform `e1000e_tx(pkt, len)` adapter;
+  // virtio-net + rtl8139 drivers land in R91.M3 / R91.M4). Each arm
+  // has its own labelled slot so a future wiring is a one-line edit
+  // at exactly the slot without touching the router topology.
+  //
+  // An unknown / out-of-range nic_kind falls to nd_tx_bad and returns
+  // NIC_ENOSYS as well -- caller receives the same sentinel it would
+  // get from any unwired arm, which is the right thing at this shim's
+  // altitude: distinguishing "unknown kind" from "unwired kind" is
+  // work for a later observability landing, not for the router.
+  //
+  // Leaf across the compare chain (the wired arms will call adapters
+  // that themselves push callee-saves; the router does not). Labels
+  // prefixed nd_tx_.
+  // ==========================================================================
+
+  pub let nic_dispatch_tx : (u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (nic_kind: u64, packet_ptr: u64, packet_len: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "R91.M1-002 (paideia-os #2012): TX router. cmp/je chain over NIC_KIND_E1000E (1) / VIRTIO (2) / RTL8139 (3) with a no-match fall-through to NIC_ENOSYS. §1: every arm returns NIC_ENOSYS today because no backend `<x>_tx(packet_ptr, packet_len)` adapter exists in-tree yet (R27 landed e1000e's ring primitives via l2_tx_send's 6-arg surface, not a uniform 2-arg adapter; virtio-net + rtl8139 drivers land in R91.M3 / R91.M4). Each arm's slot is labelled so a future wiring (R91.M2-004 / R91.M3-004 / R91.M4-003) is a one-line edit -- replace `mov rax, 0xFFFFFFFFFFFFFFDA; jmp nd_tx_out` at the target arm with `call <backend>_tx; jmp nd_tx_out`. Unknown nic_kind falls to nd_tx_bad and returns NIC_ENOSYS as well. Effects !{sysreg, mem} @{} -- no @{boot}, so the router is callable from steady-state paths (which is the whole point of the dispatch layer). Labels prefixed nd_tx_.",
+      block: {
+        cmp rdi, 1;                          // NIC_KIND_E1000E
+        je  nd_tx_e1000e;
+        cmp rdi, 2;                          // NIC_KIND_VIRTIO
+        je  nd_tx_virtio;
+        cmp rdi, 3;                          // NIC_KIND_RTL8139
+        je  nd_tx_rtl8139;
+        jmp nd_tx_bad;
+
+      nd_tx_e1000e:
+        // R91.M2-004 wires: call e1000e_tx; jmp nd_tx_out.
+        mov rax, 0xFFFFFFFFFFFFFFDA;         // NIC_ENOSYS
+        jmp nd_tx_out;
+
+      nd_tx_virtio:
+        // R91.M3-004 wires: call virtio_net_tx; jmp nd_tx_out.
+        mov rax, 0xFFFFFFFFFFFFFFDA;
+        jmp nd_tx_out;
+
+      nd_tx_rtl8139:
+        // R91.M4-003 wires: call rtl8139_tx; jmp nd_tx_out.
+        mov rax, 0xFFFFFFFFFFFFFFDA;
+        jmp nd_tx_out;
+
+      nd_tx_bad:
+        mov rax, 0xFFFFFFFFFFFFFFDA;
+
+      nd_tx_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nic_dispatch_rx_poll(nic_kind) -> u64
+  //
+  //   rdi = nic_kind (one of NIC_KIND_E1000E / VIRTIO / RTL8139)
+  //
+  // Poll the active NIC's RX ring for a ready packet. Return value
+  // shape mirrors the per-backend rx_poll adapter that will fill each
+  // arm: a NIC_KIND_* sentinel on the "packet is here, handled" path,
+  // NIC_KIND_NONE (0) on the "no packet" path, NIC_ENOSYS on the
+  // unwired path. At this landing every arm is unwired -- see §1.
+  //
+  // Every arm has its own labelled slot so R91.M1-004's e1000e IRQ
+  // handler refactor + the later R91.M3-005 / R91.M4-002 landings
+  // each become a one-line replacement of `mov rax, ENOSYS; jmp
+  // nd_rp_out` with `call <backend>_rx_poll; jmp nd_rp_out`. Labels
+  // prefixed nd_rp_.
+  // ==========================================================================
+
+  pub let nic_dispatch_rx_poll : (u64) -> u64 !{sysreg, mem} @{} =
+    fn (nic_kind: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "R91.M1-002 (paideia-os #2012): RX-poll router. cmp/je chain over the three NIC kinds with a no-match fall-through to NIC_ENOSYS. §1: every arm returns NIC_ENOSYS today (R91.M1-004 wires e1000e_rx_poll into nd_rp_e1000e; R91.M3-005 wires virtio_net_rx_poll into nd_rp_virtio; R91.M4-002 wires rtl8139_rx_poll into nd_rp_rtl8139). Return convention when arms land: NIC_KIND_* sentinel on the packet-handled path, NIC_KIND_NONE (0) on no-packet, NIC_ENOSYS on unwired. Effects !{sysreg, mem} @{} matches nd_tx one-for-one; no @{boot}, so the router is callable from ISR-adjacent paths (which is what R91.M1-004 needs). Labels prefixed nd_rp_.",
+      block: {
+        cmp rdi, 1;                          // NIC_KIND_E1000E
+        je  nd_rp_e1000e;
+        cmp rdi, 2;                          // NIC_KIND_VIRTIO
+        je  nd_rp_virtio;
+        cmp rdi, 3;                          // NIC_KIND_RTL8139
+        je  nd_rp_rtl8139;
+        jmp nd_rp_bad;
+
+      nd_rp_e1000e:
+        // R91.M1-004 wires: call e1000e_rx_poll; jmp nd_rp_out.
+        mov rax, 0xFFFFFFFFFFFFFFDA;         // NIC_ENOSYS
+        jmp nd_rp_out;
+
+      nd_rp_virtio:
+        // R91.M3-005 wires: call virtio_net_rx_poll; jmp nd_rp_out.
+        mov rax, 0xFFFFFFFFFFFFFFDA;
+        jmp nd_rp_out;
+
+      nd_rp_rtl8139:
+        // R91.M4-002 wires: call rtl8139_rx_poll; jmp nd_rp_out.
+        mov rax, 0xFFFFFFFFFFFFFFDA;
+        jmp nd_rp_out;
+
+      nd_rp_bad:
+        mov rax, 0xFFFFFFFFFFFFFFDA;
+
+      nd_rp_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // nic_dispatch_mac(nic_kind, out_mac_ptr) -> u64
+  //
+  //   rdi = nic_kind (one of NIC_KIND_E1000E / VIRTIO / RTL8139)
+  //   rsi = out_mac_ptr (caller-provided 6-byte buffer)
+  //
+  // Copy the active NIC's 6-byte MAC into the caller's buffer.
+  // Return 0 on success, NIC_ENOSYS on the unwired arm. At this
+  // landing every arm is unwired -- see §1.
+  //
+  // NOTE ON E1000E. `drivers/e1000e/mac.pdx` exports e1000e_read_mac
+  // (bar0, out_mac_ptr) -> () which DOES read MAC bytes from
+  // EEPROM/OTP words 0/1/2 into a caller buffer. Wiring nd_mac_e1000e
+  // to it today would require this shim to look up `bar0` from
+  // `_e1000e_devices[0]+8` -- a cross-module read against a table
+  // that is only populated once e1000e_probe has run. That coupling
+  // (implicit dependency on probe having completed, no error for the
+  // pre-probe caller) is exactly the kind of surface a future
+  // R91.M2-004 adapter -- `e1000e_mac(out_mac_ptr)` that looks up
+  // bar0 internally AND returns an errno on unprobed-device -- is
+  // meant to hide from this shim. Deferring to that adapter keeps
+  // this router's arms uniform (all return either 0 or NIC_ENOSYS,
+  // never an implicit-dependency-tripped SIGSEGV).
+  //
+  // Labels prefixed nd_mc_.
+  // ==========================================================================
+
+  pub let nic_dispatch_mac : (u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (nic_kind: u64, out_mac_ptr: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "R91.M1-002 (paideia-os #2012): MAC-read router. cmp/je chain over the three NIC kinds with a no-match fall-through to NIC_ENOSYS. §1: every arm returns NIC_ENOSYS today. e1000e_read_mac (drivers/e1000e/mac.pdx §R27-M1-004) exists but takes (bar0, out_mac) -- wiring it into nd_mc_e1000e would couple the shim to _e1000e_devices[0]+8 as an implicit read of state populated only after e1000e_probe, and a pre-probe caller would trip a SIGSEGV against unmapped MMIO. R91.M2-004 introduces a bar0-hiding adapter (e1000e_mac(out_mac_ptr) that returns an errno on unprobed-device); this router's e1000e arm calls THAT adapter, keeping arms uniform (each returns 0 on success or NIC_ENOSYS on the unwired / unprobed path). Return convention: 0 on success, NIC_ENOSYS on unwired. Effects !{sysreg, mem} @{} matches nd_tx / nd_rp. Labels prefixed nd_mc_.",
+      block: {
+        cmp rdi, 1;                          // NIC_KIND_E1000E
+        je  nd_mc_e1000e;
+        cmp rdi, 2;                          // NIC_KIND_VIRTIO
+        je  nd_mc_virtio;
+        cmp rdi, 3;                          // NIC_KIND_RTL8139
+        je  nd_mc_rtl8139;
+        jmp nd_mc_bad;
+
+      nd_mc_e1000e:
+        // R91.M2-004 wires: mov rdi, rsi; call e1000e_mac; jmp nd_mc_out.
+        mov rax, 0xFFFFFFFFFFFFFFDA;         // NIC_ENOSYS
+        jmp nd_mc_out;
+
+      nd_mc_virtio:
+        // R91.M3-006 wires: mov rdi, rsi; call virtio_net_mac; jmp nd_mc_out.
+        mov rax, 0xFFFFFFFFFFFFFFDA;
+        jmp nd_mc_out;
+
+      nd_mc_rtl8139:
+        // R91.M4-004 wires: mov rdi, rsi; call rtl8139_mac; jmp nd_mc_out.
+        mov rax, 0xFFFFFFFFFFFFFFDA;
+        jmp nd_mc_out;
+
+      nd_mc_bad:
+        mov rax, 0xFFFFFFFFFFFFFFDA;
+
+      nd_mc_out:
+        ret
+      }
+    }
+}

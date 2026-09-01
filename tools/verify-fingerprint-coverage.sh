@@ -679,6 +679,27 @@ ALLOWLIST = {
         "R90-XREPO.011.M1-003 (#2122): rollup emitted every boot from "
         "witness_elevate_broker_dispatch on Scenarios A + B both "
         "green. No golden pins this exact literal yet.",
+
+    # src/kernel/core/syscall/handlers/sys_cwd_resolve.pdx — R90-XREPO.
+    # 010.M1-007 (paideia-os #2115) sys_cwd_resolve (sysno 517) OK-path
+    # fingerprint.  Emitted by sys_cwd_resolve_body's klog_s1_d1 on
+    # every successful resolution, carrying `len=<n>` (strlen of the
+    # composed absolute path, EXCLUDING NUL).  Reachable at every
+    # boot via witness_r90_xrepo_010_007_cwd_resolve (three scenarios
+    # -> three emit lines), but no golden file asserts this exact
+    # literal yet -- same posture as the sibling `sys pdxfs undo write
+    # ok` / `sys pdxfs stat by inode ok` entries above.  The witness's
+    # own lowercase `boot cwd resolve ok -- count=3` rollup is the
+    # assertable signal for this code path; add a golden line for the
+    # literal `sys cwd resolve ok` text if a future mode wants to pin
+    # it directly.
+    "sys cwd resolve ok [legacy: SYS CWD RESOLVE OK]":
+        "R90-XREPO.010.M1-007 (paideia-os #2115): sys_cwd_resolve_body "
+        "emits this on every OK call.  Reachable at every boot via "
+        "r90_xrepo_010_007_cwd_resolve.pdx (three scenarios -> three "
+        "emit lines), but no golden pins this exact literal -- the "
+        "witness's own lowercase `boot cwd resolve ok --` rollup is "
+        "the assertable signal for the whole cascade.",
 }
 
 # Below these counts the extractor has stopped matching rather than the
