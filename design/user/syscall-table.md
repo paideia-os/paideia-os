@@ -85,12 +85,21 @@ preserved by the kernel.
 | 100 | `getpeername` | `fd`, `sockaddr_out` | 0 or `-errno`; R95.M2. |
 | 101 | `getsockname` | `fd`, `sockaddr_out` | 0 or `-errno`; R95.M2. |
 | 102 | `poll` | `fds_ptr`, `nfds`, `timeout_ms` | nready or `-errno`; fixed-size `fds` array, no dynamic `nfds` allocation. R95.M3. |
+| 103 | `icmp_echo` | `dst_addr_ptr`, `seq`, `payload_ptr`, `payload_len`, `timeout_ms` | rtt_ns (>=0) or `-errno`; requires R_NET_PRIVILEGED_PROTOCOL (kernel-side check via `cap_check_r_net_privileged_protocol`). Loopback (dst 127.x.x.x or `_ipv4_my_ip`) is synchronous through the ICMP send path; off-box wire dispatch deferred pending real ARP + wait-for-reply plumbing. R100-PREP-003 (paideia-os #2009). |
 
 Syscalls 96–102 are **reserved by `design/networking/r91-plan.md` §17,
 not yet implemented** as of this table's refresh (R90-XREPO.009 covers
 only through 95). They will be materialized in `dispatch.pdx` as each
 round in the R91–R99 networking wave lands the corresponding handler;
 until then they fall through to `-ENOSYS` like any other unlisted number.
+
+Sysno 103 (`sys_icmp_echo`) is placed one slot above the reserved
+96–102 range rather than at 96 itself: displacing an already-documented
+reservation for a preceding milestone (R91's `sendto`) would break the
+one-to-one map the R91–R99 wave assumes. Choosing the first slot ABOVE
+the reserved band preserves that map and is the same "IDs are
+negotiable" latitude R53.M2-001 exercised when `mount`/`umount` moved
+from 73/74 → 75/76 after 74 was pre-claimed by #1675.
 
 Numbering intentionally tracks Linux for the common core (0–3, 32, 39,
 56, 59, 60, 61) to keep future userland ports mechanical. `12` is

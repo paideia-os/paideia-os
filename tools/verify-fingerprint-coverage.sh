@@ -304,6 +304,35 @@ ALLOWLIST = {
         "(satellite repo paideia-os/shell) is the caller — no kernel-"
         "side boot witness spawns kill-STOP/CONT sequence.",
 
+    # R100-PREP-003 (paideia-os #2009) sys_icmp_echo + boot witness
+    # fingerprints. Both emit on every boot: the boot witness at
+    # src/kernel/boot/witness/r100_prep_003_icmp_echo.pdx calls
+    # sys_icmp_echo_body directly, which emits `sys icmp echo ok ...`
+    # via klog_s1_d1 on its OK path, and the witness itself then emits
+    # `boot icmp echo ok -- ... rtt_ns=<n>` via klog_s1_d1 on its own
+    # OK path. Same "declared but no golden line asserts it yet"
+    # posture the R100-PREP-001 `tls trust mint ok` and R73 `sys kill
+    # ok` entries carry above -- the 14-mode default matrix has no
+    # golden that pins a networked-syscall line, and the coverage gate
+    # correctly refuses to pass an unwitnessed OK-token marker without
+    # an explicit reason. Assertable via a future golden that pins a
+    # boot-cascade tail line beyond the network primitives (either the
+    # existing tests/r17/* goldens grown a few lines OR a new
+    # R100-scoped golden if the R100 wave lands its own smoke mode).
+    "sys icmp echo ok [legacy: SYS ICMP ECHO OK]":
+        "R100-PREP-003 (paideia-os #2009): sys_icmp_echo_body emits "
+        "this on every OK call. The boot witness at "
+        "r100_prep_003_icmp_echo.pdx is the sole caller today (init "
+        "cannot call it yet -- no userspace ping tool is wired); no "
+        "existing golden asserts networked-syscall lines. Assertable "
+        "via a future golden that grows into the R100 witness tail.",
+    "boot icmp echo ok -- [legacy: BOOT ICMP ECHO OK]":
+        "R100-PREP-003 (paideia-os #2009): witness_r100_prep_003_icmp_"
+        "echo emits this on every OK call. No existing golden asserts "
+        "it -- same posture as the `tls trust mint ok` entry above, "
+        "which the R100-PREP-001 witness triggers via the same cascade "
+        "without a golden line either.",
+
     # src/kernel/core/cap/kind_tui_canvas.pdx — R89.M1-001 (#1988) row +
     # mint gate. R89.M1-005 (#1992, src/kernel/boot/witness/
     # r89_tui_canvas.pdx) now calls kind_tui_canvas_mint_body at every

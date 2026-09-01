@@ -572,28 +572,30 @@ case "${EXPECTED}" in
         #     probe-file write below needs a real parent directory first.
         #     This is plain tmpfs mkdir, unrelated to and not a substitute
         #     for the pdxfs-block mount attempted next.
-        #     KNOWN GAP (debugger pass, R65v2 closure): both `mkdir`
-        #     invocations currently fail — /bin/mkdir execs and calls
-        #     sys_mkdir (sysno 79) correctly (`shell exec ok --
-        #     argv[0]=mkdir resolved=/bin/mkdir`), but the kernel-side
-        #     sys_mkdir_body never emits its own `sys mkdir ok` klog line
-        #     for these two calls, so vops_mkdir/tmpfs_create is failing
-        #     server-side and /bin/mkdir prints `MKDIR FAIL`. init.pdx's
-        #     own R65v2 probe never mkdirs /home (only sys_stat x2 +
-        #     sys_mount, see init.pdx), so this is not a regression from
-        #     this round's diff — most likely suspect is the 64-slot
-        #     tmpfs inode pool (TMPFS_MAX, core/fs/tmpfs/inode.pdx) being
-        #     exhausted or near-exhausted by the growing boot-seed
-        #     inventory (16+ /bin binaries, /share, /pkgs, /system/*,
-        #     /journal/*, plus boot self-test witness allocations) by the
-        #     time the shell reaches this script. Filed as a follow-up
-        #     for main to raise an issue on; the golden below asserts the
-        #     ACTUAL current wire (MKDIR FAIL x2) rather than the
-        #     aspirational `sys mkdir ok` text so this smoke mode stays a
-        #     real regression signal for R65v2's own in-scope surface
-        #     (init home-mount probe + shell HOME/PATH wiring + the
-        #     mkfs.pdxfs/mount.pdxfs dry-run flow) instead of red on an
-        #     unrelated, pre-existing tmpfs capacity issue.
+        #     FIXED at paideia-os #2004: the diagnosis matched — the
+        #     64-slot tmpfs inode pool (TMPFS_MAX, core/fs/tmpfs/inode.
+        #     pdx) was exhausted by the growing boot-seed inventory (16+
+        #     /bin binaries, /share, /pkgs, /system/*, /journal/*, plus
+        #     boot self-test witness allocations) by the time the shell
+        #     reached the `mkdir /home` step, and tmpfs_create silently
+        #     returned 0 on OOM which sys_mkdir mapped to -EIO with no
+        #     kernel-side signal on the wire.  #2004 landed three
+        #     changes together (fix + diagnostic + prevention): (1)
+        #     raised TMPFS_MAX to 256 (matches VNODE_MAX; multi-word
+        #     bitmap allocator rewrite adapted from vnode_alloc's shape);
+        #     (2) instrumented tmpfs_create's three failure arms with a
+        #     distinct `tmpfs create fail [legacy: TMPFS CREATE FAIL]
+        #     reason=<code>` fingerprint (1=parent-not-dir, 2=collision,
+        #     3=OOM) so the previously-silent three-way ambiguity now
+        #     names its own failure mode on the wire; (3) added a
+        #     `tmpfs inode alloc count -- count=<N>` snapshot immediately
+        #     after each kernel-side seed batch in kernel_main.pdx so a
+        #     future rise toward TMPFS_MAX=256 is visible before it
+        #     re-runs this regression.  The golden below now asserts the
+        #     ACTUAL post-fix wire (`sys mkdir ok [legacy: SYS MKDIR OK]`
+        #     x2) — a persistent failure of this golden signals either a
+        #     regression of the TMPFS_MAX widening or a new upstream OOM
+        #     inflating the seed inventory past 256.
         #   - `mkfs.pdxfs --dry-run /var/pdxfs/home.img`: the exact path
         #     src/user/init.pdx's own R65v2.M1-001 (#1979) boot-time probe
         #     checks. --dry-run against a TARGET_FILE never opens/writes
@@ -616,9 +618,9 @@ case "${EXPECTED}" in
         #
         # Golden asserts, in order: SHELL START, the child_hello reap
         # (`WAIT: pid=9 status=42` + `REAPED`), two `shell exec ok --
-        # argv[0]=mkdir resolved=/bin/mkdir` + `MKDIR FAIL` pairs (one
-        # per mkdir — see the KNOWN GAP note above for why these fail
-        # rather than emitting `sys mkdir ok`), the mkfs.pdxfs dry-run
+        # argv[0]=mkdir resolved=/bin/mkdir` + `sys mkdir ok [legacy:
+        # SYS MKDIR OK]` pairs (one per mkdir — post-#2004 both succeed),
+        # the mkfs.pdxfs dry-run
         # preview fragment `PdxFsFormatRecord@0.1 { target:
         # /var/pdxfs/home.img`, the mount.pdxfs dry-run preview fragment
         # `PdxFsMountRecord@0.1 { volume: cap:volume:0x0001`, the literal
