@@ -101,6 +101,18 @@ ALLOWLIST = {
         "and its `boot elevate broker ok` rollup is the assertable "
         "signal for the whole cascade — no golden pins this exact literal.",
 
+    # src/kernel/boot/witness/rootfs_seed_resolv.pdx (R100-PREP-004
+    # #2010): resolver-config seeder fires every boot (witness runs
+    # unconditionally). libpdx-net's resolver M2 will consume the file
+    # via a tmpfs read at process startup once that milestone lands;
+    # its own end-to-end witness will pin an assertable success line
+    # that supersedes this allowlist entry. Until then no golden pins
+    # this exact literal.
+    "resolv seed ok [legacy: RESOLV SEED OK]":
+        "R100-PREP-004 (#2010): resolv.conf seeder fires every boot; "
+        "libpdx-net resolver M2's own end-to-end witness will pin the "
+        "assertable consumer signal — no golden pins this exact literal.",
+
     # src/kernel/core/iommu/vtd_fault.pdx — vtd_fault_dispatch's own
     # header says "NOT WIRED AT M4 BOOT", and a tree-wide grep confirms
     # no caller in src/ or tests/. The function is reachable only once
