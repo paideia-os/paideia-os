@@ -535,6 +535,23 @@ ALLOWLIST = {
         "file asserts this exact line — the witness's own lowercase "
         "'boot tls trust ok --' fingerprint covers this code path.",
 
+    # src/kernel/core/cap/kind_nic.pdx — R91.M1-001 (paideia-os #2011)
+    # mint-body fingerprint, emitted once per KIND_NIC mint from inside
+    # kind_nic_mint_body. Reachable at every boot via r91_kind_nic.pdx's
+    # witness_r91_kind_nic (mints a synthetic KIND_DEVICE parent then a
+    # KIND_NIC row over it; nic_kind=NONE, mac=zero, link=DOWN, since
+    # no real NIC driver is wired at R91.M1-001). Same "no golden file
+    # asserts this exact line" posture as the KIND_TUI_CANVAS / KIND_
+    # TLS_TRUST mint-marker entries immediately above; the witness's
+    # own lowercase "boot nic ok --" fingerprint is the assertable
+    # signal for this code path. Add a golden line for the literal
+    # "nic mint ok" text if a future mode wants to pin it directly.
+    "nic mint ok [legacy: NIC MINT OK]":
+        "R91.M1-001 (paideia-os #2011): reachable at every boot via "
+        "r91_kind_nic.pdx's witness_r91_kind_nic, but no golden file "
+        "asserts this exact line — the witness's own lowercase "
+        "'boot nic ok --' fingerprint covers this code path.",
+
     # src/kernel/core/tui/canvas_present.pdx — R89.M1-003 (#1990)
     # TUI_OP_PRESENT real body. Same status change as the "tui canvas
     # mint ok" entry immediately above: R89.M1-005's boot witness now
