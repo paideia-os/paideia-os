@@ -40,6 +40,7 @@ if [[ -z "${NO_INCREMENTAL:-}" && -f "${STAMP}" && -f "${BUILD_DIR}/kernel.elf" 
         "${REPO_ROOT}/tools/build-image.sh" \
         "${REPO_ROOT}/tools/build-uefi-image.sh" \
         "${REPO_ROOT}/tools/build-uefi-stub.sh" \
+        "${REPO_ROOT}/tools/user" \
         "${REPO_ROOT}"/tools/verify-*.sh \
         "${REPO_ROOT}"/tools/lint-*.sh \
         "${REPO_ROOT}"/tools/*.S \
@@ -204,6 +205,138 @@ EOF
 
 echo "[build-user] ensuring build/user/shell.bin (R15-M1-007 embed prerequisite)"
 "${REPO_ROOT}/tools/build-user.sh"
+
+# R64v2 (#1976/#1977): sibling-lib + satellite-tool ELF pipeline.
+#
+# Three tool repos (mkfs.pdxfs, mount.pdxfs, umount.pdxfs) live as git
+# submodules under tools/user/ and link against lib-only sibling
+# submodules (libpdx-volume, libpdx-audit, libpdx-elevate) whose own
+# tools/build.sh only ever emits build-out/*.o -- design decision:
+# linker-only, no /lib artifact of their own. Build order:
+#   1. all three libs, sequentially (cheap -- a handful of .pdx each) --
+#      built regardless of link-time use, so a symbol-drift break in any
+#      of them is caught on every push, not just the day a tool starts
+#      calling it.
+#   2. the three tools, in PARALLEL, each pointed at libpdx-volume's and
+#      libpdx-audit's build-out/ dirs via --extra-obj-dir. libpdx-elevate
+#      is DELIBERATELY EXCLUDED from the tools' link line: none of
+#      mkfs.pdxfs/mount.pdxfs/umount.pdxfs calls any real
+#      elevate_client_* symbol at this landing (every elevate path is a
+#      hardcoded DENY stub -- see each tool's src/elevate*.pdx header:
+#      "no real elevate_client_acquire call can be honestly constructed
+#      yet"), and unlike a `.a` archive, `ld` fully links every raw .o
+#      passed positionally regardless of whether anything references it.
+#      libpdx-elevate's client-side objects (elevate_client.pdx,
+#      elevate_client_cap.pdx, elevate_client_send.pdx,
+#      elevate_client_retry.pdx, elevate_client_journal.pdx) call
+#      kernel/broker-only symbols (hpet_now_ns, svc_lookup,
+#      endpoint_take_pending/write_pending,
+#      elevate_channel_cap_mint_inner/revoke, uej_append) that exist in
+#      none of libpdx-volume, libpdx-audit, or the tools themselves --
+#      pulling those objects in unconditionally would hard-fail the link
+#      with undefined references for code no tool ever calls. Revisit
+#      this exclusion the day a tool's elevate path stops being a stub.
+#   3. copy each tool's build-out/<name>.elf into build/user/<name>.elf
+#      so tools/userbin_embed.S's .incbin lines below can find them.
+# Hard-fails the whole build.sh on any of the six sub-builds failing.
+# Mirrors this script's own STAMP no-op discipline (lines 22-54 above),
+# scoped to just these six submodule trees.
+SAT_TOOLS_DIR="${REPO_ROOT}/tools/user"
+SAT_LIBS=(libpdx-volume libpdx-audit libpdx-elevate)
+SAT_APPS=(mkfs.pdxfs mount.pdxfs umount.pdxfs)
+SAT_STAMP="${BUILD_DIR}/user/.r64v2-tools-stamp"
+
+SAT_NEEDS_BUILD=1
+if [[ -z "${NO_INCREMENTAL:-}" && -f "${SAT_STAMP}" ]]; then
+    SAT_NEWEST=$(find \
+        "${SAT_TOOLS_DIR}/libpdx-volume" \
+        "${SAT_TOOLS_DIR}/libpdx-audit" \
+        "${SAT_TOOLS_DIR}/libpdx-elevate" \
+        "${SAT_TOOLS_DIR}/mkfs.pdxfs" \
+        "${SAT_TOOLS_DIR}/mount.pdxfs" \
+        "${SAT_TOOLS_DIR}/umount.pdxfs" \
+        -type f -newer "${SAT_STAMP}" -print -quit 2>/dev/null)
+    SAT_ALL_ELFS_PRESENT=1
+    for app in "${SAT_APPS[@]}"; do
+        [[ -f "${BUILD_DIR}/user/${app}.elf" ]] || SAT_ALL_ELFS_PRESENT=0
+    done
+    if [[ -z "${SAT_NEWEST}" && "${SAT_ALL_ELFS_PRESENT}" -eq 1 ]]; then
+        SAT_NEEDS_BUILD=0
+    fi
+fi
+
+if [[ "${SAT_NEEDS_BUILD}" -eq 1 ]]; then
+    echo "[r64v2-tools] building sibling libs: ${SAT_LIBS[*]}"
+    for lib in "${SAT_LIBS[@]}"; do
+        echo "[r64v2-tools] lib ${lib}"
+        "${SAT_TOOLS_DIR}/${lib}/tools/build.sh"
+    done
+
+    # Stage filtered lib obj dirs — the raw build-out/ carries
+    # tests-*.o (duplicate `run` symbols) and libpdx-volume's pdxb_sign.o
+    # (references mldsa65_sign_runtime_entry, an extern-C thunk that
+    # exists only in the paideia-as Rust runtime and has no user-space
+    # host). Both classes need to be excluded from the tool link. A
+    # userspace stub for the three signing entry points is compiled
+    # from tools/user-sign-stub.pdx and dropped into libpdx-volume-link
+    # in place of pdxb_sign.o so downstream tools still get definitions
+    # for pdxb_sign_superblock / pdxb_sign_inode_tail / pdxb_verify_
+    # inode_tail (they route to STUB result_codes at runtime).
+    for lib in libpdx-volume libpdx-audit; do
+        FILTERED="${BUILD_DIR}/user/${lib}-link"
+        mkdir -p "${FILTERED}"
+        rm -f "${FILTERED}"/*.o
+        shopt -s nullglob
+        for obj in "${SAT_TOOLS_DIR}/${lib}/build-out"/*.o; do
+            base="$(basename "${obj}")"
+            case "${base}" in
+                tests-*.o) continue ;;
+                pdxb_sign.o) continue ;;  # calls mldsa65_sign_runtime_entry
+            esac
+            ln -sf "${obj}" "${FILTERED}/${base}"
+        done
+        shopt -u nullglob
+    done
+    # Compile the user-space sign stub and stage it into libpdx-volume-link.
+    SIGN_STUB_SRC="${REPO_ROOT}/tools/user-sign-stub.pdx"
+    SIGN_STUB_OBJ="${BUILD_DIR}/user/libpdx-volume-link/user-sign-stub.o"
+    "${PAIDEIA_AS}" build --emit elf64 "${SIGN_STUB_SRC}" -o "${SIGN_STUB_OBJ}"
+
+    echo "[r64v2-tools] building tool ELFs in parallel: ${SAT_APPS[*]}"
+    declare -A SAT_APP_PID
+    for app in "${SAT_APPS[@]}"; do
+        (
+            "${SAT_TOOLS_DIR}/${app}/tools/build.sh" \
+                --extra-obj-dir "${BUILD_DIR}/user/libpdx-volume-link" \
+                --extra-obj-dir "${BUILD_DIR}/user/libpdx-audit-link"
+        ) & SAT_APP_PID[${app}]=$!
+    done
+
+    SAT_APP_FAIL=0
+    for app in "${SAT_APPS[@]}"; do
+        if ! wait "${SAT_APP_PID[${app}]}"; then
+            echo "[FAIL] r64v2-tools: ${app} build failed" >&2
+            SAT_APP_FAIL=1
+        fi
+    done
+    if [[ "${SAT_APP_FAIL}" -ne 0 ]]; then
+        exit 1
+    fi
+
+    mkdir -p "${BUILD_DIR}/user"
+    for app in "${SAT_APPS[@]}"; do
+        SAT_ELF_SRC="${SAT_TOOLS_DIR}/${app}/build-out/${app}.elf"
+        if [[ ! -f "${SAT_ELF_SRC}" ]]; then
+            echo "[FAIL] r64v2-tools: ${SAT_ELF_SRC} missing after build" >&2
+            exit 1
+        fi
+        cp "${SAT_ELF_SRC}" "${BUILD_DIR}/user/${app}.elf"
+    done
+    touch "${SAT_STAMP}"
+    echo "[r64v2-tools] OK -> build/user/{mkfs.pdxfs,mount.pdxfs,umount.pdxfs}.elf"
+else
+    echo "[r64v2-tools] skip (stamp fresh)"
+fi
 
 echo "[boot-stub] tools/boot_stub.S -> boot_stub.o (32+64-bit, as --64)"
 BOOT_STUB_OBJ="${BUILD_DIR}/boot_stub.o"

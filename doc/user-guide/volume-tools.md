@@ -1,11 +1,12 @@
 # Volume tools: mkfs.pdxfs, mount.pdxfs, umount.pdxfs
 
-**Status:** Design-complete, tool repos in progress. This document
-describes the *intended* end-to-end walkthrough for bringing a PDXB
-volume online and keeping it mounted across a reboot. **As of this
-writing (R64), none of the three tools are runnable inside a paideia-os
-boot** — see §6 Scope and current blockers before assuming any command
-below actually works today.
+**Status:** Landed at R64v2 (paideia-os#1976/#1977). This document
+describes the end-to-end walkthrough for bringing a PDXB volume online
+and keeping it mounted across a reboot. **All three tools are real,
+runnable `/bin` ELFs inside a default paideia-os boot** — see §6
+"Current state, how to run it, and known limits" for the exact
+invocation, what still stubs out, and how the pipeline is wired
+together.
 
 **Design reference:** `design/tooling/volume-tooling-ux.md` (R53
 softarch half) is the authoritative CLI/argv/semantic-record spec this
@@ -156,38 +157,97 @@ the audit journal (design doc §8.1).
 
 ---
 
-## 6. Scope and current blockers (read this before trying any command above)
+## 6. Current state, how to run it, and known limits
 
-**None of §2's commands are runnable inside a paideia-os boot today.**
-Two independent gaps stand between this document's walkthrough and an
-operator actually typing these commands at the `$` prompt:
+**As of R64v2 (paideia-os#1976/#1977), `mkfs.pdxfs`, `mount.pdxfs`, and
+`umount.pdxfs` are real, runnable ELFs inside a default paideia-os
+boot.** Each tool is a satellite repo under `tools/user/` (git
+submodule, pinned to its `r64v2-closed` tag), linked against three
+shared-library submodules (`libpdx-volume`, `libpdx-audit`,
+`libpdx-elevate` — link-only; none of the three ships a `/lib`
+artifact of its own) by `tools/build.sh`'s `r64v2-tools` step, embedded
+into the kernel image by `tools/userbin_embed.S`, and tmpfs-seeded to
+`/bin/mkfs.pdxfs`, `/bin/mount.pdxfs`, `/bin/umount.pdxfs` at boot by
+`src/kernel/boot/witness/bin_seeds.pdx`'s `bs_mkfs_pdxfs_seed` /
+`bs_mount_pdxfs_seed` / `bs_umount_pdxfs_seed` blocks — the same
+tmpfs-seed pattern every other `/bin` tool (`ls`, `cat`, `mkdir`, …)
+uses. `tools/run-smoke.sh`'s `boot_r64v2_tools` mode exercises the real
+end-to-end path: the interactive shell forks + execves
+`/bin/mkfs.pdxfs --dry-run /tmp/t.img`, and the boot log is checked
+against `tests/r64v2/expected-tools-mkfs-dry-run.golden`.
 
-1. **The tool ELFs do not exist inside paideia-os's tmpfs.** `mkfs.pdxfs`,
-   `mount.pdxfs`, and `umount.pdxfs` are separate repos
-   (`paideia-os/mkfs.pdxfs`, `paideia-os/mount.pdxfs`,
-   `paideia-os/umount.pdxfs`, plus the shared `paideia-os/libpdx-volume`)
-   outside this monorepo's scope. Seeding their built ELFs into
-   paideia-os's init-time `/bin` seed loop (mirroring the R57.M4-006
-   pattern documented at `design/user/rootfs-seed-inventory.md`) is
-   tracked as **R64.M1-005 (#1905)** and is blocked on those repos each
-   producing a buildable ELF first.
-2. **The tool repos themselves are blocked on a paideia-as host-tools
-   build gap.** `libpdx-volume`'s superblock signing helper
-   (`pdxb_sign_superblock`) needs paideia-as's `mldsa65_sign` intrinsic,
-   and the broader mkfs-pdxb host-tools toolchain has an open build gap
-   tracked as **paideia-as #1730**. Until that lands, the tool repos'
-   own M2/M3 milestones (real superblock write, signing) cannot close,
-   which is upstream of #1905 above.
+A kernel-side boot witness *cannot* exercise this directly —
+`sys_execve_shim`'s path-based execve validates its path/argv/envp
+arguments against the *current task's* real page tables, and no user
+task exists yet at the point in boot where a witness would run (the
+same limitation `src/kernel/boot/witness/r86_relative_path.pdx`
+documents for `sys_chdir`/`sys_getcwd`). `src/kernel/boot/witness/
+r64v2_tools.pdx` is therefore a dormant symbol-linkage scaffold, wired
+into `kernel_main.pdx` for build-time proof this file compiles and
+links, but the real proof is the smoke test above running through the
+actual shell.
 
-Put together: this document is accurate about *what the tools are
-designed to do* (§1–§5, sourced from the frozen R53 design), but the
-walkthrough in §2 is aspirational until both the paideia-as toolchain
-gap and the paideia-os tmpfs-seed extension (#1905) close. The R64
-closure retrospective (`design/round-retrospectives/r64-closure.md`)
-tracks this doc as the one piece of R64 that *could* land today, with
-the seed step and any live smoke deferred behind it.
+### How to use them
 
-**What is real today:** the design (§1–§5, unchanged from R53), and the
-four repo scaffolds themselves (each may have landed M1/M2 milestones
-independently — check each repo's own CHANGELOG for its current state,
-since paideia-os does not track their internal milestone progress).
+At the shell prompt, once boot reaches `$`:
+
+```
+$ mkfs.pdxfs --dry-run /tmp/t.img
+PdxFsFormatRecord@0.1 { target: /tmp/t.img, label: , journal_size: 1024, dry_run: true }
+```
+
+`--dry-run` never opens or writes the target — it only argv-parses,
+classifies the target (`/`, `~`, or `.` prefix → file target; a
+`cap:blkdev:` prefix → device-cap target, see below), and prints the
+preview record. Dropping `--dry-run` performs the real file-target
+write pipeline described in §2.1–§2.5 above; `mount.pdxfs` and
+`umount.pdxfs` follow the same `--dry-run`-first convention.
+
+### Current stubs and known limits
+
+These apply regardless of whether the tool is reached from a real
+paideia-os boot or run under its own repo's test driver — they are
+substrate gaps, not something this round's ELF-linking work changed:
+
+- **Device-target (`cap:blkdev:...`) writes are stubbed.** No
+  `sys_cap_query`-equivalent syscall, no block-granularity write
+  syscall, and no osarch-minted `KIND_BLOCK_DEVICE` cap exist yet for
+  a standalone CLI tool to use. `mkfs.pdxfs --dry-run` against a
+  device-cap target prints the preview and exits; a real write returns
+  `FR_RESULT_DEVICE_TARGET_STUB`.
+- **Elevation always fails closed.** None of the three tools holds a
+  `KIND_ELEVATE_CHANNEL` broker-endpoint capability, so every
+  `libpdx-elevate` request they make is denied by construction (not a
+  bug — there is no broker wiring for standalone tools yet, tracked at
+  paideia-os#1997). This blocks any real `/system`, `/boot`, `/dev`, or
+  cross-user mount from actually elevating; `/mnt/**` mounts (§2.2)
+  need no elevation and are unaffected.
+- **Superblock signing uses a placeholder all-zero seed.** Every
+  signature `mkfs.pdxfs` produces is well-formed (`pdxb_sign_
+  superblock` via `libpdx-volume`) but verifies against no real key. A
+  `libpdx-key`-equivalent seed loader does not exist yet.
+- **`libpdx-semantic-pipe` framing stays line-based.** `svc.schema-
+  registry` (paideia-os#2000) is inert, so every record prints its
+  `# semantic-pipe emit deferred` header before falling back to the
+  plain `sys_write` rendering shown above — real structural framing
+  waits for that service.
+- **Umount's `IN_USE` check is conservative-not-safe.** Real per-volume
+  handle-count tracking (`VOL_OP_QUERY_HANDLE_COUNT`) and real
+  mount-table row removal (`PMT_OP_REMOVE_ROW`) are both stub bodies on
+  the kernel side (`0`-returning cap-invoke ops); they close the ABI
+  edge `mount.pdxfs`/`umount.pdxfs` call through, not the underlying
+  tracking.
+
+**Debt inventory:** the full, itemized list above (plus hardware-gated
+and out-of-R64-scope items) lives in the round retrospective,
+`design/round-retrospectives/r64-closure-v2.md` §"Debt inventory
+(carried forward)" — written when items #1976/#1977 were still HELD;
+this section supersedes that doc's "paideia-os wrappers" entries now
+that the ELF-linking + embedding + seeding pipeline has landed.
+
+**Per-repo detail:** each tool's own `CHANGELOG.md` is the authoritative
+source for its milestone history and repo-local known-deferred-substrate
+notes — `mkfs.pdxfs/CHANGELOG.md`, `mount.pdxfs/CHANGELOG.md`,
+`umount.pdxfs/CHANGELOG.md`, and `libpdx-volume/CHANGELOG.md` (all under
+`tools/user/<repo>/` once the submodules are checked out). paideia-os
+does not mirror their internal milestone tracking.

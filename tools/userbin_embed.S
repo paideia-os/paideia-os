@@ -8,6 +8,10 @@
 # R48-PREP-005.M2:     Embed elevate_broker_daemon (svc.elevate-broker drainer).
 # R61.M1-001 (#1820):  Embed ls, cat, ps, rm, mv, cp, mkdir, touch, dmesg
 #                       (R57/R58/R60 tool ELFs, previously build-only).
+# R64v2 (#1976/#1977): Embed mkfs.pdxfs, mount.pdxfs, umount.pdxfs
+#                       (satellite-repo volume tools, linked via
+#                       tools/build.sh's r64v2-tools step into
+#                       build/user/*.elf).
 .section .rodata.userbin, "a", @progbits
 .balign 4096
 .global _shell_bin_start
@@ -128,4 +132,25 @@ _dmesg_bin_start:
 .incbin "build/user/dmesg.elf"
 .global _dmesg_bin_end
 _dmesg_bin_end:
+.balign 4096
+# R64v2 (#1976/#1977): mkfs.pdxfs userspace image.
+.global _mkfs_pdxfs_bin_start
+_mkfs_pdxfs_bin_start:
+.incbin "build/user/mkfs.pdxfs.elf"
+.global _mkfs_pdxfs_bin_end
+_mkfs_pdxfs_bin_end:
+.balign 4096
+# R64v2 (#1976/#1977): mount.pdxfs userspace image.
+.global _mount_pdxfs_bin_start
+_mount_pdxfs_bin_start:
+.incbin "build/user/mount.pdxfs.elf"
+.global _mount_pdxfs_bin_end
+_mount_pdxfs_bin_end:
+.balign 4096
+# R64v2 (#1976/#1977): umount.pdxfs userspace image.
+.global _umount_pdxfs_bin_start
+_umount_pdxfs_bin_start:
+.incbin "build/user/umount.pdxfs.elf"
+.global _umount_pdxfs_bin_end
+_umount_pdxfs_bin_end:
 .balign 4096

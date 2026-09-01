@@ -395,8 +395,18 @@ def add(lit, loc):
 
 for top in ('src', 'tools', 'tests'):
     for dp, dns, fns in os.walk(os.path.join(ROOT, top)):
-        # tools/paideia-as is the submodule toolchain, not our fingerprints.
-        dns[:] = [d for d in dns if d not in ('paideia-as', 'build', 'target')]
+        # tools/paideia-as is the submodule toolchain; tools/user/* are
+        # the satellite tool repos (libpdx-volume + 3 tools + libpdx-audit
+        # + libpdx-elevate). Neither carries paideia-os fingerprints — their
+        # own fingerprint coverage is tracked in their own repos. Scoped to
+        # the literal "tools" directory so this does not also prune
+        # paideia-os-owned dirs named "user" elsewhere (src/user,
+        # tests/user, src/kernel/user, src/kernel/core/user all carry
+        # real fingerprints and must stay walked).
+        rel_dp = os.path.relpath(dp, ROOT)
+        if rel_dp == 'tools':
+            dns[:] = [d for d in dns if d not in ('paideia-as', 'user')]
+        dns[:] = [d for d in dns if d not in ('build', 'target')]
         for fn in fns:
             p = os.path.join(dp, fn)
             rel = os.path.relpath(p, ROOT)

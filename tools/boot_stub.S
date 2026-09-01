@@ -2571,3 +2571,46 @@ bin_dmesg_seed_ok_msg: .ascii "bin seed ok -- file=/bin/dmesg\0"
 .global bin_dmesg_seed_fail_msg
 .align 8
 bin_dmesg_seed_fail_msg: .ascii "bin seed fail -- file=/bin/dmesg\0"
+
+# R64v2 (#1976/#1977): tmpfs seed strings for the three volume-tool
+# satellite ELFs (mkfs.pdxfs, mount.pdxfs, umount.pdxfs). Mirrors the
+# R61.M1-002/003 nine-tool block above verbatim -- same OK/fail message
+# shape, same klog_s1_d1/klog_s1 emission convention. Symbol names swap
+# the tools' literal "." for "_" (mkfs_pdxfs_seed_name, not
+# mkfs.pdxfs_seed_name) since "." is not a valid label character; the
+# tmpfs file NAME string itself keeps the real dotted filename.
+.global mkfs_pdxfs_seed_name
+.align 8
+mkfs_pdxfs_seed_name: .ascii "mkfs.pdxfs\0"
+
+.global bin_mkfs_pdxfs_seed_ok_msg
+.align 8
+bin_mkfs_pdxfs_seed_ok_msg: .ascii "bin seed ok -- file=/bin/mkfs.pdxfs\0"
+
+.global bin_mkfs_pdxfs_seed_fail_msg
+.align 8
+bin_mkfs_pdxfs_seed_fail_msg: .ascii "bin seed fail -- file=/bin/mkfs.pdxfs\0"
+
+.global mount_pdxfs_seed_name
+.align 8
+mount_pdxfs_seed_name: .ascii "mount.pdxfs\0"
+
+.global bin_mount_pdxfs_seed_ok_msg
+.align 8
+bin_mount_pdxfs_seed_ok_msg: .ascii "bin seed ok -- file=/bin/mount.pdxfs\0"
+
+.global bin_mount_pdxfs_seed_fail_msg
+.align 8
+bin_mount_pdxfs_seed_fail_msg: .ascii "bin seed fail -- file=/bin/mount.pdxfs\0"
+
+.global umount_pdxfs_seed_name
+.align 8
+umount_pdxfs_seed_name: .ascii "umount.pdxfs\0"
+
+.global bin_umount_pdxfs_seed_ok_msg
+.align 8
+bin_umount_pdxfs_seed_ok_msg: .ascii "bin seed ok -- file=/bin/umount.pdxfs\0"
+
+.global bin_umount_pdxfs_seed_fail_msg
+.align 8
+bin_umount_pdxfs_seed_fail_msg: .ascii "bin seed fail -- file=/bin/umount.pdxfs\0"

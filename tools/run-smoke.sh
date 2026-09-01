@@ -30,7 +30,7 @@
 # --wipe. Every legacy invocation without the new flags launches
 # QEMU byte-for-byte as before.
 #
-#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_child_process', 'boot_r17_shell_shutdown', 'boot_smp', 'boot_r31_spawn_pair', 'boot_panic', 'boot_release', 'prod' (mode dispatcher)
+#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_child_process', 'boot_r17_shell_shutdown', 'boot_smp', 'boot_r31_spawn_pair', 'boot_r86_relative_path', 'boot_r64v2_tools', 'boot_panic', 'boot_release', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
 #     * boot_tick: validates boot_tick fingerprint (with timer TICKs), 5s timeout
@@ -53,6 +53,7 @@
 #     * boot_r17_shell_child_process: injects 'true\nexit\n', asserts TRUE OK from /bin/true + shell-reap chain (R17.M5 #638)
 #     * boot_r17_shell_shutdown: injects 'exit\n', asserts shell exit + init reap + init shutdown (R17.M5 #639)
 #     * boot_r86_relative_path: injects 'mkdir /tmp\ncd /tmp\nmkdir ./sub\ncd ./sub\nmkdir ../peer\npwd\nexit\n', asserts cd/mkdir fingerprints + literal '/tmp/sub' + REAPED (R86.M1-008 #1961)
+#     * boot_r64v2_tools: injects 'mkfs.pdxfs --dry-run /tmp/t.img\nexit\n', asserts sys execve argv ok + the mkfs.pdxfs dry-run preview line + REAPED (R64v2, paideia-os#1976/#1977)
 #     * boot_r72_tcp_echo: validates the R72 TCP substrate boot witness (self-connect handshake + port-7 echo + mutual orderly close), 10s timeout, no special QEMU flags (R72.M1-007 #1929)
 #     * boot_smp: validates R18.M1 SMP bring-up fingerprint on -smp 4; BSP wakes 3 APs (APIC IDs 1/2/3), each emits CPU_ID_XX_HELLO; bookended by SMP BRINGUP START / DONE (R18.M1 #764)
 #     * boot_panic: validates M3-003 fake-panic emission chain witness, 8s timeout
@@ -499,6 +500,46 @@ case "${EXPECTED}" in
         TIMEOUT=26
         UART_RX_MODE=1
         : "${INJECT_STRING:=mkdir /tmp\ncd /tmp\nmkdir ./sub\ncd ./sub\nmkdir ../peer\npwd\nexit\n}"
+        : "${INJECT_WAIT_FOR:=SHELL START}"
+        : "${INJECT_DELAY:=0.3}"
+        : "${INJECT_HOLD:=20}"
+        EXPECTED=""
+        ;;
+    boot_r64v2_tools)
+        # R64v2 (paideia-os#1976/#1977): satellite volume-tool ELF
+        # pipeline composite smoke. Real ring-3 exercise of
+        # sys_execve_shim's path-based execve against the ACTUAL
+        # /bin/mkfs.pdxfs binary (tools/user/mkfs.pdxfs submodule,
+        # linked via tools/build.sh's r64v2-tools step, tmpfs-seeded by
+        # bin_seeds.pdx's bs_mkfs_pdxfs_seed block) -- not a kernel-side
+        # boot witness. See src/kernel/boot/witness/r64v2_tools.pdx for
+        # why a kernel-side witness structurally cannot exercise
+        # sys_execve_shim at this point in boot (same limitation
+        # boot_r86_relative_path's own comment documents for
+        # sys_chdir_body/sys_getcwd_body). Driving it through the real
+        # interactive shell (mirroring boot_r17_shell_child_process's
+        # 'true\nexit\n' precedent) sidesteps the limitation entirely.
+        #
+        # Script: `mkfs.pdxfs --dry-run /tmp/t.img\nexit\n`. --dry-run
+        # against a TARGET_FILE (target starts with '/') never opens or
+        # writes the target path, so no prerequisite `mkdir /tmp` is
+        # needed (unlike boot_r86_relative_path's real mkdir/cd script).
+        #
+        # Golden asserts, in order: SHELL START, `sys execve argv ok`
+        # (R62.M1-002/003 #1826/#1829 -- proves the shell's
+        # argv=["mkfs.pdxfs","--dry-run","/tmp/t.img"] marshalled through
+        # sys_execve_shim before mkfs.pdxfs's image loaded), the literal
+        # `PdxFsFormatRecord@0.1 { target: /tmp/t.img` preview-line
+        # fragment (mkfs.pdxfs's src/pipe_wire.pdx `mkfs_sp_emit_dry_run`
+        # -> src/format_record.pdx `format_record_emit_dry_run`, proving
+        # the ELF actually ran in ring-3, argv-parsed, and classified
+        # /tmp/t.img as TARGET_FILE), and REAPED (shell exit unblocking
+        # init's wait4).
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r64v2/expected-tools-mkfs-dry-run.golden"
+        TIMEOUT=30
+        UART_RX_MODE=1
+        : "${INJECT_STRING:=mkfs.pdxfs --dry-run /tmp/t.img\nexit\n}"
         : "${INJECT_WAIT_FOR:=SHELL START}"
         : "${INJECT_DELAY:=0.3}"
         : "${INJECT_HOLD:=20}"
