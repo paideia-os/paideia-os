@@ -88,6 +88,7 @@ preserved by the kernel.
 | 103 | `icmp_echo` | `dst_addr_ptr`, `seq`, `payload_ptr`, `payload_len`, `timeout_ms` | rtt_ns (>=0) or `-errno`; requires R_NET_PRIVILEGED_PROTOCOL (kernel-side check via `cap_check_r_net_privileged_protocol`). Loopback (dst 127.x.x.x or `_ipv4_my_ip`) is synchronous through the ICMP send path; off-box wire dispatch deferred pending real ARP + wait-for-reply plumbing. R100-PREP-003 (paideia-os #2009). |
 | 104 | `pdxfs_txn_commit` | `cap_slot` | 0 or `-errno` / sentinel; commits the KIND_PDXFS_TXN behind `cap_slot` (writes JOP_COMMIT + BD_OP_FLUSH via `pdxfs_txn_commit_wal`, transitions OPEN → COMMITTED via `pdxfs_txn_row_transition`, bumps `PXT_ST_COMMITS`). `-EBADF` on a bad cap slot; underlying journal / transition sentinels forwarded verbatim. Row release + cap-slot clear are DEFERRED to a future `sys_pdxfs_txn_close`. R90-XREPO.010.M1-003 (paideia-os #2111). |
 | 105 | `pdxfs_txn_abort` | `cap_slot` | 0 or `-errno` / sentinel; aborts the KIND_PDXFS_TXN behind `cap_slot` (writes JOP_ABORT via `pdxfs_txn_abort_wal`, transitions OPEN → ABORTED, bumps `PXT_ST_ABORTS`). Per-record undo-body replay DEFERRED to paideia-os #2112 (blocked on this milestone). R90-XREPO.010.M1-003 (paideia-os #2111). |
+| 106 | `pdxfs_stat_by_inode` | `inode_no`, `out_stat_ptr` | 0 or `-errno`; populates a 32-byte record at `out_stat_ptr` with `{mode_bits, size_bytes, mtime_ns, ctime_ns}` for the tmpfs inode `inode_no`. `mode_bits` = `S_IFREG\|0o644` (`0x81A4`) for `VNODE_TYPE_REG`, `S_IFDIR\|0o755` (`0x41ED`) for `VNODE_TYPE_DIR`. `mtime_ns` = `_tick_count * 10_000_000` (matches UEJ convention). `ctime_ns` reserved zero. `-EFAULT` on bad `out_stat_ptr`; `-ENOENT` on OOR `inode_no` or unallocated slot. Blocks 3 of 6 columns in `ls -l` (mode/size/mtime). R90-XREPO.010.M1-002 (paideia-os #2110). |
 | **517** | **`cwd_resolve`** (RESERVED) | `path_ptr`, `path_len_hint`, `abs_out_ptr`, `abs_out_cap` | strlen (excl. NUL) or `-errno`; realpath primitive for the mv/rm/cp satellite consumers. Resolves the caller's path (absolute OR relative — relative anchors at `[_current_tcb + TASK_OFF_CWD]` per `design/user/cwd-semantics.md`) and writes the resulting absolute path back into the caller buffer. Body/dispatch/fingerprint deferred; the CWD resolution policy is frozen (Option A) by paideia-os #2115 (R90-XREPO.010.M1-007). |
 | **527** | **`pdxfs_fault_inject`** (RESERVED) | `class`, `arm`, `arg0`, `arg1` | 0 or `-errno`; arms/disarms a WAL/inode/extent/undo fault class. Body/dispatch land in R90-XREPO.010.M1-005; the sysno is pre-reserved by the mv/rm design docs. |
 
@@ -129,6 +130,17 @@ close`). The two are grouped by lifecycle (`open` → `commit` / `abort`)
 in this design table's discussion rather than by numeric adjacency in
 the dispatch switch; kernel dispatch grouping stays contiguous with the
 last allocated sysno.
+
+Sysno 106 (`sys_pdxfs_stat_by_inode`) occupies the first slot above the
+`104`/`105` txn lifecycle pair for the same reason those two chose 104
+and 105 — the 96–102 R91–R99 reservation stays intact, and grouping
+the R90-XREPO.010 pdxfs primitives above `sys_icmp_echo` keeps the
+dispatch switch's contiguous-with-last-allocated-sysno discipline
+unbroken. Together with `sys_pdxfs_open` (sysno 71) and
+`sys_pdxfs_dir_readnext` (sysno 72), sysno 106 gives the ring-3
+directory-listing wave three of the six columns `ls -l` needs
+(mode/size/mtime); owner/group/nlink land in future evolutions of the
+`sys_pdxfs_stat_by_inode` output record shape.
 
 Numbering intentionally tracks Linux for the common core (0–3, 32, 39,
 56, 59, 60, 61) to keep future userland ports mechanical. `12` is

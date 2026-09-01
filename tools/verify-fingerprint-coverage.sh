@@ -379,6 +379,81 @@ ALLOWLIST = {
         "commit and abort scenarios pass. No existing golden asserts "
         "it -- same posture as the `boot icmp echo ok` entry above.",
 
+    # R90-XREPO.010.M1-004 (paideia-os #2112) sys_pdxfs_undo_write +
+    # sys_pdxfs_txn_abort undo-replay extension fingerprints. Two OK-
+    # token tags:
+    #   - `sys pdxfs undo write ok` emits from sys_pdxfs_undo_write_body
+    #     on the OK path only (matches every other sys_* handler's `OK
+    #     path only` discipline).
+    #   - `sys pdxfs undo replay ok` emits from sys_pdxfs_txn_abort_body
+    #     AFTER the OPEN -> ABORTED transition succeeds and the row's
+    #     undo records have been replayed. Emitted for EVERY successful
+    #     abort now, including rows with no undo records (entries=0), so
+    #     the every-boot cascade (which runs the R90-XREPO.010.M1-003
+    #     lifecycle witness's abort scenario against an empty row) also
+    #     produces this line. Same "declared but no golden asserts it
+    #     yet" posture as every other txn-family entry above -- the 14-
+    #     mode default matrix has no golden that pins a pdxfs-undo
+    #     syscall line, and the coverage gate correctly refuses to pass
+    #     an unwitnessed OK-token marker without an explicit reason.
+    "sys pdxfs undo write ok [legacy: SYS PDXFS UNDO WRITE OK]":
+        "R90-XREPO.010.M1-004 (paideia-os #2112): sys_pdxfs_undo_write_"
+        "body emits this on every OK call. The boot witness at "
+        "r90_xrepo_010_004_pdxfs_undo_write.pdx is the sole caller "
+        "today (no userspace pdxfs-undo tool is wired); no existing "
+        "golden asserts pdxfs-undo syscall lines. Assertable via a "
+        "future golden that grows into the R90-XREPO witness tail.",
+    "sys pdxfs undo replay ok [legacy: SYS PDXFS UNDO REPLAY OK]":
+        "R90-XREPO.010.M1-004 (paideia-os #2112): sys_pdxfs_txn_abort_"
+        "body emits this on every OK abort (even entries=0 rows) once "
+        "the OPEN -> ABORTED transition succeeds and pdxfs_txn_undo_"
+        "replay has walked the row. Same caller / golden posture as "
+        "the undo_write sibling above.",
+
+    # R90-XREPO.010.M1-006 (paideia-os #2114) real multi-entry readdir
+    # fingerprint. Emitted by pdxfs_dir_readnext (core/cap/pdxfs_dir_iter.
+    # pdx) whenever it transitions to EOD; carries a `rows=<n>` KV
+    # naming how many entries the iteration session emitted.  The boot
+    # witness at tests/kernel/pdxfs_dir/pdxfs_dir_iter_synth.pdx is the
+    # sole caller today (no userspace readdir tool is wired -- ls.M2
+    # still consumes the earlier stub set) and the historical `PDXFS
+    # DIR ITER OK` witness-rollup line is what tests/r17/shell-shutdown.
+    # golden asserts.  Same "declared but no golden asserts the syscall-
+    # side literal" posture the sys_pdxfs_txn_{commit,abort} sibling
+    # entries above carry.  Assertable via a future golden that grows
+    # into the R90-XREPO witness tail (or by the ls.M3 tool witness
+    # once the semantic-pipe PdxFsDirEntry[] path is wired).
+    "sys pdxfs readdir ok [legacy: SYS PDXFS READDIR OK]":
+        "R90-XREPO.010.M1-006 (paideia-os #2114): pdxfs_dir_readnext "
+        "emits this on EOD (once per iteration session, with rows=<n>). "
+        "The dir-iter witness at tests/kernel/pdxfs_dir/pdxfs_dir_iter_"
+        "synth.pdx is the sole caller today; the witness-rollup line "
+        "`PDXFS DIR ITER OK` is what tests/r17/shell-shutdown.golden "
+        "asserts. No existing golden pins the raw `sys pdxfs readdir "
+        "ok` literal -- same posture as the `sys pdxfs txn commit ok` "
+        "sibling above.",
+
+    # R90-XREPO.010.M1-002 (paideia-os #2110) sys_pdxfs_stat_by_inode
+    # fingerprint. Emitted from sys_pdxfs_stat_by_inode_body's OK path
+    # only (klog_s1_d2, k_ino + k_size). No boot-cascade caller reaches
+    # the body today -- the M1-002 witness at src/kernel/boot/witness/
+    # r90_xrepo_010_002_stat_by_inode.pdx bypasses the body and calls
+    # sys_pdxfs_stat_by_inode_scratch_fill directly (a boot witness has
+    # no user-half address to hand user_ptr_ok), and no userspace tool
+    # is wired to sysno 106 yet. Same "declared but no golden line
+    # asserts it yet" posture the R90-XREPO.010.M1-003 sys_pdxfs_txn_
+    # {commit,abort} entries above carry. Assertable via a future
+    # golden that grows into the ls-l wave's witness tail once the
+    # sibling per-inode owner/nlink primitives land.
+    "sys pdxfs stat by inode ok [legacy: SYS PDXFS STAT BY INODE OK]":
+        "R90-XREPO.010.M1-002 (paideia-os #2110): sys_pdxfs_stat_by_"
+        "inode_body emits this on every OK call. The boot witness at "
+        "r90_xrepo_010_002_stat_by_inode.pdx bypasses the body (calls "
+        "sys_pdxfs_stat_by_inode_scratch_fill directly to avoid "
+        "user_ptr_ok's kernel-half refusal); no userspace tool is "
+        "wired to sysno 106 yet. Assertable via a future golden that "
+        "grows into the ls-l wave's witness tail.",
+
     # src/kernel/core/sched/wait.pdx -- R90-XREPO.011.M1-001 (paideia-os
     # #2117) kernel-side sched_wait / sched_wake_kind primitive. Both
     # markers emit from inside the primitive itself, not from a boot

@@ -1,0 +1,473 @@
+// src/kernel/core/fs/pdxfs/undo.pdx
+// R90-XREPO.010.M1-004 (paideia-os #2112): per-transaction undo-log substrate.
+//
+// SUBSTRATE for sys_pdxfs_undo_write (sysno 107) + sys_pdxfs_txn_abort's
+// undo-body replay path. The syscall body stages one undo record per
+// mutating operation the caller is about to perform; on abort the row's
+// records are replayed in REVERSE order, each restoring the pre-image the
+// caller stashed via tmpfs_write. This closes the I5 invariant for cp / mv /
+// rm at the syscall layer (design/round-retrospectives/r90-xrepo-wave3-plan.
+// md §2: "undo bodies land in #2112 which is blocked on #2111").
+//
+// =============================================================================
+// §0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the AUTHORITY on per-txn undo-record storage: every ring-3 call to
+// sys_pdxfs_undo_write appends a 32-byte header + `len` snapshot bytes into
+// the calling txn's undo buffer, and every call to sys_pdxfs_txn_abort walks
+// the buffer in REVERSE order applying each snapshot via tmpfs_write.
+//
+// It is NOT a durable on-disk journal. Undo records live in kernel .bss for
+// the lifetime of the transaction; a future widening will fold them into the
+// PdxFS JOURNAL alongside JOP_INODE_WRITE / JOP_DENTRY_ADD so a crash mid-
+// transaction can still replay via journal_replay.pdx. At this landing the
+// scope is exactly the in-memory pre-image needed by an EXPLICIT abort path
+// (matches design/round-retrospectives/r90-xrepo-wave3-plan.md §2's "log
+// format documented in design; readback is deferred to a future round").
+//
+// It is NOT wired into the PdxFS-block CoW write path yet. sys_pdxfs_undo_
+// write's replay applies snapshots via tmpfs_write (the substrate tmpfs
+// inode pool is the only file-content backend that has a stable byte-write
+// primitive at M1). Whichever future round adds a `pdxfs_bcow_write_
+// snapshot` primitive replaces the tmpfs_write call in pdxfs_txn_undo_
+// replay one-for-one -- the record layout does not change.
+//
+// =============================================================================
+// §1  RECORD LAYOUT (32-byte header + variable tail)
+// =============================================================================
+//
+//   +0    magic     u64  == PDXFS_UNDO_MAGIC (distinct 8-byte tag)
+//   +8    inode_no  u64  target inode (tmpfs idx for M1; low 16 bits used)
+//   +16   offset    u64  starting byte offset within the file
+//   +24   len       u64  snapshot length in bytes
+//   +32.. tail      u8[] `len` bytes of pre-image copied from the caller
+//
+// Per-row hard bounds (see §2 STORAGE below) are enforced by
+// pdxfs_txn_undo_append; a request that would overflow the per-row buffer
+// or exceed the per-row record cap is refused with PDXFS_UNDO_ENOSPC and
+// the buffer is left unchanged (partial writes never observed by a caller).
+//
+// =============================================================================
+// §2  STORAGE
+// =============================================================================
+//
+// PDXFS_UNDO_MAX_ROWS       = 16     matches PXT_MAX -- one buffer per txn row.
+// PDXFS_UNDO_PER_ROW_BYTES  = 4096   generous headroom for M1's small snapshots.
+// PDXFS_UNDO_MAX_RECS       = 32     per-row record cap; supports one abort
+//                                    walking 32 offsets on the stack without
+//                                    a heap or a linked-list backend.
+//
+//   _pdxfs_txn_undo_buffers  : [u8;  65536]  16 rows * 4096 bytes
+//   _pdxfs_txn_undo_state    : [u64;    32]  per-row (head_bytes, count) pair
+//   _pdxfs_txn_undo_offsets  : [u64;   512]  per-row [u64; 32] record offsets
+//
+// STATE LAYOUT -- _pdxfs_txn_undo_state[row*2 + k]
+//   +0    head_bytes  next-write byte offset within the row's buffer
+//   +8    count       number of records appended into the row
+//
+// OFFSETS LAYOUT -- _pdxfs_txn_undo_offsets[row*32 + i]
+//   Byte offset within the row's 4096-byte buffer at which record i starts.
+//   Consulted only on abort (§4 REPLAY): rec 0's tail bytes are at
+//   `buffers[row*4096 + offsets[row*32 + 0] + 32]`.
+//
+// =============================================================================
+// §3  ONE WRITER OF THE STATE
+// =============================================================================
+//
+// The three .bss regions above are written only by helpers in this module.
+// A future landing (paralleling the ec_confine_one calls in tools/build.
+// sh at L1635+ for the thermal / battery / audio-controller substrates)
+// can confine relocations against each symbol to `core/fs/pdxfs/undo.o`
+// once a second module has been proposed; at this landing the one-writer
+// invariant is enforced by convention (grep audit) rather than the
+// linker.  A second writer would let a caller "record an undo without
+// going through the append gate", which would let the abort replay walk
+// stale bytes with no symptom until a caller depended on the pre-image
+// content.
+//
+// =============================================================================
+// §4  REPLAY DISCIPLINE
+// =============================================================================
+//
+// pdxfs_txn_undo_replay walks the row's offsets array from index (count-1)
+// down to 0. For each record it loads (inode_no, offset, len) from the
+// header and calls tmpfs_write(inode_no, tail_ptr, len, offset). The return
+// of tmpfs_write is IGNORED at this landing: the caller (sys_pdxfs_txn_
+// abort) already committed the row to ABORTED and there is no meaningful
+// error path for "one snapshot bounced" that a syscall caller could act on
+// (a future widening threads a per-record failure code up through a wider
+// return channel). The count of records applied is returned so the caller
+// can surface it in the fingerprint.
+//
+// [unsafe] -- writes _pdxfs_txn_undo_* .bss + calls tmpfs_write which
+// writes the tmpfs inode pool + pages.
+// Audit: design/round-retrospectives/r90-xrepo-wave3-plan.md §2.
+//
+// Reserved-label discipline: labels prefixed `pxur_` / `pxua_` / `pxupr_`.
+// `loop`, `if` etc. are keywords and never used as labels.
+
+module Undo = structure {
+
+  // Distinctive 8-byte tag stamped at record +0. Value chosen to fall well
+  // outside any legitimate inode_no / offset / len a caller would pass,
+  // so a torn-record scan (future widening) can distinguish a valid header
+  // from padding without a separate length prefix.
+  pub let PDXFS_UNDO_MAGIC          : u64 = 0x504458554E444F00
+
+  pub let PDXFS_UNDO_MAX_ROWS       : u64 = 16       // = PXT_MAX
+  pub let PDXFS_UNDO_PER_ROW_BYTES  : u64 = 4096
+  pub let PDXFS_UNDO_MAX_RECS       : u64 = 32
+  pub let PDXFS_UNDO_HDR_BYTES      : u64 = 32
+
+  // Success / failure sentinels. -ENOSPC and -EINVAL are the same sign-
+  // extended u64 shape every sys_* handler in this tree uses so a caller
+  // that checks `jl 0` for any negative errno branches uniformly. -ENOSPC
+  // fires when the row's byte buffer or record cap is exhausted; -EINVAL
+  // fires on an out-of-range row_id (defensive, since the syscall body
+  // already gates the cap_slot->row_id resolution).
+  pub let PDXFS_UNDO_OK             : u64 = 0
+  pub let PDXFS_UNDO_ENOSPC         : u64 = 0xFFFFFFFFFFFFFFE4   // -ENOSPC (-28)
+  pub let PDXFS_UNDO_EINVAL         : u64 = 0xFFFFFFFFFFFFFFEA   // -EINVAL (-22)
+
+  // ==========================================================================
+  // Storage (.bss). Total footprint: 65536 + 256 + 4096 = 69888 bytes.
+  // @align(64) puts every row's buffer + state + offsets on their own cache
+  // lines so an abort replay's forward walk hits a single line per record
+  // header (the row's 4096-byte buffer straddles 64 lines but each record
+  // header is at a known byte offset that lands on one of those lines).
+  // ==========================================================================
+  pub let mut _pdxfs_txn_undo_buffers : [u8;  65536] = uninit @align(64)
+  pub let mut _pdxfs_txn_undo_state   : [u64;    32] = uninit @align(64)
+  pub let mut _pdxfs_txn_undo_offsets : [u64;   512] = uninit @align(64)
+
+  // ==========================================================================
+  // pdxfs_txn_undo_reset() -> ()
+  //
+  // Zero every row's (head_bytes, count) state pair and every offsets slot.
+  // The 65536-byte buffer region is intentionally NOT zeroed -- untouched
+  // bytes are only ever read via the offsets/head machinery gated by count,
+  // and skipping the buffer zero saves 8192 store cycles at boot with no
+  // observable effect. .bss zero-init already covers the first boot; this
+  // helper exists so the R90-XREPO.010.M1-004 witness (and any future
+  // teardown path) can start from a known-clean per-row state after a
+  // previous scenario left records behind.
+  // ==========================================================================
+  pub let pdxfs_txn_undo_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R90-XREPO.010.M1-004 (paideia-os #2112): zero every per-row (head_bytes, count) pair in _pdxfs_txn_undo_state and every offset slot in _pdxfs_txn_undo_offsets. Buffer region intentionally NOT zeroed -- untouched bytes are gated by the count field and reading them is unreachable, so skipping the buffer zero saves 8192 stores at boot. Symmetric to pdxfs_txn_table_reset (kind_pdxfs_txn.pdx) so a witness or teardown path can bring the whole txn substrate to a known-clean state in one call pair. Encoder-conservative: xor / mov / lea / cmp / jb / add / ret only. Labels prefixed pxur_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _pdxfs_txn_undo_state];
+        xor rcx, rcx;
+      pxur_state:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  pxur_state;
+
+        lea r10, [rip + _pdxfs_txn_undo_offsets];
+        xor rcx, rcx;
+      pxur_off:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 512;
+        jb  pxur_off;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_txn_undo_append(row_id, inode_no, offset, len, kbuf_ptr) -> u64
+  //
+  // Contract (SysV, 5 args):
+  //   rdi = row_id      -- txn row in [0, PDXFS_UNDO_MAX_ROWS)
+  //   rsi = inode_no    -- target inode (tmpfs idx in low 16 bits for M1)
+  //   rdx = offset      -- starting byte offset within the file
+  //   rcx = len         -- snapshot length in bytes (0 refused as -EINVAL)
+  //   r8  = kbuf_ptr    -- KERNEL VA of pre-image bytes (dispatch shim
+  //                        bounces user snapshots through a KPTI scratch
+  //                        first; boot witnesses pass .rodata directly)
+  //   -> rax = 0 on success; PDXFS_UNDO_EINVAL / PDXFS_UNDO_ENOSPC on refusal.
+  //
+  // Sequence:
+  //   (1) Bounds-check row_id (< 16). Out-of-range -> -EINVAL. This is
+  //       defensive -- the caller (sys_pdxfs_undo_write_body) already
+  //       resolved cap_slot -> row_id via pdxfs_txn_row_of_slot and
+  //       collapsed PXT_ROW_NONE to -EBADF, but a stray direct caller
+  //       gets a clear refusal.
+  //   (2) Bounds-check len (> 0 AND <= PDXFS_UNDO_PER_ROW_BYTES -
+  //       PDXFS_UNDO_HDR_BYTES). len=0 is refused because there is no
+  //       undo body to replay; oversize is refused so the tail copy
+  //       cannot overflow the row's 4096-byte buffer.
+  //   (3) Load (head_bytes, count) from _pdxfs_txn_undo_state[row*2..].
+  //       Refuse if count >= PDXFS_UNDO_MAX_RECS (32).
+  //   (4) Compute new_head = head + 32 + len; refuse if > 4096.
+  //   (5) Store the 4-word header at &buffers[row*4096 + old_head]:
+  //       [magic, inode_no, offset, len].
+  //   (6) rep_movsb the `len` snapshot bytes from kbuf_ptr into
+  //       &buffers[row*4096 + old_head + 32].
+  //   (7) Record `old_head` in _pdxfs_txn_undo_offsets[row*32 + count].
+  //   (8) Publish new state: head_bytes = new_head, count = count + 1.
+  //   (9) Return 0.
+  //
+  // Register plan (6-push callee-save prologue leaves rsp%16 == 0 at
+  // entry rsp%16 == 8):
+  //   rbx = row_id      (survives every load/store)
+  //   r12 = inode_no    (survives to header store)
+  //   r13 = offset      (survives to header store)
+  //   r14 = len         (survives to header store + rep_movsb count)
+  //   r15 = kbuf_ptr    (survives to rep_movsb src)
+  //   rbp = &state[row*2]  (row state base -- one lea suffices for both
+  //                          state loads and both state stores)
+  //
+  // NOTE: rep_movsb clobbers rsi/rdi/rcx which are all caller-save; the
+  // 6 callee-save pushes preserve everything we need across it.
+  // ==========================================================================
+  pub let pdxfs_txn_undo_append : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (inode_no: u64) (offset: u64) (len: u64) (kbuf_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R90-XREPO.010.M1-004 (paideia-os #2112): per-txn undo append primitive. Six callee-save pushes (rbx/r12/r13/r14/r15/rbp) preserve row_id + inode_no + offset + len + kbuf_ptr + state base across the rep_movsb (which clobbers rsi/rdi/rcx). Entry rsp%16==8 (SysV) + 6 pushes = 56 bytes -> rsp%16==0, aligned for any nested call (none at this landing -- this helper is leaf-adjacent). Gate order: (1) row_id < 16 -> PDXFS_UNDO_EINVAL. (2) len == 0 -> PDXFS_UNDO_EINVAL; len > PER_ROW_BYTES - HDR_BYTES = 4064 -> PDXFS_UNDO_ENOSPC (the header + snapshot would overflow the row's 4096-byte buffer even with head_bytes == 0). (3) count >= 32 -> PDXFS_UNDO_ENOSPC (per-row record cap). (4) new_head = old_head + 32 + len; > 4096 -> PDXFS_UNDO_ENOSPC. (5) Store 4-word header via `mov [r9 + K], reg` at the record base (r9 = buffers + row*4096 + old_head). (6) rep_movsb tail bytes. (7) offsets[row*32 + count] = old_head. (8) Publish new head + count. All refusals leave the row's state byte-identically unchanged (state loads happen first, and the state stores are the LAST writes -- a mid-body refusal cannot commit a partial record). Encoder: cmp/je/jne/jae/ja/mov/lea/xor/add/shl/push/pop/rep_movsb/cld/ret only. Labels prefixed pxua_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+
+        mov rbx, rdi;                    // row_id
+        mov r12, rsi;                    // inode_no
+        mov r13, rdx;                    // offset
+        mov r14, rcx;                    // len
+        mov r15, r8;                     // kbuf_ptr
+
+        // (1) row_id bound.
+        mov r10, 16;                     // PDXFS_UNDO_MAX_ROWS
+        cmp rbx, r10;
+        jae pxua_einval;
+
+        // (2) len bounds. len == 0 refused; len > 4064 refused.
+        cmp r14, 0;
+        je  pxua_einval;
+        mov r10, 4064;                   // PER_ROW_BYTES - HDR_BYTES
+        cmp r14, r10;
+        ja  pxua_enospc;
+
+        // rbp = &_pdxfs_txn_undo_state[row * 2].
+        lea rbp, [rip + _pdxfs_txn_undo_state];
+        mov r10, rbx;
+        shl r10, 4;                      // row * 16 (two u64s per row)
+        add rbp, r10;
+
+        // Load (head_bytes, count).
+        mov r10, [rbp + 0];              // r10 = head_bytes  (surviving via rbp reads)
+        mov r11, [rbp + 8];              // r11 = count
+
+        // (3) Per-row record cap.
+        mov r9, 32;                      // PDXFS_UNDO_MAX_RECS
+        cmp r11, r9;
+        jae pxua_enospc;
+
+        // (4) new_head = head + 32 + len; must fit in 4096.
+        mov rax, r10;                    // rax = new_head accumulator
+        add rax, 32;                     // + header
+        add rax, r14;                    // + len
+        mov r9, 4096;                    // PDXFS_UNDO_PER_ROW_BYTES
+        cmp rax, r9;
+        ja  pxua_enospc;
+
+        // r9 = &_pdxfs_txn_undo_buffers[row * 4096 + old_head]. We do
+        // NOT rely on any surviving-register discipline for old_head
+        // across the rep_movsb below (rep_movsb sets rcx == 0 on
+        // completion and the header-store block clobbers r10) --
+        // instead we reload old_head + count directly from state
+        // memory after rep_movsb, since neither field has been
+        // published yet.
+        lea r9, [rip + _pdxfs_txn_undo_buffers];
+        mov r11, rbx;
+        shl r11, 12;                     // row * 4096
+        add r9, r11;
+        add r9, r10;                     // r9 = &record base (r10 still == old_head here)
+
+        // (5) Store 4-word header. mov r10, imm64 for the magic.
+        mov r10, 0x504458554E444F00;     // PDXFS_UNDO_MAGIC
+        mov [r9 + 0],  r10;
+        mov [r9 + 8],  r12;              // inode_no
+        mov [r9 + 16], r13;              // offset
+        mov [r9 + 24], r14;              // len
+
+        // (6) Copy snapshot tail via rep_movsb.
+        // rep_movsb consumes: rsi=src, rdi=dst, rcx=count. All three are
+        // caller-save -- ours to clobber inside this leaf helper.
+        // Post-op: rsi, rdi advance by count; rcx == 0.
+        mov rsi, r15;                    // src = kbuf_ptr
+        lea rdi, [r9 + 32];              // dst = record base + 32
+        mov rcx, r14;                    // count = len
+        cld;
+        rep_movsb;
+
+        // (7) Publish offset into offsets[row*32 + count]. Reload
+        // old_head + count directly from state memory -- neither
+        // field has been published yet so the loads see the
+        // pre-append values.
+        mov rcx, [rbp + 0];              // rcx = old_head
+        mov r11, [rbp + 8];              // r11 = count
+        lea r10, [rip + _pdxfs_txn_undo_offsets];
+        mov r9, rbx;
+        shl r9, 8;                       // row * 32 slots * 8 bytes = row * 256
+        add r10, r9;
+        mov [r10 + r11 * 8], rcx;        // offsets[row*32 + count] = old_head
+
+        // (8) Publish new state. new_head = old_head + 32 + len;
+        // new_count = count + 1. Recompute from the known-good values
+        // just reloaded.
+        mov r9, rcx;                     // r9 = old_head
+        add r9, 32;
+        add r9, r14;                     // r9 = new_head
+        mov [rbp + 0], r9;
+        add r11, 1;
+        mov [rbp + 8], r11;
+
+        xor rax, rax;                    // PDXFS_UNDO_OK
+        jmp pxua_out;
+
+      pxua_einval:
+        mov rax, 0xFFFFFFFFFFFFFFEA;     // -EINVAL
+        jmp pxua_out;
+      pxua_enospc:
+        mov rax, 0xFFFFFFFFFFFFFFE4;     // -ENOSPC
+
+      pxua_out:
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_txn_undo_replay(row_id) -> u64
+  //
+  // Contract:
+  //   rdi = row_id
+  //   -> rax = count of records replayed on success (0 if the row has none)
+  //           PDXFS_UNDO_EINVAL if row_id is out of range.
+  //
+  // Walks the row's records from index (count-1) DOWN TO 0. For each
+  // record, loads (inode_no, offset, len) from the header at &buffers
+  // [row*4096 + offsets[row*32 + i]] and invokes
+  //   tmpfs_write(inode_no, snapshot_ptr = header + 32, len, offset)
+  // whose return is ignored (see §4 REPLAY discipline note).
+  //
+  // The record COUNT and OFFSETS array are NOT cleared after replay --
+  // the row is now ABORTED (per sys_pdxfs_txn_abort's transition, which
+  // happens before this replay), so no further sys_pdxfs_undo_write on
+  // the same row is legal. A future teardown pass (`sys_pdxfs_txn_close`,
+  // named at dispatch.pdx sysno 70's own comment) will reset the row's
+  // undo state alongside the txn row's tail_free. Leaving them in place
+  // preserves post-mortem visibility for a debugger walking the buffer.
+  //
+  // Register plan (7 callee-save pushes + 1 alignment pad = 64 bytes
+  // -> rsp%16==0 for the tmpfs_write call, entry rsp%16==8 SysV):
+  //   rbx = row_id (survives every loop iteration)
+  //   r12 = count -- total records (return value, also loop cap)
+  //   r13 = i -- current index (walks count-1 down to 0)
+  //   r14 = &record base for iteration i (recomputed each iteration)
+  //   r15 = unused (pushed for alignment symmetry)
+  //   rbp = unused (pushed for alignment symmetry)
+  // ==========================================================================
+  pub let pdxfs_txn_undo_replay : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R90-XREPO.010.M1-004 (paideia-os #2112): reverse-order undo replay. Six callee-save pushes (rbx/r12/r13/r14/r15/rbp) + `sub rsp,8` pad = 56 bytes -> rsp%16==0 for the tmpfs_write call (entry rsp%16==8 SysV). Walks _pdxfs_txn_undo_offsets[row*32 + i] from i=count-1 down to i=0; for each record loads (inode_no, offset, len) from the 32-byte header and calls tmpfs_write(inode_no, header+32, len, offset). tmpfs_write's return is INTENTIONALLY IGNORED at this landing -- the caller (sys_pdxfs_txn_abort) has already committed the row to ABORTED and a per-record failure has no meaningful ring-3 error path; a future widening threads per-record failure through a wider return channel. Returns the total count of records the row held (== count-1 iterations + 1; == 0 if the row had no records). The count and offsets ARE NOT cleared post-replay -- the row is now ABORTED so no further undo_write on this row is legal, and preserving the buffer aids post-mortem debugging. Row bound (< 16) is defensive; the caller already resolved the cap-slot. Encoder-conservative: cmp/je/jne/jae/mov/lea/xor/add/sub/shl/push/pop/call/ret only. Labels prefixed pxupr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;                      // align rsp%16 == 0 for tmpfs_write
+
+        mov rbx, rdi;                    // row_id
+
+        // Row bound (defensive).
+        mov r10, 16;
+        cmp rbx, r10;
+        jae pxupr_einval;
+
+        // Load count for this row.
+        lea r10, [rip + _pdxfs_txn_undo_state];
+        mov r11, rbx;
+        shl r11, 4;                      // row * 16
+        add r10, r11;
+        mov r12, [r10 + 8];              // r12 = count (also return value)
+
+        // Zero-record fast path.
+        cmp r12, 0;
+        je  pxupr_done;
+
+        // Start index i = count - 1.
+        mov r13, r12;
+        sub r13, 1;
+
+      pxupr_iter:
+        // Load record offset: offsets[row*32 + i].
+        lea r10, [rip + _pdxfs_txn_undo_offsets];
+        mov r11, rbx;
+        shl r11, 8;                      // row * 32 slots * 8 bytes
+        add r10, r11;
+        mov r14, [r10 + r13 * 8];        // r14 = byte offset within row's buffer
+
+        // Compute record base = &buffers[row*4096 + rec_off].
+        lea r10, [rip + _pdxfs_txn_undo_buffers];
+        mov r11, rbx;
+        shl r11, 12;                     // row * 4096
+        add r10, r11;
+        add r10, r14;                    // r10 = &record base
+        mov r14, r10;                    // r14 = record base (survives the call)
+
+        // Load header fields.
+        mov r15, [r14 + 8];              // r15 = inode_no
+        mov r10, [r14 + 16];             // r10 = offset (staged into rcx below)
+        mov r11, [r14 + 24];             // r11 = len
+
+        // tmpfs_write(inode_no = r15, snapshot_ptr = r14 + 32, len = r11, offset = r10).
+        mov rdi, r15;
+        lea rsi, [r14 + 32];
+        mov rdx, r11;
+        mov rcx, r10;
+        call tmpfs_write;                // return intentionally ignored
+
+        // Next iteration: i-- until i wraps below 0. We test i == 0
+        // BEFORE decrementing so the i == 0 iteration is the last one
+        // to run (no unsigned wrap into 0xFF...F).
+        cmp r13, 0;
+        je  pxupr_done;
+        sub r13, 1;
+        jmp pxupr_iter;
+
+      pxupr_done:
+        mov rax, r12;                    // return count
+        jmp pxupr_out;
+
+      pxupr_einval:
+        mov rax, 0xFFFFFFFFFFFFFFEA;     // -EINVAL
+
+      pxupr_out:
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

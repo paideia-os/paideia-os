@@ -6866,19 +6866,23 @@ fi
 echo "[r52-m7-005-confine] R52.M7-005 (block_cache_prefetch) confined"
 
 # ---------------------------------------------------------------------------
-# R42-PREP-008 (#1630): one-writer discipline for the PdxFS userspace
-# directory iterator cursor table.
+# R42-PREP-008 (#1630) + R90-XREPO.010.M1-006 (paideia-os #2114):
+# one-writer discipline for the PdxFS userspace directory iterator
+# cursor + rows-counter tables.
 #
-#   * pdxfs_dir_iter (KIND_PDXFS_FILE-shaped dir cap, cursor table for
-#                     sys_pdxfs_dir_readnext)
+#   * pdxfs_dir_iter (KIND_PDXFS_FILE-shaped dir cap, cursor + row-count
+#                     tables for sys_pdxfs_dir_readnext)
 #
-# _pdxfs_dir_cursor is a per-row_id cursor byte array parallel to
-# _pdxfs_file_table.  The only writers are pdxfs_dir_iter_reset (bulk
-# zero at boot), pdxfs_dir_cursor_reset (per-slot zero on open) and
-# pdxfs_dir_readnext (per-slot increment on advance), all in one file.
-# A second writer would let one caller advance / rewind another
-# caller's iterator with no capability check.  Per-module confinement
-# is what makes that unreachable by construction.
+# _pdxfs_dir_cursor is a per-row_id u16 array (widened from u8 at #2114)
+# parallel to _pdxfs_file_table.  _pdxfs_dir_rows is a per-row_id u8
+# counter added at #2114 to feed the EOD fingerprint's `rows=<n>` KV.
+# The only writers of either are pdxfs_dir_iter_reset (bulk zero at
+# boot), pdxfs_dir_cursor_reset (per-slot zero on open) and
+# pdxfs_dir_readnext (per-slot cursor advance + rows increment on
+# advance / reset on EOD), all in one file.  A second writer would let
+# one caller advance / rewind / miscount another caller's iterator with
+# no capability check.  Per-module confinement is what makes that
+# unreachable by construction.
 R42_PDI_SRC="${REPO_ROOT}/src/kernel/core/cap/pdxfs_dir_iter.pdx"
 if [[ ! -f "${R42_PDI_SRC}" ]]; then
     echo "[r42-prep-008-confine] FAIL - pdxfs_dir_iter.pdx missing" >&2
@@ -6888,6 +6892,12 @@ ec_confine_one '_pdxfs_dir_cursor' 'core/cap/pdxfs_dir_iter.o'
 if [[ "${EC_CONFINE_OK}" != "1" ]]; then
     echo "  See pdxfs_dir_iter.pdx §2 for the per-module one-writer" >&2
     echo "  discipline." >&2
+    exit 1
+fi
+ec_confine_one '_pdxfs_dir_rows' 'core/cap/pdxfs_dir_iter.o'
+if [[ "${EC_CONFINE_OK}" != "1" ]]; then
+    echo "  See pdxfs_dir_iter.pdx §2 for the per-module one-writer" >&2
+    echo "  discipline (rows counter added at paideia-os #2114)." >&2
     exit 1
 fi
 echo "[r42-prep-008-confine] R42-PREP-008 (pdxfs_dir_iter) confined"
