@@ -2351,23 +2351,30 @@ found this registry had not been updated since the R48b block above
 `KIND_TCP_LISTENER = 0x1A4` / `KIND_TCP_SOCKET = 0x1A5` (R72, landed,
 closed — both root-minted over `KIND_IPC_ENDPOINT`, `KIND_TCP_LISTENER`
 being an in-place retag of a `KIND_TCP_SOCKET` slot after `listen()`,
-per `design/kernel/tcp-substrate.md`) are real, shipped ordinals with
-**no row in this file at all**. `0x197`..`0x1A3` are unaudited by this
-pass — a future pass should confirm what (if anything) landed in that
-range before treating `0x1A4` as contiguous with `0x196`. The four rows
-below `0x1A6` are new reservations from the R91–R99 networking wave;
-`0x1A9` and `0x1AA` are reserved-but-unimplemented (see
-`design/networking/r91-plan.md` §11, §12).
+per `design/kernel/tcp-substrate.md`) landed as real, shipped ordinals
+that then collided with `KIND_PDXFS_MOUNT_TABLE = 0x1A5` (R53-PREP-001
+#1728, landed first). **Fix #2005 (2026-09-01)** renumbered the TCP
+pair — newer landing, smaller footprint — to `KIND_TCP_SOCKET = 0x1AB`
+and `KIND_TCP_LISTENER = 0x1AC`, sitting immediately after the R91-R99
+networking reservation block (0x1A7..0x1AA). `KIND_PDXFS_MOUNT_TABLE`
+kept its original slot at 0x1A5. `0x197`..`0x1A3` are unaudited by
+this pass — a future pass should confirm what (if anything) landed in
+that range. The four rows in the 0x1A7..0x1AA reservation block are
+new reservations from the R91–R99 networking wave; `0x1A9` and `0x1AA`
+are reserved-but-unimplemented (see `design/networking/r91-plan.md`
+§11, §12).
 
 | Value  | Name                     | Base                              | Purpose (short)                                                                                     | Discipline                    | Failure band        | File                            |
 |-------:|--------------------------|-----------------------------------|-------------------------------------------------------------------------------------------------------|:------------------------------|:--------------------|---------------------------------|
-| 0x1A4  | `KIND_TCP_LISTENER`      | `KIND_IPC_ENDPOINT = 5`           | *(backfill — R72, #1923-1932)* A `KIND_TCP_SOCKET` slot retagged in place after `listen()`; same `tcb_idx` target_ptr, not a second mint. Root-minted (no parent-cap argument). | derived                       | *(not audited — see `net/tcp_socket.pdx`)* | `net/tcp_socket.pdx`            |
-| 0x1A5  | `KIND_TCP_SOCKET`        | `KIND_IPC_ENDPOINT = 5`           | *(backfill — R72, #1923-1932)* An active or not-yet-connected TCP socket; `bind`/`connect`/`send`/`recv`/`shutdown` (SC+ 87-94) all require this kind. Root-minted. | derived                       | *(not audited)*     | `net/tcp_socket.pdx`            |
+| 0x1A4  | *(retired — was `KIND_TCP_LISTENER`)* | —              | Vacated by fix#2005 (2026-09-01): `KIND_TCP_LISTENER` moved to 0x1AC to sit adjacent to the relocated `KIND_TCP_SOCKET`. Do not reuse this ordinal until a dedicated audit confirms no stale reference remains. | *(vacated)*                    | —                    | —                                |
+| 0x1A5  | `KIND_PDXFS_MOUNT_TABLE` | `KIND_MEMORY = 4`                 | *(backfill — R53-PREP-001 #1728)* Row-append authority for the mount table. Landed first at 0x1A5; TCP's collision at this ordinal (#1928) was resolved in fix#2005 by moving TCP to 0x1AB/0x1AC. See `core/cap/kind_pdxfs_mount_table.pdx`. | derived                       | *(not audited by this pass)* | `core/cap/kind_pdxfs_mount_table.pdx` |
 | 0x1A6  | `KIND_TUI_CANVAS`        | *(not audited by this pass)*      | *(backfill — R89, #1988-1989, landed/closed; see `design/round-retrospectives/r89-closure.md`)*. Row/discipline detail out of scope for this networking-focused backfill. | *(not audited)*                | *(not audited)*     | `core/cap/kind_tui_canvas.pdx`  |
 | 0x1A7  | `KIND_NIC`               | `KIND_DEVICE = 10`                | R91.M1-001 (new): device-level NIC authority — active backend selector (e1000e / virtio-net / rtl8139), MAC, link state. Root-minted at the single boot-time probe. | derived                       | *(assign at filing)* | `kind_nic.pdx`                  |
 | 0x1A8  | `KIND_UDP_SOCKET`        | `KIND_IPC_ENDPOINT = 5`           | R93.M2-001 (new): modern re-registration of UDP-socket authority, superseding the pre-R30-numbering-scheme `KIND_UDP_SOCKET = 0x50` (`core/cap/udp_socket_cap.pdx`, R27.M6). The `0x50` value is retired, not reused — a stale reference to it must fail a build-time check, not silently alias this new meaning. Root-minted, mirrors `KIND_TCP_SOCKET`'s posture. | derived                       | *(assign at filing)* | `net/udp_socket.pdx`            |
 | 0x1A9  | `KIND_PACKET_FILTER`     | `KIND_IPC_ENDPOINT = 5`           | R96.M3-001 (new): **reserved, unimplemented.** Future packet-filter-chain installation authority. Chain semantics (numeric priority 0-999, `Drop` short-circuits, `Accept` continues, tie-break by registration order) are already specified at `design/network/filter-chain.md` — do not re-decide them when this ordinal is implemented. | reserved                       | —                    | —                                |
-| 0x1AA  | `KIND_TLS_CONN`          | `KIND_TCP_SOCKET = 0x1A5`         | R97.M2-001 (new): **reserved, unimplemented.** Future in-kernel PQ-hybrid TLS connection, pending paideia-as gaining the classical bridge primitives (HKDF-SHA256, SHA-256, ECDSA/RSA certificate verification, X25519) a real-Internet TLS 1.3 handshake needs — see `design/networking/r91-plan.md` §11/§13. Until then, TLS lives entirely in user-space per that document's ratification of `design/network/stack.md` NET-D6. | reserved                       | —                    | —                                |
+| 0x1AA  | `KIND_TLS_CONN`          | `KIND_TCP_SOCKET = 0x1AB`         | R97.M2-001 (new): **reserved, unimplemented.** Future in-kernel PQ-hybrid TLS connection, pending paideia-as gaining the classical bridge primitives (HKDF-SHA256, SHA-256, ECDSA/RSA certificate verification, X25519) a real-Internet TLS 1.3 handshake needs — see `design/networking/r91-plan.md` §11/§13. Until then, TLS lives entirely in user-space per that document's ratification of `design/network/stack.md` NET-D6. Base ordinal reflects fix#2005's TCP renumber. | reserved                       | —                    | —                                |
+| 0x1AB  | `KIND_TCP_SOCKET`        | `KIND_IPC_ENDPOINT = 5`           | *(relocated — R72 #1928, moved from 0x1A5 by fix#2005)* An active or not-yet-connected TCP socket; `bind`/`connect`/`send`/`recv`/`shutdown` (SC+ 87-94) all require this kind. Root-minted. | derived                       | *(not audited)*     | `net/tcp_socket.pdx`            |
+| 0x1AC  | `KIND_TCP_LISTENER`      | `KIND_IPC_ENDPOINT = 5`           | *(relocated — R72 #1928, moved from 0x1A4 by fix#2005 to sit adjacent to relocated `KIND_TCP_SOCKET`)* A `KIND_TCP_SOCKET` slot retagged in place after `listen()`; same `tcb_idx` target_ptr, not a second mint. Root-minted (no parent-cap argument). | derived                       | *(not audited — see `net/tcp_socket.pdx`)* | `net/tcp_socket.pdx`            |
 
 ### Summary counts and free bands
 
@@ -2377,7 +2384,7 @@ below `0x1A6` are new reservations from the R91–R99 networking wave;
 - **SEALED kinds (2):** `KIND_WIFI_KEY`, `KIND_BT_PAIRING`.
 - **Linearizable-on-object (1):** `KIND_FW_SESSION` (the arbitration is on the object, not the session cap).
 - **QUERY-only kinds (4):** `KIND_CSI_CAMERA`, `KIND_IPU6_STREAM`, `KIND_WWAN_MODEM`, `KIND_MBIM_SESSION` (R40 pattern — identity fields frozen at mint; the only mutator is the revoke helper).
-- **Next free derived-kind tag:** `0x1AB` (after the R91-R99 networking backfill/reservation block `0x1A4..0x1AA` above). **`0x197`..`0x1A3` are unaudited** by any pass of this file — treat that range as "unknown, not confirmed free" until a dedicated audit walks `core/cap/kind.pdx` end to end; the R72/R89 backfill above only proves this file had silently fallen behind, not that `0x197..0x1A3` is empty.
+- **Next free derived-kind tag:** `0x1AD` (after the fix#2005 TCP relocation to `0x1AB`/`0x1AC`, sitting just past the R91-R99 networking reservation block `0x1A7..0x1AA`). The vacated `0x1A4` slot is **not** treated as free — do not reuse until a dedicated audit confirms no stale reference remains; `0x1A5` continues to name `KIND_PDXFS_MOUNT_TABLE`. **`0x197`..`0x1A3` are unaudited** by any pass of this file — treat that range as "unknown, not confirmed free" until a dedicated audit walks `core/cap/kind.pdx` end to end; the R72/R89 backfill above only proves this file had silently fallen behind, not that `0x197..0x1A3` is empty.
 - **Adjacent-below free failure band:** `0xFFFFF170..7F` (16-wide; reserved for the R41 opener). `0xFFFFF180..8F` was allocated at R40.M5-001 (#1363) for `core/audit/audit_schema.pdx`.
 
 ### Migration table — audit-emit sites still on `drv_audit_emit`

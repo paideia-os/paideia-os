@@ -122,7 +122,7 @@ real hardware. This plan flags it so it is not lost.
 | ICMP | `net/icmp.pdx` | Echo Reply responder landed (R27.M6). No echo-request-originate (ping *client*) path. |
 | UDP | `net/udp.pdx` (538 lines) | Header parse/build (checksum field always 0 — "no bit-flip surface on QEMU virtual link" posture, stated explicitly). RX only echoes hardcoded port 7; **real per-port → `KIND_UDP_SOCKET` dispatch is stubbed out, deferred to "#1015"** which never landed. `KIND_UDP_SOCKET = 0x50` is a **pre-R30-numbering-scheme** ordinal, absent from `design/architecture/next-wave-derived-kinds.md`'s registry entirely (a real documentation gap). |
 | TCP | `net/tcp.pdx` (1365 lines), `net/tcp_socket.pdx` | Real 11-state RFC 793 machine, 64-TCB pool, Reno-lite congestion control, single-timer retransmit. **Exercised only via the R72 boot witness's loopback self-connect fast path** (`local_ip == remote_ip`) — the real off-box `ipv4_tx_send` path exists in code but has never been run. Retransmit timer (`tcp_poll_retransmits`) is **not wired to any interrupt/tick source** — exported but never called. Data retransmit only replays control segments correctly (SYN/ACK/FIN), not payload bytes (`_tcp_tx_buf_table` declared, not wired). TIME_WAIT frees immediately (no 2MSL). `accept()`/`recv()` are non-blocking only. |
-| Sockets syscalls | `syscall/handlers/sys_{socket,bind,listen,accept,connect,send,recv,shutdown}.pdx`, syscall numbers 87–94 | Real, TCP-only. `KIND_TCP_LISTENER = 0x1A4`, `KIND_TCP_SOCKET = 0x1A5` (both root-minted, over `KIND_IPC_ENDPOINT`) — **landed in `cap/kind.pdx` at R72 but never backfilled into `design/architecture/next-wave-derived-kinds.md`'s table** (verified: grep for either name in that file returns nothing). This plan backfills both (§10). |
+| Sockets syscalls | `syscall/handlers/sys_{socket,bind,listen,accept,connect,send,recv,shutdown}.pdx`, syscall numbers 87–94 | Real, TCP-only. Originally landed as `KIND_TCP_LISTENER = 0x1A4`, `KIND_TCP_SOCKET = 0x1A5` (both root-minted, over `KIND_IPC_ENDPOINT`) — **relocated by fix#2005 (2026-09-01) to `KIND_TCP_SOCKET = 0x1AB`, `KIND_TCP_LISTENER = 0x1AC`** after the 0x1A5 collision with `KIND_PDXFS_MOUNT_TABLE` (R53-PREP-001) was resolved. Also **landed in `cap/kind.pdx` at R72 but never backfilled into `design/architecture/next-wave-derived-kinds.md`'s table** (verified: grep for either name in that file returns nothing). This plan backfills both (§10). |
 | Legacy virtio-net stub | `src/drivers/virtio_net/probe.pdx` | Pre-refactor, Phase-7-era ("D7-006" issue numbering), disconnected from every current convention (not in `src/kernel/core/drivers/`, doesn't use `cap/kind.pdx`, doesn't use `driver_table.pdx`). Its own header says "no packet transmission" and gates its PCI config reads as non-live. **Dead code; superseded by this plan's R91.M6 (retire it).** |
 | paideia-as crypto/bit primitives | `tools/paideia-as/CHANGELOG.md` | `bswap r32/r64` (PA-R15-001, PA-R13-014), `lock xadd/cmpxchg/cmpxchg16b/bts/btr/btc/and/or/xor` (PA-R16.x), `ChaCha20-Poly1305` seal/open + `Argon2id` derive (#1305, v0.22.0), `mldsa65_sign` (#1330, v0.23.0), `f32/f64` SSE encoder (v0.24.0). **No SHA-256/HMAC/HKDF, no X25519/ECDH, no ECDSA/RSA verify, no ML-KEM intrinsic.** Directly informs §9's TLS decision. |
 
@@ -773,20 +773,24 @@ ordinals. Applied directly to `design/architecture/next-wave-derived-kinds.md`
 
 | Tag | Kind name | Parent (base) | Purpose | Discipline | Landed at |
 |---|---|---|---|---|---|
-| 0x1A4 | `KIND_TCP_LISTENER` | `KIND_IPC_ENDPOINT = 5` | *(backfill)* A `KIND_TCP_SOCKET` retagged in place after `listen()`. Root-minted. | derived | R72 (already shipped; this plan only documents it) |
-| 0x1A5 | `KIND_TCP_SOCKET` | `KIND_IPC_ENDPOINT = 5` | *(backfill)* Active or not-yet-connected TCP socket. Root-minted. | derived | R72 (already shipped; this plan only documents it) |
+| 0x1A4 | *(retired — was `KIND_TCP_LISTENER`)* | — | Vacated by fix#2005 (2026-09-01) — `KIND_TCP_LISTENER` relocated to 0x1AC. Do not reuse. | *(vacated)* | — |
+| 0x1A5 | `KIND_PDXFS_MOUNT_TABLE` | `KIND_MEMORY = 4` | Landed at R53-PREP-001 #1728. Was collided by TCP_SOCKET (fix#2005 renumbered TCP away). | derived | R53-PREP-001 |
 | 0x1A7 | `KIND_NIC` | `KIND_DEVICE = 10` | Device-level NIC authority: active backend selector (e1000e/virtio-net/rtl8139), MAC, link state. | derived | R91.M1-001 (new) |
 | 0x1A8 | `KIND_UDP_SOCKET` | `KIND_IPC_ENDPOINT = 5` | Modern re-registration superseding the pre-R30-scheme `0x50` value (§4.4). Root-minted, mirrors `KIND_TCP_SOCKET`. | derived | R93.M2-001 (new) |
 | 0x1A9 | `KIND_PACKET_FILTER` | `KIND_IPC_ENDPOINT = 5` | *(reserved, unimplemented)* Future packet-filter-chain installation authority per `design/network/filter-chain.md`. | reserved | R96.M3-001 (reservation only) |
-| 0x1AA | `KIND_TLS_CONN` | `KIND_TCP_SOCKET = 0x1A5` | *(reserved, unimplemented)* Future in-kernel PQ-hybrid TLS connection, pending paideia-as classical-bridge primitives (§13). | reserved | R97.M2-001 (reservation only) |
+| 0x1AA | `KIND_TLS_CONN` | `KIND_TCP_SOCKET = 0x1AB` | *(reserved, unimplemented)* Future in-kernel PQ-hybrid TLS connection, pending paideia-as classical-bridge primitives (§13). Base ordinal reflects fix#2005's TCP renumber. | reserved | R97.M2-001 (reservation only) |
+| 0x1AB | `KIND_TCP_SOCKET` | `KIND_IPC_ENDPOINT = 5` | *(relocated)* Active or not-yet-connected TCP socket. Root-minted. Moved from 0x1A5 in fix#2005 (2026-09-01) to resolve the collision with `KIND_PDXFS_MOUNT_TABLE`. | derived | R72 (relocated by fix#2005) |
+| 0x1AC | `KIND_TCP_LISTENER` | `KIND_IPC_ENDPOINT = 5` | *(relocated)* A `KIND_TCP_SOCKET` retagged in place after `listen()`. Root-minted. Moved from 0x1A4 in fix#2005 to sit adjacent to relocated `KIND_TCP_SOCKET`. | derived | R72 (relocated by fix#2005) |
 
 **Note on 0x1A6:** already claimed by `KIND_TUI_CANVAS` (R89) — confirmed
 via `r89-closure.md`. `KIND_NIC` therefore starts at 0x1A7, not 0x1A6.
 **Verify at filing time** that no intervening ordinal was claimed between
 this research and issue filing (the same gap that let 0x1A4/0x1A5 go
-undocumented could recur) — a quick grep for `0x1A[6-9]|0x1AA` across
-`src/kernel/core/cap/kind.pdx` immediately before filing is cheap
-insurance.
+undocumented could recur — and note that fix#2005 subsequently
+relocated TCP to 0x1AB/0x1AC after that gap turned into a live 0x1A5
+collision with `KIND_PDXFS_MOUNT_TABLE`) — a quick grep for
+`0x1A[6-9]|0x1AA|0x1A[BC]` across `src/kernel/core/cap/kind.pdx`
+immediately before filing is cheap insurance.
 
 ---
 

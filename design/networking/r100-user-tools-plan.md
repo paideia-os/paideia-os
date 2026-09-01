@@ -995,19 +995,16 @@ worth osarch's own security judgment given ping-flood/DoS potential).
 
 ### 12.3 `KIND_TLS_TRUST` derived kind (blocks `pdxtrust`.M2, `pdxcurl`.M3)
 
-**Before allocating**, resolve or explicitly confirm-harmless the
-existing **0x1A5 ordinal collision** between `KIND_PDXFS_MOUNT_TABLE`
-(R53, base `KIND_MEMORY`, dispatched via `cap_invoke_dispatch`) and
-`KIND_TCP_SOCKET` (R72, base `KIND_IPC_ENDPOINT`, explicitly *not*
-dispatched via `cap_invoke_dispatch` per its own design comment in
-`cap/kind.pdx`). Both currently define the numeric tag `0x1A5`. This is
-almost certainly latent-harmless today (TCP sockets never reach the
-generic `cap_invoke` dispatch path per their own design note), but it is
-a live registry-integrity defect this plan does not want to compound by
-allocating a third overlapping tag. Recommend a documentation pass (at
-minimum, a cross-reference comment in both files acknowledging the
-shared numeric value and why it's safe) or a renumber of one of the two,
-done by main/osarch, **before** `KIND_TLS_TRUST` lands.
+**RESOLVED by fix#2005 (2026-09-01).** The **0x1A5 ordinal collision**
+between `KIND_PDXFS_MOUNT_TABLE` (R53, base `KIND_MEMORY`, dispatched
+via `cap_invoke_dispatch`) and `KIND_TCP_SOCKET` (R72, base
+`KIND_IPC_ENDPOINT`, explicitly *not* dispatched via
+`cap_invoke_dispatch` per its own design comment in `cap/kind.pdx`)
+was renumbered by moving the TCP pair — newer landing, smaller
+footprint — to `KIND_TCP_SOCKET = 0x1AB`, `KIND_TCP_LISTENER = 0x1AC`.
+`KIND_PDXFS_MOUNT_TABLE` kept its original slot at 0x1A5. The gate is
+therefore closed for `KIND_TLS_TRUST` and every subsequent R100 kind
+allocation.
 
 Proposed placeholder ordinal (chosen to sit safely past every currently
 allocated tag, including the collision above, regardless of how it
@@ -1071,7 +1068,7 @@ M4 tests+smoke, M5 signed release).
 ### §13.0 Substrate prep (paideia-os + paideia-as, before tool M2/M3s open)
 
 ```
-paideia-os.R100-PREP-000 Resolve or confirm-harmless the KIND_PDXFS_MOUNT_TABLE / KIND_TCP_SOCKET 0x1A5 ordinal collision (§12.3)
+paideia-os.R100-PREP-000 (RESOLVED by fix#2005, 2026-09-01) KIND_PDXFS_MOUNT_TABLE / KIND_TCP_SOCKET 0x1A5 ordinal collision resolved by relocating TCP to 0x1AB/0x1AC (§12.3)
 paideia-os.R100-PREP-001 KIND_TLS_TRUST = 0x1A7 derived-kind + witness (cap_invoke_dispatch branch, mint-gate, R_TLS_TRUST_READ)
 paideia-os.R100-PREP-002 Extend sys_socket/sys_connect/sys_send/sys_recv/sys_bind (SC+87/88/91/92/93) to accept SOCK_DGRAM/AF_INET, connected-UDP semantics only (§12.1)
 paideia-os.R100-PREP-003 sys_icmp_echo new syscall (SC+ placeholder 96) + R_NET_PRIVILEGED_PROTOCOL elevate policy class (§12.2)

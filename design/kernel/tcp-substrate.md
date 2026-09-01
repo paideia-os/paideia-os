@@ -219,9 +219,13 @@ for documentation symmetry with that file's derived-kind family, both
 **root-minted** (no parent-capability argument — `sys_socket` needs no
 authority, matching `sys_open`'s own posture):
 
-- `KIND_TCP_SOCKET` (0x1A5) — an active or not-yet-connected socket:
+- `KIND_TCP_SOCKET` (0x1AB — moved from 0x1A5 in fix#2005 to resolve
+  the collision with `KIND_PDXFS_MOUNT_TABLE`, R53-PREP-001 #1728) —
+  an active or not-yet-connected socket:
   `bind`/`connect`/`send`/`recv`/`shutdown` all require this kind.
-- `KIND_TCP_LISTENER` (0x1A4) — a socket after `listen()`: only
+- `KIND_TCP_LISTENER` (0x1AC — moved from 0x1A4 in fix#2005 to sit
+  adjacent to the relocated `KIND_TCP_SOCKET`) — a socket after
+  `listen()`: only
   `accept()` operates on this kind.
 
 `listen()` **retags** an existing `KIND_TCP_SOCKET` slot to
