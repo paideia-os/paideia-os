@@ -14,7 +14,7 @@ Sort: Priority DESC, then Completion ASC (highest-priority under-built rises fir
 | Repo | Completion | Priority | Open Issues | Summary | Blocks downstream |
 |---|:-:|:-:|:-:|---|---|
 | **libpdx-net** | 1 | 5 | 22 | TCP/UDP wrappers + DNS resolver + TLS 1.3 (raw pubkey) | pdxcurl, pdxdig, pdxsock, pdxping.M2, fetch |
-| **libpdx-schema-registry** | 1 | 5 | 1 | Schema registry service + client (svc.schema-registry) | Every semantic-pipe consumer (ls, cat, doc, pdxcurl, postui, all schema-emitting tools) |
+| **libpdx-schema-registry** | 4 | 5 | 0 | Schema registry client-facade (record types, register/lookup/list, audit + elevate hooks, wire spec) — M1..M4 shipped 2026-09-01 | Every semantic-pipe consumer (ls, cat, doc, pdxcurl, postui, all schema-emitting tools) |
 | **libpdx-audit** | 3 | 5 | 0 | Audit-first emit to `/system/audit/*.log` (I5 invariant) | Every destructive-op tool (rm, mv, cp, mkfs, mount, umount, pkg) |
 | **libpdx-cap** | 3 | 5 | 2 | Capability marshalling for tool invocations | Every satellite tool that mints/consumes caps |
 | **libpdx-elevate** | 3 | 5 | 1 | Client-side elevate protocol helper | Every privileged tool (rm system paths, mkfs, pdxping, pdxcurl) |
@@ -28,7 +28,9 @@ Sort: Priority DESC, then Completion ASC (highest-priority under-built rises fir
 
 ## In-flight investment (2026-09-01)
 
-- **libpdx-schema-registry** — completion sweep in progress. See §"libpdx-schema-registry sweep" below.
+- **libpdx-schema-registry** — completion sweep in progress. See §sweep below.
+- **libpdx-cap** — #18 (ENH-008 additive caller-owned variants) sweep in progress (unblocked; #20 externally blocked on shell.ENH-032).
+- **libpdx-elevate** — cascade sweep started; #18 blocked on 5 paideia-os issues (#2117 #2118 #2119 #2121 #2122); landing the chain.
 - **libpdx-net** — recommended next; not yet started.
 
 ## libpdx-schema-registry sweep
@@ -53,4 +55,15 @@ Started 2026-09-01. Target: raise completion 1 → 4 (skip M5 signed release for
 
 | Date | Milestone | Issue | State |
 |---|---|---|---|
-| 2026-09-01 | M1 | #1 (scaffold) | in-progress (softarch dispatched) |
+| 2026-09-01 | M1 | #1 scaffold | closed `be0ae09` |
+| 2026-09-01 | M2 | #2 record types | closed `a88ae08` |
+| 2026-09-01 | M2 | #3 register+dedup | closed `2c7f4e9` |
+| 2026-09-01 | M2 | #4 lookup | closed `0ed42ef` |
+| 2026-09-01 | M2 | #5 list | closed `bd64dd6` |
+| 2026-09-01 | M3 | #6 audit hook | closed `a21158f` |
+| 2026-09-01 | M3 | #7 elevate gate | closed `483288e` |
+| 2026-09-01 | M3 | #8 semantic-pipe wire | closed `c6c509b` |
+| 2026-09-01 | M4 | #9 unit tests | closed `9df3cd5` |
+| 2026-09-01 | M4 | #10 smoke witness | closed `020e697` |
+
+**Sweep result:** completion 1 → 4. FNV-1a-64 hash placeholder (BLAKE3 intrinsic pending in paideia-as); R_SCHEMA_REGISTER = 0x40; wire spec landed as marshalling helpers only (Send/Recv routes through libpdx-semantic-pipe when a consumer wires it up).
