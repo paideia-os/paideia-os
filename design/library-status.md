@@ -16,8 +16,8 @@ Sort: Priority DESC, then Completion ASC (highest-priority under-built rises fir
 | **libpdx-net** | 1 | 5 | 22 | TCP/UDP wrappers + DNS resolver + TLS 1.3 (raw pubkey) | pdxcurl, pdxdig, pdxsock, pdxping.M2, fetch |
 | **libpdx-schema-registry** | 4 | 5 | 0 | Schema registry client-facade (record types, register/lookup/list, audit + elevate hooks, wire spec) — M1..M4 shipped 2026-09-01 | Every semantic-pipe consumer (ls, cat, doc, pdxcurl, postui, all schema-emitting tools) |
 | **libpdx-audit** | 3 | 5 | 0 | Audit-first emit to `/system/audit/*.log` (I5 invariant) | Every destructive-op tool (rm, mv, cp, mkfs, mount, umount, pkg) |
-| **libpdx-cap** | 3 | 5 | 2 | Capability marshalling for tool invocations | Every satellite tool that mints/consumes caps |
-| **libpdx-elevate** | 3 | 5 | 1 | Client-side elevate protocol helper | Every privileged tool (rm system paths, mkfs, pdxping, pdxcurl) |
+| **libpdx-cap** | 4 | 5 | 1 | Capability marshalling — ENH-008 (additive caller-owned re-entrant variants) shipped 2026-09-01 sat `f472530` | Every satellite tool that mints/consumes caps. #20 remains open (externally blocked on shell.ENH-032) |
+| **libpdx-elevate** | 4 | 5 | 0 | Client-side elevate protocol helper — ALLOW/DENY/TIMEOUT reconciliation shipped 2026-09-01 sat `3e54a8e`; full kernel-side broker landed at `2225b18` | Every privileged tool (rm system paths, mkfs, pdxping, pdxcurl) |
 | **libpdx-semantic-pipe** | 5 | 5 | 6 | Schema-typed pipe endpoints over KIND_IPC_ENDPOINT | postui + shell + every schema-emitting tool |
 | **paideia-as** | 5 | 5 | 1 | Assembler compiler (Rust, self-hosted target) | Every .pdx compilation everywhere |
 | **postui** | 1 | 4 | 40 | Ratatui-inspired TUI library, cap-based, semantically-queryable | postui-dmesg/hex/top + shell/edit/doc TUI layer |
@@ -29,8 +29,9 @@ Sort: Priority DESC, then Completion ASC (highest-priority under-built rises fir
 ## In-flight investment (2026-09-01)
 
 - **libpdx-schema-registry** — completion sweep in progress. See §sweep below.
-- **libpdx-cap** — #18 (ENH-008 additive caller-owned variants) sweep in progress (unblocked; #20 externally blocked on shell.ENH-032).
-- **libpdx-elevate** — cascade sweep started; #18 blocked on 5 paideia-os issues (#2117 #2118 #2119 #2121 #2122); landing the chain.
+- **libpdx-cap** — #18 landed at satellite `f472530` (2026-09-01). Completion 3→4. #20 remains open (externally blocked).
+- **libpdx-elevate** — cascade fully closed 2026-09-01. Kernel: #2117-#2120 leaves at `ede6179`, #2121 policy stamp, #2122 broker dispatch at `2225b18`. Satellite: #18 at `3e54a8e`. Completion 3→4. 0 open issues.
+- **ls** — 10 new ENH issues (#ENH-014..023) being filed for a completion sweep (2026-09-01).
 - **libpdx-net** — recommended next; not yet started.
 
 ## libpdx-schema-registry sweep
