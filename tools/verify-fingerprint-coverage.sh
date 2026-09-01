@@ -86,6 +86,18 @@ ALLOWLIST = {
     # -- Section A: production (src/kernel/**) markers on genuinely
     #    unreachable paths. Triaged for #1578.
 
+    # R91.M2-003 (#2017): e1000e_probe emits its rx/irq activation
+    # rollup fingerprint once per probe. Fires unconditionally under
+    # nic_dispatch_probe (called from kernel_main after PCI enum, #2015).
+    # In the default -kernel boot with no -device e1000e, kind stays 0
+    # (no NIC found) and rx/irq report 0/0. Assertable golden lands with
+    # R91.M5 boot_r91_nic_probe smoke (issue #2031) once PAIDEIA_NIC=e1000e
+    # is wired.
+    "e1000e probe ok [legacy: E1000E PROBE OK]":
+        "R91.M2-003 (#2017): e1000e_probe rx/irq activation rollup; "
+        "fires per boot via nic_dispatch_probe; assertable golden "
+        "lands with R91.M5 boot_r91_nic_probe smoke (#2031).",
+
     # src/kernel/boot/witness/rootfs_seed_policy.pdx (R90-XREPO.011.M1-004
     # #2119): policy seed marker fires every boot (witness runs
     # unconditionally). The R90-XREPO.011.M1-003 (#2122) elevate-broker
@@ -563,6 +575,28 @@ ALLOWLIST = {
         "r91_kind_nic.pdx's witness_r91_kind_nic, but no golden file "
         "asserts this exact line — the witness's own lowercase "
         "'boot nic ok --' fingerprint covers this code path.",
+
+    # src/kernel/core/net/nic_dispatch.pdx — R91.M2-001 (paideia-os #2015)
+    # boot-order NIC probe fingerprint, emitted once at the tail of every
+    # nic_dispatch_probe call from inside the nd_pb_emit label. Now
+    # reachable at every boot via kernel_main_64's call site immediately
+    # after pci_publish_caps (the R91.M2-001 wire-in landing). On the
+    # default `qemu -kernel` boot (no `-device e1000e / virtio-net-pci /
+    # rtl8139`) the probe lands on NIC_KIND_NONE and the fingerprint
+    # reports `kind=0`; on a boot that adds `-device e1000e` (paideia-os
+    # #2018) it reports `kind=1`. Same "no golden file asserts this exact
+    # line" posture as the "nic mint ok" sibling immediately above:
+    # neither the default 14-mode matrix nor the R91 witness fleet pins
+    # the literal line yet. Retires from this allowlist when a golden
+    # (likely a `-device e1000e` mode landed by #2018 asserting
+    # `kind=1`) pins the fingerprint.
+    "nic dispatch probe ok [legacy: NIC DISPATCH PROBE OK]":
+        "R91.M2-001 (paideia-os #2015): emitted at every boot from "
+        "nic_dispatch_probe's nd_pb_emit label, but no golden file "
+        "asserts this exact line yet — the probe's own no-crash "
+        "return is the assertable signal until #2018 (or a sibling "
+        "milestone) lands a `-device e1000e` mode that pins the "
+        "`kind=1` variant.",
 
     # src/kernel/core/tui/canvas_present.pdx — R89.M1-003 (#1990)
     # TUI_OP_PRESENT real body. Same status change as the "tui canvas
