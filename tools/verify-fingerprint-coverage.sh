@@ -86,12 +86,20 @@ ALLOWLIST = {
     # -- Section A: production (src/kernel/**) markers on genuinely
     #    unreachable paths. Triaged for #1578.
 
-    # src/kernel/boot/witness/rootfs_seed_policy.pdx (R90-XREPO.011.M1-004 #2119):
-    # policy seed marker fires every boot (witness runs unconditionally) but
-    # no golden asserts it yet; add golden line once the elevate-broker smoke
-    # (R90-XREPO.011.M1-003 #2122) is written and consumes the seeded file.
+    # src/kernel/boot/witness/rootfs_seed_policy.pdx (R90-XREPO.011.M1-004
+    # #2119): policy seed marker fires every boot (witness runs
+    # unconditionally). The R90-XREPO.011.M1-003 (#2122) elevate-broker
+    # dispatch witness consumes the seeded file via tmpfs_read but does
+    # not itself add a golden line for this exact literal — the seed's
+    # role in the cascade is proven by that witness's own success
+    # rollup (`boot elevate broker ok`, allowlisted below) taking the
+    # ALLOW/DENY arms that depend on the seeded rules. No golden pins
+    # the raw `policy seed ok bytes=173` literal today.
     "policy seed ok [legacy: POLICY SEED OK]":
-        "witness fires every boot; assertable golden lands with R90-XREPO.011.M1-003 (#2122) elevate-broker smoke.",
+        "R90-XREPO.011.M1-004 (#2119): policy seeder fires every boot; "
+        "R90-XREPO.011.M1-003 (#2122) consumes the file via tmpfs_read "
+        "and its `boot elevate broker ok` rollup is the assertable "
+        "signal for the whole cascade — no golden pins this exact literal.",
 
     # src/kernel/core/iommu/vtd_fault.pdx — vtd_fault_dispatch's own
     # header says "NOT WIRED AT M4 BOOT", and a tree-wide grep confirms
@@ -474,20 +482,58 @@ ALLOWLIST = {
 
     # src/kernel/core/cap/kind_elevate_channel.pdx tag_elvc_expire_set_ok
     # — R90-XREPO.011.M1-002 (paideia-os #2118). Emitted from
-    # cap_handler_elevate_channel's ELVC_OP_SET_EXPIRE (=8) arm, but
-    # cap_handler_elevate_channel has no caller in the default 14-mode
-    # matrix at this landing: the elevate broker daemon that would drive
-    # the SET_EXPIRE op is R90-XREPO.011.M1-003 (#2119, deferred), and
-    # the consumer witness that exercises the full 100 ms-deadline ->
-    # ELVC_ERR_EXPIRED cycle is R90-XREPO.011.M1-007 (#2122, deferred).
-    # Same posture as the TTY_OP_SET_RAW / SET_COOKED sibling above —
-    # the mutation op body is landed; the caller and boot witness are
-    # separate leaves.
+    # cap_handler_elevate_channel's ELVC_OP_SET_EXPIRE (=8) arm; also
+    # emitted whenever the broker's real dispatch body
+    # (elevate_broker_serve_one, #2122) calls
+    # elevate_channel_row_set_expire from ipc/elevate_broker.pdx
+    # (which routes through the same handler code path). No golden
+    # file pins the line yet — the boot-witness rollup ("boot elevate
+    # broker ok [legacy: BOOT ELEVATE BROKER OK]", allowlisted below)
+    # is the assertable signal for the whole dispatch cascade, same
+    # posture as the tag_boot_tui_canvas_ok / tag_boot_tls_trust_ok
+    # entries above. Reason retained rather than deleted because
+    # deletion would require a golden that pins this exact literal on
+    # the wire, which the witness's own rollup does not need for its
+    # assertion to bite.
     "elevate expire set ok [legacy: ELEVATE EXPIRE SET OK]":
-        "R90-XREPO.011.M1-002 (#2118): ELVC_OP_SET_EXPIRE body has no "
-        "caller in this landing — the elevate broker daemon (#2119) "
-        "and the deadline-reaper witness (#2122) are separate leaves. "
-        "Assertable once either lands and drives SET_EXPIRE.",
+        "R90-XREPO.011.M1-002 (#2118) / R90-XREPO.011.M1-003 (#2122): "
+        "ELVC_OP_SET_EXPIRE body driven every boot by "
+        "elevate_broker_serve_one; the boot witness's own rollup "
+        "`boot elevate broker ok` is the assertable signal for the "
+        "whole cascade — no golden line pins this exact literal.",
+
+    # src/kernel/core/ipc/elevate_broker.pdx tag_elvb_allow_ok
+    # / tag_elvb_deny_ok — R90-XREPO.011.M1-003 (paideia-os #2122).
+    # Both emitted from within elevate_broker_serve_one once policy
+    # evaluation lands (ALLOW under the seeded `/system/  INIT  ALLOW`
+    # rule when the boot witness runs Scenario A with requester_pid=1;
+    # DENY under the seeded `/system/  *  DENY` rule when Scenario B
+    # runs with requester_pid=99). Same "witness fires every boot but
+    # no golden asserts this exact line" posture as the sibling
+    # `tui canvas mint ok` / `tls trust mint ok` / `elevate expire set
+    # ok` entries above — the witness's own `boot elevate broker ok`
+    # rollup is the assertable signal for the whole cascade.
+    "elevate broker allow ok [legacy: ELEVATE BROKER ALLOW OK]":
+        "R90-XREPO.011.M1-003 (#2122): elevate_broker_serve_one emits "
+        "this on ALLOW every boot via witness_elevate_broker_dispatch "
+        "Scenario A. The witness's `boot elevate broker ok` rollup "
+        "covers the cascade; no golden pins this exact literal.",
+    "elevate broker deny ok [legacy: ELEVATE BROKER DENY OK]":
+        "R90-XREPO.011.M1-003 (#2122): elevate_broker_serve_one emits "
+        "this on DENY every boot via witness_elevate_broker_dispatch "
+        "Scenario B. The witness's `boot elevate broker ok` rollup "
+        "covers the cascade; no golden pins this exact literal.",
+
+    # src/kernel/boot/witness/elevate_broker_dispatch.pdx tag_boot_elvb_ok
+    # — R90-XREPO.011.M1-003 (paideia-os #2122). Emitted from
+    # witness_elevate_broker_dispatch's all-green rollup at boot
+    # (Scenarios A and B both green + cleanup free). No golden yet;
+    # same posture the sibling boot-rollup markers above take (their
+    # own witness passing is the assertable signal today).
+    "boot elevate broker ok [legacy: BOOT ELEVATE BROKER OK]":
+        "R90-XREPO.011.M1-003 (#2122): rollup emitted every boot from "
+        "witness_elevate_broker_dispatch on Scenarios A + B both "
+        "green. No golden pins this exact literal yet.",
 }
 
 # Below these counts the extractor has stopped matching rather than the
