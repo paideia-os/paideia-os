@@ -78,6 +78,19 @@ preserved by the kernel.
 | 93 | `recv` | `fd`, `buf`, `len` | bytes received or `-errno` |
 | 94 | `shutdown` | `fd`, `how` | 0 or `-errno` |
 | 95 | `kill` | `pid`, `signum` | 0 or `-errno`; only SIGSTOP/SIGCONT delivered at R73 |
+| 96 | `sendto` | `fd`, `buf`, `len`, `dst_ip`, `dst_port` | bytes sent or `-errno`; UDP's first send path (R93.M2). Also usable by TCP — `dst_ip`/`dst_port` ignored on a connected socket. |
+| 97 | `recvfrom` | `fd`, `buf`, `len`, `src_ip_out`, `src_port_out` | bytes received or `-errno`; UDP's first recv path (R93.M2). |
+| 98 | `getsockopt` | `fd`, `level`, `optname`, `optval_ptr`, `optlen_ptr` | 0 or `-errno`; `SO_ERROR`/`SO_TYPE` at R95.M1. |
+| 99 | `setsockopt` | `fd`, `level`, `optname`, `optval_ptr`, `optlen` | 0 or `-errno`; `SO_REUSEADDR`/`O_NONBLOCK`-equivalent/`TCP_NODELAY` at R95.M1. |
+| 100 | `getpeername` | `fd`, `sockaddr_out` | 0 or `-errno`; R95.M2. |
+| 101 | `getsockname` | `fd`, `sockaddr_out` | 0 or `-errno`; R95.M2. |
+| 102 | `poll` | `fds_ptr`, `nfds`, `timeout_ms` | nready or `-errno`; fixed-size `fds` array, no dynamic `nfds` allocation. R95.M3. |
+
+Syscalls 96–102 are **reserved by `design/networking/r91-plan.md` §17,
+not yet implemented** as of this table's refresh (R90-XREPO.009 covers
+only through 95). They will be materialized in `dispatch.pdx` as each
+round in the R91–R99 networking wave lands the corresponding handler;
+until then they fall through to `-ENOSYS` like any other unlisted number.
 
 Numbering intentionally tracks Linux for the common core (0–3, 32, 39,
 56, 59, 60, 61) to keep future userland ports mechanical. `12` is
@@ -124,5 +137,8 @@ Any syscall number not listed in the table above returns `-ENOSYS`
 - #1927 — R72.M1-005 TCP socket API block (87–94).
 - #1938 — R73.M1-001 sys_kill (95).
 - #2003 (R90-XREPO.009) — this table refresh.
+- `design/networking/r91-plan.md` §17 — reservation of 96–102 for the
+  R91–R99 networking wave (sendto/recvfrom/getsockopt/setsockopt/
+  getpeername/getsockname/poll).
 - `design/user/elf-lite-format.md` — user binary format that consumes
   this ABI.

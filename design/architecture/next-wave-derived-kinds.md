@@ -2342,6 +2342,33 @@ bound from `0x18F` to `0x196` (the pre-R48b bound had silently missed
 it, but a future one would be refused as an invalid kind). See
 `core/audit/audit_schema.pdx` §aud_kind_valid.
 
+### R72/R89/R91-R97 backfill + reservation — networking kinds
+
+**This table is a documentation-drift repair, not a new-round landing
+for every row.** `design/networking/r91-plan.md`'s research (2026-09-01)
+found this registry had not been updated since the R48b block above
+(`0x197`+): `KIND_TUI_CANVAS = 0x1A6` (R89, landed, closed) and
+`KIND_TCP_LISTENER = 0x1A4` / `KIND_TCP_SOCKET = 0x1A5` (R72, landed,
+closed — both root-minted over `KIND_IPC_ENDPOINT`, `KIND_TCP_LISTENER`
+being an in-place retag of a `KIND_TCP_SOCKET` slot after `listen()`,
+per `design/kernel/tcp-substrate.md`) are real, shipped ordinals with
+**no row in this file at all**. `0x197`..`0x1A3` are unaudited by this
+pass — a future pass should confirm what (if anything) landed in that
+range before treating `0x1A4` as contiguous with `0x196`. The four rows
+below `0x1A6` are new reservations from the R91–R99 networking wave;
+`0x1A9` and `0x1AA` are reserved-but-unimplemented (see
+`design/networking/r91-plan.md` §11, §12).
+
+| Value  | Name                     | Base                              | Purpose (short)                                                                                     | Discipline                    | Failure band        | File                            |
+|-------:|--------------------------|-----------------------------------|-------------------------------------------------------------------------------------------------------|:------------------------------|:--------------------|---------------------------------|
+| 0x1A4  | `KIND_TCP_LISTENER`      | `KIND_IPC_ENDPOINT = 5`           | *(backfill — R72, #1923-1932)* A `KIND_TCP_SOCKET` slot retagged in place after `listen()`; same `tcb_idx` target_ptr, not a second mint. Root-minted (no parent-cap argument). | derived                       | *(not audited — see `net/tcp_socket.pdx`)* | `net/tcp_socket.pdx`            |
+| 0x1A5  | `KIND_TCP_SOCKET`        | `KIND_IPC_ENDPOINT = 5`           | *(backfill — R72, #1923-1932)* An active or not-yet-connected TCP socket; `bind`/`connect`/`send`/`recv`/`shutdown` (SC+ 87-94) all require this kind. Root-minted. | derived                       | *(not audited)*     | `net/tcp_socket.pdx`            |
+| 0x1A6  | `KIND_TUI_CANVAS`        | *(not audited by this pass)*      | *(backfill — R89, #1988-1989, landed/closed; see `design/round-retrospectives/r89-closure.md`)*. Row/discipline detail out of scope for this networking-focused backfill. | *(not audited)*                | *(not audited)*     | `core/cap/kind_tui_canvas.pdx`  |
+| 0x1A7  | `KIND_NIC`               | `KIND_DEVICE = 10`                | R91.M1-001 (new): device-level NIC authority — active backend selector (e1000e / virtio-net / rtl8139), MAC, link state. Root-minted at the single boot-time probe. | derived                       | *(assign at filing)* | `kind_nic.pdx`                  |
+| 0x1A8  | `KIND_UDP_SOCKET`        | `KIND_IPC_ENDPOINT = 5`           | R93.M2-001 (new): modern re-registration of UDP-socket authority, superseding the pre-R30-numbering-scheme `KIND_UDP_SOCKET = 0x50` (`core/cap/udp_socket_cap.pdx`, R27.M6). The `0x50` value is retired, not reused — a stale reference to it must fail a build-time check, not silently alias this new meaning. Root-minted, mirrors `KIND_TCP_SOCKET`'s posture. | derived                       | *(assign at filing)* | `net/udp_socket.pdx`            |
+| 0x1A9  | `KIND_PACKET_FILTER`     | `KIND_IPC_ENDPOINT = 5`           | R96.M3-001 (new): **reserved, unimplemented.** Future packet-filter-chain installation authority. Chain semantics (numeric priority 0-999, `Drop` short-circuits, `Accept` continues, tie-break by registration order) are already specified at `design/network/filter-chain.md` — do not re-decide them when this ordinal is implemented. | reserved                       | —                    | —                                |
+| 0x1AA  | `KIND_TLS_CONN`          | `KIND_TCP_SOCKET = 0x1A5`         | R97.M2-001 (new): **reserved, unimplemented.** Future in-kernel PQ-hybrid TLS connection, pending paideia-as gaining the classical bridge primitives (HKDF-SHA256, SHA-256, ECDSA/RSA certificate verification, X25519) a real-Internet TLS 1.3 handshake needs — see `design/networking/r91-plan.md` §11/§13. Until then, TLS lives entirely in user-space per that document's ratification of `design/network/stack.md` NET-D6. | reserved                       | —                    | —                                |
+
 ### Summary counts and free bands
 
 - **Derived-kind values landed:** 58 (0x140..0x142, 0x150..0x186, 0x188..0x18A, 0x18B..0x18F, 0x190..0x191, 0x195..0x196; 0x143..0x14F, 0x187, 0x192..0x194 reserved).
@@ -2350,7 +2377,7 @@ it, but a future one would be refused as an invalid kind). See
 - **SEALED kinds (2):** `KIND_WIFI_KEY`, `KIND_BT_PAIRING`.
 - **Linearizable-on-object (1):** `KIND_FW_SESSION` (the arbitration is on the object, not the session cap).
 - **QUERY-only kinds (4):** `KIND_CSI_CAMERA`, `KIND_IPU6_STREAM`, `KIND_WWAN_MODEM`, `KIND_MBIM_SESSION` (R40 pattern — identity fields frozen at mint; the only mutator is the revoke helper).
-- **Next free derived-kind tag:** `0x197` (after the R48b reserved band 0x190..0x196 with 0x192..0x194 held).
+- **Next free derived-kind tag:** `0x1AB` (after the R91-R99 networking backfill/reservation block `0x1A4..0x1AA` above). **`0x197`..`0x1A3` are unaudited** by any pass of this file — treat that range as "unknown, not confirmed free" until a dedicated audit walks `core/cap/kind.pdx` end to end; the R72/R89 backfill above only proves this file had silently fallen behind, not that `0x197..0x1A3` is empty.
 - **Adjacent-below free failure band:** `0xFFFFF170..7F` (16-wide; reserved for the R41 opener). `0xFFFFF180..8F` was allocated at R40.M5-001 (#1363) for `core/audit/audit_schema.pdx`.
 
 ### Migration table — audit-emit sites still on `drv_audit_emit`
