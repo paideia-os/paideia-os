@@ -19,7 +19,7 @@ Sort: Priority DESC, then Completion ASC (highest-priority under-built rises fir
 | **libpdx-cap** | 4 | 5 | 1 | Capability marshalling — ENH-008 (additive caller-owned re-entrant variants) shipped 2026-09-01 sat `f472530` | Every satellite tool that mints/consumes caps. #20 remains open (externally blocked on shell.ENH-032) |
 | **libpdx-elevate** | 4 | 5 | 0 | Client-side elevate protocol helper — ALLOW/DENY/TIMEOUT reconciliation shipped 2026-09-01 sat `3e54a8e`; full kernel-side broker landed at `2225b18` | Every privileged tool (rm system paths, mkfs, pdxping, pdxcurl) |
 | **libpdx-semantic-pipe** | 5 | 5 | 6 | Schema-typed pipe endpoints over KIND_IPC_ENDPOINT | postui + shell + every schema-emitting tool |
-| **paideia-as** | 5 | 5 | 1 | Assembler compiler (Rust, self-hosted target) | Every .pdx compilation everywhere |
+| **paideia-as** | 5 | 5 | 2 | Assembler compiler + crypto intrinsics. Sweep 2026-09-01: lexer `\xFF` fix (`v0.24.1`), SHA-256 (`v0.25.0`), HMAC/HKDF (`v0.26.0`), X25519 (`v0.27.0`). #1341 Ed25519 stalled (sc_muladd bit-off); #1336 umbrella open pending. | Every .pdx compilation everywhere + TLS 1.3 in R100 wave |
 | **postui** | 1 | 4 | 40 | Ratatui-inspired TUI library, cap-based, semantically-queryable | postui-dmesg/hex/top + shell/edit/doc TUI layer |
 | **libpdx-volume** | 3 | 4 | 0 | KIND_VOLUME helpers + PDXB codec + mount_table | mkfs.pdxfs, mount.pdxfs, umount.pdxfs, persistent-home |
 | **libpdx-url** | 1 | 3 | 11 | RFC 3986 URL parser (http/https, no credentials) | pdxcurl, pkg mirror URLs, remote, fetch |
@@ -33,6 +33,7 @@ Sort: Priority DESC, then Completion ASC (highest-priority under-built rises fir
 - **libpdx-elevate** — cascade fully closed 2026-09-01. Kernel: #2117-#2120 leaves at `ede6179`, #2121 policy stamp, #2122 broker dispatch at `2225b18`. Satellite: #18 at `3e54a8e`. Completion 3→4. 0 open issues.
 - **ls** — 10 new ENH issues filed (ls#32..41). Sweep 2026-09-01: 1/10 fully closed (ENH-019 `-F` flag), 9/10 partial-landed with commits (scaffolding + walker arms), blocked on cross-repo deps: #29 (path resolve), #24/#25/#30 (Long/Color/schema-registry wiring), plus new kernel-side gaps flagged in bodies (`sys_ttywinsize`, `sys_pdxfs_openat`, `sys_pdxfs_readlink`, `sys_pdxfs_stat_by_inode`).
 - **libpdx-net** — recommended next; not yet started.
+- **paideia-as** — sweep 2026-09-01. Closed: #1337 (`d194327` v0.24.1), #1338 SHA-256 (`bec881e` v0.25.0), #1339 HMAC/HKDF (`f8c739f` v0.26.0), #1340 X25519 (`a825f84` v0.27.0). Stalled: #1341 Ed25519 — sc_muladd bit-off in sign; umbrella #1336 stays open awaiting fix. Cargo test at HEAD: 63 lib + 11 int pass (0 fail, 1 ignored 1M-iter X25519). Paideia-os submodule pointer NOT bumped (main decision — 3 minor + 1 patch version jump is substantial).
 
 ## libpdx-schema-registry sweep
 
