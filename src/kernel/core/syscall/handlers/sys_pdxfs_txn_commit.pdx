@@ -1,0 +1,172 @@
+// src/kernel/core/syscall/handlers/sys_pdxfs_txn_commit.pdx
+// R90-XREPO.010.M1-003 (paideia-os #2111): sys_pdxfs_txn_commit body.
+//
+// The ring-3-facing COMMIT half of the KIND_PDXFS_TXN lifecycle. Complements
+// sys_pdxfs_txn_open (sysno 70, R42-PREP-007 #1629) and its ABORT sibling
+// sys_pdxfs_txn_abort (sysno 105, this milestone). Reuses the existing
+// pdxfs_txn_commit_wal (#1712) + pdxfs_txn_row_transition (#1629) machinery
+// that cap_handler_pdxfs_txn's pxt_hn_commit arm already drives via
+// cap_invoke -- this syscall gives userspace a direct commit path that does
+// not require staging a cap_invoke op_arg, and (unlike cap_invoke's polymorphic
+// return) surfaces a POSIX-shape "0 | -errno" result.
+//
+// Contract (SysV, 1 arg):
+//   rdi = cap_slot   -- KIND_PDXFS_TXN cap slot returned by sys_pdxfs_txn_open
+//   -> rax = 0 on success, or a negative-errno / sentinel u64 on failure:
+//        -EBADF (0xFFFFFFFFFFFFFFF7 = -9)  -- cap_slot does not name a live
+//                                             KIND_PDXFS_TXN (bounds, kind,
+//                                             or freed-row failure -- all
+//                                             three flow through
+//                                             pdxfs_txn_row_of_slot's
+//                                             PXT_ROW_NONE = 0xFF)
+//        PXT_BAD_TRANSITION (0xFFFFEC15)  -- row already COMMITTED / ABORTED
+//                                             (duplicate commit refused; the
+//                                             row transition gate fires)
+//        <any journal error>              -- pdxfs_txn_commit_wal forwards
+//                                             its underlying journal_append /
+//                                             sb_read / jnl_bdev_flush failure
+//                                             sentinel verbatim (see that
+//                                             function's header for the full
+//                                             error taxonomy)
+//
+// Sequencing mirrors cap_handler_pdxfs_txn's pxt_hn_commit arm one-for-one:
+//   (1) Resolve cap_slot -> row_id via pdxfs_txn_row_of_slot. Any failure
+//       (bounds / kind mismatch / freed row) collapses to PXT_ROW_NONE
+//       (0xFF), which we translate to -EBADF for POSIX-shape callers.
+//   (2) Call pdxfs_txn_commit_wal(row_id). Writes JOP_COMMIT + BD_OP_FLUSH
+//       against the mounted root PdxFS-block volume, if any. Returns 0 on
+//       success or forwards its own error sentinel; the "no root mounted"
+//       arm short-circuits to 0 (the row transition below is what pins
+//       the visible effect in that case, matching pxt_hn_commit's own
+//       precedent). A non-zero return propagates verbatim so a caller sees
+//       the same taxonomy the cap_invoke path exposes.
+//   (3) Call pdxfs_txn_row_transition(row_id, PXT_STATE_COMMITTED=2). Gates
+//       on the current state being OPEN; refuses a duplicate commit / an
+//       abort-after-commit with PXT_BAD_TRANSITION. The WAL record was
+//       already durably written by (2), so this gate refusal is the SAME
+//       "OPEN-only" gate the cap_invoke path enforces at exactly this
+//       seam.
+//   (4) Bump PXT_ST_COMMITS via pdxfs_txn_note(4) iff the transition
+//       succeeded. Matches pxt_hn_commit's "bump only on success"
+//       convention so an operator counting mutations does not see a
+//       bump when the handler refused a duplicate.
+//   (5) Emit `sys pdxfs txn commit ok [legacy: SYS PDXFS TXN COMMIT OK]
+//       -- txn=<row>` via klog_s1_d1(SUBSYS_FS_, tag_sys_pdxfs_txn_commit_
+//       ok, k_txn, row_id) on the success arm only (matches every other
+//       sys_* handler's "OK path only" discipline).
+//   (6) Return 0.
+//
+// SCOPE NOTE (row release): this landing does NOT free the txn row back
+// to the _pdxfs_txn_table free pool or clear the cap_table slot. The row's
+// state moves from OPEN to COMMITTED (visible via pdxfs_txn_row_state) but
+// tail_valid still reports the row is in use, so a caller CAN still query
+// its post-commit metadata (state / mode / txn_id / snap_gen / wal_off /
+// bytes) via the existing cap_invoke query ops. Explicit row release +
+// cap slot clear are deferred to a future sys_pdxfs_txn_close syscall (see
+// dispatch.pdx sysno 70's own comment about a "sys_pdxfs_txn_close for
+// revoke" placeholder). This exactly matches cap_handler_pdxfs_txn's
+// pxt_hn_commit posture -- neither this syscall nor the cap_invoke path
+// releases the row today, and a caller who commits then queries the
+// state field sees the visible OPEN -> COMMITTED transition through
+// either surface.
+//
+// Register plan (1-arg SysV entry; five nested calls: pdxfs_txn_row_of_
+// slot / pdxfs_txn_commit_wal / pdxfs_txn_row_transition / pdxfs_txn_note
+// / klog_s1_d1):
+//   push r12 (row_id; survives every nested call as callee-save)
+//   One (odd) push from entry rsp%16==8 lands rsp%16==0, aligned for
+//   every subsequent nested call (each is a balanced call/ret pair that
+//   preserves alignment). Matches sys_kill's 3-push shape's arithmetic
+//   scaled to a 1-arg body: only row_id needs to survive across the
+//   pdxfs_txn_commit_wal / pdxfs_txn_row_transition / pdxfs_txn_note /
+//   klog_s1_d1 chain (cap_slot is dead once row_of_slot has been called;
+//   the intermediate rdi/rsi loads before each nested call are all
+//   caller-save scratch).
+//
+// [unsafe] -- transitively writes _pdxfs_txn_table via pdxfs_txn_row_
+// transition and pdxfs_txn_note (stats slot); performs journal_append +
+// jnl_bdev_flush through pdxfs_txn_commit_wal on a mounted root volume.
+// Audit: design/filesystem/volume-fs-substrate.md §4.4.
+//
+// Reserved-label discipline: labels prefixed `sptc_`. `loop`, `if` etc.
+// are keywords and never used as labels.
+
+module SysPdxfsTxnCommit = structure {
+
+  // Linux errno -EBADF == -9 encoded as sign-extended u64. Matches every
+  // other sys_* handler's "bad handle" sentinel (sys_close / sys_read /
+  // sys_write / sys_dup2), and lets a caller checking `jl` for any
+  // negative errno branch uniformly.
+  pub let SYS_PDXFS_TXN_COMMIT_EBADF : u64 = 0xFFFFFFFFFFFFFFF7
+
+  // ==========================================================================
+  // sys_pdxfs_txn_commit_body(cap_slot) -> 0 | -EBADF | <sentinel>
+  //
+  // See file header for the full sequence + error taxonomy.
+  // ==========================================================================
+  pub let sys_pdxfs_txn_commit_body : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (cap_slot: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap},
+      justification: "R90-XREPO.010.M1-003 (paideia-os #2111): sys_pdxfs_txn_commit body, SC+ ID 104. Entry: rdi=cap_slot. One-push callee-save prologue (r12 = row_id after pdxfs_txn_row_of_slot resolves the cap descriptor). Entry rsp%16==8 (dispatch shim's `sub rsp,8` pad before `call`); one (odd) push lands rsp%16==0, aligned for every subsequent nested call (pdxfs_txn_commit_wal / pdxfs_txn_row_transition / pdxfs_txn_note / klog_s1_d1). Balanced call/ret pairs preserve rsp%16==0 for the rest of the body. Sequencing mirrors cap_handler_pdxfs_txn's pxt_hn_commit arm one-for-one: (1) pdxfs_txn_row_of_slot(cap_slot) -- returns row_id in [0, 16) on success or PXT_ROW_NONE (0xFF) on any failure (bounds / kind mismatch / freed row); PXT_ROW_NONE >= 16 so a single `jae` catches every failure mode and returns -EBADF (-9 = 0xFFFFFFFFFFFFFFF7) for a POSIX-shape caller. (2) pdxfs_txn_commit_wal(row_id) -- writes JOP_COMMIT + BD_OP_FLUSH against the mounted root PdxFS-block volume, if any (see #1712 header for the single-root-volume resolution + no-mount-is-not-an-error rationale). A non-zero return propagates verbatim WITHOUT attempting the row transition, matching pxt_hn_commit's own convention so a caller can never observe COMMITTED state with no corresponding journal record. (3) pdxfs_txn_row_transition(row_id, PXT_STATE_COMMITTED=2) -- gates on OPEN; any other current state (COMMITTED / ABORTED / EXPIRED) returns PXT_BAD_TRANSITION (0xFFFFEC15) which propagates verbatim. (4) pdxfs_txn_note(PXT_ST_COMMITS=4) -- bumps the stats counter iff the transition succeeded (matches pxt_hn_commit's 'bump only on success' convention). (5) Fingerprint emit via klog_s1_d1(LEVEL_INFO=3, SUBSYS_FS__, tag_sys_pdxfs_txn_commit_ok, k_txn, row_id) on the OK path only. (6) xor rax, rax -- return 0. The row is NOT freed and the cap slot is NOT cleared -- a future sys_pdxfs_txn_close claims that surface; deferring here preserves the caller's ability to query post-commit state via cap_invoke query ops, exactly matching pxt_hn_commit's own posture (no release there either). Effects {mem, sysreg}: mem for _pdxfs_txn_table + _pdxfs_txn_stats writes; sysreg transitively from pdxfs_txn_commit_wal's journal_append (BD_OP_WRITE MMIO through jnl_bdev_flush) + klog_s1_d1's TSC read (matches sys_icmp_echo_body's identical widening rationale). Capability {cap}: pdxfs_txn_row_of_slot walks cap_table via the KIND_PDXFS_TXN kind gate + cap_mint_write posture matches pxt_hn_commit's cap authority (cap_handler_pdxfs_txn is @{cap}). Encoder-conservative: cmp/je/jae/jne/mov/lea/xor/push/pop/call/ret only -- every form already proven at this exact shape in sys_kill_body / sys_icmp_echo_body / the R42-PREP-007 sys_pdxfs_txn_open body. Reserved labels: sptc_.",
+      block: {
+        push r12;
+
+        // ---- Step (1): resolve cap_slot -> row_id ----
+        // rdi already holds cap_slot on entry; pdxfs_txn_row_of_slot
+        // takes (slot) and returns row_id in [0, 16) or PXT_ROW_NONE
+        // (0xFF) on any failure (bounds / not KIND_PDXFS_TXN / row
+        // freed). All three failure modes flow to the SAME sentinel
+        // and the SAME `jae 16` catches them; -EBADF is what a POSIX
+        // caller expects for a bad handle.
+        call pdxfs_txn_row_of_slot;
+        mov r10, 16;                     // PXT_MAX
+        cmp rax, r10;
+        jae sptc_ebadf;
+        mov r12, rax;                    // r12 = row_id (survives nested calls)
+
+        // ---- Step (2): pdxfs_txn_commit_wal(row_id) ----
+        // Writes JOP_COMMIT + BD_OP_FLUSH; forwards its own error
+        // sentinel verbatim. The "no root mount" arm short-circuits to
+        // 0, matching pxt_hn_commit's own precedent.
+        mov rdi, r12;
+        call pdxfs_txn_commit_wal;
+        cmp rax, 0;
+        jne sptc_out;                    // forward the sentinel verbatim
+
+        // ---- Step (3): OPEN -> COMMITTED transition ----
+        // Gates on OPEN; any other state -> PXT_BAD_TRANSITION.
+        mov rdi, r12;
+        mov rsi, 2;                      // PXT_STATE_COMMITTED
+        call pdxfs_txn_row_transition;
+        cmp rax, 0;
+        jne sptc_out;                    // forward PXT_BAD_TRANSITION / PXT_DECODE_BAD
+
+        // ---- Step (4): bump PXT_ST_COMMITS ----
+        // Success-only bump matches pxt_hn_commit's convention.
+        mov rdi, 4;                      // PXT_ST_COMMITS
+        call pdxfs_txn_note;
+
+        // ---- Step (5): emit fingerprint ----
+        // `sys pdxfs txn commit ok [legacy: SYS PDXFS TXN COMMIT OK]
+        //  -- txn=<row_id>`
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_FS__];
+        lea rdx, [rip + tag_sys_pdxfs_txn_commit_ok];
+        lea rcx, [rip + k_txn];
+        mov r8, r12;                     // v1 = row_id
+        call klog_s1_d1;
+
+        // ---- Step (6): return 0 ----
+        xor rax, rax;
+        jmp sptc_out;
+
+      sptc_ebadf:
+        mov rax, 0xFFFFFFFFFFFFFFF7;     // -EBADF (-9)
+
+      sptc_out:
+        pop r12;
+        ret
+      }
+    }
+}

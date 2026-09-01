@@ -86,6 +86,8 @@ preserved by the kernel.
 | 101 | `getsockname` | `fd`, `sockaddr_out` | 0 or `-errno`; R95.M2. |
 | 102 | `poll` | `fds_ptr`, `nfds`, `timeout_ms` | nready or `-errno`; fixed-size `fds` array, no dynamic `nfds` allocation. R95.M3. |
 | 103 | `icmp_echo` | `dst_addr_ptr`, `seq`, `payload_ptr`, `payload_len`, `timeout_ms` | rtt_ns (>=0) or `-errno`; requires R_NET_PRIVILEGED_PROTOCOL (kernel-side check via `cap_check_r_net_privileged_protocol`). Loopback (dst 127.x.x.x or `_ipv4_my_ip`) is synchronous through the ICMP send path; off-box wire dispatch deferred pending real ARP + wait-for-reply plumbing. R100-PREP-003 (paideia-os #2009). |
+| 104 | `pdxfs_txn_commit` | `cap_slot` | 0 or `-errno` / sentinel; commits the KIND_PDXFS_TXN behind `cap_slot` (writes JOP_COMMIT + BD_OP_FLUSH via `pdxfs_txn_commit_wal`, transitions OPEN → COMMITTED via `pdxfs_txn_row_transition`, bumps `PXT_ST_COMMITS`). `-EBADF` on a bad cap slot; underlying journal / transition sentinels forwarded verbatim. Row release + cap-slot clear are DEFERRED to a future `sys_pdxfs_txn_close`. R90-XREPO.010.M1-003 (paideia-os #2111). |
+| 105 | `pdxfs_txn_abort` | `cap_slot` | 0 or `-errno` / sentinel; aborts the KIND_PDXFS_TXN behind `cap_slot` (writes JOP_ABORT via `pdxfs_txn_abort_wal`, transitions OPEN → ABORTED, bumps `PXT_ST_ABORTS`). Per-record undo-body replay DEFERRED to paideia-os #2112 (blocked on this milestone). R90-XREPO.010.M1-003 (paideia-os #2111). |
 | **517** | **`cwd_resolve`** (RESERVED) | `path_ptr`, `path_len_hint`, `abs_out_ptr`, `abs_out_cap` | strlen (excl. NUL) or `-errno`; realpath primitive for the mv/rm/cp satellite consumers. Resolves the caller's path (absolute OR relative — relative anchors at `[_current_tcb + TASK_OFF_CWD]` per `design/user/cwd-semantics.md`) and writes the resulting absolute path back into the caller buffer. Body/dispatch/fingerprint deferred; the CWD resolution policy is frozen (Option A) by paideia-os #2115 (R90-XREPO.010.M1-007). |
 | **527** | **`pdxfs_fault_inject`** (RESERVED) | `class`, `arm`, `arg0`, `arg1` | 0 or `-errno`; arms/disarms a WAL/inode/extent/undo fault class. Body/dispatch land in R90-XREPO.010.M1-005; the sysno is pre-reserved by the mv/rm design docs. |
 
@@ -116,6 +118,17 @@ one-to-one map the R91–R99 wave assumes. Choosing the first slot ABOVE
 the reserved band preserves that map and is the same "IDs are
 negotiable" latitude R53.M2-001 exercised when `mount`/`umount` moved
 from 73/74 → 75/76 after 74 was pre-claimed by #1675.
+
+Sysnos 104 (`sys_pdxfs_txn_commit`) and 105 (`sys_pdxfs_txn_abort`)
+occupy the two slots immediately above `sys_icmp_echo` for the same
+reason: displacing 96–102 would break the R91–R99 one-to-one map, and
+placing them adjacent to `sys_pdxfs_txn_open` (sysno 70) would clash
+with the existing sibling reservations (71 = `sys_pdxfs_open`, 72 =
+`sys_pdxfs_dir_readnext`, 73 reserved for a future `sys_pdxfs_file_
+close`). The two are grouped by lifecycle (`open` → `commit` / `abort`)
+in this design table's discussion rather than by numeric adjacency in
+the dispatch switch; kernel dispatch grouping stays contiguous with the
+last allocated sysno.
 
 Numbering intentionally tracks Linux for the common core (0–3, 32, 39,
 56, 59, 60, 61) to keep future userland ports mechanical. `12` is

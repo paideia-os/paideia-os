@@ -348,6 +348,37 @@ ALLOWLIST = {
         "which the R100-PREP-001 witness triggers via the same cascade "
         "without a golden line either.",
 
+    # R90-XREPO.010.M1-003 (paideia-os #2111) sys_pdxfs_txn_commit /
+    # sys_pdxfs_txn_abort + boot-witness fingerprints. All three emit on
+    # every boot: sys_pdxfs_txn_{commit,abort}_body emit their per-call
+    # fingerprint via klog_s1_d1 on the OK path only, and the boot
+    # witness at src/kernel/boot/witness/r90_xrepo_010_003_pdxfs_txn_
+    # lifecycle.pdx emits `boot pdxfs txn lifecycle ok -- ... count=2`
+    # via klog_s1_d1 on its own OK path after both scenarios pass. Same
+    # "declared but no golden line asserts it yet" posture the R73
+    # `sys kill ok` / R100-PREP-003 `sys icmp echo ok` entries carry
+    # above -- the 14-mode default matrix has no golden that pins a
+    # networked or pdxfs-txn syscall line, and the coverage gate
+    # correctly refuses to pass an unwitnessed OK-token marker without
+    # an explicit reason. Assertable via a future golden that pins the
+    # boot cascade tail beyond the R90-XREPO wave.
+    "sys pdxfs txn commit ok [legacy: SYS PDXFS TXN COMMIT OK]":
+        "R90-XREPO.010.M1-003 (paideia-os #2111): sys_pdxfs_txn_commit_"
+        "body emits this on every OK call. The boot witness at "
+        "r90_xrepo_010_003_pdxfs_txn_lifecycle.pdx is the sole caller "
+        "today (no userspace pdxfs-txn tool is wired); no existing "
+        "golden asserts pdxfs-txn syscall lines. Assertable via a "
+        "future golden that grows into the R90-XREPO witness tail.",
+    "sys pdxfs txn abort ok [legacy: SYS PDXFS TXN ABORT OK]":
+        "R90-XREPO.010.M1-003 (paideia-os #2111): sys_pdxfs_txn_abort_"
+        "body emits this on every OK call. Same caller / golden "
+        "posture as the commit sibling above.",
+    "boot pdxfs txn lifecycle ok [legacy: BOOT PDXFS TXN LIFECYCLE OK]":
+        "R90-XREPO.010.M1-003 (paideia-os #2111): witness_r90_xrepo_010_"
+        "003_pdxfs_txn_lifecycle emits this on every OK boot after both "
+        "commit and abort scenarios pass. No existing golden asserts "
+        "it -- same posture as the `boot icmp echo ok` entry above.",
+
     # src/kernel/core/sched/wait.pdx -- R90-XREPO.011.M1-001 (paideia-os
     # #2117) kernel-side sched_wait / sched_wake_kind primitive. Both
     # markers emit from inside the primitive itself, not from a boot
@@ -389,6 +420,28 @@ ALLOWLIST = {
         "r89_tui_canvas.pdx's witness_r89_tui_canvas, but no golden "
         "file asserts this exact line — the witness's own lowercase "
         "'boot tui canvas ok --' fingerprint covers this code path.",
+
+    # src/kernel/core/cap/kind_pdxfs_file.pdx — R90-XREPO.010.M1-001
+    # (paideia-os #2109) PFF_OP_READ_BYTES success fingerprint,
+    # emitted once per successful cap_handler_pdxfs_file READ_BYTES
+    # invocation from inside the handler body's klog_s1_d2 emit
+    # site. Reachable at every boot via r90_xrepo_010_pdxfs_read_
+    # bytes.pdx's witness_r90_xrepo_010_pdxfs_read_bytes (seeds a
+    # tmpfs file, mints a KIND_PDXFS_FILE cap, invokes READ_BYTES,
+    # asserts the returned bytes match the seed pattern byte-for-
+    # byte). Same "no golden file asserts this exact line" posture
+    # as the KIND_TUI_CANVAS mint-marker entry immediately above:
+    # the witness's own lowercase "boot pdxfs read bytes ok --"
+    # fingerprint is the assertable signal for this code path. Add
+    # a golden line for the literal "pdxfs file read bytes ok" text
+    # if a future mode wants to pin it directly.
+    "pdxfs file read bytes ok [legacy: PDXFS FILE READ BYTES OK]":
+        "R90-XREPO.010.M1-001 (paideia-os #2109): reachable at every "
+        "boot via r90_xrepo_010_pdxfs_read_bytes.pdx's "
+        "witness_r90_xrepo_010_pdxfs_read_bytes, but no golden file "
+        "asserts this exact line — the witness's own lowercase "
+        "'boot pdxfs read bytes ok --' fingerprint covers this code "
+        "path.",
 
     # src/kernel/core/cap/kind_tls_trust.pdx — R100-PREP-001 (#2007)
     # mint-body fingerprint, emitted once per KIND_TLS_TRUST mint from
