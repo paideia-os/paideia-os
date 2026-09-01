@@ -10,7 +10,9 @@ conventions.
 
 Numbers reserved but unlisted are `ENOSYS` until a follow-up round
 extends this table. R90-XREPO.009 (paideia-os #2003) refreshed this
-document to match live dispatch through sysno 95.
+document to match live dispatch through sysno 95; R90-XREPO.010.M1-008
+(paideia-os #2116) extended the refresh through sysno 107 plus the
+out-of-band sysnos 517 (`cwd_resolve`) and 527 (`pdxfs_fault_inject`).
 
 ## Calling Convention
 
@@ -89,6 +91,7 @@ preserved by the kernel.
 | 104 | `pdxfs_txn_commit` | `cap_slot` | 0 or `-errno` / sentinel; commits the KIND_PDXFS_TXN behind `cap_slot` (writes JOP_COMMIT + BD_OP_FLUSH via `pdxfs_txn_commit_wal`, transitions OPEN → COMMITTED via `pdxfs_txn_row_transition`, bumps `PXT_ST_COMMITS`). `-EBADF` on a bad cap slot; underlying journal / transition sentinels forwarded verbatim. Row release + cap-slot clear are DEFERRED to a future `sys_pdxfs_txn_close`. R90-XREPO.010.M1-003 (paideia-os #2111). |
 | 105 | `pdxfs_txn_abort` | `cap_slot` | 0 or `-errno` / sentinel; aborts the KIND_PDXFS_TXN behind `cap_slot` (writes JOP_ABORT via `pdxfs_txn_abort_wal`, transitions OPEN → ABORTED, bumps `PXT_ST_ABORTS`). Per-record undo-body replay DEFERRED to paideia-os #2112 (blocked on this milestone). R90-XREPO.010.M1-003 (paideia-os #2111). |
 | 106 | `pdxfs_stat_by_inode` | `inode_no`, `out_stat_ptr` | 0 or `-errno`; populates a 32-byte record at `out_stat_ptr` with `{mode_bits, size_bytes, mtime_ns, ctime_ns}` for the tmpfs inode `inode_no`. `mode_bits` = `S_IFREG\|0o644` (`0x81A4`) for `VNODE_TYPE_REG`, `S_IFDIR\|0o755` (`0x41ED`) for `VNODE_TYPE_DIR`. `mtime_ns` = `_tick_count * 10_000_000` (matches UEJ convention). `ctime_ns` reserved zero. `-EFAULT` on bad `out_stat_ptr`; `-ENOENT` on OOR `inode_no` or unallocated slot. Blocks 3 of 6 columns in `ls -l` (mode/size/mtime). R90-XREPO.010.M1-002 (paideia-os #2110). |
+| 107 | `pdxfs_undo_write` | `cap_slot`, `inode_no`, `offset`, `len`, `kbuf_ptr` | 0 or `-errno`; stages a pre-image snapshot (`[offset, offset+len)` of `inode_no`) into the KIND_PDXFS_TXN row named by `cap_slot`. Must be called BEFORE the corresponding mutation; on `sys_pdxfs_txn_abort` (sysno 105) the substrate replays every staged record in reverse order to restore each pre-image. Length bound `0 < len <= 4064`; per-row cap 32 records / 4 KiB. `-EBADF` on a bad cap slot; `-EINVAL` if the row is not OPEN or the substrate refuses (len bounds); `-ENOSPC` on per-row buffer or record-cap exhaustion. Body takes a KERNEL VA for `kbuf_ptr`: the dispatch shim performs the KPTI bounce for user callers (a bounded per-call kernel scratch), boot witnesses pass a `.rodata` pointer directly. Undo records live in kernel `.bss` at this landing — crash between undo_write and abort loses staged pre-images; folding into the PdxFS journal is deferred. Closes the I5 invariant for cp/mv/rm at the syscall layer. R90-XREPO.010.M1-004 (paideia-os #2112). |
 | **517** | **`cwd_resolve`** | `path_ptr`, `abs_out_ptr`, `abs_out_cap` | strlen (excl. NUL) or `-errno`; realpath primitive for the mv/rm/cp satellite consumers. Resolves the caller's path (absolute OR relative — relative anchors at `[_current_tcb + TASK_OFF_CWD]` per `design/user/cwd-semantics.md`) via `mount_root_vnode` + `path_resolve` + a parent-chain walk composing the canonical absolute form (leading `/`, `_vnode_name_table` components joined by `/`), writing the NUL-terminated result to `abs_out_ptr` (up to `abs_out_cap` bytes). Returns strlen (excluding NUL). Body takes KERNEL VAs (dispatch shim does the KPTI bounce for user callers, matching `sys_pdxfs_undo_write`'s split). `-ENOENT` if the path does not resolve or no root mounted; `-ERANGE` if the composed path + NUL exceeds `abs_out_cap` or the parent-chain walk exceeds `SYS_CWD_RESOLVE_MAX_DEPTH=32`; `-EFAULT` (dispatch-shim only) if either user pointer is refused. The `path_len_hint` field the earlier design skeleton proposed was dropped — the walker sizes the path via NUL. R90-XREPO.010.M1-007 (paideia-os #2115). |
 | **527** | **`pdxfs_fault_inject`** | `class` | 0 or `-errno`; arms/disarms a PdxFS fault-injection class. `class` = 0 disarms; 1..4 arm one of `WAL_WRITE_FAIL` / `INODE_ALLOC_FAIL` / `EXTENT_ALLOC_FAIL` / `UNDO_APPEND_FAIL`. Single-shot: the arm is consumed by the next traversal of the named hook site (`wal_append` / `tmpfs_inode_alloc` / `tmpfs_write` pre-`phys_alloc` / `pdxfs_txn_undo_append`). Refused with `-EPERM` when the boot flag `_pdxfs_fault_enabled` is 0 (release-build gate; see `design/kernel/pdxfs-fault-inject.md` §3), refused with `-EINVAL` when class > 4. Dispatch is an explicit early check ahead of the linear switch bounds gate — the sysno sits far above the 0..107 core range, chosen out-of-band by the mv/rm design docs to preserve the tightly-packed low band. R90-XREPO.010.M1-005 (paideia-os #2113). |
 
@@ -138,6 +141,17 @@ directory-listing wave three of the six columns `ls -l` needs
 (mode/size/mtime); owner/group/nlink land in future evolutions of the
 `sys_pdxfs_stat_by_inode` output record shape.
 
+Sysno 107 (`sys_pdxfs_undo_write`) occupies the first slot above
+`sys_pdxfs_stat_by_inode` (106) under the same rule — contiguous-with-
+last-allocated inside the linear switch chain, the 96–102 R91–R99
+reservation intact. Grouped by role with the txn lifecycle (open/commit/
+abort/undo_write) in `design/kernel/pdxfs-syscalls.md` §3, dispatched
+contiguously with sysno 106 in the switch. The 5-argument body is the
+first PdxFS handler that takes more registers than the 3-arg SysV shim
+family (`sys_open` / `sys_read` / `sys_stat`); the dispatch shim
+handles the KPTI bounce for the user `kbuf_ptr` and shuffles all five
+args into SysV order before the body call.
+
 Numbering intentionally tracks Linux for the common core (0–3, 32, 39,
 56, 59, 60, 61) to keep future userland ports mechanical. `12` is
 repurposed from Linux `brk` for the paideia-os debug channel and is a
@@ -182,7 +196,23 @@ Any syscall number not listed in the table above returns `-ENOSYS`
 - #1955/#1956 — R86.M1 sys_chdir (85) / sys_getcwd (86).
 - #1927 — R72.M1-005 TCP socket API block (87–94).
 - #1938 — R73.M1-001 sys_kill (95).
-- #2003 (R90-XREPO.009) — this table refresh.
+- #2003 (R90-XREPO.009) — first refresh through sysno 95.
+- #2009 (R100-PREP-003) — sys_icmp_echo (sysno 103).
+- #2109..#2116 (R90-XREPO.010) — the R42 PdxFS syscall substrate wave.
+  #2109 landed the KIND_PDXFS_FILE `PFF_OP_READ_BYTES` op (cap-invoke
+  path; no new sysno). #2110 landed sysno 106
+  (`sys_pdxfs_stat_by_inode`). #2111 landed sysnos 104 / 105
+  (`sys_pdxfs_txn_commit` / `sys_pdxfs_txn_abort`). #2112 landed sysno
+  107 (`sys_pdxfs_undo_write`). #2113 landed sysno 527
+  (`sys_pdxfs_fault_inject`). #2114 landed the real multi-entry
+  readdir body on sysno 72 (existing sysno; no new number). #2115
+  landed sysno 517 (`sys_cwd_resolve`) body — the witness stays
+  partial pending a follow-on fix (see #2115 open state). #2116 is
+  this refresh.
+- `design/kernel/pdxfs-syscalls.md` — consolidated PdxFS syscall
+  reference produced by #2116.
+- `design/round-retrospectives/r90-xrepo-010-substrate-live.md` —
+  R90-XREPO.010 round-close retrospective.
 - `design/networking/r91-plan.md` §17 — reservation of 96–102 for the
   R91–R99 networking wave (sendto/recvfrom/getsockopt/setsockopt/
   getpeername/getsockname/poll).
