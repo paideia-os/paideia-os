@@ -1,0 +1,419 @@
+// src/kernel/core/drivers/virtio_net/rx.pdx -- R91.M3-005 (paideia-os #2023)
+//
+// virtio-net RX plane: pre-populate the driver-owned RX virtqueue with
+// buffers at attach time (virtio_net_rx_refill) and, on every IRQ pass,
+// drain the device-owned used ring, hand each completed frame body to
+// l2_rx_handle, and re-arm the descriptor for reuse
+// (virtio_net_rx_poll_and_dispatch).
+//
+// Sibling files in the R91.M3 landing:
+//   * probe.pdx        (R91.M3-001, #2019) -- vendor/device match +
+//                       modern-cap walk into _virtio_net_devices[0].
+//   * common_cfg.pdx   (R91.M3-002, #2020) -- device init handshake
+//                       and vn_cc_* MMIO accessors.
+//   * virtqueue.pdx    (R91.M3-003, #2021) -- ring primitives:
+//                         virtio_net_vq_add_avail (driver publish)
+//                         virtio_net_vq_reap_used (device completion)
+//                       Fixed queue size = VNET_VQ_SIZE = 64.
+//   * tx.pdx           (R91.M3-004, #2022) -- transmit plane.
+//   * isr.pdx          (this milestone, sibling) -- the IRQ entry
+//                       point that calls virtio_net_rx_poll_and_dispatch.
+//
+// =============================================================================
+// SECTION 0  RX BUFFER SIZING (2 KiB per slot, 64 slots = 128 KiB total)
+// =============================================================================
+//
+// virtio 1.1 §5.1.6.3 mandates that the driver-provided RX buffer be
+// large enough to hold the max receive frame plus the 12-byte
+// virtio_net_hdr the device prepends. Under the R91.M3 negotiated
+// feature set (common_cfg.pdx §"VNET_F_ACK_LO_MASK": VIRTIO_NET_F_MAC
+// | VIRTIO_NET_F_STATUS; neither VIRTIO_NET_F_MRG_RXBUF nor any GSO
+// bit is ACKed) each received frame lands whole into a single
+// descriptor. Standard Ethernet MTU 1500 + 14 B ethernet header + 4 B
+// FCS (stripped by device before delivery in virtio's model) yields
+// 1514 B of payload; adding the 12 B virtio_net_hdr gives 1526 B. A
+// 2 KiB (2048 B) buffer per slot leaves slack for a mistuned MTU or a
+// future MRG_RXBUF negotiation and is a power-of-two size that keeps
+// address arithmetic to a single `shl imm11` (2048 = 2^11).
+//
+// Total RX buffer area = VNET_VQ_SIZE * 2048 = 64 * 2048 = 128 KiB.
+// Statically allocated in .bss under `_virtio_net_rx_buffers`, aligned
+// to a 4 KiB page for future R25/R96 IOMMU-domain mapping (same
+// rationale documented in virtqueue.pdx §3 for the ring pages).
+//
+// =============================================================================
+// SECTION 1  REFILL SEQUENCE (virtio 1.1 §2.6.5 + §2.6.6)
+// =============================================================================
+//
+// virtio_net_rx_refill is called once from the driver-attach path (a
+// future wiring beyond this milestone) after virtio_net_init_handshake
+// and virtio_net_vq_init have completed for the RX queue (VQID 0).
+// For each slot i in [0..64):
+//
+//   (1) Build descriptor at &_virtio_net_rx_desc_pg + i*16:
+//         +0  u64  addr  = &_virtio_net_rx_buffers + i*2048
+//         +8  u32  len   = 2048
+//         +12 u16  flags = VNET_VQ_DESC_F_WRITE (2) -- driver-writable
+//                          (device fills this buffer)
+//         +14 u16  next  = 0 (chain terminator; unused at MVP)
+//   (2) Publish desc_idx=i into the avail ring via
+//       virtio_net_vq_add_avail(avail_pa, i, 64).
+//
+// virtio_net_vq_add_avail internally issues the mfence that virtio 1.1
+// §2.6.8.2 requires between the ring[] store and the avail.idx bump,
+// so this file does not need its own barrier around each publish.
+//
+// The device will consume avail entries opportunistically once
+// QUEUE_ENABLE has been written (step 7 of vq_init) and DRIVER_OK has
+// stuck in device_status (step 6 of the handshake). This file does NOT
+// ring the NOTIFY doorbell -- refill happens before DRIVER_OK on the
+// bring-up path today, so notify is unnecessary; when refill runs from
+// a steady-state re-arm on the reap path, the ring notification is
+// carried by the caller (isr.pdx) if/when a doorbell becomes required.
+// (QEMU's virtio-net implementation polls the avail ring without
+// requiring notifies, which is why the MVP does not need a doorbell.)
+//
+// =============================================================================
+// SECTION 2  POLL + DISPATCH SEQUENCE (drain used ring, feed l2_rx)
+// =============================================================================
+//
+// virtio_net_rx_poll_and_dispatch is called from isr.pdx's ISR entry
+// (bit 0 of the ISR status register set = queue interrupt) and, later,
+// from nic_dispatch.pdx's `nd_rx_dispatch_try_virtio` arm as the
+// generic virtio RX drain -- both callers reach the same body.
+//
+// Loop:
+//   (a) reap = virtio_net_vq_reap_used(used_pa, last_seen_idx, 64)
+//   (b) If (reap >> 63) == 0 -> no more completions, exit loop.
+//   (c) desc_idx = (reap >> 48) & 0x7FFF
+//       len      = reap & 0xFFFFFFFF
+//   (d) If len <= 12 -- pathological frame with no ethernet body beyond
+//       the virtio_net_hdr -- drop silently (do NOT call l2_rx_handle,
+//       do NOT emit a diag beyond the drop that the caller's own
+//       fingerprint carries in aggregate; a per-frame diag would spam
+//       the log under a rogue device).
+//   (e) Otherwise: buf_pa = &_virtio_net_rx_buffers + desc_idx*2048;
+//       call l2_rx_handle(buf_pa + 12, len - 12). The +12 skips the
+//       virtio_net_hdr; l2_rx_handle receives the raw Ethernet frame
+//       starting at the destination MAC.
+//   (f) Re-arm the same descriptor: virtio_net_vq_add_avail(avail_pa,
+//       desc_idx, 64). The descriptor's addr/len/flags were set at
+//       refill time and never change -- only the avail-ring publish
+//       is needed to hand the buffer back to the device.
+//   (g) Bump _virtio_net_rx_last_used_idx (the driver-owned reap
+//       cursor; virtio 1.1 §2.6.8 -- the driver advances its own
+//       cursor as it consumes used-ring entries) and repeat.
+//
+// Returns the number of packets dispatched on this invocation. A
+// return of 0 means "no completions were pending" -- the ISR treats
+// this as a spurious RX interrupt (no state change).
+//
+// The 1:1 mapping of desc_idx to _virtio_net_rx_buffers slot is
+// possible because R91.M3 does NOT negotiate VIRTIO_NET_F_MRG_RXBUF:
+// each RX completion consumes exactly one descriptor, and the descriptor
+// index equals the buffer slot. If a future milestone ACKs MRG_RXBUF,
+// the reap loop grows a chain-walk over the used ring's linked
+// descriptors and the 1:1 assumption goes away.
+//
+// =============================================================================
+// SECTION 3  BSS SLOTS OWNED BY THIS FILE
+// =============================================================================
+//
+//   _virtio_net_rx_buffers        : [u64; 16384] @align(4096) = 128 KiB
+//                                    RX packet buffers (64 * 2048).
+//   _virtio_net_rx_last_used_idx  : u64 = 0
+//                                    Driver-owned reap cursor. Read
+//                                    and written only by this file;
+//                                    read via mov_w low 16 bits, write
+//                                    via mov_w so u16 wrap semantics
+//                                    are preserved (upper 48 bits stay 0
+//                                    for the life of the process).
+//
+// =============================================================================
+// SECTION 4  RESERVED-LABEL DISCIPLINE + ENCODER POSTURE
+// =============================================================================
+//
+// Every label prefixed `vn_rx_` (paideia-as reserves `loop`, `if`,
+// `next`, ...). Encoder-conservative posture per virtqueue.pdx §5 and
+// common_cfg.pdx §4:
+//   * u16 reads via `xor rax,rax; mov_w rax, [mem]` (no mov_wzx).
+//   * u16 stores via `mov_w [mem], reg`.
+//   * u32 stores via `mov_d [mem], reg`.
+//   * u64 loads/stores via bare `mov reg, [mem]` / `mov [mem], reg`.
+//   * No `add reg, [mem]` -- every accumulate is `mov scratch,[mem];
+//     add scratch, imm; mov [mem], scratch`.
+//
+// Bit-63 test uses `mov rcx, rax; shr rcx, 63; cmp rcx, 0; je ...` --
+// paideia-as does not currently encode `js` for direct sign checks and
+// `and rax, 0x8000000000000000` would need a 64-bit-immediate stage.
+// The shift-then-compare form is what virtqueue.pdx already uses for
+// its packed-return unpacking sibling site.
+
+module Rx = structure {
+
+  // ============================================================================
+  // Fingerprint tag (ONE-line pdx string literal, coverage-gate friendly)
+  // ============================================================================
+  //
+  // "virtio-net rx refill ok [legacy: VIRTIO NET RX REFILL OK]" is
+  // 57 printable chars + 1 NUL terminator = 58 bytes. OK_TOK gate at
+  // tools/verify-fingerprint-coverage.sh L856 matches on word-boundary
+  // uppercase OK in the legacy shard. Assertable golden lands under
+  // R91.M5 boot_r91_nic_probe smoke once PAIDEIA_NIC=virtio is wired
+  // (issue #2031); until then the literal will need an ALLOWLIST entry
+  // alongside virtio_net_vq_init_ok_msg, virtio_net_probe_ok, and
+  // virtio_net_init_ok_msg -- same rationale (opt-in code path, no
+  // smoke mode pins the exact line yet).
+
+  pub let virtio_net_rx_refill_ok_msg : [u8; 58] = "virtio-net rx refill ok [legacy: VIRTIO NET RX REFILL OK]\0"
+
+  // ============================================================================
+  // BSS slots (§3).
+  //
+  // _virtio_net_rx_buffers: 128 KiB backing store for the 64 RX slots.
+  // [u64; 16384] * 8 B = 131072 B = 128 KiB. @align(4096) mirrors the
+  // ring page alignment discipline for the future R25/R96 IOMMU-domain
+  // map. Index arithmetic: buf[i] = base + i*2048 via `shl 11`.
+  //
+  // _virtio_net_rx_last_used_idx: driver's u16-modulo cursor over the
+  // used ring. Held in a u64 slot (paideia-as .bss primitives are u64;
+  // wrap semantics preserved by mov_w store to low 16 bits, upper 48
+  // stay 0 for the lifetime of the module).
+  // ============================================================================
+
+  pub let mut _virtio_net_rx_buffers       : [u64; 16384] = uninit @align(4096)
+  pub let mut _virtio_net_rx_last_used_idx : u64          = 0
+
+  // ============================================================================
+  // virtio_net_rx_refill() -> u64
+  //
+  // Pre-populate the RX virtqueue's 64 slots with 2 KiB buffers and
+  // publish each into the avail ring. Called once from driver attach.
+  //
+  // Returns:
+  //   0                            on success (VNET_VQ_OK convention);
+  //                                fingerprint carries the count via klog_s1_d1.
+  //   VNET_CC_ERR_NO_BAR (0xFF..ED) if _virtio_net_common_cfg_pa is 0
+  //                                (probe has not populated it or no
+  //                                 virtio-net device is present).
+  //
+  // Register plan (1-push callee-save):
+  //   rbx = loop counter i (also carries the final count into the
+  //         klog_s1_d1 v1 slot; refill always fills all 64 slots on
+  //         a successful entry so the value is a constant 64, but
+  //         emitting it as a run-time count keeps the fingerprint
+  //         honest if the caller ever short-circuits partway).
+  //
+  //   1 push = 8 B; entry rsp%16==8 -> 16, %16==0 (aligned for the
+  //   nested virtio_net_vq_add_avail and klog_s1_d1 calls; both are
+  //   leaves and preserve rbx per SysV so the counter survives every
+  //   call site unchanged).
+  //
+  // Labels prefixed vn_rx_r_.
+  // ============================================================================
+
+  pub let virtio_net_rx_refill : () -> u64 !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R91.M3-005 (paideia-os #2023). Pre-populate the driver-owned RX virtqueue (queue 0) with 64 device-writable 2 KiB buffers and publish each into the avail ring. Called once from driver attach after virtio_net_init_handshake + virtio_net_vq_init have completed. Body: (1) push rbx (entry rsp%16==8 -> 16, %16==0 aligned for nested calls). (2) Gate on _virtio_net_common_cfg_pa (probe has not populated it OR no virtio-net device present -> return VNET_CC_ERR_NO_BAR 0xFFFFFFFFFFFFFFED with no fingerprint since there is nothing to log about). (3) Init rbx=0 (loop counter and eventual count for klog). (4) Loop vn_rx_r_loop: cmp rbx, 64; jae vn_rx_r_done. (5) Compute desc_pa = _virtio_net_rx_desc_pg + rbx*16 in r10: `mov r10, rbx; shl r10, 4; lea r11, [rip + _virtio_net_rx_desc_pg]; add r10, r11`. (6) Compute buf_pa = _virtio_net_rx_buffers + rbx*2048 in r11: `mov r11, rbx; shl r11, 11; lea rax, [rip + _virtio_net_rx_buffers]; add r11, rax`. (7) Fill descriptor: u64 addr @+0 = buf_pa (bare mov [mem], reg64), u32 len @+8 = 2048 (mov rax, 2048; mov_d [r10+8], rax -- sized store else the bare form widens to REX.W and clobbers into flags), u16 flags @+12 = 2 (VNET_VQ_DESC_F_WRITE; mov rax, 2; mov_w [r10+12], rax), u16 next @+14 = 0 (xor rax, rax; mov_w [r10+14], rax). (8) Publish: virtio_net_vq_add_avail(avail_pa=_virtio_net_rx_avail_used_pg, desc_idx=rbx, queue_size=64). add_avail is a leaf (only mem effect, no callee-save disruption); rbx survives per SysV. (9) add rbx, 1; jmp vn_rx_r_loop. (10) vn_rx_r_done: emit fingerprint via klog_s1_d1(LEVEL_INFO=3, SUBSYS_NET_, virtio_net_rx_refill_ok_msg, k_count, rbx). rbx = final count (constant 64 on the successful path). (11) xor rax, rax; pop rbx; ret. Gate arm falls through vn_rx_r_ret which pops rbx and rets (no fingerprint on the NO_BAR arm, same posture as virtio_net_vq_init). Encoder discipline: sized stores via mov_d/mov_w so paideia-as G1 (bare `mov [mem], reg` widens) does not clobber adjacent bytes; ring index arithmetic via shl imm (16 = shl 4, 2048 = shl 11) staying inside single-register arithmetic. Labels prefixed vn_rx_r_.",
+      block: {
+        push rbx;
+
+        // ---------- (2) Gate on _virtio_net_common_cfg_pa ----------
+        mov rax, [rip + _virtio_net_common_cfg_pa];
+        cmp rax, 0;
+        jne vn_rx_r_have_bar;
+        mov rax, 0xFFFFFFFFFFFFFFED;         // VNET_CC_ERR_NO_BAR
+        jmp vn_rx_r_ret;
+
+      vn_rx_r_have_bar:
+        // ---------- (3) Init loop counter ----------
+        xor rbx, rbx;
+
+      vn_rx_r_loop:
+        // ---------- (4) Bounds check: i < VNET_VQ_SIZE=64 ----------
+        cmp rbx, 64;
+        jae vn_rx_r_done;
+
+        // ---------- (5) Compute desc_pa = _virtio_net_rx_desc_pg + i*16 ----------
+        mov r10, rbx;
+        shl r10, 4;                          // i * 16
+        lea r11, [rip + _virtio_net_rx_desc_pg];
+        add r10, r11;                        // r10 = &desc[i]
+
+        // ---------- (6) Compute buf_pa = _virtio_net_rx_buffers + i*2048 ----------
+        mov r11, rbx;
+        shl r11, 11;                         // i * 2048
+        lea rax, [rip + _virtio_net_rx_buffers];
+        add r11, rax;                        // r11 = &buffers[i*2048]
+
+        // ---------- (7) Populate descriptor ----------
+        // u64 addr @+0 -- device-writable buffer physical address.
+        mov [r10 + 0], r11;
+
+        // u32 len @+8 -- 2048 (sized store so upper 4 bytes of the
+        // u128 desc slot stay untouched).
+        mov rax, 2048;
+        mov_d [r10 + 8], rax;
+
+        // u16 flags @+12 -- VNET_VQ_DESC_F_WRITE (2). Device-writable.
+        mov rax, 2;
+        mov_w [r10 + 12], rax;
+
+        // u16 next @+14 -- 0. Chain terminator (unused at MVP since
+        // MRG_RXBUF is not negotiated).
+        xor rax, rax;
+        mov_w [r10 + 14], rax;
+
+        // ---------- (8) Publish descriptor into the avail ring ----------
+        lea rdi, [rip + _virtio_net_rx_avail_used_pg];  // avail_pa
+        mov rsi, rbx;                                   // desc_idx = i
+        mov rdx, 64;                                    // queue_size
+        call virtio_net_vq_add_avail;
+
+        // ---------- (9) Advance ----------
+        add rbx, 1;
+        jmp vn_rx_r_loop;
+
+      vn_rx_r_done:
+        // ---------- (10) Fingerprint: refill ok count=<rbx> ----------
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + virtio_net_rx_refill_ok_msg];
+        lea rcx, [rip + k_count];
+        mov r8, rbx;                         // v1 = count of slots filled
+        call klog_s1_d1;
+
+        // ---------- (11) VNET_VQ_OK ----------
+        xor rax, rax;
+
+      vn_rx_r_ret:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // virtio_net_rx_poll_and_dispatch(kind) -> u64
+  //
+  // Drain the RX used ring, hand each completed frame to l2_rx_handle,
+  // and re-arm the descriptor for reuse. Called from isr.pdx on every
+  // IRQ pass where the ISR-status register's bit 0 (queue interrupt)
+  // is set, and (in a future wiring, follow-up) from nic_dispatch.pdx's
+  // nd_rx_dispatch_try_virtio arm as the generic virtio RX drain.
+  //
+  // Argument:
+  //   rdi = kind (NIC_KIND_VIRTIO = 2). Accepted for signature parity
+  //         with nic_dispatch_rx_dispatch's arm interface (the shim
+  //         may thread the kind through a future logging surface).
+  //         Not currently used inside the body.
+  //
+  // Returns:
+  //   rax = number of packets dispatched on this invocation (0 if the
+  //         used ring was empty).
+  //
+  // Register plan (2-push callee-save + 8-byte pad):
+  //   rbx = packets dispatched (return value accumulator)
+  //   rbp = desc_idx (survives across l2_rx_handle; also used by the
+  //         re-arm call)
+  //   r12/r13/r14/r15 unused (leaf-ish loop; only rax/rcx/rdi/rsi/rdx
+  //   scratch across the nested calls).
+  //
+  //   2 pushes = 16 B; entry rsp%16==8 -> 24, sub rsp,8 -> 32, %16==0
+  //   (aligned for nested reap_used / l2_rx_handle / add_avail /
+  //   klog calls without extra pad).
+  //
+  // Labels prefixed vn_rx_p_.
+  // ============================================================================
+
+  pub let virtio_net_rx_poll_and_dispatch : (u64) -> u64 !{sysreg, mem} @{sched} =
+    fn (kind: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { sched },
+      justification: "R91.M3-005 (paideia-os #2023). Drain the RX used ring, hand each completed frame body to l2_rx_handle (net/l2_rx.pdx), and re-arm the descriptor for reuse. Called from isr.pdx's ISR-entry on every bit-0-set pass, and (in a follow-up wiring) from nic_dispatch_rx_dispatch's virtio arm. Body: (1) 2-push callee-save prologue (rbx = packets dispatched, rbp = desc_idx across l2_rx_handle + re-arm) + sub rsp,8 -> rsp%16==0 aligned for nested calls. rdi (kind arg) is intentionally unused today; accepted for signature parity with nic_dispatch_rx_dispatch's arm interface (nic-agnostic (kind, ...) shape). (2) xor rbx, rbx (count = 0). (3) vn_rx_p_loop: call virtio_net_vq_reap_used(used_pa=_virtio_net_rx_avail_used_pg + 2048 [VNET_VQ_USED_IN_PAGE_OFFSET], last_seen_idx = mov_w low 16 of _virtio_net_rx_last_used_idx, queue_size=64) -- packed u64 return per virtqueue.pdx §virtio_net_vq_reap_used: bit 63 = found flag, bits 62..48 = desc_idx, bits 31..0 = len. (4) Bit-63 test: `mov rcx, rax; shr rcx, 63; cmp rcx, 0; je vn_rx_p_done` (paideia-as does not encode `js`; the shift-then-compare form matches virtqueue.pdx's own unpacking sibling). (5) Unpack: `mov rbp, rax; shr rbp, 48; and rbp, 0x7FFF` (desc_idx into callee-save rbp so it survives l2_rx_handle); `mov r12, rax; and r12, 0xFFFFFFFF` (len; also fits in r12 briefly but we re-materialize into rsi at call time). (6) Frame length gate: if len <= 12 (only virtio_net_hdr, no ethernet body), skip l2_rx_handle -- go straight to re-arm; no diag emit to avoid per-frame log spam under a rogue device. (7) Compute buf_pa = _virtio_net_rx_buffers + desc_idx*2048 via `mov rax, rbp; shl rax, 11; lea rdi, [rip + _virtio_net_rx_buffers]; add rdi, rax; add rdi, 12` (rdi = frame_pa = buf_pa + 12 skipping virtio_net_hdr). rsi = len - 12. call l2_rx_handle. (8) Re-arm: virtio_net_vq_add_avail(_virtio_net_rx_avail_used_pg, rbp, 64). The descriptor's addr/len/flags never change (set at refill); only the avail-ring publish is needed. rbp (desc_idx) survives per SysV. (9) Bump cursor: `xor rax, rax; mov_w rax, [rip + _virtio_net_rx_last_used_idx]; add rax, 1; mov_w [rip + _virtio_net_rx_last_used_idx], rax` -- u16 wrap preserved by the mov_w store truncation. (10) add rbx, 1; jmp vn_rx_p_loop. (11) vn_rx_p_done: mov rax, rbx; add rsp, 8; pop rbp; pop rbx; ret. Encoder discipline: bit-63 via shr/cmp (no imm64 mask); bit-15 mask 0x7FFF and bit-32 mask 0xFFFFFFFF both fit imm32; u16 read/store via xor+mov_w/mov_w-store; no add reg,[mem]. Effects !{sysreg, mem} @{sched} -- @{sched} rather than @{boot} because this runs on the ISR path, not only at boot. Labels prefixed vn_rx_p_.",
+      block: {
+        push rbx;
+        push rbp;
+        sub  rsp, 8;
+
+        // ---------- (2) Init packet count ----------
+        xor rbx, rbx;
+
+      vn_rx_p_loop:
+        // ---------- (3) Reap next completion ----------
+        // rdi = used_pa = avail_used_pg + 2048 (VNET_VQ_USED_IN_PAGE_OFFSET)
+        lea rdi, [rip + _virtio_net_rx_avail_used_pg];
+        add rdi, 2048;
+        // rsi = last_seen_idx (u16 zero-extended from bss slot)
+        xor rsi, rsi;
+        mov_w rsi, [rip + _virtio_net_rx_last_used_idx];
+        // rdx = queue_size (64)
+        mov rdx, 64;
+        call virtio_net_vq_reap_used;
+
+        // ---------- (4) Bit-63 test: no completion -> done ----------
+        mov rcx, rax;
+        shr rcx, 63;
+        cmp rcx, 0;
+        je  vn_rx_p_done;
+
+        // ---------- (5) Unpack desc_idx and len ----------
+        // desc_idx = (rax >> 48) & 0x7FFF -> rbp (callee-save; survives
+        // l2_rx_handle and virtio_net_vq_add_avail)
+        mov rbp, rax;
+        shr rbp, 48;
+        and rbp, 0x7FFF;
+
+        // len = rax & 0xFFFFFFFF -> r12 briefly; re-materialized into
+        // rsi at l2_rx_handle call time.
+        mov r12, rax;
+        and r12, 0xFFFFFFFF;
+
+        // ---------- (6) Short-frame gate ----------
+        // If len <= 12 the descriptor holds only the virtio_net_hdr
+        // and no ethernet body -- skip l2_rx_handle, go to re-arm.
+        cmp r12, 12;
+        jbe vn_rx_p_rearm;
+
+        // ---------- (7) Dispatch to l2_rx_handle ----------
+        // frame_pa = _virtio_net_rx_buffers + desc_idx*2048 + 12
+        mov rax, rbp;
+        shl rax, 11;                         // desc_idx * 2048
+        lea rdi, [rip + _virtio_net_rx_buffers];
+        add rdi, rax;
+        add rdi, 12;                         // skip virtio_net_hdr
+
+        // frame_len = len - 12
+        mov rsi, r12;
+        sub rsi, 12;
+
+        call l2_rx_handle;
+
+      vn_rx_p_rearm:
+        // ---------- (8) Re-arm the descriptor for reuse ----------
+        lea rdi, [rip + _virtio_net_rx_avail_used_pg];  // avail_pa
+        mov rsi, rbp;                                   // desc_idx
+        mov rdx, 64;                                    // queue_size
+        call virtio_net_vq_add_avail;
+
+        // ---------- (9) Bump the driver-owned reap cursor (u16 wrap) ----------
+        xor rax, rax;
+        mov_w rax, [rip + _virtio_net_rx_last_used_idx];
+        add rax, 1;
+        mov_w [rip + _virtio_net_rx_last_used_idx], rax;
+
+        // ---------- (10) Count + loop ----------
+        add rbx, 1;
+        jmp vn_rx_p_loop;
+
+      vn_rx_p_done:
+        // ---------- (11) Return count of packets dispatched ----------
+        mov rax, rbx;
+        add rsp, 8;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}

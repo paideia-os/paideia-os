@@ -836,6 +836,30 @@ ALLOWLIST = {
         "this on successful QUEUE_ENABLE. Not yet reachable at boot "
         "-- dormant substrate awaiting R91.M3-004/005 tx/rx wire-in. "
         "Retire when a virtio boot mode lands in the smoke suite.",
+
+    # src/kernel/core/drivers/virtio_net/tx.pdx (R91.M3-004 #2022),
+    # rx.pdx (R91.M3-005 #2023), isr.pdx (R91.M3-005 #2023). All three
+    # fire only when the virtio-net attach path is wired (nic_dispatch
+    # tx/rx virtio arms + IDT wire for isr); today they are dormant
+    # substrate. Same posture as the sibling `virtio-net vq init ok`
+    # entry above. Retire when a virtio boot mode joins the smoke
+    # suite and pins the literals.
+    "virtio-net tx ok [legacy: VIRTIO NET TX OK]":
+        "R91.M3-004 (paideia-os #2022): virtio_net_tx_send emits "
+        "this on the OK path. Dormant substrate awaiting nic_dispatch "
+        "virtio tx arm wire-in.",
+    "virtio-net rx refill ok [legacy: VIRTIO NET RX REFILL OK]":
+        "R91.M3-005 (paideia-os #2023): virtio_net_rx_refill emits "
+        "this after prepopulating the RX ring. Dormant substrate "
+        "awaiting attach-time call from kernel_main virtio bring-up.",
+    "virtio-net isr ok [legacy: VIRTIO NET ISR OK]":
+        "R91.M3-005 (paideia-os #2023): virtio_net_isr_handle emits "
+        "this on every IRQ entry. Dormant substrate awaiting IDT "
+        "wire-in for the virtio-net vector.",
+    "virtio-net cfg change ok [legacy: VIRTIO NET CFG CHANGE OK]":
+        "R91.M3-005 (paideia-os #2023): virtio_net_isr_handle emits "
+        "this on ISR-status bit-1 (config change). Dormant substrate "
+        "awaiting IDT wire-in for the virtio-net vector.",
 }
 
 # Below these counts the extractor has stopped matching rather than the

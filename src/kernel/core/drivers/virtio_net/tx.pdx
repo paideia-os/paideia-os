@@ -1,0 +1,386 @@
+// src/kernel/core/drivers/virtio_net/tx.pdx -- R91.M3-004 (paideia-os #2022)
+//
+// virtio-net transmit primitive. Builds the modern virtio_net_hdr + copies
+// the caller's Ethernet frame into a driver-owned buffer, publishes it as a
+// single-descriptor entry into the TX virtqueue's driver-owned available
+// ring, then kicks the device via the modern NOTIFY BAR doorbell.
+//
+// This lands the target of the nic_dispatch_tx virtio arm; wiring the arm
+// itself (edit to src/kernel/core/net/nic_dispatch.pdx §nd_tx_virtio to
+// replace the NIC_ENOSYS stub with a call into virtio_net_tx_send) is a
+// deliberate follow-up scope (per issue directive) so that the target
+// symbol can be reviewed, built, and boot-witnessed independently of the
+// dispatch cutover.
+//
+// Spec references:
+//   * virtio 1.1 §5.1.6      -- virtio_net_hdr layout. Modern (VIRTIO_F_
+//                               VERSION_1 negotiated) header is 12 B:
+//                                 u8  flags        @0
+//                                 u8  gso_type     @1
+//                                 u16 hdr_len      @2
+//                                 u16 gso_size     @4
+//                                 u16 csum_start   @6
+//                                 u16 csum_offset  @8
+//                                 u16 num_buffers  @10
+//                               Legacy virtio_net_hdr (10 B) omits
+//                               num_buffers. common_cfg.pdx unconditionally
+//                               ACKs VIRTIO_F_VERSION_1 (VNET_F_ACK_HI_MASK
+//                               = 0x1) so the 12-B modern shape is the
+//                               correct posture for this MVP.
+//   * virtio 1.1 §5.1.6.1    -- Header + packet are added as ONE output
+//                               descriptor to the transmitq. This MVP takes
+//                               the single-descriptor form (12 B header +
+//                               up to 1500 B frame = ~1512 B, well under
+//                               the 4 KiB buffer). Multi-descriptor chains
+//                               are a follow-on optimisation.
+//   * virtio 1.1 §4.1.4.4    -- NOTIFY capability. Per-queue doorbell
+//                               address is computed as:
+//                                 notify_pa = bar_pa(notify_bar)
+//                                           + cap.notify_off (from probe)
+//                                           + queue_notify_off * notify_off_multiplier
+//                               where queue_notify_off is read from
+//                               COMMON_CFG.queue_notify_off (u16 @+0x1E)
+//                               AFTER QUEUE_SELECT names the target queue.
+//   * virtio 1.1 §2.6.13     -- Driver kicks the device by writing the
+//                               queue index (u16) to the queue's notify
+//                               address. The write itself is the trigger
+//                               and needs no post-fence -- the CPU's UC
+//                               MMIO discipline (SDM Vol 3A §11.3.1) makes
+//                               the store globally visible before any
+//                               following instruction retires.
+//
+// =============================================================================
+// SECTION 0  SCOPE (R91.M3-004, paideia-os #2022)
+// =============================================================================
+//
+// virtio_net_tx_send(buf_pa, len) -> u64 is the sole export. Body:
+//
+//   (1) Gate on _virtio_net_common_cfg_pa (0 -> VNET_CC_ERR_NO_BAR without
+//       side effect; the device has not been probed).
+//   (2) Zero the 12-byte modern virtio_net_hdr at _virtio_net_tx_buf_pg + 0.
+//   (3) rep_movsb-copy `len` bytes from caller-supplied buf_pa (identity-
+//       mapped kernel VA under R91 scope) into _virtio_net_tx_buf_pg + 12.
+//   (4) Populate TX descriptor 0 (single-descriptor chain):
+//         addr  (u64 @+0)  = &_virtio_net_tx_buf_pg
+//         len   (u32 @+8)  = 12 + len
+//         flags (u16 @+12) = 0     (no NEXT, no WRITE -- device reads)
+//         next  (u16 @+14) = 0     (unused when NEXT clear)
+//   (5) virtio_net_vq_add_avail(avail_pa = &_virtio_net_tx_avail_used_pg,
+//                               desc_idx = 0,
+//                               queue_size = VNET_VQ_SIZE = 64).
+//   (6) Doorbell:
+//         (a) QUEUE_SELECT = VNET_VQ_TX_QID (=1) via vn_cc_write_u16.
+//         (b) queue_notify_off = vn_cc_read_u16(COMMON_CFG + 0x1E).
+//         (c) Resolve bar_pa from record notify_bar (u8 @+33 selects
+//             bar0_pa @+8 or bar4_pa @+16; per QEMU convention modern
+//             virtio-net puts NOTIFY in BAR4).
+//         (d) notify_pa = bar_pa + cap.notify_off (u16 @+26)
+//                       + queue_notify_off * notify_off_multiplier
+//                             (u32 @+36).
+//         (e) mfence (drain the ring-idx WB store from add_avail before
+//             the UC MMIO doorbell), then mov_w [notify_pa], queue_id.
+//   (7) klog_s1_d1(INFO, NET_, virtio_net_tx_ok_msg, k_len, len).
+//   (8) Return VNET_TX_OK (0).
+//
+// MVP simplifications (deliberate, all tracked as follow-on scope):
+//   - One packet in flight at a time: descriptor slot 0 is reused every
+//     call. No used-ring reap on this path (the R91.M3-005 rx/isr wave
+//     will add TX completion handling if needed). Reserved BSS slots
+//     (_virtio_net_tx_last_used_idx, _virtio_net_tx_next_desc) are laid
+//     down here so the future reap path does not need a driver rev.
+//   - Single-active-NIC scope: always _virtio_net_devices[0]. The multi-
+//     NIC promotion mirrors the same substrate change the RX / handshake
+//     path will need and is a shared future edit.
+//   - No feature-negotiated header shape switch: modern 12-B header
+//     unconditionally, since common_cfg.pdx's handshake fails a boot that
+//     cannot negotiate VIRTIO_F_VERSION_1 (see VNET_CC_ERR_NO_VERSION_1
+//     at common_cfg.pdx §"Return codes for virtio_net_init_handshake()").
+//
+// =============================================================================
+// SECTION 1  BSS ALLOCATIONS
+// =============================================================================
+//
+//   _virtio_net_tx_buf_pg           4 KiB, @align(4096). Holds one packet:
+//                                   12-B modern virtio_net_hdr + up to
+//                                   1500 B Ethernet frame + trailing
+//                                   padding. Reused every call (MVP: one
+//                                   in flight at a time).
+//   _virtio_net_tx_last_used_idx    u16 in a u64 slot. Reserved cursor
+//                                   for a future used-ring reap on the
+//                                   TX completion path.
+//   _virtio_net_tx_next_desc        u16 in a u64 slot. Reserved round-
+//                                   robin cursor for the future multi-
+//                                   descriptor-in-flight extension.
+//
+// The descriptor and avail+used pages themselves live in virtqueue.pdx
+// (_virtio_net_tx_desc_pg, _virtio_net_tx_avail_used_pg). This file only
+// adds the buffer-and-cursors substrate.
+//
+// =============================================================================
+// SECTION 2  ENCODER-CONSERVATIVE DISCIPLINE (paideia-as v0.24.x)
+// =============================================================================
+//
+//   G1  Sized WB / MMIO stores go through mov_b / mov_w / mov_d. A bare
+//       `mov [addr], reg` widens to REX.W and would clobber neighbouring
+//       bytes. Descriptor.len (u32 @+8) and descriptor.flags/next (u16
+//       @+12/+14) are the write sites subject to this in the body.
+//   G4  `add reg, [mem]` is not emitted -- every mem-load goes through
+//       an intermediate `xor rax,rax; mov_b/w/d rax, [mem]` load, then
+//       `add reg, rax`. Applied to the cap.notify_off (u16 @+26 record)
+//       and notify_off_multiplier (u32 @+36 record) loads in the doorbell
+//       computation.
+//   No mov_bzx / mov_wzx: byte / word loads use the
+//       `xor rax,rax; mov_b/w rax, [addr]` dst-zero form (matches
+//       common_cfg.pdx §vn_cc_read_u8 / vn_cc_read_u16).
+//   imul: two-operand form (`imul rcx, rax`) matches canvas_present.pdx
+//       L765 and modeset_channel.pdx L187 precedent.
+//
+// Reserved-label discipline: every label prefixed `vn_tx_` (paideia-as
+// treats `loop`, `if`, `next` as keywords; see virtqueue.pdx §5).
+
+module Tx = structure {
+
+  // ============================================================================
+  // Return codes for virtio_net_tx_send.
+  //
+  //   VNET_TX_OK           = 0
+  //   VNET_CC_ERR_NO_BAR   = 0xFFFFFFFFFFFFFFED (reused from common_cfg.pdx --
+  //                          same semantic: probe hasn't populated
+  //                          _virtio_net_common_cfg_pa, no device is
+  //                          reachable). The sentinel is written as a full
+  //                          64-bit immediate rather than referencing the
+  //                          imported name so this file stays inspectable
+  //                          in isolation, matching virtqueue.pdx's own
+  //                          re-quoting of the same value at its NO_BAR
+  //                          gate (virtqueue.pdx §virtio_net_vq_init).
+  // ============================================================================
+
+  pub let VNET_TX_OK                   : u64 = 0
+
+  // ============================================================================
+  // Fingerprint tag for the successful TX-send path.
+  //
+  // ONE-line pdx string literal, matching the PDX_STR regex the
+  // tools/verify-fingerprint-coverage.sh gate uses (see
+  // tools/verify-fingerprint-coverage.sh L803-805).
+  //
+  //   "virtio-net tx ok [legacy: VIRTIO NET TX OK]"
+  //   len = 43 printable chars + 1 NUL terminator = 44
+  //
+  // OK_TOK regex at L811 requires word-boundary uppercase OK -- satisfied
+  // by "VIRTIO NET TX OK]". Allowlist entry for this literal is queued for
+  // main to append into tools/verify-fingerprint-coverage.sh's ALLOWLIST
+  // dict alongside the existing virtio_net_{probe,init,vq_init} entries.
+  // ============================================================================
+
+  pub let virtio_net_tx_ok_msg : [u8; 44] = "virtio-net tx ok [legacy: VIRTIO NET TX OK]\0"
+
+  // ============================================================================
+  // BSS: one 4 KiB TX buffer (header + frame) + two reserved cursors.
+  //
+  // The descriptor and avail+used pages themselves live in virtqueue.pdx;
+  // this file adds only the buffer and cursor substrate. See §1.
+  // ============================================================================
+
+  pub let mut _virtio_net_tx_buf_pg        : [u64; 512] = uninit @align(4096)
+  pub let mut _virtio_net_tx_last_used_idx : u64        = 0
+  pub let mut _virtio_net_tx_next_desc     : u64        = 0
+
+  // ============================================================================
+  // virtio_net_tx_send(buf_pa, len) -> u64
+  //
+  // Target of the nic_dispatch_tx virtio arm (wiring lands in a follow-up
+  // edit to nic_dispatch.pdx §nd_tx_virtio -- deliberately deferred so
+  // this symbol can be reviewed, built, and boot-witnessed in isolation).
+  //
+  // Register plan (4-push callee-save + 8 B alignment pad):
+  //   rbx = _virtio_net_common_cfg_pa (loaded once, reused across nested
+  //         vn_cc_read_u16 / vn_cc_write_u16 doorbell-select calls)
+  //   rbp = len  (survives every nested call to feed klog_s1_d1 at the
+  //         tail; also feeds the descriptor.len = 12 + len store)
+  //   r12 = buf_pa  (used only until the rep_movsb source-load)
+  //   r13 = per-queue queue_notify_off snapshot (survives across the
+  //         cap.notify_off + notify_off_multiplier loads that follow)
+  //
+  //   4 pushes = 32 B; entry rsp%16==8 -> 40; sub rsp,8 -> 48, %16==0
+  //   (aligned for every nested SysV call: vn_cc_read_u16 /
+  //   vn_cc_write_u16 / virtio_net_vq_add_avail / klog_s1_d1). All
+  //   nested callees preserve rbx/rbp/r12/r13 per SysV.
+  //
+  // Labels prefixed `vn_tx_`.
+  // ============================================================================
+
+  pub let virtio_net_tx_send : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (buf_pa: u64, len: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R91.M3-004 (paideia-os #2022). virtio-net TX send: build modern virtio_net_hdr + Ethernet frame into a single-descriptor chain in the TX virtqueue, then kick via the modern NOTIFY BAR doorbell. Body: (1) 4-push callee-save prologue (rbx=_virtio_net_common_cfg_pa, rbp=len, r12=buf_pa, r13=queue_notify_off snapshot) + sub rsp,8 = 40 B; entry rsp%16==8 -> 48, %16==0 (aligned for every nested SysV call). (2) NO_BAR gate: load _virtio_net_common_cfg_pa into rbx; if 0 return VNET_CC_ERR_NO_BAR (0xFFFFFFFFFFFFFFED) without side effect -- device has not been probed, no fingerprint (consistent with common_cfg.pdx / virtqueue.pdx NO_BAR arms). (3) Stash args: mov rbp, rsi (len); mov r12, rdi (buf_pa). (4) Zero the 12-byte modern virtio_net_hdr at _virtio_net_tx_buf_pg + 0. Per virtio 1.1 §5.1.6 the modern header layout is flags(u8@0) / gso_type(u8@1) / hdr_len(u16@2) / gso_size(u16@4) / csum_start(u16@6) / csum_offset(u16@8) / num_buffers(u16@10); every field == 0 for an unfeatured send (no GSO, no CSUM offload). Emitted as `mov [buf], 0` (bytes 0..7 -> flags..csum_start) + `mov_d [buf+8], 0` (bytes 8..11 -> csum_offset + num_buffers). Since the rep_movsb below overwrites [buf+12..] byte-for-byte, no zeroing is needed past +12. (5) rep_movsb: rsi = r12 (buf_pa); rdi = &_virtio_net_tx_buf_pg + 12; rcx = rbp (len); cld; rep_movsb. R91 identity-map convention makes buf_pa dereferenceable as VA (matches pdxfs_lite/read.pdx L261 memcpy pattern). len==0 is a valid no-op (rep with rcx=0). (6) Build descriptor 0 at _virtio_net_tx_desc_pg + 0: addr u64 @+0 = &_virtio_net_tx_buf_pg (identity-mapped -> PA); len u32 @+8 = 12 + rbp via mov_d; flags u16 @+12 = 0 via mov_w (no NEXT / WRITE -- device reads); next u16 @+14 = 0 via mov_w (unused when NEXT clear). Encoder G1: mov_d / mov_w sized-store forms mandatory -- a bare mov would widen to REX.W. (7) virtio_net_vq_add_avail(avail_pa=&_virtio_net_tx_avail_used_pg, desc_idx=0, queue_size=64). The primitive owns the WB-side ring[] store + mfence + idx bump per virtio 1.1 §2.6.8.2. (8) Doorbell -- kick the device: (8a) vn_cc_write_u16(rbx, 0x16 QUEUE_SEL, 1 VNET_VQ_TX_QID) so the queue_notify_off read that follows names the TX queue's slot. (8b) vn_cc_read_u16(rbx, 0x1E QUEUE_NOTIFY) -> rax; stash in r13. (8c) Resolve bar_pa: load record[0] via lea r10; read notify_bar u8 @+33 into a scratch; if == 4 use bar4_pa @+16 else use bar0_pa @+8 (the two BAR carriers modern QEMU virtio-net actually uses -- BAR4 is the modern convention, BAR0 the legacy transitional). (8d) notify_pa = bar_pa + cap.notify_off (u16 @+26, from the R91.M3-001 vendor-cap walk) + queue_notify_off (r13) * notify_off_multiplier (u32 @+36). imul rcx,rax two-operand form matches canvas_present.pdx L765 precedent; the u16*u32 = u48 product fits trivially in u64. Encoder G4: every mem load goes through a `xor rax,rax; mov_b/w/d rax, [mem]` staging before an `add reg, rax` -- no `add reg, [mem]` emitted. (8e) mfence -- drain the WB avail-ring idx store from virtio_net_vq_add_avail before the UC MMIO doorbell store, per SDM Vol 3A §11.3.1 WB-vs-UC ordering discipline. Then mov_w [notify_pa], 1 -- writes the queue index (VNET_VQ_TX_QID=1) as a u16 to the doorbell. Per virtio 1.1 §2.6.13 the write itself is the trigger and needs no post-fence; the CPU's UC-store retirement is globally visible before any following instruction retires. (9) Fingerprint: klog_s1_d1(LEVEL_INFO=3, SUBSYS_NET_, virtio_net_tx_ok_msg, k_len, rbp). rbp survives the call (callee-save under SysV). (10) Return VNET_TX_OK (0) via xor rax,rax. Reserved-label discipline: labels prefixed vn_tx_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        sub  rsp, 8;                              // rsp%16==0 for nested calls
+
+        // ============================================================
+        // (2) NO_BAR gate
+        // ============================================================
+        mov  rbx, [rip + _virtio_net_common_cfg_pa];
+        cmp  rbx, 0;
+        jne  vn_tx_have_bar;
+        mov  rax, 0xFFFFFFFFFFFFFFED;             // VNET_CC_ERR_NO_BAR
+        jmp  vn_tx_done;
+
+      vn_tx_have_bar:
+        // (3) Stash args into callee-save regs.
+        mov  rbp, rsi;                            // rbp = len
+        mov  r12, rdi;                            // r12 = buf_pa
+
+        // ============================================================
+        // (4) Zero the 12-byte modern virtio_net_hdr at buffer start.
+        //     Layout (virtio 1.1 §5.1.6):
+        //       flags(u8@0) gso_type(u8@1) hdr_len(u16@2) gso_size(u16@4)
+        //       csum_start(u16@6) csum_offset(u16@8) num_buffers(u16@10)
+        //     Bytes 0..7 (flags..csum_start) zeroed via a u64 store;
+        //     bytes 8..11 (csum_offset + num_buffers) via mov_d. All
+        //     fields zero -- unfeatured send (no GSO, no CSUM offload).
+        // ============================================================
+        lea  rax, [rip + _virtio_net_tx_buf_pg];
+        xor  rcx, rcx;
+        mov  [rax + 0], rcx;                      // bytes 0..7  = 0
+        mov_d [rax + 8], rcx;                     // bytes 8..11 = 0
+
+        // ============================================================
+        // (5) rep_movsb: copy `len` bytes from buf_pa -> buffer + 12.
+        //     R91 identity-map: buf_pa is dereferenceable as a VA.
+        //     len==0 is a valid no-op (rep with rcx=0).
+        // ============================================================
+        lea  rdi, [rip + _virtio_net_tx_buf_pg];
+        add  rdi, 12;                             // dst = buffer + 12
+        mov  rsi, r12;                            // src = buf_pa
+        mov  rcx, rbp;                            // count = len
+        cld;
+        rep_movsb;
+
+        // ============================================================
+        // (6) Build TX descriptor 0 (single-descriptor chain).
+        //     Layout (virtio 1.1 §2.6.5): addr u64 @+0; len u32 @+8;
+        //     flags u16 @+12; next u16 @+14. flags = 0 -> device reads
+        //     (no VIRTQ_DESC_F_WRITE), no chain (no VIRTQ_DESC_F_NEXT).
+        //     Encoder G1: mov_d / mov_w sized stores mandatory.
+        // ============================================================
+        lea  rax, [rip + _virtio_net_tx_desc_pg];
+
+        // desc.addr = &_virtio_net_tx_buf_pg (identity map -> PA)
+        lea  rcx, [rip + _virtio_net_tx_buf_pg];
+        mov  [rax + 0], rcx;
+
+        // desc.len = 12 + len (u32)
+        mov  rcx, rbp;
+        add  rcx, 12;
+        mov_d [rax + 8], rcx;
+
+        // desc.flags = 0 (u16); desc.next = 0 (u16)
+        xor  rcx, rcx;
+        mov_w [rax + 12], rcx;
+        mov_w [rax + 14], rcx;
+
+        // ============================================================
+        // (7) virtio_net_vq_add_avail(avail_pa, desc_idx=0, queue_size=64)
+        // ============================================================
+        lea  rdi, [rip + _virtio_net_tx_avail_used_pg];
+        xor  rsi, rsi;                            // desc_idx = 0
+        mov  rdx, 64;                             // VNET_VQ_SIZE
+        call virtio_net_vq_add_avail;
+
+        // ============================================================
+        // (8) Doorbell -- kick the device.
+        //
+        // (8a) QUEUE_SELECT = VNET_VQ_TX_QID (1) so the queue_notify_off
+        //      read that follows names the TX queue's slot.
+        // ============================================================
+        mov  rdi, rbx;                            // common_cfg_pa
+        mov  rsi, 0x16;                           // VNET_CC_OFF_QUEUE_SEL
+        mov  rdx, 1;                              // VNET_VQ_TX_QID
+        call vn_cc_write_u16;
+
+        // (8b) queue_notify_off = vn_cc_read_u16(common_cfg + 0x1E).
+        mov  rdi, rbx;
+        mov  rsi, 0x1E;                           // VNET_CC_OFF_QUEUE_NOTIFY
+        call vn_cc_read_u16;
+        mov  r13, rax;                            // r13 = queue_notify_off
+
+        // ============================================================
+        // (8c) Resolve bar_pa from record notify_bar (u8 @+33).
+        //      MVP scope: single-active-NIC -> _virtio_net_devices[0].
+        // ============================================================
+        lea  r10, [rip + _virtio_net_devices];    // r10 = &record[0]
+        xor  rax, rax;
+        mov_b rax, [r10 + 33];                    // rax = notify_bar
+        cmp  rax, 4;
+        je   vn_tx_nbar4;
+        // Default / bar_idx == 0 -> bar0_pa.
+        mov  r11, [r10 + 8];                      // r11 = bar0_pa
+        jmp  vn_tx_nbar_done;
+
+      vn_tx_nbar4:
+        mov  r11, [r10 + 16];                     // r11 = bar4_pa
+
+      vn_tx_nbar_done:
+        // ============================================================
+        // (8d) notify_pa = bar_pa + cap.notify_off (u16 @+26)
+        //                  + queue_notify_off * notify_off_multiplier
+        //                    (u32 @+36).
+        // Encoder G4: staged loads via `xor rax,rax; mov_{w,d} rax, [mem]`
+        // then `add r11, rax` -- no `add reg, [mem]` emitted.
+        // ============================================================
+        // Add cap.notify_off (u16 @+26 in record) to bar_pa.
+        xor  rax, rax;
+        mov_w rax, [r10 + 26];                    // rax = cap.notify_off
+        add  r11, rax;
+
+        // rcx = queue_notify_off * notify_off_multiplier
+        xor  rax, rax;
+        mov  eax, [r10 + 36];                     // rax = notify_off_multiplier (u32)
+        mov  rcx, r13;                            // rcx = queue_notify_off
+        imul rcx, rax;                            // rcx = product (u16 * u32 fits in u64)
+
+        add  r11, rcx;                            // r11 = notify_pa
+
+        // ============================================================
+        // (8e) mfence + doorbell store.
+        //   The mfence drains the WB avail-ring idx store from
+        //   virtio_net_vq_add_avail before the UC MMIO doorbell store
+        //   (SDM Vol 3A §11.3.1). The doorbell itself is the trigger --
+        //   per virtio 1.1 §2.6.13 no post-fence is needed; UC-store
+        //   retirement is globally visible before any following
+        //   instruction retires.
+        // ============================================================
+        mfence;
+        mov  rax, 1;                              // queue index (TX = 1)
+        mov_w [r11], rax;
+
+        // ============================================================
+        // (9) OK fingerprint: klog_s1_d1(INFO, NET_, tag, k_len, len).
+        //     rbp (len) is callee-save under SysV and survives the call.
+        // ============================================================
+        mov  rdi, 3;                              // LEVEL_INFO
+        lea  rsi, [rip + SUBSYS_NET_];
+        lea  rdx, [rip + virtio_net_tx_ok_msg];
+        lea  rcx, [rip + k_len];
+        mov  r8, rbp;                             // v1 = len
+        call klog_s1_d1;
+
+        // (10) Return VNET_TX_OK.
+        xor  rax, rax;
+
+      vn_tx_done:
+        add  rsp, 8;
+        pop  r13;
+        pop  r12;
+        pop  rbp;
+        pop  rbx;
+        ret
+      }
+    }
+}
