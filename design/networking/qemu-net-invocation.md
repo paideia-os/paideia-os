@@ -25,10 +25,14 @@ Attaches (or omits) an emulated NIC. Default: `virtio` (R91.M5-002).
 
 | Value    | QEMU flags emitted (by `run-qemu.sh`)                                                                     |
 |----------|------------------------------------------------------------------------------------------------------------|
-| `virtio` | `-netdev user,id=net0,hostfwd=tcp::0-:0[,hostfwd=...]` `-device virtio-net-pci,netdev=net0`               |
-| `e1000e` | `-netdev user,id=net0,hostfwd=tcp::0-:0[,hostfwd=...]` `-device e1000e,netdev=net0`                       |
-| `rtl8139`| `-netdev user,id=net0[,hostfwd=...]` `-device rtl8139,netdev=net0`                                        |
-| `none`   | no NIC flags emitted (opt-in for bit-identical pre-R91 arg lists on non-network smokes)                    |
+| `virtio` | `-netdev user,id=net0[,hostfwd=<spec>...]` `-device virtio-net-pci,netdev=net0`                            |
+| `e1000e` | `-netdev user,id=net0[,hostfwd=<spec>...]` `-device e1000e,netdev=net0`                                    |
+| `rtl8139`| `-netdev user,id=net0[,hostfwd=<spec>...]` `-device rtl8139,netdev=net0`                                   |
+| `none`   | no NIC flags emitted (opt-in for bit-identical pre-R91 arg lists on non-network smokes); `PAIDEIA_HOSTFWD` if set is ignored with a diagnostic |
+
+Each `hostfwd=<spec>` fragment is emitted only when `PAIDEIA_HOSTFWD`
+is set and non-empty (§1.2 below). SLIRP requires no `hostfwd` rule
+to function — inbound guest connections and DNS/DHCP just work.
 
 The dispatch cascade at `src/kernel/core/net/nic_dispatch.pdx` probes
 all three regardless of which `-device` QEMU attached; the driver
@@ -37,9 +41,14 @@ sets `_active_nic_kind` (1=e1000e, 2=virtio, 3=rtl8139, 0=none).
 
 ### `PAIDEIA_HOSTFWD` = `<hostfwd-spec>[,<hostfwd-spec>...]`
 
-Extra `hostfwd=` fragments appended to the SLIRP `-netdev user`
-argument (R94.M6-003 #2075). Comma-separated for multiple rules;
-ignored when `PAIDEIA_NIC=none`.
+`hostfwd=` fragments appended to the SLIRP `-netdev user` argument
+(R94.M6-003 #2075). Comma-separated for multiple rules. When unset OR
+the empty string, no `hostfwd=` fragment is emitted — SLIRP works
+fine without one (paideia-os #2222 removed the earlier
+`hostfwd=tcp::0-:0` seed after modern QEMU began rejecting a 0-port
+spec with `Bad guest port`). Ignored when `PAIDEIA_NIC=none` — a
+diagnostic is printed to stderr and the boot proceeds without
+networking.
 
 Example — R94 off-box TCP smoke lane:
 ```
@@ -47,11 +56,16 @@ PAIDEIA_HOSTFWD='tcp::5555-:5555' tools/run-qemu.sh
 ```
 yields
 ```
--netdev user,id=net0,hostfwd=tcp::0-:0,hostfwd=tcp::5555-:5555
+-netdev user,id=net0,hostfwd=tcp::5555-:5555
 ```
-The default `hostfwd=tcp::0-:0` placeholder is a wildcard QEMU
-accepts but never binds — retained so pre-R94 smokes see byte-
-identical arg lists.
+Multiple rules:
+```
+PAIDEIA_HOSTFWD='tcp::5555-:5555,tcp::8080-:80' tools/run-qemu.sh
+```
+yields
+```
+-netdev user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=tcp::8080-:80
+```
 
 ### `PAIDEIA_NET_SMOKE` = `0 | 1`
 

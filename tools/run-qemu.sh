@@ -10,11 +10,11 @@
 #       #2030 -- superseding the earlier `none` default so the boot_r91_
 #       nic_probe witness has a live NIC to attest against without every
 #       invocation naming a PAIDEIA_NIC value explicitly).
-#       - e1000e : -netdev user,id=net0,hostfwd=tcp::0-:0
+#       - e1000e : -netdev user,id=net0[,hostfwd=<spec>...]
 #                  -device e1000e,netdev=net0
-#       - virtio : -netdev user,id=net0,hostfwd=tcp::0-:0
+#       - virtio : -netdev user,id=net0[,hostfwd=<spec>...]
 #                  -device virtio-net-pci,netdev=net0
-#       - rtl8139: -netdev user,id=net0
+#       - rtl8139: -netdev user,id=net0[,hostfwd=<spec>...]
 #                  -device rtl8139,netdev=net0
 #       - none   : no NIC flags emitted (opt-in for bit-identical
 #                  pre-R91 arg lists on non-network smokes).
@@ -24,20 +24,25 @@
 #       full three-NIC probe cascade + attach step lands (issue #2030).
 #
 #   PAIDEIA_HOSTFWD=<qemu-hostfwd-spec>[,<spec>...]
-#       R94.M6-003 (paideia-os #2075). Extends the -netdev user hostfwd
-#       rule set for the boot_r94_tcp_offbox smoke and future off-box
-#       TCP witnesses that need a specific forwarded port. Each spec
-#       is passed VERBATIM as an additional `hostfwd=<spec>` fragment
-#       appended to the -netdev arg (comma-separated). Ignored when
-#       PAIDEIA_NIC=none. Example:
+#       R94.M6-003 (paideia-os #2075). Adds SLIRP `hostfwd=` rules for
+#       the boot_r94_tcp_offbox smoke and future off-box TCP witnesses
+#       that need a specific forwarded port. Each spec is passed
+#       VERBATIM as a `hostfwd=<spec>` fragment appended to the -netdev
+#       user arg. When PAIDEIA_HOSTFWD is unset OR the empty string,
+#       NO hostfwd fragment is emitted -- SLIRP works fine without one,
+#       and the earlier `hostfwd=tcp::0-:0` seed was removed because
+#       modern QEMU rejects it as "Bad guest port" (paideia-os #2222).
+#       Ignored when PAIDEIA_NIC=none (a diag is printed to stderr and
+#       the boot proceeds without networking). Example:
 #           PAIDEIA_HOSTFWD='tcp::5555-:5555' tools/run-qemu.sh ...
 #       yields:
-#           -netdev user,id=net0,hostfwd=tcp::0-:0,hostfwd=tcp::5555-:5555
-#       The default `hostfwd=tcp::0-:0` (a wildcard placeholder that
-#       QEMU accepts but never binds) is retained so pre-R94 smokes see
-#       byte-identical arg lists. Multiple hostfwd specs may be
-#       comma-separated in a single PAIDEIA_HOSTFWD value; each is
-#       expanded into its own `hostfwd=<spec>` fragment.
+#           -netdev user,id=net0,hostfwd=tcp::5555-:5555
+#       Multiple specs may be comma-separated in a single
+#       PAIDEIA_HOSTFWD value; each is expanded into its own
+#       `hostfwd=<spec>` fragment. Example:
+#           PAIDEIA_HOSTFWD='tcp::5555-:5555,tcp::8080-:80' ...
+#       yields:
+#           -netdev user,id=net0,hostfwd=tcp::5555-:5555,hostfwd=tcp::8080-:80
 #
 #   PAIDEIA_VGA=<std|virtio|none>
 #       R101.M4-002 (paideia-os #2151). Attach an emulated display
@@ -76,11 +81,14 @@ Networking environment variables:
     is the one that lands in the KIND_NIC row.
 
   PAIDEIA_HOSTFWD=<qemu-hostfwd-spec>[,<spec>...]
-    Extra `hostfwd=` fragments appended to the SLIRP -netdev argument
-    (R94.M6-003 #2075). Comma-separated for multiple rules. Ignored when
-    PAIDEIA_NIC=none. Example:
+    `hostfwd=` fragments appended to the SLIRP -netdev argument
+    (R94.M6-003 #2075). Comma-separated for multiple rules. When unset
+    or empty, no hostfwd fragment is emitted at all -- SLIRP works
+    fine without one (paideia-os #2222 has the history on why no
+    placeholder rule is seeded here by default). Ignored when
+    PAIDEIA_NIC=none (a diagnostic is printed to stderr). Example:
       PAIDEIA_HOSTFWD='tcp::5555-:5555' tools/run-qemu.sh ...
-    Yields `-netdev user,id=net0,hostfwd=tcp::0-:0,hostfwd=tcp::5555-:5555`.
+    Yields `-netdev user,id=net0,hostfwd=tcp::5555-:5555`.
 
   PAIDEIA_NET_SMOKE=<0|1>
     Read by tools/run-smoke.sh (NOT this script) as the opt-in gate for
@@ -109,31 +117,43 @@ fi
 # QEMU's arg list bit-identical to pre-R91.M2-004 behavior for smokes that
 # must not carry a NIC (rare -- most smokes tolerate the extra `-device`).
 NIC_ARGS=()
-# R94.M6-003 (paideia-os #2075): compose extra hostfwd fragments from
-# PAIDEIA_HOSTFWD (comma-separated), appended to the -netdev user
-# argument alongside the pre-R94 default hostfwd=tcp::0-:0 placeholder.
-HOSTFWD_EXTRA=""
+# R94.M6-003 (paideia-os #2075) + paideia-os #2222: compose optional
+# hostfwd fragments from PAIDEIA_HOSTFWD (comma-separated). Each spec
+# is expanded into its own `hostfwd=<spec>` fragment; the result is a
+# suffix (leading comma) appended to `user,id=net0`. When
+# PAIDEIA_HOSTFWD is unset OR the empty string, NO hostfwd fragment is
+# emitted -- the earlier `hostfwd=tcp::0-:0` seed was removed because
+# modern QEMU rejects a 0-port spec as "Bad guest port". SLIRP works
+# fine without any hostfwd rule.
+HOSTFWD_SUFFIX=""
 if [[ -n "${PAIDEIA_HOSTFWD:-}" ]]; then
     IFS=',' read -ra _paideia_hostfwd_specs <<< "${PAIDEIA_HOSTFWD}"
     for _spec in "${_paideia_hostfwd_specs[@]}"; do
-        HOSTFWD_EXTRA="${HOSTFWD_EXTRA},hostfwd=${_spec}"
+        HOSTFWD_SUFFIX="${HOSTFWD_SUFFIX},hostfwd=${_spec}"
     done
     unset _paideia_hostfwd_specs _spec
 fi
 
 case "${PAIDEIA_NIC:-virtio}" in
     none)
+        # PAIDEIA_NIC=none omits all -netdev / -device flags. When a
+        # caller also set PAIDEIA_HOSTFWD, surface a diagnostic (the
+        # hostfwd rule has nothing to attach to) but proceed rather
+        # than error -- keeps `PAIDEIA_NIC=none` a hard override.
+        if [[ -n "${PAIDEIA_HOSTFWD:-}" ]]; then
+            echo "run-qemu.sh: PAIDEIA_HOSTFWD='${PAIDEIA_HOSTFWD}' ignored because PAIDEIA_NIC=none" >&2
+        fi
         ;;
     e1000e)
-        NIC_ARGS=(-netdev "user,id=net0,hostfwd=tcp::0-:0${HOSTFWD_EXTRA}" \
+        NIC_ARGS=(-netdev "user,id=net0${HOSTFWD_SUFFIX}" \
                   -device e1000e,netdev=net0)
         ;;
     virtio)
-        NIC_ARGS=(-netdev "user,id=net0,hostfwd=tcp::0-:0${HOSTFWD_EXTRA}" \
+        NIC_ARGS=(-netdev "user,id=net0${HOSTFWD_SUFFIX}" \
                   -device virtio-net-pci,netdev=net0)
         ;;
     rtl8139)
-        NIC_ARGS=(-netdev "user,id=net0${HOSTFWD_EXTRA}" \
+        NIC_ARGS=(-netdev "user,id=net0${HOSTFWD_SUFFIX}" \
                   -device rtl8139,netdev=net0)
         ;;
     *)
