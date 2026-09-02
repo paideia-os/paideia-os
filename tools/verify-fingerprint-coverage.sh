@@ -860,6 +860,43 @@ ALLOWLIST = {
         "R91.M3-005 (paideia-os #2023): virtio_net_isr_handle emits "
         "this on ISR-status bit-1 (config change). Dormant substrate "
         "awaiting IDT wire-in for the virtio-net vector.",
+
+    # src/kernel/core/drivers/rtl8139/{probe,rx,tx,mac,irq}.pdx --
+    # R91.M4-001..004 (paideia-os #2025..#2028) RTL8139 driver family.
+    # All six fingerprints fire only when the rtl8139 attach path is
+    # wired (nic_dispatch cmp-chain arm + IDT wire for the ISR); today
+    # they are dormant substrate. probe emits count=0 on the default
+    # QEMU matrix (no -device rtl8139), and the remaining five never
+    # execute without an attach caller. Same posture as the sibling
+    # virtio-net entries above. Retire when a rtl8139 boot mode joins
+    # the smoke suite (R91.M5 boot_r91_nic_probe smoke, #2031) under
+    # PAIDEIA_NIC=rtl8139 and pins the literals.
+    "rtl8139 probe ok [legacy: RTL8139 PROBE OK]":
+        "R91.M4-001 (paideia-os #2025): rtl8139_probe emits this every "
+        "call with count=<n>. Fires on the default QEMU matrix with "
+        "count=0 (no -device rtl8139) once nic_dispatch_probe wires "
+        "the call in; no golden pins the literal yet.",
+    "rtl8139 rx init ok [legacy: RTL8139 RX INIT OK]":
+        "R91.M4-002 (paideia-os #2026): rtl8139_rx_init emits this after "
+        "programming RBSTART / RCR / IMR and enabling the receiver. "
+        "Dormant substrate awaiting attach-time call from the future "
+        "nic_dispatch rtl8139 arm.",
+    "rtl8139 rx poll ok [legacy: RTL8139 RX POLL OK]":
+        "R91.M4-002 (paideia-os #2026): rtl8139_rx_poll emits this at "
+        "the tail of each drain with count=<frames>. Dormant substrate "
+        "awaiting IDT wire-in for the rtl8139 IRQ vector.",
+    "rtl8139 tx ok [legacy: RTL8139 TX OK]":
+        "R91.M4-003 (paideia-os #2027): rtl8139_tx_send emits this on "
+        "the trigger-success path. Dormant substrate awaiting the "
+        "nic_dispatch rtl8139 tx arm wire-in.",
+    "rtl8139 mac ok [legacy: RTL8139 MAC OK]":
+        "R91.M4-004 (paideia-os #2028): rtl8139_read_mac emits this "
+        "after packing IDR0..IDR5 into slot 0's mac_word. Dormant "
+        "substrate awaiting the rtl8139 attach path.",
+    "rtl8139 isr ok [legacy: RTL8139 ISR OK]":
+        "R91.M4-004 (paideia-os #2028): rtl8139_isr_handle emits this "
+        "at every ISR entry past the NO_DEV gate. Dormant substrate "
+        "awaiting IDT wire-in for the rtl8139 IRQ vector.",
 }
 
 # Below these counts the extractor has stopped matching rather than the

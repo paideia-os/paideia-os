@@ -1,0 +1,436 @@
+// src/kernel/core/drivers/rtl8139/rx.pdx -- R91.M4-002 (paideia-os #2026)
+//
+// Realtek RTL8139 receive plane: single contiguous RX buffer (no
+// descriptor ring -- this NIC predates rings), CAPR/CBR cursor
+// management with the "CAPR-16 offset trick", per-frame dispatch into
+// l2_rx_handle.
+//
+// =============================================================================
+// SECTION 0  BUFFER SIZING (16 KiB @align(4096), RBLEN = 8K + 16 semantics)
+// =============================================================================
+//
+// The RTL8139 spec offers four RX buffer sizes selected via RCR bits
+// [12:11]:
+//
+//   00 -> 8 KiB + 16 B slop
+//   01 -> 16 KiB + 16 B slop
+//   10 -> 32 KiB + 16 B slop
+//   11 -> 64 KiB + 16 B slop
+//
+// We use the 00 setting (8 KiB + 16 B) at MVP -- it is the smallest
+// footprint that comfortably holds a burst of full-MTU frames and it
+// matches virtually every RTL8139 driver reference implementation. The
+// spec also warns that on wrap the device may overrun the nominal
+// end-of-buffer by up to the size of the last received frame (~1500 B)
+// even with WRAP=0, unless the driver has scheduled a CAPR advance
+// before then. To make that overrun benign we allocate a 16 KiB backing
+// store (2x the nominal 8 KiB + 16 B window), which gives ~8 KiB of
+// slack past the wrap boundary -- more than 5x the worst-case
+// per-frame overrun. The device's internal DMA cursor still wraps at
+// the 8 KiB + 16 B boundary programmed via RCR, so the driver's own
+// cursor arithmetic wraps at 8192.
+//
+// The WRAP bit (RCR bit 7) controls whether the device tolerates an
+// end-of-buffer overrun by continuing to write past it (WRAP=1) or
+// forcing an immediate wrap (WRAP=0). We choose WRAP=0 at MVP because
+// combined with the 2x oversized backing store the overrun surface
+// is already contained; WRAP=1 saves a CAPR wrap edge case at the
+// cost of relying on the exact "no packet larger than the slack"
+// invariant that a rogue device could break. The 2x buffer + WRAP=0
+// posture is the more defensive choice.
+//
+// Total RX buffer area = 16 KiB. Statically allocated in .bss under
+// `_rtl8139_rx_buf`, @align(4096) for future R25/R96 IOMMU-domain
+// mapping (same rationale documented in drivers/virtio_net/rx.pdx §0
+// for the ring pages).
+//
+// =============================================================================
+// SECTION 1  CAPR / CBR CURSOR DISCIPLINE + "CAPR-16 OFFSET TRICK"
+// =============================================================================
+//
+// The RTL8139 exposes two 16-bit cursors:
+//
+//   CAPR  (u16 @ bar1+0x38)  -- driver-owned "current address of packet
+//                               read". The driver bumps this as it
+//                               consumes packets from the RX buffer.
+//   CBR   (u16 @ bar1+0x3A)  -- device-owned "current buffer address".
+//                               Read-only from the driver; the device
+//                               advances it as it writes new packets.
+//
+// CAPR carries a hardware-imposed 16-byte bias: the initial value at
+// reset is 0xFFF0 (= -16 as u16), which the device interprets as "the
+// next unconsumed packet starts at offset 0". Concretely: whenever the
+// driver has consumed up to byte X of the RX buffer, it must WRITE
+// (X - 16) as a u16 to CAPR. Under this bias, u16 wrap of (0 - 16)
+// yields 0xFFF0, which the device reads back as "you've consumed up
+// to byte 0 -- please write new packets starting at byte 0".
+//
+// The 8 KiB buffer wraps at position 8192; the driver's own
+// consumption cursor `_rtl8139_capr` (u16 semantics carried in a u64
+// .bss slot) is taken modulo 8192 before the -16 store to CAPR. The
+// u16 truncation is implicit in the `mov_w [addr], reg` sized store
+// (which discards the upper 48 bits of the source register).
+//
+// The BUFE bit (CMD @ bar1+0x37, bit 0) is 1 when CAPR == CBR (nothing
+// to consume) and 0 otherwise; we drain until BUFE is set.
+//
+// =============================================================================
+// SECTION 2  PER-PACKET RX HEADER (4 bytes, NIC-provided)
+// =============================================================================
+//
+// Before each Ethernet frame in the RX buffer the NIC prepends a
+// 4-byte header:
+//
+//   +0  u16  rx_status   (bit 0 = ROK if the frame is good; other bits
+//                         flag CRC / alignment / runt / long errors)
+//   +2  u16  frame_size  (length in bytes of the frame body PLUS the
+//                         4-byte CRC that the NIC does NOT strip)
+//
+// The frame body proper starts at header+4 and runs for (frame_size - 4)
+// bytes once the trailing CRC is discarded. We do the CRC strip in
+// the dispatch by handing l2_rx_handle a length of (frame_size - 4).
+//
+// Length-plausibility gate: only frames with 60 <= frame_size <= 1518
+// are dispatched (60 = 14 Ethernet header + 46 min payload; 1518 = 14 +
+// 1500 MTU + 4 CRC). A frame outside that band is a NIC bug or a
+// buffer-wrap misread; we abort the drain rather than advance the
+// cursor by a garbage length that would desync the loop from the
+// device's actual cursor. The abort is silent (no diag) because a
+// pending IRQ will re-enter this function and a healthy tail of the
+// ring will still be drained. If the corruption is persistent the
+// operator sees only "no packets delivered" and can escalate; per-frame
+// diags under a rogue device would spam the log without adding signal.
+//
+// =============================================================================
+// SECTION 3  BSS SLOTS OWNED BY THIS FILE
+// =============================================================================
+//
+//   _rtl8139_rx_buf    : [u64; 2048] @align(4096) = 16 KiB backing store
+//                        (2x the nominal 8 KiB + 16 B RCR window; see §0).
+//   _rtl8139_capr      : u64 = 0
+//                        Driver-owned consumption cursor. Byte offset
+//                        into _rtl8139_rx_buf in [0, 8192). Read and
+//                        written only by this file; carried in a u64
+//                        slot but conceptually u16 (upper 48 bits stay
+//                        0 for the module's life because the modulo-
+//                        8192 arithmetic keeps the value under 2^13).
+//
+// =============================================================================
+// SECTION 4  ENCODER + LABEL DISCIPLINE (paideia-as v0.24.x)
+// =============================================================================
+//
+// Labels prefixed `rtl_rx_i_` (init) / `rtl_rx_p_` (poll). Every u16
+// read is `xor rax,rax; mov_w rax, [mem]` (no mov_wzx); u32 MMIO
+// writes go through `mov_d [addr], reg`; u8/u16 MMIO writes through
+// `mov_b`/`mov_w`. MMIO reads are bracketed with `mfence` pairs per
+// the drivers/virtio_net/isr.pdx §"MMIO byte read" convention. No
+// `add reg, [mem]`; every memory operand goes through an rax stage.
+
+module Rx = structure {
+
+  // ============================================================================
+  // MMIO register offsets consumed here (bar1_pa is the base).
+  // ============================================================================
+
+  pub let RTL8139_REG_RBSTART   : u64 = 0x30    // u32 rx buffer start (PA lo)
+  pub let RTL8139_REG_CMD       : u64 = 0x37    // u8  command
+  pub let RTL8139_REG_CAPR      : u64 = 0x38    // u16 current addr of pkt read
+  pub let RTL8139_REG_CBR       : u64 = 0x3A    // u16 current buffer addr
+  pub let RTL8139_REG_IMR       : u64 = 0x3C    // u16 interrupt mask
+  pub let RTL8139_REG_RCR       : u64 = 0x44    // u32 receive configuration
+
+  pub let RTL8139_CMD_RE        : u64 = 0x08    // bit 3 -- RX enable
+  pub let RTL8139_CMD_TE        : u64 = 0x04    // bit 2 -- TX enable
+  pub let RTL8139_CMD_BUFE      : u64 = 0x01    // bit 0 -- RX buffer empty
+
+  // RCR default: AB (bcast) | AM (mcast) | APM (my phys) | AAP (promisc);
+  // RBLEN [12:11] = 00 (8 KiB + 16 B); WRAP (bit 7) = 0.
+  pub let RTL8139_RCR_DEFAULT   : u64 = 0x0000000F
+
+  // IMR: ROK (bit 0) | TOK (bit 2).
+  pub let RTL8139_IMR_DEFAULT   : u64 = 0x0005
+
+  // The 8 KiB CAPR wrap boundary. Backing store is 16 KiB (§0); the
+  // wrap is set by RCR RBLEN, not by the buffer allocation.
+  pub let RTL8139_RX_WRAP       : u64 = 8192
+
+  // Frame plausibility bounds (§2). Ethernet minimum body + 4 CRC = 60;
+  // 14 hdr + 1500 MTU + 4 CRC = 1518.
+  pub let RTL8139_MIN_FRAME     : u64 = 60
+  pub let RTL8139_MAX_FRAME     : u64 = 1518
+
+  // ============================================================================
+  // Fingerprint tags (ONE-line pdx string literals).
+  //
+  //   "rtl8139 rx init ok [legacy: RTL8139 RX INIT OK]"
+  //     47 printable chars + 1 NUL terminator = 48 bytes.
+  //   "rtl8139 rx poll ok [legacy: RTL8139 RX POLL OK]"
+  //     47 printable chars + 1 NUL terminator = 48 bytes.
+  //
+  // OK_TOK regex matches on the word-boundary uppercase OK in the
+  // bracketed legacy shard. Both literals need ALLOWLIST entries
+  // alongside the sibling virtio_net_rx_refill_ok_msg entry until R91.M5
+  // boot_r91_nic_probe smoke (#2031) pins them under a PAIDEIA_NIC=
+  // rtl8139 boot mode.
+  // ============================================================================
+
+  pub let rtl8139_rx_init_ok_msg : [u8; 48] = "rtl8139 rx init ok [legacy: RTL8139 RX INIT OK]\0"
+  pub let rtl8139_rx_poll_ok_msg : [u8; 48] = "rtl8139 rx poll ok [legacy: RTL8139 RX POLL OK]\0"
+
+  // ============================================================================
+  // BSS slots (§3).
+  //
+  // _rtl8139_rx_buf: 16 KiB (2 × the nominal 8 KiB + 16 B RCR window).
+  //   [u64; 2048] × 8 B = 16384 B = 16 KiB. @align(4096) for future
+  //   R25/R96 IOMMU-domain mapping.
+  // _rtl8139_capr: driver-owned consumption cursor into _rtl8139_rx_buf.
+  //   u16 semantics carried in a u64 slot; modulo-8192 arithmetic keeps
+  //   the value under 2^13 so the upper 48 bits stay 0 for the module's
+  //   life.
+  // ============================================================================
+
+  pub let mut _rtl8139_rx_buf : [u64; 2048] = uninit @align(4096)
+  pub let mut _rtl8139_capr   : u64         = 0
+
+  // ============================================================================
+  // rtl8139_rx_init(bar_pa: u64) -> u64
+  //
+  // SysV: (bar_pa: u64) -> u64
+  //   rdi = BAR1 physical base (MMIO)
+  //   returns rax = 0 (VNET_TX_OK convention -- currently the only
+  //                    outcome; a future guard on _rtl8139_device_count
+  //                    == 0 could return a NO_DEV sentinel but the
+  //                    caller is already gating on that when it calls
+  //                    us with a bar_pa).
+  //
+  // Programs:
+  //   RBSTART (u32 @ bar+0x30) = &_rtl8139_rx_buf  (identity map -> PA)
+  //   RCR     (u32 @ bar+0x44) = 0x0000000F        (AB|AM|APM|AAP,
+  //                                                 RBLEN=00 = 8K+16,
+  //                                                 WRAP=0)
+  //   IMR     (u16 @ bar+0x3C) = 0x0005            (ROK|TOK)
+  //   CMD     (u8  @ bar+0x37) |= 0x0C             (RE|TE -- both RX and
+  //                                                 TX must be enabled
+  //                                                 here; the device
+  //                                                 requires CmdTxEnb
+  //                                                 (bit 2) before it
+  //                                                 will act on any TSD
+  //                                                 write -- QEMU's own
+  //                                                 rtl8139_transmit_one()
+  //                                                 silently no-ops the
+  //                                                 send when this bit
+  //                                                 is clear, and no
+  //                                                 other bring-up call
+  //                                                 in this landing sets
+  //                                                 it)
+  //
+  // Also zeroes the driver-side _rtl8139_capr so a re-init (or the
+  // hypothetical R91.M4-005 re-attach path) does not carry a stale
+  // consumption cursor across a controller reset.
+  //
+  // Register plan (1-push callee-save + 8 B align pad):
+  //   rbx = bar_pa (survives every nested MMIO write + the fingerprint call)
+  //
+  //   1 push = 8 B; entry rsp%16==8 -> 16, %16==0 (aligned for the nested
+  //   klog_s1 call; every earlier step is inline MMIO with no CALL).
+  //
+  // Labels prefixed `rtl_rx_i_`.
+  // ============================================================================
+
+  pub let rtl8139_rx_init : (u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar_pa: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R91.M4-002 (paideia-os #2026). Program RTL8139 RX plane: RBSTART = &_rtl8139_rx_buf identity-mapped as PA; RCR = 0x0000000F (accept broadcast/multicast/my-phys/promiscuous + RBLEN=00 for 8 KiB + 16 B RCR window + WRAP=0); IMR = 0x0005 (ROK|TOK); CMD |= RE|TE (bits 3, 2). TE must be set here alongside RE: this is the only bring-up call in the R91.M4 landing that touches CMD after probe's reset, and QEMU's rtl8139_transmit_one() (mirroring the real device's CmdTxEnb gate) silently no-ops any TSD-triggered send while CmdTxEnb (bit 2) is clear -- tx.pdx never sets it itself, so omitting it here would make rtl8139_tx_send report RTL8139_TX_OK on every call while no frame ever reaches the wire. Also zero the driver-side _rtl8139_capr cursor to defend against a hypothetical re-init carrying a stale value across a controller reset. Body: (1) push rbx (entry rsp%16==8 -> 16, %16==0 aligned for the nested klog_s1). mov rbx, rdi (bar_pa). (2) Zero _rtl8139_capr: `xor rax, rax; mov [rip + _rtl8139_capr], rax`. (3) RBSTART store: buf_pa = &_rtl8139_rx_buf via `lea rax, [rip + _rtl8139_rx_buf]`; addr = rbx + 0x30 in r10; mov_d [r10], rax (sized 32-bit store -- rtl8139 is 32-bit-only, so the low 32 bits of buf_pa are the PA on any identity-mapped kernel VA under R91 scope). (4) RCR store: addr = rbx + 0x44 in r10; `mov rax, 0x0000000F; mov_d [r10], rax`. (5) IMR store: addr = rbx + 0x3C in r10; `mov rax, 0x0005; mov_w [r10], rax`. (6) CMD read-OR-write (RE|TE, bits 3+2): addr = rbx + 0x37 in r10; mfence + `xor rax,rax; mov_b rax, [r10]` + mfence -> read current CMD; `or rax, 0x0C` -> set RE and TE bits; `mov_b [r10], rax` -> write back. (7) Emit fingerprint: klog_s1(LEVEL_INFO=3, SUBSYS_NET_, rtl8139_rx_init_ok_msg). (8) xor rax, rax; pop rbx; ret. Encoder discipline: mov_d / mov_w / mov_b sized stores are mandatory (bare mov would widen to REX.W); MMIO read for the CMD-OR-write path uses the mfence-bracketed dst-zero pattern from drivers/virtio_net/isr.pdx L216-219. Reserved-label discipline: labels prefixed rtl_rx_i_.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                            // rbx = bar_pa
+
+        // ---------- (2) Zero the driver-side consumption cursor ----------
+        xor rax, rax;
+        mov [rip + _rtl8139_capr], rax;
+
+        // ---------- (3) RBSTART = &_rtl8139_rx_buf ----------
+        lea rax, [rip + _rtl8139_rx_buf];        // identity map -> PA
+        mov r10, rbx;
+        add r10, 0x30;                           // RBSTART offset
+        mov_d [r10], rax;
+
+        // ---------- (4) RCR = 0x0000000F ----------
+        mov r10, rbx;
+        add r10, 0x44;                           // RCR offset
+        mov rax, 0x0000000F;                     // RTL8139_RCR_DEFAULT
+        mov_d [r10], rax;
+
+        // ---------- (5) IMR = 0x0005 (ROK | TOK) ----------
+        mov r10, rbx;
+        add r10, 0x3C;                           // IMR offset
+        mov rax, 0x0005;                         // RTL8139_IMR_DEFAULT
+        mov_w [r10], rax;
+
+        // ---------- (6) CMD |= RE | TE (bits 3, 2) ----------
+        // TE (CmdTxEnb) must be set here: it is the only CMD write in
+        // this landing after probe's reset, and the device (QEMU's
+        // rtl8139_transmit_one() included) silently drops any
+        // TSD-triggered transmit while TE is clear -- tx.pdx never
+        // sets this bit itself.
+        mov r10, rbx;
+        add r10, 0x37;                           // CMD offset
+
+        mfence;
+        xor rax, rax;
+        mov_b rax, [r10];
+        mfence;
+
+        or rax, 0x0C;                            // CMD_RE | CMD_TE
+        mov_b [r10], rax;
+
+        // ---------- (7) Fingerprint: "rtl8139 rx init ok" ----------
+        mov rdi, 3;                              // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rtl8139_rx_init_ok_msg];
+        call klog_s1;
+
+        // ---------- (8) Return 0 ----------
+        xor rax, rax;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // rtl8139_rx_poll(bar_pa: u64) -> u64
+  //
+  // SysV: (bar_pa: u64) -> u64
+  //   rdi = BAR1 physical base (MMIO)
+  //   returns rax = number of frames dispatched to l2_rx_handle on
+  //                 this invocation (0 if the buffer was already empty
+  //                 on entry).
+  //
+  // Loop invariant (drain until CMD.BUFE == 1):
+  //   (a) header_pa = &_rtl8139_rx_buf + capr
+  //   (b) status = u16 @ header_pa+0; length = u16 @ header_pa+2
+  //   (c) if length < 60 or length > 1518 -> abort (§2 corruption gate)
+  //   (d) frame_pa = header_pa + 4, frame_len = length - 4 (strip CRC)
+  //   (e) l2_rx_handle(frame_pa, frame_len)
+  //   (f) capr = (capr + 4 + length + 3) & ~3, mod 8192
+  //   (g) CAPR (u16 @ bar+0x38) = (capr - 16) as u16 (bias per §1)
+  //   (h) count += 1
+  // Exit: fingerprint via klog_s1_d1(k_count, count); return count.
+  //
+  // Register plan (4-push callee-save + 8 B align pad):
+  //   rbx = bar_pa               (survives every nested call)
+  //   rbp = capr working cursor  (survives l2_rx_handle; written back
+  //                               to _rtl8139_capr at loop exit)
+  //   r12 = count of frames dispatched (return value accumulator)
+  //   r13 = per-frame length staging (survives l2_rx_handle so the
+  //         cursor advance in (4g) reads the original NIC-reported
+  //         length, not a possibly-clobbered rax)
+  //
+  //   4 pushes = 32 B; entry rsp%16==8 -> 40; sub rsp,8 -> 48, %16==0
+  //   (aligned for nested l2_rx_handle / klog_s1_d1). All nested
+  //   callees preserve rbx/rbp/r12/r13 per SysV. r13 must be pushed
+  //   here because THIS function is a leaf w.r.t. r13 (i.e. its own
+  //   caller expects r13 preserved across the call to rtl8139_rx_poll).
+  //
+  // Labels prefixed `rtl_rx_p_`.
+  // ============================================================================
+
+  pub let rtl8139_rx_poll : (u64) -> u64 !{sysreg, mem} @{sched} =
+    fn (bar_pa: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { sched },
+      justification: "R91.M4-002 (paideia-os #2026). Drain the RTL8139 RX buffer: while CMD.BUFE clear, read the 4-byte NIC header at rx_buf+capr, dispatch (frame_pa, frame_len-4) to l2_rx_handle, advance capr by (4 + length + 3) & ~3 modulo 8192, write CAPR = (capr - 16) as u16 (per §1 bias). Body: (1) 4-push (rbx=bar_pa, rbp=working capr cursor, r12=frame count, r13=per-frame length staging that survives l2_rx_handle) + sub rsp,8 = 40 B; entry rsp%16==8 -> 48, %16==0. (2) mov rbx, rdi (bar_pa); xor r12, r12 (count = 0). (3) Load starting capr from _rtl8139_capr into rbp. (4) Drain loop rtl_rx_p_loop: (4a) Read CMD u8 @ bar+0x37 via mfence + xor rax,rax + mov_b rax,[bar+0x37] + mfence; and rax, 0x01 (BUFE); jne rtl_rx_p_done (buffer empty -> exit drain). (4b) Compute header_pa = &_rtl8139_rx_buf + capr into r10 via lea + add rbp; NO gate on capr < 8192 here because the entry cursor is invariant-preserved by (f) mod 8192 below. (4c) Read length u16 @ r10+2 via xor rax,rax + mov_w rax,[r10+2] (no MMIO fence -- this is WB memory). (4d) Corruption gate: cmp rax, 60; jb rtl_rx_p_done (abort drain); cmp rax, 1518; ja rtl_rx_p_done (abort drain). Silent abort per §2 rationale; a pending IRQ will re-enter. (4e) Stash length in r13 briefly. (4f) Compute frame_pa = header_pa + 4 into rdi; frame_len = length - 4 into rsi. call l2_rx_handle. (4g) Advance capr: rbp = rbp + 4 + length; then align up mod 4: rbp = (rbp + 3) & ~3; then wrap: rbp = rbp mod 8192 via `and rbp, 0x1FFF` (8192 = 2^13, so mask 0x1FFF works because the alignment ensured rbp < 8192 * 2 -- see arg below). (4h) Write CAPR = (rbp - 16) truncated to u16: `mov rax, rbp; sub rax, 16; mov r10, rbx; add r10, 0x38; mov_w [r10], rax`. The sized mov_w store discards the upper 48 bits; if rbp==0 the sub yields a huge u64 whose low 16 are 0xFFF0, exactly the -16 the device expects (§1). (4i) add r12, 1; jmp rtl_rx_p_loop. Note on (4g) wrap correctness: the entry cursor rbp is < 8192 (invariant), 4 + length <= 4 + 1518 = 1522, +3 alignment = at most 1525. So the sum before wrap is < 8192 + 1525 = 9717, well under 16384. A single `and rbp, 0x1FFF` correctly wraps because at most one wrap-around can have occurred and the value never exceeds 2 * 8192. If capr enters this iteration at say 8000 and (4+length+3)&~3 = 1200, the sum is 9200; 9200 & 0x1FFF = 9200 - 8192 = 1008, which is the correct wrapped position. (5) rtl_rx_p_done: publish rbp back to _rtl8139_capr: `mov [rip + _rtl8139_capr], rbp`. (6) Emit fingerprint klog_s1_d1(LEVEL_INFO=3, SUBSYS_NET_, rtl8139_rx_poll_ok_msg, k_count, r12) -- r12 survives per SysV. (7) mov rax, r12; teardown. Encoder discipline: CMD MMIO read uses the mfence-bracketed dst-zero pattern from drivers/virtio_net/isr.pdx; WB buffer reads for status/length use plain `xor rax,rax; mov_w rax, [r10+off]` (no MMIO fence needed -- the buffer sits in identity-mapped WB memory that the device DMAs into; the CAPR write on the next IRQ is what publishes our consumption to the device). CAPR write via mov_w [r10], rax (u16 sized store, upper 48 bits discarded). No `add reg, [mem]`; every accumulate goes through rax. Reserved-label discipline: labels prefixed rtl_rx_p_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        sub rsp, 8;                              // rsp%16==0 for nested calls
+
+        mov rbx, rdi;                            // rbx = bar_pa
+        xor r12, r12;                            // r12 = frame count
+
+        // Load starting capr from the persistent driver-side cursor.
+        mov rbp, [rip + _rtl8139_capr];
+
+      rtl_rx_p_loop:
+        // ---------- (4a) Check CMD.BUFE -- exit drain if empty ----------
+        mov r10, rbx;
+        add r10, 0x37;                           // CMD offset
+        mfence;
+        xor rax, rax;
+        mov_b rax, [r10];
+        mfence;
+        and rax, 0x01;                           // BUFE bit
+        cmp rax, 0;
+        jne rtl_rx_p_done;                       // buffer empty -> done
+
+        // ---------- (4b) header_pa = &_rtl8139_rx_buf + capr ----------
+        lea r10, [rip + _rtl8139_rx_buf];
+        add r10, rbp;
+
+        // ---------- (4c) length = u16 @ header_pa+2 (WB memory read) ----------
+        xor rax, rax;
+        mov_w rax, [r10 + 2];
+
+        // ---------- (4d) Corruption gate: 60 <= length <= 1518 ----------
+        cmp rax, 60;
+        jb rtl_rx_p_done;                        // corrupt -> abort drain
+        cmp rax, 1518;
+        ja rtl_rx_p_done;                        // corrupt -> abort drain
+
+        // ---------- (4e) Stash length before dispatch ----------
+        mov r13, rax;                            // r13 = length (u16 zx)
+
+        // ---------- (4f) l2_rx_handle(frame_pa, frame_len) ----------
+        // frame_pa = header_pa + 4
+        mov rdi, r10;
+        add rdi, 4;
+        // frame_len = length - 4 (strip trailing CRC)
+        mov rsi, r13;
+        sub rsi, 4;
+        call l2_rx_handle;
+
+        // ---------- (4g) Advance capr = (capr + 4 + length + 3) & ~3, mod 8192 ----------
+        add rbp, 4;
+        add rbp, r13;                            // rbp = capr + 4 + length
+        add rbp, 3;
+        and rbp, 0xFFFFFFFFFFFFFFFC;             // ~3 -- 4-byte align up
+        and rbp, 0x1FFF;                         // mod 8192 (§justification)
+
+        // ---------- (4h) CAPR = (capr - 16) truncated to u16 ----------
+        mov rax, rbp;
+        sub rax, 16;
+        mov r10, rbx;
+        add r10, 0x38;                           // CAPR offset
+        mov_w [r10], rax;                        // sized u16 store
+
+        // ---------- (4i) Bump count and loop ----------
+        add r12, 1;
+        jmp rtl_rx_p_loop;
+
+      rtl_rx_p_done:
+        // ---------- (5) Persist capr back to the driver-side cursor ----------
+        mov [rip + _rtl8139_capr], rbp;
+
+        // ---------- (6) Fingerprint: "rtl8139 rx poll ok count=<n>" ----------
+        mov rdi, 3;                              // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rtl8139_rx_poll_ok_msg];
+        lea rcx, [rip + k_count];
+        mov r8, r12;                             // v1 = count
+        call klog_s1_d1;
+
+        // ---------- (7) Return count ----------
+        mov rax, r12;
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}

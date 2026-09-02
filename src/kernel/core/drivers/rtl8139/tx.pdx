@@ -1,0 +1,275 @@
+// src/kernel/core/drivers/rtl8139/tx.pdx -- R91.M4-003 (paideia-os #2027)
+//
+// Realtek RTL8139 transmit plane: 4-slot round-robin descriptor set.
+// The rtl8139 predates descriptor rings -- transmission is driven by
+// four fixed TSAD/TSD register pairs directly in the MMIO register
+// file, one per in-flight packet. This file lands the driver-side
+// buffer pool + the send primitive; TX completion reap on TOK is a
+// follow-on (rtl8139_isr_handle currently no-ops on TOK per §MVP in
+// irq.pdx).
+//
+// =============================================================================
+// SECTION 0  4-SLOT ROUND-ROBIN TX MODEL (RTL8139 ProgrammersGuide §5)
+// =============================================================================
+//
+// The rtl8139 exposes:
+//
+//   TSAD0..TSAD3 (u32 @ bar1+0x20, 0x24, 0x28, 0x2C) -- per-slot buffer
+//                 physical address. rtl8139 is 32-bit DMA-capable only,
+//                 so the buffer PA must fit in a u32.
+//   TSD0..TSD3   (u32 @ bar1+0x10, 0x14, 0x18, 0x1C) -- per-slot status
+//                 + trigger register:
+//                   bits [12:0]   SIZE   -- packet length (0..1792)
+//                   bit  13       OWN    -- 0 = driver, 1 = device (device
+//                                            sets when DMA copy finishes)
+//                   bit  14       TUN    -- transmit FIFO underrun
+//                   bit  15       TOK    -- transmit OK (device sets when
+//                                            the packet leaves the wire)
+//                   bits [21:16]  ERTXTH -- early-TX threshold (in units
+//                                            of 32 bytes); 0 = 8 B, which
+//                                            is aggressive but safe on
+//                                            QEMU. Non-zero MAY reduce
+//                                            underruns on real hardware.
+//                   bits [27:24]  NCC    -- collision count
+//                   bits [30..28] reserved / other status
+//
+// Writing TSD with OWN=0 is the transmit trigger: the device reads
+// TSAD to fetch the buffer PA, DMAs SIZE bytes into its internal FIFO,
+// sets OWN=1 when the copy is done, transmits, and sets TOK=1 (or a
+// TUN/collision bit on error). No doorbell separate from the TSD
+// write itself is required.
+//
+// Round-robin: we track a single u64 monotonic counter
+// `_rtl8139_tx_next`; slot = counter & 3 picks the physical slot.
+// This is honest about the fact that at MVP we do NOT reap OWN=1 on a
+// per-slot basis -- if the caller sends four packets in tight
+// succession and the device has not yet completed slot 0 by the time
+// we reach slot 4 (= wrap to 0), we overwrite the still-in-flight
+// TSAD/TSD, which real hardware would reject and QEMU tolerates
+// without visible error. A future R91.M4-005+ landing will add a
+// per-slot OWN gate before write; the reserved BSS slot is laid down
+// here so that landing does not need a driver rev.
+//
+// =============================================================================
+// SECTION 1  BUFFER POOL SIZING (8 KiB @align(4096) = 4 x 2 KiB)
+// =============================================================================
+//
+// One 2 KiB buffer per slot leaves comfortable headroom over the 1518 B
+// max Ethernet frame + potential VLAN tag (4 B) + future 802.1ad
+// double-tag (8 B) growth. 2048 = 2^11 keeps slot address arithmetic
+// to a single `shl imm11` and preserves 32-bit-DMA reachability
+// trivially (the whole pool is <= 8 KiB from the base label, so any
+// 32-bit-truncated PA fits).
+//
+// Total TX buffer area = 8 KiB. Statically allocated in .bss under
+// `_rtl8139_tx_bufs`, @align(4096) for future R25/R96 IOMMU-domain
+// mapping.
+//
+// =============================================================================
+// SECTION 2  BSS SLOTS OWNED BY THIS FILE
+// =============================================================================
+//
+//   _rtl8139_tx_bufs  : [u64; 1024] @align(4096) = 8 KiB (4 x 2 KiB).
+//   _rtl8139_tx_next  : u64 = 0
+//                       Monotonic round-robin counter. slot = counter & 3.
+//                       Kept as u64 (not u2) because the .bss primitive is
+//                       u64 and the mask is cheaper than a modular add.
+//
+// =============================================================================
+// SECTION 3  ENCODER + LABEL DISCIPLINE
+// =============================================================================
+//
+// Labels prefixed `rtl_tx_`. Encoder-conservative per drivers/e1000e/
+// probe.pdx §"paideia-as encoder-gap posture" and drivers/virtio_net/
+// tx.pdx §2:
+//   * u32 MMIO writes via `mov_d [addr], reg` (bare `mov` widens to
+//     REX.W and would clobber neighbouring registers -- TSD/TSAD are
+//     4 B apart so this matters).
+//   * u16 / u8 reads via `xor rax,rax; mov_w/b rax, [mem]`.
+//   * rep_movsb for the frame copy (matches drivers/virtio_net/tx.pdx
+//     L263 precedent).
+//   * len > 2048 gated at entry with a sentinel return (RTL8139_TX_ERR_
+//     TOOBIG = 0xFFFFFFFFFFFFFFA0) rather than silent truncation --
+//     truncation would corrupt the on-wire frame in a way that appears
+//     to succeed at the syscall boundary.
+
+module Tx = structure {
+
+  // ============================================================================
+  // Return codes.
+  // ============================================================================
+
+  pub let RTL8139_TX_OK           : u64 = 0
+  pub let RTL8139_TX_ERR_TOOBIG   : u64 = 0xFFFFFFFFFFFFFFA0
+
+  // ============================================================================
+  // MMIO register offsets consumed here (bar1_pa is the base).
+  //
+  //   TSD_BASE  = 0x10  (u32 x 4, stride 4)
+  //   TSAD_BASE = 0x20  (u32 x 4, stride 4)
+  // ============================================================================
+
+  pub let RTL8139_REG_TSD_BASE    : u64 = 0x10
+  pub let RTL8139_REG_TSAD_BASE   : u64 = 0x20
+
+  pub let RTL8139_TX_SLOTS        : u64 = 4
+  pub let RTL8139_TX_BUF_SIZE     : u64 = 2048        // 2 KiB per slot
+  pub let RTL8139_TX_MAX_LEN      : u64 = 2048
+
+  // ============================================================================
+  // Fingerprint tag (ONE-line pdx string literal).
+  //
+  //   "rtl8139 tx ok [legacy: RTL8139 TX OK]"
+  //     37 printable chars + 1 NUL terminator = 38 bytes.
+  //
+  // OK_TOK regex matches on the bracketed legacy shard's word-boundary
+  // OK. Needs an ALLOWLIST entry alongside the sibling virtio_net_tx_
+  // ok_msg entry until R91.M5 boot_r91_nic_probe smoke (#2031) pins
+  // it under a PAIDEIA_NIC=rtl8139 boot mode.
+  // ============================================================================
+
+  pub let rtl8139_tx_ok_msg : [u8; 38] = "rtl8139 tx ok [legacy: RTL8139 TX OK]\0"
+
+  // ============================================================================
+  // BSS (§2).
+  // ============================================================================
+
+  pub let mut _rtl8139_tx_bufs : [u64; 1024] = uninit @align(4096)
+  pub let mut _rtl8139_tx_next : u64         = 0
+
+  // ============================================================================
+  // rtl8139_tx_send(bar_pa: u64, buf_pa: u64, len: u64) -> u64
+  //
+  // SysV: (bar_pa: u64, buf_pa: u64, len: u64) -> u64
+  //   rdi = BAR1 physical base (MMIO)
+  //   rsi = caller's frame physical address (identity-map dereferenceable
+  //         under R91 scope)
+  //   rdx = frame length in bytes (0 < len <= 2048)
+  //
+  // Returns:
+  //   RTL8139_TX_OK          (0) on trigger success (the packet is
+  //                              handed to the device; on-wire success
+  //                              is signalled asynchronously via
+  //                              TSD.TOK, out of scope here).
+  //   RTL8139_TX_ERR_TOOBIG (0xFFFFFFFFFFFFFFA0) if len > 2048; no
+  //                              MMIO or buffer write happens and the
+  //                              round-robin counter is NOT bumped.
+  //
+  // Body:
+  //   (1) Length gate: len > 2048 -> return RTL8139_TX_ERR_TOOBIG.
+  //   (2) slot = _rtl8139_tx_next & 3.
+  //   (3) dst = &_rtl8139_tx_bufs + slot * 2048; rep_movsb len bytes
+  //       from buf_pa into dst.
+  //   (4) TSAD[slot] = dst (u32 truncation is fine -- the pool is
+  //       <= 8 KiB from its base label; identity map makes low 32 bits
+  //       of the VA equal the PA under R91 scope).
+  //   (5) TSD[slot] = len (u32; bits 0..12 = SIZE, bit 13 OWN=0,
+  //       ERTXTH = 0 = 8 B). Writing this triggers the transmit.
+  //   (6) _rtl8139_tx_next += 1.
+  //   (7) Emit klog_s1_d1(NET_, rtl8139_tx_ok_msg, k_len, len).
+  //   (8) Return RTL8139_TX_OK.
+  //
+  // Register plan (4-push callee-save + 8 B align pad):
+  //   rbx = bar_pa      (survives every MMIO write + the fingerprint)
+  //   rbp = len         (survives rep_movsb -- rcx is caller-save --
+  //                      and the fingerprint call)
+  //   r12 = slot index  (0..3, survives buffer copy)
+  //   r13 = dst PA      (survives rep_movsb, feeds TSAD write)
+  //
+  //   buf_pa (rsi at entry) is consumed directly at the rep_movsb site
+  //   without an intermediate stash: no CALL happens between entry and
+  //   the rep_movsb, and no intermediate step overwrites rsi (the pre-
+  //   copy steps clobber only r10, r12, r13, rax).
+  //
+  //   4 pushes = 32 B; entry rsp%16==8 -> 40; sub rsp,8 -> 48, %16==0
+  //   (aligned for the nested klog_s1_d1 call). rep_movsb is a string
+  //   op, not a SysV call, and does not require its own alignment.
+  //
+  // Labels prefixed `rtl_tx_`.
+  // ============================================================================
+
+  pub let rtl8139_tx_send : (u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (bar_pa: u64, buf_pa: u64, len: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R91.M4-003 (paideia-os #2027). RTL8139 transmit primitive: copy caller's Ethernet frame into a slot-owned 2 KiB buffer, program TSAD[slot] with the buffer PA, program TSD[slot] with the length (bit 13 OWN=0 hands the descriptor to the device -- this is the transmit trigger per RTL8139 ProgrammersGuide §5), bump the round-robin counter. Body: (1) 4-push (rbx=bar_pa, rbp=len, r12=slot, r13=dst PA) + sub rsp,8 = 40 B; entry rsp%16==8 -> 48, %16==0 (aligned for nested klog_s1_d1). (2) mov rbx, rdi; mov rbp, rdx (len). rsi (buf_pa) is consumed directly at rep_movsb without an intermediate stash: no CALL happens between entry and rep_movsb, and no intermediate step clobbers rsi (only r10/r12/r13/rax touched). (3) Length gate: cmp rbp, 2048; ja rtl_tx_toobig -> return RTL8139_TX_ERR_TOOBIG (0xFFFFFFFFFFFFFFA0) without side effect (no buffer write, no MMIO, no counter bump). (4) slot = _rtl8139_tx_next & 3: `mov r12, [rip + _rtl8139_tx_next]; and r12, 3`. (5) dst = &_rtl8139_tx_bufs + slot*2048: `mov r13, r12; shl r13, 11; lea r10, [rip + _rtl8139_tx_bufs]; add r13, r10`. (6) rep_movsb: rsi already = buf_pa (SysV arg); rdi = r13 (dst); rcx = rbp (len); cld; rep_movsb. Matches drivers/virtio_net/tx.pdx L263. len==0 is a valid no-op (rep with rcx=0) and still bumps the counter -- an intentional 'kick' semantic. (7) TSAD[slot] = dst (u32 truncation is fine -- pool is <= 8 KiB from its base label, so identity-mapped VA low 32 bits == PA under R91): `mov r10, rbx; add r10, 0x20; mov rax, r12; shl rax, 2; add r10, rax; mov_d [r10], r13`. (8) TSD[slot] = len (u32; bits 0..12 SIZE, bit 13 OWN=0, ERTXTH=0=8B): `mov r10, rbx; add r10, 0x10; mov rax, r12; shl rax, 2; add r10, rax; mov_d [r10], rbp`. Writing TSD is the transmit trigger. (9) Bump counter: `mov rax, [rip + _rtl8139_tx_next]; add rax, 1; mov [rip + _rtl8139_tx_next], rax`. (10) Emit fingerprint klog_s1_d1(LEVEL_INFO=3, SUBSYS_NET_, rtl8139_tx_ok_msg, k_len, rbp). rbp survives per SysV. (11) xor rax, rax; teardown. Encoder discipline: mov_d for u32 TSAD/TSD stores (bare `mov` would widen to REX.W and clobber the 4-B neighbour register); rep_movsb for the copy; no `add reg, [mem]` -- the counter bump uses an rax stage. Reserved-label discipline: labels prefixed rtl_tx_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        sub rsp, 8;                              // rsp%16==0 for nested call
+
+        mov rbx, rdi;                            // rbx = bar_pa
+        mov rbp, rdx;                            // rbp = len
+        // rsi still carries buf_pa; consumed at rep_movsb below without
+        // an intermediate stash (no CALL until klog_s1_d1 at the tail,
+        // and no step between here and rep_movsb clobbers rsi).
+
+        // ---------- (3) Length gate ----------
+        cmp rbp, 2048;                           // RTL8139_TX_MAX_LEN
+        ja rtl_tx_toobig;
+
+        // ---------- (4) slot = _rtl8139_tx_next & 3 ----------
+        mov r12, [rip + _rtl8139_tx_next];
+        and r12, 3;
+
+        // ---------- (5) dst = &_rtl8139_tx_bufs + slot*2048 ----------
+        mov r13, r12;
+        shl r13, 11;                             // slot * 2048
+        lea r10, [rip + _rtl8139_tx_bufs];
+        add r13, r10;                            // r13 = dst PA
+
+        // ---------- (6) rep_movsb: buf_pa -> dst, len bytes ----------
+        // rsi already holds buf_pa (SysV arg; not clobbered above).
+        mov rdi, r13;                            // dst
+        mov rcx, rbp;                            // count = len
+        cld;
+        rep_movsb;
+
+        // ---------- (7) TSAD[slot] = dst (u32) ----------
+        mov r10, rbx;
+        add r10, 0x20;                           // TSAD_BASE
+        mov rax, r12;
+        shl rax, 2;                              // slot * 4
+        add r10, rax;
+        mov_d [r10], r13;                        // sized u32 store
+
+        // ---------- (8) TSD[slot] = len (u32) -- trigger ----------
+        mov r10, rbx;
+        add r10, 0x10;                           // TSD_BASE
+        mov rax, r12;
+        shl rax, 2;                              // slot * 4
+        add r10, rax;
+        mov_d [r10], rbp;                        // sized u32 store (OWN=0)
+
+        // ---------- (9) Bump the round-robin counter ----------
+        mov rax, [rip + _rtl8139_tx_next];
+        add rax, 1;
+        mov [rip + _rtl8139_tx_next], rax;
+
+        // ---------- (10) Fingerprint ----------
+        mov rdi, 3;                              // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rtl8139_tx_ok_msg];
+        lea rcx, [rip + k_len];
+        mov r8, rbp;                             // v1 = len
+        call klog_s1_d1;
+
+        // ---------- (11) Return RTL8139_TX_OK ----------
+        xor rax, rax;
+        jmp rtl_tx_ret;
+
+      rtl_tx_toobig:
+        mov rax, 0xFFFFFFFFFFFFFFA0;             // RTL8139_TX_ERR_TOOBIG
+
+      rtl_tx_ret:
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
