@@ -235,6 +235,14 @@ module Tcp = structure {
   pub let mut _tcp_rx_no_socket   : u64 = 0
   pub let mut _tcp_tx_pkts        : u64 = 0
   pub let mut _tcp_retransmits    : u64 = 0
+  // paideia-os #2221 D4: rate-limit gate for tag_l3_tcp emission from
+  // tcp_rx_handle's wire-entry wrapper. Holds the _tick_count value at
+  // the last emission; each entry recomputes _tick_count - this and
+  // skips the klog_s1 call when the delta is < 100 (once-per-second at
+  // the 100 Hz LAPIC-fed tick). Initial 0 makes the first meaningful
+  // wire packet always emit (delta == _tick_count, which crosses 100
+  // within ~1s of boot).
+  pub let mut _tcp_rx_emit_last_tick : u64 = 0
 
   // ============================================================================
   // tcp_tcb_ptr(tcb_idx) -> row pointer. Pure leaf; exported for
@@ -328,15 +336,21 @@ module Tcp = structure {
   pub let tcp_free_tcb : (u64) -> () !{mem} @{} =
     fn (tcb_idx: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "R72.M1-001 (#1923): clear in_use and state for tcb_idx, returning the row to tcp_alloc_tcb's free scan. Does not zero the full row here (tcp_alloc_tcb zeroes on (re)allocation instead) -- avoids a double zero-pass on the common close-then-reuse path. Leaf.",
+      justification: "R72.M1-001 (#1923) + paideia-os #2221 D1: zero the ENTIRE 512-byte row on free (not just state+in_use). Prior shape cleared only state @+0 and in_use @+168, leaving snd_una / snd_nxt / rto_deadline / local_ip / remote_ip / last_seg_* live in the row -- so a stale post-close row could satisfy tcp_poll_retransmits' rto_check (snd_una != snd_nxt AND rto_deadline <= _tick_count) AND tcp_retransmit_last's loopback fast-path check (local_ip == remote_ip when both are the zero-pattern IP the row shipped with). Zeroing the whole row makes every retransmit-gate predicate structurally false after free: state==0 (fails R94-FIX-002 filter), snd_una==snd_nxt==0 (fails tpr_check_rto), local_ip and remote_ip both zero but there's no unacked data anyway. Matches tcp_alloc_tcb's tcp_alloc_zero pattern (line ~289): 8-byte stride store loop with SIB [base+index], upper-bound 512. Leaf.",
       block: {
         mov rax, rdi;
         shl rax, 9;
         lea rcx, [rip + _tcp_tcb_table];
-        add rcx, rax;
+        add rcx, rax;                        // rcx = row base
         xor rax, rax;
-        mov [rcx + 168], rax;
-        mov [rcx + 0], rax;
+        xor rdx, rdx;
+      tcpf_zero:
+        cmp rdx, 512;
+        jae tcpf_zero_done;
+        mov [rcx + rdx], rax;
+        add rdx, 8;
+        jmp tcpf_zero;
+      tcpf_zero_done:
         ret
       }
     }
@@ -901,11 +915,20 @@ module Tcp = structure {
         xor rax, rax; mov_b rax, [rbp + 26]; xor rcx, rcx; mov_b rcx, [rbp + 34]; cmp rax, rcx; jne trxm_wire;
         xor rax, rax; mov_b rax, [rbp + 27]; xor rcx, rcx; mov_b rcx, [rbp + 35]; cmp rax, rcx; jne trxm_wire;
 
+        // paideia-os #2221 D2: retransmit-loopback dispatches to
+        // tcp_rx_deliver, NOT tcp_rx_handle. Retransmit re-injection is
+        // NOT a wire arrival: bumping _tcp_rx_pkts here would inflate
+        // RX stats on every RTO fire, and emitting tag_l3_tcp (even
+        // rate-limited) would flag the loopback re-play as an incoming
+        // packet in the fingerprint stream. Delivery semantics (4-tuple
+        // resolve + tcp_process_segment) are unchanged -- the wrapper's
+        // klog + counter are the only thing skipped. See tcp_rx_handle
+        // vs tcp_rx_deliver split below.
         lea rdi, [rip + _tcp_tx_scratch];
         mov rsi, r14; add rsi, 20;
         lea rdx, [rbp + 24];
         lea rcx, [rbp + 24];
-        call tcp_rx_handle;
+        call tcp_rx_deliver;
         jmp trxm_done;
 
       trxm_wire:
@@ -1227,18 +1250,110 @@ module Tcp = structure {
   // tcp_rx_handle(pkt_pa, pkt_len, src_ip_ptr, dst_ip_ptr) -> u64
   // ============================================================================
   //
-  // Entry point matching ipv4_rx_handle's udp_rx_handle/icmp_rx_handle
-  // calling convention: pkt_pa points at the TCP header (frame_pa + 14 +
-  // 20 for a real wire frame, or _tcp_tx_scratch for the loopback fast
-  // path), pkt_len is the TCP header+payload length, src_ip_ptr/
-  // dst_ip_ptr point at 4-byte IPv4 addresses. Resolves the 4-tuple to
-  // an established TCB first, then to a LISTEN TCB (spawning a fresh
-  // child TCB + SYN|ACK reply on a bare SYN), else drops.
+  // paideia-os #2221 D2: WIRE-ENTRY WRAPPER. This is the "packet arrived
+  // from the wire" surface -- called by ipv4_rx_handle's proto=6 arm and
+  // by tcp_send_segment's loopback fast-path (a legitimate self-connect
+  // model still routes THROUGH this shape). Its ONLY job is to:
+  //   (1) rate-limit-gated emit of tag_l3_tcp   (paideia-os #2221 D4)
+  //   (2) bump _tcp_rx_pkts (the wire-arrival counter)
+  //   (3) delegate to tcp_rx_deliver for the actual segment processing
+  //
+  // Retransmit-loopback (tcp_retransmit_last's local_ip==remote_ip
+  // fast path) bypasses this wrapper and calls tcp_rx_deliver directly
+  // -- a re-injection is not a wire arrival, so it neither emits nor
+  // bumps the counter.
+  //
+  // Frame prologue: 4-push callee-save (rbx=pkt_pa, r12=pkt_len,
+  // r13=src_ip_ptr, r14=dst_ip_ptr) + sub rsp,8 pad. Entry rsp%16==8,
+  // 4 pushes (32B) -> rsp%16==8, sub 8 -> rsp%16==0 across the nested
+  // klog_s1 / tcp_rx_deliver calls. All four incoming args are moved
+  // into callee-save regs BEFORE the klog_s1 call so klog_s1's caller-
+  // save clobber cannot lose them before the tcp_rx_deliver delegation
+  // restores them into rdi/rsi/rdx/rcx. Reserved labels: trh_.
 
   pub let tcp_rx_handle : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
     fn (pkt_pa: u64, pkt_len: u64, src_ip: u64, dst_ip: u64) -> unsafe {
       effects: {sysreg, mem}, capabilities: {},
-      justification: "R72.M1-001/002 (#1923/#1924): TCP receive engine. Parses the 20-byte header in place (no scratch copy -- pkt_pa is kept live in a callee-save register and indexed directly), resolves the segment to a TCB via the established 4-tuple lookup first and the LISTEN local_port lookup second, and either dispatches to tcp_process_segment (established match) or spawns a fresh child TCB in SYN_RCVD + replies SYN|ACK (listener match on a bare SYN) or drops (no match, or a non-SYN segment addressed to a listener -- simultaneous-open is out of scope for this MVP). 6-push callee-save (rbx=pkt_pa, rbp=pkt_len UNTIL payload_len is computed and stored, then REPURPOSED as the freshly-allocated child TCB pointer in the listener branch -- pkt_len has no further use past that point; r12=src_ip_ptr, r13=dst_ip_ptr, r14=src_port, r15=dst_port) + `sub rsp,56` for seven 8-byte stack scratch slots (seq/ack/flags/payload_pa/payload_len/listener_idx/child_idx) -- 48+56=104; entry rsp%16==8 -> 112, %16==0 for the nested tcp_find_tcb_established/tcp_find_tcb_listen/tcp_alloc_tcb/tcp_next_iss/tcp_process_segment/tcp_send_segment calls. Two internal TCB-row-pointer computations (listener_ptr, child_ptr) are done via INLINE arithmetic rather than calling tcp_tcb_ptr, specifically to avoid the caller-save-register-clobbered-across-a-call hazard a second live pointer in a caller-save register would create. Reserved labels: trh_.",
+      justification: "R72.M1-001/002 (#1923/#1924) + paideia-os #2221 D2/D4: wire-entry wrapper around tcp_rx_deliver. Splits the emit + bump (wire-arrival signalling) from the delivery core (4-tuple resolve + tcp_process_segment / listener child alloc), so a loopback re-injection from tcp_retransmit_last does NOT inflate _tcp_rx_pkts nor flag the retransmit as an incoming packet in the fingerprint stream. D4: gates tag_l3_tcp emit on a 100-tick (~1s at 100 Hz LAPIC) delta against _tcp_rx_emit_last_tick, capping the wire-side spam under real inbound traffic. 4-push callee-save (rbx=pkt_pa, r12=pkt_len, r13=src_ip_ptr, r14=dst_ip_ptr) + sub rsp,8 -- 32+8=40; entry rsp%16==8 -> after 4 pushes %16==8, sub 8 -> %16==0 for the klog_s1 / tcp_rx_deliver calls. Reserved labels: trh_. Wraps tcp_rx_deliver which retains the full 6-push + 56-byte-stack pre-fix frame.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+        mov r13, rdx;
+        mov r14, rcx;
+
+        // paideia-os #2221 D4: rate-limit tag_l3_tcp emission. Skip when
+        // delta since last emit is < 100 ticks (~1s at 100 Hz LAPIC).
+        // On the first emit the stored last_tick jumps from 0 to
+        // _tick_count; subsequent gates then require another 100 ticks.
+        mov rax, [rip + _tick_count];
+        mov rcx, [rip + _tcp_rx_emit_last_tick];
+        sub rax, rcx;
+        cmp rax, 100;
+        jb trh_skip_emit;
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + tag_l3_tcp];
+        call klog_s1;
+
+        mov rax, [rip + _tick_count];
+        mov [rip + _tcp_rx_emit_last_tick], rax;
+
+      trh_skip_emit:
+        // Bump _tcp_rx_pkts (unconditional per wire-arrival) BEFORE
+        // delegating to tcp_rx_deliver -- the counter is per-entry,
+        // and the delivery core has no need to know whether it was
+        // invoked via the wire wrapper or via a loopback re-injection.
+        mov rax, [rip + _tcp_rx_pkts];
+        add rax, 1;
+        mov [rip + _tcp_rx_pkts], rax;
+
+        // Restore the incoming ABI-arg registers and tail-delegate.
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        mov rcx, r14;
+        call tcp_rx_deliver;
+
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_rx_deliver(pkt_pa, pkt_len, src_ip_ptr, dst_ip_ptr) -> u64
+  // ============================================================================
+  //
+  // The DELIVERY core split out of tcp_rx_handle by paideia-os #2221 D2.
+  // Same calling convention: pkt_pa points at the TCP header (frame_pa
+  // + 14 + 20 for a real wire frame, or _tcp_tx_scratch for the loopback
+  // fast path), pkt_len is the TCP header+payload length, src_ip_ptr/
+  // dst_ip_ptr point at 4-byte IPv4 addresses. Resolves the 4-tuple to
+  // an established TCB first, then to a LISTEN TCB (spawning a fresh
+  // child TCB + SYN|ACK reply on a bare SYN), else drops.
+  //
+  // Callers:
+  //   - tcp_rx_handle (wrapper above): wire arrivals via
+  //     ipv4_rx_handle's proto=6 arm, and self-connect loopback via
+  //     tcp_send_segment's loopback fast-path -- both cases go through
+  //     the wrapper so the emit + bump land.
+  //   - tcp_retransmit_last (loopback fast path): direct call, no emit,
+  //     no bump -- a retransmit re-injection is not a wire arrival.
+
+  pub let tcp_rx_deliver : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (pkt_pa: u64, pkt_len: u64, src_ip: u64, dst_ip: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "R72.M1-001/002 (#1923/#1924) + paideia-os #2221 D2: TCP receive engine, delivery core (split out of the pre-#2221 tcp_rx_handle by D2, which moved the tag_l3_tcp emit and _tcp_rx_pkts bump into a wire-entry wrapper of the same name). Parses the 20-byte header in place (no scratch copy -- pkt_pa is kept live in a callee-save register and indexed directly), resolves the segment to a TCB via the established 4-tuple lookup first and the LISTEN local_port lookup second, and either dispatches to tcp_process_segment (established match) or spawns a fresh child TCB in SYN_RCVD + replies SYN|ACK (listener match on a bare SYN) or drops (no match, or a non-SYN segment addressed to a listener -- simultaneous-open is out of scope for this MVP). 6-push callee-save (rbx=pkt_pa, rbp=pkt_len UNTIL payload_len is computed and stored, then REPURPOSED as the freshly-allocated child TCB pointer in the listener branch -- pkt_len has no further use past that point; r12=src_ip_ptr, r13=dst_ip_ptr, r14=src_port, r15=dst_port) + `sub rsp,56` for seven 8-byte stack scratch slots (seq/ack/flags/payload_pa/payload_len/listener_idx/child_idx) -- 48+56=104; entry rsp%16==8 -> 112, %16==0 for the nested tcp_find_tcb_established/tcp_find_tcb_listen/tcp_alloc_tcb/tcp_next_iss/tcp_process_segment/tcp_send_segment calls. Two internal TCB-row-pointer computations (listener_ptr, child_ptr) are done via INLINE arithmetic rather than calling tcp_tcb_ptr, specifically to avoid the caller-save-register-clobbered-across-a-call hazard a second live pointer in a caller-save register would create. Reserved labels: trh_ (retained across the split; the wire wrapper above uses trh_skip_emit only).",
       block: {
         push rbx;
         push rbp;
@@ -1255,11 +1370,6 @@ module Tcp = structure {
 
         cmp rbp, 20;
         jb trh_malformed;
-
-        mov rdi, 3;
-        lea rsi, [rip + SUBSYS_NET_];
-        lea rdx, [rip + tag_l3_tcp];
-        call klog_s1;
 
         xor rax, rax; mov_b rax, [rbx + 0]; shl rax, 8; xor rcx, rcx; mov_b rcx, [rbx + 1]; or rax, rcx; mov r14, rax;
         xor rax, rax; mov_b rax, [rbx + 2]; shl rax, 8; xor rcx, rcx; mov_b rcx, [rbx + 3]; or rax, rcx; mov r15, rax;
@@ -1403,9 +1513,10 @@ module Tcp = structure {
         jmp trh_done;
 
       trh_done:
-        mov rcx, [rip + _tcp_rx_pkts];
-        add rcx, 1;
-        mov [rip + _tcp_rx_pkts], rcx;
+        // paideia-os #2221 D2: _tcp_rx_pkts bump lives in the wire-entry
+        // wrapper (tcp_rx_handle) so a retransmit-loopback re-injection
+        // -- which calls tcp_rx_deliver directly -- does NOT inflate
+        // the wire-arrival counter.
 
         add rsp, 56;
         pop r15;
