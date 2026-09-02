@@ -58,22 +58,43 @@ userspace-safe wrappers around the `argon2`, `chacha20poly1305`, and
 
 ### 3.1 Crypto shim (Argon2id + ChaCha20-Poly1305)
 
-**Owner:** `paideia-as` workspace, in-place extension of the existing
-`paideia-as-crypto` crate.
+**Owner:** `paideia-as` workspace. The crypto crate itself
+(`paideia-as-crypto`) remains a pure `no_std + alloc` **rlib**; the
+satellite-linkable archive is produced by a distinct wrapper crate
+(`paideia-satellite-runtime`) that consumes the crypto rlib as a
+path dep. See the 0.29.1 restructure entry in `CHANGELOG.md`.
 
-**Physical change:** add `crate-type = ["rlib", "staticlib"]` to the
-`[lib]` stanza (currently implicit rlib). Cargo's second build target
-emits `target/release/libpaideia_as_crypto.a`. The kernel build
-continues to consume the rlib exactly as today; satellites consume the
-staticlib.
+**Physical change:** `paideia-as-crypto`'s `[lib] crate-type` stays
+`["rlib"]`. A separate crate `paideia-satellite-runtime` sets
+`crate-type = ["staticlib"]` and depends on `paideia-as-crypto` via
+`path = "../paideia-as-crypto"`. Cargo consequently emits
+`target/release/libpaideia_satellite_runtime.a` carrying the crypto
+FFI thunks (re-exported at Rust level via `pub use`), the fail-closed
+mldsa65 stub, AND the small no_std runtime infrastructure the Rust
+compiler demands of every staticlib crate — `#[global_allocator]`,
+`#[panic_handler]`, and a `rust_eh_personality` stub. The kernel
+build continues to consume `paideia-as-crypto` as an rlib; satellites
+consume the wrapper archive.
+
+**Why not emit both rlib and staticlib from `paideia-as-crypto`
+directly?** Attempted in 0.29.0/0.29.1; failed at compile time.
+Emitting a bare staticlib forces the Rust compiler to require
+`#[global_allocator]` + `#[panic_handler]` + `panic = "abort"` inside
+the crate producing the staticlib — decisions that belong to the
+final ELF, not to a leaf crypto library. The corrected shape puts
+those runtime pieces in the wrapper crate where they belong.
 
 **Rationale for a single source of truth:** ChaCha20-Poly1305 (RFC
 8439) and Argon2id (RFC 9106) are wire-defined — but only up to a
 correct implementation. Any divergence between a "kernel body" and a
 "satellite body" would silently break the cross-domain readback
 contract (`mkfs --encrypt` on the host, `mount` in the kernel).
-Reusing the same crate as both `.rlib` and `.a` reduces that risk to
-zero at negligible engineering cost.
+Reusing the same rlib crate under both link paths — kernel rlib
+consumer directly, satellite via the wrapping staticlib — reduces
+that risk to zero at negligible engineering cost. Cargo's dependency
+graph enforces the invariant: there is exactly one Rust source of
+the AEAD and Argon2id bodies in the workspace, and both link paths
+draw from it.
 
 **Alternative rejected:** a bespoke satellite `paideia-satellite-crypto`
 crate. Rejected because two crates encoding the same RFCs will
@@ -166,14 +187,22 @@ add `AUDIT_MODE=file` writing to `$XDG_STATE_HOME/paideia/tool-audit.jsonl`.
 
 - **Repo:** `paideia-as` (github.com/paideia-os/paideia-as)
 - **New files:** none in `paideia-as-crypto/`; one new crate
-  `crates/paideia-satellite-runtime/` with `src/lib.rs` (re-export
-  + fail-closed `mldsa65_sign_runtime_entry`) and `Cargo.toml`
-  (crate-type staticlib, minimal deps).
+  `crates/paideia-satellite-runtime/` with `src/lib.rs` (re-exports
+  + fail-closed `mldsa65_sign_runtime_entry` + no_std runtime
+  infrastructure: bump allocator, panic handler, eh_personality stub)
+  and `Cargo.toml` (crate-type staticlib, minimal deps — just the
+  path dep on `paideia-as-crypto`).
 - **Artifacts published under `tools/paideia-as/target/release/`:**
-  - `libpaideia_as_crypto.a` — the three crypto symbols.
-  - `libpaideia_satellite_runtime.a` — re-exports the crypto three
-    (via `pub use` at Rust-level so `ld` finds one definition) plus
-    the fail-closed `mldsa65_sign_runtime_entry`.
+  - `libpaideia_satellite_runtime.a` — the single satellite-linkable
+    archive. Carries the three crypto FFI thunks (re-exported via
+    `pub use` at Rust level, so `ld` sees exactly one definition of
+    each — the original `#[unsafe(no_mangle)]` in
+    `paideia-as-crypto::ffi`), the fail-closed
+    `mldsa65_sign_runtime_entry`, and the small no_std runtime pieces
+    (bump allocator + `#[panic_handler]` + `rust_eh_personality`).
+    No separate `libpaideia_as_crypto.a` is emitted — the crypto
+    crate is rlib-only and its object code reaches satellites only
+    through the wrapping staticlib.
 - **Symbol signatures (SysV x86_64):**
 
   ```
@@ -199,11 +228,58 @@ add `AUDIT_MODE=file` writing to `$XDG_STATE_HOME/paideia/tool-audit.jsonl`.
   These are verified against the on-tree `#[no_mangle] extern "C"`
   definitions; the shim MUST NOT re-derive them.
 
-- **Userspace safety:** confirmed. The crypto crate depends only on
-  `argon2`, `chacha20poly1305`, `thiserror`; all pure-Rust, `no_std +
-  alloc`. The satellite-runtime crate depends only on `ml-dsa` (for
-  when the full-signer variant is toggled on) plus the crypto
-  re-export. No kernel primitive, no OS-specific syscall.
+- **Userspace safety (post-0.29.1 refactor, second pass):** the
+  crypto crate depends only on `argon2`, `chacha20poly1305`,
+  `thiserror`. All three are pure-Rust and support `no_std + alloc`
+  when their default features are turned off — which is the shape
+  `paideia-as-crypto` pins in its own `Cargo.toml`. Under
+  `#![cfg_attr(not(test), no_std)]` the compiled rlib carries no
+  `std` / libc / `_Unwind_*` scaffolding; CPUID feature detection in
+  `rng::hardware` is done via hand-rolled
+  `core::arch::x86_64::__cpuid` / `__cpuid_count` (RDRAND: leaf 1 ECX
+  bit 30; RDSEED: leaf 7 sub-0 EBX bit 18) rather than through
+  `std::is_x86_feature_detected!`, matching Intel SDM Vol. 2A §3.2
+  table 3-8. The wrapping `paideia-satellite-runtime` staticlib
+  adds:
+    * A hand-rolled bump allocator over a 4 MiB static byte pool
+      (`AtomicUsize`-serialized offset, no free) as
+      `#[global_allocator]`. Rationale on the sizing and the
+      no-free tradeoff in the module doc comment; short version:
+      satellite tools are one-shot processes with a bounded heap
+      footprint, and a bump allocator is the smallest thing that
+      satisfies the compiler's requirement without adding a Rust
+      dep. A `linked-list-allocator` swap behind an off-by-default
+      feature is the escape hatch if a future long-running
+      satellite needs reclamation.
+    * A `#[panic_handler]` that halts the current thread via inline
+      `hlt` in an infinite loop. Abort-shape by construction — no
+      partial state is committed after a panicked Rust primitive
+      returns.
+    * An empty `rust_eh_personality` symbol exported via
+      `#[unsafe(no_mangle)]` as a defensive stub, in case a
+      non-lockstep toolchain revision emits a `.eh_frame` FDE
+      referencing it. `panic = "abort"` at the workspace release
+      profile ensures the compiler does not itself emit unwind
+      tables that would call the personality routine.
+  **This was not the starting posture.** The 0.29.0 landing added
+  `crate-type = ["rlib", "staticlib"]` to `paideia-as-crypto` on the
+  assumption that the crate was already `no_std + alloc`. The
+  0.29.1 first pass fixed the `no_std + alloc` claim but kept the
+  dual crate-type on the crypto crate, which then failed to
+  compile: emitting a bare staticlib forces the compiler to require
+  `#[global_allocator]` + `#[panic_handler]` + `panic = "abort"`
+  inside the emitting crate, and those decisions do not belong to a
+  leaf crypto library. The 0.29.1 second pass (this section)
+  moved the staticlib emission (and the three runtime pieces) to
+  `paideia-satellite-runtime`, leaving `paideia-as-crypto` as an
+  rlib-only build. Load-bearing distinction: the underlying
+  requirement is a **link-time correctness** constraint for
+  satellite `-nostdlib` builds, not the archive-size concern §9
+  previously labelled it. The satellite-runtime crate declares no
+  additional Rust dependencies of its own (deliberately NO `ml-dsa`;
+  see §3.2 for the rationale — the current fail-closed satellite
+  stub returns `PDX_MLDSA_ERR_NO_SIGNER = -6` without touching any
+  signer library). No kernel primitive, no OS-specific syscall.
 - **Satellite consumption:** `tools/build.sh` gains `--extra-archive
   PATH` (repeatable). Invocation: `bash tools/build.sh --extra-obj-dir
   ../libpdx-volume/build-out --extra-archive $PAS_TARGET/libpaideia_satellite_runtime.a`.
@@ -240,15 +316,23 @@ add `AUDIT_MODE=file` writing to `$XDG_STATE_HOME/paideia/tool-audit.jsonl`.
 Dependency-aware sequence. Each step is a distinct PR / issue closure.
 
 1. **paideia-as** — audit `paideia-as-crypto` for `no_std` + `alloc`
-   compatibility if not already, then add `crate-type = ["rlib",
-   "staticlib"]`. Runs alongside a new smoke test that links a tiny
-   C program against the staticlib. Version bump paideia-as →
-   0.29.0. No paideia-os change yet.
+   compatibility; keep the crate `crate-type = ["rlib"]` (i.e. do
+   NOT emit a staticlib from this crate — see §3.1 rationale). No
+   crypto-crate `.a` is emitted; the satellite-linkable archive is
+   produced downstream by `paideia-satellite-runtime`. Version bump
+   paideia-as → 0.29.0. No paideia-os change yet.
 2. **paideia-as** — new crate `paideia-satellite-runtime` per §4.1.
-   Same 0.29.0 tag. Reuses (1)'s crypto crate; drops in the
-   fail-closed mldsa65 stub.
-3. **paideia-os** — bump the paideia-as submodule to 0.29.0. Kernel
-   build unaffected (rlib path unchanged).
+   Same 0.29.0 tag. Reuses (1)'s crypto rlib via a `path` dep, adds
+   the fail-closed mldsa65 stub, and provides the no_std runtime
+   pieces the Rust compiler requires of every staticlib crate
+   (`#[global_allocator]`, `#[panic_handler]`, `rust_eh_personality`).
+   Workspace `[profile.release]` gains `panic = "abort"` in the same
+   landing (Cargo does not allow `panic` in per-package profile
+   overrides).
+3. **paideia-os** — bump the paideia-as submodule to 0.29.0 (or
+   0.29.1 after the runtime-infrastructure follow-up). Kernel
+   build unaffected (rlib path unchanged; release-profile abort
+   matches kernel semantics).
 4. **libpdx-audit** — land the two new `.pdx` modules and the
    `--profile=satellite` build path per §4.2. Version 1.1.0.
    Zero kernel-side change; existing kernel build's default profile
@@ -299,8 +383,11 @@ capability wave — and closing it unblocks smoke-runs for the entire
 - **R1 — Byte-match on cross-domain volumes.** If satellite crypto
   and kernel crypto ever diverge, a volume `mkfs`'d on the host is
   unreadable by the kernel-side `mount`. **Mitigation:** single
-  Rust crate emitting both `.rlib` and `.a` (§3.1). Divergence is
-  physically impossible without editing the shared crate.
+  Rust rlib (`paideia-as-crypto`) drawn from cargo's dependency
+  graph by both the kernel-side consumer (`paideia-as-runtime`) and
+  the satellite-side wrapper (`paideia-satellite-runtime`, which
+  emits the staticlib satellites actually link against). Divergence
+  is physically impossible without editing the shared rlib.
 - **R2 — Symbol version drift.** Satellite `.a` shipped by an older
   paideia-as could disagree with a newer paideia-as-emitted `.o`
   on struct layout (e.g. `Argon2idParamsC` field order). **Mitigation:**
@@ -318,11 +405,19 @@ capability wave — and closing it unblocks smoke-runs for the entire
   unverifiable. **Mitigation:** the §3.2 one-line propagation must
   land in the same wave as the shim; softarch to verify with a
   targeted test.
-- **R5 — Host-toolchain footprint.** `libpaideia_as_crypto.a` will
-  carry compiler-rt / core::panic scaffolding into every satellite
-  ELF. Acceptable for bootstrap (`/bin` binaries are already several
-  hundred KB). Revisit only if satellite ELF size becomes a
-  measured constraint.
+- **R5 — Host-toolchain footprint.** After the 0.29.1 refactor
+  (second pass) `libpaideia_satellite_runtime.a` is a `no_std +
+  alloc` build carrying no libc / std / `_Unwind_*` scaffolding of
+  its own; the `#[global_allocator]` (4 MiB bump pool), the
+  `#[panic_handler]` (inline `hlt`), and the `rust_eh_personality`
+  stub all live inside the wrapper crate itself so satellite ELFs
+  need not supply them. Bootstrap-size posture: the archive adds
+  ~4 MiB of zero-initialised BSS (the bump pool) plus a few dozen
+  bytes of code for the allocator, panic handler, and personality
+  stub. `/bin` binaries are already several hundred KB and no
+  measured constraint is set; the 4 MiB BSS does not inflate the
+  on-disk ELF, only the runtime footprint. Revisit only if
+  satellite ELF size or RSS becomes a stated bound.
 - **R6 — Satellite/kernel wire divergence in audit.** The satellite
   broker writes wire records to stderr; the kernel broker sends them
   to `svc.audit-journal`. Both use the SAME 256-byte payload shape
@@ -338,6 +433,31 @@ capability wave — and closing it unblocks smoke-runs for the entire
 - `AUDIT_MODE=file` (host-journal) — libpdx-audit#20 follow-up.
 - Full `paideia-pq-sign` staticlib (for real signing satellites);
   gated behind the arrival of the first signing satellite tool.
-- Removing paideia-as-crypto's `std` dependency (if it currently
-  has one); tracked separately if a satellite ELF size limit is
-  ever set.
+### Retroactively removed from "out of scope" — landed in 0.29.1
+
+- **Removing paideia-as-crypto's `std` dependency.** The 0.28.x
+  design pass mislabelled this as an ELF-size-only concern and
+  parked it here. That framing was wrong: the crate's `std` linkage
+  was a **link-time correctness** blocker for satellite
+  `-nostdlib` builds — the archive carried ~80 unresolved libc /
+  std / panic / unwind symbols the satellite `ld` line cannot
+  satisfy. It is now done — see 0.29.1 `paideia-as-crypto`
+  refactor to true `no_std + alloc`.
+- **Landing a `#[global_allocator]` inside `paideia-satellite-runtime`.**
+  Originally deferred so a satellite that already carries a `malloc`
+  (via a C runtime or a custom crt) would not be forced to a
+  specific allocator crate by us. That deferral did not survive
+  first contact with the Rust compiler: a `no_std` staticlib
+  MUST define a global allocator inside the emitting crate; the
+  compiler will not defer that decision to the final linked ELF.
+  The 0.29.1 second-pass restructure lands a hand-rolled 4 MiB
+  bump allocator inside `paideia-satellite-runtime` (see §4.1 for
+  the sizing and no-free rationale). A `linked-list-allocator`
+  or `dlmalloc` swap behind an off-by-default feature remains a
+  future option if long-running satellites need reclamation.
+- **Landing `#[panic_handler]` and `rust_eh_personality` inside
+  `paideia-satellite-runtime`.** Same underlying constraint as the
+  allocator: a `no_std` staticlib MUST define its own panic handler,
+  and `panic = "abort"` at the workspace release profile handles
+  the eh_personality question (the stub is exported defensively
+  regardless). Both landed in the 0.29.1 second-pass restructure.
