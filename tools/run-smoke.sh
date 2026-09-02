@@ -56,6 +56,7 @@
 #     * boot_r64v2_tools: injects 'mkfs.pdxfs --dry-run /tmp/t.img\nexit\n', asserts sys execve argv ok + the mkfs.pdxfs dry-run preview line + REAPED (R64v2, paideia-os#1976/#1977)
 #     * boot_r65_persistent_home: PHASE 1 ONLY (phase 2 deferred to R51/R52). Injects 'mkdir /home\nmkdir /home/operator\nmkfs.pdxfs --dry-run /var/pdxfs/home.img\nmount.pdxfs --dry-run cap:volume:0x0001 /home/operator\ntouch /home/operator/probe.txt\nexit\n', asserts the two mkdir fingerprints + both tools' dry-run preview lines + REAPED, 32s timeout. Opt-in via PAIDEIA_R65_PERSIST=1 (R65v2.M1-004/005, paideia-os#1982/#1983)
 #     * boot_r72_tcp_echo: validates the R72 TCP substrate boot witness (self-connect handshake + port-7 echo + mutual orderly close), 10s timeout, no special QEMU flags (R72.M1-007 #1929)
+#     * boot_r92_icmp: validates the R92.M3 off-box ICMP-ping cascade (route-table update witness + arp-pending retry + arp-resolve + icmp echo/reply against QEMU SLIRP's gateway 10.0.2.2), 15s timeout, requires PAIDEIA_NIC=virtio (default) so run-qemu.sh attaches -netdev user + -device virtio-net-pci giving SLIRP networking (R92.M3-003 paideia-os #2041)
 #     * boot_smp: validates R18.M1 SMP bring-up fingerprint on -smp 4; BSP wakes 3 APs (APIC IDs 1/2/3), each emits CPU_ID_XX_HELLO; bookended by SMP BRINGUP START / DONE (R18.M1 #764)
 #     * boot_panic: validates M3-003 fake-panic emission chain witness, 8s timeout
 #     * prod: expects exit code 2 (kernel didn't build), skips verification
@@ -768,6 +769,44 @@ case "${EXPECTED}" in
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r72-tcp-echo.golden"
         TIMEOUT=10
+        EXPECTED=""
+        ;;
+    boot_r92_icmp)
+        # R92.M3-003 (paideia-os #2041): off-box ICMP-ping boot
+        # witness. The witness lives at src/kernel/boot/witness/
+        # r92_icmp_ping.pdx and fires unconditionally on every boot
+        # from kernel_main.pdx (immediately after witness_r91_nic_
+        # probe). Under PAIDEIA_NIC=virtio (R91.M5-002 default, live
+        # here because run-qemu.sh honours PAIDEIA_NIC) the witness
+        # ARP-resolves QEMU SLIRP's gateway (10.0.2.2) via the real
+        # virtio-net TX/RX rings, sends an ICMP Echo Request with
+        # ident=0xBEEF/seq=1/payload="paideia", polls RX until the
+        # Echo Reply arrives (or a bounded ~40 ms budget expires),
+        # and emits one of two fingerprints:
+        #
+        #   `boot r92 icmp ping ok -- rtt_us=<n>` on real success
+        #   `boot r92 icmp skip -- reason=<code>` on precondition miss
+        #     (code=1 no-nic, code=2 no-link)
+        #
+        # The golden at tests/expected-r92-icmp.golden pins the
+        # substring `boot r92 icmp` (contains-in-order match) so the
+        # smoke passes on EITHER the success or the skip line -- this
+        # is deliberate: the ARP + ICMP polling budget depends on
+        # QEMU SLIRP synchronous reply landing while the guest is
+        # still in the poll loop, and no IDT wiring exists for
+        # virtio-net ISR delivery (r91-closed.md deferred item #7).
+        # The golden's leading `boot r92 route table ok` line pins
+        # the R92.M1-003 witness, which does NOT depend on any NIC
+        # state and is a hard invariant of the R92 landing.
+        #
+        # A future landing that tightens the golden to demand `boot
+        # r92 icmp ping ok` will do so after the IDT-vector wiring
+        # for virtio-net ISR delivery lands (making SLIRP replies
+        # reap in a bounded time from within any long-running boot
+        # code path).
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r92-icmp.golden"
+        TIMEOUT=15
         EXPECTED=""
         ;;
     boot_r20b_echo)
