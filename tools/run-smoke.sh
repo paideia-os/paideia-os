@@ -57,6 +57,7 @@
 #     * boot_r65_persistent_home: PHASE 1 ONLY (phase 2 deferred to R51/R52). Injects 'mkdir /home\nmkdir /home/operator\nmkfs.pdxfs --dry-run /var/pdxfs/home.img\nmount.pdxfs --dry-run cap:volume:0x0001 /home/operator\ntouch /home/operator/probe.txt\nexit\n', asserts the two mkdir fingerprints + both tools' dry-run preview lines + REAPED, 32s timeout. Opt-in via PAIDEIA_R65_PERSIST=1 (R65v2.M1-004/005, paideia-os#1982/#1983)
 #     * boot_r72_tcp_echo: validates the R72 TCP substrate boot witness (self-connect handshake + port-7 echo + mutual orderly close), 10s timeout, no special QEMU flags (R72.M1-007 #1929)
 #     * boot_r92_icmp: validates the R92.M3 off-box ICMP-ping cascade (route-table update witness + arp-pending retry + arp-resolve + icmp echo/reply against QEMU SLIRP's gateway 10.0.2.2), 15s timeout, requires PAIDEIA_NIC=virtio (default) so run-qemu.sh attaches -netdev user + -device virtio-net-pci giving SLIRP networking (R92.M3-003 paideia-os #2041)
+#     * boot_r93_udp_dns: validates the R93 DHCP+DNS cascade -- DHCP DISCOVER/OFFER/REQUEST/ACK against QEMU SLIRP (10.0.2.15/24, gw 10.0.2.2, dns 10.0.2.3) followed by an A-record resolution of "example.com" against 10.0.2.3. Golden pins both lease-ok and dns-resolve-ok fingerprints. 20s timeout, requires PAIDEIA_NIC=virtio for SLIRP responsiveness (R93.M4-001 paideia-os #2058)
 #     * boot_smp: validates R18.M1 SMP bring-up fingerprint on -smp 4; BSP wakes 3 APs (APIC IDs 1/2/3), each emits CPU_ID_XX_HELLO; bookended by SMP BRINGUP START / DONE (R18.M1 #764)
 #     * boot_panic: validates M3-003 fake-panic emission chain witness, 8s timeout
 #     * prod: expects exit code 2 (kernel didn't build), skips verification
@@ -769,6 +770,30 @@ case "${EXPECTED}" in
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r72-tcp-echo.golden"
         TIMEOUT=10
+        EXPECTED=""
+        ;;
+    boot_r93_udp_dns)
+        # R93.M4-001 (paideia-os #2058): DHCP + DNS boot cascade.
+        # The witness lives at src/kernel/boot/witness/r93_udp_dns.pdx
+        # and fires unconditionally on every boot (via kernel_main.pdx
+        # after witness_r92_icmp_ping). Under PAIDEIA_NIC=virtio
+        # (R91.M5-002 default) run-qemu.sh attaches SLIRP networking;
+        # DHCP acquires 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3 from
+        # SLIRP's built-in server; the DNS witness then resolves
+        # "example.com" against 10.0.2.3 (which SLIRP forwards to the
+        # host resolver).
+        #
+        # Fingerprint sequence (contains-in-order):
+        #   `boot r93 dhcp lease ok --`     (DHCP lease install)
+        #   `boot r93 dns resolve ok --`    (A-record for example.com)
+        #
+        # A future golden that tightens the check to include the
+        # specific ip=x.x.x.x bytes lands once TSC-cal-style RTT
+        # variability is characterized. For now the substring match
+        # is sufficient to prove both fingerprints reached the wire.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r93-udp-dns.golden"
+        TIMEOUT=20
         EXPECTED=""
         ;;
     boot_r92_icmp)

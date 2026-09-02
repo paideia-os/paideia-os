@@ -1,0 +1,1040 @@
+// src/kernel/core/net/dhcp.pdx -- R93.M1-001..006 (paideia-os
+// #2043 / #2044 / #2045 / #2046 / #2047 / #2048)
+//
+// Minimal DHCPv4 client (RFC 2131 §2/§3): DISCOVER -> OFFER ->
+// REQUEST -> ACK, install lease into route_table, ARP-announce the
+// acquired address. First real mutator of route_table's IP fields
+// at runtime.
+//
+// =============================================================================
+// SECTION 0  SCOPE (MVP)
+// =============================================================================
+//
+// In scope: one-shot lease acquisition (DISCOVER, OFFER accept-first,
+// REQUEST, ACK), minimal RFC 2131 option set (53 msg-type, 50
+// requested-IP, 54 server-id, 51 lease-time, 1 subnet-mask, 3 router,
+// 6 DNS-server, 55 param-req-list, 255 END), boot-time synchronous
+// policy with bounded timeout falling back to R27 static defaults,
+// ARP announce on lease acquisition.
+//
+// Out of scope: renewal timers, T1/T2, RENEW/REBIND state machine,
+// INIT-REBOOT with a cached lease, multi-offer arbitration, option
+// 61 (client-id -- server keys on chaddr instead), IPv6 (per
+// ipv4-only-policy.md V4-D3), DHCP INFORM, dhcp_release on shutdown.
+//
+// =============================================================================
+// SECTION 1  WIRE FORMAT (RFC 2131 §2)
+// =============================================================================
+//
+//   +0    u8   op           1=BOOTREQUEST, 2=BOOTREPLY
+//   +1    u8   htype        1 (Ethernet)
+//   +2    u8   hlen         6 (MAC length)
+//   +3    u8   hops         0
+//   +4    u32  xid          Transaction ID BE
+//   +8    u16  secs         0
+//   +10   u16  flags        0x8000 = BROADCAST bit (server broadcasts
+//                             reply -- lets us receive before we've
+//                             installed our own IP)
+//   +12   u32  ciaddr       0.0.0.0 at DISCOVER
+//   +16   u32  yiaddr       Server fills at OFFER/ACK
+//   +20   u32  siaddr       0
+//   +24   u32  giaddr       0
+//   +28   [16] chaddr       First 6 = client MAC; rest 0
+//   +44   [64] sname        0
+//   +108  [128] file        0
+//   +236  u32  magic_cookie 0x63825363 BE
+//   +240  ...  options      TLV list. Opt 255 (END) terminates.
+//
+// Minimum useful DISCOVER: 240 + 3 (opt 53) + 6 (opt 55) + 1 (END)
+// = 250 bytes. REQUEST adds 6 (opt 50) + 6 (opt 54) = 262 bytes.
+//
+// =============================================================================
+// SECTION 2  FRAME LAYERING
+// =============================================================================
+//
+// ipv4_tx_send is UNUSABLE for DHCP client: it stamps src_ip from
+// _ipv4_my_ip (wrong; we need 0.0.0.0) and ARP-resolves dst_ip
+// (broadcast has no ARP entry). We stack IPv4+UDP+DHCP manually into
+// _dhcp_tx_scratch and hand the frame to l2_tx_send directly:
+//
+//   [0..19]     ipv4_build(scratch, 17, &_dhcp_zero_ip, &_dhcp_bcast_ip,
+//                          8+dhcp_len, 0). ipv4_build takes src_ip and
+//                          dst_ip as pointers, so we pick 0.0.0.0 /
+//                          255.255.255.255 by pointing at our rodata.
+//   [20..27]    udp_build(scratch+20, 68, 67, dhcp_len). Checksum = 0
+//                          (RFC 768 permits under IPv4; SLIRP accepts).
+//   [28..end]   DHCP payload we build inline.
+//
+// l2_tx_send(0, 0, &_dhcp_bcast_mac, 0x0800, scratch, 20+8+dhcp_len).
+// l2_tx_send discards bar0/tx_ring under R91.M1-003 (routes through
+// nic_dispatch_tx), so 0/0 is safe.
+//
+// =============================================================================
+// SECTION 3  RX PATH
+// =============================================================================
+//
+// dhcp_acquire allocates a KIND_UDP_SOCKET row via udp_socket_alloc
+// and binds it to port 68 via udp_socket_bind_body before the
+// DISCOVER send. R93.M2-003's udp_rx_handle rewrite dispatches
+// incoming datagrams by dst_port -> udp_socket_find_by_local_port ->
+// udp_socket_deliver_dgram, so the OFFER/ACK arriving at
+// 255.255.255.255:68 lands in that socket's rx ring.
+//
+// The poll loop drives nic_dispatch_rx_poll(kind) once per iteration
+// and reads rx_count from [_udp_socket_table + sock_idx*128 + 56];
+// non-zero -> udp_socket_recv_body drains one dgram into
+// _dhcp_rx_scratch and dhcp_parse_reply consumes it. R93.M2-004
+// relaxed udp_socket_recv_body's state gate to accept BOUND as well
+// as CONNECTED so the bind-without-connect posture works.
+//
+// =============================================================================
+// SECTION 4  XID / POLL BUDGET / FINGERPRINTS
+// =============================================================================
+//
+// Fixed sentinel xid 0x50414944 ('P','A','I','D' MSB-first) -- no
+// kernel RNG yet. QEMU SLIRP is single-server with no cross-talk so
+// a fixed xid is fine. Poll budget 8_000_000 (~40 ms at SLIRP's
+// synchronous reply cadence, matching R92 witnesses).
+//
+// Success fingerprint: "boot r93 dhcp lease ok --" via klog_s1_d4
+//   with 4 KVs k_ip_b0..k_ip_b3 for the 4 bytes of the acquired
+//   my_ip in wire order.
+// Timeout fingerprint: "boot r93 dhcp timeout fallback static" via
+//   klog_s1 (no KVs).
+// No-NIC: silent skip (nic_dispatch_active_kind==0 is boot-config).
+//
+// =============================================================================
+// SECTION 5  ENCODER + LABEL DISCIPLINE
+// =============================================================================
+//
+// Frame prologue implicit (paideia-as #1606). Labels prefixed
+// `dhcp_`. Encoder-conservative: xor+mov_b for byte loads, mov_b for
+// stores, [reg+imm] addressing only (SIB [base+index] is forbidden
+// by paideia-as v0.24.x G6). Every stack shift lands nested-call
+// sites on 16-byte alignment.
+
+module Dhcp = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  pub let DHCP_OP_BOOTREQUEST   : u64 = 1
+  pub let DHCP_OP_BOOTREPLY     : u64 = 2
+  pub let DHCP_HTYPE_ETH        : u64 = 1
+  pub let DHCP_HLEN_ETH         : u64 = 6
+  pub let DHCP_FLAGS_BCAST      : u64 = 0x8000
+  pub let DHCP_MAGIC_COOKIE     : u64 = 0x63825363
+  pub let DHCP_MSG_DISCOVER     : u64 = 1
+  pub let DHCP_MSG_OFFER        : u64 = 2
+  pub let DHCP_MSG_REQUEST      : u64 = 3
+  pub let DHCP_MSG_DECLINE      : u64 = 4
+  pub let DHCP_MSG_ACK          : u64 = 5
+  pub let DHCP_MSG_NAK          : u64 = 6
+
+  pub let DHCP_OPT_SUBNET_MASK  : u64 = 1
+  pub let DHCP_OPT_ROUTER       : u64 = 3
+  pub let DHCP_OPT_DNS_SERVER   : u64 = 6
+  pub let DHCP_OPT_REQUESTED_IP : u64 = 50
+  pub let DHCP_OPT_LEASE_TIME   : u64 = 51
+  pub let DHCP_OPT_MSG_TYPE     : u64 = 53
+  pub let DHCP_OPT_SERVER_ID    : u64 = 54
+  pub let DHCP_OPT_PARAM_REQ    : u64 = 55
+  pub let DHCP_OPT_END          : u64 = 255
+  pub let DHCP_OPT_PAD          : u64 = 0
+
+  pub let DHCP_CLIENT_PORT      : u64 = 68
+  pub let DHCP_SERVER_PORT      : u64 = 67
+
+  pub let DHCP_FIXED_LEN        : u64 = 240
+  pub let DHCP_XID_SENTINEL     : u64 = 0x50414944   // 'PAID' MSB-first
+
+  pub let DHCP_POLL_BUDGET      : u64 = 8000000
+
+  // Return codes.
+  pub let DHCP_OK               : u64 = 0
+  pub let DHCP_E_NO_NIC         : u64 = 1
+  pub let DHCP_E_NO_SOCKET      : u64 = 2
+  pub let DHCP_E_TIMEOUT        : u64 = 3
+  pub let DHCP_E_BAD_REPLY      : u64 = 4
+
+  // Parse error codes (dhcp_parse_reply).
+  pub let DHCP_PARSE_OK         : u64 = 0
+  pub let DHCP_PARSE_SHORT      : u64 = 1
+  pub let DHCP_PARSE_BAD_OP     : u64 = 2
+  pub let DHCP_PARSE_BAD_XID    : u64 = 3
+  pub let DHCP_PARSE_BAD_MAGIC  : u64 = 4
+  pub let DHCP_PARSE_BAD_MSG    : u64 = 5
+  pub let DHCP_PARSE_BAD_OPT    : u64 = 6
+
+  // ============================================================================
+  // Rodata
+  // ============================================================================
+
+  pub let _dhcp_bcast_mac : [u8; 6] = [
+    0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8
+  ]
+  pub let _dhcp_zero_ip  : [u8; 4] = [ 0u8, 0u8, 0u8, 0u8 ]
+  pub let _dhcp_bcast_ip : [u8; 4] = [ 0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8 ]
+
+  // ============================================================================
+  // .bss: TX/RX scratch + parsed-option stash
+  // ============================================================================
+
+  pub let mut _dhcp_tx_scratch    : [u8; 512]  = uninit @align(8)
+  pub let mut _dhcp_rx_scratch    : [u8; 1024] = uninit @align(8)
+
+  pub let mut _dhcp_xid           : u64 = 0
+  pub let mut _dhcp_server_id     : u64 = 0     // packed u32 wire-order
+  pub let mut _dhcp_offered_ip    : u64 = 0     // packed u32 wire-order
+  pub let mut _dhcp_lease_gw      : u64 = 0     // packed u32 wire-order
+  pub let mut _dhcp_lease_mask    : u64 = 0     // packed u32 wire-order
+  pub let mut _dhcp_lease_dns     : u64 = 0     // packed u32 wire-order
+  pub let mut _dhcp_lease_time    : u64 = 0     // seconds (BE-decoded)
+  pub let mut _dhcp_lease_acquired: u64 = 0     // 0 = static defaults; 1 = DHCP lease
+  pub let mut _dhcp_discover_sent : u64 = 0
+  pub let mut _dhcp_request_sent  : u64 = 0
+  pub let mut _dhcp_offer_seen    : u64 = 0
+  pub let mut _dhcp_ack_seen      : u64 = 0
+
+  // ============================================================================
+  // dhcp_build_and_send(sock_idx, msg_type) -> l2_tx_send rc
+  // ============================================================================
+  //
+  // Builds a full IPv4+UDP+DHCP frame in _dhcp_tx_scratch and hands
+  // to l2_tx_send with dst_mac=_dhcp_bcast_mac + ethertype=0x0800.
+  // sock_idx is accepted for RX-side symmetry (unused today).
+  // msg_type is DHCP_MSG_DISCOVER (1) or DHCP_MSG_REQUEST (3).
+
+  pub let dhcp_build_and_send : (u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (sock_idx: u64, msg_type: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "R93.M1-001/002/003 (paideia-os #2043/#2044/#2045). Build one DHCP DISCOVER or REQUEST frame (IPv4+UDP+DHCP+opts+END) at _dhcp_tx_scratch and hand to l2_tx_send. 4-push callee-save (rbx=msg_type, rbp=dhcp_len accumulator, r12=&_dhcp_tx_scratch+28, r13=option cursor) + sub rsp,8: 32+8=40; entry rsp%16==8 -> 48, %16==0 aligned for nested rep_stosb + udp_build + ipv4_build + l2_tx_send. Zero-fill 240-byte fixed part via rep_stosb; stamp op=1, htype=1, hlen=6, xid (u32 BE from _dhcp_xid low 32), flags=0x8000, chaddr[0..5] from _e1000e_devices+24 (same source l2_tx_send's eth_build reads for the Ethernet src -- keeps DHCP chaddr in sync with the Ethernet src the server observes at L2), magic cookie 0x63825363 BE @+236. Options at r13=240: opt 53 (msg-type, 3B); if REQUEST also opts 50 (requested-IP, 6B) + 54 (server-id, 6B); opt 55 (param-req-list {1,3,6,51}, 6B); opt 255 END (1B). udp_build(scratch+20, 68, 67, dhcp_len); ipv4_build(scratch, 17, &_dhcp_zero_ip, &_dhcp_bcast_ip, 8+dhcp_len, 0); l2_tx_send(0, 0, &_dhcp_bcast_mac, 0x0800, scratch, 20+8+dhcp_len). Return l2_tx_send rc. Encoder: [reg+imm] only (SIB forbidden); xor+mov_b byte loads; mov_b byte stores; cmp reg,imm only. Reserved labels dhcp_bs_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        sub rsp, 8;
+
+        mov rbx, rsi;                            // msg_type
+
+        // r12 = &_dhcp_tx_scratch + 28
+        lea r12, [rip + _dhcp_tx_scratch];
+        add r12, 28;
+
+        // Zero the 240-byte fixed part.
+        mov rdi, r12;
+        xor rax, rax;
+        mov rcx, 240;
+        cld;
+        rep_stosb;
+
+        // op = 1
+        mov rax, 1;
+        mov_b [r12 + 0], rax;
+        // htype = 1
+        mov_b [r12 + 1], rax;
+        // hlen = 6
+        mov rax, 6;
+        mov_b [r12 + 2], rax;
+
+        // xid BE @+4..+7 (from _dhcp_xid low 32 bits).
+        mov rax, [rip + _dhcp_xid];
+        mov rcx, rax;
+        shr rcx, 24;
+        and rcx, 0xFF;
+        mov_b [r12 + 4], rcx;
+        mov rcx, rax;
+        shr rcx, 16;
+        and rcx, 0xFF;
+        mov_b [r12 + 5], rcx;
+        mov rcx, rax;
+        shr rcx, 8;
+        and rcx, 0xFF;
+        mov_b [r12 + 6], rcx;
+        mov rcx, rax;
+        and rcx, 0xFF;
+        mov_b [r12 + 7], rcx;
+
+        // flags = 0x8000 BE @+10..+11
+        mov rax, 0x80;
+        mov_b [r12 + 10], rax;
+        xor rax, rax;
+        mov_b [r12 + 11], rax;
+
+        // chaddr[0..5] from _e1000e_devices+24 -- 6 mov_b copies.
+        lea rax, [rip + _e1000e_devices];
+        add rax, 24;                             // rax = &src_mac[0]
+        mov rdx, r12;
+        add rdx, 28;                             // rdx = &chaddr[0]
+
+        xor rcx, rcx;
+        mov_b rcx, [rax + 0];
+        mov_b [rdx + 0], rcx;
+        xor rcx, rcx;
+        mov_b rcx, [rax + 1];
+        mov_b [rdx + 1], rcx;
+        xor rcx, rcx;
+        mov_b rcx, [rax + 2];
+        mov_b [rdx + 2], rcx;
+        xor rcx, rcx;
+        mov_b rcx, [rax + 3];
+        mov_b [rdx + 3], rcx;
+        xor rcx, rcx;
+        mov_b rcx, [rax + 4];
+        mov_b [rdx + 4], rcx;
+        xor rcx, rcx;
+        mov_b rcx, [rax + 5];
+        mov_b [rdx + 5], rcx;
+
+        // magic cookie 0x63825363 BE @+236..+239
+        mov rax, 0x63;
+        mov_b [r12 + 236], rax;
+        mov rax, 0x82;
+        mov_b [r12 + 237], rax;
+        mov rax, 0x53;
+        mov_b [r12 + 238], rax;
+        mov rax, 0x63;
+        mov_b [r12 + 239], rax;
+
+        // Options: cursor r13 = byte offset from r12.
+        mov r13, 240;
+
+        // Opt 53 (msg-type, len=1, msg_type).
+        mov rdx, r12;
+        add rdx, r13;
+        mov rax, 53;
+        mov_b [rdx + 0], rax;
+        mov rax, 1;
+        mov_b [rdx + 1], rax;
+        mov rax, rbx;
+        mov_b [rdx + 2], rax;
+        add r13, 3;
+
+        // REQUEST-only options.
+        cmp rbx, 3;
+        jne dhcp_bs_no_request_opts;
+
+        // Opt 50 (requested-IP, len=4).
+        mov rdx, r12;
+        add rdx, r13;
+        mov rax, 50;
+        mov_b [rdx + 0], rax;
+        mov rax, 4;
+        mov_b [rdx + 1], rax;
+        mov rax, [rip + _dhcp_offered_ip];
+        mov rcx, rax;
+        shr rcx, 24;
+        and rcx, 0xFF;
+        mov_b [rdx + 2], rcx;
+        mov rcx, rax;
+        shr rcx, 16;
+        and rcx, 0xFF;
+        mov_b [rdx + 3], rcx;
+        mov rcx, rax;
+        shr rcx, 8;
+        and rcx, 0xFF;
+        mov_b [rdx + 4], rcx;
+        mov rcx, rax;
+        and rcx, 0xFF;
+        mov_b [rdx + 5], rcx;
+        add r13, 6;
+
+        // Opt 54 (server-id, len=4).
+        mov rdx, r12;
+        add rdx, r13;
+        mov rax, 54;
+        mov_b [rdx + 0], rax;
+        mov rax, 4;
+        mov_b [rdx + 1], rax;
+        mov rax, [rip + _dhcp_server_id];
+        mov rcx, rax;
+        shr rcx, 24;
+        and rcx, 0xFF;
+        mov_b [rdx + 2], rcx;
+        mov rcx, rax;
+        shr rcx, 16;
+        and rcx, 0xFF;
+        mov_b [rdx + 3], rcx;
+        mov rcx, rax;
+        shr rcx, 8;
+        and rcx, 0xFF;
+        mov_b [rdx + 4], rcx;
+        mov rcx, rax;
+        and rcx, 0xFF;
+        mov_b [rdx + 5], rcx;
+        add r13, 6;
+
+      dhcp_bs_no_request_opts:
+
+        // Opt 55 (param-req-list, len=4, {1, 3, 6, 51}).
+        mov rdx, r12;
+        add rdx, r13;
+        mov rax, 55;
+        mov_b [rdx + 0], rax;
+        mov rax, 4;
+        mov_b [rdx + 1], rax;
+        mov rax, 1;
+        mov_b [rdx + 2], rax;
+        mov rax, 3;
+        mov_b [rdx + 3], rax;
+        mov rax, 6;
+        mov_b [rdx + 4], rax;
+        mov rax, 51;
+        mov_b [rdx + 5], rax;
+        add r13, 6;
+
+        // Opt 255 END.
+        mov rdx, r12;
+        add rdx, r13;
+        mov rax, 255;
+        mov_b [rdx + 0], rax;
+        add r13, 1;
+
+        mov rbp, r13;                            // dhcp_len
+
+        // udp_build(scratch+20, 68, 67, dhcp_len)
+        lea rdi, [rip + _dhcp_tx_scratch];
+        add rdi, 20;
+        mov rsi, 68;
+        mov rdx, 67;
+        mov rcx, rbp;
+        call udp_build;
+
+        // ipv4_build(scratch, 17, &zero_ip, &bcast_ip, 8+dhcp_len, 0)
+        lea rdi, [rip + _dhcp_tx_scratch];
+        mov rsi, 17;
+        lea rdx, [rip + _dhcp_zero_ip];
+        lea rcx, [rip + _dhcp_bcast_ip];
+        mov r8, 8;
+        add r8, rbp;
+        xor r9, r9;
+        call ipv4_build;
+
+        // l2_tx_send(0, 0, &bcast_mac, 0x0800, scratch, 20+8+dhcp_len)
+        xor rdi, rdi;
+        xor rsi, rsi;
+        lea rdx, [rip + _dhcp_bcast_mac];
+        mov rcx, 0x0800;
+        lea r8, [rip + _dhcp_tx_scratch];
+        mov r9, 28;
+        add r9, rbp;
+        call l2_tx_send;
+
+        // Bump per-msg-type counter.
+        cmp rbx, 3;
+        je dhcp_bs_bump_req;
+        mov rcx, [rip + _dhcp_discover_sent];
+        add rcx, 1;
+        mov [rip + _dhcp_discover_sent], rcx;
+        jmp dhcp_bs_ret;
+      dhcp_bs_bump_req:
+        mov rcx, [rip + _dhcp_request_sent];
+        add rcx, 1;
+        mov [rip + _dhcp_request_sent], rcx;
+
+      dhcp_bs_ret:
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // dhcp_parse_reply(buf_ptr, buf_len, expected_msg_type) -> 0 | non-zero
+  // ============================================================================
+  //
+  // Validates a DHCP payload freshly drained from the bound UDP
+  // socket. On success stashes yiaddr, subnet-mask, router,
+  // DNS-server, lease-time, server-id into module-static _dhcp_*
+  // slots. Returns 0 on accept, small non-zero code on refusal.
+
+  pub let dhcp_parse_reply : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (buf_ptr: u64, buf_len: u64, expected_msg_type: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R93.M1-002/003 + R93.M3-003 sibling (paideia-os #2044/#2045/#2056). Validate + option-walk one DHCP reply drained from the bound UDP socket. 5-push callee-save (rbx=buf, rbp=len, r12=expected_msg, r13=cursor byte-offset, r14=parsed msg-type option) + sub rsp,8: 40+8=48; entry rsp%16==8 -> 56, %16==0 aligned. Length gate >= 244 (240 fixed + 4 magic). Op @+0 == 2 (BOOTREPLY). Xid @+4..+7 BE-decoded == (_dhcp_xid & 0xFFFFFFFF). Magic cookie @+236..+239 == 0x63825363 (byte-by-byte). Yiaddr @+16..+19 stashed into _dhcp_offered_ip. Option walk starting at cursor 244: cursor_ptr = rbx + r13 computed in scratch reg (paideia-as forbids SIB [reg+reg]). PAD (0) advances 1. END (255) terminates loop. Otherwise tag/len/payload: bounds-check r13+2+len <= buf_len (dhcp_pr_malformed -> 6). Recognised tags: 53 (msg-type -> r14), 1 (subnet-mask -> _dhcp_lease_mask), 3 (router -> _dhcp_lease_gw), 6 (DNS first 4 bytes -> _dhcp_lease_dns), 51 (lease-time BE u32 -> _dhcp_lease_time), 54 (server-id -> _dhcp_server_id). Unrecognised tags skipped. Loop terminates on END or buf-end. Post-loop: r14 == expected_msg_type else return 5. All-good -> return 0. Reserved labels dhcp_pr_. Encoder: [reg+imm] only.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // buf_ptr
+        mov rbp, rsi;                            // buf_len
+        mov r12, rdx;                            // expected_msg_type
+
+        // Length gate.
+        cmp rbp, 244;
+        jb dhcp_pr_short;
+
+        // op @+0 == BOOTREPLY (2)
+        xor rax, rax;
+        mov_b rax, [rbx + 0];
+        cmp rax, 2;
+        jne dhcp_pr_bad_op;
+
+        // xid @+4..+7 BE-decode
+        xor rax, rax;
+        mov_b rax, [rbx + 4];
+        shl rax, 8;
+        xor rcx, rcx;
+        mov_b rcx, [rbx + 5];
+        or rax, rcx;
+        shl rax, 8;
+        xor rcx, rcx;
+        mov_b rcx, [rbx + 6];
+        or rax, rcx;
+        shl rax, 8;
+        xor rcx, rcx;
+        mov_b rcx, [rbx + 7];
+        or rax, rcx;
+        mov rcx, [rip + _dhcp_xid];
+        and rcx, 0xFFFFFFFF;
+        cmp rax, rcx;
+        jne dhcp_pr_bad_xid;
+
+        // Magic cookie
+        xor rax, rax;
+        mov_b rax, [rbx + 236];
+        cmp rax, 0x63;
+        jne dhcp_pr_bad_magic;
+        xor rax, rax;
+        mov_b rax, [rbx + 237];
+        cmp rax, 0x82;
+        jne dhcp_pr_bad_magic;
+        xor rax, rax;
+        mov_b rax, [rbx + 238];
+        cmp rax, 0x53;
+        jne dhcp_pr_bad_magic;
+        xor rax, rax;
+        mov_b rax, [rbx + 239];
+        cmp rax, 0x63;
+        jne dhcp_pr_bad_magic;
+
+        // Stash yiaddr into _dhcp_offered_ip.
+        xor rax, rax;
+        mov_b rax, [rbx + 16];
+        shl rax, 8;
+        xor rcx, rcx;
+        mov_b rcx, [rbx + 17];
+        or rax, rcx;
+        shl rax, 8;
+        xor rcx, rcx;
+        mov_b rcx, [rbx + 18];
+        or rax, rcx;
+        shl rax, 8;
+        xor rcx, rcx;
+        mov_b rcx, [rbx + 19];
+        or rax, rcx;
+        mov [rip + _dhcp_offered_ip], rax;
+
+        // Option loop.
+        xor r14, r14;                            // msg-type seen
+        mov r13, 244;                            // cursor
+
+      dhcp_pr_opt:
+        cmp r13, rbp;
+        jae dhcp_pr_end;                         // buf exhausted
+
+        // r8 = &buf[cursor] (scratch, not callee-save)
+        mov r8, rbx;
+        add r8, r13;
+        xor rax, rax;
+        mov_b rax, [r8 + 0];                     // tag
+
+        // PAD (0): advance 1.
+        cmp rax, 0;
+        jne dhcp_pr_not_pad;
+        add r13, 1;
+        jmp dhcp_pr_opt;
+      dhcp_pr_not_pad:
+
+        // END (255): terminate.
+        cmp rax, 255;
+        je dhcp_pr_end;
+
+        // Tag byte consumed; need at least 1 more byte for len.
+        mov r9, r13;
+        add r9, 2;                               // tag + len bytes
+        cmp r9, rbp;
+        ja dhcp_pr_malformed;
+
+        // Extract len.
+        xor rcx, rcx;
+        mov_b rcx, [r8 + 1];                     // len
+        mov r9, r13;
+        add r9, 2;
+        add r9, rcx;                             // end of this option
+        cmp r9, rbp;
+        ja dhcp_pr_malformed;
+
+        // r8 currently points at tag; payload starts at r8+2.
+        // Dispatch on tag.
+        cmp rax, 53;                             // msg-type
+        je dhcp_pr_opt_msg;
+        cmp rax, 1;                              // subnet-mask
+        je dhcp_pr_opt_mask;
+        cmp rax, 3;                              // router
+        je dhcp_pr_opt_gw;
+        cmp rax, 6;                              // DNS
+        je dhcp_pr_opt_dns;
+        cmp rax, 51;                             // lease-time
+        je dhcp_pr_opt_leasetime;
+        cmp rax, 54;                             // server-id
+        je dhcp_pr_opt_server;
+        // Unknown: skip payload.
+        jmp dhcp_pr_opt_advance;
+
+      dhcp_pr_opt_msg:
+        // Expect len=1, one-byte msg-type value.
+        cmp rcx, 1;
+        jne dhcp_pr_malformed;
+        xor rax, rax;
+        mov_b rax, [r8 + 2];
+        mov r14, rax;
+        jmp dhcp_pr_opt_advance;
+
+      dhcp_pr_opt_mask:
+        cmp rcx, 4;
+        jne dhcp_pr_malformed;
+        xor rax, rax;
+        mov_b rax, [r8 + 2];
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 3];
+        or rax, r10;
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 4];
+        or rax, r10;
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 5];
+        or rax, r10;
+        mov [rip + _dhcp_lease_mask], rax;
+        jmp dhcp_pr_opt_advance;
+
+      dhcp_pr_opt_gw:
+        // Router option may list multiple gateways; take first.
+        cmp rcx, 4;
+        jb dhcp_pr_malformed;
+        xor rax, rax;
+        mov_b rax, [r8 + 2];
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 3];
+        or rax, r10;
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 4];
+        or rax, r10;
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 5];
+        or rax, r10;
+        mov [rip + _dhcp_lease_gw], rax;
+        jmp dhcp_pr_opt_advance;
+
+      dhcp_pr_opt_dns:
+        // DNS option may list multiple servers; take first.
+        cmp rcx, 4;
+        jb dhcp_pr_malformed;
+        xor rax, rax;
+        mov_b rax, [r8 + 2];
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 3];
+        or rax, r10;
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 4];
+        or rax, r10;
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 5];
+        or rax, r10;
+        mov [rip + _dhcp_lease_dns], rax;
+        jmp dhcp_pr_opt_advance;
+
+      dhcp_pr_opt_leasetime:
+        cmp rcx, 4;
+        jne dhcp_pr_malformed;
+        xor rax, rax;
+        mov_b rax, [r8 + 2];
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 3];
+        or rax, r10;
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 4];
+        or rax, r10;
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 5];
+        or rax, r10;
+        mov [rip + _dhcp_lease_time], rax;
+        jmp dhcp_pr_opt_advance;
+
+      dhcp_pr_opt_server:
+        cmp rcx, 4;
+        jne dhcp_pr_malformed;
+        xor rax, rax;
+        mov_b rax, [r8 + 2];
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 3];
+        or rax, r10;
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 4];
+        or rax, r10;
+        shl rax, 8;
+        xor r10, r10;
+        mov_b r10, [r8 + 5];
+        or rax, r10;
+        mov [rip + _dhcp_server_id], rax;
+        jmp dhcp_pr_opt_advance;
+
+      dhcp_pr_opt_advance:
+        // r13 += 2 + len (from rcx)
+        add r13, 2;
+        add r13, rcx;
+        jmp dhcp_pr_opt;
+
+      dhcp_pr_end:
+        // Verify msg-type matched.
+        cmp r14, r12;
+        jne dhcp_pr_bad_msg;
+        xor rax, rax;
+        jmp dhcp_pr_ret;
+
+      dhcp_pr_short:
+        mov rax, 1;
+        jmp dhcp_pr_ret;
+      dhcp_pr_bad_op:
+        mov rax, 2;
+        jmp dhcp_pr_ret;
+      dhcp_pr_bad_xid:
+        mov rax, 3;
+        jmp dhcp_pr_ret;
+      dhcp_pr_bad_magic:
+        mov rax, 4;
+        jmp dhcp_pr_ret;
+      dhcp_pr_bad_msg:
+        mov rax, 5;
+        jmp dhcp_pr_ret;
+      dhcp_pr_malformed:
+        mov rax, 6;
+
+      dhcp_pr_ret:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // dhcp_wait_reply(kind, sock_idx, expected_msg_type) -> 0 | non-zero
+  // ============================================================================
+  //
+  // Polls the bound UDP socket until a valid DHCP reply of the
+  // expected msg-type arrives, or the budget exhausts. Each iter:
+  //   - nic_dispatch_rx_poll(kind) drains at most one NIC RX
+  //     descriptor into l2_rx_handle -> ipv4_rx_handle ->
+  //     udp_rx_handle -> (R93.M2-003) udp_socket_deliver_dgram.
+  //   - Read rx_count at [_udp_socket_table + sock_idx*128 + 56];
+  //     non-zero means a datagram waits.
+  //   - Drain one dgram into _dhcp_rx_scratch via udp_socket_recv_body
+  //     (state gate now accepts BOUND per R93.M2-004).
+  //   - dhcp_parse_reply. On accept -> return 0. On refuse -> loop
+  //     (a stale dgram from another server would fail xid/msg-type
+  //     and we keep polling for the right one).
+  //
+  // Returns 0 on accept, DHCP_E_TIMEOUT on budget exhaustion.
+
+  pub let dhcp_wait_reply : (u64, u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (kind: u64, sock_idx: u64, expected_msg_type: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "R93.M1-002/003 (paideia-os #2044/#2045). Poll bound UDP socket for a valid DHCP reply. 5-push callee-save (rbx=kind, rbp=sock_idx, r12=expected_msg, r13=budget, r14=row_ptr) + sub rsp,8: 40+8=48; entry rsp%16==8 -> 56, %16==0 aligned. Precompute row_ptr = _udp_socket_table + sock_idx*128 (r14). Loop: budget check; nic_dispatch_rx_poll(kind); reload rx_count from [r14+56]; if 0 decrement budget and continue; else udp_socket_recv_body(sock_idx, &_dhcp_rx_scratch, 1024) -> len in rax; dhcp_parse_reply(&_dhcp_rx_scratch, len, expected_msg); on accept return 0; on refuse decrement budget and continue polling (a stale/wrong-server reply gets skipped and we wait for the right one -- xid + msg-type gates prevent cross-eating). Budget exhausted -> return DHCP_E_TIMEOUT (3). Reserved labels dhcp_wr_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // kind
+        mov rbp, rsi;                            // sock_idx
+        mov r12, rdx;                            // expected_msg_type
+
+        // Precompute row_ptr = _udp_socket_table + sock_idx*128
+        mov rax, rbp;
+        shl rax, 7;                              // *128
+        lea rcx, [rip + _udp_socket_table];
+        add rcx, rax;
+        mov r14, rcx;
+
+        mov r13, 8000000;                        // DHCP_POLL_BUDGET
+
+      dhcp_wr_loop:
+        cmp r13, 0;
+        je dhcp_wr_timeout;
+
+        // nic_dispatch_rx_poll(kind)
+        mov rdi, rbx;
+        call nic_dispatch_rx_poll;
+
+        // rx_count?
+        mov rax, [r14 + 56];
+        cmp rax, 0;
+        je dhcp_wr_no_dgram;
+
+        // Drain one dgram.
+        mov rdi, rbp;
+        lea rsi, [rip + _dhcp_rx_scratch];
+        mov rdx, 1024;
+        call udp_socket_recv_body;
+
+        // If rax high bit is set (errno), treat as no dgram (should
+        // not happen since we checked rx_count > 0, but defensive).
+        mov rcx, rax;
+        shr rcx, 63;
+        cmp rcx, 0;
+        jne dhcp_wr_no_dgram;
+
+        // dhcp_parse_reply
+        lea rdi, [rip + _dhcp_rx_scratch];
+        mov rsi, rax;                            // len
+        mov rdx, r12;                            // expected_msg
+        call dhcp_parse_reply;
+        cmp rax, 0;
+        jne dhcp_wr_refused;
+
+        // Accepted.
+        xor rax, rax;
+        jmp dhcp_wr_ret;
+
+      dhcp_wr_refused:
+        // Stale/wrong reply: bump wait counter and keep polling.
+        sub r13, 1;
+        jmp dhcp_wr_loop;
+
+      dhcp_wr_no_dgram:
+        sub r13, 1;
+        jmp dhcp_wr_loop;
+
+      dhcp_wr_timeout:
+        mov rax, 3;                              // DHCP_E_TIMEOUT
+
+      dhcp_wr_ret:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // dhcp_acquire() -> u64
+  // ============================================================================
+  //
+  // Full DHCP handshake. See file header for policy.
+  //
+  // Returns 0 on happy path (fingerprint emitted), non-zero on any
+  // failure (skip-fingerprint or timeout-fingerprint emitted per
+  // path). kernel_main.pdx discards the return -- the fingerprint is
+  // the authoritative datum.
+
+  pub let dhcp_acquire : () -> u64 !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "R93.M1-005/006 (paideia-os #2047/#2048). Boot-time DHCP acquisition + lease install + ARP announce. 4-push callee-save (rbx=kind, rbp=sock_idx, r12=my_ip packed for fingerprint stage, r13=unused/pad symmetry) + sub rsp,8: 32+8=40; entry rsp%16==8 -> 48, %16==0 aligned for the many nested calls. Gate: nic_dispatch_active_kind() == 0 -> silent skip (no fingerprint; PAIDEIA_NIC=none is a boot-config choice). Seed _dhcp_xid = DHCP_XID_SENTINEL (0x50414944). Allocate socket via udp_socket_alloc; UDP_NONE -> DHCP_E_NO_SOCKET skip (returns non-zero but no fingerprint -- no-socket at boot is a resource-exhaustion pathology; a follow-up landing may add a distinct fingerprint). Bind socket to port 68 via udp_socket_bind_body. DISCOVER: dhcp_build_and_send(sock_idx, DHCP_MSG_DISCOVER=1); dhcp_wait_reply(kind, sock_idx, DHCP_MSG_OFFER=2). Timeout -> emit `boot r93 dhcp timeout fallback static`, return DHCP_E_TIMEOUT. Bump _dhcp_offer_seen. REQUEST: dhcp_build_and_send(sock_idx, DHCP_MSG_REQUEST=3); dhcp_wait_reply(kind, sock_idx, DHCP_MSG_ACK=5). Timeout -> same fallback fingerprint. Bump _dhcp_ack_seen. Install lease via 4 route_table_set calls (MY_IP, GW_IP, NETMASK, DNS_IP; DNS field lands with R93.M1-004 route_table extension). Set _dhcp_lease_acquired=1. ARP announce via arp_announce_on_lease_acquired(_dhcp_offered_ip). Emit `boot r93 dhcp lease ok --` via klog_s1_d4 with k_ip_b0..k_ip_b3 = 4 unpacked bytes of the acquired my_ip in wire order. klog_s1_d4 needs 4 stack pushes for v2/k3/v3/k4/v4 (see wrappers.pdx §klog_s1_d4 caller convention) -- 40 bytes shift keeps 16-byte alignment across the call. Reserved labels dhcp_ac_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        sub rsp, 8;
+
+        // Gate: active NIC?
+        call nic_dispatch_active_kind;
+        mov rbx, rax;
+        cmp rbx, 0;
+        jne dhcp_ac_have_nic;
+        // Silent skip.
+        xor rax, rax;
+        jmp dhcp_ac_ret;
+
+      dhcp_ac_have_nic:
+        // Seed xid.
+        mov rax, 0x50414944;
+        mov [rip + _dhcp_xid], rax;
+
+        // Allocate socket.
+        call udp_socket_alloc;
+        cmp rax, 0xFFFFFFFFFFFFFFFF;
+        jne dhcp_ac_have_sock;
+        mov rax, 2;                              // DHCP_E_NO_SOCKET
+        jmp dhcp_ac_ret;
+
+      dhcp_ac_have_sock:
+        mov rbp, rax;                            // sock_idx
+
+        // Bind to port 68.
+        mov rdi, rbp;
+        mov rsi, 68;
+        call udp_socket_bind_body;
+        // rax != 0 -> bind refused. Should not happen (fresh socket
+        // is CLOSED). Treat as timeout for MVP.
+        cmp rax, 0;
+        jne dhcp_ac_timeout;
+
+        // DISCOVER.
+        mov rdi, rbp;
+        mov rsi, 1;                              // DHCP_MSG_DISCOVER
+        call dhcp_build_and_send;
+        // Ignore l2_tx_send return; poll drives its own outcome.
+
+        // Wait OFFER.
+        mov rdi, rbx;                            // kind
+        mov rsi, rbp;                            // sock_idx
+        mov rdx, 2;                              // DHCP_MSG_OFFER
+        call dhcp_wait_reply;
+        cmp rax, 0;
+        jne dhcp_ac_timeout;
+        mov rcx, [rip + _dhcp_offer_seen];
+        add rcx, 1;
+        mov [rip + _dhcp_offer_seen], rcx;
+
+        // REQUEST.
+        mov rdi, rbp;
+        mov rsi, 3;                              // DHCP_MSG_REQUEST
+        call dhcp_build_and_send;
+
+        // Wait ACK.
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, 5;                              // DHCP_MSG_ACK
+        call dhcp_wait_reply;
+        cmp rax, 0;
+        jne dhcp_ac_timeout;
+        mov rcx, [rip + _dhcp_ack_seen];
+        add rcx, 1;
+        mov [rip + _dhcp_ack_seen], rcx;
+
+        // Install lease into route_table. Field ids per
+        // net/route_table.pdx §2.
+        xor rdi, rdi;                            // RT_FIELD_MY_IP=0
+        mov rsi, [rip + _dhcp_offered_ip];
+        call route_table_set;
+
+        mov rdi, 1;                              // RT_FIELD_GW_IP
+        mov rsi, [rip + _dhcp_lease_gw];
+        call route_table_set;
+
+        mov rdi, 2;                              // RT_FIELD_NETMASK
+        mov rsi, [rip + _dhcp_lease_mask];
+        call route_table_set;
+
+        mov rdi, 4;                              // RT_FIELD_DNS_IP
+        mov rsi, [rip + _dhcp_lease_dns];
+        call route_table_set;
+
+        mov rax, 1;
+        mov [rip + _dhcp_lease_acquired], rax;
+
+        // ARP announce.
+        mov rdi, [rip + _dhcp_offered_ip];
+        call arp_announce_on_lease_acquired;
+
+        // Emit success fingerprint: "boot r93 dhcp lease ok --" with
+        // 4 KVs k_ip_b0..k_ip_b3.
+        //
+        // klog_s1_d4 ABI (see wrappers.pdx §klog_s1_d4): register args
+        // rdi=level, rsi=subsys, rdx=tag, rcx=k1, r8=v1, r9=k2; stack
+        // args (as accessed by CALLEE post-return-address push) at
+        // [rsp+8]=v2, [rsp+16]=k3, [rsp+24]=v3, [rsp+32]=k4,
+        // [rsp+40]=v4. From the CALLER pre-CALL perspective those slots
+        // sit at [rsp+0..32] (because CALL decrements rsp by 8 to push
+        // the return address; the caller's [rsp+N] maps to callee's
+        // [rsp+N+8]).
+        //
+        // Current rsp%16 at this point: entry rsp%16==8 + 4 pushes (32)
+        // + sub rsp,8 (8) = 48 bytes shift => rsp%16==0. We need the
+        // CALL site to observe rsp%16==0, so we sub rsp,48 (5 slots x
+        // 8 = 40 for the args, plus 8 bytes of pad to keep alignment).
+        // Args go at [rsp+0..32]; [rsp+40] is the pad. After the call,
+        // add rsp,48 restores state.
+        mov rax, [rip + _dhcp_offered_ip];
+        mov r12, rax;                            // stash for reloads
+
+        sub rsp, 48;
+
+        // Register-side args.
+        mov rdi, 3;                              // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + tag_boot_r93_dhcp_lease_ok];
+        lea rcx, [rip + k_ip_b0];                // k1
+        lea r9, [rip + k_ip_b1];                 // k2
+        mov rax, r12;
+        shr rax, 24;
+        and rax, 0xFF;
+        mov r8, rax;                             // v1 = ip_b0
+
+        // Stack args: v2, k3, v3, k4, v4 at caller [rsp+0..32].
+        mov rax, r12;
+        shr rax, 16;
+        and rax, 0xFF;
+        mov [rsp + 0], rax;                      // v2 = ip_b1
+        lea rax, [rip + k_ip_b2];
+        mov [rsp + 8], rax;                      // k3
+        mov rax, r12;
+        shr rax, 8;
+        and rax, 0xFF;
+        mov [rsp + 16], rax;                     // v3 = ip_b2
+        lea rax, [rip + k_ip_b3];
+        mov [rsp + 24], rax;                     // k4
+        mov rax, r12;
+        and rax, 0xFF;
+        mov [rsp + 32], rax;                     // v4 = ip_b3
+
+        call klog_s1_d4;
+
+        add rsp, 48;
+
+        xor rax, rax;
+        jmp dhcp_ac_ret;
+
+      dhcp_ac_timeout:
+        // Emit fallback fingerprint.
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + tag_boot_r93_dhcp_timeout_static];
+        call klog_s1;
+        mov rax, 3;                              // DHCP_E_TIMEOUT
+
+      dhcp_ac_ret:
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}

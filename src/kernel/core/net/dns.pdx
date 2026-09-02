@@ -1,0 +1,651 @@
+// src/kernel/core/net/dns.pdx -- R93.M3-001/002/003 (paideia-os
+// #2054 / #2055 / #2056)
+//
+// Minimal single-shot DNS-A-record resolver (RFC 1035 §4). Stub, not
+// a real resolver: no cache, no negative caching, no LRU, no per-
+// user namespaces, no AAAA, no DNSSEC, no compression-pointer
+// following beyond one hop. See design/network/dns-stub-vs-cache.md
+// for the split between this file and dns-cache.md's future target.
+//
+// =============================================================================
+// SECTION 0  API
+// =============================================================================
+//
+// dns_resolve(hostname_ptr, hostname_len) -> packed u32 IP | 0
+//   * Builds one A-record query (QTYPE=1 QCLASS=1) with fixed
+//     transaction id DNS_TXID_SENTINEL=0xDEED (no kernel RNG yet).
+//   * Sends via a fresh connected UDP socket to (_ipv4_dns_ip, 53).
+//     The DNS server is DHCP-installed at boot (route_table's
+//     RT_FIELD_DNS_IP slot). If unset (0.0.0.0) resolver refuses
+//     cleanly with 0.
+//   * Polls for reply, DNS_POLL_BUDGET (~40 ms) budget per attempt,
+//     DNS_MAX_ATTEMPTS=2 attempts (one retry).
+//   * Parses reply: verifies id + QDCOUNT=1 + ANCOUNT>=1 + RCODE=0 +
+//     TC=0; walks answer records for the first A record (TYPE=1
+//     CLASS=1 RDLENGTH=4). Any refusal (NXDOMAIN, TRUNCATED, wrong
+//     txid, malformed compression, no A record) returns 0.
+//
+// Returns packed u32 host-word: (b0<<24)|(b1<<16)|(b2<<8)|b3.
+//
+// =============================================================================
+// SECTION 1  WIRE FORMAT (RFC 1035 §4)
+// =============================================================================
+//
+// Header (12 bytes, all BE):
+//   +0  u16 ID           transaction id
+//   +2  u16 FLAGS        low nibble = RCODE; bit 9 = TC; bit 8 = RD
+//   +4  u16 QDCOUNT      question count (1 for us)
+//   +6  u16 ANCOUNT      answer count (>=1 on success)
+//   +8  u16 NSCOUNT      0 (ignored)
+//   +10 u16 ARCOUNT      0 (ignored)
+//
+// Question: QNAME (labels + 0-terminator) + QTYPE (u16 BE) +
+//   QCLASS (u16 BE).
+//
+// Answer RR: NAME (labels or 0xC0XX pointer) + TYPE (u16) + CLASS
+//   (u16) + TTL (u32) + RDLENGTH (u16) + RDATA (RDLENGTH bytes).
+//   For an A record: TYPE=1 CLASS=1 RDLENGTH=4 RDATA=4 IPv4 bytes.
+//
+// =============================================================================
+// SECTION 2  ENCODER + LABEL DISCIPLINE
+// =============================================================================
+//
+// Frame prologue implicit (paideia-as #1606). Labels prefixed
+// `dns_`. Encoder-conservative: [reg+imm] addressing only, xor+mov_b
+// byte loads, cmp reg,imm only.
+
+module Dns = structure {
+
+  pub let DNS_PORT              : u64 = 53
+  pub let DNS_HDR_LEN           : u64 = 12
+  pub let DNS_TXID_SENTINEL     : u64 = 0xDEED
+  pub let DNS_FLAGS_QUERY_RD    : u64 = 0x0100
+  pub let DNS_QTYPE_A           : u64 = 1
+  pub let DNS_QCLASS_IN         : u64 = 1
+  pub let DNS_POLL_BUDGET       : u64 = 8000000
+  pub let DNS_MAX_ATTEMPTS      : u64 = 2
+  pub let DNS_LABEL_MAX         : u64 = 63
+  pub let DNS_LOCAL_PORT        : u64 = 53001
+
+  pub let mut _dns_tx_scratch   : [u8; 512] = uninit @align(8)
+  pub let mut _dns_rx_scratch   : [u8; 1024] = uninit @align(8)
+
+  pub let mut _dns_query_id     : u64 = 0
+  pub let mut _dns_last_result  : u64 = 0
+  pub let mut _dns_queries_sent : u64 = 0
+  pub let mut _dns_replies_ok   : u64 = 0
+  pub let mut _dns_refused      : u64 = 0
+
+  // ============================================================================
+  // dns_encode_qname(hostname_ptr, hostname_len, out_ptr) -> bytes | 0
+  // ============================================================================
+
+  pub let dns_encode_qname : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (hostname_ptr: u64, hostname_len: u64, out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R93.M3-001 (paideia-os #2054). Encode hostname as DNS labels. 5-push callee-save (rbx=host_ptr, rbp=host_len, r12=out_ptr, r13=input cursor, r14=out length-slot idx) + sub rsp,8: 40+8=48; entry rsp%16==8 -> 56, %16==0. Additional scratch: r8 (running label byte count, caller-save). Walk host bytes; on '.' (0x2E) stamp accumulated count into out[length-slot], advance length-slot to next available, reset count; on other bytes write into out[length-slot+1+count]; refuse (return 0) on label > 63 bytes. At end stamp final count and write terminating 0-byte. Return total bytes written. Reserved labels dns_qn_. Encoder [reg+imm] only.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+        mov r12, rdx;
+
+        cmp rbp, 0;
+        je dns_qn_bad;
+
+        xor r13, r13;
+        xor r14, r14;
+        xor r8, r8;
+
+      dns_qn_loop:
+        cmp r13, rbp;
+        jae dns_qn_end;
+
+        mov rax, rbx;
+        add rax, r13;
+        xor rcx, rcx;
+        mov_b rcx, [rax + 0];
+
+        cmp rcx, 0x2E;
+        jne dns_qn_not_dot;
+
+        // Stamp label count at out[r14], move length slot forward.
+        mov rax, r12;
+        add rax, r14;
+        mov_b [rax + 0], r8;
+        add r14, 1;
+        add r14, r8;
+        xor r8, r8;
+        add r13, 1;
+        jmp dns_qn_loop;
+
+      dns_qn_not_dot:
+        cmp r8, 63;
+        jae dns_qn_bad;
+        mov rax, r12;
+        add rax, r14;
+        add rax, 1;
+        add rax, r8;
+        mov_b [rax + 0], rcx;
+        add r8, 1;
+        add r13, 1;
+        jmp dns_qn_loop;
+
+      dns_qn_end:
+        mov rax, r12;
+        add rax, r14;
+        mov_b [rax + 0], r8;
+        add r14, 1;
+        add r14, r8;
+
+        mov rax, r12;
+        add rax, r14;
+        xor rcx, rcx;
+        mov_b [rax + 0], rcx;
+        add r14, 1;
+
+        mov rax, r14;
+        jmp dns_qn_ret;
+
+      dns_qn_bad:
+        xor rax, rax;
+
+      dns_qn_ret:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // dns_build_query(hostname_ptr, hostname_len) -> total_len | 0
+  // ============================================================================
+
+  pub let dns_build_query : (u64, u64) -> u64 !{mem} @{} =
+    fn (hostname_ptr: u64, hostname_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R93.M3-001 (paideia-os #2054). Build DNS A-record query into _dns_tx_scratch. 3-push callee-save (rbx=host_ptr, rbp=host_len, r12=cursor) + sub rsp,8: 24+8=32; entry rsp%16==8 -> 40, %16==0 aligned for nested dns_encode_qname. Stamp 12-byte header: ID=0xDEED BE, FLAGS=0x0100 BE, QDCOUNT=1 BE, ANCOUNT/NSCOUNT/ARCOUNT=0. Store txid in _dns_query_id. Call dns_encode_qname(host_ptr, host_len, scratch+12); 0 -> return 0. cursor = 12 + qname_len. Append QTYPE=1 (u16 BE) + QCLASS=1 (u16 BE); return cursor+4. Reserved labels dns_bq_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+
+        lea rcx, [rip + _dns_tx_scratch];
+
+        // ID
+        mov rax, 0xDE;
+        mov_b [rcx + 0], rax;
+        mov rax, 0xED;
+        mov_b [rcx + 1], rax;
+        mov rax, 0xDEED;
+        mov [rip + _dns_query_id], rax;
+
+        // FLAGS = 0x0100
+        mov rax, 0x01;
+        mov_b [rcx + 2], rax;
+        xor rax, rax;
+        mov_b [rcx + 3], rax;
+
+        // QDCOUNT = 1
+        xor rax, rax;
+        mov_b [rcx + 4], rax;
+        mov rax, 1;
+        mov_b [rcx + 5], rax;
+
+        // ANCOUNT + NSCOUNT + ARCOUNT = 0
+        xor rax, rax;
+        mov_b [rcx + 6], rax;
+        mov_b [rcx + 7], rax;
+        mov_b [rcx + 8], rax;
+        mov_b [rcx + 9], rax;
+        mov_b [rcx + 10], rax;
+        mov_b [rcx + 11], rax;
+
+        mov rdi, rbx;
+        mov rsi, rbp;
+        lea rdx, [rip + _dns_tx_scratch];
+        add rdx, 12;
+        call dns_encode_qname;
+        cmp rax, 0;
+        je dns_bq_bad;
+
+        mov r12, 12;
+        add r12, rax;
+
+        lea rcx, [rip + _dns_tx_scratch];
+        add rcx, r12;
+        xor rax, rax;
+        mov_b [rcx + 0], rax;
+        mov rax, 1;
+        mov_b [rcx + 1], rax;
+        xor rax, rax;
+        mov_b [rcx + 2], rax;
+        mov rax, 1;
+        mov_b [rcx + 3], rax;
+
+        add r12, 4;
+        mov rax, r12;
+        jmp dns_bq_ret;
+
+      dns_bq_bad:
+        xor rax, rax;
+
+      dns_bq_ret:
+        add rsp, 8;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // dns_skip_name(buf_ptr, buf_len, cursor) -> new_cursor | UDP_NONE
+  // ============================================================================
+
+  pub let dns_skip_name : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (buf_ptr: u64, buf_len: u64, cursor: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R93.M3-001/003 (paideia-os #2054/#2056). Skip DNS NAME (uncompressed labels terminated by 0, OR one 0xC0XX compression pointer -- do NOT follow into pointer-payload space to keep the resolver O(msg_len)). Zero pushes: leaf, no nested call. r8=cursor, r9=buf_ptr, r10=buf_len. Load byte at buf[cursor]; if top two bits set (0xC0..0xFF) return cursor+2 after bounds check; else if byte==0 return cursor+1; else advance cursor by 1+byte and loop. Any bounds overrun -> UDP_NONE (0xFFFF...FFFF). Reserved labels dns_sn_.",
+      block: {
+        mov r8, rdx;
+        mov r9, rdi;
+        mov r10, rsi;
+
+      dns_sn_loop:
+        cmp r8, r10;
+        jae dns_sn_bad;
+
+        mov rax, r9;
+        add rax, r8;
+        xor rcx, rcx;
+        mov_b rcx, [rax + 0];
+
+        mov rdx, rcx;
+        and rdx, 0xC0;
+        cmp rdx, 0xC0;
+        jne dns_sn_not_ptr;
+
+        mov rdx, r8;
+        add rdx, 2;
+        cmp rdx, r10;
+        ja dns_sn_bad;
+        mov rax, rdx;
+        ret;
+
+      dns_sn_not_ptr:
+        cmp rcx, 0;
+        jne dns_sn_label;
+        add r8, 1;
+        mov rax, r8;
+        ret;
+
+      dns_sn_label:
+        add r8, 1;
+        add r8, rcx;
+        cmp r8, r10;
+        ja dns_sn_bad;
+        jmp dns_sn_loop;
+
+      dns_sn_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // dns_parse_answer(buf_ptr, buf_len) -> packed u32 IP | 0
+  // ============================================================================
+
+  pub let dns_parse_answer : (u64, u64) -> u64 !{mem} @{} =
+    fn (buf_ptr: u64, buf_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R93.M3-002/003 (paideia-os #2055/#2056). Parse DNS reply for first A record. 5-push callee-save (rbx=buf_ptr, rbp=buf_len, r12=cursor, r13=ancount, r14=idx) + sub rsp,8: 40+8=48; entry rsp%16==8 -> 56, %16==0 aligned for nested dns_skip_name calls. Header validation: len>=12; id BE @+0..+1 == _dns_query_id&0xFFFF (else 0); FLAGS BE @+2..+3 TC bit (0x0200) unset AND RCODE (low 4) == 0 (else 0); QDCOUNT @+4..+5 == 1 (else 0); ANCOUNT @+6..+7 >= 1 (else 0). Cursor=12. Skip question: dns_skip_name -> new_cursor + 4 (QTYPE+QCLASS). Answer loop: dns_skip_name for NAME; bounds-check +10 bytes for TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2); read TYPE, CLASS, RDLENGTH; advance cursor by 10; bounds-check RDATA; if TYPE==1 && CLASS==1 && RDLENGTH==4 extract 4 rdata bytes as packed u32 host-word and return; else skip RDLENGTH bytes and loop. Answers exhausted -> return 0. Any bounds overrun or malformed NAME -> return 0. Reserved labels dns_pa_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+
+        cmp rbp, 12;
+        jb dns_pa_bad;
+
+        // ID check
+        xor rax, rax;
+        mov_b rax, [rbx + 0];
+        shl rax, 8;
+        xor rcx, rcx;
+        mov_b rcx, [rbx + 1];
+        or rax, rcx;
+        mov rcx, [rip + _dns_query_id];
+        and rcx, 0xFFFF;
+        cmp rax, rcx;
+        jne dns_pa_bad;
+
+        // FLAGS
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        shl rax, 8;
+        xor rcx, rcx;
+        mov_b rcx, [rbx + 3];
+        or rax, rcx;
+        mov rdx, rax;
+        and rdx, 0x0200;
+        cmp rdx, 0;
+        jne dns_pa_bad;
+        mov rdx, rax;
+        and rdx, 0x000F;
+        cmp rdx, 0;
+        jne dns_pa_bad;
+
+        // QDCOUNT == 1
+        xor rax, rax;
+        mov_b rax, [rbx + 4];
+        shl rax, 8;
+        xor rcx, rcx;
+        mov_b rcx, [rbx + 5];
+        or rax, rcx;
+        cmp rax, 1;
+        jne dns_pa_bad;
+
+        // ANCOUNT >= 1
+        xor rax, rax;
+        mov_b rax, [rbx + 6];
+        shl rax, 8;
+        xor rcx, rcx;
+        mov_b rcx, [rbx + 7];
+        or rax, rcx;
+        cmp rax, 0;
+        je dns_pa_bad;
+        mov r13, rax;
+
+        mov r12, 12;
+
+        // Skip question NAME.
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r12;
+        call dns_skip_name;
+        cmp rax, 0xFFFFFFFFFFFFFFFF;
+        je dns_pa_bad;
+        mov r12, rax;
+        add r12, 4;
+        cmp r12, rbp;
+        ja dns_pa_bad;
+
+        xor r14, r14;
+      dns_pa_ans_loop:
+        cmp r14, r13;
+        jae dns_pa_bad;
+
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r12;
+        call dns_skip_name;
+        cmp rax, 0xFFFFFFFFFFFFFFFF;
+        je dns_pa_bad;
+        mov r12, rax;
+
+        mov rax, r12;
+        add rax, 10;
+        cmp rax, rbp;
+        ja dns_pa_bad;
+
+        mov rcx, rbx;
+        add rcx, r12;
+        // TYPE
+        xor rax, rax;
+        mov_b rax, [rcx + 0];
+        shl rax, 8;
+        xor rdx, rdx;
+        mov_b rdx, [rcx + 1];
+        or rax, rdx;
+        mov r8, rax;
+        // CLASS
+        xor rax, rax;
+        mov_b rax, [rcx + 2];
+        shl rax, 8;
+        xor rdx, rdx;
+        mov_b rdx, [rcx + 3];
+        or rax, rdx;
+        mov r9, rax;
+        // RDLENGTH
+        xor rax, rax;
+        mov_b rax, [rcx + 8];
+        shl rax, 8;
+        xor rdx, rdx;
+        mov_b rdx, [rcx + 9];
+        or rax, rdx;
+        mov r10, rax;
+
+        add r12, 10;
+        mov rax, r12;
+        add rax, r10;
+        cmp rax, rbp;
+        ja dns_pa_bad;
+
+        cmp r8, 1;
+        jne dns_pa_skip_rdata;
+        cmp r9, 1;
+        jne dns_pa_skip_rdata;
+        cmp r10, 4;
+        jne dns_pa_skip_rdata;
+
+        mov rcx, rbx;
+        add rcx, r12;
+        xor rax, rax;
+        mov_b rax, [rcx + 0];
+        shl rax, 8;
+        xor rdx, rdx;
+        mov_b rdx, [rcx + 1];
+        or rax, rdx;
+        shl rax, 8;
+        xor rdx, rdx;
+        mov_b rdx, [rcx + 2];
+        or rax, rdx;
+        shl rax, 8;
+        xor rdx, rdx;
+        mov_b rdx, [rcx + 3];
+        or rax, rdx;
+        jmp dns_pa_ret;
+
+      dns_pa_skip_rdata:
+        add r12, r10;
+        add r14, 1;
+        jmp dns_pa_ans_loop;
+
+      dns_pa_bad:
+        xor rax, rax;
+
+      dns_pa_ret:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // dns_resolve(hostname_ptr, hostname_len) -> packed u32 IP | 0
+  // ============================================================================
+
+  pub let dns_resolve : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (hostname_ptr: u64, hostname_len: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "R93.M3-002/003 (paideia-os #2055/#2056). Single-shot DNS A-record resolver. 6-push callee-save (rbx=hostname_ptr, rbp=hostname_len, r12=sock_idx, r13=row_ptr, r14=attempts, r15=query_len) + sub rsp,24 (16 bytes for [rsp+0]=nic_kind, [rsp+8]=poll budget; 8 bytes alignment pad): 48+24=72; entry rsp%16==8 -> 80, %16==0 aligned for all nested SysV calls. Gate: nic_dispatch_active_kind() != 0. Gate: route_table_get(RT_FIELD_DNS_IP=4) != 0 (unset -> refuse cleanly). Build query via dns_build_query -> 0 -> refuse. Alloc socket; bind DNS_LOCAL_PORT (53001); connect to (dns_ip, 53) via udp_socket_connect_body. Attempt loop (DNS_MAX_ATTEMPTS=2): udp_socket_send_body (peer_ip != my_ip -> wire path); reset poll budget to 8M; each iter drives nic_dispatch_rx_poll(kind), reads rx_count from row_ptr+56; on dgram udp_socket_recv_body drains into _dns_rx_scratch; dns_parse_answer returns ip or 0; non-zero -> return; else decrement attempts, retry. Exhausted -> return 0. Reserved labels dns_rv_. Encoder-safe: budget and nic_kind kept in stack slots (not caller-save regs that nested calls would clobber).",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 24;
+
+        mov rbx, rdi;
+        mov rbp, rsi;
+
+        // Gate: NIC?
+        call nic_dispatch_active_kind;
+        cmp rax, 0;
+        je dns_rv_fail;
+        mov [rsp + 0], rax;                      // nic_kind
+
+        // Gate: dns_ip configured?
+        mov rdi, 4;                              // RT_FIELD_DNS_IP
+        call route_table_get;
+        cmp rax, 0;
+        je dns_rv_fail;
+        cmp rax, 0xFFFFFFFFFFFFFFDF;             // RT_E_BAD_FIELD
+        je dns_rv_fail;
+        // dns_ip lives in [rsp+16] for the connect call below.
+        mov [rsp + 16], rax;
+
+        // Build query.
+        mov rdi, rbx;
+        mov rsi, rbp;
+        call dns_build_query;
+        cmp rax, 0;
+        je dns_rv_fail;
+        mov r15, rax;                            // query_len
+
+        // Allocate socket.
+        call udp_socket_alloc;
+        cmp rax, 0xFFFFFFFFFFFFFFFF;
+        je dns_rv_fail;
+        mov r12, rax;
+
+        // Bind local port.
+        mov rdi, r12;
+        mov rsi, 53001;
+        call udp_socket_bind_body;
+        cmp rax, 0;
+        jne dns_rv_fail;
+
+        // Connect to (dns_ip, 53).
+        mov rdi, r12;
+        mov rsi, [rsp + 16];
+        mov rdx, 53;
+        call udp_socket_connect_body;
+        cmp rax, 0;
+        jne dns_rv_fail;
+
+        // Precompute row_ptr.
+        mov rax, r12;
+        shl rax, 7;
+        lea rcx, [rip + _udp_socket_table];
+        add rcx, rax;
+        mov r13, rcx;
+
+        mov r14, 2;                              // DNS_MAX_ATTEMPTS
+
+      dns_rv_attempt:
+        cmp r14, 0;
+        je dns_rv_fail;
+
+        // Send query.
+        mov rdi, r12;
+        lea rsi, [rip + _dns_tx_scratch];
+        mov rdx, r15;
+        call udp_socket_send_body;
+
+        mov rcx, [rip + _dns_queries_sent];
+        add rcx, 1;
+        mov [rip + _dns_queries_sent], rcx;
+
+        // Reset budget.
+        mov rax, 8000000;
+        mov [rsp + 8], rax;
+
+      dns_rv_poll:
+        mov rax, [rsp + 8];
+        cmp rax, 0;
+        je dns_rv_retry;
+
+        // nic_dispatch_rx_poll(nic_kind)
+        mov rdi, [rsp + 0];
+        call nic_dispatch_rx_poll;
+
+        // rx_count?
+        mov rax, [r13 + 56];
+        cmp rax, 0;
+        je dns_rv_no_dgram;
+
+        // Drain one dgram.
+        mov rdi, r12;
+        lea rsi, [rip + _dns_rx_scratch];
+        mov rdx, 1024;
+        call udp_socket_recv_body;
+        // Errno (negative)?
+        mov rcx, rax;
+        shr rcx, 63;
+        cmp rcx, 0;
+        jne dns_rv_no_dgram;
+
+        // Parse.
+        lea rdi, [rip + _dns_rx_scratch];
+        mov rsi, rax;
+        call dns_parse_answer;
+        cmp rax, 0;
+        je dns_rv_refused_reply;
+
+        // Success.
+        mov [rip + _dns_last_result], rax;
+        mov rcx, [rip + _dns_replies_ok];
+        add rcx, 1;
+        mov [rip + _dns_replies_ok], rcx;
+        jmp dns_rv_ret;
+
+      dns_rv_refused_reply:
+        mov rcx, [rip + _dns_refused];
+        add rcx, 1;
+        mov [rip + _dns_refused], rcx;
+        jmp dns_rv_retry;
+
+      dns_rv_no_dgram:
+        mov rax, [rsp + 8];
+        sub rax, 1;
+        mov [rsp + 8], rax;
+        jmp dns_rv_poll;
+
+      dns_rv_retry:
+        sub r14, 1;
+        jmp dns_rv_attempt;
+
+      dns_rv_fail:
+        xor rax, rax;
+
+      dns_rv_ret:
+        add rsp, 24;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}
