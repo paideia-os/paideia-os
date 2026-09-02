@@ -940,6 +940,36 @@ case "${EXPECTED}" in
         TIMEOUT=30
         EXPECTED=""
         ;;
+    boot_r104_iris_xe)
+        # R104.M6-002 (paideia-os #2189): pins the R104 Iris Xe wire-up
+        # cascade's SKIP fingerprints on QEMU. The full T14-gated cascade
+        # (probe -> cdclk -> backend register -> guc -> edid -> mode -> modeset
+        # -> vblank register -> vblank witness -> 30-flip witness) emits
+        # one "r104 iris_xe <stage> skip not-t14" line per stage on any
+        # boot without T14 iGPU presence. On a real T14 UEFI boot the
+        # same stages emit their live-ok fingerprints; the golden file
+        # would then flip to the live variants (a follow-on landing
+        # produces a distinct expected-r104-iris-xe-t14.golden pinning
+        # the live path).
+        #
+        # QEMU golden (contains-in-order substring match):
+        #   `r104 t14_g4 absent ok`
+        #   `r104 iris_xe probe skip not-t14`
+        #   `r104 iris_xe cdclk skip not-t14`
+        #   `r104 iris_xe backend register skip not-t14`
+        #   `r104 iris_xe guc load skip not-t14`
+        #   `r104 edid read skip not-t14`
+        #   `r104 mode enum skip not-t14`
+        #   `r104 iris_xe modeset skip not-t14`
+        #   `r104 iris_xe vblank vector skip not-t14`
+        #   `r104 iris_xe vblank skip not-t14`
+        #   `r104 multi_scanout ok`
+        #   `r104 iris_xe flip skip not-t14`
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r104-iris-xe.golden"
+        TIMEOUT=20
+        EXPECTED=""
+        ;;
     boot_r91_nic)
         # R98.M1-001 (paideia-os #2100): retires the R91.M6 deferred
         # item #8 ("boot_r91_nic smoke mode + expected-r91-nic-probe.
