@@ -896,6 +896,72 @@ case "${EXPECTED}" in
         TIMEOUT=15
         EXPECTED=""
         ;;
+    boot_r102_first_pixel)
+        # R102.MON-004 skeleton (paideia-os #2211): pins the ONE-line
+        # skip fingerprint emitted by witness_r102_first_pixel every
+        # boot. Skeleton because the underlying userland (svc-
+        # compositor et al.) exists only as empty scaffolds on
+        # github.com/paideia-os. See src/kernel/boot/witness/r102_first_
+        # pixel.pdx header for the full disposition, and design/round-
+        # retrospectives/r102-closure.md §"Deferred" for the roadmap
+        # from skip to OK.
+        #
+        # Golden (contains-in-order substring match):
+        #   `boot r102 first pixel skip reason=no-userland`
+        # When svc-compositor.M4-001 lands and the .incbin embed pass
+        # (R102.MON-003) fills in build/user/svc-compositor.elf, the
+        # witness body flips to the real cascade and the golden line
+        # flips to `boot r102 first pixel ok`. No PAIDEIA_VGA export
+        # -- the skip path is device-independent (the OK path will need
+        # PAIDEIA_VGA=std to reach a compositor-holdable scanout).
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r102-first-pixel.golden"
+        TIMEOUT=10
+        EXPECTED=""
+        ;;
+    boot_r102_window_present)
+        # R102.MON-005 skeleton (paideia-os #2212): pins the skip
+        # fingerprint from witness_r102_window_present. Flips to
+        # `boot r102 window present ok` when svc-compositor.M4-002 +
+        # pdxclock.M4-* land and pdxclock's .elf is embedded (MON-003).
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r102-window-present.golden"
+        TIMEOUT=10
+        EXPECTED=""
+        ;;
+    boot_r102_input_route)
+        # R102.MON-006 skeleton (paideia-os #2213): pins the skip
+        # fingerprint from witness_r102_input_route. Flips to
+        # `boot r102 input route ok` when svc-compositor.M4-003 +
+        # svc-wm.M4 + pdxpaint.M4-001 land AND R101's HID-injection
+        # fixture (r102-user-plan.md §7.2.5) lands. Two independent
+        # preconditions -- flag both in the follow-up issue that
+        # activates this smoke.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r102-input-route.golden"
+        TIMEOUT=15
+        EXPECTED=""
+        ;;
+    boot_r102_pdxterm_hello)
+        # R102.MON-007 skeleton (paideia-os #2214): pins the skip
+        # fingerprint from witness_r102_pdxterm_hello. Flips to
+        # `boot r102 pdxterm hello ok` when pdxterm.M4-002 lands (and
+        # every downstream pdxterm dep -- see witness header).
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r102-pdxterm-hello.golden"
+        TIMEOUT=15
+        EXPECTED=""
+        ;;
+    boot_r102_screenshot)
+        # R102.MON-008 skeleton (paideia-os #2215): pins the skip
+        # fingerprint from witness_r102_screenshot. Flips to
+        # `boot r102 screenshot ok` when svc-compositor.M4-004 (screen-
+        # shot-region query end-to-end) lands.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r102-screenshot.golden"
+        TIMEOUT=10
+        EXPECTED=""
+        ;;
     boot_r105_flip_client_std)
         # R105.M6-001 (paideia-os R105 landing): pins the R105 flip-
         # client witness's success fingerprint proving sys_display_

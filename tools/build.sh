@@ -338,6 +338,76 @@ else
     echo "[r64v2-tools] skip (stamp fresh)"
 fi
 
+# R102.MON-002 skeleton (paideia-os #2209): r102-tools sibling-lib +
+# satellite-app ELF pipeline for the R102 userland graphical-display
+# stack. Structurally mirrors the r64v2-tools block above (SAT_LIBS_R102
+# / SAT_APPS_R102 arrays, per-tool submodule invocation, incremental
+# stamp) but stays as a SKIP stub in this MON- wave because every one
+# of the nine referenced satellite repos is currently an empty scaffold
+# on github.com/paideia-os (LICENSE + README.md only -- no src/, no
+# caps.decl, no find-paideia-as.sh, no tools/build.sh). Attempting to
+# invoke a non-existent tools/build.sh in each satellite would hard-
+# fail this monorepo build with `no such file or directory` before the
+# kernel link ever runs.
+#
+# Discipline honoured by the skip:
+#   1. Names the intended satellite-repo layout in one place (both
+#      arrays) so future issues that fill in a repo know exactly which
+#      slot they slot into.
+#   2. Skips CLEANLY when a satellite dir is missing, empty, or has no
+#      tools/build.sh -- never propagates a nonzero exit up to the
+#      kernel build.
+#   3. Emits ONE lowercase fingerprint line naming why the stage
+#      degraded (`r102 build stage skip reason=no-satellite-code`) so
+#      the build log carries a positive skip record, not an ambiguous
+#      absence.
+#
+# When the R102-M1 wave lands per-satellite scaffolds (their own
+# find-paideia-as.sh submodule pin, their own tools/build.sh, their own
+# minimal src/), each satellite becomes buildable and this block flips
+# from `skip` to a full parallel invocation matching the r64v2-tools
+# shape: sibling libs first (SAT_LIBS_R102), apps in parallel with
+# --extra-obj-dir pointing at each lib's build-out/, then copy each
+# app's build-out/<name>.elf into build/user/<name>.elf so
+# tools/userbin_embed.S's future .incbin lines (per R102.MON-003) can
+# find them. See design/graphics/r102-user-plan.md §4.10 R102.MON-002
+# and design/round-retrospectives/r102-closure.md for the full plan.
+SAT_LIBS_R102=(libpdx-font libpdx-gfx libpdx-event)
+SAT_APPS_R102=(svc-compositor svc-wm pdxterm pdxclock pdxwatch pdxpaint)
+
+r102_tools_any_present=0
+for name in "${SAT_LIBS_R102[@]}" "${SAT_APPS_R102[@]}"; do
+    if [[ -f "${SAT_TOOLS_DIR}/${name}/tools/build.sh" ]]; then
+        r102_tools_any_present=1
+        break
+    fi
+done
+
+if [[ "${r102_tools_any_present}" -eq 0 ]]; then
+    echo "[r102-tools] r102 build stage skip reason=no-satellite-code"
+    echo "[r102-tools]   satellites empty on github.com/paideia-os -- no tools/build.sh in any of:"
+    printf '[r102-tools]     - %s\n' "${SAT_LIBS_R102[@]}" "${SAT_APPS_R102[@]}"
+    echo "[r102-tools]   see design/graphics/r102-user-plan.md §4.10 R102.MON-002"
+else
+    # At least one satellite has real code. When the full wave lands,
+    # replace this stub with the r64v2-tools-shaped body (libs then
+    # parallel apps, incremental stamp, copy build-out/*.elf into
+    # build/user/*.elf). Until then, walk every satellite that IS
+    # present and invoke it individually so partial-landings can make
+    # forward progress without triggering the empty-scaffold hard-fail.
+    echo "[r102-tools] partial: at least one r102 satellite has real code"
+    for name in "${SAT_LIBS_R102[@]}" "${SAT_APPS_R102[@]}"; do
+        satpath="${SAT_TOOLS_DIR}/${name}"
+        if [[ -f "${satpath}/tools/build.sh" ]]; then
+            echo "[r102-tools]   ${name}: invoking tools/build.sh"
+            "${satpath}/tools/build.sh"
+        else
+            echo "[r102-tools]   ${name}: skip (no tools/build.sh)"
+        fi
+    done
+    echo "[r102-tools] partial-wave OK (full r102-tools pipeline lands in R102 follow-up)"
+fi
+
 echo "[boot-stub] tools/boot_stub.S -> boot_stub.o (32+64-bit, as --64)"
 BOOT_STUB_OBJ="${BUILD_DIR}/boot_stub.o"
 as --64 -o "${BOOT_STUB_OBJ}" "${REPO_ROOT}/tools/boot_stub.S"

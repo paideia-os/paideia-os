@@ -154,3 +154,77 @@ _umount_pdxfs_bin_start:
 .global _umount_pdxfs_bin_end
 _umount_pdxfs_bin_end:
 .balign 4096
+
+# R102.MON-003 skeleton (paideia-os #2210): RESERVED userbin slots for
+# the six R102 graphical-satellite ELFs. NOT yet embedded because every
+# one of the nine R102 satellite repos on github.com/paideia-os is a
+# LICENSE+README-only scaffold as of the R102 MON- wave: attempting
+# `.incbin "build/user/svc-compositor.elf"` today would hard-fail `as`
+# with `no such file` before the kernel link starts. The six symbol
+# names below are RESERVED for the future embed pass (a MON-003 hoist
+# to be filed once svc-compositor.M2+ etc. actually build); they are
+# documented here so consumers under src/kernel/boot/witness/
+# r102_bin_seeds.pdx and any future extension of bin_seeds.pdx name the
+# same symbols this file will define.
+#
+# Layout mirrors the R64v2 satellite-tool posture above: three LIBRARIES
+# (libpdx-font, libpdx-gfx, libpdx-event) are NOT embedded -- they link
+# into the six APPS at each app's own repo-build time. Only the six
+# APPS ship as /bin/<name> tmpfs entries.
+#
+# Reserved symbol pairs (uncomment + populate when the ELFs exist):
+#
+#     .global _svc_compositor_bin_start
+#     _svc_compositor_bin_start:
+#     .incbin "build/user/svc-compositor.elf"
+#     .global _svc_compositor_bin_end
+#     _svc_compositor_bin_end:
+#     .balign 4096
+#
+#     .global _svc_wm_bin_start
+#     _svc_wm_bin_start:
+#     .incbin "build/user/svc-wm.elf"
+#     .global _svc_wm_bin_end
+#     _svc_wm_bin_end:
+#     .balign 4096
+#
+#     .global _pdxterm_bin_start
+#     _pdxterm_bin_start:
+#     .incbin "build/user/pdxterm.elf"
+#     .global _pdxterm_bin_end
+#     _pdxterm_bin_end:
+#     .balign 4096
+#
+#     .global _pdxclock_bin_start
+#     _pdxclock_bin_start:
+#     .incbin "build/user/pdxclock.elf"
+#     .global _pdxclock_bin_end
+#     _pdxclock_bin_end:
+#     .balign 4096
+#
+#     .global _pdxwatch_bin_start
+#     _pdxwatch_bin_start:
+#     .incbin "build/user/pdxwatch.elf"
+#     .global _pdxwatch_bin_end
+#     _pdxwatch_bin_end:
+#     .balign 4096
+#
+#     .global _pdxpaint_bin_start
+#     _pdxpaint_bin_start:
+#     .incbin "build/user/pdxpaint.elf"
+#     .global _pdxpaint_bin_end
+#     _pdxpaint_bin_end:
+#     .balign 4096
+#
+# Companion /bin path constants (to be added to src/user/init.pdx
+# alongside bin_child_hello_path / bin_sh_path when the seeds land):
+#
+#     bin_svc_compositor_path : [u8; 20] = "/bin/svc-compositor\0"
+#     bin_svc_wm_path         : [u8; 12] = "/bin/svc-wm\0"
+#     bin_pdxterm_path        : [u8; 13] = "/bin/pdxterm\0"
+#     bin_pdxclock_path       : [u8; 14] = "/bin/pdxclock\0"
+#     bin_pdxwatch_path       : [u8; 14] = "/bin/pdxwatch\0"
+#     bin_pdxpaint_path       : [u8; 14] = "/bin/pdxpaint\0"
+#
+# See design/graphics/r102-user-plan.md §4.10 R102.MON-003 and
+# design/round-retrospectives/r102-closure.md for the full plan.
