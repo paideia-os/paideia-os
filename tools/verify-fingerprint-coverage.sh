@@ -98,6 +98,20 @@ ALLOWLIST = {
         "fires per boot via nic_dispatch_probe; assertable golden "
         "lands with R91.M5 boot_r91_nic_probe smoke (#2031).",
 
+    # R91.M2-002 (paideia-os #2016): e1000e_probe emits its driver_table
+    # row + KIND_NIC cap publication fingerprint once activation
+    # succeeds (rx=1 && irq=1 && kind_nic_mint_body returns a legal row
+    # id). Reachable only on an activation-successful boot -- the default
+    # -kernel matrix has no -device e1000e so the activation block
+    # never runs. Assertable golden lands alongside `e1000e probe ok`
+    # under R91.M5 boot_r91_nic_probe smoke (#2031) once PAIDEIA_NIC=
+    # e1000e is wired.
+    "e1000e driver row ok [legacy: E1000E DRIVER ROW OK]":
+        "R91.M2-002 (#2016): e1000e_probe driver_table + KIND_NIC "
+        "publication fingerprint; fires only on activation-successful "
+        "boots via nic_dispatch_probe; assertable golden lands with "
+        "R91.M5 boot_r91_nic_probe smoke (#2031).",
+
     # src/kernel/boot/witness/rootfs_seed_policy.pdx (R90-XREPO.011.M1-004
     # #2119): policy seed marker fires every boot (witness runs
     # unconditionally). The R90-XREPO.011.M1-003 (#2122) elevate-broker
@@ -746,6 +760,37 @@ ALLOWLIST = {
         "emit lines), but no golden pins this exact literal -- the "
         "witness's own lowercase `boot cwd resolve ok --` rollup is "
         "the assertable signal for the whole cascade.",
+
+    # src/kernel/core/drivers/virtio_net/probe.pdx and
+    # src/kernel/core/drivers/virtio_net/common_cfg.pdx -- R91.M3-002
+    # (paideia-os #2019) virtio-net PCI probe OK-path fingerprint, and
+    # R91.M3-003 (paideia-os #2020) virtio 1.0 handshake OK-path
+    # fingerprint. Both are emitted every boot as soon as the e1000e
+    # arm misses (nic_dispatch.pdx nd_pb_try_virtio calls
+    # virtio_net_probe unconditionally, and now also
+    # virtio_net_init_handshake unconditionally after debugger-fix);
+    # virtio_net_probe emits count=0 on the default QEMU matrix (no
+    # virtio-net device present), and the handshake short-circuits to
+    # NO_BAR without emitting OK. So `virtio-net probe ok` fires every
+    # default boot but no golden pins the literal; `virtio-net init
+    # handshake ok` requires a real virtio-net device (opt-in
+    # PAIDEIA_NIC=virtio) to fire, and no golden pins that either.
+    # Same posture as e1000e's own `e1000e probe ok` line above.
+    "virtio-net probe ok [legacy: VIRTIO NET PROBE OK]":
+        "R91.M3-002 (paideia-os #2019): virtio_net_probe emits this "
+        "unconditionally at its tail (count=0 on the default matrix, "
+        "count=n when virtio devices are present) -- reachable every "
+        "boot via nic_dispatch's unconditional nd_pb_try_virtio call. "
+        "No golden pins this exact literal today; retires when a "
+        "smoke mode asserts the line.",
+    "virtio-net init handshake ok [legacy: VIRTIO INIT OK]":
+        "R91.M3-003 (paideia-os #2020): virtio_net_init_handshake "
+        "emits this on successful DRIVER_OK. Only reachable when a "
+        "virtio-net device is actually present (PAIDEIA_NIC=virtio "
+        "opt-in path); on the default QEMU matrix _virtio_net_common_"
+        "cfg_pa stays 0 and the handshake takes the NO_BAR fail "
+        "branch without emitting OK. Retire when a virtio boot mode "
+        "lands in the smoke suite.",
 }
 
 # Below these counts the extractor has stopped matching rather than the
