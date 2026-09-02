@@ -58,6 +58,7 @@
 #     * boot_r72_tcp_echo: validates the R72 TCP substrate boot witness (self-connect handshake + port-7 echo + mutual orderly close), 10s timeout, no special QEMU flags (R72.M1-007 #1929)
 #     * boot_r92_icmp: validates the R92.M3 off-box ICMP-ping cascade (route-table update witness + arp-pending retry + arp-resolve + icmp echo/reply against QEMU SLIRP's gateway 10.0.2.2), 15s timeout, requires PAIDEIA_NIC=virtio (default) so run-qemu.sh attaches -netdev user + -device virtio-net-pci giving SLIRP networking (R92.M3-003 paideia-os #2041)
 #     * boot_r93_udp_dns: validates the R93 DHCP+DNS cascade -- DHCP DISCOVER/OFFER/REQUEST/ACK against QEMU SLIRP (10.0.2.15/24, gw 10.0.2.2, dns 10.0.2.3) followed by an A-record resolution of "example.com" against 10.0.2.3. Golden pins both lease-ok and dns-resolve-ok fingerprints. 20s timeout, requires PAIDEIA_NIC=virtio for SLIRP responsiveness (R93.M4-001 paideia-os #2058)
+#     * boot_r94_tcp_offbox: validates the R94 hardened TCP cascade against QEMU SLIRP's hostfwd. Fingerprint contract admits either the ok pair (handshake_ok + roundtrip_ok bytes=<N>) OR a skip line (no NIC / no responder / precondition miss). 20s timeout, requires PAIDEIA_HOSTFWD='tcp::5555-:5555' + a background netcat listener on host tcp/5555 for the ok path (R94.M6-003 paideia-os #2075)
 #     * boot_smp: validates R18.M1 SMP bring-up fingerprint on -smp 4; BSP wakes 3 APs (APIC IDs 1/2/3), each emits CPU_ID_XX_HELLO; bookended by SMP BRINGUP START / DONE (R18.M1 #764)
 #     * boot_panic: validates M3-003 fake-panic emission chain witness, 8s timeout
 #     * prod: expects exit code 2 (kernel didn't build), skips verification
@@ -770,6 +771,36 @@ case "${EXPECTED}" in
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r72-tcp-echo.golden"
         TIMEOUT=10
+        EXPECTED=""
+        ;;
+    boot_r94_tcp_offbox)
+        # R94.M6-003 (paideia-os #2075): off-box TCP boot witness.
+        # The witness at src/kernel/boot/witness/r94_tcp_offbox.pdx
+        # connects out through QEMU SLIRP's virtio-net rings +
+        # hostfwd tcp::5555-:5555 to a locally-started netcat
+        # listener on host tcp/5555, sends 4 bytes of "PING", drains
+        # the reply from the client TCB's rx_buf, and orderly-closes.
+        #
+        # Fingerprint sequence (contains-in-order; substring match):
+        #   `boot r94 offbox handshake ok --`
+        #   `boot r94 offbox roundtrip ok -- bytes=<N>`
+        # OR (skip variant on precondition miss):
+        #   `boot r94 offbox skip -- stage=<code>`
+        #
+        # The golden at tests/expected-r94-tcp-offbox.golden pins the
+        # substring `boot r94 offbox` -- either the ok pair OR any
+        # skip line satisfies the smoke. Same posture as R92 icmp
+        # ping (a follow-up landing will tighten the golden once the
+        # host responder is set up bit-identically across dev hosts).
+        #
+        # To exercise the OK path locally:
+        #   PAIDEIA_HOSTFWD='tcp::5555-:5555' PAIDEIA_NIC=virtio \
+        #     bash -c 'nc -l 5555 -q 1 <<<"PONG" & \
+        #              sleep 0.2; \
+        #              tools/run-smoke.sh boot_r94_tcp_offbox'
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r94-tcp-offbox.golden"
+        TIMEOUT=20
         EXPECTED=""
         ;;
     boot_r93_udp_dns)

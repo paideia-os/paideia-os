@@ -22,6 +22,22 @@
 #       R91-adjacent smokes could enable e1000e without perturbing other
 #       modes; R91.M5-002 flips the default to `virtio` now that the
 #       full three-NIC probe cascade + attach step lands (issue #2030).
+#
+#   PAIDEIA_HOSTFWD=<qemu-hostfwd-spec>[,<spec>...]
+#       R94.M6-003 (paideia-os #2075). Extends the -netdev user hostfwd
+#       rule set for the boot_r94_tcp_offbox smoke and future off-box
+#       TCP witnesses that need a specific forwarded port. Each spec
+#       is passed VERBATIM as an additional `hostfwd=<spec>` fragment
+#       appended to the -netdev arg (comma-separated). Ignored when
+#       PAIDEIA_NIC=none. Example:
+#           PAIDEIA_HOSTFWD='tcp::5555-:5555' tools/run-qemu.sh ...
+#       yields:
+#           -netdev user,id=net0,hostfwd=tcp::0-:0,hostfwd=tcp::5555-:5555
+#       The default `hostfwd=tcp::0-:0` (a wildcard placeholder that
+#       QEMU accepts but never binds) is retained so pre-R94 smokes see
+#       byte-identical arg lists. Multiple hostfwd specs may be
+#       comma-separated in a single PAIDEIA_HOSTFWD value; each is
+#       expanded into its own `hostfwd=<spec>` fragment.
 
 set -euo pipefail
 
@@ -39,19 +55,31 @@ fi
 # QEMU's arg list bit-identical to pre-R91.M2-004 behavior for smokes that
 # must not carry a NIC (rare -- most smokes tolerate the extra `-device`).
 NIC_ARGS=()
+# R94.M6-003 (paideia-os #2075): compose extra hostfwd fragments from
+# PAIDEIA_HOSTFWD (comma-separated), appended to the -netdev user
+# argument alongside the pre-R94 default hostfwd=tcp::0-:0 placeholder.
+HOSTFWD_EXTRA=""
+if [[ -n "${PAIDEIA_HOSTFWD:-}" ]]; then
+    IFS=',' read -ra _paideia_hostfwd_specs <<< "${PAIDEIA_HOSTFWD}"
+    for _spec in "${_paideia_hostfwd_specs[@]}"; do
+        HOSTFWD_EXTRA="${HOSTFWD_EXTRA},hostfwd=${_spec}"
+    done
+    unset _paideia_hostfwd_specs _spec
+fi
+
 case "${PAIDEIA_NIC:-virtio}" in
     none)
         ;;
     e1000e)
-        NIC_ARGS=(-netdev user,id=net0,hostfwd=tcp::0-:0 \
+        NIC_ARGS=(-netdev "user,id=net0,hostfwd=tcp::0-:0${HOSTFWD_EXTRA}" \
                   -device e1000e,netdev=net0)
         ;;
     virtio)
-        NIC_ARGS=(-netdev user,id=net0,hostfwd=tcp::0-:0 \
+        NIC_ARGS=(-netdev "user,id=net0,hostfwd=tcp::0-:0${HOSTFWD_EXTRA}" \
                   -device virtio-net-pci,netdev=net0)
         ;;
     rtl8139)
-        NIC_ARGS=(-netdev user,id=net0 \
+        NIC_ARGS=(-netdev "user,id=net0${HOSTFWD_EXTRA}" \
                   -device rtl8139,netdev=net0)
         ;;
     *)

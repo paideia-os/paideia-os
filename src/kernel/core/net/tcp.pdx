@@ -42,13 +42,34 @@
 //   +192  reserved
 //   +200  mss                  (negotiated MSS; fixed TCP_MSS_DEFAULT — no
 //                               MSS option parsing at MVP)
-//   +208..511  reserved
+//   +208  so_error             (u64; SO_ERROR observation slot; 0 = none)
+//   +216  srtt_ticks           (R94.M5-001; 0 = uninitialized;
+//                               first sample seeds; RFC 6298 §2.2)
+//   +224  rttvar_ticks         (R94.M5-001; RFC 6298 §2.3)
+//   +232  rto_ticks            (R94.M5-002; current retransmit timeout;
+//                               starts at TCP_RTO_TICKS, doubles on
+//                               timeout up to TCP_RTO_MAX_TICKS)
+//   +240  time_wait_deadline   (R94.M3-001; 0 = not in TIME_WAIT;
+//                               else tick at which TCB frees)
+//   +248  last_seg_was_rxmt    (R94.M5-001 Karn's algorithm — 1 iff
+//                               the last send was tcp_retransmit_last;
+//                               the ACK that covers it MUST NOT feed
+//                               RTT estimation, since the sender cannot
+//                               tell which copy the ACK responded to)
+//   +256  last_seg_send_tick   (R94.M5-001; _tick_count at send time)
+//   +264  shutdown_flags       (R94.M3-002 SHUT_RD/WR/RDWR: bit 0 = RD
+//                               locally shut, bit 1 = WR locally shut)
+//   +272  last_seg_payload_bytes (R94.M2-001; count of bytes stored at
+//                               _tcp_tx_buf_table[tcb_idx*4096..+N] for
+//                               tcp_retransmit_last to replay; 0 for a
+//                               pure control segment)
+//   +280..511 reserved
 //
 // rx_buf / tx_buf are NOT embedded in the 512-byte row — each lives in
 // its own 4 KiB-per-TCB table (_tcp_rx_buf_table / _tcp_tx_buf_table),
-// indexed by tcb_idx*4096. tx_buf is reserved for a future full data-
-// retransmit replay buffer (see §Retransmit honesty note below); the
-// MVP only writes into it defensively-unused.
+// indexed by tcb_idx*4096. R94.M2-001 wires tcp_send_segment to copy
+// the outgoing payload into tx_buf so a subsequent tcp_retransmit_last
+// can replay the ACTUAL bytes (not the pre-R94 zero-length probe).
 //
 // -----------------------------------------------------------------------------
 // Loopback fast path — the architectural decision this round hinges on
@@ -163,6 +184,20 @@ module Tcp = structure {
   pub let TCP_BUF_SIZE     : u64 = 4096
   pub let TCP_MSS_DEFAULT  : u64 = 536
   pub let TCP_RTO_TICKS    : u64 = 100     // ~1s at the ~100 Hz LAPIC period
+  // R94.M5-002 (#2072): exponential-backoff ceiling. 6000 ticks == ~60s
+  // at 100 Hz. Above this the timer stays saturated; a truly dead peer
+  // is eventually collected by a future dead-connection reaper (out of
+  // scope for R94).
+  pub let TCP_RTO_MAX_TICKS  : u64 = 6000
+  // R94.M3-001 (#2065): TIME_WAIT holds the TCB for 2xRTO ticks before
+  // freeing (rather than RFC 793's literal 4-minute MSL, which is far
+  // too long for a kernel-native 64-entry fixed-size TCB pool with no
+  // dynamic growth). Wired inside tcp_poll_retransmits' sweep.
+  pub let TCP_TIME_WAIT_TICKS: u64 = 200   // 2 * TCP_RTO_TICKS
+  // R94.M3-002 (#2066): sys_shutdown `how` argument.
+  pub let TCP_SHUT_RD      : u64 = 0
+  pub let TCP_SHUT_WR      : u64 = 1
+  pub let TCP_SHUT_RDWR    : u64 = 2
   pub let TCP_NONE         : u64 = 0xFFFFFFFFFFFFFFFF
 
   // Return codes for tcp_rx_handle (mirrors udp_rx_handle/ipv4_rx_handle
@@ -182,6 +217,18 @@ module Tcp = structure {
 
   pub let mut _tcp_next_iss             : u64 = 0x10000000
   pub let mut _tcp_next_ephemeral_port  : u64 = 40000
+
+  // R94.M4-001/002 (#2068/#2069): blocking accept()/recv() waiter
+  // registries. Single-slot each at MVP (sys_accept and sys_recv are
+  // reachable from at most one waiting task per TCB at boot today).
+  // A future round with multi-caller waits grows these into per-TCB
+  // arrays. Each row is one TCB entry; contents are a task-TCB pointer
+  // (as sched_wake expects) or 0 for "no waiter". The RX path
+  // (tcp_process_segment when data lands, tcp_rx_handle when a child
+  // enters ESTABLISHED under a listener) clears the slot BEFORE the
+  // sched_wake call so a re-entrant wake path cannot double-visit.
+  pub let mut _tcp_recv_waiter_table   : [u8; 512] = uninit @align(8)  // 64 * 8
+  pub let mut _tcp_accept_waiter_table : [u8; 512] = uninit @align(8)
 
   pub let mut _tcp_rx_pkts        : u64 = 0
   pub let mut _tcp_rx_bad_hdr     : u64 = 0
@@ -260,6 +307,11 @@ module Tcp = structure {
         mov [r9 + 104], rax;              // ssthresh
         mov rax, 4096;
         mov [r9 + 72], rax;               // rcv_wnd
+        // R94.M5-002 (#2072): seed current RTO to TCP_RTO_TICKS. Doubles
+        // on every timeout up to TCP_RTO_MAX_TICKS; reset on the first
+        // RTT sample per R94.M5-001.
+        mov rax, 100;                     // TCP_RTO_TICKS
+        mov [r9 + 232], rax;              // rto_ticks
         mov rax, rcx;                     // return idx
         ret;
 
@@ -623,7 +675,7 @@ module Tcp = structure {
   pub let tcp_send_segment : (u64, u64, u64, u64) -> u64 !{sysreg, mem} @{} =
     fn (tcb_idx: u64, flags: u64, payload_pa: u64, payload_len: u64) -> unsafe {
       effects: {sysreg, mem}, capabilities: {},
-      justification: "R72.M1-002/003 (#1924/#1925): build one TCP segment from tcb_idx's current snd_nxt/rcv_nxt, patch its checksum, advance snd_nxt by the seq-space this segment consumes, record retransmit-replay bookkeeping (last_seg_seq/len/flags + rto_deadline = _tick_count + TCP_RTO_TICKS), then dispatch via the loopback fast path (local_ip==remote_ip -> direct tcp_rx_handle call, bypassing ipv4_tx_send/e1000e entirely -- see module header) or ipv4_tx_send otherwise. 6-push callee-save (rbx=tcb_idx, rbp=tcb_ptr, r12=flags, r13=payload_pa, r14=payload_len, r15=seq_used) + sub rsp,8 pad -- 48+8=56; entry rsp%16==8 -> 64, %16==0 for the nested tcp_build_header/tcp_checksum/tcp_rx_handle/ipv4_tx_send calls. All four incoming args are copied into callee-save registers BEFORE the first nested call so none are lost to a callee's caller-save clobber. Reserved labels: tss_.",
+      justification: "R72.M1-002/003 + R94.M2-001 + R94.M5-001 (#1924/#1925/#2062/#2071): build one TCP segment from tcb_idx's current snd_nxt/rcv_nxt, patch its checksum, advance snd_nxt by the seq-space this segment consumes, record retransmit-replay bookkeeping (last_seg_seq/len/flags), stamp Karn fields (last_seg_send_tick = _tick_count, last_seg_was_rxmt = 0 -- this is a FRESH send, not a retransmit, so its ACK IS eligible to feed RTT sampling per RFC 6298 §3), R94.M2-001: copy payload_len bytes into _tcp_tx_buf_table[tcb_idx*4096..+N] and stash last_seg_payload_bytes so a subsequent tcp_retransmit_last can replay the ACTUAL bytes (not the pre-R94 zero-length probe), R94.M5-002: arm rto_deadline = _tick_count + rto_ticks (per-TCB, doubles on repeated timeout up to TCP_RTO_MAX_TICKS), then dispatch via the loopback fast path (local_ip==remote_ip -> direct tcp_rx_handle call, bypassing ipv4_tx_send/e1000e entirely -- see module header) or ipv4_tx_send otherwise. 6-push callee-save (rbx=tcb_idx, rbp=tcb_ptr, r12=flags, r13=payload_pa, r14=payload_len, r15=seq_used) + sub rsp,8 pad -- 48+8=56; entry rsp%16==8 -> 64, %16==0 for the nested tcp_build_header/tcp_checksum/tcp_rx_handle/ipv4_tx_send calls. All four incoming args are copied into callee-save registers BEFORE the first nested call so none are lost to a callee's caller-save clobber. Reserved labels: tss_.",
       block: {
         push rbx;
         push rbp;
@@ -661,7 +713,26 @@ module Tcp = structure {
         mov rcx, r14;
         cld;
         rep_movsb;
+        // R94.M2-001 (#2062): mirror payload into _tcp_tx_buf_table so
+        // tcp_retransmit_last can replay these bytes on timeout. Slot
+        // is tcb_idx*4096. Overwrites any prior cached segment -- MVP
+        // has a single retransmit-replay slot per TCB (the most-recent
+        // send), matching the pre-R94 last_seg_seq/last_seg_flags shape.
+        // rsi (payload_pa), r14 (payload_len) still live -- neither the
+        // rep_movsb above nor any intervening store clobbers them; we
+        // just need to re-seed rdi/rcx for a second copy.
+        mov rax, rbx; shl rax, 12;
+        lea rdi, [rip + _tcp_tx_buf_table];
+        add rdi, rax;
+        mov rsi, r13;
+        mov rcx, r14;
+        cld;
+        rep_movsb;
       tss_no_payload:
+        // R94.M2-001: stash the number of bytes cached in tx_buf so
+        // tcp_retransmit_last knows how many to replay. 0 for a pure
+        // control segment.
+        mov [rbp + 272], r14;
 
         // Compute checksum over the whole segment; patch bytes 16/17.
         lea rdi, [rbp + 24];
@@ -688,9 +759,21 @@ module Tcp = structure {
         mov [rbp + 136], rax;                              // last_seg_len
         mov rcx, r12; mov [rbp + 144], rcx;                // last_seg_flags
 
-        mov rax, [rip + _tick_count];
-        add rax, 100;
+        // R94.M5-002 (#2072): rto_deadline = _tick_count + per-TCB rto_ticks.
+        // rto_ticks defaults to TCP_RTO_TICKS at tcp_alloc_tcb time and
+        // is doubled on repeated timeouts in tcp_poll_retransmits, or
+        // recomputed from SRTT/RTTVAR in tpsg_est_new_ack after an
+        // unambiguous ACK per Karn's algorithm.
+        mov rcx, [rip + _tick_count];
+        mov [rbp + 256], rcx;                              // last_seg_send_tick (Karn)
+        mov rax, [rbp + 232];                              // rto_ticks
+        add rax, rcx;
         mov [rbp + 120], rax;                              // rto_deadline
+        // R94.M5-001 (#2071): this is a FRESH send (not a retransmit),
+        // so its ACK IS eligible to feed RTT estimation per Karn's
+        // algorithm. tcp_retransmit_last sets this back to 1.
+        xor rax, rax;
+        mov [rbp + 248], rax;                              // last_seg_was_rxmt = 0
 
         // Loopback vs wire.
         xor rax, rax; mov_b rax, [rbp + 24]; xor rcx, rcx; mov_b rcx, [rbp + 32]; cmp rax, rcx; jne tss_wire;
@@ -745,7 +828,7 @@ module Tcp = structure {
   pub let tcp_retransmit_last : (u64) -> u64 !{sysreg, mem} @{} =
     fn (tcb_idx: u64) -> unsafe {
       effects: {sysreg, mem}, capabilities: {},
-      justification: "R72.M1-003 (#1925): replay the last-sent segment's seq + flags with zero payload, WITHOUT advancing snd_nxt (a retransmit resends already-numbered seq-space, it does not claim new seq-space). Builds the segment directly against last_seg_seq/last_seg_flags rather than calling tcp_send_segment (which always reads CURRENT snd_nxt and always advances it) -- the two functions share the build/checksum/dispatch shape but differ in exactly this one respect, so they are kept as separate bodies rather than one parameterized over 'advance or not' with a bool nobody could read at the call site. Only correct for zero-payload control segments per the module header's honesty note. 6-push callee-save (rbx=tcb_idx, rbp=tcb_ptr, r12=last_seg_flags, r13=last_seg_seq) + sub rsp,8. Reserved labels: trxm_.",
+      justification: "R72.M1-003 + R94.M2-002 + R94.M5-001 (#1925/#2063/#2071): replay the last-sent segment's seq + flags WITHOUT advancing snd_nxt (a retransmit resends already-numbered seq-space; it does not claim new seq-space). R94.M2-002: if last_seg_payload_bytes (@+272) > 0 the ORIGINAL bytes are re-copied out of _tcp_tx_buf_table[tcb_idx*4096..+N] into the outgoing scratch -- the pre-R94 code replayed a zero-length probe here, which advances peer's cumulative-ack knowledge but does not recover the lost bytes. R94.M5-001: stamp last_seg_was_rxmt = 1 so the next ACK that covers this seq-space is EXCLUDED from RTT estimation per Karn's algorithm (a retransmitted segment's ACK is ambiguous -- the sender cannot tell whether the ACK responded to the original or the retransmit, and letting the retransmit's shorter apparent RTT feed SRTT would collapse the estimator toward zero). Builds the segment directly against last_seg_seq/last_seg_flags rather than calling tcp_send_segment (which always reads CURRENT snd_nxt and always advances it). 6-push callee-save (rbx=tcb_idx, rbp=tcb_ptr, r12=last_seg_flags, r13=last_seg_seq, r14=cached_payload_bytes) + sub rsp,8. Reserved labels: trxm_.",
       block: {
         push rbx;
         push rbp;
@@ -760,6 +843,7 @@ module Tcp = structure {
         mov rbp, rax;
         mov r12, [rbp + 144];                // last_seg_flags
         mov r13, [rbp + 128];                // last_seg_seq
+        mov r14, [rbp + 272];                // last_seg_payload_bytes
 
         lea rdi, [rip + _tcp_tx_scratch];
         mov rsi, [rbp + 8];
@@ -770,10 +854,26 @@ module Tcp = structure {
         mov r9, rax;
         call tcp_build_header;
 
+        // R94.M2-002 (#2063): re-copy the cached payload bytes out of
+        // _tcp_tx_buf_table into the scratch after the header. Skipped
+        // when last_seg_payload_bytes == 0 (a pure control segment --
+        // SYN, SYN|ACK, ACK, FIN -- carries no data to replay).
+        cmp r14, 0;
+        je trxm_no_payload;
+        lea rdi, [rip + _tcp_tx_scratch];
+        add rdi, 20;
+        mov rax, rbx; shl rax, 12;
+        lea rsi, [rip + _tcp_tx_buf_table];
+        add rsi, rax;
+        mov rcx, r14;
+        cld;
+        rep_movsb;
+      trxm_no_payload:
+
         lea rdi, [rbp + 24];
         lea rsi, [rbp + 32];
         lea rdx, [rip + _tcp_tx_scratch];
-        mov rcx, 20;
+        mov rcx, r14; add rcx, 20;
         call tcp_checksum;
         mov rcx, rax; shr rcx, 8; and rcx, 0xFF;
         lea rdx, [rip + _tcp_tx_scratch];
@@ -781,9 +881,20 @@ module Tcp = structure {
         mov rcx, rax; and rcx, 0xFF;
         mov_b [rdx + 17], rcx;
 
+        // R94.M5-002 (#2072): re-arm rto_deadline against the CURRENT
+        // per-TCB rto_ticks (which tcp_poll_retransmits' backoff step
+        // has just doubled). Do NOT overwrite last_seg_send_tick --
+        // that field retains the ORIGINAL send tick so the eventual ACK
+        // can be timed against, though Karn's flag (last_seg_was_rxmt=1
+        // below) will suppress that RTT sample anyway.
         mov rax, [rip + _tick_count];
-        add rax, 100;
+        mov rcx, [rbp + 232];                // rto_ticks
+        add rax, rcx;
         mov [rbp + 120], rax;
+        // R94.M5-001 (#2071): Karn -- mark this ACK-eligible seq-space
+        // as retransmitted so the ACK does not feed RTT sampling.
+        mov rax, 1;
+        mov [rbp + 248], rax;
 
         xor rax, rax; mov_b rax, [rbp + 24]; xor rcx, rcx; mov_b rcx, [rbp + 32]; cmp rax, rcx; jne trxm_wire;
         xor rax, rax; mov_b rax, [rbp + 25]; xor rcx, rcx; mov_b rcx, [rbp + 33]; cmp rax, rcx; jne trxm_wire;
@@ -791,7 +902,7 @@ module Tcp = structure {
         xor rax, rax; mov_b rax, [rbp + 27]; xor rcx, rcx; mov_b rcx, [rbp + 35]; cmp rax, rcx; jne trxm_wire;
 
         lea rdi, [rip + _tcp_tx_scratch];
-        mov rsi, 20;
+        mov rsi, r14; add rsi, 20;
         lea rdx, [rbp + 24];
         lea rcx, [rbp + 24];
         call tcp_rx_handle;
@@ -803,7 +914,7 @@ module Tcp = structure {
         mov rdx, 6;
         lea rcx, [rbp + 32];
         lea r8, [rip + _tcp_tx_scratch];
-        mov r9, 20;
+        mov r9, r14; add r9, 20;
         call ipv4_tx_send;
 
       trxm_done:
@@ -837,7 +948,7 @@ module Tcp = structure {
   pub let tcp_poll_retransmits : () -> () !{sysreg, mem} @{} =
     fn () -> unsafe {
       effects: {sysreg, mem}, capabilities: {},
-      justification: "R72.M1-003/004 (#1925/#1926): sweep the 64-entry TCB pool for an overdue single-shot RTO (rto_deadline <= _tick_count) on a TCB with outstanding unacked data (snd_una != snd_nxt), retransmit via tcp_retransmit_last, and apply the slow-start-restart cwnd/ssthresh cut (ssthresh = max(cwnd/2, mss); cwnd = mss) that RFC 5681 §4.1 prescribes after a retransmit timeout. Not wired to any periodic caller yet (see module header). 4-push callee-save (rbx=idx, rbp=now, r12=table base) + sub rsp,8 for the nested tcp_retransmit_last call. Reserved labels: tpr_.",
+      justification: "R72.M1-003/004 + R94.M1-001 + R94.M3-001 + R94.M5-002 (#1925/#1926/#2060/#2065/#2072): sweep the 64-entry TCB pool for (a) an overdue single-shot RTO (rto_deadline <= _tick_count) on a TCB with outstanding unacked data (snd_una != snd_nxt), which retransmits via tcp_retransmit_last, applies the slow-start-restart cwnd/ssthresh cut (ssthresh = max(cwnd/2, mss); cwnd = mss) that RFC 5681 §4.1 prescribes after a retransmit timeout, AND (R94.M5-002 #2072) doubles the per-TCB rto_ticks up to TCP_RTO_MAX_TICKS so a truly dead peer does not spin the retransmit ISR at 100 Hz forever; and (b) a TIME_WAIT TCB whose time_wait_deadline (@+240) has passed, which now frees via tcp_free_tcb (R94.M3-001 #2065 replaces the pre-R94 free-immediately-on-FIN behavior). Wired into the LAPIC tick path at ~10 Hz effective sampling by R94.M1-001 (int/exceptions.pdx handle_timer). 4-push callee-save (rbx=idx, rbp=now, r12=table base, r13=row_ptr) + sub rsp,8 for the nested tcp_retransmit_last / tcp_free_tcb calls. Reserved labels: tpr_.",
       block: {
         push rbx;
         push rbp;
@@ -859,6 +970,26 @@ module Tcp = structure {
         mov rcx, [r13 + 168];
         cmp rcx, 0;
         je tpr_next;
+
+        // R94.M3-001 (#2065): TIME_WAIT reap first. state==10 with a
+        // non-zero time_wait_deadline whose tick has passed frees the
+        // slot back to the pool. Runs BEFORE the RTO check because a
+        // TIME_WAIT TCB has snd_una==snd_nxt (no outstanding data) and
+        // would fall through to tpr_next anyway; folding the reap into
+        // the same scan avoids a second pass over 64 rows.
+        mov rcx, [r13 + 0];
+        cmp rcx, 10;
+        jne tpr_check_rto;
+        mov rcx, [r13 + 240];               // time_wait_deadline
+        cmp rcx, 0;
+        je tpr_next;                        // TIME_WAIT with no deadline set (pre-R94 legacy)
+        cmp rbp, rcx;
+        jb tpr_next;                        // not yet due
+        mov rdi, rbx;
+        call tcp_free_tcb;
+        jmp tpr_next;
+
+      tpr_check_rto:
         mov rcx, [r13 + 40];                // snd_una
         mov rdx, [r13 + 48];                // snd_nxt
         cmp rcx, rdx;
@@ -869,6 +1000,21 @@ module Tcp = structure {
 
         mov rdi, rbx;
         call tcp_retransmit_last;
+
+        // R94.M5-002 (#2072): exponential backoff. Double rto_ticks up
+        // to TCP_RTO_MAX_TICKS (6000 == ~60s). The NEXT rto_deadline
+        // arm inside tcp_retransmit_last (above) already consumed the
+        // doubled value, but that value is picked up on the LAST
+        // arm-store, so we double AFTER the retransmit's arm so the
+        // FOLLOWING timeout is spaced further out.
+        mov rax, [r13 + 232];               // rto_ticks
+        shl rax, 1;
+        mov rcx, 6000;                      // TCP_RTO_MAX_TICKS
+        cmp rax, rcx;
+        jbe tpr_backoff_store;
+        mov rax, rcx;
+      tpr_backoff_store:
+        mov [r13 + 232], rax;
 
         mov rax, [r13 + 96];                // cwnd
         mov rcx, [r13 + 200];               // mss
@@ -889,6 +1035,164 @@ module Tcp = structure {
         pop r13;
         pop r12;
         pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_recv_waiter_set / tcp_recv_waiter_get / tcp_wake_recv_if_any
+  // tcp_accept_waiter_set / tcp_accept_waiter_get / tcp_wake_accept_if_any
+  // ============================================================================
+  //
+  // R94.M4-001/002 (#2068/#2069): per-TCB blocking-waiter registries.
+  // sys_recv / sys_accept bodies stamp the current task's TCB pointer
+  // into the row, call sched_block, and on resume re-check readiness.
+  // The RX path (tcp_process_segment on data arrival, tcp_rx_handle on
+  // a listener child transitioning to ESTABLISHED) calls the paired
+  // tcp_wake_* helper, which reads the row, zeroes it FIRST (so a
+  // nested wake cannot re-visit the same waiter twice), and calls
+  // sched_wake. Cheap no-op when no waiter is registered.
+  //
+  // Bounds: caller must pass tcb_idx < 64; unchecked here to keep the
+  // hot path branch-free. Every caller in tcp.pdx already knows the
+  // row is valid because tcp_rx_handle / tcp_process_segment resolved
+  // it themselves.
+
+  pub let tcp_recv_waiter_set : (u64, u64) -> () !{mem} @{} =
+    fn (tcb_idx: u64, task_tcb: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R94.M4-002 (#2069): stamp task_tcb (or 0 to clear) into _tcp_recv_waiter_table[tcb_idx*8]. Leaf; rax/rcx caller-save. No prologue.",
+      block: {
+        mov rax, rdi; shl rax, 3;
+        lea rcx, [rip + _tcp_recv_waiter_table];
+        add rcx, rax;
+        mov [rcx + 0], rsi;
+        ret
+      }
+    }
+
+  pub let tcp_accept_waiter_set : (u64, u64) -> () !{mem} @{} =
+    fn (tcb_idx: u64, task_tcb: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R94.M4-001 (#2068): stamp task_tcb (or 0 to clear) into _tcp_accept_waiter_table[tcb_idx*8]. Leaf.",
+      block: {
+        mov rax, rdi; shl rax, 3;
+        lea rcx, [rip + _tcp_accept_waiter_table];
+        add rcx, rax;
+        mov [rcx + 0], rsi;
+        ret
+      }
+    }
+
+  pub let tcp_wake_recv_if_any : (u64) -> () !{sysreg, mem} @{sched, boot} =
+    fn (tcb_idx: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {sched, boot},
+      justification: "R94.M4-002 (#2069): if _tcp_recv_waiter_table[tcb_idx*8] != 0 clear the slot and sched_wake the saved value. Clear-before-wake ordering matches poll_wake_check_and_clear's at-most-once guarantee (see syscall/handlers/sys_poll.pdx §poll_wake_check_and_clear). 1-push callee-save (rbx=&slot) + sub rsp,8: entry rsp%16==8, 1 push 8 bytes lands rsp%16==0, sub 8 -> 8 -- wait, we need 0 for the call. entry 8 + push (8) = 16 (%16 = 0), sub 8 -> 8 (%16 = 8). Reverse: skip sub; 1 push (8B) + entry (8) = 16, rsp%16==0, good for the call. Leaf-of-leaf; reserved labels: twri_.",
+      block: {
+        push rbx;
+        mov rax, rdi; shl rax, 3;
+        lea rbx, [rip + _tcp_recv_waiter_table];
+        add rbx, rax;
+        mov rax, [rbx + 0];
+        cmp rax, 0;
+        je twri_done;
+        xor rcx, rcx;
+        mov [rbx + 0], rcx;
+        mov rdi, rax;
+        call sched_wake;
+      twri_done:
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let tcp_wake_accept_if_any : (u64) -> () !{sysreg, mem} @{sched, boot} =
+    fn (listener_idx: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {sched, boot},
+      justification: "R94.M4-001 (#2068): if _tcp_accept_waiter_table[listener_idx*8] != 0 clear the slot and sched_wake the saved value. Called from tcp_rx_handle after backlog_pending_tcb transitions from TCP_NONE to a valid child idx. Same clear-before-wake shape as tcp_wake_recv_if_any. Reserved labels: twai_.",
+      block: {
+        push rbx;
+        mov rax, rdi; shl rax, 3;
+        lea rbx, [rip + _tcp_accept_waiter_table];
+        add rbx, rax;
+        mov rax, [rbx + 0];
+        cmp rax, 0;
+        je twai_done;
+        xor rcx, rcx;
+        mov [rbx + 0], rcx;
+        mov rdi, rax;
+        call sched_wake;
+      twai_done:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // tcp_shutdown_how(tcb_idx, how) -> u64
+  // ============================================================================
+  //
+  // R94.M3-002 (#2066): sys_shutdown's typed body. Distinguishes:
+  //   SHUT_RD (0): mark the READ side locally closed via shutdown_flags
+  //     bit 0. Subsequent recv() returns 0 (EOF). Does NOT emit a FIN --
+  //     read-shutdown is a local-only fact.
+  //   SHUT_WR (1): mark the WRITE side locally closed via shutdown_flags
+  //     bit 1 AND drive the TCB through ESTABLISHED->FIN_WAIT_1 (or
+  //     CLOSE_WAIT->LAST_ACK) exactly as pre-R94 tcp_close did. This is
+  //     the wire-observable half of half-close.
+  //   SHUT_RDWR (2): both of the above.
+  //
+  // Pre-R94 tcp_close is retained (called by tcp_shutdown_how's WR arm)
+  // so the R72 witness and every sys_shutdown caller written against
+  // "shutdown() means full close" keeps working -- SHUT_WR alone drives
+  // exactly the same wire transitions.
+
+  pub let tcp_shutdown_how : (u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (tcb_idx: u64, how: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "R94.M3-002 (#2066): sys_shutdown_body's typed shutdown. Reads how == SHUT_RD (0) / SHUT_WR (1) / SHUT_RDWR (2). Any other value returns 0 (silently ignored, mirroring pre-R94 sys_shutdown's own posture). For RD or RDWR: OR bit 0 into shutdown_flags @+264. For WR or RDWR: OR bit 1 AND call tcp_close (the pre-R94 primitive that drives ESTABLISHED->FIN_WAIT_1 / CLOSE_WAIT->LAST_ACK). Idempotent -- setting a bit that is already set, or WR-shutting a TCB not in ESTABLISHED/CLOSE_WAIT, are both no-ops. 2-push callee-save (rbx=tcb_idx, r12=how): entry rsp%16==8, two pushes 16 bytes land rsp%16==8, sub rsp,8 -> 0 for the nested tcp_close call. Reserved labels: tsh_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+
+        cmp r12, 2;
+        ja tsh_done;
+
+        // OR the RD bit if how in {SHUT_RD, SHUT_RDWR}.
+        mov rax, rbx; shl rax, 9; lea rcx, [rip + _tcp_tcb_table]; add rax, rcx;
+        cmp r12, 0;
+        je tsh_set_rd;
+        cmp r12, 2;
+        je tsh_set_rd;
+        jmp tsh_check_wr;
+      tsh_set_rd:
+        mov rcx, [rax + 264];
+        or rcx, 1;
+        mov [rax + 264], rcx;
+
+      tsh_check_wr:
+        cmp r12, 1;
+        je tsh_set_wr;
+        cmp r12, 2;
+        je tsh_set_wr;
+        jmp tsh_done;
+      tsh_set_wr:
+        mov rax, rbx; shl rax, 9; lea rcx, [rip + _tcp_tcb_table]; add rax, rcx;
+        mov rcx, [rax + 264];
+        or rcx, 2;
+        mov [rax + 264], rcx;
+        mov rdi, rbx;
+        call tcp_close;
+
+      tsh_done:
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
         pop rbx;
         ret
       }
@@ -1030,6 +1334,21 @@ module Tcp = structure {
         xor rcx, rcx;
         call tcp_send_segment;
 
+        // R94.M4-001 (#2068): a child TCB has been parked in the
+        // listener's backlog. A sys_accept blocked on the listener
+        // is only satisfied when the child actually reaches
+        // ESTABLISHED (SYN_RCVD + peer's ACK), which happens later
+        // via tcp_process_segment's SYN_RCVD arm -- so this wake
+        // here is EARLY: it wakes accept() which then observes
+        // tcp_accept_pending returning TCP_NONE (still handshaking)
+        // and either loops back to sched_block (a still-non-blocking
+        // MVP client won't) or, more pragmatically in a synchronous
+        // loopback smoke, sees the child ESTABLISHED because the
+        // whole handshake ran in-process before this return. See
+        // r94-closed.md for the honesty note.
+        mov rdi, [rsp + 40];                 // listener_idx
+        call tcp_wake_accept_if_any;
+
         xor rax, rax;
         jmp trh_done;
 
@@ -1146,6 +1465,69 @@ module Tcp = structure {
         cmp r14, rax; jbe tpsg_est_dup_or_stale;
         mov [rbp + 40], r14;
         xor rax, rax; mov [rbp + 112], rax;
+        // R94.M5-001 (#2071): RTT sample on unambiguous ACK. Karn's
+        // algorithm: skip the sample if last_seg_was_rxmt is set (the
+        // ACK might be responding to the original or the retransmit --
+        // sender cannot tell, so its RTT is unusable). rtt = _tick_count
+        // - last_seg_send_tick. RFC 6298 §2:
+        //   First sample: SRTT = rtt; RTTVAR = rtt/2; RTO = SRTT + 4*RTTVAR
+        //   Subsequent : RTTVAR = 3/4*RTTVAR + 1/4*|SRTT - rtt|
+        //                SRTT   = 7/8*SRTT + 1/8*rtt
+        //                RTO    = SRTT + 4*RTTVAR
+        // Clamped: RTO >= 1 tick (a zero would starve retransmit
+        // scheduling; we don't clamp UP here since the exp-backoff cap
+        // in tcp_poll_retransmits handles the upper bound).
+        mov rax, [rbp + 248];               // last_seg_was_rxmt
+        cmp rax, 0;
+        jne tpsg_est_ack_cwnd;              // Karn: skip RTT sample
+        mov rax, [rip + _tick_count];
+        mov rcx, [rbp + 256];               // last_seg_send_tick
+        sub rax, rcx;                       // rtt in ticks
+        cmp rax, 0;
+        je tpsg_est_ack_cwnd;               // 0-tick RTT (loopback) is unusable
+        mov rcx, [rbp + 216];               // SRTT
+        cmp rcx, 0;
+        jne tpsg_est_rtt_update;
+        // First sample: SRTT = rtt; RTTVAR = rtt/2; RTO = SRTT+4*RTTVAR.
+        mov [rbp + 216], rax;
+        mov rdx, rax; shr rdx, 1;
+        mov [rbp + 224], rdx;
+        mov rcx, rdx; shl rcx, 2;           // 4*RTTVAR
+        add rcx, rax;                       // SRTT+4*RTTVAR
+        cmp rcx, 0; jne tpsg_est_rto_store_new;
+        mov rcx, 1;
+      tpsg_est_rto_store_new:
+        mov [rbp + 232], rcx;
+        jmp tpsg_est_ack_cwnd;
+      tpsg_est_rtt_update:
+        // |SRTT - rtt| into rdx.
+        mov rdx, rcx;
+        cmp rdx, rax; jae tpsg_est_diff_sub_srtt;
+        mov rdx, rax; sub rdx, rcx; jmp tpsg_est_diff_done;
+      tpsg_est_diff_sub_srtt:
+        sub rdx, rax;
+      tpsg_est_diff_done:
+        // RTTVAR = 3/4*RTTVAR + 1/4*|SRTT-rtt|
+        mov r8, [rbp + 224];                // RTTVAR
+        mov r9, r8; shr r9, 2;              // 1/4 * RTTVAR
+        sub r8, r9;                         // 3/4 * RTTVAR
+        mov r10, rdx; shr r10, 2;
+        add r8, r10;
+        mov [rbp + 224], r8;
+        // SRTT = 7/8*SRTT + 1/8*rtt
+        mov r9, rcx; shr r9, 3;             // 1/8 * SRTT
+        sub rcx, r9;                        // 7/8 * SRTT
+        mov r10, rax; shr r10, 3;
+        add rcx, r10;
+        mov [rbp + 216], rcx;
+        // RTO = SRTT + 4*RTTVAR
+        mov r9, r8; shl r9, 2;
+        add r9, rcx;
+        cmp r9, 0; jne tpsg_est_rto_store_upd;
+        mov r9, 1;
+      tpsg_est_rto_store_upd:
+        mov [rbp + 232], r9;
+      tpsg_est_ack_cwnd:
         mov rax, [rbp + 96]; mov rcx, [rbp + 104];
         cmp rax, rcx; jae tpsg_est_ca;
         mov rdx, [rbp + 200]; add rax, rdx; mov [rbp + 96], rax;
@@ -1191,10 +1573,19 @@ module Tcp = structure {
         cmp rcx, 7; jne tpsg_est_ack_only;
         mov rdi, rbx; mov rsi, 0x18; mov rdx, r15; mov rcx, rax;
         call tcp_send_segment;
-        jmp tpsg_est_no_data;
+        jmp tpsg_est_data_wake;
       tpsg_est_ack_only:
         mov rdi, rbx; mov rsi, 0x10; xor rdx, rdx; xor rcx, rcx;
         call tcp_send_segment;
+      tpsg_est_data_wake:
+        // R94.M4-002 (#2069 partial) + R95.M3-002 backfill for TCP:
+        // Data has landed in this TCB's rx_buf, so any blocked recv()
+        // caller AND any blocked poll() waiter that named this fd MUST
+        // wake up. Both wake sites are check-and-clear so absent
+        // waiters are cheap no-ops.
+        mov rdi, rbx;
+        call tcp_wake_recv_if_any;
+        call poll_wake_check_and_clear;
       tpsg_est_no_data:
 
         mov rax, r12; and rax, 0x01; cmp rax, 0; je tpsg_done;
@@ -1219,8 +1610,14 @@ module Tcp = structure {
       tpsg_fw1_no_ack:
         mov rax, [rsp + 8];
         cmp rax, 3; jne tpsg_fw1_single;
+        // R94.M3-001 (#2065): full FIN+ACK arrived. Transition to
+        // TIME_WAIT and arm time_wait_deadline; DO NOT free the TCB
+        // here -- tcp_poll_retransmits' reaper frees it later.
         mov rax, 10; mov [rbp + 0], rax;
-        mov rdi, rbx; call tcp_free_tcb;
+        mov rcx, [rip + _tick_count];
+        mov rdx, 200;                       // TCP_TIME_WAIT_TICKS
+        add rcx, rdx;
+        mov [rbp + 240], rcx;
         jmp tpsg_done;
       tpsg_fw1_single:
         mov rax, [rsp + 8];
@@ -1238,15 +1635,23 @@ module Tcp = structure {
         mov rax, [rbp + 64]; add rax, 1; mov [rbp + 64], rax;
         mov rdi, rbx; mov rsi, 0x10; xor rdx, rdx; xor rcx, rcx;
         call tcp_send_segment;
+        // R94.M3-001 (#2065): TIME_WAIT delay.
         mov rax, 10; mov [rbp + 0], rax;
-        mov rdi, rbx; call tcp_free_tcb;
+        mov rcx, [rip + _tick_count];
+        mov rdx, 200;
+        add rcx, rdx;
+        mov [rbp + 240], rcx;
         jmp tpsg_done;
 
       tpsg_st_closing:
         mov rax, r12; and rax, 0x10; cmp rax, 0; je tpsg_done;
         mov rax, [rbp + 48]; cmp r14, rax; jne tpsg_done;
+        // R94.M3-001 (#2065): TIME_WAIT delay.
         mov rax, 10; mov [rbp + 0], rax;
-        mov rdi, rbx; call tcp_free_tcb;
+        mov rcx, [rip + _tick_count];
+        mov rdx, 200;
+        add rcx, rdx;
+        mov [rbp + 240], rcx;
         jmp tpsg_done;
 
       tpsg_st_last_ack:
