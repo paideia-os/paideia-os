@@ -1312,3 +1312,30 @@ and the two-track next-wave pointer (Track A: IPv6 substrate; Track
 B: Phase-2 net-stack server migration to userspace) (M1-001); this
 STATUS.md update (M1-002). Retire tag: `r99-closed` PLUS wave-level
 `net-wave-closed` (main to apply after this landing).
+
+---
+
+## R105 (GUI syscall surface + hotplug + authority boundary) — CLOSED 2026-09-02
+
+R105 lands the 17-issue GUI syscall block in a single wave: sysnos
+108-113 (`sys_display_enumerate`, `sys_framebuffer_create`,
+`sys_framebuffer_map`, `sys_page_flip`, `sys_page_flip_wait`,
+`sys_display_hotplug_subscribe`) with body-owns-cap-resolution posture
+(matching R100-PREP-003 shim style) + minimal dispatch shims. Two
+kinds co-land: **KIND_PAGE_FLIP (0x1B0)** derived over KIND_DISPLAY_
+OUTPUT, LINEAR (no `R_FLIP_MINT` bit in the rights set the substrate
+accepts; enforces the compositor-holds-flip-authority invariant) with
+`pgfl_submit` / `pgfl_deliver_vblank` primitives + `sched_wait(SCHED_
+WAIT_PAGE_FLIP=2)` waker; **KIND_HOTPLUG_CHANNEL (0x1B1)** derived
+over KIND_IPC_ENDPOINT with `hotplug_channel_deliver(event_class)`
+ISR-fanout. KIND_PAGE_FLIP was originally paired with R104 (T14 Iris
+Xe wire-up); co-landed here because R104 has not landed and the R105
+syscalls hard-depend on it. Boot witness `witness_r105_flip_client`
+walks the whole cascade end-to-end (skip on `PAIDEIA_VGA=none`;
+green on `PAIDEIA_VGA=std` with `boot r105 flip client ok --
+flips=3`). New design docs: `design/graphics/authority-boundary.md`
+(compositor-holds-flip-authority invariant + landing-time audit
+showing zero violations), `design/round-retrospectives/r105-
+closure.md`. syscall-table.md refreshed to include sysnos 108-113 +
+R105 references. Retire tag: `r105-closed` (main to apply after
+this landing).

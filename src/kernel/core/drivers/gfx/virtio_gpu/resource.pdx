@@ -1,0 +1,333 @@
+// src/kernel/core/drivers/gfx/virtio_gpu/resource.pdx -- R103.M2-001
+//                                                        (paideia-os #2159)
+//
+// virtio-gpu 2D resource lifecycle: RESOURCE_CREATE_2D + RESOURCE_UNREF,
+// plus the GET_DISPLAY_INFO enumerator (task-brief scope note: needed to
+// discover scanouts + preferred modes for the R103 MVP's single-scanout
+// pin).
+//
+// -----------------------------------------------------------------------------
+// SECTION 1  COMMAND SHAPES (virtio 1.1 §5.7)
+// -----------------------------------------------------------------------------
+//
+// Every virtio-gpu control command starts with a 24-byte header:
+//
+//   +0   u32 type            (VIRTIO_GPU_CMD_*)
+//   +4   u32 flags           (0 for R103 MVP)
+//   +8   u64 fence_id        (0 for R103 MVP -- fences are follow-on)
+//   +16  u32 ctx_id          (0 -- no 3D context at R103)
+//   +20  u32 padding
+//
+// Followed by command-specific fields:
+//
+//   RESOURCE_CREATE_2D (0x0101):
+//     +24  u32 resource_id
+//     +28  u32 format         (VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM = 1)
+//     +32  u32 width
+//     +36  u32 height
+//     Total: 40 bytes.
+//
+//   RESOURCE_UNREF (0x0102):
+//     +24  u32 resource_id
+//     +28  u32 padding
+//     Total: 32 bytes.
+//
+//   GET_DISPLAY_INFO (0x0100):
+//     Total: 24 bytes (header only).
+//     Response (resp_display_info, 24 + 16*24 = 408 bytes):
+//       header 24 bytes + 16 x { u32 x, u32 y, u32 width, u32 height,
+//                                u32 enabled, u32 flags }
+//
+// Every response starts with the same 24-byte header. Success types:
+//
+//   VIRTIO_GPU_RESP_OK_NODATA         = 0x1100
+//   VIRTIO_GPU_RESP_OK_DISPLAY_INFO   = 0x1101
+//
+// -----------------------------------------------------------------------------
+// SECTION 2  RESOURCE-ID ALLOCATION
+// -----------------------------------------------------------------------------
+//
+// Per-backend counter, u32, starts at 1 (resource_id 0 is reserved by
+// the spec). Bumped monotonically on every CREATE_2D success; no ID
+// reuse -- the R103 MVP allocates 2 IDs total (one per buffer of the
+// double-flip witness) so 32-bit space is enormously oversized. R105+
+// hotplug flows would introduce ID recycling if a compositor ever
+// destroys and re-creates resources at 60 Hz.
+//
+// -----------------------------------------------------------------------------
+// SECTION 3  ENCODER + LABEL DISCIPLINE
+// -----------------------------------------------------------------------------
+//
+// Labels prefixed `vgpu_res_`. Command header stores via mov_d (u32) --
+// bare mov [mem],reg widens per G1. Structs live in _vgpu_ctrl_cmd_buf.
+
+module Resource = structure {
+
+  pub let VIRTIO_GPU_CMD_GET_DISPLAY_INFO   : u64 = 0x0100
+  pub let VIRTIO_GPU_CMD_RESOURCE_CREATE_2D : u64 = 0x0101
+  pub let VIRTIO_GPU_CMD_RESOURCE_UNREF     : u64 = 0x0102
+
+  pub let VIRTIO_GPU_RESP_OK_NODATA         : u64 = 0x1100
+  pub let VIRTIO_GPU_RESP_OK_DISPLAY_INFO   : u64 = 0x1101
+
+  pub let VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM  : u64 = 1
+
+  pub let VGPU_RESP_HDR_TYPE_OFF            : u64 = 0
+  pub let VGPU_CMD_HDR_SIZE                 : u64 = 24
+
+  // Per-backend resource-id counter.
+  pub let mut _vgpu_next_resource_id : u64 = 1
+
+  // Scanout enumeration cache (populated by GET_DISPLAY_INFO). Only
+  // scanout 0 is used by R103 MVP; the fields for the first scanout are
+  // stashed for the witness to read the "preferred" mode from.
+  pub let mut _vgpu_scanout0_width  : u64 = 0
+  pub let mut _vgpu_scanout0_height : u64 = 0
+  pub let mut _vgpu_scanout0_enabled : u64 = 0
+
+  pub let vgpu_res_create_ok_msg : [u8; 26] = "r103 vgpu resource create\0"
+  pub let vgpu_res_dinfo_ok_msg  : [u8; 24] = "r103 vgpu display info\0\0"
+
+  // ==========================================================================
+  // Helper: write cmd header (type, flags=0, fence=0, ctx=0, pad=0) into
+  // _vgpu_ctrl_cmd_buf at offset 0.
+  // ==========================================================================
+
+  pub let vgpu_res_write_hdr : (u64) -> () !{mem} @{boot} =
+    fn (cmd_type: u64) -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "R103.M2-001: write the 24-byte virtio-gpu command header into _vgpu_ctrl_cmd_buf. All fields except type are zero at R103 MVP scope. Labels prefixed vgpu_res_h_.",
+      block: {
+        lea r10, [rip + _vgpu_ctrl_cmd_buf];
+        mov rax, rdi;
+        mov_d [r10 + 0], rax;                    // type u32
+        xor rax, rax;
+        mov_d [r10 + 4], rax;                    // flags u32
+        mov [r10 + 8], rax;                      // fence_id u64
+        mov_d [r10 + 16], rax;                   // ctx_id u32
+        mov_d [r10 + 20], rax;                   // padding u32
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // virtio_gpu_resource_create_2d(width, height) -> resource_id | sentinel
+  //
+  // Allocates the next resource_id, builds a CREATE_2D command with
+  // format=BGRA8888, submits via ctrl_submit_and_wait, verifies OK_NODATA.
+  // Returns the new resource_id in rax, or the ctrl_submit sentinel on
+  // failure.
+  //
+  // Register plan (4-push callee-save):
+  //   rbx = width
+  //   r12 = height
+  //   r13 = allocated resource_id
+  //   r14 = &_vgpu_ctrl_cmd_buf
+  //   entry rsp%16==8 -> +32 -> %16==8; sub rsp,8 -> %16==0.
+  // ==========================================================================
+
+  pub let virtio_gpu_resource_create_2d : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (width: u64, height: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "R103.M2-001: build CREATE_2D command (40 bytes). Body: (1) alloc resource_id from _vgpu_next_resource_id, bump. (2) Write header via vgpu_res_write_hdr(RESOURCE_CREATE_2D). (3) Write resource_id u32 @+24, format u32 @+28 = BGRA8888, width u32 @+32, height u32 @+36. (4) Submit with cmd_len=40, resp_len=24. (5) Verify response.type == OK_NODATA. (6) Return resource_id. Labels prefixed vgpu_res_c_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                            // width
+        mov r12, rsi;                            // height
+
+        // Allocate resource_id.
+        mov r13, [rip + _vgpu_next_resource_id];
+        mov rax, r13;
+        add rax, 1;
+        mov [rip + _vgpu_next_resource_id], rax;
+
+        // Header.
+        mov rdi, 0x0101;                         // RESOURCE_CREATE_2D
+        call vgpu_res_write_hdr;
+
+        // Body @+24: resource_id, format, width, height.
+        lea r14, [rip + _vgpu_ctrl_cmd_buf];
+        mov rax, r13;
+        mov_d [r14 + 24], rax;                   // resource_id
+        mov rax, 1;                              // BGRA8888
+        mov_d [r14 + 28], rax;
+        mov rax, rbx;
+        mov_d [r14 + 32], rax;                   // width
+        mov rax, r12;
+        mov_d [r14 + 36], rax;                   // height
+
+        // Submit (cmd_len=40, resp_len=24).
+        mov rdi, 40;
+        mov rsi, 24;
+        call virtio_gpu_ctrl_submit_and_wait;
+        cmp rax, 0;
+        jne vgpu_res_c_fail;
+
+        // Verify response.type == OK_NODATA (0x1100).
+        lea r10, [rip + _vgpu_ctrl_resp_buf];
+        xor rax, rax;
+        mov eax, [r10 + 0];
+        mov r11, 0x1100;
+        cmp rax, r11;
+        jne vgpu_res_c_fail;
+
+        // Fingerprint.
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + vgpu_res_create_ok_msg];
+        lea rcx, [rip + k_n];
+        mov r8, r13;
+        call klog_s1_d1;
+
+        mov rax, r13;                            // return resource_id
+        jmp vgpu_res_c_out;
+
+      vgpu_res_c_fail:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+
+      vgpu_res_c_out:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // virtio_gpu_resource_unref(resource_id) -> 0 | sentinel
+  // ==========================================================================
+
+  pub let virtio_gpu_resource_unref : (u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (resource_id: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "R103.M2-001: build RESOURCE_UNREF (32 bytes). Header type=0x0102, body @+24 = resource_id u32, +28 padding u32=0. Labels prefixed vgpu_res_u_.",
+      block: {
+        push rbx;
+        push r12;
+        mov rbx, rdi;
+
+        mov rdi, 0x0102;
+        call vgpu_res_write_hdr;
+
+        lea r12, [rip + _vgpu_ctrl_cmd_buf];
+        mov rax, rbx;
+        mov_d [r12 + 24], rax;
+        xor rax, rax;
+        mov_d [r12 + 28], rax;
+
+        mov rdi, 32;
+        mov rsi, 24;
+        call virtio_gpu_ctrl_submit_and_wait;
+
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // virtio_gpu_get_display_info() -> scanout_count | sentinel
+  //
+  // Issues GET_DISPLAY_INFO, verifies response type, caches scanout 0's
+  // {width, height, enabled} into the module-level slots, and returns
+  // the count of enabled scanouts (0..16). Response body layout:
+  //   +24 + i*24  { u32 x, u32 y, u32 width, u32 height,
+  //                 u32 enabled, u32 flags }
+  // ==========================================================================
+
+  pub let virtio_gpu_get_display_info : () -> u64 !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "R103 scope (task brief): enumerate scanouts + preferred modes via GET_DISPLAY_INFO. Body: (1) header only (type=0x0100, 24 bytes). (2) Submit cmd_len=24 resp_len=408 (24 hdr + 16 scanouts * 24 bytes). (3) Verify response type == OK_DISPLAY_INFO (0x1101). (4) Walk 16 scanout entries; cache scanout 0 fields; count enabled entries. Labels prefixed vgpu_res_d_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub  rsp, 8;
+
+        mov rdi, 0x0100;
+        call vgpu_res_write_hdr;
+
+        mov rdi, 24;
+        mov rsi, 408;
+        call virtio_gpu_ctrl_submit_and_wait;
+        cmp rax, 0;
+        jne vgpu_res_d_fail;
+
+        lea r12, [rip + _vgpu_ctrl_resp_buf];
+        xor rax, rax;
+        mov eax, [r12 + 0];
+        mov r11, 0x1101;                         // OK_DISPLAY_INFO
+        cmp rax, r11;
+        jne vgpu_res_d_fail;
+
+        // Cache scanout 0 (offset 24 in response).
+        xor rax, rax;
+        mov eax, [r12 + 24 + 8];                 // width (skip x,y)
+        mov [rip + _vgpu_scanout0_width], rax;
+        xor rax, rax;
+        mov eax, [r12 + 24 + 12];                // height
+        mov [rip + _vgpu_scanout0_height], rax;
+        xor rax, rax;
+        mov eax, [r12 + 24 + 16];                // enabled
+        mov [rip + _vgpu_scanout0_enabled], rax;
+
+        // Count enabled scanouts across all 16.
+        xor rbx, rbx;                            // count
+        xor rcx, rcx;                            // i
+      vgpu_res_d_loop:
+        cmp rcx, 16;
+        jae vgpu_res_d_loop_done;
+        // enabled = *(u32*)(r12 + 24 + i*24 + 16). Compute i*24 via
+        // (i<<4) + (i<<3) so we avoid `imul r64, imm` (paideia-as does
+        // not emit that 2-operand form; use 3-operand or shift+add).
+        mov r13, rcx;
+        shl r13, 4;                              // i * 16
+        mov r14, rcx;
+        shl r14, 3;                              // i * 8
+        add r13, r14;                            // i * 24
+        add r13, r12;
+        add r13, 24;
+        add r13, 16;
+        xor rax, rax;
+        mov eax, [r13];
+        cmp rax, 0;
+        je  vgpu_res_d_skip;
+        add rbx, 1;
+      vgpu_res_d_skip:
+        add rcx, 1;
+        jmp vgpu_res_d_loop;
+
+      vgpu_res_d_loop_done:
+        // Fingerprint.
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + vgpu_res_dinfo_ok_msg];
+        lea rcx, [rip + k_count];
+        mov r8, rbx;
+        call klog_s1_d1;
+
+        mov rax, rbx;
+        jmp vgpu_res_d_out;
+
+      vgpu_res_d_fail:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+
+      vgpu_res_d_out:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

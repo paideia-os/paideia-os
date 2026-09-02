@@ -1,0 +1,474 @@
+// src/kernel/core/drivers/gfx/virtio_gpu/controlq.pdx -- R103.M1-004
+//                                                       (paideia-os #2157)
+//
+// Split virtqueue for the virtio-gpu control queue (queue index 0),
+// plus a submit-and-poll helper that every RESOURCE_* / SCANOUT /
+// TRANSFER / FLUSH command in this driver rides on.
+//
+// Structurally identical to drivers/virtio_net/virtqueue.pdx (R91.M3-003)
+// with queue_size=16 (the R103 MVP never has more than ~5 commands in
+// flight simultaneously) and the addition of a synchronous submit_and_wait
+// primitive that polls the used ring for the specific completion. The
+// R101 sim-vblank precedent + this landing's isr.pdx provide the
+// asynchronous vblank-signalling path; the setup commands
+// (RESOURCE_CREATE_2D, ATTACH_BACKING, SET_SCANOUT, GET_DISPLAY_INFO)
+// use the sync form because they must complete before the next command
+// is issued.
+//
+// -----------------------------------------------------------------------------
+// SECTION 1  DMA-facing .bss pages
+// -----------------------------------------------------------------------------
+//
+//   _vgpu_ctrl_desc_pg              4 KiB   descriptor table (uses 16*16 = 256)
+//   _vgpu_ctrl_avail_used_pg        4 KiB   avail @+0, used @+2048
+//   _vgpu_ctrl_cmd_buf              4 KiB   outgoing command bytes
+//   _vgpu_ctrl_resp_buf             4 KiB   incoming response bytes
+//
+// The cmd/resp buffer pair is shared across all commands (serial submit
+// discipline); a single command is in flight at a time. The polling
+// primitive returns to the caller only after used.idx advances.
+//
+// -----------------------------------------------------------------------------
+// SECTION 2  DOORBELL
+// -----------------------------------------------------------------------------
+//
+// Doorbell VA = notify_bar_va + queue_notify_off * notify_off_multiplier.
+// queue_notify_off is read from COMMON_CFG.QUEUE_NOTIFY (u16 @+0x1E)
+// AFTER writing QUEUE_SELECT=0. Stashed into _vgpu_ctrl_doorbell_va at
+// init time so the tight submit path avoids the read.
+//
+// -----------------------------------------------------------------------------
+// SECTION 3  ENCODER + LABEL DISCIPLINE
+// -----------------------------------------------------------------------------
+//
+// Labels prefixed `vgpu_cq_`. All notes on encoder floor and sized
+// stores match virtio_net/virtqueue.pdx §5 verbatim.
+
+module Controlq = structure {
+
+  pub let VGPU_VQ_SIZE                 : u64 = 16
+  pub let VGPU_VQ_WRAP_MASK            : u64 = 15
+
+  pub let VGPU_VQ_DESC_SIZE            : u64 = 16
+  pub let VGPU_VQ_DESC_F_NEXT          : u64 = 1
+  pub let VGPU_VQ_DESC_F_WRITE         : u64 = 2
+
+  pub let VGPU_VQ_AVAIL_OFF_IDX        : u64 = 2
+  pub let VGPU_VQ_AVAIL_OFF_RING       : u64 = 4
+  pub let VGPU_VQ_USED_OFF_IDX         : u64 = 2
+  pub let VGPU_VQ_USED_OFF_RING        : u64 = 4
+  pub let VGPU_VQ_USED_ELEM_SIZE       : u64 = 8
+  pub let VGPU_VQ_USED_IN_PAGE_OFFSET  : u64 = 2048
+
+  pub let VGPU_CTRLQ_ID                : u64 = 0
+
+  pub let VGPU_VQ_OK                   : u64 = 0
+  pub let VGPU_VQ_ERR_NO_BAR           : u64 = 0xFFFFFFFFFFFFFFED
+  pub let VGPU_VQ_ERR_SIZE_TOO_SMALL   : u64 = 0xFFFFFFFFFFFFFFE0
+  pub let VGPU_VQ_ERR_TIMEOUT          : u64 = 0xFFFFFFFFFFFFFFDF
+
+  // Submit-poll budget. Each iteration is a single MMIO-adjacent WB
+  // load; a bounded loop of ~100M iterations is orders of magnitude
+  // above what a live QEMU virtio-gpu takes to complete a 2D command
+  // (typically <1ms), yet safely finite even against a stalled host.
+  pub let VGPU_POLL_BUDGET             : u64 = 100000000
+
+  pub let mut _vgpu_ctrl_desc_pg       : [u64; 512] = uninit @align(4096)
+  pub let mut _vgpu_ctrl_avail_used_pg : [u64; 512] = uninit @align(4096)
+  pub let mut _vgpu_ctrl_cmd_buf       : [u64; 512] = uninit @align(4096)
+  pub let mut _vgpu_ctrl_resp_buf      : [u64; 512] = uninit @align(4096)
+
+  // Stashed at queue init time. Zero until controlq_init runs.
+  pub let mut _vgpu_ctrl_doorbell_va   : u64 = 0
+  pub let mut _vgpu_notify_bar_va      : u64 = 0
+  pub let mut _vgpu_ctrl_last_used_idx : u64 = 0
+
+  // Pending flush counter -- bumped by flush.pdx, drained by isr.pdx.
+  // Consulted by the LAPIC-tick fallback in isr.pdx (M4-002).
+  pub let mut _vgpu_ctrl_pending_flushes : u64 = 0
+
+  pub let vgpu_ctrlq_init_ok_msg : [u8; 22] = "r103 vgpu ctrlq init\0\0"
+
+  // ==========================================================================
+  // virtio_gpu_ctrlq_init() -> u64
+  //
+  // Program COMMON_CFG for control queue (index 0) using the .bss pages
+  // above as the ring PAs. Also maps the notify BAR (once) and computes
+  // the doorbell VA for queue 0.
+  //
+  // Returns VGPU_VQ_OK on success or a sentinel per §return-codes.
+  //
+  // Register plan (5-push callee-save + sub rsp,8 for alignment):
+  //   rbx = _virtio_gpu_common_cfg_pa
+  //   r12 = &_virtio_gpu_devices[0]
+  //   r13 = notify_bar_va (mapped in step 2)
+  //   r14 = queue_notify_off (read from QUEUE_NOTIFY after select=0)
+  //   r15 = doorbell_va
+  //   entry rsp%16==8 -> 5 pushes = 48 -> %16==0.
+  // ==========================================================================
+
+  pub let virtio_gpu_ctrlq_init : () -> u64 !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "R103.M1-004 (paideia-os #2157). Control-queue bring-up for the first-active virtio-gpu device. Body: (1) Gate on _virtio_gpu_common_cfg_pa (return VGPU_VQ_ERR_NO_BAR if 0). (2) Map notify BAR (bar4_pa) via platform_mmio_map(MMIO_UC=0) if _vgpu_notify_bar_va is 0 (first-time only); stash into _vgpu_notify_bar_va. Stash BAR VA also into device record @+48. (3) QUEUE_SELECT = 0. (4) Read device's max QUEUE_SIZE (u16 @+0x18); if < VGPU_VQ_SIZE(=16) return VGPU_VQ_ERR_SIZE_TOO_SMALL. (5) QUEUE_SIZE = 16. (6) Read QUEUE_NOTIFY (u16 @+0x1E) into r14; compute doorbell_va = notify_bar_va + queue_notify_off * notify_off_multiplier (u32 @ device+36); stash into _vgpu_ctrl_doorbell_va. (7) QUEUE_DESC = &_vgpu_ctrl_desc_pg (lo/hi via two u32 writes per virtio 1.1 §4.1.3.1). (8) QUEUE_DRIVER = &_vgpu_ctrl_avail_used_pg (avail is at offset 0 of that page). (9) QUEUE_DEVICE = &_vgpu_ctrl_avail_used_pg + 2048 (used ring at +2048 per §1). (10) QUEUE_ENABLE = 1. (11) Emit OK fingerprint. Labels prefixed vgpu_cq_i_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 8;
+
+        mov  rbx, [rip + _virtio_gpu_common_cfg_pa];
+        cmp  rbx, 0;
+        jne  vgpu_cq_i_have_bar;
+        mov  rax, 0xFFFFFFFFFFFFFFED;
+        jmp  vgpu_cq_i_done;
+
+      vgpu_cq_i_have_bar:
+        lea  r12, [rip + _virtio_gpu_devices];
+
+        // (2) Map notify BAR (bar4_pa) once. Notify cfg lives inside
+        // BAR4 for QEMU's virtio-gpu-pci; we map the whole BAR4 window
+        // (small -- one page is enough for the notify structure).
+        mov  r13, [rip + _vgpu_notify_bar_va];
+        cmp  r13, 0;
+        jne  vgpu_cq_i_have_notify;
+
+        mov  rdi, [r12 + 8];                     // bar4_pa
+        mov  rsi, 4096;
+        mov  rdx, 0;                             // MMIO_UC
+        call platform_mmio_map;
+        cmp  rax, 0;
+        je   vgpu_cq_i_map_fail;
+        mov  r13, rax;
+        mov  [rip + _vgpu_notify_bar_va], r13;
+        mov  [r12 + 48], r13;
+
+      vgpu_cq_i_have_notify:
+
+        // (3) QUEUE_SELECT = 0.
+        mov  rdi, rbx;
+        mov  rsi, 0x16;
+        xor  rdx, rdx;
+        call vgpu_cc_write_u16;
+
+        // (4) Verify device's max QUEUE_SIZE >= 16.
+        mov  rdi, rbx;
+        mov  rsi, 0x18;
+        call vgpu_cc_read_u16;
+        cmp  rax, 16;
+        jae  vgpu_cq_i_size_ok;
+        mov  rax, 0xFFFFFFFFFFFFFFE0;
+        jmp  vgpu_cq_i_done;
+
+      vgpu_cq_i_size_ok:
+        // (5) QUEUE_SIZE = 16.
+        mov  rdi, rbx;
+        mov  rsi, 0x18;
+        mov  rdx, 16;
+        call vgpu_cc_write_u16;
+
+        // (6) Read QUEUE_NOTIFY offset and compute doorbell_va.
+        mov  rdi, rbx;
+        mov  rsi, 0x1E;
+        call vgpu_cc_read_u16;
+        mov  r14, rax;                           // queue_notify_off
+
+        // notify_off_multiplier is u32 @ device+36. `mov eax, [addr]`
+        // zero-extends into the upper 32 bits of rax per SDM Vol 2A
+        // §3.4.1.1 (same shape as e1000e_reg_u32).
+        mov  rax, r12;
+        add  rax, 36;
+        mov  eax, [rax];
+        // doorbell = notify_bar_va + queue_notify_off * multiplier.
+        imul rax, r14;
+        mov  r15, r13;
+        add  r15, rax;
+        mov  [rip + _vgpu_ctrl_doorbell_va], r15;
+
+        // (7) QUEUE_DESC = &_vgpu_ctrl_desc_pg (lo/hi split).
+        lea  rax, [rip + _vgpu_ctrl_desc_pg];
+        mov  rdi, rbx;
+        mov  rsi, 0x20;
+        mov  rdx, rax;
+        call vgpu_cc_write_u32;
+        lea  rax, [rip + _vgpu_ctrl_desc_pg];
+        shr  rax, 32;
+        mov  rdi, rbx;
+        mov  rsi, 0x24;
+        mov  rdx, rax;
+        call vgpu_cc_write_u32;
+
+        // (8) QUEUE_DRIVER = &_vgpu_ctrl_avail_used_pg (avail @+0).
+        lea  rax, [rip + _vgpu_ctrl_avail_used_pg];
+        mov  rdi, rbx;
+        mov  rsi, 0x28;
+        mov  rdx, rax;
+        call vgpu_cc_write_u32;
+        lea  rax, [rip + _vgpu_ctrl_avail_used_pg];
+        shr  rax, 32;
+        mov  rdi, rbx;
+        mov  rsi, 0x2C;
+        mov  rdx, rax;
+        call vgpu_cc_write_u32;
+
+        // (9) QUEUE_DEVICE = &_vgpu_ctrl_avail_used_pg + 2048 (used @+2048).
+        lea  rax, [rip + _vgpu_ctrl_avail_used_pg];
+        add  rax, 2048;
+        mov  rdi, rbx;
+        mov  rsi, 0x30;
+        mov  rdx, rax;
+        call vgpu_cc_write_u32;
+        lea  rax, [rip + _vgpu_ctrl_avail_used_pg];
+        add  rax, 2048;
+        shr  rax, 32;
+        mov  rdi, rbx;
+        mov  rsi, 0x34;
+        mov  rdx, rax;
+        call vgpu_cc_write_u32;
+
+        // (10) QUEUE_ENABLE = 1.
+        mov  rdi, rbx;
+        mov  rsi, 0x1C;
+        mov  rdx, 1;
+        call vgpu_cc_write_u16;
+
+        // Fingerprint.
+        mov  rdi, 3;
+        lea  rsi, [rip + SUBSYS_DRV_];
+        lea  rdx, [rip + vgpu_ctrlq_init_ok_msg];
+        call klog_s1;
+
+        xor  rax, rax;
+        jmp  vgpu_cq_i_done;
+
+      vgpu_cq_i_map_fail:
+        mov  rax, 0xFFFFFFFFFFFFFFED;
+
+      vgpu_cq_i_done:
+        add  rsp, 8;
+        pop  r15;
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbp;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // virtio_gpu_ctrl_submit_and_wait(cmd_len, resp_len) -> u64
+  //
+  // Ships the current contents of _vgpu_ctrl_cmd_buf (cmd_len bytes) to
+  // the device via the control queue's descriptor chain, rings the
+  // doorbell, and polls the used ring until this submission's index
+  // completes. On success returns 0; on poll-budget exhaustion returns
+  // VGPU_VQ_ERR_TIMEOUT.
+  //
+  // Assumes serial submit discipline (only one command in flight at
+  // a time; every caller in this driver honours that at the R103
+  // MVP scope).
+  //
+  // Descriptor chain: desc[0] = { addr: cmd_buf, len: cmd_len,
+  //                               flags: F_NEXT, next: 1 }
+  //                   desc[1] = { addr: resp_buf, len: resp_len,
+  //                               flags: F_WRITE, next: 0 }
+  //
+  // Register plan (5-push callee-save + sub rsp,8):
+  //   rbx = new_avail_idx (old + 1) / poll iteration counter
+  //   r12 = cmd_len
+  //   r13 = resp_len
+  //   r14 = _vgpu_ctrl_doorbell_va
+  //   r15 = &_vgpu_ctrl_avail_used_pg (avail base) / used base later
+  //   rbp = saved last_used_idx
+  // ==========================================================================
+
+  pub let virtio_gpu_ctrl_submit_and_wait : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (cmd_len: u64, resp_len: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "R103.M1-004: build a 2-descriptor chain (cmd F_NEXT->resp F_WRITE) at desc[0]/desc[1], publish head=0 into avail ring (idx = idx+1), ring the doorbell (u16 write of queue_id=0), and poll used.idx until it advances past our snapshot. Serial submit -- only one in-flight command in this driver at R103 MVP. On success advances _vgpu_ctrl_last_used_idx by 1 so the next call starts fresh. Timeout path returns VGPU_VQ_ERR_TIMEOUT after VGPU_POLL_BUDGET iterations without a used advance. Labels prefixed vgpu_cq_s_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 8;
+
+        mov  r12, rdi;                           // cmd_len
+        mov  r13, rsi;                           // resp_len
+        mov  r14, [rip + _vgpu_ctrl_doorbell_va];
+        cmp  r14, 0;
+        je   vgpu_cq_s_no_bar;
+
+        // Build desc[0]: addr = cmd_buf, len = cmd_len, flags = F_NEXT,
+        // next = 1.
+        lea  r15, [rip + _vgpu_ctrl_desc_pg];
+        lea  rax, [rip + _vgpu_ctrl_cmd_buf];
+        mov  [r15 + 0], rax;                     // addr u64
+        mov  rax, r12;
+        mov_d [r15 + 8], rax;                    // len u32
+        mov  rax, 1;                             // VGPU_VQ_DESC_F_NEXT
+        mov_w [r15 + 12], rax;                   // flags u16
+        mov  rax, 1;
+        mov_w [r15 + 14], rax;                   // next u16 = 1
+
+        // Build desc[1]: addr = resp_buf, len = resp_len, flags = F_WRITE.
+        lea  rax, [rip + _vgpu_ctrl_resp_buf];
+        mov  [r15 + 16], rax;
+        mov  rax, r13;
+        mov_d [r15 + 24], rax;
+        mov  rax, 2;                             // VGPU_VQ_DESC_F_WRITE
+        mov_w [r15 + 28], rax;
+        xor  rax, rax;
+        mov_w [r15 + 30], rax;
+
+        // Zero the response buffer so a stale prior response cannot
+        // masquerade as this one.
+        lea  rax, [rip + _vgpu_ctrl_resp_buf];
+        xor  rcx, rcx;
+      vgpu_cq_s_zeroresp:
+        cmp  rcx, r13;
+        jae  vgpu_cq_s_zeroresp_done;
+        xor  r10, r10;
+        mov_b [rax + rcx * 1], r10;
+        add  rcx, 1;
+        jmp  vgpu_cq_s_zeroresp;
+      vgpu_cq_s_zeroresp_done:
+
+        // Publish head=0 into avail ring.
+        lea  r15, [rip + _vgpu_ctrl_avail_used_pg];
+        // Read current avail.idx (u16 @+2).
+        xor  rax, rax;
+        mov_w rax, [r15 + 2];
+        // slot = idx & 15 (wrap for size=16).
+        mov  rcx, rax;
+        and  rcx, 15;
+        // ring[slot] = 0 (desc head index)
+        mov  r10, rcx;
+        shl  r10, 1;                             // slot * 2
+        add  r10, r15;
+        add  r10, 4;                             // avail ring base
+        xor  r11, r11;
+        mov_w [r10], r11;                        // desc head = 0
+        mfence;
+        // idx = idx + 1.
+        add  rax, 1;
+        mov  rbx, rax;                           // new_idx
+        mov_w [r15 + 2], rax;
+        mfence;
+
+        // Ring doorbell (u16 write of queue_id = 0 to doorbell VA).
+        xor  rax, rax;
+        mov_w [r14], rax;
+        mfence;
+
+        // Poll used.idx until it advances past _vgpu_ctrl_last_used_idx.
+        mov  rbp, [rip + _vgpu_ctrl_last_used_idx];
+        and  rbp, 0xFFFF;
+
+        // used base = avail_used_pg + 2048.
+        add  r15, 2048;
+
+        xor  rcx, rcx;                           // poll counter
+      vgpu_cq_s_poll:
+        mfence;
+        xor  rax, rax;
+        mov_w rax, [r15 + 2];
+        cmp  rax, rbp;
+        jne  vgpu_cq_s_done_ok;
+        add  rcx, 1;
+        mov  r10, 100000000;
+        cmp  rcx, r10;
+        jae  vgpu_cq_s_timeout;
+        jmp  vgpu_cq_s_poll;
+
+      vgpu_cq_s_done_ok:
+        // Advance our last_used cursor.
+        mov  rax, rbp;
+        add  rax, 1;
+        mov  [rip + _vgpu_ctrl_last_used_idx], rax;
+        xor  rax, rax;
+        jmp  vgpu_cq_s_done;
+
+      vgpu_cq_s_timeout:
+        mov  rax, 0xFFFFFFFFFFFFFFDF;
+        jmp  vgpu_cq_s_done;
+
+      vgpu_cq_s_no_bar:
+        mov  rax, 0xFFFFFFFFFFFFFFED;
+
+      vgpu_cq_s_done:
+        add  rsp, 8;
+        pop  r15;
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbp;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // virtio_gpu_ctrl_notify() -> ()
+  //
+  // Just ring the doorbell. Used by the async submit path (flush.pdx)
+  // which does NOT poll -- the isr / LAPIC-tick fallback drains the used
+  // ring instead.
+  //
+  // A prior avail-ring publish must have happened before this call.
+  // ==========================================================================
+
+  pub let virtio_gpu_ctrl_notify : () -> () !{sysreg, mem} @{boot} =
+    fn () -> unsafe {
+      effects: {sysreg, mem}, capabilities: {boot},
+      justification: "R103.M1-004: leaf helper -- writes queue_id=0 to _vgpu_ctrl_doorbell_va so the device wakes on newly-published avail entries. No-op if doorbell VA is 0 (init not run). Labels prefixed vgpu_cq_n_.",
+      block: {
+        mov  r10, [rip + _vgpu_ctrl_doorbell_va];
+        cmp  r10, 0;
+        je   vgpu_cq_n_out;
+        xor  rax, rax;
+        mov_w [r10], rax;
+        mfence;
+      vgpu_cq_n_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // virtio_gpu_ctrl_publish_avail() -> ()
+  //
+  // Publish desc head 0 into the avail ring (increment avail.idx). Used
+  // by the async submit path (flush.pdx) so the caller can build the
+  // descriptor separately from ringing the notify.
+  // ==========================================================================
+
+  pub let virtio_gpu_ctrl_publish_avail : () -> () !{mem} @{boot} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "R103.M1-004: publish head=0 into the avail ring; store fence sandwich so the ring[] write globally-orders before the idx write per virtio 1.1 §2.6.8.2. Labels prefixed vgpu_cq_p_.",
+      block: {
+        lea  r10, [rip + _vgpu_ctrl_avail_used_pg];
+        xor  rax, rax;
+        mov_w rax, [r10 + 2];
+        mov  rcx, rax;
+        and  rcx, 15;
+        mov  r11, rcx;
+        shl  r11, 1;
+        add  r11, r10;
+        add  r11, 4;
+        xor  r8, r8;
+        mov_w [r11], r8;
+        mfence;
+        add  rax, 1;
+        mov_w [r10 + 2], rax;
+        mfence;
+        ret
+      }
+    }
+}

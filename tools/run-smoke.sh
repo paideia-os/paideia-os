@@ -850,6 +850,28 @@ case "${EXPECTED}" in
         TIMEOUT=20
         EXPECTED=""
         ;;
+    boot_r103_virtio_gpu)
+        # R103.M5-002 (paideia-os #2168): pins the R103.M5-001 witness's
+        # success fingerprint proving the virtio-gpu 2D backend pipeline
+        # end-to-end (probe -> handshake -> ctrlq/cursorq init -> resource
+        # create -> attach backing -> set scanout -> transfer -> flush ->
+        # double-flip readback verify).
+        #
+        # Runs under PAIDEIA_VGA=virtio (forcing `-vga none -device
+        # virtio-gpu-pci` in run-qemu.sh) so the virtio-gpu probe finds a
+        # device to bind. Without PAIDEIA_VGA forced, the witness takes
+        # the skip path and the golden fails -- pinning the invariant
+        # that the smoke mode carries its own VGA env override, matching
+        # PAIDEIA_VGA=std's boot_r101_stdvga posture.
+        #
+        # Golden (contains-in-order substring match):
+        #   `boot r103 virtio_gpu double_flip ok`
+        export PAIDEIA_VGA=virtio
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r103-virtio-gpu.golden"
+        TIMEOUT=20
+        EXPECTED=""
+        ;;
     boot_r101_stdvga)
         # R101.M4-003 (paideia-os #2152): pins the R101.M4-001 witness's
         # success fingerprint proving KIND_DISPLAY_BACKEND + KIND_
@@ -872,6 +894,50 @@ case "${EXPECTED}" in
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r101-stdvga.golden"
         TIMEOUT=15
+        EXPECTED=""
+        ;;
+    boot_r105_flip_client_std)
+        # R105.M6-001 (paideia-os R105 landing): pins the R105 flip-
+        # client witness's success fingerprint proving sys_display_
+        # enumerate / sys_framebuffer_create / sys_framebuffer_map /
+        # sys_page_flip x 3 / sys_page_flip_wait x 3 / sys_display_
+        # hotplug_subscribe end-to-end against QEMU's Bochs stdvga.
+        #
+        # Runs under PAIDEIA_VGA=std for the same reason as boot_r101_
+        # stdvga. Without the env, the witness skips cleanly and the
+        # golden fails.
+        #
+        # Golden (contains-in-order substring match):
+        #   `boot r105 flip client ok -- flips=3`
+        export PAIDEIA_VGA=std
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r105-flip-client.golden"
+        TIMEOUT=20
+        EXPECTED=""
+        ;;
+    boot_r105_flip_client_virtio)
+        # R105.M6-001 virtio arm. At R105 the virtio-gpu backend has
+        # not yet landed (R103 owns that scope); this mode is a
+        # placeholder that pins the SKIP fingerprint under PAIDEIA_VGA=
+        # virtio -- the witness detects no Bochs device (correctly)
+        # and takes the clean-skip path. When R103 lands, the mode
+        # flips to the OK fingerprint.
+        export PAIDEIA_VGA=virtio
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r105-flip-client-virtio-skip.golden"
+        TIMEOUT=20
+        EXPECTED=""
+        ;;
+    boot_r105_flip_client_t14)
+        # R105.M6-001 T14 arm. Gated on real-hardware presence per the
+        # R51.M8-006 T14 witness pattern. Placeholder at R105 -- the
+        # witness routes through the same Bochs skip path on a T14 UEFI
+        # boot (no stdvga device), and the golden pins the skip line.
+        # R104 lands the actual T14 modeset that this mode's OK line
+        # will eventually track.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r105-flip-client-t14-skip.golden"
+        TIMEOUT=30
         EXPECTED=""
         ;;
     boot_r91_nic)
