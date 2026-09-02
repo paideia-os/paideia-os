@@ -302,6 +302,20 @@ ALLOWLIST = {
         "the ring. Assertable via a one-shot future kernel-side "
         "witness (see keys.pdx §tag_sys_mountinfo_ok comment).",
 
+    # src/kernel/core/syscall/handlers/sys_volume_mint.pdx --
+    # R90-XREPO.LV11.M2-003 (paideia-os #2225) fingerprint emitted
+    # by sys_volume_mint_body on the OK path only.  This landing
+    # wires the marshalling shim + cap-kind substrate; no boot
+    # witness exercises it yet.  The libpdx-volume v1.1.0 follow-
+    # up round that flips vol_kind_mint / vol_kind_mint_elevate
+    # from stub to real is the first consumer, and its own witness
+    # will pin an assertable golden line at that landing.
+    "sys volume mint ok [legacy: SYS VOLUME MINT OK]":
+        "R90-XREPO.LV11.M2-003 (#2225) tag emitted by sys_volume_"
+        "mint_body OK path; assertable when libpdx-volume v1.1.0's "
+        "vol_kind_mint follow-up round adds a boot witness that "
+        "exercises the syscall end-to-end.",
+
     # R69 SMP scheduler dispatch markers — emitted only by the
     # boot_r69_smp_dispatch witness which runs under the opt-in
     # PAIDEIA_R69_SMP=1 pre-push gate (mirror of the PAIDEIA_UEFI_OVMF=1
