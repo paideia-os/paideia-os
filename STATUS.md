@@ -1245,3 +1245,18 @@ R57 delivered the substrate for POSIX-style userland tools: two new kernel sysca
 None (R57 ran under QEMU `-kernel`).
 
 **Next Round:** R58 (shell redirects + /bin/rm/mv/cp/mkdir/touch). Zero R57 kernel-side blockers.
+
+---
+
+## R91 (Generic NIC dispatch + three-driver bring-up) — CLOSED 2026-09-01
+
+R91 closes as a six-milestone wave landing the kernel-native path to
+the first real Ethernet frame: KIND_NIC capability (M1), e1000e probe
++ activation + KIND_NIC publication (M2), from-scratch virtio-net 1.0
+driver — probe, handshake, virtqueue init, TX, RX, MAC, ISR (M3),
+from-scratch RTL8139 driver — probe, reset, RX init, TX, MAC, ISR
+(M4), boot-order probe cascade + PAIDEIA_NIC env switch + cross-
+driver readback witness (M5), legacy stub cleanup + this retrospective
+(M6). See `design/round-retrospectives/r91-closed.md` for the full
+per-issue disposition, debt inventory, and the deferred-items list.
+Retire tag: `r91-closed` (main to apply after this landing).

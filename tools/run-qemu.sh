@@ -6,18 +6,22 @@
 #
 # Environment variables:
 #   PAIDEIA_NIC=<e1000e|virtio|rtl8139|none>
-#       Attach an emulated NIC to the guest. Default: none (no -netdev / -device
-#       NIC flags are added, preserving bit-identical args for non-network smokes).
+#       Attach an emulated NIC to the guest. Default: virtio (R91.M5-002
+#       #2030 -- superseding the earlier `none` default so the boot_r91_
+#       nic_probe witness has a live NIC to attest against without every
+#       invocation naming a PAIDEIA_NIC value explicitly).
 #       - e1000e : -netdev user,id=net0,hostfwd=tcp::0-:0
 #                  -device e1000e,netdev=net0
 #       - virtio : -netdev user,id=net0,hostfwd=tcp::0-:0
 #                  -device virtio-net-pci,netdev=net0
 #       - rtl8139: -netdev user,id=net0
 #                  -device rtl8139,netdev=net0
-#       - none   : (default) no NIC flags emitted.
-#       R91.M2-004: added so R91 NIC-probe smokes can enable e1000e without
-#       affecting other boot smokes. tools/run-smoke.sh's boot_r91_nic_probe
-#       mode (issue #2031) will set PAIDEIA_NIC=e1000e.
+#       - none   : no NIC flags emitted (opt-in for bit-identical
+#                  pre-R91 arg lists on non-network smokes).
+#       R91.M2-004 introduced the switch itself with a `none` default so
+#       R91-adjacent smokes could enable e1000e without perturbing other
+#       modes; R91.M5-002 flips the default to `virtio` now that the
+#       full three-NIC probe cascade + attach step lands (issue #2030).
 
 set -euo pipefail
 
@@ -29,11 +33,13 @@ if [[ ! -f "${KERNEL}" ]]; then
     exit 1
 fi
 
-# R91.M2-004: compose optional NIC flags based on PAIDEIA_NIC. Default 'none'
-# keeps QEMU's arg list bit-identical to pre-R91.M2-004 behavior for every
-# smoke that does not exercise the network stack.
+# R91.M2-004 / R91.M5-002: compose optional NIC flags based on PAIDEIA_NIC.
+# Default 'virtio' (R91.M5-002 #2030) gives the boot_r91_nic_probe witness
+# a live NIC to attest against on every default boot. Opt-in `none` keeps
+# QEMU's arg list bit-identical to pre-R91.M2-004 behavior for smokes that
+# must not carry a NIC (rare -- most smokes tolerate the extra `-device`).
 NIC_ARGS=()
-case "${PAIDEIA_NIC:-none}" in
+case "${PAIDEIA_NIC:-virtio}" in
     none)
         ;;
     e1000e)
