@@ -1,0 +1,663 @@
+// src/kernel/core/drivers/virtio_net/virtqueue.pdx -- R91.M3-003 (paideia-os #2021)
+//
+// Modern virtio 1.0/1.1 SPLIT virtqueue layout + driver-side ring primitives
+// (init, add-to-avail, reap-from-used) for the from-scratch virtio-net
+// driver landed by R91.M3. Downstream siblings R91.M3-004 (tx) and
+// R91.M3-005 (rx/isr) consume these primitives.
+//
+// Spec references:
+//   * virtio 1.1 §2.6      -- Split virtqueue definition (descriptor
+//                             table, driver-owned avail ring, device-
+//                             owned used ring).
+//   * virtio 1.1 §2.6.5    -- Descriptor Table layout: 16 B per entry
+//                             (addr:8, len:4, flags:2, next:2).
+//   * virtio 1.1 §2.6.6    -- Available Ring layout: 4 B header
+//                             (flags:2, idx:2) + 2 B * queue_size ring
+//                             + 2 B used_event (feature-gated).
+//   * virtio 1.1 §2.6.8    -- Used Ring layout: 4 B header (flags:2,
+//                             idx:2) + 8 B * queue_size (id:4, len:4)
+//                             + 2 B avail_event (feature-gated).
+//   * virtio 1.1 §2.6.8.2  -- Memory-barrier discipline: driver MUST
+//                             emit a suitable barrier BEFORE reading a
+//                             used ring entry and BEFORE writing avail.idx.
+//   * virtio 1.1 §4.1.3.1  -- 64-bit common-config fields (QUEUE_DESC,
+//                             QUEUE_DRIVER, QUEUE_DEVICE) MUST be
+//                             accessed as two 32-bit halves; a bare
+//                             64-bit MMIO transaction is disallowed.
+//
+// =============================================================================
+// SECTION 0  SCOPE (R91.M3-003, paideia-os #2021)
+// =============================================================================
+//
+// R91.M3-003 lands three primitives:
+//
+//   (1) virtio_net_vq_init          -- program COMMON_CFG's per-queue
+//                                      registers (QUEUE_SELECT, QUEUE_SIZE,
+//                                      QUEUE_DESC, QUEUE_DRIVER, QUEUE_DEVICE,
+//                                      QUEUE_ENABLE) for one virtqueue.
+//   (2) virtio_net_vq_add_avail     -- driver-side "publish descriptor into
+//                                      the avail ring" primitive.
+//   (3) virtio_net_vq_reap_used     -- driver-side "collect completion
+//                                      from the used ring" primitive.
+//
+// The fixed QUEUE_SIZE for the MVP is VNET_VQ_SIZE = 64. Two virtqueues
+// exist per virtio-net device: RX (queue 0) and TX (queue 1). Control
+// queue (VIRTIO_NET_F_CTRL_VQ, feature bit 17) is deferred -- the R91.M3
+// negotiated feature set (see common_cfg.pdx VNET_F_ACK_LO_MASK) does
+// not ACK it, and this file does not allocate a third pair of pages.
+//
+// The four DMA pages (rx desc, rx avail+used, tx desc, tx avail+used)
+// are statically allocated in .bss with @align(4096). MVP scope
+// per design/networking/r91-plan.md §4.1 is one virtio-net device at a
+// time; a follow-on wave that supports multiple virtio-net NICs would
+// promote these to a per-device row (mirroring how e1000e's _e1000e_rx_ring
+// today is a single global rather than a per-device array).
+//
+// =============================================================================
+// SECTION 1  SPLIT VIRTQUEUE LAYOUT (virtio 1.1 §2.6, per-queue)
+// =============================================================================
+//
+//   Descriptor Table (16 B * queue_size, 16-B aligned):
+//     +0   u64  addr        // guest-physical buffer address
+//     +8   u32  len         // buffer length
+//     +12  u16  flags       // VIRTQ_DESC_F_NEXT (1), _WRITE (2), _INDIRECT (4)
+//     +14  u16  next        // index of next descriptor (if F_NEXT)
+//
+//   Available Ring (4 B header + 2 B * queue_size + optional 2 B, 2-B aligned):
+//     +0   u16  flags       // VIRTQ_AVAIL_F_NO_INTERRUPT (1)
+//     +2   u16  idx         // producer index (wrapping u16)
+//     +4   u16  ring[queue_size]
+//     +(4+2*queue_size)  u16 used_event  // only if VIRTIO_F_EVENT_IDX
+//
+//   Used Ring (4 B header + 8 B * queue_size + optional 2 B, 4-B aligned):
+//     +0   u16  flags       // VIRTQ_USED_F_NO_NOTIFY (1)
+//     +2   u16  idx         // producer index (wrapping u16)
+//     +4   {u32 id, u32 len}[queue_size]
+//     +(4+8*queue_size)  u16 avail_event  // only if VIRTIO_F_EVENT_IDX
+//
+// At QUEUE_SIZE=64:
+//   descriptor table   = 16 * 64            = 1024 B
+//   avail ring         = 4 + 2*64 (+2)      =  132..134 B
+//   used ring          = 4 + 8*64 (+2)      =  516..518 B
+//
+// R91.M3 does NOT negotiate VIRTIO_F_EVENT_IDX (bit 29); the optional
+// used_event / avail_event trailer bytes are not accessed by this
+// milestone. They still fit within the reserved 4 KiB avail+used page.
+//
+// Page layout for the shared avail+used page (see .bss slots in §3):
+//     +0     avail ring (up to 134 B when queue_size=64)
+//     +2048  used ring  (up to 518 B when queue_size=64)
+//
+// The 2048 B split between avail and used is arbitrary as long as both
+// stay within a single 4 KiB page and each hits its own alignment
+// requirement (2 B for avail, 4 B for used). Choosing a power-of-two
+// offset keeps the used-ring 4-B alignment trivially satisfied.
+//
+// =============================================================================
+// SECTION 2  MMIO CONFIG WRITE STRATEGY (virtio 1.1 §4.1.3.1)
+// =============================================================================
+//
+// The virtio 1.1 spec DISALLOWS a bare 64-bit MMIO transaction against
+// QUEUE_DESC / QUEUE_DRIVER / QUEUE_DEVICE ("64-bit fields... MUST use
+// 32-bit wide and aligned accesses"). This file therefore programs each
+// u64 slot as a lo-then-hi pair through the sibling vn_cc_write_u32
+// helper declared in common_cfg.pdx -- exactly the shape e1000e uses
+// for its own RDBAL/RDBAH split (drivers/e1000e/rx_ring.pdx L160-173).
+//
+// The u8/u16 QUEUE_* fields (QUEUE_SELECT, QUEUE_SIZE, QUEUE_ENABLE)
+// go through vn_cc_write_u16 / vn_cc_read_u16 -- these are already
+// pub-visible sibling functions in common_cfg.pdx (see the pub let
+// vn_cc_read_u16 / vn_cc_write_u16 / vn_cc_read_u32 / vn_cc_write_u32
+// declarations at drivers/virtio_net/common_cfg.pdx §"vn_cc_*").
+//
+// The register offsets themselves (VNET_CC_OFF_QUEUE_SEL etc.) are
+// also already pub-declared in common_cfg.pdx §1. This file does NOT
+// re-declare them -- the offsets are inlined as immediates at each
+// call site (matching the pattern common_cfg.pdx's own handshake body
+// uses at L408, L441, L478, L483, L523, L528 -- literal `mov rsi, 0x14`
+// with a trailing `// VNET_CC_OFF_DEV_STATUS` comment).
+//
+// =============================================================================
+// SECTION 3  BSS PAGE LAYOUT
+// =============================================================================
+//
+// One virtio-net device (MVP scope). Four pages, each 4 KiB, each
+// @align(4096):
+//
+//   _virtio_net_rx_desc_pg           4096 B  RX descriptor table (uses 1024)
+//   _virtio_net_rx_avail_used_pg     4096 B  RX avail ring @+0, used ring @+2048
+//   _virtio_net_tx_desc_pg           4096 B  TX descriptor table (uses 1024)
+//   _virtio_net_tx_avail_used_pg     4096 B  TX avail ring @+0, used ring @+2048
+//
+// Total .bss cost: 16 KiB. All pages are zeroed by ordinary .bss
+// initialization (paideia-as guarantees @align(N) uninit arrays land
+// in the zero-cost .bss section).
+//
+// Page-alignment is stricter than any single field requires (descriptor
+// table needs only 16-B alignment; avail 2-B; used 4-B) but simplifies
+// R25 IOMMU-domain mapping when R96.M2 wires vtd_slpt_map for the NIC's
+// DMA pages -- same rationale documented in drivers/e1000e/rx_ring.pdx
+// L102-104.
+//
+// Static allocation matches the e1000e precedent (drivers/e1000e/rx_ring.pdx
+// L106-107, `_e1000e_rx_ring : [u64; 256] = uninit @align(4096)`); a
+// phys_alloc-derived pool is a legitimate future substitution once the
+// caller lifecycle (probe -> init -> supervisor) is ready for it.
+//
+// =============================================================================
+// SECTION 4  RING-PUBLISH ORDERING (virtio 1.1 §2.6.8.2)
+// =============================================================================
+//
+// The avail and used rings live in ordinary write-back DMA-coherent RAM,
+// not MMIO. The virtio 1.1 §2.6.8.2 discipline is:
+//
+//   (a) Driver writes ring[idx & (queue_size-1)] = desc_head.
+//   (b) Driver emits a store fence (mfence on x86-64 is a full fence and
+//       trivially satisfies the "store fence" requirement).
+//   (c) Driver writes avail.idx = idx + 1.
+//   -- Device may now observe the new avail entry.
+//
+// Symmetrically on the used side:
+//   (a) Driver reads used.idx (may be stale).
+//   (b) Driver emits a load fence (mfence again).
+//   (c) Driver reads used.ring[last_seen_idx & (queue_size-1)].
+//
+// The mfence pair around each publish and each reap is the SDM Vol 3A
+// §8.2.3.2 "SFENCE + LFENCE = MFENCE" order-preserving posture. Because
+// x86-64's TSO memory model already orders store-store, the mfence in
+// add_avail is arguably redundant against a hypervisor guest; it is
+// nevertheless emitted to keep the code correct against a future
+// deployment that runs the driver against a real NIC on bare metal
+// (where relaxed WC/UC quirks may reorder against the ordinary WB
+// avail-ring stores).
+//
+// =============================================================================
+// SECTION 5  RESERVED-LABEL DISCIPLINE
+// =============================================================================
+//
+// Every label in this file is prefixed `vn_vq_` per the reserved-word
+// posture -- paideia-as treats `loop`, `if`, `next` as keywords, and
+// a label with a bare `loop_head` / `next` / `if_ok` fails to parse.
+// See paideia-as v0.16.x CHANGELOG for the initial reserved-list
+// hardening.
+//
+// =============================================================================
+// SECTION 6  RETURN-CODE COMPATIBILITY WITH COMMON_CFG
+// =============================================================================
+//
+// virtio_net_vq_init reuses common_cfg's VNET_CC_ERR_NO_BAR sentinel
+// (0xFFFFFFFFFFFFFFED) when _virtio_net_common_cfg_pa has not yet been
+// populated by probe. The additional failure mode unique to vq init --
+// the device offering a QUEUE_SIZE smaller than the driver-requested
+// value -- is signalled by a fresh sentinel VNET_VQ_ERR_SIZE_TOO_SMALL
+// (0xFFFFFFFFFFFFFFE0 = -32). Values are chosen distinct from every
+// VNET_CC_ERR_* code in common_cfg.pdx §"Return codes for
+// virtio_net_init_handshake()" so a caller can distinguish origin
+// without a modality flag.
+
+module Virtqueue = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+
+  // Fixed MVP queue size. RX and TX share this. Must be power-of-two so
+  // the wrap mask `queue_size - 1` is trivially computed.
+  pub let VNET_VQ_SIZE                 : u64 = 64
+
+  // Standard virtqueue IDs for virtio-net. Per virtio 1.1 §5.1.2:
+  //   receiveq0  = 0
+  //   transmitq0 = 1
+  //   controlq   = 2 (deferred, see §0)
+  pub let VNET_VQ_RX_QID               : u64 = 0
+  pub let VNET_VQ_TX_QID               : u64 = 1
+
+  // Wrap mask for a queue of size VNET_VQ_SIZE. queue_size - 1 = 63.
+  pub let VNET_VQ_WRAP_MASK            : u64 = 63
+
+  // Descriptor structure (16 B per entry).
+  pub let VNET_VQ_DESC_SIZE            : u64 = 16
+  pub let VNET_VQ_DESC_OFF_ADDR        : u64 = 0
+  pub let VNET_VQ_DESC_OFF_LEN         : u64 = 8
+  pub let VNET_VQ_DESC_OFF_FLAGS       : u64 = 12
+  pub let VNET_VQ_DESC_OFF_NEXT        : u64 = 14
+
+  // Descriptor flags.
+  pub let VNET_VQ_DESC_F_NEXT          : u64 = 1
+  pub let VNET_VQ_DESC_F_WRITE         : u64 = 2
+  pub let VNET_VQ_DESC_F_INDIRECT      : u64 = 4
+
+  // Avail ring offsets (from avail_pa base).
+  pub let VNET_VQ_AVAIL_OFF_FLAGS      : u64 = 0
+  pub let VNET_VQ_AVAIL_OFF_IDX        : u64 = 2
+  pub let VNET_VQ_AVAIL_OFF_RING       : u64 = 4
+
+  // Used ring offsets (from used_pa base).
+  pub let VNET_VQ_USED_OFF_FLAGS       : u64 = 0
+  pub let VNET_VQ_USED_OFF_IDX         : u64 = 2
+  pub let VNET_VQ_USED_OFF_RING        : u64 = 4
+  // Each used ring element is 8 B: {u32 id, u32 len}.
+  pub let VNET_VQ_USED_ELEM_SIZE       : u64 = 8
+  pub let VNET_VQ_USED_ELEM_OFF_ID     : u64 = 0
+  pub let VNET_VQ_USED_ELEM_OFF_LEN    : u64 = 4
+
+  // In-page split for the shared avail+used page. Both landmarks stay
+  // within a single 4 KiB page and hit their alignment (avail 2 B, used
+  // 4 B). See §3.
+  pub let VNET_VQ_USED_IN_PAGE_OFFSET  : u64 = 2048
+
+  // ============================================================================
+  // Return codes for virtio_net_vq_init.
+  //
+  //   0                                = success
+  //   VNET_CC_ERR_NO_BAR   (0xFFFF..ED) = common_cfg not populated (see
+  //                                       common_cfg.pdx §"Return codes")
+  //   VNET_VQ_ERR_SIZE_TOO_SMALL (0xFFFF..E0)
+  //                                    = device offered a QUEUE_SIZE smaller
+  //                                      than the caller-requested queue_size.
+  //                                      Encoded as a full 64-bit sign-
+  //                                      extended immediate; -32 (== -ENOSPC).
+  // ============================================================================
+
+  pub let VNET_VQ_OK                   : u64 = 0
+  pub let VNET_VQ_ERR_SIZE_TOO_SMALL   : u64 = 0xFFFFFFFFFFFFFFE0
+
+  // ============================================================================
+  // Fingerprint tag for the successful init path.
+  //
+  // ONE-line pdx string literal, matching the PDX_STR regex the
+  // tools/verify-fingerprint-coverage.sh gate uses (see
+  // tools/verify-fingerprint-coverage.sh L803-805).
+  //
+  //   "virtio-net vq init ok [legacy: VIRTIO NET VQ INIT OK]"
+  //   len = 53 printable chars + 1 NUL terminator = 54
+  //
+  // The OK token in the legacy shard is what the coverage extractor
+  // matches (OK_TOK regex at L811 requires word-boundary uppercase OK).
+  // Allowlist entry for this literal is queued for main to append into
+  // tools/verify-fingerprint-coverage.sh's ALLOWLIST dict alongside the
+  // existing `virtio-net probe ok` / `virtio-net init handshake ok`
+  // entries (L779-793) -- same rationale (opt-in PAIDEIA_NIC=virtio
+  // path, no smoke mode pins the literal yet).
+  // ============================================================================
+
+  pub let virtio_net_vq_init_ok_msg : [u8; 54] = "virtio-net vq init ok [legacy: VIRTIO NET VQ INIT OK]\0"
+
+  // ============================================================================
+  // BSS pages -- one virtio-net device (MVP), two virtqueues (RX/TX),
+  // one descriptor page and one shared avail+used page per virtqueue.
+  //
+  // [u64; 512] * 8 B/u64 = 4096 B per page. @align(4096) is stricter
+  // than the per-ring alignment (16/2/4 B) but simplifies R25 IOMMU-
+  // domain mapping. See §3.
+  // ============================================================================
+
+  pub let mut _virtio_net_rx_desc_pg          : [u64; 512] = uninit @align(4096)
+  pub let mut _virtio_net_rx_avail_used_pg    : [u64; 512] = uninit @align(4096)
+  pub let mut _virtio_net_tx_desc_pg          : [u64; 512] = uninit @align(4096)
+  pub let mut _virtio_net_tx_avail_used_pg    : [u64; 512] = uninit @align(4096)
+
+  // ============================================================================
+  // virtio_net_vq_init(queue_id, desc_pa, avail_pa, used_pa, queue_size) -> u64
+  //
+  // Program the modern virtio 1.1 §4.1.4.3 common-config queue slot for
+  // one virtqueue. Body (all writes go through vn_cc_write_u16 /
+  // vn_cc_write_u32 sibling helpers in common_cfg.pdx):
+  //
+  //   (1) QUEUE_SELECT (u16 @+0x16) = queue_id.
+  //   (2) Read QUEUE_SIZE (u16 @+0x18): device advertises the max
+  //       queue_size it supports. If < caller-requested queue_size,
+  //       return VNET_VQ_ERR_SIZE_TOO_SMALL. QEMU's virtio-net emulation
+  //       advertises 256 by default, so this fails only if a caller
+  //       requests > 256 or the device is genuinely tiny.
+  //   (3) QUEUE_SIZE (u16 @+0x18) = queue_size (driver's chosen size,
+  //       always <= device's advertised max).
+  //   (4) QUEUE_DESC (u64 @+0x20) = desc_pa, written as two u32 halves
+  //       (lo @+0x20, hi @+0x24) per virtio 1.1 §4.1.3.1 restriction.
+  //   (5) QUEUE_DRIVER (u64 @+0x28) = avail_pa, same lo/hi split.
+  //   (6) QUEUE_DEVICE (u64 @+0x30) = used_pa, same lo/hi split.
+  //   (7) QUEUE_ENABLE (u16 @+0x1C) = 1. After this write the device
+  //       may access the queue.
+  //   (8) Emit fingerprint klog_s1(INFO, NET_, virtio_net_vq_init_ok_msg)
+  //       and return VNET_VQ_OK (0).
+  //
+  // Gate: if _virtio_net_common_cfg_pa is 0 (probe hasn't populated
+  // it), return VNET_CC_ERR_NO_BAR (0xFFFFFFFFFFFFFFED) without doing
+  // any config write. No FAIL fingerprint on this path -- consistent
+  // with the "there is no device" semantics of common_cfg's own NO_BAR
+  // arm (common_cfg.pdx §virtio_net_init_handshake step 2, which also
+  // does not emit the FAIL tag on NO_BAR before this file's sibling
+  // FAIL/OK convention had been established).
+  //
+  // Register plan (6-push callee-save):
+  //   rbx = _virtio_net_common_cfg_pa (loaded once, reused every write)
+  //   rbp = queue_size
+  //   r12 = queue_id
+  //   r13 = desc_pa
+  //   r14 = avail_pa
+  //   r15 = used_pa
+  //
+  //   6 pushes = 48 B; entry rsp%16==8 -> 56, %16==8. Add `sub rsp,8`
+  //   -> 64, %16==0 (aligned for every nested SysV call). All nested
+  //   callees (vn_cc_write_u16, vn_cc_read_u16, vn_cc_write_u32,
+  //   klog_s1) preserve rbx/rbp/r12-r15 per SysV.
+  //
+  // Labels prefixed `vn_vq_i_`.
+  // ============================================================================
+
+  pub let virtio_net_vq_init : (u64, u64, u64, u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (queue_id: u64, desc_pa: u64, avail_pa: u64, used_pa: u64, queue_size: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R91.M3-003 (paideia-os #2021). virtio 1.1 §4.1.4.3 per-queue COMMON_CFG programming for one virtqueue (RX or TX; the primitive is queue-index-generic). Body (see file §2 for MMIO-write strategy; every u64 register goes through the two-u32-halves shape per virtio 1.1 §4.1.3.1). Register plan: 6-push callee-save (rbx=_virtio_net_common_cfg_pa, rbp=queue_size, r12=queue_id, r13=desc_pa, r14=avail_pa, r15=used_pa) + sub rsp,8 -> rsp%16==0 aligned for nested vn_cc_write_u{16,32} / vn_cc_read_u16 / klog_s1 calls. Sequence: (1) gate on _virtio_net_common_cfg_pa (0 -> return VNET_CC_ERR_NO_BAR 0xFFFFFFFFFFFFFFED, no fingerprint since there is no device to log about); (2) vn_cc_write_u16(base, 0x16 QUEUE_SEL, queue_id); (3) vn_cc_read_u16(base, 0x18 QUEUE_SIZE) -> rax; if rax < queue_size return VNET_VQ_ERR_SIZE_TOO_SMALL (0xFFFFFFFFFFFFFFE0) -- device offers smaller max than we requested, no fingerprint; (4) vn_cc_write_u16(base, 0x18, queue_size); (5) QUEUE_DESC lo/hi: vn_cc_write_u32(base, 0x20, desc_pa low 32); mov rax,r13; shr rax,32; vn_cc_write_u32(base, 0x24, rax); (6) QUEUE_DRIVER lo/hi: vn_cc_write_u32(base, 0x28, avail_pa low 32); shr; vn_cc_write_u32(base, 0x2C, avail_pa hi); (7) QUEUE_DEVICE lo/hi: vn_cc_write_u32(base, 0x30, used_pa low 32); shr; vn_cc_write_u32(base, 0x34, used_pa hi); (8) vn_cc_write_u16(base, 0x1C QUEUE_ENABLE, 1); (9) klog_s1(LEVEL_INFO=3, SUBSYS_NET_, virtio_net_vq_init_ok_msg); (10) return xor rax,rax (VNET_VQ_OK). Encoder discipline: every u32 write's low 32 bits are taken automatically by the mov_d sized store inside vn_cc_write_u32 (see common_cfg.pdx L377) -- no explicit and/mask needed. High-half via `mov rax, <reg>; shr rax, 32; mov rdx, rax`. All immediates are 32-bit (0x16, 0x18, 0x20..0x34, 1) so they encode as imm32 in the reg-reg SysV setup. The two 64-bit error sentinels use canonical `mov rax, imm64` (see nic_dispatch.pdx NIC_ENOSYS at drivers/net/nic_dispatch.pdx §nic_dispatch_tx). Labels prefixed vn_vq_i_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 8;                          // rsp%16==0 for nested calls
+
+        // Stash the SysV arg vector into callee-save regs.
+        mov  r12, rdi;                        // queue_id
+        mov  r13, rsi;                        // desc_pa
+        mov  r14, rdx;                        // avail_pa
+        mov  r15, rcx;                        // used_pa
+        mov  rbp, r8;                         // queue_size
+
+        // Load the common_cfg base address once.
+        mov  rbx, [rip + _virtio_net_common_cfg_pa];
+        cmp  rbx, 0;
+        jne  vn_vq_i_have_bar;
+        mov  rax, 0xFFFFFFFFFFFFFFED;         // VNET_CC_ERR_NO_BAR
+        jmp  vn_vq_i_done;
+
+      vn_vq_i_have_bar:
+        // ----- (2) QUEUE_SELECT = queue_id -----
+        mov  rdi, rbx;
+        mov  rsi, 0x16;                       // VNET_CC_OFF_QUEUE_SEL
+        mov  rdx, r12;
+        call vn_cc_write_u16;
+
+        // ----- (3) verify device's max QUEUE_SIZE >= caller's requested -----
+        mov  rdi, rbx;
+        mov  rsi, 0x18;                       // VNET_CC_OFF_QUEUE_SIZE
+        call vn_cc_read_u16;
+        cmp  rax, rbp;
+        jae  vn_vq_i_size_ok;
+        mov  rax, 0xFFFFFFFFFFFFFFE0;         // VNET_VQ_ERR_SIZE_TOO_SMALL
+        jmp  vn_vq_i_done;
+
+      vn_vq_i_size_ok:
+        // ----- (4) QUEUE_SIZE = queue_size (driver-chosen) -----
+        mov  rdi, rbx;
+        mov  rsi, 0x18;                       // VNET_CC_OFF_QUEUE_SIZE
+        mov  rdx, rbp;
+        call vn_cc_write_u16;
+
+        // ----- (5) QUEUE_DESC = desc_pa (lo @+0x20, hi @+0x24) -----
+        mov  rdi, rbx;
+        mov  rsi, 0x20;                       // VNET_CC_OFF_QUEUE_DESC (lo)
+        mov  rdx, r13;                        // low 32 taken by mov_d
+        call vn_cc_write_u32;
+        mov  rax, r13;
+        shr  rax, 32;
+        mov  rdi, rbx;
+        mov  rsi, 0x24;                       // QUEUE_DESC hi
+        mov  rdx, rax;
+        call vn_cc_write_u32;
+
+        // ----- (6) QUEUE_DRIVER = avail_pa (lo @+0x28, hi @+0x2C) -----
+        mov  rdi, rbx;
+        mov  rsi, 0x28;                       // VNET_CC_OFF_QUEUE_DRV (lo)
+        mov  rdx, r14;
+        call vn_cc_write_u32;
+        mov  rax, r14;
+        shr  rax, 32;
+        mov  rdi, rbx;
+        mov  rsi, 0x2C;                       // QUEUE_DRIVER hi
+        mov  rdx, rax;
+        call vn_cc_write_u32;
+
+        // ----- (7) QUEUE_DEVICE = used_pa (lo @+0x30, hi @+0x34) -----
+        mov  rdi, rbx;
+        mov  rsi, 0x30;                       // VNET_CC_OFF_QUEUE_DEV (lo)
+        mov  rdx, r15;
+        call vn_cc_write_u32;
+        mov  rax, r15;
+        shr  rax, 32;
+        mov  rdi, rbx;
+        mov  rsi, 0x34;                       // QUEUE_DEVICE hi
+        mov  rdx, rax;
+        call vn_cc_write_u32;
+
+        // ----- (8) QUEUE_ENABLE = 1 -----
+        mov  rdi, rbx;
+        mov  rsi, 0x1C;                       // VNET_CC_OFF_QUEUE_EN
+        mov  rdx, 1;
+        call vn_cc_write_u16;
+
+        // ----- (9) OK fingerprint + return VNET_VQ_OK -----
+        mov  rdi, 3;                          // LEVEL_INFO
+        lea  rsi, [rip + SUBSYS_NET_];
+        lea  rdx, [rip + virtio_net_vq_init_ok_msg];
+        call klog_s1;
+        xor  rax, rax;                        // VNET_VQ_OK
+
+      vn_vq_i_done:
+        add  rsp, 8;
+        pop  r15;
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbp;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // virtio_net_vq_add_avail(avail_pa, desc_idx, queue_size) -> ()
+  //
+  // Publish descriptor index `desc_idx` (u16) into the driver-owned
+  // available ring. This is the primitive TX (R91.M3-004) uses when it
+  // has built a fresh descriptor chain, and RX (R91.M3-005) uses when
+  // it hands a fresh RX buffer back to the device after refill.
+  //
+  // Body:
+  //   (a) Read current avail.idx (u16 @ avail_pa + 2).
+  //   (b) slot = idx & (queue_size - 1). Since queue_size is a power of
+  //       two the mask is trivially queue_size - 1; the caller passes
+  //       a valid power-of-two size (VNET_VQ_SIZE = 64 today).
+  //   (c) Write ring[slot] = desc_idx (u16 @ avail_pa + 4 + slot*2).
+  //   (d) mfence -- ensure the ring[] store is globally visible before
+  //       the idx increment. Per virtio 1.1 §2.6.8.2 the driver MUST
+  //       emit a suitable barrier before publishing avail.idx. On x86-64
+  //       TSO the ordering is arguably already store-store safe for WB
+  //       RAM, but a real bare-metal NIC on a future deployment could
+  //       see reordering against UC/WC access, so the fence stays.
+  //   (e) Write avail.idx = idx + 1 (u16 @ avail_pa + 2). The device
+  //       polls this counter to discover new work.
+  //
+  // NOT called: this file does NOT ring the NOTIFY doorbell -- that is
+  // the caller's responsibility (typically batched at the end of a burst
+  // of add_avail calls). R91.M3-004 (tx.pdx) and R91.M3-005 (rx.pdx)
+  // are the sole notify writers; the notify_off_multiplier + per-queue
+  // notify_off tuple lives in _virtio_net_devices[j] +26/+36 per probe.pdx
+  // §"_virtio_net_devices record layout".
+  //
+  // Register plan (leaf, no callee-save preservation):
+  //   rdi = avail_pa (arg)
+  //   rsi = desc_idx (arg, u16 in low 16)
+  //   rdx = queue_size (arg)
+  //   r8  = mask (queue_size - 1)
+  //   r10 = old idx (u16, zero-extended)
+  //   r11 = &avail.idx (avail_pa + 2), reused for the final idx write
+  //   rax = &ring[slot] scratch
+  //
+  // No nested calls, so no stack alignment concern.
+  //
+  // Labels prefixed `vn_vq_a_` (unused at this size but reserved for
+  // any future error arm).
+  // ============================================================================
+
+  pub let virtio_net_vq_add_avail : (u64, u64, u64) -> () !{mem} @{boot} =
+    fn (avail_pa: u64, desc_idx: u64, queue_size: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R91.M3-003 (paideia-os #2021). Publish desc_idx into the driver-owned avail ring at avail_pa. Layout (virtio 1.1 §2.6.6): +0 u16 flags, +2 u16 idx, +4 u16 ring[queue_size]. Body: (1) Compute r11 = avail_pa + 2 (&avail.idx). Read old idx via `xor r10,r10; mov_w r10,[r11]` (u16 zero-extended load per the sibling vn_cc_read_u16 pattern at common_cfg.pdx §vn_cc_read_u16). (2) Compute mask r8 = queue_size - 1. Compute slot = r10 & r8 into rcx. (3) Compute ring slot address: rax = avail_pa + 4 + slot*2 via `mov rax, rcx; shl rax, 1; add rax, rdi; add rax, 4`. (4) Store desc_idx (low 16 bits of rsi) via `mov_w [rax], rsi` -- the sized-store form from common_cfg.pdx §vn_cc_write_u16 (bare `mov [addr], rsi` widens to REX.W and would clobber 8 bytes into a 2-byte slot). (5) mfence -- store-store barrier between the ring[] write and the idx write per virtio 1.1 §2.6.8.2. Redundant on x86-64 WB TSO but retained for bare-metal correctness. (6) Increment r10 (add r10, 1) -- u16 wrap is fine because we only ever mov_w back the low 16 bits, so the u16-value semantic is preserved by C's usual 2^16 modular arithmetic even though the register is u64. (7) Write avail.idx via `mov_w [r11], r10`. Leaf, no prologue, no ret prep needed beyond the bare ret. Labels prefixed vn_vq_a_.",
+      block: {
+        // (1) r11 = &avail.idx = avail_pa + 2
+        mov r11, rdi;
+        add r11, 2;
+
+        // Read old idx (u16 -> zero-extended u64)
+        xor r10, r10;
+        mov_w r10, [r11];
+
+        // (2) mask = queue_size - 1; slot = idx & mask
+        mov r8, rdx;
+        sub r8, 1;
+        mov rcx, r10;
+        and rcx, r8;
+
+        // (3) rax = &ring[slot] = avail_pa + 4 + slot*2
+        mov rax, rcx;
+        shl rax, 1;
+        add rax, rdi;
+        add rax, 4;
+
+        // (4) Store desc_idx (low 16 of rsi) into ring[slot]
+        mov_w [rax], rsi;
+
+        // (5) Ensure the ring write globally-orders before the idx write
+        mfence;
+
+        // (6) Increment idx (u16 wrap via mov_w truncation on write-back)
+        add r10, 1;
+
+        // (7) Publish new idx
+        mov_w [r11], r10;
+
+        ret
+      }
+    }
+
+  // ============================================================================
+  // virtio_net_vq_reap_used(used_pa, last_seen_idx, queue_size) -> u64
+  //
+  // Poll the device-owned used ring for a completion beyond last_seen_idx.
+  // Returns a u64 packed as:
+  //
+  //   bit  63     found flag (1 = a completion is being reported;
+  //                           0 = no completion, other bits are 0 too)
+  //   bits 62..48 desc_idx (15 bits) -- the head-descriptor index of the
+  //                                     chain that completed
+  //   bits 47..32 (reserved, 0)
+  //   bits 31..0  len (u32) -- number of bytes written by the device into
+  //                            the descriptor chain (for an RX buffer;
+  //                            for TX this is typically the length of the
+  //                            entire chain)
+  //
+  // Caller usage:
+  //
+  //   let r = virtio_net_vq_reap_used(used_pa, last_seen, VNET_VQ_SIZE);
+  //   if (r >> 63) != 0 {
+  //     let desc_idx = (r >> 48) & 0x7FFF;
+  //     let len      = r & 0xFFFFFFFF;
+  //     ... process ...;
+  //     last_seen += 1;  // caller advances the cursor
+  //   }
+  //
+  // The caller owns the persistent last_seen cursor; this primitive is
+  // stateless. That matches e1000e's _e1000e_rx_next cursor pattern
+  // (drivers/e1000e/rx_ring.pdx L108).
+  //
+  // Body:
+  //   (a) Read used.idx (u16 @ used_pa + 2).
+  //   (b) Compare with last_seen_idx (low 16 bits). If equal, no new
+  //       completion -- return 0.
+  //   (c) mfence -- ensure any subsequent reads of the ring entry see
+  //       the device's writes in order per virtio 1.1 §2.6.8.2.
+  //   (d) slot = last_seen_idx & (queue_size - 1).
+  //   (e) Read id  (u32 @ used_pa + 4 + slot*8).
+  //   (f) Read len (u32 @ used_pa + 8 + slot*8).
+  //   (g) Pack: (1<<63) | ((id & 0x7FFF) << 48) | len.
+  //
+  // Register plan (leaf, no callee-save):
+  //   rdi = used_pa
+  //   rsi = last_seen_idx (u16 in low 16)
+  //   rdx = queue_size
+  //   rax = used.idx / then packed return value
+  //   r8  = mask / then scratch for packing
+  //   r9  = &ring[slot] (used_pa + 4 + slot*8)
+  //   r10 = &used.idx scratch (used_pa + 2)
+  //   r11 = last_seen_idx & 0xFFFF (comparison operand + slot base)
+  //   rcx = slot
+  //
+  // Two branches: no-completion returns 0; have-completion falls through
+  // to the packing tail. No nested calls -> no stack alignment concern.
+  //
+  // Labels prefixed `vn_vq_r_`.
+  // ============================================================================
+
+  pub let virtio_net_vq_reap_used : (u64, u64, u64) -> u64 !{mem} @{boot} =
+    fn (used_pa: u64, last_seen_idx: u64, queue_size: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "R91.M3-003 (paideia-os #2021). Poll the device-owned used ring for a completion beyond last_seen_idx. Layout (virtio 1.1 §2.6.8): +0 u16 flags, +2 u16 idx, +4 {u32 id, u32 len}[queue_size]. Body: (1) Read used.idx: r10=used_pa+2; xor rax,rax; mov_w rax,[r10] -- rax = u16 zero-extended per the vn_cc_read_u16 pattern. (2) Mask last_seen_idx to u16 low bits: r11=rsi; and r11,0xFFFF. Compare rax==r11. If equal -> jmp vn_vq_r_none (return 0). (3) Otherwise mfence -- driver-side load barrier before reading the ring entry, per virtio 1.1 §2.6.8.2. (4) Compute slot: r8 = queue_size - 1; rcx = r11 & r8. (5) Compute r9 = &ring[slot] = used_pa + 4 + slot*8 via `mov r9, rcx; shl r9, 3; add r9, rdi; add r9, 4`. (6) Read id (u32) via the mov-eax-zero-extend form: `mov rax, r9; mov eax, [rax]`. Rax now holds id in low 32, upper 32 zero (SDM Vol 2A §3.4.1.1 -- 32-bit dst clears upper 32 of the 64-bit parent). Stash id in r8: mov r8, rax. Mask to 15 bits: and r8, 0x7FFF. (7) Read len (u32) at &ring[slot]+4: mov rax, r9; add rax, 4; mov eax, [rax]. Rax now holds len in low 32, upper 32 zero. (8) Pack found flag: mov r10, 0x8000000000000000 (canonical mov reg, imm64 form). Shift desc_idx into position: shl r8, 48. Combine: or rax, r10; or rax, r8. rax now holds (found<<63) | (desc_idx<<48) | len. (9) ret. no-completion arm at vn_vq_r_none: xor rax,rax; ret. Leaf function, no prologue. Labels prefixed vn_vq_r_.",
+      block: {
+        // (1) Read used.idx (u16) at used_pa + 2
+        mov r10, rdi;
+        add r10, 2;
+        xor rax, rax;
+        mov_w rax, [r10];
+
+        // (2) Compare with last_seen_idx (low 16 bits)
+        mov r11, rsi;
+        and r11, 0xFFFF;
+        cmp rax, r11;
+        jne vn_vq_r_have;
+
+        // No completion: return 0
+        xor rax, rax;
+        ret;
+
+      vn_vq_r_have:
+        // (3) Load barrier before reading the ring entry
+        mfence;
+
+        // (4) slot = last_seen_idx & (queue_size - 1)
+        mov r8, rdx;
+        sub r8, 1;
+        mov rcx, r11;
+        and rcx, r8;
+
+        // (5) r9 = &ring[slot] = used_pa + 4 + slot*8
+        mov r9, rcx;
+        shl r9, 3;
+        add r9, rdi;
+        add r9, 4;
+
+        // (6) Read id (u32), mask to 15 bits, stash in r8
+        mov rax, r9;
+        mov eax, [rax];
+        mov r8, rax;
+        and r8, 0x7FFF;
+
+        // (7) Read len (u32) at ring[slot]+4
+        mov rax, r9;
+        add rax, 4;
+        mov eax, [rax];
+
+        // (8) Pack: bit 63 = 1 (found), bits 62..48 = desc_idx, bits 31..0 = len
+        mov r10, 0x8000000000000000;
+        shl r8, 48;
+        or  rax, r10;
+        or  rax, r8;
+
+        ret
+      }
+    }
+}

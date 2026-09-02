@@ -791,6 +791,51 @@ ALLOWLIST = {
         "cfg_pa stays 0 and the handshake takes the NO_BAR fail "
         "branch without emitting OK. Retire when a virtio boot mode "
         "lands in the smoke suite.",
+
+    # src/kernel/core/drivers/virtio_net/mac.pdx -- R91.M3-006 (paideia-os
+    # #2024) MAC read and link-status query.  virtio_net_read_mac_body
+    # emits `virtio-net mac ok` on both the DEVICE-region-read path
+    # (when the handshake could have run) and the LAA-synthesise path
+    # (when the DEVICE region is unreachable) -- either way the record's
+    # +42 mac slot is populated and the value is asserted on the wire.
+    # virtio_net_link_status emits `virtio-net link ok` on all paths
+    # (bit-0 of DEVICE cfg's status u16 when reachable, safe-default 1
+    # otherwise).  Both are only invoked from a virtio-net attach path
+    # that R91.M3-006 does not wire in yet -- the current landing is
+    # dormant substrate (same posture as e1000e_read_mac / _program_rar
+    # at R27.M1 pre-attach).  No caller means no boot line today; the
+    # allowlist entries below preempt the fingerprint-coverage gate
+    # against the future wire-in that follows (nic_dispatch's virtio
+    # arm, or a dedicated attach body).  Same posture as the sibling
+    # `virtio-net init handshake ok` entry above.
+    "virtio-net mac ok [legacy: VIRTIO NET MAC OK]":
+        "R91.M3-006 (paideia-os #2024): virtio_net_read_mac_body "
+        "emits this on every call (DEVICE-region read path AND LAA "
+        "synth path).  Not yet reachable at boot -- the fn is dormant "
+        "substrate awaiting the virtio-net attach wire-in.  Retire "
+        "when a virtio boot mode lands in the smoke suite AND a "
+        "golden line pins the emitted literal.",
+    "virtio-net link ok [legacy: VIRTIO NET LINK OK]":
+        "R91.M3-006 (paideia-os #2024): virtio_net_link_status "
+        "emits this on every call (DEVICE-region status read AND "
+        "safe-default up-arm).  Not yet reachable at boot -- the fn "
+        "is dormant substrate awaiting the virtio-net attach wire-in. "
+        "Retire when a virtio boot mode lands in the smoke suite AND "
+        "a golden line pins the emitted literal.",
+
+    # src/kernel/core/drivers/virtio_net/virtqueue.pdx -- R91.M3-003
+    # (paideia-os #2021) virtio_net_vq_init OK-path fingerprint.
+    # Emitted at the tail of virtio_net_vq_init on successful QUEUE_
+    # ENABLE. Not yet reachable at boot -- vq_init has no caller yet
+    # (R91.M3-004 tx and R91.M3-005 rx are the future callers). On
+    # the default QEMU matrix the fn would short-circuit to NO_BAR
+    # anyway since _virtio_net_common_cfg_pa stays 0. Same posture as
+    # the sibling virtio init/mac/link entries.
+    "virtio-net vq init ok [legacy: VIRTIO NET VQ INIT OK]":
+        "R91.M3-003 (paideia-os #2021): virtio_net_vq_init emits "
+        "this on successful QUEUE_ENABLE. Not yet reachable at boot "
+        "-- dormant substrate awaiting R91.M3-004/005 tx/rx wire-in. "
+        "Retire when a virtio boot mode lands in the smoke suite.",
 }
 
 # Below these counts the extractor has stopped matching rather than the
