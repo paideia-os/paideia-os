@@ -38,6 +38,18 @@
 #       byte-identical arg lists. Multiple hostfwd specs may be
 #       comma-separated in a single PAIDEIA_HOSTFWD value; each is
 #       expanded into its own `hostfwd=<spec>` fragment.
+#
+#   PAIDEIA_VGA=<std|virtio|none>
+#       R101.M4-002 (paideia-os #2151). Attach an emulated display
+#       adapter for the boot_r101_stdvga smoke and future GUI witnesses.
+#       Default: `none` (bit-identical to pre-R101 boots so non-graphics
+#       smokes keep their exact arg lists).
+#       - std    : -vga std               (QEMU Bochs display, 0x1234/0x1111)
+#       - virtio : -vga none -device virtio-gpu-pci  (deferred consumer:
+#                                                     R103 virtio-gpu backend)
+#       - none   : (no -vga / -device flags emitted; the R101 witness
+#                   detects no Bochs device and takes the skip path)
+#       Follows the PAIDEIA_NIC pattern above.
 
 set -euo pipefail
 
@@ -130,6 +142,27 @@ case "${PAIDEIA_NIC:-virtio}" in
         ;;
 esac
 
+# R101.M4-002 (paideia-os #2151): compose optional VGA flags based on
+# PAIDEIA_VGA. Default `none` keeps pre-R101 arg lists byte-identical
+# for every non-graphics smoke. `std` attaches the QEMU Bochs display
+# (PCI 0x1234/0x1111) the R101 witness probes. `virtio` is reserved
+# for the R103 virtio-gpu 2D backend; consumed by that landing.
+VGA_ARGS=()
+case "${PAIDEIA_VGA:-none}" in
+    none)
+        ;;
+    std)
+        VGA_ARGS=(-vga std)
+        ;;
+    virtio)
+        VGA_ARGS=(-vga none -device virtio-gpu-pci)
+        ;;
+    *)
+        echo "PAIDEIA_VGA='${PAIDEIA_VGA}' invalid; expected one of: std, virtio, none" >&2
+        exit 2
+        ;;
+esac
+
 # PVH ELF Note emitted by paideia-as PA10-001; QEMU -kernel works directly.
 # Real bootloader integration (GRUB multiboot2 or Limine) is a Phase-12 work item.
 # R10-m2-002: QEMU TCG does not support TSC-DEADLINE. Using periodic timer mode instead.
@@ -147,4 +180,5 @@ exec qemu-system-x86_64 \
     -no-shutdown \
     -m 256M \
     ${NIC_ARGS[@]+"${NIC_ARGS[@]}"} \
+    ${VGA_ARGS[@]+"${VGA_ARGS[@]}"} \
     "$@"

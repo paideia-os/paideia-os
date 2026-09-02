@@ -850,6 +850,30 @@ case "${EXPECTED}" in
         TIMEOUT=20
         EXPECTED=""
         ;;
+    boot_r101_stdvga)
+        # R101.M4-003 (paideia-os #2152): pins the R101.M4-001 witness's
+        # success fingerprint proving KIND_DISPLAY_BACKEND + KIND_
+        # FRAMEBUFFER + backend_flush end-to-end against QEMU's Bochs
+        # stdvga LFB.
+        #
+        # Runs under PAIDEIA_VGA=std (forcing `-vga std` in run-qemu.sh)
+        # so the Bochs probe finds a device to bind. Without PAIDEIA_VGA
+        # forced, the witness takes the skip path and the golden fails
+        # -- pinning the invariant that the smoke mode carries its own
+        # VGA env override, matching PAIDEIA_NIC=virtio's boot_r91_nic
+        # posture.
+        #
+        # Golden (contains-in-order substring match):
+        #   `boot r101 stdvga ok -- w=1024 h=768`
+        # This is the success line the r101_stdvga_checkerboard.pdx
+        # witness emits after all 8 stages green. A skip / fail line
+        # would fail the golden, which is the intended discipline.
+        export PAIDEIA_VGA=std
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r101-stdvga.golden"
+        TIMEOUT=15
+        EXPECTED=""
+        ;;
     boot_r91_nic)
         # R98.M1-001 (paideia-os #2100): retires the R91.M6 deferred
         # item #8 ("boot_r91_nic smoke mode + expected-r91-nic-probe.
@@ -2405,6 +2429,28 @@ if [[ ${WITH_DISK} -eq 1 ]]; then
     )
 fi
 
+# R101.M4-003 (paideia-os #2152): PAIDEIA_VGA env-switch for the
+# boot_r101_stdvga smoke (and future GUI smokes). Default `none` keeps
+# every pre-R101 smoke's launch shape byte-for-byte identical -- no
+# -vga / -device flags emitted. `std` attaches QEMU's Bochs display
+# (PCI 0x1234/0x1111) the R101 witness probes; `virtio` reserved for
+# the R103 virtio-gpu backend once that lands.
+VGA_ARGS=()
+case "${PAIDEIA_VGA:-none}" in
+    none)
+        ;;
+    std)
+        VGA_ARGS=(-vga std)
+        ;;
+    virtio)
+        VGA_ARGS=(-vga none -device virtio-gpu-pci)
+        ;;
+    *)
+        echo "smoke: PAIDEIA_VGA='${PAIDEIA_VGA}' invalid; expected one of: std, virtio, none" >&2
+        exit 2
+        ;;
+esac
+
 if [[ ${UART_RX_MODE} -eq 1 ]]; then
     # R16.M4-666 (#666) end-to-end UART RX real-IRQ smoke.
     #
@@ -2504,6 +2550,7 @@ if [[ ${UART_RX_MODE} -eq 1 ]]; then
         -no-shutdown \
         -m 32M \
         "${DISK_ARGS[@]}" \
+        "${VGA_ARGS[@]}" \
         >/dev/null 2>&1
     QEMU_RC=$?
 
@@ -2587,6 +2634,7 @@ else
         "${SMP_ARGS[@]}" \
         "${NVME_ARGS[@]}" \
         "${DISK_ARGS[@]}" \
+        "${VGA_ARGS[@]}" \
         >/dev/null 2>&1
     QEMU_RC=$?
     if [[ -n "${NVME_CLEANUP}" ]]; then
