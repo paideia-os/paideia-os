@@ -1260,3 +1260,21 @@ driver readback witness (M5), legacy stub cleanup + this retrospective
 (M6). See `design/round-retrospectives/r91-closed.md` for the full
 per-issue disposition, debt inventory, and the deferred-items list.
 Retire tag: `r91-closed` (main to apply after this landing).
+
+---
+
+## R95 (socket API polish + poll + capability rights) — CLOSED 2026-09-01
+
+R95 closes as a four-milestone wave landing the socket ABI polish
+gap between R72/R100-PREP-002 and R96: setsockopt/getsockopt sysnos
+98/99 (M1), getpeername/getsockname sysnos 100/101 (M2), sys_poll
+sysno 102 plus the UDP wake wire (`poll_wake_check_and_clear` fired
+from `udp_socket_deliver_dgram`) plus witness (M3), R_SOCKET_READ/
+WRITE/LISTEN/CONNECT rights bits with `sock_cap_check_rights` gate
+threaded through every socket handler and default mint updated to
+grant all four bits (0x00F) (M4). See
+`design/round-retrospectives/r95-closed.md` for the full per-issue
+disposition, deferred items (TCP RX wake wire; timer-driven poll
+timeout; sys_socket privileged-port refinement; POLLNVAL; SO_ERROR
+async population; multi-caller poll), and the file-change inventory.
+Retire tag: `r95-closed` (main to apply after this landing).

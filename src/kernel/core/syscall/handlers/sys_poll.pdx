@@ -1,0 +1,391 @@
+// src/kernel/core/syscall/handlers/sys_poll.pdx --
+// R95.M3-001/002 (paideia-os #2080/#2081).
+//
+// sys_poll(pollfd_arr_va, nfds, timeout_ms) -> nready | -errno.
+// SC+ ID 102.
+//
+// pollfd struct (Linux-compatible):
+//   +0  fd       (i32)
+//   +4  events   (u16)
+//   +6  revents  (u16)
+// Total = 8 bytes per entry. This landing caps nfds at
+// POLL_MAX_NFDS = 32 (256 bytes worth of pollfd), which is more than
+// enough for the R95 witness scenarios and avoids any dynamic
+// allocation. A caller passing nfds > 32 gets -EINVAL rather than
+// silent truncation.
+//
+// events / revents bit layout (POSIX-shaped subset):
+//   POLLIN  = 0x0001 -- socket rx queue non-empty (or a listener has
+//                       a pending accept child)
+//   POLLOUT = 0x0004 -- socket tx queue has space (always true for
+//                       UDP; always true for TCP ESTABLISHED at MVP
+//                       since tcp_send_segment is synchronous, no
+//                       per-socket tx back-pressure exists)
+//   POLLERR = 0x0008 -- row.so_error != 0
+//
+// Loop:
+//   (1) Cap nfds at 32; gate + walk-copy user pollfd array into
+//       _dispatch_poll_scratch.
+//   (2) Compute readiness per entry, tally nready, stamp revents.
+//   (3) If nready > 0 OR timeout_ms == 0, walk-write the pollfd array
+//       back out (revents fields updated) and return nready.
+//   (4) Else register _poll_waiter_tcb = _current_tcb, sched_block();
+//       on resume, GOTO (2) to recompute readiness. Return.
+//
+// The R95.M3-002 (#2081) wake side lands in net/udp_socket.pdx
+// (udp_socket_deliver_dgram bottom) which calls
+// poll_wake_check_and_clear after every UDP rx enqueue -- if a poll
+// is blocked, sched_wake fires and this body resumes at (4)'s
+// continuation, re-scans, and returns. TCP RX wake wire is DEFERRED
+// (r95-closed retrospective notes this) because tcp_process_segment
+// is a dense rbp-framed body whose surgery risks the R72 witness --
+// the R94 hardening round is a better landing site. Timeout-based
+// wakeup (a true "unblock after N ms") is also DEFERRED: the tree
+// has no timer-wheel abstraction yet. So a caller with timeout > 0
+// on all-empty sockets will block until some socket wakes; scenario
+// 1 of the R95.M3-003 witness uses timeout==0 to exercise the empty
+// path, and scenario 2 injects the packet BEFORE the poll runs so
+// (2)'s first scan sees it.
+//
+// Reserved-label discipline: poll_ prefix.
+
+module SysPoll = structure {
+
+  pub let SYS_POLL_EINVAL : u64 = 0xFFFFFFFFFFFFFFEA   // -EINVAL (-22)
+  pub let SYS_POLL_EFAULT : u64 = 0xFFFFFFFFFFFFFFF2   // -EFAULT (-14)
+
+  pub let POLL_MAX_NFDS  : u64 = 32
+  pub let POLLFD_STRIDE  : u64 = 8
+
+  pub let POLLIN         : u64 = 0x0001
+  pub let POLLOUT        : u64 = 0x0004
+  pub let POLLERR        : u64 = 0x0008
+
+  // Per-syscall bounce scratch. 32 * 8 = 256 bytes.
+  pub let mut _dispatch_poll_scratch : [u8; 256] = uninit @align(8)
+
+  // R95.M3-002 (#2081): single-slot waiter registry. A blocked
+  // sys_poll writes _current_tcb here before sched_block; RX
+  // completion paths (udp_socket_deliver_dgram et al) call
+  // poll_wake_check_and_clear which zeroes the slot and sched_wake's
+  // the parked task. Single slot is safe at MVP because sys_poll is
+  // reachable from at most one user task at boot today (init); a
+  // future round with multi-caller poll grows this into a bitmap
+  // over the task pool.
+  pub let mut _poll_waiter_tcb : u64 = 0
+
+  // ============================================================================
+  // poll_wake_check_and_clear() -> ()
+  // ============================================================================
+  //
+  // Called from RX-completion paths (currently just udp_socket_deliver_
+  // dgram bottom). Idempotent no-op if no waiter is registered. If a
+  // waiter IS registered, atomically clear the slot BEFORE the sched_
+  // wake call so a re-entrancy from within sched_wake cannot re-visit
+  // the same waiter twice.
+
+  pub let poll_wake_check_and_clear : () -> () !{mem, sysreg} @{sched, boot} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, boot},
+      justification: "R95.M3-002 (paideia-os #2081): notify any sys_poll waiter that a monitored socket has become readable/writable. Reads _poll_waiter_tcb; if zero (common case, no one is polling) returns immediately without any state change. Non-zero -> clear the slot FIRST, then call sched_wake with the saved value in rdi. The clear-before-wake ordering is deliberate: sched_wake's IPI path or a nested reschedule could re-enter this file's callers (unlikely today but not architecturally forbidden) -- clearing first ensures at-most-once semantics per registration. Called from udp_socket_deliver_dgram at MVP; TCP RX wake wire is DEFERRED (see file header). Register plan: rax = waiter (also used as sched_wake arg via rdi), rcx = 0 for the clear store. Entry rsp%16==8, single sub rsp,8 aligns for sched_wake call. Leaf from the caller's perspective (one nested call). Reserved labels: pwck_.",
+      block: {
+        mov rax, [rip + _poll_waiter_tcb];
+        cmp rax, 0;
+        je pwck_done;
+        xor rcx, rcx;
+        mov [rip + _poll_waiter_tcb], rcx;     // clear before wake
+        mov rdi, rax;
+        sub rsp, 8;
+        call sched_wake;
+        add rsp, 8;
+      pwck_done:
+        ret
+      }
+    }
+
+  // ============================================================================
+  // poll_socket_readiness(fd, events_mask) -> revents_mask
+  // ============================================================================
+  //
+  // Compute readiness for a single fd against the requested events
+  // mask. Returns the AND-narrowed revents that should be reported.
+  // A bad fd (neither TCP nor UDP socket) contributes 0 -- Linux
+  // returns POLLNVAL for that case; deferred to a future round.
+
+  pub let poll_socket_readiness : (u64, u64) -> u64 !{mem} @{cap} =
+    fn (fd: u64, events_mask: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R95.M3-001 (paideia-os #2080): compute revents for one pollfd. Resolves fd via tcp_socket_resolve (both kinds); non-socket -> 0 (POLLNVAL deferred). For TCP: POLLIN iff rx_tail > rx_head (rx bytes pending) OR state==LISTEN and backlog_pending_tcb != TCP_NONE (accept-ready); POLLOUT iff state==ESTABLISHED (or a subset thereof) -- MVP always-writable posture; POLLERR iff so_error @+208 != 0. For UDP: POLLIN iff rx_count > 0; POLLOUT iff state==CONNECTED (always writable at MVP); POLLERR iff so_error @+64 != 0. AND against events_mask so a caller only requesting POLLIN never sees POLLOUT. 3-push callee-save (rbx=fd, r12=events_mask, r13=row_ptr) + sub rsp,8: entry rsp%16==8, 3 pushes 24 bytes land 0, sub 8 -> 8; nested tcp_socket_resolve needs 0 -- wait, 24+8=32, rsp%16=8. Wrong. Actually entry 8 + 3 pushes (24) = 32, %16 = 0. sub rsp,8 -> 8. Need 0 for call. Use no sub: 3 pushes land %16=0. Leaf-of-leaf semantics; no callee-save needs to survive resolve. Reserved labels: psr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+
+        // Try TCP first.
+        mov rdi, rbx;
+        mov rsi, 0x1AB;
+        call tcp_socket_resolve;
+        cmp rax, 0xFFFFFFFFFFFFFFFF;
+        jne psr_have_tcp;
+
+        // Try TCP LISTENER.
+        mov rdi, rbx;
+        mov rsi, 0x1AC;
+        call tcp_socket_resolve;
+        cmp rax, 0xFFFFFFFFFFFFFFFF;
+        jne psr_have_tcp_lis;
+
+        mov rdi, rbx;
+        mov rsi, 0x1A8;
+        call tcp_socket_resolve;
+        cmp rax, 0xFFFFFFFFFFFFFFFF;
+        jne psr_have_udp;
+
+        xor rax, rax;                          // POLLNVAL deferred
+        jmp psr_done;
+
+      psr_have_tcp:
+        mov r13, rax;
+        shl r13, 9;
+        lea rcx, [rip + _tcp_tcb_table];
+        add r13, rcx;
+
+        xor rax, rax;                          // revents accumulator
+
+        // POLLIN: rx_tail (@+184) > rx_head (@+176).
+        mov rcx, [r13 + 184];
+        mov rdx, [r13 + 176];
+        cmp rcx, rdx;
+        jbe psr_tcp_no_in;
+        or rax, 0x0001;                        // POLLIN
+      psr_tcp_no_in:
+
+        // POLLOUT: state == ESTABLISHED (4).
+        mov rcx, [r13 + 0];
+        cmp rcx, 4;
+        jne psr_tcp_no_out;
+        or rax, 0x0004;
+      psr_tcp_no_out:
+
+        // POLLERR: so_error @+208 != 0.
+        mov rcx, [r13 + 208];
+        cmp rcx, 0;
+        je psr_tcp_no_err;
+        or rax, 0x0008;
+      psr_tcp_no_err:
+
+        and rax, r12;
+        jmp psr_done;
+
+      psr_have_tcp_lis:
+        mov r13, rax;
+        shl r13, 9;
+        lea rcx, [rip + _tcp_tcb_table];
+        add r13, rcx;
+
+        xor rax, rax;
+        // POLLIN on listener: backlog_pending_tcb (@+152) != TCP_NONE
+        // (0xFFFFFFFFFFFFFFFF).
+        mov rcx, [r13 + 152];
+        cmp rcx, 0xFFFFFFFFFFFFFFFF;
+        je psr_lis_no_in;
+        or rax, 0x0001;
+      psr_lis_no_in:
+        and rax, r12;
+        jmp psr_done;
+
+      psr_have_udp:
+        mov r13, rax;
+        shl r13, 7;
+        lea rcx, [rip + _udp_socket_table];
+        add r13, rcx;
+
+        xor rax, rax;
+
+        // POLLIN: rx_count (@+56) > 0.
+        mov rcx, [r13 + 56];
+        cmp rcx, 0;
+        je psr_udp_no_in;
+        or rax, 0x0001;
+      psr_udp_no_in:
+
+        // POLLOUT: state == CONNECTED (2) => always writable at MVP.
+        mov rcx, [r13 + 0];
+        cmp rcx, 2;
+        jne psr_udp_no_out;
+        or rax, 0x0004;
+      psr_udp_no_out:
+
+        // POLLERR: so_error @+64 != 0.
+        mov rcx, [r13 + 64];
+        cmp rcx, 0;
+        je psr_udp_no_err;
+        or rax, 0x0008;
+      psr_udp_no_err:
+
+        and rax, r12;
+
+      psr_done:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // sys_poll_body(pollfd_arr_va, nfds, timeout_ms) -> nready | -errno
+  // ============================================================================
+
+  pub let sys_poll_body : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap, sched, boot} =
+    fn (pollfd_arr_va: u64, nfds: u64, timeout_ms: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched, boot},
+      justification: "R95.M3-001 (paideia-os #2080): sys_poll, SC+ ID 102. Cap nfds at POLL_MAX_NFDS (32); reject nfds==0 or nfds > 32 with -EINVAL (nfds==0 with timeout==0 is a legal Linux pattern that returns 0, but no witness exercises it and rejecting it here prevents a zero-scan spin). Gate + walk-copy the pollfd array (nfds * 8 bytes) into _dispatch_poll_scratch; iterate calling poll_socket_readiness for each entry; stamp the low 16 bits of the returned revents mask into the scratch entry's @+6 slot; count non-zero revents into r14 (nready). If nready > 0 OR timeout_ms == 0 -> walk-write the scratch back to pollfd_arr_va (updated revents) and return nready. Else register _poll_waiter_tcb = _current_tcb, sched_block; on resume re-scan once and return. Timer-driven timeout wake is DEFERRED (see file header). 6-push callee-save via rbp frame (needed because the block-and-rescan path threads pollfd_arr_va + nfds + timeout across a sched_block call, and the ordinary 5-push budget is oversubscribed). Reserved labels: poll_.",
+      block: {
+        push rbp;
+        mov rbp, rsp;
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                          // pollfd_arr_va
+        mov r12, rsi;                          // nfds
+        mov r13, rdx;                          // timeout_ms
+        // r14 = nready accumulator, r15 = scratch stride computed
+        // per-iteration (byte count nfds*8).
+
+        // Cap check.
+        cmp r12, 0;
+        je poll_einval;
+        mov rax, 32;
+        cmp r12, rax;
+        ja poll_einval;
+
+        // r15 = nfds * 8 = byte count.
+        mov r15, r12;
+        shl r15, 3;
+
+        // Gate + copy user pollfd array to scratch.
+        mov rdi, rbx;
+        mov rsi, r15;
+        call user_ptr_ok;
+        cmp rax, 0;
+        jne poll_efault;
+
+        lea rdi, [rip + _dispatch_poll_scratch];
+        mov rsi, rbx;
+        mov rdx, r15;
+        call user_read_bytes_via_walk;
+        cmp rax, 0;
+        jne poll_efault;
+
+      poll_scan:
+        xor r14, r14;                          // nready = 0
+        xor rax, rax;                          // iterator index (0..nfds)
+      poll_scan_loop:
+        cmp rax, r12;
+        jae poll_scan_done;
+
+        // entry_ptr = scratch + i*8.
+        push rax;                              // save i
+        mov rcx, rax;
+        shl rcx, 3;
+        lea rdx, [rip + _dispatch_poll_scratch];
+        add rcx, rdx;                          // entry_ptr
+
+        // Load fd (i32) at +0 and events (u16) at +4.
+        xor rdi, rdi;
+        mov_b rdi, [rcx + 0];
+        xor rdx, rdx; mov_b rdx, [rcx + 1]; shl rdx, 8;  add rdi, rdx;
+        xor rdx, rdx; mov_b rdx, [rcx + 2]; shl rdx, 16; add rdi, rdx;
+        xor rdx, rdx; mov_b rdx, [rcx + 3]; shl rdx, 24; add rdi, rdx;
+
+        xor rsi, rsi;
+        mov_b rsi, [rcx + 4];
+        xor rdx, rdx; mov_b rdx, [rcx + 5]; shl rdx, 8; add rsi, rdx;
+
+        // Save entry_ptr across the readiness call. Alignment:
+        // entering this loop rsp%16 == 0; `push rax` above -> 8;
+        // `push rcx` here -> 0 (call-aligned). No sub/add pad
+        // needed.
+        push rcx;                              // entry_ptr
+
+        call poll_socket_readiness;
+        mov r8, rax;                           // revents
+
+        pop rcx;                               // restore entry_ptr
+        pop rax;                               // restore i
+
+        // Stamp revents (low 16 bits) at entry_ptr @+6..+7.
+        mov rdx, r8; and rdx, 0xFF; mov_b [rcx + 6], rdx;
+        mov rdx, r8; shr rdx, 8; and rdx, 0xFF; mov_b [rcx + 7], rdx;
+
+        cmp r8, 0;
+        je poll_scan_next;
+        add r14, 1;                            // nready++
+
+      poll_scan_next:
+        add rax, 1;
+        jmp poll_scan_loop;
+
+      poll_scan_done:
+        // If any ready OR timeout==0, write back and return.
+        cmp r14, 0;
+        jne poll_writeback;
+        cmp r13, 0;
+        je poll_writeback;
+
+        // R95.M3-002 (#2081) block path.
+        //
+        // If a waiter is already registered (multi-caller poll not
+        // supported at MVP), fall through to writeback with nready=0
+        // to avoid clobbering the prior registration.
+        mov rax, [rip + _poll_waiter_tcb];
+        cmp rax, 0;
+        jne poll_writeback;
+
+        mov rax, [rip + _current_tcb];
+        mov [rip + _poll_waiter_tcb], rax;
+
+        call sched_block;
+        // On resume the wake side has already cleared _poll_waiter_tcb
+        // (see poll_wake_check_and_clear). Re-scan once and return the
+        // new count.
+        jmp poll_scan;
+
+      poll_writeback:
+        mov rdi, rbx;
+        lea rsi, [rip + _dispatch_poll_scratch];
+        mov rdx, r15;
+        call user_write_bytes_via_walk;
+        cmp rax, 0;
+        jne poll_efault;
+
+        mov rax, r14;                          // nready
+        jmp poll_done;
+
+      poll_einval:
+        mov rax, 0xFFFFFFFFFFFFFFEA;
+        jmp poll_done;
+
+      poll_efault:
+        mov rax, 0xFFFFFFFFFFFFFFF2;
+
+      poll_done:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        pop rbp;
+        ret
+      }
+    }
+}

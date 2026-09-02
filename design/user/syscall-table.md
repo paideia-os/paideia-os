@@ -82,11 +82,11 @@ preserved by the kernel.
 | 95 | `kill` | `pid`, `signum` | 0 or `-errno`; only SIGSTOP/SIGCONT delivered at R73 |
 | 96 | `sendto` | `fd`, `buf`, `len`, `dst_ip`, `dst_port` | bytes sent or `-errno`; UDP's first send path (R93.M2). Also usable by TCP — `dst_ip`/`dst_port` ignored on a connected socket. |
 | 97 | `recvfrom` | `fd`, `buf`, `len`, `src_ip_out`, `src_port_out` | bytes received or `-errno`; UDP's first recv path (R93.M2). |
-| 98 | `getsockopt` | `fd`, `level`, `optname`, `optval_ptr`, `optlen_ptr` | 0 or `-errno`; `SO_ERROR`/`SO_TYPE` at R95.M1. |
-| 99 | `setsockopt` | `fd`, `level`, `optname`, `optval_ptr`, `optlen` | 0 or `-errno`; `SO_REUSEADDR`/`O_NONBLOCK`-equivalent/`TCP_NODELAY` at R95.M1. |
-| 100 | `getpeername` | `fd`, `sockaddr_out` | 0 or `-errno`; R95.M2. |
-| 101 | `getsockname` | `fd`, `sockaddr_out` | 0 or `-errno`; R95.M2. |
-| 102 | `poll` | `fds_ptr`, `nfds`, `timeout_ms` | nready or `-errno`; fixed-size `fds` array, no dynamic `nfds` allocation. R95.M3. |
+| 98 | `getsockopt` | `fd`, `level`, `optname`, `optval_ptr`, `optlen_ptr` | 0 or `-errno`; `SO_REUSEADDR`/`SO_NONBLOCK`/`SO_ERROR`/`SO_TYPE` (level=`SOL_SOCKET`=1); `TCP_NODELAY` (level=`IPPROTO_TCP`=6). `SO_TYPE` derives from cap kind (`KIND_TCP_SOCKET`->`SOCK_STREAM`=1, `KIND_UDP_SOCKET`->`SOCK_DGRAM`=2). `SO_ERROR` reads and clears the row's so_error slot. R95.M1-002 (paideia-os #2077) landed. |
+| 99 | `setsockopt` | `fd`, `level`, `optname`, `optval_ptr`, `optlen` | 0 or `-errno`; `SO_REUSEADDR`/`SO_NONBLOCK`/`TCP_NODELAY` set/clear bit in row's so_flags slot (informational MVP -- no bind-collision or blocking-recv semantics change today). R95.M1-001 (paideia-os #2076) landed. |
+| 100 | `getpeername` | `fd`, `sockaddr_out` | 0 or `-errno`; writes 8-byte {ip[4] MSB-first, port[4] LE} record; requires state != CLOSED (TCP) or state == CONNECTED (UDP), else `-ENOTCONN`. R95.M2-001 (paideia-os #2078) landed. |
+| 101 | `getsockname` | `fd`, `sockaddr_out` | 0 or `-errno`; writes 8-byte {ip[4], port[4]} record; for an unbound socket, ip fills from `_ipv4_my_ip` (single-interface tree) and port stays 0. R95.M2-002 (paideia-os #2079) landed. |
+| 102 | `poll` | `fds_ptr`, `nfds`, `timeout_ms` | nready or `-errno`; fixed-size `fds` array (nfds cap 32, stride 8 bytes per Linux `pollfd`); `POLLIN`/`POLLOUT`/`POLLERR` readiness across TCP/UDP sockets. `nready > 0` or `timeout_ms == 0` short-polls without blocking; else registers waiter and calls `sched_block`. R95.M3-001 (paideia-os #2080) landed. R95.M3-002 (#2081) wired `poll_wake_check_and_clear` into `udp_socket_deliver_dgram`; TCP RX wake deferred (see round-retro). |
 | 103 | `icmp_echo` | `dst_addr_ptr`, `seq`, `payload_ptr`, `payload_len`, `timeout_ms` | rtt_ns (>=0) or `-errno`; requires R_NET_PRIVILEGED_PROTOCOL (kernel-side check via `cap_check_r_net_privileged_protocol`). Loopback (dst 127.x.x.x or `_ipv4_my_ip`) is synchronous through the ICMP send path; off-box wire dispatch deferred pending real ARP + wait-for-reply plumbing. R100-PREP-003 (paideia-os #2009). |
 | 104 | `pdxfs_txn_commit` | `cap_slot` | 0 or `-errno` / sentinel; commits the KIND_PDXFS_TXN behind `cap_slot` (writes JOP_COMMIT + BD_OP_FLUSH via `pdxfs_txn_commit_wal`, transitions OPEN → COMMITTED via `pdxfs_txn_row_transition`, bumps `PXT_ST_COMMITS`). `-EBADF` on a bad cap slot; underlying journal / transition sentinels forwarded verbatim. Row release + cap-slot clear are DEFERRED to a future `sys_pdxfs_txn_close`. R90-XREPO.010.M1-003 (paideia-os #2111). |
 | 105 | `pdxfs_txn_abort` | `cap_slot` | 0 or `-errno` / sentinel; aborts the KIND_PDXFS_TXN behind `cap_slot` (writes JOP_ABORT via `pdxfs_txn_abort_wal`, transitions OPEN → ABORTED, bumps `PXT_ST_ABORTS`). Per-record undo-body replay DEFERRED to paideia-os #2112 (blocked on this milestone). R90-XREPO.010.M1-003 (paideia-os #2111). |
@@ -95,11 +95,13 @@ preserved by the kernel.
 | **517** | **`cwd_resolve`** | `path_ptr`, `abs_out_ptr`, `abs_out_cap` | strlen (excl. NUL) or `-errno`; realpath primitive for the mv/rm/cp satellite consumers. Resolves the caller's path (absolute OR relative — relative anchors at `[_current_tcb + TASK_OFF_CWD]` per `design/user/cwd-semantics.md`) via `mount_root_vnode` + `path_resolve` + a parent-chain walk composing the canonical absolute form (leading `/`, `_vnode_name_table` components joined by `/`), writing the NUL-terminated result to `abs_out_ptr` (up to `abs_out_cap` bytes). Returns strlen (excluding NUL). Body takes KERNEL VAs (dispatch shim does the KPTI bounce for user callers, matching `sys_pdxfs_undo_write`'s split). `-ENOENT` if the path does not resolve or no root mounted; `-ERANGE` if the composed path + NUL exceeds `abs_out_cap` or the parent-chain walk exceeds `SYS_CWD_RESOLVE_MAX_DEPTH=32`; `-EFAULT` (dispatch-shim only) if either user pointer is refused. The `path_len_hint` field the earlier design skeleton proposed was dropped — the walker sizes the path via NUL. R90-XREPO.010.M1-007 (paideia-os #2115). |
 | **527** | **`pdxfs_fault_inject`** | `class` | 0 or `-errno`; arms/disarms a PdxFS fault-injection class. `class` = 0 disarms; 1..4 arm one of `WAL_WRITE_FAIL` / `INODE_ALLOC_FAIL` / `EXTENT_ALLOC_FAIL` / `UNDO_APPEND_FAIL`. Single-shot: the arm is consumed by the next traversal of the named hook site (`wal_append` / `tmpfs_inode_alloc` / `tmpfs_write` pre-`phys_alloc` / `pdxfs_txn_undo_append`). Refused with `-EPERM` when the boot flag `_pdxfs_fault_enabled` is 0 (release-build gate; see `design/kernel/pdxfs-fault-inject.md` §3), refused with `-EINVAL` when class > 4. Dispatch is an explicit early check ahead of the linear switch bounds gate — the sysno sits far above the 0..107 core range, chosen out-of-band by the mv/rm design docs to preserve the tightly-packed low band. R90-XREPO.010.M1-005 (paideia-os #2113). |
 
-Syscalls 96–102 are **reserved by `design/networking/r91-plan.md` §17,
-not yet implemented** as of this table's refresh (R90-XREPO.009 covers
-only through 95). They will be materialized in `dispatch.pdx` as each
-round in the R91–R99 networking wave lands the corresponding handler;
-until then they fall through to `-ENOSYS` like any other unlisted number.
+Syscalls 96 and 97 (`sendto` / `recvfrom`) remain **reserved by
+`design/networking/r91-plan.md` §17, not yet implemented** as of this
+refresh. Sysnos 98..102 (the socket option/name/poll block) landed in
+R95 (paideia-os #2076..#2080); the R95 landing is documented per row
+above and in `design/round-retrospectives/r95-closed.md`. Sysno 103
+(`sys_icmp_echo`) landed in R100-PREP-003. Any remaining 96..97 sysnos
+fall through to `-ENOSYS` until the deferred `sendto`/`recvfrom` land.
 
 Sysnos **517** and **527** are **out-of-band** allocations by the
 R90-XREPO.010 wave (`design/round-retrospectives/r90-xrepo-wave3-plan.md`
@@ -198,6 +200,10 @@ Any syscall number not listed in the table above returns `-ENOSYS`
 - #1938 — R73.M1-001 sys_kill (95).
 - #2003 (R90-XREPO.009) — first refresh through sysno 95.
 - #2009 (R100-PREP-003) — sys_icmp_echo (sysno 103).
+- #2076..#2085 (R95) — socket API polish + poll block (sysnos 98..102)
+  plus R_SOCKET_READ/WRITE/LISTEN/CONNECT rights bits threaded through
+  every socket handler. See
+  `design/round-retrospectives/r95-closed.md`.
 - #2109..#2116 (R90-XREPO.010) — the R42 PdxFS syscall substrate wave.
   #2109 landed the KIND_PDXFS_FILE `PFF_OP_READ_BYTES` op (cap-invoke
   path; no new sysno). #2110 landed sysno 106
