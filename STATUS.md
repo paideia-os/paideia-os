@@ -1278,3 +1278,37 @@ disposition, deferred items (TCP RX wake wire; timer-driven poll
 timeout; sys_socket privileged-port refinement; POLLNVAL; SO_ERROR
 async population; multi-caller poll), and the file-change inventory.
 Retire tag: `r95-closed` (main to apply after this landing).
+
+---
+
+## R98 (net-tools smoke lane consolidation) — CLOSED 2026-09-02
+
+R98 closes as a four-milestone tooling round consolidating the R91-R94
+kernel-side networking smoke matrix into one opt-in lane: `boot_net_
+smoke` composite in `tools/run-smoke.sh` runs `boot_r91_nic` (NEW mode
+this round -- retires R91.M6 deferred item #8) + `boot_r93_udp_dns` +
+`boot_r94_tcp_offbox` in sequence (M1); `tools/net-smoke-httpd.sh`
+minimal host-side responder (python3 preferred, nc fallback) plus a
+tightened `tests/expected-r94-tcp-offbox.golden` pinning `bytes=4` as
+the strict ok pair (M2); `tools/run-qemu.sh --help` consolidated flag
+summary + `design/networking/qemu-net-invocation.md` catalogue (M3);
+this closure (M4). `PAIDEIA_NET_SMOKE=1` env gate on the three lane
+members follows the `PAIDEIA_R72_TCP=1` precedent. No `.pdx` code
+lands. See `design/round-retrospectives/r98-closed.md` for the full
+per-issue disposition. Retire tag: `r98-closed` (main to apply after
+this landing).
+
+---
+
+## R99 (R91-R98 wave close) — CLOSED 2026-09-02
+
+R99 closes the R91-R98 networking wave as a two-milestone documentation
+round: `design/round-retrospectives/r91-r98-wave-closed.md` -- ~330-
+line wave-level retrospective covering all 96 issues shipped, per-
+round scope, wave-level metrics (35 new `.pdx` modules, 6 design
+docs, 9 retrospectives, 7 sysnos, 3 KIND ordinals, 3 env vars, 1
+cross-repo escalation), a 26-entry debt inventory carried forward,
+and the two-track next-wave pointer (Track A: IPv6 substrate; Track
+B: Phase-2 net-stack server migration to userspace) (M1-001); this
+STATUS.md update (M1-002). Retire tag: `r99-closed` PLUS wave-level
+`net-wave-closed` (main to apply after this landing).

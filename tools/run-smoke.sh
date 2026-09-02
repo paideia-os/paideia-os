@@ -57,8 +57,10 @@
 #     * boot_r65_persistent_home: PHASE 1 ONLY (phase 2 deferred to R51/R52). Injects 'mkdir /home\nmkdir /home/operator\nmkfs.pdxfs --dry-run /var/pdxfs/home.img\nmount.pdxfs --dry-run cap:volume:0x0001 /home/operator\ntouch /home/operator/probe.txt\nexit\n', asserts the two mkdir fingerprints + both tools' dry-run preview lines + REAPED, 32s timeout. Opt-in via PAIDEIA_R65_PERSIST=1 (R65v2.M1-004/005, paideia-os#1982/#1983)
 #     * boot_r72_tcp_echo: validates the R72 TCP substrate boot witness (self-connect handshake + port-7 echo + mutual orderly close), 10s timeout, no special QEMU flags (R72.M1-007 #1929)
 #     * boot_r92_icmp: validates the R92.M3 off-box ICMP-ping cascade (route-table update witness + arp-pending retry + arp-resolve + icmp echo/reply against QEMU SLIRP's gateway 10.0.2.2), 15s timeout, requires PAIDEIA_NIC=virtio (default) so run-qemu.sh attaches -netdev user + -device virtio-net-pci giving SLIRP networking (R92.M3-003 paideia-os #2041)
-#     * boot_r93_udp_dns: validates the R93 DHCP+DNS cascade -- DHCP DISCOVER/OFFER/REQUEST/ACK against QEMU SLIRP (10.0.2.15/24, gw 10.0.2.2, dns 10.0.2.3) followed by an A-record resolution of "example.com" against 10.0.2.3. Golden pins both lease-ok and dns-resolve-ok fingerprints. 20s timeout, requires PAIDEIA_NIC=virtio for SLIRP responsiveness (R93.M4-001 paideia-os #2058)
-#     * boot_r94_tcp_offbox: validates the R94 hardened TCP cascade against QEMU SLIRP's hostfwd. Fingerprint contract admits either the ok pair (handshake_ok + roundtrip_ok bytes=<N>) OR a skip line (no NIC / no responder / precondition miss). 20s timeout, requires PAIDEIA_HOSTFWD='tcp::5555-:5555' + a background netcat listener on host tcp/5555 for the ok path (R94.M6-003 paideia-os #2075)
+#     * boot_r93_udp_dns: validates the R93 DHCP+DNS cascade -- DHCP DISCOVER/OFFER/REQUEST/ACK against QEMU SLIRP (10.0.2.15/24, gw 10.0.2.2, dns 10.0.2.3) followed by an A-record resolution of "example.com" against 10.0.2.3. Golden pins both lease-ok and dns-resolve-ok fingerprints. 20s timeout, requires PAIDEIA_NIC=virtio for SLIRP responsiveness. R98.M1-002 (#2101) added PAIDEIA_NET_SMOKE=1 gate (skips cleanly outside the lane) (R93.M4-001 paideia-os #2058)
+#     * boot_r94_tcp_offbox: validates the R94 hardened TCP cascade against QEMU SLIRP's hostfwd. Fingerprint contract (R98.M2-002 #2103 tightened) pins the ok pair (handshake_ok + roundtrip_ok bytes=4 -- matches tools/net-smoke-httpd.sh's PAYLOAD=PONG default). 20s timeout, requires PAIDEIA_NET_SMOKE=1 + PAIDEIA_HOSTFWD='tcp::5555-:5555' + tools/net-smoke-httpd.sh listener on host tcp/5555. Skips cleanly outside the lane (R98.M1-002 #2101).
+#     * boot_r91_nic: pins the R91.M5-003 NIC probe fingerprint `boot r91 nic probe ok` (retires R91.M6 deferred item #8). 10s timeout, PAIDEIA_NET_SMOKE=1 gated (R98.M1-001 #2100).
+#     * boot_net_smoke: networking-smoke lane composite. Runs boot_r91_nic + boot_r93_udp_dns + boot_r94_tcp_offbox in sequence, starts+kills tools/net-smoke-httpd.sh around the R94 leg, aborts on first failure, emits a single rollup line. Sets PAIDEIA_NET_SMOKE=1 + PAIDEIA_HOSTFWD='tcp::5555-:5555' for its children (R98.M1-001/002 paideia-os #2100/#2101).
 #     * boot_smp: validates R18.M1 SMP bring-up fingerprint on -smp 4; BSP wakes 3 APs (APIC IDs 1/2/3), each emits CPU_ID_XX_HELLO; bookended by SMP BRINGUP START / DONE (R18.M1 #764)
 #     * boot_panic: validates M3-003 fake-panic emission chain witness, 8s timeout
 #     * prod: expects exit code 2 (kernel didn't build), skips verification
@@ -781,23 +783,31 @@ case "${EXPECTED}" in
         # listener on host tcp/5555, sends 4 bytes of "PING", drains
         # the reply from the client TCB's rx_buf, and orderly-closes.
         #
-        # Fingerprint sequence (contains-in-order; substring match):
+        # R98.M1-002 (#2101): gated behind PAIDEIA_NET_SMOKE=1. This
+        # mode requires a host-side responder to satisfy its (now
+        # strict) golden -- exercising it outside the networking-smoke
+        # lane would fail the strict `bytes=4` line every time. The
+        # composite `boot_net_smoke` mode owns the responder lifecycle
+        # (tools/net-smoke-httpd.sh) and sets PAIDEIA_NET_SMOKE=1 +
+        # PAIDEIA_HOSTFWD before recursively invoking this mode.
+        #
+        # R98.M2-002 (#2103): fingerprint sequence tightened. Golden
+        # at tests/expected-r94-tcp-offbox.golden now pins the ok pair
         #   `boot r94 offbox handshake ok --`
-        #   `boot r94 offbox roundtrip ok -- bytes=<N>`
-        # OR (skip variant on precondition miss):
-        #   `boot r94 offbox skip -- stage=<code>`
+        #   `boot r94 offbox roundtrip ok -- bytes=4`
+        # rather than the permissive substring `boot r94 offbox` that
+        # would also match the skip variant. `bytes=4` matches
+        # tools/net-smoke-httpd.sh's default PAYLOAD="PONG".
         #
-        # The golden at tests/expected-r94-tcp-offbox.golden pins the
-        # substring `boot r94 offbox` -- either the ok pair OR any
-        # skip line satisfies the smoke. Same posture as R92 icmp
-        # ping (a follow-up landing will tighten the golden once the
-        # host responder is set up bit-identically across dev hosts).
-        #
-        # To exercise the OK path locally:
-        #   PAIDEIA_HOSTFWD='tcp::5555-:5555' PAIDEIA_NIC=virtio \
-        #     bash -c 'nc -l 5555 -q 1 <<<"PONG" & \
+        # Manual invocation outside the composite:
+        #   PAIDEIA_NET_SMOKE=1 PAIDEIA_HOSTFWD='tcp::5555-:5555' \
+        #     bash -c 'PAYLOAD=PONG tools/net-smoke-httpd.sh & \
         #              sleep 0.2; \
         #              tools/run-smoke.sh boot_r94_tcp_offbox'
+        if [[ "${PAIDEIA_NET_SMOKE:-0}" != "1" ]]; then
+            echo "smoke: boot_r94_tcp_offbox skipped (PAIDEIA_NET_SMOKE!=1; opt-in via composite boot_net_smoke or set the flag + start tools/net-smoke-httpd.sh)"
+            exit 0
+        fi
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r94-tcp-offbox.golden"
         TIMEOUT=20
@@ -805,6 +815,15 @@ case "${EXPECTED}" in
         ;;
     boot_r93_udp_dns)
         # R93.M4-001 (paideia-os #2058): DHCP + DNS boot cascade.
+        #
+        # R98.M1-002 (#2101): gated behind PAIDEIA_NET_SMOKE=1 so it
+        # composes with the networking-smoke lane rather than running
+        # opportunistically. SLIRP's built-in DHCP + DNS servers serve
+        # this witness without any host-side responder, but the gate
+        # keeps all three lane members (R91 / R93 / R94) refusing
+        # cleanly outside the lane so a single opt-in flag is the only
+        # switch a caller needs to reason about.
+        #
         # The witness lives at src/kernel/boot/witness/r93_udp_dns.pdx
         # and fires unconditionally on every boot (via kernel_main.pdx
         # after witness_r92_icmp_ping). Under PAIDEIA_NIC=virtio
@@ -822,10 +841,140 @@ case "${EXPECTED}" in
         # specific ip=x.x.x.x bytes lands once TSC-cal-style RTT
         # variability is characterized. For now the substring match
         # is sufficient to prove both fingerprints reached the wire.
+        if [[ "${PAIDEIA_NET_SMOKE:-0}" != "1" ]]; then
+            echo "smoke: boot_r93_udp_dns skipped (PAIDEIA_NET_SMOKE!=1; opt-in via composite boot_net_smoke)"
+            exit 0
+        fi
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r93-udp-dns.golden"
         TIMEOUT=20
         EXPECTED=""
+        ;;
+    boot_r91_nic)
+        # R98.M1-001 (paideia-os #2100): retires the R91.M6 deferred
+        # item #8 ("boot_r91_nic smoke mode + expected-r91-nic-probe.
+        # golden was not landed with the round close-out"). The R91.M5-
+        # 003 witness at src/kernel/boot/witness/r91_nic_probe.pdx
+        # fires on every default boot; this mode pins the fingerprint.
+        #
+        # Fingerprint (contains-in-order, substring match):
+        #   `boot r91 nic probe ok`
+        # Matches the two emit variants (`kind=0` when no NIC attached,
+        # `kind=<n> mac=<packed> link_up=<0|1>` otherwise) because
+        # both share the same "boot r91 nic probe ok" prefix. See
+        # design/round-retrospectives/r91-closed.md §"Observable proof"
+        # for the full emission chain.
+        #
+        # R98.M1-002 (#2101): gated behind PAIDEIA_NET_SMOKE=1 like
+        # the R93 / R94 lane members, so a single opt-in flag governs
+        # the whole networking-smoke lane.
+        if [[ "${PAIDEIA_NET_SMOKE:-0}" != "1" ]]; then
+            echo "smoke: boot_r91_nic skipped (PAIDEIA_NET_SMOKE!=1; opt-in via composite boot_net_smoke)"
+            exit 0
+        fi
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/r91/expected-r91-nic-probe.golden"
+        TIMEOUT=10
+        EXPECTED=""
+        ;;
+    boot_net_smoke)
+        # R98.M1-001 (paideia-os #2100): networking-smoke composite
+        # meta-mode. Runs the three lane members (boot_r91_nic +
+        # boot_r93_udp_dns + boot_r94_tcp_offbox) in sequence, aborting
+        # on the first failure, and emits a single rollup line so
+        # pre-push / operator invocation gets one green/red for the
+        # whole R91-R94 lane.
+        #
+        # This meta-mode OWNS three side-effects that the individual
+        # modes do not:
+        #   1. Sets PAIDEIA_NET_SMOKE=1 for each child invocation so
+        #      the R98.M1-002 (#2101) gates in each lane member's own
+        #      case arm open cleanly.
+        #   2. Sets PAIDEIA_HOSTFWD='tcp::5555-:5555' so run-qemu.sh's
+        #      hostfwd-extras block wires host tcp/5555 to guest
+        #      tcp/5555 for the R94 witness's off-box connect.
+        #   3. Starts tools/net-smoke-httpd.sh in the background on
+        #      port 5555 with PAYLOAD="PONG" (4 bytes -- matches the
+        #      R98.M2-002 (#2103) tightened golden line
+        #      `roundtrip ok -- bytes=4`) before boot_r94_tcp_offbox
+        #      launches, and kills it on exit.
+        #
+        # Ordering rationale: R91 first (cheapest, proves the NIC is
+        # even attached before any wire traffic); R93 second (DHCP +
+        # DNS against SLIRP built-ins, no external responder); R94
+        # last (needs the host-side responder to be up and can leave
+        # the responder in a half-drained state if the witness fails
+        # -- runs last so a mid-lane abort doesn't strand responder
+        # state that would confuse a later lane member).
+        #
+        # PAIDEIA_NIC defaults are honoured (per run-qemu.sh header,
+        # `virtio` is the R91.M5-002 default so SLIRP wires up
+        # correctly for every child); a caller that wants e1000e or
+        # rtl8139 exports PAIDEIA_NIC before invoking.
+
+        # Preflight: refuse if neither python3 nor nc is available --
+        # net-smoke-httpd.sh would fail at start otherwise and the R94
+        # child would then fail on the strict golden with a confusing
+        # error rather than a clean skip.
+        if ! command -v python3 >/dev/null 2>&1 && ! command -v nc >/dev/null 2>&1; then
+            echo "smoke: boot_net_smoke skipped (neither python3 nor nc found -- see tools/net-smoke-httpd.sh)" >&2
+            exit 0
+        fi
+
+        _netsmoke_rollup=""
+
+        _netsmoke_run_child() {
+            local _child="$1"
+            echo "[net-smoke] running ${_child}"
+            PAIDEIA_NET_SMOKE=1 "$0" "${_child}"
+            local _rc=$?
+            if [[ ${_rc} -ne 0 && ${_rc} -ne 33 ]]; then
+                echo "smoke: boot_net_smoke FAILED at ${_child} (rc=${_rc})" >&2
+                _netsmoke_rollup+="${_child}=FAIL "
+                return ${_rc}
+            fi
+            _netsmoke_rollup+="${_child}=ok "
+            return 0
+        }
+
+        # 1. R91 -- NIC probe fingerprint (cheapest, gates NIC attach).
+        _netsmoke_run_child boot_r91_nic || exit $?
+
+        # 2. R93 -- DHCP + DNS against SLIRP built-ins.
+        _netsmoke_run_child boot_r93_udp_dns || exit $?
+
+        # 3. R94 -- off-box TCP against host-side responder. Start the
+        #    responder in the background first; PAIDEIA_HOSTFWD wires
+        #    QEMU SLIRP host tcp/5555 -> guest tcp/5555 for the connect.
+        _netsmoke_httpd_pid=""
+        PORT=5555 PAYLOAD=PONG HANG=15 \
+            "${REPO_ROOT}/tools/net-smoke-httpd.sh" &
+        _netsmoke_httpd_pid=$!
+        # Give the listener a fraction of a second to bind before the
+        # guest boots + reaches the witness's connect (~1s minimum).
+        sleep 0.3
+
+        # Ensure the responder is reaped whether the R94 child passes,
+        # fails, or the shell is interrupted mid-lane.
+        _netsmoke_cleanup() {
+            if [[ -n "${_netsmoke_httpd_pid}" ]]; then
+                kill "${_netsmoke_httpd_pid}" 2>/dev/null || true
+                wait "${_netsmoke_httpd_pid}" 2>/dev/null || true
+            fi
+        }
+        trap _netsmoke_cleanup EXIT
+
+        PAIDEIA_HOSTFWD='tcp::5555-:5555' \
+            _netsmoke_run_child boot_r94_tcp_offbox
+        _r94_rc=$?
+        _netsmoke_cleanup
+        trap - EXIT
+        if [[ ${_r94_rc} -ne 0 && ${_r94_rc} -ne 33 ]]; then
+            exit ${_r94_rc}
+        fi
+
+        echo "smoke: boot_net_smoke lane passed -- ${_netsmoke_rollup}"
+        exit 0
         ;;
     boot_r92_icmp)
         # R92.M3-003 (paideia-os #2041): off-box ICMP-ping boot
