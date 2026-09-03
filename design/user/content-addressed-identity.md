@@ -355,6 +355,64 @@ graph, restricted to a single-rooted tree for R108.
 
 ## 9. Alignment with existing tree
 
+### 9.1 R106 placeholder registry — `src/user/founder_constants.pdx`
+
+R106.M1 (paideia-os #2228, **CLOSED** at commit 444da68) introduced
+`src/user/founder_constants.pdx` (module `FounderConstants`) to isolate
+the build-time placeholder fingerprint that gives the persistent-home
+tree its final SHAPE (`/home/<64-hex-fp>/` per §4) before R108.M2
+lands real Argon2id + ML-DSA-65 key generation. Every consumer that
+would otherwise embed a literal placeholder string imports from this
+module by name, so R108.M2 can retire the placeholder in a single
+commit — flip the `fc_placeholder_*` symbols to the real founder
+fingerprint (derived from `argon2id_derive` + `mldsa65_keygen` +
+`SHAKE-256(pk)[0..32]`), and every path consumer picks up the change
+through the linker.
+
+Placeholder value: `deadbeef00000000000000000000000000000000000000000000000000000000`
+(64 lowercase hex chars = 32 bytes decoded). The `deadbeef` prefix is
+a widely-recognised sentinel; the all-zero tail is an additional
+signal (a real SHAKE-256-drawn fingerprint has every bit populated).
+No user can hold the ML-DSA-65 private key whose
+`SHAKE-256(pk)[0..32]` equals `deadbeef00...` without breaking
+SHAKE-256 preimage resistance.
+
+Placeholder → rename map (R106 → R108.M2):
+
+| R106 placeholder symbol                                | R108.M2 rename target                                              | Kind        |
+|--------------------------------------------------------|--------------------------------------------------------------------|-------------|
+| `src/user/founder_constants.pdx` (module)              | `src/user/founder_identity.pdx` (module `FounderIdentity`)         | file+module |
+| `fc_placeholder_fp_hex : [u8; 65]`                     | `fc_founder_fp_hex : [u8; 65]`                                     | rodata      |
+| `fc_placeholder_fp_hex_len : u64 = 64`                 | `fc_founder_fp_hex_len : u64 = 64` (width invariant)               | rodata      |
+| `fc_placeholder_home_path : [u8; 71]` = `/home/deadbeef00…\0` | `fc_founder_home_path : [u8; 71]` = `/home/<real_fp_hex>\0`  | rodata      |
+| `fc_placeholder_home_path_len : u64 = 70`              | `fc_founder_home_path_len : u64 = 70` (width invariant)            | rodata      |
+
+Stable across the rename (not placeholders — kept as-is):
+
+| Symbol                                        | Rationale                                                      |
+|-----------------------------------------------|----------------------------------------------------------------|
+| `FC_FINGERPRINT_BYTES : u64 = 32`             | Width primitive from §1 (SHAKE-256(pk)[0..32]); pre-real.      |
+| `FC_FINGERPRINT_HEX_CHARS : u64 = 64`         | Hex-rendered width from §1; pre-real.                          |
+| `fc_home_root_path : [u8; 6] = "/home\0"`     | Real `/home` root path (parent of every per-user home).        |
+| `fc_home_root_path_len : u64 = 5`             | Wire length of the real `/home` root path.                     |
+
+Current consumers of the placeholder symbols (as of R106.M1):
+
+| Consumer                        | Symbols used                                                  | Notes                                                 |
+|---------------------------------|---------------------------------------------------------------|-------------------------------------------------------|
+| `src/user/rootfs_seed.pdx`      | `fc_home_root_path`, `fc_placeholder_home_path`               | `mkdir /home/` (0755) + `mkdir /home/<fp>/` (0700).   |
+| `src/user/init.pdx` (R106.M2)   | `fc_placeholder_home_path`                                    | Composes `HOME=/home/<fp>` env for exec into `/bin/sh`. |
+| `src/user/dispatch.pdx` / `shell.pdx` (R106.M3) | `fc_placeholder_home_path`                    | `/home/operator` retirement path.                     |
+
+Retirement path: R108.M2 (see §9.2 round map row) rewrites the four
+`fc_placeholder_*` symbols in place with the real founder fingerprint
+after the interactive first-boot sequence (§6) computes it, renames
+the module file to `founder_identity.pdx`, and every listed consumer
+picks up the new value through the linker without any per-consumer
+source edit.
+
+### 9.2 Kernel-side scaffolds — `src/kernel/core/user/`
+
 The following files under `src/kernel/core/user/` are arbitrated-0
 scaffolds today (compiled, wired into boot, but no real crypto):
 
@@ -385,7 +443,7 @@ Round map:
 | Round  | Files that flip arbitrated-0 → arbitrated-1                              |
 |--------|---------------------------------------------------------------------------|
 | R108.M1 | `founder_keygen.pdx`, signed-record I/O primitives (new)                |
-| R108.M2 | `user_registry.pdx`, `first_boot.pdx`, `founder_cap_seed.pdx`          |
+| R108.M2 | `user_registry.pdx`, `first_boot.pdx`, `founder_cap_seed.pdx`; `src/user/founder_constants.pdx` → `founder_identity.pdx` (see §9.1) |
 | R108.M3 | (new) `alias_registry.pdx`, `/bin/alias`                                |
 | R108.M4 | (shell repo) tokenizer novel-tilde real resolution via `KIND_USER_ALIAS` |
 | R108.M6 | `founder_home.pdx` (owner_fingerprint = real founder fp)               |
