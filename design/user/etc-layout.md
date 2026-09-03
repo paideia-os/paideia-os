@@ -1,6 +1,34 @@
 # /etc layout freeze — R74.M1-002 (paideia-os #1940)
 
-The five files under `/etc` that R74 declares authoritative. Frozen
+## Superseded
+
+**Retired 2026-09-03 in favor of content-addressed identity — see
+[content-addressed-identity.md](content-addressed-identity.md).**
+
+No `/etc/passwd` will ship. In R106+ the user identity model becomes
+content-addressed: a user is an ML-DSA-65 keypair, addressed by the
+32-byte SHAKE-256 fingerprint of the public key, with the authoritative
+record at `/system/users/<pk_fingerprint>.pdxuser` (self-signed,
+grantor-countersigned) and home at `/home/<pk_fingerprint>/`. Human-
+readable aliases live in a separate signed alias registry
+(`KIND_USER_ALIAS`), not in `/etc/passwd`. No sequential `uid`/`gid` is
+minted; capability holds replace ACLs (KeyKOS/EROS/seL4 lineage).
+
+The `/etc/{passwd,group,shadow}` shape below is retained as historical
+context so anyone reading git history can locate the pivot, but it is
+**not** the target design. `/etc/hostname`, `/etc/paideia.conf`, and
+`/etc/motd` remain authoritative and are unaffected by this
+supersession — only the `passwd`/user-identity portion is retired.
+
+Research lineage justifying the pivot: KeyKOS/EROS/seL4 capability
+model, Plan 9 per-user namespaces, Tahoe-LAFS content addressing,
+sigstore transparency, W3C Verifiable Credentials, SPKI/SDSI.
+
+---
+
+## Original (historical) freeze
+
+The five files under `/etc` that R74 declared authoritative. Frozen
 shape, so a future operator running against a persistent volume from
 an older HEAD can still be parsed.
 
