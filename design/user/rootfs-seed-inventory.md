@@ -1,8 +1,19 @@
-# Rootfs seed inventory — R57.M4-006 (#1802)
+# Rootfs seed inventory — R57.M4-006 (#1802) + R106.M1 (#2228)
 
-Init-time /bin + /etc/motd seed loop. This document is the manifest that
-`src/user/rootfs_seed.pdx` implements; the code and this text must move
-together in every future landing that touches the seed table.
+Init-time /bin + /etc/motd + /home seed loop. This document is the
+manifest that `src/user/rootfs_seed.pdx` implements; the code and this
+text must move together in every future landing that touches the seed
+table.
+
+R106.M1 (`#2228`) extended the manifest with two content-addressed
+identity directories, `/home` and `/home/<placeholder_fp>/` — see
+§"R106.M1 additions" below and the anchor design docs
+[persistent-home-wave.md](../roadmap/persistent-home-wave.md) §R106
+and [content-addressed-identity.md](content-addressed-identity.md) §4.
+The placeholder fingerprint constant that composes the per-user home
+path lives in `src/user/founder_constants.pdx` (module
+`FounderConstants`, symbols `fc_*`) so R108.M2 can retire it in one
+commit when real Argon2id + ML-DSA-65 key generation lands.
 
 ## Scope
 
@@ -20,13 +31,19 @@ loop always runs its work path.
 
 ## Directory + file manifest
 
-Directories created (mkdir 0777; tmpfs backend drops the mode word):
+Directories created (mode word supplied for POSIX conformance; tmpfs
+backend drops it and forces `VNODE_TYPE_DIR` — the mode still travels
+so a future mode-honouring backend picks up the intent):
 
-| path   | notes                                              |
-| ------ | -------------------------------------------------- |
-| /bin   | may already exist under kernel `bin_seeds`; EIO ok |
-| /etc   | new — the probe target and the /etc/motd parent    |
-| /tmp   | new — reserved for shell scratch                   |
+| path                          | mode | notes                                                                   |
+| ----------------------------- | ---- | ----------------------------------------------------------------------- |
+| /bin                          | 0777 | may already exist under kernel `bin_seeds`; EIO ok                      |
+| /etc                          | 0777 | new — the probe target and the /etc/motd parent                         |
+| /tmp                          | 0777 | new — reserved for shell scratch                                        |
+| /home                         | 0755 | R106.M1 — parent of every per-user home                                 |
+| /home/<placeholder_fp>/       | 0700 | R106.M1 — placeholder founder home; `<placeholder_fp>` = 64-hex-char    |
+|                               |      |   constant from `FounderConstants::fc_placeholder_fp_hex`; R108.M2      |
+|                               |      |   overwrites it in place with the real founder fingerprint              |
 
 Files written (open O_CREAT|O_WRONLY, mode 0644; skip per-file if the file
 already exists so a kernel-side seed of the same path is not overwritten):
@@ -43,10 +60,17 @@ already exists so a kernel-side seed of the same path is not overwritten):
 |   |             |                 | seed skips per stat probe so exec stays intact  |
 | 7 | /etc/motd   | motd_banner     | fixed welcome banner — the seeded-marker file   |
 
-Total inventory: 7 entries. The fingerprint reports `files=7` — the manifest
-size — regardless of how many entries were actually written this boot. This
-is descriptive of the inventory, not the write count; keeping it stable
-lets goldens match a single line.
+Total FILE inventory: 7 entries. The fingerprint reports `files=7` — the
+FILE-manifest size — regardless of how many entries were actually
+written this boot. This is descriptive of the file inventory, not the
+write count; keeping it stable lets goldens match a single line.
+
+R106.M1 grew the DIRECTORY inventory from 3 to 5 (added `/home` and
+`/home/<placeholder_fp>/`) but the fingerprint field is deliberately a
+file count, not a total-entry count, so `files=7` remains the stable
+work-path signal and `files=0` remains the stable skip-path signal.
+The existing `tests/r17/expected-boot-r17-init.txt` golden does not
+move under R106.M1.
 
 ## Payload strategy — R57.M0 stubs
 
@@ -132,11 +156,45 @@ ret. r12 holds the fd across the sys_open → sys_write → sys_close triple
 in each unrolled per-file block. No nested SysV calls (only `syscall`),
 so no alignment pad is needed between operations.
 
+## R106.M1 additions (paideia-os #2228)
+
+R106.M1 extends the manifest to seed the persistent-home tree in its
+R108-final shape, without waiting for real crypto:
+
+* `/home` (mode 0755) — world-traversable so every user can chdir into
+  their own home; only the /home-root owner (init at R106) can add or
+  remove home entries.
+* `/home/<placeholder_fp>/` (mode 0700) — owner-only per-user home. The
+  `<placeholder_fp>` component is the 64-lowercase-hex-char value
+  exported by `FounderConstants::fc_placeholder_fp_hex` (currently
+  `deadbeef00000000000000000000000000000000000000000000000000000000` —
+  a deliberately-recognisable placeholder that R108.M2 will overwrite
+  in place with `hex(SHAKE-256(pubkey)[0..32])` from the real founder
+  keypair). See [content-addressed-identity.md §1](content-addressed-identity.md)
+  for the identity primitive; the mode-0700 default is
+  belt-and-suspenders defence-in-depth against a future POSIX-shaped
+  consumer, and the authoritative access gate on the subtree remains
+  the `KIND_HOME_ROOT` cap per §5 of that doc.
+
+Idempotency: on a second boot with a persistent FS, the top-of-body
+`sys_stat("/etc")` short-circuit (Phase 1 in `rootfs_seed_run`) skips
+Phase 2 entirely, so the two /home mkdirs bypass alongside the /bin,
+/etc, /tmp mkdirs and the seven file rows. Under today's tmpfs (§Scope
+above), /etc is fresh at every boot, so the work path always runs and
+both /home entries are (re)created every boot. Same idempotency shape
+the pre-R106.M1 seed had — no per-entry stat probe on the /home dirs
+is needed because the top-level short-circuit already covers them.
+
 ## Files
 
 * `src/user/rootfs_seed.pdx` — payload table + seed loop
+* `src/user/founder_constants.pdx` — R106.M1: placeholder fingerprint,
+  `/home` root path, and composed `/home/<placeholder_fp>` path. Pure
+  rodata; no callable surface. Retired at R108.M2 in favour of the real
+  founder-fingerprint symbols.
 * `src/user/init.pdx` — one-line `call rootfs_seed_run` insertion in _start
-* `tools/build-user.sh` — rootfs_seed.o joins INIT_OBJECTS
+* `tools/build-user.sh` — rootfs_seed.o AND founder_constants.o join
+  INIT_OBJECTS
 
 ## Argv posture (R62.M1-006, #1837)
 

@@ -174,6 +174,24 @@ while IFS= read -r -d '' pdx; do
         # LIBS_OBJECTS/SHELL_OBJECTS entry; only INIT_OBJECTS grows.
         # See design/user/rootfs-seed-inventory.md.
         INIT_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "founder_constants.pdx" ]]; then
+        # R106.M1 (paideia-os #2228): founder_constants.pdx is a pure-
+        # data module (rodata symbols only, no _start / no lambdas)
+        # holding the R106-era PLACEHOLDER content-addressed founder
+        # fingerprint and the composed /home/<placeholder_fp>/ path.
+        # rootfs_seed.pdx references its symbols via `lea rip +
+        # fc_placeholder_home_path` at Phase 2 mkdir. At M1 the only
+        # reader is rootfs_seed (init-only), so the object joins only
+        # INIT_OBJECTS. R106.M2 adds a SHELL_OBJECTS entry here when
+        # init.pdx / dispatch.pdx pick up HOME=/home/<fp>. R108.M2
+        # retires the placeholder symbols in favour of the real
+        # founder fingerprint (this module renames then). See
+        # design/user/content-addressed-identity.md §9 for the
+        # arbitrated-0 -> arbitrated-1 alignment table this module
+        # sits at the head of, and
+        # design/roadmap/persistent-home-wave.md §R106 for the wave
+        # sequencing.
+        INIT_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "child_hello.pdx" ]]; then
         CHILD_HELLO_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "true.pdx" ]]; then
