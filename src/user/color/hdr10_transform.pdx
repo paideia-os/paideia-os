@@ -1,0 +1,890 @@
+// src/user/color/hdr10_transform.pdx -- G6.M4 (#2235) Wave 0 Batch 1 #01
+//
+// HDR10 output transform. Composes the SMPTE ST 2084 PQ OETF (encode:
+// linear -> PQ) on top of the fp16 scRGB-linear composition space that
+// #1509-#1516 established, plus the SMPTE ST 2086 static mastering-
+// display metadata (MDCV) that the display-transform stage forwards to
+// the sink over the HDMI/DP infoframe.
+//
+// This module is deliberately compositor-facing and self-contained: it
+// borrows nothing at link time from the kernel-side eotf/scrgb tables
+// (those live in src/kernel/core/drivers/color/), because HDR10 is
+// applied at the user-space compositor boundary and must be reachable
+// without a syscall detour. Instead, the compositor installs its own
+// 65-sample Q16.16 piecewise-linear PQ OETF table via
+// hdr10_pq_install; hdr10_pq_encode_* then interpolate against it.
+//
+// The concrete PQ closed form (ST 2084 §5.3.2), for reference only:
+//
+//   Y_norm  = L / 10000                    (luminance in [0, 1])
+//   E'      = ( (c1 + c2 * Y_norm^m1)
+//              / (1 + c3 * Y_norm^m1) )^m2
+//   with m1 = 2610/16384, m2 = 2523/4096 * 128,
+//        c1 = 3424/4096,   c2 = 2413/4096 * 32,
+//        c3 = 2392/4096 * 32.
+//
+// The full closed form runs on the GPU shader path (deferred). The CPU
+// path (this module) uses a piecewise-linear approximation the shader
+// authority validates once at install time.
+//
+// =============================================================================
+// SECTION 0  PQ OETF TABLE SHAPE
+// =============================================================================
+//
+// 65 Q16.16 samples spanning normalized luminance [0, 1] in 64 equal
+// steps of 0x400 (1024) per interval:
+//
+//   sample[i] = OETF_PQ(i / 64)  encoded as Q16.16 in [0, 0x10000].
+//
+// Storage: 65 u64 samples + 1 header word (0 = uninstalled, 1 = ready).
+//
+// =============================================================================
+// SECTION 1  ST 2086 MDCV RECORD
+// =============================================================================
+//
+// One MDCV slot = 8 u64 words:
+//
+//   [0]  primaries_R : (x u32 lo, y u32 hi)   -- units 0.00002 (CTA-861)
+//   [1]  primaries_G : (x u32 lo, y u32 hi)
+//   [2]  primaries_B : (x u32 lo, y u32 hi)
+//   [3]  white_point : (x u32 lo, y u32 hi)
+//   [4]  luminance   : (max_disp_ml u32 lo, min_disp_ml u32 hi)
+//                       -- units 0.0001 cd/m^2 (per ST 2086)
+//   [5]  content_lvl : (MaxCLL u32 lo, MaxFALL u32 hi)  -- cd/m^2
+//   [6]  present     : 1 iff populated, else 0
+//   [7]  reserved    : 0
+//
+// Four slots are provisioned (primary display + up to three secondary
+// output sinks -- HDMI, DP, USB-C DP-alt).
+//
+// =============================================================================
+// SECTION 2  FAILURE TAXONOMY 0xFFFFEDC0..0xFFFFEDCF
+// =============================================================================
+//
+//   0xFFFFEDCF  HDR10_BAD_CHANNEL     -- fp16 bit pattern invalid or > 1.0
+//   0xFFFFEDCE  HDR10_BAD_LUMINANCE   -- normalized luminance not in [0, 1]
+//   0xFFFFEDCD  HDR10_BAD_SLOT        -- MDCV slot ordinal out of range
+//   0xFFFFEDCC  HDR10_BAD_WORD        -- MDCV word index out of range
+//   0xFFFFEDCB  HDR10_NOT_INSTALLED   -- PQ OETF table not installed
+//   0xFFFFEDCA  HDR10_BAD_SAMPLES     -- caller-supplied samples ptr rejected
+//
+// =============================================================================
+
+module Hdr10Transform = structure {
+
+  // -- fingerprint ----------------------------------------------------
+  // A witness/smoke test emits this via sys_debug_puts on a successful
+  // install; the line ends in `[legacy: HDR10 TRANSFORM OK]` per the
+  // fingerprint convention (see klog/keys.pdx and user/init.pdx §5).
+  pub let hdr10_install_ok_msg : [u8; 49] = "hdr10 transform ok [legacy: HDR10 TRANSFORM OK]\n\0"
+
+  // -- ordinals & error codes ----------------------------------------
+  pub let HDR10_OK              : u64 = 0
+  pub let HDR10_BAD_CHANNEL     : u64 = 0xFFFFEDCF
+  pub let HDR10_BAD_LUMINANCE   : u64 = 0xFFFFEDCE
+  pub let HDR10_BAD_SLOT        : u64 = 0xFFFFEDCD
+  pub let HDR10_BAD_WORD        : u64 = 0xFFFFEDCC
+  pub let HDR10_NOT_INSTALLED   : u64 = 0xFFFFEDCB
+  pub let HDR10_BAD_SAMPLES     : u64 = 0xFFFFEDCA
+
+  pub let HDR10_PEAK_LUMINANCE_NITS : u64 = 10000
+
+  pub let HDR10_PQ_SAMPLES      : u64 = 65
+  pub let HDR10_PQ_ROW_WORDS    : u64 = 66     // 65 samples + 1 header
+
+  pub let HDR10_MDCV_WORDS      : u64 = 8
+  pub let HDR10_MDCV_SLOTS      : u64 = 4
+
+  // fp16 bit-pattern anchors (reused from Scrgb for readability).
+  pub let HDR10_FP16_ZERO       : u64 = 0x0000
+  pub let HDR10_FP16_ONE        : u64 = 0x3C00
+  pub let HDR10_FP16_SIGN_MASK  : u64 = 0x8000
+  pub let HDR10_FP16_EXP_MASK   : u64 = 0x7C00
+  pub let HDR10_FP16_MANT_MASK  : u64 = 0x03FF
+
+  // -- storage --------------------------------------------------------
+  // 66 words for the PQ OETF row + 32 words (4 slots x 8) for MDCV +
+  // 8-word stats table.
+  pub let mut _hdr10_pq_row  : [u64; 66] = uninit @align(64)
+  pub let mut _hdr10_mdcv    : [u64; 32] = uninit @align(64)
+  pub let mut _hdr10_stats   : [u64; 8]  = uninit @align(64)
+
+  pub let HDR10_ST_INSTALLS     : u64 = 0
+  pub let HDR10_ST_ENCODES_Q16  : u64 = 1
+  pub let HDR10_ST_ENCODES_FP16 : u64 = 2
+  pub let HDR10_ST_ENCODES_U10  : u64 = 3
+  pub let HDR10_ST_MDCV_SETS    : u64 = 4
+  pub let HDR10_ST_MDCV_GETS    : u64 = 5
+  pub let HDR10_ST_REFUSED      : u64 = 6
+  pub let HDR10_ST_RESETS       : u64 = 7
+
+  // =========================================================================
+  // SECTION 3  STATS RESET / NOTE / READ
+  // =========================================================================
+
+  pub let hdr10_stats_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M4 (#2235): clear PQ row, MDCV slots, stat counters. Zero-fill matches eotf_stats_reset in kernel/core/drivers/color/eotf.pdx.",
+      block: {
+        lea r10, [rip + _hdr10_pq_row];
+        xor rax, rax;
+        xor rcx, rcx;
+      hdr10_rs_pq:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 66;
+        jb  hdr10_rs_pq;
+
+        lea r10, [rip + _hdr10_mdcv];
+        xor rcx, rcx;
+      hdr10_rs_md:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  hdr10_rs_md;
+
+        lea r10, [rip + _hdr10_stats];
+        xor rcx, rcx;
+      hdr10_rs_st:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  hdr10_rs_st;
+        ret
+      }
+    }
+
+  pub let hdr10_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M4 (#2235): counter bump; bounds-guard against the 8-entry stat table.",
+      block: {
+        cmp rdi, 8;
+        jae hdr10_nt_out;
+        lea r10, [rip + _hdr10_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      hdr10_nt_out:
+        ret
+      }
+    }
+
+  pub let hdr10_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M4 (#2235): counter read; out-of-range returns 0.",
+      block: {
+        cmp rdi, 8;
+        jae hdr10_st_zero;
+        lea r10, [rip + _hdr10_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      hdr10_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 4  PQ OETF TABLE INSTALL + QUERY
+  // =========================================================================
+
+  // hdr10_pq_installed() -> 1 iff hdr10_pq_install has populated the row.
+  pub let hdr10_pq_installed : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M4 (#2235): the header word of _hdr10_pq_row (offset 0) is 0 uninstalled, 1 installed. Callers gate on this before hdr10_pq_encode_q16.",
+      block: {
+        lea r10, [rip + _hdr10_pq_row];
+        mov rax, [r10 + 0];
+        ret
+      }
+    }
+
+  // hdr10_pq_install(samples_ptr) -> HDR10_OK | HDR10_BAD_SAMPLES.
+  //
+  // Copies 65 Q16.16 samples (u64 each) from the caller into the module-
+  // owned PQ OETF row and marks it installed. samples_ptr == 0 is
+  // rejected; no further validation of the samples themselves (the
+  // shader authority signs the table before install).
+  pub let hdr10_pq_install : (u64) -> u64 !{mem} @{} =
+    fn (samples: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M4 (#2235): install a 65-sample PQ OETF LUT into the module-owned row. Three-push callee-save discipline (rbx, r12, r13) keeps rsp%16 == 0 before the inner hdr10_note call. Bounds-check rejects the null pointer; per-sample validity is the shader authority's responsibility.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        mov r12, rdi;
+
+        cmp r12, 0;
+        je  hdr10_pi_bad;
+
+        lea r13, [rip + _hdr10_pq_row];
+        xor rbx, rbx;
+      hdr10_pi_copy:
+        mov rax, [r12 + rbx * 8];
+        mov [r13 + 8 + rbx * 8], rax;
+        add rbx, 1;
+        cmp rbx, 65;
+        jb  hdr10_pi_copy;
+
+        // Header word (offset 0) = 1 (installed).
+        mov rax, 1;
+        mov [r13 + 0], rax;
+
+        mov rdi, 0;
+        call hdr10_note;
+        xor rax, rax;
+        jmp hdr10_pi_out;
+
+      hdr10_pi_bad:
+        mov rdi, 6;
+        call hdr10_note;
+        mov rax, 0xFFFFEDCA;
+
+      hdr10_pi_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // hdr10_pq_sample(idx) -> Q16.16 sample | 0.
+  pub let hdr10_pq_sample : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M4 (#2235): read one Q16.16 sample of the installed OETF row. Out-of-range idx returns 0 rather than an error code so the interpolator can use it as an endpoint sentinel.",
+      block: {
+        cmp rdi, 65;
+        jae hdr10_ps_zero;
+        lea r10, [rip + _hdr10_pq_row];
+        mov rax, [r10 + 8 + rdi * 8];
+        ret;
+      hdr10_ps_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 5  Q16.16 <-> fp16 (SCOPED TO [0.0, 1.0])
+  // =========================================================================
+  //
+  // HDR10's normalized PQ domain is [0, 1] (Y_norm = L / 10000); the
+  // input fp16 channel from scRGB-linear is likewise the pre-normalized
+  // value. Anything outside [0, 1] is rejected with HDR10_BAD_CHANNEL --
+  // the caller normalizes above-SDR-white channels before invoking us.
+
+  // hdr10_fp16_to_q16(fp16) -> Q16.16 | HDR10_BAD_CHANNEL.
+  //   Only the low 16 bits of rdi are consumed. Negative or > 1.0 -> err.
+  pub let hdr10_fp16_to_q16 : (u64) -> u64 !{mem} @{} =
+    fn (fp: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M4 (#2235): convert an IEEE 754 fp16 in [0, 1] to Q16.16. Exponent field range: e==0 -> ~0 (subnormal, clamped to 0); e in [1, 14] -> shift the (1024+m) significand by (e-9), which is a right shift for e<9 and a left shift for e>=9; e==15 with m==0 -> exactly 1.0 (0x10000); any other e or a set sign bit -> HDR10_BAD_CHANNEL. Two-push callee-save discipline (r12, r13) matches the leaf-with-nested-call convention in scrgb_pack.",
+      block: {
+        push r12;
+        push r13;
+        mov r12, rdi;
+
+        // Mask to low 16 bits.
+        mov r10, 0xFFFF;
+        and r12, r10;
+
+        // Reject sign bit.
+        mov rax, r12;
+        mov r11, 0x8000;
+        and rax, r11;
+        cmp rax, 0;
+        jne hdr10_ftq_bad;
+
+        // Extract exponent field (5 bits).
+        mov rax, r12;
+        shr rax, 10;
+        mov r10, 0x1F;
+        and rax, r10;
+        mov r13, rax;              // r13 = exp
+
+        // Extract mantissa (10 bits).
+        mov rcx, r12;
+        mov r10, 0x03FF;
+        and rcx, r10;              // rcx = mantissa
+
+        // exp == 0 -> subnormal, return 0.
+        cmp r13, 0;
+        je  hdr10_ftq_zero;
+
+        // exp == 15: only mantissa == 0 (exactly 1.0) is legal here.
+        cmp r13, 15;
+        jne hdr10_ftq_norm;
+        cmp rcx, 0;
+        jne hdr10_ftq_bad;
+        mov rax, 0x10000;
+        jmp hdr10_ftq_out;
+
+      hdr10_ftq_norm:
+        // exp in [1, 14]. Reject exp > 14 (> 1.0 domain).
+        mov r10, 14;
+        cmp r13, r10;
+        ja  hdr10_ftq_bad;
+
+        // significand = 1024 + mantissa.
+        add rcx, 1024;
+
+        // Split shift direction on exp <=> 9.
+        cmp r13, 9;
+        jb  hdr10_ftq_shr;
+
+        // Left shift by (exp - 9).
+        mov rax, r13;
+        sub rax, 9;
+        mov r11, rcx;
+        mov rcx, rax;
+        mov rax, r11;
+        shl rax, cl;
+        jmp hdr10_ftq_out;
+
+      hdr10_ftq_shr:
+        // Right shift by (9 - exp).
+        mov rax, 9;
+        sub rax, r13;
+        mov r11, rcx;
+        mov rcx, rax;
+        mov rax, r11;
+        shr rax, cl;
+        jmp hdr10_ftq_out;
+
+      hdr10_ftq_zero:
+        xor rax, rax;
+        jmp hdr10_ftq_out;
+
+      hdr10_ftq_bad:
+        mov rax, 0xFFFFEDCF;
+
+      hdr10_ftq_out:
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // hdr10_q16_to_fp16(q16) -> fp16 bit pattern | HDR10_BAD_CHANNEL.
+  //   Input must be in [0, 0x10000]. Returns the closest fp16 (round to
+  //   zero on the low bits -- a bit-exact reference is deferred to the
+  //   GPU shader path).
+  pub let hdr10_q16_to_fp16 : (u64) -> u64 !{mem} @{} =
+    fn (q: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M4 (#2235): Q16.16 in [0, 0x10000] back to fp16. 0 -> 0x0000. 0x10000 -> 0x3C00 (exactly 1.0). Values in between: find the top set bit (msb) by comparing to power-of-two thresholds, from which exp = msb + 15 - 16 and mantissa = (q >> (msb - 10)) & 0x3FF. We enumerate the msb range [5, 15] explicitly rather than emit a bsr, since the encoder has not proven bsr in this codebase. Values > 0x10000 are rejected. Two-push callee-save discipline matches hdr10_fp16_to_q16 for review-symmetry.",
+      block: {
+        push r12;
+        push r13;
+        mov r12, rdi;
+
+        // Reject > 0x10000.
+        mov r10, 0x10000;
+        cmp r12, r10;
+        ja  hdr10_qtf_bad;
+
+        // Exact 1.0.
+        mov r10, 0x10000;
+        cmp r12, r10;
+        jne hdr10_qtf_lt1;
+        mov rax, 0x3C00;
+        jmp hdr10_qtf_out;
+
+      hdr10_qtf_lt1:
+        // Exact 0.
+        cmp r12, 0;
+        jne hdr10_qtf_pos;
+        xor rax, rax;
+        jmp hdr10_qtf_out;
+
+      hdr10_qtf_pos:
+        // Find msb in [5, 15]: we walk from msb=15 downward and stop at
+        // the first threshold that q >= (1 << msb). r13 accumulates msb.
+        // 15 -> 0x8000, 14 -> 0x4000, ..., 5 -> 0x20. Values below 0x20
+        // (msb < 5) round to subnormal (~ 0) which we treat as 0.
+        mov r13, 15;
+        mov r10, 0x8000;
+        cmp r12, r10;
+        jae hdr10_qtf_have;
+        mov r13, 14; mov r10, 0x4000; cmp r12, r10; jae hdr10_qtf_have;
+        mov r13, 13; mov r10, 0x2000; cmp r12, r10; jae hdr10_qtf_have;
+        mov r13, 12; mov r10, 0x1000; cmp r12, r10; jae hdr10_qtf_have;
+        mov r13, 11; mov r10, 0x0800; cmp r12, r10; jae hdr10_qtf_have;
+        mov r13, 10; mov r10, 0x0400; cmp r12, r10; jae hdr10_qtf_have;
+        mov r13, 9;  mov r10, 0x0200; cmp r12, r10; jae hdr10_qtf_have;
+        mov r13, 8;  mov r10, 0x0100; cmp r12, r10; jae hdr10_qtf_have;
+        mov r13, 7;  mov r10, 0x0080; cmp r12, r10; jae hdr10_qtf_have;
+        mov r13, 6;  mov r10, 0x0040; cmp r12, r10; jae hdr10_qtf_have;
+        mov r13, 5;  mov r10, 0x0020; cmp r12, r10; jae hdr10_qtf_have;
+        // Below 0x20: too small to represent as normal fp16 in [0, 1]
+        // via this coarse path -> clamp to zero.
+        xor rax, rax;
+        jmp hdr10_qtf_out;
+
+      hdr10_qtf_have:
+        // e_stored = msb - 1. Derivation: value = q / 2^16; msb sets
+        // value in [2^(msb-16), 2^(msb-15)); fp16 bias 15, so
+        //   e_stored = (msb - 16) + 15 = msb - 1.
+        // mantissa = ((q << (10 - msb)) or (q >> (msb - 10))) & 0x3FF
+        //   (the leading 1 bit of q, position msb, aligns with bit 10
+        //   of the significand and gets masked out by 0x3FF).
+        // We split on msb >= 10 vs msb < 10 because a variable-count
+        // shift by a negative amount would go through cl mod 64 and
+        // produce garbage.
+        mov rax, r13;
+        sub rax, 1;                // e_stored = msb - 1
+        mov r10, 10;
+        cmp r13, r10;
+        jb  hdr10_qtf_shl;
+
+        // msb >= 10: right-shift q by (msb - 10).
+        mov rcx, r13;
+        sub rcx, 10;
+        mov r11, r12;
+        shr r11, cl;
+        jmp hdr10_qtf_mask;
+
+      hdr10_qtf_shl:
+        // msb in [5, 9]: left-shift q by (10 - msb).
+        mov rcx, 10;
+        sub rcx, r13;
+        mov r11, r12;
+        shl r11, cl;
+
+      hdr10_qtf_mask:
+        mov r10, 0x3FF;
+        and r11, r10;              // r11 = mantissa
+        // Combine: fp16 = (e_stored << 10) | mantissa.
+        shl rax, 10;
+        or  rax, r11;
+        // Mask to 16 bits (safety).
+        mov r10, 0xFFFF;
+        and rax, r10;
+
+      hdr10_qtf_out:
+        pop r13;
+        pop r12;
+        ret;
+
+      hdr10_qtf_bad:
+        mov rax, 0xFFFFEDCF;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 6  PQ ENCODE ENTRY POINTS
+  // =========================================================================
+
+  // hdr10_pq_encode_q16(y_q16) -> pq_q16 | err.
+  //
+  // Piecewise-linear interpolation of the installed OETF row. y_q16 in
+  // [0, 0x10000] maps to sample index [0, 64] with fractional offset in
+  // [0, 0x400). Result is Q16.16 in [0, 0x10000].
+  //
+  //   idx     = y_q16 >> 10             (0..64)
+  //   frac    = y_q16 & 0x3FF           (0..0x3FF, i.e. Q10)
+  //   out     = s[idx] + (s[idx+1] - s[idx]) * frac / 0x400
+  //
+  // The subtraction is signed (imul), which is safe because Q16.16 in
+  // [0, 0x10000] has 15 leading zero bits and the diff fits in ~17 bits.
+  pub let hdr10_pq_encode_q16 : (u64) -> u64 !{mem} @{} =
+    fn (y: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M4 (#2235): interpolate the OETF PQ row for a normalized-luminance Q16.16. Bounds-check y in [0, 0x10000]; guard against the OETF row being uninstalled (header word 0). Three-push callee-save discipline (rbx, r12, r13) keeps rsp%16 == 0 before hdr10_note. r13 holds the row pointer during arithmetic then is REPURPOSED to carry the result across hdr10_note (which clobbers rax); frac is recomputed from the preserved r12 inside the interp block so no fourth callee-save reg is needed. imul with 32-bit-bounded operands cannot overflow a 64-bit signed product.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        mov r12, rdi;
+
+        // Reject y > 0x10000.
+        mov r10, 0x10000;
+        cmp r12, r10;
+        ja  hdr10_eq_lum;
+
+        // Reject if OETF row not installed.
+        lea r13, [rip + _hdr10_pq_row];
+        mov rax, [r13 + 0];
+        cmp rax, 0;
+        je  hdr10_eq_uninst;
+
+        // idx = y >> 10 ; frac = y & 0x3FF ; s[idx] at row[8 + idx*8].
+        mov rbx, r12;
+        shr rbx, 10;                // rbx = idx (0..64)
+        mov r10, r12;
+        mov r11, 0x3FF;
+        and r10, r11;               // r10 = frac (0..0x3FF); transient (no call before use).
+
+        // Load s[idx] into rax as the endpoint / interp base.
+        mov rax, [r13 + 8 + rbx * 8];
+        mov r11, 64;
+        cmp rbx, r11;
+        je  hdr10_eq_endpoint;
+        cmp r10, 0;
+        je  hdr10_eq_endpoint;
+
+        // s_lo = rax; s_hi = row[idx+1]; diff = s_hi - s_lo.
+        mov r11, rax;               // r11 = s_lo
+        mov rcx, rbx;
+        add rcx, 1;
+        mov rax, [r13 + 8 + rcx * 8];   // rax = s_hi
+        sub rax, r11;                    // rax = diff (signed)
+        // out = s_lo + diff * frac / 0x400.
+        imul rax, r10;
+        shr rax, 10;
+        add rax, r11;
+
+      hdr10_eq_endpoint:
+        // Stash result in r13 (row ptr no longer needed) across hdr10_note.
+        mov r13, rax;
+        mov rdi, 1;
+        call hdr10_note;
+        mov rax, r13;
+        jmp hdr10_eq_out;
+
+      hdr10_eq_lum:
+        mov rdi, 6;
+        call hdr10_note;
+        mov rax, 0xFFFFEDCE;
+        jmp hdr10_eq_out;
+
+      hdr10_eq_uninst:
+        mov rdi, 6;
+        call hdr10_note;
+        mov rax, 0xFFFFEDCB;
+
+      hdr10_eq_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // hdr10_pq_encode_fp16(fp16_linear) -> fp16_pq | err.
+  //
+  // Full CPU pipeline: fp16 -> Q16.16 -> OETF interp -> fp16.
+  pub let hdr10_pq_encode_fp16 : (u64) -> u64 !{mem} @{} =
+    fn (fp: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M4 (#2235): compose the fp16<->Q16.16 helpers with the OETF interp. Three-push callee-save discipline (rbx, r12, r13) keeps rsp%16 == 0 before every nested call; the error codes from the intermediate steps are propagated verbatim (any value >= 0xFFFF0000 short-circuits).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        mov r12, rdi;
+
+        mov rdi, r12;
+        call hdr10_fp16_to_q16;
+        mov r13, rax;
+        // Early-out on error sentinel range.
+        mov r11, 0xFFFF0000;
+        cmp r13, r11;
+        jb  hdr10_ef_step2;
+        mov rax, r13;
+        jmp hdr10_ef_out;
+
+      hdr10_ef_step2:
+        mov rdi, r13;
+        call hdr10_pq_encode_q16;
+        mov r13, rax;
+        mov r11, 0xFFFF0000;
+        cmp r13, r11;
+        jb  hdr10_ef_step3;
+        mov rax, r13;
+        jmp hdr10_ef_out;
+
+      hdr10_ef_step3:
+        mov rdi, r13;
+        call hdr10_q16_to_fp16;
+        mov r13, rax;
+        mov r11, 0xFFFF0000;
+        cmp r13, r11;
+        jb  hdr10_ef_ok;
+        mov rax, r13;
+        jmp hdr10_ef_out;
+
+      hdr10_ef_ok:
+        mov rdi, 2;
+        call hdr10_note;
+        mov rax, r13;
+
+      hdr10_ef_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // hdr10_pq_encode_u10(fp16_linear) -> u10 wire code | err.
+  //
+  // HDR10 wire format is 10-bit YCbCr (BT.2020 non-constant luminance).
+  // For a luma-primary encode, Y_out_u10 = round(pq_q16 * 1023 / 0x10000).
+  // The caller composes YCbCr conversion around this per-channel primitive.
+  pub let hdr10_pq_encode_u10 : (u64) -> u64 !{mem} @{} =
+    fn (fp: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M4 (#2235): fp16 -> Q16.16 -> OETF interp -> u10. The final scale multiplies the Q16.16 result by 1023 (fits in 27 bits, no overflow) and shifts right by 16 with round-to-nearest via '+ 0x8000'. Three-push callee-save discipline for rsp%16 == 0 before nested calls.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        mov r12, rdi;
+
+        mov rdi, r12;
+        call hdr10_fp16_to_q16;
+        mov r13, rax;
+        mov r11, 0xFFFF0000;
+        cmp r13, r11;
+        jb  hdr10_eu_step2;
+        mov rax, r13;
+        jmp hdr10_eu_out;
+
+      hdr10_eu_step2:
+        mov rdi, r13;
+        call hdr10_pq_encode_q16;
+        mov r13, rax;
+        mov r11, 0xFFFF0000;
+        cmp r13, r11;
+        jb  hdr10_eu_scale;
+        mov rax, r13;
+        jmp hdr10_eu_out;
+
+      hdr10_eu_scale:
+        // u10 = (q * 1023 + 0x8000) >> 16.  Clamp to [0, 1023].
+        mov rax, r13;
+        mov r10, 1023;
+        imul rax, r10;
+        mov r10, 0x8000;
+        add rax, r10;
+        shr rax, 16;
+        mov r10, 1023;
+        cmp rax, r10;
+        jbe hdr10_eu_ok;
+        mov rax, 1023;
+
+      hdr10_eu_ok:
+        mov rdi, 3;
+        call hdr10_note;
+
+      hdr10_eu_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 7  ST 2086 MDCV METADATA CARRIAGE
+  // =========================================================================
+
+  // hdr10_mdcv_slot_valid(slot) -> 1 iff slot in [0, 3].
+  pub let hdr10_mdcv_slot_valid : (u64) -> u64 !{} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "G6.M4 (#2235): 1 iff slot in [0, HDR10_MDCV_SLOTS).",
+      block: {
+        mov r10, 4;
+        cmp rdi, r10;
+        jae hdr10_sv_no;
+        mov rax, 1;
+        ret;
+      hdr10_sv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // hdr10_mdcv_slot_base(slot) -> u64 ptr to slot[0] | 0 on bad slot.
+  pub let hdr10_mdcv_slot_base : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M4 (#2235): compute base pointer for MDCV slot i. Three-push discipline for rsp%16 == 0 before the inner hdr10_mdcv_slot_valid call.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        mov r12, rdi;
+
+        mov rdi, r12;
+        call hdr10_mdcv_slot_valid;
+        cmp rax, 0;
+        je  hdr10_sb_zero;
+
+        // base = _hdr10_mdcv + slot * 8 * 8.
+        mov rax, r12;
+        imul rax, rax, 64;         // 8 words * 8 bytes
+        lea r10, [rip + _hdr10_mdcv];
+        add r10, rax;
+        mov rax, r10;
+        jmp hdr10_sb_out;
+
+      hdr10_sb_zero:
+        xor rax, rax;
+      hdr10_sb_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // hdr10_mdcv_set(slot, mdcv_ptr) -> HDR10_OK | err.
+  //
+  // Copies 6 caller-supplied u64 words (slot layout words [0..5]) into
+  // the MDCV slot, sets the present flag ([6] = 1) and clears the
+  // reserved word ([7] = 0). Slot [6]/[7] are module-managed; the
+  // caller does NOT include them in mdcv_ptr's 6-word payload.
+  pub let hdr10_mdcv_set : (u64, u64) -> u64 !{mem} @{} =
+    fn (slot: u64) (mdcv: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M4 (#2235): install ST 2086 static metadata. Five-push callee-save discipline (rbx, r12, r13, r14, r15) keeps rsp%16 == 0 before every nested call. Null mdcv_ptr -> HDR10_BAD_WORD (a distinct signal from HDR10_BAD_SLOT so the caller can locate the fault).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rdi;
+        mov r13, rsi;
+
+        cmp r13, 0;
+        je  hdr10_ms_badw;
+
+        mov rdi, r12;
+        call hdr10_mdcv_slot_base;
+        cmp rax, 0;
+        je  hdr10_ms_bads;
+        mov r14, rax;              // r14 = slot base
+
+        xor rbx, rbx;
+      hdr10_ms_copy:
+        mov rax, [r13 + rbx * 8];
+        mov [r14 + rbx * 8], rax;
+        add rbx, 1;
+        cmp rbx, 6;
+        jb  hdr10_ms_copy;
+
+        // present flag
+        mov rax, 1;
+        mov [r14 + 48], rax;
+        // reserved
+        xor rax, rax;
+        mov [r14 + 56], rax;
+
+        mov rdi, 4;
+        call hdr10_note;
+        xor rax, rax;
+        jmp hdr10_ms_out;
+
+      hdr10_ms_badw:
+        mov rdi, 6;
+        call hdr10_note;
+        mov rax, 0xFFFFEDCC;
+        jmp hdr10_ms_out;
+
+      hdr10_ms_bads:
+        mov rdi, 6;
+        call hdr10_note;
+        mov rax, 0xFFFFEDCD;
+
+      hdr10_ms_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // hdr10_mdcv_get_word(slot, word_idx) -> u64 | err.
+  pub let hdr10_mdcv_get_word : (u64, u64) -> u64 !{mem} @{} =
+    fn (slot: u64) (wi: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M4 (#2235): read one MDCV word. Three-push discipline (rbx unused, alignment only; r12=slot; r13=word_idx then REPURPOSED to carry the loaded u64 across hdr10_note) keeps rsp%16 == 0 before every nested call.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        mov r12, rdi;
+        mov r13, rsi;
+
+        mov r10, 8;
+        cmp r13, r10;
+        jae hdr10_mg_badw;
+
+        mov rdi, r12;
+        call hdr10_mdcv_slot_base;
+        cmp rax, 0;
+        je  hdr10_mg_bads;
+
+        mov r10, rax;                  // r10 = slot base (transient)
+        mov rax, [r10 + r13 * 8];      // rax = loaded word
+        mov r13, rax;                  // stash across hdr10_note
+
+        mov rdi, 5;
+        call hdr10_note;
+        mov rax, r13;
+        jmp hdr10_mg_out;
+
+      hdr10_mg_badw:
+        mov rdi, 6;
+        call hdr10_note;
+        mov rax, 0xFFFFEDCC;
+        jmp hdr10_mg_out;
+
+      hdr10_mg_bads:
+        mov rdi, 6;
+        call hdr10_note;
+        mov rax, 0xFFFFEDCD;
+
+      hdr10_mg_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // hdr10_mdcv_present(slot) -> 0 | 1  (0 also on bad slot).
+  pub let hdr10_mdcv_present : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G6.M4 (#2235): 1 iff slot is populated. Three-push discipline for rsp%16 == 0 before hdr10_mdcv_slot_base.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        mov r12, rdi;
+
+        mov rdi, r12;
+        call hdr10_mdcv_slot_base;
+        cmp rax, 0;
+        je  hdr10_mp_zero;
+        mov r10, rax;
+        mov rax, [r10 + 48];
+        jmp hdr10_mp_out;
+
+      hdr10_mp_zero:
+        xor rax, rax;
+
+      hdr10_mp_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

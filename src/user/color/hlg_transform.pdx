@@ -1,0 +1,623 @@
+// src/user/color/hlg_transform.pdx -- Wave0-B1-02 (#2236)
+//
+// BT.2100 Hybrid Log-Gamma (HLG) output transform.
+//
+// This module is the user-space companion to the kernel EOTF/OETF
+// table dispatcher landed by #1509-#1516 (see
+// src/kernel/core/drivers/color/eotf.pdx). Where the kernel side
+// stores four generic 65-sample transfer curves keyed by ordinal,
+// this file is the concrete HLG curve family: the OETF that encodes
+// a linear scene-light sample into HLG signal, the OOTF that maps
+// scene light to display light through the reference nominal-peak
+// gamma, and the parameterisation those two curves share.
+//
+// The compositor evaluates HLG on the render path. Because kernel
+// code refuses floating-point (see design/kernel/no-fpu.md), the
+// curves are stored as 65-sample Q16.16 piecewise-linear tables
+// installed at boot by the display supervisor; the shader
+// interpolates. This file holds the tables + the linear-interpolation
+// evaluator + the peak-luminance parameter block.
+//
+// =============================================================================
+// SECTION 0  BT.2100 REFERENCE MATH
+// =============================================================================
+//
+// Scene-referred normalised light E is in Q16.16 [0.0, 1.0].
+//
+// HLG OETF (E -> E'):
+//   E' = 0.5 * sqrt(E)                       for  0    <= E <= 1/12
+//   E' = a * ln(12*E - b) + c                for  1/12 <  E <= 1
+//
+//   a = 0.17883277
+//   b = 0.28466892   (= 1 - 4a)
+//   c = 0.55991073   (= 0.5 - a * ln(4a))
+//
+// HLG OOTF (E_S -> F_D) parameterised by nominal peak luminance L_W
+// (cd/m^2, e.g. 1000) and scene luminance Y_S:
+//   F_D = L_W * Y_S^(gamma - 1) * E_S
+//   gamma = 1.2 + 0.42 * log10(L_W / 1000)
+//
+// At the reference 1000 cd/m^2 peak, gamma = 1.2 and the OOTF collapses
+// to F_D = 1000 * Y_S^0.2 * E_S. The stored OOTF table is the scalar
+// factor L_W * Y_S^(gamma-1) at 65 Y_S sample points; the per-channel
+// multiply by E_S happens in the compositor shader.
+//
+// =============================================================================
+// SECTION 1  TABLE SHAPE
+// =============================================================================
+//
+// One curve = 65 Q16.16 samples + 1 header word (curve kind ordinal),
+// stride 66 words = 528 bytes per curve. Two curves live here:
+// OETF and OOTF. The peak-luminance block is a third row (also 66
+// words) whose first word is L_W in cd/m^2 (u64) and whose next word
+// is the derived gamma * 65536 (Q16.16). Remaining slots are reserved
+// and MUST be zero at install time.
+//
+// Total: 3 * 66 = 198 u64 = 1584 bytes @align(64).
+//
+// =============================================================================
+// SECTION 2  FAILURE TAXONOMY 0xFFFFED90..0xFFFFED9F
+// =============================================================================
+
+module HlgTransform = structure {
+
+  pub let HLG_OK                  : u64 = 0
+  pub let HLG_BAD_KIND            : u64 = 0xFFFFED9F
+  pub let HLG_BAD_INDEX           : u64 = 0xFFFFED9E
+  pub let HLG_BAD_PEAK            : u64 = 0xFFFFED9D
+  pub let HLG_NOT_INSTALLED       : u64 = 0xFFFFED9C
+
+  // Curve kinds.
+  pub let HLG_KIND_OETF           : u64 = 0
+  pub let HLG_KIND_OOTF           : u64 = 1
+  pub let HLG_KIND_PARAM          : u64 = 2
+  pub let HLG_KIND_MAX            : u64 = 3
+
+  pub let HLG_SAMPLES_PER_CURVE   : u64 = 65
+  pub let HLG_ROW_WORDS           : u64 = 66      // 65 samples + 1 hdr
+  pub let HLG_ROW_BYTES           : u64 = 528     // 66 * 8
+
+  // Nominal peak luminance defaults. BT.2100 reference is 1000 cd/m^2;
+  // consumer HDR displays cluster at 400/1000/4000. The installer
+  // rejects anything below 100 or above 10000 (HLG_BAD_PEAK).
+  pub let HLG_PEAK_MIN_CDM2       : u64 = 100
+  pub let HLG_PEAK_MAX_CDM2       : u64 = 10000
+  pub let HLG_PEAK_DEFAULT_CDM2   : u64 = 1000
+
+  // Q16.16 constants for the OETF piecewise selector. 1/12 in Q16.16
+  // = 65536 / 12 = 0x1555 (5461).
+  pub let HLG_Q16_ONE             : u64 = 0x10000
+  pub let HLG_Q16_HALF            : u64 = 0x08000
+  pub let HLG_OETF_SPLIT_Q16      : u64 = 0x01555
+
+  // Three curve rows (OETF, OOTF, PARAM) laid out contiguously.
+  pub let mut _hlg_tables : [u64; 198] = uninit @align(64)
+
+  // Counters: installs, samples, refusals, param-updates.
+  pub let mut _hlg_stats  : [u64; 4]   = uninit @align(64)
+
+  pub let HLG_ST_INSTALLS   : u64 = 0
+  pub let HLG_ST_SAMPLES    : u64 = 1
+  pub let HLG_ST_REFUSED    : u64 = 2
+  pub let HLG_ST_PARAM_SET  : u64 = 3
+
+  // Fingerprint tag. Emitted by the display supervisor once the OETF,
+  // OOTF, and peak parameter block are all installed. Legacy suffix
+  // gives grep parity with pre-Wave0 boot-log tooling.
+  pub let hlg_tag_installed : [u8; 54] = "hlg output transform installed [legacy: HLG XFORM OK]\0"
+
+  // ---------------------------------------------------------------------------
+  // Section 3  Counter primitives
+  // ---------------------------------------------------------------------------
+
+  pub let hlg_stats_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B1-02 (#2236): clear HLG tables + counters at boot before any install call.",
+      block: {
+        lea r10, [rip + _hlg_tables];
+        xor rax, rax;
+        xor rcx, rcx;
+      hlg_rs_tbl:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 198;
+        jb  hlg_rs_tbl;
+        lea r10, [rip + _hlg_stats];
+        xor rcx, rcx;
+      hlg_rs_stat:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  hlg_rs_stat;
+        ret
+      }
+    }
+
+  pub let hlg_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B1-02 (#2236): counter bump. Encoder-conservative: load-modify-store, no add reg,[mem].",
+      block: {
+        cmp rdi, 4;
+        jae hlg_nt_out;
+        lea r10, [rip + _hlg_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      hlg_nt_out:
+        ret
+      }
+    }
+
+  pub let hlg_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B1-02 (#2236): counter read.",
+      block: {
+        cmp rdi, 4;
+        jae hlg_st_zero;
+        lea r10, [rip + _hlg_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      hlg_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ---------------------------------------------------------------------------
+  // Section 4  Row addressing
+  // ---------------------------------------------------------------------------
+
+  // hlg_kind_valid(k) -> 1 iff k in [0, HLG_KIND_MAX).
+  pub let hlg_kind_valid : (u64) -> u64 !{} @{} =
+    fn (k: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B1-02 (#2236): kind bounds check.",
+      block: {
+        mov r10, 3;
+        cmp rdi, r10;
+        jae hlg_kv_no;
+        mov rax, 1;
+        ret;
+      hlg_kv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // hlg_row_base(kind) -> pointer to first u64 of the row, or 0.
+  pub let hlg_row_base : (u64) -> u64 !{mem} @{} =
+    fn (kind: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B1-02 (#2236): row base pointer = _hlg_tables + kind * 528.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        mov r12, rdi;
+        mov rdi, r12;
+        call hlg_kind_valid;
+        cmp rax, 0;
+        je  hlg_rb_zero;
+        mov rax, r12;
+        imul rax, rax, 528;
+        lea r10, [rip + _hlg_tables];
+        add r10, rax;
+        mov rax, r10;
+        jmp hlg_rb_out;
+      hlg_rb_zero:
+        xor rax, rax;
+      hlg_rb_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ---------------------------------------------------------------------------
+  // Section 5  OETF / OOTF sample installation
+  // ---------------------------------------------------------------------------
+
+  // hlg_install_curve(kind, samples_ptr) -> ok | err.
+  // kind must be HLG_KIND_OETF or HLG_KIND_OOTF. Copies 65 Q16.16
+  // samples into the row and stamps header = kind + 1 (nonzero = the
+  // installed sentinel; hlg_is_installed reads this).
+  pub let hlg_install_curve : (u64, u64) -> u64 !{mem} @{} =
+    fn (kind: u64) (samples: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B1-02 (#2236): install a 65-sample HLG curve. Five-push discipline (rbx/r12/r13/r14/r15) keeps rsp%16 == 0 before inner calls per this codebase's odd-parity convention.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rdi;
+        mov r13, rsi;
+
+        // Reject PARAM row (installed via hlg_set_peak) and OOB.
+        mov r10, 2;
+        cmp r12, r10;
+        jae hlg_ic_bad;
+
+        mov rdi, r12;
+        call hlg_row_base;
+        cmp rax, 0;
+        je  hlg_ic_bad;
+        mov r10, rax;
+
+        // Header = kind + 1 (installed sentinel).
+        mov rax, r12;
+        add rax, 1;
+        mov [r10 + 0], rax;
+
+        xor rbx, rbx;
+      hlg_ic_copy:
+        mov rax, [r13 + rbx * 8];
+        mov [r10 + 8 + rbx * 8], rax;
+        add rbx, 1;
+        cmp rbx, 65;
+        jb  hlg_ic_copy;
+
+        mov rdi, 0;
+        call hlg_note;
+        xor rax, rax;
+        jmp hlg_ic_out;
+
+      hlg_ic_bad:
+        mov rdi, 2;
+        call hlg_note;
+        mov rax, 0xFFFFED9F;
+
+      hlg_ic_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // hlg_sample(kind, idx) -> Q16.16 sample | 0.
+  pub let hlg_sample : (u64, u64) -> u64 !{mem} @{} =
+    fn (kind: u64) (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B1-02 (#2236): read one sample from an installed HLG curve.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        mov r12, rdi;
+        mov r13, rsi;
+
+        cmp r13, 65;
+        jae hlg_sa_zero;
+        mov r10, 2;
+        cmp r12, r10;
+        jae hlg_sa_zero;
+
+        mov rdi, r12;
+        call hlg_row_base;
+        cmp rax, 0;
+        je  hlg_sa_zero;
+        mov r10, rax;
+        // Require header nonzero -- refuse pre-install reads.
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        je  hlg_sa_zero;
+
+        mov rax, [r10 + 8 + r13 * 8];
+        mov rdi, 1;
+        call hlg_note;
+        jmp hlg_sa_out;
+
+      hlg_sa_zero:
+        xor rax, rax;
+      hlg_sa_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ---------------------------------------------------------------------------
+  // Section 6  Nominal peak-luminance parameterisation
+  // ---------------------------------------------------------------------------
+
+  // hlg_set_peak(peak_cdm2, gamma_q16) -> ok | err.
+  // Stores the peak luminance and the caller-supplied derived gamma
+  // (Q16.16) into the PARAM row. The caller computes gamma because
+  // this module refuses floating-point; the display supervisor holds
+  // the log10 table used to solve gamma = 1.2 + 0.42 * log10(L_W/1000).
+  pub let hlg_set_peak : (u64, u64) -> u64 !{mem} @{} =
+    fn (peak_cdm2: u64) (gamma_q16: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B1-02 (#2236): install nominal peak luminance + derived gamma into PARAM row. Bounds-check peak against BT.2100 sane range.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rdi;
+        mov r13, rsi;
+
+        mov r10, 100;
+        cmp r12, r10;
+        jb  hlg_sp_bad;
+        mov r10, 10000;
+        cmp r12, r10;
+        ja  hlg_sp_bad;
+
+        mov rdi, 2;
+        call hlg_row_base;
+        cmp rax, 0;
+        je  hlg_sp_bad;
+        mov r10, rax;
+
+        // Header = PARAM_KIND + 1 = 3 (installed sentinel).
+        mov rax, 3;
+        mov [r10 + 0], rax;
+        // Slot[0] = peak, Slot[1] = gamma_q16, rest zeroed.
+        mov [r10 + 8], r12;
+        mov [r10 + 16], r13;
+        xor rax, rax;
+        mov rbx, 2;
+      hlg_sp_zero_rest:
+        cmp rbx, 65;
+        jae hlg_sp_zdone;
+        mov [r10 + 8 + rbx * 8], rax;
+        add rbx, 1;
+        jmp hlg_sp_zero_rest;
+      hlg_sp_zdone:
+
+        mov rdi, 3;
+        call hlg_note;
+        xor rax, rax;
+        jmp hlg_sp_out;
+
+      hlg_sp_bad:
+        mov rdi, 2;
+        call hlg_note;
+        mov rax, 0xFFFFED9D;
+
+      hlg_sp_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // hlg_peak() -> peak_cdm2 | 0 iff PARAM row uninstalled.
+  pub let hlg_peak : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B1-02 (#2236): read nominal peak luminance.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        mov rdi, 2;
+        call hlg_row_base;
+        cmp rax, 0;
+        je  hlg_pk_zero;
+        mov r10, rax;
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        je  hlg_pk_zero;
+        mov rax, [r10 + 8];
+        jmp hlg_pk_out;
+      hlg_pk_zero:
+        xor rax, rax;
+      hlg_pk_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // hlg_gamma_q16() -> derived gamma (Q16.16) | 0 iff uninstalled.
+  pub let hlg_gamma_q16 : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B1-02 (#2236): read derived OOTF gamma coefficient.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        mov rdi, 2;
+        call hlg_row_base;
+        cmp rax, 0;
+        je  hlg_gm_zero;
+        mov r10, rax;
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        je  hlg_gm_zero;
+        mov rax, [r10 + 16];
+        jmp hlg_gm_out;
+      hlg_gm_zero:
+        xor rax, rax;
+      hlg_gm_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ---------------------------------------------------------------------------
+  // Section 7  Installation sentinel
+  // ---------------------------------------------------------------------------
+
+  // hlg_is_installed() -> 1 iff OETF + OOTF + PARAM all installed.
+  // The compositor gates HLG output on this predicate; a partial
+  // install must never reach the shader.
+  pub let hlg_is_installed : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B1-02 (#2236): three-row install sentinel. Three-push discipline keeps rsp%16 == 0 before each hlg_row_base call.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        xor rbx, rbx;
+      hlg_ii_loop:
+        cmp rbx, 3;
+        jae hlg_ii_yes;
+        mov rdi, rbx;
+        call hlg_row_base;
+        cmp rax, 0;
+        je  hlg_ii_no;
+        mov r10, rax;
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        je  hlg_ii_no;
+        add rbx, 1;
+        jmp hlg_ii_loop;
+      hlg_ii_yes:
+        mov rax, 1;
+        jmp hlg_ii_out;
+      hlg_ii_no:
+        xor rax, rax;
+      hlg_ii_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ---------------------------------------------------------------------------
+  // Section 8  OETF / OOTF evaluation (linear interpolation)
+  // ---------------------------------------------------------------------------
+
+  // hlg_eval(kind, x_q16) -> y_q16.
+  // kind: HLG_KIND_OETF or HLG_KIND_OOTF. x is Q16.16 in [0, 1].
+  // Returns the linearly-interpolated Q16.16 curve value.
+  //
+  // Sampling: 65 samples partition [0, 1] into 64 intervals of width
+  // 1/64 Q16.16 = 1024. seg = x >> 10 (0..63), frac = x & 0x3FF
+  // (0..1023).
+  //
+  // Interpolation:
+  //   y0 = samples[seg]
+  //   y1 = samples[seg + 1]  (samples[64] for the last bucket)
+  //   y  = y0 + ((y1 - y0) * frac) / 1024
+  //
+  // Signed diff arithmetic is intentional: OETF slope near zero is
+  // large-positive; OOTF near unity clamps to L_W. imul rdx, rcx keeps
+  // the low 64 bits, which is sufficient because |y1 - y0| fits in a
+  // signed 32-bit Q16.16 delta over one bucket.
+  pub let hlg_eval : (u64, u64) -> u64 !{mem} @{} =
+    fn (kind: u64) (x_q16: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B1-02 (#2236): piecewise-linear curve evaluator. Clamps x to [0, 0x10000] before interpolation; the last bucket collapses seg=64 -> 63,frac=1024 handled by clamping x_q16 to 0x0FFFF so seg stays <= 63. Five-push discipline keeps rsp%16 == 0 before hlg_row_base.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        mov r12, rdi;
+        mov r13, rsi;
+
+        // Bounds: kind < 2 (OETF or OOTF only).
+        mov r10, 2;
+        cmp r12, r10;
+        jae hlg_ev_zero;
+        // Clamp x to [0, 0xFFFF] so seg <= 63.
+        mov r10, 0xFFFF;
+        cmp r13, r10;
+        jbe hlg_ev_have_x;
+        mov r13, r10;
+      hlg_ev_have_x:
+
+        mov rdi, r12;
+        call hlg_row_base;
+        cmp rax, 0;
+        je  hlg_ev_zero;
+        mov r14, rax;
+        // Refuse pre-install evaluation.
+        mov rax, [r14 + 0];
+        cmp rax, 0;
+        je  hlg_ev_zero;
+
+        // seg = x >> 10, frac = x & 0x3FF.
+        mov rbx, r13;
+        shr rbx, 10;
+        mov r15, r13;
+        and r15, 0x3FF;
+
+        // y0 = samples[seg], y1 = samples[seg + 1].
+        mov rax, [r14 + 8 + rbx * 8];
+        mov rcx, rbx;
+        add rcx, 1;
+        mov rdx, [r14 + 8 + rcx * 8];
+
+        // delta = y1 - y0 (signed).
+        sub rdx, rax;
+        // scaled = delta * frac.
+        imul rdx, r15;
+        // scaled /= 1024 (arithmetic shift, signed).
+        sar rdx, 10;
+        // y = y0 + scaled.
+        add rax, rdx;
+
+        mov rdi, 1;
+        call hlg_note;
+        jmp hlg_ev_out;
+
+      hlg_ev_zero:
+        xor rax, rax;
+      hlg_ev_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // hlg_oetf(x_q16) -> encoded HLG signal Q16.16.
+  pub let hlg_oetf : (u64) -> u64 !{mem} @{} =
+    fn (x_q16: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B1-02 (#2236): OETF thin wrapper -- kind = HLG_KIND_OETF. Odd-parity push preserved by single-push before the call.",
+      block: {
+        push rbx;
+        mov rsi, rdi;
+        mov rdi, 0;
+        call hlg_eval;
+        pop rbx;
+        ret
+      }
+    }
+
+  // hlg_ootf(y_scene_q16) -> display-light factor Q16.16.
+  // Caller multiplies the per-channel linear scene value E_S by this
+  // factor to obtain F_D. Y_scene is the scene luminance from
+  // BT.2020 primaries (0.2627 R + 0.6780 G + 0.0593 B).
+  pub let hlg_ootf : (u64) -> u64 !{mem} @{} =
+    fn (y_scene_q16: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B1-02 (#2236): OOTF thin wrapper -- kind = HLG_KIND_OOTF. Odd-parity push preserved by single-push before the call.",
+      block: {
+        push rbx;
+        mov rsi, rdi;
+        mov rdi, 1;
+        call hlg_eval;
+        pop rbx;
+        ret
+      }
+    }
+}
