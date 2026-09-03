@@ -911,6 +911,89 @@ ALLOWLIST = {
         "R91.M4-004 (paideia-os #2028): rtl8139_isr_handle emits this "
         "at every ISR entry past the NO_DEV gate. Dormant substrate "
         "awaiting IDT wire-in for the rtl8139 IRQ vector.",
+
+    # ------------------------------------------------------------------
+    # Wave 0 Batches 1, 6, 7 — G7 PWP compositor + color-cap declaration
+    # tags. Each is a data-only fingerprint decl in a KIND_ cap module
+    # whose dispatcher has not yet been wired into kernel_main (compositor
+    # wire-body milestone, deferred). Retires when the wire-body lands
+    # and the mint-body emit path activates for each KIND_.
+    # ------------------------------------------------------------------
+
+    # Batch 1: color caps (src/user/color/*.pdx)
+    "hdr10 transform ok [legacy: HDR10 TRANSFORM OK]":
+        "Wave0-B1 G6-color: hdr10_transform data-only cap decl; "
+        "kernel dispatcher not yet wired.",
+    "hlg output transform installed [legacy: HLG XFORM OK]":
+        "Wave0-B1 G6-color: hlg_transform data-only cap decl; "
+        "kernel dispatcher not yet wired.",
+    "hdr metadata mint ok [legacy: HDR MD MINT OK]":
+        "Wave0-B1 G6-color: hdr_metadata_kind (KIND_HDR_METADATA=0x1B5) "
+        "data-only decl; kernel mint-body not yet wired.",
+    "tonemap lut mint ok [legacy: TONEMAP LUT MINT OK]":
+        "Wave0-B1 G6-color: tonemap_kind (KIND_TONEMAP_LUT=0x1B6) "
+        "data-only decl; kernel mint-body not yet wired.",
+    "reference display mint ok [legacy: REFERENCE DISPLAY MINT OK]":
+        "Wave0-B1 G6-color: reference_display_kind (KIND=0x1B7) "
+        "data-only decl; kernel mint-body not yet wired.",
+
+    # Batch 6: G7-M2..M7 compositor caps (src/user/compositor/*.pdx)
+    "surface kind mint ok [legacy: SURFACE KIND MINT OK]":
+        "Wave0-B6 G7-M2-001 (#2246): surface_kind (KIND_SURFACE=0x1B8) "
+        "data-only decl; kernel dispatcher not yet wired.",
+    "surface commit mint ok [legacy: SURFACE COMMIT MINT OK]":
+        "Wave0-B6 G7-M2-002 (#2248): surface_commit LINEAR (KIND=0x1B9) "
+        "data-only decl; kernel dispatcher not yet wired.",
+    "surface geometry meta ok [legacy: SURFACE GEOMETRY META OK]":
+        "Wave0-B6 G7-M2-003 (#2250): surface_geometry value-type decl; "
+        "no KIND cap, no dispatcher required — first consumer emits.",
+    "surface buffer bind meta [legacy: SBB META OK]":
+        "Wave0-B6 G7-M2-004 (#2252): surface_buffer_bind value-type decl "
+        "(explicit-sync P1); surface_commit consume path will emit.",
+    "window mint ok [legacy: WINDOW MINT OK]":
+        "Wave0-B6 G7-M3-001 (#2254): window_kind (KIND_WINDOW=0x1C1) "
+        "data-only decl; kernel dispatcher + P4 a11y-mint gate not yet wired.",
+    "pdx kind layer tree meta [legacy: LAYER TREE META OK]":
+        "Wave0-B6 G7-M3-002 (#2256): layer_tree (KIND_LAYER_TREE=0x1C2) "
+        "data-only decl; kernel dispatcher not yet wired.",
+    "layer tree commit ok [legacy: LAYER TREE COMMIT OK]":
+        "Wave0-B6 G7-M3-002 (#2256): layer_tree commit-path fingerprint; "
+        "dispatcher emit not yet wired.",
+    "xdg toplevel state mint ok [legacy: XDG TOP STATE MINT OK]":
+        "Wave0-B6 G7-M4-001 (#2260): xdg_shell_states (KIND=0x1C4) "
+        "data-only decl; kernel dispatcher not yet wired.",
+    "clip offer mint ok [legacy: CLIP OFFER MINT OK]":
+        "Wave0-B6 G7-M5-001 (#2266): clipboard sealed cap (KIND=0x1C6) "
+        "data-only decl; kernel dispatcher not yet wired.",
+    "kind_clip_offer meta [legacy: KIND_CLIP_OFFER OK]":
+        "Wave0-B6 G7-M5-001 (#2266): clipboard cap module-meta tag; "
+        "companion to clip offer mint ok, same wire-body dependency.",
+    "recovery plane reservation ok [legacy: RECOVERY PLANE RSV OK]":
+        "Wave0-B6 G7-M6-001 (#2269): recovery_plane_reserve (KIND=0x1C8) "
+        "data-only decl; input-server-side reservation not yet booted.",
+
+    # Batch 7: G7 close-out (src/user/compositor/*.pdx)
+    "pdx kind subsurface meta [legacy: SUBSURFACE SYNC OK]":
+        "Wave0-B7 G7-M3-003 (#2258): subsurface_sync (KIND=0x1BA) "
+        "data-only decl; kernel dispatcher not yet wired.",
+    "xdg shell geometry meta ok [legacy: XDG SHELL GEOMETRY META OK]":
+        "Wave0-B7 G7-M4-002 (#2262): xdg_shell_geometry value-type decl; "
+        "no KIND cap; first-consumer emit lands with dispatcher wire-body.",
+    "xdg popup mint ok [legacy: XDG POPUP MINT OK]":
+        "Wave0-B7 G7-M4-003 (#2265): xdg_shell_popup (KIND=0x1C5) "
+        "data-only decl; kernel dispatcher not yet wired.",
+    "dnd offer mint ok [legacy: DND OFFER MINT OK]":
+        "Wave0-B7 G7-M5-002 (#2267): dnd_offer sealed cap (KIND=0x1C7) "
+        "data-only decl; kernel dispatcher not yet wired.",
+    "kind_dnd_offer meta [legacy: KIND_DND_OFFER OK]":
+        "Wave0-B7 G7-M5-002 (#2267): dnd_offer cap module-meta tag; "
+        "companion to dnd offer mint ok, same wire-body dependency.",
+    "kind_selection_owner meta [legacy: KIND_SELECTION_OWNER OK]":
+        "Wave0-B7 G7-M5-003 (#2268): selection_owner sealed cap "
+        "(KIND=0x1C9) data-only decl; kernel dispatcher not yet wired.",
+    "recovery plane takeover ok [legacy: RECOVERY PLANE TAKEOVER OK]":
+        "Wave0-B7 G7-M6-002 (#2270): recovery_plane_takeover extends "
+        "#2269 with RIGHT_TAKEOVER; input-server-side takeover not yet booted.",
 }
 
 # Below these counts the extractor has stopped matching rather than the
