@@ -1,0 +1,2300 @@
+// src/user/compositor/tiling_bsp.pdx -- Wave0-B8-08 (paideia-os #2291)
+//
+// TilingBsp -- binary-space-partition tiling primitives, the ONE
+// tiling primitive used by every G9-M2 tiling mode. Novel-clean
+// posture: floating (G9-M2-002) and stacked (G9-M2-003) modes build
+// on top of BSP by treating a subtree as a "container" whose leaves
+// render in floating/stacked mode; there is no parallel tiling engine.
+//
+// =============================================================================
+// SECTION 0  WHY THIS IS A VALUE TYPE, NOT A KIND CAP
+// =============================================================================
+//
+// Every KIND_WORKSPACE (0x1D2, workspace_kind.pdx, B8-02, LANDED this
+// batch) owns ONE tiling tree as in-process compositor state. There
+// is no cross-process handoff of a bare BSP tree: a client that wants
+// to observe the tiling arrangement receives a projection through a
+// distinct capability (a KIND_WORKSPACE observer op, or a
+// KIND_A11Y_TREE binding) rather than a raw handle over this module's
+// arena. Splitting the tiling tree into its own KIND cap would add a
+// rights lattice, a mint dispatcher, and a row pool for authority we
+// never hand out.
+//
+// The compositor mints one KIND_WORKSPACE per workspace, and each row
+// claims exactly one BSP arena slot from _tiling_bsp_arenas at mint
+// time via tiling_bsp_arena_alloc. On workspace revoke the row frees
+// its arena slot via tiling_bsp_arena_free. Ownership is 1:1 with
+// the KIND_WORKSPACE row, and the module never publishes a handle to
+// its arena outside the compositor.
+//
+// =============================================================================
+// SECTION 1  KIND_* SLOT ALLOCATION
+// =============================================================================
+//
+// N/A -- this module is a VALUE TYPE. No KIND_TILING_BSP slot exists.
+// The parent capability that anchors ownership is KIND_WORKSPACE
+// (0x1D2), which references its arena slot via a small u8 index (the
+// arena_slot field is per-workspace-row and lives in workspace_kind.
+// pdx's row body, not here).
+//
+// =============================================================================
+// SECTION 2  ARENA + NODE LAYOUT
+// =============================================================================
+//
+// One arena backs one KIND_WORKSPACE row. Each arena is
+// TB_HDR_BYTES + TB_MAX_NODES * TB_NODE_BYTES bytes:
+//
+//     header:            32 bytes  (SECTION 2.1 -- struct BspTree)
+//     nodes[TB_MAX_NODES]: 64 * 32 = 2048 bytes  (SECTION 2.2 -- struct BspNode)
+//     ----
+//     total per arena:  2080 bytes
+//
+// TB_MAX_TREES arenas * 2080 bytes = 8320 bytes of arena .bss.
+//
+// Sizing: TB_MAX_NODES = 64 covers the worst case for the batch's
+// "MAX 32 windows per workspace" policy (32 leaves + 31 internal
+// splits + 1 slack slot). Refusing at 63 rather than 64 leaves room
+// for the split body to allocate both new leaves atomically without
+// half-committing.
+//
+// -----------------------------------------------------------------------------
+// 2.1  struct BspTree  (header, 32 bytes at offset 0 within an arena)
+// -----------------------------------------------------------------------------
+//
+//   [+0]  wsid_root:    workspace_kind_id[31:0] | root_index[63:32]
+//   [+8]  count_cap:    node_count[31:0]        | arena_capacity[63:32]
+//   [+16] version:      tree_version_seq[63:0]
+//   [+24] free_head:    free_head_index[31:0]   | reserved[63:32]
+//
+// Fields:
+//   workspace_kind_id: u32  -- the KIND_WORKSPACE row slot this tree
+//                              belongs to (redundant with the row's own
+//                              slot id, but carried in-band so a walker
+//                              handed a bare tree_base pointer can
+//                              cross-check against the owning row).
+//   root_index: u32         -- index of the tree root; TB_INDEX_NONE
+//                              for an empty tree.
+//   node_count: u32         -- highwater of bump-allocated nodes; 0 for
+//                              an empty tree, up to TB_MAX_NODES.
+//   arena_capacity: u32     -- TB_MAX_NODES (== 64) at init; carried
+//                              in-band so future variants can shrink
+//                              or extend without recompiling callers.
+//   tree_version_seq: u64   -- monotone; bumps on every split, collapse
+//                              or insert. Callers (repaint / a11y
+//                              broadcast) sample this to detect "the
+//                              tree changed since last present" without
+//                              walking it.
+//   free_head_index: u32    -- head of the intrusive free list; TB_
+//                              INDEX_NONE if the free list is empty.
+//                              A freed node's parent_index field is
+//                              overloaded as the "next free" link
+//                              while the slot sits on the free list.
+//
+// -----------------------------------------------------------------------------
+// 2.2  struct BspNode  (32 bytes, one per BSP tree node)
+// -----------------------------------------------------------------------------
+//
+//   [+0]  axis_den:     axis[7:0] | reserved[31:8] | ratio_den[63:32]
+//   [+8]  wnum:         window_kind_id[31:0] | ratio_num[63:32]
+//   [+16] children:     left_child_index[31:0] | right_child_index[63:32]
+//   [+24] parcnt:       parent_index[31:0] | subtree_window_count[63:32]
+//
+// A node is EITHER a LEAF or an INTERNAL split, discriminated by the
+// axis field:
+//
+//   axis == TB_SPLIT_LEAF (255) -- LEAF
+//     ratio_num  = 0 (unused)
+//     ratio_den  = 0 (unused)
+//     window_kind_id = the KIND_WINDOW cap id this leaf holds
+//     left_child  = TB_INDEX_NONE
+//     right_child = TB_INDEX_NONE
+//     subtree_window_count = 1
+//
+//   axis == TB_SPLIT_HORIZONTAL (0) -- INTERNAL: children side-by-side
+//     ratio_num  > 0   left_child gets ratio_num/ratio_den of width
+//     ratio_den  > 0
+//     window_kind_id = 0 (an internal split holds no window)
+//     left_child  != TB_INDEX_NONE
+//     right_child != TB_INDEX_NONE
+//     subtree_window_count = left_child.count + right_child.count
+//
+//   axis == TB_SPLIT_VERTICAL (1)   -- INTERNAL: children stacked
+//     (same as HORIZONTAL but ratio applies to height; left_child is
+//     the TOP half and right_child is the BOTTOM half.)
+//
+// TOPOLOGICAL INVARIANT (mint enforces; walk assumes):
+//   for every node i where parent_index != TB_INDEX_NONE:
+//       nodes[parent_index].left_child == i
+//       OR nodes[parent_index].right_child == i
+//   (i.e. child->parent and parent->child links agree at every edge.)
+//
+// FREE-LIST INVARIANT:
+//   A slot is on the free list iff its axis field == 0 AND the slot's
+//   parent_index either points at another free slot (chained) or ==
+//   TB_INDEX_NONE (list tail). Because axis == 0 is also
+//   TB_SPLIT_HORIZONTAL (a legal internal-split axis), free-list
+//   membership is disambiguated purely by the header's free_head_index
+//   chain -- a caller walking from a tree root never traverses a free
+//   slot because free slots are UNREACHABLE from the root by
+//   construction.
+//
+// =============================================================================
+// SECTION 3  FAILURE TAXONOMY  0xFFFFEB70..0xFFFFEB7F
+// =============================================================================
+//
+// A repo-wide grep at landing time (grep -rhEo '0xFFFFEB[0-9A-Fa-f]{2}'
+// over src/ + design/) showed the 0xFFFFEB70..0xFFFFEB7F page free
+// (highest live EB6x claim was 0xFFFFEB6F; next live EBxx claim was
+// 0xFFFFEBEA). Adjacent to the surrounding compositor kinds' bands so
+// downstream G9 issues that add more tiling primitives keep contiguous
+// numeric locality.
+//
+// =============================================================================
+// SECTION 4  ENCODER-CONSERVATIVE DISCIPLINE
+// =============================================================================
+//
+// Per the B8-08 spec:
+//
+//   * NO `and reg, imm64` -- for u32 zero-extension from a packed
+//     word, use `shl reg, 32; shr reg, 32` (the shl discards whatever
+//     upper bits were in the register and the shr right-shifts back,
+//     leaving bits 0..31 intact and bits 32..63 zero).
+//
+//   * NO 2-op imul-with-imm -- always use the 3-op form
+//     `imul dst, src, imm32` (which paideia-as encodes as the
+//     REX + 69 + modrm + imm32 IMUL-with-imm sequence). Every
+//     multiply-by-constant in this file uses that form or a shift-by-
+//     immediate when the constant is a power of two (`shl reg, 5`
+//     for the * 32 step of node_addr).
+//
+// TB_INDEX_NONE (0xFFFFFFFF as a u32-in-u64) is loaded via
+// `mov reg, 0xFFFFFFFF; shl reg, 32; shr reg, 32` when the caller
+// wants the exact bit-pattern 0x00000000FFFFFFFF (bounds compares are
+// unsigned and tolerate either encoding when the compare's other
+// operand is a small value, but zero-extension is preferred where
+// disambiguation matters).
+//
+// =============================================================================
+// SECTION 5  FINGERPRINT
+// =============================================================================
+//
+// ONE data-only tag ending `[legacy: TILING BSP META OK]` per softarch
+// discipline. Emitted (in a future landing that wires the tiling
+// engine into the compositor's op loop) via klog_s1_x1 on every
+// KIND_WORKSPACE mint that seeds a BSP tree. At THIS landing the
+// string is data-only; the workspace_kind.pdx mint body (B8-02) does
+// not yet call into tiling_bsp_arena_alloc, so no emission path is
+// live. The tag is defined here so the fingerprint-coverage gate has
+// a stable string to allowlist against once the workspace<->bsp wire-
+// in lands.
+//
+// LABEL PREFIX: `tb_` for internal helpers and jump labels (safely
+// avoids paideia-as reserved keywords such as `loop` / `if` /
+// `return`; see feedback_paideia_as_reserved_labels). Public API
+// functions carry the full `tiling_bsp_` prefix per the batch spec.
+
+module TilingBsp = structure {
+
+  // ==========================================================================
+  // SECTION A  Sizing + enum + sentinel constants.
+  // ==========================================================================
+
+  // Arena pool sizing.
+  pub let TB_MAX_TREES     : u64 = 4         // per-compositor tree pool.
+  pub let TB_MAX_NODES     : u64 = 64        // per tree; 32 leaves + 31 splits + 1 slack.
+  pub let TB_HDR_BYTES     : u64 = 32        // per-arena tree header.
+  pub let TB_NODE_BYTES    : u64 = 32        // per-node record.
+  pub let TB_ARENA_BYTES   : u64 = 2080      // 32 + 64 * 32.
+
+  // Split-axis enum.
+  pub let TB_SPLIT_HORIZONTAL : u64 = 0      // children side-by-side.
+  pub let TB_SPLIT_VERTICAL   : u64 = 1      // children stacked.
+  pub let TB_SPLIT_LEAF       : u64 = 255    // node is a leaf, not a split.
+
+  // Sentinels.
+  pub let TB_INDEX_NONE       : u64 = 0xFFFFFFFF     // u32-max, "no such node".
+  pub let TB_VISIT_CONTINUE   : u64 = 0
+  pub let TB_VISIT_STOP       : u64 = 1
+
+  // Byte offsets within the tree header (SECTION 2.1).
+  pub let TB_HDR_OFF_WSID_ROOT     : u64 = 0
+  pub let TB_HDR_OFF_COUNT_CAP     : u64 = 8
+  pub let TB_HDR_OFF_VERSION       : u64 = 16
+  pub let TB_HDR_OFF_FREE          : u64 = 24
+
+  // Byte offsets within a node (SECTION 2.2).
+  pub let TB_NODE_OFF_AXIS_DEN     : u64 = 0
+  pub let TB_NODE_OFF_WKID_NUM     : u64 = 8
+  pub let TB_NODE_OFF_CHILDREN     : u64 = 16
+  pub let TB_NODE_OFF_PARCNT       : u64 = 24
+
+  // Stats slots.
+  pub let TB_ST_SPLITS      : u64 = 0
+  pub let TB_ST_COLLAPSES   : u64 = 1
+  pub let TB_ST_WALKS       : u64 = 2
+  pub let TB_ST_REFUSED     : u64 = 3
+
+  // Failure taxonomy -- 0xFFFFEB70..0xFFFFEB7F (see file header §3).
+  pub let TB_OK                    : u64 = 0
+  pub let TB_ERR_ENOSPC            : u64 = 0xFFFFEB7F
+  pub let TB_ERR_BAD_INDEX         : u64 = 0xFFFFEB7E
+  pub let TB_ERR_NOT_LEAF          : u64 = 0xFFFFEB7D
+  pub let TB_ERR_BAD_AXIS          : u64 = 0xFFFFEB7C
+  pub let TB_ERR_BAD_RATIO         : u64 = 0xFFFFEB7B
+  pub let TB_ERR_EMPTY_TREE        : u64 = 0xFFFFEB7A
+  pub let TB_ERR_ROOT_COLLAPSE     : u64 = 0xFFFFEB79
+  pub let TB_ERR_BAD_TREE          : u64 = 0xFFFFEB78
+  pub let TB_ERR_STOP_VISITOR      : u64 = 0xFFFFEB77
+  pub let TB_ERR_DEPTH_LIMIT       : u64 = 0xFFFFEB76
+  pub let TB_ERR_BAD_ARENA         : u64 = 0xFFFFEB75
+  pub let TB_ERR_BAD_WORKSPACE     : u64 = 0xFFFFEB74
+  pub let TB_ERR_ALREADY_ROOT      : u64 = 0xFFFFEB73
+  pub let TB_ERR_TOPOLOGY          : u64 = 0xFFFFEB72
+  pub let TB_ERR_INTERNAL          : u64 = 0xFFFFEB71
+  pub let TB_ERR_DECODE            : u64 = 0xFFFFEB70
+
+  // ==========================================================================
+  // SECTION B  State cells (arena pool + alloc bits + stats).
+  // ==========================================================================
+
+  // Per-tree arena pool. 4 arenas * 2080 bytes = 8320 bytes = 1040 u64.
+  pub let mut _tiling_bsp_arenas    : [u64; 1040] = uninit @align(64)
+
+  // Per-slot in-use flags (0 = free, 1 = allocated). Kept as a u64
+  // per slot so the alloc/free path is a plain load+store with no
+  // bit-manipulation (matches every other pool primitive in this
+  // module and avoids the `and reg, imm64` shape).
+  pub let mut _tiling_bsp_alloc_bits: [u64; 4]    = uninit @align(64)
+
+  // Stats counters (splits, collapses, walks, refused). Bounds-
+  // checked against 4 in tb_stats_bump / tb_stats_read.
+  pub let mut _tiling_bsp_stats     : [u64; 4]    = uninit @align(64)
+
+  // ==========================================================================
+  // SECTION C  Fingerprint tag (data-only).
+  //
+  // pdx_kind_tiling_bsp_meta -- ONE tag ending [legacy: ... OK] per
+  // softarch discipline. See file header §5. Wire-up path (workspace
+  // mint -> tiling_bsp_arena_alloc -> emission via klog_s1_x1) lands
+  // with a future batch; the coverage gate allowlist entry lands at
+  // the same time.
+  // ==========================================================================
+
+  pub let pdx_kind_tiling_bsp_meta : [u8; 54] = "pdx kind tiling bsp meta [legacy: TILING BSP META OK]\0"
+
+  // ==========================================================================
+  // SECTION D  Bit-packing helpers.
+  //
+  // Every packed word in this module is (u32_lo | u32_hi << 32).
+  // tb_pack_u32_pair is the canonical constructor; readers extract via
+  // the header/node accessors in SECTIONS F + G below.
+  //
+  // Zero-extension of the low half uses `shl 32; shr 32` per the
+  // encoder-conservative discipline (SECTION 4 of the file header).
+  // ==========================================================================
+
+  // tb_pack_u32_pair(lo, hi) -> lo[31:0] | hi[63:32].
+  pub let tb_pack_u32_pair : (u64, u64) -> u64 !{} @{} =
+    fn (lo: u64) (hi: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): pack (u32, u32) -> u64 with lo at [31:0] and hi at [63:32]. Zero-extension via shl 32; shr 32 (encoder-conservative -- no `and reg, imm32` mask). The `shl r10, 32` on hi discards any extraneous upper bits before the OR. Labels prefixed tb_pu_.",
+      block: {
+        mov rax, rdi;
+        shl rax, 32;
+        shr rax, 32;                 // zero-extended lo
+        mov r10, rsi;
+        shl r10, 32;                 // discards upper bits of hi, places into [63:32]
+        or  rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION E  Arena pool primitives.
+  //
+  //   tb_arena_base(slot)  -> ptr to arena's tree header  (or 0 OOB).
+  //   tiling_bsp_arena_alloc()   -> slot | TB_ERR_ENOSPC.
+  //   tiling_bsp_arena_free(slot) -> ().
+  //
+  // Slot indices are 0..TB_MAX_TREES-1. Arena base pointer =
+  // _tiling_bsp_arenas + slot * TB_ARENA_BYTES (2080).
+  // ==========================================================================
+
+  // tb_arena_base(slot) -> ptr | 0.
+  pub let tb_arena_base : (u64) -> u64 !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): arena base pointer = _tiling_bsp_arenas + slot * TB_ARENA_BYTES(2080). Bounds-checked against TB_MAX_TREES(4); OOB returns 0 (caller compares against zero before dereferencing). Labels prefixed tb_ab_.",
+      block: {
+        mov r10, 4;
+        cmp rdi, r10;
+        jae tb_ab_no;
+        lea r10, [rip + _tiling_bsp_arenas];
+        mov r11, rdi;
+        imul r11, r11, 2080;
+        add r10, r11;
+        mov rax, r10;
+        ret;
+      tb_ab_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // tiling_bsp_arena_alloc() -> slot | TB_ERR_ENOSPC. Low-first scan
+  // over the alloc-bits pool. On claim, sets the bit to 1 but does
+  // NOT initialise the arena payload -- the caller must invoke
+  // tiling_bsp_tree_new() on the returned slot before use.
+  pub let tiling_bsp_arena_alloc : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): claim one arena slot via low-first scan of _tiling_bsp_alloc_bits (TB_MAX_TREES=4 slots, one u64 flag per slot). No callee-save needed; scratch only. Labels prefixed tb_aa_.",
+      block: {
+        xor rax, rax;                // slot cursor
+        lea r10, [rip + _tiling_bsp_alloc_bits];
+      tb_aa_scan:
+        cmp rax, 4;
+        jae tb_aa_enospc;
+        mov r11, [r10 + rax * 8];
+        cmp r11, 0;
+        je  tb_aa_claim;
+        add rax, 1;
+        jmp tb_aa_scan;
+      tb_aa_claim:
+        mov r11, 1;
+        mov [r10 + rax * 8], r11;
+        ret;
+      tb_aa_enospc:
+        mov rax, 0xFFFFEB7F;         // TB_ERR_ENOSPC
+        ret
+      }
+    }
+
+  // tiling_bsp_arena_free(slot) -> (). Clears the alloc bit. Does not
+  // zero the arena payload (redundant work; the next alloc's caller
+  // re-invokes tiling_bsp_tree_new to re-initialise the header).
+  pub let tiling_bsp_arena_free : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): free one arena slot by clearing its alloc bit. Bounds-checked against TB_MAX_TREES(4); OOB is a silent no-op (mirror lt_row_free's tolerance). Labels prefixed tb_af_.",
+      block: {
+        mov r10, 4;
+        cmp rdi, r10;
+        jae tb_af_out;
+        lea r10, [rip + _tiling_bsp_alloc_bits];
+        xor rax, rax;
+        mov [r10 + rdi * 8], rax;
+      tb_af_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION F  Address arithmetic + header accessors.
+  //
+  //   tb_node_addr(tree_base, node_index) -> ptr.
+  //     Precondition: caller validated node_index < node_count.
+  //
+  //   tb_hdr_*(tree_base) -> field value (u32 fields zero-extended).
+  // ==========================================================================
+
+  // tb_node_addr(tree_base, node_index) -> ptr.
+  pub let tb_node_addr : (u64, u64) -> u64 !{} @{} =
+    fn (tree_base: u64) (node_index: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): node address = tree_base + TB_HDR_BYTES(32) + node_index * TB_NODE_BYTES(32). node_index * 32 encoded as shl 5 (power-of-two multiply via shift). Precondition: caller validated node_index. Labels prefixed tb_na_.",
+      block: {
+        mov rax, rdi;
+        add rax, 32;                     // skip header
+        mov r10, rsi;
+        shl r10, 5;                      // * 32
+        add rax, r10;
+        ret
+      }
+    }
+
+  // tb_hdr_workspace_id(tree_base) -> u32 zero-extended.
+  pub let tb_hdr_workspace_id : (u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read workspace_kind_id from wsid_root[31:0]. shl 32; shr 32 zero-extend. Labels prefixed tb_hw_.",
+      block: {
+        mov rax, [rdi + 0];
+        shl rax, 32;
+        shr rax, 32;
+        ret
+      }
+    }
+
+  // tb_hdr_root_index(tree_base) -> u32.
+  pub let tb_hdr_root_index : (u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read root_index from wsid_root[63:32]. Labels prefixed tb_hr_.",
+      block: {
+        mov rax, [rdi + 0];
+        shr rax, 32;
+        ret
+      }
+    }
+
+  // tb_hdr_node_count(tree_base) -> u32.
+  pub let tb_hdr_node_count : (u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read node_count from count_cap[31:0]. Labels prefixed tb_hnc_.",
+      block: {
+        mov rax, [rdi + 8];
+        shl rax, 32;
+        shr rax, 32;
+        ret
+      }
+    }
+
+  // tb_hdr_arena_capacity(tree_base) -> u32.
+  pub let tb_hdr_arena_capacity : (u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read arena_capacity from count_cap[63:32]. Labels prefixed tb_hac_.",
+      block: {
+        mov rax, [rdi + 8];
+        shr rax, 32;
+        ret
+      }
+    }
+
+  // tb_hdr_version(tree_base) -> u64.
+  pub let tb_hdr_version : (u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read tree_version_seq (full u64). Labels prefixed tb_hv_.",
+      block: {
+        mov rax, [rdi + 16];
+        ret
+      }
+    }
+
+  // tb_hdr_free_head(tree_base) -> u32.
+  pub let tb_hdr_free_head : (u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read free_head_index from free_head[31:0]. Labels prefixed tb_hf_.",
+      block: {
+        mov rax, [rdi + 24];
+        shl rax, 32;
+        shr rax, 32;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION G  Node field accessors.
+  //
+  // Every accessor takes a node_base pointer (as returned by
+  // tb_node_addr) and returns the requested u32 field zero-extended
+  // into rax, or the u8 axis field zero-extended.
+  // ==========================================================================
+
+  // tb_node_axis(node_base) -> u8 zero-extended.
+  pub let tb_node_axis : (u64) -> u64 !{mem} @{} =
+    fn (node_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read axis from axis_den[7:0]. `and rax, 0xFF` uses the imm8-form AND (short encoding), which paideia-as encodes via the 32-bit-dest EAX-form when detecting a u8 mask on a u64 register -- matches layer_tree.pdx's u8 masking pattern (lt_pack_hdr_row). Labels prefixed tb_nax_.",
+      block: {
+        mov rax, [rdi + 0];
+        and rax, 0xFF;
+        ret
+      }
+    }
+
+  // tb_node_ratio_den(node_base) -> u32.
+  pub let tb_node_ratio_den : (u64) -> u64 !{mem} @{} =
+    fn (node_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read ratio_den from axis_den[63:32]. Labels prefixed tb_nrd_.",
+      block: {
+        mov rax, [rdi + 0];
+        shr rax, 32;
+        ret
+      }
+    }
+
+  // tb_node_window_kind_id(node_base) -> u32.
+  pub let tb_node_window_kind_id : (u64) -> u64 !{mem} @{} =
+    fn (node_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read window_kind_id from wnum[31:0]. Labels prefixed tb_nwk_.",
+      block: {
+        mov rax, [rdi + 8];
+        shl rax, 32;
+        shr rax, 32;
+        ret
+      }
+    }
+
+  // tb_node_ratio_num(node_base) -> u32.
+  pub let tb_node_ratio_num : (u64) -> u64 !{mem} @{} =
+    fn (node_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read ratio_num from wnum[63:32]. Labels prefixed tb_nrn_.",
+      block: {
+        mov rax, [rdi + 8];
+        shr rax, 32;
+        ret
+      }
+    }
+
+  // tb_node_left_child(node_base) -> u32.
+  pub let tb_node_left_child : (u64) -> u64 !{mem} @{} =
+    fn (node_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read left_child_index from children[31:0]. Labels prefixed tb_nlc_.",
+      block: {
+        mov rax, [rdi + 16];
+        shl rax, 32;
+        shr rax, 32;
+        ret
+      }
+    }
+
+  // tb_node_right_child(node_base) -> u32.
+  pub let tb_node_right_child : (u64) -> u64 !{mem} @{} =
+    fn (node_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read right_child_index from children[63:32]. Labels prefixed tb_nrc_.",
+      block: {
+        mov rax, [rdi + 16];
+        shr rax, 32;
+        ret
+      }
+    }
+
+  // tb_node_parent_index(node_base) -> u32.
+  pub let tb_node_parent_index : (u64) -> u64 !{mem} @{} =
+    fn (node_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read parent_index from parcnt[31:0]. Labels prefixed tb_npi_.",
+      block: {
+        mov rax, [rdi + 24];
+        shl rax, 32;
+        shr rax, 32;
+        ret
+      }
+    }
+
+  // tb_node_subtree_count(node_base) -> u32.
+  pub let tb_node_subtree_count : (u64) -> u64 !{mem} @{} =
+    fn (node_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read subtree_window_count from parcnt[63:32]. Labels prefixed tb_nsc_.",
+      block: {
+        mov rax, [rdi + 24];
+        shr rax, 32;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION H  Node write helpers.
+  //
+  //   tb_node_write_leaf(node_base, window_kind_id, parent_index)
+  //   tb_node_write_internal(node_base, axis, ratio_num, ratio_den,
+  //                          left_child, right_child, parent_index,
+  //                          subtree_count)  -- via a specialised
+  //     helper that packs and stores each of the four u64 words.
+  //   tb_node_set_children(node_base, left_child, right_child)
+  //   tb_node_set_parent(node_base, parent_index)
+  //   tb_node_set_subtree_count(node_base, count)
+  //
+  // These are the write-side counterpart to SECTION G.
+  // ==========================================================================
+
+  // tb_node_write_leaf(node_base, window_kind_id, parent_index) -> ().
+  //
+  // Writes a fresh leaf node with:
+  //   axis = TB_SPLIT_LEAF (255), ratio_den = 0
+  //   window_kind_id = arg, ratio_num = 0
+  //   left_child = right_child = TB_INDEX_NONE
+  //   parent_index = arg, subtree_window_count = 1
+  pub let tb_node_write_leaf : (u64, u64, u64) -> () !{mem} @{} =
+    fn (node_base: u64) (window_kind_id: u64) (parent_index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): initialise a leaf node in one atomic burst (four u64 word writes). axis=255, ratio_*=0, both children=TB_INDEX_NONE (loaded as 0xFFFFFFFF then shl/shr 32 zero-extended before packing so the packed word carries exactly 0xFFFFFFFFFFFFFFFF). subtree_window_count=1. No nested calls -- leaf write, all packing inline. Labels prefixed tb_nwl_.",
+      block: {
+        // axis_den word: axis[7:0]=255 | ratio_den[63:32]=0
+        mov rax, 255;
+        mov [rdi + 0], rax;
+
+        // wnum word: window_kind_id[31:0] | ratio_num[63:32]=0
+        mov rax, rsi;
+        shl rax, 32;
+        shr rax, 32;
+        mov [rdi + 8], rax;
+
+        // children word: left=NONE | right=NONE  -> both 0xFFFFFFFF -> full u64 = 0xFFFFFFFFFFFFFFFF
+        mov r10, 0xFFFFFFFF;
+        shl r10, 32;
+        shr r10, 32;                 // r10 = 0x00000000FFFFFFFF (zero-extended NONE)
+        mov r11, r10;                // right = NONE, hi half
+        shl r11, 32;                 // r11 = 0xFFFFFFFF00000000
+        or  r10, r11;                // r10 = 0xFFFFFFFFFFFFFFFF
+        mov [rdi + 16], r10;
+
+        // parcnt word: parent_index[31:0]=arg | subtree_window_count[63:32]=1
+        mov rax, rdx;
+        shl rax, 32;
+        shr rax, 32;                 // zero-extended parent
+        mov r10, 1;
+        shl r10, 32;                 // subtree_count=1 in hi half
+        or  rax, r10;
+        mov [rdi + 24], rax;
+        ret
+      }
+    }
+
+  // tb_node_write_children(node_base, left_child, right_child) -> ().
+  //
+  // Overwrites JUST the children word. Used by tiling_bsp_split when
+  // converting a leaf into an internal split, and by tiling_bsp_
+  // collapse when re-parenting a promoted sibling's children.
+  pub let tb_node_write_children : (u64, u64, u64) -> () !{mem} @{} =
+    fn (node_base: u64) (left_child: u64) (right_child: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): pack (left[31:0] | right[63:32]) and store to +16. No nested calls. Labels prefixed tb_nwc_.",
+      block: {
+        mov rax, rsi;
+        shl rax, 32;
+        shr rax, 32;                 // zero-extended left
+        mov r10, rdx;
+        shl r10, 32;                 // right into [63:32]
+        or  rax, r10;
+        mov [rdi + 16], rax;
+        ret
+      }
+    }
+
+  // tb_node_write_parent(node_base, parent_index) -> ().
+  //
+  // Overwrites JUST the parent_index low-32-bits of the parcnt word,
+  // preserving the subtree_window_count high half. Used when
+  // re-parenting a promoted sibling's children during collapse.
+  pub let tb_node_write_parent : (u64, u64) -> () !{mem} @{} =
+    fn (node_base: u64) (parent_index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read parcnt word, replace low 32 bits with new parent_index, write back. Preserves subtree_window_count in the high half. No nested calls. Labels prefixed tb_nwp_.",
+      block: {
+        mov rax, [rdi + 24];
+        shr rax, 32;                 // rax = subtree_count (u32 in low)
+        shl rax, 32;                 // move back to high 32
+        mov r10, rsi;
+        shl r10, 32;
+        shr r10, 32;                 // zero-extended new parent
+        or  rax, r10;
+        mov [rdi + 24], rax;
+        ret
+      }
+    }
+
+  // tb_node_write_subtree_count(node_base, count) -> ().
+  //
+  // Overwrites JUST the subtree_window_count high half of the parcnt
+  // word, preserving parent_index. Used by the split/collapse walkers
+  // that bubble counts up the tree.
+  pub let tb_node_write_subtree_count : (u64, u64) -> () !{mem} @{} =
+    fn (node_base: u64) (count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): read parcnt word, replace high 32 bits with new subtree_window_count, write back. Preserves parent_index in the low half. Labels prefixed tb_nwsc_.",
+      block: {
+        mov rax, [rdi + 24];
+        shl rax, 32;
+        shr rax, 32;                 // rax = parent_index (u32) in low, high zeroed
+        mov r10, rsi;
+        shl r10, 32;                 // count into [63:32]
+        or  rax, r10;
+        mov [rdi + 24], rax;
+        ret
+      }
+    }
+
+  // tb_node_write_axis_den(node_base, axis, ratio_den) -> ().
+  //
+  // Overwrites JUST the axis_den word.
+  pub let tb_node_write_axis_den : (u64, u64, u64) -> () !{mem} @{} =
+    fn (node_base: u64) (axis: u64) (ratio_den: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): pack (axis[7:0] | reserved[31:8]=0 | ratio_den[63:32]) and store to +0. Labels prefixed tb_nwad_.",
+      block: {
+        mov rax, rsi;
+        and rax, 0xFF;               // isolate u8 axis (imm8 mask; matches lt_pack_hdr_row shape)
+        mov r10, rdx;
+        shl r10, 32;                 // ratio_den into [63:32]
+        or  rax, r10;
+        mov [rdi + 0], rax;
+        ret
+      }
+    }
+
+  // tb_node_write_wkid_num(node_base, window_kind_id, ratio_num) -> ().
+  //
+  // Overwrites JUST the wnum word.
+  pub let tb_node_write_wkid_num : (u64, u64, u64) -> () !{mem} @{} =
+    fn (node_base: u64) (window_kind_id: u64) (ratio_num: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): pack (window_kind_id[31:0] | ratio_num[63:32]) and store to +8. Labels prefixed tb_nwwn_.",
+      block: {
+        mov rax, rsi;
+        shl rax, 32;
+        shr rax, 32;
+        mov r10, rdx;
+        shl r10, 32;
+        or  rax, r10;
+        mov [rdi + 8], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION I  Header write helpers.
+  //
+  //   tb_hdr_set_root(tree_base, root_index)
+  //   tb_hdr_set_node_count(tree_base, count)
+  //   tb_hdr_bump_version(tree_base)
+  //   tb_hdr_set_free_head(tree_base, head)
+  // ==========================================================================
+
+  // tb_hdr_set_root(tree_base, root_index) -> ().
+  //
+  // Overwrites JUST the root_index high half of wsid_root, preserving
+  // workspace_kind_id.
+  pub let tb_hdr_set_root : (u64, u64) -> () !{mem} @{} =
+    fn (tree_base: u64) (root_index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): preserve workspace_kind_id[31:0] (low half), replace root_index[63:32] (high half). Labels prefixed tb_hsr_.",
+      block: {
+        mov rax, [rdi + 0];
+        shl rax, 32;
+        shr rax, 32;                 // rax = workspace_kind_id
+        mov r10, rsi;
+        shl r10, 32;                 // root_index into [63:32]
+        or  rax, r10;
+        mov [rdi + 0], rax;
+        ret
+      }
+    }
+
+  // tb_hdr_set_node_count(tree_base, count) -> ().
+  //
+  // Overwrites JUST the node_count low half of count_cap, preserving
+  // arena_capacity.
+  pub let tb_hdr_set_node_count : (u64, u64) -> () !{mem} @{} =
+    fn (tree_base: u64) (count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): preserve arena_capacity[63:32] (high half), replace node_count[31:0] (low half). Labels prefixed tb_hsnc_.",
+      block: {
+        mov rax, [rdi + 8];
+        shr rax, 32;
+        shl rax, 32;                 // rax = arena_capacity in high, low zeroed
+        mov r10, rsi;
+        shl r10, 32;
+        shr r10, 32;                 // zero-extended count
+        or  rax, r10;
+        mov [rdi + 8], rax;
+        ret
+      }
+    }
+
+  // tb_hdr_bump_version(tree_base) -> new_version.
+  pub let tb_hdr_bump_version : (u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): monotone increment of tree_version_seq. Load-inc-store idiom. Labels prefixed tb_hbv_.",
+      block: {
+        mov rax, [rdi + 16];
+        add rax, 1;
+        mov [rdi + 16], rax;
+        ret
+      }
+    }
+
+  // tb_hdr_set_free_head(tree_base, head) -> ().
+  //
+  // Overwrites JUST the free_head_index low half, preserving reserved.
+  pub let tb_hdr_set_free_head : (u64, u64) -> () !{mem} @{} =
+    fn (tree_base: u64) (head: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): preserve reserved[63:32] (which is unused / zero at init), replace free_head_index[31:0]. Labels prefixed tb_hsfh_.",
+      block: {
+        mov rax, [rdi + 24];
+        shr rax, 32;
+        shl rax, 32;                 // rax = reserved word in high
+        mov r10, rsi;
+        shl r10, 32;
+        shr r10, 32;
+        or  rax, r10;
+        mov [rdi + 24], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION J  Node allocator.
+  //
+  //   tb_node_alloc(tree_base) -> new_index | TB_ERR_ENOSPC.
+  //   tb_node_free (tree_base, node_index) -> ().
+  //
+  // Allocation strategy:
+  //   1. If free_head_index != TB_INDEX_NONE: pop from the free list.
+  //      The freed slot's parent_index field carries the next-free
+  //      pointer while the slot sits on the list.
+  //   2. Else bump-allocate: if node_count < arena_capacity, return
+  //      the slot at node_count and increment node_count.
+  //   3. Else return TB_ERR_ENOSPC.
+  //
+  // Free strategy:
+  //   Push onto the free list. The freed slot's axis field is left
+  //   whatever it was (readers should reach a freed slot only via the
+  //   free-list chain, never via a tree walk from root -- see the
+  //   free-list invariant in file header §2.2).
+  // ==========================================================================
+
+  // tb_node_alloc(tree_base) -> index | TB_ERR_ENOSPC.
+  pub let tb_node_alloc : (u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): two-step allocator: free-list pop first (via tb_hdr_free_head + tb_node_parent_index chain), bump-allocate second. Three callee-save pushes (rbx=tree_base, r12=free_head, r13=arena_cap) leave rsp%16==0 (entry rsp%16==8, 3 pushes==-24 mod 16==-8 mod 16==8; then even pushes cancel, odd flip -- 3 pushes flip once == 8 -> 0). No further sub needed for nested calls. Labels prefixed tb_nal_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov  rbx, rdi;
+
+        // free_head = tb_hdr_free_head(tree_base)
+        mov  rdi, rbx;
+        call tb_hdr_free_head;
+        mov  r12, rax;
+
+        // If free_head != TB_INDEX_NONE, pop from free list.
+        // We treat any index >= arena_capacity as "not free" (defensive),
+        // which subsumes the TB_INDEX_NONE sentinel because
+        // arena_capacity <= TB_MAX_NODES(64) << 0xFFFFFFFF.
+        mov  rdi, rbx;
+        call tb_hdr_arena_capacity;
+        mov  r13, rax;
+
+        cmp  r12, r13;
+        jae  tb_nal_bump;
+
+        // Pop: new free_head = freed_slot.parent_index (chain link).
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        call tb_node_parent_index;
+        // rax = next free head
+
+        mov  rdi, rbx;
+        mov  rsi, rax;
+        call tb_hdr_set_free_head;
+
+        // Return the popped slot index.
+        mov  rax, r12;
+        jmp  tb_nal_out;
+
+      tb_nal_bump:
+        // Bump-allocate: check node_count < arena_capacity.
+        mov  rdi, rbx;
+        call tb_hdr_node_count;
+        // rax = node_count
+        cmp  rax, r13;
+        jae  tb_nal_enospc;
+
+        // new_index = node_count; new node_count = old + 1.
+        mov  r12, rax;               // r12 = new_index
+        add  rax, 1;
+        mov  rdi, rbx;
+        mov  rsi, rax;
+        call tb_hdr_set_node_count;
+
+        mov  rax, r12;
+        jmp  tb_nal_out;
+
+      tb_nal_enospc:
+        mov  rax, 0xFFFFEB7F;        // TB_ERR_ENOSPC
+
+      tb_nal_out:
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // tb_node_free(tree_base, node_index) -> ().
+  //
+  // Pushes node_index onto the free list by writing the old free_head
+  // into the freed node's parent_index field (chain link), then
+  // updating the header's free_head_index to node_index.
+  pub let tb_node_free : (u64, u64) -> () !{mem} @{} =
+    fn (tree_base: u64) (node_index: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): push node_index onto the free list. Three callee-save pushes (rbx=tree_base, r12=node_index, r13=old_free_head) leave rsp%16==0 -- aligned for nested calls without an additional sub. Labels prefixed tb_nfr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov  rbx, rdi;
+        mov  r12, rsi;
+
+        // old_free_head = tb_hdr_free_head(tree_base)
+        mov  rdi, rbx;
+        call tb_hdr_free_head;
+        mov  r13, rax;
+
+        // freed_slot.parent_index = old_free_head
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        mov  rsi, r13;
+        call tb_node_write_parent;
+
+        // tb_hdr_set_free_head(tree_base, r12)
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_hdr_set_free_head;
+
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION K  tiling_bsp_tree_new -- factory.
+  //
+  // tiling_bsp_tree_new(tree_base, workspace_kind_id) -> ().
+  //
+  // Initialises a fresh empty tree at *tree_base. Header fields:
+  //   workspace_kind_id = arg
+  //   root_index = TB_INDEX_NONE (empty)
+  //   node_count = 0
+  //   arena_capacity = TB_MAX_NODES (64)
+  //   tree_version_seq = 0
+  //   free_head_index = TB_INDEX_NONE
+  // ==========================================================================
+
+  pub let tiling_bsp_tree_new : (u64, u64) -> () !{mem} @{} =
+    fn (tree_base: u64) (workspace_kind_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): initialise a fresh empty BSP tree. Writes the four u64 header words inline (no nested calls). TB_INDEX_NONE loaded via mov+shl+shr for exact 0x00000000FFFFFFFF zero-extension. Labels prefixed tb_tn_.",
+      block: {
+        // wsid_root: workspace_kind_id[31:0] | TB_INDEX_NONE[63:32]
+        mov rax, rsi;
+        shl rax, 32;
+        shr rax, 32;                 // zero-extended workspace_kind_id
+        mov r10, 0xFFFFFFFF;
+        shl r10, 32;                 // r10 = 0xFFFFFFFF00000000 (TB_INDEX_NONE in high half)
+        or  rax, r10;
+        mov [rdi + 0], rax;
+
+        // count_cap: node_count[31:0]=0 | arena_capacity[63:32]=64
+        mov rax, 64;
+        shl rax, 32;                 // rax = 64 in high half, low half zero
+        mov [rdi + 8], rax;
+
+        // version = 0
+        xor rax, rax;
+        mov [rdi + 16], rax;
+
+        // free_head: free_head_index[31:0]=TB_INDEX_NONE | reserved[63:32]=0
+        mov rax, 0xFFFFFFFF;
+        shl rax, 32;
+        shr rax, 32;                 // rax = 0x00000000FFFFFFFF
+        mov [rdi + 24], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION L  tiling_bsp_insert_first -- seed root leaf.
+  //
+  // tiling_bsp_insert_first(tree_base, window_kind_id) -> root_idx | error.
+  //
+  // Installs the first window as the tree's root leaf. Refused with
+  // TB_ERR_ALREADY_ROOT if the tree is non-empty (caller should use
+  // tiling_bsp_split instead).
+  // ==========================================================================
+
+  pub let tiling_bsp_insert_first : (u64, u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) (window_kind_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): seed the tree's root leaf. Refuses if root_index is a valid slot (tree already has a root). Two callee-save pushes (rbx=tree_base, r12=window_kind_id) + sub rsp, 24 -- entry rsp%16==8; +16 pushes==8; +24 sub==0 (aligned). Fixed local frame: [rsp+0]=new_root_idx, [rsp+8]=arena_cap, [rsp+16]=align padding. Labels prefixed tb_if_.",
+      block: {
+        push rbx;
+        push r12;
+        sub  rsp, 24;
+
+        mov  rbx, rdi;
+        mov  r12, rsi;
+
+        // Cache arena_cap for bounds checks throughout.
+        mov  rdi, rbx;
+        call tb_hdr_arena_capacity;
+        mov  [rsp + 8], rax;
+
+        // If tree already has a root (root_index < arena_cap), refuse.
+        mov  rdi, rbx;
+        call tb_hdr_root_index;
+        mov  r10, [rsp + 8];
+        cmp  rax, r10;
+        jb   tb_if_have_root;
+
+        // Empty tree -- allocate a root leaf slot.
+        mov  rdi, rbx;
+        call tb_node_alloc;
+        mov  r10, [rsp + 8];
+        cmp  rax, r10;
+        jae  tb_if_enospc;
+        mov  [rsp + 0], rax;         // stash new_root_idx
+
+        // Write leaf into the allocated slot (window_kind_id=r12, parent=NONE).
+        mov  rdi, rbx;
+        mov  rsi, [rsp + 0];
+        call tb_node_addr;
+
+        mov  rdi, rax;               // node_base
+        mov  rsi, r12;               // window_kind_id
+        mov  rdx, 0xFFFFFFFF;        // parent = TB_INDEX_NONE
+        shl  rdx, 32;
+        shr  rdx, 32;
+        call tb_node_write_leaf;
+
+        // Update header: root_index = new_root_idx.
+        mov  rdi, rbx;
+        mov  rsi, [rsp + 0];
+        call tb_hdr_set_root;
+
+        // Bump tree_version_seq.
+        mov  rdi, rbx;
+        call tb_hdr_bump_version;
+
+        mov  rax, [rsp + 0];         // return new_root_idx
+        jmp  tb_if_out;
+
+      tb_if_have_root:
+        mov  rax, 0xFFFFEB73;        // TB_ERR_ALREADY_ROOT
+        jmp  tb_if_out;
+
+      tb_if_enospc:
+        mov  rax, 0xFFFFEB7F;        // TB_ERR_ENOSPC
+
+      tb_if_out:
+        add  rsp, 24;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION M  tiling_bsp_split -- splits a leaf into an internal node.
+  //
+  // tiling_bsp_split(tree_base, parent_leaf_idx, axis, ratio_num,
+  //                  ratio_den, new_window_kind_id)
+  //   -> new_leaf_idx (right child) | error
+  //
+  // Given an existing LEAF at parent_leaf_idx:
+  //   1. Validate axis is HORIZONTAL(0) or VERTICAL(1); reject LEAF(255).
+  //   2. Validate ratio_num > 0 and ratio_den > 0 and ratio_num <= ratio_den.
+  //   3. Allocate two new leaf slots (left_new, right_new).
+  //   4. Left_new inherits parent_leaf_idx's old window_kind_id.
+  //   5. Right_new receives new_window_kind_id.
+  //   6. Convert parent_leaf_idx from leaf to internal split:
+  //        axis, ratio_den, ratio_num set from args
+  //        window_kind_id = 0
+  //        left_child = left_new, right_child = right_new
+  //        subtree_window_count = 2 (was 1, now holds 2 leaves)
+  //   7. Walk up from parent_leaf_idx bumping subtree_window_count by +1
+  //      (only along the ancestor chain; parent_leaf_idx itself was set
+  //      to exactly 2 in step 6).
+  //   8. Bump tree_version_seq.
+  //   9. Return right_new (the newly-added window's leaf index).
+  // ==========================================================================
+
+  pub let tiling_bsp_split : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) (parent_leaf_idx: u64) (axis: u64) (ratio_num: u64)
+       (ratio_den: u64) (new_window_kind_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): split a leaf into an internal with two new leaves. Six callee-save pushes (rbx=tree_base, r12=parent_leaf_idx, r13=axis, r14=ratio_num, r15=ratio_den, rbp=new_window_kind_id) plus sub rsp, 40 -- entry rsp%16==8; +48 pushes==8; +40 sub == 0 (aligned). Fixed local layout at [rsp+0]=left_new, [rsp+8]=right_new, [rsp+16]=old_window, [rsp+24]=err_stash, [rsp+32]=align pad. tb_node_alloc returns TB_ERR_ENOSPC (0xFFFFEB7F, well above TB_MAX_NODES=64) on failure so `cmp rax, 64; jae fail` cleanly detects both ENOSPC and any impossible slot. Two-step allocation with rollback: if the second alloc fails, the first is returned to the free list via tb_node_free before the ENOSPC funnel. After the two allocations succeed the parent leaf is converted into an internal split (four field writes) and the ancestor chain has its subtree_window_count bumped by +1 in a walk-up loop. r12 (parent_leaf_idx) is repurposed as the bubble-loop cursor after the parent conversion; r13/r14 are repurposed as (arena_cap, ancestor_base). Labels prefixed tb_sp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub  rsp, 40;
+
+        mov  rbx, rdi;
+        mov  r12, rsi;
+        mov  r13, rdx;
+        mov  r14, rcx;
+        mov  r15, r8;
+        mov  rbp, r9;
+
+        // --- Validation ---
+
+        // axis must be HORIZONTAL(0) or VERTICAL(1); reject LEAF(255)
+        // and any other value.
+        cmp  r13, 1;
+        ja   tb_sp_bad_axis;
+
+        // ratio_num > 0
+        cmp  r14, 0;
+        je   tb_sp_bad_ratio;
+        // ratio_den > 0
+        cmp  r15, 0;
+        je   tb_sp_bad_ratio;
+        // ratio_num <= ratio_den  (split ratio must not exceed 100%)
+        cmp  r14, r15;
+        ja   tb_sp_bad_ratio;
+
+        // parent_leaf_idx must be < node_count.
+        mov  rdi, rbx;
+        call tb_hdr_node_count;
+        cmp  r12, rax;
+        jae  tb_sp_bad_index;
+
+        // parent must actually be a leaf: axis == TB_SPLIT_LEAF(255).
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        call tb_node_axis;
+        cmp  rax, 255;
+        jne  tb_sp_not_leaf;
+
+        // --- Stash parent's old window_kind_id ---
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        call tb_node_window_kind_id;
+        mov  [rsp + 16], rax;
+
+        // --- Allocate left_new ---
+        mov  rdi, rbx;
+        call tb_node_alloc;
+        cmp  rax, 64;                // TB_MAX_NODES; ENOSPC returns 0xFFFFEB7F >> 64
+        jae  tb_sp_enospc;
+        mov  [rsp + 0], rax;
+
+        // --- Allocate right_new ---
+        mov  rdi, rbx;
+        call tb_node_alloc;
+        cmp  rax, 64;
+        jae  tb_sp_enospc_rollback;
+        mov  [rsp + 8], rax;
+
+        // --- Seed left_new leaf with old_window, parent = r12 ---
+        mov  rdi, rbx;
+        mov  rsi, [rsp + 0];
+        call tb_node_addr;
+        mov  rdi, rax;
+        mov  rsi, [rsp + 16];
+        mov  rdx, r12;
+        call tb_node_write_leaf;
+
+        // --- Seed right_new leaf with rbp (new_window), parent = r12 ---
+        mov  rdi, rbx;
+        mov  rsi, [rsp + 8];
+        call tb_node_addr;
+        mov  rdi, rax;
+        mov  rsi, rbp;
+        mov  rdx, r12;
+        call tb_node_write_leaf;
+
+        // --- Convert parent (r12) to internal (four field writes) ---
+
+        // parent.axis_den = (axis=r13, ratio_den=r15)
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        mov  rsi, r13;
+        mov  rdx, r15;
+        call tb_node_write_axis_den;
+
+        // parent.wnum = (window_kind_id=0, ratio_num=r14)
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        xor  rsi, rsi;
+        mov  rdx, r14;
+        call tb_node_write_wkid_num;
+
+        // parent.children = (left_new, right_new)
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        mov  rsi, [rsp + 0];
+        mov  rdx, [rsp + 8];
+        call tb_node_write_children;
+
+        // parent.subtree_count = 2 (parent_index in low half stays)
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        mov  rsi, 2;
+        call tb_node_write_subtree_count;
+
+        // --- Bubble subtree_window_count up ancestor chain ---
+        //
+        // cursor = nodes[parent_leaf_idx].parent_index (first ancestor above
+        // the newly-created split; the split itself already carries count=2).
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        call tb_node_parent_index;
+
+        // Repurpose r12 as cursor (we no longer need parent_leaf_idx after
+        // the parent conversion is done).
+        mov  r12, rax;
+
+        // Repurpose r13 as arena_capacity (we no longer need axis).
+        mov  rdi, rbx;
+        call tb_hdr_arena_capacity;
+        mov  r13, rax;
+
+      tb_sp_bubble_loop:
+        cmp  r12, r13;
+        jae  tb_sp_bubble_done;
+
+        // Read ancestor.subtree_count, +1, write back.
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  r14, rax;               // r14 = ancestor_base (no longer needs ratio_num)
+
+        mov  rdi, r14;
+        call tb_node_subtree_count;
+        add  rax, 1;
+        mov  rdi, r14;
+        mov  rsi, rax;
+        call tb_node_write_subtree_count;
+
+        // cursor = ancestor.parent_index
+        mov  rdi, r14;
+        call tb_node_parent_index;
+        mov  r12, rax;
+        jmp  tb_sp_bubble_loop;
+
+      tb_sp_bubble_done:
+        // Bump tree_version_seq.
+        mov  rdi, rbx;
+        call tb_hdr_bump_version;
+
+        // Bump splits stat.
+        mov  rdi, 0;                 // TB_ST_SPLITS
+        call tb_stats_bump;
+
+        // Return right_new (the newly-added window's leaf index).
+        mov  rax, [rsp + 8];
+        jmp  tb_sp_out;
+
+      tb_sp_enospc_rollback:
+        // Second allocation failed. Return the first one (left_new,
+        // at [rsp+0]) to the free list so ENOSPC does not leak a slot.
+        mov  rdi, rbx;
+        mov  rsi, [rsp + 0];
+        call tb_node_free;
+        // fall through to enospc.
+
+      tb_sp_enospc:
+        mov  rax, 0xFFFFEB7F;        // TB_ERR_ENOSPC
+        jmp  tb_sp_out_refused;
+
+      tb_sp_bad_axis:
+        mov  rax, 0xFFFFEB7C;        // TB_ERR_BAD_AXIS
+        jmp  tb_sp_out_refused;
+
+      tb_sp_bad_ratio:
+        mov  rax, 0xFFFFEB7B;        // TB_ERR_BAD_RATIO
+        jmp  tb_sp_out_refused;
+
+      tb_sp_bad_index:
+        mov  rax, 0xFFFFEB7E;        // TB_ERR_BAD_INDEX
+        jmp  tb_sp_out_refused;
+
+      tb_sp_not_leaf:
+        mov  rax, 0xFFFFEB7D;        // TB_ERR_NOT_LEAF
+
+      tb_sp_out_refused:
+        // Stash error into the local frame's err slot, bump refused
+        // counter, restore error.
+        mov  [rsp + 24], rax;
+        mov  rdi, 3;                 // TB_ST_REFUSED
+        call tb_stats_bump;
+        mov  rax, [rsp + 24];
+
+      tb_sp_out:
+        add  rsp, 40;
+        pop  rbp;
+        pop  r15;
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION N  tiling_bsp_collapse -- remove a leaf, promote sibling.
+  //
+  // tiling_bsp_collapse(tree_base, leaf_idx) -> TB_OK | error.
+  //
+  // Given an existing LEAF at leaf_idx:
+  //   1. If leaf_idx == root_index AND leaf has no parent:
+  //        Free the leaf, set root_index = TB_INDEX_NONE, tree becomes empty.
+  //        (This is the last-window case; caller may want to know about it,
+  //         which the returned TB_OK does not distinguish from ordinary
+  //         collapses -- caller checks tiling_bsp_leaf_count() post-op.)
+  //   2. Else:
+  //        p    = leaf.parent_index
+  //        sib  = the other child of p (whichever != leaf_idx)
+  //        gp   = p.parent_index
+  //
+  //        Copy sib's four payload words into p's slot (preserving p's
+  //        parent_index in the parcnt word's low half).
+  //
+  //        If sib was internal, re-parent its two children so their
+  //        parent_index fields point at p (which now holds sib's payload).
+  //
+  //        If gp == TB_INDEX_NONE, root was p; root still is p (no change).
+  //        Else no header change is needed (p's slot index is unchanged).
+  //
+  //        Free leaf_idx and sib_idx onto the free list.
+  //
+  //        Walk up from p bumping subtree_window_count by -1 on each
+  //        ancestor (we removed one window from the tree).
+  //
+  //        Bump tree_version_seq.
+  // ==========================================================================
+
+  pub let tiling_bsp_collapse : (u64, u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) (leaf_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): remove a leaf and collapse the parent split by promoting the sibling into the parent's slot. Six callee-save pushes (rbx=tree_base, r12=leaf_idx, r13=parent_idx, r14=sib_idx, r15=parent_base, rbp=sib_base) leave rsp%16==8; sub rsp,8 aligns for nested calls. Labels prefixed tb_col_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub  rsp, 8;
+
+        mov  rbx, rdi;
+        mov  r12, rsi;
+
+        // --- Validation ---
+
+        // leaf_idx must be < node_count.
+        mov  rdi, rbx;
+        call tb_hdr_node_count;
+        cmp  r12, rax;
+        jae  tb_col_bad_index;
+
+        // Must actually be a leaf: axis == TB_SPLIT_LEAF(255).
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        call tb_node_axis;
+        cmp  rax, 255;
+        jne  tb_col_not_leaf;
+
+        // Find parent_idx = leaf.parent_index.
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        call tb_node_parent_index;
+        mov  r13, rax;               // r13 = parent_idx
+
+        // If parent is NONE (i.e., leaf is the root), handle "empty out tree".
+        mov  rdi, rbx;
+        call tb_hdr_arena_capacity;
+        cmp  r13, rax;
+        jae  tb_col_root_leaf;
+
+        // --- Determine sibling ---
+
+        // parent_base = tb_node_addr(tree_base, parent_idx)
+        mov  rdi, rbx;
+        mov  rsi, r13;
+        call tb_node_addr;
+        mov  r15, rax;               // r15 = parent_base
+
+        // parent.left_child
+        mov  rdi, r15;
+        call tb_node_left_child;
+        mov  r14, rax;               // r14 = left_child
+
+        // If left_child == leaf_idx, sib = right_child; else sib = left_child.
+        cmp  r14, r12;
+        jne  tb_col_sib_is_left;
+        // sib = right_child
+        mov  rdi, r15;
+        call tb_node_right_child;
+        mov  r14, rax;
+        jmp  tb_col_have_sib;
+
+      tb_col_sib_is_left:
+        // r14 already holds left_child (which != leaf_idx, so it's the sib).
+
+      tb_col_have_sib:
+        // sib_base = tb_node_addr(tree_base, sib_idx)
+        mov  rdi, rbx;
+        mov  rsi, r14;
+        call tb_node_addr;
+        mov  rbp, rax;               // rbp = sib_base
+
+        // --- Promote sibling into parent's slot ---
+        //
+        // Copy sib's four payload words into parent's slot, but preserve
+        // parent's parent_index (in parcnt[31:0]) so the tree topology
+        // above parent stays intact. Concretely:
+        //   parent.axis_den    = sib.axis_den
+        //   parent.wnum        = sib.wnum
+        //   parent.children    = sib.children
+        //   parent.parcnt      = (parent.parent_index [31:0] | sib.subtree_count [63:32])
+        //                        (i.e., parent_index unchanged, count from sib)
+
+        // parent.axis_den = sib.axis_den
+        mov  rax, [rbp + 0];
+        mov  [r15 + 0], rax;
+
+        // parent.wnum = sib.wnum
+        mov  rax, [rbp + 8];
+        mov  [r15 + 8], rax;
+
+        // parent.children = sib.children
+        mov  rax, [rbp + 16];
+        mov  [r15 + 16], rax;
+
+        // parent.parcnt = (parent.parent_index [31:0] | sib.subtree_count [63:32])
+        mov  rax, [r15 + 24];
+        shl  rax, 32;
+        shr  rax, 32;                // rax = parent's own parent_index (unchanged)
+        mov  r10, [rbp + 24];
+        shr  r10, 32;                // r10 = sib.subtree_count
+        shl  r10, 32;                // move to high 32
+        or   rax, r10;
+        mov  [r15 + 24], rax;
+
+        // --- Re-parent sib's children (if any) to point at parent_idx ---
+        //
+        // The child_idx value we read from parent.left_child (or _right)
+        // is passed directly to tb_node_addr via rsi in the same clause;
+        // we do NOT need to preserve it across the call because we only
+        // consume it once (as rsi) and never revisit it -- the returned
+        // child_base is what feeds tb_node_write_parent. That removes
+        // the push/pop dance the earlier draft carried.
+
+        mov  rdi, rbx;
+        call tb_hdr_arena_capacity;
+        mov  r10, rax;               // r10 = arena_capacity
+
+        mov  rdi, r15;
+        call tb_node_left_child;
+        cmp  rax, r10;
+        jae  tb_col_no_lc_reparent;
+
+        // child_idx (rax) -> tb_node_addr -> child_base (rax) -> write_parent.
+        mov  rdi, rbx;
+        mov  rsi, rax;
+        call tb_node_addr;
+        mov  rdi, rax;
+        mov  rsi, r13;               // parent_idx
+        call tb_node_write_parent;
+
+      tb_col_no_lc_reparent:
+        mov  rdi, r15;
+        call tb_node_right_child;
+        cmp  rax, r10;
+        jae  tb_col_no_rc_reparent;
+
+        mov  rdi, rbx;
+        mov  rsi, rax;
+        call tb_node_addr;
+        mov  rdi, rax;
+        mov  rsi, r13;               // parent_idx
+        call tb_node_write_parent;
+
+      tb_col_no_rc_reparent:
+        // --- Free leaf and sib slots ---
+
+        mov  rdi, rbx;
+        mov  rsi, r12;               // leaf_idx
+        call tb_node_free;
+
+        mov  rdi, rbx;
+        mov  rsi, r14;               // sib_idx
+        call tb_node_free;
+
+        // --- Walk up bumping subtree_window_count by -1 on each ancestor ---
+        //
+        // Start from parent_idx's own parent (parent's own count was
+        // overwritten by sib's count above, which already reflects the
+        // post-collapse total for that subtree).
+
+        mov  rdi, r15;
+        call tb_node_parent_index;
+        mov  r13, rax;               // r13 = cursor (ancestor)
+
+        mov  rdi, rbx;
+        call tb_hdr_arena_capacity;
+        mov  r14, rax;               // r14 = arena_capacity
+
+      tb_col_bubble_loop:
+        cmp  r13, r14;
+        jae  tb_col_bubble_done;
+
+        mov  rdi, rbx;
+        mov  rsi, r13;
+        call tb_node_addr;
+        mov  r15, rax;               // r15 = ancestor_base
+
+        mov  rdi, r15;
+        call tb_node_subtree_count;
+        // rax >= 1 by invariant; decrement.
+        cmp  rax, 0;
+        je   tb_col_bubble_step;     // corrupt count -- do not underflow
+        sub  rax, 1;
+        mov  rdi, r15;
+        mov  rsi, rax;
+        call tb_node_write_subtree_count;
+
+      tb_col_bubble_step:
+        mov  rdi, r15;
+        call tb_node_parent_index;
+        mov  r13, rax;
+        jmp  tb_col_bubble_loop;
+
+      tb_col_bubble_done:
+        // Bump version + stats. Return TB_OK.
+        mov  rdi, rbx;
+        call tb_hdr_bump_version;
+
+        mov  rdi, 1;                 // TB_ST_COLLAPSES
+        call tb_stats_bump;
+
+        xor  rax, rax;               // TB_OK
+        jmp  tb_col_out;
+
+      tb_col_root_leaf:
+        // Collapsing the root leaf empties the tree.
+        // Free the leaf slot, set root_index = TB_INDEX_NONE.
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_free;
+
+        // TB_INDEX_NONE in rsi (u32-max, zero-extended).
+        mov  rsi, 0xFFFFFFFF;
+        shl  rsi, 32;
+        shr  rsi, 32;
+        mov  rdi, rbx;
+        call tb_hdr_set_root;
+
+        mov  rdi, rbx;
+        call tb_hdr_bump_version;
+
+        mov  rdi, 1;                 // TB_ST_COLLAPSES
+        call tb_stats_bump;
+
+        xor  rax, rax;               // TB_OK
+        jmp  tb_col_out;
+
+      tb_col_bad_index:
+        mov  rax, 0xFFFFEB7E;        // TB_ERR_BAD_INDEX
+        jmp  tb_col_out_refused;
+
+      tb_col_not_leaf:
+        mov  rax, 0xFFFFEB7D;        // TB_ERR_NOT_LEAF
+
+      tb_col_out_refused:
+        push rax;
+        sub  rsp, 8;
+        mov  rdi, 3;                 // TB_ST_REFUSED
+        call tb_stats_bump;
+        add  rsp, 8;
+        pop  rax;
+
+      tb_col_out:
+        add  rsp, 8;
+        pop  rbp;
+        pop  r15;
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION O  tiling_bsp_walk_ordered -- in-order DFS driving a visitor.
+  //
+  // tiling_bsp_walk_ordered(tree_base, visit_fn)
+  //   -> TB_OK | TB_ERR_STOP_VISITOR
+  //
+  // In-order visitation for a strict binary tree: for each subtree,
+  // visit left subtree in-order, then the node itself, then right
+  // subtree in-order. On a fully-tiled workspace this walks LEAVES
+  // left-to-right in screen order, interleaved with internal-split
+  // nodes for callers that care to observe them.
+  //
+  // visit_fn signature: (tree_base, node_index) -> u64
+  //   returns TB_VISIT_CONTINUE(0) to keep walking, TB_VISIT_STOP(1)
+  //   to short-circuit.
+  //
+  // Indirect call via `call rax` mirrors layer_tree.pdx's dispatcher
+  // shape (vops.pdx precedent) with a single 8-byte alignment pad.
+  //
+  // Uses tb_leftmost_descendant + tb_next_inorder as successor helpers.
+  // ==========================================================================
+
+  // tb_leftmost_descendant(tree_base, node_idx) -> leftmost_leaf_idx.
+  //
+  // Follows left_child links from node_idx until it hits a leaf.
+  pub let tb_leftmost_descendant : (u64, u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) (node_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): descend along left_child pointers to the leftmost leaf. Three callee-save pushes (rbx=tree_base, r12=cursor, r13=arena_cap) leave rsp%16==0 -- aligned for nested calls without an additional sub. Labels prefixed tb_ld_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov  rbx, rdi;
+        mov  r12, rsi;
+
+        mov  rdi, rbx;
+        call tb_hdr_arena_capacity;
+        mov  r13, rax;
+
+      tb_ld_loop:
+        // Bounds check on cursor.
+        cmp  r12, r13;
+        jae  tb_ld_out;
+
+        // Read left_child.
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        call tb_node_left_child;
+        // If left_child is in-range, descend; else this IS the leftmost.
+        cmp  rax, r13;
+        jae  tb_ld_out;
+        mov  r12, rax;
+        jmp  tb_ld_loop;
+
+      tb_ld_out:
+        mov  rax, r12;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // tb_next_inorder(tree_base, cur_idx) -> next_idx | TB_INDEX_NONE.
+  //
+  // In-order successor:
+  //   1. If cur has right_child != NONE, return leftmost(right_child).
+  //   2. Else walk up to the first ancestor whose LEFT child was cur;
+  //      return that ancestor. If we walk past the root, return NONE.
+  pub let tb_next_inorder : (u64, u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) (cur_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): in-order successor via right-subtree-leftmost or walk-up-until-left-child. Four callee-save pushes (rbx=tree_base, r12=cur, r13=arena_cap, r14=prev) + sub rsp, 8 -- entry rsp%16==8; +32 pushes == 8; +8 sub == 0 (aligned for nested calls). Labels prefixed tb_ni_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub  rsp, 8;
+
+        mov  rbx, rdi;
+        mov  r12, rsi;
+
+        mov  rdi, rbx;
+        call tb_hdr_arena_capacity;
+        mov  r13, rax;
+
+        // Bounds check.
+        cmp  r12, r13;
+        jae  tb_ni_end;
+
+        // If right_child != NONE, descend right + leftmost.
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        call tb_node_right_child;
+        cmp  rax, r13;
+        jae  tb_ni_walk_up;
+
+        // Descend into right, then leftmost.
+        mov  rdi, rbx;
+        mov  rsi, rax;
+        call tb_leftmost_descendant;
+        jmp  tb_ni_out;
+
+      tb_ni_walk_up:
+        // Walk up until we find a parent whose LEFT child was our previous cur.
+        // Loop-carried: r12 = current, r14 = prev (starts as r12).
+      tb_ni_up_loop:
+        mov  r14, r12;               // prev = cur
+
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        call tb_node_parent_index;
+        mov  r12, rax;
+        cmp  r12, r13;
+        jae  tb_ni_end;
+
+        // Check parent.left_child == r14 (prev).
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        call tb_node_left_child;
+        cmp  rax, r14;
+        jne  tb_ni_up_loop;
+
+        // Found: r12 is the ancestor whose left child was prev.
+        mov  rax, r12;
+        jmp  tb_ni_out;
+
+      tb_ni_end:
+        mov  rax, 0xFFFFFFFF;
+        shl  rax, 32;
+        shr  rax, 32;                // TB_INDEX_NONE (zero-extended)
+
+      tb_ni_out:
+        add  rsp, 8;
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // tiling_bsp_walk_ordered(tree_base, visit_fn) -> TB_OK | TB_ERR_STOP_VISITOR.
+  pub let tiling_bsp_walk_ordered : (u64, u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) (visit_fn: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): in-order DFS driving a visit_fn via `call rax`. Four callee-save pushes (rbx=tree_base, r12=visit_fn, r13=cur_idx, r14=arena_cap) leave rsp%16==8; sub rsp,8 aligns for nested calls. Empty tree short-circuits to TB_OK. Labels prefixed tb_wo_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov  rbx, rdi;
+        mov  r12, rsi;
+
+        sub  rsp, 8;
+        mov  rdi, rbx;
+        call tb_hdr_arena_capacity;
+        mov  r14, rax;
+        mov  rdi, rbx;
+        call tb_hdr_root_index;
+        add  rsp, 8;
+
+        // Empty tree -> just OK.
+        cmp  rax, r14;
+        jae  tb_wo_ok;
+
+        // Descend to leftmost first node.
+        sub  rsp, 8;
+        mov  rdi, rbx;
+        mov  rsi, rax;
+        call tb_leftmost_descendant;
+        add  rsp, 8;
+        mov  r13, rax;
+
+      tb_wo_loop:
+        cmp  r13, r14;
+        jae  tb_wo_ok;
+
+        // visit_fn(tree_base, r13)
+        sub  rsp, 8;
+        mov  rdi, rbx;
+        mov  rsi, r13;
+        mov  rax, r12;
+        call rax;
+        add  rsp, 8;
+        cmp  rax, 1;
+        je   tb_wo_stopped;
+
+        // Advance via in-order successor.
+        sub  rsp, 8;
+        mov  rdi, rbx;
+        mov  rsi, r13;
+        call tb_next_inorder;
+        mov  r13, rax;
+        add  rsp, 8;
+
+        jmp  tb_wo_loop;
+
+      tb_wo_stopped:
+        // Bump refused counter (visitor short-circuit is a control flow signal,
+        // not a real refusal; but the counter is convenient for observability).
+        sub  rsp, 8;
+        mov  rdi, 2;                 // TB_ST_WALKS (a completed walk still counts)
+        call tb_stats_bump;
+        add  rsp, 8;
+        mov  rax, 0xFFFFEB77;        // TB_ERR_STOP_VISITOR
+        jmp  tb_wo_out;
+
+      tb_wo_ok:
+        sub  rsp, 8;
+        mov  rdi, 2;                 // TB_ST_WALKS
+        call tb_stats_bump;
+        add  rsp, 8;
+        xor  rax, rax;               // TB_OK
+
+      tb_wo_out:
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION P  tiling_bsp_leaf_geometry -- compute a leaf's rectangle.
+  //
+  // tiling_bsp_leaf_geometry(tree_base, leaf_idx, container_xy,
+  //                          container_wh, out_ptr)
+  //   -> TB_OK | error
+  //
+  // container_xy: packed (x[31:0] | y[63:32]) of the workspace's outer
+  //               rectangle.
+  // container_wh: packed (w[31:0] | h[63:32]) of the workspace's outer
+  //               rectangle.
+  // out_ptr:      16-byte buffer receiving:
+  //               *out_ptr       = packed (leaf_x | leaf_y)
+  //               *(out_ptr + 8) = packed (leaf_w | leaf_h)
+  //
+  // Algorithm: recursive descent from the node up to the root, then
+  // apply each split (root-down) to progressively narrow the container
+  // rect. Recursion depth <= tree depth <= 32 (bounded by
+  // TB_MAX_NODES); each frame is small (5 pushes + 8-byte align).
+  // ==========================================================================
+
+  // tb_leaf_geom_recur(tree_base, node_idx, container_xy, container_wh, out_ptr) -> ().
+  //
+  // Recurses to the root writing container_xy/container_wh into *out_ptr
+  // and *(out_ptr+8), then unwinds applying each ancestor's split.
+  pub let tb_leaf_geom_recur : (u64, u64, u64, u64, u64) -> () !{mem} @{} =
+    fn (tree_base: u64) (node_idx: u64) (container_xy: u64) (container_wh: u64)
+       (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): recursive geometry compute. Five callee-save pushes (rbx=tree_base, r12=node_idx, r13=container_xy, r14=container_wh, r15=out_ptr) + sub rsp, 32 -- entry rsp%16==8; +40 pushes == 0; +32 sub == 0 (aligned). Fixed local frame: [rsp+0]=parent_base, [rsp+8]=is_left, [rsp+16]=parent_idx, [rsp+24]=alignment padding. Base case (parent >= arena_cap): writes container_xy / container_wh to *out_ptr / *(out_ptr+8). Recursive case: computes parent's rect via a recursive self-call, then reads (px, py, pw, ph) back from *out_ptr, computes the split (horizontal or vertical) with px * ratio_num / ratio_den arithmetic (imul + unsigned div), selects the (left/top) or (right/bottom) half based on is_left, and writes the new rect back to *out_ptr. Recursion depth <= TB_MAX_NODES(64). Labels prefixed tb_lgr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 32;
+
+        mov  rbx, rdi;
+        mov  r12, rsi;
+        mov  r13, rdx;
+        mov  r14, rcx;
+        mov  r15, r8;
+
+        // parent_idx = node.parent_index
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        call tb_node_parent_index;
+        mov  [rsp + 16], rax;
+
+        // arena_cap for base-case comparison.
+        mov  rdi, rbx;
+        call tb_hdr_arena_capacity;
+        // rax = arena_cap
+
+        mov  r10, [rsp + 16];        // r10 = parent_idx
+        cmp  r10, rax;
+        jb   tb_lgr_recurse;
+
+        // Base case: node is root -- write container verbatim.
+        mov  [r15 + 0], r13;
+        mov  [r15 + 8], r14;
+        jmp  tb_lgr_out;
+
+      tb_lgr_recurse:
+        // Recursive call: tb_leaf_geom_recur(tree, parent_idx, xy, wh, out).
+        mov  rdi, rbx;
+        mov  rsi, r10;               // parent_idx
+        mov  rdx, r13;
+        mov  rcx, r14;
+        mov  r8,  r15;
+        call tb_leaf_geom_recur;
+
+        // After recursion, *out_ptr = parent's (xy, wh).
+        //
+        // Recompute parent_base into [rsp+0]. r12 (node_idx) is preserved
+        // (callee-save); parent_idx is in [rsp+16] (stashed pre-recursion).
+        mov  r10, [rsp + 16];
+        mov  rdi, rbx;
+        mov  rsi, r10;
+        call tb_node_addr;
+        mov  [rsp + 0], rax;
+
+        // is_left = (parent.left_child == node_idx)?
+        mov  rdi, [rsp + 0];
+        call tb_node_left_child;
+        cmp  rax, r12;
+        jne  tb_lgr_is_right;
+        mov  rax, 1;
+        jmp  tb_lgr_have_side;
+      tb_lgr_is_right:
+        xor  rax, rax;
+      tb_lgr_have_side:
+        mov  [rsp + 8], rax;         // [rsp+8] = is_left (0 or 1)
+
+        // Read parent's axis / ratio_num / ratio_den into scratch regs.
+        mov  rdi, [rsp + 0];
+        call tb_node_axis;
+        mov  rcx, rax;               // rcx = axis
+
+        mov  rdi, [rsp + 0];
+        call tb_node_ratio_num;
+        mov  r8, rax;                // r8 = ratio_num
+
+        mov  rdi, [rsp + 0];
+        call tb_node_ratio_den;
+        mov  r9, rax;                // r9 = ratio_den
+
+        // Unpack parent (px, py, pw, ph) from *out_ptr.
+        mov  rax, [r15 + 0];         // parent_xy packed
+        mov  rdx, [r15 + 8];         // parent_wh packed
+
+        mov  rdi, rax;
+        shl  rdi, 32;
+        shr  rdi, 32;                // rdi = px
+
+        mov  rsi, rax;
+        shr  rsi, 32;                // rsi = py
+
+        mov  r10, rdx;
+        shl  r10, 32;
+        shr  r10, 32;                // r10 = pw
+
+        mov  r11, rdx;
+        shr  r11, 32;                // r11 = ph
+
+        // Branch on axis.
+        cmp  rcx, 0;                 // TB_SPLIT_HORIZONTAL
+        je   tb_lgr_horiz;
+        // Fall through to VERTICAL.
+
+        // --- VERTICAL split ---
+        // top_h = ph * ratio_num / ratio_den
+        //   is_left (top):    (px, py,          pw, top_h)
+        //   is_right (bot):   (px, py + top_h,  pw, ph - top_h)
+        mov  rax, r11;               // rax = ph
+        imul rax, r8;                // rax = ph * ratio_num (fits in 64 bits for realistic screen coords)
+        xor  rdx, rdx;
+        div  r9;                     // rax = top_h  (rdx = remainder, discarded)
+
+        mov  rcx, [rsp + 8];         // rcx = is_left
+        cmp  rcx, 1;
+        je   tb_lgr_vert_top;
+
+        // Bottom half.
+        add  rsi, rax;               // py += top_h
+        sub  r11, rax;               // ph -= top_h
+        jmp  tb_lgr_write;
+
+      tb_lgr_vert_top:
+        // Top half.
+        mov  r11, rax;               // ph = top_h
+        jmp  tb_lgr_write;
+
+      tb_lgr_horiz:
+        // --- HORIZONTAL split ---
+        // left_w = pw * ratio_num / ratio_den
+        //   is_left (left):   (px,           py, left_w,       ph)
+        //   is_right (right): (px + left_w,  py, pw - left_w,  ph)
+        mov  rax, r10;               // rax = pw
+        imul rax, r8;                // rax = pw * ratio_num
+        xor  rdx, rdx;
+        div  r9;                     // rax = left_w
+
+        mov  rcx, [rsp + 8];         // rcx = is_left
+        cmp  rcx, 1;
+        je   tb_lgr_horiz_left;
+
+        // Right half.
+        add  rdi, rax;               // px += left_w
+        sub  r10, rax;               // pw -= left_w
+        jmp  tb_lgr_write;
+
+      tb_lgr_horiz_left:
+        // Left half.
+        mov  r10, rax;               // pw = left_w
+
+      tb_lgr_write:
+        // Pack (px | py << 32) -> out_ptr[0], (pw | ph << 32) -> out_ptr[8].
+        shl  rdi, 32;
+        shr  rdi, 32;
+        mov  rcx, rsi;
+        shl  rcx, 32;
+        or   rdi, rcx;
+        mov  [r15 + 0], rdi;
+
+        shl  r10, 32;
+        shr  r10, 32;
+        mov  rcx, r11;
+        shl  rcx, 32;
+        or   r10, rcx;
+        mov  [r15 + 8], r10;
+
+      tb_lgr_out:
+        add  rsp, 32;
+        pop  r15;
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // tiling_bsp_leaf_geometry(tree_base, leaf_idx, container_xy, container_wh,
+  //                          out_ptr) -> TB_OK | error.
+  //
+  // Args (SysV): rdi=tree_base, rsi=leaf_idx, rdx=container_xy,
+  //              rcx=container_wh, r8=out_ptr.
+  //
+  // ALL five args are stashed into callee-save regs at entry BEFORE any
+  // nested call so validation clobbers of rdx/rcx/r8 do not lose the
+  // container arguments. Only after validation succeeds do we hand
+  // (tree_base, leaf_idx, container_xy, container_wh, out_ptr) back to
+  // tb_leaf_geom_recur.
+  pub let tiling_bsp_leaf_geometry : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) (leaf_idx: u64) (container_xy: u64) (container_wh: u64)
+       (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): stash all five args into callee-save regs (rbx=tree_base, r12=leaf_idx, r13=container_xy, r14=container_wh, r15=out_ptr) at entry, validate leaf_idx (bounds + axis == LEAF), then delegate to tb_leaf_geom_recur. Entry rsp%16==8; 5 pushes leave rsp%16==8; sub rsp,8 aligns for every nested call. Labels prefixed tb_lg_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov  rbx, rdi;
+        mov  r12, rsi;
+        mov  r13, rdx;
+        mov  r14, rcx;
+        mov  r15, r8;
+
+        // Validate leaf_idx < node_count. 5 pushes leave rsp%16==0
+        // (aligned); no sub 8 around calls needed.
+        mov  rdi, rbx;
+        call tb_hdr_node_count;
+        cmp  r12, rax;
+        jae  tb_lg_bad_index;
+
+        // Validate the node is a leaf.
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        call tb_node_axis;
+        cmp  rax, 255;
+        jne  tb_lg_not_leaf;
+
+        // Delegate: tb_leaf_geom_recur(tree_base, leaf_idx, xy, wh, out).
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        mov  rdx, r13;
+        mov  rcx, r14;
+        mov  r8,  r15;
+        call tb_leaf_geom_recur;
+
+        xor  rax, rax;               // TB_OK
+        jmp  tb_lg_out;
+
+      tb_lg_bad_index:
+        mov  rax, 0xFFFFEB7E;        // TB_ERR_BAD_INDEX
+        jmp  tb_lg_out_refused;
+
+      tb_lg_not_leaf:
+        mov  rax, 0xFFFFEB7D;        // TB_ERR_NOT_LEAF
+
+      tb_lg_out_refused:
+        // Stash error into r15 (its arg role is done) across the stats bump
+        // -- push/pop with alignment breaks parity, and a callee-save reg
+        // trip preserves the value cleanly.
+        mov  r15, rax;
+        mov  rdi, 3;                 // TB_ST_REFUSED
+        call tb_stats_bump;
+        mov  rax, r15;
+
+      tb_lg_out:
+        pop  r15;
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION Q  tiling_bsp_leaf_count -- fast root-count read.
+  //
+  // tiling_bsp_leaf_count(tree_base) -> u32.
+  //
+  // Returns the total number of leaves (== windows) in the tree by
+  // reading the root's subtree_window_count. For an empty tree,
+  // returns 0.
+  // ==========================================================================
+
+  pub let tiling_bsp_leaf_count : (u64) -> u64 !{mem} @{} =
+    fn (tree_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): leaf count = root.subtree_window_count. Empty tree -> 0. Three callee-save pushes (rbx=tree_base, r12=root_idx, r13=arena_cap) leave rsp%16==0 -- aligned for nested calls without an additional sub. Labels prefixed tb_lc_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov  rbx, rdi;
+
+        mov  rdi, rbx;
+        call tb_hdr_root_index;
+        mov  r12, rax;
+
+        mov  rdi, rbx;
+        call tb_hdr_arena_capacity;
+        mov  r13, rax;
+
+        // Empty tree if root_index >= arena_capacity (TB_INDEX_NONE case).
+        cmp  r12, r13;
+        jae  tb_lc_empty;
+
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call tb_node_addr;
+        mov  rdi, rax;
+        call tb_node_subtree_count;
+        jmp  tb_lc_out;
+
+      tb_lc_empty:
+        xor  rax, rax;
+
+      tb_lc_out:
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION R  Stats + init.
+  // ==========================================================================
+
+  pub let tb_stats_bump : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): bounds-checked counter bump against TB_ST_REFUSED+1=4. Load-inc-store idiom (no `add reg, [mem]`). Labels prefixed tb_sb_.",
+      block: {
+        cmp rdi, 4;
+        jae tb_sb_out;
+        lea r10, [rip + _tiling_bsp_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      tb_sb_out:
+        ret
+      }
+    }
+
+  pub let tb_stats_read : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): bounds-checked counter read; OOB -> 0. Labels prefixed tb_sr_.",
+      block: {
+        cmp rdi, 4;
+        jae tb_sr_zero;
+        lea r10, [rip + _tiling_bsp_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      tb_sr_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // tiling_bsp_init(): zero arena pool, alloc bits, stats. Defensive
+  // re-scrub; .bss is already zero at real boot. Mirrors lt_init.
+  pub let tiling_bsp_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B8-08 (paideia-os #2291): zero _tiling_bsp_arenas (1040 u64), _tiling_bsp_alloc_bits (4 u64), _tiling_bsp_stats (4 u64). Defensive; .bss is already zero at real boot. Labels prefixed tb_ini_.",
+      block: {
+        lea r10, [rip + _tiling_bsp_arenas];
+        xor rax, rax;
+        xor rcx, rcx;
+      tb_ini_arenas:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 1040;
+        jb  tb_ini_arenas;
+
+        lea r10, [rip + _tiling_bsp_alloc_bits];
+        xor rcx, rcx;
+      tb_ini_alloc:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  tb_ini_alloc;
+
+        lea r10, [rip + _tiling_bsp_stats];
+        xor rcx, rcx;
+      tb_ini_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  tb_ini_stats;
+        ret
+      }
+    }
+}

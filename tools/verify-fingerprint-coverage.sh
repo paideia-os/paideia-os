@@ -994,6 +994,37 @@ ALLOWLIST = {
     "recovery plane takeover ok [legacy: RECOVERY PLANE TAKEOVER OK]":
         "Wave0-B7 G7-M6-002 (#2270): recovery_plane_takeover extends "
         "#2269 with RIGHT_TAKEOVER; input-server-side takeover not yet booted.",
+
+    # ------------------------------------------------------------------
+    # Wave 0 Batch 8 — G8/G9/G10/G11/G12 M1 leads + downstream fan-out.
+    # Data-only meta decls in cap modules whose dispatchers land with
+    # the future wire-body milestone.
+    # ------------------------------------------------------------------
+    "input server main ok [legacy: INPUT SERVER MAIN OK]":
+        "Wave0-B8 G8-M1-001 (#2274): input_server (KIND_INPUT_SERVER=0x1D0, "
+        "matches B6-09 forward reservation) data-only decl; kernel dispatcher "
+        "not yet wired.",
+    "workspace mint ok [legacy: WORKSPACE MINT OK]":
+        "Wave0-B8 G9-M1-001 (#2288): workspace_kind (KIND_WORKSPACE=0x1D2) "
+        "data-only decl; kernel dispatcher not yet wired.",
+    "pdx kind a11y tree meta [legacy: A11Y TREE META OK]":
+        "Wave0-B8 G10-M1-001 (#2302): a11y_tree (KIND_A11Y_TREE=0x1D3) "
+        "data-only decl; kernel dispatcher not yet wired.",
+    "ime session mint ok [legacy: IME SESSION MINT OK]":
+        "Wave0-B8 G11-M1-001 (#2314): ime_session LINEAR "
+        "(KIND_IME_SESSION=0x1D4) data-only decl; kernel dispatcher not yet wired.",
+    "ui context mint ok [legacy: UI CONTEXT MINT OK]":
+        "Wave0-B8 G12-M1-001 (#2326): ui_context (KIND_UI_CONTEXT=0x1D5) "
+        "data-only decl; kernel dispatcher + toolkit runtime not yet wired.",
+    "seat mint ok [legacy: SEAT MINT OK]":
+        "Wave0-B8 G8-M5-001 (#2285): seat_kind (KIND_SEAT=0x1D6) "
+        "data-only decl; kernel dispatcher not yet wired.",
+    "input route mint ok [legacy: INPUT ROUTE MINT OK]":
+        "Wave0-B8 G8-M2-001 (#2277): route_kind LINEAR "
+        "(KIND_INPUT_ROUTE=0x1D7) data-only decl; kernel dispatcher not yet wired.",
+    "pdx kind tiling bsp meta [legacy: TILING BSP META OK]":
+        "Wave0-B8 G9-M2-001 (#2291): tiling_bsp value-type module; "
+        "no KIND cap; consumer (workspace tiling) emits at wire-body land.",
 }
 
 # Below these counts the extractor has stopped matching rather than the
