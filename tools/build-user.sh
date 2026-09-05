@@ -325,6 +325,32 @@ while IFS= read -r -d '' pdx; do
         LIBS_OBJECTS+=("${obj}")
         SHELL_OBJECTS+=("${obj}")
         INIT_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == a11y/*         ]] \
+      || [[ "${rel}" == compositor/*   ]] \
+      || [[ "${rel}" == color/*        ]] \
+      || [[ "${rel}" == ime/*          ]] \
+      || [[ "${rel}" == input_server/* ]] \
+      || [[ "${rel}" == libpaideia_ui/* ]]; then
+        # paideia-os #2344 fix: keep future-subsystem library objects OUT
+        # of shell.elf so it stays small enough to fit through the execve
+        # pipeline. Each of these directories is a library/subsystem
+        # scaffold (a11y, compositor, color, ime, input_server, ui) whose
+        # eventual owning binary has NOT landed yet. Before this branch
+        # every one of these .pdx files fell through into the `else`
+        # catch-all below and was force-linked into shell.elf via
+        # SHELL_OBJECTS, dragging its rodata tables (screen_reader queues,
+        # HLG transform tables, tiling BSP arenas, view-tree pools, ...)
+        # into every boot. Shell.elf ballooned to 316 KiB — an order of
+        # magnitude past EXECVE_IMAGE_MAX (65,536) and past tmpfs's
+        # per-file 64 KiB cap — so bin_sh_seed truncated the image AND
+        # sys_execve_shim would have refused it with -E2BIG anyway, and
+        # init's second cycle emitted "INIT FORK SH FAIL" as the child's
+        # execve returned. Objects still compile (build discipline
+        # unchanged) but do not link into any binary until their owning
+        # image scaffold lands — matches the aml/ pattern above (built
+        # into libaml.a, consumed only by acpi_supervisor). No new object
+        # set needed at this point; they are simply not linked yet.
+        :
     else
         SHELL_OBJECTS+=("${obj}")
     fi
@@ -377,6 +403,20 @@ echo "[verify-exec-child] fork/execve/wait4 for R17.M3-005 — fork+execve+wait4
 
 echo "[verify-path-resolve] /bin/ prefix path resolution for R17.M3-006 — resolve_path + exec_child wiring"
 "${REPO_ROOT}/tools/verify-user-path-resolve.sh" "${BUILD_DIR}/shell.elf"
+
+# paideia-os #2344: strip .symtab + .strtab from shell.elf AFTER every
+# verify-user-*.sh has run against it (they use nm / objdump -d / -t and
+# need the symbol tables). userbin_embed.S uses `.incbin "build/user/
+# shell.elf"` -- the *whole file* -- so any bytes past the last PT_LOAD
+# segment are still fed to sys_execve_shim, which copies them into
+# _execve_image_scratch and caps at EXECVE_IMAGE_MAX (65,536). Debug /
+# symbol sections were adding ~190 KiB of dead weight on top of the
+# loadable payload, so init's second fork+exec cycle for /bin/sh hit
+# -E2BIG (or bin_sh_seed truncated at tmpfs's 64 KiB per-file cap) and
+# emitted "INIT FORK SH FAIL". Every other user ELF is already tiny, so
+# no equivalent strip is needed for them.
+echo "[strip-user] objcopy --strip-all shell.elf"
+objcopy --strip-all "${BUILD_DIR}/shell.elf"
 
 echo "[ok] ${BUILD_DIR}/shell.elf"
 echo "[ok] ${BUILD_DIR}/shell.bin"
