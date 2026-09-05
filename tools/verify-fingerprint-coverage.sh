@@ -1290,6 +1290,23 @@ ALLOWLIST = {
         "Wave0-B12 G10-M4-002 (#2312): keynav_focus_ring 4-strip painter + "
         "Ctrl+H/L/M/N skip-link; compositor key-event dispatch pending.",
 
+    # src/user/init.pdx — R106.M2 (paideia-os #2229): witness that init
+    # composed and installed the fingerprint-shaped envp HOME entry
+    # ("HOME=/home/<64-hex-placeholder>/", sourced from
+    # FounderConstants.fc_placeholder_home_path, src/user/
+    # founder_constants.pdx, R106.M1 #2228) in place of the R65v2
+    # hardcoded "HOME=/home/operator". Fires unconditionally on every
+    # boot -- no branch gates it -- but no golden file pins this exact
+    # literal yet. Retires from this allowlist once a boot smoke (R106.M5
+    # boot_r106_persistent_home, or an earlier regression check for the
+    # M2 retargeting itself) asserts it.
+    "init home envp ok [legacy: INIT HOME ENVP OK]":
+        "Wave0-B15 R106-M2 (paideia-os #2229): init's HOME-envp "
+        "composition fingerprint fires every boot unconditionally; no "
+        "golden pins this exact literal yet -- assertable once an "
+        "R106 boot smoke (M5 boot_r106_persistent_home or an earlier "
+        "M2 regression check) lands.",
+
     # ------------------------------------------------------------------
     # Wave 0 Batch 14 — G10-M3-001 compositor a11y elaboration gate.
     # Data-only meta decl; gate consumer path (window_kind mint) not
@@ -1335,6 +1352,133 @@ ALLOWLIST = {
         "`ui context mint ok` / `window mint ok` data-only decls; "
         "retires when a boot witness or the syntax-highlighting/BiDi-"
         "caret follow-up (#2338) wires a real call path.",
+    "editor render init ok [legacy: EDITOR RENDER INIT OK]":
+        "Wave0-B15 G12-M4-002 (paideia-os #2338): samples/editor/render "
+        "syntax-highlight render loop + BiDi caret navigation over "
+        "KIND_EDITOR_BUFFER (0x1E5, buffer.pdx #2337) and bidi_caret.pdx "
+        "(#2324) data-only fingerprint. editor_render_frame / editor_"
+        "render_tokenize_range / editor_render_caret_left/right/home/"
+        "end/up/down bodies are real and self-contained, painting "
+        "through widgets.pdx's widget_paint_rect placeholder sink same "
+        "as samples/clock/analog.pdx, but no sample-app dispatcher "
+        "calls editor_render_init yet, so the marker never reaches a "
+        "boot log. Same posture as the sibling `editor buffer init ok` "
+        "data-only decl.",
+
+    # ------------------------------------------------------------------
+    # Wave 0 Batch 15 — R106.M4-USER shell tokenizer tilde-alias support.
+    # Data-only meta decl; dispatch-time wiring not yet present.
+    # ------------------------------------------------------------------
+    "tokenizer tilde alias ok [legacy: TOKENIZER TILDE ALIAS OK]":
+        "Wave0-B15 R106-M4-USER (paideia-os #2342): src/user/tokenizer.pdx "
+        "TOK_TILDE_ALIAS token-kind support -- tokenize() now recognizes a "
+        "leading '~' at a token START position and scans it plus a "
+        "following alnum/'_' run into its own token kind (argv_types[i] "
+        "parallel array), with argv_buf's entry pointing at the NUL-"
+        "terminated alias name. tokenizer_resolve_alias(name_ptr, "
+        "name_len) is a real, self-contained stub (empty name -> "
+        "HOME_MARKER, any other name -> E_ALIAS_UNRESOLVED == "
+        "TTA_ALIAS_UNRESOLVED 0xFFFFE93D), but no dispatcher calls it and "
+        "no boot witness emits this marker yet -- that lands with #2231's "
+        "dispatch.pdx wiring (R108.M4 for the real KIND_USER_ALIAS "
+        "resolution). Same posture as the sibling `editor buffer init ok` "
+        "/ `clock timezone ready ok` data-only decls.",
+    "dispatch from tokenizer ok [legacy: DISPATCH FROM TOKENIZER OK]":
+        "Wave0-B15 R106-M4-KERNEL (paideia-os #2231): src/user/dispatch.pdx "
+        "dispatch_from_tokenizer_stream fixed-shape token-record entry "
+        "point (opcode u64 + arg_count u64 + arg_ptrs[8] u64, "
+        "DFT_REC_SIZE=80) added alongside the existing string-based "
+        "dispatch_line path -- dispatch_line and every builtin are "
+        "unmodified. Body is real and self-contained: guard cascade "
+        "(DFT_NULL/DFT_NOT_INIT/DFT_ARG_COUNT_OUT_OF_RANGE/"
+        "DFT_OPCODE_INVALID/DFT_REFUSED_DENSE), cd's own granular "
+        "E_CD_NO_ARG/DFT_CD_NOT_A_DIR/DFT_CD_NOT_FOUND error path (bare "
+        "`cd` distinguished from a generic dispatch failure), and a "
+        "generic bridge into the unmodified echo/exit/pwd/help/env/clear "
+        "builtins plus exec_child for external commands. The fingerprint "
+        "fires on every accepted record, but no caller constructs a "
+        "record yet -- shell.pdx still calls dispatch_line exclusively. "
+        "A real caller lands with the #2342 tokenizer's own dispatch "
+        "integration. Same posture as the sibling `tokenizer tilde "
+        "alias ok` data-only-for-now decl.",
+
+    # src/user/color/tone_map.pdx -- Wave0-B15 G6-M2-002 (paideia-os
+    # #2239) reference HDR->SDR tone-mapping curves (Hable filmic +
+    # classic/extended Reinhard). Data-only + pure-computation: every
+    # entry point (tone_map_hable, tone_map_reinhard, tone_map_reinhard_
+    # extended, tone_map_curve_select) is real and self-contained, but
+    # the paint-pipeline consumer that would actually walk a frame's HDR
+    # luminance through one of these curves on the way to an SDR sink is
+    # a future landing -- no boot witness or dispatcher calls any entry
+    # point yet, so the marker never reaches a boot log. Same posture as
+    # the sibling `editor buffer init ok` / `clock timezone ready ok` /
+    # `tokenizer tilde alias ok` data-only decls immediately above.
+    "tone map init ok [legacy: TONE MAP INIT OK]":
+        "Wave0-B15 G6-M2-002 (paideia-os #2239): tone_map.pdx's Hable/"
+        "Reinhard curve entry points are real and self-contained, but "
+        "the paint-pipeline HDR->SDR consumer wire is a future landing "
+        "-- no caller reaches this data-only fingerprint yet. Same "
+        "posture as the sibling `editor buffer init ok` decl above.",
+
+    # src/user/color/bt2100_gamut.pdx -- Wave0-B15 G6-M2-001 (paideia-os
+    # #2241) BT.2100 RGB<->XYZ + D65<->D50 Bradford chromatic-adaptation
+    # matrix constants and matrix-vector-multiply helpers
+    # (bt2100_rgb_to_xyz / bt2100_xyz_to_rgb / bt2100_bradford_d65_to_d50
+    # / bt2100_bradford_d50_to_d65 / bt2100_bradford_adapt /
+    # bt2100_matrix_cell). Data-only + pure-computation: every entry
+    # point is real and self-contained, but the compositor paint
+    # pipeline and HDR settings panel consumer wires are future
+    # landings -- no boot witness or dispatcher calls any entry point
+    # yet, so the marker never reaches a boot log. Same posture as the
+    # sibling `tone map init ok` / `editor buffer init ok` data-only
+    # decls immediately above.
+    "bt2100 gamut init ok [legacy: BT2100 GAMUT INIT OK]":
+        "Wave0-B15 G6-M2-001 (paideia-os #2241): bt2100_gamut.pdx's "
+        "RGB<->XYZ + Bradford chromatic-adaptation entry points are "
+        "real and self-contained, but the compositor paint pipeline / "
+        "HDR settings panel consumer wires are future landings -- no "
+        "caller reaches this data-only fingerprint yet. Same posture "
+        "as the sibling `tone map init ok` decl above.",
+
+    # src/samples/clock/vello_face.pdx -- Wave0-B15 G12-M3-002 (paideia-os
+    # #2335): Vello-style analog clock face sample, a sibling to clock/
+    # analog.pdx's software-raster placeholder. `vello_face_main` mints
+    # KIND_UI_CONTEXT, builds a 46-record Vello-shape path-command
+    # stream (SET_TRANSFORM + 12 tick marks + 3 hands) into a fixed
+    # 4KiB ring buffer, brackets one begin/end_frame, and returns --
+    # paint-once, no GPU submission. `pdx_kind_vello_face_meta` is a
+    # data-only fingerprint (same posture as `clock analog ready ok` /
+    # `clock timezone ready ok` above); no boot witness or klog wire
+    # emits it yet. Retires when a boot witness exercises vello_face_
+    # main end-to-end, or when the R37 GPU-context consumer that drains
+    # this command stream lands and asserts against it directly.
+    "vello face ready ok [legacy: VELLO FACE READY OK]":
+        "Wave0-B15 G12-M3-002 (paideia-os #2335): Vello-style command-"
+        "stream clock face sample (46-record path stream: transform + "
+        "12 ticks + 3 hands over a 4KiB ring); no boot witness or R37 "
+        "GPU-context consumer wired yet, same posture as the sibling "
+        "`clock analog ready ok` / `clock timezone ready ok` entries.",
+
+    # src/samples/settings/ime.pdx -- Wave0-B15 G12-M3-002 (paideia-os
+    # #2333): fine-grained IME settings sub-panel, a sibling of settings/
+    # input.pdx / display.pdx / color.pdx but decomposed into 9 named
+    # per-widget builder functions (provider, candidate-window style,
+    # learning toggle + history depth, hotkey mode + read-only label,
+    # dictionary-language bitmask, reset). ime_settings_load / _save /
+    # _render / ime_settings_layout_precheck (panel-level LINEAR atomic
+    # layout gate) and all 9 ime_widget_* builders are real and self-
+    # contained, but the settings-service tab dispatcher that would call
+    # settings_ime_main on a real KIND_WINDOW/KIND_SURFACE pair is a
+    # future G12.M4 landing -- no boot witness or klog wire emits this
+    # marker yet. Same posture as the sibling `settings input ready ok`
+    # / `settings color ready ok` data-only decls above.
+    "settings ime ready ok [legacy: SETTINGS IME READY OK]":
+        "Wave0-B15 G12-M3-002 (paideia-os #2333): 9-widget fine-grained "
+        "IME settings sub-panel (provider/window-style/learning/history-"
+        "depth/hotkey-mode/hotkey-label/dict-languages/reset), decomposed "
+        "into one named builder function per row; settings-service klog "
+        "wire pending G12.M4, same posture as the sibling `settings "
+        "input ready ok` / `settings color ready ok` entries.",
 }
 
 # Below these counts the extractor has stopped matching rather than the
