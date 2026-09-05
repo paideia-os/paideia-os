@@ -982,6 +982,22 @@ ALLOWLIST = {
     "xdg popup mint ok [legacy: XDG POPUP MINT OK]":
         "Wave0-B7 G7-M4-003 (#2265): xdg_shell_popup (KIND=0x1C5) "
         "data-only decl; kernel dispatcher not yet wired.",
+
+    # src/user/compositor/popup_positioning.pdx -- Wave0-B14 G7-M8-006
+    # (paideia-os #2264). #2264 is a byte-identical duplicate filing of
+    # the already-closed #2265 (xdg_shell_popup.pdx, immediately
+    # above); this landing closes the duplicate with a distinct,
+    # additive capability (KIND_POPUP_POSITIONER = 0x1C3, a LINEAR
+    # atomic-mint positioner) rather than re-implementing #2265's row.
+    # Same "data-only fingerprint" posture as the sibling `bidi caret
+    # init ok` entry (Wave0-B13 G11-M5-001, #2324): no kernel
+    # dispatcher exists yet to call popup_positioner_mint.
+    "popup positioner init ok [legacy: POPUP POSITIONER INIT OK]":
+        "Wave0-B14 G7-M8-006 (paideia-os #2264): popup_positioning "
+        "(KIND_POPUP_POSITIONER=0x1C3) data-only decl; kernel "
+        "dispatcher not yet wired. #2264 duplicates closed issue "
+        "#2265 (xdg_shell_popup.pdx); this row is additive, not a "
+        "re-implementation.",
     "dnd offer mint ok [legacy: DND OFFER MINT OK]":
         "Wave0-B7 G7-M5-002 (#2267): dnd_offer sealed cap (KIND=0x1C7) "
         "data-only decl; kernel dispatcher not yet wired.",
@@ -1010,6 +1026,12 @@ ALLOWLIST = {
     "pdx kind a11y tree meta [legacy: A11Y TREE META OK]":
         "Wave0-B8 G10-M1-001 (#2302): a11y_tree (KIND_A11Y_TREE=0x1D3) "
         "data-only decl; kernel dispatcher not yet wired.",
+    "a11y node init ok [legacy: A11Y NODE INIT OK]":
+        "Wave0-B14 G10-M1-002 (#2303): kind_a11y_node (KIND_A11Y_NODE=0x1E2) "
+        "LINEAR cap, data-only decl; mint/attach_child/detach are schema-only "
+        "stubs (no row-pool substrate yet), so no code path can reach a real "
+        "mint success tail. Emitted once the future substrate wires "
+        "klog_s1_x1 into a11y_node_mint's success arm.",
     "ime session mint ok [legacy: IME SESSION MINT OK]":
         "Wave0-B8 G11-M1-001 (#2314): ime_session LINEAR "
         "(KIND_IME_SESSION=0x1D4) data-only decl; kernel dispatcher not yet wired.",
@@ -1267,6 +1289,52 @@ ALLOWLIST = {
     "pdx kind keynav focus ring meta [legacy: KEYNAV FOCUS RING META OK]":
         "Wave0-B12 G10-M4-002 (#2312): keynav_focus_ring 4-strip painter + "
         "Ctrl+H/L/M/N skip-link; compositor key-event dispatch pending.",
+
+    # ------------------------------------------------------------------
+    # Wave 0 Batch 14 — G10-M3-001 compositor a11y elaboration gate.
+    # Data-only meta decl; gate consumer path (window_kind mint) not
+    # yet wired.
+    # ------------------------------------------------------------------
+    "a11y elaboration gate init ok [legacy: A11Y ELABORATION GATE INIT OK]":
+        "Wave0-B14 G10-M3-001 (#2307): elaboration_gate STRICT/PERMISSIVE "
+        "policy gate + one-way latch over the P4 a11y-subtree invariant; "
+        "gate consumer path (window_kind.pdx mint) not yet wired -- lands "
+        "with G10-M3-002.",
+    "a11y mutation log init ok [legacy: A11Y MUTATION LOG INIT OK]":
+        "Wave0-B14 G10-M2-001 (paideia-os #2304): mutation_log per-frame "
+        "a11y-subtree mutation ring buffer (KIND_A11Y_MUTATION_LOG=0x1E4, "
+        "derived over KIND_A11Y_TREE=0x1D3) data-only decl; mint/append/"
+        "commit/consume bodies are real and self-contained but no "
+        "compositor dispatcher calls mutation_log_mint yet.",
+    "window geometry init ok [legacy: WINDOW GEOMETRY INIT OK]":
+        "Wave0-B14 G7-M8-005 (paideia-os #2263): window_geometry LINEAR "
+        "cap (KIND_WINDOW_GEOMETRY=0x1CA, derived over KIND_WINDOW=0x1C1; "
+        "renumbered from 0x1C3 post-race with popup_positioning #2264) "
+        "data-only fingerprint posture, same as siblings; mint/apply "
+        "bodies are real and self-contained but no cap_invoke_dispatch "
+        "wiring calls window_geometry_mint yet.",
+    "clock timezone ready ok [legacy: CLOCK TIMEZONE READY OK]":
+        "Wave0-B14 G12-M3-002alt (paideia-os #2336): samples/clock/"
+        "timezone world-clock sample application (KIND_UI_CONTEXT "
+        "consumer at slot 0x1D5) data-only fingerprint; twelve-zone "
+        "retained-mode list (view_tree + retained_widgets factories) "
+        "rebuilt every tick via reset/diff/reconcile. Sample-side "
+        "dispatcher that would emit it on successful build is a "
+        "future landing, same posture as the sibling `clock analog "
+        "ready ok` immediate-mode sample.",
+    "editor buffer init ok [legacy: EDITOR BUFFER INIT OK]":
+        "Wave0-B14 G12-M4-001 (paideia-os #2337): samples/editor/buffer "
+        "gap-list text-editor buffer primitives (KIND_EDITOR_BUFFER="
+        "0x1E5, derived over KIND_MEMORY) data-only fingerprint. "
+        "ebuf_init / editor_buffer_mint / editor_buffer_insert_at / "
+        "editor_buffer_delete_range / editor_buffer_read_range / "
+        "editor_buffer_len_bytes bodies are real and self-contained "
+        "(a genuine gap-list edit engine, not a stub), but no boot "
+        "witness or sample-app dispatcher calls ebuf_init yet, so the "
+        "marker never reaches a boot log. Same posture as the sibling "
+        "`ui context mint ok` / `window mint ok` data-only decls; "
+        "retires when a boot witness or the syntax-highlighting/BiDi-"
+        "caret follow-up (#2338) wires a real call path.",
 }
 
 # Below these counts the extractor has stopped matching rather than the
