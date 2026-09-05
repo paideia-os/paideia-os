@@ -146,7 +146,7 @@ fi
 
 # Count actual calls to sys_open, sys_dup2, sys_close in _start disassembly
 # This verifies that init._start calls these functions (not just that they exist in the binary)
-_START_DUMP=$(echo "$DUMP" | awk '/^[0-9a-f]+ <_start>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag')
+_START_DUMP=$(set +o pipefail; echo "$DUMP" | awk '/^[0-9a-f]+ <_start>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag')
 
 # Count call sys_open
 CALL_OPEN=$(echo "$_START_DUMP" | grep -c "call.*sys_open" || true)

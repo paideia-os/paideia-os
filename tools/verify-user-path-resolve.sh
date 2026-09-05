@@ -18,7 +18,7 @@ SYMS=$(objdump -t "$ELF" 2>/dev/null || true)
 RODATA=$(objdump -s -j .rodata "$ELF" 2>/dev/null || true)
 
 # awk function-slicer
-slice() { echo "$DUMP" | awk "/<$1>:/{f=1;next} /^[0-9a-f]+ <.*>:/{if(f)exit} f"; }
+slice() { set +o pipefail; echo "$DUMP" | awk "/<$1>:/{f=1;next} /^[0-9a-f]+ <.*>:/{if(f)exit} f"; }
 
 RP=$(slice resolve_path)
 EC=$(slice exec_child)
@@ -55,7 +55,7 @@ else echo "[ok]   resolved_path in .bss, size 0x140"; fi
 RODATA_STREAM=$(echo "$RODATA" | awk '/^ [0-9a-f]+ / {for (i=2;i<=5;i++) printf "%s", $i}' || true)
 
 # 3. bin_prefix rodata bytes 2f 62 69 6e 2f (/bin/)
-if echo "$RODATA_STREAM" | grep -q "2f62696e2f"; then
+if echo "$RODATA_STREAM" | grep "2f62696e2f" >/dev/null; then
     echo "[ok]   bin_prefix bytes present in .rodata"
 else
     echo "[FAIL] bin_prefix bytes not found in .rodata"; FAIL=1
@@ -73,21 +73,21 @@ N=$(echo "$RP $RP_HELPER" | grep -Ec "call.*strlen" || true)
 if [[ "$N" -ge 1 ]]; then echo "[ok]   resolve_path(+rp_build_candidate) calls strlen ($N)"; else echo "[FAIL] resolve_path strlen count $N < 1"; FAIL=1; fi
 
 # 6. resolve_path contains cmp against 0x2F (/)
-if echo "$RP" | grep -Eq "cmp.*0x2[Ff]\b"; then
+if echo "$RP" | grep -E "cmp.*0x2[Ff]\b" >/dev/null; then
     echo "[ok]   resolve_path contains cmp against 0x2F"
 else
     echo "[FAIL] resolve_path missing cmp against 0x2F"; FAIL=1
 fi
 
 # 7. resolve_path contains cmp against 0x0
-if echo "$RP" | grep -Eq "cmp.*0x0|cmp[[:space:]]+rax[[:space:]]*,.*0\b"; then
+if echo "$RP" | grep -E "cmp.*0x0|cmp[[:space:]]+rax[[:space:]]*,.*0\b" >/dev/null; then
     echo "[ok]   resolve_path contains cmp against 0x0"
 else
     echo "[FAIL] resolve_path missing cmp against 0x0"; FAIL=1
 fi
 
 # 8. resolve_path contains xor rax,rax
-if echo "$RP" | grep -Eq "xor.*rax.*,.*rax"; then
+if echo "$RP" | grep -E "xor.*rax.*,.*rax" >/dev/null; then
     echo "[ok]   resolve_path contains xor rax,rax"
 else
     echo "[FAIL] resolve_path missing xor rax,rax"; FAIL=1
@@ -122,7 +122,7 @@ RP_LINE=$(echo "$EC" | grep -n "call.*resolve_path" | head -1 | cut -d: -f1)
 if [[ -n "$RP_LINE" ]]; then
     # Extract lines after resolve_path call (next ~4 instructions)
     RESOLVE_SECTION=$(echo "$EC" | tail -n +$RP_LINE | head -5)
-    if echo "$RESOLVE_SECTION" | grep -Eq "mov.*rdi[[:space:]]*,.*rax|mov[[:space:]]+rdi[[:space:]]*,"; then
+    if echo "$RESOLVE_SECTION" | grep -E "mov.*rdi[[:space:]]*,.*rax|mov[[:space:]]+rdi[[:space:]]*," >/dev/null; then
         echo "[ok]   exec_child has mov rdi, rax within ~4 instructions after call resolve_path"
     else
         echo "[FAIL] exec_child missing mov rdi, rax after call resolve_path"

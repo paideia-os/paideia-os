@@ -17,7 +17,7 @@ SYMS=$(objdump -t "$ELF" 2>/dev/null || true)
 RODATA=$(objdump -s -j .rodata "$ELF" 2>/dev/null || true)
 
 # awk function-slicer
-slice() { echo "$DUMP" | awk "/<$1>:/{f=1;next} /^[0-9a-f]+ <.*>:/{if(f)exit} f"; }
+slice() { set +o pipefail; echo "$DUMP" | awk "/<$1>:/{f=1;next} /^[0-9a-f]+ <.*>:/{if(f)exit} f"; }
 
 DL=$(slice dispatch_line)
 DI=$(slice dispatch_init)
@@ -66,14 +66,14 @@ else echo "[ok]   exit_builtin present"; fi
 RODATA_STREAM=$(echo "$RODATA" | awk '/^ [0-9a-f]+ / {for (i=2;i<=5;i++) printf "%s", $i}')
 
 # 5. echo_name rodata bytes 65 63 68 6f 00
-if echo "$RODATA_STREAM" | grep -q "6563686f00"; then
+if echo "$RODATA_STREAM" | grep "6563686f00" >/dev/null; then
     echo "[ok]   echo_name bytes present in .rodata"
 else
     echo "[FAIL] echo_name bytes not found in .rodata"; FAIL=1
 fi
 
 # 6. exit_name rodata bytes 65 78 69 74 00
-if echo "$RODATA_STREAM" | grep -q "6578697400"; then
+if echo "$RODATA_STREAM" | grep "6578697400" >/dev/null; then
     echo "[ok]   exit_name bytes present in .rodata"
 else
     echo "[FAIL] exit_name bytes not found in .rodata"; FAIL=1
@@ -109,7 +109,7 @@ N=$(echo "$DL" | grep -Ec "call.*memcmp" || true)
 if [[ "$N" -ge 1 ]]; then echo "[ok]   dispatch_line calls memcmp ($N)"; else echo "[FAIL] dispatch_line memcmp count $N < 1"; FAIL=1; fi
 
 # 12. dispatch_line has call rax (indirect dispatch)
-if echo "$DL" | grep -Eq "call[[:space:]]+rax|call.*QWORD PTR"; then
+if echo "$DL" | grep -E "call[[:space:]]+rax|call.*QWORD PTR" >/dev/null; then
     echo "[ok]   dispatch_line has indirect call (call rax or call QWORD PTR)"
 else
     echo "[FAIL] dispatch_line missing indirect call"; FAIL=1
@@ -151,7 +151,7 @@ N=$(echo "$EB" | grep -Ec "call.*strlen" || true)
 if [[ "$N" -ge 1 ]]; then echo "[ok]   echo_builtin calls strlen ($N)"; else echo "[FAIL] echo_builtin strlen count $N < 1"; FAIL=1; fi
 
 # 17. exit_builtin calls sys_exit (not sys_exit_thread)
-if echo "$XB" | grep -Eq "call.*<sys_exit>" && ! echo "$XB" | grep -Eq "sys_exit_thread"; then
+if echo "$XB" | grep -E "call.*<sys_exit>" >/dev/null && ! echo "$XB" | grep -E "sys_exit_thread" >/dev/null; then
     echo "[ok]   exit_builtin calls sys_exit (canonical SC+ id 60, not legacy sys_exit_thread)"
 else
     echo "[FAIL] exit_builtin missing canonical sys_exit call (or calls legacy sys_exit_thread)"; FAIL=1

@@ -26,10 +26,10 @@ FAIL=0
 DUMP=$(objdump -d -M intel "$ELF" 2>/dev/null || true)
 
 # Extract _start disassembly
-_START_DUMP=$(echo "$DUMP" | awk '/^[0-9a-f]+ <_start>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag')
+_START_DUMP=$(set +o pipefail; echo "$DUMP" | awk '/^[0-9a-f]+ <_start>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag')
 
 # Extract tokenize disassembly
-TOKENIZE_DUMP=$(echo "$DUMP" | awk '/^[0-9a-f]+ <tokenize>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag')
+TOKENIZE_DUMP=$(set +o pipefail; echo "$DUMP" | awk '/^[0-9a-f]+ <tokenize>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag')
 
 # 1. Check for argv_buf .bss symbol, size 0x88 (17*8 = 136 bytes)
 ARGV_BUF_SYMLINE=$(objdump -t "$ELF" 2>/dev/null | awk '$NF == "argv_buf" { print }')

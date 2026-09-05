@@ -17,7 +17,7 @@ DUMP=$(objdump -d -M intel "$ELF" 2>/dev/null || true)
 SYMS=$(objdump -t "$ELF" 2>/dev/null || true)
 
 # awk function-slicer
-slice() { echo "$DUMP" | awk "/<$1>:/{f=1;next} /^[0-9a-f]+ <.*>:/{if(f)exit} f"; }
+slice() { set +o pipefail; echo "$DUMP" | awk "/<$1>:/{f=1;next} /^[0-9a-f]+ <.*>:/{if(f)exit} f"; }
 
 EC=$(slice exec_child)
 START=$(slice _start)
@@ -67,7 +67,7 @@ N=$(echo "$EC" | grep -Ec "call.*sys_exit" || true)
 if [[ "$N" -ge 1 ]]; then echo "[ok]   exec_child calls sys_exit ($N)"; else echo "[FAIL] exec_child sys_exit count $N < 1"; FAIL=1; fi
 
 # 7. exec_child contains mov edi,0x7f or mov rdi,0x7f (the 127 literal for exit code)
-if echo "$EC" | grep -Eq "mov.*rdi,0x7f|mov.*edi,0x7f"; then
+if echo "$EC" | grep -E "mov.*rdi,0x7f|mov.*edi,0x7f" >/dev/null; then
     echo "[ok]   exec_child contains mov to rdi with 0x7f (exit 127)"
 else
     echo "[FAIL] exec_child missing mov rdi,0x7f or mov edi,0x7f (exit 127 literal)"
@@ -76,7 +76,7 @@ fi
 
 # 8. exec_child contains indexed store into argv_buf area (mov QWORD PTR [...*8], ...)
 #    Pattern: mov [reg + reg*8], ... (NULL-terminator store)
-if echo "$EC" | grep -Eq "mov.*QWORD PTR.*\[.*\*8\],|mov.*\[.*\*8\].*,"; then
+if echo "$EC" | grep -E "mov.*QWORD PTR.*\[.*\*8\],|mov.*\[.*\*8\].*," >/dev/null; then
     echo "[ok]   exec_child contains indexed store into argv_buf area (NULL-terminator)"
 else
     echo "[FAIL] exec_child missing indexed store (mov [...*8], ...) for NULL-terminator"
@@ -101,7 +101,7 @@ DL_LINE=$(echo "$START" | grep -n "call.*dispatch_line" | head -1 | cut -d: -f1)
 if [[ -n "$DL_LINE" ]]; then
     # Extract ~8 lines after dispatch_line call
     DISPATCH_SECTION=$(echo "$START" | tail -n +$DL_LINE | head -20)
-    if echo "$DISPATCH_SECTION" | grep -Eq "cmp.*rax,0x0|cmp.*rax,0" && echo "$DISPATCH_SECTION" | grep -Eq "je[[:space:]]+"; then
+    if echo "$DISPATCH_SECTION" | grep -E "cmp.*rax,0x0|cmp.*rax,0" >/dev/null && echo "$DISPATCH_SECTION" | grep -E "je[[:space:]]+" >/dev/null; then
         echo "[ok]   _start has cmp rax,0 + je after dispatch_line"
     else
         echo "[FAIL] _start missing cmp rax,0 + je after dispatch_line"

@@ -17,7 +17,7 @@ SYMS=$(objdump -t "$ELF" 2>/dev/null || true)
 RODATA=$(objdump -s -j .rodata "$ELF" 2>/dev/null || true)
 
 # awk function-slicer
-slice() { echo "$DUMP" | awk "/<$1>:/{f=1;next} /^[0-9a-f]+ <.*>:/{if(f)exit} f"; }
+slice() { set +o pipefail; echo "$DUMP" | awk "/<$1>:/{f=1;next} /^[0-9a-f]+ <.*>:/{if(f)exit} f"; }
 
 DI=$(slice dispatch_init)
 EB=$(slice echo_builtin)
@@ -97,35 +97,35 @@ elif [[ "$(echo "$SL" | awk '{print $(NF-1)}')" != "0000000000000100" ]]; then e
 else echo "[ok]   _pwd_buf in .bss, size 0x100"; fi
 
 # 9. pwd_name rodata bytes 70 77 64 00
-if echo "$RODATA_STREAM" | grep -q "70776400"; then
+if echo "$RODATA_STREAM" | grep "70776400" >/dev/null; then
     echo "[ok]   pwd_name bytes present in .rodata"
 else
     echo "[FAIL] pwd_name bytes not found in .rodata"; FAIL=1
 fi
 
 # 10. help_name rodata bytes 68 65 6c 70 00
-if echo "$RODATA_STREAM" | grep -q "68656c7000"; then
+if echo "$RODATA_STREAM" | grep "68656c7000" >/dev/null; then
     echo "[ok]   help_name bytes present in .rodata"
 else
     echo "[FAIL] help_name bytes not found in .rodata"; FAIL=1
 fi
 
 # 11. env_name rodata bytes 65 6e 76 00
-if echo "$RODATA_STREAM" | grep -q "656e7600"; then
+if echo "$RODATA_STREAM" | grep "656e7600" >/dev/null; then
     echo "[ok]   env_name bytes present in .rodata"
 else
     echo "[FAIL] env_name bytes not found in .rodata"; FAIL=1
 fi
 
 # 12. env_path_msg rodata bytes 504154483d2f62696e0a (PATH=/bin\n)
-if echo "$RODATA_STREAM" | grep -q "504154483d2f62696e0a"; then
+if echo "$RODATA_STREAM" | grep "504154483d2f62696e0a" >/dev/null; then
     echo "[ok]   env_path_msg bytes present in .rodata"
 else
     echo "[FAIL] env_path_msg bytes not found in .rodata"; FAIL=1
 fi
 
 # 13. help_sep rodata bytes 202d20 ( - )
-if echo "$RODATA_STREAM" | grep -q "202d20"; then
+if echo "$RODATA_STREAM" | grep "202d20" >/dev/null; then
     echo "[ok]   help_sep bytes present in .rodata"
 else
     echo "[FAIL] help_sep bytes not found in .rodata"; FAIL=1
@@ -139,7 +139,7 @@ else echo "[ok]   dispatch_init present, size 0x$SZ"; fi
 
 # 15. dispatch_init writes builtin_count=7 (mov rax,0x7) — #632 bumped 5->6,
 # clear builtin bumped 6->7.
-if echo "$DI" | grep -Eq "mov[[:space:]]+rax,0x7|mov[[:space:]]+rax,7"; then
+if echo "$DI" | grep -E "mov[[:space:]]+rax,0x7|mov[[:space:]]+rax,7" >/dev/null; then
     echo "[ok]   dispatch_init writes builtin_count=7"
 else
     echo "[FAIL] dispatch_init missing mov rax,0x7 (builtin_count=7)"; FAIL=1
@@ -148,70 +148,70 @@ fi
 # 16. cd_builtin calls sys_chdir (R86.M1-006 #1959: retired the local
 #     _cwd_buf copy + leading-'/' refusal; cd_builtin now mutates
 #     TASK_OFF_CWD through the kernel syscall)
-if echo "$CD" | grep -Eq "call.*<sys_chdir>|call.*sys_chdir"; then
+if echo "$CD" | grep -E "call.*<sys_chdir>|call.*sys_chdir" >/dev/null; then
     echo "[ok]   cd_builtin calls sys_chdir"
 else
     echo "[FAIL] cd_builtin missing sys_chdir call"; FAIL=1
 fi
 
 # 17. cd_builtin calls sys_getcwd (path echo on success)
-if echo "$CD" | grep -Eq "call.*<sys_getcwd>|call.*sys_getcwd"; then
+if echo "$CD" | grep -E "call.*<sys_getcwd>|call.*sys_getcwd" >/dev/null; then
     echo "[ok]   cd_builtin calls sys_getcwd"
 else
     echo "[FAIL] cd_builtin missing sys_getcwd call"; FAIL=1
 fi
 
 # 18. echo_builtin references echo_emit_nl
-if echo "$EB" | grep -q "echo_emit_nl"; then
+if echo "$EB" | grep "echo_emit_nl" >/dev/null; then
     echo "[ok]   echo_builtin references echo_emit_nl"
 else
     echo "[FAIL] echo_builtin missing echo_emit_nl reference"; FAIL=1
 fi
 
 # 19. echo_builtin has cmp 0x2d (-character check)
-if echo "$EB" | grep -Eq "cmp[[:space:]]+.*,0x2d|cmp.*0x2d"; then
+if echo "$EB" | grep -E "cmp[[:space:]]+.*,0x2d|cmp.*0x2d" >/dev/null; then
     echo "[ok]   echo_builtin has cmp 0x2d"
 else
     echo "[FAIL] echo_builtin missing cmp 0x2d"; FAIL=1
 fi
 
 # 20. echo_builtin has cmp 0x6e (n-character check)
-if echo "$EB" | grep -Eq "cmp[[:space:]]+.*,0x6e|cmp.*0x6e"; then
+if echo "$EB" | grep -E "cmp[[:space:]]+.*,0x6e|cmp.*0x6e" >/dev/null; then
     echo "[ok]   echo_builtin has cmp 0x6e"
 else
     echo "[FAIL] echo_builtin missing cmp 0x6e"; FAIL=1
 fi
 
 # 21. exit_builtin calls dec_parse
-if echo "$XB" | grep -Eq "call.*<dec_parse>|call.*dec_parse"; then
+if echo "$XB" | grep -E "call.*<dec_parse>|call.*dec_parse" >/dev/null; then
     echo "[ok]   exit_builtin calls dec_parse"
 else
     echo "[FAIL] exit_builtin missing dec_parse call"; FAIL=1
 fi
 
 # 22. dec_parse has cmp 0x30 (digit '0' check)
-if echo "$DP" | grep -Eq "cmp[[:space:]]+.*,0x30|cmp.*0x30"; then
+if echo "$DP" | grep -E "cmp[[:space:]]+.*,0x30|cmp.*0x30" >/dev/null; then
     echo "[ok]   dec_parse has cmp 0x30"
 else
     echo "[FAIL] dec_parse missing cmp 0x30"; FAIL=1
 fi
 
 # 23. dec_parse has cmp 0x39 (digit '9' check)
-if echo "$DP" | grep -Eq "cmp[[:space:]]+.*,0x39|cmp.*0x39"; then
+if echo "$DP" | grep -E "cmp[[:space:]]+.*,0x39|cmp.*0x39" >/dev/null; then
     echo "[ok]   dec_parse has cmp 0x39"
 else
     echo "[FAIL] dec_parse missing cmp 0x39"; FAIL=1
 fi
 
 # 24. dec_parse has shl 0x3 (multiply by 8 for digit accumulation)
-if echo "$DP" | grep -Eq "shl[[:space:]]+.*,0x3|shl.*0x3"; then
+if echo "$DP" | grep -E "shl[[:space:]]+.*,0x3|shl.*0x3" >/dev/null; then
     echo "[ok]   dec_parse has shl 0x3"
 else
     echo "[FAIL] dec_parse missing shl 0x3"; FAIL=1
 fi
 
 # 25. pwd_builtin references _pwd_buf (R86.M1-007 #1960)
-if echo "$PWD" | grep -q "_pwd_buf"; then
+if echo "$PWD" | grep "_pwd_buf" >/dev/null; then
     echo "[ok]   pwd_builtin references _pwd_buf"
 else
     echo "[FAIL] pwd_builtin missing _pwd_buf reference"; FAIL=1
@@ -219,35 +219,35 @@ fi
 
 # 26. pwd_builtin calls sys_getcwd (R86.M1-007 #1960: replaces the retired
 #     puts_new-on-_cwd_buf echo)
-if echo "$PWD" | grep -Eq "call.*<sys_getcwd>|call.*sys_getcwd"; then
+if echo "$PWD" | grep -E "call.*<sys_getcwd>|call.*sys_getcwd" >/dev/null; then
     echo "[ok]   pwd_builtin calls sys_getcwd"
 else
     echo "[FAIL] pwd_builtin missing sys_getcwd call"; FAIL=1
 fi
 
 # 27. pwd_builtin calls sys_write
-if echo "$PWD" | grep -Eq "call.*<sys_write>|call.*sys_write"; then
+if echo "$PWD" | grep -E "call.*<sys_write>|call.*sys_write" >/dev/null; then
     echo "[ok]   pwd_builtin calls sys_write"
 else
     echo "[FAIL] pwd_builtin missing sys_write call"; FAIL=1
 fi
 
 # 28. help_builtin references builtin_names
-if echo "$HELP" | grep -q "builtin_names"; then
+if echo "$HELP" | grep "builtin_names" >/dev/null; then
     echo "[ok]   help_builtin references builtin_names"
 else
     echo "[FAIL] help_builtin missing builtin_names reference"; FAIL=1
 fi
 
 # 29. help_builtin references builtin_descs
-if echo "$HELP" | grep -q "builtin_descs"; then
+if echo "$HELP" | grep "builtin_descs" >/dev/null; then
     echo "[ok]   help_builtin references builtin_descs"
 else
     echo "[FAIL] help_builtin missing builtin_descs reference"; FAIL=1
 fi
 
 # 30. help_builtin references builtin_count
-if echo "$HELP" | grep -q "builtin_count"; then
+if echo "$HELP" | grep "builtin_count" >/dev/null; then
     echo "[ok]   help_builtin references builtin_count"
 else
     echo "[FAIL] help_builtin missing builtin_count reference"; FAIL=1

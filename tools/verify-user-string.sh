@@ -21,7 +21,7 @@ verify_fn() {
 
     # Extract the function's disassembly (bytes column only).
     local dump
-    dump=$(objdump -d -M intel "$ELF" 2>/dev/null | awk -v sym="$name" -F '\t' '
+    dump=$(set +o pipefail; objdump -d -M intel "$ELF" 2>/dev/null | awk -v sym="$name" -F '\t' '
         BEGIN { seen = 0; buf = "" }
         $0 ~ "<"sym">:"       { seen = 1; next }
         seen && $0 ~ /^[0-9a-f]+ </ { exit }         # next symbol
@@ -54,23 +54,23 @@ verify_fn() {
     # Signature: must contain a byte load (8a = mov r8,r/m8; or 0f b6 = movzx),
     # a conditional branch (74 or 75 or 0f 84/85 for longer branches),
     # an unconditional jmp (eb or e9 for longer jumps), a ret (c3), and NO syscall (0f 05).
-    if ! echo "$dump" | grep -qE '(8a|0f b6)'; then
+    if ! echo "$dump" | grep -E '(8a|0f b6)' >/dev/null; then
         echo "[FAIL] $name: missing byte-load opcode (8a or 0f b6)"
         FAIL=1
     fi
-    if ! echo "$dump" | grep -qE '(74|75|0f 84|0f 85)'; then
+    if ! echo "$dump" | grep -E '(74|75|0f 84|0f 85)' >/dev/null; then
         echo "[FAIL] $name: missing conditional branch (74/75 short or 0f 84/85 long)"
         FAIL=1
     fi
-    if ! echo "$dump" | grep -qE '(eb|e9)'; then
+    if ! echo "$dump" | grep -E '(eb|e9)' >/dev/null; then
         echo "[FAIL] $name: missing unconditional jmp (eb short or e9 long)"
         FAIL=1
     fi
-    if ! echo "$dump" | grep -q 'c3'; then
+    if ! echo "$dump" | grep 'c3' >/dev/null; then
         echo "[FAIL] $name: missing ret (c3)"
         FAIL=1
     fi
-    if echo "$dump" | grep -q '0f 05'; then
+    if echo "$dump" | grep '0f 05' >/dev/null; then
         echo "[FAIL] $name: contains syscall opcode 0f 05 — must be pure userland"
         FAIL=1
     fi
@@ -87,7 +87,7 @@ verify_rep_fn() {
 
     # Extract the function's disassembly (bytes column only).
     local dump
-    dump=$(objdump -d -M intel "$ELF" 2>/dev/null | awk -v sym="$name" -F '\t' '
+    dump=$(set +o pipefail; objdump -d -M intel "$ELF" 2>/dev/null | awk -v sym="$name" -F '\t' '
         BEGIN { seen = 0; buf = "" }
         $0 ~ "<"sym">:"       { seen = 1; next }
         seen && $0 ~ /^[0-9a-f]+ </ { exit }         # next symbol
@@ -117,19 +117,19 @@ verify_rep_fn() {
 
     # rep-signature: must contain "fc" (cld), "f3 <rep_op>" (rep prefix +
     # movsb/stosb), and "c3" (ret). Must NOT contain 0f 05 (syscall).
-    if ! echo "$dump" | grep -q "fc"; then
+    if ! echo "$dump" | grep "fc" >/dev/null; then
         echo "[FAIL] $name: missing cld (fc)"
         FAIL=1
     fi
-    if ! echo "$dump" | grep -q "f3 ${rep_op}"; then
+    if ! echo "$dump" | grep "f3 ${rep_op}" >/dev/null; then
         echo "[FAIL] $name: missing rep prefix f3 ${rep_op}"
         FAIL=1
     fi
-    if ! echo "$dump" | grep -q 'c3'; then
+    if ! echo "$dump" | grep 'c3' >/dev/null; then
         echo "[FAIL] $name: missing ret (c3)"
         FAIL=1
     fi
-    if echo "$dump" | grep -q '0f 05'; then
+    if echo "$dump" | grep '0f 05' >/dev/null; then
         echo "[FAIL] $name: contains syscall opcode 0f 05 — must be pure userland"
         FAIL=1
     fi

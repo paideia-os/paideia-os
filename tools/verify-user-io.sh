@@ -22,7 +22,7 @@ verify_fn_with_calls() {
 
     # Extract the function's disassembly (bytes column only).
     local dump
-    dump=$(objdump -d -M intel "$ELF" 2>/dev/null | awk -v sym="$name" -F '\t' '
+    dump=$(set +o pipefail; objdump -d -M intel "$ELF" 2>/dev/null | awk -v sym="$name" -F '\t' '
         BEGIN { seen = 0; buf = "" }
         $0 ~ "<"sym">:"       { seen = 1; next }
         seen && $0 ~ /^[0-9a-f]+ </ { exit }         # next symbol
@@ -53,7 +53,7 @@ verify_fn_with_calls() {
     # Check for required call instructions and symbol references.
     # Disassemble again to get the full instruction stream.
     local asm_dump
-    asm_dump=$(objdump -d -M intel "$ELF" 2>/dev/null | awk -v sym="$name" '
+    asm_dump=$(set +o pipefail; objdump -d -M intel "$ELF" 2>/dev/null | awk -v sym="$name" '
         BEGIN { seen = 0 }
         $0 ~ "<"sym">:"       { seen = 1; next }
         seen && $0 ~ /^[0-9a-f]+ </ { exit }
@@ -61,27 +61,27 @@ verify_fn_with_calls() {
     ')
 
     # Must contain at least one "call" instruction.
-    if ! echo "$asm_dump" | grep -q 'call'; then
+    if ! echo "$asm_dump" | grep 'call' >/dev/null; then
         echo "[FAIL] $name: missing call instruction"
         FAIL=1
     fi
 
     # Verify that the required callees appear.
     for callee in $req_calls_str; do
-        if ! echo "$asm_dump" | grep -q "<$callee>"; then
+        if ! echo "$asm_dump" | grep "<$callee>" >/dev/null; then
             echo "[FAIL] $name: missing call to $callee"
             FAIL=1
         fi
     done
 
     # Must NOT contain syscall directly (0f 05).
-    if echo "$dump" | grep -q '0f 05'; then
+    if echo "$dump" | grep '0f 05' >/dev/null; then
         echo "[FAIL] $name: contains syscall opcode 0f 05 — must delegate to sys_read/sys_write"
         FAIL=1
     fi
 
     # Must end with ret (c3).
-    if ! echo "$dump" | grep -q 'c3'; then
+    if ! echo "$dump" | grep 'c3' >/dev/null; then
         echo "[FAIL] $name: missing ret (c3)"
         FAIL=1
     fi

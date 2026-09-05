@@ -25,10 +25,10 @@ FAIL=0
 DUMP=$(objdump -d -M intel "$ELF" 2>/dev/null || true)
 
 # Extract _start disassembly
-_START_DUMP=$(echo "$DUMP" | awk '/^[0-9a-f]+ <_start>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag')
+_START_DUMP=$(set +o pipefail; echo "$DUMP" | awk '/^[0-9a-f]+ <_start>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag')
 
 # Extract shell_read_line disassembly
-SHELL_READLINE_DUMP=$(echo "$DUMP" | awk '/^[0-9a-f]+ <shell_read_line>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag')
+SHELL_READLINE_DUMP=$(set +o pipefail; echo "$DUMP" | awk '/^[0-9a-f]+ <shell_read_line>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag')
 
 # 1. Check for prompt_msg rodata symbol
 PROMPT_MSG=$(echo "$DUMP" | grep -c "prompt_msg" || true)
@@ -104,11 +104,11 @@ else
     CMP_LINES=$(echo "$SHELL_READLINE_DUMP" | grep -B 2 "cmp.*0xa")
 
     # Check if any cmp 0xa is preceded by "and rax,0xff" or "movzx"
-    if echo "$CMP_LINES" | grep -q "and.*0xff"; then
+    if echo "$CMP_LINES" | grep "and.*0xff" >/dev/null; then
         echo "[ok]   cmp against 0x0A (newline) found with and rax,0xff guard (paideia-as #1248 mitigation)"
-    elif echo "$CMP_LINES" | grep -q "movzx"; then
+    elif echo "$CMP_LINES" | grep "movzx" >/dev/null; then
         echo "[ok]   cmp against 0x0A (newline) found with movzx guard"
-    elif echo "$CMP_LINES" | grep -q "3c 0a"; then
+    elif echo "$CMP_LINES" | grep "3c 0a" >/dev/null; then
         echo "[ok]   cmp against 0x0A (newline) found with byte-narrow opcode"
     else
         # Warn but don't fail — the cmp exists but guard is missing; this is fragile
@@ -148,12 +148,12 @@ else
 fi
 
 # 11. #627 Ctrl-D EOF exit: exit_on_eof label followed by call.*builtin_exit or sys_exit.
-EOF_EXIT=$(echo "$DUMP" | awk '/<exit_on_eof>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag' 2>/dev/null || true)
-if [[ -n "$EOF_EXIT" ]] && echo "$EOF_EXIT" | grep -Eq "call.*(builtin_exit|sys_exit)"; then
+EOF_EXIT=$(set +o pipefail; echo "$DUMP" | awk '/<exit_on_eof>:/{flag=1; next} /^[0-9a-f]+ <.*>:/{if(flag) exit} flag' 2>/dev/null || true)
+if [[ -n "$EOF_EXIT" ]] && echo "$EOF_EXIT" | grep -E "call.*(builtin_exit|sys_exit)" >/dev/null; then
     echo "[ok]   #627 exit_on_eof path present (Ctrl-D → sys_exit)"
 else
     # Fallback: check _start has a call to builtin_exit as EOF path
-    if echo "$_START_DUMP" | grep -Eq "call.*(builtin_exit|sys_exit)"; then
+    if echo "$_START_DUMP" | grep -E "call.*(builtin_exit|sys_exit)" >/dev/null; then
         echo "[ok]   #627 EOF exit call present in _start"
     else
         echo "[FAIL] #627 no EOF-exit path (expected call to builtin_exit or sys_exit)"
@@ -170,7 +170,7 @@ if [[ -n "$TOK_PC" && -n "$DL_PC" ]]; then
         pc = $1; gsub(":","",pc);
         if (pc > lo && pc < hi) print
     }')
-    if echo "$MID" | grep -Eq "cmp.*rax,0x0" && echo "$MID" | grep -Eq "\bje\b"; then
+    if echo "$MID" | grep -E "cmp.*rax,0x0" >/dev/null && echo "$MID" | grep -E "\bje\b" >/dev/null; then
         echo "[ok]   #628 empty-line reprompt (cmp rax,0 + je between tokenize and dispatch_line)"
     else
         echo "[FAIL] #628 no empty-line skip between tokenize and dispatch_line"

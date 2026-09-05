@@ -20,7 +20,7 @@ FAIL=0
 verify_symbol() {
     local name="$1"
 
-    if ! nm "$ELF" 2>/dev/null | grep -q "\b${name}\b"; then
+    if ! nm "$ELF" 2>/dev/null | grep "\b${name}\b" >/dev/null; then
         echo "[FAIL] $name: symbol not found in ELF"
         FAIL=1
         return
@@ -34,7 +34,7 @@ verify_fn() {
 
     # Extract the function's disassembly (bytes column only).
     local dump
-    dump=$(objdump -d -M intel "$ELF" 2>/dev/null | awk -v sym="$name" -F '\t' '
+    dump=$(set +o pipefail; objdump -d -M intel "$ELF" 2>/dev/null | awk -v sym="$name" -F '\t' '
         BEGIN { seen = 0; buf = "" }
         $0 ~ "<"sym">:"       { seen = 1; next }
         seen && $0 ~ /^[0-9a-f]+ </ { exit }         # next symbol
@@ -68,19 +68,19 @@ verify_fn() {
     # a ret (c3), and NO syscall (0f 05).
     # LEA = 8d (e.g., 48 8d = lea r64, [rip+disp]).
     # MOV from/to memory: 48 8b (mov r64, [mem]), 48 89 (mov [mem], r64), etc.
-    if ! echo "$dump" | grep -qE '(8d|48 8d)'; then
+    if ! echo "$dump" | grep -E '(8d|48 8d)' >/dev/null; then
         echo "[FAIL] $name: missing lea opcode (8d)"
         FAIL=1
     fi
-    if ! echo "$dump" | grep -qE '(48 8b|48 89)'; then
+    if ! echo "$dump" | grep -E '(48 8b|48 89)' >/dev/null; then
         echo "[FAIL] $name: missing mov [mem] opcode (48 8b or 48 89)"
         FAIL=1
     fi
-    if ! echo "$dump" | grep -q 'c3'; then
+    if ! echo "$dump" | grep 'c3' >/dev/null; then
         echo "[FAIL] $name: missing ret (c3)"
         FAIL=1
     fi
-    if echo "$dump" | grep -q '0f 05'; then
+    if echo "$dump" | grep '0f 05' >/dev/null; then
         echo "[FAIL] $name: contains syscall opcode 0f 05 — must be pure userland"
         FAIL=1
     fi
@@ -118,7 +118,7 @@ verify_fn syscall_check 50 150
 verify_syscall_check_no_movabs_boundary() {
     local name="syscall_check"
     local dump
-    dump=$(objdump -d -M intel "$ELF" 2>/dev/null | awk -v sym="$name" -F '\t' '
+    dump=$(set +o pipefail; objdump -d -M intel "$ELF" 2>/dev/null | awk -v sym="$name" -F '\t' '
         BEGIN { seen = 0; buf = "" }
         $0 ~ "<"sym">:"       { seen = 1; next }
         seen && $0 ~ /^[0-9a-f]+ </ { exit }         # next symbol
@@ -138,7 +138,7 @@ verify_syscall_check_no_movabs_boundary() {
 
     # (a) sub-based boundary construction present: 49 81 e8 ff 0f
     #     (REX.WB 81 /5 id = sub r8, imm32; imm32 = 0x00000fff = 4095).
-    if ! echo "$dump" | grep -qE '49 81 e8 ff 0f'; then
+    if ! echo "$dump" | grep -E '49 81 e8 ff 0f' >/dev/null; then
         echo "[FAIL] $name: missing encoder-safe boundary construction (49 81 e8 ff 0f = sub r8,0xfff / -4095) — #613 regression?"
         FAIL=1
     else
@@ -146,7 +146,7 @@ verify_syscall_check_no_movabs_boundary() {
     fi
 
     # (b) no MOVABS r8, imm64: opcode byte 49 b8 (REX.WB + B8 = MOVABS r8,imm64).
-    if echo "$dump" | grep -qE '49 b8'; then
+    if echo "$dump" | grep -E '49 b8' >/dev/null; then
         echo "[FAIL] $name: contains MOVABS r8, imm64 (49 b8) — #613 sign-extension bug has regressed"
         FAIL=1
     else

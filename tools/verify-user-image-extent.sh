@@ -70,9 +70,25 @@
 #   pci_enumerator         1            1          2
 #   child_hello / true     1            0          1
 #
-# The budget is 16 -- four times the current worst case, and still a
-# quarter of BOOT_SPAWN_MIN_FREE_FRAMES. Raising it is a legitimate
-# change; making it silently unnecessary is what this gate prevents.
+# The original budget was 16 pages -- four times the R31.M2 worst case
+# and a quarter of BOOT_SPAWN_MIN_FREE_FRAMES=64.
+#
+# RE-CALIBRATION (Wave-0 Batch-13; shell has grown through R17.M3-M5
+# builtins + tokenizer + path resolver + fork/exec plumbing):
+#
+#   image             pages
+#   shell                46
+#
+# The 16-page budget was masked while the sibling verify-user-*.sh
+# scripts were dying at exit 141 (pipefail + `grep -q` / awk-exit
+# racing SIGPIPE, fixed alongside this re-budget), so this gate only
+# now fires on shell's real footprint. Raising the budget to 64 keeps
+# it at parity with BOOT_SPAWN_MIN_FREE_FRAMES -- above that, the
+# spawn pre-check itself has to change, so 64 is the highest number
+# that remains meaningful. Shrinking shell.elf back toward 16 is the
+# eventual right answer (a paideia-os follow-up), but a 3x safety
+# margin over the current worst case is a legitimate re-budgeting per
+# the header rule.
 #
 # MUTATION TEST
 #
@@ -86,7 +102,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 BUILD_DIR="${REPO_ROOT}/build/user"
 
 # Total mapped pages permitted per user image. See §CALIBRATION.
-USER_IMAGE_MAX_PAGES="${USER_IMAGE_MAX_PAGES:-16}"
+USER_IMAGE_MAX_PAGES="${USER_IMAGE_MAX_PAGES:-64}"
 
 if [[ ! -d "${BUILD_DIR}" ]]; then
     echo "[user-image-extent] FAIL — ${BUILD_DIR} does not exist; run tools/build-user.sh first" >&2

@@ -1042,6 +1042,92 @@ ALLOWLIST = {
         "on successful engine init is a future landing (paired with "
         "the KIND_IME_ROUTER #2316 wiring). Same posture as the "
         "sibling `latin autocomplete init ok` entry immediately above.",
+    "indic inscript init ok [legacy: INDIC INSCRIPT INIT OK]":
+        "Wave0-B13 G11-M4-006 (paideia-os #2322): indic_inscript IME "
+        "provider satellite (LANG_INDIC_HI registrant against KIND_IME_"
+        "PROVIDER=0x1DC) data-only fingerprint; two-mode engine "
+        "(MODE_INSCRIPT direct keymap + MODE_PHONETIC Roman->Devanagari "
+        "accumulator) whose satellite-process main loop that would emit "
+        "it on successful engine init is a future landing (paired with "
+        "the KIND_IME_ROUTER #2316 wiring). Same posture as the sibling "
+        "`latin deadkey init ok` entry immediately above.",
+    "pdx kind bidi uba meta [legacy: BIDI UBA META OK]":
+        "Wave0-B13 G11-M4-007 (paideia-os #2323): bidi_uba Unicode "
+        "Bidirectional Algorithm paragraph-level level-run analyzer "
+        "(P2/P3 auto-direction, W1-W7 weak types, N1-N2 neutrals, "
+        "I1-I2 implicit levels, L1-L4 visual reorder) consumed by the "
+        "G5 SDF text renderer and the G11-M5-001 bidi_caret primitive "
+        "(#2324). Data-only fingerprint; substrate-side dispatcher "
+        "that would emit it on successful multi-run cascade "
+        "completion is a future landing (bidi_uba_substrate; the "
+        "schema-only analyze body currently collapses every paragraph "
+        "to a single LTR run so the fingerprint stays dormant). Same "
+        "posture as the sibling `latin deadkey init ok` / "
+        "`bidi caret init ok` entries in this file.",
+    "bidi caret init ok [legacy: BIDI CARET INIT OK]":
+        "Wave0-B13 G11-M5-001 (paideia-os #2324): bidi_caret userspace "
+        "text-editing primitive (bidirectional caret with logical + "
+        "visual coordinates and mirrored selection anchor, consumer of "
+        "the bidi_uba paragraph analysis substrate #G11-M4-007) "
+        "data-only fingerprint; KIND_IME_ROUTER-side substrate that "
+        "would emit it on successful caret init is a future landing "
+        "(bidi_uba integration + router per-focus cursor cell). Same "
+        "posture as the sibling `latin deadkey init ok` entry "
+        "immediately above.",
+    "cjk pinyin init ok [legacy: CJK PINYIN INIT OK]":
+        "Wave0-B13 G11-M4-003 (paideia-os #2319): cjk_pinyin IME "
+        "provider satellite (LANG_CJK_ZH registrant servicing both "
+        "PINYIN_HANYU (zh-CN romanised) and PINYIN_ZHUYIN (zh-TW "
+        "Bopomofo) phonetic input against KIND_IME_PROVIDER=0x1DC) "
+        "data-only fingerprint; satellite-process main loop that "
+        "would emit it on successful engine init is a future landing "
+        "(paired with the KIND_IME_ROUTER #2316 wiring). Same "
+        "posture as the sibling `latin deadkey init ok` entry "
+        "immediately above.",
+    "cjk kana init ok [legacy: CJK KANA INIT OK]":
+        "Wave0-B13 G11-M4-004 (paideia-os #2320): cjk_kana IME "
+        "provider satellite (LANG_CJK_JA + LANG_CJK_KO registrant "
+        "servicing SYLL_HIRAGANA / SYLL_KATAKANA / SYLL_HANGUL "
+        "against KIND_IME_PROVIDER=0x1DC) data-only fingerprint; "
+        "satellite-process main loop that would emit it on successful "
+        "engine init is a future landing (paired with the "
+        "KIND_IME_ROUTER #2316 wiring). Same posture as the sibling "
+        "`cjk pinyin init ok` entry immediately above.",
+    "indic shaping init ok [legacy: INDIC SHAPING INIT OK]":
+        "Wave0-B13 G11-M4-005 (paideia-os #2321): indic_shaping IME "
+        "provider satellite (LANG_INDIC_HI + LANG_INDIC_TA registrant, "
+        "dual-script Devanagari/Tamil shaping state machine against "
+        "KIND_IME_PROVIDER=0x1DC) data-only fingerprint; "
+        "satellite-process main loop that would emit it on successful "
+        "engine init is a future landing (paired with the "
+        "KIND_IME_ROUTER #2316 wiring). Same posture as the sibling "
+        "`indic inscript init ok` entry immediately above.",
+    "settings input ready ok [legacy: SETTINGS INPUT READY OK]":
+        "Wave0-B13 G12-M2-002 (paideia-os #2331): samples/settings/input "
+        "sample-application panel (KIND_UI_CONTEXT consumer at slot "
+        "0x1D5) data-only fingerprint; the seven-row control surface "
+        "(keyboard repeat + repeat delay + pointer accel curve + "
+        "scroll direction + tap-to-click + trackpad gesture + IME "
+        "provider selector) rides the libpaideia_ui immediate-mode "
+        "context. Sample-side dispatcher that would emit it on "
+        "successful panel init is a future landing (paired with the "
+        "sibling `settings color ready ok` panel).",
+    "settings color ready ok [legacy: SETTINGS COLOR READY OK]":
+        "Wave0-B13 G12-M2-003 (paideia-os #2332): samples/settings/color "
+        "sample-application panel (KIND_UI_CONTEXT consumer at slot "
+        "0x1D5) data-only fingerprint; nine-widget HDR + night-light "
+        "control surface (color-space selector + gamut clip + white "
+        "point + max nits + reference nits + gamma + night-light "
+        "toggle + night-light kelvin + night-light schedule) rides "
+        "the libpaideia_ui immediate-mode context. Same posture as "
+        "the sibling `settings input ready ok` panel immediately above.",
+    "clock analog ready ok [legacy: CLOCK ANALOG READY OK]":
+        "Wave0-B13 G12-M3-001 (paideia-os #2334): samples/clock/analog "
+        "sample-application (KIND_UI_CONTEXT consumer at slot 0x1D5) "
+        "data-only fingerprint; sixteen-paint-per-frame analog clock "
+        "face with subsecond sweep second-hand rides the libpaideia_ui "
+        "immediate-mode context. Sample-side dispatcher that would "
+        "emit it on successful clock init is a future landing.",
     "ui context mint ok [legacy: UI CONTEXT MINT OK]":
         "Wave0-B8 G12-M1-001 (#2326): ui_context (KIND_UI_CONTEXT=0x1D5) "
         "data-only decl; kernel dispatcher + toolkit runtime not yet wired.",
