@@ -1,0 +1,1195 @@
+// src/user/compositor/present_feedback_route.pdx -- Wave0-B10-06 (paideia-os #2298)
+//
+// PRESENT-FEEDBACK FAN-OUT + BUDGET-ONE-REFRESH DISCIPLINE.
+//
+// src/user/compositor/present_feedback_kind.pdx (Wave0-B9-07, KIND_PRESENT_
+// FEEDBACK = 0x1DA) lands the per-surface feedback ROW: one KIND_PRESENT_
+// FEEDBACK row per surface, with a single subscriber_kind_id slot and the
+// (last_present_nsec, last_vblank_nsec, refresh_period_nsec, frame_count,
+// last_classification) tuple that vocabulary §2.12 enumerates. That
+// landing is the *authority* half of the feedback stream: it is where the
+// compositor latches present + vblank timing and the client can poll the
+// row for the last timing tuple.
+//
+// This landing is the *fan-out* half. The problem it solves: a single
+// subscriber can subscribe against many surfaces (a screen recorder that
+// watches every top-level window on a workspace; a compositor debugging
+// overlay that watches every plane; the accessibility runtime that
+// wants to observe present cadence across every window in the active
+// a11y tree). If every present on every one of those surfaces fanned
+// out to a fresh notification, the subscriber would see N events per
+// vsync where N is the number of surfaces it follows. That is a
+// subscriber-side event storm; the classic Wayland `frame` callback
+// shape has hit exactly this cliff (a full-screen recorder subscribed
+// to 40 surfaces at 120 Hz observes 4800 callback dispatches / sec,
+// most of which the subscriber immediately coalesces back down to
+// one per vsync).
+//
+// The budget-one-refresh discipline forecloses that storm structurally:
+// each subscriber gets AT MOST ONE event per vsync interval regardless
+// of how many surfaces it follows. The discriminator is the
+// last_delivered_vblank_nsec timestamp per subscriber row -- when the
+// compositor calls present_feedback_route_deliver on a subscriber
+// whose last_delivered_vblank_nsec already equals the incoming
+// vblank_nsec, the delivery is suppressed and the dropped_count is
+// incremented; when it differs, the delivery goes through and the
+// timestamp is updated. The subscriber sees one event per vsync it is
+// observing (across ALL of its subscribed surfaces), and the
+// dropped_count exposes to observability tooling how many events the
+// budget cap suppressed.
+//
+// This is NOT a KIND cap. There is no rights bitmask, no op catalog,
+// no cap_handler routing. It is one logic module with row-pool + fan-out
+// primitives + a stats counter, mirroring the a11y_bind_at_mint.pdx
+// (Wave0-B9-08, #2305) shape: row-pool for state, fan-out helpers for
+// the discipline, counter accessors for observability. The KIND_PRESENT_
+// FEEDBACK cap (0x1DA, sibling file) is the real capability; this
+// module orchestrates the many-surface -> one-subscriber-per-vsync
+// contract on top of it.
+//
+// =============================================================================
+// SECTION 0  RELATIONSHIP TO SIBLINGS
+// =============================================================================
+//
+//   src/user/compositor/present_feedback_kind.pdx  (Wave0-B9-07,
+//                                                    KIND_PRESENT_FEEDBACK
+//                                                    = 0x1DA)
+//     Owns per-surface row: subscriber_kind_id + timing tuple + last
+//     classification. Fan-out is *not* its concern -- it stores one
+//     subscriber per surface. This route module operates one level up:
+//     one route row per subscriber, with a subscription_count that
+//     tracks how many present_feedback_kind rows point back at this
+//     subscriber, and a per-subscriber last_delivered_vblank_nsec
+//     that gates the fan-out.
+//
+//   design/compositor/pwp-spec-vocabulary.md §2.12
+//     "the compositor budget is one refresh period; the classifier
+//     labels events as ON-TIME / LATE / MISSED / SKIPPED against that
+//     budget." The budget-one-refresh discipline this file implements
+//     is the DELIVERY-SIDE analogue of the compositor's own frame
+//     budget -- one refresh period per client, no matter how many
+//     surfaces the client watches.
+//
+//   design/roadmap/next-wave-synthesis.md §4 pitfall P6
+//     "presentation feedback is mandatory, not optional". The mandate
+//     covers presence of the stream (present_feedback_kind.pdx) AND
+//     its correct back-pressure shape (this file). A stream that
+//     storms the subscriber under load is worse than no stream,
+//     because the subscriber's own work queue backs up and the client
+//     itself starts missing vsyncs.
+//
+// =============================================================================
+// SECTION 1  API
+// =============================================================================
+//
+// present_feedback_route_add_subscriber(subscriber_kind_id)
+//     -> route_id (< PFR_MAX_SUBSCRIBERS) | PFR_* sentinel
+//
+//   Allocates one route row for a fresh subscriber. subscriber_kind_id
+//   MUST be nonzero + fit in u32 (PFR_BAD_SUBSCRIBER otherwise).
+//   Duplicate subscribers are permitted -- a subscriber may hold two
+//   route slots if it wants two independent budget windows (e.g. one
+//   for on-screen surfaces and one for off-screen render targets).
+//   Row starts with subscription_count = 0, last_delivered_vblank_nsec
+//   = 0, dropped_count = 0. Bump the subscription_count via
+//   present_feedback_route_bump_subscription each time a surface is
+//   added.
+//
+// present_feedback_route_bump_subscription(route_id)
+//     -> 0 | PFR_BAD_SLOT | PFR_BUMP_OVERFLOW
+//
+//   Increments subscription_count. Refuses u32 overflow (would take
+//   4 billion surface subscriptions on one route -- defence-in-depth
+//   belt rather than a hot path). This is the accounting hook the
+//   subscriber calls each time it adds one of its subscribed surfaces
+//   to the route; the compositor uses the count for load-balancing
+//   diagnostics (a route with a very high subscription_count is a
+//   candidate for splitting into multiple routes to spread the fan-out
+//   cost).
+//
+// present_feedback_route_deliver(route_id, present_feedback_kind_id,
+//                                vblank_nsec)
+//     -> 0 | PFR_BUDGET_EXCEEDED | PFR_BAD_SLOT | PFR_BAD_KIND
+//
+//   THE BUDGET-ONE-REFRESH GATE. Called by the compositor each time a
+//   surface that this route follows completes a present. Behaviour:
+//     * route_id out of range or route not in_use -> PFR_BAD_SLOT.
+//       (Refused; refused_count is bumped.)
+//     * present_feedback_kind_id zero or > u32 -> PFR_BAD_KIND.
+//       (Refused; refused_count is bumped.)
+//     * last_delivered_vblank_nsec == vblank_nsec on this row
+//       -> PFR_BUDGET_EXCEEDED. Row's dropped_count is incremented;
+//       the aggregate _pfr_stats[PFR_ST_DROPS] is bumped. NO callback
+//       is invoked; the caller sees the sentinel and moves on. This is
+//       the load-bearing suppression -- the same subscriber will not
+//       see a second event for the same vsync.
+//     * otherwise -> update last_delivered_vblank_nsec to vblank_nsec,
+//       bump _pfr_stats[PFR_ST_DELIVERIES], return 0. The caller then
+//       invokes its own callback dispatch (a future landing that wires
+//       KIND_IPC_ENDPOINT send-on-route notifies the subscriber). The
+//       callback is decoupled from this file: this file's contract is
+//       BUDGET arbitration, not wire delivery.
+//
+//   NOTE on the vblank_nsec == 0 case: a fresh route has
+//   last_delivered_vblank_nsec == 0. The very first delivery on such a
+//   route legally carries vblank_nsec == 0 (a compositor whose
+//   monotonic clock is at exactly zero on the very first vblank has
+//   not started ticking yet -- the classic "first frame timing" edge).
+//   The current implementation TREATS vblank_nsec == 0 the same as any
+//   other value: if it equals the stored last_delivered_vblank_nsec
+//   (which is 0 on a fresh row), the delivery is suppressed and the
+//   fresh row's dropped_count goes to 1 on its first would-be
+//   delivery. This is DEFENSIVE. The compositor's clock in every
+//   reachable boot window is nonzero by the time the first vblank
+//   fires (the display timing subsystem posts its first vblank tens
+//   of thousands of ns after boot), so the vblank_nsec == 0 collision
+//   with a fresh row is only observable in synthetic test harnesses.
+//   Test harnesses that hit this edge should seed
+//   last_delivered_vblank_nsec to 0xFFFFFFFFFFFFFFFF at mint via a
+//   probe helper (future landing) rather than call in with vblank_nsec
+//   == 0.
+//
+// present_feedback_route_stats(route_id, out_ptr) -> 0 | PFR_BAD_SLOT
+//
+//   Writes 16 bytes at *out_ptr (2 u64 fields, little-endian):
+//     [+0]  subscription_count (zero-extended u32 -> u64)
+//     [+8]  dropped_count (u64)
+//   Caller MUST provide a 16-byte writable buffer. Bumps
+//   _pfr_stats[PFR_ST_QUERIES] once per call. The two individual
+//   accessors (subscription_count, dropped_count) are also exposed
+//   for callers that want a single field without an out-buffer.
+//
+// present_feedback_route_remove_subscriber(route_id) -> 0 | PFR_BAD_SLOT
+//                                                        | PFR_REMOVE_ALREADY
+//
+//   LINEAR CONSUME. Scrubs the route row (all four words zeroed,
+//   in_use cleared). The route_id is invalidated -- a subsequent call
+//   with the same route_id refuses PFR_BAD_SLOT (row not in_use) or
+//   PFR_REMOVE_ALREADY (the accessor distinguishes for observability).
+//   The subscription_count is NOT decremented on individual surface
+//   unbinds -- the route is a coarse-grained subscriber slot, and the
+//   subscription_count is monotonic-add-only until the route itself
+//   is consumed. This is the linearity property vocabulary §2 wants
+//   for stream-shaped kinds: the fan-out route is a stream, and
+//   consuming the stream is the atomic operation.
+//
+// present_feedback_route_subscription_count(route_id) -> u64
+//                                                       | 0xFF..FF sentinel
+// present_feedback_route_dropped_count(route_id) -> u64 | 0xFF..FF sentinel
+//   Direct field accessors. Bad row -> 0xFFFFFFFFFFFFFFFF (same
+//   sentinel present_feedback_kind.pdx's row-field accessors use;
+//   the caller compares against the sentinel to distinguish from a
+//   legitimate zero-valued field).
+//
+// present_feedback_route_stats_adds()       -> u64  monotonic add count.
+// present_feedback_route_stats_removes()    -> u64  monotonic remove count.
+// present_feedback_route_stats_deliveries() -> u64  monotonic deliver count.
+// present_feedback_route_stats_drops()      -> u64  aggregate drop count.
+// present_feedback_route_stats_refused()    -> u64  monotonic refused count.
+// present_feedback_route_stats_queries()    -> u64  monotonic query count.
+// present_feedback_route_stats_reset()      -> ()   zero all (test / init).
+//
+// =============================================================================
+// SECTION 2  FAILURE TAXONOMY 0xFFFFEAB0..0xFFFFEABF
+// =============================================================================
+//
+// Dispatch brief (Wave-0 B10-06) allocated 0xFFFFEC60..0xFFFFEC6F, but
+// repo-wide grep at landing time shows that band FULLY OCCUPIED by two
+// disjoint prior claimants:
+//   0xFFFFEC60..0xFFFFEC63  BDEV_ERR_* (src/kernel/core/cap/
+//                                       cap_handler_blkdev.pdx, M5-006
+//                                       extension of the blkdev band).
+//   0xFFFFEC65..0xFFFFEC6F  INDH_* (src/kernel/core/cap/
+//                                   kind_inode_handle.pdx §3 taxonomy).
+// Both claim the band explicitly; a third claim from this file would
+// alias to values the callers cross-check against the two established
+// bands' sentinels. Escalated by picking the nearest completely-free
+// 16-code band that a repo-wide grep verifies is unused: 0xFFFFEAB0..
+// 0xFFFFEABF, which sits in the same 0xFFFFEA__ page as the adjacent
+// compositor bands window_kind (0xFFFFEAA0..0xFFFFEAAF), xdg_shell_
+// geometry (0xFFFFEA70..0xFFFFEA7F), and subsurface_sync (0xFFFFEA20..
+// 0xFFFFEA2F), so a grep set that walks the compositor's failure pages
+// stays contiguous. The reallocation is documented here as a landing-
+// time delta from the brief; a follow-on issue tracking the brief's
+// EC60 collision is on the M4 punchlist (dispatch's failure-band
+// register needs the same grep pass this landing did).
+//
+// Codes (high-first, mirroring present_feedback_kind.pdx and every
+// KIND_*/logic module in this repo):
+//   PFR_TAIL_ENOSPC     = 0xFFFFEABF   row pool full.
+//   PFR_TAIL_BAD_ARG    = 0xFFFFEABE   packer bad-arg sentinel.
+//   PFR_BAD_SUBSCRIBER  = 0xFFFFEABD   subscriber_kind_id == 0 or >u32.
+//   PFR_BAD_SLOT        = 0xFFFFEABC   route_id >= PFR_MAX or not in_use.
+//   PFR_BUDGET_EXCEEDED = 0xFFFFEABB   BUDGET-ONE-REFRESH SUPPRESSION.
+//                                       Not a hard error -- the caller
+//                                       is expected to observe this and
+//                                       skip the notification cleanly.
+//   PFR_ROUTE_NONE      = 0xFFFFEABA   find-by-subscriber miss (unused
+//                                       at this landing; reserved for a
+//                                       future subscriber-uniqueness
+//                                       accessor).
+//   PFR_REMOVE_ALREADY  = 0xFFFFEAB9   remove called on an already-free
+//                                       slot; distinguished from
+//                                       PFR_BAD_SLOT so tooling can tell
+//                                       a double-remove from an out-of-
+//                                       range slot.
+//   PFR_BAD_KIND        = 0xFFFFEAB8   present_feedback_kind_id == 0
+//                                       or > u32.
+//   PFR_BUMP_OVERFLOW   = 0xFFFFEAB7   subscription_count == u32 max.
+//   PFR_STATS_BAD_PTR   = 0xFFFFEAB6   present_feedback_route_stats
+//                                       received an out_ptr sentinel
+//                                       (0 or 0xFFFF..FF).
+//   0xFFFFEAB0..0xFFFFEAB5 open for follow-on rollback / retry codes.
+//
+// =============================================================================
+// SECTION 3  ROW LAYOUT -- 32 BYTES (FOUR u64 WORDS)
+// =============================================================================
+//
+//   [+0]   header:  in_use[63:56] | reserved[55:32] | subscriber_kind_id[31:0]
+//   [+8]   counts:  subscription_count[31:0] | reserved[63:32]
+//   [+16]  last_delivered_vblank_nsec (u64, monotonic ns)
+//   [+24]  dropped_count (u64, monotonic count of suppressions)
+//
+// subscriber_kind_id is caller-supplied at add and MUST be nonzero +
+// fit in u32. Zero refused (PFR_BAD_SUBSCRIBER). Duplicates permitted
+// (see §1 add_subscriber). One route row per (subscriber, budget-
+// window) pair -- the caller is free to allocate N rows for one
+// subscriber if it wants N budget windows.
+//
+// subscription_count is a u32 in [0, 2^32). Bumped by bump_subscription
+// (each surface subscription that points at this route bumps it once);
+// never decremented (linearity: the route is consumed as a whole via
+// remove_subscriber, not decremented per surface).
+//
+// last_delivered_vblank_nsec is the last vblank_nsec value that
+// deliver() successfully forwarded. Fresh at 0; updated on every
+// non-suppressed delivery. The suppression discriminator is
+// equality between this stored value and the incoming vblank_nsec.
+//
+// dropped_count is the monotonic count of deliveries that were
+// suppressed by the budget cap. Read by observability tooling to
+// diagnose over-subscribed routes (a route with a very high
+// dropped_count relative to deliveries is a candidate for splitting).
+//
+// All slots stored little-endian. No float leaks into a timing/count
+// cell per FPU-discipline (design/kernel/no-fpu.md) -- vblank_nsec is
+// integer ns, subscription/dropped counts are unsigned integers.
+//
+// =============================================================================
+// SECTION 4  present_feedback_route_add_subscriber -- gate order
+// =============================================================================
+//
+// Gate order (fail-fast; refusal funnel bumps _pfr_stats[PFR_ST_REFUSED]
+// once):
+//   (1) subscriber_kind_id nonzero + fits in u32     -> PFR_BAD_SUBSCRIBER
+//   (2) pack header (subscriber_kind_id) + tail_alloc (zeroes rest)
+// No uniqueness gate on subscriber_kind_id (duplicates permitted per §1
+// add_subscriber). No parent-kind check (this is a logic module, not a
+// KIND cap; the KIND_PRESENT_FEEDBACK parent-kind check lives in the
+// sibling present_feedback_kind.pdx).
+//
+// =============================================================================
+// SECTION 5  DISCIPLINE
+// =============================================================================
+//
+// * Encoder rules: leaf primitives use r10/r11 scratch only; multi-arg
+//   helpers push callee-save (rbx/r12/r13/r14) with `sub rsp, 8` as
+//   needed to bring rsp%16 to 0 for every nested call. Every counter
+//   bump is load-inc-store (`mov rax, [mem]; add rax, 1; mov [mem], rax`),
+//   never `add [mem], reg` -- the encoder-safe idiom per the paideia-as
+//   Group-4 instruction discipline.
+// * Labels: all `present_feedback_route_<funcname>_<tag>` per the
+//   reserved-label note (`loop`, `if` etc. are paideia-as keywords;
+//   every label is prefixed by the function's short tag so no bare-
+//   keyword collision is possible). Short per-function tags (e.g.
+//   `_add_`, `_dl_`, `_rm_`) keep the label width in line with the
+//   sibling present_feedback_kind.pdx module.
+// * No float: every arg / return / row cell is u64. Follows
+//   design/kernel/no-fpu.md.
+// * Fingerprint: data-only tag (pdx_kind_present_feedback_route_meta)
+//   with the `[legacy: PRESENT FEEDBACK ROUTE OK]` suffix for grep
+//   parity with pdx_kind_present_feedback_meta and pdx_kind_a11y_bind_
+//   at_mint_meta. Emission body lands with the downstream compositor
+//   dispatcher; the tag decl here reserves the canonical string and is
+//   not yet emitted by any code path, so no golden line is required at
+//   this landing.
+
+module PresentFeedbackRoute = structure {
+
+  // ==========================================================================
+  // SECTION A  Constants + failure taxonomy + counter identity + fingerprint.
+  // ==========================================================================
+
+  pub let PFR_OK                    : u64 = 0
+
+  // Failure taxonomy 0xFFFFEAB0..0xFFFFEABF (see file header §2 for the
+  // dispatch-brief EC60 collision and this band's rationale).
+  pub let PFR_TAIL_ENOSPC           : u64 = 0xFFFFEABF
+  pub let PFR_TAIL_BAD_ARG          : u64 = 0xFFFFEABE
+  pub let PFR_BAD_SUBSCRIBER        : u64 = 0xFFFFEABD
+  pub let PFR_BAD_SLOT              : u64 = 0xFFFFEABC
+  pub let PFR_BUDGET_EXCEEDED       : u64 = 0xFFFFEABB
+  pub let PFR_ROUTE_NONE            : u64 = 0xFFFFEABA
+  pub let PFR_REMOVE_ALREADY        : u64 = 0xFFFFEAB9
+  pub let PFR_BAD_KIND              : u64 = 0xFFFFEAB8
+  pub let PFR_BUMP_OVERFLOW         : u64 = 0xFFFFEAB7
+  pub let PFR_STATS_BAD_PTR         : u64 = 0xFFFFEAB6
+
+  // Ceilings.
+  pub let PFR_MAX_SUBSCRIBERS       : u64 = 32
+  pub let PFR_ROW_BYTES             : u64 = 32
+  pub let PFR_U32_MAX               : u64 = 0xFFFFFFFF
+
+  // Counter slot ordinals for the _pfr_stats array (six live slots +
+  // two reserved for future rollback / retry counters -- the extra
+  // cells round the array to a full cache line for locality and give
+  // headroom to add more counters without shrinking the alignment pad).
+  pub let PFR_ST_ADDS               : u64 = 0
+  pub let PFR_ST_REMOVES            : u64 = 1
+  pub let PFR_ST_DELIVERIES         : u64 = 2
+  pub let PFR_ST_DROPS              : u64 = 3
+  pub let PFR_ST_REFUSED            : u64 = 4
+  pub let PFR_ST_QUERIES            : u64 = 5
+  pub let PFR_ST_MAX                : u64 = 8
+
+  // THE ONE STATE CELL. 32 rows * 32 bytes = 1024 bytes = 128 u64.
+  pub let mut _pfr_table : [u64; 128] = uninit @align(64)
+  pub let mut _pfr_stats : [u64; 8]   = uninit @align(64)
+
+  // Fingerprint tag. Suffix `[legacy: PRESENT FEEDBACK ROUTE OK]`
+  // matches the pattern pdx_kind_present_feedback_meta uses so grep
+  // tooling that scans for "^pdx_kind_.*_meta" finds all sibling tags
+  // as a set. Data-only at this landing; emission wiring lands when
+  // the compositor dispatcher grows a klog_s1_x1 call at the tail of
+  // every successful add_subscriber. No golden line required.
+  //
+  // "pdx present feedback route meta [legacy: PRESENT FEEDBACK ROUTE OK]\0"
+  // = 67 bytes of payload + 1 NUL terminator = 68 bytes total.
+  pub let pdx_kind_present_feedback_route_meta : [u8; 68] = "pdx present feedback route meta [legacy: PRESENT FEEDBACK ROUTE OK]\0"
+
+  // ==========================================================================
+  // SECTION B  Counter primitives.
+  //
+  // Six inlined stats accessors are direct memory reads at fixed
+  // offsets (no branch, no bounds check -- the six slot ordinals are
+  // compile-time constants). The bounds-checked bump primitive is
+  // exposed so the internal fan-out helpers can name a slot ordinal
+  // by constant (0..5) rather than hand-inline the load-add-store
+  // idiom six times. Every counter cell starts at 0 (zero-init .bss);
+  // present_feedback_route_stats_reset re-scrubs defensively on init
+  // paths that want the counters reset mid-life.
+  // ==========================================================================
+
+  pub let present_feedback_route_stats_bump : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): bounds-checked counter bump (which < 8). Load-inc-store idiom (no `add reg, [mem]`) per encoder discipline. Labels prefixed present_feedback_route_sb_.",
+      block: {
+        cmp rdi, 8;
+        jae present_feedback_route_sb_out;
+        lea r10, [rip + _pfr_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      present_feedback_route_sb_out:
+        ret
+      }
+    }
+
+  pub let present_feedback_route_stats_adds : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): direct read of _pfr_stats[PFR_ST_ADDS=0]. Labels prefixed present_feedback_route_sa_.",
+      block: {
+        lea r10, [rip + _pfr_stats];
+        mov rax, [r10 + 0];
+        ret
+      }
+    }
+
+  pub let present_feedback_route_stats_removes : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): direct read of _pfr_stats[PFR_ST_REMOVES=1] at byte offset 8. Labels prefixed present_feedback_route_sr_.",
+      block: {
+        lea r10, [rip + _pfr_stats];
+        mov rax, [r10 + 8];
+        ret
+      }
+    }
+
+  pub let present_feedback_route_stats_deliveries : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): direct read of _pfr_stats[PFR_ST_DELIVERIES=2] at byte offset 16. Labels prefixed present_feedback_route_sd_.",
+      block: {
+        lea r10, [rip + _pfr_stats];
+        mov rax, [r10 + 16];
+        ret
+      }
+    }
+
+  pub let present_feedback_route_stats_drops : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): direct read of _pfr_stats[PFR_ST_DROPS=3] at byte offset 24. Labels prefixed present_feedback_route_sp_.",
+      block: {
+        lea r10, [rip + _pfr_stats];
+        mov rax, [r10 + 24];
+        ret
+      }
+    }
+
+  pub let present_feedback_route_stats_refused : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): direct read of _pfr_stats[PFR_ST_REFUSED=4] at byte offset 32. Labels prefixed present_feedback_route_sf_.",
+      block: {
+        lea r10, [rip + _pfr_stats];
+        mov rax, [r10 + 32];
+        ret
+      }
+    }
+
+  pub let present_feedback_route_stats_queries : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): direct read of _pfr_stats[PFR_ST_QUERIES=5] at byte offset 40. Labels prefixed present_feedback_route_sq_.",
+      block: {
+        lea r10, [rip + _pfr_stats];
+        mov rax, [r10 + 40];
+        ret
+      }
+    }
+
+  pub let present_feedback_route_stats_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): scrub all eight cells of _pfr_stats (six live slots + two reserved for future counters). Encoder-safe short step-loop, no `add reg, [mem]`. `_step` suffix (not `_loop`) avoids the paideia-as `loop` keyword collision. Labels prefixed present_feedback_route_sre_.",
+      block: {
+        lea r10, [rip + _pfr_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      present_feedback_route_sre_step:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  present_feedback_route_sre_step;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION C  Validators.
+  // ==========================================================================
+
+  // present_feedback_route_subscriber_valid: 1 iff subscriber_kind_id
+  // nonzero AND fits in u32. Zero is refused (no live subscriber has a
+  // zero kind_id in this compositor's model). Used by add_subscriber
+  // to gate PFR_BAD_SUBSCRIBER.
+  pub let present_feedback_route_subscriber_valid : (u64) -> u64 !{} @{} =
+    fn (subscriber_kind_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): 1 iff subscriber_kind_id in (0, 2^32). Zero refuses a free-floating route (a route must be bound to some subscriber cap); >u32 refuses garbage. Labels prefixed present_feedback_route_sv_.",
+      block: {
+        cmp rdi, 0;
+        je  present_feedback_route_sv_no;
+        mov r10, 0xFFFFFFFF;
+        cmp rdi, r10;
+        ja  present_feedback_route_sv_no;
+        mov rax, 1;
+        ret;
+      present_feedback_route_sv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // present_feedback_route_kind_valid: 1 iff present_feedback_kind_id
+  // nonzero AND fits in u32. Zero is refused (no live KIND_PRESENT_
+  // FEEDBACK row has kind_id 0 in the sibling module's row model).
+  // Used by deliver() to gate PFR_BAD_KIND.
+  pub let present_feedback_route_kind_valid : (u64) -> u64 !{} @{} =
+    fn (present_feedback_kind_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): 1 iff present_feedback_kind_id in (0, 2^32). Zero refuses an unbound delivery (a delivery must name some KIND_PRESENT_FEEDBACK row); >u32 refuses garbage. Labels prefixed present_feedback_route_kv_.",
+      block: {
+        cmp rdi, 0;
+        je  present_feedback_route_kv_no;
+        mov r10, 0xFFFFFFFF;
+        cmp rdi, r10;
+        ja  present_feedback_route_kv_no;
+        mov rax, 1;
+        ret;
+      present_feedback_route_kv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // present_feedback_route_out_ptr_valid: 1 iff out_ptr not 0 and not
+  // the 0xFFFF..FF sentinel. Used by present_feedback_route_stats.
+  pub let present_feedback_route_out_ptr_valid : (u64) -> u64 !{} @{} =
+    fn (out_ptr: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): 1 iff out_ptr not 0 and not 0xFFFFFFFFFFFFFFFF. Any other value is treated as caller's responsibility (no alignment or writability probe -- caller MUST supply a 16-byte writable buffer per §1 stats). Labels prefixed present_feedback_route_ov_.",
+      block: {
+        cmp rdi, 0;
+        je  present_feedback_route_ov_no;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rdi, r10;
+        je  present_feedback_route_ov_no;
+        mov rax, 1;
+        ret;
+      present_feedback_route_ov_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION D  Packers.
+  // ==========================================================================
+
+  // header: in_use[63:56] | reserved[55:32] | subscriber_kind_id[31:0].
+  // Emitted WITHOUT in_use bit set; tail_alloc ORs it in on claim.
+  pub let present_feedback_route_hdr_pack : (u64) -> u64 !{} @{} =
+    fn (subscriber_kind_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): header pack. subscriber_kind_id at [31:0]; subscriber must be nonzero + <=u32 (present_feedback_route_subscriber_valid). Bad arg -> 0xFFFFFFFFFFFFFFFF sentinel (tail_alloc catches). Labels prefixed present_feedback_route_hp_.",
+      block: {
+        cmp rdi, 0;
+        je  present_feedback_route_hp_bad;
+        mov r10, 0xFFFFFFFF;
+        cmp rdi, r10;
+        ja  present_feedback_route_hp_bad;
+        mov rax, rdi;
+        and rax, 0xFFFFFFFF;
+        ret;
+      present_feedback_route_hp_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION E  Row pool: valid / alloc / free.
+  // ==========================================================================
+
+  pub let present_feedback_route_tail_valid : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): 1 iff row_id < PFR_MAX_SUBSCRIBERS(32) and in_use. Row stride 32 bytes. Labels prefixed present_feedback_route_tv_.",
+      block: {
+        cmp rdi, 32;
+        jae present_feedback_route_tv_no;
+        lea r10, [rip + _pfr_table];
+        mov r11, rdi;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  present_feedback_route_tv_no;
+        mov rax, 1;
+        ret;
+      present_feedback_route_tv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // present_feedback_route_tail_alloc(hdr) -> row_id | err.
+  // Low-first scan over 32 rows. Header stamped with in_use bit
+  // (bit 56) here so callers pass an "unset in_use" packed header.
+  // body1..body3 are zeroed (fresh row: subscription_count=0,
+  // last_delivered_vblank_nsec=0, dropped_count=0).
+  pub let present_feedback_route_tail_alloc : (u64) -> u64 !{mem} @{} =
+    fn (hdr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): claim one route row. Low-first scan (rbx=idx) over 32 rows of 32 bytes (idx*32 via imul). On claim: OR the 1<<56 in_use marker into hdr and store four u64 words (body1..body3 zero). Refuses when hdr already has the in_use bit set (caller error) or when hdr is the bad-arg sentinel. Two callee-save pushes (rbx=idx, r12=hdr); no nested calls in the body so the entry rsp%16==8 -> post-push rsp%16==8 alignment is benign (no call sites gated on rsp%16==0). Labels prefixed present_feedback_route_ta_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov r12, rdi;
+
+        // Refuse a hdr that already has in_use set (caller error).
+        mov rax, r12;
+        shr rax, 56;
+        cmp rax, 0;
+        jne present_feedback_route_ta_bad;
+        // Refuse the bad-arg sentinel from the packer.
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp r12, r10;
+        je  present_feedback_route_ta_bad;
+
+        xor rbx, rbx;
+      present_feedback_route_ta_scan:
+        cmp rbx, 32;
+        jae present_feedback_route_ta_enospc;
+        lea r10, [rip + _pfr_table];
+        mov r11, rbx;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  present_feedback_route_ta_claim;
+        add rbx, 1;
+        jmp present_feedback_route_ta_scan;
+
+      present_feedback_route_ta_claim:
+        mov rax, r12;
+        mov r11, 1;
+        shl r11, 56;
+        or  rax, r11;
+        mov [r10 + 0],  rax;
+        xor rax, rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov rax, rbx;
+        jmp present_feedback_route_ta_out;
+
+      present_feedback_route_ta_enospc:
+        mov rax, 0xFFFFEABF;
+        jmp present_feedback_route_ta_out;
+      present_feedback_route_ta_bad:
+        mov rax, 0xFFFFEABE;
+
+      present_feedback_route_ta_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let present_feedback_route_tail_free : (u64) -> () !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): scrub one row (all four words). Labels prefixed present_feedback_route_tf_.",
+      block: {
+        cmp rdi, 32;
+        jae present_feedback_route_tf_out;
+        lea r10, [rip + _pfr_table];
+        mov r11, rdi;
+        imul r11, r11, 32;
+        add r10, r11;
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+      present_feedback_route_tf_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION F  Row-field query helpers.
+  // ==========================================================================
+
+  pub let present_feedback_route_subscriber_kind : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): subscriber_kind_id at header[31:0]. Bad row -> 0xFFFFFFFFFFFFFFFF sentinel. Labels prefixed present_feedback_route_rsk_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call present_feedback_route_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_route_rsk_bad;
+        lea r10, [rip + _pfr_table];
+        mov r11, r12;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        and rax, 0xFFFFFFFF;
+        jmp present_feedback_route_rsk_out;
+      present_feedback_route_rsk_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      present_feedback_route_rsk_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let present_feedback_route_subscription_count : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): subscription_count at body1[31:0]. Bad row -> 0xFFFFFFFFFFFFFFFF sentinel. Labels prefixed present_feedback_route_rsc_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call present_feedback_route_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_route_rsc_bad;
+        lea r10, [rip + _pfr_table];
+        mov r11, r12;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        and rax, 0xFFFFFFFF;
+        jmp present_feedback_route_rsc_out;
+      present_feedback_route_rsc_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      present_feedback_route_rsc_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let present_feedback_route_last_vblank : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): last_delivered_vblank_nsec at body2 (u64). Bad row -> 0xFFFFFFFFFFFFFFFF sentinel. Labels prefixed present_feedback_route_rlv_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call present_feedback_route_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_route_rlv_bad;
+        lea r10, [rip + _pfr_table];
+        mov r11, r12;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        jmp present_feedback_route_rlv_out;
+      present_feedback_route_rlv_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      present_feedback_route_rlv_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let present_feedback_route_dropped_count : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): dropped_count at body3 (u64). Bad row -> 0xFFFFFFFFFFFFFFFF sentinel. Labels prefixed present_feedback_route_rdc_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call present_feedback_route_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_route_rdc_bad;
+        lea r10, [rip + _pfr_table];
+        mov r11, r12;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 24];
+        jmp present_feedback_route_rdc_out;
+      present_feedback_route_rdc_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      present_feedback_route_rdc_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION G  add_subscriber -- allocate one route row.
+  // ==========================================================================
+  //
+  // present_feedback_route_add_subscriber(subscriber_kind_id)
+  //     -> route_id | PFR_* sentinel.
+  //
+  // Fresh row: subscription_count=0, last_delivered_vblank_nsec=0,
+  // dropped_count=0. See file header §4 for the gate order.
+  pub let present_feedback_route_add_subscriber : (u64) -> u64 !{mem} @{} =
+    fn (subscriber_kind_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): allocate one route row for a fresh subscriber. Two callee-save pushes (rbx=subscriber_kind_id, r12=packed hdr) leave rsp%16==8; sub rsp,8 aligns to 16 for every nested call. Refusal funnel bumps _pfr_stats[PFR_ST_REFUSED] once at present_feedback_route_add_refused. Labels prefixed present_feedback_route_add_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                     // subscriber_kind_id
+
+        // (1) subscriber_kind_id nonzero + fits in u32.
+        mov rdi, rbx;
+        call present_feedback_route_subscriber_valid;
+        cmp rax, 0;
+        je  present_feedback_route_add_bad_subscriber;
+
+        // (2) Pack header (in_use bit unset; tail_alloc stamps it).
+        mov rdi, rbx;
+        call present_feedback_route_hdr_pack;
+        mov r12, rax;                     // r12 = hdr
+
+        // tail_alloc(hdr); body1..body3 zeroed by allocator.
+        mov rdi, r12;
+        call present_feedback_route_tail_alloc;
+
+        mov r10, 32;
+        cmp rax, r10;
+        jae present_feedback_route_add_enospc;
+
+        // Success: bump adds, preserve row_id across the note call.
+        mov rbx, rax;
+        mov rdi, 0;                       // PFR_ST_ADDS
+        call present_feedback_route_stats_bump;
+        mov rax, rbx;
+        jmp present_feedback_route_add_out;
+
+      present_feedback_route_add_bad_subscriber:
+        mov rax, 0xFFFFEABD;              // PFR_BAD_SUBSCRIBER
+        jmp present_feedback_route_add_refused;
+      present_feedback_route_add_enospc:
+        // rax already PFR_TAIL_ENOSPC (0xFFFFEABF) from tail_alloc.
+
+      present_feedback_route_add_refused:
+        mov rbx, rax;                     // stash sentinel
+        mov rdi, 4;                       // PFR_ST_REFUSED
+        call present_feedback_route_stats_bump;
+        mov rax, rbx;
+
+      present_feedback_route_add_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION H  bump_subscription -- increment subscription_count.
+  // ==========================================================================
+  //
+  // present_feedback_route_bump_subscription(row_id)
+  //     -> 0 | PFR_BAD_SLOT | PFR_BUMP_OVERFLOW.
+  //
+  // Refuses u32-overflow of subscription_count (would take 4 billion
+  // surface subscriptions on one route -- defence-in-depth belt).
+  // Preserves the reserved-half of body1[63:32] (0 today; reserved for
+  // future accounting fields).
+  pub let present_feedback_route_bump_subscription : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): increment subscription_count at body1[31:0]. Two callee-save pushes (rbx=row_id, r12=row base) leave rsp%16==8; sub rsp,8 aligns for the nested tail_valid call. Read-modify-write on body1: mask off low 32, saturate-refuse at u32 max, add 1, OR back in, store. Labels prefixed present_feedback_route_bp_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                     // row_id
+
+        mov rdi, rbx;
+        call present_feedback_route_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_route_bp_bad_slot;
+
+        lea r10, [rip + _pfr_table];
+        mov r11, rbx;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov r12, r10;                     // r12 = row base
+
+        // Load body1; extract low 32 into rax; refuse overflow; bump;
+        // reassemble.
+        mov rax, [r12 + 8];
+        mov r11, rax;
+        shl r11, 32;
+        shr r11, 32;              // r11 = current count
+        mov r10, 0xFFFFFFFF;
+        cmp r11, r10;
+        je  present_feedback_route_bp_overflow;
+
+        // Mask off the low 32 in rax (preserve reserved high half).
+        mov r10, 0xFFFFFFFF;
+        shl r10, 32;                      // 0xFFFFFFFF00000000
+        and rax, r10;
+
+        // Bump count and OR back in.
+        add r11, 1;
+        or  rax, r11;
+        mov [r12 + 8], rax;
+
+        xor rax, rax;
+        jmp present_feedback_route_bp_out;
+
+      present_feedback_route_bp_bad_slot:
+        mov rax, 0xFFFFEABC;              // PFR_BAD_SLOT
+        jmp present_feedback_route_bp_out;
+      present_feedback_route_bp_overflow:
+        mov rax, 0xFFFFEAB7;              // PFR_BUMP_OVERFLOW
+
+      present_feedback_route_bp_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION I  deliver -- THE BUDGET-ONE-REFRESH GATE.
+  // ==========================================================================
+  //
+  // present_feedback_route_deliver(row_id, present_feedback_kind_id,
+  //                                vblank_nsec)
+  //     -> 0 | PFR_BUDGET_EXCEEDED | PFR_BAD_SLOT | PFR_BAD_KIND.
+  //
+  // The load-bearing suppression: if the row's last_delivered_vblank_
+  // nsec already equals vblank_nsec, this delivery is a redundant fan-
+  // out of the SAME vsync and is suppressed. The row's dropped_count
+  // and the aggregate PFR_ST_DROPS counter are both bumped. Otherwise
+  // the timestamp is updated and PFR_ST_DELIVERIES is bumped; the
+  // caller then dispatches its own wire notification.
+  //
+  // The present_feedback_kind_id argument is validated but not stored
+  // -- it identifies WHICH KIND_PRESENT_FEEDBACK row triggered the
+  // delivery (for callback dispatch), not what state the route
+  // records. The route is a per-subscriber budget window; the kind_id
+  // is the payload the callback carries.
+  pub let present_feedback_route_deliver : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (present_feedback_kind_id: u64) (vblank_nsec: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): budget-one-refresh gate. Four callee-save pushes (rbx=row_id, r12=present_feedback_kind_id, r13=vblank_nsec, r14=row base) = 32 bytes: entry rsp%16==8, +32+8=40, sub rsp,8 aligns to 48, %16==0 for nested calls. Order: tail_valid, kind_valid, load body2, compare to r13, branch suppressed vs deliver. Suppressed path bumps body3 (dropped_count) via load-inc-store and PFR_ST_DROPS aggregate. Delivered path writes body2 = r13 and bumps PFR_ST_DELIVERIES. Labels prefixed present_feedback_route_dl_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                     // row_id
+        mov r12, rsi;                     // present_feedback_kind_id
+        mov r13, rdx;                     // vblank_nsec
+
+        // Gate 1: row valid.
+        mov rdi, rbx;
+        call present_feedback_route_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_route_dl_bad_slot;
+
+        // Gate 2: kind_id valid.
+        mov rdi, r12;
+        call present_feedback_route_kind_valid;
+        cmp rax, 0;
+        je  present_feedback_route_dl_bad_kind;
+
+        // Compute row base.
+        lea r10, [rip + _pfr_table];
+        mov r11, rbx;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov r14, r10;                     // r14 = row base
+
+        // Load last_delivered_vblank_nsec (body2); compare to r13.
+        mov rax, [r14 + 16];
+        cmp rax, r13;
+        je  present_feedback_route_dl_suppress;
+
+        // Delivered path: update timestamp, bump PFR_ST_DELIVERIES.
+        mov [r14 + 16], r13;
+        mov rdi, 2;                       // PFR_ST_DELIVERIES
+        call present_feedback_route_stats_bump;
+        xor rax, rax;
+        jmp present_feedback_route_dl_out;
+
+      present_feedback_route_dl_suppress:
+        // body3 (dropped_count) += 1 via load-inc-store; overflow-
+        // saturate at u64 max (defence-in-depth belt -- 4 billion
+        // suppressions per boot is not observably reachable).
+        mov rax, [r14 + 24];
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  present_feedback_route_dl_agg;
+        add rax, 1;
+        mov [r14 + 24], rax;
+      present_feedback_route_dl_agg:
+        // Aggregate: bump PFR_ST_DROPS.
+        mov rdi, 3;                       // PFR_ST_DROPS
+        call present_feedback_route_stats_bump;
+        mov rax, 0xFFFFEABB;              // PFR_BUDGET_EXCEEDED
+        jmp present_feedback_route_dl_out;
+
+      present_feedback_route_dl_bad_slot:
+        mov rax, 0xFFFFEABC;              // PFR_BAD_SLOT
+        jmp present_feedback_route_dl_refused;
+      present_feedback_route_dl_bad_kind:
+        mov rax, 0xFFFFEAB8;              // PFR_BAD_KIND
+
+      present_feedback_route_dl_refused:
+        mov rbx, rax;                     // stash sentinel
+        mov rdi, 4;                       // PFR_ST_REFUSED
+        call present_feedback_route_stats_bump;
+        mov rax, rbx;
+
+      present_feedback_route_dl_out:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION J  Bundled query -- present_feedback_route_stats.
+  // ==========================================================================
+  //
+  // present_feedback_route_stats(row_id, out_ptr) -> 0 | error.
+  //
+  // Writes 16 bytes at *out_ptr (2 u64 fields, little-endian):
+  //   [+0]  subscription_count (zero-extended to u64)
+  //   [+8]  dropped_count
+  //
+  // Bumps PFR_ST_QUERIES once per call. Refuses out_ptr == 0 or
+  // 0xFFFF..FF with PFR_STATS_BAD_PTR. The two individual field
+  // accessors (present_feedback_route_subscription_count and
+  // present_feedback_route_dropped_count above in §F) remain the
+  // preferred surface for callers that only want a single field.
+  pub let present_feedback_route_stats : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): bundled stats read. Three callee-save pushes (rbx=row_id, r12=out_ptr, r13=row base) leave rsp%16==0 for nested tail_valid + out_ptr_valid + stats_bump. Labels prefixed present_feedback_route_qs_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                     // row_id
+        mov r12, rsi;                     // out_ptr
+
+        // Gate: out_ptr valid.
+        mov rdi, r12;
+        call present_feedback_route_out_ptr_valid;
+        cmp rax, 0;
+        je  present_feedback_route_qs_bad_ptr;
+
+        // Gate: row valid.
+        mov rdi, rbx;
+        call present_feedback_route_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_route_qs_bad_slot;
+
+        // Note the query.
+        mov rdi, 5;                       // PFR_ST_QUERIES
+        call present_feedback_route_stats_bump;
+
+        lea r10, [rip + _pfr_table];
+        mov r11, rbx;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov r13, r10;                     // r13 = row base
+
+        // out[+0] = subscription_count (body1[31:0], zero-extend).
+        mov rax, [r13 + 8];
+        and rax, 0xFFFFFFFF;
+        mov [r12 + 0], rax;
+        // out[+8] = dropped_count (body3).
+        mov rax, [r13 + 24];
+        mov [r12 + 8], rax;
+
+        xor rax, rax;
+        jmp present_feedback_route_qs_out;
+
+      present_feedback_route_qs_bad_ptr:
+        mov rax, 0xFFFFEAB6;              // PFR_STATS_BAD_PTR
+        jmp present_feedback_route_qs_refused;
+      present_feedback_route_qs_bad_slot:
+        mov rax, 0xFFFFEABC;              // PFR_BAD_SLOT
+
+      present_feedback_route_qs_refused:
+        mov rbx, rax;                     // stash sentinel
+        mov rdi, 4;                       // PFR_ST_REFUSED
+        call present_feedback_route_stats_bump;
+        mov rax, rbx;
+
+      present_feedback_route_qs_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION K  remove_subscriber -- LINEAR consume.
+  // ==========================================================================
+  //
+  // present_feedback_route_remove_subscriber(row_id)
+  //     -> 0 | PFR_BAD_SLOT | PFR_REMOVE_ALREADY.
+  //
+  // Distinguished failure codes:
+  //   PFR_BAD_SLOT     -- row_id >= PFR_MAX_SUBSCRIBERS (out of range).
+  //   PFR_REMOVE_ALREADY -- row_id in range but slot already free.
+  // Callers that don't care about the distinction can treat either as
+  // "no-op"; observability tooling that does care can tell the two
+  // apart.
+  pub let present_feedback_route_remove_subscriber : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): LINEAR consume of one route row. One callee-save push (r12=row_id) gives rsp%16==0 for every nested call (tail_valid, tail_free, stats_bump). Order: bounds check, in_use check, tail_free, bump removes. Bounds and in_use are distinguished so tooling can tell an out-of-range slot from a double-remove. Labels prefixed present_feedback_route_rm_.",
+      block: {
+        push r12;
+
+        mov r12, rdi;                     // row_id
+
+        // Bounds.
+        mov r10, 32;
+        cmp r12, r10;
+        jae present_feedback_route_rm_bad_slot;
+
+        // in_use.
+        mov rdi, r12;
+        call present_feedback_route_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_route_rm_already;
+
+        // Consume.
+        mov rdi, r12;
+        call present_feedback_route_tail_free;
+        mov rdi, 1;                       // PFR_ST_REMOVES
+        call present_feedback_route_stats_bump;
+        xor rax, rax;
+        jmp present_feedback_route_rm_out;
+
+      present_feedback_route_rm_bad_slot:
+        mov rax, 0xFFFFEABC;              // PFR_BAD_SLOT
+        jmp present_feedback_route_rm_out;
+      present_feedback_route_rm_already:
+        mov rax, 0xFFFFEAB9;              // PFR_REMOVE_ALREADY
+
+      present_feedback_route_rm_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION L  Boot init.
+  // ==========================================================================
+
+  pub let present_feedback_route_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-06 (paideia-os #2298): scrub the row pool + all stats counters. 32 rows * 4 u64 = 128 u64 for the table, 8 u64 for stats. Two encoder-safe step-loops (`_step` suffix, not `_loop`, to avoid the paideia-as `loop` keyword collision). Labels prefixed present_feedback_route_i_.",
+      block: {
+        // Scrub _pfr_table.
+        lea r10, [rip + _pfr_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      present_feedback_route_i_rows_step:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 128;
+        jb  present_feedback_route_i_rows_step;
+
+        // Scrub _pfr_stats.
+        lea r10, [rip + _pfr_stats];
+        xor rcx, rcx;
+      present_feedback_route_i_stats_step:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  present_feedback_route_i_stats_step;
+        ret
+      }
+    }
+}

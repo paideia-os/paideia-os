@@ -1,0 +1,1278 @@
+// src/user/compositor/buffer_age.pdx -- Wave0-B10-05 (paideia-os #2295)
+//
+// Buffer-age driven partial repaint scheduler. Small ring buffer of per-
+// surface damage snapshots keyed by frame number, with a query primitive
+// that unions the last N snapshots into one aggregated damage cap.
+//
+// Design authority: design/compositor/pwp-spec-vocabulary.md §2.11
+// (KIND_DAMAGE_REGION) + design/compositor/pwp-spec-vocabulary.md §2.12
+// (KIND_PRESENT_FEEDBACK) + next-wave-osarch.md §"partial repaint" note.
+// Depends structurally on KIND_DAMAGE_REGION (0x1D9, LANDED B9-06 at
+// src/user/compositor/damage_kind.pdx); this landing lifts that row-cap
+// into a scheduler that lets the compositor answer "given that this
+// back-buffer was last presented N frames ago, what must be repainted?".
+//
+// =============================================================================
+// SECTION 0  MOTIVATION -- WHY BUFFER AGE MATTERS
+// =============================================================================
+//
+// EGL_EXT_buffer_age (and its Vulkan analogue VK_EXT_swapchain_maintenance1
+// present-id / back-buffer-age query) exposes one integer per acquire:
+// "this back-buffer was last presented N frames ago". Naive compositors
+// treat every frame as a full repaint; a buffer-age-aware compositor
+// unions the damage that has accumulated across the last N frames and
+// repaints only that union. The saving is proportional to the fraction
+// of the framebuffer that is stable frame-to-frame -- for a text editor
+// or a chat window with a blinking cursor the savings are dramatic
+// (well over 90 % of the framebuffer stays untouched).
+//
+// SEMANTICS. On every present the compositor calls buffer_age_push with
+// the damage_region_id that was applied that frame + the frame number.
+// On the next acquire the driver hands back an age N (1 = the buffer we
+// just presented; larger = older). The compositor calls buffer_age_query
+// with N; the primitive walks the last N snapshots, unions their damage
+// via damage_region_union (from damage_kind.pdx), and returns a fresh
+// KIND_DAMAGE_REGION row that the compose pass reads as its repaint set.
+//
+// EDGE CASES.
+//   (a) age == 0 is a driver-reported "this buffer is brand new" (never
+//       presented). The correct response is a full-surface repaint. This
+//       primitive returns BA_QUERY_EMPTY so the caller knows to fall
+//       back to full damage rather than an empty union.
+//   (b) age > count means the driver has cycled back to a buffer older
+//       than any snapshot we retained (typical when the swapchain depth
+//       exceeds BA_HISTORY_MAX). The correct response is again a full-
+//       surface repaint; we return BA_BAD_AGE so the caller falls back.
+//   (c) age > BA_HISTORY_MAX (8) means the driver reports an age we
+//       structurally cannot serve. Same fallback: BA_BAD_AGE.
+//   (d) a mode change (resolution / colour space / HDR flip) invalidates
+//       every past snapshot; the caller calls buffer_age_reset to drop
+//       the ring back to count=0 and forces the next query to fall back
+//       to full repaint.
+//
+// =============================================================================
+// SECTION 1  DEPENDENCY ON KIND_DAMAGE_REGION
+// =============================================================================
+//
+// buffer_age_query is a cross-module consumer of two damage_kind entry
+// points:
+//
+//   damage_region_mint(surface: u64) -> row_id | DR_TAIL_ENOSPC
+//                                     | DR_MINT_BAD_SURFACE
+//   damage_region_union(dst: u64, src: u64) -> DR_OK | DR_BAD_SLOT
+//
+// Both are declared `pub let` in src/user/compositor/damage_kind.pdx and
+// so are emitted as global symbols in the compositor binary. This file
+// calls them by raw symbol name; the paideia-as linker resolves them
+// at link time. If the link fails (either module compiled standalone,
+// or symbol scoping changes), the fallback is to expose a variant
+// buffer_age_query_fold that takes a caller-pre-minted dst row and only
+// calls damage_region_union. That fallback is NOT wired in this landing
+// (the module structure supports it if the primary path breaks).
+//
+// FRAME-NUMBER SEMANTICS. frame_num is a u64 monotonic counter the
+// compositor advances on every present. Wraparound at 2^64 is out of
+// scope (2^64 frames at 240 Hz = 2.4 billion years). The primitive does
+// no arithmetic on frame_num other than storing it; buffer_age_query
+// selects by count-back-from-newest, NOT by frame_num delta -- the
+// driver-reported age is the authority. frame_num is retained only for
+// observability (a future present-feedback correlator uses it to align
+// missed-vsync events with the damage snapshot that produced them).
+//
+// =============================================================================
+// SECTION 2  ROW LAYOUT -- 136 BYTES (17 u64 WORDS)
+// =============================================================================
+//
+//   [+0]   word0: surface_kind_id[31:0]
+//                | head_index[39:32]      (0..7)
+//                | count[47:40]           (0..8)
+//                | reserved[55:48]
+//                | in_use[63:56]          (0 or 1)
+//   [+8]   word1:  entry[0].damage_region_id (u32 in [31:0])
+//   [+16]  word2:  entry[0].frame_num        (u64)
+//   [+24]  word3:  entry[1].damage_region_id
+//   [+32]  word4:  entry[1].frame_num
+//   [+40]  word5:  entry[2].damage_region_id
+//   [+48]  word6:  entry[2].frame_num
+//   [+56]  word7:  entry[3].damage_region_id
+//   [+64]  word8:  entry[3].frame_num
+//   [+72]  word9:  entry[4].damage_region_id
+//   [+80]  word10: entry[4].frame_num
+//   [+88]  word11: entry[5].damage_region_id
+//   [+96]  word12: entry[5].frame_num
+//   [+104] word13: entry[6].damage_region_id
+//   [+112] word14: entry[6].frame_num
+//   [+120] word15: entry[7].damage_region_id
+//   [+128] word16: entry[7].frame_num
+// Total: 136 bytes = 17 u64 words per row. 8-byte aligned.
+//
+// Entry i is at offset 8 + i*16 (damage_region_id) and 16 + i*16
+// (frame_num). imul r,r,16 hits the mnemonic-conservative encoder
+// subset (same discipline as damage_kind's rect array at offset
+// 32 + i*16). Row-base multiplier is 136 (imul r,r,136).
+//
+// RING SEMANTICS.
+//   head_index points at the OLDEST live slot.
+//   count is the number of live entries (0..8).
+//   When count < BA_HISTORY_MAX: push writes at (head + count) % 8;
+//   count += 1.
+//   When count == BA_HISTORY_MAX: push overwrites the oldest at head,
+//   then head = (head + 1) % 8. count stays at 8.
+//   Newest live entry is always at (head + count - 1) % 8 when count > 0.
+//
+// POOL SIZING. BA_MAX = 32 rows -> 32 * 136 = 4352 bytes = 544 u64
+// words. Parity with damage_kind's 32-row pool. One ring per surface;
+// 32 surfaces is a comfortable ceiling for a workstation compositor.
+//
+// =============================================================================
+// SECTION 3  RIGHTS BITMASK
+// =============================================================================
+//
+// Layout follows the damage_kind_ / hmk_ / surface_kind_ convention
+// (READ 0x001, INVOKE 0x008, REVOKE 0x010, MINT 0x100, OBSERVE 0x200) and
+// inserts the four buffer-age-specific op-rights into the intervening
+// 0x020..0x080 range so a single AND against R_BA_ALL suffices for the
+// mint-time subset test.
+//
+//   R_BA_READ           0x001   generic query cap surface
+//   R_BA_INVOKE         0x008   permission to enter cap_invoke
+//   R_BA_REVOKE         0x010   revoke authority (holder side)
+//   R_BA_PUSH           0x020   OP_PUSH (append snapshot)
+//   R_BA_QUERY          0x040   OP_QUERY (union last N)
+//   R_BA_RESET          0x080   OP_RESET (drop history on mode change)
+//   R_BA_MINT           0x100   factory authority (holder side of surface)
+//   R_BA_OBSERVE        0x200   subscribe to push events (future)
+//   R_BA_ALL            0x3F9   OR of all above
+//
+// R_BA_PUSH is a distinct right so a diagnostic client that only holds
+// R_BA_QUERY + R_BA_READ cannot silently corrupt the compositor's own
+// snapshot stream (buffer-age accuracy is a compositor-only concern).
+// R_BA_RESET is separated from R_BA_PUSH so a mode-change orchestrator
+// can be granted CLEAR-only authority.
+//
+// =============================================================================
+// SECTION 4  OP NUMBERING
+// =============================================================================
+//
+// Every op is arity ONE (row_id in target_ptr, sub-op in op_arg[7:0]);
+// op_arg[63:8] MUST be zero -- the future dispatcher refuses a smuggled
+// second value with BA_TAIL_BAD_ARG (elided from this landing; the sole
+// dispatch discipline mirror is damage_kind's).
+//
+//   BA_OP_QUERY_SURFACE  0
+//   BA_OP_COUNT          1
+//   BA_OP_HEAD           2
+//   BA_OP_PUSH           3    (damage_region_id + frame_num as arg pair)
+//   BA_OP_QUERY          4    (back_buffer_age in op_arg[7:0])
+//   BA_OP_RESET          5
+//   BA_OP_ENTRY_REGION   6    (idx in op_arg[7:0])
+//   BA_OP_ENTRY_FRAME    7    (idx in op_arg[7:0])
+//   BA_OP_MAX            7
+//
+// =============================================================================
+// SECTION 5  FAILURE TAXONOMY -- 0xFFFFEC50..0xFFFFEC5F (16 slots)
+// =============================================================================
+//
+// Fresh page, grep-verified free across src/ + design/ at landing time.
+// The 16-slot band is claimed as a unit; individual sentinels leave one
+// slot spare for a future distinct-from-BA_BAD_AGE encoding of "driver
+// reported age larger than swapchain depth".
+//
+//   BA_OK                0             success sentinel
+//   BA_TAIL_ENOSPC       0xFFFFEC5F    row pool full at ring_init
+//   BA_TAIL_BAD_ARG      0xFFFFEC5E    op_arg[63:8] != 0 (reserved,
+//                                      dispatcher-side)
+//   BA_MINT_BAD_SURFACE  0xFFFFEC5D    surface row_id invalid (zero or
+//                                      out of u32 range)
+//   BA_MINT_BAD_RIGHTS   0xFFFFEC5C    rights !subset R_BA_ALL
+//   BA_BAD_SLOT          0xFFFFEC5B    row_id >= BA_MAX or not in_use
+//   BA_WRONG_KIND        0xFFFFEC5A    cap not KIND_BUFFER_AGE at
+//                                      cap_invoke (dispatcher-side)
+//   BA_REVOKE_ALREADY    0xFFFFEC59    double-revoke against same slot
+//   BA_BAD_PTR           0xFFFFEC58    row_id passed as sentinel u64::MAX
+//   BA_BAD_AGE           0xFFFFEC57    back_buffer_age > BA_HISTORY_MAX
+//                                      OR back_buffer_age > count
+//   BA_BAD_REGION        0xFFFFEC56    damage_region_id doesn't fit u32
+//                                      (used at push validation)
+//   BA_BAD_INDEX         0xFFFFEC55    entry accessor idx >= count
+//   BA_QUERY_EMPTY       0xFFFFEC54    query with back_buffer_age == 0
+//                                      or ring count == 0 (caller falls
+//                                      back to full repaint)
+//   BA_MINT_FAIL         0xFFFFEC53    damage_region_mint refused the
+//                                      query's dst allocation
+//   BA_UNION_FAIL        0xFFFFEC52    damage_region_union refused a
+//                                      fold step (dst or src invalidated
+//                                      between snapshot and query)
+//   BA_UNSUP_OP          0xFFFFEC51    op ordinal > BA_OP_MAX (reserved)
+//   BA_DECODE_BAD        0xFFFFEC50    generic decode-shape reject
+//
+// =============================================================================
+// SECTION 6  LABEL PREFIX
+// =============================================================================
+//
+// LABEL PREFIX: `buffer_age_` (per dispatch briefing). Every asm-body
+// label below is `buffer_age_<local>` so no collision with paideia-as
+// reserved keywords (`loop`, `if`, `let`, `while`, `for`, `match`, `pub`,
+// `mod`, `use`, `fn`, `struct`, `enum`, `impl`, `trait`, `type`, `where`,
+// `move`, `mut`, `ref`) per feedback_paideia_as_reserved_labels. Local
+// suffixes are <= 6 chars where possible so the fully-qualified label
+// stays inside the ring's log-line budget.
+
+module BufferAge = structure {
+
+  // ==========================================================================
+  // Identity.
+  // ==========================================================================
+
+  pub let KIND_BUFFER_AGE : u64 = 0x1DD               // successor to
+                                                      // KIND_PRESENT_FEEDBACK
+                                                      // (0x1DA); grep-verified
+                                                      // free at landing.
+  pub let BA_PARENT_KIND  : u64 = 0x1B8               // KIND_SURFACE
+
+  // ==========================================================================
+  // Row pool sizing.
+  // ==========================================================================
+
+  pub let BA_MAX          : u64 = 32                  // rows in pool
+  pub let BA_ROW_BYTES    : u64 = 136                 // per-row size
+  pub let BA_ROW_WORDS    : u64 = 17                  // per-row u64 count
+  pub let BA_HISTORY_MAX  : u64 = 8                   // ring depth per surface
+
+  // Cross-module dependency constants (damage_kind failure sentinels we
+  // pattern-match against on cross-module return paths).
+  pub let DR_OK_LOCAL          : u64 = 0
+  pub let DR_TAIL_ENOSPC_LOCAL : u64 = 0xFFFFEBCF
+  pub let DR_MINT_BAD_SURFACE_LOCAL : u64 = 0xFFFFEBCB
+
+  // ==========================================================================
+  // Rights bitmask.
+  // ==========================================================================
+
+  pub let R_BA_READ    : u64 = 0x001
+  pub let R_BA_INVOKE  : u64 = 0x008
+  pub let R_BA_REVOKE  : u64 = 0x010
+  pub let R_BA_PUSH    : u64 = 0x020
+  pub let R_BA_QUERY   : u64 = 0x040
+  pub let R_BA_RESET   : u64 = 0x080
+  pub let R_BA_MINT    : u64 = 0x100
+  pub let R_BA_OBSERVE : u64 = 0x200
+  pub let R_BA_ALL     : u64 = 0x3F9
+    // 0x001|0x008|0x010|0x020|0x040|0x080|0x100|0x200
+
+  // ==========================================================================
+  // Op numbering.
+  // ==========================================================================
+
+  pub let BA_OP_QUERY_SURFACE : u64 = 0
+  pub let BA_OP_COUNT         : u64 = 1
+  pub let BA_OP_HEAD          : u64 = 2
+  pub let BA_OP_PUSH          : u64 = 3
+  pub let BA_OP_QUERY         : u64 = 4
+  pub let BA_OP_RESET         : u64 = 5
+  pub let BA_OP_ENTRY_REGION  : u64 = 6
+  pub let BA_OP_ENTRY_FRAME   : u64 = 7
+  pub let BA_OP_MAX           : u64 = 7
+
+  // ==========================================================================
+  // Failure taxonomy 0xFFFFEC50..0xFFFFEC5F.
+  // ==========================================================================
+
+  pub let BA_OK                : u64 = 0
+  pub let BA_TAIL_ENOSPC       : u64 = 0xFFFFEC5F
+  pub let BA_TAIL_BAD_ARG      : u64 = 0xFFFFEC5E
+  pub let BA_MINT_BAD_SURFACE  : u64 = 0xFFFFEC5D
+  pub let BA_MINT_BAD_RIGHTS   : u64 = 0xFFFFEC5C
+  pub let BA_BAD_SLOT          : u64 = 0xFFFFEC5B
+  pub let BA_WRONG_KIND        : u64 = 0xFFFFEC5A
+  pub let BA_REVOKE_ALREADY    : u64 = 0xFFFFEC59
+  pub let BA_BAD_PTR           : u64 = 0xFFFFEC58
+  pub let BA_BAD_AGE           : u64 = 0xFFFFEC57
+  pub let BA_BAD_REGION        : u64 = 0xFFFFEC56
+  pub let BA_BAD_INDEX         : u64 = 0xFFFFEC55
+  pub let BA_QUERY_EMPTY       : u64 = 0xFFFFEC54
+  pub let BA_MINT_FAIL         : u64 = 0xFFFFEC53
+  pub let BA_UNION_FAIL        : u64 = 0xFFFFEC52
+  pub let BA_UNSUP_OP          : u64 = 0xFFFFEC51
+  pub let BA_DECODE_BAD        : u64 = 0xFFFFEC50
+
+  pub let BA_U32_MAX : u64 = 0xFFFFFFFF
+
+  // ==========================================================================
+  // THE ONE STATE CELL. 32 rows * 17 u64 = 544 u64 = 4352 bytes.
+  // Plus a 6-slot counter table.
+  // ==========================================================================
+
+  pub let mut _ba_table : [u64; 544] = uninit @align(64)
+  pub let mut _ba_stats : [u64;  6]  = uninit @align(64)
+
+  pub let BA_ST_INITS     : u64 = 0
+  pub let BA_ST_REVOKES   : u64 = 1
+  pub let BA_ST_REFUSED   : u64 = 2
+  pub let BA_ST_PUSHES    : u64 = 3
+  pub let BA_ST_QUERIES   : u64 = 4
+  pub let BA_ST_RESETS    : u64 = 5
+
+  // ==========================================================================
+  // Fingerprint tag.
+  //
+  // ONE line ending in `[legacy: ... OK]` per softarch discipline. Emitted
+  // by the future kernel-side kind_buffer_age dispatch body on successful
+  // ring_init via klog_s1_x1; until that landing arrives the string is a
+  // data-only constant and needs allowlisting in
+  // tools/verify-fingerprint-coverage.sh with reason "Wave0-B10-05 (#2295)
+  // KIND_BUFFER_AGE user-space cap-kind decl; kernel dispatch body not
+  // yet landed; user-space buffer_age_ring_init below is the transitional
+  // authority that does not emit klog (compositor process, ring 3)". Main
+  // coordinator adds that entry at Batch 10 close-out.
+  //
+  // Length: "buffer age ring init ok [legacy: BUFFER AGE RING INIT OK]\0"
+  // = 58 bytes.
+  // ==========================================================================
+
+  pub let pdx_kind_buffer_age_meta : [u8; 58] = "buffer age ring init ok [legacy: BUFFER AGE RING INIT OK]\0"
+
+  // ==========================================================================
+  // Section 7  Counter primitives.
+  // ==========================================================================
+
+  pub let buffer_age_stats_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): clear row table + counters at boot. 32 rows * 17 u64 = 544 u64 for _ba_table + 6 u64 for _ba_stats. Leaf; no callee-save discipline; rax/rcx clobber. Uses cmp reg,imm rather than test (paideia-as U1605). Labels prefixed buffer_age_.",
+      block: {
+        lea r10, [rip + _ba_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      buffer_age_srz_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 544;
+        jb  buffer_age_srz_rows;
+
+        lea r10, [rip + _ba_stats];
+        xor rcx, rcx;
+      buffer_age_srz_st:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 6;
+        jb  buffer_age_srz_st;
+        ret
+      }
+    }
+
+  pub let buffer_age_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): counter bump. Encoder-conservative load-inc-store; no add reg,[mem] (paideia-as ban). Labels prefixed buffer_age_.",
+      block: {
+        cmp rdi, 6;
+        jae buffer_age_nt_out;
+        lea r10, [rip + _ba_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      buffer_age_nt_out:
+        ret
+      }
+    }
+
+  pub let buffer_age_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): counter read. Labels prefixed buffer_age_.",
+      block: {
+        cmp rdi, 6;
+        jae buffer_age_stt_zero;
+        lea r10, [rip + _ba_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      buffer_age_stt_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Section 8  Validators.
+  // ==========================================================================
+
+  // buffer_age_rights_valid: 1 iff rights subset of R_BA_ALL.
+  pub let buffer_age_rights_valid : (u64) -> u64 !{} @{} =
+    fn (rights: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): subset test against R_BA_ALL = 0x3F9. Labels prefixed buffer_age_.",
+      block: {
+        mov rax, rdi;
+        mov r10, 0x3F9;
+        and rax, r10;
+        cmp rax, rdi;
+        jne buffer_age_rv_no;
+        mov rax, 1;
+        ret;
+      buffer_age_rv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // buffer_age_u32_valid: 1 iff v <= 0xFFFFFFFF.
+  pub let buffer_age_u32_valid : (u64) -> u64 !{} @{} =
+    fn (v: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): 1 iff v fits in u32. Reused for surface_kind_id and damage_region_id at push. Labels prefixed buffer_age_.",
+      block: {
+        mov r10, 0xFFFFFFFF;
+        cmp rdi, r10;
+        ja  buffer_age_uv_no;
+        mov rax, 1;
+        ret;
+      buffer_age_uv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Section 9  Row pool: valid / base / alloc / free.
+  // ==========================================================================
+
+  // buffer_age_tail_valid: 1 iff row_id < BA_MAX and in_use.
+  pub let buffer_age_tail_valid : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): 1 iff row_id < BA_MAX AND top byte of word0 nonzero. imul r,r,136 for row-base. Labels prefixed buffer_age_.",
+      block: {
+        cmp rdi, 32;
+        jae buffer_age_tv_no;
+        lea r10, [rip + _ba_table];
+        mov r11, rdi;
+        imul r11, r11, 136;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  buffer_age_tv_no;
+        mov rax, 1;
+        ret;
+      buffer_age_tv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // buffer_age_row_base(row_id) -> table_base + row_id*136 | 0 on out-of-
+  // range. Helper used by every mutation body.
+  pub let buffer_age_row_base : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): return &_ba_table[row_id*136]; 0 iff row_id >= BA_MAX. NOT a validity check for in_use; that is buffer_age_tail_valid. Labels prefixed buffer_age_.",
+      block: {
+        cmp rdi, 32;
+        jae buffer_age_rb_zero;
+        lea rax, [rip + _ba_table];
+        mov r11, rdi;
+        imul r11, r11, 136;
+        add rax, r11;
+        ret;
+      buffer_age_rb_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // buffer_age_tail_alloc(surface_kind_id) -> row_id | BA_TAIL_ENOSPC.
+  // Low-first scan; on claim, zero every word of the row, then set
+  // word0 = surface_kind_id[31:0] | in_use<<56 (head_index=0, count=0
+  // are already zeroed).
+  pub let buffer_age_tail_alloc : (u64) -> u64 !{mem} @{} =
+    fn (surface_kind_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): claim one KIND_BUFFER_AGE row. Low-first scan over 32 rows of 136 bytes. On claim: write in_use|surface_kind_id into word0 then zero the remaining 16 words. Two-push prologue keeps rsp%16==0 for the leaf (no nested call). Uses cmp reg,0 (not test). Labels prefixed buffer_age_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov r12, rdi;                          // r12 = surface_kind_id
+        xor rbx, rbx;                          // rbx = idx
+
+      buffer_age_ta_scan:
+        cmp rbx, 32;
+        jae buffer_age_ta_enospc;
+        lea r10, [rip + _ba_table];
+        mov r11, rbx;
+        imul r11, r11, 136;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  buffer_age_ta_claim;
+        add rbx, 1;
+        jmp buffer_age_ta_scan;
+
+      buffer_age_ta_claim:
+        // word0 = surface_kind_id[31:0] | (1 << 56); head=0, count=0.
+        mov rax, r12;
+        mov r11, 0xFFFFFFFF;
+        and rax, r11;
+        mov r11, 1;
+        shl r11, 56;
+        or  rax, r11;
+        mov [r10 + 0], rax;
+
+        // word1..word16 = 0.
+        xor rax, rax;
+        mov [r10 + 8],   rax;
+        mov [r10 + 16],  rax;
+        mov [r10 + 24],  rax;
+        mov [r10 + 32],  rax;
+        mov [r10 + 40],  rax;
+        mov [r10 + 48],  rax;
+        mov [r10 + 56],  rax;
+        mov [r10 + 64],  rax;
+        mov [r10 + 72],  rax;
+        mov [r10 + 80],  rax;
+        mov [r10 + 88],  rax;
+        mov [r10 + 96],  rax;
+        mov [r10 + 104], rax;
+        mov [r10 + 112], rax;
+        mov [r10 + 120], rax;
+        mov [r10 + 128], rax;
+
+        mov rax, rbx;
+        jmp buffer_age_ta_out;
+
+      buffer_age_ta_enospc:
+        mov rax, 0xFFFFEC5F;                   // BA_TAIL_ENOSPC
+
+      buffer_age_ta_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // buffer_age_tail_free: zero every word of the row (including in_use).
+  // No-op when row_id out of range. Leaf.
+  pub let buffer_age_tail_free : (u64) -> () !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): scrub one row (all 17 words). Labels prefixed buffer_age_.",
+      block: {
+        cmp rdi, 32;
+        jae buffer_age_tf_out;
+        lea r10, [rip + _ba_table];
+        mov r11, rdi;
+        imul r11, r11, 136;
+        add r10, r11;
+        xor rax, rax;
+        mov [r10 + 0],   rax;
+        mov [r10 + 8],   rax;
+        mov [r10 + 16],  rax;
+        mov [r10 + 24],  rax;
+        mov [r10 + 32],  rax;
+        mov [r10 + 40],  rax;
+        mov [r10 + 48],  rax;
+        mov [r10 + 56],  rax;
+        mov [r10 + 64],  rax;
+        mov [r10 + 72],  rax;
+        mov [r10 + 80],  rax;
+        mov [r10 + 88],  rax;
+        mov [r10 + 96],  rax;
+        mov [r10 + 104], rax;
+        mov [r10 + 112], rax;
+        mov [r10 + 120], rax;
+        mov [r10 + 128], rax;
+      buffer_age_tf_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Section 10  Ring init / revoke.
+  // ==========================================================================
+
+  // buffer_age_ring_init(surface: u64) -> row_id | BA_MINT_BAD_SURFACE
+  //                                     | BA_TAIL_ENOSPC.
+  //
+  // The dispatch briefing's `buffer_age_ring_init(surface)` entry point.
+  // Gate:
+  //   (1) surface != 0             -> BA_MINT_BAD_SURFACE
+  //   (2) surface fits in u32      -> BA_MINT_BAD_SURFACE
+  //   (3) tail_alloc(surface)      -> row_id or BA_TAIL_ENOSPC (funnel)
+  // Success bumps _ba_stats[BA_ST_INITS]; refusal bumps BA_ST_REFUSED.
+  pub let buffer_age_ring_init : (u64) -> u64 !{mem} @{} =
+    fn (surface: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): mint one KIND_BUFFER_AGE row. Three-push prologue (rbx=surface, r12=alloc-result, r13=ENOSPC-sentinel) leaves rsp%16==0 across every nested call. Refusal funnel bumps BA_ST_REFUSED once. Labels prefixed buffer_age_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                          // rbx = surface
+
+        // (1) surface != 0.
+        cmp rbx, 0;
+        je  buffer_age_ri_bad;
+
+        // (2) surface fits in u32.
+        mov rdi, rbx;
+        call buffer_age_u32_valid;
+        cmp rax, 0;
+        je  buffer_age_ri_bad;
+
+        // (3) tail_alloc(surface).
+        mov rdi, rbx;
+        call buffer_age_tail_alloc;
+        mov r12, rax;                          // stash result
+
+        // BA_TAIL_ENOSPC sentinel funnels through refused too.
+        mov r13, 0xFFFFEC5F;
+        cmp r12, r13;
+        je  buffer_age_ri_enospc;
+
+        // Success: bump inits, return row_id.
+        mov rdi, 0;                            // BA_ST_INITS
+        call buffer_age_note;
+        mov rax, r12;
+        jmp buffer_age_ri_out;
+
+      buffer_age_ri_bad:
+        mov r12, 0xFFFFEC5D;                   // BA_MINT_BAD_SURFACE
+      buffer_age_ri_enospc:
+        // r12 already carries the sentinel (either BA_TAIL_ENOSPC from
+        // tail_alloc or BA_MINT_BAD_SURFACE set just above).
+        mov rdi, 2;                            // BA_ST_REFUSED
+        call buffer_age_note;
+        mov rax, r12;
+
+      buffer_age_ri_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // buffer_age_ring_revoke(row_id) -> BA_OK | BA_BAD_SLOT | BA_REVOKE_ALREADY.
+  pub let buffer_age_ring_revoke : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): revoke one row. Out-of-range -> BA_BAD_SLOT; not in_use -> BA_REVOKE_ALREADY; else free + bump revokes + BA_OK. One-push prologue keeps rsp%16==0 for the nested calls. Labels prefixed buffer_age_.",
+      block: {
+        push r12;
+
+        mov r12, rdi;
+
+        mov r10, 32;
+        cmp r12, r10;
+        jae buffer_age_rv_bad;
+
+        mov rdi, r12;
+        call buffer_age_tail_valid;
+        cmp rax, 0;
+        je  buffer_age_rv_already;
+
+        mov rdi, r12;
+        call buffer_age_tail_free;
+        mov rdi, 1;                            // BA_ST_REVOKES
+        call buffer_age_note;
+        xor rax, rax;
+        jmp buffer_age_rv_out;
+
+      buffer_age_rv_bad:
+        mov rax, 0xFFFFEC5B;                   // BA_BAD_SLOT
+        jmp buffer_age_rv_out;
+      buffer_age_rv_already:
+        mov rax, 0xFFFFEC59;                   // BA_REVOKE_ALREADY
+
+      buffer_age_rv_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Section 11  Field readers.
+  // ==========================================================================
+
+  // buffer_age_surface(row_id) -> surface_kind_id | BA_BAD_SLOT.
+  pub let buffer_age_surface : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): read surface_kind_id at word0[31:0]. Guard via tail_valid. Labels prefixed buffer_age_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call buffer_age_tail_valid;
+        cmp rax, 0;
+        je  buffer_age_sf_bad;
+        lea r10, [rip + _ba_table];
+        mov r11, r12;
+        imul r11, r11, 136;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        mov r11, 0xFFFFFFFF;
+        and rax, r11;
+        jmp buffer_age_sf_out;
+      buffer_age_sf_bad:
+        mov rax, 0xFFFFEC5B;                   // BA_BAD_SLOT
+      buffer_age_sf_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // buffer_age_count(row_id) -> count | 0 on bad slot (an unreadable row
+  // is conservatively empty for a caller gating a fold on count > 0).
+  // count lives in word0 bits [47:40].
+  pub let buffer_age_count : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): read count at word0[47:40]. Bad slot -> 0. Labels prefixed buffer_age_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call buffer_age_tail_valid;
+        cmp rax, 0;
+        je  buffer_age_cn_zero;
+        lea r10, [rip + _ba_table];
+        mov r11, r12;
+        imul r11, r11, 136;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 40;
+        mov r11, 0xFF;
+        and rax, r11;
+        jmp buffer_age_cn_out;
+      buffer_age_cn_zero:
+        xor rax, rax;
+      buffer_age_cn_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // buffer_age_head(row_id) -> head_index | 0 on bad slot.
+  // head_index lives in word0 bits [39:32].
+  pub let buffer_age_head : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): read head_index at word0[39:32]. Labels prefixed buffer_age_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call buffer_age_tail_valid;
+        cmp rax, 0;
+        je  buffer_age_hd_zero;
+        lea r10, [rip + _ba_table];
+        mov r11, r12;
+        imul r11, r11, 136;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 32;
+        mov r11, 0xFF;
+        and rax, r11;
+        jmp buffer_age_hd_out;
+      buffer_age_hd_zero:
+        xor rax, rax;
+      buffer_age_hd_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // buffer_age_entry_region(row_id, idx) -> damage_region_id | BA_BAD_SLOT
+  //                                        | BA_BAD_INDEX.
+  // idx is the RAW slot index 0..BA_HISTORY_MAX (NOT age-relative). A
+  // caller that wants the newest entry reads count first then indexes
+  // (head + count - 1) % 8. Slot at offset 8 + idx*16.
+  pub let buffer_age_entry_region : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): read entry[idx].damage_region_id at offset 8+idx*16. Guards: tail_valid + idx<8. Labels prefixed buffer_age_.",
+      block: {
+        push rbx;
+        push r12;
+        sub  rsp, 8;
+        mov rbx, rdi;
+        mov r12, rsi;
+
+        cmp r12, 8;
+        jae buffer_age_er_badi;
+
+        mov rdi, rbx;
+        call buffer_age_tail_valid;
+        cmp rax, 0;
+        je  buffer_age_er_bad;
+
+        lea r10, [rip + _ba_table];
+        mov r11, rbx;
+        imul r11, r11, 136;
+        add r10, r11;
+
+        // Entry base = row_base + 8 + idx*16.
+        mov r11, r12;
+        imul r11, r11, 16;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        mov r11, 0xFFFFFFFF;
+        and rax, r11;
+        jmp buffer_age_er_out;
+
+      buffer_age_er_badi:
+        mov rax, 0xFFFFEC55;                   // BA_BAD_INDEX
+        jmp buffer_age_er_out;
+      buffer_age_er_bad:
+        mov rax, 0xFFFFEC5B;                   // BA_BAD_SLOT
+
+      buffer_age_er_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // buffer_age_entry_frame(row_id, idx) -> frame_num | 0 on bad slot/idx.
+  // frame_num lives at offset 16 + idx*16. 0 is indistinguishable from
+  // a genuine frame_num=0; a caller that cares checks tail_valid + count
+  // first.
+  pub let buffer_age_entry_frame : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): read entry[idx].frame_num at offset 16+idx*16. Labels prefixed buffer_age_.",
+      block: {
+        push rbx;
+        push r12;
+        sub  rsp, 8;
+        mov rbx, rdi;
+        mov r12, rsi;
+
+        cmp r12, 8;
+        jae buffer_age_ef_zero;
+
+        mov rdi, rbx;
+        call buffer_age_tail_valid;
+        cmp rax, 0;
+        je  buffer_age_ef_zero;
+
+        lea r10, [rip + _ba_table];
+        mov r11, rbx;
+        imul r11, r11, 136;
+        add r10, r11;
+        mov r11, r12;
+        imul r11, r11, 16;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        jmp buffer_age_ef_out;
+
+      buffer_age_ef_zero:
+        xor rax, rax;
+      buffer_age_ef_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Section 12  Mutations: reset / push.
+  // ==========================================================================
+
+  // buffer_age_reset(row_id) -> BA_OK | BA_BAD_SLOT.
+  //   count = 0, head_index = 0. Entry slots left as-is (readers gated
+  //   on count won't see them). Bumps _ba_stats[BA_ST_RESETS]. Called
+  //   on mode change / full-repaint fallback.
+  pub let buffer_age_reset : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): zero head+count; preserve in_use + surface_kind_id by masking word0. Bump _ba_stats[BA_ST_RESETS]. Labels prefixed buffer_age_.",
+      block: {
+        push r12;
+
+        mov r12, rdi;
+
+        mov rdi, r12;
+        call buffer_age_tail_valid;
+        cmp rax, 0;
+        je  buffer_age_rs_bad;
+
+        lea r10, [rip + _ba_table];
+        mov r11, r12;
+        imul r11, r11, 136;
+        add r10, r11;
+
+        // word0: preserve surface_kind_id (bits [31:0]) and in_use
+        // (bits [63:56]); zero head_index (bits [39:32]), count
+        // (bits [47:40]), reserved (bits [55:48]).
+        mov rax, [r10 + 0];
+        mov r11, 0xFF00000000000000;
+        mov rcx, 0x00000000FFFFFFFF;
+        or  r11, rcx;
+        and rax, r11;
+        mov [r10 + 0], rax;
+
+        mov rdi, 5;                            // BA_ST_RESETS
+        call buffer_age_note;
+        xor rax, rax;
+        jmp buffer_age_rs_out;
+
+      buffer_age_rs_bad:
+        mov rax, 0xFFFFEC5B;                   // BA_BAD_SLOT
+
+      buffer_age_rs_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // buffer_age_push(row_id, damage_region_id, frame_num) -> BA_OK
+  //                                                       | BA_BAD_SLOT
+  //                                                       | BA_BAD_REGION.
+  //
+  // Ring semantics:
+  //   If count < BA_HISTORY_MAX: write at slot (head + count) % 8;
+  //                              count += 1.
+  //   Else (count == BA_HISTORY_MAX): overwrite oldest at head; then
+  //                                   head = (head + 1) % 8; count
+  //                                   stays at 8.
+  //
+  // damage_region_id is stored as a u32; a value larger than u32 is
+  // structurally impossible (damage_kind's DR_MAX == 32 fits in a u8)
+  // and gated with BA_BAD_REGION for defensive parity.
+  //
+  // frame_num is stored raw; wraparound at 2^64 is out of scope.
+  pub let buffer_age_push : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (damage_region_id: u64) (frame_num: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): validate + append + head/count update + counter bump. Four-push callee-save prologue (rbx=row_id, r12=dr_id, r13=frame_num, rbp=row_base) + 8-byte align pad keeps rsp%16==0 across every nested call (entry 8, +32 pushes = 8, +8 pad = 0). Uses cmp reg,imm (not test). Labels prefixed buffer_age_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push rbp;
+        sub  rsp, 8;                           // align pad
+
+        mov rbx, rdi;                          // row_id
+        mov r12, rsi;                          // damage_region_id
+        mov r13, rdx;                          // frame_num
+
+        // (1a) row valid.
+        mov rdi, rbx;
+        call buffer_age_tail_valid;
+        cmp rax, 0;
+        je  buffer_age_ph_bad;
+
+        // (1b) damage_region_id fits u32.
+        mov rdi, r12;
+        call buffer_age_u32_valid;
+        cmp rax, 0;
+        je  buffer_age_ph_badr;
+
+        // rbp = row_base.
+        lea rbp, [rip + _ba_table];
+        mov r11, rbx;
+        imul r11, r11, 136;
+        add rbp, r11;
+
+        // Read word0 -> extract head, count.
+        mov rax, [rbp + 0];
+        mov r10, rax;
+        shr r10, 32;
+        mov r11, 0xFF;
+        and r10, r11;
+        // r10 = head_index (0..7)
+        mov r11, rax;
+        shr r11, 40;
+        mov rcx, 0xFF;
+        and r11, rcx;
+        // r11 = count (0..8)
+
+        // Determine write slot.
+        //   If count < 8: slot = (head + count) & 7.
+        //   Else:         slot = head; head = (head + 1) & 7.
+        cmp r11, 8;
+        jae buffer_age_ph_full;
+
+        // slot = (head + count) & 7.
+        mov rax, r10;
+        add rax, r11;
+        mov rcx, 7;
+        and rax, rcx;
+        // rax = write slot. head unchanged. count += 1.
+        add r11, 1;
+        jmp buffer_age_ph_write;
+
+      buffer_age_ph_full:
+        // slot = head; head = (head + 1) & 7. count stays 8.
+        mov rax, r10;                          // rax = write slot (=head)
+        add r10, 1;
+        mov rcx, 7;
+        and r10, rcx;
+        // r10 = new head; r11 = 8 (unchanged).
+
+      buffer_age_ph_write:
+        // Compute entry base = rbp + 8 + slot*16.
+        mov rcx, rax;                          // slot
+        imul rcx, rcx, 16;
+        mov rdi, rbp;
+        add rdi, rcx;
+        // rdi = entry base - 8. Actual slot at [rdi + 8] and [rdi + 16].
+
+        // entry[slot].damage_region_id = r12 (u32-masked).
+        mov rax, r12;
+        mov rcx, 0xFFFFFFFF;
+        and rax, rcx;
+        mov [rdi + 8], rax;
+
+        // entry[slot].frame_num = r13.
+        mov [rdi + 16], r13;
+
+        // Write updated head + count back to word0 (preserve
+        // surface_kind_id + in_use + reserved).
+        mov rax, [rbp + 0];
+        // Clear head bits [39:32] and count bits [47:40] via mask
+        // 0xFFFF0000_00000000 -> keep top 2 bytes (reserved+in_use),
+        //   -> keep low 4 bytes (surface_kind_id),
+        //   -> zero bytes 4 and 5 (head + count).
+        //   mask = 0xFFFF0000FFFFFFFF
+        mov rcx, 0xFFFF0000FFFFFFFF;
+        and rax, rcx;
+        // Insert head at bits [39:32].
+        mov rcx, r10;
+        mov rdi, 0xFF;
+        and rcx, rdi;
+        shl rcx, 32;
+        or  rax, rcx;
+        // Insert count at bits [47:40].
+        mov rcx, r11;
+        mov rdi, 0xFF;
+        and rcx, rdi;
+        shl rcx, 40;
+        or  rax, rcx;
+        mov [rbp + 0], rax;
+
+        mov rdi, 3;                            // BA_ST_PUSHES
+        call buffer_age_note;
+
+        xor rax, rax;                          // BA_OK
+        jmp buffer_age_ph_out;
+
+      buffer_age_ph_bad:
+        mov rax, 0xFFFFEC5B;                   // BA_BAD_SLOT
+        jmp buffer_age_ph_out;
+      buffer_age_ph_badr:
+        mov rax, 0xFFFFEC56;                   // BA_BAD_REGION
+
+      buffer_age_ph_out:
+        add rsp, 8;                            // undo align pad
+        pop rbp;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Section 13  Query -- union the last N snapshots.
+  //
+  // buffer_age_query(row_id, back_buffer_age) -> damage_region_id | error.
+  //
+  // Cross-module dependency: calls damage_region_mint (to allocate a
+  // fresh KIND_DAMAGE_REGION row that becomes the union destination)
+  // and damage_region_union (to fold each historical damage snapshot
+  // into it). Both symbols live in src/user/compositor/damage_kind.pdx
+  // and are `pub let` so the linker resolves them across module scopes.
+  //
+  // Algorithm:
+  //   (1) Validate row + age bounds:
+  //         back_buffer_age > BA_HISTORY_MAX (8)  -> BA_BAD_AGE
+  //         back_buffer_age == 0                  -> BA_QUERY_EMPTY
+  //         back_buffer_age > count               -> BA_BAD_AGE
+  //   (2) Read surface_kind_id from the ring.
+  //   (3) dst = damage_region_mint(surface_kind_id).
+  //         DR_MINT_BAD_SURFACE  -> BA_MINT_FAIL (defensive; shouldn't
+  //                                 happen if the ring was init'd cleanly)
+  //         DR_TAIL_ENOSPC       -> BA_MINT_FAIL
+  //   (4) For k in [1..back_buffer_age]:
+  //         slot = (head + count - k) % 8
+  //         src  = entry[slot].damage_region_id
+  //         result = damage_region_union(dst, src)
+  //         if result != DR_OK: return BA_UNION_FAIL (dst leaks; caller
+  //         is expected to revoke it via damage_region_revoke on error)
+  //   (5) Return dst as the aggregated damage cap.
+  //
+  // A caller that fell back to full repaint (either via BA_BAD_AGE or
+  // BA_QUERY_EMPTY) skips the compose optimisation entirely for one
+  // frame; there is no cap to revoke in those paths (no mint happened).
+  pub let buffer_age_query : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (back_buffer_age: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): validate + mint dst + fold last N snapshots via cross-module calls to damage_region_mint and damage_region_union. Six-push prologue (rbx=row_id, r12=age, r13=count, r14=head, r15=dst_row, rbp=k-loop-counter) + 8-byte pad keeps rsp%16==0 across nested calls (entry 8, +48 pushes = 8, +8 pad = 0). Labels prefixed buffer_age_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub  rsp, 8;                           // align pad
+
+        mov rbx, rdi;                          // row_id
+        mov r12, rsi;                          // back_buffer_age
+
+        // (1a) row valid.
+        mov rdi, rbx;
+        call buffer_age_tail_valid;
+        cmp rax, 0;
+        je  buffer_age_qy_bad;
+
+        // (1b) age > BA_HISTORY_MAX -> BA_BAD_AGE.
+        cmp r12, 8;
+        ja  buffer_age_qy_bage;
+
+        // (1c) age == 0 -> BA_QUERY_EMPTY.
+        cmp r12, 0;
+        je  buffer_age_qy_empty;
+
+        // Read count.
+        mov rdi, rbx;
+        call buffer_age_count;
+        mov r13, rax;                          // r13 = count
+
+        // (1d) count == 0 -> BA_QUERY_EMPTY (ring hasn't seen a push
+        // yet; caller falls back to full repaint).
+        cmp r13, 0;
+        je  buffer_age_qy_empty;
+
+        // (1e) age > count -> BA_BAD_AGE (driver reports an age we
+        // cannot serve; caller falls back to full repaint).
+        cmp r12, r13;
+        ja  buffer_age_qy_bage;
+
+        // Read head.
+        mov rdi, rbx;
+        call buffer_age_head;
+        mov r14, rax;                          // r14 = head
+
+        // (2) Read surface_kind_id.
+        mov rdi, rbx;
+        call buffer_age_surface;
+        // rax = surface_kind_id (guaranteed valid by prior tail_valid).
+
+        // (3) dst = damage_region_mint(surface_kind_id).
+        // Cross-module call; symbol resolved by linker.
+        mov rdi, rax;
+        call damage_region_mint;
+        mov r15, rax;                          // r15 = dst_row or sentinel
+
+        // Detect sentinel returns. damage_region_mint returns either
+        // a small row_id (< DR_MAX == 32) or a 0xFFFFEBCx sentinel.
+        // Any value >= BA_MAX (32) that also fits inside the DR
+        // sentinel band signals failure. Distinguish by checking the
+        // high 16 bits: sentinels are 0xFFFF____ patterns.
+        mov r10, r15;
+        shr r10, 16;
+        mov r11, 0xFFFF;
+        cmp r10, r11;
+        je  buffer_age_qy_mintf;
+
+        // (4) Fold loop. rbp = k = 1..age. slot = (head + count - k) & 7.
+        mov rbp, 1;
+
+      buffer_age_qy_iter:
+        cmp rbp, r12;
+        ja  buffer_age_qy_done;
+
+        // slot = (head + count - k) & 7. Compute in rax.
+        //   Since 1 <= k <= count <= 8, and 0 <= head <= 7, and
+        //   0 <= count <= 8, (head + count - k) is in [0, 15) so
+        //   masking with 7 gives the correct ring index.
+        //
+        // Watch out: head + count - k could underflow if evaluated as
+        // separate operations only if head + count < k; but we already
+        // gated k <= count and head >= 0, so head + count >= k
+        // unconditionally (head is unsigned).
+        mov rax, r14;                          // head
+        add rax, r13;                          // + count
+        sub rax, rbp;                          // - k
+        mov rcx, 7;
+        and rax, rcx;                          // slot
+
+        // src = entry[slot].damage_region_id via buffer_age_entry_region.
+        mov rdi, rbx;
+        mov rsi, rax;
+        call buffer_age_entry_region;
+        // rax = src or sentinel. On success rax < DR_MAX (< 32).
+        // Sentinels are 0xFFFFECxx.
+        mov r10, rax;
+        shr r10, 16;
+        mov r11, 0xFFFF;
+        cmp r10, r11;
+        je  buffer_age_qy_unionf;
+
+        // damage_region_union(dst=r15, src=rax).
+        mov rdi, r15;
+        mov rsi, rax;
+        call damage_region_union;
+        // rax = DR_OK (0) or sentinel.
+        cmp rax, 0;
+        jne buffer_age_qy_unionf;
+
+        add rbp, 1;
+        jmp buffer_age_qy_iter;
+
+      buffer_age_qy_done:
+        // Success: bump _ba_stats[BA_ST_QUERIES], return dst row_id.
+        mov rdi, 4;                            // BA_ST_QUERIES
+        call buffer_age_note;
+        mov rax, r15;
+        jmp buffer_age_qy_out;
+
+      buffer_age_qy_bad:
+        mov rax, 0xFFFFEC5B;                   // BA_BAD_SLOT
+        jmp buffer_age_qy_out;
+      buffer_age_qy_bage:
+        mov rax, 0xFFFFEC57;                   // BA_BAD_AGE
+        jmp buffer_age_qy_out;
+      buffer_age_qy_empty:
+        mov rax, 0xFFFFEC54;                   // BA_QUERY_EMPTY
+        jmp buffer_age_qy_out;
+      buffer_age_qy_mintf:
+        mov rax, 0xFFFFEC53;                   // BA_MINT_FAIL
+        jmp buffer_age_qy_out;
+      buffer_age_qy_unionf:
+        // dst leaks; caller is expected to revoke via
+        // damage_region_revoke(r15) if it wants the row back.
+        mov rax, 0xFFFFEC52;                   // BA_UNION_FAIL
+
+      buffer_age_qy_out:
+        add rsp, 8;                            // undo align pad
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Section 14  Boot init.
+  // ==========================================================================
+
+  pub let buffer_age_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-05 (#2295): call through to buffer_age_stats_reset for one clean pool + counter zero-out. Labels prefixed buffer_age_.",
+      block: {
+        call buffer_age_stats_reset;
+        ret
+      }
+    }
+}

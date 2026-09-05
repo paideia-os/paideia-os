@@ -1,0 +1,1520 @@
+// src/user/a11y/screen_reader_tts.pdx -- Wave0-B10-07 (paideia-os #2309)
+//
+// SCREEN-READER TTS OUTPUT CLIENT + PHONEME CACHE  (LOGIC MODULE).
+//
+// Companion / precedent:
+//   * src/user/a11y/screen_reader_protocol.pdx (Wave0-B9-09,
+//     paideia-os #2308) defines the subscribe/push/pop/unsubscribe
+//     protocol between the compositor's KIND_A11Y_TREE mutation site
+//     and a screen-reader client's read loop, including the
+//     ScreenReaderEvent enum (SR_TREE_UPDATED=0, SR_FOCUS_CHANGED=1,
+//     SR_NODE_DESTROYED=2, SR_TREE_DESTROYED=3) that THIS module
+//     dispatches on in tts_client_on_a11y_event.
+//   * src/user/a11y/tree_kind.pdx (Wave0-B8-03, paideia-os #2302)
+//     defines KIND_A11Y_TREE = 0x1D3 and its subscribe binding; the
+//     screen_reader_sub_id this client stores is a row_id in the
+//     screen_reader_protocol pool that was in turn allocated over a
+//     KIND_A11Y_TREE row the client already held RIGHT_A11Y_SUBSCRIBE on.
+//
+// =============================================================================
+// SECTION 0  WHY THIS MODULE EXISTS
+// =============================================================================
+//
+// The AT-SPI / Orca lineage puts speech synthesis in the same process
+// as the screen reader (Orca <-> speech-dispatcher <-> espeak, all
+// linked into or spawned by the screen-reader daemon; the daemon holds
+// the pronunciation dictionary in-heap and the speak-utterance queue
+// as an in-process std::deque). That posture bakes two ambient-authority
+// concessions into the a11y story:
+//
+//   * Whoever compromises the screen-reader process ALSO gains the
+//     TTS engine's private state -- the pronunciation dictionary,
+//     the utterance queue, the audio-device handle. A screen reader
+//     with keystroke visibility, a synthesised-voice output channel,
+//     AND a compromised TTS engine has enough surface to leak the
+//     user's typed passwords via inaudible ultrasound modulation.
+//     PaideiaOS refuses that shape: the TTS engine is a SATELLITE
+//     PROCESS holding the audio-device cap and the phoneme-cache
+//     KIND_MEMORY cap; the screen reader (and this client-side glue)
+//     holds ONLY a send-audio cap on the engine. The engine can be
+//     revoked independently of the screen reader, and vice versa.
+//
+//   * The pronunciation dictionary is a large, read-only, per-locale
+//     table (English CMUdict is 130k entries * ~20 bytes = 2.6 MB;
+//     a Japanese kanji dictionary is larger still). Loading it into
+//     the screen-reader process at startup is a 2.6 MB allocation
+//     that participates in that process's per-page write faults;
+//     sharing it across multiple assistive-tech clients (screen
+//     magnifier, braille output, TTS voice preview in a settings UI)
+//     requires a marshalling shim over IPC. PaideiaOS models the
+//     dictionary as an IMMUTABLE KIND_MEMORY capability minted once
+//     at boot from the pdxfs read-only volume that ships the
+//     locale-specific phoneme table; every a11y client receives a
+//     read-only handle to the SAME physical pages via cap-share, no
+//     copy and no per-client fault-in cost.
+//
+// This is the NOVEL-CLEAN DESIGN choice: TTS engine as satellite
+// process (revocable independently of the screen reader), phoneme
+// cache as immutable KIND_MEMORY cap (shared across all a11y
+// clients zero-copy). The client-side glue in THIS module is a
+// small state cell holding those three caps plus the voice
+// configuration; it exposes a speak/cancel API to the screen
+// reader and a dispatch shim from ScreenReaderEvent -> speak call.
+//
+// LOGIC MODULE, NOT A KIND-CAP.  Like screen_reader_protocol.pdx
+// (paideia-os #2308), this file lives entirely on the userland
+// supervisor side of the ring boundary. It exposes no cap-substrate
+// mint gate, no rights word, and is not wired into cap_table. The
+// authorities it composes over -- KIND_A11Y_TREE (0x1D3) for the
+// subscription, KIND_TTS_ENGINE (forward-reserved at 0x1E0) for the
+// engine send-cap, KIND_MEMORY (0x004) for the phoneme cache -- are
+// each gated on their own capability check at their own dispatch
+// sites; this module holds the ordinal IDs and does no minting.
+//
+// FUTURE PROMOTION PATHS.  Three plausible landings would move
+// pieces of this module into the kernel:
+//
+//   (a) KIND_TTS_ENGINE (0x1E0) mint gate lands as
+//       src/kernel/core/cap/kind_tts_engine.pdx; the tts_engine_kind_id
+//       stored here becomes a live KIND_TTS_ENGINE row rather than a
+//       forward-reserved integer.
+//   (b) A KIND_PHONEME_CACHE derivation over KIND_MEMORY lands as
+//       src/kernel/core/cap/kind_phoneme_cache.pdx; the cache
+//       lookup below promotes from "returns 0 == miss unconditionally"
+//       to a kernel-side cap dispatch that walks the hash table and
+//       returns a phoneme_offset into the shared read-only pages.
+//   (c) The utterance queue becomes crash-survivable via the
+//       recovery plane (KIND_RECOVERY_PLANE = 0x1C8), so a screen-
+//       reader crash mid-utterance resumes speech rather than
+//       dropping the current sentence.
+//
+// Nothing in this landing prevents any of those promotions; the
+// state cell's layout has a reserved u64 in each row for the
+// KIND_PHONEME_CACHE ordinal that (b) would need, and the
+// utterance_seq is already a u64 so (c) can persist it as-is.
+//
+// =============================================================================
+// SECTION 1  MODULE POSTURE
+// =============================================================================
+//
+// No KIND_* slot is allocated for this module (§0 rationale). No
+// parent kind, no rights word. The state_id returned by tts_client_new
+// is a row_id in this module's pool (0..SRTC_MAX_STATES-1) rather
+// than a KIND-cap ordinal, and the caller stores it in its per-
+// client bookkeeping and passes it back on every speak / cancel /
+// on_a11y_event / lookup_phonemes call.
+//
+// SRTC_MAX_STATES = 1 at Wave 0 fidelity: exactly one screen-reader
+// client (Orca-equivalent) per session. The pool shape is kept so a
+// future landing that supports multiple concurrent a11y clients
+// (screen magnifier + braille output + TTS voice preview in a
+// settings UI, all live at once) can bump SRTC_MAX_STATES without
+// a row-shape break.
+//
+// =============================================================================
+// SECTION 2  ROW LAYOUT  (32 BYTES = HALF CACHE LINE)
+// =============================================================================
+//
+// One row per live TTS client. 32 bytes leaves headroom for a future
+// landing that adds e.g. a locale-tag word or a per-client audio-
+// output-device cap without a row-shape break.
+//
+//   [+0]  hdr:            screen_reader_sub_id[31:0]
+//                                       | tts_engine_kind_id[63:32]
+//                         -- sub_id: row_id in the screen_reader_protocol
+//                            pool (§0 companion note).  engine: cap-slot
+//                            ordinal for the KIND_TTS_ENGINE row the
+//                            client will send speak requests to.
+//   [+8]  cfg:             phoneme_cache_kind_id[31:0]
+//                                       | voice_rate[47:32]
+//                                       | punctuation_mode[55:48]
+//                                       | in_use[63:56]
+//                         -- cache: cap-slot ordinal for the KIND_MEMORY
+//                            row backing the pronunciation dictionary.
+//                            voice_rate: words per minute (u16-wide;
+//                            enum values 50/100/180/300 fit u16 with
+//                            headroom to 65535).  punctuation_mode:
+//                            TtsPunctuationMode enum ordinal (u8).
+//                            in_use: 0 = row free, 1 = row live
+//                            (mirrors screen_reader_protocol's in_use
+//                            bit position at [63:56] of the row_hdr).
+//   [+16] utter_seq:       current_utterance_seq (u64, monotone)
+//                         -- bumped on every tts_client_speak_text
+//                            call; the returned seq is the value AFTER
+//                            the bump.  Wraparound at u64 max is
+//                            2^64 utterances, ~584 million years at
+//                            one utterance per nanosecond -- for
+//                            practical purposes the counter is
+//                            un-wrappable, so a cancel(seq) with a
+//                            stale seq safely fails the seq-match
+//                            gate without ambiguity.
+//   [+24] reserved:        u64  (headroom for a future landing that
+//                                adds e.g. a locale-tag word or a
+//                                per-client audio-device cap without
+//                                a row-shape break).
+//
+// SRTC_MAX_STATES = 1 rows * 32 bytes = 32 bytes = 4 u64.
+//
+// =============================================================================
+// SECTION 3  ENUMS
+// =============================================================================
+//
+// TtsVoiceRate  (words per minute; u16 range but semantically enum):
+//
+//   RATE_SLOW      = 50    -- lower comprehension bound for a listener
+//                             new to synthetic speech.
+//   RATE_NORMAL    = 100   -- typical "natural read-aloud" pace;
+//                             the tts_client_new default.
+//   RATE_FAST      = 180   -- experienced screen-reader user pace;
+//                             Orca's default is in this neighborhood.
+//   RATE_VERY_FAST = 300   -- power-user pace; only intelligible to
+//                             listeners with substantial synthetic-
+//                             speech acclimation.
+//
+// TtsPunctuationMode  (u8):
+//
+//   PUNCT_NONE = 0  -- punctuation is not spoken (only pauses
+//                      inferred from sentence boundaries).
+//   PUNCT_MOST = 1  -- period/comma/question/exclamation are spoken;
+//                      other punctuation is inferred as a pause.
+//                      This is the tts_client_new default (matches
+//                      Orca's out-of-box behavior).
+//   PUNCT_ALL  = 2  -- every punctuation character is spoken by
+//                      name ("open paren", "semicolon", ...);
+//                      valuable when the listener is proofreading
+//                      code or a legal contract.
+//
+// SRTC_RATE_MAX  = 300  gates tts_client_new's rate argument.
+// SRTC_PUNCT_MAX = 2    gates tts_client_new's punct-mode argument.
+//
+// =============================================================================
+// SECTION 4  FAILURE TAXONOMY  0xFFFFECD3..0xFFFFECDE
+// =============================================================================
+//
+// The task-row hint was 0xFFFFEC70..0xFFFFEC7F but a repo-wide grep at
+// landing time (`grep -rhoE '0xFFFFEC7[0-9A-Fa-f]' src/`) shows
+// 0xFFFFEC70..0xFFFFEC7F fully claimed by src/kernel/core/cap/
+// {cap_handler_blkdev,nvme_recovery,nvme_admin_events,nvme_reliability,
+// kind_ahci_controller}.pdx. Following the screen_reader_protocol.pdx §5
+// precedent -- which itself deviated from its hint band when the band
+// was already claimed -- this landing selects the free sub-band
+// 0xFFFFECD3..0xFFFFECDE (12 slots), verified free by
+// `grep -rhoE '0xFFFFECD[3-9A-Ea-e]' src/` returning empty at landing
+// time. The band remains in the EC page adjacent to a11y neighbors
+// so the wider a11y row stays contiguous in the ECxx page.
+//
+//   SRTC_OK              = 0                (canonical success)
+//   SRTC_TAIL_ENOSPC     = 0xFFFFECDE       (tts_client_new pool full)
+//   SRTC_BAD_SUB         = 0xFFFFECDD       (sr_sub_id == 0 or > u32-max)
+//   SRTC_BAD_ENGINE      = 0xFFFFECDC       (tts_engine_kind_id == 0
+//                                            or > u32-max)
+//   SRTC_BAD_CACHE       = 0xFFFFECDB       (phoneme_cache_kind_id == 0
+//                                            or > u32-max)
+//   SRTC_BAD_RATE        = 0xFFFFECDA       (voice_rate > SRTC_RATE_MAX
+//                                            (300); also refuses 0)
+//   SRTC_BAD_PUNCT       = 0xFFFFECD9       (punctuation_mode >
+//                                            SRTC_PUNCT_MAX(2))
+//   SRTC_BAD_STATE       = 0xFFFFECD8       (state_id >= SRTC_MAX_STATES
+//                                            or row not in_use)
+//   SRTC_BAD_TEXT        = 0xFFFFECD7       (text_len == 0 or text_len
+//                                            > SRTC_TEXT_MAX)
+//   SRTC_BAD_WORD        = 0xFFFFECD6       (word_len == 0 or word_len
+//                                            > SRTC_WORD_MAX)
+//   SRTC_BAD_EVENT       = 0xFFFFECD5       (event_kind >
+//                                            SR_EVENT_MAX(3); mirrors
+//                                            screen_reader_protocol's
+//                                            SR_BAD_EVENT gate)
+//   SRTC_UTTER_STALE     = 0xFFFFECD4       (cancel(seq) with a seq
+//                                            that is not the current
+//                                            utterance and not 0; not
+//                                            an error strictly -- the
+//                                            utterance already
+//                                            completed or was
+//                                            superseded; caller can
+//                                            treat as SRTC_OK.  The
+//                                            sentinel exists so a
+//                                            client can distinguish
+//                                            "cancel raced completion"
+//                                            from "cancel took effect".)
+//   SRTC_PHONEME_MISS    = 0                (cache lookup miss; NOT a
+//                                            failure -- callers of
+//                                            tts_client_lookup_phonemes
+//                                            treat a zero return as
+//                                            "not in cache, ask the
+//                                            engine to synthesize".
+//                                            Aliased with SRTC_OK
+//                                            intentionally: both are
+//                                            zero, both mean "nothing
+//                                            further to say".)
+//
+// =============================================================================
+// SECTION 5  FUNCTION CATALOGUE
+// =============================================================================
+//
+//   tts_client_new(sr_sub_id, tts_engine_kind_id, phoneme_cache_kind_id)
+//                                       -> state_id | error
+//     -- Allocates a row bound to the three cap ordinals with
+//        voice_rate = RATE_NORMAL(100) and punctuation_mode =
+//        PUNCT_MOST(1) as defaults (a caller wanting a different
+//        rate or punct-mode calls the setter after new; keeping
+//        the factory arg-count small avoids a wide argument
+//        prefix on every construction site).
+//
+//   tts_client_speak_text(state_id, text_offset, text_len)
+//                                       -> utter_seq | error
+//     -- Bumps current_utterance_seq and returns the post-bump
+//        value. AT THIS LANDING the engine send-path is NOT wired:
+//        the return value is the seq the future engine-send landing
+//        will use as the audit-record key; the text bytes at
+//        (text_offset, text_len) are validated for nonzero length
+//        and bounded length but are NOT copied out. A caller can
+//        thread the seq into a subsequent cancel call and observe
+//        the correct sequence-match behavior.
+//
+//   tts_client_cancel(state_id, utter_seq) -> SRTC_OK | SRTC_UTTER_STALE
+//                                            | SRTC_BAD_STATE
+//     -- utter_seq == 0 cancels ALL in-flight utterances (semantically
+//        equivalent to a global stop). utter_seq > 0 cancels only the
+//        matching utterance and returns SRTC_UTTER_STALE if the current
+//        utterance seq no longer matches (i.e. the utterance completed
+//        or was superseded before the cancel arrived). AT THIS LANDING
+//        the engine-side cancel dispatch is not wired; the function
+//        performs the seq-match gate and bumps stats, so a caller can
+//        already observe the correct control flow.
+//
+//   tts_client_on_a11y_event(state_id, event_kind, node_id)
+//                                       -> SRTC_OK | SRTC_BAD_STATE
+//                                        | SRTC_BAD_EVENT
+//     -- Dispatches on ScreenReaderEvent (from screen_reader_protocol
+//        §4):
+//          SR_FOCUS_CHANGED(1)  -> speak the focused node's label
+//                                  (label lookup requires walking
+//                                  KIND_A11Y_TREE; not wired at this
+//                                  landing, so the function bumps
+//                                  SRTC_ST_A11Y_EVENTS and returns).
+//          SR_TREE_UPDATED(0)   -> speak the update if applicable
+//                                  (heuristic: only if the changed
+//                                  subtree contains the focused
+//                                  node; also not wired at this
+//                                  landing, same stats bump).
+//          SR_NODE_DESTROYED(2) -> silent (the focused-node path
+//                                  is the only user-facing signal;
+//                                  a destroyed node is only spoken
+//                                  if it WAS the focused node,
+//                                  which the focus-tracker in the
+//                                  screen reader will re-emit as
+//                                  a SR_FOCUS_CHANGED to a sibling).
+//          SR_TREE_DESTROYED(3) -> silent (the client teardown is
+//                                  the screen reader's job; this
+//                                  glue does not speak "window
+//                                  closed" -- a UX choice that
+//                                  keeps the audio channel from
+//                                  becoming noisy on every alt-tab).
+//        event_kind > 3 refuses with SRTC_BAD_EVENT (mirrors
+//        screen_reader_protocol_event_valid's gate).
+//
+//   tts_client_lookup_phonemes(state_id, word_offset, word_len)
+//                                       -> phoneme_offset | 0
+//     -- Zero return means "not in cache". AT THIS LANDING the cache
+//        walker is not landed (see §0 future-promotion path (b));
+//        this function returns 0 (miss) unconditionally after
+//        validating state_id and word_len. Every call bumps
+//        SRTC_ST_PHONEME_MISSES. A future landing that wires the
+//        cache walk will bump SRTC_ST_PHONEME_HITS instead on the
+//        found path and return the offset into the KIND_MEMORY
+//        cache pages.
+//
+//   tts_client_set_rate(state_id, rate) -> SRTC_OK | SRTC_BAD_STATE
+//                                        | SRTC_BAD_RATE
+//     -- Setter for voice_rate. Validates rate in (0, SRTC_RATE_MAX(300)].
+//
+//   tts_client_set_punct(state_id, mode) -> SRTC_OK | SRTC_BAD_STATE
+//                                         | SRTC_BAD_PUNCT
+//     -- Setter for punctuation_mode. Validates mode in
+//        [0, SRTC_PUNCT_MAX(2)].
+//
+//   tts_client_free(state_id) -> SRTC_OK | SRTC_BAD_STATE
+//     -- LINEAR consume: frees the row. The caller MUST NOT reuse
+//        state_id after this call.
+//
+// =============================================================================
+// SECTION 6  FINGERPRINT
+// =============================================================================
+//
+// One tag ending `[legacy: SCREEN READER TTS META OK]` per softarch
+// discipline (see feedback_paideia_as_reserved_labels-adjacent
+// convention used by kind_tls_trust / kind_tui_canvas / kind_layer_tree /
+// a11y/tree_kind / a11y/screen_reader_protocol). Data-only at this
+// landing; needs allowlisting in tools/verify-fingerprint-coverage.sh
+// with reason "screen_reader_tts meta emit body not yet landed
+// (Wave0-B10-07 #2309)" until a future landing wires an emit site
+// into tts_client_new's success tail via klog_s1_x1. Allowlist wire-up
+// is a separate landing per the batch's file-touch discipline (this
+// landing is ONE file only).
+//
+// LABEL PREFIX: `screen_reader_tts_` throughout -- avoids paideia-as
+// reserved-keyword collisions per feedback_paideia_as_reserved_labels;
+// all ASM jump targets are `screen_reader_tts_<tag>`.
+
+module ScreenReaderTts = structure {
+
+  // ==========================================================================
+  // SECTION A  Identity + enums + sizing + failure taxonomy.
+  // ==========================================================================
+
+  // Row-pool sizing.
+  pub let SRTC_MAX_STATES     : u64 = 1      // one screen-reader client.
+  pub let SRTC_ROW_BYTES      : u64 = 32     // half cache line.
+
+  // Row byte offsets (within a 32-byte row).
+  pub let SRTC_ROW_OFF_HDR        : u64 = 0     // sr_sub | engine
+  pub let SRTC_ROW_OFF_CFG        : u64 = 8     // cache | rate | punct | in_use
+  pub let SRTC_ROW_OFF_UTTER      : u64 = 16    // current_utterance_seq
+  pub let SRTC_ROW_OFF_RESERVED   : u64 = 24    // headroom
+
+  // TtsVoiceRate enum (words per minute).
+  pub let RATE_SLOW           : u64 = 50
+  pub let RATE_NORMAL         : u64 = 100
+  pub let RATE_FAST           : u64 = 180
+  pub let RATE_VERY_FAST      : u64 = 300
+  pub let SRTC_RATE_MAX       : u64 = 300
+
+  // TtsPunctuationMode enum.
+  pub let PUNCT_NONE          : u64 = 0
+  pub let PUNCT_MOST          : u64 = 1
+  pub let PUNCT_ALL           : u64 = 2
+  pub let SRTC_PUNCT_MAX      : u64 = 2
+
+  // Text / word bounds (validators; keep the client from being asked
+  // to speak arbitrarily-long buffers at this fidelity).
+  pub let SRTC_TEXT_MAX       : u64 = 65536     // 64 KiB per utterance.
+  pub let SRTC_WORD_MAX       : u64 = 256       // 256 bytes per lookup key.
+
+  // Forward-reserved KIND ordinal for KIND_TTS_ENGINE. When a future
+  // landing mints kind_tts_engine.pdx the ordinal here becomes a live
+  // KIND_TTS_ENGINE cap slot; until then it is a client-side hint
+  // constant only. See §0 future-promotion path (a).
+  pub let KIND_TTS_ENGINE     : u64 = 0x1E0
+
+  // Failure taxonomy -- 0xFFFFECD3..0xFFFFECDE (see file header §4).
+  pub let SRTC_OK             : u64 = 0
+  pub let SRTC_TAIL_ENOSPC    : u64 = 0xFFFFECDE
+  pub let SRTC_BAD_SUB        : u64 = 0xFFFFECDD
+  pub let SRTC_BAD_ENGINE     : u64 = 0xFFFFECDC
+  pub let SRTC_BAD_CACHE      : u64 = 0xFFFFECDB
+  pub let SRTC_BAD_RATE       : u64 = 0xFFFFECDA
+  pub let SRTC_BAD_PUNCT      : u64 = 0xFFFFECD9
+  pub let SRTC_BAD_STATE      : u64 = 0xFFFFECD8
+  pub let SRTC_BAD_TEXT       : u64 = 0xFFFFECD7
+  pub let SRTC_BAD_WORD       : u64 = 0xFFFFECD6
+  pub let SRTC_BAD_EVENT      : u64 = 0xFFFFECD5
+  pub let SRTC_UTTER_STALE    : u64 = 0xFFFFECD4
+
+  // SRTC_PHONEME_MISS aliases SRTC_OK: both are 0, both mean "nothing
+  // further to say" (see §4).
+  pub let SRTC_PHONEME_MISS   : u64 = 0
+
+  // Screen-reader event ordinals -- MUST agree with
+  // screen_reader_protocol.pdx §4 (SR_TREE_UPDATED..SR_TREE_DESTROYED).
+  // Named locally so a future extension in screen_reader_protocol
+  // (SR_EVENT_MAX bump) forces a synchronised landing here.
+  pub let SRTC_EV_TREE_UPDATED    : u64 = 0
+  pub let SRTC_EV_FOCUS_CHANGED   : u64 = 1
+  pub let SRTC_EV_NODE_DESTROYED  : u64 = 2
+  pub let SRTC_EV_TREE_DESTROYED  : u64 = 3
+  pub let SRTC_EV_MAX             : u64 = 3
+
+  // Stats channels (six u64s of counters, bounds-checked against 6).
+  pub let SRTC_ST_SPOKEN          : u64 = 0
+  pub let SRTC_ST_CANCELLED       : u64 = 1
+  pub let SRTC_ST_A11Y_EVENTS     : u64 = 2
+  pub let SRTC_ST_PHONEME_HITS    : u64 = 3
+  pub let SRTC_ST_PHONEME_MISSES  : u64 = 4
+  pub let SRTC_ST_REFUSED         : u64 = 5
+
+  // ==========================================================================
+  // SECTION B  State cells.
+  // ==========================================================================
+
+  // TTS-client state-row pool. SRTC_MAX_STATES rows * 32 bytes =
+  // 32 bytes = 4 u64. Aligned to 64 so the (future) SRTC_MAX_STATES
+  // > 1 landing does not straddle a cache line for row 0.
+  pub let mut _screen_reader_tts_rows  : [u64; 4]  = uninit @align(64)
+
+  // Global stats. Bounds-checked against 6 in _stats_bump / _stats_read.
+  pub let mut _screen_reader_tts_stats : [u64; 6]  = uninit @align(64)
+
+  // Fingerprint tag. Data-only at this landing; needs allowlisting in
+  // tools/verify-fingerprint-coverage.sh with reason
+  // "screen_reader_tts meta emit body not yet landed (Wave0-B10-07
+  // #2309)" until a future landing wires an emit site into
+  // tts_client_new's success tail via klog_s1_x1.
+  //
+  // "pdx kind screen reader tts meta [legacy: SCREEN READER TTS
+  //  META OK]\0" = 67 bytes of payload + 1 NUL = 68 bytes.
+  pub let pdx_kind_screen_reader_tts_meta : [u8; 68] = "pdx kind screen reader tts meta [legacy: SCREEN READER TTS META OK]\0"
+
+  // ==========================================================================
+  // SECTION C  Validators (new-time / setter / event-time).
+  // ==========================================================================
+
+  // screen_reader_tts_sub_valid(id) -> 1 iff id in (0, 2^32).
+  // Mirrors screen_reader_protocol_subscriber_valid's shape.
+  pub let screen_reader_tts_sub_valid : (u64) -> u64 !{} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): 1 iff sr_sub_id in (0, 2^32). Zero refuses a free-floating TTS client (there must be an active screen-reader subscription); >u32 refuses garbage. Labels prefixed screen_reader_tts_sv_.",
+      block: {
+        cmp rdi, 0;
+        je  screen_reader_tts_sv_no;
+        mov r10, 0xFFFFFFFF;
+        cmp rdi, r10;
+        ja  screen_reader_tts_sv_no;
+        mov rax, 1;
+        ret;
+      screen_reader_tts_sv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_tts_engine_valid(id) -> 1 iff id in (0, 2^32).
+  pub let screen_reader_tts_engine_valid : (u64) -> u64 !{} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): 1 iff tts_engine_kind_id in (0, 2^32). Zero refuses a free-floating client (a client MUST be bound to a KIND_TTS_ENGINE cap slot to speak); >u32 refuses garbage. Labels prefixed screen_reader_tts_ev_.",
+      block: {
+        cmp rdi, 0;
+        je  screen_reader_tts_ev_no;
+        mov r10, 0xFFFFFFFF;
+        cmp rdi, r10;
+        ja  screen_reader_tts_ev_no;
+        mov rax, 1;
+        ret;
+      screen_reader_tts_ev_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_tts_cache_valid(id) -> 1 iff id in (0, 2^32).
+  pub let screen_reader_tts_cache_valid : (u64) -> u64 !{} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): 1 iff phoneme_cache_kind_id in (0, 2^32). Zero refuses a client with no cache (a lookup-miss client is fine, but the CAP must exist so a future landing can bind the walker); >u32 refuses garbage. Labels prefixed screen_reader_tts_cv_.",
+      block: {
+        cmp rdi, 0;
+        je  screen_reader_tts_cv_no;
+        mov r10, 0xFFFFFFFF;
+        cmp rdi, r10;
+        ja  screen_reader_tts_cv_no;
+        mov rax, 1;
+        ret;
+      screen_reader_tts_cv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_tts_rate_valid(rate) -> 1 iff rate in (0, SRTC_RATE_MAX(300)].
+  // Zero refuses a nonsense pace; > 300 refuses garbage that would
+  // exceed a human listener's decodable-speech ceiling.
+  pub let screen_reader_tts_rate_valid : (u64) -> u64 !{} @{} =
+    fn (rate: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): 1 iff rate in (0, 300]. Zero refuses a nonsense pace; >300 refuses garbage that exceeds RATE_VERY_FAST (the upper listener-comprehension ceiling). Labels prefixed screen_reader_tts_rv_.",
+      block: {
+        cmp rdi, 0;
+        je  screen_reader_tts_rv_no;
+        mov r10, 300;
+        cmp rdi, r10;
+        ja  screen_reader_tts_rv_no;
+        mov rax, 1;
+        ret;
+      screen_reader_tts_rv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_tts_punct_valid(mode) -> 1 iff mode in [0, SRTC_PUNCT_MAX(2)].
+  pub let screen_reader_tts_punct_valid : (u64) -> u64 !{} @{} =
+    fn (mode: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): 1 iff mode in [0, SRTC_PUNCT_MAX(2)]. Labels prefixed screen_reader_tts_pv_.",
+      block: {
+        mov r10, 2;
+        cmp rdi, r10;
+        ja  screen_reader_tts_pv_no;
+        mov rax, 1;
+        ret;
+      screen_reader_tts_pv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_tts_event_valid(ev) -> 1 iff ev <= SRTC_EV_MAX(3).
+  // MUST agree with screen_reader_protocol_event_valid at
+  // screen_reader_protocol.pdx §C; a divergence here would let a
+  // valid pushed event become an SRTC_BAD_EVENT here (or worse, a
+  // garbage event smuggled through here).
+  pub let screen_reader_tts_event_valid : (u64) -> u64 !{} @{} =
+    fn (ev: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): 1 iff ev in [0, SRTC_EV_MAX(3)]. MUST agree with screen_reader_protocol_event_valid; a divergence here would let a valid pushed event become SRTC_BAD_EVENT (or a garbage event pass through). Labels prefixed screen_reader_tts_evv_.",
+      block: {
+        mov r10, 3;
+        cmp rdi, r10;
+        ja  screen_reader_tts_evv_no;
+        mov rax, 1;
+        ret;
+      screen_reader_tts_evv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_tts_text_valid(len) -> 1 iff len in (0, SRTC_TEXT_MAX].
+  pub let screen_reader_tts_text_valid : (u64) -> u64 !{} @{} =
+    fn (len: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): 1 iff text_len in (0, SRTC_TEXT_MAX(65536)]. Zero refuses an empty utterance (nothing to speak); >SRTC_TEXT_MAX refuses garbage-length that would exhaust the (future) engine send buffer. Labels prefixed screen_reader_tts_tv_.",
+      block: {
+        cmp rdi, 0;
+        je  screen_reader_tts_tv_no;
+        mov r10, 65536;
+        cmp rdi, r10;
+        ja  screen_reader_tts_tv_no;
+        mov rax, 1;
+        ret;
+      screen_reader_tts_tv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_tts_word_valid(len) -> 1 iff len in (0, SRTC_WORD_MAX].
+  pub let screen_reader_tts_word_valid : (u64) -> u64 !{} @{} =
+    fn (len: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): 1 iff word_len in (0, SRTC_WORD_MAX(256)]. Zero refuses an empty key; >SRTC_WORD_MAX refuses a garbage-length lookup that would range over a huge span of the cache. Labels prefixed screen_reader_tts_wv_.",
+      block: {
+        cmp rdi, 0;
+        je  screen_reader_tts_wv_no;
+        mov r10, 256;
+        cmp rdi, r10;
+        ja  screen_reader_tts_wv_no;
+        mov rax, 1;
+        ret;
+      screen_reader_tts_wv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION D  Packers (row header + cfg encoders).
+  // ==========================================================================
+
+  // screen_reader_tts_pack_hdr(sr_sub_id, engine_kind_id) ->
+  //     sr_sub_id[31:0] | engine_kind_id[63:32].
+  pub let screen_reader_tts_pack_hdr : (u64, u64) -> u64 !{} @{} =
+    fn (sr_sub_id: u64) (engine_kind_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): pack row hdr word. sr_sub_id at [31:0] (u32 masked); engine_kind_id at [63:32] (u32 masked then shifted). Labels prefixed screen_reader_tts_ph_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFFFFFFFF;
+        mov r10, rsi;
+        and r10, 0xFFFFFFFF;
+        shl r10, 32;
+        or  rax, r10;
+        ret
+      }
+    }
+
+  // screen_reader_tts_pack_cfg(cache_kind_id, rate, punct) ->
+  //     cache[31:0] | rate[47:32] | punct[55:48] | in_use[63:56].
+  // in_use bit is stamped by _row_alloc's success tail.
+  pub let screen_reader_tts_pack_cfg : (u64, u64, u64) -> u64 !{} @{} =
+    fn (cache_kind_id: u64) (rate: u64) (punct: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): pack cfg word. cache_kind_id at [31:0] (u32 masked); rate at [47:32] (u16 masked); punct at [55:48] (u8 masked); in_use bit at [63:56] stamped by _row_alloc's success tail (left zero here). Labels prefixed screen_reader_tts_pc_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFFFFFFFF;
+        mov r10, rsi;
+        and r10, 0xFFFF;
+        shl r10, 32;
+        or  rax, r10;
+        mov r10, rdx;
+        and r10, 0xFF;
+        shl r10, 48;
+        or  rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION E  Row address arithmetic + accessors.
+  //
+  // Row base = _screen_reader_tts_rows + row_id * 32 (shl 5).
+  // Stride is power-of-two so no imul is emitted; the offset multiply
+  // folds to a single shl. Encoder-conservative per the file's no-imul-
+  // when-shl-suffices convention.
+  // ==========================================================================
+
+  // screen_reader_tts_row_base(row_id) -> ptr | 0.
+  pub let screen_reader_tts_row_base : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): row base pointer = _screen_reader_tts_rows + row_id * 32. Bounds-checked against SRTC_MAX_STATES(1); OOB returns 0 (caller compares against zero before dereferencing). Labels prefixed screen_reader_tts_rb_.",
+      block: {
+        mov r10, 1;
+        cmp rdi, r10;
+        jae screen_reader_tts_rb_no;
+        lea r10, [rip + _screen_reader_tts_rows];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, r10;
+        ret;
+      screen_reader_tts_rb_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_tts_row_sub_id(row_base) -> sr_sub_id at hdr[31:0].
+  pub let screen_reader_tts_row_sub_id : (u64) -> u64 !{mem} @{} =
+    fn (row_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): read sr_sub_id from hdr[31:0]. Labels prefixed screen_reader_tts_rs_.",
+      block: {
+        mov rax, [rdi + 0];
+        and rax, 0xFFFFFFFF;
+        ret
+      }
+    }
+
+  // screen_reader_tts_row_engine(row_base) -> engine_kind_id at hdr[63:32].
+  pub let screen_reader_tts_row_engine : (u64) -> u64 !{mem} @{} =
+    fn (row_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): read tts_engine_kind_id from hdr[63:32]. Labels prefixed screen_reader_tts_re_.",
+      block: {
+        mov rax, [rdi + 0];
+        shr rax, 32;
+        ret
+      }
+    }
+
+  // screen_reader_tts_row_cache(row_base) -> cache_kind_id at cfg[31:0].
+  pub let screen_reader_tts_row_cache : (u64) -> u64 !{mem} @{} =
+    fn (row_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): read phoneme_cache_kind_id from cfg[31:0]. Labels prefixed screen_reader_tts_rc_.",
+      block: {
+        mov rax, [rdi + 8];
+        and rax, 0xFFFFFFFF;
+        ret
+      }
+    }
+
+  // screen_reader_tts_row_rate(row_base) -> voice_rate at cfg[47:32].
+  pub let screen_reader_tts_row_rate : (u64) -> u64 !{mem} @{} =
+    fn (row_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): read voice_rate (u16) from cfg[47:32]. Labels prefixed screen_reader_tts_rr_.",
+      block: {
+        mov rax, [rdi + 8];
+        shr rax, 32;
+        and rax, 0xFFFF;
+        ret
+      }
+    }
+
+  // screen_reader_tts_row_punct(row_base) -> punct_mode at cfg[55:48].
+  pub let screen_reader_tts_row_punct : (u64) -> u64 !{mem} @{} =
+    fn (row_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): read punctuation_mode (u8) from cfg[55:48]. Labels prefixed screen_reader_tts_rp_.",
+      block: {
+        mov rax, [rdi + 8];
+        shr rax, 48;
+        and rax, 0xFF;
+        ret
+      }
+    }
+
+  // screen_reader_tts_row_utter_seq(row_base) -> current_utterance_seq (u64).
+  pub let screen_reader_tts_row_utter_seq : (u64) -> u64 !{mem} @{} =
+    fn (row_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): read current_utterance_seq (full u64) from row+16. Labels prefixed screen_reader_tts_ru_.",
+      block: {
+        mov rax, [rdi + 16];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION F  Row-pool primitives (valid / alloc / free).
+  // ==========================================================================
+
+  // screen_reader_tts_row_valid(row_id) -> 1 iff row_id <
+  // SRTC_MAX_STATES AND in_use bit set (cfg[63:56]).
+  pub let screen_reader_tts_row_valid : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): 1 iff row_id < SRTC_MAX_STATES(1) AND in_use (cfg[63:56] != 0). Row address = _screen_reader_tts_rows + row_id * 32; *32 uses shl 5. Labels prefixed screen_reader_tts_rv_.",
+      block: {
+        mov r10, 1;
+        cmp rdi, r10;
+        jae screen_reader_tts_rv_no;
+        lea r10, [rip + _screen_reader_tts_rows];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        shr rax, 56;
+        cmp rax, 0;
+        je  screen_reader_tts_rv_no;
+        mov rax, 1;
+        ret;
+      screen_reader_tts_rv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_tts_row_alloc(hdr, cfg) -> row_id | SRTC_TAIL_ENOSPC.
+  //
+  // hdr: _pack_hdr output (sr_sub_id at [31:0], engine at [63:32]).
+  // cfg: _pack_cfg output (cache at [31:0], rate at [47:32], punct at
+  //      [55:48], in_use=0).
+  //
+  // Low-first scan; the found row's in_use bit is stamped by ORing
+  // 1<<56 into cfg on the claim path. utterance_seq starts at 0,
+  // reserved starts at 0.
+  //
+  // Three callee-save pushes (rbx=idx, r12=hdr, r13=cfg) + sub rsp,8
+  // = 32 B => entry rsp%16==8, +32 = %16==8 (no nested call in the
+  // scan body, so this is the correct alignment for the ret).
+  pub let screen_reader_tts_row_alloc : (u64, u64) -> u64 !{mem} @{} =
+    fn (hdr: u64) (cfg: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): claim one TTS-client state row. Low-first scan (rbx=idx) over SRTC_MAX_STATES(1) rows of 32 bytes. Three callee-save pushes (rbx=idx, r12=hdr, r13=cfg) + sub rsp,8 = 32 B => entry rsp%16==8, +32 = %16==8 which suits the no-nested-call scan. Labels prefixed screen_reader_tts_ra_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        sub  rsp, 8;
+
+        mov  r12, rdi;                       // hdr
+        mov  r13, rsi;                       // cfg
+
+        xor  rbx, rbx;
+      screen_reader_tts_ra_scan:
+        cmp  rbx, 1;
+        jae  screen_reader_tts_ra_enospc;
+
+        lea  r10, [rip + _screen_reader_tts_rows];
+        mov  r11, rbx;
+        shl  r11, 5;
+        add  r10, r11;
+
+        // Check in_use at cfg[63:56] (row+8, top byte).
+        mov  rax, [r10 + 8];
+        shr  rax, 56;
+        cmp  rax, 0;
+        je   screen_reader_tts_ra_claim;
+
+        add  rbx, 1;
+        jmp  screen_reader_tts_ra_scan;
+
+      screen_reader_tts_ra_claim:
+        // Write hdr (row+0) as-is.
+        mov  [r10 + 0], r12;
+
+        // Stamp in_use bit into cfg, write row+8.
+        mov  rax, r13;
+        mov  r11, 1;
+        shl  r11, 56;
+        or   rax, r11;
+        mov  [r10 + 8], rax;
+
+        // utterance_seq = 0, reserved = 0.
+        xor  rax, rax;
+        mov  [r10 + 16], rax;
+        mov  [r10 + 24], rax;
+
+        mov  rax, rbx;                       // row_id
+        jmp  screen_reader_tts_ra_out;
+
+      screen_reader_tts_ra_enospc:
+        mov  rax, 0xFFFFECDE;                // SRTC_TAIL_ENOSPC
+
+      screen_reader_tts_ra_out:
+        add  rsp, 8;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // screen_reader_tts_row_free(row_id): scrub row (all 4 words).
+  // Bounds-checked.
+  pub let screen_reader_tts_row_free : (u64) -> () !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): scrub one TTS-client row (all 4 u64 words). Bounds-checked against SRTC_MAX_STATES(1). Labels prefixed screen_reader_tts_rf_.",
+      block: {
+        mov  r10, 1;
+        cmp  rdi, r10;
+        jae  screen_reader_tts_rf_out;
+        lea  r10, [rip + _screen_reader_tts_rows];
+        mov  r11, rdi;
+        shl  r11, 5;
+        add  r10, r11;
+        xor  rax, rax;
+        mov  [r10 + 0],  rax;
+        mov  [r10 + 8],  rax;
+        mov  [r10 + 16], rax;
+        mov  [r10 + 24], rax;
+      screen_reader_tts_rf_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION G  tts_client_new
+  //
+  // tts_client_new(sr_sub_id, tts_engine_kind_id, phoneme_cache_kind_id)
+  //     -> state_id
+  //      | SRTC_BAD_SUB | SRTC_BAD_ENGINE | SRTC_BAD_CACHE
+  //      | SRTC_TAIL_ENOSPC.
+  //
+  // Defaults: voice_rate = RATE_NORMAL(100), punctuation_mode =
+  // PUNCT_MOST(1). A caller wanting a different rate or punct-mode
+  // calls tts_client_set_rate / tts_client_set_punct after new.
+  //
+  // Five callee-save pushes (rbx=sub, r12=engine, r13=cache, r14=hdr,
+  // r15=cfg) leave rsp%16==0 -- every nested `call` sees the aligned
+  // slot every SysV callee needs. No further pad required.
+  //
+  // Refusal path funnels through screen_reader_tts_new_refused and
+  // bumps SRTC_ST_REFUSED once.
+  // ==========================================================================
+
+  pub let tts_client_new : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (sr_sub_id: u64) (tts_engine_kind_id: u64) (phoneme_cache_kind_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): claim one TTS-client state row bound to (sr_sub, engine, cache) with defaults voice_rate=RATE_NORMAL(100) and punct_mode=PUNCT_MOST(1). Five callee-save pushes (rbx=sub, r12=engine, r13=cache, r14=hdr, r15=cfg) preserve SysV alignment: entry rsp%16==8, five 8-byte pushes give rsp%16==0 which every nested `call` needs at the callsite. Refusal funnel bumps SRTC_ST_REFUSED once. Labels prefixed screen_reader_tts_new_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov  rbx, rdi;                       // sr_sub_id
+        mov  r12, rsi;                       // tts_engine_kind_id
+        mov  r13, rdx;                       // phoneme_cache_kind_id
+
+        // (1) sr_sub_id valid?
+        mov  rdi, rbx;
+        call screen_reader_tts_sub_valid;
+        cmp  rax, 0;
+        je   screen_reader_tts_new_bad_sub;
+
+        // (2) tts_engine_kind_id valid?
+        mov  rdi, r12;
+        call screen_reader_tts_engine_valid;
+        cmp  rax, 0;
+        je   screen_reader_tts_new_bad_engine;
+
+        // (3) phoneme_cache_kind_id valid?
+        mov  rdi, r13;
+        call screen_reader_tts_cache_valid;
+        cmp  rax, 0;
+        je   screen_reader_tts_new_bad_cache;
+
+        // (4) pack hdr.
+        mov  rdi, rbx;
+        mov  rsi, r12;
+        call screen_reader_tts_pack_hdr;
+        mov  r14, rax;                       // hdr
+
+        // (5) pack cfg with defaults (rate=100, punct=1).
+        mov  rdi, r13;
+        mov  rsi, 100;                       // RATE_NORMAL
+        mov  rdx, 1;                         // PUNCT_MOST
+        call screen_reader_tts_pack_cfg;
+        mov  r15, rax;                       // cfg
+
+        // (6) claim a row.
+        mov  rdi, r14;
+        mov  rsi, r15;
+        call screen_reader_tts_row_alloc;
+
+        // If _row_alloc returned SRTC_TAIL_ENOSPC (>= SRTC_MAX_STATES),
+        // fail through the refusal funnel.
+        mov  r10, 1;
+        cmp  rax, r10;
+        jae  screen_reader_tts_new_enospc;
+
+        // Success: return row_id.
+        jmp  screen_reader_tts_new_out;
+
+      screen_reader_tts_new_bad_sub:
+        mov  rax, 0xFFFFECDD;                // SRTC_BAD_SUB
+        jmp  screen_reader_tts_new_refused;
+      screen_reader_tts_new_bad_engine:
+        mov  rax, 0xFFFFECDC;                // SRTC_BAD_ENGINE
+        jmp  screen_reader_tts_new_refused;
+      screen_reader_tts_new_bad_cache:
+        mov  rax, 0xFFFFECDB;                // SRTC_BAD_CACHE
+        jmp  screen_reader_tts_new_refused;
+      screen_reader_tts_new_enospc:
+        // rax already holds SRTC_TAIL_ENOSPC from _row_alloc.
+
+      screen_reader_tts_new_refused:
+        // Bump SRTC_ST_REFUSED, preserve sentinel across the note call.
+        mov  rbx, rax;
+        mov  rdi, 5;                         // SRTC_ST_REFUSED
+        call screen_reader_tts_stats_bump;
+        mov  rax, rbx;
+
+      screen_reader_tts_new_out:
+        pop  r15;
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION H  tts_client_speak_text
+  //
+  // tts_client_speak_text(state_id, text_offset, text_len)
+  //     -> utter_seq | SRTC_BAD_STATE | SRTC_BAD_TEXT.
+  //
+  // Bumps current_utterance_seq and returns the post-bump value.
+  // AT THIS LANDING the engine send-path is NOT wired: the return
+  // value is the seq the future engine-send landing will use as the
+  // audit-record key.
+  //
+  // Four callee-save pushes (rbx=state_id, r12=text_offset,
+  // r13=text_len, r14=row_base) leave rsp%16==8 -- every nested
+  // call site is wrapped with sub rsp,8 / add rsp,8 to pad to %16==0.
+  // ==========================================================================
+
+  pub let tts_client_speak_text : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (state_id: u64) (text_offset: u64) (text_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): bump current_utterance_seq and return the post-bump value; the engine send-path is not wired at this landing (the seq is the audit-record key a future landing will attach the engine dispatch to). Four callee-save pushes (rbx=state_id, r12=text_offset, r13=text_len, r14=row_base) leave rsp%16==8; every nested call site gets a sub rsp,8 pad so the callee sees rsp%16==0. Labels prefixed screen_reader_tts_sp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov  rbx, rdi;                       // state_id
+        mov  r12, rsi;                       // text_offset (validated only for bounds; not dereferenced here)
+        mov  r13, rdx;                       // text_len
+
+        // (1) state row valid?
+        sub  rsp, 8;
+        mov  rdi, rbx;
+        call screen_reader_tts_row_valid;
+        add  rsp, 8;
+        cmp  rax, 0;
+        je   screen_reader_tts_sp_bad_state;
+
+        // (2) text_len valid?
+        sub  rsp, 8;
+        mov  rdi, r13;
+        call screen_reader_tts_text_valid;
+        add  rsp, 8;
+        cmp  rax, 0;
+        je   screen_reader_tts_sp_bad_text;
+
+        // (3) row_base.
+        sub  rsp, 8;
+        mov  rdi, rbx;
+        call screen_reader_tts_row_base;
+        add  rsp, 8;
+        cmp  rax, 0;
+        je   screen_reader_tts_sp_bad_state;
+        mov  r14, rax;                       // row_base
+
+        // (4) bump utterance_seq (load-inc-store on row+16, u64-wide).
+        mov  rax, [r14 + 16];
+        add  rax, 1;
+        mov  [r14 + 16], rax;
+
+        // (5) bump SRTC_ST_SPOKEN, preserve utter_seq across the call.
+        mov  rbx, rax;                       // save seq
+        sub  rsp, 8;
+        mov  rdi, 0;                         // SRTC_ST_SPOKEN
+        call screen_reader_tts_stats_bump;
+        add  rsp, 8;
+        mov  rax, rbx;                       // return seq
+
+        // (Suppress-unused: text_offset r12 is validated by bounds only
+        // at this landing; a future landing walks the caller's buffer
+        // via a KIND_MEMORY reader over (text_offset, text_len).)
+        jmp  screen_reader_tts_sp_out;
+
+      screen_reader_tts_sp_bad_state:
+        mov  rax, 0xFFFFECD8;                // SRTC_BAD_STATE
+        jmp  screen_reader_tts_sp_out;
+      screen_reader_tts_sp_bad_text:
+        mov  rax, 0xFFFFECD7;                // SRTC_BAD_TEXT
+
+      screen_reader_tts_sp_out:
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION I  tts_client_cancel
+  //
+  // tts_client_cancel(state_id, utter_seq)
+  //     -> SRTC_OK | SRTC_UTTER_STALE | SRTC_BAD_STATE.
+  //
+  // utter_seq == 0 cancels ALL in-flight utterances (a global stop).
+  // utter_seq > 0 cancels only the matching utterance and returns
+  // SRTC_UTTER_STALE if the current utterance_seq no longer matches
+  // (i.e. the utterance completed or was superseded before cancel).
+  //
+  // Three callee-save pushes (rbx=state_id, r12=utter_seq,
+  // r13=row_base) leave rsp%16==0 (three 8-byte pushes flip entry
+  // %16==8 to %16==0), matching every nested `call`'s alignment
+  // requirement. No further pad required.
+  // ==========================================================================
+
+  pub let tts_client_cancel : (u64, u64) -> u64 !{mem} @{} =
+    fn (state_id: u64) (utter_seq: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): cancel one utterance (utter_seq > 0) or all (utter_seq == 0). Seq-match gate: utter_seq > 0 AND != current_utterance_seq -> SRTC_UTTER_STALE (the utterance completed/was superseded before cancel arrived; not strictly an error but distinguishable). Three callee-save pushes leave rsp%16==0 which every nested `call` needs. Engine-side cancel dispatch is not wired at this landing; the seq-match gate and stats bump land now so a caller can already observe the correct control flow. Labels prefixed screen_reader_tts_ca_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov  rbx, rdi;                       // state_id
+        mov  r12, rsi;                       // utter_seq
+
+        // (1) state row valid?
+        mov  rdi, rbx;
+        call screen_reader_tts_row_valid;
+        cmp  rax, 0;
+        je   screen_reader_tts_ca_bad_state;
+
+        // (2) row_base.
+        mov  rdi, rbx;
+        call screen_reader_tts_row_base;
+        cmp  rax, 0;
+        je   screen_reader_tts_ca_bad_state;
+        mov  r13, rax;                       // row_base
+
+        // (3) seq-match gate.
+        //     If utter_seq == 0 -> global cancel; skip the match check.
+        cmp  r12, 0;
+        je   screen_reader_tts_ca_ok;
+
+        //     Otherwise: current == utter_seq ?
+        mov  rax, [r13 + 16];                // current_utterance_seq
+        cmp  rax, r12;
+        jne  screen_reader_tts_ca_stale;
+
+      screen_reader_tts_ca_ok:
+        // Bump SRTC_ST_CANCELLED, return SRTC_OK.
+        mov  rdi, 1;                         // SRTC_ST_CANCELLED
+        call screen_reader_tts_stats_bump;
+        xor  rax, rax;                       // SRTC_OK
+        jmp  screen_reader_tts_ca_out;
+
+      screen_reader_tts_ca_stale:
+        mov  rax, 0xFFFFECD4;                // SRTC_UTTER_STALE
+        jmp  screen_reader_tts_ca_out;
+      screen_reader_tts_ca_bad_state:
+        mov  rax, 0xFFFFECD8;                // SRTC_BAD_STATE
+
+      screen_reader_tts_ca_out:
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION J  tts_client_on_a11y_event
+  //
+  // tts_client_on_a11y_event(state_id, event_kind, node_id)
+  //     -> SRTC_OK | SRTC_BAD_STATE | SRTC_BAD_EVENT.
+  //
+  // Dispatches on ScreenReaderEvent (see file header §5 catalogue).
+  //
+  // FOCUS_CHANGED / TREE_UPDATED bump the a11y-events counter (the
+  // actual speak call routes through a future KIND_A11Y_TREE walk
+  // that is not landed at this fidelity); NODE_DESTROYED and
+  // TREE_DESTROYED are silent by UX design (see §5). node_id is
+  // preserved as a stats-bump argument the future landing will
+  // pass into the label lookup.
+  //
+  // Three callee-save pushes (rbx=state_id, r12=event_kind,
+  // r13=node_id) leave rsp%16==0 -- every nested `call` sees the
+  // aligned slot every SysV callee needs.
+  // ==========================================================================
+
+  pub let tts_client_on_a11y_event : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (state_id: u64) (event_kind: u64) (node_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): dispatch on ScreenReaderEvent. FOCUS_CHANGED(1) and TREE_UPDATED(0) bump SRTC_ST_A11Y_EVENTS (the actual speak call routes through a KIND_A11Y_TREE walk that is not landed at this fidelity); NODE_DESTROYED(2) and TREE_DESTROYED(3) are silent by UX design (see file header §5). event_kind > SRTC_EV_MAX(3) refuses with SRTC_BAD_EVENT (mirrors screen_reader_protocol_event_valid's gate; a divergence would let a valid pushed event fail here). node_id is preserved in r13 as the stats-bump argument the future landing will pass into the label lookup. Three callee-save pushes leave rsp%16==0. Labels prefixed screen_reader_tts_ev_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov  rbx, rdi;                       // state_id
+        mov  r12, rsi;                       // event_kind
+        mov  r13, rdx;                       // node_id
+
+        // (1) state row valid?
+        mov  rdi, rbx;
+        call screen_reader_tts_row_valid;
+        cmp  rax, 0;
+        je   screen_reader_tts_ev_bad_state;
+
+        // (2) event_kind valid?
+        mov  rdi, r12;
+        call screen_reader_tts_event_valid;
+        cmp  rax, 0;
+        je   screen_reader_tts_ev_bad_event;
+
+        // (3) Dispatch.
+        //     0 (SRTC_EV_TREE_UPDATED) / 1 (SRTC_EV_FOCUS_CHANGED)
+        //     bump the events counter; 2 / 3 are silent.
+        mov  r10, 1;
+        cmp  r12, r10;                       // ev <= 1 ?
+        ja   screen_reader_tts_ev_silent;
+
+        mov  rdi, 2;                         // SRTC_ST_A11Y_EVENTS
+        call screen_reader_tts_stats_bump;
+
+      screen_reader_tts_ev_silent:
+        xor  rax, rax;                       // SRTC_OK
+        jmp  screen_reader_tts_ev_out;
+
+      screen_reader_tts_ev_bad_state:
+        mov  rax, 0xFFFFECD8;                // SRTC_BAD_STATE
+        jmp  screen_reader_tts_ev_out;
+      screen_reader_tts_ev_bad_event:
+        mov  rax, 0xFFFFECD5;                // SRTC_BAD_EVENT
+
+      screen_reader_tts_ev_out:
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION K  tts_client_lookup_phonemes
+  //
+  // tts_client_lookup_phonemes(state_id, word_offset, word_len)
+  //     -> phoneme_offset | 0.
+  //
+  // Zero return means "not in cache". AT THIS LANDING the cache
+  // walker is not landed (see file header §0 future-promotion path
+  // (b)); this function returns 0 (miss) unconditionally after
+  // validating state_id and word_len. Every call bumps
+  // SRTC_ST_PHONEME_MISSES so the future walker landing can
+  // observe hit/miss ratio in production traces from day one.
+  //
+  // Three callee-save pushes (rbx=state_id, r12=word_offset,
+  // r13=word_len) leave rsp%16==0 -- every nested `call` sees the
+  // aligned slot every SysV callee needs.
+  // ==========================================================================
+
+  pub let tts_client_lookup_phonemes : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (state_id: u64) (word_offset: u64) (word_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): validate state_id and word_len; return 0 (cache miss = SRTC_PHONEME_MISS, aliased with SRTC_OK by design). The cache walker is not landed at this fidelity (see file header §0 future-promotion path (b)); every call bumps SRTC_ST_PHONEME_MISSES so the future walker landing can observe hit/miss ratio in production traces from day one. Three callee-save pushes leave rsp%16==0. Labels prefixed screen_reader_tts_lp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov  rbx, rdi;                       // state_id
+        mov  r12, rsi;                       // word_offset (unused at this landing; preserved for the future walker)
+        mov  r13, rdx;                       // word_len
+
+        // (1) state row valid?
+        mov  rdi, rbx;
+        call screen_reader_tts_row_valid;
+        cmp  rax, 0;
+        je   screen_reader_tts_lp_miss;
+
+        // (2) word_len valid?
+        mov  rdi, r13;
+        call screen_reader_tts_word_valid;
+        cmp  rax, 0;
+        je   screen_reader_tts_lp_miss;
+
+        // (3) At this fidelity: always miss. Bump miss counter.
+        mov  rdi, 4;                         // SRTC_ST_PHONEME_MISSES
+        call screen_reader_tts_stats_bump;
+
+      screen_reader_tts_lp_miss:
+        xor  rax, rax;                       // SRTC_PHONEME_MISS
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION L  Setters (rate / punct).
+  // ==========================================================================
+
+  pub let tts_client_set_rate : (u64, u64) -> u64 !{mem} @{} =
+    fn (state_id: u64) (rate: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): update voice_rate at cfg[47:32]. Validates state_id and rate in (0, SRTC_RATE_MAX(300)]. Read-modify-write on the cfg word (row+8) preserves cache[31:0], punct[55:48], in_use[63:56]. Three callee-save pushes leave rsp%16==0. Labels prefixed screen_reader_tts_sr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov  rbx, rdi;                       // state_id
+        mov  r12, rsi;                       // rate
+
+        // (1) state row valid?
+        mov  rdi, rbx;
+        call screen_reader_tts_row_valid;
+        cmp  rax, 0;
+        je   screen_reader_tts_sr_bad_state;
+
+        // (2) rate valid?
+        mov  rdi, r12;
+        call screen_reader_tts_rate_valid;
+        cmp  rax, 0;
+        je   screen_reader_tts_sr_bad_rate;
+
+        // (3) row_base.
+        mov  rdi, rbx;
+        call screen_reader_tts_row_base;
+        cmp  rax, 0;
+        je   screen_reader_tts_sr_bad_state;
+        mov  r13, rax;                       // row_base
+
+        // (4) RMW cfg word: clear [47:32], OR in (rate & 0xFFFF) << 32.
+        //     mask = ~(0xFFFF << 32) = 0xFFFF0000FFFFFFFF.
+        mov  rax, [r13 + 8];
+        mov  r10, 0xFFFF0000FFFFFFFF;
+        and  rax, r10;
+        mov  r10, r12;
+        and  r10, 0xFFFF;
+        shl  r10, 32;
+        or   rax, r10;
+        mov  [r13 + 8], rax;
+
+        xor  rax, rax;                       // SRTC_OK
+        jmp  screen_reader_tts_sr_out;
+
+      screen_reader_tts_sr_bad_state:
+        mov  rax, 0xFFFFECD8;                // SRTC_BAD_STATE
+        jmp  screen_reader_tts_sr_out;
+      screen_reader_tts_sr_bad_rate:
+        mov  rax, 0xFFFFECDA;                // SRTC_BAD_RATE
+
+      screen_reader_tts_sr_out:
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  pub let tts_client_set_punct : (u64, u64) -> u64 !{mem} @{} =
+    fn (state_id: u64) (mode: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): update punctuation_mode at cfg[55:48]. Validates state_id and mode in [0, SRTC_PUNCT_MAX(2)]. Read-modify-write on the cfg word (row+8) preserves cache[31:0], rate[47:32], in_use[63:56]. Three callee-save pushes leave rsp%16==0. Labels prefixed screen_reader_tts_sm_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov  rbx, rdi;                       // state_id
+        mov  r12, rsi;                       // mode
+
+        // (1) state row valid?
+        mov  rdi, rbx;
+        call screen_reader_tts_row_valid;
+        cmp  rax, 0;
+        je   screen_reader_tts_sm_bad_state;
+
+        // (2) mode valid?
+        mov  rdi, r12;
+        call screen_reader_tts_punct_valid;
+        cmp  rax, 0;
+        je   screen_reader_tts_sm_bad_punct;
+
+        // (3) row_base.
+        mov  rdi, rbx;
+        call screen_reader_tts_row_base;
+        cmp  rax, 0;
+        je   screen_reader_tts_sm_bad_state;
+        mov  r13, rax;                       // row_base
+
+        // (4) RMW cfg word: clear [55:48], OR in (mode & 0xFF) << 48.
+        //     mask = ~(0xFF << 48) = 0xFF00FFFFFFFFFFFF.
+        mov  rax, [r13 + 8];
+        mov  r10, 0xFF00FFFFFFFFFFFF;
+        and  rax, r10;
+        mov  r10, r12;
+        and  r10, 0xFF;
+        shl  r10, 48;
+        or   rax, r10;
+        mov  [r13 + 8], rax;
+
+        xor  rax, rax;                       // SRTC_OK
+        jmp  screen_reader_tts_sm_out;
+
+      screen_reader_tts_sm_bad_state:
+        mov  rax, 0xFFFFECD8;                // SRTC_BAD_STATE
+        jmp  screen_reader_tts_sm_out;
+      screen_reader_tts_sm_bad_punct:
+        mov  rax, 0xFFFFECD9;                // SRTC_BAD_PUNCT
+
+      screen_reader_tts_sm_out:
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION M  tts_client_free  (LINEAR consume)
+  //
+  // tts_client_free(state_id) -> SRTC_OK | SRTC_BAD_STATE.
+  //
+  // LINEAR consume: the caller MUST NOT reuse state_id after this
+  // call.  A second free on the same id returns SRTC_BAD_STATE
+  // (the row is no longer in_use, so _row_valid returns 0).
+  //
+  // One callee-save push (rbx=state_id): entry rsp%16==8, one 8-byte
+  // push gives rsp%16==0 -- the value every nested `call` needs at
+  // the callsite. No further pad required.
+  // ==========================================================================
+
+  pub let tts_client_free : (u64) -> u64 !{mem} @{} =
+    fn (state_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): LINEAR-consume one TTS-client state row. state_id >= SRTC_MAX_STATES(1) OR row not in_use -> SRTC_BAD_STATE; else free + return SRTC_OK. One callee-save push leaves rsp%16==0 which matches SysV call alignment; no further pad needed. Labels prefixed screen_reader_tts_fr_.",
+      block: {
+        push rbx;
+        mov  rbx, rdi;                       // state_id
+
+        // OOB or already-freed row?
+        mov  rdi, rbx;
+        call screen_reader_tts_row_valid;
+        cmp  rax, 0;
+        je   screen_reader_tts_fr_bad_state;
+
+        // Free the row.
+        mov  rdi, rbx;
+        call screen_reader_tts_row_free;
+
+        xor  rax, rax;                       // SRTC_OK
+        jmp  screen_reader_tts_fr_out;
+
+      screen_reader_tts_fr_bad_state:
+        mov  rax, 0xFFFFECD8;                // SRTC_BAD_STATE
+
+      screen_reader_tts_fr_out:
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION N  Stats + init.
+  // ==========================================================================
+
+  pub let screen_reader_tts_stats_bump : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): bounds-checked counter bump against SRTC_ST_REFUSED+1=6. Load-inc-store idiom (no `add reg, [mem]`). Labels prefixed screen_reader_tts_sb_.",
+      block: {
+        cmp rdi, 6;
+        jae screen_reader_tts_sb_out;
+        lea r10, [rip + _screen_reader_tts_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      screen_reader_tts_sb_out:
+        ret
+      }
+    }
+
+  pub let screen_reader_tts_stats_read : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): bounds-checked counter read; OOB -> 0. Labels prefixed screen_reader_tts_st_.",
+      block: {
+        cmp rdi, 6;
+        jae screen_reader_tts_st_zero;
+        lea r10, [rip + _screen_reader_tts_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      screen_reader_tts_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_tts_init(): zero row pool + stats. Defensive
+  // re-scrub; .bss is already zero at real boot. Mirrors
+  // screen_reader_protocol_init's shape.
+  pub let screen_reader_tts_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B10-07 (paideia-os #2309): zero _screen_reader_tts_rows (4 u64) + _screen_reader_tts_stats (6 u64). Defensive; .bss is already zero at real boot. Labels prefixed screen_reader_tts_ini_.",
+      block: {
+        lea r10, [rip + _screen_reader_tts_rows];
+        xor rax, rax;
+        xor rcx, rcx;
+      screen_reader_tts_ini_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  screen_reader_tts_ini_rows;
+
+        lea r10, [rip + _screen_reader_tts_stats];
+        xor rcx, rcx;
+      screen_reader_tts_ini_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 6;
+        jb  screen_reader_tts_ini_stats;
+        ret
+      }
+    }
+}

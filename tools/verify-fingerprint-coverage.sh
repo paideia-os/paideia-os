@@ -1013,6 +1013,12 @@ ALLOWLIST = {
     "ime session mint ok [legacy: IME SESSION MINT OK]":
         "Wave0-B8 G11-M1-001 (#2314): ime_session LINEAR "
         "(KIND_IME_SESSION=0x1D4) data-only decl; kernel dispatcher not yet wired.",
+    "ime provider register ok [legacy: IME PROVIDER REGISTER OK]":
+        "Wave0-B10 G11-M2-001 (paideia-os #2315): ime_provider "
+        "(KIND_IME_PROVIDER=0x1DC) data-only fingerprint; router-side "
+        "dispatcher that would emit it on successful register is a future "
+        "landing (§2.20 KIND_IME_ROUTER, #2316). Same posture as the "
+        "sibling `ime session mint ok` entry above.",
     "ui context mint ok [legacy: UI CONTEXT MINT OK]":
         "Wave0-B8 G12-M1-001 (#2326): ui_context (KIND_UI_CONTEXT=0x1D5) "
         "data-only decl; kernel dispatcher + toolkit runtime not yet wired.",
@@ -1024,6 +1030,10 @@ ALLOWLIST = {
         "(KIND_INPUT_ROUTE=0x1D7) data-only decl; kernel dispatcher not yet wired.",
     "pdx kind tiling bsp meta [legacy: TILING BSP META OK]":
         "Wave0-B8 G9-M2-001 (#2291): tiling_bsp value-type module; "
+        "no KIND cap; consumer (workspace tiling) emits at wire-body land.",
+    "pdx kind tiling floating meta [legacy: TILING FLOATING META OK]":
+        "Wave0-B10 G9-M2-002 (#2292): tiling_floating value-type module "
+        "(floating override + stacked group overlay on top of tiling_bsp); "
         "no KIND cap; consumer (workspace tiling) emits at wire-body land.",
 
     # ------------------------------------------------------------------
@@ -1059,6 +1069,35 @@ ALLOWLIST = {
     "pdx kind keynav taborder meta [legacy: KEYNAV TABORDER META OK]":
         "Wave0-B9 G10-M4-001 (#2311): keynav_taborder DFS cursor; "
         "compositor key-event dispatch not yet wired.",
+
+    # ------------------------------------------------------------------
+    # Wave 0 Batch 10 — G8/G9/G10/G11/G12 wider fan-out. Data-only meta
+    # decls; kernel dispatchers land with future wire-body milestones.
+    # ------------------------------------------------------------------
+    "recovery console ok [legacy: RECOVERY CONSOLE OK]":
+        "Wave0-B10 G8-M1-002 (#2275): recovery_console takeover logic; "
+        "input-server dispatcher not yet wired.",
+    "route revoke ok [legacy: ROUTE REVOKE OK]":
+        "Wave0-B10 G8-M2-003 (#2279): route_revoke auto-callbacks + "
+        "implicit-grab; walker primitive lands in G8-M2-004.",
+    "stylus device meta [legacy: STYLUS DEVICE META OK]":
+        "Wave0-B10 G8-M4-002 (#2284): KIND_STYLUS_DEVICE=0x1DB data-only "
+        "decl; kernel dispatcher not yet wired.",
+    "buffer age ring init ok [legacy: BUFFER AGE RING INIT OK]":
+        "Wave0-B10 G9-M3-002 (#2295): buffer_age partial-repaint scheduler; "
+        "compositor swap-chain wire-up not yet landed.",
+    "pdx present feedback route meta [legacy: PRESENT FEEDBACK ROUTE OK]":
+        "Wave0-B10 G9-M4-002 (#2298): present_feedback_route budget-one-refresh "
+        "fan-out; compositor emit path not yet wired.",
+    "pdx kind screen reader tts meta [legacy: SCREEN READER TTS META OK]":
+        "Wave0-B10 G10-M3-002 (#2309): screen_reader_tts client + phoneme "
+        "cache stub; TTS engine send-path not yet landed.",
+    "widgets ready ok [legacy: WIDGETS READY OK]":
+        "Wave0-B10 G12-M1-002 (#2327): widgets immediate-mode primitives; "
+        "renderer wire-up lands with G12-M1-004.",
+    "view tree new ok [legacy: VIEW TREE NEW OK]":
+        "Wave0-B10 G12-M2-001 (#2329): view_tree retained-mode Xilem-shape; "
+        "per-kind widget-call fanout lands with G12-M2-003.",
 }
 
 # Below these counts the extractor has stopped matching rather than the
