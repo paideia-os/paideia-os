@@ -1033,6 +1033,15 @@ ALLOWLIST = {
         "loop that would emit it on successful engine init is a future "
         "landing (paired with the KIND_IME_ROUTER #2316 wiring). Same "
         "posture as the sibling `ime provider register ok` entry above.",
+    "latin deadkey init ok [legacy: LATIN DEADKEY INIT OK]":
+        "Wave0-B12 G11-M4-002 (paideia-os #2318): latin_deadkey IME "
+        "provider satellite (second LANG_LATIN registrant alongside "
+        "latin_autocomplete #2317, servicing dead-key + Compose "
+        "sequences against KIND_IME_PROVIDER=0x1DC) data-only "
+        "fingerprint; satellite-process main loop that would emit it "
+        "on successful engine init is a future landing (paired with "
+        "the KIND_IME_ROUTER #2316 wiring). Same posture as the "
+        "sibling `latin autocomplete init ok` entry immediately above.",
     "ui context mint ok [legacy: UI CONTEXT MINT OK]":
         "Wave0-B8 G12-M1-001 (#2326): ui_context (KIND_UI_CONTEXT=0x1D5) "
         "data-only decl; kernel dispatcher + toolkit runtime not yet wired.",
@@ -1048,6 +1057,10 @@ ALLOWLIST = {
     "pdx kind tiling floating meta [legacy: TILING FLOATING META OK]":
         "Wave0-B10 G9-M2-002 (#2292): tiling_floating value-type module "
         "(floating override + stacked group overlay on top of tiling_bsp); "
+        "no KIND cap; consumer (workspace tiling) emits at wire-body land.",
+    "pdx kind tiling gaps meta [legacy: TILING GAPS META OK]":
+        "Wave0-B12 G9-M2-003 (#2293): tiling_gaps value-type module "
+        "(gap + margin geometry adjustment layer on top of tiling_bsp); "
         "no KIND cap; consumer (workspace tiling) emits at wire-body land.",
 
     # ------------------------------------------------------------------
@@ -1142,6 +1155,32 @@ ALLOWLIST = {
     "settings display ready ok [legacy: SETTINGS DISPLAY READY OK]":
         "Wave0-B11 G12-M3-001 (#2332): settings display sample panel; "
         "settings-service klog wire pending G12.M4.",
+
+    # ------------------------------------------------------------------
+    # Wave 0 Batch 12 — G8/G9/G10/G11 further fan-out. Data-only meta
+    # decls; kernel dispatchers land with future wire-body milestones.
+    # ------------------------------------------------------------------
+    "trackpad gesture meta [legacy: TRACKPAD GESTURE META OK]":
+        "Wave0-B12 G8-M3-003 (#2282): trackpad_gesture 5-gesture filter; "
+        "pointer-event wire pending.",
+    "seat lock ok [legacy: SEAT LOCK OK]":
+        "Wave0-B12 G8-M5-002 (#2286): seat_lock credential compare + "
+        "isolation invariants; lockout policy wire pending.",
+    "workspace_session save ok [legacy: WSESS SAVE OK]":
+        "Wave0-B12 G9-M1-003 (#2290): workspace_session persistence; "
+        "disk-I/O wire (fs) pending.",
+    "adaptive rate main ok [legacy: ADAPTIVE RATE MAIN OK]":
+        "Wave0-B12 G9-M5-001 (#2300): adaptive-rate sample client + "
+        "60<->120Hz hysteresis; smoke-witness klog wire pending.",
+    "adaptive rate policy ready ok [legacy: ADAPTIVE RATE POLICY READY OK]":
+        "Wave0-B12 G9-M5-002 (#2301): adaptive-rate policy knob "
+        "(LOW_LATENCY/BALANCED/BATTERY_SAVER/CUSTOM); klog wire pending.",
+    "pdx kind pwp a11y wire meta [legacy: PWP A11Y WIRE META OK]":
+        "Wave0-B12 G10-M2-002 (#2306): pwp_a11y_wire inline payload "
+        "packer/unpacker; surface-commit wire integration pending.",
+    "pdx kind keynav focus ring meta [legacy: KEYNAV FOCUS RING META OK]":
+        "Wave0-B12 G10-M4-002 (#2312): keynav_focus_ring 4-strip painter + "
+        "Ctrl+H/L/M/N skip-link; compositor key-event dispatch pending.",
 }
 
 # Below these counts the extractor has stopped matching rather than the
