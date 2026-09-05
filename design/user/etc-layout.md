@@ -70,7 +70,10 @@ an older HEAD can still be parsed.
 - `login` matches `[a-z][a-z0-9_]{0,15}`.
 - `uid` and `gid` are decimal u32.
 - `home_path` and `login_shell` are absolute paths.
-- Rootfs-seed default:
+- Rootfs-seed default (pre-R106; this passwd model is superseded by
+  the content-addressed identity model — see
+  `design/roadmap/persistent-home-wave.md` §"Supersedes / extends" and
+  `design/user/content-addressed-identity.md`):
   `operator:1000:1000:/home/operator:/bin/sh\n`.
 
 ## Freeze rationale

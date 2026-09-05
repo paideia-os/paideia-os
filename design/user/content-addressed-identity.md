@@ -402,7 +402,7 @@ Current consumers of the placeholder symbols (as of R106.M1):
 |---------------------------------|---------------------------------------------------------------|-------------------------------------------------------|
 | `src/user/rootfs_seed.pdx`      | `fc_home_root_path`, `fc_placeholder_home_path`               | `mkdir /home/` (0755) + `mkdir /home/<fp>/` (0700).   |
 | `src/user/init.pdx` (R106.M2)   | `fc_placeholder_home_path`                                    | Composes `HOME=/home/<fp>` env for exec into `/bin/sh`. |
-| `src/user/dispatch.pdx` / `shell.pdx` (R106.M3) | `fc_placeholder_home_path`                    | `/home/operator` retirement path.                     |
+| `src/user/init.pdx` (R106.M3)   | `fc_placeholder_home_path`, `fc_placeholder_home_path_len`    | Persistent-home mount point at the `sys_mount` call site, replacing the retired R65v2 hardcoded literal (`dispatch.pdx`/`shell.pdx` swept but found to hold no functional consumer of that literal). |
 
 Retirement path: R108.M2 (see §9.2 round map row) rewrites the four
 `fc_placeholder_*` symbols in place with the real founder fingerprint

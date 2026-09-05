@@ -679,12 +679,16 @@ ALLOWLIST = {
     # design/user/persistent-home.md §2/§6 and the R65v2 closure retro
     # (design/round-retrospectives/r65-closure-v2.md) for the honest
     # scope note.
-    "init home mount ok [legacy: INIT HOME MOUNT OK] -- src=/var/pdxfs/home.img mp=/home/operator backend=PDXFS_BLOCK":
-        "R65v2.M1-001 (#1979): fires only when /var/pdxfs/home.img "
-        "exists AND sys_mount succeeds; neither holds under the default "
-        "tmpfs-rootfs boot (backend_id=5 is UNIMPL pending a devfs "
-        "dev-path resolver). Assertable once R51/R52 lands a persistent "
-        "pdxfs-block rootfs — see design/user/persistent-home.md §2/§6.",
+    "init home mount ok [legacy: INIT HOME MOUNT OK] -- src=/var/pdxfs/home.img mp=/home/<fp> backend=PDXFS_BLOCK":
+        "R65v2.M1-001 (#1979), mount-point field updated R106.M3 "
+        "(paideia-os #2230, retiring the literal /home/operator hardcode "
+        "in favor of a static '<fp>' placeholder token sourced from "
+        "FounderConstants.fc_placeholder_home_path): fires only when "
+        "/var/pdxfs/home.img exists AND sys_mount succeeds; neither holds "
+        "under the default tmpfs-rootfs boot (backend_id=5 is UNIMPL "
+        "pending a devfs dev-path resolver). Assertable once R51/R52 "
+        "lands a persistent pdxfs-block rootfs — see "
+        "design/user/persistent-home.md §2/§6.",
 
     # Sibling of the entry immediately above — device-target variant.
     # Fires only when sys_stat("/dev/nvme0") returns 0 (a real block
@@ -692,12 +696,15 @@ ALLOWLIST = {
     # (design/user/persistent-home.md §5's "no devfs" gap). Same
     # backend_id=5 UNIMPL posture applies even were the stat to somehow
     # succeed.
-    "init home mount ok [legacy: INIT HOME MOUNT OK] -- src=/dev/nvme0 mp=/home/operator backend=PDXFS_BLOCK":
-        "R65v2.M1-001 (#1979) / R65v2.M1-002 device-target path (#1980): "
-        "fires only when /dev/nvme0 exists AND sys_mount succeeds; no "
-        "devfs node ever populates that path in this tree yet, and "
-        "backend_id=5 is UNIMPL regardless. Assertable once real "
-        "hardware/devfs + R51/R52 pdxfs-block land together.",
+    "init home mount ok [legacy: INIT HOME MOUNT OK] -- src=/dev/nvme0 mp=/home/<fp> backend=PDXFS_BLOCK":
+        "R65v2.M1-001 (#1979) / R65v2.M1-002 device-target path (#1980), "
+        "mount-point field updated R106.M3 (paideia-os #2230, retiring "
+        "the literal /home/operator hardcode in favor of a static "
+        "'<fp>' placeholder token): fires only when /dev/nvme0 exists "
+        "AND sys_mount succeeds; no devfs node ever populates that path "
+        "in this tree yet, and backend_id=5 is UNIMPL regardless. "
+        "Assertable once real hardware/devfs + R51/R52 pdxfs-block land "
+        "together.",
 
     # src/kernel/core/cap/kind_elevate_channel.pdx tag_elvc_expire_set_ok
     # — R90-XREPO.011.M1-002 (paideia-os #2118). Emitted from
