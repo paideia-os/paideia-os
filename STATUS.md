@@ -1339,3 +1339,27 @@ showing zero violations), `design/round-retrospectives/r105-
 closure.md`. syscall-table.md refreshed to include sysnos 108-113 +
 R105 references. Retire tag: `r105-closed` (main to apply after
 this landing).
+
+## R106 (persistent /home substrate — single-user path) — CLOSED 2026-09-05
+
+R106 lands the persistent-home substrate: one content-addressed
+placeholder path (`fc_placeholder_home_path` = `/home/deadbeef00…00`
+via `FounderConstants`, R106.M1 #2228), env-var wiring (init retargets
+its existing `HOME=` envp entry to that placeholder; shell was
+already length-agnostic, R106.M2 #2229), and a full sweep retiring
+every literal `/home/operator` from `src/` + `tests/`
+(`grep -rn '/home/operator' src/ tests/` = 0 matches, R106.M3
+#2230). Two shell-integration surfaces co-land: `dispatch.pdx`
+gets `dispatch_from_tokenizer_stream` (novel-shape 80-byte token
+record + granular `cd` errors; string dispatch path preserved
+byte-identical, R106.M4-KERNEL #2231) and `tokenizer.pdx` gets
+`TOK_TILDE_ALIAS` recognition + a stub resolver that returns
+`HOME_MARKER` for bare `~` and `E_ALIAS_UNRESOLVED` for named
+aliases (R106.M4-USER #2342). R106.M5 (two-phase persistent-home
+smoke, #2232) ESCALATED — `sys_mount` `backend_id=5`
+(`SM_BACKEND_PDXFS_BLOCK`) is still a two-instruction stub
+returning `SYS_MOUNT_UNIMPL_PDXFS_BLOCK`, so Phase B cannot land
+as green; per the milestone's own escalation instruction, filed
+paideia-os #2345 (R106->R107 escalation: pull file-bdev forward).
+New design docs: `design/round-retrospectives/r106-closed.md`.
+Retire tag: `r106-closed` (main to apply after this landing).
