@@ -1,0 +1,1046 @@
+// src/user/input_server/enumerate.pdx -- Wave0-B11-01 (paideia-os #2276)
+//
+// G8-M1-003: Input-server device enumeration + hot-plug ingest from
+// KIND_HID_STREAM.
+//
+// PURPOSE. The input server's device-enumeration table + entry points.
+// On boot the server walks the KIND_HID_STREAM linked list (bound at
+// step (4) of main.pdx's BOOT-ORDER preamble) and populates the
+// enumeration table with one row per live device. Thereafter,
+// hotplug-add / hotplug-remove events (delivered via KIND_HOTPLUG_CHANNEL
+// -- src/kernel/core/cap/kind_hotplug_channel.pdx, R105.M4-001) drive
+// row births + retirements; the correct device-kind cap
+// (KIND_KEYBOARD_DEVICE 0x1D2, KIND_POINTER_DEVICE 0x1D3, KIND_TOUCH_
+// DEVICE 0x1D4, KIND_STYLUS_DEVICE 0x1DB, KIND_JOYSTICK_DEVICE TBD) is
+// minted by dispatching on DeviceClass at ingest time. The row remembers
+// which cap it minted (bound_kind_id) so the remove path can revoke it.
+//
+// DESIGN AUTHORITY.
+//
+//   * src/user/input_server/main.pdx (B8-01, #2274) -- BOOT-ORDER §THIS
+//     LANDING notes that step (4) "input server binds its KIND_HID_STREAM
+//     read cap" precedes step (6) "input server main loop dispatches HID
+//     events to routes". This file lives BETWEEN steps (4) and (6):
+//     enumerate_boot_scan is called right after the KIND_HID_STREAM cap
+//     lands, and enumerate_on_hotplug_add is called from the main loop's
+//     hotplug-fanout branch (a future G8-M2 landing).
+//
+//   * src/user/input_server/seat_kind.pdx (B8-06, #2285) -- a seat holds
+//     typed slots for one keyboard + one pointer + optional touch + stylus.
+//     The seat_kind_id column on this table names which seat a device is
+//     auto-assigned to at enumerate time. The first-seat-hits-first-of-
+//     kind policy is what makes a single-user desktop "just work" without
+//     a per-device configuration step.
+//
+//   * src/kernel/core/cap/kind_hotplug_channel.pdx (R105.M4-001) -- the
+//     hotplug event source. This file is the input-server-side consumer
+//     of the endpoint the kernel HPD ISR delivers into.
+//
+//   * design/kernel/kind-tui-canvas.md (recently touched) -- the parallel
+//     KIND_TUI_CANVAS work reserves seat 0's keyboard slot for the
+//     recovery-console fallback; enumerate must not steal that slot when
+//     the recovery reservation is live. Enforced structurally: bound_
+//     kind_id and seat_kind_id are always 0 at initial mint (an unbound-
+//     to-seat row), and a follow-up seat_bind is a separate operation.
+//
+// =============================================================================
+// NOVEL-CLEAN CHOICES
+// =============================================================================
+//
+// (1) ENUMERATION IS A TABLE, NOT A LINKED LIST OF ALLOCATIONS.
+//     The table is a page-sized (1024 B) fixed pool of 32 rows. Row
+//     birth is an in_use-flip; row retirement is an in_use-zero. No
+//     dynamic allocator, no free-list threading, no ABA. The 32-row
+//     ceiling covers a 4-seat kiosk with 8 devices per seat comfortably;
+//     device count outside that regime is a config concern, not a
+//     dispatch concern.
+//
+// (2) DEVICE CLASS IS AN ORDINAL, NOT A KIND ORDINAL.
+//     The row's device_class field is a small enum (0..4 or 255-other)
+//     that the dispatcher maps to a concrete KIND_* ordinal at mint
+//     time. Callers ask "which class is this device?" (a stable local
+//     answer) rather than "which KIND ordinal did the kernel assign?"
+//     (a moving target as KIND_* slots stabilize). The mint dispatcher
+//     itself lands with G8-M1-004; this file's bound_kind_id column
+//     STAYS ZERO until that dispatcher writes it back.
+//
+// (3) hotplug_seq IS PER-ENUMERATE-ROW, NOT GLOBAL.
+//     Each row carries the monotonic hotplug counter value at its
+//     ingest moment. This lets a subscriber (svc-compositor, an input-
+//     health monitor) tell "row 3 was born at seq 12; row 3 is now at
+//     seq 47" without a per-subscription bookmarking scheme -- the
+//     row's own hotplug_seq is the ground truth.
+//
+// (4) ENUMERATION AND SEAT-BIND ARE SEPARATE OPERATIONS.
+//     enumerate_on_hotplug_add mints the row with seat_kind_id = 0
+//     (unbound). A follow-up seat_bind_* operation (owned by seat_kind
+//     .pdx's SEAT_OP_BIND_TOUCH / _STYLUS surface, and a future
+//     SEAT_OP_BIND_KEYBOARD / _POINTER) attaches the row to a seat.
+//     This split is deliberate: hot-plugging a keyboard on a locked
+//     multi-user workstation must not implicitly grant that keyboard
+//     access to seat 0's focus -- the lock-screen agent explicitly
+//     rebinds it once the user authenticates.
+//
+// =============================================================================
+// ROW LAYOUT -- 32 BYTES (four u64 words)
+// =============================================================================
+//
+//   [+0]  word0: hid_stream_id[31:0] | bound_kind_id[63:32]
+//                (hid_stream_id nonzero == row in-use sentinel; matches
+//                 stylus.pdx's device_serial convention)
+//   [+8]  word1: seat_kind_id[31:0]  | device_class[39:32] | reserved[63:40]
+//                (device_class is one byte; upper 24 bits of the high
+//                 32 are zero-reserved for a future device-flags nibble)
+//   [+16] word2: vendor_id[15:0] | product_id[31:16] | reserved[63:32]
+//                (u16 slots per USB HID / PCI convention; reserved
+//                 upper 32 bits are for a future subsystem_id pair)
+//   [+24] word3: hotplug_seq (u64)
+//                (monotonic counter value at ingest; per-row, not global-
+//                 subscriber-bookmarked)
+//
+// 32 rows * 32 bytes = 1024 bytes = 128 u64 = one 4 KiB page's quarter.
+// @align(64) so the pool spans 16 cache lines, cleanly.
+//
+// =============================================================================
+// SLOT ALLOCATION -- FAILURE TAXONOMY -- 0xFFFFEAD0..0xFFFFEADF
+// =============================================================================
+//
+// The spec-suggested band 0xFFFFED60..0xFFFFED6F is TAKEN: a landing-
+// time grep of src/ shows it is triple-claimed by
+//   * src/kernel/core/drivers/color/cicp.pdx        (CICP_BAD_* codes)
+//   * src/kernel/core/drivers/text/color_emoji.pdx  (CE_ERR_BAD_* codes)
+//   * src/kernel/core/drivers/vello/vello_effects.pdx (its Section 3)
+// so we advance to the next contiguous unclaimed 16-slot page per the
+// row's own "grep-verify free; if taken, pick next free 16-slot page
+// and document" discipline. A repo-wide grep for 0xFFFFEAD returns zero
+// hits; 0xFFFFEAD0..0xFFFFEADF is fully free and adjacent-free (the
+// neighbours 0xFFFFEAC0..CF and 0xFFFFEAE0..EF are also lightly
+// populated).
+//
+// =============================================================================
+// ENCODER-CONSERVATIVE DISCIPLINE (Enumerate M0305, label prefix
+// enumerate_)
+// =============================================================================
+//
+//   * NO `test rN, rN`. Use `cmp rN, 0` instead (paideia-as U1605).
+//   * NO `and r11, imm64`. r11 is internal scratch under U1615; stage
+//     the mask through rax/r10 which accept small-imm AND, or use
+//     shl/shr masking. r11 is used ONLY as a pointer holder in this
+//     file (matches main.pdx's convention).
+//   * NO 2-op imul-with-imm. Row-index * 32 is done via `shl 5`.
+//   * NO `add reg, [mem]`. Load through a scratch first, then
+//     register-to-register `add`.
+//   * NO MOVSX/MOVZX. Sign/zero extend via shl/sar or shl/shr pairs.
+//   * u32 zero-extension via `shl 32; shr 32`. Small-imm AND
+//     (`and rax, 0xFF`, `and rax, 0xFFFF`) on rax/r10 is acceptable
+//     for u8/u16 extraction.
+//   * Single-line `pub let NAME : TYPE = VALUE` for constant bindings.
+//
+// Module = Enumerate (M0305). Label prefix = enumerate_. Tag size =
+// strlen+1.
+
+module Enumerate = structure {
+
+  // ==========================================================================
+  // SECTION 1 -- PARENT KIND + POOL CEILING
+  // ==========================================================================
+  //
+  // This module is not itself a KIND -- it is process-local state on the
+  // KIND_INPUT_SERVER (0x1D0) singleton. The device kinds it MINTS (in a
+  // follow-up landing) are the four KIND_*_DEVICE ordinals reserved in
+  // the 0x1D2..0x1D5 + 0x1DB block; enumerate_class_to_kind (future
+  // helper, not in this file) will resolve those.
+
+  pub let ENUMERATE_PARENT_KIND : u64 = 0x1D0   // KIND_INPUT_SERVER
+
+  // Pool ceiling. 32 concurrent enumerated devices:
+  //   * a typical desktop:  1 keyboard + 1 pointer + optional touch = 3
+  //   * a stylus workstation: + 1 stylus                             = 4
+  //   * a 4-seat kiosk: 4 * (kb + pointer + touch)                   = 12
+  //   * a lab bench with USB HID accessories:                        ~16
+  //   * gaming rig with multiple joysticks + macropads:              ~24
+  // 32 covers the busiest realistic case with margin. 32 * 32 = 1024
+  // bytes -- one quarter-page slab, aligned to a cache line.
+  pub let EN_MAX          : u64 = 32
+  pub let EN_ROW_BYTES    : u64 = 32
+  pub let EN_TABLE_U64S   : u64 = 128        // EN_MAX * EN_ROW_BYTES / 8
+
+  // Row-index shift: row_offset = row_index << EN_ROW_SHIFT.
+  // 2^5 = 32 = EN_ROW_BYTES; used in place of imul-with-imm.
+  pub let EN_ROW_SHIFT    : u64 = 5
+
+  // Documentary u32/u16/u8 masks -- assembly uses shl/shr where the
+  // encoder-conservative posture demands (no `and reg, imm64`).
+  pub let EN_U32_MAX      : u64 = 0xFFFFFFFF
+  pub let EN_U16_MAX      : u64 = 0xFFFF
+  pub let EN_U8_MAX       : u64 = 0xFF
+
+  // ==========================================================================
+  // SECTION 2 -- DEVICEclass ENUM
+  // ==========================================================================
+  //
+  // Six classes matching the USB HID base-usage-page tags the enumerator
+  // will see once the KIND_HID_STREAM parser lands (G8-M1-005). Values
+  // are dense from 0 for the top-of-taxonomy classes plus a sentinel 255
+  // for "other" so future taxonomies can be tacked on without renumbering
+  // the settled ones.
+  //
+  //   DC_KEYBOARD  0    HID usage page 0x01, usage 0x06 (keyboard)
+  //   DC_POINTER   1    HID usage page 0x01, usage 0x02 (mouse) or
+  //                     usage page 0x0D, usage 0x02 (touchpad-as-pointer)
+  //   DC_TOUCH     2    HID usage page 0x0D, usage 0x04 (touch screen)
+  //   DC_STYLUS    3    HID usage page 0x0D, usage 0x02 with tip-switch
+  //                     (Wacom/UPD styli publish here)
+  //   DC_JOYSTICK  4    HID usage page 0x01, usage 0x04/0x05 (joystick/
+  //                     gamepad); future KIND_JOYSTICK_DEVICE lands with
+  //                     the gaming milestone
+  //   DC_OTHER     255  any HID device that does not match the five above
+  //                     (a HID-conformant sensor, a proximity switch, a
+  //                     digital-video-remote panel); the row is stashed
+  //                     but no auto-mint is attempted
+
+  pub let DC_KEYBOARD  : u64 = 0
+  pub let DC_POINTER   : u64 = 1
+  pub let DC_TOUCH     : u64 = 2
+  pub let DC_STYLUS    : u64 = 3
+  pub let DC_JOYSTICK  : u64 = 4
+  pub let DC_OTHER     : u64 = 255
+  pub let DC_KNOWN_MAX : u64 = 4   // largest ordinal that is not DC_OTHER
+
+  // ==========================================================================
+  // SECTION 3 -- ROW LAYOUT OFFSETS
+  // ==========================================================================
+  //
+  // Machine-readable spelling of the row layout documented in the file
+  // header. Every producer / consumer reads through THESE constants,
+  // not through hand-rolled +8 arithmetic.
+
+  pub let EN_OFF_IDS0  : u64 = 0     // hid_stream_id | bound_kind_id
+  pub let EN_OFF_IDS1  : u64 = 8     // seat_kind_id  | device_class
+  pub let EN_OFF_IDS2  : u64 = 16    // vendor_id | product_id | reserved
+  pub let EN_OFF_SEQ   : u64 = 24    // hotplug_seq (u64)
+
+  // Sub-word bit positions.
+  //   IDS0[63:32] = bound_kind_id
+  //   IDS1[39:32] = device_class (one byte)
+  //   IDS2[15:0]  = vendor_id
+  //   IDS2[31:16] = product_id
+  pub let EN_IDS0_BOUND_SHIFT   : u64 = 32
+  pub let EN_IDS1_CLASS_SHIFT   : u64 = 32
+  pub let EN_IDS2_PID_SHIFT     : u64 = 16
+
+  // ==========================================================================
+  // SECTION 4 -- OP TAGS (dispatch surface, future substrate)
+  // ==========================================================================
+
+  pub let EN_OP_BOOT_SCAN         : u64 = 0
+  pub let EN_OP_HOTPLUG_ADD       : u64 = 1
+  pub let EN_OP_HOTPLUG_REMOVE    : u64 = 2
+  pub let EN_OP_QUERY_BY_CLASS    : u64 = 3
+  pub let EN_OP_QUERY_ROW         : u64 = 4   // reads one row given device_id
+  pub let EN_OP_MAX               : u64 = 4
+
+  // ==========================================================================
+  // SECTION 5 -- FAILURE TAXONOMY -- 0xFFFFEAD0..0xFFFFEADF
+  // ==========================================================================
+
+  pub let EN_OK                 : u64 = 0
+  pub let EN_TAIL_ENOSPC        : u64 = 0xFFFFEADF   // no free row
+  pub let EN_BAD_HID_STREAM     : u64 = 0xFFFFEADE   // hid_stream_id zero or > u32
+  pub let EN_BAD_CLASS          : u64 = 0xFFFFEADD   // class not in {0..4, 255}
+  pub let EN_BAD_VID            : u64 = 0xFFFFEADC   // vendor_id > u16
+  pub let EN_BAD_PID            : u64 = 0xFFFFEADB   // product_id > u16
+  pub let EN_BAD_DEVICE_ID      : u64 = 0xFFFFEADA   // device_id not in [1..EN_MAX]
+  pub let EN_ALREADY_REMOVED    : u64 = 0xFFFFEAD9   // row already free
+  pub let EN_NULL_SCAN          : u64 = 0xFFFFEAD8   // hid_stream_head == 0
+  pub let EN_ALREADY_BOUND      : u64 = 0xFFFFEAD7   // hid_stream_id already in table
+  pub let EN_UNSUP_OP           : u64 = 0xFFFFEAD6   // op ordinal out of range
+  pub let EN_DECODE_BAD         : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ==========================================================================
+  // SECTION 6 -- STATS COUNTER SLOTS (declaratory; substrate bumps)
+  // ==========================================================================
+
+  pub let EN_ST_BOOT_SCANS      : u64 = 0
+  pub let EN_ST_HOTPLUG_ADDS    : u64 = 1
+  pub let EN_ST_HOTPLUG_REMOVES : u64 = 2
+  pub let EN_ST_REFUSED         : u64 = 3
+  pub let EN_ST_QUERIES         : u64 = 4
+  pub let EN_ST_MAX             : u64 = 8
+
+  // ==========================================================================
+  // SECTION 7 -- SINGLETON TABLE + COUNTERS
+  //
+  // The table is a fixed pool of 32 rows (128 u64 = 1024 bytes) scrubbed
+  // to zero by .bss. hid_stream_id at word0[31:0] doubles as the in-use
+  // sentinel (nonzero == occupied). The hotplug_seq counter is a
+  // singleton u64 bumped once per successful enumerate_on_hotplug_add;
+  // the value is stamped into the new row's word3 and returned via the
+  // row's per-row hotplug_seq getter.
+  // ==========================================================================
+
+  pub let mut _en_table               : [u64; 128] = uninit @align(64)
+  pub let mut _en_hotplug_seq_counter : [u64; 1]   = uninit @align(8)
+  pub let mut _en_stats               : [u64; 8]   = uninit @align(64)
+
+  // ==========================================================================
+  // SECTION 8 -- STRUCT SHAPE (documentation + typed consumers)
+  //
+  // The row layout above is authoritative; this struct declaration exists
+  // so future consumers that want a typed accessor can name the fields.
+  // paideia-as does not currently model intermediate-alignment padding
+  // as struct members, so the u8 device_class and u16 vendor_id fields
+  // are declared with their natural widths and readers/writers align
+  // via the ROW LAYOUT offset constants above.
+  // ==========================================================================
+
+  struct EnumeratedDevice {
+    hid_stream_id: u32,
+    device_class: u8,
+    vendor_id: u16,
+    product_id: u16,
+    bound_kind_id: u32,
+    seat_kind_id: u32,
+    hotplug_seq: u64
+  }
+
+  // ==========================================================================
+  // SECTION 9 -- FINGERPRINT TAG (one line, legacy-suffixed)
+  //
+  // Emitted once on successful enumerate_on_hotplug_add by the future
+  // substrate. tools/verify-fingerprint-coverage.sh's allowlist takes an
+  // entry with reason "input-server enumerate dispatcher not yet landed
+  // (G8-M1-003; hotplug fanout at G8-M2-***)".
+  //
+  // Byte count: "enumerate meta ok [legacy: ENUMERATE META OK]\0"
+  //   = "enumerate meta ok " (18) + "[legacy: ENUMERATE META OK]" (27)
+  //   + "\0" (1) = 46.
+  // ==========================================================================
+
+  pub let pdx_kind_enumerate_meta : [u8; 46] = "enumerate meta ok [legacy: ENUMERATE META OK]\0"
+
+  // ==========================================================================
+  // SECTION 10 -- VALIDATORS (pure leaves)
+  // ==========================================================================
+  //
+  // Every function here is a pure, unsafe-bodied leaf with small
+  // immediates. Returns in rax, clobbers rax + one scratch (r10).
+  // No `test`, no `and reg, imm64`, no MOVZX/MOVSX. Labels prefixed
+  // enumerate_.
+
+  // enumerate_hid_valid(id) -> 1 iff id in (0, 2^32). Zero is refused
+  // so word0[31:0]==0 is unambiguously the row-empty sentinel.
+  pub let enumerate_hid_valid : (u64) -> u64 !{} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "B11-01 (#2276): hid_stream_id validator (nonzero + fits u32). Zero is refused so word0's low 32 doubles as the row-empty sentinel. Uses shr 32 to check upper bits are clear rather than `and reg, 0xFFFFFFFF`. Labels prefixed enumerate_hv_.",
+      block: {
+        cmp rdi, 0;
+        je  enumerate_hv_no;
+        mov rax, rdi;
+        shr rax, 32;
+        cmp rax, 0;
+        jne enumerate_hv_no;
+        mov rax, 1;
+        ret;
+      enumerate_hv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // enumerate_class_valid(class) -> 1 iff class in {0,1,2,3,4} or ==255.
+  // Two acceptance windows: the dense 0..4 known-class window and the
+  // sentinel DC_OTHER=255. Small immediate compares only.
+  pub let enumerate_class_valid : (u64) -> u64 !{} @{} =
+    fn (class: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "B11-01 (#2276): DeviceClass validator. Accepts 0..4 (DC_KEYBOARD..DC_JOYSTICK) or 255 (DC_OTHER); all other values refused. Two small-imm compares (ja for the 0..4 window, je for the 255 sentinel). Labels prefixed enumerate_cv_.",
+      block: {
+        cmp rdi, 4;
+        jbe enumerate_cv_yes;
+        cmp rdi, 255;
+        je  enumerate_cv_yes;
+        xor rax, rax;
+        ret;
+      enumerate_cv_yes:
+        mov rax, 1;
+        ret
+      }
+    }
+
+  // enumerate_u16_valid(v) -> 1 iff v fits u16. Zero IS legal (a HID
+  // device may publish vid==0 during enumeration; the driver-side
+  // policy decides whether to accept it, not this validator).
+  pub let enumerate_u16_valid : (u64) -> u64 !{} @{} =
+    fn (v: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "B11-01 (#2276): u16 range validator (0..65535). Uses shr 16 to check upper 48 bits are clear rather than `and reg, 0xFFFF` on a masked path -- keeps the encoder posture identical between all validators in this file. Labels prefixed enumerate_wv_.",
+      block: {
+        mov rax, rdi;
+        shr rax, 16;
+        cmp rax, 0;
+        jne enumerate_wv_no;
+        mov rax, 1;
+        ret;
+      enumerate_wv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // enumerate_device_id_valid(id) -> 1 iff id in [1, EN_MAX].
+  // device_id 0 is the "not-found / no-such-device" sentinel; it is
+  // refused by the mutating ops (remove) and returned by the query
+  // op when the caller's predicate matches no row.
+  pub let enumerate_device_id_valid : (u64) -> u64 !{} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "B11-01 (#2276): device_id validator (1..EN_MAX=32). Zero is the not-found sentinel and must not survive as a valid caller id. Small immediate cmp/jb + cmp/ja pair. Labels prefixed enumerate_dv_.",
+      block: {
+        cmp rdi, 0;
+        je  enumerate_dv_no;
+        cmp rdi, 32;
+        ja  enumerate_dv_no;
+        mov rax, 1;
+        ret;
+      enumerate_dv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 11 -- PACKERS
+  // ==========================================================================
+
+  // enumerate_ids0_pack(hid_stream, bound_kind) ->
+  //     hid_stream[31:0] | bound_kind[63:32].
+  pub let enumerate_ids0_pack : (u64, u64) -> u64 !{} @{} =
+    fn (hid_stream: u64) (bound_kind: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "B11-01 (#2276): pack word0 as hid_stream[31:0] | bound_kind[63:32]. Both halves masked via shl 32/shr 32 (low) and shl 32 (high) so out-of-range args cannot smear. Labels prefixed enumerate_p0_.",
+      block: {
+        mov rax, rdi;
+        shl rax, 32;
+        shr rax, 32;
+        mov r10, rsi;
+        shl r10, 32;
+        or  rax, r10;
+        ret
+      }
+    }
+
+  // enumerate_ids1_pack(seat, class) ->
+  //     seat[31:0] | (class & 0xFF)[39:32].
+  // Upper 24 bits of the high word stay zero (reserved for future
+  // device-flags nibble).
+  pub let enumerate_ids1_pack : (u64, u64) -> u64 !{} @{} =
+    fn (seat: u64) (class: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "B11-01 (#2276): pack word1 as seat[31:0] | class[39:32]. class masked to 0xFF via small-imm AND before shifting to the [39:32] window. Labels prefixed enumerate_p1_.",
+      block: {
+        mov rax, rdi;
+        shl rax, 32;
+        shr rax, 32;
+        mov r10, rsi;
+        and r10, 0xFF;
+        shl r10, 32;
+        or  rax, r10;
+        ret
+      }
+    }
+
+  // enumerate_ids2_pack(vid, pid) ->
+  //     (vid & 0xFFFF)[15:0] | (pid & 0xFFFF)[31:16].
+  // Upper 32 bits reserved for a future subsystem-id pair.
+  pub let enumerate_ids2_pack : (u64, u64) -> u64 !{} @{} =
+    fn (vid: u64) (pid: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "B11-01 (#2276): pack word2 as vid[15:0] | pid[31:16] | reserved[63:32]. Both halves masked to 0xFFFF via small-imm AND. Labels prefixed enumerate_p2_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFFFF;
+        mov r10, rsi;
+        and r10, 0xFFFF;
+        shl r10, 16;
+        or  rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 12 -- RESET
+  // ==========================================================================
+  //
+  // Defensive scrub of the singleton table + counter + stats. .bss is
+  // already zero at real boot; this exists for test harnesses that
+  // reuse the cell between cases (mirrors input_server_reset in
+  // main.pdx and seat_reset in seat_kind.pdx).
+
+  pub let enumerate_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "B11-01 (#2276): zero _en_table (128 u64), _en_hotplug_seq_counter (1 u64), _en_stats (8 u64). Loop over table with a decrementing counter to stay within a small immediate range. Labels prefixed enumerate_r_.",
+      block: {
+        // Zero _en_table (128 u64 words).
+        lea r11, [rip + _en_table];
+        xor rax, rax;
+        mov rcx, 128;
+      enumerate_r_top:
+        mov [r11], rax;
+        add r11, 8;
+        sub rcx, 1;
+        cmp rcx, 0;
+        jne enumerate_r_top;
+
+        // Zero counter.
+        lea r11, [rip + _en_hotplug_seq_counter];
+        mov [r11], rax;
+
+        // Zero stats (8 u64).
+        lea r11, [rip + _en_stats];
+        mov [r11 + 0],  rax;
+        mov [r11 + 8],  rax;
+        mov [r11 + 16], rax;
+        mov [r11 + 24], rax;
+        mov [r11 + 32], rax;
+        mov [r11 + 40], rax;
+        mov [r11 + 48], rax;
+        mov [r11 + 56], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 13 -- BOOT SCAN
+  //
+  // enumerate_boot_scan(hid_stream_head) -> enumerated_count.
+  //
+  // Called ONCE per boot by input_server_init AFTER the KIND_HID_STREAM
+  // cap is bound (main.pdx BOOT-ORDER step (4)). Walks the linked-list
+  // head passed by the caller, calling enumerate_on_hotplug_add for
+  // each live device the list names, and returns the number of devices
+  // ingested.
+  //
+  // TODAY THIS IS A STUB. The KIND_HID_STREAM linked-list format is not
+  // yet stabilized (lands with G8-M1-005). The stub:
+  //   * refuses hid_stream_head == 0 with EN_NULL_SCAN,
+  //   * returns 0 (zero devices ingested) on any nonzero head.
+  // The real walk arrives with G8-M1-005 and replaces the body below
+  // WITHOUT changing the signature (per the "signatures are the API"
+  // contract).
+  // ==========================================================================
+
+  pub let enumerate_boot_scan : (u64) -> u64 !{mem} @{} =
+    fn (hid_stream_head: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "B11-01 (#2276): boot-scan stub. Refuses hid_stream_head == 0 with EN_NULL_SCAN. Otherwise returns 0 (no devices ingested) -- the real walk lands with G8-M1-005 once the KIND_HID_STREAM linked-list format is stable. Signature (u64 head -> u64 count) is stable across the future replacement. Labels prefixed enumerate_bs_.",
+      block: {
+        cmp rdi, 0;
+        je  enumerate_bs_null;
+        xor rax, rax;
+        ret;
+      enumerate_bs_null:
+        mov rax, 0xFFFFEAD8;    // EN_NULL_SCAN
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 14 -- HOTPLUG ADD
+  //
+  // enumerate_on_hotplug_add(hid_stream_id, class, vid, pid) -> device_id.
+  //
+  // Ingests one hotplug-add event. Validates each arg in order; if a
+  // validator refuses, returns the appropriate EN_BAD_* code without
+  // touching the table. If all four pass, scans the table for an
+  // already-bound row naming the same hid_stream_id (refuses
+  // EN_ALREADY_BOUND) and then for a free row (refuses EN_TAIL_ENOSPC
+  // if all 32 are occupied). On success:
+  //   * bumps _en_hotplug_seq_counter (load-inc-store; no `add reg,[mem]`)
+  //   * writes the row: word0 = hid_stream_id | 0 (bound_kind_id = 0),
+  //                     word1 = 0 | class,
+  //                     word2 = vid | pid,
+  //                     word3 = hotplug_seq
+  //   * returns device_id = row_index + 1 (1-based; 0 is the "no row"
+  //     sentinel returned by enumerate_query_by_class)
+  //
+  // bound_kind_id is DELIBERATELY 0 today: the class-to-KIND mint
+  // dispatcher lands with G8-M1-004 and will write it back after
+  // minting the appropriate KIND_*_DEVICE cap. seat_kind_id is 0
+  // (unbound) per NOVEL-CLEAN §4 -- a follow-up seat_bind_* op attaches
+  // the row to a seat.
+  //
+  // Argument registers (SysV AMD64):
+  //   rdi = hid_stream_id
+  //   rsi = class
+  //   rdx = vid
+  //   rcx = pid
+  //
+  // Frame: no callee-save pushes needed (all validation + scan is
+  // inline). Entry rsp%16==8 stays through the body.
+  // ==========================================================================
+
+  pub let enumerate_on_hotplug_add : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (hid_stream_id: u64) (class: u64) (vid: u64) (pid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "B11-01 (#2276): hotplug-add ingest. Validates hid_stream_id (nonzero + fits u32 -> EN_BAD_HID_STREAM); class (in {0..4,255} -> EN_BAD_CLASS); vid (fits u16 -> EN_BAD_VID); pid (fits u16 -> EN_BAD_PID). Then scans the 32-row table for a row already binding this hid_stream_id (EN_ALREADY_BOUND) and for a free row (EN_TAIL_ENOSPC if none). On success: bumps _en_hotplug_seq_counter via load-inc-store; writes word0=hid_stream_id|0, word1=0|class<<32, word2=vid|pid<<16, word3=hotplug_seq; returns 1-based device_id. bound_kind_id stays 0 (class-to-KIND mint dispatcher lands G8-M1-004). seat_kind_id stays 0 (seat-bind is a separate op per NOVEL-CLEAN §4). r11 used ONLY as pointer holder (never masked). Scratch: rax, r8, r9, r10; rcx and rdx are caller-saved args stashed early. Labels prefixed enumerate_ha_.",
+      block: {
+        // ---- Validate hid_stream_id (nonzero + fits u32). ----
+        cmp rdi, 0;
+        je  enumerate_ha_bad_hid;
+        mov r10, rdi;
+        shr r10, 32;
+        cmp r10, 0;
+        jne enumerate_ha_bad_hid;
+
+        // ---- Validate class (in {0..4} or ==255). ----
+        cmp rsi, 4;
+        jbe enumerate_ha_class_ok;
+        cmp rsi, 255;
+        jne enumerate_ha_bad_class;
+      enumerate_ha_class_ok:
+
+        // ---- Validate vid (fits u16). ----
+        mov r10, rdx;
+        shr r10, 16;
+        cmp r10, 0;
+        jne enumerate_ha_bad_vid;
+
+        // ---- Validate pid (fits u16). ----
+        mov r10, rcx;
+        shr r10, 16;
+        cmp r10, 0;
+        jne enumerate_ha_bad_pid;
+
+        // ---- Stash args before rax is reused for scans. ----
+        //   r8  = hid_stream_id (low 32 significant)
+        //   r9  = class (0..4 or 255)
+        //   The pair (vid, pid) is repacked later via ids2 shape.
+        //   rdx (vid) and rcx (pid) preserved until the write phase.
+        mov r8, rdi;
+        mov r9, rsi;
+
+        // ---- Scan for already-bound row (word0 low32 == hid_stream_id). ----
+        //   r11 = row cursor
+        //   rax = loop counter (rows remaining)
+        lea r11, [rip + _en_table];
+        mov rax, 32;
+      enumerate_ha_dup_top:
+        // Load word0 into r10, mask to low 32.
+        mov r10, [r11];
+        shl r10, 32;
+        shr r10, 32;
+        cmp r10, r8;
+        je  enumerate_ha_already;
+        add r11, 32;
+        sub rax, 1;
+        cmp rax, 0;
+        jne enumerate_ha_dup_top;
+
+        // ---- Scan for a free row (word0 low32 == 0). Row index is
+        //      tracked in rax; r11 walks the table. ----
+        lea r11, [rip + _en_table];
+        xor rax, rax;                 // rax = 0 (candidate row index)
+      enumerate_ha_free_top:
+        mov r10, [r11];
+        shl r10, 32;
+        shr r10, 32;
+        cmp r10, 0;
+        je  enumerate_ha_write;
+        add r11, 32;
+        add rax, 1;
+        cmp rax, 32;
+        jne enumerate_ha_free_top;
+
+        // No free row found.
+        mov rax, 0xFFFFEADF;          // EN_TAIL_ENOSPC
+        ret;
+
+      enumerate_ha_write:
+        // r11 -> free row, rax = row_index (0..31). We need the
+        // 1-based device_id later; stash the index in rsi (already
+        // consumed) is unsafe -- use r8's neighbour... rsi is dead
+        // after class validation, but r9 still carries class. Stash
+        // device_id-in-progress in rsi.
+        mov rsi, rax;
+        add rsi, 1;                   // rsi = device_id (1-based)
+
+        // Bump _en_hotplug_seq_counter via load-inc-store. Stash
+        // pointer in a scratch that isn't r11 (r11 -> row).
+        lea r10, [rip + _en_hotplug_seq_counter];
+        mov rax, [r10];
+        add rax, 1;
+        mov [r10], rax;
+        // rax = new hotplug_seq. Keep it for word3 write later; but
+        // we also need rax free during the packing loop. Stash in
+        // r10 (pointer to counter is done with).
+        mov r10, rax;                 // r10 = hotplug_seq (for word3)
+
+        // word0 = hid_stream_id[31:0] | bound_kind_id(=0)[63:32].
+        // r8 already holds hid_stream_id (u32-valid). Mask via
+        // shl 32; shr 32 defensively (r8's upper 32 are zero from
+        // validation, but the mask keeps the shape identical to the
+        // packer).
+        mov rax, r8;
+        shl rax, 32;
+        shr rax, 32;                  // rax = hid_stream_id low32
+        mov [r11 + 0], rax;
+
+        // word1 = seat_kind_id(=0)[31:0] | class[39:32].
+        mov rax, r9;
+        and rax, 0xFF;                // small imm, no U1615 concern on rax
+        shl rax, 32;
+        mov [r11 + 8], rax;
+
+        // word2 = vid[15:0] | pid[31:16] | reserved(=0)[63:32].
+        // rdx = vid (still live), rcx = pid (still live).
+        mov rax, rdx;
+        and rax, 0xFFFF;
+        mov r9,  rcx;
+        and r9,  0xFFFF;
+        shl r9,  16;
+        or  rax, r9;
+        mov [r11 + 16], rax;
+
+        // word3 = hotplug_seq.
+        mov [r11 + 24], r10;
+
+        // Return device_id.
+        mov rax, rsi;
+        ret;
+
+      enumerate_ha_bad_hid:
+        mov rax, 0xFFFFEADE;          // EN_BAD_HID_STREAM
+        ret;
+      enumerate_ha_bad_class:
+        mov rax, 0xFFFFEADD;          // EN_BAD_CLASS
+        ret;
+      enumerate_ha_bad_vid:
+        mov rax, 0xFFFFEADC;          // EN_BAD_VID
+        ret;
+      enumerate_ha_bad_pid:
+        mov rax, 0xFFFFEADB;          // EN_BAD_PID
+        ret;
+      enumerate_ha_already:
+        mov rax, 0xFFFFEAD7;          // EN_ALREADY_BOUND
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 15 -- HOTPLUG REMOVE
+  //
+  // enumerate_on_hotplug_remove(device_id) -> u64 status.
+  //
+  // Validates device_id (in [1..32] -> EN_BAD_DEVICE_ID), computes the
+  // row pointer as _en_table + (device_id - 1) * 32 via `shl 5`, checks
+  // the row is in-use (word0 low32 != 0 -> EN_ALREADY_REMOVED if free),
+  // and zeroes all four words. Returns EN_OK on success.
+  //
+  // The bound_kind_id cap-revoke hook lives in a follow-up landing
+  // (G8-M1-004): today bound_kind_id is always 0 at add-time, so
+  // there is no cap to revoke. Once the mint dispatcher lands, this
+  // path will grow a call to the corresponding KIND_*_DEVICE revoker
+  // BEFORE the row zero-write.
+  // ==========================================================================
+
+  pub let enumerate_on_hotplug_remove : (u64) -> u64 !{mem} @{} =
+    fn (device_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "B11-01 (#2276): hotplug-remove teardown. Validates device_id in [1..32] (EN_BAD_DEVICE_ID). Computes row_ptr = _en_table + (device_id-1)*32 via `shl 5` (no 2-op imul-with-imm). Loads word0, masks to low 32, refuses EN_ALREADY_REMOVED if zero (row free). Otherwise zeroes all four u64 words of the row. r11 used ONLY as pointer holder. Cap-revoke hook (bound_kind_id) is a G8-M1-004 follow-up. Labels prefixed enumerate_hr_.",
+      block: {
+        // Validate device_id in [1..32].
+        cmp rdi, 0;
+        je  enumerate_hr_bad_id;
+        cmp rdi, 32;
+        ja  enumerate_hr_bad_id;
+
+        // row_ptr = _en_table + (device_id - 1) * 32.
+        mov r10, rdi;
+        sub r10, 1;
+        shl r10, 5;                   // * 32
+        lea r11, [rip + _en_table];
+        add r11, r10;
+
+        // Check in_use: word0 low32 != 0.
+        mov rax, [r11];
+        shl rax, 32;
+        shr rax, 32;
+        cmp rax, 0;
+        je  enumerate_hr_free;
+
+        // Zero the row (four u64 words).
+        xor rax, rax;
+        mov [r11 + 0],  rax;
+        mov [r11 + 8],  rax;
+        mov [r11 + 16], rax;
+        mov [r11 + 24], rax;
+
+        xor rax, rax;                 // EN_OK
+        ret;
+
+      enumerate_hr_bad_id:
+        mov rax, 0xFFFFEADA;          // EN_BAD_DEVICE_ID
+        ret;
+      enumerate_hr_free:
+        mov rax, 0xFFFFEAD9;          // EN_ALREADY_REMOVED
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 16 -- QUERY BY CLASS
+  //
+  // enumerate_query_by_class(class) -> first_matching_device_id | 0.
+  //
+  // Linear scan of the 32-row table. Returns the 1-based device_id of
+  // the FIRST in-use row whose device_class matches, or 0 if no row
+  // matches (or if the class ordinal is bogus -- callers should
+  // pre-validate via enumerate_class_valid if they need to distinguish
+  // "no such class" from "no matching device"). "First" is the smallest
+  // row index; the enumerate_on_hotplug_add scan also fills lowest-
+  // free-first, so this is deterministic across boots given the same
+  // hotplug sequence.
+  //
+  // Callers use this to answer "who is my primary keyboard?" (query
+  // DC_KEYBOARD), "is there a touchscreen?" (query DC_TOUCH -> compare
+  // return with 0), and similar first-match questions. For a full
+  // enumeration, the substrate's future EN_OP_QUERY_ROW walker consumes
+  // this file's row-index -> row-ptr helper directly.
+  //
+  // Encoder posture: word0 low32 for in-use check, word1[39:32] for
+  // device_class. Both extractions are shl/shr or small-imm AND.
+  // ==========================================================================
+
+  pub let enumerate_query_by_class : (u64) -> u64 !{mem} @{} =
+    fn (class: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "B11-01 (#2276): first-match query by device_class. Returns 1-based device_id of the first in-use row whose word1[39:32] matches, or 0 if none. Scans all 32 rows unconditionally (deterministic worst case). Bogus class values fall through to zero return (callers who want the distinction pre-validate via enumerate_class_valid). r11 walks the table; r10 is scratch. Labels prefixed enumerate_qc_.",
+      block: {
+        // r11 = row cursor, rcx = row index (0..31).
+        lea r11, [rip + _en_table];
+        xor rcx, rcx;
+      enumerate_qc_top:
+        // Check in_use: word0 low32 != 0. If zero, skip to next row.
+        mov rax, [r11];
+        shl rax, 32;
+        shr rax, 32;
+        cmp rax, 0;
+        je  enumerate_qc_next;
+
+        // Load word1, extract device_class at [39:32].
+        mov rax, [r11 + 8];
+        shr rax, 32;
+        and rax, 0xFF;
+        cmp rax, rdi;
+        jne enumerate_qc_next;
+
+        // Match: return device_id = row_index + 1.
+        mov rax, rcx;
+        add rax, 1;
+        ret;
+
+      enumerate_qc_next:
+        add r11, 32;
+        add rcx, 1;
+        cmp rcx, 32;
+        jne enumerate_qc_top;
+
+        // No match.
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 17 -- ROW GETTERS (RIGHT_QUERY_STATE surface)
+  //
+  // Small, single-shot readers for a row's individual fields, addressed
+  // by 1-based device_id. Each getter validates device_id and returns
+  // the field value; on an out-of-range id the getter returns
+  // EN_BAD_DEVICE_ID (a value the u32/u16 fields cannot naturally
+  // produce, so callers can distinguish it from a legitimate zero).
+  //
+  // These are the natural entry points for the substrate's EN_OP_QUERY_
+  // ROW dispatch surface once it lands.
+  // ==========================================================================
+
+  // enumerate_get_hid_stream(device_id) -> hid_stream_id | EN_BAD_DEVICE_ID.
+  pub let enumerate_get_hid_stream : (u64) -> u64 !{mem} @{} =
+    fn (device_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "B11-01 (#2276): read hid_stream_id from row's word0[31:0]. Validates device_id in [1..32]. Labels prefixed enumerate_ghs_.",
+      block: {
+        cmp rdi, 0;
+        je  enumerate_ghs_bad;
+        cmp rdi, 32;
+        ja  enumerate_ghs_bad;
+        mov r10, rdi;
+        sub r10, 1;
+        shl r10, 5;
+        lea r11, [rip + _en_table];
+        add r11, r10;
+        mov rax, [r11];
+        shl rax, 32;
+        shr rax, 32;
+        ret;
+      enumerate_ghs_bad:
+        mov rax, 0xFFFFEADA;
+        ret
+      }
+    }
+
+  // enumerate_get_bound_kind(device_id) -> bound_kind_id | EN_BAD_DEVICE_ID.
+  pub let enumerate_get_bound_kind : (u64) -> u64 !{mem} @{} =
+    fn (device_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "B11-01 (#2276): read bound_kind_id from row's word0[63:32]. Zero today (mint dispatcher lands G8-M1-004). Labels prefixed enumerate_gbk_.",
+      block: {
+        cmp rdi, 0;
+        je  enumerate_gbk_bad;
+        cmp rdi, 32;
+        ja  enumerate_gbk_bad;
+        mov r10, rdi;
+        sub r10, 1;
+        shl r10, 5;
+        lea r11, [rip + _en_table];
+        add r11, r10;
+        mov rax, [r11];
+        shr rax, 32;
+        ret;
+      enumerate_gbk_bad:
+        mov rax, 0xFFFFEADA;
+        ret
+      }
+    }
+
+  // enumerate_get_class(device_id) -> device_class | EN_BAD_DEVICE_ID.
+  pub let enumerate_get_class : (u64) -> u64 !{mem} @{} =
+    fn (device_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "B11-01 (#2276): read device_class from row's word1[39:32]. Labels prefixed enumerate_gc_.",
+      block: {
+        cmp rdi, 0;
+        je  enumerate_gc_bad;
+        cmp rdi, 32;
+        ja  enumerate_gc_bad;
+        mov r10, rdi;
+        sub r10, 1;
+        shl r10, 5;
+        lea r11, [rip + _en_table];
+        add r11, r10;
+        mov rax, [r11 + 8];
+        shr rax, 32;
+        and rax, 0xFF;
+        ret;
+      enumerate_gc_bad:
+        mov rax, 0xFFFFEADA;
+        ret
+      }
+    }
+
+  // enumerate_get_seat(device_id) -> seat_kind_id | EN_BAD_DEVICE_ID.
+  pub let enumerate_get_seat : (u64) -> u64 !{mem} @{} =
+    fn (device_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "B11-01 (#2276): read seat_kind_id from row's word1[31:0]. Zero today (seat-bind is a separate op per NOVEL-CLEAN §4). Labels prefixed enumerate_gs_.",
+      block: {
+        cmp rdi, 0;
+        je  enumerate_gs_bad;
+        cmp rdi, 32;
+        ja  enumerate_gs_bad;
+        mov r10, rdi;
+        sub r10, 1;
+        shl r10, 5;
+        lea r11, [rip + _en_table];
+        add r11, r10;
+        mov rax, [r11 + 8];
+        shl rax, 32;
+        shr rax, 32;
+        ret;
+      enumerate_gs_bad:
+        mov rax, 0xFFFFEADA;
+        ret
+      }
+    }
+
+  // enumerate_get_vid(device_id) -> vendor_id | EN_BAD_DEVICE_ID.
+  pub let enumerate_get_vid : (u64) -> u64 !{mem} @{} =
+    fn (device_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "B11-01 (#2276): read vendor_id from row's word2[15:0]. Labels prefixed enumerate_gv_.",
+      block: {
+        cmp rdi, 0;
+        je  enumerate_gv_bad;
+        cmp rdi, 32;
+        ja  enumerate_gv_bad;
+        mov r10, rdi;
+        sub r10, 1;
+        shl r10, 5;
+        lea r11, [rip + _en_table];
+        add r11, r10;
+        mov rax, [r11 + 16];
+        and rax, 0xFFFF;
+        ret;
+      enumerate_gv_bad:
+        mov rax, 0xFFFFEADA;
+        ret
+      }
+    }
+
+  // enumerate_get_pid(device_id) -> product_id | EN_BAD_DEVICE_ID.
+  pub let enumerate_get_pid : (u64) -> u64 !{mem} @{} =
+    fn (device_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "B11-01 (#2276): read product_id from row's word2[31:16]. Labels prefixed enumerate_gp_.",
+      block: {
+        cmp rdi, 0;
+        je  enumerate_gp_bad;
+        cmp rdi, 32;
+        ja  enumerate_gp_bad;
+        mov r10, rdi;
+        sub r10, 1;
+        shl r10, 5;
+        lea r11, [rip + _en_table];
+        add r11, r10;
+        mov rax, [r11 + 16];
+        shr rax, 16;
+        and rax, 0xFFFF;
+        ret;
+      enumerate_gp_bad:
+        mov rax, 0xFFFFEADA;
+        ret
+      }
+    }
+
+  // enumerate_get_hotplug_seq(device_id) -> hotplug_seq | EN_BAD_DEVICE_ID.
+  //
+  // hotplug_seq is a full u64 so the "bad id" sentinel and a legitimate
+  // seq value could in principle collide (a boot with 2^64-262 events).
+  // Callers who care distinguish the two by first checking
+  // enumerate_get_hid_stream (which returns 0 on a free row and the
+  // EN_BAD_DEVICE_ID band on an out-of-range id).
+  pub let enumerate_get_hotplug_seq : (u64) -> u64 !{mem} @{} =
+    fn (device_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "B11-01 (#2276): read hotplug_seq from row's word3 (full u64). Labels prefixed enumerate_ghq_.",
+      block: {
+        cmp rdi, 0;
+        je  enumerate_ghq_bad;
+        cmp rdi, 32;
+        ja  enumerate_ghq_bad;
+        mov r10, rdi;
+        sub r10, 1;
+        shl r10, 5;
+        lea r11, [rip + _en_table];
+        add r11, r10;
+        mov rax, [r11 + 24];
+        ret;
+      enumerate_ghq_bad:
+        mov rax, 0xFFFFEADA;
+        ret
+      }
+    }
+}

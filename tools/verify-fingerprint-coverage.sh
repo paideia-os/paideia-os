@@ -1019,6 +1019,20 @@ ALLOWLIST = {
         "dispatcher that would emit it on successful register is a future "
         "landing (§2.20 KIND_IME_ROUTER, #2316). Same posture as the "
         "sibling `ime session mint ok` entry above.",
+    "ime router mint ok [legacy: IME ROUTER MINT OK]":
+        "Wave0-B11 G11-M3-001 (paideia-os #2316): ime_router "
+        "(KIND_IME_ROUTER=0x1DE) data-only fingerprint; dispatcher-side "
+        "substrate that would emit it on successful mint is a future "
+        "landing (compositor-side cap_handler_ime_router). Same posture "
+        "as the sibling `ime session mint ok` / `ime provider register "
+        "ok` entries above; closes the G11 IME trio (P10 mitigation).",
+    "latin autocomplete init ok [legacy: LATIN AUTOCOMPLETE INIT OK]":
+        "Wave0-B11 G11-M4-001 (paideia-os #2317): latin_autocomplete IME "
+        "provider satellite (LANG_LATIN registrant against KIND_IME_"
+        "PROVIDER=0x1DC) data-only fingerprint; satellite-process main "
+        "loop that would emit it on successful engine init is a future "
+        "landing (paired with the KIND_IME_ROUTER #2316 wiring). Same "
+        "posture as the sibling `ime provider register ok` entry above.",
     "ui context mint ok [legacy: UI CONTEXT MINT OK]":
         "Wave0-B8 G12-M1-001 (#2326): ui_context (KIND_UI_CONTEXT=0x1D5) "
         "data-only decl; kernel dispatcher + toolkit runtime not yet wired.",
@@ -1098,6 +1112,36 @@ ALLOWLIST = {
     "view tree new ok [legacy: VIEW TREE NEW OK]":
         "Wave0-B10 G12-M2-001 (#2329): view_tree retained-mode Xilem-shape; "
         "per-kind widget-call fanout lands with G12-M2-003.",
+
+    # ------------------------------------------------------------------
+    # Wave 0 Batch 11 -- G12.M1-003 immediate-mode layout containers.
+    # Data-only meta decl; renderer/klog wire-up lands with G12-M1-004.
+    # ------------------------------------------------------------------
+    "layout ready ok [legacy: LAYOUT READY OK]":
+        "Wave0-B11 G12-M1-003 (#2328): layout containers immediate-mode "
+        "primitives (horizontal / vertical / grid / z-order stack); "
+        "renderer wire-up + klog emission land with G12-M1-004.",
+    "enumerate meta ok [legacy: ENUMERATE META OK]":
+        "Wave0-B11 G8-M1-003 (#2276): input-server device enumeration; "
+        "HID stream walker deferred to G8-M1-005.",
+    "scroll axis meta [legacy: SCROLL AXIS META OK]":
+        "Wave0-B11 G8-M3-002 (#2281): scroll_axis high-res + natural-scroll "
+        "value type; pointer-event wire pending.",
+    "damage aggregate ok [legacy: DAMAGE AGGREGATE OK]":
+        "Wave0-B11 G9-M3-003 (#2296): damage_aggregate walker; consumer "
+        "(compositor commit path) not yet wired.",
+    "pdx present feedback classifier meta [legacy: PRESENT FEEDBACK CLASSIFIER OK]":
+        "Wave0-B11 G9-M4-003 (#2299): present-feedback classifier + back-pressure; "
+        "consumer (compositor policy) not yet wired.",
+    "pdx kind screen reader braille meta [legacy: SCREEN READER BRAILLE META OK]":
+        "Wave0-B11 G10-M3-003 (#2310): screen_reader_braille BRLTTY-shape "
+        "output client; KIND_BRAILLE_DEVICE forward-reserve 0x1E1.",
+    "retained widgets new ok [legacy: RETAINED WIDGETS NEW OK]":
+        "Wave0-B11 G12-M2-002 (#2330): retained_widgets factory catalogue over "
+        "view_tree; per-kind widget wire pending G12-M2-003.",
+    "settings display ready ok [legacy: SETTINGS DISPLAY READY OK]":
+        "Wave0-B11 G12-M3-001 (#2332): settings display sample panel; "
+        "settings-service klog wire pending G12.M4.",
 }
 
 # Below these counts the extractor has stopped matching rather than the

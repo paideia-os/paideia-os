@@ -1,0 +1,1513 @@
+// src/user/compositor/present_feedback_classifier.pdx -- Wave0-B11-04 (paideia-os #2299)
+//
+// MISSED-PRESENT + LATE-PRESENT CLASSIFIER + CLIENT BACK-PRESSURE SIGNAL.
+//
+// src/user/compositor/present_feedback_kind.pdx (Wave0-B9-07, KIND_PRESENT_
+// FEEDBACK = 0x1DA) lands the per-surface feedback ROW and stores the LAST
+// classification the compositor stamped into each surface's row.  It also
+// EXPORTS the PresentClassification enum (PRESENT_ON_TIME=0, PRESENT_LATE=1,
+// PRESENT_DROPPED=2, PRESENT_VBLANK=3) that the row's header[47:40] byte
+// carries.  What it deliberately does NOT own: the CLASSIFICATION LOGIC
+// itself -- the threshold policy that decides, given a present timestamp
+// and its target vblank timestamp, which enum value to stamp.  Nor the
+// per-surface HISTORY of classifications, nor the aggregate BACK-PRESSURE
+// SIGNAL that a client stack polls to slow itself down when it is
+// consistently missing vsync.
+//
+// src/user/compositor/present_feedback_route.pdx (Wave0-B10-06,
+// #2298) lands the FAN-OUT half of the feedback stream: budget-one-refresh
+// arbitration so a subscriber that follows N surfaces sees AT MOST ONE
+// event per vsync.  It sits BELOW this file's classifier -- routing
+// dispatches events, this classifier decides which class each event is.
+//
+// This landing is the CLASSIFIER + BACK-PRESSURE half.  For each surface
+// the compositor tracks separately, one ClassifierState row records:
+//   * how many presents fell in each timing band (ON_TIME / LATE / DROPPED),
+//   * the last classification's monotonic sequence number, and
+//   * a single-bit back_pressure_active latch that goes hot once the client
+//     has consistently missed vblank.
+// Client stacks poll classifier_back_pressure_signal(row_id) on their own
+// cadence; when it returns 1, the client throttles its own render loop
+// (skip a frame, drop LOD, reduce workgroup fan-out -- the client's
+// policy, not ours).  The back-pressure latch is monotonic-add-only until
+// classifier_reset clears it, so a client that briefly recovers does not
+// see the signal flap on and off; the compositor calls classifier_reset
+// on quiescence (window minimised, workspace switched away, surface
+// unmapped) to reset the classifier for the next active period.
+//
+// =============================================================================
+// SECTION 0  RELATIONSHIP TO SIBLINGS
+// =============================================================================
+//
+//   src/user/compositor/present_feedback_kind.pdx  (Wave0-B9-07,
+//                                                    KIND_PRESENT_FEEDBACK
+//                                                    = 0x1DA)
+//     Owns the per-surface feedback row + PresentClassification enum values
+//     (0..3).  This classifier RECEIVES the (present_nsec, target_vblank_
+//     nsec) inputs, computes which enum value applies, and the compositor
+//     then stamps that value into the KIND_PRESENT_FEEDBACK row via
+//     present_feedback_record_present.  The two files agree on the enum
+//     values via numeric equality (PRESENT_ON_TIME=0, PRESENT_LATE=1,
+//     PRESENT_DROPPED=2, PRESENT_VBLANK=3); no cross-file import at this
+//     landing (paideia-as user-space is per-file at present).
+//
+//   src/user/compositor/present_feedback_route.pdx  (Wave0-B10-06,
+//                                                     #2298)
+//     Owns budget-one-refresh fan-out.  Orthogonal to this classifier --
+//     routing decides HOW MANY events a subscriber gets per vsync, this
+//     classifier decides WHICH CLASS each event is.  A client that
+//     receives a budget-suppressed event pair has no observability gap
+//     because the classifier state is per-SURFACE, not per-event.
+//
+//   design/compositor/pwp-spec-vocabulary.md §2.12
+//     "the compositor budget is one refresh period; the classifier labels
+//     events as ON-TIME / LATE / MISSED / SKIPPED against that budget."
+//     The threshold policy this file lands is the concrete realisation of
+//     "against that budget" -- 1ms slop on the ON-TIME side, 5ms on the
+//     LATE side, 33ms (2 frames at 60Hz) as the hard-drop marker.
+//
+//   design/roadmap/next-wave-synthesis.md §4 pitfall P6
+//     "presentation feedback is mandatory, not optional".  A stream with
+//     no back-pressure signal is worse than no stream -- the client stack
+//     has no correction handle when the compositor is choking.  This file
+//     lands the client-visible back-pressure bit that the pitfall
+//     mandates.
+//
+// =============================================================================
+// SECTION 1  API
+// =============================================================================
+//
+// classifier_classify(present_nsec, target_vblank_nsec) -> PresentClassification
+//
+//   PURE FUNCTION.  Given the actual present timestamp and the target
+//   vblank timestamp (both monotonic ns from the compositor's clock),
+//   returns one of:
+//     0  PRESENT_ON_TIME  present arrived at or within
+//                         PFC_ON_TIME_MARGIN_NSEC (1ms) after the target
+//                         vblank (early arrivals also ON_TIME).
+//     1  PRESENT_LATE     present arrived >1ms but <=5ms after the target
+//                         vblank (past the ON_TIME slop but still within
+//                         the LATE grace band).
+//     2  PRESENT_DROPPED  present arrived >5ms after the target vblank
+//                         (past the LATE grace band -- treated as a dropped
+//                         frame from the classifier's POV even if the
+//                         compositor still displayed it eventually).
+//   PRESENT_VBLANK (3) is NEVER returned by this function; that enum
+//   value names the "vblank with no present pending" case, which is
+//   observed by the compositor's vblank tick handler, not by a present
+//   classification.  A future landing that adds classifier_classify_vblank
+//   returns 3 in that case; this landing keeps the surface trichotomous.
+//
+// classifier_ingest(row_id, classification) -> 0 | PFC_BAD_SLOT | PFC_BAD_CLASS
+//
+//   Bumps the row's counter for the given classification (on_time_count /
+//   late_count / dropped_count depending on class 0/1/2) and refreshes
+//   last_classification_seq.  On classes 1 (LATE) or 2 (DROPPED), also
+//   re-evaluates the back-pressure gate: if (late_count + dropped_count)
+//   >= PFC_BP_THRESHOLD, back_pressure_active is latched to 1.  Once
+//   latched, back_pressure_active stays 1 until classifier_reset clears
+//   it (see back-pressure semantics below).
+//
+//   Class 3 (PRESENT_VBLANK) is REFUSED with PFC_BAD_CLASS -- this file's
+//   ingest surface accepts only the ON_TIME/LATE/DROPPED trichotomy that
+//   classify() produces.  A vblank-with-no-present event is a distinct
+//   signal the caller records elsewhere (present_feedback_record_vblank
+//   in the sibling module).
+//
+// classifier_back_pressure_signal(row_id) -> u8
+//
+//   Returns 1 iff back_pressure_active is set on the row.  Returns 0 iff
+//   the row is not in_use OR back_pressure_active == 0.  This is the
+//   client-facing polling surface -- clients call it on their own render
+//   cadence, cheap (one row bounds check + one u64 load + shift + mask).
+//   No stats bump on this call: it is designed to be poll-loop hot.
+//
+// classifier_reset(row_id) -> 0 | PFC_BAD_SLOT
+//
+//   Clears on_time_count, late_count, dropped_count, back_pressure_active
+//   to 0 on the row.  PRESERVES surface_kind_id and last_classification_
+//   seq (the sequence number is a monotonic identifier the caller uses to
+//   correlate observations across reset boundaries -- resetting it would
+//   break that identity).  Called on quiescence (window minimised,
+//   workspace switched away, surface unmapped) so the next active period
+//   starts with a clean counter frame.
+//
+// classifier_mint(surface_kind_id) -> row_id | PFC_MINT_BAD_SURFACE |
+//                                     PFC_MINT_DUP | PFC_TAIL_ENOSPC
+//
+//   Allocates one ClassifierState row for a surface.  surface_kind_id
+//   MUST be nonzero + fit in u32; MUST NOT collide with an in_use row's
+//   surface_kind_id (uniqueness gate mirrors present_feedback_kind.pdx's
+//   own uniqueness: one classifier per surface, not multiple).
+//
+// classifier_revoke(row_id) -> 0 | PFC_BAD_SLOT | PFC_REVOKE_ALREADY
+//
+//   Consumes the row.  Distinguishes out-of-range from double-revoke so
+//   observability tooling can tell the two apart.
+//
+// classifier_stats(row_id, out_ptr) -> 0 | PFC_BAD_SLOT | PFC_STATS_BAD_PTR
+//
+//   Writes 32 bytes at *out_ptr (four u64 fields, little-endian):
+//     [+0]  on_time_count (zero-extended u32 -> u64)
+//     [+8]  late_count    (zero-extended u32 -> u64)
+//     [+16] dropped_count (zero-extended u32 -> u64)
+//     [+24] back_pressure_active (zero-extended u8 -> u64)
+//   Bumps _pfc_stats[PFC_ST_QUERIES] once per call.  Individual field
+//   accessors below are the preferred surface for callers that only want
+//   one field; this bundled query exists for observability tooling that
+//   wants all four in one atomic read.
+//
+// classifier_row_on_time_count / _late_count / _dropped_count / _surface
+//   Direct row-field accessors.  Bad row -> 0xFFFFFFFFFFFFFFFF sentinel
+//   (same convention as sibling row accessors).
+//
+// classifier_stats_mints / _revokes / _ingests / _resets / _queries /
+// _refused / _bp_activations -> u64
+//   Aggregate counter accessors.  Read by boot diagnostics + regression
+//   tests + the compositor debug overlay.
+//
+// classifier_stats_reset() -> ()
+//   Zero the aggregate counter block (test / init).
+//
+// classifier_init() -> ()
+//   Boot init: scrub row pool + aggregate counters.
+//
+// =============================================================================
+// SECTION 2  FAILURE TAXONOMY  0xFFFFEAD0..0xFFFFEADF
+//                              (BRIEF: 0xFFFFED90..0xFFFFED9F, COLLIDED)
+// =============================================================================
+//
+// Dispatch brief (Wave-0 B11-04) allocated 0xFFFFED90..0xFFFFED9F, but
+// repo-wide grep at landing time shows that band TRIPLE-CLAIMED by three
+// disjoint prior claimants:
+//   0xFFFFED90..9F  GCV_*  (src/kernel/core/drivers/color/gpu_convert.pdx
+//                            §1: GCV_BAD_ORD/BAD_MATRIX/BAD_SLOT).
+//   0xFFFFED90..9F  VSE_*  (src/kernel/core/drivers/vello/
+//                            vello_scene_encoder.pdx §2: VSE_ERR_BAD_
+//                            SCENE/BAD_BYTES/BAD_PATHS/BUSY/NO_ROOM/
+//                            NOT_STARTED/UPLOAD_FAIL/BAD_OP).
+//   0xFFFFED90..9F  HLG    (src/user/color/hlg_transform.pdx §2).
+// A fourth claim from this file would alias into values every one of
+// those callers cross-checks against.  Escalated by the same rule
+// present_feedback_route.pdx (§2 header) applied to the brief's own EC60
+// collision: pick the nearest completely-free 16-code band that a repo-
+// wide grep verifies is unused.  Grep pass across 0xFFFFED0x..0xFFFFED8x
+// (every one occupied) and 0xFFFFEAxx (the compositor's own page) shows
+// 0xFFFFEAD0..0xFFFFEADF FREE.  Claimed here.  Sits in the same 0xFFFFEA__
+// page as the adjacent compositor bands (present_feedback_route
+// 0xFFFFEAB0..BF, window_kind 0xFFFFEAA0..AF, xdg_shell_geometry
+// 0xFFFFEA70..7F, subsurface_sync 0xFFFFEA20..2F), so grep sets that
+// walk the compositor's failure pages remain contiguous.  A follow-on
+// issue on the M4 punchlist tracks the brief's ED90 collision: the
+// dispatch brief's failure-band register needs the same grep pass this
+// landing did (see present_feedback_route.pdx §2 for the prior instance
+// of the same pathology at EC60).
+//
+// Codes (high-first, mirroring sibling KIND_*/logic modules):
+//   PFC_TAIL_ENOSPC       = 0xFFFFEADF   row pool full.
+//   PFC_TAIL_BAD_ARG      = 0xFFFFEADE   packer bad-arg sentinel.
+//   PFC_MINT_BAD_SURFACE  = 0xFFFFEADD   surface_kind_id == 0 or > u32.
+//   PFC_MINT_DUP          = 0xFFFFEADC   surface_kind_id collides with
+//                                         an in_use row.
+//   PFC_BAD_SLOT          = 0xFFFFEADB   row_id >= PFC_MAX or not in_use.
+//   PFC_BAD_CLASS         = 0xFFFFEADA   classification value not in
+//                                         {ON_TIME, LATE, DROPPED} (3
+//                                         VBLANK is refused -- see §1
+//                                         ingest for rationale).
+//   PFC_REVOKE_ALREADY    = 0xFFFFEAD9   revoke on already-free row.
+//   PFC_STATS_BAD_PTR     = 0xFFFFEAD8   classifier_stats received a
+//                                         0/0xFFFF..FF out_ptr.
+//   PFC_INGEST_OVERFLOW   = 0xFFFFEAD7   counter would exceed u32 max
+//                                         (defence-in-depth belt; 4G
+//                                         ingests per surface is not
+//                                         observably reachable).
+//   0xFFFFEAD0..0xFFFFEAD6 open for follow-on rollback / retry codes.
+//
+// =============================================================================
+// SECTION 3  ROW LAYOUT -- 32 BYTES (FOUR u64 WORDS)
+// =============================================================================
+//
+//   [+0]   header: in_use[63:56] | reserved[55:40] |
+//                  back_pressure_active[39:32] | surface_kind_id[31:0]
+//   [+8]   counts:  on_time_count[31:0] | late_count[63:32]
+//   [+16]  drops:   dropped_count[31:0] | reserved[63:32]
+//   [+24]  last_classification_seq (u64, monotonic increment per ingest)
+//
+// surface_kind_id is caller-supplied at mint and MUST be nonzero + unique
+// across in_use rows.  Zero refused (PFC_MINT_BAD_SURFACE); duplicate
+// refused (PFC_MINT_DUP).  One classifier row per surface -- if a
+// caller wants two classification windows on one surface, that is a
+// caller-side fan-out on top of this row's single-window state.
+//
+// back_pressure_active is a u8 latch in header[39:32].  0 at mint;
+// classifier_ingest sets it to 1 when the (late_count + dropped_count)
+// crosses PFC_BP_THRESHOLD; classifier_reset clears it back to 0.
+// Stored in the header word so classifier_back_pressure_signal is a
+// single-word load + shift + mask, no body access -- the read is the
+// hot path (client polls it on the render loop) so the row layout
+// optimises for it.
+//
+// on_time_count, late_count, dropped_count are u32 counters split
+// across two u64 words for packing efficiency (header + counts + drops =
+// 3 u64 = 24 bytes; the fourth u64 carries last_classification_seq).
+// Each counter refuses u32 overflow at ingest (PFC_INGEST_OVERFLOW);
+// classifier_reset clears them.
+//
+// last_classification_seq is a monotonic u64 counter that bumps on every
+// ingest (regardless of class).  Callers use it to correlate observations
+// across ingest events without having to track their own sequence
+// separately.  PRESERVED across classifier_reset (reset clears the
+// counters and back-pressure latch but not the seq -- resetting the seq
+// would break cross-reset correlation).
+//
+// All slots stored little-endian.  No float leaks into a timing/count
+// cell per FPU-discipline (design/kernel/no-fpu.md) -- present_nsec /
+// vblank_nsec are integer ns, counters are unsigned integers.
+//
+// =============================================================================
+// SECTION 4  CLASSIFICATION LOGIC
+// =============================================================================
+//
+// classifier_classify's threshold decision tree, given present_nsec (P)
+// and target_vblank_nsec (T):
+//
+//   if P <= T + PFC_ON_TIME_MARGIN_NSEC (1ms slop):   return PRESENT_ON_TIME
+//   else if P <= T + PFC_LATE_MARGIN_NSEC (5ms):      return PRESENT_LATE
+//   else:                                             return PRESENT_DROPPED
+//
+// Early arrivals (P < T) fall into the ON_TIME branch trivially -- the
+// comparison P <= T + slop is satisfied for any P <= T.  The margin
+// values encode the compositor's real budget: 1ms below the ideal
+// deadline is "on-schedule", 1-5ms after is "late but recoverable"
+// (client can still redraw for the next vsync), >5ms is "dropped" from
+// the classifier's POV (client should assume its frame was skipped).
+//
+// The PFC_DROPPED_MARGIN_NSEC (33ms = 2 frames at 60Hz) constant is
+// exposed for callers that want to distinguish a single missed frame
+// from a bulk timeline stall (P > T + 33ms means the classifier is at
+// least 2 frames behind).  Not used in the classification itself --
+// classify's return set is trichotomous (ON_TIME/LATE/DROPPED) and any
+// overshoot past LATE_MARGIN is treated as DROPPED.  A future landing
+// that adds a "hard-drop" enum variant can consume DROPPED_MARGIN to
+// widen the return set.
+//
+// Overflow considerations: T + margin can theoretically overflow u64,
+// but the compositor's monotonic-ns clock in any reachable boot window
+// stays well below 2^64 - 33e6 (a 584-year uptime at ns precision).
+// The comparison uses unsigned semantics; a caller who deliberately
+// feeds T = 0xFFFFFFFFFFFFFFFE (near the u64 top) as a probe input
+// observes wrap and gets a nonsensical classification -- the caller's
+// responsibility, not the classifier's, since no reachable clock
+// produces that value.
+//
+// =============================================================================
+// SECTION 5  BACK-PRESSURE SIGNAL
+// =============================================================================
+//
+// The back-pressure latch has three properties the design targets:
+//
+//  (a) MONOTONIC-ADD-ONLY between resets.  Once (late_count + dropped_
+//      count) crosses PFC_BP_THRESHOLD, back_pressure_active stays 1
+//      until classifier_reset explicitly clears it.  Rationale: a
+//      client that briefly recovers (one ON_TIME event after a run of
+//      LATE events) should not observe the signal flap on and off --
+//      transient recovery is not evidence that the pressure has
+//      passed, and a flapping signal would drive the client's
+//      throttling policy into oscillation.
+//
+//  (b) CLEARABLE ON QUIESCENCE.  The compositor calls classifier_reset
+//      when the surface becomes inactive (window minimised, workspace
+//      switched away, surface unmapped).  This restores back_pressure_
+//      active to 0 so the next active period starts clean.  Without
+//      this, a surface that once experienced back-pressure would stay
+//      back-pressured for the life of the classifier row, even across
+//      full quiescence + reactivation cycles.
+//
+//  (c) SINGLE-BIT READ.  classifier_back_pressure_signal returns u8 (0
+//      or 1) so the client's polling code is a single register-width
+//      comparison against zero.  No stats bump on read -- the read
+//      is designed to be poll-loop hot, and a counter bump per read
+//      would defeat the point.
+//
+// PFC_BP_THRESHOLD = 4 (four combined LATE + DROPPED events within one
+// reset window).  Chosen so a client that has four missed vsyncs in a
+// row without a reset in between clearly deserves back-pressure; a
+// client whose miss rate is <4 events per reset window is treated as
+// recoverable.  The compositor calls classifier_reset at least once per
+// window (per §5 (b)) so the window boundary is compositor-controlled,
+// not fixed to a wall-clock interval.
+//
+// =============================================================================
+// SECTION 6  DISCIPLINE
+// =============================================================================
+//
+// * Encoder rules: leaf primitives use r10/r11 scratch only; multi-arg
+//   helpers push callee-save (rbx/r12/r13/r14) with `sub rsp, 8` as
+//   needed to bring rsp%16 to 0 for every nested call.  Every counter
+//   bump is load-inc-store (`mov rax, [mem]; add rax, 1; mov [mem], rax`),
+//   never `add [mem], reg` -- the encoder-safe idiom per the paideia-as
+//   Group-4 instruction discipline.
+// * Labels: all `present_feedback_classifier_<funcname>_<tag>` per the
+//   reserved-label note (`loop`, `if` etc. are paideia-as keywords;
+//   every label is prefixed by the function's short tag so no bare-
+//   keyword collision is possible).  Short per-function tags (e.g.
+//   `_c_`, `_in_`, `_bp_`) keep the label width in line with the
+//   sibling present_feedback_kind.pdx module.
+// * No float: every arg / return / row cell is u64.  Follows
+//   design/kernel/no-fpu.md.
+// * Fingerprint: data-only tag (pdx_kind_present_feedback_classifier_
+//   meta) with the `[legacy: PRESENT FEEDBACK CLASSIFIER OK]` suffix for
+//   grep parity with pdx_kind_present_feedback_meta and pdx_kind_present
+//   _feedback_route_meta.  Emission body lands with the downstream
+//   compositor dispatcher; the tag decl here reserves the canonical
+//   string and is not yet emitted by any code path, so no golden line
+//   is required at this landing.
+
+module PresentFeedbackClassifier = structure {
+
+  // ==========================================================================
+  // SECTION A  Constants + failure taxonomy + counter identity + fingerprint.
+  // ==========================================================================
+
+  pub let PFC_OK                     : u64 = 0
+
+  // Timing thresholds (ns).  See §4 for the classification decision tree
+  // and §5 for the back-pressure gate.
+  pub let PFC_ON_TIME_MARGIN_NSEC    : u64 = 1000000       // 1 ms
+  pub let PFC_LATE_MARGIN_NSEC       : u64 = 5000000       // 5 ms
+  pub let PFC_DROPPED_MARGIN_NSEC    : u64 = 33333333      // 33 ms (2 frames @ 60Hz)
+
+  // Back-pressure gate.  See §5.
+  pub let PFC_BP_THRESHOLD           : u64 = 4
+
+  // PresentClassification enum values (numeric parity with the sibling
+  // present_feedback_kind.pdx: PRESENT_ON_TIME=0, LATE=1, DROPPED=2,
+  // VBLANK=3).  Duplicated here so the classifier can be reasoned about
+  // as a self-contained module.
+  pub let PFC_CLASS_ON_TIME          : u64 = 0
+  pub let PFC_CLASS_LATE             : u64 = 1
+  pub let PFC_CLASS_DROPPED          : u64 = 2
+  pub let PFC_CLASS_VBLANK           : u64 = 3
+  pub let PFC_CLASS_INGEST_MAX       : u64 = 2   // ingest accepts 0..2 only
+
+  // Failure taxonomy 0xFFFFEAD0..0xFFFFEADF (see file header §2 for the
+  // brief-time ED90 triple-collision and this band's rationale).
+  pub let PFC_TAIL_ENOSPC            : u64 = 0xFFFFEADF
+  pub let PFC_TAIL_BAD_ARG           : u64 = 0xFFFFEADE
+  pub let PFC_MINT_BAD_SURFACE       : u64 = 0xFFFFEADD
+  pub let PFC_MINT_DUP               : u64 = 0xFFFFEADC
+  pub let PFC_BAD_SLOT               : u64 = 0xFFFFEADB
+  pub let PFC_BAD_CLASS              : u64 = 0xFFFFEADA
+  pub let PFC_REVOKE_ALREADY         : u64 = 0xFFFFEAD9
+  pub let PFC_STATS_BAD_PTR          : u64 = 0xFFFFEAD8
+  pub let PFC_INGEST_OVERFLOW        : u64 = 0xFFFFEAD7
+  pub let PFC_ROW_NONE               : u64 = 0xFFFFEAD6   // find-by-surface miss
+
+  // Ceilings.
+  pub let PFC_MAX                    : u64 = 16
+  pub let PFC_ROW_BYTES              : u64 = 32
+  pub let PFC_U32_MAX                : u64 = 0xFFFFFFFF
+
+  // Counter slot ordinals for the _pfc_stats array (seven live slots +
+  // one reserved for future counters -- the extra cell rounds the array
+  // to a full cache line for locality).
+  pub let PFC_ST_MINTS               : u64 = 0
+  pub let PFC_ST_REVOKES             : u64 = 1
+  pub let PFC_ST_INGESTS             : u64 = 2
+  pub let PFC_ST_RESETS              : u64 = 3
+  pub let PFC_ST_QUERIES             : u64 = 4
+  pub let PFC_ST_REFUSED             : u64 = 5
+  pub let PFC_ST_BP_ACTIVATIONS      : u64 = 6
+  pub let PFC_ST_MAX                 : u64 = 8
+
+  // THE ONE STATE CELL.  16 rows * 32 bytes = 512 bytes = 64 u64.
+  pub let mut _pfc_table : [u64; 64] = uninit @align(64)
+  pub let mut _pfc_stats : [u64; 8]  = uninit @align(64)
+
+  // Fingerprint tag.  Suffix `[legacy: PRESENT FEEDBACK CLASSIFIER OK]`
+  // matches the pattern pdx_kind_present_feedback_meta uses so grep
+  // tooling that scans for "^pdx_kind_.*_meta" finds all sibling tags
+  // as a set.  Data-only at this landing; emission wiring lands when
+  // the compositor dispatcher grows a klog_s1_x1 call at the tail of
+  // every successful classifier_mint.  No golden line required.
+  //
+  // "pdx present feedback classifier meta [legacy: PRESENT FEEDBACK CLASSIFIER OK]\0"
+  //   =  37 bytes prefix + 40 bytes bracketed suffix + 1 NUL = 78 bytes.
+  pub let pdx_kind_present_feedback_classifier_meta : [u8; 78] = "pdx present feedback classifier meta [legacy: PRESENT FEEDBACK CLASSIFIER OK]\0"
+
+  // ==========================================================================
+  // SECTION B  Counter primitives.
+  //
+  // Seven inlined stats accessors are direct memory reads at fixed
+  // offsets.  The bounds-checked bump primitive is exposed so the
+  // internal helpers can name a slot ordinal by constant (0..6) rather
+  // than hand-inline the load-add-store idiom seven times.
+  // ==========================================================================
+
+  pub let present_feedback_classifier_stats_bump : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): bounds-checked counter bump (which < 8). Load-inc-store idiom (no `add reg, [mem]`) per encoder discipline. Labels prefixed present_feedback_classifier_sb_.",
+      block: {
+        cmp rdi, 8;
+        jae present_feedback_classifier_sb_out;
+        lea r10, [rip + _pfc_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      present_feedback_classifier_sb_out:
+        ret
+      }
+    }
+
+  pub let present_feedback_classifier_stats_mints : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): direct read of _pfc_stats[PFC_ST_MINTS=0]. Labels prefixed present_feedback_classifier_sm_.",
+      block: {
+        lea r10, [rip + _pfc_stats];
+        mov rax, [r10 + 0];
+        ret
+      }
+    }
+
+  pub let present_feedback_classifier_stats_revokes : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): direct read of _pfc_stats[PFC_ST_REVOKES=1] at byte offset 8. Labels prefixed present_feedback_classifier_sv_.",
+      block: {
+        lea r10, [rip + _pfc_stats];
+        mov rax, [r10 + 8];
+        ret
+      }
+    }
+
+  pub let present_feedback_classifier_stats_ingests : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): direct read of _pfc_stats[PFC_ST_INGESTS=2] at byte offset 16. Labels prefixed present_feedback_classifier_si_.",
+      block: {
+        lea r10, [rip + _pfc_stats];
+        mov rax, [r10 + 16];
+        ret
+      }
+    }
+
+  pub let present_feedback_classifier_stats_resets : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): direct read of _pfc_stats[PFC_ST_RESETS=3] at byte offset 24. Labels prefixed present_feedback_classifier_srs_.",
+      block: {
+        lea r10, [rip + _pfc_stats];
+        mov rax, [r10 + 24];
+        ret
+      }
+    }
+
+  pub let present_feedback_classifier_stats_queries : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): direct read of _pfc_stats[PFC_ST_QUERIES=4] at byte offset 32. Labels prefixed present_feedback_classifier_sq_.",
+      block: {
+        lea r10, [rip + _pfc_stats];
+        mov rax, [r10 + 32];
+        ret
+      }
+    }
+
+  pub let present_feedback_classifier_stats_refused : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): direct read of _pfc_stats[PFC_ST_REFUSED=5] at byte offset 40. Labels prefixed present_feedback_classifier_sf_.",
+      block: {
+        lea r10, [rip + _pfc_stats];
+        mov rax, [r10 + 40];
+        ret
+      }
+    }
+
+  pub let present_feedback_classifier_stats_bp_activations : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): direct read of _pfc_stats[PFC_ST_BP_ACTIVATIONS=6] at byte offset 48. Labels prefixed present_feedback_classifier_sba_.",
+      block: {
+        lea r10, [rip + _pfc_stats];
+        mov rax, [r10 + 48];
+        ret
+      }
+    }
+
+  pub let present_feedback_classifier_stats_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): scrub all eight cells of _pfc_stats (seven live slots + one reserved). Encoder-safe short step-loop; `_step` suffix (not `_loop`) avoids the paideia-as `loop` keyword collision. Labels prefixed present_feedback_classifier_sre_.",
+      block: {
+        lea r10, [rip + _pfc_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      present_feedback_classifier_sre_step:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  present_feedback_classifier_sre_step;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION C  Validators.
+  // ==========================================================================
+
+  // present_feedback_classifier_surface_valid: 1 iff surface_kind_id
+  // nonzero AND fits in u32.  Zero is refused (no live surface has row_id
+  // 0 in the compositor's model).  Used by mint to gate
+  // PFC_MINT_BAD_SURFACE.
+  pub let present_feedback_classifier_surface_valid : (u64) -> u64 !{} @{} =
+    fn (surface_kind_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): 1 iff surface_kind_id in (0, 2^32). Labels prefixed present_feedback_classifier_sv2_.",
+      block: {
+        cmp rdi, 0;
+        je  present_feedback_classifier_sv2_no;
+        mov r10, 0xFFFFFFFF;
+        cmp rdi, r10;
+        ja  present_feedback_classifier_sv2_no;
+        mov rax, 1;
+        ret;
+      present_feedback_classifier_sv2_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // present_feedback_classifier_class_valid: 1 iff class in 0..2
+  // (ingest-side trichotomy).  PRESENT_VBLANK (3) is refused -- see §1
+  // ingest for the rationale.
+  pub let present_feedback_classifier_class_valid : (u64) -> u64 !{} @{} =
+    fn (class: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): 1 iff class <= PFC_CLASS_INGEST_MAX(2). Labels prefixed present_feedback_classifier_cv_.",
+      block: {
+        cmp rdi, 2;
+        ja  present_feedback_classifier_cv_no;
+        mov rax, 1;
+        ret;
+      present_feedback_classifier_cv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // present_feedback_classifier_out_ptr_valid: 1 iff out_ptr not 0 and
+  // not the 0xFFFF..FF sentinel.  Used by classifier_stats.
+  pub let present_feedback_classifier_out_ptr_valid : (u64) -> u64 !{} @{} =
+    fn (out_ptr: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): 1 iff out_ptr not 0 and not 0xFFFFFFFFFFFFFFFF. Caller MUST supply a 32-byte writable buffer per §1 classifier_stats. Labels prefixed present_feedback_classifier_ov_.",
+      block: {
+        cmp rdi, 0;
+        je  present_feedback_classifier_ov_no;
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rdi, r10;
+        je  present_feedback_classifier_ov_no;
+        mov rax, 1;
+        ret;
+      present_feedback_classifier_ov_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION D  Packers.
+  // ==========================================================================
+
+  // header: in_use[63:56] | reserved[55:40] | back_pressure_active[39:32] |
+  //         surface_kind_id[31:0].
+  // Emitted WITHOUT in_use bit set and WITHOUT back_pressure_active set;
+  // tail_alloc ORs the in_use marker in on claim.
+  pub let present_feedback_classifier_hdr_pack : (u64) -> u64 !{} @{} =
+    fn (surface_kind_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): header pack. surface_kind_id at [31:0]; must be nonzero + <=u32 (present_feedback_classifier_surface_valid). back_pressure_active starts 0 (cleared bits at [39:32]). Bad arg -> 0xFFFFFFFFFFFFFFFF sentinel (tail_alloc catches). Labels prefixed present_feedback_classifier_hp_.",
+      block: {
+        cmp rdi, 0;
+        je  present_feedback_classifier_hp_bad;
+        mov r10, 0xFFFFFFFF;
+        cmp rdi, r10;
+        ja  present_feedback_classifier_hp_bad;
+        mov rax, rdi;
+        and rax, 0xFFFFFFFF;
+        ret;
+      present_feedback_classifier_hp_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION E  Row pool: valid / alloc / free.
+  // ==========================================================================
+
+  pub let present_feedback_classifier_tail_valid : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): 1 iff row_id < PFC_MAX(16) and in_use. Row stride 32 bytes. Labels prefixed present_feedback_classifier_tv_.",
+      block: {
+        cmp rdi, 16;
+        jae present_feedback_classifier_tv_no;
+        lea r10, [rip + _pfc_table];
+        mov r11, rdi;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  present_feedback_classifier_tv_no;
+        mov rax, 1;
+        ret;
+      present_feedback_classifier_tv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // present_feedback_classifier_tail_alloc(hdr) -> row_id | err.
+  // Low-first scan over 16 rows.  Header stamped with in_use bit (bit 56)
+  // here so callers pass an "unset in_use" packed header.  body1..body3
+  // zeroed on claim (fresh row: on_time=0, late=0, dropped=0, seq=0,
+  // back_pressure_active=0).
+  pub let present_feedback_classifier_tail_alloc : (u64) -> u64 !{mem} @{} =
+    fn (hdr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): claim one classifier row. Low-first scan (rbx=idx) over 16 rows of 32 bytes (idx*32 via imul). On claim: OR the 1<<56 in_use marker into hdr and store four u64 words (body1..body3 zero). Refuses when hdr already has the in_use bit set (caller error) or when hdr is the bad-arg sentinel. Two callee-save pushes (rbx=idx, r12=hdr); no nested calls in the body so post-push rsp alignment is benign. Labels prefixed present_feedback_classifier_ta_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov r12, rdi;
+
+        // Refuse a hdr that already has in_use set (caller error).
+        mov rax, r12;
+        shr rax, 56;
+        cmp rax, 0;
+        jne present_feedback_classifier_ta_bad;
+        // Refuse the bad-arg sentinel from the packer.
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp r12, r10;
+        je  present_feedback_classifier_ta_bad;
+
+        xor rbx, rbx;
+      present_feedback_classifier_ta_scan:
+        cmp rbx, 16;
+        jae present_feedback_classifier_ta_enospc;
+        lea r10, [rip + _pfc_table];
+        mov r11, rbx;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  present_feedback_classifier_ta_claim;
+        add rbx, 1;
+        jmp present_feedback_classifier_ta_scan;
+
+      present_feedback_classifier_ta_claim:
+        mov rax, r12;
+        mov r11, 1;
+        shl r11, 56;
+        or  rax, r11;
+        mov [r10 + 0],  rax;
+        xor rax, rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov rax, rbx;
+        jmp present_feedback_classifier_ta_out;
+
+      present_feedback_classifier_ta_enospc:
+        mov rax, 0xFFFFEADF;
+        jmp present_feedback_classifier_ta_out;
+      present_feedback_classifier_ta_bad:
+        mov rax, 0xFFFFEADE;
+
+      present_feedback_classifier_ta_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let present_feedback_classifier_tail_free : (u64) -> () !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): scrub one row (all four words). Labels prefixed present_feedback_classifier_tf_.",
+      block: {
+        cmp rdi, 16;
+        jae present_feedback_classifier_tf_out;
+        lea r10, [rip + _pfc_table];
+        mov r11, rdi;
+        imul r11, r11, 32;
+        add r10, r11;
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+      present_feedback_classifier_tf_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION F  Row-field query helpers.
+  // ==========================================================================
+
+  pub let present_feedback_classifier_row_surface : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): surface_kind_id at header[31:0]. Bad row -> 0xFFFFFFFFFFFFFFFF. Labels prefixed present_feedback_classifier_rs_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call present_feedback_classifier_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_classifier_rs_bad;
+        lea r10, [rip + _pfc_table];
+        mov r11, r12;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        and rax, 0xFFFFFFFF;
+        jmp present_feedback_classifier_rs_out;
+      present_feedback_classifier_rs_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      present_feedback_classifier_rs_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let present_feedback_classifier_row_on_time_count : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): on_time_count at body1[31:0]. Bad row -> 0xFFFFFFFFFFFFFFFF. Labels prefixed present_feedback_classifier_rot_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call present_feedback_classifier_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_classifier_rot_bad;
+        lea r10, [rip + _pfc_table];
+        mov r11, r12;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        and rax, 0xFFFFFFFF;
+        jmp present_feedback_classifier_rot_out;
+      present_feedback_classifier_rot_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      present_feedback_classifier_rot_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let present_feedback_classifier_row_late_count : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): late_count at body1[63:32]. Bad row -> 0xFFFFFFFFFFFFFFFF. Labels prefixed present_feedback_classifier_rlt_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call present_feedback_classifier_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_classifier_rlt_bad;
+        lea r10, [rip + _pfc_table];
+        mov r11, r12;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        shr rax, 32;
+        jmp present_feedback_classifier_rlt_out;
+      present_feedback_classifier_rlt_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      present_feedback_classifier_rlt_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let present_feedback_classifier_row_dropped_count : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): dropped_count at body2[31:0]. Bad row -> 0xFFFFFFFFFFFFFFFF. Labels prefixed present_feedback_classifier_rdc_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call present_feedback_classifier_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_classifier_rdc_bad;
+        lea r10, [rip + _pfc_table];
+        mov r11, r12;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 16];
+        and rax, 0xFFFFFFFF;
+        jmp present_feedback_classifier_rdc_out;
+      present_feedback_classifier_rdc_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      present_feedback_classifier_rdc_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let present_feedback_classifier_row_last_seq : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): last_classification_seq at body3 (u64). Bad row -> 0xFFFFFFFFFFFFFFFF. Labels prefixed present_feedback_classifier_rls_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call present_feedback_classifier_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_classifier_rls_bad;
+        lea r10, [rip + _pfc_table];
+        mov r11, r12;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 24];
+        jmp present_feedback_classifier_rls_out;
+      present_feedback_classifier_rls_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+      present_feedback_classifier_rls_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // present_feedback_classifier_find_by_surface(surface_kind_id)
+  //     -> row_id | PFC_ROW_NONE.
+  // Uniqueness gate for mint; also usable by callers that hold a
+  // surface_kind_id and want to locate its classifier row.
+  pub let present_feedback_classifier_find_by_surface : (u64) -> u64 !{mem} @{} =
+    fn (surface_kind_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): linear scan for surface_kind_id in header[31:0] of every live row. Labels prefixed present_feedback_classifier_fbs_.",
+      block: {
+        push rbx;
+        push r12;
+        mov r12, rdi;
+        xor rbx, rbx;
+      present_feedback_classifier_fbs_scan:
+        cmp rbx, 16;
+        jae present_feedback_classifier_fbs_none;
+        lea r10, [rip + _pfc_table];
+        mov r11, rbx;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        mov r11, rax;
+        shr r11, 56;
+        cmp r11, 0;
+        je  present_feedback_classifier_fbs_step;
+        and rax, 0xFFFFFFFF;
+        cmp rax, r12;
+        jne present_feedback_classifier_fbs_step;
+        mov rax, rbx;
+        jmp present_feedback_classifier_fbs_out;
+      present_feedback_classifier_fbs_step:
+        add rbx, 1;
+        jmp present_feedback_classifier_fbs_scan;
+      present_feedback_classifier_fbs_none:
+        mov rax, 0xFFFFEAD6;               // PFC_ROW_NONE
+      present_feedback_classifier_fbs_out:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION G  classifier_classify  -- pure threshold-tree function.
+  // ==========================================================================
+  //
+  // present_feedback_classifier_classify(present_nsec, target_vblank_nsec)
+  //     -> PresentClassification (0/1/2).
+  //
+  // Threshold tree (§4):
+  //   if P <= T + PFC_ON_TIME_MARGIN_NSEC:   return PRESENT_ON_TIME
+  //   else if P <= T + PFC_LATE_MARGIN_NSEC: return PRESENT_LATE
+  //   else:                                  return PRESENT_DROPPED
+  //
+  // No memory access, no callee-save, no stats bump -- this function is
+  // called on every present the compositor observes (up to 60/120/240 Hz
+  // per surface) so it stays as cheap as possible.
+  pub let present_feedback_classifier_classify : (u64, u64) -> u64 !{} @{} =
+    fn (present_nsec: u64) (target_vblank_nsec: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): pure classifier. rdi=present_nsec (P), rsi=target_vblank_nsec (T). Compute T+ON_TIME_MARGIN, compare P; if P<=that -> return 0. Compute T+LATE_MARGIN, compare P; if P<=that -> return 1. Else return 2. Overflow on T+margin not reachable with monotonic-ns clock (see §4). Labels prefixed present_feedback_classifier_c_.",
+      block: {
+        // Threshold 1: T + PFC_ON_TIME_MARGIN_NSEC (1_000_000 ns).
+        mov rax, rsi;
+        mov r10, 1000000;
+        add rax, r10;
+        cmp rdi, rax;
+        jbe present_feedback_classifier_c_ontime;
+
+        // Threshold 2: T + PFC_LATE_MARGIN_NSEC (5_000_000 ns).
+        mov rax, rsi;
+        mov r10, 5000000;
+        add rax, r10;
+        cmp rdi, rax;
+        jbe present_feedback_classifier_c_late;
+
+        // Fallthrough: DROPPED.
+        mov rax, 2;
+        ret;
+
+      present_feedback_classifier_c_ontime:
+        xor rax, rax;                       // PRESENT_ON_TIME = 0
+        ret;
+      present_feedback_classifier_c_late:
+        mov rax, 1;                         // PRESENT_LATE = 1
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION H  classifier_mint  /  classifier_revoke
+  // ==========================================================================
+  //
+  // present_feedback_classifier_mint(surface_kind_id)
+  //     -> row_id | PFC_MINT_* sentinel.
+  //
+  // Fresh row: on_time_count=0, late_count=0, dropped_count=0,
+  // last_classification_seq=0, back_pressure_active=0.  Gate order:
+  // surface_valid, uniqueness, pack + alloc.
+  pub let present_feedback_classifier_mint : (u64) -> u64 !{mem} @{} =
+    fn (surface_kind_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): allocate one classifier row. Two callee-save pushes (rbx=surface_kind_id, r12=hdr) leave rsp%16==8; sub rsp,8 aligns to 16 for every nested call. Refusal funnel bumps _pfc_stats[PFC_ST_REFUSED] once at present_feedback_classifier_mb_refused. Labels prefixed present_feedback_classifier_mb_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                     // surface_kind_id
+
+        // (1) surface_kind_id nonzero + fits in u32.
+        mov rdi, rbx;
+        call present_feedback_classifier_surface_valid;
+        cmp rax, 0;
+        je  present_feedback_classifier_mb_bad_surface;
+
+        // (2) surface_kind_id uniqueness.
+        mov rdi, rbx;
+        call present_feedback_classifier_find_by_surface;
+        mov r10, 0xFFFFEAD6;              // PFC_ROW_NONE
+        cmp rax, r10;
+        jne present_feedback_classifier_mb_dup;
+
+        // (3) Pack header.
+        mov rdi, rbx;
+        call present_feedback_classifier_hdr_pack;
+        mov r12, rax;                     // r12 = hdr
+
+        // tail_alloc(hdr); body1..body3 zeroed by allocator.
+        mov rdi, r12;
+        call present_feedback_classifier_tail_alloc;
+
+        mov r10, 16;
+        cmp rax, r10;
+        jae present_feedback_classifier_mb_enospc;   // rax already sentinel
+
+        // Success: bump mints, preserve row_id across the note call.
+        mov rbx, rax;
+        mov rdi, 0;                       // PFC_ST_MINTS
+        call present_feedback_classifier_stats_bump;
+        mov rax, rbx;
+        jmp present_feedback_classifier_mb_out;
+
+      present_feedback_classifier_mb_bad_surface:
+        mov rax, 0xFFFFEADD;              // PFC_MINT_BAD_SURFACE
+        jmp present_feedback_classifier_mb_refused;
+      present_feedback_classifier_mb_dup:
+        mov rax, 0xFFFFEADC;              // PFC_MINT_DUP
+        jmp present_feedback_classifier_mb_refused;
+      present_feedback_classifier_mb_enospc:
+        // rax already PFC_TAIL_ENOSPC (0xFFFFEADF).
+
+      present_feedback_classifier_mb_refused:
+        mov rbx, rax;                     // stash sentinel
+        mov rdi, 5;                       // PFC_ST_REFUSED
+        call present_feedback_classifier_stats_bump;
+        mov rax, rbx;
+
+      present_feedback_classifier_mb_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // present_feedback_classifier_revoke(row_id) -> 0 | PFC_BAD_SLOT
+  //                                                | PFC_REVOKE_ALREADY.
+  pub let present_feedback_classifier_revoke : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): revoke one row. row_id >= PFC_MAX -> PFC_BAD_SLOT; not in_use -> PFC_REVOKE_ALREADY; else free + bump revokes + return 0. One callee-save push (r12=row_id) gives rsp%16==0 for every nested call. Labels prefixed present_feedback_classifier_rev_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+
+        mov r10, 16;
+        cmp r12, r10;
+        jae present_feedback_classifier_rev_bad_slot;
+
+        mov rdi, r12;
+        call present_feedback_classifier_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_classifier_rev_already;
+
+        mov rdi, r12;
+        call present_feedback_classifier_tail_free;
+        mov rdi, 1;                       // PFC_ST_REVOKES
+        call present_feedback_classifier_stats_bump;
+        xor rax, rax;
+        jmp present_feedback_classifier_rev_out;
+
+      present_feedback_classifier_rev_bad_slot:
+        mov rax, 0xFFFFEADB;              // PFC_BAD_SLOT
+        jmp present_feedback_classifier_rev_out;
+      present_feedback_classifier_rev_already:
+        mov rax, 0xFFFFEAD9;              // PFC_REVOKE_ALREADY
+
+      present_feedback_classifier_rev_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION I  classifier_ingest  -- bump counters + evaluate back-pressure
+  // ==========================================================================
+  //
+  // present_feedback_classifier_ingest(row_id, classification)
+  //     -> 0 | PFC_BAD_SLOT | PFC_BAD_CLASS | PFC_INGEST_OVERFLOW.
+  //
+  // 1. Validates row_id + class (class must be in {0,1,2}; PRESENT_VBLANK
+  //    is refused with PFC_BAD_CLASS per §1).
+  // 2. Bumps the appropriate u32 sub-counter (refusing u32 overflow).
+  // 3. Bumps last_classification_seq.
+  // 4. If class in {LATE, DROPPED}, re-evaluates the back-pressure gate:
+  //    if (late_count + dropped_count) >= PFC_BP_THRESHOLD and back-
+  //    pressure was NOT previously latched, latches it to 1 and bumps
+  //    the aggregate PFC_ST_BP_ACTIVATIONS.
+  // 5. Bumps aggregate PFC_ST_INGESTS.
+  pub let present_feedback_classifier_ingest : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (classification: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): ingest one classification. Four callee-save pushes (rbx=row_id, r12=class, r13=row base, r14=scratch) = 32 bytes: entry rsp%16==8, +32+8=40, sub rsp,8 aligns to 48, %16==0 for nested calls. Order: validate row, validate class, update the appropriate counter, bump seq, evaluate back-pressure. Labels prefixed present_feedback_classifier_in_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                     // row_id
+        mov r12, rsi;                     // classification
+
+        // (1) row valid.
+        mov rdi, rbx;
+        call present_feedback_classifier_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_classifier_in_bad_slot;
+
+        // (2) class valid (0..2).
+        mov rdi, r12;
+        call present_feedback_classifier_class_valid;
+        cmp rax, 0;
+        je  present_feedback_classifier_in_bad_class;
+
+        // Compute row base.
+        lea r10, [rip + _pfc_table];
+        mov r11, rbx;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov r13, r10;                     // r13 = row base
+
+        // (3) Bump the appropriate sub-counter based on class.
+        cmp r12, 0;
+        je  present_feedback_classifier_in_bump_on_time;
+        cmp r12, 1;
+        je  present_feedback_classifier_in_bump_late;
+        // class == 2: DROPPED.
+        jmp present_feedback_classifier_in_bump_dropped;
+
+      present_feedback_classifier_in_bump_on_time:
+        // body1[31:0] += 1 (refuse u32 overflow).
+        mov rax, [r13 + 8];
+        mov r11, rax;
+        shl r11, 32;
+        shr r11, 32;                      // r11 = current on_time
+        mov r10, 0xFFFFFFFF;
+        cmp r11, r10;
+        je  present_feedback_classifier_in_overflow;
+        add r11, 1;
+        // Reassemble: preserve high 32 bits of body1 (late_count).
+        mov r10, 0xFFFFFFFF;
+        shl r10, 32;                      // 0xFFFFFFFF00000000
+        and rax, r10;
+        or  rax, r11;
+        mov [r13 + 8], rax;
+        jmp present_feedback_classifier_in_seq;
+
+      present_feedback_classifier_in_bump_late:
+        // body1[63:32] += 1 (refuse u32 overflow).
+        mov rax, [r13 + 8];
+        mov r11, rax;
+        shr r11, 32;                      // r11 = current late
+        mov r10, 0xFFFFFFFF;
+        cmp r11, r10;
+        je  present_feedback_classifier_in_overflow;
+        add r11, 1;
+        // Reassemble: preserve low 32 bits of body1 (on_time_count).
+        mov r10, 0xFFFFFFFF;
+        and rax, r10;                     // rax = old on_time (low32)
+        shl r11, 32;
+        or  rax, r11;
+        mov [r13 + 8], rax;
+        jmp present_feedback_classifier_in_seq;
+
+      present_feedback_classifier_in_bump_dropped:
+        // body2[31:0] += 1 (refuse u32 overflow).
+        mov rax, [r13 + 16];
+        mov r11, rax;
+        shl r11, 32;
+        shr r11, 32;                      // r11 = current dropped
+        mov r10, 0xFFFFFFFF;
+        cmp r11, r10;
+        je  present_feedback_classifier_in_overflow;
+        add r11, 1;
+        // Reassemble: preserve high 32 bits (reserved).
+        mov r10, 0xFFFFFFFF;
+        shl r10, 32;
+        and rax, r10;
+        or  rax, r11;
+        mov [r13 + 16], rax;
+
+      present_feedback_classifier_in_seq:
+        // (4) Bump last_classification_seq (body3, u64).  Saturate at u64
+        // max as a defence-in-depth belt (unreachable in any real boot
+        // window).
+        mov rax, [r13 + 24];
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  present_feedback_classifier_in_bp_check;
+        add rax, 1;
+        mov [r13 + 24], rax;
+
+      present_feedback_classifier_in_bp_check:
+        // (5) Back-pressure gate: only relevant if class is LATE or
+        // DROPPED.  Class ON_TIME (0) skips the gate.
+        cmp r12, 0;
+        je  present_feedback_classifier_in_done;
+
+        // Read on_time (unused here), late (body1 high 32), dropped
+        // (body2 low 32); test (late + dropped) >= PFC_BP_THRESHOLD.
+        mov rax, [r13 + 8];
+        shr rax, 32;                      // rax = late_count
+        mov r14, rax;
+        mov rax, [r13 + 16];
+        and rax, 0xFFFFFFFF;              // rax = dropped_count
+        add r14, rax;                     // r14 = late + dropped
+
+        mov r10, 4;                       // PFC_BP_THRESHOLD
+        cmp r14, r10;
+        jb  present_feedback_classifier_in_done;
+
+        // Threshold crossed.  Check current back_pressure_active bit at
+        // header[39:32]; if already set, do nothing (monotonic latch).
+        mov rax, [r13 + 0];
+        mov r11, rax;
+        shr r11, 32;
+        and r11, 0xFF;
+        cmp r11, 0;
+        jne present_feedback_classifier_in_done;
+
+        // Latch back_pressure_active = 1 into header[39:32].  Mask off
+        // the byte then OR in 1<<32.
+        mov r10, 0xFF;
+        shl r10, 32;
+        not r10;                          // clear-mask for [39:32]
+        and rax, r10;
+        mov r11, 1;
+        shl r11, 32;
+        or  rax, r11;
+        mov [r13 + 0], rax;
+
+        // Bump aggregate PFC_ST_BP_ACTIVATIONS.
+        mov rdi, 6;                       // PFC_ST_BP_ACTIVATIONS
+        call present_feedback_classifier_stats_bump;
+
+      present_feedback_classifier_in_done:
+        // Bump aggregate PFC_ST_INGESTS.
+        mov rdi, 2;                       // PFC_ST_INGESTS
+        call present_feedback_classifier_stats_bump;
+        xor rax, rax;
+        jmp present_feedback_classifier_in_out;
+
+      present_feedback_classifier_in_bad_slot:
+        mov rax, 0xFFFFEADB;              // PFC_BAD_SLOT
+        jmp present_feedback_classifier_in_refused;
+      present_feedback_classifier_in_bad_class:
+        mov rax, 0xFFFFEADA;              // PFC_BAD_CLASS
+        jmp present_feedback_classifier_in_refused;
+      present_feedback_classifier_in_overflow:
+        mov rax, 0xFFFFEAD7;              // PFC_INGEST_OVERFLOW
+
+      present_feedback_classifier_in_refused:
+        mov rbx, rax;                     // stash sentinel
+        mov rdi, 5;                       // PFC_ST_REFUSED
+        call present_feedback_classifier_stats_bump;
+        mov rax, rbx;
+
+      present_feedback_classifier_in_out:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION J  classifier_back_pressure_signal  -- hot-path polling
+  // ==========================================================================
+  //
+  // present_feedback_classifier_back_pressure_signal(row_id) -> u8.
+  //
+  // Returns 1 iff back_pressure_active is set on the in_use row; 0 iff
+  // row not in_use or back-pressure not latched.  Designed to be poll-
+  // loop hot: one bounds check + one u64 load + shift + mask, no stats
+  // bump, no callee-save frame beyond the tail_valid call.
+  pub let present_feedback_classifier_back_pressure_signal : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): read back_pressure_active at header[39:32]. One callee-save push (r12=row_id) gives rsp%16==0 for the nested tail_valid call. Returns 0 (u8-widened) if row not in_use; returns 0 or 1 otherwise. Labels prefixed present_feedback_classifier_bp_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call present_feedback_classifier_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_classifier_bp_zero;
+        lea r10, [rip + _pfc_table];
+        mov r11, r12;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 32;
+        and rax, 0xFF;
+        jmp present_feedback_classifier_bp_out;
+      present_feedback_classifier_bp_zero:
+        xor rax, rax;
+      present_feedback_classifier_bp_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION K  classifier_reset  -- clear counters + back-pressure latch
+  // ==========================================================================
+  //
+  // present_feedback_classifier_reset(row_id) -> 0 | PFC_BAD_SLOT.
+  //
+  // Clears on_time_count, late_count, dropped_count, back_pressure_
+  // active.  PRESERVES surface_kind_id (header[31:0]) and last_
+  // classification_seq (body3) -- see §1 reset for the rationale.
+  // Bumps aggregate PFC_ST_RESETS.
+  pub let present_feedback_classifier_reset : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): clear per-row counters + back-pressure latch. Two callee-save pushes (rbx=row_id, r12=row base) leave rsp%16==8; sub rsp,8 aligns for nested tail_valid + stats_bump. Rewrites header preserving in_use and surface_kind_id, clearing back_pressure_active. Zeros body1 and body2 (all counters). Preserves body3 (last_classification_seq). Labels prefixed present_feedback_classifier_rst_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                     // row_id
+
+        mov rdi, rbx;
+        call present_feedback_classifier_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_classifier_rst_bad_slot;
+
+        lea r10, [rip + _pfc_table];
+        mov r11, rbx;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov r12, r10;                     // r12 = row base
+
+        // Header: preserve in_use[63:56] + surface_kind_id[31:0]; clear
+        // back_pressure_active[39:32] and reserved bytes.
+        mov rax, [r12 + 0];
+        // Mask: in_use bit + surface_kind_id low 32.
+        mov r11, 0xFF;
+        shl r11, 56;                      // in_use mask
+        mov r10, 0xFFFFFFFF;              // surface mask
+        or  r10, r11;                     // combined preserve mask
+        and rax, r10;
+        mov [r12 + 0], rax;
+
+        // Body1 (on_time / late) = 0.
+        xor rax, rax;
+        mov [r12 + 8], rax;
+        // Body2 (dropped + reserved) = 0.
+        mov [r12 + 16], rax;
+        // Body3 (last_classification_seq) PRESERVED.
+
+        mov rdi, 3;                       // PFC_ST_RESETS
+        call present_feedback_classifier_stats_bump;
+        xor rax, rax;
+        jmp present_feedback_classifier_rst_out;
+
+      present_feedback_classifier_rst_bad_slot:
+        mov rax, 0xFFFFEADB;              // PFC_BAD_SLOT
+        mov rbx, rax;
+        mov rdi, 5;                       // PFC_ST_REFUSED
+        call present_feedback_classifier_stats_bump;
+        mov rax, rbx;
+
+      present_feedback_classifier_rst_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION L  Bundled query  --  classifier_stats
+  // ==========================================================================
+  //
+  // present_feedback_classifier_stats(row_id, out_ptr) -> 0 | error.
+  //
+  // Writes 32 bytes at *out_ptr (four u64 fields, little-endian):
+  //   [+0]  on_time_count (zero-extended to u64)
+  //   [+8]  late_count    (zero-extended to u64)
+  //   [+16] dropped_count (zero-extended to u64)
+  //   [+24] back_pressure_active (zero-extended to u64)
+  // Bumps PFC_ST_QUERIES once per call.  Refuses out_ptr == 0 or
+  // 0xFFFF..FF with PFC_STATS_BAD_PTR.
+  pub let present_feedback_classifier_stats : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) (out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): bundled stats read. Three callee-save pushes (rbx=row_id, r12=out_ptr, r13=row base) leave rsp%16==0 for every nested call. Labels prefixed present_feedback_classifier_qs_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                     // row_id
+        mov r12, rsi;                     // out_ptr
+
+        // Gate: out_ptr valid.
+        mov rdi, r12;
+        call present_feedback_classifier_out_ptr_valid;
+        cmp rax, 0;
+        je  present_feedback_classifier_qs_bad_ptr;
+
+        // Gate: row valid.
+        mov rdi, rbx;
+        call present_feedback_classifier_tail_valid;
+        cmp rax, 0;
+        je  present_feedback_classifier_qs_bad_slot;
+
+        // Note the query.
+        mov rdi, 4;                       // PFC_ST_QUERIES
+        call present_feedback_classifier_stats_bump;
+
+        lea r10, [rip + _pfc_table];
+        mov r11, rbx;
+        imul r11, r11, 32;
+        add r10, r11;
+        mov r13, r10;                     // r13 = row base
+
+        // out[+0] = on_time_count (body1[31:0], zero-extend).
+        mov rax, [r13 + 8];
+        and rax, 0xFFFFFFFF;
+        mov [r12 + 0], rax;
+        // out[+8] = late_count (body1[63:32]).
+        mov rax, [r13 + 8];
+        shr rax, 32;
+        mov [r12 + 8], rax;
+        // out[+16] = dropped_count (body2[31:0]).
+        mov rax, [r13 + 16];
+        and rax, 0xFFFFFFFF;
+        mov [r12 + 16], rax;
+        // out[+24] = back_pressure_active (header[39:32], zero-extend).
+        mov rax, [r13 + 0];
+        shr rax, 32;
+        and rax, 0xFF;
+        mov [r12 + 24], rax;
+
+        xor rax, rax;
+        jmp present_feedback_classifier_qs_out;
+
+      present_feedback_classifier_qs_bad_ptr:
+        mov rax, 0xFFFFEAD8;              // PFC_STATS_BAD_PTR
+        jmp present_feedback_classifier_qs_refused;
+      present_feedback_classifier_qs_bad_slot:
+        mov rax, 0xFFFFEADB;              // PFC_BAD_SLOT
+
+      present_feedback_classifier_qs_refused:
+        mov rbx, rax;
+        mov rdi, 5;                       // PFC_ST_REFUSED
+        call present_feedback_classifier_stats_bump;
+        mov rax, rbx;
+
+      present_feedback_classifier_qs_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION M  Boot init.
+  // ==========================================================================
+
+  pub let present_feedback_classifier_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-04 (paideia-os #2299): scrub row pool + all stats counters. 16 rows * 4 u64 = 64 u64 for the table, 8 u64 for stats. Two encoder-safe step-loops (`_step` suffix to avoid the paideia-as `loop` keyword collision). Labels prefixed present_feedback_classifier_i_.",
+      block: {
+        // Scrub _pfc_table.
+        lea r10, [rip + _pfc_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      present_feedback_classifier_i_rows_step:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 64;
+        jb  present_feedback_classifier_i_rows_step;
+
+        // Scrub _pfc_stats.
+        lea r10, [rip + _pfc_stats];
+        xor rcx, rcx;
+      present_feedback_classifier_i_stats_step:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  present_feedback_classifier_i_stats_step;
+        ret
+      }
+    }
+}

@@ -1,0 +1,638 @@
+// src/user/compositor/damage_aggregate.pdx -- Wave0-B11-03 (paideia-os #2296)
+//
+// G9-M3-003: Damage aggregation across the subsurface tree.
+// Design authority: design/compositor/pwp-spec-vocabulary.md §2.11
+// (KIND_DAMAGE_REGION), §2.6 (KIND_LAYER_TREE aggregation semantics).
+//
+// Dependencies (both LANDED):
+//   * damage_kind.pdx        (Wave0-B9-06, paideia-os #2294)
+//                            KIND_DAMAGE_REGION mint + union + add_rect.
+//   * layer_tree.pdx         (Wave0-B6-06, paideia-os #2256)
+//                            KIND_LAYER_TREE arena + reverse-order
+//                            damage aggregation into root node.
+//
+// =============================================================================
+// SECTION 0  WHAT THIS FILE MINTS
+// =============================================================================
+//
+// This is a THIN LOGIC MODULE, not a new KIND. It sits between
+// KIND_LAYER_TREE (§2.6) and KIND_DAMAGE_REGION (§2.11) and provides the
+// one compositor-side entry point that, given a live KIND_LAYER_TREE row:
+//
+//   (1) folds every child node's damage into the root node (via the
+//       layer_tree_aggregate_damage single-pass helper already in
+//       layer_tree.pdx §J -- that helper mutates arena state but does
+//       NOT mint any cap; it just refreshes each node's subtree_damage_
+//       seq and bbox);
+//
+//   (2) MINTS A FRESH KIND_DAMAGE_REGION cap (via damage_region_mint
+//       from damage_kind.pdx §Section 10) whose bbox is the root node's
+//       coalesced bbox, and returns the resulting row_id to the caller.
+//
+// The distinction from layer_tree.layer_tree_aggregate_damage is
+// STRUCTURAL: that function's job is to update tree-local aggregation
+// state; this function's job is to convert that state into a cap the
+// compositor's minimum-repaint dispatch can hand off to the scanout
+// path. layer_tree_aggregate_damage does not know KIND_DAMAGE_REGION
+// exists; damage_kind.pdx does not know KIND_LAYER_TREE exists. Both
+// facts stay true after this landing; this file is the sole point that
+// couples them.
+//
+// The row-scope stats table (§Section 3) also lets a caller ask "at the
+// last aggregation, what was the root subtree_damage_seq and how many
+// nodes did the tree carry?" -- the debug-hook the row briefing pairs
+// with damage_aggregate_from_tree.
+//
+// =============================================================================
+// SECTION 1  FAILURE BAND ALLOCATION -- 0xFFFFEAD0..0xFFFFEADF
+// =============================================================================
+//
+// The row briefing named 0xFFFFED80..0xFFFFED8F as the target band with
+// a "grep-verify free" annotation. That band is NOT free at landing
+// time:
+//
+//   src/kernel/core/drivers/color/surface_check.pdx   0xFFFFED8B..0xFFFFED8F
+//   src/kernel/core/drivers/vello/vello_pipeline.pdx  0xFFFFED88..0xFFFFED8F
+//   src/user/compositor/surface_buffer_bind.pdx       0xFFFFED8x (SBB_BAD_DEST etc.)
+//
+// A full-repo grep (grep -rhEo '0xFFFFE[0-9A-Fa-f]{3}' src/ design/ |
+// sort -u then python3 gap scan) identified 0xFFFFEAD0..0xFFFFEADF as
+// FREE and adjacent to two of this file's own neighbours -- KIND_LAYER_
+// TREE (0xFFFFEA40..0xFFFFEA4F, layer_tree.pdx §5) and KIND_REFERENCE_
+// DISPLAY (0xFFFFEA50..0xFFFFEA5F). The compositor neighbourhood is
+// preserved; the 16-slot budget matches the row briefing's shape.
+//
+// If a future landing collides on this band the reconciliation is a
+// one-line edit to DA_BAD_TREE etc. below plus a rebuild of any
+// downstream test golden that pinned the numeric value.
+//
+// =============================================================================
+// SECTION 2  ROW-BRIEFING SHAPE
+// =============================================================================
+//
+// Module = DamageAggregate.
+// Label prefix = `damage_aggregate_` (per row briefing; every asm-body
+// jump target below is `damage_aggregate_<local>` so no collision with
+// paideia-as reserved keywords per feedback_paideia_as_reserved_labels).
+//
+// DA_MAX_TREES = 32 -- the width of the row-scope stats cache below.
+// The KIND_LAYER_TREE pool itself is LT_MAX=4 today (layer_tree.pdx
+// §Section 3); DA_MAX_TREES=32 leaves headroom for a future LT pool
+// expansion without a stats-table shape change. Requests against
+// tree_id >= DA_MAX_TREES land in the DA_BAD_TREE sentinel.
+//
+// pdx_kind_damage_aggregate_meta fingerprint tag -- single-line
+// "[legacy: ... OK]" per softarch discipline. Size = strlen + 1 (49 + 1
+// = 50 bytes). Data-only at this landing; the kernel-side mint body
+// that would emit it via klog_s1_x1 is a follow-on (G9-M3 dispatcher).
+// Needs allowlisting in tools/verify-fingerprint-coverage.sh with
+// reason "Wave0-B11-03 (#2296) damage_aggregate_from_tree helper; no
+// klog emission -- compositor process, ring 3; allowlist until the
+// G9-M3 dispatcher lands the kernel-side mint body that emits this
+// via klog_s1_x1". Main coordinator adds that entry at batch close-out.
+//
+// =============================================================================
+// SECTION 3  STATE
+// =============================================================================
+//
+// Two cells:
+//
+//   _da_stats:    [u64; 64] = DA_MAX_TREES(32) * 2 fields per tree_id.
+//                 Layout per tree_id t:
+//                    _da_stats[t*2 + 0] = aggregated_seq (root subtree_seq)
+//                    _da_stats[t*2 + 1] = node_count_touched
+//                 A never-aggregated tree reads back zeros in both.
+//
+//   _da_counters: [u64; 4] = (aggregations, refusals, mint_failures,
+//                             add_rect_failures).
+//                 Global; not per-tree.
+//
+// Reset via damage_aggregate_init (defensive; .bss is zero at real boot).
+//
+// =============================================================================
+// SECTION 4  SURFACE HANDLE SYNTHESIS
+// =============================================================================
+//
+// damage_region_mint(surface: u64) demands a non-zero u32-fitting
+// value; damage_kind.pdx §Section 10 does not itself validate that the
+// value maps to a live KIND_SURFACE row (that gate lives on the future
+// kernel-side kind_damage_region mint body). At this landing there is
+// NO reliable coupling between a KIND_LAYER_TREE row and a KIND_SURFACE
+// row -- the tree's arena header carries window_kind_id (0x1C1, the
+// kind ordinal of KIND_WINDOW, per layer_tree.pdx §4.1), not a surface
+// row_id, and the row header's parent_window_slot is a WINDOW slot.
+//
+// Convention adopted here: the surface handle passed to
+// damage_region_mint is `layer_tree_row_id + 1`. Rationale:
+//   * layer_tree_row_id fits in u32 (LT_MAX <= 4 today, DA_MAX_TREES=32
+//     even in the expanded future); +1 keeps it non-zero;
+//   * the resulting damage region is meaningful to the compositor as
+//     "the region minted for this layer tree" regardless of surface
+//     identity -- the compositor consumes the region without ever
+//     following the surface field for cross-cap navigation;
+//   * a future landing that wires an explicit KIND_LAYER_TREE ->
+//     KIND_SURFACE cross-reference (e.g. a `root_surface_row_id` field
+//     added to the LT arena header) can flip this to the real surface
+//     row_id in one place without changing the caller contract.
+//
+// The synthesised value is a private encoding, NOT a leaked surface
+// identity; no consumer should decode it. The `+ 1` in the mint call
+// site is the sole encoder.
+//
+// =============================================================================
+// SECTION 5  ALGORITHM  (damage_aggregate_from_tree)
+// =============================================================================
+//
+//   Input:  layer_tree_row_id (0..LT_MAX-1 for a live tree; may be
+//           anywhere in u64 for a malformed caller).
+//   Output: damage_region_row_id (0..DR_MAX-1) on success,
+//           DA_BAD_TREE / DA_MINT_FAILED on refusal.
+//
+//   Steps:
+//     (1) lt_row_valid(tree_row_id)             -> refuse DA_BAD_TREE.
+//     (2) arena_base = lt_arena_base(tree_row_id).  Row pool + arena
+//         pool share slot indices per layer_tree.pdx §K; a zero return
+//         also lands in DA_BAD_TREE.
+//     (3) layer_tree_aggregate_damage(arena_base). One reverse-order
+//         pass that leaves the root node carrying the max subtree seq
+//         and the union bbox (layer_tree.pdx §J).
+//     (4) Read root_index + node_count from the arena header. An empty
+//         tree (node_count == 0) or a corrupt root_index >= node_count
+//         proceeds to (5) with a zero-sized bbox (still a legal mint).
+//     (5) dst = damage_region_mint(tree_row_id + 1).  A mint sentinel
+//         (any 0xFFFFEBCx value, detected by shr-16 == 0xFFFF) lands in
+//         DA_MINT_FAILED.
+//     (6) If the root bbox has non-zero (w, h), fold it into dst via
+//         damage_region_add_rect(dst, x, y, w, h). An add_rect
+//         sentinel (0xFFFFEBCx family) does NOT roll back the mint --
+//         the caller gets the dst row_id back and can call
+//         damage_region_revoke on it if the add_rect refusal makes it
+//         useless; the failure is only tallied in the counter.
+//     (7) Stash aggregated_seq + node_count into _da_stats for the
+//         debug hook (damage_aggregate_stats_{seq,nodes}).
+//     (8) Bump DA_ST_AGGS + return dst row_id.
+//
+// The single per-tree stats slot is overwritten on each aggregation
+// (the counter table tracks the historical totals separately). Under
+// single-thread compositor semantics no locking is needed; a future
+// SMP compositor would put a per-tree seqlock around steps (3)..(7).
+//
+// =============================================================================
+// SECTION 6  ALIGNMENT DISCIPLINE
+// =============================================================================
+//
+// SysV: entry rsp%16==8. Each 8-byte push flips rsp%16 parity. Nested
+// calls require rsp%16==0 immediately before `call`.
+//
+// damage_aggregate_from_tree uses six callee-save pushes
+// (rbx,r12,r13,r14,r15,rbp) + one 8-byte alignment pad:
+//   entry:              rsp%16==8
+//   after 6 pushes:     rsp%16==8   (6*8 = 48; 8+48 == 56, mod 16 == 8)
+//   after sub rsp, 8:   rsp%16==0   (correct for nested call)
+//
+// The nested callees themselves each maintain their own alignment
+// (damage_region_mint, damage_region_add_rect, damage_region_union,
+// lt_row_valid, lt_arena_base, layer_tree_aggregate_damage,
+// lt_hdr_node_count, lt_hdr_root_index, lt_node_addr, damage_aggregate_
+// note) so no per-call adjustment is needed inside the body.
+//
+// The two-arg stats getters + counter reader + note are leaves with no
+// nested calls; they need no callee-save pushes or alignment work.
+//
+// damage_aggregate_init is a two-loop leaf (rows scrub + counters
+// scrub) using rax/rcx only.
+//
+// =============================================================================
+// SECTION 7  ENCODER-CONSERVATIVE IDIOMS
+// =============================================================================
+//
+// Every asm body below sticks to the paideia-as encoder subset the
+// sibling files in this directory (damage_kind.pdx, layer_tree.pdx,
+// buffer_age.pdx) already exercise:
+//
+//   * cmp reg, imm     -- never `test reg, reg` (paideia-as U1605).
+//   * mov reg, imm64;
+//     cmp reg2, reg    -- for immediates > 32 bits.
+//   * imul reg, reg, imm32
+//                      -- three-operand form for row_id * N addressing.
+//   * shl reg, N
+//     shr reg, N       -- constant shifts only.
+//   * load / add reg, 1 / store
+//                      -- never `add [mem], imm` or `add reg, [mem]`.
+//   * cross-module `call <symbol>` -- linker resolves pub let names.
+//   * `mov rax, 0xFFFFEBCF; cmp reg, rax` for 32-bit constants that
+//     need to sit inside a full register.
+//   * `shr r, 16; cmp r, 0xFFFF` sentinel detection idiom (buffer_age.
+//     pdx §buffer_age_query pattern) to distinguish a row_id return
+//     (< DR_MAX == 32) from a 0xFFFFEBCx sentinel.
+
+module DamageAggregate = structure {
+
+  // ==========================================================================
+  // Section A  Identity + constants.
+  // ==========================================================================
+
+  // Bookkeeping bounds.
+  pub let DA_MAX_TREES        : u64 = 32
+  pub let DA_STATS_PER_TREE   : u64 = 2
+
+  // Failure taxonomy 0xFFFFEAD0..0xFFFFEADF.
+  pub let DA_OK               : u64 = 0
+  pub let DA_BAD_TREE         : u64 = 0xFFFFEADF
+  pub let DA_MINT_FAILED      : u64 = 0xFFFFEADE
+  pub let DA_ADD_RECT_FAILED  : u64 = 0xFFFFEADD
+
+  // Counter table indices.
+  pub let DA_ST_AGGS              : u64 = 0
+  pub let DA_ST_REFUSED           : u64 = 1
+  pub let DA_ST_MINT_FAILURES     : u64 = 2
+  pub let DA_ST_ADD_RECT_FAILURES : u64 = 3
+  pub let DA_ST_COUNT             : u64 = 4
+
+  // Per-tree stats slot offsets (bytes within a 2 * u64 entry).
+  pub let DA_STAT_OFF_SEQ         : u64 = 0
+  pub let DA_STAT_OFF_NODES       : u64 = 8
+
+  // ==========================================================================
+  // Section B  State cells.
+  //
+  // _da_stats: DA_MAX_TREES(32) * DA_STATS_PER_TREE(2) = 64 u64 cache.
+  // _da_counters: DA_ST_COUNT(4) global counters.
+  // ==========================================================================
+
+  pub let mut _da_stats    : [u64; 64] = uninit @align(64)
+  pub let mut _da_counters : [u64; 4]  = uninit @align(64)
+
+  // ==========================================================================
+  // Section C  Fingerprint tag.
+  //
+  // Single-line "[legacy: ... OK]" per softarch discipline. 49 chars +
+  // 1 null terminator = 50 bytes total. Data-only at this landing --
+  // no klog_s1_x1 emit point in this module (compositor process, ring
+  // 3). Allowlist wire-up in tools/verify-fingerprint-coverage.sh with
+  // reason "Wave0-B11-03 (#2296) damage_aggregate_from_tree helper; no
+  // klog emission -- compositor process, ring 3; allowlist until the
+  // G9-M3 dispatcher lands the kernel-side mint body that emits this
+  // via klog_s1_x1" is a separate landing per the batch's file-touch
+  // discipline (this landing is ONE file only).
+  // ==========================================================================
+
+  pub let pdx_kind_damage_aggregate_meta : [u8; 50] = "damage aggregate ok [legacy: DAMAGE AGGREGATE OK]\0"
+
+  // ==========================================================================
+  // Section D  Counter primitives.
+  // ==========================================================================
+
+  // damage_aggregate_note(which): bounds-checked counter bump.
+  //
+  // Load-inc-store idiom (paideia-as bans `add reg, [mem]`). Leaf; no
+  // callee-save discipline; rax/r10/r11 clobber.
+  pub let damage_aggregate_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-03 (paideia-os #2296): bounds-checked counter bump against DA_ST_COUNT(4). Leaf body; rax/r10/r11 clobber. cmp reg, imm rather than test (paideia-as U1605). Labels prefixed damage_aggregate_.",
+      block: {
+        cmp rdi, 4;
+        jae damage_aggregate_nt_out;
+        lea r10, [rip + _da_counters];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      damage_aggregate_nt_out:
+        ret
+      }
+    }
+
+  // damage_aggregate_counter(which) -> value | 0.
+  //
+  // Debug hook mirror to damage_aggregate_note. OOB reads land at 0
+  // rather than a sentinel; a caller that wants an OOB signal checks
+  // its `which` argument against DA_ST_COUNT first.
+  pub let damage_aggregate_counter : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-03 (paideia-os #2296): bounds-checked counter read; OOB -> 0. Leaf. Labels prefixed damage_aggregate_.",
+      block: {
+        cmp rdi, 4;
+        jae damage_aggregate_ct_zero;
+        lea r10, [rip + _da_counters];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      damage_aggregate_ct_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Section E  Per-tree stats getters.
+  //
+  // damage_aggregate_stats_seq(tree_id) / _nodes(tree_id) -> u64.
+  //
+  // The row briefing names the combined shape
+  //     damage_aggregate_stats(tree_id) -> (aggregated_seq, node_count_touched)
+  // but paideia-as functions return exactly one u64. The two-getter
+  // shape is the surface_geometry / damage_region_bbox_* precedent in
+  // this same directory. OOB tree_ids land at zero (never sentinels)
+  // so a compositor debug consumer that reads both getters in the same
+  // frame gets a self-consistent (0, 0) pair for any untouched tree_id.
+  // ==========================================================================
+
+  pub let damage_aggregate_stats_seq : (u64) -> u64 !{mem} @{} =
+    fn (tree_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-03 (paideia-os #2296): read _da_stats[tree_id*2 + 0] (aggregated_seq). OOB -> 0. Leaf. shl r11, 4 encodes the 16-byte per-tree stride. Labels prefixed damage_aggregate_.",
+      block: {
+        cmp rdi, 32;
+        jae damage_aggregate_sq_zero;
+        lea r10, [rip + _da_stats];
+        mov r11, rdi;
+        shl r11, 4;                            // tree_id * 16 (2 * u64)
+        add r10, r11;
+        mov rax, [r10 + 0];
+        ret;
+      damage_aggregate_sq_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let damage_aggregate_stats_nodes : (u64) -> u64 !{mem} @{} =
+    fn (tree_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-03 (paideia-os #2296): read _da_stats[tree_id*2 + 1] (node_count_touched). OOB -> 0. Leaf. Labels prefixed damage_aggregate_.",
+      block: {
+        cmp rdi, 32;
+        jae damage_aggregate_sn_zero;
+        lea r10, [rip + _da_stats];
+        mov r11, rdi;
+        shl r11, 4;
+        add r10, r11;
+        mov rax, [r10 + 8];
+        ret;
+      damage_aggregate_sn_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Section F  damage_aggregate_from_tree -- THE ONE MINTER.
+  //
+  // Signature: (layer_tree_row_id) -> damage_region_row_id
+  //                                 | DA_BAD_TREE
+  //                                 | DA_MINT_FAILED
+  //
+  // Reads the tree via cross-file calls into layer_tree.pdx, folds the
+  // subtree damage into the root arena node, then mints a fresh
+  // KIND_DAMAGE_REGION via cross-file calls into damage_kind.pdx.
+  //
+  // Register plan (six pushes + 8-byte pad; entry rsp%16==8,
+  // 8 + 6*8 = 56 -> rsp%16==8, +8 pad = rsp%16==0 for nested calls):
+  //   rbx  = tree_row_id                (input, preserved for stats + surface synth)
+  //   r12  = damage_region_row_id       (mint result, returned)
+  //   r13  = arena_base                 (per-tree arena pointer)
+  //   r14  = root_node_base             (arena_base + 32 + root*48)
+  //   r15  = node_count                 (from arena header; stashed for stats)
+  //   rbp  = aggregated_seq             (from root node; stashed for stats)
+  //
+  // Sentinel detection: damage_region_mint returns either a row_id
+  // (< DR_MAX == 32) or a 0xFFFFEBCx sentinel. `shr rax, 16; cmp rax,
+  // 0xFFFF` disambiguates airtightly (the sibling buffer_age.pdx
+  // §buffer_age_query established this idiom). Simpler `cmp rax, 32;
+  // jae fail` works today but breaks the moment a future sentinel
+  // slips below DR_MAX; the shr-16 pattern doesn't.
+  // ==========================================================================
+
+  pub let damage_aggregate_from_tree : (u64) -> u64 !{mem} @{} =
+    fn (layer_tree_row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-03 (paideia-os #2296): validate tree -> fold subtree damage (layer_tree_aggregate_damage) -> mint fresh KIND_DAMAGE_REGION (damage_region_mint) -> fold root bbox into region (damage_region_add_rect) -> stash per-tree stats -> return region row_id. Six callee-save pushes (rbx,r12,r13,r14,r15,rbp) + 8-byte pad keeps rsp%16==0 across every nested cross-module call (entry 8, +48 pushes = 8, +8 pad = 0). Sentinel detection uses shr-16 == 0xFFFF idiom from buffer_age.pdx to distinguish a row_id (<DR_MAX) from a 0xFFFFEBCx sentinel. Labels prefixed damage_aggregate_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub  rsp, 8;                           // align: entry 8, +48 pushes = 8, +8 pad = 0
+
+        mov rbx, rdi;                          // rbx = tree_row_id
+
+        // ------------------------------------------------------------------
+        // (1) Validate the KIND_LAYER_TREE row_id.
+        // ------------------------------------------------------------------
+        mov rdi, rbx;
+        call lt_row_valid;
+        cmp rax, 0;
+        je  damage_aggregate_dft_bad;
+
+        // ------------------------------------------------------------------
+        // (2) Resolve arena_base. Rows and arenas share slot indices
+        //     per layer_tree.pdx §K; lt_arena_base bounds-checks
+        //     against LT_MAX. A zero return means the tree exists in
+        //     the row pool but the arena slot resolved OOB -- treat
+        //     that as DA_BAD_TREE (a corrupt row).
+        // ------------------------------------------------------------------
+        mov rdi, rbx;
+        call lt_arena_base;
+        cmp rax, 0;
+        je  damage_aggregate_dft_bad;
+        mov r13, rax;                          // r13 = arena_base
+
+        // ------------------------------------------------------------------
+        // (3) One reverse-order pass to lift every child's (subtree_
+        //     damage_seq, bbox) into its parent. On return the root
+        //     node's fields carry the aggregated result. Returns LT_OK
+        //     unconditionally (never fails in-band), so rax is
+        //     discarded.
+        // ------------------------------------------------------------------
+        mov rdi, r13;
+        call layer_tree_aggregate_damage;
+
+        // ------------------------------------------------------------------
+        // (4a) Read node_count. Stashed in r15 for the stats write.
+        // ------------------------------------------------------------------
+        mov rdi, r13;
+        call lt_hdr_node_count;
+        mov r15, rax;                          // r15 = node_count
+
+        // ------------------------------------------------------------------
+        // (4b) Read root_index. If either node_count == 0 or
+        //      root_index >= node_count, we skip the root-node reads
+        //      and proceed to mint with a zero-sized bbox -- still a
+        //      legal mint that gives the compositor a fresh (empty)
+        //      cap it can grow later. r14 (root_node_base) is left
+        //      zero so the bbox-write path is skipped, and rbp
+        //      (aggregated_seq) is zeroed for the stats cache.
+        // ------------------------------------------------------------------
+        mov rdi, r13;
+        call lt_hdr_root_index;
+        // rax = root_index
+
+        cmp r15, 0;
+        je  damage_aggregate_dft_empty_seed;
+        cmp rax, r15;
+        jae damage_aggregate_dft_empty_seed;
+
+        // ------------------------------------------------------------------
+        // Root exists; compute root_node_base and read subtree_seq.
+        // ------------------------------------------------------------------
+        mov rdi, r13;
+        mov rsi, rax;                          // root_index
+        call lt_node_addr;
+        mov r14, rax;                          // r14 = root_node_base
+        mov rbp, [r14 + 32];                   // rbp = aggregated_seq
+        jmp damage_aggregate_dft_mint;
+
+      damage_aggregate_dft_empty_seed:
+        xor r14, r14;                          // no root
+        xor rbp, rbp;                          // aggregated_seq = 0
+
+      damage_aggregate_dft_mint:
+        // ------------------------------------------------------------------
+        // (5) Mint a fresh KIND_DAMAGE_REGION. Surface handle = tree_
+        //     row_id + 1 per §Section 4 convention. Sentinel detection
+        //     via shr-16 == 0xFFFF (buffer_age.pdx idiom).
+        // ------------------------------------------------------------------
+        mov rdi, rbx;
+        add rdi, 1;                            // surface handle (nonzero)
+        call damage_region_mint;
+        mov r12, rax;                          // r12 = mint result
+
+        mov r10, r12;
+        shr r10, 16;
+        mov r11, 0xFFFF;
+        cmp r10, r11;
+        je  damage_aggregate_dft_mintfail;
+
+        // ------------------------------------------------------------------
+        // (6) Fold root bbox into dst region iff (w, h) are non-zero
+        //     AND we have a live root node. An empty bbox (or an empty
+        //     tree entirely) leaves the region rect_count == 0 -- a
+        //     legal state the compositor's consumer treats as "no
+        //     visible damage this frame".
+        // ------------------------------------------------------------------
+        cmp r14, 0;
+        je  damage_aggregate_dft_stash;
+
+        // Read bbox_wh; short-circuit if either dimension is zero.
+        mov rax, [r14 + 24];                   // node_bbox_wh
+        mov r10, rax;
+        and r10, 0xFFFFFFFF;                   // r10 = w
+        cmp r10, 0;
+        je  damage_aggregate_dft_stash;
+        mov r11, rax;
+        shr r11, 32;                           // r11 = h
+        cmp r11, 0;
+        je  damage_aggregate_dft_stash;
+
+        // Non-empty bbox: unpack (x, y, w, h) and add. add_rect args
+        // are (row=rdi, x=rsi, y=rdx, w=rcx, h=r8).
+        mov rax, [r14 + 16];                   // node_bbox_xy
+        mov rsi, rax;
+        mov r10, 0xFFFFFFFF;
+        and rsi, r10;                          // rsi = x
+        mov rdx, rax;
+        shr rdx, 32;                           // rdx = y
+
+        mov rax, [r14 + 24];                   // node_bbox_wh
+        mov rcx, rax;
+        and rcx, r10;                          // rcx = w
+        shr rax, 32;                           // rax = h
+        mov r8,  rax;                          // r8  = h
+
+        mov rdi, r12;                          // rdi = damage_region row_id
+        call damage_region_add_rect;
+        // rax = DR_OK (0) or a 0xFFFFEBCx sentinel. Failure does NOT
+        // roll back the mint -- the caller receives the region row_id
+        // and can damage_region_revoke it if the empty region is
+        // useless. Tally the failure in the counter.
+        cmp rax, 0;
+        je  damage_aggregate_dft_stash;
+        mov rdi, 3;                            // DA_ST_ADD_RECT_FAILURES
+        call damage_aggregate_note;
+
+      damage_aggregate_dft_stash:
+        // ------------------------------------------------------------------
+        // (7) Stash per-tree stats. tree_row_id is bounded by LT_MAX
+        //     (<= 32 == DA_MAX_TREES) so the shl r11, 4 * (2 * u64)
+        //     stride stays inside _da_stats. Defensive bounds check
+        //     for the future LT expansion above DA_MAX_TREES.
+        // ------------------------------------------------------------------
+        cmp rbx, 32;
+        jae damage_aggregate_dft_ok;
+        lea r10, [rip + _da_stats];
+        mov r11, rbx;
+        shl r11, 4;                            // tree_row_id * 16
+        add r10, r11;
+        mov [r10 + 0], rbp;                    // aggregated_seq
+        mov [r10 + 8], r15;                    // node_count_touched
+
+      damage_aggregate_dft_ok:
+        // ------------------------------------------------------------------
+        // (8) Success. Bump DA_ST_AGGS + return region row_id.
+        // ------------------------------------------------------------------
+        mov rdi, 0;                            // DA_ST_AGGS
+        call damage_aggregate_note;
+        mov rax, r12;
+        jmp damage_aggregate_dft_out;
+
+      damage_aggregate_dft_bad:
+        mov rdi, 1;                            // DA_ST_REFUSED
+        call damage_aggregate_note;
+        mov rax, 0xFFFFEADF;                   // DA_BAD_TREE
+        jmp damage_aggregate_dft_out;
+
+      damage_aggregate_dft_mintfail:
+        mov rdi, 2;                            // DA_ST_MINT_FAILURES
+        call damage_aggregate_note;
+        mov rdi, 1;                            // DA_ST_REFUSED
+        call damage_aggregate_note;
+        mov rax, 0xFFFFEADE;                   // DA_MINT_FAILED
+
+      damage_aggregate_dft_out:
+        add rsp, 8;                            // undo align pad
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Section G  Boot init.
+  //
+  // Zero the stats cache + counters. Defensive; .bss is already zero
+  // at real boot. Mirrors damage_kind_stats_reset / lt_init in the
+  // sibling files.
+  // ==========================================================================
+
+  pub let damage_aggregate_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-03 (paideia-os #2296): scrub _da_stats (64 u64) + _da_counters (4 u64). Two-loop leaf; rax/rcx clobber; cmp reg, imm rather than test (paideia-as U1605). Labels prefixed damage_aggregate_.",
+      block: {
+        lea r10, [rip + _da_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      damage_aggregate_ini_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 64;
+        jb  damage_aggregate_ini_stats;
+
+        lea r10, [rip + _da_counters];
+        xor rcx, rcx;
+      damage_aggregate_ini_ctrs:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  damage_aggregate_ini_ctrs;
+        ret
+      }
+    }
+}

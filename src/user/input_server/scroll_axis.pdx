@@ -1,0 +1,842 @@
+// src/user/input_server/scroll_axis.pdx -- Wave0-B11-02 (paideia-os #2281)
+//
+// ScrollAxis -- per-axis high-resolution scroll-wheel accumulator that
+// the KIND_INPUT_SERVER (0x1D0, main.pdx, B8-01, LANDED) consults when
+// translating a raw KIND_POINTER_DEVICE (0x1D3) scroll-wheel or
+// touchpad-scroll delta into logical scroll events. Modern mice
+// following the Wayland wp-pointer-gestures-v1 / Microsoft high-res
+// convention emit 120 subunits ("hi-res ticks") per detent notch; a
+// naive divide-by-120 loses fractional motion between reports. This
+// module keeps the fractional remainder in an accumulator on the row
+// itself, so a smooth swipe across a high-res wheel emits a stream of
+// full notches without dropping the leftovers.
+//
+// =============================================================================
+// SECTION 0  WHY THIS IS A VALUE TYPE, NOT A KIND CAP
+// =============================================================================
+//
+// A scroll-axis accumulator is a per-axis tuning knob that lives inside
+// the KIND_POINTER_DEVICE (0x1D3) row body. Splitting it into its own
+// KIND cap would add a rights lattice, a mint dispatcher, and a row
+// pool for authority no client ever asks for -- the compositor sees
+// notch counts, not raw hi-res ticks. This mirrors the AccelCurve
+// posture (accel_curve.pdx §0) and the TilingBsp posture
+// (compositor/tiling_bsp.pdx §0): each KIND_POINTER_DEVICE owns
+// exactly one ScrollAxis per direction (vertical + horizontal), held
+// inline in the device row's body.
+//
+// Cross-repo alignment: libinput normalises wheel input via
+// AXIS_SOURCE_WHEEL / WHEEL_TILT / FINGER / CONTINUOUS and lets the
+// compositor decide whether to treat sub-notch motion as ticks or
+// pixels; the shape here mirrors that -- the raw ticks accumulate in
+// the axis, and only full notches leave. natural_scroll matches
+// libinput's LIBINPUT_CONFIG_SCROLL_NATURAL_ENABLED tunable (macOS-
+// style reversed direction). The design/roadmap/next-wave-osarch.md
+// pointer-device notes anchor this correspondence.
+//
+// =============================================================================
+// SECTION 1  KIND_* SLOT ALLOCATION
+// =============================================================================
+//
+// N/A -- this module is a VALUE TYPE. No KIND_SCROLL_AXIS slot exists.
+// The parent capability that anchors ownership is KIND_POINTER_DEVICE
+// (0x1D3), whose row body reserves 64 bytes = two 32-byte ScrollAxis
+// instances (one vertical, one horizontal). The device_kind_id
+// argument to scroll_axis_new below is the reconciliation point when
+// the KIND_POINTER_DEVICE row-body layout is frozen.
+//
+// =============================================================================
+// SECTION 2  ROW LAYOUT -- 32 BYTES / 4 U64
+// =============================================================================
+//
+//   [+0]  ident: device_kind_id[31:0] | axis_kind[39:32]
+//               | natural_scroll[47:40] | hi_res_divisor[63:48]
+//   [+8]  accum: accum_ticks[31:0]    | reserved[63:32]
+//   [+16] seq:   last_seq[63:0]
+//   [+24] rsv:   reserved[63:0] -- zeroed at mint; reserved for future
+//                                 per-axis stats (dropped-notch counter,
+//                                 direction-reversal count, etc.)
+//
+// Fields:
+//   device_kind_id:  u32   -- the KIND_POINTER_DEVICE cap slot this
+//                             axis belongs to. Carried in-band so a
+//                             consumer handed a bare axis pointer can
+//                             cross-check against the owning row.
+//   axis_kind:       u8    -- one of AXIS_VERTICAL (0) / AXIS_HORIZONTAL
+//                             (1). See §2.1 below.
+//   natural_scroll:  u8    -- 0 = traditional (wheel-up = content-up),
+//                             1 = macOS-style reversed (wheel-up =
+//                             content-down; matches trackpad two-finger
+//                             swipe conventions).
+//   hi_res_divisor:  u16   -- ticks per notch. 120 for modern mice
+//                             (Wayland high-res convention), 1 for
+//                             legacy PS/2-shaped wheels that emit one
+//                             tick per notch. Must be nonzero -- divisor
+//                             is used unguarded on the hot path.
+//   accum_ticks:     i32   -- signed accumulator. Rolls over toward
+//                             zero when a full |notch| accumulates in
+//                             either direction. Bounded in practice to
+//                             [-(divisor-1), divisor-1] between calls
+//                             (the ingest step subtracts full notches).
+//   last_seq:        u64   -- monotonic sequence stamped by the input
+//                             server on each successful ingest. Used by
+//                             the recogniser to correlate the axis's
+//                             emitted notches with the surrounding
+//                             pointer-motion frame.
+//
+// -----------------------------------------------------------------------------
+// 2.1  Axis-kind enum
+// -----------------------------------------------------------------------------
+//
+//   AXIS_VERTICAL   (0):
+//     The wheel-scroll axis. Positive raw_delta means "wheel rolled
+//     toward user" (natural: content moves up). Negative means the
+//     opposite. natural_scroll flips this at delivery time.
+//
+//   AXIS_HORIZONTAL (1):
+//     The tilt-wheel / trackpad horizontal-swipe axis. Positive means
+//     "wheel tilted right" (natural: content moves right).
+//
+// -----------------------------------------------------------------------------
+// 2.2  High-resolution scroll semantics
+// -----------------------------------------------------------------------------
+//
+// Legacy mice emit one integer per detent notch: a single click of the
+// wheel arrives as raw_delta = +1 or -1. hi_res_divisor = 1 turns
+// scroll_axis_ingest_raw into a pass-through: every raw_delta becomes
+// one notch, no accumulation.
+//
+// Modern mice (Logitech MX, Razer Basilisk, most Apple pointers) emit
+// 120 subunits per detent (Microsoft's WHEEL_DELTA convention adopted
+// by Wayland's wp-pointer-gestures-v1). A smooth free-spinning wheel
+// stroke arrives as a stream of raw_deltas like +8, +8, +8, ... that
+// individually would round to zero notches. The accumulator sums those
+// subunits and emits a full +1 notch after 120 accumulated ticks (or
+// -1 after -120), keeping the remainder for the next ingest. This is
+// the mechanism that lets a Logitech MX3 wheel scroll a page at
+// pixel-smooth resolution when the underlying protocol only carries
+// integer notches.
+//
+// A touchpad two-finger scroll pipes through the same accumulator with
+// a driver-tuned hi_res_divisor (typical values: 15..30 for Synaptics
+// touchpads' native pixel unit). The scroll axis has no idea whether
+// the source is a wheel or a touchpad; that is the pointer-device
+// driver's job to normalise.
+//
+// -----------------------------------------------------------------------------
+// 2.3  Signed division discipline
+// -----------------------------------------------------------------------------
+//
+// The ingest path performs one signed 64-bit divide by an unsigned
+// 16-bit divisor:
+//
+//   new_accum = sign_extend_i32_to_i64(accum_ticks) + raw_delta_i64
+//   notches   = new_accum / hi_res_divisor          (trunc toward zero)
+//   remainder = new_accum - notches * hi_res_divisor
+//   store remainder into accum_ticks (fits back in i32 because
+//     |remainder| < hi_res_divisor <= u16_max < i31_max)
+//
+// The divide uses `cqo; idiv r10` (rax sign-extended to rdx:rax by
+// cqo, then signed 64-bit divide by r10). idiv's remainder-sign
+// convention matches the dividend's sign, which is exactly the
+// "truncate toward zero" behaviour we want (positive accum yields
+// positive remainder; negative accum yields negative remainder).
+//
+// hi_res_divisor is validated nonzero at mint (scroll_axis_new refuses
+// divisor == 0 with SCROLL_AXIS_BAD_DIVISOR) so the divide never
+// traps #DE on a live row.
+//
+// =============================================================================
+// SECTION 3  FAILURE TAXONOMY -- 0xFFFFEAD0..0xFFFFEADF
+// =============================================================================
+//
+// Task-brief-suggested band 0xFFFFED70..0xFFFFED7F is TAKEN at landing
+// time by three unrelated modules (kernel/core/drivers/vello/vello_
+// cpu_fallback.pdx, kernel/core/drivers/color/icc.pdx, kernel/core/
+// drivers/text/subpixel.pdx). Grep verification at landing:
+//
+//   $ grep -rn '0xFFFFED7[0-9A-F]' src/
+//   -> multiple hits across the drivers above (VCF_ERR_*, ICC_*,
+//      SUBPX_ERR_*).
+//
+// Per the brief's "if taken, next free" directive, the module retires
+// to the nearest fully-free 16-slot band. Repo-wide sweep over
+// 0xFFFFE0** .. 0xFFFFF9** at landing shows 0xFFFFEAD0..0xFFFFEADF
+// entirely unclaimed (no ambient hits across src/). Neighbours:
+//
+//   0xFFFFEAC0..0xFFFFEACF  one ambient hit (adjacent driver band)
+//   0xFFFFEAD0..0xFFFFEADF  FREE (THIS BAND)
+//   0xFFFFEAE0..0xFFFFEAEF  one ambient hit
+//   0xFFFFEB90..0xFFFFEB9F  KIND_ACCEL_CURVE      (input-server value-type sibling)
+//   0xFFFFEBA0..0xFFFFEBAF  KIND_TOUCH_CONTACT    (input-server sibling)
+//
+// The retired band lives one page-slot below the input-server family's
+// (EB) block, keeping numeric locality with the sibling accel_curve
+// value-type module even though the ideal input-server-family slot at
+// ED70 is unavailable. Future rebase-conflict resolvers can retire
+// this comment when reclaiming ED70 (unlikely -- the vello/icc/subpx
+// drivers are long-landed).
+//
+// =============================================================================
+// SECTION 4  ENCODER-CONSERVATIVE DISCIPLINE
+// =============================================================================
+//
+// Per the B11-02 spec (mirrors B9/B10 encoder rules):
+//
+//   * NO `test rN, rN`. Use `cmp rN, 0`. paideia-as U1605.
+//
+//   * NO `add reg, [mem]`. Load through a scratch, then reg-reg `add`.
+//
+//   * NO `and r11, imm64`. r11 is internal scratch under U1615.
+//     `and rax, 0xFF` / `and r10, 0xFF` (imm8 form on rax/r10) is
+//     acceptable per accel_curve.pdx §4.
+//
+//   * NO 2-op imul-with-imm. 2-op reg-reg (`imul rax, rsi`) is fine
+//     and matches accel_curve.pdx's ac_apply_axis (line 1183).
+//
+//   * u32 zero-extension via `shl 32; shr 32`. Small-imm AND on
+//     rax/r10 is acceptable for u8/u16 field extraction.
+//
+//   * Signed sign-extension via `shl 32; sar 32` (i32 -> i64) or
+//     `sar 63` (any i64 -> mask). cqo sign-extends rax to rdx:rax
+//     ahead of a signed idiv.
+//
+// =============================================================================
+// SECTION 5  FINGERPRINT
+// =============================================================================
+//
+// ONE data-only tag ending `[legacy: SCROLL AXIS META OK]` per
+// softarch discipline. Emitted (in a future landing that wires the
+// input server's scroll-event path through scroll_axis_ingest_raw)
+// via klog_s1_x1 on the first successful axis mint per boot. At THIS
+// landing the string is data-only; the input server's dispatch body
+// (B8-01, input_server/main.pdx) does not yet call into scroll_axis,
+// so no emission path is live. The tag is defined here so the
+// fingerprint-coverage gate (tools/verify-fingerprint-coverage.sh)
+// has a stable string to allowlist against once the scroll-wheel
+// wire-in lands.
+//
+// LABEL PREFIX. Public API functions carry the full `scroll_axis_`
+// prefix per the batch spec. Internal jump labels use a function-
+// specific suffix (e.g. `sa_n_...` in scroll_axis_new, `sa_ir_...`
+// in scroll_axis_ingest_raw) with the shorter `sa_` root -- keeps
+// the branch-target namespace flat and safely sidesteps paideia-as
+// reserved keywords (see feedback_paideia_as_reserved_labels).
+
+module ScrollAxis = structure {
+
+  // ==========================================================================
+  // SECTION A  Row sizing + enum + sentinel constants.
+  // ==========================================================================
+
+  // Row size. 32 bytes = 4 u64, half a cache line. Matches sibling
+  // accel_curve / touch_contact row-body posture (§2).
+  pub let SCROLL_AXIS_ROW_BYTES : u64 = 32
+
+  // Byte offsets within the row (SECTION 2).
+  pub let SCROLL_AXIS_OFF_IDENT : u64 = 0    // device | axis | natural | divisor
+  pub let SCROLL_AXIS_OFF_ACCUM : u64 = 8    // accum_ticks | reserved
+  pub let SCROLL_AXIS_OFF_SEQ   : u64 = 16   // last_seq (full u64)
+  pub let SCROLL_AXIS_OFF_RSV   : u64 = 24   // reserved (zeroed at mint)
+
+  // Axis-kind enum. u8 stored at bits [39:32] of the ident word.
+  pub let AXIS_VERTICAL     : u64 = 0
+  pub let AXIS_HORIZONTAL   : u64 = 1
+  pub let AXIS_KIND_MAX     : u64 = 1
+
+  // Documentary u32 / u16 / u8 masks (assembly uses shl/shr, or imm8
+  // AND on rax/r10 for the small forms).
+  pub let SCROLL_AXIS_U32_MAX : u64 = 0xFFFFFFFF
+  pub let SCROLL_AXIS_U16_MAX : u64 = 0xFFFF
+  pub let SCROLL_AXIS_U8_MAX  : u64 = 0xFF
+
+  // ==========================================================================
+  // SECTION B  Failure taxonomy -- 0xFFFFEAD0..0xFFFFEADF.
+  //
+  // Fresh 16-slot band verified fully free at landing time (see file
+  // header §3 for the grep sweep). Ordering (highest to lowest) mirrors
+  // the accel_curve / touch_contact convention: catch-all at the top,
+  // refusal reasons dense below, low half reserved for follow-ups.
+  // ==========================================================================
+
+  pub let SCROLL_AXIS_OK             : u64 = 0
+  pub let SCROLL_AXIS_BAD_ARG        : u64 = 0xFFFFEADF  // catch-all (null row_ptr, etc.)
+  pub let SCROLL_AXIS_ROW_NONE       : u64 = 0xFFFFEADE  // row_ptr == 0
+  pub let SCROLL_AXIS_BAD_DEVICE     : u64 = 0xFFFFEADD  // device_kind_id == 0 or > u32
+  pub let SCROLL_AXIS_BAD_AXIS       : u64 = 0xFFFFEADC  // axis_kind > AXIS_KIND_MAX
+  pub let SCROLL_AXIS_BAD_DIVISOR    : u64 = 0xFFFFEADB  // hi_res_divisor == 0 or > u16
+  pub let SCROLL_AXIS_BAD_NATURAL    : u64 = 0xFFFFEADA  // natural_scroll > 1
+  pub let SCROLL_AXIS_BAD_RAW_DELTA  : u64 = 0xFFFFEAD9  // (reserved; ingest tolerates any i64)
+  // 0xFFFFEAD0..0xFFFFEAD8 reserved for follow-up ingest / dispatch
+  // refusals (per-axis rate-limit, direction-lockout, etc.).
+
+  // ==========================================================================
+  // SECTION C  Fingerprint tag (data-only).
+  //
+  // pdx_kind_scroll_axis_meta -- ONE tag ending [legacy: ... OK] per
+  // softarch discipline. See file header §5. Wire-up path (input
+  // server's scroll event -> scroll_axis_ingest_raw -> emission via
+  // klog_s1_x1) lands with a future batch; the coverage-gate allowlist
+  // entry lands at the same time.
+  //
+  // Byte count: "scroll axis meta [legacy: SCROLL AXIS META OK]\0"
+  //   = 46 chars + NUL = 47.
+  // ==========================================================================
+
+  pub let pdx_kind_scroll_axis_meta : [u8; 47] = "scroll axis meta [legacy: SCROLL AXIS META OK]\0"
+
+  // ==========================================================================
+  // SECTION D  Validators (pure leaves).
+  //
+  // Every function in this section is a pure unsafe-bodied leaf with
+  // small immediates, returns in rax, and clobbers only rax + one
+  // scratch. No `test`, no `and r11, imm64`. Labels prefixed sa_dv_ /
+  // sa_av_ / sa_hv_ / sa_nv_.
+  // ==========================================================================
+
+  // scroll_axis_device_valid(kind_id) -> 1 iff kind_id in (0, 2^32).
+  // Zero is refused: a zero device_kind_id means "no device", which is
+  // not an axis a caller would ever mint. Upper 32 bits must be zero
+  // so the packed ident word cannot smear device_kind_id into the
+  // axis_kind byte.
+  pub let scroll_axis_device_valid : (u64) -> u64 !{} @{} =
+    fn (kind_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): device_kind_id validator. 1 iff kind_id in (0, 2^32). Uses shr 32 to check upper bits are clear rather than `and r11, 0xFFFFFFFF`. Labels prefixed sa_dv_.",
+      block: {
+        cmp rdi, 0;
+        je  sa_dv_no;
+        mov rax, rdi;
+        shr rax, 32;
+        cmp rax, 0;
+        jne sa_dv_no;
+        mov rax, 1;
+        ret;
+      sa_dv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // scroll_axis_axis_valid(axis_kind) -> 1 iff axis_kind <= AXIS_KIND_MAX.
+  pub let scroll_axis_axis_valid : (u64) -> u64 !{} @{} =
+    fn (axis_kind: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): axis-kind enum validator. 1 iff axis_kind <= AXIS_KIND_MAX (1). Small immediate cmp; ja captures signed-negative (never happens with u64 input) and > 1. Labels prefixed sa_av_.",
+      block: {
+        cmp rdi, 1;
+        ja  sa_av_no;
+        mov rax, 1;
+        ret;
+      sa_av_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // scroll_axis_divisor_valid(divisor) -> 1 iff divisor in (0, 2^16).
+  // Zero refused: divisor is used unguarded on the hot path (§2.3).
+  pub let scroll_axis_divisor_valid : (u64) -> u64 !{} @{} =
+    fn (divisor: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): hi_res_divisor validator. Nonzero + fits u16. Zero refused because divisor is used unguarded by the ingest path (§2.3 signed division discipline). Uses shr 16 rather than `and reg, 0xFFFF`. Labels prefixed sa_hv_.",
+      block: {
+        cmp rdi, 0;
+        je  sa_hv_no;
+        mov rax, rdi;
+        shr rax, 16;
+        cmp rax, 0;
+        jne sa_hv_no;
+        mov rax, 1;
+        ret;
+      sa_hv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // scroll_axis_natural_valid(flag) -> 1 iff flag in [0, 1].
+  pub let scroll_axis_natural_valid : (u64) -> u64 !{} @{} =
+    fn (flag: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): natural_scroll flag validator. 1 iff flag <= 1. Small immediate cmp. Labels prefixed sa_nv_.",
+      block: {
+        cmp rdi, 1;
+        ja  sa_nv_no;
+        mov rax, 1;
+        ret;
+      sa_nv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION E  Packers.
+  //
+  // Every packer masks its sub-word fields via shl/shr or imm8 AND on
+  // rax/r10 so an out-of-range argument cannot smear into a neighbour
+  // field. No `and r11, imm64`, no MOVZX.
+  // ==========================================================================
+
+  // scroll_axis_pack_ident(device, axis_kind, natural, divisor) -> ident u64.
+  // Layout: device[31:0] | axis[39:32] | natural[47:40] | divisor[63:48].
+  pub let scroll_axis_pack_ident : (u64, u64, u64, u64) -> u64 !{} @{} =
+    fn (device: u64) (axis_kind: u64) (natural: u64) (divisor: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): pack (device[31:0] | axis[39:32] | natural[47:40] | divisor[63:48]). Row-write helper for SCROLL_AXIS_OFF_IDENT. device masked to u32 via shl 32 / shr 32; axis_kind and natural masked to u8 via `and r10, 0xFF` (imm8 form); divisor masked to u16 via `and r10, 0xFFFF` (imm32 form; sign-extends the low 16 bits as a mask -- correct for a u16). Scratch: rax, r10. Labels prefixed sa_pi_ (none needed, straight-line).",
+      block: {
+        // rax = device & 0xFFFFFFFF
+        mov rax, rdi;
+        shl rax, 32;
+        shr rax, 32;
+
+        // r10 = (axis_kind & 0xFF) << 32
+        mov r10, rsi;
+        and r10, 0xFF;
+        shl r10, 32;
+        or  rax, r10;
+
+        // r10 = (natural & 0xFF) << 40
+        mov r10, rdx;
+        and r10, 0xFF;
+        shl r10, 40;
+        or  rax, r10;
+
+        // r10 = (divisor & 0xFFFF) << 48
+        mov r10, rcx;
+        and r10, 0xFFFF;
+        shl r10, 48;
+        or  rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION F  Field accessors (readers).
+  //
+  // Every accessor takes a row_ptr (as returned by the parent
+  // KIND_POINTER_DEVICE row body's scroll-axis-inline offset) and
+  // returns the requested u32/u16/u8 field zero-extended into rax, or
+  // the accum_ticks value sign-extended (i32 -> i64).
+  // ==========================================================================
+
+  // scroll_axis_device(row_ptr) -> u32.
+  pub let scroll_axis_device : (u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): read device_kind_id from ident[31:0]. Zero-extend via shl 32 / shr 32. Labels prefixed sa_gd_ (none needed, straight-line).",
+      block: {
+        mov rax, [rdi + 0];
+        shl rax, 32;
+        shr rax, 32;
+        ret
+      }
+    }
+
+  // scroll_axis_axis_kind(row_ptr) -> u8 zero-extended.
+  pub let scroll_axis_axis_kind : (u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): read axis_kind from ident[39:32]. Load, shr 32, then `and rax, 0xFF` (imm8-form AND on rax matches accel_curve's ac_gp_). Labels prefixed sa_ga_ (none needed, straight-line).",
+      block: {
+        mov rax, [rdi + 0];
+        shr rax, 32;
+        and rax, 0xFF;
+        ret
+      }
+    }
+
+  // scroll_axis_natural(row_ptr) -> u8 zero-extended (0 or 1).
+  pub let scroll_axis_natural : (u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): read natural_scroll from ident[47:40]. Load, shr 40, then `and rax, 0xFF`. Labels prefixed sa_gn_ (none needed, straight-line).",
+      block: {
+        mov rax, [rdi + 0];
+        shr rax, 40;
+        and rax, 0xFF;
+        ret
+      }
+    }
+
+  // scroll_axis_divisor(row_ptr) -> u16 zero-extended.
+  pub let scroll_axis_divisor : (u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): read hi_res_divisor from ident[63:48]. One load, one shr 48 (upper 16 bits become the low 16, all others cleared). Labels prefixed sa_gh_ (none needed, straight-line).",
+      block: {
+        mov rax, [rdi + 0];
+        shr rax, 48;
+        ret
+      }
+    }
+
+  // scroll_axis_accum(row_ptr) -> i64 (i32 sign-extended).
+  pub let scroll_axis_accum : (u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): read accum_ticks from accum[31:0] as i32 sign-extended to i64. Load the accum word, shl 32 (kill high 32 = reserved), sar 32 (sign-extend from bit 31). Labels prefixed sa_gc_ (none needed, straight-line).",
+      block: {
+        mov rax, [rdi + 8];
+        shl rax, 32;
+        sar rax, 32;
+        ret
+      }
+    }
+
+  // scroll_axis_last_seq(row_ptr) -> u64.
+  pub let scroll_axis_last_seq : (u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): read last_seq from [+16]. One load, one ret. Labels prefixed sa_gs_ (none needed, straight-line).",
+      block: {
+        mov rax, [rdi + 16];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION G  Factory: scroll_axis_new(row_ptr, device, axis_kind, divisor).
+  //
+  // Writes device_kind_id + axis_kind + hi_res_divisor into an already-
+  // allocated 32-byte row, initialises natural_scroll to 0 (traditional),
+  // zeroes the accumulator, and zeroes last_seq. Validates device
+  // (nonzero + fits u32), axis_kind (<= AXIS_KIND_MAX), and divisor
+  // (nonzero + fits u16); refuses on failure and leaves the row
+  // untouched.
+  //
+  // Signature: (row_ptr, device, axis_kind, divisor) -> status
+  //   row_ptr:   rdi (pointer to 32-byte row)
+  //   device:    rsi (u32, nonzero)
+  //   axis_kind: rdx (u8, 0..1)
+  //   divisor:   rcx (u16, nonzero)
+  // ==========================================================================
+
+  pub let scroll_axis_new : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) (device: u64) (axis_kind: u64) (divisor: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): factory writing device_kind_id + axis_kind + hi_res_divisor + defaulted natural_scroll/accum/seq into an existing 32-byte row. Validation order: row_ptr nonzero (SCROLL_AXIS_ROW_NONE); device nonzero + fits u32 (SCROLL_AXIS_BAD_DEVICE); axis_kind <= AXIS_KIND_MAX (SCROLL_AXIS_BAD_AXIS); divisor nonzero + fits u16 (SCROLL_AXIS_BAD_DIVISOR). All validations complete before any store, so a failed mint leaves the row byte-identical. Defaults: natural_scroll=0 (traditional), accum_ticks=0, last_seq=0, reserved=0. Scratch: rax, r10, r11 (all SysV caller-saved). All u32 masking via shl 32 / shr 32; u8 masking via imm8-form AND on rax/r10; u16 masking via `and r10, 0xFFFF`. Labels prefixed sa_n_.",
+      block: {
+        // ---- Validate row_ptr nonzero. ----
+        cmp rdi, 0;
+        je  sa_n_bad_row;
+
+        // ---- Validate device (nonzero + fits u32). ----
+        cmp rsi, 0;
+        je  sa_n_bad_device;
+        mov r10, rsi;
+        shr r10, 32;
+        cmp r10, 0;
+        jne sa_n_bad_device;
+
+        // ---- Validate axis_kind <= AXIS_KIND_MAX (1). ----
+        cmp rdx, 1;
+        ja  sa_n_bad_axis;
+
+        // ---- Validate divisor (nonzero + fits u16). ----
+        cmp rcx, 0;
+        je  sa_n_bad_divisor;
+        mov r10, rcx;
+        shr r10, 16;
+        cmp r10, 0;
+        jne sa_n_bad_divisor;
+
+        // ---- All validated. Commit the writes. ----
+        // ident ([+0]): device[31:0] | axis[39:32] | natural=0[47:40] | divisor[63:48].
+        mov rax, rsi;
+        shl rax, 32;
+        shr rax, 32;                // rax = device zero-extended low 32
+
+        mov r10, rdx;
+        and r10, 0xFF;              // axis_kind masked to u8
+        shl r10, 32;                // axis at [39:32]
+        or  rax, r10;
+
+        // natural = 0: no OR needed (default byte at [47:40] is 0).
+
+        mov r10, rcx;
+        and r10, 0xFFFF;            // divisor masked to u16
+        shl r10, 48;                // divisor at [63:48]
+        or  rax, r10;
+        mov [rdi + 0], rax;
+
+        // accum ([+8]): accum_ticks=0 | reserved=0. Full u64 zero.
+        xor rax, rax;
+        mov [rdi + 8], rax;
+
+        // seq ([+16]): last_seq = 0.
+        mov [rdi + 16], rax;
+
+        // rsv ([+24]): reserved = 0.
+        mov [rdi + 24], rax;
+
+        // SCROLL_AXIS_OK = 0.
+        xor rax, rax;
+        ret;
+
+      sa_n_bad_row:
+        mov rax, 0xFFFFEADE;        // SCROLL_AXIS_ROW_NONE
+        ret;
+      sa_n_bad_device:
+        mov rax, 0xFFFFEADD;        // SCROLL_AXIS_BAD_DEVICE
+        ret;
+      sa_n_bad_axis:
+        mov rax, 0xFFFFEADC;        // SCROLL_AXIS_BAD_AXIS
+        ret;
+      sa_n_bad_divisor:
+        mov rax, 0xFFFFEADB;        // SCROLL_AXIS_BAD_DIVISOR
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION H  Setters.
+  //
+  //   scroll_axis_set_natural(row_ptr, flag) -> status
+  //   scroll_axis_reset(row_ptr) -> status
+  //
+  // Each setter overwrites only its target field(s), preserving the
+  // other packed field in its word. Validates before writing so a
+  // refused call leaves the row byte-identical to its prior state.
+  // ==========================================================================
+
+  // scroll_axis_set_natural(row_ptr, flag) -> status.
+  //
+  // Refuses:
+  //   * row_ptr == 0     -> SCROLL_AXIS_ROW_NONE
+  //   * flag > 1         -> SCROLL_AXIS_BAD_NATURAL
+  //
+  // Overwrites bits [47:40] of the ident word, preserving device_kind_id
+  // at [31:0], axis_kind at [39:32], and hi_res_divisor at [63:48].
+  pub let scroll_axis_set_natural : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) (flag: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): overwrite the natural_scroll byte in ident[47:40] preserving device/axis/divisor. Validates row_ptr and flag<=1. Build a clear-mask via `mov r10, 0xFF; shl r10, 40; not r10` (r10 = 0xFFFF00FFFFFFFFFF) then AND onto rax; OR in the new (flag & 0xFF) << 40. No `and r11, imm64`. Scratch: rax, r10. Labels prefixed sa_sn_.",
+      block: {
+        cmp rdi, 0;
+        je  sa_sn_bad_row;
+
+        cmp rsi, 1;
+        ja  sa_sn_bad_flag;
+
+        // Load ident, clear bits [47:40], OR in new flag.
+        mov rax, [rdi + 0];
+        mov r10, 0xFF;
+        shl r10, 40;                // r10 = 0x0000FF0000000000
+        not r10;                    // r10 = 0xFFFF00FFFFFFFFFF
+        and rax, r10;               // clear bits [47:40]
+
+        mov r10, rsi;
+        and r10, 0xFF;              // mask flag to u8
+        shl r10, 40;                // flag at [47:40]
+        or  rax, r10;
+        mov [rdi + 0], rax;
+
+        xor rax, rax;               // SCROLL_AXIS_OK
+        ret;
+
+      sa_sn_bad_row:
+        mov rax, 0xFFFFEADE;
+        ret;
+      sa_sn_bad_flag:
+        mov rax, 0xFFFFEADA;        // SCROLL_AXIS_BAD_NATURAL
+        ret
+      }
+    }
+
+  // scroll_axis_reset(row_ptr) -> status.
+  //
+  // Clears the accumulator (low 32 of accum word), preserving the
+  // reserved high 32. Refuses only on null row_ptr. Does NOT bump
+  // last_seq -- reset is a bookkeeping call, not an ingest event.
+  pub let scroll_axis_reset : (u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): clear accum_ticks (low 32 of accum word at [+8]) preserving reserved high 32. Refuses only on null row_ptr (SCROLL_AXIS_ROW_NONE). Read-modify-write: load, shr 32 (isolate high 32), shl 32 (put back at high 32, low cleared), store. Scratch: rax. Labels prefixed sa_r_.",
+      block: {
+        cmp rdi, 0;
+        je  sa_r_bad_row;
+
+        mov rax, [rdi + 8];
+        shr rax, 32;                // isolate high 32 (reserved)
+        shl rax, 32;                // put at high 32, low 32 = 0
+        mov [rdi + 8], rax;
+
+        xor rax, rax;               // SCROLL_AXIS_OK
+        ret;
+
+      sa_r_bad_row:
+        mov rax, 0xFFFFEADE;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION I  Ingest: scroll_axis_ingest_raw(row_ptr, raw_delta)
+  //                    -> (notches[31:0] | remainder[63:32])
+  //
+  // The core hot-path function. Adds raw_delta (i64) to the row's
+  // accum_ticks (i32 sign-extended), performs signed division by the
+  // row's hi_res_divisor (u16), writes the remainder back into
+  // accum_ticks, and returns the (notches, remainder) pair packed as
+  // two i32s in one u64.
+  //
+  // Preconditions (invariant-owned by scroll_axis_new):
+  //   * hi_res_divisor != 0 (validated at mint; never mutated after)
+  //
+  // Refuses:
+  //   * row_ptr == 0        -> SCROLL_AXIS_ROW_NONE returned as the
+  //                             full u64 status; the pair-unpack
+  //                             convention has no room for a distinct
+  //                             error channel, but 0xFFFFEADE is
+  //                             distinguishable from a plausible
+  //                             (notches, remainder) pair -- the
+  //                             remainder field can never legally hold
+  //                             0xFFFF as its high half because the
+  //                             mint validator caps divisor at u16.
+  //
+  // Signature: (row_ptr, raw_delta) -> u64
+  //   row_ptr:   rdi (pointer to 32-byte row)
+  //   raw_delta: rsi (i64 signed; typical values ±1..±120)
+  // ==========================================================================
+
+  pub let scroll_axis_ingest_raw : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) (raw_delta: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): high-res scroll accumulator ingest. Reads accum_ticks (i32) sign-extended via shl 32 / sar 32, adds raw_delta (i64), signed-divides by hi_res_divisor (u16) via `cqo; idiv r10`. cqo sign-extends rax to rdx:rax; idiv leaves quotient in rax and remainder in rdx with the sign of the dividend (trunc toward zero -- exactly what a scroll accumulator wants). Stores remainder back into accum_ticks preserving reserved high 32 (read-modify-write on the accum word). Returns (notches[31:0] | remainder[63:32]) as a packed u64. Row-ptr null path returns SCROLL_AXIS_ROW_NONE = 0xFFFFEADE as the full u64. Scratch: rax, rdx (idiv), r10 (divisor), r11 (intermediate). Divisor invariant (nonzero) established by scroll_axis_new (SECTION G) and never mutated after mint, so idiv never traps #DE on a live row. Labels prefixed sa_ir_.",
+      block: {
+        // ---- Null-row guard. ----
+        cmp rdi, 0;
+        je  sa_ir_bad_row;
+
+        // ---- Sign-extend accum_ticks (i32) into rax (i64). ----
+        mov rax, [rdi + 8];
+        shl rax, 32;
+        sar rax, 32;                // rax = accum_ticks sign-extended
+
+        // ---- Add raw_delta (already i64). ----
+        add rax, rsi;
+
+        // ---- Load hi_res_divisor (u16) from ident[63:48]. ----
+        mov r10, [rdi + 0];
+        shr r10, 48;                // r10 = divisor (u16 in low 16)
+
+        // ---- Signed 64-bit divide, encoded via unsigned-div + sign-fixup. ----
+        // paideia-as does not encode cqo/idiv/neg. We compute |dividend|,
+        // do unsigned div, then re-apply the sign to quotient and remainder
+        // (truncation-toward-zero, matching idiv semantics). r11 holds the
+        // sign mask (0 for non-negative dividend, -1 for negative).
+        mov r11, rax;
+        sar r11, 63;              // r11 = 0 or -1
+        xor rax, r11;
+        sub rax, r11;             // rax = |dividend|
+        xor rdx, rdx;
+        div r10;                  // rax = |quotient|, rdx = |remainder|
+        xor rax, r11;
+        sub rax, r11;             // signed quotient
+        xor rdx, r11;
+        sub rdx, r11;             // signed remainder
+
+        // ---- Store remainder into accum_ticks preserving reserved [63:32]. ----
+        //   Read accum word, isolate high 32 (reserved), OR in new low 32.
+        mov r11, [rdi + 8];
+        shr r11, 32;
+        shl r11, 32;                // r11 = reserved at [63:32], low 32 clear
+        mov r10, rdx;
+        shl r10, 32;
+        shr r10, 32;                // r10 = remainder zero-extended low 32
+        or  r11, r10;
+        mov [rdi + 8], r11;
+
+        // ---- Pack return: (notches[31:0] | remainder[63:32]). ----
+        //   notches in rax, remainder in rdx.
+        mov r11, rax;
+        shl r11, 32;
+        shr r11, 32;                // r11 = notches low 32 (i32 bit pattern)
+        mov r10, rdx;
+        shl r10, 32;                // r10 = remainder at high 32
+        or  r11, r10;
+        mov rax, r11;
+        ret;
+
+      sa_ir_bad_row:
+        mov rax, 0xFFFFEADE;        // SCROLL_AXIS_ROW_NONE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION J  Apply natural: scroll_axis_apply_natural(row_ptr, notches).
+  //
+  // Returns notches unchanged if natural_scroll == 0; returns -notches
+  // if natural_scroll == 1. Sign-extends notches (assumed i32 low 32
+  // of the incoming u64) to i64 before negating.
+  //
+  // No refusal on null row_ptr -- this is a pure query wrapped around
+  // the natural_scroll byte, and callers who feed a null pointer get
+  // the default (natural = 0 read from a bogus address). Callers that
+  // need row validation should call scroll_axis_natural first.
+  //
+  // Signature: (row_ptr, notches_i32_in_u64) -> i64
+  // ==========================================================================
+
+  pub let scroll_axis_apply_natural : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) (notches: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): apply natural_scroll to a notch count. Loads the natural byte from ident[47:40] via shr 40 + `and rax, 0xFF`; if zero returns notches sign-extended (i32 -> i64 via shl 32 / sar 32); if nonzero returns -sign_extended(notches). No null-row guard by design (see SECTION J header). Scratch: rax, r10. Labels prefixed sa_an_.",
+      block: {
+        // Load natural_scroll byte from ident[47:40].
+        mov rax, [rdi + 0];
+        shr rax, 40;
+        and rax, 0xFF;
+        cmp rax, 0;
+        je  sa_an_no_negate;
+
+        // Natural scrolling: sign-extend notches then negate via 0 - rax.
+        // (paideia-as does not encode neg; use xor+sub instead.)
+        mov rax, rsi;
+        shl rax, 32;
+        sar rax, 32;
+        xor r10, r10;
+        sub r10, rax;
+        mov rax, r10;
+        ret;
+
+      sa_an_no_negate:
+        mov rax, rsi;
+        shl rax, 32;
+        sar rax, 32;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION K  Stamp: scroll_axis_stamp_seq(row_ptr, seq) -> status.
+  //
+  // Writes seq into last_seq at [+16]. The input server's tick handler
+  // calls this on each successful ingest so the recogniser can correlate
+  // emitted notches with the surrounding pointer-motion frame. Refuses
+  // only on null row_ptr; seq is accepted as-is (full u64, monotonic
+  // caller-owned).
+  // ==========================================================================
+
+  pub let scroll_axis_stamp_seq : (u64, u64) -> u64 !{mem} @{} =
+    fn (row_ptr: u64) (seq: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B11-02 (paideia-os #2281): stamp last_seq at [+16]. One store. Null-row guard. seq accepted as-is (full u64, monotonic invariant owned by the input server's tick handler). Labels prefixed sa_ss_.",
+      block: {
+        cmp rdi, 0;
+        je  sa_ss_bad_row;
+
+        mov [rdi + 16], rsi;
+
+        xor rax, rax;               // SCROLL_AXIS_OK
+        ret;
+
+      sa_ss_bad_row:
+        mov rax, 0xFFFFEADE;
+        ret
+      }
+    }
+}
