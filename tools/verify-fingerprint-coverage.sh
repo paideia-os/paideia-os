@@ -1025,6 +1025,40 @@ ALLOWLIST = {
     "pdx kind tiling bsp meta [legacy: TILING BSP META OK]":
         "Wave0-B8 G9-M2-001 (#2291): tiling_bsp value-type module; "
         "no KIND cap; consumer (workspace tiling) emits at wire-body land.",
+
+    # ------------------------------------------------------------------
+    # Wave 0 Batch 9 — G9/G12 M3/M4 fan-out over the KIND_SURFACE and
+    # KIND_UI_CONTEXT parents. Data-only meta decls in cap modules whose
+    # dispatchers land with the future wire-body milestone.
+    # ------------------------------------------------------------------
+    "present_feedback mint ok [legacy: PRESENT FEEDBACK MINT OK]":
+        "Wave0-B9 G9-M4-001 (#2297): present_feedback_kind "
+        "(KIND_PRESENT_FEEDBACK=0x1DA) data-only decl; kernel dispatcher + "
+        "vk_present_feedback_channel wire-body not yet wired.",
+    "focus router change ok [legacy: FOCUS ROUTER CHANGE OK]":
+        "Wave0-B9 G8-M2-002 (#2278): focus_router logic module; "
+        "input-server dispatcher not yet wired.",
+    "accel curve meta [legacy: ACCEL CURVE META OK]":
+        "Wave0-B9 G8-M3-001 (#2280): accel_curve value-type; input server "
+        "motion-event path not yet wired.",
+    "touch contact track ok [legacy: TOUCH CONTACT TRACK OK]":
+        "Wave0-B9 G8-M4-001 (#2283): touch_contact (KIND_TOUCH_CONTACT=0x1D8) "
+        "data-only decl; kernel dispatcher not yet wired.",
+    "workspace switch ok [legacy: WORKSPACE SWITCH OK]":
+        "Wave0-B9 G9-M1-002 (#2289): workspace_switch logic module; "
+        "present-feedback IRQ cursor advance not yet wired.",
+    "damage region mint ok [legacy: DAMAGE REGION MINT OK]":
+        "Wave0-B9 G9-M3-001 (#2294): damage_kind (KIND_DAMAGE_REGION=0x1D9) "
+        "data-only decl; kernel dispatcher not yet wired.",
+    "pdx a11y bind at mint meta [legacy: A11Y BIND AT MINT OK]":
+        "Wave0-B9 G10-M2-001 (#2305): a11y_bind_at_mint P4 gate wrap; "
+        "compositor mint-path integration not yet wired.",
+    "pdx kind screen reader protocol meta [legacy: SCREEN READER PROTOCOL META OK]":
+        "Wave0-B9 G10-M3-001 (#2308): screen_reader_protocol subscribe queue; "
+        "compositor push-emit path not yet wired.",
+    "pdx kind keynav taborder meta [legacy: KEYNAV TABORDER META OK]":
+        "Wave0-B9 G10-M4-001 (#2311): keynav_taborder DFS cursor; "
+        "compositor key-event dispatch not yet wired.",
 }
 
 # Below these counts the extractor has stopped matching rather than the

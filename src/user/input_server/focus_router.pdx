@@ -1,0 +1,780 @@
+// src/user/input_server/focus_router.pdx -- G8-M2-002 (paideia-os #2278)
+//
+// FOCUS-FOLLOWS-SURFACE routing with per-seat window stack.
+//
+// This is a LOGIC MODULE (not a KIND cap): it holds the per-seat focus
+// bookkeeping cell that the input server consults on every focus-change
+// event to (a) revoke the prior KIND_INPUT_ROUTE cap (LINEAR consume),
+// (b) mint a fresh one against the new (seat, surface) pair, and
+// (c) bump the monotonic focus_change_seq so downstream audit rows can
+// order focus history without a per-row hardware timestamp.
+//
+// Design authority:
+//   * design/compositor/pwp-spec-vocabulary.md §2.10 (KIND_INPUT_ROUTE)
+//     -- one route per focus decision; a focus change consumes the
+//     prior route and mints a new one. focus_router is the state cell
+//     that names WHICH route is currently in flight.
+//   * design/compositor/pwp-spec-vocabulary.md §2.9 (KIND_SEAT) -- the
+//     focus decision is per-seat; a multi-seat workstation has N
+//     independent focus histories, one per KIND_SEAT row. The
+//     `active_seat_kind_id` field on each FocusRouterState instance
+//     names which seat the state belongs to.
+//   * design/roadmap/next-wave-synthesis.md §4 pitfall P2 -- the input
+//     server (not the compositor) drives focus. This module lives
+//     inside the input server's user-space image so the focus decision
+//     never leaves the compositor-INDEPENDENT authority. A compromised
+//     compositor CANNOT redirect focus without going through
+//     focus_router_change_focus, which in turn goes through
+//     input_route_mint (the LINEAR mint gate).
+//   * design/roadmap/next-wave-synthesis.md §4 pitfall P10 -- LINEAR
+//     input-route caps forbid a "sticky grab": every focus change
+//     revokes the prior route. This module's change_focus contract
+//     performs the revoke BEFORE the mint, so a caller that observes
+//     the FR_MINT_REFUSED sentinel knows the prior route is already
+//     dead (linear invariant preserved even on refusal).
+//
+// LIFECYCLE POSITION.
+//
+// One FocusRouterState instance per KIND_SEAT row -- the input server's
+// per-seat event loop owns the cell. Not a singleton (contrast with
+// input_server main.pdx's `_input_server_fields_cell`): a multi-seat
+// workstation has N of these, sitting side-by-side in a caller-owned
+// backing store. The state pointer is passed in on every call so the
+// module is testable against scratch cells without needing a global
+// pool ceiling.
+//
+// PARALLEL LANDING NOTE.
+//
+// This landing depends on:
+//   * src/user/input_server/route_kind.pdx (G8-M2-001, LANDED B8) --
+//     provides `input_route_mint` and `input_route_revoke` symbols
+//     resolved at link time. Cross-file `call` targets are supported
+//     by the paideia-as linker (see src/user/init.pdx which calls
+//     src/user/rootfs_seed.pdx's `rootfs_seed_run`).
+//   * src/user/input_server/main.pdx (G8-M1-001, LANDED B8) -- pins
+//     KIND_INPUT_SERVER = 0x1D0 and defines the process cell the
+//     future dispatcher (G8-M2-004) will wire into. This landing does
+//     not touch main.pdx; it publishes symbols the future dispatcher
+//     will call.
+//
+// FAILURE-BAND ALLOCATION.
+//
+// 0xFFFFEB80..0xFFFFEB8F -- a fresh 16-slot band verified free by
+// grep across src/**/*.pdx + tests/**/*.pdx at landing time. Documented
+// as "unclaimed" by both src/user/libpaideia_ui/immediate_context.pdx
+// (line 132) and src/user/input_server/seat_kind.pdx (line 147). The
+// row itself pinned 0xFFFFEB80..0xFFFFEB8F as its first-choice band;
+// no adjacent-band collision this batch, so the row's first choice
+// stands.
+//
+// LABEL PREFIX. `focus_router_` throughout, sidestepping paideia-as
+// reserved-word collisions (`loop`, `if`, `let`, `write`, ...).
+//
+// MECE SCOPE. Single file under src/user/input_server/. No mod.pdx or
+// registry marker changes. This landing touches no other file.
+//
+// =============================================================================
+// SECTION 0 -- STRUCT SHAPE
+// =============================================================================
+//
+// FocusRouterState is a 32-byte caller-owned cell. Field layout (four
+// u64 words, five u32 slots + one u64 counter, with one 32-bit reserved
+// slot at word2[63:32]):
+//
+//   [+0]  word0:  active_seat_kind_id[31:0]
+//               | focused_window_kind_id[63:32]
+//
+//   [+8]  word1:  focused_surface_kind_id[31:0]
+//               | window_stack_head[63:32]
+//
+//   [+16] word2:  active_route_kind_id[31:0]
+//               | reserved0[63:32]                   (0 at init; future
+//                                                    per-seat cursor
+//                                                    ownership slot)
+//
+//   [+24] word3:  focus_change_seq (u64)             (monotonic; the
+//                                                    post-bump value at
+//                                                    successful focus
+//                                                    change; init leaves
+//                                                    this at 1 so a
+//                                                    subsequent "did
+//                                                    init run?" probe
+//                                                    can distinguish
+//                                                    uninitialised
+//                                                    (=0) from initialised
+//                                                    (>0))
+//
+// The `window_stack_head` slot is the u32 slot id of the topmost window
+// on this seat's most-recently-focused stack. Traversal ("what was the
+// prior focus?") walks a next-focus pointer on the KIND_WINDOW rows
+// themselves (that pointer lands with a future window-registry
+// milestone); focus_router only owns the head reference. On focus
+// change the future landing will push the old focused_window onto the
+// stack (setting its next-focus to the current head, then updating the
+// head to name it); THIS landing initialises the head to zero and
+// preserves it across change_focus (the stack push lands with the
+// window-registry wiring, not here).
+//
+// All u32 slots are little-endian; the packed-word load pattern
+// (mov word / shl 32 / shr 32) matches src/user/input_server/main.pdx
+// and src/user/input_server/route_kind.pdx precedents.
+//
+// =============================================================================
+// SECTION 1 -- FAILURE TAXONOMY (0xFFFFEB80..0xFFFFEB8F, 16 slots)
+// =============================================================================
+//
+// Fresh band, grep-verified free across src/**/*.pdx + tests/**/*.pdx.
+// Neighbours:
+//   0xFFFFEB70..7F  KIND_SEAT / KIND_INPUT_SERVER (both landed B8)
+//   0xFFFFEB80..8F  FOCUS_ROUTER    (THIS BAND)
+//   0xFFFFEB90..DF  entirely free (next fresh band for later Wave-0 rows)
+//
+// Slot map:
+//   0xFFFFEB80..83  reserved (four slots for future FR_* additions)
+//   0xFFFFEB84      FR_BAD_SEAT_MISMATCH  (future: surface not on this seat)
+//   0xFFFFEB85      FR_STALE              (future: state torn between calls)
+//   0xFFFFEB86      FR_STACK_OVERFLOW     (future: window stack ceiling)
+//   0xFFFFEB87      FR_UNCHANGED          (same window+surface as current)
+//   0xFFFFEB88      FR_NOT_INIT           (state cell not initialised)
+//   0xFFFFEB89      FR_ALREADY_INIT       (init called twice on one cell)
+//   0xFFFFEB8A      FR_REVOKE_REFUSED     (prior route revoke returned refusal)
+//   0xFFFFEB8B      FR_MINT_REFUSED       (new-route mint returned refusal)
+//   0xFFFFEB8C      FR_NULL_SURFACE       (change_focus new_surface == 0)
+//   0xFFFFEB8D      FR_NULL_WINDOW        (change_focus new_window == 0)
+//   0xFFFFEB8E      FR_NULL_STATE         (state_ptr == 0)
+//   0xFFFFEB8F      FR_NULL_SEAT          (init seat_kind_id == 0)
+//
+// FR_OK = 0 (the canonical success sentinel; matches ROUTE_KIND_OK,
+// IS_OK, and every other success code in the tree).
+
+module FocusRouter = structure {
+
+  // ==========================================================================
+  // SECTION 1.1 -- SUCCESS + FAILURE CODES
+  // ==========================================================================
+
+  pub let FR_OK                 : u64 = 0
+  pub let FR_NULL_SEAT          : u64 = 0xFFFFEB8F
+  pub let FR_NULL_STATE         : u64 = 0xFFFFEB8E
+  pub let FR_NULL_WINDOW        : u64 = 0xFFFFEB8D
+  pub let FR_NULL_SURFACE       : u64 = 0xFFFFEB8C
+  pub let FR_MINT_REFUSED       : u64 = 0xFFFFEB8B
+  pub let FR_REVOKE_REFUSED     : u64 = 0xFFFFEB8A
+  pub let FR_ALREADY_INIT       : u64 = 0xFFFFEB89
+  pub let FR_NOT_INIT           : u64 = 0xFFFFEB88
+  pub let FR_UNCHANGED          : u64 = 0xFFFFEB87
+  pub let FR_STACK_OVERFLOW     : u64 = 0xFFFFEB86
+  pub let FR_STALE              : u64 = 0xFFFFEB85
+  pub let FR_BAD_SEAT_MISMATCH  : u64 = 0xFFFFEB84
+  pub let FR_DECODE_BAD         : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ==========================================================================
+  // SECTION 1.2 -- CELL LAYOUT CONSTANTS
+  // ==========================================================================
+
+  pub let FR_CELL_BYTES         : u64 = 32
+  pub let FR_CELL_WORDS         : u64 = 4
+
+  // Byte offsets into the cell (documented for cross-module consumers;
+  // the assembly below hard-codes the same offsets as small immediates
+  // per the encoder-conservative posture that avoids MOVABS r64, imm64
+  // for constant loads).
+  pub let FR_OFF_WORD0_SEAT_WIN     : u64 = 0
+  pub let FR_OFF_WORD1_SURF_STACK   : u64 = 8
+  pub let FR_OFF_WORD2_ROUTE_RSVD   : u64 = 16
+  pub let FR_OFF_WORD3_SEQ          : u64 = 24
+
+  // ==========================================================================
+  // SECTION 1.3 -- STRUCT SHAPE (documentation-facing)
+  // ==========================================================================
+  //
+  // Declared for typed consumers and for design-doc cross-reference.
+  // The concrete byte-level accessors below match this field order (with
+  // one intermediate 4-byte pad implicit at [+20] to align the u64 at
+  // [+24]; paideia-as does not currently model intermediate padding as
+  // a struct field, mirroring InputServerFields in main.pdx §300).
+  // Consumers reading the cell as a struct should assume 32-byte size
+  // and use the FR_OFF_* offsets above rather than field-name arithmetic.
+
+  struct FocusRouterState {
+    active_seat_kind_id: u32,
+    focused_window_kind_id: u32,
+    focused_surface_kind_id: u32,
+    window_stack_head: u32,
+    active_route_kind_id: u32,
+    focus_change_seq: u64
+  }
+
+  // ==========================================================================
+  // SECTION 1.4 -- FINGERPRINT TAG (one line, legacy-suffixed)
+  // ==========================================================================
+  //
+  // pdx_kind_focus_router_meta: emitted once per successful focus change
+  // by the future dispatcher (G8-M2-004) via klog_s1. Legacy suffix
+  // convention matches tools/verify-fingerprint-coverage.sh's
+  // enumeration. Until the dispatcher wires this string into a real
+  // emission site, it is a data-only constant and needs an allowlist
+  // entry in tools/verify-fingerprint-coverage.sh with reason
+  // "focus-router dispatcher not yet landed (G8-M2-002; dispatcher at
+  // G8-M2-004)". Adding that allowlist entry is a separate landing
+  // (this file must not touch tools/), matching the posture
+  // main.pdx and route_kind.pdx already established this batch.
+  //
+  // Byte count: 55 content bytes + 1 NUL terminator = 56-byte array.
+
+  pub let pdx_kind_focus_router_meta : [u8; 56] = "focus router change ok [legacy: FOCUS ROUTER CHANGE OK]\0"
+
+  // Short field-name string constant for future debug-print use
+  // (mirrors route_kind_k_route_id / surface_commit_k_commit_id
+  // precedent).
+  pub let focus_router_k_focus_seq : [u8; 13] = "focus_seq_id\0"
+
+  // ==========================================================================
+  // SECTION 2 -- INIT FACTORY
+  // ==========================================================================
+  //
+  // focus_router_init(state_ptr, seat_kind_id, initial_window_kind_id)
+  //   -> u64 status
+  //
+  //   Populate a caller-owned FocusRouterState cell. Contract:
+  //
+  //     (1) state_ptr == 0                     -> FR_NULL_STATE
+  //     (2) seat_kind_id == 0                  -> FR_NULL_SEAT
+  //     (3) state already initialised          -> FR_ALREADY_INIT
+  //         (detected by [state + FR_OFF_WORD3_SEQ] != 0; the counter
+  //          is set to 1 on successful init and grows monotonically
+  //          thereafter, so non-zero = "seen at least one init")
+  //     (4) success: cell populated as follows and FR_OK returned:
+  //           word0[31:0]   = seat_kind_id low32
+  //           word0[63:32]  = initial_window_kind_id low32 (may be 0)
+  //           word1         = 0 (focused_surface = 0, window_stack_head = 0)
+  //           word2         = 0 (active_route = 0, reserved0 = 0)
+  //           word3         = 1 (focus_change_seq post-bump)
+  //
+  //   The natural return type is FocusRouterState (per the task shape
+  //   `focus_router_init(...) -> FocusRouterState`), but paideia-as
+  //   does not currently return structs by value from asm bodies
+  //   (mirrors the sig-compat note at src/user/input_server/main.pdx
+  //   §456 and src/user/compositor/recovery_plane_reserve.pdx line 411).
+  //   The out-of-band shape is: caller supplies a zeroed 32-byte cell,
+  //   this function populates it in place, and callers read fields via
+  //   the getters below once FR_OK is returned. A caller that wants a
+  //   fresh cell allocates one on its stack or in .bss; this file
+  //   does NOT hold a singleton because the module is per-seat, not
+  //   per-boot.
+  //
+  //   initial_window_kind_id MAY be zero: at boot no window has focus
+  //   yet, and the FIRST focus_router_change_focus call is what
+  //   establishes the first real route. Passing 0 here is a well-formed
+  //   "no initial focus" signal.
+  //
+  //   Frame: no callee-save pushes, no nested call. Entry rsp%16 == 8
+  //   stays through the body. Labels prefixed focus_router_i_.
+
+  pub let focus_router_init : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) (seat_kind_id: u64) (initial_window_kind_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G8-M2-002 (paideia-os #2278): populate a caller-owned FocusRouterState cell in place. Order: (1) state_ptr (rdi) != 0 else FR_NULL_STATE (0xFFFFEB8E). (2) seat_kind_id (rsi) != 0 else FR_NULL_SEAT (0xFFFFEB8F). (3) refuse if cell already initialised: focus_change_seq at [rdi + 24] != 0 -> FR_ALREADY_INIT (0xFFFFEB89). (4) publish: word0 = seat_kind_id low32 | (initial_window_kind_id low32 << 32); word1 = 0; word2 = 0; word3 = 1 (post-bump seq). Zero-extension of seat_kind_id and initial_window_kind_id uses shl 32 / shr 32 (no `and reg, imm64`; no MOVABS r64, imm64). No `test`, no `add reg,[mem]`, no `mov_bzx`/`mov_wzx`. Labels prefixed focus_router_i_.",
+      block: {
+        // (1) state_ptr null check
+        cmp rdi, 0;
+        je  focus_router_i_null_state;
+
+        // (2) seat_kind_id null check
+        cmp rsi, 0;
+        je  focus_router_i_null_seat;
+
+        // (3) already-init check (word3 != 0)
+        mov rax, [rdi + 24];
+        cmp rax, 0;
+        jne focus_router_i_already;
+
+        // (4) publish word0: seat_kind_id[31:0] | initial_window[63:32]
+        //     rax = seat low32
+        mov rax, rsi;
+        shl rax, 32;
+        shr rax, 32;
+        //     r10 = initial_window low32 << 32
+        mov r10, rdx;
+        shl r10, 32;
+        or  rax, r10;
+        mov [rdi + 0], rax;
+
+        // word1 = 0, word2 = 0
+        xor rax, rax;
+        mov [rdi + 8], rax;
+        mov [rdi + 16], rax;
+
+        // word3 = 1 (focus_change_seq post-bump)
+        mov rax, 1;
+        mov [rdi + 24], rax;
+
+        // return FR_OK
+        xor rax, rax;
+        ret;
+
+      focus_router_i_null_state:
+        mov rax, 0xFFFFEB8E;
+        ret;
+
+      focus_router_i_null_seat:
+        mov rax, 0xFFFFEB8F;
+        ret;
+
+      focus_router_i_already:
+        mov rax, 0xFFFFEB89;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 3 -- FOCUS CHANGE (revoke prior route, mint new route)
+  // ==========================================================================
+  //
+  // focus_router_change_focus(state_ptr, new_window, new_surface) -> u64
+  //
+  //   The core focus-follows-surface primitive. Contract:
+  //
+  //     (1) state_ptr == 0                     -> FR_NULL_STATE
+  //     (2) new_window == 0                    -> FR_NULL_WINDOW
+  //     (3) new_surface == 0                   -> FR_NULL_SURFACE
+  //     (4) (new_window, new_surface) equal to current focus
+  //                                            -> FR_UNCHANGED (no-op)
+  //     (5) if active_route_kind_id != 0, call input_route_revoke;
+  //         if the revoke returns a refusal sentinel (upper 32 bits
+  //         non-zero, matching the ROUTE_KIND_* band shape) return
+  //                                            -> FR_REVOKE_REFUSED
+  //         The active_route field is CLEARED regardless of refusal
+  //         (linear-consume invariant: after change_focus attempts a
+  //         revoke, the caller may not assume the old route is still
+  //         alive; the state cell truthfully reflects that).
+  //     (6) call input_route_mint(active_seat, new_surface); if the
+  //         mint returns a refusal sentinel (upper 32 bits non-zero)
+  //         return                             -> FR_MINT_REFUSED
+  //         In the refusal path active_route stays 0 (no route in
+  //         flight), focused_window / focused_surface remain the
+  //         PRIOR values (the caller sees a well-formed "no focus"
+  //         cell shape rather than a half-committed record).
+  //     (7) success: publish new_window, new_surface, new_route_id
+  //         into the cell; bump focus_change_seq; return FR_OK.
+  //
+  //   Linearity: the revoke happens BEFORE the mint. A caller that
+  //   observes FR_MINT_REFUSED knows the prior route is dead --
+  //   there is no state where two routes are simultaneously alive.
+  //   The window_stack_head slot is PRESERVED across change_focus
+  //   (the stack-push wiring lands with a future window-registry
+  //   milestone; this landing owns the head reference but not the
+  //   push transaction).
+  //
+  //   Frame:
+  //     - entry rsp%16 == 8 (post-ret-push).
+  //     - push rbx / r12 / r13 (three callee-save pushes) => rsp%16 == 0,
+  //       required alignment at the `call` instruction. Preserved values:
+  //         rbx = state_ptr
+  //         r12 = new_window_kind_id
+  //         r13 = new_surface_kind_id
+  //     - No fourth push needed: active_seat is re-read from the cell
+  //       (via rbx) when the mint call is prepared, rather than held
+  //       across the intervening revoke call, so three pushes suffice.
+  //     - pop r13 / r12 / rbx before ret restores caller-save state.
+  //
+  //   Labels prefixed focus_router_ch_.
+
+  pub let focus_router_change_focus : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) (new_window_kind_id: u64) (new_surface_kind_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G8-M2-002 (paideia-os #2278): focus-change primitive. Order: (1) state_ptr (rdi) != 0 else FR_NULL_STATE. (2) new_window (rsi) != 0 else FR_NULL_WINDOW. (3) new_surface (rdx) != 0 else FR_NULL_SURFACE. (4) if focused_window == new_window AND focused_surface == new_surface return FR_UNCHANGED. (5) if active_route != 0 call input_route_revoke(active_route); on refusal sentinel (upper 32 bits != 0) return FR_REVOKE_REFUSED after CLEARING active_route (linear invariant: the state cell truthfully reflects the failed revoke -- a subsequent change_focus will not attempt to revoke the dead route again). (6) call input_route_mint(active_seat, new_surface); on refusal return FR_MINT_REFUSED with focused_window / focused_surface RETAINED as prior values (no half-committed record). (7) success: publish new_window into word0[63:32], new_surface into word1[31:0], new_route into word2[31:0]; bump focus_change_seq at word3. window_stack_head at word1[63:32] preserved. Callee-save frame: push rbx / r12 / r13 (three pushes; rsp%16 -> 0 at call site). All 32-bit sentinels are imm32 sign-extended; no MOVABS. Zero-extension via shl 32 / shr 32. Labels prefixed focus_router_ch_.",
+      block: {
+        // Frame prologue: save callee-save regs and set up alignment.
+        push rbx;
+        push r12;
+        push r13;
+        // rsp%16 == 0 here. Entry rsp%16 == 8 (post-ret-push); each
+        // push subtracts 8, so after 3 pushes rsp%16 == (8 - 24) mod 16
+        // == 0, the required alignment at every `call` below.
+
+        mov rbx, rdi;                    // rbx = state_ptr
+        mov r12, rsi;                    // r12 = new_window
+        mov r13, rdx;                    // r13 = new_surface
+
+        // (1) state_ptr null check
+        cmp rbx, 0;
+        je  focus_router_ch_null_state;
+
+        // (2) new_window null check
+        cmp r12, 0;
+        je  focus_router_ch_null_window;
+
+        // (3) new_surface null check
+        cmp r13, 0;
+        je  focus_router_ch_null_surface;
+
+        // (4) unchanged-focus check:
+        //     current focused_window = word0[63:32]
+        //     current focused_surface = word1[31:0]
+        mov rax, [rbx + 0];
+        shr rax, 32;                     // rax = focused_window
+        cmp rax, r12;
+        jne focus_router_ch_do_change;
+
+        mov rax, [rbx + 8];
+        shl rax, 32;
+        shr rax, 32;                     // rax = focused_surface
+        cmp rax, r13;
+        jne focus_router_ch_do_change;
+
+        // unchanged
+        mov rax, 0xFFFFEB87;             // FR_UNCHANGED
+        jmp focus_router_ch_done;
+
+      focus_router_ch_do_change:
+        // (5) revoke prior route if any.
+        //     active_route = word2[31:0]
+        mov rax, [rbx + 16];
+        shl rax, 32;
+        shr rax, 32;                     // rax = active_route_kind_id
+        cmp rax, 0;
+        je  focus_router_ch_mint;
+
+        // Call input_route_revoke(active_route).
+        mov rdi, rax;
+        call input_route_revoke;
+        // rax = event_count (small u64; upper 32 bits zero) on success,
+        // or ROUTE_KIND_BAD_SLOT (0xFFFFEB78) / other 0xFFFFEB7x sentinel
+        // on refusal. Refusal detection: upper 32 bits non-zero.
+        mov r10, rax;
+        shr r10, 32;
+        cmp r10, 0;
+        jne focus_router_ch_revoke_refused;
+
+        // Linear-consume invariant: clear active_route slot NOW, before
+        // the mint call. If mint fails, we must not carry a stale
+        // route_id that a later change_focus would re-revoke.
+        mov rax, [rbx + 16];
+        shr rax, 32;
+        shl rax, 32;                     // preserve reserved0 [63:32]
+        mov [rbx + 16], rax;             // active_route [31:0] := 0
+
+      focus_router_ch_mint:
+        // (6) mint new route. active_seat = word0[31:0].
+        mov rdi, [rbx + 0];
+        shl rdi, 32;
+        shr rdi, 32;                     // rdi = active_seat_kind_id
+        mov rsi, r13;                    // rsi = new_surface
+        call input_route_mint;
+        // rax = new route_id (>= 1, upper 32 bits zero) on success,
+        // or ROUTE_KIND_MINT_* sentinel (upper 32 bits non-zero) on
+        // refusal.
+        mov r10, rax;
+        shr r10, 32;
+        cmp r10, 0;
+        jne focus_router_ch_mint_refused;
+
+        // (7) publish new state. Cache new_route_id in r10 across the
+        // three word rewrites (r10 is caller-save but no further calls
+        // happen before ret).
+        mov r10, rax;
+
+        // word0: preserve active_seat[31:0]; set focused_window[63:32] = r12
+        mov rax, [rbx + 0];
+        shl rax, 32;
+        shr rax, 32;                     // rax = active_seat low32
+        mov rdx, r12;
+        shl rdx, 32;                     // rdx = new_window << 32
+        or  rax, rdx;
+        mov [rbx + 0], rax;
+
+        // word1: preserve window_stack_head[63:32]; set focused_surface[31:0] = r13
+        mov rax, [rbx + 8];
+        shr rax, 32;
+        shl rax, 32;                     // rax = window_stack_head << 32
+        mov rdx, r13;
+        shl rdx, 32;
+        shr rdx, 32;                     // rdx = new_surface low32
+        or  rax, rdx;
+        mov [rbx + 8], rax;
+
+        // word2: preserve reserved0[63:32]; set active_route[31:0] = r10
+        mov rax, [rbx + 16];
+        shr rax, 32;
+        shl rax, 32;                     // rax = reserved0 << 32
+        mov rdx, r10;
+        shl rdx, 32;
+        shr rdx, 32;                     // rdx = new_route low32
+        or  rax, rdx;
+        mov [rbx + 16], rax;
+
+        // word3: bump focus_change_seq
+        mov rax, [rbx + 24];
+        add rax, 1;
+        mov [rbx + 24], rax;
+
+        xor rax, rax;                    // FR_OK
+        jmp focus_router_ch_done;
+
+      focus_router_ch_revoke_refused:
+        // Linear-consume invariant: even on refusal, clear the active
+        // route slot so the state cell does not carry a stale route_id
+        // that a subsequent change_focus would try to revoke a second
+        // time. Preserve reserved0[63:32].
+        mov rax, [rbx + 16];
+        shr rax, 32;
+        shl rax, 32;
+        mov [rbx + 16], rax;
+        mov rax, 0xFFFFEB8A;             // FR_REVOKE_REFUSED
+        jmp focus_router_ch_done;
+
+      focus_router_ch_mint_refused:
+        // On mint refusal, active_route is already 0 (the pre-mint
+        // revoke cleared it, or it was 0 to begin with). Do not touch
+        // focused_window / focused_surface -- the prior values remain
+        // authoritative for the "what was the last known good focus?"
+        // query the caller may issue after refusal.
+        mov rax, 0xFFFFEB8B;             // FR_MINT_REFUSED
+        jmp focus_router_ch_done;
+
+      focus_router_ch_null_state:
+        mov rax, 0xFFFFEB8E;             // FR_NULL_STATE
+        jmp focus_router_ch_done;
+
+      focus_router_ch_null_window:
+        mov rax, 0xFFFFEB8D;             // FR_NULL_WINDOW
+        jmp focus_router_ch_done;
+
+      focus_router_ch_null_surface:
+        mov rax, 0xFFFFEB8C;             // FR_NULL_SURFACE
+        // fallthrough
+
+      focus_router_ch_done:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 4 -- CURRENT-FOCUS QUERY (packed return)
+  // ==========================================================================
+  //
+  // focus_router_current_focus(state_ptr) -> u64 packed:
+  //
+  //   rax[63:32] = focused_window_kind_id
+  //   rax[31:0]  = focused_surface_kind_id
+  //
+  // The natural return shape is (window_kind_id, surface_kind_id) per
+  // the task signature; paideia-as does not currently return tuples by
+  // value from asm bodies, so we pack the pair into one u64 the same
+  // way route_kind_seat_surface_pack packs (seat, surface) at
+  // src/user/input_server/route_kind.pdx §356. Callers unpack via
+  // (rax >> 32) for window and (rax & 0xFFFFFFFF) for surface. The
+  // getters at Section 5 provide the same values one field at a time
+  // for callers that prefer the un-packed shape.
+  //
+  // On state_ptr == 0 the function returns FR_NULL_STATE (0xFFFFEB8E);
+  // the caller distinguishes this from a legitimate "no focus" cell
+  // (both halves 0) by the top bits (upper 32 of FR_NULL_STATE are
+  // 0xFFFFFFFF sign-extended from the imm32, so any refusal sentinel
+  // is distinguishable from a well-formed (window, surface) pack whose
+  // upper half is at most a 32-bit kind_id).
+  //
+  // Labels prefixed focus_router_cu_.
+
+  pub let focus_router_current_focus : (u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G8-M2-002 (paideia-os #2278): packed (window, surface) query. rax[63:32] = focused_window from word0[63:32]; rax[31:0] = focused_surface from word1[31:0]. Zero-extension via shl 32 / shr 32. On state_ptr == 0 return FR_NULL_STATE (0xFFFFEB8E) so the caller can distinguish `null pointer` from a well-formed `no focus` cell (both halves 0). Labels prefixed focus_router_cu_.",
+      block: {
+        cmp rdi, 0;
+        je  focus_router_cu_null;
+
+        // rax = focused_window << 32
+        mov rax, [rdi + 0];
+        shr rax, 32;
+        shl rax, 32;
+
+        // r10 = focused_surface (low32 zero-ext)
+        mov r10, [rdi + 8];
+        shl r10, 32;
+        shr r10, 32;
+
+        or  rax, r10;
+        ret;
+
+      focus_router_cu_null:
+        mov rax, 0xFFFFEB8E;             // FR_NULL_STATE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 5 -- UNPACKED GETTERS
+  // ==========================================================================
+  //
+  // Convenience readers for callers that want one field at a time.
+  // Every getter returns 0 on state_ptr == 0 (no distinct null sentinel:
+  // a null cell reads as an all-zeros cell for the purposes of these
+  // observers; callers that need to distinguish should call
+  // focus_router_is_init below or use focus_router_current_focus which
+  // does return FR_NULL_STATE). Encoder-conservative: no MOVABS, no
+  // `and reg, imm64`, no `test`.
+
+  pub let focus_router_get_active_seat : (u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G8-M2-002 (paideia-os #2278): read active_seat_kind_id from word0[31:0]. On state_ptr == 0 return 0 (null-cell reads as all-zeros; use focus_router_is_init for null-vs-uninitialised discrimination). Labels prefixed focus_router_gs_.",
+      block: {
+        cmp rdi, 0;
+        je  focus_router_gs_null;
+        mov rax, [rdi + 0];
+        shl rax, 32;
+        shr rax, 32;
+        ret;
+      focus_router_gs_null:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let focus_router_get_focused_window : (u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G8-M2-002 (paideia-os #2278): read focused_window_kind_id from word0[63:32]. Labels prefixed focus_router_gw_.",
+      block: {
+        cmp rdi, 0;
+        je  focus_router_gw_null;
+        mov rax, [rdi + 0];
+        shr rax, 32;
+        ret;
+      focus_router_gw_null:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let focus_router_get_focused_surface : (u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G8-M2-002 (paideia-os #2278): read focused_surface_kind_id from word1[31:0]. Labels prefixed focus_router_gu_.",
+      block: {
+        cmp rdi, 0;
+        je  focus_router_gu_null;
+        mov rax, [rdi + 8];
+        shl rax, 32;
+        shr rax, 32;
+        ret;
+      focus_router_gu_null:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let focus_router_get_window_stack_head : (u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G8-M2-002 (paideia-os #2278): read window_stack_head from word1[63:32]. Labels prefixed focus_router_gh_.",
+      block: {
+        cmp rdi, 0;
+        je  focus_router_gh_null;
+        mov rax, [rdi + 8];
+        shr rax, 32;
+        ret;
+      focus_router_gh_null:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let focus_router_get_active_route : (u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G8-M2-002 (paideia-os #2278): read active_route_kind_id from word2[31:0]. Labels prefixed focus_router_gr_.",
+      block: {
+        cmp rdi, 0;
+        je  focus_router_gr_null;
+        mov rax, [rdi + 16];
+        shl rax, 32;
+        shr rax, 32;
+        ret;
+      focus_router_gr_null:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let focus_router_get_focus_seq : (u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G8-M2-002 (paideia-os #2278): read focus_change_seq (full u64) from word3. Labels prefixed focus_router_gq_.",
+      block: {
+        cmp rdi, 0;
+        je  focus_router_gq_null;
+        mov rax, [rdi + 24];
+        ret;
+      focus_router_gq_null:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 6 -- INIT PREDICATE
+  // ==========================================================================
+  //
+  // focus_router_is_init(state_ptr) -> 1 iff the cell has been
+  // initialised (word3 focus_change_seq != 0), else 0. On state_ptr == 0
+  // returns 0 (a null pointer is not initialised by definition; there
+  // is no sentinel distinguishing null-pointer from uninitialised-cell
+  // because both are equivalent for the "may I call change_focus?"
+  // question). Labels prefixed focus_router_is_.
+
+  pub let focus_router_is_init : (u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G8-M2-002 (paideia-os #2278): 1 iff word3 (focus_change_seq) at [state_ptr + 24] is non-zero. state_ptr == 0 short-circuits to 0. Labels prefixed focus_router_is_.",
+      block: {
+        cmp rdi, 0;
+        je  focus_router_is_no;
+        mov rax, [rdi + 24];
+        cmp rax, 0;
+        je  focus_router_is_no;
+        mov rax, 1;
+        ret;
+      focus_router_is_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 7 -- DEFENSIVE RESET
+  // ==========================================================================
+  //
+  // focus_router_reset(state_ptr) -> ()
+  //
+  // Zero all four words. Mirrors input_server_reset in main.pdx and the
+  // rp_init reset in recovery_plane_reserve.pdx. Safe to call before
+  // focus_router_init to guarantee a clean slate when the backing cell
+  // is not in .bss (e.g. a stack scratch or an arena allocation the
+  // caller wants to re-use). No effect on state_ptr == 0 (returns
+  // without touching memory).
+  //
+  // Labels prefixed focus_router_r_.
+
+  pub let focus_router_reset : (u64) -> () !{mem} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "G8-M2-002 (paideia-os #2278): zero the four u64 words of a FocusRouterState cell. state_ptr == 0 -> no-op ret. Labels prefixed focus_router_r_.",
+      block: {
+        cmp rdi, 0;
+        je  focus_router_r_done;
+        xor rax, rax;
+        mov [rdi + 0],  rax;
+        mov [rdi + 8],  rax;
+        mov [rdi + 16], rax;
+        mov [rdi + 24], rax;
+      focus_router_r_done:
+        ret
+      }
+    }
+}

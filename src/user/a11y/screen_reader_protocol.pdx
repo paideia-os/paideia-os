@@ -1,0 +1,1217 @@
+// src/user/a11y/screen_reader_protocol.pdx -- Wave0-B9-09 (paideia-os #2308)
+//
+// SCREEN READER <-> COMPOSITOR PROTOCOL SHIM (LOGIC MODULE).
+//
+// Companion / precedent:
+//   * src/user/a11y/tree_kind.pdx (Wave0-B8-03, paideia-os #2302) defines
+//     KIND_A11Y_TREE = 0x1D3 and its subscribe binding (§L,
+//     a11y_tree_subscribe). This file lives one layer above that binding:
+//     given a screen-reader client that already holds RIGHT_SUBSCRIBE on a
+//     KIND_A11Y_TREE row, this module records the subscription in a
+//     dedicated row pool and buffers push-events (tree/focus/node/tree-
+//     destroyed) between the compositor and the client's read loop.
+//   * The sibling KIND_A11Y_TREE row itself only stores ONE
+//     subscriber_kind_id in its subscriber_ref word (tree_kind.pdx §L);
+//     THIS file is where a subscription's lifetime, event queue, drop
+//     backpressure state and unsubscribe LINEAR consume live. A future
+//     KIND_A11Y_SUBSCRIBER_SET derivation (per tree_kind.pdx §2 sealed
+//     discipline) would replace the one-slot row-side field, at which
+//     point this module's row pool becomes the backing store for the
+//     multi-subscriber set.
+//
+// =============================================================================
+// SECTION 0  WHY THIS MODULE EXISTS
+// =============================================================================
+//
+// AT-SPI (the AccessKit / GNOME lineage's protocol for wiring screen
+// readers to toolkit trees) is transported over D-Bus. Every event is a
+// D-Bus message with a UNIX-domain-socket round trip, a marshalling
+// pass, a subscriber-list scan, and a per-subscriber dispatch. The
+// PaideiaOS clean-slate a11y posture (design/compositor/pwp-spec-
+// vocabulary.md §2.6 + §2.21) refuses that shape at architectural altitude:
+//
+//   * D-Bus is ambient-authority ("if you can talk on the bus, you can
+//     enumerate a11y trees"). AT-SPI's own mitigation is a Registry
+//     Daemon that gate-keeps subscriptions, which is a service to be
+//     compromised rather than an authority the kernel enforces.
+//     PaideiaOS makes the SUBSCRIBE gate itself a capability
+//     (R_A11Y_SUBSCRIBE on the target KIND_A11Y_TREE cap; see
+//     tree_kind.pdx §A). This module's screen_reader_subscribe body
+//     runs ONLY on a caller that already holds that right; the
+//     compositor is the gate-keeper, but the gate is a cap check the
+//     kernel can NEVER be talked into skipping.
+//
+//   * D-Bus is a request/response protocol layered under the a11y
+//     event stream; every event is a synchronous IPC. That is the
+//     ambient tax the PaideiaOS shape refuses: this module models a
+//     PUSH protocol -- the compositor's mutation site (append_node,
+//     update_state, revoke) calls screen_reader_push_event directly
+//     and the client polls with screen_reader_pop_event when its own
+//     read loop wakes. No round trip, no marshalling, no per-event
+//     capability check (the subscription itself IS the standing cap
+//     to receive its events).
+//
+//   * D-Bus has no backpressure story: a slow client causes the bus
+//     daemon to grow its queues unboundedly or to disconnect the
+//     client with an obscure timeout. This module owns a per-
+//     subscription bounded ring buffer (SR_QUEUE_MAX slots) plus a
+//     monotone dropped_event_count that the client reads on every
+//     pop -- an explicit backpressure signal the screen reader can
+//     surface to the user ("N events dropped since last read; tree
+//     may have desynchronised, invalidate and re-walk"). Dropping is
+//     a first-class outcome, not a silent buffer growth.
+//
+// This is a NOVEL-CLEAN DESIGN choice: capability-scoped push protocol
+// with an explicit drop signal, instead of an ambient-authority bus
+// with unbounded queues. It costs one bounded-arena allocation
+// (SR_MAX_SUBSCRIPTIONS rows * SR_QUEUE_MAX slots * 8 bytes = 4 * 32 *
+// 8 = 1 KB of arena at Wave 0 fidelity) and buys a story where a
+// misbehaving screen reader cannot exhaust the compositor's memory,
+// cannot silently lose events, and cannot subscribe to a tree it has
+// no capability to observe.
+//
+// LOGIC MODULE, NOT A KIND-CAP.  Unlike tree_kind.pdx (which mints
+// derived KIND_A11Y_TREE rows through the kernel's cap dispatch), this
+// module lives entirely on the compositor side of the ring boundary
+// (userland supervisor at ring 3). It exposes no cap-substrate mint
+// gate, no rights word of its own, and is not wired into cap_table.
+// The caller-side authority is entirely R_A11Y_SUBSCRIBE on the
+// target KIND_A11Y_TREE, checked by the compositor's dispatch shim
+// BEFORE it invokes screen_reader_subscribe. A future promotion of
+// screen-reader subscription authority INTO the kernel (to make
+// subscription-holding a compositor-crash-survivable invariant
+// carried by the recovery plane at KIND_RECOVERY_PLANE = 0x1C8)
+// would move the row pool + event ring into
+// src/kernel/core/cap/kind_screen_reader_sub.pdx; nothing here
+// prevents that promotion.
+//
+// =============================================================================
+// SECTION 1  MODULE POSTURE
+// =============================================================================
+//
+// No KIND_* slot is allocated for this module (§0 rationale). No parent
+// kind, no rights word. The subscription_id returned by
+// screen_reader_subscribe is a row_id in this module's pool
+// (0..SR_MAX_SUBSCRIPTIONS-1) rather than a KIND-cap ordinal, which
+// the compositor stores in its per-client bookkeeping and passes back
+// on every push_event / pop_event / unsubscribe call.
+//
+// The subscription pool is bounded (SR_MAX_SUBSCRIPTIONS = 4 at
+// Wave 0 fidelity, matching tree_kind.pdx's A11Y_MAX row-pool bound).
+// A subscribe request that finds the pool full is refused with
+// SR_TAIL_ENOSPC, mirroring a11y_tree_row_alloc's own enospc funnel.
+//
+// =============================================================================
+// SECTION 2  ROW LAYOUT  (64 BYTES = ONE CACHE LINE)
+// =============================================================================
+//
+// One row per live screen-reader subscription. The per-row event ring
+// (SR_QUEUE_MAX * 8 = 256 bytes) lives in a sibling arena (§3).
+//
+//   [+0]  row_hdr:       in_use[63:56] | subscriber_kind_id[31:0]
+//                                       | reserved[55:32]
+//   [+8]  tree_ref:      tree_kind_id[31:0] | reserved[63:32]
+//                        -- the KIND_A11Y_TREE row this subscription
+//                           is bound to.  Populated at subscribe;
+//                           never mutated.
+//   [+16] queue_ptrs:    event_queue_head[31:0]
+//                                       | event_queue_tail[63:32]
+//                        -- monotone u32 counters (NOT indexes).
+//                           head advances on pop; tail advances on
+//                           push; empty iff head == tail; full iff
+//                           tail - head == SR_QUEUE_MAX; the slot
+//                           index is `counter & (SR_QUEUE_MAX-1)`.
+//                           Wraparound at u32 max is 2^32/32 = 2^27
+//                           subscription-lifetime events, far above
+//                           any real user session; the arithmetic
+//                           still works past that point because
+//                           (tail - head) is computed modulo 2^32
+//                           and every valid queue depth <= 32.
+//   [+24] dropped_event_count: u64
+//                        -- monotone u64 counter, bumped on every
+//                           push_event that finds the queue full.
+//                           The client reads this on every pop_event
+//                           to surface an explicit backpressure
+//                           signal to the user (see §0).
+//   [+32..+56] reserved (four u64s of headroom for a future landing
+//              that adds e.g. last-focus-node hint or per-event
+//              filter mask without a row-shape break).
+//
+// SR_MAX_SUBSCRIPTIONS = 4 rows * 64 bytes = 256 bytes = 32 u64.
+//
+// =============================================================================
+// SECTION 3  EVENT-RING LAYOUT  (PER-ROW STORAGE)
+// =============================================================================
+//
+// One ring backs one subscription. Ring stride = SR_QUEUE_MAX *
+// SR_QUEUE_SLOT_BYTES = 32 * 8 = 256 bytes per subscription.
+// SR_MAX_SUBSCRIPTIONS * 256 = 1024 bytes of ring .bss (= 128 u64).
+//
+// Each slot is one packed u64:
+//
+//   [+0]  event_word:  event_kind[7:0] | node_id[39:8] | reserved[63:40]
+//
+// The high 24 bits [63:40] MUST stay zero on every push so the caller
+// of pop_event can distinguish a valid packed event (bits [63:40] == 0)
+// from the SR_EMPTY sentinel (0xFFFFFFFFFFFFFFFF, all bits set). This
+// discriminator matters because node_id is a full u32 -- there is no
+// spare bit inside the packed word to signal "empty" as a valid
+// value.
+//
+// =============================================================================
+// SECTION 4  EVENT ENUM
+// =============================================================================
+//
+//   SR_TREE_UPDATED   (=0)  -- the tree_version_seq bumped; the client
+//                              re-walks affected subtrees.  node_id
+//                              carries the deepest known-changed
+//                              subtree root (or A11Y_INDEX_NONE if
+//                              the whole tree needs re-walking).
+//   SR_FOCUS_CHANGED  (=1)  -- focused-node changed; node_id carries
+//                              the new focused node ordinal.  Emitted
+//                              when a11y_tree_update_state toggles
+//                              STATE_FOCUSED on a node.
+//   SR_NODE_DESTROYED (=2)  -- a specific node was removed from the
+//                              tree.  node_id carries the destroyed
+//                              node ordinal.  (A11Y_INDEX_NONE
+//                              signals "whole subtree destroyed at
+//                              an unspecified root" for callers that
+//                              want a coalesced hint.)
+//   SR_TREE_DESTROYED (=3)  -- the whole tree is gone (window revoke,
+//                              §M of tree_kind.pdx).  node_id is
+//                              ignored; screen reader tears down the
+//                              subscription immediately and MUST call
+//                              screen_reader_unsubscribe.
+//
+// SR_EVENT_MAX = 3 gates the encoder: event_kind > 3 refuses the
+// push with SR_BAD_EVENT so a caller cannot smuggle garbage into the
+// [39:8] window via a wrong-width event tag.
+//
+// =============================================================================
+// SECTION 5  FAILURE TAXONOMY  0xFFFFEBF0..0xFFFFEBF8
+// =============================================================================
+//
+// The task-row hint was 0xFFFFEBF0..0xFFFFEBFF but a repo-wide grep at
+// landing time (`grep -rhoE '0xFFFFEB[0-9A-Fa-f]{2}' src/`) shows
+// 0xFFFFEBF9..0xFFFFEBFF already claimed by src/kernel/core/ipc/
+// elevate_broker.pdx (ELVB_REGISTER_*, ELVB_DISPATCH_* at
+// R48-PREP-005.M2 landing). Following the a11y_tree.pdx §5 precedent
+// -- which noted its task-row hint at 0xFFFFEB20..2F was already
+// claimed and the grep-verify note authorized selecting the free
+// portion of the band -- this landing uses the free sub-band
+// 0xFFFFEBF0..0xFFFFEBF8 (9 slots), which is sufficient for the
+// module's small failure surface. The band remains adjacent to the
+// a11y-tree neighborhood (0xFFFFEB70..7F) so the wider a11y row
+// stays contiguous in the EBxx page.
+//
+//   SR_OK             = 0                (canonical success)
+//   SR_QUEUE_FULL     = 0xFFFFEBF8       (push dropped -- not an error;
+//                                         caller reads dropped_event_count
+//                                         to quantify since last pop)
+//   SR_UNSUB_ALREADY  = 0xFFFFEBF7       (unsubscribe on a freed row)
+//   SR_BAD_EVENT      = 0xFFFFEBF6       (event_kind > SR_EVENT_MAX(3))
+//   SR_BAD_SUBSCRIBER = 0xFFFFEBF5       (subscriber_kind_id == 0
+//                                         or > u32-max)
+//   SR_BAD_TREE       = 0xFFFFEBF4       (tree_kind_id == 0
+//                                         or > u32-max)
+//   SR_BAD_SLOT       = 0xFFFFEBF3       (subscription_id >= SR_MAX
+//                                         or row not in_use)
+//   SR_TAIL_ENOSPC    = 0xFFFFEBF2       (subscribe pool full)
+//   SR_EMPTY          = 0xFFFFFFFFFFFFFFFF (pop on empty ring;
+//                                          all-bits-set so distinct
+//                                          from any valid packed event
+//                                          whose bits [63:40] are
+//                                          zero -- see §3)
+//   SR_DECODE_BAD     = 0xFFFFFFFFFFFFFFFF (aliased with SR_EMPTY
+//                                          intentionally: both denote
+//                                          "no meaningful packed
+//                                          event to decode"; a caller
+//                                          treating them as one is
+//                                          correct)
+//
+// =============================================================================
+// SECTION 6  FUNCTION CATALOGUE
+// =============================================================================
+//
+//   screen_reader_subscribe(subscriber_kind_id, tree_kind_id)
+//                                       -> subscription_id | error
+//     -- Allocates a row bound to (subscriber, tree). The caller has
+//        already been gated for R_A11Y_SUBSCRIBE on the tree by the
+//        compositor's dispatch shim; this body validates the ids are
+//        nonzero + u32-fitting and claims a pool slot.
+//
+//   screen_reader_push_event(subscription_id, event_kind, node_id)
+//                                       -> SR_OK | SR_QUEUE_FULL
+//                                        | SR_BAD_SLOT | SR_BAD_EVENT
+//     -- Enqueues one event.  On full queue: bumps dropped_event_count
+//        and returns SR_QUEUE_FULL (not an error -- the caller need
+//        not roll back).  Only the compositor calls push_event; the
+//        screen reader is the pop side.
+//
+//   screen_reader_pop_event(subscription_id) -> packed_word | SR_EMPTY
+//     -- Dequeues one event.  packed_word = event_kind[7:0] |
+//        node_id[39:8].  On empty ring OR invalid subscription_id
+//        returns SR_EMPTY (all-ones); the caller's discriminator is
+//        `rax == -1` because a valid packed event always has
+//        bits [63:40] == 0.  A bad subscription_id folding to
+//        SR_EMPTY is the safe fallback -- a screen reader with a
+//        stale sub_id sees an empty queue and eventually notices
+//        via its dropped_event_count read or its own bookkeeping.
+//
+//   screen_reader_unsubscribe(subscription_id) -> SR_OK
+//                                              | SR_BAD_SLOT
+//                                              | SR_UNSUB_ALREADY
+//     -- LINEAR consume: frees the row.  A second call on the same
+//        subscription_id returns SR_UNSUB_ALREADY (idempotent from
+//        the caller's perspective but the counter distinguishes so
+//        a client can detect a double-unsubscribe bug).
+//
+// =============================================================================
+// SECTION 7  FINGERPRINT
+// =============================================================================
+//
+// One tag ending `[legacy: SCREEN READER PROTOCOL META OK]` per softarch
+// discipline (see feedback_paideia_as_reserved_labels-adjacent convention
+// used by kind_tls_trust / kind_tui_canvas / kind_layer_tree /
+// a11y/tree_kind). Data-only at this landing; needs allowlisting in
+// tools/verify-fingerprint-coverage.sh with reason
+// "screen_reader_protocol meta emit body not yet landed (Wave0-B9-09
+// #2308)" until a future landing wires an emit site into
+// screen_reader_subscribe's success tail via klog_s1_x1. Allowlist
+// wire-up is a separate landing per the batch's file-touch discipline
+// (this landing is ONE file only).
+//
+// LABEL PREFIX: `screen_reader_protocol_` throughout -- avoids paideia-as
+// reserved-keyword collisions per feedback_paideia_as_reserved_labels;
+// all ASM jump targets are `screen_reader_protocol_<tag>`.
+
+module ScreenReaderProtocol = structure {
+
+  // ==========================================================================
+  // SECTION A  Identity + event enum + sizing + failure taxonomy.
+  // ==========================================================================
+
+  // Row-pool + ring sizing.
+  pub let SR_MAX_SUBSCRIPTIONS : u64 = 4              // subscription rows.
+  pub let SR_ROW_BYTES         : u64 = 64             // one cache line.
+  pub let SR_QUEUE_MAX         : u64 = 32             // events per ring.
+  pub let SR_QUEUE_MASK        : u64 = 31             // (SR_QUEUE_MAX-1); &-mask.
+  pub let SR_QUEUE_SLOT_BYTES  : u64 = 8              // one packed u64.
+  pub let SR_QUEUE_STRIDE      : u64 = 256            // 32 * 8 = per-ring bytes.
+
+  // Row byte offsets (within a 64-byte row).
+  pub let SR_ROW_OFF_HDR        : u64 = 0     // in_use | subscriber_kind_id
+  pub let SR_ROW_OFF_TREE_REF   : u64 = 8     // tree_kind_id
+  pub let SR_ROW_OFF_QUEUE_PTR  : u64 = 16    // head | tail
+  pub let SR_ROW_OFF_DROPPED    : u64 = 24    // dropped_event_count
+
+  // ScreenReaderEvent enum -- SR_EVENT_MAX gates encoder input.
+  pub let SR_TREE_UPDATED    : u64 = 0
+  pub let SR_FOCUS_CHANGED   : u64 = 1
+  pub let SR_NODE_DESTROYED  : u64 = 2
+  pub let SR_TREE_DESTROYED  : u64 = 3
+  pub let SR_EVENT_MAX       : u64 = 3
+
+  // Sentinel: SR_INDEX_NONE mirrors A11Y_INDEX_NONE for the "no
+  // specific node" pop_event contract (see §4 SR_NODE_DESTROYED,
+  // SR_TREE_UPDATED). Callers reading a packed word check the
+  // node_id portion against this sentinel to detect the
+  // coalesced-subtree hint.
+  pub let SR_INDEX_NONE      : u64 = 0xFFFFFFFF
+
+  // Failure taxonomy -- 0xFFFFEBF0..0xFFFFEBF8 (see file header §5).
+  pub let SR_OK              : u64 = 0
+  pub let SR_QUEUE_FULL      : u64 = 0xFFFFEBF8
+  pub let SR_UNSUB_ALREADY   : u64 = 0xFFFFEBF7
+  pub let SR_BAD_EVENT       : u64 = 0xFFFFEBF6
+  pub let SR_BAD_SUBSCRIBER  : u64 = 0xFFFFEBF5
+  pub let SR_BAD_TREE        : u64 = 0xFFFFEBF4
+  pub let SR_BAD_SLOT        : u64 = 0xFFFFEBF3
+  pub let SR_TAIL_ENOSPC     : u64 = 0xFFFFEBF2
+
+  // Empty / decode sentinels -- all-bits-set (see §3, §5).
+  pub let SR_EMPTY           : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let SR_DECODE_BAD      : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // Stats channels (four u64s of counters, bounds-checked against 4).
+  pub let SRP_ST_SUBSCRIBES   : u64 = 0
+  pub let SRP_ST_UNSUBSCRIBES : u64 = 1
+  pub let SRP_ST_DROPPED      : u64 = 2
+  pub let SRP_ST_REFUSED      : u64 = 3
+
+  // ==========================================================================
+  // SECTION B  State cells.
+  // ==========================================================================
+
+  // Subscription-row pool. SR_MAX_SUBSCRIPTIONS rows * 64 bytes = 256 bytes
+  // = 32 u64.
+  pub let mut _screen_reader_protocol_rows   : [u64; 32]  = uninit @align(64)
+
+  // Per-row event ring. SR_MAX_SUBSCRIPTIONS rings * 256 bytes = 1024 bytes
+  // = 128 u64. Ring i backs row i under the 1-to-1 slot rule (mirrors
+  // tree_kind's row/arena pairing at §G).
+  pub let mut _screen_reader_protocol_queues : [u64; 128] = uninit @align(64)
+
+  // Global stats. Bounds-checked against 4 in _stats_bump / _stats_read.
+  pub let mut _screen_reader_protocol_stats  : [u64; 4]   = uninit @align(64)
+
+  // Fingerprint tag. Data-only at this landing; needs allowlisting in
+  // tools/verify-fingerprint-coverage.sh with reason
+  // "screen_reader_protocol meta emit body not yet landed (Wave0-B9-09
+  // #2308)" until a future landing wires an emit site into
+  // screen_reader_subscribe's success tail.
+  //
+  // "pdx kind screen reader protocol meta [legacy: SCREEN READER
+  //  PROTOCOL META OK]\0" = 77 bytes of payload + 1 NUL = 78 bytes.
+  pub let pdx_kind_screen_reader_protocol_meta : [u8; 78] = "pdx kind screen reader protocol meta [legacy: SCREEN READER PROTOCOL META OK]\0"
+
+  // ==========================================================================
+  // SECTION C  Validators (subscribe-time / push-time).
+  // ==========================================================================
+
+  // screen_reader_protocol_subscriber_valid(id) -> 1 iff id in (0, 2^32).
+  // Mirrors a11y_tree_window_valid's nonzero-plus-u32-fit shape.
+  pub let screen_reader_protocol_subscriber_valid : (u64) -> u64 !{} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): 1 iff subscriber_kind_id in (0, 2^32). Zero refuses a free-floating subscription (there must be an owning screen-reader cap); >u32 refuses garbage. Labels prefixed screen_reader_protocol_sv_.",
+      block: {
+        cmp rdi, 0;
+        je  screen_reader_protocol_sv_no;
+        mov r10, 0xFFFFFFFF;
+        cmp rdi, r10;
+        ja  screen_reader_protocol_sv_no;
+        mov rax, 1;
+        ret;
+      screen_reader_protocol_sv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_protocol_tree_valid(id) -> 1 iff id in (0, 2^32).
+  // Same shape as _subscriber_valid; separate name for callsite clarity.
+  pub let screen_reader_protocol_tree_valid : (u64) -> u64 !{} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): 1 iff tree_kind_id in (0, 2^32). Zero refuses a free-floating subscription (a subscription must be bound to some KIND_A11Y_TREE row); >u32 refuses garbage. Labels prefixed screen_reader_protocol_tv_.",
+      block: {
+        cmp rdi, 0;
+        je  screen_reader_protocol_tv_no;
+        mov r10, 0xFFFFFFFF;
+        cmp rdi, r10;
+        ja  screen_reader_protocol_tv_no;
+        mov rax, 1;
+        ret;
+      screen_reader_protocol_tv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_protocol_event_valid(ev) -> 1 iff ev <= SR_EVENT_MAX(3).
+  // Rejects garbage that would corrupt the [7:0] byte of the packed
+  // queue slot, or (worse) mislead the pop-side dispatcher after a
+  // future enum extension shifts the ordinals.
+  pub let screen_reader_protocol_event_valid : (u64) -> u64 !{} @{} =
+    fn (ev: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): 1 iff ev in [0, SR_EVENT_MAX(3)]. Labels prefixed screen_reader_protocol_ev_.",
+      block: {
+        mov r10, 3;
+        cmp rdi, r10;
+        ja  screen_reader_protocol_ev_no;
+        mov rax, 1;
+        ret;
+      screen_reader_protocol_ev_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION D  Packers (row header + queue-slot encoders).
+  // ==========================================================================
+
+  // screen_reader_protocol_pack_row_hdr(subscriber_kind_id) -> hdr word.
+  // in_use[63:56] is left zero; the alloc path sets it. subscriber_kind_id
+  // sits at [31:0] (u32-masked). Reserved bits [55:32] remain zero.
+  pub let screen_reader_protocol_pack_row_hdr : (u64) -> u64 !{} @{} =
+    fn (subscriber_kind_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): pack row header. subscriber_kind_id at [31:0] (u32 masked); in_use bit is stamped by _row_alloc's success tail. Labels prefixed screen_reader_protocol_phr_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFFFFFFFF;
+        ret
+      }
+    }
+
+  // screen_reader_protocol_pack_queue_slot(event_kind, node_id)
+  //     -> event_kind[7:0] | node_id[39:8].
+  // Reserved bits [63:40] remain zero so pop_event's caller can
+  // distinguish a valid packed word from SR_EMPTY (all-bits-set).
+  pub let screen_reader_protocol_pack_queue_slot : (u64, u64) -> u64 !{} @{} =
+    fn (event_kind: u64) (node_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): pack queue slot. event_kind masked to u8 at [7:0]; node_id masked to u32 then shifted to [39:8]. Reserved bits [63:40] remain zero -- load-bearing for pop_event's SR_EMPTY discriminator (see file header §3). Labels prefixed screen_reader_protocol_pqs_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFF;
+        mov r10, rsi;
+        and r10, 0xFFFFFFFF;
+        shl r10, 8;
+        or  rax, r10;
+        ret
+      }
+    }
+
+  // screen_reader_protocol_pack_queue_ptrs(head, tail) ->
+  //     head[31:0] | tail[63:32].
+  pub let screen_reader_protocol_pack_queue_ptrs : (u64, u64) -> u64 !{} @{} =
+    fn (head: u64) (tail: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): pack (head, tail) into queue_ptrs word. Both masked to u32. Labels prefixed screen_reader_protocol_pqp_.",
+      block: {
+        mov rax, rdi;
+        and rax, 0xFFFFFFFF;
+        mov r10, rsi;
+        and r10, 0xFFFFFFFF;
+        shl r10, 32;
+        or  rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION E  Row + ring address arithmetic.
+  //
+  // Row base   = _screen_reader_protocol_rows   + row_id * 64  (shl 6)
+  // Ring base  = _screen_reader_protocol_queues + row_id * 256 (shl 8)
+  // Slot addr  = ring_base + (idx & SR_QUEUE_MASK) * 8         (shl 3)
+  //
+  // All strides are powers of two so no imul is emitted; every offset
+  // multiply folds to a single shl. Encoder-conservative per the file's
+  // no-imul-when-shl-suffices convention.
+  // ==========================================================================
+
+  // screen_reader_protocol_row_base(row_id) -> ptr | 0.
+  pub let screen_reader_protocol_row_base : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): row base pointer = _screen_reader_protocol_rows + row_id * 64. Bounds-checked against SR_MAX_SUBSCRIPTIONS(4); OOB returns 0 (caller compares against zero before dereferencing). Labels prefixed screen_reader_protocol_rb_.",
+      block: {
+        mov r10, 4;
+        cmp rdi, r10;
+        jae screen_reader_protocol_rb_no;
+        lea r10, [rip + _screen_reader_protocol_rows];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, r10;
+        ret;
+      screen_reader_protocol_rb_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_protocol_queue_base(row_id) -> ptr | 0.
+  pub let screen_reader_protocol_queue_base : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): ring base pointer = _screen_reader_protocol_queues + row_id * 256. Bounds-checked against SR_MAX_SUBSCRIPTIONS(4); OOB returns 0. Labels prefixed screen_reader_protocol_qb_.",
+      block: {
+        mov r10, 4;
+        cmp rdi, r10;
+        jae screen_reader_protocol_qb_no;
+        lea r10, [rip + _screen_reader_protocol_queues];
+        mov r11, rdi;
+        shl r11, 8;
+        add r10, r11;
+        mov rax, r10;
+        ret;
+      screen_reader_protocol_qb_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_protocol_slot_addr(queue_base, counter) -> slot ptr.
+  // The counter (monotone u32) is masked to SR_QUEUE_MASK(31) before
+  // being multiplied by 8. Caller MUST have validated queue_base != 0.
+  pub let screen_reader_protocol_slot_addr : (u64, u64) -> u64 !{} @{} =
+    fn (queue_base: u64) (counter: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): slot address = queue_base + (counter & 31) * 8. shl 3 for the *8 (encoder-conservative). Labels prefixed screen_reader_protocol_sa_.",
+      block: {
+        mov rax, rdi;
+        mov r10, rsi;
+        and r10, 31;
+        shl r10, 3;
+        add rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION F  Row field accessors (read-side).
+  // ==========================================================================
+
+  pub let screen_reader_protocol_row_subscriber : (u64) -> u64 !{mem} @{} =
+    fn (row_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): read subscriber_kind_id from row_hdr[31:0]. Labels prefixed screen_reader_protocol_rs_.",
+      block: {
+        mov rax, [rdi + 0];
+        and rax, 0xFFFFFFFF;
+        ret
+      }
+    }
+
+  pub let screen_reader_protocol_row_tree_kind : (u64) -> u64 !{mem} @{} =
+    fn (row_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): read tree_kind_id from tree_ref[31:0]. Labels prefixed screen_reader_protocol_rt_.",
+      block: {
+        mov rax, [rdi + 8];
+        and rax, 0xFFFFFFFF;
+        ret
+      }
+    }
+
+  pub let screen_reader_protocol_row_head : (u64) -> u64 !{mem} @{} =
+    fn (row_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): read event_queue_head from queue_ptrs[31:0]. Labels prefixed screen_reader_protocol_rh_.",
+      block: {
+        mov rax, [rdi + 16];
+        and rax, 0xFFFFFFFF;
+        ret
+      }
+    }
+
+  pub let screen_reader_protocol_row_tail : (u64) -> u64 !{mem} @{} =
+    fn (row_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): read event_queue_tail from queue_ptrs[63:32]. Labels prefixed screen_reader_protocol_rtl_.",
+      block: {
+        mov rax, [rdi + 16];
+        shr rax, 32;
+        ret
+      }
+    }
+
+  pub let screen_reader_protocol_row_dropped : (u64) -> u64 !{mem} @{} =
+    fn (row_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): read dropped_event_count (full u64) from row+24. Labels prefixed screen_reader_protocol_rd_.",
+      block: {
+        mov rax, [rdi + 24];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION G  Row-pool primitives (valid / alloc / free).
+  // ==========================================================================
+
+  // screen_reader_protocol_row_valid(row_id) -> 1 iff row_id <
+  // SR_MAX_SUBSCRIPTIONS AND in_use bit set.
+  pub let screen_reader_protocol_row_valid : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): 1 iff row_id < SR_MAX_SUBSCRIPTIONS(4) AND in_use. Row address = _screen_reader_protocol_rows + row_id * 64; *64 uses shl 6. Labels prefixed screen_reader_protocol_rv_.",
+      block: {
+        mov r10, 4;
+        cmp rdi, r10;
+        jae screen_reader_protocol_rv_no;
+        lea r10, [rip + _screen_reader_protocol_rows];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  screen_reader_protocol_rv_no;
+        mov rax, 1;
+        ret;
+      screen_reader_protocol_rv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_protocol_row_alloc(hdr, tree_kind_id)
+  //     -> row_id | SR_TAIL_ENOSPC.
+  //
+  // hdr: _pack_row_hdr output (subscriber_kind_id at [31:0], in_use=0).
+  //
+  // Low-first scan; the found row's in_use bit is stamped by ORing
+  // 1<<56 into hdr on the claim path. queue_ptrs starts at (0, 0),
+  // dropped_event_count starts at 0.
+  pub let screen_reader_protocol_row_alloc : (u64, u64) -> u64 !{mem} @{} =
+    fn (hdr: u64) (tree_kind_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): claim one subscription row. Low-first scan (rbx=idx) over SR_MAX_SUBSCRIPTIONS(4) rows of 64 bytes. Three callee-save pushes (rbx=idx, r12=hdr, r13=tree_kind_id) + sub rsp,8 = 32 B => entry rsp%16==8, +32 = %16==8 which suits the no-nested-call scan (any indirect call here would need one further pad). Labels prefixed screen_reader_protocol_ra_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        sub  rsp, 8;
+
+        mov  r12, rdi;                       // hdr
+        mov  r13, rsi;                       // tree_kind_id
+
+        xor  rbx, rbx;
+      screen_reader_protocol_ra_scan:
+        cmp  rbx, 4;
+        jae  screen_reader_protocol_ra_enospc;
+
+        lea  r10, [rip + _screen_reader_protocol_rows];
+        mov  r11, rbx;
+        shl  r11, 6;
+        add  r10, r11;
+
+        mov  rax, [r10 + 0];
+        shr  rax, 56;
+        cmp  rax, 0;
+        je   screen_reader_protocol_ra_claim;
+
+        add  rbx, 1;
+        jmp  screen_reader_protocol_ra_scan;
+
+      screen_reader_protocol_ra_claim:
+        // Stamp in_use bit into hdr, write row.
+        mov  rax, r12;
+        mov  r11, 1;
+        shl  r11, 56;
+        or   rax, r11;
+        mov  [r10 + 0],  rax;                // row_hdr (with in_use=1)
+
+        // tree_ref = tree_kind_id (u32-masked).
+        mov  rax, r13;
+        and  rax, 0xFFFFFFFF;
+        mov  [r10 + 8],  rax;
+
+        // queue_ptrs = (head=0, tail=0), dropped = 0, reserved.
+        xor  rax, rax;
+        mov  [r10 + 16], rax;
+        mov  [r10 + 24], rax;
+        mov  [r10 + 32], rax;
+        mov  [r10 + 40], rax;
+        mov  [r10 + 48], rax;
+        mov  [r10 + 56], rax;
+
+        mov  rax, rbx;                       // row_id
+        jmp  screen_reader_protocol_ra_out;
+
+      screen_reader_protocol_ra_enospc:
+        mov  rax, 0xFFFFEBF2;                // SR_TAIL_ENOSPC
+
+      screen_reader_protocol_ra_out:
+        add  rsp, 8;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // screen_reader_protocol_row_free(row_id): scrub row (all 8 words).
+  // Bounds-checked; does NOT scrub the backing ring (a subsequent
+  // subscribe onto the same slot resets head/tail to 0 so any stale
+  // ring content is unreachable).
+  pub let screen_reader_protocol_row_free : (u64) -> () !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): scrub one row (all 8 u64 words). Bounds-checked against SR_MAX_SUBSCRIPTIONS(4). Ring bytes are left in place; the next _row_alloc onto this slot resets head/tail so the stale ring content is unreachable. Labels prefixed screen_reader_protocol_rf_.",
+      block: {
+        mov  r10, 4;
+        cmp  rdi, r10;
+        jae  screen_reader_protocol_rf_out;
+        lea  r10, [rip + _screen_reader_protocol_rows];
+        mov  r11, rdi;
+        shl  r11, 6;
+        add  r10, r11;
+        xor  rax, rax;
+        mov  [r10 + 0],  rax;
+        mov  [r10 + 8],  rax;
+        mov  [r10 + 16], rax;
+        mov  [r10 + 24], rax;
+        mov  [r10 + 32], rax;
+        mov  [r10 + 40], rax;
+        mov  [r10 + 48], rax;
+        mov  [r10 + 56], rax;
+      screen_reader_protocol_rf_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION H  screen_reader_subscribe
+  //
+  // screen_reader_subscribe(subscriber_kind_id, tree_kind_id)
+  //     -> subscription_id
+  //      | SR_BAD_SUBSCRIBER | SR_BAD_TREE | SR_TAIL_ENOSPC.
+  //
+  // The caller has already been gated for R_A11Y_SUBSCRIBE on the
+  // tree by the compositor's dispatch shim. This body validates the
+  // ids are nonzero + u32-fitting and claims a pool slot.
+  //
+  // Three callee-save pushes (rbx=subscriber, r12=tree_kind_id,
+  // r13=hdr) leave rsp%16==0 (three 8-byte pushes flip entry %16==8
+  // to %16==0), which is exactly what every nested `call` needs at
+  // the callsite. No further pad required.
+  //
+  // Refusal path funnels through screen_reader_protocol_sub_refused
+  // and bumps SRP_ST_REFUSED once.
+  // ==========================================================================
+
+  pub let screen_reader_subscribe : (u64, u64) -> u64 !{mem} @{} =
+    fn (subscriber_kind_id: u64) (tree_kind_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): claim one subscription row bound to (subscriber, tree). Three callee-save pushes (rbx=subscriber, r12=tree_kind_id, r13=hdr) preserve SysV alignment: entry rsp%16==8, three 8-byte pushes give rsp%16==0 which every nested `call` needs at the callsite. Refusal funnel bumps SRP_ST_REFUSED once. Labels prefixed screen_reader_protocol_sub_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov  rbx, rdi;                       // subscriber_kind_id
+        mov  r12, rsi;                       // tree_kind_id
+
+        // (1) subscriber_kind_id valid?
+        mov  rdi, rbx;
+        call screen_reader_protocol_subscriber_valid;
+        cmp  rax, 0;
+        je   screen_reader_protocol_sub_bad_sub;
+
+        // (2) tree_kind_id valid?
+        mov  rdi, r12;
+        call screen_reader_protocol_tree_valid;
+        cmp  rax, 0;
+        je   screen_reader_protocol_sub_bad_tree;
+
+        // (3) pack row hdr and claim a row.
+        mov  rdi, rbx;
+        call screen_reader_protocol_pack_row_hdr;
+        mov  r13, rax;                       // hdr
+
+        mov  rdi, r13;
+        mov  rsi, r12;
+        call screen_reader_protocol_row_alloc;
+
+        // If _row_alloc returned SR_TAIL_ENOSPC (>= SR_MAX_SUBSCRIPTIONS),
+        // fail through the refusal funnel.
+        mov  r10, 4;
+        cmp  rax, r10;
+        jae  screen_reader_protocol_sub_enospc;
+
+        // Success: bump SRP_ST_SUBSCRIBES, preserve row_id in rbx.
+        mov  rbx, rax;                       // row_id
+        mov  rdi, 0;                         // SRP_ST_SUBSCRIBES
+        call screen_reader_protocol_stats_bump;
+        mov  rax, rbx;                       // return row_id
+        jmp  screen_reader_protocol_sub_out;
+
+      screen_reader_protocol_sub_bad_sub:
+        mov  rax, 0xFFFFEBF5;                // SR_BAD_SUBSCRIBER
+        jmp  screen_reader_protocol_sub_refused;
+      screen_reader_protocol_sub_bad_tree:
+        mov  rax, 0xFFFFEBF4;                // SR_BAD_TREE
+        jmp  screen_reader_protocol_sub_refused;
+      screen_reader_protocol_sub_enospc:
+        // rax already holds the ENOSPC sentinel from _row_alloc.
+
+      screen_reader_protocol_sub_refused:
+        // Bump SRP_ST_REFUSED, preserve sentinel across the note call.
+        mov  rbx, rax;
+        mov  rdi, 3;                         // SRP_ST_REFUSED
+        call screen_reader_protocol_stats_bump;
+        mov  rax, rbx;
+
+      screen_reader_protocol_sub_out:
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION I  screen_reader_push_event
+  //
+  // screen_reader_push_event(subscription_id, event_kind, node_id)
+  //     -> SR_OK | SR_QUEUE_FULL | SR_BAD_SLOT | SR_BAD_EVENT.
+  //
+  // Gate order:
+  //   (1) row_valid?
+  //   (2) event_valid?
+  //   (3) queue_base
+  //   (4) if tail - head == SR_QUEUE_MAX: bump dropped, return SR_QUEUE_FULL
+  //   (5) commit slot at (tail & MASK), bump tail
+  //
+  // Five callee-save pushes (rbx=sub_id, r12=event_kind, r13=node_id,
+  // r14=row_base, r15=queue_base) leave rsp%16==0 after the prologue --
+  // every nested call site is naturally aligned. No further pad required.
+  // ==========================================================================
+
+  pub let screen_reader_push_event : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (subscription_id: u64) (event_kind: u64) (node_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): enqueue one event; drop with SR_QUEUE_FULL if the ring is full (SRP_ST_DROPPED bumped, per-row dropped_event_count bumped). Five callee-save pushes (rbx=sub_id, r12=event_kind, r13=node_id, r14=row_base, r15=queue_base) preserve SysV alignment: entry rsp%16==8, five 8-byte pushes give rsp%16==0 which every nested `call` needs at the callsite. Gate order: row_valid -> event_valid -> queue_base -> full-check -> commit + tail bump. Labels prefixed screen_reader_protocol_pu_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov  rbx, rdi;                       // sub_id
+        mov  r12, rsi;                       // event_kind
+        mov  r13, rdx;                       // node_id
+
+        // (1) row_valid?
+        mov  rdi, rbx;
+        call screen_reader_protocol_row_valid;
+        cmp  rax, 0;
+        je   screen_reader_protocol_pu_bad_slot;
+
+        // (2) event_valid?
+        mov  rdi, r12;
+        call screen_reader_protocol_event_valid;
+        cmp  rax, 0;
+        je   screen_reader_protocol_pu_bad_event;
+
+        // (3) row_base + queue_base.
+        mov  rdi, rbx;
+        call screen_reader_protocol_row_base;
+        cmp  rax, 0;
+        je   screen_reader_protocol_pu_bad_slot;
+        mov  r14, rax;                       // row_base
+
+        mov  rdi, rbx;
+        call screen_reader_protocol_queue_base;
+        cmp  rax, 0;
+        je   screen_reader_protocol_pu_bad_slot;
+        mov  r15, rax;                       // queue_base
+
+        // (4) full-check: (tail - head) == SR_QUEUE_MAX(32).
+        //     Both head and tail live in queue_ptrs at row+16; we
+        //     read the packed word once and split it in registers.
+        mov  rax, [r14 + 16];
+        mov  r10, rax;
+        and  r10, 0xFFFFFFFF;                // head (u32)
+        shr  rax, 32;                        // tail (u32)
+        mov  r11, rax;                       // save tail
+
+        // depth = tail - head, masked to u32 (arithmetic modulo 2^32
+        // is exactly what we want when either counter has wrapped).
+        sub  rax, r10;
+        and  rax, 0xFFFFFFFF;
+        mov  r10, 32;
+        cmp  rax, r10;
+        jae  screen_reader_protocol_pu_full;
+
+        // (5) commit slot at (tail & MASK) with (event_kind, node_id).
+        //     slot_addr = queue_base + (tail & 31) * 8.
+        //
+        //     REGISTER DISCIPLINE: r10/r11 are caller-saved and will be
+        //     clobbered by the nested pack_queue_slot call, so we can't
+        //     stash the slot pointer there. queue_base (r15) is no longer
+        //     needed after slot_addr returns, so we reuse r15 as the
+        //     callee-saved home for the slot pointer across the pack call.
+        mov  rdi, r15;
+        mov  rsi, r11;                       // tail
+        call screen_reader_protocol_slot_addr;
+        mov  r15, rax;                       // slot ptr (queue_base retired)
+
+        // packed = event_kind[7:0] | node_id[39:8].
+        mov  rdi, r12;
+        mov  rsi, r13;
+        call screen_reader_protocol_pack_queue_slot;
+        mov  [r15 + 0], rax;
+
+        // Bump tail (u32-wide) and write back queue_ptrs preserving head.
+        // Re-read head from the row so we don't rely on a stashed value.
+        mov  rax, [r14 + 16];
+        mov  r10, rax;
+        and  r10, 0xFFFFFFFF;                // head
+        shr  rax, 32;                        // tail
+        add  rax, 1;
+        and  rax, 0xFFFFFFFF;                // tail' (u32)
+        // Rebuild queue_ptrs = head[31:0] | tail'[63:32].
+        mov  r11, rax;
+        shl  r11, 32;
+        or   r10, r11;
+        mov  [r14 + 16], r10;
+
+        xor  rax, rax;                       // SR_OK
+        jmp  screen_reader_protocol_pu_out;
+
+      screen_reader_protocol_pu_full:
+        // Drop: bump per-row dropped_event_count and global SRP_ST_DROPPED,
+        // then return SR_QUEUE_FULL. The event is discarded.
+        // Load-inc-store on row+24 (dropped_event_count is u64-wide).
+        mov  rax, [r14 + 24];
+        add  rax, 1;
+        mov  [r14 + 24], rax;
+        mov  rdi, 2;                         // SRP_ST_DROPPED
+        call screen_reader_protocol_stats_bump;
+        mov  rax, 0xFFFFEBF8;                // SR_QUEUE_FULL
+        jmp  screen_reader_protocol_pu_out;
+
+      screen_reader_protocol_pu_bad_slot:
+        mov  rax, 0xFFFFEBF3;                // SR_BAD_SLOT
+        jmp  screen_reader_protocol_pu_out;
+      screen_reader_protocol_pu_bad_event:
+        mov  rax, 0xFFFFEBF6;                // SR_BAD_EVENT
+
+      screen_reader_protocol_pu_out:
+        pop  r15;
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION J  screen_reader_pop_event
+  //
+  // screen_reader_pop_event(subscription_id)
+  //     -> packed_word (event_kind[7:0] | node_id[39:8])
+  //      | SR_EMPTY.
+  //
+  // SR_EMPTY (all-bits-set) is returned on:
+  //   * empty ring (head == tail)
+  //   * invalid subscription_id (safe fallback -- a screen reader
+  //     with a stale sub_id sees an empty queue)
+  //
+  // A valid packed word always has bits [63:40] == 0 (see file
+  // header §3), so callers discriminate with `rax == -1`.
+  //
+  // Four callee-save pushes (rbx=sub_id, r12=row_base, r13=queue_base,
+  // r14=head) leave rsp%16==8 after the prologue -- every nested call
+  // site is wrapped with sub rsp,8 / add rsp,8 to pad to %16==0.
+  // ==========================================================================
+
+  pub let screen_reader_pop_event : (u64) -> u64 !{mem} @{} =
+    fn (subscription_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): dequeue one event or return SR_EMPTY (all-bits-set). Four callee-save pushes (rbx=sub_id, r12=row_base, r13=queue_base, r14=head) leave rsp%16==8; every nested call site gets a sub rsp,8 pad so the callee sees rsp%16==0. Bad sub_id folds to SR_EMPTY (safe fallback -- the ring appears empty to a stale-sub_id caller). Labels prefixed screen_reader_protocol_po_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov  rbx, rdi;                       // sub_id
+
+        // (1) row_valid? Bad sub_id folds to SR_EMPTY.
+        sub  rsp, 8;
+        mov  rdi, rbx;
+        call screen_reader_protocol_row_valid;
+        add  rsp, 8;
+        cmp  rax, 0;
+        je   screen_reader_protocol_po_empty;
+
+        // (2) row_base + queue_base.
+        sub  rsp, 8;
+        mov  rdi, rbx;
+        call screen_reader_protocol_row_base;
+        add  rsp, 8;
+        cmp  rax, 0;
+        je   screen_reader_protocol_po_empty;
+        mov  r12, rax;                       // row_base
+
+        sub  rsp, 8;
+        mov  rdi, rbx;
+        call screen_reader_protocol_queue_base;
+        add  rsp, 8;
+        cmp  rax, 0;
+        je   screen_reader_protocol_po_empty;
+        mov  r13, rax;                       // queue_base
+
+        // (3) empty-check: head == tail.
+        mov  rax, [r12 + 16];
+        mov  r10, rax;
+        and  r10, 0xFFFFFFFF;                // head
+        shr  rax, 32;                        // tail
+        cmp  r10, rax;
+        je   screen_reader_protocol_po_empty;
+        mov  r14, r10;                       // save head
+
+        // (4) read slot at (head & MASK).
+        sub  rsp, 8;
+        mov  rdi, r13;
+        mov  rsi, r14;
+        call screen_reader_protocol_slot_addr;
+        add  rsp, 8;
+        mov  r10, rax;                       // slot ptr
+        mov  r11, [r10 + 0];                 // packed event
+
+        // (5) bump head (u32-wide) and rewrite queue_ptrs preserving tail.
+        mov  rax, [r12 + 16];
+        mov  r10, rax;
+        and  r10, 0xFFFFFFFF;                // head
+        shr  rax, 32;                        // tail
+        add  r10, 1;
+        and  r10, 0xFFFFFFFF;                // head' (u32)
+        // Rebuild queue_ptrs = head'[31:0] | tail[63:32].
+        shl  rax, 32;
+        or   r10, rax;
+        mov  [r12 + 16], r10;
+
+        // Return packed event in rax. (bits [63:40] are already zero
+        // because _pack_queue_slot preserves that -- see §3.)
+        mov  rax, r11;
+        jmp  screen_reader_protocol_po_out;
+
+      screen_reader_protocol_po_empty:
+        // SR_EMPTY = 0xFFFFFFFFFFFFFFFF (all-bits-set). mov rax, -1
+        // is the single-byte-imm encoding of the same constant, but
+        // we spell the immediate explicitly here to match the file's
+        // "constants are hex-literal at the emit site" convention.
+        mov  rax, 0xFFFFFFFFFFFFFFFF;
+
+      screen_reader_protocol_po_out:
+        pop  r14;
+        pop  r13;
+        pop  r12;
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION K  screen_reader_unsubscribe  (LINEAR consume)
+  //
+  // screen_reader_unsubscribe(subscription_id)
+  //     -> SR_OK | SR_BAD_SLOT | SR_UNSUB_ALREADY.
+  //
+  // LINEAR consume: the caller MUST NOT reuse the subscription_id
+  // after this call. A second unsubscribe on the same id returns
+  // SR_UNSUB_ALREADY -- idempotent from the caller's perspective
+  // but the sentinel distinguishes so a client can detect a
+  // double-unsubscribe bug.
+  //
+  // One callee-save push (rbx=sub_id): entry rsp%16==8, one 8-byte
+  // push gives rsp%16==0 -- the value every nested `call` needs at
+  // the callsite. No further pad required.
+  // ==========================================================================
+
+  pub let screen_reader_unsubscribe : (u64) -> u64 !{mem} @{} =
+    fn (subscription_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): LINEAR-consume one subscription row. sub_id >= SR_MAX_SUBSCRIPTIONS -> SR_BAD_SLOT; row not in_use -> SR_UNSUB_ALREADY; else free + bump SRP_ST_UNSUBSCRIBES + return SR_OK. One callee-save push leaves rsp%16==0 which matches SysV call alignment; no further pad needed. Labels prefixed screen_reader_protocol_un_.",
+      block: {
+        push rbx;
+        mov  rbx, rdi;                       // sub_id
+
+        // OOB row_id?
+        mov  r10, 4;
+        cmp  rbx, r10;
+        jae  screen_reader_protocol_un_bad_slot;
+
+        // Already freed?
+        mov  rdi, rbx;
+        call screen_reader_protocol_row_valid;
+        cmp  rax, 0;
+        je   screen_reader_protocol_un_already;
+
+        // Free the row.
+        mov  rdi, rbx;
+        call screen_reader_protocol_row_free;
+
+        // Bump unsubscribe counter, return SR_OK.
+        mov  rdi, 1;                         // SRP_ST_UNSUBSCRIBES
+        call screen_reader_protocol_stats_bump;
+        xor  rax, rax;                       // SR_OK
+        jmp  screen_reader_protocol_un_out;
+
+      screen_reader_protocol_un_bad_slot:
+        mov  rax, 0xFFFFEBF3;                // SR_BAD_SLOT
+        jmp  screen_reader_protocol_un_out;
+      screen_reader_protocol_un_already:
+        mov  rax, 0xFFFFEBF7;                // SR_UNSUB_ALREADY
+
+      screen_reader_protocol_un_out:
+        pop  rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION L  Stats + init.
+  // ==========================================================================
+
+  pub let screen_reader_protocol_stats_bump : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): bounds-checked counter bump against SRP_ST_REFUSED+1=4. Load-inc-store idiom (no `add reg, [mem]`). Labels prefixed screen_reader_protocol_sb_.",
+      block: {
+        cmp rdi, 4;
+        jae screen_reader_protocol_sb_out;
+        lea r10, [rip + _screen_reader_protocol_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      screen_reader_protocol_sb_out:
+        ret
+      }
+    }
+
+  pub let screen_reader_protocol_stats_read : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): bounds-checked counter read; OOB -> 0. Labels prefixed screen_reader_protocol_sr_.",
+      block: {
+        cmp rdi, 4;
+        jae screen_reader_protocol_sr_zero;
+        lea r10, [rip + _screen_reader_protocol_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      screen_reader_protocol_sr_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screen_reader_protocol_init(): zero row pool, queue pool, stats.
+  // Defensive re-scrub; .bss is already zero at real boot. Mirrors
+  // a11y_tree_init's zeroing loop.
+  pub let screen_reader_protocol_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave0-B9-09 (paideia-os #2308): zero _screen_reader_protocol_rows (32 u64), _screen_reader_protocol_queues (128 u64), _screen_reader_protocol_stats (4 u64). Defensive; .bss is already zero at real boot. Labels prefixed screen_reader_protocol_ini_.",
+      block: {
+        lea r10, [rip + _screen_reader_protocol_rows];
+        xor rax, rax;
+        xor rcx, rcx;
+      screen_reader_protocol_ini_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  screen_reader_protocol_ini_rows;
+
+        lea r10, [rip + _screen_reader_protocol_queues];
+        xor rcx, rcx;
+      screen_reader_protocol_ini_queues:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 128;
+        jb  screen_reader_protocol_ini_queues;
+
+        lea r10, [rip + _screen_reader_protocol_stats];
+        xor rcx, rcx;
+      screen_reader_protocol_ini_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  screen_reader_protocol_ini_stats;
+        ret
+      }
+    }
+}
