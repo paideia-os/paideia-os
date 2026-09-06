@@ -242,37 +242,25 @@ echo "[build-user] ensuring build/user/shell.bin (R15-M1-007 embed prerequisite)
 # Mirrors this script's own STAMP no-op discipline (lines 22-54 above),
 # scoped to just these six submodule trees.
 SAT_TOOLS_DIR="${REPO_ROOT}/tools/user"
-SAT_LIBS=(libpdx-volume libpdx-audit libpdx-elevate)
+SAT_LIBS=(libpdx-volume libpdx-audit libpdx-elevate libpdx-argv)
 SAT_APPS=(mkfs.pdxfs mount.pdxfs umount.pdxfs)
 SAT_STAMP="${BUILD_DIR}/user/.r64v2-tools-stamp"
 
-# r64v2-tools argv.pdx sources reference `flag_spec_register`, `parse_argv`,
-# `pos_count`, `flag_ids`, `snap_chain_walk`, `mount_deps_parse`,
-# `vol_kind_mint_elevate`, `pdxb_sb_get_flags` et al — a phantom `libpdx-argv`
-# (v1.1.0) library that has never been checked in. When it's absent (any of
-# the missing satellites) the r64v2-tools link cannot succeed. Detect that
-# up-front and skip the whole stage, staging zero-byte stubs so
-# tools/userbin_embed.S `.incbin` still resolves and the kernel build
-# completes. The tools are userspace-only; kernel doesn't call into them.
-SAT_LIBPDX_ARGV_MISSING=0
-if [[ ! -d "${SAT_TOOLS_DIR}/libpdx-argv/src" ]]; then
-    SAT_LIBPDX_ARGV_MISSING=1
-fi
-if [[ "${SAT_LIBPDX_ARGV_MISSING}" -eq 1 ]]; then
-    echo "[r64v2-tools] SKIP: libpdx-argv absent — staging 512B stub ELFs"
-    mkdir -p "${BUILD_DIR}/user"
-    for app in mkfs.pdxfs mount.pdxfs umount.pdxfs; do
-        dd if=/dev/zero of="${BUILD_DIR}/user/${app}.elf" bs=512 count=1 status=none
-    done
-    touch "${SAT_STAMP}"
-fi
-
+# libpdx-argv (paideia-os/libpdx-argv v1.1.0, submoduled at tools/user/
+# libpdx-argv, issue #2346) provides the ten argv-parsing symbols the three
+# r64v2 tools reference (flag_spec_reset, flag_spec_register, parsed_args_
+# reset, parse_argv, parse_int_u64, plus flag_count/flag_ids/flag_values/
+# pos_count/pos_ptrs .bss storage). The pre-#2346 workaround here staged
+# 512B zero-filled stub ELFs whenever tools/user/libpdx-argv/src was absent;
+# the submodule now guarantees presence, so any absence is a submodule-
+# init failure that must hard-fail the build rather than paper over.
 SAT_NEEDS_BUILD=1
 if [[ -z "${NO_INCREMENTAL:-}" && -f "${SAT_STAMP}" ]]; then
     SAT_NEWEST=$(find \
         "${SAT_TOOLS_DIR}/libpdx-volume" \
         "${SAT_TOOLS_DIR}/libpdx-audit" \
         "${SAT_TOOLS_DIR}/libpdx-elevate" \
+        "${SAT_TOOLS_DIR}/libpdx-argv" \
         "${SAT_TOOLS_DIR}/mkfs.pdxfs" \
         "${SAT_TOOLS_DIR}/mount.pdxfs" \
         "${SAT_TOOLS_DIR}/umount.pdxfs" \
@@ -303,7 +291,7 @@ if [[ "${SAT_NEEDS_BUILD}" -eq 1 ]]; then
     # in place of pdxb_sign.o so downstream tools still get definitions
     # for pdxb_sign_superblock / pdxb_sign_inode_tail / pdxb_verify_
     # inode_tail (they route to STUB result_codes at runtime).
-    for lib in libpdx-volume libpdx-audit; do
+    for lib in libpdx-volume libpdx-audit libpdx-argv; do
         FILTERED="${BUILD_DIR}/user/${lib}-link"
         mkdir -p "${FILTERED}"
         rm -f "${FILTERED}"/*.o
@@ -330,7 +318,8 @@ if [[ "${SAT_NEEDS_BUILD}" -eq 1 ]]; then
         (
             "${SAT_TOOLS_DIR}/${app}/tools/build.sh" \
                 --extra-obj-dir "${BUILD_DIR}/user/libpdx-volume-link" \
-                --extra-obj-dir "${BUILD_DIR}/user/libpdx-audit-link"
+                --extra-obj-dir "${BUILD_DIR}/user/libpdx-audit-link" \
+                --extra-obj-dir "${BUILD_DIR}/user/libpdx-argv-link"
         ) & SAT_APP_PID[${app}]=$!
     done
 
