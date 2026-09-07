@@ -44,7 +44,7 @@ preserved by the kernel.
 | 3 | `close` | `fd` | 0 or `-errno` |
 | 4 | `cap_invoke` | `slot`, `op_arg` | op-defined; retained from R13 |
 | 12 | `debug_puts` | `buf`, `count` | bytes emitted; kernel-owned debug channel (bypasses normal fd routing) |
-| 13 | `dmesg` | `buf`, `cap` | bytes copied out of the klog ring or `-errno` |
+| 13 | `dmesg` | `buf`, `len` | bytes copied out of the klog ring (newest-N tail per fix #2351) or `-errno` |
 | 32 | `dup2` | `oldfd`, `newfd` | `newfd` or `-errno` |
 | 39 | `getpid` | — | current pid (always succeeds) |
 | 40 | `ipc_recv` | `endpoint`, `buf`, `cap`, `timeout` | bytes received or `-errno` |
