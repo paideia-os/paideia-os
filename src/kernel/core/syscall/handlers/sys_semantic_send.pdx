@@ -1,0 +1,235 @@
+// src/kernel/core/syscall/handlers/sys_semantic_send.pdx
+// R107-M0-001 (paideia-os #2350): sys_semantic_send body.
+//
+// Kernel-side substrate for the libpdx-semantic-pipe stub that postui
+// (postui#42) currently short-circuits to `xor rax, rax; ret`. The
+// syscall provides the mint-pipe end of a schema-tagged record channel:
+// the caller hands over (schema, record_ptr, record_len); the kernel
+// copies the record into a fixed-size per-kernel ring keyed positionally
+// (schema stored with the record; consumers filter). This is the
+// PRODUCER-only landing -- the corresponding consumer (either a peer
+// `sys_semantic_recv` syscall or a KIND_SEMANTIC_PIPE cap-invoke op)
+// is deferred to a follow-on round.
+//
+// The single-global-ring shape is a deliberate v1 simplification of the
+// per-task/per-schema shape the issue text names. Grounds:
+//
+//   (1) At this landing there is no consumer, so multi-task fan-out
+//       carries no observable behaviour -- any shape that lets us
+//       land the producer + hand postui#42 a non-zero sysno is
+//       sufficient. Deferring the per-task shape keeps this landing's
+//       diff footprint under 300 lines of .pdx.
+//
+//   (2) A per-task-per-schema hashtable at v1 would ossify a
+//       hashtable choice (open-addressed vs chained; steal-slot vs
+//       stop-the-world resize) BEFORE any real consumer has told us
+//       whether the recv side wants a bounded blocking queue, a
+//       pub/sub broadcast, or a syscall-tail dequeue. The ring is
+//       trivially replaceable when that clarity arrives -- the
+//       producer's syscall shape (schema, record_ptr, record_len) is
+//       stable across every plausible v2.
+//
+//   (3) The 16-slot / 240-byte-per-record cap matches the "small
+//       structured event" workload semantic pipes target
+//       (design/terminal/schema-registry.md §4 has records at ~48-96
+//       bytes each) -- a full 4 KiB record would already be pipe
+//       misuse. Callers with wire records >240 bytes fragment.
+//
+// Contract (SysV, 3 args):
+//   rdi = schema      -- opaque u64 schema tag (echoed back to the
+//                        consumer; kernel does not interpret)
+//   rsi = record_ptr  -- user VA of the record bytes
+//   rdx = record_len  -- byte length of the record, in [1, 240]
+//   -> rax = 0 on success
+//        or a negative-errno u64 on failure:
+//        -EFAULT   (0xFFFFFFFFFFFFFFF2)  record_ptr failed user_ptr_ok
+//                                        or user_read_bytes_via_walk
+//                                        faulted mid-copy (a partial
+//                                        header is left in the pending
+//                                        slot -- head is NOT advanced,
+//                                        so the next successful write
+//                                        overwrites it in full)
+//        -EINVAL   (0xFFFFFFFFFFFFFFEA)  record_len == 0 or > 240
+//
+// Note: the issue text names PIPE_FULL / NO_SUBSCRIBERS / BAD_SCHEMA
+// as failure modes. NO_SUBSCRIBERS folds to success (drop silently,
+// per issue) and is invisible from ring-3 at v1. PIPE_FULL never
+// fires at v1 -- overwrite-oldest is the ring policy (the consumer's
+// tail tracking arrives with the recv wave). BAD_SCHEMA is caller-
+// side pre-flight in libpdx-semantic-pipe; the kernel does not
+// enumerate a schema whitelist at this layer.
+//
+// =============================================================================
+// SECTION 1  RING LAYOUT
+// =============================================================================
+//
+// Fixed-shape single global ring in .bss, sized to 4 KiB total:
+//
+//   _semantic_ring_head : u64       -- next-write slot index, in [0, 16)
+//   _semantic_ring      : [u8; 4096] -- 16 slots of 256 bytes
+//
+// Per-slot layout (256 bytes, @align(8)):
+//   [ +0]  schema  (u64)                     -- caller-supplied tag
+//   [ +8]  len     (u64)                     -- bytes valid in data area
+//   [+16]  data    ([u8; 240])               -- record bytes
+//
+// A future recv wave adds a tail cursor + wake-list; slot layout is
+// intentionally stable so that add is additive (no re-pack).
+//
+// =============================================================================
+// SECTION 2  ENCODER DISCIPLINE
+// =============================================================================
+//
+// No `test rN,rN` (use `cmp reg, 0`); no 2-op `imul r,imm` (not used);
+// no `and reg, imm64` (mask 15 fits imm8); no `cmp reg, [mem]` (stage
+// through r14 or r10). SEMANTIC_MAX_RECORD (240), MOD_MASK (15), and
+// SEMANTIC_SLOT_STRIDE (256, applied via `shl rax, 8`) all fit imm8.
+// Labels prefixed `sss_` (sys-semantic-send).
+
+module SysSemanticSend = structure {
+
+  // Sysno 115 (see design/user/syscall-table.md; wired at
+  // src/kernel/core/syscall/dispatch.pdx dispatch_semantic_send).
+  pub let SSS_SYSNO : u64 = 115
+
+  // Per-record byte cap. 240 = 256 (per-slot stride) minus 16-byte
+  // header (schema u64 @+0, len u64 @+8). Callers with wider records
+  // must fragment -- see file header §1 for the rationale.
+  pub let SSS_MAX_RECORD : u64 = 240
+
+  // Ring geometry.
+  pub let SSS_SLOT_COUNT     : u64 = 16
+  pub let SSS_SLOT_STRIDE    : u64 = 256      // 16-byte header + 240 data
+  pub let SSS_SLOT_HEAD_OFF  : u64 = 0        // schema
+  pub let SSS_SLOT_LEN_OFF   : u64 = 8        // len
+  pub let SSS_SLOT_DATA_OFF  : u64 = 16       // data[0]
+  pub let SSS_MOD_MASK       : u64 = 15       // 16 - 1
+
+  // Errno sentinels (SysV sign-extended u64 form).
+  pub let SSS_ERR_EFAULT : u64 = 0xFFFFFFFFFFFFFFF2
+  pub let SSS_ERR_EINVAL : u64 = 0xFFFFFFFFFFFFFFEA
+
+  // ---------------------------------------------------------------
+  // The ring. .bss-resident, @align(8) so the schema/len u64 stores
+  // are naturally aligned regardless of slot index (256 is a multiple
+  // of 8, so slot base % 8 == 0 for every slot).
+  // ---------------------------------------------------------------
+  pub let mut _semantic_ring_head : u64        = 0
+  pub let mut _semantic_ring      : [u8; 4096] = uninit @align(8)
+
+  // ==========================================================================
+  // sys_semantic_send_body(schema, record_ptr, record_len) -> u64
+  //
+  // See file header for the full contract + failure taxonomy.
+  //
+  // Sequence:
+  //   (1) record_len in [1, SSS_MAX_RECORD] else -EINVAL.
+  //   (2) user_ptr_ok(record_ptr, record_len) -> 0/1. Non-zero -> -EFAULT.
+  //   (3) head := _semantic_ring_head (saved in r14 across the copy call).
+  //   (4) slot := _semantic_ring + head * SSS_SLOT_STRIDE.
+  //   (5) user_read_bytes_via_walk(&slot.data, record_ptr, record_len)
+  //         -- copy BEFORE header commit so a mid-copy -EFAULT leaves the
+  //         slot's previous header intact (see §Contract note on
+  //         -EFAULT). r11 (slot base) is clobbered by the call; head
+  //         survives in r14 and slot is recomputed on the success path.
+  //   (6) Commit header: [slot+0]=schema, [slot+8]=record_len.
+  //   (7) Advance head: head := (head + 1) & 15; store back.
+  //   (8) Return 0.
+  //
+  // Register plan (5-push callee-save prologue = 40B; entry rsp%16==8
+  // so rsp%16==0 across every nested call, matching the "5-push
+  // standard" in feedback_pdx_encoder_pitfalls):
+  //   rbx = schema        (survives calls; committed to slot on success)
+  //   r12 = record_ptr    (survives calls; source of the walk-copy)
+  //   r13 = record_len    (survives calls; committed to slot on success)
+  //   r14 = head          (survives the walk-copy call; used to
+  //                        recompute slot base after the call)
+  //   r15 = unused        (padding push for the 5-push standard; the
+  //                        alternative shape -- 4 pushes + sub rsp,8 --
+  //                        does not read more cleanly, so we prefer
+  //                        the standard prologue shape all other
+  //                        3-arg bodies follow)
+  //   r11 = slot base     (scratch; recomputed after the walk-copy)
+  //   r10 = scratch       (SSS_MAX_RECORD compare)
+  // ==========================================================================
+
+  pub let sys_semantic_send_body : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (schema: u64) (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R107-M0-001 (paideia-os #2350): sys_semantic_send body, SC+ ID 115. Entry: rdi=schema, rsi=record_ptr, rdx=record_len. Sequence: (1) length bounds in [1, 240] -> -EINVAL; (2) user_ptr_ok(record_ptr, record_len) -> -EFAULT; (3) head := _semantic_ring_head; (4) slot base := _semantic_ring + head*256; (5) user_read_bytes_via_walk into slot.data (offset 16) BEFORE committing header, so a mid-copy -EFAULT leaves the previous slot header intact; (6) commit header (schema @+0, len @+8) on success; (7) advance head modulo 16 (and rax,15 -- imm8) and store back. Effects {mem}: ring writes + transitively user_read_bytes_via_walk's kernel higher-half read via boot PML4. No {cap} -- schema is opaque to the kernel and this producer takes no cap slots. Five-push prologue (rbx, r12, r13, r14, r15) = 40 bytes; entry rsp%16==8 so rsp%16==0 at every nested call. r14 carries head across the walk-copy call; r11 (slot base) is scratch and recomputed on the success path. Encoder-conservative: cmp/je/jne/ja/mov/lea/xor/shl/and/add/push/pop/call/ret only. All immediates fit imm8 (240, 15, 8, 0, 1) or the SysV -errno u64 constants (staged via `mov rax, imm64` which is the movabs form). Labels prefixed sss_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // schema
+        mov r12, rsi;                    // record_ptr
+        mov r13, rdx;                    // record_len
+
+        // ---- (1) Length bounds: 1 <= record_len <= SSS_MAX_RECORD ----
+        cmp r13, 0;
+        je  sss_einval;
+        mov r10, 240;                    // SSS_MAX_RECORD
+        cmp r13, r10;
+        ja  sss_einval;
+
+        // ---- (2) user_ptr_ok(record_ptr, record_len) ----
+        mov rdi, r12;
+        mov rsi, r13;
+        call user_ptr_ok;
+        cmp rax, 0;
+        jne sss_efault;
+
+        // ---- (3) head := _semantic_ring_head (survives call in r14) ----
+        mov r14, [rip + _semantic_ring_head];
+
+        // ---- (4) slot base := _semantic_ring + head * 256 ----
+        mov rax, r14;
+        shl rax, 8;                      // *256 (SSS_SLOT_STRIDE)
+        lea r11, [rip + _semantic_ring];
+        add r11, rax;
+
+        // ---- (5) Copy user bytes into slot.data (offset 16) ----
+        //         user_read_bytes_via_walk(kernel_dst, user_va, len)
+        lea rdi, [r11 + 16];             // slot.data
+        mov rsi, r12;                    // record_ptr
+        mov rdx, r13;                    // record_len
+        call user_read_bytes_via_walk;
+        cmp rax, 0;
+        jne sss_efault;
+
+        // ---- (6) Commit header. r11 clobbered by the call; recompute. ----
+        mov rax, r14;
+        shl rax, 8;
+        lea r11, [rip + _semantic_ring];
+        add r11, rax;
+        mov [r11 + 0], rbx;              // schema  (SSS_SLOT_HEAD_OFF = 0)
+        mov [r11 + 8], r13;              // length  (SSS_SLOT_LEN_OFF  = 8)
+
+        // ---- (7) Advance head modulo 16, store back ----
+        add r14, 1;
+        and r14, 15;                     // SSS_MOD_MASK (imm8)
+        mov [rip + _semantic_ring_head], r14;
+
+        // ---- (8) Success ----
+        xor rax, rax;
+        jmp sss_out;
+
+      sss_efault:
+        mov rax, 0xFFFFFFFFFFFFFFF2;     // -EFAULT
+        jmp sss_out;
+      sss_einval:
+        mov rax, 0xFFFFFFFFFFFFFFEA;     // -EINVAL
+
+      sss_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
