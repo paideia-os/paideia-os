@@ -182,6 +182,21 @@ ALLOWLIST = {
         "UEFI-only path; the 14-mode matrix boots via -kernel, and the "
         "opt-in OVMF fixture stops at the pre-EBS banner (R19.M5).",
 
+    # src/kernel/kernel_main_uefi.pdx — R111.M1-002 (paideia-os #2354).
+    # Bridge fingerprint from kernel_main_uefi's Phase 5, emitted right
+    # before `call kernel_main_64` on the UEFI boot path.  Same UEFI-only
+    # reachability as "EFI SIGNATURE OK" above: the 14-mode -kernel
+    # matrix never takes the UEFI path, and the PAIDEIA_UEFI_OVMF opt-in
+    # fixture stops at the pre-EBS hello banner today.  Retires from this
+    # allowlist when the R111.M2 sub-wave opens an OVMF smoke mode that
+    # boots past ExitBootServices and asserts the bridge line against a
+    # live golden (planned as `boot_r111_uefi_bridge`, one of the
+    # `expected-r111-*.golden` companions to expected-r19-ovmf.golden).
+    "UEFI BRIDGE OK":
+        "UEFI-only path (R111.M1-002 bridge); the 14-mode matrix boots "
+        "via -kernel, and no OVMF smoke mode boots past ExitBootServices "
+        "yet — assertable when R111.M2 opens boot_r111_uefi_bridge.",
+
     # -- Section B: synth-witness markers under tests/**, each emitted
     #    only by an opt-in mode or a real-hardware smoke that the default
     #    matrix never runs. Verified against a full default-matrix boot
