@@ -1549,6 +1549,32 @@ ALLOWLIST = {
         "taskbar / notification surfaces are the M2 consumers).",
 
     # ------------------------------------------------------------------
+    # R113.M2-009 (paideia-os #2389): wl_shm-equivalent CPU-side buffer
+    # path (src/kernel/core/graphics/shm_pool.pdx).  shm_pool_init is
+    # wired into kernel_main after damage_region_init and fires on
+    # every boot, emitting `shm pool ok size=<n> free=<n>` via
+    # klog_s1_x2 with (SHM_POOL_SIZE_BYTES=4194304, initial-free=same)
+    # as the two hex KVs.  BOOT-VISIBLE and stable-valued but no
+    # golden file currently pins the literal -- pinning it requires an
+    # expected-boot-*.txt line that fits every existing 14-mode matrix
+    # AND survives a future landing that changes the pool size or
+    # pre-reserves a compositor carve-out reducing the free count.
+    # The natural pin lands with the M3 rendering-path boot witness
+    # (mint -> shm_pool_alloc -> shm_buffer_wrap -> surface_attach_
+    # buffer -> surface_commit end-to-end) which will also assert the
+    # post-alloc free-byte movement, making the initial-state pin
+    # meaningful in cascade rather than in isolation.
+    # ------------------------------------------------------------------
+    "shm pool ok [legacy: SHM POOL OK]":
+        "R113.M2-009 (#2389): SHM pool boot init fingerprint; "
+        "shm_pool_init (src/kernel/core/graphics/shm_pool.pdx) fires "
+        "unconditionally in kernel_main after damage_region_init and "
+        "emits `shm pool ok size=<n> free=<n>` via klog_s1_x2.  "
+        "Assertable when the M3 rendering-path boot witness lands and "
+        "pins both the initial-state values and the post-alloc "
+        "movement in cascade.",
+
+    # ------------------------------------------------------------------
     # R113.M2-011 (paideia-os #2391): global focus model
     # (src/kernel/core/graphics/focus.pdx).  Two transition fingerprints
     # (KBD / PTR) fire on focus_set_keyboard / focus_set_pointer when
@@ -1673,6 +1699,40 @@ ALLOWLIST = {
         "ptr_event_* leaf against a live surface slot end-to-end.",
 
     # ------------------------------------------------------------------
+    # R113.M3-014 (paideia-os #2394): touch event routing from HID
+    # touchscreen (T14 G4 touchscreen SKUs).  Module:
+    # src/kernel/core/graphics/touch_route.pdx.  touch_event_down /
+    # touch_event_move / touch_event_up / touch_event_cancel each emit
+    # TOUCH ROUTE READY sid=<target> via klog_s1_x1 on every successful
+    # ring-enqueue.  Down hit-tests via z_order top-down and latches
+    # _touch_target[touch_slot]; move/up follow the sticky anchor
+    # (wl_touch pinning discipline).  Cancel walks all 10 slots and
+    # emits per active target.  Unreachable in the default 14-mode
+    # QEMU matrix -- no live caller wires the touch_event_* leaves,
+    # blocked on the T14 G4 touchscreen HID handler which itself is
+    # blocked on the xHCI MSI-X routing (drivers/xhci/hid_kbd_attach.
+    # pdx §IRQ path, same blocker as the ptr_route / focus / z-order /
+    # hid_kbd_attach siblings above).  Assertable when the R113.M3
+    # touch-dispatcher landing or a boot witness drives a touch_event_*
+    # leaf against a live surface slot end-to-end (down + hit-test
+    # path is the natural first witness since it exercises the full
+    # chain: touch_slot validate -> z_order walk -> surface_row_dims_
+    # get -> per-touch state latch -> ring enqueue -> emit).
+    # ------------------------------------------------------------------
+    "touch route ready [legacy: TOUCH ROUTE READY]":
+        "R113.M3-014 (#2394): touch-route delivery fingerprint; "
+        "touch_event_down / touch_event_move / touch_event_up / "
+        "touch_event_cancel emit via klog_s1_x1 with sid=<target> "
+        "KV on every successful ring-enqueue.  Unreachable in the "
+        "default 14-mode QEMU matrix -- no live caller wires the "
+        "touch_event_* leaves yet (blocked on the T14 G4 touchscreen "
+        "HID handler + xHCI MSI-X routing, same blocker as the "
+        "ptr route / focus / z order / hid kbd attach siblings above). "
+        " Assertable when the R113.M3 touch-dispatcher landing or a "
+        "boot witness drives a touch_event_* leaf against a live "
+        "surface slot end-to-end.",
+
+    # ------------------------------------------------------------------
     # R113.M3-015 (paideia-os #2395): modifier-state tracker
     # (src/kernel/core/graphics/modifier_state.pdx).  Single transition
     # fingerprint fires on modifier_set (state actually changed) or
@@ -1693,6 +1753,31 @@ ALLOWLIST = {
         "xHCI MSI-X routing per drivers/xhci/hid_kbd_attach.pdx "
         "§IRQ path).  Assertable when a boot witness drives "
         "modifier_set / modifier_toggle_lock end-to-end.",
+
+    # ------------------------------------------------------------------
+    # R113.M3-016 (paideia-os #2396): XKB-equivalent keymap + per-
+    # surface delivery (src/kernel/core/graphics/keymap.pdx).  Single
+    # summary fingerprint fires from keymap_init (called by
+    # kernel_main.pdx alongside kbd_route_init / modifier_state_init /
+    # ptr_route_init), reporting the layout name (packed 8-byte ASCII
+    # "USQWERTY" LE = 0x5954524557515355) and the number of installed
+    # rows (52 = 26 letters + 10 digits + 5 whitespace + 11
+    # punctuation).  Reachable every boot -- keymap_init runs
+    # unconditionally in the init sequence -- but no golden line pins
+    # the exact literal today; the R113.M3-016+ boot smoke that drives
+    # keymap_deliver_per_surface end-to-end will land the assertable
+    # line and this allowlist entry retires.  Same "reachable but no
+    # golden pin yet" posture as the `policy seed ok` / `resolv seed
+    # ok` entries above.
+    # ------------------------------------------------------------------
+    "keymap layout ok [legacy: KEYMAP LAYOUT OK]":
+        "R113.M3-016 (#2396): keymap layout summary tag; keymap_init "
+        "emits once per boot via klog_s1_x2 with name=<hex> keys=<n> "
+        "KVs after installing the US QWERTY rows.  Reachable every "
+        "boot via kernel_main.pdx (called alongside kbd_route_init / "
+        "modifier_state_init / ptr_route_init), but no golden pins "
+        "this exact literal yet -- a R113.M3-016+ boot smoke driving "
+        "keymap_deliver_per_surface end-to-end will retire this entry.",
 
     # Batch 7: G7 close-out (src/user/compositor/*.pdx)
     "pdx kind subsurface meta [legacy: SUBSURFACE SYNC OK]":

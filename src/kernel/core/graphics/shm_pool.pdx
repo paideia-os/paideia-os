@@ -1,0 +1,1264 @@
+// src/kernel/core/graphics/shm_pool.pdx -- R113.M2-009 (paideia-os #2389)
+//
+// wl_shm-equivalent CPU-side buffer path: a global 4 MiB shared-memory
+// pool, a page-granular sub-allocator over it, and a 32-row buffer
+// descriptor table that wraps (offset, w, h, stride, format) tuples
+// into "shm_buffer_id" handles that surface_attach_buffer accepts in
+// place of a KIND_GPU_BO slot.
+//
+// -----------------------------------------------------------------------------
+// SCOPE (per issue #2389 + doc §11 non-goals rollup)
+// -----------------------------------------------------------------------------
+//
+// Clients without GPU access (CLI tools rendering to a KIND_SURFACE,
+// early-boot compositors, the on-screen keyboard's first frames before
+// the GPU driver initializes) need a way to hand pixels to the
+// compositor.  The wl_shm protocol (Wayland's CPU-side buffer path)
+// gives that: a shared-memory pool the client mmap's on its side and
+// the compositor scans out from on its side, with (offset, stride,
+// format) tuples naming sub-regions inside that pool as individual
+// buffers.
+//
+// This landing is the kernel-side substrate for that path:
+//
+//   * `_shm_pool` -- one global 4 MiB backing store in .bss.  A future
+//     M2/M3 landing (issue TBD, listed in doc §11 non-goals) will
+//     mmap this range into every client aspace at a fixed VA so the
+//     client-side wl_shm library can just `wl_shm_pool_create_buffer(offset,
+//     w, h, stride, fmt)` without a copy.  For M2-009 the pool lives
+//     only kernel-side and callers reach the allocator through direct
+//     symbol import; the user-facing mmap wire lands with the R113.M3
+//     rendering-path work when surface_attach_buffer's SHM arm sees
+//     its first live user-space call.
+//
+//   * `shm_pool_alloc(size) -> offset | -1` and `shm_pool_free(offset)`
+//     -- a page-granular (4 KiB) first-fit sub-allocator.  4 KiB
+//     granularity matches the natural x86-64 page size and keeps the
+//     bookkeeping small (128 B bitmap for 1024 pages; 8 KiB length
+//     table indexed by starting page) while giving the smallest
+//     framebuffer (80x25 TUI * 4 B pixel = 8000 B, rounds to 2 pages
+//     = 8 KiB) a comfortable footprint.  The alloc contract returns
+//     0xFFFFFFFFFFFFFFFF (a u64 all-ones "-1" sentinel) on any failure
+//     per the task spec's "offset | -1" shape; internal failure
+//     codes (SHM_POOL_*) live in the 0xFFFFE1F0..0xFFFFE1FF band and
+//     surface only through shm_pool_free / the buffer-table ops (which
+//     have distinct success shapes).
+//
+//   * `shm_buffer_wrap(offset, w, h, stride, format) -> shm_buffer_id`
+//     -- allocates one 64 B row in `_shm_buf_table` recording the sub-
+//     region and returns an opaque 32-bit handle marked with bit 31 set
+//     (SHM_BUF_ID_TAG = 0x80000000).  The bit-31 discriminator lets
+//     surface_attach_buffer route (bo & 0x80000000) != 0 handles
+//     through `shm_buffer_valid` instead of `kgb_tail_valid`, without
+//     changing the wire ABI or the row-layout 32-bit pending_bo field
+//     (kind_surface.pdx L456-482).  KIND_GPU_BO rows use small slot
+//     numbers 0..15 so the bit-31 space is unambiguously free for the
+//     SHM tag.
+//
+//   * `shm_buffer_valid(id) -> 0|1`, `shm_buffer_free(id) -> 0|error`
+//     -- companion accessors for surface_attach_buffer's discrimination
+//     and for a compositor-side release.  The current implementation
+//     does NOT auto-free the pool backing on shm_buffer_free (a wrap
+//     is a *view* into a pool sub-region, not an owner of it), matching
+//     wl_shm semantics where the pool outlives its buffers.
+//
+// -----------------------------------------------------------------------------
+// ROW LAYOUT (buffer descriptor table) -- 64 BYTES / 8 u64 WORDS
+// -----------------------------------------------------------------------------
+//
+//   +0   hdr      in_use[63:56] | generation[55:0]   (mirrors KIND_SURFACE §2)
+//   +8   offset   byte offset into _shm_pool          (0..SHM_POOL_SIZE-1)
+//   +16  size     h * stride (bytes)                  (client-declared)
+//   +24  wh       w[63:32] | h[31:0]                  (matches surface row §2)
+//   +32  stride   bytes per row                       (client-declared)
+//   +40  format   fourcc (u32 low, high half reserved)
+//   +48  reserved                                     (0 at wrap)
+//   +56  reserved                                     (0 at wrap)
+//
+// 64-byte stride matches the KIND_SURFACE row (kind_surface.pdx §2)
+// and keeps every row on its own L1D cache line.  32 rows * 64 B =
+// 2 KiB total buffer-descriptor working set.
+//
+// -----------------------------------------------------------------------------
+// SUB-ALLOCATOR (page-granular first-fit)
+// -----------------------------------------------------------------------------
+//
+// The pool carries 1024 pages of 4 KiB each.  Two side tables track
+// occupancy:
+//
+//   _shm_used : [u64; 16]    -- 1024-bit bitmap, 1 bit per page,
+//                                bit set = page in use.
+//   _shm_lens : [u64; 1024]  -- length in pages of the allocation
+//                                whose FIRST page is this index; 0
+//                                elsewhere.  Storing length per start-
+//                                page lets `shm_pool_free(offset)` look
+//                                up the release length without the
+//                                caller having to know it, matching
+//                                the task spec's single-arg free.
+//
+// Alloc:
+//   (1) pages = (size + 4095) >> 12                     -- round up
+//   (2) scan i = 0..1024-pages: if bitmap[i..i+pages] all 0, claim
+//   (3) set bits i..i+pages-1; write _shm_lens[i] = pages
+//   (4) return offset = i << 12
+//
+// Free:
+//   (1) validate offset & 0xFFF == 0 and offset < POOL_SIZE
+//   (2) start_page = offset >> 12; pages = _shm_lens[start_page]
+//   (3) if pages == 0: refuse (not a live alloc start)
+//   (4) clear bits start_page..start_page+pages-1; zero _shm_lens[start]
+//
+// Complexity: O(pool_pages * alloc_pages) worst case.  Acceptable for
+// M2-009 (the pool holds at most O(hundred) live allocs; the 14-mode
+// smoke matrix never exercises the alloc hot path).  A future landing
+// can layer a free-list / buddy allocator over the same bitmap.
+//
+// -----------------------------------------------------------------------------
+// FAILURE TAXONOMY -- 0xFFFFE1F0..0xFFFFE1FF (fresh band, grep-verified)
+// -----------------------------------------------------------------------------
+//
+// Task briefing named this band.  Freshness sweep (2026-09-08):
+//
+//   $ grep -rn '0xFFFFE1F' src/     -> zero live references
+//   $ grep -rn 'E1F0\|E1FF' src/    -> zero live references
+//   $ modifier_state.pdx L140 map    -> "0xFFFFE1C0..0xFFFFE1FF entirely free"
+//
+// Band claimed.  Adjacent bands (all doc-referenced):
+//
+//   0xFFFFE160..E16F   R113.M1-003 damage_region
+//   0xFFFFE1E0..E1EF   R113.M3-015 modifier_state
+//   0xFFFFE1F0..E1FF   R113.M2-009 shm_pool               (THIS FILE)
+//
+// Codes:
+//
+//   0xFFFFE1FF  SHM_POOL_ENOSPC       -- no free run of `pages` pages
+//   0xFFFFE1FE  SHM_POOL_BAD_SIZE     -- size == 0 or size > POOL_SIZE
+//   0xFFFFE1FD  SHM_POOL_BAD_OFFSET   -- free of non-live / mis-aligned offset
+//   0xFFFFE1FC  SHM_BUF_TAIL_ENOSPC   -- descriptor table full
+//   0xFFFFE1FB  SHM_BUF_BAD_DIMS      -- w == 0 || h == 0
+//   0xFFFFE1FA  SHM_BUF_BAD_STRIDE    -- stride == 0
+//   0xFFFFE1F9  SHM_BUF_BAD_FORMAT    -- format == 0 (M1-004 refines to fourcc)
+//   0xFFFFE1F8  SHM_BUF_BAD_SLOT      -- shm_buffer_id decodes invalid
+//   0xFFFFE1F7  SHM_BUF_BAD_OFFSET    -- wrap offset outside pool or unaligned
+//   0xFFFFE1F6  SHM_BUF_SIZE_MISMATCH -- h*stride exceeds allocated pool region
+//   0xFFFFE1F0..0xFFFFE1F5             -- reserved for M2-009 follow-on
+//
+// The `alloc -> -1` sentinel is 0xFFFFFFFFFFFFFFFF (a canonical u64
+// "-1") per task spec; it deliberately does NOT land in the E1Fx band
+// because callers gate on `== -1` rather than a range check for the
+// alloc path (matches every other pool allocator in the tree).
+//
+// -----------------------------------------------------------------------------
+// FINGERPRINT
+// -----------------------------------------------------------------------------
+//
+// `shm pool ok [legacy: SHM POOL OK]` emitted from `shm_pool_init`
+// with two hex KVs (`size` = SHM_POOL_SIZE_BYTES, `free` = same, both
+// in bytes) via `klog_s1_x2`.  Fires exactly once per boot from
+// kernel_main's cascade (init position: after damage_region_init;
+// before toplevel_init).  Byte counts verified by hand (§ FINGERPRINT
+// TAG below).  The `free` KV reports the initial free-byte count at
+// boot, which for the M2-009 landing always equals SHM_POOL_SIZE_BYTES
+// (no reservations at init); a future landing that pre-reserves a
+// carve-out for the compositor's mmap window will reduce this value.
+//
+// The tag is BOOT-VISIBLE.  A companion allowlist entry in
+// tools/verify-fingerprint-coverage.sh notes that no golden currently
+// pins the literal because the size / free suffix values are stable
+// but no test file asserts them today; the natural pin lands with the
+// M3 rendering-path boot witness that exercises alloc / wrap / attach
+// end-to-end.
+//
+// -----------------------------------------------------------------------------
+// SURFACE_ATTACH_BUFFER WIRE-UP (companion edit at surface_commit_ops.pdx)
+// -----------------------------------------------------------------------------
+//
+// surface_commit_ops.pdx sab_ body is edited alongside this file so
+// that the bo-slot validity gate discriminates on bit 31:
+//
+//   if (bo & 0x80000000):
+//     -> shm_buffer_valid(bo) -- return 1 iff live shm buffer id
+//   else:
+//     -> kgb_tail_valid(bo)   -- existing GPU BO gate (unchanged)
+//
+// Neither branch changes the surface_row_pending_set contract: the
+// low 32 bits of the id (SHM_BUF_ID_TAG | slot with SHM_BUF_MAX <= 32,
+// so slot fits in 5 bits) fit comfortably within the pending_bo u32
+// field of the KIND_SURFACE row (kind_surface.pdx §2).
+//
+// SURFACE_ATTACH_BAD_BO (0xFFFFE118, kind_surface.pdx L148) remains
+// the failure code for both an invalid GPU BO slot AND an invalid
+// SHM buffer id -- surface-side callers do not need to distinguish
+// which kind of buffer failed validation; the compositor's own error
+// path handles both uniformly.
+//
+// -----------------------------------------------------------------------------
+// ENCODER PITFALLS (per feedback_pdx_encoder_pitfalls v0.36+)
+// -----------------------------------------------------------------------------
+//
+//   * No `test rN, rN` -- every zero-check uses `cmp rN, 0` + `je/jne`.
+//   * No 2-op `imul r, imm` -- page-index math uses `shl r, 12` for
+//     *4096 and `shl r, 6` for row-index *64.
+//   * No `and reg, imm64` -- masks all fit imm32 (0xFFFFFFFF safe per
+//     tui_canvas/kind_gpu_bo precedent; 0x3F, 0xFFF, 0x80000000, and
+//     0x7FFFFFFF all fit as imm32 with sign bit clear at bit 31).
+//   * No `cmp reg, [mem]` -- every mem-compare loads to a scratch first.
+//   * No `not rN` -- use `xor r, 0xFFFFFFFFFFFFFFFF` (uefi_phys_seed.pdx
+//     L322-324 precedent).
+//   * `[reg + rN * 8]` register-scaled SIB with 8 in {1,2,4,8} used
+//     throughout for u64 tables.
+//   * Module name `ShmPool` matches the filename basename `shm_pool`.
+//
+// -----------------------------------------------------------------------------
+// LABEL PREFIXES (avoiding paideia-as reserved-keyword set per
+// feedback_paideia_as_reserved_labels: loop, if, let, while, for,
+// match, pub, mod, use, fn, struct, enum, impl, trait, type, where,
+// move, mut, ref)
+// -----------------------------------------------------------------------------
+//
+//   spi_    shm_pool_init
+//   spa_    shm_pool_alloc
+//   spf_    shm_pool_free
+//   sbw_    shm_buffer_wrap
+//   sbv_    shm_buffer_valid
+//   sbf_    shm_buffer_free
+//   sbs_    shm_buffer_stats bumpers (internal)
+
+module ShmPool = structure {
+
+  // ==========================================================================
+  // Constants (pool geometry).
+  // ==========================================================================
+
+  pub let SHM_POOL_SIZE_BYTES : u64 = 4194304    // 4 MiB
+  pub let SHM_PAGE_BYTES      : u64 = 4096
+  pub let SHM_PAGE_SHIFT      : u64 = 12         // log2(4096)
+  pub let SHM_PAGE_COUNT      : u64 = 1024       // 4 MiB / 4 KiB
+  pub let SHM_PAGE_MASK       : u64 = 4095       // low 12 bits
+
+  // ==========================================================================
+  // Constants (buffer descriptor table).
+  // ==========================================================================
+
+  pub let SHM_BUF_MAX          : u64 = 32
+  pub let SHM_BUF_ROW_BYTES    : u64 = 64
+  pub let SHM_BUF_ROW_SHIFT    : u64 = 6         // log2(64)
+
+  // Bit-31 discriminator.  The 32-bit pending_bo field on a KIND_SURFACE
+  // row (kind_surface.pdx §2 +56) holds either (a) a GPU BO slot in
+  // 0..KGB_MAX-1 (small integers, bit 31 always clear) or (b) an SHM
+  // buffer id 0x80000000 | slot with slot < SHM_BUF_MAX(32) so slot
+  // fits in 5 bits.  The two spaces are disjoint by construction.
+  pub let SHM_BUF_ID_TAG       : u64 = 0x80000000
+  pub let SHM_BUF_ID_MASK      : u64 = 0x0000001F   // low 5 bits (SHM_BUF_MAX=32)
+
+  // ==========================================================================
+  // Failure taxonomy -- 0xFFFFE1F0..0xFFFFE1FF (see file header).
+  // ==========================================================================
+
+  pub let SHM_OK                    : u64 = 0
+  pub let SHM_POOL_ENOSPC           : u64 = 0xFFFFE1FF
+  pub let SHM_POOL_BAD_SIZE         : u64 = 0xFFFFE1FE
+  pub let SHM_POOL_BAD_OFFSET       : u64 = 0xFFFFE1FD
+  pub let SHM_BUF_TAIL_ENOSPC       : u64 = 0xFFFFE1FC
+  pub let SHM_BUF_BAD_DIMS          : u64 = 0xFFFFE1FB
+  pub let SHM_BUF_BAD_STRIDE        : u64 = 0xFFFFE1FA
+  pub let SHM_BUF_BAD_FORMAT        : u64 = 0xFFFFE1F9
+  pub let SHM_BUF_BAD_SLOT          : u64 = 0xFFFFE1F8
+  pub let SHM_BUF_BAD_OFFSET        : u64 = 0xFFFFE1F7
+  pub let SHM_BUF_SIZE_MISMATCH     : u64 = 0xFFFFE1F6
+
+  // Alloc sentinel -- returned by shm_pool_alloc on any failure per
+  // the task spec's "offset | -1" contract.  Distinct from the E1Fx
+  // band because callers gate on `== -1` (mirrors every other pool
+  // allocator in the tree).
+  pub let SHM_ALLOC_FAIL            : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ==========================================================================
+  // Storage.
+  //
+  // _shm_pool (4 MiB) is a raw byte backing store; the kernel never
+  // accesses its payload directly (only mmap arranges VA windows over
+  // it in a future landing).  524288 u64 words * 8 B = 4 MiB.  Aligned
+  // 4 KiB so page-boundary offsets are natural page addresses.
+  //
+  // The pool is NOT scrubbed at boot for the same reason
+  // damage_region.pdx skips its 4 KiB _kbd_events store (see file
+  // header): with _shm_used == 0 no allocation is live, so the payload
+  // is semantically unreachable regardless of its contents.  Scrubbing
+  // 4 MiB at every boot would cost ~2^19 stores for zero correctness
+  // gain.  The metadata (bitmap, lens, stats, buffer table) IS scrubbed
+  // by shm_pool_init below.
+  // ==========================================================================
+
+  pub let mut _shm_pool      : [u64; 524288] = uninit @align(4096)  // 4 MiB
+  pub let mut _shm_used      : [u64; 16]     = uninit @align(64)    // 1024-bit bitmap
+  pub let mut _shm_lens      : [u64; 1024]   = uninit @align(64)    // pages per alloc
+  pub let mut _shm_stats     : [u64; 4]      = uninit @align(64)
+  pub let mut _shm_buf_table : [u64; 256]    = uninit @align(64)    // 32 * 8 u64
+  pub let mut _shm_buf_stats : [u64; 4]      = uninit @align(64)
+
+  pub let SHM_ST_ALLOCS   : u64 = 0
+  pub let SHM_ST_FREES    : u64 = 1
+  pub let SHM_ST_REFUSED  : u64 = 2
+  pub let SHM_ST_IN_USE   : u64 = 3
+
+  pub let SHM_BS_WRAPS    : u64 = 0
+  pub let SHM_BS_UNWRAPS  : u64 = 1
+  pub let SHM_BS_REFUSED  : u64 = 2
+  pub let SHM_BS_IN_USE   : u64 = 3
+
+  // ==========================================================================
+  // Fingerprint tag + KV keys.
+  //
+  // Byte count for shm_pool_ok_msg verified by hand:
+  //   "shm pool ok [legacy: SHM POOL OK]\0"
+  //    s h m _ p o o l _ o k _ [ l e g a c y :  _  S  H  M  _  P  O  O  L  _  O  K  ] NUL
+  //    1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34
+  // Total = 34 bytes.
+  //
+  // shm_k_size / shm_k_free are locally declared 5-byte keys ("size\0"
+  // + "free\0").  k_size already exists in klog/keys.pdx L353 as a
+  // shared key but declared here as file-local to keep the shm_pool
+  // landing self-contained and match the surface_commit_ops.pdx
+  // discipline (surface_k_serial declared locally at L170 even though
+  // it could theoretically reuse a generic k_serial).
+  // ==========================================================================
+
+  pub let shm_pool_ok_msg : [u8; 34] = "shm pool ok [legacy: SHM POOL OK]\0"
+  pub let shm_k_size      : [u8; 5]  = "size\0"
+  pub let shm_k_free      : [u8; 5]  = "free\0"
+
+  // ==========================================================================
+  // Stats bumpers (narrow-writer discipline per kind_surface.pdx
+  // stats_bump_* precedent).  All four are load-inc-store leaves,
+  // touching only rax/r10.  Callers reach these via named leaves
+  // rather than an index-dispatched note helper -- mirrors the
+  // tui_canvas / kind_surface narrow-writer style.
+  // ==========================================================================
+
+  pub let shm_pool_stats_bump_allocs : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): bump _shm_stats[SHM_ST_ALLOCS=0]. Load-inc-store, no `add reg, [mem]`. Called from shm_pool_alloc success tail only.",
+      block: {
+        lea r10, [rip + _shm_stats];
+        mov rax, [r10 + 0];
+        add rax, 1;
+        mov [r10 + 0], rax;
+        ret
+      }
+    }
+
+  pub let shm_pool_stats_bump_frees : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): bump _shm_stats[SHM_ST_FREES=1]. Load-inc-store.",
+      block: {
+        lea r10, [rip + _shm_stats];
+        mov rax, [r10 + 8];
+        add rax, 1;
+        mov [r10 + 8], rax;
+        ret
+      }
+    }
+
+  pub let shm_pool_stats_bump_refused : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): bump _shm_stats[SHM_ST_REFUSED=2]. Called from shm_pool_alloc / shm_pool_free refusal funnels.",
+      block: {
+        lea r10, [rip + _shm_stats];
+        mov rax, [r10 + 16];
+        add rax, 1;
+        mov [r10 + 16], rax;
+        ret
+      }
+    }
+
+  pub let shm_buf_stats_bump_wraps : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): bump _shm_buf_stats[SHM_BS_WRAPS=0]. Called from shm_buffer_wrap success tail only.",
+      block: {
+        lea r10, [rip + _shm_buf_stats];
+        mov rax, [r10 + 0];
+        add rax, 1;
+        mov [r10 + 0], rax;
+        ret
+      }
+    }
+
+  pub let shm_buf_stats_bump_unwraps : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): bump _shm_buf_stats[SHM_BS_UNWRAPS=1]. Called from shm_buffer_free success tail only.",
+      block: {
+        lea r10, [rip + _shm_buf_stats];
+        mov rax, [r10 + 8];
+        add rax, 1;
+        mov [r10 + 8], rax;
+        ret
+      }
+    }
+
+  pub let shm_buf_stats_bump_refused : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): bump _shm_buf_stats[SHM_BS_REFUSED=2]. Called from shm_buffer_wrap / shm_buffer_free refusal funnels.",
+      block: {
+        lea r10, [rip + _shm_buf_stats];
+        mov rax, [r10 + 16];
+        add rax, 1;
+        mov [r10 + 16], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Boot init (shm_pool_init).
+  //
+  // Scrubs the four metadata tables (bitmap, lens, stats, buf table,
+  // buf stats) then emits `shm pool ok size=<n> free=<n>` via
+  // klog_s1_x2.  Skips the 4 MiB payload for the reason argued in the
+  // file header (metadata zero = payload semantically unreachable).
+  //
+  // Register plan: no callee-save pushes needed (no long-lived scratch
+  // across the klog call; all state loaded fresh from imm).  klog_s1_x2
+  // v2 push idiom, alignment-adapted for our zero-frame context:
+  //
+  // klog_s1_x2 (wrappers.pdx L72) reads v2 via `mov rax, [rbp + 16]`
+  // AFTER its own `push rbp`.  Working backwards: at wrapper entry
+  // rsp%16 must be 8 (SysV ABI: call has just pushed ret_addr onto a
+  // 16-aligned rsp).  After wrapper's push rbp, rsp%16=0 and rbp =
+  // rsp = rsp_at_call - 16, so [rbp + 16] = [rsp_at_call], i.e. v2
+  // must be at the memory address that WAS rsp immediately before the
+  // caller's `call` instruction.
+  //
+  // Equivalently: at the moment of the caller's `call`, [rsp+0] = v2
+  // and rsp%16 = 0.  The canonical sequence is `push v2; call; add
+  // rsp, 8` which subtracts 8 (making rsp%16 flip) then executes the
+  // call with v2 sitting at [rsp+0].  For that to leave rsp%16=0 at
+  // the call, the pre-push rsp must be %16=8.
+  //
+  // Our entry rsp%16=8 (function-entry convention) with zero pushes
+  // gives us %16=8 right at the klog block, so we use the SHORT form:
+  //
+  //   push r10 (v2):   rsp%16 = 0    <- v2 at [rsp+0]
+  //   call klog_s1_x2: pushes ret     <- rsp%16 = 8 inside callee (correct)
+  //   add rsp, 8:      pops v2        <- rsp%16 = 8 (matches entry)
+  //
+  // The `sub rsp, 8; push v2; call; add rsp, 16` idiom used in
+  // surface_commit_ops.pdx (L419-423) is needed ONLY when the caller's
+  // pre-klog rsp%16 is 0 (which after 3 callee-save pushes + sub 16
+  // it becomes for scm_).  Ours is 8 without any pushes, so we skip
+  // the extra pad.  Both forms end up with the same rsp%16=0 at the
+  // moment of `call` -- the pad exists purely to normalize the
+  // starting alignment.
+  // ==========================================================================
+
+  pub let shm_pool_init : () -> () !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R113.M2-009 (#2389): zero all four metadata tables (_shm_used 16 u64, _shm_lens 1024 u64, _shm_stats 4 u64, _shm_buf_table 256 u64, _shm_buf_stats 4 u64) then emit `shm pool ok size=<POOL_SIZE> free=<POOL_SIZE>` via klog_s1_x2. Payload _shm_pool (524288 u64 = 4 MiB) deliberately NOT scrubbed: bitmap zero means no alloc is live, payload semantically unreachable. Called from kernel_main after damage_region_init and before toplevel_init (mirrors the kind_surface_init / damage_region_init cascade). Zero-frame variant of the klog_s1_x2 v2 push idiom: no callee-save pushes -> entry rsp%16=8 -> `push v2; call klog_s1_x2; add rsp, 8` (rsp%16 goes 8 -> 0 at call, matching the wrapper's ABI). This differs from the `sub rsp,8; push v2; call; add rsp,16` form used when the caller's pre-klog rsp%16=0 (surface_commit_ops.pdx L419 has 3 callee-save pushes + sub 16 which normalize to %16=0 before the klog block; we have zero pushes so we start at %16=8 and use the shorter form). Labels prefixed spi_.",
+      block: {
+        // Zero _shm_used (16 u64 = 1024 bits = 128 B).
+        lea r10, [rip + _shm_used];
+        xor rax, rax;
+        xor rcx, rcx;
+      spi_used:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  spi_used;
+
+        // Zero _shm_lens (1024 u64 = 8 KiB).
+        lea r10, [rip + _shm_lens];
+        xor rcx, rcx;
+      spi_lens:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 1024;
+        jb  spi_lens;
+
+        // Zero _shm_stats (4 u64).
+        lea r10, [rip + _shm_stats];
+        xor rcx, rcx;
+      spi_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  spi_stats;
+
+        // Zero _shm_buf_table (256 u64 = 2 KiB).
+        lea r10, [rip + _shm_buf_table];
+        xor rcx, rcx;
+      spi_bufs:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 256;
+        jb  spi_bufs;
+
+        // Zero _shm_buf_stats (4 u64).
+        lea r10, [rip + _shm_buf_stats];
+        xor rcx, rcx;
+      spi_bufstats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  spi_bufstats;
+
+        // Emit fingerprint: klog_s1_x2(LEVEL_INFO=3, SUBSYS_MM__,
+        //   shm_pool_ok_msg, shm_k_size, POOL_SIZE, shm_k_free, POOL_SIZE).
+        // v2 (POOL_SIZE) pushed as 7th arg per klog_s1_x2 ABI
+        // (wrappers.pdx L72).
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_MM__];
+        lea rdx, [rip + shm_pool_ok_msg];
+        lea rcx, [rip + shm_k_size];
+        mov r8,  0x400000;                   // v1 = SHM_POOL_SIZE_BYTES = 4 MiB
+        lea r9,  [rip + shm_k_free];
+        mov r10, 0x400000;                   // v2 = same (all bytes free at init)
+        push r10;                            // v2 lands at [rsp+0]; rsp%16 flips 8->0
+        call klog_s1_x2;                     // wrapper reads v2 at [rbp+16] post-push-rbp
+        add rsp, 8;                          // pop v2; restore entry rsp%16=8
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // shm_pool_alloc(size) -> offset | SHM_ALLOC_FAIL
+  //
+  // Gate order:
+  //   (1) size != 0                              -> else SHM_ALLOC_FAIL
+  //   (2) size <= SHM_POOL_SIZE_BYTES            -> else SHM_ALLOC_FAIL
+  //   (3) pages = (size + 4095) >> 12
+  //   (4) first-fit scan i = 0..PAGE_COUNT-pages
+  //         at each i, check pages consecutive bits clear in bitmap
+  //   (5) if none found: bump refused stats, return SHM_ALLOC_FAIL
+  //   (6) set bits i..i+pages-1
+  //   (7) _shm_lens[i] = pages
+  //   (8) bump allocs stats
+  //   (9) return i << 12
+  //
+  // The task spec calls for `offset | -1` -- all three failure arms
+  // above collapse to SHM_ALLOC_FAIL (0xFFFFFFFFFFFFFFFF).  Refused
+  // stats bump on the ENOSPC arm only (BAD_SIZE is a caller error;
+  // tracked implicitly via absence of a corresponding alloc).
+  //
+  // Register plan: rbx=size (survives across bumper call), r12=pages,
+  // r13=start_page, r14=probe_page, r15=end_page.  Five callee-save
+  // pushes = 40 B; entry rsp%16==8 -> (8+40)=48 %16=0, aligned for
+  // every nested call (only the bumpers, all pure leaves).
+  // ==========================================================================
+
+  pub let shm_pool_alloc : (u64) -> u64 !{mem} @{} =
+    fn (size: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): first-fit page-granular allocator over _shm_pool. Gate order: (1) size != 0; (2) size <= SHM_POOL_SIZE_BYTES; (3) round pages = (size+4095)>>12; (4) linear scan for a run of `pages` clear bits; (5) if none: refused++, return SHM_ALLOC_FAIL; (6) set bits; (7) _shm_lens[start] = pages; (8) allocs++; (9) return start<<12. All failure arms return SHM_ALLOC_FAIL (0xFFFFFFFFFFFFFFFF) per task spec `offset | -1`. Five callee-save pushes align rsp%16=0 for nested bumper calls. Bitmap ops via word_idx=page>>6, bit_idx=page&63, `mov r; shl by cl; and/or` idiom (uefi_phys_seed.pdx L315-330 precedent). Labels prefixed spa_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                        // rbx = size (survives)
+
+        // Gate 1: size != 0
+        cmp rbx, 0;
+        je  spa_fail;
+
+        // Gate 2: size <= SHM_POOL_SIZE_BYTES
+        mov r10, 0x400000;                   // 4 MiB
+        cmp rbx, r10;
+        ja  spa_fail;
+
+        // pages = (size + 4095) >> 12
+        mov r12, rbx;
+        add r12, 4095;
+        shr r12, 12;
+        // Guard: pages must be >= 1 (implied by size != 0) and
+        // <= SHM_PAGE_COUNT (1024).  size <= 4 MiB gives pages <= 1024.
+        cmp r12, 0;
+        je  spa_fail;
+
+        // Scan: start_page = 0..1024-pages, inclusive.
+        // r13 = start_page (probe candidate)
+        // r15 = SHM_PAGE_COUNT - pages (last legal start, inclusive)
+        mov r15, 1024;
+        sub r15, r12;                        // r15 = 1024 - pages
+
+        xor r13, r13;                        // r13 = start = 0
+      spa_scan:
+        cmp r13, r15;
+        ja  spa_enospc;                      // r13 > 1024-pages -> no room
+
+        // Inner check: probe pages [r13..r13+r12).  If any is set,
+        // bump start and continue.
+        mov r14, r13;                        // r14 = probe page
+        mov r11, r12;                        // r11 = pages remaining
+      spa_probe:
+        cmp r11, 0;
+        je  spa_claim;                       // all pages checked, run is clear
+
+        // word = probe >> 6; bit = probe & 63
+        mov r8, r14;
+        shr r8, 6;
+        mov r9, r14;
+        and r9, 63;
+
+        lea r10, [rip + _shm_used];
+        mov rax, [r10 + r8 * 8];
+        mov rcx, r9;
+        mov rdx, 1;
+        shl rdx, cl;                         // rdx = 1 << bit
+        and rax, rdx;
+        cmp rax, 0;
+        jne spa_next;                        // bit set -> advance start
+
+        add r14, 1;
+        sub r11, 1;
+        jmp spa_probe;
+
+      spa_next:
+        add r13, 1;
+        jmp spa_scan;
+
+      spa_claim:
+        // Claim [r13..r13+r12): set bits.
+        mov r14, r13;                        // r14 = current page
+        mov r11, r12;                        // r11 = pages remaining
+      spa_set:
+        cmp r11, 0;
+        je  spa_recorded;
+
+        mov r8, r14;
+        shr r8, 6;
+        mov r9, r14;
+        and r9, 63;
+
+        lea r10, [rip + _shm_used];
+        mov rax, [r10 + r8 * 8];
+        mov rcx, r9;
+        mov rdx, 1;
+        shl rdx, cl;
+        or  rax, rdx;
+        mov [r10 + r8 * 8], rax;
+
+        add r14, 1;
+        sub r11, 1;
+        jmp spa_set;
+
+      spa_recorded:
+        // _shm_lens[r13] = r12 (pages)
+        lea r10, [rip + _shm_lens];
+        mov [r10 + r13 * 8], r12;
+
+        // stats.allocs++
+        call shm_pool_stats_bump_allocs;
+
+        // return offset = start_page << 12
+        mov rax, r13;
+        shl rax, 12;
+        jmp spa_out;
+
+      spa_enospc:
+        call shm_pool_stats_bump_refused;
+      spa_fail:
+        mov rax, 0xFFFFFFFFFFFFFFFF;         // SHM_ALLOC_FAIL
+
+      spa_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // shm_pool_free(offset) -> 0 | SHM_POOL_BAD_OFFSET
+  //
+  // Gate order:
+  //   (1) offset < SHM_POOL_SIZE_BYTES                 -> else BAD_OFFSET
+  //   (2) offset & 0xFFF == 0 (page-aligned)           -> else BAD_OFFSET
+  //   (3) start_page = offset >> 12
+  //   (4) pages = _shm_lens[start_page]
+  //   (5) pages != 0 (offset names a live alloc start) -> else BAD_OFFSET
+  //   (6) clear bits [start..start+pages)
+  //   (7) _shm_lens[start] = 0
+  //   (8) bump frees stats
+  //   (9) return SHM_OK
+  //
+  // Three callee-save pushes (r12=start_page, r13=pages, r14=current_page
+  // used as clear-loop cursor) = 24 B; entry rsp%16==8 -> (8+24)=32 %16=0.
+  // No sub rsp,8 needed; pushing an odd count of callee-saves that arrives
+  // at %16=0 avoids the alignment pad.
+  // ==========================================================================
+
+  pub let shm_pool_free : (u64) -> u64 !{mem} @{} =
+    fn (offset: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): release an allocation by first-page offset. Gate order: (1) offset < POOL_SIZE; (2) offset page-aligned; (3) look up pages from _shm_lens[offset>>12]; (4) refuse if pages==0 (not a live start); (5) clear bits [start..start+pages); (6) zero _shm_lens[start]; (7) frees++. Refused arm bumps refused stats. Three callee-save pushes (r12/r13/r14 -- r14 is the clear-loop cursor and must be preserved for our caller) sum to 24 B; entry rsp%16==8 -> (8+24)=32 %16=0 aligned for bumper calls without an extra alignment pad. Bit-clear via `xor r, -1 ; and` (uefi_phys_seed.pdx L322-329 precedent). Labels prefixed spf_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                        // r12 = offset
+
+        // Gate 1: offset < POOL_SIZE
+        mov r10, 0x400000;
+        cmp r12, r10;
+        jae spf_bad;
+
+        // Gate 2: page-aligned
+        mov rax, r12;
+        and rax, 4095;
+        cmp rax, 0;
+        jne spf_bad;
+
+        // start_page = offset >> 12
+        mov r13, r12;
+        shr r13, 12;
+
+        // Look up length
+        lea r10, [rip + _shm_lens];
+        mov r11, [r10 + r13 * 8];            // r11 = pages
+        cmp r11, 0;
+        je  spf_bad;
+
+        // Save length for the clear loop
+        mov r12, r13;                        // r12 = start_page (reuse; offset no longer needed)
+        mov r13, r11;                        // r13 = pages
+
+        // Clear bits [r12..r12+r13)
+        mov r14, r12;                        // current page
+        mov r11, r13;                        // pages remaining
+      spf_clr:
+        cmp r11, 0;
+        je  spf_zeroed;
+
+        mov r8, r14;
+        shr r8, 6;
+        mov r9, r14;
+        and r9, 63;
+
+        lea r10, [rip + _shm_used];
+        mov rax, [r10 + r8 * 8];
+        mov rcx, r9;
+        mov rdx, 1;
+        shl rdx, cl;
+        xor rdx, 0xFFFFFFFFFFFFFFFF;         // rdx = ~(1<<bit)
+        and rax, rdx;
+        mov [r10 + r8 * 8], rax;
+
+        add r14, 1;
+        sub r11, 1;
+        jmp spf_clr;
+
+      spf_zeroed:
+        // Zero _shm_lens[start]
+        lea r10, [rip + _shm_lens];
+        xor rax, rax;
+        mov [r10 + r12 * 8], rax;
+
+        // stats.frees++
+        call shm_pool_stats_bump_frees;
+
+        xor rax, rax;                        // SHM_OK
+        jmp spf_out;
+
+      spf_bad:
+        call shm_pool_stats_bump_refused;
+        mov rax, 0xFFFFE1FD;                 // SHM_POOL_BAD_OFFSET
+
+      spf_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // shm_buffer_wrap(offset, w, h, stride, format) -> shm_buffer_id | error
+  //
+  // Gate order:
+  //   (1) offset < SHM_POOL_SIZE_BYTES                    -> else SHM_BUF_BAD_OFFSET
+  //   (2) offset & 0xFFF == 0                             -> else SHM_BUF_BAD_OFFSET
+  //   (3) w != 0 && h != 0                                -> else SHM_BUF_BAD_DIMS
+  //   (4) stride != 0                                     -> else SHM_BUF_BAD_STRIDE
+  //   (5) format != 0                                     -> else SHM_BUF_BAD_FORMAT
+  //   (6) pages = _shm_lens[offset >> 12]; pages != 0     -> else SHM_BUF_BAD_OFFSET
+  //   (7) alloc_size = pages << 12; buf_size = h * stride
+  //   (8) buf_size <= alloc_size                          -> else SHM_BUF_SIZE_MISMATCH
+  //   (9) scan _shm_buf_table for first free row
+  //  (10) if none: SHM_BUF_TAIL_ENOSPC
+  //  (11) LAM: bump generation, OR in 1<<56 marker
+  //  (12) stamp row: offset, size, wh_packed, stride, format
+  //  (13) bump wraps stats
+  //  (14) return SHM_BUF_ID_TAG | slot
+  //
+  // Register plan: rbx=offset, r12=w, r13=h, r14=stride, r15=format,
+  // rbp=slot (later id).  Six callee-save pushes = 48 B; entry rsp%16=8
+  // -> (8+48)=56 %16=8 -- WRONG.  Add `sub rsp, 8` -> 64 %16=0.
+  //
+  // h * stride uses `imul r64, r64` (signed 64x64 -> 64 truncated;
+  // per gamepad.pdx L286 paideia-as has NO `mul r64` primitive so the
+  // rdx:rax overflow-detecting form is unavailable).  To keep the
+  // multiply overflow-safe with only the truncated primitive, we
+  // gate h < 2^32 and stride < 2^32 BEFORE the multiply: with both
+  // factors bounded by 2^32 the product is < 2^64 so the truncated
+  // result equals the true 64-bit result.  0xFFFFFFFF is safe as an
+  // imm32 mask per the pitfall precedent (tui_canvas / kind_gpu_bo).
+  // ==========================================================================
+
+  pub let shm_buffer_wrap : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (offset: u64) (w: u64) (h: u64) (stride: u64) (format: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): wrap a pool sub-region as an SHM buffer id. Gate order per file header §sbw_ block. h*stride via `imul r64, r64` (truncated; no `mul r64` in paideia-as per gamepad.pdx L286) is overflow-safe because w/h/stride are all gated < 2^32 first, keeping the u64 product within 2^64. Six callee-save pushes (rbx=offset, r12=w, r13=h, r14=stride, r15=format, rbp=slot) + sub rsp,8 align rsp%16=0 (entry 8 + 48 + 8 = 64) for nested bumper calls. Refusal funnel stashes sentinel in the [rsp+0] alignment pad rather than pushing rax (avoids flipping rsp%16 mid-bumper-call). SHM_BUF_ID_TAG built via `mov rax, 1; shl rax, 31` rather than `mov rax, 0x80000000` (encoder may sign-extend the imm32 literal, which would then trip surface_row_pending_set's bo>=2^32 gate). Labels prefixed sbw_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;
+
+        mov rbx, rdi;                        // offset
+        mov r12, rsi;                        // w
+        mov r13, rdx;                        // h
+        mov r14, rcx;                        // stride
+        mov r15, r8;                         // format
+
+        // Gate 1: offset < POOL_SIZE
+        mov r10, 0x400000;
+        cmp rbx, r10;
+        jae sbw_bad_offset;
+
+        // Gate 2: page-aligned
+        mov rax, rbx;
+        and rax, 4095;
+        cmp rax, 0;
+        jne sbw_bad_offset;
+
+        // Gate 3: w != 0 && h != 0 && each < 2^32.
+        // The upper bound on h is essential for overflow-safe h*stride
+        // via `imul r64, r64` (truncated); see file header §Register
+        // plan.  w's own upper bound is not required for the multiply
+        // but is imposed symmetrically so the wh_packed field never
+        // truncates a legitimate value.
+        cmp r12, 0;
+        je  sbw_bad_dims;
+        mov rax, 0xFFFFFFFF;
+        cmp r12, rax;
+        ja  sbw_bad_dims;
+        cmp r13, 0;
+        je  sbw_bad_dims;
+        cmp r13, rax;
+        ja  sbw_bad_dims;
+
+        // Gate 4: stride != 0 && stride < 2^32.
+        cmp r14, 0;
+        je  sbw_bad_stride;
+        cmp r14, rax;
+        ja  sbw_bad_stride;
+
+        // Gate 5: format != 0
+        cmp r15, 0;
+        je  sbw_bad_format;
+
+        // Gate 6: _shm_lens[offset >> 12] != 0
+        mov r11, rbx;
+        shr r11, 12;                         // r11 = start_page
+        lea r10, [rip + _shm_lens];
+        mov r9, [r10 + r11 * 8];             // r9 = pages
+        cmp r9, 0;
+        je  sbw_bad_offset;
+
+        // Gate 8: h * stride <= pages << 12
+        // buf_size = h * stride via `imul r64, r64` (truncated; no
+        // `mul r64` primitive in paideia-as per gamepad.pdx L286).
+        // With h < 2^32 and stride < 2^32 (both gated above), the
+        // product is < 2^64 so the truncated result equals the true
+        // product -- no overflow to detect.
+        mov rax, r14;                        // rax = stride
+        imul rax, r13;                       // rax = stride * h  (u64, no overflow given u32 bounds)
+        mov r10, r9;                         // r10 = pages
+        shl r10, 12;                         // r10 = pages * 4096 = alloc_size (u64, r9 <= 1024 so r10 <= 4 MiB)
+        cmp rax, r10;
+        ja  sbw_size_mismatch;
+        // Save buf_size in a callee-preserved holding cell (stack pad).
+        mov [rsp + 0], rax;                  // [rsp+0] = buf_size
+
+        // (9) Scan _shm_buf_table for first free row.
+        xor rbp, rbp;                        // rbp = slot
+      sbw_scan:
+        cmp rbp, 32;                         // SHM_BUF_MAX
+        jae sbw_enospc;
+
+        lea r10, [rip + _shm_buf_table];
+        mov r11, rbp;
+        shl r11, 6;                          // slot * 64
+        add r10, r11;                        // r10 = row base
+
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  sbw_claim;
+
+        add rbp, 1;
+        jmp sbw_scan;
+
+      sbw_claim:
+        // (11) LAM: hdr = ((old_gen + 1) & 0x00FFFFFFFFFFFFFF) | (1<<56)
+        mov r11, [r10 + 0];
+        mov r9, 0x00FFFFFFFFFFFFFF;
+        and r11, r9;
+        add r11, 1;
+        and r11, r9;
+        mov r8, 1;
+        shl r8, 56;
+        or  r11, r8;
+        mov [r10 + 0], r11;                  // hdr
+
+        // (12) Row stamp:
+        //   +8  offset
+        mov [r10 + 8], rbx;
+        //   +16 size (h * stride from stack pad)
+        mov rax, [rsp + 0];
+        mov [r10 + 16], rax;
+        //   +24 wh_packed = (w << 32) | h
+        mov rax, r12;
+        and rax, 0xFFFFFFFF;
+        shl rax, 32;
+        mov r11, r13;
+        and r11, 0xFFFFFFFF;
+        or  rax, r11;
+        mov [r10 + 24], rax;
+        //   +32 stride
+        mov [r10 + 32], r14;
+        //   +40 format
+        mov [r10 + 40], r15;
+        //   +48 reserved
+        xor rax, rax;
+        mov [r10 + 48], rax;
+        //   +56 reserved
+        mov [r10 + 56], rax;
+
+        // (13) wraps++
+        call shm_buf_stats_bump_wraps;
+
+        // (14) return SHM_BUF_ID_TAG | slot
+        // Build 0x80000000 via `mov + shl` rather than `mov rax,
+        // 0x80000000`: paideia-as's imm32 encoding of that literal
+        // may sign-extend to 0xFFFFFFFF_80000000, which would trip
+        // surface_row_pending_set's `bo >= 2^32` gate (kind_surface.pdx
+        // L466-469 checks `bo >> 32 != 0` and rejects with
+        // SURFACE_BAD_SLOT).  `shl rax, 31` unambiguously zero-extends.
+        mov rax, 1;
+        shl rax, 31;                         // rax = 0x00000000_80000000
+        or  rax, rbp;                        // rax = SHM_BUF_ID_TAG | slot
+        jmp sbw_out;
+
+      sbw_bad_offset:
+        mov rax, 0xFFFFE1F7;
+        jmp sbw_refused;
+      sbw_bad_dims:
+        mov rax, 0xFFFFE1FB;
+        jmp sbw_refused;
+      sbw_bad_stride:
+        mov rax, 0xFFFFE1FA;
+        jmp sbw_refused;
+      sbw_bad_format:
+        mov rax, 0xFFFFE1F9;
+        jmp sbw_refused;
+      sbw_size_mismatch:
+        mov rax, 0xFFFFE1F6;
+        jmp sbw_refused;
+      sbw_enospc:
+        mov rax, 0xFFFFE1FC;
+
+      sbw_refused:
+        // Shared refusal funnel: preserve sentinel across the bumper
+        // call by stashing it in the 8-byte alignment pad at [rsp+0]
+        // (repurposed from its buf_size role in the success path,
+        // which is dead once we reach this funnel).  Using the pad
+        // instead of `push rax` avoids flipping rsp%16 mid-call --
+        // the bumper is a SysV callee that expects rsp%16=0 at its
+        // call site (post-6-pushes + sub 8 rsp is at %16=0; a naked
+        // push rax would flip that to %16=8 which is an ABI violation
+        // even though the bumper's own body would still run correctly).
+        mov [rsp + 0], rax;
+        call shm_buf_stats_bump_refused;
+        mov rax, [rsp + 0];
+
+      sbw_out:
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // shm_buffer_valid(id) -> 0 | 1
+  //
+  // 1 iff id has SHM_BUF_ID_TAG set AND (id & 0x1F) names a live row
+  // in _shm_buf_table.  Callers include surface_attach_buffer's SHM-
+  // path arm (surface_commit_ops.pdx sab_).  Returns 0 on any invalid
+  // id (missing tag, out-of-range slot, cleared in_use); does NOT bump
+  // stats (predicates never bump).  Pure leaf, no callee-save clobber.
+  // ==========================================================================
+
+  pub let shm_buffer_valid : (u64) -> u64 !{mem} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): 1 iff id has SHM_BUF_ID_TAG (bit 31) set AND slot < SHM_BUF_MAX AND row in_use. Pure predicate; does not bump stats. Called from surface_commit_ops.pdx sab_ SHM-path arm. Labels prefixed sbv_.",
+      block: {
+        // Check bit 31 set
+        mov rax, rdi;
+        shr rax, 31;
+        and rax, 1;
+        cmp rax, 0;
+        je  sbv_no;
+
+        // slot = id & 0x1F
+        mov r11, rdi;
+        and r11, 0x1F;                       // SHM_BUF_ID_MASK (low 5 bits)
+
+        // slot < SHM_BUF_MAX (32) guaranteed by 5-bit mask, but keep
+        // the check for defense against a future MAX bump.
+        cmp r11, 32;
+        jae sbv_no;
+
+        // Read hdr
+        lea r10, [rip + _shm_buf_table];
+        mov r8, r11;
+        shl r8, 6;
+        add r10, r8;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  sbv_no;
+
+        mov rax, 1;
+        ret;
+      sbv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // shm_buffer_free(id) -> SHM_OK | SHM_BUF_BAD_SLOT
+  //
+  // Releases the buffer descriptor row (bumps gen, clears in_use).
+  // Does NOT release the underlying pool region -- wl_shm semantics
+  // treat the pool as owning its bytes independently of any buffer
+  // views into it.  The caller is responsible for shm_pool_free on
+  // the region when the last buffer view is dropped.
+  //
+  // Register plan: r12=slot (survives across bumper call).  One
+  // callee-save push + sub rsp,8 = 16 B; entry rsp%16==8 -> (8+16)=24
+  // %16=8 -- WRONG.  Use one push only (rsp%16==0), no sub.
+  // ==========================================================================
+
+  pub let shm_buffer_free : (u64) -> u64 !{mem} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): release an SHM buffer descriptor row. Does NOT release underlying pool region (wl_shm pool outlives its buffer views). Gate: id must decode via shm_buffer_valid; else SHM_BUF_BAD_SLOT. Bump gen + clear in_use byte + unwraps++. One callee-save push (r12=slot) aligns rsp%16=0 (entry 8 + 8 = 16) for nested calls. Labels prefixed sbf_.",
+      block: {
+        push r12;
+
+        mov r12, rdi;                        // id
+
+        // Validate via shm_buffer_valid (predicate touches only rax/r8/r10/r11)
+        mov rdi, r12;
+        call shm_buffer_valid;
+        cmp rax, 0;
+        je  sbf_bad;
+
+        // slot = id & 0x1F
+        mov r11, r12;
+        and r11, 0x1F;
+
+        // hdr = ((old_low56 + 1) & 0x00FFFFFFFFFFFFFF); top byte = 0 (clears in_use)
+        lea r10, [rip + _shm_buf_table];
+        mov r8, r11;
+        shl r8, 6;
+        add r10, r8;
+
+        mov rax, [r10 + 0];
+        mov r9, 0x00FFFFFFFFFFFFFF;
+        and rax, r9;
+        add rax, 1;
+        and rax, r9;
+        mov [r10 + 0], rax;                  // top byte now 0 (in_use cleared), gen bumped
+
+        // unwraps++
+        call shm_buf_stats_bump_unwraps;
+
+        xor rax, rax;                        // SHM_OK
+        jmp sbf_out;
+
+      sbf_bad:
+        call shm_buf_stats_bump_refused;
+        mov rax, 0xFFFFE1F8;                 // SHM_BUF_BAD_SLOT
+
+      sbf_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Row accessors for the buffer descriptor table.
+  //
+  // Callers (surface_commit_ops attach path, a future compositor
+  // scanout body) read (offset, size, w, h, stride, format) via these
+  // typed getters rather than raw row-base + displacement.  All
+  // accessors gate on shm_buffer_valid first; a stale id returns
+  // SHM_BUF_BAD_SLOT for size/offset/stride/format (all values are u64
+  // sentinel-clean at 0xFFFFE1F8) or 0 for dims (w and h are packed
+  // together; a sentinel would collide with a legal 0 result).
+  // ==========================================================================
+
+  pub let shm_buf_row_offset : (u64) -> u64 !{mem} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): pool offset stored at row+8. Returns SHM_BUF_BAD_SLOT on invalid id. Labels prefixed sbo_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call shm_buffer_valid;
+        cmp rax, 0;
+        je  sbo_bad;
+        mov r11, r12;
+        and r11, 0x1F;
+        lea r10, [rip + _shm_buf_table];
+        mov r8, r11;
+        shl r8, 6;
+        add r10, r8;
+        mov rax, [r10 + 8];
+        jmp sbo_out;
+      sbo_bad:
+        mov rax, 0xFFFFE1F8;
+      sbo_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let shm_buf_row_size : (u64) -> u64 !{mem} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): buffer byte size (h*stride) stored at row+16. Labels prefixed sbz_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call shm_buffer_valid;
+        cmp rax, 0;
+        je  sbz_bad;
+        mov r11, r12;
+        and r11, 0x1F;
+        lea r10, [rip + _shm_buf_table];
+        mov r8, r11;
+        shl r8, 6;
+        add r10, r8;
+        mov rax, [r10 + 16];
+        jmp sbz_out;
+      sbz_bad:
+        mov rax, 0xFFFFE1F8;
+      sbz_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let shm_buf_row_dims : (u64) -> u64 !{mem} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): wh_packed (w<<32|h) at row+24. Returns 0 on invalid id (caller unpacks; a 0 result already reads as w=0, h=0 which are refused at wrap). Labels prefixed sbd_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call shm_buffer_valid;
+        cmp rax, 0;
+        je  sbd_zero;
+        mov r11, r12;
+        and r11, 0x1F;
+        lea r10, [rip + _shm_buf_table];
+        mov r8, r11;
+        shl r8, 6;
+        add r10, r8;
+        mov rax, [r10 + 24];
+        jmp sbd_out;
+      sbd_zero:
+        xor rax, rax;
+      sbd_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let shm_buf_row_stride : (u64) -> u64 !{mem} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): stride at row+32. Labels prefixed sbt_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call shm_buffer_valid;
+        cmp rax, 0;
+        je  sbt_bad;
+        mov r11, r12;
+        and r11, 0x1F;
+        lea r10, [rip + _shm_buf_table];
+        mov r8, r11;
+        shl r8, 6;
+        add r10, r8;
+        mov rax, [r10 + 32];
+        jmp sbt_out;
+      sbt_bad:
+        mov rax, 0xFFFFE1F8;
+      sbt_out:
+        pop r12;
+        ret
+      }
+    }
+
+  pub let shm_buf_row_format : (u64) -> u64 !{mem} @{} =
+    fn (id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M2-009 (#2389): format fourcc at row+40. Labels prefixed sbr_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+        call shm_buffer_valid;
+        cmp rax, 0;
+        je  sbr_bad;
+        mov r11, r12;
+        and r11, 0x1F;
+        lea r10, [rip + _shm_buf_table];
+        mov r8, r11;
+        shl r8, 6;
+        add r10, r8;
+        mov rax, [r10 + 40];
+        jmp sbr_out;
+      sbr_bad:
+        mov rax, 0xFFFFE1F8;
+      sbr_out:
+        pop r12;
+        ret
+      }
+    }
+}
