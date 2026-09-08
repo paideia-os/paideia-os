@@ -1490,6 +1490,60 @@ ALLOWLIST = {
         "Wave0-B6 G7-M6-001 (#2269): recovery_plane_reserve (KIND=0x1C8) "
         "data-only decl; input-server-side reservation not yet booted.",
 
+    # ------------------------------------------------------------------
+    # R113.M1-001 (paideia-os #2381): KIND_SURFACE kernel-side substrate
+    # (row pool + mint + destroy + row accessors). All five R113.M1
+    # fingerprint tags (mint / destroy / commit / fmt bind / present)
+    # land in this PR per design/graphics/r113-m1-substrate.md §8's
+    # mandate to prevent the Wave-12 SURFACE COMMIT OK allowlist gap
+    # from re-opening; the mint + destroy emitters are wired in
+    # src/kernel/core/cap/kind_surface.pdx (surface_mint / surface_
+    # destroy), the other three tags live there as data-only with the
+    # emitters landing in the M1-002 / M1-004 / M1-005 siblings.
+    #
+    # None of the five is reachable in the default matrix today: mint
+    # and destroy fire only when cap_handler_surface (a follow-on
+    # kernel dispatcher, doc §9 milestone graph) invokes surface_mint
+    # or surface_destroy -- no code path in kernel_main.pdx does that
+    # yet (kind_surface_init runs at boot but is a pure pool scrub and
+    # does not itself call mint/destroy). The other three fingerprints
+    # (commit / fmt bind / present) belong to the M1-002 / M1-004 /
+    # M1-005 wire bodies which have not landed. Real-HW / wire-deferred
+    # posture identical to the sibling `surface kind mint ok` /
+    # `surface commit mint ok` entries above.
+    # ------------------------------------------------------------------
+    "surface mint ok [legacy: SURFACE MINT OK]":
+        "R113.M1-001 (#2381): kernel-side KIND_SURFACE mint fingerprint; "
+        "surface_mint body is wired but no caller exists today (cap_"
+        "handler_surface dispatcher is a follow-on landing per design/"
+        "graphics/r113-m1-substrate.md §9). Assertable when the "
+        "dispatcher + a boot witness exercise the mint path end-to-end.",
+    "surface destroy ok [legacy: SURFACE DESTROY OK]":
+        "R113.M1-001 (#2381): kernel-side KIND_SURFACE destroy fingerprint; "
+        "surface_destroy body is wired but no caller exists today (same "
+        "cap_handler_surface dispatcher dependency as `surface mint ok` "
+        "above). Assertable when the dispatcher + a boot witness exercise "
+        "the destroy path end-to-end.",
+    "surface commit ok [legacy: SURFACE COMMIT OK]":
+        "R113.M1-001 (#2381): kernel-side SURFACE COMMIT OK tag; landed "
+        "here alongside the other four R113.M1 tags to close the Wave-12 "
+        "SURFACE COMMIT OK allowlist gap. Emitter lands in R113.M1-002 "
+        "(#2382, surface commit-txn body) which calls surface_row_swap + "
+        "surface_stats_bump_commits then klog_s1_x1 with this tag. "
+        "Assertable when M1-002 + a boot witness land together.",
+    "surface fmt bind ok [legacy: SURFACE FMT BIND OK]":
+        "R113.M1-001 (#2381): kernel-side SURFACE FMT BIND OK tag; landed "
+        "here per doc §8's five-tag mandate. Emitter lands in R113.M1-004 "
+        "(#2384, format negotiation) which calls surface_row_format_set "
+        "on first attach and klog_s1_x1 with this tag. Assertable when "
+        "M1-004 + a boot witness land together.",
+    "surface present ok [legacy: SURFACE PRESENT OK]":
+        "R113.M1-001 (#2381): kernel-side SURFACE PRESENT OK tag; landed "
+        "here per doc §8's five-tag mandate. Emitter lands in R113.M1-005 "
+        "(#2385, present-fence) which calls surface_row_swap from the "
+        "scanout-complete IRQ handler and klog_s1_x1 with this tag. "
+        "Assertable when M1-005 + a boot witness land together.",
+
     # Batch 7: G7 close-out (src/user/compositor/*.pdx)
     "pdx kind subsurface meta [legacy: SUBSURFACE SYNC OK]":
         "Wave0-B7 G7-M3-003 (#2258): subsurface_sync (KIND=0x1BA) "
