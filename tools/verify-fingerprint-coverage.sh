@@ -250,6 +250,57 @@ ALLOWLIST = {
         "when R111.M2 opens boot_r111_uefi_bridge (same follow-up "
         "target as UEFI BRIDGE OK / UEFI PML4 OK above).",
 
+    # src/kernel/core/klog/keys.pdx tag_nvme_attach_ok —
+    # R111.M3-011 (paideia-os #2363).  NVMe real-HW controller-attach
+    # per-instance OK fingerprint. Wire line shape:
+    #     "NVME ATTACH OK bdf=0x<hex> mn=0x<hex8> fr=0x<hex8> ncap=<dec>"
+    # Unreachable in every 14-mode QEMU matrix: under `-kernel` boot
+    # MCFG is absent so `_nvme_device_count` stays 0 even with
+    # `-device nvme` attached (see tools/run-smoke.sh L1866-1868 note
+    # for boot_r52_pdxfs_mkfs_nvme --with-disk); attach then takes
+    # the NVME BOOT NONE arm (no OK token, correctly not gate-visible).
+    # Same real-HW-only posture as the sibling
+    # "NVME HW SMOKE IDENTIFY-NS OK" entry below; assertable when a
+    # real-HW T14 G4 smoke wire lands.
+    "NVME ATTACH OK":
+        "Real-HW-only reachability (R111.M3-011 NVMe attach OK "
+        "fingerprint); the 14-mode QEMU matrix takes the sibling "
+        "NVME BOOT NONE arm because -kernel boot has no MCFG, so "
+        "_nvme_device_count stays 0 even with -device nvme.",
+
+    # src/kernel/boot/witness/rootfs_mount_witness.pdx tag_rootfs_mount_ok —
+    # R111.M3-013 (paideia-os #2365).  ESP-embedded PdxFS-lite rootfs
+    # blob witness fingerprint (OK arm) emitted from
+    # rootfs_mount_witness_run when the UEFI stub's efi_load_initrd
+    # successfully staged a blob from L"\EFI\PAIDEIA\rootfs.pdxfs"
+    # into a Boot-Services pool alloc and latched (pa, size) through
+    # boot_env @ +104 / +112.  Wire line shape:
+    #     "ROOTFS MOUNT OK type=pdxfs pa=0x<16hex> size=<dec>"
+    # The OK-bearing tag prefix is broken out as tag_rootfs_mount_ok
+    # ("ROOTFS MOUNT OK type=pdxfs"); the trailing ` pa=... size=...`
+    # is appended by the klog_s1_x1_d1 KV loop and carries no OK
+    # token.  UEFI-only reachability: the 14-mode -kernel matrix
+    # takes the sibling ROOTFS MOUNT NONE arm (no OK token, not
+    # gate-visible), and the PAIDEIA_UEFI_OVMF opt-in fixture stops
+    # at the pre-EBS hello banner today.  Same posture as
+    # "UEFI BRIDGE OK" / "UEFI PML4 OK" / "UEFI EBS OK" /
+    # "FB CONSOLE OK" above; retires from this allowlist when
+    # R111.M2 opens an OVMF smoke mode that boots past
+    # ExitBootServices with a real rootfs.pdxfs on the ESP and
+    # asserts the fingerprint against a live golden (same follow-up
+    # boot_r111_uefi_bridge target the other UEFI-only entries name).
+    "ROOTFS MOUNT OK type=pdxfs":
+        "R111.M3-013 (#2365): ESP-embedded rootfs blob witness (OK "
+        "arm); reachable only on UEFI boot with the ESP carrying "
+        "\\EFI\\PAIDEIA\\rootfs.pdxfs and every step of "
+        "efi_load_initrd (SFS OpenProtocol, OpenVolume, Open, "
+        "GetInfo, AllocatePool, Read, short-read check) succeeding. "
+        "The 14-mode -kernel matrix takes the sibling `ROOTFS MOUNT "
+        "NONE` arm (no OK token, not gate-visible); no OVMF smoke "
+        "mode boots past ExitBootServices yet. Retires when R111.M2 "
+        "opens boot_r111_uefi_bridge (same follow-up target as "
+        "UEFI BRIDGE OK / UEFI PML4 OK / UEFI EBS OK).",
+
     # src/kernel/core/klog/keys.pdx tag_msix_ir_table_ok — R111.M2-007
     # (paideia-os #2359). MSI-X + VT-d IR bring-up fingerprint emitted
     # from src/kernel/core/iommu/msix_ir_bringup.pdx §msix_ir_bringup_all

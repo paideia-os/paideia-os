@@ -1,0 +1,401 @@
+// src/kernel/core/drivers/nvme/attach.pdx — R111.M3-011 (paideia-os #2363)
+//
+// NVMe real-HW controller attach cascade.
+//
+// The R51.M1 substrate (kind_nvme_controller.pdx, R24.M1 nvme/probe.pdx,
+// R24.M1 nvme/enable.pdx, R24.M1 nvme/identify_ctrl.pdx) already lands
+// every controller-attach primitive:
+//
+//   nvme_probe                     — PCI walk for class 0x01/subclass 0x08/
+//                                    prog-if 0x02; publishes _nvme_devices.
+//   nvme_ctrl_cap_mint_inner       — mint one KIND_NVME_CONTROLLER row.
+//   nvme_ctrl_bring_up             — platform_mmio_map(BAR0, 0x2000, UC=0),
+//                                    admin queue init, CC.EN + CSTS.RDY.
+//   nvme_ctrl_identify             — Identify(CNS=1); populate row mdts/oncs/nn.
+//   cap_mint_write                 — publish a cap-slot descriptor.
+//
+// What has been missing is the top-level orchestrator that CHAINS these
+// primitives together in the real boot cascade, mints the parent
+// KIND_PCI_DEV broker the R51 gate demands (see below), publishes a
+// per-controller KIND_NVME_CONTROLLER cap-slot for downstream namespace
+// / block-device derivations, and emits the R111 fingerprints
+// (NVME ATTACH OK / NVME ATTACH FAIL / NVME BOOT NONE) so the
+// operator + goldens can observe every T14 G4 NVMe function that boot
+// reaches.
+//
+// Placement: called from kernel_main immediately after
+// msix_ir_bringup_all so (a) _pci_devices is populated (pci_publish_caps
+// ran earlier), (b) the DMAR / IRT bring-up has landed one way or the
+// other so subsequent NVMe MSI-X programming has a well-defined runtime
+// gate, and (c) vmd_detect_and_refuse has halted the boot if a VMD
+// silicon block is masking NVMe from config space.
+//
+// -----------------------------------------------------------------------------
+// Parent-cap discipline
+// -----------------------------------------------------------------------------
+//
+// nvme_ctrl_check_parent_pci_dev (kind_nvme_controller.pdx L329) demands
+// that the parent slot carry kind == KIND_PCI_DEV (0x30) AND rights bit
+// RIGHT_MINT (0x200). pci_publish_caps (pci/publish.pdx L57) mints its
+// per-device slots with only R_DEV_CONFIG_READ (0x01) — insufficient to
+// derive a controller. Every R51 substrate witness that exercises the
+// nvme_ctrl_cap_mint_inner path therefore mints a fresh KIND_PCI_DEV
+// with R_DEV_ALL | RIGHT_MINT into a broker slot immediately before
+// deriving (pdxfs_boot_mount_smoke.pdx L279-283; identical shape in
+// pdxfs_reboot_verify_smoke.pdx, mount_replay_witness_synth.pdx,
+// pdxfs_round_trip_phased.pdx). This module follows that pattern: slot
+// NVME_ATTACH_BROKER_SLOT (177) is a rotating broker minted once per
+// discovered controller with the packed bdf as target_ptr. The broker
+// is overwritten each iteration; the KIND_NVME_CONTROLLER cap it births
+// persists at slot NVME_ATTACH_PUB_SLOT_BASE + i.
+//
+// Slot 176 sits above the witness-mode fixed layout (172-175 per
+// pdxfs_boot_mount_smoke.pdx L273-329) so witness-mode fixtures and
+// real-boot attach do not collide.
+//
+// -----------------------------------------------------------------------------
+// Fingerprint contract
+// -----------------------------------------------------------------------------
+//
+// Per controller successfully brought up:
+//   NVME ATTACH OK bdf=<packed> mn=<hex> fr=<hex> ncap=<n>
+//     mn   = first 8 ASCII bytes of Identify Controller MN field
+//            (NVME_ID_CTRL_MN_OFF = 24); 40-byte field, low 8 hashed to u64.
+//     fr   = first 8 ASCII bytes of FR field (NVME_ID_CTRL_FR_OFF = 64);
+//            8-byte field, full value.
+//     ncap = row.nn (number of namespaces).
+//   klog_s1_x4 stack-arg layout: caller writes v2/k3/v3/k4/v4 into a
+//   pre-reserved 40-byte scratch region at [rsp+0..rsp+32]. On call, ret_addr
+//   goes to [rsp-8]; callee sees v2 at [callee_rsp+8] = [caller_rsp+0]. This
+//   pattern (mov-based) is chosen over the push-based idiom (wal.pdx L1058)
+//   because the four values (ncap, mn, fr, bdf) come from three separate
+//   nested calls that clobber rax between each — a mov-into-scratch keeps
+//   register pressure down and the stack pointer stable across the sequence.
+//
+// Per controller that fails mint / bring_up / identify:
+//   NVME ATTACH FAIL bdf=<packed> csts=<hex>
+//     csts = NVME_REG_CSTS (0x1C) via nvme_reg_u32 on the mapped BAR0 VA
+//            when available. On mint failure (no BAR0 mapped yet) or on
+//            bring_up map-failure (row.bar0 still holds raw PA), csts=0
+//            — indicating "not observable" rather than a real controller
+//            status. Best-effort.
+//
+// If nvme_probe reports zero devices (typical on QEMU-TCG -kernel boot
+// where MCFG is absent, and on real hardware if a VMD is hiding NVMe
+// silicon despite vmd_detect_and_refuse's clearance):
+//   NVME BOOT NONE
+//   nvme_attach_all returns 0.
+//
+// -----------------------------------------------------------------------------
+// Register plan + stack layout
+// -----------------------------------------------------------------------------
+//
+// Callee-save prologue: push rbx, r12, r13, r14, r15 (5 × 8 = 40 B) then
+// sub rsp, 64 (scratch). Entry rsp%16 == 8 (SysV); post-prologue
+// rsp%16 == (8 - 40 - 64) mod 16 = -96 mod 16 = 0 — aligned for every
+// nested call. Epilogue reverses.
+//
+// Register roles across the loop:
+//   rbx = i               — loop cursor into _nvme_devices (0..count).
+//   r12 = count           — _nvme_device_count latched once from nvme_probe.
+//   r13 = packed bdf      — per-iter, survives to fingerprint emit.
+//   r14 = &_nvme_devices[i] initially, reassigned to row_id after mint.
+//   r15 = successes       — accumulator returned in rax at exit.
+//
+// Scratch layout (64 B at [rsp+0..rsp+56], 8 B pad at [rsp+56..64]):
+//   [rsp+0]  = klog v2 (mn @ OK / csts @ FAIL) — becomes callee [rsp+8]
+//   [rsp+8]  = klog k3 (&k_fr @ OK)             — callee [rsp+16]
+//   [rsp+16] = klog v3 (fr @ OK)                — callee [rsp+24]
+//   [rsp+24] = klog k4 (&k_ncap @ OK)           — callee [rsp+32]
+//   [rsp+32] = klog v4 (ncap @ OK)              — callee [rsp+40]
+//   [rsp+40] = bar0_pa      (per-iter temp; only used mint path)
+//   [rsp+48] = (unused)
+//   [rsp+56] = alignment pad
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.36+)
+// -----------------------------------------------------------------------------
+//
+//   G1: byte + word loads via `xor rax, rax; mov_b/mov_w rax, [mem]`
+//       — same pattern established by nvme/probe.pdx L138-169.
+//   G4: full-register compares (`cmp rax, 0`, not `test`; `cmp rax, r10`
+//       with imm64 sentinels staged into r10 first — kind_nvme_controller.pdx
+//       L1223 / L1427 precedent).
+//
+// Reserved-label discipline: all labels prefixed `nvme_at_` to avoid
+// reserved names (`loop`, `if`, `done`, `next`).
+
+module Attach = structure {
+
+  // ==========================================================================
+  // Constants
+  // ==========================================================================
+
+  // Slot 176 = rotating parent-broker KIND_PCI_DEV cap. Overwritten each
+  // iteration. Above the witness-mode fixed range (172-175) to prevent
+  // collision with fixtures.
+  pub let NVME_ATTACH_BROKER_SLOT   : u64 = 177
+
+  // Slots 184..191 (8 slots, one per NVMEC_MAX row) = per-controller
+  // KIND_NVME_CONTROLLER cap. Row_id lives in the target_ptr column.
+  // Downstream namespace / blkdev mints derive from these slots.
+  pub let NVME_ATTACH_PUB_SLOT_BASE : u64 = 184
+
+  // ==========================================================================
+  // nvme_attach_all() -> u64
+  // ==========================================================================
+  //
+  // SysV: () -> u64
+  //   rax = number of controllers successfully brought up + identified
+  //         + published (0..NVME_MAX_DEVS). Zero indicates either "no
+  //         NVMe silicon in this segment" (fingerprint NVME BOOT NONE)
+  //         or "every discovered controller failed attach" (per-device
+  //         NVME ATTACH FAIL fingerprints emitted).
+
+  pub let nvme_attach_all : () -> u64 !{sysreg, mem} @{boot, cap} =
+    fn () -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot, cap },
+      justification: "R111.M3-011 (paideia-os #2363): NVMe real-HW controller attach orchestrator. Called from kernel_main_64 immediately after msix_ir_bringup_all (kernel_main.pdx L513). Body: (1) 5-push callee-save prologue (rbx, r12, r13, r14, r15) + sub rsp, 64 for scratch. Entry rsp%16==8; post-prologue rsp%16==0 for every nested call. (2) Call nvme_probe to populate _nvme_devices and latch count in r12. Zero-count branch: emit NVME BOOT NONE via klog_s1(LEVEL_INFO, SUBSYS_NVME, tag_nvme_boot_none) and return 0. (3) Per iteration i in [0, count): compute &_nvme_devices[i] via shl 5; stash bar0_pa @+8 into [rsp+40]; extract seg (u16 @+0), bus/dev/fn (u8 @+2/+3/+4) using the xor+mov_b/mov_w byte-zero pattern from nvme/probe.pdx L138-169; pack via bdf_pack (rax = packed bdf) and save in r13. (4) Mint fresh KIND_PCI_DEV broker at slot 176 via cap_mint_write(176, 0x30 KIND_PCI_DEV, 0x21F R_DEV_ALL|RIGHT_MINT, bdf) — pci_publish_caps only grants R_DEV_CONFIG_READ (0x01), insufficient for nvme_ctrl_check_parent_pci_dev's RIGHT_MINT gate (kind_nvme_controller.pdx L347-355); the substrate witness pattern (pdxfs_boot_mount_smoke.pdx L279-283) mints a rotating broker slot for exactly this reason. Slot 176 sits above the witness-mode fixed range 172-175. (5) Derive KIND_NVME_CONTROLLER row via nvme_ctrl_cap_mint_inner(176, 0x61F R_NVMEC_ALL, i, bar0_pa). Success gate: rax < NVMEC_MAX (8); otherwise refusal (rax >= 0xFFFFEC4B) — jump to nvme_at_mint_fail. Cache row_id in r14 (base ptr no longer needed). (6) nvme_ctrl_bring_up(row_id) — the substrate call performs platform_mmio_map(BAR0, 0x2000, MMIO_UC=0), nvme_admin_queue_init (programs DSTRD/ASQ/ACQ), and nvme_reset (CC.EN, CSTS.RDY poll with NVME_RESET_SPIN_MAX=5_000_000 ~ 500 ms wall). Non-zero return → nvme_at_bu_fail. (7) nvme_ctrl_identify(row_id) — issues Identify(CNS=0x01), populates row.mdts/oncs/nn and _nvme_id_ctrl_buf via nvme_identify_ctrl_submit_and_parse. Non-zero → nvme_at_id_fail. (8) Publish per-controller cap at slot NVME_ATTACH_PUB_SLOT_BASE + i (184+i) via cap_mint_write(184+i, 0x198 KIND_NVME_CONTROLLER, 0x61F R_NVMEC_ALL, row_id). Downstream nvme_ns_dual_kind_mint derivations gate on this KIND_NVME_CONTROLLER slot. (9) OK-fingerprint emit: ncap = nvme_ctrl_row_nn(row_id) → [rsp+32]; mn = nvme_id_ctrl_read_u64(NVME_ID_CTRL_MN_OFF=24) → [rsp+0]; fr = nvme_id_ctrl_read_u64(NVME_ID_CTRL_FR_OFF=64) → [rsp+16]; fill k3 = &k_fr into [rsp+8], k4 = &k_ncap into [rsp+24]; call klog_s1_x4(LEVEL_INFO, SUBSYS_NVME, tag_nvme_attach_ok, k_bdf, r13 bdf, k_mn, ...). klog_s1_x4 reads v2/k3/v3/k4/v4 at callee's [rsp+8..40] = caller's [rsp+0..32]; mov-into-scratch is chosen over the push idiom (wal.pdx L1058) because the three source values arrive from separate nested calls that clobber rax between each — the mov form keeps rsp stable across the sequence. Increment r15. (10) FAIL fingerprint emit: mint_fail (no BAR0 mapped) sets csts=0 into [rsp+0]; bu_fail reads row.bar0 and only dereferences if VA (>= KERNEL_VMA_BASE 0xFFFF800000000000 staged in r10 per encoder G4 discipline) — otherwise csts=0; id_fail reads csts unconditionally (bring_up succeeded, bar0 is a mapped VA). klog_s1_x2(LEVEL_WARN, SUBSYS_NVME, tag_nvme_attach_fail, k_bdf, r13 bdf, k_csts, csts) reads v2 at callee's [rsp+8] = caller's [rsp+0], matching the OK-path layout. (11) Return r15 (successes count) in rax; epilogue reverses. Reserved labels: nvme_at_. Encoder pitfalls avoided: no test rN/rN (use cmp rax, 0), no cmp reg,[mem], no imul r,imm 2-op, no and reg,imm64 (0x21F/0x61F fit imm32), imm64 KERNEL_VMA_BASE staged into r10 first. Byte-load-zero pattern for u8/u16 fields.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 64;
+
+        // ---------------------------------------------------------------
+        // Populate _nvme_devices via nvme_probe. Idempotent — if the
+        // probe already ran (it does not; nvme_attach_all is the sole
+        // caller in the boot cascade) this is a re-walk.
+        // ---------------------------------------------------------------
+        call nvme_probe;
+        mov r12, rax;                    // r12 = _nvme_device_count
+
+        cmp r12, 0;
+        jne nvme_at_have;
+
+        // NVME BOOT NONE: no NVMe controllers discovered.
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NVME];
+        lea rdx, [rip + tag_nvme_boot_none];
+        call klog_s1;
+        xor rax, rax;
+        jmp nvme_at_out;
+
+      nvme_at_have:
+        xor rbx, rbx;                    // i = 0
+        xor r15, r15;                    // successes = 0
+
+      nvme_at_loop:
+        cmp rbx, r12;
+        jae nvme_at_done;
+
+        // -------------------------------------------------------------
+        // Compute &_nvme_devices[i] = base + (i << 5). Row stride 32 B
+        // per nvme/probe.pdx L24-38.
+        // -------------------------------------------------------------
+        mov rax, rbx;
+        shl rax, 5;
+        lea r14, [rip + _nvme_devices];
+        add r14, rax;
+
+        // Stash bar0_pa (u64 @+8) into scratch for the mint call below.
+        mov rax, [r14 + 8];
+        mov [rsp + 40], rax;
+
+        // -------------------------------------------------------------
+        // Pack BDF via bdf_pack(seg, bus, dev, fn). Byte-load-zero
+        // pattern per nvme/probe.pdx L138-169 avoids the mov_b hazard.
+        // -------------------------------------------------------------
+        xor rax, rax;
+        mov_w rax, [r14 + 0];            // seg (u16)
+        mov rdi, rax;
+
+        xor rax, rax;
+        mov_b rax, [r14 + 2];            // bus (u8)
+        mov rsi, rax;
+
+        xor rax, rax;
+        mov_b rax, [r14 + 3];            // dev (u8)
+        mov rdx, rax;
+
+        xor rax, rax;
+        mov_b rax, [r14 + 4];            // fn (u8)
+        mov rcx, rax;
+
+        call bdf_pack;
+        mov r13, rax;                    // r13 = packed bdf
+
+        // -------------------------------------------------------------
+        // Mint fresh KIND_PCI_DEV broker cap at slot 177 with
+        // R_DEV_ALL | RIGHT_MINT (0x21F). Overwrites any prior broker.
+        // Slot 177 (not 176) to avoid collision with production
+        // MBOT_ROOT_VOLUME_CAP_SLOT (fs/pdxfs/mount_bootstrap.pdx L164
+        // — R53.M3-004 #1745, mounts real root KIND_VOLUME cap).
+        // -------------------------------------------------------------
+        mov rdi, 177;                    // NVME_ATTACH_BROKER_SLOT
+        mov rsi, 0x30;                   // KIND_PCI_DEV
+        mov rdx, 0x21F;                  // R_DEV_ALL | RIGHT_MINT
+        mov rcx, r13;                    // target_ptr = packed bdf
+        call cap_mint_write;
+
+        // -------------------------------------------------------------
+        // Derive KIND_NVME_CONTROLLER row via
+        //   nvme_ctrl_cap_mint_inner(parent_slot, rights, ctrl_idx, bar0_pa).
+        // Success iff rax < NVMEC_MAX (8); refusals return
+        // NVMEC_MINT_BAD_* >= 0xFFFFEC4B.
+        // -------------------------------------------------------------
+        mov rdi, 176;                    // parent_slot
+        mov rsi, 0x61F;                  // R_NVMEC_ALL
+        mov rdx, rbx;                    // ctrl_idx = i
+        mov rcx, [rsp + 40];             // bar0_pa
+        call nvme_ctrl_cap_mint_inner;
+
+        mov r10, 8;                      // NVMEC_MAX
+        cmp rax, r10;
+        jae nvme_at_mint_fail;
+
+        mov r14, rax;                    // r14 = row_id (rebound from base ptr)
+
+        // -------------------------------------------------------------
+        // Bring up: platform_mmio_map(BAR0, 0x2000, UC) + admin queue
+        // init + CC.EN + CSTS.RDY poll (spin bound 5_000_000).
+        // -------------------------------------------------------------
+        mov rdi, r14;
+        call nvme_ctrl_bring_up;
+        cmp rax, 0;
+        jne nvme_at_bu_fail;
+
+        // -------------------------------------------------------------
+        // Identify Controller (CNS=1) — cache mdts/oncs/nn into row +
+        // populate _nvme_id_ctrl_buf for downstream MN/FR reads.
+        // -------------------------------------------------------------
+        mov rdi, r14;
+        call nvme_ctrl_identify;
+        cmp rax, 0;
+        jne nvme_at_id_fail;
+
+        // -------------------------------------------------------------
+        // Publish per-controller KIND_NVME_CONTROLLER cap at slot
+        // NVME_ATTACH_PUB_SLOT_BASE + i, target_ptr = row_id. Downstream
+        // consumers (namespace mint, blkdev derivation) refer to this
+        // slot.
+        // -------------------------------------------------------------
+        mov rdi, 184;                    // NVME_ATTACH_PUB_SLOT_BASE
+        add rdi, rbx;
+        mov rsi, 0x198;                  // KIND_NVME_CONTROLLER
+        mov rdx, 0x61F;                  // R_NVMEC_ALL
+        mov rcx, r14;                    // target_ptr = row_id
+        call cap_mint_write;
+
+        // -------------------------------------------------------------
+        // NVME ATTACH OK fingerprint:
+        //   bdf, mn (MN[0..8] as u64), fr (FR[0..8] as u64), ncap (row.nn).
+        // Populate klog_s1_x4 stack-arg slots in-place at [rsp+0..32].
+        // -------------------------------------------------------------
+
+        // ncap = nvme_ctrl_row_nn(row_id) → v4
+        mov rdi, r14;
+        call nvme_ctrl_row_nn;
+        mov [rsp + 32], rax;             // v4 = ncap
+
+        // mn = nvme_id_ctrl_read_u64(24) → v2
+        mov rdi, 24;                     // NVME_ID_CTRL_MN_OFF
+        call nvme_id_ctrl_read_u64;
+        mov [rsp + 0], rax;              // v2 = mn (first 8 ASCII bytes as u64)
+
+        // fr = nvme_id_ctrl_read_u64(64) → v3
+        mov rdi, 64;                     // NVME_ID_CTRL_FR_OFF
+        call nvme_id_ctrl_read_u64;
+        mov [rsp + 16], rax;             // v3 = fr
+
+        // k3 = &k_fr, k4 = &k_ncap
+        lea rax, [rip + k_fr];
+        mov [rsp + 8], rax;              // k3
+        lea rax, [rip + k_ncap];
+        mov [rsp + 24], rax;             // k4
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NVME];
+        lea rdx, [rip + tag_nvme_attach_ok];
+        lea rcx, [rip + k_bdf];          // k1
+        mov r8, r13;                     // v1 = packed bdf
+        lea r9, [rip + k_mn];            // k2
+        call klog_s1_x4;
+
+        add r15, 1;                      // successes++
+        jmp nvme_at_next;
+
+        // -------------------------------------------------------------
+        // Failure paths — populate csts into [rsp+0], then fall into
+        // the shared emit.
+        // -------------------------------------------------------------
+      nvme_at_mint_fail:
+        // No row minted, no BAR0 mapped. csts = 0.
+        xor rax, rax;
+        mov [rsp + 0], rax;              // v2 = csts = 0
+        jmp nvme_at_emit_fail;
+
+      nvme_at_bu_fail:
+        // r14 = row_id. Row's bar0 slot MAY be a mapped VA
+        // (nvme_reset returned CFS/timeout after platform_mmio_map
+        // succeeded) or the raw PA (platform_mmio_map failed).
+        // Only dereference through a kernel VA.
+        mov rdi, r14;
+        call nvme_ctrl_row_bar0;
+        mov r10, 0xFFFF800000000000;     // KERNEL_VMA_BASE (staged for cmp)
+        cmp rax, r10;
+        jb nvme_at_bu_csts_zero;
+
+        mov rdi, rax;                    // bar0_va
+        mov rsi, 0x1C;                   // NVME_REG_CSTS
+        call nvme_reg_u32;
+        mov [rsp + 0], rax;              // v2 = csts
+        jmp nvme_at_emit_fail;
+
+      nvme_at_bu_csts_zero:
+        xor rax, rax;
+        mov [rsp + 0], rax;              // v2 = 0 (bar0 unmapped)
+        jmp nvme_at_emit_fail;
+
+      nvme_at_id_fail:
+        // Bring_up succeeded → bar0 is definitely a mapped VA.
+        mov rdi, r14;
+        call nvme_ctrl_row_bar0;
+        mov rdi, rax;
+        mov rsi, 0x1C;                   // NVME_REG_CSTS
+        call nvme_reg_u32;
+        mov [rsp + 0], rax;              // v2 = csts
+
+      nvme_at_emit_fail:
+        // NVME ATTACH FAIL bdf=<> csts=<>.
+        // klog_s1_x2 reads v2 at callee [rsp+8] = caller [rsp+0].
+        mov rdi, 2;                      // LEVEL_WARN
+        lea rsi, [rip + SUBSYS_NVME];
+        lea rdx, [rip + tag_nvme_attach_fail];
+        lea rcx, [rip + k_bdf];          // k1
+        mov r8, r13;                     // v1 = bdf
+        lea r9, [rip + k_csts];          // k2
+        call klog_s1_x2;
+
+      nvme_at_next:
+        add rbx, 1;
+        jmp nvme_at_loop;
+
+      nvme_at_done:
+        mov rax, r15;                    // return successes
+
+      nvme_at_out:
+        add rsp, 64;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}
