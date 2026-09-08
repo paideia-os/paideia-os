@@ -218,6 +218,38 @@ ALLOWLIST = {
         "boot_r111_uefi_bridge (same follow-up target as the sibling "
         "UEFI BRIDGE OK entry above).",
 
+    # src/boot/uefi_stub.pdx — R111.M2-010 (paideia-os #2362).
+    # Emitted by efi_finalize_and_handoff's OK path after
+    # ExitBootServices returns EFI_SUCCESS and before the
+    # `push _kernel_main_uefi_pa; ret` handoff to kernel_main_uefi.
+    # Direct-to-COM1 (stub_com1_init + stub_com1_puts) because
+    # Boot Services are invalidated on EFI_SUCCESS return — only
+    # port I/O remains reachable at that point.  Wire line shape:
+    # "UEFI EBS OK attempts=<n>\r\n" where n is 1..4 (the 1-based
+    # attempt counter the retry loop settled on).  The OK-bearing
+    # header is broken into a dedicated 11-byte _ebs_ok_hdr array
+    # ("UEFI EBS OK") that this allowlist key matches exactly; the
+    # " attempts=" separator + digit + CRLF trail carry no OK token
+    # and are invisible to the fingerprint-coverage extractor.
+    # Same UEFI-only reachability as "UEFI BRIDGE OK" above: the
+    # 14-mode -kernel matrix never takes the UEFI path, and the
+    # PAIDEIA_UEFI_OVMF opt-in fixture stops at the pre-EBS hello
+    # banner today.  Retires from this allowlist when R111.M2
+    # opens an OVMF smoke mode that boots past ExitBootServices
+    # and asserts this line against a live golden (same follow-up
+    # boot_r111_uefi_bridge target the sibling UEFI BRIDGE OK /
+    # UEFI PML4 OK entries name).  A companion "UEFI EBS FAIL
+    # exhausted=4 last_status=0x<hex>" line is emitted from the
+    # 4-attempt exhaustion path but carries no OK token — it does
+    # not appear in this allowlist by design (the extractor never
+    # sees it; a stale-allowlist entry would trip the gate).
+    "UEFI EBS OK":
+        "UEFI-only path (R111.M2-010 EBS retry hardening — OK "
+        "fingerprint); the 14-mode matrix boots via -kernel, and no "
+        "OVMF smoke mode boots past ExitBootServices yet — assertable "
+        "when R111.M2 opens boot_r111_uefi_bridge (same follow-up "
+        "target as UEFI BRIDGE OK / UEFI PML4 OK above).",
+
     # src/kernel/core/klog/keys.pdx tag_msix_ir_table_ok — R111.M2-007
     # (paideia-os #2359). MSI-X + VT-d IR bring-up fingerprint emitted
     # from src/kernel/core/iommu/msix_ir_bringup.pdx §msix_ir_bringup_all
