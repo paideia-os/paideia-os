@@ -182,73 +182,10 @@ ALLOWLIST = {
         "UEFI-only path; the 14-mode matrix boots via -kernel, and the "
         "opt-in OVMF fixture stops at the pre-EBS banner (R19.M5).",
 
-    # src/kernel/kernel_main_uefi.pdx — R111.M1-002 (paideia-os #2354).
-    # Bridge fingerprint from kernel_main_uefi's Phase 5, emitted right
-    # before `call kernel_main_64` on the UEFI boot path.  Same UEFI-only
-    # reachability as "EFI SIGNATURE OK" above: the 14-mode -kernel
-    # matrix never takes the UEFI path, and the PAIDEIA_UEFI_OVMF opt-in
-    # fixture stops at the pre-EBS hello banner today.  Retires from this
-    # allowlist when the R111.M2 sub-wave opens an OVMF smoke mode that
-    # boots past ExitBootServices and asserts the bridge line against a
-    # live golden (planned as `boot_r111_uefi_bridge`, one of the
-    # `expected-r111-*.golden` companions to expected-r19-ovmf.golden).
-    "UEFI BRIDGE OK":
-        "UEFI-only path (R111.M1-002 bridge); the 14-mode matrix boots "
-        "via -kernel, and no OVMF smoke mode boots past ExitBootServices "
-        "yet — assertable when R111.M2 opens boot_r111_uefi_bridge.",
-
-    # src/kernel/mm/bootstrap_pml4.pdx — R111.M1-003 (paideia-os #2355).
-    # Bootstrap PML4 install fingerprint emitted by
-    # uefi_bootstrap_pml4_install immediately after the `mov cr3, rax`
-    # that swaps in the PVH-shape PML4[0]-identity + PML4[256]-alias
-    # + PDPT[0..3]-1GiB-huge layout on the UEFI boot path (Phase 4d,
-    # between verify_self and the R111.M1-002 UEFI BRIDGE OK line).
-    # Same UEFI-only reachability posture as "UEFI BRIDGE OK" /
-    # "EFI SIGNATURE OK" above: the 14-mode -kernel matrix never takes
-    # the UEFI path, and the PAIDEIA_UEFI_OVMF opt-in fixture stops at
-    # the pre-EBS hello banner today.  Retires from this allowlist
-    # when R111.M2 opens an OVMF smoke mode that boots past
-    # ExitBootServices and asserts the install line against a live
-    # golden — same follow-up boot_r111_uefi_bridge target the
-    # "UEFI BRIDGE OK" sibling entry names.
-    "UEFI PML4 OK":
-        "UEFI-only path (R111.M1-003 bootstrap PML4 install); the "
-        "14-mode matrix boots via -kernel, and no OVMF smoke mode boots "
-        "past ExitBootServices yet — assertable when R111.M2 opens "
-        "boot_r111_uefi_bridge (same follow-up target as the sibling "
-        "UEFI BRIDGE OK entry above).",
-
-    # src/boot/uefi_stub.pdx — R111.M2-010 (paideia-os #2362).
-    # Emitted by efi_finalize_and_handoff's OK path after
-    # ExitBootServices returns EFI_SUCCESS and before the
-    # `push _kernel_main_uefi_pa; ret` handoff to kernel_main_uefi.
-    # Direct-to-COM1 (stub_com1_init + stub_com1_puts) because
-    # Boot Services are invalidated on EFI_SUCCESS return — only
-    # port I/O remains reachable at that point.  Wire line shape:
-    # "UEFI EBS OK attempts=<n>\r\n" where n is 1..4 (the 1-based
-    # attempt counter the retry loop settled on).  The OK-bearing
-    # header is broken into a dedicated 11-byte _ebs_ok_hdr array
-    # ("UEFI EBS OK") that this allowlist key matches exactly; the
-    # " attempts=" separator + digit + CRLF trail carry no OK token
-    # and are invisible to the fingerprint-coverage extractor.
-    # Same UEFI-only reachability as "UEFI BRIDGE OK" above: the
-    # 14-mode -kernel matrix never takes the UEFI path, and the
-    # PAIDEIA_UEFI_OVMF opt-in fixture stops at the pre-EBS hello
-    # banner today.  Retires from this allowlist when R111.M2
-    # opens an OVMF smoke mode that boots past ExitBootServices
-    # and asserts this line against a live golden (same follow-up
-    # boot_r111_uefi_bridge target the sibling UEFI BRIDGE OK /
-    # UEFI PML4 OK entries name).  A companion "UEFI EBS FAIL
-    # exhausted=4 last_status=0x<hex>" line is emitted from the
-    # 4-attempt exhaustion path but carries no OK token — it does
-    # not appear in this allowlist by design (the extractor never
-    # sees it; a stale-allowlist entry would trip the gate).
-    "UEFI EBS OK":
-        "UEFI-only path (R111.M2-010 EBS retry hardening — OK "
-        "fingerprint); the 14-mode matrix boots via -kernel, and no "
-        "OVMF smoke mode boots past ExitBootServices yet — assertable "
-        "when R111.M2 opens boot_r111_uefi_bridge (same follow-up "
-        "target as UEFI BRIDGE OK / UEFI PML4 OK above).",
+    # UEFI BRIDGE OK / UEFI PML4 OK / UEFI EBS OK: allowlist entries
+    # RETIRED 2026-09-08 — goldens now assert these lines directly, so
+    # the exemption is redundant. See tests/expected-t14-fidelity.golden
+    # for the assertions (R111.M7-026 landed).
 
     # src/kernel/core/klog/keys.pdx tag_nvme_attach_ok —
     # R111.M3-011 (paideia-os #2363).  NVMe real-HW controller-attach
@@ -613,12 +550,8 @@ ALLOWLIST = {
     # (targeted at the same R111.M2 OVMF-smoke-mode window that
     # retires UEFI BRIDGE OK / UEFI PML4 OK above, plus a companion
     # -kernel-mode assertion since this marker fires on both paths).
-    "ACPI RSDP HANDOFF OK":
-        "R111.M1-004 (#2356): ACPI RSDP handoff fingerprint (Line 1 of "
-        "the R20 witness seeded from boot_env_t.rsdp_pa). Fires on every "
-        "boot from kernel_main_64 post-phase1_acpi_gather; assertable in "
-        "an existing boot golden. Golden-wiring deferred to the R111.M2 "
-        "OVMF-smoke-mode landing (same target as UEFI BRIDGE OK).",
+    # ACPI RSDP HANDOFF OK: allowlist entry RETIRED 2026-09-08 —
+    # golden now asserts this line directly (T14 fidelity golden).
 
     # src/kernel/core/klog/keys.pdx tag_acpi_tables_summary_ok —
     # R111.M1-004 (paideia-os #2356). Line 2 of the R20 witness,
@@ -683,15 +616,8 @@ ALLOWLIST = {
     # ExitBootServices and asserts the fingerprint against a live
     # golden (planned as `boot_r111_uefi_bridge`, same follow-up
     # target the sibling UEFI entries name).
-    "FB CONSOLE OK":
-        "R111.M4-015 (#2367): GOP framebuffer console bring-up "
-        "fingerprint (Line 1); reachable only on UEFI boot with GOP "
-        "handoff. The 14-mode -kernel matrix takes the sibling "
-        "'FB CONSOLE OFF' arm (no OK token, not gate-visible), and "
-        "no OVMF smoke mode boots past ExitBootServices yet. "
-        "Retires when R111.M2 opens boot_r111_uefi_bridge (same "
-        "follow-up target as UEFI BRIDGE OK / UEFI PML4 OK / ACPI "
-        "RSDP HANDOFF OK).",
+    # FB CONSOLE OK: allowlist entry RETIRED 2026-09-08 —
+    # golden now asserts this line directly (T14 fidelity golden).
 
     # -- Section B: synth-witness markers under tests/**, each emitted
     #    only by an opt-in mode or a real-hardware smoke that the default
@@ -1491,58 +1417,87 @@ ALLOWLIST = {
         "data-only decl; input-server-side reservation not yet booted.",
 
     # ------------------------------------------------------------------
-    # R113.M1-001 (paideia-os #2381): KIND_SURFACE kernel-side substrate
-    # (row pool + mint + destroy + row accessors). All five R113.M1
-    # fingerprint tags (mint / destroy / commit / fmt bind / present)
-    # land in this PR per design/graphics/r113-m1-substrate.md §8's
-    # mandate to prevent the Wave-12 SURFACE COMMIT OK allowlist gap
-    # from re-opening; the mint + destroy emitters are wired in
-    # src/kernel/core/cap/kind_surface.pdx (surface_mint / surface_
-    # destroy), the other three tags live there as data-only with the
-    # emitters landing in the M1-002 / M1-004 / M1-005 siblings.
+    # R113.M1-001 (paideia-os #2381) + R113.M1-001b (paideia-os #2424):
+    # KIND_SURFACE kernel-side substrate (row pool + mint + destroy +
+    # row_* accessors, #2381) plus the six-op cap_handler_surface
+    # dispatcher wire (#2424, cap/handlers/cap_handler_surface.pdx +
+    # the cap/invoke.pdx 0x1B8 arm + call_kind_surface landing pad).
+    # All five R113.M1 fingerprint tags (mint / destroy / commit / fmt
+    # bind / present) landed at #2381 per design/graphics/r113-m1-
+    # substrate.md §8's mandate to close the Wave-12 SURFACE COMMIT OK
+    # allowlist gap; mint + destroy emitters live in cap/kind_surface.
+    # pdx, commit/fmt-bind emitters have landed at M1-002 / M1-004,
+    # and the present emitter is deferred to M1-005.
     #
-    # None of the five is reachable in the default matrix today: mint
-    # and destroy fire only when cap_handler_surface (a follow-on
-    # kernel dispatcher, doc §9 milestone graph) invokes surface_mint
-    # or surface_destroy -- no code path in kernel_main.pdx does that
-    # yet (kind_surface_init runs at boot but is a pure pool scrub and
-    # does not itself call mint/destroy). The other three fingerprints
-    # (commit / fmt bind / present) belong to the M1-002 / M1-004 /
-    # M1-005 wire bodies which have not landed. Real-HW / wire-deferred
-    # posture identical to the sibling `surface kind mint ok` /
-    # `surface commit mint ok` entries above.
+    # Post-#2424 the dispatcher IS wired end-to-end: cap_invoke against
+    # a KIND_SURFACE cap now reaches cap_handler_surface, which fans
+    # out on OP_SURFACE_QUERY / COMMIT / DAMAGE / ATTACH / DESTROY /
+    # MINT under the KGATE_* rights aliases and calls the corresponding
+    # substrate leaf (surface_mint / surface_destroy / surface_row_*
+    # accessors, surface_row_swap for commit).  None of the five tags
+    # is reachable in the default matrix yet because no user-space
+    # caller of cap_invoke against a KIND_SURFACE cap exists: no boot
+    # witness mints a surface (kind_surface_init runs at boot but is a
+    # pure pool scrub), and the M1-002 op_arg-encoding refinement that
+    # would let a normal cap_invoke pass w/h/format has not landed.  A
+    # direct-invocation boot witness (5-arg cap_handler_surface call)
+    # could trip mint / destroy today; that witness is the natural
+    # companion to the M1-002 refinement per doc §9's milestone graph.
+    # Real-HW / wire-deferred posture identical to the sibling
+    # `surface kind mint ok` / `surface commit mint ok` entries above.
     # ------------------------------------------------------------------
     "surface mint ok [legacy: SURFACE MINT OK]":
-        "R113.M1-001 (#2381): kernel-side KIND_SURFACE mint fingerprint; "
-        "surface_mint body is wired but no caller exists today (cap_"
-        "handler_surface dispatcher is a follow-on landing per design/"
-        "graphics/r113-m1-substrate.md §9). Assertable when the "
-        "dispatcher + a boot witness exercise the mint path end-to-end.",
+        "R113.M1-001 (#2381) + R113.M1-001b (#2424): kernel-side "
+        "KIND_SURFACE mint fingerprint; handler wired M1-001b (cap/"
+        "handlers/cap_handler_surface.pdx OP_SURFACE_MINT branches on "
+        "R_SURFACE_MINT and calls surface_mint), emitter (mint/destroy) "
+        "lands via first user-space surface_mint call.  Assertable when "
+        "a boot witness or the M1-002 op_arg-encoding refinement drives "
+        "a live mint end-to-end.",
     "surface destroy ok [legacy: SURFACE DESTROY OK]":
-        "R113.M1-001 (#2381): kernel-side KIND_SURFACE destroy fingerprint; "
-        "surface_destroy body is wired but no caller exists today (same "
-        "cap_handler_surface dispatcher dependency as `surface mint ok` "
-        "above). Assertable when the dispatcher + a boot witness exercise "
-        "the destroy path end-to-end.",
+        "R113.M1-001 (#2381) + R113.M1-001b (#2424): kernel-side "
+        "KIND_SURFACE destroy fingerprint; handler wired M1-001b (cap/"
+        "handlers/cap_handler_surface.pdx OP_SURFACE_DESTROY branches "
+        "on R_SURFACE_KGATE_DESTROY and calls surface_destroy), emitter "
+        "(mint/destroy) lands via first user-space surface_mint call.  "
+        "Assertable when a boot witness or the M1-002 refinement drives "
+        "the mint -> destroy pair end-to-end.",
     "surface commit ok [legacy: SURFACE COMMIT OK]":
-        "R113.M1-001 (#2381): kernel-side SURFACE COMMIT OK tag; landed "
-        "here alongside the other four R113.M1 tags to close the Wave-12 "
-        "SURFACE COMMIT OK allowlist gap. Emitter lands in R113.M1-002 "
-        "(#2382, surface commit-txn body) which calls surface_row_swap + "
-        "surface_stats_bump_commits then klog_s1_x1 with this tag. "
-        "Assertable when M1-002 + a boot witness land together.",
+        "R113.M1-002 (#2382) + R113.M1-001b (#2424): kernel-side "
+        "SURFACE COMMIT OK tag; the M1-002 emitter has landed at src/"
+        "kernel/core/graphics/surface_commit_ops.pdx (surface_commit "
+        "body) which calls surface_row_swap + surface_stats_bump_commits "
+        "then klog_s1_x2 with this tag and (sid, serial) KVs.  Handler "
+        "wired M1-001b (cap/handlers/cap_handler_surface.pdx "
+        "OP_SURFACE_COMMIT branches on R_SURFACE_KGATE_COMMIT and calls "
+        "surface_row_swap; the M1-002 surface_commit body sits alongside "
+        "and can be invoked directly by a boot witness).  Emitter lands "
+        "in the default matrix via first user-space surface_mint call.  "
+        "Closed the Wave-12 SURFACE COMMIT OK allowlist gap when the "
+        "tag landed with the substrate.",
     "surface fmt bind ok [legacy: SURFACE FMT BIND OK]":
-        "R113.M1-001 (#2381): kernel-side SURFACE FMT BIND OK tag; landed "
-        "here per doc §8's five-tag mandate. Emitter lands in R113.M1-004 "
-        "(#2384, format negotiation) which calls surface_row_format_set "
-        "on first attach and klog_s1_x1 with this tag. Assertable when "
-        "M1-004 + a boot witness land together.",
+        "R113.M1-004 (#2384) + R113.M1-001b (#2424): kernel-side "
+        "SURFACE FMT BIND OK fingerprint; surface_format_bind_at_mint "
+        "(src/kernel/core/graphics/surface_format.pdx) emits this via "
+        "klog_s1_d2 with sid=<slot> + formats=<count> on first-bind for "
+        "a slot (idempotent via the 256-bit _bind_bitmap).  Handler "
+        "wired M1-001b (cap/handlers/cap_handler_surface.pdx "
+        "OP_SURFACE_ATTACH already reaches surface_row_pending_set; the "
+        "M1-004 format-bind body sits alongside and its klog_s1_d2 tag "
+        "emit is reached whenever a live mint triggers the first-bind "
+        "path).  Emitter lands in the default matrix via first user-"
+        "space surface_mint call.",
     "surface present ok [legacy: SURFACE PRESENT OK]":
-        "R113.M1-001 (#2381): kernel-side SURFACE PRESENT OK tag; landed "
-        "here per doc §8's five-tag mandate. Emitter lands in R113.M1-005 "
-        "(#2385, present-fence) which calls surface_row_swap from the "
-        "scanout-complete IRQ handler and klog_s1_x1 with this tag. "
-        "Assertable when M1-005 + a boot witness land together.",
+        "R113.M1-001 (#2381) + R113.M1-001b (#2424): kernel-side "
+        "SURFACE PRESENT OK tag; landed with the substrate per doc §8's "
+        "five-tag mandate.  Handler wired M1-001b (the M1-005 present-"
+        "fence emitter is the specific site that wraps surface_row_swap "
+        "in the klog_s1_x1 call for this tag; cap_handler_surface's "
+        "OP_SURFACE_COMMIT already reaches surface_row_swap but does "
+        "not emit the present tag -- that emission belongs to the IRQ-"
+        "handler path M1-005 lands).  Emitter (mint/destroy) lands via "
+        "first user-space surface_mint call.  Assertable when M1-005 + "
+        "a boot witness land together.",
 
     # Batch 7: G7 close-out (src/user/compositor/*.pdx)
     "pdx kind subsurface meta [legacy: SUBSURFACE SYNC OK]":

@@ -1,0 +1,557 @@
+// src/kernel/core/graphics/surface_format.pdx -- R113.M1-004 (paideia-os #2384)
+//
+// Buffer-format negotiation for KIND_SURFACE.  Sibling to R113.M1-001
+// (kind_surface.pdx substrate) per design/graphics/r113-m1-substrate.md
+// §9's parallel-consumer arm; consumes surface_row_valid + the
+// pre-declared surface_fmt_bind_ok_msg / surface_k_sid data from
+// kind_surface.pdx (the freeze doc §8 five-tag mandate landed the tag
+// there in M1-001; this landing wires the emitter).
+//
+// SCOPE (per issue #2384 + design doc §9 M1-004 line):
+//   * DRM_FOURCC subset: XRGB8888, ARGB8888, XBGR8888, ABGR8888,
+//     RGB565, NV12, YUYV, P010 (8 fourccs).  Kept local per the doc's
+//     "an M1-004-local constant, no kernel-wide table needed at M1"
+//     mandate -- the fourcc catalogue is a policy surface owned by this
+//     substrate and consumed by cap_handler_surface at attach time.
+//   * DRM format modifiers subset: LINEAR + 3 Intel-family tile layouts
+//     (I915_X_TILED, I915_Y_TILED, I915_YF_TILED).  The three tiled
+//     values are 0x0100_0000_0000_000N (vendor id 1 = Intel in the
+//     high byte, format code N in the low byte); every load of these
+//     from an asm body uses `mov r64, imm64` (movabs) because the
+//     value cannot fit in imm32 -- feedback_pdx_encoder_pitfalls line
+//     8's `1<<56` rule.
+//   * N_SUPPORTED = 12 (fourcc, modifier) pairs the kernel considers
+//     legal for surface attach.  Flat [u64; 24] row-major table with
+//     alternating fourcc / modifier words -- lookup is a single scan
+//     with (idx*2) fourcc load and (idx*2+1) modifier compare.
+//   * Three entry points:
+//       - surface_supported_formats(slot, out_buf, out_cap) -> count
+//       - buffer_format_compat(fourcc, modifier) -> 0 | error
+//       - surface_format_bind_at_mint(slot, formats_count) (idempotent)
+//   * Failure band 0xFFFFE120..0xFFFFE12F -- verified free by the
+//     R113.M1 1528-code sweep (design doc §5.1) AND a targeted repeat
+//     grep of 0xFFFFE12 over src/ before landing (empty result).
+//     Neighbouring band 0xFFFFE110..E11F belongs to M1-001's substrate;
+//     this landing sits one nibble page above it.
+//   * Fingerprint: emits "surface fmt bind ok [legacy: SURFACE FMT BIND
+//     OK] sid=<slot> formats=<count>" via klog_s1_d2 on first-bind for
+//     a slot.  The tag byte array + surface_k_sid ("sid\0") were
+//     declared in kind_surface.pdx per the R113.M1-001 five-tag
+//     mandate; this landing adds the local key surface_k_formats
+//     ("formats\0") for the second KV.
+//   * Idempotency: 256-bit bitmap (4 u64 words) keyed on slot index.
+//     A repeat bind for the same slot is a no-op success (returns 0
+//     without re-emitting the fingerprint).  256 bits is deliberately
+//     larger than SURFACE_ROW_MAX (16 today, rising to ~48 at R113.M2
+//     per doc §6) so no rewire is needed as the pool grows.
+//
+// ENCODER PITFALLS (per feedback_pdx_encoder_pitfalls v0.36+):
+//   * No `test rN, rN` -- every zero-check uses `cmp rN, 0` + `je/jne`.
+//   * No `and reg, imm64` -- the tile-modifier 0x01000000_00000001..3
+//     values are only compared (via a table load into a scratch and
+//     `cmp reg, reg`), never bit-anded.  Where bit-clip is needed for
+//     bitmap addressing (bit_idx = slot & 63), 63 is imm8 and safe.
+//   * No 2-op `imul r, imm` -- pair-row byte offset is `shl idx, 1` +
+//     `SIB *8` (per-pair stride = 2 words = 16 bytes; the walker
+//     works in word units to sidestep any 16-byte SIB scale).
+//   * No `cmp reg, [mem]` -- every mem compare loads to scratch first.
+//   * Register-scaled `[reg + rN * 8]` (with 8 in SIB {1,2,4,8}) is
+//     the established idiom for u64 table walks (see vnode_pool.pdx
+//     L106, fs/mount.pdx L150, mm/phys_free.pdx L50).
+//   * `shl r64, cl` (variable shift by cl) is proven -- used at
+//     pdxfs_lite/alloc.pdx L233 / L388 and mm/uefi_phys_seed.pdx
+//     L327 / L396.
+//
+// STACK ALIGNMENT (SysV: pre-CALL rsp%16 == 0 => callee entry rsp%16 == 8):
+//   * surface_supported_formats: 5 pushes (rbx, r12-r15) = 40B ->
+//     (8+40)%16 = 0 in body; nested `call surface_row_valid` needs no
+//     stack args and inherits rsp%16 == 0.  5 pops before ret.
+//   * buffer_format_compat: leaf, no callee-save, no nested call.
+//   * surface_format_bind_at_mint: 2 pushes (r12, r13) + `sub rsp, 8`
+//     pad = 24B -> (8+24)%16 = 0 in body; the nested `call surface_
+//     row_valid` uses that alignment directly.  For the stack-arg
+//     `call klog_s1_d2` (7 args -> v2 on stack), the caller-side
+//     `sub rsp, 8` + `push rax` (16B total) restores rsp%16 == 0
+//     pre-CALL, matching the panic_dump.pdx L215-217 and ioapic_
+//     route.pdx L337 idiom byte-for-byte; `add rsp, 16` post-CALL
+//     reclaims both slots.
+//
+// LABEL PREFIX: `sf_` for surface_supported_formats, `bfc_` for
+// buffer_format_compat, `sfbm_` for surface_format_bind_at_mint.
+// None of these collide with the paideia-as reserved-keyword set
+// (feedback_paideia_as_reserved_labels: loop, if, let, while, for,
+// match, pub, mod, use, fn, struct, enum, impl, trait, type, where,
+// move, mut, ref).
+
+module SurfaceFormat = structure {
+
+  // ==========================================================================
+  // DRM_FOURCC subset (§Scope item 1).  DRM_FOURCC packs 4 ASCII bytes
+  // little-endian into a u32; e.g. XRGB8888 -> "XR24" -> 'X'(0x58) |
+  // 'R'(0x52)<<8 | '2'(0x32)<<16 | '4'(0x34)<<24 = 0x34325258.  Every
+  // constant below is byte-verified against the DRM headers.
+  // ==========================================================================
+
+  pub let SF_FOURCC_XRGB8888 : u64 = 0x34325258   // "XR24"
+  pub let SF_FOURCC_ARGB8888 : u64 = 0x34325241   // "AR24"
+  pub let SF_FOURCC_XBGR8888 : u64 = 0x34324258   // "XB24"
+  pub let SF_FOURCC_ABGR8888 : u64 = 0x34324241   // "AB24"
+  pub let SF_FOURCC_RGB565   : u64 = 0x36314752   // "RG16"
+  pub let SF_FOURCC_NV12     : u64 = 0x3231564E   // "NV12"
+  pub let SF_FOURCC_YUYV     : u64 = 0x56595559   // "YUYV"
+  pub let SF_FOURCC_P010     : u64 = 0x30313050   // "P010"
+
+  pub let SF_FOURCC_COUNT    : u64 = 8
+
+  // ==========================================================================
+  // DRM format-modifier subset (§Scope item 2).  Vendor byte in the
+  // high 8 bits of the u64 payload (Intel = 0x01), format code in the
+  // low 56 bits.  Values > 32 bits must be loaded via movabs at
+  // runtime -- see the pitfall note in the file header.
+  // ==========================================================================
+
+  pub let SF_MOD_LINEAR         : u64 = 0
+  pub let SF_MOD_I915_X_TILED   : u64 = 0x0100000000000001   // (1<<56) | 1
+  pub let SF_MOD_I915_Y_TILED   : u64 = 0x0100000000000002   // (1<<56) | 2
+  pub let SF_MOD_I915_YF_TILED  : u64 = 0x0100000000000003   // (1<<56) | 3
+
+  pub let SF_MOD_COUNT          : u64 = 4
+
+  // ==========================================================================
+  // Supported-set cap.  Exactly N_SUPPORTED pairs live in
+  // _supported_pairs below; surface_supported_formats clamps the caller
+  // out_cap against this ceiling.  Sized so every entry that appears
+  // in _fourcc_table has at least one legal modifier pairing (LINEAR
+  // as the universal fallback), with three extra tiled variants for
+  // the two XRGB8888 / ARGB8888 fourccs the compositor uses most.
+  // ==========================================================================
+
+  pub let SF_N_SUPPORTED : u64 = 12
+
+  // ==========================================================================
+  // Failure taxonomy -- 0xFFFFE120..0xFFFFE12F.
+  //
+  // Freshness verification (2026-09-08 pre-landing):
+  //   $ grep -rn '0xFFFFE12' src -> empty
+  // Neighbouring bands: 0xFFFFE110..E11F is R113.M1-001 substrate
+  // (kind_surface.pdx §5); 0xFFFFE100..E10F is unclaimed.  The three
+  // error arms mirror the three-arm decomposition the issue #2384
+  // spec calls out: fourcc unknown, modifier unknown, pair illegal.
+  // The two auxiliary codes SFMT_BAD_SLOT / SFMT_OUT_NULL cover the
+  // surface_supported_formats / surface_format_bind_at_mint entry-
+  // point pre-conditions; both stay inside the same nibble page.
+  // ==========================================================================
+
+  pub let SFMT_OK                     : u64 = 0
+  pub let SFMT_BAD_SLOT               : u64 = 0xFFFFE120
+  pub let SFMT_UNSUPPORTED_FOURCC     : u64 = 0xFFFFE121
+  pub let SFMT_UNSUPPORTED_MODIFIER   : u64 = 0xFFFFE122
+  pub let SFMT_INCOMPATIBLE_PAIR      : u64 = 0xFFFFE123
+  pub let SFMT_OUT_NULL               : u64 = 0xFFFFE124
+
+  // ==========================================================================
+  // FOURCC catalogue -- [u64; 8] linear scan table for the
+  // buffer_format_compat gate (1).  Order matches the constant
+  // declarations above; every u32 fits in imm32 so the initializer
+  // needs no movabs discipline.
+  // ==========================================================================
+
+  pub let _fourcc_table : [u64; 8] = [
+    0x34325258, 0x34325241, 0x34324258, 0x34324241,
+    0x36314752, 0x3231564E, 0x56595559, 0x30313050
+  ]
+
+  // ==========================================================================
+  // Modifier catalogue -- [u64; 4] linear scan table for the
+  // buffer_format_compat gate (2).  The three tiled values are > u32
+  // and are laid down as full u64 words by the initializer (values
+  // are placed into .rodata directly, so no movabs is needed here --
+  // that discipline only applies to asm-body loads via `mov reg, imm`).
+  // ==========================================================================
+
+  pub let _modifier_table : [u64; 4] = [
+    0,
+    0x0100000000000001, 0x0100000000000002, 0x0100000000000003
+  ]
+
+  // ==========================================================================
+  // Supported (fourcc, modifier) pair table.  Flat [u64; 24] with
+  // alternating (fourcc, modifier) words; row idx r addresses
+  // _supported_pairs[r*2 + 0] = fourcc and _supported_pairs[r*2 + 1]
+  // = modifier.  Chosen to give every fourcc a LINEAR admission and
+  // the two most-used surface fourccs (XRGB8888, ARGB8888) three
+  // Intel tiled admissions each for the R113.M4 rendering path.
+  //
+  // Layout (12 rows):
+  //   0  XRGB8888 LINEAR
+  //   1  XRGB8888 I915_X_TILED
+  //   2  XRGB8888 I915_Y_TILED
+  //   3  ARGB8888 LINEAR
+  //   4  ARGB8888 I915_X_TILED
+  //   5  ARGB8888 I915_Y_TILED
+  //   6  XBGR8888 LINEAR
+  //   7  ABGR8888 LINEAR
+  //   8  RGB565   LINEAR
+  //   9  NV12     LINEAR
+  //  10  YUYV     LINEAR
+  //  11  P010     LINEAR
+  //
+  // I915_YF_TILED is intentionally represented in _modifier_table but
+  // omitted from every pair here -- YF is a Gen12+ format-specific
+  // tile whose scanout-side plumbing lands in R113.M4; keeping it in
+  // the modifier catalogue means buffer_format_compat's arm (2) can
+  // report UNSUPPORTED_MODIFIER separately from INCOMPATIBLE_PAIR
+  // once M4 wires the pair(s) in.
+  // ==========================================================================
+
+  pub let _supported_pairs : [u64; 24] = [
+    0x34325258, 0,                    0x34325258, 0x0100000000000001,
+    0x34325258, 0x0100000000000002,   0x34325241, 0,
+    0x34325241, 0x0100000000000001,   0x34325241, 0x0100000000000002,
+    0x34324258, 0,                    0x34324241, 0,
+    0x36314752, 0,                    0x3231564E, 0,
+    0x56595559, 0,                    0x30313050, 0
+  ]
+
+  // ==========================================================================
+  // Per-slot bind bitmap -- 256 bits (4 u64 words) keyed on surface
+  // row index.  Sized above SURFACE_ROW_MAX (16 today, rising to ~48
+  // at R113.M2 per r113-m1-substrate.md §6) so no rewire is needed
+  // as the pool grows.  Zero-initialised (.bss default); no explicit
+  // reset function -- the pool_reset in kind_surface_init runs before
+  // any surface_mint could bind a format so the bitmap is clean at
+  // boot.  Would need a matching reset entry only if kind_surface_
+  // reset ever gains a runtime clear semantic (which today it does
+  // not -- see kind_surface.pdx L272).
+  // ==========================================================================
+
+  pub let mut _bind_bitmap : [u64; 4] = [0; 4] @align(32)
+
+  // ==========================================================================
+  // Fingerprint KV key: "formats\0".  Paired with kind_surface.pdx's
+  // pre-existing surface_k_sid ("sid\0") for the two-KV klog_s1_d2
+  // emission from surface_format_bind_at_mint.  Kept module-local
+  // because "formats" is a format-negotiation-specific key that no
+  // other subsystem's fingerprint uses; adding it to kind_surface.pdx
+  // would smear M1-004 vocabulary into the substrate layer.
+  // ==========================================================================
+
+  pub let surface_k_formats : [u8; 8] = "formats\0"
+
+  // ==========================================================================
+  // surface_supported_formats(slot, out_buf, out_cap) -> count
+  //
+  // Copy up to min(SF_N_SUPPORTED = 12, out_cap) (fourcc, modifier)
+  // pairs from _supported_pairs into out_buf and return the count
+  // written.  Each pair is 16 bytes (two u64 words); the walker
+  // iterates word-by-word rather than pair-by-pair to keep the SIB
+  // scale at 8 (SIB {1,2,4,8}), sidestepping any need for a 16-byte
+  // stride.
+  //
+  // Contract:
+  //   slot invalid (surface_row_valid == 0) -> return 0 (no error --
+  //     the caller reads count and gates on count > 0).  Same
+  //     "return 0 on invalid" posture the other row-shape accessors
+  //     take (surface_row_pending_get / surface_row_current_get).
+  //   out_buf == 0                            -> return 0
+  //   out_cap == 0                            -> return 0 (nothing to
+  //     write; the count-only query pattern is unsupported at M1 --
+  //     callers pass a real buffer or accept the 0 return).
+  //
+  // Register plan: rbx=(unused pad), r12=slot, r13=out_buf,
+  // r14=out_cap, r15=count.  5 callee-save pushes = 40B, entry
+  // rsp%16==8 -> body rsp%16 = (8+40)%16 = 0, safe for the nested
+  // call surface_row_valid (no stack args).  surface_row_valid
+  // preserves rbx/r12-r15/rbp per its own SysV callee-save discipline
+  // (see kind_surface.pdx L309 -- pure leaf, touches rax/r10/r11).
+  // ==========================================================================
+
+  pub let surface_supported_formats : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (slot: u64) (out_buf: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M1-004 (#2384): copy up to min(SF_N_SUPPORTED=12, out_cap) (fourcc, modifier) pairs from _supported_pairs into out_buf, return count. Word-by-word walker keeps SIB scale at 8. Invalid slot / null out_buf / zero out_cap all funnel to return 0 (count-shape return, no error channel). 5 callee-save pushes align rsp for the nested surface_row_valid call. Labels prefixed sf_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                        // slot
+        mov r13, rsi;                        // out_buf
+        mov r14, rdx;                        // out_cap
+
+        // Validate slot via surface_row_valid.
+        mov rdi, r12;
+        call surface_row_valid;
+        cmp rax, 0;
+        je  sf_zero;
+
+        // Null out_buf -> 0.
+        cmp r13, 0;
+        je  sf_zero;
+
+        // Zero out_cap -> 0.
+        cmp r14, 0;
+        je  sf_zero;
+
+        // count = min(SF_N_SUPPORTED = 12, out_cap)
+        mov r15, r14;
+        mov rax, 12;
+        cmp r15, rax;
+        jb  sf_have_count;
+        mov r15, rax;
+
+      sf_have_count:
+        // Copy r15 pairs = r15 * 2 words.  r10 = word count.
+        mov r10, r15;
+        shl r10, 1;                          // r10 = word count = r15 * 2
+
+        lea r11, [rip + _supported_pairs];
+        xor rcx, rcx;                        // word idx = 0
+
+      sf_copy_loop:
+        cmp rcx, r10;
+        jae sf_done;
+        mov rax, [r11 + rcx * 8];
+        mov [r13 + rcx * 8], rax;
+        add rcx, 1;
+        jmp sf_copy_loop;
+
+      sf_done:
+        mov rax, r15;                        // return count
+        jmp sf_out;
+
+      sf_zero:
+        xor rax, rax;
+
+      sf_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // buffer_format_compat(fourcc, modifier) -> 0 | error
+  //
+  // Three-arm decomposition per the issue #2384 spec:
+  //   (1) fourcc in _fourcc_table     ? else SFMT_UNSUPPORTED_FOURCC
+  //   (2) modifier in _modifier_table ? else SFMT_UNSUPPORTED_MODIFIER
+  //   (3) (fourcc, modifier) in _supported_pairs ? else SFMT_INCOMPATIBLE_PAIR
+  //
+  // Order matters: a fourcc that fails (1) also fails (3), but the
+  // caller wants to distinguish "we do not recognise this pixel
+  // format at all" (1) from "we recognise both but do not accept the
+  // pair" (3).  A modifier YF_TILED that fails (3) but passes (2) is
+  // the deliberate design gap the _supported_pairs comment above
+  // calls out -- ships as INCOMPATIBLE_PAIR today, promoted to a
+  // real pair once R113.M4 wires YF.
+  //
+  // Leaf function -- no callee-save needed, no nested call, so entry
+  // rsp%16==8 stays untouched through ret.
+  //
+  // Register plan: rdi=fourcc, rsi=modifier, r10=table base, rcx=idx,
+  // r11=scratch pair-index compute, rax=return / scratch load.
+  // ==========================================================================
+
+  pub let buffer_format_compat : (u64, u64) -> u64 !{mem} @{} =
+    fn (fourcc: u64) (modifier: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M1-004 (#2384): three-arm buffer-format admission gate. (1) fourcc scan over _fourcc_table[0..8] -> SFMT_UNSUPPORTED_FOURCC on miss; (2) modifier scan over _modifier_table[0..4] -> SFMT_UNSUPPORTED_MODIFIER on miss; (3) (fourcc, modifier) walk over _supported_pairs[0..12] -> SFMT_INCOMPATIBLE_PAIR on miss. Word-scale SIB *8 throughout. Leaf function, entry rsp%16==8 preserved to ret. Labels prefixed bfc_.",
+      block: {
+        // ---- (1) fourcc catalogue scan ----------------------------
+        lea r10, [rip + _fourcc_table];
+        xor rcx, rcx;
+      bfc_fourcc_scan:
+        cmp rcx, 8;
+        jae bfc_bad_fourcc;
+        mov rax, [r10 + rcx * 8];
+        cmp rax, rdi;
+        je  bfc_fourcc_ok;
+        add rcx, 1;
+        jmp bfc_fourcc_scan;
+
+      bfc_fourcc_ok:
+        // ---- (2) modifier catalogue scan ------------------------
+        lea r10, [rip + _modifier_table];
+        xor rcx, rcx;
+      bfc_mod_scan:
+        cmp rcx, 4;
+        jae bfc_bad_modifier;
+        mov rax, [r10 + rcx * 8];
+        cmp rax, rsi;
+        je  bfc_mod_ok;
+        add rcx, 1;
+        jmp bfc_mod_scan;
+
+      bfc_mod_ok:
+        // ---- (3) pair walk over 12 rows -------------------------
+        // Each row is 2 words = 16 bytes; word idx of row r is r*2.
+        lea r10, [rip + _supported_pairs];
+        xor rcx, rcx;                        // row idx
+      bfc_pair_scan:
+        cmp rcx, 12;
+        jae bfc_bad_pair;
+        mov r11, rcx;
+        shl r11, 1;                          // r11 = word idx of fourcc slot
+        mov rax, [r10 + r11 * 8];
+        cmp rax, rdi;
+        jne bfc_pair_next;
+        add r11, 1;                          // word idx of modifier slot
+        mov rax, [r10 + r11 * 8];
+        cmp rax, rsi;
+        je  bfc_pair_ok;
+      bfc_pair_next:
+        add rcx, 1;
+        jmp bfc_pair_scan;
+
+      bfc_pair_ok:
+        xor rax, rax;                        // SFMT_OK
+        ret;
+
+      bfc_bad_fourcc:
+        mov rax, 0xFFFFE121;
+        ret;
+      bfc_bad_modifier:
+        mov rax, 0xFFFFE122;
+        ret;
+      bfc_bad_pair:
+        mov rax, 0xFFFFE123;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // surface_format_bind_at_mint(slot, formats_count) -> 0 | error
+  //
+  // Marks the surface at `slot` as having negotiated a format set of
+  // `formats_count` entries and emits the SURFACE FMT BIND OK
+  // fingerprint on FIRST bind for the slot.  Repeat calls for the
+  // same slot are no-op successes -- the 256-bit _bind_bitmap tracks
+  // which slots have already been bound, so a re-attach on a
+  // committed surface does not re-emit the tag (avoiding the
+  // multi-emit smearing that would defeat the fingerprint's use as a
+  // per-surface transition witness).
+  //
+  // Bitmap addressing: word = slot / 64 (shr 6), bit = slot & 63
+  // (and imm8 63 -- safe).  A bitmap of 256 bits comfortably covers
+  // SURFACE_ROW_MAX (16 today; ~48 at M2; the substrate could scale
+  // to 256 slots without touching this file).
+  //
+  // Contract:
+  //   slot invalid (surface_row_valid == 0) -> SFMT_BAD_SLOT
+  //   slot already bound                    -> SFMT_OK (no-op, no emit)
+  //   otherwise                             -> set bit, emit, SFMT_OK
+  //
+  // formats_count is passed straight to the fingerprint as the
+  // `formats=<n>` KV -- it is a caller-supplied advisory, not gated
+  // by the substrate (the compositor knows what its own attach
+  // negotiated); a zero count is legal (a surface with no format
+  // options bound is a valid transient state at mint time).
+  //
+  // Register plan: r12=slot (live across the nested surface_row_
+  // valid + klog_s1_d2 calls), r13=formats_count (live for the KV
+  // emit).  2 callee-save pushes + `sub rsp, 8` pad = 24B -> body
+  // rsp%16==0.  klog_s1_d2 stack-arg call adds a further 16B (pad +
+  // push) mirroring panic_dump.pdx L215-217 exactly; post-CALL
+  // `add rsp, 16` reclaims both slots.  Epilogue: `add rsp, 8` + 2
+  // pops before ret.
+  //
+  // klog_s1_d2 (klog/wrappers.pdx L261) signature:
+  //   rdi=level, rsi=subsys_ptr, rdx=tag_ptr,
+  //   rcx=k1, r8=v1, r9=k2, [rsp+8]=v2
+  // Emission at LEVEL_INFO=3 with SUBSYS_CAP_, tag_ptr=surface_fmt_
+  // bind_ok_msg (kind_surface.pdx L196), k1=surface_k_sid (kind_
+  // surface.pdx L200), v1=slot, k2=surface_k_formats (this file),
+  // v2=formats_count.  Wire form:
+  //   "info cap surface fmt bind ok [legacy: SURFACE FMT BIND OK] sid=<n> formats=<n>"
+  // -- matches the design/graphics/r113-m1-substrate.md §8 fingerprint
+  // taxonomy byte-for-byte.
+  // ==========================================================================
+
+  pub let surface_format_bind_at_mint : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (slot: u64) (formats_count: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R113.M1-004 (#2384): idempotent format-bind stamp for a surface slot. Gate 1: surface_row_valid else SFMT_BAD_SLOT. Gate 2: bit already set in _bind_bitmap[slot/64] & (1<<(slot&63)) -> no-op SFMT_OK (idempotent). Else: set bit + emit SURFACE FMT BIND OK via klog_s1_d2 with sid=slot, formats=formats_count, and return SFMT_OK. Stack: 2 callee-save pushes (r12=slot, r13=formats_count) + sub rsp,8 pad = 24B -> body rsp%16==0 for both nested calls. klog_s1_d2's 7th arg goes on stack via the sub+push idiom that mirrors panic_dump.pdx L215-217 byte-for-byte. `shl r64, cl` for the bit mask is proven at pdxfs_lite/alloc.pdx L233. sysreg effect is present because klog_s1_d2 declares it (COM1 uart_putc path); mem carries the bitmap RMW. Labels prefixed sfbm_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;                          // pad -> body rsp%16==0
+
+        mov r12, rdi;                        // slot
+        mov r13, rsi;                        // formats_count
+
+        // Gate 1: surface_row_valid(slot).
+        mov rdi, r12;
+        call surface_row_valid;
+        cmp rax, 0;
+        je  sfbm_bad_slot;
+
+        // Bitmap addressing: word = slot / 64, bit = slot & 63.
+        mov r10, r12;
+        shr r10, 6;                          // r10 = word idx
+        mov r11, r12;
+        and r11, 63;                         // r11 = bit idx  (imm8, safe)
+
+        // Load bitmap[word].
+        lea r8, [rip + _bind_bitmap];
+        mov rax, [r8 + r10 * 8];
+
+        // mask = 1 << bit
+        mov rcx, r11;                        // cl = bit for shl
+        mov r9, 1;
+        shl r9, cl;                          // r9 = 1 << bit
+
+        // Idempotency: word & mask ?
+        mov rdx, rax;
+        and rdx, r9;
+        cmp rdx, 0;
+        jne sfbm_already;                    // already bound -> no-op
+
+        // Set the bit and write back.
+        or  rax, r9;
+        mov [r8 + r10 * 8], rax;
+
+        // Emit fingerprint via klog_s1_d2.
+        //   klog_s1_d2 signature (klog/wrappers.pdx L261):
+        //     rdi=level, rsi=subsys_ptr, rdx=tag_ptr,
+        //     rcx=k1, r8=v1, r9=k2, [rsp+8]=v2
+        //   Body rsp%16==0; 8-byte pad + 8-byte push (16B total) keeps
+        //   the callee-entry rsp%16==8 invariant, byte-identical to
+        //   panic_dump.pdx L215-217 and ioapic_route.pdx L337.
+        sub rsp, 8;                          // alignment pad
+        mov rax, r13;                        // v2 = formats_count
+        push rax;                            // [rsp+8] post-CALL = v2
+
+        mov  rdi, 3;                         // LEVEL_INFO
+        lea  rsi, [rip + SUBSYS_CAP_];
+        lea  rdx, [rip + surface_fmt_bind_ok_msg];
+        lea  rcx, [rip + surface_k_sid];
+        mov  r8,  r12;                       // v1 = slot
+        lea  r9,  [rip + surface_k_formats];
+        call klog_s1_d2;
+
+        add rsp, 16;                         // reclaim push + pad
+
+        xor rax, rax;                        // SFMT_OK
+        jmp sfbm_out;
+
+      sfbm_already:
+        xor rax, rax;                        // SFMT_OK (idempotent)
+        jmp sfbm_out;
+
+      sfbm_bad_slot:
+        mov rax, 0xFFFFE120;
+
+      sfbm_out:
+        add rsp, 8;                          // undo pad
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}
