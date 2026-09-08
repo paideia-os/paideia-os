@@ -381,6 +381,43 @@ ALLOWLIST = {
         "UEFI BRIDGE OK / UEFI PML4 OK / UEFI EBS OK / ROOTFS MOUNT "
         "OK type=pdxfs).",
 
+    # src/kernel/core/fw/loader.pdx tag_fw_manifest_sig_ok --
+    # R111.M6-023 (paideia-os #2375).  Whole-manifest Ed25519
+    # signature-verify success fingerprint emitted from
+    # firmware_load_all_from_manifest via fwl_emit_sig_ok / klog_s1
+    # exactly once per boot on the happy path, immediately before the
+    # entry-dispatch loop begins.  Wire line shape:
+    #     "FW MANIFEST SIG OK"
+    # No KV suffix (klog_s1 has zero KV entries).  The sibling
+    # SIG FAIL arm emits `FW MANIFEST SIG FAIL reason=<dec>` (no OK
+    # token -> not gate-visible) followed by `FW LOAD SKIP kind=0
+    # reason=10` (FW_SKIP_SIG_FAIL) so the SKIP-shape coverage
+    # taxonomy stays complete.  Unreachable in every 14-mode QEMU
+    # matrix because kernel_main gates the loader call itself on
+    # (_boot_env_pa != 0 && boot_env->fw_manifest_pa != 0), and
+    # neither PVH -kernel (never latches _boot_env_pa) nor any OVMF
+    # smoke mode (does not carry /paideia/firmware/manifest.pdxsig
+    # on its ESP yet) reaches the call.  Even the UEFI reach would
+    # today land on FW MANIFEST SIG FAIL under the R111.M6-023 dev-
+    # bypass semantics (accept iff the 64-byte sig trailer is
+    # bytewise all zero -- see manifest_sig.pdx
+    # fw_manifest_verify_signature) unless the mkimage.sh producer
+    # emits an all-zero trailer.  Same wire-deferred posture as
+    # FW MANIFEST OK / FW LOAD OK / MICROCODE APPLY OK; retires from
+    # this allowlist when the M7-025 image builder lands AND an OVMF
+    # smoke mode consumes it AND the R32/R82 real ed25519_verify
+    # primitive lands to accept a real-signed manifest.
+    "FW MANIFEST SIG OK":
+        "R111.M6-023 (#2375): whole-manifest Ed25519 signature-verify "
+        "success fingerprint; wire-deferred (no live manifest producer "
+        "until R111.M7-025 mkimage.sh lands, and no OVMF smoke mode "
+        "consumes it until R111.M2 opens boot_r111_uefi_bridge).  "
+        "Loader gates its own call in kernel_main on (_boot_env_pa "
+        "!= 0 && fw_manifest_pa != 0) so the -kernel matrix is silent "
+        "(FW MANIFEST NONE is the asserted sibling).  Retires when "
+        "mkimage.sh + OVMF smoke + R32/R82 real ed25519_verify all "
+        "land.",
+
     # src/kernel/core/cpu/microcode.pdx tag_microcode_apply_ok --
     # R111.M6-019 (paideia-os #2371).  Intel-microcode WRMSR-path
     # per-CPU apply-success fingerprint emitted from

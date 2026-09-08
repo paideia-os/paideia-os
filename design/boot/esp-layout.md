@@ -137,13 +137,85 @@ sanitize differently.
 
 ## 2. Manifest format (`manifest.pdxsig`)
 
-**Scope note (R111.M6-022 landing):** This milestone defines the
-manifest **file path + carry across boot** only.  The concrete
-schema, hash algorithm, and signature envelope land in R111.M6-023
-alongside the microcode WRMSR path (which is the first consumer of
-the "which blob is authoritative" query the manifest answers).  What
-this document freezes now, to keep future landings backwards-
-compatible with any manifest already staged on operator ESPs:
+**Status update (R111.M6-023, paideia-os #2375, 2026-09-07):** the
+concrete on-wire binary schema is now frozen at
+`src/kernel/core/fw/loader.pdx`'s file-header MANIFEST BINARY FORMAT
+narrative (16-byte header + N x 32B entries + 64-byte Ed25519
+signature trailer).  §2.1 below records the wire-visible facts; the
+whole-manifest signature-verify seam lands in
+`src/kernel/core/fw/manifest_sig.pdx` as
+`fw_manifest_verify_signature`, and the loader's gate 5.5 refuses to
+dispatch a single entry when it fails.  Under R111.M6-023 the
+verifier body is a dev-bypass accepting iff the 64-byte trailer is
+bytewise all zero (matching pdxfs_lite/verify.pdx's
+pdxfs_sb_verify_sig precedent, R25.M5-001); the R32/R82 landing
+replaces that body with real Ed25519 verification against the
+kernel-embedded trust-root pubkey
+(`fw_manifest_trust_root_pubkey`, all-zero placeholder at R111).
+
+### 2.1 On-wire binary layout (R111.M6-023, frozen)
+
+```
+Offset (from manifest_pa)         Size    Field
+---------------------------------------------------------------
++0                                16      header:
+                                            +0  u32 magic       = 0x464D4450 ('P','D','M','F')
+                                            +4  u32 version     = 1
+                                            +8  u32 entry_count = N
+                                            +12 u32 reserved    = 0
++16                               N * 32  entry table (each entry):
+                                            +0  u32 kind       (1=microcode, 2=GuC, 3=HuC)
+                                            +4  u32 offset     (blob start, relative to manifest_pa)
+                                            +8  u32 size       (blob length in bytes)
+                                            +12 u8[20] sha256   (leading 20 bytes of SHA-256(blob_body))
++16 + N * 32                      64      Ed25519 signature over bytes [0, +16 + N * 32).
+                                            The signature covers the header + entry
+                                            table; per-entry SHA256 fields cover the
+                                            blob bodies.  Producer:
+                                            tools/mkimage.sh (R111.M7-025).
+                                            Consumer: fw_manifest_verify_signature
+                                            (src/kernel/core/fw/manifest_sig.pdx).
+```
+
+**Total manifest size:** `16 + N * 32 + 64` bytes plus the blob
+bodies referenced by each entry.offset (which live INSIDE the same
+pool alloc, per file layout).  The loader's gate 5 refuses the
+manifest if `manifest_size < 16 + N * 32 + 64`; gate 5.5 then runs
+`fw_manifest_verify_signature`.
+
+**Trust root:** the kernel embeds `fw_manifest_trust_root_pubkey`
+as a 32-byte array (Ed25519 pubkey length per RFC 8032 §5.1.5).  At
+R111 the array is all zeros -- this pairs one-for-one with the
+dev-bypass accept-all-zero-sig posture: a manifest whose 64-byte sig
+trailer AND whose trust-root pubkey are both all-zero passes; a
+tamper of either half (real Ed25519 sig with all-zero pubkey, or
+non-zero pubkey with all-zero sig) trips the reject.  R32/R82 lands
+the real release-line signing pubkey here; the dev-bypass path in
+`fw_manifest_verify_signature` drops in the same commit.
+
+**Rationale for hardcoded-in-kernel:** the trust root MUST resist
+firmware-time or bootloader-time swap.  A boot_env slot would let a
+compromised UEFI stub substitute a pubkey the attacker controls; a
+hardcoded array is fixed at kernel-image sign time and inherits the
+R28 kernel-image sig-verify (`src/kernel/boot/verify_self.pdx`) as
+its own root of trust.  See design/security/secure-boot.md §3 "no
+lateral trust escalation" rule.
+
+**Boot policy on sig verify FAIL:** the loader emits `FW MANIFEST
+SIG FAIL reason=<FW_SIG_FAIL_*>` and then the umbrella `FW LOAD SKIP
+kind=0 reason=10 (FW_SKIP_SIG_FAIL)`, and returns without
+dispatching any entry.  This matches design/security/no-silent-
+fallback.md's fail-loud rule: a tampered or unsigned manifest gets
+no firmware loaded, not "signature failed but we loaded it anyway."
+
+### 2.2 Scope note (R111.M6-022 origin, superseded by §2.1)
+
+The R111.M6-022 landing carried the manifest across boot with the
+concrete schema deferred; this section records what that milestone
+froze, retained here for historical continuity and for any operator
+inspecting an older ESP.  What it fixed (path, container, payload
+semantics sketch) still holds; the concrete binary layout is now in
+§2.1.
 
 - **Path:** `/paideia/firmware/manifest.pdxsig`.  Case-sensitive
   match by the UEFI stub's `L"\paideia\firmware\manifest.pdxsig"`
@@ -395,11 +467,14 @@ implement its consumers:
 | ------------- | ------------------------------------ | ---------------------- |
 | R111.M6-022   | ESP layout + boot_env carry + fw     | THIS LANDING (#2374)   |
 |               | manifest witness                     |                        |
-| R111.M6-023   | Intel microcode WRMSR path (BSP+AP)  | Blocked on M6-022      |
-| R111.M6-024   | GuC/HuC blob staging (KIND_BLOB      | Blocked on M6-022      |
-|               | mint; no consumer wiring)            |                        |
-| R111.M7-025   | `tools/mkimage.sh` — the image       | Blocked on M6-020..024 |
-|               | builder that populates the ESP per   |                        |
+| R111.M6-023   | Firmware manifest signed hash chain: | LANDED 2026-09-07      |
+|               | 64B Ed25519 sig trailer + trust-root | (paideia-os #2375)     |
+|               | pubkey + verifier seam + per-entry   |                        |
+|               | SHA compare + boot-policy gate       |                        |
+| R111.M6-024   | GuC/HuC blob staging (KIND_BLOB      | LANDED 2026-09-07      |
+|               | mint; no consumer wiring)            | (paideia-os #2376)     |
+| R111.M7-025   | `tools/mkimage.sh` — the image       | LANDED 2026-09-07      |
+|               | builder that populates the ESP per   | (paideia-os #2377)     |
 |               | this document                        |                        |
 | R32 / R82     | ML-DSA-65 signature envelope for     | Deferred               |
 |               | manifest.pdxsig; verify_self chain   |                        |
