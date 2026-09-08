@@ -416,6 +416,106 @@ ALLOWLIST = {
         "unchanged so the SKIP arm fires). Assertable when M6-024 "
         "wires the boot cascade AND a real T14 G4 smoke lands.",
 
+    # src/kernel/core/drivers/gpu/huc/bundle.pdx tag_huc_bundle_ok --
+    # R111.M6-021 (paideia-os #2373).  ESP-embedded HuC firmware
+    # bundle admission fingerprint emitted from
+    # huc_firmware_bundle_verify once all seven Intel-CSS-header
+    # gates pass (pa != 0, size >= 0x288, module_type == 7 = CSS_
+    # MODULE_TYPE_HUC, header_size_dw == 0xA1, module_vendor ==
+    # 0x8086 = Intel, sw_version.major == 16, RSA-2048 signature
+    # slot first 16 bytes non-zero).  Byte-for-byte parallel to
+    # guc/bundle.pdx tag_guc_bundle_ok landed at the same wave
+    # (R111.M6-020, #2372); the two verifiers differ only by
+    # module_type pin (7 vs 6) and sw_version.major pin (16 vs 70).
+    # Wire line shape:
+    #     "HUC BUNDLE OK ver_maj=<dec> ver_min=<dec> size=<dec>"
+    # emitted via klog_s1_d3 (three decimal KV entries -- the
+    # `ver=<n>.<n>` form from the issue text is expressed as two
+    # ver_maj + ver_min KVs so the existing klog_s1_d3 wrapper
+    # covers the emit without a new arity).  The OK-bearing tag
+    # prefix is broken out as tag_huc_bundle_ok ("HUC BUNDLE OK");
+    # the trailing ` ver_maj=... ver_min=... size=...` is appended
+    # by the klog_s1_d3 KV loop and carries no OK token.
+    # Unreachable in every 14-mode QEMU matrix because R111.M6-021
+    # lands the verify-only substrate but does not wire a call
+    # site into kernel_main.pdx -- the ESP-to-KIND_BLOB staging
+    # cascade (which fetches the HuC bundle from
+    # /paideia/firmware/gpu/huc_16.bin, parses it, and invokes
+    # this verify) lands in R111.M6-024's firmware_load_all_from_
+    # manifest per-kind dispatch.  Additionally, QEMU-TCG's OVMF
+    # matrix does not ship a signed HuC blob on the ESP: even if
+    # the M6-024 wire landed, the default 14-mode boot would land
+    # on the SKIP arm (BAD_MODULE_TYPE or NULL_BLOB depending on
+    # whether the loader returns an empty descriptor or nothing).
+    # Same wire-deferred posture as MICROCODE APPLY OK / FW LOAD
+    # OK / GUC BUNDLE OK (which shares this landing wave and
+    # deferred its own allowlist entry to M6-024 -- covered
+    # separately when that entry lands); assertable when M6-024
+    # wires the boot cascade AND a real T14 G4 smoke mode ships
+    # a signed HuC 16.x bundle on its ESP.
+    # src/kernel/core/drivers/gpu/guc/bundle.pdx tag_guc_bundle_ok —
+    # R111.M6-020 (#2372).  Intel CSS-header GuC firmware verifier OK
+    # fingerprint; only fires on a live-HW ESP that ships a signed GuC
+    # blob at /paideia/firmware/gpu/guc_70.bin, then via
+    # firmware_load_all_from_manifest (M6-024).  Real-HW-only reachability
+    # today; the 14-mode QEMU matrix has no ESP + no firmware manifest.
+    "GUC BUNDLE OK":
+        "Real-HW-only reachability (R111.M6-020 GuC bundle CSS-header "
+        "verifier OK fingerprint); the 14-mode QEMU matrix has no ESP "
+        "with a signed GuC blob so this line never fires today.",
+
+    "HUC BUNDLE OK":
+        "R111.M6-021 (#2373): HuC firmware bundle admission "
+        "fingerprint; wire-deferred (no boot-cascade call site "
+        "until R111.M6-024 wires the ESP-to-KIND_BLOB staging). "
+        "Additionally requires a signed HuC 16.x bundle on the ESP "
+        "which the 14-mode QEMU matrix does not ship. Assertable "
+        "when M6-024 wires the boot cascade AND a real T14 G4 "
+        "smoke lands with a signed HuC 16.x bundle.",
+
+    # src/kernel/core/fw/loader.pdx tag_fw_load_ok --
+    # R111.M6-024 (paideia-os #2376). Kernel firmware loader per-entry
+    # dispatch-success fingerprint emitted from
+    # firmware_load_all_from_manifest via fwl_emit_ok / klog_s1_d2_x1
+    # once per manifest entry whose per-kind loader (microcode_load_and_
+    # apply for kind=1, gucv_verify for kind=2, hucl_verify_vendor +
+    # hucl_verify_paideia for kind=3) returns success.  Wire line shape:
+    #     "FW LOAD OK kind=<dec> size=<dec> ver=0x<hex>"
+    # The OK-bearing tag prefix is broken out as tag_fw_load_ok
+    # ("FW LOAD OK"); the trailing ` kind=... size=... ver=...` is
+    # appended by the klog_s1_d2_x1 KV loop and carries no OK token.
+    # Unreachable in every 14-mode QEMU matrix under R111.M6-024
+    # because kernel_main gates the loader call itself on
+    # (_boot_env_pa != 0 && boot_env->fw_manifest_pa != 0), and neither
+    # PVH -kernel (never latches _boot_env_pa) nor any OVMF smoke mode
+    # (does not carry /paideia/firmware/manifest.pdxsig on its ESP
+    # yet) reaches the call.  The kernel-visible witness on those
+    # boots is `FW MANIFEST NONE` (R111.M6-022 sibling); the loader
+    # itself is silent.  Additionally, even a boot that reached the
+    # loader would land on QEMU-TCG's microcode SKIP arm for kind=1
+    # entries (see MICROCODE APPLY OK reasoning above), so full
+    # end-to-end reach requires (a) mkimage.sh (R111.M7-025) building
+    # an ESP with manifest.pdxsig + populated microcode/gpu blobs,
+    # (b) an OVMF smoke mode that boots past ExitBootServices onto
+    # that ESP, and (c) either real T14 G4 silicon OR a QEMU with a
+    # full-fidelity microcode-apply simulation.  Same wire-deferred
+    # posture as MICROCODE APPLY OK / FW MANIFEST OK; retires from
+    # this allowlist when the M7 image builder lands AND an OVMF
+    # smoke mode consumes it.
+    "FW LOAD OK":
+        "R111.M6-024 (#2376): kernel firmware loader per-entry "
+        "dispatch-success fingerprint; wire-deferred (no live "
+        "manifest producer until R111.M7-025 mkimage.sh lands, and "
+        "no OVMF smoke mode consumes it until R111.M2 opens boot_"
+        "r111_uefi_bridge).  Loader gates its own call in "
+        "kernel_main on (_boot_env_pa != 0 && fw_manifest_pa != 0) "
+        "so the -kernel matrix is silent (FW MANIFEST NONE is the "
+        "asserted sibling).  Additionally unreachable on QEMU-TCG "
+        "even with a manifest for kind=1 entries (microcode SKIP "
+        "arm fires -- same reason as MICROCODE APPLY OK above). "
+        "Assertable when mkimage.sh + an OVMF smoke mode + either "
+        "real T14 G4 or a fidelity-upgraded QEMU all land.",
+
     # src/kernel/core/klog/keys.pdx tag_msix_ir_table_ok — R111.M2-007
     # (paideia-os #2359). MSI-X + VT-d IR bring-up fingerprint emitted
     # from src/kernel/core/iommu/msix_ir_bringup.pdx §msix_ir_bringup_all

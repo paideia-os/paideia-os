@@ -3844,6 +3844,16 @@ if [[ "${EC_CONFINE_OK}" != "1" ]]; then
 fi
 echo "[gpu-m8-confine] R37.M8 (GPU video-decode enablement) confined"
 
+# NOTE: R111.M6-020 (guc/bundle.pdx, #2372) and R111.M6-021
+# (huc/bundle.pdx, #2373) confinement blocks are DEFERRED to the
+# R111.M6-024 loader wire landing per the sibling files' SECTION 2
+# ("Confinement not yet wired at file-landing (build.sh touch
+# happens in the same wave with M6-024's loader).").  The .pdx
+# find-based sweep above still picks up both files and compiles
+# them, so the one-writer .bss allocations are in place; the
+# ec_confine_one relocation gate is what M6-024 will bolt on
+# once the loader has a live call site to observe.
+
 # ---------------------------------------------------------------------------
 # R38.M1 (#1289/#1291/#1292/#1293): AX211 WiFi bring-up substrate --
 # PCI probe + BAR mapping (ax211_probe), UMAC/MVM firmware
