@@ -299,6 +299,65 @@ ALLOWLIST = {
         "Golden-wiring deferred to the R111.M2 OVMF-smoke-mode landing "
         "(same target as UEFI BRIDGE OK).",
 
+    # src/kernel/core/klog/keys.pdx tag_ioapic_route_ok — R111.M2-008
+    # (paideia-os #2360). Legacy ISA IRQ [0..15] MADT ISO resolution
+    # rollup emitted by ioapic_route_witness_legacy_isas from
+    # src/kernel/core/apic/ioapic_route.pdx, called from kernel_main_64
+    # immediately after topology_seed_from_madt (which populates
+    # _madt_scratch_isos). Renders "IOAPIC ROUTE OK identity=<n>
+    # overridden=<n>" via klog_s1_d2, tallied across a 16-iteration
+    # walk of madt_iso_gsi_for_irq(irq) for irq in 0..15. Under QEMU-TCG
+    # q35 / i440fx with `-kernel` the boot path takes the env==0 EBDA-
+    # scan fallback; when that yields no MADT (or a MADT with no ISOs)
+    # the rollup is `identity=16 overridden=0`. On T14 G4 / EPYC boards
+    # a typical shape is `identity=13 overridden=3` (SCI + IRQ0→GSI2 +
+    # IRQ9 fixup). Fires on EVERY boot from kernel_main_64 post-
+    # topology_seed_from_madt, so the marker IS reachable in the default
+    # matrix — assertable in an existing boot golden without a new smoke
+    # mode. Same "code emit lands now, golden-wiring lands with the next
+    # OVMF-smoke-mode window" posture as the R111.M1-004 sibling entries
+    # (`ACPI RSDP HANDOFF OK`, `ACPI TABLES SUMMARY OK`) immediately
+    # above; the sibling `MADT ISO OVERRIDE` per-record fingerprint has
+    # no OK token and does not need an allowlist entry.
+    "IOAPIC ROUTE OK":
+        "R111.M2-008 (#2360): legacy ISA IRQ [0..15] MADT ISO "
+        "resolution rollup. Fires on every boot from kernel_main_64 "
+        "post-topology_seed_from_madt via ioapic_route_witness_legacy_"
+        "isas; assertable in an existing boot golden. Golden-wiring "
+        "deferred to the R111.M2 OVMF-smoke-mode landing (same target "
+        "as ACPI RSDP HANDOFF OK / ACPI TABLES SUMMARY OK).",
+
+    # src/kernel/devices/display/gop_fb_console.pdx gop_fb_ok_msg —
+    # R111.M4-015 (paideia-os #2367). GOP framebuffer console
+    # bring-up fingerprint (Line 1 of a two-line pair) emitted by
+    # gop_fb_console_init immediately after phase1_emit_rsdp_fingerprint
+    # in kernel_main_64. Renders "FB CONSOLE OK width=<n> height=<n>
+    # bpp=<n>" via klog_s1_d3; the companion Line 2 "fb console base
+    # base=0x<...>" carries no OK token so does not need its own
+    # allowlist entry. Reachable only on the UEFI boot path where
+    # _boot_env_pa != 0 AND boot_env->fb.base_pa != 0 AND
+    # platform_mmio_map succeeds; every other path (PVH -kernel,
+    # firmware without GOP, LFB map failure) takes the sibling
+    # "FB CONSOLE OFF" arm (no OK token, not gate-visible). The
+    # 14-mode default matrix boots via -kernel so this fingerprint
+    # never fires there; the PAIDEIA_UEFI_OVMF opt-in stops at the
+    # pre-EBS banner and does not reach kernel_main_64 either.
+    # Same UEFI-only reachability posture as "UEFI BRIDGE OK" /
+    # "UEFI PML4 OK" / "ACPI RSDP HANDOFF OK" above; retires from this
+    # allowlist when R111.M2 opens an OVMF smoke mode that boots past
+    # ExitBootServices and asserts the fingerprint against a live
+    # golden (planned as `boot_r111_uefi_bridge`, same follow-up
+    # target the sibling UEFI entries name).
+    "FB CONSOLE OK":
+        "R111.M4-015 (#2367): GOP framebuffer console bring-up "
+        "fingerprint (Line 1); reachable only on UEFI boot with GOP "
+        "handoff. The 14-mode -kernel matrix takes the sibling "
+        "'FB CONSOLE OFF' arm (no OK token, not gate-visible), and "
+        "no OVMF smoke mode boots past ExitBootServices yet. "
+        "Retires when R111.M2 opens boot_r111_uefi_bridge (same "
+        "follow-up target as UEFI BRIDGE OK / UEFI PML4 OK / ACPI "
+        "RSDP HANDOFF OK).",
+
     # -- Section B: synth-witness markers under tests/**, each emitted
     #    only by an opt-in mode or a real-hardware smoke that the default
     #    matrix never runs. Verified against a full default-matrix boot
