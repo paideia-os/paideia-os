@@ -1501,6 +1501,23 @@ ALLOWLIST = {
         "default matrix once a boot witness wires mint -> attach -> "
         "commit -> notify end-to-end.  Closed the last of the doc §8 "
         "five-tag mandate slots (all five tags now have live emitters).",
+    "dmabuf import ok [legacy: DMABUF IMPORT OK]":
+        "R113.M4-017 (paideia-os #2397): kernel-side DMABUF IMPORT OK "
+        "tag emitted by dma_buf_import (src/kernel/core/graphics/"
+        "dma_buf.pdx) via klog_s1_x3 with (id, bo, size) KVs on every "
+        "successful KIND_GPU_BO -> DMA-BUF descriptor import.  Emitter "
+        "is live but not reachable in the default matrix yet: no boot "
+        "witness or cap dispatcher arm calls dma_buf_import -- "
+        "dma_buf_init is a pure zero-out at boot and the descriptor "
+        "pool itself is kernel-internal at M4 (a KIND_DMA_BUF cap "
+        "wrapper lands with R113.M5's cross-process share path).  "
+        "Reachable end-to-end when the R113.M4 rendering-path wave "
+        "wires a scanout witness that mints a KIND_GPU_BO, imports it "
+        "as a DMA-BUF descriptor via dma_buf_import, and releases via "
+        "dma_buf_release after the scanout ack -- the natural first "
+        "consumer of the substrate this file lands.  Same real-HW / "
+        "wire-deferred posture as the sibling `surface present ok` "
+        "entry above.",
     "surface toplevel create ok [legacy: TOPLEVEL CREATE OK]":
         "R113.M2-006 (paideia-os #2386): kernel-side SURFACE TOPLEVEL "
         "CREATE OK tag emitted by toplevel_create (src/kernel/core/"
@@ -1630,6 +1647,85 @@ ALLOWLIST = {
         "the default matrix when a boot witness drives focus_set_"
         "keyboard against a live surface slot (same MSI-X wire "
         "blocker as the focus kbd / focus ptr siblings above).",
+
+    # ------------------------------------------------------------------
+    # R113.M4-020 (paideia-os #2400): damage-driven redraw planner
+    # (src/kernel/core/graphics/composite_plan.pdx).  composite_plan
+    # walks _z_stack top-down, enumerates each surface's per-frame
+    # damage rects via damage_region_count/damage_region_get, clips
+    # each rect to the _gop_fb_width x _gop_fb_height framebuffer
+    # bounds, and writes the clipped packed u64 rects into the
+    # caller's out_rects_ptr buffer up to out_cap; after enumeration
+    # it calls damage_region_clear per visited surface so the next
+    # frame starts with an empty region.  Emits COMPOSITE PLAN OK
+    # via klog_s1_x2 with (dirty_count=<n_written>, covered=<n_
+    # examined>) KVs once per invocation.  covered - dirty_count is
+    # the observability handle for "planner did work the GPU won't
+    # see" (offscreen drops + capacity overflow).  M4-020 is the
+    # planner primitive only; the GPU backend wire (R36 display-
+    # plane bring-up / R113.M4 present-fence hook that calls the
+    # planner once per composited frame) is a separate follow-on
+    # landing.  Same real-HW / wire-deferred posture as the surface
+    # present ok / z order raise ok siblings above.  Assertable when
+    # a boot witness or the R113.M4 vsync hook drives composite_plan
+    # against a live z-stack with pending damage end-to-end.
+    # ------------------------------------------------------------------
+    "composite plan ok [legacy: COMPOSITE PLAN OK]":
+        "R113.M4-020 (#2400): per-frame damage-driven composite "
+        "planner fingerprint; composite_plan emits via klog_s1_x2 "
+        "with (dirty_count=<n_written>, covered=<n_examined>) KVs "
+        "on every invocation (unconditional; covers the "
+        "dirty_count==0 case as the 'no dirty surfaces this frame' "
+        "witness).  Emitter is live but not reachable in the "
+        "default matrix yet: no live caller wires the planner -- "
+        "the GPU backend hook (R36 display-plane bring-up / "
+        "R113.M4 present-fence integration) is a separate follow-"
+        "on landing.  Same real-HW / wire-deferred posture as the "
+        "surface present ok / z order raise ok siblings above; "
+        "assertable when a boot witness or the R113.M4 vsync hook "
+        "drives composite_plan against a live z-stack with pending "
+        "damage end-to-end.",
+
+    # ------------------------------------------------------------------
+    # R113.M4-018 (paideia-os #2398): direct-scanout gate
+    # (src/kernel/core/graphics/scanout.pdx).  scanout_try_direct
+    # walks the seven gates (primary plane latched, plane row live,
+    # z-stack has exactly one surface, top slot live, surface fourcc
+    # maps to a DPP ordinal, plane native format matches, bind
+    # succeeds) once per frame; on the FIRST successful admission for
+    # each surface it emits SCANOUT DIRECT OK via klog_s1_x2 with
+    # (sid=<slot>, plane=<row>) KVs and sets the corresponding bit in
+    # _scanout_emitted_bmp so a re-activation of the same surface is
+    # silent from the second admission onwards (defeats the multi-
+    # emit smearing that would swamp the fingerprint stream on a
+    # workload that oscillates between direct and composite paths).
+    # Unreachable in the default 14-mode QEMU matrix today because
+    # (a) no boot witness calls scanout_set_primary_plane against a
+    # live display-plane row, and (b) the physical HW plane write
+    # (Iris Xe DSPCNTR / DSPSURF etc.) is the R36 atomic-commit
+    # landing still open.  Same real-HW / wire-deferred posture as
+    # the composite plan ok / surface present ok / z order raise ok
+    # siblings above; assertable when a boot witness mints a display
+    # plane, calls scanout_set_primary_plane, minted a KIND_SURFACE
+    # with a matching fourcc, committed a frame (current_bo non-zero
+    # via surface_row_swap), pushes the surface onto the z-order
+    # stack via z_order_push_top and then calls scanout_try_direct.
+    # ------------------------------------------------------------------
+    "scanout direct ok [legacy: SCANOUT DIRECT OK]":
+        "R113.M4-018 (#2398): direct-scanout admission fingerprint; "
+        "scanout_try_direct emits via klog_s1_x2 with (sid=<slot>, "
+        "plane=<row>) KVs on the FIRST successful admission for "
+        "each surface (subsequent admissions of the same surface "
+        "are silent, gated by _scanout_emitted_bmp).  Emitter is "
+        "live but not reachable in the default matrix yet: no boot "
+        "witness calls scanout_set_primary_plane, and the plane's "
+        "physical HW register write is the R36 atomic-commit "
+        "landing still open.  Same real-HW / wire-deferred posture "
+        "as the composite plan ok / surface present ok / z order "
+        "raise ok siblings; assertable when a boot witness mints a "
+        "display plane, calls scanout_set_primary_plane, mints a "
+        "KIND_SURFACE with a matching fourcc, commits a frame, "
+        "pushes it onto z-order and calls scanout_try_direct.",
 
     # ------------------------------------------------------------------
     # R113.M3-012 (paideia-os #2392): keyboard event routing from the

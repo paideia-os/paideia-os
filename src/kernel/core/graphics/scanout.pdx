@@ -1,0 +1,850 @@
+// src/kernel/core/graphics/scanout.pdx -- R113.M4-018 (paideia-os #2398)
+//
+// Direct-scanout gate: skip compositing when the single top-of-Z-order
+// surface's buffer format matches the primary display plane's native
+// format.  This is the "1 surface, 1 plane, 0 blend" fast path -- the
+// compositor's frame loop calls scanout_try_direct() every frame; when
+// it returns 1 the frame's pixels reach the panel without any GPU
+// blit through the compositor's scratch surface, saving one full-
+// framebuffer copy per vsync and (on Iris Xe) the associated GPU
+// context switch.
+//
+// -----------------------------------------------------------------------------
+// SCOPE (per issue #2398)
+// -----------------------------------------------------------------------------
+//
+// Five entry points:
+//
+//   * scanout_init()                              -- boot-time init;
+//                                                    latches _scanout_
+//                                                    primary_plane to
+//                                                    SCANOUT_SLOT_NONE,
+//                                                    scrubs the per-
+//                                                    plane binding
+//                                                    arrays and the
+//                                                    per-surface first-
+//                                                    activation bitmap.
+//                                                    Defensive re-scrub
+//                                                    mirroring the
+//                                                    kind_surface_init
+//                                                    / z_order_init /
+//                                                    keymap_init
+//                                                    discipline.
+//   * scanout_set_primary_plane(row_id) -> u64    -- validate row_id
+//                                                    via dpp_tail_valid
+//                                                    and latch as the
+//                                                    plane scanout_try_
+//                                                    direct will
+//                                                    consider.  Called
+//                                                    once at compositor
+//                                                    start (after the
+//                                                    primary plane
+//                                                    mint), and again
+//                                                    on any modeset
+//                                                    that re-mints the
+//                                                    plane.
+//   * scanout_fourcc_to_dpp_format(fourcc) -> u64 -- DRM_FOURCC ->
+//                                                    DPP_FORMAT_*
+//                                                    ordinal.  Returns
+//                                                    SCANOUT_FORMAT_
+//                                                    UNMAP on any
+//                                                    fourcc outside the
+//                                                    direct-scanout
+//                                                    admissible subset
+//                                                    (XRGB8888, NV12,
+//                                                    YUYV at M4; ARGB /
+//                                                    RGBA / P010 land
+//                                                    when the plane
+//                                                    driver's per-class
+//                                                    admission set
+//                                                    widens).
+//   * scanout_bind(plane_id, surface_slot) -> u64 -- validate + latch
+//                                                    the (plane_id ->
+//                                                    surface_slot) and
+//                                                    (plane_id ->
+//                                                    current_bo)
+//                                                    tracking cells.
+//                                                    Records the
+//                                                    binding for
+//                                                    downstream driver
+//                                                    consumption; the
+//                                                    physical HW write
+//                                                    (Iris Xe DSPCNTR /
+//                                                    DSPSURF etc.)
+//                                                    lands separately
+//                                                    with the atomic
+//                                                    commit landing.
+//                                                    Callable directly
+//                                                    from a manual
+//                                                    (non-try-direct)
+//                                                    path.
+//   * scanout_try_direct() -> u64                 -- frame-hot gate.
+//                                                    Returns
+//                                                    SCANOUT_DIRECT_
+//                                                    ACTIVE (1) when
+//                                                    the seven gates
+//                                                    below all pass,
+//                                                    else SCANOUT_
+//                                                    DIRECT_FALLBACK
+//                                                    (0).  Emits the
+//                                                    SCANOUT DIRECT OK
+//                                                    fingerprint the
+//                                                    first time each
+//                                                    surface becomes
+//                                                    direct-scanned
+//                                                    (idempotent per
+//                                                    surface via the
+//                                                    256-bit _scanout_
+//                                                    emitted_bmp).
+//
+// -----------------------------------------------------------------------------
+// GATE ORDER (scanout_try_direct)
+// -----------------------------------------------------------------------------
+//
+//   (1) _scanout_primary_plane != SCANOUT_SLOT_NONE
+//         -- no plane latched, no direct path possible.
+//   (2) dpp_tail_valid(_scanout_primary_plane)
+//         -- the latched plane row is still live (guards against a
+//            revocation racing the frame loop).
+//   (3) _z_stack_count == 1
+//         -- multi-surface stacks REQUIRE compositing; the direct-scan
+//            path serves the single-surface case only (fullscreen app,
+//            splash screen, lock screen -- the R113.M4 workloads).
+//   (4) z_order_slot_at(0) is a live surface slot
+//         -- surface_row_valid gate on the top slot.  Redundant with
+//            z_order_push_top's own gate (kind_surface.pdx L307) but
+//            re-run here so a destroy racing the frame loop lands as
+//            fallback rather than a bogus bind.
+//   (5) surface_row_format_get(slot) low-32 fourcc maps to a DPP
+//       ordinal
+//         -- scanout_fourcc_to_dpp_format returns SCANOUT_FORMAT_UNMAP
+//            (0xFFFFE234) on any fourcc outside {XRGB8888, NV12,
+//            YUYV}; fallback treats an unmapped fourcc as
+//            "composite-only" rather than "error", since the
+//            compositor can always render an unsupported fourcc into
+//            a supported one via GPU shaders.
+//   (6) dpp_row_format(plane) == mapped surface ordinal
+//         -- exact match required.  A close match (e.g. XRGB8888
+//            surface on an RGBA8888 plane) is a compositor-scope
+//            format conversion that this landing does not attempt.
+//   (7) scanout_bind(plane, slot) succeeds
+//         -- primarily gates on the surface having a non-zero
+//            current_bo (SCANOUT_NO_CURRENT_BO on a surface that
+//            mounted a format but never committed a frame; direct-
+//            scanout of an empty surface would program the plane to
+//            scan out of a null/garbage buffer, defeating the point).
+//
+// On success: bump SCANOUT_ST_DIRECT_HITS.  If _scanout_emitted_bmp
+// bit for the surface is unset, set it, emit SCANOUT DIRECT OK, and
+// bump SCANOUT_ST_EMITS.  Return 1.
+//
+// On any gate failure: bump SCANOUT_ST_FALLBACKS.  Return 0.  The
+// compositor's frame loop is the sole caller; a 0 return means "run
+// the composite pass this frame".
+//
+// -----------------------------------------------------------------------------
+// STATE MACHINE / IDEMPOTENCY
+// -----------------------------------------------------------------------------
+//
+// _scanout_emitted_bmp is a 256-bit bitmap keyed on surface slot
+// index (same shape as surface_format.pdx _bind_bitmap).  Bit is set
+// on the FIRST time each surface is admitted onto the direct-scan
+// path; a re-activation of the same surface (fallback -> direct
+// transition after a composited frame) is silent from the second
+// admission onwards.  This defeats the multi-emit smearing that would
+// swamp the fingerprint stream on a workload that oscillates between
+// direct and composite paths (e.g. a fullscreen app that spawns a
+// notification pop-up for one frame).
+//
+// _scanout_bound_sid[plane] and _scanout_bound_bo[plane] survive
+// across frames; scanout_bind overwrites unconditionally on success.
+// A subsequent frame that hits direct-scanout for the same (plane,
+// surface) with an updated current_bo (surface_row_swap advanced the
+// pending -> current promotion) will re-latch the bo but NOT re-emit
+// (bit already set).  Downstream consumers of the binding read the
+// pair at scanout time.
+//
+// -----------------------------------------------------------------------------
+// FAILURE TAXONOMY -- 0xFFFFE230..0xFFFFE23F
+// -----------------------------------------------------------------------------
+//
+// Pre-landing sweep (2026-09-08):
+//
+//     $ grep -rn '0xFFFFE23' src design tools tests  ->  empty
+//
+// so 0xFFFFE230..0xFFFFE23F is fresh and uncontested.  Neighbouring
+// bands in the 0xFFFFE2XX page:
+//
+//   0xFFFFE200..E20F  R113.M3-014 TOUCH ROUTE
+//   0xFFFFE210..E21F  R113.M3-016 KEYMAP
+//   0xFFFFE220..E22F  free
+//   0xFFFFE230..E23F  R113.M4-018 SCANOUT DIRECT   (THIS FILE)
+//   0xFFFFE240..E2FF  free
+//
+// Slot map:
+//
+//   0xFFFFE230  SCANOUT_BAD_PLANE           plane_id not a live
+//                                           display-plane row
+//   0xFFFFE231  SCANOUT_BAD_SURFACE         surface_slot not a live
+//                                           KIND_SURFACE row
+//   0xFFFFE232  SCANOUT_NO_CURRENT_BO       surface has no committed
+//                                           frame (current_bo == 0)
+//   0xFFFFE233  SCANOUT_FORMAT_MISMATCH     surface fmt ordinal !=
+//                                           plane fmt ordinal (return
+//                                           via scanout_bind's caller
+//                                           context; scanout_try_
+//                                           direct itself treats as
+//                                           silent fallback)
+//   0xFFFFE234  SCANOUT_FORMAT_UNMAP        fourcc outside the direct-
+//                                           scan admissible subset
+//                                           (XRGB8888/NV12/YUYV at M4)
+//   0xFFFFE235  SCANOUT_MULTI_SURFACE       _z_stack_count > 1;
+//                                           composite required
+//   0xFFFFE236  SCANOUT_EMPTY_STACK         _z_stack_count == 0; no
+//                                           surface to scan
+//   0xFFFFE237  SCANOUT_NO_PRIMARY_PLANE    scanout_set_primary_plane
+//                                           has not run yet (init
+//                                           state)
+//   0xFFFFE238..0xFFFFE23F                  reserved for M4 follow-on
+//                                           (overlay planes, cursor
+//                                           plane, plane-specific
+//                                           direct-scan rules)
+//
+// scanout_try_direct returns 1|0 only -- it does NOT propagate the
+// codes above.  They exist because scanout_bind and scanout_set_
+// primary_plane DO surface them to their direct callers (a compositor
+// or witness that binds manually wants the diagnostic distinction),
+// and because the enum keeps the failure vocabulary uniform with
+// every sibling module in this tree.
+//
+// -----------------------------------------------------------------------------
+// FINGERPRINT (per issue #2398 §4)
+// -----------------------------------------------------------------------------
+//
+// Wire form (post-klog_s1_x2 KV append):
+//
+//   scanout direct ok [legacy: SCANOUT DIRECT OK] sid=0x<hex> plane=0x<hex>
+//
+// Byte count verified by hand: "scanout direct ok " (18) + "[legacy: "
+// (9) + "SCANOUT DIRECT OK" (17) + "]" (1) + "\0" (1) = 46 bytes.
+//
+// KV keys:
+//   * surface_k_sid ("sid\0", 4 bytes) reused from kind_surface.pdx
+//     L200 (same reuse pattern as surface_present.pdx, surface_
+//     toplevel.pdx, z_order.pdx).
+//   * scanout_k_plane ("plane\0", 6 bytes) declared here.  Kept
+//     module-local because "plane" is a scanout-scope key that no
+//     other subsystem's fingerprint uses; adding it to kind_display_
+//     plane.pdx would smear direct-scanout vocabulary into the plane-
+//     capability layer.
+//
+// Emitter reachability: `scanout_try_direct` fires on every frame the
+// compositor runs; the fingerprint fires the FIRST time each surface
+// enters the direct path.  Unreachable in the default 14-mode QEMU
+// matrix today because no boot witness drives the R113.M4 compositor
+// end-to-end (the physical HW write for the plane binding lands with
+// the atomic commit path, still open); a tools/verify-fingerprint-
+// coverage.sh allowlist entry mirrors the R113.M2 z_order_raise /
+// R113.M2 focus / R113.M3 kbd_route posture.
+//
+// -----------------------------------------------------------------------------
+// EXTERNAL SYMBOLS
+// -----------------------------------------------------------------------------
+//
+// This module references (bare symbols, kernel .pdx single global
+// namespace):
+//
+//   * dpp_tail_valid            (cap/kind_display_plane.pdx)    -- plane liveness
+//   * dpp_row_format            (cap/kind_display_plane.pdx)    -- plane fmt ordinal
+//   * surface_row_valid         (cap/kind_surface.pdx)          -- surface liveness
+//   * surface_row_format_get    (cap/kind_surface.pdx)          -- surface fmt+flags
+//   * surface_row_current_get   (cap/kind_surface.pdx)          -- current_bo read
+//   * _z_stack_count            (graphics/z_order.pdx)          -- stack depth
+//   * z_order_slot_at           (graphics/z_order.pdx)          -- top-slot fetch
+//   * SUBSYS_CAP_               (klog/subsys.pdx)               -- klog subsys
+//   * surface_k_sid             (cap/kind_surface.pdx)          -- reused KV key
+//   * klog_s1_x2                (klog/wrappers.pdx)             -- 2-KV hex emit
+//
+// -----------------------------------------------------------------------------
+// ENCODER PITFALLS (per feedback_pdx_encoder_pitfalls v0.36+)
+// -----------------------------------------------------------------------------
+//
+//   * No `test rN, rN` -- every zero-check uses `cmp rN, 0` + `je/jne`.
+//   * No 2-op `imul r, imm` -- every scaled address uses `[reg + rN *
+//     8]` (scale 8 in the SIB-legal {1,2,4,8} set) or `shl` for
+//     compile-time-known factors.
+//   * No `and reg, imm64` -- 32-bit mask 0xFFFFFFFF is safe as imm32
+//     per the kind_surface.pdx / tui_canvas precedent (see kind_
+//     surface.pdx L43-44 comment); 8-bit mask 63 is imm8 and safe.
+//     Full-width 0xFFFF...FF sentinels are loaded via `mov r64,
+//     imm64` (movabs) and compared as reg-reg.
+//   * No `cmp reg, [mem]` -- every mem compare loads to a scratch
+//     register first.
+//   * No `mov qword [mem], imm64` -- immediates staged in a register
+//     first (movabs for 0xFFFF...FF; xor r,r for zero).
+//   * Multiline `pub let ="..."` refused -- both string literals in
+//     this file live on one source line.
+//   * Module name matches file basename: `Scanout` for `scanout.pdx`.
+//   * Fingerprint tag byte count asserted in the `[u8; N]` type
+//     ascription (46 for scanout_direct_ok_msg, 6 for scanout_k_plane).
+//
+// -----------------------------------------------------------------------------
+// STACK ALIGNMENT (SysV: pre-CALL rsp%16 == 0 => callee entry rsp%16 == 8)
+// -----------------------------------------------------------------------------
+//
+//   * scanout_init:                leaf, no callee-save, no nested call.
+//   * scanout_set_primary_plane:   1 push (r12) = 8B; entry rsp%16=8
+//                                  -> body rsp%16=0 for the nested
+//                                  dpp_tail_valid call.
+//   * scanout_fourcc_to_dpp_format: leaf, no callee-save, no nested call.
+//   * scanout_bind:                3 pushes (r12/r13/r14) = 24B; entry
+//                                  rsp%16=8 -> body rsp%16=0 for
+//                                  every nested leaf call.
+//   * scanout_try_direct:          3 pushes (r12/r13/r14) = 24B; entry
+//                                  rsp%16=8 -> body rsp%16=0.  For
+//                                  the stack-arg klog_s1_x2 call the
+//                                  `sub rsp, 8; push v2` idiom (16B)
+//                                  keeps rsp%16=0 pre-CALL, byte-
+//                                  identical to surface_format.pdx
+//                                  L526-528.
+//
+// -----------------------------------------------------------------------------
+// LABEL PREFIXES
+// -----------------------------------------------------------------------------
+//
+//   si_    scanout_init
+//   ssp_   scanout_set_primary_plane
+//   sf2o_  scanout_fourcc_to_dpp_format
+//   sb_    scanout_bind
+//   std_   scanout_try_direct
+//
+// All prefixes avoid the paideia-as reserved-keyword set
+// (feedback_paideia_as_reserved_labels: loop, if, let, while, for,
+// match, pub, mod, use, fn, struct, enum, impl, trait, type, where,
+// move, mut, ref).
+
+module Scanout = structure {
+
+  // ==========================================================================
+  // Constants
+  // ==========================================================================
+
+  pub let SCANOUT_OK                : u64 = 0
+
+  pub let SCANOUT_BAD_PLANE         : u64 = 0xFFFFE230
+  pub let SCANOUT_BAD_SURFACE       : u64 = 0xFFFFE231
+  pub let SCANOUT_NO_CURRENT_BO     : u64 = 0xFFFFE232
+  pub let SCANOUT_FORMAT_MISMATCH   : u64 = 0xFFFFE233
+  pub let SCANOUT_FORMAT_UNMAP      : u64 = 0xFFFFE234
+  pub let SCANOUT_MULTI_SURFACE     : u64 = 0xFFFFE235
+  pub let SCANOUT_EMPTY_STACK       : u64 = 0xFFFFE236
+  pub let SCANOUT_NO_PRIMARY_PLANE  : u64 = 0xFFFFE237
+
+  // Sentinel for "no primary plane latched"; matches the FOCUS_NONE
+  // convention (all-ones u64) rather than 0, because plane row 0 is a
+  // valid display-plane row per kind_display_plane.pdx §2 (dpp_tail_
+  // alloc's low-first free scan claims row 0 for the first-ever mint).
+  pub let SCANOUT_SLOT_NONE         : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // scanout_try_direct return codomain (2-value; the direct/fallback
+  // distinction is binary per issue #2398 §2).
+  pub let SCANOUT_DIRECT_ACTIVE     : u64 = 1
+  pub let SCANOUT_DIRECT_FALLBACK   : u64 = 0
+
+  // DRM_FOURCC subset admissible on the direct-scan path.  Verified
+  // byte-for-byte against SurfaceFormat._fourcc_table (see graphics/
+  // surface_format.pdx L159-162); duplicated as local constants
+  // rather than symbol-referenced so scanout_fourcc_to_dpp_format
+  // stays a pure leaf with no memory reads.
+  pub let SCANOUT_FOURCC_XRGB8888   : u64 = 0x34325258
+  pub let SCANOUT_FOURCC_NV12       : u64 = 0x3231564E
+  pub let SCANOUT_FOURCC_YUYV       : u64 = 0x56595559
+
+  // DPP_FORMAT ordinals (mirror kind_display_plane.pdx §Format
+  // ordinals).  Duplicated as local constants for the same pure-leaf
+  // reason above.
+  pub let SCANOUT_DPP_XRGB8888      : u64 = 0
+  pub let SCANOUT_DPP_NV12          : u64 = 1
+  pub let SCANOUT_DPP_YUYV          : u64 = 2
+
+  // ==========================================================================
+  // State
+  // ==========================================================================
+  //
+  //   _scanout_primary_plane   -- one u64 cell holding the row_id of
+  //                               the display plane scanout_try_direct
+  //                               will consider, or SCANOUT_SLOT_NONE
+  //                               when no plane is latched.
+  //   _scanout_bound_sid[16]   -- per-plane last-bound surface slot.
+  //                               DPP_MAX = 16, so one cell per plane
+  //                               row.  Zero-init at boot; scanout_
+  //                               init re-scrubs to SCANOUT_SLOT_NONE
+  //                               so an unbound plane can be
+  //                               distinguished from one bound to slot
+  //                               0.
+  //   _scanout_bound_bo[16]    -- per-plane last-bound current_bo.
+  //                               Zero == "no bo bound".
+  //   _scanout_emitted_bmp[4]  -- 256-bit bitmap keyed on surface slot;
+  //                               tracks first-per-surface fingerprint
+  //                               emit.  Same shape as surface_format.
+  //                               pdx _bind_bitmap.
+  //   _scanout_direct_stats[4]        -- {tries, hits, fallbacks, emits}.
+  //
+  // ==========================================================================
+
+  pub let mut _scanout_primary_plane : u64        = uninit @align(8)
+
+  pub let mut _scanout_bound_sid     : [u64; 16] = uninit @align(64)
+  pub let mut _scanout_bound_bo      : [u64; 16] = uninit @align(64)
+
+  pub let mut _scanout_emitted_bmp   : [u64; 4]  = [0; 4] @align(32)
+
+  pub let mut _scanout_direct_stats         : [u64; 4]  = uninit @align(32)
+
+  pub let SCANOUT_ST_DIRECT_TRIES    : u64 = 0
+  pub let SCANOUT_ST_DIRECT_HITS     : u64 = 1
+  pub let SCANOUT_ST_FALLBACKS       : u64 = 2
+  pub let SCANOUT_ST_EMITS           : u64 = 3
+
+  // ==========================================================================
+  // Fingerprint tag (46 bytes) + plane KV key (6 bytes).  surface_k_
+  // sid ("sid\0") is reused from kind_surface.pdx L200 by bare-symbol
+  // lookup (same pattern surface_present.pdx / surface_toplevel.pdx /
+  // z_order.pdx use).
+  // ==========================================================================
+
+  pub let scanout_direct_ok_msg : [u8; 46] = "scanout direct ok [legacy: SCANOUT DIRECT OK]\0"
+  pub let scanout_k_plane       : [u8; 6]  = "plane\0"
+
+  // ==========================================================================
+  // scanout_init() -> ()
+  //
+  // Latch _scanout_primary_plane to SCANOUT_SLOT_NONE, scrub the
+  // per-plane binding arrays (_scanout_bound_sid to SCANOUT_SLOT_NONE,
+  // _scanout_bound_bo to 0), zero the first-activation bitmap and
+  // the stats.  Called from kernel_main.pdx boot cascade alongside
+  // keymap_init / touch_route_init.  Zero-arg leaf; touches only
+  // rax, rcx, r10, r11.
+  // ==========================================================================
+
+  pub let scanout_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M4-018 (#2398): latch _scanout_primary_plane to SCANOUT_SLOT_NONE, scrub _scanout_bound_sid[16] to SCANOUT_SLOT_NONE, _scanout_bound_bo[16] to 0, _scanout_emitted_bmp[4] to 0, _scanout_direct_stats[4] to 0. Defensive boot-time re-scrub mirroring the kind_surface_init / z_order_init / focus_init / keymap_init discipline (chaos-restart witness re-scrub point).  Latching _scanout_primary_plane to SCANOUT_SLOT_NONE (not zero) is REQUIRED not defensive: .bss zero-init would leave the cell at 0, which aliases display-plane row 0 (a valid live row per kind_display_plane.pdx §2) as 'the primary plane', so the first scanout_try_direct without a preceding scanout_set_primary_plane would mis-latch onto row 0.  Same discipline focus_init uses for _kbd_focus_slot / _ptr_focus_slot / _implicit_grab_slot (see focus.pdx §'Why FOCUS_NONE = 0xFF..FF').  Four straight-line loops using [reg + rcx * 8] register-scaled SIB (scale 8 in the legal {1,2,4,8} set); zero staged via xor rax,rax, sentinel via movabs into r11.  Zero-arg leaf; entry rsp%16=8 unchanged on return.  Labels prefixed si_.",
+      block: {
+        // Latch _scanout_primary_plane = SCANOUT_SLOT_NONE.
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        lea r10, [rip + _scanout_primary_plane];
+        mov [r10 + 0], r11;
+
+        // Scrub _scanout_bound_sid[16] to SCANOUT_SLOT_NONE (r11 still
+        // holds the sentinel from the store above).
+        lea r10, [rip + _scanout_bound_sid];
+        xor rcx, rcx;
+      si_sid:
+        mov [r10 + rcx * 8], r11;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  si_sid;
+
+        // Scrub _scanout_bound_bo[16] to 0.
+        xor rax, rax;
+        lea r10, [rip + _scanout_bound_bo];
+        xor rcx, rcx;
+      si_bo:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  si_bo;
+
+        // Scrub _scanout_emitted_bmp[4] to 0.
+        lea r10, [rip + _scanout_emitted_bmp];
+        xor rcx, rcx;
+      si_bmp:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  si_bmp;
+
+        // Scrub _scanout_direct_stats[4] to 0.
+        lea r10, [rip + _scanout_direct_stats];
+        xor rcx, rcx;
+      si_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  si_stats;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // scanout_set_primary_plane(row_id) -> u64
+  //
+  // Validate row_id via dpp_tail_valid; on success latch
+  // _scanout_primary_plane = row_id and return SCANOUT_OK.  On
+  // invalid row_id return SCANOUT_BAD_PLANE (0xFFFFE230).
+  //
+  // Called once at compositor start (after the primary plane mint via
+  // display_plane_cap_mint), and again on any modeset that re-mints
+  // the plane at a different row.  Idempotent for the same row_id.
+  //
+  // Register plan: 1 callee-save push (r12 = row_id) aligns rsp%16=0
+  // (entry 8 + 8 = 16) for the nested dpp_tail_valid call.  Labels
+  // prefixed ssp_.
+  // ==========================================================================
+
+  pub let scanout_set_primary_plane : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M4-018 (#2398): validate + latch primary plane row.  dpp_tail_valid gate rejects out-of-range or unclaimed rows via SCANOUT_BAD_PLANE.  Idempotent: relatching the same row_id is a no-op success.  One callee-save push (r12 = row_id) aligns rsp%16=0 (entry 8 + 8 = 16) for the nested dpp_tail_valid call.  Labels prefixed ssp_.",
+      block: {
+        push r12;
+        mov r12, rdi;
+
+        mov rdi, r12;
+        call dpp_tail_valid;
+        cmp rax, 0;
+        je  ssp_bad;
+
+        lea r10, [rip + _scanout_primary_plane];
+        mov [r10 + 0], r12;
+
+        xor rax, rax;
+        jmp ssp_out;
+
+      ssp_bad:
+        mov rax, 0xFFFFE230;                 // SCANOUT_BAD_PLANE
+
+      ssp_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // scanout_fourcc_to_dpp_format(fourcc) -> u64
+  //
+  // Map a DRM_FOURCC to the DPP_FORMAT_* ordinal that kind_display_
+  // plane.pdx uses.  Returns SCANOUT_FORMAT_UNMAP (0xFFFFE234) on any
+  // fourcc outside the direct-scanout admissible subset.
+  //
+  // Admissible subset (M4-018 opening set):
+  //   0x34325258 XRGB8888 -> 0 (SCANOUT_DPP_XRGB8888)
+  //   0x3231564E NV12     -> 1 (SCANOUT_DPP_NV12)
+  //   0x56595559 YUYV     -> 2 (SCANOUT_DPP_YUYV)
+  //
+  // ARGB / RGBA / P010 / RGB565 / XBGR / ABGR are recognised by
+  // buffer_format_compat (graphics/surface_format.pdx) as legal
+  // surface formats but land as fallback-only here until the plane
+  // driver's per-class admission set widens (kind_display_plane.pdx
+  // §1e note: primary admits 0/3, overlay admits 1/2/4, cursor
+  // admits 3 only).
+  //
+  // Pure leaf: entry rsp%16==8 preserved to ret.  Labels prefixed sf2o_.
+  // ==========================================================================
+
+  pub let scanout_fourcc_to_dpp_format : (u64) -> u64 !{} @{} =
+    fn (fourcc: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R113.M4-018 (#2398): DRM_FOURCC -> DPP_FORMAT ordinal map for the direct-scan admissible subset {XRGB8888, NV12, YUYV}.  Returns SCANOUT_FORMAT_UNMAP (0xFFFFE234) on any fourcc outside the subset.  Straight-line linear scan with three equality checks; compared literals are all 32-bit fourcc packs (movabs unneeded).  Pure leaf, no callee-save, no nested call.  Labels prefixed sf2o_.",
+      block: {
+        mov rax, 0x34325258;                 // XRGB8888
+        cmp rdi, rax;
+        je  sf2o_xrgb;
+        mov rax, 0x3231564E;                 // NV12
+        cmp rdi, rax;
+        je  sf2o_nv12;
+        mov rax, 0x56595559;                 // YUYV
+        cmp rdi, rax;
+        je  sf2o_yuyv;
+        mov rax, 0xFFFFE234;                 // SCANOUT_FORMAT_UNMAP
+        ret;
+
+      sf2o_xrgb:
+        xor rax, rax;                        // SCANOUT_DPP_XRGB8888 = 0
+        ret;
+      sf2o_nv12:
+        mov rax, 1;                          // SCANOUT_DPP_NV12
+        ret;
+      sf2o_yuyv:
+        mov rax, 2;                          // SCANOUT_DPP_YUYV
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // scanout_bind(plane_id, surface_slot) -> u64
+  //
+  // Validate plane_id + surface_slot + current_bo, then latch the
+  // (plane_id -> surface_slot) and (plane_id -> current_bo) tracking
+  // cells.
+  //
+  // Gate order:
+  //   (1) dpp_tail_valid(plane_id)          -> else SCANOUT_BAD_PLANE
+  //   (2) surface_row_valid(surface_slot)   -> else SCANOUT_BAD_SURFACE
+  //   (3) surface_row_current_get != 0      -> else SCANOUT_NO_CURRENT_BO
+  //   (4) _scanout_bound_sid[plane_id] = surface_slot
+  //       _scanout_bound_bo[plane_id]  = current_bo
+  //   (5) return SCANOUT_OK
+  //
+  // The physical HW plane program (Iris Xe DSPCNTR / DSPSURF etc.)
+  // is NOT performed here; the compositor's driver-facing arm reads
+  // the two cells at scanout time and issues the register write.
+  // Keeping the substrate side pure-latch preserves the "no driver
+  // dispatch in the graphics core" discipline the sibling files hold
+  // to (surface_row_swap, dpp_tail_alloc, etc.).
+  //
+  // Register plan: 3 callee-save pushes (r12=plane, r13=slot, r14=bo)
+  // = 24B; entry rsp%16=8 -> body rsp%16=0 for every nested leaf
+  // call.  Labels prefixed sb_.
+  // ==========================================================================
+
+  pub let scanout_bind : (u64, u64) -> u64 !{mem} @{} =
+    fn (plane_id: u64) (surface_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M4-018 (#2398): validate + latch (plane_id -> surface_slot) + (plane_id -> current_bo).  Gate order per file header: (1) dpp_tail_valid else SCANOUT_BAD_PLANE; (2) surface_row_valid else SCANOUT_BAD_SURFACE; (3) surface_row_current_get != 0 else SCANOUT_NO_CURRENT_BO; (4) latch into _scanout_bound_sid[plane_id] and _scanout_bound_bo[plane_id] via [reg + r12 * 8] register-scaled SIB (scale 8 legal); (5) SCANOUT_OK.  Three callee-save pushes (r12=plane_id, r13=surface_slot, r14=bo) = 24B; entry rsp%16=8 -> body rsp%16=0 for every nested leaf call (dpp_tail_valid, surface_row_valid, surface_row_current_get all preserve rbx/r12-r15/rbp per SysV).  Labels prefixed sb_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        mov r12, rdi;                        // plane_id
+        mov r13, rsi;                        // surface_slot
+
+        // Gate 1: plane row live?
+        mov rdi, r12;
+        call dpp_tail_valid;
+        cmp rax, 0;
+        je  sb_bad_plane;
+
+        // Gate 2: surface slot live?
+        mov rdi, r13;
+        call surface_row_valid;
+        cmp rax, 0;
+        je  sb_bad_surface;
+
+        // Gate 3: surface has a committed frame?
+        mov rdi, r13;
+        call surface_row_current_get;
+        cmp rax, 0;
+        je  sb_no_bo;
+        mov r14, rax;                        // r14 = current_bo
+
+        // Gate 4: latch (plane_id -> surface_slot) + (plane_id -> bo).
+        lea r10, [rip + _scanout_bound_sid];
+        mov [r10 + r12 * 8], r13;
+        lea r10, [rip + _scanout_bound_bo];
+        mov [r10 + r12 * 8], r14;
+
+        // Gate 5: return SCANOUT_OK.
+        xor rax, rax;
+        jmp sb_out;
+
+      sb_bad_plane:
+        mov rax, 0xFFFFE230;                 // SCANOUT_BAD_PLANE
+        jmp sb_out;
+      sb_bad_surface:
+        mov rax, 0xFFFFE231;                 // SCANOUT_BAD_SURFACE
+        jmp sb_out;
+      sb_no_bo:
+        mov rax, 0xFFFFE232;                 // SCANOUT_NO_CURRENT_BO
+
+      sb_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // scanout_try_direct() -> u64
+  //
+  // Called every frame by the compositor's frame loop.  Returns
+  // SCANOUT_DIRECT_ACTIVE (1) when the seven gates in the file
+  // header all pass; else SCANOUT_DIRECT_FALLBACK (0).  On the first
+  // successful admission for each surface, emits SCANOUT DIRECT OK
+  // sid=<slot> plane=<row> via klog_s1_x2 and sets the corresponding
+  // bit in _scanout_emitted_bmp.
+  //
+  // Stats bookkeeping (unconditional):
+  //   SCANOUT_ST_DIRECT_TRIES ++     on every entry
+  //   SCANOUT_ST_DIRECT_HITS  ++     on success (fingerprint or not)
+  //   SCANOUT_ST_FALLBACKS    ++     on any gate failure
+  //   SCANOUT_ST_EMITS        ++     on the fingerprint emit path only
+  //
+  // The tries counter minus hits+fallbacks is always zero -- the
+  // three counters partition every entry.  emits <= hits.
+  //
+  // klog_s1_x2 signature (klog/wrappers.pdx L72):
+  //   rdi=level, rsi=subsys_ptr, rdx=tag_ptr,
+  //   rcx=k1, r8=v1, r9=k2, [rsp+8]=v2
+  //
+  // Emission at LEVEL_INFO=3 with SUBSYS_CAP_, tag_ptr=scanout_
+  // direct_ok_msg, k1=surface_k_sid, v1=slot, k2=scanout_k_plane,
+  // v2=plane_row.  Wire form:
+  //   "info cap scanout direct ok [legacy: SCANOUT DIRECT OK] sid=0x<n> plane=0x<n>"
+  //
+  // Register plan: 3 callee-save pushes (r12=plane_row, r13=sid,
+  // r14=surface_fmt_ordinal) = 24B; entry rsp%16=8 -> body rsp%16=0
+  // for every nested call and for the klog_s1_x2 stack-arg emit.
+  // klog_s1_x2 v2 push idiom (sub 8; push r12; call; add 16) mirrors
+  // surface_format.pdx L526-528 byte-for-byte.  klog_s1_x2 preserves
+  // rbx/r12-r15/rbp per SysV.  Labels prefixed std_.
+  // ==========================================================================
+
+  pub let scanout_try_direct : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R113.M4-018 (#2398): frame-hot direct-scanout gate.  Gate order per file header (§GATE ORDER): (1) primary plane latched; (2) plane row live; (3) z-order stack has exactly 1 entry; (4) top slot live; (5) surface fourcc maps to a DPP ordinal; (6) plane native format matches; (7) scanout_bind succeeds.  On success bump SCANOUT_ST_DIRECT_HITS; if first-per-surface (bit unset in _scanout_emitted_bmp), set bit + emit SCANOUT DIRECT OK via klog_s1_x2 (sid, plane KVs) + bump SCANOUT_ST_EMITS.  On any gate failure bump SCANOUT_ST_FALLBACKS.  Every entry bumps SCANOUT_ST_DIRECT_TRIES.  Three callee-save pushes (r12=plane_row, r13=sid, r14=surface_fmt_ordinal) = 24B; entry rsp%16=8 -> body rsp%16=0 for every nested call.  klog_s1_x2 v2 push idiom (sub 8; push r12; call; add 16) mirrors surface_format.pdx L526-528 byte-for-byte.  All nested callees (dpp_tail_valid, z_order_slot_at, surface_row_valid, surface_row_format_get, dpp_row_format, scanout_fourcc_to_dpp_format, scanout_bind, klog_s1_x2) preserve rbx/r12-r15/rbp per SysV.  `shl r64, cl` for the bitmap mask is proven at pdxfs_lite/alloc.pdx L233 / surface_format.pdx L507.  Bitmap addressing: word = sid / 64 (shr 6, imm8 safe), bit = sid & 63 (imm8 safe).  Labels prefixed std_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+
+        // Bump SCANOUT_ST_DIRECT_TRIES unconditionally.
+        lea r10, [rip + _scanout_direct_stats];
+        mov rax, [r10 + 0];
+        add rax, 1;
+        mov [r10 + 0], rax;
+
+        // Gate 1: primary plane latched?
+        lea r10, [rip + _scanout_primary_plane];
+        mov r12, [r10 + 0];
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp r12, r11;
+        je  std_fallback;
+
+        // Gate 2: plane row still live?
+        mov rdi, r12;
+        call dpp_tail_valid;
+        cmp rax, 0;
+        je  std_fallback;
+
+        // Gate 3: z-order stack has exactly 1 entry?  Multi-surface
+        // stacks require compositing; empty stacks have nothing to
+        // scan.  Both cases fall back silently.
+        lea r10, [rip + _z_stack_count];
+        mov rax, [r10 + 0];
+        cmp rax, 1;
+        jne std_fallback;
+
+        // Gate 4: fetch top slot (index 0, sole entry).  z_order_
+        // slot_at returns 0 on OOB, but with count == 1 index 0 is
+        // in-range.  Still gate on surface_row_valid to reject a
+        // destroy racing the frame loop.
+        xor rdi, rdi;
+        call z_order_slot_at;
+        mov r13, rax;                        // r13 = sid
+
+        mov rdi, r13;
+        call surface_row_valid;
+        cmp rax, 0;
+        je  std_fallback;
+
+        // Gate 5: surface fourcc -> DPP ordinal.
+        mov rdi, r13;
+        call surface_row_format_get;
+        // Low 32 = fourcc, high 32 = flags; mask to fourcc before
+        // the map (the map compares against 32-bit fourcc packs).
+        mov rdi, rax;
+        and rdi, 0xFFFFFFFF;
+        call scanout_fourcc_to_dpp_format;
+        mov r10, 0xFFFFE234;                 // SCANOUT_FORMAT_UNMAP
+        cmp rax, r10;
+        je  std_fallback;
+        mov r14, rax;                        // r14 = surface fmt ordinal
+
+        // Gate 6: plane native format == surface ordinal?
+        mov rdi, r12;
+        call dpp_row_format;
+        // dpp_row_format returns 0xFF..FF on invalid row; we already
+        // gated on dpp_tail_valid above, so a sentinel here indicates
+        // a race and we fall back.
+        mov r10, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r10;
+        je  std_fallback;
+        cmp rax, r14;
+        jne std_fallback;
+
+        // Gate 7: bind (validates surface has current_bo).
+        mov rdi, r12;
+        mov rsi, r13;
+        call scanout_bind;
+        cmp rax, 0;
+        jne std_fallback;
+
+        // ---- Success path -----------------------------------------
+        // Check per-surface first-activation bitmap.  Bit already set
+        // -> silent success (idempotent).  Bit unset -> set + emit +
+        // bump SCANOUT_ST_EMITS.
+        mov r10, r13;
+        shr r10, 6;                          // word idx = sid / 64
+        mov r11, r13;
+        and r11, 63;                         // bit idx = sid & 63  (imm8 safe)
+
+        lea r8, [rip + _scanout_emitted_bmp];
+        mov rax, [r8 + r10 * 8];
+
+        mov rcx, r11;                        // cl = bit
+        mov r9, 1;
+        shl r9, cl;                          // r9 = 1 << bit
+
+        mov rdx, rax;
+        and rdx, r9;
+        cmp rdx, 0;
+        jne std_hit_no_emit;                 // already emitted for this sid
+
+        // Set bit and write back.
+        or  rax, r9;
+        mov [r8 + r10 * 8], rax;
+
+        // Emit SCANOUT DIRECT OK sid=<r13> plane=<r12> via klog_s1_x2.
+        //   Body rsp%16 == 0 -> sub 8 (pad) + push r12 (v2) = 16 B
+        //   keeps pre-CALL rsp%16 == 0.
+        sub rsp, 8;                          // alignment pad
+        push r12;                            // v2 = plane_row
+
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + scanout_direct_ok_msg];
+        lea rcx, [rip + surface_k_sid];
+        mov r8,  r13;                        // v1 = sid
+        lea r9,  [rip + scanout_k_plane];
+        call klog_s1_x2;
+
+        add rsp, 16;                         // reclaim push + pad
+
+        // Bump SCANOUT_ST_EMITS.
+        lea r10, [rip + _scanout_direct_stats];
+        mov rax, [r10 + 24];                 // SCANOUT_ST_EMITS = 3
+        add rax, 1;
+        mov [r10 + 24], rax;
+
+      std_hit_no_emit:
+        // Bump SCANOUT_ST_DIRECT_HITS.
+        lea r10, [rip + _scanout_direct_stats];
+        mov rax, [r10 + 8];                  // SCANOUT_ST_DIRECT_HITS = 1
+        add rax, 1;
+        mov [r10 + 8], rax;
+
+        mov rax, 1;                          // SCANOUT_DIRECT_ACTIVE
+        jmp std_out;
+
+      std_fallback:
+        // Bump SCANOUT_ST_FALLBACKS.
+        lea r10, [rip + _scanout_direct_stats];
+        mov rax, [r10 + 16];                 // SCANOUT_ST_FALLBACKS = 2
+        add rax, 1;
+        mov [r10 + 16], rax;
+        xor rax, rax;                        // SCANOUT_DIRECT_FALLBACK
+
+      std_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}

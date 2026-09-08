@@ -1,0 +1,860 @@
+// src/kernel/core/graphics/dma_buf.pdx -- R113.M4-017 (paideia-os #2397)
+//
+// GBM-equivalent DMA-BUF import from KIND_GPU_BO.  Sibling of the R113
+// rendering path; consumes the KIND_GPU_BO substrate (R37.M3-001, #1262,
+// src/kernel/core/cap/kind_gpu_bo.pdx) and exposes a small-integer "fd-
+// like" descriptor space that downstream code (compositor scanout, EGL/
+// Vulkan-analog bridges, cross-process share) can pass around without
+// re-plumbing KIND_GPU_BO cap slots through every layer.
+//
+// -----------------------------------------------------------------------------
+// WHY THIS LANDS AT M4 (not M1)
+// -----------------------------------------------------------------------------
+//
+// The R113.M1 substrate freeze doc (design/graphics/r113-m1-substrate.md
+// §11) explicitly defers "DMA-BUF import" to R113.M4 (rendering path).
+// The KIND_SURFACE row carries pending_bo / current_bo as u32 KIND_GPU_BO
+// row-ids: the compositor references BOs by cap-slot, not by DMA-BUF fd,
+// so M1 needed no DMA-BUF vocabulary.  M4 changes that -- the rendering
+// path exports frames to scanout planes, cross-context share to a GPU
+// worker, and (eventually) hands them to a user-space wl_drm-analog
+// bridge.  Each of those consumers wants a stable share-token that
+// survives BO cap-slot revocation as long as at least one holder still
+// references the descriptor.  DMA-BUF descriptors are that token.
+//
+// The Linux/Mesa GBM (Generic Buffer Manager) primitive analogues here:
+//
+//   gbm_bo_create()              -> KIND_GPU_BO mint (R37.M3-001)
+//   gbm_bo_get_fd()              -> dma_buf_import (THIS FILE)
+//   gbm_bo_get_stride()          -> dma_buf_export_size / _format /
+//                                     _modifier (THIS FILE)
+//   drmPrimeHandleToFD           -> dma_buf_import (THIS FILE)
+//   drmPrimeFDToHandle           -> deferred; the reverse-map (dma_buf_id
+//                                     -> newly-minted KIND_GPU_BO in a
+//                                     different task) lands with the
+//                                     R113.M5 cross-process share path
+//   close(dma_buf_fd)            -> dma_buf_release (THIS FILE)
+//
+// The descriptor pool is kernel-internal at M4.  A cap kind wrapper
+// (KIND_DMA_BUF derived over KIND_GPU_BO) that lets a user-space holder
+// pass a dma_buf_id across a cap_invoke is a separate landing on the M5
+// share path -- the pool here is the substrate that landing will
+// consume, exactly as KIND_GPU_BO's _gpu_bo_table is the substrate
+// underneath its cap-kind wrapper.
+//
+// -----------------------------------------------------------------------------
+// RECORD LAYOUT -- 32 BYTES / 4 u64 WORDS
+// -----------------------------------------------------------------------------
+//
+//   [+ 0] hdr:      in_use[63:56]  | refcount[55:32] | dma_buf_id[31:0]
+//   [+ 8] bo_slot:  bo_slot (u64; only low 32 bits meaningful today)
+//   [+16] pa:       physical-address surrogate (u64)
+//                     -- populated from kgb_row_memory (the KIND_MEMORY
+//                        slot backing this BO).  A real MMU-derived PA
+//                        (page-table walk from memory_slot's base +
+//                        offset) lands with R113.M5's user-space
+//                        wl_drm-analog bridge, which is the first path
+//                        that needs a real bus address (scanout / IOMMU
+//                        map).  Until then the memory-slot suffices as
+//                        an opaque handle: it uniquely names the byte
+//                        range, and every kernel-side consumer today
+//                        already resolves memory_slot -> pa through the
+//                        same KIND_MEMORY accessor.
+//   [+24] body:     size[31:0] | format[47:32] | modifier[63:48]
+//                     size:     KIND_GPU_BO size_bytes (u32-clamped, from
+//                                 kgb_row_size)
+//                     format:   16-bit format-hint low-word (from
+//                                 kgb_row_format; DRM fourcc mapping is
+//                                 the plane kind's problem, not the BO's)
+//                     modifier: 16-bit modifier low-word (from
+//                                 kgb_row_tiling; the closed 5-enum
+//                                 tiling ordinal is the M4 modifier
+//                                 vocabulary -- DRM_FORMAT_MOD_* 64-bit
+//                                 space arrives with M5 when the wl_drm
+//                                 bridge needs the full width)
+//
+// Alignment: 8-byte within a record; pool is 64-byte aligned so each
+// record spans HALF a cache line (two records per cache line).  Same
+// posture as KIND_GPU_BO's _gpu_bo_table (kind_gpu_bo.pdx L149).
+//
+// -----------------------------------------------------------------------------
+// POOL SIZING -- 32 SLOTS
+// -----------------------------------------------------------------------------
+//
+// Task briefing pins 32.  Working-set justification: the R113.M1
+// substrate targets ~16 live surfaces (SURFACE_ROW_MAX, doc §6); each
+// surface at scanout may hold TWO in-flight BOs (front + back for double-
+// buffering).  32 = 16*2 covers the M1/M4 target working set exactly.
+// R113.M5's window-manager bump will scale surfaces to ~48; the DMA-BUF
+// pool will bump in lockstep (single-constant edit) once the M5 boot
+// witness proves the descriptor churn is bounded.
+//
+// Pool memory: 32 * 32 = 1024 bytes = one aligned page, matching the
+// KIND_GPU_BO substrate posture.
+//
+// -----------------------------------------------------------------------------
+// REFCOUNT SEMANTICS
+// -----------------------------------------------------------------------------
+//
+// dma_buf_import(bo_slot) mints a NEW descriptor with refcount = 1.  A
+// caller wanting to share a descriptor across N holders would call
+// dma_buf_import ONCE and hand the returned id to the (N-1) other
+// holders through some external ownership discipline; each of those
+// holders calls dma_buf_release when done.  A future dma_buf_dup()
+// (bump refcount, return same id) is a natural M5 addition; not needed
+// at M4 because the M4 consumers are all kernel-side and hold their own
+// per-descriptor references synchronously through the frame lifecycle
+// (import at BO commit, release at scanout complete).
+//
+// The refcount lives in bits [55:32] of the record header (24 bits =
+// max 16 M references, well above any realistic sharing depth).
+// dma_buf_release decrements the refcount; on the transition to zero,
+// the in_use marker byte is cleared and the record is available for
+// re-mint.  A caller-facing "you released a descriptor that already had
+// refcount=0" case returns DMABUF_REFCOUNT_ZERO -- a use-after-free
+// signal that should never fire in a correct compositor, and if it does
+// fire the kernel refuses to double-free and preserves the record slot.
+//
+// -----------------------------------------------------------------------------
+// FAILURE TAXONOMY -- 0xFFFFE220..0xFFFFE22F (fresh band, sweep-verified)
+// -----------------------------------------------------------------------------
+//
+// Freshness sweep (2026-09-08, this landing):
+//
+//   $ grep -rn '0xFFFFE22' src
+//   (empty)
+//
+// No live code in the entire 0xFFFFE220..0xFFFFE22F band.  Claimed.
+//
+// Neighbouring bands (targeted `grep -rho '0xFFFFE2[0-9A-Fa-f][0-9A-Fa-f]'`):
+//   0xFFFFE1F0..E1FF   (checked -- free per surface_present.pdx L86-88)
+//   0xFFFFE200..E20F   (checked -- free)
+//   0xFFFFE210..E21F   (checked -- free)
+//   0xFFFFE220..E22F   R113.M4-017 DMA-BUF import (THIS FILE)
+//   0xFFFFE230..E23F   (free, reserved for M4 follow-on)
+//
+// Slot map:
+//
+//   0xFFFFE220  DMABUF_BAD_BO           bo_slot invalid or wrong kind
+//                                          (kgb_tail_valid returned 0)
+//   0xFFFFE221  DMABUF_ENOSPC           _dma_bufs pool full at import
+//   0xFFFFE222  DMABUF_BAD_ID           dma_buf_id out of range or
+//                                          record not in_use
+//   0xFFFFE223  DMABUF_REFCOUNT_ZERO    release called on already-zero
+//                                          refcount (use-after-free signal;
+//                                          kernel refuses to double-free)
+//   0xFFFFE224..0xFFFFE22F              reserved for M4 follow-on
+//                                          (per-plane import ack, cross-
+//                                          process share, dma_buf_dup, ...)
+//
+// -----------------------------------------------------------------------------
+// EXPORT RETURN CHANNEL
+// -----------------------------------------------------------------------------
+//
+// dma_buf_export_pa / _size / _format / _modifier all return the queried
+// field on success, or DMABUF_BAD_ID (0xFFFFE222) on invalid id.  This
+// works because the sentinel value 0xFFFFE222 does not overlap any legal
+// field value at M4:
+//
+//   * pa       -- populated from kgb_row_memory which returns a u16 slot
+//                 index in the KIND_MEMORY cap-table (0..255); 0xFFFFE222
+//                 is a u32-domain value never in the memory-slot range.
+//                 When the real PA landing arrives at M5, physical
+//                 addresses on x86_64 fit in 52 bits and 0xFFFFE222 is
+//                 not a page-aligned address (top nibble != 0) so a
+//                 valid PA never matches the sentinel; the return
+//                 channel stays unambiguous.
+//   * size     -- u32 domain; 0xFFFFE222 is a possible u32 value in
+//                 principle but no realistic BO size hits it exactly
+//                 (byte-count 4294697506 is a nonsense allocation).
+//                 Callers requiring strict discrimination should call
+//                 dma_buf_valid(id) first.
+//   * format   -- 16-bit domain (kgb_row_format returns u16);
+//                 0xFFFFE222 exceeds u16 max so no collision.
+//   * modifier -- 8-bit domain (kgb_row_tiling returns 0..4);
+//                 0xFFFFE222 wildly exceeds; no collision.
+//
+// -----------------------------------------------------------------------------
+// FINGERPRINT
+// -----------------------------------------------------------------------------
+//
+//   "dmabuf import ok [legacy: DMABUF IMPORT OK]\0"
+//   klog_s1_x3(LEVEL_INFO, SUBSYS_CAP_, tag,
+//              dmabuf_k_id, id, dmabuf_k_bo, /* stack: */ bo_slot,
+//              dmabuf_k_size, size)
+//
+// One emit per successful import.  Release does NOT emit -- release is
+// a per-frame high-volume path (up to one per scanout at 240 Hz) and a
+// per-release klog would flood the ring buffer; the correctness signal
+// is the return code (DMABUF_OK vs DMABUF_REFCOUNT_ZERO) plus the
+// _dma_buf_stats.releases counter.  Same discipline as damage_region's
+// no-emit-per-add posture (damage_region.pdx §FINGERPRINT).
+//
+// Allowlist entry lands in tools/verify-fingerprint-coverage.sh with
+// reason "R113.M4-017 (#2397) kernel-side DMA-BUF descriptor import;
+// emitter reachable in default matrix once R113.M4 rendering path
+// wires an end-to-end scanout witness (mint BO -> import DMA-BUF ->
+// release)".
+//
+// -----------------------------------------------------------------------------
+// SUBSYSTEM CHOICE (SUBSYS_CAP_ vs a new SUBSYS_GFX_)
+// -----------------------------------------------------------------------------
+//
+// The klog subsystem tag names the SUBSYSTEM the message belongs to, not
+// the module.  DMA-BUF is a capability-space concern (descriptor
+// lifecycle, refcount discipline, share-token vocabulary) rather than a
+// pure graphics-substrate concern (pixel layout, damage compression,
+// commit protocol).  Same posture as KIND_GPU_BO's cap_handler_gpu_bo
+// which emits under SUBSYS_CAP_ (kind_gpu_bo.pdx L1119).  A future
+// SUBSYS_GFX_ (graphics-substrate messages: damage, present, scanout)
+// is a natural follow-on but out of scope for M4-017.
+//
+// -----------------------------------------------------------------------------
+// ENCODER PITFALLS (per feedback_pdx_encoder_pitfalls v0.36+)
+// -----------------------------------------------------------------------------
+//
+//   * No `test rN, rN` -- every zero-check uses `cmp rN, 0` + `je/jne`.
+//   * No 2-op `imul r, imm` -- record-index math is via `shl rN, 5`
+//     (record_id * 32).
+//   * No `and reg, imm64` -- field masks use `and reg, 0xFFFF` /
+//     `and reg, 0xFFFFFFFF` which encode as imm32 with sign bit clear
+//     (safe per surface_commit_ops.pdx L269 precedent).
+//   * No `cmp reg, [mem]` -- every mem-compare loads to a scratch first.
+//   * No literal-scaled `[reg + N*8]` -- displacement form used.
+//   * klog_s1_x3 stack-arg idiom follows wrappers.pdx L112-115: caller
+//     places (v2, k3, v3) at [rsp+0], [rsp+8], [rsp+16] via
+//     `sub rsp, 32; mov [rsp+K], value; call; add rsp, 32`.  32-byte
+//     reservation preserves rsp%16=0 alignment across the call without
+//     an extra alignment sub, and gives the wrapper the 24 bytes it
+//     reads plus 8 bytes of tail-pad.
+//
+// -----------------------------------------------------------------------------
+// LABEL PREFIXES
+// -----------------------------------------------------------------------------
+//
+//   dbi_    dma_buf_init          (boot / defensive re-scrub)
+//   dbv_    dma_buf_valid         (internal validator)
+//   dbm_    dma_buf_import        ("m" for mint; "i" collides with init)
+//   dbp_    dma_buf_export_pa
+//   dbs_    dma_buf_export_size
+//   dbf_    dma_buf_export_format
+//   dbo_    dma_buf_export_modifier ("o" for mOdifier; "m" taken by mint)
+//   dbr_    dma_buf_release
+//
+// All prefixes avoid the paideia-as reserved-keyword set per
+// feedback_paideia_as_reserved_labels.
+//
+// -----------------------------------------------------------------------------
+// EXTERNAL SYMBOLS (bare per kernel .pdx global-namespace linking)
+// -----------------------------------------------------------------------------
+//
+//   * kgb_tail_valid   (kind_gpu_bo.pdx L488)
+//   * kgb_row_memory   (kind_gpu_bo.pdx L560)
+//   * kgb_row_size     (kind_gpu_bo.pdx L585)
+//   * kgb_row_format   (kind_gpu_bo.pdx L662)
+//   * kgb_row_tiling   (kind_gpu_bo.pdx L611)
+//   * klog_s1_x3       (klog/wrappers.pdx L116)
+//   * SUBSYS_CAP_      (klog/subsys.pdx L68)
+
+module DmaBuf = structure {
+
+  // ==========================================================================
+  // Pool sizing.
+  // ==========================================================================
+
+  pub let DMABUF_MAX          : u64 = 32
+  pub let DMABUF_REC_BYTES    : u64 = 32
+  pub let DMABUF_REC_WORDS    : u64 = 4
+  pub let DMABUF_TABLE_WORDS  : u64 = 128        // 32 records * 4 u64
+
+  // ==========================================================================
+  // Failure taxonomy -- 0xFFFFE220..0xFFFFE22F.  Fresh band; see file
+  // header FAILURE TAXONOMY for the neighbourhood map and sweep.
+  // ==========================================================================
+
+  pub let DMABUF_OK              : u64 = 0
+  pub let DMABUF_BAD_BO          : u64 = 0xFFFFE220
+  pub let DMABUF_ENOSPC          : u64 = 0xFFFFE221
+  pub let DMABUF_BAD_ID          : u64 = 0xFFFFE222
+  pub let DMABUF_REFCOUNT_ZERO   : u64 = 0xFFFFE223
+
+  // ==========================================================================
+  // Storage.  Pool + stats blocks are 64-byte aligned so each 32-byte
+  // record spans half a cache line (two records per line), matching the
+  // KIND_GPU_BO substrate posture (kind_gpu_bo.pdx L149).  .bss default
+  // is zero at real boot; dma_buf_init defensively re-scrubs at boot
+  // time so a future chaos-restart witness has a clean re-scrub point,
+  // matching damage_region_init discipline (damage_region.pdx L192).
+  // ==========================================================================
+
+  pub let mut _dma_bufs       : [u64; 128] = uninit @align(64)
+  pub let mut _dma_buf_stats  : [u64; 4]   = uninit @align(64)
+
+  pub let DMABUF_ST_IMPORTS   : u64 = 0
+  pub let DMABUF_ST_RELEASES  : u64 = 1
+  pub let DMABUF_ST_ENOSPC    : u64 = 2
+  pub let DMABUF_ST_BAD_BO    : u64 = 3
+
+  // ==========================================================================
+  // Fingerprint payload -- one tag + three KV keys.
+  //
+  // Byte counts include NUL terminator:
+  //   "dmabuf import ok [legacy: DMABUF IMPORT OK]\0"  = 44
+  //   "id\0"                                             =  3
+  //   "bo\0"                                             =  3
+  //   "size\0"                                           =  5
+  // ==========================================================================
+
+  pub let dmabuf_import_ok_msg : [u8; 44] = "dmabuf import ok [legacy: DMABUF IMPORT OK]\0"
+  pub let dmabuf_k_id          : [u8; 3]  = "id\0"
+  pub let dmabuf_k_bo          : [u8; 3]  = "bo\0"
+  pub let dmabuf_k_size        : [u8; 5]  = "size\0"
+
+  // ==========================================================================
+  // dma_buf_init() -- zero the pool + stats blocks at boot.
+  //
+  // Called from kernel_main's graphics-substrate init phase alongside
+  // damage_region_init / kind_surface_init.  Two straight-line loops,
+  // no nested calls.  Wiring to kernel_main is a companion landing
+  // (this file only lands the substrate; the boot wire is picked up
+  // when the R113.M4 rendering-path wave lands).
+  // ==========================================================================
+
+  pub let dma_buf_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M4-017 (#2397): zero _dma_bufs (128 u64 = 1 KiB) and _dma_buf_stats (4 u64 = 32 B). Defensive boot-time re-scrub mirroring damage_region_init (damage_region.pdx L192). Two straight-line loops using [reg + rcx * 8] SIB. Labels prefixed dbi_.",
+      block: {
+        lea r10, [rip + _dma_bufs];
+        xor rax, rax;
+        xor rcx, rcx;
+      dbi_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 128;
+        jb  dbi_rows;
+
+        lea r10, [rip + _dma_buf_stats];
+        xor rcx, rcx;
+      dbi_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  dbi_stats;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dma_buf_valid(dma_buf_id) -> u64
+  //
+  // Returns 1 iff dma_buf_id < DMABUF_MAX AND the record's in_use
+  // marker byte is nonzero AND refcount > 0.  Refcount>0 is included in
+  // the "valid" predicate so a record that has been released to zero but
+  // whose in_use byte has not yet been scrubbed (impossible in the
+  // single-threaded kernel today, but a defence-in-depth check for the
+  // eventual multicore landing) does not read as valid.
+  //
+  // Pure leaf (no calls); no push/pop required.
+  // ==========================================================================
+
+  pub let dma_buf_valid : (u64) -> u64 !{mem} @{} =
+    fn (dma_buf_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M4-017 (#2397): 1 iff id < DMABUF_MAX and record is in_use with refcount>0. Two gates: bounds check + hdr top-byte check + refcount [55:32] check. Pure leaf. `shl rN, 5` for id*32 (no 2-op imul). Labels prefixed dbv_.",
+      block: {
+        cmp rdi, 32;
+        jae dbv_no;
+
+        lea r10, [rip + _dma_bufs];
+        mov r11, rdi;
+        shl r11, 5;                          // id * 32
+        add r10, r11;
+
+        mov rax, [r10 + 0];                  // hdr
+        mov r11, rax;
+        shr r11, 56;                         // top byte: in_use
+        cmp r11, 0;
+        je  dbv_no;
+
+        // refcount = hdr[55:32]
+        shr rax, 32;
+        and rax, 0xFFFFFF;                   // 24-bit mask
+        cmp rax, 0;
+        je  dbv_no;
+
+        mov rax, 1;
+        ret;
+
+      dbv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dma_buf_import(bo_slot) -> dma_buf_id | error
+  //
+  // Gate order:
+  //   (1) kgb_tail_valid(bo_slot)         -> else DMABUF_BAD_BO
+  //   (2) find free record slot            -> else DMABUF_ENOSPC
+  //   (3) extract descriptor fields from the BO row via kgb_row_*
+  //       accessors: pa (from kgb_row_memory), size, format, modifier
+  //       (from kgb_row_tiling).
+  //   (4) populate the record: hdr = (1<<56) | (1<<32) | id (refcount=1),
+  //       bo_slot, pa, body(size|format|modifier).
+  //   (5) klog_s1_x3 DMABUF IMPORT OK id=<n> bo=<n> size=<n>.
+  //   (6) bump _dma_buf_stats.imports.
+  //   (7) return id.
+  //
+  // Register plan (5 callee-save pushes, rsp%16 = 0 post-push):
+  //   rbx = bo_slot        r12 = record slot idx
+  //   r13 = pa             r14 = size
+  //   r15 = format hint (16-bit)
+  // modifier is fetched just-in-time into rax during body pack.
+  //
+  // Alignment: entry rsp%16 = 8; 5 pushes shift by 40 bytes ->
+  // rsp%16 = (8 - 40) mod 16 = 0.  All nested calls (kgb_*, klog_s1_x3)
+  // run with rsp%16 = 0.
+  //
+  // klog_s1_x3 stack-arg idiom (per wrappers.pdx L112-115): the wrapper
+  // reads [rbp+16]=v2, [rbp+24]=k3, [rbp+32]=v3 where rbp = rsp_at_call
+  // - 16.  Caller places these at [rsp+0], [rsp+8], [rsp+16] before the
+  // call.  `sub rsp, 32` (a) reserves 24 bytes for the three stack args
+  // plus 8 bytes of tail pad, and (b) preserves rsp%16 alignment (32 is
+  // a multiple of 16).  Post-call `add rsp, 32` restores.
+  // ==========================================================================
+
+  pub let dma_buf_import : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (bo_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R113.M4-017 (#2397): import a KIND_GPU_BO as a DMA-BUF descriptor. Gate order: (1) kgb_tail_valid else DMABUF_BAD_BO; (2) low-first free scan over 32 records for the first with in_use==0 else DMABUF_ENOSPC; (3) extract pa (kgb_row_memory), size (kgb_row_size), format (kgb_row_format), modifier (kgb_row_tiling); (4) populate record: hdr = 1<<56 | 1<<32 | id (refcount=1); (5) klog_s1_x3 DMABUF IMPORT OK id=<r12> bo=<rbx> size=<r14>; (6) bump imports stat; (7) return id. Five callee-save pushes (rbx/r12/r13/r14/r15) align rsp%16=0 post-push (entry 8 + 40 = 48 = %16 0) so every nested call runs aligned without further pad. `_dma_bufs` base reloaded via lea after each nested call (caller-save r10 clobbered by call). Record slot index * 32 via `shl rN, 5` (no 2-op imul). klog_s1_x3 stack-arg reservation: sub rsp, 32 preserves rsp%16 alignment while giving the wrapper's [rbp+16/24/32] triple slot; add rsp, 32 restores. All nested kgb_* callees preserve callee-saves per SysV, so rbx/r12/r13/r14/r15 survive across calls. Labels prefixed dbm_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                        // rbx = bo_slot
+
+        // (1) BO liveness -- kgb_tail_valid returns 1/0.
+        mov rdi, rbx;
+        call kgb_tail_valid;
+        cmp rax, 0;
+        je  dbm_bad_bo;
+
+        // (2) Low-first free-record scan over 32 slots.
+        xor r12, r12;                        // r12 = candidate id
+      dbm_scan:
+        cmp r12, 32;
+        jae dbm_enospc;
+
+        lea r10, [rip + _dma_bufs];
+        mov r11, r12;
+        shl r11, 5;                          // id * 32
+        add r10, r11;                        // r10 = &_dma_bufs[id*4]
+
+        mov rax, [r10 + 0];                  // hdr
+        shr rax, 56;                         // top byte = in_use
+        cmp rax, 0;
+        je  dbm_claim;
+
+        add r12, 1;
+        jmp dbm_scan;
+
+      dbm_claim:
+        // (3) Extract descriptor fields.  Each accessor takes rdi=row_id
+        // and returns in rax; r10-r11 are caller-save so they're
+        // recomputed after each call.
+
+        // pa <- kgb_row_memory(bo_slot)
+        mov rdi, rbx;
+        call kgb_row_memory;
+        mov r13, rax;                        // r13 = pa
+
+        // size <- kgb_row_size(bo_slot)
+        mov rdi, rbx;
+        call kgb_row_size;
+        mov r14, rax;                        // r14 = size
+
+        // format <- kgb_row_format(bo_slot)
+        mov rdi, rbx;
+        call kgb_row_format;
+        mov r15, rax;                        // r15 = format
+
+        // modifier <- kgb_row_tiling(bo_slot)  -- fetched last, kept in rax.
+        mov rdi, rbx;
+        call kgb_row_tiling;
+        // rax = modifier
+
+        // (4) Populate record.  Re-derive record base (r10 was clobbered
+        // by the four calls above).
+        lea r10, [rip + _dma_bufs];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;                        // r10 = &record
+
+        // hdr = (in_use=1 << 56) | (refcount=1 << 32) | (id[31:0])
+        mov r11, 1;
+        shl r11, 56;                         // in_use marker
+        mov r9, 1;
+        shl r9, 32;                          // refcount = 1
+        or  r11, r9;
+        mov r9, r12;
+        and r9, 0xFFFFFFFF;                  // dma_buf_id[31:0]
+        or  r11, r9;
+        mov [r10 + 0], r11;                  // hdr
+
+        // bo_slot
+        mov [r10 + 8], rbx;
+
+        // pa
+        mov [r10 + 16], r13;
+
+        // body: size[31:0] | format[47:32] | modifier[63:48].
+        // r11 is paideia-as's imm64-expansion scratch, so `and r11,
+        // 0xFFFFFFFF` collides (feedback_pdx_encoder_pitfalls); use the
+        // `shl 32; shr 32` zero-extend idiom instead.
+        mov r11, r14;                        // size
+        shl r11, 32;
+        shr r11, 32;                         // r11 = size[31:0]
+        mov r9, r15;                         // format
+        and r9, 0xFFFF;
+        shl r9, 32;
+        or  r11, r9;
+        and rax, 0xFFFF;                     // modifier (rax from last call)
+        shl rax, 48;
+        or  r11, rax;
+        mov [r10 + 24], r11;                 // body
+
+        // (5) Emit fingerprint: DMABUF IMPORT OK id=<r12> bo=<rbx> size=<r14>.
+        //   klog_s1_x3(LEVEL_INFO=3, SUBSYS_CAP_, dmabuf_import_ok_msg,
+        //              dmabuf_k_id, id,
+        //              dmabuf_k_bo, /* v2 stack */ bo_slot,
+        //              dmabuf_k_size, /* k3+v3 stack */ size)
+        // Wrapper reads [rbp+16]=v2, [rbp+24]=k3, [rbp+32]=v3; caller
+        // stores at [rsp+0], [rsp+8], [rsp+16] after `sub rsp, 32`.
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + dmabuf_import_ok_msg];
+        lea rcx, [rip + dmabuf_k_id];
+        mov r8, r12;                         // v1 = id
+        lea r9, [rip + dmabuf_k_bo];         // k2
+
+        sub rsp, 32;                         // 24 args + 8 pad, preserves %16=0
+        mov [rsp + 0], rbx;                  // v2 = bo_slot
+        lea r10, [rip + dmabuf_k_size];
+        mov [rsp + 8], r10;                  // k3 = &dmabuf_k_size
+        mov [rsp + 16], r14;                 // v3 = size
+        call klog_s1_x3;
+        add rsp, 32;
+
+        // (6) Bump imports stat.
+        lea r10, [rip + _dma_buf_stats];
+        mov rax, [r10 + 0];
+        add rax, 1;
+        mov [r10 + 0], rax;
+
+        // (7) Return dma_buf_id.
+        mov rax, r12;
+        jmp dbm_out;
+
+      dbm_bad_bo:
+        // Bump bad_bo stat then return DMABUF_BAD_BO.
+        lea r10, [rip + _dma_buf_stats];
+        mov rax, [r10 + 24];                 // stats[3] = bad_bo
+        add rax, 1;
+        mov [r10 + 24], rax;
+        mov rax, 0xFFFFE220;
+        jmp dbm_out;
+
+      dbm_enospc:
+        // Bump enospc stat then return DMABUF_ENOSPC.
+        lea r10, [rip + _dma_buf_stats];
+        mov rax, [r10 + 16];                 // stats[2] = enospc
+        add rax, 1;
+        mov [r10 + 16], rax;
+        mov rax, 0xFFFFE221;
+
+      dbm_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dma_buf_export_pa(dma_buf_id) -> pa | DMABUF_BAD_ID
+  //
+  // Reads record[+16].  See file header EXPORT RETURN CHANNEL for the
+  // sentinel-value discussion.
+  //
+  // Pure leaf calling dma_buf_valid; entry rsp%16=8, `sub rsp, 8`
+  // aligns for the nested call, `add rsp, 8` restores before ret.
+  // ==========================================================================
+
+  pub let dma_buf_export_pa : (u64) -> u64 !{mem} @{} =
+    fn (dma_buf_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M4-017 (#2397): read record[+16] (pa surrogate). Two-step: dma_buf_valid gate then displacement load. `sub rsp, 8` aligns rsp%16=0 for the nested call; `add rsp, 8` restores. `shl r11, 5` for id*32 record stride. Labels prefixed dbp_.",
+      block: {
+        push r12;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // r12 = id
+
+        mov rdi, r12;
+        call dma_buf_valid;
+        cmp rax, 0;
+        je  dbp_bad;
+
+        lea r10, [rip + _dma_bufs];
+        mov r11, r12;
+        shl r11, 5;                          // id * 32
+        add r10, r11;
+        mov rax, [r10 + 16];                 // pa
+        jmp dbp_out;
+
+      dbp_bad:
+        mov rax, 0xFFFFE222;                 // DMABUF_BAD_ID
+
+      dbp_out:
+        add rsp, 8;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dma_buf_export_size(dma_buf_id) -> size | DMABUF_BAD_ID
+  //
+  // Reads record[+24] and extracts size[31:0].
+  // ==========================================================================
+
+  pub let dma_buf_export_size : (u64) -> u64 !{mem} @{} =
+    fn (dma_buf_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M4-017 (#2397): read record[+24][31:0] (size). `and rax, 0xFFFFFFFF` masks to u32 (imm32-safe encoding). Alignment shape identical to dma_buf_export_pa. Labels prefixed dbs_.",
+      block: {
+        push r12;
+        sub rsp, 8;
+
+        mov r12, rdi;
+
+        mov rdi, r12;
+        call dma_buf_valid;
+        cmp rax, 0;
+        je  dbs_bad;
+
+        lea r10, [rip + _dma_bufs];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 24];                 // body
+        and rax, 0xFFFFFFFF;                 // size[31:0]
+        jmp dbs_out;
+
+      dbs_bad:
+        mov rax, 0xFFFFE222;
+
+      dbs_out:
+        add rsp, 8;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dma_buf_export_format(dma_buf_id) -> format | DMABUF_BAD_ID
+  //
+  // Reads record[+24] and extracts format[47:32].
+  // ==========================================================================
+
+  pub let dma_buf_export_format : (u64) -> u64 !{mem} @{} =
+    fn (dma_buf_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M4-017 (#2397): read record[+24][47:32] (format low-16). `shr rax, 32; and rax, 0xFFFF` extracts the format field. Alignment shape identical to dma_buf_export_pa. Labels prefixed dbf_.",
+      block: {
+        push r12;
+        sub rsp, 8;
+
+        mov r12, rdi;
+
+        mov rdi, r12;
+        call dma_buf_valid;
+        cmp rax, 0;
+        je  dbf_bad;
+
+        lea r10, [rip + _dma_bufs];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 24];
+        shr rax, 32;
+        and rax, 0xFFFF;                     // format[47:32]
+        jmp dbf_out;
+
+      dbf_bad:
+        mov rax, 0xFFFFE222;
+
+      dbf_out:
+        add rsp, 8;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dma_buf_export_modifier(dma_buf_id) -> modifier | DMABUF_BAD_ID
+  //
+  // Reads record[+24] and extracts modifier[63:48].
+  // ==========================================================================
+
+  pub let dma_buf_export_modifier : (u64) -> u64 !{mem} @{} =
+    fn (dma_buf_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M4-017 (#2397): read record[+24][63:48] (modifier low-16). `shr rax, 48` extracts the modifier field (shift alone masks the upper bits). Alignment shape identical to dma_buf_export_pa. Labels prefixed dbo_ ('o' for mOdifier; 'm' taken by dbm_ for import/mint).",
+      block: {
+        push r12;
+        sub rsp, 8;
+
+        mov r12, rdi;
+
+        mov rdi, r12;
+        call dma_buf_valid;
+        cmp rax, 0;
+        je  dbo_bad;
+
+        lea r10, [rip + _dma_bufs];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 24];
+        shr rax, 48;                         // modifier[63:48] (shift alone masks)
+        jmp dbo_out;
+
+      dbo_bad:
+        mov rax, 0xFFFFE222;
+
+      dbo_out:
+        add rsp, 8;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dma_buf_release(dma_buf_id) -> u64
+  //
+  // Gate order:
+  //   (1) bounds check id < DMABUF_MAX          -> else DMABUF_BAD_ID
+  //   (2) record in_use == 0                    -> DMABUF_BAD_ID
+  //   (3) refcount == 0                         -> DMABUF_REFCOUNT_ZERO
+  //       (use-after-free signal; refuse to double-free)
+  //   (4) decrement refcount
+  //   (5) if refcount was 1 (now 0): clear the in_use marker byte to
+  //       return the record to the free pool.  Rest of record data
+  //       stays behind and is overwritten on next import (harmless;
+  //       no accessor reads a record with in_use==0).
+  //   (6) bump _dma_buf_stats.releases.
+  //   (7) return DMABUF_OK.
+  //
+  // Register plan: r12 = id.  One callee-save push + sub rsp, 8 = 16
+  // bytes shift; entry rsp%16 = 8 -> post-push+sub rsp%16 = (8 - 16)
+  // mod 16 = 8 -- BAD.  This function makes NO nested calls so we
+  // don't need call-time alignment; we only need push/pop symmetry.
+  // Use a single `push r12` (no sub) and pop before ret; no alignment
+  // discipline required for a call-free body.
+  //
+  // No klog emit -- per-frame high-volume path (see file header
+  // FINGERPRINT).  Correctness signal is the return code plus the
+  // stats counter.
+  // ==========================================================================
+
+  pub let dma_buf_release : (u64) -> u64 !{mem} @{} =
+    fn (dma_buf_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M4-017 (#2397): decrement refcount; free record on 0. Gate order: (1) id < 32 else DMABUF_BAD_ID; (2) in_use != 0 else DMABUF_BAD_ID; (3) refcount != 0 else DMABUF_REFCOUNT_ZERO (double-free refusal); (4) decrement refcount in place; (5) if new refcount == 0 clear in_use marker byte; (6) bump releases stat; (7) DMABUF_OK. Pure leaf (no calls) -- push r12 + pop symmetry; no alignment sub needed. No klog: per-frame high-volume path (see file header FINGERPRINT). In-place hdr rewrite preserves dma_buf_id field so a future stale-id caller can be distinguished from a wholly out-of-range id (both return DMABUF_BAD_ID today; the id field survival lets a future audit path recover it). Labels prefixed dbr_.",
+      block: {
+        push r12;
+
+        mov r12, rdi;                        // r12 = id
+
+        // (1) bounds
+        cmp r12, 32;
+        jae dbr_bad_id;
+
+        // Load record base + hdr.
+        lea r10, [rip + _dma_bufs];
+        mov r11, r12;
+        shl r11, 5;
+        add r10, r11;                        // r10 = &record
+
+        mov rax, [r10 + 0];                  // hdr
+
+        // (2) in_use != 0 (top byte)
+        mov r11, rax;
+        shr r11, 56;
+        cmp r11, 0;
+        je  dbr_bad_id;
+
+        // (3) refcount != 0 (bits [55:32], 24-bit field)
+        mov r11, rax;
+        shr r11, 32;
+        and r11, 0xFFFFFF;
+        cmp r11, 0;
+        je  dbr_refcount_zero;
+
+        // (4) decrement refcount in place.  Refcount lives at bits
+        // [55:32]; decrement is a subtract of (1 << 32) from the hdr
+        // word.  The in_use byte and the id field are untouched.
+        mov r11, 1;
+        shl r11, 32;                         // r11 = 1 << 32
+        sub rax, r11;                        // hdr -= 1<<32 (refcount--)
+
+        // (5) if new refcount == 0, clear the in_use marker byte.
+        // Re-extract refcount to test.
+        mov r11, rax;
+        shr r11, 32;
+        and r11, 0xFFFFFF;
+        cmp r11, 0;
+        jne dbr_write_hdr;                   // still held; just write hdr
+
+        // Clear in_use byte by masking off bits [63:56].  0x00FFFFFFFFFFFFFF
+        // does NOT fit as an imm32 with sign bit clear (it's a 56-bit
+        // literal), so build the mask in r11 rather than using
+        // `and rax, imm64`.  r11 = (1<<56) - 1 = 0x00FF_FFFF_FFFF_FFFF.
+        mov r11, 1;
+        shl r11, 56;
+        sub r11, 1;                          // r11 = 0x00FF_FFFF_FFFF_FFFF
+        and rax, r11;                        // clear top byte (in_use := 0)
+
+      dbr_write_hdr:
+        mov [r10 + 0], rax;                  // commit updated hdr
+
+        // (6) bump releases stat.
+        lea r10, [rip + _dma_buf_stats];
+        mov rax, [r10 + 8];                  // stats[1] = releases
+        add rax, 1;
+        mov [r10 + 8], rax;
+
+        // (7) DMABUF_OK
+        xor rax, rax;
+        jmp dbr_out;
+
+      dbr_bad_id:
+        mov rax, 0xFFFFE222;                 // DMABUF_BAD_ID
+        jmp dbr_out;
+      dbr_refcount_zero:
+        mov rax, 0xFFFFE223;                 // DMABUF_REFCOUNT_ZERO
+
+      dbr_out:
+        pop r12;
+        ret
+      }
+    }
+}
