@@ -403,6 +403,87 @@ accessor. There is no user-space code path that touches
 `_surface_table` directly; that boundary is what makes the LAM
 generation counter meaningful.
 
+## 7.1 Reconciliation of the two 0x1B8 files (paideia-os #2423, 2026-09-08)
+
+**Rollback context.** Between Wave 12 and the R113.M1-001 landing,
+two files simultaneously declared `KIND_SURFACE = 0x1B8`:
+
+1. `src/user/compositor/surface_kind.pdx` (Wave-0 Batch-6 landing,
+   paideia-os #2246, live since 2026-07). Vocabulary authority.
+2. `src/kernel/core/cap/kind_surface.pdx` (R113.M1-001 landing,
+   paideia-os #2381, live since 2026-09). Substrate authority.
+
+Wave 12 attempted three times to collapse (1) and (2) into a single
+file, each attempt rolled back for either a kind-id clash (M1-001
+had proposed `0x1B5` instead of preserving `0x1B8`), a row-layout
+divergence, a failure-band collision, or a fingerprint-allowlist
+gap. paideia-os #2423 was filed to (a) freeze the two-file shape and
+(b) publish the single authoritative reference for `0x1B8`. This
+subsection is that publication.
+
+**No file is dead code.** Neither `src/user/compositor/surface_kind
+.pdx` nor `src/kernel/core/cap/kind_surface.pdx` is a stale
+duplicate. Both are needed because they answer disjoint questions:
+
+* "What is a surface, as spoken about at the RPC vocabulary layer?"
+  — user-side. Identity, rights, op numbering, mint-facing failure
+  codes, `pdx_kind_surface_meta` fingerprint tag.
+* "How does a surface actually live in memory, and how does the
+  kernel authorize + apply mutations to it?" — kernel-side. Row
+  layout, row pool, accessors, mint/destroy asm bodies, KGATE
+  aliases, kernel-side substrate failure codes, five R113.M1
+  fingerprint tags.
+
+**Single authoritative reference for `KIND_SURFACE = 0x1B8`:**
+
+> `src/user/compositor/surface_kind.pdx:102`
+
+is the canonical identity declaration. The kernel-side file
+(`src/kernel/core/cap/kind_surface.pdx`, `KIND_SURFACE_ID`) mirrors
+that literal with a header comment naming the user-side line as
+authority. Both files carry cross-reference blocks in their
+headers pointing at each other and at this section of this doc.
+
+**Duplication surface (what mirrors what):**
+
+| Constant                        | Canonical location                                          | Mirror location                                                   |
+|---------------------------------|-------------------------------------------------------------|-------------------------------------------------------------------|
+| `KIND_SURFACE = 0x1B8`          | `src/user/compositor/surface_kind.pdx:102`                  | `src/kernel/core/cap/kind_surface.pdx` (`KIND_SURFACE_ID`)         |
+| `KIND_SURFACE_BASE = 5`         | `src/user/compositor/surface_kind.pdx:103`                  | `src/kernel/core/cap/kind_surface.pdx` (`KIND_SURFACE_BASE`)       |
+| `R_SURFACE_*` (9 rights + ALL)  | `src/user/compositor/surface_kind.pdx:131-140`              | `src/kernel/core/cap/kind_surface.pdx` (identical literals)        |
+
+No other constants are duplicated. In particular:
+
+* The user-side failure band `0xFFFFEEF1..0xFFFFEEFA` (mint/revoke
+  validators) and the kernel-side failure band
+  `0xFFFFE110..0xFFFFE11F` (substrate dispatcher) are **disjoint**;
+  no code appears in both files.
+* Op numbering (`SURFACE_OP_*`) lives ONLY user-side; the
+  kernel-side dispatcher branches on those values imported by
+  literal reference in its per-op arms.
+* Row layout / row pool / accessors / mint asm bodies /
+  `KGATE_*` aliases live ONLY kernel-side.
+* `pdx_kind_surface_meta` fingerprint tag lives ONLY user-side; the
+  five R113.M1 kernel-side tags (SURFACE MINT/DESTROY/COMMIT/
+  FMT BIND/PRESENT OK) live ONLY kernel-side.
+
+**Parity enforcement plan.** paideia-as has no cross-file import,
+so the duplication is enforced by a build-time grep gate. That gate
+(`tools/verify-kind-parity.sh`) is not yet implemented; it is a
+follow-up ticket owed to R113.M1 close-out. Until it lands, the
+cross-reference comments in both file headers are the only
+mechanism catching drift, and a debugger pass on any PR touching
+either file must eyeball the mirror.
+
+**No collapse.** The two-file shape is intentional and permanent
+under the current paideia-as. A future paideia-as with a genuine
+cross-file `use` statement could migrate the kernel-side to `use
+KIND_SURFACE from user.compositor.surface_kind` (per doc §7
+sketched syntax), at which point the kernel-side literal becomes an
+import and the parity gate becomes unnecessary. That migration is
+NOT scheduled; do not attempt a fourth collapse before the import
+mechanism ships in paideia-as.
+
 ## 8. Fingerprint tags (FROZEN — allowlist owed)
 
 Kernel-side dispatchers emit these on successful mint / destroy /
