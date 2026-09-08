@@ -1501,6 +1501,52 @@ ALLOWLIST = {
         "default matrix once a boot witness wires mint -> attach -> "
         "commit -> notify end-to-end.  Closed the last of the doc §8 "
         "five-tag mandate slots (all five tags now have live emitters).",
+    "surface toplevel create ok [legacy: TOPLEVEL CREATE OK]":
+        "R113.M2-006 (paideia-os #2386): kernel-side SURFACE TOPLEVEL "
+        "CREATE OK tag emitted by toplevel_create (src/kernel/core/"
+        "graphics/surface_toplevel.pdx) via klog_s1_x2 with (sid, tid) "
+        "KVs on every successful create.  Emitter is live but not "
+        "reachable in the default matrix yet: no boot witness or cap "
+        "dispatcher arm calls toplevel_create -- toplevel_init runs at "
+        "boot (defensive pool scrub) but is a pure zero-out.  The "
+        "companion cap dispatcher wire (a role-multiplexed OP_SURFACE_"
+        "ROLE_TOPLEVEL_* arm on cap_handler_surface) is a follow-on "
+        "landing.  Same real-HW / wire-deferred posture as the sibling "
+        "`surface mint ok` and `surface commit ok` entries above; "
+        "reachable end-to-end when a boot witness mints a surface + "
+        "creates a toplevel role over it (natural companion to the "
+        "M1-002 op_arg-encoding refinement).",
+
+    # ------------------------------------------------------------------
+    # R113.M2-011 (paideia-os #2391): global focus model
+    # (src/kernel/core/graphics/focus.pdx).  Two transition fingerprints
+    # (KBD / PTR) fire on focus_set_keyboard / focus_set_pointer when
+    # the target slot differs from the current cell; a repeat-set with
+    # the same slot is a silent no-op success (idempotency mirrors
+    # surface_format_bind_at_mint).  Neither is reachable in the
+    # default 14-mode matrix today: the first live callers are the
+    # input dispatcher (blocked on xHCI MSI-X routing for the HID
+    # Transfer Event handler, see drivers/xhci/hid_kbd_attach.pdx §IRQ
+    # path) and the compositor's refocus-on-window-activate path
+    # (R113.M2-002+ landings still open).  Real-HW / wire-deferred
+    # posture identical to `hid kbd attach ok` sibling.
+    # ------------------------------------------------------------------
+    "focus kbd ok [legacy: FOCUS KBD OK]":
+        "R113.M2-011 (#2391): keyboard-focus transition tag; "
+        "focus_set_keyboard emits via klog_s1_x1 with sid=<slot> KV "
+        "when the new slot differs from _kbd_focus_slot.  First live "
+        "caller is the input dispatcher (blocked on xHCI MSI-X routing "
+        "per drivers/xhci/hid_kbd_attach.pdx §IRQ path).  Assertable "
+        "when a boot witness drives focus_set_keyboard against a live "
+        "surface slot end-to-end.",
+    "focus ptr ok [legacy: FOCUS PTR OK]":
+        "R113.M2-011 (#2391): pointer-focus transition tag; "
+        "focus_set_pointer emits via klog_s1_x1 with sid=<slot> KV "
+        "when the new slot differs from _ptr_focus_slot.  First live "
+        "caller is the pointer-motion worker in the input dispatcher "
+        "landing (same MSI-X blocker as the KBD sibling).  Assertable "
+        "when a boot witness drives focus_set_pointer against a live "
+        "surface slot end-to-end.",
 
     # Batch 7: G7 close-out (src/user/compositor/*.pdx)
     "pdx kind subsurface meta [legacy: SUBSURFACE SYNC OK]":
