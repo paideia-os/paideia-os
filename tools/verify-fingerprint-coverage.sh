@@ -1516,6 +1516,37 @@ ALLOWLIST = {
         "reachable end-to-end when a boot witness mints a surface + "
         "creates a toplevel role over it (natural companion to the "
         "M1-002 op_arg-encoding refinement).",
+    "surface popup create ok [legacy: POPUP CREATE OK]":
+        "R113.M2-007 (paideia-os #2387): kernel-side SURFACE POPUP "
+        "CREATE OK tag emitted by popup_create (src/kernel/core/"
+        "graphics/surface_popup.pdx) via klog_s1_x3 with (sid, pid, "
+        "parent) KVs on every successful create.  Emitter is live but "
+        "not reachable in the default matrix yet: no boot witness or "
+        "cap dispatcher arm calls popup_create -- popup_init runs at "
+        "boot (defensive pool scrub) but is a pure zero-out.  The "
+        "companion cap dispatcher wire (a role-multiplexed OP_SURFACE_"
+        "ROLE_POPUP_* arm on cap_handler_surface) is a follow-on "
+        "landing.  Same real-HW / wire-deferred posture as the sibling "
+        "`surface toplevel create ok` entry above; reachable end-to-"
+        "end when a boot witness mints two surfaces (popup + parent) "
+        "and creates a popup role anchored to the parent via "
+        "popup_create(surface_slot, parent_slot, anchor_x, anchor_y, "
+        "gravity).",
+    "surface layer shell create ok [legacy: LAYER SHELL CREATE OK]":
+        "R113.M2-008 (paideia-os #2388): kernel-side SURFACE LAYER "
+        "SHELL CREATE OK tag emitted by layer_shell_create (src/kernel/"
+        "core/graphics/surface_layer_shell.pdx) via klog_s1_x3 with "
+        "(sid, lsid, layer) KVs on every successful create.  Emitter "
+        "is live but not reachable in the default matrix yet: no boot "
+        "witness or cap dispatcher arm calls layer_shell_create -- "
+        "layer_shell_init runs at boot (defensive pool scrub) but is a "
+        "pure zero-out.  The companion cap dispatcher wire (a role-"
+        "multiplexed OP_SURFACE_ROLE_LAYER_SHELL_* arm on cap_handler_"
+        "surface) is a follow-on landing.  Same real-HW / wire-"
+        "deferred posture as the sibling `surface toplevel create ok` "
+        "entry above; reachable end-to-end when a boot witness mints "
+        "a surface + creates a layer-shell role over it (panel / "
+        "taskbar / notification surfaces are the M2 consumers).",
 
     # ------------------------------------------------------------------
     # R113.M2-011 (paideia-os #2391): global focus model
@@ -1547,6 +1578,32 @@ ALLOWLIST = {
         "landing (same MSI-X blocker as the KBD sibling).  Assertable "
         "when a boot witness drives focus_set_pointer against a live "
         "surface slot end-to-end.",
+
+    # ------------------------------------------------------------------
+    # R113.M2-010 (paideia-os #2390): Z-order stack + "raise on focus"
+    # activation (src/kernel/core/graphics/z_order.pdx).  Emitted by
+    # z_order_raise via klog_s1_x2 with (sid, depth) KVs on any
+    # successful raise (both the shift-remove-and-append arm and the
+    # auto-add arm).  Live caller is focus_set_keyboard (focus.pdx
+    # fsk_store arm) as the "raise on focus" side-effect per the issue
+    # title mandate; unreachable in the default 14-mode matrix today
+    # because focus_set_keyboard itself is only reached via the input
+    # dispatcher (blocked on xHCI MSI-X routing, see the focus kbd ok /
+    # focus ptr ok siblings above and drivers/xhci/hid_kbd_attach.pdx
+    # §IRQ path) or the compositor's refocus-on-window-activate path
+    # (R113.M2-002+ landings still open).  Same real-HW / wire-deferred
+    # posture as the focus siblings; assertable when a boot witness
+    # drives focus_set_keyboard against a live surface slot end-to-end.
+    # ------------------------------------------------------------------
+    "z order raise ok [legacy: Z ORDER RAISE OK]":
+        "R113.M2-010 (#2390): Z-order raise fingerprint; "
+        "z_order_raise emits via klog_s1_x2 with (sid=<slot>, "
+        "depth=<new_count>) KVs on any successful raise.  Live "
+        "caller is focus_set_keyboard (focus.pdx fsk_store arm) "
+        "as the 'raise on focus' side-effect.  First reachable in "
+        "the default matrix when a boot witness drives focus_set_"
+        "keyboard against a live surface slot (same MSI-X wire "
+        "blocker as the focus kbd / focus ptr siblings above).",
 
     # Batch 7: G7 close-out (src/user/compositor/*.pdx)
     "pdx kind subsurface meta [legacy: SUBSURFACE SYNC OK]":
