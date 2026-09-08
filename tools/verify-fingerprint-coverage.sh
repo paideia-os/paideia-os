@@ -1534,6 +1534,40 @@ ALLOWLIST = {
         "landing (or a boot witness) drives session_mint end-to-end.",
 
     # ------------------------------------------------------------------
+    # R113.M7-036 (paideia-os #2416): KIND_CAPTURE grant fingerprint
+    # (src/kernel/core/cap/kind_capture.pdx).  capture_grant validates
+    # granted_task != 0, low-first-scans over the 16-row _captures pool
+    # for a free slot, reads hpet_now_ns for granted_ns, computes
+    # expires_ns (0 for permanent-grant sentinel, else granted_ns +
+    # duration_ns), bumps the LAM generation on the claimed row, stamps
+    # capture_id (== row_id) + granted_task + source_surface (0 =
+    # full-screen sentinel) + granted_ns + expires_ns + reserved zero,
+    # bumps _capture_stats[GRANTS] and emits CAPTURE GRANT OK id=<n>
+    # src=<n> expires=<n> via klog_s1_x3 with the 3-push idiom lifted
+    # from cow_write.pdx L996-1002.  Revoke / check DO NOT emit
+    # fingerprints per issue #2416's contract (only grant emits).
+    # Emitter is live but not reachable in the default matrix yet:
+    # kind_capture_init runs at boot (defensive _captures +
+    # _capture_stats zero-scrub) but is a pure zero-out, and no boot
+    # witness or cap-dispatcher arm calls capture_grant yet -- the
+    # follow-on capture-broker landing wiring OP_CAPTURE_GRANT /
+    # OP_CAPTURE_REVOKE / OP_CAPTURE_CHECK end-to-end will close this
+    # allowlist entry.  Same real-HW / wire-deferred posture as the
+    # sibling `session mint ok` entry above.
+    # ------------------------------------------------------------------
+    "capture grant ok [legacy: CAPTURE GRANT OK]":
+        "R113.M7-036 (#2416): kernel-side KIND_CAPTURE grant "
+        "fingerprint; capture_grant (src/kernel/core/cap/kind_capture."
+        "pdx) emits this via klog_s1_x3 with (id, src, expires) KVs "
+        "on every successful grant past the granted_task != 0 + "
+        "free-slot gates.  Substrate + emitter landed together; "
+        "kind_capture_init runs at boot (defensive pool + stats "
+        "scrub) but is a pure zero-out, and the cap-dispatcher "
+        "OP_CAPTURE_GRANT arm is a follow-on landing.  Assertable "
+        "when the follow-on capture-broker landing (or a boot "
+        "witness) drives capture_grant end-to-end.",
+
+    # ------------------------------------------------------------------
     # R113.M5-026 (paideia-os #2406): SESSION REVOKE cascade fingerprint
     # (src/kernel/core/graphics/session_revoke.pdx).  session_revoke
     # tears down every KIND_SURFACE row + wrapping role authority
@@ -1652,6 +1686,37 @@ ALLOWLIST = {
         "Assertable when the M3 rendering-path boot witness lands and "
         "pins both the initial-state values and the post-alloc "
         "movement in cascade.",
+
+    # ------------------------------------------------------------------
+    # R113.M7-032 (paideia-os #2412): FrameCaptureView@0.1 semantic-
+    # pipe schema DECLARATION (src/kernel/core/graphics/frame_capture_
+    # schema.pdx).  frame_capture_schema_init is wired into kernel_main
+    # after vblank_init and fires unconditionally on every boot,
+    # emitting `frame capture schema ok size=0x60` via klog_s1_x1
+    # with (FCV_RECORD_BYTES = 96) as the sole hex KV.  BOOT-VISIBLE
+    # and stable-valued but no golden currently pins the literal --
+    # the M7-032 landing is schema DECLARATION only (constants +
+    # fingerprint emit); the pool substrate, mint gate, cap-invoke
+    # dispatcher, and vblank_handler emit hook all land at M7-033
+    # (sibling issue, deferred).  The natural pin lands with the
+    # M7-033 end-to-end capture witness (compositor mint -> vblank
+    # capture emit -> semantic-pipe consumer decode) which will also
+    # assert the record-shape decode against the same 96-byte
+    # constant, making the initial-state pin meaningful in cascade
+    # rather than in isolation.  Splitting DECLARATION from SUBSTRATE
+    # matches the shm_pool.pdx allowlist rationale above one-for-one.
+    # ------------------------------------------------------------------
+    "frame capture schema ok [legacy: FRAME CAPTURE SCHEMA OK]":
+        "R113.M7-032 (#2412): FrameCaptureView@0.1 schema declaration "
+        "boot fingerprint; frame_capture_schema_init (src/kernel/core/"
+        "graphics/frame_capture_schema.pdx) fires unconditionally in "
+        "kernel_main after vblank_init and emits `frame capture schema "
+        "ok size=0x60` via klog_s1_x1.  M7-032 lands constants + "
+        "fingerprint only; the pool substrate + mint gate + cap-invoke "
+        "dispatcher + vblank_handler emit hook all land at M7-033 "
+        "(sibling issue, deferred).  Assertable when the M7-033 end-"
+        "to-end capture witness lands and pins the record-shape decode "
+        "against the same 96-byte constant in cascade.",
 
     # ------------------------------------------------------------------
     # R113.M2-011 (paideia-os #2391): global focus model
@@ -1881,6 +1946,15 @@ ALLOWLIST = {
         "surface z-stack and pending damage.",
 
     # ------------------------------------------------------------------
+    # R113.M4-021 (paideia-os #2401): KIND_DISPLAY vblank event handler
+    # emits "vblank tick [legacy: VBLANK TICK] counter=<n>" via
+    # klog_s1_x1.  Not tracked here — the gate scanner requires an "OK"
+    # token to record an emit, and this tag uses TICK.  Allowlist entry
+    # retired 2026-09-08 to satisfy the stale-allowlist gate; the
+    # deferred-witness rationale is preserved inline in vblank.pdx.
+    # (Original vblank vestigial allowlist below intentionally removed.)
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # R113.M4-021 (paideia-os #2401): KIND_DISPLAY vblank event
     # handler (src/kernel/core/graphics/vblank.pdx).  vblank_handler
     # bumps _vblank_counter, fires the compositor pass (scanout_try_
@@ -1901,19 +1975,60 @@ ALLOWLIST = {
     # when the R36 IRQ dispatcher (or a boot witness) calls vblank_
     # handler(display_id=1) end-to-end.
     # ------------------------------------------------------------------
-    "vblank tick [legacy: VBLANK TICK]":
-        "R113.M4-021 (#2401): KIND_DISPLAY vblank-handler fingerprint; "
-        "vblank_handler emits via klog_s1_x1 with counter=<n> KV on "
-        "every invocation past the display_id != 0 gate.  Emitter is "
-        "live but not reachable in the default matrix yet: no boot "
-        "witness or KIND_DISPLAY IRQ dispatcher calls vblank_handler "
-        "-- vblank_init runs at boot (defensive _vblank_counter "
-        "scrub) but is a pure zero-out, and vblank_get_counter is a "
-        "pure read.  Same real-HW / wire-deferred posture as the "
-        "composite plan ok / scanout direct ok / surface present ok "
-        "siblings above; assertable when the R36 KIND_DISPLAY IRQ "
-        "dispatcher (or a boot witness) drives vblank_handler(display"
-        "_id=1) end-to-end against a live z-stack.",
+    # (vblank tick entry retired 2026-09-08: gate scanner only tracks
+    # tags containing "OK"; TICK tag was never scanned in, causing the
+    # allowlist entry to always report STALE.  Deferred-witness rationale
+    # preserved inline in src/kernel/core/graphics/vblank.pdx.)
+
+    # ------------------------------------------------------------------
+    # R113.M7-034 (paideia-os #2414): on-demand full-frame capture
+    # substrate (src/kernel/core/graphics/screenshot.pdx).
+    # capture_screenshot(dst_bo_slot, format) validates the
+    # destination KIND_GPU_BO row, gates the format against the
+    # M7-034 admissible set (XRGB8888 only), verifies the GOP
+    # framebuffer is initialised (_gop_fb_base_pa != 0), verifies
+    # the destination BO is large enough for width * height * 4
+    # bytes, bumps the wire-deferred SCREENSHOT_ST_BLITS_PENDING
+    # witness counter (the physical memcpy from _gop_fb_ptr lands
+    # with the R113.M7-034 wire that also lands the KIND_MEMORY-
+    # slot-to-VA resolver per dma_buf.pdx §BO L60-63), and emits
+    # SCREENSHOT OK bo=<slot> w=<width> h=<height> via klog_s1_x3
+    # (one emit per successful capture; per-capture is exactly what
+    # a screenshot audit trail wants, distinct from the first-per-
+    # surface idempotency scanout_try_direct uses).  Unreachable in
+    # the default 14-mode QEMU matrix today because the screenshot
+    # key handler (R113.M7-035) and the FrameCaptureView@0.1
+    # semantic-pipe consumer (R113.M7-036) are separate follow-on
+    # landings; the substrate is staged here so those landings are
+    # a single-call insert rather than a substrate-plus-consumer
+    # joint drop.  screenshot_init runs at boot (defensive stats
+    # scrub) but emits no fingerprint of its own.  Same real-HW /
+    # wire-deferred posture as the composite gpu ok / scanout
+    # direct ok / vblank tick / dmabuf import ok siblings above;
+    # assertable when a boot witness mints a KIND_GPU_BO large
+    # enough to hold the framebuffer and calls capture_screenshot
+    # with XRGB8888 after gop_fb_console_init has run.
+    # ------------------------------------------------------------------
+    "screenshot ok [legacy: SCREENSHOT OK]":
+        "R113.M7-034 (#2414): on-demand full-frame capture "
+        "fingerprint; capture_screenshot emits via klog_s1_x3 with "
+        "(bo=<slot>, w=<width>, h=<height>) KVs on every successful "
+        "capture (per-capture, not first-per-BO -- each capture is "
+        "a distinct user-observable event that the audit trail "
+        "should record).  Emitter is live but not reachable in the "
+        "default matrix yet: no live caller wires the substrate -- "
+        "the screenshot key handler (R113.M7-035) and the "
+        "FrameCaptureView@0.1 semantic-pipe consumer (R113.M7-036) "
+        "are separate follow-on landings, and the physical memcpy "
+        "from _gop_fb_ptr into the destination BO's mapped byte "
+        "range is the R113.M7-034 wire that also lands the "
+        "KIND_MEMORY-slot-to-VA resolver (per dma_buf.pdx §BO "
+        "L60-63).  Same real-HW / wire-deferred posture as the "
+        "composite gpu ok / scanout direct ok / vblank tick / "
+        "dmabuf import ok siblings above; assertable when a boot "
+        "witness mints a KIND_GPU_BO large enough for the panel "
+        "geometry and calls capture_screenshot(bo, XRGB8888) after "
+        "gop_fb_console_init has run.",
 
     # ------------------------------------------------------------------
     # R113.M3-012 (paideia-os #2392): keyboard event routing from the
@@ -1938,19 +2053,8 @@ ALLOWLIST = {
     # drives focus_set_keyboard against a live surface slot and then
     # exercises tty_stdin_drain (or calls kbd_event_deliver directly).
     # ------------------------------------------------------------------
-    "kbd route ready [legacy: KBD ROUTE READY]":
-        "R113.M3-012 (#2392): keyboard-route delivery fingerprint; "
-        "kbd_event_deliver emits via klog_s1_x1 with sid=<slot> KV "
-        "on the FIRST successful enqueue for each surface_slot ever "
-        "(subsequent enqueues on the same slot are silent per issue "
-        "#2392 §5 'no per-event fingerprint').  Wire caller is "
-        "tty_stdin_drain via kbd_route_from_tty_byte; unreachable "
-        "in the default 14-mode QEMU matrix because focus_get_"
-        "keyboard() returns FOCUS_NONE on every current boot (same "
-        "MSI-X wire blocker as the focus kbd / focus ptr / z order "
-        "raise / ptr route siblings).  Assertable when a boot "
-        "witness drives focus_set_keyboard against a live surface "
-        "slot and then drains a byte end-to-end.",
+    # (kbd route ready entry retired 2026-09-08: same reason — READY
+    # tag not scanned.  Deferred-witness rationale in kbd_route.pdx.)
 
     # ------------------------------------------------------------------
     # R113.M3-013 (paideia-os #2393): pointer event routing from HID
@@ -1971,16 +2075,8 @@ ALLOWLIST = {
     # -> surface_row_dims_get -> focus_set_pointer -> ring enqueue ->
     # emit).
     # ------------------------------------------------------------------
-    "ptr route ready [legacy: PTR ROUTE READY]":
-        "R113.M3-013 (#2393): pointer-route delivery fingerprint; "
-        "ptr_event_motion / ptr_event_button / ptr_event_axis emit "
-        "via klog_s1_x1 with sid=<target> KV on every successful "
-        "ring-enqueue.  Unreachable in the default 14-mode QEMU "
-        "matrix -- no live caller wires the ptr_event_* leaves yet "
-        "(same MSI-X wire blocker as the focus kbd / focus ptr / "
-        "z order raise siblings above).  Assertable when the R113.M3 "
-        "input dispatcher landing or a boot witness drives a "
-        "ptr_event_* leaf against a live surface slot end-to-end.",
+    # (ptr route ready entry retired 2026-09-08: same reason — READY
+    # tag not scanned.  Deferred-witness rationale in ptr_route.pdx.)
 
     # ------------------------------------------------------------------
     # R113.M3-014 (paideia-os #2394): touch event routing from HID
@@ -2003,18 +2099,8 @@ ALLOWLIST = {
     # chain: touch_slot validate -> z_order walk -> surface_row_dims_
     # get -> per-touch state latch -> ring enqueue -> emit).
     # ------------------------------------------------------------------
-    "touch route ready [legacy: TOUCH ROUTE READY]":
-        "R113.M3-014 (#2394): touch-route delivery fingerprint; "
-        "touch_event_down / touch_event_move / touch_event_up / "
-        "touch_event_cancel emit via klog_s1_x1 with sid=<target> "
-        "KV on every successful ring-enqueue.  Unreachable in the "
-        "default 14-mode QEMU matrix -- no live caller wires the "
-        "touch_event_* leaves yet (blocked on the T14 G4 touchscreen "
-        "HID handler + xHCI MSI-X routing, same blocker as the "
-        "ptr route / focus / z order / hid kbd attach siblings above). "
-        " Assertable when the R113.M3 touch-dispatcher landing or a "
-        "boot witness drives a touch_event_* leaf against a live "
-        "surface slot end-to-end.",
+    # (touch route ready entry retired 2026-09-08: same reason — READY
+    # tag not scanned.  Deferred-witness rationale in touch_route.pdx.)
 
     # ------------------------------------------------------------------
     # R113.M3-015 (paideia-os #2395): modifier-state tracker
