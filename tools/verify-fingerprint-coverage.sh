@@ -218,6 +218,87 @@ ALLOWLIST = {
         "boot_r111_uefi_bridge (same follow-up target as the sibling "
         "UEFI BRIDGE OK entry above).",
 
+    # src/kernel/core/klog/keys.pdx tag_msix_ir_table_ok — R111.M2-007
+    # (paideia-os #2359). MSI-X + VT-d IR bring-up fingerprint emitted
+    # from src/kernel/core/iommu/msix_ir_bringup.pdx §msix_ir_bringup_all
+    # once vtd_ir_init has allocated the IRT, programmed IRTA_REG, and
+    # driven the SIRTP + IRE ceremony on the first DRHD. Fires only when
+    # the platform's ACPI DMAR is present + checksum-valid AND at least
+    # one DRHD is populated AND vtd_ir_init succeeds. On QEMU-TCG
+    # -machine q35 (the 14-mode default matrix) the platform publishes
+    # no DMAR — has_dmar stays 0 and the bring-up lands on the sibling
+    # `MSIX IR OFF` fingerprint (asserted by the R111 golden) instead.
+    # Assertable when a T14 G4 real-HW smoke mode lands (per
+    # design/roadmap/t14-bootable-usb-wave.md §4.B); until then this
+    # allowlist entry gates a live-verified production tag whose only
+    # reachable path requires actual VT-d silicon.
+    "MSIX IR TABLE OK":
+        "R111.M2-007 (#2359): MSI-X + VT-d IR bring-up success; requires "
+        "real VT-d silicon (T14 G4 / Raptor Lake). QEMU-TCG -machine q35 "
+        "publishes no DMAR so has_dmar==0 and bring-up lands on `MSIX IR "
+        "OFF` instead. Assertable when the R111.M2 T14 G4 smoke lands.",
+
+    # src/kernel/core/klog/keys.pdx tag_msix_vec_ok — R111.M2-007
+    # (paideia-os #2359). Per-vector MSI-X programming fingerprint
+    # emitted from src/kernel/core/iommu/msix_ir_bringup.pdx §msix_ir_
+    # program_device once per programmed table entry, carrying KVs
+    # { bdf, vec, addr, irt }. Reachable only when a driver-attach
+    # callsite invokes msix_ir_program_device on a real MSI-X-capable
+    # PCI function — no default-matrix driver does this yet (e1000e's
+    # own R91.M2 activation body programs its 5 vectors internally
+    # via a legacy code path that predates R111.M2's shared bring-up
+    # substrate; the R111.M4 driver-migration wave will retire that
+    # path to route through msix_ir_program_device, at which point
+    # this line fires per active NIC vector on every boot with
+    # -device e1000e / virtio-net-pci). Assertable then; today no
+    # golden pins the string because no code path reaches it.
+    "MSIX VEC OK":
+        "R111.M2-007 (#2359): per-vector MSI-X programming fingerprint; "
+        "no default-matrix driver-attach site invokes msix_ir_program_"
+        "device yet (drivers still use their own R91-era MSI-X paths). "
+        "Assertable when R111.M4 migrates driver-attach to the shared "
+        "bring-up substrate.",
+
+    # src/kernel/core/klog/keys.pdx tag_acpi_rsdp_handoff_ok — R111.M1-004
+    # (paideia-os #2356). ACPI RSDP handoff fingerprint emitted by
+    # src/kernel/acpi/phase1_info.pdx §phase1_emit_rsdp_fingerprint,
+    # called from kernel_main_64 immediately after phase1_acpi_gather
+    # returns. Renders "ACPI RSDP HANDOFF OK pa=0x<pa> xsdt=<n>" as
+    # part 1 of the two-line R20 witness "ACPI RSDP @0x<pa> XSDT[<n>]
+    # MADT MCFG FADT HPET" seeded from the real firmware handoff
+    # (boot_env_t.rsdp_pa @ +48) rather than the synth-witness fixture
+    # at tests/kernel/acpi/rsdp_synth.pdx (whose "ACPI RSDP OK" marker
+    # is asserted at tests/r17/shell-shutdown.golden:25). Fires on
+    # EVERY boot (PVH -kernel path with pa=0x0, UEFI path with the
+    # authoritative firmware pa) so the fingerprint IS reachable in
+    # the default matrix — assertable in a boot golden without a new
+    # smoke mode. Allowlisted here because R111.M1-004's scope is the
+    # code emit; the boot-golden update that pins the exact wire line
+    # (level+timestamp+cpu prefix + tag + KVs) is a separate landing
+    # (targeted at the same R111.M2 OVMF-smoke-mode window that
+    # retires UEFI BRIDGE OK / UEFI PML4 OK above, plus a companion
+    # -kernel-mode assertion since this marker fires on both paths).
+    "ACPI RSDP HANDOFF OK":
+        "R111.M1-004 (#2356): ACPI RSDP handoff fingerprint (Line 1 of "
+        "the R20 witness seeded from boot_env_t.rsdp_pa). Fires on every "
+        "boot from kernel_main_64 post-phase1_acpi_gather; assertable in "
+        "an existing boot golden. Golden-wiring deferred to the R111.M2 "
+        "OVMF-smoke-mode landing (same target as UEFI BRIDGE OK).",
+
+    # src/kernel/core/klog/keys.pdx tag_acpi_tables_summary_ok —
+    # R111.M1-004 (paideia-os #2356). Line 2 of the R20 witness,
+    # rendering "ACPI TABLES SUMMARY OK madt=<0|1> mcfg=<0|1>
+    # fadt=<0|1> hpet=<0|1>" from _phase1_acpi_info's has_* u8 slots
+    # + _madt_lapic_base. Same reachability posture as its sibling
+    # ACPI RSDP HANDOFF OK — fires on every boot from kernel_main_64
+    # post-phase1_acpi_gather. Same golden-wiring plan.
+    "ACPI TABLES SUMMARY OK":
+        "R111.M1-004 (#2356): ACPI tables presence fingerprint (Line 2 "
+        "of the R20 witness). Fires on every boot from kernel_main_64 "
+        "post-phase1_acpi_gather; assertable in an existing boot golden. "
+        "Golden-wiring deferred to the R111.M2 OVMF-smoke-mode landing "
+        "(same target as UEFI BRIDGE OK).",
+
     # -- Section B: synth-witness markers under tests/**, each emitted
     #    only by an opt-in mode or a real-hardware smoke that the default
     #    matrix never runs. Verified against a full default-matrix boot
