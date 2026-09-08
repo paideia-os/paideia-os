@@ -1,0 +1,580 @@
+// src/kernel/core/cpu/microcode.pdx — R111.M6-019 (paideia-os #2371)
+//
+// Intel microcode WRMSR update path (SDM Vol 3A §9.11).
+//
+// Round: R111 — T14 G4 bring-up wave
+// Milestone: R111.M6-019 (standalone WRMSR primitive)
+// Encoder floor: paideia-as v0.36+
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// This file implements the STANDALONE WRMSR path.  It provides two
+// primitives:
+//
+//   microcode_apply_this_cpu(data_pa) -> u64
+//     The core Intel-microcode-update sequence per SDM Vol 3A §9.11.7.
+//     Runs on the calling CPU; emits one fingerprint per invocation
+//     (either MICROCODE APPLY OK or MICROCODE APPLY SKIP).  Callable
+//     from a future IPI handler so APs perform the identical sequence.
+//
+//   microcode_load_and_apply(blob_pa, blob_size) -> u64
+//     BSP-facing entry.  Validates the microcode blob header per SDM
+//     §9.11.1, checks the CPUID(1) processor-signature match against
+//     the header's processor_signature field, and if the blob is
+//     compatible with this CPU, delegates to microcode_apply_this_cpu.
+//     Otherwise emits MICROCODE APPLY SKIP with a diagnostic reason
+//     code and returns 0.
+//
+//   microcode_broadcast_to_aps(data_pa) -> u64
+//     Iterates the AP cpu_idx range and emits MICROCODE APPLY SKIP
+//     cpu=<n> reason=AP_IPI_DEFERRED for each AP as a visible witness
+//     that AP-side apply is not yet wired.  Real IPI dispatch to a
+//     new vector whose handler runs microcode_apply_this_cpu on the
+//     AP lands in R111.M6-024 (blob bundling + ESP loader wire).
+//
+// The bundling / ESP loader path (fetching a real Intel microcode
+// blob out of /paideia/firmware/microcode/<sig>.bin) lands in
+// R111.M6-020..M6-022.  The real cross-CPU IPI apply lands in
+// R111.M6-024.  For this milestone the primitives are exposed as
+// callable but not wired into kernel_main.pdx — the R111.M6-024
+// wire is what triggers the fingerprint on real boots.
+//
+// =============================================================================
+// INTEL SDM Vol 3A §9.11.1 MICROCODE UPDATE HEADER LAYOUT (48 bytes)
+// =============================================================================
+//
+//   Offset  Type  Name                    Notes
+//   +0      u32   header_version          Must be 0x00000001 (v1)
+//   +4      u32   update_revision         Informational revision
+//   +8      u32   date                    BCD YYYYMMDD
+//   +12     u32   processor_signature     Match against CPUID(1) EAX
+//   +16     u32   processor_flags         Bitmap; matched against
+//                                         MSR 0x17 [50:52] platform ID
+//   +20     u32   checksum                u32 sum of update = 0
+//   +24     u32   loader_version          Must be 0x00000001 (v1)
+//   +28     u32   reserved_or_flags_mask  Reserved in v1 headers; some
+//                                         extended layouts define
+//                                         processor_flags_mask here.
+//   +32     u32   data_size               Bytes of update data; 0 => 2000
+//   +36     u32   total_size              Total bytes of blob (header +
+//                                         data + optional extended sig
+//                                         table); 0 => 2048
+//   +40     u32   reserved[0]
+//   +44     u32   reserved[1]
+//   +48     ..    <update data begins here>
+//
+// Note on platform_flags:  For MVP we do NOT enforce the MSR 0x17
+// platform-ID match — the CPUID(1) signature check is the primary
+// selector.  A future refinement (M6-022 or later) can gate on
+//     (header.processor_flags & (1 << MSR_0x17[52:50])) != 0
+// with an additional skip reason.
+//
+// Note on WRMSR argument:  Intel SDM says the value written to
+// IA32_BIOS_UPDT_TRIG (MSR 0x79) is the LINEAR ADDRESS of the update
+// (i.e. the start of the header, not of the data region).  On the
+// PaideiaOS boot path the low 4 GiB are identity-mapped as 1 GiB huge
+// pages under both PVH and UEFI boot, so a PA in that range is also a
+// valid linear address; we pass blob_pa directly.
+//
+// =============================================================================
+// FINGERPRINTS
+// =============================================================================
+//
+//   OK   arm : `MICROCODE APPLY OK cpu=<dec> old_rev=0x<hex> new_rev=0x<hex>`
+//              via klog_s1_d1_x2 (k_cpu decimal, k_old_rev + k_new_rev hex).
+//              OK-token carrying; requires allowlist entry (added at
+//              this landing under the same "wire-deferred" posture as
+//              NVME ATTACH OK / MSIX IR TABLE OK) because M6-024 has
+//              not yet wired a call site.
+//
+//   SKIP arm : `MICROCODE APPLY SKIP cpu=<dec> reason=<dec>`
+//              via klog_s1_d2 (both KVs decimal).  Carries no OK token
+//              so verify-fingerprint-coverage.sh's OK_TOK regex ignores
+//              it (matches the ROOTFS MOUNT NONE precedent).
+//
+// Skip reason codes (kept as pub let so a downstream diagnostic tool
+// can decode them uniformly):
+//
+//   1 = MICROCODE_SKIP_NULL_BLOB          blob_pa == 0
+//   2 = MICROCODE_SKIP_BAD_HEADER_VER     header_version != 1
+//   3 = MICROCODE_SKIP_BAD_LOADER_VER     loader_version  != 1
+//   4 = MICROCODE_SKIP_SIG_MISMATCH       CPUID(1) EAX != header sig
+//   5 = MICROCODE_SKIP_PLATFORM_MISMATCH  (reserved for M6-022 MSR 0x17 gate)
+//   6 = MICROCODE_SKIP_SIZE_OVERFLOW      total_size > blob_size
+//   7 = MICROCODE_SKIP_APPLY_FAILED       WRMSR completed but RDMSR
+//                                         IA32_BIOS_SIGN_ID EDX == 0
+//   8 = MICROCODE_SKIP_AP_IPI_DEFERRED    AP branch, M6-024 not landed
+//
+// =============================================================================
+// REGISTER + ALIGNMENT LEDGER (both entry points)
+// =============================================================================
+//
+// Every entry point saves { r12, r13, r14, r15 } (SysV callee-save)
+// on entry — 4 pushes.  Entry rsp % 16 == 8; after the 4 pushes
+// rsp % 16 == 8 (unchanged; 4 pushes preserves parity).  Every nested
+// call is bracketed by an explicit `sub rsp, 8` / `add rsp, 8` pad
+// EXCEPT the klog wrapper calls whose caller-side arg pushes already
+// consume the pad — see per-call notes in the bodies.  The 4-push
+// prologue is uniform even though r15 is not always used, so the
+// epilogue is a fixed 4-pop sequence and the alignment ledger holds
+// regardless of which arm was taken.
+//
+// Callee-save discipline for cpuid: paideia-as's `cpuid` mnemonic
+// clobbers RAX/RBX/RCX/RDX per the architectural contract.  We avoid
+// holding a live value in RBX across a `cpuid`; blob_pa lives in R12
+// (not RBX) precisely because R12 is preserved through cpuid, and
+// RBX is not touched by these bodies.
+//
+// =============================================================================
+// ENCODER PITFALLS OBSERVED (per issue #2371)
+// =============================================================================
+//
+//   * No `test rN, rN` — every zero-check is `cmp rN, 0`.
+//   * No 2-op `imul r, imm` — this file does no multiplication.
+//   * No `and reg, imm64` — every 32-bit mask stages through the
+//     32-bit-load zero-extension (`mov r14d, [mem]` and friends)
+//     rather than a `and rN, 0xFFFFFFFF` immediate.
+//   * No `cmp reg, [mem]` — every memory read lands in RAX first.
+//   * u32 loads use `mov <32-bit alias>, [mem]` (r14d / eax / ecx)
+//     which zero-extends into the 64-bit register per SDM Vol 2A §3.4.1.1,
+//     matching the tlb_shootdown.pdx L138 / sched/wake_block.pdx L147
+//     precedent.
+//
+// =============================================================================
+// LABEL DISCIPLINE
+// =============================================================================
+//
+// Local labels prefixed `mcu_` for microcode-load/apply and
+// `mcuap_` for microcode_apply_this_cpu / `mcub_` for the AP
+// broadcast stub.  Grep audit 2026-09-07: none of these prefixes
+// hit anywhere else in src/kernel/.
+
+module Microcode = structure {
+
+  // ==========================================================================
+  // Public MSR / feature constants
+  // ==========================================================================
+
+  pub let IA32_BIOS_UPDT_TRIG           : u64 = 0x79
+  pub let IA32_BIOS_SIGN_ID             : u64 = 0x8B
+  pub let IA32_PLATFORM_ID              : u64 = 0x17
+
+  pub let MICROCODE_HDR_SIZE            : u64 = 48
+  pub let MICROCODE_DEFAULT_TOTAL_SIZE  : u64 = 2048
+  pub let MICROCODE_DEFAULT_DATA_SIZE   : u64 = 2000
+  pub let MICROCODE_HEADER_VER_1        : u64 = 1
+  pub let MICROCODE_LOADER_VER_1        : u64 = 1
+
+  // Header field offsets (SDM Vol 3A §9.11.1)
+  pub let MCU_OFF_HEADER_VER    : u64 = 0
+  pub let MCU_OFF_UPDATE_REV    : u64 = 4
+  pub let MCU_OFF_DATE          : u64 = 8
+  pub let MCU_OFF_PROC_SIG      : u64 = 12
+  pub let MCU_OFF_PROC_FLAGS    : u64 = 16
+  pub let MCU_OFF_CHECKSUM      : u64 = 20
+  pub let MCU_OFF_LOADER_VER    : u64 = 24
+  pub let MCU_OFF_DATA_SIZE     : u64 = 32
+  pub let MCU_OFF_TOTAL_SIZE    : u64 = 36
+
+  // Skip reason codes — see file header for narrative.
+  pub let MICROCODE_SKIP_NULL_BLOB          : u64 = 1
+  pub let MICROCODE_SKIP_BAD_HEADER_VER     : u64 = 2
+  pub let MICROCODE_SKIP_BAD_LOADER_VER     : u64 = 3
+  pub let MICROCODE_SKIP_SIG_MISMATCH       : u64 = 4
+  pub let MICROCODE_SKIP_PLATFORM_MISMATCH  : u64 = 5
+  pub let MICROCODE_SKIP_SIZE_OVERFLOW      : u64 = 6
+  pub let MICROCODE_SKIP_APPLY_FAILED       : u64 = 7
+  pub let MICROCODE_SKIP_AP_IPI_DEFERRED    : u64 = 8
+
+  // ==========================================================================
+  // Fingerprint tags
+  //
+  // OK tag: "MICROCODE APPLY OK\0"     — 18 chars + NUL = 19 bytes.
+  //         Carries the OK fingerprint token; verify-fingerprint-coverage.sh
+  //         requires the sibling allowlist entry in tools/verify-fingerprint-
+  //         coverage.sh (added at this landing under the wire-deferred
+  //         posture — no call site until R111.M6-024).
+  // SKIP tag: "MICROCODE APPLY SKIP\0" — 20 chars + NUL = 21 bytes.
+  //         No OK token → invisible to the coverage extractor.
+  // ==========================================================================
+
+  pub let tag_microcode_apply_ok   : [u8; 19] = "MICROCODE APPLY OK\0"
+  pub let tag_microcode_apply_skip : [u8; 21] = "MICROCODE APPLY SKIP\0"
+
+  // ==========================================================================
+  // microcode_apply_this_cpu(data_pa: u64) -> u64
+  // ==========================================================================
+  //
+  // Runs the Intel SDM Vol 3A §9.11.7 microcode-apply sequence on the
+  // CALLING CPU.  RDI = linear address of the update (i.e. the start
+  // of the microcode blob including its 48-byte header — see the file-
+  // header WRMSR note for why we pass blob-start rather than
+  // blob+48).  Emits exactly one fingerprint (OK or SKIP) and returns
+  // the post-apply revision (0 on failure, non-zero on success).
+  //
+  // Sequence per SDM Vol 3A §9.11.7 Loading Microcode Updates:
+  //   (a) WRMSR(IA32_BIOS_SIGN_ID, 0)          — clear cached rev
+  //   (b) CPUID(1)                              — force rev re-read
+  //   (c) RDMSR(IA32_BIOS_SIGN_ID); EDX = old   — pre-apply rev
+  //   (d) WRMSR(IA32_BIOS_UPDT_TRIG, data_pa)   — trigger apply
+  //   (e) WRMSR(IA32_BIOS_SIGN_ID, 0)           — re-clear cached rev
+  //   (f) CPUID(1)                              — force rev re-read
+  //   (g) RDMSR(IA32_BIOS_SIGN_ID); EDX = new   — post-apply rev
+  //   (h) If EDX (new_rev) == 0 → SKIP reason=APPLY_FAILED; else OK.
+  //
+  // The task acceptance criterion "Read back MSR 0x8B upper 32 bits —
+  // if 0, load failed" is enforced at step (h).  On real Intel silicon
+  // a successful load leaves EDX equal to the update's revision
+  // number; a rejected load (bad signature, checksum, or downgrade
+  // attempt) leaves EDX == 0 per SDM §9.11.7.
+  //
+  // Register plan:
+  //   r12 = data_pa (arg, preserved across cpuid — RBX would not be)
+  //   r13 = old_rev (from step c EDX)
+  //   r14 = new_rev (from step g EDX)
+  //   r15 = cpu_idx (from gs_base_read_cpu_idx)
+  //
+  // 4 callee-save pushes; rsp % 16 stays at 8 across the body.  Each
+  // nested call is padded (`sub rsp, 8` / `add rsp, 8`) or has caller
+  // arg pushes that reach alignment (see per-call notes).
+  //
+  // ==========================================================================
+  pub let microcode_apply_this_cpu : (u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (data_pa: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R111.M6-019 (paideia-os #2371): standalone WRMSR-path microcode-apply primitive per Intel SDM Vol 3A §9.11.7. RDI = linear address of the full microcode blob (header + data). Body runs the 7-step Intel sequence: clear IA32_BIOS_SIGN_ID (wrmsr with edx:eax=0, rcx=0x8B), cpuid(1) to force revision cache re-fetch, rdmsr(0x8B) reading EDX = pre-apply revision (stashed in r13), wrmsr(IA32_BIOS_UPDT_TRIG=0x79) with data_pa split into edx:eax to trigger the update, re-clear IA32_BIOS_SIGN_ID, cpuid(1) again, rdmsr(0x8B) reading EDX = post-apply revision (stashed in r14). If EDX == 0 the update was rejected -> SKIP reason=7 (APPLY_FAILED); else -> OK with cpu/old/new revs. Register plan: r12=data_pa (chosen over rbx because cpuid clobbers rbx per SDM Vol 2A CPUID; r12 is callee-save AND cpuid-safe), r13=old_rev, r14=new_rev, r15=cpu_idx (from gs_base_read_cpu_idx). Alignment: entry rsp%16==8, 4 callee-save pushes leave rsp%16==8, each nested call is padded. OK-arm caller pushes (v2=new_rev, k3=&k_new_rev, v1=old_rev in reverse order for klog_s1_d1_x2's 7th/8th/9th arg convention) add 24 bytes reaching rsp%16==0 pre-call. SKIP-arm single arg push (reason) adds 8 reaching rsp%16==0. gs_base_read_cpu_idx wrapped in sub rsp,8 / add rsp,8 alignment. Encoder: cpuid (0F A2), rdmsr (0F 32), wrmsr (0F 30), mov r64,imm32/64, mov (rip-rel mem load / reg-plus-disp mem load), xor r64,r64, shr r64,imm, cmp r64,imm8, je / jne / jmp / call / ret, lea r64,[rip+sym] — all pre-existing in paideia-as v0.36+. No test rN,rN (all zero-checks are cmp reg,0), no 2-op imul r,imm (no multiplication), no and reg,imm64 (no masking), no cmp reg,[mem] (every mem read staged through rax first). Labels prefixed mcuap_ (grep audit 2026-09-07: no mcuap_ elsewhere in src/kernel/).",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                            // r12 = data_pa
+
+        // ----- (a) Clear IA32_BIOS_SIGN_ID -----
+        xor rax, rax;
+        xor rdx, rdx;
+        mov rcx, 0x8B;
+        wrmsr;
+
+        // ----- (b) CPUID(1) — force revision re-cache -----
+        mov rax, 1;
+        xor rcx, rcx;
+        cpuid;
+
+        // ----- (c) RDMSR(IA32_BIOS_SIGN_ID) -> old_rev = EDX -----
+        mov rcx, 0x8B;
+        rdmsr;
+        mov r13, rdx;                            // r13 = old_rev (u32 in low 32)
+
+        // ----- (d) WRMSR(IA32_BIOS_UPDT_TRIG, data_pa) -----
+        // Split data_pa across EDX:EAX per SDM Vol 2C §5.2.10.
+        mov rax, r12;                            // eax = low 32 of data_pa
+        mov rdx, r12;
+        shr rdx, 32;                             // edx = high 32 of data_pa
+        mov rcx, 0x79;
+        wrmsr;
+
+        // ----- (e) Re-clear IA32_BIOS_SIGN_ID -----
+        xor rax, rax;
+        xor rdx, rdx;
+        mov rcx, 0x8B;
+        wrmsr;
+
+        // ----- (f) CPUID(1) again -----
+        mov rax, 1;
+        xor rcx, rcx;
+        cpuid;
+
+        // ----- (g) RDMSR(IA32_BIOS_SIGN_ID) -> new_rev = EDX -----
+        mov rcx, 0x8B;
+        rdmsr;
+        mov r14, rdx;                            // r14 = new_rev
+
+        // Fetch cpu_idx for the fingerprint.  Padded call.
+        sub rsp, 8;
+        call gs_base_read_cpu_idx;
+        add rsp, 8;
+        mov r15, rax;                            // r15 = cpu_idx
+
+        // ----- (h) Emit fingerprint based on new_rev -----
+        cmp r14, 0;
+        je mcuap_skip;
+
+        // OK arm: klog_s1_d1_x2(LEVEL_INFO=3, SUBSYS_BOOT,
+        //   tag_microcode_apply_ok, k_cpu, r15, k_old_rev,
+        //   [rsp+8]=old_rev, [rsp+16]=&k_new_rev, [rsp+24]=new_rev)
+        //
+        // Push order (reverse offset): v3 first, then k3, then v2.
+        // After 3 pushes rsp%16 == 8-24 == 0 mod 16.
+        push r14;                                // [rsp+24] = new_rev
+        lea rax, [rip + k_new_rev];
+        push rax;                                // [rsp+16] = &k_new_rev
+        push r13;                                // [rsp+8]  = old_rev
+
+        mov rdi, 3;                              // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + tag_microcode_apply_ok];
+        lea rcx, [rip + k_cpu];                  // k1 dec
+        mov r8, r15;                             // v1 = cpu_idx
+        lea r9, [rip + k_old_rev];               // k2 hex
+        call klog_s1_d1_x2;
+        add rsp, 24;
+
+        mov rax, r14;                            // return new_rev
+        jmp mcuap_done;
+
+      mcuap_skip:
+        // SKIP arm: klog_s1_d2(LEVEL_INFO=3, SUBSYS_BOOT,
+        //   tag_microcode_apply_skip, k_cpu, r15, k_reason, [rsp+8]=7)
+        mov rax, 7;                              // MICROCODE_SKIP_APPLY_FAILED
+        push rax;                                // [rsp+8] = reason
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + tag_microcode_apply_skip];
+        lea rcx, [rip + k_cpu];
+        mov r8, r15;
+        lea r9, [rip + k_reason];
+        call klog_s1_d2;
+        add rsp, 8;
+
+        xor rax, rax;                            // return 0 on skip
+
+      mcuap_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // microcode_load_and_apply(blob_pa: u64, blob_size: u64) -> u64
+  // ==========================================================================
+  //
+  // BSP entry point.  Reads and validates the 48-byte Intel microcode
+  // header at blob_pa per SDM Vol 3A §9.11.1, checks the CPUID(1)
+  // processor-signature match, and if the blob is compatible with the
+  // running CPU, delegates to microcode_apply_this_cpu.  Emits one of
+  // { MICROCODE APPLY OK, MICROCODE APPLY SKIP } fingerprints; returns
+  // the post-apply revision on success or 0 on skip.
+  //
+  // Gate order (fails at first failed predicate; single fingerprint):
+  //   (1) blob_pa != 0                              else reason=1
+  //   (2) header_version == 1                       else reason=2
+  //   (3) loader_version  == 1                      else reason=3
+  //   (4) header.processor_signature == CPUID(1) EAX  else reason=4
+  //   (5) total_size (or default 2048) <= blob_size else reason=6
+  //   (6) apply via microcode_apply_this_cpu
+  //
+  // Register plan:
+  //   r12 = blob_pa  (preserved across cpuid; RBX would not be)
+  //   r13 = blob_size (also reused as skip-reason accumulator on
+  //                    the SKIP path — after we've stopped needing
+  //                    the size)
+  //   r14 = u32 scratch for header fields extracted via 32-bit loads
+  //   r15 = cpu_idx (on the SKIP path only)
+  //
+  // Alignment ledger: entry rsp%16==8; 4 pushes -> rsp%16==8; every
+  // nested call padded (sub rsp,8 / add rsp,8) or reaches alignment
+  // via caller arg pushes (see per-call notes).
+  //
+  // ==========================================================================
+  pub let microcode_load_and_apply : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (blob_pa: u64) (blob_size: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R111.M6-019 (paideia-os #2371): BSP-facing microcode load-and-apply orchestrator. Parses the 48-byte Intel SDM Vol 3A §9.11.1 header at RDI (blob_pa), validates header_version @ +0 == 1, loader_version @ +24 == 1, and processor_signature @ +12 == CPUID(1) EAX (family+model+stepping); if all gates pass and total_size @ +36 (or default 2048) <= blob_size (RSI), delegates to microcode_apply_this_cpu with blob_pa as the linear address (SDM §9.11.6 argument is start-of-header, not start-of-data — kernel identity map for low 4GiB makes PA and VA equivalent for boot-time initrd staging under both PVH and UEFI). Emits MICROCODE APPLY SKIP cpu=<n> reason=<code> on any predicate failure via klog_s1_d2; on the HIT arm microcode_apply_this_cpu emits its own OK/SKIP line and we simply propagate its return. Skip reason encoding: 1=NULL_BLOB, 2=BAD_HEADER_VER, 3=BAD_LOADER_VER, 4=SIG_MISMATCH, 6=SIZE_OVERFLOW (5 reserved for MSR 0x17 platform-flags gate landing in M6-022, 7 owned by microcode_apply_this_cpu). Register plan: r12=blob_pa (chosen over rbx because cpuid at gate 4 clobbers rbx per SDM; r12 is cpuid-safe), r13=blob_size then reused as reason on the SKIP arm (last blob_size use is the SIZE_OVERFLOW check at gate 5), r14=32-bit-load scratch reading u32 header fields via `mov r14d, [r12 + N]` (zero-extends into r14 per SDM Vol 2A §3.4.1.1 -- matches tlb_shootdown.pdx L138 idiom, avoids the `and r64,imm64` encoder gap), r15=cpu_idx (SKIP arm only, from gs_base_read_cpu_idx). Alignment: entry rsp%16==8, 4 pushes keep rsp%16==8. Nested-call parity: cpuid is an instruction (no pad needed), microcode_apply_this_cpu on HIT wrapped in sub rsp,8/add rsp,8, gs_base_read_cpu_idx on SKIP wrapped in sub rsp,8/add rsp,8, klog_s1_d2 on SKIP takes 1 arg push which reaches rsp%16==0. Encoder posture per issue #2371 pitfall list: no test rN,rN (all zero-checks cmp rN,0), no 2-op imul r,imm (no multiplication anywhere), no and reg,imm64 (u32 loads use `mov r14d, [mem]` zero-extending idiom, and cpuid-EAX compare uses `mov rax, r14; cmp rax, rN` staged through rax), no cmp reg,[mem] (every mem read lands in a register first). Labels prefixed mcu_ (grep audit 2026-09-07: no mcu_ hits elsewhere in src/kernel/).",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                            // r12 = blob_pa
+        mov r13, rsi;                            // r13 = blob_size
+
+        // ----- Gate (1): blob_pa != 0 -----
+        cmp r12, 0;
+        jne mcu_check_header_ver;
+        mov r13, 1;                              // reason = NULL_BLOB
+        jmp mcu_emit_skip;
+
+      mcu_check_header_ver:
+        // ----- Gate (2): header_version @ +0 == 1 -----
+        // 32-bit load zero-extends into r14 (skips the `and r64,imm64` gap).
+        mov r14d, [r12 + 0];
+        cmp r14, 1;
+        je mcu_check_loader_ver;
+        mov r13, 2;                              // reason = BAD_HEADER_VER
+        jmp mcu_emit_skip;
+
+      mcu_check_loader_ver:
+        // ----- Gate (3): loader_version @ +24 == 1 -----
+        mov r14d, [r12 + 24];
+        cmp r14, 1;
+        je mcu_check_sig;
+        mov r13, 3;                              // reason = BAD_LOADER_VER
+        jmp mcu_emit_skip;
+
+      mcu_check_sig:
+        // ----- Gate (4): CPUID(1) EAX == header.processor_signature @ +12 -----
+        // Load header sig first (r14 = header sig, u32 zero-extended).
+        mov r14d, [r12 + 12];
+
+        // CPUID(1) — clobbers rax/rbx/rcx/rdx per SDM Vol 2A.
+        // r14/r15/r12/r13 are cpuid-safe (callee-save AND not touched
+        // by the cpuid architectural clobber set).
+        mov rax, 1;
+        xor rcx, rcx;
+        cpuid;
+        // Post-cpuid: RAX low 32 = family/model/stepping (with reserved
+        // bits in the middle). SDM Vol 2A CPUID leaf 1 EAX layout: bits
+        // 3:0 stepping, 7:4 model, 11:8 family, 13:12 processor type
+        // (reserved for AMD-compat), 19:16 extended model, 27:20
+        // extended family. Real Intel microcode-blob headers write the
+        // full 32-bit CPUID value verbatim, so a raw u32 == u32 compare
+        // is the correct match test (no bitmask arithmetic needed).
+        cmp rax, r14;
+        je mcu_check_size;
+        mov r13, 4;                              // reason = SIG_MISMATCH
+        jmp mcu_emit_skip;
+
+      mcu_check_size:
+        // ----- Gate (5): total_size (or default) <= blob_size -----
+        mov r14d, [r12 + 36];                    // total_size
+        cmp r14, 0;
+        jne mcu_check_size_bound;
+        mov r14, 2048;                           // MICROCODE_DEFAULT_TOTAL_SIZE
+
+      mcu_check_size_bound:
+        cmp r14, r13;                            // r14 = total_size, r13 = blob_size
+        jbe mcu_apply;
+        mov r13, 6;                              // reason = SIZE_OVERFLOW
+        jmp mcu_emit_skip;
+
+      mcu_apply:
+        // ----- All predicates passed -> apply on this (BSP) CPU. -----
+        mov rdi, r12;                            // blob_pa (WRMSR takes header start)
+        sub rsp, 8;
+        call microcode_apply_this_cpu;
+        add rsp, 8;
+        // microcode_apply_this_cpu emits its own OK/SKIP fingerprint;
+        // return its result verbatim (new_rev on success, 0 on failure).
+        jmp mcu_done;
+
+      mcu_emit_skip:
+        // ----- SKIP emit path: r13 = reason code -----
+        sub rsp, 8;
+        call gs_base_read_cpu_idx;               // rax = cpu_idx (SysV preserves r13)
+        add rsp, 8;
+        mov r15, rax;                            // r15 = cpu_idx
+
+        // klog_s1_d2(LEVEL_INFO=3, SUBSYS_BOOT, tag_microcode_apply_skip,
+        //            k_cpu, r15, k_reason, [rsp+8]=r13)
+        mov rax, r13;
+        push rax;                                // [rsp+8] = reason
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + tag_microcode_apply_skip];
+        lea rcx, [rip + k_cpu];
+        mov r8, r15;
+        lea r9, [rip + k_reason];
+        call klog_s1_d2;
+        add rsp, 8;
+
+        xor rax, rax;                            // return 0
+
+      mcu_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // microcode_broadcast_to_aps(data_pa: u64) -> u64
+  // ==========================================================================
+  //
+  // Deferred-wire AP broadcast stub.  Walks cpu_idx in [1, MAX_CPUS)
+  // and emits MICROCODE APPLY SKIP cpu=<n> reason=8 (AP_IPI_DEFERRED)
+  // for each AP as a visible witness that the standalone WRMSR path
+  // has landed but cross-CPU dispatch has not.
+  //
+  // R111.M6-024 replaces this body with:
+  //   (a) latch data_pa into a shared BSS slot readable by an
+  //       AP-side IPI handler,
+  //   (b) allocate an IPI vector via vector_pool_alloc,
+  //   (c) install the handler that calls microcode_apply_this_cpu
+  //       on the AP,
+  //   (d) lapic_send_ipi_broadcast_excl_self(<vec>) and poll the
+  //       per-AP completion flag written by the handler.
+  //
+  // For M6-019 this stub keeps the WRMSR path independently
+  // exercisable from the eventual bundling wire while documenting
+  // the cross-CPU intent on the fingerprint stream.  RDI is accepted
+  // and immediately dropped — it is the future data_pa the handler
+  // will consume.
+  //
+  // Register plan:
+  //   r12 = data_pa (retained across the loop even though unused, so
+  //                  the eventual M6-024 body can drop it into rdi
+  //                  before the IPI dispatch without re-loading).
+  //   r13 = loop counter (cpu_idx, iterating 1..MAX_CPUS=4).
+  //   r14 = scratch (reason value for the klog push).
+  //   r15 = unused (aligns the 4-push prologue with the two other
+  //                 entry points so the epilogue is identical).
+  //
+  // Alignment: 4 pushes -> rsp%16==8 body-wide; klog_s1_d2's 1 arg
+  // push reaches rsp%16==0 pre-call.
+  // ==========================================================================
+  pub let microcode_broadcast_to_aps : (u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (data_pa: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R111.M6-019 (paideia-os #2371): AP-broadcast stub for the standalone WRMSR path. RDI = data_pa (the linear address the eventual R111.M6-024 IPI handler will pass to microcode_apply_this_cpu on each AP). Body iterates cpu_idx in [1, MAX_CPUS=4) and emits MICROCODE APPLY SKIP cpu=<n> reason=8 (AP_IPI_DEFERRED) per AP via klog_s1_d2 -- the visible witness that cross-CPU dispatch is deferred to M6-024, so an operator reading the boot wire sees the AP set explicitly named with the deferral reason rather than a silent BSP-only apply. MAX_CPUS==4 is the R18.M1 ceiling (src/kernel/core/smp/percpu.pdx L81); cpu_idx==0 is the BSP and is excluded because microcode_load_and_apply already handled BSP directly via microcode_apply_this_cpu. Register plan: r12=data_pa (retained across the loop unchanged so M6-024's body can `mov rdi, r12` immediately before its `call lapic_send_ipi_broadcast_excl_self` without a re-load), r13=loop counter, r14=scratch for the reason immediate, r15=unused (padded prologue matches the sibling entry points so the epilogue is a fixed 4-pop). Alignment: 4 pushes leave rsp%16==8; klog_s1_d2's single 7th-arg push reaches rsp%16==0 pre-call. Return value always 0 (caller does not consume; fingerprint IS the assertable datum). Encoder posture per issue #2371: no test rN,rN, no 2-op imul r,imm (loop uses `add r13,1`), no and reg,imm64, no cmp reg,[mem]. Labels prefixed mcub_ (grep audit 2026-09-07: no mcub_ elsewhere in src/kernel/).",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                            // r12 = data_pa (retained for M6-024)
+        mov r13, 1;                              // cpu_idx = 1 (skip BSP)
+
+      mcub_loop:
+        cmp r13, 4;                              // MAX_CPUS (percpu.pdx L81)
+        jae mcub_done;
+
+        // klog_s1_d2(LEVEL_INFO=3, SUBSYS_BOOT, tag_microcode_apply_skip,
+        //            k_cpu, r13, k_reason, [rsp+8]=8)
+        mov r14, 8;                              // reason = AP_IPI_DEFERRED
+        push r14;                                // [rsp+8] = reason
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_BOOT];
+        lea rdx, [rip + tag_microcode_apply_skip];
+        lea rcx, [rip + k_cpu];
+        mov r8, r13;
+        lea r9, [rip + k_reason];
+        call klog_s1_d2;
+        add rsp, 8;
+
+        add r13, 1;
+        jmp mcub_loop;
+
+      mcub_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        xor rax, rax;                            // return 0
+        ret
+      }
+    }
+}

@@ -268,6 +268,24 @@ ALLOWLIST = {
         "NVME BOOT NONE arm because -kernel boot has no MCFG, so "
         "_nvme_device_count stays 0 even with -device nvme.",
 
+    # src/kernel/core/klog/keys.pdx tag_xhci_attach_ok —
+    # R111.M5-017 (paideia-os #2369).  xHCI real-HW controller-attach
+    # per-instance OK fingerprint. Wire line shape:
+    #     "XHCI ATTACH OK bdf=0x<hex> ports=<dec> mmio=0x<16hex>"
+    # Unreachable in every 14-mode QEMU matrix: under `-kernel` boot
+    # MCFG is absent so `_xhci_device_count` stays 0 even with
+    # `-device qemu-xhci` attached (same MCFG-absent path that keeps
+    # nvme_probe empty; see the NVME ATTACH OK sibling entry above);
+    # attach then takes the XHCI BOOT NONE arm (no OK token,
+    # correctly not gate-visible). Assertable when a real-HW T14 G4
+    # smoke wire lands (companion to the NVME real-HW smoke; T14 G4
+    # exposes both xHCI USB 3.x/2.0 controllers via the PCH USB block).
+    "XHCI ATTACH OK":
+        "Real-HW-only reachability (R111.M5-017 xHCI attach OK "
+        "fingerprint); the 14-mode QEMU matrix takes the sibling "
+        "XHCI BOOT NONE arm because -kernel boot has no MCFG, so "
+        "_xhci_device_count stays 0 even with -device qemu-xhci.",
+
     # src/kernel/boot/witness/rootfs_mount_witness.pdx tag_rootfs_mount_ok —
     # R111.M3-013 (paideia-os #2365).  ESP-embedded PdxFS-lite rootfs
     # blob witness fingerprint (OK arm) emitted from
@@ -300,6 +318,41 @@ ALLOWLIST = {
         "mode boots past ExitBootServices yet. Retires when R111.M2 "
         "opens boot_r111_uefi_bridge (same follow-up target as "
         "UEFI BRIDGE OK / UEFI PML4 OK / UEFI EBS OK).",
+
+    # src/kernel/core/cpu/microcode.pdx tag_microcode_apply_ok --
+    # R111.M6-019 (paideia-os #2371).  Intel-microcode WRMSR-path
+    # per-CPU apply-success fingerprint emitted from
+    # microcode_apply_this_cpu when the SDM Vol 3A §9.11.7 sequence
+    # (clear IA32_BIOS_SIGN_ID -> cpuid -> rdmsr for old_rev ->
+    # wrmsr IA32_BIOS_UPDT_TRIG=0x79 with the blob linear address ->
+    # clear -> cpuid -> rdmsr for new_rev) yields a non-zero
+    # post-apply revision.  Wire line shape:
+    #     "MICROCODE APPLY OK cpu=<dec> old_rev=0x<hex> new_rev=0x<hex>"
+    # The OK-bearing tag prefix is broken out as tag_microcode_apply_ok
+    # ("MICROCODE APPLY OK"); the trailing ` cpu=... old_rev=...
+    # new_rev=...` is appended by the klog_s1_d1_x2 KV loop and
+    # carries no OK token.  Unreachable in every 14-mode QEMU matrix
+    # because R111.M6-019 lands the standalone WRMSR primitives but
+    # does not wire a call site into kernel_main.pdx -- the real
+    # loader wire (loading a validated Intel microcode blob from
+    # /paideia/firmware/microcode/<sig>.bin) lands in R111.M6-020..
+    # M6-022 (blob bundling + ESP path), and the actual boot-time
+    # apply cascade lands in R111.M6-024.  Additionally, QEMU-TCG
+    # does not implement a functional microcode-apply path: even if
+    # a blob were passed, rdmsr(0x8B) EDX would return 0 (or the
+    # boot-time firmware-supplied revision unchanged), so the SKIP
+    # arm would fire.  Same wire-deferred posture as `NVME ATTACH
+    # OK` above; assertable when R111.M6-024 wires the boot cascade
+    # AND either a real T14 G4 smoke wire lands OR QEMU is upgraded
+    # to a full-fidelity microcode-apply simulation.
+    "MICROCODE APPLY OK":
+        "R111.M6-019 (#2371): standalone Intel-microcode WRMSR-path "
+        "apply fingerprint; wire-deferred (no boot-cascade call site "
+        "until R111.M6-024 lands the loader + IPI broadcast). "
+        "Additionally unreachable on QEMU-TCG (no functional "
+        "microcode-apply path -- rdmsr(0x8B) EDX stays 0 or "
+        "unchanged so the SKIP arm fires). Assertable when M6-024 "
+        "wires the boot cascade AND a real T14 G4 smoke lands.",
 
     # src/kernel/core/klog/keys.pdx tag_msix_ir_table_ok — R111.M2-007
     # (paideia-os #2359). MSI-X + VT-d IR bring-up fingerprint emitted
