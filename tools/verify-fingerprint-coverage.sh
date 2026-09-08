@@ -197,6 +197,27 @@ ALLOWLIST = {
         "via -kernel, and no OVMF smoke mode boots past ExitBootServices "
         "yet — assertable when R111.M2 opens boot_r111_uefi_bridge.",
 
+    # src/kernel/mm/bootstrap_pml4.pdx — R111.M1-003 (paideia-os #2355).
+    # Bootstrap PML4 install fingerprint emitted by
+    # uefi_bootstrap_pml4_install immediately after the `mov cr3, rax`
+    # that swaps in the PVH-shape PML4[0]-identity + PML4[256]-alias
+    # + PDPT[0..3]-1GiB-huge layout on the UEFI boot path (Phase 4d,
+    # between verify_self and the R111.M1-002 UEFI BRIDGE OK line).
+    # Same UEFI-only reachability posture as "UEFI BRIDGE OK" /
+    # "EFI SIGNATURE OK" above: the 14-mode -kernel matrix never takes
+    # the UEFI path, and the PAIDEIA_UEFI_OVMF opt-in fixture stops at
+    # the pre-EBS hello banner today.  Retires from this allowlist
+    # when R111.M2 opens an OVMF smoke mode that boots past
+    # ExitBootServices and asserts the install line against a live
+    # golden — same follow-up boot_r111_uefi_bridge target the
+    # "UEFI BRIDGE OK" sibling entry names.
+    "UEFI PML4 OK":
+        "UEFI-only path (R111.M1-003 bootstrap PML4 install); the "
+        "14-mode matrix boots via -kernel, and no OVMF smoke mode boots "
+        "past ExitBootServices yet — assertable when R111.M2 opens "
+        "boot_r111_uefi_bridge (same follow-up target as the sibling "
+        "UEFI BRIDGE OK entry above).",
+
     # -- Section B: synth-witness markers under tests/**, each emitted
     #    only by an opt-in mode or a real-hardware smoke that the default
     #    matrix never runs. Verified against a full default-matrix boot

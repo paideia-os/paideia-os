@@ -109,6 +109,21 @@ gdt32_ptr:
 _pml4_addr:
     .quad pml4
 
+# R111.M1-003 (paideia-os #2355): 64-bit absolute-address slot for boot PDPT.
+# Sibling of _pml4_addr immediately above. src/kernel/mm/bootstrap_pml4.pdx
+# (UefiBootstrapPml4 module) reads this slot to populate PML4[0]/PML4[256]
+# with the pdpt phys address on the UEFI boot path — the PVH path already
+# initialises the same pml4/pdpt pair in .code32 above (movl $pdpt, %eax; ...
+# movl %eax, pml4 + 0), where the low-32 VA reach lets it name pdpt directly.
+# Under UEFI the installer runs from higher-half .text via kernel_main_uefi
+# Phase 4d, so it cannot lea a low-VA symbol without an R_X86_64_64 slot to
+# bridge the VA gap — same rationale _pml4_addr was introduced under.
+# Linker emits R_X86_64_64 here → filled with runtime absolute VA of pdpt.
+.global _pdpt_addr
+.align 8
+_pdpt_addr:
+    .quad pdpt
+
 # R49.M2-001 (#1573): ASCII-art boot banner.
 # Emitted via uart_puts (RAW), never klog_s1 — the klog formatter prefixes
 # every line with "TSC|cpu|level|SUBSYS|", which would shred the art.
