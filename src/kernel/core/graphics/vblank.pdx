@@ -1,0 +1,501 @@
+// src/kernel/core/graphics/vblank.pdx -- R113.M4-021 (paideia-os #2401)
+//
+// VBlank sync: KIND_DISPLAY vblank event triggers a compositor pass and
+// per-surface present-fence notifications.  The kernel's vblank handler
+// is the piece that bridges "the display panel finished scanning out a
+// frame" with "the compositor's per-surface book-keeping (damage clear,
+// present-fence emit) must run now."  Every downstream renderer (Iris
+// Xe MSI-X vblank ISR at drivers/dpy/iris_xe_vblank_isr.pdx §L159, the
+// virtio-gpu queue-interrupt fallback at drivers/gfx/virtio_gpu/isr.pdx
+// §L108, and the LAPIC-tick simulated source at graphics/sim_vblank.pdx
+// §L71) publishes into KIND_DISPLAY_TIMELINE; this handler is the
+// consumer that finally acts on the tick.
+//
+// Umbrella: R113 (#2380); sibling to R113.M4-018 (scanout.pdx #2398)
+// which provides the direct-scanout fast path, R113.M4-019 (composite_
+// gpu.pdx #2399) which provides the GPU-native fallback blend
+// orchestrator, R113.M4-020 (composite_plan.pdx #2400) which provides
+// the damage-driven per-frame planner, and R113.M1-005 (surface_
+// present.pdx #2385) which provides the per-surface present-fence
+// notify body.  R113.M4-021 is the FRAME-KICKER on top of those
+// substrates -- the piece the KIND_DISPLAY IRQ path calls when the
+// display panel fires vblank.
+//
+// -----------------------------------------------------------------------------
+// SCOPE (per issue #2401)
+// -----------------------------------------------------------------------------
+//
+// Three entry points:
+//
+//   * vblank_init() -> ()
+//     Boot-time defensive re-scrub of _vblank_counter.  Zero-init at
+//     .bss so this is not strictly required; ordered alongside
+//     scanout_init in kernel_main.pdx for pattern uniformity with the
+//     graphics-state chain (kind_surface_init / z_order_init / focus_
+//     init / kbd_route_init / modifier_state_init / ptr_route_init /
+//     touch_route_init / keymap_init / scanout_init / vblank_init).  A
+//     chaos-restart witness re-scrub point.
+//
+//   * vblank_get_counter() -> u64
+//     Non-blocking read of _vblank_counter.  Exposes the monotonic
+//     vblank tick count to any caller that wants to correlate wall-
+//     clock work with the display's vsync cadence -- the natural first
+//     consumer is a wait-for-vblank primitive that samples the counter,
+//     yields, and re-samples to detect an advance.  Also drives the
+//     R104.M3-003 iris_xe_vblank_witness's future rewire from the raw
+//     KIND_DISPLAY_TIMELINE poll (still in use today for scaffold-
+//     honesty) to the substrate counter this landing publishes.
+//
+//   * vblank_handler(display_id) -> u64
+//     The frame-kicker itself.  Called by the KIND_DISPLAY IRQ path
+//     once per vblank tick per display.  Body:
+//       (1) validate display_id != 0 (0 aliases KIND_DISPLAY_TIMELINE
+//           mint refusal per iris_xe_vblank_isr.pdx §Section 2 note
+//           "output_id 1-based per KIND_DISPLAY_TIMELINE mint rule
+//           that refuses 0"; a display_id 0 would be a caller bug)
+//       (2) bump _vblank_counter monotonically
+//       (3) fire compositor pass:
+//             scanout_try_direct() first (the 1-surface / 1-plane /
+//             0-blend fast path per scanout.pdx §GATE ORDER); on
+//             SCANOUT_DIRECT_FALLBACK (0) fall through to
+//             composite_gpu_blend() (the M4-019 GPU-native fallback
+//             blend orchestrator per composite_gpu.pdx §SCOPE: prepares
+//             the batch stream into _composite_gpu_scratch, notes a
+//             submit-ring interaction via kgsub_note, emits COMPOSITE
+//             GPU OK).  composite_gpu_blend internally walks + clears
+//             per-surface damage via composite_prepare_blit_batch, so
+//             the per-frame damage-clear contract is preserved without
+//             this handler having to fire composite_plan separately.
+//             The physical KIND_GPU_SUBMIT wire that would push the
+//             prepared batches to the GPU submit ring is the R36
+//             atomic-commit landing (still open; same wire-deferred
+//             posture as the scanout / composite plan / composite gpu
+//             / z order raise siblings).
+//       (4) surface_present_notify per rendered surface:
+//             walk _z_stack index 0..z_depth-1 (bottom-up; the top-
+//             down direction that composite_plan uses is a rendering-
+//             order concern, not a notify-order concern -- Wayland's
+//             wl_surface.frame callbacks fire per surface with no
+//             per-frame ordering guarantee).  For each cur_slot:
+//               * read row_serial via surface_row_serial_get
+//               * skip if row_serial == SURFACE_BAD_SLOT (0xFFFFE110)
+//                 -- stale z-stack entry (destroy racing the handler)
+//               * skip if row_serial == 0 -- no commits yet (surface
+//                 minted + attached but never committed a frame;
+//                 surface_present_notify would return BAD_SERIAL, the
+//                 skip is a cleanliness optimisation not a correctness
+//                 requirement)
+//               * call surface_present_notify(cur_slot, row_serial);
+//                 ignore return (BAD_SLOT / BAD_SERIAL under a race
+//                 are silent failures at the handler level)
+//       (5) emit VBLANK TICK counter=<_vblank_counter> via klog_s1_x1
+//       (6) return VBLANK_OK
+//
+// -----------------------------------------------------------------------------
+// FINGERPRINT CADENCE + RING COST
+// -----------------------------------------------------------------------------
+//
+// Emit is unconditional per handler call (one fingerprint per vblank
+// tick).  At 60 Hz per display, one display = 60 lines/sec; three
+// displays = 180 lines/sec (the KIND_DISPLAY IRQ path calls this handler
+// once per (display_id, tick) tuple).  klog_s1_x1 has a 32-byte stack
+// frame + one klog_emit_core call; the ring cost is bounded to well
+// below the composite_plan.pdx §FINGERPRINT bound "~250 kB/s at 240 Hz"
+// and remains within saturation limits.
+//
+// If frame-rate tuning ever surfaces this as a hot path, a follow-on
+// splits the emit into (a) a per-tick unconditional bump of a stats
+// cell + (b) a rate-limited fingerprint emit (e.g. every 60th tick,
+// once/second).  For M4-021 the emit is unconditional because (a) no
+// live caller wires the handler yet (see allowlist entry below), and
+// (b) the "did vblank fire?" observability handle depends on the
+// per-tick emit.
+//
+// -----------------------------------------------------------------------------
+// DE-DUPLICATION OF surface_present_notify EMITS -- INTENTIONALLY OMITTED
+// -----------------------------------------------------------------------------
+//
+// A well-behaved vblank handler would call surface_present_notify only
+// when the surface's serial has actually advanced since the last notify
+// (otherwise every vblank fires SURFACE PRESENT OK for surfaces that
+// haven't committed, which is klog noise at 60+ Hz).  The natural
+// tracking shape is a per-slot _vblank_last_notified[SURFACE_ROW_MAX]
+// array; a notify fires only when row_serial != _vblank_last_notified[
+// slot], and the array is updated in the same step.
+//
+// M4-021 does NOT implement this today because a proper de-duplicator
+// needs a destroy hook so slot re-mint resets the entry -- a re-minted
+// slot's fresh serial (1..) would compare against the previous
+// surface's stale value (say, 5) and the "!=" check would spuriously
+// fire the notify at serial 1 while the ">" check would spuriously
+// suppress notify at serial 1..4.  Adding a destroy hook is out of
+// scope for M4-021 (the surface_destroy path in kind_surface.pdx §L923
+// touches only its own row header + stats; a scanout-side hook is a
+// wire-out).  Rather than land a subtly wrong de-duplicator, this
+// landing accepts the noise and defers de-duplication to the follow-on
+// that also lands the destroy hook.  Precedent: scanout_bind similarly
+// leaves _scanout_bound_sid / _scanout_bound_bo un-hooked on destroy
+// (scanout.pdx §STATE MACHINE / IDEMPOTENCY note).
+//
+// -----------------------------------------------------------------------------
+// FAILURE TAXONOMY -- 0xFFFFE260..0xFFFFE26F (fresh band)
+// -----------------------------------------------------------------------------
+//
+// Pre-landing sweep (2026-09-08):
+//
+//   $ grep -rn '0xFFFFE26' src design tools tests -> empty
+//
+// so 0xFFFFE260..0xFFFFE26F is fresh and uncontested.  Neighbouring
+// bands in the 0xFFFFE2XX page (from composite_plan.pdx §FAILURE
+// TAXONOMY + scanout.pdx §FAILURE TAXONOMY + a targeted repeat sweep):
+//
+//   0xFFFFE230..E23F  R113.M4-018 SCANOUT DIRECT
+//   0xFFFFE240..E24F  R113.M4-020 COMPOSITE PLAN
+//   0xFFFFE250..E25F  free
+//   0xFFFFE260..E26F  R113.M4-021 VBLANK           (THIS FILE)
+//   0xFFFFE270..E2FF  free
+//
+// Slot map:
+//
+//   0xFFFFE260  VBLANK_BAD_DISPLAY   display_id == 0.  A KIND_DISPLAY
+//                                    row_id is 1-based per iris_xe_
+//                                    vblank_isr.pdx §Section 2 note
+//                                    ("output_id = 1... 1-based per
+//                                    KIND_DISPLAY_TIMELINE mint rule
+//                                    that refuses 0"); the caller who
+//                                    passes 0 is asserting a display
+//                                    that cannot exist.  Rejected
+//                                    before the counter bump so a
+//                                    bogus caller does not perturb
+//                                    the monotonic tick count.
+//   0xFFFFE261..0xFFFFE26F           reserved for M4 follow-on
+//                                    (per-display counter split,
+//                                    missed-vblank taxonomy, panel-
+//                                    self-refresh gating, etc.)
+//
+// vblank_handler is the only entry point that can return a failure
+// sentinel; vblank_init and vblank_get_counter are infallible (leaf +
+// pure-read respectively).
+//
+// -----------------------------------------------------------------------------
+// FINGERPRINT (per issue #2401 §4)
+// -----------------------------------------------------------------------------
+//
+// Wire form (post-klog_s1_x1 KV append):
+//
+//   vblank tick [legacy: VBLANK TICK] counter=0x<hex>
+//
+// Byte counts hand-verified:
+//
+//   "vblank tick [legacy: VBLANK TICK]\0"    = 34 bytes
+//     ("vblank tick " = 12, "[legacy: VBLANK TICK]" = 21, "\0" = 1)
+//   "counter\0"                              = 8 bytes
+//
+// Emitter reachability: NO live caller in the M4-021 landing.  The
+// KIND_DISPLAY IRQ dispatcher that would drive vblank_handler is a
+// separate follow-on landing; the handler is staged here so that
+// landing is a single-call insert rather than a compositor-plus-
+// vblank-plus-notify joint drop.  A tools/verify-fingerprint-coverage
+// .sh allowlist entry mirrors the composite plan ok / scanout direct
+// ok / surface present ok siblings' "wire-deferred; assertable when
+// a boot witness or the R113.M4 IRQ dispatcher drives vblank_handler
+// end-to-end" posture (companion edit).
+//
+// -----------------------------------------------------------------------------
+// EXTERNAL SYMBOLS
+// -----------------------------------------------------------------------------
+//
+// This module references (bare symbols, kernel .pdx single global
+// namespace, same pattern as composite_plan.pdx / scanout.pdx):
+//
+//   * scanout_try_direct         (graphics/scanout.pdx)          -- fast-path gate
+//   * composite_gpu_blend        (graphics/composite_gpu.pdx)    -- fallback compositor
+//   * z_order_slot_at            (graphics/z_order.pdx)          -- surface walk
+//   * _z_stack_count             (graphics/z_order.pdx)          -- depth read
+//   * surface_row_serial_get     (cap/kind_surface.pdx)          -- per-surface serial
+//   * surface_present_notify     (graphics/surface_present.pdx)  -- present-fence emit
+//   * SUBSYS_CAP_                (klog/subsys.pdx)               -- klog subsys
+//   * klog_s1_x1                 (klog/wrappers.pdx)             -- 1-KV hex emit
+//
+// -----------------------------------------------------------------------------
+// ENCODER PITFALLS (per feedback_pdx_encoder_pitfalls v0.36+)
+// -----------------------------------------------------------------------------
+//
+//   * No `test rN, rN` -- every zero-check uses `cmp rN, 0` + `je/jne`.
+//   * No 2-op `imul r, imm` -- no scaled address math in this module.
+//   * No `and reg, imm64` -- no bit-mask work in this module.
+//   * No `cmp reg, [mem]` -- every mem compare loads to scratch first
+//     (`mov rax, [rip + _z_stack_count]; cmp r13, rax`).
+//   * No `mov qword [mem], imm64` -- immediates staged in a register
+//     first (movabs for full-width; xor r,r for zero).
+//   * Sentinel `0xFFFFE110` (bit 31 set) loaded via `mov r10,
+//     0xFFFFE110` -- established idiom in surface_present.pdx L242.
+//   * Failure sentinel `0xFFFFE260` (bit 31 set) loaded via `mov rax,
+//     0xFFFFE260` -- same idiom as scanout.pdx L517 / surface_present.
+//     pdx L280.
+//   * Multiline `pub let ="..."` refused by the encoder -- both string
+//     literals in this file live on one source line each.
+//   * Module name matches file basename: `VBlank` for `vblank.pdx`.
+//   * Fingerprint tag byte count asserted in the `[u8; N]` type
+//     ascription (34 for vblank_tick_msg, 8 for vblank_k_counter).
+//   * `[rip + sym]` and `lea reg, [rip + sym]` are the standing forms
+//     for global data access; every symbol reference is bare.
+//
+// -----------------------------------------------------------------------------
+// STACK ALIGNMENT (SysV: pre-CALL rsp%16 == 0 => callee entry rsp%16 == 8)
+// -----------------------------------------------------------------------------
+//
+//   * vblank_init:           leaf, no callee-save, no nested call.
+//                            Entry rsp%16=8 unchanged on return.
+//   * vblank_get_counter:    leaf, no callee-save, no nested call.
+//                            Pure read; entry rsp%16=8 unchanged.
+//   * vblank_handler:        1 rbp + 5 callee-save pushes (rbx/r12/
+//                            r13/r14/r15) + sub rsp, 8 = 56 bytes
+//                            below saved-rbp = %16=0 alignment for
+//                            every nested call (scanout_try_direct,
+//                            composite_gpu_blend, z_order_slot_at,
+//                            surface_row_serial_get, surface_present_
+//                            notify, klog_s1_x1) without further
+//                            padding.  All nested callees preserve
+//                            rbx/r12-r15/rbp per SysV so the loop
+//                            invariants survive across every emit.
+//
+// Verification: entry rsp%16=8; push rbp -> %16=0; +5 pushes (40B)
+// -> (0 - 40) mod 16 = 8; sub rsp, 8 -> (0 - 48) mod 16 = 0.  Every
+// CALL from body sees rsp%16=0 (SysV requirement).
+//
+// -----------------------------------------------------------------------------
+// LABEL PREFIXES
+// -----------------------------------------------------------------------------
+//
+//   vi_    vblank_init
+//   vgc_   vblank_get_counter
+//   vh_    vblank_handler
+//
+// All prefixes avoid the paideia-as reserved-keyword set
+// (feedback_paideia_as_reserved_labels: loop, if, let, while, for,
+// match, pub, mod, use, fn, struct, enum, impl, trait, type, where,
+// move, mut, ref).
+
+module VBlank = structure {
+
+  // ==========================================================================
+  // Failure taxonomy (0xFFFFE260..0xFFFFE26F).  See file header
+  // §FAILURE TAXONOMY.
+  // ==========================================================================
+
+  pub let VBLANK_OK             : u64 = 0
+  pub let VBLANK_BAD_DISPLAY    : u64 = 0xFFFFE260
+
+  // ==========================================================================
+  // State: monotonic vblank tick counter.  Zero-init at .bss; vblank_
+  // init defensively re-scrubs at boot.  Advances by 1 on every
+  // vblank_handler entry that passes the display_id gate.  Never
+  // decremented, never wrapped in a bounded window -- a 64-bit counter
+  // at 240 Hz would take ~2.4 billion years to wrap, which safely
+  // exceeds any realistic uptime.  Read via vblank_get_counter (public
+  // API); the KV in the VBLANK TICK fingerprint is the same value.
+  // ==========================================================================
+
+  pub let mut _vblank_counter   : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // Fingerprint tag (34 bytes) + counter KV key (8 bytes).  Byte
+  // counts hand-verified in the file header §FINGERPRINT.
+  // ==========================================================================
+
+  pub let vblank_tick_msg       : [u8; 34] = "vblank tick [legacy: VBLANK TICK]\0"
+  pub let vblank_k_counter      : [u8; 8]  = "counter\0"
+
+  // ==========================================================================
+  // vblank_init() -> ()
+  //
+  // Defensive re-scrub of _vblank_counter.  Zero-init at .bss makes
+  // this strictly redundant on a clean boot, but the chaos-restart
+  // witness reruns the boot cascade against a pre-populated .bss so
+  // the re-scrub is REQUIRED for restart correctness (same discipline
+  // scanout_init / touch_route_init / keymap_init hold to).  Called
+  // from kernel_main.pdx boot cascade alongside scanout_init.  Zero-
+  // arg leaf; touches only rax, r10.  Entry rsp%16=8 unchanged on
+  // return.  Labels prefixed vi_.
+  // ==========================================================================
+
+  pub let vblank_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M4-021 (#2401): zero _vblank_counter (single u64 cell).  Defensive boot-time re-scrub mirroring the scanout_init / z_order_init / kind_surface_init / touch_route_init discipline (chaos-restart witness re-scrub point).  Zero staged via xor rax, rax then stored (no `mov qword [mem], imm64` form).  Zero-arg leaf; entry rsp%16=8 unchanged on return.  Labels prefixed vi_.",
+      block: {
+        xor rax, rax;
+        lea r10, [rip + _vblank_counter];
+        mov [r10 + 0], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // vblank_get_counter() -> u64
+  //
+  // Return the current _vblank_counter value.  Pure read; no side
+  // effects.  Used by callers that want to correlate wall-clock work
+  // with the display's vsync cadence -- the natural first consumer is
+  // a wait-for-vblank primitive that samples the counter, yields, and
+  // re-samples to detect an advance.  Also drives the R104.M3-003
+  // iris_xe_vblank_witness's future rewire.
+  //
+  // Pure leaf: entry rsp%16=8 preserved to ret.  Labels prefixed vgc_.
+  // ==========================================================================
+
+  pub let vblank_get_counter : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M4-021 (#2401): non-blocking read of _vblank_counter.  Pure leaf, no callee-save, no nested call.  Single mem load into rax via `[rip + _vblank_counter]`.  Labels prefixed vgc_.",
+      block: {
+        mov rax, [rip + _vblank_counter];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // vblank_handler(display_id) -> u64
+  //
+  // The frame-kicker itself.  Body order per file header §SCOPE.
+  // Register plan + stack frame per file header §STACK ALIGNMENT.
+  // Labels prefixed vh_.
+  //
+  // klog_s1_x1 signature per klog/wrappers.pdx L38:
+  //   (level, subsys_ptr, tag_ptr, key1, value1) -- all in registers
+  //   (rdi/rsi/rdx/rcx/r8); no stack push required.
+  // ==========================================================================
+
+  pub let vblank_handler : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (display_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R113.M4-021 (#2401): KIND_DISPLAY vblank event handler.  Body per file header §SCOPE: (1) display_id != 0 else VBLANK_BAD_DISPLAY; (2) _vblank_counter++; (3) scanout_try_direct fast path; on SCANOUT_DIRECT_FALLBACK (0) fall through to composite_gpu_blend (which internally walks + clears per-surface damage via composite_prepare_blit_batch); (4) surface_present_notify per rendered surface -- walk _z_stack index 0..z_depth-1 (bottom-up), read row_serial via surface_row_serial_get, skip sentinel (0xFFFFE110) and skip serial==0 (uncommitted surface), call surface_present_notify(cur_slot, row_serial) and ignore return; (5) emit VBLANK TICK counter=<_vblank_counter> via klog_s1_x1; (6) return VBLANK_OK.  Frame: 1 rbp + 5 callee-save pushes (rbx=display_id, r12=z_depth, r13=loop i, r14=cur_slot, r15=row_serial) + sub rsp, 8 = 56B below saved-rbp = %16=0 alignment for every nested call (scanout_try_direct, composite_gpu_blend, z_order_slot_at, surface_row_serial_get, surface_present_notify, klog_s1_x1) without further padding.  All nested callees preserve rbx/r12-r15/rbp per SysV so the loop invariants survive across every emit.  Sentinel handling: surface_row_serial_get returns SURFACE_BAD_SLOT (0xFFFFE110) on stale slot; loaded via `mov r10, 0xFFFFE110` (bit-31-set imm; encoder emits imm32 zero-extend or imm64 movabs per surface_present.pdx L242 idiom).  Failure sentinel 0xFFFFE260 loaded via `mov rax, 0xFFFFE260` per scanout.pdx L517 / surface_present.pdx L280 idiom.  De-duplication of per-surface notify emits deferred to a follow-on that also lands the destroy hook (see file header §DE-DUPLICATION).  Labels prefixed vh_.",
+      block: {
+        push rbp;
+        mov rbp, rsp;
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                        // rbx = display_id
+
+        // (1) display_id != 0 gate.  A KIND_DISPLAY row_id is 1-based
+        // per iris_xe_vblank_isr.pdx §Section 2; passing 0 is a caller
+        // bug and is rejected BEFORE the counter bump so a bogus caller
+        // does not perturb the monotonic tick count.
+        cmp rbx, 0;
+        jne vh_display_ok;
+        mov rax, 0xFFFFE260;                 // VBLANK_BAD_DISPLAY
+        jmp vh_out;
+
+      vh_display_ok:
+        // (2) bump _vblank_counter monotonically.
+        lea r10, [rip + _vblank_counter];
+        mov rax, [r10 + 0];
+        add rax, 1;
+        mov [r10 + 0], rax;
+
+        // (3) fire compositor pass: scanout_try_direct fast path first.
+        // Return code: SCANOUT_DIRECT_ACTIVE (1) -> the direct-scan
+        // path handled this frame; SCANOUT_DIRECT_FALLBACK (0) -> need
+        // to run the GPU-native blend fallback.
+        call scanout_try_direct;
+        cmp rax, 1;
+        je  vh_notify_prep;                  // direct scan handled it
+
+        // Fallback: composite_gpu_blend() -- M4-019 orchestrator that
+        // prepares the per-surface blit batches into the module-local
+        // scratch, notes the submit-ring interaction (wire-deferred to
+        // R36), emits COMPOSITE GPU OK, and returns 0 on all paths in
+        // the M4-019 landing.  Internally walks + clears per-surface
+        // damage via composite_prepare_blit_batch so this handler does
+        // not need a separate composite_plan call for the damage-clear
+        // contract.  Ignore the (always-0) return.
+        call composite_gpu_blend;
+
+      vh_notify_prep:
+        // (4) surface_present_notify per rendered surface.  Load z-depth
+        // once into r12; loop over _z_stack index 0..r12-1 (bottom-up).
+        lea r10, [rip + _z_stack_count];
+        mov r12, [r10 + 0];                  // r12 = z_depth
+
+        xor r13, r13;                        // r13 = i = 0
+
+      vh_notify_loop:
+        cmp r13, r12;
+        jae vh_emit;
+
+        // cur_slot = z_order_slot_at(i).  Returns 0 on OOB, which is a
+        // valid surface slot (row 0 is the low-first mint target).  With
+        // i < z_depth by construction, no OOB call is possible; but the
+        // returned slot may be stale (a destroy racing this handler).
+        mov rdi, r13;
+        call z_order_slot_at;
+        mov r14, rax;                        // r14 = cur_slot
+
+        // row_serial = surface_row_serial_get(cur_slot).  Returns
+        // SURFACE_BAD_SLOT (0xFFFFE110) on invalid slot (destroy raced
+        // the handler) or the low-48-clipped next_serial otherwise.
+        mov rdi, r14;
+        call surface_row_serial_get;
+        mov r15, rax;                        // r15 = row_serial
+
+        // Skip if sentinel (stale entry).
+        mov r10, 0xFFFFE110;
+        cmp r15, r10;
+        je  vh_notify_advance;
+
+        // Skip if serial == 0 (surface minted but never committed).
+        // surface_present_notify would return BAD_SERIAL; the skip is
+        // a cleanliness optimisation, not a correctness requirement.
+        cmp r15, 0;
+        je  vh_notify_advance;
+
+        // Fire the notify.  Return code (SURFACE_PRESENT_OK on success,
+        // SURFACE_PRESENT_BAD_SLOT / BAD_SERIAL under a race) is
+        // intentionally discarded -- a race-loss at the handler layer
+        // is silent; the fingerprint stream is the observability
+        // handle, and surface_present_notify emits its own fingerprint
+        // on success.
+        mov rdi, r14;
+        mov rsi, r15;
+        call surface_present_notify;
+
+      vh_notify_advance:
+        add r13, 1;
+        jmp vh_notify_loop;
+
+      vh_emit:
+        // (5) emit VBLANK TICK counter=<_vblank_counter> via klog_s1_x1.
+        // Reload the counter -- the notify loop's nested calls preserved
+        // callee-saves but the counter itself lives in memory; re-read
+        // to publish the current value (which the earlier bump made
+        // authoritative and no other code path mutated between).
+        lea r10, [rip + _vblank_counter];
+        mov r8, [r10 + 0];                   // v1 = _vblank_counter
+
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + vblank_tick_msg];
+        lea rcx, [rip + vblank_k_counter];
+        call klog_s1_x1;
+
+        // (6) return VBLANK_OK.
+        xor rax, rax;
+
+      vh_out:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        pop rbp;
+        ret
+      }
+    }
+}

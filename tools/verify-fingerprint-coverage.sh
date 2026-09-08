@@ -1501,6 +1501,37 @@ ALLOWLIST = {
         "default matrix once a boot witness wires mint -> attach -> "
         "commit -> notify end-to-end.  Closed the last of the doc §8 "
         "five-tag mandate slots (all five tags now have live emitters).",
+
+    # ------------------------------------------------------------------
+    # R113.M5-022 (paideia-os #2402): KIND_SESSION mint fingerprint
+    # (src/kernel/core/cap/kind_session.pdx).  session_mint validates
+    # owner_task, low-first-scans over the 16-row _sessions pool for a
+    # free slot, bumps the LAM generation on the claimed row, stamps
+    # session_id (== row_id) + owner_task + state=LOGIN(1) + seats=0
+    # + reserved zero, bumps _session_stats[MINTS] and emits SESSION
+    # MINT OK sid=<session_id> own=<owner_task> via klog_s1_x2 with
+    # the v2-push idiom.  Destroy / attach_seat / set_state DO NOT
+    # emit fingerprints per issue #2402's contract (only mint emits).
+    # Emitter is live but not reachable in the default matrix yet:
+    # kind_session_init runs at boot (defensive _sessions +
+    # _session_stats zero-scrub) but is a pure zero-out, and no boot
+    # witness or cap-dispatcher arm calls session_mint yet -- the
+    # follow-on session-manager landing wiring session_mint ->
+    # session_attach_seat -> session_set_state end-to-end will close
+    # this allowlist entry.  Same real-HW / wire-deferred posture as
+    # the sibling `surface mint ok` / `surface commit ok` entries
+    # above.
+    # ------------------------------------------------------------------
+    "session mint ok [legacy: SESSION MINT OK]":
+        "R113.M5-022 (#2402): kernel-side KIND_SESSION mint "
+        "fingerprint; session_mint (src/kernel/core/cap/kind_session."
+        "pdx) emits this via klog_s1_x2 with (sid, own) KVs on every "
+        "successful mint past the owner_task != 0 + free-slot gates.  "
+        "Substrate + emitter landed together; kind_session_init runs "
+        "at boot (defensive pool + stats scrub) but is a pure zero-"
+        "out, and the cap-dispatcher OP_SESSION_MINT arm is a follow-"
+        "on landing.  Assertable when the follow-on session-manager "
+        "landing (or a boot witness) drives session_mint end-to-end.",
     "dmabuf import ok [legacy: DMABUF IMPORT OK]":
         "R113.M4-017 (paideia-os #2397): kernel-side DMABUF IMPORT OK "
         "tag emitted by dma_buf_import (src/kernel/core/graphics/"
@@ -1726,6 +1757,81 @@ ALLOWLIST = {
         "display plane, calls scanout_set_primary_plane, mints a "
         "KIND_SURFACE with a matching fourcc, commits a frame, "
         "pushes it onto z-order and calls scanout_try_direct.",
+
+    # ------------------------------------------------------------------
+    # R113.M4-019 (paideia-os #2399): GPU-composite fallback path
+    # (src/kernel/core/graphics/composite_gpu.pdx).  composite_gpu_
+    # blend orchestrates the multi-surface blend the compositor's
+    # frame loop falls back to when scanout_try_direct declines
+    # (multi-surface z-stack, format mismatch, no primary plane
+    # latched, ...).  composite_prepare_blit_batch walks _z_stack
+    # bottom-up and emits per-surface (header + packed rects) into
+    # a scratch buffer; composite_gpu_blend calls kgsub_note for
+    # the wire-deferred submit-ring witness and emits COMPOSITE GPU
+    # OK batches=<n> dirty=<n> via klog_s1_x2 once per fallback
+    # frame.  Unreachable in the default 14-mode QEMU matrix today
+    # because (a) no boot witness calls composite_gpu_blend, and
+    # (b) the physical KIND_GPU_SUBMIT mint + submit-ring doorbell
+    # wire is the follow-on R36 atomic-commit landing.  Same real-
+    # HW / wire-deferred posture as the composite plan ok /
+    # scanout direct ok / surface present ok / z order raise ok
+    # siblings above; assertable when a boot witness drives the
+    # compositor frame loop end-to-end with a multi-surface z-stack
+    # and pending damage.
+    # ------------------------------------------------------------------
+    "composite gpu ok [legacy: COMPOSITE GPU OK]":
+        "R113.M4-019 (#2399): multi-surface GPU-composite fallback "
+        "fingerprint; composite_gpu_blend emits via klog_s1_x2 with "
+        "(batches=<n_surfaces>, dirty=<n_rects>) KVs on every "
+        "invocation (unconditional; the batches==0 case is the "
+        "'fallback frame with nothing dirty' witness).  Emitter is "
+        "live but not reachable in the default matrix yet: no live "
+        "caller wires the blender -- the compositor frame loop wire "
+        "(R36 display-plane bring-up / R113.M4 present-fence hook "
+        "that calls composite_gpu_blend once per fallback frame) is "
+        "a separate follow-on landing, and the physical KIND_GPU_"
+        "SUBMIT mint + submit-ring doorbell wire is the R36 atomic-"
+        "commit landing still open.  Same real-HW / wire-deferred "
+        "posture as the composite plan ok / scanout direct ok / "
+        "surface present ok / z order raise ok siblings above; "
+        "assertable when a boot witness or the R113.M4 vsync hook "
+        "drives the compositor frame loop end-to-end with a multi-"
+        "surface z-stack and pending damage.",
+
+    # ------------------------------------------------------------------
+    # R113.M4-021 (paideia-os #2401): KIND_DISPLAY vblank event
+    # handler (src/kernel/core/graphics/vblank.pdx).  vblank_handler
+    # bumps _vblank_counter, fires the compositor pass (scanout_try_
+    # direct fast path first; composite_plan enumerate-only fallback),
+    # walks the z-stack and calls surface_present_notify per rendered
+    # surface, then emits VBLANK TICK counter=<n> via klog_s1_x1.  The
+    # emit is unconditional per handler call (once per vblank tick per
+    # display) -- the observability handle for "did vblank fire?"
+    # depends on the per-tick emit.  Unreachable in the default 14-
+    # mode QEMU matrix today because the KIND_DISPLAY IRQ dispatcher
+    # that would drive vblank_handler is a separate follow-on landing
+    # (the R36 display-plane bring-up wave still open).  vblank_init
+    # runs at boot from kernel_main.pdx boot cascade (defensive re-
+    # scrub of _vblank_counter) but emits no fingerprint of its own,
+    # and vblank_get_counter is a pure read.  Same real-HW / wire-
+    # deferred posture as the composite plan ok / scanout direct ok /
+    # surface present ok / z order raise ok siblings above; assertable
+    # when the R36 IRQ dispatcher (or a boot witness) calls vblank_
+    # handler(display_id=1) end-to-end.
+    # ------------------------------------------------------------------
+    "vblank tick [legacy: VBLANK TICK]":
+        "R113.M4-021 (#2401): KIND_DISPLAY vblank-handler fingerprint; "
+        "vblank_handler emits via klog_s1_x1 with counter=<n> KV on "
+        "every invocation past the display_id != 0 gate.  Emitter is "
+        "live but not reachable in the default matrix yet: no boot "
+        "witness or KIND_DISPLAY IRQ dispatcher calls vblank_handler "
+        "-- vblank_init runs at boot (defensive _vblank_counter "
+        "scrub) but is a pure zero-out, and vblank_get_counter is a "
+        "pure read.  Same real-HW / wire-deferred posture as the "
+        "composite plan ok / scanout direct ok / surface present ok "
+        "siblings above; assertable when the R36 KIND_DISPLAY IRQ "
+        "dispatcher (or a boot witness) drives vblank_handler(display"
+        "_id=1) end-to-end against a live z-stack.",
 
     # ------------------------------------------------------------------
     # R113.M3-012 (paideia-os #2392): keyboard event routing from the

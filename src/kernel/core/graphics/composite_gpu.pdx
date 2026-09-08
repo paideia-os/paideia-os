@@ -1,0 +1,750 @@
+// src/kernel/core/graphics/composite_gpu.pdx -- R113.M4-019 (paideia-os #2399)
+//
+// Multi-surface composite fallback: when scanout_try_direct
+// (R113.M4-018 / #2398) refuses the frame (multi-surface z-stack,
+// format mismatch, no primary plane latched, ...), the compositor
+// falls back to a GPU-driven composite pass.  This module builds
+// the per-frame blit batch that describes what the GPU needs to
+// paint and exposes an orchestrator (composite_gpu_blend) that the
+// frame loop calls once the direct-scanout arm has declined.
+//
+// Umbrella: R113 (#2380); sibling to R113.M4-018 (scanout.pdx
+// #2398) which owns the direct/fallback gate, R113.M4-020
+// (composite_plan.pdx #2400) which owns the per-frame damage-driven
+// planner (flat packed-rect list, one output vector), R113.M1-003
+// (damage_region.pdx #2383) which owns the per-surface rect store,
+// R113.M2-010 (z_order.pdx #2390) which owns the paint-order stack.
+// R37.M6-001 (kind_gpu_submit.pdx #1276) owns the submit-ring
+// capability the follow-on wire lands against; this module refers
+// to it via `kgsub_note` only (a stats bump, not a live submission)
+// -- the physical submit-ring wire is deferred to the R36 atomic-
+// commit landing that also wires scanout_bind's HW plane program.
+//
+// -----------------------------------------------------------------------------
+// SCOPE (per issue #2399)
+// -----------------------------------------------------------------------------
+//
+// Two entry points:
+//
+//   composite_prepare_blit_batch(out_batch_ptr, out_cap) -> count
+//   composite_gpu_blend() -> u64  (0 = OK; else 0xFFFFE250..0xFFFFE25F)
+//
+// Semantics:
+//
+//   composite_prepare_blit_batch walks the z-order stack BOTTOM-UP
+//   (index 0 up to _z_stack_count - 1, i.e. back-to-front paint
+//   order, opposite to composite_plan's top-down walk).  A GPU
+//   composite pass paints back to front so alpha-blending accretes
+//   in the natural order the fragments arrive; the top-down walk
+//   composite_plan.pdx uses is picked for its future occlusion-
+//   culling filter (front surfaces culling back-surface damage),
+//   which does not apply to the paint step this module structures.
+//
+//   For each visited surface slot the walker emits:
+//
+//     * one HEADER u64:
+//         slot[15:0] | rect_count[31:16] | reserved[55:32] | marker[63:56]
+//
+//       where marker = 0xBB is a fixed tag the (future) GPU-side
+//       decoder uses to sync the batch stream against a corrupted
+//       or partially-truncated write (a rect u64 whose top byte is
+//       any of {dh-high == 0x00..0xFF} would otherwise be ambiguous
+//       against a header -- 0xBB in bit [63:56] disambiguates).
+//
+//     * rect_count RECT u64s, each already packed per damage_region
+//       doc §2 layout:
+//
+//         dx[15:0] | dy[31:16] | dw[47:32] | dh[63:48]
+//
+//   The (header, rects...) sequence is the "batch" the GPU submit
+//   ring will hand to the compositor's shader.  Batches concatenate
+//   directly in the output buffer (no inter-batch padding).
+//
+//   composite_prepare_blit_batch clears each visited surface's
+//   damage region via damage_region_clear regardless of whether its
+//   batch was written to the output buffer -- if capacity was
+//   exhausted before this surface fit, the surface's damage is
+//   still cleared (mirroring composite_plan's "visited surfaces
+//   have their damage dispatched from the planner's view" contract;
+//   the alternative -- leave-damage-on-overflow -- would cause the
+//   next frame to redo work the current frame accounted for and
+//   drown the workload in ever-growing rect counts).
+//
+//   Enumerate-only mode: (out_batch_ptr == 0, out_cap == 0) walks
+//   + clears damage without writing; return value is 0 (nothing
+//   written).  Useful for a "flush damage without blitting" call
+//   site (e.g. a scanout blackout frame).  (out_batch_ptr == 0,
+//   out_cap > 0) is rejected as COMPOSITE_GPU_BAD_ARG -- a positive
+//   capacity without a buffer would cause a wild-pointer store on
+//   the first header write.
+//
+//   composite_gpu_blend orchestrates the fallback path:
+//
+//     (1) bump COMPOSITE_GPU_ST_INVOKES
+//     (2) call composite_prepare_blit_batch against the module-local
+//         scratch buffer _composite_gpu_scratch (256 u64 = 2 KiB;
+//         holds up to SURFACE_ROW_MAX (16) surface batches, each
+//         1 header + up to DMG_RECTS_PER_SURFACE (8) rects = 144
+//         entries worst case, well below the 256 cap)
+//     (3) read _composite_gpu_last_batches and
+//         _composite_gpu_last_dirty (side-channel from the prepare
+//         helper; see §RATIONALE below)
+//     (4) accrete into COMPOSITE_GPU_ST_BATCHES / COMPOSITE_GPU_ST_
+//         DIRTY stats
+//     (5) if batches > 0, note one submit-ring interaction via
+//         kgsub_note(KGSUB_ST_MINTS) as a wire-deferred witness
+//         hook and bump COMPOSITE_GPU_ST_SUBMITS locally; the
+//         physical KIND_GPU_SUBMIT mint + submit-ring doorbell wire
+//         is the follow-on R36 atomic-commit landing (see
+//         §EXTERNAL SYMBOLS)
+//     (6) emit COMPOSITE GPU OK batches=<n> dirty=<n> via klog_s1_x2
+//     (7) return 0
+//
+//   composite_gpu_blend returns 0 on all paths in this landing;
+//   the failure sentinels 0xFFFFE250..0xFFFFE25F are reserved for
+//   the follow-on wire's submit-ring propagation.
+//
+// -----------------------------------------------------------------------------
+// RATIONALE FOR THE SIDE-CHANNEL BATCHES / DIRTY CELLS
+// -----------------------------------------------------------------------------
+//
+// The paideia-as SysV ABI carries one u64 return in rax.  The
+// prepare helper needs to report THREE numbers to composite_gpu_
+// blend: total u64s written (used by callers who want to know how
+// much of the buffer was consumed), batches (surface count for the
+// fingerprint), and dirty (rect count for the fingerprint).  The
+// alternatives:
+//
+//   (a) Bit-pack all three into one u64 (e.g. count[15:0] |
+//       batches[23:16] | dirty[39:24]).  Compact but fragile: the
+//       count already exceeds 8 bits (256 max), the caller has to
+//       repack, and any future extension needs a new encoding.
+//   (b) Take out-pointer args for batches and dirty.  Doubles the
+//       argument count; the frame loop caller does not need
+//       batches/dirty at all (only composite_gpu_blend does).
+//   (c) Stash batches/dirty in module state and expose accessors.
+//       Trades one u64 of BSS for a clean return channel.  Chosen
+//       here: _composite_gpu_last_batches / _composite_gpu_last_
+//       dirty are one-writer (only composite_prepare_blit_batch
+//       writes them) and one-reader (only composite_gpu_blend
+//       reads them in the same call chain).  A concurrent caller
+//       would race these cells, but composite_gpu_blend is single-
+//       threaded per frame loop and composite_prepare_blit_batch
+//       has no other callers today.
+//
+// The R36 wire will replace the local scratch with a KIND_GPU_BO-
+// backed batch buffer and route the count/batches/dirty triple
+// through kind_gpu_submit's row layout (submit_key names the
+// batch; the row records batch_bo_slot and the ctx_slot the pass
+// runs on).  At that point the side-channel cells collapse into
+// KIND_GPU_SUBMIT row reads.
+//
+// -----------------------------------------------------------------------------
+// FAILURE TAXONOMY -- 0xFFFFE250..0xFFFFE25F (fresh band)
+// -----------------------------------------------------------------------------
+//
+// Pre-landing sweep (2026-09-08):
+//
+//   $ grep -rn '0xFFFFE25' src design tools tests  ->  empty
+//
+// so 0xFFFFE250..0xFFFFE25F is fresh and uncontested.  Neighbouring
+// bands in the 0xFFFFE2XX page (post-M4-018 / M4-020):
+//
+//   0xFFFFE200..E20F  R113.M3-014 TOUCH ROUTE
+//   0xFFFFE210..E21F  R113.M3-016 KEYMAP
+//   0xFFFFE220..E22F  free
+//   0xFFFFE230..E23F  R113.M4-018 SCANOUT DIRECT
+//   0xFFFFE240..E24F  R113.M4-020 COMPOSITE PLAN
+//   0xFFFFE250..E25F  R113.M4-019 COMPOSITE GPU  (THIS FILE)
+//   0xFFFFE260..E2FF  free
+//
+// Slot map:
+//
+//   0xFFFFE250  COMPOSITE_GPU_BAD_ARG      out_batch_ptr == 0 while
+//                                          out_cap > 0.  Refused before
+//                                          the walk so a caller who
+//                                          promised capacity without
+//                                          supplying a buffer does not
+//                                          land a wild-pointer store on
+//                                          the first header write.
+//   0xFFFFE251  COMPOSITE_GPU_SCRATCH_FULL reserved: raised by a
+//                                          follow-on landing that
+//                                          promotes silent-truncate
+//                                          into an explicit signal
+//                                          when the scratch buffer
+//                                          overflows.  This landing
+//                                          matches composite_plan's
+//                                          drop-on-overflow convention
+//                                          and does not raise it live.
+//   0xFFFFE252  COMPOSITE_GPU_SUBMIT_FAIL  reserved: raised by the
+//                                          follow-on R36 wire when
+//                                          kind_gpu_submit's mint or
+//                                          submit-ring doorbell
+//                                          refuses (surface passthrough
+//                                          of KGSUB_MINT_* /
+//                                          KGSUB_BAD_TRANSITION).
+//   0xFFFFE253..0xFFFFE25F                 reserved for M4 follow-on
+//                                          (per-plane composite plans,
+//                                          alpha-composite skip fast
+//                                          paths, occlusion-culled
+//                                          batch shortening, etc.)
+//
+// The count return channel does not overlap: the maximum output
+// count is bounded by COMPOSITE_GPU_SCRATCH_MAX (256) which is far
+// below 0xFFFFE250, so returning the count as a bare u64 is
+// unambiguous versus the failure sentinel.
+//
+// -----------------------------------------------------------------------------
+// FINGERPRINT (per issue #2399 §4)
+// -----------------------------------------------------------------------------
+//
+// Wire form (post-klog_s1_x2 KV append):
+//
+//   composite gpu ok [legacy: COMPOSITE GPU OK] batches=0x<hex> dirty=0x<hex>
+//
+// Byte counts hand-verified:
+//
+//   "composite gpu ok " (17)      = 9 + 1 + 3 + 1 + 2 + 1
+//   "[legacy: " (9)               = 1 + 6 + 1 + 1
+//   "COMPOSITE GPU OK" (16)       = 9 + 1 + 3 + 1 + 2
+//   "]" (1)
+//   "\0" (1)
+//   -----------------------------------
+//   total                          = 44 bytes
+//
+//   "batches\0"                    = 8 bytes  (7 letters + NUL)
+//   "dirty\0"                      = 6 bytes  (5 letters + NUL)
+//
+// Semantics of the two KVs:
+//
+//   batches   Number of surface batches actually WRITTEN to the
+//             output buffer (one header emitted per surface with
+//             at least one damage rect that fits under the
+//             capacity).  Bounded above by SURFACE_ROW_MAX (16).
+//
+//   dirty     Number of rect entries actually WRITTEN across all
+//             batches (does NOT count header entries).  Bounded
+//             above by SURFACE_ROW_MAX * DMG_RECTS_PER_SURFACE = 128.
+//
+// Emitter cadence: composite_gpu_blend is called once per fallback
+// frame (i.e. every frame the compositor cannot direct-scan --
+// which is the default for any workload with more than one visible
+// surface).  klog_s1_x2 is a light emitter; ring cost is bounded
+// even at 240 Hz.
+//
+// Emitter reachability: NO live caller in the M4-019 landing.  The
+// compositor's frame loop wire (R36 display-plane bring-up / R113.
+// M4 present-fence hook) is a separate follow-on landing; the
+// blender is staged here so those landings are a single-call
+// insert rather than a compositor-plus-blender joint drop.  A
+// tools/verify-fingerprint-coverage.sh allowlist entry mirrors the
+// composite plan ok / scanout direct ok / z order raise ok
+// siblings' "wire-deferred; assertable when a boot witness drives
+// the compositor end-to-end" posture.
+//
+// -----------------------------------------------------------------------------
+// EXTERNAL SYMBOLS
+// -----------------------------------------------------------------------------
+//
+// This module references (bare symbols, kernel .pdx single global
+// namespace, same pattern as composite_plan.pdx / scanout.pdx):
+//
+//   * z_order_slot_at        (graphics/z_order.pdx)       -- bottom-up walk
+//   * _z_stack_count         (graphics/z_order.pdx)       -- depth read
+//   * damage_region_count    (graphics/damage_region.pdx) -- per-surface count
+//   * damage_region_get      (graphics/damage_region.pdx) -- per-rect read
+//   * damage_region_clear    (graphics/damage_region.pdx) -- per-surface scrub
+//   * kgsub_note             (cap/kind_gpu_submit.pdx)    -- submit-ring stats
+//   * SUBSYS_CAP_            (klog subsystem ordinal)
+//   * klog_s1_x2             (klog/wrappers.pdx)          -- 2-KV hex emit
+//
+// The kgsub_note call is a wire-deferred witness: it bumps
+// _gpu_submit_stats[KGSUB_ST_MINTS] as a stand-in for the future
+// physical KIND_GPU_SUBMIT mint the R36 wire will perform.  This
+// keeps the fallback path's submit-ring interaction visible in the
+// KIND_GPU_SUBMIT stats even before the real mint lands, so a
+// boot witness can already assert that the fallback path was
+// exercised the expected number of times.  When the physical mint
+// arrives it replaces this note with a real gpu_submit_cap_mint;
+// the stat bump moves inside that call and the local
+// COMPOSITE_GPU_ST_SUBMITS counter becomes redundant (kept then
+// for cross-module witness).
+//
+// -----------------------------------------------------------------------------
+// ENCODER PITFALLS (per feedback_pdx_encoder_pitfalls v0.36+)
+// -----------------------------------------------------------------------------
+//
+//   * No `test rN, rN` -- every zero-check uses `cmp rN, 0` + `je/jne`.
+//   * No 2-op `imul r, imm` -- all offsets computed via `shl`, `shr`
+//     or via register-scaled SIB `[reg + rN * 8]` (scale 8 in the
+//     legal {1,2,4,8} set).
+//   * No `and reg, imm64` -- masks are `and reg, 0xFFFF` (imm32
+//     0x0000FFFF, sign bit clear at bit 31, safe per composite_plan.
+//     pdx L484-487 / kind_gpu_submit.pdx L419 precedent).
+//   * No `cmp reg, [mem]` -- every mem compare loads to a scratch
+//     first (`mov rdx, [rbp - N]; cmp r13, rdx`).
+//   * Failure sentinel `0xFFFFE250` uses `mov reg, imm64`; the
+//     encoder emits the 10-byte imm64 form for constants with bit
+//     31 set (established idiom throughout kind_surface.pdx failure
+//     returns).  Marker byte 0xBB shifted into position via `shl
+//     r10, 56` (shift-immediate is imm8 safe).
+//   * `mov [rdx + r13 * 8], rax` uses register-scaled SIB with
+//     scale in the legal {1,2,4,8} set (composite_plan.pdx L505
+//     precedent).
+//   * `[rip + sym]` and `lea reg, [rip + sym]` are the standing
+//     forms for global data access; every symbol reference is bare.
+//   * Multiline `pub let ="..."` refused by the encoder -- every
+//     string literal in this file lives on one source line.
+//   * Module name matches file basename: `CompositeGpu` for
+//     `composite_gpu.pdx`.
+//   * Fingerprint tag byte counts computed by hand and asserted in
+//     the `[u8; N]` type ascription (44 for the ok tag, 8 for the
+//     batches KV key, 6 for the dirty KV key).
+//
+// -----------------------------------------------------------------------------
+// STACK FRAME + REGISTER PLAN
+// -----------------------------------------------------------------------------
+//
+// composite_prepare_blit_batch:
+//
+//   Frame layout (post push rbp; mov rbp, rsp; 5 callee-save
+//   pushes; sub rsp, 56 = 96 bytes below rbp, %16 = 0):
+//
+//     [rbp-8]   saved rbx
+//     [rbp-16]  saved r12
+//     [rbp-24]  saved r13
+//     [rbp-32]  saved r14
+//     [rbp-40]  saved r15
+//     [rbp-48]  out_batch_ptr  (spill)
+//     [rbp-56]  out_cap        (spill)
+//     [rbp-64]  z_depth        (spill; loaded once at entry)
+//     [rbp-72]  j              (inner index; spilled across
+//                              damage_region_get)
+//     [rbp-80]  batches        (running surface count)
+//     [rbp-88]  pad
+//     [rbp-96]  pad
+//
+//   Live-across-call callee-save registers:
+//
+//     rbx  cur_slot (from z_order_slot_at each outer iteration)
+//     r12  damage_count for cur_slot (from damage_region_count)
+//     r13  count (running output index; also return value)
+//     r14  dirty (running rect count; folded into module state at emit)
+//     r15  z-index (outer loop, incremented bottom-up)
+//
+// composite_gpu_blend:
+//
+//   Frame layout (push rbp; mov rbp, rsp; 4 callee-save pushes =
+//   32 bytes below rbp, %16 = 0):
+//
+//     [rbp-8]   saved r12
+//     [rbp-16]  saved r13
+//     [rbp-24]  saved r14
+//     [rbp-32]  saved r15
+//
+//   For the klog_s1_x2 stack-arg emit: `sub rsp, 8; push v2 (=r13)`
+//   at body rsp%16=0 lands v2 at [rsp+8] pre-CALL and rsp%16=0
+//   pre-CALL, byte-identical to surface_format.pdx L526-528.
+//
+// -----------------------------------------------------------------------------
+// LABEL PREFIXES
+// -----------------------------------------------------------------------------
+//
+//   cpbb_   composite_prepare_blit_batch
+//   cgb_    composite_gpu_blend
+//
+// All prefixes avoid the paideia-as reserved-keyword set
+// (feedback_paideia_as_reserved_labels: loop, if, let, while, for,
+// match, pub, mod, use, fn, struct, enum, impl, trait, type, where,
+// move, mut, ref).
+
+module CompositeGpu = structure {
+
+  // ==========================================================================
+  // Failure taxonomy (0xFFFFE250..0xFFFFE25F).  See file header
+  // §FAILURE TAXONOMY.
+  // ==========================================================================
+
+  pub let COMPOSITE_GPU_OK              : u64 = 0
+  pub let COMPOSITE_GPU_BAD_ARG         : u64 = 0xFFFFE250
+  pub let COMPOSITE_GPU_SCRATCH_FULL    : u64 = 0xFFFFE251
+  pub let COMPOSITE_GPU_SUBMIT_FAIL     : u64 = 0xFFFFE252
+
+  // Scratch buffer sizing.  256 u64 = 2 KiB, holds the worst-case
+  // batch stream:
+  //   SURFACE_ROW_MAX (16) surfaces
+  //   x (1 header + DMG_RECTS_PER_SURFACE (8) rects) per surface
+  //   = 144 entries.  256 leaves headroom for a future SURFACE_ROW_MAX
+  //   bump to 24-28 without a scratch resize.
+  pub let COMPOSITE_GPU_SCRATCH_MAX     : u64 = 256
+
+  // Batch header marker byte (top 8 bits of a header u64; see file
+  // header §SCOPE).  Chosen for the "not a plausible rect dh high
+  // byte" property: a well-formed rect has dh in bits [63:48], and
+  // no visual coordinate falls at 0xBB in a 16-bit height field
+  // that a compositor would legitimately want to blit at (0xBB =
+  // 187 rows is a legal height, but pairs with a header shape only
+  // by coincidence -- the marker gives the GPU-side decoder ONE
+  // reliable resync point per batch even if a rect happens to
+  // collide).
+  pub let COMPOSITE_GPU_HDR_MARKER      : u64 = 0xBB
+
+  // ==========================================================================
+  // Stats counters.
+  // ==========================================================================
+  //
+  //   COMPOSITE_GPU_ST_INVOKES  incremented on every composite_gpu_blend entry
+  //   COMPOSITE_GPU_ST_BATCHES  cumulative surface batches emitted
+  //   COMPOSITE_GPU_ST_DIRTY    cumulative rect entries emitted
+  //   COMPOSITE_GPU_ST_SUBMITS  cumulative submit-ring interactions
+  //
+  // The (INVOKES - SUBMITS) delta reports frames where the walker
+  // found no dirty surfaces (nothing to blit).  BATCHES / DIRTY is
+  // the average rect count per batch, useful for tuning the M4
+  // occlusion-culling and coalescing thresholds.
+
+  pub let mut _composite_gpu_stats         : [u64; 4] = uninit @align(32)
+
+  pub let COMPOSITE_GPU_ST_INVOKES  : u64 = 0
+  pub let COMPOSITE_GPU_ST_BATCHES  : u64 = 1
+  pub let COMPOSITE_GPU_ST_DIRTY    : u64 = 2
+  pub let COMPOSITE_GPU_ST_SUBMITS  : u64 = 3
+
+  // ==========================================================================
+  // Side-channel cells (see file header §RATIONALE).  One-writer
+  // (composite_prepare_blit_batch), one-reader (composite_gpu_blend).
+  // ==========================================================================
+
+  pub let mut _composite_gpu_last_batches  : u64 = uninit @align(8)
+  pub let mut _composite_gpu_last_dirty    : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // Scratch batch buffer used by composite_gpu_blend.  Not intended
+  // for external consumers; the follow-on R36 wire replaces this
+  // with a KIND_GPU_BO-backed batch buffer.
+  // ==========================================================================
+
+  pub let mut _composite_gpu_scratch       : [u64; 256] = uninit @align(64)
+
+  // ==========================================================================
+  // Fingerprint tag (44 bytes) + two KV keys (8 + 6 bytes).  Byte
+  // counts hand-verified in the file header §FINGERPRINT.
+  // ==========================================================================
+
+  pub let composite_gpu_ok_msg     : [u8; 44] = "composite gpu ok [legacy: COMPOSITE GPU OK]\0"
+  pub let composite_gpu_k_batches  : [u8; 8]  = "batches\0"
+  pub let composite_gpu_k_dirty    : [u8; 6]  = "dirty\0"
+
+  // ==========================================================================
+  // composite_prepare_blit_batch(out_batch_ptr, out_cap) -> count
+  //
+  // Walk _z_stack BOTTOM-UP, emit per-surface (header + rects) into
+  // out_batch_ptr up to out_cap.  Clears each visited surface's
+  // damage region regardless of capacity outcome.  Side-effects
+  // _composite_gpu_last_batches and _composite_gpu_last_dirty for
+  // composite_gpu_blend's fingerprint.  Returns TOTAL u64 entries
+  // written (headers + rects).
+  //
+  // Enumerate-only mode: (out_batch_ptr==0, out_cap==0) walks +
+  // clears without writing, returns 0.  (out_batch_ptr==0,
+  // out_cap>0) -> COMPOSITE_GPU_BAD_ARG.
+  //
+  // See file header §SCOPE for the bytecode layout and §STACK FRAME
+  // for the register plan.  Labels prefixed cpbb_.
+  // ==========================================================================
+
+  pub let composite_prepare_blit_batch : (u64, u64) -> u64 !{mem} @{cap} =
+    fn (out_batch_ptr: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R113.M4-019 (#2399): walk _z_stack bottom-up (index 0 up to count-1, back-to-front paint order -- OPPOSITE composite_plan's top-down walk because a GPU composite pass paints back-to-front so alpha-blending accretes naturally, whereas composite_plan walks top-down so a future occlusion-culling filter can cull back-surface damage).  For each visited surface emit ONE header u64 (slot[15:0] | rect_count[31:16] | marker=0xBB[63:56]) followed by rect_count damage rects (packed doc §2 layout: dx[15:0] | dy[31:16] | dw[47:32] | dh[63:48]).  Batches concatenate directly.  Clears each visited surface's damage_region regardless of capacity outcome (mirrors composite_plan's visited-then-cleared contract; leaving damage on overflow would drown the next frame).  Enumerate-only mode: (ptr==0, cap==0) walks + clears without writing.  (ptr==0, cap>0) -> COMPOSITE_GPU_BAD_ARG.  Sentinel handling: damage_region_count returns 0..8 legal or DMG_BAD_SLOT (0xFFFFE160) on out-of-range slot -- treat any return > 8 as stale-entry sentinel and skip the surface entirely (do NOT clear damage for a bad slot: it is not a legitimate surface and clearing would be wrong).  damage_region_get returns 0 on out-of-range (impossible here since j < count) -- skipped defensively.  Capacity gating: header + all rects must fit AS A UNIT (otherwise the header claims a rect count larger than the tail actually carries, and the GPU-side decoder would consume the next surface's header as a rect); if either header alone (count == cap) or header + rects (count + 1 + dmg > cap) will not fit, skip this surface's emission but still clear damage.  Frame: 1 rbp + 5 callee-save pushes + sub rsp, 56 = 96 bytes below rbp = %16=0 alignment for every nested call (z_order_slot_at, damage_region_count, damage_region_get, damage_region_clear) without further padding.  Side-effects _composite_gpu_last_batches / _composite_gpu_last_dirty (one-writer here / one-reader composite_gpu_blend; see file header §RATIONALE).  No test rN,rN; no 2-op imul; no `and reg, imm64`; no `cmp reg, [mem]` (every mem compare goes through a scratch load); register-scaled SIB `[reg + rN * 8]` with scale 8 in the legal set for the output store.  Labels prefixed cpbb_.",
+      block: {
+        push rbp;
+        mov rbp, rsp;
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 56;
+
+        // Spill args.
+        mov [rbp - 48], rdi;                 // out_batch_ptr
+        mov [rbp - 56], rsi;                 // out_cap
+
+        // Gate: (out_batch_ptr == 0 && out_cap > 0) -> BAD_ARG.
+        // (0, 0) is legal enumerate-only mode.
+        cmp rdi, 0;
+        jne cpbb_args_ok;
+        cmp rsi, 0;
+        je  cpbb_args_ok;
+        mov rax, 0xFFFFE250;                 // COMPOSITE_GPU_BAD_ARG
+        jmp cpbb_out;
+
+      cpbb_args_ok:
+        // Load z-stack depth.
+        lea r10, [rip + _z_stack_count];
+        mov rax, [r10 + 0];
+        mov [rbp - 64], rax;                 // z_depth
+
+        // Init loop state.
+        xor r13, r13;                        // count = 0
+        xor r14, r14;                        // dirty = 0
+        xor rax, rax;
+        mov [rbp - 80], rax;                 // batches = 0
+        xor r15, r15;                        // z-index = 0 (bottom-up)
+
+      cpbb_outer:
+        // r15 < z_depth?
+        mov rax, [rbp - 64];
+        cmp r15, rax;
+        jae cpbb_emit;
+
+        // cur_slot = z_order_slot_at(r15).
+        mov rdi, r15;
+        call z_order_slot_at;
+        mov rbx, rax;                        // rbx = cur_slot
+
+        // damage_count = damage_region_count(cur_slot).  Returns
+        // 0..8 legal or DMG_BAD_SLOT (0xFFFFE160) on out-of-range
+        // slot.  Any return > 8 is stale-entry sentinel; skip
+        // surface (do NOT clear damage for a bad slot).
+        mov rdi, rbx;
+        call damage_region_count;
+        cmp rax, 8;
+        ja  cpbb_advance_i;                  // sentinel: skip surface
+        mov r12, rax;                        // r12 = damage_count
+
+        // dmg == 0 -> no header, no clear needed
+        cmp r12, 0;
+        je  cpbb_advance_i;
+
+        // Capacity: header (1) + rects (r12) must fit as a unit.
+        // First check count < cap for the header slot.
+        mov rdx, [rbp - 56];                 // out_cap
+        cmp r13, rdx;
+        jae cpbb_next_surface;               // no room for header; skip + clear
+
+        // Then check remaining = cap - count >= 1 + dmg.
+        mov rax, rdx;
+        sub rax, r13;                        // remaining slots
+        mov rcx, r12;
+        add rcx, 1;                          // needed = 1 + dmg
+        cmp rcx, rax;
+        ja  cpbb_next_surface;               // won't fit; skip + clear
+
+        // Emit header: slot[15:0] | dmg[31:16] | marker[63:56].
+        mov rax, rbx;
+        and rax, 0xFFFF;                     // slot low 16
+        mov r10, r12;
+        and r10, 0xFFFF;
+        shl r10, 16;
+        or  rax, r10;                        // | dmg << 16
+        mov r10, 0xBB;                       // COMPOSITE_GPU_HDR_MARKER
+        shl r10, 56;
+        or  rax, r10;                        // | marker << 56
+
+        mov rdx, [rbp - 48];                 // out_batch_ptr
+        mov [rdx + r13 * 8], rax;
+        add r13, 1;                          // count++
+
+        // batches++
+        mov rax, [rbp - 80];
+        add rax, 1;
+        mov [rbp - 80], rax;
+
+        // Inner loop: for j in 0..damage_count.
+        xor rax, rax;
+        mov [rbp - 72], rax;                 // j = 0
+
+      cpbb_inner:
+        mov rcx, [rbp - 72];                 // j
+        cmp rcx, r12;
+        jae cpbb_next_surface;
+
+        // packed_rect = damage_region_get(cur_slot, j).
+        mov rdi, rbx;
+        mov rsi, rcx;
+        call damage_region_get;
+        // rax = packed rect.  Return of 0 is a defensive-impossibility
+        // here: j < count and cur_slot was accepted by damage_region_
+        // count above.  We deliberately DO NOT skip on 0 -- the header
+        // above committed rect_count=r12 into the batch stream, so
+        // skipping a rect would leave the header claiming more rects
+        // than the tail carries and the GPU-side decoder would consume
+        // the next surface's header as a rect.  Writing a 0 rect
+        // instead is safe (a shader interprets it as w=h=0 -> null
+        // blit) and preserves header/count consistency.  Capacity gate
+        // (defensive; the atomic-per-surface gate above guarantees
+        // room, but a second check protects against a future refactor
+        // that removes the atomic gate).
+        mov rdx, [rbp - 56];                 // out_cap
+        cmp r13, rdx;
+        jae cpbb_advance_j;                  // full; skip write
+
+        mov rdx, [rbp - 48];                 // out_batch_ptr
+        mov [rdx + r13 * 8], rax;
+        add r13, 1;                          // count++
+        add r14, 1;                          // dirty++
+
+      cpbb_advance_j:
+        mov rcx, [rbp - 72];
+        add rcx, 1;
+        mov [rbp - 72], rcx;
+        jmp cpbb_inner;
+
+      cpbb_next_surface:
+        // Clear per-surface damage.  Return value (DMG_OK or DMG_
+        // BAD_SLOT) is discarded: we already gated on the slot via
+        // damage_region_count above, so a stale DMG_BAD_SLOT here
+        // is impossible.
+        mov rdi, rbx;
+        call damage_region_clear;
+        jmp cpbb_advance_i;
+
+      cpbb_advance_i:
+        add r15, 1;
+        jmp cpbb_outer;
+
+      cpbb_emit:
+        // Fold batches and dirty into module state so composite_gpu_
+        // blend can emit them in the fingerprint.
+        mov rax, [rbp - 80];
+        lea r10, [rip + _composite_gpu_last_batches];
+        mov [r10 + 0], rax;
+        mov rax, r14;
+        lea r10, [rip + _composite_gpu_last_dirty];
+        mov [r10 + 0], rax;
+
+        // Return total count.
+        mov rax, r13;
+
+      cpbb_out:
+        add rsp, 56;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        pop rbp;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // composite_gpu_blend() -> u64  (0 = OK; else 0xFFFFE250..0xFFFFE25F)
+  //
+  // Orchestrator for the multi-surface fallback path.  Called by
+  // the compositor's frame loop when scanout_try_direct returns 0
+  // (multi-surface or format mismatch).  Sequence per file header
+  // §SCOPE:
+  //
+  //   (1) bump COMPOSITE_GPU_ST_INVOKES
+  //   (2) call composite_prepare_blit_batch(_composite_gpu_scratch,
+  //       COMPOSITE_GPU_SCRATCH_MAX)
+  //   (3) read _composite_gpu_last_batches and
+  //       _composite_gpu_last_dirty
+  //   (4) accrete BATCHES / DIRTY stats
+  //   (5) if batches > 0: kgsub_note(KGSUB_ST_MINTS=0) + bump
+  //       COMPOSITE_GPU_ST_SUBMITS (wire-deferred witness)
+  //   (6) emit COMPOSITE GPU OK batches=<n> dirty=<n>
+  //   (7) return 0
+  //
+  // Labels prefixed cgb_.
+  // ==========================================================================
+
+  pub let composite_gpu_blend : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R113.M4-019 (#2399): multi-surface composite fallback orchestrator.  Called by the compositor's frame loop when scanout_try_direct returns 0 (multi-surface or format mismatch).  Sequence: (1) bump COMPOSITE_GPU_ST_INVOKES; (2) composite_prepare_blit_batch against _composite_gpu_scratch (256 u64); (3) read _composite_gpu_last_batches / _composite_gpu_last_dirty side-channel cells (see file header §RATIONALE); (4) accrete BATCHES + DIRTY stats; (5) if batches > 0 call kgsub_note(KGSUB_ST_MINTS=0) as wire-deferred submit-ring witness and bump COMPOSITE_GPU_ST_SUBMITS locally; (6) emit COMPOSITE GPU OK batches=<n> dirty=<n> via klog_s1_x2; (7) return 0.  BAD_ARG from the prepare call is impossible in this landing (we pass a live buffer + non-zero cap) but propagated defensively as COMPOSITE_GPU_BAD_ARG for a future refactor.  Frame: 1 rbp + 4 callee-save pushes = 32 bytes below rbp = %16=0 for every nested call.  klog_s1_x2 v2 push idiom (sub 8; push r13; call; add 16) at rsp%16=0 lands v2 at [rsp+8] per klog_s1_x2 ABI (wrappers.pdx L72).  kgsub_note preserves rbx/r12-r15/rbp per SysV; klog_s1_x2 does the same.  No test rN,rN; no 2-op imul; no `and reg, imm64`; failure sentinels loaded via `mov reg, imm64`.  Labels prefixed cgb_.",
+      block: {
+        push rbp;
+        mov rbp, rsp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // (1) Bump COMPOSITE_GPU_ST_INVOKES.
+        lea r10, [rip + _composite_gpu_stats];
+        mov rax, [r10 + 0];                  // ST_INVOKES = 0
+        add rax, 1;
+        mov [r10 + 0], rax;
+
+        // (2) composite_prepare_blit_batch(_composite_gpu_scratch,
+        //     COMPOSITE_GPU_SCRATCH_MAX).
+        lea rdi, [rip + _composite_gpu_scratch];
+        mov rsi, 256;                        // COMPOSITE_GPU_SCRATCH_MAX
+        call composite_prepare_blit_batch;
+
+        // Defensive: propagate BAD_ARG (impossible with the args we
+        // pass; kept for a future refactor that lets the scratch
+        // pointer come from a caller).
+        mov r10, 0xFFFFE250;                 // COMPOSITE_GPU_BAD_ARG
+        cmp rax, r10;
+        je  cgb_bad_arg;
+
+        // (3) Read side-channel cells.
+        lea r10, [rip + _composite_gpu_last_batches];
+        mov r12, [r10 + 0];                  // batches
+        lea r10, [rip + _composite_gpu_last_dirty];
+        mov r13, [r10 + 0];                  // dirty
+
+        // (4) Accrete BATCHES + DIRTY stats.
+        lea r10, [rip + _composite_gpu_stats];
+        mov rax, [r10 + 8];                  // ST_BATCHES = 1
+        add rax, r12;
+        mov [r10 + 8], rax;
+        mov rax, [r10 + 16];                 // ST_DIRTY = 2
+        add rax, r13;
+        mov [r10 + 16], rax;
+
+        // (5) Wire-deferred submit-ring witness.  Bump only when
+        // batches > 0 so the (INVOKES - SUBMITS) delta reports
+        // fallback frames that found nothing dirty.
+        cmp r12, 0;
+        je  cgb_no_submit;
+
+        // kgsub_note(KGSUB_ST_MINTS = 0) -- witness of a submit-
+        // ring interaction under the stand-in the R36 wire will
+        // replace with a real gpu_submit_cap_mint.
+        xor rdi, rdi;                        // KGSUB_ST_MINTS = 0
+        call kgsub_note;
+
+        lea r10, [rip + _composite_gpu_stats];
+        mov rax, [r10 + 24];                 // ST_SUBMITS = 3
+        add rax, 1;
+        mov [r10 + 24], rax;
+
+      cgb_no_submit:
+        // (6) Emit COMPOSITE GPU OK batches=<r12> dirty=<r13>.
+        // klog_s1_x2 v2 push idiom (sub 8; push v2; call; add 16)
+        // at body rsp%16=0 lands v2 at [rsp+8] per klog_s1_x2 ABI
+        // (wrappers.pdx L72).
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + composite_gpu_ok_msg];
+        lea rcx, [rip + composite_gpu_k_batches];
+        mov r8, r12;                         // v1 = batches
+        lea r9, [rip + composite_gpu_k_dirty];
+        sub rsp, 8;
+        push r13;                            // v2 = dirty
+        call klog_s1_x2;
+        add rsp, 16;
+
+        // (7) Return OK.
+        xor rax, rax;
+        jmp cgb_out;
+
+      cgb_bad_arg:
+        mov rax, 0xFFFFE250;                 // COMPOSITE_GPU_BAD_ARG
+
+      cgb_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        ret
+      }
+    }
+}
