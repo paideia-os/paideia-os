@@ -1568,6 +1568,68 @@ ALLOWLIST = {
         "witness) drives capture_grant end-to-end.",
 
     # ------------------------------------------------------------------
+    # R113.M5-025 (paideia-os #2405): kernel-side KIND_SEAT mint
+    # fingerprint (src/kernel/core/cap/kind_seat.pdx).  Unlike the
+    # sibling session/capture inits (pure zero-scrub), kind_seat_init
+    # additionally mints default seat 0 at boot via seat_create(0,
+    # &default_seat_name) so a single-seat kernel has seat 0 available
+    # before any real seat-manager landing runs.  This fires SEAT
+    # CREATE OK id=0 session=0 on every boot in the default QEMU
+    # matrix.  Allowlisted pending the golden refresh that pins this
+    # line into the boot fingerprint sequence; when that lands the
+    # entry retires and the assertion holds the invariant instead.
+    # ------------------------------------------------------------------
+    "seat create ok [legacy: SEAT CREATE OK]":
+        "R113.M5-025 (#2405): kernel-side KIND_SEAT mint "
+        "fingerprint; seat_create (src/kernel/core/cap/kind_seat.pdx) "
+        "emits via klog_s1_x2 with (id, session) KVs on every "
+        "successful mint past the session_slot + free-slot gates.  "
+        "kind_seat_init calls seat_create(0, &default_seat_name) at "
+        "boot to establish seat 0 for single-seat compatibility, "
+        "which makes this a live boot-witness emit today.  Pending "
+        "golden refresh to pin the line into the boot fingerprint "
+        "sequence; retire this entry when the compositor smoke "
+        "golden is updated.",
+
+    # ------------------------------------------------------------------
+    # R113.M7-035 (paideia-os #2415): SCREENCAST START OK fingerprint
+    # (src/kernel/core/cap/kind_screencast.pdx).  screencast_start
+    # validates the KIND_CAPTURE binding (capture_row_valid), the dst
+    # ring slot, the format, and the fps_limit ceiling (240), scans for
+    # a free slot, reads hpet_now_ns for started_ns (seeded as
+    # last_frame_ns), bumps the LAM generation on the claimed row,
+    # stamps capture_id + dst_ring_slot + format + fps_limit +
+    # frame_count=0 + started_ns + last_frame_ns, bumps _screencast_
+    # stats[STARTS] and emits SCREENCAST START OK id=<n> cap=<n>
+    # fps=<n> via klog_s1_x3 with the 3-push idiom.  Stop / frame /
+    # tick_all DO NOT emit per issue #2415 contract (start-only emit).
+    # Emitter is live but not reachable in the default matrix yet:
+    # kind_screencast_init runs at boot (defensive pool + stats zero-
+    # scrub) but is a pure zero-out, and no boot witness or cap-
+    # dispatcher arm calls screencast_start yet -- the follow-on
+    # capture-broker landing wiring OP_SCREENCAST_START /
+    # OP_SCREENCAST_STOP end-to-end (together with the vblank_handler
+    # wire-in of screencast_tick_all) will close this allowlist entry.
+    # Same wire-deferred posture as the sibling `capture grant ok`
+    # entry above.
+    # ------------------------------------------------------------------
+    "screencast start ok [legacy: SCREENCAST START OK]":
+        "R113.M7-035 (#2415): kernel-side KIND_SCREENCAST start "
+        "fingerprint; screencast_start (src/kernel/core/cap/kind_"
+        "screencast.pdx) emits this via klog_s1_x3 with (id, cap, "
+        "fps) KVs on every successful start past the "
+        "capture_row_valid + dst != 0 + format != 0 + fps <= 240 + "
+        "free-slot gates.  Substrate + emitter landed together; "
+        "kind_screencast_init runs at boot (defensive pool + stats "
+        "scrub) but is a pure zero-out, and both the cap-dispatcher "
+        "OP_SCREENCAST_START arm and the vblank_handler wire-in of "
+        "screencast_tick_all are follow-on landings (the latter "
+        "co-lands with the M7-033 frame_capture_emit hook).  "
+        "Assertable when the follow-on capture-broker landing (or a "
+        "boot witness) drives capture_grant -> screencast_start "
+        "end-to-end.",
+
+    # ------------------------------------------------------------------
     # R113.M5-026 (paideia-os #2406): SESSION REVOKE cascade fingerprint
     # (src/kernel/core/graphics/session_revoke.pdx).  session_revoke
     # tears down every KIND_SURFACE row + wrapping role authority
@@ -1717,6 +1779,44 @@ ALLOWLIST = {
         "(sibling issue, deferred).  Assertable when the M7-033 end-"
         "to-end capture witness lands and pins the record-shape decode "
         "against the same 96-byte constant in cascade.",
+
+    # ------------------------------------------------------------------
+    # R113.M7-033 (paideia-os #2413): FrameCaptureView@0.1 per-frame
+    # emission (src/kernel/core/graphics/frame_capture_emit.pdx).
+    # frame_capture_emit pushes one 96-byte FrameCaptureView@0.1 record
+    # into the 4-slot bounded ring _frame_capture_records at slot =
+    # _fcv_head & 3 and advances _fcv_head; it emits `frame capture
+    # emit ok fid=<n> sid=<n>` via klog_s1_x2 per emit.  Reachable in
+    # principle via the wire surface_present_notify -> frame_capture_
+    # maybe_emit_for_surface -> frame_capture_emit, but the wrapper
+    # gates on a covering KIND_CAPTURE consent grant (kind_capture.pdx
+    # §POOL SUBSTRATE) and the default 14-mode QEMU matrix mints no
+    # grants (the M7-036 capture-broker's UX path that mints them
+    # requires user-space driving; see kind_capture.pdx §SCOPE), so no
+    # emit fires in any current smoke mode.  Same real-HW / wire-
+    # deferred posture as the SCREENSHOT OK / SURFACE PRESENT OK /
+    # COMPOSITE GPU OK / VBLANK siblings above; assertable when a boot
+    # witness mints a KIND_CAPTURE grant covering a live surface and
+    # drives a full commit -> present cycle on it (which surfaces the
+    # emit through surface_present_notify's post-fingerprint hook).
+    # frame_capture_emit_init runs at boot (defensive ring scrub) but
+    # emits no fingerprint of its own.
+    # ------------------------------------------------------------------
+    "frame capture emit ok [legacy: FRAME CAPTURE EMIT OK]":
+        "R113.M7-033 (#2413): per-frame FrameCaptureView@0.1 emit "
+        "fingerprint; frame_capture_emit (src/kernel/core/graphics/"
+        "frame_capture_emit.pdx) emits via klog_s1_x2 with (fid=<frame_"
+        "id>, sid=<surface_id>) KVs on every successful ring push.  "
+        "Reachable via surface_present_notify -> frame_capture_maybe_"
+        "emit_for_surface -> frame_capture_emit, gated on a covering "
+        "KIND_CAPTURE consent grant.  Emitter is live but not reached "
+        "in the default matrix yet: the M7-036 capture-broker's UX "
+        "path that mints KIND_CAPTURE grants requires user-space "
+        "driving.  Same real-HW / wire-deferred posture as the "
+        "SCREENSHOT OK / SURFACE PRESENT OK / COMPOSITE GPU OK "
+        "siblings above; assertable when a boot witness mints a "
+        "KIND_CAPTURE grant covering a live surface and drives one "
+        "commit -> present cycle on it end-to-end.",
 
     # ------------------------------------------------------------------
     # R113.M2-011 (paideia-os #2391): global focus model

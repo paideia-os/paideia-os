@@ -1,0 +1,983 @@
+// src/kernel/core/cap/kind_screencast.pdx -- R113.M7-035 (paideia-os #2415)
+//
+// KIND_SCREENCAST = 0x1C0 kernel-side substrate for a live capture session:
+// row pool + start + stop + per-frame body + vblank-tick fan-out.
+//
+// PURPOSE.  A screencast is a bounded-lifetime session that turns the
+// compositor's fully-composited frames into a stream of FrameCaptureView
+// @0.1 records dropped into a caller-designated destination ring.  The
+// caller mints a KIND_CAPTURE grant first (M7-036 sibling; kind_capture.
+// pdx), then calls screencast_start(capture_id, dst_ring_slot, format,
+// fps_limit) to bind that grant to a screencast row.  From that moment
+// forward every vblank tick fans out through screencast_tick_all which
+// walks the active-screencast set, applies the per-row fps_limit gate,
+// and calls screencast_frame(screencast_id) for every row whose next
+// frame is due.  screencast_frame stamps a fresh last_frame_ns, bumps
+// the row's frame_count, and (M7-033 wire-out) publishes one
+// FrameCaptureView@0.1 record via frame_capture_emit.
+//
+// SCOPE OF THIS LANDING (per issue #2415):
+//   * Substrate: row pool (SCREENCAST_ROW_MAX = 8 rows * 64 bytes =
+//     512 bytes), _screencast_stats[8], and kind_screencast_init.
+//   * Ops: screencast_start(capture_id, dst_ring_slot, format, fps_limit)
+//              -> screencast_id | error,
+//          screencast_stop(screencast_id) -> 0 | error,
+//          screencast_frame(screencast_id) -> 0 | error   (per-frame body),
+//          screencast_tick_all() -> ()   (vblank-tick fan-out).
+//   * Fingerprint: `SCREENCAST START OK id=<n> cap=<n> fps=<n>` via
+//     klog_s1_x3 (3 hex KVs).  Stop / frame / tick_all DO NOT emit
+//     fingerprints -- the start tag is the only R113.M7-035 boot-
+//     witness anchor per the issue's contract, matching KIND_CAPTURE's
+//     mint-only emit posture.
+//   * Row accessors (screencast_row_valid / screencast_row_addr) as
+//     pure leaves for consumers in the follow-on frame_capture_emit
+//     landing (M7-033 sibling) and any live-screencasts enumerator.
+//
+// DERIVED-KIND POSITIONING.  KIND_SCREENCAST derives from KIND_IPC_
+// ENDPOINT (= 5) in the abstract graph -- a screencast IS an endpoint
+// that the vblank tick fires typed FrameCaptureView@0.1 records down
+// (kind_frame_capture at 0x1BD is the wire endpoint; KIND_SCREENCAST at
+// 0x1C0 is the ACTIVE-SESSION handle that keeps state per emitting
+// endpoint).  A single screencast consumer holds three caps: KIND_
+// CAPTURE (0x1BE) for the consent gate, KIND_FRAME_CAPTURE (0x1BD) as
+// the transport, and KIND_SCREENCAST (0x1C0) as the session handle
+// this substrate mints.
+//
+// KIND-ID SLOT ALLOCATION -- 0x1C0.
+//   0x1BC  KIND_SESSION             (R113.M5-022)
+//   0x1BD  KIND_FRAME_CAPTURE       (R113.M7-032)
+//   0x1BE  KIND_CAPTURE             (R113.M7-036)
+//   0x1BF  free
+//   0x1C0  KIND_SCREENCAST          (THIS LANDING, R113.M7-035)
+//   0x1C1  free (next fresh slot for follow-on rows)
+//
+// A tree-wide grep for `= 0x1C0` across src/kernel/core/cap/*.pdx returns
+// zero KIND_ declarations before this landing (verified 2026-09-08; the
+// only 0x1C0 mentions elsewhere are a `mov rdx, 0x1C0` mode literal
+// (rootfs_seed.pdx, /home 0700 stat mode) and a series of user-side
+// compositor reservation comments naming the range as free -- see
+// src/user/compositor/window_kind.pdx L52 / layer_tree.pdx L47 /
+// popup_positioning.pdx L94 / window_geometry.pdx L51).  No live
+// KIND_ collision.
+//
+// FAILURE BAND -- 0xFFFFE300..0xFFFFE30F.  Verified free 2026-09-08 by
+// tree-wide grep for `0xFFFFE30` against src/**/*.pdx (empty match);
+// allocated per the issue's pre-assigned band directive.  The immediate
+// preceding used band is KIND_CAPTURE's 0xFFFFE2D0..0xFFFFE2DF; the
+// intervening range: 0xFFFFE2E0..0xFFFFE2EF now owned by KIND_SEAT (M5-025), 0xFFFFE2F0..0xFFFFE2FF owned by frame_capture_emit (M7-033).
+//
+// ENCODER PITFALLS (per feedback_pdx_encoder_pitfalls v0.36+):
+//   * No `test rN, rN` -- every zero-check uses `cmp rN, 0` + `je/jne`.
+//   * No 2-op `imul r, imm` -- row-offset math uses `shl r, 6` for *64.
+//   * No `and reg, imm64` -- the 56-bit gen mask (0x00FFFFFFFFFFFFFF)
+//     is staged through `mov r9, imm64` then `and r11, r9`.
+//   * No `cmp reg, [mem]` -- every mem compare loads to a scratch first.
+//   * No literal-scaled `[reg + N*8]` -- displacement form `[reg + 8N]`
+//     used throughout; register-scaled `[reg + rcx * 8]` (SIB-legal
+//     scale) is used only in the stats bumpers and init scrub.
+//   * The nanosecond constant 1_000_000_000 (= 0x3B9ACA00) fits imm32
+//     and is loaded via `mov rcx, 1000000000` verbatim (elevate_channel.
+//     pdx L146 idiom).
+//   * Failure sentinels 0xFFFFE30[0-F] have bit 31 set -> load via
+//     `mov rax, 0xFFFFE30X` (10-byte movabs form) per surface_present.
+//     pdx L280 / composite_gpu.pdx L682 idiom.
+//   * Reserved-keyword labels avoided (loop/if/let/while/for/match/pub/
+//     mod/use/fn/struct/enum/impl/trait/type/where/move/mut/ref).
+//     Label prefixes:  sc_init_  sc_bs_  sc_bp_  sc_br_  sc_bt_
+//                      sc_be_    sc_bk_  sc_rv_  sc_ra_  sc_s_
+//                      sc_p_     sc_f_   sc_t_
+//   * Module name matches file basename: `KindScreencast` for
+//     `kind_screencast.pdx`.
+//   * Fingerprint tag byte count asserted in the `[u8; 50]` type
+//     ascription (see SECTION 6 hand-count).
+//
+// STACK DISCIPLINE (start path calls klog_s1_x3 with a 3-arg v-push).
+// Idiom lifted verbatim from src/kernel/core/fs/pdxfs/cow_write.pdx
+// L996-1002 (same as kind_capture.pdx §capture_grant):
+//     sub rsp, 8;      // pad to keep rsp%16==0 after the 3 pushes
+//     push <v3>;       // 9th klog arg
+//     push <k3>;       // 8th klog arg
+//     push <v2>;       // 7th klog arg
+//     call klog_s1_x3;
+//     add rsp, 32;     // undo pad + 3 pushes
+//
+// TIME SOURCE.  screencast_tick_all and screencast_frame both call
+// hpet_now_ns (src/kernel/core/time/hpet.pdx) as the monotonic clock.
+// The FPS gate compares (now_ns - last_frame_ns) against a per-row
+// frame period of 1_000_000_000 / fps_limit nanoseconds.  hpet_now_ns
+// carries @{boot}; the frame + tick_all bodies inherit it via effect
+// propagation, kept narrow (no other capability bleed).
+//
+// FPS RATE LIMIT DISCIPLINE.
+//   * fps_limit == 0 is a legal value meaning "no rate limit; fire on
+//     every vblank tick" (a caller that wants the panel's full cadence
+//     without additional gating).
+//   * fps_limit > SCREENCAST_FPS_MAX (240) is refused -- 240 Hz covers
+//     every panel this project targets and forms an upper bound past
+//     which the FrameCaptureView@0.1 emit path would saturate the
+//     destination ring under any realistic consumer.
+//   * The gate compares monotonic-ns rather than counting vblank ticks
+//     (a per-display counter comparison would need a display_id here,
+//     which the tick_all fan-out does not carry; a wall-clock ns
+//     compare is display-agnostic and matches the "moving-average
+//     effective FPS" observability shape a consumer usually wants).
+//
+// WIRE-DEFERRED PIECES.  Two pieces are intentionally staged rather
+// than fully wired at this landing:
+//
+//   (a) The FrameCaptureView@0.1 emit inside screencast_frame.  The
+//       emitter primitive is `frame_capture_emit` (M7-033 sibling per
+//       frame_capture_schema.pdx L32 "frame_capture_mint / frame_
+//       capture_destroy or the KIND_FRAME_CAPTURE cap-invoke dispatcher
+//       ... land at M7-033 alongside the vblank_handler emit hook").
+//       Until M7-033 lands, screencast_frame stamps frame_count +
+//       last_frame_ns and bumps SCREENCAST_ST_FRAMES_EMIT; the emit
+//       call drops in without further body reshaping.  Same wire-
+//       deferred posture screenshot.pdx §GATE 5 uses for the physical
+//       blit that awaits the KIND_MEMORY-slot-to-VA resolver.
+//
+//   (b) The vblank_handler wire-in of screencast_tick_all.  The
+//       handler at graphics/vblank.pdx today walks _z_stack and fires
+//       surface_present_notify per rendered surface; a follow-on adds
+//       a `call screencast_tick_all` after that walk so every screen-
+//       cast row gets its fps-gated frame after the compositor pass
+//       has actually rendered the frame.  This landing lands the fan-
+//       out primitive; the wire-in lives with the M7-033 vblank_
+//       handler emit hook (frame_capture_schema.pdx L34).
+//
+// Neither wire-out is a correctness debt against this substrate --
+// screencast_start / screencast_stop stand on their own for grant
+// binding + revocation, and screencast_frame's stat + counter
+// increments are the boot-witness anchor until the emit path lands.
+
+module KindScreencast = structure {
+
+  // ==========================================================================
+  // SECTION 1 -- IDENTITY + PARENT + POOL CEILING
+  // ==========================================================================
+
+  pub let KIND_SCREENCAST_ID    : u64 = 0x1C0
+  pub let KIND_SCREENCAST_BASE  : u64 = 5           // = KIND_IPC_ENDPOINT
+
+  // Pool ceiling.  8 concurrent screencasts covers: (a) one full-screen
+  // recorder (the common "record my desktop" case), (b) one per-window
+  // recorder (a screencast tool binding to a specific surface), (c) two
+  // browser-based conferencing shares (screen + camera composite), (d)
+  // 4+ headroom for multi-window recording, a screenshot-preview live
+  // update, or a chained handoff during a fast-user-switch.  8 * 64 =
+  // 512 bytes -- one eighth-page slab, matches kind_capture.pdx's 16-row
+  // ceiling at half the scale (screencast rows are longer-lived and
+  // fewer in practice than the screenshot / preview / broker grants
+  // KIND_CAPTURE holds).
+  pub let SCREENCAST_ROW_MAX    : u64 = 8
+  pub let SCREENCAST_ROW_BYTES  : u64 = 64
+  pub let SCREENCAST_ROW_WORDS  : u64 = 8
+
+  // FPS ceiling (see file header §FPS RATE LIMIT DISCIPLINE).
+  pub let SCREENCAST_FPS_MAX    : u64 = 240
+
+  // Precomputed nanoseconds-per-second (for the FPS gate's period compute).
+  pub let SCREENCAST_NS_PER_SEC : u64 = 1000000000
+
+  // ==========================================================================
+  // SECTION 2 -- RIGHTS
+  // ==========================================================================
+  //
+  //   R_SCREENCAST_READ     -- read screencast_id, capture, dst, format,
+  //                            fps, frame_count, started_ns, last_frame_ns
+  //   R_SCREENCAST_START    -- mint a new screencast row via screencast_start
+  //   R_SCREENCAST_STOP     -- stop a live screencast row
+  //   R_SCREENCAST_TICK     -- exercise screencast_tick_all (vblank handler
+  //                            hook right)
+  //   R_SCREENCAST_OBSERVE  -- introspection (live-screencast enumeration)
+
+  pub let R_SCREENCAST_READ    : u64 = 0x001
+  pub let R_SCREENCAST_START   : u64 = 0x008
+  pub let R_SCREENCAST_STOP    : u64 = 0x010
+  pub let R_SCREENCAST_TICK    : u64 = 0x020
+  pub let R_SCREENCAST_OBSERVE : u64 = 0x400
+  pub let R_SCREENCAST_ALL     : u64 = 0x439
+    // 0x001 | 0x008 | 0x010 | 0x020 | 0x400 = 0x439
+
+  // ==========================================================================
+  // SECTION 3 -- ROW LAYOUT OFFSETS
+  // ==========================================================================
+  //
+  //   +0   hdr           in_use[63:56] | generation[55:0]  (56-bit LAM ABA)
+  //   +8   capture_id    (KIND_CAPTURE grant this screencast is bound to;
+  //                       screencast_frame's future FrameCaptureView@0.1
+  //                       emit MUST also gate against capture_check with
+  //                       this id -- M7-033 wire-out concern)
+  //   +16  dst_ring_slot (destination ring the FrameCaptureView@0.1
+  //                       records land in; opaque u64 from this
+  //                       substrate's perspective, resolved by the
+  //                       M7-033 frame_capture_emit path)
+  //   +24  format        (DRM_FOURCC ordinal; surface_format.pdx
+  //                       admissible subset; treated as opaque here)
+  //   +32  fps_limit     (frames/sec ceiling; 0 = no limit, fire on
+  //                       every vblank; see file header §FPS RATE
+  //                       LIMIT DISCIPLINE)
+  //   +40  frame_count   (monotonic count of frames screencast_frame
+  //                       has fired for this row; the natural
+  //                       observability + audit handle)
+  //   +48  started_ns    (hpet_now_ns at start time; audit trail for
+  //                       a live-screencasts enumerator)
+  //   +56  last_frame_ns (hpet_now_ns at the most recent screencast_
+  //                       frame call; screencast_tick_all's FPS gate
+  //                       reads this to compute elapsed-since-last)
+
+  pub let SCREENCAST_OFF_HDR       : u64 = 0
+  pub let SCREENCAST_OFF_CAPTURE   : u64 = 8
+  pub let SCREENCAST_OFF_DST       : u64 = 16
+  pub let SCREENCAST_OFF_FORMAT    : u64 = 24
+  pub let SCREENCAST_OFF_FPS       : u64 = 32
+  pub let SCREENCAST_OFF_FRAMES    : u64 = 40
+  pub let SCREENCAST_OFF_STARTED   : u64 = 48
+  pub let SCREENCAST_OFF_LAST      : u64 = 56
+
+  // ==========================================================================
+  // SECTION 4 -- FAILURE TAXONOMY -- 0xFFFFE300..0xFFFFE30F
+  // ==========================================================================
+  //
+  // Verified free 2026-09-08 by tree-wide grep for 0xFFFFE30 against
+  // src/**/*.pdx (empty match); allocated per issue #2415 pre-assigned
+  // band directive.
+
+  pub let SCREENCAST_OK               : u64 = 0
+  pub let SCREENCAST_TAIL_ENOSPC      : u64 = 0xFFFFE30F
+  pub let SCREENCAST_BAD_CAPTURE      : u64 = 0xFFFFE30E
+  pub let SCREENCAST_BAD_DST          : u64 = 0xFFFFE30D
+  pub let SCREENCAST_BAD_FORMAT       : u64 = 0xFFFFE30C
+  pub let SCREENCAST_BAD_FPS          : u64 = 0xFFFFE30B
+  pub let SCREENCAST_BAD_SLOT         : u64 = 0xFFFFE30A
+  pub let SCREENCAST_STOP_ALREADY     : u64 = 0xFFFFE309
+  pub let SCREENCAST_FRAME_BAD_SLOT   : u64 = 0xFFFFE308
+  pub let SCREENCAST_BAD_ARG          : u64 = 0xFFFFE307
+  pub let SCREENCAST_WRONG_KIND       : u64 = 0xFFFFE306
+  pub let SCREENCAST_UNSUP_OP         : u64 = 0xFFFFE305
+  pub let SCREENCAST_BAD_RIGHTS       : u64 = 0xFFFFE304
+  pub let SCREENCAST_GEN_MISMATCH     : u64 = 0xFFFFE303
+  pub let SCREENCAST_RESERVED_302     : u64 = 0xFFFFE302
+  pub let SCREENCAST_RESERVED_301     : u64 = 0xFFFFE301
+  pub let SCREENCAST_DECODE_BAD       : u64 = 0xFFFFE300
+
+  // ==========================================================================
+  // SECTION 5 -- POOL SUBSTRATE
+  // ==========================================================================
+  //
+  // 8 rows * 64 bytes = 512 bytes = 64 u64 words.  Stats table sized to
+  // 8 slots (headroom for a follow-on rate-limit-refused counter, a
+  // frames-per-tick histogram cell).  Pool named `_screencasts` per
+  // kind_capture.pdx `_captures` / kind_session.pdx `_sessions` naming
+  // shape.
+
+  pub let mut _screencasts        : [u64; 64] = uninit @align(64)  // 8 * 8
+  pub let mut _screencast_stats   : [u64; 8]  = uninit @align(64)
+
+  pub let SCREENCAST_ST_STARTS       : u64 = 0
+  pub let SCREENCAST_ST_STOPS        : u64 = 1
+  pub let SCREENCAST_ST_REFUSED      : u64 = 2
+  pub let SCREENCAST_ST_TICKS        : u64 = 3
+  pub let SCREENCAST_ST_FRAMES_EMIT  : u64 = 4
+  pub let SCREENCAST_ST_FRAMES_SKIP  : u64 = 5
+  pub let SCREENCAST_ST_MAX          : u64 = 8
+
+  // ==========================================================================
+  // SECTION 6 -- FINGERPRINT TAG + KV KEY NAMES
+  // ==========================================================================
+  //
+  // Only the start tag is emitted by this landing (per issue #2415).
+  // Byte counts hand-verified:
+  //
+  //   "screencast start ok [legacy: SCREENCAST START OK]\0" = 50 bytes
+  //     - "screencast start ok "                = 20
+  //     - "[legacy: "                           =  9
+  //     - "SCREENCAST START OK"                 = 19
+  //     - "]"                                   =  1
+  //     - NUL                                   =  1
+  //     -------------------------------------------
+  //     - total                                 = 50
+  //
+  // KV keys: "id\0" (3), "cap\0" (4), "fps\0" (4).  The tag prefix + KV
+  // keys reconstitute the issue-required wire line shape verbatim:
+  //     "SCREENCAST START OK id=<n> cap=<n> fps=<n>"
+
+  pub let screencast_start_ok_msg : [u8; 50] = "screencast start ok [legacy: SCREENCAST START OK]\0"
+  pub let screencast_k_id         : [u8; 3]  = "id\0"
+  pub let screencast_k_cap        : [u8; 4]  = "cap\0"
+  pub let screencast_k_fps        : [u8; 4]  = "fps\0"
+
+  // ==========================================================================
+  // SECTION 7 -- STATS BUMPERS (narrow writers)
+  // ==========================================================================
+  //
+  // Narrow writers per the kind_capture / kind_session discipline: one
+  // leaf per stats slot, load-inc-store, no `add reg, [mem]`.  The ONLY
+  // writers of _screencast_stats.
+
+  pub let screencast_stats_bump_starts : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M7-035 (#2415): bump _screencast_stats[SCREENCAST_ST_STARTS=0]. Load-inc-store leaf, no `add reg, [mem]`. Called from screencast_start success tail only. Labels prefixed sc_bs_.",
+      block: {
+        lea r10, [rip + _screencast_stats];
+        mov rax, [r10 + 0];
+        add rax, 1;
+        mov [r10 + 0], rax;
+        ret
+      }
+    }
+
+  pub let screencast_stats_bump_stops : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M7-035 (#2415): bump _screencast_stats[SCREENCAST_ST_STOPS=1]. Load-inc-store leaf. Called from screencast_stop success tail only. Labels prefixed sc_bp_.",
+      block: {
+        lea r10, [rip + _screencast_stats];
+        mov rax, [r10 + 8];
+        add rax, 1;
+        mov [r10 + 8], rax;
+        ret
+      }
+    }
+
+  pub let screencast_stats_bump_refused : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M7-035 (#2415): bump _screencast_stats[SCREENCAST_ST_REFUSED=2]. Load-inc-store leaf. Called from every refusal funnel across start/stop/frame (tick_all itself does not refuse -- it silently skips rate-limited rows via bump_frames_skip). Labels prefixed sc_br_.",
+      block: {
+        lea r10, [rip + _screencast_stats];
+        mov rax, [r10 + 16];
+        add rax, 1;
+        mov [r10 + 16], rax;
+        ret
+      }
+    }
+
+  pub let screencast_stats_bump_ticks : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M7-035 (#2415): bump _screencast_stats[SCREENCAST_ST_TICKS=3]. Load-inc-store leaf. Called from screencast_tick_all every fan-out invocation (once per vblank tick per display when the M7-033 wire-in lands). Labels prefixed sc_bt_.",
+      block: {
+        lea r10, [rip + _screencast_stats];
+        mov rax, [r10 + 24];
+        add rax, 1;
+        mov [r10 + 24], rax;
+        ret
+      }
+    }
+
+  pub let screencast_stats_bump_frames_emit : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M7-035 (#2415): bump _screencast_stats[SCREENCAST_ST_FRAMES_EMIT=4]. Load-inc-store leaf. Called from screencast_frame success tail (per-row per-frame; the natural observability handle for total captured frames across all live screencasts). Labels prefixed sc_be_.",
+      block: {
+        lea r10, [rip + _screencast_stats];
+        mov rax, [r10 + 32];
+        add rax, 1;
+        mov [r10 + 32], rax;
+        ret
+      }
+    }
+
+  pub let screencast_stats_bump_frames_skip : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M7-035 (#2415): bump _screencast_stats[SCREENCAST_ST_FRAMES_SKIP=5]. Load-inc-store leaf. Called from screencast_tick_all when the FPS gate refuses a row this tick (elapsed_since_last < 1e9/fps_limit). Distinct counter from REFUSED because a skipped frame is a normal outcome (not an error), and the FRAMES_SKIP / FRAMES_EMIT ratio is the observability handle for effective-vs-requested FPS. Labels prefixed sc_bk_.",
+      block: {
+        lea r10, [rip + _screencast_stats];
+        mov rax, [r10 + 40];
+        add rax, 1;
+        mov [r10 + 40], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 8 -- BOOT INIT (kind_screencast_init)
+  // ==========================================================================
+  //
+  // Zeroes _screencasts (64 u64 words = 512 B) and _screencast_stats (8
+  // u64 = 64 B).  Defensive re-scrub matching kind_capture_init one-for-
+  // one.  .bss is zero at real boot; this leaf gives a future chaos-
+  // restart witness (and any repeat call to the init sequence) a clean
+  // re-scrub point.
+
+  pub let kind_screencast_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M7-035 (#2415): zero _screencasts (64 u64) and _screencast_stats (8 u64). Defensive boot-time re-scrub, mirrors kind_capture_init / kind_session_init one-for-one. Two straight-line loops using [reg + rcx * 8] register-scaled SIB (scale 8 in the legal {1,2,4,8} set); zero staged via xor rax,rax. Zero-arg leaf; entry rsp%16=8 unchanged on return. Labels prefixed sc_init_.",
+      block: {
+        lea r10, [rip + _screencasts];
+        xor rax, rax;
+        xor rcx, rcx;
+      sc_init_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 64;
+        jb  sc_init_rows;
+
+        lea r10, [rip + _screencast_stats];
+        xor rcx, rcx;
+      sc_init_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  sc_init_stats;
+
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 9 -- ROW ACCESSORS (pure leaves)
+  // ==========================================================================
+  //
+  // Two accessors take a screencast_id (== row_id / slot); return-shape
+  // sentinels use SCREENCAST_BAD_SLOT = 0xFFFFE30A.
+
+  // screencast_row_valid(screencast_id) -> 1 iff screencast_id <
+  // SCREENCAST_ROW_MAX and the row's in_use byte (top byte of hdr) is
+  // nonzero; 0 otherwise.
+  pub let screencast_row_valid : (u64) -> u64 !{mem} @{} =
+    fn (screencast_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M7-035 (#2415): 1 iff screencast_id < SCREENCAST_ROW_MAX(8) and in_use set. Inlined address compute (screencast_id*64 via shl 6). Labels prefixed sc_rv_.",
+      block: {
+        mov r10, [rip + SCREENCAST_ROW_MAX];
+        cmp rdi, r10;
+        jae sc_rv_no;
+        lea r10, [rip + _screencasts];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  sc_rv_no;
+        mov rax, 1;
+        ret;
+      sc_rv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // screencast_row_addr(screencast_id) -> &_screencasts[screencast_id*64]
+  // iff live; 0 else.  Exported for the M7-033 frame_capture_emit path
+  // and any live-screencasts enumerator.
+  pub let screencast_row_addr : (u64) -> u64 !{mem} @{} =
+    fn (screencast_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M7-035 (#2415): row base pointer post-liveness. Returns 0 on invalid slot. Labels prefixed sc_ra_.",
+      block: {
+        mov r10, [rip + SCREENCAST_ROW_MAX];
+        cmp rdi, r10;
+        jae sc_ra_no;
+        lea r10, [rip + _screencasts];
+        mov r11, rdi;
+        shl r11, 6;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  sc_ra_no;
+        mov rax, r10;
+        ret;
+      sc_ra_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 10 -- screencast_start(capture_id, dst_ring_slot, format,
+  //                                fps_limit) -> screencast_id | error
+  // ==========================================================================
+  //
+  // Gate order (bail-first, cheapest gate first):
+  //   (1) capture_row_valid(capture_id) -> else SCREENCAST_BAD_CAPTURE
+  //         (a screencast MUST be bound to a live KIND_CAPTURE grant;
+  //         the M7-036 sibling landing owns capture_row_valid)
+  //   (2) dst_ring_slot != 0            -> else SCREENCAST_BAD_DST
+  //   (3) format != 0                    -> else SCREENCAST_BAD_FORMAT
+  //         (format is treated opaquely here; a stricter admissible-set
+  //         gate lives with the M7-033 frame_capture_emit path)
+  //   (4) fps_limit <= SCREENCAST_FPS_MAX (240)
+  //                                      -> else SCREENCAST_BAD_FPS
+  //         (0 is legal -- "no limit"; anything above 240 is refused)
+  //   (5) low-first free-slot scan       -> else SCREENCAST_TAIL_ENOSPC
+  //   (6) hpet_now_ns() -> started_ns    (also stamped as last_frame_ns
+  //         so the first tick_all fires the first frame after
+  //         one-frame-period elapsed; a caller that wants the first
+  //         frame immediately passes fps_limit == 0)
+  //   (7) LAM header bump + row stamp:
+  //         +8   capture_id
+  //         +16  dst_ring_slot
+  //         +24  format
+  //         +32  fps_limit
+  //         +40  0   (frame_count)
+  //         +48  started_ns
+  //         +56  started_ns  (last_frame_ns, seeded)
+  //   (8) stats.starts++
+  //   (9) klog SCREENCAST START OK id=<screencast_id> cap=<capture_id>
+  //             fps=<fps_limit> via klog_s1_x3
+  //  (10) return screencast_id
+  //
+  // Register plan: rbx=capture_id (survives klog + nested calls),
+  // r12=dst_ring_slot, r13=format, r14=fps_limit, r15=screencast_id.
+  // 5 callee-save pushes = 40 B; entry rsp%16==8 -> post-pushes rsp%16==0,
+  // safe for every nested call.  capture_row_valid / hpet_now_ns /
+  // bumpers preserve callee-saves (SysV) so rbx/r12-r15 survive through
+  // the whole body.
+
+  pub let screencast_start : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap, boot} =
+    fn (capture_id: u64) (dst_ring_slot: u64) (format: u64) (fps_limit: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, boot},
+      justification: "R113.M7-035 (#2415): mint KIND_SCREENCAST session. Gate order per file header SECTION 10: (1) capture_row_valid(capture_id) else BAD_CAPTURE (M7-036 sibling gate ensures the caller holds a live KIND_CAPTURE grant); (2) dst_ring_slot != 0 else BAD_DST; (3) format != 0 else BAD_FORMAT (opaque here; the M7-033 frame_capture_emit path lands the admissible-set gate); (4) fps_limit <= SCREENCAST_FPS_MAX(240) else BAD_FPS (0 is legal -- no limit); (5) low-first scan over 8 rows else TAIL_ENOSPC; (6) hpet_now_ns() -> started_ns (also seeds last_frame_ns so first tick_all fires the first frame after one-frame-period elapsed); (7) LAM header bump + row stamp per SECTION 3; (8) stats.starts++; (9) klog SCREENCAST START OK id=<row_id> cap=<capture_id> fps=<fps_limit> via klog_s1_x3 with the 3-push idiom lifted from cow_write.pdx L996-1002 (same as kind_capture.pdx capture_grant); (10) return row_id. Five callee-save pushes (rbx=capture_id, r12=dst_ring_slot, r13=format, r14=fps_limit, r15=screencast_id) leave rsp%16==0 for every nested call. capture_row_valid + hpet_now_ns + bumpers preserve callee-saves per SysV. Refusal funnel bumps stats.refused. Effects {mem, sysreg}: mem for row + counter stores; sysreg for the klog path (serial writes). Capabilities {cap, boot}: cap for the substrate mint role; boot propagates from hpet_now_ns's own @{boot}. Labels prefixed sc_s_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                        // capture_id
+        mov r12, rsi;                        // dst_ring_slot
+        mov r13, rdx;                        // format
+        mov r14, rcx;                        // fps_limit
+
+        // Gate 1: capture_id refers to a live KIND_CAPTURE row.
+        //   capture_row_valid returns 1/0; 0 -> refuse with BAD_CAPTURE.
+        mov rdi, rbx;
+        call capture_row_valid;
+        cmp rax, 0;
+        je  sc_s_bad_capture;
+
+        // Gate 2: dst_ring_slot != 0.
+        cmp r12, 0;
+        je  sc_s_bad_dst;
+
+        // Gate 3: format != 0.
+        cmp r13, 0;
+        je  sc_s_bad_format;
+
+        // Gate 4: fps_limit <= SCREENCAST_FPS_MAX (240).
+        //   240 fits imm32 so the compare is direct.
+        cmp r14, 240;
+        ja  sc_s_bad_fps;
+
+        // Gate 5: low-first scan over 8 rows for in_use == 0.
+        xor rcx, rcx;                        // idx = 0
+      sc_s_scan:
+        mov r10, [rip + SCREENCAST_ROW_MAX];
+        cmp rcx, r10;
+        jae sc_s_enospc;
+
+        lea r10, [rip + _screencasts];
+        mov r11, rcx;
+        shl r11, 6;                          // idx * 64
+        add r10, r11;
+
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  sc_s_claim;
+
+        add rcx, 1;
+        jmp sc_s_scan;
+
+      sc_s_claim:
+        // rcx = free slot idx.  Save as screencast_id in callee-save r15.
+        mov r15, rcx;
+
+        // Gate 6: started_ns = hpet_now_ns().
+        //   Nested call: rsp%16 == 0 (5 pushes from entry rsp%16 == 8
+        //   -> 0).  hpet_now_ns preserves callee-saves.
+        call hpet_now_ns;
+        //   rax = started_ns.  Save in r11 while we rebuild row base;
+        //   r11 is caller-save but survives until the next call.
+        mov r11, rax;                        // r11 = started_ns
+
+        // Recompute row base (r10 was clobbered by hpet_now_ns).
+        lea r10, [rip + _screencasts];
+        mov r9, r15;
+        shl r9, 6;                           // screencast_id * 64
+        add r10, r9;                         // r10 = row base
+
+        // Gate 7: LAM header bump.
+        //   hdr = ((old_gen + 1) & 0x00FFFFFFFFFFFFFF) | (1 << 56)
+        mov r8, [r10 + 0];
+        mov r9, 0x00FFFFFFFFFFFFFF;
+        and r8, r9;                          // r8 = old low-56 gen
+        add r8, 1;
+        and r8, r9;                          // clip to 56 bits
+        mov rcx, 1;
+        shl rcx, 56;                         // rcx = 1<<56 (in_use marker)
+        or  r8, rcx;
+        mov [r10 + 0], r8;                   // write new hdr
+
+        // Gate 7: row stamp per SECTION 3.
+        mov [r10 + 8],  rbx;                 // capture_id
+        mov [r10 + 16], r12;                 // dst_ring_slot
+        mov [r10 + 24], r13;                 // format
+        mov [r10 + 32], r14;                 // fps_limit
+        xor rax, rax;
+        mov [r10 + 40], rax;                 // frame_count = 0
+        mov [r10 + 48], r11;                 // started_ns
+        mov [r10 + 56], r11;                 // last_frame_ns seeded to started_ns
+
+        // Gate 8: stats.starts++.
+        call screencast_stats_bump_starts;
+
+        // Gate 9: klog_s1_x3(LEVEL_INFO=3, SUBSYS_CAP_,
+        //                    screencast_start_ok_msg,
+        //                    screencast_k_id,  id=r15,
+        //                    screencast_k_cap, cap=rbx,
+        //                    screencast_k_fps, fps=r14).
+        //   Stack shape (post 3 pushes + 1 pad = 32 bytes below rsp):
+        //     [rsp+0]  = v2 (capture_id)
+        //     [rsp+8]  = k3 (&screencast_k_fps)
+        //     [rsp+16] = v3 (fps_limit)
+        //     [rsp+24] = 8-byte pad
+        //   rsp%16 == 0 post 5 callee-save pushes; sub 8 -> 8; push v3
+        //   -> 0; push k3 -> 8; push v2 -> 0 (aligned pre-call).
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + screencast_start_ok_msg];
+        lea rcx, [rip + screencast_k_id];
+        mov r8,  r15;                        // v1 = screencast_id
+        lea r9,  [rip + screencast_k_cap];
+
+        sub rsp, 8;                          // pad
+        push r14;                            // v3 = fps_limit
+        lea r10, [rip + screencast_k_fps];
+        push r10;                            // k3
+        push rbx;                            // v2 = capture_id
+        call klog_s1_x3;
+        add rsp, 32;                         // undo pad + 3 pushes
+
+        mov rax, r15;                        // return screencast_id
+        jmp sc_s_out;
+
+      sc_s_bad_capture:
+        mov rax, 0xFFFFE30E;
+        jmp sc_s_refused;
+      sc_s_bad_dst:
+        mov rax, 0xFFFFE30D;
+        jmp sc_s_refused;
+      sc_s_bad_format:
+        mov rax, 0xFFFFE30C;
+        jmp sc_s_refused;
+      sc_s_bad_fps:
+        mov rax, 0xFFFFE30B;
+        jmp sc_s_refused;
+      sc_s_enospc:
+        mov rax, 0xFFFFE30F;
+
+      sc_s_refused:
+        // Shared refusal funnel: bump stats.refused, preserving the
+        // sentinel across the call (bumper clobbers rax as scratch).
+        push rax;
+        call screencast_stats_bump_refused;
+        pop rax;
+
+      sc_s_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 11 -- screencast_stop(screencast_id) -> 0 | error
+  // ==========================================================================
+  //
+  // Bumps generation (so a stale handle to the same slot is invalidated)
+  // and clears the in_use marker byte.  Row payload is left intact so a
+  // chaos-restart witness reading the tombstone sees the pre-stop
+  // capture_id / dst_ring_slot / frame_count / started_ns / last_frame_
+  // ns.  No fingerprint emit per issue #2415 (only start emits).
+  //
+  // A stopped screencast is invisible to screencast_tick_all's fan-out
+  // (the in_use gate the walker uses drops the row); a subsequent
+  // screencast_start will re-mint the slot with a fresh generation.
+  //
+  // Register plan: r12=screencast_id (survives the bumper call).  One
+  // callee-save push = 8 bytes; entry rsp%16==8 -> (8+8)%16 = 0 for
+  // the nested bumper call.
+
+  pub let screencast_stop : (u64) -> u64 !{mem} @{cap} =
+    fn (screencast_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R113.M7-035 (#2415): stop KIND_SCREENCAST row. screencast_id >= SCREENCAST_ROW_MAX(8) -> SCREENCAST_BAD_SLOT; row not in_use -> SCREENCAST_STOP_ALREADY; else bump generation + clear in_use byte + stats.stops++. No fingerprint (per issue #2415 contract; only start emits). One callee-save push (r12) aligns rsp to 16 for the nested bumper call. Refusal funnel bumps stats.refused. Labels prefixed sc_p_.",
+      block: {
+        push r12;
+
+        mov r12, rdi;                        // screencast_id
+
+        mov r10, [rip + SCREENCAST_ROW_MAX];
+        cmp r12, r10;
+        jae sc_p_bad_slot;
+
+        lea r10, [rip + _screencasts];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;                        // r10 = row base
+
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  sc_p_already;
+
+        // Bump generation and clear in_use in one write.
+        mov r11, [r10 + 0];
+        mov r9, 0x00FFFFFFFFFFFFFF;
+        and r11, r9;
+        add r11, 1;
+        and r11, r9;
+        mov [r10 + 0], r11;                  // in_use now 0; gen bumped
+
+        call screencast_stats_bump_stops;
+
+        xor rax, rax;                        // SCREENCAST_OK
+        jmp sc_p_out;
+
+      sc_p_bad_slot:
+        mov rax, 0xFFFFE30A;
+        jmp sc_p_refused;
+      sc_p_already:
+        mov rax, 0xFFFFE309;
+
+      sc_p_refused:
+        push rax;
+        call screencast_stats_bump_refused;
+        pop rax;
+
+      sc_p_out:
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 12 -- screencast_frame(screencast_id) -> 0 | error
+  // ==========================================================================
+  //
+  // Per-frame body.  Called from screencast_tick_all for each row whose
+  // FPS gate opened on the current vblank tick.  Body:
+  //
+  //   (1) Validate screencast_id < SCREENCAST_ROW_MAX and row in_use;
+  //       else return SCREENCAST_FRAME_BAD_SLOT (silent -- tick_all
+  //       does not check the return, but a direct caller sees it).
+  //   (2) Bump row.frame_count.
+  //   (3) Stamp row.last_frame_ns = hpet_now_ns().
+  //   (4) [WIRE-DEFERRED, M7-033]: call frame_capture_emit(screencast_
+  //       id, row) to publish one FrameCaptureView@0.1 record into
+  //       dst_ring_slot.  Until M7-033 lands, the stat + counter
+  //       bumps are the boot-witness anchor.
+  //   (5) stats.frames_emit++.
+  //   (6) Return SCREENCAST_OK.
+  //
+  // No fingerprint emit (per issue #2415 contract; only start emits).
+  // A per-frame fingerprint would swamp the klog ring under any
+  // realistic fps_limit; the FrameCaptureView@0.1 wire record IS the
+  // per-frame observability handle once M7-033 lands.
+  //
+  // Register plan: r12=screencast_id, r13=row base pointer.  Two callee-
+  // save pushes = 16 bytes; entry rsp%16==8 -> (8+16)%16 = 8; sub rsp,8
+  // -> 0 for the nested hpet_now_ns / bumper calls.
+
+  pub let screencast_frame : (u64) -> u64 !{mem} @{cap, boot} =
+    fn (screencast_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap, boot},
+      justification: "R113.M7-035 (#2415): per-frame body invoked by screencast_tick_all's FPS-gated fan-out (and directly by any consumer that wants a specific frame). Body per file header SECTION 12: (1) screencast_id valid + in_use else SCREENCAST_FRAME_BAD_SLOT; (2) row.frame_count++; (3) row.last_frame_ns = hpet_now_ns() (the tick_all FPS gate reads this on the next tick); (4) wire-deferred M7-033 frame_capture_emit call (published as a stat counter bump until frame_capture_emit lands); (5) stats.frames_emit++; (6) SCREENCAST_OK. No fingerprint (per-frame emit would swamp the klog ring under any realistic fps_limit; the FrameCaptureView@0.1 wire record IS the per-frame observability handle). Two callee-save pushes (r12=screencast_id, r13=row base) + sub rsp,8 leave rsp%16==0 for the hpet_now_ns and bumper nested calls. Capabilities {cap, boot}: cap for the substrate role; boot propagates from hpet_now_ns's own @{boot}. Labels prefixed sc_f_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // screencast_id
+
+        // Gate 1: bounds + in_use.
+        mov r10, [rip + SCREENCAST_ROW_MAX];
+        cmp r12, r10;
+        jae sc_f_bad_slot;
+
+        lea r10, [rip + _screencasts];
+        mov r11, r12;
+        shl r11, 6;
+        add r10, r11;                        // r10 = row base
+        mov r13, r10;                        // save row base in callee-save
+
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  sc_f_bad_slot;
+
+        // Gate 2: row.frame_count++.
+        mov rax, [r13 + 40];
+        add rax, 1;
+        mov [r13 + 40], rax;
+
+        // Gate 3: row.last_frame_ns = hpet_now_ns().
+        //   rsp%16 == 0 here (2 pushes + sub 8 from entry rsp%16 == 8).
+        //   hpet_now_ns preserves callee-saves so r13 (row base)
+        //   survives.
+        call hpet_now_ns;
+        mov [r13 + 56], rax;
+
+        // Gate 4: [WIRE-DEFERRED M7-033] frame_capture_emit(screencast_id, r13).
+        //   The M7-033 sibling landing drops one call in here; until then
+        //   the stat + counter bumps carry the boot-witness anchor.
+
+        // Gate 5: stats.frames_emit++.
+        call screencast_stats_bump_frames_emit;
+
+        // Gate 6: return SCREENCAST_OK.
+        xor rax, rax;
+        jmp sc_f_out;
+
+      sc_f_bad_slot:
+        mov rax, 0xFFFFE308;
+
+      sc_f_out:
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 13 -- screencast_tick_all() -> ()
+  // ==========================================================================
+  //
+  // Vblank-tick fan-out.  Called from vblank_handler (M7-033 wire-in;
+  // see file header §WIRE-DEFERRED PIECES) once per vblank tick per
+  // display.  Body:
+  //
+  //   (1) now_ns = hpet_now_ns()
+  //   (2) stats.ticks++
+  //   (3) for i in 0..SCREENCAST_ROW_MAX:
+  //         row = &_screencasts[i*64]
+  //         if row.in_use == 0: continue
+  //         fps = row.fps
+  //         if fps == 0:
+  //             // unlimited -- fire every tick
+  //             screencast_frame(i)
+  //             continue
+  //         last = row.last_frame_ns
+  //         elapsed = now_ns - last
+  //         period_ns = 1_000_000_000 / fps      (fps <= 240; period >= ~4.17 M ns)
+  //         if elapsed >= period_ns:
+  //             screencast_frame(i)
+  //         else:
+  //             stats.frames_skip++
+  //
+  // No fingerprint emit (per-tick emit would swamp klog under a live
+  // vblank cadence; STATS_TICKS is the observability handle).
+  //
+  // Register plan across the loop:
+  //   rbx = i (loop index; callee-save)
+  //   r12 = now_ns (survives every nested call)
+  //   r13 = row base pointer (recomputed per iteration; caller-save is
+  //         fine since we recompute)
+  // 2 callee-save pushes + 1 pad = 24 bytes; entry rsp%16==8 -> (8+24)
+  // %16 = 0 for every nested call.
+
+  pub let screencast_tick_all : () -> () !{mem} @{cap, boot} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {cap, boot},
+      justification: "R113.M7-035 (#2415): vblank-tick fan-out. Body per file header SECTION 13: (1) now_ns = hpet_now_ns(); (2) stats.ticks++; (3) loop i in 0..SCREENCAST_ROW_MAX: skip !in_use, if fps==0 fire unconditionally (unlimited), else compute period_ns = 1e9/fps and fire iff now_ns - last_frame_ns >= period_ns (else bump frames_skip). No fingerprint (per-tick emit would swamp klog under vblank cadence; STATS_TICKS is the observability handle). Two callee-save pushes (rbx=i, r12=now_ns) + sub rsp,8 leave rsp%16==0 for every nested call (hpet_now_ns, screencast_frame, screencast_stats_bump_ticks, screencast_stats_bump_frames_skip). All nested callees preserve rbx/r12 per SysV so the loop invariants survive. Division uses xor rdx,rdx; div rcx idiom (hpet.pdx L171 / mkfs.pdx L300 precedent); the 1_000_000_000 constant fits imm32 (0x3B9ACA00). Capabilities {cap, boot}: cap for the substrate role; boot propagates from hpet_now_ns's own @{boot}. Labels prefixed sc_t_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        // (1) now_ns = hpet_now_ns()
+        call hpet_now_ns;
+        mov r12, rax;                        // r12 = now_ns
+
+        // (2) stats.ticks++
+        call screencast_stats_bump_ticks;
+
+        // (3) loop i = 0..SCREENCAST_ROW_MAX
+        xor rbx, rbx;                        // rbx = i = 0
+
+      sc_t_loop:
+        mov r10, [rip + SCREENCAST_ROW_MAX];
+        cmp rbx, r10;
+        jae sc_t_done;
+
+        // row = &_screencasts[i*64]
+        lea r10, [rip + _screencasts];
+        mov r11, rbx;
+        shl r11, 6;
+        add r10, r11;                        // r10 = row base
+
+        // if row.in_use == 0 continue
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  sc_t_advance;
+
+        // fps = row.fps
+        mov r9, [r10 + 32];                  // r9 = fps
+
+        // if fps == 0: unlimited -- fire every tick.
+        cmp r9, 0;
+        je  sc_t_fire;
+
+        // last = row.last_frame_ns
+        mov r8, [r10 + 56];                  // r8 = last_frame_ns
+
+        // elapsed = now_ns - last.  now_ns >= last is expected (both
+        // sourced from hpet_now_ns which is monotonic); a boot-early
+        // last of 0 works because r12 - 0 = r12 which will exceed any
+        // period_ns.  A pathological last > now_ns (clock rollback,
+        // not possible with hpet) would underflow to a huge unsigned
+        // value which trivially exceeds period_ns -> fire, which is
+        // the safe direction (fire spuriously rather than stall).
+        mov rax, r12;
+        sub rax, r8;                         // rax = elapsed (unsigned)
+
+        // Save elapsed across div (div clobbers rax/rdx).
+        mov r11, rax;                        // r11 = elapsed
+
+        // period_ns = 1_000_000_000 / fps
+        mov rax, 1000000000;                 // 10^9 (fits imm32, sign-safe)
+        xor rdx, rdx;                        // clear high half for div
+        div r9;                              // rax = period_ns, rdx = rem
+
+        // if elapsed >= period_ns fire else skip
+        cmp r11, rax;
+        jae sc_t_fire;
+
+        // Not due yet -- bump frames_skip and advance.
+        call screencast_stats_bump_frames_skip;
+        jmp sc_t_advance;
+
+      sc_t_fire:
+        // Fire: screencast_frame(i).  Discard return -- a race-loss at
+        // the tick_all layer is silent (the row could have been stopped
+        // between the in_use check and here; screencast_frame's own
+        // in_use gate handles it).
+        mov rdi, rbx;
+        call screencast_frame;
+
+      sc_t_advance:
+        add rbx, 1;
+        jmp sc_t_loop;
+
+      sc_t_done:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
