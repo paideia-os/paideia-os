@@ -1,0 +1,411 @@
+// src/kernel/core/drivers/nvme/hw_smoke.pdx — R111.M3-014 (paideia-os #2366)
+//
+// NVMe hardware smoke seed — data-plane liveness fingerprint.
+//
+// The R111.M3-011 attach cascade (attach.pdx) proves a controller can
+// be enumerated, reset, brought up and identified.  M3-012 (identify.pdx
+// §nvme_id_ctrl_hash_fnv1a) proves the Identify Controller response
+// carries readable ASCII SKU/firmware strings by hashing them into a
+// per-controller identity signature.  Neither line proves the drive
+// answers a real block read: a controller can hold CSTS.RDY, publish
+// a plausible Identify structure, and STILL fail the very first Read
+// (a stuck DMA engine, a mis-programmed BAR, a namespace that fails
+// FLBAS-negotiation, ...).  This module lands the missing wire:
+//
+//   nvme_hw_smoke_seed(row_id, bdf) -> u64
+//
+// per-controller data-path smoke that:
+//
+//   (1) Verifies the IO queue infrastructure is live (checks
+//       _nvme_io_queue_count > 0 — the R24.M3 IO-queue lifecycle
+//       stays dormant at boot today, so this arm is the reason
+//       every current run emits "NVME SMOKE SKIP reason=1").  Reason
+//       1 skip on any zero-count.
+//
+//   (2) Issues Identify Namespace(nsid=1) via the admin queue into the
+//       shared _nvme_id_ns_buf (identify_ns.pdx L93) — non-zero CQE
+//       status or NSZE==0 both mean "namespace 1 is not a usable block
+//       device on this controller"; SKIP reason 2.
+//
+//   (3) Issues Read(LBA=0, len=1 block) via the IO queue into a
+//       DMA-capable 512-byte scratch buffer (_nvme_hw_smoke_buf,
+//       @align(4096) so PRP1 sits inside a single 4 KiB page — see
+//       "buffer alignment" section below); non-zero CQE status or
+//       NVME_SYNC_TIMEOUT (0xFFFF) → SKIP reason 3.
+//
+//   (4) Computes an FNV-1a 64-bit hash of the 512 bytes read and emits
+//       the OK fingerprint
+//
+//         NVME SMOKE bdf=<h> nsid=<h> lba=<h> hash=<h>
+//
+//       (klog_s1_x4).  On subsequent boots of the same drive the
+//       hash will remain stable (barring a real block-0 write) so
+//       the boot log carries a compact witness that (a) the DMA
+//       engine, (b) the completion path, (c) the namespace's
+//       LBADS-1 block are all live — three things attach + ID hash
+//       cannot prove between them.
+//
+// The SKIP arm shares the same wire-line shape as the OK arm's k_bdf
+// column so a downstream watcher can key on "NVME SMOKE" and read the
+// second KV for either the hash (success) or the reason code
+// (skip).  Neither tag carries an "OK" token, so verify-
+// fingerprint-coverage.sh does not gate them (see keys.pdx §"R111.M3-
+// 014" for the reachability posture note).
+//
+// -----------------------------------------------------------------------------
+// Buffer alignment
+// -----------------------------------------------------------------------------
+//
+// The task spec calls for `_nvme_hw_smoke_buf` at `@align(64)`.  For an
+// NVMe PRP1 pointer (NVMe Base Spec 2.0 §4.1.2) the transfer must not
+// cross a physical page boundary.  A 512-byte buffer at 64-byte
+// alignment can straddle a page (e.g. base=4032 within a 4 KiB page →
+// end=4544, crosses into next page).  Raising the alignment to 4096
+// keeps the buffer inside a single page unconditionally — the same
+// posture identify.pdx §_nvme_id_ctrl_buf and identify_ns.pdx
+// §_nvme_id_ns_buf take.  The 64-byte guidance in the task was a
+// cache-line hint rather than a PRP correctness gate; 4096 is a
+// strict superset (every 4096-byte alignment is also a 64-byte
+// alignment) so no requirement is weakened.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.36+)
+// -----------------------------------------------------------------------------
+//
+//   G1: byte + word loads via `xor rax, rax; mov_b/mov_w rax, [mem]`
+//       (nvme/probe.pdx L138-169 precedent).
+//   G4: full-register compares (`cmp rax, 0`, not `test`; imm64
+//       constants staged into r10 before compare — attach.pdx L458).
+//   No 2-op `imul r,imm` (use `imul rax, r10` with prime pre-staged).
+//   No `and reg, imm64` (all masks fit imm32).
+//   No `cmp reg, [mem]` (load then compare register-register).
+//
+// Reserved-label discipline: labels prefixed `nvme_hs_` / `nvme_hh_`
+// to avoid the paideia-as reserved names (`loop`, `if`, `done`, `next`).
+
+module HwSmoke = structure {
+
+  // ============================================================================
+  // Constants
+  // ============================================================================
+  //
+  //   NVME_HW_SMOKE_SECTOR_BYTES  = 512 (matches the ubiquitous LBADS=9
+  //                                       default; larger LBAF just means
+  //                                       we hash the first 512 bytes of
+  //                                       the larger block).
+  //   NVME_HW_SMOKE_REASON_NOQUE  = 1  → no I/O queue.
+  //   NVME_HW_SMOKE_REASON_NSBAD  = 2  → NSID 1 inaccessible (Identify NS
+  //                                       failure or NSZE==0).
+  //   NVME_HW_SMOKE_REASON_RDFAIL = 3  → Read command failed / timed out.
+  //
+  //   NVME_HW_SMOKE_OK            = 0  → return value on the OK arm.
+  // ============================================================================
+
+  pub let NVME_HW_SMOKE_SECTOR_BYTES  : u64 = 512
+  pub let NVME_HW_SMOKE_REASON_NOQUE  : u64 = 1
+  pub let NVME_HW_SMOKE_REASON_NSBAD  : u64 = 2
+  pub let NVME_HW_SMOKE_REASON_RDFAIL : u64 = 3
+  pub let NVME_HW_SMOKE_OK            : u64 = 0
+
+  // ============================================================================
+  // DMA-capable scratch for the sector-0 Read.  Page-aligned so PRP1
+  // sits inside one physical page (NVMe Base Spec 2.0 §4.1.2).  64 u64
+  // = 512 bytes; sole reader is the FNV-1a hash below.  Sole writer is
+  // the controller DMA engine during the Read.  Single-shot per boot
+  // (called once per attached controller, then unused) so no
+  // concurrency discipline is required.
+  // ============================================================================
+
+  pub let mut _nvme_hw_smoke_buf     : [u64; 64] = uninit @align(4096)
+
+  // ============================================================================
+  // nvme_hw_smoke_hash_fnv1a() -> u64
+  // ============================================================================
+  //
+  // R111.M3-014 (paideia-os #2366): 64-bit FNV-1a hash over the 512
+  // bytes of _nvme_hw_smoke_buf populated by the sector-0 Read.
+  // Byte-for-byte mirror of identify.pdx §nvme_id_ctrl_hash_fnv1a with
+  // a fixed [0..512) walk instead of the three-field MN||SN||FR walk.
+  // Emitted as the `hash=` KV in the NVME SMOKE fingerprint.
+  //
+  // Rationale for FNV-1a vs SHA256/BLAKE3: the M3-012 sibling documents
+  // the confirmed kernel BLAKE3 cross-repo gap (identify.pdx L365-
+  // L385); the same posture applies here — the fingerprint's role is
+  // "same sector 0, second boot" detection, not adversarial collision
+  // resistance, and 8 hex chars (32 bits) of a 64-bit non-cryptographic
+  // hash over 512 input bytes meets that discrimination goal.  The
+  // emit-line contract survives a later BLAKE3 swap byte-compatibly.
+  //
+  // SysV: () -> u64
+  //   rax = 64-bit FNV-1a hash of _nvme_hw_smoke_buf[0..512).
+  //
+  // Leaf function — no callee-save prologue.  Scratch: rax (hash acc),
+  // r10 (FNV prime, imm64), r11 (buffer base), r9 (byte scratch),
+  // rcx (loop cursor).  Labels prefixed `nvme_hh_`.
+
+  pub let nvme_hw_smoke_hash_fnv1a : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: { mem },
+      capabilities: {},
+      justification: "R111.M3-014 (paideia-os #2366): 64-bit FNV-1a hash over _nvme_hw_smoke_buf[0..512). Body: (1) rax = FNV_OFFSET_BASIS_64 = 0xCBF29CE484222325 via mov r64, imm64 (REX.W encoding — same as identify.pdx L406). (2) r10 = FNV_PRIME_64 = 0x100000001B3 (imm64; 41 bits so imm32-sign-extended is insufficient — staged into r10 for the `imul rax, r10` inner step per the forbidden-form pattern documented at project MEMORY §pdx_encoder_pitfalls). (3) r11 = &_nvme_hw_smoke_buf via lea rip-relative. (4) Byte loop rcx=0..512: xor r9,r9; mov_b r9,[r11+rcx*1]; xor rax,r9; imul rax,r10; inc rcx; loop-cmp on 512 (imm32, fits directly). Encoder posture: `mov r64, imm64` REX.W encoding for both constants; `imul rax, r10` 2-op reg-reg (the forbidden form is 2-op imul r,imm); `xor rax, r9` reg-reg; `mov_b r9, [r11+rcx*1]` indexed byte load (proven in identify.pdx L420, path.pdx L211). No test rN,rN; no cmp reg,[mem]; no and reg,imm64. Reserved-label prefix nvme_hh_.",
+      block: {
+        // (1) rax = FNV_OFFSET_BASIS_64.
+        mov rax, 0xCBF29CE484222325;
+
+        // (2) r10 = FNV_PRIME_64 (staged for `imul rax, r10`).
+        mov r10, 0x100000001B3;
+
+        // (3) r11 = &_nvme_hw_smoke_buf.
+        lea r11, [rip + _nvme_hw_smoke_buf];
+
+        // (4) Byte loop rcx = 0..512.
+        xor rcx, rcx;
+      nvme_hh_top:
+        cmp rcx, 512;
+        jae nvme_hh_done;
+        xor r9, r9;
+        mov_b r9, [r11 + rcx*1];
+        xor rax, r9;
+        imul rax, r10;
+        inc rcx;
+        jmp nvme_hh_top;
+      nvme_hh_done:
+        ret
+      }
+    }
+
+  // ============================================================================
+  // nvme_hw_smoke_seed(row_id, bdf) -> u64
+  // ============================================================================
+  //
+  // R111.M3-014 (paideia-os #2366): per-controller data-plane smoke.
+  // Called from attach.pdx §nvme_attach_all immediately after the
+  // NVME ID HASH line and before the NVME ATTACH OK line.
+  //
+  // SysV: (row_id: u64, bdf: u64) -> u64
+  //   rdi = KIND_NVME_CONTROLLER row_id (opaque handle from
+  //         nvme_ctrl_cap_mint_inner — used to read bar0_va +
+  //         admin_ctx_pa via the row accessors in
+  //         kind_nvme_controller.pdx).
+  //   rsi = packed BDF (from attach.pdx's r13; carried in as the
+  //         `bdf=` KV of both the OK and SKIP fingerprints).  The
+  //         task spec's suggested signature `nvme_hw_smoke_seed(row_id)`
+  //         is extended by the second `bdf` parameter to avoid coupling
+  //         this module to the _nvme_devices layout in probe.pdx: the
+  //         row_id → ctrl_idx → _nvme_devices[ctrl_idx] chain would
+  //         make this file depend on probe.pdx's internal row stride
+  //         and byte offsets.  attach.pdx already holds bdf in r13
+  //         at the call site (nvme_at_ loop L253), so passing it in
+  //         is a trivial single mov.
+  //
+  // Returns rax:
+  //   0                              — OK arm ("NVME SMOKE" emitted).
+  //   NVME_HW_SMOKE_REASON_NOQUE (1) — no I/O queue    (SKIP emitted).
+  //   NVME_HW_SMOKE_REASON_NSBAD (2) — NSID inaccessible (SKIP).
+  //   NVME_HW_SMOKE_REASON_RDFAIL(3) — Read command failed (SKIP).
+  //
+  // Register plan (5-push callee-save + 64 B scratch):
+  //   rbx = packed bdf              (survives every nested call)
+  //   rbp = row_id                  (survives every nested call)
+  //   r12 = bar0_va                 (populated by nvme_ctrl_row_bar0)
+  //   r13 = admin_ctx_pa            (populated by nvme_ctrl_row_admin_ctx)
+  //   r14 = hash-or-reason payload  (v2 for both OK and SKIP klog paths)
+  //
+  //   5 pushes = 40 B; entry rsp%16==8 → 8+40 = 48, %16==0.  sub rsp,64
+  //   → still %16==0.  Aligned for every nested call
+  //   (nvme_identify_ns, nvme_read_blocking, klog_s1_x4, klog_s1_x2).
+  //
+  // Scratch layout (64 B at [rsp+0..rsp+56], 8 B pad at [rsp+56..64]):
+  //   [rsp+0]  = klog v2 (hash on OK, reason on SKIP) → callee [rsp+8]
+  //   [rsp+8]  = klog k3 (&k_lba on OK; unused on SKIP)
+  //   [rsp+16] = klog v3 (lba=0 on OK; unused on SKIP)
+  //   [rsp+24] = klog k4 (&k_hash on OK; unused on SKIP)
+  //   [rsp+32] = klog v4 (hash on OK; unused on SKIP)
+  //   [rsp+40] = (unused)
+  //   [rsp+48] = (unused)
+  //   [rsp+56] = alignment pad
+  //
+  // The mov-into-scratch idiom (same as attach.pdx L369-435) is
+  // chosen over the push-based idiom because the values arrive from
+  // separate nested calls (nvme_read_blocking + nvme_hw_smoke_hash_fnv1a)
+  // that clobber rax between each — the mov form keeps rsp stable
+  // across the whole build-args-then-emit sequence.
+
+  pub let nvme_hw_smoke_seed : (u64, u64) -> u64 !{sysreg, mem} @{boot} =
+    fn (row_id: u64, bdf: u64) -> unsafe {
+      effects: { sysreg, mem },
+      capabilities: { boot },
+      justification: "R111.M3-014 (paideia-os #2366): per-controller NVMe data-plane liveness smoke.  Body: (1) 5-push callee-save prologue (rbx=bdf, rbp=row_id, r12=bar0_va, r13=admin_ctx_pa, r14=hash/reason) — 40 B; entry rsp%16==8 → 48, %16==0; sub rsp,64 → still 0 (aligned for every nested call: nvme_identify_ns, nvme_read_blocking, klog_s1_x4, klog_s1_x2). (2) IO-queue availability gate: load _nvme_io_queue_count into rax; cmp against 0; on zero → jump to SKIP reason 1.  At R24.M3 the IO-queue lifecycle is dormant (io_queue.pdx L77 posture note), so every current -kernel boot lands here — the fingerprint is the wire-carrying observable of that dormancy; the OK arm becomes reachable when nvme_create_all_io_cqs+_sqs are wired into the boot cascade.  (3) Fetch bar0_va (nvme_ctrl_row_bar0) into r12 and admin_ctx_pa (nvme_ctrl_row_admin_ctx) into r13 via the row accessors — both preserve r14/r15 per SysV. (4) Issue Identify Namespace(nsid=1): rdi=r12, rsi=r13, rdx=1, rcx=lea _nvme_id_ns_buf; call nvme_identify_ns → rax = raw 16-bit CQE status.  Success gate: (status & 0xFFFE) == 0.  On error → SKIP reason 2. (5) NSZE existence gate: load [_nvme_id_ns_buf + 0] (u64 NSZE per identify_ns.pdx L71) into rax; cmp against 0; on zero → SKIP reason 2 (namespace ID exists but reports zero logical blocks — not a live block device). (6) Issue synchronous Read: rdi=1 (nsid), rsi=0 (lba), rdx=1 (count=1 block), rcx=lea _nvme_hw_smoke_buf; call nvme_read_blocking (sync.pdx §nvme_read_blocking).  nvme_read_blocking uses nvme_submit_io_cmd which drops through nvme_dispatch_for_this_cpu — safe because step (2) already gated on _nvme_io_queue_count > 0 (BSP is cpu_idx=0, always the first populated slot).  rax = 16-bit CQE status or NVME_SYNC_TIMEOUT (0xFFFF).  Success gate: (status & 0xFFFE) == 0.  On non-zero → SKIP reason 3. (7) Compute FNV-1a 64-bit hash of the 512 bytes just DMA'd into _nvme_hw_smoke_buf via nvme_hw_smoke_hash_fnv1a → rax = hash; save in r14. (8) Emit OK fingerprint: NVME SMOKE bdf=<h> nsid=<h> lba=<h> hash=<h> via klog_s1_x4.  Scratch layout: [rsp+0]=v2=nsid=1, [rsp+8]=k3=&k_lba, [rsp+16]=v3=lba=0, [rsp+24]=k4=&k_hash, [rsp+32]=v4=hash.  klog_s1_x4 (wrappers.pdx L168) reads v2/k3/v3/k4/v4 at callee's [rsp+8..40] = caller's [rsp+0..32].  k1=k_bdf, v1=rbx (bdf), k2=k_nsid — the two register KV slots. (9) SKIP paths converge at nvme_hs_skip: save reason code into [rsp+0] as v2, then klog_s1_x2 with tag_nvme_smoke_skip, k1=k_bdf, v1=rbx, k2=k_reason.  klog_s1_x2 reads v2 at callee's [rsp+8] = caller's [rsp+0].  Encoder posture (v0.36+): all u16/u32 loads use `xor rax,rax; mov_b/mov_w/mov_d rax, [mem]` byte-zero pattern (probe.pdx L138-169 precedent); full-register `cmp reg, imm/reg` (never cmp reg,[mem]); imm64 constants staged into r10 before compare per attach.pdx L458 precedent; 0xFFFE mask fits imm32 so plain `and rax, 0xFFFE` is safe (attach.pdx L491, identify_ns.pdx L202 precedent); no test rN,rN; no imul r,imm 2-op; no and reg,imm64.  Reserved-label prefix nvme_hs_ (avoids `loop`, `if`, `done`, `next`).",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 64;
+
+        mov rbx, rsi;                    // rbx = packed bdf
+        mov rbp, rdi;                    // rbp = row_id
+
+        // ---------------------------------------------------------------
+        // (2) IO-queue availability gate.
+        //
+        // At R24.M3 the IO-queue lifecycle (nvme_create_all_io_cqs +
+        // nvme_create_all_io_sqs, io_queue.pdx L417/L569) is dormant at
+        // boot — the count stays 0 and every -kernel-mode boot lands on
+        // this SKIP arm.  Once the create-all pair is wired into the
+        // boot cascade (a later M3+ step) this gate opens and the OK
+        // arm becomes reachable.
+        // ---------------------------------------------------------------
+        mov rax, [rip + _nvme_io_queue_count];
+        cmp rax, 0;
+        jne nvme_hs_have_ioq;
+
+        mov r14, 1;                      // NVME_HW_SMOKE_REASON_NOQUE
+        jmp nvme_hs_skip;
+
+      nvme_hs_have_ioq:
+        // ---------------------------------------------------------------
+        // (3) Fetch bar0_va + admin_ctx_pa from the row.  Both accessors
+        //     preserve rbx/rbp/r14 per SysV.
+        // ---------------------------------------------------------------
+        mov rdi, rbp;                    // row_id
+        call nvme_ctrl_row_bar0;
+        mov r12, rax;                    // r12 = bar0_va
+
+        mov rdi, rbp;                    // row_id
+        call nvme_ctrl_row_admin_ctx;
+        mov r13, rax;                    // r13 = admin_ctx_pa
+
+        // ---------------------------------------------------------------
+        // (4) Identify Namespace(nsid=1).  Uses _nvme_id_ns_buf as the
+        //     4 KiB response buffer (identify_ns.pdx L93; @align(4096)).
+        //     Under identity-map VA=PA so the lea is a valid PRP1.
+        // ---------------------------------------------------------------
+        mov rdi, r12;                    // bar0_va
+        mov rsi, r13;                    // admin_ctx_pa
+        mov rdx, 1;                      // nsid = 1
+        lea rcx, [rip + _nvme_id_ns_buf];// out_buf_pa
+        call nvme_identify_ns;
+
+        // Success gate: (status & 0xFFFE) == 0.  Bit 0 is the phase tag,
+        // always set on completion regardless of success.
+        and rax, 0xFFFE;
+        cmp rax, 0;
+        jne nvme_hs_ns_bad;
+
+        // ---------------------------------------------------------------
+        // (5) NSZE existence gate.  NSZE (u64 @ +0) == 0 means the
+        //     namespace ID exists in the controller's table but reports
+        //     zero logical blocks — not a live block device.  Distinct
+        //     from "namespace doesn't exist" which nvme_identify_ns
+        //     surfaces as non-zero CQE status (caught in step 4).
+        // ---------------------------------------------------------------
+        lea r10, [rip + _nvme_id_ns_buf];
+        mov rax, [r10 + 0];              // NSZE
+        cmp rax, 0;
+        jne nvme_hs_ns_ok;
+
+      nvme_hs_ns_bad:
+        mov r14, 2;                      // NVME_HW_SMOKE_REASON_NSBAD
+        jmp nvme_hs_skip;
+
+      nvme_hs_ns_ok:
+        // ---------------------------------------------------------------
+        // (6) Synchronous Read(nsid=1, lba=0, count=1 block) into the
+        //     512-byte DMA scratch.  nvme_read_blocking allocates a CID,
+        //     builds an IO SQE at _nvme_admin_sqe_scratch (reused for
+        //     the IO path per sync.pdx L230), submits via
+        //     nvme_submit_io_cmd, busy-waits on completion_flag, returns
+        //     the 16-bit CQE status.  Success gate matches step (4).
+        // ---------------------------------------------------------------
+        mov rdi, 1;                      // nsid = 1
+        mov rsi, 0;                      // lba  = 0
+        mov rdx, 1;                      // count = 1 block
+        lea rcx, [rip + _nvme_hw_smoke_buf];
+        call nvme_read_blocking;
+
+        and rax, 0xFFFE;
+        cmp rax, 0;
+        je nvme_hs_read_ok;
+
+        mov r14, 3;                      // NVME_HW_SMOKE_REASON_RDFAIL
+        jmp nvme_hs_skip;
+
+      nvme_hs_read_ok:
+        // ---------------------------------------------------------------
+        // (7) Hash the 512-byte sector-0 payload.
+        // ---------------------------------------------------------------
+        call nvme_hw_smoke_hash_fnv1a;   // rax = 64-bit FNV-1a hash
+        mov r14, rax;                    // r14 = hash for emit
+
+        // ---------------------------------------------------------------
+        // (8) Emit OK fingerprint:
+        //       NVME SMOKE bdf=<h> nsid=<h> lba=<h> hash=<h>
+        //
+        //     Scratch layout for klog_s1_x4 (mov-into-scratch idiom;
+        //     wrappers.pdx L168-219 reads v2/k3/v3/k4/v4 at callee
+        //     [rsp+8..40] == caller [rsp+0..32]):
+        //       [rsp+0]  = v2 = nsid = 1
+        //       [rsp+8]  = k3 = &k_lba
+        //       [rsp+16] = v3 = lba = 0
+        //       [rsp+24] = k4 = &k_hash
+        //       [rsp+32] = v4 = hash (r14)
+        // ---------------------------------------------------------------
+        mov rax, 1;
+        mov [rsp + 0], rax;              // v2 = nsid = 1
+
+        lea rax, [rip + k_lba];
+        mov [rsp + 8], rax;              // k3
+
+        xor rax, rax;
+        mov [rsp + 16], rax;             // v3 = lba = 0
+
+        lea rax, [rip + k_hash];
+        mov [rsp + 24], rax;             // k4
+
+        mov [rsp + 32], r14;             // v4 = hash
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NVME];
+        lea rdx, [rip + tag_nvme_smoke];
+        lea rcx, [rip + k_bdf];          // k1
+        mov r8, rbx;                     // v1 = packed bdf
+        lea r9, [rip + k_nsid];          // k2
+        call klog_s1_x4;
+
+        xor rax, rax;                    // NVME_HW_SMOKE_OK = 0
+        jmp nvme_hs_out;
+
+        // ---------------------------------------------------------------
+        // (9) SKIP path — converges from every reason.  r14 holds the
+        //     reason code (1|2|3); publish as v2 for klog_s1_x2.
+        //
+        //     klog_s1_x2 (wrappers.pdx L72-107) reads v2 at callee's
+        //     [rsp+8] == caller's [rsp+0].
+        // ---------------------------------------------------------------
+      nvme_hs_skip:
+        mov [rsp + 0], r14;              // v2 = reason
+
+        mov rdi, 2;                      // LEVEL_WARN
+        lea rsi, [rip + SUBSYS_NVME];
+        lea rdx, [rip + tag_nvme_smoke_skip];
+        lea rcx, [rip + k_bdf];          // k1
+        mov r8, rbx;                     // v1 = packed bdf
+        lea r9, [rip + k_reason];        // k2
+        call klog_s1_x2;
+
+        mov rax, r14;                    // return reason code
+
+      nvme_hs_out:
+        add rsp, 64;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+}

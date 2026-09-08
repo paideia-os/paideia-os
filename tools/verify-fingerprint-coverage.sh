@@ -286,6 +286,34 @@ ALLOWLIST = {
         "XHCI BOOT NONE arm because -kernel boot has no MCFG, so "
         "_xhci_device_count stays 0 even with -device qemu-xhci.",
 
+    # src/kernel/core/klog/keys.pdx tag_hid_kbd_attach_ok —
+    # R111.M5-018 (paideia-os #2370).  HID boot-keyboard attach
+    # per-instance OK fingerprint. Wire line shape:
+    #     "HID KBD ATTACH OK bdf=0x<hex> iface=0x<hex> ep=0x<hex>"
+    # Unreachable in every 14-mode QEMU matrix AND on real T14 G4
+    # today: the row table `_hid_kbd_devices` is populated by a
+    # downstream USB-enumeration worker (per-controller cmd_ring /
+    # event_ring / DCBA / per-slot Input Context allocation +
+    # SET_ADDRESS + GET_DESCRIPTOR + parse_config_descriptor) that
+    # has not yet landed a call site above hid_keyboard_attach_all
+    # (kernel_main.pdx). Consequently `_hid_kbd_dev_count` stays 0
+    # on every boot and the orchestrator takes the sibling
+    # HID KBD NONE arm (no OK token, correctly not gate-visible).
+    # Same real-HW-plus-substrate-plumbing posture as the sibling
+    # XHCI ATTACH OK / NVME ATTACH OK entries above; assertable when
+    # the USB-enumeration worker lands its call site (task follow-on
+    # after R111.M5-019 HID keyboard on USB-A per
+    # design/roadmap/t14-bootable-usb-wave.md §4.E).
+    "HID KBD ATTACH OK":
+        "R111.M5-018 (#2370): HID boot-keyboard attach OK "
+        "fingerprint; _hid_kbd_dev_count stays 0 in every current "
+        "boot because the USB-enumeration worker that populates "
+        "_hid_kbd_devices has not landed a call site above "
+        "hid_keyboard_attach_all, so the sibling HID KBD NONE arm "
+        "always fires. Retires when the USB-enum worker lands "
+        "(follow-on to R111.M5-019 HID keyboard on USB-A per "
+        "design/roadmap/t14-bootable-usb-wave.md §4.E).",
+
     # src/kernel/boot/witness/rootfs_mount_witness.pdx tag_rootfs_mount_ok —
     # R111.M3-013 (paideia-os #2365).  ESP-embedded PdxFS-lite rootfs
     # blob witness fingerprint (OK arm) emitted from
@@ -318,6 +346,40 @@ ALLOWLIST = {
         "mode boots past ExitBootServices yet. Retires when R111.M2 "
         "opens boot_r111_uefi_bridge (same follow-up target as "
         "UEFI BRIDGE OK / UEFI PML4 OK / UEFI EBS OK).",
+
+    # src/kernel/boot/witness/fw_manifest_witness.pdx tag_fw_manifest_ok --
+    # R111.M6-022 (paideia-os #2374).  ESP-embedded firmware-manifest
+    # witness fingerprint (OK arm) emitted from
+    # fw_manifest_witness_run when the UEFI stub's
+    # efi_load_fw_manifest successfully staged the manifest from
+    # /paideia/firmware/manifest.pdxsig into a Boot-Services pool
+    # alloc and latched (pa, size) through boot_env @ +120 / +128.
+    # Wire line shape:
+    #     "FW MANIFEST OK pa=0x<16hex> size=<dec>"
+    # The OK-bearing tag prefix is broken out as tag_fw_manifest_ok
+    # ("FW MANIFEST OK"); the trailing ` pa=... size=...` is
+    # appended by the klog_s1_x1_d1 KV loop and carries no OK token.
+    # UEFI-only reachability: the 14-mode -kernel matrix takes the
+    # sibling FW MANIFEST NONE arm (no OK token, not gate-visible),
+    # and the PAIDEIA_UEFI_OVMF opt-in fixture stops at the pre-EBS
+    # hello banner today.  Same posture as ROOTFS MOUNT OK type=pdxfs
+    # / UEFI BRIDGE OK / UEFI PML4 OK / UEFI EBS OK / FB CONSOLE OK
+    # above; retires from this allowlist when R111.M2 opens an OVMF
+    # smoke mode that boots past ExitBootServices with a real
+    # manifest.pdxsig on the ESP and asserts the fingerprint against
+    # a live golden.
+    "FW MANIFEST OK":
+        "R111.M6-022 (#2374): ESP-embedded firmware-manifest witness "
+        "(OK arm); reachable only on UEFI boot with the ESP carrying "
+        "/paideia/firmware/manifest.pdxsig and every step of "
+        "efi_load_fw_manifest (SFS OpenProtocol, OpenVolume, Open, "
+        "GetInfo, AllocatePool, Read, short-read check) succeeding. "
+        "The 14-mode -kernel matrix takes the sibling `FW MANIFEST "
+        "NONE` arm (no OK token, not gate-visible); no OVMF smoke "
+        "mode boots past ExitBootServices yet. Retires when R111.M2 "
+        "opens boot_r111_uefi_bridge (same follow-up target as "
+        "UEFI BRIDGE OK / UEFI PML4 OK / UEFI EBS OK / ROOTFS MOUNT "
+        "OK type=pdxfs).",
 
     # src/kernel/core/cpu/microcode.pdx tag_microcode_apply_ok --
     # R111.M6-019 (paideia-os #2371).  Intel-microcode WRMSR-path
