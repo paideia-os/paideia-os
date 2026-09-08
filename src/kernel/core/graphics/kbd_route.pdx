@@ -1,0 +1,646 @@
+// src/kernel/core/graphics/kbd_route.pdx -- R113.M3-012 (paideia-os #2392)
+//
+// Keyboard event routing: KIND_TTY input ring -> focused surface.
+//
+// -----------------------------------------------------------------------------
+// SCOPE (per issue #2392)
+// -----------------------------------------------------------------------------
+//
+// Sits atop R113.M2-011 (focus.pdx) and R113.M1-001 (kind_surface.pdx).
+// focus_set_keyboard latches _kbd_focus_slot; this file's job is what
+// happens BETWEEN a byte landing in the KIND_TTY input ring and the
+// focused surface's client-side event queue.
+//
+// Two API entry points -- both callable from kernel-internal contexts,
+// gated only by their own argument-range checks (no cap_invoke arm
+// touches them; the input-server / compositor wiring gates rights the
+// same way focus_set_keyboard is gated, see focus.pdx §"Rights gating
+// -- owned by the input dispatcher, not here"):
+//
+//   * kbd_event_deliver(surface_slot, key_code, modifiers, is_press) -> u64
+//         Encode the (key_code, modifiers, is_press) triple into a
+//         single u64 event and enqueue it on the surface's per-surface
+//         ring.  Returns 0 on success or a KBD_ROUTE_* sentinel; ring-
+//         full is a soft failure (the tail overwrite policy is caller
+//         choice -- this landing refuses the enqueue rather than drop
+//         the oldest event, to keep keystroke ordering strict).
+//
+//   * kbd_event_consume(surface_slot, out_buf, out_cap) -> count
+//         Drain up to out_cap events from the surface's ring into
+//         out_buf, advancing tail.  Returns the number of events
+//         actually copied (0..out_cap).  A caller passing out_cap=0
+//         probes fullness cheaply.
+//
+// One wire helper:
+//
+//   * kbd_route_from_tty_byte(byte) -> ()
+//         Look up focus_get_keyboard(); if unfocused (FOCUS_NONE), no-
+//         op; else call kbd_event_deliver(slot, byte, 0, 1).  Keeps
+//         tty/stdin_drain.pdx's byte-drain loop compact -- one call
+//         per byte instead of an inline focus lookup + arg juggle.
+//
+// -----------------------------------------------------------------------------
+// STORAGE MODEL
+// -----------------------------------------------------------------------------
+//
+// One event ring per surface slot; 16 surfaces (SURFACE_ROW_MAX, per
+// kind_surface.pdx today) x 32 events x 8 bytes = 4096 bytes for the
+// event backing store.  Head + tail cursors held in two parallel
+// [u64; 16] arrays -- monotonic (never wrap; two-word head/tail rather
+// than a single "count" preserves the classic SPSC empty/full
+// invariants without an unused-slot penalty).  Depth 32 is a compromise:
+// deep enough to absorb a fast typist between drains (Zipf-typical
+// bursts of 4-10 chars, and 32 covers 300ms of sustained typing at 100
+// wpm without loss); shallow enough that the total .bss footprint stays
+// under 5 KiB.  A follow-on can bump KBD_ROUTE_RING_DEPTH without
+// touching any consumer -- the ring math indexes off the constant.
+//
+// Empty:  head == tail
+// Full:   (head - tail) == KBD_ROUTE_RING_DEPTH
+// Write:  _kbd_events[slot*DEPTH + (head % DEPTH)] = event; head++
+// Read:   event = _kbd_events[slot*DEPTH + (tail % DEPTH)]; tail++
+//
+// u64 head/tail overflow lands at 2^64 events; at 8 kHz peak keyboard
+// polling that is ~73 million years, not worth guarding against.
+//
+// A parallel [u64; 16] _kbd_seen bitmap gates the "KBD ROUTE READY
+// sid=<n>" summary fingerprint: the first successful enqueue for a
+// given surface latches _kbd_seen[slot] = 1 and emits the tag once,
+// subsequent enqueues on the same slot are silent (per issue #2392 §5
+// "no per-event fingerprint").  This mirrors the surface_format_bind_
+// at_mint / focus_set_keyboard idempotency discipline: fingerprint
+// volume proportional to distinct surfaces that ever received input,
+// not to keystroke rate.
+//
+// -----------------------------------------------------------------------------
+// EVENT ENCODING
+// -----------------------------------------------------------------------------
+//
+// One u64 event lane; bits packed low-to-high so a follow-on release
+// bit or repeat count can widen without disturbing already-consumed
+// bytes:
+//
+//   [15:0]   key_code   (u16 -- HID Usage codes fit in u8 today; u16
+//                        headroom for future ASCII/UTF-16 punthrough)
+//   [23:16]  modifiers  (u8  -- HID modifier byte layout per USB HID
+//                        1.11 §B.1: LCtrl/LShift/LAlt/LGui/RCtrl/
+//                        RShift/RAlt/RGui)
+//   [31:24]  is_press   (u8  -- 0=release, 1=press.  Boolean today,
+//                        u8-wide for future edge-typing (double-tap,
+//                        triple-tap, etc.))
+//   [63:32]  reserved   (zeroed at pack time; future timestamp / seq)
+//
+// -----------------------------------------------------------------------------
+// FAILURE TAXONOMY -- 0xFFFFE1C0..0xFFFFE1CF (fresh band, grep-verified)
+// -----------------------------------------------------------------------------
+//
+// Pre-landing sweep (2026-09-08):
+//   $ grep -rn '0xFFFFE1C' src design tests -> empty
+//
+// so 0xFFFFE1C0..0xFFFFE1CF is uncontested.  Neighbouring bands (per
+// R113.M1/M2 landings, focus.pdx and z_order.pdx headers):
+//
+//   0xFFFFE180..E18F  R113.M2-011 FOCUS         (focus.pdx)
+//   0xFFFFE190..E19F  free
+//   0xFFFFE1A0..E1AF  free
+//   0xFFFFE1B0..E1BF  R113.M2-010 Z-ORDER       (z_order.pdx)
+//   0xFFFFE1C0..E1CF  R113.M3-012 KBD_ROUTE     (THIS FILE)
+//   0xFFFFE1D0..E1DF  reserved for M3 follow-on
+//
+// Slot map:
+//
+//   0xFFFFE1C0  KBD_ROUTE_BAD_SLOT      surface_slot >= KBD_ROUTE_MAX_SURFACES
+//   0xFFFFE1C1  KBD_ROUTE_RING_FULL     (head - tail) == DEPTH; enqueue refused
+//   0xFFFFE1C2  KBD_ROUTE_BAD_BUF       consume called with out_buf == 0
+//   0xFFFFE1C3..0xFFFFE1CF              reserved for M3 follow-on (per-
+//                                       surface backpressure signal,
+//                                       drop-on-full policy toggle,
+//                                       modifier-only echo route, etc.)
+//
+// -----------------------------------------------------------------------------
+// FINGERPRINT ALLOWLIST
+// -----------------------------------------------------------------------------
+//
+// One tag emitted, at most once per surface_slot ever:
+//   "kbd route ready [legacy: KBD ROUTE READY] sid=0x<hex>"
+//
+// Reachable in the default 14-mode matrix only when a boot witness
+// exercises kbd_event_deliver against a live surface_slot -- the wire
+// caller (tty_stdin_drain via kbd_route_from_tty_byte) requires
+// focus_get_keyboard() != FOCUS_NONE, which in turn requires
+// focus_set_keyboard on a real surface, which requires a compositor
+// activation path that has not yet landed.  Same real-HW / wire-
+// deferred posture as the focus / z_order siblings above.  Two
+// tools/verify-fingerprint-coverage.sh entries land alongside this
+// file (KBD_ROUTE_READY tag + a note on the sibling wire posture).
+//
+// -----------------------------------------------------------------------------
+// RIGHTS GATING -- OWNED BY THE INPUT DISPATCHER, NOT HERE
+// -----------------------------------------------------------------------------
+//
+// These bodies do NOT check rights.  kbd_event_deliver and
+// kbd_event_consume are kernel-internal; no cap_invoke arm dispatches
+// to them.  The follow-on input-server / cap_handler_surface landings
+// will gate on R_SURFACE_KGATE_QUERY (kind_surface.pdx §3.2) or a
+// dedicated R_INPUT_ROUTE right before calling in.  Same discipline as
+// focus_set_keyboard (focus.pdx §"Rights gating").
+//
+// -----------------------------------------------------------------------------
+// ENCODER PITFALLS (per feedback_pdx_encoder_pitfalls v0.36+)
+// -----------------------------------------------------------------------------
+//
+//   * No `test rN, rN` -- every zero-check uses `cmp rN, 0` + `je/jne`.
+//   * No 2-op `imul r, imm` -- ring stride 256 (32*8) via `shl 8`;
+//     event slot inside the ring uses `shl 3` (8-byte lane); head/tail
+//     row index uses `shl 3` (8-byte per-surface cursor).
+//   * No `and reg, imm64` -- masks fit imm8 (0xFF, 31) or imm32
+//     (0xFFFF).  FOCUS_NONE (0xFFFFFFFFFFFFFFFF) staged via `mov r64,
+//     imm64` (movabs).
+//   * No `cmp reg, [mem]` -- every mem compare loads to a scratch
+//     first (surface_present.pdx L242 pattern).
+//   * No literal-scaled `[reg + N*8]` beyond SIB scale 1/2/4/8 --
+//     ring stride 256 uses shl 8 + add; only displacement form
+//     `[reg + 0]` used for cursor cells.
+//   * No `mov qword [mem], imm64` -- immediates staged into rax via
+//     movabs then stored (only relevant to the FOCUS_NONE compare
+//     in the wire helper).
+//
+// -----------------------------------------------------------------------------
+// LABEL PREFIX
+// -----------------------------------------------------------------------------
+//
+// `kri_` = kbd_route_init, `kep_` = kbd_event_pack, `ked_` =
+// kbd_event_deliver, `kec_` = kbd_event_consume, `krf_` =
+// kbd_route_from_tty_byte.  All prefixes avoid the paideia-as reserved
+// keyword set (feedback_paideia_as_reserved_labels).
+
+module KbdRoute = structure {
+
+  // ==========================================================================
+  // Constants
+  // ==========================================================================
+
+  // Matches kind_surface.pdx SURFACE_ROW_MAX (16 today).  Bumping
+  // SURFACE_ROW_MAX in the substrate should be paired with a bump here
+  // so a per-surface ring exists for every mintable surface slot.
+  pub let KBD_ROUTE_MAX_SURFACES : u64 = 16
+
+  // Per-surface ring depth.  32 = ~300ms of sustained 100 wpm typing.
+  // See file header §Storage model for the compromise rationale.
+  pub let KBD_ROUTE_RING_DEPTH   : u64 = 32
+
+  // Ring depth mask (depth - 1); depth is a power of two so head%depth
+  // reduces to `and head, DEPTH_MASK` (imm8, fits).
+  pub let KBD_ROUTE_DEPTH_MASK   : u64 = 31
+
+  pub let KBD_ROUTE_OK           : u64 = 0
+  pub let KBD_ROUTE_BAD_SLOT     : u64 = 0xFFFFE1C0
+  pub let KBD_ROUTE_RING_FULL    : u64 = 0xFFFFE1C1
+  pub let KBD_ROUTE_BAD_BUF      : u64 = 0xFFFFE1C2
+
+  // FOCUS_NONE sentinel -- duplicated locally so this file has no
+  // symbolic dependency on focus.pdx beyond the focus_get_keyboard
+  // call.  Kept in sync with focus.pdx FOCUS_NONE by the same reason
+  // z_order.pdx does not import FOCUS_NONE either (small integer
+  // constant, easier to inline than to plumb across modules).
+  pub let KBD_ROUTE_FOCUS_NONE   : u64 = 0xFFFFFFFFFFFFFFFF
+
+  // ==========================================================================
+  // Global ring state -- .bss, @align(8).
+  //
+  // _kbd_events: flat [MAX_SURFACES * DEPTH] u64.  Row-major:
+  //   surface s's ring occupies _kbd_events[s*DEPTH .. (s+1)*DEPTH - 1].
+  //
+  // _kbd_head / _kbd_tail: monotonic per-surface cursors.  Two words
+  //   rather than a shared count keeps SPSC empty/full invariants
+  //   trivially provable and avoids the "one slot wasted" penalty of
+  //   the classical (head+1)==tail full form.
+  //
+  // _kbd_seen: 0/1 flag per surface, gates the KBD_ROUTE_READY summary
+  //   fingerprint to a single emission per surface ever.
+  //
+  // .bss zero-init means all four arrays boot to a coherent empty
+  // state; kbd_route_init below is defensive re-scrub for the chaos-
+  // restart / witness re-entry idiom the M2 siblings established.
+  // ==========================================================================
+
+  pub let mut _kbd_events : [u64; 512] = uninit @align(8)    // 16 * 32
+  pub let mut _kbd_head   : [u64; 16]  = uninit @align(8)
+  pub let mut _kbd_tail   : [u64; 16]  = uninit @align(8)
+  pub let mut _kbd_seen   : [u64; 16]  = uninit @align(8)
+
+  // ==========================================================================
+  // Fingerprint tag (summary emitter -- see file header §Fingerprint
+  // allowlist).
+  //
+  // Wire form (post-klog_s1_x1 KV append):
+  //   kbd route ready [legacy: KBD ROUTE READY] sid=0x<hex>
+  //
+  // Byte count verified by hand:
+  //   "kbd route ready [legacy: KBD ROUTE READY]\0" = 42 bytes
+  //
+  // KV key reused: surface_k_sid ("sid\0", 4 bytes) from
+  // src/kernel/core/cap/kind_surface.pdx (declared at R113.M1-001,
+  // #2381).  focus.pdx and surface_present.pdx use the same reuse
+  // pattern; keeps the wire-log sid= renderer contract stable.
+  // ==========================================================================
+
+  pub let kbd_route_ready_msg : [u8; 42] = "kbd route ready [legacy: KBD ROUTE READY]\0"
+
+  // ==========================================================================
+  // kbd_route_init() -> ()
+  //
+  // Defensive zero-scrub of head/tail/seen.  .bss is already zero at
+  // real boot (both PVH and UEFI paths); this exists so a chaos-restart
+  // or witness re-entry has a clean re-scrub point, mirroring
+  // focus_init / z_order_init.  Does NOT scrub _kbd_events itself:
+  // resetting head=tail=0 semantically empties every ring, so the
+  // 4 KiB backing store's stale contents are unreachable and scrubbing
+  // them adds no correctness value at ~4x the cost.
+  //
+  // Zero-arg leaf; no callee-save clobber; only touches rax, rcx, r10.
+  // Called from kernel_main.pdx alongside focus_init.
+  // ==========================================================================
+
+  pub let kbd_route_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M3-012 (#2392): defensive zero-scrub of the three [u64; 16] cursor / bitmap arrays (_kbd_head, _kbd_tail, _kbd_seen).  Skips the 4 KiB _kbd_events backing store: head=tail=0 semantically empties every ring, so the payload is unreachable and scrubbing it adds no correctness value.  Straight-line ranges via three shared load-store loops.  Pure leaf; no callee-save; entry rsp%16=8 unchanged on ret.  Labels prefixed kri_.",
+      block: {
+        xor rax, rax;                   // zero payload
+
+        // Scrub _kbd_head (16 u64 lanes).
+        lea r10, [rip + _kbd_head];
+        xor rcx, rcx;
+      kri_head_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  kri_head_loop;
+
+        // Scrub _kbd_tail (16 u64 lanes).
+        lea r10, [rip + _kbd_tail];
+        xor rcx, rcx;
+      kri_tail_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  kri_tail_loop;
+
+        // Scrub _kbd_seen (16 u64 lanes).
+        lea r10, [rip + _kbd_seen];
+        xor rcx, rcx;
+      kri_seen_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  kri_seen_loop;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // kbd_event_pack(key_code, modifiers, is_press) -> u64
+  //
+  // Encode the triple into one u64 lane per file header §Event
+  // encoding.  Pure leaf; no memory access; used by kbd_event_deliver
+  // and callable by tests that want to shape an event out of band.
+  // ==========================================================================
+
+  pub let kbd_event_pack : (u64, u64, u64) -> u64 !{} @{} =
+    fn (key_code: u64) (modifiers: u64) (is_press: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R113.M3-012 (#2392): pack (key_code[15:0], modifiers[23:16], is_press[31:24]) into a single u64 lane per file header §Event encoding.  Masks fit imm32 (0xFFFF) / imm8 (0xFF) so no `and reg, imm64`.  Pure leaf; no callee-save; entry rsp%16=8 unchanged on ret.  Labels prefixed kep_ (none needed, straight-line).",
+      block: {
+        mov rax, rdi;                   // key_code
+        and rax, 0xFFFF;
+
+        mov r10, rsi;                   // modifiers
+        and r10, 0xFF;
+        shl r10, 16;
+        or  rax, r10;
+
+        mov r10, rdx;                   // is_press
+        and r10, 0xFF;
+        shl r10, 24;
+        or  rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // kbd_event_deliver(surface_slot, key_code, modifiers, is_press) -> u64
+  //
+  // Gate order:
+  //   (1) surface_slot >= KBD_ROUTE_MAX_SURFACES -> KBD_ROUTE_BAD_SLOT.
+  //   (2) load head[slot], tail[slot]; if (head - tail) >= DEPTH ->
+  //       KBD_ROUTE_RING_FULL (strict-refuse policy per file header
+  //       §Storage model).
+  //   (3) pack event via kbd_event_pack.
+  //   (4) write _kbd_events[slot*DEPTH + (head & DEPTH_MASK)] = event.
+  //   (5) head++.
+  //   (6) if _kbd_seen[slot] == 0: latch it, emit KBD ROUTE READY
+  //       sid=<slot> fingerprint (summary; issue #2392 §5 forbids per-
+  //       event fingerprints).
+  //   (7) return 0.
+  //
+  // Register plan: six callee-save pushes (rbx=slot, r12=event,
+  // r13=head, r14=tail, r15=scratch, rbp=ring_base) + sub rsp, 8 -->
+  // entry rsp%16==8, +48+8=56, rsp%16==0 for every nested call
+  // (kbd_event_pack, klog_s1_x1).  klog_s1_x1 preserves rbx/r12..r15/
+  // rbp per SysV so all state survives to the emission.
+  // ==========================================================================
+
+  pub let kbd_event_deliver : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (surface_slot: u64) (key_code: u64) (modifiers: u64) (is_press: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R113.M3-012 (#2392): enqueue one keyboard event on surface_slot's per-surface ring.  Gate order per file header: (1) surface_slot >= KBD_ROUTE_MAX_SURFACES(16) -> KBD_ROUTE_BAD_SLOT (0xFFFFE1C0); (2) head - tail >= DEPTH(32) -> KBD_ROUTE_RING_FULL (0xFFFFE1C1, strict-refuse policy to preserve keystroke ordering); (3) pack via kbd_event_pack; (4) store into _kbd_events[slot*DEPTH + (head & DEPTH_MASK)]; (5) advance head; (6) first-ever enqueue on this slot emits KBD ROUTE READY sid=<slot> via klog_s1_x1 and latches _kbd_seen[slot]=1; (7) return 0.  Ring stride 256 bytes (32*8) via shl 8; slot inside ring uses shl 3 (imm8 8-byte lane); head/tail row index uses shl 3.  Mask 31 fits imm8, so head & DEPTH_MASK avoids `and reg, imm64`.  Six callee-save pushes (rbx=slot, r12=event, r13=head, r14=tail, r15=ring_base_va, rbp=head_addr_reused_for_seen_addr) + sub rsp,8 -> entry rsp%16==8, +48+8=56, %16==0 for kbd_event_pack + klog_s1_x1.  klog_s1_x1 per SysV preserves rbx/r12..r15/rbp so all state survives to the emit.  Labels prefixed ked_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;
+
+        mov rbx, rdi;                   // rbx = surface_slot
+
+        // (1) slot bounds check
+        cmp rbx, 16;                    // KBD_ROUTE_MAX_SURFACES
+        jae ked_bad_slot;
+
+        // (2) load head[slot], tail[slot]; check fullness
+        lea r10, [rip + _kbd_head];
+        mov r11, rbx;
+        shl r11, 3;
+        add r10, r11;
+        mov r13, [r10 + 0];             // r13 = head
+
+        lea r10, [rip + _kbd_tail];
+        mov r11, rbx;
+        shl r11, 3;
+        add r10, r11;
+        mov r14, [r10 + 0];             // r14 = tail
+
+        mov rax, r13;
+        sub rax, r14;                   // rax = head - tail (u64 modular)
+        cmp rax, 32;                    // KBD_ROUTE_RING_DEPTH
+        jae ked_ring_full;
+
+        // (3) pack event via kbd_event_pack(key_code, modifiers, is_press).
+        // key_code=rsi, modifiers=rdx, is_press=rcx on entry -- shift into
+        // rdi/rsi/rdx SysV positions for the call.
+        mov rdi, rsi;                   // key_code
+        mov rsi, rdx;                   // modifiers
+        mov rdx, rcx;                   // is_press
+        call kbd_event_pack;
+        mov r12, rax;                   // r12 = packed event
+
+        // (4) store into _kbd_events[slot*DEPTH + (head & MASK)]
+        lea r15, [rip + _kbd_events];   // r15 = ring base
+        mov r11, rbx;
+        shl r11, 8;                     // slot * (DEPTH * 8) = slot * 256
+        add r15, r11;                   // r15 = &ring[slot][0]
+
+        mov r11, r13;                   // head
+        and r11, 31;                    // head & DEPTH_MASK
+        shl r11, 3;                     // * 8 bytes per event
+        add r15, r11;
+
+        mov [r15 + 0], r12;             // enqueue
+
+        // (5) head++
+        add r13, 1;
+        lea r10, [rip + _kbd_head];
+        mov r11, rbx;
+        shl r11, 3;
+        add r10, r11;
+        mov [r10 + 0], r13;
+
+        // (6) first-delivery summary: if _kbd_seen[slot] == 0, emit
+        // KBD ROUTE READY sid=<slot> once and latch _kbd_seen[slot]=1.
+        lea rbp, [rip + _kbd_seen];
+        mov r11, rbx;
+        shl r11, 3;
+        add rbp, r11;                   // rbp = &_kbd_seen[slot]
+        mov rax, [rbp + 0];
+        cmp rax, 0;
+        jne ked_ok;
+
+        mov rax, 1;
+        mov [rbp + 0], rax;             // latch seen
+
+        mov rdi, 3;                     // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + kbd_route_ready_msg];
+        lea rcx, [rip + surface_k_sid];
+        mov r8,  rbx;                   // sid = slot
+        call klog_s1_x1;
+
+      ked_ok:
+        xor rax, rax;                   // KBD_ROUTE_OK
+        jmp ked_out;
+
+      ked_bad_slot:
+        mov rax, 0xFFFFE1C0;            // KBD_ROUTE_BAD_SLOT
+        jmp ked_out;
+
+      ked_ring_full:
+        mov rax, 0xFFFFE1C1;            // KBD_ROUTE_RING_FULL
+
+      ked_out:
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // kbd_event_consume(surface_slot, out_buf, out_cap) -> count
+  //
+  // Drain up to out_cap events from surface_slot's ring into out_buf,
+  // advancing tail.  Returns the number of events actually copied
+  // (0..out_cap).  out_cap==0 is legal (probe form; returns 0 without
+  // touching tail).
+  //
+  // Gate order:
+  //   (1) surface_slot >= KBD_ROUTE_MAX_SURFACES -> return 0 (soft
+  //       failure; consume is a poll, not an error surface).
+  //   (2) out_buf == 0 and out_cap != 0 -> return 0 (would-segfault
+  //       guard; out_cap==0 with a null buf is legal probe).
+  //   (3) available = min(out_cap, head - tail).
+  //   (4) copy available events out_buf[0..available-1], advance tail.
+  //   (5) return available.
+  //
+  // No fingerprint emit -- consume is client-side and would flood the
+  // wire on every syscall poll (per issue #2392 §5 "no per-event
+  // fingerprint" -- consume is even more per-event than deliver).
+  //
+  // Register plan: five callee-save pushes (rbx=slot, r12=out_buf,
+  // r13=out_cap, r14=count/tail, r15=ring_base) -> entry rsp%16==8,
+  // +40=48, %16==0 for the internal loop (no nested calls).  Pure
+  // memory-only body.
+  // ==========================================================================
+
+  pub let kbd_event_consume : (u64, u64, u64) -> u64 !{mem} @{cap} =
+    fn (surface_slot: u64) (out_buf: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R113.M3-012 (#2392): drain up to out_cap events from surface_slot's ring into out_buf.  Gate order per file header: (1) slot >= MAX -> return 0; (2) out_buf==0 with out_cap!=0 -> return 0 (would-segfault guard; probe form out_cap==0 with null buf is legal); (3) available = min(out_cap, head - tail); (4) copy events + advance tail; (5) return count.  No fingerprint -- consume is client-side polling, per-call emit would flood the wire.  Ring stride 256 (shl 8); event lane 8 (shl 3); mask 31 (imm8).  Five callee-save pushes -> entry rsp%16==8, +40=48, %16==0.  No nested calls; pure memory body.  Labels prefixed kec_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                   // rbx = surface_slot
+        mov r12, rsi;                   // r12 = out_buf
+        mov r13, rdx;                   // r13 = out_cap
+
+        // (1) slot bounds check -- soft-fail return 0
+        cmp rbx, 16;                    // KBD_ROUTE_MAX_SURFACES
+        jae kec_zero;
+
+        // (2) out_cap==0 short-circuit (probe form is legal even with
+        // null out_buf).
+        cmp r13, 0;
+        je  kec_zero;
+
+        // (2b) out_buf==0 with non-zero out_cap -> soft-fail return 0.
+        cmp r12, 0;
+        je  kec_zero;
+
+        // (3) load head, tail; compute available = min(cap, head-tail).
+        lea r10, [rip + _kbd_head];
+        mov r11, rbx;
+        shl r11, 3;
+        add r10, r11;
+        mov rax, [r10 + 0];             // rax = head
+
+        lea r10, [rip + _kbd_tail];
+        mov r11, rbx;
+        shl r11, 3;
+        add r10, r11;
+        mov r14, [r10 + 0];             // r14 = tail
+
+        sub rax, r14;                   // rax = head - tail (u64 modular)
+        cmp rax, r13;                   // available <= out_cap ?
+        jbe kec_have_avail;
+        mov rax, r13;                   // clamp to out_cap
+      kec_have_avail:
+        cmp rax, 0;
+        je  kec_flush_tail;             // nothing to copy; still land on tail-writeback (no-op)
+
+        // r14 = tail cursor (moves during copy); rax = remaining count.
+        // Ring base = _kbd_events + slot*256
+        lea r15, [rip + _kbd_events];
+        mov r11, rbx;
+        shl r11, 8;
+        add r15, r11;                   // r15 = &ring[slot][0]
+
+        mov rcx, rax;                   // rcx = remaining copies
+        xor r8,  r8;                    // r8 = out cursor (0..cap)
+      kec_copy_loop:
+        // Load event at ring[slot][tail & MASK]
+        mov r11, r14;
+        and r11, 31;
+        shl r11, 3;
+        mov r9, r15;
+        add r9, r11;
+        mov r11, [r9 + 0];              // r11 = event
+
+        // Store into out_buf[out_cursor]
+        mov r9, r12;
+        mov rdx, r8;
+        shl rdx, 3;
+        add r9, rdx;
+        mov [r9 + 0], r11;
+
+        add r14, 1;                     // tail++
+        add r8,  1;                     // out_cursor++
+        sub rcx, 1;                     // remaining--
+        cmp rcx, 0;
+        jne kec_copy_loop;
+
+      kec_flush_tail:
+        // Write back updated tail.
+        lea r10, [rip + _kbd_tail];
+        mov r11, rbx;
+        shl r11, 3;
+        add r10, r11;
+        mov [r10 + 0], r14;
+
+        mov rax, r8;                    // return count (0 if we jumped past copy loop)
+        jmp kec_out;
+
+      kec_zero:
+        xor rax, rax;
+
+      kec_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // kbd_route_from_tty_byte(byte) -> ()
+  //
+  // The wire helper called by tty_stdin_drain (core/tty/stdin_drain.pdx)
+  // once per drained byte.  Looks up focus_get_keyboard(); if unfocused,
+  // no-op.  Else calls kbd_event_deliver(slot, byte, modifiers=0,
+  // is_press=1).
+  //
+  // Modifiers = 0 today: TTY input arrives cooked (UART RX ring bytes
+  // are pre-shifted ASCII, not raw HID scan codes).  A follow-on that
+  // wires the hid_process_report path directly into kbd_event_deliver
+  // (bypassing tty_process_input) will carry real modifier bits; the
+  // TTY-cooked path stays modifier-free.
+  //
+  // is_press = 1: the byte itself is the press event; the cooked-mode
+  // TTY layer collapses press+release into a single character.  Client
+  // TUI code that wants edge-triggered semantics reads the ring; press-
+  // only stream is a valid subset (equivalent to "auto-release
+  // immediately", which is the shell's own semantic anyway).
+  //
+  // Register plan: one callee-save push (rbx = byte) -> entry rsp%16==8,
+  // +8=16, %16==0 for the nested focus_get_keyboard + kbd_event_deliver
+  // calls.  Both preserve rbx per SysV so the byte survives across the
+  // focus lookup.  Labels prefixed krf_.
+  // ==========================================================================
+
+  pub let kbd_route_from_tty_byte : (u64) -> () !{mem, sysreg} @{cap} =
+    fn (byte: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R113.M3-012 (#2392): wire helper called by tty_stdin_drain per drained byte.  (1) push rbx; mov rbx, rdi (save byte across focus_get_keyboard).  (2) call focus_get_keyboard -> rax = focus slot or FOCUS_NONE.  (3) FOCUS_NONE (0xFFFFFFFFFFFFFFFF) staged via movabs into r11; cmp rax, r11; je no-op arm.  (4) mov rdi, rax (surface_slot); mov rsi, rbx (key_code=byte); xor rdx, rdx (modifiers=0); mov rcx, 1 (is_press); call kbd_event_deliver -- return value swallowed (best-effort; RING_FULL is a legitimate soft-failure at consumer-slow rates and BAD_SLOT is defended by focus_set_keyboard's own validation gate).  One callee-save push -> entry rsp%16==8, +8=16, %16==0 for both nested calls; focus_get_keyboard and kbd_event_deliver preserve rbx per SysV so byte survives across the focus lookup.  Modifiers=0 because TTY input is cooked (UART RX ring bytes are pre-shifted ASCII, not raw HID scan codes -- a follow-on HID-direct path will carry real modifier bits).  is_press=1 because the byte itself IS the press event; TTY layer collapses press+release into a single character.  Labels prefixed krf_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;                   // rbx = byte (survives focus_get_keyboard)
+
+        call focus_get_keyboard;
+        mov r11, 0xFFFFFFFFFFFFFFFF;    // FOCUS_NONE
+        cmp rax, r11;
+        je  krf_unfocused;
+
+        mov rdi, rax;                   // surface_slot
+        mov rsi, rbx;                   // key_code = byte
+        xor rdx, rdx;                   // modifiers = 0
+        mov rcx, 1;                     // is_press = 1
+        call kbd_event_deliver;
+
+      krf_unfocused:
+        pop rbx;
+        ret
+      }
+    }
+
+}

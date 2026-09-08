@@ -1,0 +1,802 @@
+// src/kernel/core/graphics/ptr_route.pdx -- R113.M3-013 (paideia-os #2393)
+//
+// Pointer event routing: the HID mouse / touchpad ingress side of the
+// R113 GPU-native compositor's input model.  Umbrella: R113 (#2380).
+// Sibling to focus.pdx (M2-011, #2391) and z_order.pdx (M2-010, #2390);
+// depends only on surface_row_valid + surface_row_dims_get from the
+// KIND_SURFACE substrate (design/graphics/r113-m1-substrate.md §4), on
+// _z_stack / _z_stack_count from z_order.pdx, and on
+// focus_set_pointer + focus_get_pointer + _implicit_grab_slot from
+// focus.pdx.
+//
+// -----------------------------------------------------------------------------
+// SCOPE (per issue #2393)
+// -----------------------------------------------------------------------------
+//
+// Three ingress leaves + per-surface event ring + global pointer state:
+//
+//   * _ptr_x, _ptr_y                 -- global screen-coordinate pointer
+//                                       position, latched by every
+//                                       motion event.  u64 each to keep
+//                                       the accessor forms uniform with
+//                                       the row layout wh_packed shape;
+//                                       overflow past 2^24 is fenced by
+//                                       the 24-bit motion payload mask
+//                                       (see event encoding below).
+//
+//   * _ptr_events[16][32]             -- per-surface event ring, 16
+//                                       surfaces (matching SURFACE_ROW_
+//                                       MAX and Z_STACK_MAX) x 32 slot
+//                                       depth.  Flat u64 array of 512
+//                                       entries laid out row-major:
+//                                       _ptr_events[slot * 32 + head].
+//                                       One-way SPSC-shaped write from
+//                                       the input dispatcher; consumer
+//                                       (user-space compositor via a
+//                                       future OP_SURFACE_DRAIN op)
+//                                       lands in a later milestone.
+//                                       Overflow overwrites the oldest
+//                                       entry (natural mod-32 wrap).
+//
+//   * _ptr_heads[16]                  -- per-surface write cursor, one
+//                                       u64 per surface.  head[slot]
+//                                       advances mod 32 on every
+//                                       successful enqueue; a paired
+//                                       tail cell arrives with the drain
+//                                       op landing.  Kept in a dedicated
+//                                       cell (not colocated in the ring)
+//                                       so a cache-line evict of the
+//                                       ring tail does not evict the hot
+//                                       head read.
+//
+//   * ptr_route_init()                -- boot-time init; scrubs _ptr_x /
+//                                       _ptr_y / _ptr_heads / _ptr_
+//                                       events to zero.  Defensive
+//                                       mirroring the kind_surface_init
+//                                       / z_order_init / focus_init
+//                                       chaos-restart discipline.
+//
+//   * ptr_event_motion(x, y) -> u64   -- (1) latch _ptr_x, _ptr_y;
+//                                       (2) if _implicit_grab_slot !=
+//                                           FOCUS_NONE, target = grab;
+//                                       (3) else hit-test the z_order
+//                                           stack top-down (index count
+//                                           -1 down to 0), first slot
+//                                           whose (0 <= x < w) && (0 <=
+//                                           y < h) is the hit;
+//                                       (4) on hit, call focus_set_
+//                                           pointer(hit); target = hit;
+//                                       (5) on target != FOCUS_NONE,
+//                                           enqueue motion event to the
+//                                           target's ring and emit
+//                                           PTR ROUTE READY sid=<target>;
+//                                       returns 0 on delivery, PTR_
+//                                       ROUTE_NO_TARGET if no surface
+//                                       under pointer AND no grab.
+//                                       Hit-test uses the surface row's
+//                                       dims (w in high 32, h in low
+//                                       32) with an at-origin position
+//                                       assumption -- surface rows do
+//                                       not carry x/y today; per-surface
+//                                       position landings in R113.M2
+//                                       xdg_toplevel geometry follow-ons
+//                                       will refine this to (x < row_x
+//                                       + w) && (y < row_y + h).  Until
+//                                       then all live surfaces overlap
+//                                       at the origin and the top-of-
+//                                       z-order tie-breaker (first slot
+//                                       found in the top-down walk) is
+//                                       the honest routing decision.
+//
+//   * ptr_event_button(btn, press) -> u64  -- deliver a button-edge
+//                                       event to the current pointer
+//                                       target (implicit grab if active,
+//                                       else focus_get_pointer()).  Does
+//                                       NOT itself take or release the
+//                                       grab -- that discipline (focus_
+//                                       grab on press, focus_ungrab on
+//                                       release) belongs to the input
+//                                       dispatcher one caller layer up,
+//                                       so this leaf stays pure and can
+//                                       serve non-toggling event sources
+//                                       (touch, stylus barrel) with the
+//                                       same body.  Returns 0 on
+//                                       delivery, PTR_ROUTE_NO_TARGET
+//                                       if neither grab nor pointer
+//                                       focus is set.
+//
+//   * ptr_event_axis(axis, delta) -> u64   -- scroll / wheel axis
+//                                       event; same target policy as
+//                                       button (grab-or-focus).
+//                                       axis_index >= 4 (only 4 axes
+//                                       reserved: vertical, horizontal,
+//                                       future 2) refused with PTR_
+//                                       ROUTE_BAD_AXIS.  delta is a
+//                                       signed 32-bit scroll increment,
+//                                       consumer-defined units.
+//
+// -----------------------------------------------------------------------------
+// EVENT WORD ENCODING (u64 per ring slot)
+// -----------------------------------------------------------------------------
+//
+//   [63:60] event_kind     1 = motion, 2 = button, 3 = axis
+//   [59:48] reserved       zero at emit; consumer must ignore
+//   [47:0]  payload        kind-specific:
+//
+//     motion:   [47:24] x24 | [23:0] y24    (screen coords, 24-bit each)
+//     button:   [47:32] btn16 | [31:0] press32   (press!=0 iff down-edge)
+//     axis:     [47:32] axis16 | [31:0] delta32  (signed delta as u32)
+//
+// 24-bit motion payload gives 16 Mpx x 16 Mpx addressable pointer space
+// -- far more than any display topology R113.M2 targets (T14 G4 is 3840
+// x 2400 at the top of the roadmap).  Overflow past 2^24 in _ptr_x /
+// _ptr_y is silently truncated in the enqueued word but the raw x/y
+// still land in the global cells at full u64 precision.
+//
+// button/axis payload's 16-bit code + 32-bit modifier covers the full
+// evdev BTN_* / REL_WHEEL_HI_RES value space.
+//
+// The 4-bit kind field leaves 12 kinds unused; future gesture / stylus
+// tilt / haptic-feedback events slot in without a wire-format bump.
+//
+// -----------------------------------------------------------------------------
+// HIT-TEST POSITION ASSUMPTION
+// -----------------------------------------------------------------------------
+//
+// KIND_SURFACE rows (kind_surface.pdx §Row layout, doc §2) carry width
+// and height (wh_packed at +24) but NOT an (x, y) origin.  The R113
+// compositor model defers per-surface positioning to the role side-
+// tables (surface_toplevel.pdx's future geometry annotation for xdg
+// toplevels, surface_layer_shell.pdx's anchor + margin computation for
+// panels).  This landing therefore hit-tests at the origin: for each
+// slot in the z-order stack (top-down), the surface is a hit iff
+// (0 <= x < w) && (0 <= y < h).
+//
+// Rationale for landing before the position side-table exists:
+//   * The routing / delivery / ring-enqueue substrate is orthogonal to
+//     the geometric predicate -- swapping "at origin" for "(x - row_x <
+//     w)" is a single-instruction change per axis inside the loop body.
+//   * z-order tie-breaking (top-down walk, first hit wins) is the
+//     policy this landing owns and it stays correct under any origin.
+//   * A boot witness that mints one surface and drives motion at (0, 0)
+//     validates the whole wire (motion -> hit -> focus_set_pointer ->
+//     ring enqueue -> emit) without needing the position field.
+//
+// The R113.M2 xdg_toplevel geometry follow-on (issue not yet filed;
+// natural cousin to M2-006 surface_toplevel) will land the per-surface
+// (row_x, row_y) side-table and refine this hit-test inline.
+//
+// -----------------------------------------------------------------------------
+// GRAB SEMANTIC (delegation to focus.pdx)
+// -----------------------------------------------------------------------------
+//
+// The pointer-event leaves READ _implicit_grab_slot to steer delivery
+// but do NOT themselves take or release the grab.  focus_grab / focus_
+// ungrab (focus.pdx) are the sole writers; the input dispatcher one
+// layer up drives them on button-down / button-up edges per the Weston /
+// wlroots implicit-grab pattern focus.pdx §"Focus model" documents.
+// This split keeps the ptr_event_* leaves pure with respect to the
+// grab state (no grab mutation on delivery) and lets non-toggling
+// event sources (touch contact-down/up, stylus barrel button) drive
+// the same leaves without accidental grab churn.
+//
+// -----------------------------------------------------------------------------
+// FAILURE TAXONOMY -- 0xFFFFE1D0..0xFFFFE1DF (fresh band, grep-verified)
+// -----------------------------------------------------------------------------
+//
+// Pre-landing sweep (2026-09-08):
+//
+//     $ grep -rn '0xFFFFE1D' src design tests -> empty
+//
+// so 0xFFFFE1D0..0xFFFFE1DF is fresh and uncontested.  Neighbouring
+// bands in the 0xFFFFE1XX page:
+//
+//   0xFFFFE110..E11F  R113.M1-001 KIND_SURFACE substrate
+//   0xFFFFE120..E12F  R113.M1-004 kernel-side surface_format
+//   0xFFFFE130..E13F  ROUTE_REVOKE
+//   0xFFFFE140..E14F  SEAT_LOCK
+//   0xFFFFE150..E15F  R113.M1-005 SURFACE PRESENT
+//   0xFFFFE160..E16F  free
+//   0xFFFFE170..E17F  R113.M2-006 SURFACE TOPLEVEL
+//   0xFFFFE180..E18F  R113.M2-011 FOCUS
+//   0xFFFFE190..E1AF  free
+//   0xFFFFE1B0..E1BF  R113.M2-010 Z-ORDER
+//   0xFFFFE1C0..E1CF  free
+//   0xFFFFE1D0..E1DF  R113.M3-013 PTR ROUTE (THIS FILE)
+//
+// Slot map:
+//
+//   0xFFFFE1D0  PTR_ROUTE_NO_TARGET     motion: no surface under pointer
+//                                       AND no active implicit grab;
+//                                       button/axis: focus_get_pointer
+//                                       returned FOCUS_NONE AND no grab.
+//   0xFFFFE1D1  PTR_ROUTE_BAD_SLOT      target slot resolved to a value
+//                                       outside [0, SURFACE_ROW_MAX);
+//                                       defensive -- reachable only if
+//                                       a corrupt cell in _ptr_heads /
+//                                       _implicit_grab_slot / _ptr_
+//                                       focus_slot leaked past the
+//                                       source-side validators.
+//   0xFFFFE1D2  PTR_ROUTE_BAD_AXIS      ptr_event_axis called with
+//                                       axis_index >= 4 (only 4 axes
+//                                       reserved: vertical, horizontal,
+//                                       and two future placeholders).
+//   0xFFFFE1D3..0xFFFFE1DF              reserved for M3 follow-on
+//                                       (per-seat routing, touch-
+//                                       contact multiplexer, gesture
+//                                       recognizer disagreement, etc.)
+//
+// -----------------------------------------------------------------------------
+// FINGERPRINT (per issue #2393 §6)
+// -----------------------------------------------------------------------------
+//
+// Wire form (post-klog_s1_x1 KV append):
+//
+//   ptr route ready [legacy: PTR ROUTE READY] sid=0x<hex>
+//
+// Byte count verified by hand:
+//   "ptr route ready " (16) + "[legacy: " (9) + "PTR ROUTE READY" (15) +
+//   "]" (1) + "\0" (1) = 42 bytes.
+//
+// KV key reused: surface_k_sid ("sid\0", 4 bytes) from kind_surface.pdx
+// L200 (same reuse pattern surface_present.pdx / surface_toplevel.pdx
+// / z_order.pdx use).
+//
+// Emission cadence: every successful ring-enqueue emits once.  For
+// motion this is once per delivered event (may be at scroll-line
+// frequency; a real 240 Hz mouse would emit ~240 tags/sec, but the
+// default 14-mode QEMU matrix is unreachable here -- no input
+// dispatcher wires the ptr_event_* leaves today, blocked on the same
+// xHCI MSI-X routing the focus / hid_kbd_attach siblings name).
+//
+// Emitter reachability: unreachable in the default 14-mode QEMU matrix
+// today (no caller wires the ptr_event_* leaves).  A tools/verify-
+// fingerprint-coverage.sh allowlist entry mirrors the focus / z-order /
+// hid_kbd_attach siblings' "input-server wire deferred" posture.
+//
+// -----------------------------------------------------------------------------
+// EXTERNAL SYMBOLS
+// -----------------------------------------------------------------------------
+//
+// This module references (bare symbols, kernel .pdx single global
+// namespace, same pattern as focus.pdx / z_order.pdx):
+//
+//   * surface_row_dims_get    (kind_surface.pdx)   -- w/h unpack source
+//   * SURFACE_ROW_MAX         (kind_surface.pdx)   -- 16, hit-test bound
+//   * _z_stack                (z_order.pdx)        -- top-down walk
+//   * _z_stack_count          (z_order.pdx)        -- walk length
+//   * _implicit_grab_slot     (focus.pdx)          -- grab check
+//   * focus_set_pointer       (focus.pdx)          -- hit-transition
+//   * focus_get_pointer       (focus.pdx)          -- current p-focus
+//   * SUBSYS_CAP_             (klog subsystem ordinal)
+//   * surface_k_sid           (kind_surface.pdx)   -- reused KV key
+//   * klog_s1_x1              (klog/wrappers.pdx)  -- 1-KV hex emit
+//
+// -----------------------------------------------------------------------------
+// ENCODER PITFALLS (per feedback_pdx_encoder_pitfalls v0.36+)
+// -----------------------------------------------------------------------------
+//
+//   * No `test rN, rN` -- every zero-check uses `cmp rN, 0` + `je/jne`.
+//   * No 2-op `imul r, imm` -- ring offset math uses `shl r, 8` for
+//     slot * 256 (32 u64) and `shl r, 3` for head * 8.
+//   * No `and reg, imm64` -- FOCUS_NONE (0xFFFFFFFFFFFFFFFF) staged
+//     into a scratch register via `mov r64, imm64` (movabs) first.
+//     Narrow masks 0xFFFFFFFF / 0xFFFFFF / 0xFFFF / 0x1F fit in 32-bit
+//     immediates and encode without sign-extension per the tui_canvas /
+//     kind_gpu_bo precedent.
+//   * No `cmp reg, [mem]` -- every mem compare loads to a scratch
+//     register first (surface_present.pdx L242 pattern).
+//   * No literal-scaled `[reg + N*8]` -- only displacement form
+//     `[reg + 0]` for scalar cells; register-scaled `[reg + rN * 8]`
+//     for the ring / stack / heads walks (scale 8 in the SIB-legal
+//     {1, 2, 4, 8} set).
+//   * No `mov qword [mem], imm64` -- zero staged via `xor rax, rax`
+//     then stored; FOCUS_NONE staged via movabs then compared, never
+//     stored (this file only READS FOCUS_NONE).
+//   * Multiline `pub let ="..."` refused by the encoder -- both string
+//     literals in this file live on one source line.
+//   * Module name matches file basename: `PtrRoute` for `ptr_route.pdx`.
+//   * Fingerprint tag byte count computed by hand and asserted in the
+//     `[u8; N]` type ascription (42 for the ready tag).
+//
+// -----------------------------------------------------------------------------
+// LABEL PREFIXES
+// -----------------------------------------------------------------------------
+//
+//   pri_    ptr_route_init
+//   pm_     ptr_event_motion
+//   pb_     ptr_event_button
+//   pax_    ptr_event_axis
+//
+// All prefixes avoid the paideia-as reserved-keyword set
+// (feedback_paideia_as_reserved_labels: loop, if, let, while, for,
+// match, pub, mod, use, fn, struct, enum, impl, trait, type, where,
+// move, mut, ref).
+
+module PtrRoute = structure {
+
+  // ==========================================================================
+  // Constants
+  // ==========================================================================
+
+  pub let PTR_ROUTE_OK           : u64 = 0
+  pub let PTR_ROUTE_NO_TARGET    : u64 = 0xFFFFE1D0
+  pub let PTR_ROUTE_BAD_SLOT     : u64 = 0xFFFFE1D1
+  pub let PTR_ROUTE_BAD_AXIS     : u64 = 0xFFFFE1D2
+
+  pub let PTR_RING_MAX           : u64 = 16      // matches SURFACE_ROW_MAX
+  pub let PTR_RING_DEPTH         : u64 = 32      // per-surface ring depth
+  pub let PTR_AXIS_MAX           : u64 = 4       // vertical, horizontal, +2 rsvd
+
+  // ==========================================================================
+  // Pool storage
+  //
+  // _ptr_events: 16 surfaces * 32 u64 slots = 512 u64 = 4 KiB, one page
+  //              aligned.  Row-major: entry (slot, head) at index
+  //              slot * 32 + head; byte offset slot * 256 + head * 8.
+  // _ptr_heads:  16 u64 write cursors (one per surface).  16 * 8 = 128 B.
+  // _ptr_x/_ptr_y: two u64 global cells.
+  //
+  // Zero-initialised .bss; ptr_route_init defensively re-scrubs at boot.
+  // ==========================================================================
+
+  pub let mut _ptr_events : [u64; 512] = uninit @align(64)
+  pub let mut _ptr_heads  : [u64; 16]  = uninit @align(64)
+  pub let mut _ptr_x      : u64        = uninit @align(8)
+  pub let mut _ptr_y      : u64        = uninit @align(8)
+
+  // ==========================================================================
+  // Fingerprint tag (42 bytes).  surface_k_sid ("sid\0") is reused from
+  // kind_surface.pdx L200 by bare-symbol lookup (same pattern as
+  // z_order.pdx / surface_toplevel.pdx).
+  // ==========================================================================
+
+  pub let ptr_route_ready_msg : [u8; 42] = "ptr route ready [legacy: PTR ROUTE READY]\0"
+
+  // ==========================================================================
+  // ptr_route_init() -> ()
+  //
+  // Zero _ptr_x, _ptr_y, _ptr_heads[16], _ptr_events[512].  Called from
+  // kernel_main.pdx boot cascade after focus_init (which the
+  // ptr_event_* leaves depend on via focus_get_pointer / focus_set_
+  // pointer).  Zero-arg leaf, no callee-save clobber; touches only
+  // rax, rcx, r10.  Defensive re-scrub mirroring kind_surface_init /
+  // z_order_init / focus_init discipline (chaos-restart witness re-
+  // scrub point).  Labels prefixed pri_.
+  // ==========================================================================
+
+  pub let ptr_route_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M3-013 (#2393): zero _ptr_x, _ptr_y, _ptr_heads (16 u64), _ptr_events (512 u64).  Defensive boot-time re-scrub mirroring kind_surface_init / z_order_init / focus_init discipline.  Three straight-line loops (scalars, heads, events) using [reg + rcx * 8] register-scaled SIB (scale 8 in the legal {1,2,4,8} set).  Zero staged via xor rax, rax then stored (no `mov qword [mem], imm64` form).  Zero-arg leaf; entry rsp%16=8 unchanged on return.  Labels prefixed pri_.",
+      block: {
+        xor rax, rax;
+
+        lea r10, [rip + _ptr_x];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _ptr_y];
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _ptr_heads];
+        xor rcx, rcx;
+      pri_heads:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  pri_heads;
+
+        lea r10, [rip + _ptr_events];
+        xor rcx, rcx;
+      pri_events:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 512;
+        jb  pri_events;
+
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ptr_event_motion(x, y) -> u64
+  //
+  // Gate order:
+  //   (1) latch _ptr_x = x, _ptr_y = y (unconditional -- global pointer
+  //       state must always reflect the last motion, even if no target)
+  //   (2) if _implicit_grab_slot != FOCUS_NONE -> target = grab_slot,
+  //       skip hit-test (implicit grab holds delivery pinned)
+  //   (3) else hit-test the z_order stack top-down (index count-1 down
+  //       to 0): for each slot, call surface_row_dims_get; unpack w
+  //       (high 32) and h (low 32); first slot with (x < w && y < h) is
+  //       the hit
+  //   (4) on hit, call focus_set_pointer(hit_slot); target = hit_slot
+  //   (5) on target != FOCUS_NONE, pack motion event word and enqueue
+  //       to _ptr_events[target]; emit PTR ROUTE READY sid=<target>
+  //   (6) return 0 on delivery, PTR_ROUTE_NO_TARGET if no route
+  //
+  // Register plan:
+  //   rbx = event word (live across emit)
+  //   r12 = x (live across nested calls to preserve for event pack)
+  //   r13 = y (same)
+  //   r14 = target slot (init FOCUS_NONE; live across emit)
+  //   r15 = z_order loop index (during hit-test only)
+  //
+  // Five callee-save pushes = 40 bytes; entry rsp%16=8 -> post 8+40=48,
+  // mod 16 = 0.  Every nested call (surface_row_dims_get, focus_set_
+  // pointer, klog_s1_x1) lands rsp aligned without further padding.
+  // All three preserve callee-save per SysV / the iommu/domain_switch.
+  // pdx precedent tui_canvas cites.
+  //
+  // Labels prefixed pm_.
+  // ==========================================================================
+
+  pub let ptr_event_motion : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (x: u64) (y: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R113.M3-013 (#2393): motion ingress.  Gate order per file header: (1) latch _ptr_x/_ptr_y; (2) grab short-circuit; (3) z-order top-down hit-test using surface_row_dims_get (dims high 32 = w, low 32 = h -- matches kind_surface.pdx surface_mint layout); (4) focus_set_pointer on hit; (5) enqueue + emit PTR ROUTE READY sid=<target>.  Five callee-save pushes (rbx=event, r12=x, r13=y, r14=target, r15=loop_idx) land rsp%16=0 for every nested call.  FOCUS_NONE (0xFFFFFFFFFFFFFFFF) staged via movabs into r11 for the equality compare, never used as `cmp reg, imm64` directly.  Narrow masks 0xFFFFFF / 0xFFFFFFFF safe as 32-bit immediates per the tui_canvas / kind_gpu_bo precedent.  Ring offset computed via shl 8 (slot * 256) + register-scaled [r10 + r9 * 8] (head * 8), never via 2-op imul.  Hit-test at-origin position assumption documented in file header §HIT-TEST POSITION ASSUMPTION; refinement lands with the R113.M2 xdg_toplevel geometry follow-on.  Labels prefixed pm_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                        // x
+        mov r13, rsi;                        // y
+
+        // (1) latch global pointer position
+        lea r10, [rip + _ptr_x];
+        mov [r10 + 0], r12;
+        lea r10, [rip + _ptr_y];
+        mov [r10 + 0], r13;
+
+        // (2) check implicit grab
+        mov r14, 0xFFFFFFFFFFFFFFFF;         // target = FOCUS_NONE (default)
+
+        lea r10, [rip + _implicit_grab_slot];
+        mov rax, [r10 + 0];
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  pm_hittest;                      // no grab -> hit-test
+        mov r14, rax;                        // grab active -> pinned target
+        jmp pm_have_target;
+
+      pm_hittest:
+        // (3) walk z_order stack top-down: for i = count - 1 downto 0
+        lea r10, [rip + _z_stack_count];
+        mov r15, [r10 + 0];
+        cmp r15, 0;
+        je  pm_no_deliver;                   // empty stack -> no target
+        sub r15, 1;                          // r15 = start idx (count - 1)
+
+      pm_hit_loop:
+        lea r10, [rip + _z_stack];
+        mov rdi, [r10 + r15 * 8];            // rdi = slot arg
+        call surface_row_dims_get;           // rax = wh_packed | 0 (invalid)
+
+        cmp rax, 0;
+        je  pm_hit_skip;                     // dims 0 -> row not in_use
+
+        // Unpack: high 32 = w, low 32 = h (matches surface_mint layout).
+        mov r11, rax;
+        shr r11, 32;                         // r11 = w
+        and rax, 0xFFFFFFFF;                 // rax = h
+
+        // Hit predicate: (x < w) && (y < h)
+        cmp r12, r11;
+        jae pm_hit_skip;
+        cmp r13, rax;
+        jae pm_hit_skip;
+
+        // Hit -- reload slot into r14 (surface_row_dims_get preserves
+        // r15 per SysV so this re-fetch is safe).
+        lea r10, [rip + _z_stack];
+        mov r14, [r10 + r15 * 8];
+
+        // (4) call focus_set_pointer(hit_slot).  focus_set_pointer
+        //     preserves r14 and every other callee-save per its own
+        //     one-push-r12 discipline; its return (rax) is ignored --
+        //     focus state is already durable in _ptr_focus_slot on
+        //     success and the hit is authoritatively r14.
+        mov rdi, r14;
+        call focus_set_pointer;
+        jmp pm_have_target;
+
+      pm_hit_skip:
+        cmp r15, 0;
+        je  pm_no_deliver;
+        sub r15, 1;
+        jmp pm_hit_loop;
+
+      pm_have_target:
+        // Defensive: target must be within SURFACE_ROW_MAX(16) before
+        // we use it as a ring index.  A leak past focus_set_pointer /
+        // focus_grab validators would land here.  Immediate 16 mirrors
+        // the z_order.pdx zop_ / zore_ / zor_ discipline of inlining
+        // the cross-module bound rather than sourcing it via
+        // [rip + SURFACE_ROW_MAX] -- cross-module data-symbol reach is
+        // less battle-tested in paideia-as than cross-module code-label
+        // reach.  A single-token edit follows when SURFACE_ROW_MAX and
+        // PTR_RING_MAX are bumped together (see z_order.pdx §pool
+        // sizing).
+        cmp r14, 16;
+        jae pm_bad_slot;
+
+        // (5) pack motion event word:
+        //   (1 << 60) | ((x & 0xFFFFFF) << 24) | (y & 0xFFFFFF)
+        mov rbx, r12;
+        and rbx, 0xFFFFFF;                   // x24
+        shl rbx, 24;
+        mov r10, r13;
+        and r10, 0xFFFFFF;                   // y24
+        or  rbx, r10;
+        mov r11, 1;
+        shl r11, 60;                         // kind = 1 (motion)
+        or  rbx, r11;
+
+        // Enqueue to _ptr_events[r14 * 32 + head]:
+        //   head = _ptr_heads[r14]
+        //   base = _ptr_events + r14 * 256
+        //   [base + head * 8] = rbx
+        //   _ptr_heads[r14] = (head + 1) & 31
+        lea r10, [rip + _ptr_heads];
+        mov r9, [r10 + r14 * 8];             // r9 = head
+
+        lea r10, [rip + _ptr_events];
+        mov r11, r14;
+        shl r11, 8;                          // r11 = r14 * 256
+        add r10, r11;                        // r10 = ring base
+        mov [r10 + r9 * 8], rbx;             // store event
+
+        add r9, 1;
+        and r9, 31;                          // mod 32
+        lea r10, [rip + _ptr_heads];
+        mov [r10 + r14 * 8], r9;
+
+        // (6) emit PTR ROUTE READY sid=<r14>
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + ptr_route_ready_msg];
+        lea rcx, [rip + surface_k_sid];
+        mov r8, r14;                         // sid = target
+        call klog_s1_x1;
+
+        xor rax, rax;
+        jmp pm_out;
+
+      pm_no_deliver:
+        mov rax, 0xFFFFE1D0;                 // PTR_ROUTE_NO_TARGET
+        jmp pm_out;
+      pm_bad_slot:
+        mov rax, 0xFFFFE1D1;                 // PTR_ROUTE_BAD_SLOT
+
+      pm_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ptr_event_button(button, is_press) -> u64
+  //
+  // Deliver a button-edge event to the current pointer target
+  // (implicit grab if active, else focus_get_pointer).  Does NOT take
+  // or release the grab -- the input dispatcher one caller layer up
+  // owns focus_grab / focus_ungrab per the Weston / wlroots implicit-
+  // grab discipline focus.pdx §"Focus model" documents.
+  //
+  // Gate order:
+  //   (1) target = grab if active else focus_get_pointer
+  //   (2) if target == FOCUS_NONE -> PTR_ROUTE_NO_TARGET
+  //   (3) defensive: target < SURFACE_ROW_MAX else PTR_ROUTE_BAD_SLOT
+  //   (4) pack event word (kind=2), enqueue, emit
+  //
+  // Register plan:
+  //   rbx = event word (live across emit)
+  //   r14 = target slot (live across emit)
+  //   Two callee-save pushes + sub rsp, 8 = 24 bytes; entry rsp%16=8
+  //   -> post 8+16+8 = 32, mod 16 = 0.  Nested calls (focus_get_
+  //   pointer, klog_s1_x1) both land aligned.
+  //
+  // Labels prefixed pb_.
+  // ==========================================================================
+
+  pub let ptr_event_button : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (button: u64) (is_press: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R113.M3-013 (#2393): button ingress.  Gate order per file header: (1) target = grab-if-active else focus_get_pointer; (2) FOCUS_NONE -> PTR_ROUTE_NO_TARGET; (3) SURFACE_ROW_MAX bounds check; (4) pack event (kind=2, btn16<<32 | press32) + enqueue + emit PTR ROUTE READY.  Does NOT take/release grab -- input dispatcher one layer up owns focus_grab/focus_ungrab.  Two callee-save pushes (rbx=event, r14=target) + sub rsp,8 align rsp%16=0 for focus_get_pointer + klog_s1_x1.  FOCUS_NONE staged via movabs.  Narrow masks 0xFFFF / 0xFFFFFFFF safe as 32-bit immediates.  Ring offset via shl 8 + register-scaled SIB.  Labels prefixed pb_.",
+      block: {
+        push rbx;
+        push r14;
+        sub rsp, 8;
+
+        // (1) pack event word first so we can free rdi/rsi before the
+        //     focus_get_pointer call:
+        //   (2 << 60) | ((button & 0xFFFF) << 32) | (is_press & 0xFFFFFFFF)
+        mov rbx, rdi;
+        and rbx, 0xFFFF;                     // btn16
+        shl rbx, 32;
+        mov r10, rsi;
+        and r10, 0xFFFFFFFF;                 // press32
+        or  rbx, r10;
+        mov r11, 2;
+        shl r11, 60;                         // kind = 2 (button)
+        or  rbx, r11;
+
+        // (2) target = grab if active
+        mov r14, 0xFFFFFFFFFFFFFFFF;         // FOCUS_NONE default
+
+        lea r10, [rip + _implicit_grab_slot];
+        mov rax, [r10 + 0];
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  pb_via_focus;                    // no grab -> use focus
+        mov r14, rax;
+        jmp pb_have_target;
+
+      pb_via_focus:
+        call focus_get_pointer;              // rax = _ptr_focus_slot
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  pb_no_target;
+        mov r14, rax;
+
+      pb_have_target:
+        // (3) bounds check -- inline 16 per the pm_have_target comment
+        cmp r14, 16;
+        jae pb_bad_slot;
+
+        // (4) enqueue rbx to _ptr_events[r14][head]
+        lea r10, [rip + _ptr_heads];
+        mov r9, [r10 + r14 * 8];             // r9 = head
+
+        lea r10, [rip + _ptr_events];
+        mov r11, r14;
+        shl r11, 8;                          // r11 = r14 * 256
+        add r10, r11;
+        mov [r10 + r9 * 8], rbx;
+
+        add r9, 1;
+        and r9, 31;
+        lea r10, [rip + _ptr_heads];
+        mov [r10 + r14 * 8], r9;
+
+        // Emit PTR ROUTE READY sid=<r14>
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + ptr_route_ready_msg];
+        lea rcx, [rip + surface_k_sid];
+        mov r8, r14;
+        call klog_s1_x1;
+
+        xor rax, rax;
+        jmp pb_out;
+
+      pb_no_target:
+        mov rax, 0xFFFFE1D0;                 // PTR_ROUTE_NO_TARGET
+        jmp pb_out;
+      pb_bad_slot:
+        mov rax, 0xFFFFE1D1;                 // PTR_ROUTE_BAD_SLOT
+
+      pb_out:
+        add rsp, 8;
+        pop r14;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ptr_event_axis(axis_index, delta) -> u64
+  //
+  // Scroll / wheel axis event.  Same target policy as button (grab-or-
+  // focus).  axis_index >= PTR_AXIS_MAX(4) -> PTR_ROUTE_BAD_AXIS.
+  //
+  // Gate order:
+  //   (1) axis_index < PTR_AXIS_MAX else PTR_ROUTE_BAD_AXIS
+  //   (2) target = grab if active else focus_get_pointer
+  //   (3) target valid + within bounds else NO_TARGET / BAD_SLOT
+  //   (4) pack event (kind=3, axis16<<32 | delta32), enqueue, emit
+  //
+  // Register plan: identical to ptr_event_button (rbx = event, r14 =
+  // target, two callee-save pushes + sub rsp, 8).  Labels prefixed pax_.
+  // ==========================================================================
+
+  pub let ptr_event_axis : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (axis_index: u64) (delta: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R113.M3-013 (#2393): axis ingress.  Gate order per file header: (1) axis_index < PTR_AXIS_MAX(4) else PTR_ROUTE_BAD_AXIS; (2) target = grab-if-active else focus_get_pointer; (3) NO_TARGET / bounds refuse; (4) pack event (kind=3, axis16<<32 | delta32) + enqueue + emit PTR ROUTE READY.  Identical register plan to ptr_event_button (rbx=event, r14=target, two callee-save pushes + sub rsp,8 land rsp%16=0).  delta stored in the low 32 bits as raw u32 (caller-side signed / unsigned interpretation).  Labels prefixed pax_.",
+      block: {
+        push rbx;
+        push r14;
+        sub rsp, 8;
+
+        // (1) axis_index bounds -- inline 4 (PTR_AXIS_MAX declared
+        // in-module, but immediate keeps the compare form uniform with
+        // the sibling bounds gates above).
+        cmp rdi, 4;
+        jae pax_bad_axis;
+
+        // Pack event word early:
+        //   (3 << 60) | ((axis_index & 0xFFFF) << 32) | (delta & 0xFFFFFFFF)
+        mov rbx, rdi;
+        and rbx, 0xFFFF;
+        shl rbx, 32;
+        mov r10, rsi;
+        and r10, 0xFFFFFFFF;
+        or  rbx, r10;
+        mov r11, 3;
+        shl r11, 60;                         // kind = 3 (axis)
+        or  rbx, r11;
+
+        // (2) target = grab if active
+        mov r14, 0xFFFFFFFFFFFFFFFF;         // FOCUS_NONE default
+
+        lea r10, [rip + _implicit_grab_slot];
+        mov rax, [r10 + 0];
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  pax_via_focus;
+        mov r14, rax;
+        jmp pax_have_target;
+
+      pax_via_focus:
+        call focus_get_pointer;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  pax_no_target;
+        mov r14, rax;
+
+      pax_have_target:
+        // (3) bounds check -- inline 16 per the pm_have_target comment
+        cmp r14, 16;
+        jae pax_bad_slot;
+
+        // (4) enqueue rbx to _ptr_events[r14][head]
+        lea r10, [rip + _ptr_heads];
+        mov r9, [r10 + r14 * 8];
+
+        lea r10, [rip + _ptr_events];
+        mov r11, r14;
+        shl r11, 8;
+        add r10, r11;
+        mov [r10 + r9 * 8], rbx;
+
+        add r9, 1;
+        and r9, 31;
+        lea r10, [rip + _ptr_heads];
+        mov [r10 + r14 * 8], r9;
+
+        // Emit PTR ROUTE READY sid=<r14>
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + ptr_route_ready_msg];
+        lea rcx, [rip + surface_k_sid];
+        mov r8, r14;
+        call klog_s1_x1;
+
+        xor rax, rax;
+        jmp pax_out;
+
+      pax_bad_axis:
+        mov rax, 0xFFFFE1D2;                 // PTR_ROUTE_BAD_AXIS
+        jmp pax_out;
+      pax_no_target:
+        mov rax, 0xFFFFE1D0;                 // PTR_ROUTE_NO_TARGET
+        jmp pax_out;
+      pax_bad_slot:
+        mov rax, 0xFFFFE1D1;                 // PTR_ROUTE_BAD_SLOT
+
+      pax_out:
+        add rsp, 8;
+        pop r14;
+        pop rbx;
+        ret
+      }
+    }
+
+}

@@ -1605,6 +1605,95 @@ ALLOWLIST = {
         "keyboard against a live surface slot (same MSI-X wire "
         "blocker as the focus kbd / focus ptr siblings above).",
 
+    # ------------------------------------------------------------------
+    # R113.M3-012 (paideia-os #2392): keyboard event routing from the
+    # KIND_TTY input ring to the focused surface's per-surface u64 ring
+    # (src/kernel/core/graphics/kbd_route.pdx).  kbd_event_deliver
+    # enqueues one packed (key_code, modifiers, is_press) u64 per
+    # drained byte and, on the first-ever successful enqueue for a
+    # given surface_slot, emits KBD ROUTE READY sid=<slot> via
+    # klog_s1_x1 -- a summary fingerprint, NOT per-event (per issue
+    # #2392 §5: "no per-event fingerprint (high-volume)").  Subsequent
+    # enqueues on the same slot are silent; the wire volume is
+    # proportional to distinct surfaces that ever received input, not
+    # to keystroke rate.  Wire caller is tty_stdin_drain via kbd_route_
+    # from_tty_byte; focus_get_keyboard() returning FOCUS_NONE short-
+    # circuits the helper before any enqueue.  Unreachable in the
+    # default 14-mode QEMU matrix because no boot witness sets a
+    # keyboard focus (the compositor's refocus-on-window-activate path
+    # is still open, and the HID Transfer Event ISR is blocked on
+    # xHCI MSI-X routing per drivers/xhci/hid_kbd_attach.pdx §IRQ
+    # path).  Same real-HW / wire-deferred posture as the focus /
+    # z_order / ptr_route siblings; assertable when a boot witness
+    # drives focus_set_keyboard against a live surface slot and then
+    # exercises tty_stdin_drain (or calls kbd_event_deliver directly).
+    # ------------------------------------------------------------------
+    "kbd route ready [legacy: KBD ROUTE READY]":
+        "R113.M3-012 (#2392): keyboard-route delivery fingerprint; "
+        "kbd_event_deliver emits via klog_s1_x1 with sid=<slot> KV "
+        "on the FIRST successful enqueue for each surface_slot ever "
+        "(subsequent enqueues on the same slot are silent per issue "
+        "#2392 §5 'no per-event fingerprint').  Wire caller is "
+        "tty_stdin_drain via kbd_route_from_tty_byte; unreachable "
+        "in the default 14-mode QEMU matrix because focus_get_"
+        "keyboard() returns FOCUS_NONE on every current boot (same "
+        "MSI-X wire blocker as the focus kbd / focus ptr / z order "
+        "raise / ptr route siblings).  Assertable when a boot "
+        "witness drives focus_set_keyboard against a live surface "
+        "slot and then drains a byte end-to-end.",
+
+    # ------------------------------------------------------------------
+    # R113.M3-013 (paideia-os #2393): pointer event routing from HID
+    # mouse + touchpad (src/kernel/core/graphics/ptr_route.pdx).
+    # ptr_event_motion / ptr_event_button / ptr_event_axis each emit
+    # PTR ROUTE READY sid=<target> via klog_s1_x1 on every successful
+    # ring-enqueue.  Delivery target is _implicit_grab_slot (if
+    # active) or the z_order top-down hit-test result (motion) /
+    # focus_get_pointer (button / axis).  Unreachable in the default
+    # 14-mode QEMU matrix because no live caller wires the ptr_event_*
+    # leaves yet -- the input dispatcher is blocked on xHCI MSI-X
+    # routing (drivers/xhci/hid_kbd_attach.pdx §IRQ path, same blocker
+    # as the focus kbd / focus ptr / z order raise siblings above).
+    # Assertable when a boot witness or the R113.M3 input dispatcher
+    # landing drives a ptr_event_* leaf against a live surface slot
+    # end-to-end (motion + hit-test path is the natural first witness
+    # since it exercises the full chain: motion latch -> z_order walk
+    # -> surface_row_dims_get -> focus_set_pointer -> ring enqueue ->
+    # emit).
+    # ------------------------------------------------------------------
+    "ptr route ready [legacy: PTR ROUTE READY]":
+        "R113.M3-013 (#2393): pointer-route delivery fingerprint; "
+        "ptr_event_motion / ptr_event_button / ptr_event_axis emit "
+        "via klog_s1_x1 with sid=<target> KV on every successful "
+        "ring-enqueue.  Unreachable in the default 14-mode QEMU "
+        "matrix -- no live caller wires the ptr_event_* leaves yet "
+        "(same MSI-X wire blocker as the focus kbd / focus ptr / "
+        "z order raise siblings above).  Assertable when the R113.M3 "
+        "input dispatcher landing or a boot witness drives a "
+        "ptr_event_* leaf against a live surface slot end-to-end.",
+
+    # ------------------------------------------------------------------
+    # R113.M3-015 (paideia-os #2395): modifier-state tracker
+    # (src/kernel/core/graphics/modifier_state.pdx).  Single transition
+    # fingerprint fires on modifier_set (state actually changed) or
+    # modifier_toggle_lock (always changes, XOR is guaranteed to flip).
+    # Not reachable in the default 14-mode matrix today: first live
+    # callers are the HID keyboard handlers (Transfer Event handler +
+    # lock-LED-drive worker) blocked on xHCI MSI-X routing (see
+    # drivers/xhci/hid_kbd_attach.pdx §IRQ path).  Real-HW / wire-
+    # deferred posture identical to the focus kbd / focus ptr siblings.
+    # ------------------------------------------------------------------
+    "modifier state ok [legacy: MODIFIER STATE OK]":
+        "R113.M3-015 (#2395): modifier-state transition tag; "
+        "modifier_set emits via klog_s1_x1 with mask=<hex> KV "
+        "when the new state differs from _modifier_state (silent "
+        "no-op on key-repeat / spurious-release); modifier_toggle_"
+        "lock always emits (XOR always transitions).  First live "
+        "caller is the HID kbd Transfer Event handler (blocked on "
+        "xHCI MSI-X routing per drivers/xhci/hid_kbd_attach.pdx "
+        "§IRQ path).  Assertable when a boot witness drives "
+        "modifier_set / modifier_toggle_lock end-to-end.",
+
     # Batch 7: G7 close-out (src/user/compositor/*.pdx)
     "pdx kind subsurface meta [legacy: SUBSURFACE SYNC OK]":
         "Wave0-B7 G7-M3-003 (#2258): subsurface_sync (KIND=0x1BA) "
