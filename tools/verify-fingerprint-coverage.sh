@@ -1488,16 +1488,19 @@ ALLOWLIST = {
         "path).  Emitter lands in the default matrix via first user-"
         "space surface_mint call.",
     "surface present ok [legacy: SURFACE PRESENT OK]":
-        "R113.M1-001 (#2381) + R113.M1-001b (#2424): kernel-side "
-        "SURFACE PRESENT OK tag; landed with the substrate per doc §8's "
-        "five-tag mandate.  Handler wired M1-001b (the M1-005 present-"
-        "fence emitter is the specific site that wraps surface_row_swap "
-        "in the klog_s1_x1 call for this tag; cap_handler_surface's "
-        "OP_SURFACE_COMMIT already reaches surface_row_swap but does "
-        "not emit the present tag -- that emission belongs to the IRQ-"
-        "handler path M1-005 lands).  Emitter (mint/destroy) lands via "
-        "first user-space surface_mint call.  Assertable when M1-005 + "
-        "a boot witness land together.",
+        "R113.M1-005 (#2385) + R113.M1-001b (#2424): kernel-side "
+        "SURFACE PRESENT OK tag; the M1-005 emitter has landed at src/"
+        "kernel/core/graphics/surface_present.pdx (surface_present_"
+        "notify body) which validates slot + serial then klog_s1_x2's "
+        "this tag with (sid, serial) KVs.  Handler wired M1-001b (cap/"
+        "handlers/cap_handler_surface.pdx OP_SURFACE_COMMIT already "
+        "reaches surface_row_swap; the M1-005 surface_present_notify "
+        "body is called by the R36 display-plane IRQ handler after "
+        "scanout completes -- that IRQ wire lands separately with the "
+        "R36 display-plane bring-up).  Emitter reachable in the "
+        "default matrix once a boot witness wires mint -> attach -> "
+        "commit -> notify end-to-end.  Closed the last of the doc §8 "
+        "five-tag mandate slots (all five tags now have live emitters).",
 
     # Batch 7: G7 close-out (src/user/compositor/*.pdx)
     "pdx kind subsurface meta [legacy: SUBSURFACE SYNC OK]":
