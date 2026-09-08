@@ -1532,6 +1532,37 @@ ALLOWLIST = {
         "out, and the cap-dispatcher OP_SESSION_MINT arm is a follow-"
         "on landing.  Assertable when the follow-on session-manager "
         "landing (or a boot witness) drives session_mint end-to-end.",
+
+    # ------------------------------------------------------------------
+    # R113.M5-026 (paideia-os #2406): SESSION REVOKE cascade fingerprint
+    # (src/kernel/core/graphics/session_revoke.pdx).  session_revoke
+    # tears down every KIND_SURFACE row + wrapping role authority
+    # (TOPLEVEL / POPUP / LAYER_SHELL) owned by the session's owner_task,
+    # drops surface slots from the z-order stack, clears keyboard/pointer
+    # focus if it points at any dying surface, then session_set_state
+    # (EXITED) + session_destroy on the session row itself.  Emits
+    # SESSION REVOKE OK sid=<n> surfaces=<n> tops=<n> pops=<n> lyrs=<n>
+    # via klog_s1_d5 (this same landing mints that wrapper -- see
+    # src/kernel/core/klog/wrappers.pdx §klog_s1_d5).  Emitter is live
+    # but not reachable in the default matrix yet: no boot witness or
+    # cap-dispatcher arm calls session_revoke -- the follow-on cap-
+    # dispatcher landing wiring session cap-drop -> session_revoke is
+    # the natural first consumer.  Same wire-deferred posture as the
+    # sibling `session mint ok` entry above; retires when a boot witness
+    # (or the cap-dispatcher wire) exercises the full mint session ->
+    # mint surfaces -> create roles -> revoke session cascade.
+    # ------------------------------------------------------------------
+    "session revoke ok [legacy: SESSION REVOKE OK]":
+        "R113.M5-026 (#2406): SESSION REVOKE cascade fingerprint; "
+        "session_revoke (src/kernel/core/graphics/session_revoke.pdx) "
+        "emits this via klog_s1_d5 with (sid, surfaces, tops, pops, "
+        "lyrs) KVs on every successful cascade past the session-live + "
+        "owner != 0 + state != EXITED gates.  Emitter is live but not "
+        "reachable in the default matrix yet: no boot witness or cap-"
+        "dispatcher arm calls session_revoke.  Assertable when the "
+        "follow-on cap-dispatcher landing (or a boot witness) drives "
+        "mint session -> mint surfaces -> create roles -> revoke "
+        "session end-to-end.",
     "dmabuf import ok [legacy: DMABUF IMPORT OK]":
         "R113.M4-017 (paideia-os #2397): kernel-side DMABUF IMPORT OK "
         "tag emitted by dma_buf_import (src/kernel/core/graphics/"
@@ -1678,6 +1709,57 @@ ALLOWLIST = {
         "the default matrix when a boot witness drives focus_set_"
         "keyboard against a live surface slot (same MSI-X wire "
         "blocker as the focus kbd / focus ptr siblings above).",
+
+    # ------------------------------------------------------------------
+    # R113.M5-024 (paideia-os #2404): mid-session compositor lock hook
+    # (src/kernel/core/graphics/lockscreen.pdx).  Two fingerprints fire
+    # from the engage / dismiss entry points: LOCKSCREEN ENGAGE OK on
+    # a successful lock (session validated, not already engaged, lock
+    # surface bound, z-stack snapshotted + dismantled, lock surface
+    # raised + focused, session moved to LOCKED) and LOCKSCREEN
+    # DISMISS OK on a successful unlock (session validated, engaged,
+    # lock surface removed from z-stack, snapshot restored via z_order
+    # _push_top loop, session moved to ACTIVE, engaged/stash cleared).
+    # Both emit via klog_s1_x1 with sid=<session_id> KV.  Emitter is
+    # live but unreachable in the default 14-mode QEMU matrix today:
+    # the full engage/dismiss cascade requires (a) a live session_mint
+    # (kind_session substrate; no boot witness drives it yet -- the
+    # sibling `session mint ok` entry above documents the same wire-
+    # deferred posture), (b) a bound lock surface via lockscreen_bind
+    # _surface (compositor-side lock-agent landing not yet wired), and
+    # (c) the input-server MSI-X wire (shared blocker with focus /
+    # z_order siblings, drivers/xhci/hid_kbd_attach.pdx §IRQ path) for
+    # the interactive dismiss path (auth-success trigger flows through
+    # the input dispatcher).  Assertable end-to-end when the follow-on
+    # KIND_LOCK_AGENT cap dispatcher lands and a boot witness drives
+    # session_mint -> lockscreen_bind_surface -> lockscreen_engage ->
+    # lockscreen_dismiss against a live surface pair.
+    # ------------------------------------------------------------------
+    "lockscreen engage ok [legacy: LOCKSCREEN ENGAGE OK]":
+        "R113.M5-024 (#2404): mid-session compositor lock engage "
+        "fingerprint; lockscreen_engage (src/kernel/core/graphics/"
+        "lockscreen.pdx) emits via klog_s1_x1 with sid=<session_id> "
+        "KV on every successful engage past the session_row_valid + "
+        "not-already-engaged + surface-bound gates.  Emitter is live "
+        "but not reachable in the default matrix yet: no boot witness "
+        "drives session_mint (same posture as the `session mint ok` "
+        "sibling above), no compositor-side lock-agent lands a "
+        "lockscreen_bind_surface call, and the KIND_LOCK_AGENT cap "
+        "dispatcher arm is a follow-on landing.  Assertable when a "
+        "boot witness drives the full cascade end-to-end (session_mint "
+        "-> lockscreen_bind_surface -> lockscreen_engage).",
+    "lockscreen dismiss ok [legacy: LOCKSCREEN DISMISS OK]":
+        "R113.M5-024 (#2404): mid-session compositor lock dismiss "
+        "fingerprint; lockscreen_dismiss (src/kernel/core/graphics/"
+        "lockscreen.pdx) emits via klog_s1_x1 with sid=<session_id> "
+        "KV on every successful dismiss past the session_row_valid + "
+        "engaged gates.  Same real-HW / wire-deferred posture as the "
+        "`lockscreen engage ok` sibling above; additionally requires "
+        "the input-server MSI-X wire for the interactive auth-success "
+        "trigger (shared blocker with the focus / z_order siblings, "
+        "drivers/xhci/hid_kbd_attach.pdx §IRQ path).  Assertable when "
+        "the KIND_LOCK_AGENT cap dispatcher lands and a boot witness "
+        "drives engage -> dismiss end-to-end.",
 
     # ------------------------------------------------------------------
     # R113.M4-020 (paideia-os #2400): damage-driven redraw planner

@@ -1,0 +1,692 @@
+// src/kernel/core/graphics/session_revoke.pdx -- R113.M5-026 (paideia-os #2406)
+//
+// Session revocation: on cap drop (or admin-driven session close), tear
+// down every KIND_SURFACE row + every wrapping role authority (TOPLEVEL /
+// POPUP / LAYER_SHELL) owned by the session's owner_task, drop the
+// surface slots from the z-order stack, clear focus if it points at any
+// dying surface, then set the session's state to EXITED and destroy the
+// KIND_SESSION row itself.  Umbrella: R113 GPU-native compositor (#2380).
+//
+// -----------------------------------------------------------------------------
+// SCOPE (per issue #2406)
+// -----------------------------------------------------------------------------
+//
+// Two entry points:
+//
+//   * session_revoke(session_id) -> u64
+//     Cascade tear-down.  Gate order:
+//       (1) session_row_addr(session_id) != 0  -> else SESSION_REVOKE_BAD_SESSION
+//       (2) owner_task (row+16) != 0           -> else SESSION_REVOKE_BAD_OWNER
+//       (3) current state != EXITED            -> else SESSION_REVOKE_ALREADY_EXITED
+//       (4) walk every surface row [0, SURFACE_ROW_MAX):
+//             if surface_row_valid(s) && surface_owner(s) == owner_task:
+//               - destroy every toplevel/popup/layer_shell wrapping s
+//                 (LAM bump + in_use clear per role row, per the
+//                  substrate discipline established by surface_destroy)
+//               - z_order_remove(s)                     -- best-effort
+//               - if focus_get_keyboard()==s: focus_set_keyboard(FOCUS_NONE)
+//               - if focus_get_pointer()==s: focus_set_pointer(FOCUS_NONE)
+//               - surface_destroy(s)
+//       (5) session_set_state(session_id, EXITED)       -- best-effort
+//       (6) session_destroy(session_id)                 -- best-effort
+//       (7) emit SESSION REVOKE OK sid=<n> surfaces=<n> tops=<n>
+//                                  pops=<n> lyrs=<n>
+//       (8) return SESSION_REVOKE_OK
+//
+//   * session_owned_surfaces_count(session_id) -> u64
+//     Audit leaf.  Returns the number of live KIND_SURFACE rows whose
+//     owner_task matches session's owner_task; returns 0 on invalid
+//     session (no distinct sentinel -- 0 is a valid answer meaning
+//     "no surfaces owned").
+//
+// The session_id argument is the caller-visible slot index (kind_
+// session.pdx §"IDENTITY CHOICE": session_id == row_id).  No LAM
+// generation check on the caller side today -- the substrate's own
+// session_row_addr liveness gate suffices, and a follow-on cap-
+// dispatcher landing that carries a fingerprinted cap slot with a
+// generation stamp will layer that check on top.
+//
+// -----------------------------------------------------------------------------
+// WHY INLINE ROLE-ROW DESTROY (not a role-side destroy op)
+// -----------------------------------------------------------------------------
+//
+// surface_toplevel.pdx / surface_popup.pdx / surface_layer_shell.pdx do
+// NOT export a role_destroy() op today; their published lifetime toggles
+// are toplevel_request_close/ack_close, popup_dismiss, and layer_shell_
+// set_exclusive_zone -- none of which frees the row slot.  Revocation is
+// the first path that needs slot-level freeing on the role side, so this
+// file inlines the LAM bump + in_use clear directly (mirroring surface_
+// destroy in kind_surface.pdx L935-999 byte-for-byte on the header
+// discipline).  A future role-side destroy op is welcome to reach in
+// through the row_addr accessors and reuse the same shape; the substrate
+// authority for "clear in_use, bump gen, do not touch payload" is
+// unambiguous.
+//
+// Stats bumping: the role stats tables (TL_ST_*, PU_ST_*, LS_ST_*) do
+// NOT have a DESTROYS slot in this landing (a follow-on may add one
+// alongside a public role_destroy op).  Session revocation counts are
+// exposed through the fingerprint KVs instead, which is where a boot
+// witness or audit consumer would read them.
+//
+// -----------------------------------------------------------------------------
+// FOCUS + Z-ORDER SEMANTICS
+// -----------------------------------------------------------------------------
+//
+// Focus cells are single u64 slot values (see focus.pdx §"Global focus-
+// state cells").  If a dying surface holds keyboard or pointer focus,
+// we call focus_set_keyboard/focus_set_pointer(FOCUS_NONE) to clear the
+// cell -- this re-uses focus.pdx's own clear-focus arm (which skips the
+// surface_row_valid gate when the new slot == FOCUS_NONE).  The implicit
+// grab cell is NOT cleared: a grab only exists between button-down and
+// button-up, and revocation racing an active grab is a shell-layer bug
+// the substrate has no policy for; a follow-on may thread the grab
+// invariant into this path once the input dispatcher lands.
+//
+// z_order_remove refuses NOT_PRESENT when the slot is not in the stack;
+// we ignore that (best-effort), same as we ignore session_set_state's
+// STATE_TERMINAL and session_destroy's DESTROY_ALREADY.
+//
+// -----------------------------------------------------------------------------
+// FAILURE TAXONOMY -- 0xFFFFE2A0..0xFFFFE2AF (FRESH BAND)
+// -----------------------------------------------------------------------------
+//
+// Pre-landing grep-verified free at landing time against src/ and
+// design/ (2026-09-08):
+//
+//     $ grep -rn '0xFFFFE2[Aa][0-9A-Fa-f]' src/ design/  ->  empty
+//
+// Neighbouring bands on the 0xFFFFE2XX page:
+//
+//   0xFFFFE270..E27F   kind_session.pdx      (KIND_SESSION substrate)
+//   0xFFFFE280..E28F   free
+//   0xFFFFE290..E29F   free
+//   0xFFFFE2A0..E2AF   THIS FILE             (session-revocation cascade)
+//
+// Slot map:
+//
+//   0xFFFFE2AF  SESSION_REVOKE_BAD_SESSION      session_id invalid / not live
+//   0xFFFFE2AE  SESSION_REVOKE_BAD_OWNER        row's owner_task field == 0
+//                                               (defensive; session_mint
+//                                                gates on owner_task != 0
+//                                                so this is impossible today)
+//   0xFFFFE2AD  SESSION_REVOKE_ALREADY_EXITED   current state == EXITED
+//                                                (revocation is single-shot)
+//   0xFFFFE2A0..AC  RESERVED for M5 revocation follow-on (per-seat drop,
+//                   admin-forced revoke, cross-session tenant cleanup)
+//
+// -----------------------------------------------------------------------------
+// FINGERPRINT (per issue #2406)
+// -----------------------------------------------------------------------------
+//
+// SESSION REVOKE OK sid=<n> surfaces=<n> tops=<n> pops=<n> lyrs=<n>
+//
+// Emitted via klog_s1_d5 (this landing mints that wrapper alongside the
+// module -- src/kernel/core/klog/wrappers.pdx §klog_s1_d5) from session_
+// revoke's success tail.  All five KVs render as decimal (natural for a
+// slot index and four counts).  Tag byte count (46) verified by hand:
+// "session revoke ok " (18) + "[legacy: SESSION REVOKE OK]" (27) + "\0"
+// (1) = 46.  KV keys: "sid\0" (4) reused from kind_session.pdx (session_
+// k_sid); "surfaces\0" (9), "tops\0" (5), "pops\0" (5), "lyrs\0" (5)
+// declared in this file.
+//
+// A tools/verify-fingerprint-coverage.sh allowlist entry accompanies
+// this landing so the tag is not a coverage-gate silent hole -- same
+// wire-deferred posture as sibling `session mint ok` / `surface toplevel
+// create ok` / `surface popup create ok` entries.  Assertable end-to-end
+// when a boot witness or cap dispatcher path exercises session_revoke
+// against a populated session (mint session -> mint surfaces -> create
+// roles -> revoke session).
+//
+// -----------------------------------------------------------------------------
+// EXTERNAL SYMBOLS
+// -----------------------------------------------------------------------------
+//
+// This module references (bare symbols, kernel .pdx single global namespace):
+//
+//   * session_row_addr        (kind_session.pdx)         -- gate + owner read
+//   * session_set_state       (kind_session.pdx)         -- transition to EXITED
+//   * session_destroy         (kind_session.pdx)         -- row teardown
+//   * session_k_sid           (kind_session.pdx)         -- reused "sid\0" KV key
+//   * SESSION_STATE_EXITED    (kind_session.pdx)         -- state ordinal
+//   * SURFACE_ROW_MAX         (kind_surface.pdx)         -- iterator ceiling
+//   * _surface_table          (kind_surface.pdx)         -- pool base
+//   * surface_row_valid       (kind_surface.pdx)         -- liveness gate
+//   * surface_destroy         (kind_surface.pdx)         -- per-slot teardown
+//   * TOPLEVEL_ROW_MAX        (surface_toplevel.pdx)     -- iterator ceiling
+//   * _toplevels              (surface_toplevel.pdx)     -- role pool base
+//   * POPUP_ROW_MAX           (surface_popup.pdx)        -- iterator ceiling
+//   * _popups                 (surface_popup.pdx)        -- role pool base
+//   * LAYER_SHELL_ROW_MAX     (surface_layer_shell.pdx)  -- iterator ceiling
+//   * _layer_shells           (surface_layer_shell.pdx)  -- role pool base
+//   * focus_get_keyboard      (focus.pdx)                -- kbd cell read
+//   * focus_set_keyboard      (focus.pdx)                -- kbd cell write
+//   * focus_get_pointer       (focus.pdx)                -- ptr cell read
+//   * focus_set_pointer       (focus.pdx)                -- ptr cell write
+//   * z_order_remove          (z_order.pdx)              -- stack drop
+//   * SUBSYS_CAP_             (klog subsystem ordinal)
+//   * klog_s1_d5              (klog/wrappers.pdx)        -- 5-KV decimal emit
+//
+// No import declaration needed -- paideia-as's kernel .pdx link path is
+// one global namespace (same pattern the sibling surface_toplevel.pdx /
+// focus.pdx / z_order.pdx files use for cross-module symbol references).
+//
+// -----------------------------------------------------------------------------
+// ENCODER PITFALLS (per feedback_pdx_encoder_pitfalls v0.36+)
+// -----------------------------------------------------------------------------
+//
+//   * No `test rN, rN` -- every zero-check uses `cmp rN, 0` + `je/jne`.
+//   * No 2-op `imul r, imm` -- surface slot->offset uses `shl r, 6`;
+//     toplevel/layer_shell slot->offset uses `shl r, 8`; popup slot->
+//     offset uses `shl r, 6` (all row-size compile-time constants).
+//   * No `and reg, imm64` -- the 56-bit LAM mask (0x00FFFFFFFFFFFFFF)
+//     is staged into a scratch via `mov r64, imm64` first, then the
+//     and takes two registers.  The 32-bit mask 0xFFFFFFFF is safe as
+//     `and reg, 0xFFFFFFFF` per the kind_surface / surface_toplevel /
+//     kind_gpu_bo precedent (encodes as an unsigned imm32, no sign-
+//     extend for that value).  FOCUS_NONE (0xFFFFFFFFFFFFFFFF) is
+//     staged into rdi via `mov rdi, imm64` (movabs) before the focus_
+//     set_keyboard/focus_set_pointer arg-passing, never used as a
+//     `cmp reg, imm64` directly.
+//   * No `cmp reg, [mem]` -- every mem-compare loads to a scratch first.
+//   * No literal-scaled `[reg + N*8]` -- displacement form `[reg + N]`
+//     used for fixed offsets throughout.
+//   * No `mov qword [mem], imm64` -- all immediates staged in a register
+//     first (0 via `xor rax, rax`; 8-byte constants via movabs into r9
+//     for the LAM mask).
+//   * Multiline `pub let ="..."` refused by the encoder -- every string
+//     literal in this file lives on one source line.
+//   * Module name matches file basename: `SessionRevoke` for
+//     `session_revoke.pdx`.
+//   * Reserved-keyword labels avoided (loop/if/let/while/for/match/pub/
+//     mod/use/fn/struct/enum/impl/trait/type/where/move/mut/ref);
+//     labels prefixed sr_ (session_revoke) and sosc_ (session_owned_
+//     surfaces_count).
+//   * Fingerprint tag byte count computed by hand and asserted in the
+//     `[u8; N]` type ascription (46 for the revoke-ok tag; KV key bytes
+//     9/5/5/5 for surfaces/tops/pops/lyrs).
+//
+// -----------------------------------------------------------------------------
+// STACK DISCIPLINE
+// -----------------------------------------------------------------------------
+//
+// session_revoke:  6 callee-save pushes (rbx/r12/r13/r14/r15/rbp) +
+// sub rsp, 40 (4 u64 counter slots at [rsp+0..24] + 8-byte pad at
+// [rsp+32]).  Entry rsp%16==8 -> post-pushes 8+48=56, %16=8 ->
+// post-sub 56+40=96, %16=0 -- aligned for every nested call including
+// surface_destroy / focus_set_* / session_set_state / session_destroy /
+// klog_s1_d5.  klog_s1_d5 v2..v5 push idiom follows the klog_s1_x4
+// precedent extended by two more args: at rsp%16=0 emit-site,
+// sub rsp,8 (pre-align to %16=8) + push v5 + push k5 + push v4 +
+// push k4 + push v3 + push k3 + push v2 (7 pushes = 56 B, %16 back to 0
+// for call) + call + add rsp, 64 (pop 7 pushes + pre-align).
+//
+// session_owned_surfaces_count:  3 callee-save pushes (rbx/r12/r13) =
+// 24 B.  Entry rsp%16==8 -> post-pushes 8+24=32, %16=0 -- aligned for
+// the single nested call (session_row_addr) without further padding.
+
+module SessionRevoke = structure {
+
+  // ==========================================================================
+  // Failure taxonomy (0xFFFFE2A0..0xFFFFE2AF, fresh band).
+  // ==========================================================================
+
+  pub let SESSION_REVOKE_OK              : u64 = 0
+  pub let SESSION_REVOKE_BAD_SESSION     : u64 = 0xFFFFE2AF
+  pub let SESSION_REVOKE_BAD_OWNER       : u64 = 0xFFFFE2AE
+  pub let SESSION_REVOKE_ALREADY_EXITED  : u64 = 0xFFFFE2AD
+
+  // ==========================================================================
+  // Fingerprint tag (46 bytes) + KV keys.
+  //
+  // session_k_sid ("sid\0", 4 bytes) is already declared in kind_session.
+  // pdx L272 and reused here by bare-symbol lookup (single global
+  // namespace, same pattern surface_toplevel.pdx / focus.pdx / z_order.
+  // pdx use for surface_k_sid).  The four count-KV keys are unique to
+  // this file.
+  // ==========================================================================
+
+  pub let session_revoke_ok_msg    : [u8; 46] = "session revoke ok [legacy: SESSION REVOKE OK]\0"
+  pub let session_revoke_k_surfaces : [u8; 9] = "surfaces\0"
+  pub let session_revoke_k_tops     : [u8; 5] = "tops\0"
+  pub let session_revoke_k_pops     : [u8; 5] = "pops\0"
+  pub let session_revoke_k_lyrs     : [u8; 5] = "lyrs\0"
+
+  // ==========================================================================
+  // session_owned_surfaces_count(session_id) -> count
+  //
+  // Pure audit.  Returns the number of live KIND_SURFACE rows whose
+  // owner_task_id (surface row+16) equals the session's owner_task_id
+  // (session row+16).  Returns 0 on invalid session_id (out-of-range,
+  // in_use==0, or owner_task==0).
+  //
+  // Register plan: 3 callee-save pushes (rbx=iterator, r12=owner_task,
+  // r13=count) = 24 B; entry rsp%16==8 -> post-pushes 8+24=32, %16=0,
+  // aligned for the single nested call (session_row_addr).
+  // ==========================================================================
+
+  pub let session_owned_surfaces_count : (u64) -> u64 !{mem} @{} =
+    fn (session_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R113.M5-026 (#2406): count live KIND_SURFACE rows whose owner_task matches the session's owner_task_id (session row+16).  Returns 0 on invalid session (session_row_addr returns 0 for out-of-range slot or in_use==0) OR on defensive owner_task==0 sentinel (session_mint gates on owner!=0 so this is impossible today, but conflating the two cases into a zero-return keeps the audit-leaf contract compact).  Three callee-save pushes (rbx=iterator, r12=owner_task, r13=count) land rsp%16=0 (entry 8 + 24 = 32) for the single nested session_row_addr call.  Surface slot->offset via shl 6 (row * 64, per kind_surface.pdx SURFACE_ROW_BYTES; encoder pitfall v0.36+ no 2-op imul r,imm).  Labels prefixed sosc_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        xor r13, r13;                        // count = 0
+
+        // (1) Get session row via session_row_addr(session_id).
+        //     rdi already holds session_id.
+        call session_row_addr;
+        cmp rax, 0;
+        je  sosc_out;
+
+        // (2) Read owner_task (session row + SESSION_OFF_OWNER = 16).
+        mov r12, [rax + 16];
+        cmp r12, 0;
+        je  sosc_out;
+
+        // (3) Walk all surface rows [0, SURFACE_ROW_MAX).
+        xor rbx, rbx;                        // rbx = surface_slot iterator
+      sosc_scan:
+        mov r10, [rip + SURFACE_ROW_MAX];
+        cmp rbx, r10;
+        jae sosc_out;
+
+        // Compute surface row base = _surface_table + rbx*64.
+        lea r10, [rip + _surface_table];
+        mov r11, rbx;
+        shl r11, 6;
+        add r10, r11;
+
+        // Skip if in_use marker clear (top byte of hdr).
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  sosc_next;
+
+        // Compare surface owner_task (surface row + 16) against session's.
+        mov rax, [r10 + 16];
+        cmp rax, r12;
+        jne sosc_next;
+
+        // Match -- bump count.
+        add r13, 1;
+
+      sosc_next:
+        add rbx, 1;
+        jmp sosc_scan;
+
+      sosc_out:
+        mov rax, r13;                        // return count
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // session_revoke(session_id) -> SESSION_REVOKE_OK | error
+  //
+  // Cascade tear-down per file header.  Register plan:
+  //   Six callee-save pushes (rbx/r12/r13/r14/r15/rbp) + sub rsp, 40
+  //   land rsp%16=0 (entry 8 + 48 + 40 = 96) for every nested call.
+  //   Stack slots (4 counter u64s + 8-byte pad):
+  //     [rsp+0]  surfaces_count
+  //     [rsp+8]  tops_count
+  //     [rsp+16] pops_count
+  //     [rsp+24] lyrs_count
+  //     [rsp+32] pad (8 bytes to reach 40 total)
+  //   Live registers during the outer walk:
+  //     rbx   -- current surface_slot iterator
+  //     r12   -- session_id (survives whole body incl. klog emit)
+  //     r13   -- owner_task_id (matched against surface row+16)
+  //     r14/r15/rbp -- scratch (inner-loop indices reuse rcx)
+  //
+  // The klog_s1_d5 emit at the tail pushes 7 stack args (v2..v5 + k3..
+  // k5) after a `sub rsp, 8` pre-align (rsp%16=0 -> 8 -> 0 after seven
+  // 8-byte pushes = 56 B).  While those pushes are on the stack the
+  // counter-slot offsets shift by (8 + 8*N) each additional push, so
+  // every read reloads from the correct shifted offset.
+  // ==========================================================================
+
+  pub let session_revoke : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (session_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R113.M5-026 (paideia-os #2406): cascade session tear-down.  Gate order per file header §SCOPE: (1) session_row_addr(session_id) != 0 else BAD_SESSION; (2) owner_task (session row+16) != 0 else BAD_OWNER; (3) current state != EXITED else ALREADY_EXITED; (4) walk every KIND_SURFACE row [0, SURFACE_ROW_MAX) and for each row whose owner matches session's owner: destroy every wrapping toplevel/popup/layer_shell (inline LAM bump + in_use clear per role row -- no role-side destroy op exists today, this file is the first path that needs slot-level freeing on the role side), z_order_remove the surface slot (best-effort; NOT_PRESENT ignored), clear kbd/ptr focus if pointing at this slot (via focus.pdx's clear-focus arm at FOCUS_NONE), surface_destroy the row; (5) session_set_state(session_id, EXITED) best-effort; (6) session_destroy(session_id) best-effort; (7) klog SESSION REVOKE OK sid + surfaces + tops + pops + lyrs KVs via klog_s1_d5 (this landing's new wrapper).  Six callee-save pushes + sub rsp,40 land rsp%16=0 (entry 8 + 48 + 40 = 96) for every nested call.  Counter slots at [rsp+0..24] shift by (8 + 8*N) during the klog emit's push cascade; every read reloads from the shifted offset.  Role-row destroy inlined via LAM bump (56-bit mask via movabs, matches kind_surface.pdx L965-972 byte-for-byte on the header discipline).  Surface owner is at surface row+16 (SRF_OFF_OWNER per kind_surface.pdx L124); role rows all pack their surface_slot ref at role row+16 low-32 (surface_toplevel §TL_OFF_REFS, surface_popup §PU_OFF_REFS, surface_layer_shell §LS_OFF_REFS -- all agree by convention).  klog_s1_d5 push idiom (sub 8; push v5..v2 + k5..k3; call; add 64) mirrors klog_s1_x4's precedent extended by two more args.  Labels prefixed sr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 40;
+
+        // Zero-init the four counter slots.
+        xor rax, rax;
+        mov [rsp + 0], rax;                  // surfaces_count = 0
+        mov [rsp + 8], rax;                  // tops_count = 0
+        mov [rsp + 16], rax;                 // pops_count = 0
+        mov [rsp + 24], rax;                 // lyrs_count = 0
+
+        mov r12, rdi;                        // r12 = session_id
+
+        // (1) session_row_addr(session_id) — 0 means invalid slot.
+        //     rdi already holds session_id.
+        call session_row_addr;
+        cmp rax, 0;
+        je  sr_bad_session;
+
+        // (2) owner_task (session row + SESSION_OFF_OWNER = 16) != 0
+        mov r13, [rax + 16];
+        cmp r13, 0;
+        je  sr_bad_owner;
+
+        // (3) current state (session row + SESSION_OFF_STATE = 24) != EXITED
+        mov r10, [rax + 24];
+        mov r11, [rip + SESSION_STATE_EXITED];
+        cmp r10, r11;
+        je  sr_already_exited;
+
+        // (4) Walk every KIND_SURFACE row [0, SURFACE_ROW_MAX).
+        xor rbx, rbx;                        // rbx = surface_slot iterator
+      sr_surf_scan:
+        mov r10, [rip + SURFACE_ROW_MAX];
+        cmp rbx, r10;
+        jae sr_surf_done;
+
+        // Compute surface row base = _surface_table + rbx*64.
+        lea r10, [rip + _surface_table];
+        mov r11, rbx;
+        shl r11, 6;
+        add r10, r11;
+
+        // Skip if in_use clear.
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  sr_surf_next;
+
+        // Compare surface owner_task against session's owner.
+        mov rax, [r10 + 16];
+        cmp rax, r13;
+        jne sr_surf_next;
+
+        // ---- Match: surface `rbx` belongs to session's owner_task ----
+
+        // (4a) Destroy every wrapping TOPLEVEL role row.
+        xor rcx, rcx;                        // rcx = toplevel iterator
+      sr_tl_scan:
+        mov r11, [rip + TOPLEVEL_ROW_MAX];
+        cmp rcx, r11;
+        jae sr_tl_done;
+
+        // Compute toplevel row base = _toplevels + rcx*256.
+        lea r10, [rip + _toplevels];
+        mov r9, rcx;
+        shl r9, 8;
+        add r10, r9;
+
+        // Skip if in_use clear.
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  sr_tl_next;
+
+        // Check refs low-32 (surface_slot) == rbx.
+        mov rax, [r10 + 16];
+        and rax, 0xFFFFFFFF;
+        cmp rax, rbx;
+        jne sr_tl_next;
+
+        // Inline destroy: LAM bump gen + clear in_use marker.
+        mov rax, [r10 + 0];
+        mov r9, 0x00FFFFFFFFFFFFFF;
+        and rax, r9;
+        add rax, 1;
+        and rax, r9;
+        mov [r10 + 0], rax;                  // in_use=0, gen bumped
+
+        // tops_count++
+        mov rax, [rsp + 8];
+        add rax, 1;
+        mov [rsp + 8], rax;
+
+      sr_tl_next:
+        add rcx, 1;
+        jmp sr_tl_scan;
+      sr_tl_done:
+
+        // (4b) Destroy every wrapping POPUP role row.
+        xor rcx, rcx;                        // rcx = popup iterator
+      sr_pu_scan:
+        mov r11, [rip + POPUP_ROW_MAX];
+        cmp rcx, r11;
+        jae sr_pu_done;
+
+        // Compute popup row base = _popups + rcx*64.
+        lea r10, [rip + _popups];
+        mov r9, rcx;
+        shl r9, 6;
+        add r10, r9;
+
+        // Skip if in_use clear.
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  sr_pu_next;
+
+        // Check refs low-32 (surface_slot) == rbx.
+        mov rax, [r10 + 16];
+        and rax, 0xFFFFFFFF;
+        cmp rax, rbx;
+        jne sr_pu_next;
+
+        // Inline destroy.
+        mov rax, [r10 + 0];
+        mov r9, 0x00FFFFFFFFFFFFFF;
+        and rax, r9;
+        add rax, 1;
+        and rax, r9;
+        mov [r10 + 0], rax;
+
+        // pops_count++
+        mov rax, [rsp + 16];
+        add rax, 1;
+        mov [rsp + 16], rax;
+
+      sr_pu_next:
+        add rcx, 1;
+        jmp sr_pu_scan;
+      sr_pu_done:
+
+        // (4c) Destroy every wrapping LAYER_SHELL role row.
+        xor rcx, rcx;                        // rcx = layer_shell iterator
+      sr_ls_scan:
+        mov r11, [rip + LAYER_SHELL_ROW_MAX];
+        cmp rcx, r11;
+        jae sr_ls_done;
+
+        // Compute layer_shell row base = _layer_shells + rcx*256.
+        lea r10, [rip + _layer_shells];
+        mov r9, rcx;
+        shl r9, 8;
+        add r10, r9;
+
+        // Skip if in_use clear.
+        mov rax, [r10 + 0];
+        shr rax, 56;
+        cmp rax, 0;
+        je  sr_ls_next;
+
+        // Check refs low-32 (surface_slot) == rbx.
+        mov rax, [r10 + 16];
+        and rax, 0xFFFFFFFF;
+        cmp rax, rbx;
+        jne sr_ls_next;
+
+        // Inline destroy.
+        mov rax, [r10 + 0];
+        mov r9, 0x00FFFFFFFFFFFFFF;
+        and rax, r9;
+        add rax, 1;
+        and rax, r9;
+        mov [r10 + 0], rax;
+
+        // lyrs_count++
+        mov rax, [rsp + 24];
+        add rax, 1;
+        mov [rsp + 24], rax;
+
+      sr_ls_next:
+        add rcx, 1;
+        jmp sr_ls_scan;
+      sr_ls_done:
+
+        // (4d) z_order_remove(rbx) — best-effort (NOT_PRESENT ignored).
+        mov rdi, rbx;
+        call z_order_remove;
+
+        // (4e) Clear keyboard focus if it points at this surface.
+        call focus_get_keyboard;
+        cmp rax, rbx;
+        jne sr_kbd_ok;
+        mov rdi, 0xFFFFFFFFFFFFFFFF;         // FOCUS_NONE
+        call focus_set_keyboard;
+      sr_kbd_ok:
+
+        // (4f) Clear pointer focus if it points at this surface.
+        call focus_get_pointer;
+        cmp rax, rbx;
+        jne sr_ptr_ok;
+        mov rdi, 0xFFFFFFFFFFFFFFFF;         // FOCUS_NONE
+        call focus_set_pointer;
+      sr_ptr_ok:
+
+        // (4g) surface_destroy(rbx) — best-effort (emits SURFACE DESTROY
+        //      OK per surface; return value ignored -- gate 4 already
+        //      proved in_use so DESTROY_ALREADY cannot fire).
+        mov rdi, rbx;
+        call surface_destroy;
+
+        // surfaces_count++
+        mov rax, [rsp + 0];
+        add rax, 1;
+        mov [rsp + 0], rax;
+
+      sr_surf_next:
+        add rbx, 1;
+        jmp sr_surf_scan;
+      sr_surf_done:
+
+        // (5) session_set_state(session_id, EXITED=4) — best-effort;
+        //     STATE_TERMINAL would fire only if state was already EXITED
+        //     which gate (3) rejected, so it succeeds here.
+        mov rdi, r12;
+        mov r10, [rip + SESSION_STATE_EXITED];
+        mov rsi, r10;
+        call session_set_state;
+
+        // (6) session_destroy(session_id) — best-effort; DESTROY_ALREADY
+        //     cannot fire on a row we just proved live.
+        mov rdi, r12;
+        call session_destroy;
+
+        // (7) Emit SESSION REVOKE OK via klog_s1_d5.
+        //     KV[0] = ("sid",      session_id = r12)
+        //     KV[1] = ("surfaces", stack slot for surfaces_count)
+        //     KV[2] = ("tops",     stack slot for tops_count)
+        //     KV[3] = ("pops",     stack slot for pops_count)
+        //     KV[4] = ("lyrs",     stack slot for lyrs_count)
+        //
+        //     Counter slots pre-emit at [rsp+0..24].  After sub rsp,8
+        //     pre-align they sit at [rsp+8..32], and each subsequent
+        //     push shifts them by another 8.  Read the current slot
+        //     offset just before each push (see running annotation).
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + session_revoke_ok_msg];
+        lea rcx, [rip + session_k_sid];
+        mov r8, r12;                         // v1 = sid (session_id)
+        lea r9, [rip + session_revoke_k_surfaces];
+
+        // Pre-align: rsp%16 was 0 -> 8; counter slots shift by +8:
+        //   surfaces at [rsp+8], tops at [rsp+16], pops at [rsp+24],
+        //   lyrs at [rsp+32].
+        sub rsp, 8;
+
+        // Push v5 = lyrs.  Load from current offset [rsp+32] first.
+        //   Post-push shifts: surfaces [rsp+16], tops [rsp+24],
+        //                     pops [rsp+32], lyrs [rsp+40].
+        mov rax, [rsp + 32];
+        push rax;
+
+        // Push k5 = &session_revoke_k_lyrs.
+        //   Post-push shifts: surfaces [rsp+24], tops [rsp+32],
+        //                     pops [rsp+40], lyrs [rsp+48].
+        lea rax, [rip + session_revoke_k_lyrs];
+        push rax;
+
+        // Push v4 = pops.  Load from current offset [rsp+40].
+        //   Post-push shifts: surfaces [rsp+32], tops [rsp+40],
+        //                     pops [rsp+48], lyrs [rsp+56].
+        mov rax, [rsp + 40];
+        push rax;
+
+        // Push k4 = &session_revoke_k_pops.
+        //   Post-push shifts: surfaces [rsp+40], tops [rsp+48],
+        //                     pops [rsp+56], lyrs [rsp+64].
+        lea rax, [rip + session_revoke_k_pops];
+        push rax;
+
+        // Push v3 = tops.  Load from current offset [rsp+48].
+        //   Post-push shifts: surfaces [rsp+48], tops [rsp+56],
+        //                     pops [rsp+64], lyrs [rsp+72].
+        mov rax, [rsp + 48];
+        push rax;
+
+        // Push k3 = &session_revoke_k_tops.
+        //   Post-push shifts: surfaces [rsp+56], tops [rsp+64],
+        //                     pops [rsp+72], lyrs [rsp+80].
+        lea rax, [rip + session_revoke_k_tops];
+        push rax;
+
+        // Push v2 = surfaces.  Load from current offset [rsp+56].
+        //   After this push rsp%16 = 0 (7 pushes = 56 B, from pre-align
+        //   %16=8).  CALL then brings %16 to 8 for klog_s1_d5 entry;
+        //   its own `push rbp` restores %16 to 0 for klog_emit_core.
+        mov rax, [rsp + 56];
+        push rax;
+
+        call klog_s1_d5;
+
+        // Undo 7 pushes (56 B) + pre-align (8 B) = 64 B.
+        add rsp, 64;
+
+        // (8) return SESSION_REVOKE_OK
+        xor rax, rax;
+        jmp sr_out;
+
+      sr_bad_session:
+        mov rax, 0xFFFFE2AF;                 // SESSION_REVOKE_BAD_SESSION
+        jmp sr_out;
+      sr_bad_owner:
+        mov rax, 0xFFFFE2AE;                 // SESSION_REVOKE_BAD_OWNER
+        jmp sr_out;
+      sr_already_exited:
+        mov rax, 0xFFFFE2AD;                 // SESSION_REVOKE_ALREADY_EXITED
+
+      sr_out:
+        add rsp, 40;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
