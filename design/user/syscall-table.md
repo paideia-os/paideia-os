@@ -55,6 +55,7 @@ preserved by the kernel.
 | 59 | `execve` | `path`, `argv`, `envp` | does not return on success; `-errno` on failure |
 | 60 | `exit` | `status` | never returns |
 | 61 | `wait4` | `pid`, `wstatus`, `options`, `rusage` | reaped pid or `-errno` |
+| 66 | `clock_read_ns` | — | u64 nanoseconds since boot (monotonic-non-decreasing); nullary — no arguments, no user pointer, no errno path. Body tail-calls `hpet_now_ns` (MAIN_COUNTER read at `_hpet_mmio_va+0xF0` multiplied by precomputed `period_ns`), falling back to 0 if the HPET MMIO map is absent (defence-in-depth for early-witness paths; every ring-3 boot path has HPET mapped before `boot_continue_after_ring3`). Callers today: the AML executor wall-clock probe (#1087 performance budget) and the R30 monotonicity witness. #1582 part A. |
 | 70 | `pdxfs_txn_open` | `vol_slot`, `flags` | txn slot or `-errno` |
 | 71 | `pdxfs_open` | `vol_slot`, `path_ptr`, `flags` | pdxfs handle or `-errno` |
 | 72 | `pdxfs_dir_readnext` | `dir_handle`, `entry_out_ptr` | 1 = entry filled, 0 = EOD, `-errno` on failure |
@@ -67,7 +68,7 @@ preserved by the kernel.
 | 80 | `rmdir` | `path_ptr`, `path_len_hint` | 0 or `-errno` |
 | 81 | `unlink` | `path_ptr`, `path_len_hint` | 0 or `-errno` |
 | 82 | `rename` | `old_ptr`, `old_len`, `new_ptr`, `new_len` | 0 or `-errno` |
-| 83 | `taskinfo` | `buf`, `cap` | bytes filled or `-errno`; fixed 40-byte-per-task records for /bin/ps |
+| 83 | `taskinfo` | `idx`, `user_buf_va` | 0 or `-ENOENT` / `-ESRCH` / `-EFAULT`; fills a fixed **64-byte** record at `user_buf_va` for task-pool slot `idx` (record layout in `src/kernel/core/sched/task_info.pdx` §Record layout — pid/ppid/state/reserved u32s + `comm[16]` + three u64 fields appended by R60.M7-002). Record widened from 32→64 bytes by R60.M7-002 (paideia-os #1817); original landing was R57.M4-003 (#1799). Dispatch bounces via a kernel scratch (`_dispatch_taskinfo_scratch`) then `user_write_bytes_via_walk` on rc==0 only — an errno passthrough writes nothing to the user buffer. |
 | 84 | `mountinfo` | `buf`, `cap` | bytes filled or `-errno`; mount-table snapshot for /bin/mount no-args |
 | 85 | `chdir` | `path_ptr`, `path_len_hint` | 0 or `-errno`; hint is a walker CAP (255 typical), not exact strlen |
 | 86 | `getcwd` | `buf`, `cap` | strlen (excl. NUL) or `-errno`; NUL-terminated on success |
@@ -199,8 +200,10 @@ Any syscall number not listed in the table above returns `-ENOSYS`
 ## References
 
 - #536 — R15.M4 kernel dispatch table (original freeze).
+- #1582 — R30 sys_clock_read_ns (66) + sched_setaffinity/getaffinity/reserve_lpe_class (67/68/69) dispatch block.
 - #1790 — R56.M3-001 VFS metadata block (77–82).
-- #1799 — R57.M4-003 sys_taskinfo (83).
+- #1799 — R57.M4-003 sys_taskinfo (83) initial 32-byte record.
+- #1817 — R60.M7-002 sys_taskinfo record widened 32→64 bytes (three u64 fields appended).
 - #1800 — R57.M4-004 sys_mountinfo (84).
 - #1955/#1956 — R86.M1 sys_chdir (85) / sys_getcwd (86).
 - #1927 — R72.M1-005 TCP socket API block (87–94).
