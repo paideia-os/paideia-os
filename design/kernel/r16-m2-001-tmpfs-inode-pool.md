@@ -5,12 +5,15 @@ subsystem: 12 — tmpfs
 topic: tmpfs inode pool declaration (R16-M2-001)
 freeze-discipline: strict (inode offsets frozen for the entire R16.M2 series;
   #580–#584 dentry / lookup / create / write / read modules encode these
-  offsets as immediates in SIB+disp addressing)
+  offsets as immediates in SIB+disp addressing). Widened once at paideia-os
+  #2234 (name[32]->name[96]) and once at paideia-os #2436 (page_ptrs[16]->
+  page_ptrs[128], TMPFS_INODE_SIZE 256->2048); every consumer's offset
+  immediates shifted with each widen.
 blocks:
   - "#580 (tmpfs_root_init — writes VNODE_TYPE_DIR into slot 1's `type` at +0)"
-  - "#581 (tmpfs_lookup — walks dentry list, reads name at +144, parent at +176)"
+  - "#581 (tmpfs_lookup — walks dentry list, reads name at +1040, parent at +1136)"
   - "#582 (tmpfs_create — bitmap alloc, insert into parent dentry list)"
-  - "#583 (tmpfs_write — indexes page_ptrs at +16 + 8*i)"
+  - "#583 (tmpfs_write — indexes page_ptrs at +16 + 8*i, 128 slots)"
   - "#584 (tmpfs_read — same indexing, plus `size` bound at +8)"
 touching:
   - src/kernel/core/fs/tmpfs/inode.pdx           (new module — pool + bitmap + slot helper)
@@ -66,30 +69,52 @@ Out of scope (deferred by design):
   (create). This issue guarantees the storage exists; it does not
   wire it into the VFS lattice.
 
-## 2. Inode layout — frozen (256 B per slot, 15 fields, 4 cache lines)
+## 2. Inode layout — frozen (2048 B per slot, current-wave)
 
-The layout parallels vfs-layout.md §2 (vnode 64 B freeze) with the same
-discipline: hot fields in low half, cold/reserved in high half,
-single-shift indexing.
+The R16-M2-001 (#579) original was 256 B per slot with `name[32]` and
+`page_ptrs[16]`. Two widens have landed since:
 
-| Offset | Size | Field           | Type   | Notes                                                                                                            |
-|--------|------|-----------------|--------|------------------------------------------------------------------------------------------------------------------|
-| +0     | 1    | `type`          | u8     | Shares constants with vnode (`VNODE_TYPE_{FREE=0, REG=1, DIR=2, ...}`) — an inode's `type` is what the vnode's `type` copies at bind time. FREE=0 matches zero-init. |
-| +1     | 1    | `flags`         | u8     | Bit 0 = `TMPFS_INODE_FLAG_VALID`. Bits 1..7 reserved (R16.M3 grows `DIRTY`, `LOCKED`).                            |
-| +2     | 2    | `refcount`      | u16    | In-memory hold counter (dentry references + vnode references). Frees the inode when it reaches 0 AND `link_count` == 0. |
-| +4     | 2    | `link_count`    | u16    | Directory-entry references (hard links). tmpfs has no `link(2)` at R16.M2, so this is always 1 for live inodes; the field is reserved so R17 can grow `link` support without a re-freeze. |
-| +6     | 2    | `_reserved_hot` | u16    | Reserved. R16.M3 candidate: `mode` (POSIX permission bits — currently derived from `type` at open time). |
-| +8     | 8    | `size`          | u64    | File size in bytes. u64 covers R16.M2 cap (64 KiB) and any R18 grow-out. Read/write bounds check reads this field. |
-| +16    | 128  | `page_ptrs[16]` | u64×16 | Each slot is a physical-page frame address returned by `phys_alloc(0)`. Slot `i` is unallocated iff `page_ptrs[i] == 0`. Covers 16 × 4 KiB = 64 KiB — the R16.M2 file cap. |
-| +144   | 32   | `name[32]`      | u8×32  | NUL-padded name. 32 bytes = 31 chars + NUL — comfortably above the POSIX minimum NAME_MAX = 14 and matches the tactical plan's "dir max entries 64" / "file max 64 KiB" sizing. |
-| +176   | 2    | `parent_idx`    | u16    | Index into `_tmpfs_inode_pool[64]`. Sentinel `0xFFFF` = root or detached (mirrors `VNODE_IDX_NONE`). u16 has 1024× headroom over TMPFS_MAX = 64. |
-| +178   | 2    | `next_sibling`  | u16    | Intrusive singly-linked dentry list — `parent`'s children form a chain by walking `_tmpfs_inode_pool[cur].next_sibling` until `0xFFFF`. Directory operations touch this field; regular files leave it at `0xFFFF`. |
-| +180   | 2    | `first_child`   | u16    | Head of the child-inode chain (directories only). `0xFFFF` = empty directory. Regular-file inodes leave this at `0xFFFF`. |
-| +182   | 2    | `_pad_hot_tail` | u16    | Explicit tail pad closing the third cache line at +184. Reserved.                                                |
-| +184   | 8    | `_reserved_a`   | u64    | R16.M3 candidate: `mtime` (ns since boot).                                                                       |
-| +192   | 64   | `_reserved_b[8]`| u64×8  | 64 B fourth cache line, wholly reserved. R16.M3 / R17 growth: `atime`, `ctime`, `uid`, `gid`, `mode`, `xattr_ptr`, `block_count`, `generation`. Growth into this line is a **new-field freeze issue**, not a re-freeze of §2. |
+- **paideia-os #2234 (R106)** — `name[32] -> name[96]` for 64-hex fingerprint
+  home-dir names. Tree fields (`parent_idx`, `next_sibling`, `first_child`)
+  shifted `+176/+178/+180 -> +240/+242/+244` (+64) to sit past the wider
+  name field. `TMPFS_INODE_SIZE` stayed at 256 (the growth landed in the
+  previously-reserved padding).
+- **paideia-os #2436 (R113)** — `page_ptrs[16] -> page_ptrs[128]` so that
+  `/bin/mkfs.pdxfs` (116 872 bytes today) fits in a tmpfs file (the
+  16-slot direct-page array capped every file at 16 * 4 KiB = 64 KiB, and
+  `bin_seeds.pdx`'s seed loop failed at that ceiling). The name field
+  shifted `+144 -> +1040` and the tree fields shifted `+240/+242/+244 ->
+  +1136/+1138/+1140` (both +896). `TMPFS_INODE_SIZE` grew `256 -> 2048`
+  (next power of two above the 1142 semantic-byte extent, so the pool
+  indexing stays a single `shl imm8 + add` — `shl 11` in place of the
+  original `shl 8`).
 
-**Total struct extent: [+0, +256) — 15 semantic + reserved slots, exactly 256 bytes, 4 L1 cache lines.**
+Layout parallels vfs-layout.md §2 (vnode 64 B freeze) with the same
+discipline: hot fields low, cold/reserved high, single-shift indexing.
+
+| Offset | Size | Field           | Type    | Notes                                                                                                            |
+|--------|------|-----------------|---------|------------------------------------------------------------------------------------------------------------------|
+| +0     | 1    | `type`          | u8      | Shares constants with vnode (`VNODE_TYPE_{FREE=0, REG=1, DIR=2, ...}`) — an inode's `type` is what the vnode's `type` copies at bind time. FREE=0 matches zero-init. |
+| +1     | 1    | `flags`         | u8      | Bit 0 = `TMPFS_INODE_FLAG_VALID`. Bits 1..7 reserved.                                                              |
+| +2     | 2    | `refcount`      | u16     | In-memory hold counter (dentry references + vnode references). Frees the inode when it reaches 0 AND `link_count` == 0. |
+| +4     | 2    | `link_count`    | u16     | Directory-entry references (hard links). Always 1 for live inodes at R16.M2; reserved for future hard-link support. |
+| +6     | 2    | `_reserved_hot` | u16     | Reserved.                                                                                                          |
+| +8     | 8    | `size`          | u64     | File size in bytes. `tmpfs_write` / `tmpfs_read` bounds-check against this and against `TMPFS_INODE_MAX_FILE_BYTES=524288` (#2436: was 65536). |
+| +16    | 1024 | `page_ptrs[128]`| u64×128 | Each slot is a physical-page frame address returned by `phys_alloc(0)`. Slot `i` is unallocated iff `page_ptrs[i] == 0`. Covers 128 × 4 KiB = 512 KiB — the current per-file cap (#2436: was 16 × 4 KiB = 64 KiB). |
+| +1040  | 96   | `name[96]`      | u8×96   | NUL-padded name. 96 bytes = 95 chars + NUL (#2234: was 32; widened for 64-hex fingerprint home-dir names). Copy loop caps at 95, stamps NUL at cursor. |
+| +1136  | 2    | `parent_idx`    | u16     | Index into `_tmpfs_inode_pool[256]`. Sentinel `0xFFFF` = root or detached (mirrors `VNODE_IDX_NONE`). |
+| +1138  | 2    | `next_sibling`  | u16     | Intrusive singly-linked dentry list — `parent`'s children form a chain by walking `_tmpfs_inode_pool[cur].next_sibling` until `0xFFFF`. Directory operations touch this field; regular files leave it at `0xFFFF`. |
+| +1140  | 2    | `first_child`   | u16     | Head of the child-inode chain (directories only). `0xFFFF` = empty directory. Regular-file inodes leave this at `0xFFFF`. |
+| +1142  | 906  | `_reserved_tail`| —       | Padding to the next power-of-two so `[base + idx*2048]` stays a `shl imm8`. Absorbs R16.M3 timestamps / R17 uid/gid/mode / R18 indirect-block pointer without re-freeze. |
+
+**Total struct extent: [+0, +2048) — 2048 bytes, 32 L1 cache lines per slot
+(#2436: was 4 lines / 256 bytes). Semantic content stops at +1142; the
+906-byte tail is reserved growth headroom.**
+
+**Pool footprint: 256 slots × 2048 bytes = 524 288 bytes (512 KiB) in .bss
+(#2436: was 65 536 bytes / 64 KiB). One-shot growth of +458 752 bytes
+(~448 KiB) is the price of unblocking every satellite user tool that
+exceeds 64 KiB — starting with `/bin/mkfs.pdxfs` at 116 872 bytes today.**
 
 Slot #0 in `_tmpfs_inode_pool` is reserved (its `type == 0 == FREE`
 matches zero-init and doubles as the "invalid inode" sentinel that
@@ -99,9 +124,11 @@ in place of a NULL check). Root inode lives at index 1 (mirrors
 
 ### 2.1 Alignment
 
-Pool declared `@align(64)` so every 256-byte slot lands on a
-cache-line boundary AND every slot is 4-line-aligned. Indexing is
-`[base + idx*256]` — see §3.2.
+Pool declared `@align(64)` so every 2048-byte slot lands on a
+cache-line boundary AND every slot is 32-line-aligned (#2436: was
+4-line-aligned when slots were 256 B). Indexing is `[base + idx*2048]`,
+lowered to `shl 11 + add` — see §3.2 (originally `shl 8` for the
+256-byte stride).
 
 ## 3. Sizing decision — 256 vs 192
 
@@ -182,29 +209,37 @@ Single source of truth for offset arithmetic. No `.pdx` file outside
 this module may embed a numeric offset for a tmpfs inode field.
 
 ```
-// Size + pool
-TMPFS_INODE_SIZE          : u64 = 256
+// Size + pool  (#2436: TMPFS_INODE_SIZE 256 -> 2048, POOL_BYTES 65536 -> 524288)
+TMPFS_INODE_SIZE          : u64 = 2048
+TMPFS_INODE_SHIFT         : u64 = 11           // log2(TMPFS_INODE_SIZE) — pool indexing exponent
 TMPFS_INODE_ALIGN         : u64 = 64
-TMPFS_MAX                 : u64 = 64
-TMPFS_INODE_POOL_BYTES    : u64 = 16384        // TMPFS_MAX * TMPFS_INODE_SIZE
-TMPFS_INODE_BITMAP_WORDS  : u64 = 1            // TMPFS_MAX / 64
+TMPFS_MAX                 : u64 = 256          // (#2004: widened 64 -> 256)
+TMPFS_INODE_POOL_BYTES    : u64 = 524288       // TMPFS_MAX * TMPFS_INODE_SIZE
+TMPFS_INODE_BITMAP_WORDS  : u64 = 4            // TMPFS_MAX / 64
 TMPFS_INODE_IDX_ROOT      : u64 = 1
 TMPFS_INODE_IDX_NONE      : u64 = 0xFFFF
 TMPFS_INODE_ALLOC_OOM     : u64 = 0xFFFF
+TMPFS_INODE_NAME_MAX      : u64 = 96           // (#2234: widened 32 -> 96)
+TMPFS_INODE_PAGES_COUNT   : u64 = 128          // (#2436: widened 16 -> 128)
+TMPFS_INODE_MAX_FILE_BYTES: u64 = 524288       // PAGES_COUNT * 4096 (#2436: was 65536)
 
-// Field offsets — hot half (first 3 lines: [0, 192))
+// Field offsets — hot half (first two lines: [0, 128))
 TMPFS_INODE_TYPE_OFFSET       : u64 = 0
 TMPFS_INODE_FLAGS_OFFSET      : u64 = 1
 TMPFS_INODE_REFCOUNT_OFFSET   : u64 = 2
 TMPFS_INODE_LINK_COUNT_OFFSET : u64 = 4
 TMPFS_INODE_SIZE_OFFSET       : u64 = 8
-TMPFS_INODE_PAGES_OFFSET      : u64 = 16       // page_ptrs[16] base
-TMPFS_INODE_NAME_OFFSET       : u64 = 144      // name[32] base
-TMPFS_INODE_PARENT_OFFSET     : u64 = 176
-TMPFS_INODE_NEXT_SIB_OFFSET   : u64 = 178
-TMPFS_INODE_FIRST_CHILD_OFFSET: u64 = 180
+TMPFS_INODE_PAGES_OFFSET      : u64 = 16       // page_ptrs[128] base (#2436: was page_ptrs[16])
 
-// Cold half ([192, 256)) — reserved; no exported names yet.
+// Post-page-array fields (#2436: name shifted +144 -> +1040, tree +240 -> +1136)
+TMPFS_INODE_NAME_OFFSET       : u64 = 1040     // name[96] base
+TMPFS_INODE_PARENT_OFFSET     : u64 = 1136
+TMPFS_INODE_NEXT_SIB_OFFSET   : u64 = 1138
+TMPFS_INODE_FIRST_CHILD_OFFSET: u64 = 1140
+
+// Cold half ([1142, 2048)) — reserved growth headroom (906 B) —
+// absorbs R16.M3 timestamps / R17 uid/gid/mode / R18 indirect-block
+// without a re-freeze.
 
 // Constants shared with vnode (§2 imports these — do not redefine locally):
 //   VNODE_TYPE_FREE = 0

@@ -427,11 +427,11 @@ fi
 
 echo "[boot-stub] tools/boot_stub.S -> boot_stub.o (32+64-bit, as --64)"
 BOOT_STUB_OBJ="${BUILD_DIR}/boot_stub.o"
-as --64 -o "${BOOT_STUB_OBJ}" "${REPO_ROOT}/tools/boot_stub.S"
+as --64 --noexecstack -o "${BOOT_STUB_OBJ}" "${REPO_ROOT}/tools/boot_stub.S"
 
 echo "[userbin] tools/userbin_embed.S -> userbin_embed.o"
 USERBIN_OBJ="${BUILD_DIR}/userbin_embed.o"
-( cd "${REPO_ROOT}" && as --64 -o "${USERBIN_OBJ}" tools/userbin_embed.S )
+( cd "${REPO_ROOT}" && as --64 --noexecstack -o "${USERBIN_OBJ}" tools/userbin_embed.S )
 
 # R18-M1-002 (#761): AP boot trampoline. Standalone-link the trampoline
 # blob to VMA=0x8000, extract flat bytes via objcopy, then .incbin the
@@ -442,13 +442,13 @@ echo "[ap-tramp] tools/ap_trampoline.S -> ap_trampoline.bin (real->prot->long)"
 AP_TRAMP_OBJ="${BUILD_DIR}/ap_trampoline.o"
 AP_TRAMP_ELF="${BUILD_DIR}/ap_trampoline.elf"
 AP_TRAMP_BIN="${BUILD_DIR}/ap_trampoline.bin"
-as --64 -o "${AP_TRAMP_OBJ}" "${REPO_ROOT}/tools/ap_trampoline.S"
+as --64 --noexecstack -o "${AP_TRAMP_OBJ}" "${REPO_ROOT}/tools/ap_trampoline.S"
 ld -T "${REPO_ROOT}/tools/ap_trampoline.ld" -o "${AP_TRAMP_ELF}" "${AP_TRAMP_OBJ}"
 objcopy -O binary "${AP_TRAMP_ELF}" "${AP_TRAMP_BIN}"
 
 echo "[ap-tramp-embed] tools/ap_trampoline_embed.S -> ap_trampoline_embed.o"
 AP_TRAMP_EMBED_OBJ="${BUILD_DIR}/ap_trampoline_embed.o"
-( cd "${REPO_ROOT}" && as --64 -o "${AP_TRAMP_EMBED_OBJ}" tools/ap_trampoline_embed.S )
+( cd "${REPO_ROOT}" && as --64 --noexecstack -o "${AP_TRAMP_EMBED_OBJ}" tools/ap_trampoline_embed.S )
 
 # #761: propagate the trampoline's parameter-slot byte offsets from the
 # standalone-linked ap_trampoline.elf into kernel.elf as absolute
@@ -478,7 +478,7 @@ cat > "${AP_TRAMP_OFF_SRC}" <<EOF
 .global _ap_trampoline_entry_offset
 .set    _ap_trampoline_entry_offset, 0x${ENTRY_OFF}
 EOF
-as --64 -o "${AP_TRAMP_OFF_OBJ}" "${AP_TRAMP_OFF_SRC}"
+as --64 --noexecstack -o "${AP_TRAMP_OFF_OBJ}" "${AP_TRAMP_OFF_SRC}"
 
 # Parallel compile (perf #3): dispatch every .pdx → .o through
 # tools/compile-one.sh under xargs -P. Each invocation does its own
@@ -9803,7 +9803,7 @@ fi
 # tools/stubs.S is no longer needed for linking
 # echo "[stub] tools/stubs.S — Phase-7-in-progress link stubs"
 # STUBS_OBJ="${BUILD_DIR}/stubs.o"
-# as --64 -o "${STUBS_OBJ}" "${REPO_ROOT}/tools/stubs.S"
+# as --64 --noexecstack -o "${STUBS_OBJ}" "${REPO_ROOT}/tools/stubs.S"
 # OBJECTS+=("${STUBS_OBJ}")
 
 echo "[link] ld -T link.ld -> kernel.elf"
