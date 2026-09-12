@@ -108,6 +108,7 @@ Absolute slots in the single global `cap_table`, partitioned by image.
 | 10–11 | *reserved* | |
 | 12–13 | `pci_enumerator` | 12 = RPC endpoint (ep 4, `R_IPC_ALL`); 13 = `KIND_PCI_DEV` (`R_DEV_CONFIG_READ`) |
 | 14+ | free | |
+| 128–129 | **kernel boot witness** (R106.SHELL, paideia-os#2425) | 128 = synthetic `KIND_IPC_ENDPOINT` parent, 129 = live `KIND_TTY(write)` cap over the seeded row -- both stay live for the rest of the boot. Body: `src/kernel/boot/witness/r106_shell_tty_seed.pdx`. |
 
 Slot 5 is reserved rather than merely avoided: the boot witness genuinely
 mints there, and an image that took it would collide with the kernel's own
@@ -198,9 +199,19 @@ change is a **narrowing** as well as a widening, and why the numbering
 regions are accretion rather than taxonomy — is in the comment block above
 that table.
 
-The one-line summary: **seedable = {5, 0x15, 0x16, 0x20, 0x30}**, and the
-kernel-object base kinds are refused because their `target_ptr` is an
-unvalidated kernel pointer supplied by untrusted image bytes.
+The one-line summary: **seedable = {5, 0x15, 0x16, 0x20, 0x30, 0x197}**,
+and the kernel-object base kinds are refused because their `target_ptr`
+is an unvalidated kernel pointer supplied by untrusted image bytes.
+
+### 5.1 Additions after R31.M2
+
+| round     | issue    | added                | reason (one line)                                                                 |
+|-----------|----------|----------------------|-----------------------------------------------------------------------------------|
+| R106.SHELL | paideia-os#2425 | `KIND_TTY` (0x197) | Shell (and any tool with `KIND_TTY(write)` in its caps.decl) has no other path to acquire a stdin/stdout sink; the mint gate still refuses every ill-formed sidecar row. Persistent boot-time seed witnessed by `src/kernel/boot/witness/r106_shell_tty_seed.pdx` (fingerprint `boot kind_tty seed ok -- row=<idx> fd=0`). |
+
+Every future addition must land here, one row per issue, with the
+reason a boot image may be handed authority of that kind without asking
+anyone.
 
 ---
 
