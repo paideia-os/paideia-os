@@ -501,9 +501,10 @@ fi
 # pattern. Inlines sys_write / sys_taskinfo / sys_exit at their call
 # sites; every emit routes through write_bytes so a future pipe or file
 # stdout re-target composes without touching ps itself. See the source
-# header of src/user/ps.pdx for the M0 vs. M1 posture (name-field
-# rendering flips from synthesised `task<pid>` to record[16..32] when
-# task_struct.comm[16] lands at M1).
+# header of src/user/ps.pdx for the current posture: paideia-os#2431
+# wired the CMD column to real TCB.comm[16] (populated by
+# sys_execve_shim's Phase 8.5 basename stamp) and dropped the RSS
+# column, deferring an honest aspace-walk to a future landing.
 if [[ ${#PS_OBJECTS[@]} -gt 0 ]]; then
     echo "[link-user] ld -T ps.ld -> ps.elf"
     ld -nostdlib --warn-common --fatal-warnings \

@@ -319,7 +319,8 @@ if [[ "${SAT_NEEDS_BUILD}" -eq 1 ]]; then
             "${SAT_TOOLS_DIR}/${app}/tools/build.sh" \
                 --extra-obj-dir "${BUILD_DIR}/user/libpdx-volume-link" \
                 --extra-obj-dir "${BUILD_DIR}/user/libpdx-audit-link" \
-                --extra-obj-dir "${BUILD_DIR}/user/libpdx-argv-link"
+                --extra-obj-dir "${BUILD_DIR}/user/libpdx-argv-link" \
+                --extra-archive "${REPO_ROOT}/tools/paideia-as/target/release/libpaideia_satellite_runtime.a"
         ) & SAT_APP_PID[${app}]=$!
     done
 
