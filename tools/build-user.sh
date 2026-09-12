@@ -421,23 +421,13 @@ objcopy --strip-all "${BUILD_DIR}/shell.elf"
 echo "[ok] ${BUILD_DIR}/shell.elf"
 echo "[ok] ${BUILD_DIR}/shell.bin"
 
-# Link init.elf with init objects only
-if [[ ${#INIT_OBJECTS[@]} -gt 0 ]]; then
-    echo "[link-user] ld -T init.ld -> init.elf"
-    ld -nostdlib --warn-common --fatal-warnings \
-        -T "${INIT_LINK_SCRIPT}" \
-        -o "${BUILD_DIR}/init.elf" \
-        "${INIT_OBJECTS[@]}"
-
-    echo "[objcopy-user] init.elf -> init.bin"
-    objcopy -O binary "${BUILD_DIR}/init.elf" "${BUILD_DIR}/init.bin"
-
-    echo "[verify-user] byte-pattern canary on sys_open/sys_dup2/sys_close in init.elf"
-    "${REPO_ROOT}/tools/verify-user-init.sh" "${BUILD_DIR}/init.elf"
-
-    echo "[ok] ${BUILD_DIR}/init.elf"
-    echo "[ok] ${BUILD_DIR}/init.bin"
-fi
+# R113 (paideia-os #2441): the init.elf link is DEFERRED until after
+# ls.elf/cat.elf/ps.elf have been linked, because init.elf now embeds
+# those three ELFs via tools/init_userbin_embed.S's `.incbin` lines
+# so rootfs_seed.pdx can seed real binaries at /bin/{ls,cat,ps}. The
+# `.incbin` directive reads bytes at ASSEMBLE time, so the per-tool
+# links below must run first. The moved init.elf link block lives
+# right after the ls.elf link (search for "Link init.elf" — moved).
 
 # Link child_hello.elf with child_hello objects only (R15-M6-009 / #560).
 # Self-contained; no libs, no shim — the ELF pulls only child_hello.o.
@@ -698,6 +688,39 @@ if [[ ${#LS_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/ls.elf"
     echo "[ok] ${BUILD_DIR}/ls.bin"
+fi
+
+# R113 (paideia-os #2441): assemble tools/init_userbin_embed.S NOW that
+# ls.elf, cat.elf and ps.elf are all on disk, then thread the resulting
+# object into INIT_OBJECTS for the deferred init.elf link below. The
+# `.incbin` directives in the .S file read the referenced ELFs at
+# assemble time; if any of the three is missing, `as` hard-fails here
+# before we get to the init link -- symmetric with tools/build.sh's
+# userbin_embed.S ordering. Assembled with `cwd = REPO_ROOT` so the
+# repo-relative `build/user/*.elf` paths resolve.
+echo "[init-userbin] tools/init_userbin_embed.S -> init_userbin_embed.o"
+INIT_USERBIN_OBJ="${BUILD_DIR}/init_userbin_embed.o"
+( cd "${REPO_ROOT}" && as --64 --noexecstack -o "${INIT_USERBIN_OBJ}" tools/init_userbin_embed.S )
+INIT_OBJECTS+=("${INIT_USERBIN_OBJ}")
+
+# Link init.elf with INIT_OBJECTS + init_userbin_embed.o (R113 #2441 —
+# moved down from the pre-child_hello.elf position so `.incbin` sees the
+# per-tool ELFs on disk).
+if [[ ${#INIT_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T init.ld -> init.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${INIT_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/init.elf" \
+        "${INIT_OBJECTS[@]}"
+
+    echo "[objcopy-user] init.elf -> init.bin"
+    objcopy -O binary "${BUILD_DIR}/init.elf" "${BUILD_DIR}/init.bin"
+
+    echo "[verify-user] byte-pattern canary on sys_open/sys_dup2/sys_close in init.elf"
+    "${REPO_ROOT}/tools/verify-user-init.sh" "${BUILD_DIR}/init.elf"
+
+    echo "[ok] ${BUILD_DIR}/init.elf"
+    echo "[ok] ${BUILD_DIR}/init.bin"
 fi
 
 # Link rm.elf with rm objects only (R58.M5 paideia-os #1806).
