@@ -52,7 +52,7 @@
 #     * boot_r17_shell_multi_command: injects 'pwd\ncd /tmp\npwd\nhelp\nexit\n', asserts /tmp + help output + REAPED (R17.M5 #637)
 #     * boot_r17_shell_child_process: injects 'true\nexit\n', asserts TRUE OK from /bin/true + shell-reap chain (R17.M5 #638)
 #     * boot_r17_shell_shutdown: injects 'exit\n', asserts shell exit + init reap + init shutdown (R17.M5 #639)
-#     * boot_r86_relative_path: injects 'mkdir /tmp\ncd /tmp\nmkdir ./sub\ncd ./sub\nmkdir ../peer\npwd\nexit\n', asserts cd/mkdir fingerprints + literal '/tmp/sub' + REAPED (R86.M1-008 #1961)
+#     * boot_r86_relative_path: injects 'mkdir /tmp\ncd /tmp\nmkdir ./sub\ncd ./sub\nmkdir ../peer\npwd\ncd /tmp\nls\nexit\n', asserts cd/mkdir fingerprints + literal '/tmp/sub' + a second 'shell cd ok -- path=/tmp' + literal 'peer' from /bin/ls listing /tmp (v1.1 paideia-os/ls#29 cwd-relative resolve witness) + REAPED (R86.M1-008 #1961; ls v1.1 witness landed 2026-09-12)
 #     * boot_r64v2_tools: injects 'mkfs.pdxfs --dry-run /tmp/t.img\nexit\n', asserts sys execve argv ok + the mkfs.pdxfs dry-run preview line + REAPED (R64v2, paideia-os#1976/#1977)
 #     * boot_r65_persistent_home: PHASE 1 ONLY (phase 2 deferred to R51/R52). Injects 'mkdir /home\nmkdir /home/operator\nmkfs.pdxfs --dry-run /var/pdxfs/home.img\nmount.pdxfs --dry-run cap:volume:0x0001 /home/operator\ntouch /home/operator/probe.txt\nexit\n', asserts the two mkdir fingerprints + both tools' dry-run preview lines + REAPED, 32s timeout. Opt-in via PAIDEIA_R65_PERSIST=1 (R65v2.M1-004/005, paideia-os#1982/#1983)
 #     * boot_r72_tcp_echo: validates the R72 TCP substrate boot witness (self-connect handshake + port-7 echo + mutual orderly close), 10s timeout, no special QEMU flags (R72.M1-007 #1929)
@@ -482,12 +482,23 @@ case "${EXPECTED}" in
         #
         # Script: `mkdir /tmp` first (nothing seeds /tmp at boot), then
         # `cd /tmp`, `mkdir ./sub`, `cd ./sub`, `mkdir ../peer`, `pwd`,
-        # `exit`. Every mkdir target after the first contains a '/'
-        # (`./sub`, `../peer`) rather than a bare name -- sys_mkdir's
-        # last-slash parent-path split has a known, pre-existing,
-        # out-of-R86-scope gap that rejects a bare no-slash relative
-        # name (see sys_mkdir.pdx's "no slash found -> ENOENT" branch);
-        # this smoke does not exercise that path.
+        # `cd /tmp`, `ls`, `exit`. Every mkdir target after the first
+        # contains a '/' (`./sub`, `../peer`) rather than a bare name --
+        # sys_mkdir's last-slash parent-path split has a known,
+        # pre-existing, out-of-R86-scope gap that rejects a bare no-
+        # slash relative name (see sys_mkdir.pdx's "no slash found ->
+        # ENOENT" branch); this smoke does not exercise that path.
+        #
+        # v1.1 (paideia-os/ls#29, landed 2026-09-12): the trailing
+        # `cd /tmp\nls\n` pair is the /bin/ls cwd-relative resolve
+        # witness. Bare `ls` (argc<2) under v1.0 hardcoded target=`/`
+        # and would list ROOT (no `peer` entry there); v1.1 defaults
+        # argc<2 to the caller's cwd via sys_getcwd + sys_open, so at
+        # cwd=/tmp the listing MUST include the two entries created by
+        # the prior mkdir chain (`sub`, `peer`). Asserting the literal
+        # `peer` in the log after the second `shell cd ok -- path=/tmp`
+        # pins the fix specifically -- old ls listing `/` would emit
+        # bin/etc/dev/... but never `peer`.
         #
         # Golden asserts, in order: SHELL START, `shell cd ok -- path=`
         # (cd_builtin's fingerprint after `cd /tmp`, proving sys_chdir
@@ -499,16 +510,18 @@ case "${EXPECTED}" in
         # `/tmp/sub` (pwd_builtin's sys_write of the sys_getcwd-composed
         # path -- the actual end-to-end proof that TASK_OFF_CWD
         # threading + the R86.M1-002/003 vnode name table + the parent-
-        # chain walk all agree), and REAPED (shell exit unblocking
-        # init's wait4).
+        # chain walk all agree), a THIRD `shell cd ok -- path=/tmp`
+        # (from the trailing `cd /tmp`), the literal `peer` (from
+        # /bin/ls listing /tmp under v1.1 argc<2 defaults-to-cwd), and
+        # REAPED (shell exit unblocking init's wait4).
         FINGERPRINT_MODE=1
         FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r86-relative-path.golden"
         TIMEOUT=26
         UART_RX_MODE=1
-        : "${INJECT_STRING:=mkdir /tmp\ncd /tmp\nmkdir ./sub\ncd ./sub\nmkdir ../peer\npwd\nexit\n}"
+        : "${INJECT_STRING:=mkdir /tmp\ncd /tmp\nmkdir ./sub\ncd ./sub\nmkdir ../peer\npwd\ncd /tmp\nls\nexit\n}"
         : "${INJECT_WAIT_FOR:=SHELL START}"
         : "${INJECT_DELAY:=0.3}"
-        : "${INJECT_HOLD:=20}"
+        : "${INJECT_HOLD:=22}"
         EXPECTED=""
         ;;
     boot_r64v2_tools)
