@@ -104,13 +104,15 @@ if [[ -n "$RP" ]]; then
     fi
 fi
 
-# 10. exec_child calls resolve_path exactly once
+# 10. exec_child calls resolve_path at least once; post-#2451 pipe support
+# introduces exec_child_pipeline_entry siblings (left+right), each with its own
+# resolve_path call — allow 1 (pre-pipe) or 3 (post-pipe: exec_child + L + R).
 N=$(echo "$EC" | grep -Ec "call.*resolve_path" || true)
-if [[ "$N" -eq 1 ]]; then echo "[ok]   exec_child calls resolve_path once"; else echo "[FAIL] exec_child resolve_path count $N != 1"; FAIL=1; fi
+if [[ "$N" -eq 1 || "$N" -eq 3 ]]; then echo "[ok]   exec_child calls resolve_path ($N — 1 or 3 post-pipe accepted)"; else echo "[FAIL] exec_child resolve_path count $N not in {1,3}"; FAIL=1; fi
 
 # 11. exec_child ordering: resolve_path call PC < sys_execve call PC
-RP_PC=$(echo "$EC" | grep -E "call.*resolve_path" | head -1 | awk -F: '{print $1}' | tr -d ' ')
-EXECVE_PC=$(echo "$EC" | grep -E "call.*sys_execve" | head -1 | awk -F: '{print $1}' | tr -d ' ')
+RP_PC=$(set +o pipefail; echo "$EC" | grep -E "call.*resolve_path" | head -1 | awk -F: '{print $1}' | tr -d ' ')
+EXECVE_PC=$(set +o pipefail; echo "$EC" | grep -E "call.*sys_execve" | head -1 | awk -F: '{print $1}' | tr -d ' ')
 if [[ -n "$RP_PC" && -n "$EXECVE_PC" ]] && (( 16#$RP_PC < 16#$EXECVE_PC )); then
     echo "[ok]   exec_child ordering: resolve_path ($RP_PC) < sys_execve ($EXECVE_PC)"
 else
@@ -118,7 +120,10 @@ else
 fi
 
 # 12. exec_child has mov rdi, rax within ~4 instructions after call resolve_path
-RP_LINE=$(echo "$EC" | grep -n "call.*resolve_path" | head -1 | cut -d: -f1)
+# Post-#2451 pipe support: multiple resolve_path calls exist; check only the
+# first. `head -1 | grep` triggers SIGPIPE against grep which pipefail would
+# propagate as 141, so shell out to a no-pipefail sub-shell.
+RP_LINE=$(set +o pipefail; echo "$EC" | grep -n "call.*resolve_path" | head -1 | cut -d: -f1)
 if [[ -n "$RP_LINE" ]]; then
     # Extract lines after resolve_path call (next ~4 instructions)
     RESOLVE_SECTION=$(echo "$EC" | tail -n +$RP_LINE | head -5)

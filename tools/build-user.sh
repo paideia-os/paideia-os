@@ -325,12 +325,13 @@ while IFS= read -r -d '' pdx; do
         LIBS_OBJECTS+=("${obj}")
         SHELL_OBJECTS+=("${obj}")
         INIT_OBJECTS+=("${obj}")
-    elif [[ "${rel}" == a11y/*         ]] \
-      || [[ "${rel}" == compositor/*   ]] \
-      || [[ "${rel}" == color/*        ]] \
-      || [[ "${rel}" == ime/*          ]] \
-      || [[ "${rel}" == input_server/* ]] \
-      || [[ "${rel}" == libpaideia_ui/* ]]; then
+    elif [[ "${rel}" == a11y/*            ]] \
+      || [[ "${rel}" == compositor/*      ]] \
+      || [[ "${rel}" == color/*           ]] \
+      || [[ "${rel}" == ime/*             ]] \
+      || [[ "${rel}" == input_server/*    ]] \
+      || [[ "${rel}" == libpaideia_ui/*   ]] \
+      || [[ "${rel}" == postui-desktop/*  ]]; then
         # paideia-os #2344 fix: keep future-subsystem library objects OUT
         # of shell.elf so it stays small enough to fit through the execve
         # pipeline. Each of these directories is a library/subsystem

@@ -78,6 +78,13 @@ module Dispatch = structure {
   pub let mut builtin_count : u64 = uninit @align(8)
 
   pub let mut child_wait_status : [u64; 1] = uninit @align(8)
+
+  // paideia-os#2451: sys_pipe's caller-owned output pair. [0] = read_fd,
+  // [1] = write_fd, matching syscall_shim.pdx sys_pipe's documented
+  // 2x u64 output layout. Populated once per exec_child_pipeline call;
+  // no reentrancy concern (single-threaded shell, one line dispatched
+  // at a time).
+  pub let mut _dp_pipe_fds : [u64; 2] = uninit @align(8)
   pub let mut resolved_path : [u8; 320] = uninit @align(8)
   // R57.M4-005 (#1801): sys_stat (SC+ ID 77) result scratch for
   // resolve_path's PATH-prefix probe. 64 bytes matches the kernel-side
@@ -1145,6 +1152,15 @@ rp_hit:
   // from argv_buf (left-compact) so execve never sees them. This scan is
   // child-only (post-fork, separate address space via COW) — the parent's
   // argv_buf is untouched.
+  // paideia-os#2451 (Wave U, 2026-09-13) addendum: exec_child now scans
+  // argv_buf for a pipe ('|') token BEFORE forking. On a hit it branches
+  // to exec_child_pipeline_entry (defined at the tail of this function's
+  // body, after exec_child_err) instead of the single-fork path below --
+  // see that label's own header comment for the two-fork + sys_pipe
+  // strategy. The redirect scan (child-only, below) also gained a
+  // "2>&1" case (content-compare against Tokenizer::dup2_stderr_op)
+  // that issues a bare sys_dup2(1, 2) and consumes just its own token
+  // (no following filename, unlike >, >>, <).
   pub let exec_child : () -> u64 !{mem, sysreg, sysprivcap} @{fs, sched, cap} =
     fn () -> unsafe {
       effects: {mem, sysreg, sysprivcap}, capabilities: {fs, sched, cap},
@@ -1155,6 +1171,38 @@ rp_hit:
         mov rax, [rax];
         cmp rax, 0;
         je exec_child_err;
+
+        // paideia-os#2451: scan for a pipe token BEFORE forking -- a
+        // pipeline needs two forks + an inter-process fd, an entirely
+        // different shape from the single-fork path below. Parent-side
+        // scan (unlike the redirect scan, which is child-only): if no
+        // '|' is found, argv_buf/argc are untouched and control falls
+        // straight through to the pre-existing single-command path.
+        // r12 = argc (parked here; strlen/memcmp never touch r12) and
+        // doubles as exec_child_pipeline_entry's own argc input. r10 =
+        // scan index / pipe_idx on a hit.
+        mov r12, rax;             // r12 = argc
+        xor r10, r10;             // r10 = scan index
+      ec_pipe_scan:
+        cmp r10, r12;
+        jge ec_no_pipe;
+        lea r11, [rip + argv_buf];
+        mov rdi, [r11 + r10*8];
+        call strlen;
+        cmp rax, 1;
+        jne ec_pipe_scan_next;
+        lea r11, [rip + argv_buf];
+        mov rdi, [r11 + r10*8];
+        lea rsi, [rip + pipe_op];
+        mov rdx, 1;
+        call memcmp;
+        cmp rax, 0;
+        je exec_child_pipeline_entry;   // r10 = pipe_idx, r12 = argc
+      ec_pipe_scan_next:
+        add r10, 1;
+        jmp ec_pipe_scan;
+      ec_no_pipe:
+        mov rax, r12;             // restore argc into rax for the code below
 
         // NULL-terminate argv_buf[argc] = 0
         xor rcx, rcx;
@@ -1196,6 +1244,8 @@ rd_loop:
         mov r15, [rax + r13*8]; // r15 = argv_buf[read_idx] (survives strlen/memcmp — neither touches r15)
         mov rdi, r15;
         call strlen;            // rax = strlen(token)
+        cmp rax, 4;
+        je rd_try_dup2_stderr;
         cmp rax, 2;
         je rd_try_gtgt;
         cmp rax, 1;
@@ -1217,6 +1267,21 @@ rd_loop:
         je rd_try_lt;
 
         jmp rd_keep_token;
+
+rd_try_dup2_stderr:
+        // paideia-os#2451: "2>&1" -- dup2(1, 2), no following filename
+        // token to consume (unlike >, >>, < which all take a target).
+        mov rdi, r15;
+        lea rsi, [rip + dup2_stderr_op];
+        mov rdx, 4;
+        call memcmp;
+        cmp rax, 0;
+        jne rd_keep_token;
+        mov rdi, 1;              // oldfd = stdout
+        mov rsi, 2;              // newfd = stderr
+        call sys_dup2;
+        add r13, 1;              // consumed just this one token
+        jmp rd_loop;
 
 rd_try_gtgt:
         mov rdi, r15;
@@ -1389,6 +1454,171 @@ rd_apply_empty_argv:
         hlt;
 
 exec_child_err:
+        mov rax, 1;
+        ret;
+
+      // ==========================================================================
+      // paideia-os#2451: two-command pipeline ("cmd1 | cmd2").
+      //
+      // Reached from ec_pipe_scan above with r10 = pipe_idx, r12 = argc.
+      // Strategy: sys_pipe for an fd pair, fork the LEFT (writer) child
+      // first, then fork the RIGHT (reader) child from the still-intact
+      // parent argv_buf, then the parent closes both pipe ends and waits
+      // on both children. Each child mutates its OWN COW copy of
+      // argv_buf/argc (truncate-in-place for LEFT, shift-and-truncate
+      // for RIGHT) so resolve_path/sys_execve can stay argument-free
+      // exactly like the pre-existing single-command path -- neither
+      // child's mutation is visible to the parent or its sibling.
+      //
+      // Register plan (5 callee-save pushes = 40 bytes; entry rsp%16==8
+      // (fresh from exec_child's own entry, no prior pushes on this
+      // control-flow branch) -> after 5 pushes rsp%16==0 for every
+      // nested SysV call in every branch, parent and both children):
+      //   r12 = pipe_idx (LEFT child's own truncation point; dead in
+      //         the parent once right_start/right_count are computed,
+      //         so the parent reuses it to carry right_pid)
+      //   r13 = right_start = pipe_idx + 1 (RIGHT child only)
+      //   r14 = right_count = argc - right_start (RIGHT child only)
+      //   r15 = read_fd  (parent close + RIGHT child dup2 target)
+      //   rbx = write_fd (parent close + LEFT child dup2 target)
+      //   rbp = left_pid (parent only, set after the first fork)
+      // ==========================================================================
+      exec_child_pipeline_entry:
+        push rbx;
+        push rbp;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r13, r10;
+        add r13, 1;              // right_start = pipe_idx + 1
+        mov r14, r12;
+        sub r14, r13;            // right_count = argc - right_start
+        mov r12, r10;            // r12 = pipe_idx (argc no longer needed)
+
+        lea rdi, [rip + _dp_pipe_fds];
+        call sys_pipe;
+        cmp rax, 0;
+        jl exec_child_pipeline_err;
+
+        lea r11, [rip + _dp_pipe_fds];
+        mov r15, [r11 + 0];      // read_fd
+        mov rbx, [r11 + 8];      // write_fd
+
+        // Fork LEFT (writer) child.
+        call sys_fork;
+        cmp rax, 0;
+        jl exec_child_pipeline_err;
+        je exec_child_pipeline_left_child;
+        mov rbp, rax;            // parent: left_pid
+
+        // Fork RIGHT (reader) child from the parent's still-intact argv_buf.
+        call sys_fork;
+        cmp rax, 0;
+        jl exec_child_pipeline_err;
+        je exec_child_pipeline_right_child;
+
+        // Parent: rax = right_pid. pipe_idx (r12) is dead on this path;
+        // reuse it to carry right_pid across the close/wait4 calls
+        // below (all caller-save regs are clobbered by those calls).
+        mov r12, rax;
+        mov rdi, r15;
+        call sys_close;
+        mov rdi, rbx;
+        call sys_close;
+
+        mov rdi, rbp;
+        lea rsi, [rip + child_wait_status];
+        xor rdx, rdx;
+        xor rcx, rcx;
+        call sys_wait4;
+
+        mov rdi, r12;
+        lea rsi, [rip + child_wait_status];
+        xor rdx, rdx;
+        xor rcx, rcx;
+        call sys_wait4;
+
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      exec_child_pipeline_left_child:
+        // Truncate this child's own argv_buf/argc copy at pipe_idx,
+        // wire write_fd onto stdout, drop both original pipe fds.
+        lea r11, [rip + argv_buf];
+        xor rcx, rcx;
+        mov [r11 + r12*8], rcx;
+        lea r11, [rip + argc];
+        mov [r11], r12;
+
+        mov rdi, rbx;
+        mov rsi, 1;
+        call sys_dup2;
+        mov rdi, r15;
+        call sys_close;
+        mov rdi, rbx;
+        call sys_close;
+
+        call resolve_path;
+        mov rdi, rax;
+        lea rsi, [rip + argv_buf];
+        xor rdx, rdx;
+        call sys_execve;
+        mov rdi, 127;
+        call sys_exit;
+        hlt;
+
+      exec_child_pipeline_right_child:
+        // Shift argv_buf[right_start .. right_start+right_count) down
+        // to argv_buf[0 .. right_count) in this child's own COW copy,
+        // NUL-terminate, wire read_fd onto stdin, drop both original
+        // pipe fds.
+        xor rcx, rcx;            // i = 0
+      ecp_rc_shift:
+        cmp rcx, r14;
+        jge ecp_rc_shift_done;
+        lea r11, [rip + argv_buf];
+        mov r9, r13;
+        add r9, rcx;
+        mov r8, [r11 + r9*8];
+        mov [r11 + rcx*8], r8;
+        add rcx, 1;
+        jmp ecp_rc_shift;
+      ecp_rc_shift_done:
+        lea r11, [rip + argv_buf];
+        xor rcx, rcx;
+        mov [r11 + r14*8], rcx;
+        lea r11, [rip + argc];
+        mov [r11], r14;
+
+        mov rdi, r15;
+        mov rsi, 0;
+        call sys_dup2;
+        mov rdi, r15;
+        call sys_close;
+        mov rdi, rbx;
+        call sys_close;
+
+        call resolve_path;
+        mov rdi, rax;
+        lea rsi, [rip + argv_buf];
+        xor rdx, rdx;
+        call sys_execve;
+        mov rdi, 127;
+        call sys_exit;
+        hlt;
+
+      exec_child_pipeline_err:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop rbp;
+        pop rbx;
         mov rax, 1;
         ret
       }
