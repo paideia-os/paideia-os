@@ -91,10 +91,19 @@ first fork+exec cycle, now runs:
 5. On `sys_mount` success (return value in `[0..7]`, the mount-table
    slot index): emit one of two fixed rodata fingerprint lines —
    `init home mount ok [legacy: INIT HOME MOUNT OK] -- src=<path>
-   mp=/home/operator backend=PDXFS_BLOCK` — selecting the file or
-   device variant by which target was actually used. Both variants are
-   compile-time-known literals (no dynamic path formatting exists in
-   this userland tree).
+   backend=PDXFS_BLOCK` — selecting the file or device variant by
+   which target was actually used. Both variants are compile-time-known
+   literals (no dynamic path formatting exists in this userland tree).
+   The `mp=<path>` field the earlier design paragraph carried was
+   retired at R106.M3-followup (paideia-os #2439): the mount point is
+   always the well-known founder-fingerprint `/home/<64-hex>` sourced
+   from `FounderConstants.fc_placeholder_home_path`, so stamping it
+   onto the fingerprint added no witness value the src=/backend= pair
+   did not already carry — and its brief life as a static `<fp>`
+   placeholder token (R106.M3, paideia-os #2230) sat on the wire as a
+   TODO-shape landmine ahead of R108.M2's real-fingerprint
+   substitution. Retiring the field tightens the wire format and lets
+   R108.M2 land without touching this fingerprint at all.
 6. On `sys_mount` failure (return `>= 8`, i.e. any `0xFFFFED6x`
    sentinel or negative errno): fall through silently to the tmpfs-
    backed `/home/operator` every boot already has. A missing or corrupt
