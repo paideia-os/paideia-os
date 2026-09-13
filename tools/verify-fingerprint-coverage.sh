@@ -2663,6 +2663,27 @@ ALLOWLIST = {
         "dispatch.pdx wiring (R108.M4 for the real KIND_USER_ALIAS "
         "resolution). Same posture as the sibling `editor buffer init ok` "
         "/ `clock timezone ready ok` data-only decls.",
+    # ------------------------------------------------------------------
+    # WAVE-17 (paideia-os/paideia-os #2457) -- shell tokenizer quoting,
+    # backslash escape, and $VAR expansion. Data-only meta decl; no
+    # boot witness emits this marker (the tokenizer runs at every shell
+    # line, but nobody sys_debug_puts the marker). Same posture as the
+    # sibling `tokenizer tilde alias ok` decl above.
+    # ------------------------------------------------------------------
+    "tokenizer wave17 cook ok [legacy: TOKENIZER WAVE17 COOK OK]":
+        "WAVE-17 (paideia-os/paideia-os #2457): src/user/tokenizer.pdx "
+        "WORD tokens now flow through a tk_cook_* state-machine that "
+        "stages cooked bytes into tokenizer_arg_buf .bss with quote "
+        "stripping (single '..' literal, double \"..\" limited-escape + "
+        "$VAR-active), backslash escape (bare '\\' consumes next byte "
+        "literally), and $VAR expansion via tokenizer_find_env(envp, "
+        "name_ptr, name_len) -- a generic env scanner modeled on "
+        "dispatch_find_path_env (#2456), returning envp[i]+name_len+1 "
+        "on match. Redirect ('>', '>>', '<') and tilde-alias tokens "
+        "keep their pre-wave paths (rodata pointers / line_buf name "
+        "substrings). Data-only fingerprint: no boot witness emits the "
+        "marker (the cooker runs silently at every shell line). Same "
+        "posture as the sibling `tokenizer tilde alias ok` decl above.",
     "dispatch from tokenizer ok [legacy: DISPATCH FROM TOKENIZER OK]":
         "Wave0-B15 R106-M4-KERNEL (paideia-os #2231): src/user/dispatch.pdx "
         "dispatch_from_tokenizer_stream fixed-shape token-record entry "
