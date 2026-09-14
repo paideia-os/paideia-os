@@ -123,8 +123,36 @@ if [[ ! -f "${DMESG_LINK_SCRIPT}" ]]; then
     exit 1
 fi
 
+# Satellite-tool ELF preservation (design/build/satellite-elf-preservation.md).
+#
+# tools/build.sh's r64v2-tools block stages mkfs.pdxfs.elf /
+# mount.pdxfs.elf / umount.pdxfs.elf into this same directory
+# (build/user/) AFTER this script's own build has already run once
+# from inside tools/build.sh. But tools/build-image.sh (and
+# tools/mkimage.sh) also invoke this script standalone, later in
+# their own pipeline, purely to (re)build the shell/init/true/
+# child_hello/etc. userland set — and a bare `rm -rf "${BUILD_DIR}"`
+# at that point silently deletes the satellite *.elf files a prior
+# tools/build.sh run already staged, with no re-build step of its own
+# to replace them. Stash any `*.pdxfs.elf` present before wiping the
+# directory, then restore them after recreating it, so this script's
+# own job (userland-only) never has a destructive side effect on a
+# sibling pipeline's already-completed work.
+SAT_ELF_STASH="$(mktemp -d)"
+trap 'rm -rf "${SAT_ELF_STASH}"' EXIT
+if [[ -d "${BUILD_DIR}" ]]; then
+    find "${BUILD_DIR}" -maxdepth 1 -name '*.pdxfs.elf' -exec mv {} "${SAT_ELF_STASH}/" \;
+fi
+
 rm -rf "${BUILD_DIR}"
 mkdir -p "${BUILD_DIR}"
+
+shopt -s nullglob
+for f in "${SAT_ELF_STASH}"/*.pdxfs.elf; do
+    mv "${f}" "${BUILD_DIR}/"
+    echo "[build-user] preserved satellite artifact: ${BUILD_DIR}/$(basename "${f}")"
+done
+shopt -u nullglob
 
 # Build all .pdx files to objects
 ALL_OBJECTS=()
