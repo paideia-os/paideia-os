@@ -20,6 +20,83 @@ fi
 mkdir -p "${BUILD_DIR}"
 
 # ---------------------------------------------------------------------------
+# --compositor-tests (Wave π / π-02): opt-in build of the standalone
+# compositor kernel-linked test-runner ELF (design/testing/compositor-
+# test-runner.md). Runs unconditionally whenever the flag is present,
+# BEFORE the kernel's own no-op fast-path stamp check below, so it is
+# never skipped by a fresh kernel.elf stamp. Independent build: its own
+# object set, its own `ld` invocation, its own output directory
+# (build/tests/); it never touches build/kernel.elf or the fast-path
+# STAMP file.
+# ---------------------------------------------------------------------------
+COMPOSITOR_TESTS=0
+for __arg in "$@"; do
+    if [[ "${__arg}" == "--compositor-tests" ]]; then
+        COMPOSITOR_TESTS=1
+    fi
+done
+
+if [[ "${COMPOSITOR_TESTS}" -eq 1 ]]; then
+    echo "[compositor-tests] building build/tests/compositor-runner.elf"
+
+    CT_SRC_COMPOSITOR="${REPO_ROOT}/src/user/compositor"
+    CT_SRC_TESTS="${REPO_ROOT}/tests/kernel/compositor"
+    CT_HARNESS_DIR="${CT_SRC_TESTS}/test_harness"
+    CT_LINK_SCRIPT="${CT_HARNESS_DIR}/test.ld"
+    CT_MAIN_PDX="${CT_HARNESS_DIR}/main.pdx"
+    CT_BUILD_DIR="${BUILD_DIR}/tests"
+
+    if [[ ! -f "${CT_LINK_SCRIPT}" ]]; then
+        echo "compositor test-runner linker script missing: ${CT_LINK_SCRIPT}" >&2
+        exit 1
+    fi
+    if [[ ! -f "${CT_MAIN_PDX}" ]]; then
+        echo "compositor test-runner main.pdx missing: ${CT_MAIN_PDX}" >&2
+        exit 1
+    fi
+
+    rm -rf "${CT_BUILD_DIR}"
+    mkdir -p "${CT_BUILD_DIR}"
+
+    CT_OBJECTS=()
+
+    # src/user/compositor/*.pdx -- EXCLUDING selftest.pdx, which owns
+    # its own competing `_start` for the separate Wave β β-01
+    # compositor_selftest.elf (tools/build-user.sh) and must never share
+    # a link unit with this harness's `_start` (test_harness/main.pdx).
+    while IFS= read -r -d '' pdx; do
+        rel="${pdx#"${REPO_ROOT}"/}"
+        obj="${CT_BUILD_DIR}/$(basename "${pdx%.pdx}").o"
+        echo "[compositor-tests] paideia-as ${rel} -> ${obj#"${BUILD_DIR}"/}"
+        "${PAIDEIA_AS}" build --emit elf64 "${pdx}" -o "${obj}"
+        CT_OBJECTS+=("${obj}")
+    done < <(find "${CT_SRC_COMPOSITOR}" -maxdepth 1 -name '*.pdx' ! -name 'selftest.pdx' -print0 | sort -z)
+
+    # tests/kernel/compositor/test_*.pdx -- the witnesses under test.
+    while IFS= read -r -d '' pdx; do
+        rel="${pdx#"${REPO_ROOT}"/}"
+        obj="${CT_BUILD_DIR}/$(basename "${pdx%.pdx}").o"
+        echo "[compositor-tests] paideia-as ${rel} -> ${obj#"${BUILD_DIR}"/}"
+        "${PAIDEIA_AS}" build --emit elf64 "${pdx}" -o "${obj}"
+        CT_OBJECTS+=("${obj}")
+    done < <(find "${CT_SRC_TESTS}" -maxdepth 1 -name 'test_*.pdx' -print0 | sort -z)
+
+    # test_harness/main.pdx -- the runner's own _start + dispatch table.
+    CT_MAIN_OBJ="${CT_BUILD_DIR}/compositor_test_harness_main.o"
+    echo "[compositor-tests] paideia-as tests/kernel/compositor/test_harness/main.pdx -> ${CT_MAIN_OBJ#"${BUILD_DIR}"/}"
+    "${PAIDEIA_AS}" build --emit elf64 "${CT_MAIN_PDX}" -o "${CT_MAIN_OBJ}"
+    CT_OBJECTS+=("${CT_MAIN_OBJ}")
+
+    echo "[compositor-tests] ld -T test.ld -> compositor-runner.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${CT_LINK_SCRIPT}" \
+        -o "${CT_BUILD_DIR}/compositor-runner.elf" \
+        "${CT_OBJECTS[@]}"
+
+    echo "[ok] ${CT_BUILD_DIR}/compositor-runner.elf"
+fi
+
+# ---------------------------------------------------------------------------
 # Whole-build no-op fast-path.
 #
 # A successful full run touches "${BUILD_DIR}/.verified-stamp" as its final

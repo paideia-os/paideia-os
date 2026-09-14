@@ -1,118 +1,201 @@
-# Compositor test runner — a `--compositor-tests` build.sh flag
+# Compositor kernel-test-runner ELF (Wave π / π-02)
 
-**Status:** Design (wave α-02). Docs-only, proposes a flag; does not implement it.
-**Date:** 2026-09-14.
-**Grounds in:** `tools/build.sh` (TESTS_KERNEL_DIR loop, ~L509-524), `tools/build-user.sh` (~L326-345, compositor/* exclusion, paideia-os #2344), `tests/kernel/compositor/*.pdx` (20 files), `src/user/compositor/*.pdx` (35 files).
+**Status:** LANDED. `tools/build.sh --compositor-tests` builds
+`build/tests/compositor-runner.elf`; `tools/run-qemu-tests.sh
+--compositor` boots it and checks the summary fingerprint. Not yet
+wired into the default `tools/build.sh` / `tools/run-smoke.sh` flows
+(opt-in flag only) — see §5.
 
-## 1. What exists today, precisely
+**Co-located with:** `design/testing/kernel-test-runner.md` (the
+general pattern this instance implements) and `design/testing/
+compositor-qemu-smoke-plan.md` (the separate α-track compositor
+boot-smoke design — see §5 for how the two relate). This file
+**supersedes the Wave α-02 draft** that previously occupied this exact
+path (docs-only, proposed the flag without implementing it) — §6
+below reconciles what that draft proposed against what actually
+landed, rather than silently discarding it.
 
-`tools/build.sh` already compiles every `.pdx` under `tests/kernel/`
-(compositor included) and links the resulting objects **into
-`kernel.elf` itself**:
+---
+
+## 1. What this is, and what it is not
+
+This is a **unit-test harness**, not a boot-smoke fixture. It calls 20
+pure-compute witness functions (`tests/kernel/compositor/test_*.pdx`)
+against the compositor's library modules
+(`src/user/compositor/*.pdx`) inside one ring-3 process, with no
+scheduler, no IPC, no capability-system involvement, and no dependency
+on any daemon (`svc-compositor` / `svc-wm`, both still zero-source per
+`compositor-qemu-smoke-plan.md` §1.2). It answers "does the compositor
+library's arena arithmetic / bitmask logic / state-machine code still
+do what its own unit witness expects", not "does a compositor process
+boot and composite a frame" (that is COMP-QM-01..05 in the sibling
+smoke-plan doc, still gated on G1-G8 there).
+
+## 2. Build
 
 ```
-# tools/build.sh ~L509
-TESTS_KERNEL_DIR="${REPO_ROOT}/tests/kernel"
-if [[ -d "${TESTS_KERNEL_DIR}" ]]; then
-    find "${TESTS_KERNEL_DIR}" -name '*.pdx' \
-        -not -path '*/drivers/elaborator/*' -print0 \
-      | xargs -0 ... "${REPO_ROOT}/tools/compile-one.sh" "{}" ...
-    # objects appended to OBJECTS[], which becomes kernel.elf's link set
-fi
+bash tools/build.sh --compositor-tests
 ```
 
-This is a kernel-image build, not a standalone test ELF. It works for
-most `tests/kernel/*` subdirectories because their witnesses are
-self-contained (they call kernel-internal functions already being
-linked into `kernel.elf` anyway).
+produces `build/tests/compositor-runner.elf` by:
 
-**It does not work the way `tests/kernel/compositor/*.pdx` needs.**
-Those tests exist to validate `src/user/compositor/*.pdx` — a
-**userspace** module library, compiled by `tools/build-user.sh`, not by
-`tools/build.sh`. The two build passes never share an object namespace,
-so a compositor test that wanted to call a real function from
-`layer_tree.pdx` (say) has no link path to it today. Confirmed by
-reading `tests/kernel/compositor/test_layer_tree.pdx`: rather than
-calling the module under test, it ships four local WEAK-stub helpers
-(`tlt_attach`/`tlt_detach`/`tlt_get_at`/`tlt_count`) that reimplement
-the arena arithmetic `layer_tree.pdx`'s own header documents, because
-"there is also no mint body yet... so there is no shipping way to
-populate a tree" through the real API. The test suite is testing byte
-layouts it copied out of comments, not the module.
+1. Compiling every `src/user/compositor/*.pdx` file **except
+   `selftest.pdx`** (paideia-as, `--emit elf64`, one object per file).
+   `selftest.pdx` is excluded because it declares its own `pub let
+   _start`, competing with this harness's own `_start`
+   (`test_harness/main.pdx`) — see §2.1 for why linking it in at all
+   would be a mistake even setting the `_start` collision aside.
+2. Compiling every `tests/kernel/compositor/test_*.pdx` witness (20 at
+   landing).
+3. Compiling `tests/kernel/compositor/test_harness/main.pdx`, the
+   runner's own entry point.
+4. Linking all of the above with `ld -T tests/kernel/compositor/
+   test_harness/test.ld` (a dedicated linker script, byte-identical in
+   shape to `src/user/link.ld` — same two-`PT_LOAD` layout at
+   `0x00400000`/`0x00600000` every other user ELF in this tree uses).
 
-Separately, `tools/build-user.sh` excludes `compositor/*` (and five
-sibling scaffold directories) from `SHELL_OBJECTS`/`INIT_OBJECTS` —
-deliberately, per the #2344 fix, so `shell.elf` doesn't balloon past
-`EXECVE_IMAGE_MAX` (65536 bytes) with rodata tables no shipping binary
-uses yet. That exclusion is correct for `shell.elf`/`init.elf`. It is
-irrelevant to — and currently blocks nothing about — a hypothetical
-third link target, because no such target exists yet. The wave brief's
-framing ("blocked because build-user.sh excludes compositor/*") is
-slightly imprecise: the real blocker is the *absence* of a build path
-that treats `compositor/*` objects as consumable by anything other
-than `shell.elf`/`init.elf`, not the exclusion itself. This document
-proposes that path.
+### 2.1 A prerequisite fix this landing needed
 
-## 2. Proposed flag: `bash tools/build.sh --compositor-tests`
+Before this landing, no build ever linked more than TWO of the 36
+`src/user/compositor/*.pdx` files into one object
+(`compositor_selftest.elf` links `selftest.o` + `buffer_age.o` only —
+`tools/build-user.sh`'s own comment explains this was deliberate, to
+avoid ballooning `shell.elf` past its tmpfs size cap when an earlier
+attempt pulled in the whole directory). Nothing had ever exercised
+linking the *whole* library together.
 
-A new, opt-in flag (default off — this must never become part of the
-standing `bash tools/build.sh` / `bash tools/run-qemu.sh` pair per
-`feedback_paideia_os_test_defaults`) that:
+Doing so surfaced a latent defect: three files
+(`window_geometry.pdx`, `xdg_shell_geometry.pdx`,
+`xdg_shell_states.pdx`) independently declare an identical,
+deliberately byte-stable `RESIZE_EDGE_*` bitmask table (11 constants)
+as `pub let`, and two more (`recovery_plane_reserve.pdx`,
+`recovery_plane_takeover.pdx`) independently declare identical
+`KIND_RECOVERY_PLANE` / `RESERVATION_HOLDER_KIND` constants the same
+way. In `paideia-as`, `pub let NAME : u64 = <literal>` is not a
+macro-style compile-time-only constant — it lowers to a real `Rodata`
+ELF symbol, `STB_GLOBAL` because of the `pub` keyword (see
+`tools/paideia-as/crates/paideia-as/tests/codegen/
+pub_cross_module_link.rs`). Five files' worth of duplicate global
+symbols is a multiple-definition link error the instant two of them
+share a link unit — which had simply never happened until this file's
+own build path tried to link all five together.
 
-1. **Compiles `src/user/compositor/*.pdx`** using the same
-   `compile-one.sh` invocation `build-user.sh` already uses for that
-   directory today (the objects are already produced; they just aren't
-   linked into anything). No change to `build-user.sh`'s exclusion
-   list — this flag reads the same `.o` outputs, it does not change
-   what gets excluded from `shell.elf`.
-2. **Compiles `tests/kernel/compositor/*.pdx`** the same way
-   `tools/build.sh`'s existing `TESTS_KERNEL_DIR` loop does.
-3. **Links both object sets into a new standalone ELF**,
-   `build/tests/compositor_tests.elf`, using a dedicated link script
-   distinct from `kernel.elf`'s and from `shell.elf`'s — it needs
-   `kernel.elf`'s test-witness calling convention (since the test
-   bodies are written kernel-side, per the existing
-   `tests/kernel/*` idiom) while resolving symbols against the
-   userspace-ABI `compositor/*.o` objects. This is the one genuinely
-   new piece of build machinery: today every `tests/kernel/*` witness
-   assumes its callees are also kernel-linked. A cross-ABI link needs
-   an explicit trampoline layer or a build-time assertion that the two
-   sides agree on calling convention for the specific functions under
-   test (SysV throughout, per `paideia-as`, so this may be a non-issue
-   in practice — worth a spike before committing to the flag's
-   implementation, not before documenting it).
-4. **Runs nothing by itself.** The flag only builds
-   `compositor_tests.elf`; execution is a QEMU or native-run concern
-   left to `tools/run-smoke.sh` (or a future
-   `tools/run-compositor-tests.sh`) exactly the way other kernel
-   artifacts are exercised — this document does not propose a new
-   execution harness, only the build-side link path.
+The fix, landed alongside this doc: demote the 13 duplicate names from
+`pub let` to file-local `let` in all five files. This is safe because
+every use site in the whole tree hardcodes the literal value directly
+(`mov r11, 0x1D0; // RESERVATION_HOLDER_KIND`, not `mov r11,
+RESERVATION_HOLDER_KIND`) — grep-verified zero symbol-name references
+anywhere, including within the declaring file itself. The `pub`
+declarations exist purely as named documentation of the contract (and,
+for the `RESIZE_EDGE_*` table, an explicit "byte-stable across these
+three files" cross-reference in each file's own header) — dropping
+`pub` changes no emitted code, only symbol visibility. Each edited
+file carries an inline comment recording this at the affected
+declaration.
 
-## 3. Why gate it behind a flag rather than making it standard
+Any future subsystem's first-ever whole-library link should expect the
+same class of surprise; `kernel-test-runner.md` §2(c) generalizes the
+lesson (grep for duplicate `pub let` names before wiring the harness,
+not after the link fails).
 
-- `compositor/*.pdx` and its test suite are mid-flight (α-01):
-  linking them into every build by default would slow every developer
-  build for a module library with no shipping consumer yet.
-- The cross-ABI link path is new, unproven machinery. It should not
-  gate the standing `bash tools/build.sh` invocation's exit code until
-  it has run clean across a few real iterations.
-- This mirrors how `tools/verify-elaborator-negatives.sh`
-  (`tools/build.sh`'s own `-not -path '*/drivers/elaborator/*'`
-  exclusion) already keeps an intentionally-special test class out of
-  the default object-emitting path and verifies it via a separate,
-  explicitly-invoked script.
+## 3. The runner's own shape (`test_harness/main.pdx`)
 
-## 4. Payoff
+Twenty `call test_<name>_run` sites in `_start`, each immediately
+followed by `call th_record(name_buf, name_len, result)` — a helper
+that:
 
-Once `--compositor-tests` exists, `tests/kernel/compositor/*.pdx` can
-be rewritten to call the *real* `layer_tree.pdx`/`surface_commit.pdx`/…
-functions instead of shipping local reimplementations of their byte
-layouts — closing the exact gap `test_layer_tree.pdx`'s own header
-comment names ("Requires layer_tree.pdx ... to export real
-attach/detach/get_at/count primitives before this stub can be
-retired"). This becomes the regression gate `compositor-split-decision.md`
-(α-01) Phase 1 assigns to the in-tree library's reference/test-oracle
-role.
+* tallies the result into one of two `.bss` counters (`_th_pass` /
+  `_th_fail`, load-inc-store, no `add reg,[mem]`);
+* emits one diagnostic line to fd 2 per witness: `"<name> PASS\n"` or
+  `"<name> FAIL stage=<N>\n"`.
 
-No code changes accompany this document; it specifies the flag's
-contract for a future softarch/osarch implementation pass.
+After all 20, `_start` emits the summary fingerprint and exits:
+
+```
+COMPOSITOR TESTS: <pass> passed / <fail> failed
+```
+
+on fd 2, then `sys_exit(fail_count)` (zero iff every witness passed).
+`fd 2` is used because `src/kernel/core/syscall/dispatch.pdx`
+documents "ID 1 (write) uses fast-path for fd∈{1,2}→UART" — fd 2
+reaches the same serial wire as fd 1 under the default `-kernel` boot,
+with no fd-table setup, no `_init_caps` sidecar, and no tmpfs
+dependency (this ELF is self-contained, inlining `sys_write`/`sys_exit`
+directly, matching `true.pdx`/`child_hello.pdx`/`selftest.pdx`
+discipline).
+
+The summary line deliberately carries no `OK` token. `tools/
+verify-fingerprint-coverage.sh` only requires assertable-golden
+coverage for markers containing the whole word `OK` (`design/testing/
+fingerprint-coverage.md` §2); this line's counts are runtime-computed,
+so no golden could pin it as an ordered substring regardless. Its
+consumer is `tools/run-qemu-tests.sh` (§4 below), which greps the
+fixed prefix `"COMPOSITOR TESTS: "` directly rather than going through
+the coverage-gate machinery built for static fingerprints.
+
+## 4. Consumption
+
+`tools/run-qemu-tests.sh --compositor` (Wave π / π-04) boots
+`build/tests/compositor-runner.elf` via `tools/run-qemu.sh`, greps the
+serial log for `"COMPOSITOR TESTS: "`, parses the pass/fail counts, and
+reports success iff `failed == 0`. See that script's own header for
+the full contract, including how it also drives the (not-yet-built)
+`postui-desktop` runner.
+
+Not wired into `tools/run-smoke.sh`'s default matrix, and not invoked
+by `tools/build.sh` without the explicit `--compositor-tests` flag —
+same opt-in posture `compositor-qemu-smoke-plan.md` used for its own
+stub fixtures, until this harness has run clean in QEMU at least once
+(main builds/boots; this doc's authoring pass did not run QEMU per
+this wave's no-background-builds discipline).
+
+## 5. Relationship to `compositor-qemu-smoke-plan.md`
+
+That doc's COMP-QM-01..05 fixtures are **boot-smoke** fixtures — full
+QEMU boots that would (once G1-G8 close) prove a compositor daemon
+composites frames end-to-end. This doc's runner is a **unit-test**
+fixture that proves the compositor's own library code is internally
+correct, entirely independent of whether any daemon (`svc-compositor`,
+`svc-wm`, `postui-desktop`) ever spawns. The two are complementary, not
+competing: COMP-QM-01 could plausibly boot THIS runner as its "module
+self-checks" content once G5 (an init-time gate) lands, but that wiring
+is not attempted here — this landing's runner is invoked only via the
+opt-in `tools/run-qemu-tests.sh` path, not the default boot sequence
+COMP-QM-01 would need to hook into.
+
+## 6. Reconciliation with the Wave α-02 draft this file supersedes
+
+The α-02 draft that previously lived at this path correctly identified
+the core problem (`tests/kernel/compositor/*.pdx` witnesses have no
+link path to the real `src/user/compositor/*.pdx` functions they claim
+to test, so `test_layer_tree.pdx` and its siblings ship local WEAK-stub
+reimplementations of byte layouts instead) and correctly proposed the
+shape of the fix (a new opt-in `tools/build.sh --compositor-tests` flag
+producing a standalone ELF via a dedicated linker script). Three things
+changed between that proposal and what actually landed:
+
+* **ELF name/path:** the draft guessed `build/tests/compositor_tests.elf`
+  (underscore); this landing uses `build/tests/compositor-runner.elf`
+  (hyphen), matching this wave's brief.
+* **The "cross-ABI link" concern (draft §2 item 3) did not materialize.**
+  The draft worried that `tests/kernel/*` witnesses are written against
+  a kernel-linked calling convention that might not agree with
+  `compositor/*.pdx`'s userspace ABI, needing "an explicit trampoline
+  layer" — flagged as "worth a spike... may be a non-issue in practice"
+  since both sides use SysV via `paideia-as`. It is in fact a non-issue:
+  `tests/kernel/compositor/test_*.pdx` witnesses were ALREADY plain
+  userspace-ABI `pub let test_X_run : () -> u64` functions with no
+  kernel-linked assumptions (confirmed by reading all 20 at this
+  landing) — they were simply never compiled with `--emit elf64` and
+  linked as a userspace ELF before. No trampoline was needed.
+* **The draft's §4 payoff (real functions retire the WEAK stubs) is
+  NOT yet claimed here.** This landing makes the link path exist and
+  proves it links (the RESIZE_EDGE_*/KIND_RECOVERY_PLANE fix in §2.1
+  above is the direct evidence: a link that couldn't have failed that
+  way before because it had never been attempted). It does not rewrite
+  any of the 20 witnesses to stop using their WEAK stubs and start
+  calling real mint/mutation primitives — `test_layer_tree.pdx`'s own
+  GAP NOTE (no `layer_tree.pdx` mutation API exists yet) is still
+  exactly as true today as it was when the α-02 draft described it.
+  That rewrite is separate follow-on work, now unblocked rather than
+  landed.
