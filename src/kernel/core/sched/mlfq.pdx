@@ -1,0 +1,398 @@
+// src/kernel/core/sched/mlfq.pdx — Wave κ (κ-03)
+//
+// Multi-Level Feedback Queue (MLFQ) — three per-CPU runqueues indexed by
+// PriorityClass.PRIO_CLASS_INTERACTIVE (0) / _BATCH (1) / _IDLE (2). The
+// pick-next walk scans queue[0] first, then queue[1], then queue[2];
+// within a queue the round-robin discipline mirrors the existing
+// single-queue runqueue (sched/runqueue.pdx per-CPU CB doubly-linked
+// list).
+//
+// PARALLEL STORAGE, NOT AN INLINE CB EXTENSION
+//
+// The existing per-CPU runqueue lives inside each CPU's Percpu control
+// block at PERCPU_OFF_RUNQUEUE_HEAD(+32) / _TAIL(+40) — that CB's
+// two-cache-line footprint is a design invariant (percpu.pdx §L header)
+// and is NOT extended here. Instead, three separate .bss arrays hold
+// the MLFQ head/tail pairs, indexed by (cpu_idx * 3 + class):
+//
+//   _mlfq_heads[MAX_CPUS * 3]
+//   _mlfq_tails[MAX_CPUS * 3]
+//
+// MAX_CPUS = 4 (matches Percpu.MAX_CPUS, duplicated locally per this tree's
+// cross-module-const-does-not-resolve-at-parse-time discipline).
+//
+// COEXISTENCE WITH sched_pick_next_r15
+//
+// κ-03 does NOT retire the CB-resident single-queue runqueue or change
+// sched_pick_next_r15's algorithm. The MLFQ primitives below are the
+// SCAFFOLD for a future scheduler swap (a pick_next.pdx variant that
+// consults runqueue_pick_next instead of the CB doubly-linked walk).
+// Wiring in the swap is a separate follow-up because it touches every
+// pick-next caller (wake_block sched_block, sys_exit's post-reap pick,
+// trampoline_vec32 preemption) and needs its own dispatch verification.
+//
+// LAPIC / PREEMPTION UNCHANGED
+//
+// κ-03 explicitly excludes LAPIC-timer or preemption modifications
+// (per the wave brief). The 100 Hz tick and SCHED_BUDGET_DEFAULT-driven
+// preempt path from #566 continue to fire against the CB doubly-linked
+// runqueue exactly as before this landing.
+//
+// FIELD OFFSETS BORROWED FROM runqueue.pdx
+//
+// The per-task next/prev pointers at TCB +432 (runq_next) and +440
+// (runq_prev) are shared with the CB doubly-linked runqueue — a task
+// that is on the MLFQ path is NOT simultaneously on the CB list, so
+// the linkage slots are single-owner at any instant. A task can only
+// belong to one runqueue-shape at a time; the transition (if any) is
+// the follow-up scheduler swap noted above.
+//
+// Audit: design/kernel/wave-kappa-scheduling.md §κ-03.
+
+module Mlfq = structure {
+  // ==========================================================================
+  // Local constants — duplicated per the file-local-let discipline this
+  // tree uses when a parent-module `pub let` collision would occur.
+  // ==========================================================================
+
+  let MLFQ_MAX_CPUS   : u64 = 4
+  let MLFQ_NUM_CLASSES : u64 = 3
+
+  // TCB byte-offsets. Canonical source: sched/runqueue.pdx +432/+440.
+  let MLFQ_TASK_OFF_NEXT : u64 = 432
+  let MLFQ_TASK_OFF_PREV : u64 = 440
+
+  // Field offset for priority class. Canonical source:
+  // sched/priority_class.pdx +488.
+  let MLFQ_TASK_OFF_PRIO : u64 = 488
+
+  // ==========================================================================
+  // Per-CPU MLFQ storage — one head/tail pair per (cpu, class).
+  //
+  // Indexing: slot = cpu_idx * MLFQ_NUM_CLASSES + class
+  //           = cpu_idx * 3 + class, class in [0, 2]
+  //
+  // Empty invariant: head[slot] == tail[slot] == 0.
+  //
+  // Size: 4 * 3 = 12 u64 entries per array; 96 bytes each; 192 bytes
+  // total. Two separate arrays (rather than an interleaved [head,tail]
+  // struct array) so pick can prefetch a cache line of heads without
+  // pulling in tail slots it does not read on the pick-fast path.
+  // ==========================================================================
+
+  pub let mut _mlfq_heads : [u64; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  pub let mut _mlfq_tails : [u64; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+  // ==========================================================================
+  // mlfq_slot_index(cpu_idx, class) -> u64
+  //
+  // Returns cpu_idx * 3 + class. NOT bounds-checked (the callers below
+  // pre-validate cpu_idx < MLFQ_MAX_CPUS and class < MLFQ_NUM_CLASSES).
+  // Inlined as a helper so the *3 lands in one place — if the arithmetic
+  // ever needs to be shl-by-2 (4-queue variant) or shl-by-log2, only
+  // this helper moves.
+  //
+  // Leaf, no callee-save touched, no stack use.
+  // ==========================================================================
+  let mlfq_slot_index : (u64, u64) -> u64 !{} @{} =
+    fn (cpu_idx: u64, class: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "Wave κ (κ-03): compute cpu_idx*3+class. rdi=cpu_idx, rsi=class. Uses lea rax, [rdi + rdi*2] for the *3 (well-known lea-scale-3 trick, avoids the 2-op `imul r,imm` encoder pitfall — see project MEMORY reference to pdx encoder pitfalls). add rax, rsi lands the final offset. Leaf, no callee-save touched. Labels: none.",
+      block: {
+        lea rax, [rdi + rdi*2];                // rax = cpu_idx * 3
+        add rax, rsi;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // runqueue_enqueue(cpu_idx, task) — O(1) tail insertion into the MLFQ
+  // queue selected by task.priority_class on CPU cpu_idx.
+  //
+  // Reads task.priority_class from TCB+488 to decide which of the three
+  // per-CPU queues this task joins. Bounds-clamps class to [0, 2] with
+  // an out-of-range value routed to queue[0] (INTERACTIVE) as a fail-safe
+  // — a corrupted TCB should still be scheduled somewhere, not lost.
+  //
+  // Preserves the existing sched/runqueue.pdx doubly-linked-list shape:
+  //   Head -> T0 <-> T1 <-> ... <-> Tn <- Tail
+  //   T0.prev == 0 (head marker); Tn.next == 0 (tail marker).
+  //
+  // Register discipline: 3-push callee-save prologue (rbx=task, r12=slot
+  // offset in bytes, r13=head/tail base VA for the slot). Entry rsp%16==8,
+  // 3 pushes -> 0 (no nested calls in this function, but the alignment
+  // keeps every future addition trivially compliant).
+  //
+  // Effects {mem}: TCB and head/tail array writes. No capabilities: this
+  // is a data-structure primitive; the scheduler-mutating (@{sched})
+  // caller is a level up in the future MLFQ pick chain.
+  // ==========================================================================
+  pub let runqueue_enqueue : (u64, u64) -> () !{mem} @{sched} =
+    fn (cpu_idx: u64, task: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {sched},
+      justification: "Wave κ (κ-03): MLFQ tail insertion. rdi=cpu_idx, rsi=task. (1) 3-push callee-save prologue (rbx/r12/r13). (2) rbx=task. (3) rcx = task.priority_class (mov rcx, [rsi+488]); if rcx>=3, clamp to 0 (fail-safe against a corrupted TCB — an out-of-range class still gets scheduled at INTERACTIVE rather than being lost). (4) rax = mlfq_slot_index(cpu_idx, class) via imul-add — since mlfq_slot_index is a leaf we inline the imul/add here rather than pay the call/ret cost. slot = cpu_idx*3+class; r12 = slot*8 (byte offset into u64 array). (5) Load current tail from _mlfq_tails[slot] into rdx. Set task.next = 0 (xor rcx,rcx; mov [rbx+432], rcx) and task.prev = rdx (mov [rbx+440], rdx). (6) If tail was 0 (empty queue): _mlfq_heads[slot] = task; else old_tail.next = task. (7) _mlfq_tails[slot] = task. Preserves the doubly-linked invariant runq_enqueue/runq_dequeue rely on: head-marker (T0.prev==0), tail-marker (Tn.next==0). Register discipline: rbx=task (callee-save, live end-to-end), r12=slot*8 byte offset (callee-save, live from (4) through (7)), r13=lea base VA of heads or tails array (callee-save, reused). rax/rcx/rdx caller-save scratch. No nested calls -- pure straight-line data-structure code. Alignment: entry rsp%16==8, 3 pushes -> 0. Effects {mem}: TCB writes and array writes. Capability {sched}: mutates a scheduler runqueue. Labels prefixed mqe_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rsi;                          // rbx = task
+
+        // (3) Read priority class; clamp >=3 to 0 (fail-safe).
+        mov rcx, [rsi + 488];                  // rcx = task.priority_class
+        cmp rcx, 3;
+        jb  mqe_class_ok;
+        xor rcx, rcx;                          // clamp to INTERACTIVE
+      mqe_class_ok:
+
+        // (4) slot = cpu_idx*3 + class; byte offset = slot*8.
+        // Use lea-scale-3 rather than `imul rax, 3` (encoder pitfall:
+        // no 2-op `imul r,imm`).
+        lea rax, [rdi + rdi*2];                // rax = cpu_idx * 3
+        add rax, rcx;
+        mov r12, rax;
+        shl r12, 3;                            // r12 = slot*8 (u64 stride)
+
+        // (5) Tail load + task.next/prev writes.
+        lea r13, [rip + _mlfq_tails];
+        mov rdx, [r13 + r12];                  // rdx = old tail (may be 0)
+
+        xor rcx, rcx;
+        mov [rbx + 432], rcx;                  // task.next = 0
+        mov [rbx + 440], rdx;                  // task.prev = old tail
+
+        // (6) If empty, head[slot]=task; else old_tail.next=task.
+        cmp rdx, 0;
+        je  mqe_empty;
+          mov [rdx + 432], rbx;                // old_tail.next = task
+          jmp mqe_publish_tail;
+      mqe_empty:
+          lea r13, [rip + _mlfq_heads];
+          mov [r13 + r12], rbx;                // _mlfq_heads[slot] = task
+      mqe_publish_tail:
+
+        // (7) _mlfq_tails[slot] = task.
+        lea r13, [rip + _mlfq_tails];
+        mov [r13 + r12], rbx;
+
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // runqueue_pick_next(cpu_idx) -> u64  (task VA, or 0 if all three
+  // classes are empty on this CPU).
+  //
+  // Scans queue[0] (INTERACTIVE) first, then queue[1] (BATCH), then
+  // queue[2] (IDLE). Within a queue, round-robin: the picked task IS the
+  // head, and it is rotated to the tail so the next pick lands on the
+  // successor. Single-element queue is a no-op rotation (head==tail,
+  // picked returned unchanged, no next/prev churn).
+  //
+  // Register discipline: 3-push callee-save prologue (rbx=cpu_idx, r12=class
+  // scan cursor, r13=slot byte offset). Entry rsp%16==8, 3 pushes -> 0.
+  //
+  // Effects {mem}: head/tail array reads + rotation writes. No sysreg
+  // (no rdmsr — the CPU index is passed in rather than resolved from
+  // GS_BASE, mirroring the sched_try_steal remote-runqueue idiom).
+  // Capability {sched}: mutates a scheduler runqueue.
+  // ==========================================================================
+  pub let runqueue_pick_next : (u64) -> u64 !{mem} @{sched} =
+    fn (cpu_idx: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {sched},
+      justification: "Wave κ (κ-03): MLFQ pick-next. rdi=cpu_idx. 3-push callee-save prologue (rbx=cpu_idx, r12=class cursor 0..2, r13=slot byte offset). Entry rsp%16==8, 3 pushes -> 0 (no nested calls; alignment is defensive). Scan queue[0]/queue[1]/queue[2] head; first non-empty wins. For the winning slot: rax=head; new_head=head.next. If new_head!=0 (multi-element): head.next=0, head.prev=old_tail, old_tail.next=head, _mlfq_tails[slot]=head, new_head.prev=0, _mlfq_heads[slot]=new_head — same rotation algorithm as sched_pick_next_r15's multi-element branch (pick_next.pdx L254-263). If new_head==0 (single element): no rotation, return head as-is. All three queues empty -> rax=0 (caller's responsibility to route to idle). Register discipline: rbx=cpu_idx (callee-save, live for slot computation), r12=class cursor (callee-save, dead after loop), r13=slot byte offset (callee-save, live from slot resolution through rotation writes). rax/rcx/rdx/r8 caller-save scratch. Effects {mem}: array reads and rotation writes. Capability {sched}: mutates a runqueue. Labels prefixed mqp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                          // rbx = cpu_idx
+        xor r12, r12;                          // r12 = class = 0
+
+      mqp_class_loop:
+        cmp r12, 3;                            // MLFQ_NUM_CLASSES
+        jae mqp_empty;
+
+        // slot = cpu_idx*3 + class; r13 = slot*8.
+        // Uses lea-scale-3 (see runqueue_enqueue's own note on the
+        // 2-op `imul r,imm` encoder pitfall).
+        lea rax, [rbx + rbx*2];                // rax = cpu_idx * 3
+        add rax, r12;
+        mov r13, rax;
+        shl r13, 3;
+
+        // rax = _mlfq_heads[slot].
+        lea rcx, [rip + _mlfq_heads];
+        mov rax, [rcx + r13];
+        cmp rax, 0;
+        jne mqp_hit;
+
+        // empty at this class -> next class.
+        add r12, 1;
+        jmp mqp_class_loop;
+
+      mqp_hit:
+        // rax = picked = head. rdx = head.next (may be 0).
+        mov rdx, [rax + 432];
+        cmp rdx, 0;
+        je  mqp_return;                        // single element: no rotate
+
+        // Multi-element rotation (head -> tail):
+        //   new_head = rdx;
+        //   old_tail = _mlfq_tails[slot];
+        //   head.next = 0; head.prev = old_tail;
+        //   old_tail.next = head; _mlfq_tails[slot] = head;
+        //   new_head.prev = 0; _mlfq_heads[slot] = new_head.
+        lea rcx, [rip + _mlfq_tails];
+        mov r8, [rcx + r13];                   // r8 = old_tail
+
+        xor rcx, rcx;
+        mov [rax + 432], rcx;                  // head.next = 0
+        mov [rax + 440], r8;                   // head.prev = old_tail
+        mov [r8 + 432], rax;                   // old_tail.next = head
+        lea rcx, [rip + _mlfq_tails];
+        mov [rcx + r13], rax;                  // _mlfq_tails[slot] = head
+
+        xor rcx, rcx;
+        mov [rdx + 440], rcx;                  // new_head.prev = 0
+        lea rcx, [rip + _mlfq_heads];
+        mov [rcx + r13], rdx;                  // _mlfq_heads[slot] = new_head
+
+      mqp_return:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      mqp_empty:
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // runqueue_pick(cpu_idx) -> u64  (compat shim; dispatches to
+  // runqueue_pick_next).
+  //
+  // Kept as its own symbol so a future single-queue caller that was
+  // written against the pre-κ-03 name binds through this shim rather
+  // than being rewritten in every call site. Not called by the tree
+  // today (the pre-κ-03 pick was sched_pick_next_r15, not runqueue_pick).
+  //
+  // Leaf, no state of its own, no callee-save touched.
+  // ==========================================================================
+  pub let runqueue_pick : (u64) -> u64 !{mem} @{sched} =
+    fn (cpu_idx: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {sched},
+      justification: "Wave κ (κ-03): compat shim -> runqueue_pick_next. Bare tail-shape call+ret (rdi already carries cpu_idx as the callee's arg0). Entry rsp%16==8; sub rsp,8 pad brings %16==0 for the nested call; add rsp,8 restores. Same shape as every other single-callee shim in this tree (sys_sched_wait_ns_body's own tail-shape into sched_wait_ns). Effects/capabilities propagate verbatim from the callee.",
+      block: {
+        sub rsp, 8;
+        call runqueue_pick_next;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mlfq_witness(cpu_idx) -> u64
+  //
+  // Dormant self-test: enqueues 3 tasks (one per class) to cpu_idx's
+  // MLFQ, then picks and asserts the INTERACTIVE task fires first.
+  // Returns 0 on match, 1 on mismatch.
+  //
+  // No boot wire-in yet (see priority_class.pdx witness note on the
+  // #1578 fingerprint-coverage gate — same posture here for the semantic
+  // R_KAPPA_MLFQ_OK marker).
+  //
+  // Uses three .bss witness slabs (56 u64s each, matching the runqueue
+  // witness sizing from sched/runqueue.pdx L65-69) rather than the real
+  // _task_pool so the witness is self-contained and never touches a
+  // production TCB slot.
+  //
+  // Register discipline: 2-push callee-save prologue (rbx=cpu_idx,
+  // r12=picked). Entry rsp%16==8, 2 pushes -> 8 -> +sub 8 -> 0 for the
+  // three nested runqueue_enqueue calls and the one runqueue_pick_next.
+  // ==========================================================================
+
+  pub let mut _mlfq_witness_task_i : [u64; 62] = uninit @align(8)
+  pub let mut _mlfq_witness_task_b : [u64; 62] = uninit @align(8)
+  pub let mut _mlfq_witness_task_d : [u64; 62] = uninit @align(8)
+
+  pub let mlfq_witness : (u64) -> u64 !{mem} @{sched} =
+    fn (cpu_idx: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {sched},
+      justification: "Wave κ (κ-03) dormant self-test. Populates three synthetic task slabs with distinct priority_class values (I=0, B=1, D=2) at +488, enqueues them to cpu_idx's MLFQ (INTERACTIVE first — verifies within-class order doesn't leak class ordering), then picks and asserts the INTERACTIVE task is returned. Returns 0 (R_KAPPA_MLFQ_OK semantic) on match, 1 on mismatch. Uses three pub-let 496-byte .bss slabs (62 u64s each -- covers +488 priority_class slot and the +432/+440 linkage slots plus enough headroom for future field additions without a slab resize) rather than real _task_pool entries. 2-push callee-save prologue (rbx=cpu_idx, r12=picked); entry rsp%16==8, 2 pushes -> 8; every nested call brackets with sub rsp,8 / add rsp,8 for the SysV %16==0 requirement (matches sys_sched_wait_ns_body's own single-call bracket idiom). No fingerprint emit (see priority_class witness note re #1578). Labels prefixed mqw_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                          // rbx = cpu_idx
+
+        // Populate slabs: write priority_class at +488.
+        lea rax, [rip + _mlfq_witness_task_i];
+        xor rcx, rcx;                          // INTERACTIVE = 0
+        mov [rax + 488], rcx;
+
+        lea rax, [rip + _mlfq_witness_task_b];
+        mov rcx, 1;                            // BATCH
+        mov [rax + 488], rcx;
+
+        lea rax, [rip + _mlfq_witness_task_d];
+        mov rcx, 2;                            // IDLE
+        mov [rax + 488], rcx;
+
+        // Enqueue in reverse (IDLE, BATCH, INTERACTIVE) to ensure the
+        // pick order is class-driven rather than insertion-driven.
+        mov rdi, rbx;
+        lea rsi, [rip + _mlfq_witness_task_d];
+        sub rsp, 8;
+        call runqueue_enqueue;
+        add rsp, 8;
+
+        mov rdi, rbx;
+        lea rsi, [rip + _mlfq_witness_task_b];
+        sub rsp, 8;
+        call runqueue_enqueue;
+        add rsp, 8;
+
+        mov rdi, rbx;
+        lea rsi, [rip + _mlfq_witness_task_i];
+        sub rsp, 8;
+        call runqueue_enqueue;
+        add rsp, 8;
+
+        // Pick — must return the INTERACTIVE task.
+        mov rdi, rbx;
+        sub rsp, 8;
+        call runqueue_pick_next;
+        add rsp, 8;
+        mov r12, rax;
+
+        lea rax, [rip + _mlfq_witness_task_i];
+        cmp r12, rax;
+        jne mqw_mismatch;
+
+        xor rax, rax;                          // R_KAPPA_MLFQ_OK
+        pop r12;
+        pop rbx;
+        ret;
+
+      mqw_mismatch:
+        mov rax, 1;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

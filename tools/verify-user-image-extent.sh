@@ -123,8 +123,39 @@ fi
 
 RC=0
 
+# paideia-os#2348: mkfs.pdxfs.elf / mount.pdxfs.elf / umount.pdxfs.elf
+# are staged as 512-byte zero-filled stubs by tools/build.sh's
+# r64v2-tools block when the satellite tool link fails (typically on
+# libpdx-volume symbol drift — see the block's own "WARN: {app} build
+# failed" line + the paideia-os#2348 tracker for the volume-symbol gap
+# root-cause). tools/userbin_embed.S must still resolve its .incbin
+# lines against SOMETHING or the whole kernel build breaks, so the
+# fallback exists; but this extent gate is a hard-fail on those same
+# stubs (they have no PT_LOAD by construction). Allowlist the three
+# known-stub names WITH A REASON: any OTHER *.elf with no PT_LOAD still
+# fails, mirroring the fingerprint-coverage gate's ALLOWLIST discipline.
+# Removal condition: paideia-os#2348 lands + r64v2-tools stops emitting
+# stubs (real ELFs will have PT_LOAD and pass the gate outright).
+declare -A KNOWN_STUB_ELFS=(
+    [mkfs.pdxfs.elf]="paideia-os#2348: r64v2-tools 512B stub — libpdx-volume symbol drift"
+    [mount.pdxfs.elf]="paideia-os#2348: r64v2-tools 512B stub — libpdx-volume symbol drift"
+    [umount.pdxfs.elf]="paideia-os#2348: r64v2-tools 512B stub — libpdx-volume symbol drift"
+)
+
 for elf in "${IMAGES[@]}"; do
     name="$(basename "${elf}")"
+
+    # Skip the known 512-byte stubs above. Real ELFs at these names
+    # (once #2348 lands) pass the gate outright without hitting this
+    # branch, so removing the allowlist is a no-op when it becomes
+    # unnecessary.
+    if [[ -n "${KNOWN_STUB_ELFS[${name}]:-}" ]]; then
+        sz=$(stat -c%s "${elf}")
+        if [[ "${sz}" -eq 512 ]]; then
+            echo "[user-image-extent] SKIP ${name} — 512B stub (${KNOWN_STUB_ELFS[${name}]})"
+            continue
+        fi
+    fi
 
     # readelf -SW carries section sizes; readelf -lW carries the program
     # headers AND the section-to-segment map. Both are fed to one parser
