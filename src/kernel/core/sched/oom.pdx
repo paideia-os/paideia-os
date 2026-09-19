@@ -1,0 +1,213 @@
+// src/kernel/core/sched/oom.pdx — Wave τ (τ-04 / τ-05)
+//
+// Out-of-memory response: transition the current task to ZOMBIE with a
+// distinctive exit_status sentinel, emit an "OOM KILL PID=NN" wire
+// fingerprint (for the boot smoke and post-mortem grep), and yield the
+// CPU to another runnable task via runq_dequeue + sched_pick_next_r15 +
+// sched_switch_r15.  Called from phys_alloc's exhaustion arm on
+// allocation failure originating in a user-task context; the kernel-
+// self exhaustion case (current_tcb == NULL, or a synthetic witness
+// TCB owning the caller) short-circuits without a kill.
+//
+// KILL vs REFUSE
+//
+// The alternative to a kill would be to return the OOM up the call
+// chain and let each syscall body surface -ENOMEM.  That threading
+// would require every phys_alloc caller in the tree to grow an OOM
+// branch (mm/aspace_map, mm/aspace_create, every fork/execve path,
+// tmpfs_write, ...), most of which have no natural refusal shape --
+// aspace_create half-way through a PML4 build cannot cleanly unwind
+// its partial state without a separate rollback pass that itself may
+// need memory.  A kill is the honest response to "the OS has run out
+// of pages": the process asking for the page cannot continue, and the
+// OS records why in the fingerprint stream before letting another task
+// run.
+//
+// The alternative to a HARD kill (SIGSEGV-shape) would be a per-task
+// OOM-handler notification the caller could catch and free memory
+// from.  POSIX offers no such surface; Linux's OOM killer is
+// substantially the same "pick a victim, transition to ZOMBIE, emit
+// audit record" shape this file implements, minus the victim-selection
+// heuristics (Linux's `oom_score` is out of scope for τ-04 -- the
+// caller of phys_alloc is trivially the victim under our
+// synchronous-fault model, and a future asynchronous OOM daemon can
+// add scoring on top of this substrate).
+//
+// TRUST-ANCHOR SEMANTIC PIPE (τ-05, scaffold)
+//
+// The task also asks for an OOM_REASON record on the audit anchor via
+// sys_semantic_send (sysno 115).  A syscall body cannot be invoked
+// from KERNEL context (semantic_send's contract copies from user VA
+// via user_read_bytes_via_walk under kernel CR3), so a direct
+// sys_semantic_send call from oom_kill_current would fault.  The
+// intended wire format lives at design/audit/oom-reason-record.md as a
+// scaffold; the actual anchor emission is deferred to a follow-up
+// wave that either (a) exposes a kernel-facing semantic_pipe_emit
+// primitive that bypasses user_read, or (b) delays the OOM emit until
+// the next tick when a housekeeping task can run the syscall on our
+// behalf from ring-3.  τ-04's wire fingerprint on the UART is the
+// interim substitute; grep-driven post-mortem tools consume it.
+//
+// EXIT_STATUS SENTINEL
+//
+// exit_status is a u32 field at TASK_OFF_EXIT_STATUS (+12); a full
+// 0xFFFFFFFFDEAD0001 (per the task brief) truncates to its low 32 bits
+// = 0xDEAD0001, which is what actually lives in the slab.  Consumers
+// that need to distinguish "normal exit code" from "OOM kill" grep for
+// this sentinel in the sys_wait4 return path -- the value is chosen
+// clear of the [0..255] range POSIX WEXITSTATUS carves out, so no
+// legitimate user exit can collide with it.
+//
+// FINGERPRINT
+//
+// "OOM KILL PID=NN\n" where NN is the pid rendered as two hex chars
+// (pids 1..63 all fit in two nibbles at task_pool.pdx MAX_PIDS = 64).
+// No "OK" substring -- so the #1578 fingerprint-coverage gate does not
+// require an ALLOWLIST entry.  Deliberately terse: the OOM path is
+// hostile territory (memory pressure), and a rich wire message risks
+// the emit itself allocating.
+//
+// Audit: design/kernel/wave-tau-resource-accounting.md §τ-04.
+
+module Oom = structure {
+  // ==========================================================================
+  // Fingerprint strings.  Terminated with a NUL byte because uart_puts
+  // walks bytes until it finds one (see boot/uart.pdx §uart_puts).
+  //
+  // The exact ASCII shape "OOM KILL PID=" is grep-anchored by the
+  // future smoke script; a rename here needs a matching update to the
+  // grep pattern.  Two hex chars + '\n' + '\0' close the record.
+  // ==========================================================================
+  pub let msg_oom_kill_prefix : [u8; 14] = "OOM KILL PID=\0"
+  pub let msg_oom_kill_suffix : [u8; 2]  = "\n\0"
+
+  // ==========================================================================
+  // Exit-status sentinel for OOM-killed tasks.  Only the low 32 bits
+  // survive the u32 store into exit_status @ +12.
+  // ==========================================================================
+  pub let OOM_EXIT_STATUS_LO32 : u64 = 0xDEAD0001
+
+  // ==========================================================================
+  // ZOMBIE state literal, copied from sys_exit.pdx §STATE_ZOMBIE to
+  // avoid a cross-module import for a single constant.  Move to a
+  // shared header if a third file grows a copy.
+  // ==========================================================================
+  pub let OOM_STATE_ZOMBIE : u32 = 3
+
+  // ==========================================================================
+  // oom_kill_current() -> ()
+  //
+  // Transition the current task to ZOMBIE with the OOM sentinel exit
+  // status, emit the fingerprint, dequeue from the runqueue, pick the
+  // next runnable task and switch to it.  DOES NOT RETURN when a live
+  // user task is current -- sched_switch_r15 is the terminal call.
+  //
+  // If _current_tcb is NULL (early boot before init publishes it) or
+  // if the current task is a kernel-only synthetic TCB (pid outside
+  // [1, MAX_PIDS-1]), the call returns without touching state -- the
+  // KERNEL cannot be OOM-killed, and phys_alloc's exhaustion path
+  // that reaches us in that case just falls through to its own
+  // pre-existing "return 0" arm.
+  //
+  // Register discipline: 1-push callee-save prologue (rbx = current
+  // TCB, live across every nested call).  Entry rsp %16 == 8; one
+  // push -> rsp %16 == 0, which SysV requires at each nested call
+  // boundary; no additional sub rsp,8 pad needed for the plain
+  // 0-arg / 1-arg calls in this sequence.
+  //
+  // Effects: {mem, sysreg} -- mem for the TCB stores + runq mutation,
+  // sysreg because uart_puts writes COM1 IO and sched_switch_r15
+  // writes CR3 / TSS.RSP0.
+  // Capabilities: {cap, sched} -- cap because a future extension may
+  // call driver_death_notify here (matching sys_exit_body step 2.6);
+  // sched because runq_dequeue + sched_switch_r15 both require it.
+  // ==========================================================================
+  pub let oom_kill_current : () -> () !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap, sched},
+      justification: "Wave τ (τ-04): OOM response for the currently-running task. Sequence: (1) rax = _current_tcb; short-circuit if NULL (pre-scheduler-init caller or a genuine kernel-context OOM) -- returns without side effects, and the phys_alloc arm that called us takes its own pre-existing 'return 0' path. (2) 1-push callee-save prologue: push rbx; rbx = current TCB. Entry rsp %16 == 8, one push -> 0, which is what SysV requires at each nested call site. (3) Extract pid via mov ecx, [rbx+0] (TASK_OFF_PID, u32 zero-ext); if pid == 0 or pid >= 64 (idle / synthetic witness TCB), pop rbx and return -- see file header. (4) current->state = STATE_ZOMBIE (3). u32 store at TASK_OFF_STATE=+8. (5) current->exit_status = 0xDEAD0001. u32 store at TASK_OFF_EXIT_STATUS=+12 via mov r11, imm; mov [rbx+12], r11d -- see file header for why the full 64-bit sentinel truncates. (6) Emit fingerprint 'OOM KILL PID=': lea rdi, [rip+msg_oom_kill_prefix]; call uart_puts. (7) Emit pid as two hex chars via the standard high-nibble-then-low-nibble pattern (ap_entry.pdx precedent lines 152-177). r12 (callee-save, additional push here) holds pid across the two uart_putc calls; we widen the prologue to two pushes to keep pid live -- entry %16 == 8 + 2 pushes = %16 == 8 again after the second push, so we need a sub rsp,8 pad before uart_putc (which is a nested call). Actually simpler: use rbx already, and load pid into rax freshly for each nibble from rbx via mov ecx, [rbx+0] -- the TCB slab is invariant across our sequence so a re-load is cheap. Adopting that shape and staying at 1-push. (8) Emit suffix '\\n'. (9) runq_dequeue(current) -- takes current TCB in rdi. (10) sched_pick_next_r15() -> rax = next TCB. (11) sched_switch_r15(next) -- terminal, does not return; the pop rbx below is a defensive unreachable that a scheduler bug would fall through to. Effects/capability widening per file header. Fingerprint does NOT contain 'OK' so no #1578 ALLOWLIST needed. Labels prefixed oom_.",
+      block: {
+        // (1) Guard: NULL _current_tcb -> return silently.
+        mov rax, [rip + _current_tcb];
+        cmp rax, 0;
+        je  oom_return;
+
+        // (2) Prologue.
+        push rbx;
+        mov rbx, rax;                          // rbx = current TCB
+
+        // (3) pid gate: 0 or >= 64 means kernel-only synthetic TCB.
+        mov ecx, [rbx + 0];                    // pid (u32 zero-ext into rcx)
+        cmp rcx, 0;
+        je  oom_epilogue;
+        cmp rcx, 64;
+        jae oom_epilogue;
+
+        // (4) current->state = STATE_ZOMBIE.
+        mov rax, 3;                            // STATE_ZOMBIE literal (matches sys_exit.pdx)
+        mov [rbx + 8], eax;                    // TASK_OFF_STATE @ +8 (u32)
+
+        // (5) current->exit_status = 0xDEAD0001 (low 32 of the u64 sentinel).
+        mov r11, 0xDEAD0001;
+        mov [rbx + 12], r11d;                  // TASK_OFF_EXIT_STATUS @ +12 (u32)
+
+        // (6) uart_puts("OOM KILL PID=").
+        lea rdi, [rip + msg_oom_kill_prefix];
+        call uart_puts;
+
+        // (7a) Emit high nibble of pid.
+        mov ecx, [rbx + 0];                    // fresh pid load
+        mov rax, rcx;
+        shr rax, 4;
+        and rax, 0x0f;
+        cmp rax, 10;
+        jb  oom_hi_digit;
+        add rax, 0x57;                         // 'a'..'f'
+        jmp oom_hi_emit;
+      oom_hi_digit:
+        add rax, 0x30;                         // '0'..'9'
+      oom_hi_emit:
+        mov rdi, rax;
+        call uart_putc;
+
+        // (7b) Emit low nibble of pid.
+        mov ecx, [rbx + 0];                    // fresh pid load
+        mov rax, rcx;
+        and rax, 0x0f;
+        cmp rax, 10;
+        jb  oom_lo_digit;
+        add rax, 0x57;
+        jmp oom_lo_emit;
+      oom_lo_digit:
+        add rax, 0x30;
+      oom_lo_emit:
+        mov rdi, rax;
+        call uart_putc;
+
+        // (8) uart_puts("\n").
+        lea rdi, [rip + msg_oom_kill_suffix];
+        call uart_puts;
+
+        // (9) runq_dequeue(current).
+        mov rdi, rbx;                          // arg = current TCB
+        call runq_dequeue;
+
+        // (10) sched_pick_next_r15() -> rax = next TCB.
+        call sched_pick_next_r15;
+
+        // (11) sched_switch_r15(next) -- TERMINAL, does not return.
+        mov rdi, rax;
+        call sched_switch_r15;
+
+        // Defensive unreachable: sched_switch_r15 to a live next task
+        // does not resume the ZOMBIE we just marked.  If it does, the
+        // scheduler has a bug, and we take the same clean return path
+        // that a bounds-refused kill would take.
+      oom_epilogue:
+        pop rbx;
+      oom_return:
+        ret
+      }
+    }
+}
