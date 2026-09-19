@@ -1,10 +1,14 @@
 # Compositor QEMU boot-smoke plan (Wave SSS)
 
-**Status:** DESIGN + PREREQUISITE SCOPING ONLY. Nothing under
-`tools/boot/compositor-smokes/` is runnable today. Each `.sh` in that
-directory is a stub that documents intent and exits 77 (skip). Do not
-wire any of these into `tools/run-smoke.sh`'s `MODE` dispatcher until
-the prerequisite gaps in §3 close for that fixture.
+**Status:** DESIGN + PREREQUISITE SCOPING for COMP-QM-02..05. **COMP-QM-01
+is LANDED** (Wave β β-01/β-02, closing G5 -- see
+`design/testing/compositor-e2e-plan.md` §3 Stage 1): `boot_r113_
+compositor.sh` now boots QEMU for real and asserts "COMP INIT OK" on
+the wire, emitted by `src/user/compositor/selftest.pdx` via init's
+compositor-selftest fork+exec+wait4 cycle. COMP-QM-02..05 remain
+design-stage stubs (exit 77) pending G1-G4/G6-G8 below. Do not wire the
+remaining stubs into `tools/run-smoke.sh`'s `MODE` dispatcher until
+their prerequisite gaps in §3 close.
 
 **Scope:** five candidate boot-smoke fixtures (COMP-QM-01..05) that
 would exercise the compositor stack end-to-end once it exists. This
@@ -63,7 +67,7 @@ wired for real, pick one:
 | `src/user/postui-desktop/entry.pdx` | Exists, 115 lines, explicitly marked "LIFECYCLE-SKELETON SCOPE... not yet a linked, spawned process" — `tools/build-user.sh` has an active exclusion branch for `postui-desktop/*`. Compiles/type-checks; init does not fork+execve it. |
 | `KIND_SURFACE` kernel substrate | Real, code-complete (R113.M1). Mint/destroy/dispatch wired. No userspace-reachable mint syscall confirmed for a ring-3 daemon to use on client connect (G7). |
 | `KIND_SCANOUT_LEASE` | Real (G2.M1, 1233 lines), a different authority (direct-scanout plane lease) than the R102 `KIND_FB_SCANOUT` stub the brief's name evokes. |
-| `tools/run-qemu.sh` | No compositor bring-up path at all — no `COMPOSITOR_INIT_ENABLE`, no userspace-daemon spawn sequencing knob. Confirmed by `grep -i compositor tools/run-qemu.sh` (zero hits). |
+| `tools/run-qemu.sh` | Wave β β-01: accepts `COMPOSITOR_INIT=<0\|1>`, composing a reserved (not yet guest-consumed) `-fw_cfg` entry. The compositor-module self-check itself runs unconditionally at init (no daemon dependency), so G5 is closed without this flag gating any live behavior yet -- see that flag's own composition-site comment in the script. |
 | Fingerprints named in this wave (`COMP INIT OK`, `SVC-COMP READY host_id=<n>`, `SVC-WM REGISTER OK`, `PU-DT UP status_bar=OK terminal=OK`, `COMPOSITOR E2E OK client=1 surface=1 frames>=60`) | None exist in source today. `SVC-WM REGISTER OK` collides in spirit (not string-identical) with R102's already-specced `SVC-WM REGISTER OK` fingerprint in `r102-user-plan.md` — reconcile against that doc rather than mint a second, divergent contract (see G6). |
 
 **Net:** everything above kernel-substrate level (R113.M1) is
@@ -108,7 +112,7 @@ differ.
 | G2 | `svc-compositor` daemon has zero source. Needs: repo-or-module scaffold, `main`/entry, `svc_broker` registration, an init-handoff spawn wire. | COMP-QM-02..05 |
 | G3 | `svc-wm` daemon has zero source and zero design beyond the R102 issue list (no freeze doc comparable to `r113-m1-substrate.md`). | COMP-QM-03..05 |
 | G4 | `postui-desktop` has a skeleton entry point but no process-spawn wire — init never forks/execves it, and `tools/build-user.sh` explicitly excludes it from the link step. | COMP-QM-04, 05 |
-| G5 | `tools/run-qemu.sh` / `kernel_main.pdx` init sequencing has no compositor-bringup gate (`COMPOSITOR_INIT_ENABLE` or equivalent) to conditionally run compositor module init before/instead of the plain shell handoff. | COMP-QM-01..05 |
+| G5 | ~~`tools/run-qemu.sh` / `kernel_main.pdx` init sequencing has no compositor-bringup gate.~~ **CLOSED (Wave β β-01/β-02).** Init now forks+execs `/bin/compositor_selftest` unconditionally before the pre-existing shell handoff; `COMP INIT OK` is real. | ~~COMP-QM-01~~..05 |
 | G6 | Fingerprint contracts named in this wave are either unminted (§2) or collide informally with R102's pre-existing `r102-user-plan.md` fingerprint table — needs one authoritative fingerprint appendix, not two. | COMP-QM-02..05 |
 | G7 | No confirmed userspace-reachable (ring-3) syscall path to mint a `KIND_SURFACE` capability on client connect — current mint wiring is exercised kernel-internally (witness chain), not proven from a ring-3 caller via `sys_cap_mint`. | COMP-QM-02..05 |
 | G8 | No reference demo client exists that would speak whatever wire protocol wins G1 (needed for COMP-QM-05's "one demo client" leg). | COMP-QM-05 |
@@ -144,7 +148,7 @@ attempt to parallelize SSS-02..05 ahead of their listed dependencies.
 
 | ID | Fixture | Fingerprint (coverage-gate-compliant) | Runnable? |
 |---|---|---|---|
-| COMP-QM-01 | `tools/boot/compositor-smokes/boot_r113_compositor.sh` | `COMP INIT OK` | No — blocked on G5 |
+| COMP-QM-01 | `tools/boot/compositor-smokes/boot_r113_compositor.sh` | `COMP INIT OK` | **Yes (Wave β β-01/β-02)** |
 | COMP-QM-02 | `tools/boot/compositor-smokes/boot_svc_compositor.sh` | `SVC-COMP READY OK host_id=0` | No — blocked on G1, G2, G7 |
 | COMP-QM-03 | `tools/boot/compositor-smokes/boot_svc_wm.sh` | `SVC-WM REGISTER OK` | No — blocked on G1, G2, G3, G7 |
 | COMP-QM-04 | `tools/boot/compositor-smokes/boot_postui_desktop.sh` | `PU-DT UP status_bar=OK terminal=OK` | No — blocked on G1-G4, G7 |

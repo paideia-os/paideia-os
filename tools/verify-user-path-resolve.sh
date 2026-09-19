@@ -125,8 +125,17 @@ fi
 # propagate as 141, so shell out to a no-pipefail sub-shell.
 RP_LINE=$(set +o pipefail; echo "$EC" | grep -n "call.*resolve_path" | head -1 | cut -d: -f1)
 if [[ -n "$RP_LINE" ]]; then
-    # Extract lines after resolve_path call (next ~4 instructions)
-    RESOLVE_SECTION=$(echo "$EC" | tail -n +$RP_LINE | head -5)
+    # Extract lines after resolve_path call (next ~4 instructions).
+    # Same SIGPIPE-vs-pipefail rationale as the RP_LINE assignment above:
+    # `tail -n +N | head -5` will trigger SIGPIPE against tail once head
+    # has read its 5 lines, and pipefail inherited from any caller
+    # (tools/build-user.sh sets `set -euo pipefail`, and the child bash
+    # here inherits pipefail on some invocation paths -- deterministic
+    # 141 exit when driven from build.sh's build-user.sh call, but not
+    # when this script is run standalone in a shell without pipefail).
+    # Wrap the pipe in a no-pipefail sub-shell so SIGPIPE against `tail`
+    # cannot promote to the pipeline's exit status.
+    RESOLVE_SECTION=$(set +o pipefail; echo "$EC" | tail -n +"$RP_LINE" | head -5)
     if echo "$RESOLVE_SECTION" | grep -E "mov.*rdi[[:space:]]*,.*rax|mov[[:space:]]+rdi[[:space:]]*," >/dev/null; then
         echo "[ok]   exec_child has mov rdi, rax within ~4 instructions after call resolve_path"
     else

@@ -11,6 +11,7 @@ SHELL_LINK_SCRIPT="${USER_SRC}/link.ld"
 INIT_LINK_SCRIPT="${USER_SRC}/init.ld"
 CHILD_HELLO_LINK_SCRIPT="${USER_SRC}/child_hello.ld"
 TRUE_LINK_SCRIPT="${USER_SRC}/true.ld"
+COMPOSITOR_SELFTEST_LINK_SCRIPT="${USER_SRC}/compositor_selftest.ld"
 CAT_LINK_SCRIPT="${USER_SRC}/cat.ld"
 PS_LINK_SCRIPT="${USER_SRC}/ps.ld"
 MOUNT_LINK_SCRIPT=""  # R57.M4-004 (#1800): /bin/mount userland deferred to R57+ debt (parser gap on trailing @no_frame in module w/ 4 lambdas)
@@ -45,6 +46,11 @@ fi
 
 if [[ ! -f "${TRUE_LINK_SCRIPT}" ]]; then
     echo "true linker script missing: ${TRUE_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${COMPOSITOR_SELFTEST_LINK_SCRIPT}" ]]; then
+    echo "compositor_selftest linker script missing: ${COMPOSITOR_SELFTEST_LINK_SCRIPT}" >&2
     exit 1
 fi
 
@@ -160,6 +166,7 @@ SHELL_OBJECTS=()
 INIT_OBJECTS=()
 CHILD_HELLO_OBJECTS=()
 TRUE_OBJECTS=()
+COMPOSITOR_SELFTEST_OBJECTS=()
 CAT_OBJECTS=()
 PS_OBJECTS=()
 MOUNT_OBJECTS=()
@@ -193,6 +200,14 @@ while IFS= read -r -d '' pdx; do
     # (child_hello and true both inline their two syscalls to avoid pulling
     # the shim's other 10 wrappers — one .pdx file, one .elf pattern).
     if [[ "${rel}" == "init.pdx" ]]; then
+        INIT_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "init/svc_compositor_spawn.pdx" ]]; then
+        # Wave β β-04: init/svc_compositor_spawn.pdx is init-only (Init.
+        # _start calls SvcCompositorSpawn.svc_compositor_spawn_run once,
+        # right after tty0 setup). Calls back into Init.print_u64_dec and
+        # Init._init_envp (both `pub`, cross-module linker-resolved) so
+        # it needs no LIBS_OBJECTS entry of its own -- only INIT_OBJECTS
+        # grows. Mirrors rootfs_seed.pdx's classification rationale.
         INIT_OBJECTS+=("${obj}")
     elif [[ "${rel}" == "rootfs_seed.pdx" ]]; then
         # R57.M4-006 (paideia-os #1802): rootfs_seed.pdx is init-only
@@ -353,6 +368,36 @@ while IFS= read -r -d '' pdx; do
         LIBS_OBJECTS+=("${obj}")
         SHELL_OBJECTS+=("${obj}")
         INIT_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "compositor/selftest.pdx" ]]; then
+        # Wave β β-01: compositor/selftest.pdx is the compositor-module
+        # test-runner _start. Self-contained (inlines sys_write/sys_exit)
+        # but calls OUT to buffer_age_rights_valid (compositor/
+        # buffer_age.pdx, classified just below) to prove real cross-
+        # object linkage into the compositor tree, so it gets its own
+        # object set consumed by BOTH selftest.o and buffer_age.o at
+        # link time (mirrors the LS_OBJECTS + LIBC_OBJECTS pattern).
+        COMPOSITOR_SELFTEST_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "compositor/buffer_age.pdx" ]]; then
+        # Wave β β-01: buffer_age.pdx is the ONE compositor/* sibling
+        # compositor_selftest.elf calls into (buffer_age_rights_valid).
+        # Routed to COMPOSITOR_SELFTEST_OBJECTS instead of falling into
+        # the compositor/* no-op branch below -- still excluded from
+        # shell.elf/init.elf per the #2344 discipline that branch exists
+        # to enforce; this is a NEW, narrowly-scoped consumer, not a
+        # reopening of that exclusion.
+        COMPOSITOR_SELFTEST_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "compositor/damage_kind.pdx" ]]; then
+        # Wave β β-01 (post-debugger): buffer_age.o contains
+        # buffer_age_query which references damage_region_mint and
+        # damage_region_union defined in damage_kind.pdx. Since ld
+        # resolves all undefined references in linked-in .o files
+        # (they are not archived), damage_kind.o must join the link
+        # even though selftest itself does not directly call into it.
+        # damage_kind.pdx is self-contained (all its external refs
+        # resolve within damage_kind.o -- damage_kind_*, damage_region_*)
+        # so adding it does not cascade further. Same #2344 exclusion
+        # applies: not routed to shell.elf/init.elf.
+        COMPOSITOR_SELFTEST_OBJECTS+=("${obj}")
     elif [[ "${rel}" == a11y/*            ]] \
       || [[ "${rel}" == compositor/*      ]] \
       || [[ "${rel}" == color/*           ]] \
@@ -493,6 +538,24 @@ if [[ ${#TRUE_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/true.elf"
     echo "[ok] ${BUILD_DIR}/true.bin"
+fi
+
+# Link compositor_selftest.elf (Wave β β-01: compositor QEMU bring-up).
+# Consumes selftest.o + buffer_age.o only -- NOT the shell.elf/init.elf
+# link, and NOT the other 29 compositor/*.pdx objects (see the #2344
+# exclusion discipline noted at the classification sites above).
+if [[ ${#COMPOSITOR_SELFTEST_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T compositor_selftest.ld -> compositor_selftest.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${COMPOSITOR_SELFTEST_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/compositor_selftest.elf" \
+        "${COMPOSITOR_SELFTEST_OBJECTS[@]}"
+
+    echo "[objcopy-user] compositor_selftest.elf -> compositor_selftest.bin"
+    objcopy -O binary "${BUILD_DIR}/compositor_selftest.elf" "${BUILD_DIR}/compositor_selftest.bin"
+
+    echo "[ok] ${BUILD_DIR}/compositor_selftest.elf"
+    echo "[ok] ${BUILD_DIR}/compositor_selftest.bin"
 fi
 
 # Link cat.elf with cat objects only (R57.M4-002 paideia-os #1798).

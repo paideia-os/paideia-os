@@ -589,10 +589,32 @@ done < <(find "${KERNEL_SRC}" -name '*.pdx' -print0 | sort -z)
 # kernel.elf so their `pub` witness functions (e.g. tlb_shootdown_witness)
 # are callable from bring-up wire-ups. Object paths are namespaced under
 # build/tests/kernel/ to keep the build tree unambiguous.
+#
+# EXCLUSIONS:
+#   - drivers/elaborator/*  (R29-M2-002 #1024: intentional-reject fixtures)
+#   - compositor/*          (Wave π π-01 + Waves KKK-NNN: these tests
+#                            link against user-space compositor symbols
+#                            like selection_owner_replace, subsurface_
+#                            edge_new, recovery_plane_takeover_execute
+#                            from src/user/compositor/*.pdx -- none of
+#                            which the kernel links. They belong ONLY to
+#                            the --compositor-tests standalone runner
+#                            (see the block earlier in this script).
+#                            Sweeping them into kernel.elf triggered a
+#                            hard link failure that manifested as a
+#                            downstream SIGPIPE 141 through build.sh's
+#                            piped output redirection.)
+#   - postui-desktop/*      (Wave RRR: same pattern -- these tests
+#                            reference sys_cap_invoke as a bare symbol
+#                            plus other user-space postui-desktop names
+#                            not present in the kernel link.)
 TESTS_KERNEL_DIR="${REPO_ROOT}/tests/kernel"
 if [[ -d "${TESTS_KERNEL_DIR}" ]]; then
     find "${TESTS_KERNEL_DIR}" -name '*.pdx' \
-        -not -path '*/drivers/elaborator/*' -print0 \
+        -not -path '*/drivers/elaborator/*' \
+        -not -path '*/compositor/*' \
+        -not -path '*/postui-desktop/*' \
+        -print0 \
       | xargs -0 -n1 -P "${PARALLEL_JOBS}" -I{} \
             "${REPO_ROOT}/tools/compile-one.sh" "{}" "${REPO_ROOT}"
 
@@ -600,7 +622,10 @@ if [[ -d "${TESTS_KERNEL_DIR}" ]]; then
         rel="${pdx#"${REPO_ROOT}"/}"
         OBJECTS+=("${BUILD_DIR}/${rel%.pdx}.o")
     done < <(find "${TESTS_KERNEL_DIR}" -name '*.pdx' \
-                  -not -path '*/drivers/elaborator/*' -print0 | sort -z)
+                  -not -path '*/drivers/elaborator/*' \
+                  -not -path '*/compositor/*' \
+                  -not -path '*/postui-desktop/*' \
+                  -print0 | sort -z)
 fi
 
 # (old sequential tests-kernel while-loop retired by perf #3 above)

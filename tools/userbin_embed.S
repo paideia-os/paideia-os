@@ -38,6 +38,18 @@ _true_bin_start:
 .global _true_bin_end
 _true_bin_end:
 .balign 4096
+# Wave β β-01 (paideia-os compositor QEMU bring-up): compositor_selftest
+# userspace image. Kernel-only compositor-module self-check per
+# design/testing/compositor-qemu-smoke-plan.md §4 SSS-01 (COMP-QM-01) --
+# no daemon dependency, unlike the RESERVED svc-compositor/svc-wm slots
+# further down this file (those stay commented out; their ELFs still
+# do not exist -- see that block's own header for why).
+.global _compositor_selftest_bin_start
+_compositor_selftest_bin_start:
+.incbin "build/user/compositor_selftest.elf"
+.global _compositor_selftest_bin_end
+_compositor_selftest_bin_end:
+.balign 4096
 .global _echo_server_bin_start
 _echo_server_bin_start:
 .incbin "build/user/echo_server.elf"

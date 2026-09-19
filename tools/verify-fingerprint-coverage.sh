@@ -83,6 +83,32 @@ ROOT = sys.argv[1]
 # ---------------------------------------------------------------------------
 
 ALLOWLIST = {
+    # Wave β (paideia-os compositor QEMU bring-up, α–τ plan): three
+    # compositor bring-up markers that fire on every boot once
+    # src/user/init.pdx's β-01 fork+exec+wait4 cycle runs the
+    # compositor_selftest.elf and svc_compositor_spawn_run kicks off
+    # the daemon child. No smoke mode currently asserts them because
+    # β-02 (runnable boot_r113_compositor.sh with real fingerprint
+    # check) has not landed yet — it is queued as its own α-τ entry.
+    # Removing this allowlist as soon as β-02 lands is the honesty
+    # test: the gate itself will refuse to keep an entry that has
+    # since been asserted.
+    "BIN COMPOSITOR SELFTEST SEED OK":
+        "Wave β β-01: tools/boot_stub.S seeds "
+        "/bin/compositor_selftest into tmpfs at boot; fires "
+        "unconditionally via bin_seeds. Asserted golden lands with "
+        "β-02 boot_r113_compositor.sh runnable-mode conversion.",
+    "COMP INIT OK":
+        "Wave β β-01: src/user/compositor/selftest.pdx emits this on "
+        "successful compositor self-check. Reachable via init.pdx's "
+        "β-01 fork+exec+wait4 cycle. Asserted golden lands with "
+        "β-02 boot_r113_compositor.sh runnable-mode conversion.",
+    "INIT FORK COMPOSITOR OK":
+        "Wave β β-01: src/user/init.pdx emits this unconditionally "
+        "in the parent once fork returns during the compositor "
+        "self-check cycle (mirrors INIT FORK SH OK convention). "
+        "Asserted golden lands with β-02.",
+
     # -- Section A: production (src/kernel/**) markers on genuinely
     #    unreachable paths. Triaged for #1578.
 

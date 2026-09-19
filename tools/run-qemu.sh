@@ -97,6 +97,15 @@ Networking environment variables:
     #2101). The `boot_net_smoke` composite mode sets it for its child
     invocations. Setting it here has no direct effect on QEMU flags.
 
+  COMPOSITOR_INIT=<0|1>
+    Wave β β-01 (paideia-os compositor QEMU bring-up). `1` adds a
+    `-fw_cfg name=opt/paideia/compositor_init,string=1` entry, reserved
+    for a future guest-side runtime cmdline/fw_cfg parser (none exists
+    yet). The compositor-module self-check itself (src/user/compositor/
+    selftest.pdx, "COMP INIT OK" fingerprint) runs on every boot
+    unconditionally regardless of this flag -- see the flag's own
+    composition-site comment below for the full rationale. Default `0`.
+
 Full invocation catalogue (host prerequisites, SLIRP addressing, hostfwd
 examples, IPv6 non-scope note): design/networking/qemu-net-invocation.md.
 
@@ -183,6 +192,40 @@ case "${PAIDEIA_VGA:-none}" in
         ;;
 esac
 
+# Wave β β-01 (paideia-os compositor QEMU bring-up): compose an optional
+# fw_cfg entry based on COMPOSITOR_INIT. Follows the PAIDEIA_VGA pattern
+# above: default `0` keeps every existing boot's arg list byte-identical.
+#
+# Guest-side consumption of this fw_cfg entry is RESERVED, not wired
+# today -- this kernel has no runtime boot-cmdline/fw_cfg parser yet
+# (src/kernel/boot/root_select.pdx's own header documents the identical
+# gap for `root=UUID=...`, stubbed pending a future cmdline parser).
+# The actual compositor-module self-check this wave adds
+# (src/user/compositor/selftest.pdx, seeded + fork/exec'd from
+# src/user/init.pdx unconditionally) runs on EVERY boot regardless of
+# this flag -- it is cheap and has no daemon dependency per
+# design/testing/compositor-qemu-smoke-plan.md §4 SSS-01, so gating it
+# at runtime buys nothing today. COMPOSITOR_INIT=1 exists so (a) the
+# Wave β boot-smoke fixture (tools/boot/compositor-smokes/
+# boot_r113_compositor.sh) documents its intent explicitly rather than
+# relying on undocumented always-on behavior, and (b) a future runtime
+# cmdline/fw_cfg parser has a real, already-named guest-visible entry
+# (`opt/paideia/compositor_init`) to consume without a run-qemu.sh
+# change, exactly mirroring PAIDEIA_VGA=virtio's own "reserved for a
+# future consumer" precedent.
+COMPOSITOR_ARGS=()
+case "${COMPOSITOR_INIT:-0}" in
+    0)
+        ;;
+    1)
+        COMPOSITOR_ARGS=(-fw_cfg "name=opt/paideia/compositor_init,string=1")
+        ;;
+    *)
+        echo "COMPOSITOR_INIT='${COMPOSITOR_INIT}' invalid; expected 0 or 1" >&2
+        exit 2
+        ;;
+esac
+
 # PVH ELF Note emitted by paideia-as PA10-001; QEMU -kernel works directly.
 # Real bootloader integration (GRUB multiboot2 or Limine) is a Phase-12 work item.
 # R10-m2-002: QEMU TCG does not support TSC-DEADLINE. Using periodic timer mode instead.
@@ -201,4 +244,5 @@ exec qemu-system-x86_64 \
     -m 256M \
     ${NIC_ARGS[@]+"${NIC_ARGS[@]}"} \
     ${VGA_ARGS[@]+"${VGA_ARGS[@]}"} \
+    ${COMPOSITOR_ARGS[@]+"${COMPOSITOR_ARGS[@]}"} \
     "$@"

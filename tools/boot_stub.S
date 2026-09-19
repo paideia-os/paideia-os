@@ -325,6 +325,24 @@ bin_true_seed_ok_msg: .ascii "BIN TRUE SEED OK\n\0"
 .align 8
 bin_true_seed_fail_msg: .ascii "BIN TRUE SEED FAIL\n\0"
 
+# Wave β β-01 (paideia-os compositor QEMU bring-up): /bin/compositor_selftest
+# tmpfs seed strings + markers. compositor_selftest is the compositor-module
+# self-check user binary (src/user/compositor/selftest.pdx) -- calls
+# buffer_age_rights_valid then emits "COMP INIT OK\n" or "COMP INIT FAIL\n"
+# and sys_exit()s. Seeded into /bin at boot using the same vnode_cache_or_alloc
+# pattern as bin_true_seed (design/kernel/r17-m0-665-vnode-conflation-fix.md).
+.global compositor_selftest_seed_name
+.align 8
+compositor_selftest_seed_name: .ascii "compositor_selftest\0"
+
+.global bin_compositor_selftest_seed_ok_msg
+.align 8
+bin_compositor_selftest_seed_ok_msg: .ascii "BIN COMPOSITOR SELFTEST SEED OK\n\0"
+
+.global bin_compositor_selftest_seed_fail_msg
+.align 8
+bin_compositor_selftest_seed_fail_msg: .ascii "BIN COMPOSITOR SELFTEST SEED FAIL\n\0"
+
 # R48-PREP-005.M2 (design/services/svc-elevate-broker-registration.md
 # §4.M2): /bin/elevate_broker_daemon tmpfs seed strings + markers.
 # Mirrors bin_true_seed's pattern (which mirrors bin_sh_seed / D10a's
