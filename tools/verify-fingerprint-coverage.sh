@@ -108,6 +108,16 @@ ALLOWLIST = {
         "in the parent once fork returns during the compositor "
         "self-check cycle (mirrors INIT FORK SH OK convention). "
         "Asserted golden lands with β-02.",
+    "SEAT ISOLATION OK":
+        "Wave θ θ-05 (α–τ plan): src/user/compositor/seat_isolation.pdx "
+        "carries this fingerprint as a rodata tag next to "
+        "seat_isolation_witness(). The witness is not yet called from "
+        "any boot-path ELF -- compositor_selftest.elf currently only "
+        "consumes buffer_age_rights_valid. Retires from this allowlist "
+        "when the future compositor-runner.elf pulls seat_isolation.o "
+        "into its object set and calls seat_isolation_witness at boot "
+        "(the α–τ plan queues this under the compositor-runner "
+        "landing).",
 
     # -- Section A: production (src/kernel/**) markers on genuinely
     #    unreachable paths. Triaged for #1578.
