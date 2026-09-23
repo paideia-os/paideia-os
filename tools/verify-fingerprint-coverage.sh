@@ -119,6 +119,38 @@ ALLOWLIST = {
         "(the α–τ plan queues this under the compositor-runner "
         "landing).",
 
+    # Wave ν (α–τ plan, deferred): three real-HW paideia-os monorepo
+    # issues (#2418 external USB keyboard, #2419 Iris Xe direct-scanout,
+    # #2420 Iris Xe multi-surface composite) whose honest closure needs
+    # physical T14 G4 hardware. Wave ν landed the QEMU-approximation
+    # code-path exercisers so that a regression in the kernel-side
+    # substrate (xHCI probe + PORTSC, Bochs LFB round-trip, R113 M1-001
+    # KIND_SURFACE mint pool) is visible without waiting for a T14
+    # boot session. Each marker fires ONLY under an opt-in hw-smoke
+    # script (tools/boot/hw-smokes/boot_r113_m8_{kbd,scanout,composite}
+    # _qemu.sh) with the right QEMU flags -- no smoke in the standard
+    # 14-mode matrix asserts them. Retires from this allowlist when
+    # the real-HW golden lands from an actual T14 boot session; the
+    # gate itself refuses to keep an entry that has since become
+    # asserted, so the honesty test is intrinsic.
+    "R113 M8-038 KBD QEMU OK":
+        "Wave ν #2418 QEMU-proxy: fires only under `-device qemu-xhci "
+        "-device usb-kbd` (opt-in hw-smoke tools/boot/hw-smokes/"
+        "boot_r113_m8_kbd_qemu.sh). Real-HW golden pending T14 boot "
+        "session; issue #2418 stays OPEN post-Wave-ν landing.",
+    "R113 M8-039 SCANOUT QEMU OK":
+        "Wave ν #2419 QEMU-proxy: fires only under `PAIDEIA_VGA=std` "
+        "(opt-in hw-smoke tools/boot/hw-smokes/"
+        "boot_r113_m8_scanout_qemu.sh). Real-HW golden pending T14 "
+        "Iris Xe DDI programming; issue #2419 stays OPEN post-Wave-ν "
+        "landing.",
+    "R113 M8-040 COMPOSITE QEMU OK":
+        "Wave ν #2420 QEMU-proxy: fires only under `PAIDEIA_VGA=std` "
+        "(opt-in hw-smoke tools/boot/hw-smokes/"
+        "boot_r113_m8_composite_qemu.sh). Real-HW golden pending T14 "
+        "Iris Xe GPU BLEND/SF programming; issue #2420 stays OPEN "
+        "post-Wave-ν landing.",
+
     # -- Section A: production (src/kernel/**) markers on genuinely
     #    unreachable paths. Triaged for #1578.
 
