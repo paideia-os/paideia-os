@@ -1,0 +1,1056 @@
+// src/kernel/core/cap/pipeline_edge_transport.pdx -- R121.M2 (paideia-os #2496)
+//
+// Session-typed SPSC transport riding on top of R121.M1's KIND_PIPELINE_EDGE
+// row substrate. Lands three by-row primitives (pipe_edge_bind_byrow,
+// pipe_edge_send_byrow, pipe_edge_recv_byrow) that the R121.M2 boot witness
+// exercises directly, plus by-cap public entry points (pipe_edge_send,
+// pipe_edge_recv, pipe_edge_bind) that syscall dispatch calls into.
+//
+// M2 discipline (mirrors R121.M1 §0..§5 discipline):
+//   * Rides directly on top of pipeline_edge.pdx row substrate. Extends the
+//     row without changing R121.M1's field layout: the reserved u8 slot at
+//     [row+8][31:24] is NOT touched (M1 mint leaves it 0; unbound sentinel
+//     is the separately-tracked _pet_row_ring_id[idx] == 0xFF, so a live
+//     row with ring_id 0 remains distinguishable from an unbound one
+//     without stealing a bit from the reserved slot).
+//   * buddy_edge_id [row+8][63:32] IS written by bind (RMW at [+8]),
+//     matching the R121.M1 §3 note that "R121.M2 bind_edges writes the
+//     peer's edge_id here".
+//   * Session-typed SPSC: single-producer/single-consumer, monotonic
+//     head/tail indices, wrap-modulo SLOTS_PER_RING (16). "Slot-cap
+//     economy provides backpressure" (IPC-Q8): -EAGAIN on full producer,
+//     -EAGAIN on empty consumer.
+//   * Store MemCap handles as raw u64 cap_slot indices in ring cells
+//     (no serialization, per plan §4 R121.M2 "no serialization" + IPC-Q5
+//     "zero-copy discipline"). Intra-process only at M2: both endpoints
+//     share the caller's cap_table, so a cap_slot travels intact through
+//     the ring. R121.M3 lifts this into cross-process by minting a fresh
+//     receiver-side cap over the transferred KIND_MEMORY.
+//
+// =============================================================================
+// SECTION 0  BAND / RING ID SLOT CHOICE
+// =============================================================================
+//
+// Ring pool sized to PE_MAX/2 = 16 rings (a PROD/CONS pair occupies two
+// PE rows and one ring). Row -> ring_id mapping kept in a separate
+// _pet_row_ring_id[32] table (rather than stealing the [row+8][31:24]
+// reserved byte) because ring_id 0 is a valid ring assignment; a
+// sentinel encoded in the row header would need +1-biased storage.
+// A dedicated 32 u64 table keeps sentinel semantics unambiguous
+// (0xFF = unbound; any value in [0..15] = valid ring_id) without
+// re-writing pipeline_edge.pdx §2 row layout.
+//
+// Failure taxonomy band: 0xFFFFEB90..0xFFFFEB9F (audited via
+// `grep -rn 0xFFFFEB9 src/kernel/`; huc/bundle.pdx L200 explicitly
+// documents this band as "reserved for future" so this landing claims
+// it cleanly).
+//
+//   PET_BIND_BAD_ROW      0xFFFFEB9F  -- either row idx out of range /
+//                                        not live / role mismatch
+//   PET_BIND_ENOSPC       0xFFFFEB9E  -- ring pool full (all 16 live)
+//   PET_BIND_ALREADY      0xFFFFEB9D  -- either row already bound
+//   PET_SEND_BAD_ROW      0xFFFFEB9C  -- prod row invalid / wrong role
+//   PET_SEND_UNBOUND      0xFFFFEB9B  -- prod row has no ring assignment
+//   PET_RECV_BAD_ROW      0xFFFFEB9A  -- cons row invalid / wrong role
+//   PET_RECV_UNBOUND      0xFFFFEB99  -- cons row has no ring assignment
+//   PET_INVALID_RING      0xFFFFEB98  -- ring_id out of range / not in use
+//
+// POSIX-shape errno returned by the by-cap public entry points (matches
+// sys_accept SYS_ACCEPT_EAGAIN discipline):
+//
+//   PET_EAGAIN            0xFFFFFFFFFFFFFFF5  -- -EAGAIN (-11)
+//   PET_EBADF             0xFFFFFFFFFFFFFFF7  -- -EBADF  (-9)
+//   PET_EINVAL            0xFFFFFFFFFFFFFFEA  -- -EINVAL (-22)
+//
+// =============================================================================
+// SECTION 1  SPSC PROTOCOL
+// =============================================================================
+//
+// Per-ring state: (_pet_ring_head, _pet_ring_tail, _pet_ring_in_use,
+// _pet_ring_slots[SLOTS_PER_RING]). head_idx and tail_idx are monotonic
+// u64 counters that never wrap in practice (would overflow after 2^64
+// send operations; not a concern). Physical slot addressed via
+// (head_idx & 0xF) for SLOTS_PER_RING = 16.
+//
+//   used  = head - tail
+//   empty = (used == 0)
+//   full  = (used >= 16)
+//
+// SPSC contract: exactly one producer writes head and _pet_ring_slots;
+// exactly one consumer writes tail. Both read both. Publish order:
+//   producer: write slot value, THEN bump head_idx (readers of head
+//             see a full slot).
+//   consumer: read slot value, THEN bump tail_idx (writers of tail
+//             see the slot as free).
+//
+// Under paideia-as's straight-line x86_64 encoder these are plain
+// mov [mem], reg stores; TSO gives us the release ordering for free
+// on a single-CPU boot (no mfence needed). For SMP at M4+ we'll add
+// an sfence between the slot write and the head bump; that is a
+// design-time note here rather than a code change today because M2
+// runs entirely in-process on the current CPU.
+//
+// =============================================================================
+// SECTION 2  ENCODER DISCIPLINE (mirror pipeline_edge.pdx §5)
+// =============================================================================
+//
+//   * No `test rN, rN` -- every zero-check uses `cmp reg, 0`.
+//   * No 2-op `imul r, imm` -- slot addressing uses `shl reg, N` for *(2^N).
+//   * No `and reg, imm64` -- 0xF / 0xFF / 0xFFFF / 0xFFFFFFFF fit imm32.
+//   * No `add reg, [mem]` / `cmp reg, [mem]` -- every memory operand
+//     lands in a register first (load-inc-store idiom on head/tail bumps
+//     and stats bumper).
+//   * No `mov_b` in this file -- every store is a qword `mov [mem], reg`.
+//   * Reserved-label prefix `pet_` (short for pipeline_edge_transport)
+//     avoids the `loop`/`if`/`top`/`done` collision class per
+//     feedback_paideia_as_reserved_labels; inner labels also carry a
+//     second-level prefix (pet_bd_ bind, pet_sd_ send, pet_rc_ recv,
+//     pet_rp_ ring_push, pet_rq_ ring_pop, pet_ra_ ring_alloc,
+//     pet_nt_ note, pet_in_ init, pet_rv_ ring_valid, pet_rr_ row_read
+//     ring_id, pet_rw_ row_write ring_id, pet_bw_ row_write buddy,
+//     pet_sc_ send_bycap, pet_rc2_ recv_bycap).
+
+module PipelineEdgeTransport = structure {
+
+  // =========================================================================
+  // SECTION 3  CONSTANTS
+  // =========================================================================
+
+  pub let PET_RING_MAX       : u64 = 16    // pairs per system
+  pub let PET_SLOTS_PER_RING : u64 = 16    // depth per ring
+  pub let PET_RING_MASK      : u64 = 15    // SLOTS_PER_RING - 1
+
+  // Row -> ring sentinel.
+  pub let PET_RING_UNBOUND   : u64 = 0xFF
+
+  // Kernel-side failure sentinels (0xFFFFEB90..0xFFFFEB9F band).
+  pub let PET_BIND_BAD_ROW   : u64 = 0xFFFFEB9F
+  pub let PET_BIND_ENOSPC    : u64 = 0xFFFFEB9E
+  pub let PET_BIND_ALREADY   : u64 = 0xFFFFEB9D
+  pub let PET_SEND_BAD_ROW   : u64 = 0xFFFFEB9C
+  pub let PET_SEND_UNBOUND   : u64 = 0xFFFFEB9B
+  pub let PET_RECV_BAD_ROW   : u64 = 0xFFFFEB9A
+  pub let PET_RECV_UNBOUND   : u64 = 0xFFFFEB99
+  pub let PET_INVALID_RING   : u64 = 0xFFFFEB98
+
+  // POSIX-shape errno for by-cap public entry points.
+  pub let PET_EAGAIN         : u64 = 0xFFFFFFFFFFFFFFF5
+  pub let PET_EBADF          : u64 = 0xFFFFFFFFFFFFFFF7
+  pub let PET_EINVAL         : u64 = 0xFFFFFFFFFFFFFFEA
+
+  // Per-row -> per-ring assignment. 0xFF = unbound. Indexed by
+  // pipeline_edge row_idx (0..PE_MAX-1 == 0..31).
+  pub let mut _pet_row_ring_id : [u64; 32] = uninit @align(64)
+
+  // Per-ring SoA state.
+  pub let mut _pet_ring_head   : [u64; 16]  = uninit @align(64)
+  pub let mut _pet_ring_tail   : [u64; 16]  = uninit @align(64)
+  pub let mut _pet_ring_in_use : [u64; 16]  = uninit @align(64)
+
+  // Ring cells (16 rings * 16 slots = 256 u64 = 2048 bytes).
+  pub let mut _pet_ring_slots  : [u64; 256] = uninit @align(64)
+
+  // Bounded stats counters.
+  pub let mut _pet_stats       : [u64; 8]   = uninit @align(64)
+
+  pub let PET_ST_BINDS   : u64 = 0
+  pub let PET_ST_PUSHES  : u64 = 1
+  pub let PET_ST_POPS    : u64 = 2
+  pub let PET_ST_PUSH_EA : u64 = 3   // push refused with EAGAIN (ring full)
+  pub let PET_ST_POP_EA  : u64 = 4   // pop  refused with EAGAIN (ring empty)
+  pub let PET_ST_REFUSED : u64 = 5   // any other refusal (bind / role / row)
+  pub let PET_ST_MAX     : u64 = 8
+
+  // =========================================================================
+  // SECTION 4  pet_init() -> ()
+  //
+  // Boot / teardown scrub: zeros all four SoA tables + stats + sets every
+  // _pet_row_ring_id entry to PET_RING_UNBOUND (0xFF). Mirrors
+  // pipeline_edge_init one-for-one; called from kernel_main's derived-
+  // kind reset cascade adjacent to pipeline_edge_init.
+  // =========================================================================
+
+  pub let pet_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R121.M2 (paideia-os #2496): defensive scrub of all transport SoA tables. _pet_row_ring_id[32] stamped with 0xFF (PET_RING_UNBOUND) via load-store loop; _pet_ring_head/_pet_ring_tail/_pet_ring_in_use (16 u64 each) zeroed via straight-line loops; _pet_ring_slots (256 u64) zeroed via a single 256-iter loop; _pet_stats (8 u64) zeroed via a straight-line loop. Six loops total. Labels prefixed pet_in_.",
+      block: {
+        // (1) _pet_row_ring_id = [0xFF; 32].
+        lea r10, [rip + _pet_row_ring_id];
+        mov rax, 0xFF;                    // PET_RING_UNBOUND
+        xor rcx, rcx;
+      pet_in_rowring:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  pet_in_rowring;
+
+        // (2) _pet_ring_head = [0; 16].
+        lea r10, [rip + _pet_ring_head];
+        xor rax, rax;
+        xor rcx, rcx;
+      pet_in_head:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  pet_in_head;
+
+        // (3) _pet_ring_tail = [0; 16].
+        lea r10, [rip + _pet_ring_tail];
+        xor rcx, rcx;
+      pet_in_tail:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  pet_in_tail;
+
+        // (4) _pet_ring_in_use = [0; 16].
+        lea r10, [rip + _pet_ring_in_use];
+        xor rcx, rcx;
+      pet_in_use:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  pet_in_use;
+
+        // (5) _pet_ring_slots = [0; 256].
+        lea r10, [rip + _pet_ring_slots];
+        xor rcx, rcx;
+      pet_in_slots:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 256;
+        jb  pet_in_slots;
+
+        // (6) _pet_stats = [0; 8].
+        lea r10, [rip + _pet_stats];
+        xor rcx, rcx;
+      pet_in_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  pet_in_stats;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 5  pet_note(which) -- bounded stats increment.
+  // =========================================================================
+
+  pub let pet_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R121.M2 (paideia-os #2496): bounded increment on _pet_stats. Load-inc-store idiom. Labels prefixed pet_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae pet_nt_out;
+        lea r10, [rip + _pet_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      pet_nt_out:
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 6  Ring pool helpers.
+  // =========================================================================
+
+  // pet_ring_valid(ring_id) -> 1 iff ring_id < PET_RING_MAX AND in_use.
+  pub let pet_ring_valid : (u64) -> u64 !{mem} @{} =
+    fn (ring_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R121.M2 (paideia-os #2496): 1 iff ring_id in [0..15] AND _pet_ring_in_use[ring_id] == 1. Labels prefixed pet_rv_.",
+      block: {
+        cmp rdi, 16;
+        jae pet_rv_no;
+        lea r10, [rip + _pet_ring_in_use];
+        mov rax, [r10 + rdi * 8];
+        cmp rax, 0;
+        je  pet_rv_no;
+        mov rax, 1;
+        ret;
+      pet_rv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // pet_ring_alloc() -> ring_id | PET_BIND_ENOSPC.
+  //
+  // Low-first scan over _pet_ring_in_use[16]. On claim: set in_use=1,
+  // zero head/tail (already zero from pet_init or a prior pet_ring_free
+  // scrub -- kept as defense-in-depth).
+  pub let pet_ring_alloc : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R121.M2 (paideia-os #2496): claim one ring from the 16-slot pool. Low-first scan (rcx=idx cursor) over _pet_ring_in_use. On claim: set in_use=1, zero head/tail (defense-in-depth; pet_init and pet_ring_free both scrub). Returns ring_id in [0..15] or PET_BIND_ENOSPC (0xFFFFEB9E). Leaf function; no callee-save needed. Labels prefixed pet_ra_.",
+      block: {
+        xor rcx, rcx;                     // ring_id cursor
+        lea r10, [rip + _pet_ring_in_use];
+      pet_ra_scan:
+        cmp rcx, 16;
+        jae pet_ra_enospc;
+        mov rax, [r10 + rcx * 8];
+        cmp rax, 0;
+        je  pet_ra_claim;
+        add rcx, 1;
+        jmp pet_ra_scan;
+
+      pet_ra_claim:
+        // Mark in_use.
+        mov rax, 1;
+        mov [r10 + rcx * 8], rax;
+        // Zero head + tail (defense-in-depth).
+        lea r11, [rip + _pet_ring_head];
+        xor rax, rax;
+        mov [r11 + rcx * 8], rax;
+        lea r11, [rip + _pet_ring_tail];
+        mov [r11 + rcx * 8], rax;
+        mov rax, rcx;                     // return ring_id
+        ret;
+
+      pet_ra_enospc:
+        mov rax, 0xFFFFEB9E;              // PET_BIND_ENOSPC
+        ret
+      }
+    }
+
+  // pet_ring_free(ring_id) -> (). Scrubs the ring's head/tail/in_use
+  // + zeroes its 16 slot cells. Not bounds-checked by contract; callers
+  // (M4/M6 teardown) guarantee ring_id < PET_RING_MAX.
+  pub let pet_ring_free : (u64) -> () !{mem} @{} =
+    fn (ring_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R121.M2 (paideia-os #2496): scrub one ring's SoA state + 16 slot cells. No bounds check by contract. Labels prefixed pet_rf_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;                     // ring_id
+        // Clear in_use LAST (publish teardown last, same discipline as
+        // pipeline_edge.pdx pe_row_free_inner writing header last).
+        // Scrub head/tail first.
+        lea r10, [rip + _pet_ring_head];
+        xor rax, rax;
+        mov [r10 + rbx * 8], rax;
+        lea r10, [rip + _pet_ring_tail];
+        mov [r10 + rbx * 8], rax;
+        // Zero the ring's 16 slot cells.
+        lea r10, [rip + _pet_ring_slots];
+        mov r11, rbx;
+        shl r11, 4;                       // ring_id * 16 (base slot idx)
+        xor rcx, rcx;
+      pet_rf_slots:
+        cmp rcx, 16;
+        jae pet_rf_slots_done;
+        mov r8, r11;
+        add r8, rcx;                      // absolute slot idx
+        mov [r10 + r8 * 8], rax;
+        add rcx, 1;
+        jmp pet_rf_slots;
+      pet_rf_slots_done:
+        // Clear in_use LAST.
+        lea r10, [rip + _pet_ring_in_use];
+        mov [r10 + rbx * 8], rax;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 7  Row -> ring_id + buddy_edge_id writers.
+  //
+  // pet_row_read_ring_id(row_idx) -> ring_id | PET_RING_UNBOUND.
+  // pet_row_write_ring_id(row_idx, ring_id) -> ().
+  // pet_row_write_buddy(row_idx, buddy_edge_id) -> ().
+  //
+  // The row_write helpers do NOT re-validate the row; callers
+  // (pipe_edge_bind_byrow only) guarantee pe_row_valid.
+  // =========================================================================
+
+  pub let pet_row_read_ring_id : (u64) -> u64 !{mem} @{} =
+    fn (row_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R121.M2 (paideia-os #2496): read _pet_row_ring_id[row_idx]. Bounds-check row_idx < PE_MAX (32); returns PET_RING_UNBOUND (0xFF) on out-of-range. Labels prefixed pet_rr_.",
+      block: {
+        cmp rdi, 32;
+        jae pet_rr_unbound;
+        lea r10, [rip + _pet_row_ring_id];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      pet_rr_unbound:
+        mov rax, 0xFF;
+        ret
+      }
+    }
+
+  pub let pet_row_write_ring_id : (u64, u64) -> () !{mem} @{} =
+    fn (row_idx: u64) (ring_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R121.M2 (paideia-os #2496): _pet_row_ring_id[row_idx] = ring_id. No bounds check by contract (only pipe_edge_bind_byrow calls, after pe_row_valid). Labels prefixed pet_rw_.",
+      block: {
+        lea r10, [rip + _pet_row_ring_id];
+        mov [r10 + rdi * 8], rsi;
+        ret
+      }
+    }
+
+  // pet_row_write_buddy(row_idx, buddy_edge_id): RMW at [row+8][63:32].
+  // Preserves role [7:0], rights [23:8], reserved [31:24] from the M1
+  // pack.
+  pub let pet_row_write_buddy : (u64, u64) -> () !{mem} @{} =
+    fn (row_idx: u64) (buddy_edge_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R121.M2 (paideia-os #2496): RMW at _pipeline_edge_table[row_idx][+8]. Load qword, mask off [63:32] with imm32 0xFFFFFFFF (via mov r11 + and r11), OR in (buddy_edge_id & 0xFFFFFFFF) shifted left 32, store back. Preserves M1's role [7:0] + rights [23:8] + reserved [31:24]. No callee-save (leaf), no nested calls. Labels prefixed pet_bw_.",
+      block: {
+        lea r10, [rip + _pipeline_edge_table];
+        mov r11, rdi;
+        shl r11, 5;                       // row_idx * 32
+        add r10, r11;
+        // Load current role_rights word.
+        mov rax, [r10 + 8];
+        // Clear [63:32].
+        mov r11, 0xFFFFFFFF;
+        and rax, r11;
+        // Pack buddy_edge_id low 32 into [63:32].
+        mov rcx, rsi;
+        and rcx, r11;
+        shl rcx, 32;
+        or  rax, rcx;
+        mov [r10 + 8], rax;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 8  pipe_edge_bind_byrow(prod_row_idx, cons_row_idx)
+  //             -> 0 | PET_BIND_BAD_ROW | PET_BIND_ENOSPC | PET_BIND_ALREADY
+  //
+  // Gate order:
+  //   (1) both row_idx < PE_MAX and pe_row_valid
+  //   (2) prod row role == PE_ROLE_PROD (0), cons row role == PE_ROLE_CONS (1)
+  //   (3) neither row already bound (_pet_row_ring_id[i] == 0xFF)
+  //   (4) pet_ring_alloc -> ring_id
+  //   (5) _pet_row_ring_id[prod] = ring_id; _pet_row_ring_id[cons] = ring_id
+  //   (6) pet_row_write_buddy(prod, cons_edge_id); pet_row_write_buddy
+  //       (cons, prod_edge_id)
+  //
+  // Register plan: rbx=prod_row, r12=cons_row, r13=ring_id, r14=prod_edge_id,
+  // r15=cons_edge_id. Five callee-save pushes = 40 bytes; entry rsp%16==8,
+  // +40 -> rsp%16==0 for every nested call.
+  // =========================================================================
+
+  pub let pipe_edge_bind_byrow : (u64, u64) -> u64 !{sysreg, mem} @{} =
+    fn (prod_row_idx: u64) (cons_row_idx: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {},
+      justification: "R121.M2 (paideia-os #2496): bind a PROD row to a CONS row with a fresh ring. Gate order per §8 body. Emits `pipe edge bind ok kind=<hex> ring=<hex>` via klog_s1_x2 on success (v2=ring_id pushed onto the stack with sub rsp,8/push v2/call/add rsp,16 idiom, identical to r121_pipeline_edge.pdx rollup emit). Effects widened to (sysreg, mem) because klog_s1_x2 -> klog_emit_core touches UART. Five callee-save pushes (rbx=prod_row, r12=cons_row, r13=ring_id, r14=prod_edge_id, r15=cons_edge_id) leave rsp%16==0 for every nested call (entry rsp%16==8, +40 -> %16==0). Labels prefixed pet_bd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                     // prod_row_idx
+        mov r12, rsi;                     // cons_row_idx
+
+        // (1a) prod row valid.
+        mov rdi, rbx;
+        call pe_row_valid;
+        cmp rax, 0;
+        je  pet_bd_bad_row;
+        // (1b) cons row valid.
+        mov rdi, r12;
+        call pe_row_valid;
+        cmp rax, 0;
+        je  pet_bd_bad_row;
+
+        // (2a) prod row role == PE_ROLE_PROD (0).
+        mov rdi, rbx;
+        call pe_row_role;
+        cmp rax, 0;                       // PE_ROLE_PROD
+        jne pet_bd_bad_row;
+        // (2b) cons row role == PE_ROLE_CONS (1).
+        mov rdi, r12;
+        call pe_row_role;
+        cmp rax, 1;                       // PE_ROLE_CONS
+        jne pet_bd_bad_row;
+
+        // (3a) prod row not already bound.
+        mov rdi, rbx;
+        call pet_row_read_ring_id;
+        mov r10, 0xFF;                    // PET_RING_UNBOUND
+        cmp rax, r10;
+        jne pet_bd_already;
+        // (3b) cons row not already bound.
+        mov rdi, r12;
+        call pet_row_read_ring_id;
+        mov r10, 0xFF;
+        cmp rax, r10;
+        jne pet_bd_already;
+
+        // Snapshot both edge_ids for the buddy writes.
+        mov rdi, rbx;
+        call pe_row_edge_id;
+        mov r14, rax;                     // prod_edge_id
+        mov rdi, r12;
+        call pe_row_edge_id;
+        mov r15, rax;                     // cons_edge_id
+
+        // (4) Allocate ring.
+        call pet_ring_alloc;
+        mov r10, 16;                      // PET_RING_MAX (values in [0..15];
+                                          //   >=16 is a sentinel)
+        cmp rax, r10;
+        jae pet_bd_enospc;
+        mov r13, rax;                     // ring_id
+
+        // (5a) Bind prod row.
+        mov rdi, rbx;
+        mov rsi, r13;
+        call pet_row_write_ring_id;
+        // (5b) Bind cons row.
+        mov rdi, r12;
+        mov rsi, r13;
+        call pet_row_write_ring_id;
+
+        // (6a) Write cons_edge_id into prod row's buddy slot.
+        mov rdi, rbx;
+        mov rsi, r15;                     // cons_edge_id
+        call pet_row_write_buddy;
+        // (6b) Write prod_edge_id into cons row's buddy slot.
+        mov rdi, r12;
+        mov rsi, r14;                     // prod_edge_id
+        call pet_row_write_buddy;
+
+        // Success: bump PET_ST_BINDS.
+        mov rdi, 0;                       // PET_ST_BINDS
+        call pet_note;
+
+        // Emit `pipe edge bind ok kind=<hex> ring=<hex>` via klog_s1_x2.
+        //
+        // Entry to emit block: five callee-save pushes on entry left
+        // rsp%16 == 0. sub 8 -> %16 == 8. push v2 -> %16 == 0.
+        sub rsp, 8;
+        mov rax, r13;                     // v2 = ring_id
+        push rax;
+        mov rdi, 3;                       // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + tag_pipe_edge_bind_ok];
+        lea rcx, [rip + k_kind];
+        mov r8,  0x1F0;                   // KIND_PIPELINE_EDGE
+        lea r9,  [rip + k_ring];
+        call klog_s1_x2;
+        add rsp, 16;
+
+        xor rax, rax;                     // return 0 (PE_OK)
+        jmp pet_bd_out;
+
+      pet_bd_enospc:
+        mov rax, 0xFFFFEB9E;              // PET_BIND_ENOSPC
+        jmp pet_bd_refused;
+      pet_bd_already:
+        mov rax, 0xFFFFEB9D;              // PET_BIND_ALREADY
+        jmp pet_bd_refused;
+      pet_bd_bad_row:
+        mov rax, 0xFFFFEB9F;              // PET_BIND_BAD_ROW
+
+      pet_bd_refused:
+        push rax;
+        mov rdi, 5;                       // PET_ST_REFUSED
+        call pet_note;
+        pop rax;
+
+      pet_bd_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 9  pet_ring_push(ring_id, handle) -> 0 | PET_EAGAIN sentinel
+  //
+  // SPSC producer half. Reads head + tail, computes used, refuses on
+  // full. On success: writes slot then bumps head (publish LAST).
+  // Returns 0 (OK) or an EAGAIN sentinel; both are u64 values the
+  // by-cap layer forwards verbatim (0xFFFFFFFFFFFFFFF5 is well above
+  // any valid slot value).
+  // =========================================================================
+
+  pub let pet_ring_push : (u64, u64) -> u64 !{mem} @{} =
+    fn (ring_id: u64) (handle: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R121.M2 (paideia-os #2496): SPSC producer push. Read head + tail into rax/rcx, used = head - tail; if used >= 16 -> PET_EAGAIN. Else slot_idx = head & 0xF; base = ring_id * 16 (shl 4); abs_slot = base + slot_idx; write _pet_ring_slots[abs_slot] = handle; bump head_idx (publish LAST). One callee-save push (rbx = handle across pet_note nested call in the EAGAIN arm; kept identical between arms so rsp bookkeeping is uniform). Labels prefixed pet_rp_.",
+      block: {
+        push rbx;
+        mov rbx, rsi;                     // handle cache
+
+        // Load head, tail.
+        lea r10, [rip + _pet_ring_head];
+        mov rax, [r10 + rdi * 8];         // head_idx
+        lea r11, [rip + _pet_ring_tail];
+        mov rcx, [r11 + rdi * 8];         // tail_idx
+        // used = head - tail.
+        mov r8, rax;
+        sub r8, rcx;
+        cmp r8, 16;                       // PET_SLOTS_PER_RING
+        jae pet_rp_full;
+
+        // slot_idx = head & 0xF.
+        mov rcx, rax;
+        mov r9, 0xF;                      // PET_RING_MASK
+        and rcx, r9;
+
+        // abs_slot = ring_id * 16 + slot_idx.
+        mov r9, rdi;
+        shl r9, 4;                        // ring_id * 16
+        add r9, rcx;
+
+        // Write cell.
+        lea r10, [rip + _pet_ring_slots];
+        mov [r10 + r9 * 8], rbx;
+
+        // Publish LAST: bump head_idx.
+        add rax, 1;
+        lea r10, [rip + _pet_ring_head];
+        mov [r10 + rdi * 8], rax;
+
+        // Bump PET_ST_PUSHES.
+        mov rdi, 1;                       // PET_ST_PUSHES
+        call pet_note;
+
+        xor rax, rax;                     // return 0
+        pop rbx;
+        ret;
+
+      pet_rp_full:
+        mov rdi, 3;                       // PET_ST_PUSH_EA
+        call pet_note;
+        mov rax, 0xFFFFFFFFFFFFFFF5;      // PET_EAGAIN
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 10  pet_ring_pop(ring_id) -> handle | PET_EAGAIN sentinel
+  //
+  // SPSC consumer half. Reads head + tail, refuses on empty. On success:
+  // reads slot, then bumps tail (publish LAST).
+  // =========================================================================
+
+  pub let pet_ring_pop : (u64) -> u64 !{mem} @{} =
+    fn (ring_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R121.M2 (paideia-os #2496): SPSC consumer pop. Read head + tail; if head == tail -> PET_EAGAIN. Else slot_idx = tail & 0xF; abs_slot = ring_id * 16 + slot_idx; handle = _pet_ring_slots[abs_slot]; bump tail_idx (publish LAST). One callee-save push (rbx = handle across pet_note nested call). Labels prefixed pet_rq_.",
+      block: {
+        push rbx;
+
+        // Load head, tail.
+        lea r10, [rip + _pet_ring_head];
+        mov rax, [r10 + rdi * 8];         // head_idx
+        lea r11, [rip + _pet_ring_tail];
+        mov rcx, [r11 + rdi * 8];         // tail_idx
+        cmp rax, rcx;
+        je  pet_rq_empty;
+
+        // slot_idx = tail & 0xF.
+        mov r8, rcx;
+        mov r9, 0xF;                      // PET_RING_MASK
+        and r8, r9;
+
+        // abs_slot = ring_id * 16 + slot_idx.
+        mov r9, rdi;
+        shl r9, 4;                        // ring_id * 16
+        add r9, r8;
+
+        // Read cell.
+        lea r10, [rip + _pet_ring_slots];
+        mov rbx, [r10 + r9 * 8];
+
+        // Publish LAST: bump tail_idx.
+        add rcx, 1;
+        lea r10, [rip + _pet_ring_tail];
+        mov [r10 + rdi * 8], rcx;
+
+        // Bump PET_ST_POPS.
+        mov rdi, 2;                       // PET_ST_POPS
+        call pet_note;
+
+        mov rax, rbx;
+        pop rbx;
+        ret;
+
+      pet_rq_empty:
+        mov rdi, 4;                       // PET_ST_POP_EA
+        call pet_note;
+        mov rax, 0xFFFFFFFFFFFFFFF5;      // PET_EAGAIN
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 11  pipe_edge_send_byrow(prod_row_idx, handle)
+  //              -> 0 | PET_EAGAIN | PET_EBADF sentinels
+  //
+  // Kernel-internal send: skips cap_table lookup, callers guarantee
+  // handle is opaque. Used by the R121.M2 boot witness for the 10k-record
+  // pump and, from R121.M5 onward, by the shell dispatcher after it has
+  // already resolved edge_cap -> row_idx.
+  // =========================================================================
+
+  pub let pipe_edge_send_byrow : (u64, u64) -> u64 !{mem} @{} =
+    fn (prod_row_idx: u64) (handle: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R121.M2 (paideia-os #2496): by-row send. Gates: (1) pe_row_valid; (2) pe_row_role == PE_ROLE_PROD (0); (3) pet_row_read_ring_id != PET_RING_UNBOUND. Then pet_ring_push. Register plan: rbx=prod_row, r12=handle. Two callee-save pushes leave rsp%16==8 for every nested call (entry rsp%16==8, +16 -> %16==8, so each nested call needs a sub rsp,8/add rsp,8 bracket). Rather than repeating the bracket, an odd 3rd push (r13 unused) lands rsp%16==0 uniformly across all nested calls -- matches the sys_close 3-push idiom (feedback_paideia_os_test_defaults land site). Labels prefixed pet_sd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;                         // rsp align pad (unused)
+
+        mov rbx, rdi;                     // prod_row_idx
+        mov r12, rsi;                     // handle
+
+        // (1) row valid.
+        mov rdi, rbx;
+        call pe_row_valid;
+        cmp rax, 0;
+        je  pet_sd_bad_row;
+
+        // (2) role == PROD.
+        mov rdi, rbx;
+        call pe_row_role;
+        cmp rax, 0;                       // PE_ROLE_PROD
+        jne pet_sd_bad_row;
+
+        // (3) ring_id != 0xFF.
+        mov rdi, rbx;
+        call pet_row_read_ring_id;
+        mov r10, 0xFF;
+        cmp rax, r10;
+        je  pet_sd_unbound;
+
+        // Push into ring.
+        mov rdi, rax;                     // ring_id
+        mov rsi, r12;                     // handle
+        call pet_ring_push;
+        // rax = 0 or PET_EAGAIN; forward verbatim.
+        jmp pet_sd_out;
+
+      pet_sd_unbound:
+        mov rdi, 5;                       // PET_ST_REFUSED
+        call pet_note;
+        mov rax, 0xFFFFFFFFFFFFFFF7;      // PET_EBADF (unbound is an
+                                          //   endpoint-state defect, not
+                                          //   a transient full ring)
+        jmp pet_sd_out;
+      pet_sd_bad_row:
+        mov rdi, 5;                       // PET_ST_REFUSED
+        call pet_note;
+        mov rax, 0xFFFFFFFFFFFFFFF7;      // PET_EBADF
+
+      pet_sd_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 12  pipe_edge_recv_byrow(cons_row_idx)
+  //              -> handle | PET_EAGAIN | PET_EBADF sentinels
+  // =========================================================================
+
+  pub let pipe_edge_recv_byrow : (u64) -> u64 !{mem} @{} =
+    fn (cons_row_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R121.M2 (paideia-os #2496): by-row recv. Gates: (1) pe_row_valid; (2) pe_row_role == PE_ROLE_CONS (1); (3) pet_row_read_ring_id != PET_RING_UNBOUND. Then pet_ring_pop. Three callee-save pushes (rbx=row, r12/r13=unused pads) leave rsp%16==0 for every nested call (entry rsp%16==8, +24 -> %16==0). Two pushes would leave rsp%16==8 which mis-aligns the SysV pre-call requirement; the odd third push carries the alignment. Labels prefixed pet_rc_.",
+      block: {
+        push rbx;
+        push r12;                         // rsp align pad (unused)
+        push r13;                         // rsp align pad (unused)
+
+        mov rbx, rdi;                     // cons_row_idx
+
+        // (1) row valid.
+        mov rdi, rbx;
+        call pe_row_valid;
+        cmp rax, 0;
+        je  pet_rc_bad_row;
+
+        // (2) role == CONS.
+        mov rdi, rbx;
+        call pe_row_role;
+        cmp rax, 1;                       // PE_ROLE_CONS
+        jne pet_rc_bad_row;
+
+        // (3) ring_id != 0xFF.
+        mov rdi, rbx;
+        call pet_row_read_ring_id;
+        mov r10, 0xFF;
+        cmp rax, r10;
+        je  pet_rc_unbound;
+
+        // Pop from ring.
+        mov rdi, rax;                     // ring_id
+        call pet_ring_pop;
+        // rax = handle or PET_EAGAIN; forward verbatim.
+        jmp pet_rc_out;
+
+      pet_rc_unbound:
+        mov rdi, 5;                       // PET_ST_REFUSED
+        call pet_note;
+        mov rax, 0xFFFFFFFFFFFFFFF7;      // PET_EBADF
+        jmp pet_rc_out;
+      pet_rc_bad_row:
+        mov rdi, 5;                       // PET_ST_REFUSED
+        call pet_note;
+        mov rax, 0xFFFFFFFFFFFFFFF7;      // PET_EBADF
+
+      pet_rc_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // SECTION 13  By-cap public entry points.
+  //
+  // pipe_edge_send(edge_cap_slot, mem_cap_slot)
+  //   -> 0 | PET_EAGAIN | PET_EBADF | PET_EINVAL
+  //
+  // pipe_edge_recv(edge_cap_slot)
+  //   -> mem_cap_slot | PET_EAGAIN | PET_EBADF
+  //
+  // pipe_edge_bind(prod_edge_cap_slot, cons_edge_cap_slot)
+  //   -> 0 | PET_EINVAL
+  //
+  // The cap_table stride is 24 (see pipeline_edge.pdx §14 / cap/mint.pdx
+  // §target_ptr) with {kind@0, rights@8, target_ptr@16}. row_id is
+  // target_ptr[15:0]. Rights gate per-op: SEND requires R_PE_SEND (0x001);
+  // RECV requires R_PE_RECV (0x002); BIND requires R_PE_BIND (0x004).
+  //
+  // The mem_cap validation on send: cap_table[mem_slot].kind == KIND_MEMORY
+  // (4). Rights on the mem cap are NOT gated here -- the send transfers
+  // authority the sender already holds; whether the mem cap carries
+  // RIGHT_MINT / RIGHT_MAP is a receiver-side concern when it later
+  // invokes the mem cap. This matches sys_semantic_send's own posture
+  // of "carry a cap slot as opaque payload".
+  // =========================================================================
+
+  pub let pipe_edge_send : (u64, u64) -> u64 !{mem} @{cap} =
+    fn (edge_cap_slot: u64) (mem_cap_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R121.M2 (paideia-os #2496): by-cap send. Resolves edge_cap_slot -> row_idx via pipeline_edge_row_of_slot; requires R_PE_SEND on the edge cap; validates mem_cap_slot kind == KIND_MEMORY (4). Then pipe_edge_send_byrow. Register plan: rbx=edge_slot, r12=mem_slot, r13=edge_row. Three callee-save pushes leave rsp%16==0 for every nested call (entry rsp%16==8, +24 -> %16==0). Labels prefixed pet_sc_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                     // edge_cap_slot
+        mov r12, rsi;                     // mem_cap_slot
+
+        // Edge slot bounds + kind + rights.
+        cmp rbx, 256;
+        jae pet_sc_ebadf;
+        cmp r12, 256;
+        jae pet_sc_ebadf;
+
+        // Resolve edge row.
+        mov rdi, rbx;
+        call pipeline_edge_row_of_slot;   // -> row_id or PE_ROW_NONE (0xFF)
+        mov r10, 32;                      // PE_MAX
+        cmp rax, r10;
+        jae pet_sc_ebadf;
+        mov r13, rax;                     // edge_row
+
+        // Rights gate: R_PE_SEND on edge cap.
+        lea rax, [rip + cap_table];
+        mov r8, rbx;
+        shl r8, 3;                        // slot * 8
+        mov r9, rbx;
+        shl r9, 4;                        // slot * 16
+        add r8, r9;                       // slot * 24
+        add rax, r8;
+        mov rcx, [rax + 8];               // cap_table[edge].rights
+        mov r11, 0x001;                   // R_PE_SEND
+        and rcx, r11;
+        cmp rcx, 0;
+        je  pet_sc_ebadf;
+
+        // Mem cap: kind == KIND_MEMORY (4).
+        lea rax, [rip + cap_table];
+        mov r8, r12;
+        shl r8, 3;
+        mov r9, r12;
+        shl r9, 4;
+        add r8, r9;                       // slot * 24
+        add rax, r8;
+        mov rcx, [rax + 0];               // cap_table[mem_slot].kind
+        cmp rcx, 4;                       // KIND_MEMORY
+        jne pet_sc_ebadf;
+
+        // pipe_edge_send_byrow(edge_row, mem_cap_slot).
+        mov rdi, r13;
+        mov rsi, r12;
+        call pipe_edge_send_byrow;
+        // rax = 0 or PET_EAGAIN or PET_EBADF; forward verbatim.
+        jmp pet_sc_out;
+
+      pet_sc_ebadf:
+        mov rax, 0xFFFFFFFFFFFFFFF7;      // PET_EBADF
+
+      pet_sc_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  pub let pipe_edge_recv : (u64) -> u64 !{mem} @{cap} =
+    fn (edge_cap_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "R121.M2 (paideia-os #2496): by-cap recv. Resolves edge_cap_slot -> row_idx; requires R_PE_RECV on the edge cap. Then pipe_edge_recv_byrow. Two callee-save pushes (rbx=edge_slot, r12=edge_row) + one pad (r13 unused) leave rsp%16==0 for every nested call. Labels prefixed pet_rc2_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;                         // rsp align pad
+
+        mov rbx, rdi;                     // edge_cap_slot
+
+        cmp rbx, 256;
+        jae pet_rc2_ebadf;
+
+        mov rdi, rbx;
+        call pipeline_edge_row_of_slot;
+        mov r10, 32;
+        cmp rax, r10;
+        jae pet_rc2_ebadf;
+        mov r12, rax;                     // edge_row
+
+        // Rights gate: R_PE_RECV.
+        lea rax, [rip + cap_table];
+        mov r8, rbx;
+        shl r8, 3;
+        mov r9, rbx;
+        shl r9, 4;
+        add r8, r9;
+        add rax, r8;
+        mov rcx, [rax + 8];
+        mov r11, 0x002;                   // R_PE_RECV
+        and rcx, r11;
+        cmp rcx, 0;
+        je  pet_rc2_ebadf;
+
+        mov rdi, r12;
+        call pipe_edge_recv_byrow;
+        jmp pet_rc2_out;
+
+      pet_rc2_ebadf:
+        mov rax, 0xFFFFFFFFFFFFFFF7;      // PET_EBADF
+
+      pet_rc2_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // pipe_edge_bind resolves two edge caps and hands their rows to
+  // pipe_edge_bind_byrow. Both edge caps must carry R_PE_BIND (0x004),
+  // per §3 of pipeline_edge.pdx ("held only by the shell runtime that
+  // owns both halves").
+  pub let pipe_edge_bind : (u64, u64) -> u64 !{sysreg, mem} @{cap} =
+    fn (prod_edge_slot: u64) (cons_edge_slot: u64) -> unsafe {
+      effects: {sysreg, mem}, capabilities: {cap},
+      justification: "R121.M2 (paideia-os #2496): by-cap bind. Optional at M2 (M4 formalises with the duality checker), landed here so the syscall wire has something to invoke and the shell integration in R121.M5 has a stable primitive to call. Resolves both edge caps, gates each on R_PE_BIND (0x004), calls pipe_edge_bind_byrow which does the row-side gate + ring alloc + buddy_edge_id writes. Effects widened to (sysreg, mem) transitively because pipe_edge_bind_byrow emits the bind fingerprint via klog. Register plan: rbx=prod_slot, r12=cons_slot, r13=prod_row, r14=cons_row, r15=pad. Five callee-save pushes leave rsp%16==0 for every nested call. Labels prefixed pet_bd2_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                     // prod_edge_slot
+        mov r12, rsi;                     // cons_edge_slot
+
+        cmp rbx, 256;
+        jae pet_bd2_einval;
+        cmp r12, 256;
+        jae pet_bd2_einval;
+
+        // Prod row + BIND right.
+        mov rdi, rbx;
+        call pipeline_edge_row_of_slot;
+        mov r10, 32;
+        cmp rax, r10;
+        jae pet_bd2_einval;
+        mov r13, rax;
+        lea rax, [rip + cap_table];
+        mov r8, rbx;
+        shl r8, 3;
+        mov r9, rbx;
+        shl r9, 4;
+        add r8, r9;
+        add rax, r8;
+        mov rcx, [rax + 8];
+        mov r11, 0x004;                   // R_PE_BIND
+        and rcx, r11;
+        cmp rcx, 0;
+        je  pet_bd2_einval;
+
+        // Cons row + BIND right.
+        mov rdi, r12;
+        call pipeline_edge_row_of_slot;
+        mov r10, 32;
+        cmp rax, r10;
+        jae pet_bd2_einval;
+        mov r14, rax;
+        lea rax, [rip + cap_table];
+        mov r8, r12;
+        shl r8, 3;
+        mov r9, r12;
+        shl r9, 4;
+        add r8, r9;
+        add rax, r8;
+        mov rcx, [rax + 8];
+        mov r11, 0x004;
+        and rcx, r11;
+        cmp rcx, 0;
+        je  pet_bd2_einval;
+
+        // Delegate.
+        mov rdi, r13;
+        mov rsi, r14;
+        call pipe_edge_bind_byrow;
+        // rax = 0 or PET_BIND_* sentinel. Promote sentinel to -EINVAL
+        // for the userspace ABI.
+        cmp rax, 0;
+        je  pet_bd2_out;
+        mov rax, 0xFFFFFFFFFFFFFFEA;      // PET_EINVAL
+        jmp pet_bd2_out;
+
+      pet_bd2_einval:
+        mov rax, 0xFFFFFFFFFFFFFFEA;      // PET_EINVAL
+
+      pet_bd2_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
