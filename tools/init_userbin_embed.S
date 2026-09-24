@@ -51,3 +51,27 @@ _init_ps_bin_start:
 .incbin "build/user/ps.elf"
 .global _init_ps_bin_end
 _init_ps_bin_end:
+
+/*
+ * R121.M5 (paideia-os #2499): pdx-produce / pdx-consume canaries for
+ * the semantic-shell typed pipeline (KIND_PIPELINE_EDGE substrate at
+ * src/kernel/core/cap/pipeline_edge{,_transport}.pdx). Same shape as
+ * the R113 ls/cat/ps trio above; symbols consumed by
+ * src/user/rootfs_seed.pdx's rs_pp_/rs_pc_ chunked-write blocks.
+ * build/user/pdx_produce.elf and build/user/pdx_consume.elf must
+ * exist on disk at the time this file is assembled -- see
+ * tools/build-user.sh's per-tool link block ordering.
+ */
+.balign 8
+.global _init_pdx_produce_bin_start
+_init_pdx_produce_bin_start:
+.incbin "build/user/pdx_produce.elf"
+.global _init_pdx_produce_bin_end
+_init_pdx_produce_bin_end:
+
+.balign 8
+.global _init_pdx_consume_bin_start
+_init_pdx_consume_bin_start:
+.incbin "build/user/pdx_consume.elf"
+.global _init_pdx_consume_bin_end
+_init_pdx_consume_bin_end:

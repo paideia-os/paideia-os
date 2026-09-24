@@ -28,6 +28,12 @@ CP_LINK_SCRIPT="${USER_SRC}/cp.ld"
 MKDIR_LINK_SCRIPT="${USER_SRC}/mkdir.ld"
 TOUCH_LINK_SCRIPT="${USER_SRC}/touch.ld"
 DMESG_LINK_SCRIPT="${USER_SRC}/dmesg.ld"
+# R121.M5 (paideia-os #2499): pdx-produce / pdx-consume canaries for the
+# semantic-shell typed pipeline. Self-contained (inline SC+ 12/60 plus
+# 131/132), so each gets its own object set + linker script + link step
+# (mirrors the child_hello/true/cat/ps one-file-one-ELF discipline).
+PDX_PRODUCE_LINK_SCRIPT="${USER_SRC}/pdx_produce.ld"
+PDX_CONSUME_LINK_SCRIPT="${USER_SRC}/pdx_consume.ld"
 
 if [[ ! -f "${SHELL_LINK_SCRIPT}" ]]; then
     echo "shell linker script missing: ${SHELL_LINK_SCRIPT}" >&2
@@ -129,6 +135,16 @@ if [[ ! -f "${DMESG_LINK_SCRIPT}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${PDX_PRODUCE_LINK_SCRIPT}" ]]; then
+    echo "pdx_produce linker script missing: ${PDX_PRODUCE_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
+if [[ ! -f "${PDX_CONSUME_LINK_SCRIPT}" ]]; then
+    echo "pdx_consume linker script missing: ${PDX_CONSUME_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
 # Satellite-tool ELF preservation (design/build/satellite-elf-preservation.md).
 #
 # tools/build.sh's r64v2-tools block stages mkfs.pdxfs.elf /
@@ -183,6 +199,9 @@ CP_OBJECTS=()
 MKDIR_OBJECTS=()
 TOUCH_OBJECTS=()
 DMESG_OBJECTS=()
+# R121.M5 (paideia-os #2499): pdx-produce / pdx-consume canary object sets.
+PDX_PRODUCE_OBJECTS=()
+PDX_CONSUME_OBJECTS=()
 LIBC_OBJECTS=()
 AML_OBJECTS=()
 LIBS_OBJECTS=()
@@ -336,6 +355,17 @@ while IFS= read -r -d '' pdx; do
         # dm_print_u64_dec helper) so its object goes to its own set only --
         # no library pull-in. Mirrors the cp.pdx classification pattern.
         DMESG_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "pdx_produce.pdx" ]]; then
+        # R121.M5 (paideia-os #2499): pdx-produce canary. Self-contained
+        # (inlines sys_debug_puts/sys_pipe_edge_send/sys_exit) so its
+        # object goes to its own set only -- no library pull-in. Mirrors
+        # child_hello.pdx / true.pdx classification pattern.
+        PDX_PRODUCE_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "pdx_consume.pdx" ]]; then
+        # R121.M5 (paideia-os #2499): pdx-consume canary. Self-contained
+        # (inlines sys_debug_puts/sys_pipe_edge_recv/sys_exit) so its
+        # object goes to its own set only. Mirror of pdx_produce.pdx.
+        PDX_CONSUME_OBJECTS+=("${obj}")
     elif [[ "${rel}" == libc/* ]]; then
         # R57.M4-001 (#1797): src/user/libc/ -- userspace runtime library
         # for the growing R57 ring-3 surface (ls, cat, mkdir, ...). Each
@@ -782,14 +812,49 @@ if [[ ${#LS_OBJECTS[@]} -gt 0 ]]; then
     echo "[ok] ${BUILD_DIR}/ls.bin"
 fi
 
+# R121.M5 (paideia-os #2499): pdx_produce.elf / pdx_consume.elf canaries.
+# Self-contained (inline sys_debug_puts / sys_pipe_edge_send-or-recv /
+# sys_exit -- see the source headers for the CAP-MINT GAP note). Both
+# link BEFORE init_userbin_embed.S is assembled so its added `.incbin`
+# lines for these two ELFs read bytes that already exist on disk --
+# same ordering constraint as the ls/cat/ps trio above.
+if [[ ${#PDX_PRODUCE_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T pdx_produce.ld -> pdx_produce.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${PDX_PRODUCE_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/pdx_produce.elf" \
+        "${PDX_PRODUCE_OBJECTS[@]}"
+
+    echo "[objcopy-user] pdx_produce.elf -> pdx_produce.bin"
+    objcopy -O binary "${BUILD_DIR}/pdx_produce.elf" "${BUILD_DIR}/pdx_produce.bin"
+
+    echo "[ok] ${BUILD_DIR}/pdx_produce.elf"
+    echo "[ok] ${BUILD_DIR}/pdx_produce.bin"
+fi
+
+if [[ ${#PDX_CONSUME_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T pdx_consume.ld -> pdx_consume.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${PDX_CONSUME_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/pdx_consume.elf" \
+        "${PDX_CONSUME_OBJECTS[@]}"
+
+    echo "[objcopy-user] pdx_consume.elf -> pdx_consume.bin"
+    objcopy -O binary "${BUILD_DIR}/pdx_consume.elf" "${BUILD_DIR}/pdx_consume.bin"
+
+    echo "[ok] ${BUILD_DIR}/pdx_consume.elf"
+    echo "[ok] ${BUILD_DIR}/pdx_consume.bin"
+fi
+
 # R113 (paideia-os #2441): assemble tools/init_userbin_embed.S NOW that
-# ls.elf, cat.elf and ps.elf are all on disk, then thread the resulting
-# object into INIT_OBJECTS for the deferred init.elf link below. The
-# `.incbin` directives in the .S file read the referenced ELFs at
-# assemble time; if any of the three is missing, `as` hard-fails here
-# before we get to the init link -- symmetric with tools/build.sh's
-# userbin_embed.S ordering. Assembled with `cwd = REPO_ROOT` so the
-# repo-relative `build/user/*.elf` paths resolve.
+# ls.elf, cat.elf, ps.elf and (R121.M5) pdx_produce.elf/pdx_consume.elf
+# are all on disk, then thread the resulting object into INIT_OBJECTS
+# for the deferred init.elf link below. The `.incbin` directives in
+# the .S file read the referenced ELFs at assemble time; if any of the
+# five is missing, `as` hard-fails here before we get to the init link
+# -- symmetric with tools/build.sh's userbin_embed.S ordering.
+# Assembled with `cwd = REPO_ROOT` so the repo-relative
+# `build/user/*.elf` paths resolve.
 echo "[init-userbin] tools/init_userbin_embed.S -> init_userbin_embed.o"
 INIT_USERBIN_OBJ="${BUILD_DIR}/init_userbin_embed.o"
 ( cd "${REPO_ROOT}" && as --64 --noexecstack -o "${INIT_USERBIN_OBJ}" tools/init_userbin_embed.S )

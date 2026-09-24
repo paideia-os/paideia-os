@@ -108,7 +108,7 @@ fi
 # introduces exec_child_pipeline_entry siblings (left+right), each with its own
 # resolve_path call — allow 1 (pre-pipe) or 3 (post-pipe: exec_child + L + R).
 N=$(echo "$EC" | grep -Ec "call.*resolve_path" || true)
-if [[ "$N" -eq 1 || "$N" -eq 3 ]]; then echo "[ok]   exec_child calls resolve_path ($N — 1 or 3 post-pipe accepted)"; else echo "[FAIL] exec_child resolve_path count $N not in {1,3}"; FAIL=1; fi
+if [[ "$N" -eq 1 || "$N" -eq 3 || "$N" -eq 5 ]]; then echo "[ok]   exec_child calls resolve_path ($N — 1, 3 post-pipe, or 5 post-R121.M5 typed-pipe accepted)"; else echo "[FAIL] exec_child resolve_path count $N not in {1,3,5}"; FAIL=1; fi
 
 # 11. exec_child ordering: resolve_path call PC < sys_execve call PC
 RP_PC=$(set +o pipefail; echo "$EC" | grep -E "call.*resolve_path" | head -1 | awk -F: '{print $1}' | tr -d ' ')
