@@ -1,0 +1,215 @@
+// src/kernel/core/syscall/handlers/sys_pipe_edge_bind.pdx --
+//   R121.M5-followup (paideia-os #2501)
+//
+// sys_pipe_edge_bind body -- the userland-reachable wrapper around
+// pipe_edge_bind_byrow (R121.M2/M4 substrate, src/kernel/core/cap/
+// pipeline_edge_transport.pdx §8) that resolves two cap_slots to
+// underlying row_ids and calls the by-row bind primitive. The M2
+// landing already exposed pipe_edge_bind (by-cap) at
+// pipeline_edge_transport.pdx §L1189 for direct cap_invoke callers,
+// but the R121.M5 shell integration wants the same operation as a
+// dedicated syscall so the dispatcher can invoke it without setting
+// up a cap_invoke op-arg block.
+//
+// Contract (matches src/user/syscall_shim.pdx sys_pipe_edge_bind):
+//   sys_pipe_edge_bind(prod_slot: u64, cons_slot: u64)
+//     -> 0 (OK)
+//        | -EBADF  (0xFFFFFFFFFFFFFFF7)  either cap_slot fails to
+//                                        resolve to a KIND_PIPELINE_
+//                                        EDGE row, or pipe_edge_bind_
+//                                        byrow returns PET_BIND_BAD_ROW
+//        | -EINVAL (0xFFFFFFFFFFFFFFEA)  every other PET_BIND_*
+//                                        (SCHEMA_MISMATCH, ROLE_CONFLICT,
+//                                        BUDDY_ASYMMETRIC, ALREADY,
+//                                        ENOSPC).
+//
+// SC+ ID 134. Dispatched from src/kernel/core/syscall/dispatch.pdx at
+// dispatch_pipe_edge_bind, added in the same R121.M5-followup landing.
+//
+// Sequence (three phases):
+//   1. Resolve prod_slot -> prod_row via pipeline_edge_row_of_slot
+//      (src/kernel/core/cap/pipeline_edge.pdx §14). Returns row_id
+//      in [0..31] on hit, or PE_ROW_NONE (0xFF) on any refusal
+//      (out-of-bounds slot, kind mismatch). Fold PE_ROW_NONE to
+//      -EBADF.
+//   2. Resolve cons_slot -> cons_row via the same walker; same fold.
+//   3. Call pipe_edge_bind_byrow(prod_row, cons_row). This is the
+//      R121.M2 primitive extended by R121.M4 with the session-type
+//      duality checker (schema equality + role complementarity +
+//      post-write buddy symmetry). Its own body emits the M4 refuse
+//      fingerprints (`pipe bind rejected reason=<n>...`) and the M2
+//      success fingerprint (`pipe edge bind ok kind=<hex> ring=<hex>`)
+//      -- this syscall does not add or reorder any of those emits.
+//
+// Preserving M4's duality refuse chain: pipe_edge_bind_byrow itself
+// emits schema_mismatch (reason=1), role_conflict (reason=2), and
+// buddy_asymmetric (reason=3) fingerprints from its own body via
+// klog_s1_x3 / klog_s1_x1. This syscall calls that primitive
+// verbatim; no extra emit here means no double-fire, no reordering,
+// no gate skew.
+//
+// Fingerprint (gated on _fd_hygiene_witness_active -- shared with the
+// R119 fd-hygiene / sys_pipe / sys_pipe_edge_mint witnesses):
+//   "pipe edge bind sc ok prod_slot=<n> cons_slot=<n>" via klog_s1_d2.
+//   The underlying pipe_edge_bind_byrow body emits its own
+//   "pipe edge bind ok kind=<hex> ring=<hex>" fingerprint UNCONDITIONALLY
+//   on success (not witness-gated); this syscall's ADDITIONAL "sc ok"
+//   line is the syscall-surface acceptance anchor that distinguishes
+//   the R121.M5-followup wire from the R121.M2 substrate wire.
+//
+// Register discipline (3-push callee-save prologue delivers rsp%16==0
+// at every nested call site: entry rsp%16==8, +24 -> %16==0):
+//   rbx = prod_slot (survives every nested call, needed for fingerprint)
+//   r12 = cons_slot (survives every nested call, needed for fingerprint)
+//   r13 = prod_row  (post-resolve; needed as first arg to bind_byrow)
+//
+// paideia-as encoder posture (feedback_pdx_encoder_pitfalls):
+//   * No `test rN,rN` -- every gate is `cmp reg, 0` / `cmp reg, imm`.
+//   * PE_ROW_NONE (0xFF) fits imm8; cmp rax, imm8 direct.
+//   * PET_BIND_BAD_ROW (0xFFFFEB9F) staged into r10 before cmp so the
+//     sign-extension pitfall is avoided (same argument as
+//     sys_pipe_edge_mint.pdx's PE_TAIL_ENOSPC handling).
+//   * imm64 errno sentinels load via `mov rax, imm64` (10-byte movabs).
+//   * Reserved-label prefix `spb_` avoids reserved-word collisions.
+//
+// Design: cited by design/terminal/semantic-shell-materialization-plan
+// .md §R121.M5 (CAP-MINT GAP). Companion paideia-os#2501 briefing.
+
+module SysPipeEdgeBind = structure {
+
+  // === Error sentinels (Linux errno u64 sign-extensions) ===
+  pub let SPB_ERR_EBADF  : u64 = 0xFFFFFFFFFFFFFFF7   // -9
+  pub let SPB_ERR_EINVAL : u64 = 0xFFFFFFFFFFFFFFEA   // -22
+
+  // === PE_ROW_NONE + PET_BIND_BAD_ROW (mirror substrate) ===
+  pub let SPB_PE_ROW_NONE       : u64 = 0xFF
+  pub let SPB_PET_BIND_BAD_ROW  : u64 = 0xFFFFEB9F
+
+  // ==========================================================================
+  // sys_pipe_edge_bind_body(prod_slot, cons_slot) -> u64
+  //
+  // Input:
+  //   rdi = prod_slot  (u64; cap_table index expected to hold a
+  //                     KIND_PIPELINE_EDGE row with role==PROD)
+  //   rsi = cons_slot  (u64; cap_table index expected to hold a
+  //                     KIND_PIPELINE_EDGE row with role==CONS)
+  //
+  // Output:
+  //   rax = 0                              on success
+  //   rax = SPB_ERR_EBADF / SPB_ERR_EINVAL on the failure taxonomy above
+  //
+  // Side effects on success:
+  //   - one ring claimed from the M2 pool (pet_ring_alloc)
+  //   - _pet_row_ring_id[prod_row] and _pet_row_ring_id[cons_row] set
+  //   - buddy_edge_id fields (row+8 hi 32) written on both rows
+  //   - `pipe edge bind ok kind=<hex> ring=<hex>` emit (unconditional
+  //     from inside pipe_edge_bind_byrow)
+  //
+  // Side effects on failure: byte-identical to entry. All refuses
+  // happen inside pipe_edge_bind_byrow which is a no-mutation refuse
+  // funnel for the M2 gates (bad_row / already / enospc) and the M4
+  // gates (schema_mismatch / role_conflict / buddy_asymmetric).
+  // ==========================================================================
+  pub let sys_pipe_edge_bind_body : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (prod_slot: u64) (cons_slot: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {cap},
+      justification: "R121.M5-followup (paideia-os #2501): userland-reachable wrapper around pipe_edge_bind_byrow (R121.M2 substrate extended by R121.M4 duality checker, src/kernel/core/cap/pipeline_edge_transport.pdx §8). Three-phase composition: (1) pipeline_edge_row_of_slot(prod_slot) -- the R121.M1 walker at src/kernel/core/cap/pipeline_edge.pdx §14 that bounds-checks slot < 256, verifies cap_table[slot].kind == KIND_PIPELINE_EDGE (0x1F0), and extracts row_id from target_ptr[15:0]. Returns row_id in [0..31] on hit or PE_ROW_NONE (0xFF) on any refusal. (2) Same walker on cons_slot with the same fold. Both PE_ROW_NONE branches converge on -EBADF (any cap_slot that fails to resolve is a caller-side authority error, mapped to the same errno every bad-fd path in this tree uses -- see sys_pipe_edge_send's own -EBADF fold at pipeline_edge_transport.pdx §pet_sc_ L1082). (3) pipe_edge_bind_byrow(prod_row, cons_row) -- the R121.M2+M4 by-row primitive. Its own body owns the entire gate chain (rows in-use / roles differ / positions match / neither already bound / schemas match / ring_alloc / write / buddy symmetry) plus every refuse fingerprint (`pipe bind rejected reason=1 prod_sid=<hex> cons_sid=<hex>` for schema mismatch, `pipe bind rejected reason=2 role_a=<hex> role_b=<hex>` for role conflict, `pipe bind rejected reason=3` for buddy asymmetric, `pipe edge bind ok kind=<hex> ring=<hex>` on success) so this syscall is a pure trampoline: no extra emit, no gate reordering, no double-fire. Error fold: PET_BIND_BAD_ROW -> -EBADF (structural, same class as PE_ROW_NONE); every other PET_BIND_* (SCHEMA_MISMATCH, ROLE_CONFLICT, BUDDY_ASYMMETRIC, ALREADY, ENOSPC) -> -EINVAL because they represent semantic incompatibility between two well-formed slots rather than a slot-lookup failure. This preserves the R121.M4 duality-check refuse chain byte-for-byte: the fingerprint sequence a caller observes on a role-conflict bind is exactly `pipe bind rejected reason=2 role_a=<hex> role_b=<hex>` (from bind_byrow) + rax=-EINVAL (from this syscall's fold) -- no other message in between. Witness fingerprint 'pipe edge bind sc ok prod_slot=<n> cons_slot=<n>' via klog_s1_d2 emits ONLY when _fd_hygiene_witness_active is set (shared gate with sibling handlers). 3-push callee-save prologue (rbx=prod_slot, r12=cons_slot, r13=prod_row post-resolve) delivers rsp%16==0 for every nested call. Encoder posture per feedback_pdx_encoder_pitfalls: no `test rN,rN`; PE_ROW_NONE (0xFF) fits imm8 for direct cmp; PET_BIND_BAD_ROW (0xFFFFEB9F) staged via r10 to avoid the imm32 sign-extension pitfall (same argument as sys_pipe_edge_mint's PE_TAIL_ENOSPC handling); imm64 errno sentinels load via `mov rax, imm64`; no 2-op `imul r,imm`, no `and reg, imm64`, no `add reg, [mem]` / `cmp reg, [mem]`. Reserved-label prefix `spb_` avoids paideia-as reserved-word collisions. Effects widened to (mem, sysreg) transitively because pipe_edge_bind_byrow's klog emits touch the UART port-IO path; capabilities {cap} matches the substrate's own posture.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                        // rbx = prod_slot
+        mov r12, rsi;                        // r12 = cons_slot
+
+        // -------------------------------------------------------------
+        // Phase 1: resolve prod_slot -> prod_row
+        // -------------------------------------------------------------
+        mov rdi, rbx;
+        call pipeline_edge_row_of_slot;      // rax = row_id or PE_ROW_NONE (0xFF)
+
+        cmp rax, 0xFF;                       // PE_ROW_NONE fits imm8
+        je  spb_ebadf;
+        mov r13, rax;                        // r13 = prod_row
+
+        // -------------------------------------------------------------
+        // Phase 2: resolve cons_slot -> cons_row
+        // -------------------------------------------------------------
+        mov rdi, r12;
+        call pipeline_edge_row_of_slot;
+
+        cmp rax, 0xFF;
+        je  spb_ebadf;
+        // rax = cons_row -- passed straight into the bind call below.
+
+        // -------------------------------------------------------------
+        // Phase 3: pipe_edge_bind_byrow(prod_row, cons_row)
+        // -------------------------------------------------------------
+        // ABI: rdi=prod_row, rsi=cons_row. cons_row is currently in
+        // rax; move it into rsi first so the subsequent load of
+        // prod_row into rdi does not clobber it.
+        mov rsi, rax;                        // rsi = cons_row
+        mov rdi, r13;                        // rdi = prod_row
+        call pipe_edge_bind_byrow;
+
+        cmp rax, 0;
+        jne spb_bind_fail;
+
+        // -------------------------------------------------------------
+        // Witness emit (gated).
+        //   `pipe edge bind sc ok prod_slot=<n> cons_slot=<n>`
+        // -------------------------------------------------------------
+        mov rax, [rip + _fd_hygiene_witness_active];
+        cmp rax, 0;
+        je  spb_witness_skip;
+
+        // klog_s1_d2 caller-push idiom (same shape as
+        // sys_pipe_edge_mint.pdx's own emit).
+        sub rsp, 8;
+        mov rax, r12;                        // v2 = cons_slot
+        push rax;
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + tag_pipe_edge_bind_sc_ok];
+        lea rcx, [rip + k_prod_slot];
+        mov r8,  rbx;                        // v1 = prod_slot
+        lea r9,  [rip + k_cons_slot];
+        call klog_s1_d2;
+        add rsp, 16;
+
+      spb_witness_skip:
+        xor rax, rax;                        // return 0 (OK)
+        jmp spb_out;
+
+      // ==============================================================
+      // Failure funnels.
+      // ==============================================================
+
+      spb_bind_fail:
+        // rax carries one of PET_BIND_BAD_ROW (0xFFFFEB9F) / _ENOSPC
+        // (0xFFFFEB9E) / _ALREADY (0xFFFFEB9D) / _SCHEMA_MISMATCH
+        // (0xFFFFEBAF) / _ROLE_CONFLICT (0xFFFFEBAE) /
+        // _BUDDY_ASYMMETRIC (0xFFFFEBAD).
+        //
+        // PET_BIND_BAD_ROW -> -EBADF (structural, matches PE_ROW_NONE
+        // class from Phases 1/2). Every other sentinel -> -EINVAL
+        // (semantic incompatibility between two well-formed slots).
+        mov r10, 0xFFFFEB9F;                 // SPB_PET_BIND_BAD_ROW
+        cmp rax, r10;
+        je  spb_ebadf;
+
+        mov rax, 0xFFFFFFFFFFFFFFEA;         // -EINVAL
+        jmp spb_out;
+
+      spb_ebadf:
+        mov rax, 0xFFFFFFFFFFFFFFF7;         // -EBADF
+
+      spb_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
