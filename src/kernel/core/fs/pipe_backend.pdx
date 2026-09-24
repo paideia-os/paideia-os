@@ -1,0 +1,482 @@
+// src/kernel/core/fs/pipe_backend.pdx — R119.M1 (paideia-os #2471)
+// Minimal in-memory pipe backend for sys_pipe.
+//
+// Landing scope
+// -------------
+// Provides the storage substrate + vops adapters that let sys_pipe hand
+// userspace two fds pointing at a shared 4 KiB ring — enough to unblock
+// the R119.M2/M3 rounds that fix shell#2469 (redirect) and shell#2470
+// (pipe). No POSIX niceties yet: no read-side blocking on empty (returns
+// 0 bytes = EOF), no write-side blocking on full (returns short byte
+// count), no EPIPE on write-after-close-read.  Those semantics arrive in
+// R119.M3 alongside the shell pipe integration test; landing them here
+// would add scheduler-visible state (per-pipe wait queues) that has
+// nothing to sanity-check without a real userspace consumer.
+//
+// Storage
+// -------
+//   _pipe_rings  : [u8; PIPE_MAX_PIPES * PIPE_RING_BYTES]  = 8 * 4096 = 32 KiB
+//   _pipe_descs  : [u64; PIPE_MAX_PIPES * 8]              = 8 * 64 B  = 512 B
+//
+// Descriptor layout (64 B / one L1 line each, indexed by pipe_idx):
+//   +0   head       (u64) — read cursor within the ring [0, PIPE_RING_BYTES)
+//   +8   tail       (u64) — write cursor within the ring
+//   +16  count      (u64) — bytes currently buffered (0..PIPE_RING_BYTES)
+//   +24  occupied   (u64) — 1 iff the slot is live
+//   +32..+63              — reserved (future: per-end refcounts, wait queues)
+//
+// pipe_alloc linear-scans for occupied==0.  On success the descriptor is
+// zeroed then occupied stamped 1; returns pipe_idx in [0, PIPE_MAX_PIPES).
+// On OOM returns 0xFFFF (matches vnode_alloc's OOM sentinel).
+//
+// vops table (_pipe_vops : [u64; 14]) mirrors _tmpfs_vops layout at
+// core/fs/tmpfs/vops.pdx L15-36.  Only read/write/close carry real
+// adapters; every other slot stays null so vops_lookup / vops_create /
+// vops_stat / vops_readdir / vops_mkdir / vops_rmdir / vops_rename /
+// vops_readlink / vops_symlink on a pipe vnode all surface
+// VOPS_ERR_NOT_SUPPORTED via the dispatcher's null-guard.  Open stays
+// null because sys_pipe seeds the vnode directly (no vfs_open call site
+// reaches a pipe vnode; there is no path in the namespace that resolves
+// to one).
+//
+// Backend-idx encoding on the vnode: matches _tmpfs_read_adapter's
+// discipline (tmpfs/vops.pdx L83-96) — pipe_idx lives in the low 16 bits
+// of vnode.backend_ptr (+32).  The adapters load [rdi + 32], mask
+// 0xFFFF, and operate on the corresponding pipe descriptor.
+//
+// paideia-as encoder posture (cited every softarch dispatch):
+//   * No `test rN,rN` — replaced with `cmp rN,0` throughout.
+//   * `and reg, imm` uses only imm32-fitting masks (0xFFFF, 0xFFF).
+//   * No 2-op `imul r,imm`; ring/desc address arithmetic uses shl by a
+//     constant (shl 12 for 4096-B rings, shl 6 for 64-B descriptors).
+//   * No `add reg, [mem]` / `cmp reg, [mem]` — every mem-side operand
+//     lands in a register first.
+//   * All local labels prefixed with `pb_` (pipe backend) to avoid the
+//     reserved-word class (`loop`, `if`, `top`, `done`, ...) —
+//     feedback_pdx_encoder_pitfalls / feedback_paideia_as_reserved_labels.
+//   * mov_b loads pre-XOR the destination register (mov_b does not
+//     zero-extend on the encoder we ship).  Same discipline as
+//     vnode_pool.pdx vnode_name_set.
+//
+// Design note: pipe_read and pipe_write both take (idx, buf, len, off);
+// off is IGNORED (pipes are streams, not seekable).  The signature stays
+// aligned with vops_read/vops_write so the adapter shim is a straight
+// register forward with no rearg — mirrors tmpfs' own adapter shape.
+
+module PipeBackend = structure {
+  // ==========================================================================
+  // Constants
+  // ==========================================================================
+  pub let PIPE_MAX_PIPES     : u64 = 8
+  pub let PIPE_RING_BYTES    : u64 = 4096          // 1 << 12
+  pub let PIPE_RING_MASK     : u64 = 4095          // PIPE_RING_BYTES - 1
+  pub let PIPE_DESC_BYTES    : u64 = 64            // 1 << 6, one cache line
+  pub let PIPE_ALLOC_OOM     : u64 = 0xFFFF        // matches VNODE_ALLOC_OOM
+
+  // Descriptor field offsets.
+  pub let PIPE_OFF_HEAD      : u64 = 0
+  pub let PIPE_OFF_TAIL      : u64 = 8
+  pub let PIPE_OFF_COUNT     : u64 = 16
+  pub let PIPE_OFF_OCCUPIED  : u64 = 24
+
+  // vops slot offsets (mirror src/kernel/core/fs/vops.pdx §Slot offsets).
+  pub let VOPS_READ_OFFSET       : u64 = 0
+  pub let VOPS_WRITE_OFFSET      : u64 = 8
+  pub let VOPS_CLOSE_OFFSET      : u64 = 24
+
+  // ==========================================================================
+  // Storage
+  // ==========================================================================
+  //
+  // 32 KiB ring pool + 512 B descriptor pool.  All .bss — every slot boots
+  // occupied==0 so the first pipe_alloc scan lands at idx 0 with no
+  // fixup pass required.
+  //
+  // @align(64) puts each 4 KiB ring on its own page boundary (matches
+  // vnode_pool's per-line alignment discipline; not required for correctness
+  // but useful for future single-page mapping into a userspace shared-ring
+  // fast path).
+  pub let mut _pipe_rings : [u8;  32768] = uninit @align(64)   // 8 * 4096
+  pub let mut _pipe_descs : [u64;    64] = uninit @align(64)   // 8 * 64 / 8
+
+  // ==========================================================================
+  // _pipe_desc(idx) -> u64  — descriptor slot address helper.
+  //
+  // Returns &_pipe_descs[idx * PIPE_DESC_BYTES].  Leaf, matches
+  // vnode_slot's shape.  No bounds check by policy — caller has validated
+  // idx via a pipe_alloc round-trip.
+  // ==========================================================================
+  pub let _pipe_desc : (u64) -> u64 !{} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "R119.M1 (paideia-os #2471): compute &_pipe_descs[idx * 64]. SIB scale caps at 8 so *64 requires shl 6 + add. Leaf; only rax touched. No bounds check by policy — caller has validated idx via a pipe_alloc round-trip or a vnode backend_ptr populated by sys_pipe (whose alloc-then-install idiom is the same as vnode_cache_or_alloc's populator at vnode_pool.pdx L262-266).",
+      block: {
+        mov rax, rdi;
+        shl rax, 6;                         // idx * PIPE_DESC_BYTES
+        lea rcx, [rip + _pipe_descs];
+        add rax, rcx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _pipe_ring(idx) -> u64  — ring buffer base address helper.
+  //
+  // Returns &_pipe_rings[idx * PIPE_RING_BYTES] = &_pipe_rings[idx << 12].
+  // ==========================================================================
+  pub let _pipe_ring : (u64) -> u64 !{} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "R119.M1 (paideia-os #2471): compute &_pipe_rings[idx * 4096]. shl 12 keeps the encoder off the 2-op `imul r,imm` path (pdx encoder pitfall). Leaf; only rax touched.",
+      block: {
+        mov rax, rdi;
+        shl rax, 12;                        // idx * PIPE_RING_BYTES
+        lea rcx, [rip + _pipe_rings];
+        add rax, rcx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pipe_alloc() -> u64  — reserve a pipe slot, initialize its descriptor.
+  //
+  // Linear scan of _pipe_descs[0..PIPE_MAX_PIPES] for the first slot with
+  // occupied == 0.  On success: zero head/tail/count, stamp occupied=1,
+  // return idx in [0, PIPE_MAX_PIPES).  On OOM: return 0xFFFF.
+  //
+  // The scan order matches vnode_alloc's low-first discipline (lowest
+  // free slot wins) so smoke tests are deterministic — the first
+  // sys_pipe call always returns pipe_idx == 0.
+  //
+  // No bitmap: only 8 slots, so an 8-iteration scan is cheaper than the
+  // bitmap-load + bsf_q + mask dance vnode_alloc pays for its 256-slot
+  // pool.
+  //
+  // Register plan (leaf):
+  //   rax = descriptor ptr scratch / return
+  //   rcx = loop counter (0..PIPE_MAX_PIPES)
+  //   rdx = occupied field scratch
+  // No callee-save touched.
+  // ==========================================================================
+  pub let pipe_alloc : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R119.M1 (paideia-os #2471): linear scan of _pipe_descs for occupied==0. Each iteration computes descriptor base via lea+shl 6+add (mirroring _pipe_desc), loads occupied (u64 @ +24), and on zero writes head=tail=count=0 + occupied=1 then returns idx. On PIPE_MAX_PIPES exhaustion returns 0xFFFF (matches vnode_alloc's OOM sentinel). Leaf; rax/rcx/rdx scratch; no callee-save spill. Encoder posture: cmp rdx,0 (no `test rN,rN`), and-mask never wider than imm32 (unused here), shl-only arithmetic (no 2-op imul). Reserved-label prefix `pa_` avoids `loop`/`done`/`top` collisions per feedback_paideia_as_reserved_labels.",
+      block: {
+        xor rcx, rcx;                       // rcx = idx counter
+
+      pa_scan:
+        cmp rcx, 8;                         // PIPE_MAX_PIPES
+        jae pa_oom;
+
+        // rax = &_pipe_descs[rcx * 64]
+        mov rax, rcx;
+        shl rax, 6;
+        lea rdx, [rip + _pipe_descs];
+        add rax, rdx;
+
+        // rdx = occupied
+        mov rdx, [rax + 24];                // PIPE_OFF_OCCUPIED
+        cmp rdx, 0;
+        jne pa_next;
+
+        // Free slot found — zero head/tail/count, stamp occupied=1.
+        xor rdx, rdx;
+        mov [rax + 0],  rdx;                // head
+        mov [rax + 8],  rdx;                // tail
+        mov [rax + 16], rdx;                // count
+        mov rdx, 1;
+        mov [rax + 24], rdx;                // occupied = 1
+
+        mov rax, rcx;                       // return idx
+        ret;
+
+      pa_next:
+        add rcx, 1;
+        jmp pa_scan;
+
+      pa_oom:
+        mov rax, 0xFFFF;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pipe_write(idx, kbuf, len, off) -> u64  — byte-copy into ring tail.
+  //
+  // Copies min(len, PIPE_RING_BYTES - count) bytes from kbuf into the
+  // ring starting at tail; updates tail = (tail + n) mod PIPE_RING_BYTES,
+  // count += n.  Returns n (bytes actually written).
+  //
+  // The `off` arg is accepted for vops_write signature compatibility and
+  // IGNORED — pipes are streams, not seekable.  The signature match
+  // means the vops_write adapter is a straight forward with no rearg,
+  // mirroring the tmpfs adapter shape.
+  //
+  // No caller yet blocks on full; a caller filling the ring past its
+  // capacity gets a short-write and issues another sys_write when the
+  // reader drains.  Full posix EAGAIN/EPIPE semantics land with the
+  // R119.M3 shell integration test.
+  //
+  // Register plan (3-push):
+  //   rbx = descriptor base (survives inner loop)
+  //   r12 = kbuf pointer (advancing)
+  //   r13 = bytes-remaining counter, then bytes-written return
+  //   rax = scratch (byte load / desc field load / return)
+  //   rcx = tail cursor scratch
+  //   rdx = byte scratch (zero-extended via xor pre mov_b)
+  // ==========================================================================
+  pub let pipe_write : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (idx: u64) (kbuf: u64) (len: u64) (off: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R119.M1 (paideia-os #2471): pipe write body — byte-copy kbuf..kbuf+n into the ring at tail, cap n at PIPE_RING_BYTES - count so the ring never overflows. off argument ignored (pipes are non-seekable; the arg is present only to match the vops_write 4-arg signature so the adapter is a straight forward). Returns bytes written (>=0). 3-push callee-save prologue (rbx=desc_base, r12=kbuf, r13=bytes-written accumulator, plus r14 pushed as alignment pad to keep rsp%16==0 pre-any-future nested call — currently a leaf but the pad keeps prologue uniform with pipe_read and pipe_close_adapter). Loop body: reload count, compare vs PIPE_RING_BYTES, exit on full; xor-zero rdx then mov_b byte from [r12 + r13]; compute tail = [rbx+8]; store byte at [ring_base + tail]; tail = (tail + 1) & PIPE_RING_MASK; count = count + 1; r13 += 1; continue. Encoder posture: no test rN,rN (cmp reg,0 throughout); and-mask uses 0xFFF (imm32); no 2-op imul r,imm (ring base via shl 12); no add reg,[mem] / cmp reg,[mem] (every mem load goes through a register first). Reserved-label prefix `pw_` per feedback_paideia_as_reserved_labels.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;                           // alignment pad — keeps rsp%16==0
+
+        // rbx = descriptor base
+        mov rax, rdi;
+        shl rax, 6;
+        lea rcx, [rip + _pipe_descs];
+        add rax, rcx;
+        mov rbx, rax;
+
+        // r14 = ring base (for byte stores)
+        mov rax, rdi;
+        shl rax, 12;
+        lea rcx, [rip + _pipe_rings];
+        add rax, rcx;
+        mov r14, rax;
+
+        mov r12, rsi;                       // r12 = kbuf
+        xor r13, r13;                       // r13 = bytes written
+
+      pw_loop:
+        // Exit if we've written `len` bytes.
+        cmp r13, rdx;
+        jae pw_done;
+
+        // Exit if ring full: count >= PIPE_RING_BYTES.
+        mov rax, [rbx + 16];                // rax = count
+        cmp rax, 4096;                      // PIPE_RING_BYTES
+        jae pw_done;
+
+        // Load one source byte (zero-extended).
+        xor rax, rax;
+        mov_b rax, [r12 + r13*1];
+
+        // rcx = tail
+        mov rcx, [rbx + 8];
+
+        // Store byte at ring[tail].
+        mov_b [r14 + rcx*1], rax;
+
+        // tail = (tail + 1) & PIPE_RING_MASK
+        add rcx, 1;
+        and rcx, 4095;
+        mov [rbx + 8], rcx;
+
+        // count += 1
+        mov rax, [rbx + 16];
+        add rax, 1;
+        mov [rbx + 16], rax;
+
+        add r13, 1;
+        jmp pw_loop;
+
+      pw_done:
+        mov rax, r13;                       // return bytes written
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pipe_read(idx, kbuf, len, off) -> u64  — byte-copy from ring head.
+  //
+  // Copies min(len, count) bytes from the ring's head into kbuf; updates
+  // head = (head + n) mod PIPE_RING_BYTES, count -= n.  Returns n.
+  //
+  // No blocking on empty at this landing: an empty pipe returns 0
+  // (matches POSIX EOF-on-drained-and-all-writers-closed shape from the
+  // reader's perspective; a caller distinguishing "empty" from "closed"
+  // would consult the descriptor's writer-refcount, added in R119.M3
+  // alongside the wait-queue).
+  // ==========================================================================
+  pub let pipe_read : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (idx: u64) (kbuf: u64) (len: u64) (off: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R119.M1 (paideia-os #2471): pipe read body — byte-copy from ring at head into kbuf..kbuf+n, cap n at min(len, count) so the reader never underflows the ring. off argument ignored (pipes are non-seekable; the arg is present only to match the vops_read 4-arg signature so the adapter is a straight forward). Returns bytes read (>=0). Register plan and encoder posture byte-identical to pipe_write above with head/tail roles swapped and count decremented instead of incremented. Reserved-label prefix `pr_` per feedback_paideia_as_reserved_labels.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        // rbx = descriptor base
+        mov rax, rdi;
+        shl rax, 6;
+        lea rcx, [rip + _pipe_descs];
+        add rax, rcx;
+        mov rbx, rax;
+
+        // r14 = ring base
+        mov rax, rdi;
+        shl rax, 12;
+        lea rcx, [rip + _pipe_rings];
+        add rax, rcx;
+        mov r14, rax;
+
+        mov r12, rsi;                       // r12 = kbuf
+        xor r13, r13;                       // r13 = bytes read
+
+      pr_loop:
+        // Exit if we've read `len` bytes.
+        cmp r13, rdx;
+        jae pr_done;
+
+        // Exit if ring empty: count == 0.
+        mov rax, [rbx + 16];
+        cmp rax, 0;
+        je  pr_done;
+
+        // rcx = head
+        mov rcx, [rbx + 0];
+
+        // Load one byte from ring[head].
+        xor rax, rax;
+        mov_b rax, [r14 + rcx*1];
+
+        // Store byte into kbuf[r13].
+        mov_b [r12 + r13*1], rax;
+
+        // head = (head + 1) & PIPE_RING_MASK
+        add rcx, 1;
+        and rcx, 4095;
+        mov [rbx + 0], rcx;
+
+        // count -= 1
+        mov rax, [rbx + 16];
+        sub rax, 1;
+        mov [rbx + 16], rax;
+
+        add r13, 1;
+        jmp pr_loop;
+
+      pr_done:
+        mov rax, r13;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // vops adapters
+  // ==========================================================================
+  //
+  // Bridge the vops (vnode_ptr) signature to the pipe primitives
+  // (pipe_idx).  Extract idx from vnode.backend_ptr @ +32 low 16 bits —
+  // symmetric with _tmpfs_read_adapter at core/fs/tmpfs/vops.pdx L83-96.
+
+  pub let _pipe_read_adapter : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (vn: u64) (buf: u64) (len: u64) (off: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R119.M1 (paideia-os #2471): vops->pipe adapter for read. Loads vnode.backend_ptr from [rdi+32], masks 0xFFFF -> pipe_idx (imm32-fitting mask; no `and reg,imm64` pitfall), tail-call-style forwards to pipe_read via sub/call/add. Same shape as _tmpfs_read_adapter.",
+      block: {
+        mov rdi, [rdi + 32];
+        and rdi, 0xFFFF;
+        sub rsp, 8;
+        call pipe_read;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  pub let _pipe_write_adapter : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (vn: u64) (buf: u64) (len: u64) (off: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R119.M1 (paideia-os #2471): vops->pipe adapter for write. Byte-identical shape to _pipe_read_adapter with pipe_write as the callee. Both adapters preserve the 4-arg signature that vops_write / vops_read hand down.",
+      block: {
+        mov rdi, [rdi + 32];
+        and rdi, 0xFFFF;
+        sub rsp, 8;
+        call pipe_write;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // vops_close signature: (vn) -> u64.  At this landing the close hook
+  // fires only when vfs_close's refcount hits zero for THIS vnode (the
+  // read-end and write-end have independent refcounts because they are
+  // independent vnodes sharing the ring).  A future round will mark the
+  // pipe's read-closed / write-closed halves and free the descriptor
+  // when both are gone; here we just return 0 (success no-op).  The
+  // occupied bit is never cleared at this landing, so the pipe pool
+  // leaks descriptors on close — bounded to PIPE_MAX_PIPES lifetime
+  // pipes, which R119.M3's smoke keeps well under.
+  pub let _pipe_close_stub : (u64) -> u64 !{mem} @{} =
+    fn (vn: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R119.M1 (paideia-os #2471): vops close stub for pipe vnodes. Returns 0 (success no-op). Deferred to R119.M3 alongside the wait-queue: mark read-closed / write-closed halves and free the descriptor when both go. Leaks descriptors at PIPE_MAX_PIPES scale (8 lifetime pipes), well within the smoke bound. Leaf; no callee-save touched.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _pipe_vops : [u64; 14] — shared vops table for pipe vnodes.
+  // ==========================================================================
+  //
+  // Sized to match VOPS_NUM_OPS (see core/fs/vops.pdx §Slot offsets).
+  // Only read/write/close carry real adapters; every other slot stays
+  // null so vops_lookup / vops_create / vops_unlink / vops_stat /
+  // vops_readdir / vops_mkdir / vops_rmdir / vops_rename / vops_readlink
+  // / vops_symlink on a pipe vnode all surface VOPS_ERR_NOT_SUPPORTED
+  // via the dispatcher's null-guard.  Open stays null because no path
+  // in the namespace resolves to a pipe vnode — sys_pipe seeds the
+  // vnode directly.
+  //
+  // .bss allocation + boot-time populator (pipe_vops_init) — symmetric
+  // to tmpfs_vops_init at core/fs/tmpfs/vops.pdx L1006.
+  pub let mut _pipe_vops : [u64; 14] = uninit @align(8)
+
+  // ==========================================================================
+  // pipe_vops_init() -> u64 — boot-time populator.
+  //
+  // Called once from fd_hygiene_witness_bringup (kernel_main-side).
+  // Idempotent: safe to call twice (stores land at the same fixed
+  // offsets each time).  Leaf.
+  // ==========================================================================
+  pub let pipe_vops_init : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R119.M1 (paideia-os #2471): populate _pipe_vops with read/write/close pointers at offsets 0/8/24 (matches core/fs/vops.pdx VOPS_*_OFFSET constants and the tmpfs_vops_init discipline at tmpfs/vops.pdx L1006). All other slots (open at +16; lookup, create, unlink, stat, readdir, mkdir, rmdir, rename, readlink, symlink at +32/+40/+48/+56/+64/+72/+80/+88/+96/+104) stay .bss-zero so a mis-routed vops dispatch through them surfaces VOPS_ERR_NOT_SUPPORTED via the dispatcher's null-guard. Leaf; no callee-save touched.",
+      block: {
+        lea r8, [rip + _pipe_vops];
+
+        lea rax, [rip + _pipe_read_adapter];
+        mov [r8 + 0], rax;                  // VOPS_READ_OFFSET
+
+        lea rax, [rip + _pipe_write_adapter];
+        mov [r8 + 8], rax;                  // VOPS_WRITE_OFFSET
+
+        lea rax, [rip + _pipe_close_stub];
+        mov [r8 + 24], rax;                 // VOPS_CLOSE_OFFSET
+
+        xor rax, rax;
+        ret
+      }
+    }
+}

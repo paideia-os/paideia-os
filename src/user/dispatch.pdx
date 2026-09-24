@@ -121,6 +121,19 @@ module Dispatch = structure {
   // and drops straight through to the fallback list.
   pub let mut envp_slot : u64 = uninit @align(8)
 
+  // paideia-os #2469 (R119.M2, #2472): stash slot for the bitmap
+  // apply_pre_dispatch_redirects returns, parked here across
+  // dispatch_line + exec_child and consumed by
+  // unwind_pre_dispatch_redirects at the tail of every main_loop
+  // iteration. Single-flow (main_loop is strictly sequential and this
+  // module has one call site), so no aliasing concern; stays in .bss
+  // rather than on the caller's stack to keep shell.pdx main_loop's
+  // pre-fix zero-push-per-iteration discipline unchanged. 0 (its
+  // uninit-.bss reset each iteration by the explicit write below)
+  // means "no redirects applied this cycle" and the unwind call is
+  // a fall-through-noop.
+  pub let mut _shell_redirect_bitmap : u64 = uninit @align(8)
+
   // paideia-os #2456: scratch for building "<segment>/" out of one
   // colon-separated PATH segment (which unlike bin_prefix/sbin_prefix
   // does NOT carry a trailing slash) before rp_build_seg_candidate copies
@@ -255,6 +268,312 @@ dispatch_next:
         jmp dispatch_loop;
 dispatch_notfound:
         mov rax, 1;
+        ret
+      }
+    } @no_frame
+
+  // ==========================================================================
+  // paideia-os #2469 (R119.M2, #2472): pre-dispatch redirect application.
+  //
+  // Root-cause bisection for #2469 (recorded here so the flow is visible
+  // at the call site):
+  //
+  //   Symptom A:  `cat /etc/hostname > out` — file created, empty; the
+  //   'shell redirect ok' fingerprint fired (so exec_child's rd_ scan
+  //   ran and sys_open returned a positive fd) but cat's content still
+  //   landed on the console instead of in `out`.
+  //
+  //     Bug (i)   sys_dup2's phase-1/2 fd validator rejected any dst
+  //               < 3 as -EBADF. exec_child's rd_open_common issued
+  //               `sys_dup2(new_fd, 1)` which was refused: fd_table[1]
+  //               was NEVER rewired onto `out`, and the subsequent
+  //               sys_close(new_fd) dropped the last vnode ref and
+  //               truncated `out` back to empty.
+  //
+  //     Bug (ii)  Even IF phase-1/2 had accepted dst=1, the kernel's
+  //               dispatch_write handler short-circuited ALL fd 1/2
+  //               writes to a UART fast-path before ever reading
+  //               task.fd_table[fd]. cat's `sys_write(1, "paideia\n", 8)`
+  //               went to the console regardless of what fd_table[1]
+  //               held. (The comment on the shortcut cited an early-
+  //               boot 'preserves stdout/stderr until init opens TTY
+  //               fds' convenience that was never retired once real
+  //               producers started installing fds there.)
+  //
+  //     Bug (iii) sys_write's own [3,32) fd lower-bound gate — a
+  //               transitive duplicate of the sys_dup2 gate above. Even
+  //               once the dispatch shortcut was made conditional, the
+  //               body would still EBADF a legitimate fd=1 write.
+  //
+  //   Symptom B:  `echo hello > out` — printed 'hello > out' literally,
+  //   no file created. The tokenizer produced argv=[echo, hello, >, out]
+  //   and dispatch_line matched `echo`, invoking echo_builtin -- which
+  //   walked argv[1..argc) space-separated. The redirect scan lives ONLY
+  //   in exec_child (post-fork, child-only) and never fires for builtins.
+  //
+  //     Bug (iv)  No builtin-side redirect scrub. Any builtin (echo, env,
+  //               pwd, help, ...) received redirect operators as literal
+  //               argv entries.
+  //
+  // Fix layout:
+  //
+  //   (i)-(iii) Kernel-side: sys_dup2 fd range widened to [0,32),
+  //             sys_write range likewise, and dispatch_write for fd 1/2
+  //             now probes task.fd_table[fd] before the UART shortcut
+  //             (empty slot ⇒ UART fallback for early boot; populated
+  //             slot ⇒ real body path). See sys_dup2.pdx, sys_write.pdx,
+  //             core/syscall/dispatch.pdx.
+  //
+  //   (iv)      This module: apply_pre_dispatch_redirects + companion
+  //             unwind_pre_dispatch_redirects are called from shell.pdx
+  //             main_loop BEFORE dispatch_line. Applies redirects to the
+  //             shell's own fd_table (so any builtin that writes to fd 1
+  //             hits the redirected file, and any external command that
+  //             falls through to exec_child inherits the fd across fork).
+  //             argv is scrubbed in place so exec_child's own rd_ scan
+  //             (still there defensively) finds nothing to do.
+  //
+  // Save/restore discipline:
+  //   Today the shell's fd_table[0/1/2] is empty (init's dup2 chain also
+  //   suffered bug (i) until this fix; even after, those slots depend on
+  //   /dev/tty0 being opened successfully). The unwind path therefore
+  //   just closes the redirected fd -- the slot returns to 0 and
+  //   subsequent shell writes take dispatch_write's UART fallback, which
+  //   is exactly what the shell had before the redirect. If a future init
+  //   populates stdio with a real vnode, a follow-up will grow this pair
+  //   to sys_dup2(target_fd, save_slot) before the redirect and dup2 back
+  //   afterward -- sys_dup2 now accepts stdio fds on both sides for
+  //   exactly that shape.
+  // ==========================================================================
+
+  // apply_pre_dispatch_redirects() -> u64
+  //
+  // Scans Tokenizer's argv_buf/argc for '>'/'>>'/'<' operators. For each
+  // hit, opens the following filename token, sys_dup2's the new fd onto
+  // the target (1 for '>'/'>>'; 0 for '<'), closes the new fd, and drops
+  // both the operator and filename tokens from argv (left-compact write
+  // cursor). Updates argc to the post-scrub count.
+  //
+  // Returns a bitmap of target_fds that were successfully retargeted:
+  //   bit 0 set -> fd 0 was redirected
+  //   bit 1 set -> fd 1 was redirected
+  //   bit 2 set -> fd 2 was redirected
+  // (Higher bits reserved for future save-slot state.) 0 means "no
+  // redirects present or every candidate was malformed"; the caller
+  // still runs dispatch_line/exec_child but does not need to unwind.
+  //
+  // Best-effort: a sys_open failure or a missing filename token drops
+  // that redirect silently and the loop continues -- same posture as
+  // exec_child's rd_apply_open_err. Idempotent on an already-scrubbed
+  // argv (returns 0 and touches nothing).
+  //
+  // Register plan (mirrors exec_child's rd_ scan):
+  //   rbx = accumulated bitmap (survives sys_open/sys_dup2/sys_close)
+  //   r12 = argc, loaded once
+  //   r13 = read_idx, r14 = write_idx
+  //   r15 = current token ptr / target_fd carrier (as in exec_child)
+  // All five are callee-save; strlen/memcmp/sys_* touch only caller-save.
+  // Rax/rcx/rdx/rdi/rsi/r8-r11 are NOT trusted across CALL or SYSCALL
+  // (dispatch.pdx-wide convention -- see resolve_path's rp_hit reload
+  // discipline); every argv_buf[i] use is reloaded fresh.
+  //
+  // Reserved-label discipline: every label is apr_-prefixed (bare `loop`,
+  // `if`, `top`, `done` are paideia-as keywords).
+  pub let apply_pre_dispatch_redirects : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "paideia-os #2469 (R119.M2, #2472): scans Tokenizer argv_buf for '>'/'>>'/'<' and applies each redirect to the shell's OWN fd_table via sys_open + sys_dup2 + sys_close, left-compacts argv, updates argc, and returns a bitmap (bit N = target_fd N was retargeted). Called from shell.pdx main_loop BEFORE dispatch_line so that both builtins (in-process) and external commands (post-fork via exec_child) see the redirect applied. Structural twin of exec_child's rd_ scan (same argc/argv walk, same open+dup2+close+compact shape, same operator constants from Tokenizer rodata), but this one runs in the PARENT shell process (whereas exec_child's runs in the forked child); the parent needs the redirect for builtins that never fork, and the child inherits it across fork for the external-command path. exec_child's own rd_ scan is preserved as defense-in-depth: on an already-scrubbed argv it left-compacts verbatim and dups nothing (idempotent). Best-effort taxonomy: sys_open failure or missing filename drops that redirect silently and the loop continues, mirroring rd_apply_open_err/rd_apply_no_target. 2>&1 is intentionally NOT handled here (it's a fd-to-fd redirect, not a file open; exec_child's own rd_ scan still covers it for external commands; a builtin-side 2>&1 is a future add). Register plan: rbx=bitmap (must survive every nested call; not touched by strlen/memcmp/sys_* per SysV callee-save + the syscall_shim's `mov rax,N; syscall; ret` shape that clobbers only rcx/r11 beyond rax), r12=argc, r13=read_idx, r14=write_idx, r15=token_ptr/target_fd -- exactly the layout exec_child uses so its debugger discipline for rd_ transfers verbatim. Bitmap-set uses `or rbx, imm8` (1/2/4 for fd 0/1/2) rather than a variable shift so the encoder path stays on 8-bit immediates (avoids the codebase's `shl reg, cl` cases and the `and r11, imm64` pitfall class entirely). Encoder-gap discipline: no `test rN,rN` (uses cmp rN,0); no `add reg,[mem]` (indexed loads via [base + idx*8]); no 2-op `imul r,imm`. Alignment: 5-push prologue (40B) + return-addr (8B) = 48B = 16 mod 0 at every nested call site, matching every other 5-push callee in this file. Pushing rax mid-flow (across sys_dup2/sys_close) breaks that to %16==8 -- safe because syscall_shim entries are `mov+syscall+ret` with no C-ABI callee inside. Effects/capabilities `!{mem,sysreg} @{fs}` cover argv scans + open/dup2/close syscalls; no fingerprint emitted (the existing exec_child rd_ scan's 'shell redirect ok' fingerprint stays -- for builtin paths, the caller is expected to add its own witness at the main_loop callsite if desired). Reserved-label discipline: every label apr_-prefixed.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        xor rbx, rbx;                    // bitmap = 0
+
+        lea rax, [rip + argc];
+        mov r12, [rax];                  // r12 = argc
+        xor r13, r13;                    // r13 = read_idx
+        xor r14, r14;                    // r14 = write_idx
+
+      apr_loop:
+        cmp r13, r12;
+        jge apr_compact_done;
+
+        lea rax, [rip + argv_buf];
+        mov r15, [rax + r13*8];          // r15 = argv_buf[read_idx]
+        mov rdi, r15;
+        call strlen;                     // rax = strlen(token)
+
+        cmp rax, 2;
+        je apr_try_gtgt;
+        cmp rax, 1;
+        jne apr_keep_token;
+
+        // len == 1: '>' or '<'
+        mov rdi, r15;
+        lea rsi, [rip + redirect_gt];
+        mov rdx, 1;
+        call memcmp;
+        cmp rax, 0;
+        je apr_gt_single;
+
+        mov rdi, r15;
+        lea rsi, [rip + redirect_lt];
+        mov rdx, 1;
+        call memcmp;
+        cmp rax, 0;
+        je apr_lt;
+
+        jmp apr_keep_token;
+
+      apr_try_gtgt:
+        mov rdi, r15;
+        lea rsi, [rip + redirect_gtgt];
+        mov rdx, 2;
+        call memcmp;
+        cmp rax, 0;
+        jne apr_keep_token;
+        // matched ">>": append to stdout
+        mov r15, 1;                       // target_fd = 1
+        mov rsi, 0x241;                    // O_WRONLY|O_CREAT|O_APPEND (see vfs_open.pdx)
+        jmp apr_open_common;
+
+      apr_gt_single:
+        mov r15, 1;                       // target_fd = 1
+        mov rsi, 0xC1;                     // O_WRONLY|O_CREAT|O_TRUNC
+        jmp apr_open_common;
+
+      apr_lt:
+        mov r15, 0;                       // target_fd = 0
+        mov rsi, 0;                        // O_RDONLY
+        jmp apr_open_common;
+
+      apr_open_common:
+        // Need argv_buf[read_idx + 1] as the filename token.
+        mov rax, r13;
+        add rax, 1;
+        cmp rax, r12;
+        jge apr_no_target;
+
+        lea rcx, [rip + argv_buf];
+        mov rdi, [rcx + rax*8];           // filename ptr
+        mov rdx, 0x1A4;                    // mode 0644
+        call sys_open;                     // rax = new_fd or -errno
+        cmp rax, 0;
+        jl apr_open_err;
+
+        // rax = new_fd. Preserve it across sys_dup2 by stashing on stack
+        // (rbx-r15 are all live; syscalls only clobber rax/rcx/r11).
+        push rax;                          // save new_fd  (%16 breaks to 8; safe for syscall shims)
+        mov rdi, rax;                      // oldfd = new_fd
+        mov rsi, r15;                      // newfd = target_fd
+        call sys_dup2;
+        pop rdi;                           // restore new_fd
+        call sys_close;
+
+        // Mark bit r15 in the bitmap (r15 is 0/1/2 -> or with 1/2/4).
+        cmp r15, 0;
+        je apr_mark_stdin;
+        cmp r15, 1;
+        je apr_mark_stdout;
+        or rbx, 4;                         // fd 2
+        jmp apr_consumed;
+      apr_mark_stdin:
+        or rbx, 1;
+        jmp apr_consumed;
+      apr_mark_stdout:
+        or rbx, 2;
+
+      apr_consumed:
+        add r13, 2;                        // dropped operator + filename
+        jmp apr_loop;
+
+      apr_open_err:
+        // Malformed redirect: drop operator + filename silently.
+        add r13, 2;
+        jmp apr_loop;
+
+      apr_no_target:
+        // Operator with no following token: drop just the operator.
+        add r13, 1;
+        jmp apr_loop;
+
+      apr_keep_token:
+        // Not a redirect: left-compact copy argv_buf[read] -> argv_buf[write].
+        lea rax, [rip + argv_buf];
+        mov [rax + r14*8], r15;
+        add r13, 1;
+        add r14, 1;
+        jmp apr_loop;
+
+      apr_compact_done:
+        // NUL-pointer-terminate compacted argv; update argc.
+        lea rax, [rip + argv_buf];
+        xor rcx, rcx;
+        mov [rax + r14*8], rcx;
+        lea rax, [rip + argc];
+        mov [rax], r14;
+
+        mov rax, rbx;                      // return bitmap
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    } @no_frame
+
+  // unwind_pre_dispatch_redirects(bitmap) -> ()
+  //
+  // Inverse of apply_pre_dispatch_redirects. For each bit set in `bitmap`,
+  // sys_close's the corresponding fd (0, 1, or 2). This drops the vnode
+  // refcount held by the redirect's sys_dup2, so on the shell's next
+  // write to that fd, dispatch_write's fd_table probe finds an empty
+  // slot and takes the UART fallback -- identical to the pre-redirect
+  // behavior in a shell whose stdio was never externally installed. See
+  // the header block above for the save/restore extension path (needs
+  // sys_dup2 accepting stdio on both sides, which this fix landed).
+  //
+  // rdi = bitmap (u64; only bits 0/1/2 consulted).
+  //
+  // Reserved-label discipline: upr_-prefixed.
+  pub let unwind_pre_dispatch_redirects : (u64) -> () !{sysreg} @{fs} =
+    fn (bitmap: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {fs},
+      justification: "paideia-os #2469 (R119.M2, #2472): closes each fd the companion apply_pre_dispatch_redirects retargeted, restoring the shell's fd_table[0/1/2] to 'empty' so dispatch_write's fd 1/2 probe falls back to UART for subsequent shell output (prompt, error messages, next command's dispatch). 1-push prologue (rbx) preserves the bitmap across sys_close's syscall shim (which only clobbers rax/rcx/r11 beyond rax, but rbx is callee-save regardless). Bit-test uses `mov rax, rbx; and rax, imm8; cmp rax, 0; je` rather than `test rbx, imm` (paideia-as encoder pitfall list — no `test rN, rN` and defensive against test-with-imm gaps). Three fixed sys_close calls in sequence rather than a loop -- simplest possible shape for a three-element enumeration; the loop version would need a shift/loop-index register but gain no size benefit. If bitmap is 0 (no redirects were applied), all three branches fall through and the function returns without any syscall. Effects/capabilities `!{sysreg} @{fs}` match sys_close's own row. Alignment: 1-push prologue (8B) + return-addr (8B) = 16 = 0 mod 16 at every syscall shim callsite -- but shims are `mov rax,N; syscall; ret` (no nested C-ABI call) so alignment is irrelevant; the push is purely for rbx preservation. Reserved-label discipline: upr_-prefixed.",
+      block: {
+        push rbx;
+        mov rbx, rdi;                      // rbx = bitmap
+
+        mov rax, rbx;
+        and rax, 1;
+        cmp rax, 0;
+        je upr_check_stdout;
+        mov rdi, 0;
+        call sys_close;
+
+      upr_check_stdout:
+        mov rax, rbx;
+        and rax, 2;
+        cmp rax, 0;
+        je upr_check_stderr;
+        mov rdi, 1;
+        call sys_close;
+
+      upr_check_stderr:
+        mov rax, rbx;
+        and rax, 4;
+        cmp rax, 0;
+        je upr_end;
+        mov rdi, 2;
+        call sys_close;
+
+      upr_end:
+        pop rbx;
         ret
       }
     } @no_frame

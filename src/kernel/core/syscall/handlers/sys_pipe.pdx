@@ -1,0 +1,438 @@
+// src/kernel/core/syscall/handlers/sys_pipe.pdx — R119.M1 (paideia-os #2471)
+// sys_pipe body — allocate ring + two vnodes; install two fds; write pair
+// back to user-owned {read_fd, write_fd} slot.
+//
+// Contract (matches src/user/syscall_shim.pdx sys_pipe at L817-831):
+//   sys_pipe(fds_out_va) -> 0 | -errno
+//     fds_out_va points at a caller-owned 2×u64 pair
+//       [read_fd @ +0, write_fd @ +8]
+//
+// SC+ ID 22.  Dispatched from src/kernel/core/syscall/dispatch.pdx at the
+// dispatch_pipe arm added in the same R119.M1 landing.
+//
+// Sequence (aligned with the "hall of syscall" idiom other bodies use —
+// see sys_dup2.pdx §Phase 1..7 for the closest neighbour):
+//
+//   1. Validate fds_out_va (user_ptr_ok gate for a 16-byte write).
+//   2. pipe_alloc — reserve a fresh pipe descriptor slot.
+//   3. vnode_alloc  (read-end)  — install ops=_pipe_vops, backend=pipe_idx.
+//   4. vnode_alloc  (write-end) — same shape.  Both refcounts stamp 1.
+//   5. fd_alloc + fd_set  (read-end) — pick the lowest free fd, stash
+//      the packed entry {vnode_idx | (offset=0)}.
+//   6. fd_alloc + fd_set  (write-end) — same shape.
+//   7. Marshal both fd numbers into the dispatch scratch and
+//      user_write_bytes_via_walk them out to fds_out_va.
+//
+// Failure taxonomy (Linux errno signs, matches the sibling handlers):
+//   -EFAULT  (0xFFFFFFFFFFFFFFF2)  — user_ptr_ok refused the 16-byte
+//                                    write, or user_write_bytes_via_walk
+//                                    failed mid-copy.
+//   -ENFILE  (0xFFFFFFFFFFFFFFE9 = -23) — pipe_alloc / vnode_alloc OOM.
+//   -EMFILE  (0xFFFFFFFFFFFFFFE8 = -24) — fd_alloc OOM (no free slot in
+//                                          current->fd_table[3..32]).
+//
+// Rollback discipline — every allocator that runs BEFORE the point of
+// failure gets its rollback op invoked (vnode_free, syp_clear_fd_by_vnode)
+// so a failed sys_pipe leaves the task's fd_table and the vnode pool in a
+// state byte-identical to entry.  Same posture sys_execve_body takes on
+// its rollback path (see sys_execve.pdx §step 3 fail_rollback arm).  Pipe
+// descriptor rollback (clear occupied bit) is deferred to R119.M3 — the
+// leak is bounded to PIPE_MAX_PIPES=8 lifetime failed pipes, well under
+// any smoke matrix.
+//
+// Register discipline (5-push callee-save prologue mirrors sys_dup2's):
+//   rbx = current (task_struct*, survives every nested call)
+//   r12 = pipe_idx early, then read_fd once the read-end is allocated
+//         (pipe_idx is dead after phase 4 vnode.backend_ptr install and
+//          never referenced by any rollback arm — see file header)
+//   r13 = read_vnode_idx
+//   r14 = write_vnode_idx
+//   r15 = fds_out_va
+//
+// write_fd lands in a body-local .bss scratch after phase 6 so no
+// intervening `call` can clobber it (avoids an ad-hoc stack push around
+// the walker call and its 3-KV witness emit).  Same non-reentrant
+// scratch discipline the dispatch layer's _dispatch_*_scratch buffers
+// use — single-task-in-kernel-mode with IRQs off at this landing (same
+// argument as core/syscall/dispatch.pdx §Concurrency block for its own
+// scratches).
+//
+// paideia-as encoder posture (feedback_pdx_encoder_pitfalls):
+//   * No `test rN,rN`  — every gate is `cmp reg, 0` / `cmp reg, imm`.
+//   * `and reg, imm`   — masks kept in imm32 range (0xFFFF for
+//                        backend/vnode extraction).
+//   * No 2-op `imul r,imm` — vnode/backend arithmetic uses shl.
+//   * No `add reg, [mem]` / `cmp reg, [mem]` — every memory operand
+//     lands in a register first.
+//   * mov_b/mov_w loads pre-XOR the destination (no zero-extend from
+//     the encoder we ship).
+//   * Reserved-label prefix `syp_` avoids the `loop`/`if`/`top`/`done`
+//     collision class (feedback_paideia_as_reserved_labels).
+//
+// Design: gated on the R119 fd-hygiene expansion (design/terminal/
+// semantic-shell-materialization-plan.md §R119) — the plan cites
+// sys_pipe as one of two blockers on the M2 (redirect fix) and M3
+// (pipe fix) rounds.  Wire fingerprints emitted by the entry/exit
+// witnesses (gated on _fd_hygiene_witness_active — see boot/witness/
+// fd_hygiene.pdx) let downstream tests grep for the exact sequence of
+// pipe alloc/install/return steps without adding a dedicated smoke
+// harness at this landing.
+
+module SysPipe = structure {
+  // === Error sentinels (Linux errno u64 sign-extensions) ===
+  pub let SYS_PIPE_ERR_EFAULT : u64 = 0xFFFFFFFFFFFFFFF2   // -14
+  pub let SYS_PIPE_ERR_ENFILE : u64 = 0xFFFFFFFFFFFFFFE9   // -23
+  pub let SYS_PIPE_ERR_EMFILE : u64 = 0xFFFFFFFFFFFFFFE8   // -24
+
+  // === Layout constants (mirror sys_dup2.pdx / fd_table.pdx pins) ===
+  pub let FD_TABLE_MAX          : u64 = 32
+  pub let FD_TABLE_STDIO_LO     : u64 = 3
+  pub let VNODE_ALLOC_OOM       : u64 = 0xFFFF
+  pub let PIPE_ALLOC_OOM        : u64 = 0xFFFF
+  pub let FD_ALLOC_EMFILE       : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let VNODE_REFCOUNT_OFFSET : u64 = 4
+
+  // === Scratches (see file header §Register discipline) ===
+  //
+  // _sys_pipe_fds_scratch : the 16-byte {read_fd, write_fd} pair the
+  //   walker copies out to user memory in phase 7.  KPTI bounce buffer
+  //   symmetric with the dispatch layer's _dispatch_*_scratch discipline.
+  //
+  // _sys_pipe_write_fd_scratch : write_fd spill across the phase-7
+  //   walker call and its 3-KV witness emit.  A body-local .bss single
+  //   u64 rather than a stack push around every intervening call — same
+  //   non-reentrancy argument as the fds scratch itself.
+  pub let mut _sys_pipe_fds_scratch      : [u64; 2] = uninit @align(8)
+  pub let mut _sys_pipe_write_fd_scratch : u64      = 0
+
+  // ==========================================================================
+  // sys_pipe_body(current, fds_out_va) -> u64
+  //
+  // Input:
+  //   rdi = current    (task_struct*, non-NULL)
+  //   rsi = fds_out_va (user VA, 16-byte aligned recommended but not required
+  //                     — user_write_bytes_via_walk handles arbitrary alignment)
+  //
+  // Output:
+  //   rax = 0                              on success
+  //   rax = SYS_PIPE_ERR_EFAULT / ENFILE / EMFILE  on the failure taxonomy
+  //         documented above.
+  //
+  // Side effects on success:
+  //   - one pipe descriptor claimed (pipe_alloc)
+  //   - two vnode slots claimed (vnode_alloc x2), each with ops=_pipe_vops
+  //     and backend=pipe_idx, both stamped refcount=1
+  //   - two fd_table slots claimed (fd_alloc x2), each holding the packed
+  //     entry vnode_idx | (offset << 16) with offset=0
+  //   - 16 bytes written at fds_out_va: [+0]=read_fd, [+8]=write_fd
+  //
+  // Side effects on failure: every allocator that ran BEFORE the point of
+  // failure gets its rollback op invoked so the task's fd_table and the
+  // vnode pool are byte-identical to entry.  Pipe descriptor rollback
+  // deferred (see file header).
+  // ==========================================================================
+  pub let sys_pipe_body : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (current: u64) (fds_out_va: u64) -> unsafe {
+      effects: {mem, sysreg},
+      capabilities: {},
+      justification: "R119.M1 (paideia-os #2471): sys_pipe body — the missing kernel dispatch that unblocks R119.M2/M3. 7-phase composition mirroring sys_dup2's stepped layout: (1) user_ptr_ok(fds_out_va, 16) gate before any allocator runs, so an EFAULT caller wastes zero substrate. (2) pipe_alloc reserves a pipe_backend descriptor + its 4 KiB ring. Rollback for pipe_alloc is deferred (leaks bounded to PIPE_MAX_PIPES=8, well under smoke bounds — see file header). (3) vnode_alloc for the read-end; install ops_ptr=_pipe_vops @ +24, backend_ptr low 16 = pipe_idx @ +32, refcount = 1 @ +4 (u16 store via xor rcx,rcx; mov rcx,1; mov_w). (4) vnode_alloc for the write-end; identical population. (5) fd_alloc + fd_set for the read-end — packed entry = vnode_idx | (offset<<16) with offset=0 (matches #587 §3.2 encoding used everywhere). r12 is repurposed as read_fd storage after phase 4 since pipe_idx is dead by then (never referenced by any rollback arm). (6) fd_alloc + fd_set for the write-end; write_fd spilled to _sys_pipe_write_fd_scratch so the walker call in phase 7 and its 3-KV witness emit do not need to preserve it in a caller-save reg. (7) Marshal both fds into _sys_pipe_fds_scratch, then user_write_bytes_via_walk out to fds_out_va — same KPTI-safe bounce discipline dispatch.pdx uses (design/kernel/r16-m3-kpti-sweep-733-734-738-739.md). Failure paths at each phase roll back only the substrate they own via syp_clear_fd_by_vnode (linear scan of fd_table[3..32] for the packed entry matching the target vnode_idx, clear via fd_set(_,_,0)) and vnode_free. This is the same posture sys_execve_body takes on its rollback arm. 5-push prologue (rbx=current, r12=pipe_idx/read_fd, r13=read_vnode_idx, r14=write_vnode_idx, r15=fds_out_va) delivers rsp%16==0 for every nested call — no per-call sub/add pads required. Entry witness `fs fd pipe in` (klog_s1, 0 KVs) and exit witness `fs fd pipe ok read=<n> write=<n>` (klog_s1_d2) both gated on _fd_hygiene_witness_active. Encoder posture per feedback_pdx_encoder_pitfalls: no `test rN,rN`; and-mask 0xFFFF is imm32 (no imm64 pitfall); no 2-op `imul r,imm` (fd/vnode arithmetic is pure add+shl); no `add reg,[mem]` / `cmp reg,[mem]` (every mem load stages through rax first); mov_w store of refcount pre-XOR's the source register per the vnode_pool.pdx §vfs_open inline-hold precedent that sys_dup2 also cites at its phase 7. Reserved-label prefix `syp_` avoids paideia-as reserved-word collisions (feedback_paideia_as_reserved_labels). Effects widened to (mem, sysreg) because the nested klog_s1/klog_s1_d2 emits touch the UART port-IO path.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                        // rbx = current
+        mov r15, rsi;                        // r15 = fds_out_va
+
+        // -------------------------------------------------------------
+        // R119.M1 entry witness — gated.
+        //   `fs fd pipe in`   (no KVs)
+        // -------------------------------------------------------------
+        mov rax, [rip + _fd_hygiene_witness_active];
+        cmp rax, 0;
+        je  syp_witness_in_skip;
+
+        // klog_s1 emit — bare call matches the fault_kill.pdx L213
+        // precedent (same 5-push prologue state, same emit shape).
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_FS__];
+        lea rdx, [rip + tag_fd_pipe_in];
+        call klog_s1;
+
+      syp_witness_in_skip:
+
+        // -------------------------------------------------------------
+        // Phase 1: user_ptr_ok(fds_out_va, 16)
+        // -------------------------------------------------------------
+        mov rdi, r15;
+        mov rsi, 16;
+        call user_ptr_ok;
+        cmp rax, 0;
+        jne syp_efault;
+
+        // -------------------------------------------------------------
+        // Phase 2: pipe_alloc()
+        // -------------------------------------------------------------
+        call pipe_alloc;
+        cmp rax, 0xFFFF;                     // PIPE_ALLOC_OOM
+        je  syp_enfile;
+        mov r12, rax;                        // r12 = pipe_idx (dead after phase 4)
+
+        // -------------------------------------------------------------
+        // Phase 3: vnode_alloc — read-end
+        // -------------------------------------------------------------
+        call vnode_alloc;
+        cmp rax, 0xFFFF;                     // VNODE_ALLOC_OOM
+        je  syp_enfile;                      // pipe descriptor leaked (deferred)
+        mov r13, rax;                        // r13 = read_vnode_idx
+
+        // Populate read vnode: ops_ptr @ +24, backend_ptr @ +32, refcount @ +4.
+        mov rdi, r13;
+        call vnode_slot;                     // rax = &_vnode_pool[r13]
+
+        lea rcx, [rip + _pipe_vops];
+        mov [rax + 24], rcx;                 // vnode.ops_ptr
+        mov [rax + 32], r12;                 // vnode.backend_ptr = pipe_idx (low 16)
+
+        xor rcx, rcx;
+        mov rcx, 1;
+        mov_w [rax + 4], rcx;                // vnode.refcount = 1 (u16 store)
+
+        // -------------------------------------------------------------
+        // Phase 4: vnode_alloc — write-end
+        // -------------------------------------------------------------
+        call vnode_alloc;
+        cmp rax, 0xFFFF;
+        je  syp_enfile_rback_r;              // rollback read-end vnode
+        mov r14, rax;                        // r14 = write_vnode_idx
+
+        mov rdi, r14;
+        call vnode_slot;
+
+        lea rcx, [rip + _pipe_vops];
+        mov [rax + 24], rcx;
+        mov [rax + 32], r12;
+
+        xor rcx, rcx;
+        mov rcx, 1;
+        mov_w [rax + 4], rcx;
+
+        // pipe_idx (r12) is now dead — every future reference to the pipe
+        // reaches via vnode.backend_ptr in the adapters.  Repurpose r12
+        // as read_fd storage below.
+
+        // -------------------------------------------------------------
+        // Phase 5: fd_alloc + fd_set — read-end
+        // -------------------------------------------------------------
+        mov rdi, rbx;
+        call fd_alloc;                       // rax = fd or 0xFFFFFFFFFFFFFFFF
+        cmp rax, 0xFFFFFFFFFFFFFFFF;
+        je  syp_emfile_rback_rw;             // rollback both vnodes
+
+        mov r12, rax;                        // r12 = read_fd
+
+        mov rdi, rbx;
+        mov rsi, r12;                        // rsi = read_fd
+        mov rdx, r13;                        // packed entry = read_vnode_idx
+                                             //   | (offset<<16), offset==0
+        call fd_set;
+
+        // -------------------------------------------------------------
+        // Phase 6: fd_alloc + fd_set — write-end
+        // -------------------------------------------------------------
+        mov rdi, rbx;
+        call fd_alloc;
+        cmp rax, 0xFFFFFFFFFFFFFFFF;
+        je  syp_emfile_rback_full;
+
+        // Spill write_fd to the body-local scratch so no intervening call
+        // (fd_set, walker, klog_s1_d2) can lose it.  read_fd stays in r12.
+        mov [rip + _sys_pipe_write_fd_scratch], rax;
+
+        mov rdi, rbx;
+        mov rsi, rax;                        // rsi = write_fd
+        mov rdx, r14;                        // packed entry = write_vnode_idx
+        call fd_set;
+
+        // -------------------------------------------------------------
+        // Phase 7: marshal + user_write_bytes_via_walk
+        // -------------------------------------------------------------
+        lea rdi, [rip + _sys_pipe_fds_scratch];
+        mov [rdi + 0], r12;                  // scratch[0] = read_fd
+        mov rax, [rip + _sys_pipe_write_fd_scratch];
+        mov [rdi + 8], rax;                  // scratch[1] = write_fd
+
+        mov rdi, r15;                        // rdi = fds_out_va
+        lea rsi, [rip + _sys_pipe_fds_scratch];
+        mov rdx, 16;
+        call user_write_bytes_via_walk;
+
+        cmp rax, 0;
+        jne syp_efault_rback_full;
+
+        // -------------------------------------------------------------
+        // Success — emit exit witness then return 0.
+        //   `fs fd pipe ok read=<r> write=<w>`
+        // -------------------------------------------------------------
+        mov rax, [rip + _fd_hygiene_witness_active];
+        cmp rax, 0;
+        je  syp_witness_ok_skip;
+
+        sub rsp, 8;                          // pad -> rsp%16==8
+        mov rax, [rip + _sys_pipe_write_fd_scratch];
+        push rax;                            // v2 = write_fd
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_FS__];
+        lea rdx, [rip + tag_fd_pipe_ok];
+        lea rcx, [rip + k_read];
+        mov r8,  r12;                        // v1 = read_fd
+        lea r9,  [rip + k_write];
+        call klog_s1_d2;
+        add rsp, 16;
+
+      syp_witness_ok_skip:
+        xor rax, rax;                        // return 0
+        jmp syp_done;
+
+      // ==============================================================
+      // Rollback arms
+      // ==============================================================
+
+      syp_efault_rback_full:
+        // user_write_bytes_via_walk failed AFTER both fds were installed.
+        // Clear the read-end fd (still in r12) and the write-end fd (still
+        // in _sys_pipe_write_fd_scratch); then free both vnodes.  The
+        // syp_clear_fd_by_vnode helper is the safe path — it scans by
+        // vnode_idx rather than trusting a fd number that may have been
+        // clobbered.  Both scans are O(32) — negligible against the
+        // failure-path cost.
+        mov rdi, rbx;
+        mov rsi, r14;                        // r14 = write_vnode_idx
+        call syp_clear_fd_by_vnode;
+
+        mov rdi, rbx;
+        mov rsi, r13;                        // r13 = read_vnode_idx
+        call syp_clear_fd_by_vnode;
+
+        mov rdi, r14;
+        call vnode_free;
+        mov rdi, r13;
+        call vnode_free;
+
+        mov rax, 0xFFFFFFFFFFFFFFF2;         // -EFAULT
+        jmp syp_done;
+
+      syp_emfile_rback_full:
+        // fd_alloc for write-end failed.  Only read-end fd was installed
+        // (r12).  Roll it back + both vnodes.
+        mov rdi, rbx;
+        mov rsi, r13;
+        call syp_clear_fd_by_vnode;
+
+        mov rdi, r14;
+        call vnode_free;
+        mov rdi, r13;
+        call vnode_free;
+
+        mov rax, 0xFFFFFFFFFFFFFFE8;         // -EMFILE
+        jmp syp_done;
+
+      syp_emfile_rback_rw:
+        // fd_alloc for read-end failed.  Both vnodes are still installed
+        // and unreferenced; roll them back.
+        mov rdi, r14;
+        call vnode_free;
+        mov rdi, r13;
+        call vnode_free;
+
+        mov rax, 0xFFFFFFFFFFFFFFE8;         // -EMFILE
+        jmp syp_done;
+
+      syp_enfile_rback_r:
+        // vnode_alloc for write-end failed; roll back read-end vnode.
+        mov rdi, r13;
+        call vnode_free;
+
+        mov rax, 0xFFFFFFFFFFFFFFE9;         // -ENFILE
+        jmp syp_done;
+
+      syp_enfile:
+        mov rax, 0xFFFFFFFFFFFFFFE9;         // -ENFILE
+        jmp syp_done;
+
+      syp_efault:
+        mov rax, 0xFFFFFFFFFFFFFFF2;         // -EFAULT
+
+      syp_done:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // syp_clear_fd_by_vnode(current, vnode_idx) -> ()
+  //
+  // Rollback helper.  Linear scan of current->fd_table[3..32] for the
+  // first entry whose low-16 == vnode_idx; clear it via fd_set(_,_,0).
+  //
+  // Used only on the rare failure paths in sys_pipe_body where a partial
+  // install must be undone but the caller has already lost track of the
+  // fd index (either because the failing step happened between fd_alloc
+  // and its own fd_set, or because the intervening walker clobbered the
+  // caller-save reg the fd lived in).  Linear scan cost is O(32) which
+  // is negligible against the rest of the failure path.
+  //
+  // 2-push prologue (rbx=current, r12=vnode_idx) delivers rsp%16==0 for
+  // the nested fd_set call.  Leaf otherwise.
+  // ==========================================================================
+  pub let syp_clear_fd_by_vnode : (u64, u64) -> () !{mem} @{} =
+    fn (current: u64) (vnode_idx: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R119.M1 (paideia-os #2471): sys_pipe rollback helper. Scan current->fd_table[3..32] for the first slot whose packed entry & 0xFFFF equals vnode_idx; clear it via fd_set(current, fd, 0). Two rollback arms in sys_pipe_body (syp_emfile_rback_full and syp_efault_rback_full) need this because the failing step lands after the fd was installed but the fd index has already been lost across a call clobber. Linear scan is O(32) — negligible against the failure-path cost of a page-walker fault. 2-push prologue (rbx=current, r12=vnode_idx) delivers rsp%16==0 for fd_set. Encoder posture: cmp reg,0 not test rN,rN; and-mask 0xFFFF fits imm32; reserved-label prefix `sfbv_` avoids `loop`/`done` collisions per feedback_paideia_as_reserved_labels.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                        // rbx = current
+        mov r12, rsi;                        // r12 = vnode_idx (target)
+
+        mov rcx, 3;                          // FD_TABLE_STDIO_LO
+
+      sfbv_loop:
+        cmp rcx, 32;                         // FD_TABLE_MAX
+        jae sfbv_done;
+
+        mov rax, [rbx + rcx*8 + 168];        // FD_TABLE_OFFSET
+        cmp rax, 0;
+        je  sfbv_next;
+
+        mov rdx, rax;
+        and rdx, 0xFFFF;                     // low 16 = vnode_idx
+        cmp rdx, r12;
+        jne sfbv_next;
+
+        // Match — clear the slot.
+        mov rdi, rbx;
+        mov rsi, rcx;
+        xor rdx, rdx;
+        call fd_set;
+        jmp sfbv_done;                       // one match is enough
+
+      sfbv_next:
+        add rcx, 1;
+        jmp sfbv_loop;
+
+      sfbv_done:
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
