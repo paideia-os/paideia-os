@@ -106,6 +106,21 @@ Networking environment variables:
     unconditionally regardless of this flag -- see the flag's own
     composition-site comment below for the full rationale. Default `0`.
 
+  PAIDEIA_KVM=<0|1>
+    Enable KVM hardware acceleration. Default: `0` (TCG software
+    emulation, byte-identical to pre-PAIDEIA_KVM boots -- required for
+    smoke-fingerprint stability). Set `1` for interactive work and
+    tool-execution latency (5-20x speedup on syscall / branch-heavy
+    userland like mkfs.pdxfs, libpdx-audit).
+    - 0 : `-cpu max` (current default). TCG lacks TSC-DEADLINE, so the
+          LAPIC init path takes the periodic-timer fallback that the
+          R10 / R11 timer-witness fingerprints assert against.
+    - 1 : `-enable-kvm -cpu host` (REPLACES `-cpu max`). Host CPU
+          features pass through; TSC-DEADLINE becomes visible and the
+          LAPIC uses it. THIS PERTURBS boot-timing / CPUID-derived
+          fingerprints -- do NOT set this for smoke lanes. Requires
+          /dev/kvm readable on the host (kvm-ok / ls /dev/kvm).
+
 Full invocation catalogue (host prerequisites, SLIRP addressing, hostfwd
 examples, IPv6 non-scope note): design/networking/qemu-net-invocation.md.
 
@@ -226,15 +241,40 @@ case "${COMPOSITOR_INIT:-0}" in
         ;;
 esac
 
+# PAIDEIA_KVM: opt-in KVM acceleration for interactive dev. Default 0
+# (TCG + `-cpu max`) preserves byte-identical arg lists and boot-timing
+# fingerprints for the smoke lanes -- R10/R11 witnesses assert against
+# the TCG LAPIC-periodic path. When set to 1, we swap `-cpu max` for
+# `-enable-kvm -cpu host` (NOT additive: `-cpu host` is only meaningful
+# with KVM, and `-cpu max` under KVM is a warning). Refuse cleanly if
+# /dev/kvm is unreadable rather than silently falling through to TCG.
+ACCEL_ARGS=(-cpu max)
+case "${PAIDEIA_KVM:-0}" in
+    0)
+        ;;
+    1)
+        if [[ ! -r /dev/kvm ]]; then
+            echo "PAIDEIA_KVM=1 but /dev/kvm not readable; check host KVM setup or unset PAIDEIA_KVM" >&2
+            exit 2
+        fi
+        ACCEL_ARGS=(-enable-kvm -cpu host)
+        ;;
+    *)
+        echo "PAIDEIA_KVM='${PAIDEIA_KVM}' invalid; expected 0 or 1" >&2
+        exit 2
+        ;;
+esac
+
 # PVH ELF Note emitted by paideia-as PA10-001; QEMU -kernel works directly.
 # Real bootloader integration (GRUB multiboot2 or Limine) is a Phase-12 work item.
-# R10-m2-002: QEMU TCG does not support TSC-DEADLINE. Using periodic timer mode instead.
-# Per design/audit/entries/r10-timer-delivery-diagnosis-001.md, P3 identified but
-# QEMU TCG limitation requires fallback to LAPIC periodic mode.
-# R11-m1-002: Add -cpu max to expose CPUID.01H:ECX[24] (TSC-DEADLINE support flag).
-# This enables LAPIC SVR and allows for future TSC-DEADLINE mode support.
+# R10-m2-002 / R11-m1-002: default `-cpu max` under TCG lacks TSC-DEADLINE,
+# so LAPIC init uses the periodic-timer fallback (see design/audit/entries/
+# r10-timer-delivery-diagnosis-001.md). Interactive dev may opt into KVM
+# via PAIDEIA_KVM=1 (see --help); that swaps to `-cpu host` and exposes
+# TSC-DEADLINE, which perturbs the R10/R11 timer fingerprints -- smoke
+# lanes must keep PAIDEIA_KVM unset.
 exec qemu-system-x86_64 \
-    -cpu max \
+    "${ACCEL_ARGS[@]}" \
     -kernel "${KERNEL}" \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     -serial stdio \
