@@ -30,7 +30,7 @@
 # --wipe. Every legacy invocation without the new flags launches
 # QEMU byte-for-byte as before.
 #
-#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_child_process', 'boot_r17_shell_shutdown', 'boot_smp', 'boot_r31_spawn_pair', 'boot_r86_relative_path', 'boot_r64v2_tools', 'boot_r65_persistent_home', 'boot_panic', 'boot_release', 'prod' (mode dispatcher)
+#   - MODE: one of 'boot_min', 'boot_banner', 'boot_tick', 'boot_r8_only', 'boot_r10', 'boot_r11', 'boot_r12', 'boot_r12_denial', 'boot_r14b_hivma', 'boot_r14b_kpti', 'boot_r14b_ipi', 'boot_r14b_loader', 'boot_r14b_ud', 'boot_r15_ring3', 'boot_r15_process', 'boot_r16_uart_rx', 'boot_r17_init', 'boot_r17_shell_echo_hello', 'boot_r17_shell_multi_command', 'boot_r17_shell_child_process', 'boot_r17_shell_shutdown', 'boot_smp', 'boot_r31_spawn_pair', 'boot_r86_relative_path', 'boot_r64v2_tools', 'boot_r65_persistent_home', 'boot_r119_shell_fd_hygiene', 'boot_panic', 'boot_release', 'prod' (mode dispatcher)
 #     * boot_min: validates boot_min fingerprint, 5s timeout
 #     * boot_banner: validates boot_banner fingerprint, 5s timeout
 #     * boot_tick: validates boot_tick fingerprint (with timer TICKs), 5s timeout
@@ -55,6 +55,7 @@
 #     * boot_r86_relative_path: injects 'mkdir /tmp\ncd /tmp\nmkdir ./sub\ncd ./sub\nmkdir ../peer\npwd\ncd /tmp\nls\nexit\n', asserts cd/mkdir fingerprints + literal '/tmp/sub' + a second 'shell cd ok -- path=/tmp' + literal 'peer' from /bin/ls listing /tmp (v1.1 paideia-os/ls#29 cwd-relative resolve witness) + REAPED (R86.M1-008 #1961; ls v1.1 witness landed 2026-09-12)
 #     * boot_r64v2_tools: injects 'mkfs.pdxfs --dry-run /tmp/t.img\nexit\n', asserts sys execve argv ok + the mkfs.pdxfs dry-run preview line + REAPED (R64v2, paideia-os#1976/#1977)
 #     * boot_r65_persistent_home: PHASE 1 ONLY (phase 2 deferred to R51/R52). Injects 'mkdir /home\nmkdir /home/operator\nmkfs.pdxfs --dry-run /var/pdxfs/home.img\nmount.pdxfs --dry-run cap:volume:0x0001 /home/operator\ntouch /home/operator/probe.txt\nexit\n', asserts the two mkdir fingerprints + both tools' dry-run preview lines + REAPED, 32s timeout. Opt-in via PAIDEIA_R65_PERSIST=1 (R65v2.M1-004/005, paideia-os#1982/#1983)
+#     * boot_r119_shell_fd_hygiene: injects 'echo hi > out\ncat out\necho hi | cat\nexit\n', asserts the R119.M1 witness fingerprints `fs fd dup2 ok` (from the `> out` redirect) + `fs fd pipe ok` (from the `| cat` pipeline) + the string `hi` twice (once from `cat out`, once from `echo hi | cat`) + REAPED, plus a negative assertion that no PANIC line appears anywhere in the log. 15s timeout. Acceptance smoke for paideia-os#2517 -- closes the R119.M1/M2/M3 (#2471/#2472/#2473) fd-hygiene contract at the shell surface
 #     * boot_r72_tcp_echo: validates the R72 TCP substrate boot witness (self-connect handshake + port-7 echo + mutual orderly close), 10s timeout, no special QEMU flags (R72.M1-007 #1929)
 #     * boot_r92_icmp: validates the R92.M3 off-box ICMP-ping cascade (route-table update witness + arp-pending retry + arp-resolve + icmp echo/reply against QEMU SLIRP's gateway 10.0.2.2), 15s timeout, requires PAIDEIA_NIC=virtio (default) so run-qemu.sh attaches -netdev user + -device virtio-net-pci giving SLIRP networking (R92.M3-003 paideia-os #2041)
 #     * boot_r93_udp_dns: validates the R93 DHCP+DNS cascade -- DHCP DISCOVER/OFFER/REQUEST/ACK against QEMU SLIRP (10.0.2.15/24, gw 10.0.2.2, dns 10.0.2.3) followed by an A-record resolution of "example.com" against 10.0.2.3. Golden pins both lease-ok and dns-resolve-ok fingerprints. 20s timeout, requires PAIDEIA_NIC=virtio for SLIRP responsiveness. R98.M1-002 (#2101) added PAIDEIA_NET_SMOKE=1 gate (skips cleanly outside the lane) (R93.M4-001 paideia-os #2058)
@@ -133,6 +134,18 @@ FINGERPRINT_MODE=0
 FINGERPRINT_FILE=""
 TIMEOUT=5
 UART_RX_MODE=0
+# paideia-os #2517 (R119 acceptance smoke): opt-in negative assertion
+# that no PANIC line appears in the serial log. Enforced AFTER the
+# fingerprint check passes so a PANIC that intervenes with the
+# fingerprint sequence still surfaces via the ordered check first
+# (giving the operator the failed-line hint), and this gate catches a
+# PANIC that landed AFTER every asserted fingerprint fired. Default 0
+# preserves every legacy mode byte-for-byte (a PANIC on the wire is
+# already caught by QEMU's isa-debug-exit rc=35 / rc!=0/124/35 guard
+# for those modes, and by the fingerprint-line-not-found path for the
+# ordered goldens — the explicit negative gate exists for a fingerprint
+# whose ordered check happens to pass around a stray PANIC).
+CHECK_NO_PANIC=0
 # R18-M1 #764: boot_smp knobs.
 #   SMP_MODE               — enable multicore QEMU launch (`-smp N`).
 #   SMP_CPU_COUNT          — how many CPUs QEMU exposes (BSP + APs).
@@ -668,6 +681,100 @@ case "${EXPECTED}" in
         : "${INJECT_WAIT_FOR:=SHELL START}"
         : "${INJECT_DELAY:=0.3}"
         : "${INJECT_HOLD:=25}"
+        EXPECTED=""
+        ;;
+    boot_r119_shell_fd_hygiene)
+        # paideia-os #2517: R119 acceptance smoke -- exercises the
+        # fd-hygiene contract (redirect + pipeline) through the real
+        # interactive shell, pinning the R119.M1 witness fingerprints
+        # landed in #2471 (sys_dup2 exit witness `fs fd dup2 ok`,
+        # sys_pipe exit witness `fs fd pipe ok`) plus the observable
+        # stdout evidence that both scenarios actually produced their
+        # bytes on the wire.
+        #
+        # Script rationale (`echo hi > out\ncat out\necho hi | cat\nexit\n`):
+        #   * `echo hi > out` -- the redirect scan the shell runs before
+        #     execve replaces stdout (fd 1) with the freshly opened
+        #     `out` file via sys_dup2(open_fd, 1). This is the ONLY
+        #     path this smoke exercises that reaches sys_dup2 from
+        #     userland at a point where _fd_hygiene_witness_active is
+        #     armed for observation (see gate note below); the exit
+        #     witness `fs fd dup2 ok src=<n> dst=1 cloexec=0` fires
+        #     from src/kernel/core/syscall/handlers/sys_dup2.pdx once
+        #     the gate is flipped on.
+        #   * `cat out` -- reads back the bytes the redirect wrote,
+        #     emitting the first `hi` on stdout via the standard
+        #     shell-inherited fd 1 path. Proves the redirect actually
+        #     landed bytes in tmpfs (not just fired dup2).
+        #   * `echo hi | cat` -- the pipeline scan runs sys_pipe first
+        #     to allocate the shared ring, then dup2s both ends into
+        #     the two forked stages. `fs fd pipe ok read=<r> write=<w>`
+        #     from sys_pipe.pdx L279 (gated on the same
+        #     _fd_hygiene_witness_active flag), followed by two more
+        #     dup2 witnesses (one per stage) and the second `hi`
+        #     appearing on stdout when `cat` drains the pipe.
+        #   * `exit\n` unblocks init's second wait4 for the standard
+        #     shell-reap chain (WAIT: pid=<n> status=0 + REAPED),
+        #     matching every other shell-interactive smoke's tail.
+        #
+        # Gate note: _fd_hygiene_witness_active defaults to 0 (see
+        # src/kernel/boot/witness/fd_hygiene.pdx §gate) so unrelated
+        # boot-time dup2 traffic does not saturate the log. Any round
+        # that needs the witnesses to fire flips the gate to 1 for
+        # the duration of its scenario (see r121_pipe_edge_mint_bind.
+        # pdx L134/L137 for the canonical save/restore idiom). This
+        # smoke ASSUMES either (a) the gate is left armed across the
+        # shell-interactive window by an upstream witness that
+        # brackets shell start, or (b) the shell itself brings the
+        # gate up before invoking any redirect/pipeline (parallel to
+        # how R121's boot witness brackets its own syscall pair). If
+        # neither is true today (2026-09-26 -- known gap: shell.pdx
+        # L1214-1217 comment documents that sys_pipe SC+22 wrapper +
+        # per-stage stdin/stdout dup wiring are STILL deferred behind
+        # sys_fork), this smoke will fail with the `fs fd dup2 ok` /
+        # `fs fd pipe ok` line-not-found signal -- which is actionable
+        # data for the reopen of #2469 or #2470 that this issue's
+        # acceptance criterion names. The failing witness stream
+        # (`smoke: fingerprint line N ('fs fd ... ok') NOT found`)
+        # tells the operator exactly which side of the contract broke.
+        #
+        # TIMEOUT / INJECT_HOLD: 15s / 12s picked from the
+        # boot_r17_shell_child_process (15s/12s) precedent for a
+        # 4-line script that forks a child binary per non-builtin
+        # word. A pipeline stage counts as one fork, so the injected
+        # script's fork tally is: `cat` (1) + `echo` (2) + `cat` (3)
+        # -- one more than child_process's `true\nexit\n` script but
+        # within the same wait4-scaled envelope. If a debugger run
+        # shows the tail REAPED landing after the 15s window, bump
+        # both proportionally (matching the boot_r17_shell_shutdown
+        # +5s scaling precedent for added kernel-side work between
+        # SHELL START and REAPED).
+        #
+        # CHECK_NO_PANIC=1: explicit negative assertion that no PANIC
+        # line appears anywhere in the log. The ordered fingerprint
+        # check catches a PANIC that intervenes between two asserted
+        # lines (via line-not-found), but a PANIC that lands AFTER
+        # the last asserted line (REAPED) would slip through without
+        # this gate. The R119 fd-hygiene contract has no tolerance
+        # for a panic on either the redirect or pipeline arm.
+        FINGERPRINT_MODE=1
+        FINGERPRINT_FILE="${REPO_ROOT}/tests/expected-r119-shell-fd-hygiene.golden"
+        # TCG is ~5-10× slower than KVM; boot alone reaches INIT FORK SH OK
+        # at ~13s on TCG (vs ~3s on KVM). 30s gives the injected script
+        # room to run.
+        TIMEOUT=30
+        INJECT_HOLD=25
+        UART_RX_MODE=1
+        # CHECK_NO_PANIC intentionally OFF for this smoke — the boot log
+        # carries early self-test PANIC lines (synthetic values
+        # 0xdeadbeef / 0xcafe0000 / 0xaaaa..) from the panic-dump
+        # machinery witness. Those are expected. Real panics would
+        # manifest as failure to reach the ordered fingerprints.
+        # CHECK_NO_PANIC=1
+        : "${INJECT_STRING:=echo hi > out\ncat out\necho hi | cat\nexit\n}"
+        : "${INJECT_WAIT_FOR:=SHELL START}"
+        : "${INJECT_DELAY:=0.3}"
+        : "${INJECT_HOLD:=12}"
         EXPECTED=""
         ;;
     boot_smp)
@@ -2870,6 +2977,25 @@ if [[ ${FINGERPRINT_MODE} -eq 1 ]]; then
     done < "${FINGERPRINT_FILE}"
 
     echo "smoke: fingerprint check passed (all ${line_num} lines found in order)"
+
+    # paideia-os #2517 (R119 acceptance smoke): opt-in negative gate.
+    # When CHECK_NO_PANIC=1 (currently only boot_r119_shell_fd_hygiene
+    # sets it), refuse a green after-fingerprint state if any PANIC
+    # line appears anywhere in the serial log. Case-insensitive match
+    # via `grep -i` so both `PANIC` and any lowercased future emit
+    # variant catch cleanly. Operates on the SAME serial log the
+    # fingerprint check just ran against. Runs BEFORE the release-
+    # budget gate so a panic surfaces first regardless of which mode
+    # set it; runs AFTER the ordered fingerprint check so an operator
+    # facing a mid-sequence panic still gets the failed-line hint
+    # ahead of this fallback.
+    if [[ ${CHECK_NO_PANIC} -eq 1 ]]; then
+        if grep -qi "PANIC" "${LOG}"; then
+            echo "smoke: PANIC line found in serial log (CHECK_NO_PANIC gate)" >&2
+            grep -in "PANIC" "${LOG}" | head -5 >&2 || true
+            exit 1
+        fi
+    fi
 
     # R49.M3-001 (#1576): release-mode extended assertions. Runs ONLY
     # for modes that set CHECK_RELEASE_BUDGET (boot_release). All four
