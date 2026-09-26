@@ -9917,7 +9917,18 @@ echo "[link] ld -T link.ld -> kernel.elf"
 # kernel returns through these stubs at runtime (no UART, no init) but the
 # image links and QEMU can load it. Real symbol-export lands in a later
 # paideia-as phase.
-ld -nostdlib --warn-common --fatal-warnings -T "${LINK_SCRIPT}" -o "${BUILD_DIR}/kernel.elf" "${OBJECTS[@]}"
+#
+# paideia-os #2508 (RETIRE-1): kernel .pdx call sites (schema_registry
+# sreg_fnv1a64, pdxfs_lite inode_checksum) reach the BLAKE3 extern-C
+# thunks paideia_crypto_blake3_hash / paideia_crypto_blake3_hash_keyed
+# via libpaideia_satellite_runtime.a (paideia-as B6-002 split shipped
+# with v0.36.54; #1545 Wave 15 shipped the Blake3::hash stdlib hooks in
+# v0.36.55). The archive is self-contained under
+# `nm --defined-only` vs `nm --undefined-only` (empty diff — compiler_
+# builtins is included), so it satisfies its own transitive symbol
+# graph and cannot break the kernel's -nostdlib link.
+SAT_RUNTIME_A="${REPO_ROOT}/tools/paideia-as/target/release/libpaideia_satellite_runtime.a"
+ld -nostdlib --warn-common --fatal-warnings -T "${LINK_SCRIPT}" -o "${BUILD_DIR}/kernel.elf" "${OBJECTS[@]}" "${SAT_RUNTIME_A}"
 
 echo "[audit] R_X86_64_32 relocations must not target high-VA (>= 0xffff800000000000) symbols"
 
