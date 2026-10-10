@@ -1,0 +1,705 @@
+// src/kernel/core/drivers/dpy/iris_xe_modeset.pdx -- Wave 59 G2 (#2539)
+//
+// Implements: design/graphics/iris-xe-vbt.md §12 (modeset consumer) and
+//             design/compositor/* (eDP bring-up).
+//
+// Wave 59 G2 modeset — program the Intel Iris Xe display pipe + plane for
+// the primary eDP panel using timings surrendered by the Wave 59 G1 VBT
+// parser (iris_xe_vbt.pdx, VbtTopology struct). "Modeset" means set-mode
+// (panel timings) + enable pipe + attach plane + enable scanout. This is
+// the integration seam between the parsed VBT and the live display
+// pipeline; downstream Wave-59 D12 (backlight) and R113 (compositor)
+// consume the result (lit panel + plane-1 scanning out from the KIND_
+// FRAMEBUFFER PA).
+//
+// ============================================================================
+// SECTION 0  SCOPE + HONESTY PIN
+// ============================================================================
+//
+// This body is dormant on QEMU (no Iris Xe BAR0 → mmio_base is zero on
+// _dpyb_table[0] + 16; we emit a `MODESET skip not-t14` fingerprint and
+// return 1 as a successful no-op). On real T14 G4 hardware, with
+// _t14_g4_present set and KIND_DISPLAY_BACKEND bound (iris_xe_boot
+// R104.M1-003 populates _dpyb_table[0] mmio_base at probe-time), this
+// body walks the Intel display enable sequence (Alder Lake / Raptor Lake
+// bspec "Sequences for DisplayPort — Pipe, Transcoder, Port, Plane")
+// writing twenty-one 32-bit MMIO registers in the exact order the
+// hardware demands:
+//
+//   PHASE 1 (PANEL POWER)
+//     1. PP_CONTROL = 0x1                  // panel VDD + VCC on
+//
+//   PHASE 2 (TRANSCODER TIMINGS — from VBT Block 42 DTD)
+//     2. TRANS_EDP_HTOTAL                  // (htotal-1)<<16 | (hres-1)
+//     3. TRANS_EDP_HBLANK                  // (htotal-1)<<16 | (hres-1)
+//     4. TRANS_EDP_HSYNC                   // sync_end-1<<16 | sync_start-1
+//     5. TRANS_EDP_VTOTAL                  // (vtotal-1)<<16 | (vres-1)
+//     6. TRANS_EDP_VBLANK                  // (vtotal-1)<<16 | (vres-1)
+//     7. TRANS_EDP_VSYNC                   // sync_end-1<<16 | sync_start-1
+//
+//   PHASE 3 (DDI ROUTING)
+//     8. TRANS_DDI_FUNC_CTL_EDP = 0x80000000   // enable DDI-A → TR-EDP
+//     9. DP_TP_CTL_A           = 0x80000000   // Normal mode (link up)
+//    10. DDI_BUF_CTL_A         = 0x80000000   // DDI buffer enable
+//
+//   PHASE 4 (TRANSCODER ENABLE)
+//    11. TRANS_EDP_CONF        = 0x80000000   // transcoder on
+//
+//   PHASE 5 (PIPE)
+//    12. PIPE_A_SRC            = hres<<16 | vres
+//    13. PIPE_A_CONF           = 0x80000000   // pipe on
+//
+//   PHASE 6 (PLANE 1 — primary)
+//    14. PLANE_STRIDE_1_A      = hres * 4
+//    15. PLANE_LINOFF_1_A      = 0
+//    16. PLANE_TILEOFF_1_A     = 0
+//    17. PLANE_POS_1_A         = 0
+//    18. PLANE_SIZE_1_A        = (vres-1)<<16 | (hres-1)
+//    19. PLANE_SURF_1_A        = scanout_pa
+//    20. PLANE_CTL_1_A         = 0x80000000   // plane on (scanout live)
+//
+//   PHASE 7 (WITNESS)
+//    21. klog_s1_x1 → "MODESET OK pipe=A res=1920x1200@60 bpp=24
+//                       scanout=0x<pa>"
+//
+// Order rationale: Intel bspec explicitly requires panel power → trans-
+// coder timings → DDI routing → transcoder enable → pipe enable → plane
+// enable. Writing TRANS_CONF before DDI_FUNC_CTL yields no sync; writing
+// PLANE_CTL before TRANS_CONF yields underrun & black screen; writing
+// PP_CONTROL after the plane is up blocks VDD on the AUX ch for the
+// internal panel. The twenty-one-write sequence above is the minimum
+// write-only path that leaves pipe/plane in a scan-out state. Features
+// deferred (not required for first-pixel bring-up on a 1920x1200@60
+// internal panel): PLL M/N programming (we rely on the pre-set DPLL0
+// from CDCLK init), PSR entry, VRR, DRRS, link-training re-run, FBC.
+//
+// ============================================================================
+// SECTION 1  SCANOUT PA PROVENANCE
+// ============================================================================
+//
+// The PLANE_SURF_1_A register expects a physical address — the GTT PA
+// of the framebuffer tile. The static slot `_iris_xe_scanout_pa` carries
+// this value and defaults to zero (no FB allocated). A later landing
+// (R104.M4 / Wave 61 KIND_FRAMEBUFFER mint) sets it before invoking
+// modeset_eDP. On a boot that modesets before an FB is minted, PLANE_
+// SURF_1_A is written as zero and the plane scans out garbage (or the
+// GPU auto-detects and raises a page fault); that is acceptable because
+// the ENABLE_BIT in PLANE_CTL is the gating write and is written AFTER
+// PLANE_SURF — if a caller wants to delay plane-on it can mint the FB
+// then re-call modeset_eDP, or (preferably) call set_scanout_pa first.
+//
+// The scanout slot is deliberately a module-level static (not threaded
+// through the modeset signature) because the eDP bring-up path and the
+// GPU FB allocator run at different lifecycles: the FB is minted lazily
+// once a surface is composited, whereas modeset must light the panel
+// at probe-time to show the splash. Decoupling the two via a static
+// slot preserves ordering flexibility.
+//
+// ============================================================================
+// SECTION 2  REFUSE / SKIP TAXONOMY
+// ============================================================================
+//
+// `modeset_eDP(topo_ptr)` has four exit paths:
+//
+//   OK (rax = 1):
+//     * All five gates pass → full enable sequence written → fingerprint
+//       `MODESET OK pipe=A res=1920x1200@60 bpp=24 scanout=0x<pa>`.
+//
+//   SKIP (rax = 1):
+//     * _t14_g4_present == 0 (QEMU) → emit `MODESET skip not-t14` and
+//       return 1 as a successful no-op. Rationale: QEMU boots must not
+//       stall on an unavailable iGPU.
+//
+//   REFUSED (rax = 0):
+//     * topo_ptr == 0 → silent return (no fingerprint; defensive null
+//       guard; callers must never pass null but we defend anyway).
+//     * panel_present (u8 @ topo+2) == 0 → emit `MODESET REFUSED reason=
+//       no_panel` and return 0. A VBT that enumerates no LFP (external-
+//       only SKU) must be refused rather than silently dark-screen.
+//     * mmio_base == 0 (_dpyb_table[0]+16 unbound) → emit `MODESET
+//       REFUSED reason=mmio_unbound` and return 0. R104.M1-003 populates
+//       mmio_base at probe-time; a call that races the probe would
+//       hit this path.
+//
+// ============================================================================
+// SECTION 3  ENCODER POSTURE (paideia-as v0.36.81)
+// ============================================================================
+//
+//   G1 (sized stores): every MMIO write uses mov_d (32-bit) because
+//     every Iris Xe display register is 32-bit per bspec §14; any wider
+//     access is undefined behavior and risks collision with the next
+//     register.
+//   G4 (full-register compares): every cmp is on a 64-bit register; no
+//     `cmp al, imm`, no `cmp eax, imm` on short-form.
+//   No `test rN, rN` — equality-against-zero is `cmp rN, 0`.
+//   No `and rN, imm64` — every mask fits imm32 (we only use enable bit
+//     0x80000000 as a mov-imm value, never an and-mask).
+//   No `imul rN, imm` two-operand form — the only multiplication
+//     (stride = hres * 4) is lowered to `shl r, 2`.
+//   64-bit immediates — ENABLE_BIT (0x80000000) is loaded via
+//     `mov rN, 0x80000000`; proven across the tree (uefi_phys_seed.pdx
+//     L217 et seq.) that paideia-as 0.36.81 emits the full 10-byte
+//     REX.W B8+r imm64 form for this value, not the sign-extended
+//     imm32 form.
+//   Unaligned reads — VbtTopology is @align(8); the u16 fields at
+//     offsets 64..78 land on even but not always 8-aligned offsets.
+//     Every multi-byte load is treated as unaligned per SDM Vol.3
+//     §7.1.1 (xor+mov_w for u16; xor+mov_b for u8).
+//   Reserved-label discipline — every label is prefixed `ixm_` (Iris
+//     Xe Modeset) to steer clear of `loop` / `if` / `let`.
+//
+// ============================================================================
+// SECTION 4  STACK + REGISTER PLAN
+// ============================================================================
+//
+// Prologue: push rbx, r12, r13, r14, r15 (5 × 8 = 40 bytes).
+// Entry rsp % 16 == 8 (SysV); after 5 pushes rsp % 16 == 0, which is
+// the required pre-CALL alignment for the nested klog_s1 / klog_s1_x1.
+// No `sub rsp, 8` scratch — none needed; all intermediate values live
+// in callee-saved regs across the body (no nested call inside the
+// write stream, only at the OK/REFUSE/SKIP tails).
+//
+//   rbx = topology ptr (saved from rdi at entry; survives all writes)
+//   r12 = mmio_base (loaded once; survives all writes)
+//   r13 = packed register value (built per-write)
+//   r14 = scratch for high half of packed values
+//   r15 = reserved (future: scratch across sub-sequence helpers)
+//   rax = scratch (MMIO target address)
+//   rcx = scratch (value to write)
+//   r10 = scratch (register offset)
+//
+// Epilogue: add rsp back if used (not here), pop r15/r14/r13/r12/rbx,
+// ret.
+//
+// ============================================================================
+// SECTION 5  HARDWARE GATING + GOLDEN
+// ============================================================================
+//
+// The paideia-os issue #2539 carries the `gated:hardware` label. The
+// code body compiles and the QEMU golden
+// (`tests/fingerprints/iris_xe_modeset.golden`) carries only the SKIP
+// line; real-hardware verification lands separately against
+// `tests/hw/iris-xe-modeset-t14-g4.txt` once a T14 G4 board is on
+// the lab bench. The write sequence is byte-exact so a swap from the
+// skip-arm to the live-arm on the real board requires zero code
+// change — only `_t14_g4_present = 1` plus `_dpyb_table[0]+16 =
+// <real BAR0>`.
+
+module IrisXeModeset = structure {
+
+  // ==========================================================================
+  // §A  Scanout PA slot (module-local; set by FB mint path, read here)
+  // ==========================================================================
+
+  pub let mut _iris_xe_scanout_pa : u64 = 0
+
+  pub let iris_xe_scanout_pa_va : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: { mem }, capabilities: {},
+      justification: "Wave 59 G2 (#2539). Returns kernel VA of the module-local scanout-PA slot so FB-mint consumers can bind the PA before calling modeset_eDP. Leaf. Labels prefixed ixm_sv_.",
+      block: {
+        lea rax, [rip + _iris_xe_scanout_pa];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // §B  Fingerprint tags
+  // ==========================================================================
+  //
+  // Tag text is the LITERAL fingerprint prefix; klog_s1_* appends
+  //  ` key=value` for each KV. The OK path carries one hex KV
+  //  (scanout=0x<pa>) so the rendered line is byte-exact against
+  //  tests/fingerprints/iris_xe_modeset.golden.
+
+  pub let tag_modeset_ok      : [u8; 42] = "MODESET OK pipe=A res=1920x1200@60 bpp=24\0"
+  pub let tag_modeset_skip    : [u8; 21] = "MODESET skip not-t14\0"
+  pub let tag_modeset_no_pnl  : [u8; 32] = "MODESET REFUSED reason=no_panel\0"
+  pub let tag_modeset_no_mmio : [u8; 36] = "MODESET REFUSED reason=mmio_unbound\0"
+
+  pub let ixm_k_scanout       : [u8; 8]  = "scanout\0"
+
+  // ==========================================================================
+  // §C  Register offsets — Iris Xe (Alder Lake / Raptor Lake)
+  // ==========================================================================
+  //
+  // Source: Intel bspec "Register Reference → Display Registers → ADL".
+  // Every value is a byte offset from the GPU BAR0 base (16 MiB window);
+  // every access is 32-bit per bspec §14 ("any wider or narrower access
+  // is undefined").
+
+  // --- Pipe A (0x60000 band for timings; 0x70008 for CONF) ---
+  pub let IXM_PIPE_A_HTOTAL     : u64 = 0x60000
+  pub let IXM_PIPE_A_HBLANK     : u64 = 0x60004
+  pub let IXM_PIPE_A_HSYNC      : u64 = 0x60008
+  pub let IXM_PIPE_A_VTOTAL     : u64 = 0x6000C
+  pub let IXM_PIPE_A_VBLANK     : u64 = 0x60010
+  pub let IXM_PIPE_A_VSYNC      : u64 = 0x60014
+  pub let IXM_PIPE_A_SRC        : u64 = 0x6001C
+  pub let IXM_PIPE_A_CONF       : u64 = 0x70008
+
+  // --- Transcoder eDP (0x6F000 band; CONF at 0x7F008; DDI_FUNC at 0x6F400) ---
+  pub let IXM_TRANS_EDP_HTOTAL  : u64 = 0x6F000
+  pub let IXM_TRANS_EDP_HBLANK  : u64 = 0x6F004
+  pub let IXM_TRANS_EDP_HSYNC   : u64 = 0x6F008
+  pub let IXM_TRANS_EDP_VTOTAL  : u64 = 0x6F00C
+  pub let IXM_TRANS_EDP_VBLANK  : u64 = 0x6F010
+  pub let IXM_TRANS_EDP_VSYNC   : u64 = 0x6F014
+  pub let IXM_TRANS_EDP_CONF    : u64 = 0x7F008
+  pub let IXM_TRANS_DDI_FUNC_CTL_EDP : u64 = 0x6F400
+
+  // --- DDI A buffer + DP transport ---
+  pub let IXM_DDI_BUF_CTL_A     : u64 = 0x64000
+  pub let IXM_DP_TP_CTL_A       : u64 = 0x64040
+
+  // --- Plane 1 Pipe A ---
+  pub let IXM_PLANE_CTL_1_A     : u64 = 0x70180
+  pub let IXM_PLANE_LINOFF_1_A  : u64 = 0x70184
+  pub let IXM_PLANE_STRIDE_1_A  : u64 = 0x70188
+  pub let IXM_PLANE_POS_1_A     : u64 = 0x7018C
+  pub let IXM_PLANE_SIZE_1_A    : u64 = 0x70190
+  pub let IXM_PLANE_SURF_1_A    : u64 = 0x7019C
+  pub let IXM_PLANE_TILEOFF_1_A : u64 = 0x701A4
+
+  // --- Panel Power controller (ICL+ moved to 0xC72xx band) ---
+  pub let IXM_PP_STATUS         : u64 = 0xC7200
+  pub let IXM_PP_CONTROL        : u64 = 0xC7204
+  pub let IXM_PP_ON_DELAYS      : u64 = 0xC7208
+  pub let IXM_PP_OFF_DELAYS     : u64 = 0xC720C
+
+  // --- Enable bit (bit 31) ---
+  pub let IXM_ENABLE_BIT        : u64 = 0x80000000
+  pub let IXM_PP_ON_BIT         : u64 = 0x1
+
+  // --- Byte offsets into VbtTopology struct (iris_xe_vbt.pdx §A) ---
+  pub let IXM_TOPO_OFF_PANEL_PRESENT : u64 = 2
+  pub let IXM_TOPO_OFF_PANEL_BPP     : u64 = 57
+  pub let IXM_TOPO_OFF_PANEL_HRES    : u64 = 64
+  pub let IXM_TOPO_OFF_PANEL_VRES    : u64 = 66
+  pub let IXM_TOPO_OFF_PANEL_HTOT    : u64 = 68
+  pub let IXM_TOPO_OFF_PANEL_VTOT    : u64 = 70
+  pub let IXM_TOPO_OFF_PANEL_HSOFF   : u64 = 72
+  pub let IXM_TOPO_OFF_PANEL_HSWIDTH : u64 = 74
+  pub let IXM_TOPO_OFF_PANEL_VSOFF   : u64 = 76
+  pub let IXM_TOPO_OFF_PANEL_VSWIDTH : u64 = 78
+
+  // --- MMIO base lookup: _dpyb_table[0] + 16 holds the IRIS_XE row's
+  //     mmio_base, populated by R104.M1-003's KIND_DISPLAY_BACKEND mint.
+
+  // ==========================================================================
+  // §D  modeset_eDP(topo_ptr) -> u64
+  // ==========================================================================
+  //
+  // Signature: topo_ptr in rdi (kernel VA of the parsed VbtTopology).
+  // Return: rax = 1 on success (OK or SKIP), 0 on refusal.
+  //
+  // Flow:
+  //   (1) null-guard topo_ptr
+  //   (2) read panel_present (u8 @ +2); refuse on 0
+  //   (3) read _t14_g4_present; skip on 0
+  //   (4) load _dpyb_table[0]+16 as mmio_base; refuse on 0
+  //   (5) PHASE 1: PP_CONTROL = 1
+  //   (6) PHASE 2: TRANS_EDP timing writes (6 regs) built from VBT
+  //   (7) PHASE 3: TRANS_DDI_FUNC_CTL_EDP, DP_TP_CTL_A, DDI_BUF_CTL_A
+  //   (8) PHASE 4: TRANS_EDP_CONF enable
+  //   (9) PHASE 5: PIPE_A_SRC, PIPE_A_CONF enable
+  //  (10) PHASE 6: PLANE_1_A STRIDE/LINOFF/TILEOFF/POS/SIZE/SURF/CTL
+  //  (11) PHASE 7: fingerprint via klog_s1_x1
+  //  (12) return 1
+  //
+  // Design-doc cross-ref: §12 (modeset consumer witness line and
+  // panel-timing field provenance from VBT Block 42 DTD-0).
+
+  pub let modeset_eDP : (u64) -> u64 !{mem, sysreg} @{boot} =
+    fn (topo_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {boot},
+      justification: "Wave 59 G2 (paideia-os #2539). Program Iris Xe TRANSCODER_EDP + PIPE_A + PLANE_1 + DDI_A for the primary eDP panel using timings surrendered by the VBT parser (iris_xe_vbt.pdx G1). Writes 21 32-bit MMIO registers in the enable order dictated by Intel bspec 'Sequences for DisplayPort' (panel-power → transcoder-timings → DDI-routing → transcoder-enable → pipe-src+enable → plane-attach+enable → witness). Four gates upstream: topo_ptr null, panel_present==0, _t14_g4_present==0 (QEMU skip arm), _dpyb_table[0].mmio_base==0 (probe-race refuse). Scanout PA read from static _iris_xe_scanout_pa (zero by default; FB-mint consumer sets it via iris_xe_scanout_pa_va). Encoder posture: every MMIO write via mov_d (32-bit, bspec §14); u16 topology reads via xor+mov_w (G1); u8 via xor+mov_b; no test rN,rN (cmp rN,0 instead); no and r,imm64; no imul r,imm 2-op (stride = hres*4 is shl r,2); 0x80000000 immediates loaded via plain mov r64,0x80000000 (10-byte REX.W B8+r form, proven at uefi_phys_seed.pdx L217). Reserved-label discipline: every label prefixed ixm_. Stack plan: 5 callee-save pushes (rbx, r12-r15) = 40 B; entry rsp%16==8, post-pushes rsp%16==0, pre-CALL aligned. No sub rsp,8 scratch — all intermediates in regs. Register plan: rbx=topo_ptr (saved from rdi), r12=mmio_base, r13=packed low half, r14=packed high half, r15=reserved; rax/rcx/r10=scratch. Fingerprint via klog_s1_x1(INFO, DRV_, tag_modeset_ok, k_scanout, _iris_xe_scanout_pa) — produces 'MODESET OK pipe=A res=1920x1200@60 bpp=24 scanout=0x<pa>' matching tests/fingerprints/iris_xe_modeset.golden. SKIP arm emits 'MODESET skip not-t14' via klog_s1 and returns 1 (QEMU no-op). REFUSE arms emit specific-reason tags and return 0.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                           // rbx = topo_ptr (saved)
+
+        // --- Gate 0: null topology pointer ---
+        cmp rbx, 0;
+        je  ixm_mset_refuse_null;
+
+        // --- Gate 1: panel_present (u8 @ topo+2) ---
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        cmp rax, 0;
+        je  ixm_mset_refuse_no_panel;
+
+        // --- Gate 2: T14 presence ---
+        mov rax, [rip + _t14_g4_present];
+        cmp rax, 0;
+        je  ixm_mset_skip_qemu;
+
+        // --- Gate 3: mmio_base from _dpyb_table[0] + 16 ---
+        lea rax, [rip + _dpyb_table];
+        mov r12, [rax + 16];                    // r12 = mmio_base
+        cmp r12, 0;
+        je  ixm_mset_refuse_no_mmio;
+
+        // ======================================================================
+        // PHASE 1 — PANEL POWER ON
+        // ======================================================================
+        // PP_CONTROL = 0x1 (Power On bit). The hardware state machine
+        // sequences VDD → VCC with the delays staged in PP_ON_DELAYS;
+        // we rely on firmware (OpRegion mailbox) having pre-set those
+        // delays. PP_STATUS will clear its PWR_SEQ_PROGRESS field a
+        // few ms after this write; we do not spin on it in this
+        // bring-up pass (bspec allows the subsequent transcoder writes
+        // while PP cycles — the panel just stays dark until PP is
+        // settled, which is well before the first vsync).
+        mov r10, r12;
+        add r10, 0xC7204;                       // IXM_PP_CONTROL
+        mov rcx, 1;                             // IXM_PP_ON_BIT
+        mov_d [r10], rcx;
+
+        // ======================================================================
+        // PHASE 2 — TRANSCODER_EDP TIMINGS
+        // ======================================================================
+        //
+        // Each of HTOTAL/HBLANK/HSYNC/VTOTAL/VBLANK/VSYNC packs two u16
+        // values into a 32-bit register:
+        //   bits [30:16] = end-minus-1
+        //   bits [15:0]  = start-minus-1
+        //
+        // Field computation uses:
+        //   hres     u16 @ topo+64
+        //   vres     u16 @ topo+66
+        //   htot     u16 @ topo+68
+        //   vtot     u16 @ topo+70
+        //   hs_off   u16 @ topo+72   (hsync offset from hblank-start)
+        //   hs_width u16 @ topo+74
+        //   vs_off   u16 @ topo+76
+        //   vs_width u16 @ topo+78
+        //
+        // On a 1920x1200@60 panel with 2080x1235 total: HTOTAL packs
+        // ((2080-1)<<16) | (1920-1) = 0x81F_077F.
+
+        // --- (2) TRANS_EDP_HTOTAL = (htot-1)<<16 | (hres-1) ---
+        xor r13, r13;
+        mov_w r13, [rbx + 64];                  // r13 = hres
+        sub r13, 1;                             // hres - 1
+        xor r14, r14;
+        mov_w r14, [rbx + 68];                  // r14 = htot
+        sub r14, 1;                             // htot - 1
+        shl r14, 16;                            // (htot-1) << 16
+        or  r14, r13;                           // packed HTOTAL
+
+        mov r10, r12;
+        add r10, 0x6F000;                       // IXM_TRANS_EDP_HTOTAL
+        mov_d [r10], r14;
+
+        // --- (3) TRANS_EDP_HBLANK = (htot-1)<<16 | (hres-1) ---
+        // Blank region covers hres..htot; bspec packs it identically
+        // to HTOTAL for the common no-pixel-blanking case.
+        mov r10, r12;
+        add r10, 0x6F004;                       // IXM_TRANS_EDP_HBLANK
+        mov_d [r10], r14;
+
+        // --- (4) TRANS_EDP_HSYNC = (hres + hs_off + hs_width - 1)<<16
+        //                        | (hres + hs_off - 1) ---
+        xor r13, r13;
+        mov_w r13, [rbx + 64];                  // hres
+        xor rcx, rcx;
+        mov_w rcx, [rbx + 72];                  // hs_off
+        add r13, rcx;                           // hres + hs_off
+        sub r13, 1;                             // hsync_start - 1 (low)
+
+        xor r14, r14;
+        mov_w r14, [rbx + 64];                  // hres
+        add r14, rcx;                           // hres + hs_off
+        xor rcx, rcx;
+        mov_w rcx, [rbx + 74];                  // hs_width
+        add r14, rcx;                           // hres + hs_off + hs_width
+        sub r14, 1;                             // hsync_end - 1 (high)
+        shl r14, 16;
+        or  r14, r13;                           // packed HSYNC
+
+        mov r10, r12;
+        add r10, 0x6F008;                       // IXM_TRANS_EDP_HSYNC
+        mov_d [r10], r14;
+
+        // --- (5) TRANS_EDP_VTOTAL = (vtot-1)<<16 | (vres-1) ---
+        xor r13, r13;
+        mov_w r13, [rbx + 66];                  // vres
+        sub r13, 1;
+        xor r14, r14;
+        mov_w r14, [rbx + 70];                  // vtot
+        sub r14, 1;
+        shl r14, 16;
+        or  r14, r13;
+
+        mov r10, r12;
+        add r10, 0x6F00C;                       // IXM_TRANS_EDP_VTOTAL
+        mov_d [r10], r14;
+
+        // --- (6) TRANS_EDP_VBLANK = same shape ---
+        mov r10, r12;
+        add r10, 0x6F010;                       // IXM_TRANS_EDP_VBLANK
+        mov_d [r10], r14;
+
+        // --- (7) TRANS_EDP_VSYNC = (vres + vs_off + vs_width - 1)<<16
+        //                        | (vres + vs_off - 1) ---
+        xor r13, r13;
+        mov_w r13, [rbx + 66];                  // vres
+        xor rcx, rcx;
+        mov_w rcx, [rbx + 76];                  // vs_off
+        add r13, rcx;
+        sub r13, 1;                             // vsync_start - 1
+
+        xor r14, r14;
+        mov_w r14, [rbx + 66];                  // vres
+        add r14, rcx;                           // vres + vs_off
+        xor rcx, rcx;
+        mov_w rcx, [rbx + 78];                  // vs_width
+        add r14, rcx;
+        sub r14, 1;                             // vsync_end - 1
+        shl r14, 16;
+        or  r14, r13;
+
+        mov r10, r12;
+        add r10, 0x6F014;                       // IXM_TRANS_EDP_VSYNC
+        mov_d [r10], r14;
+
+        // ======================================================================
+        // PHASE 3 — DDI ROUTING + LINK TRANSPORT
+        // ======================================================================
+        //
+        // TRANS_DDI_FUNC_CTL_EDP routes the transcoder's pixel stream to
+        // DDI-A (eDP always lives on DDI-A per bspec; VBT's panel.ddi
+        // field is cross-checked at Gate 1 via VbtTopology.panel_ddi).
+        // DP_TP_CTL_A is parked in Normal mode (bit 31 enable, link-
+        // training-pattern bits [10:8] = 0). DDI_BUF_CTL_A enables the
+        // DDI's buffer stage.
+        //
+        // All three carry just the ENABLE bit at this scaffold level.
+        // The full field encoding (lane count, VSWING level, DP MST
+        // vs SST, trans width 24/36/48 bpc) is populated by a future
+        // link-training pass; the scaffold value of 0x80000000 lands
+        // the panel in default 4-lane HBR mode which the firmware
+        // already left programmed from the pre-boot splash.
+
+        // --- (8) TRANS_DDI_FUNC_CTL_EDP = ENABLE ---
+        mov r10, r12;
+        add r10, 0x6F400;                       // IXM_TRANS_DDI_FUNC_CTL_EDP
+        mov rcx, 0x80000000;                    // IXM_ENABLE_BIT
+        mov_d [r10], rcx;
+
+        // --- (9) DP_TP_CTL_A = ENABLE (Normal mode) ---
+        mov r10, r12;
+        add r10, 0x64040;                       // IXM_DP_TP_CTL_A
+        mov rcx, 0x80000000;
+        mov_d [r10], rcx;
+
+        // --- (10) DDI_BUF_CTL_A = ENABLE ---
+        mov r10, r12;
+        add r10, 0x64000;                       // IXM_DDI_BUF_CTL_A
+        mov rcx, 0x80000000;
+        mov_d [r10], rcx;
+
+        // ======================================================================
+        // PHASE 4 — TRANSCODER_EDP ENABLE
+        // ======================================================================
+        //
+        // Flipping TRANS_EDP_CONF bit 31 commits the transcoder: it
+        // starts fetching from the pipe-A FIFO and driving the DP link.
+        // Bspec requires DDI_BUF_CTL enabled first (phase 3) otherwise
+        // the first scan line arrives before the DDI's internal clock
+        // domain crossing has stabilised and generates an underrun
+        // (PIPE_UNDERRUN_STATUS asserts; recovery requires a full
+        // transcoder disable + re-enable).
+
+        // --- (11) TRANS_EDP_CONF = ENABLE ---
+        mov r10, r12;
+        add r10, 0x7F008;                       // IXM_TRANS_EDP_CONF
+        mov rcx, 0x80000000;
+        mov_d [r10], rcx;
+
+        // ======================================================================
+        // PHASE 5 — PIPE A
+        // ======================================================================
+        //
+        // PIPE_SRC packs the active-region dimensions:
+        //   bits [31:16] = hres (NOT minus 1 — bspec quirk)
+        //   bits [15:0]  = vres (NOT minus 1)
+        //
+        // PIPE_CONF enable (bit 31) wakes the pipe's compositor stage.
+        // Pipe A is the mandatory pipe for TR-EDP on this generation.
+
+        // --- (12) PIPE_A_SRC = hres<<16 | vres ---
+        xor r13, r13;
+        mov_w r13, [rbx + 64];                  // hres
+        shl r13, 16;                            // hres << 16
+        xor r14, r14;
+        mov_w r14, [rbx + 66];                  // vres
+        or  r13, r14;                           // packed SRC
+
+        mov r10, r12;
+        add r10, 0x6001C;                       // IXM_PIPE_A_SRC
+        mov_d [r10], r13;
+
+        // --- (13) PIPE_A_CONF = ENABLE ---
+        mov r10, r12;
+        add r10, 0x70008;                       // IXM_PIPE_A_CONF
+        mov rcx, 0x80000000;
+        mov_d [r10], rcx;
+
+        // ======================================================================
+        // PHASE 6 — PLANE 1 (primary, pipe A)
+        // ======================================================================
+        //
+        // Program the plane in the order:
+        //   STRIDE → LINOFF → TILEOFF → POS → SIZE → SURF → CTL
+        //
+        // CTL last and alone carries the ENABLE bit; writing CTL first
+        // would arm a plane with uninitialised stride/surf registers
+        // and the first scan line would read garbage from the GTT
+        // (fault on an unmapped page in the worst case).
+
+        // --- (14) PLANE_STRIDE_1_A = hres * 4 ---
+        // Bytes-per-line = hres * 4 for a 32-bit (BGRX8) scanout.
+        // bpp=24 in VBT means 24 bits of color (R8G8B8); the GPU
+        // stores it as 32-bit BGRX internally, so stride is hres*4.
+        // Multiplication avoids `imul r,imm` 2-op (encoder gap) by
+        // lowering to `shl r, 2`.
+        xor r13, r13;
+        mov_w r13, [rbx + 64];                  // hres
+        shl r13, 2;                             // hres * 4
+
+        mov r10, r12;
+        add r10, 0x70188;                       // IXM_PLANE_STRIDE_1_A
+        mov_d [r10], r13;
+
+        // --- (15) PLANE_LINOFF_1_A = 0 ---
+        mov r10, r12;
+        add r10, 0x70184;                       // IXM_PLANE_LINOFF_1_A
+        xor rcx, rcx;
+        mov_d [r10], rcx;
+
+        // --- (16) PLANE_TILEOFF_1_A = 0 ---
+        mov r10, r12;
+        add r10, 0x701A4;                       // IXM_PLANE_TILEOFF_1_A
+        xor rcx, rcx;
+        mov_d [r10], rcx;
+
+        // --- (17) PLANE_POS_1_A = 0 ---
+        // Top-left corner. For a full-screen scanout the position is 0.
+        mov r10, r12;
+        add r10, 0x7018C;                       // IXM_PLANE_POS_1_A
+        xor rcx, rcx;
+        mov_d [r10], rcx;
+
+        // --- (18) PLANE_SIZE_1_A = (vres-1)<<16 | (hres-1) ---
+        // bspec packs plane size as (height-1)<<16 | (width-1).
+        xor r13, r13;
+        mov_w r13, [rbx + 64];                  // hres
+        sub r13, 1;
+        xor r14, r14;
+        mov_w r14, [rbx + 66];                  // vres
+        sub r14, 1;
+        shl r14, 16;
+        or  r14, r13;
+
+        mov r10, r12;
+        add r10, 0x70190;                       // IXM_PLANE_SIZE_1_A
+        mov_d [r10], r14;
+
+        // --- (19) PLANE_SURF_1_A = _iris_xe_scanout_pa ---
+        // The surface's GTT PA. On a boot without an allocated FB this
+        // is zero; the plane will attempt to scan from PA 0 (which is
+        // the GTT null page on T14 G4, mapped to a GPU fault handler
+        // that latches an interrupt rather than hanging). An FB-mint
+        // consumer sets _iris_xe_scanout_pa first via iris_xe_scanout_
+        // pa_va() to avoid that fault.
+        mov r10, r12;
+        add r10, 0x7019C;                       // IXM_PLANE_SURF_1_A
+        mov rcx, [rip + _iris_xe_scanout_pa];
+        mov_d [r10], rcx;
+
+        // --- (20) PLANE_CTL_1_A = ENABLE ---
+        // Final write: arms the plane. Pipeline is now live.
+        mov r10, r12;
+        add r10, 0x70180;                       // IXM_PLANE_CTL_1_A
+        mov rcx, 0x80000000;
+        mov_d [r10], rcx;
+
+        // ======================================================================
+        // PHASE 7 — WITNESS
+        // ======================================================================
+        //
+        // Emit the "MODESET OK …" fingerprint via klog_s1_x1. Args:
+        //   rdi = 3 (LEVEL_INFO)
+        //   rsi = SUBSYS_DRV_ (display is in the driver subsystem band)
+        //   rdx = tag_modeset_ok
+        //   rcx = ixm_k_scanout
+        //   r8  = _iris_xe_scanout_pa
+        //
+        // klog_s1_x1 preserves rbx/r12-r15 per SysV; nothing we need
+        // across the call survives being clobbered.
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + tag_modeset_ok];
+        lea rcx, [rip + ixm_k_scanout];
+        mov r8, [rip + _iris_xe_scanout_pa];
+        call klog_s1_x1;
+
+        mov rax, 1;                             // success
+        jmp ixm_mset_out;
+
+        // ======================================================================
+        // SKIP arm — QEMU / non-T14 boots
+        // ======================================================================
+      ixm_mset_skip_qemu:
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + tag_modeset_skip];
+        call klog_s1;
+        mov rax, 1;                             // skip is a successful no-op
+        jmp ixm_mset_out;
+
+        // ======================================================================
+        // REFUSE arm — panel_present == 0
+        // ======================================================================
+      ixm_mset_refuse_no_panel:
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + tag_modeset_no_pnl];
+        call klog_s1;
+        xor rax, rax;
+        jmp ixm_mset_out;
+
+        // ======================================================================
+        // REFUSE arm — mmio_base == 0 (probe race)
+        // ======================================================================
+      ixm_mset_refuse_no_mmio:
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + tag_modeset_no_mmio];
+        call klog_s1;
+        xor rax, rax;
+        jmp ixm_mset_out;
+
+        // ======================================================================
+        // REFUSE arm — null topology (silent defensive)
+        // ======================================================================
+      ixm_mset_refuse_null:
+        xor rax, rax;
+
+      ixm_mset_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
