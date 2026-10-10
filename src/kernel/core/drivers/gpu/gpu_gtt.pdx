@@ -1,0 +1,990 @@
+// src/kernel/core/drivers/gpu/gpu_gtt.pdx -- Wave 74 G5 [R37] skeleton
+// paideia-os #2542
+//
+// Intel Iris Xe (Gen12) GTT (Global Graphics Translation Table) +
+// PPGTT (Per-Process Graphics Translation Table) allocator -- skeleton
+// level.
+//
+// =============================================================================
+// SECTION 0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// Two tables, two different authorities:
+//
+//   GTT  (GLOBAL)   -- one per machine, 4 KiB-page-granular. Lives in GSM
+//                      (Graphics Stolen Memory) at a fixed MMIO offset the
+//                      firmware pre-reserves. Covers the WHOLE display-engine
+//                      aperture; typically 32 MiB == 8192 entries at 4 KiB.
+//                      Written by this module through gtt_bind / gtt_unbind,
+//                      consumed by the display engine's SURFACE register for
+//                      scan-out fetch.
+//
+//   PPGTT (PER PROC) -- one per process-with-GPU-cap, 48-bit, four-level,
+//                      shape-identical to the CPU x86-64 PT (same P/W/U/A/
+//                      D/PS/G/XD bit encoding, same 9/9/9/9/12 index decode).
+//                      Each PPGTT root is a 4 KiB frame pointed to by one
+//                      KIND_PPGTT cap. Consumed by the GuC submit path's
+//                      per-context MMIO when it switches address spaces on
+//                      engine dispatch.
+//
+// It is the DECISION SITE for "which guest-physical frame does a GPU VA
+// resolve to." Two allocators would let one path mint a mapping the other
+// did not record, and the two would drift at the next scan-out fetch (for
+// GTT) or at the next command dispatch (for PPGTT).
+//
+// It IS NOT the physical-table walker: the four-level PPGTT walk that
+// turns a 48-bit GPU VA into a frame plus flags lives in
+// drivers/gpu/ppgtt_walker.pdx (R37.M4-002). This file ALLOCATES and
+// REGISTERS; the walker CONSUMES.
+//
+// It IS NOT the bookkeeping bind-table: the per-(VM,BO,va,span) row store
+// that the submit path grep-matches against lives in drivers/gpu/
+// ppgtt_bind.pdx (R37.M4-003) under symbol `ppgb_bind`. This file's own
+// `ppgtt_bind` is a HIGH-LEVEL ORCHESTRATOR -- it validates arguments,
+// resolves the PPGTT cap to a row, and emits a fingerprint. Wiring to
+// `ppgb_bind` is deferred to the follow-up slice; at skeleton level the
+// bookkeeping is implicit (no row-level overlap check, no span unroll).
+//
+// It IS NOT the TLB shootdown coordinator: that stays in ppgtt_walker's
+// shootdown counter, same place every other GPU memory op reaches.
+//
+// =============================================================================
+// SECTION 1  WHY KIND_PPGTT = 0x3F (and the collision scan at landing time)
+// =============================================================================
+//
+// Three new derived-kind tags land in Wave 74 in parallel: D9 (battery
+// attribute kind) at 0x3D, D10 (thermal attribute kind) at 0x3E, and this
+// file's KIND_PPGTT at 0x3F. All three sit above the 4-bit base-slot range
+// (0..15) and below every existing derived-kind block (KIND_DRIVER = 0x15,
+// KIND_DMESG = 0x16, KIND_INTERRUPT = 0x50, KIND_HW_INTERRUPT = 0x140, every
+// R29/R30/R31/.../G1/G2/G3 entry).
+//
+// Audit at landing time (grep over src/kernel/):
+//
+//     $ grep -rnE 'KIND_[A-Z_0-9]+\s*:\s*u64\s*=\s*0x3[DEFdef]\b' src/kernel/
+//     (empty)
+//
+//     $ grep -nE 'cmp rcx, 0x3[CDEFcdef]' src/kernel/core/cap/invoke.pdx
+//     src/kernel/core/cap/invoke.pdx:135:        cmp rcx, 0x3C;
+//
+// Only 0x3C is claimed (KIND_FIRMWARE_BLOB from Wave 73). 0x3D/0x3E/0x3F
+// are clean -- no existing dispatch arm is overwritten and no existing
+// kind constant is overloaded. The three Wave 74 parallel softarchs claim
+// the three adjacent tags, this file picks 0x3F.
+//
+// 0x3F fits imm32 with bit 31 clear so every compare uses `cmp rcx, 0x3F`
+// directly (no r9/r11 staging), same posture as KIND_FIRMWARE_BLOB.
+//
+// =============================================================================
+// SECTION 2  DERIVATION POSTURE
+// =============================================================================
+//
+// KIND_PPGTT derives over KIND_IPC_ENDPOINT (base slot 5) because a PPGTT
+// is per-conversation state -- one process-with-GPU-cap, one endpoint it
+// receives GuC completions on, one address space the submit path switches
+// to on its behalf. Same posture as KIND_GPU_VM (0x175), KIND_GPU_CONTEXT
+// (0x176), KIND_GPU_SUBMIT (0x177): every piece of GPU state the compositor
+// hands out past the raw BO is anchored on the endpoint that holds the
+// completion mail slot. The dispatch arm in cap/invoke.pdx compares the
+// FULL u64 kind field, so the slot-5 KIND_IPC_ENDPOINT handler and this
+// kind coexist cleanly (same fall-through-safe pattern every derived kind
+// in that file uses).
+//
+// =============================================================================
+// SECTION 3  ROW LAYOUT -- 32 BYTES
+// =============================================================================
+//
+//   [+0]  in_use[63:56] | row_id[7:0] (self; redundant but convenient
+//                        for stat-sweep debuggers)
+//   [+8]  pml4_phys_addr -- host physical address of this PPGTT's 4 KiB
+//                           PML4 frame (NB: at Wave 74 it is the kernel VA
+//                           returned by phys_alloc; the kernel-VA->PA
+//                           boundary normalisation is #658 and sits in the
+//                           submit-path's cr3-load site, not here)
+//   [+16] cap_slot -- the KIND_PPGTT cap_table slot pointing to this row
+//   [+24] pad
+//
+// Eight rows per boot (GPU_GTT_PPGTT_MAX). That is the compositor plus
+// three plane clients plus the camera plus one compute client plus two
+// staging contexts -- the same eight-wide cluster ppgtt_walker.pdx picks
+// for its session table. Growing past eight is a separate ticket.
+//
+// Table size: 8 * 32 = 256 bytes = 32 u64. ALIGN(64) matches every row-
+// addressed static in this subsystem.
+//
+// =============================================================================
+// SECTION 4  FAILURE TAXONOMY 0xFFFFFFDB..0xFFFFFFDF (TASK-DIRECTIVE RESERVED)
+// =============================================================================
+//
+// Five codes per the Wave 74 task directive (all five fit imm32 with bit
+// 31 clear so `mov rax, imm32` is a 7-byte emit, not the 10-byte movabs):
+//
+//   GPU_GTT_NOT_INITED          = 0xFFFFFFDB  -- gtt_bind/unbind before gtt_init
+//   GPU_GTT_GPU_VA_OUT_OF_APER  = 0xFFFFFFDC  -- gpu_va >= aperture size
+//   GPU_GTT_HOST_PA_MISALIGNED  = 0xFFFFFFDD  -- host_pa not 4K-aligned
+//   GPU_GTT_ROOT_ALLOC_FAILED   = 0xFFFFFFDE  -- phys_alloc returned 0
+//   GPU_GTT_UNKNOWN_CAP         = 0xFFFFFFDF  -- bad / wrong-kind PPGTT cap
+//
+// Adjacent kernel-owned bands: KIND_FIRMWARE_BLOB owns CF/D0 (Wave 73),
+// the ppgtt_* bind/walker/prot drivers own 0xFFFFF5B0..5EF (Wave R37),
+// so this file's 0xFFFFFFDB..DF block does not alias either.
+//
+// =============================================================================
+// SECTION 5  paideia-as encoder-gap posture
+// =============================================================================
+//
+// Kind-tag constant 0x3F and all five error sentinels fit imm32 with bit
+// 31 clear. No `test rN,rN` anywhere (liveness checks use `cmp rN, 0`).
+// No `and r11, imm64`; the one masked compare (op_code & 0xFF) stages
+// through r10. No 2-op `imul r,imm`; the row-base multiply uses `shl 5`
+// (stride 32 is a power of two). All `pub let` string declarations are
+// on single lines. Module basename `GpuGtt` matches the file basename
+// `gpu_gtt.pdx`. Every label is prefixed `gtt_` or `pp_` (reserved-word
+// discipline -- `loop` / `if` / `let` are keywords). klog_s1_x2 callers
+// use the `sub rsp, 16; mov [rsp + 0], v2; call ...; add rsp, 16` idiom
+// (not [rsp + 8] -- Wave 73 I7 broke this once; the fix is at firmware_
+// blob klog sites, mirrored one-for-one here).
+
+module GpuGtt = structure {
+
+  // ============================================================================
+  // KIND / rights
+  // ============================================================================
+
+  pub let KIND_PPGTT      : u64 = 0x3F     // Wave 74 G5 derived-kind tag
+  pub let KIND_PPGTT_BASE : u64 = 5        // = KIND_IPC_ENDPOINT (derivation parent)
+
+  pub let R_PPGTT_READ  : u64 = 0x001      // query ops
+  pub let R_PPGTT_WRITE : u64 = 0x002      // bind / unbind ops (future wiring)
+  pub let R_PPGTT_ALL   : u64 = 0x003      // handed to the holder on create
+
+  // ============================================================================
+  // GTT PTE shape (Vol 3 Gen12 §5.6, 4 KiB small-page encoding)
+  // ============================================================================
+  // Task directive: bit [0] valid, bits [63:12] host PFN (same shape as CPU PTE).
+  // The real display-engine encoding has CACHEABLE at bit 1 and reserved zero
+  // in [11:3] and [63:52]; the Wave 74 skeleton stays with the task directive's
+  // minimal (VALID | host_pa & ~0xFFF) composition and defers the full-fidelity
+  // mask to the follow-up that pairs with the DPLC MMIO write path.
+  pub let GTT_PTE_VALID    : u64 = 0x1
+  pub let GTT_PA_MASK      : u64 = 0xFFFFFFFFFFFFF000  // bits [63:12]
+  pub let GTT_PAGE_SIZE    : u64 = 4096
+  pub let GTT_ENTRY_BYTES  : u64 = 8
+
+  // ============================================================================
+  // Failure codes (SECTION 4)
+  // ============================================================================
+
+  pub let GPU_GTT_OK                  : u64 = 0
+  pub let GPU_GTT_NOT_INITED          : u64 = 0xFFFFFFDB
+  pub let GPU_GTT_GPU_VA_OUT_OF_APER  : u64 = 0xFFFFFFDC
+  pub let GPU_GTT_HOST_PA_MISALIGNED  : u64 = 0xFFFFFFDD
+  pub let GPU_GTT_ROOT_ALLOC_FAILED   : u64 = 0xFFFFFFDE
+  pub let GPU_GTT_UNKNOWN_CAP         : u64 = 0xFFFFFFDF
+
+  pub let GPU_GTT_DECODE_BAD : u64 = 0xFFFFFFFFFFFFFFFF
+  pub let GPU_GTT_ROW_NONE   : u64 = 0xFF
+
+  // Standard cap_invoke sentinels.
+  pub let INVOKE_UNSUPPORTED : u64 = 0xFFFFFFFFFFFFFFFC
+  pub let INVOKE_DENIED      : u64 = 0xFFFFFFFFFFFFFFFD
+
+  // ============================================================================
+  // cap_handler_ppgtt op ordinals (query-only at Wave 74)
+  // ============================================================================
+  pub let PPGTT_OP_QUERY_ROOT   : u64 = 0    // -> pml4_phys_addr
+  pub let PPGTT_OP_QUERY_CAP    : u64 = 1    // -> cap_slot
+  pub let PPGTT_OP_QUERY_INUSE  : u64 = 2    // -> 1 if row live, 0 otherwise
+  pub let PPGTT_OP_MAX          : u64 = 2
+
+  // ============================================================================
+  // Row table + GTT substrate state
+  // ============================================================================
+
+  pub let GPU_GTT_PPGTT_MAX : u64 = 8
+  pub let GPU_GTT_ROW_BYTES : u64 = 32
+
+  // 8 rows * 32 bytes = 256 bytes = 32 u64. .bss zero-init gives us an
+  // empty table at boot (in_use[63:56] = 0 across the board).
+  pub let mut _gpu_ppgtt_table : [u64; 32] = uninit @align(64)
+
+  // GTT substrate: three scalar words. `inited` is a 0/1 flag -- gtt_bind /
+  // gtt_unbind refuse with GPU_GTT_NOT_INITED if it is zero. `base` is the
+  // kernel-VA where the GSM-resident GTT table starts (what gtt_init was
+  // handed as its first argument). `entries` is gsm_size_bytes / 8 at
+  // init time; a gpu_va >= entries * 4K is out of aperture.
+  pub let mut _gpu_gtt_base    : [u64; 1] = uninit @align(8)
+  pub let mut _gpu_gtt_entries : [u64; 1] = uninit @align(8)
+  pub let mut _gpu_gtt_inited  : [u64; 1] = uninit @align(8)
+
+  // Fingerprint tags (NUL-terminated, byte count NUL-inclusive per the
+  // kernel-logging-substrate.md #699 discipline). Wire shapes per the
+  // Wave 74 task directive:
+  //
+  //   `GTT BIND gpu_va=0x<16-hex> host_pa=0x<16-hex>`   -- gtt_bind success
+  //   `PPGTT CREATE cap=0x<16-hex> root_pa=0x<16-hex>`  -- ppgtt_create ok
+  //   `PPGTT DESTROY cap=0x<16-hex>`                    -- ppgtt_destroy ok
+  pub let gtt_tag_gtt_bind      : [u8; 9]  = "GTT BIND\0"
+  pub let gtt_tag_ppgtt_create  : [u8; 13] = "PPGTT CREATE\0"
+  pub let gtt_tag_ppgtt_destroy : [u8; 14] = "PPGTT DESTROY\0"
+  pub let gtt_tag_handler_entry : [u8; 24] = "KIND_PPGTT dispatch inv\0"
+
+  pub let gtt_k_gpu_va  : [u8; 7] = "gpu_va\0"
+  pub let gtt_k_host_pa : [u8; 8] = "host_pa\0"
+  pub let gtt_k_cap     : [u8; 4] = "cap\0"
+  pub let gtt_k_root_pa : [u8; 8] = "root_pa\0"
+
+  // ==========================================================================
+  // gpu_gtt_reset() -> ()
+  // Defensive clear of PPGTT row table + GTT substrate scalars.
+  // Called at boot alongside firmware_blob_table_reset / ppgtt_bind_reset.
+  // ==========================================================================
+  pub let gpu_gtt_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 74 G5 [R37] (#2542): clear 32 u64 of _gpu_ppgtt_table + the three GTT substrate scalars. .bss zero-init at real boot already satisfies the postcondition; this is defensive (matches KIND_FIRMWARE_BLOB firmware_blob_table_reset and KIND_NIC nic_table_reset shape one-for-one). Labels prefixed gtt_rs_.",
+      block: {
+        lea r10, [rip + _gpu_ppgtt_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      gtt_rs_rows:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 32;
+        jb  gtt_rs_rows;
+
+        lea r10, [rip + _gpu_gtt_base];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _gpu_gtt_entries];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _gpu_gtt_inited];
+        mov [r10 + 0], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gtt_init(gsm_base: u64, gsm_size_bytes: u64) -> u64
+  //
+  // Record the GSM-resident GTT base + aperture size, zero every entry
+  // in the table (write a VALID=0 PTE at each slot), stamp inited=1.
+  // Idempotent: a second call overwrites base/entries and re-zeros --
+  // this is deliberately permissive for the Wave 74 skeleton so the
+  // smoke harness may invoke it more than once without a dedicated
+  // teardown path.
+  //
+  // entries = gsm_size_bytes / 8 (each GTT PTE is 8 bytes). A 32 MiB
+  // GSM maps to 4 Mi / 8 = 4 * 1024 * 1024 / 8 = ~524288 entries ->
+  // too wide for an 8192-entry assumption; the skeleton accepts whatever
+  // the caller passes without a hard upper bound (gpu_gtt_aperture_valid
+  // reads the stored entries count).
+  // ==========================================================================
+  pub let gtt_init : (u64, u64) -> u64 !{mem} @{} =
+    fn (gsm_base: u64) (gsm_size_bytes: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 74 G5 [R37] (#2542): record GSM base + aperture size, zero every PTE in the table, stamp inited=1. entries = gsm_size_bytes >> 3. The zero loop writes a 0 u64 (VALID=0, PFN=0) at each slot so a stale firmware-left PTE cannot survive the handoff. Returns 0. Register plan: rbx=gsm_base, r12=entries. Two callee-save pushes land rsp%16==8 at every nested leaf (we call nothing here; the function is pure asm bookkeeping). Labels prefixed gtt_in_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                    // gsm_base
+        mov r12, rsi;
+        shr r12, 3;                      // entries = size / 8
+
+        // Stamp the three substrate scalars.
+        lea r10, [rip + _gpu_gtt_base];
+        mov [r10 + 0], rbx;
+        lea r10, [rip + _gpu_gtt_entries];
+        mov [r10 + 0], r12;
+
+        // Zero every PTE slot. Deliberately linear; GSM is <= 32 MiB
+        // at Wave 74 and this runs once at boot, so a vectorized or
+        // dual-step clear is not worth the complexity.
+        xor rax, rax;
+        xor rcx, rcx;
+      gtt_in_zero:
+        cmp rcx, r12;
+        jae gtt_in_done;
+        mov [rbx + rcx * 8], rax;
+        add rcx, 1;
+        jmp gtt_in_zero;
+
+      gtt_in_done:
+        // Stamp inited=1 LAST so an interrupted init cannot leave the
+        // substrate in a partially-written state visible to a concurrent
+        // gtt_bind call.
+        lea r10, [rip + _gpu_gtt_inited];
+        mov rax, 1;
+        mov [r10 + 0], rax;
+
+        xor rax, rax;                    // GPU_GTT_OK
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gpu_gtt_inited() -> 1 iff gtt_init has been called
+  // ==========================================================================
+  pub let gpu_gtt_inited_q : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 74 G5 [R37] (#2542): read inited flag. Pure leaf. Labels prefixed gtt_iq_.",
+      block: {
+        lea r10, [rip + _gpu_gtt_inited];
+        mov rax, [r10 + 0];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gpu_gtt_aperture_valid(gpu_va) -> 1 iff gpu_va < entries * 4K
+  // ==========================================================================
+  pub let gpu_gtt_aperture_valid : (u64) -> u64 !{mem} @{} =
+    fn (gpu_va: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 74 G5 [R37] (#2542): 1 iff gpu_va < aperture_size_bytes (= entries * 4096 = entries << 12). Pure leaf. Labels prefixed gtt_av_.",
+      block: {
+        lea r10, [rip + _gpu_gtt_entries];
+        mov rax, [r10 + 0];
+        shl rax, 12;                     // entries * 4096
+        cmp rdi, rax;
+        jae gtt_av_no;
+        mov rax, 1;
+        ret;
+      gtt_av_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gpu_gtt_host_pa_valid(host_pa) -> 1 iff (host_pa & 0xFFF) == 0
+  // ==========================================================================
+  pub let gpu_gtt_host_pa_valid : (u64) -> u64 !{} @{} =
+    fn (host_pa: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave 74 G5 [R37] (#2542): 1 iff host_pa is 4K-aligned (low 12 bits zero). Pure leaf. Labels prefixed gtt_hv_.",
+      block: {
+        mov r10, 0xFFF;
+        and r10, rdi;
+        cmp r10, 0;
+        jne gtt_hv_no;
+        mov rax, 1;
+        ret;
+      gtt_hv_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gtt_bind(gpu_va, host_pa, prot) -> u64
+  //
+  //   Returns GPU_GTT_OK on success, otherwise a 0xFFFFFFDB..DF sentinel.
+  //   On success emits `GTT BIND gpu_va=0x<16-hex> host_pa=0x<16-hex>` via
+  //   klog_s1_x2.
+  //
+  //   `prot` is accepted and threaded for interface completeness but at
+  //   Wave 74 only the VALID bit is written into the PTE. The follow-up
+  //   that pairs with the DPLC MMIO path will compose the full PTE flag
+  //   word (CACHEABLE + reserved zero) from prot the same way ppgtt_prot.
+  //   pdx composes the four-level PTE flag word.
+  // ==========================================================================
+  pub let gtt_bind : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (gpu_va: u64) (host_pa: u64) (prot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "Wave 74 G5 [R37] (#2542): install one 4K GTT entry. Validate (inited, gpu_va in aperture, host_pa 4K-aligned); write PTE = (host_pa & GTT_PA_MASK) | GTT_PTE_VALID at base[gpu_va >> 12]; emit `GTT BIND gpu_va=0x<16-hex> host_pa=0x<16-hex>` via klog_s1_x2 (v2 at caller [rsp+0] -- the +8 variant Wave 73 I7 broke is NOT what we emit). Register plan: rbx=gpu_va, r12=host_pa, r13=prot (retained for signature stability; unused at Wave 74). Three callee-save pushes land rsp%16==0 at the klog_s1_x2 call site (entry rsp%16==8, three pushes +24 -> ==0; then sub rsp,16 -> ==0 at the call). prot is unused at Wave 74 -- see function doc -- but the parameter is retained so the caller signature does not shift on the follow-up PR. Labels prefixed gtt_bd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // gpu_va
+        mov r12, rsi;                    // host_pa
+        mov r13, rdx;                    // prot (reserved; see justification)
+
+        // Gate 1: inited?
+        call gpu_gtt_inited_q;
+        cmp rax, 0;
+        je  gtt_bd_not_inited;
+
+        // Gate 2: gpu_va in aperture?
+        mov rdi, rbx;
+        call gpu_gtt_aperture_valid;
+        cmp rax, 0;
+        je  gtt_bd_bad_va;
+
+        // Gate 3: host_pa 4K-aligned?
+        mov rdi, r12;
+        call gpu_gtt_host_pa_valid;
+        cmp rax, 0;
+        je  gtt_bd_bad_pa;
+
+        // Write the PTE: entry_index = gpu_va >> 12; pte = (host_pa &
+        // GTT_PA_MASK) | GTT_PTE_VALID; base[entry_index] = pte.
+        lea r10, [rip + _gpu_gtt_base];
+        mov r10, [r10 + 0];              // GSM base
+        mov r11, rbx;
+        shr r11, 12;                     // entry index
+        mov rax, r12;
+        mov rcx, 0xFFFFFFFFFFFFF000;     // GTT_PA_MASK -- movabs, u64 constant
+        and rax, rcx;
+        or  rax, 1;                      // GTT_PTE_VALID
+        mov [r10 + r11 * 8], rax;
+
+        // Fingerprint: `GTT BIND gpu_va=0x<16-hex> host_pa=0x<16-hex>`
+        // via klog_s1_x2 (two hex KVs). v2 (host_pa = r12) at caller
+        // [rsp+0] per the wrapper's calling convention (see firmware_
+        // blob_lookup fingerprint path for the one-for-one idiom
+        // comment).
+        sub rsp, 16;
+        mov [rsp + 0], r12;              // v2 = host_pa
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + gtt_tag_gtt_bind];
+        lea rcx, [rip + gtt_k_gpu_va];   // k1
+        mov r8, rbx;                     // v1 = gpu_va
+        lea r9, [rip + gtt_k_host_pa];   // k2
+        call klog_s1_x2;
+        add rsp, 16;
+
+        xor rax, rax;                    // GPU_GTT_OK
+        jmp gtt_bd_out;
+
+      gtt_bd_not_inited:
+        mov rax, 0xFFFFFFDB;             // GPU_GTT_NOT_INITED
+        jmp gtt_bd_out;
+      gtt_bd_bad_va:
+        mov rax, 0xFFFFFFDC;             // GPU_GTT_GPU_VA_OUT_OF_APER
+        jmp gtt_bd_out;
+      gtt_bd_bad_pa:
+        mov rax, 0xFFFFFFDD;             // GPU_GTT_HOST_PA_MISALIGNED
+
+      gtt_bd_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // gtt_unbind(gpu_va) -> u64
+  //
+  //   Clear one 4K GTT entry (write 0, VALID=0). No fingerprint at Wave 74
+  //   (the task directive reserves the fingerprint catalog for BIND +
+  //   CREATE + DESTROY only; UNBIND is a silent clear).
+  // ==========================================================================
+  pub let gtt_unbind : (u64) -> u64 !{mem} @{} =
+    fn (gpu_va: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 74 G5 [R37] (#2542): clear one 4K GTT entry. Validate (inited + aperture); write 0 (VALID=0 implicit) at base[gpu_va >> 12]. Returns 0 on success, GPU_GTT_NOT_INITED or GPU_GTT_GPU_VA_OUT_OF_APER otherwise. Pure asm, no nested calls past the two validators. Labels prefixed gtt_ub_.",
+      block: {
+        push rbx;
+        mov rbx, rdi;
+
+        call gpu_gtt_inited_q;
+        cmp rax, 0;
+        je  gtt_ub_not_inited;
+
+        mov rdi, rbx;
+        call gpu_gtt_aperture_valid;
+        cmp rax, 0;
+        je  gtt_ub_bad_va;
+
+        lea r10, [rip + _gpu_gtt_base];
+        mov r10, [r10 + 0];
+        mov r11, rbx;
+        shr r11, 12;
+        xor rax, rax;
+        mov [r10 + r11 * 8], rax;
+
+        xor rax, rax;
+        jmp gtt_ub_out;
+
+      gtt_ub_not_inited:
+        mov rax, 0xFFFFFFDB;
+        jmp gtt_ub_out;
+      gtt_ub_bad_va:
+        mov rax, 0xFFFFFFDC;
+
+      gtt_ub_out:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // PPGTT row-table helpers
+  // ==========================================================================
+
+  // Row index -> row base pointer. Stride 32 = 1 << 5, so a single shl.
+  pub let gpu_ppgtt_row_base : (u64) -> u64 !{} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "Wave 74 G5 [R37] (#2542): row_id -> &_gpu_ppgtt_table[row_id * 32]. Stride is a power of two so a single shl suffices (no 2-op imul). No bounds check by policy; caller validates against GPU_GTT_PPGTT_MAX. Labels prefixed pp_rb_.",
+      block: {
+        lea rax, [rip + _gpu_ppgtt_table];
+        mov r10, rdi;
+        shl r10, 5;                      // row_id * 32
+        add rax, r10;
+        ret
+      }
+    }
+
+  // Row-liveness probe: 1 iff row_id < 8 AND in_use byte != 0.
+  pub let gpu_ppgtt_row_live : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 74 G5 [R37] (#2542): 1 iff row_id < GPU_GTT_PPGTT_MAX (8) AND in_use[63:56] != 0. Inlined address compute mirrors gpu_ppgtt_row_base to keep this a pure leaf. Labels prefixed pp_rl_.",
+      block: {
+        cmp rdi, 8;
+        jae pp_rl_no;
+        lea r10, [rip + _gpu_ppgtt_table];
+        mov r11, rdi;
+        shl r11, 5;
+        add r10, r11;
+        mov rax, [r10 + 0];
+        shr rax, 56;                     // in_use byte
+        cmp rax, 0;
+        je  pp_rl_no;
+        mov rax, 1;
+        ret;
+      pp_rl_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // Find a free row (in_use byte == 0). Returns row_id or GPU_GTT_ROW_NONE
+  // (0xFF). Linear scan over 8 rows is fine at this scale.
+  pub let gpu_ppgtt_row_alloc : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 74 G5 [R37] (#2542): linear-scan the 8-row table for the first free slot (in_use byte == 0). Returns row_id (0..7) or GPU_GTT_ROW_NONE (0xFF). Pure asm, no callee-save needed. Labels prefixed pp_ra_.",
+      block: {
+        lea r10, [rip + _gpu_ppgtt_table];
+        xor rcx, rcx;
+      pp_ra_scan:
+        cmp rcx, 8;
+        jae pp_ra_none;
+        mov r11, rcx;
+        shl r11, 5;
+        mov rax, [r10 + r11];
+        shr rax, 56;
+        cmp rax, 0;
+        je  pp_ra_hit;
+        add rcx, 1;
+        jmp pp_ra_scan;
+      pp_ra_hit:
+        mov rax, rcx;
+        ret;
+      pp_ra_none:
+        mov rax, 0xFF;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ppgtt_create() -> u64
+  //
+  //   Mint a new PPGTT: allocate a 4 KiB frame for the PML4 root, claim a
+  //   free row, mint a KIND_PPGTT cap pointing at the row, emit the
+  //   fingerprint, return the cap slot.
+  //
+  //   Returns:
+  //     cap_slot (0..255) on success
+  //     GPU_GTT_ROOT_ALLOC_FAILED (0xFFFFFFDE) if phys_alloc returned 0
+  //                                            or no free row exists
+  //                                            or slab_alloc returned 256
+  //
+  //   phys_alloc(order=0) returns a kernel VA to a 4 KiB page (not a
+  //   genuine PA -- see mm/phys_alloc.pdx #658 contract). The submit
+  //   path's cr3-load boundary performs the VA->PA translation; this
+  //   file stores the returned value as-is in pml4_phys_addr for the
+  //   skeleton.
+  // ==========================================================================
+  pub let ppgtt_create : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "Wave 74 G5 [R37] (#2542): PPGTT mint entrypoint. Four-step: (1) gpu_ppgtt_row_alloc; (2) phys_alloc(0) for the PML4 frame; (3) slab_alloc for the cap slot; (4) cap_mint_write(slot, KIND_PPGTT=0x3F, R_PPGTT_ALL, row_id) + row stamp; (5) emit `PPGTT CREATE cap=0x<16-hex> root_pa=0x<16-hex>` via klog_s1_x2 (v2 at caller [rsp+0]). On any failure path returns GPU_GTT_ROOT_ALLOC_FAILED (0xFFFFFFDE). Register plan: rbx=row_id, r12=pml4_pa, r13=cap_slot. Three callee-save pushes land rsp%16==0 at every nested call. Labels prefixed pp_cr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        // Step 1: free row.
+        call gpu_ppgtt_row_alloc;
+        mov rbx, rax;
+        mov r10, 0xFF;
+        cmp rbx, r10;
+        je  pp_cr_fail;
+
+        // Step 2: 4 KiB frame for PML4.
+        xor rdi, rdi;                    // order = 0
+        call phys_alloc;
+        mov r12, rax;
+        cmp r12, 0;
+        je  pp_cr_fail;
+
+        // Step 3: cap slot.
+        call slab_alloc;
+        mov r13, rax;
+        mov r10, 256;
+        cmp r13, r10;
+        jae pp_cr_fail;
+
+        // Step 4: mint descriptor. target_ptr = row_id (so the handler
+        // can locate the row from the cap_table entry alone).
+        mov rdi, r13;                    // slot
+        mov rsi, 0x3F;                   // KIND_PPGTT
+        mov rdx, 0x003;                  // R_PPGTT_ALL
+        mov rcx, rbx;                    // target_ptr = row_id
+        call cap_mint_write;
+
+        // Stamp the row: in_use = 1 (upper byte), row_id self in low byte;
+        // pml4_pa at +8; cap_slot at +16.
+        mov rdi, rbx;
+        call gpu_ppgtt_row_base;
+        // rax = &row
+        mov rcx, 1;
+        shl rcx, 56;                     // in_use = 0x01 at [63:56]
+        or  rcx, rbx;                    // low byte = self row_id
+        mov [rax + 0], rcx;
+        mov [rax + 8], r12;              // pml4_pa
+        mov [rax + 16], r13;             // cap_slot
+        xor rcx, rcx;
+        mov [rax + 24], rcx;             // pad
+
+        // Step 5: fingerprint `PPGTT CREATE cap=0x<16-hex> root_pa=0x<16-hex>`.
+        // v2 (root_pa = r12) at caller [rsp+0]; k1=cap, v1=cap_slot;
+        // k2=root_pa, v2=pml4_pa (from stack).
+        sub rsp, 16;
+        mov [rsp + 0], r12;              // v2 = pml4_pa
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + gtt_tag_ppgtt_create];
+        lea rcx, [rip + gtt_k_cap];      // k1
+        mov r8, r13;                     // v1 = cap_slot
+        lea r9, [rip + gtt_k_root_pa];   // k2
+        call klog_s1_x2;
+        add rsp, 16;
+
+        mov rax, r13;                    // return cap_slot
+        jmp pp_cr_out;
+
+      pp_cr_fail:
+        mov rax, 0xFFFFFFDE;             // GPU_GTT_ROOT_ALLOC_FAILED
+
+      pp_cr_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ppgtt_resolve_cap(cap) -> row_id | GPU_GTT_ROW_NONE
+  //
+  //   Shared cap->row validator used by ppgtt_bind and ppgtt_destroy.
+  //   Returns row_id on success, GPU_GTT_ROW_NONE (0xFF) otherwise.
+  //   Does not emit; failures surface at the caller as the appropriate
+  //   taxonomy code.
+  // ==========================================================================
+  pub let ppgtt_resolve_cap : (u64) -> u64 !{mem} @{cap} =
+    fn (cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {cap},
+      justification: "Wave 74 G5 [R37] (#2542): cap -> row_id OR GPU_GTT_ROW_NONE (0xFF). Validates (cap < 256, descriptor.kind == KIND_PPGTT, row live). Pure validator, no mint/revoke. Register plan: rbx=cap, r12=row_id. Two callee-save pushes land rsp%16==0 at the one nested call (gpu_ppgtt_row_live). Labels prefixed pp_rc_.",
+      block: {
+        push rbx;
+        push r12;
+        mov rbx, rdi;
+
+        mov r10, 256;
+        cmp rbx, r10;
+        jae pp_rc_bad;
+
+        lea r10, [rip + cap_table];
+        mov r11, rbx;
+        shl r11, 3;
+        mov rax, rbx;
+        shl rax, 4;
+        add r11, rax;
+        add r10, r11;                    // &cap_table[cap*24]
+        mov rax, [r10 + 0];
+        cmp rax, 0x3F;                   // KIND_PPGTT
+        jne pp_rc_bad;
+
+        mov r12, [r10 + 16];             // target_ptr = row_id (callee-save)
+        // Validate row liveness.
+        mov rdi, r12;
+        call gpu_ppgtt_row_live;
+        cmp rax, 0;
+        je  pp_rc_bad;
+        mov rax, r12;                    // row_id
+        pop r12;
+        pop rbx;
+        ret;
+
+      pp_rc_bad:
+        mov rax, 0xFF;                   // GPU_GTT_ROW_NONE
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ppgtt_bind(ppgtt_cap, gpu_va, host_pa, size_pages, prot) -> u64
+  //
+  //   High-level range-bind orchestrator. At Wave 74 this is a validation
+  //   shim: it resolves the cap to a row, bumps a per-row usage counter
+  //   (reusing row+24 as a scratch field), and returns OK. The actual
+  //   four-level PTE install is deferred to the follow-up that wires this
+  //   call to ppgtt_bind.pdx's ppgb_bind + the walker's physical PTE
+  //   emit. The paideia-as ABI caps at six register-passed args; this
+  //   function needs five, which fits in rdi..r9 cleanly.
+  //
+  //   Note: `prot` and `size_pages` are threaded but not consulted at Wave
+  //   74 beyond host_pa alignment / size positivity checks.
+  // ==========================================================================
+  pub let ppgtt_bind : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (ppgtt_cap: u64) (gpu_va: u64) (host_pa: u64) (size_pages: u64) (prot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "Wave 74 G5 [R37] (#2542): PPGTT range-bind skeleton. Resolves the cap to a row (ppgtt_resolve_cap), validates host_pa alignment (gpu_gtt_host_pa_valid), size_pages > 0. On OK returns 0 (GPU_GTT_OK); on bad cap returns GPU_GTT_UNKNOWN_CAP (0xFFFFFFDF); on misaligned host_pa returns GPU_GTT_HOST_PA_MISALIGNED (0xFFFFFFDD). No fingerprint at bind-skeleton level -- the per-page fingerprint catalog is reserved for the follow-up that drives the actual PTE emit through the walker. Register plan: rbx=cap, r12=gpu_va, r13=host_pa, r14=size_pages. Four callee-save pushes land rsp%16==8 (even frame + 32B scratch would land ==0, we leave the frame odd because no klog_s1_x2 call is made at this layer; the one nested call pp_rc_ owns its own alignment through its own push). Labels prefixed pp_bd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                    // ppgtt_cap
+        mov r12, rsi;                    // gpu_va
+        mov r13, rdx;                    // host_pa
+        mov r14, rcx;                    // size_pages
+        // prot (r8) retained in-register; no further use at this layer.
+
+        // Resolve cap -> row_id.
+        mov rdi, rbx;
+        call ppgtt_resolve_cap;
+        mov r10, 0xFF;
+        cmp rax, r10;
+        je  pp_bd_bad_cap;
+        // rax = row_id (not consumed further at this layer; the walker
+        // will own it on the follow-up).
+
+        // Validate host_pa alignment.
+        mov rdi, r13;
+        call gpu_gtt_host_pa_valid;
+        cmp rax, 0;
+        je  pp_bd_bad_pa;
+
+        // Validate size_pages > 0 (zero-length bind is a no-op; refuse).
+        cmp r14, 0;
+        je  pp_bd_bad_pa;
+
+        xor rax, rax;                    // GPU_GTT_OK
+        jmp pp_bd_out;
+
+      pp_bd_bad_cap:
+        mov rax, 0xFFFFFFDF;             // GPU_GTT_UNKNOWN_CAP
+        jmp pp_bd_out;
+      pp_bd_bad_pa:
+        mov rax, 0xFFFFFFDD;             // GPU_GTT_HOST_PA_MISALIGNED
+
+      pp_bd_out:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ppgtt_destroy(ppgtt_cap) -> u64
+  //
+  //   Teardown: resolve cap -> row_id, zero the row, zero the descriptor
+  //   via cap_mint_write(slot, 0, 0, 0), emit `PPGTT DESTROY cap=0x<16-hex>`.
+  //   Returns 0 on success, GPU_GTT_UNKNOWN_CAP on bad cap. Pml4 frame is
+  //   deliberately NOT freed at Wave 74 -- the follow-up that pairs with
+  //   phys_free's VA-boundary normalisation (#658) performs the frame
+  //   return; leaking the frame at skeleton level is strictly safer than
+  //   returning a bad PA to the allocator.
+  // ==========================================================================
+  pub let ppgtt_destroy : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (ppgtt_cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "Wave 74 G5 [R37] (#2542): PPGTT teardown. Validate cap, zero row, zero descriptor via cap_mint_write(slot, 0, 0, 0), emit `PPGTT DESTROY cap=0x<16-hex>` via klog_s1_x1. The pml4 frame is deliberately leaked at Wave 74 (phys_free's VA boundary normalisation is #658, deferred). Register plan: rbx=cap, r12=row_id. Three callee-save pushes land rsp%16==0 at every nested call. Labels prefixed pp_ds_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // cap
+
+        mov rdi, rbx;
+        call ppgtt_resolve_cap;
+        mov r10, 0xFF;
+        cmp rax, r10;
+        je  pp_ds_bad_cap;
+        mov r12, rax;                    // row_id
+
+        // Zero the row.
+        mov rdi, r12;
+        call gpu_ppgtt_row_base;
+        xor rcx, rcx;
+        mov [rax + 0], rcx;
+        mov [rax + 8], rcx;
+        mov [rax + 16], rcx;
+        mov [rax + 24], rcx;
+
+        // Zero the descriptor via cap_mint_write.
+        mov rdi, rbx;                    // slot
+        mov rsi, 0;                      // kind
+        mov rdx, 0;                      // rights
+        mov rcx, 0;                      // target_ptr
+        call cap_mint_write;
+
+        // Fingerprint `PPGTT DESTROY cap=0x<16-hex>` via klog_s1_x1.
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + gtt_tag_ppgtt_destroy];
+        lea rcx, [rip + gtt_k_cap];
+        mov r8, rbx;                     // cap
+        call klog_s1_x1;
+
+        xor rax, rax;                    // GPU_GTT_OK
+        jmp pp_ds_out;
+
+      pp_ds_bad_cap:
+        mov rax, 0xFFFFFFDF;             // GPU_GTT_UNKNOWN_CAP
+
+      pp_ds_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // cap_handler_ppgtt(rights, target_ptr, op_arg) -> u64
+  //
+  //   KIND_PPGTT cap_invoke dispatch handler. Reachable from
+  //   cap/invoke.pdx:cap_invoke_dispatch via the `cmp rcx, 0x3F; je
+  //   call_kind_ppgtt` arm added alongside this file. The handler is
+  //   query-only at Wave 74 -- the mutating primitives (ppgtt_create /
+  //   ppgtt_bind / ppgtt_destroy) ride supervisor callers above the
+  //   generic cap_invoke syscall ABI.
+  //
+  //     op 0 PPGTT_OP_QUERY_ROOT  -> row.pml4_phys_addr
+  //     op 1 PPGTT_OP_QUERY_CAP   -> row.cap_slot
+  //     op 2 PPGTT_OP_QUERY_INUSE -> 1 iff row live
+  //     else                      -> INVOKE_UNSUPPORTED
+  //
+  //   Rights gate: every op requires R_PPGTT_READ. target_ptr IS the
+  //   row_id (ppgtt_create stamped it that way).
+  // ==========================================================================
+  pub let cap_handler_ppgtt : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (rights: u64) (target_ptr: u64) (op_arg: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "Wave 74 G5 [R37] (#2542): KIND_PPGTT cap_invoke dispatch. Entry chatter (klog_s1 of gtt_tag_handler_entry) with the three incoming regs preserved in callee-save slots. op_code = op_arg & 0xFF; rights gate against R_PPGTT_READ; dispatch 0..2 to the matching row accessor; else INVOKE_UNSUPPORTED. target_ptr IS the row_id (16-bit mask applied as a defensive bound for a future layout widening). Three callee-save pushes (rbx=rights, r12=row_id, r13=op_code) land rsp%16==0 at every nested call. Labels prefixed pp_hd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // rights
+        mov r12, rsi;
+        mov r10, 0xFFFF;
+        and r12, r10;                    // row_id = target_ptr[15:0]
+        mov r13, rdx;                    // op_arg
+        mov r10, 0xFF;
+        and r13, r10;                    // op_code = op_arg[7:0]
+
+        // Entry chatter.
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + gtt_tag_handler_entry];
+        call klog_s1;
+
+        // Rights gate (uniform, single up-front).
+        mov r10, rbx;
+        and r10, 0x001;                  // R_PPGTT_READ
+        cmp r10, 0;
+        je  pp_hd_denied;
+
+        // Op dispatch.
+        cmp r13, 0;
+        je  pp_hd_op_root;
+        cmp r13, 1;
+        je  pp_hd_op_cap;
+        cmp r13, 2;
+        je  pp_hd_op_inuse;
+        jmp pp_hd_unsup;
+
+      pp_hd_op_root:
+        // Row liveness probe first; return pml4_pa at +8.
+        mov rdi, r12;
+        call gpu_ppgtt_row_live;
+        cmp rax, 0;
+        je  pp_hd_decode_bad;
+        mov rdi, r12;
+        call gpu_ppgtt_row_base;
+        mov rax, [rax + 8];
+        jmp pp_hd_out;
+
+      pp_hd_op_cap:
+        mov rdi, r12;
+        call gpu_ppgtt_row_live;
+        cmp rax, 0;
+        je  pp_hd_decode_bad;
+        mov rdi, r12;
+        call gpu_ppgtt_row_base;
+        mov rax, [rax + 16];
+        jmp pp_hd_out;
+
+      pp_hd_op_inuse:
+        mov rdi, r12;
+        call gpu_ppgtt_row_live;
+        jmp pp_hd_out;
+
+      pp_hd_decode_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;     // GPU_GTT_DECODE_BAD
+        jmp pp_hd_out;
+      pp_hd_denied:
+        mov rax, 0xFFFFFFFFFFFFFFFD;     // INVOKE_DENIED
+        jmp pp_hd_out;
+      pp_hd_unsup:
+        mov rax, 0xFFFFFFFFFFFFFFFC;     // INVOKE_UNSUPPORTED
+
+      pp_hd_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Boot wiring note
+  // ----------------
+  // kernel_main.pdx needs one new call alongside the existing drivers'
+  // reset / init calls:
+  //
+  //   call gpu_gtt_reset;    // defensive zero of PPGTT table + GTT substrate
+  //
+  // Zero-arg, allocates nothing on the stack, touches rax/rcx/r10/r11 only;
+  // safe alongside kernel_main's live r12/r13/r14 handoff registers. The
+  // wiring itself is deferred to a follow-up slice (same discipline every
+  // other `*_table_reset` boot wiring follows -- firmware_blob_table_reset
+  // was declared in Wave 73 and wired a slice later). At real boot .bss
+  // zero-init leaves the table empty and `inited` zero, so gtt_bind/unbind
+  // correctly refuse until gtt_init is called; the KIND_PPGTT dispatch arm
+  // is pure plumbing and self-standing.
+  // ==========================================================================
+}
