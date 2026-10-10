@@ -1,0 +1,669 @@
+// src/kernel/core/acpi/crs.pdx — Wave 59 I3 (paideia-os#2560)
+//
+// ACPI _CRS (Current Resource Settings) byte-stream decoder for the
+// DSDT PCI root-bridge device. Reads the ACPI 6.5 §6.4 / §19.6.90
+// resource-descriptor stream a caller has materialised from a prior
+// AML walk (D5 will provide that walk; this module only decodes the
+// resulting buffer), classifies each descriptor, and populates a
+// fixed-size CrsInfo record with the host bridge's:
+//
+//   - PCI bus number range  (from Word / QWord / DWord Address Space
+//                            descriptors with Resource Type = 2)
+//   - MMIO windows          (from Memory32Fixed + Address Space
+//                            descriptors with Resource Type = 0)
+//   - I/O port windows      (from Small I/O-Port + Address Space
+//                            descriptors with Resource Type = 1)
+//   - An ECAM window        (heuristic: an MMIO window whose length
+//                            is >= 256 MiB — exactly the span of 256
+//                            PCIe buses × 1 MiB config space per bus,
+//                            which is the ECAM shape every mainline
+//                            firmware publishes). The caller is
+//                            expected to cross-check against the HID
+//                            of the owning device (PNP0A08 → ECAM
+//                            present; PNP0A03 → no ECAM) before
+//                            trusting the flag.
+//
+// The parser is a strict byte-stream walker — no AML interpreter,
+// no name-space, no evaluation. The caller does the DSDT walk; this
+// just decodes the already-materialised _CRS byte buffer. Keeping
+// those two concerns separate lets this land independently of D5
+// (ACPICA DSDT/SSDT walker) while providing the exact decoded shape
+// D5 needs when it starts calling into us.
+//
+// -----------------------------------------------------------------------------
+// On-wire resource-descriptor format (ACPI 6.5 §6.4, §19.6.90)
+// -----------------------------------------------------------------------------
+//
+// Each descriptor begins with a one-byte header; bit 7 distinguishes
+// Small from Large.
+//
+//   Small item: byte 0 = [ 0 | tag:4 | len:3 ]
+//               followed by `len` bytes of data (len <= 7).
+//               Total descriptor size = 1 + len.
+//
+//   Large item: byte 0 = [ 1 | tag:7 ]
+//               bytes 1..2 = u16 `len` (little-endian)
+//               followed by `len` bytes of data.
+//               Total descriptor size = 3 + len.
+//
+// The stream is terminated by an END_TAG small item (tag=0xF, len=1,
+// so byte 0 = 0x79, byte 1 = checksum). On a well-formed _CRS the
+// walker observes END_TAG before running past the buffer end; on a
+// malformed one it bails and returns 0.
+//
+// -----------------------------------------------------------------------------
+// Descriptors we classify (vs. defensively skip)
+// -----------------------------------------------------------------------------
+//
+//   Small 0x4  IRQ               — skip (not a bus / mmio / io range)
+//   Small 0x5  DMA               — skip
+//   Small 0x8  I/O Port          — io_win (base = u16@+2, length = u8@+7)
+//   Small 0x9  Fixed I/O Port    — skip (short-form; superseded by
+//                                   Address Space descriptors on modern
+//                                   firmware; counting it here would
+//                                   double-count the same resource)
+//   Small 0xF  End Tag           — terminate loop, return success
+//
+//   Large 0x5  Memory32          — skip (producer-only form, rare)
+//   Large 0x6  Memory32Fixed     — mmio_win (base=u32@+4, length=u32@+8)
+//   Large 0x7  DWord Address     — classify by Resource Type at +3:
+//                                    0 → mmio_win  (base=+10, length=+22)
+//                                    1 → io_win    (base=+10, length=+22)
+//                                    2 → bus range (lo=+10, hi=+14 as u16)
+//   Large 0x8  Word Address      — classify by Resource Type at +3:
+//                                    1 → io_win    (base=+8, length=+14)
+//                                    2 → bus range (lo=+8, hi=+10 as u16)
+//   Large 0x9  Extended IRQ      — skip
+//   Large 0xA  QWord Address     — classify by Resource Type at +3:
+//                                    0 → mmio_win  (base=+14, length=+38)
+//                                    1 → io_win    (base=+14, length=+38)
+//                                    2 → bus range (lo=+14, hi=+22 as u16)
+//   Large 0xB  Extended Address  — skip (encoding adds a type-specific
+//                                   attributes attribute; not needed for
+//                                   bus / mmio / io classification)
+//
+// Unrecognised tags advance by their declared length without comment.
+// A length that would overshoot the buffer is treated as malformed and
+// returns 0.
+//
+// -----------------------------------------------------------------------------
+// CrsInfo (296 B, @align(8)) — fixed-size output record
+// -----------------------------------------------------------------------------
+//
+//   +0    u16  bus_lo               — bus range Min (0 if none seen)
+//   +2    u16  bus_hi               — bus range Max (0 if none seen)
+//   +4    u32  _pad0
+//   +8    u32  n_mmio_wins          — count of entries written into
+//                                      mmio_bases / mmio_lengths
+//   +12   u32  n_io_wins            — count of entries written into
+//                                      io_bases / io_lengths
+//   +16   u32  has_ecam             — 1 if any mmio_win length was >=
+//                                      CRS_ECAM_MIN_SIZE (256 MiB)
+//   +20   u32  _pad1
+//   +24   [u64;8] mmio_bases       — [n_mmio_wins], up to CRS_MMIO_CAP
+//   +88   [u64;8] mmio_lengths     — likewise
+//   +152  [u64;8] io_bases         — [n_io_wins], up to CRS_IO_CAP
+//   +216  [u64;8] io_lengths       — likewise
+//   +280  u64 ecam_base             — the last-seen >=256-MiB mmio_base
+//   +288  u64 ecam_length           — its length
+//
+// All counts and offsets are stable so the fingerprint emitter (future)
+// can read fields without re-parsing. CrsInfo is 296 bytes which is
+// 37 × 8 B — the zero-init loop walks exactly 37 u64 slots.
+//
+// -----------------------------------------------------------------------------
+// paideia-as encoder-gap posture (v0.36.81)
+// -----------------------------------------------------------------------------
+//
+//   G1 (`mov [mem], reg32` widens): every u32 store uses `mov_d` so the
+//      count fields (n_mmio_wins, n_io_wins, has_ecam) stay 4-byte sized.
+//   G4 (`cmp al, imm` may miscompile): every compare in this file is
+//      against a full 64-bit register, no `cmp al,imm` anywhere.
+//   Reserved labels: `loop`, `if`, `let` cannot be labels. Every label
+//      in this file is `crs_`-prefixed for namespace hygiene and to keep
+//      clear of reserved names.
+//   Unaligned reads: _CRS buffers start at an arbitrary byte offset
+//      (whatever the AML materialiser handed us), so every multi-byte
+//      field read is treated as unaligned. x86-64 tolerates unaligned
+//      MOVs per SDM Vol.3 §7.1.1 (same posture xsdt.pdx L109 and
+//      mcfg.pdx L203 adopt for the SDT+entry run). u16 reads use
+//      `xor+mov_w`, u32 reads use `xor + mov r32,[...]` (the 32-bit
+//      MOV zero-extends into the full 64-bit register per SDM Vol.1
+//      §3.4.1.1), u64 reads use a plain `mov r64,[...]`.
+//
+// -----------------------------------------------------------------------------
+// Register plan (crs_parse, 5-push callee-save prologue)
+// -----------------------------------------------------------------------------
+//
+//   Prologue: push rbx, r12, r13, r14, r15 (40 B → rsp%16==0 at loop).
+//   rbx = total current-descriptor size (header_bytes + data_bytes),
+//         used to advance the cursor at the end of each iteration.
+//   r12 = unused (kept pushed for review-symmetry with mcfg_parse_segments'
+//         identical 5-push prologue and to leave the registers free for a
+//         future second parsing pass over the same buffer).
+//   r13 = end = buf + crs_len.
+//   r14 = cursor.
+//   r15 = out pointer (CrsInfo base).
+
+module Crs = structure {
+
+  // ==========================================================================
+  // Resource descriptor tag constants (ACPI 6.5 §6.4)
+  // ==========================================================================
+  //
+  // Small items: tag occupies bits 6..3 of the header byte.
+  // Large items: tag occupies bits 6..0 of the header byte.
+
+  pub let CRS_SMALL_IRQ            : u64 = 0x4
+  pub let CRS_SMALL_DMA            : u64 = 0x5
+  pub let CRS_SMALL_IO             : u64 = 0x8
+  pub let CRS_SMALL_FIXED_IO       : u64 = 0x9
+  pub let CRS_SMALL_END_TAG        : u64 = 0xF
+
+  pub let CRS_LARGE_MEM24          : u64 = 0x01
+  pub let CRS_LARGE_MEM32          : u64 = 0x05
+  pub let CRS_LARGE_MEM32_FIXED    : u64 = 0x06
+  pub let CRS_LARGE_DWORD_ADDR     : u64 = 0x07
+  pub let CRS_LARGE_WORD_ADDR      : u64 = 0x08
+  pub let CRS_LARGE_EXT_IRQ        : u64 = 0x09
+  pub let CRS_LARGE_QWORD_ADDR     : u64 = 0x0A
+  pub let CRS_LARGE_EXT_ADDR       : u64 = 0x0B
+
+  // Address Space Descriptor resource types (byte @ descriptor+3).
+  pub let CRS_RESTYPE_MEMORY       : u64 = 0
+  pub let CRS_RESTYPE_IO           : u64 = 1
+  pub let CRS_RESTYPE_BUS          : u64 = 2
+
+  // ==========================================================================
+  // CrsInfo field offsets (bytes from the record base)
+  // ==========================================================================
+
+  pub let CRS_INFO_OFF_BUS_LO      : u64 = 0
+  pub let CRS_INFO_OFF_BUS_HI      : u64 = 2
+  pub let CRS_INFO_OFF_N_MMIO      : u64 = 8
+  pub let CRS_INFO_OFF_N_IO        : u64 = 12
+  pub let CRS_INFO_OFF_HAS_ECAM    : u64 = 16
+  pub let CRS_INFO_OFF_MMIO_BASES  : u64 = 24
+  pub let CRS_INFO_OFF_MMIO_LENS   : u64 = 88
+  pub let CRS_INFO_OFF_IO_BASES    : u64 = 152
+  pub let CRS_INFO_OFF_IO_LENS     : u64 = 216
+  pub let CRS_INFO_OFF_ECAM_BASE   : u64 = 280
+  pub let CRS_INFO_OFF_ECAM_LEN    : u64 = 288
+
+  pub let CRS_INFO_SIZE            : u64 = 296    // 37 × 8 B u64 slots
+  pub let CRS_INFO_U64_SLOTS       : u64 = 37
+
+  // Window-array caps — every count is bounds-checked against these
+  // before writing into the arrays. Over-count windows are dropped
+  // silently (the parser still advances past them so the END_TAG is
+  // still reached) — a T14 G4 _CRS publishes at most 2-4 MMIO + 1-2
+  // I/O windows, so 8 of each is 2–4× headroom.
+  pub let CRS_MMIO_CAP             : u64 = 8
+  pub let CRS_IO_CAP               : u64 = 8
+
+  // ECAM detection heuristic: an MMIO window whose length is >=
+  // 256 MiB (= 256 PCIe buses × 1 MiB config space per bus) is the
+  // ECAM — that is the exact shape every mainline firmware publishes
+  // and no non-ECAM BAR window on x86-64 reaches this size. The
+  // caller still cross-checks the owning device HID (PNP0A08 → ECAM,
+  // PNP0A03 → no ECAM) before trusting the flag.
+  pub let CRS_ECAM_MIN_SIZE        : u64 = 0x10000000
+
+  // ==========================================================================
+  // crs_parse — _CRS byte-stream decoder
+  // ==========================================================================
+  //
+  // SysV: (crs_buf: u64, crs_len: u64, out: u64) -> u64
+  //
+  //   rdi = pointer to the _CRS buffer bytes (as materialised from the
+  //         prior AML walk; this parser never allocates).
+  //   rsi = length of that buffer in bytes (caller passes u32 zero-
+  //         extended into a full 64-bit value — a dirty-high-bits rsi
+  //         would overshoot the compare but still fail the per-
+  //         descriptor bounds guard at the next iteration).
+  //   rdx = pointer to a caller-allocated CrsInfo (296 bytes, @align(8))
+  //         that this parser zero-initialises before walking.
+  //
+  // Returns rax = 1 on success (END_TAG reached inside the buffer),
+  //         rax = 0 on malformed (buffer exhausted before END_TAG, or
+  //                               a declared descriptor length overshoots
+  //                               the buffer).
+  //
+  // On a 0 return CrsInfo holds whatever decoding happened before the
+  // bail — callers that must distinguish partial from empty can inspect
+  // the count fields.
+
+  pub let crs_parse : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (crs_buf: u64, crs_len: u64, out: u64) -> unsafe {
+      effects: { mem },
+      capabilities: { boot },
+      justification: "Wave 59 I3 (paideia-os#2560). ACPI 6.5 §6.4 / §19.6.90 _CRS resource-descriptor byte-stream decoder. 5-push callee-save prologue (rbx,r12-r15) → rsp%16==0. rbx tracks the current descriptor's total length (header_bytes + data_bytes) for the end-of-iteration advance; r12 is unused but pushed for review-symmetry with mcfg_parse_segments. r13 = end (buf + len), r14 = cursor (starts at buf), r15 = out pointer. Zero-initialises the 296-byte CrsInfo as 37 × u64 before the walk so every count defaults to 0 and the fingerprint emitter reads unseeded buckets as zero. Per iteration: (a) cursor-vs-end bounds-check — if cursor >= end we fell off without seeing END_TAG, return 0. (b) Load the one-byte descriptor header via `xor rax,rax; mov_b rax,[r14]`. (c) Bit-7 test via `mov rcx,rax; and rcx,0x80; cmp rcx,0; jne crs_large_item`. (d) Small path: tag = (byte >> 3) & 0xF (shr rcx,3; and rcx,0xF), len = byte & 0x7 (and rbx,0x7), total descriptor size = 1 + len. Bounds-check (cursor + 1 + len) <= end; else return 0. Classify: END_TAG (tag==0xF) → return 1 immediately. I/O Port (tag==0x8) → read u16 base at +2 (xor+mov_w), u8 length at +7 (xor+mov_b), append to io_wins if n_io_wins < CRS_IO_CAP; bump n_io_wins via mov_d (G1). Every other small tag (IRQ, DMA, FixedIO, VendorShort) is skipped — the parser advances past it unchanged. (e) Large path: tag = byte & 0x7F (and rdx,0x7F), descriptor data length = u16 at +1 (xor+mov_w into rbx), total descriptor size = 3 + len. Two-stage bounds check: first require 3 more bytes to even read the length field, then require 3 + len total. Classify Memory32Fixed (tag==0x6): mmio_base = u32@+4, mmio_length = u32@+8, zero-extended via `mov r32,[r14+off]`; append + ECAM-check. DWord Address Space (tag==0x7): resource_type = u8@+3; type 0 → mmio_base = u32@+10, length = u32@+22; type 1 → io_base/length likewise at the same offsets (IO); type 2 → bus range: write bus_lo = u16(low 16 bits of u32@+10) at out+0 and bus_hi = u16(low 16 bits of u32@+14) at out+2 via mov_w. Word Address Space (tag==0x8): resource_type at +3; type 2 (bus) → bus_lo = u16@+8, bus_hi = u16@+10 via mov_w; type 1 (io) → io_base = u16@+8, length = u16@+14 via mov_w, zero-extended via xor+mov_w. QWord Address Space (tag==0xA): resource_type at +3; type 0 (mem) → mmio_base = u64@+14, length = u64@+38 via plain `mov r64,[...]`; type 1 (io) → likewise into io_wins; type 2 (bus) → bus_lo = low 16 of u64@+14, bus_hi = low 16 of u64@+22 via mov_w. Mem32 / Mem24 / Extended Address / Extended IRQ / Large-vendor tags are skipped without comment — not needed for root-bridge classification and silently advancing keeps the parser forward-compatible with firmware that emits them. ECAM detection on every mmio_win record: if the window's length >= CRS_ECAM_MIN_SIZE (0x10000000 = 256 MiB) populate ecam_base + ecam_length at out+280/+288 and set has_ecam = 1 via mov_d (G1). The parser still counts the ECAM window itself in n_mmio_wins (so mmio_wins=2 when one of them is the ECAM, matching the fingerprint shape). (f) Advance: `add r14, rbx; jmp crs_walk_top`. Unaligned reads: _CRS buffers come from AML materialisation at arbitrary byte offsets so no field is natural-alignment guaranteed; every multi-byte load is treated as unaligned per SDM Vol.3 §7.1.1 (same posture as xsdt.pdx L109 and mcfg.pdx L203). Zero-extension: u8 loads use `xor rN,rN; mov_b rN,[...]`; u16 loads use `xor rN,rN; mov_w rN,[...]`; u32 loads use `xor rN,rN; mov r32d,[...]` (the 32-bit MOV zero-extends into the full 64-bit register per SDM Vol.1 §3.4.1.1); u64 loads use a plain `mov r64,[...]`. All u32 stores (n_mmio_wins, n_io_wins, has_ecam) use mov_d (G1). Every compare is on a full 64-bit register — no cmp al,imm (G4). Reserved label discipline: every label is `crs_`-prefixed so none clash with the reserved `loop`, `if`, `let` names. Leaf function — no nested call, 5-push prologue kept for alignment-review-symmetry with mcfg_parse_segments.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Save args ----
+        mov r14, rdi;                          // r14 = cursor (starts at buf)
+        mov r13, rdi;                          // r13 = end = buf + len
+        add r13, rsi;
+        mov r15, rdx;                          // r15 = out
+
+        // ---- Zero-init the 296-byte CrsInfo (37 × u64) ----
+        xor rax, rax;
+        xor rcx, rcx;
+      crs_zero_top:
+        cmp rcx, 37;
+        jae crs_zero_done;
+        mov [r15 + rcx * 8], rax;
+        add rcx, 1;
+        jmp crs_zero_top;
+      crs_zero_done:
+
+      crs_walk_top:
+        // Need at least 1 byte for a descriptor header.
+        cmp r14, r13;
+        jae crs_fail;
+
+        // Load the header byte.
+        xor rax, rax;
+        mov_b rax, [r14];
+
+        // Bit 7 → Large; bit 7 clear → Small.
+        mov rcx, rax;
+        and rcx, 0x80;
+        cmp rcx, 0;
+        jne crs_large_item;
+
+        // ============================================================
+        // Small item: byte 0 = [ 0 | tag:4 | len:3 ]
+        // ============================================================
+
+        // tag = (byte >> 3) & 0xF
+        mov rdx, rax;
+        shr rdx, 3;
+        and rdx, 0xF;
+
+        // len (data bytes) = byte & 0x7; total descriptor size = 1 + len.
+        mov rbx, rax;
+        and rbx, 0x7;
+        add rbx, 1;
+
+        // Bounds-check: cursor + total <= end.
+        mov rax, r14;
+        add rax, rbx;
+        cmp rax, r13;
+        ja crs_fail;
+
+        // END_TAG → success.
+        cmp rdx, 0xF;
+        je crs_success;
+
+        // I/O Port (small tag 0x8) → io_win.
+        cmp rdx, 0x8;
+        jne crs_small_advance;
+
+        // n = n_io_wins (u32 @ out+12, zero-extended into rax).
+        xor rax, rax;
+        mov eax, [r15 + 12];
+        cmp rax, 8;                            // CRS_IO_CAP
+        jae crs_small_advance;
+
+        // slot = n * 8
+        mov r10, rax;
+        shl r10, 3;
+
+        // base = u16 @ cursor+2
+        xor r11, r11;
+        mov_w r11, [r14 + 2];
+        mov r9, r15;
+        add r9, 152;                           // CRS_INFO_OFF_IO_BASES
+        add r9, r10;
+        mov [r9], r11;
+
+        // length = u8 @ cursor+7
+        xor r11, r11;
+        mov_b r11, [r14 + 7];
+        mov r9, r15;
+        add r9, 216;                           // CRS_INFO_OFF_IO_LENS
+        add r9, r10;
+        mov [r9], r11;
+
+        // n_io_wins += 1
+        add rax, 1;
+        mov_d [r15 + 12], rax;
+
+      crs_small_advance:
+        add r14, rbx;
+        jmp crs_walk_top;
+
+        // ============================================================
+        // Large item: byte 0 = [ 1 | tag:7 ], bytes 1..2 = u16 len
+        // ============================================================
+
+      crs_large_item:
+        // tag = byte & 0x7F
+        mov rdx, rax;
+        and rdx, 0x7F;
+
+        // Need 3 header bytes available to read the length field.
+        mov rax, r14;
+        add rax, 3;
+        cmp rax, r13;
+        ja crs_fail;
+
+        // data length = u16 @ cursor+1 (zero-extended into rbx).
+        xor rbx, rbx;
+        mov_w rbx, [r14 + 1];
+        add rbx, 3;                            // total = 3 + data_len
+
+        // Bounds-check: cursor + total <= end.
+        mov rax, r14;
+        add rax, rbx;
+        cmp rax, r13;
+        ja crs_fail;
+
+        // ---- Memory32Fixed (tag 0x06) ----
+        cmp rdx, 0x6;
+        jne crs_large_check_dword;
+
+        // n = n_mmio_wins
+        xor rax, rax;
+        mov eax, [r15 + 8];
+        cmp rax, 8;                            // CRS_MMIO_CAP
+        jae crs_large_advance;
+
+        mov r10, rax;
+        shl r10, 3;
+
+        // base = u32 @ cursor+4
+        xor r11, r11;
+        mov r11d, [r14 + 4];
+        mov r9, r15;
+        add r9, 24;                            // CRS_INFO_OFF_MMIO_BASES
+        add r9, r10;
+        mov [r9], r11;
+
+        // length = u32 @ cursor+8
+        xor rcx, rcx;
+        mov ecx, [r14 + 8];
+        mov r9, r15;
+        add r9, 88;                            // CRS_INFO_OFF_MMIO_LENS
+        add r9, r10;
+        mov [r9], rcx;
+
+        // ECAM check: length >= CRS_ECAM_MIN_SIZE (256 MiB)
+        mov r8, 0x10000000;
+        cmp rcx, r8;
+        jb crs_m32f_no_ecam;
+
+        // Record ECAM at out+280 / +288 and set has_ecam.
+        mov [r15 + 280], r11;
+        mov [r15 + 288], rcx;
+        mov r8, 1;
+        mov_d [r15 + 16], r8;                  // has_ecam = 1
+
+      crs_m32f_no_ecam:
+        // Reload n (we may have clobbered rax above with the ECAM scratch
+        // — defensive: redo the count read, bump, store).
+        xor rax, rax;
+        mov eax, [r15 + 8];
+        add rax, 1;
+        mov_d [r15 + 8], rax;
+        jmp crs_large_advance;
+
+        // ---- DWord Address Space (tag 0x07) ----
+      crs_large_check_dword:
+        cmp rdx, 0x7;
+        jne crs_large_check_word;
+
+        // resource_type (u8 @ cursor+3)
+        xor rax, rax;
+        mov_b rax, [r14 + 3];
+
+        // Memory (type 0) → mmio_win.
+        cmp rax, 0;
+        jne crs_dword_check_io;
+
+        xor rax, rax;
+        mov eax, [r15 + 8];
+        cmp rax, 8;
+        jae crs_large_advance;
+        mov r10, rax;
+        shl r10, 3;
+
+        // base = u32 @ cursor+10
+        xor r11, r11;
+        mov r11d, [r14 + 10];
+        mov r9, r15;
+        add r9, 24;
+        add r9, r10;
+        mov [r9], r11;
+
+        // length = u32 @ cursor+22
+        xor rcx, rcx;
+        mov ecx, [r14 + 22];
+        mov r9, r15;
+        add r9, 88;
+        add r9, r10;
+        mov [r9], rcx;
+
+        // ECAM check.
+        mov r8, 0x10000000;
+        cmp rcx, r8;
+        jb crs_dword_mem_no_ecam;
+        mov [r15 + 280], r11;
+        mov [r15 + 288], rcx;
+        mov r8, 1;
+        mov_d [r15 + 16], r8;
+
+      crs_dword_mem_no_ecam:
+        xor rax, rax;
+        mov eax, [r15 + 8];
+        add rax, 1;
+        mov_d [r15 + 8], rax;
+        jmp crs_large_advance;
+
+      crs_dword_check_io:
+        // I/O (type 1) → io_win.
+        cmp rax, 1;
+        jne crs_dword_check_bus;
+
+        xor rax, rax;
+        mov eax, [r15 + 12];
+        cmp rax, 8;
+        jae crs_large_advance;
+        mov r10, rax;
+        shl r10, 3;
+
+        xor r11, r11;
+        mov r11d, [r14 + 10];                  // base = u32 @ +10
+        mov r9, r15;
+        add r9, 152;
+        add r9, r10;
+        mov [r9], r11;
+
+        xor rcx, rcx;
+        mov ecx, [r14 + 22];                   // length = u32 @ +22
+        mov r9, r15;
+        add r9, 216;
+        add r9, r10;
+        mov [r9], rcx;
+
+        add rax, 1;
+        mov_d [r15 + 12], rax;
+        jmp crs_large_advance;
+
+      crs_dword_check_bus:
+        // Bus (type 2) → bus range (low 16 bits of min / max).
+        cmp rax, 2;
+        jne crs_large_advance;
+
+        xor r11, r11;
+        mov r11d, [r14 + 10];                  // min (u32 → low u16)
+        mov_w [r15 + 0], r11;                  // bus_lo
+        xor rcx, rcx;
+        mov ecx, [r14 + 14];                   // max (u32 → low u16)
+        mov_w [r15 + 2], rcx;                  // bus_hi
+        jmp crs_large_advance;
+
+        // ---- Word Address Space (tag 0x08) ----
+      crs_large_check_word:
+        cmp rdx, 0x8;
+        jne crs_large_check_qword;
+
+        xor rax, rax;
+        mov_b rax, [r14 + 3];
+
+        // Bus (type 2) → bus range.
+        cmp rax, 2;
+        jne crs_word_check_io;
+
+        xor r11, r11;
+        mov_w r11, [r14 + 8];                  // min
+        mov_w [r15 + 0], r11;
+        xor rcx, rcx;
+        mov_w rcx, [r14 + 10];                 // max
+        mov_w [r15 + 2], rcx;
+        jmp crs_large_advance;
+
+      crs_word_check_io:
+        // I/O (type 1) → io_win.
+        cmp rax, 1;
+        jne crs_large_advance;
+
+        xor rax, rax;
+        mov eax, [r15 + 12];
+        cmp rax, 8;
+        jae crs_large_advance;
+        mov r10, rax;
+        shl r10, 3;
+
+        xor r11, r11;
+        mov_w r11, [r14 + 8];                  // base = u16 @ +8
+        mov r9, r15;
+        add r9, 152;
+        add r9, r10;
+        mov [r9], r11;
+
+        xor rcx, rcx;
+        mov_w rcx, [r14 + 14];                 // length = u16 @ +14
+        mov r9, r15;
+        add r9, 216;
+        add r9, r10;
+        mov [r9], rcx;
+
+        add rax, 1;
+        mov_d [r15 + 12], rax;
+        jmp crs_large_advance;
+
+        // ---- QWord Address Space (tag 0x0A) ----
+      crs_large_check_qword:
+        cmp rdx, 0xA;
+        jne crs_large_advance;
+
+        xor rax, rax;
+        mov_b rax, [r14 + 3];
+
+        // Memory (type 0).
+        cmp rax, 0;
+        jne crs_qword_check_io;
+
+        xor rax, rax;
+        mov eax, [r15 + 8];
+        cmp rax, 8;
+        jae crs_large_advance;
+        mov r10, rax;
+        shl r10, 3;
+
+        mov r11, [r14 + 14];                   // base = u64 @ +14 (unaligned OK)
+        mov r9, r15;
+        add r9, 24;
+        add r9, r10;
+        mov [r9], r11;
+
+        mov rcx, [r14 + 38];                   // length = u64 @ +38
+        mov r9, r15;
+        add r9, 88;
+        add r9, r10;
+        mov [r9], rcx;
+
+        mov r8, 0x10000000;
+        cmp rcx, r8;
+        jb crs_qword_mem_no_ecam;
+        mov [r15 + 280], r11;
+        mov [r15 + 288], rcx;
+        mov r8, 1;
+        mov_d [r15 + 16], r8;
+
+      crs_qword_mem_no_ecam:
+        xor rax, rax;
+        mov eax, [r15 + 8];
+        add rax, 1;
+        mov_d [r15 + 8], rax;
+        jmp crs_large_advance;
+
+      crs_qword_check_io:
+        cmp rax, 1;
+        jne crs_qword_check_bus;
+
+        xor rax, rax;
+        mov eax, [r15 + 12];
+        cmp rax, 8;
+        jae crs_large_advance;
+        mov r10, rax;
+        shl r10, 3;
+
+        mov r11, [r14 + 14];
+        mov r9, r15;
+        add r9, 152;
+        add r9, r10;
+        mov [r9], r11;
+
+        mov rcx, [r14 + 38];
+        mov r9, r15;
+        add r9, 216;
+        add r9, r10;
+        mov [r9], rcx;
+
+        add rax, 1;
+        mov_d [r15 + 12], rax;
+        jmp crs_large_advance;
+
+      crs_qword_check_bus:
+        cmp rax, 2;
+        jne crs_large_advance;
+
+        // bus_lo = low 16 bits of u64 @ +14; bus_hi = low 16 of u64 @ +22.
+        mov r11, [r14 + 14];
+        mov_w [r15 + 0], r11;
+        mov rcx, [r14 + 22];
+        mov_w [r15 + 2], rcx;
+        // fallthrough
+
+      crs_large_advance:
+        add r14, rbx;
+        jmp crs_walk_top;
+
+      crs_success:
+        mov rax, 1;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      crs_fail:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
