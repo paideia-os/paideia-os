@@ -2,8 +2,8 @@
 
 **Wave:** R131 (semantic shell -- Unicode substrate umbrella,
 paideia-os#2480)
-**Current milestone:** M2 (grapheme-cluster iterator) -- landed.
-**Version:** 1.1.0.
+**Current milestone:** M3 (NFC/NFD/NFKC/NFKD normalization) -- landed.
+**Version:** 1.2.0.
 
 See the R131 M-table in the umbrella issue (paideia-os#2480) for the
 upstream wave-level design; this file tracks the per-milestone
@@ -79,7 +79,93 @@ landing checklist as it closes locally.
   (U+0300..U+036F); Hebrew / Arabic / Devanagari combining
   marks are not yet recognised.
 
-### M3 -- Streaming decoder iterator (planned)
+### M3 -- NFC/NFD/NFKC/NFKD normalization (paideia-os#2614, landed)
+
+- [x] **M3-001** -- `src/normalize.pdx` scaffold + module `Normalize`,
+      status / error / form-flag constants, scratch-buffer .bss
+      allocation (1024 x 8-byte entries), decomposition table
+      (255 entries x 3 u32 = 765 u32), CCC table (10 pairs x 2
+      u32 = 20 u32).
+- [x] **M3-002** -- `_norm_lookup_decomp(cp, use_compat) -> packed`
+      real body: landed. Linear scan with pointer advance (stride
+      12 bytes); early-exit on `table_cp > query`; `mark==0`
+      entries are skipped on canonical lookups and surfaced on
+      compat lookups.
+- [x] **M3-003** -- `_norm_lookup_ccc(cp) -> ccc` real body:
+      landed. Range-gate on U+0300..U+036F; linear scan of the
+      sparse `_norm_ccc_table`; default 230 for marks not
+      explicitly listed.
+- [x] **M3-004** -- `_norm_lookup_compose(part0, part1) -> cp`
+      real body: landed. Scans the canonical half of the decomp
+      table (mark != 0 only); returns the precomposed cp when
+      (part0, part1) matches an entry's (base, mark).
+- [x] **M3-005** -- `_norm_decompose(src_ptr, src_len, use_compat)
+      -> packed` real body: landed. Walks the input via
+      `utf8_decode_cp`; for each cp looks up the (compat or
+      canonical) decomposition and emits (cp, ccc) scratch
+      entries; one-level decomposition (the table encodes
+      fully-decomposed forms); scratch-overflow and UTF-8-error
+      exits.
+- [x] **M3-006** -- `_norm_sort_scratch(count) -> ()` real body:
+      landed. Bubble sort within non-starter runs by CCC;
+      starters terminate a run (TR#15 §12 Canonical Ordering
+      Algorithm).
+- [x] **M3-007** -- `_norm_compose_scratch(count) -> new_count`
+      real body: landed. Left-to-right single-pass walk;
+      (starter, non-starter) pairs reduced via
+      `_norm_lookup_compose`; tombstone + compact pass at the
+      end (TR#15 §13 Canonical Composition Algorithm reduced).
+- [x] **M3-008** -- `_norm_encode_scratch(count, out_ptr, out_cap)
+      -> packed` real body: landed. Walks scratch, emits each
+      non-tombstoned cp via `utf8_encode_cp`; buffer-underrun
+      returns status=1 (OUT_TOO_SMALL) with out_bytes=0 (atomic
+      failure).
+- [x] **M3-009** -- `_norm_core(form_flag, ...)` dispatcher +
+      four public wrappers (`_norm_nfd`, `_norm_nfkd`,
+      `_norm_nfc`, `_norm_nfkc`) landed. form_flag bit 0 = compat,
+      bit 1 = compose.
+- [x] **M3-010** -- Fingerprint goldens:
+      `tests/fingerprints/normalize.golden` with 8 TAG lines
+      (NFC_A_ACUTE, NFD_A_ACUTE_PRECOMPOSED, NFKC_FULLWIDTH,
+      NFKD_FULLWIDTH, NFC_IDEMPOTENT, NFD_EMPTY, NFC_MULTIPLE,
+      NFC_PASSTHROUGH).
+- [x] **M3-011** -- Proptest witnesses:
+      `tests/proptest_normalize.pdx` module `ProptestNormalize`
+      with 4 invariants (idempotence, round-trip, UTF-8 validity,
+      length bound) and umbrella `pnm_run_all`.
+
+**M3 limitations (reduced UCD scope; follow-ups filed for M3.1+):**
+
+- Canonical decomposition table carries ONLY Latin-1 Supplement
+  (U+00C0..U+00FF) and Latin Extended-A (U+0100..U+017F); every
+  entry is encoded in a single level (no two-level decomp
+  recursion is wired, so Latin Extended-B precomposed forms that
+  decompose through Latin-1 Supplement are not landed yet).
+- Compatibility decomposition table carries ONLY fullwidth-ASCII
+  (U+FF01..U+FF5E). Other NFKD-relevant blocks are deferred:
+  compatibility ideographs, Arabic presentation forms,
+  CJK Compatibility, Hangul fullwidth, Mathematical Alphanumeric
+  symbols.
+- Composition_Exclusions table is EMPTY. In the full UCD this is
+  non-empty (singleton + non-starter decompositions, script-specific
+  pairs); M3.2 lands the full list.
+- CCC table carries only ~10 explicit entries plus a default of
+  230 for anything in U+0300..U+036F not listed. The real UCD
+  CCC assignments include 1 (overlay), 7 (nukta), 8 (hiragana
+  voicing), 9 (virama), 10..199 (fixed classes), 200..240
+  (reorder targets, iota subscript); M3.1 lands the full set.
+- Scripts explicitly deferred to M3.2+: Devanagari (U+0900..097F),
+  Hebrew (U+0590..05FF), Arabic (U+0600..06FF + presentation forms
+  U+FB50..FDFF, U+FE70..FEFF), CJK Compatibility (U+F900..FAFF,
+  U+2F800..2FA1F), Hangul syllables (U+AC00..D7A3) which TR#15
+  §16 defines algorithmically rather than by table.
+- Scratch buffer is static .bss (`_norm_scratch`, 8192 bytes).
+  Overlapping calls -- including a signal handler mid-normalise
+  -- corrupt the intermediate representation. The library is
+  single-threaded by design; M3.3+ moves the scratch to a
+  caller-supplied workspace argument.
+
+### M4 -- Streaming decoder iterator (planned)
 
 - [ ] `utf8_decode_iter_begin(src_ptr, src_len) -> handle`
 - [ ] `utf8_decode_iter_next(handle) -> packed | UTF8_* | EOF`
@@ -88,24 +174,19 @@ landing checklist as it closes locally.
       a 24-byte struct `{src_ptr, src_len, pos}` the caller allocates
       and the primitives walk; no cap, no syscall).
 
-### M4 -- UTF-16 bridge (planned)
+### M5 -- UTF-16 bridge (planned)
 
 - [ ] `utf8_offset_to_utf16(src_ptr, src_len, utf8_off) -> utf16_off`
 - [ ] `utf16_offset_to_utf8(src_ptr, src_len, utf16_off) -> utf8_off`
 - [ ] `utf8_offset_to_utf32` / `utf32_offset_to_utf8`
 - [ ] Mirror of the paideia-as-unicode `lsp_bridge` module.
 
-### M5 -- Stream validators (planned)
+### M6 -- Stream validators (planned)
 
 - [ ] `utf8_validate_stream` -- fail-fast whole-buffer validator.
 - [ ] `utf8_validate_stream_recover` -- walks past the first
       malformed byte and reports every error offset, matching
       `paideia-as-unicode::Utf8Decoder::next`'s per-byte recovery.
-
-### M6 -- Normalization (planned)
-
-- [ ] UCD-pinned DerivedNormalizationProps + decomposition tables.
-- [ ] `norm_nfc` / `norm_nfd` in-place over caller-allocated buffer.
 
 ## Compatibility posture
 
@@ -123,3 +204,19 @@ one-code error band 0xFFFFE710..0xFFFFE71F (first slot used:
 packed into the low 32 bits of `_gc_next`'s return; the next_cursor
 in the high 32 bits is unsigned. M2 is additive and preserves every
 M1 symbol unchanged -- v1.1.0 is backward-compatible with v1.0.0.
+
+M3 adds four public bindings (`_norm_nfd`, `_norm_nfkd`,
+`_norm_nfc`, `_norm_nfkc`) plus five internal helpers
+(`_norm_lookup_decomp`, `_norm_lookup_ccc`, `_norm_lookup_compose`,
+`_norm_decompose`, `_norm_sort_scratch`, `_norm_compose_scratch`,
+`_norm_encode_scratch`, `_norm_core`), the normalize error band
+0xFFFFE720..0xFFFFE72F (two slots used: `NORM_INVALID_UTF8_CODE`
+at 0xFFFFE720, `NORM_OUT_TOO_SMALL_CODE` at 0xFFFFE721), the
+three status codes (NORM_STATUS_OK=0, NORM_STATUS_OUT_TOO_SMALL=1,
+NORM_STATUS_INVALID_UTF8=2), and the four form-flag constants
+(NORM_FORM_NFD=0, NORM_FORM_NFKD=1, NORM_FORM_NFC=2,
+NORM_FORM_NFKC=3). The status fits in the low 8 bits of the
+packed return (0..2); the high 32 bits carry out_bytes_written
+on success and 0 on failure. M3 is additive and preserves every
+M1 + M2 symbol unchanged -- v1.2.0 is backward-compatible with
+v1.1.0 and v1.0.0.

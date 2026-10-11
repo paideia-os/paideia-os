@@ -4,6 +4,102 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] -- 2026-10-11
+
+R131.M3 of the semantic-shell Unicode umbrella (paideia-os#2480,
+decomposed into paideia-os#2614 for this M3).
+
+### Added
+
+- `src/normalize.pdx` module `Normalize`: UAX #15 Unicode
+  Normalization Forms (NFC, NFD, NFKC, NFKD) over UTF-8.
+  - `_norm_nfd(bytes_ptr, bytes_len, out_ptr, out_cap)
+    -> packed_u64` -- canonical decomposition only.
+  - `_norm_nfkd(bytes_ptr, bytes_len, out_ptr, out_cap)
+    -> packed_u64` -- compatibility decomposition only.
+  - `_norm_nfc(bytes_ptr, bytes_len, out_ptr, out_cap)
+    -> packed_u64` -- canonical decomposition then composition.
+  - `_norm_nfkc(bytes_ptr, bytes_len, out_ptr, out_cap)
+    -> packed_u64` -- compatibility decomposition then
+    composition.
+  - Return shape `(out_bytes << 32) | status` with status in
+    {0=OK, 1=OUT_TOO_SMALL, 2=INVALID_UTF8}.
+  - Internal helpers (also `pub` for the proptest's benefit):
+    `_norm_lookup_decomp`, `_norm_lookup_ccc`,
+    `_norm_lookup_compose`, `_norm_decompose`,
+    `_norm_sort_scratch`, `_norm_compose_scratch`,
+    `_norm_encode_scratch`, `_norm_core`.
+  - Reduced UCD scope at M3: Latin-1 Supplement (U+00C0..00FF)
+    canonical decompositions, Latin Extended-A (U+0100..017F)
+    canonical decompositions, Fullwidth-ASCII (U+FF01..FF5E)
+    compatibility decompositions. Composition_Exclusions empty.
+  - Static .bss scratch buffer `_norm_scratch` (8192 bytes, 1024
+    entries x 8 bytes). Single-threaded by construction.
+- `tests/fingerprints/normalize.golden`: 8 TAG lines covering
+  the four forms and the four decomposition / composition /
+  idempotence / passthrough shapes (NFC_A_ACUTE, NFD_A_ACUTE_
+  PRECOMPOSED, NFKC_FULLWIDTH, NFKD_FULLWIDTH, NFC_IDEMPOTENT,
+  NFD_EMPTY, NFC_MULTIPLE, NFC_PASSTHROUGH).
+- `tests/proptest_normalize.pdx` module `ProptestNormalize`:
+  four invariant witnesses (idempotence, round-trip,
+  UTF-8 validity, length bound) plus umbrella `pnm_run_all`;
+  fail codes in the 0xFFFFED7x band (extends the existing
+  TestLexer / ProptestGrapheme band family).
+
+### Changed
+
+- `src/lib.pdx`: version bump 1.1.0 -> 1.2.0;
+  `LPX_UNICODE_VERSION_MINOR` = 2; `LPX_UNICODE_M3_READY` = 1;
+  `lpx_unicode_feature_level()` now returns 3. The per-milestone
+  commentary in `lib.pdx` reflects the M3-promotes-up renumbering:
+  normalization took the M3 slot (was M6 in the M2 draft) so the
+  streaming decoder (now M4), utf16 bridge (M5), and stream
+  validators (M6) slide down one.
+
+### Error band
+
+- 0xFFFFE720..0xFFFFE72F reserved for normalize-layer error codes
+  (two used at M3: `NORM_INVALID_UTF8_CODE` = 0xFFFFE720,
+  `NORM_OUT_TOO_SMALL_CODE` = 0xFFFFE721). Disjoint from the M1
+  (0xFFFFE700..0F) and M2 (0xFFFFE710..1F) slices and every other
+  band in the paideia-os tree. The public API return packs the
+  status code into the low 8 bits (0..2) rather than returning
+  the raw band value, matching the `_gc_next`-style packed
+  convention from M2.
+
+### UAX #15 scope (Rev 55 reduced-Latin+fullwidth baseline)
+
+Phases IMPLEMENTED:
+
+- Decomposition (canonical + compatibility, table-driven for the
+  Latin + fullwidth baseline above).
+- Canonical ordering (TR#15 §12 bubble sort within non-starter
+  runs by CCC; starters terminate a run).
+- Composition (TR#15 §13 reduced: left-to-right single pass over
+  (starter, non-starter) pairs via composition-table lookup;
+  Composition_Exclusions treated as empty).
+- Encode back to UTF-8 (via `utf8_encode_cp`, atomic
+  all-or-nothing on buffer underrun).
+
+Phases STUBBED at M3 (land at M3.1+ follow-ups):
+
+- Multi-level decomposition recursion (Latin Extended-B and
+  beyond, when a precomposed form decomposes through another
+  precomposed form). Current table encodes fully-decomposed
+  entries so the decomposer stays single-level.
+- Hangul syllable decomposition / composition (TR#15 §16
+  algorithmic path, not table-driven; needs L/V/T math).
+- Composition_Exclusions non-empty set.
+- CCC values beyond the sparse ~10-entry Latin baseline + 230
+  default for marks in U+0300..036F.
+
+### Build
+
+- paideia-as >= 0.21.0 required (unchanged from M1 / M2).
+- `tools/build.sh` emits per-module `build-out/*.o` objects for
+  `src/`, `tests/`, and `benches/`; no link step at M3 (downstream
+  satellites link via `--extra-obj-dir`).
+
 ## [1.1.0] -- 2026-10-11
 
 R131.M2 of the semantic-shell Unicode umbrella (paideia-os#2480,
