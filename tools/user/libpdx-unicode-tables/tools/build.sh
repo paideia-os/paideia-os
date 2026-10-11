@@ -75,6 +75,17 @@ if [ -d tests ]; then
     done
 fi
 
+if [ -d benches ]; then
+    for pdx in benches/*.pdx; do
+        [ -f "$pdx" ] || continue
+        COUNT=$((COUNT + 1))
+        obj="$BUILD_DIR/benches-$(basename "$pdx" .pdx).o"
+        if ! "$PA" build --emit elf64 "$pdx" -o "$obj" 2>&1; then
+            FAIL=$((FAIL + 1))
+        fi
+    done
+fi
+
 echo "[build] $COUNT source(s), $FAIL failure(s)"
 [ "$FAIL" -eq 0 ] || exit 1
 echo "[build] OK"
