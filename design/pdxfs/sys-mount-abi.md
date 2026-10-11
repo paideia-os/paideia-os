@@ -634,7 +634,10 @@ L755-L822.
 PMT_OP_LIST               = 0   (reserved; returns INVOKE_UNSUPPORTED
                                  at this landing; follow-up work)
 PMT_OP_READ_ROW           = 1   (reserved; returns INVOKE_UNSUPPORTED)
-PMT_OP_APPEND_ROW         = 2   (reserved; returns INVOKE_UNSUPPORTED)
+PMT_OP_APPEND_ROW         = 2   (WIRED at PFS-10 — requires R_PMT_WRITE;
+                                 returns 0 (stub body); real per-row
+                                 allocation happens inside sys_mount_body
+                                 — this cap-invoke is the ABI edge)
 PMT_OP_QUERY_SLOT_COUNT   = 3   (WIRED — requires R_PMT_INVOKE;
                                  returns PMT_MOUNT_SLOT_COUNT = 8)
 PMT_OP_REMOVE_ROW         = 4   (WIRED — requires R_PMT_WRITE;
@@ -830,6 +833,40 @@ NOT close.  Each has a follow-up ticket shape; none blocks PFS-02..17.
   `dispatch.pdx` L2400-L2422 and every "KERNEL GAP" assertion in
   `tools/user/mount.pdxfs/STATUS.md` + `tools/user/umount.pdxfs/STATUS.md`
   predating this doc.
+- **2026-10-11 (Wave 94 / PFS-10, paideia-os#2577)** — ABI adopted
+  end-to-end from ring 3.  `mount.pdxfs` v1.1.5 switches
+  `mount_op_invoke` from the retracted cap-slot shape to the frozen
+  path-based register layout documented in §2.3; the `<volume-cap>` →
+  `/dev/pdxvol<H>` splice from §2.8 is landed as a stop-gap
+  `narrowed_volume_slot & 0xF` nibble (PFS-11 will replace it with the
+  real `VOL_OP_QUERY_DEVICE_SLOT` wire-through).  Kernel-side,
+  `KIND_PDXFS_MOUNT_TABLE.PMT_OP_APPEND_ROW` (op 2) is now wired as a
+  stub body in `cap_handler_pdxfs_mount_table` (requires `R_PMT_WRITE`;
+  returns `0`) — matching the shape `PMT_OP_REMOVE_ROW` already carried
+  for `umount.pdxfs`.  §5.1's op catalog accordingly reclassifies
+  APPEND_ROW from "reserved; returns INVOKE_UNSUPPORTED" to "WIRED —
+  requires `R_PMT_WRITE`; returns `0` (stub body)".  Real per-row
+  allocation of `_mount_table[]` slots continues to happen implicitly
+  inside `sys_mount_body`'s successful backend arm; the cap-invoke is
+  the authoritative ABI edge, with the underlying work already done.
+
+## §9 Status
+
+**Overall adoption (as of PFS-10 / Wave 94):** FROZEN ABI adopted
+end-to-end for the sys_mount leg.  sys_umount's ring-3 adoption remains
+PFS-13 scope.
+
+| Consumer                                  | Status                 |
+|-------------------------------------------|------------------------|
+| `tools/user/mount.pdxfs/src/mount_op.pdx` | adopted at v1.1.5 (PFS-10) |
+| `tools/user/umount.pdxfs/src/unmount_op.pdx` | pending (PFS-13)     |
+| `tools/user/libpdx-volume/src/*.pdx`      | kernel-call-site wiring continues through PFS-11..PFS-15 |
+| `tools/user/mountall.pdxfs/*`             | pending (PFS-16+)      |
+
+Kernel ops opened at PFS-10:
+
+- `KIND_PDXFS_MOUNT_TABLE.PMT_OP_APPEND_ROW` (op 2) — WIRED stub body
+  (requires `R_PMT_WRITE`; returns `0`).
 
 ---
 

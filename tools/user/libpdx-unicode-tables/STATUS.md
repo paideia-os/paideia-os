@@ -2,8 +2,8 @@
 
 **Wave:** R131 (semantic shell -- Unicode substrate umbrella,
 paideia-os#2480)
-**Current milestone:** M4 (UCA collation, UTS #10 reduced DUCET) -- landed.
-**Version:** 1.3.0.
+**Current milestone:** M5 (display width, UAX #11 reduced EAW) -- landed.
+**Version:** 1.4.0.
 
 See the R131 M-table in the umbrella issue (paideia-os#2480) for the
 upstream wave-level design; this file tracks the per-milestone
@@ -246,7 +246,53 @@ landing checklist as it closes locally.
   treats that side as empty (no crash), orderable but silent.
   Fail-fast callers should run `utf8_is_valid` first.
 
-### M5 -- Streaming decoder iterator (planned)
+### M5 -- Display width (paideia-os#2616, landed)
+
+- [x] **M5-001** -- `src/width.pdx` scaffold + module `Width`, status
+      constants (W_STATUS_OK=0, W_STATUS_INVALID_UTF8=2), error-band
+      slice 0xFFFFE740..0xFFFFE74F (first slot used: `W_INVALID_UTF8`
+      at 0xFFFFE740).
+- [x] **M5-002** -- `_width_char(cp) -> u64` real body: landed.
+      Straight-line range-dispatch classifier returning 0 (zero-width:
+      C0 controls, C1 controls + DEL, Latin combining U+0300..036F,
+      ZWJ U+200D, Variation Selectors U+FE00..FE0F), 2 (wide: nine
+      CJK + Hangul + fullwidth + emoji bands), or 1 (narrow default).
+      Pure leaf; no callee-save push.
+- [x] **M5-003** -- `_width_str(bytes_ptr, bytes_len) -> packed_u64`
+      real body: landed. Walks the input one grapheme cluster at a
+      time via `_gc_next`, decodes the base cp of each cluster via
+      `utf8_decode_cp`, calls `_width_char` on the base, accumulates
+      in r14. Packed return `(total_width << 32) | status` with
+      status in {0=OK, 2=INVALID_UTF8}. INVALID propagates the
+      partial accumulator alongside status=2.
+- [x] **M5-004** -- Fingerprint goldens: `tests/fingerprints/width.golden`
+      with 8 TAG lines (W_ASCII, W_CJK, W_FULLWIDTH, W_COMBINING,
+      W_EMOJI, W_MIXED, W_EMPTY, W_CONTROL).
+- [x] **M5-005** -- Proptest witnesses:
+      `tests/proptest_width.pdx` with 3 invariants (non-negative +
+      status-OK on ASCII, additive-under-concatenation for ASCII,
+      zero-input returns zero) and umbrella `pw_run_all`.
+- [x] **M5-006** -- Design doc:
+      `design/toolchain/libpdx-unicode-width.md`.
+
+**M5 limitations (stubbed; tracked for M5.1+ follow-up tickets):**
+
+- UAX #11 Ambiguous class (A) is treated as narrow. Locale-aware
+  widening to 2 under East Asian locales lands at M5.1 via
+  `_width_char_lc(cp, locale)` plus a locale constant table.
+- Full UCD EastAsianWidth.txt load. The current hand-coded range
+  table covers CJK + Hangul syllables + fullwidth + the emoji
+  supplement blocks (U+1F300..1F9FF) but is NOT the ~140k-cp
+  EastAsianWidth.txt. Myanmar, Khmer, Tibetan, Mongolian and
+  other complex-shaping BMP scripts are deferred to M5.2.
+- Extended_Pictographic approximated as the single range
+  U+1F300..U+1F9FF (same approximation M2 Grapheme uses for
+  PICTOGRAPHIC); a sparser-trie landing is M5.3 work.
+- Hangul Jamo (U+1100..U+11FF, standalone L/V/T not composed into
+  a syllable): currently narrow. TR#11 §5 widens L and V to 2
+  independently of their syllable role. M5.4 target.
+
+### M6 -- Streaming decoder iterator (planned)
 
 - [ ] `utf8_decode_iter_begin(src_ptr, src_len) -> handle`
 - [ ] `utf8_decode_iter_next(handle) -> packed | UTF8_* | EOF`
@@ -255,14 +301,14 @@ landing checklist as it closes locally.
       a 24-byte struct `{src_ptr, src_len, pos}` the caller allocates
       and the primitives walk; no cap, no syscall).
 
-### M6 -- UTF-16 bridge (planned)
+### M7 -- UTF-16 bridge (planned)
 
 - [ ] `utf8_offset_to_utf16(src_ptr, src_len, utf8_off) -> utf16_off`
 - [ ] `utf16_offset_to_utf8(src_ptr, src_len, utf16_off) -> utf8_off`
 - [ ] `utf8_offset_to_utf32` / `utf32_offset_to_utf8`
 - [ ] Mirror of the paideia-as-unicode `lsp_bridge` module.
 
-### M7 -- Stream validators (planned)
+### M8 -- Stream validators (planned)
 
 - [ ] `utf8_validate_stream` -- fail-fast whole-buffer validator.
 - [ ] `utf8_validate_stream_recover` -- walks past the first
@@ -315,3 +361,13 @@ directly as an i64 (the -1 bit pattern is 0xFFFFFFFFFFFFFFFF).
 M4 is additive and preserves every M1 + M2 + M3 symbol
 unchanged -- v1.3.0 is backward-compatible with v1.2.0,
 v1.1.0, and v1.0.0.
+
+M5 adds two public bindings (`_width_char`, `_width_str`), the
+width error band 0xFFFFE740..0xFFFFE74F (one slot used:
+`W_INVALID_UTF8` at 0xFFFFE740), and two status codes
+(W_STATUS_OK=0, W_STATUS_INVALID_UTF8=2) packed into the low 8
+bits of `_width_str`'s return. `_width_char` returns 0/1/2
+directly as a u64 with no error band (the caller has already
+decoded the cp). M5 is additive and preserves every
+M1 + M2 + M3 + M4 symbol unchanged -- v1.4.0 is
+backward-compatible with v1.3.0, v1.2.0, v1.1.0, and v1.0.0.

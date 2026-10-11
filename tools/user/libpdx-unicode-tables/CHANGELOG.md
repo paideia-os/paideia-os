@@ -4,6 +4,110 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] -- 2026-10-11
+
+R131.M5 of the semantic-shell Unicode umbrella (paideia-os#2480,
+decomposed into paideia-os#2616 for this M5).
+
+### Added
+
+- `src/width.pdx` module `Width`: UAX #11 (East Asian Width) baseline
+  display-width classifier over UTF-8.
+  - `_width_char(cp) -> u64` -- 0 (zero-width mark / control), 1
+    (narrow default), or 2 (wide East Asian / emoji). Pure leaf
+    classifier.
+  - `_width_str(bytes_ptr, bytes_len) -> packed_u64` -- iterates
+    grapheme clusters via `_gc_next`, decodes the base cp of each
+    cluster via `utf8_decode_cp`, calls `_width_char` on the base,
+    and accumulates per-cluster widths. Return shape
+    `(total_width << 32) | status` with status in {0=OK,
+    2=INVALID_UTF8}.
+  - Reduced EAW scope at M5:
+    - Width 0: C0 controls (U+0000..001F), DEL + C1 controls
+      (U+007F..009F), Latin combining diacritics (U+0300..036F),
+      ZWJ (U+200D), Variation Selectors (U+FE00..FE0F).
+    - Width 2: CJK Symbols/Punctuation (U+3000..303E),
+      Hiragana/Katakana (U+3041..30FF), CJK Unified Ext-A
+      (U+3400..4DBF), CJK Unified (U+4E00..9FFF), Hangul Syllables
+      (U+AC00..D7A3), CJK Compat (U+F900..FAFF), Fullwidth ASCII
+      (U+FF01..FF60), Fullwidth signs (U+FFE0..FFE6), Emoji
+      single-range (U+1F300..1F9FF, same range the M2 Grapheme
+      classifier uses for PICTOGRAPHIC).
+    - Width 1: everything else (narrow default).
+  - Ambiguous width (UAX #11 class A) is treated as NARROW at the
+    M5 baseline. Locale-sensitive handling (East Asian locales
+    widen Ambiguous to 2) lands at M5.1 via a second entry point
+    `_width_char_lc(cp, locale)`.
+- `tests/fingerprints/width.golden`: 8 TAG lines (W_ASCII, W_CJK,
+  W_FULLWIDTH, W_COMBINING, W_EMOJI, W_MIXED, W_EMPTY, W_CONTROL)
+  with byte-level walk-throughs documented in the file header.
+- `tests/proptest_width.pdx` module `ProptestWidth`: three invariant
+  witnesses (non-negative width + status, additive-under-ASCII-
+  concatenation, zero-input returns zero) plus umbrella
+  `pw_run_all`; fail codes in the 0xFFFFED9x band (extends the
+  TestLexer / ProptestGrapheme / ProptestNormalize /
+  ProptestCollation family).
+
+### Changed
+
+- `src/lib.pdx`: version bump 1.3.0 -> 1.4.0;
+  `LPX_UNICODE_VERSION_MINOR` = 4; `LPX_UNICODE_M5_READY` = 1;
+  `lpx_unicode_feature_level()` now returns 5. The per-milestone
+  commentary in `lib.pdx` reflects the M5-promotes-up renumbering:
+  display width took the M5 slot (was later in the M2/M3/M4 drafts)
+  so the streaming decoder (now M6), utf16 bridge (M7), and stream
+  validators (M8) slide down one.
+
+### Error band
+
+- 0xFFFFE750..0xFFFFE75F reserved for width-layer error codes
+  (one used at M5: `W_INVALID_UTF8` = 0xFFFFE750). Skips
+  0xFFFFE740..0xFFFFE74F which is already claimed by the
+  adaptive_rate sample's policy module (G9.M6). Disjoint from
+  the M1 (0xFFFFE700..0F), M2 (0xFFFFE710..1F), M3 (0xFFFFE720..2F)
+  and M4 (0xFFFFE730..3F) slices and every other band in the
+  paideia-os tree. The public API return packs the status code
+  (0=OK, 2=INVALID_UTF8) into the low 8 bits of the packed result
+  rather than returning the raw band value, matching the
+  _norm_nfX / _coll_sort_key / _gc_next convention.
+
+### UAX #11 scope (Rev. 36 reduced-CJK+emoji baseline)
+
+Phases IMPLEMENTED:
+
+- Per-cp classification over the width-0 and width-2 ranges above.
+- Per-cluster accumulation via `_gc_next` seed-and-sum.
+- Status propagation (OK, INVALID_UTF8) matching the rest of the
+  library's packed-return convention.
+
+Phases STUBBED at M5 (land at M5.1+ follow-ups):
+
+- Locale-sensitive Ambiguous handling. The baseline treats every
+  Ambiguous cp as narrow; East Asian locales (ja, ko, zh) widen
+  these to 2. M5.1 adds `_width_char_lc(cp, locale) -> u64` and a
+  small locale constant table.
+- Full UCD EastAsianWidth.txt load. Replaces the hand-coded range
+  table in `_width_char` with a trie or sorted range lookup. The
+  current CJK+emoji baseline covers every consumer site in the
+  paideia-os tree today; a sparser-trie landing is M5.2 work.
+- Extended_Pictographic trie (sparse, ~1500 cps) replacing the
+  single-range approximation at U+1F300..U+1F9FF. Lands alongside
+  M2.2's trie for the Grapheme classifier (shared data source).
+- Hangul Jamo (U+1100..U+11FF). L (leading consonant) and V (vowel)
+  are wide=2 at TR#11 even when standalone (not composed into a
+  syllable); T (trailing) is narrow. M5.4 wires this.
+- Scripts explicitly deferred to M5.2+: Myanmar (U+1000..109F),
+  Khmer (U+1780..17FF), Tibetan (U+0F00..0FFF), Mongolian
+  (U+1800..18AF), and other complex-shaping BMP scripts that have
+  mixed width classes in the full UCD.
+
+### Build
+
+- paideia-as >= 0.21.0 required (unchanged from M1 / M2 / M3 / M4).
+- `tools/build.sh` emits per-module `build-out/*.o` objects for
+  `src/`, `tests/`, and `benches/`; no link step at M5 (downstream
+  satellites link via `--extra-obj-dir`).
+
 ## [1.3.0] -- 2026-10-11
 
 R131.M4 of the semantic-shell Unicode umbrella (paideia-os#2480,
