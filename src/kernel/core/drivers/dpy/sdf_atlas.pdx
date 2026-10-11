@@ -1,0 +1,1140 @@
+// src/kernel/core/drivers/dpy/sdf_atlas.pdx -- Wave 79 G11 [G4] (#2548)
+//
+// Signed-Distance-Field (SDF) text glyph atlas management SKELETON for
+// Wave 79 G11. Modern GPU text rendering per Eric Lengyel's "Area-
+// Preserving Signed-Distance-Field" (Game Programming Gems 6, Ch. 4,
+// 2007; refined in "Improved Alpha-Tested Magnification for Vector
+// Textures and Special Effects", Chris Green, SIGGRAPH 2007, and
+// Lengyel's follow-up work at Terathon on the "Slug" font-rendering
+// library, 2017) stores each glyph as an 8-bit SDF texture tile in a
+// shared GPU-resident atlas. At draw time the vertex shader stamps the
+// glyph's quad using the atlas-rect coordinates recorded here; the
+// fragment shader samples the 4 corners of the quad in UV space,
+// reconstructs the glyph outline from the SDF, and uses supersampled
+// gradient analysis for pixel-exact anti-aliasing with GPU-side
+// subpixel positioning. The 1x/2x/3x per-DPI hinting cascade required
+// by CPU rasterizers (FreeType, DirectWrite classic path) is unneeded:
+// the SDF representation IS resolution-independent, and the gradient
+// width maps to the on-screen pixel footprint without a hint table.
+//
+// This file manages (A) the atlas resident texture (a KIND_GPU_BO_DRV
+// capability pinned at init time) and (B) the glyph -> atlas-rect
+// lookup table (a 1024-entry open-addressed hash table keyed by
+// codepoint). The shelf-pack allocator (Jukka Jylanki's "A Thousand
+// Ways to Pack the Bin: A Practical Approach to Two-Dimensional
+// Rectangle Bin Packing", 2010 §5.2 "Shelf-Next-Fit") carves the
+// atlas into left-to-right horizontal shelves; when a glyph doesn't
+// fit on the current shelf, a new shelf opens at `y += shelf_height`.
+// Overflow (y + h > atlas_height) returns ATLAS_FULL and the caller
+// is expected to invoke `sdf_atlas_evict_lru` -- a later-wave real
+// body -- to reclaim slots.
+//
+// This file sits beside direct_scanout.pdx (Wave 78 G8, #2545) which
+// binds a KIND_GPU_BO_DRV surface as a pipe's PRIMARY plane framebuffer
+// without a compositor-side blit, and iris_xe_cursor.pdx (Wave 59 G3)
+// which manages the HARDWARE cursor plane. The SDF atlas is cap-visible
+// as KIND_SDF_ATLAS (slot 0x4D) and sits above KIND_GPU_BO_DRV (0x43)
+// in the dependency DAG: the atlas BO is a KIND_GPU_BO_DRV capability
+// that the compositor's text-renderer passes to the shader at bind
+// time, and the glyph table is this file's private state.
+//
+// =============================================================================
+// SECTION 0  SCOPE + HONESTY PIN
+// =============================================================================
+//
+// Posture: EVERY body here is a STUB per the Wave 79 G11 skeleton
+// directive. The atlas layout (2048x2048 default), the hash table
+// shape (1024 slots x 4 u64 per row = 4096 u64s total), the shelf-
+// pack arithmetic, the glyph-table row encoding, the error taxonomy,
+// and the fingerprint shapes are FROZEN at this skeleton stage so a
+// follow-up slice can land the real SDF encoder + GPU upload pipeline
+// against the same ABI + constants without churn. The static state
+// blocks, the fingerprint tags, and the counter bumps are real; no
+// GPU memory is yet uploaded (QEMU: no Iris Xe BAR0; T14 G4: BAR0 is
+// wired by R104.M1-003 but consumed only by iris_xe_modeset today).
+//
+// On the Wave 79 G11 skeleton, every entrypoint:
+//   (1) range-checks its inputs against the frozen atlas / hash-table
+//       geometry (see §4 for the error taxonomy);
+//   (2) consults the G6 (KIND_GPU_BO_DRV, #2543) row accessors
+//       (gpu_bo_row_host_pa / gpu_bo_row_size_pages) when the atlas BO
+//       cap must be validated;
+//   (3) records the request into the module-level state block;
+//   (4) bumps the per-op counter so an operator can see the entry
+//       on a boot-witness programme;
+//   (5) emits a fingerprint so init / insert / lookup events show up
+//       on the klog wire.
+//
+// =============================================================================
+// SECTION 1  ATLAS GEOMETRY
+// =============================================================================
+//
+// Default atlas dimensions: 2048 x 2048 pixels, 8 bits per texel
+// (one-byte SDF value per pixel). A 2048-side atlas holds roughly
+// (2048 / 32)^2 = 4096 glyph tiles at the 32-px tile-size that the
+// Slug paper reports as the median for Latin text; Chinese / Japanese
+// / Korean workloads benefit from a 4096-side atlas, which is deferred
+// to a follow-up slice because the Iris Xe maximum 2D texture is 16K
+// but the Alder-Lake-N / Raptor-Lake-P GTT budget on 16GB laptops
+// prefers 2K sides to keep the resident set under 4MB per atlas.
+//
+// The caller passes atlas_width / atlas_height to `sdf_atlas_init`;
+// a value of 0 defaults to 2048 (the sentinel). The atlas BO (a
+// KIND_GPU_BO_DRV capability) MUST be at least
+// `atlas_width * atlas_height` bytes (1 byte per texel for the 8-bit
+// SDF format) which translates to `atlas_width * atlas_height / 4096`
+// pages. The skeleton does NOT enforce the size check against the BO
+// row -- a follow-up slice adds the gate once the real SDF encoder
+// path lands and starts stamping texels into the BO.
+//
+// =============================================================================
+// SECTION 2  GLYPH TABLE SHAPE
+// =============================================================================
+//
+// 1024 slots, each 4 u64 wide (32 bytes). Total: 4096 u64 = 32 KiB.
+// Row layout (byte offsets within the 32-byte slot):
+//
+//     +0   codepoint      -- Unicode scalar value (0 = empty slot
+//                            sentinel; U+0000 NUL is never cached,
+//                            which is standard for text atlases)
+//     +8   u_v_packed     -- (u | v << 32); u, v are atlas-space pixel
+//                            offsets of the tile's top-left corner
+//     +16  w_h_packed     -- (w | h << 32); w, h are tile dimensions
+//                            in pixels (NOT the glyph's visual size,
+//                            which equals w,h at skeleton stage but
+//                            may include SDF margin padding in the
+//                            follow-up)
+//     +24  lru_tick       -- the `_sdf_lru_tick` counter at the slot's
+//                            last access (insert or lookup); the LRU
+//                            evictor (deferred) walks the table for
+//                            the minimum tick to pick a victim
+//
+// Hash function: slot_idx = codepoint & 0x3FF (`and r, 0x3FF`, which
+// fits imm8 and needs no r11 staging). Open-addressed with no probe
+// sequence at skeleton stage: a collision OVERWRITES the earlier
+// glyph. A follow-up slice adds linear probing + a per-row generation
+// tag so the lookup path can distinguish "slot has your codepoint"
+// from "slot has a different codepoint". The skeleton's lookup path
+// returns SDF_ATLAS_ERR_UNKNOWN_CP when the slot's codepoint word
+// does not match the query, which is the right answer for both the
+// uncached and the collided-away cases.
+//
+// =============================================================================
+// SECTION 3  SHELF-PACK ARITHMETIC
+// =============================================================================
+//
+// Three cursors maintained in module state:
+//
+//     _sdf_shelf_cursor_x  -- next free x on the current shelf
+//     _sdf_shelf_cursor_y  -- top y of the current shelf
+//     _sdf_shelf_height    -- height of the current shelf (= max h
+//                             of any tile placed on it so far)
+//
+// Insert of a (w, h) tile:
+//
+//     (1) if _sdf_shelf_cursor_x + w > atlas_width then
+//             _sdf_shelf_cursor_y += _sdf_shelf_height
+//             _sdf_shelf_cursor_x  = 0
+//             _sdf_shelf_height    = 0
+//     (2) if _sdf_shelf_cursor_y + h > atlas_height then
+//             return SDF_ATLAS_ERR_ATLAS_FULL
+//     (3) u = _sdf_shelf_cursor_x
+//         v = _sdf_shelf_cursor_y
+//         _sdf_shelf_cursor_x += w
+//         if h > _sdf_shelf_height then _sdf_shelf_height = h
+//
+// Shelf-Next-Fit is the simplest shelf-pack variant. It has worse
+// packing density than Shelf-Best-Fit (Jylanki §5.2.3) but admits an
+// O(1) insert path with no shelf list to scan. Density for mixed-
+// height tiles is roughly 70-80% of the atlas area; the LRU evictor
+// reclaims the slack. A follow-up slice may upgrade to Shelf-Best-Fit
+// once the glyph size distribution of Latin + CJK workloads is
+// measured.
+//
+// =============================================================================
+// SECTION 4  FAILURE TAXONOMY -- 0xFFFFFD58..0xFFFFFD5C
+// =============================================================================
+//
+// Five codes reserved for this module.  The task directive proposed
+// 0xFFFFFD4E..52, but:
+//
+//   (a) 0xFFFFFD50 and 0xFFFFFD51 are already claimed by core/driver/
+//       registry_snapshot.pdx (REGISTRY_SNAPSHOT_ERR_BAD_SNAP /
+//       REGISTRY_SNAPSHOT_ERR_TOO_MANY);
+//   (b) the next contiguous free window 0xFFFFFD49..0xFFFFFD4D (after
+//       ec_discovery.pdx's FD44..FD48 at Wave 78 I6) was ALSO taken
+//       by the parallel Wave 79 G9 landing drivers/dpy/damage_plane.
+//       pdx (paideia-os#2546, same wave as this file -- DP_ERR_*
+//       sentinels at 0xFFFFFD49..0xFFFFFD4D).
+//
+// Shifting further up to the free 0xFFFFFD58..0xFFFFFD5F window
+// (0xFFFFFD53..57 is claimed by drivers/tpm/tpm_crb.pdx; FD52 is a
+// single-slot orphan; FD58..5F is contiguous and empty by `grep -rnE
+// '0xFFFFFD5[89A-F]' src/` returning zero hits) keeps the SDF atlas
+// band contiguous and avoids a byte-value collision with any
+// driver-layer kind that could plausibly share a cap-invoke call
+// site. Same posture as every prior shift when a parallel wave
+// claimed the first-free window.
+//
+//     0xFFFFFD58  SDF_ATLAS_ERR_NOT_INITED    -- init was never called
+//                                                or returned nonzero
+//     0xFFFFFD59  SDF_ATLAS_ERR_UNKNOWN_CP    -- lookup slot's
+//                                                codepoint word does
+//                                                not match the query
+//                                                (slot empty or
+//                                                collided-away)
+//     0xFFFFFD5A  SDF_ATLAS_ERR_GLYPH_OOB     -- insert tile dimensions
+//                                                exceed atlas (w > W
+//                                                or h > H), or lookup
+//                                                out_rect_ptr is 0
+//     0xFFFFFD5B  SDF_ATLAS_ERR_ATLAS_FULL    -- shelf-pack overflow
+//                                                (new shelf would push
+//                                                y + h past atlas_h)
+//     0xFFFFFD5C  SDF_ATLAS_ERR_BAD_SDF_DATA  -- sdf_data_ptr == 0 on
+//                                                insert, or atlas BO
+//                                                is dead on init
+//                                                (defensive; a real
+//                                                body also checks
+//                                                the first SDF byte
+//                                                header)
+//
+// =============================================================================
+// SECTION 5  ENCODER POSTURE (paideia-as v0.36.82)
+// =============================================================================
+//
+//   G1 (sized stores): atlas BO byte-writes land in a follow-up slice
+//      via mov_b (SDF is 1 byte per texel). This skeleton emits no
+//      texel writes; the state fields are u64 so plain REX.W `mov`
+//      is correct.
+//   G4 (full-register compares): every cmp here is on a 64-bit
+//      register; no `cmp al, imm`, no `cmp eax, imm` short-form.
+//   No `test rN, rN` -- equality-against-zero is `cmp rN, 0`.
+//   No `and rN, imm64` -- the hash mask (0x3FF for codepoint %
+//      1024) fits imm8; the byte-mask (0xFF for op demux) fits
+//      imm8; neither needs an r11 staging.
+//   No two-operand `imul r, imm` -- slot_idx * 32 (row stride) is
+//      folded with `shl r, 5`; w / h / u / v upcasts to u64 are
+//      plain `mov r64, rN`. Any multi-register multiply uses the
+//      reg-reg form (none needed in this skeleton).
+//   64-bit immediates -- SDF_ATLAS_ATLAS_DIM_DEFAULT (0x800 = 2048)
+//      is loaded via `mov r64, 0x800` (imm32 sign-extended via REX.W).
+//      The error sentinels (0xFFFFFD58..5C) fit imm32 but have bit 31
+//      set, so the paideia-as encoder emits them through the proven
+//      `mov r64, imm64` form (same posture as every prior 0xFFFFFxxx
+//      sentinel load across the driver tree).
+//   Multiline `pub let ="..."` is forbidden by the pdx parser; every
+//      tag below is a single line.
+//   Module basename matches filename basename:
+//      sdf_atlas.pdx -> module SdfAtlas.
+//   Reserved labels -- every label in this file is prefixed `sdf_`
+//      so none collides with the ds_/ixc_/ixm_/plpr_ labels of the
+//      sibling dpy drivers, and none accidentally spells `loop`,
+//      `if`, or `let`.
+//   klog wrapper discipline -- the three fingerprints use klog_s1_x1_
+//      d2 (INIT, 1 hex + 2 decimal), klog_s1_d2 (INSERT, 2 decimal),
+//      and klog_s1_d3 (LOOKUP, 3 decimal) respectively. Caller
+//      pushes stack args in REVERSE order so vd1 lands at caller
+//      [rsp+0] right before CALL, which the wrapper reads at
+//      [rbp+16] after its own `push rbp` (direct_scanout.pdx L586
+//      precedent). Writing vd1 to [rsp+8] directly is the klog_s1_
+//      x1_* / s1_d2 / s1_d3 caller trap that has burned 5+ softarchs
+//      in prior slices.
+//   Fingerprint tag `[u8; N]` length is `strlen(string) + 1` (NUL
+//      terminator); a tag_len off-by-one is a build-time error.
+//
+// =============================================================================
+// SECTION 6  STACK + REGISTER PLAN
+// =============================================================================
+//
+// Five entry shapes (plus the cap handler):
+//
+//   sdf_atlas_init(bo_cap, atlas_width, atlas_height) -> u64
+//   sdf_atlas_insert_glyph(codepoint, sdf_data_ptr, w, h) -> u64
+//   sdf_atlas_lookup(codepoint, out_rect_ptr) -> u64
+//   sdf_atlas_evict_lru() -> u64
+//   cap_handler_sdf_atlas(rights, target_ptr, op_arg) -> u64
+//
+// All non-leaf entrypoints use the direct_scanout.pdx 3-push callee-
+// save prologue:
+//
+//   push rbx; push r12; push r13;    // 3-push, 24 B
+//   -- entry rsp%16 == 8; after 3 pushes rsp%16 == 0 (pre-CALL)
+//
+// INIT (klog_s1_x1_d2, 3 stack args): 5-push prologue (rbx = bo_cap,
+// r12 = width, r13 = height, r14 = scratch, r15 = scratch) + `sub rsp,
+// 8` pad + 3 pushes (vd2 = h, kd2 = sdf_k_h, vd1 = w). 5*8 + 32 = 72;
+// entry %16==8, +72 = 80, %16==0. `add rsp, 32` reclaims pad + 3 args.
+//
+// INSERT (klog_s1_d2, 1 stack arg): 5-push prologue (rbx = codepoint,
+// r12 = sdf_data_ptr, r13 = w, r14 = h, r15 = slot_idx) + `sub rsp,
+// 16` + `mov [rsp+0], slot_idx`. 5*8 + 16 = 56; entry %16==8, +56 =
+// 64, %16==0. `add rsp, 16` reclaims pad + vd slot.
+//
+// LOOKUP (klog_s1_d3, 3 stack args): 5-push prologue (rbx = codepoint,
+// r12 = out_rect_ptr, r13 = row_base, r14 = u, r15 = v) + `sub rsp, 8`
+// pad + 3 pushes (vd3 = v, kd3 = sdf_k_v, vd2 = u). 5*8 + 32 = 72; %16
+// alignment matches INIT. `add rsp, 32` reclaims pad + 3 args.
+//
+// EVICT_LRU (no stack args): 3-push prologue only; the skeleton is a
+// counter bump + return 0.
+//
+// cap_handler (klog_s1 chatter, 0 stack args): 3-push prologue.
+//
+// =============================================================================
+// SECTION 7  WIRING
+// =============================================================================
+//
+// Not wired to the smoke witness at skeleton stage. The file compiles
+// alongside the kernel because tools/build.sh recurses through src/
+// kernel/ with `find -name '*.pdx' | compile-one.sh`, so a new .pdx
+// in src/kernel/core/drivers/dpy/ is picked up automatically; no
+// build.sh edit required.
+//
+// invoke.pdx gets ONE new dispatch arm (0x4D -> cap_handler_sdf_atlas)
+// landed alongside this file (see invoke.pdx §Wave 79 G11 arm) so the
+// kind is reachable from cap_invoke the moment this skeleton lands.
+// Slot 0x4D is free per `grep -nE 'cmp rcx, 0x4D\b' src/kernel/core/
+// cap/invoke.pdx` returning no hits; 0x4C is also left free for a
+// future adjacent landing (parallel Wave 79 lands claim 0x4C and 0x4E
+// at coordinator discretion).
+//
+// klog/wrappers.pdx needs no new mints: klog_s1_x1_d2 landed in Wave
+// 78 G8 (direct_scanout.pdx), klog_s1_d2 landed in R62.M1-003 (sys_
+// execve), and klog_s1_d3 landed in R69.M1 (SMP dispatch); all three
+// are proven callers at this point.
+//
+// No caller invokes sdf_atlas_* yet. A follow-up slice adds a boot-
+// witness programme at tests/kernel/drivers/wit_sdf_atlas.pdx that:
+//   (1) sdf_atlas_init(bo_cap, 2048, 2048) -> SDF_ATLAS_OK;
+//   (2) sdf_atlas_insert_glyph(U+0041 'A', sdf_ptr, 32, 32) -> slot=65;
+//   (3) sdf_atlas_lookup(U+0041 'A', &out_rect) -> SDF_ATLAS_OK with
+//       {u=0, v=0, w=32, h=32};
+// and asserts the three fingerprints land on the klog wire.
+
+module SdfAtlas = structure {
+
+  // ==========================================================================
+  // §A  Atlas geometry defaults
+  // ==========================================================================
+
+  pub let SDF_ATLAS_DIM_DEFAULT    : u64 = 0x800     // 2048 pixels
+
+  // ==========================================================================
+  // §B  Glyph table shape
+  //
+  // 1024 slots, 4 u64 per slot = 4096 u64 total = 32 KiB. Row stride
+  // is 32 bytes (shl 5). Hash mask is 0x3FF (fits imm8).
+  // ==========================================================================
+
+  pub let SDF_HASH_SLOTS          : u64 = 1024
+  pub let SDF_HASH_MASK           : u64 = 0x3FF      // slots - 1
+  pub let SDF_ROW_STRIDE_BYTES    : u64 = 32         // 4 * 8
+
+  // Byte offsets within a row.
+  pub let SDF_ROW_OFF_CODEPOINT   : u64 = 0
+  pub let SDF_ROW_OFF_UV_PACKED   : u64 = 8
+  pub let SDF_ROW_OFF_WH_PACKED   : u64 = 16
+  pub let SDF_ROW_OFF_LRU_TICK    : u64 = 24
+
+  // ==========================================================================
+  // §C  Failure taxonomy -- band 0xFFFFFD58..0xFFFFFD5C
+  //
+  // See §4 of the file header for the full shift-from-task-directive
+  // note. Summary: directive proposed 0xFFFFFD4E..52; FD50/51 taken by
+  // registry_snapshot.pdx, FD49..4D taken by the sibling parallel-wave
+  // damage_plane.pdx (G9, #2546), FD53..57 taken by tpm_crb.pdx; the
+  // next contiguous free window is 0xFFFFFD58..0xFFFFFD5F.
+  // ==========================================================================
+
+  pub let SDF_ATLAS_OK                   : u64 = 0
+  pub let SDF_ATLAS_ERR_NOT_INITED       : u64 = 0xFFFFFD58
+  pub let SDF_ATLAS_ERR_UNKNOWN_CP       : u64 = 0xFFFFFD59
+  pub let SDF_ATLAS_ERR_GLYPH_OOB        : u64 = 0xFFFFFD5A
+  pub let SDF_ATLAS_ERR_ATLAS_FULL       : u64 = 0xFFFFFD5B
+  pub let SDF_ATLAS_ERR_BAD_SDF_DATA     : u64 = 0xFFFFFD5C
+
+  // ==========================================================================
+  // §D  Module state
+  //
+  // Atlas-level state (8 u64 slots, 64-byte aligned). Zero-init in .bss
+  // keeps every field at 0 until sdf_atlas_init runs; the `_sdf_inited`
+  // sentinel starts at 0 (= not inited) and the init path flips it to 1.
+  //
+  // Layout:
+  //   +0   _sdf_inited          -- 0 (not inited) or 1 (inited)
+  //   +8   _sdf_atlas_bo_cap    -- the KIND_GPU_BO_DRV cap row id
+  //   +16  _sdf_atlas_width     -- atlas width in pixels
+  //   +24  _sdf_atlas_height    -- atlas height in pixels
+  //   +32  _sdf_shelf_cursor_x  -- next free x on current shelf
+  //   +40  _sdf_shelf_cursor_y  -- top y of current shelf
+  //   +48  _sdf_shelf_height    -- height of current shelf
+  //   +56  _sdf_lru_tick        -- monotonic access counter
+  // ==========================================================================
+
+  pub let mut _sdf_state : [u64; 8] = uninit @align(64)
+
+  // Field byte offsets inside `_sdf_state`. Pure constants used as
+  // `[rip + _sdf_state + N]` displacements; keeping them named makes
+  // the body easier to audit.
+  pub let SDF_ST_INITED        : u64 = 0
+  pub let SDF_ST_BO_CAP        : u64 = 8
+  pub let SDF_ST_WIDTH         : u64 = 16
+  pub let SDF_ST_HEIGHT        : u64 = 24
+  pub let SDF_ST_CURSOR_X      : u64 = 32
+  pub let SDF_ST_CURSOR_Y      : u64 = 40
+  pub let SDF_ST_SHELF_HEIGHT  : u64 = 48
+  pub let SDF_ST_LRU_TICK      : u64 = 56
+
+  // Glyph hash table: 1024 slots x 4 u64 per slot = 4096 u64 = 32 KiB.
+  pub let mut _sdf_glyph_table : [u64; 4096] = uninit @align(64)
+
+  // Per-op counters (bumped once per successful entry). Visible via
+  // the getter trio in §J.
+  pub let mut _sdf_init_ct    : u64 = 0
+  pub let mut _sdf_insert_ct  : u64 = 0
+  pub let mut _sdf_lookup_ct  : u64 = 0
+  pub let mut _sdf_evict_ct   : u64 = 0
+
+  // ==========================================================================
+  // §E  Fingerprint tags + keys
+  //
+  // Three tags, one per entrypoint. Each is a single-line string
+  // literal (the multiline `pub let ="..."` form is forbidden by the
+  // pdx parser). Tag length is `strlen + 1` (NUL terminator) so a
+  // tag_len off-by-one is a build-time error.
+  //
+  // Fingerprints on the wire:
+  //   SDF_ATLAS INIT atlas_bo=0x<hex> w=<dec> h=<dec>
+  //   SDF_ATLAS INSERT cp=<dec> slot=<dec>
+  //   SDF_ATLAS LOOKUP cp=<dec> u=<dec> v=<dec>
+  //
+  // The task directive wrote the INIT line as `dim=<dec>x<dec>`; a
+  // compound value shape like that is not emittable by the klog KV
+  // formatter (every KV is one key = one formatted scalar). Splitting
+  // into w / h decimal keys preserves the shape semantically and
+  // yields a line that matches tests/fingerprints/sdf_atlas.golden
+  // verbatim.
+  //
+  // Matches tests/fingerprints/sdf_atlas.golden pattern.
+  // ==========================================================================
+
+  pub let sdf_tag_init     : [u8; 15] = "SDF_ATLAS INIT\0"
+  pub let sdf_tag_insert   : [u8; 17] = "SDF_ATLAS INSERT\0"
+  pub let sdf_tag_lookup   : [u8; 17] = "SDF_ATLAS LOOKUP\0"
+
+  pub let sdf_k_atlas_bo   : [u8; 9]  = "atlas_bo\0"
+  pub let sdf_k_w          : [u8; 2]  = "w\0"
+  pub let sdf_k_h          : [u8; 2]  = "h\0"
+  pub let sdf_k_cp         : [u8; 3]  = "cp\0"
+  pub let sdf_k_slot       : [u8; 5]  = "slot\0"
+  pub let sdf_k_u          : [u8; 2]  = "u\0"
+  pub let sdf_k_v          : [u8; 2]  = "v\0"
+
+  // Handler-entry chatter tag (for the cap-handler path).
+  pub let sdf_tag_handler_entry : [u8; 24] = "SDF_ATLAS handler entry\0"
+
+  // ==========================================================================
+  // §F  sdf_atlas_init(bo_cap, atlas_width, atlas_height) -> u64
+  //
+  // Pin the KIND_GPU_BO_DRV capability `bo_cap` as the atlas texture
+  // and record (atlas_width, atlas_height) into module state. Returns
+  // SDF_ATLAS_OK on success.
+  //
+  // Gates in order:
+  //   (1) bo_cap must be live (gpu_bo_row_size_pages != GPU_BO_DECODE_
+  //       BAD). A dead row returns SDF_ATLAS_ERR_BAD_SDF_DATA because
+  //       there is no valid atlas texture to insert glyphs into.
+  //       Zero-sized BOs are refused with the same code.
+  //
+  // atlas_width / atlas_height values of 0 are coerced to the default
+  // (SDF_ATLAS_DIM_DEFAULT = 2048). A value > 0 is taken verbatim; a
+  // follow-up slice may add a maximum-size gate once the real BO
+  // size-vs-dimensions check lands.
+  //
+  // Fingerprint: `SDF_ATLAS INIT atlas_bo=0x<hex> w=<dec> h=<dec>`
+  // via klog_s1_x1_d2.
+  //
+  // SysV: rdi = bo_cap, rsi = atlas_width, rdx = atlas_height.
+  // Stack recipe: 5 callee-save pushes (rbx = bo_cap, r12 = width,
+  // r13 = height, r14 = scratch, r15 = scratch) + sub rsp, 8 pad +
+  // 3 pushes for klog_s1_x1_d2 stack args.
+  // ==========================================================================
+
+  pub let sdf_atlas_init : (u64, u64, u64) -> u64 !{mem, sysreg} @{boot} =
+    fn (bo_cap: u64, atlas_width: u64, atlas_height: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {boot},
+      justification: "Wave 79 G11 (paideia-os#2548) skeleton: pin bo_cap as atlas BO, record (width, height) in _sdf_state, bump _sdf_init_ct, emit SDF_ATLAS INIT fingerprint. Gate: gpu_bo_row_size_pages(bo_cap) == GPU_BO_DECODE_BAD -> SDF_ATLAS_ERR_BAD_SDF_DATA (0xFFFFFD5C). Width/height of 0 coerce to SDF_ATLAS_DIM_DEFAULT (0x800 = 2048). Shelf cursors (_sdf_shelf_cursor_x / _y / _height) start at 0 courtesy of .bss zero-init. _sdf_inited flips 0 -> 1 at the end so a repeat init path overwrites prior state. Register plan: rbx = bo_cap (saved across gpu_bo_row_size_pages), r12 = width (post-coerce), r13 = height (post-coerce). klog_s1_x1_d2 caller contract: pad 8 + push vd2(height) + push kd2(sdf_k_h) + push vd1(width); after 5 callee-save pushes rsp%16==0 at the klog_s1_x1_d2 call. add rsp, 32 reclaims pad + 3 args. Labels prefixed sdf_init_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                       // rbx = bo_cap (saved)
+        mov r12, rsi;                       // r12 = atlas_width (raw)
+        mov r13, rdx;                       // r13 = atlas_height (raw)
+
+        // --- Coerce width = 0 -> default 2048.
+        cmp r12, 0;
+        jne sdf_init_width_ok;
+        mov r12, 0x800;
+      sdf_init_width_ok:
+
+        // --- Coerce height = 0 -> default 2048.
+        cmp r13, 0;
+        jne sdf_init_height_ok;
+        mov r13, 0x800;
+      sdf_init_height_ok:
+
+        // --- Gate: bo_cap row must be live.
+        mov rdi, rbx;
+        call gpu_bo_row_size_pages;
+        // rax = size_pages or GPU_BO_DECODE_BAD (0xFFFFFFFFFFFFFFFF).
+        mov r14, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r14;
+        je  sdf_init_bad_bo;
+        cmp rax, 0;
+        je  sdf_init_bad_bo;
+
+        // --- Record state. _sdf_state base.
+        lea r14, [rip + _sdf_state];
+        mov [r14 + 8],  rbx;                // SDF_ST_BO_CAP
+        mov [r14 + 16], r12;                // SDF_ST_WIDTH
+        mov [r14 + 24], r13;                // SDF_ST_HEIGHT
+        // SDF_ST_CURSOR_X / CURSOR_Y / SHELF_HEIGHT / LRU_TICK stay
+        // zero courtesy of .bss zero-init (first init) or are reset
+        // to zero on re-init below.
+        xor rax, rax;
+        mov [r14 + 32], rax;                // SDF_ST_CURSOR_X
+        mov [r14 + 40], rax;                // SDF_ST_CURSOR_Y
+        mov [r14 + 48], rax;                // SDF_ST_SHELF_HEIGHT
+        mov [r14 + 56], rax;                // SDF_ST_LRU_TICK
+
+        // --- Set the inited sentinel.
+        mov rax, 1;
+        mov [r14 + 0], rax;                 // SDF_ST_INITED = 1
+
+        // --- Count the init (bump BEFORE fingerprint).
+        mov rax, [rip + _sdf_init_ct];
+        add rax, 1;
+        mov [rip + _sdf_init_ct], rax;
+
+        // --- klog_s1_x1_d2(LEVEL_INFO, SUBSYS_DRV_, sdf_tag_init,
+        //                   sdf_k_atlas_bo, bo_cap,
+        //                   sdf_k_w, [vd1=width],
+        //                   sdf_k_h, [vd2=height])
+        //
+        // SysV reg args: rdi, rsi, rdx, rcx, r8, r9. Stack args pushed
+        // in reverse order (vd2 first = farthest from rsp, vd1 last =
+        // closest to rsp): push vd2=height, push kd2=sdf_k_h, push
+        // vd1=width. Pad 8 keeps rsp%16==0 pre-CALL.
+        mov rdi, 3;                         // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + sdf_tag_init];
+        lea rcx, [rip + sdf_k_atlas_bo];
+        mov r8, rbx;                        // vx = bo_cap (hex)
+        lea r9, [rip + sdf_k_w];            // kd1 = "w"
+
+        sub rsp, 8;                         // pad
+        mov rax, r13;                       // vd2 = height
+        push rax;
+        lea rax, [rip + sdf_k_h];           // kd2 = "h"
+        push rax;
+        mov rax, r12;                       // vd1 = width
+        push rax;
+        call klog_s1_x1_d2;
+        add rsp, 32;                        // reclaim pad + 3 args
+
+        xor rax, rax;                       // SDF_ATLAS_OK
+        jmp sdf_init_out;
+
+      sdf_init_bad_bo:
+        mov rax, 0xFFFFFD5C;                // SDF_ATLAS_ERR_BAD_SDF_DATA
+
+      sdf_init_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // §G  sdf_atlas_insert_glyph(codepoint, sdf_data_ptr, w, h) -> u64
+  //
+  // Pack a (w, h) SDF tile into the next free shelf-pack slot and
+  // record (codepoint, {u,v}, {w,h}, lru_tick) into the hash table.
+  // Returns the slot_idx (0..1023) on success, or an SDF_ATLAS_ERR_*
+  // sentinel on failure.
+  //
+  // Gates in order:
+  //   (1) _sdf_inited == 0            -> SDF_ATLAS_ERR_NOT_INITED
+  //   (2) sdf_data_ptr == 0           -> SDF_ATLAS_ERR_BAD_SDF_DATA
+  //   (3) w == 0 or h == 0            -> SDF_ATLAS_ERR_GLYPH_OOB
+  //       w > atlas_width or h > atlas_height
+  //                                   -> SDF_ATLAS_ERR_GLYPH_OOB
+  //   (4) shelf-pack overflow         -> SDF_ATLAS_ERR_ATLAS_FULL
+  //
+  // Shelf-pack carved into:
+  //   if cursor_x + w > atlas_width:
+  //       cursor_y += shelf_height
+  //       cursor_x  = 0
+  //       shelf_height = 0
+  //   if cursor_y + h > atlas_height:  -> ATLAS_FULL
+  //   u = cursor_x; v = cursor_y
+  //   cursor_x += w
+  //   if h > shelf_height: shelf_height = h
+  //
+  // Hash: slot_idx = codepoint & 0x3FF.
+  // Row base: _sdf_glyph_table + slot_idx * 32.
+  // Row writes:
+  //   [row + 0]  = codepoint
+  //   [row + 8]  = u | (v << 32)
+  //   [row + 16] = w | (h << 32)
+  //   [row + 24] = ++_sdf_lru_tick
+  //
+  // Fingerprint: `SDF_ATLAS INSERT cp=<dec> slot=<dec>` via
+  // klog_s1_d2.
+  //
+  // SysV: rdi = codepoint, rsi = sdf_data_ptr, rdx = w, rcx = h.
+  // Stack recipe: 5 callee-save pushes (rbx = codepoint, r12 =
+  // sdf_data_ptr [unused post-gate], r13 = w, r14 = h, r15 = slot_idx)
+  // + sub rsp, 16 + mov [rsp+0], slot_idx for the klog_s1_d2 vd arg.
+  // ==========================================================================
+
+  pub let sdf_atlas_insert_glyph : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{boot} =
+    fn (codepoint: u64, sdf_data_ptr: u64, w: u64, h: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {boot},
+      justification: "Wave 79 G11 (paideia-os#2548) skeleton: shelf-pack a (w,h) tile into the next free atlas slot, record (codepoint, u_v_packed, w_h_packed, lru_tick) into _sdf_glyph_table[codepoint & 0x3FF], bump _sdf_insert_ct, emit SDF_ATLAS INSERT fingerprint, return slot_idx. Gates in order: (1) _sdf_inited == 0 -> SDF_ATLAS_ERR_NOT_INITED (0xFFFFFD58); (2) sdf_data_ptr == 0 -> SDF_ATLAS_ERR_BAD_SDF_DATA (0xFFFFFD5C); (3) w==0 || h==0 || w>atlas_width || h>atlas_height -> SDF_ATLAS_ERR_GLYPH_OOB (0xFFFFFD5A); (4) shelf-pack overflow (cursor_y + h > atlas_height after possible shelf advance) -> SDF_ATLAS_ERR_ATLAS_FULL (0xFFFFFD5B). Register plan: rbx = codepoint (saved for row key + fingerprint), r12 = sdf_data_ptr (held for the follow-up slice's real byte-copy; unused in skeleton gates past (2)), r13 = w (saved for row width + shelf advance), r14 = h (saved for row height + shelf advance), r15 = slot_idx (saved for row base + fingerprint). Five callee-save pushes land rsp%16==0 at every nested call. klog_s1_d2 caller contract: sub rsp, 16; mov [rsp+0], slot_idx writes vd2=slot to caller [rsp+0] (which the wrapper reads at [rbp+16] after its own push rbp). add rsp, 16 reclaims pad + vd slot. Labels prefixed sdf_ins_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                       // rbx = codepoint (saved)
+        mov r12, rsi;                       // r12 = sdf_data_ptr
+        mov r13, rdx;                       // r13 = w
+        mov r14, rcx;                       // r14 = h
+
+        // --- Gate (1): _sdf_inited.
+        lea r15, [rip + _sdf_state];
+        mov rax, [r15 + 0];                 // SDF_ST_INITED
+        cmp rax, 0;
+        je  sdf_ins_not_inited;
+
+        // --- Gate (2): sdf_data_ptr != 0.
+        cmp r12, 0;
+        je  sdf_ins_bad_data;
+
+        // --- Gate (3a): w, h nonzero.
+        cmp r13, 0;
+        je  sdf_ins_glyph_oob;
+        cmp r14, 0;
+        je  sdf_ins_glyph_oob;
+
+        // --- Gate (3b): w <= atlas_width, h <= atlas_height.
+        mov rax, [r15 + 16];                // atlas_width
+        cmp r13, rax;
+        ja  sdf_ins_glyph_oob;
+        mov rax, [r15 + 24];                // atlas_height
+        cmp r14, rax;
+        ja  sdf_ins_glyph_oob;
+
+        // --- Shelf-pack: advance shelf if the tile won't fit on
+        //     the current row.
+        mov rax, [r15 + 32];                // cursor_x
+        add rax, r13;                       // cursor_x + w
+        mov rcx, [r15 + 16];                // atlas_width
+        cmp rax, rcx;
+        jbe sdf_ins_fit;
+
+        // Advance: cursor_y += shelf_height; cursor_x = 0;
+        //          shelf_height = 0.
+        mov rax, [r15 + 40];                // cursor_y
+        add rax, [r15 + 48];                // shelf_height
+        mov [r15 + 40], rax;                // cursor_y = new
+        xor rax, rax;
+        mov [r15 + 32], rax;                // cursor_x = 0
+        mov [r15 + 48], rax;                // shelf_height = 0
+
+      sdf_ins_fit:
+        // --- Gate (4): cursor_y + h > atlas_height -> ATLAS_FULL.
+        mov rax, [r15 + 40];                // cursor_y
+        add rax, r14;                       // cursor_y + h
+        mov rcx, [r15 + 24];                // atlas_height
+        cmp rax, rcx;
+        ja  sdf_ins_atlas_full;
+
+        // --- Allocate: u = cursor_x, v = cursor_y.
+        //     cursor_x += w; shelf_height = max(shelf_height, h).
+        mov rax, [r15 + 32];                // rax = u (= cursor_x)
+        mov rcx, [r15 + 40];                // rcx = v (= cursor_y)
+        push rax;                           // stash u on stack
+        push rcx;                           // stash v on stack
+
+        mov rax, [r15 + 32];                // cursor_x
+        add rax, r13;                       // cursor_x + w
+        mov [r15 + 32], rax;                // cursor_x = new
+
+        mov rax, [r15 + 48];                // shelf_height
+        cmp r14, rax;
+        jbe sdf_ins_sh_ok;
+        mov [r15 + 48], r14;                // shelf_height = h
+      sdf_ins_sh_ok:
+
+        // --- Compute slot_idx = codepoint & 0x3FF.
+        mov r15, rbx;
+        and r15, 0x3FF;                     // r15 = slot_idx
+
+        // --- Row base = _sdf_glyph_table + slot_idx * 32.
+        lea rax, [rip + _sdf_glyph_table];
+        mov rcx, r15;
+        shl rcx, 5;                         // slot_idx * 32
+        add rax, rcx;
+
+        // --- Row writes.
+        //     [row + 0]  = codepoint
+        mov [rax + 0],  rbx;
+
+        //     [row + 8]  = u | (v << 32)
+        //     recover u, v from stack (last-in-first-out: top is v).
+        pop rcx;                            // rcx = v
+        pop rdx;                            // rdx = u
+        mov r10, rcx;
+        shl r10, 32;                        // r10 = v << 32
+        or  r10, rdx;                       // r10 = u | (v << 32)
+        mov [rax + 8], r10;
+
+        //     [row + 16] = w | (h << 32)
+        mov r10, r14;
+        shl r10, 32;                        // r10 = h << 32
+        or  r10, r13;                       // r10 = w | (h << 32)
+        mov [rax + 16], r10;
+
+        //     [row + 24] = ++_sdf_lru_tick.
+        lea rdx, [rip + _sdf_state];
+        mov rcx, [rdx + 56];                // SDF_ST_LRU_TICK
+        add rcx, 1;
+        mov [rdx + 56], rcx;
+        mov [rax + 24], rcx;
+
+        // --- Count the insert (bump BEFORE fingerprint).
+        mov rax, [rip + _sdf_insert_ct];
+        add rax, 1;
+        mov [rip + _sdf_insert_ct], rax;
+
+        // --- klog_s1_d2(LEVEL_INFO, SUBSYS_DRV_, sdf_tag_insert,
+        //                sdf_k_cp, codepoint, sdf_k_slot, [vd2=slot])
+        //
+        // SysV reg args: rdi, rsi, rdx, rcx, r8, r9. Stack arg (v2 =
+        // slot_idx) at caller [rsp+0] right before CALL; 16-byte
+        // reserve = 1 arg slot (8B) + 1 pad (8B) keeps rsp%16==0.
+        mov rdi, 3;                         // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + sdf_tag_insert];
+        lea rcx, [rip + sdf_k_cp];
+        mov r8, rbx;                        // v1 = codepoint
+        lea r9, [rip + sdf_k_slot];         // k2 = "slot"
+
+        sub rsp, 16;
+        mov [rsp + 0], r15;                 // vd2 = slot_idx
+        call klog_s1_d2;
+        add rsp, 16;
+
+        // --- Return value: slot_idx.
+        mov rax, r15;
+        jmp sdf_ins_out;
+
+      sdf_ins_not_inited:
+        mov rax, 0xFFFFFD58;                // SDF_ATLAS_ERR_NOT_INITED
+        jmp sdf_ins_out;
+      sdf_ins_bad_data:
+        mov rax, 0xFFFFFD5C;                // SDF_ATLAS_ERR_BAD_SDF_DATA
+        jmp sdf_ins_out;
+      sdf_ins_glyph_oob:
+        mov rax, 0xFFFFFD5A;                // SDF_ATLAS_ERR_GLYPH_OOB
+        jmp sdf_ins_out;
+      sdf_ins_atlas_full:
+        mov rax, 0xFFFFFD5B;                // SDF_ATLAS_ERR_ATLAS_FULL
+
+      sdf_ins_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // §H  sdf_atlas_lookup(codepoint, out_rect_ptr) -> u64
+  //
+  // Resolve a codepoint to its atlas-rect (u, v, w, h) by walking the
+  // open-addressed hash slot at codepoint & 0x3FF. Writes four u64s
+  // to out_rect_ptr: {u, v, w, h}.
+  //
+  // Gates:
+  //   (1) _sdf_inited == 0            -> SDF_ATLAS_ERR_NOT_INITED
+  //   (2) out_rect_ptr == 0           -> SDF_ATLAS_ERR_GLYPH_OOB
+  //   (3) slot's codepoint word != query codepoint
+  //                                   -> SDF_ATLAS_ERR_UNKNOWN_CP
+  //
+  // On hit:
+  //   u = u_v_packed & 0xFFFFFFFF
+  //   v = u_v_packed >> 32
+  //   w = w_h_packed & 0xFFFFFFFF
+  //   h = w_h_packed >> 32
+  //   bump _sdf_lru_tick, stash into row's lru_tick slot
+  //
+  // Fingerprint: `SDF_ATLAS LOOKUP cp=<dec> u=<dec> v=<dec>` via
+  // klog_s1_d3.
+  //
+  // SysV: rdi = codepoint, rsi = out_rect_ptr.
+  // Stack recipe: 5 callee-save pushes (rbx = codepoint, r12 =
+  // out_rect_ptr, r13 = row_base, r14 = u, r15 = v) + sub rsp, 8 pad
+  // + 3 pushes (vd3 = v, kd3 = sdf_k_v, vd2 = u) for klog_s1_d3.
+  // ==========================================================================
+
+  pub let sdf_atlas_lookup : (u64, u64) -> u64 !{mem, sysreg} @{boot} =
+    fn (codepoint: u64, out_rect_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {boot},
+      justification: "Wave 79 G11 (paideia-os#2548) skeleton: hash-table lookup at codepoint & 0x3FF, slot codepoint-word compare, unpack {u,v,w,h} from row packed slots, write to out_rect_ptr, bump _sdf_lookup_ct + _sdf_lru_tick, emit SDF_ATLAS LOOKUP fingerprint. Gates: (1) _sdf_inited == 0 -> SDF_ATLAS_ERR_NOT_INITED (0xFFFFFD58); (2) out_rect_ptr == 0 -> SDF_ATLAS_ERR_GLYPH_OOB (0xFFFFFD5A); (3) slot[0] != codepoint -> SDF_ATLAS_ERR_UNKNOWN_CP (0xFFFFFD59). Register plan: rbx = codepoint (saved for row key + fingerprint), r12 = out_rect_ptr (saved for the four store slots), r13 = row_base (computed once from codepoint & 0x3FF), r14 = u (unpacked from u_v_packed low 32), r15 = v (unpacked from u_v_packed high 32). klog_s1_d3 caller contract: pad 8 + push vd3(v) + push kd3(sdf_k_v) + push vd2(u); after 5 callee-save pushes rsp%16==0 at the klog_s1_d3 call. add rsp, 32 reclaims pad + 3 args. Labels prefixed sdf_lu_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                       // rbx = codepoint
+        mov r12, rsi;                       // r12 = out_rect_ptr
+
+        // --- Gate (1): inited.
+        lea r13, [rip + _sdf_state];
+        mov rax, [r13 + 0];
+        cmp rax, 0;
+        je  sdf_lu_not_inited;
+
+        // --- Gate (2): out_rect_ptr != 0.
+        cmp r12, 0;
+        je  sdf_lu_glyph_oob;
+
+        // --- Hash: slot_idx = codepoint & 0x3FF; row = table + slot*32.
+        mov rax, rbx;
+        and rax, 0x3FF;                     // slot_idx
+        shl rax, 5;                         // slot_idx * 32
+        lea r13, [rip + _sdf_glyph_table];
+        add r13, rax;                       // r13 = row_base
+
+        // --- Gate (3): slot's codepoint must match.
+        mov rax, [r13 + 0];
+        cmp rax, rbx;
+        jne sdf_lu_unknown_cp;
+
+        // --- Unpack u, v from u_v_packed.
+        mov rax, [r13 + 8];                 // u_v_packed
+        mov rcx, 0xFFFFFFFF;
+        mov r14, rax;
+        and r14, rcx;                       // r14 = u (low 32)
+        mov r15, rax;
+        shr r15, 32;                        // r15 = v (high 32)
+
+        // --- Write {u, v, w, h} to out_rect_ptr.
+        mov [r12 + 0], r14;                 // *out = u
+        mov [r12 + 8], r15;                 // *out+8 = v
+
+        mov rax, [r13 + 16];                // w_h_packed
+        mov rdx, rax;
+        and rdx, rcx;                       // rdx = w (low 32)
+        mov [r12 + 16], rdx;
+        shr rax, 32;                        // rax = h (high 32)
+        mov [r12 + 24], rax;
+
+        // --- Touch LRU: ++_sdf_lru_tick, stash into row.
+        lea rax, [rip + _sdf_state];
+        mov rcx, [rax + 56];
+        add rcx, 1;
+        mov [rax + 56], rcx;
+        mov [r13 + 24], rcx;
+
+        // --- Count the lookup (bump BEFORE fingerprint).
+        mov rax, [rip + _sdf_lookup_ct];
+        add rax, 1;
+        mov [rip + _sdf_lookup_ct], rax;
+
+        // --- klog_s1_d3(LEVEL_INFO, SUBSYS_DRV_, sdf_tag_lookup,
+        //                sdf_k_cp, codepoint, sdf_k_u, [vd2=u],
+        //                sdf_k_v, [vd3=v])
+        //
+        // Reg args: level, subsys, tag, k1=sdf_k_cp, v1=codepoint,
+        // k2=sdf_k_u. Stack args (reverse order): push vd3=v, push
+        // k3=sdf_k_v, push vd2=u. Pad 8 keeps rsp%16==0 pre-CALL.
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + sdf_tag_lookup];
+        lea rcx, [rip + sdf_k_cp];
+        mov r8, rbx;                        // v1 = codepoint
+        lea r9, [rip + sdf_k_u];            // k2 = "u"
+
+        sub rsp, 8;                         // pad
+        mov rax, r15;                       // vd3 = v
+        push rax;
+        lea rax, [rip + sdf_k_v];           // kd3 = "v"
+        push rax;
+        mov rax, r14;                       // vd2 = u
+        push rax;
+        call klog_s1_d3;
+        add rsp, 32;
+
+        xor rax, rax;                       // SDF_ATLAS_OK
+        jmp sdf_lu_out;
+
+      sdf_lu_not_inited:
+        mov rax, 0xFFFFFD58;                // SDF_ATLAS_ERR_NOT_INITED
+        jmp sdf_lu_out;
+      sdf_lu_glyph_oob:
+        mov rax, 0xFFFFFD5A;                // SDF_ATLAS_ERR_GLYPH_OOB
+        jmp sdf_lu_out;
+      sdf_lu_unknown_cp:
+        mov rax, 0xFFFFFD59;                // SDF_ATLAS_ERR_UNKNOWN_CP
+
+      sdf_lu_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // §I  sdf_atlas_evict_lru() -> u64
+  //
+  // STUB. The real body walks _sdf_glyph_table for the slot with the
+  // minimum lru_tick, zeroes it, and (in a later slice) rewrites the
+  // shelf-pack cursor if the evicted slot leaves a reusable rectangle.
+  // The skeleton bumps _sdf_evict_ct and returns SDF_ATLAS_OK so a
+  // caller that invokes it (defensively) does not crash. Not inited
+  // -> SDF_ATLAS_ERR_NOT_INITED.
+  //
+  // SysV: no arguments.
+  // Stack recipe: 3 callee-save pushes (none strictly needed; kept
+  // for parity with the other entries so a follow-up body can land
+  // without touching the prologue).
+  // ==========================================================================
+
+  pub let sdf_atlas_evict_lru : () -> u64 !{mem} @{boot} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {boot},
+      justification: "Wave 79 G11 (paideia-os#2548) skeleton: stubbed LRU evictor. Gate on _sdf_inited (NOT_INITED on 0). Bump _sdf_evict_ct, return SDF_ATLAS_OK. Real body (follow-up slice): walk _sdf_glyph_table for min lru_tick, zero that slot, optionally rewind the shelf-pack cursor. Three callee-save pushes kept for parity with other entries so the follow-up body can land without touching the prologue. Labels prefixed sdf_ev_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        lea rbx, [rip + _sdf_state];
+        mov rax, [rbx + 0];                 // SDF_ST_INITED
+        cmp rax, 0;
+        je  sdf_ev_not_inited;
+
+        mov rax, [rip + _sdf_evict_ct];
+        add rax, 1;
+        mov [rip + _sdf_evict_ct], rax;
+
+        xor rax, rax;                       // SDF_ATLAS_OK
+        jmp sdf_ev_out;
+
+      sdf_ev_not_inited:
+        mov rax, 0xFFFFFD58;                // SDF_ATLAS_ERR_NOT_INITED
+
+      sdf_ev_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // §J  Per-op counter getters
+  //
+  // Four leaf getters so a boot-witness programme can assert
+  // (init_ct, insert_ct, lookup_ct, evict_ct) without touching the
+  // _sdf_*_ct symbols directly.
+  // ==========================================================================
+
+  pub let sdf_atlas_init_ct : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 79 G11 (paideia-os#2548) skeleton: single mov load from _sdf_init_ct. Leaf.",
+      block: {
+        mov rax, [rip + _sdf_init_ct];
+        ret
+      }
+    }
+
+  pub let sdf_atlas_insert_ct : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 79 G11 (paideia-os#2548) skeleton: single mov load from _sdf_insert_ct. Leaf.",
+      block: {
+        mov rax, [rip + _sdf_insert_ct];
+        ret
+      }
+    }
+
+  pub let sdf_atlas_lookup_ct : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 79 G11 (paideia-os#2548) skeleton: single mov load from _sdf_lookup_ct. Leaf.",
+      block: {
+        mov rax, [rip + _sdf_lookup_ct];
+        ret
+      }
+    }
+
+  pub let sdf_atlas_evict_ct : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 79 G11 (paideia-os#2548) skeleton: single mov load from _sdf_evict_ct. Leaf.",
+      block: {
+        mov rax, [rip + _sdf_evict_ct];
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // §K  cap_handler_sdf_atlas(rights, target_ptr, op_arg) -> u64
+  //
+  // KIND_SDF_ATLAS (0x4D) cap_invoke dispatch handler. Reachable from
+  // cap/invoke.pdx:cap_invoke_dispatch via the `cmp rcx, 0x4D; je
+  // call_kind_sdf_atlas` arm added alongside this file.
+  //
+  // The three mutating entrypoints (init / insert / lookup) take more
+  // than three arguments, so cap_invoke -- which hands the handler
+  // only (rights, target_ptr, op_arg) -- cannot plumb them directly
+  // without an extended cap_invoke signature or a packed op_arg. The
+  // handler is therefore QUERY-ONLY at skeleton stage, exactly like
+  // direct_scanout / iris_xe_hotplug / kind_gpu_bo_drv do for their
+  // first slice. Four ops:
+  //
+  //     op 0 SDF_OP_QUERY_INIT_CT    -> _sdf_init_ct
+  //     op 1 SDF_OP_QUERY_INSERT_CT  -> _sdf_insert_ct
+  //     op 2 SDF_OP_QUERY_LOOKUP_CT  -> _sdf_lookup_ct
+  //     op 3 SDF_OP_QUERY_EVICT_CT   -> _sdf_evict_ct
+  //     else                           INVOKE_UNSUPPORTED
+  //
+  // Rights gate: every op requires R_SDF_READ (0x001). target_ptr is
+  // ignored at skeleton stage; the mutating ops will interpret it
+  // (codepoint for insert/lookup) in a follow-up slice.
+  //
+  // SysV: rdi = rights, rsi = target_ptr, rdx = op_arg.
+  // Stack recipe: 3 callee-save pushes (rbx = rights, r13 = op_code).
+  // ==========================================================================
+
+  pub let R_SDF_READ : u64 = 0x001
+
+  pub let SDF_OP_QUERY_INIT_CT    : u64 = 0
+  pub let SDF_OP_QUERY_INSERT_CT  : u64 = 1
+  pub let SDF_OP_QUERY_LOOKUP_CT  : u64 = 2
+  pub let SDF_OP_QUERY_EVICT_CT   : u64 = 3
+
+  pub let cap_handler_sdf_atlas : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (rights: u64, target_ptr: u64, op_arg: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "Wave 79 G11 (paideia-os#2548) skeleton: KIND_SDF_ATLAS (0x4D) cap_invoke dispatch. Entry chatter (klog_s1 of sdf_tag_handler_entry). op_code = op_arg & 0xFF; rights gate against R_SDF_READ; dispatch 0..3 to the matching reader (sdf_atlas_init_ct / insert_ct / lookup_ct / evict_ct); else INVOKE_UNSUPPORTED. target_ptr ignored at skeleton stage; the mutating ops (init / insert / lookup) are deferred to a follow-up slice that either extends cap_invoke with a 4-register slot variant or packs multiple args into op_arg. Three callee-save pushes land rsp%16==0 at every nested call. Labels prefixed sdf_hd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                       // rights
+        mov r13, rdx;                       // op_arg
+        and r13, 0xFF;                      // op_code = op_arg[7:0]
+
+        // Entry chatter.
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + sdf_tag_handler_entry];
+        call klog_s1;
+
+        // Rights gate.
+        mov r10, rbx;
+        and r10, 0x001;                     // R_SDF_READ
+        cmp r10, 0;
+        je  sdf_hd_denied;
+
+        // Op dispatch.
+        cmp r13, 0;
+        je  sdf_hd_op_init_ct;
+        cmp r13, 1;
+        je  sdf_hd_op_insert_ct;
+        cmp r13, 2;
+        je  sdf_hd_op_lookup_ct;
+        cmp r13, 3;
+        je  sdf_hd_op_evict_ct;
+        jmp sdf_hd_unsup;
+
+      sdf_hd_op_init_ct:
+        call sdf_atlas_init_ct;
+        jmp sdf_hd_out;
+      sdf_hd_op_insert_ct:
+        call sdf_atlas_insert_ct;
+        jmp sdf_hd_out;
+      sdf_hd_op_lookup_ct:
+        call sdf_atlas_lookup_ct;
+        jmp sdf_hd_out;
+      sdf_hd_op_evict_ct:
+        call sdf_atlas_evict_ct;
+        jmp sdf_hd_out;
+
+      sdf_hd_denied:
+        mov rax, 0xFFFFFFFFFFFFFFFD;        // INVOKE_DENIED
+        jmp sdf_hd_out;
+      sdf_hd_unsup:
+        mov rax, 0xFFFFFFFFFFFFFFFC;        // INVOKE_UNSUPPORTED
+
+      sdf_hd_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // §L  Boot wiring note
+  // ----------------
+  // kernel_main.pdx does NOT need a dedicated reset entry: .bss zero-
+  // init leaves _sdf_state empty (_sdf_inited = 0) and the four counters
+  // at zero, which is exactly the never-inited starting state the
+  // insert / lookup / evict paths expect. A follow-up slice may mint
+  // a defensive `sdf_atlas_reset` for parity with the other dpy
+  // drivers' reset entries, but the skeleton gets by on .bss alone.
+  //
+  // invoke.pdx picks up the KIND_SDF_ATLAS (0x4D) dispatch arm in the
+  // same slice as this file -- the arm is pure plumbing and self-
+  // standing (handler returns INVOKE_UNSUPPORTED for every mutating
+  // op at skeleton stage, which is observable but harmless).
+  //
+  // Follow-up slices (G12 and later):
+  //   - Real SDF encoder: CPU rasterize glyph -> 8-bit SDF via Chris
+  //     Green's eight-direction scan (SIGGRAPH 2007 §3.1) + GPU upload
+  //     via gpu_bo_row_host_pa into the atlas BO.
+  //   - Linear probing on hash-table collision (skeleton overwrites).
+  //   - Real LRU evictor body (walk for min lru_tick, zero slot,
+  //     optionally rewind shelf cursor).
+  //   - Shelf-Best-Fit upgrade over Shelf-Next-Fit once mixed-height
+  //     tile distributions are measured.
+  //   - cap_handler extension for the mutating ops (init / insert /
+  //     lookup -- packed op_arg or a 4-register cap_invoke slot
+  //     variant).
+  // ==========================================================================
+}
