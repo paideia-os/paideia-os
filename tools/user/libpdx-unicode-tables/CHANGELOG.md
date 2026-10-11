@@ -4,6 +4,113 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] -- 2026-10-11
+
+R131.M4 of the semantic-shell Unicode umbrella (paideia-os#2480,
+decomposed into paideia-os#2615 for this M4).
+
+### Added
+
+- `src/collation.pdx` module `Collation`: UTS #10 Unicode Collation
+  Algorithm (UCA) baseline over NFD-normalised UTF-8.
+  - `_coll_compare(a_ptr, a_len, b_ptr, b_len) -> i64` -- lexicographic
+    comparison by UCA sort key under the reduced DUCET. Returns -1
+    (0xFFFFFFFFFFFFFFFF), 0, or 1.
+  - `_coll_sort_key(bytes_ptr, bytes_len, out_ptr, out_cap)
+    -> packed_u64` -- materialises a UCA sort key suitable for
+    byte-wise memcmp. Return shape `(out_bytes << 32) | status`
+    with status in {0=OK, 1=OUT_TOO_SMALL, 2=INVALID_UTF8}.
+  - Internal helpers (also `pub` for the proptest's benefit):
+    `_coll_lookup_mark`, `_coll_classify`, `_coll_build_ces`,
+    `_coll_emit_key`, `_coll_keycmp`.
+  - Reduced DUCET scope at M4:
+    - ASCII printable U+0020..U+007E: algorithmic L1 bands
+      (space / punct1-4 / digit / letter) with L2=0x0020 default
+      and L3=0x0002 (lower) or L3=0x0008 (upper).
+    - Combining marks U+0300..U+036F: 13 explicit (cp, L2) pairs
+      covering every mark in the normalize module's canonical
+      decomposition set; default L2=0x0040 for unlisted marks.
+    - Latin-1 Supplement U+00A0..U+00FF and Latin Ext-A U+0100..
+      U+017F non-decomposing cps: algorithmic fallback L1 bands
+      placed strictly above every ASCII letter. (Decomposing cps
+      never reach the classifier because the pipeline runs NFD
+      first; they appear as base + mark pairs.)
+  - Four .bss scratch buffers: `_coll_nfd_scratch` (4096 B),
+    `_coll_ce_scratch` (8192 B, 1024 CEs x 8 B), `_coll_key_a_scratch`
+    (8192 B), `_coll_key_b_scratch` (8192 B). Single-threaded by
+    construction.
+- `tests/fingerprints/collation.golden`: 8 TAG lines covering six
+  CMP cases (AB, BA, AA, a_vs_A, a_vs_aacute, cafe_vs_café) and two
+  KEY cases (KEY_a, KEY_empty). Walk-throughs documented in the
+  file header show how each byte of the key is derived from the
+  CE triplets.
+- `tests/proptest_collation.pdx` module `ProptestCollation`: four
+  invariant witnesses (reflexivity, antisymmetry, transitivity,
+  sort-key correctness) plus umbrella `pnc_run_all`; fail codes in
+  the 0xFFFFED8x band (extends the existing TestLexer /
+  ProptestGrapheme / ProptestNormalize band family).
+
+### Changed
+
+- `src/lib.pdx`: version bump 1.2.0 -> 1.3.0;
+  `LPX_UNICODE_VERSION_MINOR` = 3; `LPX_UNICODE_M4_READY` = 1;
+  `lpx_unicode_feature_level()` now returns 4. The per-milestone
+  commentary in `lib.pdx` reflects the M4-promotes-up renumbering:
+  UCA collation took the M4 slot (was later in the M2/M3 drafts)
+  so the streaming decoder (now M5), utf16 bridge (M6), and stream
+  validators (M7) slide down one.
+
+### Error band
+
+- 0xFFFFE730..0xFFFFE73F reserved for collation-layer error codes
+  (two used at M4: `COLL_INVALID_UTF8` = 0xFFFFE730,
+  `COLL_OUT_TOO_SMALL` = 0xFFFFE731). Disjoint from the M1
+  (0xFFFFE700..0F), M2 (0xFFFFE710..1F), M3 (0xFFFFE720..2F)
+  slices and every other band in the paideia-os tree. The public
+  API return packs the status code into the low 8 bits (0..2)
+  rather than returning the raw band value, matching the
+  _norm_nfX / _gc_next-style packed convention from M2/M3.
+
+### UCA scope (UTS #10 Rev. 46 reduced-ASCII+Latin-combining baseline)
+
+Phases IMPLEMENTED:
+
+- Normalisation to NFD (via M3's `_norm_nfd`).
+- Collation element construction (one CE per code point; no
+  contractions or expansions at M4; algorithmic per-range
+  classification + sparse mark-table lookup).
+- Sort-key formation (three-level stream, big-endian u16 weights,
+  0x0000 separator between levels, no trailing separator after L3).
+- Byte-wise memcmp of sort keys with shorter-wins tiebreaker.
+
+Phases STUBBED at M4 (land at M4.1+ follow-ups):
+
+- CJK Unified Ideographs: need DUCET implicit-weight algorithm
+  (TR#10 §10) or the pinyin/radical-stroke tailoring. M4.2 target.
+- Hangul (Jamos U+1100..U+11FF, Syllables U+AC00..U+D7A3):
+  TR#10 §7.1.5 per-Hangul weighting. M4.2 target.
+- Bidi/RTL scripts (Arabic U+0600..U+06FF + presentation forms,
+  Hebrew U+0590..U+05FF): currently fall into the generic Latin-
+  Ext-and-above fallback. M4.3 target.
+- Complex-shaping scripts (Devanagari U+0900..U+097F, Thai
+  U+0E00..U+0E7F, etc.): same posture as bidi; M4.3 target.
+- Locale tailorings (CLDR root -> per-locale deltas, e.g. Swedish
+  á after z): the baseline is DUCET root collation only. M4.4
+  target.
+- Variable weighting (L4 for whitespace/punctuation):
+  shifted/blanked/non-ignorable variants deferred. M4.3 target.
+- Case level (L2.5): case folded into L3 at M4; a separate
+  fine-grain case level is M4.4.
+- Many-to-one contractions and one-to-many expansions in the
+  DUCET: baseline is one-cp-one-CE. M4.1 lands these.
+
+### Build
+
+- paideia-as >= 0.21.0 required (unchanged from M1 / M2 / M3).
+- `tools/build.sh` emits per-module `build-out/*.o` objects for
+  `src/`, `tests/`, and `benches/`; no link step at M4 (downstream
+  satellites link via `--extra-obj-dir`).
+
 ## [1.2.0] -- 2026-10-11
 
 R131.M3 of the semantic-shell Unicode umbrella (paideia-os#2480,

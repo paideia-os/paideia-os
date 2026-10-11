@@ -2,8 +2,8 @@
 
 **Wave:** R131 (semantic shell -- Unicode substrate umbrella,
 paideia-os#2480)
-**Current milestone:** M3 (NFC/NFD/NFKC/NFKD normalization) -- landed.
-**Version:** 1.2.0.
+**Current milestone:** M4 (UCA collation, UTS #10 reduced DUCET) -- landed.
+**Version:** 1.3.0.
 
 See the R131 M-table in the umbrella issue (paideia-os#2480) for the
 upstream wave-level design; this file tracks the per-milestone
@@ -165,7 +165,88 @@ landing checklist as it closes locally.
   single-threaded by design; M3.3+ moves the scratch to a
   caller-supplied workspace argument.
 
-### M4 -- Streaming decoder iterator (planned)
+### M4 -- UCA collation (paideia-os#2615, landed)
+
+- [x] **M4-001** -- `src/collation.pdx` scaffold + module `Collation`,
+      status / error-band / weight constants, four scratch buffers
+      in .bss (NFD 4096 B, CE 8192 B = 1024 x 8-byte entries, two
+      key-scratch buffers 8192 B each), 13-entry mark L2 table.
+- [x] **M4-002** -- `_coll_lookup_mark(cp) -> L2` real body: landed.
+      Linear scan over the 13-entry mark table at stride 8 bytes;
+      returns `COLL_L2_MARK_DEFAULT` (0x0040) for unlisted marks in
+      U+0300..U+036F.
+- [x] **M4-003** -- `_coll_classify(cp) -> packed` real body:
+      landed. Range tree over the ASCII bands (space, punct1-4,
+      digits, letters-upper, letters-lower), combining-mark lookup
+      (U+0300..U+036F), Latin-1 / Latin-Ext-A fallback bands,
+      above-marks fallback. Packs (L1 << 32) | (L2 << 16) | L3.
+- [x] **M4-004** -- `_coll_build_ces(src_ptr, src_len) -> packed`
+      real body: landed. Walks UTF-8 bytes via `utf8_decode_cp`;
+      for each cp calls `_coll_classify` and writes the packed CE
+      qword to `_coll_ce_scratch[count]`. CE-array overflow at
+      1024 entries returns status=1; UTF-8 error returns status=2.
+- [x] **M4-005** -- `_coll_emit_key(count, out_ptr, out_cap)
+      -> packed` real body: landed. Three level streams (L1/L2/L3)
+      separated by u16 0x0000 sentinels; per-byte capacity gate;
+      atomic failure on buffer underrun.
+- [x] **M4-006** -- `_coll_sort_key(bytes_ptr, bytes_len, out_ptr,
+      out_cap) -> packed` public entry point: landed. Driver:
+      NFD -> build CEs -> emit key. Empty input returns status=0,
+      0 bytes.
+- [x] **M4-007** -- `_coll_keycmp(a_ptr, a_len, b_ptr, b_len)
+      -> i64` real body: landed. Byte-wise memcmp with shorter-
+      wins tiebreaker; returns -1 (via `xor rax,rax; sub rax,1`),
+      0, or 1.
+- [x] **M4-008** -- `_coll_compare(a_ptr, a_len, b_ptr, b_len)
+      -> i64` public entry point: landed. Materialises both sort
+      keys into the two compare-local scratch buffers, then calls
+      `_coll_keycmp`. UTF-8 or OUT_TOO_SMALL on either input
+      zeros that side's key length (treat as empty, don't crash).
+- [x] **M4-009** -- Fingerprint goldens:
+      `tests/fingerprints/collation.golden` with 8 TAG lines
+      (CMP_AB, CMP_BA, CMP_AA, CMP_a_vs_A, CMP_a_vs_aacute,
+      CMP_cafe_vs_café, KEY_a, KEY_empty).
+- [x] **M4-010** -- Proptest witnesses:
+      `tests/proptest_collation.pdx` module `ProptestCollation`
+      with 4 invariants (reflexivity, antisymmetry, transitivity,
+      sort-key correctness) and umbrella `pnc_run_all`.
+
+**M4 limitations (reduced DUCET scope; follow-ups filed for M4.1+):**
+
+- The reduced DUCET encoded in `collation.pdx` covers ONLY the
+  printable ASCII range U+0020..U+007E (algorithmic weight bands)
+  and the 13 explicit combining marks in `_coll_mark_table`
+  (U+0300..U+036F); every other code point falls into one of
+  four fallback bands (Latin-1 Supp, Latin Ext-A, high-fallback,
+  above-marks). CJK (U+4E00..U+9FFF etc), Hangul (U+1100..,
+  U+AC00..), Arabic (U+0600..), Hebrew (U+0590..), Devanagari
+  (U+0900..), Thai (U+0E00..), and every other script are
+  EXPLICITLY DEFERRED to M4.2+ follow-ups.
+- Contractions (many-cp -> one CE) and expansions (one-cp -> many
+  CEs) are NOT implemented; the baseline is strict one-cp-one-CE.
+  M4.1 lands these.
+- Composition_Exclusions handling in the NFD phase inherits M3's
+  posture (empty set); non-empty exclusions land at M3.2 before
+  M4 can take advantage of them.
+- Variable weighting (L4 for whitespace / punctuation --
+  shifted/blanked/non-ignorable variants) is NOT implemented.
+  M4.3 target.
+- Case level (L2.5): case information is folded into L3 at M4;
+  a separate fine-grain case level is M4.4.
+- Locale tailorings (CLDR root -> per-locale, e.g. Swedish á
+  after z, German sharp s expansion to "ss") NOT implemented.
+  M4.4 target.
+- Scratch buffers are static .bss (`_coll_nfd_scratch`,
+  `_coll_ce_scratch`, `_coll_key_a_scratch`, `_coll_key_b_scratch`,
+  28 KiB total). Overlapping calls -- including a signal handler
+  interrupting mid-compare -- corrupt the intermediate
+  representation. The library is single-threaded by design;
+  M4.5+ moves scratch to caller-supplied workspace arguments.
+- UTF-8 or OUT_TOO_SMALL on EITHER input to `_coll_compare`
+  treats that side as empty (no crash), orderable but silent.
+  Fail-fast callers should run `utf8_is_valid` first.
+
+### M5 -- Streaming decoder iterator (planned)
 
 - [ ] `utf8_decode_iter_begin(src_ptr, src_len) -> handle`
 - [ ] `utf8_decode_iter_next(handle) -> packed | UTF8_* | EOF`
@@ -174,14 +255,14 @@ landing checklist as it closes locally.
       a 24-byte struct `{src_ptr, src_len, pos}` the caller allocates
       and the primitives walk; no cap, no syscall).
 
-### M5 -- UTF-16 bridge (planned)
+### M6 -- UTF-16 bridge (planned)
 
 - [ ] `utf8_offset_to_utf16(src_ptr, src_len, utf8_off) -> utf16_off`
 - [ ] `utf16_offset_to_utf8(src_ptr, src_len, utf16_off) -> utf8_off`
 - [ ] `utf8_offset_to_utf32` / `utf32_offset_to_utf8`
 - [ ] Mirror of the paideia-as-unicode `lsp_bridge` module.
 
-### M6 -- Stream validators (planned)
+### M7 -- Stream validators (planned)
 
 - [ ] `utf8_validate_stream` -- fail-fast whole-buffer validator.
 - [ ] `utf8_validate_stream_recover` -- walks past the first
@@ -220,3 +301,17 @@ packed return (0..2); the high 32 bits carry out_bytes_written
 on success and 0 on failure. M3 is additive and preserves every
 M1 + M2 symbol unchanged -- v1.2.0 is backward-compatible with
 v1.1.0 and v1.0.0.
+
+M4 adds two public bindings (`_coll_compare`, `_coll_sort_key`)
+plus five internal helpers (`_coll_lookup_mark`,
+`_coll_classify`, `_coll_build_ces`, `_coll_emit_key`,
+`_coll_keycmp`), the collation error band 0xFFFFE730..0xFFFFE73F
+(two slots used: `COLL_INVALID_UTF8` at 0xFFFFE730,
+`COLL_OUT_TOO_SMALL` at 0xFFFFE731), and three status codes
+(COLL_STATUS_OK=0, COLL_STATUS_OUT_TOO_SMALL=1,
+COLL_STATUS_INVALID_UTF8=2) packed into the low 8 bits of
+`_coll_sort_key`'s return. `_coll_compare` returns -1/0/1
+directly as an i64 (the -1 bit pattern is 0xFFFFFFFFFFFFFFFF).
+M4 is additive and preserves every M1 + M2 + M3 symbol
+unchanged -- v1.3.0 is backward-compatible with v1.2.0,
+v1.1.0, and v1.0.0.

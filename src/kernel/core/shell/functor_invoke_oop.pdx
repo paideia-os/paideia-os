@@ -1,0 +1,1206 @@
+// src/kernel/core/shell/functor_invoke_oop.pdx -- UMB-W6 R123.M4 (paideia-os #2588)
+//
+// Out-of-process functor invoke path. Sits beside the UMB-W5 R123.M3
+// in-process ABI (functor_invoke.pdx). For functors flagged
+// `isolate = true` in /system/shell/commands.toml, the shell does NOT
+// call into the functor's VA in the shell's own address space; it
+// spawns a child task with a fresh COW-cloned aspace and lets the
+// child dispatch the functor at its first schedule. Argv marshalling
+// uses a packed byte buffer the child reads at the oop-landing step;
+// the parent waits via sys_wait_body and surfaces the child's
+// exit_status as the functor's result.
+//
+// =============================================================================
+// SECTION 0  WHAT R123.M4 LANDS vs. WHAT A FOLLOW-UP OWNS
+// =============================================================================
+//
+// LANDED HERE (R123.M4):
+//
+//   (1) The two public primitives named by the parent task directive:
+//
+//         _functor_invoke_oop_spawn(name_ptr, name_len, argv_ptr, argc)
+//                                                     -> packed u64
+//         _functor_invoke_oop_wait(child_pid)         -> i64
+//
+//   (2) The isolate-flag plumbing. The row shape frozen by R123.M1
+//       (kind_cmd_module.pdx §2) packs a `flags` word at [+32] with
+//       bit 0 = CM_FLAG_LIVE and bits 1..63 reserved. UMB-W6 claims
+//       bit 1 (CM_FLAG_ISOLATE = 0x2). The parser (R123.M2) does NOT
+//       yet set this bit -- it is set via the new in-this-file writer
+//       `_functor_invoke_oop_set_isolate(row_id)` (M4-adjacent; the
+//       parser-side extension that reads `isolate = true` from the
+//       TOML and calls this setter is a follow-up slice described
+//       in SECTION 2 and in the design doc).
+//
+//       We do NOT grow the row (no new column). The reserved slot at
+//       [+40] stays reserved for the R125 cap_env_ptr integration;
+//       widening the row would ripple through every KIND_CMD_MODULE
+//       witness and every cap/invoke dispatch stride.
+//
+//   (3) The argv marshalling format described in SECTION 3. For R123.M4
+//       the marshalled buffer is a kernel-side .bss scratch
+//       (`_fio_argv_scratch`) consumed by `fio_oop_child_landing`
+//       before any user-visible transition. The buffer is sized at
+//       FIO_ARGV_BUF_SIZE = 4096 bytes; argv totals that would exceed
+//       it return FIO_ERR_ARGV_TOO_BIG without ever touching the
+//       child aspace.
+//
+//   (4) A bespoke child materialization (`fio_spawn_task`) that
+//       mirrors sys_fork_body's phases 1..4.5 (task_new + aspace_
+//       clone_cow + fd_table copy + fd_inherit_hold) and then
+//       installs `fio_oop_child_landing` as the landing RA instead
+//       of `sys_fork_child_landing`. We DO NOT call sys_fork_body
+//       directly because sys_fork_body's landing iretq's the child
+//       back to the parent's user-space RIP (POSIX fork(2) semantics),
+//       which is NOT what an OOP functor invoke wants -- the child
+//       must start execution at the functor's kernel VA with argv in
+//       its SysV argument registers.
+//
+//   (5) `fio_oop_child_landing` -- the ring-0 trampoline the child
+//       runs on its first schedule. Reads (functor_va, argv_ptr,
+//       argc) from the child's slab, calls the functor, and invokes
+//       `sys_exit_body(current, exit_code)` to drain into the
+//       zombie-and-reap pipeline sys_wait_body consumes.
+//
+// DEFERRED (follow-up issues):
+//
+//   (a) Parser-side isolate wiring. cmd_registry_parser.pdx (R123.M2)
+//       currently discards per-key values after shape validation
+//       (see its own §9 justification: "discard value"). The follow-
+//       up slice extends the per-key action to recognise the key
+//       `isolate`, parse `true`/`false`, and on `true` call
+//       `_functor_invoke_oop_set_isolate(row_id)` after cmd_module_
+//       open mints the row. The row-id is already in-hand at the end
+//       of each `[command.NAME]` section action per parse_sec.
+//
+//   (b) True IPC-mediated argv marshalling. R123.M4 passes argv
+//       through the kernel-side `_fio_argv_scratch` buffer because
+//       (i) the shell is still kernel-side; (ii) KIND_IPC_ENDPOINT
+//       (R20b.M3) provides a 4088-byte payload cap per message and
+//       the packed format described in §3 fits within that cap --
+//       the follow-up slice swaps `_fio_argv_scratch` for a real
+//       sys_ipc_send + sys_ipc_recv round-trip once the shell
+//       materializes as a ring-3 process.
+//
+//   (c) Cap-env sealing. The child inherits the parent aspace via
+//       COW but currently NOT a narrowed cap env. R125 integration
+//       (cap_env_ptr field at _kcm_table[+40]) adds the step:
+//       aspace_create_user -> cap_env_derive_from(parent, functor->
+//       declared_caps) -> install into child slab before enqueue.
+//
+//   (d) Specific-pid wait. _functor_invoke_oop_wait currently drains
+//       the next zombie child via sys_wait_body (POSIX wait(2)
+//       semantics). For a shell that fired several OOP spawns the
+//       follow-up adds a child_pid filter -- either a sys_wait4 arm
+//       with a specific pid, or a per-spawn exit-status channel.
+//
+// =============================================================================
+// SECTION 1  WHY A SEPARATE FILE
+// =============================================================================
+//
+// The in-process path (functor_invoke.pdx) resolves (name, argv, argc)
+// and does a direct `call rax` to the functor's VA in the SAME aspace.
+// Everything is synchronous: the functor runs on the shell's stack,
+// returns i64 in rax, and the shell proceeds. The invoke boundary is
+// one stack frame deep.
+//
+// The out-of-process path crosses an aspace boundary: a fresh pml4,
+// a fresh pid, a fresh runq entry, a scheduler-mediated hand-off, and
+// a wait-and-reap return path. The failure modes are different (fork
+// OOM, aspace clone OOM, argv-marshal overflow), the scheduling model
+// is different (parent blocks via sys_wait_body), and the capability
+// posture is different (child gets a narrowed cap env, not the shell's).
+//
+// We keep these two paths in separate files so each stays independently
+// auditable. The ONLY shared piece is the lookup -- `_functor_invoke_
+// lookup` returns the same packed `(va << 1) | 1` whether the caller
+// then dispatches in-process or out-of-process. The dispatch choice is
+// made at the shell layer by consulting the isolate bit (new helper
+// `_functor_invoke_oop_is_isolated(row_id)` exposed here).
+//
+// =============================================================================
+// SECTION 2  ISOLATE FLAG BIT
+// =============================================================================
+//
+// CM_FLAG_ISOLATE = 0x2 (bit 1 of _kcm_table[row+32]).
+//
+// Rationale:
+//   * Bit 0 is already CM_FLAG_LIVE (kind_cmd_module.pdx §2); bit 1 is
+//     the next natural slot and remains in bits 1..63 reserved.
+//   * Zero on mint -- cmd_module_open writes `flags = CM_FLAG_LIVE`
+//     unconditionally (kind_cmd_module.pdx line 671), so a fresh row
+//     is NOT isolated until the parser (or a direct call) sets the bit.
+//   * The setter is a read-modify-write on the flags word, NOT a
+//     publish-last store. The LIVE bit is already published; writing
+//     the ISOLATE bit after publish is correct because the shell
+//     reads the whole word with a single mov, and both bits are
+//     observed atomically within one aligned 8-byte load.
+//
+// A row with ISOLATE clear is dispatched in-process (M3 path). A row
+// with ISOLATE set is dispatched out-of-process (this file). The
+// mapping is strict -- there is no "either way" fallback -- so a
+// mis-set bit surfaces as `FIO_ERR_NOT_ISOLATED` at the OOP spawn
+// site, which is loud enough to catch in a boot-witness run.
+//
+// =============================================================================
+// SECTION 3  ARGV MARSHALLING FORMAT
+// =============================================================================
+//
+// The marshalled buffer is a packed byte array laid out as:
+//
+//   +0        u32 argc                   // argument count
+//   +4        u32 total_bytes            // of this entire buffer
+//   +8        u32 offsets[argc]          // byte offsets of each arg's
+//                                         //   first byte, relative to
+//                                         //   this buffer's +0
+//   +8+4*argc  bytes[]                   // argv strings, each NUL-
+//                                         //   terminated; the trailing
+//                                         //   NUL IS counted in the
+//                                         //   per-arg byte range
+//                                         //   (end_i == offsets[i+1]-1
+//                                         //    for i < argc-1, or
+//                                         //    total_bytes-1 for i ==
+//                                         //    argc-1)
+//
+// Invariants:
+//   * argc >= 1 -- argv[0] is the invocation name (same convention
+//     as POSIX argv). Zero-argc dispatch is rejected at the entry
+//     with FIO_ERR_ARGV_TOO_BIG (we fold "empty argv" into the
+//     overflow arm since neither is a legitimate invocation shape).
+//   * total_bytes <= FIO_ARGV_BUF_SIZE (4096) -- overflow returns
+//     FIO_ERR_ARGV_TOO_BIG.
+//   * offsets[i] is monotonically increasing: offsets[0] == 8+4*argc,
+//     offsets[i+1] == offsets[i] + len(argv[i]) + 1.
+//   * The functor reads argv as (argv_ptr, argc) in (rdi, rsi) -- the
+//     child-landing trampoline (SECTION 6) sets this up before
+//     calling the functor.
+//
+// Caller (shell) side -- the parent's argv_ptr is an in-memory flat
+// list of (ptr, len) tuples maintained by the shell's lexer. The
+// marshaller walks that list, computes total_bytes, bails on overflow,
+// and writes the packed buffer into `_fio_argv_scratch`. The child's
+// landing step reads the SAME buffer (shared .bss region; the aspace
+// clone is COW so the kernel-mapped high-half is identical in both
+// pml4s). The child then calls the functor with argv_ptr pointing
+// into `_fio_argv_scratch` and argc from the buffer's header.
+//
+// =============================================================================
+// SECTION 4  FAILURE TAXONOMY  --  0x0C41..0x0C44
+// =============================================================================
+//
+// Band audit (2026-10-11):
+//   * cmd_registry_parser.pdx (R123.M2): 0x0C01..0x0C04.
+//   * functor_invoke.pdx       (R123.M3): 0x0C21..0x0C23.
+//   * This file                (R123.M4): 0x0C41..0x0C44.
+//
+// The 0x0C10..0x0C1F and 0x0C24..0x0C3F strips remain unclaimed; this
+// file sits at 0x0C40 to leave a four-code gap between R123.M3 and
+// R123.M4 that an eventual R123.M5 (bus/async) can occupy without
+// bumping either neighbour.
+//
+//   FIO_OK                 = 0x0000
+//   FIO_ERR_NOT_FOUND      = 0x0C41  (name does not resolve against the
+//                                      KIND_CMD_MODULE row pool)
+//   FIO_ERR_NOT_ISOLATED   = 0x0C42  (row resolved but CM_FLAG_ISOLATE
+//                                      is clear -- caller should take
+//                                      the in-process path via
+//                                      _functor_invoke_call)
+//   FIO_ERR_SPAWN          = 0x0C43  (task_new OOM, aspace_clone_cow
+//                                      OOM, or any other spawn-step
+//                                      failure; the caller cannot
+//                                      distinguish between EAGAIN and
+//                                      ENOMEM at the OOP boundary --
+//                                      a follow-up may fan this out)
+//   FIO_ERR_ARGV_TOO_BIG   = 0x0C44  (argc == 0 OR total marshalled
+//                                      bytes > FIO_ARGV_BUF_SIZE)
+//
+// All four fit imm32 (zero-extend to u64 via the `mov rax, imm32`
+// 7-byte emit, same posture as functor_invoke.pdx §3 and
+// cmd_registry_parser.pdx §2). The packed return of spawn uses the
+// low 32 bits for errno and the high 32 bits for the child pid; on
+// error, pid is zero so the whole u64 is just the errno.
+//
+// =============================================================================
+// SECTION 5  ENCODER DISCIPLINE
+// =============================================================================
+//
+// paideia-as encoder posture (feedback_pdx_encoder_pitfalls):
+//   * `cmp reg, 0` for every zero-check (never `test rN, rN`).
+//   * `and` of a register against another register staged via
+//     r10/r11; never `and r11, imm64`.
+//   * No 2-op `imul r, imm` -- argv stride-4 uses `shl 2`.
+//   * No `cmp reg, [mem]` -- every memory operand lands in a register.
+//   * Reserved-label prefix `fio_` (short for functor_invoke_oop)
+//     avoids `loop`/`if`/`top`/`done` collisions per
+//     feedback_paideia_as_reserved_labels. Inner labels carry a
+//     second-level prefix: fio_sp_ spawn, fio_wa_ wait, fio_mg_
+//     marshal, fio_sr_ shadow-reset, fio_cl_ child-landing, fio_si_
+//     set-isolate, fio_cq_ check-isolated.
+//   * Module basename `FunctorInvokeOop` matches the file basename
+//     `functor_invoke_oop.pdx`.
+//   * All `pub let` string / byte-array declarations are single-line.
+//   * Fingerprint tag `[u8; N]` byte-array literals have N = string
+//     length + 1 (the trailing NUL counts).
+//   * Entry rsp%16==8; every nested-call site lands rsp%16==0 after
+//     prologue + alignment pad.
+//
+// klog_s1_x1 convention: key in rcx, value in r8; no stack arg.
+// klog_s1_x2 convention: k1 rcx, v1 r8, k2 r9, v2 at caller
+// `[rsp+0]` after `sub rsp,16`. SPAWN and WAIT fingerprints use
+// klog_s1_x2; ARGV MARSHAL overflow uses klog_s1_x1.
+
+module FunctorInvokeOop = structure {
+
+  // ==========================================================================
+  // SECTION 6  CONSTANTS
+  // ==========================================================================
+
+  // Return codes (§4).
+  pub let FIO_OK               : u64 = 0
+  pub let FIO_ERR_NOT_FOUND    : u64 = 0x0C41
+  pub let FIO_ERR_NOT_ISOLATED : u64 = 0x0C42
+  pub let FIO_ERR_SPAWN        : u64 = 0x0C43
+  pub let FIO_ERR_ARGV_TOO_BIG : u64 = 0x0C44
+
+  // Row-pool ceilings mirrored from kind_cmd_module.pdx (local copies
+  // so this module can fold them without pulling KindCmdModule into
+  // every call site; identical posture to functor_invoke.pdx §6).
+  pub let FIO_ROW_MAX  : u64 = 8     // mirrors CM_MODULE_MAX
+  pub let FIO_NAME_MAX : u64 = 64    // mirrors CM_NAME_MAX
+
+  // Substrate-side sentinels.
+  pub let FIO_KCM_ROW_NONE : u64 = 0xFF   // mirrors kind_cmd_module CM_ROW_NONE
+
+  // Flags-word bits on _kcm_table[row+32].
+  pub let FIO_FLAG_LIVE    : u64 = 0x1    // CM_FLAG_LIVE
+  pub let FIO_FLAG_ISOLATE : u64 = 0x2    // UMB-W6 claim
+
+  // Argv-buffer sizing (§3).
+  pub let FIO_ARGV_BUF_SIZE : u64 = 4096
+
+  // Task-slab offsets consumed by fio_oop_child_landing. The slab is
+  // 2224 bytes (278 u64) per sys_fork.pdx; the +1744..+1768 strip is
+  // unclaimed (grep audit 2026-10-11: TASK_OFF_* in [1744,2200)
+  // returned 0 results). sys_fork_body's TASK_OFF_LANDING_RA at +2216
+  // remains the landing-RA slot both landings consume.
+  pub let TASK_OFF_FIO_FUNCTOR_VA : u64 = 1744
+  pub let TASK_OFF_FIO_ARGV_PTR   : u64 = 1752
+  pub let TASK_OFF_FIO_ARGC       : u64 = 1760
+  pub let TASK_OFF_LANDING_RA     : u64 = 2216
+
+  // Mirror the sched_switch_r15 continuation offsets (regs_save).
+  pub let TASK_OFF_REGS_RSP    : u64 = 32
+  pub let TASK_OFF_REGS_RIP    : u64 = 40
+  pub let TASK_OFF_REGS_RFLAGS : u64 = 48
+  pub let TASK_OFF_STATE       : u64 = 8
+  pub let TASK_OFF_PID         : u64 = 0
+
+  // Fresh-child rflags (IF=0 for the popfq/ret window, same as
+  // sys_fork_body's FRESH_CHILD_RFLAGS).
+  pub let FIO_FRESH_RFLAGS : u64 = 0x2
+
+  // State constants.
+  pub let FIO_STATE_RUNNABLE : u32 = 1
+
+  // Observability counters.
+  pub let mut _fio_stats : [u64; 8] = uninit @align(64)
+
+  pub let FIO_ST_SPAWN_OK      : u64 = 0
+  pub let FIO_ST_SPAWN_NF      : u64 = 1    // name not found
+  pub let FIO_ST_SPAWN_NI      : u64 = 2    // not isolated
+  pub let FIO_ST_SPAWN_FAIL    : u64 = 3    // task_new / clone_cow OOM
+  pub let FIO_ST_SPAWN_ARGV    : u64 = 4    // argv too big
+  pub let FIO_ST_WAIT_OK       : u64 = 5
+  pub let FIO_ST_WAIT_NONE     : u64 = 6
+  pub let FIO_ST_SETISO_OK     : u64 = 7
+
+  // Argv marshalling scratch (§3). Kernel-mapped in the high half of
+  // every pml4, so both parent and child observe the same bytes
+  // without an explicit COW split.
+  pub let mut _fio_argv_scratch : [u8; 4096] = uninit @align(64)
+
+  // Fingerprint tags + keys. Byte counts NUL-inclusive.
+  pub let fio_tag_spawn   : [u8; 14] = "FUNCTOR SPAWN\0"
+  pub let fio_tag_wait    : [u8; 13] = "FUNCTOR WAIT\0"
+  pub let fio_tag_marshal : [u8; 13] = "ARGV MARSHAL\0"
+  pub let fio_tag_isolate : [u8; 15] = "FUNCTOR ISOLATE\0"
+
+  pub let fio_k_pid    : [u8; 4]  = "pid\0"
+  pub let fio_k_errno  : [u8; 6]  = "errno\0"
+  pub let fio_k_bytes  : [u8; 6]  = "bytes\0"
+  pub let fio_k_rowid  : [u8; 6]  = "rowid\0"
+  pub let fio_k_status : [u8; 7]  = "status\0"
+
+  // ==========================================================================
+  // SECTION 7  fio_shadow_reset() -> ()
+  //
+  // Defensive clear of _fio_stats + _fio_argv_scratch. .bss already
+  // zero at real boot; this call matches the kcm_table_reset /
+  // fi_shadow_reset precedent one-for-one. Called adjacent to those
+  // from kernel_main's derived-kind reset cascade.
+  // ==========================================================================
+  pub let fio_shadow_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "UMB-W6 R123.M4 (#2588): clear every _fio_stats u64 (8 words) and every _fio_argv_scratch byte (4096 words via 512 u64 strides). Boot + teardown only. .bss already zero at real boot; this is defensive (matches kcm_table_reset + fi_shadow_reset one-for-one). Labels prefixed fio_sr_.",
+      block: {
+        lea r10, [rip + _fio_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      fio_sr_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  fio_sr_stats;
+
+        // argv scratch: 4096 bytes = 512 u64 strides.
+        lea r10, [rip + _fio_argv_scratch];
+        xor rcx, rcx;
+      fio_sr_argv:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 512;
+        jb  fio_sr_argv;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 8  fio_note(slot) -- bounded stats increment.
+  //
+  // Byte-identical to kcm_note / fi_note / cr_note. Caller passes slot
+  // ordinal (FIO_ST_*). Load-inc-store idiom (no `add reg, [mem]`).
+  // ==========================================================================
+  pub let fio_note : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "UMB-W6 R123.M4 (#2588): bump _fio_stats[slot] by 1. Slot ordinals in {0..7} per FIO_ST_* enumeration. Pure leaf, bounds-checked. Labels prefixed fio_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae fio_nt_out;
+        lea r10, [rip + _fio_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      fio_nt_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 9  _functor_invoke_oop_set_isolate(row_id) -> u64
+  //
+  // Set CM_FLAG_ISOLATE (0x2) on a KIND_CMD_MODULE row's flags word.
+  // Idempotent; bounds-checked. The caller is cmd_registry_parser.pdx
+  // (follow-up slice) OR a direct kernel-boot binding. The LIVE bit
+  // must already be set (otherwise the row is EMPTY and setting bits
+  // on it is a bug the parser follow-up has already filtered out via
+  // its cmd_module_open return check).
+  //
+  // Returns FIO_OK on success, FIO_ERR_NOT_FOUND if row_id is out of
+  // range OR the row's LIVE bit is clear.
+  //
+  // Register plan: single-push prologue (rbx = row_id). Entry
+  // rsp%16==8 + 8 = 16, which already aligns at nested-call sites.
+  // ==========================================================================
+  pub let _functor_invoke_oop_set_isolate : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "UMB-W6 R123.M4 (#2588): mark a KIND_CMD_MODULE row as isolate-dispatched. Gate: row_id<FIO_ROW_MAX=8; row's flags word (word 5 at [+32]) must have CM_FLAG_LIVE (0x1) set, else FIO_ERR_NOT_FOUND. Operation: read flags, OR in CM_FLAG_ISOLATE (0x2), store back. NOT publish-last -- LIVE is already published; the OR is observed atomically within one 8-byte aligned store. Emits `FUNCTOR ISOLATE rowid=0x<n>` via klog_s1_x1. Register plan: one callee-save push (rbx=row_id); entry rsp%16==8 + 8 = 0; klog_s1_x1 and kcm_row_base both callee-save clean. Labels prefixed fio_si_.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                    // rbx = row_id
+
+        // Bounds.
+        mov r10, 8;                      // FIO_ROW_MAX
+        cmp rbx, r10;
+        jae fio_si_bad;
+
+        // Resolve row base via kcm_row_base.
+        mov rdi, rbx;
+        call kcm_row_base;               // rax = &row
+        cmp rax, 0;
+        je  fio_si_bad;
+
+        // Load flags; require LIVE.
+        mov r10, [rax + 32];             // flags
+        mov r11, 1;                      // CM_FLAG_LIVE
+        and r10, r11;                    // keep bit 0 only (register-register)
+        cmp r10, 0;
+        je  fio_si_bad;
+
+        // Read-modify-write OR in ISOLATE bit.
+        mov r10, [rax + 32];             // flags (full word)
+        mov r11, 2;                      // CM_FLAG_ISOLATE
+        or  r10, r11;
+        mov [rax + 32], r10;             // store back
+
+        // Fingerprint.
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + fio_tag_isolate];
+        lea rcx, [rip + fio_k_rowid];
+        mov r8,  rbx;                    // v1 = row_id
+        call klog_s1_x1;
+
+        mov rdi, 7;                      // FIO_ST_SETISO_OK
+        call fio_note;
+
+        xor rax, rax;                    // FIO_OK
+        jmp fio_si_out;
+
+      fio_si_bad:
+        mov rax, 0x0C41;                 // FIO_ERR_NOT_FOUND
+
+      fio_si_out:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 10  _functor_invoke_oop_is_isolated(row_id) -> u64
+  //
+  // Query the isolate bit. Returns 1 if the row is live AND isolate,
+  // 0 otherwise. Shell-dispatch wiring uses this to pick between the
+  // in-process (M3) and out-of-process (M4) arm.
+  //
+  // Inlines the row-base computation (bounds + stride-48 multiply +
+  // table-address add) so this function is a pure leaf with no
+  // nested calls; keeps rsp%16==8 at entry straight through to ret,
+  // matching the SysV discipline for leaf accessors.
+  // ==========================================================================
+  pub let _functor_invoke_oop_is_isolated : (u64) -> u64 !{mem} @{} =
+    fn (row_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "UMB-W6 R123.M4 (#2588): return 1 iff row_id<FIO_ROW_MAX(8), row is LIVE, and ISOLATE bit (0x2) is set. Pure leaf (inlines row_base so no nested calls; keeps rsp%16==8 straight through), no fingerprint. Labels prefixed fio_cq_.",
+      block: {
+        mov r10, 8;                      // FIO_ROW_MAX
+        cmp rdi, r10;
+        jae fio_cq_zero;
+
+        // Inline row-base: rax = &_kcm_table[row_id * 48].
+        mov rax, rdi;
+        mov r11, 48;
+        imul rax, r11;
+        lea r10, [rip + _kcm_table];
+        add rax, r10;
+
+        mov r10, [rax + 32];             // flags
+        mov r11, 3;                      // LIVE | ISOLATE
+        and r10, r11;                    // register-register and
+        mov r11, 3;                      // keep as comparison target
+        cmp r10, r11;
+        jne fio_cq_zero;
+
+        mov rax, 1;
+        ret
+
+      fio_cq_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 11  fio_marshal_argv(src_argv_ptr, argc) -> packed u64
+  //
+  // Walk a flat (ptr, len) tuple list and emit the packed buffer
+  // described in §3 into _fio_argv_scratch. Returns:
+  //   high 32 bits = total_bytes on success, 0 on overflow
+  //   low  32 bits = 0 on success, FIO_ERR_ARGV_TOO_BIG on overflow
+  //
+  // Input shape: src_argv_ptr -> [ ptr0, len0, ptr1, len1, ... ] with
+  // 2*argc u64 entries. The shell (follow-up) owns constructing this.
+  //
+  // At M4 we accept argc >= 1 only; argc == 0 collapses into the
+  // overflow arm (same semantic -- "not a legitimate invocation shape").
+  //
+  // Register plan: five callee-save pushes (rbx = src_argv_ptr, r12 =
+  // argc, r13 = i (per-arg loop index), r14 = cursor (byte offset in
+  // _fio_argv_scratch), r15 = tmp). Entry rsp%16==8 + 40 = 48 ->
+  // %16==0 at nested calls.
+  //
+  // Nested calls: fio_note. mem_copy_bytes is NOT called -- a direct
+  // byte-copy loop stays here to keep the scratch write path a single
+  // auditable region.
+  // ==========================================================================
+  pub let fio_marshal_argv : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (src_argv_ptr: u64) (argc: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "UMB-W6 R123.M4 (#2588): marshal (src_argv_ptr, argc) into _fio_argv_scratch per the §3 packed format. Pipeline: (1) argc==0 -> overflow arm; (2) compute header bytes = 8 + 4*argc; refuse if > FIO_ARGV_BUF_SIZE; (3) sum per-arg (len+1) bytes with a running cursor; refuse if cursor > FIO_ARGV_BUF_SIZE; (4) write u32 argc at +0, u32 total_bytes at +4, u32 offsets[i] at +8+4*i; (5) copy each arg's bytes into _fio_argv_scratch at offsets[i], append a NUL byte. Returns (total_bytes << 32) | 0 on success or (0 << 32) | FIO_ERR_ARGV_TOO_BIG on overflow. Five callee-save pushes (rbx=src, r12=argc, r13=i, r14=cursor, r15=tmp) leave rsp%16==0 at nested fio_note calls (entry 8 + 40 = 48, %16==0). Byte copy is a direct 1-byte-at-a-time loop using mov_b with xor r10,r10 preceding each load (encoder does not zero-extend 8-bit loads on its own). Labels prefixed fio_mg_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // src_argv_ptr
+        mov r12, rsi;                    // argc
+
+        // (1) argc > 0.
+        cmp r12, 0;
+        je  fio_mg_overflow;
+
+        // (2) Header size = 8 + 4*argc. Encoder: no 2-op imul, use shl.
+        mov r14, r12;                    // r14 = argc
+        shl r14, 2;                      // r14 = 4*argc
+        add r14, 8;                      // r14 = cursor = header bytes
+
+        mov r10, 4096;                   // FIO_ARGV_BUF_SIZE
+        cmp r14, r10;
+        ja  fio_mg_overflow;
+
+        // (3) Compute total bytes by walking the per-arg lens.
+        //     src layout: [ptr0, len0, ptr1, len1, ...]; each entry
+        //     is 16 bytes (2 u64). We don't commit the offsets yet;
+        //     we need them to WRITE in the header before copying.
+        //
+        // Strategy: two-pass.
+        //   Pass A: walk src, compute cursor_i for each i, store
+        //           cursor_i into offsets[i] IN _fio_argv_scratch
+        //           (overwrites nothing live yet). Final r14 =
+        //           total_bytes.
+        //   Pass B: for each i, copy argv[i] bytes to offsets[i].
+
+        lea r11, [rip + _fio_argv_scratch];
+        xor r13, r13;                    // i = 0
+      fio_mg_pass_a:
+        cmp r13, r12;
+        jae fio_mg_pass_a_done;
+
+        // offsets[i] := current cursor (r14).
+        //   addr = &_fio_argv_scratch + 8 + 4*i
+        mov r10, r13;
+        shl r10, 2;                      // r10 = 4*i
+        add r10, 8;                      // r10 = 8 + 4*i
+        mov r15, r11;                    // r15 = &_fio_argv_scratch
+        add r15, r10;                    // r15 = &offsets[i]
+        mov_d [r15], r14;                // 4-byte store (u32 encode)
+
+        // Advance cursor by len_i + 1.
+        //   len_i at src + 16*i + 8
+        mov r10, r13;
+        shl r10, 4;                      // r10 = 16*i
+        mov r15, rbx;
+        add r15, r10;                    // r15 = &src[i]
+        mov r10, [r15 + 8];              // r10 = len_i
+        add r14, r10;
+        add r14, 1;                      // + NUL
+
+        // Overflow gate.
+        mov r10, 4096;                   // FIO_ARGV_BUF_SIZE
+        cmp r14, r10;
+        ja  fio_mg_overflow;
+
+        add r13, 1;
+        jmp fio_mg_pass_a;
+      fio_mg_pass_a_done:
+
+        // Write header: argc at +0, total_bytes at +4.
+        mov_d [r11], r12;                // u32 argc (32-bit encode)
+        mov r10, r11;
+        add r10, 4;
+        mov_d [r10], r14;                // u32 total_bytes (32-bit encode)
+
+        // Pass B: byte-copy each argv[i] into the scratch at its
+        // offset. For each i:
+        //   dst = &_fio_argv_scratch + offsets[i]
+        //   src = argv[i].ptr
+        //   len = argv[i].len
+        //   copy len bytes, then append NUL.
+        xor r13, r13;                    // i = 0
+      fio_mg_pass_b:
+        cmp r13, r12;
+        jae fio_mg_pass_b_done;
+
+        // Load offsets[i].
+        mov r10, r13;
+        shl r10, 2;                      // 4*i
+        add r10, 8;                      // 8 + 4*i
+        mov r15, r11;
+        add r15, r10;                    // &offsets[i]
+        xor r10, r10;
+        mov_d r10, [r15];                // u32 offset -> r10 (zero-ext via xor)
+        // r10 = offset in buffer
+
+        // dst = r11 + r10.
+        mov r15, r11;
+        add r15, r10;                    // r15 = dst
+
+        // src = argv[i].ptr, len = argv[i].len
+        mov r10, r13;
+        shl r10, 4;                      // 16*i
+        mov rax, rbx;
+        add rax, r10;                    // rax = &src[i]
+        mov rdi, [rax];                  // rdi = ptr
+        mov rsi, [rax + 8];              // rsi = len
+
+        // Byte-copy loop.
+        xor rcx, rcx;                    // j = 0
+      fio_mg_copy:
+        cmp rcx, rsi;
+        jae fio_mg_copy_done;
+        xor r10, r10;                    // zero-extend (encoder discipline)
+        mov_b r10b, [rdi + rcx*1];
+        mov_b [r15 + rcx*1], r10b;
+        add rcx, 1;
+        jmp fio_mg_copy;
+      fio_mg_copy_done:
+        // Append NUL at r15 + rsi.
+        xor r10, r10;
+        mov_b [r15 + rsi*1], r10b;
+
+        add r13, 1;
+        jmp fio_mg_pass_b;
+      fio_mg_pass_b_done:
+
+        // Success: pack (total_bytes << 32) | 0.
+        mov rax, r14;
+        shl rax, 32;
+        jmp fio_mg_out;
+
+      fio_mg_overflow:
+        mov rdi, 4;                      // FIO_ST_SPAWN_ARGV
+        call fio_note;
+        mov rax, 0x0C44;                 // FIO_ERR_ARGV_TOO_BIG
+
+      fio_mg_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 12  fio_oop_child_landing() -- ring-0 trampoline
+  //
+  // The child's regs_save.rip points at sched_switch_r15_continuation
+  // (uniform convention) and the top-of-slab return-address slot
+  // (+2216) is pre-placed with the address of THIS function. On the
+  // child's first schedule, continuation's final `ret` pops this
+  // address and transfers control here.
+  //
+  // At entry:
+  //   * We are in the child's aspace (cr3 switched by sched_switch_r15).
+  //   * rsp is at [child_slab + 2208] after continuation's popfq (the
+  //     popfq consumed the top qword). Interrupts are disabled (IF=0
+  //     from FIO_FRESH_RFLAGS).
+  //   * _current_tcb points at the child's slab (sched_switch_r15
+  //     publishes it before the swap).
+  //
+  // We must:
+  //   (1) Load (functor_va, argv_ptr, argc) from the child's slab via
+  //       _current_tcb. The three fields were pre-populated by
+  //       fio_spawn_task.
+  //   (2) Set rdi = argv_ptr, rsi = argc (SysV).
+  //   (3) `call rax` where rax = functor_va. The functor runs on the
+  //       child's own kernel stack (now that we're ring-0 kernel).
+  //   (4) When the functor returns, its i64 return in rax is the
+  //       exit code. Call sys_exit_body(_current_tcb, exit_code).
+  //       sys_exit_body never returns -- it drains into
+  //       sched_pick_next_r15 -> sched_switch_r15.
+  //
+  // This function has NO caller-side ABI because it's never called
+  // conventionally: it's a scheduled-into entry point. No prologue /
+  // epilogue -- we're setting up the SysV call to the functor and
+  // then tail-calling sys_exit_body.
+  //
+  // sti is NOT re-enabled here because sys_exit_body / sched_switch_
+  // r15 flip IF via the next task's rflags; see sys_fork_child_landing
+  // for the mirror discipline.
+  // ==========================================================================
+  pub let fio_oop_child_landing : () -> () !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "UMB-W6 R123.M4 (#2588): ring-0 trampoline the child runs on its first schedule after fio_spawn_task materialised it. (1) Load _current_tcb; (2) load functor_va = [current+1744], argv_ptr = [current+1752], argc = [current+1760]; (3) rdi=argv_ptr, rsi=argc; (4) call rax (functor_va). On return, rax = i64 exit code. (5) Load _current_tcb again (functor-return path), rdi = current, rsi = exit code; call sys_exit_body. sys_exit_body never returns -- it marks the child ZOMBIE, wakes any waiter_parent, runq_dequeue, pick_next, switch_r15. This landing therefore has no epilogue. Capabilities widened to {cap, sched} because sys_exit_body transitively requires both (R15-M6-006 + R31.M0-1583 driver_death_notify). Entry rsp invariant: continuation's popfq consumed [child_slab+2208] of the stack and `ret` consumed [child_slab+2216]; our rsp now points at [child_slab+2208] with 8 bytes of in-slab stack room. The call to the functor pushes a return address (filling [child_slab+2200]); the functor is responsible for its own stack usage within the slab-tail region. In practice functors are very shallow at M4 (echo-shaped; the follow-up slice adds a per-child kernel-stack hand-off that moves rsp onto _task_kernel_stacks[pid] before the functor call). Labels prefixed fio_cl_.",
+      block: {
+        // (1) Load current.
+        mov r11, [rip + _current_tcb];
+
+        // (2) Load triplet.
+        mov rax, [r11 + 1744];           // functor_va
+        mov rdi, [r11 + 1752];           // argv_ptr (SysV arg 1)
+        mov rsi, [r11 + 1760];           // argc     (SysV arg 2)
+
+        // (3) Call functor via register.
+        call rax;
+                                         // rax = functor's i64 return
+        // (4) Exit with that code. sys_exit_body never returns.
+        mov r11, [rip + _current_tcb];
+        mov rdi, r11;                    // arg 1 = current
+        mov rsi, rax;                    // arg 2 = exit_code
+        call sys_exit_body;
+        // UNREACHABLE. A debugger-trap or hlt would belong here if
+        // we wanted to catch a sys_exit_body regression; for now the
+        // fall-through is a bare ret that will fault on the garbage
+        // RA (surfaces as #UD / #PF, which the kernel's trap handlers
+        // print loudly).
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 13  fio_spawn_task(parent, functor_va, argv_scratch_va,
+  //                             argc) -> packed u64
+  //
+  // Mirror of sys_fork_body's phases 1..4.8 with the landing swapped
+  // from sys_fork_child_landing to fio_oop_child_landing. Returns
+  // (child_pid << 32) | 0 on success or (0 << 32) | FIO_ERR_SPAWN on
+  // failure (OOM at any step).
+  //
+  // Steps:
+  //   (1) task_new(parent) -> child slab or 0.
+  //   (2) aspace_clone_cow(parent_pml4, child_pml4) -> 0 or 0xFFFFFFFF.
+  //   (3) fd_table copy loop (32 qwords from parent -> child).
+  //   (4) fd_inherit_hold(child) to refcount each inherited vnode.
+  //   (5) Materialize child's regs_save:
+  //       * regs_save.rip = &sched_switch_r15_continuation
+  //       * regs_save.rflags = FIO_FRESH_RFLAGS (0x2)
+  //       * [child+2216] = &fio_oop_child_landing
+  //       * regs_save.rsp = child + 2216
+  //   (6) Install triplet at child slab offsets (1744/1752/1760).
+  //   (7) child.state = STATE_RUNNABLE; runq_enqueue(child).
+  //   (8) Return pid.
+  //
+  // Failure rollback:
+  //   * task_new OOM: return SPAWN errno.
+  //   * clone_cow OOM: aspace_teardown(child_pml4) + pid_free(child_pid)
+  //                    + return SPAWN errno.
+  //
+  // Register plan: five callee-save pushes (rbx=parent, r12=child,
+  // r13=functor_va, r14=argv_ptr, r15=argc). Entry rsp%16==8 + 40 =
+  // 48, %16==0 at every nested call site. No separate alignment pad.
+  // ==========================================================================
+  pub let fio_spawn_task : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{sched} =
+    fn (parent: u64) (functor_va: u64) (argv_scratch_va: u64) (argc: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched},
+      justification: "UMB-W6 R123.M4 (#2588): mirror sys_fork_body with fio_oop_child_landing as the landing. Steps (1) task_new(rbx=parent) -> r12=child or 0; (2) aspace_clone_cow(parent_pml4=[rbx+16], child_pml4=[r12+16]) -> 0 or sentinel; (3) fd_table copy 32 qwords from [rbx+168+8*k] to [r12+168+8*k]; (4) fd_inherit_hold(r12); (5) materialize regs_save ([r12+40]=&sched_switch_r15_continuation, [r12+48]=0x2, [r12+2216]=&fio_oop_child_landing, [r12+32]=r12+2216); (6) install triplet ([r12+1744]=r13, [r12+1752]=r14, [r12+1760]=r15); (7) [r12+8]=STATE_RUNNABLE(u32), runq_enqueue(r12); (8) return (pid<<32)|0 where pid=u32 at [r12+0]. Rollback: task_new OOM -> SPAWN errno; clone_cow OOM -> aspace_teardown([r12+16]) + pid_free([r12+0]) + SPAWN errno. Five callee-save pushes (rbx=parent, r12=child, r13=functor_va, r14=argv_ptr, r15=argc); entry %16==8 + 40 = %16==0. Labels prefixed fio_sp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // parent
+        mov r13, rsi;                    // functor_va
+        mov r14, rdx;                    // argv_ptr
+        mov r15, rcx;                    // argc
+
+        // (1) task_new(parent).
+        mov rdi, rbx;
+        call task_new;
+        cmp rax, 0;
+        je  fio_sp_fail_new;
+        mov r12, rax;                    // child
+
+        // (2) aspace_clone_cow.
+        mov rdi, [rbx + 16];             // parent user_pml4_va
+        mov rsi, [r12 + 16];             // child  user_pml4_va
+        call aspace_clone_cow;
+        cmp rax, 0;
+        jne fio_sp_fail_clone;
+
+        // (3) fd_table copy.
+        xor rcx, rcx;
+      fio_sp_fd_loop:
+        cmp rcx, 32;
+        jae fio_sp_fd_done;
+        mov rax, [rbx + rcx*8 + 168];
+        mov [r12 + rcx*8 + 168], rax;
+        add rcx, 1;
+        jmp fio_sp_fd_loop;
+      fio_sp_fd_done:
+
+        // (4) fd_inherit_hold.
+        mov rdi, r12;
+        call fd_inherit_hold;
+
+        // (5) Materialize regs_save.
+        //  (a) rip = &sched_switch_r15_continuation
+        lea rcx, [rip + sched_switch_r15_continuation];
+        mov [r12 + 40], rcx;
+
+        //  (b) rflags = 0x2 (IF=0 window).
+        mov rcx, 2;
+        mov [r12 + 48], rcx;
+
+        //  (c) landing RA at [+2216] = &fio_oop_child_landing.
+        lea rcx, [rip + fio_oop_child_landing];
+        mov [r12 + 2216], rcx;
+
+        //  (d) rsp = r12 + 2216.
+        mov rcx, r12;
+        add rcx, 2216;
+        mov [r12 + 32], rcx;
+
+        // (6) Install triplet.
+        mov [r12 + 1744], r13;           // functor_va
+        mov [r12 + 1752], r14;           // argv_ptr
+        mov [r12 + 1760], r15;           // argc
+
+        // (7) state = RUNNABLE; enqueue.
+        mov ecx, 1;                      // STATE_RUNNABLE (u32)
+        mov [r12 + 8], ecx;
+
+        mov rdi, r12;
+        call runq_enqueue;
+
+        // (8) Pack return: (pid << 32) | 0.
+        xor rax, rax;
+        mov eax, [r12 + 0];              // u32 pid, zero-extended
+        shl rax, 32;
+        jmp fio_sp_out;
+
+      fio_sp_fail_clone:
+        // Teardown new aspace + pid_free.
+        mov rdi, [r12 + 16];
+        call aspace_teardown;
+        mov edi, [r12 + 0];
+        call pid_free;
+        mov rax, 0x0C43;                 // FIO_ERR_SPAWN
+        jmp fio_sp_out;
+
+      fio_sp_fail_new:
+        mov rax, 0x0C43;                 // FIO_ERR_SPAWN
+
+      fio_sp_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 14  _functor_invoke_oop_spawn(name_ptr, name_len,
+  //                                        argv_ptr, argc) -> packed u64
+  //
+  // Public API primitive #1. Pipeline:
+  //
+  //   (1) Validate name shape: name_ptr != 0, 0 < name_len <= 64.
+  //       Bad shape -> FIO_ERR_NOT_FOUND (we fold shape+miss into
+  //       the same code at the OOP boundary; the in-process ABI's
+  //       lookup already distinguishes, and a caller that cares
+  //       does `_functor_invoke_lookup` first).
+  //   (2) kcm_name_hash + kcm_find_hash -> row_id or 0xFF.
+  //       Miss -> FIO_ERR_NOT_FOUND.
+  //   (3) Read row's flags word; require LIVE AND ISOLATE both set.
+  //       Live-but-not-isolate -> FIO_ERR_NOT_ISOLATED (caller should
+  //       take the in-process path).
+  //   (4) Read functor_va from _fi_entry_va[row_id] via the M3
+  //       shadow. Zero -> FIO_ERR_NOT_FOUND (bind has not run).
+  //   (5) fio_marshal_argv(argv_ptr, argc). Overflow -> FIO_ERR_
+  //       ARGV_TOO_BIG. Success -> argv_scratch_va = _fio_argv_scratch
+  //       (the buffer is kernel-global; the base address is the same
+  //       for both parent and child via the high-half kernel mapping).
+  //   (6) fio_spawn_task(_current_tcb, functor_va, _fio_argv_scratch,
+  //       argc). SPAWN errno surfaces verbatim.
+  //   (7) Emit `FUNCTOR SPAWN pid=<p> errno=<e>` via klog_s1_x2.
+  //   (8) Return (child_pid << 32) | 0 or (0 << 32) | errno.
+  //
+  // Register plan: six callee-save pushes (rbx=name_ptr, r12=name_len,
+  // r13=argv_ptr stash, r14=argc stash, r15=row_id/functor_va). Entry
+  // rsp%16==8 + 48 = 56, so one sub rsp,8 alignment pad lands rsp%16=0.
+  // klog_s1_x2 caller frame uses sub rsp,16 (v2 at [rsp+0]).
+  // ==========================================================================
+  pub let _functor_invoke_oop_spawn : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{sched} =
+    fn (name_ptr: u64) (name_len: u64) (argv_ptr: u64) (argc: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched},
+      justification: "UMB-W6 R123.M4 (#2588): public spawn primitive. Pipeline: (1) shape gate (name_ptr!=0 AND 1<=name_len<=64); bad -> NOT_FOUND; (2) kcm_name_hash + kcm_find_hash -> row_id or 0xFF (miss -> NOT_FOUND); (3) flags & (LIVE|ISOLATE) == both -> continue; LIVE-only -> NOT_ISOLATED; (4) _fi_entry_va[row_id] -> functor_va; 0 -> NOT_FOUND; (5) fio_marshal_argv -> packed (bytes<<32)|errno; errno nonzero -> propagate (ARGV_TOO_BIG); (6) fio_spawn_task(_current_tcb, functor_va, &_fio_argv_scratch, argc) -> packed (pid<<32)|errno; errno nonzero -> propagate (SPAWN); (7) emit klog_s1_x2 fingerprint; (8) return (pid<<32)|0 on success or (0<<32)|errno on failure. Six callee-save pushes + sub rsp,8 land rsp%16==0 at every nested call site (entry 8 + 48 + 8 = %16==0). klog_s1_x2 adds sub rsp,16 (v2 at [rsp+0]). Effects/caps widened for the fingerprint emit + spawn-task's sched capability. Labels prefixed fio_sp_x_ (where _x_ demarks the public API vs the internal fio_sp_ helper above).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub  rsp, 8;
+
+        mov rbx, rdi;                    // name_ptr
+        mov r12, rsi;                    // name_len
+        mov r13, rdx;                    // argv_ptr
+        mov r14, rcx;                    // argc
+
+        // (1) Shape gate.
+        cmp rbx, 0;
+        je  fio_sp_x_notfound;
+        cmp r12, 0;
+        je  fio_sp_x_notfound;
+        mov r10, 64;                     // FIO_NAME_MAX
+        cmp r12, r10;
+        ja  fio_sp_x_notfound;
+
+        // (2) Hash + find.
+        mov rdi, rbx;
+        mov rsi, r12;
+        call kcm_name_hash;
+
+        mov rdi, rax;
+        call kcm_find_hash;
+        mov r10, 0xFF;                   // FIO_KCM_ROW_NONE
+        cmp rax, r10;
+        je  fio_sp_x_notfound;
+        mov r15, rax;                    // r15 = row_id
+
+        // (3) Flags: require LIVE AND ISOLATE.
+        mov rdi, r15;
+        call kcm_row_base;               // rax = &row
+        cmp rax, 0;
+        je  fio_sp_x_notfound;
+
+        mov r10, [rax + 32];             // flags
+        mov r11, 3;                      // LIVE | ISOLATE
+        and r10, r11;
+        mov r11, 3;
+        cmp r10, r11;
+        jne fio_sp_x_notiso_check;
+
+        // (4) functor_va from M3 shadow.
+        lea r10, [rip + _fi_entry_va];
+        mov r15, [r10 + r15 * 8];        // r15 = functor_va (overwrite row_id)
+        cmp r15, 0;
+        je  fio_sp_x_notfound;
+
+        // (5) Marshal argv.
+        mov rdi, r13;                    // argv_ptr
+        mov rsi, r14;                    // argc
+        call fio_marshal_argv;
+        // rax = (total_bytes << 32) | errno
+        mov r10, rax;
+        mov r11, 0xFFFFFFFF;             // low-32 mask (fits imm32)
+        and r10, r11;                    // low 32 = errno
+        cmp r10, 0;
+        jne fio_sp_x_argv_bad;
+
+        // (6) fio_spawn_task(current, functor_va, &_fio_argv_scratch, argc).
+        mov rdi, [rip + _current_tcb];
+        mov rsi, r15;                    // functor_va
+        lea rdx, [rip + _fio_argv_scratch];
+        mov rcx, r14;                    // argc
+        call fio_spawn_task;
+        // rax = (pid << 32) | errno
+        mov r10, rax;
+        mov r11, 0xFFFFFFFF;
+        and r10, r11;
+        cmp r10, 0;
+        jne fio_sp_x_spawn_fail;
+
+        // Success. Stash return in rbp so we can emit fingerprint
+        // without clobbering it (klog_s1_x2 trashes rsi/rdx/rcx but
+        // SysV preserves rbp).
+        mov rbp, rax;
+
+        // (7) Fingerprint: `FUNCTOR SPAWN pid=0x<pid> errno=0x0`.
+        //     v1 = pid, v2 = errno. We derived pid from rbp>>32.
+        mov r10, rbp;
+        shr r10, 32;                     // pid
+
+        sub rsp, 16;
+        xor r11, r11;
+        mov [rsp + 0], r11;              // v2 = errno = 0
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + fio_tag_spawn];
+        lea rcx, [rip + fio_k_pid];
+        mov r8,  r10;                    // v1 = pid
+        lea r9,  [rip + fio_k_errno];
+        call klog_s1_x2;
+        add rsp, 16;
+
+        mov rdi, 0;                      // FIO_ST_SPAWN_OK
+        call fio_note;
+
+        mov rax, rbp;                    // packed success
+        jmp fio_sp_x_out;
+
+      fio_sp_x_notiso_check:
+        // Distinguish NOT_ISOLATED from NOT_FOUND: if LIVE bit set
+        // but ISOLATE clear, surface NOT_ISOLATED.
+        mov r10, [rax + 32];             // flags
+        mov r11, 1;                      // LIVE
+        and r10, r11;
+        cmp r10, 0;
+        je  fio_sp_x_notfound;           // not even LIVE
+        mov rdi, 2;                      // FIO_ST_SPAWN_NI
+        call fio_note;
+        mov rax, 0x0C42;                 // FIO_ERR_NOT_ISOLATED
+        jmp fio_sp_x_out;
+
+      fio_sp_x_argv_bad:
+        mov rdi, 4;                      // FIO_ST_SPAWN_ARGV
+        call fio_note;
+        mov rax, 0x0C44;                 // FIO_ERR_ARGV_TOO_BIG
+        jmp fio_sp_x_out;
+
+      fio_sp_x_spawn_fail:
+        mov rdi, 3;                      // FIO_ST_SPAWN_FAIL
+        call fio_note;
+        mov rax, 0x0C43;                 // FIO_ERR_SPAWN
+        jmp fio_sp_x_out;
+
+      fio_sp_x_notfound:
+        mov rdi, 1;                      // FIO_ST_SPAWN_NF
+        call fio_note;
+        mov rax, 0x0C41;                 // FIO_ERR_NOT_FOUND
+
+      fio_sp_x_out:
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 15  _functor_invoke_oop_wait(child_pid) -> i64
+  //
+  // Public API primitive #2. Drains the next zombie child via
+  // sys_wait_body and returns its exit_status. At M4 we do NOT yet
+  // filter on the specific child_pid parameter (the follow-up slice
+  // described in §0.d narrows this). The parameter is accepted and
+  // stashed in the fingerprint so a boot witness can diff expected
+  // vs actual.
+  //
+  // Return:
+  //   On success: i64 exit_status (0..255 for the shell-exit-code
+  //               convention; wider values are returned verbatim).
+  //   On no-children: -ECHILD (0xFFFFFFFFFFFFFFF6, sign-extended u64).
+  //   On would-block: -EAGAIN (0xFFFFFFFFFFFFFFF5). The caller is
+  //                   expected to retry; the full blocking sys_wait
+  //                   path requires the dispatch-layer sched_block
+  //                   hook (sys_wait.pdx §D5a) which we don't want
+  //                   to pull into a kernel-side spawn primitive
+  //                   yet. This surfaces as EAGAIN rather than silent
+  //                   wedging.
+  //
+  // Register plan: three callee-save pushes (rbx=child_pid stash,
+  // r12=pid return, r13=status return). Entry rsp%16==8; after 24
+  // bytes of pushes rsp%16==0, aligned for every nested call. The
+  // klog_s1_x2 site reserves 16 bytes of stack room (v2 at [rsp+0])
+  // which preserves alignment.
+  // ==========================================================================
+  pub let _functor_invoke_oop_wait : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (child_pid: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "UMB-W6 R123.M4 (#2588): drain the next zombie child via sys_wait_body(_current_tcb). Returns i64 exit_status on success, -ECHILD (0xF...FF6) if no children, -EAGAIN (0xF...FF5) on would-block. Does NOT yet filter on child_pid -- that is the follow-up slice. Emits `FUNCTOR WAIT pid=0x<p> status=0x<s>` via klog_s1_x2. Three callee-save pushes land rsp%16==0 (entry 8 + 24 = %16==0); klog_s1_x2 adds sub rsp,16 (v2 at [rsp+0]) keeping alignment. sys_wait_body returns {rax=pid|-ECHILD|0, rdx=status} per sys_wait.pdx §D5a; we fold rax==0 (would-block) into -EAGAIN for this leaf wrapper. Labels prefixed fio_wa_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // child_pid stash (unused in body)
+
+        // sys_wait_body(_current_tcb).
+        mov rdi, [rip + _current_tcb];
+        call sys_wait_body;
+        // rax = pid or -ECHILD or 0 (would-block)
+        // rdx = status
+
+        mov r12, rax;
+        mov r13, rdx;
+
+        // Fold would-block -> EAGAIN.
+        cmp r12, 0;
+        jne fio_wa_got;
+        mov r12, 0xFFFFFFFFFFFFFFF5;     // -EAGAIN
+        xor r13, r13;
+        jmp fio_wa_done_bump;
+
+      fio_wa_got:
+        // Check for -ECHILD sentinel.
+        mov r10, 0xFFFFFFFFFFFFFFF6;
+        cmp r12, r10;
+        je  fio_wa_echild;
+        // Regular pid return.
+        mov rdi, 5;                      // FIO_ST_WAIT_OK
+        call fio_note;
+        jmp fio_wa_fingerprint;
+
+      fio_wa_echild:
+        mov rdi, 6;                      // FIO_ST_WAIT_NONE
+        call fio_note;
+        jmp fio_wa_fingerprint;
+
+      fio_wa_done_bump:
+        mov rdi, 6;                      // FIO_ST_WAIT_NONE (fold EAGAIN)
+        call fio_note;
+
+      fio_wa_fingerprint:
+        // Fingerprint: pid in v1, status in v2.
+        sub rsp, 16;
+        mov [rsp + 0], r13;              // v2 = status
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_CAP_];
+        lea rdx, [rip + fio_tag_wait];
+        lea rcx, [rip + fio_k_pid];
+        mov r8,  r12;                    // v1 = pid (or sentinel)
+        lea r9,  [rip + fio_k_status];
+        call klog_s1_x2;
+        add rsp, 16;
+
+        // Return exit_status on success (positive pid), else propagate
+        // the sentinel in r12.
+        mov r10, 0xFFFFFFFFFFFFFFF6;
+        cmp r12, r10;
+        je  fio_wa_return_r12;
+        mov r10, 0xFFFFFFFFFFFFFFF5;
+        cmp r12, r10;
+        je  fio_wa_return_r12;
+        // Positive pid -> return the status.
+        mov rax, r13;
+        jmp fio_wa_out;
+
+      fio_wa_return_r12:
+        mov rax, r12;
+
+      fio_wa_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // SECTION 16  Boot wiring note
+  // --------------------------------------------------------------------------
+  // kernel_main.pdx needs one new call adjacent to kcm_table_reset
+  // and fi_shadow_reset:
+  //
+  //   call fio_shadow_reset;             // defensive zero (M4)
+  //
+  // Zero-arg, allocates nothing on the stack; safe alongside the
+  // live handoff registers. At real boot .bss zero-init already
+  // leaves _fio_stats + _fio_argv_scratch empty, so this is purely
+  // belt-and-braces per the fi_shadow_reset precedent.
+  //
+  // Cross-module caller sites (future landings):
+  //
+  //   - src/kernel/core/shell/shell_dispatch.pdx (follow-up):
+  //     for each resolved command, consult _functor_invoke_oop_
+  //     is_isolated(row_id); on 1 take _functor_invoke_oop_spawn +
+  //     _functor_invoke_oop_wait, on 0 take _functor_invoke_call.
+  //
+  //   - src/kernel/core/shell/cmd_registry_parser.pdx (§0.a follow-up):
+  //     recognise `isolate = true` keys; call _functor_invoke_oop_
+  //     set_isolate(row_id) after cmd_module_open for the matching
+  //     section.
+  //
+  //   - src/kernel/boot/kernel_main.pdx: call fio_shadow_reset once
+  //     adjacent to the derived-kind reset cascade.
+  //
+  // ==========================================================================
+}
