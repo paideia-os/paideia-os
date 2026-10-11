@@ -2,8 +2,8 @@
 
 **Wave:** R131 (semantic shell -- Unicode substrate umbrella,
 paideia-os#2480)
-**Current milestone:** M5 (display width, UAX #11 reduced EAW) -- landed.
-**Version:** 1.4.0.
+**Current milestone:** M6 (bidi runs, UAX #9 reduced five-class) -- landed.
+**Version:** 1.5.0.
 
 See the R131 M-table in the umbrella issue (paideia-os#2480) for the
 upstream wave-level design; this file tracks the per-milestone
@@ -292,7 +292,71 @@ landing checklist as it closes locally.
   a syllable): currently narrow. TR#11 §5 widens L and V to 2
   independently of their syllable role. M5.4 target.
 
-### M6 -- Streaming decoder iterator (planned)
+### M6 -- Bidi runs (paideia-os#2617, landed)
+
+- [x] **M6-001** -- `src/bidi.pdx` scaffold + module `Bidi`, five
+      BIDI_CLASS constants (L=0, R=1, N=2, AN=3, EN=4), three status
+      codes (BIDI_STATUS_OK=0, BIDI_STATUS_OUT_TOO_SMALL=1,
+      BIDI_STATUS_INVALID_UTF8=2), error-band slice
+      0xFFFFE760..0xFFFFE76F (two slots used: `BIDI_INVALID_UTF8` at
+      0xFFFFE760, `BIDI_OUT_TOO_SMALL` at 0xFFFFE761).
+- [x] **M6-002** -- `_bidi_class(cp) -> u64` real body: landed.
+      Straight-line range-dispatch classifier returning 0 (L: ASCII
+      letters, Latin-1 letters U+00C0..00FF, Latin Ext-A/B
+      U+0100..024F), 1 (R: Hebrew U+0590..05FF, Arabic U+0600..06FF
+      except digits, Arabic Pres Forms-A U+FB50..FDFF), 2 (N: default
+      fallback), 3 (AN: Arabic-Indic digits U+0660..0669 and extended
+      U+06F0..06F9, peeled before the generic Arabic R range), 4
+      (EN: ASCII digits U+0030..0039). Pure leaf; no callee-save push.
+- [x] **M6-003** -- `_bidi_runs(bytes_ptr, bytes_len, out_runs_ptr,
+      out_cap) -> packed_u64` real body: landed. Walks input one
+      grapheme cluster at a time via `_gc_next`, classifies first cp
+      of each cluster via `_bidi_class`, aggregates consecutive same-
+      class clusters into monotone runs. 16-byte run entry
+      {byte_start u32 LE, byte_end u32 LE, class u8, pad u8[7]}.
+      Packed return `(runs_emitted << 32) | status` with status in
+      {0=OK, 1=OUT_TOO_SMALL, 2=INVALID_UTF8}. OUT_TOO_SMALL commits
+      partial output (caller resumes from last byte_end); INVALID
+      discards the current open run (invariant: emitted runs end at
+      valid cluster boundaries).
+- [x] **M6-004** -- Fingerprint goldens: `tests/fingerprints/bidi.golden`
+      with 8 TAG lines (BIDI_PURE_LTR, BIDI_PURE_RTL, BIDI_MIXED,
+      BIDI_NUMBER, BIDI_ARABIC_DIGITS, BIDI_NEUTRAL, BIDI_EMPTY,
+      BIDI_SINGLE_L); OUTPUT_HEX encodes concatenated 16-byte run
+      entries (32 nibbles per run).
+- [x] **M6-005** -- Proptest witnesses:
+      `tests/proptest_bidi.pdx` with 3 invariants (coverage, non-empty,
+      monotone class) and umbrella `pb_run_all`; fail codes in the
+      0xFFFFEDCx band.
+- [x] **M6-006** -- Design doc:
+      `design/toolchain/libpdx-unicode-bidi.md`.
+
+**M6 limitations (stubbed; tracked for M6.1+ follow-up tickets):**
+
+- Reduced five-class BIDI_CLASS table only (L, R, N, AN, EN). The full
+  UAX #9 class set has 23 values (AL distinct from R, NSM carved out
+  of Hebrew/Arabic, ES/ET/CS for European number clustering, ON for
+  brackets and math, WS/BN/B/S for whitespace and separators, and the
+  LRE/RLE/PDF explicit embedding set). M6.1 target.
+- AL (Arabic Letter) folded into R. In the full UAX #9 these resolve
+  slightly differently (AL characters inherit paragraph direction when
+  mixed with EN digits); M6.1 splits them.
+- Hebrew cantillation marks and Arabic combining marks classified as
+  R (parent block) rather than NSM (Non-Spacing Mark); works for pure-
+  RTL runs but misclassifies mixed Hebrew-ASCII content with trailing
+  combining marks. M6.1 target.
+- Latin-1 Supplement entire U+00C0..00FF treated as L; in the full UCD
+  U+00D7 (×) and U+00F7 (÷) are class ON (neutral). Minor; M6.1 refines.
+- Paragraph-level resolution (TR#9 §P1): the first-strong-character
+  algorithm determining sot direction is NOT implemented. The caller
+  can approximate by inspecting the first non-N run. M6.2 target.
+- Explicit directional embeddings (LRE / RLE / LRO / RLO / PDF / LRI
+  / RLI / FSI / PDI, TR#9 §3.3.2): treated as N. Rare in terminal
+  input today; M6.3 target.
+- Mirroring pairs (TR#9 §3.4): brackets and paired characters that
+  mirror inside an RTL run. Needs UCD BidiMirroring.txt. M6.4 target.
+
+### M7 -- Streaming decoder iterator (planned)
 
 - [ ] `utf8_decode_iter_begin(src_ptr, src_len) -> handle`
 - [ ] `utf8_decode_iter_next(handle) -> packed | UTF8_* | EOF`
@@ -301,14 +365,14 @@ landing checklist as it closes locally.
       a 24-byte struct `{src_ptr, src_len, pos}` the caller allocates
       and the primitives walk; no cap, no syscall).
 
-### M7 -- UTF-16 bridge (planned)
+### M8 -- UTF-16 bridge (planned)
 
 - [ ] `utf8_offset_to_utf16(src_ptr, src_len, utf8_off) -> utf16_off`
 - [ ] `utf16_offset_to_utf8(src_ptr, src_len, utf16_off) -> utf8_off`
 - [ ] `utf8_offset_to_utf32` / `utf32_offset_to_utf8`
 - [ ] Mirror of the paideia-as-unicode `lsp_bridge` module.
 
-### M8 -- Stream validators (planned)
+### M9 -- Stream validators (planned)
 
 - [ ] `utf8_validate_stream` -- fail-fast whole-buffer validator.
 - [ ] `utf8_validate_stream_recover` -- walks past the first
@@ -371,3 +435,19 @@ directly as a u64 with no error band (the caller has already
 decoded the cp). M5 is additive and preserves every
 M1 + M2 + M3 + M4 symbol unchanged -- v1.4.0 is
 backward-compatible with v1.3.0, v1.2.0, v1.1.0, and v1.0.0.
+
+M6 adds two public bindings (`_bidi_class`, `_bidi_runs`), five
+BIDI_CLASS constants (BIDI_L=0, BIDI_R=1, BIDI_N=2, BIDI_AN=3,
+BIDI_EN=4), the bidi error band 0xFFFFE760..0xFFFFE76F (two slots
+used: `BIDI_INVALID_UTF8` at 0xFFFFE760, `BIDI_OUT_TOO_SMALL` at
+0xFFFFE761), and three status codes (BIDI_STATUS_OK=0,
+BIDI_STATUS_OUT_TOO_SMALL=1, BIDI_STATUS_INVALID_UTF8=2) packed
+into the low 8 bits of `_bidi_runs`'s return. `_bidi_class`
+returns 0..4 directly as a u64 with no error band (the caller
+has already decoded the cp). Each 16-byte run entry carries
+byte_start (u32 LE), byte_end (u32 LE), class (u8), and seven
+bytes of padding; the stride-16 layout lets callers index runs
+with `shl i, 4`. M6 is additive and preserves every
+M1 + M2 + M3 + M4 + M5 symbol unchanged -- v1.5.0 is
+backward-compatible with v1.4.0, v1.3.0, v1.2.0, v1.1.0, and
+v1.0.0.

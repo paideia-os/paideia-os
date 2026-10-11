@@ -87,6 +87,7 @@ Per `BLANK` / `COMMENT`: skip.
 | `CRP_ERR_TOO_MANY_ROWS`     | `0x0C02`   | `cmd_module_open` returned `CM_MODULE_FULL`; pool exhausted.           |
 | `CRP_ERR_READ`              | `0x0C03`   | `vfs_read` returned the 0xFFFF... sentinel.                            |
 | `CRP_ERR_NO_FILE`           | `0x0C04`   | `vfs_open` returned 0. Non-fatal at boot.                              |
+| `CRP_ERR_RELOAD_BUSY`       | `0x0C05`   | Another reload is already in flight (see §13 Hot-reload).              |
 
 The byte-offset packing on `CRP_ERR_BAD_SYNTAX` lets an operator jump to the offending byte with `tail -c +<offset+1>` on the file.
 
@@ -159,3 +160,109 @@ The grammar deliberately omits features that could be added without breakage:
 * Nested dotted keys (`version.major = "1"`).
 
 Any additions ride the grammar as a strict superset: files that parse today keep parsing. Behavior changes are reserved for a MAJOR schema bump, carried in a top-of-file comment that the parser must inspect.
+
+## 13. Hot-reload
+
+**Issue:** paideia-os#2590 (UMB-W8 R123.M6)
+**Code:** `src/kernel/core/shell/cmd_registry_parser.pdx` §12 — `_cmd_registry_reload`.
+**Dispatch:** `src/kernel/core/cap/kind_cmd_module.pdx` — `CM_OP_RELOAD = 6`, gated by `R_CM_WRITE` (`0x004`).
+
+### 13.1 Purpose
+
+The shell can rebuild its command table at runtime after an operator (or a configuration tool) edits `/system/shell/commands.toml`, without a reboot. The capability is driven synchronously by any holder of a `KIND_CMD_MODULE` capability that carries `R_CM_WRITE`; a future landing adds an FS-watch (`KIND_FS_WATCH`) daemon that invokes it automatically after a file-change event.
+
+### 13.2 Phases
+
+```
+_cmd_registry_reload() -> errno
+    (1) atomic_xchg_u64(&_crp_reload_in_flight, 1)   -- acquire guard
+            previous == 1 -> return CRP_ERR_RELOAD_BUSY (0x0C05)
+    (2) pre_rows = _crp_stats[CRP_ST_ROWS_ADDED]     -- snapshot
+    (3) kcm_table_reset()                            -- flush KCM pool
+            zeros _kcm_table (48 u64), _kcm_stats (8 u64),
+            _kcm_names (64 u64 = 512 B), _kcm_name_lens (8 u64).
+    (4) errno = _cmd_registry_load_boot()            -- re-parse
+            opens /system/shell/commands.toml, reads up to CRP_BUF_CAP
+            bytes, iterates `[command.NAME]` sections through
+            cmd_module_open. Emits its own CMDREG TOML LOADED
+            fingerprint as a side-effect.
+    (5) delta = _crp_stats[CRP_ST_ROWS_ADDED] - pre_rows
+        klog_s1_x2(INFO, SUBSYS_CAP_, "CMDREG RELOADED",
+                   rows=delta, errno=errno)          -- fingerprint
+    (6) atomic_store_u64(&_crp_reload_in_flight, 0)  -- release guard
+    return errno
+```
+
+### 13.3 Idempotency guard
+
+`_crp_reload_in_flight` is a static `u64` in the `CmdRegistryParser` module. Entry is a single-instruction test-and-set:
+
+```
+atomic_xchg_u64(&_crp_reload_in_flight, 1) -> previous
+```
+
+`xchg` on a memory operand is implicitly `LOCK`-prefixed per Intel SDM Vol 2A §XCHG; the bus lock excludes a racing CPU between read and write. A naive `cmp [mem], 0 / mov [mem], 1` pair is NOT equivalent — two CPUs could both pass the compare and both store 1, each believing it holds the guard. The reload primitive therefore MUST route through `atomic_xchg_u64` (never a plain `mov`).
+
+The guard is released with `atomic_store_u64(&_crp_reload_in_flight, 0)`. On x86 TSO a plain `mov [mem], 0` would deliver release-ordered visibility, but routing through the helper keeps the module's atomic discipline uniform.
+
+A concurrent re-entry (two CPUs land `cap_invoke(CM_OP_RELOAD)` in overlap, or a nested call on the same CPU re-enters through an interrupt-wake path) sees `previous == 1` and returns `CRP_ERR_RELOAD_BUSY` immediately — WITHOUT touching the KCM pool, WITHOUT emitting the fingerprint. The holder completes its reload uninterrupted; the loser's errno is a signal to retry later.
+
+### 13.4 Fingerprint
+
+Wire shape (`klog_s1_x2`, `SUBSYS_CAP_`, `LEVEL_INFO`):
+
+```
+CMDREG RELOADED rows=<hex> errno=<hex>
+```
+
+Fields:
+
+* `rows` — delta of `_crp_stats[CRP_ST_ROWS_ADDED]` across the inner `_cmd_registry_load_boot` call. On a clean reload with N commands in the file: `rows=0x<N>` (hex). On a missing or malformed file: `rows=0` plus a nonzero `errno`.
+* `errno` — the inner `_cmd_registry_load_boot` return value. See §5 for codes.
+
+The inner call also emits its own `CMDREG TOML LOADED rows=<n> errno=<e>` fingerprint; the two lines come out in order (TOML LOADED first, RELOADED second).
+
+### 13.5 Right gate
+
+`CM_OP_RELOAD` gates `R_CM_WRITE` (`0x004`), a bit distinct from the per-row `R_CM_INVOKE` that gates `CM_OP_CLOSE`. The distinction reflects the scope: a holder with `R_CM_INVOKE` can close its own handle; a holder with `R_CM_WRITE` can flush and rebuild the entire table. At today's landing no non-supervisor process holds `R_CM_WRITE`; a shell admin shim mints it from the capability substrate root.
+
+### 13.6 Concurrency caveat (DEFERRED to R123.M6-followup)
+
+The guard excludes concurrent **RELOADs**, not concurrent **LOOKUPs**. Between phases (3) `kcm_table_reset` and (4) `_cmd_registry_load_boot` returning, a racing `cap_invoke(KIND_CMD_MODULE, CM_OP_LOOKUP)` will miss (the pool is empty). A follow-up adds a shadow-table + seqlock swap so lookups continue to resolve against the old table until the new one is fully populated, then switch atomically. Today's reload is a stop-the-world update suitable for the single-shell early-boot phase.
+
+The FS-watch integration (`KIND_FS_WATCH`) is similarly deferred: today's reload is driven by an explicit shell `rebuild` command (or a `cap_invoke` from an admin tool), not by a file-change event.
+
+## 14. Lifecycle
+
+The parser substrate goes through three phases in a kernel's lifetime:
+
+### 14.1 Boot-load (R123.M2, UMB-W4)
+
+```
+kernel_main.pdx
+    ...
+    call _mb_init;
+    call _cmd_registry_load_boot;       <-- initial parse
+    call x2apic_probe_bsp;
+    ...
+    call cmd_module_init;
+    call cmd_registry_init;
+    call cmd_registry_parser_init;       <-- defensive scrub
+    ...
+```
+
+At today's wiring the parser-boot call runs BEFORE `witness_r16_vfs`, so `vfs_open` returns 0 and the load drains to `CRP_ERR_NO_FILE`. A later landing moves the call behind the VFS witness.
+
+### 14.2 Discovery (R123.M5, UMB-W5)
+
+`cap_invoke(KIND_CMD_MODULE, CM_OP_LIST_FIRST | CM_OP_LIST_NEXT | CM_OP_READ_NAME)` iterates the live KCM rows (populated by the boot-load phase above) under the `R_CM_READ` gate. The row-id iterator exposes module handles to a holder that wants to enumerate the registered command set without pre-knowing names.
+
+### 14.3 Hot-reload (R123.M6, UMB-W8)
+
+`cap_invoke(KIND_CMD_MODULE, CM_OP_RELOAD)` runs the phases in §13.2 under the `R_CM_WRITE` gate. The on-disk `commands.toml` is the authoritative source; the KCM pool is derived state that the reload path rebuilds from scratch.
+
+A subsequent lookup against the fresh pool sees the current file contents. The `_crp_stats[CRP_ST_ROWS_ADDED]` counter is cumulative across every parse run (boot + reload × N); the hot-reload fingerprint reports the per-call DELTA so an operator reading `CMDREG RELOADED rows=0x3` knows this call added three rows, independent of history.
+
+### 14.4 Boot-reset (chaos restart / witness replay)
+
+`cmd_registry_parser_init` scrubs `_crp_load_buf`, `_crp_stats`, and `_crp_reload_in_flight` to zero. This is defensive (`.bss` already starts zero at real boot) but allows a chaos-restart flow or a witness-replay harness to re-run the full lifecycle from a known state.

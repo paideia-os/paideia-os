@@ -850,6 +850,14 @@ NOT close.  Each has a follow-up ticket shape; none blocks PFS-02..17.
   inside `sys_mount_body`'s successful backend arm; the cap-invoke is
   the authoritative ABI edge, with the underlying work already done.
 
+- **2026-10-11 (Wave 95 / PFS-11, paideia-os#2578)** — the §2.8
+  stop-gap `narrowed_volume_slot & 0xF` nibble is RETIRED; the real
+  `VOL_OP_QUERY_DEVICE_SLOT` wire-through is now live in `mount.pdxfs`
+  v1.1.6 and the `/system`-tier elevate-mint arm's long-standing
+  `dev_cap = 0` gap is CLOSED.  See the new §PFS-11 section below for
+  the resolver contract, call-site topology, and the matching
+  tool-side `caps.decl` fix.
+
 ## §9 Status
 
 **Overall adoption (as of PFS-10 / Wave 94):** FROZEN ABI adopted
@@ -873,3 +881,226 @@ Kernel ops opened at PFS-10:
 *This file is the authoritative kernel-syscall contract for the PFS
 wave.  Edits that change behavior require coordination with every PFS
 consumer in §6.1.*
+
+---
+
+## §PFS-11 Real `VOL_OP_QUERY_DEVICE_SLOT` wire-through (paideia-os#2578)
+
+**Status:** LANDED at `mount.pdxfs` v1.1.6 (Wave 95 / 2026-10-11).  No
+kernel changes — the op has been live since R52.M5-001 (#1703) at op
+ordinal `0` in `kind_volume.pdx`'s `cap_handler_volume` dispatcher.
+What landed in this wave is the user-space wire-up.
+
+### §PFS-11.1 What this closes
+
+PFS-10 (v1.1.5) carried two documented stop-gaps, both rooted in the
+same missing user-space resolver from a `KIND_VOLUME` cap-slot to the
+volume's backing device slot:
+
+1. **Dev-path digit (§2.8)** — `mount_op_build_dev_path` used
+   `narrowed_volume_slot & 0xF` on the user-space cap-table SLOT
+   number to produce the `/dev/pdxvol<H>` hex digit.  Two volume
+   caps whose cap-table slots collided on the low nibble would
+   both produce the same dev_path even if they backed different
+   kernel-side volume rows.  The kernel's `SYS_MOUNT_ENODEV`
+   covered the mis-mount case but any adjacent operator diagnostic
+   that reads the dev-path at face value would mis-attribute.
+
+2. **Elevate-mint dev_cap (`src/main.pdx`, `src/mint_wire.pdx`)** —
+   the `/system`-tier elevate-mint arm (`MPC_SYSTEM_PATH` /
+   `MPC_CROSS_USER`) called `mint_wire_invoke` with `rdi = 0` for the
+   `KIND_BLKDEV` dev_cap argument.  v1.1.1 flagged this as "safe
+   today because `mint_wire_invoke`'s refuse-gate fires on every
+   reachable input before dev_cap is dereferenced", but the day the
+   gate stops firing (i.e. a real `KIND_ELEVATE_CHANNEL` seed lands),
+   every `/system` mount would hit a null `dev_cap` inside
+   `vol_kind_mint_elevate` and fail opaquely.
+
+### §PFS-11.2 Chosen path (Path B: KIND_VOLUME op surface)
+
+PFS-11 allowed either direction:
+
+- **Path A** — a `KIND_BLKDEV` resolver (`BD_OP_QUERY_SLOT`) on the
+  backing device cap.  Natural if the user already holds a
+  `KIND_BLKDEV` cap, but the direction here is "I hold a volume cap;
+  what's its backing block device?" — a one-to-many relationship
+  (one block device backs potentially many volumes) that would need
+  an inverse index on the device side.
+
+- **Path B** — a `VOL_OP_QUERY_DEVICE_SLOT` on the volume cap.
+  Already landed kernel-side at R52.M5-001 (`kind_volume.pdx` op 0,
+  routed via `volume_row_device_slot` which returns header bits
+  [39:24] = the 16-bit device slot).
+
+**Decision: Path B.**  The direction is naturally expressed on the
+volume cap, and the kernel-side plumbing already exists.
+
+### §PFS-11.3 User-space resolver (`src/volume_device_slot.pdx`)
+
+A new ~210 LOC file exposes a single entry point:
+
+```
+volume_device_slot_query(narrowed_volume_slot) -> u64
+```
+
+- Issues `cap_invoke(narrowed_volume_slot, op_arg = 0)` via SC+ ID 4.
+  `op_arg = 0` encodes `VOL_OP_QUERY_DEVICE_SLOT` (op code 0 in the
+  low 8 bits; high 56 bits zero, satisfying
+  `cap_handler_volume`'s `op_arg[63:8] == 0` gate).
+- Return taxonomy (see the file's own module header for the
+  rationale):
+    - `[0..0x10000)` — live device_slot.  Real-world dense range is
+      `[0..16)` per `_volume_table`'s 16-row cap.
+    - `0xFFFFFFFFFFFFFFFF` — `VDS_ERR_DECODE` (`VOL_DECODE_BAD`).
+    - `0xFFFFFFFFFFFFFFFE` — `VDS_ERR_HANDLE`
+      (`INVOKE_RESULT_INVALID_HANDLE`).
+    - `0xFFFFFFFFFFFFFFFD` — `VDS_ERR_INVOKE` (`INVOKE_DENIED`,
+      i.e. `R_VOL_INVOKE` not held on the cap).
+    - `0xFFFFFFFFFFFFFFFC` — `VDS_ERR_UNSUP`
+      (`INVOKE_UNSUPPORTED`).
+- Pure leaf at the syscall boundary; no push/pop; no branch (the
+  kernel's return value is the function's return).
+
+Callers discriminate with `cmp rax, 0x10000; jae refuse` — the live
+range sits well below every sentinel.
+
+### §PFS-11.4 Call-site topology
+
+**User-tier (`/home/**`, `/mnt/**`, `/tmp/**`):**
+`MountOp::mount_op_invoke` (`src/mount_op.pdx`) now runs
+`volume_device_slot_query` as **Step 0** of the real-mount arm
+(immediately after the dry-run gate), BEFORE `mount_op_build_dev_path`.
+A refusal maps to the new `MOUNT_OP_ERR_RESOLVER = 2` return;
+`main.pdx` dispatches that distinctly from `MOUNT_OP_ERR_KERNEL`
+(=`1`) so the emitted record carries
+`MR_RESULT_DEV_RESOLVER_FAILED` (`23`) rather than being mis-labelled
+as a kernel errno — the resolver refusal happens BEFORE `sys_mount`
+is issued, so `mount_raw_errno_out` is zero and
+`mount_record_classify_mount_errno` would otherwise mis-label it as
+`KERNEL_ERROR` (`3`).
+
+**System-tier (`/system/**`, `/boot/**`, `/dev/**`):** `main.pdx`'s
+elevate arm now:
+
+1. Runs `volume_cap_resolve` first (previously skipped for this tier),
+   producing the narrowed `KIND_VOLUME` slot.
+2. Runs `volume_device_slot_query` on that slot to obtain the real
+   `KIND_BLKDEV` dev_cap.
+3. Feeds the resolved dev_cap into `mint_wire_invoke`
+   (`src/mint_wire.pdx`), replacing the v1.1.1 `xor rdi, rdi`
+   stop-gap.
+
+On resolver refusal before mint, the dedicated
+`mount_main_resolver_failed` arm emits
+`MR_RESULT_DEV_RESOLVER_FAILED` (`23`) and exits with status `3`.  On
+`mint_wire_invoke` refusal (the pre-existing `MW_ERR_NO_ELEVATE` /
+`MW_ERR_LIBPDX_VK` paths), the existing `MR_RESULT_NO_ELEVATE` (`16`)
+/ `MR_RESULT_MINT_FAILED` (`22`) emits remain unchanged.
+
+### §PFS-11.5 Real elevate for `/system` mounts
+
+**Design posture at PFS-11:** the real elevate check lives in
+`MintWire::mint_wire_invoke` (`src/mint_wire.pdx`, M6-002 landing),
+NOT in the legacy `Elevate::mount_elev_require_system` stub (which is
+retained for test backward-compat but no longer reached from
+`main.pdx`).  The flow is:
+
+1. `Elevate::mount_point_class` classifies the mount point into
+   `MPC_USER_SUBTREE` (0, no elevate) /`MPC_SYSTEM_PATH` (1, elevate
+   required) / `MPC_CROSS_USER` (2, elevate required but currently
+   unreachable per the `KIND_USER` identity gap) / `MPC_INVALID` (3,
+   refuse).
+2. For `MPC_SYSTEM_PATH` / `MPC_CROSS_USER`,
+   `mint_wire_elevate_slot_for_tier` reads the process's own held
+   `KIND_ELEVATE_CHANNEL` cap slot from `mount_mw_elevate_slot`
+   (`.bss`, initialised to `0`).
+3. If the slot is `0` (today's landing, pre–cap-seeding), the
+   refuse-gate fires BEFORE `vol_kind_mint_elevate` is called and
+   returns `MW_ERR_NO_ELEVATE` → `main.pdx` emits
+   `MR_RESULT_NO_ELEVATE` (`16`) and exits `3`.
+4. If the slot is non-zero (future landing once an `_init_caps`
+   seeding hook installs a real broker-endpoint cap),
+   `vol_kind_mint_elevate(dev_cap, elevate_channel_slot,
+   &narrowed_slot)` runs; PFS-11's wire-through now feeds the REAL
+   `dev_cap` (via `volume_device_slot_query`) rather than `0`, so
+   that future landing's mint path will work end-to-end without a
+   further mount.pdxfs change.
+
+**No new rights kind is introduced.**  `R_SYSTEM_MOUNT` (floated in
+the PFS-11 scope note) is subsumed by `KIND_ELEVATE_CHANNEL`'s
+existence — holding the broker endpoint IS the authority to elevate.
+The rights model stays as `R_VOL_INVOKE` on the cap-handler side
+(`cap_handler_volume`, gating `VOL_OP_QUERY_DEVICE_SLOT` on bit `0x008`
+of the cap descriptor's rights band) and whatever the elevate broker
+enforces on its own channel.
+
+### §PFS-11.6 `caps.decl` correction
+
+PFS-11 also corrects a pre-existing hex-vs-comment mismatch in
+`tools/user/mount.pdxfs/caps.decl`.  The line was:
+
+```
+!KIND_VOLUME              0x003   # READ + INVOKE
+```
+
+`0x003` is `R_VOL_READ | R_VOL_WRITE`, not `R_VOL_READ | R_VOL_INVOKE`
+(which would be `0x009`).  Worse, the real need for the mount pipeline
+is `R_VOL_INVOKE` alone (`0x008`) — the kernel's `cap_handler_volume`
+gates every `QUERY_*` op on `R_VOL_INVOKE` (bit `0x008`); mount.pdxfs
+does not need `R_VOL_READ` because it never reads volume content, and
+`sys_volume_mint` itself only grants `R_VOL_INVOKE | R_VOL_OBSERVE`
+(`0x408`) today.  Fixed to:
+
+```
+!KIND_VOLUME              0x008   # R_VOL_INVOKE (QUERY_* ops)
+```
+
+The exec-time reconciler's `C[kind] = parent AND decl` rule previously
+would have landed `C = 0x408 AND 0x003 = 0x000`, failing the
+"mandatory kind present but narrower than the decl" gate with
+`-EACCES`.  The fact that this hadn't been caught suggests
+mount.pdxfs is still launched outside a cap-reconciling loader today;
+the correction keeps the decl right for the day a reconciling loader
+starts invoking it.
+
+### §PFS-11.7 Failure-taxonomy addition
+
+`mount_record.pdx` grows one new result_code label:
+
+```
+pub let MR_RESULT_DEV_RESOLVER_FAILED : u64 = 23
+pub let mr_lit_result_dev_resolver     : [u8; 20] = "DEV_RESOLVER_FAILED\0"
+```
+
+Distinct from `MR_RESULT_NO_ELEVATE` (`16`, elevate cap missing
+BEFORE the resolver), `MR_RESULT_NARROW_FAILED` (`7`, legacy user-tier
+`vol_kind_narrow` refusal), and `MR_RESULT_MINT_FAILED` (`22`,
+`vol_kind_mint_elevate` returned non-zero AFTER the refuse-gate
+cleared).  The new code specifically names the
+`cap_invoke(VOL_OP_QUERY_DEVICE_SLOT)` refusal.  Emit happens before
+`sys_mount`; no kernel errno pairs with it.
+
+### §PFS-11.8 Status
+
+| Component                                       | Status  |
+|-------------------------------------------------|---------|
+| `src/volume_device_slot.pdx` (new, ~210 LOC)    | LANDED  |
+| `src/mount_op.pdx` dev-path wire-through        | LANDED  |
+| `src/main.pdx` /system dev_cap wire-through     | LANDED  |
+| `src/mount_record.pdx` new result code 23       | LANDED  |
+| `caps.decl` `KIND_VOLUME` rights fix (`0x008`)  | LANDED  |
+| Kernel-side `VOL_OP_QUERY_DEVICE_SLOT` (op 0)   | pre-landed R52.M5-001 |
+
+Not in PFS-11 scope (tracked separately):
+
+- Kernel-side `sys_mount` dev-path interpretation (today the `<H>`
+  digit is decoded as a volume registry `row_id`, not a device_slot
+  — see `sys_mount.pdx` step (c)/(e)).  At current `_volume_table`
+  sizes (16 rows) the two coincide numerically in practice, but a
+  future wave should either rename the kernel-side variable to
+  `device_slot` and route through `volume_registry_lookup_by_device`
+  or expose a parallel `VOL_OP_QUERY_ROW_ID` op.
+- `_init_caps`-style seeding of `KIND_ELEVATE_CHANNEL` for standalone
+  CLI tools (lifts `mint_wire_invoke`'s refuse-gate; a mount.pdxfs
+  change is already not needed — the mint call now carries a real
+  `dev_cap`).

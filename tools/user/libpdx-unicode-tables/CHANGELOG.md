@@ -4,6 +4,125 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] -- 2026-10-11
+
+R131.M6 of the semantic-shell Unicode umbrella (paideia-os#2480,
+decomposed into paideia-os#2617 for this M6).
+
+### Added
+
+- `src/bidi.pdx` module `Bidi`: UAX #9 (Unicode Bidirectional
+  Algorithm) baseline run-level classifier over UTF-8.
+  - `_bidi_class(cp) -> u64` -- maps a decoded code point to one of
+    five reduced BIDI_CLASS values: 0 (L, Left-to-Right: ASCII
+    letters, Latin-1 letters, Latin Extended-A/B), 1 (R,
+    Right-to-Left: Hebrew, Arabic letters, Arabic Presentation
+    Forms-A), 2 (N, Neutral / default fallback), 3 (AN, Arabic
+    Number: Arabic-Indic and extended Arabic-Indic digits), 4 (EN,
+    European Number: ASCII digits). Pure leaf classifier.
+  - `_bidi_runs(bytes_ptr, bytes_len, out_runs_ptr, out_cap)
+    -> packed_u64` -- iterates grapheme clusters via `_gc_next`,
+    classifies first cp of each cluster, groups consecutive same-
+    class clusters into monotone runs. Writes 16-byte run entries
+    `{byte_start u32 LE, byte_end u32 LE, class u8, pad u8[7]}` to
+    `out_runs_ptr`. Return shape `(runs_emitted << 32) | status`
+    with status in {0=OK, 1=OUT_TOO_SMALL, 2=INVALID_UTF8}.
+  - Reduced BIDI_CLASS scope at M6:
+    - L (0): U+0041..U+005A, U+0061..U+007A (ASCII letters);
+      U+00C0..U+00FF (Latin-1 Supplement letters, folds U+00D7/U+00F7
+      into L); U+0100..U+024F (Latin Extended-A + Latin Extended-B).
+    - R (1): U+0590..U+05FF (Hebrew entire block, folds cantillation
+      marks into R); U+0600..U+06FF Arabic block except digits;
+      U+FB50..U+FDFF (Arabic Presentation Forms-A).
+    - AN (3): U+0660..U+0669 (Arabic-Indic digits);
+      U+06F0..U+06F9 (Extended Arabic-Indic digits). Peeled from the
+      Arabic R block before the generic Arabic range check fires.
+    - EN (4): U+0030..U+0039 (ASCII digits).
+    - N (2): everything else (default fallback) -- ASCII space,
+      punctuation, Greek, Cyrillic, CJK, emoji, combining marks
+      outside Hebrew / Arabic, control characters, and every
+      supplementary-plane cp.
+  - Aggregator semantics: OUT_TOO_SMALL commits PARTIAL output
+    (caller may resume from the last committed run's byte_end).
+    INVALID_UTF8 DISCARDS the current open run (invariant: emitted
+    runs always end at a valid cluster boundary).
+- `tests/fingerprints/bidi.golden`: 8 TAG lines (BIDI_PURE_LTR,
+  BIDI_PURE_RTL, BIDI_MIXED, BIDI_NUMBER, BIDI_ARABIC_DIGITS,
+  BIDI_NEUTRAL, BIDI_EMPTY, BIDI_SINGLE_L) with byte-level walk-
+  throughs documented in the file header. OUTPUT_HEX encodes the
+  concatenated 16-byte run entries (32 hex nibbles per run) rather
+  than the packed u64 return, giving the fingerprint maximal
+  discriminative power on each case's run array.
+- `tests/proptest_bidi.pdx` module `ProptestBidi`: three invariant
+  witnesses (coverage of [0, bytes_len) with no gaps/overlaps,
+  non-empty runs, monotone class between consecutive runs) plus
+  umbrella `pb_run_all`; fail codes in the 0xFFFFEDCx band (extends
+  the TestLexer / ProptestGrapheme / ProptestNormalize /
+  ProptestCollation / ProptestWidth family, skips the VKBench
+  (EDAx) and VKFeatures (EDBx) kernel bands).
+
+### Changed
+
+- `src/lib.pdx`: version bump 1.4.0 -> 1.5.0;
+  `LPX_UNICODE_VERSION_MINOR` = 5; `LPX_UNICODE_M6_READY` = 1;
+  `lpx_unicode_feature_level()` now returns 6. The per-milestone
+  commentary in `lib.pdx` reflects the M6-promotes-up renumbering:
+  bidi runs took the M6 slot (was later in the earlier drafts) so
+  the streaming decoder (now M7), utf16 bridge (M8), and stream
+  validators (M9) slide down one.
+
+### Error band
+
+- 0xFFFFE760..0xFFFFE76F reserved for bidi-layer error codes
+  (two used at M6: `BIDI_INVALID_UTF8` = 0xFFFFE760,
+  `BIDI_OUT_TOO_SMALL` = 0xFFFFE761). Jumps over the M5 slice
+  (0xFFFFE750..0xFFFFE75F). Disjoint from the M1 (0xFFFFE700..0F),
+  M2 (0xFFFFE710..1F), M3 (0xFFFFE720..2F), M4 (0xFFFFE730..3F),
+  and M5 (0xFFFFE750..5F) slices and every other band in the
+  paideia-os tree. The public API return packs the status code
+  (0=OK, 1=OUT_TOO_SMALL, 2=INVALID_UTF8) into the low 8 bits of
+  the packed result rather than returning the raw band value,
+  matching the _norm_nfX / _coll_sort_key / _width_str convention.
+
+### UAX #9 scope (Rev. 48 reduced-five-class baseline)
+
+Phases IMPLEMENTED:
+
+- Per-cp classification over the four strong-direction / number
+  classes above (L, R, AN, EN) with N as default fallback.
+- Per-cluster aggregation via `_gc_next` + first-cp classification.
+- Monotone run grouping (consecutive same-class clusters coalesce;
+  class change triggers a run boundary).
+- Status propagation (OK, OUT_TOO_SMALL, INVALID_UTF8) matching the
+  rest of the library's packed-return convention.
+
+Phases STUBBED at M6 (land at M6.1+ follow-ups):
+
+- Full 23-class BIDI_CLASS split. The current five-class reduction
+  is enough for Latin + Arabic + Hebrew runs but not for the per-
+  paragraph reordering TR#9 §3.3 defines (AL distinct from R, NSM
+  carved out of Hebrew/Arabic, ES/ET/CS for European number
+  clustering, ON for brackets and math, WS/BN/B/S for whitespace
+  and separators). M6.1 target.
+- Paragraph-level resolution (TR#9 §P1). First-strong-character
+  algorithm determining sot direction is NOT implemented; the
+  caller can approximate by inspecting the first non-N run. M6.2
+  target.
+- Explicit directional embeddings (LRE / RLE / LRO / RLO / PDF /
+  LRI / RLI / FSI / PDI, TR#9 §3.3.2). Treated as N at M6; rare in
+  terminal input today. M6.3 target.
+- Mirroring pairs (TR#9 §3.4). Brackets and paired characters that
+  mirror inside an RTL run. Needs UCD BidiMirroring.txt. M6.4
+  target.
+
+### Build
+
+- paideia-as >= 0.21.0 required (unchanged from M1 / M2 / M3 / M4
+  / M5).
+- `tools/build.sh` emits per-module `build-out/*.o` objects for
+  `src/`, `tests/`, and `benches/`; no link step at M6 (downstream
+  satellites link via `--extra-obj-dir`).
+
 ## [1.4.0] -- 2026-10-11
 
 R131.M5 of the semantic-shell Unicode umbrella (paideia-os#2480,
