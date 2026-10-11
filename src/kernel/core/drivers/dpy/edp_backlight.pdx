@@ -1,0 +1,1074 @@
+// src/kernel/core/drivers/dpy/edp_backlight.pdx -- Wave 76 D12 [R31]
+// paideia-os #2529
+//
+// Lenovo T14 G4 eDP (embedded DisplayPort) panel backlight driver
+// SKELETON.  Modern eDP panels on the T14 G4 (and every ADL-/RPL-based
+// ultraportable since the 2022 refresh) expose brightness through the
+// DP-AUX channel at DPCD registers 0x720..0x72F rather than through
+// the legacy BLC_PWM_CTL MMIO wires that pre-eDP-1.4 panels used.
+// This file speaks the native-AUX backlight interface + consumes the
+// 101-step _BCL curve a future AML walker (`src/user/aml/aml_walker
+// .pdx`) will extract from the DSDT.
+//
+// =============================================================================
+// SECTION 0  WHAT THIS MODULE IS AND WHAT IT IS DELIBERATELY NOT
+// =============================================================================
+//
+// It is the DPCD backlight register interface + _BCL curve consumer.
+// Given a DPCD-base MMIO cookie (the register-window base the Iris Xe
+// G2 modeset path opens for the eDP sink), it:
+//
+//   (1) latches that cookie into _bl_dpcd_base,
+//   (2) initialises _bcl_curve with a 101-entry linear ramp
+//       (0..100 integer %),  the follow-up slice replaces this with the
+//       panel's real curve read via the AML walker's _BCL evaluation,
+//   (3) exposes level set/get in native-AUX 16-bit units
+//       (DPCD 0x722/0x723), and
+//   (4) exposes _BCL step lookup (step_idx 0..100 -> level, via the
+//       curve table) plus the curve step count accessor.
+//
+// It IS NOT the Iris Xe AUX channel transport.  The transport is a
+// future G2-modeset follow-up slice; the actual AUX_CH_BUFn /
+// AUX_CH_CTLn MMIO orchestration lives in `iris_xe_modeset.pdx` once
+// that slice lands.  This file's aux_read_u8 / aux_write_u8 are
+// placeholder stubs that return 0 / 0 with a TODO; the real-body
+// slice replaces each stub with a call into the transport symbols.
+//
+// It IS NOT the _BCL ACPI method evaluator.  `src/user/aml/aml_walker
+// .pdx` (Wave 71, 1460 LOC) owns DSDT-side method evaluation.  The
+// expected pipeline is: AML walker evaluates \_SB.PCI0.GFX0.LCD._BCL,
+// pins the 101-entry u16 array into kernel memory, and the follow-up
+// slice replaces this file's linear-ramp init with a copy of that
+// pinned buffer.  Until that lands, consumers that call
+// backlight_set_bcl_step(k) get `k` back as the written level, which
+// is the correct linear-ramp placeholder behaviour.
+//
+// It IS NOT the panel power sequencing (PP_ON_DELAYS /
+// PP_OFF_DELAYS / PP_CONTROL).  That is G2 modeset's job on panel
+// bring-up; this file only touches brightness on an already-powered
+// panel.  Writing a non-zero brightness to a panel in standby would
+// race the PP_CONTROL VDD gate -- the follow-up slice adds a
+// `pp_powered_q` gate before the AUX write.
+//
+// =============================================================================
+// SECTION 1  DPCD REGISTER MAP (per DisplayPort 1.4a §2.9.5 + eDP 1.4b §11)
+// =============================================================================
+//
+// Source: VESA DisplayPort 1.4a specification + VESA eDP 1.4b
+// specification Appendix "Native-AUX Backlight Control".  Native-AUX
+// backlight control is the mode eDP 1.4+ panels declare in their
+// EDID; the T14 G4 panel (BOE 0x056D NV140FHM-N4B) sets
+// EDID_CAP_FLAGS[AUX_BL]=1 so this is the correct path.
+//
+//   DP_EDP_DISPLAY_CONTROL_REGISTER     0x720   -- panel-level control
+//                                                  bit 0  BL_ENABLE
+//                                                  bit 2  FRC_ENABLE
+//                                                     (frame-rate ctl)
+//                                                  bit 7  BL_PWM_PIN_ENABLE
+//                                                     (legacy pin
+//                                                     coexistence; set
+//                                                     only for mixed-
+//                                                     mode panels, 0
+//                                                     for pure-AUX)
+//   DP_EDP_BACKLIGHT_MODE_SET_REGISTER  0x721   -- backlight-source
+//                                                  arbitration
+//                                                  bits 1:0 BRIGHTNESS_
+//                                                             CONTROL_MODE
+//                                                     00 = PWM pin
+//                                                     01 = presence
+//                                                            (dim-sense
+//                                                             only)
+//                                                     10 = AUX (DPCD
+//                                                             0x722/723
+//                                                             drive it)
+//                                                     11 = product-
+//                                                            defined
+//                                                            (vendor)
+//   DP_EDP_BACKLIGHT_BRIGHTNESS_MSB     0x722   -- level[15:8]
+//   DP_EDP_BACKLIGHT_BRIGHTNESS_LSB     0x723   -- level[7:0]
+//   DP_EDP_PWMGEN_BIT_COUNT             0x724   -- resolution hint
+//                                                  (bits-per-level the
+//                                                  panel accepts;
+//                                                  typically 16 on
+//                                                  modern panels)
+//   DP_EDP_BACKLIGHT_FREQ_SET           0x728   -- PWM carrier
+//                                                  frequency, in units
+//                                                  of 27 MHz / (freq+1)
+//                                                  (only meaningful on
+//                                                  mixed-mode panels)
+//
+// All five writes are u8 per the DPCD transaction model: an AUX
+// transaction is a <length, address> header plus 1..16 bytes of
+// payload; this driver issues ONE byte per transaction so the
+// transport does not need to batch.  The 16-bit level therefore
+// splits into two consecutive AUX writes (MSB first per the eDP spec
+// 11.4; the panel latches on the LSB write).
+//
+// =============================================================================
+// SECTION 2  LEVEL ENCODING AND THE SHIFT-BY-8 SPLIT
+// =============================================================================
+//
+// `backlight_set_level(level_u16)` accepts a u32 in which the LOW
+// 16 bits carry the brightness in native-AUX units (0..0xFFFF).  Any
+// upper bit set is a BAD_LEVEL refusal:
+//
+//     if level & 0xFFFF0000 != 0 -> ERR_BAD_LEVEL
+//
+// Split into MSB + LSB:
+//
+//     msb = (level >> 8) & 0xFF
+//     lsb =  level       & 0xFF
+//
+// Two single-byte AUX writes:
+//
+//     aux_write_u8(0x722, msb)
+//     aux_write_u8(0x723, lsb)      -- the panel latches here
+//
+// The upper-32 check uses the `cmp rax, imm32` form after a
+// `mov r11, 0xFFFF0000` stage (bit 31 is set on the mask so a direct
+// `cmp r,imm32` would sign-extend -- same pdx-encoder-pitfall ec.pdx
+// documents at §4).  Actually we use `mov r11, 0xFFFF0000; test... `
+// NO, no test; use `and rax, r11; cmp rax, 0; jne ...`.  Below we take
+// the simpler form: `shr r, 16; cmp r, 0; jne ...` which drops the
+// mask constant entirely and detects any high bits with one shift.
+//
+// =============================================================================
+// SECTION 3  _BCL CURVE (ACPI 6.5 §B.6.2)
+// =============================================================================
+//
+// The ACPI _BCL method on a graphics-device sub-object returns a
+// Package of integer brightness levels.  The convention this driver
+// adopts (and that the AML walker's _BCL evaluator will populate in
+// the follow-up slice) is a 101-entry u16 array indexed by percent:
+//
+//     _bcl_curve[0]   = native-AUX level for  0% brightness
+//     _bcl_curve[1]   = ... for  1% brightness
+//     ...
+//     _bcl_curve[100] = ... for 100% brightness
+//
+// At skeleton stage the curve is initialised to the linear identity
+// 0..100 (so step_idx == level) by `backlight_init`.  The follow-up
+// slice replaces that fill with a copy from the AML walker's pinned
+// _BCL buffer.  The entry type is u16 (not u8) because eDP 1.4
+// native-AUX accepts 16 bits of brightness resolution and the real
+// _BCL on a 16-bit panel will populate at least the top 8 bits of
+// each entry.
+//
+// `backlight_set_bcl_step(step_idx)` looks up level = _bcl_curve
+// [step_idx] and calls backlight_set_level(level).  Step indices
+// >= 101 return ERR_BAD_STEP; valid indices 0..100 always succeed on
+// the AUX-write side at skeleton stage (the stub returns 0 from
+// aux_write_u8).  The STEP fingerprint carries both the index and
+// the resolved level so a tester can see which curve entry fired.
+//
+// =============================================================================
+// SECTION 4  RETURN CODE BAND 0xFFFFFFF6..FA (per Wave 76 D12 directive)
+// =============================================================================
+//
+// Five codes reserved for this module.  Band collision notes (per the
+// MODULE-LOCAL collision-is-harmless policy stated in
+// `cap/kind_op_region.pdx` §4):
+//
+//   0xFFFFFFF6..FA overlap with:
+//     HW_INT_MINT_BAD_ARG   = 0xFFFFFFFA (cap/kind_hw_interrupt.pdx)
+//     LOADER_SEED_FAILED    = 0xFFFFFFF9 (loader/seed_caps.pdx)
+//     LOADER_SEED_SLOT_TAKEN= 0xFFFFFFF8 (loader/seed_caps.pdx)
+//     HW_INT_REVOKE_ALREADY = 0xFFFFFFF7 (cap/kind_hw_interrupt.pdx)
+//
+//   All four of those sentinels are MODULE-LOCAL: they never leave
+//   their origin module's cap-handler, so the backlight codes which
+//   also never leave this file do not confuse any sweep.  Same
+//   collision shape fan.pdx §4 argued for the 0xFFFFFFF0..F4 band.
+//
+//   0xFFFFFFF6  BACKLIGHT_ERR_PANEL_ABSENT  -- backlight_set_level /
+//                                              get_level / set_bcl_step
+//                                              called before
+//                                              backlight_init (so
+//                                              _bl_dpcd_base is zero
+//                                              and the panel the driver
+//                                              would speak to has not
+//                                              been located).
+//   0xFFFFFFF7  BACKLIGHT_ERR_BAD_LEVEL     -- level > 0xFFFF (i.e. any
+//                                              bit set in the upper 16).
+//                                              Refused rather than
+//                                              truncated -- a caller
+//                                              passing 0x10000 is a
+//                                              compositor bug and
+//                                              silently masking it
+//                                              would make that bug
+//                                              invisible.
+//   0xFFFFFFF8  BACKLIGHT_ERR_BAD_STEP      -- step_idx >= 101.  The
+//                                              _BCL curve is exactly
+//                                              101 entries by
+//                                              construction (0..100
+//                                              integer %); nothing
+//                                              valid lands outside.
+//   0xFFFFFFF9  BACKLIGHT_ERR_AUX_WRITE     -- aux_write_u8 returned a
+//                                              nonzero code (the
+//                                              transport refused the
+//                                              transaction).  At
+//                                              skeleton stage the stub
+//                                              always returns 0 so this
+//                                              arm never fires today;
+//                                              it is wired so the
+//                                              follow-up slice does not
+//                                              need to re-shape the
+//                                              error taxonomy.
+//   0xFFFFFFFA  BACKLIGHT_ERR_AUX_READ      -- aux_read_u8 returned a
+//                                              sentinel (the transport
+//                                              refused the read).  Same
+//                                              posture as AUX_WRITE.
+//
+// =============================================================================
+// SECTION 5  DISPATCH SLOT -- KIND_BACKLIGHT_DRV = 0x44 (Wave 76 D12)
+// =============================================================================
+//
+// 0x44 is the next free sub-0x80 derived-kind tag after the Wave 74
+// / Wave 75 cluster (0x3C..0x43).  0x42 belongs to KIND_BLKDEV
+// (R51.M3-003 #1647) so this file does not claim it.  Audit at
+// landing time (grep over `src/kernel/core/cap/`):
+//
+//   $ grep -nE 'cmp rcx, 0x44\b' src/kernel/core/cap/invoke.pdx
+//   (empty before landing)
+//   $ grep -rnE 'KIND_BACKLIGHT_DRV\s*:\s*u64\s*=' src/kernel/
+//   (empty before landing)
+//
+// DISTINCT from KIND_BACKLIGHT (0x15a = 346, R31.M5-001 #1106,
+// `cap/kind_backlight.pdx`), which is the AUTHORITY-layer kind that
+// names a backlight ROW by (parent_device_key, index, backend,
+// brightness_min, brightness_max).  THIS kind is the DRIVER-layer
+// kind that speaks to one specific panel's DPCD registers and
+// consumes its _BCL curve -- the two coexist for the same reason
+// KIND_BATTERY_DRV (0x3D) and KIND_BATTERY (0x158) coexist (Wave 59
+// D9 precedent) and KIND_THERMAL_ZONE_DRV (0x3E) and
+// KIND_THERMAL_ZONE (0x157) coexist (Wave 59 D10 precedent).
+//
+// The dispatch handler symbol is therefore `cap_handler_backlight_drv`
+// (NOT `cap_handler_backlight`, which is already claimed by the
+// authority-layer file).  Same two-handler shape every other
+// drv/authority pair uses in this cap-table.
+//
+// 0x44 fits imm32 with bit 31 clear so the dispatch arm uses
+// `cmp rcx, 0x44` directly (no r9 staging), same posture as every
+// other sub-0x80 kind in this block.
+//
+// =============================================================================
+// SECTION 6  DERIVATION POSTURE
+// =============================================================================
+//
+// KIND_BACKLIGHT_DRV derives over KIND_DEVICE (base slot 10): the
+// backlight driver is per-GPU-device state anchored on the Iris Xe
+// PCI function the panel is wired to.  Same posture as KIND_FAN_DRV
+// (0x40, derives over KIND_DEVICE) and KIND_BATTERY_DRV (0x3D,
+// derives over KIND_DEVICE via the EC OpRegion).  The dispatch arm
+// in cap/invoke.pdx compares the FULL u64 kind field, so the slot-
+// 10 KIND_DEVICE handler and this kind coexist cleanly.
+//
+// =============================================================================
+// SECTION 7  paideia-as v0.36.82 ENCODER POSTURE
+// =============================================================================
+//
+//   Kind-tag constant 0x44 and all five error sentinels fit imm32
+//   with bit 31 clear.  No `test rN,rN` anywhere (zero-equality uses
+//   `cmp rN, 0`).  No `and r11, imm64`; the one masked compare
+//   (op_arg & 0xFF) stages through r10.  No 2-op `imul r,imm`; the
+//   _bcl_curve lookup uses `shl rax, 1` (stride 2 is a power of
+//   two for u16).  All `pub let` string declarations are on single
+//   lines.  Module basename `EdpBacklight` matches the file basename
+//   `edp_backlight.pdx`.  Every label is prefixed `bl_` (reserved-
+//   word discipline -- `loop` / `if` / `let` are keywords).
+//   Fingerprint tag [u8; N] = len(string) + 1 exactly for the NUL.
+//   klog_s1_d1 / klog_s1_d2 wrappers -- v2 at caller [rsp+0], the
+//   wrapper reads it at [rbp+16] after its own push rbp.
+//
+// =============================================================================
+// SECTION 8  WIRING
+// =============================================================================
+//
+// Not wired to the smoke witness at skeleton stage.  The file
+// compiles alongside the kernel because tools/build.sh recurses
+// through src/kernel/core/drivers/dpy/ with a single `find`, so a
+// new .pdx in that directory is picked up automatically.
+//
+// invoke.pdx gets ONE new dispatch arm (0x44 -> cap_handler_
+// backlight_drv) alongside this file; the arm sits between the Wave
+// 75 G6 0x43 KIND_GPU_BO_DRV arm and the Wave 59 R29 0x140
+// KIND_HW_INTERRUPT block.
+//
+// A follow-up slice adds a boot-witness programme at
+// tests/kernel/drivers/wit_edp_backlight.pdx that:
+//   (1) backlight_init(0xDEADBEEF);
+//   (2) backlight_set_level(0x8000);              // 50% in native-AUX
+//   (3) backlight_set_bcl_step(50);               // 50% via curve
+//   (4) backlight_get_level();
+//   (5) backlight_read_bcl_curve();               // -> 101
+// and asserts the three fingerprints land on the klog wire plus the
+// counter getters report (1, 1, 1, 1, _).
+
+module EdpBacklight = structure {
+
+  // ==========================================================================
+  // §A  KIND / rights
+  // ==========================================================================
+
+  pub let KIND_BACKLIGHT_DRV      : u64 = 0x44    // Wave 76 D12 derived-kind tag
+  pub let KIND_BACKLIGHT_DRV_BASE : u64 = 10      // = KIND_DEVICE
+
+  pub let R_BL_READ   : u64 = 0x001    // query ops (level, curve-count)
+  pub let R_BL_WRITE  : u64 = 0x002    // mutate ops (set level, set step)
+  pub let R_BL_ALL    : u64 = 0x003    // handed to the holder on create
+
+  // ==========================================================================
+  // §B  DPCD register offsets (SECTION 1)
+  // ==========================================================================
+
+  pub let DP_EDP_DISPLAY_CONTROL_REGISTER    : u64 = 0x720
+  pub let DP_EDP_BACKLIGHT_MODE_SET_REGISTER : u64 = 0x721
+  pub let DP_EDP_BACKLIGHT_BRIGHTNESS_MSB    : u64 = 0x722
+  pub let DP_EDP_BACKLIGHT_BRIGHTNESS_LSB    : u64 = 0x723
+  pub let DP_EDP_PWMGEN_BIT_COUNT            : u64 = 0x724
+  pub let DP_EDP_BACKLIGHT_FREQ_SET          : u64 = 0x728
+
+  // ==========================================================================
+  // §C  Curve bounds
+  // ==========================================================================
+
+  pub let BL_BCL_STEPS       : u64 = 101          // 0..100 inclusive
+  pub let BL_LEVEL_MASK_16   : u64 = 0xFFFF       // mask for the 16-bit level
+  pub let BL_LEVEL_MAX_U16   : u64 = 0xFFFF
+
+  // ==========================================================================
+  // §D  Operation codes (cap_handler_backlight_drv dispatch)
+  //
+  // op 0 is reserved (INVOKE_OP_NULL per invoke.pdx) and is NOT
+  // mapped to any backlight entrypoint.  Four values are legal;
+  // anything else is INVOKE_UNSUPPORTED.
+  // ==========================================================================
+
+  pub let BL_OP_SET_LEVEL      : u64 = 1
+  pub let BL_OP_GET_LEVEL      : u64 = 2
+  pub let BL_OP_SET_BCL_STEP   : u64 = 3
+  pub let BL_OP_READ_CURVE_N   : u64 = 4
+  pub let BL_OP_MAX            : u64 = 4
+
+  // ==========================================================================
+  // §E  Failure codes (SECTION 4)
+  // ==========================================================================
+
+  pub let BL_OK                      : u64 = 0
+  pub let BACKLIGHT_ERR_PANEL_ABSENT : u64 = 0xFFFFFFF6
+  pub let BACKLIGHT_ERR_BAD_LEVEL    : u64 = 0xFFFFFFF7
+  pub let BACKLIGHT_ERR_BAD_STEP     : u64 = 0xFFFFFFF8
+  pub let BACKLIGHT_ERR_AUX_WRITE    : u64 = 0xFFFFFFF9
+  pub let BACKLIGHT_ERR_AUX_READ     : u64 = 0xFFFFFFFA
+
+  // Standard cap_invoke sentinels.
+  pub let INVOKE_UNSUPPORTED : u64 = 0xFFFFFFFFFFFFFFFC
+  pub let INVOKE_DENIED      : u64 = 0xFFFFFFFFFFFFFFFD
+
+  // ==========================================================================
+  // §F  Module-level state
+  //
+  //   _bl_dpcd_base      MMIO cookie the Iris Xe AUX transport uses to
+  //                      target the eDP sink.  Zero until
+  //                      backlight_init stamps it; used only as an
+  //                      "is a panel present" flag at skeleton stage
+  //                      (the transport reads it, not this file).
+  //   _bl_inited         1 iff backlight_init has run successfully.
+  //   _bl_last_level     Most recent 16-bit level the driver wrote OR
+  //                      read, for test-oracle inspection via the
+  //                      getter.
+  //   _bl_last_step      Most recent step_idx a successful
+  //                      set_bcl_step call carried.
+  //   _bl_set_ct         Count of successful backlight_set_level.
+  //   _bl_get_ct         Count of successful backlight_get_level.
+  //   _bl_step_ct        Count of successful backlight_set_bcl_step.
+  //
+  //   _bcl_curve         101-entry u16 array of native-AUX brightness
+  //                      levels, one per integer percent.  Populated
+  //                      with a linear ramp at skeleton stage; the
+  //                      follow-up slice fills it from AML _BCL.
+  // ==========================================================================
+
+  pub let mut _bl_dpcd_base    : u64 = 0
+  pub let mut _bl_inited       : u64 = 0
+  pub let mut _bl_last_level   : u64 = 0
+  pub let mut _bl_last_step    : u64 = 0
+
+  pub let mut _bl_set_ct       : u64 = 0
+  pub let mut _bl_get_ct       : u64 = 0
+  pub let mut _bl_step_ct      : u64 = 0
+
+  pub let mut _bcl_curve       : [u16; 101] = uninit @align(8)
+
+  // ==========================================================================
+  // §G  Fingerprint tags + keys  (single-line, len+1 sized)
+  //
+  //   BACKLIGHT SET level=<dec>
+  //   BACKLIGHT STEP idx=<dec> level=<dec>
+  //   BACKLIGHT GET level=<dec>
+  // ==========================================================================
+
+  pub let bl_tag_set     : [u8; 14] = "BACKLIGHT SET\0"
+  pub let bl_tag_step    : [u8; 15] = "BACKLIGHT STEP\0"
+  pub let bl_tag_get     : [u8; 14] = "BACKLIGHT GET\0"
+
+  pub let bl_tag_handler_entry : [u8; 31] = "KIND_BACKLIGHT_DRV dispatch iv\0"
+
+  pub let bl_k_level : [u8; 6] = "level\0"
+  pub let bl_k_idx   : [u8; 4] = "idx\0"
+
+  // ==========================================================================
+  // §H  aux_read_u8 / aux_write_u8  --  internal AUX-channel stubs
+  //
+  // Placeholder stubs: the real-body slice replaces them with a call
+  // into the Iris Xe AUX transport in `iris_xe_modeset.pdx`.  Both
+  // return 0 at skeleton stage so the error band remains dormant.
+  //
+  // TODO(wave-77): wire into Iris Xe AUX channel.
+  //                See `src/kernel/core/drivers/dpy/iris_xe_modeset
+  //                .pdx` for the DPCD AUX_CH_BUFn / AUX_CH_CTLn
+  //                MMIO sequence.  The transport will accept
+  //                (dpcd_base, dpcd_addr, length, direction) and
+  //                return a byte in rax plus a nonzero sentinel on
+  //                failure.
+  // ==========================================================================
+
+  pub let aux_read_u8 : (u64) -> u64 !{sysreg} @{} =
+    fn (dpcd_addr: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "Wave 76 D12 (paideia-os#2529) skeleton: AUX-channel read stub. Returns 0 unconditionally. The real body (follow-up slice wave-77) issues an Iris Xe AUX transaction (dpcd_base from _bl_dpcd_base, dpcd_addr argument, length 1, direction READ) and returns the single byte in rax, or a sentinel in the fan-band for a NACK/DEFER/TIMEOUT. At skeleton stage every reader exercises the fingerprint path with a known byte value: the follow-up slice does not need to re-shape the caller sites. Pure leaf. No labels needed.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    }
+
+  pub let aux_write_u8 : (u64, u64) -> u64 !{sysreg} @{} =
+    fn (dpcd_addr: u64) (value: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "Wave 76 D12 (paideia-os#2529) skeleton: AUX-channel write stub. Returns 0 unconditionally. The real body (follow-up slice wave-77) issues an Iris Xe AUX transaction (dpcd_base from _bl_dpcd_base, dpcd_addr argument, length 1, direction WRITE, payload the low byte of value) and returns 0 on ACK, or a sentinel in the fan-band on NACK/DEFER/TIMEOUT. At skeleton stage every write path exercises the fingerprint path with a known byte value: the follow-up slice does not need to re-shape the caller sites. Pure leaf. No labels needed.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // §I  backlight_init(dpcd_base_mmio) -> u64
+  //
+  // Latch the dpcd_base_mmio cookie, fill _bcl_curve with the linear
+  // identity ramp (0..100), zero every counter, flip _bl_inited to
+  // 1, return BL_OK.
+  //
+  // The ramp fills _bcl_curve[k] = k, for k in 0..100.  Entry type
+  // is u16 so the follow-up slice that reads the real _BCL into the
+  // same slot preserves the panel's 16-bit resolution.  u16 stride
+  // 2; the loop writes one u16 per iteration via `mov_w [rip +
+  // _bcl_curve + rcx*2], rax` -- stride 2 is a power of two so no
+  // `imul` is needed.
+  //
+  // SysV: rdi = dpcd_base_mmio.  Register plan: 3-push callee-save
+  // prologue (rbx = dpcd_base, r12 scratch, r13 scratch).  Labels
+  // prefixed `bl_in_`.
+  // ==========================================================================
+  pub let backlight_init : (u64) -> u64 !{mem} @{} =
+    fn (dpcd_base_mmio: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 76 D12 (paideia-os#2529) skeleton: latch dpcd_base_mmio into _bl_dpcd_base, fill _bcl_curve[0..100] with linear ramp (identity: curve[k] = k), zero every counter, stamp _bl_inited=1, return BL_OK. The identity ramp is a deliberate placeholder -- the follow-up slice (wave-77 or later) replaces this fill with a memcpy from the AML walker's pinned _BCL buffer so each percent maps to the panel's actual native-AUX level. Loop body: `mov [rip + _bcl_curve + rcx*2], ax` would widen; use `lea r10, [rip + _bcl_curve]; mov_w [r10 + rcx*2], rax` (sized store so bit 31+ of rax do not clobber adjacent u16 entries). The ramp runs BEFORE _bl_inited is flipped so a crash mid-fill leaves the module reset-state consistent (zero curve + zero inited). 3-push prologue aligns rsp%16==0 for no nested CALL (pure leaf, prologue retained for symmetry with the other mutators and to leave room for the follow-up slice's aml_bcl_eval call). Labels prefixed `bl_in_`.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                        // dpcd_base_mmio
+
+        // --- Zero every counter + the state slots.
+        xor rax, rax;
+        mov [rip + _bl_last_level], rax;
+        mov [rip + _bl_last_step],  rax;
+        mov [rip + _bl_set_ct],     rax;
+        mov [rip + _bl_get_ct],     rax;
+        mov [rip + _bl_step_ct],    rax;
+
+        // --- Fill the _BCL curve: linear ramp 0..100.
+        lea r10, [rip + _bcl_curve];
+        xor rcx, rcx;
+      bl_in_ramp:
+        mov rax, rcx;                        // level_u16 = idx (identity)
+        mov_w [r10 + rcx * 2], rax;          // u16 store at stride 2
+        add rcx, 1;
+        cmp rcx, 101;
+        jb  bl_in_ramp;
+
+        // --- Latch dpcd_base.
+        mov [rip + _bl_dpcd_base], rbx;
+
+        // --- Stamp inited LAST.
+        mov rax, 1;
+        mov [rip + _bl_inited], rax;
+
+        xor rax, rax;                        // BL_OK
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // §J  backlight_set_level(level_u16) -> u64
+  //
+  // Write the 16-bit brightness level to the panel via two AUX byte
+  // writes (MSB first at DPCD 0x722, LSB second at DPCD 0x723 --
+  // panel latches on LSB per eDP 1.4b §11.4), stash in
+  // _bl_last_level, bump _bl_set_ct, emit the SET fingerprint,
+  // return BL_OK.
+  //
+  // Gates in order:
+  //   (1) _bl_inited == 0            -> BACKLIGHT_ERR_PANEL_ABSENT
+  //   (2) level & 0xFFFF0000 != 0    -> BACKLIGHT_ERR_BAD_LEVEL
+  //   (3) aux_write_u8(MSB) != 0     -> BACKLIGHT_ERR_AUX_WRITE
+  //   (4) aux_write_u8(LSB) != 0     -> BACKLIGHT_ERR_AUX_WRITE
+  //
+  // SysV: rdi = level (u32 in low 32 bits).  Register plan: 3-push
+  // callee-save prologue (rbx = level, r12 scratch, r13 scratch).
+  // Aligned rsp%16==0 for every nested CALL (aux_write_u8 twice,
+  // klog_s1_d1).  Labels prefixed `bl_sl_`.
+  // ==========================================================================
+  pub let backlight_set_level : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (level_u16: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "Wave 76 D12 (paideia-os#2529) skeleton: 16-bit level write via two AUX byte transactions. High-bits refusal uses `mov r12, rbx; shr r12, 16; cmp r12, 0; jne ...` -- one shift detects any bit above 15 and avoids staging a 0xFFFF0000 mask constant whose bit 31 would be sign-extended by `cmp r,imm32` (same pdx-encoder-pitfall ec.pdx documents at §4). MSB first per eDP 1.4b §11.4: the panel latches brightness on the LSB write, so the MSB alone is observed internally but not applied until the LSB arrives. Split: `mov r13, rbx; shr r13, 8; and r13, 0xFF` for MSB; `mov r13, rbx; and r13, 0xFF` for LSB -- no 2-op imul, no and r,imm64 (0xFF fits imm8). Both aux_write_u8 refusals route to BACKLIGHT_ERR_AUX_WRITE; the band is per-direction and the DPCD stream is write-only on these two offsets. At skeleton stage the stubs return 0 so the refusal arm never fires; it is wired so the follow-up slice (wave-77) does not need to re-shape the error taxonomy. 3-push prologue aligns rsp%16==0 for every nested CALL. Labels prefixed `bl_sl_`.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                        // level_u16 (preserve)
+
+        // --- Gate (1): inited?
+        mov rax, [rip + _bl_inited];
+        cmp rax, 0;
+        je  bl_sl_absent;
+
+        // --- Gate (2): level fits in 16 bits (no bit above 15 set).
+        mov r12, rbx;
+        shr r12, 16;
+        cmp r12, 0;
+        jne bl_sl_bad_level;
+
+        // --- Write MSB at DPCD 0x722.
+        mov rdi, 0x722;
+        mov r13, rbx;
+        shr r13, 8;
+        mov r10, 0xFF;
+        and r13, r10;
+        mov rsi, r13;
+        call aux_write_u8;
+        cmp rax, 0;
+        jne bl_sl_aux_err;
+
+        // --- Write LSB at DPCD 0x723 (panel latches here).
+        mov rdi, 0x723;
+        mov r13, rbx;
+        mov r10, 0xFF;
+        and r13, r10;
+        mov rsi, r13;
+        call aux_write_u8;
+        cmp rax, 0;
+        jne bl_sl_aux_err;
+
+        // --- Stash + bump counter.
+        mov [rip + _bl_last_level], rbx;
+        mov rax, [rip + _bl_set_ct];
+        add rax, 1;
+        mov [rip + _bl_set_ct], rax;
+
+        // --- Emit fingerprint: BACKLIGHT SET level=<dec>
+        //
+        // klog_s1_d1 signature: rdi=level, rsi=subsys, rdx=tag,
+        // rcx=k1, r8=v1.  Zero stack args.  3-push prologue leaves
+        // rsp%16==0 so CALL is aligned without any adjustment.
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + bl_tag_set];
+        lea rcx, [rip + bl_k_level];
+        mov r8,  rbx;                        // v1 = level
+        call klog_s1_d1;
+
+        xor rax, rax;                        // BL_OK
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bl_sl_absent:
+        mov rax, 0xFFFFFFF6;                 // BACKLIGHT_ERR_PANEL_ABSENT
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bl_sl_bad_level:
+        mov rax, 0xFFFFFFF7;                 // BACKLIGHT_ERR_BAD_LEVEL
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bl_sl_aux_err:
+        mov rax, 0xFFFFFFF9;                 // BACKLIGHT_ERR_AUX_WRITE
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // §K  backlight_get_level() -> u64
+  //
+  // Read the current 16-bit level by composing two AUX byte reads
+  // (MSB at DPCD 0x722, LSB at DPCD 0x723), stash in _bl_last_level,
+  // bump _bl_get_ct, emit the GET fingerprint, return the composed
+  // level.
+  //
+  // Gates in order:
+  //   (1) _bl_inited == 0            -> BACKLIGHT_ERR_PANEL_ABSENT
+  //   (2) aux_read_u8(MSB) sentinel  -> BACKLIGHT_ERR_AUX_READ (not
+  //       wired at skeleton stage: the stub returns 0)
+  //   (3) aux_read_u8(LSB) sentinel  -> BACKLIGHT_ERR_AUX_READ
+  //
+  // At skeleton stage both reads return 0 so the composed level is
+  // 0; the GET fingerprint still fires with level=0 which exercises
+  // the klog wire.  The follow-up slice replaces the stubs with the
+  // real transport reads, at which point the fingerprint reports
+  // the panel's live level.
+  //
+  // SysV: no inputs.  Register plan: 3-push callee-save prologue
+  // (rbx = MSB, r12 = LSB, r13 = composed level).  Aligned rsp%16==0
+  // for every nested CALL.  Labels prefixed `bl_gl_`.
+  // ==========================================================================
+  pub let backlight_get_level : () -> u64 !{mem, sysreg} @{} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "Wave 76 D12 (paideia-os#2529) skeleton: 16-bit level read via two AUX byte transactions, composed with `shl rax, 8; or r13, rax` (MSB << 8 | LSB) -- same compose idiom bat_read_u16 in battery.pdx §I uses. The read refusal arm is wired so the follow-up slice (wave-77) does not need to re-shape the error taxonomy; at skeleton stage aux_read_u8 returns 0 so the refusal never fires and the composed level is 0, which still exercises the klog wire for the GET fingerprint. The fingerprint reports what was READ (not what _bl_last_level stored before the read) so a tester who writes a known level and reads it back can confirm the write landed. 3-push prologue aligns rsp%16==0 for every nested CALL. Labels prefixed `bl_gl_`.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        // --- Gate (1): inited?
+        mov rax, [rip + _bl_inited];
+        cmp rax, 0;
+        je  bl_gl_absent;
+
+        // --- Read MSB at DPCD 0x722.
+        mov rdi, 0x722;
+        call aux_read_u8;
+        mov rbx, rax;                        // rbx = MSB byte (stub: 0)
+
+        // --- Read LSB at DPCD 0x723.
+        mov rdi, 0x723;
+        call aux_read_u8;
+        mov r12, rax;                        // r12 = LSB byte (stub: 0)
+
+        // --- Compose: level = (MSB << 8) | LSB.
+        mov rax, rbx;
+        shl rax, 8;
+        or  rax, r12;
+        mov r13, rax;                        // r13 = composed level
+
+        // --- Stash + bump counter.
+        mov [rip + _bl_last_level], r13;
+        mov rax, [rip + _bl_get_ct];
+        add rax, 1;
+        mov [rip + _bl_get_ct], rax;
+
+        // --- Emit fingerprint: BACKLIGHT GET level=<dec>
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + bl_tag_get];
+        lea rcx, [rip + bl_k_level];
+        mov r8,  r13;                        // v1 = composed level
+        call klog_s1_d1;
+
+        // --- Return the composed level.
+        mov rax, r13;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bl_gl_absent:
+        mov rax, 0xFFFFFFF6;                 // BACKLIGHT_ERR_PANEL_ABSENT
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // §L  backlight_set_bcl_step(step_idx) -> u64
+  //
+  // Look up _bcl_curve[step_idx] as a u16, pass that level to
+  // backlight_set_level, bump _bl_step_ct, emit the STEP fingerprint
+  // (both idx and resolved level), return BL_OK (or the level-write
+  // refusal propagated verbatim).
+  //
+  // Gates in order:
+  //   (1) _bl_inited == 0            -> BACKLIGHT_ERR_PANEL_ABSENT
+  //   (2) step_idx >= 101            -> BACKLIGHT_ERR_BAD_STEP
+  //   (3) backlight_set_level refusal propagated verbatim
+  //
+  // The STEP fingerprint carries both idx and the resolved level so
+  // a tester correlating "percent brightness" with "native-AUX
+  // level" sees both in one on-wire frame.  At skeleton stage the
+  // mapping is linear (level == idx) which the fingerprint confirms;
+  // the follow-up slice that lands the real _BCL curve will produce
+  // nonlinear pairs (e.g. idx=50 -> level=0x3FFF rather than 0x32).
+  //
+  // SysV: rdi = step_idx.  Register plan: 3-push callee-save
+  // prologue (rbx = step_idx, r12 = resolved level, r13 scratch).
+  // Aligned rsp%16==0 for every nested CALL.  klog_s1_d2 takes v2
+  // (= resolved level) on the stack via `sub rsp, 8; push r12`
+  // (16 bytes total; `add rsp, 16` reclaims).  Labels prefixed
+  // `bl_sb_`.
+  // ==========================================================================
+  pub let backlight_set_bcl_step : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (step_idx: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "Wave 76 D12 (paideia-os#2529) skeleton: resolve _bcl_curve[step_idx] -> level, call backlight_set_level(level), bump _bl_step_ct, emit `BACKLIGHT STEP idx=<dec> level=<dec>`. Lookup uses `xor rax, rax; mov_w rax, [r10 + rbx*2]` -- zero-extended u16 load, stride 2 is a power of two so no 2-op imul is needed (same discipline hpet.pdx uses for its u16 min_tick reads). _bl_step is stashed BEFORE the nested set_level call so a propagated-refusal path still records which step the caller tried. backlight_set_level's refusal propagates verbatim: its band (0xFFFFFFF6..FA) is identical to this file's so no remapping is required, and the only level this function hands set_level is one that the curve itself produced -- which is always <= 0xFFFF by construction. The STEP fingerprint fires AFTER set_level returns BL_OK; a failed set_level does not emit the step line (same discipline fan.pdx §M uses for POLICY frames). klog_s1_d2 v2 (= resolved level) placed via `sub rsp, 8; push r12` -- rsp%16==0 at CALL per the pdx-encoder-pitfalls memory 2026-09-26's v2-at-[rsp+0] convention. 3-push prologue aligns rsp%16==0. Labels prefixed `bl_sb_`.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                        // step_idx
+
+        // --- Gate (1): inited?
+        mov rax, [rip + _bl_inited];
+        cmp rax, 0;
+        je  bl_sb_absent;
+
+        // --- Gate (2): step_idx in {0..100}.
+        cmp rbx, 101;
+        jae bl_sb_bad_step;
+
+        // --- Lookup level = _bcl_curve[step_idx] (u16, stride 2).
+        lea r10, [rip + _bcl_curve];
+        xor rax, rax;
+        mov_w rax, [r10 + rbx * 2];
+        mov r12, rax;                        // r12 = resolved level
+
+        // --- Stash _bl_last_step BEFORE the nested call so a
+        //     propagated refusal still records the step attempted.
+        mov [rip + _bl_last_step], rbx;
+
+        // --- Nested write: backlight_set_level(resolved level).
+        mov rdi, r12;
+        call backlight_set_level;
+        mov r11, 0xFFFFFF00;
+        cmp rax, r11;
+        jae bl_sb_propagate;
+
+        // --- Bump counter.
+        mov rax, [rip + _bl_step_ct];
+        add rax, 1;
+        mov [rip + _bl_step_ct], rax;
+
+        // --- Emit fingerprint: BACKLIGHT STEP idx=<dec> level=<dec>
+        //
+        // klog_s1_d2 signature:
+        //   rdi = level, rsi = subsys_ptr, rdx = tag_ptr,
+        //   rcx = k1_ptr, r8 = v1, r9 = k2_ptr,
+        //   [rsp+0] = v2 before CALL  (= [rbp+16] inside wrapper)
+        //
+        // Alignment: 3-push prologue leaves rsp%16==0.  `sub rsp, 8`
+        // lands rsp%16==8, `push r12` lands rsp%16==0 for CALL, and
+        // `add rsp, 16` after reclaims both.
+        sub rsp, 8;                          // align-for-push
+        push r12;                            // [rsp+0] = v2 = resolved level
+
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + bl_tag_step];
+        lea rcx, [rip + bl_k_idx];
+        mov r8,  rbx;                        // v1 = step_idx
+        lea r9,  [rip + bl_k_level];
+        call klog_s1_d2;
+        add rsp, 16;                         // reclaim align + push
+
+        xor rax, rax;                        // BL_OK
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bl_sb_absent:
+        mov rax, 0xFFFFFFF6;                 // BACKLIGHT_ERR_PANEL_ABSENT
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bl_sb_bad_step:
+        mov rax, 0xFFFFFFF8;                 // BACKLIGHT_ERR_BAD_STEP
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bl_sb_propagate:
+        // backlight_set_level refusal already in rax.
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // §M  backlight_read_bcl_curve() -> u64
+  //
+  // Return the number of steps in the _BCL curve.  Constant 101 at
+  // skeleton stage; the follow-up slice may return a smaller count
+  // if the panel's real _BCL has fewer than 101 entries (observed
+  // minimum is 10 on some ADL-U-class panels).  Pure leaf.
+  // ==========================================================================
+  pub let backlight_read_bcl_curve : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 76 D12 (paideia-os#2529) skeleton: single-constant getter for the _BCL curve step count. 101 at skeleton stage (0..100 integer %). The follow-up slice reads the real curve length from AML _BCL and returns that instead; the signature stays constant so no caller re-plumbing. Pure leaf. No labels needed.",
+      block: {
+        mov rax, 101;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // §N  cap_handler_backlight_drv(rights, target_ptr, op_arg) -> u64
+  //
+  // KIND_BACKLIGHT_DRV (0x44) cap_invoke dispatch handler.
+  // Reachable from cap/invoke.pdx:cap_invoke_dispatch via the
+  // `cmp rcx, 0x44; je call_kind_backlight_drv` arm added alongside
+  // this file.  Routes by op_arg's low byte to one of the four
+  // op-coded leaves; anything else is INVOKE_UNSUPPORTED.
+  //
+  // Op encoding (low byte of op_arg names the op; the next byte
+  // carries an argument when needed):
+  //
+  //     op 1 BL_OP_SET_LEVEL     arg = level_u16 (bits [23:8])
+  //     op 2 BL_OP_GET_LEVEL     no arg
+  //     op 3 BL_OP_SET_BCL_STEP  arg = step_idx (byte [15:8])
+  //     op 4 BL_OP_READ_CURVE_N  no arg
+  //     else                     -> INVOKE_UNSUPPORTED
+  //
+  // The SET_LEVEL arg is a 16-bit level occupying bits [23:8] of
+  // op_arg (so op_arg = (level << 8) | 1); SET_BCL_STEP's arg is
+  // one byte at [15:8] (so op_arg = (step << 8) | 3).  Same
+  // op-arg-shift-by-8 convention fan.pdx and ec.pdx both use.
+  //
+  // Rights gate: SET_LEVEL / SET_BCL_STEP require R_BL_WRITE;
+  // GET_LEVEL / READ_CURVE_N require R_BL_READ.  R_BL_ALL carries
+  // both bits so a holder may do all four.
+  //
+  // SysV: rdi=rights, rsi=target_ptr, rdx=op_arg.  Register plan:
+  // 3-push callee-save (rbx=rights, r12=op_arg, r13=op_code).
+  // Labels prefixed `bl_hd_`.
+  // ==========================================================================
+  pub let cap_handler_backlight_drv : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (rights: u64) (target_ptr: u64) (op_arg: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "Wave 76 D12 (paideia-os#2529): KIND_BACKLIGHT_DRV cap_invoke dispatch. Entry chatter (klog_s1 of bl_tag_handler_entry) with the three incoming regs preserved in callee-save slots. op_code = op_arg & 0xFF; rights gate per-op against R_BL_READ or R_BL_WRITE; dispatch 1..4 to the matching entrypoint; else INVOKE_UNSUPPORTED. SET_LEVEL unpacks level from op_arg[23:8] (so op_arg = (level<<8)|1); SET_BCL_STEP unpacks step from op_arg[15:8] (so op_arg = (step<<8)|3) -- same shift-by-8 convention fan.pdx and ec.pdx use. target_ptr is accepted but unused at skeleton stage (reserved for a future N-panel system; today the one eDP panel is implicit). The handler name is cap_handler_backlight_drv (NOT cap_handler_backlight -- that symbol is claimed by the AUTHORITY-layer file cap/kind_backlight.pdx handling KIND_BACKLIGHT 0x15a, same two-handler shape every drv/authority pair in this cap-table uses). Three callee-save pushes (rbx=rights, r12=op_arg, r13=op_code) land rsp%16==0 at every nested call. Labels prefixed `bl_hd_`.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                        // rights
+        mov r12, rdx;                        // op_arg (preserve)
+        mov r13, rdx;
+        mov r10, 0xFF;
+        and r13, r10;                        // op_code = op_arg[7:0]
+
+        // --- Entry chatter.
+        mov rdi, 3;                          // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_DRV_];
+        lea rdx, [rip + bl_tag_handler_entry];
+        call klog_s1;
+
+        // --- Op dispatch.
+        cmp r13, 1;                          // BL_OP_SET_LEVEL
+        je  bl_hd_op_set_level;
+        cmp r13, 2;                          // BL_OP_GET_LEVEL
+        je  bl_hd_op_get_level;
+        cmp r13, 3;                          // BL_OP_SET_BCL_STEP
+        je  bl_hd_op_set_step;
+        cmp r13, 4;                          // BL_OP_READ_CURVE_N
+        je  bl_hd_op_read_curve;
+        jmp bl_hd_unsup;
+
+      bl_hd_op_set_level:
+        // Require R_BL_WRITE.
+        mov r10, rbx;
+        and r10, 0x002;                      // R_BL_WRITE
+        cmp r10, 0;
+        je  bl_hd_denied;
+        // Unpack level_u16 from op_arg[23:8] = op_arg >> 8 & 0xFFFF.
+        mov rdi, r12;
+        shr rdi, 8;
+        mov r10, 0xFFFF;
+        and rdi, r10;
+        call backlight_set_level;
+        jmp bl_hd_out;
+
+      bl_hd_op_get_level:
+        // Require R_BL_READ.
+        mov r10, rbx;
+        and r10, 0x001;                      // R_BL_READ
+        cmp r10, 0;
+        je  bl_hd_denied;
+        call backlight_get_level;
+        jmp bl_hd_out;
+
+      bl_hd_op_set_step:
+        // Require R_BL_WRITE.
+        mov r10, rbx;
+        and r10, 0x002;
+        cmp r10, 0;
+        je  bl_hd_denied;
+        // Unpack step_idx from op_arg[15:8] = op_arg >> 8 & 0xFF.
+        mov rdi, r12;
+        shr rdi, 8;
+        mov r10, 0xFF;
+        and rdi, r10;
+        call backlight_set_bcl_step;
+        jmp bl_hd_out;
+
+      bl_hd_op_read_curve:
+        // Require R_BL_READ.
+        mov r10, rbx;
+        and r10, 0x001;
+        cmp r10, 0;
+        je  bl_hd_denied;
+        call backlight_read_bcl_curve;
+        jmp bl_hd_out;
+
+      bl_hd_denied:
+        mov rax, 0xFFFFFFFFFFFFFFFD;         // INVOKE_DENIED
+        jmp bl_hd_out;
+
+      bl_hd_unsup:
+        mov rax, 0xFFFFFFFFFFFFFFFC;         // INVOKE_UNSUPPORTED
+
+      bl_hd_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // §O  Stat accessors -- single-load leaves for witness callers.
+  //
+  // Parallel to fan.pdx and iris_xe_hotplug.pdx accessor sets.  A
+  // boot witness can assert `backlight_inited() == 1 AND
+  // backlight_set_count() > 0` after a smoke test that drives
+  // cap_handler_backlight_drv a known number of times.
+  // ==========================================================================
+
+  pub let backlight_inited : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 76 D12 (paideia-os#2529): single-load getter for _bl_inited. Witness-side assertion anchor. Leaf.",
+      block: { mov rax, [rip + _bl_inited]; ret }
+    }
+
+  pub let backlight_dpcd_base : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 76 D12 (paideia-os#2529): single-load getter for _bl_dpcd_base -- the MMIO cookie backlight_init latched. Zero before init. Leaf.",
+      block: { mov rax, [rip + _bl_dpcd_base]; ret }
+    }
+
+  pub let backlight_last_level : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 76 D12 (paideia-os#2529): single-load getter for _bl_last_level -- the 16-bit level last written by backlight_set_level or composed by backlight_get_level. Zero before the first successful write/read. Leaf.",
+      block: { mov rax, [rip + _bl_last_level]; ret }
+    }
+
+  pub let backlight_last_step : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 76 D12 (paideia-os#2529): single-load getter for _bl_last_step -- the step_idx last attempted via backlight_set_bcl_step (stashed BEFORE the nested set_level, so a propagated refusal still records the step). Zero before the first attempt. Leaf.",
+      block: { mov rax, [rip + _bl_last_step]; ret }
+    }
+
+  pub let backlight_set_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 76 D12 (paideia-os#2529): single-load getter for _bl_set_ct. Bumped once per successful backlight_set_level. Leaf.",
+      block: { mov rax, [rip + _bl_set_ct]; ret }
+    }
+
+  pub let backlight_get_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 76 D12 (paideia-os#2529): single-load getter for _bl_get_ct. Bumped once per successful backlight_get_level. Leaf.",
+      block: { mov rax, [rip + _bl_get_ct]; ret }
+    }
+
+  pub let backlight_step_count : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 76 D12 (paideia-os#2529): single-load getter for _bl_step_ct. Bumped once per successful backlight_set_bcl_step (not bumped on a propagated set_level refusal, same discipline fan.pdx §M uses for POLICY). Leaf.",
+      block: { mov rax, [rip + _bl_step_ct]; ret }
+    }
+
+  // Per-step curve lookup -- single-load, zero-extended, for witnesses
+  // that want to confirm the ramp fill (or, after wave-77, the real
+  // _BCL evaluation).  Returns 0 for an out-of-range step_idx.
+  pub let backlight_curve_at : (u64) -> u64 !{mem} @{} =
+    fn (step_idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "Wave 76 D12 (paideia-os#2529): zero-extended u16 load from _bcl_curve[step_idx]. Returns 0 if step_idx >= 101 -- a defensive bound so a witness that overshoots the curve length does not read adjacent memory. Pure leaf. Labels prefixed `bl_ca_`.",
+      block: {
+        cmp rdi, 101;
+        jae bl_ca_bad;
+        lea r10, [rip + _bcl_curve];
+        xor rax, rax;
+        mov_w rax, [r10 + rdi * 2];
+        ret;
+      bl_ca_bad:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // §P  Boot wiring note
+  // ----------------
+  // kernel_main.pdx picks up `backlight_init(dpcd_base)` alongside
+  // the Iris Xe G2 modeset bring-up at the follow-up slice:
+  //
+  //   call iris_xe_modeset_init;    // brings up PIPE_A at native timing
+  //   mov rdi, <dpcd_base cookie>;
+  //   call backlight_init;          // latches the DPCD base + fills curve
+  //
+  // The dpcd_base cookie is the Iris Xe eDP AUX channel register-
+  // window base; iris_xe_modeset.pdx computes it from _dpyb_table
+  // [0] + 16 and exposes it via a `iris_xe_edp_dpcd_base()` getter
+  // the follow-up slice adds.
+  //
+  // At real boot .bss zero-init leaves _bl_inited zero and
+  // _bl_dpcd_base zero, so backlight_set_level / get_level /
+  // set_bcl_step correctly refuse until backlight_init is called;
+  // the KIND_BACKLIGHT_DRV dispatch arm is pure plumbing and self-
+  // standing.
+  // ==========================================================================
+}
