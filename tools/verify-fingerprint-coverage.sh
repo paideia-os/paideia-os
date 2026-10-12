@@ -83,6 +83,26 @@ ROOT = sys.argv[1]
 # ---------------------------------------------------------------------------
 
 ALLOWLIST = {
+    # Wave 96 R125.M2 (paideia-os#2592): svc.cap-minter daemon
+    # bringup + harness-only derive path. CAP_MINTER INIT OK fires
+    # on every boot from _cap_minter_init during the svc.* bringup
+    # cascade (kernel_main.pdx after schema_registry_bringup). No
+    # smoke mode currently asserts the svc.cap-minter boot line
+    # because R125.M3 (ELF .caps.decl loader + production dispatch)
+    # has not landed yet. CAP_MINTER DERIVE OK is harness-only at
+    # M2 and unreachable from any production path. Both retire from
+    # this allowlist when R125.M3 lands with an asserting golden.
+    "CAP_MINTER INIT OK":
+        "Wave 96 R125.M2: src/kernel/core/svc/cap_minter.pdx emits "
+        "this unconditionally on boot via _cap_minter_init in the "
+        "svc.* bringup cascade. Retires when R125.M3 (production "
+        "dispatch landing) adds an asserting smoke-mode golden.",
+    "CAP_MINTER DERIVE OK":
+        "Wave 96 R125.M2: src/kernel/core/svc/cap_minter.pdx emits "
+        "this from _cap_minter_derive. Unreachable from any "
+        "production path at M2 (harness-only; _cap_minter_set_active_env "
+        "is a stub). Retires when R125.M3 wires derive to IPC dispatch.",
+
     # Wave β (paideia-os compositor QEMU bring-up, α–τ plan): three
     # compositor bring-up markers that fire on every boot once
     # src/user/init.pdx's β-01 fork+exec+wait4 cycle runs the

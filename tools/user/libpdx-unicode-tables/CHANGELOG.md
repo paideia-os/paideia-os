@@ -4,6 +4,123 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] -- 2026-10-11
+
+R131.M7 of the semantic-shell Unicode umbrella (paideia-os#2480,
+decomposed into paideia-os#2618 for this M7).
+
+### Added
+
+- `src/locale.pdx` module `Locale`: BCP 47 locale registry
+  substrate for the shell, pds, and the GPU-native terminal.
+  - `_locale_parse(tag_ptr, tag_len) -> packed_u64` -- parses the
+    strict `xx-YY` five-byte BCP 47 subset, canonicalises the
+    language (lowercase) and region (uppercase) subtags, packs the
+    four normalised bytes into a 4-byte key, dispatches over the
+    seven keyed registry entries. Returns `(locale_id << 8) |
+    status` with status in {0=OK, 1=UNKNOWN, 2=MALFORMED}. Pure
+    leaf; no callee-save push.
+  - `_locale_default() -> u64` -- returns 0 (C / POSIX). Pure leaf.
+  - `_locale_direction(locale_id) -> u64` -- returns 1 (RTL) iff
+    locale_id in {6, 7} (he-IL, ar-SA); 0 (LTR) otherwise, including
+    every id outside the baseline registry. Pure leaf.
+  - `_locale_width_ambiguous_is_wide(locale_id) -> u64` -- returns
+    1 (wide) iff locale_id in {3, 4, 5} (ja-JP, zh-CN, ko-KR); 0
+    (narrow) otherwise. Pure leaf.
+  - Reduced locale registry at M7 (eight baseline entries):
+    - id 0: C / POSIX (default) -- LTR, narrow-ambiguous.
+    - id 1: en-US -- LTR, narrow-ambiguous.
+    - id 2: en-GB -- LTR, narrow-ambiguous.
+    - id 3: ja-JP -- LTR, wide-ambiguous.
+    - id 4: zh-CN -- LTR, wide-ambiguous.
+    - id 5: ko-KR -- LTR, wide-ambiguous.
+    - id 6: he-IL -- RTL, narrow-ambiguous.
+    - id 7: ar-SA -- RTL, narrow-ambiguous.
+  - Parse semantics: strict 5-byte `xx-YY` only (length != 5 ->
+    MALFORMED). Byte[2] separator gate: '_' (0x5F) is explicitly
+    MALFORMED (surfaces the POSIX `en_US` style as a loud
+    diagnostic); every non-'-' separator is MALFORMED. Case-
+    insensitive via byte-level normalise before key compare. A
+    well-formed 5-byte `xx-YY` with no registry hit is UNKNOWN
+    (status=1, locale_id=0 -- caller falls back to default
+    cleanly).
+- `tests/fingerprints/locale.golden`: 5 TAG lines (LOC_PARSE_EN,
+  LOC_PARSE_JA, LOC_PARSE_HE, LOC_PARSE_UNKNOWN, LOC_PARSE_MALFORMED)
+  with byte-level walk-throughs documented in the file header.
+  OUTPUT_HEX encodes the packed u64 return (16 nibbles big-endian).
+- `tests/proptest_locale.pdx` module `ProptestLocale`: three
+  invariant witnesses (default well-defined -- direction of default
+  locale is LTR; parse idempotent -- two calls on the same input
+  agree; direction totality -- every id in [0, 8) returns a
+  direction in {0, 1}) plus umbrella `pl_run_all`; fail codes in
+  the 0xFFFFEDDx band (extends the TestLexer / ProptestGrapheme /
+  ProptestNormalize / ProptestCollation / ProptestWidth /
+  ProptestBidi family).
+
+### Changed
+
+- `src/lib.pdx`: version bump 1.5.0 -> 1.6.0;
+  `LPX_UNICODE_VERSION_MINOR` = 6; `LPX_UNICODE_M7_READY` = 1;
+  `lpx_unicode_feature_level()` now returns 7. The per-milestone
+  commentary in `lib.pdx` reflects the M7-promotes-up renumbering:
+  locale registry took the M7 slot (was later in the earlier
+  drafts) so the streaming decoder (now M8) and utf16 bridge (M9)
+  slide down one.
+
+### Error band
+
+- 0xFFFFE770..0xFFFFE77F reserved for locale-layer error codes.
+  Zero slots used at M7 (every status fits in the low 8 bits of
+  the packed return). Jumps over the M5 slice
+  (0xFFFFE750..0xFFFFE75F) and sits above the M6 slice
+  (0xFFFFE760..0xFFFFE76F). Disjoint from the M1 (0xFFFFE700..0F),
+  M2 (0xFFFFE710..1F), M3 (0xFFFFE720..2F), M4 (0xFFFFE730..3F),
+  M5 (0xFFFFE750..5F), and M6 (0xFFFFE760..6F) slices and every
+  other band in the paideia-os tree. Reserved for later locale-
+  layer error kinds (LOCALE_TAG_TOO_LONG once length-flexible tags
+  land at M7.2; LOCALE_REGISTRY_FULL if the registry becomes
+  caller-populated at M7.5).
+
+### BCP 47 scope (strict xx-YY five-byte baseline)
+
+Phases IMPLEMENTED:
+
+- Strict `language-REGION` parse with 2-letter language and 2-letter
+  region, hyphen separator at byte offset 2.
+- Case-insensitive subtag matching via byte-level lowercase /
+  uppercase before key compare.
+- Explicit MALFORMED on '_' separator (loud diagnostic for POSIX-
+  style `en_US` input).
+- Direction and ambiguous-width policy accessors for the eight-
+  entry baseline registry.
+- Status propagation (OK / UNKNOWN / MALFORMED) packed into the
+  low 8 bits of the parser return, matching the
+  `_norm_nf{c,d,kc,kd}` / `_coll_sort_key` / `_width_str` /
+  `_bidi_runs` convention.
+
+Phases STUBBED at M7 (land at M7.1+ follow-ups):
+
+- Language-only parse (`en`, `ja`, `he`). M7.1 adds the 2-byte and
+  3-byte prefix path; each language maps to its first-registry-match
+  locale (en -> en-US, ja -> ja-JP, etc).
+- 3-letter language codes (ISO 639-3, `iw-IL`-style legacy). M7.1
+  target.
+- Script subtag (`sr-Cyrl-RS`). M7.2 target.
+- Variant subtags (`de-CH-1996`). M7.3 target.
+- Extension subtags (`en-US-u-ca-gregory`). M7.3 target.
+- Full locale axes (decimal separator, grouping separator,
+  currency symbol, first-day-of-week, per-locale date / time
+  patterns). M7.4+ target.
+- Larger CLDR registry slice (es, fr, de, it, pt, ru, pl, nl, tr,
+  vi, th, id, ms, hi, ...). M7.4 target.
+
+### Build
+
+- paideia-as >= 0.21.0 required (unchanged from M1..M6).
+- `tools/build.sh` emits per-module `build-out/*.o` objects for
+  `src/`, `tests/`, and `benches/`; no link step at M7 (downstream
+  satellites link via `--extra-obj-dir`).
+
 ## [1.5.0] -- 2026-10-11
 
 R131.M6 of the semantic-shell Unicode umbrella (paideia-os#2480,

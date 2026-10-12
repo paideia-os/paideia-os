@@ -2,8 +2,8 @@
 
 **Wave:** R131 (semantic shell -- Unicode substrate umbrella,
 paideia-os#2480)
-**Current milestone:** M6 (bidi runs, UAX #9 reduced five-class) -- landed.
-**Version:** 1.5.0.
+**Current milestone:** M7 (locale registry, BCP 47 subset) -- landed.
+**Version:** 1.6.0.
 
 See the R131 M-table in the umbrella issue (paideia-os#2480) for the
 upstream wave-level design; this file tracks the per-milestone
@@ -356,7 +356,78 @@ landing checklist as it closes locally.
 - Mirroring pairs (TR#9 §3.4): brackets and paired characters that
   mirror inside an RTL run. Needs UCD BidiMirroring.txt. M6.4 target.
 
-### M7 -- Streaming decoder iterator (planned)
+### M7 -- Locale registry (paideia-os#2618, landed)
+
+- [x] **M7-001** -- `src/locale.pdx` scaffold + module `Locale`, eight
+      locale_id constants (LOCALE_C=0, LOCALE_EN_US=1, LOCALE_EN_GB=2,
+      LOCALE_JA_JP=3, LOCALE_ZH_CN=4, LOCALE_KO_KR=5, LOCALE_HE_IL=6,
+      LOCALE_AR_SA=7), three status codes (LOCALE_STATUS_OK=0,
+      LOCALE_STATUS_UNKNOWN=1, LOCALE_STATUS_MALFORMED=2), direction
+      constants (LOCALE_DIR_LTR=0, LOCALE_DIR_RTL=1), ambiguous-width
+      constants (LOCALE_AMBIG_NARROW=0, LOCALE_AMBIG_WIDE=1),
+      error-band slice 0xFFFFE770..0xFFFFE77F (reserved; no slots
+      consumed at M7 since every status is encoded in the packed
+      return's low 8 bits).
+- [x] **M7-002** -- `_locale_parse(tag_ptr, tag_len) -> packed_u64`
+      real body: landed. Strict `xx-YY` five-byte parser:
+      `tag_len == 5` gate, byte[2] separator gate (reject '_' as
+      MALFORMED, require '-'), lowercase language bytes (A..Z ->
+      +0x20) and uppercase region bytes (a..z -> -0x20), pack the
+      four normalised bytes into a 4-byte key, dispatch over seven
+      registry keys (en-US, en-GB, ja-JP, zh-CN, ko-KR, he-IL,
+      ar-SA). Returns `(locale_id << 8) | status`. Pure leaf; no
+      callee-save push.
+- [x] **M7-003** -- `_locale_default() -> u64` real body: landed.
+      Returns 0 (C / POSIX). Pure leaf.
+- [x] **M7-004** -- `_locale_direction(locale_id) -> u64` real body:
+      landed. Returns 1 (RTL) iff locale_id in {6, 7}; 0 (LTR)
+      otherwise, including every id outside the baseline registry.
+      Pure leaf.
+- [x] **M7-005** -- `_locale_width_ambiguous_is_wide(locale_id)
+      -> u64` real body: landed. Returns 1 (wide) iff locale_id in
+      {3, 4, 5} (East Asian locales); 0 (narrow) otherwise. Pure
+      leaf.
+- [x] **M7-006** -- Fingerprint goldens:
+      `tests/fingerprints/locale.golden` with 5 TAG lines
+      (LOC_PARSE_EN, LOC_PARSE_JA, LOC_PARSE_HE, LOC_PARSE_UNKNOWN,
+      LOC_PARSE_MALFORMED); OUTPUT_HEX encodes the packed u64 return
+      (16 nibbles big-endian).
+- [x] **M7-007** -- Proptest witnesses:
+      `tests/proptest_locale.pdx` with 3 invariants (default
+      well-defined, parse idempotent, direction totality) and
+      umbrella `pl_run_all`; fail codes in the 0xFFFFEDDx band.
+- [x] **M7-008** -- Design doc:
+      `design/toolchain/libpdx-unicode-locale.md`.
+
+**M7 limitations (stubbed; tracked for M7.1+ follow-up tickets):**
+
+- Strict 5-byte `xx-YY` shape only. Shorter language-only tags
+  (`en`, `ja`), 3-letter language codes (ISO 639-3), script subtags
+  (`sr-Cyrl-RS`), variant subtags (`de-CH-1996`), and extension
+  subtags (`en-US-u-ca-gregory`) are MALFORMED at M7. M7.1 lands the
+  2-byte and 3-byte prefix path first (needed before environment-
+  variable passthrough `LANG=en` stops surfacing MALFORMED on an
+  otherwise legal POSIX value).
+- Eight-entry baseline registry (C, en-US, en-GB, ja-JP, zh-CN,
+  ko-KR, he-IL, ar-SA). Covers every direction / ambiguous-width
+  class the M6 / M5 primitives distinguish today; a larger CLDR
+  slice (es, fr, de, it, pt, ru, pl, nl, tr, vi, th, id, ms, hi, ...)
+  lands at M7.4.
+- Direction and ambiguous-wide only. Full locale axes (decimal
+  separator, grouping separator, currency symbol, first-day-of-week,
+  per-locale date / time patterns) are M7.4+ work.
+- The eighth entry (C / POSIX) is reachable only through
+  `_locale_default()`; the parser never resolves to it because its
+  canonical tag is not `xx-YY`. A caller that wants to parse the
+  literal strings `C` or `POSIX` into id=0 can intercept them above
+  this library (shell dispatch, environment-variable parser).
+- Error band 0xFFFFE770..0xFFFFE77F is reserved but holds no slots
+  at M7; every status fits in the low 8 bits of the packed return.
+  M7.1+ error kinds (LOCALE_TAG_TOO_LONG at M7.2, LOCALE_REGISTRY_FULL
+  if the registry becomes caller-populated at M7.5) land as band
+  values.
+
+### M8 -- Streaming decoder iterator (planned)
 
 - [ ] `utf8_decode_iter_begin(src_ptr, src_len) -> handle`
 - [ ] `utf8_decode_iter_next(handle) -> packed | UTF8_* | EOF`
@@ -365,19 +436,12 @@ landing checklist as it closes locally.
       a 24-byte struct `{src_ptr, src_len, pos}` the caller allocates
       and the primitives walk; no cap, no syscall).
 
-### M8 -- UTF-16 bridge (planned)
+### M9 -- UTF-16 bridge (planned)
 
 - [ ] `utf8_offset_to_utf16(src_ptr, src_len, utf8_off) -> utf16_off`
 - [ ] `utf16_offset_to_utf8(src_ptr, src_len, utf16_off) -> utf8_off`
 - [ ] `utf8_offset_to_utf32` / `utf32_offset_to_utf8`
 - [ ] Mirror of the paideia-as-unicode `lsp_bridge` module.
-
-### M9 -- Stream validators (planned)
-
-- [ ] `utf8_validate_stream` -- fail-fast whole-buffer validator.
-- [ ] `utf8_validate_stream_recover` -- walks past the first
-      malformed byte and reports every error offset, matching
-      `paideia-as-unicode::Utf8Decoder::next`'s per-byte recovery.
 
 ## Compatibility posture
 
@@ -451,3 +515,21 @@ with `shl i, 4`. M6 is additive and preserves every
 M1 + M2 + M3 + M4 + M5 symbol unchanged -- v1.5.0 is
 backward-compatible with v1.4.0, v1.3.0, v1.2.0, v1.1.0, and
 v1.0.0.
+
+M7 adds four public bindings (`_locale_parse`, `_locale_default`,
+`_locale_direction`, `_locale_width_ambiguous_is_wide`), eight
+locale_id constants (LOCALE_C=0, LOCALE_EN_US=1, LOCALE_EN_GB=2,
+LOCALE_JA_JP=3, LOCALE_ZH_CN=4, LOCALE_KO_KR=5, LOCALE_HE_IL=6,
+LOCALE_AR_SA=7), three status codes (LOCALE_STATUS_OK=0,
+LOCALE_STATUS_UNKNOWN=1, LOCALE_STATUS_MALFORMED=2), two direction
+constants (LOCALE_DIR_LTR=0, LOCALE_DIR_RTL=1), two ambiguous-width
+constants (LOCALE_AMBIG_NARROW=0, LOCALE_AMBIG_WIDE=1), seven
+registry key constants (LOCALE_KEY_EN_US..LOCALE_KEY_AR_SA), and
+the locale error band 0xFFFFE770..0xFFFFE77F (reserved; no slots
+used -- every status fits in the low 8 bits of
+`_locale_parse`'s packed return). `_locale_default`,
+`_locale_direction`, and `_locale_width_ambiguous_is_wide` return
+small enum values directly as u64 with no error band. M7 is
+additive and preserves every M1 + M2 + M3 + M4 + M5 + M6 symbol
+unchanged -- v1.6.0 is backward-compatible with v1.5.0, v1.4.0,
+v1.3.0, v1.2.0, v1.1.0, and v1.0.0.
