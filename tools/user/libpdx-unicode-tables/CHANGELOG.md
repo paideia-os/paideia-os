@@ -4,6 +4,81 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] -- 2026-10-11
+
+R131.M8 of the semantic-shell Unicode umbrella (paideia-os#2480,
+decomposed into paideia-os#2619 for this M8).
+
+### Added
+
+- `src/ipc_nfc.pdx` module `IpcNfc`: IPC-boundary NFC hook enforcing
+  the canonical-form invariant across the paideia-os IPC fabric.
+  - `_ipc_nfc_check(bytes_ptr, bytes_len) -> packed_u64` -- scans
+    the byte range for UTF-8 lead bytes 0xCC and 0xCD (the combining
+    diacriticals block U+0300..U+037F). Any hit returns is_nfc=0;
+    no hit returns is_nfc=1. Returns `(is_nfc << 32) | status` with
+    status always 0 at M8 (the check does no UTF-8 validation; that
+    is the apply path's responsibility). Pure leaf; O(bytes_len);
+    no .bss touch; no nested CALL.
+  - `_ipc_nfc_apply(bytes_ptr, bytes_len, out_ptr, out_cap) ->
+    packed_u64` -- thin wrapper over M3's `_norm_nfc` with the
+    identical 4-arg signature (no arg-shuffle required). Returns
+    the normalise result unchanged: `(out_bytes << 32) | status`
+    with status in {0=OK, 1=OUT_TOO_SMALL, 2=INVALID_UTF8}. One
+    nested CALL into `_norm_nfc`; `sub rsp, 8` + `add rsp, 8` for
+    SysV alignment.
+  - Fast-path heuristic: never a false-POSITIVE on NFC (every M3
+    canonical-decomposition entry's mark cp is in U+0300..U+036F,
+    whose UTF-8 lead is exactly 0xCC/0xCD, so a no-hit scan
+    guarantees no decomposition could apply). MAY be a false-
+    NEGATIVE on NFC-stable inputs that happen to contain a 0xCC
+    or 0xCD byte in a non-mark role (e.g. Greek U+0370+); false
+    negatives cost one no-op apply call and no correctness loss.
+  - Error band 0xFFFFE780..0xFFFFE78F reserved for M8 (currently
+    empty; every status fits in the low 8 bits of the packed
+    return). Disjoint from every other user-space band in the
+    paideia-os tree.
+- `tests/fingerprints/ipc_nfc.golden`: 5 golden fingerprints
+  (IPC_NFC_ASCII, IPC_NFC_PRECOMPOSED, IPC_NFC_DECOMPOSED,
+  IPC_NFC_EMPTY, IPC_NFC_APPLY). Four check cases encoded as
+  16-nibble big-endian packed u64; apply case encoded as the
+  output bytes (shape matches normalize.golden).
+- `tests/proptest_ipc_nfc.pdx` module `ProptestIpcNfc`: three
+  invariant witnesses -- PIN_IDEMPOTENT (apply(apply(x)) ==
+  apply(x)), PIN_CHECK_APPLY (check(apply(x)) == is_nfc=1),
+  PIN_ASCII (check("hello") == is_nfc=1) -- and umbrella
+  `pin_run_all`. Fail codes in the 0xFFFFEDEx band.
+- `design/toolchain/libpdx-unicode-ipc-nfc.md`: design doc.
+
+### Changed
+
+- `src/lib.pdx`:
+  - `LPX_UNICODE_VERSION_MINOR`: 6 -> 7.
+  - `LPX_UNICODE_M8_READY`: 0 -> 1.
+  - `lpx_unicode_feature_level()`: returns 8 (up from 7).
+  - M8 slot repurposed from "streaming decoder" (now M9) to the
+    IPC-boundary NFC hook; the streaming decoder and the utf16
+    bridge move one slot each (M9 and M10 respectively).
+
+### Deferred (tracked in STATUS.md "M8 limitations")
+
+- Kernel-side `sys_ipc_recv` hook: not landed. The normaliser's
+  .bss scratch + M3 decomp table (~3 KiB) cannot be called from
+  the kernel's IPC fast path without duplicating state or
+  trampolining through userspace. M8 lands the ring-3 convention
+  "every IPC receiver's glue calls `_ipc_nfc_apply`"; a VPC- or
+  pds-side wrapper that applies it uniformly across every
+  channel's receive path is M8.1 target.
+- Exact-check variant `_ipc_nfc_check_exact`: opt-in exact
+  predicate that calls `_norm_nfc` and byte-compares against the
+  input. M8.2 target.
+- Table-synchronised scan growth: as M3 grows its decomposition
+  table (Devanagari M3.2+, Arabic M3.3+, CJK M3.4+), the check's
+  scan loop must grow in lockstep. M8.3 target.
+- `_ipc_nfkc_apply`: compatibility-fold sibling for sites that
+  need NFKC at the IPC boundary (e.g. fullwidth-ASCII cleanup
+  for Japanese IME input). M8.4 target.
+
 ## [1.6.0] -- 2026-10-11
 
 R131.M7 of the semantic-shell Unicode umbrella (paideia-os#2480,

@@ -2,8 +2,8 @@
 
 **Wave:** R131 (semantic shell -- Unicode substrate umbrella,
 paideia-os#2480)
-**Current milestone:** M7 (locale registry, BCP 47 subset) -- landed.
-**Version:** 1.6.0.
+**Current milestone:** M8 (IPC-boundary NFC hook) -- landed.
+**Version:** 1.7.0.
 
 See the R131 M-table in the umbrella issue (paideia-os#2480) for the
 upstream wave-level design; this file tracks the per-milestone
@@ -427,7 +427,73 @@ landing checklist as it closes locally.
   if the registry becomes caller-populated at M7.5) land as band
   values.
 
-### M8 -- Streaming decoder iterator (planned)
+### M8 -- IPC-boundary NFC hook (paideia-os#2619, landed)
+
+- [x] **M8-001** -- `src/ipc_nfc.pdx` scaffold + module `IpcNfc`,
+      three status codes (IPC_NFC_STATUS_OK=0,
+      IPC_NFC_STATUS_OUT_TOO_SMALL=1, IPC_NFC_STATUS_INVALID_UTF8=2),
+      two is_nfc constants (IPC_NFC_NOT_NFC=0, IPC_NFC_IS_NFC=1),
+      error-band slice 0xFFFFE780..0xFFFFE78F (reserved; no slots
+      consumed at M8 since every status is encoded in the low 8
+      bits of the packed return).
+- [x] **M8-002** -- `_ipc_nfc_check(bytes_ptr, bytes_len) -> packed_u64`
+      real body: landed. Single-pass byte scan for UTF-8 lead bytes
+      0xCC and 0xCD (U+0300..U+037F combining-marks block). Any hit
+      returns is_nfc=0; no hit returns is_nfc=1. Status always 0
+      (no UTF-8 validation at the check layer). Pure leaf; no
+      callee-save push; no stack frame.
+- [x] **M8-003** -- `_ipc_nfc_apply(bytes_ptr, bytes_len, out_ptr,
+      out_cap) -> packed_u64` real body: landed. Thin wrapper over
+      M3's `_norm_nfc` (identical 4-arg signature; no arg-shuffle
+      needed). Returns the normalise result unchanged. One nested
+      CALL (`_norm_nfc`); `sub rsp, 8` + `add rsp, 8` for alignment.
+- [x] **M8-004** -- Fingerprint goldens:
+      `tests/fingerprints/ipc_nfc.golden` with 5 TAG lines
+      (IPC_NFC_ASCII, IPC_NFC_PRECOMPOSED, IPC_NFC_DECOMPOSED,
+      IPC_NFC_EMPTY, IPC_NFC_APPLY). Four check cases encoded as
+      16-nibble big-endian packed u64; apply case encoded as the
+      output bytes (same convention as normalize.golden).
+- [x] **M8-005** -- Proptest witnesses:
+      `tests/proptest_ipc_nfc.pdx` module `ProptestIpcNfc` with 3
+      invariants (idempotence, check-apply agreement, ASCII fast
+      path) and umbrella `pin_run_all`; fail codes in the
+      0xFFFFEDEx band.
+- [x] **M8-006** -- Design doc:
+      `design/toolchain/libpdx-unicode-ipc-nfc.md`.
+
+**M8 limitations (ring-3-only; tracked for M8.1+ follow-up tickets):**
+
+- Kernel-side per-syscall hook in `sys_ipc_recv` NOT landed. The
+  normaliser is a ring-3 library using .bss scratch and the M3
+  decomp table (~3 KiB), neither of which the kernel's IPC fast
+  path can call without duplicating the state or trampolining
+  through userspace. The convention at M8 is "every IPC receiver's
+  ring-3 glue calls `_ipc_nfc_apply` on each string field it
+  parses". A VPC-side or pds-side wrapper that applies the hook
+  uniformly across every channel's receive path is M8.1 target.
+- Check is a CONSERVATIVE OVER-APPROXIMATION of NFC: it reports
+  is_nfc=1 on inputs that are actually already NFC (correct), and
+  MAY report is_nfc=0 on inputs that are also already NFC (e.g. a
+  bare U+0300 combining mark with no preceding base). False
+  negatives cost one no-op apply call; false positives cannot
+  occur (every M3 decomposition entry's mark cp is in U+0300..036F
+  whose UTF-8 lead is 0xCC/0xCD, exhaustively covered by the
+  scan). The exact check that calls _norm_nfc and byte-compares
+  against the input is landed as an opt-in `_ipc_nfc_check_exact`
+  at M8.2.
+- The scan does NOT widen for post-M3 decomposition table growth
+  (Devanagari, Hebrew, Arabic, CJK -- planned for M3.2+). As M3
+  grows, the check's scan loop must grow in lockstep with
+  additional `cmp rax, 0xXX; je ipc_chk_not_nfc` lines for the
+  new blocks' combining-mark UTF-8 lead bytes. M8.3 lands the
+  M3.2-synchronised scan.
+- The hook always normalises to NFC. If a future consumer site
+  needs NFKC (compatibility fold -- e.g. a fullwidth-ASCII cleanup
+  pass for Japanese IME input), that site must call `_norm_nfkc`
+  directly. M8.4 lands `_ipc_nfkc_apply` as a sibling entry point
+  if the demand materialises.
+
+### M9 -- Streaming decoder iterator (planned)
 
 - [ ] `utf8_decode_iter_begin(src_ptr, src_len) -> handle`
 - [ ] `utf8_decode_iter_next(handle) -> packed | UTF8_* | EOF`
@@ -436,7 +502,7 @@ landing checklist as it closes locally.
       a 24-byte struct `{src_ptr, src_len, pos}` the caller allocates
       and the primitives walk; no cap, no syscall).
 
-### M9 -- UTF-16 bridge (planned)
+### M10 -- UTF-16 bridge (planned)
 
 - [ ] `utf8_offset_to_utf16(src_ptr, src_len, utf8_off) -> utf16_off`
 - [ ] `utf16_offset_to_utf8(src_ptr, src_len, utf16_off) -> utf8_off`
@@ -515,6 +581,21 @@ with `shl i, 4`. M6 is additive and preserves every
 M1 + M2 + M3 + M4 + M5 symbol unchanged -- v1.5.0 is
 backward-compatible with v1.4.0, v1.3.0, v1.2.0, v1.1.0, and
 v1.0.0.
+
+M8 adds two public bindings (`_ipc_nfc_check`, `_ipc_nfc_apply`),
+three status codes (IPC_NFC_STATUS_OK=0, IPC_NFC_STATUS_OUT_TOO_SMALL=1,
+IPC_NFC_STATUS_INVALID_UTF8=2, same values as M3's Normalize status
+codes), two is_nfc constants (IPC_NFC_NOT_NFC=0, IPC_NFC_IS_NFC=1), and
+the ipc-nfc error band 0xFFFFE780..0xFFFFE78F (reserved; no slots used
+-- every status fits in the low 8 bits of `_ipc_nfc_apply`'s packed
+return, and `_ipc_nfc_check` never fails since it does no UTF-8
+validation). `_ipc_nfc_check` returns `(is_nfc << 32) | status` with
+is_nfc in {0, 1} and status always 0 at M8. `_ipc_nfc_apply` returns
+`(out_bytes << 32) | status` with the same shape as `_norm_nfc` (it is
+a direct pass-through). M8 is additive and preserves every
+M1 + M2 + M3 + M4 + M5 + M6 + M7 symbol unchanged -- v1.7.0 is
+backward-compatible with v1.6.0, v1.5.0, v1.4.0, v1.3.0, v1.2.0,
+v1.1.0, and v1.0.0.
 
 M7 adds four public bindings (`_locale_parse`, `_locale_default`,
 `_locale_direction`, `_locale_width_ambiguous_is_wide`), eight
