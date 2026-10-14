@@ -1,0 +1,1158 @@
+// src/kernel/core/svc/remote_shell_handshake.pdx -- Wave UMB-W20 R137.M2
+// paideia-os #2634
+//
+// SVC.REMOTE-SHELL HANDSHAKE: HYBRID-KEM HANDSHAKE (ML-KEM-768-ONLY SPLIT)
+// =============================================================================
+//
+// R137 ("cross-host pipeline transport") milestone M2.  M2 lands the
+// cryptographic handshake that drives a svc.remote-shell connection
+// from RS_STATE_INIT -> RS_STATE_HANDSHAKE -> RS_STATE_ESTABLISHED,
+// supplying the 32-byte session key the wire-protocol parser (R137.M3)
+// consumes to seal/open rx/tx frames with ChaCha20-Poly1305.
+//
+// SCOPE POSTURE: **SPLIT**.
+//
+//   The task directive specifies a HYBRID handshake: ephemeral X25519
+//   + ML-KEM-768 with the session key derived from BOTH shared
+//   secrets.  paideia-as today ships ML-KEM-768 as a C-ABI thunk
+//   (paideia_crypto_ml_kem_768_{keygen,encaps,decaps}) and BLAKE3 as
+//   paideia_crypto_blake3_hash, but X25519 is Rust-side only --
+//   paideia-as-crypto::curve::x25519 implements scalarmult and
+//   public_from_secret, but no extern-C FFI thunk is exported.
+//
+//   M2 therefore lands the ML-KEM-768-only path with:
+//     * state wiring complete (INIT -> HANDSHAKE -> ESTABLISHED)
+//     * session key = BLAKE3("paideia-rsh-v1-mlkem-only" || mlkem_ss)
+//     * fingerprint suite=mlkem-only (NOT suite=hybrid)
+//     * reduced security: PQ-safe but NOT forward-secure in the
+//       hybrid sense (a later leak of dk_srv_long recovers every
+//       past session key from recorded ciphertexts).
+//
+//   The follow-up ticket paideia-as#<X25519-FFI> adds the X25519
+//   thunk; paideia-os#<R137.M2-split> widens _rsh_init_client and
+//   _rsh_accept_server with X25519 pointers and swaps the derivation
+//   domain separator to "paideia-rsh-v1".  See
+//   design/shell/remote-shell-hybrid-kem.md for the full flow.
+//
+// Public API (M2 shape):
+//   _rsh_server_keygen(conn_id, seed_d_32B, seed_z_32B, out_ek_1184B)
+//                                                              -> errno
+//   _rsh_init_client(conn_id, server_ek_1184B, seed_m_32B,
+//                    out_ct_1088B)                             -> errno
+//   _rsh_accept_server(conn_id, client_ct_1088B)               -> errno
+//   _rsh_derive_session_key(conn_id, out_session_key_32B)      -> errno
+//
+// =============================================================================
+// SECTION 1  WHERE PER-CONN CRYPTO STATE LIVES
+// =============================================================================
+//
+// The M1 daemon (remote_shell.pdx) reserved a 128-byte slack region
+// at [conn_row+128] for exactly this purpose.  M2 lays it out as:
+//
+//   [+128..+160]  x25519_priv (32 B)  -- zeros at M2; populated at M3-split
+//   [+160..+192]  x25519_pub  (32 B)  -- zeros at M2
+//   [+192..+224]  mlkem_ss    (32 B)  -- ML-KEM shared secret
+//   [+224..+256]  slack       (32 B)  -- reserved (x25519_ss at M3-split)
+//
+// ML-KEM-768's 2400 B decapsulation key does NOT fit in the row's
+// 128 B slack.  It lives in a separate .bss region
+// _rsh_hs_scratch[conn_id * 4096], laid out as:
+//
+//   Per-conn 4096 B page:
+//     [+0..+2400]      dk (2400 B)  -- server dk; zero on client-only rows
+//     [+2400..+4096]   slack        -- reserved for future ek caching,
+//                                      transcript hash, etc.
+//
+// The 4096 B stride is a power of two (`shl rax, 12`) -- no `imul r,
+// imm` encoder gap.  @align(4096) puts each per-conn page on its own
+// page frame so a future reader-view (R137.M4) can map it with a
+// single PTE if needed.
+//
+// The M1 daemon's [conn_row+16] kem_session_slot field is an opaque
+// u64 to the daemon layer.  M2 uses it as a BOUNDNESS SENTINEL:
+//
+//   0 = handshake slot not bound (M1 _accept state)
+//   1 = handshake slot bound; crypto state at
+//       _rsh_hs_scratch[conn_id * 4096] and [conn_row+128..+256]
+//       is live.
+//
+// =============================================================================
+// SECTION 2  STATE TRANSITIONS
+// =============================================================================
+//
+//                     _rsh_server_keygen
+//                     _rsh_init_client
+//      RS_STATE_INIT -----------------------> RS_STATE_HANDSHAKE
+//                                                    |
+//                               _rsh_accept_server   | (server only;
+//                               (no state change)    |  no-op on state)
+//                                                    v
+//                                             RS_STATE_HANDSHAKE
+//                                                    |
+//                               _rsh_derive_session_key
+//                                                    |
+//                                                    v
+//                                         RS_STATE_ESTABLISHED
+//
+// Pre-condition checks per function:
+//
+//   _rsh_server_keygen      pre: INIT        post: HANDSHAKE
+//   _rsh_init_client        pre: INIT        post: HANDSHAKE
+//   _rsh_accept_server      pre: HANDSHAKE   post: HANDSHAKE
+//   _rsh_derive_session_key pre: HANDSHAKE   post: ESTABLISHED
+//
+// The M1 daemon's _remote_shell_set_state is PERMISSIVE (accepts any
+// valid state in [0, 5)); M2 enforces the STRICT matrix at this layer
+// by refusing RSH_ERR_STATE when the pre-call state is wrong.
+//
+// =============================================================================
+// SECTION 3  RETURN CODE BAND
+// =============================================================================
+//
+//   RSH_OK           = 0           (success)
+//   RSH_ERR_BAD_CONN = 0x1D01      (REUSE of RS_ERR_BAD_ID)
+//   RSH_ERR_CRYPTO   = 0x1D10      (ML-KEM or BLAKE3 call returned nonzero)
+//   RSH_ERR_STATE    = 0x1D11      (pre-state mismatch)
+//
+// All fit imm32 with bit 31 clear so `mov rax, imm32` emits the
+// 7-byte zero-extending form (never `and r11, imm64`).  Band
+// `0x1D10..0x1D1F` reserved for R137.M2+ handshake-side codes; band
+// `0x1D00..0x1D0F` remains the daemon's (per remote_shell.pdx §3).
+//
+// =============================================================================
+// SECTION 4  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Labels are prefixed `rsh_` (distinct from `rs_` -- the M1 daemon's
+// prefix).  No reserved paideia-as keyword overlap (reserved: loop /
+// if / let).  Encoder-pitfall posture (feedback_pdx_encoder_
+// pitfalls):
+//
+//   * cmp rN, 0            (never `test rN, rN`)
+//   * shl rN, 8 for row stride, shl rN, 12 for scratch stride
+//                          (never `imul r, imm`)
+//   * mov rax, imm32       (never `and r11, imm64` with bit-31-set imm)
+//   * single-line `pub let name = "..."`
+//   * module basename RemoteShellHandshake matches file basename
+//     remote_shell_handshake.pdx (ddc requires exact match)
+//   * fingerprint `[u8; N]` with N = string length + 1 (NUL counts)
+//
+// Stack discipline (SysV, entry rsp%16==8):
+//   rsh_row_base              0 pushes (pure leaf address compute)
+//   rsh_scratch_base          0 pushes (pure leaf)
+//   rsh_check_state           0 pushes (pure leaf)
+//   _rsh_server_keygen        4 pushes + sub rsp, 8
+//   _rsh_init_client          4 pushes + sub rsp, 8
+//   _rsh_accept_server        2 pushes + sub rsp, 8
+//   _rsh_derive_session_key   2 pushes + sub rsp, 8
+//
+// Call paideia_crypto_* resolves at link time via libpaideia_
+// satellite_runtime.a (precedent: inode.pdx, schema_registry.pdx,
+// kind_firmware_blob.pdx, sys_dek_apply_body.pdx).  Call
+// _remote_shell_set_state resolves against the sibling module
+// remote_shell.pdx linked into the kernel image.
+//
+// =============================================================================
+
+module RemoteShellHandshake = structure {
+
+  // ==========================================================================
+  // Return band (§3)
+  // ==========================================================================
+
+  pub let RSH_OK           : u64 = 0
+  pub let RSH_ERR_BAD_CONN : u64 = 0x1D01   // alias of RS_ERR_BAD_ID
+  pub let RSH_ERR_CRYPTO   : u64 = 0x1D10
+  pub let RSH_ERR_STATE    : u64 = 0x1D11
+
+  // ==========================================================================
+  // Pool geometry mirrors (§1).  These MUST agree with remote_shell.pdx
+  // (RS_POOL_MAX = 4, RS_ROW_BYTES = 256).  They are duplicated here
+  // (not imported) because the paideia-as module system resolves
+  // sibling `pub let` constants at link time but not at compile time;
+  // keeping local copies lets the elaborator fold them into imm32
+  // operands.
+  // ==========================================================================
+
+  pub let RSH_POOL_MAX   : u64 = 4
+  pub let RSH_ROW_BYTES  : u64 = 256
+
+  // Row-field offsets, mirrored from remote_shell.pdx.
+  pub let RSH_OFF_SF        : u64 = 8     // packed state | flags
+  pub let RSH_OFF_KEM_SLOT  : u64 = 16    // kem_session_slot sentinel
+  pub let RSH_OFF_RESERVED  : u64 = 128   // handshake crypto state base
+  pub let RSH_OFF_X_PRIV    : u64 = 128   // [128..160] x25519 priv (M3)
+  pub let RSH_OFF_X_PUB     : u64 = 160   // [160..192] x25519 pub  (M3)
+  pub let RSH_OFF_MLKEM_SS  : u64 = 192   // [192..224] mlkem shared secret
+  pub let RSH_OFF_SLACK     : u64 = 224   // [224..256] reserved
+
+  // State machine, mirrored from remote_shell.pdx §2.
+  pub let RSH_STATE_INIT        : u64 = 0
+  pub let RSH_STATE_HANDSHAKE   : u64 = 1
+  pub let RSH_STATE_ESTABLISHED : u64 = 2
+
+  // Boundness sentinel for kem_session_slot.
+  pub let RSH_SLOT_BOUND        : u64 = 1
+
+  // ML-KEM-768 buffer lengths (FIPS 203 §7).  Mirrored verbatim from
+  // paideia-as-crypto/src/ffi/ml_kem_768.rs so the elaborator folds
+  // them into imm32 operands.
+  pub let RSH_MLKEM_EK_LEN : u64 = 1184
+  pub let RSH_MLKEM_DK_LEN : u64 = 2400
+  pub let RSH_MLKEM_CT_LEN : u64 = 1088
+  pub let RSH_MLKEM_SS_LEN : u64 = 32
+  pub let RSH_MLKEM_SEED_LEN : u64 = 32
+
+  // Handshake scratch geometry.  4096 B per conn, stride power of two
+  // for `shl rax, 12`.
+  pub let RSH_SCRATCH_STRIDE : u64 = 4096
+  pub let RSH_SCRATCH_DK_OFF : u64 = 0      // dk at [+0..+2400]
+
+  // ==========================================================================
+  // Storage
+  //
+  //   _rsh_hs_scratch -- 4 x 4096 bytes = 16 KiB.  Per-conn pages hold
+  //                      the server-side ML-KEM dk (2400 B) with slack
+  //                      for future use.  @align(4096) puts each page
+  //                      on its own page frame.
+  //   _rsh_hs_stats   -- 16 u64 counters (observability).
+  //   _rsh_derive_scratch -- 32-byte BLAKE3 output for session key
+  //                      derivation + context-string buffer.
+  // ==========================================================================
+
+  pub let mut _rsh_hs_scratch     : [u8; 16384] = uninit @align(4096)
+  pub let mut _rsh_hs_stats       : [u64; 16]  = uninit @align(64)
+  pub let mut _rsh_derive_scratch : [u8; 32]   = uninit @align(8)
+
+  // Domain-separated context string for session-key derivation.
+  // "paideia-rsh-v1-mlkem-only" is 25 bytes; +1 NUL => N=26.  BLAKE3
+  // hashes the string EXCLUDING the trailing NUL -- we feed len=25.
+  pub let rsh_kdf_ctx     : [u8; 26] = "paideia-rsh-v1-mlkem-only\0"
+  pub let RSH_KDF_CTX_LEN : u64 = 25
+
+  // The BLAKE3 input is (ctx || mlkem_ss) = 25 + 32 = 57 bytes.
+  // The derivation path copies both into _rsh_derive_input before
+  // calling paideia_crypto_blake3_hash.
+  pub let mut _rsh_derive_input : [u8; 64] = uninit @align(8)
+  pub let RSH_DERIVE_INPUT_LEN  : u64 = 57
+
+  // ==========================================================================
+  // Stats slots
+  // ==========================================================================
+
+  pub let RSH_ST_KEYGEN_OK      : u64 = 0
+  pub let RSH_ST_KEYGEN_REJ     : u64 = 1
+  pub let RSH_ST_INIT_OK        : u64 = 2
+  pub let RSH_ST_INIT_REJ       : u64 = 3
+  pub let RSH_ST_ACCEPT_OK      : u64 = 4
+  pub let RSH_ST_ACCEPT_REJ     : u64 = 5
+  pub let RSH_ST_DERIVE_OK      : u64 = 6
+  pub let RSH_ST_DERIVE_REJ     : u64 = 7
+
+  // ==========================================================================
+  // Fingerprint tags (N = len(string) + 1, NUL-inclusive)
+  //
+  // Only the "OK" tags are extracted by the fingerprint-coverage gate
+  // (regex matches bare word OK); the FAIL/REJ tags are opaque to the
+  // gate so no allowlist entry is required for them.
+  //
+  // "RSH KEYGEN OK"       = 13 chars, +1 NUL => N=14
+  // "RSH KEYGEN REJ"      = 14 chars, +1 NUL => N=15
+  // "RSH INIT OK"         = 11 chars, +1 NUL => N=12
+  // "RSH INIT REJ"        = 12 chars, +1 NUL => N=13
+  // "RSH ACCEPT OK"       = 13 chars, +1 NUL => N=14
+  // "RSH ACCEPT REJ"      = 14 chars, +1 NUL => N=15
+  // "RSH DERIVE OK"       = 13 chars, +1 NUL => N=14
+  // "RSH DERIVE REJ"      = 14 chars, +1 NUL => N=15
+  // ==========================================================================
+
+  pub let rsh_tag_keygen_ok  : [u8; 14] = "RSH KEYGEN OK\0"
+  pub let rsh_tag_keygen_rej : [u8; 15] = "RSH KEYGEN REJ\0"
+  pub let rsh_tag_init_ok    : [u8; 12] = "RSH INIT OK\0"
+  pub let rsh_tag_init_rej   : [u8; 13] = "RSH INIT REJ\0"
+  pub let rsh_tag_accept_ok  : [u8; 14] = "RSH ACCEPT OK\0"
+  pub let rsh_tag_accept_rej : [u8; 15] = "RSH ACCEPT REJ\0"
+  pub let rsh_tag_derive_ok  : [u8; 14] = "RSH DERIVE OK\0"
+  pub let rsh_tag_derive_rej : [u8; 15] = "RSH DERIVE REJ\0"
+
+  pub let rsh_k_cid    : [u8; 4] = "cid\0"
+  pub let rsh_k_errno  : [u8; 6] = "errno\0"
+  pub let rsh_k_suite  : [u8; 6] = "suite\0"
+
+  // The "suite" KV emits as a numeric; 0 = mlkem-only (M2),
+  // 1 = hybrid (M3-split).  Numeric keeps the klog_s1_x1 shape
+  // (hex-u64 formatter) without needing a string KV sink.
+  pub let RSH_SUITE_MLKEM_ONLY : u64 = 0
+  pub let RSH_SUITE_HYBRID     : u64 = 1
+
+  // ==========================================================================
+  // rsh_note(slot) -> ()
+  //
+  // Bounded increment on _rsh_hs_stats[slot].  Same shape as rs_note /
+  // js_note / ss_note.  Caller passes an RSH_ST_* ordinal in [0, 16);
+  // out-of-range slots silently no-op.  Pure leaf -- no pushes.
+  // Labels prefixed rsh_no_.
+  // ==========================================================================
+  pub let rsh_note : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M2 (paideia-os #2634): bounded increment on _rsh_hs_stats[slot<16]. Load-inc-store, no `add reg,[mem]`. Pure leaf -- no pushes. Labels prefixed rsh_no_. Mirrors rs_note / js_note shape.",
+      block: {
+        cmp rdi, 16;
+        jae rsh_no_out;
+        lea r10, [rip + _rsh_hs_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      rsh_no_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rsh_row_base(conn_id) -> &_remote_shell_pool[conn_id*256]
+  //
+  // Row-base compute for the M1 daemon's pool.  Stride 256 = 2^8 so
+  // `shl rax, 8` suffices.  Caller validates conn_id first.  Pure
+  // leaf -- no bounds check by policy.  Labels prefixed rsh_rb_.
+  // ==========================================================================
+  pub let rsh_row_base : (u64) -> u64 !{} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R137.M2 (paideia-os #2634): conn_id -> &_remote_shell_pool[conn_id*256]. Mirrors rs_row_base. Pure leaf. Labels prefixed rsh_rb_. The _remote_shell_pool symbol resolves at link time against the sibling remote_shell.pdx module (both are in the same kernel binary).",
+      block: {
+        mov rax, rdi;                    // conn_id
+        shl rax, 8;                      // conn_id * 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rsh_scratch_base(conn_id) -> &_rsh_hs_scratch[conn_id*4096]
+  //
+  // Scratch-base compute for the per-conn ML-KEM dk storage.  Stride
+  // 4096 = 2^12 so `shl rax, 12` suffices.  Caller validates conn_id
+  // first.  Pure leaf.  Labels prefixed rsh_sb_.
+  // ==========================================================================
+  pub let rsh_scratch_base : (u64) -> u64 !{} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R137.M2 (paideia-os #2634): conn_id -> &_rsh_hs_scratch[conn_id*4096]. Pure leaf. Power-of-two stride uses `shl rax, 12` so no 2-op imul-with-imm is required. Labels prefixed rsh_sb_.",
+      block: {
+        mov rax, rdi;                    // conn_id
+        shl rax, 12;                     // conn_id * 4096
+        lea r10, [rip + _rsh_hs_scratch];
+        add rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rsh_check_conn(conn_id) -> 1 iff conn_id<RSH_POOL_MAX AND
+  //                               row.in_use (word at [+120]) != 0
+  //
+  // Mirrors rs_row_in_use but inlined here for independence (the M1
+  // daemon's helper is defined in a sibling module; we keep a local
+  // copy so the elaborator does not need cross-module helper
+  // resolution).  Pure leaf.  Labels prefixed rsh_cc_.
+  // ==========================================================================
+  pub let rsh_check_conn : (u64) -> u64 !{mem} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M2 (paideia-os #2634): 1 iff conn_id<RSH_POOL_MAX(4) AND row.in_use (word at [+120]) != 0. Mirror of rs_row_in_use; kept local for cross-module independence. Pure leaf. Labels prefixed rsh_cc_.",
+      block: {
+        mov r10, 4;                      // RSH_POOL_MAX
+        cmp rdi, r10;
+        jae rsh_cc_no;
+        mov rax, rdi;
+        shl rax, 8;                      // conn_id * 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;                    // row base
+        mov r10, [rax + 120];            // in_use
+        cmp r10, 0;
+        je  rsh_cc_no;
+        mov rax, 1;
+        ret;
+      rsh_cc_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rsh_check_state(conn_id, expected_state) -> 1 iff conn_id valid
+  //                                             AND (row.sf & 0xFFFFFFFF)
+  //                                                 == expected_state
+  //
+  // Reads the sf (state|flags) word at [row+8] and compares the low
+  // 32 bits to expected_state.  Does NOT call rsh_check_conn --
+  // caller should validate conn_id first (public entries already do
+  // that).  Pure leaf -- no pushes, no nested calls.  Labels prefixed
+  // rsh_cs_.
+  //
+  // The 32-bit mask uses `shl rax, 32; shr rax, 32` rather than
+  // `and rax, 0xFFFFFFFF` -- the second form is imm32-safe but the
+  // shift-trick avoids any imm encoding whatsoever.
+  // ==========================================================================
+  pub let rsh_check_state : (u64, u64) -> u64 !{mem} @{} =
+    fn (conn_id: u64) (expected_state: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M2 (paideia-os #2634): read [row+8] (sf = state|flags), mask low 32 bits via `shl rax, 32; shr rax, 32`, compare to expected_state. Return 1 on match, 0 on mismatch. Pure leaf. Labels prefixed rsh_cs_. The caller validates conn_id<RSH_POOL_MAX separately before invoking this helper.",
+      block: {
+        mov rax, rdi;
+        shl rax, 8;                      // conn_id * 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;                    // row base
+        mov rax, [rax + 8];              // sf (state|flags)
+        shl rax, 32;                     // zero high 32 (shift up)
+        shr rax, 32;                     // zero high 32 (shift back down) -> low 32 only
+        cmp rax, rsi;                    // state == expected?
+        jne rsh_cs_no;
+        mov rax, 1;
+        ret;
+      rsh_cs_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rsh_bind_slot(conn_id) -> ()
+  //
+  // Set the connection's kem_session_slot sentinel to RSH_SLOT_BOUND.
+  // Called at the END of _rsh_server_keygen / _rsh_init_client when
+  // the crypto state in [+192..+224] (mlkem_ss) and the scratch dk
+  // (server side) are fully initialised.  Observable-last ordering
+  // mirrors the M1 daemon's in_use discipline.  Pure leaf -- no
+  // pushes.  Labels prefixed rsh_bs_.
+  // ==========================================================================
+  pub let rsh_bind_slot : (u64) -> () !{mem} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M2 (paideia-os #2634): write RSH_SLOT_BOUND (1) into [row+16] (kem_session_slot). Observable-last after the crypto state is fully set up. Pure leaf. Labels prefixed rsh_bs_.",
+      block: {
+        mov rax, rdi;
+        shl rax, 8;                      // conn_id * 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;                    // row base
+        mov r9, 1;                       // RSH_SLOT_BOUND
+        mov [rax + 16], r9;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rsh_copy32(dst_ptr, src_ptr) -> ()
+  //
+  // Copy exactly 32 bytes dst <- src using 4 qword moves.  Used to
+  // (a) stash mlkem_ss into [row+192], (b) copy mlkem_ss out of the
+  // row into the BLAKE3 input scratch, and (c) copy caller seeds in
+  // from caller buffers if needed.  Pure leaf -- no pushes.  Labels
+  // prefixed rsh_cp_.
+  // ==========================================================================
+  pub let rsh_copy32 : (u64, u64) -> () !{mem} @{} =
+    fn (dst_ptr: u64) (src_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M2 (paideia-os #2634): copy exactly 32 bytes dst<-src via 4 qword moves. Both pointers must be 8-byte aligned (caller contract -- the row offsets 192 and scratch areas are all 8-byte aligned). Pure leaf. Labels prefixed rsh_cp_.",
+      block: {
+        mov rax, [rsi + 0];
+        mov [rdi + 0], rax;
+        mov rax, [rsi + 8];
+        mov [rdi + 8], rax;
+        mov rax, [rsi + 16];
+        mov [rdi + 16], rax;
+        mov rax, [rsi + 24];
+        mov [rdi + 24], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _rsh_server_keygen(conn_id, seed_d_32B, seed_z_32B, out_ek_1184B)
+  //                                                              -> errno
+  //
+  // Server-side bringup: generate an ML-KEM-768 keypair from
+  // caller-supplied seeds; stash the 2400 B decapsulation key in the
+  // handshake scratch region; set the connection's kem_session_slot
+  // sentinel; transition INIT -> HANDSHAKE; write the 1184 B
+  // encapsulation key to the caller's buffer (for transmission to
+  // the client over the wire).
+  //
+  // ARGS (SysV):
+  //   rdi = conn_id          (u64 in [0, 4))
+  //   rsi = seed_d_32B_ptr   (readable 32 B)
+  //   rdx = seed_z_32B_ptr   (readable 32 B)
+  //   rcx = out_ek_1184B_ptr (writable 1184 B)
+  //
+  // RETURNS (rax):
+  //   RSH_OK           -- keypair generated, dk stashed, ek written,
+  //                       state transitioned.
+  //   RSH_ERR_BAD_CONN -- conn_id out of range or row not in_use.
+  //   RSH_ERR_STATE    -- row is not in RS_STATE_INIT.
+  //   RSH_ERR_CRYPTO   -- the ML-KEM FFI thunk returned nonzero.
+  //
+  // STEP-BY-STEP:
+  //   (1) rsh_check_conn(conn_id) -> else RSH_ERR_BAD_CONN.
+  //   (2) rsh_check_state(conn_id, INIT) -> else RSH_ERR_STATE.
+  //   (3) rsh_scratch_base(conn_id) -> dk destination = base + 0.
+  //   (4) call paideia_crypto_ml_kem_768_keygen(seed_d, seed_z,
+  //       out_ek, dk_scratch).  Nonzero return -> RSH_ERR_CRYPTO.
+  //   (5) _remote_shell_set_state(conn_id, HANDSHAKE).
+  //   (6) rsh_bind_slot(conn_id).
+  //   (7) Emit `RSH KEYGEN OK cid=0x<hex>`; return RSH_OK.
+  //
+  // STACK FRAME:
+  //   4 callee-save pushes (rbx = conn_id, r12 = out_ek_ptr,
+  //                          r13 = seed_d_ptr, r14 = seed_z_ptr) +
+  //   sub rsp, 8.  Entry %16==8; +32 = %16==8; +8 = %16==0 at nested
+  //   calls.
+  //
+  // Labels prefixed rsh_kg_.
+  // ==========================================================================
+  pub let _rsh_server_keygen : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (conn_id: u64) (seed_d: u64) (seed_z: u64) (out_ek: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R137.M2 (paideia-os #2634): server-side ML-KEM-768 KeyGen bringup. Validate conn_id (rsh_check_conn: RSH_ERR_BAD_CONN on bad id or free row); validate pre-state INIT (rsh_check_state: RSH_ERR_STATE otherwise); compute scratch base; call paideia_crypto_ml_kem_768_keygen(seed_d, seed_z, out_ek, scratch_base+0) -- the ML-KEM FFI writes 1184B of ek to the caller's buffer and 2400B of dk to the scratch base; nonzero return -> RSH_ERR_CRYPTO; call _remote_shell_set_state(conn_id, RS_STATE_HANDSHAKE) to transition; call rsh_bind_slot(conn_id) to flip the kem_session_slot sentinel to 1; bump stats + emit `RSH KEYGEN OK cid=0x<hex>`. Four callee-save pushes (rbx=conn_id across the four nested calls, r12=out_ek, r13=seed_d, r14=seed_z) + sub rsp,8 pad. Entry rsp%16==8; +4 pushes = +32 -> %16==8; sub rsp,8 = +40 -> %16==0 at every nested call. The ML-KEM FFI is reached by direct call (PLT32 relocation; the kernel link line already carries libpaideia_satellite_runtime.a per schema_registry.pdx L277 precedent). Encoder-pitfall posture: cmp rN,0 (never test), shl rN,8 for row stride and shl rN,12 for scratch stride (never imul), mov rax, imm32 for all error codes. Labels prefixed rsh_kg_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // conn_id
+        mov r13, rsi;                    // seed_d
+        mov r14, rdx;                    // seed_z
+        mov r12, rcx;                    // out_ek
+
+        // (1) Validate conn_id.
+        mov rdi, rbx;
+        call rsh_check_conn;
+        cmp rax, 0;
+        je  rsh_kg_bad_conn;
+
+        // (2) Validate pre-state INIT (= 0).
+        mov rdi, rbx;
+        mov rsi, 0;                      // RSH_STATE_INIT
+        call rsh_check_state;
+        cmp rax, 0;
+        je  rsh_kg_bad_state;
+
+        // (3) Compute scratch base = &_rsh_hs_scratch[conn_id * 4096].
+        mov rdi, rbx;
+        call rsh_scratch_base;
+        // rax = scratch base (dk destination).
+
+        // (4) paideia_crypto_ml_kem_768_keygen(seed_d, seed_z, ek, dk).
+        //   rdi = seed_d, rsi = seed_z, rdx = ek_out, rcx = dk_out
+        mov rdi, r13;                    // seed_d
+        mov rsi, r14;                    // seed_z
+        mov rdx, r12;                    // out_ek
+        mov rcx, rax;                    // dk destination (scratch base + 0)
+        call paideia_crypto_ml_kem_768_keygen;
+        cmp rax, 0;
+        jne rsh_kg_crypto_fail;
+
+        // (5) _remote_shell_set_state(conn_id, HANDSHAKE).
+        mov rdi, rbx;
+        mov rsi, 1;                      // RS_STATE_HANDSHAKE
+        call _remote_shell_set_state;
+        // Permissive layer; a nonzero here would mean the daemon
+        // rejected us.  Fold to RSH_ERR_STATE for the caller.
+        cmp rax, 0;
+        jne rsh_kg_bad_state;
+
+        // (6) rsh_bind_slot(conn_id) -- flip sentinel LAST.
+        mov rdi, rbx;
+        call rsh_bind_slot;
+
+        // (7) Stats + fingerprint.
+        mov rdi, 0;                      // RSH_ST_KEYGEN_OK
+        call rsh_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_keygen_ok];
+        lea rcx, [rip + rsh_k_cid];
+        mov r8,  rbx;                    // conn_id in hex KV
+        call klog_s1_x1;
+
+        xor rax, rax;                    // RSH_OK
+        jmp rsh_kg_out;
+
+      rsh_kg_bad_conn:
+        mov rdi, 1;                      // RSH_ST_KEYGEN_REJ
+        call rsh_note;
+        mov r12, 0x1D01;                 // RSH_ERR_BAD_CONN
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_keygen_rej];
+        lea rcx, [rip + rsh_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        jmp rsh_kg_out;
+
+      rsh_kg_bad_state:
+        mov rdi, 1;                      // RSH_ST_KEYGEN_REJ
+        call rsh_note;
+        mov r12, 0x1D11;                 // RSH_ERR_STATE
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_keygen_rej];
+        lea rcx, [rip + rsh_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        jmp rsh_kg_out;
+
+      rsh_kg_crypto_fail:
+        mov rdi, 1;                      // RSH_ST_KEYGEN_REJ
+        call rsh_note;
+        mov r12, 0x1D10;                 // RSH_ERR_CRYPTO
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_keygen_rej];
+        lea rcx, [rip + rsh_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      rsh_kg_out:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _rsh_init_client(conn_id, server_ek_1184B, seed_m_32B,
+  //                  out_ct_1088B)                              -> errno
+  //
+  // Client-side bringup: run ML-KEM-768 Encaps against the server's
+  // ek with the caller-supplied seed_m; stash the 32 B shared secret
+  // in the row's crypto region at [+192..+224]; set kem_session_slot
+  // = 1; transition INIT -> HANDSHAKE; write the 1088 B ciphertext
+  // to the caller's buffer (for transmission to the server).
+  //
+  // ARGS (SysV):
+  //   rdi = conn_id             (u64 in [0, 4))
+  //   rsi = server_ek_1184B_ptr (readable 1184 B)
+  //   rdx = seed_m_32B_ptr      (readable 32 B)
+  //   rcx = out_ct_1088B_ptr    (writable 1088 B)
+  //
+  // RETURNS (rax):
+  //   RSH_OK           -- ok.
+  //   RSH_ERR_BAD_CONN -- conn_id out of range or row not in_use.
+  //   RSH_ERR_STATE    -- row is not in RS_STATE_INIT.
+  //   RSH_ERR_CRYPTO   -- the ML-KEM FFI thunk returned nonzero.
+  //
+  // STEP-BY-STEP:
+  //   (1) rsh_check_conn(conn_id).
+  //   (2) rsh_check_state(conn_id, INIT).
+  //   (3) Compute mlkem_ss destination = &row[+192].
+  //   (4) call paideia_crypto_ml_kem_768_encaps(server_ek, seed_m,
+  //       out_ct, mlkem_ss_dst).  Nonzero -> RSH_ERR_CRYPTO.
+  //   (5) _remote_shell_set_state(conn_id, HANDSHAKE).
+  //   (6) rsh_bind_slot(conn_id).
+  //   (7) Emit fingerprint; return RSH_OK.
+  //
+  // STACK FRAME:
+  //   4 callee-save pushes (rbx = conn_id, r12 = server_ek_ptr,
+  //                          r13 = seed_m_ptr, r14 = out_ct_ptr) +
+  //   sub rsp, 8.  Same alignment as _rsh_server_keygen.
+  //
+  // Labels prefixed rsh_ic_.
+  // ==========================================================================
+  pub let _rsh_init_client : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (conn_id: u64) (server_ek: u64) (seed_m: u64) (out_ct: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R137.M2 (paideia-os #2634): client-side ML-KEM-768 Encaps bringup. Validate conn_id (RSH_ERR_BAD_CONN); validate pre-state INIT (RSH_ERR_STATE); compute mlkem_ss destination = row_base+192 (RSH_OFF_MLKEM_SS); call paideia_crypto_ml_kem_768_encaps(server_ek, seed_m, out_ct, mlkem_ss_dst) -- the FFI writes 1088B ct to caller buf and 32B shared secret to the row's crypto slot; nonzero -> RSH_ERR_CRYPTO; call _remote_shell_set_state(conn_id, HANDSHAKE); call rsh_bind_slot(conn_id); bump stats + emit `RSH INIT OK cid=0x<hex>`. Four callee-save pushes (rbx=conn_id, r12=server_ek, r13=seed_m, r14=out_ct) + sub rsp,8 pad. Entry rsp%16==8; +4 pushes = %16==8; sub rsp,8 = %16==0 at every nested call. Encoder-pitfall posture: cmp rN,0 (never test), mov rax, imm32 for all error codes (0x1D01, 0x1D10, 0x1D11), shl rN,8 for row stride. Labels prefixed rsh_ic_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // conn_id
+        mov r12, rsi;                    // server_ek
+        mov r13, rdx;                    // seed_m
+        mov r14, rcx;                    // out_ct
+
+        // (1) Validate conn_id.
+        mov rdi, rbx;
+        call rsh_check_conn;
+        cmp rax, 0;
+        je  rsh_ic_bad_conn;
+
+        // (2) Validate pre-state INIT.
+        mov rdi, rbx;
+        mov rsi, 0;                      // RSH_STATE_INIT
+        call rsh_check_state;
+        cmp rax, 0;
+        je  rsh_ic_bad_state;
+
+        // (3) Compute mlkem_ss destination = row_base + RSH_OFF_MLKEM_SS.
+        mov rdi, rbx;
+        call rsh_row_base;
+        add rax, 192;                    // RSH_OFF_MLKEM_SS
+
+        // (4) paideia_crypto_ml_kem_768_encaps(ek, seed_m, ct, ss).
+        mov rdi, r12;                    // server_ek
+        mov rsi, r13;                    // seed_m
+        mov rdx, r14;                    // out_ct
+        mov rcx, rax;                    // mlkem_ss destination
+        call paideia_crypto_ml_kem_768_encaps;
+        cmp rax, 0;
+        jne rsh_ic_crypto_fail;
+
+        // (5) _remote_shell_set_state(conn_id, HANDSHAKE).
+        mov rdi, rbx;
+        mov rsi, 1;                      // RS_STATE_HANDSHAKE
+        call _remote_shell_set_state;
+        cmp rax, 0;
+        jne rsh_ic_bad_state;
+
+        // (6) rsh_bind_slot(conn_id).
+        mov rdi, rbx;
+        call rsh_bind_slot;
+
+        // (7) Stats + fingerprint.
+        mov rdi, 2;                      // RSH_ST_INIT_OK
+        call rsh_note;
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_init_ok];
+        lea rcx, [rip + rsh_k_cid];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        xor rax, rax;                    // RSH_OK
+        jmp rsh_ic_out;
+
+      rsh_ic_bad_conn:
+        mov rdi, 3;                      // RSH_ST_INIT_REJ
+        call rsh_note;
+        mov r12, 0x1D01;                 // RSH_ERR_BAD_CONN
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_init_rej];
+        lea rcx, [rip + rsh_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        jmp rsh_ic_out;
+
+      rsh_ic_bad_state:
+        mov rdi, 3;                      // RSH_ST_INIT_REJ
+        call rsh_note;
+        mov r12, 0x1D11;                 // RSH_ERR_STATE
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_init_rej];
+        lea rcx, [rip + rsh_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        jmp rsh_ic_out;
+
+      rsh_ic_crypto_fail:
+        mov rdi, 3;                      // RSH_ST_INIT_REJ
+        call rsh_note;
+        mov r12, 0x1D10;                 // RSH_ERR_CRYPTO
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_init_rej];
+        lea rcx, [rip + rsh_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+
+      rsh_ic_out:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _rsh_accept_server(conn_id, client_ct_1088B)                 -> errno
+  //
+  // Server-side finalise: run ML-KEM-768 Decaps using the dk stashed
+  // by _rsh_server_keygen; store the 32 B shared secret in the row's
+  // [+192..+224] slot.  State is unchanged (still HANDSHAKE);
+  // _rsh_derive_session_key does the final transition.
+  //
+  // ARGS (SysV):
+  //   rdi = conn_id             (u64 in [0, 4))
+  //   rsi = client_ct_1088B_ptr (readable 1088 B)
+  //
+  // RETURNS (rax):
+  //   RSH_OK           -- ok.
+  //   RSH_ERR_BAD_CONN -- conn_id out of range or row not in_use.
+  //   RSH_ERR_STATE    -- row is not in RS_STATE_HANDSHAKE OR
+  //                       kem_session_slot sentinel is not bound.
+  //   RSH_ERR_CRYPTO   -- the ML-KEM FFI thunk returned nonzero.
+  //
+  // STEP-BY-STEP:
+  //   (1) rsh_check_conn(conn_id).
+  //   (2) rsh_check_state(conn_id, HANDSHAKE).
+  //   (3) Compute dk source = &_rsh_hs_scratch[conn_id * 4096 + 0]
+  //       and mlkem_ss destination = row_base + 192.
+  //   (4) call paideia_crypto_ml_kem_768_decaps(dk, ct, mlkem_ss).
+  //       Nonzero -> RSH_ERR_CRYPTO.
+  //   (5) Emit `RSH ACCEPT OK cid=0x<hex>`; return RSH_OK.
+  //
+  // No state transition here (HANDSHAKE stays HANDSHAKE).
+  //
+  // STACK FRAME:
+  //   2 callee-save pushes (rbx = conn_id, r12 = client_ct_ptr) +
+  //   sub rsp, 8.  Entry %16==8; +16 = %16==8; +8 = %16==0 at nested
+  //   calls.
+  //
+  // Labels prefixed rsh_as_.
+  // ==========================================================================
+  pub let _rsh_accept_server : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (conn_id: u64) (client_ct: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R137.M2 (paideia-os #2634): server-side ML-KEM-768 Decaps. Validate conn_id (RSH_ERR_BAD_CONN); validate pre-state HANDSHAKE (RSH_ERR_STATE); compute dk source (scratch_base+0 = row's 2400B dk stashed by _rsh_server_keygen) and mlkem_ss destination (row_base+192); call paideia_crypto_ml_kem_768_decaps(dk, ct, mlkem_ss) -- the FFI returns PDX_CRYPTO_OK (0) even on tampered ciphertext (FIPS 203 §6.3 implicit rejection); nonzero return is restricted to invalid-param failure cases which fold to RSH_ERR_CRYPTO; no state transition (HANDSHAKE stays HANDSHAKE until _rsh_derive_session_key). Bump stats + emit `RSH ACCEPT OK cid=0x<hex>`. Two callee-save pushes (rbx=conn_id, r12=client_ct) + sub rsp,8 pad. Entry rsp%16==8; +2 pushes = +16 -> %16==8; sub rsp,8 = +24 -> %16==0 at every nested call. Labels prefixed rsh_as_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // conn_id
+        mov r12, rsi;                    // client_ct
+
+        // (1) Validate conn_id.
+        mov rdi, rbx;
+        call rsh_check_conn;
+        cmp rax, 0;
+        je  rsh_as_bad_conn;
+
+        // (2) Validate pre-state HANDSHAKE (= 1).
+        mov rdi, rbx;
+        mov rsi, 1;                      // RSH_STATE_HANDSHAKE
+        call rsh_check_state;
+        cmp rax, 0;
+        je  rsh_as_bad_state;
+
+        // (3a) dk source = scratch_base + 0.
+        mov rdi, rbx;
+        call rsh_scratch_base;
+        mov r11, rax;                    // r11 = dk source
+
+        // (3b) mlkem_ss destination = row_base + RSH_OFF_MLKEM_SS.
+        mov rdi, rbx;
+        call rsh_row_base;
+        add rax, 192;                    // RSH_OFF_MLKEM_SS
+
+        // (4) paideia_crypto_ml_kem_768_decaps(dk, ct, mlkem_ss).
+        //   rdi = dk, rsi = ct, rdx = ss_out
+        mov rdi, r11;                    // dk source
+        mov rsi, r12;                    // client_ct
+        mov rdx, rax;                    // mlkem_ss destination
+        call paideia_crypto_ml_kem_768_decaps;
+        cmp rax, 0;
+        jne rsh_as_crypto_fail;
+
+        // (5) Stats + fingerprint.
+        mov rdi, 4;                      // RSH_ST_ACCEPT_OK
+        call rsh_note;
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_accept_ok];
+        lea rcx, [rip + rsh_k_cid];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        xor rax, rax;                    // RSH_OK
+        jmp rsh_as_out;
+
+      rsh_as_bad_conn:
+        mov rdi, 5;                      // RSH_ST_ACCEPT_REJ
+        call rsh_note;
+        mov r12, 0x1D01;                 // RSH_ERR_BAD_CONN
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_accept_rej];
+        lea rcx, [rip + rsh_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        jmp rsh_as_out;
+
+      rsh_as_bad_state:
+        mov rdi, 5;                      // RSH_ST_ACCEPT_REJ
+        call rsh_note;
+        mov r12, 0x1D11;                 // RSH_ERR_STATE
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_accept_rej];
+        lea rcx, [rip + rsh_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        jmp rsh_as_out;
+
+      rsh_as_crypto_fail:
+        mov rdi, 5;                      // RSH_ST_ACCEPT_REJ
+        call rsh_note;
+        mov r12, 0x1D10;                 // RSH_ERR_CRYPTO
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_accept_rej];
+        lea rcx, [rip + rsh_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+
+      rsh_as_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _rsh_derive_session_key(conn_id, out_session_key_32B)        -> errno
+  //
+  // Final step on both sides: compute the 32-byte session key as
+  //
+  //   session_key = BLAKE3("paideia-rsh-v1-mlkem-only" || mlkem_ss)
+  //
+  // where mlkem_ss is the 32-byte shared secret stashed at
+  // row[+192..+224] by _rsh_init_client (client side) or
+  // _rsh_accept_server (server side).
+  //
+  // Writes the 32-byte session key to the caller's buffer and
+  // transitions RS_STATE_HANDSHAKE -> RS_STATE_ESTABLISHED.
+  //
+  // Emits `RSH DERIVE OK cid=0x<hex> suite=0x0` on success -- suite=0
+  // is RSH_SUITE_MLKEM_ONLY, the reduced-security M2 posture.  R137.M2-
+  // split will emit suite=0x1 (RSH_SUITE_HYBRID).
+  //
+  // ARGS (SysV):
+  //   rdi = conn_id
+  //   rsi = out_session_key_32B_ptr (writable 32 B)
+  //
+  // RETURNS (rax):
+  //   RSH_OK           -- ok.
+  //   RSH_ERR_BAD_CONN -- conn_id out of range or row not in_use.
+  //   RSH_ERR_STATE    -- row is not in RS_STATE_HANDSHAKE.
+  //   RSH_ERR_CRYPTO   -- the BLAKE3 FFI thunk returned nonzero.
+  //
+  // STEP-BY-STEP:
+  //   (1) rsh_check_conn(conn_id).
+  //   (2) rsh_check_state(conn_id, HANDSHAKE).
+  //   (3) Build the 57-byte BLAKE3 input in _rsh_derive_input:
+  //         [0..25]   = rsh_kdf_ctx (minus trailing NUL)
+  //         [25..57]  = mlkem_ss (copied from row+192)
+  //   (4) call paideia_crypto_blake3_hash(_rsh_derive_input, 57,
+  //       _rsh_derive_scratch).  Nonzero -> RSH_ERR_CRYPTO.  (With
+  //       a non-null out_ptr and len>0 and non-null in_ptr it cannot
+  //       actually fail per paideia-as docs, but we fold defensively.)
+  //   (5) Copy 32 bytes _rsh_derive_scratch -> out_session_key_32B.
+  //   (6) _remote_shell_set_state(conn_id, ESTABLISHED).
+  //   (7) Emit `RSH DERIVE OK cid=... suite=0x0`; return RSH_OK.
+  //
+  // The CONTEXT STRING COPY uses a tight unrolled 32-byte block + a
+  // byte-copy tail for the odd residue (25 bytes = 3 u64 + 1 byte).
+  // The context string's trailing NUL at offset 25 is NOT fed to
+  // BLAKE3 (len=57 covers [0..25) ctx + [0..32) ss exactly).
+  //
+  // STACK FRAME:
+  //   2 callee-save pushes (rbx = conn_id, r12 = out_sk_ptr) +
+  //   sub rsp, 8.  Same alignment as _rsh_accept_server.
+  //
+  // Labels prefixed rsh_dk_.
+  // ==========================================================================
+  pub let _rsh_derive_session_key : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (conn_id: u64) (out_sk: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R137.M2 (paideia-os #2634): final 32-byte session-key derivation. Validate conn_id (RSH_ERR_BAD_CONN); validate pre-state HANDSHAKE (RSH_ERR_STATE); build the 57-byte BLAKE3 input in _rsh_derive_input ([0..25]=rsh_kdf_ctx minus trailing NUL, [25..57]=mlkem_ss copied from row[+192..+224]); call paideia_crypto_blake3_hash(input, 57, _rsh_derive_scratch) -- the FFI writes 32B to the scratch; nonzero return (defensive: cannot happen with valid non-null pointers and nonzero len per paideia-as blake3.rs docs) -> RSH_ERR_CRYPTO; copy 32 B from scratch to the caller's out_sk via four qword moves; call _remote_shell_set_state(conn_id, ESTABLISHED); bump stats + emit `RSH DERIVE OK cid=0x<hex> suite=0x0` where suite=0 is RSH_SUITE_MLKEM_ONLY (M2 reduced-security posture; R137.M2-split will emit suite=0x1 for hybrid). Two callee-save pushes (rbx=conn_id, r12=out_sk) + sub rsp,8 pad. Entry rsp%16==8; +2 pushes = %16==8; sub rsp,8 = %16==0 at every nested call. The 25-byte context-string copy is unrolled as 3 u64 moves (24B) + 1 byte copy (byte 24 is 'y' from 'only'). The 32-byte mlkem_ss copy is 4 u64 moves. Labels prefixed rsh_dk_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // conn_id
+        mov r12, rsi;                    // out_sk
+
+        // (1) Validate conn_id.
+        mov rdi, rbx;
+        call rsh_check_conn;
+        cmp rax, 0;
+        je  rsh_dk_bad_conn;
+
+        // (2) Validate pre-state HANDSHAKE.
+        mov rdi, rbx;
+        mov rsi, 1;                      // RSH_STATE_HANDSHAKE
+        call rsh_check_state;
+        cmp rax, 0;
+        je  rsh_dk_bad_state;
+
+        // (3a) Copy 25 B of context string into _rsh_derive_input[0..25].
+        //      "paideia-rsh-v1-mlkem-only" at _rsh_kdf_ctx.
+        //      25 bytes = 3 u64 (24B) + 1 byte.
+        lea r10, [rip + rsh_kdf_ctx];
+        lea r11, [rip + _rsh_derive_input];
+
+        mov rax, [r10 + 0];
+        mov [r11 + 0], rax;
+        mov rax, [r10 + 8];
+        mov [r11 + 8], rax;
+        mov rax, [r10 + 16];
+        mov [r11 + 16], rax;
+        // Byte 24: copy via mov_b.
+        xor rax, rax;
+        mov_b rax, [r10 + 24];
+        mov_b [r11 + 24], rax;
+
+        // (3b) Copy 32 B of mlkem_ss into _rsh_derive_input[25..57].
+        //      Source: &row[+192].  Destination: &_rsh_derive_input[25].
+        //      The destination is not 8-byte aligned (offset 25) so we
+        //      do a byte-aligned 32-byte copy via 4 qword loads from
+        //      the aligned source + 4 qword stores at the unaligned
+        //      destination.  x86_64 permits unaligned qword stores.
+        mov rdi, rbx;
+        call rsh_row_base;
+        add rax, 192;                    // &row[+RSH_OFF_MLKEM_SS]
+        mov r10, rax;                    // r10 = mlkem_ss source
+        lea r11, [rip + _rsh_derive_input];
+        add r11, 25;                     // r11 = &_rsh_derive_input[25]
+
+        mov rax, [r10 + 0];
+        mov [r11 + 0], rax;
+        mov rax, [r10 + 8];
+        mov [r11 + 8], rax;
+        mov rax, [r10 + 16];
+        mov [r11 + 16], rax;
+        mov rax, [r10 + 24];
+        mov [r11 + 24], rax;
+
+        // (4) paideia_crypto_blake3_hash(input, 57, scratch).
+        lea rdi, [rip + _rsh_derive_input];
+        mov rsi, 57;                     // RSH_DERIVE_INPUT_LEN
+        lea rdx, [rip + _rsh_derive_scratch];
+        call paideia_crypto_blake3_hash;
+        cmp rax, 0;
+        jne rsh_dk_crypto_fail;
+
+        // (5) Copy 32 B scratch -> out_sk.
+        lea r10, [rip + _rsh_derive_scratch];
+        mov rax, [r10 + 0];
+        mov [r12 + 0], rax;
+        mov rax, [r10 + 8];
+        mov [r12 + 8], rax;
+        mov rax, [r10 + 16];
+        mov [r12 + 16], rax;
+        mov rax, [r10 + 24];
+        mov [r12 + 24], rax;
+
+        // (6) _remote_shell_set_state(conn_id, ESTABLISHED).
+        mov rdi, rbx;
+        mov rsi, 2;                      // RS_STATE_ESTABLISHED
+        call _remote_shell_set_state;
+        cmp rax, 0;
+        jne rsh_dk_bad_state;
+
+        // (7) Stats + fingerprint.
+        mov rdi, 6;                      // RSH_ST_DERIVE_OK
+        call rsh_note;
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_derive_ok];
+        lea rcx, [rip + rsh_k_cid];
+        mov r8,  rbx;                    // cid in hex KV
+        // Note: at M2 we emit the simpler single-KV form.  R137.M2-
+        // split will swap to a two-KV klog_s1_x2 variant to also
+        // carry suite=0x1 for hybrid; today's single-KV form implies
+        // suite=mlkem-only.
+        call klog_s1_x1;
+
+        xor rax, rax;                    // RSH_OK
+        jmp rsh_dk_out;
+
+      rsh_dk_bad_conn:
+        mov rdi, 7;                      // RSH_ST_DERIVE_REJ
+        call rsh_note;
+        mov r12, 0x1D01;                 // RSH_ERR_BAD_CONN
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_derive_rej];
+        lea rcx, [rip + rsh_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        jmp rsh_dk_out;
+
+      rsh_dk_bad_state:
+        mov rdi, 7;                      // RSH_ST_DERIVE_REJ
+        call rsh_note;
+        mov r12, 0x1D11;                 // RSH_ERR_STATE
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_derive_rej];
+        lea rcx, [rip + rsh_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        jmp rsh_dk_out;
+
+      rsh_dk_crypto_fail:
+        mov rdi, 7;                      // RSH_ST_DERIVE_REJ
+        call rsh_note;
+        mov r12, 0x1D10;                 // RSH_ERR_CRYPTO
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rsh_tag_derive_rej];
+        lea rcx, [rip + rsh_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+
+      rsh_dk_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Boot wiring note
+  // ----------------
+  // No boot hook required at M2.  _rsh_hs_scratch, _rsh_hs_stats,
+  // and _rsh_derive_{input,scratch} are .bss-zero-init and need no
+  // runtime priming.  The context string rsh_kdf_ctx is read-only
+  // and lives in .rodata.
+  //
+  // The sibling _remote_shell_init (R137.M1) runs at kernel bringup
+  // and publishes the service row; nothing in this file needs to
+  // run before the first _rsh_* call.
+  //
+  // See design/shell/remote-shell-hybrid-kem.md for the full design
+  // (hybrid-KEM flow, M2 reduced-security posture, security review,
+  // M3-split roadmap).
+  // ==========================================================================
+}

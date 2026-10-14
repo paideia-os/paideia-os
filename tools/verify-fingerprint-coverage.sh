@@ -262,6 +262,53 @@ ALLOWLIST = {
         "production path at M1 (same reason as ACCEPT OK). Retires "
         "when R137.M2 wires the cap-invoke CLOSE op.",
 
+    # Wave UMB-W20 R137.M2 (paideia-os#2634): hybrid-KEM handshake
+    # (ML-KEM-768-only SPLIT -- X25519 widening deferred to R137.M2-
+    # split pending paideia-as#<X25519-FFI>).  RSH {KEYGEN,INIT,ACCEPT,
+    # DERIVE} OK are .rodata tag literals inside the four public
+    # _rsh_* handshake entries in src/kernel/core/svc/remote_shell_
+    # handshake.pdx.  At M2 no production path invokes them because:
+    # (a) the TCP accept path that would feed the server's keygen call
+    #     is deferred to R137.M3 alongside the wire-protocol framer,
+    # (b) no KIND_REMOTE_SHELL cap-invoke surface exists (reserved
+    #     for R137.M4 alongside the per-connection auth cap).
+    # All four retire from this allowlist when R137.M3+ lands with
+    # asserting smoke-mode goldens driving the server-keygen /
+    # client-encaps / server-decaps / session-derive cascade against a
+    # pair of VM-local kernels (see design/shell/remote-shell-hybrid-
+    # kem.md §10 for the acceptance smoke).
+    "RSH KEYGEN OK":
+        "Wave UMB-W20 R137.M2: src/kernel/core/svc/remote_shell_"
+        "handshake.pdx emits this from _rsh_server_keygen. Unreachable "
+        "from any production path at M2 (no TCP accept path reaches "
+        "the handshake until R137.M3 wires the wire-protocol framer, "
+        "and no KIND_REMOTE_SHELL cap-invoke surface exists yet). "
+        "Retires when R137.M3+ lands with asserting smoke-mode "
+        "goldens driving the full handshake cascade.",
+    "RSH INIT OK":
+        "Wave UMB-W20 R137.M2: src/kernel/core/svc/remote_shell_"
+        "handshake.pdx emits this from _rsh_init_client. Unreachable "
+        "from any production path at M2 (same reason as KEYGEN OK -- "
+        "the client-side TCP connect path that feeds the first "
+        "handshake flow is deferred to R137.M3). Retires when "
+        "R137.M3+ lands with asserting smoke-mode goldens.",
+    "RSH ACCEPT OK":
+        "Wave UMB-W20 R137.M2: src/kernel/core/svc/remote_shell_"
+        "handshake.pdx emits this from _rsh_accept_server. "
+        "Unreachable from any production path at M2 (same reason as "
+        "KEYGEN OK -- the server-side second-flow decaps path is "
+        "deferred to R137.M3's wire-protocol framer). Retires when "
+        "R137.M3+ lands with asserting smoke-mode goldens.",
+    "RSH DERIVE OK":
+        "Wave UMB-W20 R137.M2: src/kernel/core/svc/remote_shell_"
+        "handshake.pdx emits this from _rsh_derive_session_key. "
+        "Unreachable from any production path at M2 (same reason as "
+        "KEYGEN OK -- no caller yet derives a session key because the "
+        "wire-protocol framer that uses it is deferred to R137.M3). "
+        "Retires when R137.M3+ lands with asserting smoke-mode "
+        "goldens exercising a complete handshake and the first AEAD "
+        "frame.",
+
     # Wave UMB-W14 R127.M3 (paideia-os#2599): raw-mode TTY substrate.
     # SHELL_SESSION RAW OK fires from _shell_session_set_raw's success
     # tail (and from ks_op_set_raw transitively via KIND_SHELL_SESSION
@@ -362,6 +409,51 @@ ALLOWLIST = {
         "expose them to userspace is a future-wave landing). Retires "
         "when that op surface lands with an asserting smoke-mode "
         "golden exercising at least one query predicate.",
+
+    # Wave UMB-W20 R139.M1 (paideia-os#2639): per-session history
+    # segmentation. HISTORY_SEG INIT OK fires on every boot via
+    # _hs_init in the svc.* bringup cascade (kernel_main.pdx right
+    # after _hf_init, before _shell_jobs_init). UNION OK /
+    # INTERSECT OK / SUMMARY OK are present as .rodata tags inside
+    # _hs_project_union / _hs_project_intersect / _hs_session_summary
+    # respectively. At M1 no production path invokes any of the
+    # three projection verbs because the KIND_SHELL_SESSION op
+    # surface that would expose them to userspace (and the shell
+    # parent task that would call them from the dispatch loop /
+    # built-in `history` command) are future-wave landings. All
+    # three retire from this allowlist when a production caller
+    # drives at least one union / intersect / summary with an
+    # asserting smoke-mode golden -- either through the cap-invoke
+    # ops the next wave adds or through a built-in that queries
+    # the three verbs directly.
+    "HISTORY_SEG INIT OK":
+        "Wave UMB-W20 R139.M1: src/kernel/core/svc/history_segmentation."
+        "pdx emits this unconditionally on boot via _hs_init in the "
+        "svc.* bringup cascade (after _hf_init, before _shell_jobs_"
+        "init). Retires when a production caller drives at least "
+        "one of the three projection verbs with an asserting smoke-"
+        "mode golden.",
+    "HISTORY_SEG UNION OK":
+        "Wave UMB-W20 R139.M1: src/kernel/core/svc/history_segmentation."
+        "pdx emits this from _hs_project_union. Unreachable from any "
+        "production path at M1 (no caller yet invokes the cross-"
+        "session projection; the KIND_SHELL_SESSION op surface that "
+        "would expose it to userspace lands with a later wave, as "
+        "does the built-in `history --all` that would call it from "
+        "the shell parent). Retires alongside the other two HISTORY_"
+        "SEG verbs when the production caller lands.",
+    "HISTORY_SEG INTERSECT OK":
+        "Wave UMB-W20 R139.M1: src/kernel/core/svc/history_segmentation."
+        "pdx emits this from _hs_project_intersect. Unreachable from "
+        "any production path at M1 (same reason as HISTORY_SEG UNION "
+        "OK). Retires alongside the other two HISTORY_SEG verbs "
+        "when the production caller lands.",
+    "HISTORY_SEG SUMMARY OK":
+        "Wave UMB-W20 R139.M1: src/kernel/core/svc/history_segmentation."
+        "pdx emits this from _hs_session_summary. Unreachable from any "
+        "production path at M1 (same reason as HISTORY_SEG UNION OK). "
+        "Retires alongside the other two HISTORY_SEG verbs when the "
+        "production caller lands.",
 
     # Wave UMB-W16 R127.M5 (paideia-os#2601): shell job-control
     # primitives substrate. SHELL_JOBS INIT OK fires on every boot

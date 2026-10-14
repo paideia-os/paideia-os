@@ -1,0 +1,1166 @@
+// src/kernel/core/wasi/wasi_fd_mediation.pdx -- Wave UMB-W20 R135.M6
+// paideia-os #2631
+//
+// WASI-FD / FILE-CAP MEDIATION
+// =============================================================================
+//
+// R135.M6 lands the dispatch arm that bridges a jailed WASI module's
+// integer fd space (fd 0, 1, 2, ..., 31) with the paideia-os capability-
+// based file surface (vfs_read / vfs_write over a file-cap handle).  The
+// three earlier WASI side tables (M3 argv/stdin, M4 stdout_records, M5
+// WIT bridge) parked the "we have a byte stream here" posture at stubs
+// returning WASI_OK with zero bytes; this landing wires those stubs into
+// real file I/O while preserving every semantic the M4 schema-record
+// pipeline already provides.
+//
+// Full design: `design/shell/wasi-fd-mediation.md`.
+//
+// Companion substrates:
+//   - wasi/wasi_args_conv.pdx (R135.M3) -- the twin side table for WASI
+//     argv / stdin registration.  Same 8-row shape, same encoder-pitfall
+//     posture.
+//   - wasi/stdout_records.pdx (R135.M4) -- the kernel-side typed-record
+//     ring; _wfd_write(fd=1, ...) routes bytes through
+//     _stdout_records_feed when a schema is registered for the pid.
+//   - wasi/wit_bridge.pdx (R135.M5) -- the WIT -> schema adapter that
+//     seats the stdout_records schema at module-load time.
+//   - svc/jail_supervisor.pdx (R135.M1/M2) -- 1:1 logical mate; a WASI
+//     jail that owns an fd mediation row also owns an argv row, a
+//     stdout_records row (when its WIT declares one), and a jail
+//     supervisor row.
+//   - fs/vfs_read.pdx + fs/vfs_write.pdx (R16.M1-008) -- the kernel-
+//     side VFS surface this module dispatches into after resolving the
+//     fd through the per-pid table.
+//
+// =============================================================================
+// SECTION 0  WHY A SIDE TABLE INSTEAD OF A TASK-ROW FD TABLE
+// =============================================================================
+//
+// paideia-os's native per-task fd table (core/fs/fd_table.pdx) is caps-
+// shaped: a task holds an fd slot whose value is a vnode index; vfs_open /
+// vfs_close keep the vnode refcount honest.  A WASI jail needs an fd
+// surface too, but the fd semantics differ:
+//
+//   (a) WASI preview1 integers in [0, 32) with stable 0 / 1 / 2 for
+//       stdin / stdout / stderr; a jailed module cannot see the kernel-
+//       side vnode index behind each fd (opaque-capability discipline).
+//   (b) The underlying resource is a FILE CAP, not a raw vnode index.
+//       At M6 the two are 1:1 (a cap handle is the vnode index in the
+//       low 48 bits with 0 reserved as "no cap"); M8+ widens cap_handle
+//       to index a cap table that may enforce finer permission bits.
+//   (c) fd 1 is intercepted when the jail declared a WIT record schema:
+//       the write bytes flow into _stdout_records_feed instead of
+//       vfs_write, so the kernel materialises records on a per-pid ring
+//       before user space sees them.
+//   (d) WASI maintains a per-fd FILE OFFSET; the native fd table does
+//       not (seek is per-vnode in paideia-os at this altitude).  The
+//       per-fd offset lives on this side table.
+//
+// All four reasons point at a dedicated 8-row side table keyed by pid.
+// Its capacity match (WFD_POOL_MAX = 8 = WA_POOL_MAX = SR_POOL_MAX =
+// JS_POOL_MAX) is intentional -- every WASI jail owns at most one row on
+// each of the four side tables simultaneously.
+//
+// =============================================================================
+// SECTION 1  POOL ROW LAYOUT  --  128 BYTES PER ROW, 8 ROWS
+// =============================================================================
+//
+// The pool holds per-pid header rows; the fd entries live in a separate
+// companion array (SECTION 2).  Stride 128 is a power of two so row
+// addressing uses `shl rax, 7` -- no imul (feedback_pdx_encoder_pitfalls).
+//
+//   [+0]    pid                 (u64)  owning pid; 0 is reserved
+//   [+8]    reserved_a          (u64)  slack (future: dispatch counters)
+//   [+16]   reserved_b          (u64)  slack
+//   [+24..+119]                        (12 u64) slack for M7+ metadata
+//                                      (pread/pwrite stats, cloexec mask,
+//                                      wit-schema row link, parent pid)
+//   [+120]  in_use              (u64)  0 = row free, 1 = row allocated.
+//                                      .bss zero-init gives us FREE at
+//                                      boot.  Written LAST at register-
+//                                      time so a concurrent scanner sees
+//                                      FREE or fully-initialised row.
+//
+// Pool capacity 8 rows x 128 bytes = 1024 bytes = 128 u64.
+//
+// =============================================================================
+// SECTION 2  FD ENTRIES  --  4 KiB TOTAL, 32 FDS/PID, 16 BYTES/ENTRY
+// =============================================================================
+//
+//   _wfd_entries : [u8; 4096] @align(64)
+//
+// Pid row `i` owns bytes [i*512 .. (i+1)*512); within that row, fd `k`
+// owns bytes [k*16 .. (k+1)*16).  Both strides are powers of two:
+//   * per-pid stride = 512 = 2^9  --> `shl rax, 9`
+//   * per-fd stride  = 16  = 2^4  --> `shl rax, 4`
+//
+// Each 16-byte fd entry packs the three WASI-visible pieces of per-fd
+// state into two u64 words:
+//
+//   [+0]    packed              (u64)  high 48 bits = file_cap_handle
+//                                      low  16 bits = flags
+//                                      ENTIRE WORD == 0 iff fd is NOT
+//                                      registered (cap_handle==0 is the
+//                                      reserved "no cap" sentinel, so no
+//                                      live entry can have packed==0)
+//   [+8]    offset              (u64)  seek position; updated after each
+//                                      successful _wfd_read / _wfd_write
+//                                      (M6).  M7 adds pread/pwrite that
+//                                      take an explicit offset and leave
+//                                      this field alone.
+//
+// The packed-u64 shape at [+0] is what `_wfd_lookup` returns verbatim on
+// hit, so callers that already know the cap_handle / flags encoding can
+// decode without a second kernel round-trip.
+//
+// Flag bits (low 16 of `packed`):
+//
+//   WFD_FLAG_READABLE : 0x0001  -- fd satisfies _wfd_read
+//   WFD_FLAG_WRITABLE : 0x0002  -- fd satisfies _wfd_write
+//   WFD_FLAG_APPEND   : 0x0004  -- M7: writes seek to end before dispatch
+//   WFD_FLAG_SPECIAL  : 0x0008  -- M8: fd dispatches to a specialised
+//                                   backend (socket, pipe, timer-fd);
+//                                   M6 ignores this bit
+//
+// =============================================================================
+// SECTION 3  RETURN CODE BAND
+// =============================================================================
+//
+//   WFD_OK       = 0
+//   WFD_EBADF    = 0x08    -- fd out of range, pid not registered, or
+//                             cap_handle == 0 at register-time
+//                             (WASI-aligned with wasi_args_conv's EBADF)
+//   WFD_ENOTCAP  = 0x1E00  -- fd slot has no cap registered yet (lookup)
+//                             OR pool full (register overload)
+//   WFD_IO       = 0x1E01  -- downstream VFS or stdout_records call
+//                             returned a sentinel / error status
+//
+// All fit imm32 with bit 31 clear so `mov rax, imm32` emits the 7-byte
+// zero-extending form (never `and r11, imm64`).
+//
+// `_wfd_lookup` folds EBADF / ENOTCAP into its u64 return value as a
+// low-16 error code with the high 48 bits zero.  Callers discriminate
+// hit vs miss by `cap_handle_bits == 0`: a live entry always has a
+// non-zero cap_handle in the high 48, so (ret >> 16) == 0 unambiguously
+// signals a miss and `(ret & 0xFFFF)` carries the specific error.
+//
+// =============================================================================
+// SECTION 4  INTERACTION WITH R135.M4 stdout_records
+// =============================================================================
+//
+// `_wfd_write(pid, fd=1, iovs_ptr, iovs_len, nwritten_out_ptr)` consults
+// _stdout_records at the TOP of its vfs/sr-path branch:
+//
+//   1. If fd != 1 -> vfs path (always, regardless of schema state).
+//   2. If fd == 1 and `_sr_find_row(pid)` != 0xFF  -> stdout_records
+//      path: iterate iovs; for each iov, call
+//      `_stdout_records_feed(pid, iov.buf, iov.len)`; accumulate iov.len
+//      into *nwritten_out_ptr (feed consumes the whole buffer -- partial
+//      bytes are buffered in the row's partial_buf for the next feed).
+//      On SR_ERR_* status, bail with WFD_IO and write partial count.
+//   3. If fd == 1 and no schema row -> vfs path (unchanged).  A WASI
+//      module that writes to stdout without declaring a WIT schema sees
+//      regular file-shaped behaviour (vfs_write of the kernel-side fd
+//      table slot behind cap_handle), which is how its stderr equivalent
+//      (fd 2) always flows.
+//
+// Nothing about M4's register / drain surface changes.  The schema row
+// is independently gated by `wit_bridge_register_module`; M6 only reads
+// it to make a routing decision.
+//
+// =============================================================================
+// SECTION 5  M6 -> M7 SPLIT  --  pread/pwrite + explicit offsets
+// =============================================================================
+//
+// M6 implements only the "implicit offset" (stream-shaped) WASI read /
+// write surface: the per-fd offset field at entry+8 is advanced by the
+// return value of each successful dispatch.  WASI preview1's `fd_pread`
+// / `fd_pwrite` take an explicit offset and must NOT touch the stored
+// offset.  Those land at M7 together with a `_wfd_seek` surface for
+// `fd_seek`; the pool row has 96 bytes of slack reserved (SECTION 1)
+// for the required book-keeping (dispatch counters, per-fd whence
+// cache).
+//
+// =============================================================================
+// SECTION 6  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Labels prefixed `wfd_` (wasi-fd) to stay clear of `wa_` (wasi-args),
+// `sr_` (stdout-records), `wb_` (wit-bridge), `js_` (jail_supervisor),
+// `ss_` (shell_session), `cmnt_` (cap_minter).  No reserved paideia-as
+// keyword overlap (reserved: loop / if / let).  Encoder-pitfall posture:
+//
+//   * cmp rN, 0            (never `test rN, rN`)
+//   * shl rN, 7            (pool stride; never `imul r, imm`)
+//   * shl rN, 9            (entries per-pid stride; never `imul r, imm`)
+//   * shl rN, 4            (entries per-fd stride; never `imul r, imm`)
+//   * shl rN, 16           (cap_handle pack; imm8 operand)
+//   * shr rN, 16           (cap_handle unpack; imm8 operand)
+//   * shl r11, 32 / shr r11, 32  (zero-extend low 32; mirrors wit_bridge's
+//                                 status/length unpack; never `and r11, imm64`)
+//   * mov rax, imm32       (bit 31 clear only; for 32-bit masks with bit
+//                           31 set use the shl/shr trick instead)
+//   * mov r64, imm64       (10-byte REX.W form; used for the 48-bit
+//                           cap-handle mask and the 0xFFFFFFFFFFFFFFFF
+//                           vfs sentinel; always safe)
+//   * single-line `pub let name = "..."` -- none emitted at M6
+//   * module basename WasiFdMediation matches file basename
+//     wasi_fd_mediation.pdx (ddc requires exact match)
+//
+// Stack discipline (SysV, entry rsp%16==8; odd pushes aligned, even
+// pushes need sub rsp,8 before nested call):
+//
+//   _wfd_find_row                0 pushes (pure leaf scan)
+//   _wfd_find_free               0 pushes (pure leaf scan)
+//   _wfd_entry_base              0 pushes (pure leaf address compute)
+//   _wfd_register                3 pushes (odd -> aligned)
+//   _wfd_lookup                  2 pushes + sub rsp,8 (even -> aligned)
+//   _wfd_close                   2 pushes + sub rsp,8 (even -> aligned)
+//   _wfd_read                    5 pushes + sub rsp,16 (odd + slack)
+//   _wfd_write                   5 pushes + sub rsp,16 (odd + slack)
+//
+// =============================================================================
+
+module WasiFdMediation = structure {
+
+  // ==========================================================================
+  // Return band (§3)
+  // ==========================================================================
+
+  pub let WFD_OK      : u64 = 0
+  pub let WFD_EBADF   : u64 = 0x08
+  pub let WFD_ENOTCAP : u64 = 0x1E00
+  pub let WFD_IO      : u64 = 0x1E01
+
+  // ==========================================================================
+  // Pool + entries geometry (§1, §2)
+  // ==========================================================================
+
+  pub let WFD_POOL_MAX    : u64 = 8      // rows (jailed WASI pids)
+  pub let WFD_FDS_MAX     : u64 = 32     // fds per pid
+  pub let WFD_ROW_BYTES   : u64 = 128    // bytes per pool row
+  pub let WFD_PID_STRIDE  : u64 = 512    // bytes per pid in entries table
+  pub let WFD_ENTRY_BYTES : u64 = 16     // bytes per fd entry
+
+  // Pool row offsets (bytes, from row base)
+  pub let WFD_OFF_PID            : u64 = 0
+  pub let WFD_OFF_IN_USE         : u64 = 120
+
+  // Entry offsets (bytes, from entry base)
+  pub let WFD_OFF_ENTRY_PACKED   : u64 = 0   // (cap_handle<<16) | flags
+  pub let WFD_OFF_ENTRY_OFFSET   : u64 = 8   // seek position
+
+  // Flag bits (low 16 of packed)
+  pub let WFD_FLAG_READABLE : u64 = 0x0001
+  pub let WFD_FLAG_WRITABLE : u64 = 0x0002
+  pub let WFD_FLAG_APPEND   : u64 = 0x0004
+  pub let WFD_FLAG_SPECIAL  : u64 = 0x0008
+
+  // Sentinel for "no row matched" (find_row / find_free).
+  pub let WFD_ID_NONE : u64 = 0xFF
+
+  // Kernel iovec stride (buf_ptr u64 + buf_len u64 = 16 bytes).  Caller
+  // (future M7 WASM-space translation layer) must marshal 32-bit WASM
+  // iovecs into this 64-bit shape before calling _wfd_read / _wfd_write.
+  pub let WFD_IOV_BYTES : u64 = 16
+
+  // ==========================================================================
+  // Storage
+  //
+  //   _wfd_pool    -- 8 rows x 128 bytes = 128 u64. @align(64) puts the
+  //                   pool on a cache-line boundary; rows at offsets
+  //                   0, 128, 256, ... land on cache-line starts.
+  //   _wfd_entries -- 4096 bytes = 8 pid-rows x 512 bytes = 8 x 32 x 16.
+  //                   @align(64) matches the pool.
+  //
+  // .bss zero-init gives us all-FREE at boot (in_use==0 on every row,
+  // packed==0 on every entry).
+  // ==========================================================================
+
+  pub let mut _wfd_pool    : [u64; 128]  = uninit @align(64)
+  pub let mut _wfd_entries : [u8;  4096] = uninit @align(64)
+
+  // ==========================================================================
+  // _wfd_find_row(pid) -> row_idx | WFD_ID_NONE
+  //
+  // Linear scan _wfd_pool[0..WFD_POOL_MAX) for the first row whose in_use
+  // (word at [+120]) is 1 AND pid (word at [+0]) matches rdi.  Return
+  // row_idx in [0, 8) on hit, WFD_ID_NONE (0xFF) on miss.  pid==0 can
+  // never match a live row because _wfd_register refuses pid==0 at mint
+  // time with WFD_EBADF.  Pure leaf -- no pushes, no nested calls.
+  // Labels prefixed wfd_fr_.  Shape mirror of _wasi_args_find_row.
+  // ==========================================================================
+  pub let _wfd_find_row : (u64) -> u64 !{mem} @{} =
+    fn (pid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M6 (paideia-os #2631): linear scan _wfd_pool[0..WFD_POOL_MAX) for the first row whose in_use (word at [+120]) is 1 AND pid (word at [+0]) matches rdi. Return row_idx (0..7) or WFD_ID_NONE (0xFF) on miss. pid==0 can never match a live row because _wfd_register refuses pid==0 at mint time. Inlined row-base (shl 7 for 128-byte stride). Pure leaf -- no callee-save pushes, no nested calls. Writes only rax, rcx, r10, r11; preserves rsi/rdx/rcx-callers (we only clobber rcx as the loop cursor -- callers that need rcx preserved spill it). Labels prefixed wfd_fr_. Mirrors _wasi_args_find_row and _sr_find_row.",
+      block: {
+        lea r10, [rip + _wfd_pool];
+        xor rcx, rcx;                    // row_idx cursor
+      wfd_fr_scan:
+        cmp rcx, 8;                      // WFD_POOL_MAX
+        jae wfd_fr_none;
+
+        mov rax, rcx;
+        shl rax, 7;                      // row_idx * 128
+        add rax, r10;                    // row base
+
+        // Row must be in_use.
+        mov r11, [rax + 120];
+        cmp r11, 0;
+        je  wfd_fr_next;
+
+        // pid must match.
+        mov r11, [rax + 0];
+        cmp r11, rdi;
+        je  wfd_fr_hit;
+
+      wfd_fr_next:
+        add rcx, 1;
+        jmp wfd_fr_scan;
+
+      wfd_fr_hit:
+        mov rax, rcx;
+        ret;
+
+      wfd_fr_none:
+        mov rax, 0xFF;                   // WFD_ID_NONE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _wfd_find_free() -> row_idx | WFD_ID_NONE
+  //
+  // Linear scan for the first row whose in_use field is zero.  Used only
+  // by _wfd_register when no existing row for the pid is found.  Pure
+  // leaf.  Labels prefixed wfd_ff_.
+  // ==========================================================================
+  pub let _wfd_find_free : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M6 (paideia-os #2631): linear scan _wfd_pool[0..WFD_POOL_MAX) for the first row whose in_use (word at [+120]) is zero. Return row_idx or WFD_ID_NONE (0xFF). Inlined row-base (shl 7). Pure leaf -- no pushes. Labels prefixed wfd_ff_. Mirrors _wasi_args_find_free.",
+      block: {
+        lea r10, [rip + _wfd_pool];
+        xor rcx, rcx;                    // row_idx cursor
+      wfd_ff_scan:
+        cmp rcx, 8;                      // WFD_POOL_MAX
+        jae wfd_ff_none;
+
+        mov rax, rcx;
+        shl rax, 7;                      // row_idx * 128
+        add rax, r10;                    // row base
+        mov r11, [rax + 120];            // in_use
+        cmp r11, 0;
+        je  wfd_ff_hit;
+
+        add rcx, 1;
+        jmp wfd_ff_scan;
+
+      wfd_ff_hit:
+        mov rax, rcx;
+        ret;
+
+      wfd_ff_none:
+        mov rax, 0xFF;                   // WFD_ID_NONE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _wfd_entry_base(row_idx, fd) -> &_wfd_entries[row_idx*512 + fd*16]
+  //
+  // Pure address compute: pid-row stride 512 (shl 9) + per-fd stride 16
+  // (shl 4).  Caller validates fd < WFD_FDS_MAX; this helper does not.
+  // Pure leaf.  Labels prefixed wfd_eb_.
+  // ==========================================================================
+  pub let _wfd_entry_base : (u64, u64) -> u64 !{} @{} =
+    fn (row_idx: u64) (fd: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R135.M6 (paideia-os #2631): row_idx and fd -> &_wfd_entries[row_idx*512 + fd*16]. Power-of-two strides: shl rax,9 for the per-pid stride (512) and shl r11,4 for the per-fd stride (16). No bounds check -- caller validates fd < WFD_FDS_MAX. Pure leaf -- no pushes. Labels prefixed wfd_eb_.",
+      block: {
+        mov rax, rdi;                    // row_idx
+        shl rax, 9;                      // row_idx * 512
+        lea r10, [rip + _wfd_entries];
+        add rax, r10;                    // &entries_row
+
+        mov r11, rsi;                    // fd
+        shl r11, 4;                      // fd * 16
+        add rax, r11;                    // &entries_row[fd]
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _wfd_register(pid, fd, cap_handle, flags) -> errno
+  //
+  // Mint (or replace) an fd entry mapping WASI integer fd `fd` to the
+  // kernel-side file-cap handle `cap_handle` for the owning pid, with
+  // the given flags.
+  //
+  // ARGS (SysV):
+  //   rdi = pid                 (must be non-zero)
+  //   rsi = fd                  (must be < WFD_FDS_MAX = 32)
+  //   rdx = cap_handle          (must be non-zero; low 48 bits used)
+  //   rcx = flags               (low 16 bits used; high bits ignored)
+  //
+  // RETURNS (rax):
+  //   WFD_OK       -- entry registered or replaced
+  //   WFD_EBADF    -- pid == 0, fd >= 32, or cap_handle == 0
+  //   WFD_ENOTCAP  -- pool full (overload: no free row for new pid)
+  //
+  // STEP-BY-STEP:
+  //   1. Pack: packed = (cap_handle & 0xFFFFFFFFFFFF) << 16 | (flags & 0xFFFF).
+  //      Done BEFORE pushes so rdx and rcx can be clobbered freely.
+  //   2. pid != 0 and fd < 32 and (packed >> 16) != 0 -> else WFD_EBADF.
+  //   3. _wfd_find_row(pid) -> row_idx.  If WFD_ID_NONE,
+  //      _wfd_find_free() -> row_idx.  If still WFD_ID_NONE,
+  //      -> WFD_ENOTCAP (pool full).  Branch tracks whether row was newly
+  //      allocated (jne wfd_rg_have_row for existing, fall-through for new).
+  //   4. Existing-row path: call _wfd_entry_base(row_idx, fd) to compute
+  //      entry_ptr; write packed at [+0], offset=0 at [+8]; return WFD_OK.
+  //   5. New-row path: inline the row_base and entry_base arithmetic
+  //      (no nested call -- avoids the alignment pad that an extra
+  //      push rax / pop r9 pair would need); write entry; write pid at
+  //      row+0; write in_use=1 at row+120 LAST (publication fence);
+  //      return WFD_OK.
+  //
+  // STACK FRAME:
+  //   3 callee-save pushes (rbx=pid, r12=fd, r13=packed).  Entry rsp%16==8;
+  //   +3 pushes = +24 bytes = +8 mod 16 -> new rsp%16==0 at every nested
+  //   call (odd # of pushes puts us back on 16-byte alignment).  Nested
+  //   calls: _wfd_find_row, _wfd_find_free (both reached from the same
+  //   depth; existing-row path adds _wfd_entry_base at the same depth;
+  //   new-row path uses inline arithmetic so has zero further nested
+  //   calls).
+  //
+  // Labels prefixed wfd_rg_.
+  // ==========================================================================
+  pub let _wfd_register : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (pid: u64) (fd: u64) (cap_handle: u64) (flags: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M6 (paideia-os #2631): register (or replace) an fd entry mapping WASI integer fd `fd` to kernel file-cap handle `cap_handle` for pid. Validate pid != 0 (WFD_EBADF), fd < WFD_FDS_MAX=32 (WFD_EBADF), cap_handle != 0 (WFD_EBADF). Pack = ((cap_handle & 0xFFFFFFFFFFFF) << 16) | (flags & 0xFFFF). Find-or-allocate a row (WFD_ENOTCAP overload on pool full). Existing-row path: dispatch _wfd_entry_base helper. New-row path: inline both entry_base and row_base arithmetic to avoid the alignment pad that an extra push/pop pair around a nested call would need (3 pushes keeps rsp%16==0 at the one or two nested calls we do make; adding a push rax to save row_idx would make 4 pushes and require sub rsp,8). Three callee-save pushes (rbx=pid, r12=fd, r13=packed). Entry rsp%16==8; +3 pushes = +24 bytes = +8 mod 16 -> rsp%16==0 at every nested call. Nested calls: _wfd_find_row, _wfd_find_free (always); _wfd_entry_base (existing-row path only). Packed computed from cap_handle (rdx) and flags (rcx) BEFORE any pushes. Mask 0xFFFFFFFFFFFF (48-bit) does not fit imm32 so we materialise via mov r64, imm64 (10-byte encoding) then and reg,reg -- never `and r11, imm64`. Mask 0xFFFF for flags fits imm32 cleanly (bit 31 clear). Encoder-pitfall posture: cmp rN,0 (never test), shl rN,16 for cap_handle pack (imm8), shl rN,9 and shl rN,7 for strides (never imul), shl rN,4 for per-fd stride, mov rax,imm32 for WFD codes (all have bit 31 clear). Labels prefixed wfd_rg_.",
+      block: {
+        // ---- Step 1: pack cap_handle + flags BEFORE pushes ----
+        // Mask flags to low 16 bits (0xFFFF fits imm32, bit 31 clear).
+        mov r11, 0xFFFF;
+        and rcx, r11;
+
+        // Mask cap_handle to low 48 bits.  0xFFFFFFFFFFFF is >= 2^31 so
+        // it does not fit the sign-extended imm32 form; materialise as
+        // imm64 and and reg-reg.
+        mov r11, 0xFFFFFFFFFFFF;
+        and rdx, r11;
+
+        // Pack: cap_handle << 16 | flags.
+        shl rdx, 16;
+        or  rdx, rcx;                    // rdx = packed
+
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // pid
+        mov r12, rsi;                    // fd
+        mov r13, rdx;                    // packed
+
+        // ---- Step 2a: pid != 0 ----
+        cmp rbx, 0;
+        je  wfd_rg_badf;
+
+        // ---- Step 2b: fd < WFD_FDS_MAX ----
+        mov r11, 32;
+        cmp r12, r11;
+        jae wfd_rg_badf;
+
+        // ---- Step 2c: cap_handle != 0 (packed >> 16 != 0) ----
+        mov r11, r13;
+        shr r11, 16;
+        cmp r11, 0;
+        je  wfd_rg_badf;
+
+        // ---- Step 3a: find existing row ----
+        mov rdi, rbx;
+        call _wfd_find_row;
+        mov r11, 0xFF;
+        cmp rax, r11;
+        jne wfd_rg_have_row;             // reuse existing
+
+        // ---- Step 3b: find free row ----
+        call _wfd_find_free;
+        mov r11, 0xFF;
+        cmp rax, r11;
+        je  wfd_rg_pool_full;
+
+        // Fall through to wfd_rg_new_row with rax = row_idx.
+        jmp wfd_rg_new_row;
+
+      wfd_rg_have_row:
+        // Existing row.  rax = row_idx; r12 = fd; r13 = packed.
+        // One nested call to _wfd_entry_base; 3 pushes already aligned
+        // the caller (rsp%16==0) so the call enters correctly.
+        mov rdi, rax;
+        mov rsi, r12;
+        call _wfd_entry_base;
+        // rax = entry_ptr.
+        mov [rax + 0], r13;              // packed
+        xor r11, r11;
+        mov [rax + 8], r11;              // offset = 0
+        xor rax, rax;                    // WFD_OK
+        jmp wfd_rg_out;
+
+      wfd_rg_new_row:
+        // Newly allocated row.  rax = row_idx.  Inline the entry_base
+        // and row_base arithmetic so we do not need to spill row_idx
+        // across a nested call (which would push the push count to 4
+        // and misalign the stack).
+
+        // entry_ptr = _wfd_entries + row_idx*512 + fd*16.
+        mov r10, rax;
+        shl r10, 9;                      // row_idx * 512
+        lea r11, [rip + _wfd_entries];
+        add r10, r11;                    // entries row base
+        mov r11, r12;                    // fd
+        shl r11, 4;                      // fd * 16
+        add r10, r11;                    // r10 = entry_ptr
+
+        mov [r10 + 0], r13;              // packed
+        xor r11, r11;
+        mov [r10 + 8], r11;              // offset = 0
+
+        // row_base = _wfd_pool + row_idx*128.
+        mov r10, rax;
+        shl r10, 7;                      // row_idx * 128
+        lea r11, [rip + _wfd_pool];
+        add r10, r11;                    // r10 = row_base
+
+        // Write pid at row+0.
+        mov [r10 + 0], rbx;
+
+        // Write in_use=1 at row+120 LAST (publication fence).
+        mov r11, 1;
+        mov [r10 + 120], r11;
+
+        xor rax, rax;                    // WFD_OK
+        jmp wfd_rg_out;
+
+      wfd_rg_badf:
+        mov rax, 0x08;                   // WFD_EBADF
+        jmp wfd_rg_out;
+
+      wfd_rg_pool_full:
+        mov rax, 0x1E00;                 // WFD_ENOTCAP (overload: pool full)
+
+      wfd_rg_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _wfd_lookup(pid, fd) -> packed u64
+  //
+  // Look up fd on pid's row and return the packed cap_handle/flags word.
+  //
+  // ARGS (SysV):
+  //   rdi = pid
+  //   rsi = fd
+  //
+  // RETURNS (rax):
+  //   On HIT:   (cap_handle << 16) | flags   -- high 48 cap_handle (non-
+  //                                              zero), low 16 flags
+  //   On MISS:  WFD_EBADF (fd out of range) or WFD_ENOTCAP (pid-not-
+  //             registered, no slot registered for fd) in the low 16
+  //             bits with the high 48 bits zero.
+  //
+  // Discriminator: (ret >> 16) == 0 iff miss.  (ret & 0xFFFF) is the
+  // specific error code on miss, or the flags on hit.
+  //
+  // STACK FRAME:
+  //   2 callee-save pushes (rbx=pid, r12=fd) + sub rsp,8 (alignment held
+  //   throughout).  Entry rsp%16==8; +2 pushes = +16 -> %16==8; sub rsp,8
+  //   = +24 -> %16==0 at every nested call.  Nested calls: _wfd_find_row,
+  //   _wfd_entry_base.  Labels prefixed wfd_lk_.
+  // ==========================================================================
+  pub let _wfd_lookup : (u64, u64) -> u64 !{mem} @{} =
+    fn (pid: u64) (fd: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M6 (paideia-os #2631): look up fd on pid's row; return packed (cap_handle << 16) | flags on hit, or (0 | WFD_EBADF/WFD_ENOTCAP) with high 48 bits zero on miss. Discriminator: (ret >> 16) == 0 iff miss. Validate fd < WFD_FDS_MAX=32 (WFD_EBADF). Call _wfd_find_row(pid); miss -> WFD_ENOTCAP. Compute entry_base via _wfd_entry_base(row_idx, fd); load packed at [+0]; packed == 0 -> WFD_ENOTCAP (unregistered fd). Two callee-save pushes (rbx=pid, r12=fd) + sub rsp,8 (alignment held throughout; both nested calls see rsp%16==0 so the callee enters at %16==8 after retaddr push). Encoder posture: cmp rN,0 (never test), mov rax,imm32 for WFD codes. Labels prefixed wfd_lk_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // pid
+        mov r12, rsi;                    // fd
+
+        // ---- Validate fd < WFD_FDS_MAX ----
+        mov r11, 32;
+        cmp r12, r11;
+        jae wfd_lk_badf;
+
+        // ---- Lookup row ----
+        mov rdi, rbx;
+        call _wfd_find_row;
+        mov r11, 0xFF;
+        cmp rax, r11;
+        je  wfd_lk_notcap;
+
+        // ---- Compute entry base ----
+        mov rdi, rax;
+        mov rsi, r12;
+        call _wfd_entry_base;
+
+        // ---- Load packed ----
+        mov r11, [rax + 0];
+        cmp r11, 0;
+        je  wfd_lk_notcap;               // packed==0 => fd unregistered
+
+        mov rax, r11;                    // return packed verbatim
+        jmp wfd_lk_out;
+
+      wfd_lk_badf:
+        mov rax, 0x08;                   // WFD_EBADF
+        jmp wfd_lk_out;
+
+      wfd_lk_notcap:
+        mov rax, 0x1E00;                 // WFD_ENOTCAP
+
+      wfd_lk_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _wfd_close(pid, fd) -> errno
+  //
+  // Scrub the fd entry (packed=0, offset=0).  Leaves the pool row live
+  // -- row teardown is driven by jail-supervisor shutdown, not by
+  // closing the last fd.
+  //
+  // ARGS (SysV):
+  //   rdi = pid
+  //   rsi = fd
+  //
+  // RETURNS (rax):
+  //   WFD_OK       -- entry scrubbed (idempotent on already-empty slots)
+  //   WFD_EBADF    -- fd >= 32 or pid not registered
+  //
+  // STACK FRAME:
+  //   2 callee-save pushes (rbx=pid, r12=fd) + sub rsp,8 (alignment held
+  //   throughout).  Nested calls: _wfd_find_row, _wfd_entry_base.
+  //   Labels prefixed wfd_cl_.
+  // ==========================================================================
+  pub let _wfd_close : (u64, u64) -> u64 !{mem} @{} =
+    fn (pid: u64) (fd: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M6 (paideia-os #2631): scrub pid's fd entry (packed=0, offset=0). Leaves the pool row live; row teardown is driven by jail-supervisor shutdown, not by closing the last fd (symmetry with wasi_args_conv's permanent-row posture). Validate fd < WFD_FDS_MAX=32 (WFD_EBADF). Call _wfd_find_row(pid); miss -> WFD_EBADF. Compute entry_base via _wfd_entry_base; zero both u64 slots. Idempotent on already-empty entries. Two callee-save pushes (rbx=pid, r12=fd) + sub rsp,8 (alignment held throughout). Entry rsp%16==8; +2 pushes = +16 -> %16==8; sub rsp,8 = +24 -> %16==0 at every nested call. Encoder posture: cmp rN,0 (never test), mov rax,imm32 for WFD codes. Labels prefixed wfd_cl_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // pid
+        mov r12, rsi;                    // fd
+
+        // ---- Validate fd < WFD_FDS_MAX ----
+        mov r11, 32;
+        cmp r12, r11;
+        jae wfd_cl_badf;
+
+        // ---- Lookup row ----
+        mov rdi, rbx;
+        call _wfd_find_row;
+        mov r11, 0xFF;
+        cmp rax, r11;
+        je  wfd_cl_badf;
+
+        // ---- Compute entry base ----
+        mov rdi, rax;
+        mov rsi, r12;
+        call _wfd_entry_base;
+
+        // ---- Zero both slots ----
+        xor r11, r11;
+        mov [rax + 0], r11;              // packed
+        mov [rax + 8], r11;              // offset
+
+        xor rax, rax;                    // WFD_OK
+        jmp wfd_cl_out;
+
+      wfd_cl_badf:
+        mov rax, 0x08;                   // WFD_EBADF
+
+      wfd_cl_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _wfd_read(pid, fd, iovs_ptr, iovs_len, nread_out_ptr) -> errno
+  //
+  // Walk the iovec array, dispatching each entry through vfs_read against
+  // the cap_handle stored for (pid, fd).  Advance the per-fd offset by
+  // the sum of bytes read.  Short reads at EOF are honoured per-iovec
+  // (we loop and keep issuing reads until an iovec returns fewer bytes
+  // than requested or iovs_len is exhausted).
+  //
+  // ARGS (SysV):
+  //   rdi = pid
+  //   rsi = fd
+  //   rdx = iovs_ptr            (kernel pointer to [struct {buf: u64;
+  //                              buf_len: u64}; iovs_len]; see §2 kernel
+  //                              iovec shape -- M7 WASM-space translator
+  //                              marshals from 32-bit WASM iovecs into
+  //                              this 64-bit layout before calling)
+  //   rcx = iovs_len
+  //   r8  = nread_out_ptr       (writable u64 destination for sum of
+  //                              bytes read; always written on non-EBADF
+  //                              returns, with the partial sum on error)
+  //
+  // RETURNS (rax):
+  //   WFD_OK       -- all iovecs processed; *nread_out_ptr holds the
+  //                   total.  A short / EOF read anywhere is still OK;
+  //                   the caller sees it via *nread_out_ptr < sum(len).
+  //   WFD_EBADF    -- fd >= 32 or pid not registered or nread_out_ptr==0
+  //                   or pid == 0.  *nread_out_ptr NOT touched.
+  //   WFD_ENOTCAP  -- fd slot unregistered.  *nread_out_ptr = 0.
+  //   WFD_IO       -- vfs_read returned a sentinel on some iov; partial
+  //                   sum is still written to *nread_out_ptr.
+  //
+  // STEP-BY-STEP:
+  //   1. Validate args: pid!=0, fd<32, nread_out_ptr!=0.
+  //   2. Save fd into r15 (callee-save) IMMEDIATELY so it survives
+  //      _wfd_find_row (SysV says rsi is caller-save; the leaf happens
+  //      to preserve it today but we do not rely on that).
+  //   3. _wfd_find_row(pid) -> row_idx; miss -> EBADF.
+  //   4. _wfd_entry_base(row_idx=rax, fd=r15); overwrite r15 with the
+  //      returned entry_ptr.
+  //   5. Load packed = [r15+0]; packed==0 -> ENOTCAP.
+  //   6. Load offset = [r15+8] into the stack scratch slot.
+  //   7. Loop i in [0, iovs_len):
+  //        iov_buf = iovs[i].buf, iov_len = iovs[i].buf_len.
+  //        Reload cap_handle = (packed >> 16) each iteration (packed
+  //        itself is reloaded from [r15+0] since r11 is caller-save).
+  //        call vfs_read(cap_handle, iov_buf, iov_len, offset).
+  //        rax == VFS_ERR sentinel  -> write partial, return WFD_IO.
+  //        offset       += rax; total_read += rax.
+  //        rax < iov_len            -> short read / EOF; break loop OK.
+  //   8. Persist offset back to entry[+8].  Store total_read to
+  //      *nread_out_ptr.  Return WFD_OK.
+  //
+  // STACK FRAME:
+  //   5 callee-save pushes (rbx=pid, r12=iovs_cur, r13=iovs_end,
+  //   r14=nread_out_ptr, r15=fd-then-entry_ptr) + sub rsp,16 (two scratch
+  //   u64 slots).  Entry rsp%16==8; +5 pushes = +40 bytes = +8 mod 16 ->
+  //   %16==0 (odd pushes aligned); sub rsp,16 keeps %16==0 at nested
+  //   calls.  Stack slots:
+  //     [rsp+0] = total_read   (accumulator)
+  //     [rsp+8] = offset       (seek position, held across nested calls)
+  //
+  // Labels prefixed wfd_rd_.
+  // ==========================================================================
+  pub let _wfd_read : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (pid: u64) (fd: u64) (iovs_ptr: u64) (iovs_len: u64) (nread_out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M6 (paideia-os #2631): walk the kernel-iovec array dispatching each entry through vfs_read against the cap_handle stored for (pid, fd); advance per-fd offset. Validate pid!=0, fd<32, nread_out_ptr!=0 (WFD_EBADF; *nread_out_ptr NOT touched on EBADF). Save fd into r15 BEFORE any nested call so it survives through to _wfd_entry_base (SysV says rsi is caller-save; even though _wfd_find_row happens to preserve rsi today, we do not rely on leaf-local register discipline across the function boundary). Lookup row (miss -> EBADF). Compute entry_ptr via _wfd_entry_base(row_idx, fd); overwrite r15 with entry_ptr for the loop. Load packed; packed==0 -> ENOTCAP (write 0 to *nread_out_ptr first). Load offset from entry+8 into stack scratch. Loop iovecs: for each (buf, len), reload packed from [r15+0] and derive cap_handle = packed>>16 each iteration (packed is caller-save-shaped since r11 cannot survive a nested call); zero-length iovecs are skipped defensively. Call vfs_read(cap_handle, buf, len, offset); on sentinel 0xFFFFFFFFFFFFFFFF -> write partial sum, persist offset, return WFD_IO; else offset += bytes, total += bytes; on short read (bytes < len), persist offset+total and return WFD_OK. Persist offset back to entry+8; write total to *nread_out_ptr. Five callee-save pushes (rbx=pid, r12=iovs_cur, r13=iovs_end, r14=nread_out_ptr, r15=fd-then-entry_ptr) + sub rsp,16 (two scratch slots: [rsp+0]=total_read, [rsp+8]=offset). Entry rsp%16==8; +5 pushes = +40 bytes = +8 mod 16 -> %16==0 (odd pushes aligned); sub rsp,16 keeps %16==0 at every nested call. iovs_end = iovs_ptr + iovs_len*16 computed via shl r11,4; add r11,rdx; held in r13 so the loop exit condition is a cheap `cmp r12, r13`. Sentinel 0xFFFFFFFFFFFFFFFF materialised via `mov r11, imm64` (same encoder pattern as vfs_read's wrapping failure path). Encoder posture: cmp rN,0 (never test), shl rN,4 for iovec stride (never imul), shr rN,16 for cap_handle unpack (imm8), mov r11,imm64 for sentinel, mov rax,imm32 for WFD codes. Labels prefixed wfd_rd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;
+
+        // ---- Step 1: validate ----
+        cmp rdi, 0;
+        je  wfd_rd_badf;
+
+        mov r11, 32;
+        cmp rsi, r11;
+        jae wfd_rd_badf;
+
+        cmp r8, 0;
+        je  wfd_rd_badf;
+
+        // ---- Step 2: save callee-save state (fd survives into step 4) ----
+        mov rbx, rdi;                    // pid
+        mov r15, rsi;                    // fd (survives _wfd_find_row)
+        mov r14, r8;                     // nread_out_ptr
+
+        // Compute iovs_end = iovs_ptr + iovs_len * 16.
+        mov r11, rcx;                    // iovs_len
+        shl r11, 4;                      // * 16
+        add r11, rdx;                    // iovs_ptr + iovs_len*16
+        mov r13, r11;                    // r13 = iovs_end
+        mov r12, rdx;                    // r12 = iovs_cur
+
+        xor r11, r11;
+        mov [rsp + 0], r11;              // total_read = 0
+        mov [rsp + 8], r11;              // offset placeholder
+
+        // ---- Step 3: lookup row ----
+        mov rdi, rbx;
+        call _wfd_find_row;
+        mov r11, 0xFF;
+        cmp rax, r11;
+        je  wfd_rd_badf;
+
+        // ---- Step 4: compute entry base; r15 absorbs the result ----
+        mov rdi, rax;
+        mov rsi, r15;                    // fd
+        call _wfd_entry_base;
+        mov r15, rax;                    // r15 = entry_ptr (overwrites fd)
+
+        // ---- Step 5: load packed; packed==0 -> ENOTCAP ----
+        mov r11, [r15 + 0];
+        cmp r11, 0;
+        je  wfd_rd_notcap;
+
+        // ---- Step 6: load offset into stack scratch ----
+        mov r9, [r15 + 8];
+        mov [rsp + 8], r9;
+
+        // ---- Step 7: iov loop ----
+      wfd_rd_loop:
+        cmp r12, r13;
+        jae wfd_rd_persist;              // all iovs done
+
+        mov r9,  [r12 + 0];              // iov.buf
+        mov r10, [r12 + 8];              // iov.len
+
+        // Zero-length iovec: skip defensively (do not call vfs_read with
+        // len=0 -- backend semantics for zero-byte reads vary).
+        cmp r10, 0;
+        je  wfd_rd_loop_next;
+
+        // Reload packed, derive cap_handle each iteration (r11 is
+        // caller-save and does not survive the nested vfs_read call).
+        mov r11, [r15 + 0];
+        shr r11, 16;                     // cap_handle (low 48 bits)
+
+        mov rdi, r11;                    // vnode_idx = cap_handle (M6 identity)
+        mov rsi, r9;                     // buf
+        mov rdx, r10;                    // len
+        mov rcx, [rsp + 8];              // offset
+        call vfs_read;
+
+        // Check sentinel 0xFFFFFFFFFFFFFFFF.
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  wfd_rd_io;
+
+        // offset += rax; total_read += rax.
+        mov r9, [rsp + 8];
+        add r9, rax;
+        mov [rsp + 8], r9;               // offset
+
+        mov r9, [rsp + 0];
+        add r9, rax;
+        mov [rsp + 0], r9;               // total_read
+
+        // Short-read detection: rax < iov.len -> EOF-ish; stop.
+        mov r10, [r12 + 8];              // iov.len (reload; r10 may be clobbered)
+        cmp rax, r10;
+        jb  wfd_rd_persist;
+
+      wfd_rd_loop_next:
+        add r12, 16;                     // next iovec (shl 4 stride)
+        jmp wfd_rd_loop;
+
+      wfd_rd_persist:
+        // Persist offset back to entry+8; write total to *nread_out_ptr.
+        mov r9, [rsp + 8];
+        mov [r15 + 8], r9;               // offset
+
+        mov r9, [rsp + 0];
+        mov [r14 + 0], r9;               // *nread_out_ptr = total_read
+
+        xor rax, rax;                    // WFD_OK
+        jmp wfd_rd_out;
+
+      wfd_rd_io:
+        // Short-circuit error: persist offset and partial total, return WFD_IO.
+        mov r9, [rsp + 8];
+        mov [r15 + 8], r9;
+
+        mov r9, [rsp + 0];
+        mov [r14 + 0], r9;
+
+        mov rax, 0x1E01;                 // WFD_IO
+        jmp wfd_rd_out;
+
+      wfd_rd_notcap:
+        // packed==0: fd unregistered.  Write 0 to *nread_out_ptr.
+        xor r9, r9;
+        mov [r14 + 0], r9;
+        mov rax, 0x1E00;                 // WFD_ENOTCAP
+        jmp wfd_rd_out;
+
+      wfd_rd_badf:
+        // Return WFD_EBADF without touching *nread_out_ptr (caller must
+        // treat *nread as undefined on EBADF).
+        mov rax, 0x08;                   // WFD_EBADF
+
+      wfd_rd_out:
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _wfd_write(pid, fd, iovs_ptr, iovs_len, nwritten_out_ptr) -> errno
+  //
+  // Walk the iovec array, dispatching each entry through either
+  // _stdout_records_feed (if fd==1 and the pid has a stdout_records
+  // schema row) or vfs_write (otherwise).  For the vfs path, advance
+  // the per-fd offset by the sum of bytes written.  For the sr path,
+  // the per-fd offset is NOT advanced (stdout is a stream, not a
+  // seekable file, in the WASI preview1 sense -- the pretend-offset
+  // field stays zero).
+  //
+  // ARGS (SysV):
+  //   rdi = pid
+  //   rsi = fd
+  //   rdx = iovs_ptr            (kernel-iovec array)
+  //   rcx = iovs_len
+  //   r8  = nwritten_out_ptr    (writable u64 destination; always written
+  //                              on non-EBADF returns, with the partial
+  //                              sum on error)
+  //
+  // RETURNS (rax):
+  //   WFD_OK       -- all iovecs processed; *nwritten_out_ptr holds total
+  //   WFD_EBADF    -- fd >= 32 or pid not registered or nwritten_out==0
+  //                   or pid == 0.  *nwritten_out_ptr NOT touched.
+  //   WFD_ENOTCAP  -- fd slot unregistered (vfs path).
+  //                   *nwritten_out_ptr = 0.
+  //   WFD_IO       -- vfs_write or _stdout_records_feed returned error.
+  //                   Partial sum written to *nwritten_out_ptr.
+  //
+  // DISPATCH DECISION (§4):
+  //   if fd == 1 and _sr_find_row(pid) != 0xFF:  stdout_records path
+  //   else:                                       vfs path
+  //
+  // STACK FRAME:
+  //   5 callee-save pushes (rbx=pid, r12=iovs_cur, r13=iovs_end,
+  //   r14=nwritten_out_ptr, r15=fd-then-entry_ptr) + sub rsp,16 (two
+  //   scratch slots: [rsp+0]=total_written, [rsp+8]=offset for vfs path /
+  //   unused for sr path).  Same alignment as _wfd_read.
+  //
+  // Labels prefixed wfd_wr_.
+  // ==========================================================================
+  pub let _wfd_write : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (pid: u64) (fd: u64) (iovs_ptr: u64) (iovs_len: u64) (nwritten_out_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M6 (paideia-os #2631): walk kernel-iovec array dispatching each entry through either _stdout_records_feed (fd==1 AND pid has a schema row via _sr_find_row) or vfs_write (otherwise). Per-fd offset advanced on vfs path only; stdout is treated as a stream (sr path keeps offset=0 permanently). Validate pid!=0, fd<32, nwritten_out_ptr!=0 (WFD_EBADF; *nwritten_out_ptr NOT touched on EBADF). Save fd into r15 BEFORE any nested call so it survives through to the vfs-path's _wfd_entry_base call. Decision tree at the top: fd==1 branch calls _sr_find_row(pid); miss falls through to vfs path (fd==1 without a schema is treated as a regular file-cap write, which is how fd=2/stderr always flows). SR path loops iovs calling _stdout_records_feed(pid, buf, len); the packed-u64 return's low-32 status band is zero-extended via shl r11,32 / shr r11,32 (NEVER `and r11, imm64` -- the 0xFFFFFFFF mask has bit 31 set and would sign-extend if passed as imm32; mirrors wit_bridge.pdx's status unpack); non-zero status -> WFD_IO with partial sum written. VFS path mirrors _wfd_read: lookup entry (ENOTCAP on packed==0), unpack cap_handle, load offset, loop vfs_write(cap_handle, buf, len, offset); sentinel 0xFFFFFFFFFFFFFFFF -> WFD_IO; else offset += bytes, total += bytes. Persist offset to entry+8; write total to *nwritten_out_ptr. Five callee-save pushes (rbx=pid, r12=iovs_cur, r13=iovs_end, r14=nwritten_out_ptr, r15=fd-then-entry_ptr) + sub rsp,16 (two scratch slots). Entry rsp%16==8; +5 pushes = +40 bytes = +8 mod 16 -> %16==0 (odd pushes aligned); sub rsp,16 keeps %16==0 at every nested call. Nested calls: _sr_find_row, _stdout_records_feed (sr path), _wfd_find_row, _wfd_entry_base, vfs_write (vfs path). Encoder posture: cmp rN,0 (never test), shl rN,4 for iovec stride, shr rN,16 for cap_handle unpack, shl r11,32 / shr r11,32 for status unpack, mov r11,imm64 for the vfs sentinel and for the 48-bit cap-handle mask, mov rax,imm32 for WFD codes. Labels prefixed wfd_wr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;
+
+        // ---- Validate ----
+        cmp rdi, 0;
+        je  wfd_wr_badf;
+
+        mov r11, 32;
+        cmp rsi, r11;
+        jae wfd_wr_badf;
+
+        cmp r8, 0;
+        je  wfd_wr_badf;
+
+        // ---- Save callee-save state ----
+        mov rbx, rdi;                    // pid
+        mov r15, rsi;                    // fd (survives nested calls)
+        mov r14, r8;                     // nwritten_out_ptr
+
+        // Compute iovs_end + iovs_cur.
+        mov r11, rcx;
+        shl r11, 4;
+        add r11, rdx;
+        mov r13, r11;                    // iovs_end
+        mov r12, rdx;                    // iovs_cur
+
+        // Initialise stack scratch.
+        xor r11, r11;
+        mov [rsp + 0], r11;              // total_written = 0
+        mov [rsp + 8], r11;              // offset / unused
+
+        // ---- Dispatch decision: fd == 1 AND stdout_records schema registered? ----
+        cmp r15, 1;
+        jne wfd_wr_vfs;                  // fd != 1 -> vfs path
+
+        // Check for schema row via _sr_find_row.
+        mov rdi, rbx;                    // pid
+        call _sr_find_row;
+        mov r11, 0xFF;
+        cmp rax, r11;
+        je  wfd_wr_vfs;                  // no schema row -> vfs path
+
+        // ---- STDOUT_RECORDS PATH ----
+      wfd_wr_sr_loop:
+        cmp r12, r13;
+        jae wfd_wr_sr_done;
+
+        mov r9,  [r12 + 0];              // iov.buf
+        mov r10, [r12 + 8];              // iov.len
+
+        cmp r10, 0;
+        je  wfd_wr_sr_next;
+
+        // call _stdout_records_feed(pid, buf, len).
+        mov rdi, rbx;
+        mov rsi, r9;
+        mov rdx, r10;
+        call _stdout_records_feed;
+
+        // Return is packed (records_emitted << 32) | status.  Extract
+        // the low-32 status band via shl/shr (never and-with-imm32
+        // because 0xFFFFFFFF has bit 31 set and would sign-extend).
+        mov r11, rax;
+        shl r11, 32;
+        shr r11, 32;                     // r11 = status (low 32, zero-extended)
+        cmp r11, 0;
+        jne wfd_wr_sr_io;
+
+        // Successful feed: count iov.len bytes as "written" from WASI's POV
+        // (feed consumes the whole buffer -- partial lines are buffered in
+        // the row's partial_buf for the next feed, so no bytes are lost).
+        mov r9, [r12 + 8];               // reload iov.len (r10 may be clobbered)
+        mov r11, [rsp + 0];
+        add r11, r9;
+        mov [rsp + 0], r11;
+
+      wfd_wr_sr_next:
+        add r12, 16;
+        jmp wfd_wr_sr_loop;
+
+      wfd_wr_sr_done:
+        mov r9, [rsp + 0];
+        mov [r14 + 0], r9;
+        xor rax, rax;                    // WFD_OK
+        jmp wfd_wr_out;
+
+      wfd_wr_sr_io:
+        mov r9, [rsp + 0];
+        mov [r14 + 0], r9;
+        mov rax, 0x1E01;                 // WFD_IO
+        jmp wfd_wr_out;
+
+        // ---- VFS PATH ----
+      wfd_wr_vfs:
+        // r15 holds fd.  Lookup row -> entry -> write loop.
+        mov rdi, rbx;
+        call _wfd_find_row;
+        mov r11, 0xFF;
+        cmp rax, r11;
+        je  wfd_wr_badf;
+
+        mov rdi, rax;
+        mov rsi, r15;                    // fd (preserved)
+        call _wfd_entry_base;
+        mov r15, rax;                    // r15 = entry_ptr (overwrites fd)
+
+        mov r11, [r15 + 0];
+        cmp r11, 0;
+        je  wfd_wr_notcap;
+
+        mov r9, [r15 + 8];
+        mov [rsp + 8], r9;               // offset
+
+      wfd_wr_vfs_loop:
+        cmp r12, r13;
+        jae wfd_wr_persist;
+
+        mov r9,  [r12 + 0];              // iov.buf
+        mov r10, [r12 + 8];              // iov.len
+
+        cmp r10, 0;
+        je  wfd_wr_vfs_next;
+
+        // Reload cap_handle each iteration.
+        mov r11, [r15 + 0];
+        shr r11, 16;                     // cap_handle
+
+        mov rdi, r11;
+        mov rsi, r9;
+        mov rdx, r10;
+        mov rcx, [rsp + 8];              // offset
+        call vfs_write;
+
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  wfd_wr_io;
+
+        mov r9, [rsp + 8];
+        add r9, rax;
+        mov [rsp + 8], r9;               // offset
+
+        mov r9, [rsp + 0];
+        add r9, rax;
+        mov [rsp + 0], r9;               // total_written
+
+        mov r10, [r12 + 8];              // reload iov.len
+        cmp rax, r10;
+        jb  wfd_wr_persist;
+
+      wfd_wr_vfs_next:
+        add r12, 16;
+        jmp wfd_wr_vfs_loop;
+
+      wfd_wr_persist:
+        mov r9, [rsp + 8];
+        mov [r15 + 8], r9;
+
+        mov r9, [rsp + 0];
+        mov [r14 + 0], r9;
+
+        xor rax, rax;                    // WFD_OK
+        jmp wfd_wr_out;
+
+      wfd_wr_io:
+        mov r9, [rsp + 8];
+        mov [r15 + 8], r9;
+
+        mov r9, [rsp + 0];
+        mov [r14 + 0], r9;
+
+        mov rax, 0x1E01;                 // WFD_IO
+        jmp wfd_wr_out;
+
+      wfd_wr_notcap:
+        xor r9, r9;
+        mov [r14 + 0], r9;
+        mov rax, 0x1E00;                 // WFD_ENOTCAP
+        jmp wfd_wr_out;
+
+      wfd_wr_badf:
+        mov rax, 0x08;                   // WFD_EBADF
+
+      wfd_wr_out:
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

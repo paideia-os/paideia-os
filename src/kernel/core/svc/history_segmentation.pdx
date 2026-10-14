@@ -1,0 +1,949 @@
+// src/kernel/core/svc/history_segmentation.pdx -- Wave UMB-W20 R139.M1
+// paideia-os #2639
+//
+// PER-SESSION HISTORY SEGMENTATION (UNION / INTERSECT / SUMMARY)
+// =============================================================================
+//
+// R139 ("multi-session") milestone M1.  R127.M4 (Wave UMB-W15, #2600)
+// landed the TEXT ring keyed by shell_session row-id; R127.M7 (Wave
+// UMB-W18, #2603) landed the structured FACT store at the same per-
+// session cardinality (8 sessions x 128 entries each).  Both already
+// SEGMENT by session_id -- a per-session scan is a `_hf_query_by_session`
+// away, and a per-session count is a `_shell_history_count`.
+//
+// R139.M1 lifts those building blocks into a cross-session PROJECTION
+// surface: when multiple shell sessions run concurrently (local +
+// R137 remote-shell + R135 nested jails), each session's history
+// remains isolated (one ring per sid, no shared slot ever) AND a
+// cross-session query can project a UNION view, an INTERSECT view
+// shaped by two cmd_hash disjuncts, and a per-session SUMMARY.
+//
+// Design posture:
+//   * No new storage.  The two existing substrates are the source of
+//     truth; this module is pure PROJECTION over them.
+//   * The sessions_mask is a filter, not a dispatch keyword -- a bit
+//     clear is "exclude", not "fault".  Mask bits above SS_POOL_MAX
+//     (8) are silently ignored.
+//   * The UNION order at M1 is "per-session newest-first, sids
+//     ascending" -- a true tsc-ordered k-way merge waits for R127.M8
+//     to populate tsc_start.  See §3 for the rationale and the M2
+//     retirement path.
+//   * No cap-invoke surface at M1 (direct-call only).  A later wave
+//     folds the three verbs into a KIND_SHELL_SESSION op dispatched
+//     by svc_broker, with the sessions_mask carried in the op
+//     payload.
+//
+// Design: design/shell/history-segmentation.md.
+//
+// =============================================================================
+// SECTION 1  INPUTS  --  THE EXISTING SUBSTRATES
+// =============================================================================
+//
+// Read-only reach into:
+//   * _hf_pool   -- 64 KiB fact ring   (R127.M7 history_facts.pdx)
+//   * _hf_heads  -- 8 u64 monotonic head counters per session
+//   * ss_row_in_use(sid) -- liveness probe on the shell_session row
+//
+// This module WRITES only to its own stats pool (_hs_stats) and to
+// caller-supplied out buffers.  No cross-module mutation; the fact
+// pool stays owned by history_facts.
+//
+// =============================================================================
+// SECTION 2  PUBLIC API
+// =============================================================================
+//
+//   _hs_init() -> ()
+//     Boot-time scrub of _hs_stats + one `HISTORY_SEG INIT OK`
+//     fingerprint.
+//
+//   _hs_project_union(sessions_mask, out_rows_ptr, out_cap)
+//                                                         -> packed u64
+//     Scan every session whose bit is set in sessions_mask
+//     (bit sid == 1 << sid) and emit live fact rows newest-first
+//     within each session, concatenated in sid-ascending order.
+//     Each row is a 64-byte copy from the fact ring; the caller's
+//     buffer must be a multiple of 64 bytes.  Early-out when the
+//     emit count hits out_cap >> 6.
+//
+//   _hs_project_intersect(cmd_hash_a, cmd_hash_b, sessions_mask,
+//                         out_rows_ptr, out_cap) -> packed u64
+//     Datalog disjunction with session filter: emit rows whose
+//     cmd_hash (u32 at [row+4]) matches cmd_hash_a OR cmd_hash_b
+//     AND whose session is set in sessions_mask.  To query a single
+//     hash, pass the same value as both arguments.  Order is the
+//     same as _hs_project_union.
+//
+//   _hs_session_summary(session_id, out_summary_ptr) -> errno
+//     Validate session_id (SS_ERR_BAD_SESSION on bad / free row).
+//     Write a fixed 24-byte summary to out_summary_ptr:
+//        [+0]  total_cmds       u64  = _hf_heads[sid] (monotonic;
+//                                      includes evicted rows)
+//        [+8]  non_zero_exits   u64  = count of live facts whose
+//                                      exit_code (u32 at [+24]) != 0
+//        [+16] tsc_span_cycles  u64  = max(tsc_end) - min(tsc_start)
+//                                      over live facts with
+//                                      tsc_start != 0 (0 pre-M8)
+//     Returns HS_OK or HS_ERR_BAD_SESSION.  No out_cap -- the shape
+//     is fixed and the caller is responsible for providing 24 B.
+//
+// =============================================================================
+// SECTION 3  UNION ORDER AT M1
+// =============================================================================
+//
+// The brief calls for "newest-first across the union".  A true merge
+// requires an absolute timestamp per row; the fact row carries
+// tsc_start (u64 at [+8]) but R127.M7 ships with tsc_start == 0 on
+// every row and leaves M8 to fill it from RDTSC at dispatch.  At M1
+// a tsc-based k-way merge is therefore meaningless (all keys tie at
+// zero), so the deterministic M1 shape is:
+//
+//     for sid in [0, 8):
+//       if (sessions_mask >> sid) & 1 == 0: continue
+//       for i in [0, min(_hf_heads[sid], 128)):
+//         emit sid's slot (head - 1 - i) & 0x7F
+//
+// i.e. per-session newest-first, concatenated in sid-ascending order.
+// This gives a stable, test-reproducible emit order; the caller can
+// later sort the out buffer by tsc_start once M8 lands.  M2 of this
+// module retires the concatenation in favour of a bounded 8-way
+// merge over tsc_start with sid-ascending as the tiebreak.
+//
+// =============================================================================
+// SECTION 4  RETURN CODE BAND  --  0x1F00
+// =============================================================================
+//
+//   HS_OK                 = 0
+//   HS_ERR_BAD_SESSION    = reuse SS_ERR_BAD_ID = 0x1102
+//   HS_ERR_OUT_TOO_SMALL  = 0x1F00
+//
+// Band audit (2026-10-14):
+//   `grep -rnE '0x1F00\b' src/kernel/` -> zero hits.  Clean band.
+//
+// 0x1F00 fits imm32 with bit 31 clear so `mov rax, imm32` emits the
+// 7-byte zero-extending form.
+//
+// The projection functions pack success results as (bytes << 32) |
+// HS_OK matching the hf_query_* convention.  _hs_session_summary
+// returns a bare errno (its payload lives in out_summary_ptr).
+//
+// =============================================================================
+// SECTION 5  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Labels prefixed `hs_` (history-segmentation) to stay clear of `hf_`
+// (history_facts), `sh_` (shell_history), `ss_` (shell_session),
+// `sj_` (shell_jobs) and `svc_` (ipc/svc_broker).  Encoder-pitfall
+// posture (feedback_pdx_encoder_pitfalls):
+//
+//   * cmp rN, 0              (never `test rN, rN`)
+//   * shl rN, 6              (fact-stride compose)
+//   * shl rN, 13             (ring-base compose)
+//   * shr rN, 1              (mask-walk shift; fits imm8)
+//   * and rN, 0x7F           (slot-index mask; fits imm32)
+//   * and rN, 1              (low-bit extraction; fits imm8)
+//   * mov rax, imm32         (never `and r11, imm64`)
+//   * shl rN,32 / shr rN,32  (u32 isolation; never and r11,imm64)
+//   * single-line `pub let name = "..."`
+//   * module basename HistorySegmentation matches file basename
+//     history_segmentation.pdx
+//   * fingerprint [u8; N] with N = len(string) + 1 (NUL counts)
+//
+// Stack discipline (SysV, entry rsp%16==8):
+//   _hs_init                 1 push + 0 sub       (klog_s1 parity)
+//   _hs_project_union        5 pushes + sub rsp,16  (klog slot + pad)
+//   _hs_project_intersect    5 pushes + sub rsp,32  (klog + 2 hash + pad)
+//   _hs_session_summary      5 pushes + sub rsp,16  (klog slot + pad)
+//
+// =============================================================================
+// SECTION 6  BOOT WIRING
+// =============================================================================
+//
+// kernel_main.pdx picks this up with ONE new call right after
+// _hf_init and before _shell_jobs_init:
+//
+//   call _hf_init;                   // R127.M7
+//   call _hs_init;                   // R139.M1 (this file)
+//   call _shell_jobs_init;           // R127.M5
+//
+// Placement rationale: _hs_init MUST follow _hf_init so an audit grep
+// sees the three history-shaped fingerprints in subsystem order
+// (SHELL_HISTORY INIT OK -> HISTORY_FACTS INIT OK -> HISTORY_SEG
+// INIT OK).  No data dependency on _shell_jobs_init.
+//
+// =============================================================================
+
+module HistorySegmentation = structure {
+
+  // ==========================================================================
+  // Return band (§4)
+  // ==========================================================================
+
+  pub let HS_OK                : u64 = 0
+  pub let HS_ERR_BAD_SESSION   : u64 = 0x1102    // alias SS_ERR_BAD_ID
+  pub let HS_ERR_OUT_TOO_SMALL : u64 = 0x1F00
+
+  // ==========================================================================
+  // Geometry references (mirrors history_facts.pdx §1)
+  // ==========================================================================
+
+  pub let HS_SESSIONS          : u64 = 8
+  pub let HS_FACTS_PER_SESSION : u64 = 128
+  pub let HS_FACT_BYTES        : u64 = 64        // (shl 6)
+  pub let HS_SLOT_MASK         : u64 = 0x7F
+
+  // Row-field offsets (mirror HF_OFF_*).
+  pub let HS_OFF_SID           : u64 = 0
+  pub let HS_OFF_HASH          : u64 = 4
+  pub let HS_OFF_TSC_S         : u64 = 8
+  pub let HS_OFF_TSC_E         : u64 = 16
+  pub let HS_OFF_EXIT          : u64 = 24
+
+  // Summary struct layout (24 B).
+  pub let HS_SUM_OFF_TOTAL     : u64 = 0
+  pub let HS_SUM_OFF_NZ_EXITS  : u64 = 8
+  pub let HS_SUM_OFF_TSC_SPAN  : u64 = 16
+  pub let HS_SUM_BYTES         : u64 = 24
+
+  // ==========================================================================
+  // Storage
+  //
+  //   _hs_stats  -- 8 u64 counters (observability).  No fact storage;
+  //                 all reads flow through _hf_pool / _hf_heads.
+  // ==========================================================================
+
+  pub let mut _hs_stats : [u64; 8] = uninit @align(64)
+
+  pub let HS_ST_INIT_OK        : u64 = 0
+  pub let HS_ST_UNION_OK       : u64 = 1
+  pub let HS_ST_UNION_REJ      : u64 = 2
+  pub let HS_ST_INTERSECT_OK   : u64 = 3
+  pub let HS_ST_INTERSECT_REJ  : u64 = 4
+  pub let HS_ST_SUMMARY_OK     : u64 = 5
+  pub let HS_ST_SUMMARY_REJ    : u64 = 6
+
+  // ==========================================================================
+  // Fingerprint tags (N = len(string) + 1, NUL inclusive).
+  //
+  // Only the "OK" tags are extracted by the fingerprint-coverage gate;
+  // REJ tags are opaque to the gate so no allowlist entry is required.
+  // ==========================================================================
+
+  // "HISTORY_SEG INIT OK"       = 19 chars + NUL => N = 20
+  // "HISTORY_SEG UNION OK"      = 20 chars + NUL => N = 21
+  // "HISTORY_SEG UNION REJ"     = 21 chars + NUL => N = 22
+  // "HISTORY_SEG INTERSECT OK"  = 24 chars + NUL => N = 25
+  // "HISTORY_SEG INTERSECT REJ" = 25 chars + NUL => N = 26
+  // "HISTORY_SEG SUMMARY OK"    = 22 chars + NUL => N = 23
+  // "HISTORY_SEG SUMMARY REJ"   = 23 chars + NUL => N = 24
+
+  pub let hs_tag_init_ok        : [u8; 20] = "HISTORY_SEG INIT OK\0"
+  pub let hs_tag_union_ok       : [u8; 21] = "HISTORY_SEG UNION OK\0"
+  pub let hs_tag_union_rej      : [u8; 22] = "HISTORY_SEG UNION REJ\0"
+  pub let hs_tag_intersect_ok   : [u8; 25] = "HISTORY_SEG INTERSECT OK\0"
+  pub let hs_tag_intersect_rej  : [u8; 26] = "HISTORY_SEG INTERSECT REJ\0"
+  pub let hs_tag_summary_ok     : [u8; 23] = "HISTORY_SEG SUMMARY OK\0"
+  pub let hs_tag_summary_rej    : [u8; 24] = "HISTORY_SEG SUMMARY REJ\0"
+
+  pub let hs_k_mask   : [u8; 5] = "mask\0"
+  pub let hs_k_sid    : [u8; 4] = "sid\0"
+  pub let hs_k_cnt    : [u8; 4] = "cnt\0"
+  pub let hs_k_errno  : [u8; 6] = "errno\0"
+
+  // ==========================================================================
+  // hs_note(slot) -> ()
+  //
+  // Bounded increment on _hs_stats[slot]. Load-inc-store idiom (no
+  // `add reg, [mem]`). Caller passes an HS_ST_* ordinal; the bounds
+  // check guards against the stats pool size (8). Pure leaf -- no
+  // pushes.
+  // ==========================================================================
+  pub let hs_note : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R139.M1 (paideia-os #2639): bounded increment on _hs_stats[slot<8]. Load-inc-store, no `add reg,[mem]`. Pure leaf -- no pushes. Labels prefixed hs_no_.",
+      block: {
+        cmp rdi, 8;
+        jae hs_no_out;
+        lea r10, [rip + _hs_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      hs_no_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _hs_init() -> ()
+  //
+  // Boot hook. Defensive scrub of _hs_stats (8 u64 = 64 bytes) + one
+  // INIT OK fingerprint. .bss zero-init handles the array at real
+  // boot; the explicit scrub is defensive for a chaos-restart re-
+  // entering init.
+  //
+  // Single callee-save push (r12) corrects entry parity rsp%16==8 -> 0
+  // for the sibling klog_s1 call, matching _hf_init shape.
+  //
+  // Labels prefixed hs_in_.
+  // ==========================================================================
+  pub let _hs_init : () -> () !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M1 (paideia-os #2639): boot-time scrub of _hs_stats (8 u64 = 64 bytes) + one INIT OK fingerprint. .bss zero-init handles the array at real boot; the explicit scrub is defensive for a chaos-restart re-entering init. No fact storage to scrub -- all reads flow through _hf_pool / _hf_heads owned by history_facts.pdx. Single callee-save push (r12) corrects entry parity rsp%16==8 -> 0 for the sibling klog_s1 call, matching _hf_init shape. Labels prefixed hs_in_.",
+      block: {
+        push r12;
+
+        // Scrub _hs_stats[0..8].
+        lea r10, [rip + _hs_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      hs_in_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  hs_in_stats;
+
+        // Bump INIT_OK counter.
+        mov rdi, 0;                      // HS_ST_INIT_OK
+        call hs_note;
+
+        // Emit INIT OK fingerprint.
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hs_tag_init_ok];
+        call klog_s1;
+
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _hs_project_union(sessions_mask, out_rows_ptr, out_cap) -> packed u64
+  //
+  // Scan every session whose bit is set in sessions_mask and emit
+  // live fact rows newest-first within each session, concatenated in
+  // sid-ascending order.  See §3 for the M1 order rationale.
+  //
+  // Mask semantics:
+  //   bit N of sessions_mask == 1  -> include session N
+  //   bit N of sessions_mask == 0  -> exclude session N
+  // Bits above HS_SESSIONS (8) are silently ignored (we iterate sid in
+  // [0, 8) only).
+  //
+  // ARGS (SysV):
+  //   rdi = sessions_mask
+  //   rsi = out_rows_ptr
+  //   rdx = out_cap   (bytes; >= 64 unless result is 0 rows)
+  //
+  // RETURNS (rax):
+  //   (bytes_written << 32) | HS_OK  on success (0 rows is OK)
+  //   HS_ERR_OUT_TOO_SMALL           on out_cap < 64 with any live row
+  //
+  // STACK FRAME:
+  //   5 callee-save pushes (rbx = rolling mask, r12 = out_ptr,
+  //   r13 = max_rows, r14 = written, r15 = sid) + sub rsp, 16
+  //   (klog stack-arg slot + pad).  Entry rsp%16==8; +5 pushes +
+  //   16 = +56 -> %16==0 at every nested call.
+  //
+  // Labels prefixed hs_pu_.
+  // ==========================================================================
+  pub let _hs_project_union : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (sessions_mask: u64) (out_rows_ptr: u64) (out_cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M1 (paideia-os #2639): union projection as `for sid in [0,8): if mask bit sid set: emit sid's live fact rows newest-first`. Fail-fast on out_cap<64 -> HS_ERR_OUT_TOO_SMALL. max_rows = out_cap >> 6. Rolling mask in rbx: at each outer iter test `rbx & 1`, then `shr rbx, 1` and `add r15, 1`. Per sid: head = _hf_heads[sid]; count = min(head, 128); if count==0 skip (session never ran -- no live row). Inner i in [0, count): slot = (head-1-i) & 0x7F; src = _hf_pool + (sid<<13) + (slot<<6); dst = out_ptr + (written<<6); memcpy 64 bytes via 8 u64 stores; written++. Early-out when written==max_rows. Bump HS_ST_UNION_OK; emit `HISTORY_SEG UNION OK mask=0x<hex> cnt=<dec>` via klog_s1_x1_d1. Return (written*64 << 32) | HS_OK. Five callee-save pushes (rbx=mask_rolling, r12=out_ptr, r13=max_rows, r14=written, r15=sid) + sub rsp,16 pad = 56 bytes land rsp%16==0 at every nested call. The rolling-mask-plus-sid-counter shape avoids `bt rN,rM` and `shl rN,cl` (neither is in the proven encoder set) and keeps the mask walk to shr-imm8 + and-imm8 only. Encoder-pitfall posture: cmp rN,0 (never test), shl/shr imm8 only (never imul and never cl-indirect), and rN,0x7F / and rN,1 (imm32/imm8 fits; never and r,imm64), mov rax,imm32 for all error codes. Labels prefixed hs_pu_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;                     // klog slot + pad
+
+        mov rbx, rdi;                    // sessions_mask (rolling)
+        mov r12, rsi;                    // out_ptr
+        mov r13, rdx;                    // out_cap (reused as max_rows)
+
+        // Save original mask at pad slot for the final fingerprint;
+        // the rolling copy in rbx will be shifted out by loop end.
+        mov [rsp + 8], rdi;              // orig_mask
+
+        // ---- max_rows = out_cap >> 6 ----
+        shr r13, 6;
+        cmp r13, 0;
+        je  hs_pu_too_small;
+
+        xor r14, r14;                    // written = 0
+        xor r15, r15;                    // sid = 0
+
+      hs_pu_outer:
+        cmp r15, 8;
+        jae hs_pu_done;
+
+        // ---- Test low bit of rolling mask ----
+        mov r10, rbx;
+        and r10, 1;
+        cmp r10, 0;
+        je  hs_pu_skip;
+
+        // ---- head = _hf_heads[sid] ----
+        lea r10, [rip + _hf_heads];
+        mov r11, [r10 + r15 * 8];        // r11 = head
+
+        // ---- count = min(head, 128) ----
+        mov r9, r11;
+        mov r10, 128;
+        cmp r9, r10;
+        jbe hs_pu_cnt_ok;
+        mov r9, r10;
+      hs_pu_cnt_ok:
+        // r9 = count
+
+        cmp r9, 0;
+        je  hs_pu_skip;
+
+        // ---- Inner i = 0 .. count ----
+        xor rcx, rcx;                    // i = 0
+      hs_pu_inner:
+        cmp rcx, r9;
+        jae hs_pu_inner_done;
+
+        // early-out: written == max_rows
+        cmp r14, r13;
+        jae hs_pu_done;
+
+        // slot = (head - 1 - i) & 0x7F
+        mov r10, r11;
+        sub r10, 1;
+        sub r10, rcx;
+        and r10, 0x7F;
+
+        // src = _hf_pool + (sid << 13) + (slot << 6)
+        mov r8, r15;
+        shl r8, 13;
+        shl r10, 6;
+        add r8, r10;
+        lea r10, [rip + _hf_pool];
+        add r8, r10;
+        // r8 = src
+
+        // dst = out_ptr + (written << 6)
+        mov rdx, r14;
+        shl rdx, 6;
+        mov r10, r12;
+        add r10, rdx;
+        // r10 = dst
+
+        // memcpy 64 bytes = 8 u64 stores.
+        // Save state before the inner cp loop clobbers rcx; also save
+        // r9 (count) and r11 (head) so the outer loop header can
+        // resume.  No nested calls across this span so stack
+        // alignment does not need to stay %16==0.
+        push rcx;
+        push r9;
+        push r11;
+        xor rcx, rcx;
+      hs_pu_cp:
+        cmp rcx, 8;
+        jae hs_pu_cp_done;
+        mov rdx, [r8 + rcx * 8];
+        mov [r10 + rcx * 8], rdx;
+        add rcx, 1;
+        jmp hs_pu_cp;
+      hs_pu_cp_done:
+        pop r11;
+        pop r9;
+        pop rcx;
+
+        add r14, 1;                      // written += 1
+        add rcx, 1;
+        jmp hs_pu_inner;
+      hs_pu_inner_done:
+
+      hs_pu_skip:
+        shr rbx, 1;                      // mask >>= 1
+        add r15, 1;                      // sid += 1
+        jmp hs_pu_outer;
+
+      hs_pu_done:
+        // ---- Stats + fingerprint ----
+        mov rdi, 1;                      // HS_ST_UNION_OK
+        call hs_note;
+
+        // klog_s1_x1_d1: mask=0x<hex> cnt=<dec>
+        //   The original mask was saved to [rsp+8] at entry; the
+        //   rolling copy in rbx has been shifted out and would read
+        //   as zero here.
+        mov [rsp + 0], r14;              // v_dec = written (row count)
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hs_tag_union_ok];
+        lea rcx, [rip + hs_k_mask];
+        mov r8,  [rsp + 8];              // v_hex = original mask
+        lea r9,  [rip + hs_k_cnt];
+        call klog_s1_x1_d1;
+
+        // ---- Pack return: (written * 64) << 32 | HS_OK ----
+        mov rax, r14;
+        shl rax, 6;                      // bytes = written * 64
+        shl rax, 32;                     // pack
+        jmp hs_pu_out;
+
+      hs_pu_too_small:
+        mov rdi, 2;                      // HS_ST_UNION_REJ
+        call hs_note;
+
+        mov r12, 0x1F00;                 // HS_ERR_OUT_TOO_SMALL
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hs_tag_union_rej];
+        lea rcx, [rip + hs_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      hs_pu_out:
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _hs_project_intersect(cmd_hash_a, cmd_hash_b, sessions_mask,
+  //                       out_rows_ptr, out_cap) -> packed u64
+  //
+  // Datalog disjunction with session filter.  Emit rows whose
+  // cmd_hash (u32 at [row+4]) matches cmd_hash_a OR cmd_hash_b AND
+  // whose session is set in sessions_mask.  To query a single hash,
+  // pass the same value as both arguments.  Order is the same as
+  // _hs_project_union: per-session newest-first, sids ascending.
+  //
+  // ARGS (SysV):
+  //   rdi = cmd_hash_a  (u32 live in low 32)
+  //   rsi = cmd_hash_b  (u32 live in low 32)
+  //   rdx = sessions_mask
+  //   rcx = out_rows_ptr
+  //   r8  = out_cap     (bytes; >= 64 to carry one row)
+  //
+  // RETURNS (rax):
+  //   (bytes_written << 32) | HS_OK  on success (0 rows is OK)
+  //   HS_ERR_OUT_TOO_SMALL           on out_cap < 64
+  //
+  // STACK FRAME:
+  //   5 callee-save pushes (rbx = rolling mask, r12 = out_ptr,
+  //   r13 = max_rows, r14 = written, r15 = sid) + sub rsp, 32 (klog
+  //   slot [+0], hash_a [+8], hash_b [+16], pad [+24]).  Entry
+  //   rsp%16==8; +5 pushes + 32 = +72 -> %16==0 at every nested
+  //   call.
+  //
+  // Labels prefixed hs_pi_.
+  // ==========================================================================
+  pub let _hs_project_intersect : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (cmd_hash_a: u64) (cmd_hash_b: u64) (sessions_mask: u64) (out_rows_ptr: u64) (out_cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M1 (paideia-os #2639): disjunction-with-filter projection as `for sid in [0,8): if mask bit sid set: for i in [0, min(head[sid],128)): slot=(head-1-i)&0x7F; if row.hash_u32 == hash_a or hash_b: emit`. Fail-fast on out_cap<64 -> HS_ERR_OUT_TOO_SMALL. max_rows = out_cap >> 6. Hash args isolated to low 32 via shl 32 / shr 32 round-trip and stashed on stack ([rsp+8] = hash_a, [rsp+16] = hash_b) so inner compares are two memory loads. Row hash loaded as full u64 at [src+0] (which packs {sid: u32, hash: u32}); shr 32 isolates the hash in the low 32 (sid stays in top 32 which becomes zero after the shift). Match either hash_a OR hash_b -> memcpy 64 bytes to out_ptr + (written<<6); written++. Early-out when written==max_rows. Rolling-mask-plus-sid-counter shape avoids `bt rN,rM` and `shl rN,cl` and keeps the mask walk to shr-imm8 + and-imm8 only. Bump HS_ST_INTERSECT_OK; emit `HISTORY_SEG INTERSECT OK mask=0x<hex> cnt=<dec>` via klog_s1_x1_d1. Return (written*64 << 32) | HS_OK. Five callee-save pushes (rbx=mask_rolling, r12=out_ptr, r13=max_rows, r14=written, r15=sid) + sub rsp,32 (klog + 2 hash + pad) = 72 bytes land rsp%16==0 at every nested call. Encoder-pitfall posture: cmp rN,0 (never test), shl/shr imm8 only (never imul and never cl-indirect), and rN,0x7F / and rN,1 (imm32/imm8), mov rax,imm32 for all error codes, mem-stash hash args to avoid rbx double-booking. Labels prefixed hs_pi_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 32;                     // klog + 2 hash + pad
+
+        // Save original mask too (for the final fingerprint); the
+        // rolling copy in rbx will be shifted out by loop end.
+        mov [rsp + 24], rdx;             // pad slot now carries orig mask
+
+        // Isolate hash_a to low 32 and stash.
+        mov r10, rdi;
+        shl r10, 32;
+        shr r10, 32;
+        mov [rsp + 8], r10;              // isolated hash_a
+
+        // Isolate hash_b to low 32 and stash.
+        mov r10, rsi;
+        shl r10, 32;
+        shr r10, 32;
+        mov [rsp + 16], r10;             // isolated hash_b
+
+        mov rbx, rdx;                    // sessions_mask (rolling)
+        mov r12, rcx;                    // out_ptr
+        mov r13, r8;                     // out_cap (reused as max_rows)
+
+        // ---- max_rows = out_cap >> 6 ----
+        shr r13, 6;
+        cmp r13, 0;
+        je  hs_pi_too_small;
+
+        xor r14, r14;                    // written = 0
+        xor r15, r15;                    // sid = 0
+
+      hs_pi_outer:
+        cmp r15, 8;
+        jae hs_pi_done;
+
+        // ---- Test low bit of rolling mask ----
+        mov r10, rbx;
+        and r10, 1;
+        cmp r10, 0;
+        je  hs_pi_skip;
+
+        // ---- head = _hf_heads[sid] ----
+        lea r10, [rip + _hf_heads];
+        mov r11, [r10 + r15 * 8];        // r11 = head
+
+        // ---- count = min(head, 128) ----
+        mov r9, r11;
+        mov r10, 128;
+        cmp r9, r10;
+        jbe hs_pi_cnt_ok;
+        mov r9, r10;
+      hs_pi_cnt_ok:
+
+        cmp r9, 0;
+        je  hs_pi_skip;
+
+        xor rcx, rcx;                    // i = 0
+      hs_pi_inner:
+        cmp rcx, r9;
+        jae hs_pi_inner_done;
+
+        // early-out: written == max_rows
+        cmp r14, r13;
+        jae hs_pi_done;
+
+        // slot = (head - 1 - i) & 0x7F
+        mov r10, r11;
+        sub r10, 1;
+        sub r10, rcx;
+        and r10, 0x7F;
+
+        // src = _hf_pool + (sid << 13) + (slot << 6)
+        mov r8, r15;
+        shl r8, 13;
+        shl r10, 6;
+        add r8, r10;
+        lea r10, [rip + _hf_pool];
+        add r8, r10;
+        // r8 = src
+
+        // Load row u64 at [src + 0] = {sid: u32, hash: u32}; isolate
+        // hash via shr 32 (sid in high 32 is discarded).
+        mov rdx, [r8 + 0];
+        shr rdx, 32;
+
+        // Compare against hash_a and hash_b (OR).
+        mov r10, [rsp + 8];              // hash_a
+        cmp rdx, r10;
+        je  hs_pi_match;
+        mov r10, [rsp + 16];             // hash_b
+        cmp rdx, r10;
+        jne hs_pi_no_match;
+
+      hs_pi_match:
+        // dst = out_ptr + (written << 6)
+        mov rdx, r14;
+        shl rdx, 6;
+        mov r10, r12;
+        add r10, rdx;
+        // r10 = dst
+
+        // memcpy 64 bytes = 8 u64 stores.
+        push rcx;
+        push r9;
+        push r11;
+        xor rcx, rcx;
+      hs_pi_cp:
+        cmp rcx, 8;
+        jae hs_pi_cp_done;
+        mov rdx, [r8 + rcx * 8];
+        mov [r10 + rcx * 8], rdx;
+        add rcx, 1;
+        jmp hs_pi_cp;
+      hs_pi_cp_done:
+        pop r11;
+        pop r9;
+        pop rcx;
+
+        add r14, 1;                      // written += 1
+
+      hs_pi_no_match:
+        add rcx, 1;
+        jmp hs_pi_inner;
+
+      hs_pi_inner_done:
+
+      hs_pi_skip:
+        shr rbx, 1;                      // mask >>= 1
+        add r15, 1;                      // sid += 1
+        jmp hs_pi_outer;
+
+      hs_pi_done:
+        // ---- Stats + fingerprint ----
+        mov rdi, 3;                      // HS_ST_INTERSECT_OK
+        call hs_note;
+
+        // klog_s1_x1_d1: mask=0x<hex> cnt=<dec>
+        mov [rsp + 0], r14;              // v_dec = written
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hs_tag_intersect_ok];
+        lea rcx, [rip + hs_k_mask];
+        mov r8, [rsp + 24];              // v_hex = original mask
+        lea r9, [rip + hs_k_cnt];
+        call klog_s1_x1_d1;
+
+        mov rax, r14;
+        shl rax, 6;                      // bytes = written * 64
+        shl rax, 32;
+        jmp hs_pi_out;
+
+      hs_pi_too_small:
+        mov rdi, 4;                      // HS_ST_INTERSECT_REJ
+        call hs_note;
+
+        mov r12, 0x1F00;                 // HS_ERR_OUT_TOO_SMALL
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hs_tag_intersect_rej];
+        lea rcx, [rip + hs_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      hs_pi_out:
+        add rsp, 32;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _hs_session_summary(session_id, out_summary_ptr) -> errno
+  //
+  // Validate session_id via ss_row_in_use (HS_ERR_BAD_SESSION on bad /
+  // free row).  Compute the 3-field summary and write it to the caller's
+  // 24-byte buffer in row-order:
+  //
+  //   [+0]  total_cmds       u64  = _hf_heads[sid]   (monotonic)
+  //   [+8]  non_zero_exits   u64  = count of live facts with
+  //                                 (exit_code u32 at [+24]) != 0
+  //   [+16] tsc_span_cycles  u64  = max(tsc_end) - min(tsc_start)
+  //                                 over live facts with
+  //                                 tsc_start != 0; 0 if none
+  //
+  // "live" means i in [0, min(_hf_heads[sid], 128)) with slot =
+  // (head - 1 - i) & 0x7F.  Pre-M8 all tsc values are 0 so the
+  // tsc_span field reads back as 0 -- the semantics is "span over
+  // the observed data"; a caller must not treat 0 as "unmeasured"
+  // unless total_cmds > 0 and non_zero_exits + (zero_exits inferred)
+  // suggest otherwise.
+  //
+  // ARGS (SysV):
+  //   rdi = session_id
+  //   rsi = out_summary_ptr   (writable; 24 bytes)
+  //
+  // RETURNS (rax):
+  //   HS_OK                 -- summary written
+  //   HS_ERR_BAD_SESSION    -- session_id invalid / row not in use;
+  //                            out_summary_ptr untouched.
+  //
+  // STACK FRAME:
+  //   5 callee-save pushes (rbx = session_id, r12 = out_ptr,
+  //   r13 = non_zero_exits, r14 = min_tsc_start, r15 = max_tsc_end) +
+  //   sub rsp, 16 (klog slot + pad).  Entry rsp%16==8; +5 pushes + 16
+  //   = +56 -> %16==0 at every nested call.
+  //
+  // Labels prefixed hs_su_.
+  // ==========================================================================
+  pub let _hs_session_summary : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (session_id: u64) (out_summary_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M1 (paideia-os #2639): per-session summary over the fact ring. Validate session_id via ss_row_in_use (else HS_ERR_BAD_SESSION; out buffer untouched). total_cmds = _hf_heads[sid] (monotonic -- caller sees the full lifetime count including evicted rows, not just live). Walk live slots: i in [0, min(head, 128)); slot = (head-1-i) & 0x7F; src = _hf_pool + (sid<<13) + (slot<<6). For each row: load exit_code (u32 at [+24]) and bump non_zero_exits when non-zero (shl 32 / shr 32 isolates the u32 before cmp -- no and r,imm64). Load tsc_start (u64 at [+8]); if non-zero, track min in r14 (sentinel ~0 at entry via xor + sub 1). Load tsc_end (u64 at [+16]); track max in r15 (initialised to 0). After the walk: if r14 is still the sentinel OR r15 == 0 OR r14 > r15, tsc_span = 0; else tsc_span = r15 - r14. Write 3 u64 fields at out_summary_ptr: [+0] total_cmds, [+8] non_zero_exits, [+16] tsc_span. Bump HS_ST_SUMMARY_OK; emit `HISTORY_SEG SUMMARY OK sid=0x<hex> cnt=<dec>` via klog_s1_x1_d1 (cnt = total_cmds). Five callee-save pushes (rbx=sid, r12=out_ptr, r13=non_zero_exits, r14=min_tsc_start, r15=max_tsc_end) + sub rsp,16 pad = 56 bytes land rsp%16==0 at every nested call. Encoder-pitfall posture: cmp rN,0 (never test), shl/shr imm8 only, and rN,0x7F (imm32), mov rax,imm32 for error codes, mem-mov [reg+imm8] for u64 field writes to the summary buffer (24-byte struct is a 3 u64 store). Labels prefixed hs_su_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;                     // klog slot + pad
+
+        mov rbx, rdi;                    // session_id
+        mov r12, rsi;                    // out_ptr
+
+        // ---- Validate session_id ----
+        mov rdi, rbx;
+        call ss_row_in_use;
+        cmp rax, 0;
+        je  hs_su_bad_id;
+
+        // ---- Load head; total_cmds = head (monotonic) ----
+        lea r10, [rip + _hf_heads];
+        mov r11, [r10 + rbx * 8];        // r11 = head
+
+        // Stash total_cmds at [rsp + 8] for the final write (r11 gets
+        // reused below as the loop head-anchor; stashing frees it
+        // for inner compute).
+        mov [rsp + 8], r11;
+
+        // ---- Init accumulators ----
+        xor r13, r13;                    // non_zero_exits = 0
+        xor r14, r14;
+        sub r14, 1;                      // min_tsc_start = ~0 (sentinel)
+        xor r15, r15;                    // max_tsc_end = 0
+
+        // ---- count = min(head, 128) ----
+        mov r9, r11;
+        mov r10, 128;
+        cmp r9, r10;
+        jbe hs_su_cnt_ok;
+        mov r9, r10;
+      hs_su_cnt_ok:
+        // r9 = count
+
+        cmp r9, 0;
+        je  hs_su_write;                 // no live rows -> emit zeros/sentinel
+
+        // ---- Walk live slots ----
+        xor rcx, rcx;                    // i = 0
+      hs_su_loop:
+        cmp rcx, r9;
+        jae hs_su_walk_done;
+
+        // slot = (head - 1 - i) & 0x7F
+        mov r10, r11;
+        sub r10, 1;
+        sub r10, rcx;
+        and r10, 0x7F;
+
+        // src = _hf_pool + (sid << 13) + (slot << 6)
+        mov r8, rbx;
+        shl r8, 13;
+        shl r10, 6;
+        add r8, r10;
+        lea r10, [rip + _hf_pool];
+        add r8, r10;
+        // r8 = src
+
+        // ---- exit_code (u32 at [src + 24]) ----
+        mov rdx, [r8 + 24];
+        shl rdx, 32;
+        shr rdx, 32;                     // rdx = exit_code_u32
+        cmp rdx, 0;
+        je  hs_su_zero_exit;
+        add r13, 1;                      // non_zero_exits += 1
+      hs_su_zero_exit:
+
+        // ---- tsc_start (u64 at [src + 8]); update min if non-zero ----
+        mov rdx, [r8 + 8];
+        cmp rdx, 0;
+        je  hs_su_skip_min;
+        cmp rdx, r14;
+        jae hs_su_skip_min;              // rdx >= r14 -> no update
+        mov r14, rdx;                    // min_tsc_start = tsc_start
+      hs_su_skip_min:
+
+        // ---- tsc_end (u64 at [src + 16]); update max ----
+        mov rdx, [r8 + 16];
+        cmp rdx, r15;
+        jbe hs_su_skip_max;              // rdx <= r15 -> no update
+        mov r15, rdx;                    // max_tsc_end = tsc_end
+      hs_su_skip_max:
+
+        add rcx, 1;
+        jmp hs_su_loop;
+      hs_su_walk_done:
+
+      hs_su_write:
+        // ---- Compute tsc_span_cycles ----
+        // If r14 is still the sentinel (~0) OR r15 == 0 OR r14 > r15,
+        // span = 0.  Sentinel check: compare r14 against ~0 by
+        // computing r14 + 1 and checking for zero (overflow).
+        //
+        // Simpler: if r15 >= r14 and r15 != 0 and r14 != ~0, span =
+        // r15 - r14.  Else span = 0.
+        xor r10, r10;                    // r10 = span candidate = 0
+        cmp r15, 0;
+        je  hs_su_span_done;             // max == 0 -> no valid data
+        // Sentinel probe: ~0 == 0xFFFF_FFFF_FFFF_FFFF.  Compute r14+1
+        // into r11; if the result is 0, r14 was the sentinel.
+        mov r11, r14;
+        add r11, 1;
+        cmp r11, 0;
+        je  hs_su_span_done;             // r14 == ~0 -> no valid data
+        cmp r14, r15;
+        ja  hs_su_span_done;             // r14 > r15 -> inconsistent
+        mov r10, r15;
+        sub r10, r14;                    // span = max - min
+      hs_su_span_done:
+        // r10 = tsc_span_cycles
+
+        // ---- Write summary at [r12 + 0..24] ----
+        //   [+0]  total_cmds
+        //   [+8]  non_zero_exits
+        //   [+16] tsc_span_cycles
+        mov r11, [rsp + 8];              // reload total_cmds
+        mov [r12 + 0],  r11;
+        mov [r12 + 8],  r13;
+        mov [r12 + 16], r10;
+
+        // ---- Stats + fingerprint ----
+        mov rdi, 5;                      // HS_ST_SUMMARY_OK
+        call hs_note;
+
+        // klog_s1_x1_d1: sid=0x<hex> cnt=<dec>  (cnt = total_cmds).
+        // Reload total_cmds from the stash slot -- r11 is caller-save
+        // and the hs_note call may be assumed to have clobbered it.
+        mov r11, [rsp + 8];              // reload total_cmds
+        mov [rsp + 0], r11;              // v_dec = total_cmds
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hs_tag_summary_ok];
+        lea rcx, [rip + hs_k_sid];
+        mov r8,  rbx;                    // v_hex = sid
+        lea r9,  [rip + hs_k_cnt];
+        call klog_s1_x1_d1;
+
+        xor rax, rax;                    // HS_OK
+        jmp hs_su_out;
+
+      hs_su_bad_id:
+        mov rdi, 6;                      // HS_ST_SUMMARY_REJ
+        call hs_note;
+
+        mov r12, 0x1102;                 // HS_ERR_BAD_SESSION
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hs_tag_summary_rej];
+        lea rcx, [rip + hs_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      hs_su_out:
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}
