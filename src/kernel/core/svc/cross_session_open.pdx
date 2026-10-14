@@ -1,0 +1,1239 @@
+// src/kernel/core/svc/cross_session_open.pdx -- Wave UMB-W24 R139.M6
+// paideia-os #2644
+//
+// CROSS-SESSION FILE-CAP OPEN  --  USER-FACING SURFACE OF R139 SHARING
+// =============================================================================
+//
+// R139.M5 (env_sharing.pdx) landed the PUSH-direction primitive:
+// `_es_share(src_sid, dst_sid, src_slot, rights)` -- the owner of a
+// cap in one session hands a narrowed copy to a destination session
+// it names.  That shape is correct for jail-supervisor-mediated
+// pinning (where the parent session KNOWS which child wants the cap)
+// but WRONG for the interactive case the user types:
+//
+//     $ fileref /mnt/log.txt @sid=3        # "open the file-cap that
+//                                            session 3 is already
+//                                            holding, in MY env"
+//
+// Here the REQUESTING session names a target session + slot, pulls
+// the cap, and lands it in its own env.  The target session cannot
+// predict the moment of the pull and should not be forced to call
+// _es_share preemptively.
+//
+// R139.M6 lifts the push primitive into a REQUEST/ALLOWANCE model:
+//
+//   (a) Target session mints an ALLOWANCE on one of its env slots:
+//
+//           _cso_allow(target_sid, target_env_slot, max_rights)
+//
+//       The allowance says "I, session <target_sid>, will let anyone
+//       with a valid session-id pull a child of slot <target_env_slot>
+//       up to rights <max_rights>".  The 16-row allowance table
+//       (same geometry as R139.M5's share table) tracks these.
+//
+//   (b) Requester session pulls on demand:
+//
+//           _cso_request(req_sid, tgt_sid, tgt_slot, rights_mask)
+//              -> packed u64 (dst_env_slot << 2) | status
+//
+//       The request validates both sessions, verifies the allowance
+//       exists and covers the requested rights, then delegates the
+//       actual mint to _es_share (so the cap_table reserved range,
+//       release-ordered record publication, and narrow-only invariant
+//       at the cap-rights lattice all stay in one place).
+//
+//   (c) Requester revokes when done:
+//
+//           _cso_revoke(req_sid, req_slot) -> errno
+//
+//       Scans _es_share_table (owner module) for a share where
+//       dst_sid == req_sid AND dst_env_slot == req_slot, then calls
+//       the owner's _es_revoke on the matched record.  No new share-
+//       record state at R139.M6 -- the M5 table is the source of
+//       truth; this module just adds the user-facing pull semantics.
+//
+//   (d) Target withdraws the standing offer:
+//
+//           _cso_revoke_allowance(tgt_sid, tgt_slot) -> errno
+//
+//       Clears the allowance record.  Does NOT invalidate caps
+//       already pulled -- those are owned by the requester's env and
+//       the requester drops them with _cso_revoke when ready.  This
+//       matches the "offer withdrawn, prior deliveries honoured"
+//       discipline that every allowance-shaped protocol uses
+//       (POSIX setuid-after-fd-open, SPKI/SDSI delegations).
+//
+// =============================================================================
+// SECTION 0  WHY TWO MODULES INSTEAD OF ONE
+// =============================================================================
+//
+// R139.M5 is the LOW-LEVEL mint primitive and holds the share-record
+// table (geometry owned by the invariant).  R139.M6 is the UX-shaped
+// surface and holds the allowance table.  Collapsing both into one
+// module would couple the record-publication discipline (release-
+// ordered flags) with the policy-gate discipline (allowance match
+// before mint) and make either half harder to replace independently.
+// The two sibling modules each own one invariant and call the other
+// across the public API.
+//
+// A future wave MAY lift _cso_request into a KIND_SHELL_SESSION op
+// variant (OP_OPEN_FOREIGN) so a ring-3 shell can invoke it directly
+// via cap-invoke rather than through a kernel-trusted dispatch arm.
+// At M6 the direct-call API keeps the handler dispatch narrow while
+// the ring-3-caller env is still being wired at R125.M3+.  See
+// design/shell/cross-session-file-open.md §6.
+//
+// =============================================================================
+// SECTION 1  ALLOWANCE RECORD LAYOUT  --  16 RECORDS x 32 BYTES
+// =============================================================================
+//
+// Mirror of R139.M5's share-record geometry (16 rows x 32 B so the
+// row stride is 2^5 and the row-address compute is a single `shl rax,
+// 5` -- no `imul r, imm` encoder gap).
+//
+//   [+0]   target_sid         (u64)  low 32 = target_session_id
+//                                     high 32 reserved (zero)
+//   [+8]   target_env_slot    (u64)  low 32 = target_env_slot
+//                                     high 32 reserved (zero)
+//   [+16]  max_rights         (u64)  ceiling rights for pulls against
+//                                     this allowance (narrow lattice)
+//   [+24]  flags              (u64)  bit 0 = IN_USE
+//                                     all other bits reserved (zero)
+//
+// Row-addressed capacity: CSO_ALLOW_MAX = 16 records.  16 x 32 =
+// 512 bytes = 64 u64.  .bss zero-init handles the pool at real boot;
+// the defensive scrub in _cso_init covers chaos-restart.
+//
+// Flag bit 0 == IN_USE: a record whose IN_USE bit is set is a live
+// allowance; (target_sid, target_env_slot) is the unique key.  A
+// duplicate _cso_allow on an already-live (tgt_sid, tgt_slot) pair
+// is a no-op success (idempotent re-authorisation) rather than an
+// error, so the shell can safely re-run its "open these slots up"
+// script without checking first.
+//
+// =============================================================================
+// SECTION 2  PUBLIC API
+// =============================================================================
+//
+// _cso_init() -> ()
+//   Boot-time scrub of _cso_allow_table (16 x 32 = 512 B) + _cso_stats
+//   (8 u64) + one `CSOPEN INIT OK` fingerprint.
+//
+// _cso_allow(target_sid, target_env_slot, max_rights) -> errno
+//   Target session pre-authorises slot <target_env_slot> of its env
+//   to be pulled by any requester with up to <max_rights>.  Returns:
+//     CSO_OK                 -- allowance recorded (or already-live)
+//     CSO_ERR_BAD_SESSION    -- bad target_sid, slot out of range,
+//                               or target slot empty
+//     CSO_ERR_POOL_FULL      -- allowance table full
+//
+// _cso_request(requester_sid, target_sid, target_env_slot, rights_mask)
+//                                                     -> packed u64
+//   Pull a narrowed child cap from (target_sid, target_env_slot) into
+//   requester_sid's env.  Returns:
+//     success: (dst_env_slot << 2) | CSO_OK      (status in [0, 4))
+//     failure: CSO_ERR_* (see §5)
+//   Success-packed form is disjoint from every CSO_ERR_* code
+//   because env slots are in [0, 6) so (dst_env_slot << 2) is in
+//   [0, 24) which is below the lowest error code 0x1102.
+//
+//   Failure cases (short form; the long form lives in §4):
+//     bad req_sid / tgt_sid / tgt_slot          -> CSO_ERR_BAD_SESSION
+//     no allowance mint for (tgt_sid, tgt_slot) -> CSO_ERR_NO_PERMISSION
+//     requested rights wider than allowance     -> CSO_ERR_WIDEN
+//     M5 pool exhaustion (share/cap/env slot)   -> CSO_ERR_POOL_FULL
+//
+// _cso_revoke(requester_sid, requester_slot) -> errno
+//   Drop a shared cap in requester_sid's env.  Finds the M5 share-
+//   record keyed on (dst_sid == requester_sid AND dst_env_slot ==
+//   requester_slot AND IN_USE), then delegates teardown to _es_revoke.
+//   Returns:
+//     CSO_OK                 -- share revoked
+//     CSO_ERR_BAD_SESSION    -- bad requester_sid, no matching share
+//
+// _cso_revoke_allowance(target_sid, target_env_slot) -> errno
+//   Clear the standing offer.  Does NOT touch already-pulled caps
+//   (those are owned by requesters' envs and the requesters drop
+//   them with _cso_revoke).  Returns:
+//     CSO_OK                 -- allowance cleared
+//     CSO_ERR_BAD_SESSION    -- bad target_sid, slot out of range,
+//                               or no live allowance for the pair
+//
+// =============================================================================
+// SECTION 3  DELEGATION TO R139.M5
+// =============================================================================
+//
+// _cso_request's step 7 calls _es_share(target_sid, requester_sid,
+// target_env_slot, rights_mask) and receives one of:
+//
+//    success:          (dst_env_slot << 2) | 0   (low bits [0, 4))
+//    ES_ERR_BAD_SESSION  0x1102
+//    ES_ERR_WIDEN        0x1F11
+//    ES_ERR_POOL_FULL    0x1F10
+//
+// The success-packed form passes through unchanged (same shape as
+// CSO's success encoding -- CSO_OK = ES_OK = 0).  Errors remap:
+//
+//    0x1102 -> CSO_ERR_BAD_SESSION    (same value; identity remap)
+//    0x1F11 -> CSO_ERR_WIDEN          (0x1F21; shouldn't fire because
+//                                      the allowance check above
+//                                      narrows rights, but defensive)
+//    0x1F10 -> CSO_ERR_POOL_FULL      (0x1F22)
+//
+// _cso_revoke's step 3 calls _es_revoke(share_record_idx) and
+// propagates its ES_OK / ES_ERR_BAD_SESSION result as-is (identity
+// remap on BAD_SESSION; ES_OK and CSO_OK are the same zero).
+//
+// =============================================================================
+// SECTION 4  TWO NARROW CHECKS (defense-in-depth)
+// =============================================================================
+//
+// _cso_request enforces narrow-only at TWO layers:
+//
+//    (A) POLICY gate (this module, §2 _cso_request step 5):
+//        (rights_mask & allowance.max_rights) == rights_mask
+//
+//    (B) CAPABILITY-SYSTEM invariant (_es_share §4, inside the
+//        delegated mint):
+//        (rights_mask & parent_cap.rights) == rights_mask
+//
+// (A) enforces the TARGET SESSION'S chosen ceiling (the user said
+// "at most read-only"); (B) enforces the CAPABILITY SYSTEM'S invariant
+// (the mint cannot widen beyond what the parent cap already holds).
+//
+// Both checks use `and reg, reg; cmp reg, reg; jne` -- never `not reg`
+// (paideia-as encoder gap).
+//
+// =============================================================================
+// SECTION 5  RETURN CODE BAND  --  0x1F20..0x1F2F
+// =============================================================================
+//
+// Band audit (2026-10-14):
+//   `grep -rnE '0x1F2[0-9]\b' src/kernel/` -> zero hits.  Clean band.
+//
+// 0x1F20..0x1F22 are adjacent to R139.M5's ES band (0x1F10, 0x1F11)
+// and disjoint from every SS_* / CA_* / SSD_* / CM_* / RS_* / JS_* /
+// HS_* / SJ_* / ES_* code.
+//
+//   CSO_OK                 = 0
+//   CSO_ERR_NO_PERMISSION  = 0x1F20
+//   CSO_ERR_BAD_SESSION    = 0x1102    (alias SS_ERR_BAD_ID)
+//   CSO_ERR_WIDEN          = 0x1F21
+//   CSO_ERR_POOL_FULL      = 0x1F22
+//
+// All codes fit imm32 with bit 31 clear so `mov rax, imm32` emits the
+// 7-byte zero-extending form.  No `and r11, imm64` encoder gap.
+//
+// =============================================================================
+// SECTION 6  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Labels prefixed `cso_` -- distinct from `es_` (env_sharing),
+// `cmnt_` (cap_minter), `ss_` (shell_session), `ssd_` (session_shutdown),
+// `hs_` (history_segmentation), `wfd_` (wasi fd mediation).
+//
+// Encoder-pitfall posture (feedback_pdx_encoder_pitfalls):
+//
+//   * cmp rN, 0            (never `test rN, rN`)
+//   * shl rN, 5            (allowance-row stride 32 compose)
+//   * shl rN, 7            (shell_session row stride 128 compose)
+//   * shl rN, 32 / shr rN, 32  (u32 isolation in record fields)
+//   * mov rax, imm32       (never `and r11, imm64`)
+//   * single-line `pub let name = "..."`
+//   * module basename CrossSessionOpen matches cross_session_open.pdx
+//   * fingerprint [u8; N] with N = len(string) + 1 (NUL counts)
+//   * narrow-check uses `and reg,reg; cmp reg,reg; jne` (no `not reg`)
+//
+// Stack discipline (SysV, entry rsp%16==8; pushes * 8 + sub ≡ 8 mod 16):
+//   _cso_init                  1 push  + 0 sub   (klog_s1 parity)
+//   _cso_allow                 3 pushes + 0 sub  (3*8 = 24 ≡ 8 mod 16)
+//   _cso_request               5 pushes + 0 sub  (5*8 = 40 ≡ 8 mod 16)
+//   _cso_revoke                3 pushes + 0 sub
+//   _cso_revoke_allowance      3 pushes + 0 sub
+//
+// =============================================================================
+// SECTION 7  BOOT WIRING NOTE
+// =============================================================================
+//
+// kernel_main.pdx picks this up with ONE new call right after
+// _es_init / before any user-space init:
+//
+//   call _es_init;                   // R139.M5
+//   call _cso_init;                  // R139.M6 (this file)
+//
+// Zero-arg, allocates nothing on the stack, touches rax/rcx/r10/r12;
+// safe alongside kernel_main's live r13/r14 handoff registers.
+// Wiring deferred to the same follow-up slice that lands the
+// production caller.  At real boot .bss zero-init leaves
+// _cso_allow_table already in the FREE state so request/allow work
+// correctly without the wiring; the explicit scrub covers chaos-
+// restart / witness-replay only.
+//
+// =============================================================================
+
+module CrossSessionOpen = structure {
+
+  // ==========================================================================
+  // Return band (§5)
+  // ==========================================================================
+
+  pub let CSO_OK                : u64 = 0
+  pub let CSO_ERR_NO_PERMISSION : u64 = 0x1F20
+  pub let CSO_ERR_BAD_SESSION   : u64 = 0x1102   // alias SS_ERR_BAD_ID
+  pub let CSO_ERR_WIDEN         : u64 = 0x1F21
+  pub let CSO_ERR_POOL_FULL     : u64 = 0x1F22
+
+  // Delegated-mint sentinels (from R139.M5; copied here for the
+  // _es_share return-code switch in _cso_request).  Keeping these
+  // local sidesteps a cross-module `let` dependency and documents
+  // the mapping at the only call site that reads them.
+
+  pub let CSO_ES_BAD_SESSION   : u64 = 0x1102
+  pub let CSO_ES_WIDEN         : u64 = 0x1F11
+  pub let CSO_ES_POOL_FULL     : u64 = 0x1F10
+
+  // ==========================================================================
+  // Geometry constants
+  // ==========================================================================
+
+  pub let CSO_ALLOW_MAX         : u64 = 16    // allowance records
+  pub let CSO_ALLOW_BYTES       : u64 = 32    // 4 u64 per row
+  pub let CSO_CAP_ENV_SLOTS     : u64 = 6     // kind_cap_env.pdx CAP_ENV_SLOTS
+  pub let CSO_SS_POOL_MAX       : u64 = 8     // shell_session.pdx SS_POOL_MAX
+  pub let CSO_ES_RECORDS_MAX    : u64 = 16    // env_sharing.pdx ES_RECORDS_MAX
+
+  // Row-field offsets (bytes, from record base; §1).
+  pub let CSO_OFF_TGT_SID    : u64 = 0
+  pub let CSO_OFF_TGT_SLOT   : u64 = 8
+  pub let CSO_OFF_RIGHTS     : u64 = 16
+  pub let CSO_OFF_FLAGS      : u64 = 24
+
+  // Flag bits.
+  pub let CSO_FLAG_IN_USE    : u64 = 0x1
+
+  // Record-id sentinel (es_find_free_allowance miss).
+  pub let CSO_REC_NONE       : u64 = 0x10    // == CSO_ALLOW_MAX; unambiguous
+
+  // Share-record idx sentinel (reverse scan on _es_share_table miss).
+  pub let CSO_SHARE_NONE     : u64 = 0x10    // == 16; unambiguous
+
+  // ==========================================================================
+  // Storage
+  //
+  //   _cso_allow_table -- 16 records x 32 B = 512 B = 64 u64.
+  //   _cso_stats       -- 8 u64 counters (observability).  @align(64)
+  //                       lands the pool start on a cache-line boundary
+  //                       (same discipline as _es_share_table).
+  // ==========================================================================
+
+  pub let mut _cso_allow_table : [u64; 64] = uninit @align(64)
+  pub let mut _cso_stats       : [u64; 8]  = uninit @align(64)
+
+  pub let CSO_ST_INIT_OK           : u64 = 0
+  pub let CSO_ST_ALLOW_OK          : u64 = 1
+  pub let CSO_ST_ALLOW_REJ         : u64 = 2
+  pub let CSO_ST_REQUEST_OK        : u64 = 3
+  pub let CSO_ST_REQUEST_REJ_PERM  : u64 = 4
+  pub let CSO_ST_REQUEST_REJ_OTHER : u64 = 5
+  pub let CSO_ST_REVOKE_OK         : u64 = 6
+  pub let CSO_ST_REVOKE_REJ        : u64 = 7
+
+  // ==========================================================================
+  // Fingerprint tags (N = len(string) + 1, NUL inclusive).
+  //
+  // Only the "OK" tags are extracted by the fingerprint-coverage gate;
+  // the REJ tags are opaque to the gate so no allowlist entry is
+  // required for them.
+  // ==========================================================================
+
+  // "CSOPEN INIT OK"       = 14 chars + 1 NUL => N = 15
+  // "CSOPEN ALLOW OK"      = 15 chars + 1 NUL => N = 16
+  // "CSOPEN ALLOW REJ"     = 16 chars + 1 NUL => N = 17
+  // "CSOPEN REQUEST OK"    = 17 chars + 1 NUL => N = 18
+  // "CSOPEN REQUEST REJ"   = 18 chars + 1 NUL => N = 19
+  // "CSOPEN REVOKE OK"     = 16 chars + 1 NUL => N = 17
+  // "CSOPEN REVOKE REJ"    = 17 chars + 1 NUL => N = 18
+
+  pub let cso_tag_init_ok    : [u8; 15] = "CSOPEN INIT OK\0"
+  pub let cso_tag_allow_ok   : [u8; 16] = "CSOPEN ALLOW OK\0"
+  pub let cso_tag_allow_rej  : [u8; 17] = "CSOPEN ALLOW REJ\0"
+  pub let cso_tag_req_ok     : [u8; 18] = "CSOPEN REQUEST OK\0"
+  pub let cso_tag_req_rej    : [u8; 19] = "CSOPEN REQUEST REJ\0"
+  pub let cso_tag_rev_ok     : [u8; 17] = "CSOPEN REVOKE OK\0"
+  pub let cso_tag_rev_rej    : [u8; 18] = "CSOPEN REVOKE REJ\0"
+
+  pub let cso_k_req_sid  : [u8; 8] = "req_sid\0"
+  pub let cso_k_tgt_sid  : [u8; 8] = "tgt_sid\0"
+  pub let cso_k_tgt_slot : [u8; 9] = "tgt_slot\0"
+  pub let cso_k_req_slot : [u8; 9] = "req_slot\0"
+  pub let cso_k_errno    : [u8; 6] = "errno\0"
+  pub let cso_k_idx      : [u8; 4] = "idx\0"
+
+  // ==========================================================================
+  // cso_note(slot) -> ()
+  //
+  // Bounded increment on _cso_stats[slot].  Mirror of es_note.  Pure
+  // leaf -- no pushes.  Labels prefixed cso_no_.
+  // ==========================================================================
+  pub let cso_note : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R139.M6 (paideia-os #2644): bounded increment on _cso_stats[slot<8]. Load-inc-store, no `add reg,[mem]`. Pure leaf -- no pushes. Labels prefixed cso_no_.",
+      block: {
+        cmp rdi, 8;
+        jae cso_no_out;
+        lea r10, [rip + _cso_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      cso_no_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // cso_allow_base(idx) -> &_cso_allow_table[idx*4]
+  //
+  // Idx -> allowance-record base pointer.  Stride 32 = 2^5 so `shl
+  // rax, 5` suffices (no `imul r, imm` encoder gap).  Caller validates
+  // idx < CSO_ALLOW_MAX; this helper is a pure address compute.
+  // Labels prefixed cso_ab_.
+  // ==========================================================================
+  pub let cso_allow_base : (u64) -> u64 !{} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R139.M6 (paideia-os #2644): idx -> &_cso_allow_table[idx*32]. Power-of-two stride uses `shl rax, 5` so no 2-op imul-with-imm is required. No bounds check by policy -- caller validates. Labels prefixed cso_ab_.",
+      block: {
+        mov rax, rdi;                    // idx
+        shl rax, 5;                      // idx * 32
+        lea r10, [rip + _cso_allow_table];
+        add rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // cso_find_allowance(tgt_sid, tgt_slot) -> idx | CSO_REC_NONE
+  //
+  // Linear scan _cso_allow_table[0..16) for a record matching
+  // (tgt_sid, tgt_slot) with IN_USE set.  Returns idx on hit, 16
+  // (CSO_REC_NONE) on miss.  Pure leaf -- no pushes.
+  // Labels prefixed cso_fa_.
+  // ==========================================================================
+  pub let cso_find_allowance : (u64, u64) -> u64 !{mem} @{} =
+    fn (tgt_sid: u64) (tgt_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R139.M6 (paideia-os #2644): scan _cso_allow_table[0..16) for a record matching (tgt_sid, tgt_slot) AND IN_USE. Returns idx on hit or 16 (CSO_REC_NONE) on miss. Inlined record-base (shl 5). Pure leaf -- no pushes. Encoder posture: cmp rN,0 (never test), shl rN,5 for stride. Labels prefixed cso_fa_.",
+      block: {
+        lea r10, [rip + _cso_allow_table];
+        xor rcx, rcx;                    // idx cursor
+      cso_fa_scan:
+        cmp rcx, 16;                     // CSO_ALLOW_MAX
+        jae cso_fa_miss;
+
+        mov rax, rcx;
+        shl rax, 5;                      // idx * 32
+        add rax, r10;                    // record base
+
+        // IN_USE first (fast skip for free rows).
+        mov r11, [rax + 24];             // flags
+        mov r9,  1;                      // CSO_FLAG_IN_USE
+        and r11, r9;
+        cmp r11, 0;
+        je  cso_fa_next;
+
+        // Match tgt_sid at [+0].
+        mov r11, [rax + 0];
+        cmp r11, rdi;
+        jne cso_fa_next;
+
+        // Match tgt_slot at [+8].
+        mov r11, [rax + 8];
+        cmp r11, rsi;
+        jne cso_fa_next;
+
+        mov rax, rcx;                    // HIT -> idx
+        ret;
+
+      cso_fa_next:
+        add rcx, 1;
+        jmp cso_fa_scan;
+
+      cso_fa_miss:
+        mov rax, 16;                     // CSO_REC_NONE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // cso_find_free_allowance() -> idx | CSO_REC_NONE
+  //
+  // Linear scan _cso_allow_table[0..16) for a record whose IN_USE bit
+  // is clear.  Returns idx on hit, 16 (CSO_REC_NONE) on miss.  Pure
+  // leaf -- no pushes.  Labels prefixed cso_ff_.
+  // ==========================================================================
+  pub let cso_find_free_allowance : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R139.M6 (paideia-os #2644): linear scan _cso_allow_table[0..16) for the first record whose IN_USE bit is clear. Return idx or 16 (CSO_REC_NONE). Inlined record-base (shl 5). Pure leaf -- no pushes. Labels prefixed cso_ff_.",
+      block: {
+        lea r10, [rip + _cso_allow_table];
+        xor rcx, rcx;
+      cso_ff_scan:
+        cmp rcx, 16;
+        jae cso_ff_none;
+
+        mov rax, rcx;
+        shl rax, 5;
+        add rax, r10;
+        mov r11, [rax + 24];             // flags
+        mov r9,  1;
+        and r11, r9;
+        cmp r11, 0;
+        je  cso_ff_hit;
+
+        add rcx, 1;
+        jmp cso_ff_scan;
+
+      cso_ff_hit:
+        mov rax, rcx;
+        ret;
+
+      cso_ff_none:
+        mov rax, 16;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // cso_find_share_by_dst(dst_sid, dst_slot) -> idx | CSO_SHARE_NONE
+  //
+  // REVERSE scan on R139.M5's _es_share_table for a record whose
+  // IN_USE bit is set AND whose dst_sid (HIGH 32 of [+0]) matches
+  // AND whose dst_env_slot (HIGH 32 of [+8]) matches.  Mirrors
+  // _es_lookup_sharing one-for-one but keys on DST instead of SRC
+  // -- _cso_revoke needs this direction because the requester (= dst
+  // in M5 terms) is the one calling revoke.
+  //
+  // Returns:
+  //   hit:  record idx in [0, 16)
+  //   miss: 16 (CSO_SHARE_NONE)
+  //
+  // u32 isolation uses shr 32 (no `and r11, 0xFFFFFFFF`).  Pure leaf
+  // -- no pushes, no nested calls.  Labels prefixed cso_fs_.
+  // ==========================================================================
+  pub let cso_find_share_by_dst : (u64, u64) -> u64 !{mem} @{} =
+    fn (dst_sid: u64) (dst_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R139.M6 (paideia-os #2644): reverse scan on R139.M5's _es_share_table[0..16) for a record matching (dst_sid, dst_env_slot) AND IN_USE. Keys on HIGH 32 of [+0] (dst_sid) and HIGH 32 of [+8] (dst_env_slot). Returns idx on hit, 16 (CSO_SHARE_NONE) on miss. Inlined record-base (shl 5). u32 isolation uses shr 32 to extract high half (no `and r11, 0xFFFFFFFF`). Pure leaf -- no pushes. Labels prefixed cso_fs_.",
+      block: {
+        lea r10, [rip + _es_share_table];
+        xor rcx, rcx;
+      cso_fs_scan:
+        cmp rcx, 16;                     // CSO_ES_RECORDS_MAX
+        jae cso_fs_miss;
+
+        mov rax, rcx;
+        shl rax, 5;                      // idx * 32
+        add rax, r10;                    // record base
+
+        // IN_USE first.
+        mov r11, [rax + 24];
+        mov r9,  1;
+        and r11, r9;
+        cmp r11, 0;
+        je  cso_fs_next;
+
+        // dst_sid = high 32 of [+0].
+        mov r11, [rax + 0];
+        shr r11, 32;
+        cmp r11, rdi;
+        jne cso_fs_next;
+
+        // dst_env_slot = high 32 of [+8].
+        mov r11, [rax + 8];
+        shr r11, 32;
+        cmp r11, rsi;
+        jne cso_fs_next;
+
+        mov rax, rcx;                    // HIT
+        ret;
+
+      cso_fs_next:
+        add rcx, 1;
+        jmp cso_fs_scan;
+
+      cso_fs_miss:
+        mov rax, 16;                     // CSO_SHARE_NONE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _cso_init() -> ()
+  //
+  // Boot hook.  Scrubs _cso_allow_table (64 u64) + _cso_stats (8 u64)
+  // and emits one `CSOPEN INIT OK` fingerprint.  Single callee-save
+  // push (r12) corrects entry parity rsp%16==8 -> 0 for the sibling
+  // klog_s1 call.  Labels prefixed cso_in_.
+  // ==========================================================================
+  pub let _cso_init : () -> () !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M6 (paideia-os #2644): boot-time scrub of _cso_allow_table (64 u64 = 512 B) and _cso_stats (8 u64 = 64 B) + one INIT OK fingerprint. .bss zero-init handles both at real boot; the explicit scrub is defensive for a chaos-restart re-entering init. Single callee-save push (r12) corrects entry parity rsp%16==8 -> 0 for the sibling klog_s1 call, matching _es_init / _hs_init / _ssd_init one-for-one. Labels prefixed cso_in_.",
+      block: {
+        push r12;
+
+        // Scrub _cso_allow_table[0..64].
+        lea r10, [rip + _cso_allow_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      cso_in_table:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 64;
+        jb  cso_in_table;
+
+        // Scrub _cso_stats[0..8].
+        lea r10, [rip + _cso_stats];
+        xor rcx, rcx;
+      cso_in_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  cso_in_stats;
+
+        // Bump CSO_ST_INIT_OK.
+        mov rdi, 0;                      // CSO_ST_INIT_OK
+        call cso_note;
+
+        // Emit INIT OK fingerprint.
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + cso_tag_init_ok];
+        call klog_s1;
+
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _cso_allow(target_sid, target_env_slot, max_rights) -> errno
+  //
+  // The target session pre-authorises slot <target_env_slot> of its
+  // env to be pulled by any requester with up to <max_rights>.
+  //
+  // ARGS (SysV):
+  //   rdi = target_sid
+  //   rsi = target_env_slot
+  //   rdx = max_rights
+  //
+  // RETURNS (rax):
+  //   CSO_OK                 -- allowance recorded or already-live
+  //   CSO_ERR_BAD_SESSION    -- bad target_sid / slot / empty slot
+  //   CSO_ERR_POOL_FULL      -- allowance table full
+  //
+  // STEP-BY-STEP:
+  //   1. Validate target_sid via ss_row_in_use. Else BAD_SESSION.
+  //   2. Validate target_env_slot < CAP_ENV_SLOTS. Else BAD_SESSION.
+  //   3. Resolve tgt env_handle (= ss_row.cap_env). On bad -> BAD_SESSION.
+  //   4. cap_env_lookup(env_handle, slot). On 0 (empty) -> BAD_SESSION.
+  //   5. cso_find_allowance(tgt_sid, tgt_slot). On HIT (idempotent),
+  //      update max_rights in-place, emit OK, return CSO_OK.
+  //   6. cso_find_free_allowance(). On NONE -> POOL_FULL.
+  //   7. Populate record (sids/slot/rights FIRST, flags IN_USE LAST
+  //      -- release-publication discipline mirroring _es_share step 14).
+  //   8. Bump stat, emit fingerprint, return CSO_OK.
+  //
+  // REGISTER MAP:
+  //   rbx = target_sid
+  //   r12 = target_env_slot
+  //   r13 = max_rights
+  //
+  // Register plan: 3 callee-save pushes + 0 sub.  Entry rsp%16==8;
+  // +3 pushes = +24 = +8 mod 16 -> %16==0 at every nested call.
+  // Labels prefixed cso_al_.
+  // ==========================================================================
+  pub let _cso_allow : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (target_sid: u64) (target_env_slot: u64) (max_rights: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M6 (paideia-os #2644): target session pre-authorises slot <target_env_slot> of its env for cross-session pulls with ceiling <max_rights>. Validates tgt_sid via ss_row_in_use, tgt_slot < 6, env_handle resolve via inlined ss_row read at [+16], cap_env_lookup != 0 (slot occupied). On an existing (tgt_sid, tgt_slot) allowance the max_rights field is updated in place (idempotent re-auth); otherwise a free record is populated with release-ordered publication (sids/slot/rights FIRST, flags LAST). Three callee-save pushes (rbx=tgt_sid, r12=tgt_slot, r13=max_rights) land rsp%16==0 at every nested call. Encoder posture: cmp rN,0 (never test), shl rN,7 for row stride (never imul), shl rN,5 for record stride, mov rax,imm32 for return codes. Labels prefixed cso_al_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // target_sid
+        mov r12, rsi;                    // target_env_slot
+        mov r13, rdx;                    // max_rights
+
+        // ---- Step 1: validate target_sid ----
+        mov rdi, rbx;
+        call ss_row_in_use;
+        cmp rax, 0;
+        je  cso_al_bad_session;
+
+        // ---- Step 2: validate target_env_slot ----
+        cmp r12, 6;                      // CSO_CAP_ENV_SLOTS
+        jae cso_al_bad_session;
+
+        // ---- Step 3: resolve tgt env_handle ----
+        //   row_base + SS_OFF_CAP_ENV (16).  Inline (shl 7).
+        mov rax, rbx;
+        shl rax, 7;                      // sid * 128
+        lea r10, [rip + _shell_session_pool];
+        add rax, r10;                    // row base
+        mov rax, [rax + 16];             // env_handle
+
+        //   Defensive: env_handle < CAP_ENV_MAX (16).
+        mov r11, 16;
+        cmp rax, r11;
+        jae cso_al_bad_session;
+
+        //   Park env_handle in r11 (we'll pass through to cap_env_lookup).
+        mov r11, rax;
+
+        // ---- Step 4: validate target slot is occupied ----
+        mov rdi, r11;                    // env_handle
+        mov rsi, r12;                    // slot
+        call cap_env_lookup;
+        cmp rax, 0;
+        je  cso_al_bad_session;          // empty slot
+
+        // ---- Step 5: check for existing allowance (idempotent path) ----
+        mov rdi, rbx;                    // tgt_sid
+        mov rsi, r12;                    // tgt_slot
+        call cso_find_allowance;
+        mov r11, 16;                     // CSO_REC_NONE
+        cmp rax, r11;
+        jae cso_al_fresh;                // not found -> new record path
+
+        //   Existing record: update max_rights in place.  Record base
+        //   = _cso_allow_table + idx * 32.
+        mov r11, rax;                    // existing idx
+        shl r11, 5;
+        lea r10, [rip + _cso_allow_table];
+        add r11, r10;                    // record base
+        mov [r11 + 16], r13;             // overwrite rights (narrow or widen
+                                         // vs. the prior cap-system invariant
+                                         // -- the TARGET SESSION owns the
+                                         // policy ceiling so re-auth may lift)
+        jmp cso_al_emit_ok;
+
+      cso_al_fresh:
+        // ---- Step 6: find a free allowance record ----
+        call cso_find_free_allowance;
+        mov r11, 16;                     // CSO_REC_NONE
+        cmp rax, r11;
+        jae cso_al_pool_full;
+
+        // ---- Step 7: populate new record ----
+        //   Base in r11 for the field stores; flags LAST (release).
+        shl rax, 5;
+        lea r10, [rip + _cso_allow_table];
+        add rax, r10;
+        mov r11, rax;                    // record base
+
+        mov [r11 + 0],  rbx;             // target_sid
+        mov [r11 + 8],  r12;             // target_env_slot
+        mov [r11 + 16], r13;             // max_rights
+
+        mov rax, 1;                      // CSO_FLAG_IN_USE
+        mov [r11 + 24], rax;             // flags LAST (publishes IN_USE)
+
+      cso_al_emit_ok:
+        // ---- Step 8: stats + fingerprint + success ----
+        mov rdi, 1;                      // CSO_ST_ALLOW_OK
+        call cso_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + cso_tag_allow_ok];
+        lea rcx, [rip + cso_k_tgt_sid];
+        mov r8,  rbx;                    // v_hex = tgt_sid
+        call klog_s1_x1;
+
+        xor rax, rax;                    // CSO_OK
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cso_al_bad_session:
+        mov rdi, 2;                      // CSO_ST_ALLOW_REJ
+        call cso_note;
+        mov r12, 0x1102;                 // CSO_ERR_BAD_SESSION
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + cso_tag_allow_rej];
+        lea rcx, [rip + cso_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cso_al_pool_full:
+        mov rdi, 2;                      // CSO_ST_ALLOW_REJ
+        call cso_note;
+        mov r12, 0x1F22;                 // CSO_ERR_POOL_FULL
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + cso_tag_allow_rej];
+        lea rcx, [rip + cso_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _cso_request(req_sid, tgt_sid, tgt_slot, rights_mask) -> packed u64
+  //
+  // The user-facing pull.  See §2 for the return contract, §4 for the
+  // two-layer narrow check, §3 for the _es_share delegation.
+  //
+  // ARGS (SysV):
+  //   rdi = requester_sid
+  //   rsi = target_sid
+  //   rdx = target_env_slot
+  //   rcx = rights_mask
+  //
+  // RETURNS (rax):
+  //   success: (dst_env_slot << 2) | CSO_OK      (status in [0, 4))
+  //   failure: CSO_ERR_NO_PERMISSION / _BAD_SESSION / _WIDEN /
+  //            _POOL_FULL
+  //
+  // STEP-BY-STEP:
+  //   1. Validate req_sid via ss_row_in_use. Else BAD_SESSION.
+  //   2. Validate tgt_sid via ss_row_in_use. Else BAD_SESSION.
+  //   3. Validate tgt_slot < CAP_ENV_SLOTS. Else BAD_SESSION.
+  //   4. cso_find_allowance(tgt_sid, tgt_slot). On miss -> NO_PERMISSION.
+  //   5. Load allowance.max_rights; narrow check against rights_mask.
+  //      Fail -> CSO_ERR_WIDEN.
+  //   6. Delegate: _es_share(tgt_sid, req_sid, tgt_slot, rights_mask).
+  //   7. Translate M5 return (§3):
+  //        rax < 0x100       -> pass through (success-packed form)
+  //        rax == 0x1102     -> CSO_ERR_BAD_SESSION
+  //        rax == 0x1F10     -> CSO_ERR_POOL_FULL
+  //        rax == 0x1F11     -> CSO_ERR_WIDEN
+  //      (0x1F10/0x1F11 shouldn't fire post step 5 but defensive.)
+  //
+  // REGISTER MAP:
+  //   rbx = req_sid
+  //   r12 = tgt_sid
+  //   r13 = tgt_slot
+  //   r14 = rights_mask
+  //   r15 = allowance_idx (step 4..5); reused as scratch after step 6
+  //
+  // Register plan: 5 callee-save pushes + 0 sub.  Entry rsp%16==8;
+  // +5 pushes = +40 = +8 mod 16 -> %16==0 at every nested call.
+  // Labels prefixed cso_rq_.
+  // ==========================================================================
+  pub let _cso_request : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (req_sid: u64) (tgt_sid: u64) (tgt_slot: u64) (rights_mask: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M6 (paideia-os #2644): pull a narrowed child cap from (tgt_sid, tgt_slot) into req_sid's env. 7-step algorithm: (1) validate req_sid, (2) validate tgt_sid, (3) tgt_slot<6, (4) find matching allowance (miss -> NO_PERMISSION), (5) policy narrow check against allowance.max_rights (fail -> WIDEN), (6) delegate the mint to _es_share(tgt, req, tgt_slot, rights), (7) translate M5 return codes to the CSO band. Defense-in-depth: this module enforces the TARGET SESSION'S policy ceiling (step 5); _es_share's internal narrow check enforces the CAPABILITY SYSTEM invariant against parent cap rights (R139.M5 §4). The two checks use `and reg,reg; cmp reg,reg; jne` -- never `not reg` (paideia-as encoder gap). Five callee-save pushes (rbx=req_sid, r12=tgt_sid, r13=tgt_slot, r14=rights_mask, r15=allowance_idx-then-scratch) land rsp%16==0 at every nested call. Encoder posture: cmp rN,0 (never test), shl rN,5 for record stride, mov rax,imm32 for return codes (all have bit 31 clear). Labels prefixed cso_rq_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // req_sid
+        mov r12, rsi;                    // tgt_sid
+        mov r13, rdx;                    // tgt_slot
+        mov r14, rcx;                    // rights_mask
+
+        // ---- Step 1: req_sid in use ----
+        mov rdi, rbx;
+        call ss_row_in_use;
+        cmp rax, 0;
+        je  cso_rq_bad_session;
+
+        // ---- Step 2: tgt_sid in use ----
+        mov rdi, r12;
+        call ss_row_in_use;
+        cmp rax, 0;
+        je  cso_rq_bad_session;
+
+        // ---- Step 3: tgt_slot < CAP_ENV_SLOTS ----
+        cmp r13, 6;                      // CSO_CAP_ENV_SLOTS
+        jae cso_rq_bad_session;
+
+        // ---- Step 4: find allowance ----
+        mov rdi, r12;                    // tgt_sid
+        mov rsi, r13;                    // tgt_slot
+        call cso_find_allowance;
+        mov r11, 16;                     // CSO_REC_NONE
+        cmp rax, r11;
+        jae cso_rq_no_permission;
+        mov r15, rax;                    // allowance_idx
+
+        // ---- Step 5: narrow check against allowance.max_rights ----
+        //   record_base = _cso_allow_table + idx * 32; max_rights at +16.
+        mov rax, r15;
+        shl rax, 5;
+        lea r10, [rip + _cso_allow_table];
+        add rax, r10;
+        mov r11, [rax + 16];             // allowance.max_rights
+
+        //   (rights_mask & max_rights) == rights_mask
+        mov rax, r14;                    // requested
+        and rax, r11;                    // & ceiling
+        cmp rax, r14;
+        jne cso_rq_widen;
+
+        // ---- Step 6: delegate to _es_share(tgt, req, tgt_slot, rights) ----
+        mov rdi, r12;                    // src = tgt_sid
+        mov rsi, rbx;                    // dst = req_sid
+        mov rdx, r13;                    // src_env_slot = tgt_slot
+        mov rcx, r14;                    // rights
+        call _es_share;
+
+        // ---- Step 7: translate M5 return ----
+        //   Success is in [0, 24) (6 env slots << 2); all errors are
+        //   >= 0x1102.  Discriminator at 0x100.
+        mov r11, 0x100;
+        cmp rax, r11;
+        jb  cso_rq_ok;                   // success-packed form
+
+        //   Error.  Switch on known codes.
+        mov r11, 0x1102;                 // ES_ERR_BAD_SESSION
+        cmp rax, r11;
+        je  cso_rq_bad_session;
+
+        mov r11, 0x1F10;                 // ES_ERR_POOL_FULL
+        cmp rax, r11;
+        je  cso_rq_pool_full;
+
+        mov r11, 0x1F11;                 // ES_ERR_WIDEN
+        cmp rax, r11;
+        je  cso_rq_widen;
+
+        //   Unknown code from M5 (should not happen): treat as pool
+        //   full to prefer a terminating-safe failure.
+        jmp cso_rq_pool_full;
+
+      cso_rq_ok:
+        //   rax already holds the packed success value from _es_share.
+        //   Park it, emit fingerprint, restore.
+        mov r15, rax;                    // park result (r15 scratch)
+        mov rdi, 3;                      // CSO_ST_REQUEST_OK
+        call cso_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + cso_tag_req_ok];
+        lea rcx, [rip + cso_k_req_sid];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        mov rax, r15;                    // restore packed result
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cso_rq_no_permission:
+        mov rdi, 4;                      // CSO_ST_REQUEST_REJ_PERM
+        call cso_note;
+        mov r15, 0x1F20;                 // CSO_ERR_NO_PERMISSION
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + cso_tag_req_rej];
+        lea rcx, [rip + cso_k_errno];
+        mov r8,  r15;
+        call klog_s1_x1;
+        mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cso_rq_bad_session:
+        mov rdi, 5;                      // CSO_ST_REQUEST_REJ_OTHER
+        call cso_note;
+        mov r15, 0x1102;                 // CSO_ERR_BAD_SESSION
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + cso_tag_req_rej];
+        lea rcx, [rip + cso_k_errno];
+        mov r8,  r15;
+        call klog_s1_x1;
+        mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cso_rq_widen:
+        mov rdi, 5;                      // CSO_ST_REQUEST_REJ_OTHER
+        call cso_note;
+        mov r15, 0x1F21;                 // CSO_ERR_WIDEN
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + cso_tag_req_rej];
+        lea rcx, [rip + cso_k_errno];
+        mov r8,  r15;
+        call klog_s1_x1;
+        mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cso_rq_pool_full:
+        mov rdi, 5;                      // CSO_ST_REQUEST_REJ_OTHER
+        call cso_note;
+        mov r15, 0x1F22;                 // CSO_ERR_POOL_FULL
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + cso_tag_req_rej];
+        lea rcx, [rip + cso_k_errno];
+        mov r8,  r15;
+        call klog_s1_x1;
+        mov rax, r15;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _cso_revoke(requester_sid, requester_slot) -> errno
+  //
+  // Drop a shared cap in requester_sid's env.  Finds the M5 share-
+  // record keyed on (dst_sid == req_sid AND dst_env_slot == req_slot
+  // AND IN_USE), then delegates teardown to _es_revoke.
+  //
+  // ARGS (SysV):
+  //   rdi = requester_sid
+  //   rsi = requester_slot
+  //
+  // RETURNS (rax):
+  //   CSO_OK                 -- share revoked
+  //   CSO_ERR_BAD_SESSION    -- bad req_sid, no matching share
+  //
+  // STEP-BY-STEP:
+  //   1. Validate req_sid via ss_row_in_use.  Else BAD_SESSION.
+  //      (requester_slot bounds are validated implicitly by the
+  //       reverse scan -- a slot not in [0, 6) will never match a
+  //       record and we fall through to BAD_SESSION.)
+  //   2. cso_find_share_by_dst(req_sid, req_slot). On miss ->
+  //      BAD_SESSION.
+  //   3. Delegate: _es_revoke(share_record_idx).  Propagate return
+  //      (ES_OK == CSO_OK; ES_ERR_BAD_SESSION identity-remap).
+  //
+  // Register plan: 3 callee-save pushes (rbx=req_sid, r12=req_slot,
+  // r13=record_idx) land rsp%16==0 at every nested call.  Labels
+  // prefixed cso_rv_.
+  // ==========================================================================
+  pub let _cso_revoke : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (requester_sid: u64) (requester_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M6 (paideia-os #2644): drop a shared cap in req_sid's env. Validate req_sid via ss_row_in_use (else BAD_SESSION), reverse-scan _es_share_table via cso_find_share_by_dst keyed on (dst_sid, dst_env_slot) (miss -> BAD_SESSION), delegate teardown to _es_revoke(idx). ES_OK and CSO_OK are both zero; ES_ERR_BAD_SESSION identity-remaps. Three callee-save pushes (rbx=req_sid, r12=req_slot, r13=record_idx) land rsp%16==0 at every nested call. Encoder posture: cmp rN,0 (never test), mov rax,imm32 for return codes. Labels prefixed cso_rv_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // req_sid
+        mov r12, rsi;                    // req_slot
+
+        // ---- Step 1: validate req_sid ----
+        mov rdi, rbx;
+        call ss_row_in_use;
+        cmp rax, 0;
+        je  cso_rv_bad_session;
+
+        // ---- Step 2: reverse-scan M5 share table ----
+        mov rdi, rbx;                    // dst_sid = req_sid
+        mov rsi, r12;                    // dst_slot = req_slot
+        call cso_find_share_by_dst;
+        mov r11, 16;                     // CSO_SHARE_NONE
+        cmp rax, r11;
+        jae cso_rv_bad_session;
+        mov r13, rax;                    // record_idx
+
+        // ---- Step 3: delegate to _es_revoke ----
+        mov rdi, r13;
+        call _es_revoke;
+        //   rax = ES_OK (0) or ES_ERR_BAD_SESSION (0x1102).  Both are
+        //   valid CSO returns; propagate as-is.
+        cmp rax, 0;
+        jne cso_rv_bad_session;
+
+        // ---- Success ----
+        mov rdi, 6;                      // CSO_ST_REVOKE_OK
+        call cso_note;
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + cso_tag_rev_ok];
+        lea rcx, [rip + cso_k_req_sid];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        xor rax, rax;                    // CSO_OK
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cso_rv_bad_session:
+        mov rdi, 7;                      // CSO_ST_REVOKE_REJ
+        call cso_note;
+        mov r13, 0x1102;                 // CSO_ERR_BAD_SESSION
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + cso_tag_rev_rej];
+        lea rcx, [rip + cso_k_errno];
+        mov r8,  r13;
+        call klog_s1_x1;
+        mov rax, r13;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _cso_revoke_allowance(target_sid, target_env_slot) -> errno
+  //
+  // Clear a standing offer.  Does NOT invalidate caps that were
+  // already pulled against this allowance (those live in requester
+  // envs; requesters drop them via _cso_revoke).  Matches the
+  // "offer withdrawn, prior deliveries honoured" discipline.
+  //
+  // ARGS (SysV):
+  //   rdi = target_sid
+  //   rsi = target_env_slot
+  //
+  // RETURNS (rax):
+  //   CSO_OK                 -- allowance cleared
+  //   CSO_ERR_BAD_SESSION    -- bad target_sid / slot / no live
+  //                             allowance for the pair
+  //
+  // Register plan: 3 callee-save pushes (rbx, r12, r13 = record_idx)
+  // land rsp%16==0 at every nested call.  Labels prefixed cso_ra_.
+  // ==========================================================================
+  pub let _cso_revoke_allowance : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (target_sid: u64) (target_env_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M6 (paideia-os #2644): clear a standing allowance. Validate tgt_sid via ss_row_in_use (else BAD_SESSION), find the matching allowance via cso_find_allowance (miss -> BAD_SESSION), zero its fields in release order (flags LAST publishes FREE). Does NOT touch caps already pulled against this allowance (they live in requester envs; requesters drop them via _cso_revoke). Three callee-save pushes land rsp%16==0 at every nested call. Encoder posture: cmp rN,0 (never test), shl rN,5 for record stride. Labels prefixed cso_ra_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // target_sid
+        mov r12, rsi;                    // target_env_slot
+
+        // ---- Validate target_sid ----
+        mov rdi, rbx;
+        call ss_row_in_use;
+        cmp rax, 0;
+        je  cso_ra_bad_session;
+
+        // ---- Find allowance ----
+        mov rdi, rbx;
+        mov rsi, r12;
+        call cso_find_allowance;
+        mov r11, 16;                     // CSO_REC_NONE
+        cmp rax, r11;
+        jae cso_ra_bad_session;
+        mov r13, rax;                    // allowance_idx
+
+        // ---- Zero record (flags LAST, release) ----
+        mov rax, r13;
+        shl rax, 5;
+        lea r10, [rip + _cso_allow_table];
+        add rax, r10;                    // record base
+
+        xor r11, r11;
+        mov [rax + 0],  r11;             // target_sid
+        mov [rax + 8],  r11;             // target_env_slot
+        mov [rax + 16], r11;             // max_rights
+        mov [rax + 24], r11;             // flags = 0 (FREE), LAST
+
+        mov rdi, 6;                      // CSO_ST_REVOKE_OK
+        call cso_note;
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + cso_tag_rev_ok];
+        lea rcx, [rip + cso_k_tgt_sid];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        xor rax, rax;                    // CSO_OK
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cso_ra_bad_session:
+        mov rdi, 7;                      // CSO_ST_REVOKE_REJ
+        call cso_note;
+        mov r13, 0x1102;                 // CSO_ERR_BAD_SESSION
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + cso_tag_rev_rej];
+        lea rcx, [rip + cso_k_errno];
+        mov r8,  r13;
+        call klog_s1_x1;
+        mov rax, r13;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Boot wiring note (see §7)
+  //
+  // kernel_main.pdx picks this up with ONE new call right after
+  // _es_init / before any user-space init:
+  //
+  //   call _es_init;                   // R139.M5
+  //   call _cso_init;                  // R139.M6 (this file)
+  //   // ... user-space init ...
+  //
+  // --- Dispatch arm reservation (future) ---
+  // A later wave MAY lift the request/allow surface into a
+  // KIND_SHELL_SESSION op variant:
+  //
+  //   OP_OPEN_FOREIGN   op_arg[7:0]=0x12, op_arg[15:8]=tgt_slot
+  //                     target_ptr=(tgt_sid<<32)|req_sid
+  //                     rights_mask passed in a cap-invoke payload word
+  //
+  //   OP_ALLOW_OPEN     op_arg[7:0]=0x13, op_arg[15:8]=tgt_slot
+  //                     max_rights in a payload word
+  //
+  // At M6 the standalone direct-call API avoids widening the handler
+  // dispatch while the ring-3-caller env is still being wired at
+  // R125.M3+.  See design/shell/cross-session-file-open.md §6.
+  // ==========================================================================
+}

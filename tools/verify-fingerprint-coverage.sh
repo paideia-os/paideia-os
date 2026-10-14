@@ -83,6 +83,26 @@ ROOT = sys.argv[1]
 # ---------------------------------------------------------------------------
 
 ALLOWLIST = {
+    # Wave 111 R139.M6 (paideia-os#2644): cross-session file open.
+    # Four fingerprints emitted from cross_session_open.pdx: INIT /
+    # ALLOW / REQUEST / REVOKE OK. All unreachable at M6 (no
+    # production caller; UX surface lands in a follow-up wave).
+    # Retire when first smoke-mode golden asserts the allowance/
+    # request round-trip.
+    "CSOPEN INIT OK":
+        "Wave 111 R139.M6: src/kernel/core/svc/cross_session_open.pdx "
+        "emits on first _cso allowance action. Retires when a smoke "
+        "mode drives allowance + request + revoke end-to-end.",
+    "CSOPEN ALLOW OK":
+        "Wave 111 R139.M6: _cso_allow success. Unreachable at M6 "
+        "(no production caller). Retires with first smoke mode.",
+    "CSOPEN REQUEST OK":
+        "Wave 111 R139.M6: _cso_request success. Unreachable at M6. "
+        "Retires with first smoke mode.",
+    "CSOPEN REVOKE OK":
+        "Wave 111 R139.M6: _cso_revoke success. Unreachable at M6. "
+        "Retires with first smoke mode.",
+
     # Wave 110 R139.M5 (paideia-os#2643): multi-session env sharing.
     # Four fingerprints: INIT fires on boot via _es_init (no boot
     # wire at M5; emitted from first _es_share call). SHARE/LOOKUP/
@@ -120,6 +140,28 @@ ALLOWLIST = {
     "REMOTE_IDENTITY REVOKE OK":
         "Wave 110 R137.M5: same file, _ri_revoke_peer_env success. "
         "Unreachable at M5. Retires with R137.M6.",
+
+    # Wave UMB-W24 R137.M6 (paideia-os#2638): failure-mode discipline.
+    # Three fingerprints: RECV/SEND/CASCADE OK. All unreachable at M6
+    # (M6 lands the handler in isolation; the cap-invoke dispatch arm
+    # at _rrw_send_record / _rrw_recv_frame error-return sites that
+    # routes into _rf_handle_{send,recv}_err is R137.M7+). Retire when
+    # R137.M7 lands with a smoke-mode golden exercising a seeded AEAD
+    # failure through the cascade end-to-end.
+    "REMOTE_FAILURE RECV OK":
+        "Wave UMB-W24 R137.M6: src/kernel/core/svc/remote_failure.pdx "
+        "emits from _rf_handle_recv_err on both the transient-no-"
+        "cascade tail and the dispatched-to-cascade tail. Unreachable "
+        "at M6 (no caller invokes the handler yet). Retires with "
+        "R137.M7's wire-up at the _rrw_recv_frame error-return site.",
+    "REMOTE_FAILURE SEND OK":
+        "Wave UMB-W24 R137.M6: same file, _rf_handle_send_err's "
+        "transient-no-cascade and dispatched tails. Unreachable at M6. "
+        "Retires with R137.M7's wire-up at _rrw_send_record.",
+    "REMOTE_FAILURE CASCADE OK":
+        "Wave UMB-W24 R137.M6: same file, rf_cascade clean-completion "
+        "tail (every step returned its own OK). Unreachable at M6. "
+        "Retires with R137.M7's cascade smoke exercise.",
 
     # Wave 99 R125.M4 (paideia-os#2594): syscall-entry cap check
     # integration. SYSCALL CAP_CHECK TABLE OK fires on every boot

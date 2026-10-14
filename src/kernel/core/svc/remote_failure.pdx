@@ -1,0 +1,1216 @@
+// src/kernel/core/svc/remote_failure.pdx -- Wave UMB-W24 R137.M6
+// paideia-os #2638
+//
+// SVC.REMOTE-SHELL: FAILURE-MODE DISCIPLINE (INTEGRATION LAYER)
+// =============================================================================
+//
+// R137 ("cross-host pipeline transport") milestone M6.  M6 lands the
+// INTEGRATION LAYER that bolts a defined, auditable failure cascade onto
+// the five callable surfaces that compose the cross-host transport
+// stack:
+//
+//   M1  remote_shell.pdx          -- the conn-row pool and lifecycle
+//   M2  remote_shell_handshake.pdx -- the ML-KEM-768 handshake
+//   M3  federation_discovery.pdx  -- the peer registry
+//   M4  remote_record_wire.pdx    -- the ChaCha20-Poly1305 record framer
+//   M5  remote_identity.pdx       -- the (fed_id, peer_index) -> env map
+//
+// Up through M5 each callable layer surfaces its own band of error
+// codes but NO LAYER DECIDES WHAT TO DO WHEN ONE OF THEM FIRES.  A
+// peer sends a frame whose Poly1305 tag does not verify -- the record
+// framer returns RRW_ERR_AEAD_FAIL and NO ONE DECIDES whether that is:
+//
+//     * a once-off bit flip in flight (log, drop the frame, continue),
+//     * a replay attempt against a stale nonce (log, drop, counter),
+//     * a key compromise or active-attack probe (REVOKE the peer, close
+//       the connection, audit the event with the peer's identity),
+//     * a repeated failure that trips a per-connection circuit breaker
+//       (close the connection without necessarily revoking identity).
+//
+// Deciding what to do -- "the failure discipline" -- is a kernel-side
+// POLICY surface.  M6 encodes it as a single, consolidated module that
+// every upstream caller funnels into whenever an RRW_ERR_* fires.
+//
+// Service name:    (NONE -- not a svc.* daemon, no endpoint claimed,
+//                   no broker registration, no cap-invoke dispatch arm.
+//                   This module is a direct-call POLICY bridge sibling
+//                   to remote_identity.pdx.)
+// Direct API:
+//   _rf_handle_recv_err (conn_id, rrw_err) -> errno
+//   _rf_handle_send_err (conn_id, rrw_err) -> errno
+//   _rf_classify        (rrw_err)          -> failure_class
+//
+// =============================================================================
+// SECTION 0  POSITIONING RELATIVE TO M1-M5
+// =============================================================================
+//
+// Up to and including M5 the stack handles errors by RETURNING a plain
+// RRW_ERR_* / RI_ERR_* / FD_ERR_* code to the direct caller.  No layer
+// treats an error as a security event or triggers teardown.  That was
+// intentional: M1..M5 are mechanism, M6 is policy.
+//
+// M6 draws the policy line.  Every path that returns an RRW_ERR_* on a
+// LIVE (ESTABLISHED) remote-shell row must route that error through
+//
+//     _rf_handle_recv_err(conn_id, rrw_err)        (receive side)
+//     _rf_handle_send_err(conn_id, rrw_err)        (transmit side)
+//
+// which runs the three-class classifier (TRANSIENT / FATAL / SECURITY),
+// bumps the per-conn fail counter, decides whether to invoke the
+// cascade, and returns RF_OK (no cascade, upstream may retry) or the
+// cascade's final errno.  Routing is the caller's responsibility -- M6
+// does not reach INTO rrw_send / rrw_recv to install itself; it exposes
+// an entry the caller invokes at the error-return site.  See §9 for the
+// wire-up contract.
+//
+// The cascade itself is DEFENCE-IN-DEPTH, not optimistic:
+//
+//   1. AUDIT  -- a _cmd_audit record with the reason, conn_id, and the
+//                peer's identity (from the still-live _ri_pool row).
+//                The audit is written BEFORE revoke so the peer that
+//                caused the event is still identifiable in the record.
+//   2. REVOKE -- _ri_revoke_peer_env tears down the (conn_id, fed_id,
+//                peer_index) -> env_slot binding.  Any subsequent frame
+//                on the same conn_id would miss the identity map and
+//                the dispatcher would refuse the record.
+//   3. CLOSING state -- _remote_shell_set_state marks the row CLOSING
+//                       so the handshake layer refuses re-establish
+//                       attempts and the record wire refuses sends.
+//   4. KEY/NONCE ZERO -- the ML-KEM shared secret at [+192..+224] and
+//                        the AEAD nonce counter at [+224..+232] are
+//                        both zeroed.  Defence-in-depth: even if the
+//                        row's in_use bit were somehow re-set without
+//                        a fresh handshake, no key material would be
+//                        reachable from the row.
+//   5. CLOSE -- _remote_shell_close zeroes the structural fields and
+//               clears in_use LAST, freeing the row for a future
+//               _accept.
+//
+// This ordering is INVARIANT.  Steps may NOT be re-ordered: audit must
+// read identity BEFORE revoke clears it; revoke must happen BEFORE
+// state transitions to CLOSING (so the next AEAD_FAIL from the same
+// peer on a race-raced follow-up frame cannot re-enter the cascade
+// against a stale identity); key/nonce zero must happen BEFORE close
+// (so no window exists where the row's in_use is cleared but residual
+// key material is still readable through a cache-line probe).
+//
+// =============================================================================
+// SECTION 1  CLASSIFICATION  --  TRANSIENT / FATAL / SECURITY
+// =============================================================================
+//
+// `_rf_classify(rrw_err) -> failure_class` is a PURE LEAF that maps a
+// bare RRW_ERR_* code to a BASELINE class.  Classes are u64 ordinals:
+//
+//     RF_CLASS_TRANSIENT  = 0   -- single-shot error; log, bump counter,
+//                                  no cascade on first occurrence
+//     RF_CLASS_FATAL      = 1   -- unrecoverable without a fresh row
+//     RF_CLASS_SECURITY   = 2   -- evidence of an active attack
+//     RF_CLASS_UNKNOWN    = RF_ERR_UNKNOWN_CLASS = 0x1D40
+//
+// Baseline rules (classify does NOT consult per-conn state):
+//
+//   RRW_ERR_FRAME_MALFORMED  (0x1D21) -> TRANSIENT
+//     First-shot bit flip or truncated frame.  No security semantics on
+//     its own; a repeat on the same conn escalates (handler path).
+//
+//   RRW_ERR_AEAD_FAIL        (0x1D22) -> TRANSIENT
+//     First-shot authentication failure.  Likely a replay or bit flip;
+//     a repeat OR the presence of an identity binding escalates.
+//
+//   RRW_ERR_NOT_ESTABLISHED  (0x1D20) -> FATAL
+//     Caller tried send/recv against a row that is not ESTABLISHED.
+//     Not a security event per se, but there is nothing to retry: the
+//     row is in the wrong state for I/O.  Close.
+//
+//   RRW_ERR_NONCE_EXHAUSTED  (0x1D23) -> FATAL
+//     The counter wrapped past 0xFFFF...FFFF.  Reusing a nonce would
+//     break the AEAD's authenticity guarantee; the only safe action is
+//     to tear down the session.  Not a security event because the
+//     peer did not cause it (we hit our own 2^64 limit).
+//
+//   RRW_ERR_BAD_CONN         (0x1D01) -> FATAL
+//     The conn_id does not resolve to a live row.  Nothing to escalate.
+//     Caller invoked us on a stale id.
+//
+//   anything else                    -> UNKNOWN (RF_ERR_UNKNOWN_CLASS)
+//     Caller passed us an rrw_err outside the band we know how to
+//     classify.  We bump an UNKNOWN stat and return
+//     RF_ERR_UNKNOWN_CLASS without cascading -- the caller gets the
+//     escape hatch to decide what to do.
+//
+// The handler path (_rf_handle_recv_err / _rf_handle_send_err) ESCALATES
+// the baseline using per-conn state:
+//
+//   TRANSIENT + repeat (counter >= 2) and rrw_err in {AEAD_FAIL,
+//               FRAME_MALFORMED}             -> escalates to FATAL
+//
+//   TRANSIENT + rrw_err == AEAD_FAIL and the identity map on this
+//               conn_id has a BOUND peer_env_slot (lookup != NONE)
+//                                            -> escalates to SECURITY
+//
+// SECURITY is strictly stronger than FATAL: both run the cascade, but
+// SECURITY stamps a dedicated stat slot and emits a distinct audit
+// argv_hash so a verifier can filter attack-shaped events.
+//
+// =============================================================================
+// SECTION 2  CASCADE STEP ORDERING
+// =============================================================================
+//
+// `rf_cascade(conn_id, rrw_err, class)` runs the five-step teardown.
+// Each step is defence-in-depth: a prior-step error does NOT abort the
+// subsequent steps.  The cascade's return is RF_OK iff every step
+// returned its own OK; otherwise the cascade still runs to completion
+// and the earliest non-OK step's errno is returned.
+//
+// Step ordering (SEE §0 for WHY this is invariant):
+//
+//   (1) peer_env = _ri_lookup_peer_env(conn_id)    (slot or RI_SLOT_NONE)
+//       Read BEFORE revoke so the audit record below carries the
+//       peer's local principal.  Pure read; no state change.
+//
+//   (2) token = _cmd_audit_begin(session_id = conn_id,
+//                                pid         = 0xFFF (wire-layer),
+//                                cmd_hash    = rrw_err,
+//                                argv_hash   = class,
+//                                cap_env_fp  = peer_env)
+//       _cmd_audit_end(token, exit_code = rrw_err)
+//
+//       The audit record is the forgery-resistant primitive: it is
+//       chained via BLAKE3 against the previous record's this_hash
+//       (R139.M3 integrity surface) so a later _cmd_audit_verify tells
+//       a reader whether the record was present AT THE TIME it was
+//       written.  A token of 0 (pool full) is logged but not retried.
+//
+//   (3) _ri_revoke_peer_env(conn_id)
+//       Clears the (fed_id, peer_index, env_slot, in_use) tuple in
+//       _ri_pool.  Idempotent -- RI_ERR_BAD_CONN on a row that was
+//       never bound; we treat that as a non-fatal outcome.
+//
+//   (4) _remote_shell_set_state(conn_id, RS_STATE_CLOSING)
+//       Rewrites the state field in [row+8] without touching flags.
+//       Future sends/recvs on this conn now fail with
+//       RRW_ERR_NOT_ESTABLISHED (which classify maps to FATAL, which
+//       the next handler-pass would route into another cascade -- but
+//       the row's in_use is cleared by step 5 before any such reroute
+//       is possible, so the cascade is self-terminating).
+//
+//   (5) Zero the ML-KEM shared secret at [row+192..+224] (4 qwords)
+//       and the nonce counter at [row+224..+232] (1 qword).  These are
+//       the ONLY fields with sensitive key material.  All five stores
+//       are mov [mem], r9 with r9=0, so no imm64 bitmask is required.
+//
+//   (6) _remote_shell_close(conn_id)
+//       Zeroes ep_lo + sf + kem_session_slot + bytes_rx + bytes_tx and
+//       clears in_use LAST.  After this call the row is logically free
+//       and a future _accept may re-use the slot.
+//
+// =============================================================================
+// SECTION 3  INTERACTION WITH M5 IDENTITY
+// =============================================================================
+//
+// The identity map (M5) is BOTH an input and an output of the cascade:
+//
+//   * INPUT  -- rf_cascade reads peer_env via _ri_lookup_peer_env BEFORE
+//               invoking revoke, so the audit record carries the local
+//               principal that was authorised to act for this peer.
+//               A map miss (RI_SLOT_NONE) is NOT an error; it means the
+//               connection was never bound to a local principal (e.g.
+//               the handshake completed but the server task never
+//               called _ri_bind_peer_to_env).  The audit record then
+//               carries peer_env = 0xFF.
+//
+//   * OUTPUT -- rf_cascade calls _ri_revoke_peer_env regardless of
+//               whether a binding was present.  Revoke is idempotent:
+//               the ri_pool row's in_use check short-circuits a free
+//               row to RI_ERR_BAD_CONN which the cascade ignores.
+//
+// The escalation TRANSIENT -> SECURITY on AEAD_FAIL is predicated on
+// identity presence: an AEAD failure on an UNBOUND connection is still
+// suspicious but a server-task's bind decision has NOT yet granted the
+// peer any authority, so the escalation is deferred to repeat (which
+// routes to FATAL) rather than one-shot SECURITY.  An AEAD failure on
+// a BOUND connection means the peer we granted local authority to is
+// failing to authenticate, which is strong evidence of key compromise
+// or active MitM -- SECURITY fires on the first occurrence.
+//
+// =============================================================================
+// SECTION 4  RETURN CODE BAND  --  0x1D40..0x1D4F
+// =============================================================================
+//
+//   RF_OK                = 0           (success -- either no cascade
+//                                        was needed OR the cascade ran
+//                                        to completion with every step
+//                                        returning its own OK)
+//   RF_ERR_BAD_CONN      = 0x1D01      (REUSE of RS_ERR_BAD_ID /
+//                                        RRW_ERR_BAD_CONN -- uniform
+//                                        wire-layer "no such connection"
+//                                        across the remote-shell stack)
+//   RF_ERR_UNKNOWN_CLASS = 0x1D40      (classify saw an rrw_err outside
+//                                        the known RRW_* band; caller
+//                                        gets the escape hatch to
+//                                        decide what to do)
+//
+// Band audit (2026-10-14):
+//   `grep -rnE '0x1D4[0-9A-Fa-f]\b' src/kernel/`
+//   -> ONLY a stale documentary comment in remote_identity.pdx line
+//      113.  No code uses the band.  Clean.
+//
+// Both codes fit imm32 with bit 31 clear so `mov rax, imm32` emits the
+// 7-byte zero-extending form (never `and r11, imm64`).  The band
+// 0x1D40..0x1D4F is reserved for R137.M6+ failure-discipline codes.
+//
+// =============================================================================
+// SECTION 5  POOL GEOMETRY
+// =============================================================================
+//
+// The per-conn fail counter needs 8 bytes per conn.  Four conns gives
+// 32 B total.  Row stride = 8 so addressing uses `shl rax, 3`.
+//
+//   _rf_pool    -- 4 u64 rows: _rf_pool[conn_id] = recent-fail count on
+//                   this conn.  Bumped on every TRANSIENT; read to
+//                   drive the "two in a row escalates to FATAL" rule.
+//                   The counter is NOT reset on a cascade (the row's
+//                   in_use is cleared by _remote_shell_close, so the
+//                   counter becomes stale but harmless).  A future
+//                   _accept of the same conn_id SHOULD reset the
+//                   counter -- deferred to M7 integration (the accept
+//                   call does not currently reach rf), with the fail-
+//                   safe that a stale counter only ESCALATES rather
+//                   than suppresses, so a new session's first AEAD
+//                   failure may spuriously escalate once.  Documented
+//                   here so a future refactor sees the gap.
+//   _rf_stats   -- 16 u64 counters (observability).  Slot assignments
+//                   in §7.
+//
+// =============================================================================
+// SECTION 6  STACK DISCIPLINE  (SysV, entry rsp%16==8)
+// =============================================================================
+//
+//   rf_note                 0 pushes (pure leaf stat bump)
+//   rf_check_rs_conn        0 pushes (pure leaf; bounds + in_use)
+//   _rf_classify            0 callee-save pushes; a one-off
+//                            `push rax; call rf_note; pop rax` at
+//                            each tail parks the return value across
+//                            the stat bump (entry %16==8, +1 push ->
+//                            %16==0 call-ready at rf_note).
+//   rf_cascade              5 pushes + sub rsp, 16
+//                             rbx = conn_id
+//                             r12 = rrw_err
+//                             r13 = class
+//                             r14 = peer_env (saved for audit begin arg)
+//                             r15 = earliest_err (RF_OK init, latched on
+//                                                 first non-OK step)
+//                             +16 = 8 B token spill + 8 B pad.  Entry
+//                             rsp%16==8; +5*8=+40 -> %16==0; sub 16 =
+//                             +56 -> %16==0 at every nested call.
+//   _rf_handle_recv_err     3 pushes (rbx=conn_id, r12=rrw_err,
+//                                     r13=class_after_escalation).
+//                           Entry %16==8; +3*8=+24 -> %16==0 at every
+//                           nested call (no extra sub rsp; escalation
+//                           state lives in registers; no stack-passed-
+//                           arg slot used -- klog_s1_x1 takes 5 regs).
+//   _rf_handle_send_err     3 pushes (same shape as recv)
+//
+// =============================================================================
+// SECTION 7  STATS SLOT ASSIGNMENTS  (_rf_stats indexed 0..16)
+// =============================================================================
+//
+//   RF_ST_RECV_TRANSIENT  = 0   recv-side transient; no cascade run
+//   RF_ST_RECV_FATAL      = 1   recv-side fatal; cascade run
+//   RF_ST_RECV_SECURITY   = 2   recv-side security escalation
+//   RF_ST_RECV_UNKNOWN    = 3   recv-side classify saw unknown rrw_err
+//   RF_ST_RECV_BAD_CONN   = 4   recv-side conn_id check failed
+//   RF_ST_SEND_TRANSIENT  = 5   send-side transient
+//   RF_ST_SEND_FATAL      = 6   send-side fatal
+//   RF_ST_SEND_SECURITY   = 7   send-side security
+//   RF_ST_SEND_UNKNOWN    = 8   send-side unknown
+//   RF_ST_SEND_BAD_CONN   = 9   send-side conn_id check failed
+//   RF_ST_CASCADE_OK      = 10  cascade ran to completion with every
+//                                step returning OK
+//   RF_ST_CASCADE_PART    = 11  cascade ran but some step returned
+//                                non-OK (earliest latched)
+//   RF_ST_CLASSIFY_OK     = 12  classify returned a known class
+//   RF_ST_CLASSIFY_UNKNOWN= 13  classify returned UNKNOWN
+//
+// =============================================================================
+// SECTION 8  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Labels prefixed `rf_` (remote-failure; distinct from `rs_`,
+// `rsh_`, `rrw_`, `ri_`, `fd_`, `ca_`).  No reserved paideia-as
+// keyword overlap (reserved: loop / if / let).  Encoder-pitfall
+// posture (feedback_pdx_encoder_pitfalls):
+//
+//   * cmp rN, 0            (never `test rN, rN`)
+//   * shl rN, 3            (counter stride 8; never `imul r, imm`)
+//   * shl rN, 8            (RS row stride 256; never `imul r, imm`)
+//   * mov rax, imm32       (never `and r11, imm64` with bit-31-set imm)
+//   * single-line `pub let name = "..."`
+//   * module basename `RemoteFailure` matches file basename
+//     `remote_failure.pdx` (ddc requires exact match)
+//   * fingerprint `[u8; N]` with N = string length + 1 (NUL counts)
+//
+// =============================================================================
+// SECTION 9  BOOT-WIRING NOTE
+// =============================================================================
+//
+// `kernel_main.pdx` does NOT call an _rf_init at boot.  M6 declares no
+// runtime bringup state; _rf_pool (32 B) and _rf_stats (128 B) are
+// .bss and zero-initialise naturally.  No endpoint id is claimed; no
+// svc_register call is made; no allowlist entry is added to the
+// build gate's allowlist (fingerprint-coverage.sh ALREADY needs new
+// entries for each OK tag below -- see tools/verify-fingerprint-
+// coverage.sh).
+//
+// Callers wire up at the error-return sites of _rrw_send_record and
+// _rrw_recv_frame: whenever those routines return a non-RRW_OK code
+// on an ESTABLISHED row, they must invoke _rf_handle_send_err /
+// _rf_handle_recv_err with (conn_id, rrw_err).  The wire-up is
+// deferred to R137.M7 (the next milestone, cap-invoke dispatch arm)
+// so M6 may land in isolation with no visible kernel path change.
+//
+// See design/shell/remote-failure-discipline.md for the full design.
+//
+// =============================================================================
+
+module RemoteFailure = structure {
+
+  // ==========================================================================
+  // Service identity (documentary only; no broker registration at M6)
+  // ==========================================================================
+
+  pub let REMOTE_FAILURE_NAME_LEN : u64 = 18   // "svc.remote-failure" is 18 bytes
+  pub let remote_failure_name : [u8; 19] = "svc.remote-failure\0"
+
+  // ==========================================================================
+  // Return band (§4)
+  // ==========================================================================
+
+  pub let RF_OK                : u64 = 0
+  pub let RF_ERR_BAD_CONN      : u64 = 0x1D01   // alias of RS_ERR_BAD_ID
+  pub let RF_ERR_UNKNOWN_CLASS : u64 = 0x1D40
+
+  // ==========================================================================
+  // Failure-class ordinals (§1)
+  //
+  // RF_CLASS_UNKNOWN deliberately equals RF_ERR_UNKNOWN_CLASS so
+  // _rf_classify's "unknown" return can be surfaced directly as the
+  // handler's return errno without a translation step.
+  // ==========================================================================
+
+  pub let RF_CLASS_TRANSIENT : u64 = 0
+  pub let RF_CLASS_FATAL     : u64 = 1
+  pub let RF_CLASS_SECURITY  : u64 = 2
+  pub let RF_CLASS_UNKNOWN   : u64 = 0x1D40
+
+  // ==========================================================================
+  // RRW error-code mirrors
+  //
+  // We mirror these constants locally rather than take a cross-module
+  // `pub let` dependency so the classifier is self-contained and the
+  // numeric values are visible at the compare sites.  Any drift between
+  // these mirrors and remote_record_wire.pdx is caught by the band-
+  // audit grep documented in §4.
+  // ==========================================================================
+
+  pub let RF_RRW_OK                  : u64 = 0
+  pub let RF_RRW_ERR_BAD_CONN        : u64 = 0x1D01
+  pub let RF_RRW_ERR_NOT_ESTABLISHED : u64 = 0x1D20
+  pub let RF_RRW_ERR_FRAME_MALFORMED : u64 = 0x1D21
+  pub let RF_RRW_ERR_AEAD_FAIL       : u64 = 0x1D22
+  pub let RF_RRW_ERR_NONCE_EXHAUSTED : u64 = 0x1D23
+
+  // RS state constant mirror (CLOSING is the only one we write).
+  pub let RF_RS_STATE_CLOSING : u64 = 3
+
+  // RI "no-binding" sentinel mirror.
+  pub let RF_RI_SLOT_NONE : u64 = 0xFF
+
+  // RS row-pool geometry (§5) -- MUST agree with remote_shell.pdx.
+  pub let RF_RS_POOL_MAX  : u64 = 4
+  pub let RF_RS_OFF_IN_USE : u64 = 120
+
+  // RRW row offsets (for key/nonce zero in step 5 of the cascade) --
+  // MUST agree with remote_record_wire.pdx.
+  pub let RF_RRW_OFF_MLKEM_SS : u64 = 192
+  pub let RF_RRW_OFF_NONCE_CT : u64 = 224
+
+  // Sentinels used in audit payload fields.
+  pub let RF_AUDIT_PID_WIRE : u64 = 0xFFF   // "wire-layer, no process"
+
+  // ==========================================================================
+  // Pool geometry (§5)
+  // ==========================================================================
+
+  pub let RF_POOL_MAX  : u64 = 4
+  pub let RF_ROW_BYTES : u64 = 8     // u64 counter per conn
+
+  // ==========================================================================
+  // Storage
+  //
+  //   _rf_pool    -- 4 u64 fail-count rows.  Address compute via shl 3.
+  //   _rf_stats   -- 16 u64 counters.  Slot assignments in §7.
+  // ==========================================================================
+
+  pub let mut _rf_pool  : [u64; 4]  = uninit @align(64)
+  pub let mut _rf_stats : [u64; 16] = uninit @align(64)
+
+  // ==========================================================================
+  // Stat slot assignments (§7)
+  // ==========================================================================
+
+  pub let RF_ST_RECV_TRANSIENT   : u64 = 0
+  pub let RF_ST_RECV_FATAL       : u64 = 1
+  pub let RF_ST_RECV_SECURITY    : u64 = 2
+  pub let RF_ST_RECV_UNKNOWN     : u64 = 3
+  pub let RF_ST_RECV_BAD_CONN    : u64 = 4
+  pub let RF_ST_SEND_TRANSIENT   : u64 = 5
+  pub let RF_ST_SEND_FATAL       : u64 = 6
+  pub let RF_ST_SEND_SECURITY    : u64 = 7
+  pub let RF_ST_SEND_UNKNOWN     : u64 = 8
+  pub let RF_ST_SEND_BAD_CONN    : u64 = 9
+  pub let RF_ST_CASCADE_OK       : u64 = 10
+  pub let RF_ST_CASCADE_PART     : u64 = 11
+  pub let RF_ST_CLASSIFY_OK      : u64 = 12
+  pub let RF_ST_CLASSIFY_UNKNOWN : u64 = 13
+
+  // ==========================================================================
+  // Fingerprint tags  (N = len(string) + 1, NUL-inclusive)
+  //
+  // Only the "OK" tags are extracted by the fingerprint-coverage gate;
+  // the "REJ" tags are retained for operator diagnostics.
+  //
+  // "REMOTE_FAILURE RECV OK"     = 22 chars + NUL => N=23
+  // "REMOTE_FAILURE RECV REJ"    = 23 chars + NUL => N=24
+  // "REMOTE_FAILURE SEND OK"     = 22 chars + NUL => N=23
+  // "REMOTE_FAILURE SEND REJ"    = 23 chars + NUL => N=24
+  // "REMOTE_FAILURE CASCADE OK"  = 25 chars + NUL => N=26
+  // "REMOTE_FAILURE CASCADE REJ" = 26 chars + NUL => N=27
+  // ==========================================================================
+
+  pub let rf_tag_recv_ok      : [u8; 23] = "REMOTE_FAILURE RECV OK\0"
+  pub let rf_tag_recv_rej     : [u8; 24] = "REMOTE_FAILURE RECV REJ\0"
+  pub let rf_tag_send_ok      : [u8; 23] = "REMOTE_FAILURE SEND OK\0"
+  pub let rf_tag_send_rej     : [u8; 24] = "REMOTE_FAILURE SEND REJ\0"
+  pub let rf_tag_cascade_ok   : [u8; 26] = "REMOTE_FAILURE CASCADE OK\0"
+  pub let rf_tag_cascade_rej  : [u8; 27] = "REMOTE_FAILURE CASCADE REJ\0"
+
+  // KV keys referenced by emission sites.
+  pub let rf_k_cid    : [u8; 4]  = "cid\0"
+  pub let rf_k_class  : [u8; 6]  = "class\0"
+  pub let rf_k_errno  : [u8; 6]  = "errno\0"
+
+  // ==========================================================================
+  // rf_note(slot) -> ()
+  //
+  // Bounded increment on _rf_stats[slot].  Load-inc-store, no
+  // `add reg,[mem]`.  Pure leaf -- no pushes.  Labels prefixed rf_no_.
+  // Mirrors rs_note / rrw_note / ri_note shape.
+  // ==========================================================================
+  pub let rf_note : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M6 (paideia-os #2638): bounded increment on _rf_stats[slot<16]. Load-inc-store, no `add reg,[mem]`. Pure leaf -- no pushes. Labels prefixed rf_no_. Mirrors rs_note / rrw_note / ri_note shape.",
+      block: {
+        cmp rdi, 16;
+        jae rf_no_out;
+        lea r10, [rip + _rf_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      rf_no_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rf_check_rs_conn(conn_id) -> 1 iff conn_id<RF_RS_POOL_MAX AND
+  //                              _remote_shell_pool[conn_id].in_use != 0
+  //
+  // Mirror of ri_check_rs_conn: validate the conn_id against the OWNING
+  // row pool in remote_shell.pdx so a stale/free conn_id cannot pass
+  // the failure-handler path.  Pure leaf -- no pushes.
+  //
+  // The _remote_shell_pool symbol resolves at link time against
+  // remote_shell.pdx.  Row stride = 256 = shl rax, 8.  in_use offset
+  // = 120 bytes from row base.
+  //
+  // Labels prefixed rf_cc_.
+  // ==========================================================================
+  pub let rf_check_rs_conn : (u64) -> u64 !{mem} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M6 (paideia-os #2638): 1 iff conn_id<4 AND _remote_shell_pool[conn_id].in_use (word at [+120]) != 0. Pure leaf -- no pushes. Labels prefixed rf_cc_. Mirror of ri_check_rs_conn shape; stride 256 via shl rax, 8. The _remote_shell_pool symbol resolves at link time.",
+      block: {
+        mov r10, 4;                      // RF_RS_POOL_MAX
+        cmp rdi, r10;
+        jae rf_cc_no;
+        mov rax, rdi;
+        shl rax, 8;                      // conn_id * 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;                    // rax = &row[conn_id]
+        mov rax, [rax + 120];            // row.in_use
+        cmp rax, 0;
+        je  rf_cc_no;
+        mov rax, 1;
+        ret;
+      rf_cc_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rf_rs_row_base(conn_id) -> &_remote_shell_pool[conn_id*256]
+  //
+  // Row-base compute for the key/nonce zero in step 5 of the cascade.
+  // Stride 256 = 2^8 so `shl rax, 8` suffices.  Caller validates
+  // conn_id first.  Pure leaf -- no pushes.
+  //
+  // Labels prefixed rf_rb_.
+  // ==========================================================================
+  pub let rf_rs_row_base : (u64) -> u64 !{} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R137.M6 (paideia-os #2638): conn_id -> &_remote_shell_pool[conn_id*256]. Power-of-two stride uses `shl rax, 8` so no 2-op imul-with-imm is required. No bounds check -- caller validates. Labels prefixed rf_rb_. Mirrors rs_row_base shape.",
+      block: {
+        mov rax, rdi;
+        shl rax, 8;                      // conn_id * 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _rf_classify(rrw_err) -> failure_class
+  //
+  // Map a BARE RRW_ERR_* value to a baseline class ordinal.  Pure leaf
+  // -- no pushes, no state read, no per-conn awareness.  The handler
+  // path (_rf_handle_{recv,send}_err) escalates based on per-conn state
+  // AFTER consulting this classifier.
+  //
+  // ARGS (SysV):
+  //   rdi = rrw_err
+  //
+  // RETURNS (rax):
+  //   RF_CLASS_TRANSIENT (0)                for FRAME_MALFORMED, AEAD_FAIL
+  //   RF_CLASS_FATAL (1)                    for NOT_ESTABLISHED,
+  //                                          NONCE_EXHAUSTED, BAD_CONN
+  //   RF_ERR_UNKNOWN_CLASS (0x1D40)         for anything else
+  //
+  // Bumps RF_ST_CLASSIFY_OK on known-class return; RF_ST_CLASSIFY_UNKNOWN
+  // on the unknown fall-through.
+  //
+  // Labels prefixed rf_cl_.
+  // ==========================================================================
+  pub let _rf_classify : (u64) -> u64 !{mem} @{} =
+    fn (rrw_err: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M6 (paideia-os #2638): map rrw_err to a baseline failure class ordinal. Series of cmp-against-literal (FRAME_MALFORMED 0x1D21 and AEAD_FAIL 0x1D22 -> TRANSIENT; NOT_ESTABLISHED 0x1D20, NONCE_EXHAUSTED 0x1D23, BAD_CONN 0x1D01 -> FATAL; else UNKNOWN=RF_ERR_UNKNOWN_CLASS 0x1D40). Each of the three tails bumps a stat via rf_note; the one-off `push rax; call rf_note; pop rax` sequence parks the return value across the call (entry rsp%16==8, +1 push -> %16==0 call-ready at rf_note) and no further nested call occurs. Bumps RF_ST_CLASSIFY_OK (12) on TRANSIENT/FATAL tails; RF_ST_CLASSIFY_UNKNOWN (13) on the UNKNOWN fall-through. Encoder-pitfall posture: cmp rN,0 (never test), mov rax,imm32 for class ordinals (all < bit31). Labels prefixed rf_cl_.",
+      block: {
+        // TRANSIENT: FRAME_MALFORMED (0x1D21) OR AEAD_FAIL (0x1D22).
+        mov r10, 0x1D21;
+        cmp rdi, r10;
+        je  rf_cl_transient;
+        mov r10, 0x1D22;
+        cmp rdi, r10;
+        je  rf_cl_transient;
+
+        // FATAL: NOT_ESTABLISHED (0x1D20), NONCE_EXHAUSTED (0x1D23),
+        //        BAD_CONN (0x1D01).
+        mov r10, 0x1D20;
+        cmp rdi, r10;
+        je  rf_cl_fatal;
+        mov r10, 0x1D23;
+        cmp rdi, r10;
+        je  rf_cl_fatal;
+        mov r10, 0x1D01;
+        cmp rdi, r10;
+        je  rf_cl_fatal;
+
+        // UNKNOWN: anything else.  Fall through.
+        //   RF_ST_CLASSIFY_UNKNOWN = 13
+        push rax;                        // align: rsp%16==0 at call
+        mov rdi, 13;
+        call rf_note;
+        pop rax;
+        mov rax, 0x1D40;                 // RF_ERR_UNKNOWN_CLASS
+        ret;
+
+      rf_cl_transient:
+        push rax;
+        mov rdi, 12;                     // RF_ST_CLASSIFY_OK
+        call rf_note;
+        pop rax;
+        xor rax, rax;                    // RF_CLASS_TRANSIENT
+        ret;
+
+      rf_cl_fatal:
+        push rax;
+        mov rdi, 12;                     // RF_ST_CLASSIFY_OK
+        call rf_note;
+        pop rax;
+        mov rax, 1;                      // RF_CLASS_FATAL
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rf_cascade(conn_id, rrw_err, class) -> errno
+  //
+  // Run the five-step teardown (§2).  Each step is defence-in-depth:
+  // a non-OK return from one step does NOT abort subsequent steps;
+  // the earliest non-OK errno is latched in r15 and returned at the
+  // tail.
+  //
+  // ARGS (SysV):
+  //   rdi = conn_id
+  //   rsi = rrw_err
+  //   rdx = class       (RF_CLASS_FATAL or RF_CLASS_SECURITY)
+  //
+  // RETURNS (rax):
+  //   RF_OK (0)                 iff every step returned its own OK
+  //   earliest non-OK errno     otherwise
+  //
+  // Bumps RF_ST_CASCADE_OK / _PART and emits CASCADE OK / REJ.
+  //
+  // STACK FRAME:
+  //   5 callee-save pushes (rbx=conn_id, r12=rrw_err, r13=class,
+  //   r14=peer_env, r15=earliest_err) + sub rsp,16 (token spill + pad).
+  //   Entry rsp%16==8; +5*8=+40 -> %16==0; sub 16 = +56 -> %16==0 at
+  //   every nested call.
+  //
+  // Labels prefixed rf_ca_.
+  // ==========================================================================
+  pub let rf_cascade : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (conn_id: u64) (rrw_err: u64) (class: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R137.M6 (paideia-os #2638): run the five-step failure cascade (§2 of the module header). Order is invariant: (1) peer_env = _ri_lookup_peer_env(conn_id) read BEFORE revoke so audit carries identity; (2) _cmd_audit_begin + _cmd_audit_end with (session_id=conn_id, pid=0xFFF, cmd_hash=rrw_err, argv_hash=class, cap_env_fingerprint=peer_env); token=0 (pool full) is a non-OK that latches but does not short-circuit; (3) _ri_revoke_peer_env (idempotent -- RI_ERR_BAD_CONN on no-binding is NOT latched); (4) _remote_shell_set_state(conn_id, RS_STATE_CLOSING=3); (5) zero ML-KEM shared secret at [row+192..+224] (4 qwords) and nonce counter at [row+224..+232] (1 qword); (6) _remote_shell_close(conn_id). Each step's non-OK is latched in r15 (init to RF_OK). Final return = r15. Five callee-save pushes (rbx=conn_id, r12=rrw_err, r13=class, r14=peer_env, r15=earliest_err) + sub rsp,16 (one 8 B spill for token, 8 B pad). Entry rsp%16==8; +5*8=+40 -> %16==0; sub 16 = +56 -> %16==0 at every nested call. Encoder-pitfall posture: cmp rN,0 (never test), shl rN,8 for RS row stride, mov rax,imm32 for all literals (0xFFF, 3, class ordinals all fit imm32). Labels prefixed rf_ca_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;
+
+        mov rbx, rdi;                    // rbx = conn_id
+        mov r12, rsi;                    // r12 = rrw_err
+        mov r13, rdx;                    // r13 = class
+        xor r15, r15;                    // r15 = earliest_err = RF_OK
+
+        // ---- Step 1: peer_env = _ri_lookup_peer_env(conn_id) ----
+        mov rdi, rbx;
+        call _ri_lookup_peer_env;
+        mov r14, rax;                    // r14 = peer_env (slot or 0xFF)
+
+        // ---- Step 2a: token = _cmd_audit_begin(...) ----
+        //   session_id = conn_id (rdi)
+        //   pid        = 0xFFF   (rsi -- RF_AUDIT_PID_WIRE)
+        //   cmd_hash   = rrw_err (rdx)
+        //   argv_hash  = class   (rcx)
+        //   cap_env_fp = peer_env(r8)
+        mov rdi, rbx;
+        mov rsi, 0xFFF;                  // RF_AUDIT_PID_WIRE
+        mov rdx, r12;
+        mov rcx, r13;
+        mov r8,  r14;
+        call _cmd_audit_begin;
+        mov [rsp + 0], rax;              // spill token
+
+        // Zero token => pool full; latch and skip _end.  r15 stays
+        // RF_OK unless we latch; latch on earliest non-OK.
+        cmp rax, 0;
+        jne rf_ca_audit_end;
+        // Latch CA_ERR_POOL_FULL (0x2200) as earliest err.
+        cmp r15, 0;
+        jne rf_ca_skip_end;
+        mov r15, 0x2200;                 // CA_ERR_POOL_FULL
+        jmp rf_ca_skip_end;
+
+      rf_ca_audit_end:
+        // ---- Step 2b: _cmd_audit_end(token, exit_code = rrw_err) ----
+        mov rdi, [rsp + 0];              // reload token
+        mov rsi, r12;                    // exit_code = rrw_err
+        call _cmd_audit_end;
+        cmp rax, 0;
+        je  rf_ca_skip_end;
+        // Non-OK: latch iff r15 still RF_OK.
+        cmp r15, 0;
+        jne rf_ca_skip_end;
+        mov r15, rax;
+
+      rf_ca_skip_end:
+        // ---- Step 3: _ri_revoke_peer_env(conn_id) ----
+        //
+        // Idempotent -- RI_ERR_BAD_CONN on no-binding is ignored (NOT
+        // latched).  This is the ONE step whose non-OK is swallowed
+        // because "no binding" is the common case on an UNBOUND
+        // security-failure cascade.
+        mov rdi, rbx;
+        call _ri_revoke_peer_env;
+        // Do not latch -- idempotent.
+
+        // ---- Step 4: _remote_shell_set_state(conn_id, CLOSING=3) ----
+        mov rdi, rbx;
+        mov rsi, 3;                      // RF_RS_STATE_CLOSING
+        call _remote_shell_set_state;
+        cmp rax, 0;
+        je  rf_ca_zero_key;
+        cmp r15, 0;
+        jne rf_ca_zero_key;
+        mov r15, rax;
+
+      rf_ca_zero_key:
+        // ---- Step 5: zero ML-KEM shared secret + nonce counter ----
+        //
+        // row_base = _remote_shell_pool + conn_id * 256.  Row width is
+        // 256 B; we touch [+192..+232] which is inside the reserved
+        // slack at [+128..+256].  Five qword stores of r9=0.
+        mov rax, rbx;
+        shl rax, 8;                      // conn_id * 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;                    // rax = row base
+        xor r9, r9;
+        mov [rax + 192], r9;             // mlkem_ss[0..8]
+        mov [rax + 200], r9;             // mlkem_ss[8..16]
+        mov [rax + 208], r9;             // mlkem_ss[16..24]
+        mov [rax + 216], r9;             // mlkem_ss[24..32]
+        mov [rax + 224], r9;             // nonce counter
+
+        // ---- Step 6: _remote_shell_close(conn_id) ----
+        mov rdi, rbx;
+        call _remote_shell_close;
+        cmp rax, 0;
+        je  rf_ca_commit_ok;
+        cmp r15, 0;
+        jne rf_ca_commit_ok;
+        mov r15, rax;
+
+      rf_ca_commit_ok:
+        // ---- Finalisation ----
+        //
+        // r15 == 0  iff cascade clean  -> bump CASCADE_OK, emit OK tag
+        // r15 != 0  iff some step bled -> bump CASCADE_PART, emit REJ
+        //                                 tag with r15 as errno kv
+        cmp r15, 0;
+        jne rf_ca_part;
+
+        mov rdi, 10;                     // RF_ST_CASCADE_OK
+        call rf_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rf_tag_cascade_ok];
+        lea rcx, [rip + rf_k_cid];
+        mov r8,  rbx;                    // cid in hex KV
+        call klog_s1_x1;
+
+        xor rax, rax;                    // RF_OK
+        jmp rf_ca_out;
+
+      rf_ca_part:
+        mov rdi, 11;                     // RF_ST_CASCADE_PART
+        call rf_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rf_tag_cascade_rej];
+        lea rcx, [rip + rf_k_errno];
+        mov r8,  r15;                    // earliest err in hex KV
+        call klog_s1_x1;
+
+        mov rax, r15;                    // return earliest err
+
+      rf_ca_out:
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _rf_handle_recv_err(conn_id, rrw_err) -> errno
+  //
+  // Receive-side failure handler.  Steps:
+  //
+  //   (1) rf_check_rs_conn(conn_id); miss -> bump RF_ST_RECV_BAD_CONN,
+  //       emit RECV REJ, return RF_ERR_BAD_CONN.
+  //   (2) class = _rf_classify(rrw_err).
+  //   (3) class == UNKNOWN -> bump RF_ST_RECV_UNKNOWN, emit RECV REJ,
+  //                           return RF_ERR_UNKNOWN_CLASS.
+  //   (4) class == TRANSIENT -> bump _rf_pool[conn_id] counter.
+  //       counter_now = _rf_pool[conn_id] (post-bump).
+  //       Escalation rules (§1):
+  //         rrw_err == AEAD_FAIL AND _ri_lookup_peer_env != NONE
+  //           -> class = SECURITY (first-shot SECURITY on BOUND row).
+  //         counter_now >= 2 (repeat on this conn)
+  //           -> class = FATAL.
+  //         else
+  //           -> stay TRANSIENT: bump RECV_TRANSIENT, emit RECV OK,
+  //              return RF_OK (NO cascade).
+  //   (5) class in {FATAL, SECURITY} -> bump RECV_FATAL or RECV_SECURITY,
+  //       emit RECV OK (handler succeeded in dispatching to cascade),
+  //       call rf_cascade(conn_id, rrw_err, class), return its result.
+  //
+  // ARGS (SysV):
+  //   rdi = conn_id
+  //   rsi = rrw_err
+  //
+  // RETURNS (rax):
+  //   RF_OK (0)                          on transient (no cascade) OR
+  //                                       on clean cascade completion
+  //   RF_ERR_BAD_CONN (0x1D01)           on conn_id check miss
+  //   RF_ERR_UNKNOWN_CLASS (0x1D40)      on classify unknown
+  //   earliest cascade step's errno      on partial cascade
+  //
+  // STACK FRAME:
+  //   3 callee-save pushes (rbx=conn_id, r12=rrw_err, r13=class_live).
+  //   Entry rsp%16==8; +3*8=+24 lands rsp%16==0 at every nested call
+  //   (no extra `sub rsp` needed; no stack-passed-arg slot used).
+  //
+  // Labels prefixed rf_re_.
+  // ==========================================================================
+  pub let _rf_handle_recv_err : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (conn_id: u64) (rrw_err: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R137.M6 (paideia-os #2638): receive-side failure handler. (1) rf_check_rs_conn miss -> RF_ERR_BAD_CONN; (2) class = _rf_classify(rrw_err); (3) UNKNOWN -> RF_ERR_UNKNOWN_CLASS; (4) TRANSIENT -> bump _rf_pool[conn_id], escalate to SECURITY if rrw_err==AEAD_FAIL and _ri_lookup_peer_env!=NONE, else escalate to FATAL on repeat (counter>=2), else stay TRANSIENT and return RF_OK with no cascade; (5) FATAL/SECURITY -> bump corresponding RECV stat, emit RECV OK, call rf_cascade, return its result. Three callee-save pushes (rbx=conn_id, r12=rrw_err, r13=class_live). Entry %16==8; +3*8=+24 -> %16==0 at every nested call (no extra sub rsp needed; no stack-passed-arg slot). Encoder-pitfall posture: cmp rN,0 (never test), shl rN,3 for _rf_pool stride-8, mov rax,imm32 for all error codes. Labels prefixed rf_re_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // rbx = conn_id
+        mov r12, rsi;                    // r12 = rrw_err
+
+        // ---- (1) Validate conn_id against RS pool ----
+        mov rdi, rbx;
+        call rf_check_rs_conn;
+        cmp rax, 0;
+        je  rf_re_bad_conn;
+
+        // ---- (2) class = _rf_classify(rrw_err) ----
+        mov rdi, r12;
+        call _rf_classify;
+        mov r13, rax;                    // r13 = class
+
+        // ---- (3) UNKNOWN -> RF_ERR_UNKNOWN_CLASS ----
+        mov r10, 0x1D40;                 // RF_CLASS_UNKNOWN
+        cmp r13, r10;
+        je  rf_re_unknown;
+
+        // ---- (4) TRANSIENT -> escalate or stay ----
+        cmp r13, 0;                      // RF_CLASS_TRANSIENT
+        jne rf_re_dispatch;              // FATAL already; skip ahead
+
+        // Bump _rf_pool[conn_id] counter.
+        mov rax, rbx;
+        shl rax, 3;                      // conn_id * 8
+        lea r10, [rip + _rf_pool];
+        add rax, r10;                    // rax = &_rf_pool[conn_id]
+        mov r9, [rax];
+        add r9, 1;
+        mov [rax], r9;                   // store incremented counter
+
+        // Escalation check 1: AEAD_FAIL + bound identity -> SECURITY.
+        mov r10, 0x1D22;                 // RRW_ERR_AEAD_FAIL
+        cmp r12, r10;
+        jne rf_re_repeat_check;
+
+        // AEAD_FAIL: look up identity.
+        mov rdi, rbx;
+        call _ri_lookup_peer_env;
+        mov r10, 0xFF;                   // RI_SLOT_NONE
+        cmp rax, r10;
+        je  rf_re_repeat_check;
+        // Bound: escalate to SECURITY.
+        mov r13, 2;                      // RF_CLASS_SECURITY
+        jmp rf_re_dispatch;
+
+      rf_re_repeat_check:
+        // Escalation check 2: repeat (counter >= 2) -> FATAL.
+        //
+        // Reload the counter from memory to avoid depending on r9's
+        // live value across the AEAD-branch intermediate calls.
+        mov rax, rbx;
+        shl rax, 3;
+        lea r10, [rip + _rf_pool];
+        add rax, r10;
+        mov r9, [rax];
+        mov r10, 2;
+        cmp r9, r10;
+        jae rf_re_escalate_fatal;
+
+        // Stay TRANSIENT.
+        mov rdi, 0;                      // RF_ST_RECV_TRANSIENT
+        call rf_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rf_tag_recv_ok];
+        lea rcx, [rip + rf_k_cid];
+        mov r8,  rbx;                    // cid
+        call klog_s1_x1;
+
+        xor rax, rax;                    // RF_OK
+        jmp rf_re_out;
+
+      rf_re_escalate_fatal:
+        mov r13, 1;                      // RF_CLASS_FATAL
+
+      rf_re_dispatch:
+        // Dispatch FATAL (1) or SECURITY (2).  Pick stat slot.
+        cmp r13, 2;                      // SECURITY
+        je  rf_re_security;
+
+        // FATAL path.
+        mov rdi, 1;                      // RF_ST_RECV_FATAL
+        call rf_note;
+        jmp rf_re_cascade;
+
+      rf_re_security:
+        mov rdi, 2;                      // RF_ST_RECV_SECURITY
+        call rf_note;
+
+      rf_re_cascade:
+        // Emit RECV OK (handler succeeded; cascade result is separate).
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rf_tag_recv_ok];
+        lea rcx, [rip + rf_k_cid];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        // Call cascade.
+        mov rdi, rbx;                    // conn_id
+        mov rsi, r12;                    // rrw_err
+        mov rdx, r13;                    // class
+        call rf_cascade;
+        // rax now holds cascade result; propagate.
+        jmp rf_re_out;
+
+      rf_re_bad_conn:
+        mov rdi, 4;                      // RF_ST_RECV_BAD_CONN
+        call rf_note;
+
+        mov r12, 0x1D01;                 // RF_ERR_BAD_CONN (reuse r12)
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rf_tag_recv_rej];
+        lea rcx, [rip + rf_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        jmp rf_re_out;
+
+      rf_re_unknown:
+        mov rdi, 3;                      // RF_ST_RECV_UNKNOWN
+        call rf_note;
+
+        mov r12, 0x1D40;                 // RF_ERR_UNKNOWN_CLASS
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rf_tag_recv_rej];
+        lea rcx, [rip + rf_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      rf_re_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _rf_handle_send_err(conn_id, rrw_err) -> errno
+  //
+  // Send-side failure handler.  Same shape as _rf_handle_recv_err but
+  // with SEND stats and the SEND OK/REJ tags.  The classification and
+  // escalation logic is identical: a send-side AEAD failure is just as
+  // significant as a receive-side one (ciphertext we produced that the
+  // peer could not verify, or that our own ChaCha20-Poly1305 seal
+  // returned nonzero).
+  //
+  // ARGS (SysV):   rdi = conn_id, rsi = rrw_err
+  // RETURNS (rax): see _rf_handle_recv_err -- same return set.
+  //
+  // STACK FRAME:   3 pushes (same alignment as recv, call-ready without
+  //                extra sub).
+  //
+  // Labels prefixed rf_se_.
+  // ==========================================================================
+  pub let _rf_handle_send_err : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (conn_id: u64) (rrw_err: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R137.M6 (paideia-os #2638): send-side failure handler. Same classification and escalation shape as _rf_handle_recv_err; different stat slots and SEND OK/REJ tags. (1) rf_check_rs_conn miss -> RF_ERR_BAD_CONN; (2) class = _rf_classify; (3) UNKNOWN -> RF_ERR_UNKNOWN_CLASS; (4) TRANSIENT -> bump _rf_pool counter; escalate to SECURITY on AEAD_FAIL+bound-identity; escalate to FATAL on repeat; else stay TRANSIENT no cascade; (5) FATAL/SECURITY -> cascade. Three callee-save pushes (rbx=conn_id, r12=rrw_err, r13=class). Entry %16==8; +3*8=+24 -> %16==0 at every nested call (no extra sub rsp needed). Encoder-pitfall posture matches _rf_handle_recv_err. Labels prefixed rf_se_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;
+        mov r12, rsi;
+
+        // ---- (1) Validate conn_id ----
+        mov rdi, rbx;
+        call rf_check_rs_conn;
+        cmp rax, 0;
+        je  rf_se_bad_conn;
+
+        // ---- (2) Classify ----
+        mov rdi, r12;
+        call _rf_classify;
+        mov r13, rax;
+
+        // ---- (3) UNKNOWN -> RF_ERR_UNKNOWN_CLASS ----
+        mov r10, 0x1D40;
+        cmp r13, r10;
+        je  rf_se_unknown;
+
+        // ---- (4) TRANSIENT escalation ----
+        cmp r13, 0;                      // RF_CLASS_TRANSIENT
+        jne rf_se_dispatch;
+
+        // Bump counter.
+        mov rax, rbx;
+        shl rax, 3;
+        lea r10, [rip + _rf_pool];
+        add rax, r10;
+        mov r9, [rax];
+        add r9, 1;
+        mov [rax], r9;
+
+        // Escalation 1: AEAD_FAIL + bound identity -> SECURITY.
+        mov r10, 0x1D22;                 // RRW_ERR_AEAD_FAIL
+        cmp r12, r10;
+        jne rf_se_repeat_check;
+
+        mov rdi, rbx;
+        call _ri_lookup_peer_env;
+        mov r10, 0xFF;
+        cmp rax, r10;
+        je  rf_se_repeat_check;
+        mov r13, 2;                      // SECURITY
+        jmp rf_se_dispatch;
+
+      rf_se_repeat_check:
+        // Escalation 2: repeat -> FATAL.
+        mov rax, rbx;
+        shl rax, 3;
+        lea r10, [rip + _rf_pool];
+        add rax, r10;
+        mov r9, [rax];
+        mov r10, 2;
+        cmp r9, r10;
+        jae rf_se_escalate_fatal;
+
+        // Stay TRANSIENT.
+        mov rdi, 5;                      // RF_ST_SEND_TRANSIENT
+        call rf_note;
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rf_tag_send_ok];
+        lea rcx, [rip + rf_k_cid];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        xor rax, rax;                    // RF_OK
+        jmp rf_se_out;
+
+      rf_se_escalate_fatal:
+        mov r13, 1;                      // FATAL
+
+      rf_se_dispatch:
+        cmp r13, 2;
+        je  rf_se_security;
+
+        mov rdi, 6;                      // RF_ST_SEND_FATAL
+        call rf_note;
+        jmp rf_se_cascade;
+
+      rf_se_security:
+        mov rdi, 7;                      // RF_ST_SEND_SECURITY
+        call rf_note;
+
+      rf_se_cascade:
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rf_tag_send_ok];
+        lea rcx, [rip + rf_k_cid];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, r13;
+        call rf_cascade;
+        jmp rf_se_out;
+
+      rf_se_bad_conn:
+        mov rdi, 9;                      // RF_ST_SEND_BAD_CONN
+        call rf_note;
+
+        mov r12, 0x1D01;                 // RF_ERR_BAD_CONN
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rf_tag_send_rej];
+        lea rcx, [rip + rf_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        jmp rf_se_out;
+
+      rf_se_unknown:
+        mov rdi, 8;                      // RF_ST_SEND_UNKNOWN
+        call rf_note;
+
+        mov r12, 0x1D40;                 // RF_ERR_UNKNOWN_CLASS
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rf_tag_send_rej];
+        lea rcx, [rip + rf_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      rf_se_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // BOOT-WIRING NOTE
+  //
+  // No _rf_init is required.  M6 declares no runtime bringup state:
+  // _rf_pool (32 B) and _rf_stats (128 B) are .bss and zero-initialise
+  // at real boot.  No endpoint id is claimed; no svc_register call is
+  // made.
+  //
+  // The three OK fingerprints below need allowlist entries in
+  // tools/verify-fingerprint-coverage.sh because no smoke mode asserts
+  // them at M6 (no production caller yet; the cap-invoke dispatch arm
+  // that would consume the handlers lands in R137.M7):
+  //
+  //   REMOTE_FAILURE RECV OK
+  //   REMOTE_FAILURE SEND OK
+  //   REMOTE_FAILURE CASCADE OK
+  //
+  // See design/shell/remote-failure-discipline.md for the full design.
+  // ==========================================================================
+}
