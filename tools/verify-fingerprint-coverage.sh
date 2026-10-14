@@ -83,6 +83,41 @@ ROOT = sys.argv[1]
 # ---------------------------------------------------------------------------
 
 ALLOWLIST = {
+    # Wave 99 R125.M4 (paideia-os#2594): syscall-entry cap check
+    # integration. SYSCALL CAP_CHECK TABLE OK fires on every boot
+    # from _syscall_rights_table_init in the svc.* bringup cascade.
+    # No smoke mode asserts the gate's boot line because the hard-fail
+    # transition (M5) has not landed; current posture is soft-fail
+    # bridge (missing env → CC_OK). Retires when R125.M5 lands with
+    # an asserting smoke-mode golden.
+    "SYSCALL CAP_CHECK TABLE OK":
+        "Wave 99 R125.M4: src/kernel/core/syscall/cap_check.pdx "
+        "emits this unconditionally on boot via "
+        "_syscall_rights_table_init. Retires when R125.M5 flips the "
+        "bridge posture to hard-fail with an asserting smoke-mode "
+        "golden pinned at the correct boot-order position.",
+
+    # Wave 99 R127.M2 (paideia-os#2598): KIND_SHELL_SESSION
+    # capability. Three fingerprints — INIT fires on boot via the
+    # kind_shell_session table reset; HANDLER OK and MINT OK are
+    # emitted from the cap-invoke dispatch arm (handler) and mint
+    # helper, both only reachable from a userspace caller that holds
+    # a KIND_SHELL_SESSION cap. R127.M3 is the first production
+    # consumer that reaches HANDLER/MINT paths; INIT retires alongside.
+    "KIND_SHELL_SESSION INIT OK":
+        "Wave 99 R127.M2: src/kernel/core/cap/kind_shell_session.pdx "
+        "emits this on boot via kind_shell_session_init. Retires when "
+        "R127.M3 lands production dispatch with an asserting golden.",
+    "KIND_SHELL_SESSION HANDLER OK":
+        "Wave 99 R127.M2: emitted from cap_handler_shell_session. "
+        "Unreachable at M2 (no userspace holds a KIND_SHELL_SESSION "
+        "cap yet; R127.M3 mints the first one). Retires when R127.M3 "
+        "lands.",
+    "KIND_SHELL_SESSION MINT OK":
+        "Wave 99 R127.M2: emitted from kind_shell_session_mint_body. "
+        "Supervisor-only reach; no userspace caller at M2. Retires "
+        "when R127.M3's mint path is wired into a smoke mode.",
+
     # Wave 96 R125.M2 (paideia-os#2592): svc.cap-minter daemon
     # bringup + harness-only derive path. CAP_MINTER INIT OK fires
     # on every boot from _cap_minter_init during the svc.* bringup
