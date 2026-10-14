@@ -1,0 +1,1127 @@
+// src/kernel/core/svc/jail_supervisor.pdx -- Wave UMB-W15 R135.M1
+// paideia-os #2626
+//
+// SVC.JAIL-SUPERVISOR DAEMON: WASI-JAIL CAP-ENV + SYSCALL ALLOWLIST
+// =============================================================================
+//
+// R135 ("WASI-jail: a sandboxed execution environment for WASI /
+// WebAssembly modules running on paideia-os") milestone M1.  M1 adds
+// the kernel-side daemon that OWNS one or more running WASI jails and
+// their per-jail (cap-env slot, syscall allowlist, lifecycle state,
+// display name) tuples.  R135.M2 (follow-on) adds the KIND_JAIL
+// capability + cap_invoke dispatch surface so a ring-3 WASI runtime
+// can bind to its own jail by cap rather than by direct kernel call;
+// M1 lands the daemon substrate and the direct-call API that the
+// syscall dispatch pre-check (M2 integrates) consults every time a
+// jailed task invokes the syscall boundary.
+//
+// Service name:    "svc.jail-supervisor"
+// Endpoint id:     22 (claimed via endpoint_alloc_at; next after
+//                       21 = svc.shell-session)
+// Broker row:      svc_register("svc.jail-supervisor", 19, 22)
+// Direct API:      _jail_supervisor_{init,create,check_syscall,destroy}
+//
+// =============================================================================
+// SECTION 0  WHY A DAEMON INSTEAD OF A PER-TASK FIELD
+// =============================================================================
+//
+// A WASI jail is an aggregate of (pid, cap_env_slot, syscall_mask [128
+// bits], lifecycle state, display name).  Only pid is already on the
+// task struct; the rest are jail-specific and have no obvious home on
+// the task row without widening it for every task that isn't running
+// WASI (99 % of them, at WASI-jail bringup).  A dedicated row pool
+// keyed by jail_id keeps the WASI state off the task hot path and
+// gives R135.M2 a stable id (jail_id in [0, 8)) to mint KIND_JAIL
+// capabilities against.
+//
+// Shape mirrors `svc.shell-session` (R127.M1, shell_session.pdx) one-
+// for-one: a bringup entry that claims a specific endpoint via
+// endpoint_alloc_at + svc_register, a small row pool with a linear
+// scan for find-free, and a direct-call API for in-kernel callers
+// that is lifted to a cap_invoke dispatch surface in the next
+// milestone.
+//
+// =============================================================================
+// SECTION 1  ROW LAYOUT  --  128 BYTES PER ROW, 8 ROWS
+// =============================================================================
+//
+// Each row is 128 bytes = 16 u64.  Stride 128 is a power of two so row
+// addressing uses `shl rax, 7` -- no imul (feedback_pdx_encoder_
+// pitfalls: 2-op `imul r, imm` is an encoder gap).
+//
+//   [+0]    pid                 (u64)  owning process pid (0 is reserved;
+//                                       pid==0 at mint time refuses with
+//                                       JS_ERR_BAD_PID so a zero pid can
+//                                       never match a live row at
+//                                       check_syscall time)
+//   [+8]    cap_env_slot        (u64)  env_handle of the cap-env the
+//                                       jailed WASI module launched
+//                                       under (R125.M1 KIND_CAP_ENV
+//                                       row index -- NOT validated at
+//                                       this layer; the shell-side
+//                                       jail launcher is the trusting
+//                                       party.  R135.M3 may add a
+//                                       validator pass once KIND_JAIL
+//                                       mints land)
+//   [+16]   syscall_mask_lo     (u64)  bits 0..63 of the syscall
+//                                       allowlist; bit N = sysno N
+//                                       allowed
+//   [+24]   syscall_mask_hi     (u64)  bits 64..127
+//   [+32]   state (u32) + flags (u32)  stored as one u64 store.  Low
+//                                       32 bits = state (JS_STATE_*);
+//                                       high 32 bits reserved for a
+//                                       future flag word (R135.M2 may
+//                                       repurpose for a KIND_JAIL
+//                                       rights-mask mirror; today
+//                                       written as zero)
+//   [+40]   name[ 0.. 7]        (u64 word; 8 raw bytes of display name)
+//   [+48]   name[ 8..15]        (u64 word)
+//   [+56]   name[16..23]        (u64 word)
+//   [+64]   name[24..31]        (u64 word)
+//   [+72]   name[32..39]        (u64 word)
+//   [+80]   name[40..47]        (u64 word)
+//   [+88]   name[48..55]        (u64 word)
+//   [+96]   name[56..63]        (u64 word -- 64 total name bytes, the
+//                                       last byte reserved for a
+//                                       trailing NUL so the max usable
+//                                       name length is 63)
+//   [+104]  reserved            (u64)  slack for R135.M2 (anticipated
+//                                       to carry a creation tick, or
+//                                       the parent jail_id for a
+//                                       nested-sandbox mode once that
+//                                       landing exists)
+//   [+112]  in_use              (u64)  0 = row free, 1 = row allocated.
+//                                       .bss zero-init gives us the
+//                                       FREE sentinel for free at real
+//                                       boot
+//   [+120]  reserved            (u64)  slack for R135.M2 (expected to
+//                                       hold the KIND_JAIL rights
+//                                       mask once the cap-invoke arm
+//                                       lands)
+//
+// Row-addressed capacity: JS_POOL_MAX = 8 jails.  8 x 128 = 1024
+// bytes = 128 u64.  The `in_use` field at +112 (not pid) is the
+// authoritative free/live gate.  Pid==0 is still rejected at mint
+// time to keep the "pid is a positive integer" invariant honest and
+// to guarantee check_syscall's zero-pid fast path cannot shadow a
+// genuine jail row.
+//
+// =============================================================================
+// SECTION 2  SYSCALL ALLOWLIST SEMANTICS
+// =============================================================================
+//
+// `syscall_mask` is a 128-bit bitmask over sysnos 0..127; bit N
+// (counted from the low end, split across two u64 halves) indicates
+// that sysno N is PERMITTED for this jail.  check_syscall(pid, sysno)
+// returns one of three outcomes:
+//
+//   (a) pid is not in the pool  -> JS_OK (pass-through; this process
+//                                   is not jailed)
+//   (b) pid IS jailed, sysno < 128, bit is SET      -> JS_OK
+//   (c) pid IS jailed, sysno >= 128 or bit is CLEAR -> JS_ERR_SYSCALL_DENIED
+//
+// Case (c)'s "sysno >= 128" bucket is a FAIL-CLOSED decision: the
+// dispatch dispatch table (R125.M4) currently indexes sysnos in
+// [0, 137]; sysnos [128, 137] are the audit-journal / IPC-reply
+// outliers that a WASI jail has no business reaching, and allowing
+// them because the mask doesn't cover their index would be a trivial
+// escape.  R135.M3 may lift the mask width (to 256 bits or an
+// explicit extension word) if a jailed WASI runtime needs to reach
+// a sysno in that range; today the strict-closed posture matches the
+// "WASI by default sees a POSIX-shaped tiny universe" design bias
+// (feedback_novel_clean_design: WASI is intentionally narrower than
+// POSIX, not a POSIX inheritance).
+//
+// The AUTHORITATIVE wire-up (jail check happens AFTER cap-check, so a
+// jailed caller still cannot invoke a syscall they lack the capability
+// for, independent of what the mask admits):
+//
+//   syscall_dispatch
+//     \_ cap-check preamble            (R125.M4; refuses if cap missing)
+//     \_ jail-check preamble           (R135.M2; this file at M1)
+//     \_ main bounds check + handler
+//
+// The order is deliberate: cap-check is cheaper (table lookup against
+// _syscall_rights_table) than a jail scan, so an un-capped caller is
+// refused before we touch the jail pool.  A caller that has the cap
+// but is jailed out of that sysno is refused by the jail-check.
+//
+// =============================================================================
+// SECTION 3  STATE MACHINE
+// =============================================================================
+//
+// R135.M1 states (name = ordinal):
+//
+//   INIT       = 0   -- freshly created, WASI module not yet handed
+//                        the entry point
+//   ACTIVE     = 1   -- WASI module executing
+//   TERMINATED = 2   -- post-exit; row stays live until _destroy is
+//                        called so the launcher parent can scrape
+//                        exit status
+//
+// Transitions at M1 are permissive (any state X -> any state Y with
+// Y < JS_STATE_MAX = 3) because _jail_supervisor_set_state is not
+// yet part of the M1 public API (reserved for R135.M2).  The state
+// field is written to the INIT ordinal at mint time; subsequent
+// writes land with R135.M2 alongside the KIND_JAIL set-state op.
+//
+// =============================================================================
+// SECTION 4  RETURN CODE BAND
+// =============================================================================
+//
+// Per task directive:
+//
+//   JS_OK                 = 0
+//   JS_ERR_POOL_FULL      = 0x1500
+//   JS_ERR_BAD_ID         = 0x1501
+//   JS_ERR_SYSCALL_DENIED = 0x1502
+//   JS_ERR_BAD_PID        = 0x1503
+//
+// All fit imm32 with bit 31 clear so `mov rax, imm32` emits the
+// 7-byte zero-extending form (never `and r11, imm64`).  Band audit
+// (2026-10-13):
+//   `grep -rnE '0x150[0-3]\b' src/kernel/ 2>/dev/null` -> zero hits
+// in the production tree.  Clean band; R135.M2+ may extend to
+// 0x1504..0x150F while retaining the first four as pinned.
+//
+// _jail_supervisor_create returns a PACKED u64:
+//
+//     result = (jail_id << 2) | status
+//
+// On success status == JS_OK (0), so result == jail_id << 2 and the
+// caller recovers jail_id by right-shifting 2 bits.  Jail ids live
+// in [0, 8), so jail_id << 2 is in [0, 32) -- disjoint from every
+// JS_ERR_* value (all >= 0x1500) so a caller that treats the whole
+// u64 as an error-or-id tagged value never collides.  On error
+// jail_id is 0, so result == status.
+//
+// _jail_supervisor_check_syscall and _jail_supervisor_destroy return
+// JS_OK or an JS_ERR_* code directly (not packed).
+//
+// Bringup codes (adjacent to shell_session's EBD2/EBD3 pair in the
+// free EBC8..EBDF band; shell_session takes D2/D3 so jail_supervisor
+// takes D4/D5):
+//
+//   JS_BRINGUP_EP_FAIL  = 0xFFFFEBD4  (endpoint_alloc_at(22) refused)
+//   JS_BRINGUP_REG_FAIL = 0xFFFFEBD5  (svc_register refused)
+//
+// =============================================================================
+// SECTION 5  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Labels are prefixed `js_` (jail-supervisor) to stay clear of `ss_`
+// (svc/shell_session.pdx), `cmnt_` (svc/cap_minter.pdx), `ks_` (cap/
+// kind_shell_session.pdx) and the broader `s_` family.  No reserved
+// paideia-as keyword overlap (reserved: loop / if / let).  Encoder-
+// pitfall posture (feedback_pdx_encoder_pitfalls):
+//
+//   * cmp rN, 0            (never `test rN, rN`)
+//   * shl rN, 7 to compose row-base * 128 stride (never `imul r, imm`)
+//   * shl rN, cl           (variable-shift for syscall-mask bit test)
+//   * mov rax, imm32       (never `and r11, imm64`)
+//   * single-line `pub let name = "..."`
+//   * module basename JailSupervisor matches file basename
+//     jail_supervisor.pdx (ddc requires exact match)
+//   * fingerprint `[u8; N]` with N = string length + 1 (NUL counts)
+//
+// Stack discipline (SysV, entry rsp%16==8):
+//   _jail_supervisor_init           1 push  (r12 across the klog call)
+//   _jail_supervisor_lookup         0 pushes (pure leaf scan)
+//   _jail_supervisor_create         5 pushes + sub rsp, 16
+//                                     (name_ptr/name_len spill)
+//   _jail_supervisor_check_syscall  2 pushes + sub rsp, 8
+//                                     (klog_s1_x2 stack-arg slot)
+//   _jail_supervisor_destroy        1 push  (rbx)
+//
+// =============================================================================
+// SECTION 6  BOOT WIRING NOTE
+// =============================================================================
+//
+// kernel_main.pdx picks this up with ONE new call after
+// _shell_session_init and BEFORE witness_r30_platform:
+//
+//   call _cap_minter_init;           // ENDPOINT 20, R125.M2
+//   call _syscall_rights_table_init; // R125.M4 cap-check table
+//   call _shell_session_init;        // ENDPOINT 21, R127.M1
+//   call _jail_supervisor_init;      // ENDPOINT 22, R135.M1 (this file)
+//   call witness_r30_platform;       // R30 platform witness cascade
+//
+// Placement rationale: AFTER the three svc.* bringups (so the broker
+// table has elevate / audit / schema / cap-minter / shell-session
+// rows published before the jail supervisor registers) and BEFORE
+// witness_r30_platform (so a future platform witness that spins up a
+// WASI jail task sees the svc.jail-supervisor row).
+//
+// Dispatch arm reservation:
+//
+// At R135.M1 there is NO cap_invoke dispatch arm for KIND_JAIL.
+// Named-IPC callers (if any arrive before R135.M2) route through the
+// broker:
+//
+//   endpoint_id = svc_lookup("svc.jail-supervisor")  (= 22)
+//   send CREATE / CHECK_SYSCALL / DESTROY frame to endpoint_id,
+//   receive REPLY
+//
+// The frame-body dispatcher is landed by R135.M2 alongside the
+// KIND_JAIL kind registration.  The direct-call API below is the
+// in-kernel surface the WASI-jail launcher task uses before the
+// cap-invoke surface lands.
+//
+// =============================================================================
+
+module JailSupervisor = structure {
+
+  // ==========================================================================
+  // Service identity
+  // ==========================================================================
+
+  pub let JAIL_SUPERVISOR_ENDPOINT_ID : u64 = 22
+  pub let JAIL_SUPERVISOR_NAME_LEN    : u64 = 19   // "svc.jail-supervisor" is 19 bytes
+
+  // "svc.jail-supervisor" (19 chars) + NUL => [u8; 20].
+  pub let jail_supervisor_name : [u8; 20] = "svc.jail-supervisor\0"
+
+  // ==========================================================================
+  // Return band (task-pinned, §4)
+  // ==========================================================================
+
+  pub let JS_OK                 : u64 = 0
+  pub let JS_ERR_POOL_FULL      : u64 = 0x1500
+  pub let JS_ERR_BAD_ID         : u64 = 0x1501
+  pub let JS_ERR_SYSCALL_DENIED : u64 = 0x1502
+  pub let JS_ERR_BAD_PID        : u64 = 0x1503
+
+  pub let JS_BRINGUP_EP_FAIL  : u64 = 0xFFFFEBD4
+  pub let JS_BRINGUP_REG_FAIL : u64 = 0xFFFFEBD5
+
+  // ==========================================================================
+  // Pool geometry (§1)
+  // ==========================================================================
+
+  pub let JS_POOL_MAX   : u64 = 8     // rows (jails)
+  pub let JS_ROW_BYTES  : u64 = 128   // 16 u64 per row
+
+  // Row-field offsets (bytes, from row base)
+  pub let JS_OFF_PID         : u64 = 0
+  pub let JS_OFF_CAP_ENV     : u64 = 8
+  pub let JS_OFF_MASK_LO     : u64 = 16
+  pub let JS_OFF_MASK_HI     : u64 = 24
+  pub let JS_OFF_STATE       : u64 = 32
+  pub let JS_OFF_NAME        : u64 = 40
+  pub let JS_OFF_RESERVED_A  : u64 = 104
+  pub let JS_OFF_IN_USE      : u64 = 112
+  pub let JS_OFF_RESERVED_B  : u64 = 120
+
+  pub let JS_NAME_MAX   : u64 = 63    // 64 bytes with trailing NUL
+
+  // Sysno maskable range (bit N for sysno N, N in [0, 128)).
+  pub let JS_SYSNO_MAX  : u64 = 128
+
+  // Sentinel for "no jail matched" (lookup).
+  pub let JS_ID_NONE : u64 = 0xFF
+
+  // State machine (§3)
+  pub let JS_STATE_INIT       : u64 = 0
+  pub let JS_STATE_ACTIVE     : u64 = 1
+  pub let JS_STATE_TERMINATED : u64 = 2
+  pub let JS_STATE_MAX        : u64 = 3   // exclusive upper bound
+
+  // ==========================================================================
+  // Storage
+  //
+  //   _jail_supervisor_pool  -- 8 rows x 128 bytes = 128 u64. @align(64)
+  //                             puts the pool start on a cache-line
+  //                             boundary (rows 0, 2, 4, 6 land on cache
+  //                             line starts; the 128 stride is a power
+  //                             of two so no imul is needed).
+  //   _jail_supervisor_stats -- 16 u64 counters (observability).
+  // ==========================================================================
+
+  pub let mut _jail_supervisor_pool  : [u64; 128] = uninit @align(64)
+  pub let mut _jail_supervisor_stats : [u64; 16]  = uninit @align(64)
+
+  pub let JS_ST_INIT_OK            : u64 = 0
+  pub let JS_ST_INIT_EP_FAIL       : u64 = 1
+  pub let JS_ST_INIT_REG_FAIL      : u64 = 2
+  pub let JS_ST_CREATE_OK          : u64 = 3
+  pub let JS_ST_CREATE_FULL        : u64 = 4
+  pub let JS_ST_CREATE_BAD_PID     : u64 = 5
+  pub let JS_ST_CHECK_PASSTHROUGH  : u64 = 6
+  pub let JS_ST_CHECK_OK           : u64 = 7
+  pub let JS_ST_CHECK_DENIED       : u64 = 8
+  pub let JS_ST_DESTROY_OK         : u64 = 9
+  pub let JS_ST_DESTROY_REJ        : u64 = 10
+
+  // ==========================================================================
+  // Fingerprint tags (N = len(string) + 1, NUL-inclusive)
+  //
+  // Only the "OK" tags are extracted by the fingerprint-coverage gate
+  // (regex matches bare word OK); the FAIL/REJ tags are opaque to the
+  // gate so no allowlist entry is required for them.  Note that
+  // "DENIED OK" is intentional -- the DENIED tag emits on the deny
+  // path (a jail REFUSAL is the daemon's expected business outcome,
+  // so emitting "OK" over the klog is the honest wording from the
+  // supervisor's point of view).
+  // ==========================================================================
+
+  // "JAIL_SUPERVISOR INIT OK"    = 23 chars, +1 NUL => N=24
+  // "JAIL_SUPERVISOR INIT FAIL"  = 25 chars, +1 NUL => N=26
+  // "JAIL_SUPERVISOR CREATE OK"  = 25 chars, +1 NUL => N=26
+  // "JAIL_SUPERVISOR CREATE REJ" = 26 chars, +1 NUL => N=27
+  // "JAIL_SUPERVISOR DENIED OK"  = 25 chars, +1 NUL => N=26
+  // "JAIL_SUPERVISOR DESTROY OK"  = 26 chars, +1 NUL => N=27
+  // "JAIL_SUPERVISOR DESTROY REJ" = 27 chars, +1 NUL => N=28
+
+  pub let js_tag_init_ok     : [u8; 24] = "JAIL_SUPERVISOR INIT OK\0"
+  pub let js_tag_init_fail   : [u8; 26] = "JAIL_SUPERVISOR INIT FAIL\0"
+  pub let js_tag_create_ok   : [u8; 26] = "JAIL_SUPERVISOR CREATE OK\0"
+  pub let js_tag_create_rej  : [u8; 27] = "JAIL_SUPERVISOR CREATE REJ\0"
+  pub let js_tag_denied_ok   : [u8; 26] = "JAIL_SUPERVISOR DENIED OK\0"
+  pub let js_tag_destroy_ok  : [u8; 27] = "JAIL_SUPERVISOR DESTROY OK\0"
+  pub let js_tag_destroy_rej : [u8; 28] = "JAIL_SUPERVISOR DESTROY REJ\0"
+
+  pub let js_k_pid    : [u8; 4] = "pid\0"
+  pub let js_k_jid    : [u8; 4] = "jid\0"
+  pub let js_k_sysno  : [u8; 6] = "sysno\0"
+  pub let js_k_errno  : [u8; 6] = "errno\0"
+
+  // ==========================================================================
+  // js_note(slot) -> ()
+  //
+  // Bounded increment on _jail_supervisor_stats[slot].  Same shape as
+  // ss_note / cmnt_note (load-inc-store; no `add reg, [mem]`).  Caller
+  // passes an JS_ST_* ordinal in [0, 16); out-of-range slots silently
+  // no-op.  Pure leaf -- no pushes.  Labels prefixed js_no_.
+  // ==========================================================================
+  pub let js_note : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M1 (paideia-os #2626): bounded increment on _jail_supervisor_stats[slot<16]. Load-inc-store, no `add reg,[mem]`. Pure leaf -- no pushes. Labels prefixed js_no_. Mirrors ss_note / cmnt_note shape.",
+      block: {
+        cmp rdi, 16;
+        jae js_no_out;
+        lea r10, [rip + _jail_supervisor_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      js_no_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // js_row_base(jail_id) -> &_jail_supervisor_pool[jail_id*128]
+  //
+  // Row index -> row base pointer.  Stride 128 = 2^7 so `shl rax, 7`
+  // suffices (no `imul r, imm` encoder gap, no reg-reg staging).
+  // Caller validates jail_id < JS_POOL_MAX first; this helper is a
+  // pure address compute.
+  // ==========================================================================
+  pub let js_row_base : (u64) -> u64 !{} @{} =
+    fn (jail_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R135.M1 (paideia-os #2626): jail_id -> &_jail_supervisor_pool[jail_id*128]. Power-of-two stride uses `shl rax, 7` so no 2-op imul-with-imm is required. No bounds check by policy -- caller validates. Labels prefixed js_rb_.",
+      block: {
+        mov rax, rdi;                    // jail_id
+        shl rax, 7;                      // jail_id * 128
+        lea r10, [rip + _jail_supervisor_pool];
+        add rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // js_row_in_use(jail_id) -> 1 iff jail_id<JS_POOL_MAX AND row.in_use != 0
+  //
+  // Validator used by destroy.  Inlined row-base compute (shl 7).
+  // Pure leaf -- no pushes, no nested calls.
+  // ==========================================================================
+  pub let js_row_in_use : (u64) -> u64 !{mem} @{} =
+    fn (jail_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M1 (paideia-os #2626): 1 iff jail_id<JS_POOL_MAX(8) AND row.in_use (word at [+112]) != 0. Inlined address compute (shl 7). Pure leaf. Labels prefixed js_ru_. Mirrors ss_row_in_use.",
+      block: {
+        mov r10, 8;                      // JS_POOL_MAX
+        cmp rdi, r10;
+        jae js_ru_no;
+        mov rax, rdi;
+        shl rax, 7;                      // jail_id * 128
+        lea r10, [rip + _jail_supervisor_pool];
+        add rax, r10;                    // row base
+        mov r10, [rax + 112];            // in_use field
+        cmp r10, 0;
+        je  js_ru_no;
+        mov rax, 1;
+        ret;
+      js_ru_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // js_find_free() -> jail_id | JS_ID_NONE
+  //
+  // Linear scan for the first row whose in_use field is zero.  Used
+  // only by _jail_supervisor_create.  Pure leaf (row-base is inlined).
+  // ==========================================================================
+  pub let js_find_free : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M1 (paideia-os #2626): linear scan _jail_supervisor_pool[0..JS_POOL_MAX) for the first row whose in_use (word at [+112]) is zero. Return jail_id or JS_ID_NONE (0xFF). Inlined row-base (shl 7). Pure leaf -- no pushes. Labels prefixed js_ff_. Mirrors ss_find_free.",
+      block: {
+        lea r10, [rip + _jail_supervisor_pool];
+        xor rcx, rcx;                    // jail_id cursor
+      js_ff_scan:
+        cmp rcx, 8;                      // JS_POOL_MAX
+        jae js_ff_none;
+
+        mov rax, rcx;
+        shl rax, 7;                      // jail_id * 128
+        add rax, r10;                    // row base
+        mov r11, [rax + 112];            // in_use
+        cmp r11, 0;
+        je  js_ff_hit;
+
+        add rcx, 1;
+        jmp js_ff_scan;
+
+      js_ff_hit:
+        mov rax, rcx;
+        ret;
+
+      js_ff_none:
+        mov rax, 0xFF;                   // JS_ID_NONE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _jail_supervisor_lookup(pid) -> jail_id | JS_ID_NONE
+  //
+  // Scan for the first row whose in_use==1 AND pid matches the
+  // argument.  Returns jail_id in [0, 8) on hit, JS_ID_NONE (0xFF)
+  // on miss.  pid==0 is reserved and never produces a hit (any row
+  // with pid==0 is a programming error since _jail_supervisor_create
+  // refuses such rows with JS_ERR_BAD_PID).
+  //
+  // Internal (not called from the task-pinned public API list); used
+  // by _jail_supervisor_create for duplicate detection.  Pure leaf --
+  // no pushes, no nested calls.  Labels prefixed js_lu_.
+  // ==========================================================================
+  pub let _jail_supervisor_lookup : (u64) -> u64 !{mem} @{} =
+    fn (pid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M1 (paideia-os #2626): scan _jail_supervisor_pool[0..JS_POOL_MAX) for the first row whose in_use (word at [+112]) is 1 AND pid (word at [+0]) matches rdi. Return jail_id (0..7) or JS_ID_NONE (0xFF) on miss. pid==0 can never match a live row because _jail_supervisor_create refuses pid==0 at mint time. Inlined row-base (shl 7). Pure leaf -- no callee-save pushes, no nested calls. Labels prefixed js_lu_. Mirrors _shell_session_lookup.",
+      block: {
+        lea r10, [rip + _jail_supervisor_pool];
+        xor rcx, rcx;                    // jail_id cursor
+      js_lu_scan:
+        cmp rcx, 8;                      // JS_POOL_MAX
+        jae js_lu_none;
+
+        mov rax, rcx;
+        shl rax, 7;                      // jail_id * 128
+        add rax, r10;                    // row base
+
+        // Row must be in_use.
+        mov r11, [rax + 112];
+        cmp r11, 0;
+        je  js_lu_next;
+
+        // pid must match.
+        mov r11, [rax + 0];
+        cmp r11, rdi;
+        je  js_lu_hit;
+
+      js_lu_next:
+        add rcx, 1;
+        jmp js_lu_scan;
+
+      js_lu_hit:
+        mov rax, rcx;
+        ret;
+
+      js_lu_none:
+        mov rax, 0xFF;                   // JS_ID_NONE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _jail_supervisor_init() -> JS_OK | JS_BRINGUP_*
+  //
+  // Boot hook.  Shape mirrors _shell_session_init one-for-one:
+  //   (1) endpoint_alloc_at(22).  On refusal -> JS_BRINGUP_EP_FAIL
+  //       WITHOUT calling svc_register (the row never publishes a
+  //       name against an endpoint id we did not claim).
+  //   (2) svc_register("svc.jail-supervisor", 19, 22).  Any non-zero
+  //       code (NAME_LEN / DUP / FULL) maps to JS_BRINGUP_REG_FAIL.
+  //
+  // Register plan: 1 callee-save push (r12 holds the bringup code
+  // across klog) to correct entry parity rsp%16==8 -> 0 for the two
+  // sibling (non-nested) calls, matching _shell_session_init /
+  // _cap_minter_init / schema_registry_bringup shape.
+  //
+  // Fingerprint emission:
+  //   On success:  `JAIL_SUPERVISOR INIT OK` (no KV).
+  //   On EP fail:  `JAIL_SUPERVISOR INIT FAIL errno=0x<hex>` with EP_FAIL.
+  //   On REG fail: `JAIL_SUPERVISOR INIT FAIL errno=0x<hex>` with REG_FAIL.
+  // ==========================================================================
+  pub let _jail_supervisor_init : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R135.M1 (paideia-os #2626): kernel-side bringup for svc.jail-supervisor. Claims JAIL_SUPERVISOR_ENDPOINT_ID (22) via endpoint_alloc_at; on refusal returns JS_BRINGUP_EP_FAIL WITHOUT calling svc_register. On successful claim, calls svc_register(jail_supervisor_name, 19, 22) and translates its {0=OK, 1=NAME_LEN, 2=DUP, 3=FULL} return into JS_OK / JS_BRINGUP_REG_FAIL. Single callee-save push (r12) corrects entry parity rsp%16==8 -> 0 for the two sibling (non-nested) calls, matching _shell_session_init / _cap_minter_init / schema_registry_bringup / elevate_broker_bringup one-for-one. Bumps JS_ST_INIT_OK / INIT_EP_FAIL / INIT_REG_FAIL and emits one fingerprint. Labels prefixed js_in_.",
+      block: {
+        push r12;
+
+        // (1) endpoint_alloc_at(22).
+        mov rdi, 22;                     // JAIL_SUPERVISOR_ENDPOINT_ID
+        call endpoint_alloc_at;
+        cmp rax, 0;
+        jne js_in_ep_fail;
+
+        // (2) svc_register("svc.jail-supervisor", 19, 22).
+        lea rdi, [rip + jail_supervisor_name];
+        mov rsi, 19;                     // JAIL_SUPERVISOR_NAME_LEN
+        mov rdx, 22;                     // endpoint id
+        call svc_register;
+        cmp rax, 0;
+        jne js_in_reg_fail;
+
+        // Success path.
+        mov rdi, 0;                      // JS_ST_INIT_OK
+        call js_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + js_tag_init_ok];
+        call klog_s1;
+
+        xor rax, rax;                    // JS_OK
+        pop r12;
+        ret;
+
+      js_in_ep_fail:
+        mov rdi, 1;                      // JS_ST_INIT_EP_FAIL
+        call js_note;
+
+        mov r12, 0xFFFFEBD4;             // JS_BRINGUP_EP_FAIL
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + js_tag_init_fail];
+        lea rcx, [rip + js_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        pop r12;
+        ret;
+
+      js_in_reg_fail:
+        mov rdi, 2;                      // JS_ST_INIT_REG_FAIL
+        call js_note;
+
+        mov r12, 0xFFFFEBD5;             // JS_BRINGUP_REG_FAIL
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + js_tag_init_fail];
+        lea rcx, [rip + js_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _jail_supervisor_create(pid, cap_env_slot,
+  //                         syscall_mask_lo, syscall_mask_hi,
+  //                         name_ptr, name_len) -> packed u64
+  //
+  // Mint a fresh jail row.
+  //
+  // ARGS (SysV):
+  //   rdi = pid              (must be non-zero)
+  //   rsi = cap_env_slot     (opaque; validated at R125.M1 layer)
+  //   rdx = syscall_mask_lo  (bits 0..63 of the allowlist)
+  //   rcx = syscall_mask_hi  (bits 64..127)
+  //   r8  = name_ptr         (readable up to name_len bytes; may be
+  //                           0 iff name_len is 0)
+  //   r9  = name_len         (clamped to JS_NAME_MAX = 63; the +64th
+  //                           byte is reserved for the trailing NUL)
+  //
+  // RETURNS (rax):
+  //   On success:  (jail_id << 2) | JS_OK  (JS_OK=0, so just
+  //                jail_id * 4; recoverable via `shr rax, 2`)
+  //   JS_ERR_BAD_PID    -- pid == 0, or a live row already holds this pid
+  //   JS_ERR_POOL_FULL  -- all 8 rows are in use
+  //
+  // STEP-BY-STEP:
+  //   1. pid != 0 -> else JS_ERR_BAD_PID.
+  //   2. _jail_supervisor_lookup(pid) != JS_ID_NONE -> JS_ERR_BAD_PID
+  //      (duplicate; a pid can own at most one jail).
+  //   3. js_find_free() -> jail_id.  If JS_ID_NONE -> JS_ERR_POOL_FULL.
+  //   4. Init row:
+  //        pid               <- rdi
+  //        cap_env_slot      <- rsi
+  //        syscall_mask_lo   <- rdx
+  //        syscall_mask_hi   <- rcx
+  //        state (u64)       <- 0 (JS_STATE_INIT in low 32; flags 0 in high 32)
+  //        name[0..63]       <- byte-copy up to min(name_len, 63); NUL at
+  //                             byte min(name_len, 63)
+  //        in_use            <- 1 (LAST write)
+  //   5. Bump JS_ST_CREATE_OK; emit `JAIL_SUPERVISOR CREATE OK pid=0x<hex>`.
+  //   6. Return (jail_id << 2) | JS_OK.
+  //
+  // STACK FRAME:
+  //   5 callee-save pushes + sub rsp, 16.  Entry rsp%16==8; +5 pushes
+  //   = +40 -> %16==0; sub rsp, 16 = +56 -> %16==0 (call-ready at
+  //   every nested call AND two spill slots).
+  //
+  //   REGISTER MAP:
+  //     rbx = pid                 (held across every nested call)
+  //     r12 = cap_env_slot
+  //     r13 = syscall_mask_lo
+  //     r14 = syscall_mask_hi
+  //     r15 = jail_id             (after allocation)
+  //     [rsp+0] = name_ptr        (spill; preserved across lookup / find_free)
+  //     [rsp+8] = name_len        (unclamped; clamped on reload)
+  //
+  //   NAME COPY:
+  //     After allocation we recover jail_id, compute row_base via
+  //     shl 7, and bulk-write the fixed fields.  The name byte copy
+  //     is a short loop (name_len <= 63) using `mov_b` which the
+  //     paideia-as encoder emits.  NUL is written at [name_base +
+  //     clamped_len].
+  //
+  //   Labels prefixed js_cr_.
+  // ==========================================================================
+  pub let _jail_supervisor_create : (u64, u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (pid: u64) (cap_env_slot: u64) (syscall_mask_lo: u64) (syscall_mask_hi: u64) (name_ptr: u64) (name_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R135.M1 (paideia-os #2626): mint a fresh jail row. Validate pid != 0 (JS_ERR_BAD_PID), lookup-by-pid for duplicate detection (JS_ERR_BAD_PID), find a free row (JS_ERR_POOL_FULL on none), write fixed fields pid/cap_env_slot/mask_lo/mask_hi/state=INIT, byte-copy up to min(name_len, 63) bytes from name_ptr with a trailing NUL, set in_use=1 LAST so a concurrent scanner either sees FREE or fully-initialised, bump JS_ST_CREATE_OK, emit `JAIL_SUPERVISOR CREATE OK pid=0x<16-hex>` via klog_s1_x1 (5-reg wrapper), and return (jail_id << 2) | JS_OK. Five callee-save pushes (rbx=pid, r12=cap_env_slot, r13=mask_lo, r14=mask_hi, r15=jail_id after alloc) + sub rsp,16 (two 8-byte spill slots for name_ptr and unclamped name_len). Entry rsp%16==8; +5 pushes = +40 -> %16==0; sub rsp,16 = +56 -> %16==0 at every nested call. Byte copy uses mov_b scalar-indexed addressing proven in shell_session.pdx ss_cr_name_loop / svc_broker.pdx / path.pdx. Encoder-pitfall posture: cmp rN, 0 (never test), shl rN, 7 for stride-128 (never imul), mov rax, imm32 for all error codes (never and r11, imm64). Labels prefixed js_cr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;
+
+        mov rbx, rdi;                    // pid
+        mov r12, rsi;                    // cap_env_slot
+        mov r13, rdx;                    // syscall_mask_lo
+        mov r14, rcx;                    // syscall_mask_hi
+        mov [rsp + 0], r8;               // name_ptr (spill)
+        mov [rsp + 8], r9;               // name_len unclamped (spill)
+
+        // ---- Step 1: pid != 0 ----
+        cmp rbx, 0;
+        je  js_cr_bad_pid;
+
+        // ---- Step 2: duplicate check ----
+        mov rdi, rbx;
+        call _jail_supervisor_lookup;
+        mov r11, 0xFF;                   // JS_ID_NONE
+        cmp rax, r11;
+        jne js_cr_bad_pid;               // existing jail for this pid
+
+        // ---- Step 3: find free row ----
+        call js_find_free;
+        mov r11, 0xFF;
+        cmp rax, r11;
+        je  js_cr_full;
+
+        mov r15, rax;                    // r15 = jail_id
+
+        // Compute row base.  jail_id << 7 + pool base.
+        mov rax, r15;
+        shl rax, 7;
+        lea r10, [rip + _jail_supervisor_pool];
+        add rax, r10;                    // rax = row base
+        // Keep row base in r10.
+        mov r10, rax;
+
+        // ---- Step 4: write fixed fields ----
+        mov [r10 + 0],   rbx;            // pid
+        mov [r10 + 8],   r12;            // cap_env_slot
+        mov [r10 + 16],  r13;            // syscall_mask_lo
+        mov [r10 + 24],  r14;            // syscall_mask_hi
+        xor r9,  r9;
+        mov [r10 + 32],  r9;             // state (low 32) + flags (high 32) = 0
+
+        // ---- Name copy ----
+        // Reload name_ptr (r14-shadow) and name_len (r11) from spill
+        // slots; r12..r14 are now free since fields are written.
+        mov r14, [rsp + 0];              // name_ptr
+        mov r11, [rsp + 8];              // name_len (unclamped)
+
+        // Clamp name_len to JS_NAME_MAX (63).
+        mov r9, 63;                      // JS_NAME_MAX
+        cmp r11, r9;
+        jbe js_cr_len_ok;
+        mov r11, r9;                     // clamp to 63
+      js_cr_len_ok:
+
+        // Pre-advance dst pointer by 40 (JS_OFF_NAME) to sidestep the
+        // unsupported `mov_b [reg+reg*1+off], reg` store form (repo-
+        // wide: only [reg+reg*1] and [reg+off] byte-write forms are
+        // encoded; see shell_session.pdx ss_cr_name_loop comment).
+        // r9 = pre-advanced name dst pointer.
+        mov r9, r10;
+        add r9, 40;                      // r9 = &row.name[0]
+
+        // r11 = clamped name_len.  Loop i = 0 .. r11.
+        xor rcx, rcx;                    // i = 0
+      js_cr_name_loop:
+        cmp rcx, r11;
+        jae js_cr_name_done;
+
+        xor rax, rax;
+        mov_b rax, [r14 + rcx * 1];      // src byte
+        mov_b [r9 + rcx * 1], rax;       // dst byte at name[i]
+        add rcx, 1;
+        jmp js_cr_name_loop;
+
+      js_cr_name_done:
+        // Write NUL at [name + clamped_len].  Even if clamped_len==63
+        // this writes the 64th name byte -- in-bounds (name field spans
+        // [+40..+104), 64 bytes total).
+        xor rax, rax;
+        mov_b [r9 + rcx * 1], rax;
+
+        // in_use = 1 (make the row observable last so a concurrent
+        // scanner either sees FREE or fully-initialised).  r9 reused
+        // here is harmless -- the name-copy loop is complete.
+        mov r9, 1;
+        mov [r10 + 112], r9;
+
+        // ---- Step 5: stats + fingerprint ----
+        mov rdi, 3;                      // JS_ST_CREATE_OK
+        call js_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + js_tag_create_ok];
+        lea rcx, [rip + js_k_pid];
+        mov r8,  rbx;                    // pid in hex KV
+        call klog_s1_x1;
+
+        // ---- Step 6: packed return ----
+        //   result = (jail_id << 2) | JS_OK = jail_id << 2.
+        mov rax, r15;
+        shl rax, 2;
+        jmp js_cr_out;
+
+      js_cr_bad_pid:
+        mov rdi, 5;                      // JS_ST_CREATE_BAD_PID
+        call js_note;
+
+        mov r12, 0x1503;                 // JS_ERR_BAD_PID (preserved
+                                         //  across klog via r12)
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + js_tag_create_rej];
+        lea rcx, [rip + js_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        jmp js_cr_out;
+
+      js_cr_full:
+        mov rdi, 4;                      // JS_ST_CREATE_FULL
+        call js_note;
+
+        mov r12, 0x1500;                 // JS_ERR_POOL_FULL
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + js_tag_create_rej];
+        lea rcx, [rip + js_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      js_cr_out:
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _jail_supervisor_check_syscall(pid, sysno) -> errno
+  //
+  // The syscall-dispatch pre-check gate for jailed callers.  Called
+  // from the dispatcher BEFORE routing to a per-syscall handler
+  // (R135.M2 integrates in src/kernel/core/syscall/dispatch.pdx
+  // alongside the R125.M4 cap-check preamble).  Four outcomes:
+  //
+  //   (a) pid is not in the pool
+  //       -> JS_OK (pass-through; this process is not jailed)
+  //       Bumps JS_ST_CHECK_PASSTHROUGH, no fingerprint.
+  //
+  //   (b) pid IS jailed, sysno < 128, mask bit is SET
+  //       -> JS_OK (jailed but permitted on this sysno)
+  //       Bumps JS_ST_CHECK_OK, no fingerprint.
+  //
+  //   (c) pid IS jailed, sysno >= 128
+  //       -> JS_ERR_SYSCALL_DENIED (fail-closed; mask does not cover
+  //          this sysno band so the jailed caller is refused)
+  //       Bumps JS_ST_CHECK_DENIED, emits `JAIL_SUPERVISOR DENIED OK
+  //          pid=0x<hex> sysno=0x<hex>` via klog_s1_x2.
+  //
+  //   (d) pid IS jailed, sysno < 128, mask bit is CLEAR
+  //       -> JS_ERR_SYSCALL_DENIED (jailed and this sysno not allowed)
+  //       Same stats bump + fingerprint as (c).
+  //
+  // ARGS (SysV):
+  //   rdi = pid
+  //   rsi = sysno
+  //
+  // RETURNS (rax):
+  //   JS_OK                 -- not jailed, or jailed and permitted
+  //   JS_ERR_SYSCALL_DENIED -- jailed and this sysno is refused
+  //
+  // STACK FRAME:
+  //   2 callee-save pushes (rbx = pid, r12 = sysno) + sub rsp, 8
+  //   HELD throughout the body.  Entry rsp%16==8; +2 pushes = +16
+  //   -> rsp%16==8; sub rsp,8 = +24 -> rsp%16==0 at every nested
+  //   call.  The 8-byte frame doubles as the klog_s1_x2 stack-arg
+  //   slot (v2 at [rsp+0] before the klog call).  Trailing `add
+  //   rsp, 8` restores before the two pops.
+  //
+  // ENCODER DISCIPLINE:
+  //   Variable-amount shift uses `shl rN, cl` (encoded; see
+  //   src/kernel/mm/uefi_phys_seed.pdx L327/L396, core/fs/pdxfs_lite/
+  //   alloc.pdx L233/L388).  `cl` is the low 8 bits of rcx; we `mov
+  //   rcx, <shift_count>` before each use.  All comparison constants
+  //   (64, 128) fit imm32 so `mov r11, imm32` emits the 7-byte
+  //   zero-extending form.  No `and r11, imm64`, no `imul r, imm`.
+  //
+  // Labels prefixed js_cs_.
+  // ==========================================================================
+  pub let _jail_supervisor_check_syscall : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (pid: u64) (sysno: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R135.M1 (paideia-os #2626): syscall-dispatch pre-check gate for jailed callers. Linear scan _jail_supervisor_pool[0..JS_POOL_MAX) for the first row with in_use==1 AND pid==rbx. Miss -> JS_OK pass-through (bump JS_ST_CHECK_PASSTHROUGH, no fingerprint; the common fast path). Hit -> check sysno < JS_SYSNO_MAX (128); if not, DENIED (fail-closed on unmaskable sysno range). If < 128, split on sysno < 64: low mask [row+16], shift (1 << sysno), AND -> bit set? Pass; else deny. High half: mask [row+24], shift count = sysno-64. Deny path bumps JS_ST_CHECK_DENIED and emits `JAIL_SUPERVISOR DENIED OK pid=0x<hex> sysno=0x<hex>` via klog_s1_x2 (6-reg + 1-stack-arg wrapper, v2=sysno at [rsp+0]). Two callee-save pushes (rbx=pid, r12=sysno) + sub rsp,8 (HELD throughout the body: lands rsp%16==0 at every nested call AND reserves the stack-arg slot for klog_s1_x2). Variable shift uses `shl rN, cl` (encoded in uefi_phys_seed.pdx / pdxfs_lite alloc.pdx). Encoder-pitfall posture: cmp rN, 0 (never test), shl rN, 7 for stride-128 (never imul), mov rax, imm32 for all error codes (never and r11, imm64). Labels prefixed js_cs_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;                      // alignment + klog_s1_x2 stack-arg slot
+
+        mov rbx, rdi;                    // pid
+        mov r12, rsi;                    // sysno
+
+        // Defence-in-depth: pid==0 is reserved and never matches a
+        // live row, so a zero pid takes the pass-through path.  The
+        // check also saves one scan iteration on the common no-pid-0
+        // callers.
+        cmp rbx, 0;
+        je  js_cs_pass;
+
+        // ---- Scan for a row with in_use==1 AND pid==rbx ----
+        lea r10, [rip + _jail_supervisor_pool];
+        xor rcx, rcx;                    // cursor
+      js_cs_scan:
+        cmp rcx, 8;                      // JS_POOL_MAX
+        jae js_cs_pass;                  // miss -> not jailed
+
+        mov rax, rcx;
+        shl rax, 7;                      // cursor * 128
+        add rax, r10;                    // row base in rax
+        mov r11, [rax + 112];            // in_use
+        cmp r11, 0;
+        je  js_cs_next;
+        mov r11, [rax + 0];              // pid
+        cmp r11, rbx;
+        je  js_cs_hit;
+      js_cs_next:
+        add rcx, 1;
+        jmp js_cs_scan;
+
+      js_cs_hit:
+        // Row base in rax; sysno in r12.
+        // ---- Check sysno < JS_SYSNO_MAX = 128 ----
+        mov r11, 128;
+        cmp r12, r11;
+        jae js_cs_deny;                  // fail-closed on unmaskable sysno
+
+        // ---- Branch on sysno < 64 vs >= 64 ----
+        mov r11, 64;
+        cmp r12, r11;
+        jae js_cs_hi;
+
+        // ---- Low half: mask [row+16], shift 1 by sysno ----
+        mov r11, [rax + 16];             // syscall_mask_lo
+        mov rcx, r12;                    // shift count (sysno)
+        mov r9,  1;
+        shl r9,  cl;                     // r9 = 1 << sysno
+        and r11, r9;
+        cmp r11, 0;
+        je  js_cs_deny;
+        jmp js_cs_allow;
+
+      js_cs_hi:
+        // ---- High half: mask [row+24], shift 1 by (sysno - 64) ----
+        mov r11, [rax + 24];             // syscall_mask_hi
+        mov rcx, r12;
+        sub rcx, 64;                     // shift count (sysno - 64)
+        mov r9,  1;
+        shl r9,  cl;                     // r9 = 1 << (sysno - 64)
+        and r11, r9;
+        cmp r11, 0;
+        je  js_cs_deny;
+        // fallthrough
+
+      js_cs_allow:
+        mov rdi, 7;                      // JS_ST_CHECK_OK
+        call js_note;
+        xor rax, rax;                    // JS_OK
+        jmp js_cs_out;
+
+      js_cs_pass:
+        mov rdi, 6;                      // JS_ST_CHECK_PASSTHROUGH
+        call js_note;
+        xor rax, rax;                    // JS_OK (not jailed)
+        jmp js_cs_out;
+
+      js_cs_deny:
+        mov rdi, 8;                      // JS_ST_CHECK_DENIED
+        call js_note;
+
+        // Emit DENIED fingerprint: klog_s1_x2 (6 regs + 1 stack arg).
+        // Stack-arg slot v2 at [rsp+0]; v1 in r8.
+        mov [rsp + 0], r12;              // v2 = sysno (hex)
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + js_tag_denied_ok];
+        lea rcx, [rip + js_k_pid];
+        mov r8,  rbx;                    // v1 = pid
+        lea r9,  [rip + js_k_sysno];
+        call klog_s1_x2;
+
+        mov rax, 0x1502;                 // JS_ERR_SYSCALL_DENIED
+
+      js_cs_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _jail_supervisor_destroy(jail_id) -> errno
+  //
+  // Mark a row free.  Validate jail_id, zero the critical fields,
+  // clear in_use so a future _create may re-use the slot.
+  //
+  // ARGS (SysV):
+  //   rdi = jail_id
+  //
+  // RETURNS (rax):
+  //   JS_OK          -- row freed
+  //   JS_ERR_BAD_ID  -- jail_id out of range or row already free
+  //
+  // The row is NOT fully zeroed -- fields written by _create (pid,
+  // cap_env_slot, mask_*, state, name) are overwritten at the NEXT
+  // _create of this slot, and in_use==0 is the authoritative "not
+  // populated" sentinel so a concurrent scan cannot latch stale data.
+  // Explicitly zero'd here:
+  //   pid           (defence-in-depth: pid==0 is the "reserved"
+  //                  value so a stale read before the next create
+  //                  cannot look like a real jail)
+  //   mask_lo       (defence-in-depth: a stale non-zero mask on an
+  //                  empty row cannot be observed by check_syscall
+  //                  before in_use is set, but zeroing it anyway
+  //                  tightens the "destroyed jail has no residual
+  //                  authority" invariant)
+  //   mask_hi       (same)
+  //   in_use        (the LAST write; see concurrent-scan note)
+  //
+  // STACK FRAME:
+  //   1 callee-save push (rbx = jail_id).  Entry rsp%16==8; +1 push
+  //   -> %16==0 (call-ready for js_row_in_use + klog_s1_x1).
+  //
+  // Labels prefixed js_de_.
+  // ==========================================================================
+  pub let _jail_supervisor_destroy : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (jail_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R135.M1 (paideia-os #2626): mark a jail row free. Validate jail_id via js_row_in_use (else JS_ERR_BAD_ID); zero pid + mask_lo + mask_hi (defence-in-depth: a stale non-zero mask on an empty row cannot be observed by check_syscall before in_use is set, but zeroing tightens the 'destroyed jail has no residual authority' invariant), then clear in_use LAST so a concurrent scan either sees the live row or a fully-free row (ordering mirrors ss_destroy and the broker row-free discipline). Bump JS_ST_DESTROY_OK, emit `JAIL_SUPERVISOR DESTROY OK jid=0x<hex>` via klog_s1_x1. Single callee-save push (rbx = jail_id) parks the id across the nested row_in_use + klog calls (entry %16==8, +1 push -> %16==0 call-ready). Labels prefixed js_de_.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                    // jail_id
+
+        // Validate jail_id.
+        mov rdi, rbx;
+        call js_row_in_use;
+        cmp rax, 0;
+        je  js_de_bad_id;
+
+        // Compute row base.
+        mov rax, rbx;
+        shl rax, 7;
+        lea r10, [rip + _jail_supervisor_pool];
+        add rax, r10;
+
+        // Zero pid + mask_lo + mask_hi (defence-in-depth).
+        xor r9, r9;
+        mov [rax + 0],  r9;              // pid = 0
+        mov [rax + 16], r9;              // syscall_mask_lo = 0
+        mov [rax + 24], r9;              // syscall_mask_hi = 0
+
+        // Clear in_use LAST so a concurrent scanner either sees the
+        // live row or a fully-free row.
+        mov [rax + 112], r9;             // in_use = 0
+
+        // Stats + fingerprint.
+        mov rdi, 9;                      // JS_ST_DESTROY_OK
+        call js_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + js_tag_destroy_ok];
+        lea rcx, [rip + js_k_jid];
+        mov r8,  rbx;                    // jid in hex KV
+        call klog_s1_x1;
+
+        xor rax, rax;                    // JS_OK
+        pop rbx;
+        ret;
+
+      js_de_bad_id:
+        mov rdi, 10;                     // JS_ST_DESTROY_REJ
+        call js_note;
+
+        mov rbx, 0x1501;                 // JS_ERR_BAD_ID (reuse rbx
+                                         //  for the klog + return)
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + js_tag_destroy_rej];
+        lea rcx, [rip + js_k_errno];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        mov rax, rbx;
+        pop rbx;
+        ret
+      }
+    }
+
+}

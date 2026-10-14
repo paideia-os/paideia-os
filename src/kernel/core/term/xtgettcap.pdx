@@ -1,0 +1,801 @@
+// src/kernel/core/term/xtgettcap.pdx -- Wave UMB-W15 R129.M1
+//
+// XTGETTCAP terminal-capability probe (paideia-os#2604).
+//
+// Lands:  2026-10-13
+//
+// Overview
+// ========
+//
+// xterm defines a DCS (Device Control String) query that lets a client
+// program (or in our case a kernel-side helper) ask the terminal
+// emulator which capabilities it advertises -- truecolor, mouse
+// reporting, kitty-graphics, number of colors, terminal name, and so
+// on.  The sequence is:
+//
+//     ESC P + q <cap-name-hex> ESC '\'
+//
+// where
+//     ESC          = 0x1B
+//     P            = 0x50       (DCS introducer)
+//     + q          = 0x2B 0x71  (xterm "GetTermcap/Terminfo" selector)
+//     cap-name-hex = ASCII capability name, each byte encoded as two
+//                    uppercase hex digits (e.g. "TN" -> "544E")
+//     ESC '\'      = 0x1B 0x5C  (String Terminator / ST)
+//
+// A conforming terminal replies with one DCS of its own:
+//
+//     ESC P 1 + r <cap-name-hex> '=' <value-hex> ESC '\'   -- cap known
+//     ESC P 0 + r <cap-name-hex> ESC '\'                   -- cap not known
+//
+// R129.M1 lands the KERNEL-SIDE PROBE: the helper that writes the
+// query, drains the response from the UART rx ring under a bounded
+// TSC-based timeout, parses the DCS envelope, and hands back a decoded
+// value byte slice plus a status code.  It is the first consumer of
+// the raw-mode flag that R127.M3 (Wave UMB-W14) stamped onto the
+// shell session row; the probe REQUIRES the TTY to be in raw mode so
+// the response bytes bypass the cooked-mode line discipline and land
+// in the raw rx ring where this helper can dequeue them.
+//
+// Scope
+// -----
+//   * emits the DCS query to the UART tx path
+//   * dequeues response bytes from _uart_rx_ring with a bounded
+//     100ms deadline, TSC-based (fallback to a poll-count cap when
+//     _tsc_hz is 0 -- i.e. calibration has not run)
+//   * parses the DCS envelope ESC P (0|1) + r ... ESC '\'
+//   * hex-decodes the value segment into a caller-supplied buffer
+//   * returns (bytes_written << 32) | status
+//
+// Explicit non-scope at M1
+// ------------------------
+//   * tty_fd is accepted but not dispatched -- M1 funnels every write
+//     through uart_putc and every read through uart_rx_dequeue
+//     (COM1 is the only wired-up TTY).  R129.M2+ grows a vops path.
+//   * no automatic raw-mode flip.  Callers must have invoked
+//     _shell_session_set_raw(session_id, SS_RAW_FLAG_RAW_MODE) first.
+//     This probe will still RUN under cooked mode but the response is
+//     likely to be eaten by tty_process_input before it reaches us.
+//   * no retry-on-malformed.  The caller may re-probe at a higher
+//     layer.
+//
+// See design/shell/xtgettcap-probe.md for the full contract and
+// the sequence diagram of a successful round-trip.
+//
+// Encoder-pitfall notes
+// ---------------------
+//   * no `test rN, rN` -- always `cmp rN, 0; j{e,ne}`
+//   * no 2-op `imul rN, imm`
+//   * no `and rN, imm64` -- all masks fit in imm32 (0xFF, 0x0F, 0x07)
+//   * labels prefixed `xt_` / `xhe_` / `xhd_` / `xtp_` to avoid
+//     collisions with sibling-module labels and to avoid pdx reserved
+//     keywords (loop, if, let, fn, ...)
+//   * module basename `Xtgettcap` matches `xtgettcap.pdx`
+//   * single-line `pub let X : T = ...`
+//   * cross-module symbols (uart_putc, uart_rx_dequeue, kread_tsc,
+//     _tsc_hz) accessed as RIP-relative calls / loads; linker resolves
+
+module Xtgettcap = structure {
+  // =========================================================================
+  // Section 1 -- public constants
+  // =========================================================================
+
+  // Return-status codes.  M1 bands them in 0x14xx; the band is otherwise
+  // unused and leaves room for XT_ERR_BAD_CAP, XT_ERR_BAD_FD, etc. at
+  // R129.M2+.
+  pub let XT_OK              : u64 = 0
+  pub let XT_ERR_NO_RESPONSE : u64 = 0x1400
+  pub let XT_ERR_MALFORMED   : u64 = 0x1401
+  pub let XT_ERR_TIMEOUT     : u64 = 0x1402
+
+  // DCS protocol bytes
+  pub let XT_ESC    : u64 = 0x1B      // introducer / terminator-head
+  pub let XT_DCS_P  : u64 = 0x50      // 'P'  -- DCS kick byte
+  pub let XT_PLUS   : u64 = 0x2B      // '+'  -- xterm GetTermcap selector
+  pub let XT_Q_LC   : u64 = 0x71      // 'q'  -- query marker
+  pub let XT_R_LC   : u64 = 0x72      // 'r'  -- response marker
+  pub let XT_ONE    : u64 = 0x31      // '1'  -- cap-known flag
+  pub let XT_ZERO   : u64 = 0x30      // '0'  -- cap-unknown flag
+  pub let XT_EQ     : u64 = 0x3D      // '='  -- value separator
+  pub let XT_ST     : u64 = 0x5C      // '\\' -- ST tail byte
+
+  // Response buffer and bounds.
+  //
+  // 256 bytes is deliberately generous: the longest well-formed xterm
+  // response to any M1 cap is ~24 bytes (TN -> "ESC P 1 + r 544E=78746572 ESC\\"
+  // = 20-ish bytes); a terminal that spews > 256 bytes in reply has
+  // violated the protocol and we fall through to XT_ERR_MALFORMED on
+  // the overflow guard rather than overrun a static.
+  pub let XT_RESP_MAX : u64 = 256
+
+  // Timeout policy.
+  //
+  // 100 ms is the xterm-community-recommended ceiling for XTGETTCAP
+  // round-trip under direct serial attach.  Over nested PTY the number
+  // can balloon to ~300 ms but at that point the probe is useful only
+  // during a quiescent REPL idle, which we treat as a tunable in a
+  // later wave.
+  //
+  // XT_TIMEOUT_NS feeds the TSC path:
+  //     timeout_cycles = _tsc_hz / 10          (100 ms worth, since
+  //                                             _tsc_hz is cycles/sec)
+  //
+  // XT_FALLBACK_POLL_CAP feeds the uncalibrated path:
+  //     at ~3 GHz an rdtsc delta of 1e8 cycles is ~33 ms; we fold
+  //     the fallback cap into "TSC-counted" rather than iteration-
+  //     counted so the SAME uart_rx_dequeue poll loop handles both
+  //     calibrated and uncalibrated boots without a branch.
+  pub let XT_TIMEOUT_NS        : u64 = 100000000      // 100 ms
+  pub let XT_FALLBACK_POLL_CAP : u64 = 100000000      // ~33 ms @ 3 GHz
+
+  // =========================================================================
+  // Section 2 -- static buffers (.bss)
+  // =========================================================================
+
+  // _xt_resp_buf -- shared static response collector.
+  //
+  // The probe is NOT reentrant.  M1 is single-threaded along the
+  // shell-session path (one probe per session at a time), so a shared
+  // 256-byte .bss slab is correct and avoids a stack allocation that
+  // paideia-as cannot currently emit without a frame pointer.  A
+  // future reentrant variant would move this onto the caller's stack
+  // or into a per-session scratch area.
+  pub let mut _xt_resp_buf : [u8; 256] = uninit @align(8)
+
+  // =========================================================================
+  // Section 3 -- _xt_hex_encode(src, len, dst) -> u64
+  // =========================================================================
+  //
+  // Encodes `len` bytes at src[0..len) as 2*len uppercase ASCII hex
+  // digits written to dst[0..2*len).  Returns 2*len.
+  //
+  // Mapping: 0..9 -> '0'..'9' (0x30..0x39); 10..15 -> 'A'..'F' (0x41..0x46).
+  // Uppercase matches xterm's own request echo in the response, which
+  // simplifies the (currently absent) echo check.
+  //
+  // Registers:
+  //   rbx = src   (callee-save, survives any nested call -- there are
+  //                none, but matched to tty_write.pdx discipline)
+  //   r12 = len
+  //   r13 = dst
+  //   rcx = i (loop index)
+  //   rax = byte / nibble staging
+  //   r9  = nibble value / ASCII digit
+  //   r10 = dst offset = 2*i (or 2*i + 1)
+  //
+  // Preserves (SysV callee-save): rbx, rbp, r12-r15.
+  // Clobbers (SysV caller-save):  rax, rcx, rdx, rsi, rdi, r8-r11.
+  pub let _xt_hex_encode : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (src: u64) (len: u64) (dst: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R129.M1 (paideia-os#2604, Wave UMB-W15): byte-to-hex-ASCII fan-out used by the DCS query emitter to turn the cap name (e.g. 'TN') into its wire form ('544E'). Pure write-side helper; reads only caller-supplied src[0..len). Register discipline: 3-push callee-save prologue (rbx=src, r12=len, r13=dst) matches the tty_write.pdx precedent of pre-call spilling into callee-save slots even though this leaf makes no nested call, keeping the shape identical to any later variant that calls into klog_s1_x1 for a trace fingerprint. Per-iteration body: zero-extend src[i] via `xor rax,rax; mov_b rax, [r8+0]`, extract high nibble via `mov r9,rax; shr r9,4; and r9,0x0F`, pick '0'..'9' vs 'A'..'F' with a two-arm `cmp r9,10; jb` branch (same idiom as klog/hex.pdx L41), store at dst[2*i] via `shl r10,1` then `mov rax,r9; mov_b [r10+0], rax`; low nibble `and r9,0x0F` after reload, store at dst[2*i+1]. Encoder: mov / cmp / je / jb / jmp / shr / shl / and / add / mov_b / xor -- all pre-existing. Loop is unbounded in input `len` but the probe caller clamps cap names to <=16 bytes so wall-time is sub-microsecond. mov_b store takes rax low byte per the core/tty/line_buffer.pdx L77 idiom.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                      // rbx = src
+        mov r12, rsi;                      // r12 = len
+        mov r13, rdx;                      // r13 = dst
+        xor rcx, rcx;                      // i = 0
+
+      xhe_loop:
+        cmp rcx, r12;
+        jae xhe_done;
+
+        // byte = src[i]
+        xor rax, rax;
+        mov r8, rbx;
+        add r8, rcx;
+        mov_b rax, [r8 + 0];               // rax = src[i] (zero-extended)
+
+        // ---- High nibble -> dst[2*i] ----
+        mov r9, rax;
+        shr r9, 4;
+        and r9, 0x0F;
+        cmp r9, 10;
+        jb  xhe_hi_digit;
+        add r9, 0x37;                      // 10..15 -> 'A'..'F'
+        jmp xhe_hi_store;
+      xhe_hi_digit:
+        add r9, 0x30;                      // 0..9 -> '0'..'9'
+      xhe_hi_store:
+        mov r10, rcx;
+        shl r10, 1;                        // r10 = 2*i
+        add r10, r13;                      // r10 = &dst[2*i]
+        mov rax, r9;
+        mov_b [r10 + 0], rax;
+
+        // ---- Low nibble -> dst[2*i + 1] ----
+        xor rax, rax;
+        mov r8, rbx;
+        add r8, rcx;
+        mov_b rax, [r8 + 0];               // reload byte (clobbered above)
+        mov r9, rax;
+        and r9, 0x0F;
+        cmp r9, 10;
+        jb  xhe_lo_digit;
+        add r9, 0x37;
+        jmp xhe_lo_store;
+      xhe_lo_digit:
+        add r9, 0x30;
+      xhe_lo_store:
+        mov r10, rcx;
+        shl r10, 1;
+        add r10, 1;                        // r10 = 2*i + 1
+        add r10, r13;
+        mov rax, r9;
+        mov_b [r10 + 0], rax;
+
+        add rcx, 1;
+        jmp xhe_loop;
+
+      xhe_done:
+        mov rax, r12;
+        shl rax, 1;                        // return 2 * len
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // Section 4 -- _xt_hex_decode(hex, len, dst) -> u64
+  // =========================================================================
+  //
+  // Decodes `len` ASCII hex chars at hex[0..len) into dst[0..len/2).
+  // Accepts both uppercase and lowercase.  Returns:
+  //     bytes_written  on success (= len/2)
+  //     0xFFFFFFFFFFFFFFFF  on malformed input (odd len or non-hex char)
+  //
+  // Caller is responsible for bounding `len` by the destination capacity;
+  // this helper decodes exactly len/2 bytes without a cap-check.  The
+  // probe caller supplies len already clamped to the response buffer
+  // size and clamps the write-out to the caller's out_cap AFTER the
+  // decode by passing a shorter `len`.
+  //
+  // Registers:
+  //   rbx = hex (src)
+  //   r12 = len
+  //   r13 = dst
+  //   rcx = i (hex index, 0..len step 2)
+  //   rax = nibble staging
+  //
+  // Preserves callee-save; clobbers caller-save per SysV.
+  pub let _xt_hex_decode : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (hex: u64) (len: u64) (dst: u64) -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R129.M1 (paideia-os#2604, Wave UMB-W15): hex-ASCII-to-byte fan-in used by the DCS response parser to decode the value segment of an XTGETTCAP reply. Odd-length guard first: `mov rax,r12; and rax,1; cmp rax,0; jne xhd_bad` rejects half-nibble input. Loop body processes two chars per iteration: load hex[i] via mov_b into rax, dispatch on 0x30..0x39 vs 0x41..0x46 vs 0x61..0x66, map to 0..15, same for hex[i+1], shift the first nibble left 4, OR with the second, store at dst[i/2] via `mov rdx,rcx; shr rdx,1`. Non-hex char on either half -> jmp xhd_bad; return 0xFFFFFFFFFFFFFFFF (all-ones u64). Encoder: cmp / jb / jbe / jne / je / jmp / and / or / shl / shr / mov / mov_b / sub / add / xor -- all pre-existing.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                      // rbx = hex
+        mov r12, rsi;                      // r12 = len
+        mov r13, rdx;                      // r13 = dst
+
+        // Reject odd-length input.
+        mov rax, r12;
+        and rax, 1;
+        cmp rax, 0;
+        jne xhd_bad;
+
+        xor rcx, rcx;                      // i = 0
+
+      xhd_loop:
+        cmp rcx, r12;
+        jae xhd_done;
+
+        // ---- High nibble: decode hex[i] ----
+        xor rax, rax;
+        mov r8, rbx;
+        add r8, rcx;
+        mov_b rax, [r8 + 0];
+
+        // '0'..'9' -> 0..9
+        cmp rax, 0x30;
+        jb  xhd_bad;
+        cmp rax, 0x39;
+        ja  xhd_hi_not_dec;
+        sub rax, 0x30;
+        jmp xhd_hi_ok;
+      xhd_hi_not_dec:
+        // 'A'..'F' -> 10..15
+        cmp rax, 0x41;
+        jb  xhd_bad;
+        cmp rax, 0x46;
+        ja  xhd_hi_not_upper;
+        sub rax, 0x37;
+        jmp xhd_hi_ok;
+      xhd_hi_not_upper:
+        // 'a'..'f' -> 10..15
+        cmp rax, 0x61;
+        jb  xhd_bad;
+        cmp rax, 0x66;
+        ja  xhd_bad;
+        sub rax, 0x57;
+      xhd_hi_ok:
+        shl rax, 4;
+        mov r9, rax;                       // r9 = high nibble shifted
+
+        // ---- Low nibble: decode hex[i+1] ----
+        xor rax, rax;
+        mov r8, rbx;
+        add r8, rcx;
+        add r8, 1;
+        mov_b rax, [r8 + 0];
+
+        cmp rax, 0x30;
+        jb  xhd_bad;
+        cmp rax, 0x39;
+        ja  xhd_lo_not_dec;
+        sub rax, 0x30;
+        jmp xhd_lo_ok;
+      xhd_lo_not_dec:
+        cmp rax, 0x41;
+        jb  xhd_bad;
+        cmp rax, 0x46;
+        ja  xhd_lo_not_upper;
+        sub rax, 0x37;
+        jmp xhd_lo_ok;
+      xhd_lo_not_upper:
+        cmp rax, 0x61;
+        jb  xhd_bad;
+        cmp rax, 0x66;
+        ja  xhd_bad;
+        sub rax, 0x57;
+      xhd_lo_ok:
+        or rax, r9;                        // rax = full byte
+
+        // Store at dst[i/2]
+        mov rdx, rcx;
+        shr rdx, 1;
+        add rdx, r13;
+        mov_b [rdx + 0], rax;
+
+        add rcx, 2;
+        jmp xhd_loop;
+
+      xhd_done:
+        mov rax, r12;
+        shr rax, 1;                        // return len / 2
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      xhd_bad:
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // Section 5 -- _xt_tx_byte(byte) -> ()
+  // =========================================================================
+  //
+  // Thin wrapper over uart_putc so the probe can emit protocol bytes
+  // without routing through tty_write (which would translate '\n' to
+  // '\r\n' -- fine for DCS but we also want to bypass the fb-mirror
+  // tail that tty_write adds; XTGETTCAP output is never meant for the
+  // framebuffer console).
+  //
+  // At R129.M1 this is literally `jmp uart_putc` with a tail-call
+  // pattern (actually `call + ret` since paideia-as does not currently
+  // encode tail-calls; the small overhead is irrelevant inside the
+  // handful-of-bytes emit path).  Isolated so that R129.M2+ can route
+  // via tty_fd without touching the DCS emitter body.
+  pub let _xt_tx_byte : (u64) -> () !{sysreg, PortIo} @{paideia.port_io} =
+    fn (byte: u64) -> unsafe {
+      effects: {sysreg, PortIo},
+      capabilities: {paideia.port_io},
+      justification: "R129.M1 (paideia-os#2604, Wave UMB-W15): single-byte TX shim. SysV: rdi carries the byte through to uart_putc; no re-marshalling needed. `sub rsp,8; call uart_putc; add rsp,8` keeps the SysV %16 alignment at the nested call site (entry rsp%16==8 + 8-byte pad = rsp%16==0 for callee). No prologue needed; uart_putc preserves rbx and r12-r15, so we have no state to save.",
+      block: {
+        sub rsp, 8;
+        call uart_putc;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // =========================================================================
+  // Section 6 -- _xt_timeout_cycles() -> u64
+  // =========================================================================
+  //
+  // Returns the TSC-cycle budget for a single probe round-trip.
+  //
+  //   calibrated:    _tsc_hz / 10        (= 100 ms at any clock)
+  //   uncalibrated:  XT_FALLBACK_POLL_CAP (= 1e8 TSC cycles,
+  //                                        ~ 33 ms at 3 GHz)
+  //
+  // The uncalibrated case can happen on very early boot or on QEMU
+  // configurations where the PM_TMR window overshoots; either way we
+  // still want a bounded probe rather than an infinite loop.
+  //
+  // Leaf; preserves all callee-save; clobbers rax, rdx, rcx.
+  pub let _xt_timeout_cycles : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem},
+      capabilities: {},
+      justification: "R129.M1 (paideia-os#2604, Wave UMB-W15): compute the per-probe TSC deadline. Loads _tsc_hz; if zero (calibration bailed) returns XT_FALLBACK_POLL_CAP. Otherwise computes _tsc_hz / 10 (= cycles-per-100ms) via `xor rdx,rdx; mov rcx,10; div rcx`. Encoder: mov / cmp / je / xor / div -- all pre-existing. Leaf; no callee-save.",
+      block: {
+        mov rax, [rip + _tsc_hz];
+        cmp rax, 0;
+        je  xt_tc_fallback;
+        xor rdx, rdx;
+        mov rcx, 10;
+        div rcx;                           // rax = _tsc_hz / 10
+        ret;
+      xt_tc_fallback:
+        mov rax, 100000000;                // XT_FALLBACK_POLL_CAP literal
+        ret
+      }
+    }
+
+  // =========================================================================
+  // Section 7 -- _xtgettcap_probe(tty_fd, cap_ptr, cap_len,
+  //                                out_ptr, out_cap) -> packed u64
+  // =========================================================================
+  //
+  // SysV register map:
+  //     rdi = tty_fd       (M1 ignored -- see note below)
+  //     rsi = cap_ptr      (ASCII cap name)
+  //     rdx = cap_len      (cap_ptr length, in bytes; <= 16 at M1)
+  //     rcx = out_ptr      (caller buffer for decoded value)
+  //     r8  = out_cap      (caller buffer capacity in bytes)
+  //     ret = (bytes_written << 32) | status
+  //
+  // Status taxonomy:
+  //     XT_OK              value (or empty-on-cap-not-known) decoded
+  //                         into out_ptr; bytes_written is the hex-
+  //                         decoded length clamped to out_cap
+  //     XT_ERR_NO_RESPONSE no byte at all arrived within the deadline
+  //     XT_ERR_TIMEOUT     at least one byte arrived but the ESC '\'
+  //                         terminator did not, within the deadline
+  //     XT_ERR_MALFORMED   response bytes arrived but the DCS envelope
+  //                         does not match ESC P (0|1) + r ... ESC '\'
+  //                         or the value hex has an odd length / non-
+  //                         hex char
+  //
+  // Caller contract:
+  //     * The TTY must be in raw mode (SS_RAW_FLAG_RAW_MODE on the
+  //       current shell session) so the response bytes land in
+  //       _uart_rx_ring without being consumed by the cooked-mode
+  //       line discipline.  See design/shell/xtgettcap-probe.md §4.
+  //     * cap_ptr must point to the ASCII cap name (not already hex-
+  //       encoded).  The probe hex-encodes it onto the wire.
+  //     * out_cap may be 0; the probe will still perform the full
+  //       round-trip and report (0, XT_OK) on success.
+  //
+  // M1-ignored tty_fd:
+  //     The parameter is reserved for the R129.M2 fd-dispatch pass.
+  //     M1 funnels every byte to uart_putc and reads from the
+  //     single raw rx ring; passing any fd value is accepted.
+  //
+  // Register discipline:
+  //     rbx = out_ptr      (survives nested calls)
+  //     r12 = out_cap
+  //     r13 = resp_len     (bytes collected into _xt_resp_buf so far)
+  //     r14 = deadline     (TSC cycle count at which we abort)
+  //     r15 = cap_ptr      (preserved so the request echo check could
+  //                         be re-enabled by a future wave without
+  //                         re-marshalling)
+  //
+  // Preserves (SysV callee-save): rbx, rbp, r12-r15 (via push/pop).
+  // Clobbers (SysV caller-save):  rax, rcx, rdx, rsi, rdi, r8-r11.
+  pub let _xtgettcap_probe : (u64, u64, u64, u64, u64) -> u64
+                             !{sysreg, mem, PortIo} @{paideia.port_io} =
+    fn (tty_fd: u64) (cap_ptr: u64) (cap_len: u64)
+       (out_ptr: u64) (out_cap: u64) -> unsafe {
+      effects: {sysreg, mem, PortIo},
+      capabilities: {paideia.port_io},
+      justification: "R129.M1 (paideia-os#2604, Wave UMB-W15): XTGETTCAP DCS round-trip. Six-push callee-save prologue (rbx, rbp, r12-r15) + the implicit SysV %16==8-at-entry gives rsp%16==0 at every nested call (prologue: 6 x 8 = 48 bytes; entry +8 ret addr = 56 = %16==8; after 6 pushes = %16==8, so one 8-byte pad is added at each nested-call site where needed). TX stage: emits the fixed 4-byte DCS prefix (ESC, 'P', '+', 'q'), then hex-encodes cap_ptr/cap_len via _xt_hex_encode into _xt_resp_buf as scratch (reused post-TX for the response), writes the resulting 2*cap_len hex bytes to the UART via per-byte _xt_tx_byte, then emits the ESC '\\' tail (ST). RX stage: reads _xt_timeout_cycles() and stores it + kread_tsc() to compute the deadline in r14; main poll loop calls uart_rx_dequeue; on 0xFFFF (empty) checks kread_tsc()>=deadline, returns NO_RESPONSE if no byte yet seen or TIMEOUT if some bytes seen; on byte, stores into _xt_resp_buf[resp_len] (byte-store via mov_b), increments resp_len, and if resp_len >= 2 and _xt_resp_buf[resp_len-2]==ESC && _xt_resp_buf[resp_len-1]==ST, breaks to parse. Overflow guard: if resp_len==XT_RESP_MAX before terminator, returns MALFORMED. Parse stage: validates prefix (ESC P (0|1) + r), on '0'-flag returns (0<<32)|OK, on '1'-flag scans forward from offset 5 for '=' (bounded by resp_len-2 so the ESC '\\' tail is not consumed), hex-decodes the segment between '=' and the ESC via _xt_hex_decode into a scratch (first XT_RESP_MAX/2 bytes of _xt_resp_buf, re-aliased after parse), then copies up to out_cap bytes to out_ptr. Encoder: standard mov/cmp/j{e,ne,b,ae,a}/jmp/add/sub/and/or/shl/shr/mov_b -- all pre-existing. Reserved-label discipline: xtp_ prefix throughout. Return packing: (bytes_written << 32) | status via `shl rax,32; or rax,r9`.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;                        // SysV alignment pad:
+                                           //   entry rsp%16==8;
+                                           //   +6 pushes = %16==8;
+                                           //   +8 pad   = %16==0 for
+                                           //   every direct nested call.
+
+        mov rbx, rcx;                      // rbx = out_ptr
+        mov r12, r8;                       // r12 = out_cap
+        mov r15, rsi;                      // r15 = cap_ptr
+        xor r13, r13;                      // resp_len = 0
+
+        // Stash cap_len on the stack across _xt_hex_encode / _xt_tx_byte
+        // calls that would otherwise clobber it (SysV rdx is caller-save).
+        // We re-materialise it from rbp below for the TX loop.
+        mov rbp, rdx;                      // rbp = cap_len (preserved)
+
+        // ---- TX stage -----------------------------------------------------
+
+        // Emit ESC (0x1B)
+        mov rdi, 0x1B;
+        call _xt_tx_byte;
+
+        // Emit 'P' (0x50)
+        mov rdi, 0x50;
+        call _xt_tx_byte;
+
+        // Emit '+' (0x2B)
+        mov rdi, 0x2B;
+        call _xt_tx_byte;
+
+        // Emit 'q' (0x71)
+        mov rdi, 0x71;
+        call _xt_tx_byte;
+
+        // Hex-encode cap_ptr/cap_len into _xt_resp_buf as scratch.
+        //   rdi = cap_ptr (from r15), rsi = cap_len (from rbp),
+        //   rdx = &_xt_resp_buf
+        mov rdi, r15;
+        mov rsi, rbp;
+        lea rdx, [rip + _xt_resp_buf];
+        call _xt_hex_encode;               // rax = 2 * cap_len
+
+        // Walk the scratch 2*cap_len bytes and emit each.
+        //   r9 counts; r10 base
+        mov r9, rax;                       // r9 = total hex bytes to tx
+        lea r10, [rip + _xt_resp_buf];     // r10 = base
+        xor rcx, rcx;                      // i = 0
+
+      xtp_tx_hex_loop:
+        cmp rcx, r9;
+        jae xtp_tx_hex_done;
+        // byte = scratch[i]
+        xor rax, rax;
+        mov r11, r10;
+        add r11, rcx;
+        mov_b rax, [r11 + 0];
+        mov rdi, rax;
+        // SysV: scratch (r9, r10, r11, rcx) are caller-save; save+restore
+        // across _xt_tx_byte via the stack.
+        push r9;
+        push r10;
+        push rcx;
+        sub rsp, 8;                        // align
+        call _xt_tx_byte;
+        add rsp, 8;
+        pop rcx;
+        pop r10;
+        pop r9;
+        add rcx, 1;
+        jmp xtp_tx_hex_loop;
+
+      xtp_tx_hex_done:
+        // Emit ESC '\\' (ST tail)
+        mov rdi, 0x1B;
+        call _xt_tx_byte;
+        mov rdi, 0x5C;
+        call _xt_tx_byte;
+
+        // ---- RX stage -----------------------------------------------------
+
+        // Compute deadline = kread_tsc() + _xt_timeout_cycles()
+        call _xt_timeout_cycles;           // rax = cycles
+        mov r14, rax;                      // r14 = timeout_cycles
+        call kread_tsc;                    // rax = tsc_now
+        add r14, rax;                      // r14 = deadline (abs)
+
+        xor r13, r13;                      // resp_len = 0
+
+      xtp_rx_loop:
+        // Overflow guard: if resp_len == XT_RESP_MAX we must bail;
+        // a well-formed response is at most ~24 bytes.
+        cmp r13, 256;                      // XT_RESP_MAX
+        jae xtp_err_malformed;
+
+        call uart_rx_dequeue;              // rax = byte or 0xFFFF
+        cmp rax, 0xFFFF;
+        je  xtp_rx_check_deadline;
+
+        // Store rax (byte) at _xt_resp_buf[resp_len]
+        lea r11, [rip + _xt_resp_buf];
+        add r11, r13;
+        mov_b [r11 + 0], rax;
+        add r13, 1;
+
+        // Terminator check: if resp_len >= 2 and buf[len-2]==ESC and
+        // buf[len-1]=='\\'
+        cmp r13, 2;
+        jb  xtp_rx_loop;
+        lea r11, [rip + _xt_resp_buf];
+        mov r9, r13;
+        sub r9, 2;
+        add r11, r9;
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        cmp rax, 0x1B;
+        jne xtp_rx_loop;
+        lea r11, [rip + _xt_resp_buf];
+        mov r9, r13;
+        sub r9, 1;
+        add r11, r9;
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        cmp rax, 0x5C;
+        jne xtp_rx_loop;
+        jmp xtp_parse;
+
+      xtp_rx_check_deadline:
+        call kread_tsc;                    // rax = tsc_now
+        cmp rax, r14;
+        jb  xtp_rx_loop;                   // still within budget
+        // Timed out.  Distinguish NO_RESPONSE vs TIMEOUT by resp_len.
+        cmp r13, 0;
+        je  xtp_err_no_response;
+        jmp xtp_err_timeout;
+
+        // ---- Parse stage --------------------------------------------------
+        //
+        // At entry: _xt_resp_buf[0..r13) is the full response ending
+        // in ESC '\\'.  Validate the DCS envelope and extract the
+        // value segment.
+
+      xtp_parse:
+        // Need at least ESC P (0|1) + r X ESC '\\' = 7 bytes
+        cmp r13, 7;
+        jb  xtp_err_malformed;
+
+        lea r11, [rip + _xt_resp_buf];
+
+        // byte[0] == ESC
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        cmp rax, 0x1B;
+        jne xtp_err_malformed;
+
+        // byte[1] == 'P'
+        xor rax, rax;
+        mov_b rax, [r11 + 1];
+        cmp rax, 0x50;
+        jne xtp_err_malformed;
+
+        // byte[2] in {'0','1'}
+        xor rax, rax;
+        mov_b rax, [r11 + 2];
+        cmp rax, 0x30;
+        je  xtp_cap_unknown;
+        cmp rax, 0x31;
+        jne xtp_err_malformed;
+
+        // byte[3] == '+'
+        xor rax, rax;
+        mov_b rax, [r11 + 3];
+        cmp rax, 0x2B;
+        jne xtp_err_malformed;
+
+        // byte[4] == 'r'
+        xor rax, rax;
+        mov_b rax, [r11 + 4];
+        cmp rax, 0x72;
+        jne xtp_err_malformed;
+
+        // Scan for '=' starting at i=5, bounded by r13-2 (keep ESC '\\' intact)
+        mov rcx, 5;
+        mov r10, r13;
+        sub r10, 2;                        // r10 = end (exclusive)
+
+      xtp_scan_eq:
+        cmp rcx, r10;
+        jae xtp_err_malformed;             // no '=' before terminator
+        lea r11, [rip + _xt_resp_buf];
+        add r11, rcx;
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        cmp rax, 0x3D;
+        je  xtp_found_eq;
+        add rcx, 1;
+        jmp xtp_scan_eq;
+
+      xtp_found_eq:
+        // Value hex spans _xt_resp_buf[rcx+1 .. r13-2].
+        mov r9, r13;
+        sub r9, 2;                         // r9 = end (exclusive)
+        mov r8, rcx;
+        add r8, 1;                         // r8 = start
+        mov rdx, r9;
+        sub rdx, r8;                       // rdx = value_hex_len
+
+        // If value_hex_len is 0, nothing to decode: treat as cap known
+        // but empty, bytes_written=0, status=OK.
+        cmp rdx, 0;
+        je  xtp_ok_empty;
+
+        // Decode in-place to the LOW half of _xt_resp_buf (overlap-safe:
+        // we read from offset r8 >= 6, write to offset 0, and the write
+        // index is always strictly less than the read index because
+        // decode consumes 2 hex chars per written byte).
+        lea rdi, [rip + _xt_resp_buf];
+        add rdi, r8;                       // src = &buf[start]
+        mov rsi, rdx;                      // len = value_hex_len
+        lea rdx, [rip + _xt_resp_buf];     // dst = &buf[0]
+        call _xt_hex_decode;               // rax = len/2 or -1
+
+        cmp rax, 0xFFFFFFFFFFFFFFFF;
+        je  xtp_err_malformed;
+
+        // Clamp decoded length to out_cap.
+        mov r9, rax;                       // r9 = decoded_len
+        cmp r9, r12;
+        jbe xtp_copy_out;
+        mov r9, r12;                       // r9 = min(decoded_len, out_cap)
+
+      xtp_copy_out:
+        // Copy _xt_resp_buf[0..r9) to out_ptr (rbx).  Skip when out_cap=0.
+        cmp r9, 0;
+        je  xtp_ok_done;
+        lea r10, [rip + _xt_resp_buf];
+        xor rcx, rcx;                      // i = 0
+      xtp_copy_loop:
+        cmp rcx, r9;
+        jae xtp_ok_done;
+        mov r11, r10;
+        add r11, rcx;
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        mov r8, rbx;
+        add r8, rcx;
+        mov_b [r8 + 0], rax;
+        add rcx, 1;
+        jmp xtp_copy_loop;
+
+      xtp_ok_done:
+        // return (r9 << 32) | XT_OK; XT_OK is 0 so the OR is a no-op.
+        mov rax, r9;
+        shl rax, 32;
+        jmp xtp_epilogue;
+
+      xtp_ok_empty:
+        // Cap known (envelope valid) but value segment empty.
+        xor rax, rax;                      // (0 << 32) | XT_OK
+        jmp xtp_epilogue;
+
+      xtp_cap_unknown:
+        // ESC P 0 + r <cap-hex> ESC '\\' -- cap not known by terminal.
+        // The terminator loop already observed ESC '\\' before we got
+        // here, so just confirm byte[3] == '+'.
+        xor rax, rax;
+        mov_b rax, [r11 + 3];              // r11 still holds base
+        cmp rax, 0x2B;
+        jne xtp_err_malformed;
+        xor rax, rax;                      // (0 << 32) | XT_OK
+        jmp xtp_epilogue;
+
+      xtp_err_no_response:
+        mov rax, 0x1400;                   // (0 << 32) | XT_ERR_NO_RESPONSE
+        jmp xtp_epilogue;
+
+      xtp_err_malformed:
+        mov rax, 0x1401;                   // (0 << 32) | XT_ERR_MALFORMED
+        jmp xtp_epilogue;
+
+      xtp_err_timeout:
+        mov rax, 0x1402;                   // (0 << 32) | XT_ERR_TIMEOUT
+        jmp xtp_epilogue;
+
+      xtp_epilogue:
+        add rsp, 8;                        // unwind the alignment pad
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}

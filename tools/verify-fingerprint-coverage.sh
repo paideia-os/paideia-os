@@ -175,6 +175,49 @@ ALLOWLIST = {
         "any production path at M1 (same reason as CREATE OK). "
         "Retires when R127.M2 wires the cap-invoke DESTROY op.",
 
+    # Wave UMB-W15 R135.M1 (paideia-os#2626): svc.jail-supervisor
+    # daemon bringup + direct-call API for the WASI-jail cap-env +
+    # syscall allowlist. JAIL_SUPERVISOR INIT OK fires on every boot
+    # from _jail_supervisor_init during the svc.* bringup cascade
+    # (kernel_main.pdx after _shell_session_init, before
+    # witness_r30_platform). JAIL_SUPERVISOR CREATE OK / DENIED OK /
+    # DESTROY OK are present as .rodata tag literals inside the
+    # direct-call API functions; at M1 no production path invokes
+    # them because the WASI-jail launcher cannot bind to the daemon
+    # until R135.M2 registers KIND_JAIL and adds the cap-invoke
+    # dispatch arm, AND the dispatch-layer syscall gate that consults
+    # _jail_supervisor_check_syscall is likewise deferred to R135.M2.
+    # All four retire from this allowlist when R135.M2 lands with
+    # asserting smoke-mode goldens driving each verb end-to-end
+    # (bringup + a launcher parent task minting / syscall-checking /
+    # destroying one or more jails).
+    "JAIL_SUPERVISOR INIT OK":
+        "Wave UMB-W15 R135.M1: src/kernel/core/svc/jail_supervisor.pdx "
+        "emits this unconditionally on boot via _jail_supervisor_init "
+        "in the svc.* bringup cascade. Retires when R135.M2 (KIND_"
+        "JAIL + cap-invoke dispatch + syscall-dispatch gate wire-up) "
+        "adds an asserting smoke-mode golden.",
+    "JAIL_SUPERVISOR CREATE OK":
+        "Wave UMB-W15 R135.M1: src/kernel/core/svc/jail_supervisor.pdx "
+        "emits this from _jail_supervisor_create. Unreachable from "
+        "any production path at M1 (no WASI-jail launcher task binds "
+        "to the daemon until R135.M2 lands KIND_JAIL). Retires when "
+        "R135.M2 wires the cap-invoke CREATE op.",
+    "JAIL_SUPERVISOR DENIED OK":
+        "Wave UMB-W15 R135.M1: src/kernel/core/svc/jail_supervisor.pdx "
+        "emits this from _jail_supervisor_check_syscall's deny path. "
+        "Unreachable from any production path at M1 (the syscall "
+        "dispatcher does not yet consult _jail_supervisor_check_syscall "
+        "-- the gate wire-up in src/kernel/core/syscall/dispatch.pdx "
+        "is deferred to R135.M2). Retires when R135.M2 wires the "
+        "dispatch-layer jail-check preamble with a smoke-mode golden "
+        "driving a jailed caller against a denied sysno.",
+    "JAIL_SUPERVISOR DESTROY OK":
+        "Wave UMB-W15 R135.M1: src/kernel/core/svc/jail_supervisor.pdx "
+        "emits this from _jail_supervisor_destroy. Unreachable from "
+        "any production path at M1 (same reason as CREATE OK). "
+        "Retires when R135.M2 wires the cap-invoke DESTROY op.",
+
     # Wave UMB-W14 R127.M3 (paideia-os#2599): raw-mode TTY substrate.
     # SHELL_SESSION RAW OK fires from _shell_session_set_raw's success
     # tail (and from ks_op_set_raw transitively via KIND_SHELL_SESSION
@@ -195,6 +238,42 @@ ALLOWLIST = {
         "deferred). Retires when R127.M4 (session-aware TTY line "
         "discipline) lands with a smoke-mode golden driving SET_RAW "
         "+ a cooked-vs-raw ldisc observation.",
+
+    # Wave UMB-W15 R127.M4 (paideia-os#2600): history storage substrate.
+    # SHELL_HISTORY INIT OK fires on every boot via _shell_history_init
+    # in the svc.* bringup cascade (kernel_main.pdx right after
+    # _shell_session_init, before witness_r30_platform). APPEND OK /
+    # READ OK are present as .rodata tags inside _shell_history_append
+    # and _shell_history_read respectively and transitively reachable
+    # via KIND_SHELL_SESSION ops 5 / 6 through ks_op_history_* in
+    # kind_shell_session.pdx; at M4 no production path invokes them
+    # because the shell parent's actual dispatch loop (which would
+    # drive APPEND on every command and READ for history recall) is
+    # the responsibility of R127.M5 (job control + shell parent
+    # dispatch loop). All three retire from this allowlist when
+    # R127.M5 lands with asserting smoke-mode goldens driving each
+    # verb end-to-end (bringup + a shell parent task minting /
+    # appending / reading / counting one or more history entries).
+    "SHELL_HISTORY INIT OK":
+        "Wave UMB-W15 R127.M4: src/kernel/core/svc/shell_history.pdx "
+        "emits this unconditionally on boot via _shell_history_init "
+        "in the svc.* bringup cascade (after _shell_session_init). "
+        "Retires when R127.M5 (job control + shell parent dispatch "
+        "loop) adds an asserting smoke-mode golden.",
+    "SHELL_HISTORY APPEND OK":
+        "Wave UMB-W15 R127.M4: src/kernel/core/svc/shell_history.pdx "
+        "emits this from _shell_history_append. Unreachable from any "
+        "production path at M4 (no shell parent task mints a "
+        "KIND_SHELL_SESSION cap yet; the dispatch loop that would "
+        "drive APPEND lands with R127.M5). Retires when R127.M5 "
+        "wires the dispatch loop with an asserting smoke-mode golden.",
+    "SHELL_HISTORY READ OK":
+        "Wave UMB-W15 R127.M4: src/kernel/core/svc/shell_history.pdx "
+        "emits this from _shell_history_read. Unreachable from any "
+        "production path at M4 (same reason as APPEND OK; up-arrow / "
+        "Ctrl-R TTY bindings that would drive READ land with R127.M5). "
+        "Retires when R127.M5 wires the TTY recall binding with an "
+        "asserting smoke-mode golden.",
 
     # Wave UMB-W13 R141.M2 (paideia-os#2646): perf-sink logging layer.
     # PERF SINK INIT OK fires on every boot from _perf_sink_init in
