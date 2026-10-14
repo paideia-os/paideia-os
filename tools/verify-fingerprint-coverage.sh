@@ -218,6 +218,50 @@ ALLOWLIST = {
         "any production path at M1 (same reason as CREATE OK). "
         "Retires when R135.M2 wires the cap-invoke DESTROY op.",
 
+    # Wave UMB-W19 R137.M1 (paideia-os#2633): svc.remote-shell
+    # daemon bringup + direct-call API for cross-host shell session
+    # state. REMOTE_SHELL INIT OK fires on every boot from
+    # _remote_shell_init during the svc.* bringup cascade
+    # (kernel_main.pdx after _jail_supervisor_init, before
+    # witness_r30_platform). REMOTE_SHELL ACCEPT OK / STATE OK /
+    # CLOSE OK are present as .rodata tag literals inside the
+    # direct-call API functions; at M1 no production path invokes
+    # them because the TCP accept path that mints connection rows is
+    # deferred to R137.M2 alongside the ML-KEM-768 + X25519 hybrid
+    # handshake, AND no KIND_REMOTE_SHELL cap-invoke surface exists
+    # yet (reserved for R137.M2 alongside the KEM session binding).
+    # All four retire from this allowlist when R137.M2 lands with
+    # asserting smoke-mode goldens driving each verb end-to-end
+    # (bringup + a TCP accept path minting / state-transitioning /
+    # closing one or more connections).
+    "REMOTE_SHELL INIT OK":
+        "Wave UMB-W19 R137.M1: src/kernel/core/svc/remote_shell.pdx "
+        "emits this unconditionally on boot via _remote_shell_init "
+        "in the svc.* bringup cascade. Retires when R137.M2 "
+        "(KIND_REMOTE_SHELL + ML-KEM-768 hybrid handshake + cap-"
+        "invoke dispatch + TCP accept wire-up) adds an asserting "
+        "smoke-mode golden.",
+    "REMOTE_SHELL ACCEPT OK":
+        "Wave UMB-W19 R137.M1: src/kernel/core/svc/remote_shell.pdx "
+        "emits this from _remote_shell_accept. Unreachable from any "
+        "production path at M1 (no TCP accept path reaches the "
+        "daemon until R137.M2 lands the hybrid-KEM handshake and "
+        "KIND_REMOTE_SHELL). Retires when R137.M2 wires the cap-"
+        "invoke ACCEPT op (and/or the TCP accept-path direct call).",
+    "REMOTE_SHELL STATE OK":
+        "Wave UMB-W19 R137.M1: src/kernel/core/svc/remote_shell.pdx "
+        "emits this from _remote_shell_set_state. Unreachable from "
+        "any production path at M1 (same reason as ACCEPT OK -- the "
+        "handshake state machine that drives INIT -> HANDSHAKE -> "
+        "ESTABLISHED is deferred to R137.M2). Retires when R137.M2 "
+        "wires the cap-invoke SET_STATE op alongside the handshake "
+        "state-machine driver.",
+    "REMOTE_SHELL CLOSE OK":
+        "Wave UMB-W19 R137.M1: src/kernel/core/svc/remote_shell.pdx "
+        "emits this from _remote_shell_close. Unreachable from any "
+        "production path at M1 (same reason as ACCEPT OK). Retires "
+        "when R137.M2 wires the cap-invoke CLOSE op.",
+
     # Wave UMB-W14 R127.M3 (paideia-os#2599): raw-mode TTY substrate.
     # SHELL_SESSION RAW OK fires from _shell_session_set_raw's success
     # tail (and from ks_op_set_raw transitively via KIND_SHELL_SESSION

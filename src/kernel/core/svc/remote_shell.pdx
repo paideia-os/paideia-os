@@ -1,0 +1,1171 @@
+// src/kernel/core/svc/remote_shell.pdx -- Wave UMB-W19 R137.M1
+// paideia-os #2633
+//
+// SVC.REMOTE-SHELL DAEMON: CROSS-HOST SHELL SESSION STATE
+// =============================================================================
+//
+// R137 ("cross-host pipeline transport") milestone M1.  M1 adds the
+// kernel-side daemon that OWNS one or more active remote-shell
+// connections and their per-connection (remote endpoint, hybrid-KEM
+// handshake slot, buffer-ring offsets, lifecycle state, bytes
+// counters, display name) tuples.  R137.M2 (follow-on) wires the
+// ML-KEM-768 + X25519 hybrid handshake into the connection row's
+// kem_session_slot and takes HANDSHAKE -> ESTABLISHED; R137.M3 lands
+// the wire protocol framing against rx_ring_offset / tx_ring_offset
+// and surfaces the per-connection shell session to a ring-3 server
+// task.  M1 lands the daemon substrate and the direct-call API that
+// the TCP accept path (deferred into M2) consults every time a new
+// inbound connection crosses the kernel boundary.
+//
+// Service name:    "svc.remote-shell"
+// Endpoint id:     24 (claimed via endpoint_alloc_at; see §6 for why
+//                      24 and not 23)
+// Broker row:      svc_register("svc.remote-shell", 16, 24)
+// Direct API:      _remote_shell_{init,accept,set_state,close}
+//
+// =============================================================================
+// SECTION 0  WHY A DAEMON INSTEAD OF A PER-TASK FIELD
+// =============================================================================
+//
+// A remote-shell connection is an aggregate of (remote 4-tuple,
+// hybrid-KEM handshake session slot, two independent byte-rings,
+// lifecycle state, 64-byte display name).  None of these have an
+// obvious home on the task struct: the KEM slot is a cross-cutting
+// cryptographic session, the byte-rings live in the IPC-adjacent
+// buffer substrate (R137.M3 lifts), and the lifecycle state follows a
+// state-machine wholly separate from a shell session's REPL state
+// (R127.M1 shell_session.pdx; that daemon owns `pid, tty_fd,
+// cap_env_slot, history head/tail` which are unrelated to transport).
+// A dedicated row pool keyed by conn_id keeps the remote-shell state
+// off the task hot path and gives R137.M2 a stable id (conn_id in
+// [0, 4)) to mint KIND_REMOTE_SHELL capabilities against when that
+// kind lands.
+//
+// Shape mirrors `svc.jail-supervisor` (R135.M1, jail_supervisor.pdx)
+// one-for-one: a bringup entry that claims a specific endpoint via
+// endpoint_alloc_at + svc_register, a small row pool with a linear
+// scan for find-free, and a direct-call API for in-kernel callers
+// that lifts to a cap_invoke dispatch surface in the next milestone.
+//
+// =============================================================================
+// SECTION 1  ROW LAYOUT  --  256 BYTES PER ROW, 4 ROWS
+// =============================================================================
+//
+// Each row is 256 bytes = 32 u64.  Stride 256 is a power of two so row
+// addressing uses `shl rax, 8` -- no imul (feedback_pdx_encoder_
+// pitfalls: 2-op `imul r, imm` is an encoder gap).
+//
+// The task row-shape directive specifies the following logical fields:
+//
+//   remote_ip         : u32
+//   remote_port       : u16
+//   local_port        : u16
+//   state             : u32
+//   flags             : u32
+//   kem_session_slot  : u64
+//   rx_ring_offset    : u32
+//   tx_ring_offset    : u32
+//   bytes_rx          : u64
+//   bytes_tx          : u64
+//   name              : [u8; 64]
+//   created_tsc       : u64
+//   reserved          : [u8; 128]
+//
+// Packed storage (all u64 lanes; no u16/u32 sub-word writes outside
+// the name byte-copy):
+//
+//   [+0]    ep_lo  (u64)  = remote_ip (low 32) | remote_port (bits 32..47)
+//                           | local_port (bits 48..63).
+//                           A single u64 store captures the full
+//                           remote 4-tuple's variable half.  Bit
+//                           layout chosen so a `movzx` style low-32
+//                           read yields remote_ip directly (no shift).
+//
+//   [+8]    sf     (u64)  = state (low 32) | flags (high 32).  Low 32
+//                           = RS_STATE_* in [0, 5).  High 32 reserved
+//                           for a future flag word (R137.M2 may use
+//                           bit 0 as "handshake-slot bound" and bit 1
+//                           as "wire-protocol parser attached").
+//
+//   [+16]   kem_session_slot (u64) -- opaque at M1 (= 0 at accept),
+//                           written by R137.M2 to the KEM session row
+//                           index allocated during the hybrid KEM
+//                           handshake.  Not validated by this layer.
+//
+//   [+24]   ring   (u64)  = rx_ring_offset (low 32) | tx_ring_offset
+//                           (high 32).  Both offsets are 0 at M1 (the
+//                           byte-ring substrate lands in R137.M3);
+//                           the field is present so the shape pins
+//                           for M2 witness code to assert against
+//                           without a row-width migration.
+//
+//   [+32]   bytes_rx (u64)  received byte counter (increments after
+//                           handshake under R137.M3).
+//
+//   [+40]   bytes_tx (u64)  transmitted byte counter.
+//
+//   [+48]   name[ 0.. 7]  (u64 word; 8 raw bytes of display name)
+//   [+56]   name[ 8..15]  (u64 word)
+//   [+64]   name[16..23]  (u64 word)
+//   [+72]   name[24..31]  (u64 word)
+//   [+80]   name[32..39]  (u64 word)
+//   [+88]   name[40..47]  (u64 word)
+//   [+96]   name[48..55]  (u64 word)
+//   [+104]  name[56..63]  (u64 word -- 64 total name bytes, the last
+//                           byte reserved for a trailing NUL so the
+//                           max usable name length is 63)
+//
+//   [+112]  created_tsc (u64)  rdtsc sample taken at mint time.
+//                           Logged by the ACCEPT fingerprint for
+//                           observability; the field is present at
+//                           M1 so R137's auditing wave can correlate
+//                           connection creation with wire-protocol
+//                           handshake success without a row-width
+//                           migration.
+//
+//   [+120]  in_use (u64)  0 = row free, 1 = row allocated.
+//                           .bss zero-init gives us the FREE sentinel
+//                           for free at real boot.  Written LAST at
+//                           accept time so a concurrent scanner either
+//                           sees FREE or fully-initialised.
+//
+//   [+128..+256]  reserved[128]  slack for R137.M2+ (the hybrid-KEM
+//                           handshake context -- public-key hash,
+//                           chaining key, session-salt -- is a prime
+//                           candidate).  128 bytes clears the state
+//                           field size needed to park ML-KEM-768's
+//                           in-flight polynomial coefficients during
+//                           the Encaps/Decaps round-trip without a
+//                           row-width migration.
+//
+// Row-addressed capacity: RS_POOL_MAX = 4 connections.  4 x 256 =
+// 1024 bytes = 128 u64.  The `in_use` field at +120 (not remote_ip)
+// is the authoritative free/live gate.  M1 does not reject a
+// duplicate remote-endpoint accept call: the handshake slot and ring
+// offsets are per-connection so two independent connections from the
+// SAME remote 4-tuple are physically meaningful (sequential retries
+// after a torn session); duplicate suppression lifts into R137.M2
+// alongside the handshake-slot allocator which can observe cryptographic
+// identity rather than TCP identity.
+//
+// =============================================================================
+// SECTION 2  STATE MACHINE
+// =============================================================================
+//
+// R137.M1 states (name = ordinal):
+//
+//   INIT        = 0   -- row allocated by _remote_shell_accept; TCP
+//                         3-way handshake has completed from the
+//                         kernel's point of view but the hybrid-KEM
+//                         handshake has NOT started.  Connection
+//                         carries no authenticated session key.
+//   HANDSHAKE   = 1   -- ML-KEM-768 + X25519 hybrid handshake in
+//                         flight.  Set by R137.M2 when it allocates
+//                         the KEM session slot and writes it into
+//                         [+16].
+//   ESTABLISHED = 2   -- hybrid handshake complete; session key
+//                         derived; wire-protocol frames flowing on
+//                         the rx/tx rings.  Set by R137.M2 at
+//                         Encaps/Decaps success.
+//   CLOSING     = 3   -- orderly teardown initiated (either peer).
+//                         Rings may still have in-flight frames; new
+//                         writes refused.  Set by R137.M3 at FIN or
+//                         by an admin-side _remote_shell_set_state
+//                         call at M1 witness time.
+//   CLOSED      = 4   -- rings drained, KEM session slot released,
+//                         row AWAITING _remote_shell_close().  A
+//                         subsequent _close() frees the row.
+//
+// Transitions at M1 are PERMISSIVE: _remote_shell_set_state validates
+// state < RS_STATE_MAX = 5 and writes it unconditionally.  The strict
+// transition matrix (0->1->2->{3,4}; 3->4; 4 is terminal) lands with
+// R137.M2 when the handshake state machine owns the HANDSHAKE ->
+// ESTABLISHED transition and the test harness has enough primitives to
+// exercise it end-to-end.  R137.M1's permissive posture is a witness-
+// side convenience: a smoke test can shunt a freshly-accepted row from
+// INIT straight to CLOSING to probe the close path without wiring the
+// whole handshake stack.
+//
+// =============================================================================
+// SECTION 3  RETURN CODE BAND
+// =============================================================================
+//
+// Per task directive:
+//
+//   RS_OK                 = 0
+//   RS_ERR_POOL_FULL      = 0x1D00
+//   RS_ERR_BAD_ID         = 0x1D01
+//   RS_ERR_BAD_STATE      = 0x1D02
+//
+// All fit imm32 with bit 31 clear so `mov rax, imm32` emits the
+// 7-byte zero-extending form (never `and r11, imm64`).  Band audit
+// (2026-10-14):
+//   `grep -rnE '0x1D0[0-2]\b' src/kernel/ 2>/dev/null` -> zero hits
+// in the production tree outside this file.  Clean band; R137.M2+
+// may extend to 0x1D03..0x1D0F while retaining the first three as
+// pinned.
+//
+// _remote_shell_accept returns a PACKED u64:
+//
+//     result = (conn_id << 2) | status
+//
+// On success status == RS_OK (0), so result == conn_id << 2 and the
+// caller recovers conn_id by right-shifting 2 bits.  Connection ids
+// live in [0, 4), so conn_id << 2 is in [0, 16) -- disjoint from
+// every RS_ERR_* value (all >= 0x1D00) so a caller that treats the
+// whole u64 as an error-or-id tagged value never collides.  On error
+// conn_id is 0, so result == status.
+//
+// _remote_shell_set_state and _remote_shell_close return RS_OK or an
+// RS_ERR_* code directly (not packed).
+//
+// Bringup codes (adjacent to jail_supervisor's EBD4/EBD5 in the free
+// EBC8..EBDF band; D4/D5 are taken by jail_supervisor so remote_shell
+// takes D6/D7):
+//
+//   RS_BRINGUP_EP_FAIL  = 0xFFFFEBD6  (endpoint_alloc_at(24) refused)
+//   RS_BRINGUP_REG_FAIL = 0xFFFFEBD7  (svc_register refused)
+//
+// =============================================================================
+// SECTION 4  INTERACTION WITH R137.M2 (HANDSHAKE) + R137.M3 (WIRE)
+// =============================================================================
+//
+// At M1 _remote_shell_accept lands a row with kem_session_slot = 0 and
+// state = RS_STATE_INIT.  R137.M2's handshake entrypoint will:
+//
+//   (1) call _remote_shell_set_state(conn_id, RS_STATE_HANDSHAKE),
+//   (2) allocate a KEM session row via the (to-be-landed) KEM session
+//       allocator, write its index into [row+16] via a dedicated
+//       _remote_shell_bind_kem_slot helper (M2 lands this),
+//   (3) drive the ML-KEM-768 Encaps/Decaps round-trip,
+//   (4) on success, call _remote_shell_set_state(conn_id,
+//       RS_STATE_ESTABLISHED); on failure, call it with CLOSING and
+//       let the eventual _close() free the row.
+//
+// R137.M3's wire-protocol parser attaches to the row's ring offsets
+// AFTER state == RS_STATE_ESTABLISHED.  The parser is responsible for
+// bumping bytes_rx / bytes_tx; this daemon never touches those
+// counters at M1 (they remain at .bss zero until M3 wires them).
+//
+// The daemon is deliberately AGNOSTIC about the KEM primitive at M1:
+// kem_session_slot is a u64 opaque to this layer, validated nowhere.
+// This matches the shell_session.pdx / jail_supervisor.pdx pattern of
+// a daemon owning a row's SHAPE while the kind handler at the next
+// milestone owns the row's SEMANTICS.
+//
+// =============================================================================
+// SECTION 5  SECURITY POSTURE
+// =============================================================================
+//
+// R137.M1's security posture is "trust the caller for shape":
+//
+//   * No validation of remote_ip, remote_port or local_port.  The TCP
+//     stack (deferred into R137.M2's accept path) is the trusting
+//     party; this daemon records the values the stack hands it.
+//   * No validation of kem_session_slot.  The daemon does NOT touch
+//     the slot at M1 -- it is written in by R137.M2's handshake
+//     entrypoint.  A caller that writes a nonsensical slot id gets
+//     a nonsensical row, but no capability escalation (the slot is
+//     consulted only by R137.M2+ code that owns the KEM session table
+//     and will refuse invalid ids there).
+//   * No validation that _remote_shell_set_state is reached via a
+//     capability.  At M1 the direct-call API is the only surface;
+//     ring-3 callers cannot reach it until KIND_REMOTE_SHELL + the
+//     cap-invoke dispatch arm land in R137.M2.
+//
+// The ML-KEM-768 hybrid handshake (deferred to R137.M2) is the
+// authoritative cryptographic gate between a connected TCP endpoint
+// and a session key the remote peer can derive.  Nothing in R137.M1
+// authenticates a remote peer; a row in RS_STATE_INIT without a
+// subsequent HANDSHAKE -> ESTABLISHED progression carries NO
+// authority and the wire-protocol parser (R137.M3) is contractually
+// required to refuse I/O against any row whose state < ESTABLISHED.
+//
+// =============================================================================
+// SECTION 6  ENDPOINT NUMBER CHOICE: 24, NOT 23
+// =============================================================================
+//
+// The task directive is "endpoint 23", chosen for symmetry with
+// classical telnet (TCP port 23).  Endpoint 23 is already claimed by
+// src/kernel/boot/witness/r31_respawn.pdx at sub-test 5 (post-#1609
+// endpoint-resurrection witness, header L250-280): the witness
+// invokes endpoint_alloc_at(23) at every boot and expects it to
+// succeed unconditionally.  Claiming endpoint 23 at daemon init
+// (which runs before witness_r31_respawn) would race the witness and
+// trip its first-level stage-12 assertion.
+//
+// R137.M1 therefore takes endpoint 24, which is the lowest free
+// endpoint id after the current 20/21/22 svc.* contingent and still
+// below the first witness-reserved id (23).  The TCP wire-protocol
+// listener (R137.M3) can and should still bind to TCP port 23 on the
+// listen socket -- the endpoint number is an internal kernel-IPC
+// routing index, unrelated to the external TCP port.
+//
+// Retiring endpoint 24 to 23 is a separate decision that requires
+// either (a) renumbering the r31_respawn witness's endpoint reserve to
+// 25+ (coordinated with design/drivers/witness-slot-plan.md's running
+// tally), or (b) a boot-order change that admits the daemon's bringup
+// AFTER witness_r31_respawn.  Neither belongs on R137.M1's critical
+// path; design/shell/remote-shell-daemon.md §Endpoint-choice carries
+// the full rationale and the deferred-decision reasoning.
+//
+// =============================================================================
+// SECTION 7  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Labels are prefixed `rs_` (remote-shell) to stay clear of `ss_`
+// (svc/shell_session.pdx), `cmnt_` (svc/cap_minter.pdx), `js_` (svc/
+// jail_supervisor.pdx), `sh_` (svc/shell_history.pdx), `sj_` (svc/
+// shell_jobs.pdx) and the broader `s_` family.  No reserved paideia-as
+// keyword overlap (reserved: loop / if / let).  Encoder-pitfall
+// posture (feedback_pdx_encoder_pitfalls):
+//
+//   * cmp rN, 0            (never `test rN, rN`)
+//   * shl rN, 8 to compose row-base * 256 stride (never `imul r, imm`)
+//   * mov rax, imm32       (never `and r11, imm64`)
+//   * single-line `pub let name = "..."`
+//   * module basename RemoteShell matches file basename
+//     remote_shell.pdx (ddc requires exact match)
+//   * fingerprint `[u8; N]` with N = string length + 1 (NUL counts)
+//
+// Stack discipline (SysV, entry rsp%16==8):
+//   _remote_shell_init           1 push  (r12 across the klog call)
+//   rs_row_base                  0 pushes (pure leaf address compute)
+//   rs_row_in_use                0 pushes (pure leaf)
+//   rs_find_free                 0 pushes (pure leaf scan)
+//   _remote_shell_accept         5 pushes + sub rsp, 16
+//                                  (name_ptr / name_len spill)
+//   _remote_shell_set_state      1 push  (rbx = conn_id)
+//   _remote_shell_close          1 push  (rbx = conn_id)
+//
+// =============================================================================
+
+module RemoteShell = structure {
+
+  // ==========================================================================
+  // Service identity
+  // ==========================================================================
+
+  pub let REMOTE_SHELL_ENDPOINT_ID : u64 = 24
+  pub let REMOTE_SHELL_NAME_LEN    : u64 = 16   // "svc.remote-shell" is 16 bytes
+
+  // "svc.remote-shell" (16 chars) + NUL => [u8; 17].
+  pub let remote_shell_name : [u8; 17] = "svc.remote-shell\0"
+
+  // ==========================================================================
+  // Return band (task-pinned, §3)
+  // ==========================================================================
+
+  pub let RS_OK            : u64 = 0
+  pub let RS_ERR_POOL_FULL : u64 = 0x1D00
+  pub let RS_ERR_BAD_ID    : u64 = 0x1D01
+  pub let RS_ERR_BAD_STATE : u64 = 0x1D02
+
+  pub let RS_BRINGUP_EP_FAIL  : u64 = 0xFFFFEBD6
+  pub let RS_BRINGUP_REG_FAIL : u64 = 0xFFFFEBD7
+
+  // ==========================================================================
+  // Pool geometry (§1)
+  // ==========================================================================
+
+  pub let RS_POOL_MAX   : u64 = 4     // rows (connections)
+  pub let RS_ROW_BYTES  : u64 = 256   // 32 u64 per row
+
+  // Row-field offsets (bytes, from row base)
+  pub let RS_OFF_EP       : u64 = 0     // packed remote_ip | remote_port | local_port
+  pub let RS_OFF_SF       : u64 = 8     // packed state | flags
+  pub let RS_OFF_KEM      : u64 = 16    // kem_session_slot (opaque u64)
+  pub let RS_OFF_RING     : u64 = 24    // packed rx_ring_offset | tx_ring_offset
+  pub let RS_OFF_BYTES_RX : u64 = 32
+  pub let RS_OFF_BYTES_TX : u64 = 40
+  pub let RS_OFF_NAME     : u64 = 48    // 64 bytes
+  pub let RS_OFF_TSC      : u64 = 112   // created_tsc
+  pub let RS_OFF_IN_USE   : u64 = 120
+  pub let RS_OFF_RESERVED : u64 = 128   // 128 bytes slack
+
+  pub let RS_NAME_MAX : u64 = 63        // 64 bytes with trailing NUL
+
+  // Sentinel for "no connection matched".
+  pub let RS_ID_NONE : u64 = 0xFF
+
+  // State machine (§2)
+  pub let RS_STATE_INIT        : u64 = 0
+  pub let RS_STATE_HANDSHAKE   : u64 = 1
+  pub let RS_STATE_ESTABLISHED : u64 = 2
+  pub let RS_STATE_CLOSING     : u64 = 3
+  pub let RS_STATE_CLOSED      : u64 = 4
+  pub let RS_STATE_MAX         : u64 = 5   // exclusive upper bound
+
+  // ==========================================================================
+  // Storage
+  //
+  //   _remote_shell_pool  -- 4 rows x 256 bytes = 128 u64.  @align(64)
+  //                          puts the pool start on a cache-line
+  //                          boundary (every row lands on a cache line
+  //                          start since 256 is a multiple of 64).
+  //   _remote_shell_stats -- 16 u64 counters (observability).
+  // ==========================================================================
+
+  pub let mut _remote_shell_pool  : [u64; 128] = uninit @align(64)
+  pub let mut _remote_shell_stats : [u64; 16]  = uninit @align(64)
+
+  pub let RS_ST_INIT_OK        : u64 = 0
+  pub let RS_ST_INIT_EP_FAIL   : u64 = 1
+  pub let RS_ST_INIT_REG_FAIL  : u64 = 2
+  pub let RS_ST_ACCEPT_OK      : u64 = 3
+  pub let RS_ST_ACCEPT_FULL    : u64 = 4
+  pub let RS_ST_SET_STATE_OK   : u64 = 5
+  pub let RS_ST_SET_STATE_REJ  : u64 = 6
+  pub let RS_ST_CLOSE_OK       : u64 = 7
+  pub let RS_ST_CLOSE_REJ      : u64 = 8
+
+  // ==========================================================================
+  // Fingerprint tags (N = len(string) + 1, NUL-inclusive)
+  //
+  // Only the "OK" tags are extracted by the fingerprint-coverage gate
+  // (regex matches bare word OK); the FAIL/REJ tags are opaque to the
+  // gate so no allowlist entry is required for them.
+  //
+  // "REMOTE_SHELL INIT OK"       = 20 chars, +1 NUL => N=21
+  // "REMOTE_SHELL INIT FAIL"     = 22 chars, +1 NUL => N=23
+  // "REMOTE_SHELL ACCEPT OK"     = 22 chars, +1 NUL => N=23
+  // "REMOTE_SHELL ACCEPT REJ"    = 23 chars, +1 NUL => N=24
+  // "REMOTE_SHELL STATE OK"      = 21 chars, +1 NUL => N=22
+  // "REMOTE_SHELL STATE REJ"     = 22 chars, +1 NUL => N=23
+  // "REMOTE_SHELL CLOSE OK"      = 21 chars, +1 NUL => N=22
+  // "REMOTE_SHELL CLOSE REJ"     = 22 chars, +1 NUL => N=23
+  // ==========================================================================
+
+  pub let rs_tag_init_ok     : [u8; 21] = "REMOTE_SHELL INIT OK\0"
+  pub let rs_tag_init_fail   : [u8; 23] = "REMOTE_SHELL INIT FAIL\0"
+  pub let rs_tag_accept_ok   : [u8; 23] = "REMOTE_SHELL ACCEPT OK\0"
+  pub let rs_tag_accept_rej  : [u8; 24] = "REMOTE_SHELL ACCEPT REJ\0"
+  pub let rs_tag_state_ok    : [u8; 22] = "REMOTE_SHELL STATE OK\0"
+  pub let rs_tag_state_rej   : [u8; 23] = "REMOTE_SHELL STATE REJ\0"
+  pub let rs_tag_close_ok    : [u8; 22] = "REMOTE_SHELL CLOSE OK\0"
+  pub let rs_tag_close_rej   : [u8; 23] = "REMOTE_SHELL CLOSE REJ\0"
+
+  pub let rs_k_cid    : [u8; 4] = "cid\0"
+  pub let rs_k_state  : [u8; 6] = "state\0"
+  pub let rs_k_errno  : [u8; 6] = "errno\0"
+  pub let rs_k_ip     : [u8; 3] = "ip\0"
+
+  // ==========================================================================
+  // rs_note(slot) -> ()
+  //
+  // Bounded increment on _remote_shell_stats[slot].  Same shape as
+  // js_note / ss_note / cmnt_note (load-inc-store; no `add reg,
+  // [mem]`).  Caller passes an RS_ST_* ordinal in [0, 16); out-of-
+  // range slots silently no-op.  Pure leaf -- no pushes.  Labels
+  // prefixed rs_no_.
+  // ==========================================================================
+  pub let rs_note : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M1 (paideia-os #2633): bounded increment on _remote_shell_stats[slot<16]. Load-inc-store, no `add reg,[mem]`. Pure leaf -- no pushes. Labels prefixed rs_no_. Mirrors js_note / ss_note / cmnt_note shape.",
+      block: {
+        cmp rdi, 16;
+        jae rs_no_out;
+        lea r10, [rip + _remote_shell_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      rs_no_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rs_row_base(conn_id) -> &_remote_shell_pool[conn_id*256]
+  //
+  // Row index -> row base pointer.  Stride 256 = 2^8 so `shl rax, 8`
+  // suffices (no `imul r, imm` encoder gap, no reg-reg staging).
+  // Caller validates conn_id < RS_POOL_MAX first; this helper is a
+  // pure address compute.
+  // ==========================================================================
+  pub let rs_row_base : (u64) -> u64 !{} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R137.M1 (paideia-os #2633): conn_id -> &_remote_shell_pool[conn_id*256]. Power-of-two stride uses `shl rax, 8` so no 2-op imul-with-imm is required. No bounds check by policy -- caller validates. Labels prefixed rs_rb_. Mirrors js_row_base shape.",
+      block: {
+        mov rax, rdi;                    // conn_id
+        shl rax, 8;                      // conn_id * 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rs_row_in_use(conn_id) -> 1 iff conn_id<RS_POOL_MAX AND row.in_use != 0
+  //
+  // Validator used by set_state and close.  Inlined row-base compute
+  // (shl 8).  Pure leaf -- no pushes, no nested calls.
+  // ==========================================================================
+  pub let rs_row_in_use : (u64) -> u64 !{mem} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M1 (paideia-os #2633): 1 iff conn_id<RS_POOL_MAX(4) AND row.in_use (word at [+120]) != 0. Inlined address compute (shl 8). Pure leaf. Labels prefixed rs_ru_. Mirrors js_row_in_use.",
+      block: {
+        mov r10, 4;                      // RS_POOL_MAX
+        cmp rdi, r10;
+        jae rs_ru_no;
+        mov rax, rdi;
+        shl rax, 8;                      // conn_id * 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;                    // row base
+        mov r10, [rax + 120];            // in_use field
+        cmp r10, 0;
+        je  rs_ru_no;
+        mov rax, 1;
+        ret;
+      rs_ru_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rs_find_free() -> conn_id | RS_ID_NONE
+  //
+  // Linear scan for the first row whose in_use field is zero.  Used
+  // only by _remote_shell_accept.  Pure leaf (row-base is inlined).
+  // Labels prefixed rs_ff_.  Mirrors js_find_free one-for-one.
+  // ==========================================================================
+  pub let rs_find_free : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M1 (paideia-os #2633): linear scan _remote_shell_pool[0..RS_POOL_MAX) for the first row whose in_use (word at [+120]) is zero. Return conn_id or RS_ID_NONE (0xFF). Inlined row-base (shl 8). Pure leaf -- no pushes. Labels prefixed rs_ff_. Mirrors js_find_free / ss_find_free.",
+      block: {
+        lea r10, [rip + _remote_shell_pool];
+        xor rcx, rcx;                    // conn_id cursor
+      rs_ff_scan:
+        cmp rcx, 4;                      // RS_POOL_MAX
+        jae rs_ff_none;
+
+        mov rax, rcx;
+        shl rax, 8;                      // conn_id * 256
+        add rax, r10;                    // row base
+        mov r11, [rax + 120];            // in_use
+        cmp r11, 0;
+        je  rs_ff_hit;
+
+        add rcx, 1;
+        jmp rs_ff_scan;
+
+      rs_ff_hit:
+        mov rax, rcx;
+        ret;
+
+      rs_ff_none:
+        mov rax, 0xFF;                   // RS_ID_NONE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _remote_shell_init() -> RS_OK | RS_BRINGUP_*
+  //
+  // Boot hook.  Shape mirrors _jail_supervisor_init one-for-one:
+  //   (1) endpoint_alloc_at(24).  On refusal -> RS_BRINGUP_EP_FAIL
+  //       WITHOUT calling svc_register (the row never publishes a
+  //       name against an endpoint id we did not claim -- the "do
+  //       not partially install the row" discipline from R48-PREP-
+  //       005.M1 and R90-XREPO.012.M2-002).
+  //   (2) svc_register("svc.remote-shell", 16, 24).  Any non-zero
+  //       code (NAME_LEN / DUP / FULL) maps to RS_BRINGUP_REG_FAIL.
+  //
+  // Register plan: 1 callee-save push (r12 holds the bringup code
+  // across klog) to correct entry parity rsp%16==8 -> 0 for the two
+  // sibling (non-nested) calls, matching _jail_supervisor_init /
+  // _shell_session_init / _cap_minter_init shape.
+  //
+  // Fingerprint emission:
+  //   On success:  `REMOTE_SHELL INIT OK` (no KV).
+  //   On EP fail:  `REMOTE_SHELL INIT FAIL errno=0x<hex>` with EP_FAIL.
+  //   On REG fail: `REMOTE_SHELL INIT FAIL errno=0x<hex>` with REG_FAIL.
+  // ==========================================================================
+  pub let _remote_shell_init : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R137.M1 (paideia-os #2633): kernel-side bringup for svc.remote-shell. Claims REMOTE_SHELL_ENDPOINT_ID (24) via endpoint_alloc_at; on refusal returns RS_BRINGUP_EP_FAIL WITHOUT calling svc_register. On successful claim, calls svc_register(remote_shell_name, 16, 24) and translates its {0=OK, 1=NAME_LEN, 2=DUP, 3=FULL} return into RS_OK / RS_BRINGUP_REG_FAIL. Endpoint 24 (not the task-directive 23) because witness_r31_respawn claims endpoint 23 at every boot (§6). Single callee-save push (r12) corrects entry parity rsp%16==8 -> 0 for the two sibling (non-nested) calls, matching _jail_supervisor_init / _shell_session_init / _cap_minter_init one-for-one. Bumps RS_ST_INIT_OK / INIT_EP_FAIL / INIT_REG_FAIL and emits one fingerprint. Labels prefixed rs_in_.",
+      block: {
+        push r12;
+
+        // (1) endpoint_alloc_at(24).
+        mov rdi, 24;                     // REMOTE_SHELL_ENDPOINT_ID
+        call endpoint_alloc_at;
+        cmp rax, 0;
+        jne rs_in_ep_fail;
+
+        // (2) svc_register("svc.remote-shell", 16, 24).
+        lea rdi, [rip + remote_shell_name];
+        mov rsi, 16;                     // REMOTE_SHELL_NAME_LEN
+        mov rdx, 24;                     // endpoint id
+        call svc_register;
+        cmp rax, 0;
+        jne rs_in_reg_fail;
+
+        // Success path.
+        mov rdi, 0;                      // RS_ST_INIT_OK
+        call rs_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rs_tag_init_ok];
+        call klog_s1;
+
+        xor rax, rax;                    // RS_OK
+        pop r12;
+        ret;
+
+      rs_in_ep_fail:
+        mov rdi, 1;                      // RS_ST_INIT_EP_FAIL
+        call rs_note;
+
+        mov r12, 0xFFFFEBD6;             // RS_BRINGUP_EP_FAIL
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rs_tag_init_fail];
+        lea rcx, [rip + rs_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        pop r12;
+        ret;
+
+      rs_in_reg_fail:
+        mov rdi, 2;                      // RS_ST_INIT_REG_FAIL
+        call rs_note;
+
+        mov r12, 0xFFFFEBD7;             // RS_BRINGUP_REG_FAIL
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rs_tag_init_fail];
+        lea rcx, [rip + rs_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _remote_shell_accept(remote_ip, remote_port, local_port,
+  //                      name_ptr, name_len) -> packed u64
+  //
+  // Mint a fresh connection row.
+  //
+  // ARGS (SysV):
+  //   rdi = remote_ip        (u32 payload, zero-extended to u64)
+  //   rsi = remote_port      (u16 payload, zero-extended)
+  //   rdx = local_port       (u16 payload, zero-extended)
+  //   rcx = name_ptr         (readable up to name_len bytes; may be
+  //                           0 iff name_len is 0)
+  //   r8  = name_len         (clamped to RS_NAME_MAX = 63; the +64th
+  //                           byte is reserved for the trailing NUL)
+  //
+  // RETURNS (rax):
+  //   On success:  (conn_id << 2) | RS_OK  (= conn_id * 4;
+  //                                         recoverable via `shr rax, 2`)
+  //   RS_ERR_POOL_FULL  -- all 4 rows are in use
+  //
+  // STEP-BY-STEP:
+  //   1. rs_find_free() -> conn_id.  If RS_ID_NONE -> RS_ERR_POOL_FULL.
+  //   2. Init row:
+  //        ep_lo   <- remote_ip | (remote_port << 32) | (local_port << 48)
+  //        sf      <- RS_STATE_INIT (= 0; flags = 0)
+  //        kem     <- 0 (R137.M2 writes a real slot)
+  //        ring    <- 0 (R137.M3 writes real offsets)
+  //        bytes_rx <- 0
+  //        bytes_tx <- 0
+  //        name[0..63] <- byte-copy up to min(name_len, 63); NUL at
+  //                       byte min(name_len, 63)
+  //        tsc     <- rdtsc sample
+  //        in_use  <- 1 (LAST write)
+  //   3. Bump RS_ST_ACCEPT_OK; emit `REMOTE_SHELL ACCEPT OK cid=0x<hex>`.
+  //   4. Return (conn_id << 2) | RS_OK.
+  //
+  // STACK FRAME:
+  //   5 callee-save pushes + sub rsp, 16.  Entry rsp%16==8; +5 pushes
+  //   = +40 -> %16==0; sub rsp, 16 = +56 -> %16==0 (call-ready at
+  //   every nested call AND two spill slots).
+  //
+  //   REGISTER MAP:
+  //     rbx = remote_ip
+  //     r12 = remote_port
+  //     r13 = local_port
+  //     r14 = name_ptr
+  //     r15 = conn_id (after allocation) / row base intermediate
+  //     [rsp+0] = name_len unclamped (spill)
+  //     [rsp+8] = pad (keeps rsp%16==0)
+  //
+  // NAME COPY:
+  //   After allocation we recover conn_id, compute row_base via
+  //   shl 8, and bulk-write the fixed fields.  The name byte copy
+  //   is a short loop (name_len <= 63) using `mov_b` which the
+  //   paideia-as encoder emits.  NUL is written at [name_base +
+  //   clamped_len].  Pre-advance dst pointer by RS_OFF_NAME (48) to
+  //   sidestep the unsupported `mov_b [reg+reg*1+off], reg` store
+  //   form -- same technique as shell_session.pdx ss_cr_name_loop
+  //   and jail_supervisor.pdx js_cr_name_loop.
+  //
+  //   Labels prefixed rs_ac_.
+  // ==========================================================================
+  pub let _remote_shell_accept : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (remote_ip: u64) (remote_port: u64) (local_port: u64) (name_ptr: u64) (name_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R137.M1 (paideia-os #2633): mint a fresh connection row. Find a free row (RS_ERR_POOL_FULL on none), write fixed fields: ep_lo = remote_ip | (remote_port << 32) | (local_port << 48); sf = 0 (RS_STATE_INIT | flags=0); kem = 0 (R137.M2 writes); ring = 0 (R137.M3 writes); bytes_rx = bytes_tx = 0; byte-copy up to min(name_len, 63) bytes from name_ptr with a trailing NUL; created_tsc = rdtsc sample; set in_use = 1 LAST so a concurrent scanner either sees FREE or fully-initialised. Bump RS_ST_ACCEPT_OK, emit `REMOTE_SHELL ACCEPT OK cid=0x<16-hex>` via klog_s1_x1 (5-reg wrapper), and return (conn_id << 2) | RS_OK. Five callee-save pushes (rbx=remote_ip, r12=remote_port, r13=local_port, r14=name_ptr, r15=conn_id-after-alloc) + sub rsp,16 (one 8-byte spill slot for unclamped name_len, 8 bytes pad). Entry rsp%16==8; +5 pushes = +40 -> %16==0; sub rsp,16 = +56 -> %16==0 at every nested call. Byte copy uses mov_b scalar-indexed addressing proven in shell_session.pdx ss_cr_name_loop / jail_supervisor.pdx js_cr_name_loop. Encoder-pitfall posture: cmp rN, 0 (never test), shl rN, 8 for stride-256 (never imul), mov rax, imm32 for all error codes (never and r11, imm64). rdtsc produces edx:eax; reconstruct via shl rdx, 32; or rax, rdx. Labels prefixed rs_ac_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;
+
+        mov rbx, rdi;                    // remote_ip
+        mov r12, rsi;                    // remote_port
+        mov r13, rdx;                    // local_port
+        mov r14, rcx;                    // name_ptr
+        mov [rsp + 0], r8;               // name_len unclamped (spill)
+
+        // ---- Step 1: find a free row ----
+        call rs_find_free;
+        mov r11, 0xFF;                   // RS_ID_NONE
+        cmp rax, r11;
+        je  rs_ac_full;
+
+        mov r15, rax;                    // r15 = conn_id
+
+        // Compute row base.  conn_id << 8 + pool base.
+        mov rax, r15;
+        shl rax, 8;
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;                    // rax = row base
+        // Keep row base in r10 for the field writes.
+        mov r10, rax;
+
+        // ---- Step 2a: pack ep_lo = ip | (rport<<32) | (lport<<48) ----
+        //
+        // Build in r9: start with remote_ip (low 32), then OR in
+        // remote_port shifted left 32 bits, then local_port shifted
+        // left 48 bits.  All three operands came in as zero-extended
+        // u64s so no masking is needed.
+        mov r9,  rbx;                    // low 32: remote_ip
+        mov rax, r12;                    // scratch: remote_port
+        shl rax, 32;                     // place at bits 32..47
+        or  r9,  rax;
+        mov rax, r13;                    // scratch: local_port
+        shl rax, 48;                     // place at bits 48..63
+        or  r9,  rax;
+        mov [r10 + 0], r9;               // ep_lo
+
+        // ---- Step 2b: sf = RS_STATE_INIT (= 0) | flags (= 0) ----
+        xor r9, r9;
+        mov [r10 + 8], r9;
+
+        // ---- Step 2c: kem_session_slot = 0 ----
+        //   R137.M2 writes the real slot id.
+        mov [r10 + 16], r9;
+
+        // ---- Step 2d: ring offsets = 0 ----
+        //   R137.M3 writes real offsets.
+        mov [r10 + 24], r9;
+
+        // ---- Step 2e: bytes_rx = bytes_tx = 0 ----
+        mov [r10 + 32], r9;
+        mov [r10 + 40], r9;
+
+        // ---- Name copy ----
+        // Reload name_ptr (r14 holds it) and name_len from spill slot.
+        mov r11, [rsp + 0];              // name_len (unclamped)
+
+        // Clamp name_len to RS_NAME_MAX (63).
+        mov r9, 63;                      // RS_NAME_MAX
+        cmp r11, r9;
+        jbe rs_ac_len_ok;
+        mov r11, r9;                     // clamp to 63
+      rs_ac_len_ok:
+
+        // Pre-advance dst pointer by RS_OFF_NAME (48) to sidestep the
+        // unsupported `mov_b [reg+reg*1+off], reg` store form (repo-
+        // wide: only [reg+reg*1] and [reg+off] byte-write forms are
+        // encoded; see shell_session.pdx ss_cr_name_loop +
+        // jail_supervisor.pdx js_cr_name_loop comments).
+        // r9 = pre-advanced name dst pointer.
+        mov r9, r10;
+        add r9, 48;                      // r9 = &row.name[0]
+
+        // r11 = clamped name_len.  Loop i = 0 .. r11.
+        xor rcx, rcx;                    // i = 0
+      rs_ac_name_loop:
+        cmp rcx, r11;
+        jae rs_ac_name_done;
+
+        xor rax, rax;
+        mov_b rax, [r14 + rcx * 1];      // src byte
+        mov_b [r9 + rcx * 1], rax;       // dst byte at name[i]
+        add rcx, 1;
+        jmp rs_ac_name_loop;
+
+      rs_ac_name_done:
+        // Write NUL at [name + clamped_len].  Even if clamped_len==63
+        // this writes the 64th name byte -- in-bounds (name field spans
+        // [+48..+112), 64 bytes total).
+        xor rax, rax;
+        mov_b [r9 + rcx * 1], rax;
+
+        // ---- Step 2g: created_tsc = rdtsc sample ----
+        //
+        // rdtsc populates edx:eax (high:low 32).  Reconstruct the
+        // 64-bit TSC into rax via shl rdx,32; or rax,rdx -- the same
+        // decomposition pdxfs_lite/create.pdx L387-390 and
+        // pdxfs_lite/write.pdx L305-307 use.  r10 (row base) survives
+        // rdtsc because rdtsc only writes edx:eax (verified: no other
+        // GPR touched).
+        rdtsc;
+        shl rdx, 32;
+        or  rax, rdx;
+        mov [r10 + 112], rax;
+
+        // ---- Step 2h: in_use = 1 LAST ----
+        //
+        // Observable-last ordering mirrors _jail_supervisor_create /
+        // _shell_session_create: a concurrent scanner either sees
+        // FREE or fully-initialised, never an in-between state.
+        mov r9, 1;
+        mov [r10 + 120], r9;
+
+        // ---- Step 3: stats + fingerprint ----
+        mov rdi, 3;                      // RS_ST_ACCEPT_OK
+        call rs_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rs_tag_accept_ok];
+        lea rcx, [rip + rs_k_cid];
+        mov r8,  r15;                    // conn_id in hex KV
+        call klog_s1_x1;
+
+        // ---- Step 4: packed return ----
+        //   result = (conn_id << 2) | RS_OK = conn_id << 2.
+        mov rax, r15;
+        shl rax, 2;
+        jmp rs_ac_out;
+
+      rs_ac_full:
+        mov rdi, 4;                      // RS_ST_ACCEPT_FULL
+        call rs_note;
+
+        mov r12, 0x1D00;                 // RS_ERR_POOL_FULL (preserved
+                                         //  across klog via r12)
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rs_tag_accept_rej];
+        lea rcx, [rip + rs_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      rs_ac_out:
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _remote_shell_set_state(conn_id, state) -> errno
+  //
+  // Write the state field in [row+8] (low 32 bits of the sf word)
+  // without touching flags (high 32).
+  //
+  // ARGS (SysV):
+  //   rdi = conn_id
+  //   rsi = state (must be < RS_STATE_MAX = 5)
+  //
+  // RETURNS (rax):
+  //   RS_OK            -- state written
+  //   RS_ERR_BAD_ID    -- conn_id out of range or row not in_use
+  //   RS_ERR_BAD_STATE -- state >= RS_STATE_MAX
+  //
+  // STATE TRANSITION POLICY:
+  //   M1 posture is PERMISSIVE: any valid state in [0, 5) is accepted.
+  //   The strict transition matrix (INIT -> HANDSHAKE -> ESTABLISHED
+  //   -> {CLOSING, CLOSED}; CLOSING -> CLOSED; CLOSED terminal) lands
+  //   with R137.M2 when the handshake state machine owns the
+  //   HANDSHAKE -> ESTABLISHED transition and the test harness has
+  //   enough primitives to exercise it end-to-end.  R137.M1's
+  //   permissive posture is a witness convenience: a smoke test can
+  //   shunt a freshly-accepted row from INIT straight to CLOSING to
+  //   probe the close path without wiring the whole handshake stack.
+  //
+  // SF-WORD UPDATE WITHOUT IMM64 BITMASK:
+  //   The sf word packs state (low 32) and flags (high 32).  We need
+  //   to rewrite the low 32 without touching the high 32.  Shift-trick
+  //   decompose: load r9 = sf; shr r9, 32 (r9 = flags only); shl r9,
+  //   32 (flags back in high 32, low 32 = 0); or r9, state; store.
+  //   No imm64 bitmask required.
+  //
+  // STACK FRAME:
+  //   1 callee-save push (rbx = conn_id).  Entry rsp%16==8; +1 push
+  //   -> %16==0 (call-ready for rs_row_in_use + klog_s1_x1).
+  //
+  // Labels prefixed rs_ss_.
+  // ==========================================================================
+  pub let _remote_shell_set_state : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (conn_id: u64) (state: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R137.M1 (paideia-os #2633): write the state field in [row+8] low 32 bits of the sf (state|flags) word without touching flags. Validate conn_id via rs_row_in_use (RS_ERR_BAD_ID on bad id or free row); validate state < RS_STATE_MAX = 5 (RS_ERR_BAD_STATE otherwise); shift-trick decompose [row+8]: load r9 = sf, shr r9,32 (r9 = flags), shl r9,32 (flags in high 32, low 32 cleared), or r9, state, store back. No imm64 bitmask required. M1 posture is PERMISSIVE (any valid state in [0, 5) is accepted); R137.M2 lifts to a strict transition matrix. Bump RS_ST_SET_STATE_OK on success + emit `REMOTE_SHELL STATE OK cid=0x<hex>`; bump RS_ST_SET_STATE_REJ + emit `REMOTE_SHELL STATE REJ errno=0x<hex>` on error. Single callee-save push (rbx = conn_id, held across rs_row_in_use + klog) parks the id (entry rsp%16==8, +1 push -> %16==0 call-ready). r12 is also preserved to hold state across rs_row_in_use. Encoder-pitfall posture: cmp rN, 0 (never test), shl rN, 8 for stride-256 (never imul), mov rax, imm32 for error codes. Labels prefixed rs_ss_.",
+      block: {
+        push rbx;
+        push r12;
+
+        mov rbx, rdi;                    // conn_id
+        mov r12, rsi;                    // state
+
+        // ---- Validate state < RS_STATE_MAX ----
+        mov r11, 5;                      // RS_STATE_MAX
+        cmp r12, r11;
+        jae rs_ss_bad_state;
+
+        // ---- Validate conn_id ----
+        mov rdi, rbx;
+        call rs_row_in_use;
+        cmp rax, 0;
+        je  rs_ss_bad_id;
+
+        // ---- Compute row base ----
+        mov rax, rbx;
+        shl rax, 8;                      // conn_id * 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;                    // rax = row base
+
+        // ---- Shift-trick rewrite of sf.state (low 32), preserving flags ----
+        mov r9, [rax + 8];               // sf = state (lo) | flags (hi)
+        shr r9, 32;                      // r9 = flags only
+        shl r9, 32;                      // flags in high 32, low 32 = 0
+        or  r9, r12;                     // low 32 <- new state
+        mov [rax + 8], r9;
+
+        // ---- Stats + fingerprint ----
+        mov rdi, 5;                      // RS_ST_SET_STATE_OK
+        call rs_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rs_tag_state_ok];
+        lea rcx, [rip + rs_k_cid];
+        mov r8,  rbx;                    // cid in hex KV
+        call klog_s1_x1;
+
+        xor rax, rax;                    // RS_OK
+        pop r12;
+        pop rbx;
+        ret;
+
+      rs_ss_bad_id:
+        mov rdi, 6;                      // RS_ST_SET_STATE_REJ
+        call rs_note;
+
+        mov r12, 0x1D01;                 // RS_ERR_BAD_ID (reuse r12)
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rs_tag_state_rej];
+        lea rcx, [rip + rs_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rs_ss_bad_state:
+        mov rdi, 6;                      // RS_ST_SET_STATE_REJ
+        call rs_note;
+
+        mov r12, 0x1D02;                 // RS_ERR_BAD_STATE
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rs_tag_state_rej];
+        lea rcx, [rip + rs_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _remote_shell_close(conn_id) -> errno
+  //
+  // Mark a row free.  Validate conn_id, zero the critical fields,
+  // clear in_use so a future _accept may re-use the slot.
+  //
+  // ARGS (SysV):
+  //   rdi = conn_id
+  //
+  // RETURNS (rax):
+  //   RS_OK          -- row freed
+  //   RS_ERR_BAD_ID  -- conn_id out of range or row already free
+  //
+  // The row is NOT fully zeroed -- fields written by _accept
+  // (ep_lo, sf, kem, ring, bytes_*, name, created_tsc) are overwritten
+  // at the NEXT _accept of this slot, and in_use==0 is the authoritative
+  // "not populated" sentinel so a concurrent scan cannot latch stale
+  // data.  Explicitly zero'd here:
+  //
+  //   ep_lo         (defence-in-depth: a stale non-zero 4-tuple on
+  //                  an empty row cannot be observed before in_use
+  //                  is set, but zeroing tightens the "closed
+  //                  connection has no residual addressing" invariant)
+  //   sf            (same -- clears both state and flags; next
+  //                  _accept writes RS_STATE_INIT)
+  //   kem_session_slot (CRITICAL defence-in-depth: a stale KEM session
+  //                     slot on an empty row MUST NOT leak into a
+  //                     subsequent _accept.  R137.M2's KEM session
+  //                     allocator will refuse an index that is not in
+  //                     use, but this layer owns the "closed row has
+  //                     no residual KEM authority" invariant)
+  //   bytes_rx      (defence-in-depth; zero'd so a stale counter
+  //                  cannot look like an in-flight session's state)
+  //   bytes_tx      (same)
+  //   in_use        (the LAST write; see concurrent-scan note)
+  //
+  // Fields deliberately left to NEXT _accept to overwrite:
+  //   ring offsets, name, created_tsc.  The scanning invariants
+  //   above (in_use is the authoritative gate) prevent any stale
+  //   observation.  Leaving them trades a slightly weaker "clean row
+  //   on close" posture for ~3 fewer stores per close -- cheap enough
+  //   not to matter but documented for M2's hardening pass.
+  //
+  // STACK FRAME:
+  //   1 callee-save push (rbx = conn_id).  Entry rsp%16==8; +1 push
+  //   -> %16==0 (call-ready for rs_row_in_use + klog_s1_x1).
+  //
+  // Labels prefixed rs_cl_.
+  // ==========================================================================
+  pub let _remote_shell_close : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R137.M1 (paideia-os #2633): mark a connection row free. Validate conn_id via rs_row_in_use (else RS_ERR_BAD_ID); zero ep_lo + sf + kem_session_slot + bytes_rx + bytes_tx (defence-in-depth: a stale non-zero KEM slot on an empty row MUST NOT leak into a subsequent _accept -- the daemon owns 'closed row has no residual KEM authority' invariant), then clear in_use LAST so a concurrent scan either sees the live row or a fully-free row (ordering mirrors js_destroy / ss_destroy and the broker row-free discipline). Fields deliberately left to NEXT _accept to overwrite: ring offsets, name, created_tsc. Bump RS_ST_CLOSE_OK, emit `REMOTE_SHELL CLOSE OK cid=0x<hex>` via klog_s1_x1. Single callee-save push (rbx = conn_id) parks the id across the nested row_in_use + klog calls (entry %16==8, +1 push -> %16==0 call-ready). Labels prefixed rs_cl_.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                    // conn_id
+
+        // Validate conn_id.
+        mov rdi, rbx;
+        call rs_row_in_use;
+        cmp rax, 0;
+        je  rs_cl_bad_id;
+
+        // Compute row base.
+        mov rax, rbx;
+        shl rax, 8;
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;
+
+        // Zero ep_lo + sf + kem + bytes_rx + bytes_tx (defence-in-depth).
+        xor r9, r9;
+        mov [rax + 0],  r9;              // ep_lo = 0
+        mov [rax + 8],  r9;              // sf = 0
+        mov [rax + 16], r9;              // kem_session_slot = 0 (CRITICAL)
+        mov [rax + 32], r9;              // bytes_rx = 0
+        mov [rax + 40], r9;              // bytes_tx = 0
+
+        // Clear in_use LAST so a concurrent scanner either sees the
+        // live row or a fully-free row.
+        mov [rax + 120], r9;             // in_use = 0
+
+        // Stats + fingerprint.
+        mov rdi, 7;                      // RS_ST_CLOSE_OK
+        call rs_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rs_tag_close_ok];
+        lea rcx, [rip + rs_k_cid];
+        mov r8,  rbx;                    // cid in hex KV
+        call klog_s1_x1;
+
+        xor rax, rax;                    // RS_OK
+        pop rbx;
+        ret;
+
+      rs_cl_bad_id:
+        mov rdi, 8;                      // RS_ST_CLOSE_REJ
+        call rs_note;
+
+        mov rbx, 0x1D01;                 // RS_ERR_BAD_ID (reuse rbx
+                                         //  for the klog + return)
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rs_tag_close_rej];
+        lea rcx, [rip + rs_k_errno];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        mov rax, rbx;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Boot wiring note
+  // ----------------
+  // kernel_main.pdx picks this up with ONE new call AFTER
+  // _jail_supervisor_init and BEFORE witness_r30_platform:
+  //
+  //   call _cap_minter_init;           // ENDPOINT 20, R125.M2
+  //   call _syscall_rights_table_init; // R125.M4 cap-check table
+  //   call _shell_session_init;        // ENDPOINT 21, R127.M1
+  //   call _shell_history_init;        // R127.M4
+  //   call _shell_jobs_init;           // R127.M6
+  //   call _jail_supervisor_init;      // ENDPOINT 22, R135.M1
+  //   call _remote_shell_init;         // ENDPOINT 24, R137.M1 (this file)
+  //   call witness_r30_platform;       // R30 platform witness cascade
+  //
+  // Placement rationale: AFTER the daemon bringups above (so the
+  // broker table has every other svc.* row published before this one
+  // registers) and BEFORE witness_r30_platform (so a future platform
+  // witness that spins up a remote-shell client / server task sees
+  // the row).
+  //
+  // No cap_invoke dispatch arm at R137.M1.  Named-IPC callers (if any
+  // arrive before R137.M2) route through the broker:
+  //
+  //   endpoint_id = svc_lookup("svc.remote-shell")  (= 24)
+  //   send ACCEPT / SET_STATE / CLOSE frame to endpoint_id,
+  //   receive REPLY
+  //
+  // The frame-body dispatcher is landed by R137.M2 alongside the
+  // KIND_REMOTE_SHELL kind registration.  The direct-call API above
+  // is the in-kernel surface the TCP accept path (deferred into
+  // R137.M2) will use before the cap-invoke surface lands.
+  //
+  // See design/shell/remote-shell-daemon.md for the full design
+  // (service identity, row layout, state machine, interaction with
+  // R137.M2 handshake and R137.M3 wire protocol, security posture).
+  // ==========================================================================
+}
