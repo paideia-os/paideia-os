@@ -275,6 +275,65 @@ ALLOWLIST = {
         "Retires when R127.M5 wires the TTY recall binding with an "
         "asserting smoke-mode golden.",
 
+    # Wave UMB-W16 R127.M5 (paideia-os#2601): shell job-control
+    # primitives substrate. SHELL_JOBS INIT OK fires on every boot
+    # via _shell_jobs_init in the svc.* bringup cascade (kernel_main.
+    # pdx right after _shell_history_init, before _jail_supervisor_
+    # init). CREATE OK / STATE OK / DESTROY OK are present as .rodata
+    # tags inside _shell_jobs_create / _shell_jobs_set_state /
+    # _shell_jobs_destroy respectively. Likewise SHELL_SESSION
+    # ACTIVE_JOB OK is present as a .rodata tag inside the companion
+    # write path _shell_session_set_active_job (in shell_session.pdx).
+    # At M5 no production path invokes any of them because the shell
+    # parent's actual dispatch loop + the KIND_JOB cap-invoke surface
+    # (which would drive CREATE on every backgrounded command and
+    # ACTIVE_JOB on every fg/bg transition) is the responsibility of
+    # R127.M6 (job-control cap surface + scheduler pause/resume hook).
+    # All five retire from this allowlist when R127.M6 lands with
+    # asserting smoke-mode goldens driving each verb end-to-end
+    # (bringup + a shell parent task minting / fg / bg / destroy
+    # against one or more jobs under a shell session).
+    "SHELL_JOBS INIT OK":
+        "Wave UMB-W16 R127.M5: src/kernel/core/svc/shell_jobs.pdx "
+        "emits this unconditionally on boot via _shell_jobs_init "
+        "in the svc.* bringup cascade (after _shell_history_init, "
+        "before _jail_supervisor_init). Retires when R127.M6 "
+        "(KIND_JOB cap-invoke surface + scheduler hook) adds an "
+        "asserting smoke-mode golden.",
+    "SHELL_JOBS CREATE OK":
+        "Wave UMB-W16 R127.M5: src/kernel/core/svc/shell_jobs.pdx "
+        "emits this from _shell_jobs_create. Unreachable from any "
+        "production path at M5 (no shell parent task mints a "
+        "KIND_JOB cap yet; the dispatch loop that would drive "
+        "CREATE on every backgrounded command lands with R127.M6). "
+        "Retires when R127.M6 wires the dispatch loop with an "
+        "asserting smoke-mode golden.",
+    "SHELL_JOBS STATE OK":
+        "Wave UMB-W16 R127.M5: src/kernel/core/svc/shell_jobs.pdx "
+        "emits this from _shell_jobs_set_state. Unreachable from "
+        "any production path at M5 (no scheduler-side exit handler "
+        "promotes a row to COMPLETED / FAILED yet; the promotion "
+        "path lands with R127.M6). Retires when R127.M6 wires the "
+        "exit-disposition handler with an asserting smoke-mode "
+        "golden.",
+    "SHELL_JOBS DESTROY OK":
+        "Wave UMB-W16 R127.M5: src/kernel/core/svc/shell_jobs.pdx "
+        "emits this from _shell_jobs_destroy. Unreachable from any "
+        "production path at M5 (no shell parent task reaps a job "
+        "yet; the reap path lands with R127.M6 alongside the user-"
+        "side `jobs` / `kill %<n>` builtins). Retires when R127.M6 "
+        "wires the reap path with an asserting smoke-mode golden.",
+    "SHELL_SESSION ACTIVE_JOB OK":
+        "Wave UMB-W16 R127.M5: src/kernel/core/svc/shell_session.pdx "
+        "emits this from _shell_session_set_active_job (the companion "
+        "write path on the shell-session row for the R127.M5 jobs "
+        "substrate; reinterprets [row+120] as active_job_pid). "
+        "Unreachable from any production path at M5 (no JOB_OP_"
+        "FOREGROUND / JOB_OP_BACKGROUND cap-invoke op lands yet; "
+        "the TTY-side routing that would consult the field lands "
+        "with R127.M6). Retires when R127.M6 wires the fg/bg verbs "
+        "with an asserting smoke-mode golden.",
+
     # Wave UMB-W13 R141.M2 (paideia-os#2646): perf-sink logging layer.
     # PERF SINK INIT OK fires on every boot from _perf_sink_init in
     # kernel_main.pdx immediately after _mb_init (R141.M1 wiring).

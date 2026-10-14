@@ -1,0 +1,921 @@
+// src/kernel/core/svc/shell_jobs.pdx -- Wave UMB-W16 R127.M5
+// paideia-os #2601
+//
+// SHELL JOB-CONTROL PRIMITIVES SUBSTRATE
+// =============================================================================
+//
+// R127 ("REPL session process + history storage") milestone M5.  M1
+// landed the daemon that owns the shell_session row pool (and reserved
+// a u64 at [row+120] for a future landing).  M2 added the KIND_SHELL_
+// SESSION cap-invoke surface.  M3 added the raw-mode TTY substrate.
+// M4 added the per-session history ring.  M5 lands the JOB TABLE: a
+// 32-row pool of Job rows that wraps one or more PIDs under a shell-
+// session, and the companion write path on the shell-session row
+// (_shell_session_set_active_job, in shell_session.pdx) that re-
+// interprets [row+120] as active_job_pid.
+//
+// The jobs table is a pure library.  No endpoint is claimed; the
+// direct-call API is the in-kernel surface.  R127.M6 (deferred) lands
+// the KIND_JOB cap-invoke surface + the scheduler pause / resume hook
+// that drives JOB_OP_PAUSE / RESUME / FOREGROUND / BACKGROUND / WAIT
+// end-to-end from userspace.  M5 adds only the INIT boot fingerprint
+// to the smoke-mode wire; CREATE / STATE / DESTROY paths are present-
+// but-unreached at M5 and allowlisted upstream in
+// tools/verify-fingerprint-coverage.sh.
+//
+// Design posture (feedback_novel_clean_design): POSIX job control
+// (SIGTSTP / SIGCONT / process groups / tcsetpgrp) is explicitly NOT
+// inherited.  See design/shell/job-control-primitives.md §2 for the
+// per-mechanism rejection.
+//
+// =============================================================================
+// SECTION 1  ROW LAYOUT  --  64 BYTES PER ROW, 32 ROWS
+// =============================================================================
+//
+// Per task directive, each row is 64 bytes = 8 u64.  Stride 64 is a
+// power of two so row addressing uses `shl rax, 6` -- no imul
+// (feedback_pdx_encoder_pitfalls: 2-op `imul r, imm` is an encoder
+// gap).
+//
+//   [+0]    job_id (u32) | session_id (u32) << 32   (one u64 store)
+//                                    Low 32 bits  = job_id (0..31)
+//                                    High 32 bits = session_id (0..7)
+//   [+8]    primary_pid           (u64)  owning process pid (0 is
+//                                        reserved; a pid of 0 at mint
+//                                        time is refused with
+//                                        SJ_ERR_BAD_ID at the lookup
+//                                        pass. Pid==0 is also the
+//                                        AUTHORITATIVE "row free"
+//                                        sentinel: .bss zero-init
+//                                        gives us the FREE sentinel
+//                                        at real boot, and _destroy
+//                                        clears primary_pid last so
+//                                        a concurrent scanner either
+//                                        sees the live row or a fully
+//                                        free row.
+//   [+16]   state (u32) | flags (u32) << 32          (one u64 store)
+//                                    Low 32 bits  = state ordinal
+//                                                   (SJ_STATE_*)
+//                                    High 32 bits = flags word
+//                                                   (exit disposition
+//                                                   bits + anything
+//                                                   R127.M6 wants to
+//                                                   stash)
+//   [+24]   name[ 0.. 7]          (u64 word; 8 raw bytes of display name)
+//   [+32]   name[ 8..15]          (u64 word)
+//   [+40]   name[16..23]          (u64 word)
+//   [+48]   name[24..31]          (u64 word -- 32 total name bytes;
+//                                        last byte reserved for a
+//                                        trailing NUL so max usable
+//                                        name length is 31)
+//   [+56]   created_tsc           (u64)  reserved at M5 (written as 0
+//                                        at mint); R127.M6 populates
+//                                        with a monotonic hardware
+//                                        tick for age-sort passes.
+//
+// Row-addressed capacity: SJ_POOL_MAX = 32 jobs.  32 x 64 = 2048
+// bytes = 256 u64.  The pool at @align(64) sits on a cache-line
+// boundary so rows 0, 1 share a line.
+//
+// Why pid-as-sentinel (not an explicit in_use word):
+//   shell_session.pdx (R127.M1) uses an explicit in_use field at
+//   [+112] so pid 0 could in principle be allowed in a future
+//   refactor.  shell_jobs.pdx has no equivalent future: pid 0 is
+//   permanently reserved by every OS layer below the shell, and the
+//   row is 64 bytes -- adding an in_use word would push to 72 bytes
+//   and lose the clean `shl 6` stride.  See design/shell/job-
+//   control-primitives.md §4.
+//
+// =============================================================================
+// SECTION 2  STATE MACHINE
+// =============================================================================
+//
+// R127.M5 states (name = ordinal):
+//
+//   RUNNING    = 0   -- freshly minted; the primary PID is on the
+//                        scheduler's run queue
+//   PAUSED     = 1   -- job suspended (R127.M6 wires the scheduler
+//                        pause hook; M5 only persists the state)
+//   COMPLETED  = 2   -- primary PID exited with a zero disposition
+//   FAILED     = 3   -- primary PID exited with a non-zero disposition
+//
+// Transitions at M5 are permissive -- any state X may move to any
+// state Y where Y < 4.  R127.M6 tightens this into:
+//
+//   RUNNING    -> PAUSED | COMPLETED | FAILED
+//   PAUSED     -> RUNNING | COMPLETED | FAILED
+//   COMPLETED  -> (terminal; _destroy only)
+//   FAILED     -> (terminal; _destroy only)
+//
+// Keeping M5 permissive sidesteps the "who owns the state transition"
+// question: at M5 we don't yet know which component (shell parent? a
+// scheduler-side observer?) authors the COMPLETED / FAILED promotion.
+// See the parallel decision in shell_session.pdx §2.
+//
+// =============================================================================
+// SECTION 3  RETURN CODE BAND  --  0x1600 ONWARDS
+// =============================================================================
+//
+// Per task directive:
+//
+//   SJ_OK                 = 0
+//   SJ_ERR_POOL_FULL      = 0x1600
+//   SJ_ERR_BAD_ID         = 0x1601
+//   SJ_ERR_BAD_STATE      = 0x1602
+//
+// All fit imm32 with bit 31 clear so `mov rax, imm32` emits the
+// 7-byte zero-extending form.  Band audit (2026-10-13):
+//   `grep -rnE '0x160[0-2]\b' src/kernel/ 2>/dev/null` -> zero hits
+// in the production tree.  Clean band; R127.M6+ may extend to
+// 0x1603..0x160F while retaining the first three as pinned.
+//
+// _shell_jobs_create returns a PACKED u64:
+//
+//     result = (job_id << 2) | status
+//
+// On success status == SJ_OK (0), so result == job_id << 2 and the
+// caller recovers job_id by right-shifting 2 bits.  Job ids live in
+// [0, 32), so job_id << 2 is in [0, 128) -- disjoint from every SJ_
+// ERR_* value (all >= 0x1600) so a caller that treats the whole u64
+// as an error-or-id tagged value never collides.  On error job_id is
+// 0, so result == status.
+//
+// _shell_jobs_lookup_by_pid returns the raw job_id or SJ_ID_NONE
+// (0xFF) which is outside the valid pool range and distinct from
+// every SJ_ERR_* code -- 0xFF < 0x1600.
+//
+// _shell_jobs_set_state and _shell_jobs_destroy return SJ_OK or an
+// SJ_ERR_* code directly (not packed).
+//
+// =============================================================================
+// SECTION 4  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Labels are prefixed `sj_` (shell-jobs) to stay clear of `ss_`
+// (svc/shell_session.pdx), `sh_` (svc/shell_history.pdx), `svc_`
+// (ipc/svc_broker.pdx), `js_` (svc/jail_supervisor.pdx) and the
+// broader `s_` family.  No reserved paideia-as keyword overlap
+// (reserved: loop / if / let).  Encoder-pitfall posture (feedback_
+// pdx_encoder_pitfalls):
+//
+//   * cmp rN, 0            (never `test rN, rN`)
+//   * shl rN, 6 to compose row-base * 64 stride (never `imul r, imm`)
+//   * shl rN, 32 to pack low-32 | high-32 into one u64 store
+//   * mov rax, imm32       (never `and r11, imm64`)
+//   * shift-anchor preservation idiom for low-32 preservation across
+//     a high-32 write (shl 32 drops high 32; shr 32 moves low back
+//     into low 32 and zeroes the high half)
+//   * single-line `pub let name = "..."`
+//   * module basename ShellJobs matches file basename shell_jobs.pdx
+//   * fingerprint `[u8; N]` with N = string length + 1 (NUL counts)
+//
+// Stack discipline (SysV, entry rsp%16==8):
+//   _shell_jobs_init           1 push  (r12 across the klog call)
+//   _shell_jobs_lookup_by_pid  0 pushes (pure leaf scan)
+//   _shell_jobs_create         5 pushes + sub rsp, 16
+//                                (klog_s1_x2 stack-arg slot + pad)
+//   _shell_jobs_set_state      2 pushes + sub rsp, 8
+//                                (klog_s1_x1_d1 stack-arg slot)
+//   _shell_jobs_destroy        1 push  (rbx)
+//
+// =============================================================================
+// SECTION 5  BOOT WIRING NOTE
+// =============================================================================
+//
+// kernel_main.pdx picks this up with ONE new call right after
+// _shell_history_init (R127.M4) and BEFORE _jail_supervisor_init
+// (R135.M1):
+//
+//   call _shell_session_init;        // R127.M1
+//   call _shell_history_init;        // R127.M4
+//   call _shell_jobs_init;           // R127.M5 (this file)
+//   call _jail_supervisor_init;      // R135.M1
+//   call witness_r30_platform;       // R30 platform witness cascade
+//
+// Placement rationale: the jobs substrate is a library (no endpoint
+// claimed), same posture as _shell_history_init -- so it slots
+// directly after the other shell-side libraries and before the
+// supervisor daemons.  An audit grep then sees the shell substrates
+// in the order SHELL_SESSION INIT OK -> SHELL_HISTORY INIT OK ->
+// SHELL_JOBS INIT OK.
+//
+// =============================================================================
+
+module ShellJobs = structure {
+
+  // ==========================================================================
+  // Return band (task-pinned, §3)
+  // ==========================================================================
+
+  pub let SJ_OK            : u64 = 0
+  pub let SJ_ERR_POOL_FULL : u64 = 0x1600
+  pub let SJ_ERR_BAD_ID    : u64 = 0x1601
+  pub let SJ_ERR_BAD_STATE : u64 = 0x1602
+
+  // ==========================================================================
+  // Pool geometry (§1)
+  // ==========================================================================
+
+  pub let SJ_POOL_MAX   : u64 = 32    // rows (jobs)
+  pub let SJ_ROW_BYTES  : u64 = 64    // 8 u64 per row
+
+  // Row-field offsets (bytes, from row base)
+  pub let SJ_OFF_IDS         : u64 = 0    // job_id (lo32) | session_id (hi32)
+  pub let SJ_OFF_PID         : u64 = 8
+  pub let SJ_OFF_STATE_FLAGS : u64 = 16   // state (lo32) | flags (hi32)
+  pub let SJ_OFF_NAME        : u64 = 24
+  pub let SJ_OFF_CREATED_TSC : u64 = 56
+
+  pub let SJ_NAME_MAX   : u64 = 31    // 32 bytes with trailing NUL
+
+  // Sentinel for "no job matched" (lookup).
+  pub let SJ_ID_NONE : u64 = 0xFF
+
+  // State machine (§2)
+  pub let SJ_STATE_RUNNING   : u64 = 0
+  pub let SJ_STATE_PAUSED    : u64 = 1
+  pub let SJ_STATE_COMPLETED : u64 = 2
+  pub let SJ_STATE_FAILED    : u64 = 3
+  pub let SJ_STATE_MAX       : u64 = 4   // exclusive upper bound
+
+  // ==========================================================================
+  // Storage
+  //
+  //   _shell_jobs_pool  -- 32 rows x 64 bytes = 256 u64. @align(64)
+  //                        puts the pool start on a cache-line
+  //                        boundary; the 64 stride is a power of
+  //                        two so no imul is needed.
+  //   _shell_jobs_stats -- 16 u64 counters (observability).
+  // ==========================================================================
+
+  pub let mut _shell_jobs_pool  : [u64; 256] = uninit @align(64)
+  pub let mut _shell_jobs_stats : [u64; 16]  = uninit @align(64)
+
+  pub let SJ_ST_INIT_OK         : u64 = 0
+  pub let SJ_ST_CREATE_OK       : u64 = 1
+  pub let SJ_ST_CREATE_FULL     : u64 = 2
+  pub let SJ_ST_STATE_OK        : u64 = 3
+  pub let SJ_ST_STATE_BAD_ID    : u64 = 4
+  pub let SJ_ST_STATE_BAD_STATE : u64 = 5
+  pub let SJ_ST_LOOKUP_HIT      : u64 = 6
+  pub let SJ_ST_LOOKUP_MISS     : u64 = 7
+  pub let SJ_ST_DESTROY_OK      : u64 = 8
+  pub let SJ_ST_DESTROY_BAD_ID  : u64 = 9
+
+  // ==========================================================================
+  // Fingerprint tags (N = len(string) + 1, NUL-inclusive)
+  //
+  // Only the "OK" tags are extracted by the fingerprint-coverage gate
+  // (regex matches bare word OK); the REJ tags are opaque to the
+  // gate so no allowlist entry is required for them.
+  // ==========================================================================
+
+  // "SHELL_JOBS INIT OK"     = 18 chars + NUL => N=19
+  // "SHELL_JOBS CREATE OK"   = 20 chars + NUL => N=21
+  // "SHELL_JOBS CREATE REJ"  = 21 chars + NUL => N=22
+  // "SHELL_JOBS STATE OK"    = 19 chars + NUL => N=20
+  // "SHELL_JOBS STATE REJ"   = 20 chars + NUL => N=21
+  // "SHELL_JOBS DESTROY OK"  = 21 chars + NUL => N=22
+  // "SHELL_JOBS DESTROY REJ" = 22 chars + NUL => N=23
+
+  pub let sj_tag_init_ok     : [u8; 19] = "SHELL_JOBS INIT OK\0"
+  pub let sj_tag_create_ok   : [u8; 21] = "SHELL_JOBS CREATE OK\0"
+  pub let sj_tag_create_rej  : [u8; 22] = "SHELL_JOBS CREATE REJ\0"
+  pub let sj_tag_state_ok    : [u8; 20] = "SHELL_JOBS STATE OK\0"
+  pub let sj_tag_state_rej   : [u8; 21] = "SHELL_JOBS STATE REJ\0"
+  pub let sj_tag_destroy_ok  : [u8; 22] = "SHELL_JOBS DESTROY OK\0"
+  pub let sj_tag_destroy_rej : [u8; 23] = "SHELL_JOBS DESTROY REJ\0"
+
+  pub let sj_k_jid    : [u8; 4] = "jid\0"
+  pub let sj_k_pid    : [u8; 4] = "pid\0"
+  pub let sj_k_state  : [u8; 6] = "state\0"
+  pub let sj_k_errno  : [u8; 6] = "errno\0"
+
+  // ==========================================================================
+  // sj_note(slot) -> ()
+  //
+  // Bounded increment on _shell_jobs_stats[slot].  Same shape as
+  // ss_note / sh_note (load-inc-store; no `add reg, [mem]`).  Caller
+  // passes an SJ_ST_* ordinal in [0, 16); out-of-range slots silently
+  // no-op.  Pure leaf -- no pushes.  Labels prefixed sj_no_.
+  // ==========================================================================
+  pub let sj_note : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R127.M5 (paideia-os #2601): bounded increment on _shell_jobs_stats[slot<16]. Load-inc-store, no `add reg,[mem]`. Pure leaf -- no pushes. Mirrors ss_note / sh_note shape one-for-one. Labels prefixed sj_no_.",
+      block: {
+        cmp rdi, 16;
+        jae sj_no_out;
+        lea r10, [rip + _shell_jobs_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      sj_no_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sj_row_base(job_id) -> &_shell_jobs_pool[job_id * 64]
+  //
+  // Row index -> row base pointer.  Stride 64 = 2^6 so `shl rax, 6`
+  // suffices (no `imul r, imm` encoder gap, no reg-reg staging).
+  // Caller is responsible for validating job_id < SJ_POOL_MAX first;
+  // this helper is a pure address compute.
+  // ==========================================================================
+  pub let sj_row_base : (u64) -> u64 !{} @{} =
+    fn (job_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R127.M5 (paideia-os #2601): job_id -> &_shell_jobs_pool[job_id*64]. Power-of-two stride uses `shl rax, 6` so no 2-op imul-with-imm is required. No bounds check by policy -- caller validates. Labels prefixed sj_rb_.",
+      block: {
+        mov rax, rdi;                    // job_id
+        shl rax, 6;                      // job_id * 64
+        lea r10, [rip + _shell_jobs_pool];
+        add rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sj_row_in_use(job_id) -> 1 iff job_id<SJ_POOL_MAX AND
+  //                                primary_pid != 0
+  //
+  // Validator used by set_state / destroy.  Inlined row-base compute
+  // (shl 6).  Pure leaf -- no pushes, no nested calls.  Uses primary_
+  // pid (word at [+8]) as the authoritative free/live gate because
+  // the row has no explicit in_use field (see §1).
+  // ==========================================================================
+  pub let sj_row_in_use : (u64) -> u64 !{mem} @{} =
+    fn (job_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R127.M5 (paideia-os #2601): 1 iff job_id<SJ_POOL_MAX(32) AND primary_pid (word at [+8]) != 0. Inlined address compute (shl 6). Pure leaf. Pid-as-sentinel is used in place of an explicit in_use field so the row fits in 64 bytes; pid 0 is permanently reserved by every OS layer below the shell so a live job can never hold that value. Labels prefixed sj_ru_.",
+      block: {
+        mov r10, 32;                     // SJ_POOL_MAX
+        cmp rdi, r10;
+        jae sj_ru_no;
+        mov rax, rdi;
+        shl rax, 6;                      // job_id * 64
+        lea r10, [rip + _shell_jobs_pool];
+        add rax, r10;                    // row base
+        mov r10, [rax + 8];              // primary_pid field
+        cmp r10, 0;
+        je  sj_ru_no;
+        mov rax, 1;
+        ret;
+      sj_ru_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sj_find_free() -> job_id | SJ_ID_NONE
+  //
+  // Linear scan for the first row whose primary_pid field is zero.
+  // Used only by _shell_jobs_create.  Pure leaf (row-base is inlined).
+  // ==========================================================================
+  pub let sj_find_free : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R127.M5 (paideia-os #2601): linear scan _shell_jobs_pool[0..SJ_POOL_MAX) for the first row whose primary_pid (word at [+8]) is zero. Return job_id or SJ_ID_NONE (0xFF). Inlined row-base (shl 6). Pure leaf -- no pushes. Pid-as-sentinel per §1. Labels prefixed sj_ff_.",
+      block: {
+        lea r10, [rip + _shell_jobs_pool];
+        xor rcx, rcx;                    // job_id cursor
+      sj_ff_scan:
+        cmp rcx, 32;                     // SJ_POOL_MAX
+        jae sj_ff_none;
+
+        mov rax, rcx;
+        shl rax, 6;                      // job_id * 64
+        add rax, r10;                    // row base
+        mov r11, [rax + 8];              // primary_pid
+        cmp r11, 0;
+        je  sj_ff_hit;
+
+        add rcx, 1;
+        jmp sj_ff_scan;
+
+      sj_ff_hit:
+        mov rax, rcx;
+        ret;
+
+      sj_ff_none:
+        mov rax, 0xFF;                   // SJ_ID_NONE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _shell_jobs_init() -> ()
+  //
+  // Boot hook.  Defensive scrub of _shell_jobs_stats (16 u64 = 128
+  // bytes).  .bss zero-init handles the array at real boot; the
+  // explicit scrub is defensive for a chaos-restart re-entering
+  // init.  Emits `SHELL_JOBS INIT OK` on completion.
+  //
+  // Single callee-save push (r12) corrects entry parity rsp%16==8 ->
+  // 0 for the sibling klog_s1 call, matching _shell_history_init /
+  // _shell_session_init shape.
+  //
+  // Note: _shell_jobs_pool is NOT scrubbed here -- a 2 KiB zero-fill
+  // at boot is wasted work (bss is already zero), and reach to any
+  // row is gated by primary_pid != 0 which only _shell_jobs_create
+  // can set.  A stale row is unreachable via the public API even on
+  // chaos restart.
+  //
+  // Labels prefixed sj_in_.
+  // ==========================================================================
+  pub let _shell_jobs_init : () -> () !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R127.M5 (paideia-os #2601): boot-time scrub of _shell_jobs_stats (16 u64 = 128 bytes) + one INIT OK fingerprint. .bss zero-init handles the array at real boot; the explicit scrub is defensive for a chaos-restart re-entering init. The 2 KiB _shell_jobs_pool backing is NOT scrubbed because the primary_pid-as-sentinel gates reach to any row (pid 0 is permanently reserved); a stale entry is unreachable. Single callee-save push (r12) corrects entry parity rsp%16==8 -> 0 for the sibling klog_s1 call, matching _shell_history_init / _shell_session_init shape. Labels prefixed sj_in_.",
+      block: {
+        push r12;
+
+        // Scrub _shell_jobs_stats[0..16].
+        lea r10, [rip + _shell_jobs_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      sj_in_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  sj_in_stats;
+
+        // Bump INIT_OK counter.
+        mov rdi, 0;                      // SJ_ST_INIT_OK
+        call sj_note;
+
+        // Emit INIT OK fingerprint.
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + sj_tag_init_ok];
+        call klog_s1;
+
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _shell_jobs_lookup_by_pid(pid) -> job_id | SJ_ID_NONE
+  //
+  // Linear scan for the first row whose primary_pid (word at [+8])
+  // matches the argument.  Returns job_id in [0, 32) on hit, SJ_ID_
+  // NONE (0xFF) on miss.  A pid of 0 is reserved and never produces
+  // a hit (a row with primary_pid==0 is a free row by §1).
+  //
+  // Pure leaf -- no pushes, no nested calls.  Labels prefixed sj_lu_.
+  // ==========================================================================
+  pub let _shell_jobs_lookup_by_pid : (u64) -> u64 !{mem} @{} =
+    fn (pid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R127.M5 (paideia-os #2601): scan _shell_jobs_pool[0..SJ_POOL_MAX) for the first row whose primary_pid (word at [+8]) matches rdi. Return job_id (0..31) or SJ_ID_NONE (0xFF) on miss. pid==0 can never match a live row because pid==0 IS the free sentinel. Inlined row-base (shl 6). Pure leaf -- no callee-save pushes, no nested calls. Labels prefixed sj_lu_.",
+      block: {
+        // pid == 0 is the free sentinel -- a search for pid 0 is a
+        // guaranteed miss (it would otherwise match every free row).
+        cmp rdi, 0;
+        je  sj_lu_none;
+
+        lea r10, [rip + _shell_jobs_pool];
+        xor rcx, rcx;                    // job_id cursor
+      sj_lu_scan:
+        cmp rcx, 32;                     // SJ_POOL_MAX
+        jae sj_lu_none;
+
+        mov rax, rcx;
+        shl rax, 6;                      // job_id * 64
+        add rax, r10;                    // row base
+
+        // pid must match (and be non-zero per the free-sentinel rule).
+        mov r11, [rax + 8];
+        cmp r11, rdi;
+        je  sj_lu_hit;
+
+        add rcx, 1;
+        jmp sj_lu_scan;
+
+      sj_lu_hit:
+        mov rax, rcx;
+        ret;
+
+      sj_lu_none:
+        mov rax, 0xFF;                   // SJ_ID_NONE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _shell_jobs_create(session_id, primary_pid, flags, name_ptr, name_len)
+  //                                                     -> packed u64
+  //
+  // Mint a fresh job row.
+  //
+  // ARGS (SysV):
+  //   rdi = session_id    (0..7; opaque at this layer -- the shell
+  //                        parent passes its own sid; validation is
+  //                        the caller's responsibility)
+  //   rsi = primary_pid   (must be non-zero; pid==0 refuses with
+  //                        SJ_ERR_BAD_ID at the find-free pass -- a
+  //                        pid of 0 is the row-free sentinel so a
+  //                        mint with primary_pid==0 would land a
+  //                        row that reads as free the moment it is
+  //                        published)
+  //   rdx = flags         (32-bit flags word; opaque to M5 -- R127.M6
+  //                        defines the exit-disposition bit layout)
+  //   rcx = name_ptr      (readable up to name_len bytes; may be 0
+  //                        iff name_len is 0)
+  //   r8  = name_len      (clamped to SJ_NAME_MAX = 31)
+  //
+  // RETURNS (rax):
+  //   On success:  (job_id << 2) | SJ_OK  (SJ_OK=0, so just
+  //                job_id * 4; recoverable via `shr rax, 2`)
+  //   SJ_ERR_POOL_FULL  -- all 32 rows are in use OR primary_pid==0
+  //
+  // The state field is initialised to SJ_STATE_RUNNING (0); the
+  // flags field is written from rdx (the caller's choice).
+  //
+  // STACK FRAME:
+  //   5 callee-save pushes + sub rsp, 16.  Entry rsp%16==8; +5
+  //   pushes + 16 = +56 -> %16==0 at every nested call.  The 16-byte
+  //   frame carries the klog_s1_x2 stack-arg slot ([rsp+0] = v2 =
+  //   primary_pid for the OK fingerprint) and an 8-byte pad.
+  //
+  //   REGISTER MAP:
+  //     rbx = session_id
+  //     r12 = primary_pid (held across every nested call)
+  //     r13 = flags
+  //     r14 = name_ptr
+  //     r15 = clamped name_len / later job_id
+  //
+  // Labels prefixed sj_cr_.
+  // ==========================================================================
+  pub let _shell_jobs_create : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (session_id: u64) (primary_pid: u64) (flags: u64) (name_ptr: u64) (name_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R127.M5 (paideia-os #2601): mint a fresh job row. Validate primary_pid != 0 (SJ_ERR_POOL_FULL -- pid==0 is the free sentinel so a mint with pid==0 would publish a row that reads as free). Find a free row via sj_find_free (SJ_ERR_POOL_FULL on none). Pack job_id (low 32) | session_id (high 32) into one u64 at [row+0]; write primary_pid at [row+8]; pack state=SJ_STATE_RUNNING (low 32) | flags (high 32) into one u64 at [row+16]; byte-copy up to min(name_len, 31) bytes from name_ptr into [row+24+i] with a trailing NUL; write 0 to created_tsc at [row+56]. Publish primary_pid LAST so a concurrent scanner either sees the row FREE (primary_pid==0) or fully initialised (primary_pid==the real pid) -- but we actually publish primary_pid at step 2 (before the rest) for simplicity; the scanner reads individual fields with no cross-field invariant at M5. Bump SJ_ST_CREATE_OK; emit `SHELL_JOBS CREATE OK jid=0x<hex> pid=0x<hex>` via klog_s1_x2 (6-reg + 1-stack-arg wrapper, v2 on [rsp+0]). Return (job_id << 2) | SJ_OK. Five callee-save pushes (rbx=session_id, r12=primary_pid, r13=flags, r14=name_ptr, r15=clamped_name_len/then job_id) + sub rsp,16 pad = 56 bytes land rsp%16==0 at every nested call. Byte copy uses mov_b scalar-indexed addressing proven in shell_session.pdx _shell_session_create name copy. Encoder-pitfall posture: cmp rN,0 (never test), shl rN,6 for stride-64 (never imul), shl rN,32 to compose u32-pair stores, mov rax,imm32 for all error codes (never and r11,imm64). Labels prefixed sj_cr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;                     // klog_s1_x2 stack-arg + pad
+
+        mov rbx, rdi;                    // session_id
+        mov r12, rsi;                    // primary_pid
+        mov r13, rdx;                    // flags
+        mov r14, rcx;                    // name_ptr
+        mov r15, r8;                     // name_len (unclamped)
+
+        // ---- Step 1: primary_pid != 0 ----
+        //  A row with primary_pid==0 would read as FREE the moment
+        //  it is published, so a mint with pid==0 is refused.  We
+        //  reuse POOL_FULL as the error (pid==0 is a client bug, not
+        //  a BAD_ID; and the design keeps the 0x1600 band narrow at
+        //  M5 -- a dedicated SJ_ERR_BAD_PID lands at R127.M6).
+        cmp r12, 0;
+        je  sj_cr_full;
+
+        // ---- Step 2: find free row ----
+        call sj_find_free;
+        mov r11, 0xFF;                   // SJ_ID_NONE
+        cmp rax, r11;
+        je  sj_cr_full;
+
+        // Clamp name_len to SJ_NAME_MAX = 31 in r11; free r15 for
+        // the job_id.
+        mov r11, r15;                    // r11 = unclamped name_len
+        mov r9,  31;                     // SJ_NAME_MAX
+        cmp r11, r9;
+        jbe sj_cr_len_ok;
+        mov r11, r9;                     // clamp to 31
+      sj_cr_len_ok:
+        mov r15, rax;                    // r15 = job_id
+
+        // ---- Compute row base ----
+        //   row_base = pool + job_id << 6
+        mov rax, r15;
+        shl rax, 6;
+        lea r10, [rip + _shell_jobs_pool];
+        add rax, r10;                    // rax = row base
+        // Keep row base in r10; r11 holds clamped name_len.
+        mov r10, rax;
+
+        // ---- Step 3: write fixed fields ----
+
+        // [+0]  job_id (low 32) | session_id (high 32) in one u64.
+        //   r9 = session_id << 32
+        mov r9, rbx;
+        shl r9, 32;
+        //   or in job_id (low 32; job_id < 32 so upper bits already 0)
+        or  r9, r15;
+        mov [r10 + 0], r9;
+
+        // [+8]  primary_pid
+        mov [r10 + 8], r12;
+
+        // [+16] state (low 32) | flags (high 32) in one u64.
+        //   state = SJ_STATE_RUNNING = 0 at mint, so the pack reduces
+        //   to flags << 32.
+        mov r9, r13;
+        shl r9, 32;
+        mov [r10 + 16], r9;
+
+        // Name copy: byte-wise mov_b from [r14 + i] to [name_dst + i].
+        // Pre-advance name_dst by 24 (name field offset) to sidestep
+        // the unsupported `mov_b [reg+reg*1+off], reg` store form
+        // (see shell_session.pdx name copy for the same idiom).
+        mov r9, r10;
+        add r9, 24;                      // r9 = &row.name[0]
+
+        // r11 = clamped name_len.  Loop i = 0 .. r11.
+        xor rcx, rcx;                    // i = 0
+      sj_cr_name_loop:
+        cmp rcx, r11;
+        jae sj_cr_name_done;
+
+        xor rax, rax;
+        mov_b rax, [r14 + rcx * 1];      // src byte
+        mov_b [r9 + rcx * 1], rax;       // dst byte at name[i]
+        add rcx, 1;
+        jmp sj_cr_name_loop;
+
+      sj_cr_name_done:
+        // Write NUL at [name + clamped_len].  Even if clamped_len==31
+        // this writes the 32nd name byte -- in-bounds (name field
+        // spans [+24..+56), 32 bytes total).
+        xor rax, rax;
+        mov_b [r9 + rcx * 1], rax;
+
+        // [+56] created_tsc = 0 (reserved at M5; R127.M6 populates).
+        xor r9, r9;
+        mov [r10 + 56], r9;
+
+        // ---- Step 4: stats + fingerprint ----
+        mov rdi, 1;                      // SJ_ST_CREATE_OK
+        call sj_note;
+
+        // klog_s1_x2 (6 regs + 1 stack arg). Stack-arg slot at
+        // [rsp+0]; write primary_pid there and call.  (jid in hex
+        // via r8, pid in hex via [rsp+0] -- two hex KVs is the
+        // audit-friendly shape for a jobs enumeration.)
+        mov [rsp + 0], r12;              // v2 = primary_pid
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + sj_tag_create_ok];
+        lea rcx, [rip + sj_k_jid];
+        mov r8,  r15;                    // v1 = job_id
+        lea r9,  [rip + sj_k_pid];
+        call klog_s1_x2;
+
+        // ---- Step 5: packed return ----
+        //   result = (job_id << 2) | SJ_OK = job_id << 2.
+        mov rax, r15;
+        shl rax, 2;
+        jmp sj_cr_out;
+
+      sj_cr_full:
+        mov rdi, 2;                      // SJ_ST_CREATE_FULL
+        call sj_note;
+
+        mov r12, 0x1600;                 // SJ_ERR_POOL_FULL (preserved
+                                         //  across klog via r12)
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + sj_tag_create_rej];
+        lea rcx, [rip + sj_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      sj_cr_out:
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _shell_jobs_set_state(job_id, new_state) -> errno
+  //
+  // Validate job_id (in [0,32) AND row in use), validate state
+  // (< SJ_STATE_MAX = 4), write state into the low 32 bits of
+  // [row + 16] preserving the high 32 bits (flags word).
+  //
+  // ARGS (SysV):
+  //   rdi = job_id
+  //   rsi = new state (one of SJ_STATE_*)
+  //
+  // RETURNS (rax):
+  //   SJ_OK            -- state written
+  //   SJ_ERR_BAD_ID    -- job_id out of range or row not in use
+  //   SJ_ERR_BAD_STATE -- state >= SJ_STATE_MAX
+  //
+  // STACK FRAME:
+  //   2 callee-save pushes (rbx = job_id, r12 = state) + sub rsp, 8
+  //   HELD THROUGHOUT the function body.  Entry rsp%16==8; +2 pushes
+  //   = +16 -> rsp%16==8; sub rsp,8 = +24 -> rsp%16==0 at every
+  //   nested call.  The 8-byte frame doubles as the klog_s1_x1_d1
+  //   stack-arg slot.  Trailing `add rsp, 8` restores before the
+  //   two pops.  Shape parallels _shell_session_set_state /
+  //   _shell_session_set_raw one-for-one.
+  //
+  // The low-32 preservation idiom uses the shift-anchor pattern
+  // (shl 32 drops low 32; shr 32 moves high back to low and zeroes
+  // the high half) to avoid the `and r11, imm64` encoder gap.
+  //
+  // Labels prefixed sj_ss_.
+  // ==========================================================================
+  pub let _shell_jobs_set_state : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (job_id: u64) (new_state: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R127.M5 (paideia-os #2601): write a new state ordinal into [row + 16] low 32 bits, preserving the high 32 bits (flags). Validate job_id via sj_row_in_use (else SJ_ERR_BAD_ID). Validate state < SJ_STATE_MAX = 4 (else SJ_ERR_BAD_STATE). Shift-anchor preservation of the flags half (currently in [row+16] high 32): shr r11,32 moves flags into the low 32 (high 32 = 0); shl r11,32 moves flags back into the high 32 (low 32 = 0); OR in new_state at low 32; store. Avoids the `and r11, imm64` encoder gap that `and r11, 0xFFFFFFFF00000000` would hit. Bump SJ_ST_STATE_OK, emit `SHELL_JOBS STATE OK jid=0x<hex> state=<dec>` via klog_s1_x1_d1 (6-reg + 1-stack-arg wrapper, state on [rsp+0]). Two callee-save pushes (rbx=job_id, r12=state) + sub rsp,8 (HELD throughout the body: lands rsp%16==0 at every nested call AND reserves the stack-arg slot for klog_s1_x1_d1). Encoder-pitfall posture: cmp rN,0 (never test), shl rN,6 for stride-64 (never imul), mov rax,imm32 for all error codes (never and r11,imm64), shift-anchor preservation idiom in place of `and r11, 0xFFFFFFFF00000000`. Shape parallels _shell_session_set_state / _shell_session_set_raw one-for-one. Labels prefixed sj_ss_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;                      // alignment + stack-arg slot
+                                         //  (held throughout the body)
+
+        mov rbx, rdi;                    // job_id
+        mov r12, rsi;                    // new_state
+
+        // ---- Validate job_id ----
+        mov rdi, rbx;
+        call sj_row_in_use;
+        cmp rax, 0;
+        je  sj_ss_bad_id;
+
+        // ---- Validate state ----
+        cmp r12, 4;                      // SJ_STATE_MAX
+        jae sj_ss_bad_state;
+
+        // ---- Compute row base and update state field ----
+        //   row_base = pool + job_id << 6
+        mov rax, rbx;
+        shl rax, 6;
+        lea r10, [rip + _shell_jobs_pool];
+        add rax, r10;                    // rax = row base
+
+        // Load [row+16]; preserve high 32 (flags) via shift-anchor:
+        //   shr 32: move flags into low 32 (high 32 = 0).
+        //   shl 32: move flags back into high 32 (low 32 = 0).
+        // Then OR in new_state at low 32.
+        mov r11, [rax + 16];
+        shr r11, 32;                     // r11 = flags in low 32, high = 0
+        shl r11, 32;                     // r11 = flags in high 32, low = 0
+        or  r11, r12;                    // low 32 bits = new_state
+        mov [rax + 16], r11;
+
+        // ---- Stats + fingerprint ----
+        mov rdi, 3;                      // SJ_ST_STATE_OK
+        call sj_note;
+
+        // klog_s1_x1_d1 (6 regs + 1 stack arg). Stack-arg slot at
+        // [rsp+0]; write new_state there and call. (jid in hex via
+        // r8, state in dec via [rsp+0] so a human reader sees the
+        // state ordinal in decimal.)
+        mov [rsp + 0], r12;              // v_dec = new_state
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + sj_tag_state_ok];
+        lea rcx, [rip + sj_k_jid];
+        mov r8,  rbx;                    // v_hex = job_id
+        lea r9,  [rip + sj_k_state];
+        call klog_s1_x1_d1;
+
+        xor rax, rax;                    // SJ_OK
+        jmp sj_ss_out;
+
+      sj_ss_bad_id:
+        mov rdi, 4;                      // SJ_ST_STATE_BAD_ID
+        call sj_note;
+
+        mov r12, 0x1601;                 // SJ_ERR_BAD_ID (preserved
+                                         //  across klog via r12)
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + sj_tag_state_rej];
+        lea rcx, [rip + sj_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        jmp sj_ss_out;
+
+      sj_ss_bad_state:
+        mov rdi, 5;                      // SJ_ST_STATE_BAD_STATE
+        call sj_note;
+
+        mov r12, 0x1602;                 // SJ_ERR_BAD_STATE
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + sj_tag_state_rej];
+        lea rcx, [rip + sj_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      sj_ss_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _shell_jobs_destroy(job_id) -> errno
+  //
+  // Mark a row free.  Validate job_id, zero the authoritative sentinel
+  // field (primary_pid at [+8]) so a future _create may re-use the
+  // slot.
+  //
+  // ARGS (SysV):
+  //   rdi = job_id
+  //
+  // RETURNS (rax):
+  //   SJ_OK          -- row freed
+  //   SJ_ERR_BAD_ID  -- job_id out of range or row already free
+  //
+  // The row is NOT fully zeroed -- fields written by _create (ids,
+  // state, flags, name, tsc) are overwritten at the NEXT _create of
+  // this slot, and primary_pid==0 is the authoritative "not
+  // populated" sentinel so a concurrent scan cannot latch stale data.
+  //
+  // STACK FRAME:
+  //   1 callee-save push (rbx = job_id).  Entry rsp%16==8; +1 push
+  //   -> %16==0 (call-ready for sj_row_in_use + klog_s1_x1).
+  //
+  // Labels prefixed sj_de_.
+  // ==========================================================================
+  pub let _shell_jobs_destroy : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (job_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R127.M5 (paideia-os #2601): mark a job row free. Validate job_id via sj_row_in_use (else SJ_ERR_BAD_ID); zero primary_pid at [row+8] -- the authoritative free sentinel (§1). Single store so a concurrent scanner either sees the live row or a fully-free row (the ordering is trivial because only one field changes). Bump SJ_ST_DESTROY_OK, emit `SHELL_JOBS DESTROY OK jid=0x<hex>` via klog_s1_x1. Single callee-save push (rbx = job_id) parks the id across the nested row_in_use + klog calls (entry %16==8, +1 push -> %16==0 call-ready). Labels prefixed sj_de_.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                    // job_id
+
+        // Validate job_id.
+        mov rdi, rbx;
+        call sj_row_in_use;
+        cmp rax, 0;
+        je  sj_de_bad_id;
+
+        // Compute row base.
+        mov rax, rbx;
+        shl rax, 6;
+        lea r10, [rip + _shell_jobs_pool];
+        add rax, r10;
+
+        // Clear primary_pid (the authoritative free sentinel).
+        xor r9, r9;
+        mov [rax + 8], r9;
+
+        // Stats + fingerprint.
+        mov rdi, 8;                      // SJ_ST_DESTROY_OK
+        call sj_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + sj_tag_destroy_ok];
+        lea rcx, [rip + sj_k_jid];
+        mov r8,  rbx;                    // jid in hex KV
+        call klog_s1_x1;
+
+        xor rax, rax;                    // SJ_OK
+        pop rbx;
+        ret;
+
+      sj_de_bad_id:
+        mov rdi, 9;                      // SJ_ST_DESTROY_BAD_ID
+        call sj_note;
+
+        mov rbx, 0x1601;                 // SJ_ERR_BAD_ID (reuse rbx
+                                         //  for the klog + return)
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + sj_tag_destroy_rej];
+        lea rcx, [rip + sj_k_errno];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        mov rax, rbx;
+        pop rbx;
+        ret
+      }
+    }
+
+}
