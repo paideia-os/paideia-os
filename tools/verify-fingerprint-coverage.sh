@@ -175,6 +175,27 @@ ALLOWLIST = {
         "any production path at M1 (same reason as CREATE OK). "
         "Retires when R127.M2 wires the cap-invoke DESTROY op.",
 
+    # Wave UMB-W14 R127.M3 (paideia-os#2599): raw-mode TTY substrate.
+    # SHELL_SESSION RAW OK fires from _shell_session_set_raw's success
+    # tail (and from ks_op_set_raw transitively via KIND_SHELL_SESSION
+    # op 4). The R127.M3 substrate persists flags on the shell_session
+    # row but the TTY-side line-discipline flip (session-aware ldisc
+    # bypass in src/kernel/core/tty/process_input.pdx + read.pdx) is
+    # DEFERRED to R127.M4 -- today the global TTY still runs cooked
+    # mode regardless of the row flags. No production caller mints or
+    # invokes a KIND_SHELL_SESSION cap yet (SHELL_SESSION CREATE OK /
+    # KIND_SHELL_SESSION HANDLER OK remain allowlisted upstream for
+    # the same reason). Retires when R127.M4 lands the ldisc flip with
+    # an asserting smoke-mode golden exercising SET_RAW end-to-end.
+    "SHELL_SESSION RAW OK":
+        "Wave UMB-W14 R127.M3: src/kernel/core/svc/shell_session.pdx "
+        "emits this from _shell_session_set_raw. Unreachable from any "
+        "production path at M3 (no shell parent task mints a "
+        "KIND_SHELL_SESSION cap yet; the TTY-side ldisc flip is "
+        "deferred). Retires when R127.M4 (session-aware TTY line "
+        "discipline) lands with a smoke-mode golden driving SET_RAW "
+        "+ a cooked-vs-raw ldisc observation.",
+
     # Wave UMB-W13 R141.M2 (paideia-os#2646): perf-sink logging layer.
     # PERF SINK INIT OK fires on every boot from _perf_sink_init in
     # kernel_main.pdx immediately after _mb_init (R141.M1 wiring).
