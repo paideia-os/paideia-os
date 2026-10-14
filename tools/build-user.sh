@@ -34,6 +34,12 @@ DMESG_LINK_SCRIPT="${USER_SRC}/dmesg.ld"
 # (mirrors the child_hello/true/cat/ps one-file-one-ELF discipline).
 PDX_PRODUCE_LINK_SCRIPT="${USER_SRC}/pdx_produce.ld"
 PDX_CONSUME_LINK_SCRIPT="${USER_SRC}/pdx_consume.ld"
+# R125.M5 (paideia-os #2595): /bin/run -- --grant cap-override shell surface.
+# Self-contained (inlines SC+ 1/12/59/60/138), so its own object set + linker
+# script + link step (mirrors the touch/cat classification pattern). SC+ 138
+# (sys_caps_grant_override) is unwired at M5 and returns -ENOSYS until the
+# M5-cont kernel-side landing; /bin/run detects that and warns to stderr.
+RUN_LINK_SCRIPT="${USER_SRC}/run.ld"
 
 if [[ ! -f "${SHELL_LINK_SCRIPT}" ]]; then
     echo "shell linker script missing: ${SHELL_LINK_SCRIPT}" >&2
@@ -145,6 +151,11 @@ if [[ ! -f "${PDX_CONSUME_LINK_SCRIPT}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${RUN_LINK_SCRIPT}" ]]; then
+    echo "run linker script missing: ${RUN_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
 # Satellite-tool ELF preservation (design/build/satellite-elf-preservation.md).
 #
 # tools/build.sh's r64v2-tools block stages mkfs.pdxfs.elf /
@@ -202,6 +213,8 @@ DMESG_OBJECTS=()
 # R121.M5 (paideia-os #2499): pdx-produce / pdx-consume canary object sets.
 PDX_PRODUCE_OBJECTS=()
 PDX_CONSUME_OBJECTS=()
+# R125.M5 (paideia-os #2595): /bin/run cap-grant surface object set.
+RUN_OBJECTS=()
 LIBC_OBJECTS=()
 AML_OBJECTS=()
 LIBS_OBJECTS=()
@@ -366,6 +379,16 @@ while IFS= read -r -d '' pdx; do
         # (inlines sys_debug_puts/sys_pipe_edge_recv/sys_exit) so its
         # object goes to its own set only. Mirror of pdx_produce.pdx.
         PDX_CONSUME_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "run.pdx" ]]; then
+        # R125.M5 (paideia-os #2595): /bin/run cap-grant surface. Self-
+        # contained (inlines sys_write/sys_debug_puts/sys_execve/sys_exit
+        # plus SC+ 138 sys_caps_grant_override) so its object goes to its
+        # own set only -- no library pull-in. SC+ 138 is unwired at M5
+        # and returns -ENOSYS until M5-cont lands src/kernel/core/svc/
+        # caps_grant_override.pdx; /bin/run detects that specific errno
+        # and falls through to a plain execve with a warning. Mirrors
+        # the touch.pdx / cat.pdx classification pattern.
+        RUN_OBJECTS+=("${obj}")
     elif [[ "${rel}" == libc/* ]]; then
         # R57.M4-001 (#1797): src/user/libc/ -- userspace runtime library
         # for the growing R57 ring-3 surface (ls, cat, mkdir, ...). Each
@@ -997,6 +1020,30 @@ if [[ ${#DMESG_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/dmesg.elf"
     echo "[ok] ${BUILD_DIR}/dmesg.bin"
+fi
+
+# Link run.elf with run objects only (R125.M5 paideia-os #2595).
+# Self-contained; no libs, no shim. Inlines sys_write (SC+ ID 1) +
+# sys_debug_puts (SC+ ID 12) + sys_execve (SC+ ID 59) + sys_exit
+# (SC+ ID 60) + sys_caps_grant_override (SC+ ID 138). SC+ 138 is
+# unwired at M5 and returns -ENOSYS; run.pdx _start detects that
+# sentinel and emits a one-line warning to stderr before executing
+# the target with a plain execve. The 160 B run_blob scratch
+# (uninit @align(8)) lives in .bss; the R31.M2-1595 (#1595)
+# contiguity rule is preserved by run.ld verbatim. See
+# design/shell/run-grant-surface.md for full semantics.
+if [[ ${#RUN_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T run.ld -> run.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${RUN_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/run.elf" \
+        "${RUN_OBJECTS[@]}"
+
+    echo "[objcopy-user] run.elf -> run.bin"
+    objcopy -O binary "${BUILD_DIR}/run.elf" "${BUILD_DIR}/run.bin"
+
+    echo "[ok] ${BUILD_DIR}/run.elf"
+    echo "[ok] ${BUILD_DIR}/run.bin"
 fi
 
 # R31.M2-1595 (#1595): PT_LOAD extent gate over every image linked above.

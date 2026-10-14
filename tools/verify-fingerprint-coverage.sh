@@ -175,6 +175,33 @@ ALLOWLIST = {
         "any production path at M1 (same reason as CREATE OK). "
         "Retires when R127.M2 wires the cap-invoke DESTROY op.",
 
+    # Wave UMB-W13 R141.M2 (paideia-os#2646): perf-sink logging layer.
+    # PERF SINK INIT OK fires on every boot from _perf_sink_init in
+    # kernel_main.pdx immediately after _mb_init (R141.M1 wiring).
+    # PERF SINK DUMP OK is emitted at the tail of _perf_sink_dump_all
+    # after walking every registered microbench site and emitting a
+    # per-site `PERF SITE ...` klog line via klog_emit_core; the only
+    # production reach is through KIND_MICROBENCH op MB_OP_DUMP_ALL=5
+    # under a userspace-held cap with R_MB_READ, which has no in-tree
+    # consumer at M2. Both retire from this allowlist when R141.M3
+    # lands (KIND_LOG_SINK wiring + the first MB_OP_DUMP_ALL smoke-
+    # mode golden exercising the dump cascade end-to-end).
+    "PERF SINK INIT OK":
+        "Wave UMB-W13 R141.M2: src/kernel/core/perf/perf_sink.pdx "
+        "emits this unconditionally on boot via _perf_sink_init in "
+        "kernel_main.pdx (after _mb_init, before "
+        "_cmd_registry_load_boot). Retires when R141.M3 (KIND_LOG_"
+        "SINK wiring) adds an asserting smoke-mode golden.",
+    "PERF SINK DUMP OK":
+        "Wave UMB-W13 R141.M2: src/kernel/core/perf/perf_sink.pdx "
+        "emits this from _perf_sink_dump_all's success tail. "
+        "Unreachable from any production path at M2 -- the only "
+        "caller is KIND_MICROBENCH op MB_OP_DUMP_ALL=5 "
+        "(cap/kind_microbench.pdx), and no in-tree consumer holds a "
+        "KIND_MICROBENCH cap yet. Retires when R141.M3 wires a "
+        "boot-witness or periodic timer trigger with an asserting "
+        "smoke-mode golden.",
+
     # Wave β (paideia-os compositor QEMU bring-up, α–τ plan): three
     # compositor bring-up markers that fire on every boot once
     # src/user/init.pdx's β-01 fork+exec+wait4 cycle runs the
