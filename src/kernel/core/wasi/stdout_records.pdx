@@ -1,0 +1,891 @@
+// src/kernel/core/wasi/stdout_records.pdx -- Wave UMB-W18 R135.M4
+// paideia-os #2629
+//
+// WASI STDOUT -> TYPED-RECORD CONVERSION
+// =============================================================================
+//
+// R135.M4 lands the kernel-side side-table that converts a jailed WASI
+// module's stdout byte-stream into typed records flowing downstream to the
+// R129.M4 schema-driven formatter.  A WASI jail declares a SCHEMA at exec
+// time (newline-terminated line of tab-separated field names), then every
+// `wasi_fd_write(1, bytes)` call feeds those bytes into this module.  The
+// kernel parses line-by-line against the schema and emits records into a
+// per-pid ring; downstream consumers (shell, schema_fmt, telemetry sinks)
+// drain the ring.
+//
+// Full design: `design/shell/wasi-stdout-records.md`.
+//
+// Companion substrates:
+//   - wasi/wasi_args_conv.pdx (R135.M3) -- the twin side table that
+//     converts WASI argv at exec time.  This module mirrors its shape:
+//     8-row pool, power-of-two row stride, in_use gate at the tail.
+//   - svc/jail_supervisor.pdx (R135.M1/M2) -- 1:1 logical mate; a WASI jail
+//     that owns an argv blob also owns a stdout-record state row.
+//   - term/schema_fmt.pdx (R129.M4, pending) -- the downstream formatter
+//     that consumes records emitted here and renders them to the terminal
+//     using the schema and the ANSI/Kitty substrates.
+//   - wasi/fd_mediation.pdx (R135.M5, pending) -- the fd dispatch arm that
+//     calls `_stdout_records_feed` from `wasi_fd_write(1, ...)` and routes
+//     drained records into schema_fmt + telemetry sinks.
+//
+// =============================================================================
+// SECTION 0  WHY A SIDE TABLE INSTEAD OF A TASK-ROW FIELD
+// =============================================================================
+//
+// Same reasoning as wasi_args_conv.pdx §0 and jail_supervisor.pdx §0:
+// stdout-record state is dead weight for the 99 % of tasks that are not
+// WASI jails emitting structured records.  Keeping the ring + schema +
+// parse state off the task hot path (every scheduler tick, every syscall
+// dispatch) by hanging it on a dedicated 8-row side table is the right
+// altitude.  Capacity match (SR_POOL_MAX = 8 = WA_POOL_MAX = JS_POOL_MAX)
+// is intentional -- the three tables are logically 1:1.
+//
+// =============================================================================
+// SECTION 1  ROW LAYOUT  --  256 BYTES PER ROW, 8 ROWS
+// =============================================================================
+//
+// Stride 256 is a power of two so row addressing uses `shl rax, 8` -- no
+// imul (feedback_pdx_encoder_pitfalls: 2-op `imul r, imm` is an encoder gap).
+// Width is 256 (not 128 like wasi_args_conv) because we inline the per-pid
+// partial-line buffer (128 bytes) alongside the control fields.
+//
+//   [+0]    pid                 (u64)  owning pid; 0 is reserved
+//   [+8]    schema_len          (u64)  bytes stored (<= SR_SCHEMA_MAX = 256)
+//   [+16]   num_fields          (u64)  derived at register time
+//                                       (count_tabs(schema) + 1 when
+//                                       schema_len > 0; else 0)
+//   [+24]   ring_head           (u64)  write cursor, 0..SR_RING_CAP
+//   [+32]   ring_tail           (u64)  read cursor, 0..SR_RING_CAP
+//   [+40]   ring_count          (u64)  live record count, 0..SR_RING_CAP
+//   [+48]   total_records       (u64)  monotonic lifetime count
+//   [+56]   partial_len         (u64)  bytes buffered in cross-feed partial
+//                                       line, 0..SR_PARTIAL_MAX
+//   [+64..+191]  partial_buf    (128 B) per-row partial-line buffer; usable
+//                                       bytes <= SR_PARTIAL_MAX = 120
+//   [+192..+247] reserved       (56 B)  slack for M5 fd mediation state
+//                                       (parent pid, dispatch counters)
+//   [+248]  in_use              (u64)  0 = row free, 1 = row allocated.
+//                                       .bss zero-init gives us FREE at
+//                                       boot.  Written LAST at register
+//                                       time so a concurrent scanner sees
+//                                       FREE or fully-initialised row.
+//
+// =============================================================================
+// SECTION 2  SCHEMA STORE  --  2 KiB TOTAL, 256 BYTES PER ROW
+// =============================================================================
+//
+//   _stdout_records_schemas : [u8; 2048] @align(64)
+//
+// Row `i` owns bytes [i*256 .. (i+1)*256).  Row base pointer for the schema
+// is `_stdout_records_schemas + (row_idx << 8)` -- power-of-two stride.
+// SR_SCHEMA_MAX = 256.  A schema is a tab-separated line of field names
+// (no trailing newline), e.g. "name\tsize\tmtime" -> num_fields = 3.
+//
+// =============================================================================
+// SECTION 3  RING STORE  --  16 KiB TOTAL, 2 KiB PER ROW
+// =============================================================================
+//
+//   _stdout_records_rings : [u8; 16384] @align(64)
+//
+// Row `i` owns bytes [i*2048 .. (i+1)*2048) == SR_RING_CAP (16) record
+// slots of SR_RECORD_BYTES (128) bytes each.  Ring stride is 2048 = 2^11
+// so `shl rax, 11` suffices.  Slot stride is 128 = 2^7 so `shl rax, 7`.
+//
+// Each record slot (128 bytes):
+//   [+0]       record_len (u64)   payload byte count (<= SR_RECORD_PAYLOAD_MAX)
+//   [+8..+127] payload (120 B)    tab-separated raw bytes of the line
+//
+// Reader drains full slots (len header + payload) and interprets by the
+// schema stored on the owning row.
+//
+// =============================================================================
+// SECTION 4  RETURN CODE BAND
+// =============================================================================
+//
+//   SR_OK                   = 0
+//   SR_ERR_BAD_PID          = 0x08    pid == 0 (register) or pid not
+//                                     registered (feed / drain)
+//   SR_ERR_RING_FULL        = 0x1A00  pool full (register) or per-pid
+//                                     ring full (feed)
+//   SR_ERR_SCHEMA_MISMATCH  = 0x1A01  schema oversized (register), parsed
+//                                     line's tab-count != num_fields
+//                                     (feed), or line length exceeds
+//                                     SR_PARTIAL_MAX (feed)
+//
+// All fit imm32 with bit 31 clear so `mov rax, imm32` emits the 7-byte
+// zero-extending form (never `and r11, imm64`).  Overload rationale:
+// four codes keep the surface tight for M4; M5's fd-mediation layer
+// may introduce bespoke codes for I/O-side errors.
+//
+// =============================================================================
+// SECTION 5  PACKED RETURN DISCIPLINE  --  feed / drain
+// =============================================================================
+//
+// `_stdout_records_feed` and `_stdout_records_drain` return a packed u64:
+//
+//   bits [63..32] = records_emitted / records_copied (count u32)
+//   bits [31.. 0] = status (one of the SR_* codes)
+//
+// The caller unpacks via `(ret >> 32)` for the count and `(ret & 0xFFFFFFFF)`
+// for the status.  Non-zero status terminates processing: for feed, the
+// kernel-side partial buffer may still hold bytes (caller re-registers to
+// reset); for drain, remaining ring entries stay in place for the next
+// drain call.  SR_ERR_BAD_PID always comes with count==0.
+//
+// =============================================================================
+// SECTION 6  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Labels prefixed `sr_` (stdout-records) to stay clear of `wa_`
+// (wasi-args), `js_` (jail_supervisor), `ss_` (shell_session), `cmnt_`
+// (cap_minter), `ks_` (kind_shell_session), `sh_` (shell_history).  No
+// reserved paideia-as keyword overlap (reserved: loop / if / let).
+// Encoder-pitfall posture:
+//
+//   * cmp rN, 0            (never `test rN, rN`)
+//   * shl rN, 8            (stride-256 row base; never `imul r, imm`)
+//   * shl rN, 11           (stride-2048 ring base; never `imul r, imm`)
+//   * shl rN, 7            (stride-128 slot base; never `imul r, imm`)
+//   * shl rax, 32          (packed-return hi half; imm8 operand)
+//   * mov rax, imm32       (never `and r11, imm64`)
+//   * single-line `pub let name = "..."` -- none emitted at M4
+//   * module basename StdoutRecords matches file basename
+//     stdout_records.pdx (ddc requires exact match)
+//
+// Stack discipline (SysV, entry rsp%16==8):
+//
+//   _sr_find_row                 0 pushes (pure leaf scan)
+//   _sr_find_free                0 pushes (pure leaf scan)
+//   _stdout_records_register_schema  3 pushes (rbx=pid, r12=schema_ptr,
+//                                               r13=schema_len; odd -> aligned)
+//   _stdout_records_feed         5 pushes (rbx=records_emitted, r12=bytes_ptr,
+//                                           r13=bytes_len, r14=row_base,
+//                                           r15=ring_base; odd -> aligned)
+//   _stdout_records_drain        5 pushes (rbx=records_copied, r12=out_ptr,
+//                                           r13=out_cap, r14=row_base,
+//                                           r15=ring_base; odd -> aligned)
+//
+// Entry rsp%16==8; odd push count +8*N = +8 mod 16 for odd N -> new
+// rsp%16==0 at nested call sites.  No `sub rsp,8` padding needed.
+//
+// =============================================================================
+
+module StdoutRecords = structure {
+
+  // ==========================================================================
+  // Return band (§4)
+  // ==========================================================================
+
+  pub let SR_OK                  : u64 = 0
+  pub let SR_ERR_BAD_PID         : u64 = 0x08
+  pub let SR_ERR_RING_FULL       : u64 = 0x1A00
+  pub let SR_ERR_SCHEMA_MISMATCH : u64 = 0x1A01
+
+  // ==========================================================================
+  // Pool + schema + ring geometry (§1-§3)
+  // ==========================================================================
+
+  pub let SR_POOL_MAX           : u64 = 8     // rows (jailed WASI pids)
+  pub let SR_ROW_BYTES          : u64 = 256   // 32 u64 per row
+  pub let SR_SCHEMA_MAX         : u64 = 256   // bytes per row's schema slot
+  pub let SR_RING_CAP           : u64 = 16    // records per per-pid ring
+  pub let SR_RECORD_BYTES       : u64 = 128   // bytes per record slot
+  pub let SR_RECORD_HEADER      : u64 = 8     // record_len (u64) prefix
+  pub let SR_RECORD_PAYLOAD_MAX : u64 = 120   // SR_RECORD_BYTES - 8
+  pub let SR_PARTIAL_MAX        : u64 = 120   // bytes per partial-line buf
+
+  // Row-field offsets (bytes, from row base)
+  pub let SR_OFF_PID            : u64 = 0
+  pub let SR_OFF_SCHEMA_LEN     : u64 = 8
+  pub let SR_OFF_NUM_FIELDS     : u64 = 16
+  pub let SR_OFF_RING_HEAD      : u64 = 24
+  pub let SR_OFF_RING_TAIL      : u64 = 32
+  pub let SR_OFF_RING_COUNT     : u64 = 40
+  pub let SR_OFF_TOTAL_RECORDS  : u64 = 48
+  pub let SR_OFF_PARTIAL_LEN    : u64 = 56
+  pub let SR_OFF_PARTIAL_BUF    : u64 = 64
+  pub let SR_OFF_IN_USE         : u64 = 248
+
+  // Sentinel for "no row matched" (find_row).
+  pub let SR_ID_NONE : u64 = 0xFF
+
+  // ==========================================================================
+  // Storage
+  //
+  //   _stdout_records_pool    -- 8 rows x 256 bytes = 256 u64.  @align(64)
+  //                              puts the pool on a cache-line boundary.
+  //                              Rows at offsets 0,256,512,... all land on
+  //                              cache-line starts (stride 256 is 4 cache
+  //                              lines).
+  //   _stdout_records_schemas -- 2048 bytes = 8 slots x 256 bytes.
+  //   _stdout_records_rings   -- 16384 bytes = 8 rings x 2048 bytes
+  //                              = 8 x 16 slots x 128 bytes.
+  //
+  // .bss zero-init gives us all-FREE at boot (in_use == 0 on every row).
+  // ==========================================================================
+
+  pub let mut _stdout_records_pool    : [u64; 256]   = uninit @align(64)
+  pub let mut _stdout_records_schemas : [u8;  2048]  = uninit @align(64)
+  pub let mut _stdout_records_rings   : [u8;  16384] = uninit @align(64)
+
+  // ==========================================================================
+  // _sr_find_row(pid) -> row_idx | SR_ID_NONE
+  //
+  // Linear scan _stdout_records_pool[0..SR_POOL_MAX) for the first row
+  // whose in_use (word at [+248]) is 1 AND pid (word at [+0]) matches rdi.
+  // Return row_idx in [0, 8) on hit, SR_ID_NONE (0xFF) on miss.  pid==0
+  // can never match a live row because _stdout_records_register_schema
+  // refuses pid==0 at register time with SR_ERR_BAD_PID.  Pure leaf -- no
+  // pushes, no nested calls.  Labels prefixed sr_fr_.  Shape mirror of
+  // _wasi_args_find_row.
+  // ==========================================================================
+  pub let _sr_find_row : (u64) -> u64 !{mem} @{} =
+    fn (pid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M4 (paideia-os #2629): linear scan _stdout_records_pool[0..SR_POOL_MAX) for the first row whose in_use (word at [+248]) is 1 AND pid (word at [+0]) matches rdi. Return row_idx (0..7) or SR_ID_NONE (0xFF) on miss. pid==0 can never match a live row because _stdout_records_register_schema refuses pid==0 at mint time. Inlined row-base (shl 8 for 256-byte stride). Pure leaf -- no callee-save pushes, no nested calls. Labels prefixed sr_fr_. Mirrors _wasi_args_find_row.",
+      block: {
+        lea r10, [rip + _stdout_records_pool];
+        xor rcx, rcx;                    // row_idx cursor
+      sr_fr_scan:
+        cmp rcx, 8;                      // SR_POOL_MAX
+        jae sr_fr_none;
+
+        mov rax, rcx;
+        shl rax, 8;                      // row_idx * 256
+        add rax, r10;                    // row base
+
+        // Row must be in_use.
+        mov r11, [rax + 248];
+        cmp r11, 0;
+        je  sr_fr_next;
+
+        // pid must match.
+        mov r11, [rax + 0];
+        cmp r11, rdi;
+        je  sr_fr_hit;
+
+      sr_fr_next:
+        add rcx, 1;
+        jmp sr_fr_scan;
+
+      sr_fr_hit:
+        mov rax, rcx;
+        ret;
+
+      sr_fr_none:
+        mov rax, 0xFF;                   // SR_ID_NONE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _sr_find_free() -> row_idx | SR_ID_NONE
+  //
+  // Linear scan for the first row whose in_use field is zero.  Used only
+  // by _stdout_records_register_schema when no existing row for the pid
+  // is found.  Pure leaf.  Labels prefixed sr_ff_.
+  // ==========================================================================
+  pub let _sr_find_free : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M4 (paideia-os #2629): linear scan _stdout_records_pool[0..SR_POOL_MAX) for the first row whose in_use (word at [+248]) is zero. Return row_idx or SR_ID_NONE (0xFF). Inlined row-base (shl 8). Pure leaf -- no pushes. Labels prefixed sr_ff_. Mirrors _wasi_args_find_free.",
+      block: {
+        lea r10, [rip + _stdout_records_pool];
+        xor rcx, rcx;                    // row_idx cursor
+      sr_ff_scan:
+        cmp rcx, 8;                      // SR_POOL_MAX
+        jae sr_ff_none;
+
+        mov rax, rcx;
+        shl rax, 8;                      // row_idx * 256
+        add rax, r10;                    // row base
+        mov r11, [rax + 248];            // in_use
+        cmp r11, 0;
+        je  sr_ff_hit;
+
+        add rcx, 1;
+        jmp sr_ff_scan;
+
+      sr_ff_hit:
+        mov rax, rcx;
+        ret;
+
+      sr_ff_none:
+        mov rax, 0xFF;                   // SR_ID_NONE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _stdout_records_register_schema(pid, schema_ptr, schema_len) -> errno
+  //
+  // Mint (or replace) a side-table row owning a copy of the schema line
+  // `[schema_ptr .. schema_ptr + schema_len)`.  Resets the per-pid ring,
+  // partial buffer, and counters.
+  //
+  // ARGS (SysV):
+  //   rdi = pid                 (must be non-zero)
+  //   rsi = schema_ptr          (kernel pointer; readable up to schema_len
+  //                              bytes; a tab-separated line of field
+  //                              names, no trailing newline)
+  //   rdx = schema_len          (<= SR_SCHEMA_MAX = 256)
+  //
+  // RETURNS (rax):
+  //   SR_OK                     -- row registered or replaced
+  //   SR_ERR_BAD_PID            -- pid == 0
+  //   SR_ERR_RING_FULL          -- pool full (overload: no free row)
+  //   SR_ERR_SCHEMA_MISMATCH    -- schema_len > SR_SCHEMA_MAX
+  //
+  // STEP-BY-STEP:
+  //   1. pid != 0 -> else SR_ERR_BAD_PID.
+  //   2. schema_len <= SR_SCHEMA_MAX -> else SR_ERR_SCHEMA_MISMATCH.
+  //   3. _sr_find_row(pid) -> row_idx.  If SR_ID_NONE,
+  //      _sr_find_free() -> row_idx.  If still SR_ID_NONE,
+  //      -> SR_ERR_RING_FULL.
+  //   4. Compute row_base (shl 8) and schema_base (shl 8).
+  //   5. Byte-copy schema_len bytes from schema_ptr into schema_base.
+  //   6. Scan the copied schema: tab_count = count of '\t' bytes.
+  //      num_fields = (schema_len > 0) ? (tab_count + 1) : 0.
+  //   7. Zero per-pid ring state: ring_head/tail/count, total_records,
+  //      partial_len.
+  //   8. Write fixed fields: pid, schema_len, num_fields.
+  //   9. Write in_use=1 LAST so a concurrent scanner either sees FREE or
+  //      fully-initialised.
+  //  10. Return SR_OK.
+  //
+  // STACK FRAME:
+  //   3 callee-save pushes (rbx=pid, r12=schema_ptr, r13=schema_len).
+  //   Entry rsp%16==8; +3 pushes = +24 bytes = +8 mod 16 -> new rsp%16==0
+  //   at nested call (odd # of pushes puts us back on 16-byte alignment).
+  //   Nested calls: _sr_find_row, _sr_find_free.
+  //
+  // Labels prefixed sr_rg_.
+  // ==========================================================================
+  pub let _stdout_records_register_schema : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (pid: u64) (schema_ptr: u64) (schema_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M4 (paideia-os #2629): register (or replace) a stdout-record state row for pid, owning a copy of the schema line. Validate pid != 0 (SR_ERR_BAD_PID), schema_len <= SR_SCHEMA_MAX=256 (SR_ERR_SCHEMA_MISMATCH), find-or-allocate a row (SR_ERR_RING_FULL on pool full), byte-copy schema_ptr into the row's slice of _stdout_records_schemas, scan for tab count (num_fields = tabs+1 when schema_len>0; else 0), zero per-pid ring state (ring_head/tail/count, total_records, partial_len), write fixed fields pid/schema_len/num_fields, set in_use=1 LAST so a concurrent scanner sees FREE or fully-initialised. Three callee-save pushes (rbx=pid, r12=schema_ptr, r13=schema_len). Entry rsp%16==8; +3 pushes = +24 bytes = +8 mod 16 -> new rsp%16==0 at every nested call (odd # of pushes puts us back on 16-byte alignment). Nested calls: _sr_find_row, _sr_find_free. After allocation, no more nested calls -- r9/r10/r11 scratch suffices for row_base, schema_base, and loop state. Byte copy and tab-count scan use mov_b scalar-indexed addressing proven in wasi_args_conv.pdx. Encoder-pitfall posture: cmp rN, 0 (never test), shl rN, 8 for stride-256 (never imul), mov rax, imm32 for all SR codes. Labels prefixed sr_rg_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // pid
+        mov r12, rsi;                    // schema_ptr
+        mov r13, rdx;                    // schema_len
+
+        // ---- Step 1: pid != 0 ----
+        cmp rbx, 0;
+        je  sr_rg_bad_pid;
+
+        // ---- Step 2: schema_len <= SR_SCHEMA_MAX ----
+        mov r11, 256;                    // SR_SCHEMA_MAX
+        cmp r13, r11;
+        ja  sr_rg_mismatch;
+
+        // ---- Step 3a: find existing row ----
+        mov rdi, rbx;
+        call _sr_find_row;
+        mov r11, 0xFF;                   // SR_ID_NONE
+        cmp rax, r11;
+        jne sr_rg_have_row;
+
+        // ---- Step 3b: find free row ----
+        call _sr_find_free;
+        mov r11, 0xFF;
+        cmp rax, r11;
+        je  sr_rg_pool_full;
+
+      sr_rg_have_row:
+        // rax = row_idx.  Compute row_base in r10, schema_base in r11.
+        mov r10, rax;
+        shl r10, 8;                      // row_idx * 256
+        lea r9,  [rip + _stdout_records_pool];
+        add r10, r9;                     // r10 = row_base
+
+        mov r11, rax;
+        shl r11, 8;                      // row_idx * 256
+        lea r9,  [rip + _stdout_records_schemas];
+        add r11, r9;                     // r11 = schema_base
+
+        // ---- Step 5: byte-copy schema_len bytes from r12 (src) to r11 (dst) ----
+        xor rcx, rcx;                    // i = 0
+      sr_rg_copy:
+        cmp rcx, r13;
+        jae sr_rg_copy_done;
+
+        xor rax, rax;
+        mov_b rax, [r12 + rcx * 1];      // src byte
+        mov_b [r11 + rcx * 1], rax;      // dst byte at schema[i]
+        add rcx, 1;
+        jmp sr_rg_copy;
+
+      sr_rg_copy_done:
+        // ---- Step 6: scan copied schema for tab bytes ('\t' = 9) ----
+        xor rcx, rcx;                    // i = 0
+        xor r9,  r9;                     // tab_count = 0
+      sr_rg_scan:
+        cmp rcx, r13;
+        jae sr_rg_scan_done;
+
+        xor rax, rax;
+        mov_b rax, [r11 + rcx * 1];
+        cmp rax, 9;                      // '\t'
+        jne sr_rg_scan_next;
+        add r9, 1;
+      sr_rg_scan_next:
+        add rcx, 1;
+        jmp sr_rg_scan;
+
+      sr_rg_scan_done:
+        // num_fields = (schema_len > 0) ? (tab_count + 1) : 0
+        cmp r13, 0;
+        je  sr_rg_zero_fields;
+        add r9, 1;
+        jmp sr_rg_write;
+
+      sr_rg_zero_fields:
+        xor r9, r9;
+
+      sr_rg_write:
+        // ---- Step 7: zero per-pid ring state ----
+        xor rax, rax;
+        mov [r10 + 24],  rax;            // ring_head = 0
+        mov [r10 + 32],  rax;            // ring_tail = 0
+        mov [r10 + 40],  rax;            // ring_count = 0
+        mov [r10 + 48],  rax;            // total_records = 0
+        mov [r10 + 56],  rax;            // partial_len = 0
+
+        // ---- Step 8: write fixed fields ----
+        mov [r10 + 0],   rbx;            // pid
+        mov [r10 + 8],   r13;            // schema_len
+        mov [r10 + 16],  r9;             // num_fields
+
+        // ---- Step 9: in_use = 1 LAST ----
+        mov r9, 1;
+        mov [r10 + 248], r9;
+
+        // ---- Step 10: SR_OK ----
+        xor rax, rax;
+        jmp sr_rg_out;
+
+      sr_rg_bad_pid:
+        mov rax, 0x08;                   // SR_ERR_BAD_PID
+        jmp sr_rg_out;
+
+      sr_rg_pool_full:
+        mov rax, 0x1A00;                 // SR_ERR_RING_FULL (overload: pool full)
+        jmp sr_rg_out;
+
+      sr_rg_mismatch:
+        mov rax, 0x1A01;                 // SR_ERR_SCHEMA_MISMATCH
+
+      sr_rg_out:
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _stdout_records_feed(pid, bytes_ptr, bytes_len) -> packed u64
+  //
+  // Parse bytes_ptr[0..bytes_len) against the schema registered for pid.
+  // Each '\n' (0x0A) delimits a record; blank lines are skipped silently.
+  // On each non-blank line the kernel verifies the tab-count matches
+  // num_fields and emits the line into the per-pid ring as (record_len,
+  // payload).  Partial lines (bytes before the next '\n' when the feed
+  // exhausts) are retained in the row's partial_buf for the next feed.
+  //
+  // ARGS (SysV):
+  //   rdi = pid
+  //   rsi = bytes_ptr           (kernel pointer; readable up to bytes_len)
+  //   rdx = bytes_len
+  //
+  // RETURNS (rax):  packed u64
+  //   bits [63..32] = records_emitted (count of lines added to the ring)
+  //   bits [31.. 0] = status
+  //
+  //   status = SR_OK                   -- feed accepted; may be incomplete
+  //                                        (trailing partial line retained)
+  //   status = SR_ERR_BAD_PID          -- pid not registered (count=0)
+  //   status = SR_ERR_RING_FULL        -- per-pid ring full; feed aborted
+  //                                        at the offending line
+  //   status = SR_ERR_SCHEMA_MISMATCH  -- parsed line's tab-count !=
+  //                                        num_fields OR line exceeded
+  //                                        SR_PARTIAL_MAX; feed aborted
+  //
+  // Non-OK statuses leave partial_buf in whatever state the loop was in;
+  // the caller recovers by re-registering (which resets partial_len=0 and
+  // the ring state) or by draining the already-emitted records.
+  //
+  // STATE MACHINE:
+  //   Byte != '\n':
+  //     partial_len == SR_PARTIAL_MAX -> SR_ERR_SCHEMA_MISMATCH
+  //     else -> partial_buf[partial_len++] = byte
+  //   Byte == '\n':
+  //     partial_len == 0 -> blank line, skip
+  //     else -> count tabs in partial_buf[0..partial_len], validate
+  //             against num_fields, emit into ring (record_len header
+  //             + payload copy), advance ring_head, bump ring_count,
+  //             bump total_records, zero partial_len.
+  //
+  // STACK FRAME:
+  //   5 callee-save pushes (rbx=records_emitted, r12=bytes_ptr,
+  //   r13=bytes_len, r14=row_base, r15=ring_base).  Entry rsp%16==8;
+  //   +5 pushes = +40 bytes = +8 mod 16 -> new rsp%16==0 at the nested
+  //   call (odd # of pushes puts us back on 16-byte alignment).  Nested
+  //   call: _sr_find_row.  After find_row returns, no further nested
+  //   calls -- rax/rcx/rdx/rsi/rdi/r8/r9/r10/r11 are free scratch.
+  //
+  // Labels prefixed sr_fd_.
+  // ==========================================================================
+  pub let _stdout_records_feed : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (pid: u64) (bytes_ptr: u64) (bytes_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M4 (paideia-os #2629): parse bytes_ptr[0..bytes_len) against pid's registered schema, emit records into the per-pid ring on each '\\n'. Returns packed u64 (records_emitted << 32) | status. Byte-by-byte state machine: non-newline bytes accumulate into partial_buf (bounded by SR_PARTIAL_MAX=120, overflow -> SR_ERR_SCHEMA_MISMATCH); newline closes a record (blank line -> skip; non-blank -> count tabs, validate against num_fields, emit into ring slot). Ring addressed by ring_head (shl 7 for 128-byte slots), bounded by SR_RING_CAP=16; full ring -> SR_ERR_RING_FULL. Five callee-save pushes (rbx=records_emitted, r12=bytes_ptr, r13=bytes_len, r14=row_base, r15=ring_base). Entry rsp%16==8; +5 pushes = +40 bytes = +8 mod 16 -> new rsp%16==0 at the nested call (odd # of pushes puts us back on 16-byte alignment). Nested call: _sr_find_row only; after return, no further nested calls -- rax/rcx/rdx/rsi/rdi/r8/r9/r10/r11 are free scratch. Encoder posture: cmp rN,0 (never test), shl rN,8 (stride-256 row base), shl rN,11 (stride-2048 ring base), shl rN,7 (stride-128 slot base), shl rax,32 (packed-return hi half), mov rax,imm32 for all SR codes. Labels prefixed sr_fd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rsi;                    // bytes_ptr
+        mov r13, rdx;                    // bytes_len
+
+        xor rbx, rbx;                    // records_emitted = 0
+
+        // ---- Lookup row ----
+        // rdi still = pid on entry
+        call _sr_find_row;
+        mov r11, 0xFF;                   // SR_ID_NONE
+        cmp rax, r11;
+        je  sr_fd_badpid;
+
+        // Compute row_base in r14, ring_base in r15.
+        mov r14, rax;
+        shl r14, 8;                      // row_idx * 256
+        lea r11, [rip + _stdout_records_pool];
+        add r14, r11;                    // r14 = row_base
+
+        mov r15, rax;
+        shl r15, 11;                     // row_idx * 2048
+        lea r11, [rip + _stdout_records_rings];
+        add r15, r11;                    // r15 = ring_base
+
+        // Main byte loop: for i in 0..bytes_len
+        xor rcx, rcx;                    // i = 0
+
+      sr_fd_loop:
+        cmp rcx, r13;
+        jae sr_fd_done;
+
+        xor rax, rax;
+        mov_b rax, [r12 + rcx * 1];      // byte in rax
+        cmp rax, 10;                     // '\n'
+        je  sr_fd_newline;
+
+        // --- Non-newline: append to partial_buf ---
+        mov r8, [r14 + 56];              // partial_len
+        mov r11, 120;                    // SR_PARTIAL_MAX
+        cmp r8, r11;
+        jae sr_fd_too_long;
+
+        // partial_buf base = r14 + 64
+        lea r11, [r14 + 64];
+        mov_b [r11 + r8 * 1], rax;
+        add r8, 1;
+        mov [r14 + 56], r8;
+
+        add rcx, 1;
+        jmp sr_fd_loop;
+
+      sr_fd_newline:
+        // --- Newline: close a record ---
+        mov r8, [r14 + 56];              // partial_len
+        cmp r8, 0;
+        je  sr_fd_blank;                 // blank line -> skip
+
+        // Count tabs in partial_buf[0..partial_len].  r11 = partial_buf,
+        // r9 = tab_count, r10 = j.
+        lea r11, [r14 + 64];
+        xor r9, r9;
+        xor r10, r10;
+
+      sr_fd_count:
+        cmp r10, r8;
+        jae sr_fd_count_done;
+        xor rax, rax;
+        mov_b rax, [r11 + r10 * 1];
+        cmp rax, 9;                      // '\t'
+        jne sr_fd_count_next;
+        add r9, 1;
+      sr_fd_count_next:
+        add r10, 1;
+        jmp sr_fd_count;
+
+      sr_fd_count_done:
+        add r9, 1;                       // field_count = tab_count + 1
+
+        // Compare field_count against num_fields.
+        mov r10, [r14 + 16];             // num_fields
+        cmp r9, r10;
+        jne sr_fd_mismatch;
+
+        // Ring full?
+        mov r9, [r14 + 40];              // ring_count
+        mov r10, 16;                     // SR_RING_CAP
+        cmp r9, r10;
+        jae sr_fd_ring_full;
+
+        // Compute ring_slot = ring_base + ring_head * 128 (in r10).
+        mov r10, [r14 + 24];             // ring_head
+        shl r10, 7;                      // ring_head * 128
+        add r10, r15;                    // r10 = ring_slot
+
+        // Store record_len at ring_slot[+0] (r8 holds partial_len).
+        mov [r10 + 0], r8;
+
+        // Copy r8 bytes from partial_buf (r14+64) -> ring_slot+8.
+        lea r11, [r14 + 64];             // src
+        lea r9,  [r10 + 8];              // dst
+        xor rdi, rdi;                    // j = 0 (rdi is caller-save; safe)
+
+      sr_fd_copy:
+        cmp rdi, r8;
+        jae sr_fd_copy_done;
+        xor rax, rax;
+        mov_b rax, [r11 + rdi * 1];
+        mov_b [r9  + rdi * 1], rax;
+        add rdi, 1;
+        jmp sr_fd_copy;
+
+      sr_fd_copy_done:
+        // ring_head = (ring_head + 1) mod SR_RING_CAP
+        mov r9, [r14 + 24];
+        add r9, 1;
+        mov r10, 16;
+        cmp r9, r10;
+        jb  sr_fd_head_ok;
+        xor r9, r9;
+      sr_fd_head_ok:
+        mov [r14 + 24], r9;
+
+        // ring_count += 1
+        mov r9, [r14 + 40];
+        add r9, 1;
+        mov [r14 + 40], r9;
+
+        // total_records += 1
+        mov r9, [r14 + 48];
+        add r9, 1;
+        mov [r14 + 48], r9;
+
+        // partial_len = 0
+        xor r9, r9;
+        mov [r14 + 56], r9;
+
+        // records_emitted (rbx) += 1
+        add rbx, 1;
+
+      sr_fd_blank:
+        add rcx, 1;
+        jmp sr_fd_loop;
+
+      sr_fd_done:
+        // Normal fallthrough: records_emitted in rbx, status = SR_OK.
+        mov rax, rbx;
+        shl rax, 32;                     // (records_emitted << 32) | 0
+        jmp sr_fd_out;
+
+      sr_fd_badpid:
+        // records_emitted = 0 by construction, status = SR_ERR_BAD_PID.
+        mov rax, 0x08;
+        jmp sr_fd_out;
+
+      sr_fd_mismatch:
+        mov rax, rbx;
+        shl rax, 32;
+        mov r11, 0x1A01;                 // SR_ERR_SCHEMA_MISMATCH
+        or  rax, r11;
+        jmp sr_fd_out;
+
+      sr_fd_too_long:
+        // Overlength line -> schema mismatch (overload).
+        mov rax, rbx;
+        shl rax, 32;
+        mov r11, 0x1A01;
+        or  rax, r11;
+        jmp sr_fd_out;
+
+      sr_fd_ring_full:
+        mov rax, rbx;
+        shl rax, 32;
+        mov r11, 0x1A00;                 // SR_ERR_RING_FULL
+        or  rax, r11;
+
+      sr_fd_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _stdout_records_drain(pid, out_records_ptr, out_cap) -> packed u64
+  //
+  // Copy up to `out_cap` records from the per-pid ring into
+  // `out_records_ptr`.  Each record is a 128-byte slot
+  // (record_len header + 120-byte payload).  Advances ring_tail by
+  // records_copied and decrements ring_count.
+  //
+  // ARGS (SysV):
+  //   rdi = pid
+  //   rsi = out_records_ptr     (writable [u8; out_cap * 128] destination;
+  //                              0 is treated as a zero-cap probe)
+  //   rdx = out_cap             (max records to copy)
+  //
+  // RETURNS (rax):  packed u64
+  //   bits [63..32] = records_copied
+  //   bits [31.. 0] = status
+  //
+  //   status = SR_OK            -- copy complete; ring may still hold
+  //                                 more records (drain again to catch
+  //                                 up) or may be empty.
+  //   status = SR_ERR_BAD_PID   -- pid not registered (count=0).
+  //
+  // STEP-BY-STEP:
+  //   1. _sr_find_row(pid).  SR_ID_NONE -> (0 << 32) | SR_ERR_BAD_PID.
+  //   2. Compute row_base and ring_base.
+  //   3. Loop: while records_copied < out_cap AND ring_count > 0 AND
+  //      out_records_ptr != 0:
+  //        a. src_slot = ring_base + ring_tail * 128.
+  //        b. dst_slot = out_records_ptr + records_copied * 128.
+  //        c. Byte-copy 128 bytes from src_slot to dst_slot.
+  //        d. ring_tail = (ring_tail + 1) mod SR_RING_CAP.
+  //        e. ring_count -= 1.
+  //        f. records_copied += 1.
+  //   4. Return (records_copied << 32) | SR_OK.
+  //
+  // STACK FRAME:
+  //   5 callee-save pushes (rbx=records_copied, r12=out_records_ptr,
+  //   r13=out_cap, r14=row_base, r15=ring_base).  Entry rsp%16==8;
+  //   +5 pushes = +40 bytes = +8 mod 16 -> new rsp%16==0 at the nested
+  //   call.  Nested call: _sr_find_row only; after return, no further
+  //   nested calls.
+  //
+  // Labels prefixed sr_dr_.
+  // ==========================================================================
+  pub let _stdout_records_drain : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (pid: u64) (out_records_ptr: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R135.M4 (paideia-os #2629): drain up to out_cap records from pid's per-pid ring into out_records_ptr (slot-shaped [u8; out_cap*128]). Each slot is (record_len u64 header, 120-byte payload). Returns packed u64 (records_copied << 32) | status. Pid-not-registered -> (0 << 32) | SR_ERR_BAD_PID. Null out_records_ptr terminates copy at the current count (zero-cap probe). Loop computes src_slot = ring_base + ring_tail*128 and dst_slot = out_ptr + records_copied*128, byte-copies 128 bytes, advances ring_tail mod SR_RING_CAP, decrements ring_count. Five callee-save pushes (rbx=records_copied, r12=out_records_ptr, r13=out_cap, r14=row_base, r15=ring_base). Entry rsp%16==8; +5 pushes = +40 bytes = +8 mod 16 -> rsp%16==0 at the one nested call. After find_row returns, no further nested calls; r8/r9/r10/r11/rax/rcx/rdx/rsi/rdi are free scratch. Encoder posture: cmp rN,0 (never test), shl rN,8 (row stride), shl rN,11 (ring stride), shl rN,7 (slot stride), shl rax,32 (packed-return hi half), mov rax,imm32 for SR codes. Labels prefixed sr_dr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rsi;                    // out_records_ptr
+        mov r13, rdx;                    // out_cap
+
+        xor rbx, rbx;                    // records_copied = 0
+
+        // ---- Lookup row ----
+        // rdi still = pid on entry
+        call _sr_find_row;
+        mov r11, 0xFF;
+        cmp rax, r11;
+        je  sr_dr_badpid;
+
+        // row_base in r14
+        mov r14, rax;
+        shl r14, 8;                      // row_idx * 256
+        lea r11, [rip + _stdout_records_pool];
+        add r14, r11;
+
+        // ring_base in r15
+        mov r15, rax;
+        shl r15, 11;                     // row_idx * 2048
+        lea r11, [rip + _stdout_records_rings];
+        add r15, r11;
+
+      sr_dr_loop:
+        // records_copied < out_cap?
+        cmp rbx, r13;
+        jae sr_dr_done;
+
+        // ring_count > 0?
+        mov r9, [r14 + 40];
+        cmp r9, 0;
+        je  sr_dr_done;
+
+        // out_records_ptr != 0?  (null = zero-cap probe)
+        cmp r12, 0;
+        je  sr_dr_done;
+
+        // src_slot = ring_base + ring_tail * 128
+        mov r9, [r14 + 32];              // ring_tail
+        shl r9, 7;
+        add r9, r15;                     // r9 = src_slot
+
+        // dst_slot = out_records_ptr + records_copied * 128
+        mov r10, rbx;
+        shl r10, 7;
+        add r10, r12;                    // r10 = dst_slot
+
+        // Copy 128 bytes from r9 -> r10.
+        xor rcx, rcx;
+      sr_dr_copy:
+        cmp rcx, 128;                    // SR_RECORD_BYTES
+        jae sr_dr_copy_done;
+        xor rax, rax;
+        mov_b rax, [r9  + rcx * 1];
+        mov_b [r10 + rcx * 1], rax;
+        add rcx, 1;
+        jmp sr_dr_copy;
+
+      sr_dr_copy_done:
+        // ring_tail = (ring_tail + 1) mod SR_RING_CAP
+        mov r9, [r14 + 32];
+        add r9, 1;
+        mov r10, 16;
+        cmp r9, r10;
+        jb  sr_dr_tail_ok;
+        xor r9, r9;
+      sr_dr_tail_ok:
+        mov [r14 + 32], r9;
+
+        // ring_count -= 1
+        mov r9, [r14 + 40];
+        sub r9, 1;
+        mov [r14 + 40], r9;
+
+        // records_copied += 1
+        add rbx, 1;
+        jmp sr_dr_loop;
+
+      sr_dr_done:
+        mov rax, rbx;
+        shl rax, 32;                     // (records_copied << 32) | 0
+        jmp sr_dr_out;
+
+      sr_dr_badpid:
+        mov rax, 0x08;                   // SR_ERR_BAD_PID (count=0)
+
+      sr_dr_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

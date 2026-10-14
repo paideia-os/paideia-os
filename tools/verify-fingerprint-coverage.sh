@@ -275,6 +275,50 @@ ALLOWLIST = {
         "Retires when R127.M5 wires the TTY recall binding with an "
         "asserting smoke-mode golden.",
 
+    # Wave UMB-W18 R127.M7 (paideia-os#2603): datalog-queryable history
+    # fact store. HISTORY_FACTS INIT OK fires on every boot via
+    # _hf_init in the svc.* bringup cascade (kernel_main.pdx right
+    # after _shell_history_init, before _shell_jobs_init). APPEND OK
+    # is present as a .rodata tag inside _hf_append, which is called
+    # from _shell_history_append after the ring write (hook landed
+    # 2026-10-14 in this same wave), so it transitively depends on a
+    # production caller that actually drives APPEND end-to-end --
+    # which the shell parent's dispatch loop (R127.M5+) owns.
+    # QUERY OK is present as a .rodata tag inside _hf_query_by_session
+    # / _hf_query_by_cmd_hash / _hf_query_by_exit (all three emit the
+    # same string); at M7 no production path invokes any query because
+    # the KIND_SHELL_SESSION op surface that would expose them to
+    # userspace is a future-wave landing. All three retire from this
+    # allowlist when R127.M5+ lands with asserting smoke-mode goldens
+    # driving APPEND end-to-end (via a shell parent task that mints
+    # a session and dispatches at least one command), AND when the
+    # KIND_SHELL_SESSION ops surface the three query predicates with
+    # an asserting smoke-mode golden exercising at least one query.
+    "HISTORY_FACTS INIT OK":
+        "Wave UMB-W18 R127.M7: src/kernel/core/svc/history_facts.pdx "
+        "emits this unconditionally on boot via _hf_init in the svc.* "
+        "bringup cascade (after _shell_history_init). Retires when "
+        "R127.M5+ (shell parent dispatch loop) adds an asserting "
+        "smoke-mode golden driving APPEND end-to-end.",
+    "HISTORY_FACTS APPEND OK":
+        "Wave UMB-W18 R127.M7: src/kernel/core/svc/history_facts.pdx "
+        "emits this from _hf_append, which the hook in "
+        "_shell_history_append calls on every ring append. "
+        "Unreachable from any production path at M7 (same reason as "
+        "SHELL_HISTORY APPEND OK: no shell parent task mints a "
+        "KIND_SHELL_SESSION cap yet; the dispatch loop that would "
+        "drive APPEND lands with R127.M5). Retires alongside "
+        "SHELL_HISTORY APPEND OK when the dispatch loop lands.",
+    "HISTORY_FACTS QUERY OK":
+        "Wave UMB-W18 R127.M7: src/kernel/core/svc/history_facts.pdx "
+        "emits this from _hf_query_by_session / _hf_query_by_cmd_hash "
+        "/ _hf_query_by_exit (all three share the string). Unreachable "
+        "from any production path at M7 (no production caller invokes "
+        "the queries; the KIND_SHELL_SESSION op surface that would "
+        "expose them to userspace is a future-wave landing). Retires "
+        "when that op surface lands with an asserting smoke-mode "
+        "golden exercising at least one query predicate.",
+
     # Wave UMB-W16 R127.M5 (paideia-os#2601): shell job-control
     # primitives substrate. SHELL_JOBS INIT OK fires on every boot
     # via _shell_jobs_init in the svc.* bringup cascade (kernel_main.

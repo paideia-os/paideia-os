@@ -1,0 +1,1131 @@
+// src/kernel/core/svc/history_facts.pdx -- Wave UMB-W18 R127.M7
+// paideia-os #2603
+//
+// DATALOG-QUERYABLE HISTORY FACT STORE
+// =============================================================================
+//
+// R127 ("REPL session process + history storage") milestone M7.  M4
+// (Wave UMB-W15, #2600) landed the shell-history ring: 128 entries of
+// raw command TEXT per session, keyed by the per-session
+// history_head / history_tail counters on the shell_session row.  M7
+// lands a parallel, STRUCTURED fact store: each command's execution
+// is a 64-byte row of audit-shaped fields (session_id, cmd_hash,
+// tsc_start/end, exit_code, argc, argv_blob_offset, flags) over
+// which a tiny datalog-style query engine filters.
+//
+// The two stores are deliberately independent.  The TEXT ring is for
+// up-arrow / Ctrl-R recall (shell UX).  The FACT store is for queries
+// of the form "which commands exited non-zero in the last session?"
+// or "which commands had cmd_hash = djb2("ls") across all sessions?" --
+// a reach the TEXT ring cannot satisfy without reparsing every line.
+// Keeping the fact row at a fixed 64 bytes means the structured scan
+// never pays the cost of variable-length command text, and the two
+// stores can be versioned independently.
+//
+// Design posture (feedback_novel_clean_design): POSIX bash's
+// `HISTTIMEFORMAT` / per-shell log file is retired in favour of a
+// kernel-held fact table whose only reach is through direct-call API
+// (M7) and, in a later wave, a KIND_SHELL_SESSION cap-invoke op.  The
+// fact store is content-addressable: a replay or `jq`-style filter is
+// a native capability of the kernel, not an afterthought wrapped
+// around a text file.
+//
+// Design: design/shell/history-datalog-substrate.md.
+//
+// =============================================================================
+// SECTION 1  GEOMETRY  --  64 KiB BACKING, 8 SESSIONS, 128 FACTS
+// =============================================================================
+//
+//   per-fact stride   = 64 bytes                            (shl 6)
+//   per-session ring  = 128 facts  x 64 bytes = 8 KiB       (shl 13)
+//   pool              = 8 sessions x 8 KiB    = 64 KiB
+//
+// Backing storage: _hf_pool : [u8; 65536] in .bss, @align(64) so the
+// first ring (session 0) sits on a cache-line boundary and session N's
+// ring starts at (N << 13) from the pool base -- no `imul r, imm` is
+// ever needed to address a fact slot.
+//
+// Fact row layout (64 bytes, cache-line-sized):
+//
+//   [+0]   session_id        u32   mirrors the shell_session row id (0..7)
+//   [+4]   cmd_hash          u32   djb2(cmd_bytes[0..len])
+//   [+8]   tsc_start         u64   RDTSC captured at dispatch (M8 fills)
+//   [+16]  tsc_end           u64   RDTSC captured at exit     (M8 fills)
+//   [+24]  exit_code         i32   process-exit code          (M8 fills)
+//   [+28]  argc              u32   parsed-argv count          (M8 fills)
+//   [+32]  argv_blob_offset  u32   offset into argv blob arena (M8 fills)
+//   [+36]  flags             u32   fact-flags (reserved; 0 at M7)
+//   [+40]  reserved         [u8; 24]   explicit-zero on write; M8 may
+//                                      reinterpret low 8 bytes as pid
+//                                      and high 16 as cwd_hash (one
+//                                      forward path considered).
+//
+// Total: 4+4+8+8+4+4+4+4+24 = 64 bytes.  Fixed-stride row keeps the
+// scan loop a straight-line shl-and-add.
+//
+// =============================================================================
+// SECTION 2  SEMANTICS  --  MONOTONIC head WITH SILENT EVICTION
+// =============================================================================
+//
+// _hf_heads : [u64; 8] is a monotonic u64 counter per session.  It
+// NEVER wraps in realistic lifetime (2^64 commands at 1 GHz = 584
+// years).  Slot indices are the low 7 bits:
+//
+//   write_slot = _hf_heads[sid] & 0x7F
+//   count      = min(_hf_heads[sid], 128)
+//   read_slot(i_from_head) = (_hf_heads[sid] - 1 - i) & 0x7F
+//
+// Append:
+//
+//   slot = _hf_heads[sid] & 0x7F
+//   fact[sid][slot] <- {sid, hash, tsc_s, tsc_e, exit, argc, blob, flags, 0*24}
+//   _hf_heads[sid] += 1
+//   if _hf_heads[sid] > 128:  increment HF_ST_APPEND_EVICT   (silent)
+//
+// Unlike shell_history we do NOT maintain a tail: queries range over
+// min(head, 128) live slots, and the eviction counter is observability
+// only.  M8's query planner may introduce an explicit tail to support
+// range-by-tsc predicates ("facts strictly before tsc T") without
+// scanning stale rows -- out of scope at M7.
+//
+// =============================================================================
+// SECTION 3  QUERY PREDICATES  --  THREE FLAT SCANS, CALLER-COMPOSED JOINS
+// =============================================================================
+//
+// M7 ships three predicates as flat scans:
+//
+//   session(S)      -- facts with session_id == S            (per-sid)
+//   cmd_hash(H)     -- facts with cmd_hash   == H            (cross-sid)
+//   exit(E)         -- facts with exit_code  == E            (cross-sid)
+//
+// A join is composed by the caller: issue two queries into two scratch
+// buffers and intersect by row-identity (session_id, cmd_hash pair).
+// A compound predicate like
+//
+//   { f | session(f, 2) AND exit(f, != 0) }
+//
+// is computed by the caller running `_hf_query_by_session(2, buf_a, ...)`
+// then filtering `buf_a` for exit_code != 0 inline.  This keeps the
+// kernel surface tiny (three verbs) and defers the real planner to
+// M8 (design/shell/history-datalog-substrate.md §6).
+//
+// Each query returns a packed u64:
+//
+//   result = (bytes_written << 32) | status
+//
+// where bytes_written is the number of 64-byte rows written to out_ptr,
+// scaled by 64.  On success status == HF_OK (0) so the whole word is
+// bytes_written << 32; a caller recovers rows_written by `shr rax, 38`
+// (shr 32 to extract bytes, then shr 6 to divide by 64).  Error codes
+// have bit 31 clear so no error word collides with a success word.
+//
+// =============================================================================
+// SECTION 4  RETURN CODE BAND  --  0x1109..0x110A
+// =============================================================================
+//
+//   HF_OK                 = 0
+//   HF_ERR_BAD_SESSION    = reuse SS_ERR_BAD_ID = 0x1102
+//   HF_ERR_POOL_FULL      = 0x1109    (reserved for M8 planner;
+//                                      ring evicts silently at M7)
+//   HF_ERR_OUT_TOO_SMALL  = 0x110A    (out_cap < 64; cannot fit one row)
+//
+// Band audit (2026-10-14):
+//   `grep -rnE '0x110[9A]\b' src/kernel/` -> zero hits.  Clean band.
+//
+// All fit imm32 with bit 31 clear so `mov rax, imm32` emits the 7-byte
+// zero-extending form.
+//
+// =============================================================================
+// SECTION 5  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Labels prefixed `hf_` (history-facts) to stay clear of `sh_`
+// (shell_history), `ss_` (shell_session), `sj_` (shell_jobs) and
+// `svc_` (ipc/svc_broker).  Encoder-pitfall posture
+// (feedback_pdx_encoder_pitfalls):
+//
+//   * cmp rN, 0              (never `test rN, rN`)
+//   * shl rN, 6              (fact-stride compose)
+//   * shl rN, 13             (ring-base compose)
+//   * and rN, 0x7F           (slot-index mask; fits imm32)
+//   * mov rax, imm32         (never `and r11, imm64`)
+//   * mov_d [mem], reg       (32-bit stores for u32 row fields;
+//                             bare `mov [mem], reg` would REX.W-widen
+//                             to a 64-bit store and clobber neighbouring
+//                             u32 fields in the row)
+//   * single-line `pub let name = "..."`
+//   * module basename HistoryFacts matches file basename
+//     history_facts.pdx
+//   * fingerprint [u8; N] with N = len(string) + 1 (NUL counts)
+//
+// Stack discipline (SysV, entry rsp%16==8):
+//   _hf_init                1 push + 0 sub       (klog_s1 parity)
+//   _hf_append              3 pushes + sub rsp,48
+//                                                (5 stack slots: klog
+//                                                 + tsc_start/end +
+//                                                 exit_code + argc_blob
+//                                                 + pad)
+//   _hf_query_by_session    5 pushes + sub rsp,16
+//                                                (klog slot + pad)
+//   _hf_query_by_cmd_hash   5 pushes + sub rsp,16
+//   _hf_query_by_exit       5 pushes + sub rsp,16
+//
+// SysV arg packing for _hf_append (6-arg signature; the brief's 7th
+// field argv_blob_offset is paired with argc into a single u64):
+//
+//   argc_blob = (argc << 32) | argv_blob_offset
+//
+// so `shr r, 32` recovers argc and the low 32 are argv_blob_offset.
+// The 6-arg call fits SysV register args (rdi..r9) with no on-stack
+// arg -- avoiding the one 7-arg paideia-as encoder shape nothing in
+// the kernel exercises yet.
+//
+// =============================================================================
+// SECTION 6  BOOT WIRING
+// =============================================================================
+//
+// kernel_main.pdx picks this up with ONE new call right after
+// _shell_history_init and before _shell_jobs_init:
+//
+//   call _shell_history_init;    // R127.M4
+//   call _hf_init;               // R127.M7 (this file)
+//   call _shell_jobs_init;       // R127.M5
+//
+// Placement rationale: _hf_init MUST follow _shell_history_init so the
+// audit grep sees the two history-shaped fingerprints in subsystem
+// order (SHELL_HISTORY INIT OK -> HISTORY_FACTS INIT OK).  It MUST
+// precede _shell_jobs_init only by convention -- there is no data
+// dependency.  The hook into _shell_history_append (which also calls
+// _hf_append) is wired inline in src/kernel/core/svc/shell_history.pdx.
+//
+// =============================================================================
+
+module HistoryFacts = structure {
+
+  // ==========================================================================
+  // Return band (§4)
+  // ==========================================================================
+
+  pub let HF_OK                : u64 = 0
+  pub let HF_ERR_BAD_SESSION   : u64 = 0x1102    // alias SS_ERR_BAD_ID
+  pub let HF_ERR_POOL_FULL     : u64 = 0x1109    // reserved for M8 planner
+  pub let HF_ERR_OUT_TOO_SMALL : u64 = 0x110A
+
+  // ==========================================================================
+  // Pool geometry (§1)
+  // ==========================================================================
+
+  pub let HF_FACTS_PER_SESSION : u64 = 128
+  pub let HF_SESSIONS          : u64 = 8
+  pub let HF_FACT_BYTES        : u64 = 64        // (shl 6)
+  pub let HF_RING_BYTES        : u64 = 8192      // 128 * 64   (shl 13)
+  pub let HF_POOL_BYTES        : u64 = 65536     // 8 * 8192
+  pub let HF_SLOT_MASK         : u64 = 0x7F
+
+  // Fact-row field offsets.
+  pub let HF_OFF_SID       : u64 = 0
+  pub let HF_OFF_HASH      : u64 = 4
+  pub let HF_OFF_TSC_S     : u64 = 8
+  pub let HF_OFF_TSC_E     : u64 = 16
+  pub let HF_OFF_EXIT      : u64 = 24
+  pub let HF_OFF_ARGC      : u64 = 28
+  pub let HF_OFF_BLOB_OFF  : u64 = 32
+  pub let HF_OFF_FLAGS     : u64 = 36
+  pub let HF_OFF_RESV0     : u64 = 40
+
+  // ==========================================================================
+  // Storage
+  //
+  //   _hf_pool  -- 64 KiB backing. @align(64) puts the first ring on a
+  //                cache-line boundary; per-session ring base =
+  //                _hf_pool + (sid << 13).
+  //   _hf_heads -- 8 u64 monotonic counters, one per session.
+  //   _hf_stats -- 16 u64 counters (observability).
+  // ==========================================================================
+
+  pub let mut _hf_pool  : [u8;  65536] = uninit @align(64)
+  pub let mut _hf_heads : [u64; 8]     = uninit @align(64)
+  pub let mut _hf_stats : [u64; 16]    = uninit @align(64)
+
+  pub let HF_ST_INIT_OK       : u64 = 0
+  pub let HF_ST_APPEND_OK     : u64 = 1
+  pub let HF_ST_APPEND_REJ    : u64 = 2
+  pub let HF_ST_APPEND_EVICT  : u64 = 3
+  pub let HF_ST_Q_SES_OK      : u64 = 4
+  pub let HF_ST_Q_SES_REJ     : u64 = 5
+  pub let HF_ST_Q_HASH_OK     : u64 = 6
+  pub let HF_ST_Q_HASH_REJ    : u64 = 7
+  pub let HF_ST_Q_EXIT_OK     : u64 = 8
+  pub let HF_ST_Q_EXIT_REJ    : u64 = 9
+
+  // ==========================================================================
+  // Fingerprint tags (N = len(string) + 1, NUL inclusive).
+  //
+  // Only the "OK" tags are extracted by the fingerprint-coverage gate;
+  // REJ tags are opaque to the gate so no allowlist entry is required
+  // for them.
+  // ==========================================================================
+
+  // "HISTORY_FACTS INIT OK"   = 21 chars + NUL => N = 22
+  // "HISTORY_FACTS APPEND OK" = 23 chars + NUL => N = 24
+  // "HISTORY_FACTS APPEND REJ"= 24 chars + NUL => N = 25
+  // "HISTORY_FACTS QUERY OK"  = 22 chars + NUL => N = 23
+  // "HISTORY_FACTS QUERY REJ" = 23 chars + NUL => N = 24
+
+  pub let hf_tag_init_ok    : [u8; 22] = "HISTORY_FACTS INIT OK\0"
+  pub let hf_tag_append_ok  : [u8; 24] = "HISTORY_FACTS APPEND OK\0"
+  pub let hf_tag_append_rej : [u8; 25] = "HISTORY_FACTS APPEND REJ\0"
+  pub let hf_tag_query_ok   : [u8; 23] = "HISTORY_FACTS QUERY OK\0"
+  pub let hf_tag_query_rej  : [u8; 24] = "HISTORY_FACTS QUERY REJ\0"
+
+  pub let hf_k_sid    : [u8; 4] = "sid\0"
+  pub let hf_k_hash   : [u8; 5] = "hash\0"
+  pub let hf_k_exit   : [u8; 5] = "exit\0"
+  pub let hf_k_cnt    : [u8; 4] = "cnt\0"
+  pub let hf_k_errno  : [u8; 6] = "errno\0"
+
+  // ==========================================================================
+  // hf_note(slot) -> ()
+  //
+  // Bounded increment on _hf_stats[slot]. Load-inc-store idiom (no
+  // `add reg, [mem]`). Caller passes an HF_ST_* ordinal; the bounds
+  // check guards against the stats pool size (16). Pure leaf -- no
+  // pushes.
+  // ==========================================================================
+  pub let hf_note : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R127.M7 (paideia-os #2603): bounded increment on _hf_stats[slot<16]. Load-inc-store, no `add reg,[mem]`. Pure leaf -- no pushes. Labels prefixed hf_no_.",
+      block: {
+        cmp rdi, 16;
+        jae hf_no_out;
+        lea r10, [rip + _hf_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      hf_no_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // hf_fact_base(session_id, slot_index) -> &fact
+  //
+  // Pure address compute. ring_base = _hf_pool + (sid << 13); fact =
+  // ring_base + (slot_index << 6). Caller is responsible for keeping
+  // session_id < 8 and slot_index < 128 so the resulting pointer lands
+  // inside _hf_pool; _hf_append / _hf_query_* always mask slot_index
+  // with HF_SLOT_MASK (0x7F) before entering here.
+  //
+  // Not currently called from the main append / query bodies (they
+  // open-code the address compute to avoid a nested call in a hot
+  // path) but exported for M8 planner reuse and for direct-call
+  // testing from a future witness.
+  // ==========================================================================
+  pub let hf_fact_base : (u64, u64) -> u64 !{} @{} =
+    fn (session_id: u64) (slot_index: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R127.M7 (paideia-os #2603): &_hf_pool[sid*8192 + slot*64]. Composed as (sid << 13) + (slot << 6). Both shifts fit imm8 and both strides are powers of two so no 2-op imul-with-imm is required. Pure leaf. Labels prefixed hf_fb_.",
+      block: {
+        mov rax, rdi;                    // session_id
+        shl rax, 13;                     // sid * 8192
+        mov r10, rsi;                    // slot_index
+        shl r10, 6;                      // slot * 64
+        add rax, r10;                    // sid*8192 + slot*64
+        lea r10, [rip + _hf_pool];
+        add rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _hf_init() -> ()
+  //
+  // Boot hook. Defensive scrub of _hf_heads (8 u64 = 64 bytes) and
+  // _hf_stats (16 u64 = 128 bytes). .bss zero-init handles both arrays
+  // at real boot; the explicit scrub is defensive for a chaos-restart
+  // re-entering init. Emits `HISTORY_FACTS INIT OK` on completion.
+  //
+  // _hf_pool is NOT scrubbed (64 KiB zero-fill is wasted work; the
+  // _hf_heads counters gate reach to any fact slot, and bss is
+  // already zero at real boot).
+  //
+  // Single callee-save push (r12) corrects entry parity rsp%16==8 -> 0
+  // for the sibling klog_s1 call, matching _shell_history_init shape.
+  //
+  // Labels prefixed hf_in_.
+  // ==========================================================================
+  pub let _hf_init : () -> () !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R127.M7 (paideia-os #2603): boot-time scrub of _hf_heads (8 u64 = 64 bytes) and _hf_stats (16 u64 = 128 bytes) + one INIT OK fingerprint. .bss zero-init handles both arrays at real boot; the explicit scrub is defensive for a chaos-restart re-entering init. _hf_pool (64 KiB) is NOT scrubbed because _hf_heads gate reach to any slot (a slot is live only when _hf_heads[sid] has reached it); a stale fact row is unreachable via the public API even on chaos restart. Single callee-save push (r12) corrects entry parity rsp%16==8 -> 0 for the sibling klog_s1 call, matching _shell_history_init shape. Labels prefixed hf_in_.",
+      block: {
+        push r12;
+
+        // Scrub _hf_heads[0..8].
+        lea r10, [rip + _hf_heads];
+        xor rax, rax;
+        xor rcx, rcx;
+      hf_in_heads:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  hf_in_heads;
+
+        // Scrub _hf_stats[0..16].
+        lea r10, [rip + _hf_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      hf_in_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  hf_in_stats;
+
+        // Bump INIT_OK counter.
+        mov rdi, 0;                      // HF_ST_INIT_OK
+        call hf_note;
+
+        // Emit INIT OK fingerprint.
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hf_tag_init_ok];
+        call klog_s1;
+
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _hf_append(session_id, cmd_hash, tsc_start, tsc_end, exit_code,
+  //            argc_blob) -> errno
+  //
+  // Validate session_id via ss_row_in_use (SH_ERR_BAD_SESSION on bad /
+  // free row). Compute slot = _hf_heads[sid] & 0x7F; fact_base =
+  // _hf_pool + (sid << 13) + (slot << 6). Store the 7 field values
+  // + 24 reserved bytes (all zero) in row-order. Advance _hf_heads[sid]
+  // by 1 and if the new value exceeds 128 bump HF_ST_APPEND_EVICT.
+  // Emits `HISTORY_FACTS APPEND OK sid=0x<hex> hash=0x<hex>`.
+  //
+  // ARGS (SysV):
+  //   rdi = session_id       (u32 live in low 32)
+  //   rsi = cmd_hash         (u32 live in low 32; djb2 of cmd_bytes)
+  //   rdx = tsc_start        (u64)
+  //   rcx = tsc_end          (u64)
+  //   r8  = exit_code        (i32 live in low 32; sign-extended into r8)
+  //   r9  = argc_blob        = (argc << 32) | argv_blob_offset
+  //
+  // RETURNS (rax):
+  //   HF_OK                 -- fact written
+  //   HF_ERR_BAD_SESSION    -- session_id out of range or row not in use
+  //
+  // STACK FRAME:
+  //   3 callee-save pushes (rbx = session_id, r12 = cmd_hash,
+  //   r13 = fact_base) + sub rsp, 48 (5 slots: [+0] = klog stack-arg,
+  //   [+8] = tsc_start, [+16] = tsc_end, [+24] = exit_code,
+  //   [+32] = argc_blob; [+40] = pad). Entry rsp%16==8; +3 pushes +
+  //   48 = +72 -> %16==0 at every nested call.
+  //
+  // Labels prefixed hf_ap_.
+  // ==========================================================================
+  pub let _hf_append : (u64, u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (session_id: u64) (cmd_hash: u64) (tsc_start: u64) (tsc_end: u64) (exit_code: u64) (argc_blob: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R127.M7 (paideia-os #2603): append one structured fact to the per-session fact ring. Validate session_id via ss_row_in_use (else HF_ERR_BAD_SESSION). Compute old_head = _hf_heads[sid]; slot = old_head & 0x7F; fact_base = _hf_pool + (sid << 13) + (slot << 6). Store the 9 row fields: session_id (u32 via mov_d), cmd_hash (u32), tsc_start (u64), tsc_end (u64), exit_code (u32 via mov_d), argc (high 32 of argc_blob via shr-then-mov_d), argv_blob_offset (low 32 of argc_blob via mov_d), flags (u32 zero), reserved [u8;24] zero. Advance _hf_heads[sid] = old_head + 1; if new > 128 bump HF_ST_APPEND_EVICT (observability only -- the ring silently evicts). Bump HF_ST_APPEND_OK; emit `HISTORY_FACTS APPEND OK sid=0x<hex> hash=0x<hex>` via klog_s1_x2 (6-reg + 1-stack-arg wrapper, hash on [rsp+0]). Three callee-save pushes (rbx = session_id, r12 = cmd_hash, r13 = fact_base) + sub rsp,48 (5 stack slots: klog + 4 arg saves + pad; 3 pushes * 8 + 48 = 72 = entry+8 lands rsp%16==0 at every nested call). argc_blob packing lets the 6th SysV reg carry both argc (high 32) and argv_blob_offset (low 32) in one register, so the function stays within the 6-reg SysV register-arg band and avoids any on-stack arg. Encoder-pitfall posture: cmp rN,0 (never test), shl rN,6 / shl rN,13 for stride compose (never imul), and rN,0x7F for slot mask (fits imm32), mov rax,imm32 for all error codes (never and r11,imm64), mov_d [mem],reg for every u32 field store (bare mov would REX.W-widen to 8 bytes and clobber the neighbour), explicit xor-zero reserved[0..24]. Labels prefixed hf_ap_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        sub rsp, 48;                     // 5 stack slots
+
+        mov rbx, rdi;                    // session_id
+        mov r12, rsi;                    // cmd_hash
+        mov [rsp + 8],  rdx;             // tsc_start
+        mov [rsp + 16], rcx;             // tsc_end
+        mov [rsp + 24], r8;              // exit_code
+        mov [rsp + 32], r9;              // argc_blob
+
+        // ---- Validate session_id ----
+        mov rdi, rbx;
+        call ss_row_in_use;
+        cmp rax, 0;
+        je  hf_ap_bad_id;
+
+        // ---- Load old head and compute fact_base ----
+        //   fact_base = _hf_pool + (sid << 13) + ((old_head & 0x7F) << 6)
+        lea r10, [rip + _hf_heads];
+        mov r11, [r10 + rbx * 8];        // r11 = old_head
+
+        mov rax, rbx;
+        shl rax, 13;                     // sid * 8192
+        mov r9, r11;
+        and r9, 0x7F;                    // slot
+        shl r9, 6;                       // slot * 64
+        add rax, r9;
+        lea r9, [rip + _hf_pool];
+        add rax, r9;
+        mov r13, rax;                    // r13 = fact_base
+
+        // ---- Advance head ----
+        add r11, 1;                      // new_head = old_head + 1
+        mov [r10 + rbx * 8], r11;        // store new head
+
+        // ---- Eviction counter (observability only) ----
+        mov r9, 128;
+        cmp r11, r9;
+        jbe hf_ap_no_evict;
+        mov rdi, 3;                      // HF_ST_APPEND_EVICT
+        call hf_note;
+      hf_ap_no_evict:
+
+        // ---- Write row at r13 = fact_base ----
+
+        // [+0] session_id (u32 in low 32 of rbx)
+        mov_d [r13 + 0], rbx;
+
+        // [+4] cmd_hash (u32 in low 32 of r12)
+        mov_d [r13 + 4], r12;
+
+        // [+8] tsc_start (u64)
+        mov r10, [rsp + 8];
+        mov [r13 + 8], r10;
+
+        // [+16] tsc_end (u64)
+        mov r10, [rsp + 16];
+        mov [r13 + 16], r10;
+
+        // [+24] exit_code (u32 in low 32)
+        mov r10, [rsp + 24];
+        mov_d [r13 + 24], r10;
+
+        // [+28] argc (high 32 of argc_blob)
+        mov r10, [rsp + 32];
+        mov r9, r10;
+        shr r9, 32;
+        mov_d [r13 + 28], r9;
+
+        // [+32] argv_blob_offset (low 32 of argc_blob)
+        mov_d [r13 + 32], r10;
+
+        // [+36] flags = 0 (u32)
+        xor r9, r9;
+        mov_d [r13 + 36], r9;
+
+        // [+40..+64] reserved[0..24] = 0 (3 x u64 stores)
+        xor r9, r9;
+        mov [r13 + 40], r9;
+        mov [r13 + 48], r9;
+        mov [r13 + 56], r9;
+
+        // ---- Stats + fingerprint ----
+        mov rdi, 1;                      // HF_ST_APPEND_OK
+        call hf_note;
+
+        // klog_s1_x2 (6 regs + 1 stack arg): emit two hex KVs
+        //   sid=0x<rbx> hash=0x<r12>.
+        mov [rsp + 0], r12;              // v2 = cmd_hash
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hf_tag_append_ok];
+        lea rcx, [rip + hf_k_sid];
+        mov r8,  rbx;                    // v1 = session_id
+        lea r9,  [rip + hf_k_hash];
+        call klog_s1_x2;
+
+        xor rax, rax;                    // HF_OK
+        jmp hf_ap_out;
+
+      hf_ap_bad_id:
+        mov rdi, 2;                      // HF_ST_APPEND_REJ
+        call hf_note;
+
+        mov r12, 0x1102;                 // HF_ERR_BAD_SESSION
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hf_tag_append_rej];
+        lea rcx, [rip + hf_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      hf_ap_out:
+        add rsp, 48;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _hf_query_by_session(session_id, out_rows_ptr, out_cap) -> packed u64
+  //
+  // The `session(S)` predicate: return every live fact row whose
+  // session_id matches, newest-first.  Flat scan over the per-session
+  // ring (min(head, 128) live slots).
+  //
+  // Validate session_id via ss_row_in_use (else HF_ERR_BAD_SESSION).
+  // Compute count = min(_hf_heads[sid], 128).  If count == 0 return
+  // packed (0 << 32) | HF_OK (success-with-zero-rows).  Otherwise
+  // compute max_rows = out_cap / 64; if max_rows == 0 return
+  // HF_ERR_OUT_TOO_SMALL.  Walk i in [0, min(count, max_rows)) emitting
+  // slot = (head - 1 - i) & 0x7F into out_rows_ptr + (i << 6).  Returns
+  // packed (bytes_written << 32) | HF_OK with bytes_written = i_last * 64.
+  //
+  // ARGS (SysV):
+  //   rdi = session_id
+  //   rsi = out_rows_ptr
+  //   rdx = out_cap   (bytes; must be >= 64 unless count==0)
+  //
+  // RETURNS (rax):
+  //   (bytes_written << 32) | HF_OK  on success
+  //   HF_ERR_BAD_SESSION             on bad session_id
+  //   HF_ERR_OUT_TOO_SMALL           on out_cap < 64 with count > 0
+  //
+  // STACK FRAME:
+  //   5 callee-save pushes (rbx = session_id, r12 = out_ptr,
+  //   r13 = actual, r14 = head, r15 = i) + sub rsp, 16 (klog stack-arg
+  //   slot + pad).  Entry rsp%16==8; +5 pushes + 16 = +56 -> %16==0.
+  //
+  // Labels prefixed hf_qs_.
+  // ==========================================================================
+  pub let _hf_query_by_session : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (session_id: u64) (out_rows_ptr: u64) (out_cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R127.M7 (paideia-os #2603): session(S) predicate as a per-session flat scan newest-first. Validate session_id via ss_row_in_use (else HF_ERR_BAD_SESSION). count = min(_hf_heads[sid], 128); if count==0 emit QUERY OK with cnt=0 and return packed (0<<32)|HF_OK. Else compute max_rows = out_cap >> 6; if max_rows==0 return HF_ERR_OUT_TOO_SMALL. actual = min(count, max_rows). Loop i in [0, actual): slot = (head - 1 - i) & 0x7F; src = _hf_pool + (sid << 13) + (slot << 6); dst = out_ptr + (i << 6); memcpy 64 bytes = 8 u64 stores via a tight inner loop. Bump HF_ST_Q_SES_OK; emit `HISTORY_FACTS QUERY OK sid=0x<hex> cnt=<dec>` via klog_s1_x1_d1. Return (actual*64 << 32) | HF_OK; caller recovers rows_written by `shr rax, 38`. Five callee-save pushes (rbx=sid, r12=out_ptr, r13=actual, r14=head, r15=i) + sub rsp,16 pad = 56 bytes land rsp%16==0 at every nested call. Encoder-pitfall posture: cmp rN,0 (never test), shl / shr by imm8 only, and rN,0x7F for slot mask, mov rax,imm32 for all error codes. Labels prefixed hf_qs_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;                     // klog slot + pad
+
+        mov rbx, rdi;                    // session_id
+        mov r12, rsi;                    // out_ptr
+        mov r13, rdx;                    // out_cap (will be reused as actual)
+
+        // ---- Validate session_id ----
+        mov rdi, rbx;
+        call ss_row_in_use;
+        cmp rax, 0;
+        je  hf_qs_bad_id;
+
+        // ---- Load head and compute count = min(head, 128) ----
+        lea r10, [rip + _hf_heads];
+        mov r14, [r10 + rbx * 8];        // r14 = head
+
+        mov r9, r14;
+        mov r11, 128;
+        cmp r9, r11;
+        jbe hf_qs_cnt_ok;
+        mov r9, r11;
+      hf_qs_cnt_ok:
+        // r9 = count
+
+        cmp r9, 0;
+        je  hf_qs_zero;
+
+        // ---- max_rows = out_cap >> 6 ----
+        mov r10, r13;                    // r13 was out_cap
+        shr r10, 6;
+        cmp r10, 0;
+        je  hf_qs_too_small;
+
+        // ---- actual = min(count, max_rows) ----
+        cmp r9, r10;
+        jbe hf_qs_actual_ok;
+        mov r9, r10;
+      hf_qs_actual_ok:
+        mov r13, r9;                     // r13 = actual (overwrites out_cap)
+
+        // ---- Walk i = 0 .. actual ----
+        xor r15, r15;                    // i = 0
+      hf_qs_loop:
+        cmp r15, r13;
+        jae hf_qs_done;
+
+        // slot = (head - 1 - i) & 0x7F
+        mov r10, r14;
+        sub r10, 1;
+        sub r10, r15;
+        and r10, 0x7F;
+
+        // src = _hf_pool + (sid << 13) + (slot << 6)
+        mov r11, rbx;
+        shl r11, 13;
+        shl r10, 6;
+        add r11, r10;
+        lea r10, [rip + _hf_pool];
+        add r11, r10;
+        // r11 = src
+
+        // dst = out_ptr + (i << 6)
+        mov r9, r15;
+        shl r9, 6;
+        mov r8, r12;
+        add r8, r9;
+        // r8 = dst
+
+        // memcpy 64 bytes = 8 u64 stores
+        xor rcx, rcx;
+      hf_qs_cp:
+        cmp rcx, 8;
+        jae hf_qs_cp_done;
+        mov r9, [r11 + rcx * 8];
+        mov [r8 + rcx * 8], r9;
+        add rcx, 1;
+        jmp hf_qs_cp;
+      hf_qs_cp_done:
+
+        add r15, 1;
+        jmp hf_qs_loop;
+      hf_qs_done:
+
+        // ---- Stats + fingerprint ----
+        mov rdi, 4;                      // HF_ST_Q_SES_OK
+        call hf_note;
+
+        // klog_s1_x1_d1: sid=0x<hex> cnt=<dec>
+        mov [rsp + 0], r13;              // v_dec = actual (row count)
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hf_tag_query_ok];
+        lea rcx, [rip + hf_k_sid];
+        mov r8,  rbx;                    // v_hex = sid
+        lea r9,  [rip + hf_k_cnt];
+        call klog_s1_x1_d1;
+
+        // ---- Pack return: (actual * 64) << 32 | HF_OK ----
+        mov rax, r13;
+        shl rax, 6;                      // bytes = actual * 64
+        shl rax, 32;                     // pack
+        jmp hf_qs_out;
+
+      hf_qs_zero:
+        // Success-with-zero-rows: emit QUERY OK with cnt=0, return 0.
+        mov rdi, 4;                      // HF_ST_Q_SES_OK
+        call hf_note;
+
+        xor r13, r13;                    // cnt = 0
+        mov [rsp + 0], r13;
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hf_tag_query_ok];
+        lea rcx, [rip + hf_k_sid];
+        mov r8,  rbx;
+        lea r9,  [rip + hf_k_cnt];
+        call klog_s1_x1_d1;
+
+        xor rax, rax;                    // (0 << 32) | HF_OK
+        jmp hf_qs_out;
+
+      hf_qs_bad_id:
+        mov rdi, 5;                      // HF_ST_Q_SES_REJ
+        call hf_note;
+
+        mov r12, 0x1102;                 // HF_ERR_BAD_SESSION
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hf_tag_query_rej];
+        lea rcx, [rip + hf_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        jmp hf_qs_out;
+
+      hf_qs_too_small:
+        mov rdi, 5;                      // HF_ST_Q_SES_REJ
+        call hf_note;
+
+        mov r12, 0x110A;                 // HF_ERR_OUT_TOO_SMALL
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hf_tag_query_rej];
+        lea rcx, [rip + hf_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      hf_qs_out:
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _hf_query_by_cmd_hash(cmd_hash, out_rows_ptr, out_cap) -> packed u64
+  //
+  // The `cmd_hash(H)` predicate: return every live fact row whose
+  // cmd_hash matches, newest-first within each session, scanning all
+  // 8 sessions in order.
+  //
+  // Validate out_cap >= 64 (else HF_ERR_OUT_TOO_SMALL unless no match
+  // is found -- but we fail-fast on out_cap==0 since even one row
+  // cannot fit).  Outer loop sid in [0, 8); inner loop i in
+  // [0, min(_hf_heads[sid], 128)) with slot = (head - 1 - i) & 0x7F.
+  // If row.cmd_hash (u32 at [+4]) == target, copy 64 bytes to
+  // out_ptr + (written << 6) and bump written; stop early when
+  // written == max_rows.
+  //
+  // ARGS (SysV):
+  //   rdi = cmd_hash  (u32 live in low 32)
+  //   rsi = out_rows_ptr
+  //   rdx = out_cap   (bytes; >= 64 to carry one row)
+  //
+  // RETURNS (rax):
+  //   (bytes_written << 32) | HF_OK  on success (0 rows is still OK)
+  //   HF_ERR_OUT_TOO_SMALL           on out_cap < 64
+  //
+  // STACK FRAME:
+  //   5 callee-save pushes (rbx = cmd_hash, r12 = out_ptr,
+  //   r13 = max_rows, r14 = written, r15 = outer sid) + sub rsp, 16
+  //   (klog stack-arg slot + pad).  Entry rsp%16==8; +5 pushes + 16 =
+  //   +56 -> %16==0.
+  //
+  // Labels prefixed hf_qh_.
+  // ==========================================================================
+  pub let _hf_query_by_cmd_hash : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (cmd_hash: u64) (out_rows_ptr: u64) (out_cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R127.M7 (paideia-os #2603): cmd_hash(H) predicate as a cross-session flat scan. Fail-fast on out_cap<64 -> HF_ERR_OUT_TOO_SMALL. max_rows = out_cap >> 6. Outer loop sid in [0,8); inner loop over the sid's live slots newest-first. For each slot load row u32 at [+4] into r9 (zero-extended via xor r9,r9 then mov_d r9,[row+4] -- paideia-as does not emit mov_d reg,[mem] here, so load the full u64 and mask the low 32 via shl 32 / shr 32). If match, memcpy 64 bytes to out_ptr + (written<<6) and bump written; return early when written==max_rows. Bump HF_ST_Q_HASH_OK; emit `HISTORY_FACTS QUERY OK hash=0x<hex> cnt=<dec>` via klog_s1_x1_d1. Return (written*64 << 32) | HF_OK. Five callee-save pushes (rbx=hash, r12=out_ptr, r13=max_rows, r14=written, r15=sid) + sub rsp,16 = 56 bytes land rsp%16==0 at every nested call. Encoder-pitfall posture: cmp rN,0 (never test), shl/shr imm8 (never imul), and rN,0x7F / shl 32 / shr 32 for u32 isolation (never and r,imm64 with bit31). Labels prefixed hf_qh_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;                     // klog slot + pad
+
+        mov rbx, rdi;                    // cmd_hash target
+        mov r12, rsi;                    // out_ptr
+        mov r13, rdx;                    // out_cap (reused as max_rows)
+
+        // ---- max_rows = out_cap >> 6 ----
+        shr r13, 6;
+        cmp r13, 0;
+        je  hf_qh_too_small;
+
+        // ---- Isolate target to low 32 (zero-extend) via shl/shr round-trip ----
+        shl rbx, 32;
+        shr rbx, 32;                     // rbx = cmd_hash_u32
+
+        xor r14, r14;                    // written = 0
+        xor r15, r15;                    // sid = 0
+
+      hf_qh_outer:
+        cmp r15, 8;
+        jae hf_qh_done;
+
+        // head = _hf_heads[sid]
+        lea r10, [rip + _hf_heads];
+        mov r11, [r10 + r15 * 8];        // r11 = head
+
+        // inner count = min(head, 128); emit via r9
+        mov r9, r11;
+        mov r10, 128;
+        cmp r9, r10;
+        jbe hf_qh_cnt_ok;
+        mov r9, r10;
+      hf_qh_cnt_ok:
+        // r9 = inner count
+
+        xor rcx, rcx;                    // i = 0
+      hf_qh_inner:
+        cmp rcx, r9;
+        jae hf_qh_inner_done;
+
+        // early-out: written == max_rows
+        cmp r14, r13;
+        jae hf_qh_done;
+
+        // slot = (head - 1 - i) & 0x7F
+        mov r10, r11;
+        sub r10, 1;
+        sub r10, rcx;
+        and r10, 0x7F;
+
+        // src = _hf_pool + (sid << 13) + (slot << 6)
+        mov r8, r15;
+        shl r8, 13;
+        shl r10, 6;
+        add r8, r10;
+        lea r10, [rip + _hf_pool];
+        add r8, r10;
+        // r8 = src
+
+        // Load row.cmd_hash (u32 at [src+4]), zero-extend into rdx.
+        // mov_d reg,[mem] is not in the proven set; use full u64 load
+        // then low-32 isolation via shl/shr round-trip.
+        mov rdx, [r8 + 0];               // low 8 bytes = {sid, hash}
+        shr rdx, 32;                     // hash now in low 32, high 0
+
+        cmp rdx, rbx;
+        jne hf_qh_no_match;
+
+        // dst = out_ptr + (written << 6)
+        mov rdx, r14;
+        shl rdx, 6;
+        mov r10, r12;
+        add r10, rdx;
+        // r10 = dst
+
+        // memcpy 64 bytes = 8 u64 stores
+        push rcx;                        // save inner i
+        push r9;                         // save inner count
+        push r11;                        // save head
+        xor rcx, rcx;
+      hf_qh_cp:
+        cmp rcx, 8;
+        jae hf_qh_cp_done;
+        mov rdx, [r8 + rcx * 8];
+        mov [r10 + rcx * 8], rdx;
+        add rcx, 1;
+        jmp hf_qh_cp;
+      hf_qh_cp_done:
+        pop r11;
+        pop r9;
+        pop rcx;
+
+        add r14, 1;                      // written += 1
+
+      hf_qh_no_match:
+        add rcx, 1;
+        jmp hf_qh_inner;
+
+      hf_qh_inner_done:
+        add r15, 1;                      // sid += 1
+        jmp hf_qh_outer;
+
+      hf_qh_done:
+        // ---- Stats + fingerprint ----
+        mov rdi, 6;                      // HF_ST_Q_HASH_OK
+        call hf_note;
+
+        // klog_s1_x1_d1: hash=0x<hex> cnt=<dec>
+        mov [rsp + 0], r14;              // v_dec = written
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hf_tag_query_ok];
+        lea rcx, [rip + hf_k_hash];
+        mov r8,  rbx;                    // v_hex = cmd_hash (low 32)
+        lea r9,  [rip + hf_k_cnt];
+        call klog_s1_x1_d1;
+
+        // ---- Pack return ----
+        mov rax, r14;
+        shl rax, 6;                      // bytes = written * 64
+        shl rax, 32;
+        jmp hf_qh_out;
+
+      hf_qh_too_small:
+        mov rdi, 7;                      // HF_ST_Q_HASH_REJ
+        call hf_note;
+
+        mov r12, 0x110A;                 // HF_ERR_OUT_TOO_SMALL
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hf_tag_query_rej];
+        lea rcx, [rip + hf_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      hf_qh_out:
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _hf_query_by_exit(exit_code, out_rows_ptr, out_cap) -> packed u64
+  //
+  // The `exit(E)` predicate: return every live fact row whose
+  // exit_code matches, newest-first within each session, scanning all
+  // 8 sessions in order.  Same shape as _hf_query_by_cmd_hash but the
+  // filter loads from [row + 24] (HF_OFF_EXIT) instead of [row + 4].
+  //
+  // ARGS (SysV):
+  //   rdi = exit_code  (i32; low 32 bits are the match target --
+  //                     caller sign-extended into r8 at call-site)
+  //   rsi = out_rows_ptr
+  //   rdx = out_cap    (bytes; >= 64 to carry one row)
+  //
+  // RETURNS (rax):
+  //   (bytes_written << 32) | HF_OK  on success (0 rows is still OK)
+  //   HF_ERR_OUT_TOO_SMALL           on out_cap < 64
+  //
+  // STACK FRAME: identical to _hf_query_by_cmd_hash.
+  //
+  // Labels prefixed hf_qe_.
+  // ==========================================================================
+  pub let _hf_query_by_exit : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (exit_code: u64) (out_rows_ptr: u64) (out_cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R127.M7 (paideia-os #2603): exit(E) predicate as a cross-session flat scan. Shape mirrors _hf_query_by_cmd_hash one-for-one; the only differences are the filter load offset (24 for exit_code, 4 for cmd_hash), the per-byte unpack path (exit lives in low 32 of [row+24] which is the LOW qword of the second-oct octet pair at [+24..+32] = {exit, argc}), and the fingerprint key (`exit` instead of `hash`). Fail-fast on out_cap<64. Outer loop sid in [0,8); inner loop over live slots newest-first with written<max_rows early-out. Match target isolated via shl/shr round-trip (never and r,imm64 with bit31). Bump HF_ST_Q_EXIT_OK; emit `HISTORY_FACTS QUERY OK exit=0x<hex> cnt=<dec>` via klog_s1_x1_d1. Five callee-save pushes + sub rsp,16 = 56 bytes land rsp%16==0 at every nested call. Labels prefixed hf_qe_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;
+
+        mov rbx, rdi;                    // exit_code target
+        mov r12, rsi;                    // out_ptr
+        mov r13, rdx;                    // out_cap
+
+        shr r13, 6;                      // max_rows
+        cmp r13, 0;
+        je  hf_qe_too_small;
+
+        // Isolate target to low 32 (zero-extend) via shl/shr round-trip.
+        shl rbx, 32;
+        shr rbx, 32;
+
+        xor r14, r14;                    // written = 0
+        xor r15, r15;                    // sid = 0
+
+      hf_qe_outer:
+        cmp r15, 8;
+        jae hf_qe_done;
+
+        lea r10, [rip + _hf_heads];
+        mov r11, [r10 + r15 * 8];        // head
+
+        mov r9, r11;
+        mov r10, 128;
+        cmp r9, r10;
+        jbe hf_qe_cnt_ok;
+        mov r9, r10;
+      hf_qe_cnt_ok:
+
+        xor rcx, rcx;
+      hf_qe_inner:
+        cmp rcx, r9;
+        jae hf_qe_inner_done;
+
+        cmp r14, r13;
+        jae hf_qe_done;
+
+        // slot = (head - 1 - i) & 0x7F
+        mov r10, r11;
+        sub r10, 1;
+        sub r10, rcx;
+        and r10, 0x7F;
+
+        // src = _hf_pool + (sid << 13) + (slot << 6)
+        mov r8, r15;
+        shl r8, 13;
+        shl r10, 6;
+        add r8, r10;
+        lea r10, [rip + _hf_pool];
+        add r8, r10;
+
+        // Load exit_code (u32 at [src + 24]); isolate low 32.
+        // [+24..+32] packs {exit_code: u32, argc: u32}: load the full
+        // u64 and mask via shl 32 / shr 32 to keep the low 32.
+        mov rdx, [r8 + 24];
+        shl rdx, 32;
+        shr rdx, 32;
+
+        cmp rdx, rbx;
+        jne hf_qe_no_match;
+
+        // dst = out_ptr + (written << 6)
+        mov rdx, r14;
+        shl rdx, 6;
+        mov r10, r12;
+        add r10, rdx;
+
+        // memcpy 64 bytes
+        push rcx;
+        push r9;
+        push r11;
+        xor rcx, rcx;
+      hf_qe_cp:
+        cmp rcx, 8;
+        jae hf_qe_cp_done;
+        mov rdx, [r8 + rcx * 8];
+        mov [r10 + rcx * 8], rdx;
+        add rcx, 1;
+        jmp hf_qe_cp;
+      hf_qe_cp_done:
+        pop r11;
+        pop r9;
+        pop rcx;
+
+        add r14, 1;
+
+      hf_qe_no_match:
+        add rcx, 1;
+        jmp hf_qe_inner;
+
+      hf_qe_inner_done:
+        add r15, 1;
+        jmp hf_qe_outer;
+
+      hf_qe_done:
+        mov rdi, 8;                      // HF_ST_Q_EXIT_OK
+        call hf_note;
+
+        mov [rsp + 0], r14;
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hf_tag_query_ok];
+        lea rcx, [rip + hf_k_exit];
+        mov r8,  rbx;
+        lea r9,  [rip + hf_k_cnt];
+        call klog_s1_x1_d1;
+
+        mov rax, r14;
+        shl rax, 6;
+        shl rax, 32;
+        jmp hf_qe_out;
+
+      hf_qe_too_small:
+        mov rdi, 9;                      // HF_ST_Q_EXIT_REJ
+        call hf_note;
+
+        mov r12, 0x110A;                 // HF_ERR_OUT_TOO_SMALL
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + hf_tag_query_rej];
+        lea rcx, [rip + hf_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      hf_qe_out:
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}
