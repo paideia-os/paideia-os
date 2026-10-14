@@ -366,6 +366,36 @@ ALLOWLIST = {
         "invoke LIST op or an observability path consumes the "
         "list for the shell's `peers` builtin.",
 
+    # Wave UMB-W22 R137.M4 (paideia-os#2636): cross-host record wire.
+    # RRW SEND OK / RRW RECV OK are .rodata tag literals inside the
+    # two public _rrw_send_record / _rrw_recv_frame entries in
+    # src/kernel/core/svc/remote_record_wire.pdx. At M4 no production
+    # path invokes them because:
+    # (a) the TCP wire I/O that moves bytes between the per-conn
+    #     TX/RX frame slots and the network is deferred to R137.M5
+    #     alongside KIND_FEDERATION cap-invoke dispatch, and
+    # (b) no KIND_REMOTE_SHELL cap-invoke surface mints the
+    #     capability a user task would hold to drive sends.
+    # Both retire from this allowlist when R137.M5 lands with
+    # asserting smoke-mode goldens driving a complete handshake +
+    # frame seal/open round-trip against a pair of VM-local kernels.
+    "RRW SEND OK":
+        "Wave UMB-W22 R137.M4: src/kernel/core/svc/remote_record_"
+        "wire.pdx emits this from _rrw_send_record. Unreachable from "
+        "any production path at M4 (no TCP wire-write path exists "
+        "yet; the TX frame slot is staged for the deferred R137.M5 "
+        "transport to pick up, and no KIND_REMOTE_SHELL cap-invoke "
+        "surface drives sends). Retires when R137.M5 lands with "
+        "asserting smoke-mode goldens driving a full seal + wire-"
+        "transmit cascade end-to-end.",
+    "RRW RECV OK":
+        "Wave UMB-W22 R137.M4: src/kernel/core/svc/remote_record_"
+        "wire.pdx emits this from _rrw_recv_frame. Unreachable from "
+        "any production path at M4 (same reason as RRW SEND OK -- "
+        "no TCP wire-read path stages the RX frame slot yet). "
+        "Retires when R137.M5 lands with asserting smoke-mode "
+        "goldens driving a full wire-receive + open cascade.",
+
     # Wave UMB-W14 R127.M3 (paideia-os#2599): raw-mode TTY substrate.
     # SHELL_SESSION RAW OK fires from _shell_session_set_raw's success
     # tail (and from ks_op_set_raw transitively via KIND_SHELL_SESSION
@@ -647,6 +677,37 @@ ALLOWLIST = {
         "mints or exits a live shell session).  Retires with the "
         "first smoke mode that drives a session create + exit cycle "
         "through one of these paths with an asserting golden.",
+
+    # Wave UMB-W22 R139.M4 (paideia-os#2642): multi-session shutdown
+    # ordering. SESSION_SHUTDOWN ALL OK fires from the tail of
+    # _ssd_shutdown_all after the 8-step pipeline (audit flush ->
+    # remote close -> jail destroy -> jobs reap -> history flush ->
+    # raw-flags scrub -> active_job scrub -> shell_session destroy).
+    # SESSION_SHUTDOWN SUB OK fires from the tail of
+    # _ssd_shutdown_subtree. Neither has a production caller at M4:
+    # the sys_shutdown handler and the chaos-restart entry sequencer
+    # that will drive _ssd_shutdown_all are deferred to R145+ / R150+
+    # respectively; the subtree variant is driven by a future
+    # jail-tree-exit sequencer not yet landed. Both retire from this
+    # allowlist when the first production caller lands with an
+    # asserting smoke-mode golden driving the pipeline end-to-end.
+    "SESSION_SHUTDOWN ALL OK":
+        "Wave UMB-W22 R139.M4: src/kernel/core/svc/session_shutdown.pdx "
+        "emits this from the tail of _ssd_shutdown_all after the 8-"
+        "step wholesale pipeline. Unreachable from any production path "
+        "at M4 (no sys_shutdown handler yet; no platform-witness drill "
+        "wires _ssd_shutdown_all yet; no chaos-restart sequencer). "
+        "Retires when a caller lands (R145+ sys_shutdown or a R30 "
+        "witness extension) with an asserting smoke-mode golden.",
+    "SESSION_SHUTDOWN SUB OK":
+        "Wave UMB-W22 R139.M4: src/kernel/core/svc/session_shutdown.pdx "
+        "emits this from the tail of _ssd_shutdown_subtree after a "
+        "subtree-rooted teardown of one shell_session row's audit "
+        "pending records, jails pinned to its pid, jobs with its sid, "
+        "and the session row itself. Unreachable at M4 (no caller "
+        "yet; the jail-tree-exit sequencer that will drive subtree "
+        "shutdown is a future landing). Retires when that caller "
+        "lands with an asserting smoke-mode golden.",
 
     # Wave UMB-W13 R141.M2 (paideia-os#2646): perf-sink logging layer.
     # PERF SINK INIT OK fires on every boot from _perf_sink_init in

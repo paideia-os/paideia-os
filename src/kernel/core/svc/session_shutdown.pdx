@@ -1,0 +1,1049 @@
+// src/kernel/core/svc/session_shutdown.pdx -- Wave UMB-W22 R139.M4
+// paideia-os #2642
+//
+// SVC.SESSION-SHUTDOWN: MULTI-SESSION SHUTDOWN ORDERING
+// =============================================================================
+//
+// R139 ("Audit chain + session shutdown") milestone M4.  R127.M6 (Wave
+// UMB-W17) landed the PER-SESSION teardown cascade in
+// _shell_session_destroy: for one session row the inner cascade reaps
+// jobs -> flushes history counters -> scrubs raw-mode flags -> zeroes
+// active_job_pid -> zeroes pid -> clears in_use (LAST, publication).
+// That is the right shape for an isolated session exit (sys_exit of a
+// shell parent task).
+//
+// R139.M4 lifts the discipline WHOLESALE: when the kernel is winding
+// down (clean shutdown, chaos-restart entry, platform-witness
+// shutdown drill) or when an entire jail subtree is being torn down,
+// every active session MUST be destroyed, but ALSO the subsystems
+// that outlive any single session (remote-shell connections, jails,
+// jobs, pending audit records) must be torn down FIRST and in a
+// specific order so no cross-dependency hangs.  The ordering doctrine
+// is:
+//
+//   (1) FLUSH audit chain      -- finalize every PENDING record FIRST
+//                                 so later teardowns do not strand
+//                                 half-written entries whose this_hash
+//                                 was never computed; the audit chain
+//                                 remains verifiable across shutdown.
+//
+//   (2) CLOSE remote-shell     -- a remote shell that holds an
+//                                 established KEM session may be
+//                                 WAITING on a reply from a local
+//                                 session's command dispatcher.
+//                                 Transitioning to CLOSING + closing
+//                                 the row first drops any waiter the
+//                                 session's reply path would other-
+//                                 wise block behind during destroy.
+//
+//   (3) DESTROY jails          -- a jail's child_count ties into
+//                                 parent jails; _jail_supervisor_
+//                                 destroy frees the row.  Jails are
+//                                 destroyed BEFORE the jobs that
+//                                 would observe their rows (so a
+//                                 job's syscall-check-at-exit does
+//                                 not look up a half-destroyed jail
+//                                 row).
+//
+//   (4) REAP jobs              -- a job may hold a reference to a
+//                                 session's active_job_pid; reaping
+//                                 jobs before flushing the per-session
+//                                 active_job_pid field keeps the
+//                                 observable invariant "active_job_pid
+//                                 is either 0 or points to a live job
+//                                 row" through every intermediate
+//                                 shutdown step.
+//
+//   (5) FLUSH history ring     -- head/tail counters zeroed; the 128-
+//                                 KiB ring backing is NOT scrubbed
+//                                 (stale slot content unreachable
+//                                 once head==tail; next create path
+//                                 overwrites on append).
+//
+//   (6) SCRUB raw-mode flags   -- high 32 of [row+40] cleared via
+//                                 shift-anchor so the state ordinal
+//                                 (low 32) is preserved during the
+//                                 pre-pass.
+//
+//   (7) ZERO active_job_pid    -- defence-in-depth: if a late-arriving
+//                                 observer reads [row+120] between
+//                                 step 7 and the step-8 destroy, it
+//                                 sees 0 (no live foreground job)
+//                                 instead of a stale pid.
+//
+//   (8) DESTROY shell_session  -- the final row release, via
+//                                 _shell_session_destroy, which runs
+//                                 its own per-session cascade.  The
+//                                 inner cascade is REDUNDANT with
+//                                 steps 4-7 on this path (every target
+//                                 field has already been scrubbed) but
+//                                 _shell_session_destroy remains the
+//                                 single authority for "clear in_use
+//                                 LAST" so a concurrent scanner never
+//                                 observes an interleaved row.
+//
+// Service name:    "svc.session-shutdown"  (NO BROKER REGISTRATION
+//                                           at M4 -- this module is
+//                                           a direct-call wholesale
+//                                           coordinator, not a svc.*
+//                                           daemon.  No endpoint id
+//                                           is claimed; no cap-invoke
+//                                           dispatch arm exists.
+//                                           R139.M5+ MAY lift to a
+//                                           cap-invoke surface for
+//                                           authenticated userspace
+//                                           "please shut this subtree
+//                                           down" callers.)
+// Direct API:      _ssd_shutdown_{all,subtree}
+//
+// =============================================================================
+// SECTION 0  WHY WHOLESALE INSTEAD OF ONE-SESSION-AT-A-TIME
+// =============================================================================
+//
+// Looping _shell_session_destroy over SS_POOL_MAX works for session
+// rows but IGNORES four shutdown-relevant subsystems:
+//
+//   (a) PENDING audit records -- _cmd_audit_begin without a matching
+//       _cmd_audit_end leaves the slot's FINALIZED bit clear.  A
+//       verify of a subsequent record then fails the prev_hash chain
+//       check because the predecessor's this_hash was never written.
+//       On a chaos restart the chain is unverifiable from the
+//       surviving ring segment.  M4 finalizes every PENDING record
+//       with exit_code = SSD_SHUTDOWN_EXIT (0xFFFFFFFF) so the chain
+//       stays intact.
+//
+//   (b) REMOTE-SHELL connections -- a connection row is NOT tied 1:1
+//       to any shell_session row (M4 remote-shell has no back-link);
+//       looping sessions never visits them.  Closing them before
+//       sessions prevents a stall on a reply path.
+//
+//   (c) JAIL rows -- a jail row's pid points at a jailed process; the
+//       jailed process is NOT necessarily the shell_session owner
+//       (the shell may spawn a jailed child).  Looping sessions does
+//       not visit jail rows; _ssd_shutdown_all does.
+//
+//   (d) SHELL JOBS -- the per-session _shell_session_destroy cascade
+//       scans the jobs pool for matching session_id, but a job row
+//       whose session_id is STALE (e.g. a job created against a now-
+//       freed session row because of a bookkeeping bug) is NOT
+//       visited.  M4 scans the full job pool.
+//
+// =============================================================================
+// SECTION 1  RETURN CODE BAND  --  0x2300..0x230F
+// =============================================================================
+//
+// Band audit (2026-10-14):
+//   `grep -rnE '0x230[0-9]\b' src/kernel/`  -> zero hits.
+// 0x23xx is adjacent to the CA_* band (0x22xx, cmd_audit.pdx) and
+// disjoint from every SS_* / SJ_* / RS_* / JS_* code.
+//
+//   SSD_OK                 = 0
+//   SSD_ERR_AUDIT_FLUSH    = 0x2300  (audit-chain flush failed on at
+//                                     least one PENDING record; the
+//                                     specific record's seq is in the
+//                                     fingerprint but not in the
+//                                     return value)
+//   SSD_ERR_PARTIAL        = 0x2301  (one or more subsystem destroy
+//                                     calls returned a non-OK code
+//                                     during best-effort traversal;
+//                                     shutdown CONTINUED through the
+//                                     remaining steps.  The caller
+//                                     treats this as "most of
+//                                     shutdown succeeded; inspect
+//                                     fingerprints for the specific
+//                                     failing step".)
+//
+// Both codes fit imm32 with bit 31 clear so `mov rax, imm32` emits the
+// 7-byte zero-extending form.  No `and r11, imm64` encoder gap.
+//
+// =============================================================================
+// SECTION 2  ENTRY POINTS
+// =============================================================================
+//
+// _ssd_shutdown_all() -> errno
+//   KERNEL-WIDE shutdown.  Traverses in the 8-step order documented
+//   above across EVERY active row in EVERY subsystem.  Idempotent:
+//   calling twice is safe (every PENDING is finalized or already
+//   finalized; every in_use row is destroyed or already free).  No
+//   argument validation.
+//
+// _ssd_shutdown_subtree(root_session_id) -> errno
+//   PARTIAL shutdown rooted at one shell_session row.  Visits only:
+//     - PENDING audit records whose session_id (at CA_OFF_SID = +40,
+//       u32) matches root_session_id;
+//     - jobs whose session_id (hi32 of row[+0]) matches
+//       root_session_id;
+//     - jails whose pid (at JS_OFF_PID = +0) matches the shell
+//       session's owner pid (recovered from row[+0] of the session);
+//     - the shell_session row itself (via _shell_session_destroy).
+//
+//   REMOTE-SHELL rows are DELIBERATELY not visited by subtree mode:
+//   remote connections carry no back-link to a shell_session, and
+//   closing all remote connections on a per-subtree call would be
+//   wrong for the common "jail subtree exits but a different shell's
+//   remote connection stays live" scenario.  R139.M5+ MAY add an
+//   explicit RS_OFF_OWNER_SID back-link, at which point subtree mode
+//   closes connections owned by the subtree root.
+//
+//   Returns SSD_OK on success, SSD_ERR_PARTIAL if any inner call
+//   returned non-OK (best-effort).  SSD_ERR_AUDIT_FLUSH on an audit
+//   flush failure.
+//
+// =============================================================================
+// SECTION 3  INTERACTION WITH R127.M6 TEARDOWN CASCADE
+// =============================================================================
+//
+// R127.M6 (_shell_session_destroy, shell_session.pdx) IS the per-row
+// cascade.  R139.M4 (_ssd_shutdown_all, this file) IS the WHOLESALE
+// coordinator that runs across subsystems BEFORE the per-row cascade
+// is invoked on each row.  The two layers are composable:
+//
+//   M4 step 1-7:  cross-subsystem pre-pass (audit, remote, jails,
+//                 jobs, history, raw-flags, active-job).
+//   M4 step 8:    per-row destroy -> _shell_session_destroy -> M6
+//                 cascade -> redundant but harmless scrubs then
+//                 in_use publication.
+//
+// The redundancy is DELIBERATE: M4 cannot omit M6's inner scrubs
+// because M6 is the sole authority for the "clear in_use LAST"
+// publication contract.  M6 cannot omit the earlier scrubs because
+// M6 is also the sys_exit entrypoint for a single-session teardown
+// where the M4 pre-pass has NOT run.
+//
+// =============================================================================
+// SECTION 4  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Labels are prefixed `ssd_` (session-shutdown).  Encoder-pitfall
+// posture (feedback_pdx_encoder_pitfalls):
+//
+//   * cmp rN, 0            (never `test rN, rN`)
+//   * shl rN, 7 for stride-128 (sessions, jails, audit records)
+//     shl rN, 6 for stride-64  (jobs)
+//     shl rN, 8 for stride-256 (remote-shell connections)
+//     (never `imul r, imm`)
+//   * mov rax, imm32       (never `and r11, imm64`; the error codes
+//                           0x2300 / 0x2301 and the exit-code marker
+//                           0xFFFFFFFF all fit imm32)
+//   * shift-anchor to clear high 32 of a packed u64 (shl 32 ; shr 32)
+//   * single-line `pub let name = "..."`
+//   * module basename SessionShutdown matches file basename
+//     session_shutdown.pdx
+//   * fingerprint `[u8; N]` with N = string length + 1 (NUL counts)
+//
+// Stack discipline (SysV, entry rsp%16==8):
+//
+//   _ssd_shutdown_all           2 pushes (r12 = cursor,
+//                                         r13 = err_mask) + sub rsp,8
+//                                         (alignment pad).  Entry
+//                                         %16==8; +2 pushes = %16==8;
+//                                         +8 pad = %16==0 at every
+//                                         nested call.
+//
+//   _ssd_shutdown_subtree       4 pushes (rbx = root_sid,
+//                                         r12 = cursor,
+//                                         r13 = err_mask,
+//                                         r14 = root_pid) + sub rsp,8
+//                                         (alignment pad).  Entry
+//                                         %16==8; +4 pushes = %16==8;
+//                                         +8 pad = %16==0 at every
+//                                         nested call.
+//
+// =============================================================================
+// SECTION 5  BOOT WIRING NOTE
+// =============================================================================
+//
+// kernel_main.pdx does NOT call _ssd_shutdown_* at boot (there is
+// nothing to shut down).  Callers:
+//
+//   * platform-witness clean-shutdown drill (R30 cascade addition,
+//     deferred to the first witness after R139.M4 lands);
+//   * sys_shutdown handler (R145+, when the shutdown syscall lands);
+//   * chaos-restart entry sequencer (R150+ future, for the "replay
+//     from last audit chain tail" path).
+//
+// No explicit init is required: this module declares no .bss state
+// of its own.  Statistics live in _ssd_stats (16 u64) which .bss-
+// zeroes at real boot.
+//
+// =============================================================================
+
+module SessionShutdown = structure {
+
+  // ==========================================================================
+  // Service identity (documentary only; no broker registration at M4)
+  // ==========================================================================
+
+  pub let SESSION_SHUTDOWN_NAME_LEN : u64 = 20   // "svc.session-shutdown" is 20 bytes
+  pub let session_shutdown_name : [u8; 21] = "svc.session-shutdown\0"
+
+  // ==========================================================================
+  // Return band
+  // ==========================================================================
+
+  pub let SSD_OK              : u64 = 0
+  pub let SSD_ERR_AUDIT_FLUSH : u64 = 0x2300
+  pub let SSD_ERR_PARTIAL     : u64 = 0x2301
+
+  // Shutdown-synthetic exit code marker: a PENDING audit record whose
+  // owning command never reached _cmd_audit_end is finalized by the
+  // M4 coordinator with this marker in the record's exit_code field
+  // so a later verify can distinguish "command finished with exit=X"
+  // from "command interrupted by shutdown".
+  pub let SSD_SHUTDOWN_EXIT : u64 = 0xFFFFFFFF
+
+  // ==========================================================================
+  // Loop bounds (mirrors each subsystem's own POOL_MAX; carried here
+  // as immediates in the emitted shifts so no cross-module reload is
+  // required at runtime).
+  // ==========================================================================
+
+  pub let SSD_SS_POOL_MAX  : u64 = 8      // shell_session rows
+  pub let SSD_JS_POOL_MAX  : u64 = 8      // jail_supervisor rows
+  pub let SSD_SJ_POOL_MAX  : u64 = 32     // shell_jobs rows
+  pub let SSD_RS_POOL_MAX  : u64 = 4      // remote_shell rows
+  pub let SSD_CA_POOL_SLOTS: u64 = 128    // cmd_audit ring slots
+
+  // Remote-shell transitional state ordinal (RS_STATE_CLOSING in
+  // remote_shell.pdx = 3).  Carried locally so this file does not
+  // alias a cross-module `pub let`.
+  pub let SSD_RS_STATE_CLOSING : u64 = 3
+
+  // ==========================================================================
+  // Observability storage
+  //
+  //   _ssd_stats -- 16 u64 counters.  Slot assignments:
+  //     [0]  SSD_ST_SHUTDOWN_ALL_OK      -- all-mode entries completing
+  //     [1]  SSD_ST_SHUTDOWN_SUB_OK      -- subtree-mode entries completing
+  //     [2]  SSD_ST_AUDIT_FLUSHED        -- records finalized by step 1
+  //     [3]  SSD_ST_AUDIT_FLUSH_FAIL     -- records that refused finalize
+  //     [4]  SSD_ST_REMOTE_CLOSED        -- rows closed by step 2
+  //     [5]  SSD_ST_JAILS_DESTROYED      -- rows freed by step 3
+  //     [6]  SSD_ST_JOBS_REAPED          -- rows freed by step 4
+  //     [7]  SSD_ST_HISTORY_FLUSHED      -- session rows touched by step 5
+  //     [8]  SSD_ST_RAW_SCRUBBED         -- session rows touched by step 6
+  //     [9]  SSD_ST_ACTIVE_JOB_ZEROED    -- session rows touched by step 7
+  //     [10] SSD_ST_SESSIONS_DESTROYED   -- session rows freed by step 8
+  //     [11..15] reserved
+  // ==========================================================================
+
+  pub let mut _ssd_stats : [u64; 16] = uninit @align(64)
+
+  pub let SSD_ST_SHUTDOWN_ALL_OK    : u64 = 0
+  pub let SSD_ST_SHUTDOWN_SUB_OK    : u64 = 1
+  pub let SSD_ST_AUDIT_FLUSHED      : u64 = 2
+  pub let SSD_ST_AUDIT_FLUSH_FAIL   : u64 = 3
+  pub let SSD_ST_REMOTE_CLOSED      : u64 = 4
+  pub let SSD_ST_JAILS_DESTROYED    : u64 = 5
+  pub let SSD_ST_JOBS_REAPED        : u64 = 6
+  pub let SSD_ST_HISTORY_FLUSHED    : u64 = 7
+  pub let SSD_ST_RAW_SCRUBBED       : u64 = 8
+  pub let SSD_ST_ACTIVE_JOB_ZEROED  : u64 = 9
+  pub let SSD_ST_SESSIONS_DESTROYED : u64 = 10
+
+  // ==========================================================================
+  // Fingerprint tags
+  //
+  // "SESSION_SHUTDOWN ALL OK"      = 23 chars + NUL => N=24
+  // "SESSION_SHUTDOWN SUB OK"      = 23 chars + NUL => N=24
+  // "SESSION_SHUTDOWN AUDIT OK"    = 25 chars + NUL => N=26
+  // "SESSION_SHUTDOWN AUDIT REJ"   = 26 chars + NUL => N=27
+  // "SESSION_SHUTDOWN STEP OK"     = 24 chars + NUL => N=25
+  // ==========================================================================
+
+  pub let ssd_tag_all_ok     : [u8; 24] = "SESSION_SHUTDOWN ALL OK\0"
+  pub let ssd_tag_sub_ok     : [u8; 24] = "SESSION_SHUTDOWN SUB OK\0"
+  // ssd_tag_audit_rej (26 chars + NUL) — "REJ" string, no "OK" token so
+  // the fingerprint-coverage gate ignores it; retained for M5+ callers
+  // that will emit on an audit-flush failure path.
+  pub let ssd_tag_audit_rej  : [u8; 27] = "SESSION_SHUTDOWN AUDIT REJ\0"
+
+  // KV keys actually referenced by the M4 emission sites.
+  pub let ssd_k_sid          : [u8; 4]  = "sid\0"
+  pub let ssd_k_errno        : [u8; 6]  = "errno\0"
+
+  // ==========================================================================
+  // ssd_note(slot) -> ()
+  //
+  // Bounded increment on _ssd_stats[slot].  Load-inc-store, no
+  // `add reg,[mem]`.  Pure leaf.  Shape mirrors ss_note / ca_note.
+  // ==========================================================================
+  pub let ssd_note : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R139.M4 (paideia-os #2642): bounded increment on _ssd_stats[slot<16]. Load-inc-store, no `add reg,[mem]`. Pure leaf -- no pushes. Labels prefixed ssd_no_.",
+      block: {
+        cmp rdi, 16;
+        jae ssd_no_out;
+        lea r10, [rip + _ssd_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      ssd_no_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _ssd_shutdown_all() -> errno
+  //
+  // Kernel-wide shutdown.  Walks the 8-step pipeline across every
+  // active row in every subsystem.  Idempotent.
+  //
+  // ARGS (SysV): none.
+  //
+  // RETURNS (rax):
+  //   SSD_OK (= 0)              -- every step completed cleanly.
+  //   SSD_ERR_AUDIT_FLUSH       -- at least one PENDING audit record
+  //                                 refused finalize (BAD_TOKEN).
+  //   SSD_ERR_PARTIAL           -- an inner destroy returned non-OK
+  //                                 at some step; shutdown proceeded
+  //                                 best-effort through the rest.
+  //
+  // Note: SSD_ERR_AUDIT_FLUSH takes precedence over SSD_ERR_PARTIAL
+  // when both apply (audit flush failure is the most severe condition
+  // because it compromises the audit-chain integrity invariant).
+  //
+  // STACK FRAME:
+  //   2 callee-save pushes (r12 = cursor, r13 = err_mask) + sub rsp, 8
+  //   (alignment pad). Entry rsp%16==8; +2 pushes = +16 (%16==8 still);
+  //   +8 pad = +24 total = %16==0 at every nested call.
+  //
+  // Labels prefixed ssd_sa_.
+  // ==========================================================================
+  pub let _ssd_shutdown_all : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M4 (paideia-os #2642): kernel-wide multi-subsystem shutdown pipeline. 8 steps in a fixed order: (1) scan _cmd_audit_pool for PENDING records (flags u32 at [+84], bit 0 isolated via (packed>>32)&1 from [+80]); finalize each via _cmd_audit_end(seq, 0xFFFFFFFF); SSD_ERR_AUDIT_FLUSH on any CA_ERR. (2) scan _remote_shell_pool for in_use rows (word at [+120]); set CLOSING then call _remote_shell_close. (3) scan _jail_supervisor_pool for in_use rows (word at [+112]); call _jail_supervisor_destroy. (4) scan _shell_jobs_pool for primary_pid!=0 (word at [+8]); call _shell_jobs_destroy. (5-7) scan _shell_session_pool for in_use rows (word at [+112]); zero history_head/tail at [+24]/[+32], shift-anchor scrub [+40] (preserves state lo32, clears raw-flags hi32), zero active_job_pid at [+120]. (8) scan _shell_session_pool again; call _shell_session_destroy (its own M6 cascade runs; the fields are already scrubbed by steps 5-7 so the inner reap is a no-op but in_use publication contract is preserved). Encoder-pitfall posture: cmp rN,0 (never test), shl rN,7 for session/jail/audit stride, shl rN,6 for jobs, shl rN,8 for remote-shell, mov rax,imm32 for 0x2300/0x2301, shift-anchor (shl 32; shr 32) for raw-flags scrub, mov r11,0xFFFFFFFF (fits imm32) for the SHUTDOWN exit marker. Two callee-save pushes (r12=cursor, r13=err_mask) + sub rsp,8 (alignment pad) land rsp%16==0 at every nested call. Labels prefixed ssd_sa_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;                      // alignment pad
+
+        xor r13, r13;                    // err_mask = 0
+
+        // ======================================================================
+        // Step 1: FLUSH audit chain
+        //
+        //   for slot_idx in 0..128:
+        //     base = _cmd_audit_pool + (slot_idx << 7)
+        //     packed = [base + 80]       (exit_code lo32 | flags hi32)
+        //     flags = packed >> 32
+        //     if (flags & 1) == 0: continue   (not PENDING)
+        //     seq = [base + 0]
+        //     rc = _cmd_audit_end(seq, 0xFFFFFFFF)
+        //     if rc != 0: err_mask |= SSD_ERR_AUDIT_FLUSH
+        //     else:        ssd_note(SSD_ST_AUDIT_FLUSHED)
+        // ======================================================================
+        xor r12, r12;                    // cursor = 0
+
+      ssd_sa_audit_scan:
+        cmp r12, 128;                    // SSD_CA_POOL_SLOTS
+        jae ssd_sa_audit_done;
+
+        // base = _cmd_audit_pool + (cursor << 7)
+        mov rax, r12;
+        shl rax, 7;
+        lea r10, [rip + _cmd_audit_pool];
+        add rax, r10;                    // rax = base
+
+        // packed = [base + 80]; flags = packed >> 32; test PENDING bit 0.
+        mov r10, [rax + 80];
+        shr r10, 32;
+        and r10, 1;                      // CA_FLAG_PENDING
+        cmp r10, 0;
+        je  ssd_sa_audit_next;
+
+        // seq = [base + 0]
+        mov rdi, [rax + 0];              // token (seq)
+        mov rsi, 0xFFFFFFFF;             // SSD_SHUTDOWN_EXIT (imm32 fits)
+        call _cmd_audit_end;
+        cmp rax, 0;
+        je  ssd_sa_audit_ok1;
+
+        // Non-OK -- bump fail counter and OR into err_mask.
+        mov rdi, 3;                      // SSD_ST_AUDIT_FLUSH_FAIL
+        call ssd_note;
+        mov rax, 0x2300;                 // SSD_ERR_AUDIT_FLUSH
+        or  r13, rax;
+        jmp ssd_sa_audit_next;
+
+      ssd_sa_audit_ok1:
+        mov rdi, 2;                      // SSD_ST_AUDIT_FLUSHED
+        call ssd_note;
+
+      ssd_sa_audit_next:
+        add r12, 1;
+        jmp ssd_sa_audit_scan;
+
+      ssd_sa_audit_done:
+
+        // ======================================================================
+        // Step 2: CLOSE remote-shell connections
+        //
+        //   for conn_id in 0..4:
+        //     base = _remote_shell_pool + (conn_id << 8)
+        //     if [base + 120] (in_use) == 0: continue
+        //     _remote_shell_set_state(conn_id, RS_STATE_CLOSING)
+        //     _remote_shell_close(conn_id)
+        // ======================================================================
+        xor r12, r12;
+
+      ssd_sa_remote_scan:
+        cmp r12, 4;                      // SSD_RS_POOL_MAX
+        jae ssd_sa_remote_done;
+
+        mov rax, r12;
+        shl rax, 8;                      // stride 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;
+
+        mov r10, [rax + 120];            // in_use
+        cmp r10, 0;
+        je  ssd_sa_remote_next;
+
+        // Transition to CLOSING first, then close.
+        mov rdi, r12;
+        mov rsi, 3;                      // RS_STATE_CLOSING
+        call _remote_shell_set_state;
+        cmp rax, 0;
+        je  ssd_sa_remote_do_close;
+
+        // Transition refused -- record PARTIAL but attempt close anyway
+        // (close path only requires in_use to be set).
+        mov rax, 0x2301;                 // SSD_ERR_PARTIAL
+        or  r13, rax;
+
+      ssd_sa_remote_do_close:
+        mov rdi, r12;
+        call _remote_shell_close;
+        cmp rax, 0;
+        je  ssd_sa_remote_ok;
+
+        mov rax, 0x2301;
+        or  r13, rax;
+        jmp ssd_sa_remote_next;
+
+      ssd_sa_remote_ok:
+        mov rdi, 4;                      // SSD_ST_REMOTE_CLOSED
+        call ssd_note;
+
+      ssd_sa_remote_next:
+        add r12, 1;
+        jmp ssd_sa_remote_scan;
+
+      ssd_sa_remote_done:
+
+        // ======================================================================
+        // Step 3: DESTROY jails
+        //
+        //   for jail_id in 0..8:
+        //     base = _jail_supervisor_pool + (jail_id << 7)
+        //     if [base + 112] (in_use) == 0: continue
+        //     _jail_supervisor_destroy(jail_id)
+        // ======================================================================
+        xor r12, r12;
+
+      ssd_sa_jail_scan:
+        cmp r12, 8;                      // SSD_JS_POOL_MAX
+        jae ssd_sa_jail_done;
+
+        mov rax, r12;
+        shl rax, 7;
+        lea r10, [rip + _jail_supervisor_pool];
+        add rax, r10;
+
+        mov r10, [rax + 112];
+        cmp r10, 0;
+        je  ssd_sa_jail_next;
+
+        mov rdi, r12;
+        call _jail_supervisor_destroy;
+        cmp rax, 0;
+        je  ssd_sa_jail_ok;
+
+        mov rax, 0x2301;
+        or  r13, rax;
+        jmp ssd_sa_jail_next;
+
+      ssd_sa_jail_ok:
+        mov rdi, 5;                      // SSD_ST_JAILS_DESTROYED
+        call ssd_note;
+
+      ssd_sa_jail_next:
+        add r12, 1;
+        jmp ssd_sa_jail_scan;
+
+      ssd_sa_jail_done:
+
+        // ======================================================================
+        // Step 4: REAP jobs
+        //
+        //   for job_id in 0..32:
+        //     base = _shell_jobs_pool + (job_id << 6)
+        //     if [base + 8] (primary_pid) == 0: continue
+        //     _shell_jobs_destroy(job_id)
+        // ======================================================================
+        xor r12, r12;
+
+      ssd_sa_jobs_scan:
+        cmp r12, 32;                     // SSD_SJ_POOL_MAX
+        jae ssd_sa_jobs_done;
+
+        mov rax, r12;
+        shl rax, 6;
+        lea r10, [rip + _shell_jobs_pool];
+        add rax, r10;
+
+        mov r10, [rax + 8];
+        cmp r10, 0;
+        je  ssd_sa_jobs_next;
+
+        mov rdi, r12;
+        call _shell_jobs_destroy;
+        cmp rax, 0;
+        je  ssd_sa_jobs_ok;
+
+        mov rax, 0x2301;
+        or  r13, rax;
+        jmp ssd_sa_jobs_next;
+
+      ssd_sa_jobs_ok:
+        mov rdi, 6;                      // SSD_ST_JOBS_REAPED
+        call ssd_note;
+
+      ssd_sa_jobs_next:
+        add r12, 1;
+        jmp ssd_sa_jobs_scan;
+
+      ssd_sa_jobs_done:
+
+        // ======================================================================
+        // Steps 5-7: PER-SESSION PRE-SCRUB
+        //
+        //   for sid in 0..8:
+        //     base = _shell_session_pool + (sid << 7)
+        //     if [base + 112] (in_use) == 0: continue
+        //     [base + 24] = 0           -- history_head
+        //     [base + 32] = 0           -- history_tail
+        //     r11 = [base + 40]
+        //     shl r11, 32; shr r11, 32  -- preserve state, clear raw-flags
+        //     [base + 40] = r11
+        //     [base + 120] = 0          -- active_job_pid
+        //
+        // The scrub does NOT touch in_use; step 8 does the row release.
+        // ======================================================================
+        xor r12, r12;
+
+      ssd_sa_prescrub_scan:
+        cmp r12, 8;                      // SSD_SS_POOL_MAX
+        jae ssd_sa_prescrub_done;
+
+        mov rax, r12;
+        shl rax, 7;
+        lea r10, [rip + _shell_session_pool];
+        add rax, r10;
+
+        mov r10, [rax + 112];
+        cmp r10, 0;
+        je  ssd_sa_prescrub_next;
+
+        // Zero history_head + history_tail.
+        xor r9, r9;
+        mov [rax + 24], r9;
+        mov [rax + 32], r9;
+
+        // Shift-anchor scrub of raw-flags (hi32 of [+40]).
+        mov r11, [rax + 40];
+        shl r11, 32;
+        shr r11, 32;
+        mov [rax + 40], r11;
+
+        // Zero active_job_pid.
+        mov [rax + 120], r9;
+
+        // Three counters bumped per touched session (one per step).
+        mov rdi, 7;                      // SSD_ST_HISTORY_FLUSHED
+        call ssd_note;
+        mov rdi, 8;                      // SSD_ST_RAW_SCRUBBED
+        call ssd_note;
+        mov rdi, 9;                      // SSD_ST_ACTIVE_JOB_ZEROED
+        call ssd_note;
+
+      ssd_sa_prescrub_next:
+        add r12, 1;
+        jmp ssd_sa_prescrub_scan;
+
+      ssd_sa_prescrub_done:
+
+        // ======================================================================
+        // Step 8: DESTROY shell_session rows
+        //
+        //   for sid in 0..8:
+        //     if ss_row_in_use(sid) == 0: continue
+        //     _shell_session_destroy(sid)
+        //
+        // Note: the inner M6 cascade is REDUNDANT on this path (its
+        // target fields were zeroed at steps 5-7) but
+        // _shell_session_destroy remains the sole authority for the
+        // "clear in_use LAST" publication contract.
+        // ======================================================================
+        xor r12, r12;
+
+      ssd_sa_destroy_scan:
+        cmp r12, 8;                      // SSD_SS_POOL_MAX
+        jae ssd_sa_destroy_done;
+
+        mov rdi, r12;
+        call ss_row_in_use;
+        cmp rax, 0;
+        je  ssd_sa_destroy_next;
+
+        mov rdi, r12;
+        call _shell_session_destroy;
+        cmp rax, 0;
+        je  ssd_sa_destroy_ok;
+
+        mov rax, 0x2301;
+        or  r13, rax;
+        jmp ssd_sa_destroy_next;
+
+      ssd_sa_destroy_ok:
+        mov rdi, 10;                     // SSD_ST_SESSIONS_DESTROYED
+        call ssd_note;
+
+      ssd_sa_destroy_next:
+        add r12, 1;
+        jmp ssd_sa_destroy_scan;
+
+      ssd_sa_destroy_done:
+
+        // ======================================================================
+        // Final: stats + fingerprint + err_mask return.
+        // ======================================================================
+        mov rdi, 0;                      // SSD_ST_SHUTDOWN_ALL_OK
+        call ssd_note;
+
+        // Emit SESSION_SHUTDOWN ALL OK errno=0x<hex> with r13 payload
+        // (err_mask: 0 on clean, 0x2300 on audit failure, 0x2301 on
+        // partial, 0x2301|0x2300 = 0x2301 on both because 0x2300|0x2301
+        // = 0x2301 as the low bit of 0x2300 is already set in 0x2301;
+        // audit precedence rule below extracts the 0x2300 case).
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ssd_tag_all_ok];
+        lea rcx, [rip + ssd_k_errno];
+        mov r8,  r13;                    // v_hex = err_mask
+        call klog_s1_x1;
+
+        // Precedence: audit flush failure dominates partial.  If the
+        // 0x2300 bit is set in r13, return 0x2300; else return r13 as
+        // is (which is 0 or 0x2301).
+        mov rax, r13;
+        mov r10, 0x2300;
+        and r10, rax;                    // r10 = r13 & 0x2300
+        cmp r10, 0;
+        je  ssd_sa_ret_partial;
+        mov rax, 0x2300;
+        jmp ssd_sa_out;
+
+      ssd_sa_ret_partial:
+        // rax already carries r13 (either 0 or 0x2301).
+
+      ssd_sa_out:
+        add rsp, 8;                      // undo alignment pad
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _ssd_shutdown_subtree(root_session_id) -> errno
+  //
+  // Partial shutdown rooted at ONE shell_session row.  Semantics:
+  //   root_session_id INVALID or row free -> SSD_OK (no-op; idempotent
+  //                                           on a nonexistent root,
+  //                                           matching R127.M6's
+  //                                           SS_TEARDOWN_NOT_SHELL_PID
+  //                                           softness for sys_exit).
+  //
+  // Order (matches _ssd_shutdown_all but filtered to the subtree):
+  //   (1) flush PENDING audit records whose session_id == root
+  //   (2) [REMOTE-SHELL SKIPPED -- no back-link at M4; see Section 2]
+  //   (3) destroy jails whose pid == root_session.pid
+  //   (4) reap jobs whose session_id == root
+  //   (5-7) per-session scrub of root row (redundant with step 8's
+  //         cascade but kept for parity with _shutdown_all)
+  //   (8) destroy root shell_session row
+  //
+  // ARGS (SysV):
+  //   rdi = root_session_id   (0..SS_POOL_MAX)
+  //
+  // RETURNS (rax):
+  //   SSD_OK                     -- subtree cleaned (or already clean)
+  //   SSD_ERR_AUDIT_FLUSH        -- audit-chain flush saw a BAD_TOKEN
+  //                                  on at least one PENDING record
+  //                                  attributed to this session.
+  //   SSD_ERR_PARTIAL            -- an inner destroy returned non-OK;
+  //                                  shutdown proceeded best-effort.
+  //
+  // STACK FRAME:
+  //   4 callee-save pushes (rbx = root_sid, r12 = cursor,
+  //                         r13 = err_mask, r14 = root_pid) + sub rsp,8
+  //   (alignment pad). Entry rsp%16==8; +4 pushes = +32 (%16==8 still);
+  //   +8 pad = +40 total = %16==0 at every nested call.
+  //
+  // Labels prefixed ssd_ss_.
+  // ==========================================================================
+  pub let _ssd_shutdown_subtree : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (root_session_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M4 (paideia-os #2642): subtree shutdown rooted at one shell_session row. Validate root_session_id via ss_row_in_use (noop SSD_OK on miss, matching R127.M6's softness for sys_exit). Capture root_pid from row[+0]. (1) Scan _cmd_audit_pool for records where session_id (u32 at [+40]) == root AND PENDING is set; _cmd_audit_end(seq, 0xFFFFFFFF) each. (3) Scan _jail_supervisor_pool for rows where in_use AND pid == root_pid; _jail_supervisor_destroy each. Remote-shell SKIPPED by M4 doctrine (no back-link). (4) Scan _shell_jobs_pool for rows where primary_pid!=0 AND session_id (hi32 of [+0]>>32) == root; _shell_jobs_destroy each. (5-7) scrub root row's history/raw-flags/active-job (parity with _shutdown_all). (8) _shell_session_destroy(root). Encoder-pitfall posture: cmp rN,0 (never test); shl rN,7 for session/jail/audit stride; shl rN,6 for jobs; shr rN,32 to recover session_id from job's packed u64 (never and r,imm64); mov rax,imm32 for all error codes; mov_d-less loads of u32 fields via plain mov with shift masking. Four callee-save pushes (rbx=root_sid, r12=cursor, r13=err_mask, r14=root_pid) + sub rsp,8 (alignment pad) land rsp%16==0 at every nested call. Labels prefixed ssd_ss_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;                      // alignment pad
+
+        mov rbx, rdi;                    // root_session_id
+
+        // Validate root via ss_row_in_use.  Miss -> SSD_OK no-op.
+        mov rdi, rbx;
+        call ss_row_in_use;
+        cmp rax, 0;
+        je  ssd_ss_noop;
+
+        // Capture root_pid.  base = _shell_session_pool + (rbx << 7).
+        mov rax, rbx;
+        shl rax, 7;
+        lea r10, [rip + _shell_session_pool];
+        add rax, r10;
+        mov r14, [rax + 0];              // root_pid
+
+        xor r13, r13;                    // err_mask = 0
+
+        // ======================================================================
+        // Step 1: flush PENDING audit records with session_id == root
+        // ======================================================================
+        xor r12, r12;
+
+      ssd_ss_audit_scan:
+        cmp r12, 128;                    // SSD_CA_POOL_SLOTS
+        jae ssd_ss_audit_done;
+
+        mov rax, r12;
+        shl rax, 7;
+        lea r10, [rip + _cmd_audit_pool];
+        add rax, r10;                    // rax = slot base
+
+        // session_id is a u32 at [+40].  Load as u64; the hi32 holds
+        // pid (u32 at [+44]).  Shift-trick to isolate: shl 32 then
+        // shr 32 gives us the low 32 bits (session_id) in r10.
+        mov r10, [rax + 40];
+        shl r10, 32;
+        shr r10, 32;                     // r10 = session_id (u32 zx)
+        cmp r10, rbx;
+        jne ssd_ss_audit_next;
+
+        // Flags check: PENDING?
+        mov r10, [rax + 80];
+        shr r10, 32;
+        and r10, 1;
+        cmp r10, 0;
+        je  ssd_ss_audit_next;
+
+        // Finalize.
+        mov rdi, [rax + 0];              // seq
+        mov rsi, 0xFFFFFFFF;             // SSD_SHUTDOWN_EXIT
+        call _cmd_audit_end;
+        cmp rax, 0;
+        je  ssd_ss_audit_ok1;
+
+        mov rdi, 3;                      // SSD_ST_AUDIT_FLUSH_FAIL
+        call ssd_note;
+        mov rax, 0x2300;
+        or  r13, rax;
+        jmp ssd_ss_audit_next;
+
+      ssd_ss_audit_ok1:
+        mov rdi, 2;                      // SSD_ST_AUDIT_FLUSHED
+        call ssd_note;
+
+      ssd_ss_audit_next:
+        add r12, 1;
+        jmp ssd_ss_audit_scan;
+
+      ssd_ss_audit_done:
+
+        // ======================================================================
+        // Step 3: destroy jails whose pid == root_pid (one-level only
+        //          at M4; parent/child jail tree walk deferred to M5+).
+        // ======================================================================
+        xor r12, r12;
+
+      ssd_ss_jail_scan:
+        cmp r12, 8;                      // SSD_JS_POOL_MAX
+        jae ssd_ss_jail_done;
+
+        mov rax, r12;
+        shl rax, 7;
+        lea r10, [rip + _jail_supervisor_pool];
+        add rax, r10;
+
+        // in_use?
+        mov r10, [rax + 112];
+        cmp r10, 0;
+        je  ssd_ss_jail_next;
+
+        // pid match?
+        mov r10, [rax + 0];
+        cmp r10, r14;                    // root_pid
+        jne ssd_ss_jail_next;
+
+        mov rdi, r12;
+        call _jail_supervisor_destroy;
+        cmp rax, 0;
+        je  ssd_ss_jail_ok;
+
+        mov rax, 0x2301;
+        or  r13, rax;
+        jmp ssd_ss_jail_next;
+
+      ssd_ss_jail_ok:
+        mov rdi, 5;                      // SSD_ST_JAILS_DESTROYED
+        call ssd_note;
+
+      ssd_ss_jail_next:
+        add r12, 1;
+        jmp ssd_ss_jail_scan;
+
+      ssd_ss_jail_done:
+
+        // ======================================================================
+        // Step 4: reap jobs where session_id == root
+        //
+        //   row[+0] = job_id (lo32) | session_id (hi32); shr 32 isolates.
+        //   row[+8] = primary_pid; nonzero => in_use.
+        // ======================================================================
+        xor r12, r12;
+
+      ssd_ss_jobs_scan:
+        cmp r12, 32;                     // SSD_SJ_POOL_MAX
+        jae ssd_ss_jobs_done;
+
+        mov rax, r12;
+        shl rax, 6;
+        lea r10, [rip + _shell_jobs_pool];
+        add rax, r10;
+
+        mov r10, [rax + 8];              // primary_pid
+        cmp r10, 0;
+        je  ssd_ss_jobs_next;
+
+        mov r10, [rax + 0];
+        shr r10, 32;                     // r10 = session_id
+        cmp r10, rbx;
+        jne ssd_ss_jobs_next;
+
+        mov rdi, r12;
+        call _shell_jobs_destroy;
+        cmp rax, 0;
+        je  ssd_ss_jobs_ok;
+
+        mov rax, 0x2301;
+        or  r13, rax;
+        jmp ssd_ss_jobs_next;
+
+      ssd_ss_jobs_ok:
+        mov rdi, 6;                      // SSD_ST_JOBS_REAPED
+        call ssd_note;
+
+      ssd_ss_jobs_next:
+        add r12, 1;
+        jmp ssd_ss_jobs_scan;
+
+      ssd_ss_jobs_done:
+
+        // ======================================================================
+        // Steps 5-7: per-session scrub of root row.
+        // ======================================================================
+        mov rax, rbx;
+        shl rax, 7;
+        lea r10, [rip + _shell_session_pool];
+        add rax, r10;
+
+        xor r9, r9;
+        mov [rax + 24], r9;
+        mov [rax + 32], r9;
+
+        mov r11, [rax + 40];
+        shl r11, 32;
+        shr r11, 32;
+        mov [rax + 40], r11;
+
+        mov [rax + 120], r9;
+
+        mov rdi, 7;
+        call ssd_note;
+        mov rdi, 8;
+        call ssd_note;
+        mov rdi, 9;
+        call ssd_note;
+
+        // ======================================================================
+        // Step 8: destroy root session row.
+        // ======================================================================
+        mov rdi, rbx;
+        call _shell_session_destroy;
+        cmp rax, 0;
+        je  ssd_ss_destroy_ok;
+
+        mov rax, 0x2301;
+        or  r13, rax;
+        jmp ssd_ss_tail;
+
+      ssd_ss_destroy_ok:
+        mov rdi, 10;
+        call ssd_note;
+
+      ssd_ss_tail:
+        mov rdi, 1;                      // SSD_ST_SHUTDOWN_SUB_OK
+        call ssd_note;
+
+        // Fingerprint: SESSION_SHUTDOWN SUB OK sid=0x<hex>.
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ssd_tag_sub_ok];
+        lea rcx, [rip + ssd_k_sid];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        // Precedence: audit flush > partial > ok.
+        mov rax, r13;
+        mov r10, 0x2300;
+        and r10, rax;
+        cmp r10, 0;
+        je  ssd_ss_ret_partial;
+        mov rax, 0x2300;
+        jmp ssd_ss_out;
+
+      ssd_ss_ret_partial:
+        // rax = r13 (0 or 0x2301)
+        jmp ssd_ss_out;
+
+      ssd_ss_noop:
+        xor rax, rax;                    // SSD_OK (no live session for this id)
+
+      ssd_ss_out:
+        add rsp, 8;                      // undo alignment pad
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}

@@ -1,0 +1,1261 @@
+// src/kernel/core/svc/remote_record_wire.pdx -- Wave UMB-W22 R137.M4
+// paideia-os #2636
+//
+// SVC.REMOTE-SHELL: CROSS-HOST TYPED-RECORD WIRE
+// =============================================================================
+//
+// R137 ("cross-host pipeline transport") milestone M4.  M4 lands the
+// SESSION-KEY-ENCRYPTED FRAMER that carries typed records between two
+// peers over a svc.remote-shell connection established by M2 (hybrid-
+// KEM handshake, mlkem-only split) and discovered via M3's federation
+// registry.  Each record flows as a self-contained frame:
+//
+//   [u32 magic 'PDXR'][u32 record_len][u8 nonce[12]]
+//                              [u8 ciphertext[record_len]][u8 tag[16]]
+//
+// where ciphertext is ChaCha20-Poly1305 seal of the record under the
+// session key derived from the connection's ML-KEM shared secret and
+// a 12-byte nonce = (per-conn monotonic u64 counter LE || 0x00000000).
+//
+// SCOPE POSTURE: M4 lands the FRAMER + per-conn TX/RX frame slots.
+// The actual TCP wire I/O that moves bytes between the slot and the
+// network is DEFERRED to R137.M5 (which also lands fd_authorise_
+// handshake against the M3 federation registry and the KIND_FEDERATION
+// cap-invoke dispatch arm).  At M4 _rrw_send_record SEALS a record
+// into the per-conn TX slot (observable via _rrw_tx_frame_len), and
+// _rrw_recv_frame OPENS a frame the caller has staged into the per-
+// conn RX slot.  The split keeps the cryptographic surface auditable
+// without blocking on the TCP integration.
+//
+// Public API:
+//   _rrw_send_record(conn_id, record_ptr, record_len) -> errno
+//   _rrw_recv_frame (conn_id, out_ptr, out_cap) -> packed u64
+//   _rrw_tx_slot    (conn_id) -> u64  (per-conn TX frame slot pointer)
+//   _rrw_rx_slot    (conn_id) -> u64  (per-conn RX frame slot pointer)
+//   _rrw_tx_frame_len(conn_id) -> u64 (bytes staged by last send_record)
+//   _rrw_rx_stage   (conn_id, frame_len) -> errno  (test/transport helper
+//                                                   that stamps RX
+//                                                   frame_len)
+//
+// =============================================================================
+// SECTION 1  WHERE PER-CONN WIRE STATE LIVES
+// =============================================================================
+//
+// Three pieces of per-conn state back the framer:
+//
+//   (a) the ML-KEM shared secret, at row[+192..+224] (RSH_OFF_MLKEM_SS,
+//       stamped by M2's _rsh_accept_server or _rsh_init_client).  M4
+//       re-derives the 32-byte session key on every send/recv call by
+//       hashing the 25-byte context "paideia-rsh-v1-mlkem-only" plus
+//       the 32-byte mlkem_ss into a 32-byte BLAKE3 digest -- the SAME
+//       derivation M2's _rsh_derive_session_key does.  Both peers
+//       therefore produce identical session keys without needing a
+//       separate stash.  State-free derivation also means a session
+//       key never persists beyond the single call that uses it.
+//
+//   (b) the monotonic 64-bit nonce counter, at row[+224..+232] (first
+//       word of the row's post-mlkem_ss slack, the segment the row
+//       layout labelled "reserved (x25519_ss at M3-split)").  M4
+//       occupies this word for the counter; the hybrid landing that
+//       widens the handshake with X25519 will relocate x25519_ss to a
+//       dedicated side table (see design/shell/remote-record-wire.md
+//       §Forward-path).  .bss zero-init starts the counter at 0 for
+//       every row.  The counter advances only on a SUCCESSFUL seal;
+//       an aborted send does not consume nonce space.
+//
+//   (c) the per-conn TX/RX frame slots at module-owned side tables,
+//       one 2048-byte slot per connection in each direction, plus a
+//       u64 "frame_len" witness alongside each slot.
+//
+// Nonce discipline: the 12-byte AEAD nonce is `(counter as LE u64) ||
+// 0x00000000` -- 8 bytes of counter followed by 4 zero bytes.  Two
+// peers that agree on the counter sequence (0, 1, 2, ...) produce
+// disjoint nonces, so neither key-nonce reuse nor cross-direction
+// collisions are possible as long as a single connection does not
+// exceed 2^64 - 1 sealed records.  The counter saturates at
+// 0xFFFFFFFFFFFFFFFF; the NEXT send then returns RRW_ERR_NONCE_
+// EXHAUSTED.  At the current record ceiling (RRW_RECORD_MAX = 1024 B
+// per record) a connection would have to seal 2^64 records -- more
+// records than fit in a 2^74 B transport -- before saturating.  The
+// gate is purely defensive against a long-lived connection or a
+// pathological burst loop.
+//
+// =============================================================================
+// SECTION 2  FRAME FORMAT
+// =============================================================================
+//
+// Little-endian, byte-exact:
+//
+//   bytes [+0..+4]            magic   = 0x52584450 ('P','D','X','R' LE)
+//   bytes [+4..+8]            record_len (u32 LE; bounded by RRW_RECORD_MAX)
+//   bytes [+8..+20]           nonce (12 bytes = counter LE u64 || 0x00000000)
+//   bytes [+20..+20+record_len]  ciphertext (ChaCha20-Poly1305 seal)
+//   bytes [+20+record_len..+36+record_len]  tag (16 bytes)
+//
+// Total frame bytes: 36 + record_len.  Header-constant bytes: 36 (20
+// of header + 16 of tag).  record_len is the PLAINTEXT length (not
+// including the tag) -- it bounds BOTH the plaintext input to seal
+// and the plaintext output of open.
+//
+// Rationale for the layout:
+//
+//   * Magic FIRST so a partial read can decide "not my frame" without
+//     allocating any decryption state.
+//   * record_len BEFORE nonce so a transport can route or shard on
+//     payload size without touching the nonce space.
+//   * Nonce IN-BAND (not AAD) so an attacker who merely replays a
+//     frame produces an authentication failure at the OPEN step
+//     (ChaCha20-Poly1305 binds the nonce into the tag).
+//   * NO AAD.  M4 keeps the AAD field zero because the sealed set of
+//     bytes already covers everything a replay or substitution could
+//     affect: record_len is pinned by the open-length argument and
+//     the magic is a public constant.  M5 may extend to a
+//     (fed_id, conn_id) AAD once the KIND_FEDERATION cap-invoke arm
+//     wires it in.
+//
+// =============================================================================
+// SECTION 3  STATE CHECK
+// =============================================================================
+//
+// Both send and recv require the row to be in RS_STATE_ESTABLISHED
+// (state ordinal 2) and the row's in_use byte to be 1.  A row in
+// INIT / HANDSHAKE has no derivable session key (mlkem_ss has not
+// been stamped yet or has been stamped incompletely); a row in
+// CLOSING / CLOSED has either had its session key notionally
+// retired or is awaiting a free().  CLOSING-direction asymmetry
+// (one side can still send FIN-equivalent records while the other
+// cannot) is a R137.M5-plus concern and does not land here.
+//
+// The ESTABLISHED gate is enforced via a LOCAL helper rrw_check_
+// established() rather than a cross-module helper -- the sibling
+// rsh_check_state in remote_shell_handshake.pdx is the right shape
+// but we duplicate the two instructions here to keep the module
+// stand-alone and the elaborator free of cross-module helper
+// resolution.
+//
+// =============================================================================
+// SECTION 4  RETURN CODE BAND
+// =============================================================================
+//
+//   RRW_OK                 = 0           (success)
+//   RRW_ERR_BAD_CONN       = 0x1D01      (REUSE of RS_ERR_BAD_ID /
+//                                         RSH_ERR_BAD_CONN)
+//   RRW_ERR_NOT_ESTABLISHED= 0x1D20      (row not in RS_STATE_ESTABLISHED)
+//   RRW_ERR_FRAME_MALFORMED= 0x1D21      (frame magic/len mismatch, or
+//                                         caller record_len out of range,
+//                                         or RX staged frame_len < 36)
+//   RRW_ERR_AEAD_FAIL      = 0x1D22      (seal or open returned nonzero;
+//                                         for open this includes tag
+//                                         mismatch)
+//   RRW_ERR_NONCE_EXHAUSTED= 0x1D23      (counter == 0xFFFF...FFFF)
+//
+// All fit imm32 with bit 31 clear so `mov rax, imm32` emits the
+// 7-byte zero-extending form (never `and r11, imm64`).  Band
+// `0x1D20..0x1D2F` reserved for R137.M4+ wire-side codes.
+//
+// _rrw_recv_frame returns a PACKED u64:
+//   bits [63..32] = bytes_decrypted (count u32)
+//   bits [31.. 0] = status
+//
+// On error bytes_decrypted is 0; on success it is the record_len
+// written to out_ptr (equal to the frame's u32 record_len field).
+// _rrw_send_record returns a plain errno (not packed).
+//
+// =============================================================================
+// SECTION 5  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Labels prefixed `rrw_` (remote-record-wire; distinct from `rsh_` --
+// handshake, `rs_` -- daemon, `fd_` -- federation).  No reserved
+// paideia-as keyword overlap (reserved: loop / if / let).  Encoder-
+// pitfall posture (feedback_pdx_encoder_pitfalls):
+//
+//   * cmp rN, 0            (never `test rN, rN`)
+//   * shl rN, 8            (row stride 256; never `imul r, imm`)
+//   * shl rN, 11           (TX/RX slot stride 2048; never `imul r, imm`)
+//   * mov rax, imm32       (never `and r11, imm64` with bit-31-set imm)
+//   * shl rax, 32          (packed-return hi half; imm8 operand)
+//   * single-line `pub let name = "..."`
+//   * module basename RemoteRecordWire matches file basename
+//     remote_record_wire.pdx (ddc requires exact match)
+//   * fingerprint `[u8; N]` with N = string length + 1 (NUL counts)
+//
+// Stack discipline (SysV, entry rsp%16==8):
+//   rrw_row_base              0 pushes (pure leaf address compute)
+//   rrw_tx_slot_base          0 pushes (pure leaf)
+//   rrw_rx_slot_base          0 pushes (pure leaf)
+//   rrw_check_conn            0 pushes (pure leaf scan)
+//   rrw_check_established     0 pushes (pure leaf, 1 cmp)
+//   rrw_derive_sk             0 pushes + sub rsp, 8 (one nested call
+//                                                     to BLAKE3 FFI)
+//   _rrw_send_record          4 pushes + sub rsp, 8
+//   _rrw_recv_frame           4 pushes + sub rsp, 8
+//   _rrw_tx_frame_len         0 pushes (pure leaf memory read)
+//   _rrw_rx_stage             1 push (rbx = conn_id)
+//
+// =============================================================================
+
+module RemoteRecordWire = structure {
+
+  // ==========================================================================
+  // Return band (§4)
+  // ==========================================================================
+
+  pub let RRW_OK                  : u64 = 0
+  pub let RRW_ERR_BAD_CONN        : u64 = 0x1D01   // alias of RS_ERR_BAD_ID
+  pub let RRW_ERR_NOT_ESTABLISHED : u64 = 0x1D20
+  pub let RRW_ERR_FRAME_MALFORMED : u64 = 0x1D21
+  pub let RRW_ERR_AEAD_FAIL       : u64 = 0x1D22
+  pub let RRW_ERR_NONCE_EXHAUSTED : u64 = 0x1D23
+
+  // ==========================================================================
+  // Row geometry mirrors (§1) -- MUST agree with remote_shell.pdx /
+  // remote_shell_handshake.pdx.
+  // ==========================================================================
+
+  pub let RRW_POOL_MAX   : u64 = 4
+  pub let RRW_ROW_BYTES  : u64 = 256
+
+  // Row-field offsets, mirrored from remote_shell.pdx.
+  pub let RRW_OFF_SF       : u64 = 8     // packed state | flags
+  pub let RRW_OFF_IN_USE   : u64 = 120
+  pub let RRW_OFF_MLKEM_SS : u64 = 192   // [192..224] mlkem shared secret
+  pub let RRW_OFF_NONCE_CT : u64 = 224   // [224..232] u64 nonce counter
+
+  // State machine (mirrored).
+  pub let RRW_STATE_ESTABLISHED : u64 = 2
+
+  // ==========================================================================
+  // Frame geometry (§2)
+  // ==========================================================================
+
+  // 'PDXR' little-endian: 'P'=0x50, 'D'=0x44, 'X'=0x58, 'R'=0x52 ->
+  // bytes 0x50,0x44,0x58,0x52 as LE u32 = 0x52584450.
+  pub let RRW_MAGIC_LE : u64 = 0x52584450
+
+  pub let RRW_HEADER_LEN : u64 = 20       // magic(4) + record_len(4) + nonce(12)
+  pub let RRW_TAG_LEN    : u64 = 16       // Poly1305 tag
+  pub let RRW_OVERHEAD   : u64 = 36       // header + tag
+
+  // Record ceiling.  Keeps the TX/RX slot at 2 KiB.
+  //   max frame = RRW_OVERHEAD + RRW_RECORD_MAX = 36 + 1024 = 1060 B.
+  //   2048 B per slot gives us ~1 KiB of slack for M5 header extensions.
+  pub let RRW_RECORD_MAX : u64 = 1024
+
+  // Per-conn TX/RX slot stride (power-of-two for `shl rax, 11`).
+  pub let RRW_SLOT_STRIDE : u64 = 2048
+
+  // 12-byte AEAD nonce (ChaCha20-Poly1305 reads exactly 12 bytes).
+  pub let RRW_NONCE_LEN : u64 = 12
+
+  // 32-byte ChaCha20-Poly1305 key (and 32-byte BLAKE3 digest).
+  pub let RRW_SK_LEN : u64 = 32
+
+  // ML-KEM shared secret length (mirrors handshake constant).
+  pub let RRW_MLKEM_SS_LEN : u64 = 32
+
+  // BLAKE3 input: 25-byte context || 32-byte mlkem_ss = 57 bytes.
+  pub let RRW_DERIVE_INPUT_LEN : u64 = 57
+  pub let RRW_KDF_CTX_LEN      : u64 = 25
+
+  // ==========================================================================
+  // Storage
+  //
+  //   _rrw_tx_frames      -- 4 x 2048 B.  Per-conn TX frame slot.  Written
+  //                           by _rrw_send_record; picked up by the future
+  //                           M5 TCP transport.
+  //   _rrw_tx_frame_lens  -- 4 x u64.  Byte length staged by the most
+  //                           recent _rrw_send_record.  0 means "no frame
+  //                           ready".  M5 transport zeroes after
+  //                           transmission.
+  //   _rrw_rx_frames      -- 4 x 2048 B.  Per-conn RX frame slot.  The
+  //                           future M5 transport (or an M4 test harness
+  //                           via _rrw_rx_stage) deposits one received
+  //                           frame here; _rrw_recv_frame consumes it.
+  //   _rrw_rx_frame_lens  -- 4 x u64.  Byte length of the staged RX
+  //                           frame.  _rrw_recv_frame reads this and
+  //                           zeros it on consume.
+  //   _rrw_stats          -- 16 u64 counters (observability).
+  //
+  // Scratches:
+  //   _rrw_sk_scratch     -- 32 B derived session key (clobbered every
+  //                           send/recv; never read outside the
+  //                           immediate AEAD call).
+  //   _rrw_nonce_scratch  -- 16 B (12 B nonce + 4 B pad).  AEAD reads
+  //                           only the first 12 bytes.
+  //   _rrw_aead_scratch   -- 32 B AeadParamsC {key_ptr, nonce_ptr,
+  //                           aad_ptr, aad_len}.
+  //   _rrw_derive_input   -- 64 B BLAKE3 input (25 ctx + 32 mlkem_ss).
+  //   _rrw_derive_output  -- 32 B BLAKE3 digest buffer.
+  //   _rrw_written        -- u64 AEAD "written" out-slot (unused value;
+  //                           the length is fixed by contract).
+  //
+  // .bss zero-init gives us all-zero at boot: no TX frame ready, no
+  // RX frame staged, counters all zero.
+  //
+  // The context string matches remote_shell_handshake.pdx's
+  // rsh_kdf_ctx byte-for-byte so a session key derived here equals
+  // the one `_rsh_derive_session_key` writes to its caller.  A local
+  // copy avoids cross-module .rodata reference fragility; .rodata
+  // deduplication is a linker concern, not ours.
+  // ==========================================================================
+
+  pub let mut _rrw_tx_frames     : [u8; 8192] = uninit @align(64)
+  pub let mut _rrw_tx_frame_lens : [u64; 4]   = uninit @align(32)
+  pub let mut _rrw_rx_frames     : [u8; 8192] = uninit @align(64)
+  pub let mut _rrw_rx_frame_lens : [u64; 4]   = uninit @align(32)
+  pub let mut _rrw_stats         : [u64; 16]  = uninit @align(64)
+
+  pub let mut _rrw_sk_scratch    : [u8; 32]  = uninit @align(8)
+  pub let mut _rrw_nonce_scratch : [u8; 16]  = uninit @align(8)
+  pub let mut _rrw_aead_scratch  : [u8; 32]  = uninit @align(8)
+  pub let mut _rrw_derive_input  : [u8; 64]  = uninit @align(8)
+  pub let mut _rrw_derive_output : [u8; 32]  = uninit @align(8)
+  pub let mut _rrw_written       : u64       = uninit @align(8)
+
+  pub let rrw_kdf_ctx : [u8; 26] = "paideia-rsh-v1-mlkem-only\0"
+
+  // ==========================================================================
+  // Stats slots
+  // ==========================================================================
+
+  pub let RRW_ST_SEND_OK          : u64 = 0
+  pub let RRW_ST_SEND_REJ         : u64 = 1
+  pub let RRW_ST_RECV_OK          : u64 = 2
+  pub let RRW_ST_RECV_REJ         : u64 = 3
+
+  // ==========================================================================
+  // Fingerprint tags (N = len(string) + 1, NUL-inclusive)
+  //
+  // Only the "OK" tags are extracted by the fingerprint-coverage gate.
+  //
+  // "RRW SEND OK"   = 11 chars, +1 NUL => N=12
+  // "RRW SEND REJ"  = 12 chars, +1 NUL => N=13
+  // "RRW RECV OK"   = 11 chars, +1 NUL => N=12
+  // "RRW RECV REJ"  = 12 chars, +1 NUL => N=13
+  // ==========================================================================
+
+  pub let rrw_tag_send_ok  : [u8; 12] = "RRW SEND OK\0"
+  pub let rrw_tag_send_rej : [u8; 13] = "RRW SEND REJ\0"
+  pub let rrw_tag_recv_ok  : [u8; 12] = "RRW RECV OK\0"
+  pub let rrw_tag_recv_rej : [u8; 13] = "RRW RECV REJ\0"
+
+  pub let rrw_k_cid    : [u8; 4] = "cid\0"
+  pub let rrw_k_errno  : [u8; 6] = "errno\0"
+  pub let rrw_k_len    : [u8; 4] = "len\0"
+
+  // ==========================================================================
+  // rrw_note(slot) -> ()
+  //
+  // Bounded increment on _rrw_stats[slot].  Load-inc-store, no
+  // `add reg, [mem]`.  Pure leaf -- no pushes.  Labels prefixed rrw_no_.
+  // ==========================================================================
+  pub let rrw_note : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M4 (paideia-os #2636): bounded increment on _rrw_stats[slot<16]. Load-inc-store (no `add reg,[mem]`). Pure leaf. Labels prefixed rrw_no_. Mirrors rsh_note / rs_note shape.",
+      block: {
+        cmp rdi, 16;
+        jae rrw_no_out;
+        lea r10, [rip + _rrw_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      rrw_no_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rrw_row_base(conn_id) -> &_remote_shell_pool[conn_id*256]
+  //
+  // Row-base compute.  Stride 256 = 2^8 so `shl rax, 8` suffices.
+  // Caller validates conn_id first.  Pure leaf.  Labels prefixed rrw_rb_.
+  // ==========================================================================
+  pub let rrw_row_base : (u64) -> u64 !{} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R137.M4 (paideia-os #2636): conn_id -> &_remote_shell_pool[conn_id*256]. Mirrors rsh_row_base / rs_row_base. Pure leaf. Labels prefixed rrw_rb_. The _remote_shell_pool symbol resolves at link time against remote_shell.pdx.",
+      block: {
+        mov rax, rdi;                    // conn_id
+        shl rax, 8;                      // conn_id * 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rrw_tx_slot_base(conn_id) -> &_rrw_tx_frames[conn_id*2048]
+  //
+  // Per-conn TX slot pointer.  Stride 2048 = 2^11.  Pure leaf.
+  // Labels prefixed rrw_tb_.
+  // ==========================================================================
+  pub let rrw_tx_slot_base : (u64) -> u64 !{} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R137.M4 (paideia-os #2636): conn_id -> &_rrw_tx_frames[conn_id*2048]. Power-of-two stride uses `shl rax, 11`. Caller validates conn_id. Pure leaf. Labels prefixed rrw_tb_.",
+      block: {
+        mov rax, rdi;                    // conn_id
+        shl rax, 11;                     // conn_id * 2048
+        lea r10, [rip + _rrw_tx_frames];
+        add rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rrw_rx_slot_base(conn_id) -> &_rrw_rx_frames[conn_id*2048]
+  //
+  // Per-conn RX slot pointer.  Pure leaf.  Labels prefixed rrw_rsb_.
+  // ==========================================================================
+  pub let rrw_rx_slot_base : (u64) -> u64 !{} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R137.M4 (paideia-os #2636): conn_id -> &_rrw_rx_frames[conn_id*2048]. Power-of-two stride uses `shl rax, 11`. Caller validates conn_id. Pure leaf. Labels prefixed rrw_rsb_.",
+      block: {
+        mov rax, rdi;                    // conn_id
+        shl rax, 11;                     // conn_id * 2048
+        lea r10, [rip + _rrw_rx_frames];
+        add rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rrw_check_conn(conn_id) -> 1 iff conn_id<RRW_POOL_MAX AND
+  //                               row.in_use (word at [+120]) != 0
+  //
+  // Pure leaf.  Labels prefixed rrw_cc_.  Mirror of rsh_check_conn.
+  // ==========================================================================
+  pub let rrw_check_conn : (u64) -> u64 !{mem} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M4 (paideia-os #2636): 1 iff conn_id<RRW_POOL_MAX(4) AND row.in_use (word at [+120]) != 0. Pure leaf. Labels prefixed rrw_cc_. Mirror of rsh_check_conn.",
+      block: {
+        mov r10, 4;                      // RRW_POOL_MAX
+        cmp rdi, r10;
+        jae rrw_cc_no;
+        mov rax, rdi;
+        shl rax, 8;                      // conn_id * 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;                    // row base
+        mov r10, [rax + 120];            // in_use
+        cmp r10, 0;
+        je  rrw_cc_no;
+        mov rax, 1;
+        ret;
+      rrw_cc_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rrw_check_established(conn_id) -> 1 iff conn_id valid AND
+  //                                      (row.sf & 0xFFFFFFFF) ==
+  //                                      RRW_STATE_ESTABLISHED
+  //
+  // Reads sf at [row+8] and compares the low 32 bits to 2.  Does NOT
+  // call rrw_check_conn -- caller validates conn_id first.  Pure
+  // leaf -- no pushes, no nested calls.  Labels prefixed rrw_ce_.
+  //
+  // The 32-bit mask uses `shl rax, 32; shr rax, 32` rather than
+  // `and rax, 0xFFFFFFFF` -- the shift-trick avoids any imm encoding.
+  // ==========================================================================
+  pub let rrw_check_established : (u64) -> u64 !{mem} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M4 (paideia-os #2636): read [row+8] (sf = state|flags), mask low 32 bits via shl/shr-32 trick, compare to RRW_STATE_ESTABLISHED (= 2). Pure leaf. Labels prefixed rrw_ce_. Caller validates conn_id<RRW_POOL_MAX separately.",
+      block: {
+        mov rax, rdi;
+        shl rax, 8;                      // conn_id * 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;                    // row base
+        mov rax, [rax + 8];              // sf
+        shl rax, 32;                     // zero high 32 (shift up)
+        shr rax, 32;                     // zero high 32 (shift back down)
+        cmp rax, 2;                      // RRW_STATE_ESTABLISHED
+        jne rrw_ce_no;
+        mov rax, 1;
+        ret;
+      rrw_ce_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _rrw_tx_slot(conn_id) -> u64 (pointer | 0)
+  //
+  // Public accessor for the per-conn TX frame slot.  Returns 0 if
+  // conn_id is out of range (the caller is expected to be the M5+
+  // transport layer, which should never pass an out-of-range id).
+  // Pure leaf.  Labels prefixed rrw_tsa_.
+  // ==========================================================================
+  pub let _rrw_tx_slot : (u64) -> u64 !{} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R137.M4 (paideia-os #2636): public accessor returning &_rrw_tx_frames[conn_id*2048] or 0 on out-of-range. Pure leaf. Labels prefixed rrw_tsa_.",
+      block: {
+        mov r10, 4;                      // RRW_POOL_MAX
+        cmp rdi, r10;
+        jae rrw_tsa_bad;
+        mov rax, rdi;
+        shl rax, 11;                     // conn_id * 2048
+        lea r10, [rip + _rrw_tx_frames];
+        add rax, r10;
+        ret;
+      rrw_tsa_bad:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _rrw_rx_slot(conn_id) -> u64 (pointer | 0)
+  //
+  // Public accessor for the per-conn RX frame slot.  Mirror of
+  // _rrw_tx_slot.  Labels prefixed rrw_rsa_.
+  // ==========================================================================
+  pub let _rrw_rx_slot : (u64) -> u64 !{} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R137.M4 (paideia-os #2636): public accessor returning &_rrw_rx_frames[conn_id*2048] or 0 on out-of-range. Pure leaf. Labels prefixed rrw_rsa_.",
+      block: {
+        mov r10, 4;                      // RRW_POOL_MAX
+        cmp rdi, r10;
+        jae rrw_rsa_bad;
+        mov rax, rdi;
+        shl rax, 11;                     // conn_id * 2048
+        lea r10, [rip + _rrw_rx_frames];
+        add rax, r10;
+        ret;
+      rrw_rsa_bad:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _rrw_tx_frame_len(conn_id) -> u64
+  //
+  // Returns the byte length of the most recently sealed TX frame for
+  // conn_id, or 0 if nothing is staged (or conn_id out of range).  Pure
+  // leaf.  Labels prefixed rrw_tfl_.
+  // ==========================================================================
+  pub let _rrw_tx_frame_len : (u64) -> u64 !{mem} @{} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M4 (paideia-os #2636): return _rrw_tx_frame_lens[conn_id] or 0 on OOB. Pure leaf. Labels prefixed rrw_tfl_.",
+      block: {
+        mov r10, 4;
+        cmp rdi, r10;
+        jae rrw_tfl_bad;
+        lea r10, [rip + _rrw_tx_frame_lens];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      rrw_tfl_bad:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _rrw_rx_stage(conn_id, frame_len) -> errno
+  //
+  // Stage an incoming frame length for conn_id.  Used by the M5+
+  // transport layer (and by the M4 witness/test harness) to signal
+  // that _rrw_rx_frames[conn_id*2048..+frame_len] now holds a wire
+  // frame ready for _rrw_recv_frame to consume.
+  //
+  // Validation:
+  //   conn_id < RRW_POOL_MAX AND frame_len <= RRW_SLOT_STRIDE AND
+  //   frame_len >= RRW_OVERHEAD (36) else RRW_ERR_FRAME_MALFORMED;
+  //   conn_id out of range alone -> RRW_ERR_BAD_CONN.
+  //
+  // One callee-save push (rbx = conn_id) to park across the (future)
+  // nested rrw_note call; the current body makes none, so the push
+  // keeps the shape consistent with the OK/REJ paths.  Labels
+  // prefixed rrw_rs_.
+  // ==========================================================================
+  pub let _rrw_rx_stage : (u64, u64) -> u64 !{mem} @{} =
+    fn (conn_id: u64) (frame_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R137.M4 (paideia-os #2636): stage an incoming frame length. Validates conn_id<4 (RRW_ERR_BAD_CONN), 36<=frame_len<=2048 (RRW_ERR_FRAME_MALFORMED), writes _rrw_rx_frame_lens[conn_id]=frame_len. Transport (or test harness) deposits the frame bytes into _rrw_rx_frames[conn_id*2048..+frame_len] BEFORE calling this stamp. One callee-save push (rbx = conn_id). Pure leaf w.r.t. the current body; the push keeps the shape stable for future note/klog calls. Labels prefixed rrw_rs_.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                    // conn_id
+
+        // ---- conn_id in range ----
+        mov r10, 4;
+        cmp rbx, r10;
+        jae rrw_rs_bad_conn;
+
+        // ---- frame_len bounds ----
+        mov r10, 36;                     // RRW_OVERHEAD
+        cmp rsi, r10;
+        jb  rrw_rs_malformed;
+        mov r10, 2048;                   // RRW_SLOT_STRIDE
+        cmp rsi, r10;
+        ja  rrw_rs_malformed;
+
+        // ---- stamp ----
+        lea r10, [rip + _rrw_rx_frame_lens];
+        mov [r10 + rbx * 8], rsi;
+
+        xor rax, rax;                    // RRW_OK
+        jmp rrw_rs_out;
+
+      rrw_rs_bad_conn:
+        mov rax, 0x1D01;                 // RRW_ERR_BAD_CONN
+        jmp rrw_rs_out;
+
+      rrw_rs_malformed:
+        mov rax, 0x1D21;                 // RRW_ERR_FRAME_MALFORMED
+
+      rrw_rs_out:
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // rrw_derive_sk(conn_id) -> errno
+  //
+  // Compute the 32-byte session key for conn_id into _rrw_sk_scratch
+  // by hashing the 25-byte context "paideia-rsh-v1-mlkem-only" ||
+  // the 32-byte mlkem_ss (at row[+192..+224]) with BLAKE3.  State-
+  // free: does NOT consult or transition the row's state field, and
+  // reruns the derivation on every call.
+  //
+  // Returns RRW_OK on success, RRW_ERR_AEAD_FAIL if the BLAKE3 FFI
+  // returns nonzero (defensive -- cannot happen with non-null
+  // pointers and nonzero len per paideia-as blake3.rs docs).
+  //
+  // STEP-BY-STEP:
+  //   (1) Copy 25 B of rrw_kdf_ctx into _rrw_derive_input[0..25].
+  //       25 = 3 u64 (24B) + 1 byte.
+  //   (2) Copy 32 B of mlkem_ss (row[+192..+224]) into
+  //       _rrw_derive_input[25..57].  Dst is not 8-byte aligned
+  //       (offset 25) so we use 4 unaligned qword stores; x86_64
+  //       permits unaligned qword stores.
+  //   (3) call paideia_crypto_blake3_hash(input, 57, output).
+  //   (4) Copy 32 B of output into _rrw_sk_scratch via 4 qword moves.
+  //
+  // No callee-save pushes; sub rsp, 8 pad for the one nested FFI call
+  // (entry rsp%16==8; +8 pad = rsp%16==0 at the call).  Labels
+  // prefixed rrw_dk_.
+  // ==========================================================================
+  pub let rrw_derive_sk : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (conn_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R137.M4 (paideia-os #2636): compute 32-byte session key into _rrw_sk_scratch via BLAKE3(ctx || mlkem_ss) where ctx = \"paideia-rsh-v1-mlkem-only\" (25B) and mlkem_ss is at row[+192..+224] (RRW_OFF_MLKEM_SS). Same derivation as _rsh_derive_session_key so client and server converge on the same key independently. State-free (no state read/transition). No callee-save pushes; sub rsp,8 pad for the one nested paideia_crypto_blake3_hash call (entry rsp%16==8; +8 = rsp%16==0 at the call). Context-string copy unrolled as 3 u64 (24B) + 1 byte. mlkem_ss copy as 4 unaligned qword stores to _rrw_derive_input[25..57] (x86_64 permits unaligned qword stores). Output copy to _rrw_sk_scratch as 4 qword moves. Labels prefixed rrw_dk_.",
+      block: {
+        sub rsp, 8;
+
+        // (1) Copy 25 B of context string.
+        lea r10, [rip + rrw_kdf_ctx];
+        lea r11, [rip + _rrw_derive_input];
+
+        mov rax, [r10 + 0];
+        mov [r11 + 0], rax;
+        mov rax, [r10 + 8];
+        mov [r11 + 8], rax;
+        mov rax, [r10 + 16];
+        mov [r11 + 16], rax;
+        // Byte 24 via mov_b.
+        xor rax, rax;
+        mov_b rax, [r10 + 24];
+        mov_b [r11 + 24], rax;
+
+        // (2) Copy 32 B of mlkem_ss (row+192) into derive_input[25..57].
+        mov rax, rdi;                    // conn_id
+        shl rax, 8;                      // conn_id * 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;                    // row base
+        add rax, 192;                    // &row[+RRW_OFF_MLKEM_SS]
+        mov r10, rax;                    // r10 = mlkem_ss source
+        lea r11, [rip + _rrw_derive_input];
+        add r11, 25;                     // r11 = &_rrw_derive_input[25]
+
+        mov rax, [r10 + 0];
+        mov [r11 + 0], rax;
+        mov rax, [r10 + 8];
+        mov [r11 + 8], rax;
+        mov rax, [r10 + 16];
+        mov [r11 + 16], rax;
+        mov rax, [r10 + 24];
+        mov [r11 + 24], rax;
+
+        // (3) paideia_crypto_blake3_hash(input, 57, output).
+        lea rdi, [rip + _rrw_derive_input];
+        mov rsi, 57;                     // RRW_DERIVE_INPUT_LEN
+        lea rdx, [rip + _rrw_derive_output];
+        call paideia_crypto_blake3_hash;
+        cmp rax, 0;
+        jne rrw_dk_fail;
+
+        // (4) Copy 32 B output into _rrw_sk_scratch via 4 qwords.
+        lea r10, [rip + _rrw_derive_output];
+        lea r11, [rip + _rrw_sk_scratch];
+        mov rax, [r10 + 0];
+        mov [r11 + 0], rax;
+        mov rax, [r10 + 8];
+        mov [r11 + 8], rax;
+        mov rax, [r10 + 16];
+        mov [r11 + 16], rax;
+        mov rax, [r10 + 24];
+        mov [r11 + 24], rax;
+
+        xor rax, rax;                    // RRW_OK
+        jmp rrw_dk_out;
+
+      rrw_dk_fail:
+        mov rax, 0x1D22;                 // RRW_ERR_AEAD_FAIL
+
+      rrw_dk_out:
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _rrw_send_record(conn_id, record_ptr, record_len) -> errno
+  //
+  // Seal a typed record into the per-conn TX frame slot.
+  //
+  // ARGS (SysV):
+  //   rdi = conn_id          (u64 in [0, 4))
+  //   rsi = record_ptr       (readable record_len bytes of plaintext)
+  //   rdx = record_len       (<= RRW_RECORD_MAX = 1024)
+  //
+  // RETURNS (rax):
+  //   RRW_OK                 -- frame sealed; _rrw_tx_frame_lens[conn_id]
+  //                             updated to the total frame byte count.
+  //   RRW_ERR_BAD_CONN       -- conn_id out of range or row not in_use.
+  //   RRW_ERR_NOT_ESTABLISHED-- row state != RRW_STATE_ESTABLISHED.
+  //   RRW_ERR_FRAME_MALFORMED-- record_len > RRW_RECORD_MAX.
+  //   RRW_ERR_NONCE_EXHAUSTED-- counter == 0xFFFF...FFFF before bump.
+  //   RRW_ERR_AEAD_FAIL      -- seal returned nonzero OR BLAKE3 derive
+  //                             returned nonzero.
+  //
+  // STEP-BY-STEP:
+  //   (1) rrw_check_conn(conn_id) -> else BAD_CONN.
+  //   (2) rrw_check_established(conn_id) -> else NOT_ESTABLISHED.
+  //   (3) record_len <= RRW_RECORD_MAX -> else FRAME_MALFORMED.
+  //   (4) Read nonce counter at row[+224..+232].  If 0xFFFF...FFFF
+  //       -> NONCE_EXHAUSTED.  Hold counter value in r11.
+  //   (5) Derive session key into _rrw_sk_scratch via rrw_derive_sk.
+  //       Nonzero -> AEAD_FAIL.
+  //   (6) Build nonce in _rrw_nonce_scratch: [+0..+8] = counter LE,
+  //       [+8..+12] = 0x00000000.
+  //   (7) Write frame header to TX slot:
+  //         [+0..+4]  = magic 0x52584450
+  //         [+4..+8]  = record_len (u32 LE)
+  //         [+8..+20] = nonce (12 bytes = counter_le8 || 0x0..3=0)
+  //   (8) Build AeadParamsC in _rrw_aead_scratch:
+  //         [+0]  key_ptr   = &_rrw_sk_scratch
+  //         [+8]  nonce_ptr = &_rrw_nonce_scratch
+  //         [+16] aad_ptr   = 0
+  //         [+24] aad_len   = 0
+  //   (9) call paideia_crypto_chacha20_poly1305_seal(&params,
+  //       record_ptr, record_len, &tx_slot[+20], record_len+16,
+  //       &_rrw_written).  Nonzero -> AEAD_FAIL.
+  //  (10) Advance counter: row[+224..+232] = counter + 1.
+  //  (11) Stamp _rrw_tx_frame_lens[conn_id] = RRW_OVERHEAD + record_len.
+  //  (12) Emit `RRW SEND OK cid=0x<hex>`; return RRW_OK.
+  //
+  // STACK FRAME:
+  //   4 callee-save pushes (rbx = conn_id, r12 = record_ptr,
+  //                          r13 = record_len, r14 = counter_le8) +
+  //   sub rsp, 8.  Entry %16==8; +32 = %16==8; +8 = %16==0 at every
+  //   nested call.
+  //
+  // Labels prefixed rrw_sd_.
+  // ==========================================================================
+  pub let _rrw_send_record : (u64, u64, u64) -> u64 !{crypto, mem, sysreg} @{paideia.crypto, cap} =
+    fn (conn_id: u64) (record_ptr: u64) (record_len: u64) -> unsafe {
+      effects: {crypto, mem, sysreg}, capabilities: {paideia.crypto, cap},
+      justification: "R137.M4 (paideia-os #2636): seal a record under the connection's session key into the per-conn TX frame slot. Validate conn_id (RRW_ERR_BAD_CONN), state=ESTABLISHED (RRW_ERR_NOT_ESTABLISHED), record_len<=1024 (RRW_ERR_FRAME_MALFORMED), nonce counter not exhausted (RRW_ERR_NONCE_EXHAUSTED). Derive 32-byte session key via rrw_derive_sk (inline BLAKE3 over mlkem_ss at row+192). Build 12-byte nonce = counter_le8 || 0x00000000. Write frame header (magic 0x52584450, record_len u32 LE, nonce 12B) to _rrw_tx_frames[conn_id*2048..]. Build AeadParamsC {key=&sk, nonce=&nonce, aad=0, aad_len=0}; call paideia_crypto_chacha20_poly1305_seal(params, record_ptr, record_len, &tx_slot[+20], record_len+16, &written); nonzero -> RRW_ERR_AEAD_FAIL. On success, advance row[+224..+232] counter by 1 and stamp _rrw_tx_frame_lens[conn_id] = 36 + record_len. Bump stats + emit `RRW SEND OK cid=0x<hex>`. Four callee-save pushes (rbx=conn_id, r12=record_ptr, r13=record_len, r14=counter_le8) + sub rsp,8 pad. Entry rsp%16==8; +4 pushes = +32 -> %16==8; sub rsp,8 = +40 -> %16==0 at every nested call (rrw_check_conn, rrw_check_established, rrw_derive_sk, paideia_crypto_chacha20_poly1305_seal, rrw_note, klog_s1_x1). Nonce counter advance is a load-inc-store (never `add reg,[mem]`). Encoder-pitfall posture: cmp rN,0 (never test), shl rN,8 (row stride), shl rN,11 (TX slot stride), mov rax, imm32 for all error codes, no 2-op imul. The ChaCha20-Poly1305 FFI thunk is reached by direct call (PLT32 relocation; the kernel link line already carries libpaideia_satellite_runtime.a per sys_dek_apply_body.pdx L388 precedent). Labels prefixed rrw_sd_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // conn_id
+        mov r12, rsi;                    // record_ptr
+        mov r13, rdx;                    // record_len
+
+        // (1) Validate conn_id.
+        mov rdi, rbx;
+        call rrw_check_conn;
+        cmp rax, 0;
+        je  rrw_sd_bad_conn;
+
+        // (2) Validate state == ESTABLISHED.
+        mov rdi, rbx;
+        call rrw_check_established;
+        cmp rax, 0;
+        je  rrw_sd_not_estab;
+
+        // (3) Validate record_len <= RRW_RECORD_MAX.
+        mov r10, 1024;                   // RRW_RECORD_MAX
+        cmp r13, r10;
+        ja  rrw_sd_malformed;
+
+        // (4) Read nonce counter.
+        mov rax, rbx;
+        shl rax, 8;                      // conn_id * 256
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;                    // row base
+        mov r14, [rax + 224];            // counter
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp r14, r11;
+        je  rrw_sd_nonce_exhaust;
+
+        // (5) Derive session key.
+        mov rdi, rbx;
+        call rrw_derive_sk;
+        cmp rax, 0;
+        jne rrw_sd_aead_fail;
+
+        // (6) Build 12-byte nonce in _rrw_nonce_scratch.
+        lea r10, [rip + _rrw_nonce_scratch];
+        mov [r10 + 0], r14;              // counter LE u64
+        xor rax, rax;
+        mov_d [r10 + 8], rax;            // 4 zero bytes
+
+        // (7) Write frame header to TX slot.
+        //    tx_slot = &_rrw_tx_frames[conn_id * 2048].
+        mov rax, rbx;
+        shl rax, 11;                     // conn_id * 2048
+        lea r10, [rip + _rrw_tx_frames];
+        add rax, r10;                    // rax = tx_slot
+        mov r10, rax;                    // park tx_slot in r10
+
+        mov r11, 0x52584450;             // RRW_MAGIC_LE
+        mov_d [r10 + 0], r11;            // magic
+        mov_d [r10 + 4], r13;            // record_len (low 32 bits only; <=1024)
+        mov [r10 + 8], r14;              // nonce[0..8] = counter LE
+        xor rax, rax;
+        mov_d [r10 + 16], rax;           // nonce[8..12] = 0x00000000
+
+        // (8) Build AeadParamsC in _rrw_aead_scratch.
+        lea r10, [rip + _rrw_aead_scratch];
+        lea r11, [rip + _rrw_sk_scratch];
+        mov [r10 + 0], r11;              // key_ptr
+        lea r11, [rip + _rrw_nonce_scratch];
+        mov [r10 + 8], r11;              // nonce_ptr
+        xor rax, rax;
+        mov [r10 + 16], rax;             // aad_ptr = 0
+        mov [r10 + 24], rax;             // aad_len = 0
+
+        // (9) paideia_crypto_chacha20_poly1305_seal(params, pt, pt_len,
+        //                                           out, out_cap, written).
+        // out = &tx_slot[+20]; out_cap = record_len + 16.
+        lea rdi, [rip + _rrw_aead_scratch];       // params
+        mov rsi, r12;                             // record_ptr (pt)
+        mov rdx, r13;                             // record_len
+        mov rax, rbx;
+        shl rax, 11;
+        lea r10, [rip + _rrw_tx_frames];
+        add rax, r10;
+        add rax, 20;                              // &tx_slot[+20]
+        mov rcx, rax;                             // out_ptr
+        mov r8,  r13;
+        add r8,  16;                              // out_cap = record_len + 16
+        lea r9,  [rip + _rrw_written];
+        call paideia_crypto_chacha20_poly1305_seal;
+        cmp rax, 0;
+        jne rrw_sd_aead_fail;
+
+        // (10) Advance nonce counter: row[+224..+232] = counter + 1.
+        mov rax, rbx;
+        shl rax, 8;
+        lea r10, [rip + _remote_shell_pool];
+        add rax, r10;                             // row base
+        mov r11, r14;
+        add r11, 1;
+        mov [rax + 224], r11;
+
+        // (11) Stamp _rrw_tx_frame_lens[conn_id] = 36 + record_len.
+        lea r10, [rip + _rrw_tx_frame_lens];
+        mov r11, r13;
+        add r11, 36;                              // RRW_OVERHEAD
+        mov [r10 + rbx * 8], r11;
+
+        // (12) Stats + fingerprint.
+        mov rdi, 0;                               // RRW_ST_SEND_OK
+        call rrw_note;
+
+        mov rdi, 3;                               // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rrw_tag_send_ok];
+        lea rcx, [rip + rrw_k_cid];
+        mov r8,  rbx;                             // cid in hex KV
+        call klog_s1_x1;
+
+        xor rax, rax;                             // RRW_OK
+        jmp rrw_sd_out;
+
+      rrw_sd_bad_conn:
+        mov rdi, 1;                               // RRW_ST_SEND_REJ
+        call rrw_note;
+        mov r12, 0x1D01;                          // RRW_ERR_BAD_CONN
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rrw_tag_send_rej];
+        lea rcx, [rip + rrw_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        jmp rrw_sd_out;
+
+      rrw_sd_not_estab:
+        mov rdi, 1;                               // RRW_ST_SEND_REJ
+        call rrw_note;
+        mov r12, 0x1D20;                          // RRW_ERR_NOT_ESTABLISHED
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rrw_tag_send_rej];
+        lea rcx, [rip + rrw_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        jmp rrw_sd_out;
+
+      rrw_sd_malformed:
+        mov rdi, 1;
+        call rrw_note;
+        mov r12, 0x1D21;                          // RRW_ERR_FRAME_MALFORMED
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rrw_tag_send_rej];
+        lea rcx, [rip + rrw_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        jmp rrw_sd_out;
+
+      rrw_sd_nonce_exhaust:
+        mov rdi, 1;
+        call rrw_note;
+        mov r12, 0x1D23;                          // RRW_ERR_NONCE_EXHAUSTED
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rrw_tag_send_rej];
+        lea rcx, [rip + rrw_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        jmp rrw_sd_out;
+
+      rrw_sd_aead_fail:
+        mov rdi, 1;
+        call rrw_note;
+        mov r12, 0x1D22;                          // RRW_ERR_AEAD_FAIL
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rrw_tag_send_rej];
+        lea rcx, [rip + rrw_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+
+      rrw_sd_out:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _rrw_recv_frame(conn_id, out_ptr, out_cap) -> packed u64
+  //
+  // Open one wire frame from the per-conn RX frame slot.  The caller
+  // (or the M5+ transport) must have deposited the frame bytes into
+  // _rrw_rx_frames[conn_id*2048..] and stamped the length via
+  // _rrw_rx_stage BEFORE calling this.
+  //
+  // ARGS (SysV):
+  //   rdi = conn_id        (u64 in [0, 4))
+  //   rsi = out_ptr        (writable up to out_cap bytes of plaintext)
+  //   rdx = out_cap        (<= RRW_RECORD_MAX)
+  //
+  // RETURNS (rax):  packed u64
+  //   bits [63..32] = bytes_decrypted (0 on error; frame.record_len on
+  //                                     success)
+  //   bits [31.. 0] = status
+  //
+  //   status = RRW_OK                 -- plaintext written to out_ptr;
+  //                                       RX slot cleared (_rrw_rx_
+  //                                       frame_lens[conn_id] = 0).
+  //   status = RRW_ERR_BAD_CONN       -- conn_id out of range or row
+  //                                       not in_use.
+  //   status = RRW_ERR_NOT_ESTABLISHED-- row state != ESTABLISHED.
+  //   status = RRW_ERR_FRAME_MALFORMED-- no frame staged (len == 0),
+  //                                       or frame_len < RRW_OVERHEAD,
+  //                                       or magic mismatch, or
+  //                                       declared record_len does not
+  //                                       equal frame_len - RRW_OVERHEAD,
+  //                                       or declared record_len >
+  //                                       RRW_RECORD_MAX,
+  //                                       or out_cap < declared
+  //                                       record_len.
+  //   status = RRW_ERR_AEAD_FAIL      -- open returned nonzero (incl.
+  //                                       tag mismatch) OR BLAKE3
+  //                                       derive returned nonzero.
+  //
+  // STEP-BY-STEP:
+  //   (1) rrw_check_conn / rrw_check_established.
+  //   (2) frame_len = _rrw_rx_frame_lens[conn_id].  Validate >= 36
+  //       and <= 2048, else FRAME_MALFORMED.
+  //   (3) Read frame header from RX slot:
+  //         magic = u32 LE at [+0].  Reject if != 0x52584450.
+  //         declared_len = u32 LE at [+4].  Reject if > RRW_RECORD_MAX.
+  //         Nonce 12 B at [+8..+20] copied verbatim into
+  //           _rrw_nonce_scratch.
+  //       Validate declared_len == frame_len - RRW_OVERHEAD, else
+  //       FRAME_MALFORMED.
+  //   (4) Validate out_cap >= declared_len, else FRAME_MALFORMED.
+  //   (5) Derive session key via rrw_derive_sk.
+  //   (6) Build AeadParamsC.
+  //   (7) call paideia_crypto_chacha20_poly1305_open(&params,
+  //       &rx_slot[+20], declared_len+16, out_ptr, declared_len,
+  //       &_rrw_written).  Nonzero -> AEAD_FAIL.
+  //   (8) Clear _rrw_rx_frame_lens[conn_id] = 0.
+  //   (9) Emit `RRW RECV OK cid=0x<hex>`.
+  //  (10) Return (declared_len << 32) | 0.
+  //
+  // STACK FRAME:
+  //   4 callee-save pushes (rbx = conn_id, r12 = out_ptr, r13 = out_cap,
+  //                          r14 = declared_len) + sub rsp, 8.
+  //
+  // Labels prefixed rrw_rv_.
+  // ==========================================================================
+  pub let _rrw_recv_frame : (u64, u64, u64) -> u64 !{crypto, mem, sysreg} @{paideia.crypto, cap} =
+    fn (conn_id: u64) (out_ptr: u64) (out_cap: u64) -> unsafe {
+      effects: {crypto, mem, sysreg}, capabilities: {paideia.crypto, cap},
+      justification: "R137.M4 (paideia-os #2636): open a wire frame from the per-conn RX slot. Validate conn_id, ESTABLISHED, frame staged (36 <= frame_len <= 2048), magic == 0x52584450, declared_len == frame_len - 36, declared_len <= 1024, out_cap >= declared_len. Copy 12-byte nonce from RX slot [+8..+20] into _rrw_nonce_scratch. Derive 32-byte session key via rrw_derive_sk. Build AeadParamsC {key=&sk, nonce=&nonce, aad=0, aad_len=0}. Call paideia_crypto_chacha20_poly1305_open(params, &rx_slot[+20], declared_len+16, out_ptr, declared_len, &written); nonzero -> RRW_ERR_AEAD_FAIL (open's -3 tag-mismatch and other negatives fold uniformly). On success, clear _rrw_rx_frame_lens[conn_id] = 0. Returns packed (declared_len << 32) | status. Four callee-save pushes (rbx=conn_id, r12=out_ptr, r13=out_cap, r14=declared_len) + sub rsp,8. Entry rsp%16==8; +4 pushes = +32 -> %16==8; sub rsp,8 = +40 -> %16==0 at every nested call. Encoder-pitfall posture: cmp rN,0, shl rN,8 (row stride), shl rN,11 (RX slot stride), shl rax,32 (packed-return hi), mov rax,imm32, mov_d/mov for 32-bit reads from the RX slot (never a cross-mode cast). Labels prefixed rrw_rv_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // conn_id
+        mov r12, rsi;                    // out_ptr
+        mov r13, rdx;                    // out_cap
+
+        // (1a) Validate conn_id.
+        mov rdi, rbx;
+        call rrw_check_conn;
+        cmp rax, 0;
+        je  rrw_rv_bad_conn;
+
+        // (1b) Validate state == ESTABLISHED.
+        mov rdi, rbx;
+        call rrw_check_established;
+        cmp rax, 0;
+        je  rrw_rv_not_estab;
+
+        // (2) Read staged frame_len; validate bounds.
+        lea r10, [rip + _rrw_rx_frame_lens];
+        mov r11, [r10 + rbx * 8];        // r11 = frame_len
+        mov r10, 36;                     // RRW_OVERHEAD
+        cmp r11, r10;
+        jb  rrw_rv_malformed;
+        mov r10, 2048;                   // RRW_SLOT_STRIDE
+        cmp r11, r10;
+        ja  rrw_rv_malformed;
+
+        // (3a) rx_slot pointer in r10 (preserve r11=frame_len).
+        mov rax, rbx;
+        shl rax, 11;                     // conn_id * 2048
+        lea r9,  [rip + _rrw_rx_frames];
+        add rax, r9;
+        mov r10, rax;                    // r10 = rx_slot
+
+        // (3b) Validate magic.  Load 32-bit LE word at [rx_slot+0].
+        xor rax, rax;
+        mov_d rax, [r10 + 0];
+        mov r9, 0x52584450;              // RRW_MAGIC_LE
+        cmp rax, r9;
+        jne rrw_rv_malformed;
+
+        // (3c) Load declared_len (u32 LE at [+4]) into r14.
+        xor rax, rax;
+        mov_d rax, [r10 + 4];
+        mov r14, rax;                    // declared_len
+
+        // Validate declared_len <= RRW_RECORD_MAX.
+        mov r9, 1024;
+        cmp r14, r9;
+        ja  rrw_rv_malformed;
+
+        // Validate declared_len == frame_len - RRW_OVERHEAD (36).
+        mov r9, r11;
+        sub r9, 36;
+        cmp r9, r14;
+        jne rrw_rv_malformed;
+
+        // (3d) Copy nonce (12 bytes at [rx_slot+8..+20]) into
+        //       _rrw_nonce_scratch.  8 bytes via qword mov, 4 bytes
+        //       via mov_d.
+        lea r9, [rip + _rrw_nonce_scratch];
+        mov rax, [r10 + 8];
+        mov [r9 + 0], rax;
+        xor rax, rax;
+        mov_d rax, [r10 + 16];
+        mov_d [r9 + 8], rax;
+
+        // (4) Validate out_cap >= declared_len.
+        cmp r13, r14;
+        jb  rrw_rv_malformed;
+
+        // (5) Derive session key.
+        mov rdi, rbx;
+        call rrw_derive_sk;
+        cmp rax, 0;
+        jne rrw_rv_aead_fail;
+
+        // (6) Build AeadParamsC.
+        lea r10, [rip + _rrw_aead_scratch];
+        lea r11, [rip + _rrw_sk_scratch];
+        mov [r10 + 0], r11;              // key_ptr
+        lea r11, [rip + _rrw_nonce_scratch];
+        mov [r10 + 8], r11;              // nonce_ptr
+        xor rax, rax;
+        mov [r10 + 16], rax;             // aad_ptr = 0
+        mov [r10 + 24], rax;             // aad_len = 0
+
+        // (7) paideia_crypto_chacha20_poly1305_open(params, sealed,
+        //                                            sealed_len,
+        //                                            out, out_cap_declared,
+        //                                            written).
+        // sealed = &rx_slot[+20]; sealed_len = declared_len + 16;
+        // out = out_ptr; out_cap_declared = declared_len.
+        lea rdi, [rip + _rrw_aead_scratch];
+        mov rax, rbx;
+        shl rax, 11;
+        lea r10, [rip + _rrw_rx_frames];
+        add rax, r10;
+        add rax, 20;
+        mov rsi, rax;                             // sealed
+        mov rdx, r14;
+        add rdx, 16;                              // sealed_len = declared_len + 16
+        mov rcx, r12;                             // out_ptr
+        mov r8,  r14;                             // out_cap_declared
+        lea r9,  [rip + _rrw_written];
+        call paideia_crypto_chacha20_poly1305_open;
+        cmp rax, 0;
+        jne rrw_rv_aead_fail;
+
+        // (8) Clear RX slot's frame_len.
+        lea r10, [rip + _rrw_rx_frame_lens];
+        xor rax, rax;
+        mov [r10 + rbx * 8], rax;
+
+        // (9) Stats + fingerprint.
+        mov rdi, 2;                               // RRW_ST_RECV_OK
+        call rrw_note;
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rrw_tag_recv_ok];
+        lea rcx, [rip + rrw_k_cid];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        // (10) Pack return: (declared_len << 32) | RRW_OK.
+        mov rax, r14;
+        shl rax, 32;
+        jmp rrw_rv_out;
+
+      rrw_rv_bad_conn:
+        mov rdi, 3;                               // RRW_ST_RECV_REJ
+        call rrw_note;
+        mov r12, 0x1D01;                          // RRW_ERR_BAD_CONN
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rrw_tag_recv_rej];
+        lea rcx, [rip + rrw_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;                             // packed (count=0, status)
+        jmp rrw_rv_out;
+
+      rrw_rv_not_estab:
+        mov rdi, 3;
+        call rrw_note;
+        mov r12, 0x1D20;                          // RRW_ERR_NOT_ESTABLISHED
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rrw_tag_recv_rej];
+        lea rcx, [rip + rrw_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        jmp rrw_rv_out;
+
+      rrw_rv_malformed:
+        mov rdi, 3;
+        call rrw_note;
+        mov r12, 0x1D21;                          // RRW_ERR_FRAME_MALFORMED
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rrw_tag_recv_rej];
+        lea rcx, [rip + rrw_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        jmp rrw_rv_out;
+
+      rrw_rv_aead_fail:
+        mov rdi, 3;
+        call rrw_note;
+        mov r12, 0x1D22;                          // RRW_ERR_AEAD_FAIL
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_NET_];
+        lea rdx, [rip + rrw_tag_recv_rej];
+        lea rcx, [rip + rrw_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+
+      rrw_rv_out:
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Boot wiring note
+  // ----------------
+  // No boot hook required at M4.  _rrw_tx_frames, _rrw_rx_frames,
+  // _rrw_tx_frame_lens, _rrw_rx_frame_lens, _rrw_stats, _rrw_sk_scratch,
+  // _rrw_nonce_scratch, _rrw_aead_scratch, _rrw_derive_input,
+  // _rrw_derive_output, and _rrw_written are all .bss-zero-init.  The
+  // rrw_kdf_ctx context string is read-only .rodata.
+  //
+  // The per-conn nonce counter at row[+224..+232] rides on the
+  // sibling remote_shell.pdx row pool which is already .bss-zero-
+  // init; a fresh _remote_shell_accept lands a row with counter = 0.
+  //
+  // See design/shell/remote-record-wire.md for the full design
+  // (frame format, nonce discipline, forward path to M5 wire
+  // integration, interaction with hybrid handshake widening).
+  // ==========================================================================
+}
