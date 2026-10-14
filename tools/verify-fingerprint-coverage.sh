@@ -816,6 +816,36 @@ ALLOWLIST = {
         "boot-witness or periodic timer trigger with an asserting "
         "smoke-mode golden.",
 
+    # Wave UMB-W25 R141.M6 (paideia-os#2650): regression gate. Four
+    # fingerprints emitted by src/kernel/core/perf/regression_gate.pdx:
+    # PERF_GATE INIT OK fires once at _rg_init tail during boot.
+    # PERF_GATE SITE PASS fires per-call from _rg_check_site on a live
+    # row that stays inside the §5 tolerance budget. PERF_GATE SITE
+    # FAIL fires per-call when any axis (min/max/mean) exceeds its
+    # per-axis tolerance. PERF_GATE ALL OK fires per cascade from
+    # _rg_check_all with fail_mask + pass_count KVs. At the M6
+    # landing the gate has no automatic driver -- a kernel-mode
+    # caller (today, a one-shot stub; forward, a KIND_MICROBENCH
+    # MB_OP_CHECK_ALL op) drives _rg_check_all. All four retire from
+    # this allowlist when R141.M7 wires the smoke-mode consumer that
+    # greps for PERF_GATE SITE FAIL and fails the smoke on hit.
+    "PERF_GATE INIT OK":
+        "Wave UMB-W25 R141.M6: src/kernel/core/perf/regression_gate.pdx "
+        "emits this unconditionally on boot via _rg_init in "
+        "kernel_main.pdx (after _mb_init / _perf_sink_init / _fz_init). "
+        "Retires when R141.M7 wires an asserting smoke-mode golden.",
+    # PERF_GATE SITE PASS / PERF_GATE SITE FAIL tags are opaque to the
+    # fingerprint-coverage gate (regex matches bare OK only, so PASS/
+    # FAIL emissions are never extracted and need no allowlist entry).
+    # Entries removed 2026-10-14 after the gate flagged them stale.
+    "PERF_GATE ALL OK":
+        "Wave UMB-W25 R141.M6: src/kernel/core/perf/regression_gate.pdx "
+        "emits this from _rg_check_all's cascade tail with fail_mask + "
+        "pass_count KVs. Unreachable from any production path at M6 -- "
+        "no automatic cascade driver yet; a KIND_MICROBENCH "
+        "MB_OP_CHECK_ALL op lands with R141.M7. Retires when that op "
+        "or the smoke-mode golden drives the cascade end-to-end.",
+
     # Wave β (paideia-os compositor QEMU bring-up, α–τ plan): three
     # compositor bring-up markers that fire on every boot once
     # src/user/init.pdx's β-01 fork+exec+wait4 cycle runs the
