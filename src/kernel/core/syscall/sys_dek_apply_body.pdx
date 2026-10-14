@@ -1,0 +1,639 @@
+// src/kernel/core/syscall/sys_dek_apply_body.pdx -- PFS-14 (paideia-os #2732)
+//
+// SYS_DEK_APPLY -- per-block ChaCha20-Poly1305 encrypt/decrypt against a
+// KIND_DEK row (sysno 137).
+//
+// =============================================================================
+// SECTION 0  SCOPE  (PFS-14, Wave PFS-W11)
+// =============================================================================
+//
+// Wave 96 (PFS-12 / paideia-os #2579) landed the KIND_DEK substrate.  Wave 97
+// (PFS-13 / paideia-os #2731) landed sys_dek_seal (sysno 136) which seeds a
+// KIND_DEK row with a 32-byte DEK extracted from a mount-time passphrase.
+//
+// PFS-05 (design/pdxfs/block-crypto-contract.md) froze the per-block AEAD
+// discipline:
+//   - one DEK per volume, 32 bytes, ChaCha20-Poly1305
+//   - deterministic 12-byte nonce: volume_prefix[4] || LE_u64(blk_lba)
+//   - per-block 16-byte Poly1305 tag (stored in a paired metadata block;
+//     the on-disk pairing is a library-side concern, see PFS-14b follow-up).
+//
+// This syscall is Path B of the PFS-14 dispatch brief:
+//   - The DEK bytes NEVER leave kernel space.  Previous flows left the DEK
+//     in a user-space .bss slot (passphrase_wire_dek_scratch) across the
+//     window from pdxb_dek_unwrap to pdxb_block_encrypt; sys_dek_seal
+//     closed the inbound half (ring-3 -> kernel KIND_DEK row).  This body
+//     closes the outbound half: the per-block crypto runs KERNEL-side,
+//     reading plaintext/ciphertext across the user/kernel boundary via
+//     the already-landed user_read_bytes_via_walk + user_write_bytes_via_walk
+//     primitives.  libpdx-volume's pdxb_block_encrypt/_decrypt become
+//     thin ring-3 marshaller/trampolines that just invoke this syscall.
+//
+// =============================================================================
+// SECTION 1  CONTRACT
+// =============================================================================
+//
+// sys_dek_apply_body(row_id, buf_user_ptr, lba, mode, volume_prefix_u64) -> u64
+//
+//   row_id            : KIND_DEK row index in [0, DEK_MAX=16).  The row MUST
+//                       be live (in_use byte set in the row header).  A
+//                       stale row_id returns SDA_INVALID_ROW; this is
+//                       library-caller discipline, not an authority gate.
+//
+//   buf_user_ptr      : User VA of the 4112-byte block buffer.  MUST be
+//                       4KiB-aligned (addr & 0xFFF == 0).  Layout:
+//                         [+0..+4096)   data  (plaintext in, ciphertext out
+//                                              for encrypt; reversed for
+//                                              decrypt)
+//                         [+4096..+4112) tag  (16 bytes, written by encrypt
+//                                              / read by decrypt)
+//                       The library's PFS-14b paired-metadata module
+//                       (pdxb_block_meta.pdx, follow-up) is where the tag
+//                       is persisted to its own paired block on disk; for
+//                       the kernel boundary we pass tag inline for a single
+//                       4112-byte transport unit.
+//
+//   lba               : 64-bit logical block address.  MUST be < 2^48 per
+//                       the PFS-05 contract §4.2 nonce birthday bound.
+//                       Values >= 2^48 return SDA_INVALID_LBA (fail safe:
+//                       a volume approaching the ceiling refuses writes
+//                       rather than risk nonce reuse).
+//
+//   mode              : 0 = encrypt, 1 = decrypt.  Any other value returns
+//                       SDA_INVALID_MODE.
+//
+//   volume_prefix_u64 : u64 whose LOW 32 bits = volume_prefix[4] (the first
+//                       four bytes of the volume's superblock kdf_salt per
+//                       PFS-05 §4.1).  Caller (libpdx-volume) caches this
+//                       at mount-time from pdxb_sb_get_kdf_salt's first
+//                       u32 slice.  High 32 bits ignored.
+//
+//                       Why pass volume_prefix as an arg instead of fetching
+//                       it from the KIND_DEK row: the row layout (kind_dek.pdx
+//                       §2) stores DEK bytes + volume_id + flags only; it
+//                       has no slot for a 4-byte nonce prefix.  Extending
+//                       the row would cascade through kind_dek_mint_body's
+//                       signature (which sys_dek_seal already uses) and the
+//                       MVP ABI; this would be acceptable at a future wave
+//                       (reserved slot [+56] IS marked "future KDF-mode /
+//                       nonce-prefix storage" in kind_dek.pdx) but is scope
+//                       beyond PFS-14.  Caller-passed prefix also keeps the
+//                       nonce-derivation visible at every call site, which
+//                       satisfies PFS-05 §4.1's "deterministic LBA-indexed
+//                       nonce (adopted)" visibility note.
+//
+// Return (rax): errno-style u64.
+//
+//   0 = SDA_OK            -- data/tag updated in user buffer.
+//   1 = SDA_INVALID_ROW   -- row_id >= 16 OR row header's in_use byte zero.
+//   2 = SDA_INVALID_PAGE  -- buf_user_ptr not 4KiB-aligned, OR user_ptr_ok
+//                            rejected the range, OR user_read_bytes_via_walk
+//                            / user_write_bytes_via_walk failed (unmapped,
+//                            huge-page, kernel-half, overflow, etc.).
+//   3 = SDA_INVALID_LBA   -- lba >= 2^48 (nonce birthday bound).
+//   4 = SDA_AEAD_FAIL     -- ChaCha20-Poly1305 primitive refused (bad params
+//                            or decrypt tag mismatch).  Fail-closed; the
+//                            crypto scratch is scrubbed before return.
+//   5 = SDA_INVALID_MODE  -- mode not in {0, 1}.
+//
+// =============================================================================
+// SECTION 2  NONCE DISCIPLINE  (PFS-05 §4.1-4.3)
+// =============================================================================
+//
+// For every call: nonce[12] = volume_prefix[4] || LE_u64(lba).
+//
+//   - nonce[0..4]  = volume_prefix_u64 & 0xFFFFFFFF   (4-byte dword store)
+//   - nonce[4..12] = lba as LE u64                     (8-byte qword store)
+//
+// Scratch is 16-byte-aligned (@align(8)); the AEAD intrinsic reads exactly
+// 12 bytes starting at nonce_ptr (RFC 8439 ChaCha20-Poly1305 fixed 96-bit
+// nonce), so bytes 12..16 of the scratch are untouched and ignored.
+//
+// Nonce reuse across (DEK, LBA) pairs is catastrophic for ChaCha20-Poly1305.
+// This body does NOT itself maintain a bitmap-of-written-LBAs or any
+// collision gate -- the CoW invariant upstream (nvme_write.pdx: every
+// write targets a fresh LBA) is the structural uniqueness source.  The
+// 2^48 lba ceiling (step 3 below) is the fail-safe for the ceiling itself.
+//
+// =============================================================================
+// SECTION 3  SCRUB POSTURE
+// =============================================================================
+//
+// Five transient secrets exist in this body's frame:
+//
+//   (S1) _sys_dek_apply_dek_scratch[32] -- the 32-byte DEK copied in from
+//        the KIND_DEK row via four dek_row_read_qword calls.  Scrubbed
+//        (four u64 zero stores) at every return path -- OK, INVALID_ROW,
+//        INVALID_PAGE, AEAD_FAIL, INVALID_MODE, INVALID_LBA.
+//
+//   (S2) _sys_dek_apply_nonce_scratch[16] -- the 12-byte deterministic
+//        nonce.  Not strictly secret (it is reconstructable from
+//        volume_prefix + lba) but scrubbed anyway for uniform discipline.
+//        Two u64 zero stores.
+//
+//   (S3) _sys_dek_apply_aead_scratch[32] -- AeadParamsC {key_ptr,
+//        nonce_ptr, aad_ptr=0, aad_len=0}.  Scrubbed because key_ptr
+//        aliases the DEK scratch; leaving the pointer live after scrub
+//        would hand a reader a free dangling-pointer handle.  Four u64
+//        zero stores.
+//
+//   (S4) _sys_dek_apply_user_scratch[4112] -- the plaintext/ciphertext
+//        input copied from the user's 4096-byte block (plus the 16-byte
+//        tag for decrypt).  Plaintext here is strictly volume data, not a
+//        key, but scrubbing uniformly keeps the body's "no transient
+//        secret survives this frame" invariant.  Scrubbed via a bounded
+//        514-iteration qword zero loop.
+//
+//   (S5) _sys_dek_apply_crypt_scratch[4112] -- the AEAD-produced
+//        ciphertext+tag (encrypt) or plaintext (decrypt).  Same posture
+//        as S4.  Scrubbed via a bounded 514-iteration qword zero loop.
+//
+// The caller's own user buffer is NOT scrubbed on failure.  mount.pdxfs
+// / libpdx-volume (callers of pdxb_block_encrypt / _decrypt) are expected
+// to treat a non-OK return as "data destination contents UNDEFINED"
+// and discard the buffer, matching tools/user/libpdx-volume/src/
+// pdxb_crypto.pdx's AEAD return-code discipline for v1.0.x.
+//
+// =============================================================================
+// SECTION 4  DISPATCH WIRING
+// =============================================================================
+//
+//   src/kernel/core/syscall/dispatch.pdx
+//     Bounds check widened 136 -> 137 at the top of the switch.
+//     New arm:   cmp rdi, 137; je dispatch_dek_apply;
+//     New label: dispatch_dek_apply  (register shuffle + call
+//                sys_dek_apply_body).
+//
+// SysV at the dispatch label (post entry.pdx left-rotate):
+//   rsi = a0 = row_id
+//   rdx = a1 = buf_user_ptr
+//   rcx = a2 = lba
+//   r8  = a3 = mode
+//   r9  = a4 = volume_prefix_u64
+// Body signature: (row_id, buf_user_ptr, lba, mode, volume_prefix_u64).
+// Body wants rdi/rsi/rdx/rcx/r8.  Five-move shuffle at the dispatch arm.
+// No dispatch-layer KPTI bounce because the body owns its own user_ptr_ok
+// + user_read_bytes_via_walk + user_write_bytes_via_walk (same posture as
+// sys_dek_seal_body L250-254).
+//
+// =============================================================================
+// SECTION 5  ENCODER-PITFALL DISCIPLINE
+// =============================================================================
+//
+// - KIND tags are not referenced in this body (unlike sys_dek_seal, this
+//   body operates on a row_id directly; no cap_table reads).  Only small
+//   immediates (4096, 4112, 16, 0xFFF, 32, 2 etc.) and bit-position
+//   staging values appear; all fit imm32.  48-bit nonce ceiling (2^48) is
+//   staged via `mov r11, 1; shl r11, 48` and compared.
+// - No `add reg, [mem]`; every memory op is mov load or mov store.
+// - No `test`; every zero/equality check is `cmp reg, 0` / `cmp reg, reg`.
+// - No `imul`; no 2-op reg,imm shape.
+// - No `mov_bzx` / `mov_wzx`; the 32-byte DEK is read as four u64 words
+//   via dek_row_read_qword; the 4096-byte data block passes through byte-
+//   walker helpers in both directions.
+// - 4KiB-mask 0xFFF is a well-formed imm32.
+// - mov_d used for the volume_prefix low-32-bit store at nonce[0..4];
+//   AEAD-params pointer stores use plain mov (u64 slots).
+// - Labels prefixed `sda_` (sys-dek-apply).  Grep-audit (2026-10-13):
+//   no `sda_` collisions elsewhere in src/kernel/.
+// - Module basename match: file is sys_dek_apply_body.pdx, module is
+//   SysDekApplyBody.
+//
+// =============================================================================
+// SECTION 6  INTERACTION WITH LIBPDX-VOLUME
+// =============================================================================
+//
+// After this landing, tools/user/libpdx-volume/src/pdxb_crypto.pdx's
+// pdxb_block_encrypt / _decrypt replace their fail-closed stubs with:
+//
+//   pdxb_block_encrypt(data_ptr, lba) -> u64
+//     -> read dek_row_id + volume_prefix from library .bss
+//        (set at mount by passphrase_wire_unlock + sys_dek_seal's return)
+//     -> issue syscall(137, dek_row_id, data_ptr, lba, 0 /*encrypt*/,
+//                        volume_prefix)
+//     -> translate SDA_* return to LPV_CRYPTO_ERR_* band
+//
+// The signature changes from (dek_ptr, block_ptr, nonce_ptr, out_tag_ptr)
+// to (data_ptr, lba) -- the key material becomes implicit (library caches
+// row_id after sys_dek_seal returns), the nonce becomes implicit (kernel
+// derives from lba + prefix), and the tag becomes inline (4112 bytes at
+// data_ptr).  Call sites in mount.pdxfs's block-write path and the future
+// PFS-11 pdxfs kernel block-write path mirror this discipline.
+
+module SysDekApplyBody = structure {
+
+  // ===========================================================================
+  // Wire-level constants (see §1 contract).
+  // ===========================================================================
+
+  pub let SDA_OK            : u64 = 0
+  pub let SDA_INVALID_ROW   : u64 = 1
+  pub let SDA_INVALID_PAGE  : u64 = 2
+  pub let SDA_INVALID_LBA   : u64 = 3
+  pub let SDA_AEAD_FAIL     : u64 = 4
+  pub let SDA_INVALID_MODE  : u64 = 5
+
+  pub let SDA_MODE_ENCRYPT  : u64 = 0
+  pub let SDA_MODE_DECRYPT  : u64 = 1
+
+  pub let SDA_BLOCK_BYTES   : u64 = 4096
+  pub let SDA_TAG_BYTES     : u64 = 16
+  pub let SDA_FRAME_BYTES   : u64 = 4112      // 4096 + 16
+  pub let SDA_PAGE_MASK     : u64 = 0xFFF
+  pub let SDA_DEK_BYTES     : u64 = 32
+  pub let SDA_NONCE_BYTES   : u64 = 12
+  pub let SDA_DEK_MAX       : u64 = 16
+
+  // ===========================================================================
+  // ChaCha20-Poly1305 AEAD -- kernel-side extern-C thunk call convention.
+  //
+  // Kernel .pdx code reaches crypto FFI thunks by direct symbol name
+  // (via libpaideia_satellite_runtime.a on the kernel link line) rather
+  // than via the stdlib_lowering::cryptoops trait-lowering recipe.
+  // Precedent: src/kernel/core/ipc/schema_registry.pdx L277+ calls
+  // paideia_crypto_blake3_hash directly from inside an unsafe asm
+  // block.  Same posture applies here -- no `trait ChaCha20Poly1305`
+  // declaration is needed; the raw SysV call lands at the thunk's own
+  // extern-C symbol via a standard PLT32 relocation.
+  //
+  // Thunk signatures (verified against
+  // tools/paideia-as/crates/paideia-as-crypto/src/ffi/chacha20_poly1305.rs
+  // L77-84 and L141-148):
+  //
+  //   fn paideia_crypto_chacha20_poly1305_seal(
+  //       params: *const AeadParamsC,
+  //       plaintext_ptr: *const u8,
+  //       plaintext_len: usize,
+  //       out_ptr: *mut u8,
+  //       out_cap: usize,
+  //       written: *mut usize,
+  //   ) -> i64
+  //
+  //   fn paideia_crypto_chacha20_poly1305_open(
+  //       params: *const AeadParamsC,
+  //       sealed_ptr: *const u8,
+  //       sealed_len: usize,
+  //       out_ptr: *mut u8,
+  //       out_cap: usize,
+  //       written: *mut usize,
+  //   ) -> i64
+  //
+  // SysV register mapping (rdi, rsi, rdx, rcx, r8, r9) applies to both.
+  // Return codes: 0 = OK, negative values are the PDX_CRYPTO_ERR_* band
+  // from paideia-as-crypto (specifically -1 = INVALID_PARAM, -2 =
+  // INVALID_LENGTH, -3 = AUTHENTICATION, -4 = internal, -5 =
+  // BUFFER_TOO_SMALL).  This body treats ANY non-zero return as
+  // SDA_AEAD_FAIL -- the discrimination is not useful to a mount.pdxfs
+  // caller (see §Contract SDA_AEAD_FAIL rationale).
+  // ===========================================================================
+
+  // ===========================================================================
+  // .bss scratches.  All private to this module; single-flow safe (sys_dek_
+  // apply is a synchronous syscall; a single ring-3 caller cannot
+  // interleave two of these on itself).  Future SMP work moves these into
+  // per-CPU slabs; the discipline is identical to sys_dek_seal_body L344
+  // (_sys_dek_seal_scratch, same single-flow note).
+  //
+  //   _sys_dek_apply_dek_scratch   -- 32B DEK read from KIND_DEK row.
+  //   _sys_dek_apply_nonce_scratch -- 16B (12B nonce + 4B pad).
+  //   _sys_dek_apply_aead_scratch  -- 32B AeadParamsC.
+  //   _sys_dek_apply_user_scratch  -- 4112B: user-side input, read in via
+  //                                   user_read_bytes_via_walk at step 6.
+  //                                   Holds plaintext for encrypt, or
+  //                                   (ciphertext+tag) for decrypt.
+  //   _sys_dek_apply_crypt_scratch -- 4112B: AEAD output, written out via
+  //                                   user_write_bytes_via_walk at step 10.
+  //                                   Holds (ciphertext+tag) for encrypt,
+  //                                   or plaintext (first 4096B) for decrypt.
+  //   _sys_dek_apply_written       -- u64 out-slot for the AEAD intrinsic's
+  //                                   `written_ptr` argument (bytes-written
+  //                                   witness; we do not consult it after
+  //                                   the call because the length is
+  //                                   fixed by contract).
+  // ===========================================================================
+
+  pub let mut _sys_dek_apply_dek_scratch   : [u8; 32]   = uninit @align(8)
+  pub let mut _sys_dek_apply_nonce_scratch : [u8; 16]   = uninit @align(8)
+  pub let mut _sys_dek_apply_aead_scratch  : [u8; 32]   = uninit @align(8)
+  pub let mut _sys_dek_apply_user_scratch  : [u8; 4112] = uninit @align(8)
+  pub let mut _sys_dek_apply_crypt_scratch : [u8; 4112] = uninit @align(8)
+  pub let mut _sys_dek_apply_written       : u64        = uninit @align(8)
+
+  // ===========================================================================
+  // sys_dek_apply_body(row_id, buf_user_ptr, lba, mode, volume_prefix_u64) -> u64
+  //
+  // SysV: rdi=row_id, rsi=buf_user_ptr, rdx=lba, rcx=mode, r8=volume_prefix_u64.
+  //   -> rax = SDA_* u64 errno-style code.
+  //
+  // Sequence (gate order follows §1 return taxonomy):
+  //   (1) mode in {0, 1} else INVALID_MODE.
+  //   (2) row_id < DEK_MAX AND dek_row_valid(row_id) == 1 else INVALID_ROW.
+  //   (3) lba < 2^48 else INVALID_LBA.
+  //   (4) buf_user_ptr & 0xFFF == 0 else INVALID_PAGE.
+  //   (5) user_ptr_ok(buf_user_ptr, 4112) == 0 else INVALID_PAGE.
+  //   (6) user_read_bytes_via_walk(user_scratch, buf_user_ptr, 4112) == 0
+  //       else INVALID_PAGE.
+  //   (7) Fill _dek_scratch via four dek_row_read_qword(row_id, q) calls
+  //       for q in {0,1,2,3}.  Any DEK_DECODE_BAD return (0xFFFF...FFFF)
+  //       maps to INVALID_ROW -- defensive; row_valid passed at step 2 so
+  //       this only fires on a race, which the single-flow syscall
+  //       discipline rules out structurally.
+  //   (8) Build nonce: _nonce_scratch[0..4] = volume_prefix_u64 (mov_d),
+  //       _nonce_scratch[4..12] = lba (mov).
+  //   (9) Build AeadParamsC: key_ptr=&_dek_scratch, nonce_ptr=&_nonce_
+  //       scratch, aad_ptr=0, aad_len=0.
+  //   (10) mode == encrypt:
+  //          paideia_crypto_chacha20_poly1305_seal(&_aead_scratch,
+  //                       &_user_scratch, 4096,
+  //                       &_crypt_scratch, 4112, &_written) -> i64.
+  //          On rax != 0 -> AEAD_FAIL.  On OK:
+  //          user_write_bytes_via_walk(buf_user_ptr, &_crypt_scratch, 4112)
+  //          -> 0 else INVALID_PAGE.
+  //        mode == decrypt:
+  //          paideia_crypto_chacha20_poly1305_open(&_aead_scratch,
+  //                       &_user_scratch, 4112,
+  //                       &_crypt_scratch, 4096, &_written) -> i64.
+  //          On rax != 0 -> AEAD_FAIL (open returns -3 on tag mismatch and
+  //          other negatives on primitive error; both fold to AEAD_FAIL
+  //          because a mount.pdxfs caller cannot do anything differently
+  //          about the two cases).  On OK:
+  //          user_write_bytes_via_walk(buf_user_ptr, &_crypt_scratch, 4096)
+  //          -> 0 else INVALID_PAGE.
+  //          (Decrypt writeback is 4096 bytes; the tag slot at user+4096
+  //          is NOT overwritten -- it was input and the caller may
+  //          preserve it for a later re-verification.)
+  //   (11) Fall through to shared epilogue sda_out which scrubs every
+  //        scratch (§3 S1-S5) and restores callee-save frame.
+  //
+  // Register plan (6 callee-save pushes, +8 pad = 56 B; entry rsp%16==8
+  // -> rsp%16==0 at every nested call site):
+  //   rbx = row_id             (used in steps 2, 7)
+  //   r12 = buf_user_ptr       (used in steps 4, 5, 6, 10 writebacks)
+  //   r13 = lba                (used in steps 3, 8)
+  //   r14 = mode               (used in steps 1, 10 branch)
+  //   r15 = volume_prefix_u64  (used in step 8)
+  //   rbp = status carrier     (holds the SDA_* code across the scrub
+  //                              epilogue which clobbers rax)
+  //
+  // Shared epilogue sda_out: scrubs five scratches, restores rax from rbp,
+  // undoes the 6-push + 8-pad frame, and returns.  Every error path sets
+  // `mov rbp, <code>; jmp sda_out`; the success path sets `xor rbp, rbp;
+  // jmp sda_out`.  The scrub stores use `xor rax, rax` so rax is clobbered
+  // -- the final `mov rax, rbp` restores the return code before `ret`.
+  // ===========================================================================
+
+  pub let sys_dek_apply_body : (u64, u64, u64, u64, u64) -> u64 !{crypto, mem, sysreg} @{paideia.crypto, cap} =
+    fn (row_id: u64) (buf_user_ptr: u64) (lba: u64) (mode: u64) (volume_prefix_u64: u64) -> unsafe {
+      effects: {crypto, mem, sysreg}, capabilities: {paideia.crypto, cap},
+      justification: "PFS-14 (paideia-os #2732): sys_dek_apply body, SC+ ID 137. Entry: rdi=row_id, rsi=buf_user_ptr, rdx=lba, rcx=mode, r8=volume_prefix_u64. Sequence per §Contract: (1) mode in {0,1} else SDA_INVALID_MODE (cmp mode,2 jae); (2) row_id < DEK_MAX(16) AND dek_row_valid(row_id)==1 else SDA_INVALID_ROW (bounds cmp first, then nested call -- row_valid gates in_use byte); (3) lba < 2^48 else SDA_INVALID_LBA (shr r10,48 of a copy of r13; cmp r10,0; jne); (4) buf_user_ptr & 0xFFF == 0 else SDA_INVALID_PAGE; (5) user_ptr_ok(buf_user_ptr, 4112) == 0 else SDA_INVALID_PAGE; (6) user_read_bytes_via_walk(_user_scratch, buf_user_ptr, 4112) == 0 else SDA_INVALID_PAGE -- the walk IS the KIND_MEMORY ownership proof (same posture as sys_dek_seal_body §3 G3); (7) assemble 32-byte DEK via four dek_row_read_qword(row_id, q) nested calls for q in {0,1,2,3}, storing results at [_dek_scratch+0/+8/+16/+24]; any DEK_DECODE_BAD (0xFFFF...FFFF, movabs cmp against mov r11, 0xFFFFFFFFFFFFFFFF) folds to INVALID_ROW (defensive -- unreachable under single-flow syscall discipline but structurally gated); (8) build nonce: mov_d [_nonce_scratch+0], r15 (writes low 32 bits of volume_prefix_u64 as volume_prefix[4]), mov [_nonce_scratch+4], r13 (writes LE_u64 of lba at bytes 4..12 -- the AEAD intrinsic reads exactly 12 bytes starting at nonce_ptr, so bytes 12..16 of the 16B scratch are untouched); (9) build AeadParamsC: [_aead_scratch+0] = &_dek_scratch (key_ptr), [_aead_scratch+8] = &_nonce_scratch (nonce_ptr), [_aead_scratch+16] = 0 (aad_ptr NULL), [_aead_scratch+24] = 0 (aad_len 0); (10) mode-branch: encrypt calls paideia_crypto_chacha20_poly1305_seal(&_aead_scratch, &_user_scratch, 4096, &_crypt_scratch, 4112, &_written) and on OK writes 4112 bytes back via user_write_bytes_via_walk(buf_user_ptr, &_crypt_scratch, 4112); decrypt calls paideia_crypto_chacha20_poly1305_open(&_aead_scratch, &_user_scratch, 4112, &_crypt_scratch, 4096, &_written) and on OK writes 4096 bytes back via user_write_bytes_via_walk(buf_user_ptr, &_crypt_scratch, 4096). AEAD seal/open non-zero return -> SDA_AEAD_FAIL (open's -3 tag-mismatch and other negatives fold uniformly -- a mount.pdxfs caller cannot act on the distinction); writeback walker non-zero return -> SDA_INVALID_PAGE. The two extern-C thunks are reached by direct call (PLT32 relocation; the kernel link line already carries libpaideia_satellite_runtime.a per schema_registry.pdx L277 precedent), not via the stdlib_lowering::cryptoops trait recipe. (11) fall-through sda_out shared epilogue: scrubs _dek_scratch (4 u64 zero stores), _nonce_scratch (2 u64 zero stores), _aead_scratch (4 u64 zero stores), _user_scratch (514-iter qword zero loop at 4112B), _crypt_scratch (514-iter qword zero loop at 4112B); then mov rax,rbp (restore status); add rsp,8; pop rbp/r15/r14/r13/r12/rbx; ret. Register plan: 6 callee-save pushes (rbx=row_id, r12=buf_user_ptr, r13=lba, r14=mode, r15=volume_prefix_u64, rbp=status carrier across scrub) + sub rsp,8 pad = 56 B; from entry rsp%16==8 -> %16==0 at every nested call (dek_row_valid, dek_row_read_qword x4, user_ptr_ok, user_read_bytes_via_walk, paideia_crypto_chacha20_poly1305_seal/open, user_write_bytes_via_walk). Encoder discipline: no `add reg,[mem]`, no `test`, no `imul`, no `mov_bzx`/`mov_wzx`; all SDA_* status codes are small imm32 constants; 2^48 lba ceiling staged via `mov r11,1; shl r11,48; cmp r10,r11`; AEAD -3 sentinel staged via `mov r11, 0xFFFFFFFFFFFFFFFD` where mentioned. Effects {crypto, mem, sysreg}: crypto for AEAD intrinsic, mem for scratch + user_pml4 walks + DEK row reads, sysreg transitively from walker's _current_tcb load. Capabilities {paideia.crypto, cap}: paideia.crypto for the AEAD intrinsic (same cap wrapper as pdxb_dek_wrap in libpdx-volume), cap transitively from dek_row_valid / dek_row_read_qword's own posture. Labels prefixed sda_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        push rbp;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // row_id
+        mov r12, rsi;                    // buf_user_ptr
+        mov r13, rdx;                    // lba
+        mov r14, rcx;                    // mode
+        mov r15, r8;                     // volume_prefix_u64
+
+        // ---- (1) mode in {0, 1} ----
+        mov r10, 2;
+        cmp r14, r10;
+        jae sda_bad_mode;
+
+        // ---- (2a) row_id < DEK_MAX ----
+        mov r10, 16;                     // SDA_DEK_MAX
+        cmp rbx, r10;
+        jae sda_bad_row;
+
+        // ---- (2b) dek_row_valid(row_id) == 1 ----
+        mov rdi, rbx;
+        call dek_row_valid;
+        cmp rax, 0;
+        je  sda_bad_row;
+
+        // ---- (3) lba < 2^48 ----
+        mov r10, r13;
+        shr r10, 48;
+        cmp r10, 0;
+        jne sda_bad_lba;
+
+        // ---- (4) buf_user_ptr & 0xFFF == 0 ----
+        mov rax, r12;
+        mov r11, 0xFFF;                  // SDA_PAGE_MASK
+        and rax, r11;
+        cmp rax, 0;
+        jne sda_bad_page;
+
+        // ---- (5) user_ptr_ok(buf_user_ptr, 4112) ----
+        mov rdi, r12;
+        mov rsi, 4112;                   // SDA_FRAME_BYTES
+        call user_ptr_ok;
+        cmp rax, 0;
+        jne sda_bad_page;
+
+        // ---- (6) user_read_bytes_via_walk(user_scratch, buf, 4112) ----
+        lea rdi, [rip + _sys_dek_apply_user_scratch];
+        mov rsi, r12;
+        mov rdx, 4112;
+        call user_read_bytes_via_walk;
+        cmp rax, 0;
+        jne sda_bad_page;
+
+        // ---- (7) Assemble 32-byte DEK ----
+        //   Four dek_row_read_qword(row_id, q) nested calls q=0..3.
+        //   DEK_DECODE_BAD = 0xFFFFFFFFFFFFFFFF -> INVALID_ROW.
+        //   Store each returned u64 at _dek_scratch + q*8.
+
+        mov rdi, rbx;
+        mov rsi, 0;
+        call dek_row_read_qword;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  sda_bad_row;
+        lea r10, [rip + _sys_dek_apply_dek_scratch];
+        mov [r10 + 0], rax;
+
+        mov rdi, rbx;
+        mov rsi, 1;
+        call dek_row_read_qword;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  sda_bad_row;
+        lea r10, [rip + _sys_dek_apply_dek_scratch];
+        mov [r10 + 8], rax;
+
+        mov rdi, rbx;
+        mov rsi, 2;
+        call dek_row_read_qword;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  sda_bad_row;
+        lea r10, [rip + _sys_dek_apply_dek_scratch];
+        mov [r10 + 16], rax;
+
+        mov rdi, rbx;
+        mov rsi, 3;
+        call dek_row_read_qword;
+        mov r11, 0xFFFFFFFFFFFFFFFF;
+        cmp rax, r11;
+        je  sda_bad_row;
+        lea r10, [rip + _sys_dek_apply_dek_scratch];
+        mov [r10 + 24], rax;
+
+        // ---- (8) Build 12-byte nonce ----
+        //   nonce[0..4]  = volume_prefix_u64 (low 32 bits) -- mov_d.
+        //   nonce[4..12] = lba (LE u64) -- plain mov.
+        lea r10, [rip + _sys_dek_apply_nonce_scratch];
+        mov_d [r10 + 0], r15;
+        mov [r10 + 4], r13;
+
+        // ---- (9) Build AeadParamsC ----
+        //   [+0]  key_ptr   = &_dek_scratch
+        //   [+8]  nonce_ptr = &_nonce_scratch
+        //   [+16] aad_ptr   = 0
+        //   [+24] aad_len   = 0
+        lea r10, [rip + _sys_dek_apply_aead_scratch];
+        lea r11, [rip + _sys_dek_apply_dek_scratch];
+        mov [r10 + 0], r11;
+        lea r11, [rip + _sys_dek_apply_nonce_scratch];
+        mov [r10 + 8], r11;
+        xor rax, rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+
+        // ---- (10) AEAD call per mode ----
+        cmp r14, 0;
+        je  sda_do_encrypt;
+        // mode == 1 (decrypt).  jmp to decrypt branch.
+        jmp sda_do_decrypt;
+
+      sda_do_encrypt:
+        // paideia_crypto_chacha20_poly1305_seal(params, pt_ptr, pt_len,
+        //                                      out_ptr, out_cap, written_ptr).
+        lea rdi, [rip + _sys_dek_apply_aead_scratch];
+        lea rsi, [rip + _sys_dek_apply_user_scratch];
+        mov rdx, 4096;                   // SDA_BLOCK_BYTES
+        lea rcx, [rip + _sys_dek_apply_crypt_scratch];
+        mov r8,  4112;                   // SDA_FRAME_BYTES
+        lea r9,  [rip + _sys_dek_apply_written];
+        call paideia_crypto_chacha20_poly1305_seal;
+        cmp rax, 0;
+        jne sda_bad_aead;
+        // Writeback: 4112 bytes (ciphertext[4096] + tag[16]).
+        mov rdi, r12;
+        lea rsi, [rip + _sys_dek_apply_crypt_scratch];
+        mov rdx, 4112;
+        call user_write_bytes_via_walk;
+        cmp rax, 0;
+        jne sda_bad_page;
+        jmp sda_ok;
+
+      sda_do_decrypt:
+        // paideia_crypto_chacha20_poly1305_open(params, sealed_ptr,
+        //                                      sealed_len, out_ptr,
+        //                                      out_cap, written_ptr).
+        lea rdi, [rip + _sys_dek_apply_aead_scratch];
+        lea rsi, [rip + _sys_dek_apply_user_scratch];
+        mov rdx, 4112;                   // sealed_len
+        lea rcx, [rip + _sys_dek_apply_crypt_scratch];
+        mov r8,  4096;                   // out_cap = plaintext only
+        lea r9,  [rip + _sys_dek_apply_written];
+        call paideia_crypto_chacha20_poly1305_open;
+        cmp rax, 0;
+        jne sda_bad_aead;
+        // Writeback: 4096 bytes (plaintext only; caller's tag slot preserved).
+        mov rdi, r12;
+        lea rsi, [rip + _sys_dek_apply_crypt_scratch];
+        mov rdx, 4096;
+        call user_write_bytes_via_walk;
+        cmp rax, 0;
+        jne sda_bad_page;
+        // fall through to sda_ok.
+
+      sda_ok:
+        xor rbp, rbp;                    // SDA_OK = 0
+        jmp sda_out;
+
+      sda_bad_mode:
+        mov rbp, 5;                      // SDA_INVALID_MODE
+        jmp sda_out;
+
+      sda_bad_row:
+        mov rbp, 1;                      // SDA_INVALID_ROW
+        jmp sda_out;
+
+      sda_bad_lba:
+        mov rbp, 3;                      // SDA_INVALID_LBA
+        jmp sda_out;
+
+      sda_bad_page:
+        mov rbp, 2;                      // SDA_INVALID_PAGE
+        jmp sda_out;
+
+      sda_bad_aead:
+        mov rbp, 4;                      // SDA_AEAD_FAIL
+        // fall through to sda_out.
+
+      sda_out:
+        // ---- Scrub _dek_scratch (4 u64 writes) ----
+        lea r10, [rip + _sys_dek_apply_dek_scratch];
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+
+        // ---- Scrub _nonce_scratch (2 u64 writes) ----
+        lea r10, [rip + _sys_dek_apply_nonce_scratch];
+        xor rax, rax;
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+
+        // ---- Scrub _aead_scratch (4 u64 writes) ----
+        lea r10, [rip + _sys_dek_apply_aead_scratch];
+        xor rax, rax;
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+
+        // ---- Scrub _user_scratch (514 qwords = 4112 B) ----
+        lea r10, [rip + _sys_dek_apply_user_scratch];
+        xor rax, rax;
+        xor rcx, rcx;
+      sda_scrub_user:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 514;
+        jb  sda_scrub_user;
+
+        // ---- Scrub _crypt_scratch (514 qwords = 4112 B) ----
+        lea r10, [rip + _sys_dek_apply_crypt_scratch];
+        xor rax, rax;
+        xor rcx, rcx;
+      sda_scrub_crypt:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 514;
+        jb  sda_scrub_crypt;
+
+        // ---- Restore status from rbp and unwind frame ----
+        mov rax, rbp;
+        add rsp, 8;
+        pop rbp;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}

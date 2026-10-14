@@ -103,6 +103,43 @@ ALLOWLIST = {
         "production path at M2 (harness-only; _cap_minter_set_active_env "
         "is a stub). Retires when R125.M3 wires derive to IPC dispatch.",
 
+    # Wave UMB-W11 R127.M1 (paideia-os#2597): svc.shell-session
+    # daemon bringup + direct-call API. SHELL_SESSION INIT OK fires
+    # on every boot from _shell_session_init during the svc.*
+    # bringup cascade (kernel_main.pdx after _cap_minter_init,
+    # before witness_r30_platform). SHELL_SESSION CREATE OK /
+    # STATE OK / DESTROY OK are present as .rodata tag literals
+    # inside the direct-call API functions; at M1 no production
+    # path invokes them because the shell parent cannot bind to the
+    # daemon until R127.M2 registers KIND_SHELL_SESSION and adds
+    # the cap-invoke dispatch arm. All four retire from this
+    # allowlist when R127.M2 lands with asserting smoke-mode
+    # goldens driving each verb end-to-end (bringup + a shell
+    # parent task minting / state-cycling / destroying one or
+    # more sessions).
+    "SHELL_SESSION INIT OK":
+        "Wave UMB-W11 R127.M1: src/kernel/core/svc/shell_session.pdx "
+        "emits this unconditionally on boot via _shell_session_init "
+        "in the svc.* bringup cascade. Retires when R127.M2 (KIND_"
+        "SHELL_SESSION + cap-invoke dispatch) adds an asserting "
+        "smoke-mode golden.",
+    "SHELL_SESSION CREATE OK":
+        "Wave UMB-W11 R127.M1: src/kernel/core/svc/shell_session.pdx "
+        "emits this from _shell_session_create. Unreachable from any "
+        "production path at M1 (no shell parent task binds to the "
+        "daemon until R127.M2 lands KIND_SHELL_SESSION). Retires "
+        "when R127.M2 wires the cap-invoke CREATE op.",
+    "SHELL_SESSION STATE OK":
+        "Wave UMB-W11 R127.M1: src/kernel/core/svc/shell_session.pdx "
+        "emits this from _shell_session_set_state. Unreachable from "
+        "any production path at M1 (same reason as CREATE OK). "
+        "Retires when R127.M2 wires the cap-invoke SET_STATE op.",
+    "SHELL_SESSION DESTROY OK":
+        "Wave UMB-W11 R127.M1: src/kernel/core/svc/shell_session.pdx "
+        "emits this from _shell_session_destroy. Unreachable from "
+        "any production path at M1 (same reason as CREATE OK). "
+        "Retires when R127.M2 wires the cap-invoke DESTROY op.",
+
     # Wave β (paideia-os compositor QEMU bring-up, α–τ plan): three
     # compositor bring-up markers that fire on every boot once
     # src/user/init.pdx's β-01 fork+exec+wait4 cycle runs the

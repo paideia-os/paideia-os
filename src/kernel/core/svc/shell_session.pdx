@@ -1,0 +1,1008 @@
+// src/kernel/core/svc/shell_session.pdx -- Wave UMB-W11 R127.M1
+// paideia-os #2597
+//
+// SVC.SHELL-SESSION DAEMON: REPL SESSION OWNERSHIP SUBSTRATE
+// =============================================================================
+//
+// R127 ("REPL session process + history storage") milestone M1.  M1
+// adds the kernel-side daemon that OWNS one or more running shell REPL
+// sessions, their history buffer anchors, and the cap-env slot each
+// session was launched under.  R127.M2 (follow-on) adds the KIND_
+// SHELL_SESSION capability + cap_invoke dispatch surface so ring-3
+// callers can bind to a session by cap rather than by direct kernel
+// call; M1 lands the daemon substrate and the direct-call API.
+//
+// Service name:    "svc.shell-session"
+// Endpoint id:     21 (claimed via endpoint_alloc_at)
+// Broker row:      svc_register("svc.shell-session", 17, 21)
+// Direct API:      _shell_session_{create,lookup,set_state,destroy}
+//
+// =============================================================================
+// SECTION 0  WHY A DAEMON INSTEAD OF A PER-TASK FIELD
+// =============================================================================
+//
+// A REPL session is an aggregate of (pid, tty_fd, cap_env_slot, history
+// anchor, lifecycle state, display name).  Only one of those -- pid --
+// is already in the task struct; the rest are shell-specific and have
+// no obvious home on the task row without widening it for every task
+// that isn't a shell.  A dedicated row pool keyed by session_id lets us
+// keep the shell state out of the task hot path and gives R127.M2 a
+// stable id to mint KIND_SHELL_SESSION caps against.
+//
+// Shape mirrors `svc.cap-minter` (R125.M2, cap_minter.pdx) one-for-one:
+// a bringup entry that claims a specific endpoint via endpoint_alloc_at
+// + svc_register, a small row pool with a linear scan for find-free,
+// and a direct-call API for in-kernel callers that is lifted to a
+// cap_invoke dispatch surface in the next milestone.
+//
+// =============================================================================
+// SECTION 1  ROW LAYOUT  --  128 BYTES PER ROW, 8 ROWS
+// =============================================================================
+//
+// Per R127.M1 task directive, each row is 128 bytes = 16 u64.  Stride
+// 128 is a power of two so row addressing uses `shl rax, 7` -- no imul.
+//
+//   [+0]    pid              (u64)  owning process pid (0 is reserved;
+//                                    a pid of 0 at mint time is refused
+//                                    with SS_ERR_BAD_PID)
+//   [+8]    tty_fd           (u64)  the fd number the shell reads/writes
+//                                    (opaque to this daemon; the shell
+//                                    minted it against a KIND_IO_HANDLE)
+//   [+16]   cap_env_slot     (u64)  env_handle of the cap-env this
+//                                    session's commands launch under
+//                                    (R125.M1 kind_cap_env row index)
+//   [+24]   history_head     (u64)  tail-pointer into the history ring
+//                                    buffer (R127.M3 populates; M1
+//                                    writes 0 at mint)
+//   [+32]   history_tail     (u64)  head-pointer into the history ring
+//                                    buffer (R127.M3 populates; M1
+//                                    writes 0 at mint)
+//   [+40]   state (u32) + reserved (u32)   stored as one u64 store.
+//                                    Low 32 bits = state (SS_STATE_*);
+//                                    high 32 bits reserved for a future
+//                                    generation counter (R127.M2).
+//   [+48]   name[ 0.. 7]     (u64 word; 8 raw bytes of the display name)
+//   [+56]   name[ 8..15]     (u64 word)
+//   [+64]   name[16..23]     (u64 word)
+//   [+72]   name[24..31]     (u64 word)
+//   [+80]   name[32..39]     (u64 word)
+//   [+88]   name[40..47]     (u64 word)
+//   [+96]   name[48..55]     (u64 word)
+//   [+104]  name[56..63]     (u64 word -- 64 total name bytes, the
+//                                    last byte reserved for a trailing
+//                                    NUL so the max usable name length
+//                                    is 63)
+//   [+112]  in_use           (u64)  0 = row free, 1 = row allocated.
+//                                    .bss zero-init gives us the FREE
+//                                    sentinel for free at real boot.
+//   [+120]  reserved         (u64)  slack for R127.M2 (expected to hold
+//                                    the KIND_SHELL_SESSION rights
+//                                    mask once the cap-invoke arm
+//                                    lands)
+//
+// Row-addressed capacity: SS_POOL_MAX = 8 sessions.  8 x 128 = 1024
+// bytes = 128 u64.  The `in_use` field at +112 (not pid) is the
+// authoritative free/live gate so that a pid of 0 could be minted
+// safely in a future refactor; today pid==0 is still rejected at mint
+// time to keep the "pid is a positive integer" shell contract honest.
+//
+// =============================================================================
+// SECTION 2  STATE MACHINE
+// =============================================================================
+//
+// R127.M1 states (name = ordinal):
+//
+//   INIT       = 0   -- freshly created, no stdin forwarder yet attached
+//   ACTIVE     = 1   -- stdin forwarder attached; commands may execute
+//   SUSPENDED  = 2   -- shell parked (job-control stop / ^Z equivalent)
+//   TERMINATED = 3   -- post-exit; row stays live until _destroy is called
+//                       so the shell parent can scrape exit status.
+//
+// Transitions at M1 are permissive -- any state X may move to any
+// state Y where Y < 4.  R127.M3 (shell lifecycle manager) tightens
+// this into:
+//
+//   INIT       -> ACTIVE
+//   ACTIVE     -> SUSPENDED | TERMINATED
+//   SUSPENDED  -> ACTIVE | TERMINATED
+//   TERMINATED -> (terminal; _destroy only)
+//
+// Keeping M1 permissive sidesteps a bootstrap ordering question: at
+// M1 we don't yet know which component (shell parent? session daemon
+// itself?) owns the SUSPEND verb for ^Z (feedback_novel_clean_design
+// — the frozen POSIX job-control shape is explicitly a design
+// decision for M3, not an inheritance).  State >= 4 is refused with
+// SS_ERR_BAD_STATE.
+//
+// =============================================================================
+// SECTION 3  RETURN CODE BAND
+// =============================================================================
+//
+// Per task directive:
+//
+//   SS_OK                 = 0
+//   SS_ERR_POOL_FULL      = 0x1101
+//   SS_ERR_BAD_ID         = 0x1102
+//   SS_ERR_BAD_PID        = 0x1103
+//   SS_ERR_BAD_STATE      = 0x1104
+//
+// All fit imm32 with bit 31 clear so `mov rax, imm32` emits the 7-byte
+// zero-extending form.  Band audit (2026-10-13):
+//   `grep -rnE '0x110[1-4]\b' src/kernel/ 2>/dev/null` -> zero hits
+// in the production tree.  Clean band; R127.M2+ may extend to
+// 0x1105..0x110F while retaining the first four as pinned.
+//
+// _shell_session_create returns a PACKED u64:
+//
+//     result = (session_id << 2) | status
+//
+// On success status == SS_OK (0), so result == session_id << 2 and
+// the caller recovers session_id by right-shifting 2 bits.  Session
+// ids live in [0, 8), so session_id << 2 is in [0, 32) -- disjoint
+// from every SS_ERR_* value (all >= 0x1101) so a caller that treats
+// the whole u64 as an error-or-id tagged value never collides.  On
+// error session_id is 0, so result == status.
+//
+// _shell_session_lookup returns the raw session_id or 0xFF (which is
+// outside the valid pool range and distinct from any SS_ERR_* code --
+// 0xFF < 0x1101).
+//
+// _shell_session_set_state and _shell_session_destroy return SS_OK or
+// an SS_ERR_* code directly (not packed).
+//
+// Bringup codes (adjacent to cap_minter's EBD0/EBD1 pair, using the
+// free EBC8..EBDF band noted in cmd_invoke.pdx):
+//
+//   SS_BRINGUP_EP_FAIL  = 0xFFFFEBD2  (endpoint_alloc_at(21) refused)
+//   SS_BRINGUP_REG_FAIL = 0xFFFFEBD3  (svc_register refused)
+//
+// =============================================================================
+// SECTION 4  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Labels are prefixed `ss_` (shell-session) to stay clear of `svc_`
+// (ipc/svc_broker.pdx) and the broader `s_` family.  Encoder-pitfall
+// posture (feedback_pdx_encoder_pitfalls):
+//
+//   * cmp rN, 0            (never `test rN, rN`)
+//   * shl rN, 7 to compose row-base * 128 stride (never `imul r, imm`)
+//   * mov rax, imm32       (never `and r11, imm64`)
+//   * single-line `pub let name = "..."`
+//   * module basename ShellSession matches file basename shell_session.pdx
+//   * fingerprint `[u8; N]` with N = string length + 1 (NUL counts)
+//
+// Stack discipline (SysV, entry rsp%16==8):
+//   _shell_session_init         1 push  (r12 across the klog call)
+//   _shell_session_lookup       0 pushes (pure leaf scan)
+//   _shell_session_create       5 pushes (rbx/r12/r13/r14/r15)
+//   _shell_session_set_state    2 pushes + sub rsp, 8   (klog_s1_x1_d1
+//                                                        1-stack-arg)
+//   _shell_session_destroy      1 push  (rbx)
+//
+// =============================================================================
+// SECTION 5  BOOT WIRING NOTE
+// =============================================================================
+//
+// kernel_main.pdx picks this up with ONE new call after _cap_minter_init
+// and BEFORE witness_r30_platform:
+//
+//   call elevate_broker_bringup;     // ENDPOINT 16, R48-PREP-005.M1
+//   call schema_registry_bringup;    // ENDPOINT 18, R90-XREPO.012.M2
+//   call _cap_minter_init;           // ENDPOINT 20, R125.M2
+//   call _shell_session_init;        // ENDPOINT 21, R127.M1 (this file)
+//   call witness_r30_platform;       // R30 platform witness cascade
+//
+// Placement rationale: AFTER the two svc.* bringups (so the broker
+// table has the elevate / schema / cap-minter rows published before
+// the shell daemon registers) and BEFORE witness_r30_platform (so a
+// future platform witness that spins up a shell task sees the
+// svc.shell-session row).
+//
+// Dispatch arm reservation:
+//
+// At R127.M1 there is NO cap_invoke dispatch arm for KIND_SHELL_
+// SESSION.  Named-IPC callers (if any arrive before R127.M2) route
+// through the broker:
+//
+//   endpoint_id = svc_lookup("svc.shell-session")  (= 21)
+//   send CREATE frame to endpoint_id, receive REPLY
+//
+// The frame-body dispatcher is landed by R127.M2 alongside the
+// KIND_SHELL_SESSION kind registration.  The direct-call API below
+// is the in-kernel surface the shell parent task uses before the
+// cap-invoke surface lands.
+//
+// =============================================================================
+
+module ShellSession = structure {
+
+  // ==========================================================================
+  // Service identity
+  // ==========================================================================
+
+  pub let SHELL_SESSION_ENDPOINT_ID : u64 = 21
+  pub let SHELL_SESSION_NAME_LEN    : u64 = 17  // "svc.shell-session" is 17 bytes
+
+  // "svc.shell-session" (17 chars) + NUL => [u8; 18].
+  pub let shell_session_name : [u8; 18] = "svc.shell-session\0"
+
+  // ==========================================================================
+  // Return band (task-pinned, §3)
+  // ==========================================================================
+
+  pub let SS_OK            : u64 = 0
+  pub let SS_ERR_POOL_FULL : u64 = 0x1101
+  pub let SS_ERR_BAD_ID    : u64 = 0x1102
+  pub let SS_ERR_BAD_PID   : u64 = 0x1103
+  pub let SS_ERR_BAD_STATE : u64 = 0x1104
+
+  pub let SS_BRINGUP_EP_FAIL  : u64 = 0xFFFFEBD2
+  pub let SS_BRINGUP_REG_FAIL : u64 = 0xFFFFEBD3
+
+  // ==========================================================================
+  // Pool geometry (§1)
+  // ==========================================================================
+
+  pub let SS_POOL_MAX   : u64 = 8     // rows (sessions)
+  pub let SS_ROW_BYTES  : u64 = 128   // 16 u64 per row
+
+  // Row-field offsets (bytes, from row base)
+  pub let SS_OFF_PID         : u64 = 0
+  pub let SS_OFF_TTY_FD      : u64 = 8
+  pub let SS_OFF_CAP_ENV     : u64 = 16
+  pub let SS_OFF_HIST_HEAD   : u64 = 24
+  pub let SS_OFF_HIST_TAIL   : u64 = 32
+  pub let SS_OFF_STATE       : u64 = 40
+  pub let SS_OFF_NAME        : u64 = 48
+  pub let SS_OFF_IN_USE      : u64 = 112
+  pub let SS_OFF_RESERVED    : u64 = 120
+
+  pub let SS_NAME_MAX   : u64 = 63    // 64 bytes with trailing NUL
+
+  // Sentinel for "no session matched" (lookup).
+  pub let SS_ID_NONE : u64 = 0xFF
+
+  // State machine (§2)
+  pub let SS_STATE_INIT       : u64 = 0
+  pub let SS_STATE_ACTIVE     : u64 = 1
+  pub let SS_STATE_SUSPENDED  : u64 = 2
+  pub let SS_STATE_TERMINATED : u64 = 3
+  pub let SS_STATE_MAX        : u64 = 4   // exclusive upper bound
+
+  // ==========================================================================
+  // Storage
+  //
+  //   _shell_session_pool  -- 8 rows x 128 bytes = 128 u64. @align(64)
+  //                           puts the pool start on a cache-line
+  //                           boundary (rows 0, 2, 4, 6 land on cache
+  //                           line starts; the 128 stride is a power
+  //                           of two so no imul is needed).
+  //   _shell_session_stats -- 8 u64 counters (observability).
+  // ==========================================================================
+
+  pub let mut _shell_session_pool  : [u64; 128] = uninit @align(64)
+  pub let mut _shell_session_stats : [u64; 8]   = uninit @align(64)
+
+  pub let SS_ST_INIT_OK        : u64 = 0
+  pub let SS_ST_INIT_EP_FAIL   : u64 = 1
+  pub let SS_ST_INIT_REG_FAIL  : u64 = 2
+  pub let SS_ST_CREATE_OK      : u64 = 3
+  pub let SS_ST_CREATE_FULL    : u64 = 4
+  pub let SS_ST_CREATE_BAD_PID : u64 = 5
+  pub let SS_ST_STATE_OK       : u64 = 6
+  pub let SS_ST_DESTROY_OK     : u64 = 7
+
+  // ==========================================================================
+  // Fingerprint tags (N = len(string) + 1, NUL-inclusive)
+  //
+  // Only the "OK" tags are extracted by the fingerprint-coverage gate
+  // (regex matches bare word OK); the FAIL/REJ tags are opaque to the
+  // gate so no allowlist entry is required for them.
+  // ==========================================================================
+
+  // "SHELL_SESSION INIT OK"    = 21 chars, +1 NUL => N=22
+  // "SHELL_SESSION INIT FAIL"  = 23 chars, +1 NUL => N=24
+  // "SHELL_SESSION CREATE OK"  = 23 chars, +1 NUL => N=24
+  // "SHELL_SESSION CREATE REJ" = 24 chars, +1 NUL => N=25
+  // "SHELL_SESSION STATE OK"   = 22 chars, +1 NUL => N=23
+  // "SHELL_SESSION STATE REJ"  = 23 chars, +1 NUL => N=24
+  // "SHELL_SESSION DESTROY OK"  = 24 chars, +1 NUL => N=25
+  // "SHELL_SESSION DESTROY REJ" = 25 chars, +1 NUL => N=26
+
+  pub let ss_tag_init_ok     : [u8; 22] = "SHELL_SESSION INIT OK\0"
+  pub let ss_tag_init_fail   : [u8; 24] = "SHELL_SESSION INIT FAIL\0"
+  pub let ss_tag_create_ok   : [u8; 24] = "SHELL_SESSION CREATE OK\0"
+  pub let ss_tag_create_rej  : [u8; 25] = "SHELL_SESSION CREATE REJ\0"
+  pub let ss_tag_state_ok    : [u8; 23] = "SHELL_SESSION STATE OK\0"
+  pub let ss_tag_state_rej   : [u8; 24] = "SHELL_SESSION STATE REJ\0"
+  pub let ss_tag_destroy_ok  : [u8; 25] = "SHELL_SESSION DESTROY OK\0"
+  pub let ss_tag_destroy_rej : [u8; 26] = "SHELL_SESSION DESTROY REJ\0"
+
+  pub let ss_k_pid    : [u8; 4] = "pid\0"
+  pub let ss_k_sid    : [u8; 4] = "sid\0"
+  pub let ss_k_state  : [u8; 6] = "state\0"
+  pub let ss_k_errno  : [u8; 6] = "errno\0"
+
+  // ==========================================================================
+  // ss_note(slot) -> ()
+  //
+  // Bounded increment on _shell_session_stats[slot].  Same shape as
+  // cap_env_note / cmnt_note (load-inc-store; no `add reg, [mem]`).
+  // Caller passes an SS_ST_* ordinal; the bounds check guards against
+  // the pool size (8).
+  // ==========================================================================
+  pub let ss_note : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R127.M1 (paideia-os #2597): bounded increment on _shell_session_stats[slot<8]. Load-inc-store, no `add reg,[mem]`. Pure leaf -- no pushes. Labels prefixed ss_no_.",
+      block: {
+        cmp rdi, 8;
+        jae ss_no_out;
+        lea r10, [rip + _shell_session_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      ss_no_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ss_row_base(session_id) -> &_shell_session_pool[session_id*128]
+  //
+  // Row index -> row base pointer.  Stride 128 = 2^7 so `shl rax, 7`
+  // suffices (no `imul r, imm` encoder gap, no reg-reg staging).
+  // Caller is responsible for validating session_id < SS_POOL_MAX
+  // first; this helper is a pure address compute.
+  // ==========================================================================
+  pub let ss_row_base : (u64) -> u64 !{} @{} =
+    fn (session_id: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R127.M1 (paideia-os #2597): session_id -> &_shell_session_pool[session_id*128]. Power-of-two stride uses `shl rax, 7` so no 2-op imul-with-imm is required. No bounds check by policy -- caller validates. Labels prefixed ss_rb_.",
+      block: {
+        mov rax, rdi;                    // session_id
+        shl rax, 7;                      // session_id * 128
+        lea r10, [rip + _shell_session_pool];
+        add rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ss_row_in_use(session_id) -> 1 iff session_id<SS_POOL_MAX AND
+  //                                     row.in_use != 0
+  //
+  // Validator used by set_state / destroy / lookup.  Inlined row-base
+  // compute (shl 7).  Pure leaf -- no pushes, no nested calls.
+  // ==========================================================================
+  pub let ss_row_in_use : (u64) -> u64 !{mem} @{} =
+    fn (session_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R127.M1 (paideia-os #2597): 1 iff session_id<SS_POOL_MAX(8) AND row.in_use (word at [+112]) != 0. Inlined address compute (shl 7). Pure leaf. Labels prefixed ss_ru_.",
+      block: {
+        mov r10, 8;                      // SS_POOL_MAX
+        cmp rdi, r10;
+        jae ss_ru_no;
+        mov rax, rdi;
+        shl rax, 7;                      // session_id * 128
+        lea r10, [rip + _shell_session_pool];
+        add rax, r10;                    // row base
+        mov r10, [rax + 112];            // in_use field
+        cmp r10, 0;
+        je  ss_ru_no;
+        mov rax, 1;
+        ret;
+      ss_ru_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ss_find_free() -> session_id | SS_ID_NONE
+  //
+  // Linear scan for the first row whose in_use field is zero.  Used
+  // only by _shell_session_create.  Pure leaf (row-base is inlined).
+  // ==========================================================================
+  pub let ss_find_free : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R127.M1 (paideia-os #2597): linear scan _shell_session_pool[0..SS_POOL_MAX) for the first row whose in_use (word at [+112]) is zero. Return session_id or SS_ID_NONE (0xFF). Inlined row-base (shl 7). Pure leaf -- no pushes. Labels prefixed ss_ff_.",
+      block: {
+        lea r10, [rip + _shell_session_pool];
+        xor rcx, rcx;                    // session_id cursor
+      ss_ff_scan:
+        cmp rcx, 8;                      // SS_POOL_MAX
+        jae ss_ff_none;
+
+        mov rax, rcx;
+        shl rax, 7;                      // session_id * 128
+        add rax, r10;                    // row base
+        mov r11, [rax + 112];            // in_use
+        cmp r11, 0;
+        je  ss_ff_hit;
+
+        add rcx, 1;
+        jmp ss_ff_scan;
+
+      ss_ff_hit:
+        mov rax, rcx;
+        ret;
+
+      ss_ff_none:
+        mov rax, 0xFF;                   // SS_ID_NONE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _shell_session_init() -> SS_OK | SS_BRINGUP_*
+  //
+  // Boot hook.  Shape mirrors _cap_minter_init one-for-one:
+  //   (1) endpoint_alloc_at(21).  On refusal -> SS_BRINGUP_EP_FAIL
+  //       WITHOUT calling svc_register (the row never publishes a name
+  //       against an endpoint id we did not claim).
+  //   (2) svc_register("svc.shell-session", 17, 21).  Any non-zero
+  //       code (NAME_LEN / DUP / FULL) maps to SS_BRINGUP_REG_FAIL.
+  //
+  // Register plan: 1 callee-save push (r12 holds the bringup code
+  // across klog) to correct entry parity rsp%16==8 -> 0 for the two
+  // sibling (non-nested) calls, matching cap_minter_init / schema_
+  // registry_bringup shape.
+  //
+  // Fingerprint emission:
+  //   On success:  `SHELL_SESSION INIT OK` (no KV).
+  //   On EP fail:  `SHELL_SESSION INIT FAIL errno=0x<hex>` with EP_FAIL.
+  //   On REG fail: `SHELL_SESSION INIT FAIL errno=0x<hex>` with REG_FAIL.
+  // ==========================================================================
+  pub let _shell_session_init : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R127.M1 (paideia-os #2597): kernel-side bringup for svc.shell-session. Claims SHELL_SESSION_ENDPOINT_ID (21) via endpoint_alloc_at; on refusal returns SS_BRINGUP_EP_FAIL WITHOUT calling svc_register. On successful claim, calls svc_register(shell_session_name, 17, 21) and translates its {0=OK, 1=NAME_LEN, 2=DUP, 3=FULL} return into SS_OK / SS_BRINGUP_REG_FAIL. Single callee-save push (r12) corrects entry parity rsp%16==8 -> 0 for the two sibling (non-nested) calls, matching cap_minter_init / schema_registry_bringup / elevate_broker_bringup one-for-one. Bumps SS_ST_INIT_OK / INIT_EP_FAIL / INIT_REG_FAIL and emits one fingerprint. Labels prefixed ss_in_.",
+      block: {
+        push r12;
+
+        // (1) endpoint_alloc_at(21).
+        mov rdi, 21;                     // SHELL_SESSION_ENDPOINT_ID
+        call endpoint_alloc_at;
+        cmp rax, 0;
+        jne ss_in_ep_fail;
+
+        // (2) svc_register("svc.shell-session", 17, 21).
+        lea rdi, [rip + shell_session_name];
+        mov rsi, 17;                     // SHELL_SESSION_NAME_LEN
+        mov rdx, 21;                     // endpoint id
+        call svc_register;
+        cmp rax, 0;
+        jne ss_in_reg_fail;
+
+        // Success path.
+        mov rdi, 0;                      // SS_ST_INIT_OK
+        call ss_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ss_tag_init_ok];
+        call klog_s1;
+
+        xor rax, rax;                    // SS_OK
+        pop r12;
+        ret;
+
+      ss_in_ep_fail:
+        mov rdi, 1;                      // SS_ST_INIT_EP_FAIL
+        call ss_note;
+
+        mov r12, 0xFFFFEBD2;             // SS_BRINGUP_EP_FAIL
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ss_tag_init_fail];
+        lea rcx, [rip + ss_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        pop r12;
+        ret;
+
+      ss_in_reg_fail:
+        mov rdi, 2;                      // SS_ST_INIT_REG_FAIL
+        call ss_note;
+
+        mov r12, 0xFFFFEBD3;             // SS_BRINGUP_REG_FAIL
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ss_tag_init_fail];
+        lea rcx, [rip + ss_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _shell_session_lookup(pid) -> session_id | SS_ID_NONE
+  //
+  // Linear scan for the first row whose in_use==1 AND pid matches the
+  // argument.  Returns session_id in [0, 8) on hit, SS_ID_NONE (0xFF)
+  // on miss.  pid==0 is reserved and never produces a hit (any row with
+  // pid==0 is a programming error since _shell_session_create refuses
+  // such rows with SS_ERR_BAD_PID).
+  //
+  // Pure leaf -- no pushes, no nested calls.  Labels prefixed ss_lu_.
+  // ==========================================================================
+  pub let _shell_session_lookup : (u64) -> u64 !{mem} @{} =
+    fn (pid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R127.M1 (paideia-os #2597): scan _shell_session_pool[0..SS_POOL_MAX) for the first row whose in_use (word at [+112]) is 1 AND pid (word at [+0]) matches rdi. Return session_id (0..7) or SS_ID_NONE (0xFF) on miss. pid==0 can never match a live row because _shell_session_create refuses pid==0 at mint time. Inlined row-base (shl 7). Pure leaf -- no callee-save pushes, no nested calls. Labels prefixed ss_lu_.",
+      block: {
+        lea r10, [rip + _shell_session_pool];
+        xor rcx, rcx;                    // session_id cursor
+      ss_lu_scan:
+        cmp rcx, 8;                      // SS_POOL_MAX
+        jae ss_lu_none;
+
+        mov rax, rcx;
+        shl rax, 7;                      // session_id * 128
+        add rax, r10;                    // row base
+
+        // Row must be in_use.
+        mov r11, [rax + 112];
+        cmp r11, 0;
+        je  ss_lu_next;
+
+        // pid must match.
+        mov r11, [rax + 0];
+        cmp r11, rdi;
+        je  ss_lu_hit;
+
+      ss_lu_next:
+        add rcx, 1;
+        jmp ss_lu_scan;
+
+      ss_lu_hit:
+        mov rax, rcx;
+        ret;
+
+      ss_lu_none:
+        mov rax, 0xFF;                   // SS_ID_NONE
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _shell_session_create(pid, tty_fd, cap_env_slot, name_ptr, name_len)
+  //                                                     -> packed u64
+  //
+  // Create a fresh session row.
+  //
+  // ARGS (SysV):
+  //   rdi = pid           (must be non-zero)
+  //   rsi = tty_fd        (opaque)
+  //   rdx = cap_env_slot  (opaque; validated at R125.M1 layer)
+  //   rcx = name_ptr      (readable up to name_len bytes; may be 0 iff
+  //                        name_len is 0)
+  //   r8  = name_len      (clamped to SS_NAME_MAX = 63; the +64th byte
+  //                        is reserved for the trailing NUL)
+  //
+  // RETURNS (rax):
+  //   On success:  (session_id << 2) | SS_OK  (SS_OK=0, so just
+  //                session_id * 4; recoverable via `shr rax, 2`)
+  //   SS_ERR_BAD_PID    -- pid == 0, or a live row already holds this pid
+  //   SS_ERR_POOL_FULL  -- all 8 rows are in use
+  //
+  // STEP-BY-STEP:
+  //   1. pid != 0 -> else SS_ERR_BAD_PID.
+  //   2. _shell_session_lookup(pid) != SS_ID_NONE -> SS_ERR_BAD_PID
+  //      (duplicate; a pid can own at most one session).
+  //   3. ss_find_free() -> session_id.  If SS_ID_NONE -> SS_ERR_POOL_FULL.
+  //   4. Init row:
+  //        pid           <- rdi
+  //        tty_fd        <- rsi (preserved via r12)
+  //        cap_env_slot  <- rdx (preserved via r13)
+  //        history_head  <- 0
+  //        history_tail  <- 0
+  //        state         <- SS_STATE_INIT (0) in low 32 bits (zero u64 write)
+  //        name[0..63]   <- byte-copy up to min(name_len, 63); NUL at
+  //                         byte min(name_len, 63) (so a name_len of 63
+  //                         writes bytes 0..62 and NUL at 63).
+  //        in_use        <- 1
+  //        reserved      <- 0 (bss-zero preserved; no explicit write)
+  //   5. Bump SS_ST_CREATE_OK; emit `SHELL_SESSION CREATE OK pid=0x<hex>`.
+  //   6. Return (session_id << 2) | SS_OK.
+  //
+  // STACK FRAME:
+  //   5 callee-save pushes.  Entry rsp%16==8; +5 pushes = +40 -> %16==0
+  //   (call-ready at every nested call).  No sub rsp because every
+  //   nested call is a 5-reg (klog_s1_x1) or no-stack-arg wrapper.
+  //
+  //   REGISTER MAP:
+  //     rbx = pid (held across every nested call; also the fingerprint v)
+  //     r12 = tty_fd
+  //     r13 = cap_env_slot
+  //     r14 = name_ptr
+  //     r15 = clamped name_len / later session_id
+  //
+  //   NAME COPY:
+  //     After allocation we recover session_id, compute row_base via
+  //     ss_row_base, and bulk-write the fixed fields.  The name byte
+  //     copy is a short loop (name_len <= 63) using `mov_b` which the
+  //     paideia-as encoder emits.  NUL is written at [name_base + clamped_len].
+  //
+  //   Labels prefixed ss_cr_.
+  // ==========================================================================
+  pub let _shell_session_create : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (pid: u64) (tty_fd: u64) (cap_env_slot: u64) (name_ptr: u64) (name_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R127.M1 (paideia-os #2597): mint a fresh session row. Validate pid != 0 (SS_ERR_BAD_PID), lookup-by-pid for duplicate detection (SS_ERR_BAD_PID), find a free row (SS_ERR_POOL_FULL on none), write fixed fields pid/tty_fd/cap_env_slot/history_head=0/history_tail=0/state=INIT, byte-copy up to min(name_len, 63) bytes from name_ptr with a trailing NUL, set in_use=1, bump SS_ST_CREATE_OK, emit `SHELL_SESSION CREATE OK pid=0x<16-hex>` via klog_s1_x1 (5-reg wrapper), and return (session_id << 2) | SS_OK. Five callee-save pushes (rbx=pid, r12=tty_fd, r13=cap_env_slot, r14=name_ptr, r15=clamped_name_len/then session_id) land rsp%16==0 at every nested call. Byte copy uses mov_b scalar-indexed addressing proven in svc_broker.pdx / path.pdx. Encoder-pitfall posture: cmp rN, 0 (never test), shl rN, 7 for stride-128 (never imul), mov rax, imm32 for all error codes (never and r11, imm64). Labels prefixed ss_cr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                    // pid
+        mov r12, rsi;                    // tty_fd
+        mov r13, rdx;                    // cap_env_slot
+        mov r14, rcx;                    // name_ptr
+        mov r15, r8;                     // name_len (unclamped)
+
+        // ---- Step 1: pid != 0 ----
+        cmp rbx, 0;
+        je  ss_cr_bad_pid;
+
+        // ---- Step 2: duplicate check ----
+        mov rdi, rbx;
+        call _shell_session_lookup;
+        mov r11, 0xFF;                   // SS_ID_NONE
+        cmp rax, r11;
+        jne ss_cr_bad_pid;               // existing session for this pid
+
+        // ---- Step 3: find free row ----
+        call ss_find_free;
+        mov r11, 0xFF;
+        cmp rax, r11;
+        je  ss_cr_full;
+
+        // Reuse r15 as session_id (name_len about to be clamped below).
+        // Spill name_len to rax briefly: we don't need it until the copy
+        // loop and we can clamp from r15 at that point. Simpler: clamp
+        // name_len NOW into r11, use r11 for the copy loop, free r15.
+        mov r11, r15;                    // r11 = unclamped name_len
+        mov r9,  63;                     // SS_NAME_MAX
+        cmp r11, r9;
+        jbe ss_cr_len_ok;
+        mov r11, r9;                     // clamp to 63
+      ss_cr_len_ok:
+        mov r15, rax;                    // r15 = session_id
+
+        // Compute row base.  session_id << 7 + pool base.
+        mov rax, r15;
+        shl rax, 7;
+        lea r10, [rip + _shell_session_pool];
+        add rax, r10;                    // rax = row base
+        // Keep row base in r10; r11 holds clamped name_len.
+        mov r10, rax;
+
+        // ---- Step 4: write fixed fields ----
+        mov [r10 + 0],   rbx;            // pid
+        mov [r10 + 8],   r12;            // tty_fd
+        mov [r10 + 16],  r13;            // cap_env_slot
+        xor r9,  r9;
+        mov [r10 + 24],  r9;             // history_head = 0
+        mov [r10 + 32],  r9;             // history_tail = 0
+        mov [r10 + 40],  r9;             // state (low 32) + reserved
+                                         //  (high 32) both 0
+
+        // Name copy: byte-wise mov_b from [r14 + i] to [name_dst + i].
+        // Pre-advance name_dst by 48 (name field offset) to sidestep
+        // the unsupported `mov_b [reg+reg*1+off], reg` store form
+        // (repo-wide sweep per schema_registry.pdx sreg_copy_name
+        // confirms only [reg+reg*1] and [reg+off] byte-write forms
+        // are encoded).  r9 = pre-advanced name dst pointer.
+        mov r9, r10;
+        add r9, 48;                      // r9 = &row.name[0]
+
+        // r11 = clamped name_len.  Loop i = 0 .. r11.
+        xor rcx, rcx;                    // i = 0
+      ss_cr_name_loop:
+        cmp rcx, r11;
+        jae ss_cr_name_done;
+
+        xor rax, rax;
+        mov_b rax, [r14 + rcx * 1];      // src byte
+        mov_b [r9 + rcx * 1], rax;       // dst byte at name[i]
+        add rcx, 1;
+        jmp ss_cr_name_loop;
+
+      ss_cr_name_done:
+        // Write NUL at [name + clamped_len].  Even if clamped_len==63
+        // this writes the 64th name byte -- in-bounds (name field spans
+        // [+48..+112), 64 bytes total).
+        xor rax, rax;
+        mov_b [r9 + rcx * 1], rax;
+
+        // in_use = 1 (make the row observable last so a concurrent
+        // scanner either sees FREE or fully-initialised).  r9 reused
+        // here is harmless -- the name-copy loop is complete.
+        mov r9, 1;
+        mov [r10 + 112], r9;
+
+        // ---- Step 5: stats + fingerprint ----
+        mov rdi, 3;                      // SS_ST_CREATE_OK
+        call ss_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ss_tag_create_ok];
+        lea rcx, [rip + ss_k_pid];
+        mov r8,  rbx;                    // pid in hex KV
+        call klog_s1_x1;
+
+        // ---- Step 6: packed return ----
+        //   result = (session_id << 2) | SS_OK = session_id << 2.
+        mov rax, r15;
+        shl rax, 2;
+        jmp ss_cr_out;
+
+      ss_cr_bad_pid:
+        mov rdi, 5;                      // SS_ST_CREATE_BAD_PID
+        call ss_note;
+
+        mov r12, 0x1103;                 // SS_ERR_BAD_PID (preserved
+                                         //  across klog via r12)
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ss_tag_create_rej];
+        lea rcx, [rip + ss_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        jmp ss_cr_out;
+
+      ss_cr_full:
+        mov rdi, 4;                      // SS_ST_CREATE_FULL
+        call ss_note;
+
+        mov r12, 0x1101;                 // SS_ERR_POOL_FULL
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ss_tag_create_rej];
+        lea rcx, [rip + ss_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      ss_cr_out:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _shell_session_set_state(session_id, state) -> errno
+  //
+  // Validate session_id (in [0,8) AND row in use), validate state
+  // (< SS_STATE_MAX = 4), write state into the low 32 bits of
+  // [row + 40] preserving the high 32 bits (reserved generation
+  // counter slot for R127.M2).
+  //
+  // ARGS (SysV):
+  //   rdi = session_id
+  //   rsi = new state (one of SS_STATE_*)
+  //
+  // RETURNS (rax):
+  //   SS_OK            -- state written
+  //   SS_ERR_BAD_ID    -- session_id out of range or row not in use
+  //   SS_ERR_BAD_STATE -- state >= SS_STATE_MAX
+  //
+  // STACK FRAME:
+  //   2 callee-save pushes (rbx = session_id, r12 = state) + sub rsp, 8
+  //   HELD THROUGHOUT the function body.  Entry rsp%16==8; +2 pushes
+  //   = +16 -> rsp%16==8; sub rsp,8 = +24 -> rsp%16==0 at every
+  //   nested call.  The 8-byte frame doubles as the klog_s1_x1_d1
+  //   stack-arg slot (v_dec at [rsp+0] after the write below).
+  //   Trailing `add rsp, 8` restores before the two pops.
+  //
+  // The high-32 mask 0xFFFFFFFF00000000 does NOT fit imm32, so we
+  // build it in r9 as (0xFFFFFFFF << 32) -- `mov r9, 0xFFFFFFFF; shl
+  // r9, 32` avoids the `and r11, imm64` encoder gap.
+  //
+  // Labels prefixed ss_ss_.
+  // ==========================================================================
+  pub let _shell_session_set_state : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (session_id: u64) (state: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R127.M1 (paideia-os #2597): write a new state ordinal into [row + 40] low 32 bits. Validate session_id via ss_row_in_use (else SS_ERR_BAD_ID). Validate state < SS_STATE_MAX = 4 (else SS_ERR_BAD_STATE). On write: load existing u64 at [row+40], mask off low 32 bits via `and r11, high32_mask`, OR with the new state (low 32), store back. Preserves the high 32 bits (reserved for R127.M2 generation counter). Bump SS_ST_STATE_OK, emit `SHELL_SESSION STATE OK sid=0x<hex> state=<dec>` via klog_s1_x1_d1 (6-reg + 1-stack-arg wrapper, v_dec at [rsp+0]). Two callee-save pushes (rbx=session_id, r12=state) + sub rsp,8 (HELD throughout the body: lands rsp%16==0 at every nested call AND reserves the stack-arg slot for klog_s1_x1_d1). The high-32 mask 0xFFFFFFFF00000000 does NOT fit imm32 so we build it in r9 as (0xFFFFFFFF << 32) via `mov r9, 0xFFFFFFFF; shl r9, 32` to avoid the `and r11, imm64` encoder gap. Labels prefixed ss_ss_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;                      // alignment + stack-arg slot
+                                         //  (held throughout the body)
+
+        mov rbx, rdi;                    // session_id
+        mov r12, rsi;                    // state
+
+        // ---- Validate session_id ----
+        mov rdi, rbx;
+        call ss_row_in_use;
+        cmp rax, 0;
+        je  ss_ss_bad_id;
+
+        // ---- Validate state ----
+        cmp r12, 4;                      // SS_STATE_MAX
+        jae ss_ss_bad_state;
+
+        // ---- Compute row base and update state field ----
+        //   row_base = pool + session_id << 7
+        mov rax, rbx;
+        shl rax, 7;
+        lea r10, [rip + _shell_session_pool];
+        add rax, r10;                    // rax = row base
+
+        // Load existing u64 at [row+40], mask low 32 bits, OR new state.
+        // 0xFFFFFFFF00000000 does not fit imm32, so build it in r9.
+        mov r9, 0xFFFFFFFF;              // low 32 all ones
+        shl r9, 32;                      // high-32 mask
+        mov r11, [rax + 40];
+        and r11, r9;                     // clear low 32 bits
+        or  r11, r12;                    // low 32 bits = state
+        mov [rax + 40], r11;
+
+        // ---- Stats + fingerprint ----
+        mov rdi, 6;                      // SS_ST_STATE_OK
+        call ss_note;
+
+        // klog_s1_x1_d1 (6 regs + 1 stack arg).  Stack arg slot is
+        // the [rsp+0] 8-byte we reserved on entry; write state there
+        // and call.
+        mov [rsp + 0], r12;              // v_dec = state
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ss_tag_state_ok];
+        lea rcx, [rip + ss_k_sid];
+        mov r8,  rbx;                    // v_hex = session_id
+        lea r9,  [rip + ss_k_state];
+        call klog_s1_x1_d1;
+
+        xor rax, rax;                    // SS_OK
+        jmp ss_ss_out;
+
+      ss_ss_bad_id:
+        mov r12, 0x1102;                 // SS_ERR_BAD_ID (preserved
+                                         //  across klog via r12)
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ss_tag_state_rej];
+        lea rcx, [rip + ss_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        jmp ss_ss_out;
+
+      ss_ss_bad_state:
+        mov r12, 0x1104;                 // SS_ERR_BAD_STATE
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ss_tag_state_rej];
+        lea rcx, [rip + ss_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      ss_ss_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _shell_session_destroy(session_id) -> errno
+  //
+  // Mark a row free.  Validate session_id, zero the critical fields,
+  // clear in_use so a future _create may re-use the slot.
+  //
+  // ARGS (SysV):
+  //   rdi = session_id
+  //
+  // RETURNS (rax):
+  //   SS_OK          -- row freed
+  //   SS_ERR_BAD_ID  -- session_id out of range or row already free
+  //
+  // The row is NOT fully zeroed -- fields written by _create (pid,
+  // tty_fd, etc.) are overwritten at the NEXT _create of this slot,
+  // and in_use==0 is the authoritative "not populated" sentinel so a
+  // concurrent scan cannot latch stale data.  Explicitly zero'd here:
+  //   pid           (defence-in-depth: pid==0 is the "reserved" value
+  //                  so a stale read before the next create cannot
+  //                  look like a real session)
+  //   in_use        (the LAST write; see concurrent-scan note)
+  //
+  // STACK FRAME:
+  //   1 callee-save push (rbx = session_id).  Entry rsp%16==8; +1 push
+  //   -> %16==0 (call-ready for ss_row_in_use + klog_s1_x1).
+  //
+  // Labels prefixed ss_de_.
+  // ==========================================================================
+  pub let _shell_session_destroy : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (session_id: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R127.M1 (paideia-os #2597): mark a session row free. Validate session_id via ss_row_in_use (else SS_ERR_BAD_ID); zero pid (defence-in-depth so a stale read before next _create cannot look like a real session), then clear in_use LAST so a concurrent scan either sees the live row or a fully-free row (the ordering mirrors cap_env destroy and the broker row-free discipline). Bump SS_ST_DESTROY_OK, emit `SHELL_SESSION DESTROY OK sid=0x<hex>` via klog_s1_x1. Single callee-save push (rbx = session_id) parks the id across the nested row_in_use + klog calls (entry %16==8, +1 push -> %16==0 call-ready). Labels prefixed ss_de_.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                    // session_id
+
+        // Validate session_id.
+        mov rdi, rbx;
+        call ss_row_in_use;
+        cmp rax, 0;
+        je  ss_de_bad_id;
+
+        // Compute row base.
+        mov rax, rbx;
+        shl rax, 7;
+        lea r10, [rip + _shell_session_pool];
+        add rax, r10;
+
+        // Zero pid first (defence-in-depth).
+        xor r9, r9;
+        mov [rax + 0], r9;               // pid = 0
+
+        // Clear in_use LAST so a concurrent scanner either sees the
+        // live row or a fully-free row.
+        mov [rax + 112], r9;             // in_use = 0
+
+        // Stats + fingerprint.
+        mov rdi, 7;                      // SS_ST_DESTROY_OK
+        call ss_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ss_tag_destroy_ok];
+        lea rcx, [rip + ss_k_sid];
+        mov r8,  rbx;                    // sid in hex KV
+        call klog_s1_x1;
+
+        xor rax, rax;                    // SS_OK
+        pop rbx;
+        ret;
+
+      ss_de_bad_id:
+        mov rbx, 0x1102;                 // SS_ERR_BAD_ID (reuse rbx for
+                                         //  the klog + return)
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ss_tag_destroy_rej];
+        lea rcx, [rip + ss_k_errno];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        mov rax, rbx;
+        pop rbx;
+        ret
+      }
+    }
+
+}
