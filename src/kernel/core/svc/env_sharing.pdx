@@ -1,0 +1,1313 @@
+// src/kernel/core/svc/env_sharing.pdx -- Wave UMB-W23 R139.M5
+// paideia-os #2643
+//
+// MULTI-SESSION CAPABILITY-ENVIRONMENT SHARING
+// =============================================================================
+//
+// R139 ("multi-session") milestone M5.  R125.M1 (Wave UMB-W1, #2591)
+// landed the KIND_CAP_ENV substrate: one env_handle per shell_session
+// row, backed by _cap_env_table (16 rows x 64 B, 6 slots per env).
+// R125.M2 (Wave UMB-W9, #2592) added svc.cap-minter, which NARROWS a
+// cap that the caller ALREADY HOLDS in its own env and lands the
+// derived view in a free slot of THAT SAME env.
+//
+// R139.M5 lifts that discipline across sessions.  When two shells
+// run concurrently -- the common pairs are:
+//
+//   (A) a LOCAL shell + an R137 REMOTE SHELL that just KEM-handshaked
+//       into the same box and shares a cap-env with the local user;
+//   (B) a LOCAL shell + an R135 WASI JAIL-NESTED shell whose jail
+//       supervisor pinned a cap-env slot the parent shell is also
+//       authorised against;
+//
+// -- there are moments when BOTH sessions need to see a cap that was
+// MINTED in only one (a volume cap minted in the local shell during an
+// interactive mount; a block-device cap minted in the jail parent to
+// let a sibling jail reach a shared tmpfs file; a stdout record stream
+// minted in the remote shell that the local operator wants to inspect
+// live).  Without sharing, the receiving session would have to RE-MINT
+// the cap from scratch -- which may require privileges the receiving
+// session does not hold -- or hand the entire env over, breaking the
+// bounded-cap-flow invariant.
+//
+// R139.M5 adds a NARROW-ONLY share surface that mints a child cap in
+// the destination session's env pointing at the SAME underlying
+// resource with STRICTLY NARROWED rights.  The share is tracked in a
+// bounded table (16 records) so a later _es_revoke can tear the
+// receiving-side view down without walking the whole cap_table.
+//
+// Service name:    "svc.env-sharing"  (NO BROKER REGISTRATION at M5 --
+//                                      direct-call API only; a later
+//                                      wave MAY lift this to a
+//                                      KIND_SHELL_SESSION op variant
+//                                      or a svc.cap-minter op variant.
+//                                      See design/shell/multi-session-
+//                                      cap-env-sharing.md §5.)
+// Direct API:      _es_share / _es_lookup_sharing / _es_revoke
+//
+// =============================================================================
+// SECTION 0  WHY A STANDALONE MODULE INSTEAD OF A CAP-MINTER OP
+// =============================================================================
+//
+// The R125.M2 _cap_minter_derive signature targets ONE env -- the
+// ambient `_cap_minter_active_env`.  Cross-session sharing names TWO
+// envs (src + dst) and persists the (src, dst, rights, record_idx)
+// tuple so revocation does not need to walk the full cap_table in
+// search of the shared child.  Rather than widening _cap_minter_derive
+// with a dst-env argument -- which would complicate every existing
+// in-session narrow callsite -- we land R139.M5 as a sibling module
+// that REUSES the same narrow-only invariant and the same
+// cap_mint_write path.
+//
+// A future wave MAY retire this module in favour of a cap-minter op
+// variant (op_arg carries src_slot in bits [15:8], rights_mask in
+// [23:16]... the encoding is deferred to a later design iteration).
+// At M5 the standalone shape keeps the share-record table local to
+// the sharing substrate and keeps _cap_minter_derive's single-env
+// contract intact.
+//
+// =============================================================================
+// SECTION 1  SHARE RECORD LAYOUT  --  16 RECORDS x 32 BYTES
+// =============================================================================
+//
+// Per task directive each record is 32 bytes = 4 u64.  Stride 32 is a
+// power of two so row addressing uses `shl rax, 5` -- no `imul r,
+// imm` (paideia-as encoder gap).  The {u32, u32} pairs are stored as
+// packed u64 so a single 8-byte load/store suffices.
+//
+//   [+0]   src_sid_dst_sid    (u64)  low 32 = src_session_id
+//                                     high 32 = dst_session_id
+//   [+8]   src_slot_dst_slot  (u64)  low 32 = src_env_slot
+//                                     high 32 = dst_env_slot
+//   [+16]  rights_mask        (u64)  rights handed to the destination
+//                                     (strict subset of parent's rights)
+//   [+24]  flags              (u64)  bit 0 = IN_USE (record allocated)
+//                                     all other bits reserved (zero)
+//
+// Row-addressed capacity: ES_RECORDS_MAX = 16 records.  16 x 32 = 512
+// bytes = 64 u64.  The flags==0 sentinel marks a FREE record (.bss
+// zero-init handles the pool at real boot; the defensive reset covers
+// chaos-restart / witness-replay paths).
+//
+// Flag bit 0 = IN_USE: a record whose IN_USE bit is set has (a) a
+// matching derived cap in the destination env's slot (dst_env_slot),
+// and (b) the (src_sid, src_env_slot) pair that originated it is the
+// unique key for lookups.
+//
+// =============================================================================
+// SECTION 2  PUBLIC API
+// =============================================================================
+//
+// _es_init() -> ()
+//   Boot-time scrub of _es_share_table (16 x 32 = 512 B) + _es_stats
+//   (8 u64) + one `ENV_SHARE INIT OK` fingerprint.  .bss zero-init
+//   handles the pool at real boot; the explicit scrub is defensive
+//   for the chaos-restart / witness-replay path.
+//
+// _es_share(src_session_id, dst_session_id, src_env_slot, rights_mask)
+//                                                     -> packed u64
+//   Mint a child cap in dst_session's env pointing at the same
+//   underlying resource as the parent cap in src_session's env at
+//   src_env_slot, with STRICTLY NARROWED rights.  Returns:
+//     success: (dst_env_slot << 2) | ES_OK          (status in [0,4))
+//     failure: status                                (ES_ERR_* >= 0x1102)
+//   The success-packed form is disjoint from every ES_ERR_* code
+//   because env slots are in [0, 6) so (dst_env_slot << 2) is in
+//   [0, 24) which is below the lowest error code 0x1102.
+//
+//   Failure cases (short form; the long form lives in §4):
+//     bad src_sid / dst_sid / src_env_slot / empty src slot
+//       -> ES_ERR_BAD_SESSION
+//     requested rights wider than parent's rights
+//       -> ES_ERR_WIDEN
+//     share table full / cap_table reserved range full / dst env full
+//       -> ES_ERR_POOL_FULL
+//
+// _es_lookup_sharing(src_session_id, src_env_slot) -> packed u64
+//   Scan the share table for a record whose (src_sid, src_env_slot)
+//   matches.  Returns:
+//     hit:  (dst_env_slot << 32) | share_record_idx     (idx in [0,16))
+//     miss: 0xFFFFFFFF
+//   The hit form packs dst_env_slot in the high 32 bits so a caller
+//   that only cares about the slot can right-shift; the miss sentinel
+//   stays distinct because share_record_idx is in [0, 16) and
+//   dst_env_slot is in [0, 6) so a hit's low 32 bits never reach
+//   0xFFFFFFFF.
+//
+// _es_revoke(share_record_idx) -> errno
+//   Clear the share record and the derived env slot in the dst
+//   session.  Returns ES_OK on success, ES_ERR_BAD_SESSION on an
+//   invalid idx (out of range or already-free record).  Idempotent:
+//   revoking an already-revoked record returns ES_ERR_BAD_SESSION so
+//   the caller is informed.
+//
+// =============================================================================
+// SECTION 3  CAP_TABLE RESERVED RANGE  --  [128, 192)
+// =============================================================================
+//
+// The same slab-allocator caveat that pins cap_minter to [192, 256)
+// (cap/slab.pdx's Phase-2 slab_alloc stub returns CAP_SLAB_CAPACITY
+// unconditionally) applies here.  Until the slab is rewritten with a
+// lineage-aware free list, R139.M5 owns a disjoint reserved range:
+//
+//   ES_SLOT_BASE  = 128
+//   ES_SLOT_LIMIT = 192
+//
+// 64 slots are plenty for 16 share records (which cap the simultaneous
+// cross-session shares at 16 anyway).  Range audit at landing time:
+//   `grep -rnE 'cap_table.*\\* *24.*(128|176|192)' src/kernel/` -> no
+//   live producers in [128, 192).  Adjacent band usage:
+//     [192, 256) owned by svc.cap-minter (R125.M2, cap_minter.pdx §3)
+//     [0, 128)   available for early-boot kernel-side mints
+//   When the slab allocator lands with lineage tracking (R128.M*),
+//   both reserved ranges collapse: the slab hands back any free slot
+//   and this module stops scanning.
+//
+// =============================================================================
+// SECTION 4  NARROW-ONLY INVARIANT
+// =============================================================================
+//
+// The LOAD-BEARING check is:
+//
+//   requested_rights  &  parent_rights  ==  requested_rights
+//
+// which is equivalent to `requested_rights <= parent_rights` in the
+// bitmask lattice.  If any bit of requested_rights is clear in
+// parent_rights, the AND reduces that bit to zero and the equality
+// fails -- the share is refused with ES_ERR_WIDEN.
+//
+// This formulation uses only `and reg, reg` and `cmp reg, reg` -- no
+// `not reg` (paideia-as encoder gap).  Enforced inline in _es_share
+// at step 7 (the share hot path, after parent descriptor resolution).
+//
+// Narrow-only is the SAME contract that _cap_minter_derive enforces
+// at R125.M2 §1(b); the two modules share the invariant, differ only
+// in the destination env (same env for cap-minter, cross-session for
+// env-sharing).  R125.M4 cap-check (syscall-cap-check.md) routes
+// shared caps through the same per-cap rights check as any other --
+// a shared cap carries narrowed rights in its cap_table descriptor
+// just like any other derived cap, so no special shared-cap handling
+// is needed at check time.
+//
+// =============================================================================
+// SECTION 5  RETURN CODE BAND  --  0x1F10..0x1F1F
+// =============================================================================
+//
+// Band audit (2026-10-14):
+//   `grep -rnE '0x1F1[0-9]\b' src/kernel/` -> zero hits.  Clean band.
+// 0x1F10/11 are adjacent to the HS_ERR_OUT_TOO_SMALL = 0x1F00
+// (history_segmentation.pdx §4) and disjoint from every SS_* / CA_* /
+// SSD_* / CM_* / RS_* / JS_* / HS_* / SJ_* code.
+//
+//   ES_OK                 = 0
+//   ES_ERR_POOL_FULL      = 0x1F10
+//   ES_ERR_BAD_SESSION    = 0x1102   (alias SS_ERR_BAD_ID)
+//   ES_ERR_WIDEN          = 0x1F11
+//
+// All codes fit imm32 with bit 31 clear so `mov rax, imm32` emits the
+// 7-byte zero-extending form.  No `and r11, imm64` encoder gap.
+//
+// =============================================================================
+// SECTION 6  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Labels prefixed `es_` (env-sharing) to stay clear of `ce_` (kind_
+// cap_env), `cmnt_` (cap_minter), `ss_` (shell_session), `ssd_`
+// (session_shutdown), `hs_` (history_segmentation).  Encoder-pitfall
+// posture (feedback_pdx_encoder_pitfalls):
+//
+//   * cmp rN, 0            (never `test rN, rN`)
+//   * shl rN, 5            (share-record stride 32 compose)
+//   * shl rN, 7            (shell_session row stride 128 compose)
+//   * shl rN, 6            (cap_env row stride 64 compose; via helpers)
+//   * shl rN, 3 / shl rN, 4 (cap_table stride 24 compose; two shifts)
+//   * shl rN, 32 / shr rN, 32  (u32 isolation in record fields)
+//   * mov rax, imm32       (never `and r11, imm64`)
+//   * single-line `pub let name = "..."`
+//   * module basename EnvSharing matches file basename env_sharing.pdx
+//   * fingerprint [u8; N] with N = len(string) + 1 (NUL counts)
+//   * narrow-check uses `and reg,reg; cmp reg,reg; jne` (no `not reg`)
+//
+// Stack discipline (SysV, entry rsp%16==8):
+//   _es_init                 1 push + 0 sub       (klog_s1 parity)
+//   _es_share                5 pushes + sub rsp,32  (klog slot + spill)
+//   _es_lookup_sharing       2 pushes + sub rsp,8   (realign for klog)
+//   _es_revoke               1 push  + 0 sub       (klog parity)
+//
+// =============================================================================
+// SECTION 7  BOOT WIRING NOTE
+// =============================================================================
+//
+// kernel_main.pdx picks this up with ONE new call right after
+// _ssd_init / before any user-space init:
+//
+//   call _ssd_init;                  // R139.M4
+//   call _es_init;                   // R139.M5 (this file)
+//
+// Placement rationale: _es_init MUST follow the shell-substrate
+// bringups (_shell_session_init / _cap_minter_init / _ssd_init) so
+// an audit grep sees the fingerprints in subsystem order
+// (SHELL_SESSION INIT OK -> CAP_MINTER INIT OK -> SESSION_SHUTDOWN
+// INIT OK -> ENV_SHARE INIT OK).  No data dependency on any
+// user-space init.  Wiring deferred to a follow-up slice (same
+// discipline as _hs_init / _ssd_init: the module ships with its
+// _init symbol and the boot-wire change is small enough to batch).
+// At real boot .bss zero-init leaves _es_share_table already in
+// the FREE state so share works correctly without the wiring.
+//
+// =============================================================================
+
+module EnvSharing = structure {
+
+  // ==========================================================================
+  // Return band (§5)
+  // ==========================================================================
+
+  pub let ES_OK              : u64 = 0
+  pub let ES_ERR_POOL_FULL   : u64 = 0x1F10
+  pub let ES_ERR_BAD_SESSION : u64 = 0x1102    // alias SS_ERR_BAD_ID
+  pub let ES_ERR_WIDEN       : u64 = 0x1F11
+
+  // ==========================================================================
+  // Geometry constants
+  // ==========================================================================
+
+  pub let ES_RECORDS_MAX     : u64 = 16     // rows (shares)
+  pub let ES_RECORD_BYTES    : u64 = 32     // 4 u64 per row
+  pub let ES_SLOT_BASE       : u64 = 128    // cap_table reserved range start
+  pub let ES_SLOT_LIMIT      : u64 = 192    // cap_table reserved range end (excl.)
+  pub let ES_CAP_SLOT_MAX    : u64 = 256    // cap/table.pdx CAP_SLOT_MAX
+  pub let ES_CAP_ENV_SLOTS   : u64 = 6      // kind_cap_env.pdx CAP_ENV_SLOTS
+  pub let ES_SS_POOL_MAX     : u64 = 8      // shell_session.pdx SS_POOL_MAX
+  pub let ES_SS_OFF_CAP_ENV  : u64 = 16     // shell_session.pdx SS_OFF_CAP_ENV
+  pub let ES_CAP_ENV_MAX     : u64 = 16     // kind_cap_env.pdx CAP_ENV_MAX
+
+  // Row-field offsets (bytes, from record base; §1).
+  pub let ES_OFF_SIDS        : u64 = 0      // {src_sid:u32, dst_sid:u32}
+  pub let ES_OFF_SLOTS       : u64 = 8      // {src_slot:u32, dst_slot:u32}
+  pub let ES_OFF_RIGHTS      : u64 = 16
+  pub let ES_OFF_FLAGS       : u64 = 24
+
+  // Flag bits.
+  pub let ES_FLAG_IN_USE     : u64 = 0x1
+
+  // Record-id sentinel (used internally by es_find_free_record).
+  pub let ES_REC_NONE        : u64 = 0x10   // == ES_RECORDS_MAX; unambiguous
+
+  // Env-slot "none free" sentinel (returned by es_find_free_env_slot).
+  pub let ES_ENV_SLOT_NONE   : u64 = 0x6    // == ES_CAP_ENV_SLOTS; unambiguous
+
+  // Lookup miss sentinel (§2).
+  pub let ES_LOOKUP_MISS     : u64 = 0xFFFFFFFF
+
+  // Env-handle "no caller" sentinel (shadow of CAP_ENV_ROW_NONE).
+  pub let ES_ENV_NONE        : u64 = 0xFF
+
+  // ==========================================================================
+  // Storage
+  //
+  //   _es_share_table -- 16 records x 32 B = 512 B = 64 u64.
+  //   _es_stats       -- 8 u64 counters (observability).  @align(64)
+  //                      lands the pool start on a cache-line boundary
+  //                      so record 0 and 2 straddle the first line, 4
+  //                      and 6 the second, etc. -- stride 32 means
+  //                      every pair shares one line.
+  // ==========================================================================
+
+  pub let mut _es_share_table : [u64; 64] = uninit @align(64)
+  pub let mut _es_stats       : [u64; 8]  = uninit @align(64)
+
+  pub let ES_ST_INIT_OK       : u64 = 0
+  pub let ES_ST_SHARE_OK      : u64 = 1
+  pub let ES_ST_SHARE_SESSION : u64 = 2
+  pub let ES_ST_SHARE_WIDEN   : u64 = 3
+  pub let ES_ST_SHARE_FULL    : u64 = 4
+  pub let ES_ST_LOOKUP_HIT    : u64 = 5
+  pub let ES_ST_LOOKUP_MISS   : u64 = 6
+  pub let ES_ST_REVOKE_OK     : u64 = 7
+
+  // ==========================================================================
+  // Fingerprint tags (N = len(string) + 1, NUL inclusive).
+  //
+  // Only the "OK" tags are extracted by the fingerprint-coverage gate;
+  // the REJ/MISS tags are opaque to the gate so no allowlist entry is
+  // required for them.
+  // ==========================================================================
+
+  // "ENV_SHARE INIT OK"      = 17 chars + 1 NUL => N = 18
+  // "ENV_SHARE SHARE OK"     = 18 chars + 1 NUL => N = 19
+  // "ENV_SHARE SHARE REJ"    = 19 chars + 1 NUL => N = 20
+  // "ENV_SHARE LOOKUP OK"    = 19 chars + 1 NUL => N = 20
+  // "ENV_SHARE LOOKUP MISS"  = 21 chars + 1 NUL => N = 22
+  // "ENV_SHARE REVOKE OK"    = 19 chars + 1 NUL => N = 20
+  // "ENV_SHARE REVOKE REJ"   = 20 chars + 1 NUL => N = 21
+
+  pub let es_tag_init_ok     : [u8; 18] = "ENV_SHARE INIT OK\0"
+  pub let es_tag_share_ok    : [u8; 19] = "ENV_SHARE SHARE OK\0"
+  pub let es_tag_share_rej   : [u8; 20] = "ENV_SHARE SHARE REJ\0"
+  pub let es_tag_lookup_ok   : [u8; 20] = "ENV_SHARE LOOKUP OK\0"
+  pub let es_tag_lookup_miss : [u8; 22] = "ENV_SHARE LOOKUP MISS\0"
+  pub let es_tag_revoke_ok   : [u8; 20] = "ENV_SHARE REVOKE OK\0"
+  pub let es_tag_revoke_rej  : [u8; 21] = "ENV_SHARE REVOKE REJ\0"
+
+  pub let es_k_src_sid  : [u8; 8] = "src_sid\0"
+  pub let es_k_dst_sid  : [u8; 8] = "dst_sid\0"
+  pub let es_k_src_slot : [u8; 9] = "src_slot\0"
+  pub let es_k_dst_slot : [u8; 9] = "dst_slot\0"
+  pub let es_k_idx      : [u8; 4] = "idx\0"
+  pub let es_k_errno    : [u8; 6] = "errno\0"
+
+  // ==========================================================================
+  // es_note(slot) -> ()
+  //
+  // Bounded increment on _es_stats[slot].  Load-inc-store idiom (no
+  // `add reg, [mem]`).  Caller passes an ES_ST_* ordinal; the bounds
+  // check guards the stats pool size (8).  Pure leaf -- no pushes.
+  // ==========================================================================
+  pub let es_note : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R139.M5 (paideia-os #2643): bounded increment on _es_stats[slot<8]. Load-inc-store, no `add reg,[mem]`. Pure leaf -- no pushes. Labels prefixed es_no_.",
+      block: {
+        cmp rdi, 8;
+        jae es_no_out;
+        lea r10, [rip + _es_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      es_no_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // es_record_base(idx) -> &_es_share_table[idx*4]  (u64 units; +0..+24
+  //                                                   = 32 B)
+  //
+  // Record index -> record base pointer.  Stride 32 = 2^5 so `shl rax,
+  // 5` suffices (no `imul r, imm` encoder gap).  Caller validates
+  // idx < ES_RECORDS_MAX; this helper is a pure address compute.
+  // ==========================================================================
+  pub let es_record_base : (u64) -> u64 !{} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R139.M5 (paideia-os #2643): idx -> &_es_share_table[idx*32]. Power-of-two stride uses `shl rax, 5` so no 2-op imul-with-imm is required. No bounds check by policy -- caller validates. Labels prefixed es_rb_.",
+      block: {
+        mov rax, rdi;                    // idx
+        shl rax, 5;                      // idx * 32
+        lea r10, [rip + _es_share_table];
+        add rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // es_record_in_use(idx) -> 1 iff idx<ES_RECORDS_MAX AND
+  //                                  record.flags & IN_USE != 0
+  //
+  // Validator used by _es_revoke.  Inlined address compute (shl 5).
+  // Pure leaf -- no pushes, no nested calls.
+  // ==========================================================================
+  pub let es_record_in_use : (u64) -> u64 !{mem} @{} =
+    fn (idx: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R139.M5 (paideia-os #2643): 1 iff idx<ES_RECORDS_MAX(16) AND flags (word at [+24]) & ES_FLAG_IN_USE != 0. Inlined address compute (shl 5). Pure leaf. Labels prefixed es_ri_.",
+      block: {
+        mov r10, 16;                     // ES_RECORDS_MAX
+        cmp rdi, r10;
+        jae es_ri_no;
+        mov rax, rdi;
+        shl rax, 5;                      // idx * 32
+        lea r10, [rip + _es_share_table];
+        add rax, r10;                    // record base
+        mov r10, [rax + 24];             // flags
+        mov r11, 1;                      // ES_FLAG_IN_USE
+        and r10, r11;
+        cmp r10, 0;
+        je  es_ri_no;
+        mov rax, 1;
+        ret;
+      es_ri_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // es_find_free_record() -> idx | ES_REC_NONE (16)
+  //
+  // Linear scan for the first record whose IN_USE bit is clear.
+  // Pure leaf (record-base inlined).  Returns idx in [0, 16) on hit
+  // or 16 (== ES_RECORDS_MAX) as the "none free" sentinel.
+  // ==========================================================================
+  pub let es_find_free_record : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R139.M5 (paideia-os #2643): linear scan _es_share_table[0..16) for the first record whose flags IN_USE bit is clear. Return idx or 16 as the 'none free' sentinel (ES_REC_NONE). Inlined record-base (shl 5). Pure leaf -- no pushes. Labels prefixed es_ff_.",
+      block: {
+        lea r10, [rip + _es_share_table];
+        xor rcx, rcx;                    // idx cursor
+      es_ff_scan:
+        cmp rcx, 16;                     // ES_RECORDS_MAX
+        jae es_ff_none;
+
+        mov rax, rcx;
+        shl rax, 5;                      // idx * 32
+        add rax, r10;                    // record base
+        mov r11, [rax + 24];             // flags
+        mov r9,  1;                      // ES_FLAG_IN_USE
+        and r11, r9;
+        cmp r11, 0;
+        je  es_ff_hit;                   // IN_USE clear -> free
+
+        add rcx, 1;
+        jmp es_ff_scan;
+
+      es_ff_hit:
+        mov rax, rcx;
+        ret;
+
+      es_ff_none:
+        mov rax, 16;                     // ES_REC_NONE (= ES_RECORDS_MAX)
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // es_find_free_cap_slot() -> cap_table slot | ES_CAP_SLOT_MAX (256)
+  //
+  // Scan [ES_SLOT_BASE, ES_SLOT_LIMIT) of cap_table for the first slot
+  // whose kind (at offset +0) is zero.  Stride 24 = 8 + 16 composed as
+  // (slot<<3) + (slot<<4) (no 2-op `imul r, imm`).  Returns slot id
+  // in [128, 192) on hit or 256 as the "none free" sentinel.  See
+  // cap_minter.pdx §3 for the matching discipline on [192, 256).
+  // Pure leaf -- no pushes.
+  // ==========================================================================
+  pub let es_find_free_cap_slot : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R139.M5 (paideia-os #2643): scan cap_table slots [ES_SLOT_BASE=128, ES_SLOT_LIMIT=192) for the first slot whose kind field (at [cap_table + slot*24 + 0]) is zero. Returns slot id (128..191), or 256 as the 'none free' sentinel. Stride 24 composed as (slot<<3)+(slot<<4) because paideia-as does not emit 2-op `imul r, imm`. Pure leaf -- no pushes. Labels prefixed es_fc_.",
+      block: {
+        lea r10, [rip + cap_table];
+        mov rcx, 128;                    // slot cursor = ES_SLOT_BASE
+
+      es_fc_scan:
+        mov r11, 192;                    // ES_SLOT_LIMIT
+        cmp rcx, r11;
+        jae es_fc_none;
+
+        // Compute slot * 24 = (slot<<3) + (slot<<4).
+        mov rax, rcx;
+        shl rax, 3;                      // slot * 8
+        mov r11, rcx;
+        shl r11, 4;                      // slot * 16
+        add rax, r11;                    // slot * 24
+        add rax, r10;                    // &cap_table[slot]
+
+        mov r11, [rax + 0];              // kind
+        cmp r11, 0;
+        je  es_fc_hit;
+
+        add rcx, 1;
+        jmp es_fc_scan;
+
+      es_fc_hit:
+        mov rax, rcx;
+        ret;
+
+      es_fc_none:
+        mov rax, 256;                    // ES_CAP_SLOT_MAX
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // es_find_free_env_slot(env_handle) -> slot | ES_ENV_SLOT_NONE (6)
+  //
+  // Scan 0..ES_CAP_ENV_SLOTS of the given env for the first slot whose
+  // cap_env_lookup returns 0 (empty).  Shape mirrors cmnt_find_free_
+  // env_slot one-for-one.
+  //
+  // Register plan: 2 callee-save pushes (rbx = env_handle, r12 = slot
+  // cursor) + sub rsp,8 to realign.  Entry rsp%16==8; +2 pushes +sub8
+  // = +24 -> %16==0 (call-ready for the nested cap_env_lookup).
+  // ==========================================================================
+  pub let es_find_free_env_slot : (u64) -> u64 !{mem} @{} =
+    fn (env_handle: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R139.M5 (paideia-os #2643): scan 0..CAP_ENV_SLOTS of env for the first slot where cap_env_lookup returns 0. Returns slot id (0..5), or 6 (ES_ENV_SLOT_NONE) as the 'none free' sentinel. Two callee-save pushes (rbx=env_handle, r12=slot cursor) + sub rsp,8 land rsp%16==0 at the nested cap_env_lookup call. Labels prefixed es_fe_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // env_handle
+        xor r12, r12;                    // slot cursor = 0
+
+      es_fe_scan:
+        cmp r12, 6;                      // ES_CAP_ENV_SLOTS
+        jae es_fe_none;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        call cap_env_lookup;
+        cmp rax, 0;
+        je  es_fe_hit;
+
+        add r12, 1;
+        jmp es_fe_scan;
+
+      es_fe_hit:
+        mov rax, r12;
+        jmp es_fe_out;
+
+      es_fe_none:
+        mov rax, 6;                      // ES_ENV_SLOT_NONE
+
+      es_fe_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // es_resolve_session_env(sid) -> env_handle | ES_ENV_NONE (0xFF)
+  //
+  // Validate sid < SS_POOL_MAX AND the session row is in use, then
+  // read the cap_env field at [row + SS_OFF_CAP_ENV = +16].  Returns
+  // the env_handle (0..15) on success or ES_ENV_NONE (0xFF) on a bad
+  // sid / free session row / out-of-range env_handle.
+  //
+  // Register plan: 1 callee-save push (rbx = sid) lands rsp%16==0
+  // at the nested ss_row_in_use call.
+  // ==========================================================================
+  pub let es_resolve_session_env : (u64) -> u64 !{mem} @{} =
+    fn (sid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R139.M5 (paideia-os #2643): validate sid<SS_POOL_MAX via ss_row_in_use, then load [ss_row_base(sid) + SS_OFF_CAP_ENV]. Returns env_handle on success or 0xFF (ES_ENV_NONE) on bad sid / free row / out-of-range env_handle. One callee-save push (rbx=sid) lands rsp%16==0 at every nested call. The env_handle sanity check (< CAP_ENV_MAX = 16) covers a stale session row whose cap_env field was never populated by _shell_session_create (defensive -- the create path writes the handle in R125.M3+ wiring). Labels prefixed es_rs_.",
+      block: {
+        push rbx;
+
+        mov rbx, rdi;                    // sid
+
+        // Validate sid via ss_row_in_use (checks < SS_POOL_MAX AND in_use).
+        mov rdi, rbx;
+        call ss_row_in_use;
+        cmp rax, 0;
+        je  es_rs_none;
+
+        // Load [row_base + SS_OFF_CAP_ENV].  Inline row-base compute
+        // (shl 7) avoids a second call site (ss_row_base is a pure
+        // leaf but inlining saves the function-call overhead on the
+        // read-only path).
+        mov rax, rbx;
+        shl rax, 7;                      // sid * 128
+        lea r10, [rip + _shell_session_pool];
+        add rax, r10;                    // row base
+        mov rax, [rax + 16];             // SS_OFF_CAP_ENV
+
+        // Sanity: env_handle must be < CAP_ENV_MAX (16).  A stale
+        // row that never had _shell_session_create's cap_env field
+        // populated would show 0 -- which is a valid env row -- but
+        // its _cap_env_table row's IN_USE bit may be clear.  The
+        // downstream cap_env_lookup / cap_env_row_in_use handle that
+        // case; this check only guards against a corrupted session
+        // row writing a garbage env_handle.
+        mov r10, 16;                     // ES_CAP_ENV_MAX
+        cmp rax, r10;
+        jae es_rs_none;
+
+        pop rbx;
+        ret;
+
+      es_rs_none:
+        mov rax, 0xFF;                   // ES_ENV_NONE
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _es_init() -> ()
+  //
+  // Boot hook.  Scrubs _es_share_table (64 u64) + _es_stats (8 u64)
+  // and emits one `ENV_SHARE INIT OK` fingerprint.  .bss zero-init
+  // handles both at real boot; the explicit scrub is defensive for a
+  // chaos-restart re-entering init.
+  //
+  // Single callee-save push (r12) corrects entry parity rsp%16==8 ->
+  // 0 for the sibling klog_s1 call, matching _hs_init / _ssd_init
+  // shape.  Labels prefixed es_in_.
+  // ==========================================================================
+  pub let _es_init : () -> () !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M5 (paideia-os #2643): boot-time scrub of _es_share_table (64 u64 = 512 B) and _es_stats (8 u64 = 64 B) + one INIT OK fingerprint. .bss zero-init handles both at real boot; the explicit scrub is defensive for a chaos-restart re-entering init. Single callee-save push (r12) corrects entry parity rsp%16==8 -> 0 for the sibling klog_s1 call, matching _hs_init / _ssd_init one-for-one. Labels prefixed es_in_.",
+      block: {
+        push r12;
+
+        // Scrub _es_share_table[0..64].
+        lea r10, [rip + _es_share_table];
+        xor rax, rax;
+        xor rcx, rcx;
+      es_in_table:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 64;
+        jb  es_in_table;
+
+        // Scrub _es_stats[0..8].
+        lea r10, [rip + _es_stats];
+        xor rcx, rcx;
+      es_in_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  es_in_stats;
+
+        // Bump ES_ST_INIT_OK counter.
+        mov rdi, 0;                      // ES_ST_INIT_OK
+        call es_note;
+
+        // Emit INIT OK fingerprint.
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + es_tag_init_ok];
+        call klog_s1;
+
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _es_share(src_sid, dst_sid, src_env_slot, rights_mask) -> packed u64
+  //
+  // The core cross-session cap-share entrypoint.  See §2 for the
+  // return contract, §4 for the narrow-only invariant, §3 for the
+  // cap_table reserved range.
+  //
+  // ARGS (SysV):
+  //   rdi = src_session_id   (0..SS_POOL_MAX-1 = 0..7)
+  //   rsi = dst_session_id   (0..SS_POOL_MAX-1 = 0..7)
+  //   rdx = src_env_slot     (0..CAP_ENV_SLOTS-1 = 0..5)
+  //   rcx = rights_mask      (bit mask, 64 bits)
+  //
+  // RETURNS (rax):
+  //   success: (dst_env_slot << 2) | ES_OK          (status in [0,4))
+  //   failure: ES_ERR_BAD_SESSION / _WIDEN / _POOL_FULL
+  //
+  // STEP-BY-STEP:
+  //    1. src_env = es_resolve_session_env(src_sid). On 0xFF -> BAD_SESSION.
+  //    2. dst_env = es_resolve_session_env(dst_sid). On 0xFF -> BAD_SESSION.
+  //    3. Validate src_env_slot < CAP_ENV_SLOTS. Else BAD_SESSION.
+  //    4. parent_cap_idx = cap_env_lookup(src_env, src_env_slot).
+  //       If 0 (empty slot) -> BAD_SESSION.
+  //    5. Validate parent_cap_idx < CAP_SLOT_MAX. Else BAD_SESSION.
+  //    6. Load cap_table[parent_cap_idx]: parent_kind, parent_rights,
+  //       parent_target_ptr. If parent_kind == 0 -> BAD_SESSION.
+  //    7. Narrow-only (§4): (rights & parent_rights) == rights.
+  //       Else -> ES_ERR_WIDEN.
+  //    8. Allocate: find_free_record() -> idx. If == 16 -> POOL_FULL.
+  //    9. Allocate: find_free_cap_slot() -> new_cap_idx. If == 256 ->
+  //       POOL_FULL.
+  //   10. Allocate: find_free_env_slot(dst_env) -> dst_env_slot.
+  //       If == 6 -> POOL_FULL (dst env full or frozen).
+  //   11. Re-read parent cap_table row (parent_kind + parent_target_ptr
+  //       scratch registers were reused).
+  //   12. cap_mint_write(new_cap_idx, parent_kind, rights, parent_tgt).
+  //   13. cap_env_insert(dst_env, dst_env_slot, new_cap_idx). On any
+  //       non-zero return -> POOL_FULL.
+  //   14. Populate share record:
+  //         [+0]  = (dst_sid << 32) | src_sid
+  //         [+8]  = (dst_env_slot << 32) | src_env_slot
+  //         [+16] = rights
+  //         [+24] = ES_FLAG_IN_USE
+  //       Store ORDER: write slots/sids/rights FIRST, publish flags
+  //       LAST, so a concurrent scanner never observes a half-filled
+  //       IN_USE record (release-publication discipline).
+  //   15. Bump stat, emit fingerprint, return (dst_env_slot << 2).
+  //
+  // REGISTER MAP:
+  //   rbx = src_sid           (steps 1..14)
+  //   r12 = dst_sid           (steps 2..14)
+  //   r13 = src_env_slot      (steps 3..4); then dst_env_slot (10..15)
+  //   r14 = rights_mask       (throughout)
+  //   r15 = src_env_handle    (steps 1..4); then new_cap_idx (steps 9..15)
+  //
+  // STACK SPILL (32 B):
+  //   [rsp+0]  = dst_env_handle    (step 2, used 10..13)
+  //   [rsp+8]  = parent_cap_idx    (step 4, re-read step 11)
+  //   [rsp+16] = free_record_idx   (step 8, used 14..15)
+  //   [rsp+24] = src_env_slot      (prelude spill, used step 14 --
+  //                                 r13 is reassigned at step 10)
+  //
+  // Register plan: 5 callee-save pushes + sub rsp, 32.  Entry rsp%16
+  // ==8; +5 pushes = +40 -> %16==0; +sub32 = +72 -> %16==0 (call-
+  // ready at every nested call).
+  // ==========================================================================
+  pub let _es_share : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (src_sid: u64) (dst_sid: u64) (src_env_slot: u64) (rights_mask: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M5 (paideia-os #2643): mint a narrowed child cap in dst_sid's env from a parent cap in src_sid's env. See the long comment above the function for the 15-step algorithm, failure taxonomy, and register timeline (rbx=src_sid, r12=dst_sid, r13=src_env_slot then dst_env_slot, r14=rights, r15=src_env then new_cap_idx). parent_kind and parent_target_ptr are re-read from cap_table at mint time rather than held across the free-slot scans -- two cache-hot 8-byte loads trade cleanly for the register budget. The narrow-only invariant (§4) is enforced by `mov rax, req; and rax, par; cmp rax, req; jne widen` which avoids the paideia-as `not reg` encoder gap. Share-record publication is release-ordered: slots/sids/rights fields written FIRST, flags (IN_USE) stored LAST so a concurrent scanner never observes a half-filled record (R139 is single-flow at M5 so this is a design invariant more than a hardware ordering guarantee; the cost is zero and makes the invariant easy to assert at R145+). All error paths bump a stat and jump to a single epilogue that pops the 5 regs. Labels prefixed es_sh_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 32;                     // spill frame
+
+        mov rbx, rdi;                    // src_sid
+        mov r12, rsi;                    // dst_sid
+        mov r13, rdx;                    // src_env_slot
+        mov r14, rcx;                    // rights_mask
+
+        // src_env_slot spill: r13 is reassigned to dst_env_slot at step
+        // 10 but src_env_slot is still needed at step 14 for the record
+        // field store.  Spill to the pad slot immediately so the live
+        // range is bounded cleanly (entry..step 4 use r13; step 14 reads
+        // [rsp+24]).  No `and r,imm64` or widening -- a bare u64 store.
+        mov [rsp + 24], r13;             // spill src_env_slot
+
+        // ---- Step 1: resolve src env ----
+        mov rdi, rbx;
+        call es_resolve_session_env;
+        mov r11, 0xFF;                   // ES_ENV_NONE
+        cmp rax, r11;
+        je  es_sh_bad_session;
+        mov r15, rax;                    // src_env_handle
+
+        // ---- Step 2: resolve dst env ----
+        mov rdi, r12;
+        call es_resolve_session_env;
+        mov r11, 0xFF;
+        cmp rax, r11;
+        je  es_sh_bad_session;
+        mov [rsp + 0], rax;              // dst_env_handle
+
+        // ---- Step 3: src_env_slot < CAP_ENV_SLOTS ----
+        cmp r13, 6;                      // ES_CAP_ENV_SLOTS
+        jae es_sh_bad_session;
+
+        // ---- Step 4: lookup parent cap_table idx in src env ----
+        mov rdi, r15;                    // src_env_handle
+        mov rsi, r13;                    // src_env_slot
+        call cap_env_lookup;
+        cmp rax, 0;
+        je  es_sh_bad_session;           // empty src slot
+        mov [rsp + 8], rax;              // spill parent_cap_idx
+
+        // ---- Step 5: parent_cap_idx < CAP_SLOT_MAX ----
+        mov r11, 256;                    // ES_CAP_SLOT_MAX
+        cmp rax, r11;
+        jae es_sh_bad_session;
+
+        // ---- Step 6: load parent descriptor; validate kind != 0 ----
+        //   &cap_table[parent_cap_idx] = cap_table + parent_cap_idx * 24
+        //   stride composed as (idx<<3) + (idx<<4) (no imul).
+        mov r9,  rax;                    // r9 = parent_cap_idx scratch
+        shl rax, 3;                      // idx * 8
+        mov r11, r9;
+        shl r11, 4;                      // idx * 16
+        add rax, r11;                    // idx * 24
+        lea r10, [rip + cap_table];
+        add rax, r10;                    // &cap_table[idx]
+
+        mov r9,  [rax + 0];              // parent_kind
+        cmp r9,  0;
+        je  es_sh_bad_session;
+
+        //   parent_rights at +8 for the narrow check below.  Loaded
+        //   into r11 (scratch) because r9 is holding parent_kind
+        //   which we need below.
+        mov r11, [rax + 8];              // parent_rights
+
+        // ---- Step 7: narrow-only check (§4) ----
+        //   (rights & parent_rights) == rights
+        //   AND-and-compare avoids the paideia-as `not reg` encoder gap.
+        mov rax, r14;                    // requested_rights
+        and rax, r11;                    // & parent_rights
+        cmp rax, r14;
+        jne es_sh_widen;
+
+        // ---- Step 8: find a free share record ----
+        call es_find_free_record;
+        mov r11, 16;                     // ES_REC_NONE
+        cmp rax, r11;
+        jae es_sh_pool_full;
+        mov [rsp + 16], rax;             // spill free_record_idx
+
+        // ---- Step 9: find a free cap_table slot in [128, 192) ----
+        call es_find_free_cap_slot;
+        mov r11, 256;                    // ES_CAP_SLOT_MAX
+        cmp rax, r11;
+        jae es_sh_pool_full;
+        mov r15, rax;                    // new_cap_idx
+
+        // ---- Step 10: find a free env slot in dst env ----
+        mov rdi, [rsp + 0];              // dst_env_handle
+        call es_find_free_env_slot;
+        mov r11, 6;                      // ES_ENV_SLOT_NONE
+        cmp rax, r11;
+        jae es_sh_pool_full;             // includes "env frozen" case:
+                                         // cap_env_insert refuses on
+                                         // frozen, and even the pre-
+                                         // check would have returned
+                                         // ENV_SLOT_NONE if no slot was
+                                         // ever free (collapsed per §4)
+        mov r13, rax;                    // dst_env_slot (r13 reused;
+                                         // src_env_slot no longer needed)
+
+        // ---- Step 11: re-read parent cap_table row for mint ----
+        //   parent_kind and parent_target_ptr are needed at step 12
+        //   but r9 and the computed row address were lost across the
+        //   free-slot scans.  Reload from the spilled parent_cap_idx
+        //   (cheap: two cache-hot 8-byte loads).
+        mov r11, [rsp + 8];              // parent_cap_idx
+        mov rax, r11;
+        shl rax, 3;                      // idx * 8
+        mov r9,  r11;
+        shl r9,  4;                      // idx * 16
+        add rax, r9;                     // idx * 24
+        lea r10, [rip + cap_table];
+        add rax, r10;                    // &cap_table[parent_cap_idx]
+
+        // ---- Step 12: cap_mint_write(new_cap_idx, parent_kind,
+        //                              rights_mask, parent_target_ptr) ----
+        mov rdi, r15;                    // new_cap_idx
+        mov rsi, [rax + 0];              // parent_kind
+        mov rcx, [rax + 16];             // parent_target_ptr
+        mov rdx, r14;                    // rights_mask
+        call cap_mint_write;
+
+        // ---- Step 13: insert new cap into dst env ----
+        mov rdi, [rsp + 0];              // dst_env_handle
+        mov rsi, r13;                    // dst_env_slot
+        mov rdx, r15;                    // new_cap_idx
+        call cap_env_insert;
+        cmp rax, 0;
+        jne es_sh_pool_full;             // frozen env or race -> collapse
+
+        // ---- Step 14: populate share record ----
+        //   Base address of record = _es_share_table + idx * 32.
+        mov rax, [rsp + 16];             // free_record_idx
+        shl rax, 5;                      // idx * 32
+        lea r10, [rip + _es_share_table];
+        add rax, r10;                    // record base
+                                         // (held in rax for the field
+                                         // stores below -- publishing
+                                         // flags LAST, release order)
+
+        // [+0] = (dst_sid << 32) | src_sid
+        mov r11, r12;                    // dst_sid
+        shl r11, 32;                     // << 32
+        mov r9,  rbx;                    // src_sid  (low 32 is sid value)
+        or  r11, r9;
+        mov [rax + 0], r11;
+
+        // [+8] = (dst_env_slot << 32) | src_env_slot
+        //   src_env_slot was spilled to [rsp+24] in the entry prelude
+        //   (r13 was reassigned to dst_env_slot at step 10).  Reload
+        //   from the spill.
+        mov r11, r13;                    // dst_env_slot
+        shl r11, 32;                     // << 32
+        mov r9,  [rsp + 24];             // src_env_slot (spilled at entry)
+        or  r11, r9;
+        mov [rax + 8], r11;
+
+        // [+16] = rights_mask
+        mov [rax + 16], r14;
+
+        // [+24] = flags (ES_FLAG_IN_USE)  -- published LAST
+        mov r11, 1;                      // ES_FLAG_IN_USE
+        mov [rax + 24], r11;
+
+        // ---- Step 15: stats + fingerprint + success return ----
+        mov rdi, 1;                      // ES_ST_SHARE_OK
+        call es_note;
+
+        // Emit `ENV_SHARE SHARE OK src_sid=0x<hex>`.  Headline KV is
+        // src_sid; dst_sid, src_slot, dst_slot are observable through
+        // _es_share_table (idx is spilled on stack but not in the
+        // fingerprint).  One-fingerprint-per-outcome discipline per
+        // _cap_minter_derive / schema_registry convention.
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + es_tag_share_ok];
+        lea rcx, [rip + es_k_src_sid];
+        mov r8,  rbx;                    // v_hex = src_sid
+        call klog_s1_x1;
+
+        // Return (dst_env_slot << 2) | ES_OK
+        mov rax, r13;                    // dst_env_slot
+        shl rax, 2;                      // << 2
+        jmp es_sh_out;
+
+      es_sh_bad_session:
+        mov rdi, 2;                      // ES_ST_SHARE_SESSION
+        call es_note;
+        mov r12, 0x1102;                 // ES_ERR_BAD_SESSION
+                                         //   (r12 is preserved
+                                         //    across the klog call)
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + es_tag_share_rej];
+        lea rcx, [rip + es_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        jmp es_sh_out;
+
+      es_sh_widen:
+        mov rdi, 3;                      // ES_ST_SHARE_WIDEN
+        call es_note;
+        mov r12, 0x1F11;                 // ES_ERR_WIDEN
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + es_tag_share_rej];
+        lea rcx, [rip + es_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+        jmp es_sh_out;
+
+      es_sh_pool_full:
+        mov rdi, 4;                      // ES_ST_SHARE_FULL
+        call es_note;
+        mov r12, 0x1F10;                 // ES_ERR_POOL_FULL
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + es_tag_share_rej];
+        lea rcx, [rip + es_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+        mov rax, r12;
+
+      es_sh_out:
+        add rsp, 32;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _es_lookup_sharing(src_sid, src_env_slot) -> packed u64
+  //
+  // Scan the share table for a record whose (src_sid, src_env_slot)
+  // matches.  Returns on hit: (dst_env_slot << 32) | share_record_idx.
+  // On miss: 0xFFFFFFFF.
+  //
+  // ARGS (SysV):
+  //   rdi = src_sid
+  //   rsi = src_env_slot
+  //
+  // RETURNS (rax):
+  //   hit:  (dst_env_slot << 32) | share_record_idx   (idx in [0, 16))
+  //   miss: 0xFFFFFFFF
+  //
+  // Match semantics:
+  //   record.flags & IN_USE AND
+  //   record.src_sid (low 32 of [+0]) == src_sid AND
+  //   record.src_env_slot (low 32 of [+8]) == src_env_slot
+  //
+  // Register plan: 2 callee-save pushes (rbx = src_sid, r12 =
+  // src_env_slot) + sub rsp, 8 to realign for the klog call.
+  // Entry rsp%16==8; +2 pushes +sub8 = +24 -> %16==0 at the klog
+  // slot.  Labels prefixed es_lu_.
+  // ==========================================================================
+  pub let _es_lookup_sharing : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (src_sid: u64) (src_env_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M5 (paideia-os #2643): linear scan _es_share_table[0..16) for a record matching (src_sid, src_env_slot). Match predicate: flags&IN_USE AND (low 32 of [+0]) == src_sid AND (low 32 of [+8]) == src_env_slot. Returns (dst_env_slot << 32) | idx on hit, 0xFFFFFFFF on miss. The hit form packs dst_env_slot in the HIGH 32 of rax so the LOW 32 (idx) is distinct from the miss sentinel (idx is in [0,16); dst_env_slot is in [0,6)). Two callee-save pushes (rbx=src_sid, r12=src_env_slot) + sub rsp,8 land rsp%16==0 at the klog slot. u32 isolation uses shl/shr 32 round-trip (no `and r11, 0xFFFFFFFF`). Labels prefixed es_lu_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                    // src_sid
+        mov r12, rsi;                    // src_env_slot
+
+        lea r10, [rip + _es_share_table];
+        xor rcx, rcx;                    // idx cursor = 0
+
+      es_lu_scan:
+        cmp rcx, 16;                     // ES_RECORDS_MAX
+        jae es_lu_miss;
+
+        mov rax, rcx;
+        shl rax, 5;                      // idx * 32
+        add rax, r10;                    // record base
+
+        // Check IN_USE first (fast skip for free rows).
+        mov r11, [rax + 24];             // flags
+        mov r9,  1;                      // ES_FLAG_IN_USE
+        and r11, r9;
+        cmp r11, 0;
+        je  es_lu_next;
+
+        // Load packed sids; isolate low 32 (src_sid) via shl32 + shr32.
+        mov r11, [rax + 0];              // {dst_sid:u32 | src_sid:u32}
+        shl r11, 32;
+        shr r11, 32;                     // r11 = src_sid
+        cmp r11, rbx;
+        jne es_lu_next;
+
+        // Load packed slots; isolate low 32 (src_env_slot).
+        mov r11, [rax + 8];              // {dst_slot:u32 | src_slot:u32}
+        shl r11, 32;
+        shr r11, 32;                     // r11 = src_env_slot
+        cmp r11, r12;
+        jne es_lu_next;
+
+        // HIT.  Extract dst_env_slot = high 32 of [+8].
+        mov r11, [rax + 8];
+        shr r11, 32;                     // r11 = dst_env_slot
+
+        // Pack: (dst_env_slot << 32) | idx.
+        mov rax, r11;
+        shl rax, 32;
+        or  rax, rcx;                    // low 32 = idx
+
+        // Bump ES_ST_LOOKUP_HIT and emit `ENV_SHARE LOOKUP OK idx=<dec>`.
+        //   (Idx fits in 4 bits so hex vs dec is a style choice; using
+        //   klog_s1_x1 hex-KV for uniformity with the SHARE/REVOKE
+        //   fingerprints.)
+        mov [rsp + 0], rax;              // park result across klog call
+        mov rdi, 5;                      // ES_ST_LOOKUP_HIT
+        call es_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + es_tag_lookup_ok];
+        lea rcx, [rip + es_k_idx];
+        mov r8,  [rsp + 0];              // reload packed result for the
+                                         // KV value (hex of low bits
+                                         // only is fine; the full
+                                         // packed value is diagnostic)
+        call klog_s1_x1;
+
+        mov rax, [rsp + 0];              // restore packed result
+        jmp es_lu_out;
+
+      es_lu_next:
+        add rcx, 1;
+        jmp es_lu_scan;
+
+      es_lu_miss:
+        mov rdi, 6;                      // ES_ST_LOOKUP_MISS
+        call es_note;
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + es_tag_lookup_miss];
+        lea rcx, [rip + es_k_src_sid];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        mov rax, 0xFFFFFFFF;             // ES_LOOKUP_MISS
+
+      es_lu_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _es_revoke(share_record_idx) -> errno
+  //
+  // Tear down a share.  Validates record_idx and IN_USE, loads the
+  // record to extract dst_env_handle (looked up from dst_sid) and
+  // dst_env_slot, calls cap_env_insert(dst_env, dst_slot, 0) to clear
+  // the derived cap from the destination env, and zeroes the record
+  // (flags=0 publishes FREE).
+  //
+  // Returns ES_OK on success, ES_ERR_BAD_SESSION on bad idx or
+  // already-free record.  Idempotent in the sense that a double-
+  // revoke returns ES_ERR_BAD_SESSION on the second call (the first
+  // call freed the record so the second observes IN_USE clear).
+  //
+  // ARGS (SysV):
+  //   rdi = share_record_idx
+  //
+  // RETURNS (rax):
+  //   ES_OK                 on success
+  //   ES_ERR_BAD_SESSION    on bad idx / free record / stale dst row
+  //
+  // STEP-BY-STEP:
+  //   1. Validate idx via es_record_in_use. Else BAD_SESSION.
+  //   2. Load record base; extract dst_sid (high 32 of [+0]) and
+  //      dst_env_slot (high 32 of [+8]).
+  //   3. dst_env = es_resolve_session_env(dst_sid). On 0xFF ->
+  //      BAD_SESSION (the destination session died since the share
+  //      landed; still clear the record so the pool slot frees).
+  //   4. cap_env_insert(dst_env, dst_env_slot, 0) -- the clear-slot
+  //      path (cap=0; cap_env_insert decrements cap_count if the
+  //      slot was occupied).  Ignore the return: a frozen dst env
+  //      refuses, but we still want to clear OUR record state.
+  //   5. Zero the record (flags = 0 LAST, publishing FREE).
+  //   6. Bump stat, emit fingerprint, return ES_OK.
+  //
+  // Register plan: 3 callee-save pushes (rbx = record_idx, r12 =
+  // dst_sid, r13 = dst_env_slot) land rsp%16==0 at every nested call.
+  // Labels prefixed es_rv_.
+  // ==========================================================================
+  pub let _es_revoke : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (share_record_idx: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M5 (paideia-os #2643): tear down a share. Validate idx via es_record_in_use (bad idx or already-free record -> ES_ERR_BAD_SESSION). On a stale dst session (es_resolve_session_env returns 0xFF) we STILL clear the record so the share-pool slot frees -- but the final return is ES_ERR_BAD_SESSION so the caller knows the destination side is already gone. Clear the dst env slot via cap_env_insert(dst_env, dst_slot, 0) (ignores the return: a frozen dst env refuses but our record is cleared regardless). Zero the record (flags=0 LAST, publishing FREE) in the SAME release order as _es_share's step 14. Three callee-save pushes (rbx=idx, r12=dst_sid, r13=dst_env_slot) land rsp%16==0 at every nested call. u32 isolation uses shr 32 (no `and r11, 0xFFFFFFFF`). Labels prefixed es_rv_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                    // record_idx
+
+        // ---- Step 1: validate ----
+        mov rdi, rbx;
+        call es_record_in_use;
+        cmp rax, 0;
+        je  es_rv_bad_session;
+
+        // ---- Step 2: load record; extract dst_sid, dst_env_slot ----
+        mov rax, rbx;
+        shl rax, 5;                      // idx * 32
+        lea r10, [rip + _es_share_table];
+        add rax, r10;                    // record base
+                                         // (keep in rax across steps
+                                         //  2-5 for the final zero
+                                         //  pass; nested calls do not
+                                         //  touch rax after use)
+
+        // dst_sid = high 32 of [+0]
+        mov r11, [rax + 0];              // {dst_sid:u32 | src_sid:u32}
+        shr r11, 32;                     // r11 = dst_sid
+        mov r12, r11;                    // park dst_sid
+
+        // dst_env_slot = high 32 of [+8]
+        mov r11, [rax + 8];              // {dst_slot:u32 | src_slot:u32}
+        shr r11, 32;                     // r11 = dst_env_slot
+        mov r13, r11;                    // park dst_env_slot
+
+        // ---- Step 3: resolve dst env ----
+        //   rax (record base) is a GP register the called function
+        //   may clobber; save it on the stack... actually we recompute
+        //   it after step 4 so no save is needed.  Still, we need rax
+        //   AFTER step 4 for the zero pass -- recompute at step 5.
+        mov rdi, r12;                    // dst_sid
+        call es_resolve_session_env;
+        mov r11, 0xFF;                   // ES_ENV_NONE
+        cmp rax, r11;
+        je  es_rv_zero_bad;              // dst gone; still clear OUR record
+
+        // ---- Step 4: clear dst env slot (cap=0) ----
+        mov rdi, rax;                    // dst_env_handle
+        mov rsi, r13;                    // dst_env_slot
+        mov rdx, 0;                      // cap = 0 (clear path)
+        call cap_env_insert;             // ignore the return
+
+        // ---- Step 5: zero the record ----
+        //   Recompute record base.
+        mov rax, rbx;
+        shl rax, 5;                      // idx * 32
+        lea r10, [rip + _es_share_table];
+        add rax, r10;                    // record base
+
+        //   Zero in release order: flags LAST publishes FREE.
+        xor r11, r11;
+        mov [rax + 0],  r11;             // sids
+        mov [rax + 8],  r11;             // slots
+        mov [rax + 16], r11;             // rights
+        mov [rax + 24], r11;             // flags = 0 (FREE)
+
+        // ---- Step 6: stats + fingerprint + success ----
+        mov rdi, 7;                      // ES_ST_REVOKE_OK
+        call es_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + es_tag_revoke_ok];
+        lea rcx, [rip + es_k_idx];
+        mov r8,  rbx;                    // v_hex = idx
+        call klog_s1_x1;
+
+        xor rax, rax;                    // ES_OK
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      es_rv_zero_bad:
+        // dst_sid resolved to ES_ENV_NONE.  Still zero our record so
+        // the share-pool slot frees for a future _es_share.  Then
+        // return ES_ERR_BAD_SESSION so the caller knows the dst side
+        // was gone when revoke ran.
+        mov rax, rbx;
+        shl rax, 5;
+        lea r10, [rip + _es_share_table];
+        add rax, r10;
+
+        xor r11, r11;
+        mov [rax + 0],  r11;
+        mov [rax + 8],  r11;
+        mov [rax + 16], r11;
+        mov [rax + 24], r11;             // flags = 0 (FREE), published LAST
+
+        // fall through to the REJ emit path below.
+
+      es_rv_bad_session:
+        mov r12, 0x1102;                 // ES_ERR_BAD_SESSION
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + es_tag_revoke_rej];
+        lea rcx, [rip + es_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Boot wiring note (see §7)
+  //
+  // kernel_main.pdx picks this up with ONE new call right after
+  // _ssd_init / before any user-space init:
+  //
+  //   call _ssd_init;                  // R139.M4
+  //   call _es_init;                   // R139.M5 (this file)
+  //   // ... user-space init ...
+  //
+  // Zero-arg, allocates nothing on the stack, touches rax/rcx/r10/r12;
+  // safe alongside kernel_main's live r13/r14 handoff registers.
+  // Wiring deferred to the same follow-up slice that lands the
+  // production caller (see §7 for the retirement path).
+  //
+  // --- Dispatch arm reservation (future) ---
+  // A later wave MAY lift the share surface into a cap-minter op
+  // variant on KIND_CAP_ENV (CAP_ENV_OP_SHARE), encoded as:
+  //
+  //   op_arg[7:0]   = CAP_ENV_OP_SHARE (reserved; not yet assigned)
+  //   op_arg[15:8]  = src_env_slot
+  //   target_ptr[7:0]  = src_session_id
+  //   target_ptr[15:8] = dst_session_id
+  //
+  // with rights_mask passed as a separate cap-invoke payload word.
+  // At M5 the standalone direct-call API avoids widening the handler
+  // dispatch while the ring-3-caller env is still being wired at
+  // R125.M3+.  See design/shell/multi-session-cap-env-sharing.md §5.
+  // ==========================================================================
+}

@@ -83,6 +83,44 @@ ROOT = sys.argv[1]
 # ---------------------------------------------------------------------------
 
 ALLOWLIST = {
+    # Wave 110 R139.M5 (paideia-os#2643): multi-session env sharing.
+    # Four fingerprints: INIT fires on boot via _es_init (no boot
+    # wire at M5; emitted from first _es_share call). SHARE/LOOKUP/
+    # REVOKE unreachable at M5 (no production caller yet; integration
+    # with cap-flow dispatch lands in R139.M6). All retire when
+    # R139.M6 lands a smoke-mode golden exercising the full share
+    # cycle end-to-end.
+    "ENV_SHARE INIT OK":
+        "Wave 110 R139.M5: src/kernel/core/svc/env_sharing.pdx "
+        "emits on first _es_share invocation. Retires when R139.M6 "
+        "wires a smoke mode asserting the share cycle.",
+    "ENV_SHARE SHARE OK":
+        "Wave 110 R139.M5: same file, _es_share success tail. "
+        "Unreachable at M5 (no production caller). Retires with "
+        "R139.M6.",
+    "ENV_SHARE LOOKUP OK":
+        "Wave 110 R139.M5: _es_lookup_sharing hit. Unreachable at "
+        "M5. Retires with R139.M6.",
+    "ENV_SHARE REVOKE OK":
+        "Wave 110 R139.M5: _es_revoke success tail. Unreachable at "
+        "M5. Retires with R139.M6.",
+
+    # Wave 110 R137.M5 (paideia-os#2637): remote-side identity.
+    # Three fingerprints: BIND/LOOKUP/REVOKE OK. All unreachable at
+    # M5 (M4 wire does NOT consult identity; the KIND_FEDERATION
+    # dispatcher that consumes them is R137.M6+). Retire when
+    # KIND_FEDERATION wave lands with asserting smoke golden.
+    "REMOTE_IDENTITY BIND OK":
+        "Wave 110 R137.M5: src/kernel/core/svc/remote_identity.pdx "
+        "emits from _ri_bind_peer_to_env. Unreachable at M5 "
+        "(KIND_FEDERATION dispatcher is R137.M6+). Retires then.",
+    "REMOTE_IDENTITY LOOKUP OK":
+        "Wave 110 R137.M5: same file, _ri_lookup_peer_env hit. "
+        "Unreachable at M5. Retires with R137.M6.",
+    "REMOTE_IDENTITY REVOKE OK":
+        "Wave 110 R137.M5: same file, _ri_revoke_peer_env success. "
+        "Unreachable at M5. Retires with R137.M6.",
+
     # Wave 99 R125.M4 (paideia-os#2594): syscall-entry cap check
     # integration. SYSCALL CAP_CHECK TABLE OK fires on every boot
     # from _syscall_rights_table_init in the svc.* bringup cascade.
