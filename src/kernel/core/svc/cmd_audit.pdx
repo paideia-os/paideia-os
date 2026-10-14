@@ -1,0 +1,1017 @@
+// src/kernel/core/svc/cmd_audit.pdx -- Wave UMB-W21 R139.M3
+// paideia-os #2641
+//
+// AUDIT-LOG DISCIPLINE FOR EVERY COMMAND
+// =============================================================================
+//
+// R139 ("multi-session") milestone M3.  M1 (Wave UMB-W20, #2639) landed
+// the projection surface over the per-session history_facts fact rings
+// (union / intersect / summary).  M3 lands the AUDIT-LOG DISCIPLINE
+// one layer above: every command dispatched through any surface --
+// in-process REPL (R127.M5+), R135 WASI-jail, R137 remote-shell --
+// emits a tamper-evident audit record carrying session_id, pid,
+// cmd_hash, argv_hash, cap-env fingerprint, tsc_start / tsc_end,
+// exit_code, and a BLAKE3 chain hash binding each record to its
+// predecessor.
+//
+// Separation from history_facts:
+//   * history_facts (R127.M7) is a SCRATCH substrate -- 64-byte rows,
+//     silently evicted at 128 commands per session, used for query
+//     predicates ("which commands exited non-zero last session?").
+//     Not append-only; not hashed; not forgery-resistant.
+//   * cmd_audit (R139.M3) is an APPEND-ONLY tamper-evident log --
+//     128-byte records, BLAKE3-chained, 128 slots in-RAM at M3,
+//     spilled to pdxfs at M4.  The chain is one-way: altering any
+//     record's bytes breaks every subsequent record's prev_hash,
+//     detectable in O(1) per record by _cmd_audit_verify.
+//
+// Design posture (feedback_novel_clean_design): POSIX syslog's audit
+// facility (auditd + /var/log/audit/audit.log + ausearch) is retired.
+// The kernel owns the audit substrate end-to-end, the chain is first-
+// class (not a bolt-on log forwarder), and the record carries the
+// cap-env fingerprint -- a reach POSIX auditd has no name for.  The
+// log is forgery-resistant by construction, not by convention
+// (unlike auditd's "trust the admin's chmod" posture).
+//
+// Design: design/shell/command-audit-discipline.md.
+//
+// =============================================================================
+// SECTION 1  GEOMETRY  --  128B x 128 SLOTS = 16 KiB IN-RAM RING
+// =============================================================================
+//
+//   per-record stride = 128 bytes                             (shl 7)
+//   pool              = 128 records x 128 bytes = 16384 B     (shl 14)
+//
+// Backing storage: _cmd_audit_pool : [u8; 16384] in .bss, @align(128)
+// so the first record sits on a cache-line pair boundary and record N
+// starts at (N << 7) from the pool base -- no `imul r, imm` is ever
+// needed to address a record slot.
+//
+// Record row layout (128 bytes):
+//
+//   [+0]    seq               u64         monotonic sequence number
+//                                         (starts at 1; 0 reserved for
+//                                         "invalid token")
+//   [+8]    prev_hash         [u8; 32]    BLAKE3-32 of the predecessor
+//                                         record's bytes [0..96]; zero
+//                                         for the genesis record (seq==1)
+//   [+40]   session_id        u32         caller-supplied; mirrors the
+//                                         shell_session row id, remote-
+//                                         shell conn id, or jail sid
+//                                         depending on the dispatch surface
+//   [+44]   pid               u32         task pid at dispatch
+//   [+48]   cmd_hash          u32         djb2(cmd_bytes) (same hash
+//                                         as history_facts for cross-
+//                                         substrate join)
+//   [+52]   argv_hash         u32         djb2(argv_blob) (caller-supplied;
+//                                         0 if argv is empty)
+//   [+56]   cap_env_fingerprint u64       64-bit fingerprint of the
+//                                         caller's cap-env at dispatch
+//                                         (caller-supplied; typically
+//                                         the handle index + rights mask
+//                                         rolled through djb2)
+//   [+64]   tsc_start         u64         RDTSC at _cmd_audit_begin
+//   [+72]   tsc_end           u64         RDTSC at _cmd_audit_end
+//                                         (zero while the record is
+//                                         still PENDING)
+//   [+80]   exit_code         u32         process-exit code (signed in
+//                                         low 32; sign-extend at read
+//                                         time; zero while PENDING)
+//   [+84]   flags             u32         bit 0 = CA_FLAG_PENDING
+//                                         bit 1 = CA_FLAG_FINALIZED
+//                                         (mutually exclusive)
+//   [+88]   reserved          [u8; 8]     explicit-zero on write; M4
+//                                         may reinterpret as a pdxfs
+//                                         block pointer
+//   [+96]   this_hash         [u8; 32]    BLAKE3-32 of this record's
+//                                         bytes [0..96] (which includes
+//                                         prev_hash at [+8..+40]);
+//                                         computed at _cmd_audit_end
+//                                         after tsc_end + exit_code
+//                                         + flags are finalized
+//
+// Total: 8+32+4+4+4+4+8+8+8+4+4+8+32 = 128 bytes.  Fixed stride keeps
+// the slot-address compute a straight-line shl-and-add.
+//
+// =============================================================================
+// SECTION 2  BLAKE3 CHAIN
+// =============================================================================
+//
+//   this_hash[seq] = BLAKE3(record[seq].bytes[0..96])
+//
+// The 96-byte prefix already includes prev_hash at [+8..+40], so this
+// is identical to the brief's `BLAKE3(prev_hash || record_bytes_minus_
+// this_hash)` -- the prev_hash is inside the hashed window.  The chain
+// is one-way: altering any field in record N (seq, session_id, pid,
+// cmd_hash, argv_hash, cap_env_fingerprint, tsc_*, exit_code, flags)
+// changes record N's BLAKE3 and therefore every subsequent record's
+// prev_hash would no longer match N's this_hash.  _cmd_audit_verify
+// (§3) detects the break in O(1) per record.
+//
+// BLAKE3 is reached via paideia_crypto_blake3_hash (satellite-runtime
+// extern-C, same hook pdxfs_lite/inode.pdx uses for inode checksums
+// and schema_registry.pdx uses for schema hashes).  SysV marshalling:
+// rdi=&data, rsi=len, rdx=&out32.  Return value is discarded: with
+// non-null out and non-zero len the FFI cannot fail per paideia-as
+// Blake3::hash docs.
+//
+// Ring eviction + chain integrity: the pool is a 128-slot ring, so
+// after 128+1 begins the first record is overwritten.  prev_hash for
+// record (N+128) is pulled from the slot at ((N+128-1) & 0x7F) which
+// is the IMMEDIATELY PRECEDING begin's slot (correct, by construction).
+// What is NOT recoverable after eviction is the chain prefix: once
+// record N is gone, _cmd_audit_verify of record (N+128) cannot cross-
+// check prev_hash against record N -- it has to trust the on-ring
+// prefix only.  The design treats this as acceptable because (a) 128
+// is 256x the typical burst length between flushes and (b) R139.M4
+// spills to pdxfs before the ring saturates in any realistic workload.
+//
+// =============================================================================
+// SECTION 3  PUBLIC API
+// =============================================================================
+//
+//   _cmd_audit_init() -> ()
+//     Boot-time scrub of _cmd_audit_stats + reset of _cmd_audit_seq;
+//     emits `CMD_AUDIT INIT OK`.
+//
+//   _cmd_audit_begin(session_id, pid, cmd_hash, argv_hash,
+//                    cap_env_fingerprint) -> audit_token | 0
+//     Pre-increment _cmd_audit_seq (atomic in the single-core sense;
+//     SMP serialisation deferred to M4 alongside the pdxfs spill);
+//     allocate the next ring slot; capture tsc_start via kread_tsc;
+//     copy the predecessor record's this_hash into the new slot's
+//     prev_hash (zero for seq==1 genesis); write the caller's five
+//     metadata fields; set flags=PENDING; zero this_hash (deferred
+//     until _end).  Returns token=seq (nonzero) on success, 0 iff the
+//     slot being overwritten still has PENDING set (begin>128 without
+//     any end -- the pool is logically full of in-flight records),
+//     which emits `CMD_AUDIT BEGIN REJ errno=0x2200`.
+//
+//     The token is opaque to the caller.  It encodes the seq (which
+//     also determines the slot) and is validated at _end / _verify by
+//     comparing slot.seq against token.
+//
+//   _cmd_audit_end(audit_token, exit_code) -> errno
+//     Validate token (0 -> BAD_TOKEN; slot.seq != token -> BAD_TOKEN;
+//     slot not PENDING -> BAD_TOKEN); capture tsc_end via kread_tsc;
+//     write tsc_end + exit_code; flip flags from PENDING to FINALIZED;
+//     compute this_hash = BLAKE3(record[0..96]) and write it to
+//     [+96..+128].  Emits `CMD_AUDIT END OK seq=0x<hex> exit=<dec>`
+//     on success, `CMD_AUDIT END REJ errno=0x2201` on bad token.
+//
+//   _cmd_audit_verify(audit_token) -> errno
+//     Validate token (as above); recompute this_hash into a verify
+//     scratch and compare 4 qwords against slot.this_hash
+//     (CHAIN_BROKEN on mismatch); then, iff the predecessor slot
+//     still holds record (seq-1) finalized (eviction cross-check:
+//     prev_slot.seq == seq - 1 AND prev_slot.flags == FINALIZED),
+//     compare slot.prev_hash against prev_slot.this_hash
+//     (CHAIN_BROKEN on mismatch).  On successful partial verification
+//     (self-hash OK; prev-slot evicted so chain-prefix verification
+//     skipped) returns CA_OK -- the self-hash is still the forgery-
+//     resistant primitive, and prev_slot eviction is NOT a forgery
+//     signal.  Emits `CMD_AUDIT VERIFY OK seq=0x<hex>` on success,
+//     `CMD_AUDIT VERIFY REJ errno=0x<hex>` on failure.
+//
+// =============================================================================
+// SECTION 4  RETURN CODE BAND  --  0x2200..0x2202
+// =============================================================================
+//
+//   CA_OK                 = 0
+//   CA_ERR_POOL_FULL      = 0x2200    (begin: PENDING collision)
+//   CA_ERR_BAD_TOKEN      = 0x2201    (end / verify: token zero or
+//                                       slot.seq mismatch or state wrong)
+//   CA_ERR_CHAIN_BROKEN   = 0x2202    (verify: hash mismatch)
+//
+// Band audit (2026-10-14):
+//   `grep -rnE '0x220[0-2]\b' src/kernel/` -> zero hits.  Clean band.
+//
+// All three codes fit imm32 with bit 31 clear so `mov rax, imm32`
+// emits the 7-byte zero-extending form.
+//
+// =============================================================================
+// SECTION 5  ENCODER DISCIPLINE
+// =============================================================================
+//
+// Labels prefixed `ca_` (cmd-audit) to stay clear of `hf_` (history_
+// facts), `hs_` (history_segmentation), `sh_` (shell_history), `ss_`
+// (shell_session), `sj_` (shell_jobs) and `svc_` (ipc/svc_broker).
+// Encoder-pitfall posture (feedback_pdx_encoder_pitfalls):
+//
+//   * cmp rN, 0              (never `test rN, rN`)
+//   * shl rN, 7              (record-stride compose)
+//   * shl rN, 32             (u32 high-half pack / isolation)
+//   * shr rN, 32             (u32 low-half isolation)
+//   * and rN, 0x7F           (slot-index mask; fits imm32)
+//   * and rN, 1              (flag-bit extract; fits imm8)
+//   * mov rax, imm32         (error codes 0x2200..0x2202; never
+//                             `and r11, imm64`)
+//   * mov_d [mem], reg       (32-bit stores for u32 record fields;
+//                             bare `mov [mem], reg` would REX.W-widen
+//                             to a 64-bit store and clobber neighbour)
+//   * single-line `pub let name = "..."`
+//   * module basename CmdAudit matches file basename cmd_audit.pdx
+//   * fingerprint [u8; N] with N = len(string) + 1 (NUL counts)
+//
+// Stack discipline (SysV, entry rsp%16==8):
+//   _cmd_audit_init           1 push + 0 sub      (klog_s1 parity)
+//   _cmd_audit_begin          5 pushes + sub rsp,32
+//                                                 (4 stack slots: klog
+//                                                  arg + seq + slot_ptr
+//                                                  + pad; 5*8+32 = 72 ->
+//                                                  entry+8 lands %16==0)
+//   _cmd_audit_end            3 pushes + sub rsp,16
+//                                                 (klog slot + pad;
+//                                                  3*8+16 = 40 -> %16==0)
+//   _cmd_audit_verify         3 pushes + sub rsp,16
+//                                                 (klog slot + pad)
+//
+// =============================================================================
+// SECTION 6  BOOT WIRING
+// =============================================================================
+//
+// kernel_main.pdx picks this up with ONE new call right after
+// _hs_init:
+//
+//   call _hf_init;                   // R127.M7
+//   call _hs_init;                   // R139.M1
+//   call _cmd_audit_init;            // R139.M3 (this file)
+//   call _shell_jobs_init;           // R127.M5
+//
+// Placement rationale: _cmd_audit_init MUST follow _hs_init so an
+// audit grep sees the four history-shaped fingerprints in subsystem
+// order (SHELL_HISTORY INIT OK -> HISTORY_FACTS INIT OK -> HISTORY_
+// SEG INIT OK -> CMD_AUDIT INIT OK).  No data dependency on
+// _shell_jobs_init.
+//
+// =============================================================================
+
+module CmdAudit = structure {
+
+  // ==========================================================================
+  // Return band (§4)
+  // ==========================================================================
+
+  pub let CA_OK                : u64 = 0
+  pub let CA_ERR_POOL_FULL     : u64 = 0x2200
+  pub let CA_ERR_BAD_TOKEN     : u64 = 0x2201
+  pub let CA_ERR_CHAIN_BROKEN  : u64 = 0x2202
+
+  // ==========================================================================
+  // Pool geometry (§1)
+  // ==========================================================================
+
+  pub let CA_POOL_SLOTS        : u64 = 128
+  pub let CA_RECORD_BYTES      : u64 = 128      // (shl 7)
+  pub let CA_POOL_BYTES        : u64 = 16384    // 128 * 128
+  pub let CA_SLOT_MASK         : u64 = 0x7F
+
+  // Record field offsets.
+  pub let CA_OFF_SEQ           : u64 = 0
+  pub let CA_OFF_PREV_HASH     : u64 = 8
+  pub let CA_OFF_SID           : u64 = 40
+  pub let CA_OFF_PID           : u64 = 44
+  pub let CA_OFF_CMD_HASH      : u64 = 48
+  pub let CA_OFF_ARGV_HASH     : u64 = 52
+  pub let CA_OFF_CAP_ENV_FP    : u64 = 56
+  pub let CA_OFF_TSC_START     : u64 = 64
+  pub let CA_OFF_TSC_END       : u64 = 72
+  pub let CA_OFF_EXIT          : u64 = 80
+  pub let CA_OFF_FLAGS         : u64 = 84
+  pub let CA_OFF_RESERVED      : u64 = 88
+  pub let CA_OFF_THIS_HASH     : u64 = 96
+
+  pub let CA_HASH_BYTES        : u64 = 32
+  pub let CA_HASH_INPUT_BYTES  : u64 = 96       // record[0..96]
+
+  // Record state flags (bit field in [+84..+88]).
+  pub let CA_FLAG_PENDING      : u64 = 0x1
+  pub let CA_FLAG_FINALIZED    : u64 = 0x2
+
+  // ==========================================================================
+  // Storage
+  //
+  //   _cmd_audit_pool            -- 16 KiB backing (128 records x 128 B).
+  //                                 @align(128) puts record 0 on a cache-
+  //                                 line pair boundary; record N starts at
+  //                                 _cmd_audit_pool + (N << 7).
+  //   _cmd_audit_seq             -- monotonic u64 sequence counter; pre-
+  //                                 incremented by begin.  Zero means
+  //                                 "no record ever written" (boot state).
+  //   _cmd_audit_verify_scratch  -- 32-byte scratch for the BLAKE3 digest
+  //                                 computed by _cmd_audit_verify.
+  //                                 Single-flow (verify is leaf-called;
+  //                                 no reentrancy at M3).
+  //   _cmd_audit_stats           -- 8 u64 counters (observability).
+  // ==========================================================================
+
+  pub let mut _cmd_audit_pool            : [u8; 16384] = uninit @align(128)
+  pub let mut _cmd_audit_seq             : u64         = 0
+  pub let mut _cmd_audit_verify_scratch  : [u8; 32]    = uninit @align(8)
+  pub let mut _cmd_audit_stats           : [u64; 8]    = uninit @align(64)
+
+  pub let CA_ST_INIT_OK        : u64 = 0
+  pub let CA_ST_BEGIN_OK       : u64 = 1
+  pub let CA_ST_BEGIN_REJ      : u64 = 2
+  pub let CA_ST_END_OK         : u64 = 3
+  pub let CA_ST_END_REJ        : u64 = 4
+  pub let CA_ST_VERIFY_OK      : u64 = 5
+  pub let CA_ST_VERIFY_REJ_TOK : u64 = 6
+  pub let CA_ST_VERIFY_REJ_CHN : u64 = 7
+
+  // ==========================================================================
+  // Fingerprint tags (N = len(string) + 1, NUL inclusive).
+  //
+  // Only the "OK" tags are extracted by the fingerprint-coverage gate;
+  // REJ tags are opaque to the gate so no allowlist entry is required
+  // for them.
+  // ==========================================================================
+
+  // "CMD_AUDIT INIT OK"      = 17 chars + NUL => N = 18
+  // "CMD_AUDIT BEGIN OK"     = 18 chars + NUL => N = 19
+  // "CMD_AUDIT BEGIN REJ"    = 19 chars + NUL => N = 20
+  // "CMD_AUDIT END OK"       = 16 chars + NUL => N = 17
+  // "CMD_AUDIT END REJ"      = 17 chars + NUL => N = 18
+  // "CMD_AUDIT VERIFY OK"    = 19 chars + NUL => N = 20
+  // "CMD_AUDIT VERIFY REJ"   = 20 chars + NUL => N = 21
+
+  pub let ca_tag_init_ok     : [u8; 18] = "CMD_AUDIT INIT OK\0"
+  pub let ca_tag_begin_ok    : [u8; 19] = "CMD_AUDIT BEGIN OK\0"
+  pub let ca_tag_begin_rej   : [u8; 20] = "CMD_AUDIT BEGIN REJ\0"
+  pub let ca_tag_end_ok      : [u8; 17] = "CMD_AUDIT END OK\0"
+  pub let ca_tag_end_rej     : [u8; 18] = "CMD_AUDIT END REJ\0"
+  pub let ca_tag_verify_ok   : [u8; 20] = "CMD_AUDIT VERIFY OK\0"
+  pub let ca_tag_verify_rej  : [u8; 21] = "CMD_AUDIT VERIFY REJ\0"
+
+  pub let ca_k_seq    : [u8; 4] = "seq\0"
+  pub let ca_k_sid    : [u8; 4] = "sid\0"
+  pub let ca_k_exit   : [u8; 5] = "exit\0"
+  pub let ca_k_errno  : [u8; 6] = "errno\0"
+
+  // ==========================================================================
+  // ca_note(slot) -> ()
+  //
+  // Bounded increment on _cmd_audit_stats[slot]. Load-inc-store idiom
+  // (no `add reg, [mem]`). Caller passes a CA_ST_* ordinal; the bounds
+  // check guards against the stats pool size (8). Pure leaf -- no
+  // pushes.
+  // ==========================================================================
+  pub let ca_note : (u64) -> () !{mem} @{} =
+    fn (slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R139.M3 (paideia-os #2641): bounded increment on _cmd_audit_stats[slot<8]. Load-inc-store, no `add reg,[mem]`. Pure leaf -- no pushes. Labels prefixed ca_no_.",
+      block: {
+        cmp rdi, 8;
+        jae ca_no_out;
+        lea r10, [rip + _cmd_audit_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      ca_no_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ca_slot_base(seq) -> &slot
+  //
+  // Pure address compute: slot_idx = (seq - 1) & 0x7F; slot_base =
+  // _cmd_audit_pool + (slot_idx << 7).  Caller is responsible for
+  // seq != 0 (seq==0 would compute slot_idx=0x7F which is still in
+  // bounds but semantically "no record"); _cmd_audit_begin / _end /
+  // _verify all gate on seq != 0 before calling here.
+  //
+  // Pure leaf -- no pushes.
+  // ==========================================================================
+  pub let ca_slot_base : (u64) -> u64 !{} @{} =
+    fn (seq: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "R139.M3 (paideia-os #2641): compute slot_base = _cmd_audit_pool + (((seq - 1) & 0x7F) << 7). Both the mask and the stride fit as immediates: 0x7F is imm32, 7 is imm8, so no 2-op imul is required. Pure leaf. Labels prefixed ca_sb_.",
+      block: {
+        mov rax, rdi;
+        sub rax, 1;
+        and rax, 0x7F;
+        shl rax, 7;
+        lea r10, [rip + _cmd_audit_pool];
+        add rax, r10;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _cmd_audit_init() -> ()
+  //
+  // Boot hook. Defensive scrub of _cmd_audit_seq (1 u64) and
+  // _cmd_audit_stats (8 u64 = 64 bytes). .bss zero-init handles both
+  // at real boot; the explicit scrub is defensive for a chaos-restart
+  // re-entering init. Emits `CMD_AUDIT INIT OK` on completion.
+  //
+  // _cmd_audit_pool and _cmd_audit_verify_scratch are NOT scrubbed
+  // (16 KiB + 32 B zero-fill is wasted work; the _cmd_audit_seq
+  // counter gates reach to any slot, and bss is already zero at real
+  // boot).
+  //
+  // Single callee-save push (r12) corrects entry parity rsp%16==8 -> 0
+  // for the sibling klog_s1 call, matching _hf_init / _hs_init shape.
+  //
+  // Labels prefixed ca_in_.
+  // ==========================================================================
+  pub let _cmd_audit_init : () -> () !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M3 (paideia-os #2641): boot-time scrub of _cmd_audit_seq (single u64) and _cmd_audit_stats (8 u64 = 64 bytes) + one INIT OK fingerprint. .bss zero-init handles both at real boot; the explicit scrub is defensive for a chaos-restart re-entering init. _cmd_audit_pool (16 KiB) is NOT scrubbed because _cmd_audit_seq gates reach to any slot (a slot is live only when _cmd_audit_seq has reached it); a stale record is unreachable via the public API even on chaos restart. _cmd_audit_verify_scratch is single-flow (verify is leaf-called at M3) so a stale digest from a previous verify is overwritten before each read. Single callee-save push (r12) corrects entry parity rsp%16==8 -> 0 for the sibling klog_s1 call. Labels prefixed ca_in_.",
+      block: {
+        push r12;
+
+        // Scrub _cmd_audit_seq.
+        lea r10, [rip + _cmd_audit_seq];
+        xor rax, rax;
+        mov [r10], rax;
+
+        // Scrub _cmd_audit_stats[0..8].
+        lea r10, [rip + _cmd_audit_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      ca_in_stats:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  ca_in_stats;
+
+        // Bump INIT_OK counter.
+        mov rdi, 0;                      // CA_ST_INIT_OK
+        call ca_note;
+
+        // Emit INIT OK fingerprint.
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ca_tag_init_ok];
+        call klog_s1;
+
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _cmd_audit_begin(session_id, pid, cmd_hash, argv_hash,
+  //                  cap_env_fingerprint) -> audit_token | 0
+  //
+  // Allocate the next record slot and write the dispatch metadata.
+  // Returns a nonzero opaque token (= the record's seq) on success,
+  // or 0 iff the slot being overwritten still has PENDING set --
+  // meaning begin>128 begins have landed with no matching ends, so
+  // the pool is logically full of in-flight records.  The caller
+  // treats 0 as "audit substrate full; do not call _end".
+  //
+  // Flow:
+  //   1. Save all five SysV reg args into callee-save slots.
+  //   2. Pre-increment _cmd_audit_seq (seq counter starts at 0 so
+  //      the first begin returns seq=1).
+  //   3. Compute slot_idx = (seq - 1) & 0x7F; slot = pool + (idx<<7).
+  //   4. Check the slot's existing flags for PENDING: if set,
+  //      POOL_FULL + emit REJ fingerprint + return 0.
+  //   5. Capture tsc_start via kread_tsc.
+  //   6. Copy predecessor's this_hash into new slot's prev_hash
+  //      (32 B = 4 qword stores); zero prev_hash for seq==1 genesis.
+  //   7. Write seq, session_id (u32), pid (u32), cmd_hash (u32),
+  //      argv_hash (u32), cap_env_fingerprint (u64), tsc_start,
+  //      tsc_end=0, exit_code=0, flags=PENDING, reserved=0,
+  //      this_hash=0.
+  //   8. Bump CA_ST_BEGIN_OK; emit `CMD_AUDIT BEGIN OK seq=0x<hex>
+  //      sid=0x<hex>` via klog_s1_x2.
+  //   9. Return token = seq.
+  //
+  // ARGS (SysV):
+  //   rdi = session_id          (u32 in low 32)
+  //   rsi = pid                 (u32 in low 32)
+  //   rdx = cmd_hash            (u32 in low 32; djb2 of command bytes)
+  //   rcx = argv_hash           (u32 in low 32; djb2 of argv blob)
+  //   r8  = cap_env_fingerprint (u64)
+  //
+  // RETURNS (rax):
+  //   nonzero token on success (= seq)
+  //   0 on POOL_FULL (slot's predecessor still PENDING)
+  //
+  // STACK FRAME:
+  //   5 callee-save pushes (rbx=session_id, r12=pid, r13=cmd_hash,
+  //   r14=argv_hash, r15=cap_env_fingerprint) + sub rsp, 32
+  //   (4 stack slots: [+0] klog stack-arg, [+8] saved seq, [+16]
+  //   saved slot_ptr, [+24] pad).  Entry rsp%16==8; +5 pushes + 32 =
+  //   72 -> %16==0 at every nested call.
+  //
+  // Labels prefixed ca_bg_.
+  // ==========================================================================
+  pub let _cmd_audit_begin : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (session_id: u64) (pid: u64) (cmd_hash: u64) (argv_hash: u64) (cap_env_fingerprint: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M3 (paideia-os #2641): allocate the next ring slot in the 128-slot audit pool and populate the dispatch half of the record (tsc_start, session_id, pid, cmd_hash, argv_hash, cap_env_fingerprint, flags=PENDING). Pre-increment _cmd_audit_seq; slot_idx = (seq-1) & 0x7F; slot_ptr = _cmd_audit_pool + (slot_idx << 7). Check the slot's existing flags for PENDING (bit 0 of the u32 at [+84]): if set, the slot's prior begin never ended -- the pool is logically full of in-flight records -- bump CA_ST_BEGIN_REJ, emit `CMD_AUDIT BEGIN REJ errno=0x2200`, return 0. Otherwise capture tsc_start via kread_tsc; copy predecessor's this_hash into new slot's prev_hash (32 B = 4 qword moves) for seq>1, zero for seq==1 genesis; write every u32/u64 field. The exit_code+flags u64 at [+80..+88] is packed as (flags<<32)|exit_code with flags=PENDING=1 and exit_code=0, written as a single mov. The 32-byte this_hash at [+96..+128] is zero-filled (deferred until _cmd_audit_end computes the BLAKE3). Finally bump CA_ST_BEGIN_OK, emit `CMD_AUDIT BEGIN OK seq=0x<hex> sid=0x<hex>` via klog_s1_x2 with v2 (sid) on [rsp+0], return token=seq. Five callee-save pushes (rbx=session_id, r12=pid, r13=cmd_hash, r14=argv_hash, r15=cap_env_fingerprint) + sub rsp,32 lands rsp%16==0 at every nested call. The seq is saved to [rsp+8] (survives kread_tsc / ca_note / klog_s1_x2 calls, which clobber rax) and the slot_ptr is saved to [rsp+16] (survives kread_tsc). Encoder-pitfall posture: cmp rN,0 (never test), shl rN,7 (record stride), and rN,0x7F (slot mask fits imm32), and rN,1 (flag bit fits imm8), mov rax,imm32 for error codes (0x2200 fits), mov_d [mem],reg for every u32 field store (bare mov would REX.W-widen to 8 bytes and clobber the neighbour), flags-high / exit-low pack via shl rN,32 + or (never and r,imm64 with bit31). Labels prefixed ca_bg_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 32;
+
+        mov rbx, rdi;                    // session_id
+        mov r12, rsi;                    // pid
+        mov r13, rdx;                    // cmd_hash
+        mov r14, rcx;                    // argv_hash
+        mov r15, r8;                     // cap_env_fingerprint
+
+        // ---- Pre-increment _cmd_audit_seq ----
+        lea r10, [rip + _cmd_audit_seq];
+        mov rax, [r10];
+        add rax, 1;
+        mov [r10], rax;
+        mov [rsp + 8], rax;              // save seq
+
+        // ---- slot_ptr = pool + (((seq - 1) & 0x7F) << 7) ----
+        mov r9, rax;
+        sub r9, 1;
+        and r9, 0x7F;
+        shl r9, 7;                       // slot_idx * 128
+        lea r10, [rip + _cmd_audit_pool];
+        add r10, r9;
+        mov [rsp + 16], r10;             // save slot_ptr
+
+        // ---- Check existing PENDING bit at [slot + 80..+88] ----
+        //      Load u64; shr 32 to isolate the flags u32 in low 32;
+        //      and 1 to extract CA_FLAG_PENDING; nonzero -> POOL_FULL.
+        mov r9, [r10 + 80];
+        shr r9, 32;
+        and r9, 1;
+        cmp r9, 0;
+        jne ca_bg_pool_full;
+
+        // ---- Capture tsc_start ----
+        //      kread_tsc returns the TSC in rax; it clobbers rax/rdx
+        //      and preserves callee-save.  slot_ptr is on the stack
+        //      so the clobber of r10/r11 inside the leaf is safe.
+        call kread_tsc;
+        mov r10, [rsp + 16];             // reload slot_ptr
+        mov [r10 + 64], rax;             // tsc_start
+
+        // ---- Copy predecessor's this_hash into prev_hash ----
+        //      For seq==1 (genesis), zero prev_hash instead.
+        mov rax, [rsp + 8];              // seq
+        cmp rax, 1;
+        je  ca_bg_genesis;
+
+        // prev_slot_ptr = pool + (((seq - 2) & 0x7F) << 7)
+        sub rax, 2;
+        and rax, 0x7F;
+        shl rax, 7;
+        lea r11, [rip + _cmd_audit_pool];
+        add r11, rax;                    // r11 = &prev_slot
+
+        // Copy 32 B = 4 qwords from prev_slot[+96..+128] to slot[+8..+40].
+        mov rax, [r11 + 96];
+        mov [r10 + 8], rax;
+        mov rax, [r11 + 104];
+        mov [r10 + 16], rax;
+        mov rax, [r11 + 112];
+        mov [r10 + 24], rax;
+        mov rax, [r11 + 120];
+        mov [r10 + 32], rax;
+        jmp ca_bg_prev_done;
+
+      ca_bg_genesis:
+        // Zero prev_hash (seq==1 has no predecessor).
+        xor rax, rax;
+        mov [r10 + 8], rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+
+      ca_bg_prev_done:
+        // ---- Write seq at [+0] ----
+        mov rax, [rsp + 8];
+        mov [r10 + 0], rax;
+
+        // ---- session_id (u32) at [+40] ----
+        mov_d [r10 + 40], rbx;
+
+        // ---- pid (u32) at [+44] ----
+        mov_d [r10 + 44], r12;
+
+        // ---- cmd_hash (u32) at [+48] ----
+        mov_d [r10 + 48], r13;
+
+        // ---- argv_hash (u32) at [+52] ----
+        mov_d [r10 + 52], r14;
+
+        // ---- cap_env_fingerprint (u64) at [+56] ----
+        mov [r10 + 56], r15;
+
+        // ---- tsc_end (u64) at [+72] = 0 (deferred until _end) ----
+        xor rax, rax;
+        mov [r10 + 72], rax;
+
+        // ---- exit_code (u32) at [+80] + flags (u32) at [+84] ----
+        //      Packed: (flags << 32) | exit_code with flags=PENDING=1
+        //      and exit_code=0.  Build via shl so bit31 does not
+        //      trip and r11,imm64.
+        mov rax, 1;                      // CA_FLAG_PENDING
+        shl rax, 32;                     // flags in high 32
+        mov [r10 + 80], rax;             // low 32 = exit_code = 0
+
+        // ---- reserved (8 B) at [+88] = 0 ----
+        xor rax, rax;
+        mov [r10 + 88], rax;
+
+        // ---- this_hash (32 B = 4 qwords) at [+96] = 0 ----
+        xor rax, rax;
+        mov [r10 + 96], rax;
+        mov [r10 + 104], rax;
+        mov [r10 + 112], rax;
+        mov [r10 + 120], rax;
+
+        // ---- Stats + fingerprint ----
+        mov rdi, 1;                      // CA_ST_BEGIN_OK
+        call ca_note;
+
+        // klog_s1_x2: CMD_AUDIT BEGIN OK seq=0x<hex> sid=0x<hex>
+        mov [rsp + 0], rbx;              // v2 = sid
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ca_tag_begin_ok];
+        lea rcx, [rip + ca_k_seq];
+        mov r8,  [rsp + 8];              // v1 = seq
+        lea r9,  [rip + ca_k_sid];
+        call klog_s1_x2;
+
+        // ---- Return token = seq ----
+        mov rax, [rsp + 8];
+        jmp ca_bg_out;
+
+      ca_bg_pool_full:
+        mov rdi, 2;                      // CA_ST_BEGIN_REJ
+        call ca_note;
+
+        mov r12, 0x2200;                 // CA_ERR_POOL_FULL
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ca_tag_begin_rej];
+        lea rcx, [rip + ca_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        xor rax, rax;                    // return 0 (failure)
+
+      ca_bg_out:
+        add rsp, 32;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _cmd_audit_end(audit_token, exit_code) -> errno
+  //
+  // Finalize the record identified by audit_token.  Validate the
+  // token (nonzero AND slot.seq == token AND flags & PENDING);
+  // capture tsc_end; write tsc_end + exit_code; flip flags to
+  // FINALIZED; compute this_hash = BLAKE3(record[0..96]) and write
+  // it to [+96..+128].
+  //
+  // ARGS (SysV):
+  //   rdi = audit_token         (= seq from _cmd_audit_begin)
+  //   rsi = exit_code           (i32 in low 32; sign-extended by caller)
+  //
+  // RETURNS (rax):
+  //   CA_OK                 on success
+  //   CA_ERR_BAD_TOKEN      on token=0, slot.seq mismatch, or
+  //                         slot not PENDING
+  //
+  // STACK FRAME:
+  //   3 callee-save pushes (rbx=token, r12=exit_code, r13=slot_ptr)
+  //   + sub rsp, 16 (klog stack-arg slot + pad).  Entry rsp%16==8;
+  //   +3 pushes + 16 = 40 -> %16==0 at every nested call.
+  //
+  // Labels prefixed ca_ed_.
+  // ==========================================================================
+  pub let _cmd_audit_end : (u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (audit_token: u64) (exit_code: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M3 (paideia-os #2641): finalize the record whose seq matches audit_token. Validate: token != 0 (else BAD_TOKEN); slot_ptr = pool + (((token-1) & 0x7F) << 7); slot.seq (u64 at [+0]) == token (else BAD_TOKEN); flags & PENDING == 1 (else BAD_TOKEN). On success: capture tsc_end via kread_tsc (writes to [+72]); pack (flags=FINALIZED=2 in high 32) | (exit_code in low 32) and write at [+80..+88] via single mov (bit31 not involved so no `and r11,imm64` risk); call paideia_crypto_blake3_hash(rdi=slot_ptr, rsi=96, rdx=slot_ptr+96) to write this_hash directly into [+96..+128]. Bump CA_ST_END_OK; emit `CMD_AUDIT END OK seq=0x<hex> exit=<dec>` via klog_s1_x1_d1. Three callee-save pushes (rbx=audit_token, r12=exit_code, r13=slot_ptr) + sub rsp,16 (klog slot + pad). Entry rsp%16==8; +3 pushes + 16 = 40 -> %16==0 at every nested call. The exit_code arg is kept in r12 and used both as the record field (via mov_d) and as the klog_s1_x1_d1 decimal arg; the BLAKE3 call reads slot_ptr from r13 (preserved across kread_tsc and all prior calls). Encoder-pitfall posture: cmp rN,0 (never test), shl rN,32 for flags-high pack, shr rN,32 for flags isolation, and rN,0x7F / and rN,1 (imm32/imm8), mov rax,imm32 for error code 0x2201. Labels prefixed ca_ed_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        sub rsp, 16;
+
+        mov rbx, rdi;                    // audit_token
+        mov r12, rsi;                    // exit_code
+
+        // ---- Validate: token != 0 ----
+        cmp rbx, 0;
+        je  ca_ed_bad_token;
+
+        // ---- slot_ptr = pool + (((token - 1) & 0x7F) << 7) ----
+        mov rax, rbx;
+        sub rax, 1;
+        and rax, 0x7F;
+        shl rax, 7;
+        lea r10, [rip + _cmd_audit_pool];
+        add r10, rax;
+        mov r13, r10;                    // r13 = slot_ptr
+
+        // ---- Validate: slot.seq == token ----
+        mov rax, [r13 + 0];
+        cmp rax, rbx;
+        jne ca_ed_bad_token;
+
+        // ---- Validate: flags & PENDING ----
+        mov rax, [r13 + 80];
+        shr rax, 32;                     // isolate flags u32
+        and rax, 1;                      // CA_FLAG_PENDING
+        cmp rax, 0;
+        je  ca_ed_bad_token;
+
+        // ---- Capture tsc_end ----
+        call kread_tsc;
+        mov [r13 + 72], rax;
+
+        // ---- Write exit_code + flags=FINALIZED packed u64 at [+80..+88] ----
+        //      exit_code in low 32 (zero-extend via shl/shr round-trip);
+        //      flags=2 in high 32 via shl.
+        mov rax, r12;
+        shl rax, 32;
+        shr rax, 32;                     // rax = exit_code zero-extended
+        mov r11, 2;                      // CA_FLAG_FINALIZED
+        shl r11, 32;
+        or  rax, r11;
+        mov [r13 + 80], rax;
+
+        // ---- Compute this_hash = BLAKE3(record[0..96]) in-place at [+96] ----
+        //      paideia_crypto_blake3_hash(rdi=data, rsi=len, rdx=out)
+        mov rdi, r13;
+        mov rsi, 96;
+        mov rdx, r13;
+        add rdx, 96;                     // &slot.this_hash
+        call paideia_crypto_blake3_hash;
+
+        // ---- Stats + fingerprint ----
+        mov rdi, 3;                      // CA_ST_END_OK
+        call ca_note;
+
+        mov [rsp + 0], r12;              // v_dec = exit_code
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ca_tag_end_ok];
+        lea rcx, [rip + ca_k_seq];
+        mov r8,  rbx;                    // v_hex = seq
+        lea r9,  [rip + ca_k_exit];
+        call klog_s1_x1_d1;
+
+        xor rax, rax;                    // CA_OK
+        jmp ca_ed_out;
+
+      ca_ed_bad_token:
+        mov rdi, 4;                      // CA_ST_END_REJ
+        call ca_note;
+
+        mov r12, 0x2201;                 // CA_ERR_BAD_TOKEN
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ca_tag_end_rej];
+        lea rcx, [rip + ca_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      ca_ed_out:
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _cmd_audit_verify(audit_token) -> errno
+  //
+  // Validate the chain prefix for the record identified by audit_
+  // token.  Two integrity checks:
+  //
+  //   SELF-HASH:   recompute BLAKE3(record[0..96]) into verify_scratch
+  //                and compare 4 qwords against slot.this_hash. On
+  //                mismatch -> CHAIN_BROKEN (someone tampered with
+  //                this record's bytes after _cmd_audit_end wrote the
+  //                hash).
+  //
+  //   CHAIN-PREFIX: iff the predecessor slot still holds record
+  //                (seq-1) finalized (prev_slot.seq == seq-1 AND
+  //                flags==FINALIZED), compare slot.prev_hash against
+  //                prev_slot.this_hash. On mismatch -> CHAIN_BROKEN
+  //                (someone forged this record's prev_hash). If the
+  //                predecessor slot was evicted (seq-1 > 128 begins
+  //                ago), the chain-prefix check is SKIPPED -- not
+  //                treated as a break -- because eviction is a
+  //                legitimate ring-overflow outcome, not a forgery
+  //                signal.
+  //
+  // ARGS (SysV):
+  //   rdi = audit_token
+  //
+  // RETURNS (rax):
+  //   CA_OK                 on success (self-hash OK; chain-prefix
+  //                         OK or SKIPPED)
+  //   CA_ERR_BAD_TOKEN      on token=0, slot.seq mismatch, or slot
+  //                         not FINALIZED
+  //   CA_ERR_CHAIN_BROKEN   on self-hash or chain-prefix mismatch
+  //
+  // STACK FRAME:
+  //   3 callee-save pushes (rbx=token, r12=slot_ptr, r13=prev_slot_ptr
+  //   or scratch) + sub rsp, 16 (klog stack-arg slot + pad).  Entry
+  //   rsp%16==8; +3 pushes + 16 = 40 -> %16==0 at every nested call.
+  //
+  // Labels prefixed ca_vf_.
+  // ==========================================================================
+  pub let _cmd_audit_verify : (u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (audit_token: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "R139.M3 (paideia-os #2641): adversarial-use chain verifier. Validate token != 0 and slot.seq == token and flags == FINALIZED (not PENDING, not fresh zero) -> else BAD_TOKEN. Recompute BLAKE3(slot[0..96]) into _cmd_audit_verify_scratch via paideia_crypto_blake3_hash(rdi=slot, rsi=96, rdx=&scratch). Compare 4 qwords of scratch against slot.this_hash at [+96..+128]; any mismatch -> CHAIN_BROKEN (the record's own bytes were tampered). Then verify the chain prefix: compute prev_slot_ptr for (seq-1); if prev_slot.seq == seq-1 AND flags==FINALIZED, compare prev_slot.this_hash (4 qwords at [+96..+128]) against slot.prev_hash (4 qwords at [+8..+40]). On mismatch -> CHAIN_BROKEN; on prev-slot-evicted (seq != seq-1 OR not finalized) -> skip chain-prefix check as legitimate ring overflow (eviction is not a forgery signal). Bump CA_ST_VERIFY_OK; emit `CMD_AUDIT VERIFY OK seq=0x<hex>` via klog_s1_x1. For seq==1 (genesis), skip chain-prefix check entirely (no predecessor exists). Three callee-save pushes (rbx=audit_token, r12=slot_ptr, r13=prev_slot_ptr) + sub rsp,16 (klog slot + pad); entry rsp%16==8, +3 pushes + 16 = 40 -> %16==0 at every nested call. Encoder-pitfall posture: cmp rN,0 (never test), shl rN,7 (record stride), shr rN,32 (flags isolation), and rN,0x7F (slot mask fits imm32), mov rax,imm32 for 0x2201 / 0x2202. Labels prefixed ca_vf_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        sub rsp, 16;
+
+        mov rbx, rdi;                    // audit_token
+
+        // ---- Validate: token != 0 ----
+        cmp rbx, 0;
+        je  ca_vf_bad_token;
+
+        // ---- slot_ptr = pool + (((token - 1) & 0x7F) << 7) ----
+        mov rax, rbx;
+        sub rax, 1;
+        and rax, 0x7F;
+        shl rax, 7;
+        lea r10, [rip + _cmd_audit_pool];
+        add r10, rax;
+        mov r12, r10;                    // r12 = slot_ptr
+
+        // ---- Validate: slot.seq == token ----
+        mov rax, [r12 + 0];
+        cmp rax, rbx;
+        jne ca_vf_bad_token;
+
+        // ---- Validate: flags == FINALIZED (bit 1 set) ----
+        //      Load u64 at [+80..+88]; shr 32 to isolate flags u32;
+        //      compare equal to 2.  (Equality guards against both
+        //      PENDING (==1) and the zeroed slot (==0).)
+        mov rax, [r12 + 80];
+        shr rax, 32;
+        cmp rax, 2;
+        jne ca_vf_bad_token;
+
+        // ---- Recompute self-hash into scratch ----
+        mov rdi, r12;
+        mov rsi, 96;
+        lea rdx, [rip + _cmd_audit_verify_scratch];
+        call paideia_crypto_blake3_hash;
+
+        // ---- Compare 4 qwords of scratch vs slot.this_hash[+96..+128] ----
+        lea r10, [rip + _cmd_audit_verify_scratch];
+
+        mov rax, [r10 + 0];
+        mov r11, [r12 + 96];
+        cmp rax, r11;
+        jne ca_vf_chain_broken;
+
+        mov rax, [r10 + 8];
+        mov r11, [r12 + 104];
+        cmp rax, r11;
+        jne ca_vf_chain_broken;
+
+        mov rax, [r10 + 16];
+        mov r11, [r12 + 112];
+        cmp rax, r11;
+        jne ca_vf_chain_broken;
+
+        mov rax, [r10 + 24];
+        mov r11, [r12 + 120];
+        cmp rax, r11;
+        jne ca_vf_chain_broken;
+
+        // ---- Chain-prefix check ----
+        //      Skip for genesis (seq==1 has no predecessor).
+        cmp rbx, 1;
+        je  ca_vf_ok;
+
+        // prev_slot_ptr = pool + (((seq - 2) & 0x7F) << 7)
+        mov rax, rbx;
+        sub rax, 2;
+        and rax, 0x7F;
+        shl rax, 7;
+        lea r11, [rip + _cmd_audit_pool];
+        add r11, rax;
+        mov r13, r11;                    // r13 = prev_slot_ptr
+
+        // Only cross-check if prev_slot.seq == seq - 1
+        // (otherwise the predecessor has been evicted; skip chain-
+        // prefix check as a legitimate ring-overflow outcome, not a
+        // forgery signal).
+        mov rax, [r13 + 0];
+        mov r9, rbx;
+        sub r9, 1;
+        cmp rax, r9;
+        jne ca_vf_ok;
+
+        // Only cross-check if prev_slot.flags == FINALIZED
+        // (otherwise the predecessor was never finalized -- also a
+        // legitimate skip, not a forgery).
+        mov rax, [r13 + 80];
+        shr rax, 32;
+        cmp rax, 2;
+        jne ca_vf_ok;
+
+        // Compare prev_slot.this_hash[+96..+128] vs slot.prev_hash[+8..+40]
+        // 4 qword compares.
+        mov rax, [r13 + 96];
+        mov r11, [r12 + 8];
+        cmp rax, r11;
+        jne ca_vf_chain_broken;
+
+        mov rax, [r13 + 104];
+        mov r11, [r12 + 16];
+        cmp rax, r11;
+        jne ca_vf_chain_broken;
+
+        mov rax, [r13 + 112];
+        mov r11, [r12 + 24];
+        cmp rax, r11;
+        jne ca_vf_chain_broken;
+
+        mov rax, [r13 + 120];
+        mov r11, [r12 + 32];
+        cmp rax, r11;
+        jne ca_vf_chain_broken;
+
+      ca_vf_ok:
+        mov rdi, 5;                      // CA_ST_VERIFY_OK
+        call ca_note;
+
+        mov rdi, 3;                      // LEVEL_INFO
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ca_tag_verify_ok];
+        lea rcx, [rip + ca_k_seq];
+        mov r8,  rbx;
+        call klog_s1_x1;
+
+        xor rax, rax;                    // CA_OK
+        jmp ca_vf_out;
+
+      ca_vf_bad_token:
+        mov rdi, 6;                      // CA_ST_VERIFY_REJ_TOK
+        call ca_note;
+
+        mov r12, 0x2201;                 // CA_ERR_BAD_TOKEN
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ca_tag_verify_rej];
+        lea rcx, [rip + ca_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+        jmp ca_vf_out;
+
+      ca_vf_chain_broken:
+        mov rdi, 7;                      // CA_ST_VERIFY_REJ_CHN
+        call ca_note;
+
+        mov r12, 0x2202;                 // CA_ERR_CHAIN_BROKEN
+
+        mov rdi, 3;
+        lea rsi, [rip + SUBSYS_USER];
+        lea rdx, [rip + ca_tag_verify_rej];
+        lea rcx, [rip + ca_k_errno];
+        mov r8,  r12;
+        call klog_s1_x1;
+
+        mov rax, r12;
+
+      ca_vf_out:
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}

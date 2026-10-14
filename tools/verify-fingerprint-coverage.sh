@@ -309,6 +309,63 @@ ALLOWLIST = {
         "goldens exercising a complete handshake and the first AEAD "
         "frame.",
 
+    # Wave UMB-W21 R137.M3 (paideia-os#2635): peer discovery via
+    # federation cap.  In-kernel registry of (federation, peer) rows
+    # that identifies trust boundaries and enumerates reachable peers
+    # per federation.  FED_DISC INIT OK fires on every boot via
+    # _fd_init during the svc.* bringup cascade (kernel_main.pdx
+    # after _remote_shell_init, before witness_r30_platform).
+    # FED_DISC FED_REG OK / PEER_REG OK / LOOKUP OK / LIST OK are
+    # present as .rodata tag literals inside the direct-call API
+    # functions; at M3 no production path invokes them because:
+    # (a) the R137.M2 handshake does NOT yet consult the registry
+    #     (fd_authorise_handshake lands with R137.M5 alongside
+    #      KIND_FEDERATION), and
+    # (b) no cap_invoke dispatch surface exists (reserved for
+    #     R137.M5 which also endpoint_alloc_at + svc_register this
+    #     daemon's broker row).
+    # All five retire from this allowlist when R137.M5 lands with
+    # asserting smoke-mode goldens driving the full federation
+    # + peer registration + authorise-handshake cascade end-to-end.
+    "FED_DISC INIT OK":
+        "Wave UMB-W21 R137.M3: src/kernel/core/svc/federation_"
+        "discovery.pdx emits this unconditionally on boot via "
+        "_fd_init in the svc.* bringup cascade. Retires when "
+        "R137.M5 (KIND_FEDERATION + cap-invoke dispatch + "
+        "fd_authorise_handshake wire-up) adds an asserting smoke-"
+        "mode golden.",
+    "FED_DISC FED_REG OK":
+        "Wave UMB-W21 R137.M3: src/kernel/core/svc/federation_"
+        "discovery.pdx emits this from _fd_federation_register. "
+        "Unreachable from any production path at M3 (no caller "
+        "mints a KIND_FEDERATION cap yet; the R137.M2 handshake "
+        "does not consult the registry until R137.M5 wires "
+        "fd_authorise_handshake). Retires when R137.M5 wires the "
+        "cap-invoke FED_REG op (and/or the handshake authorisation "
+        "path).",
+    "FED_DISC PEER_REG OK":
+        "Wave UMB-W21 R137.M3: src/kernel/core/svc/federation_"
+        "discovery.pdx emits this from _fd_peer_register. "
+        "Unreachable from any production path at M3 (same reason "
+        "as FED_REG OK). Retires when R137.M5 wires the cap-"
+        "invoke PEER_REG op.",
+    "FED_DISC LOOKUP OK":
+        "Wave UMB-W21 R137.M3: src/kernel/core/svc/federation_"
+        "discovery.pdx emits this from _fd_peer_lookup. "
+        "Unreachable from any production path at M3 (same reason "
+        "as FED_REG OK -- no caller yet looks up peers because "
+        "the R137.M4 wire framer that would consult the registry "
+        "is deferred). Retires when R137.M4 lands with an "
+        "asserting smoke-mode golden driving a cross-host wire "
+        "frame end-to-end.",
+    "FED_DISC LIST OK":
+        "Wave UMB-W21 R137.M3: src/kernel/core/svc/federation_"
+        "discovery.pdx emits this from _fd_peer_list. "
+        "Unreachable from any production path at M3 (same reason "
+        "as LOOKUP OK). Retires when R137.M5 wires the cap-"
+        "invoke LIST op or an observability path consumes the "
+        "list for the shell's `peers` builtin.",
+
     # Wave UMB-W14 R127.M3 (paideia-os#2599): raw-mode TTY substrate.
     # SHELL_SESSION RAW OK fires from _shell_session_set_raw's success
     # tail (and from ks_op_set_raw transitively via KIND_SHELL_SESSION
@@ -454,6 +511,56 @@ ALLOWLIST = {
         "production path at M1 (same reason as HISTORY_SEG UNION OK). "
         "Retires alongside the other two HISTORY_SEG verbs when the "
         "production caller lands.",
+
+    # Wave UMB-W21 R139.M3 (paideia-os#2641): audit-log discipline for
+    # every command. CMD_AUDIT INIT OK fires on every boot via
+    # _cmd_audit_init in the svc.* bringup cascade (kernel_main.pdx
+    # right after _hs_init, before _shell_jobs_init). BEGIN OK /
+    # END OK / VERIFY OK are present as .rodata tags inside
+    # _cmd_audit_begin / _cmd_audit_end / _cmd_audit_verify
+    # respectively. At M3 no production path invokes any of the
+    # three verbs because the dispatch loop that would call begin /
+    # end around every command (R127.M5+ shell parent, R135 jail
+    # supervisor, R137 remote-shell) is a future-wave consumer, and
+    # the KIND_SHELL_SESSION op surface that would expose VERIFY to
+    # userspace is likewise a future-wave landing. All four retire
+    # from this allowlist when the production dispatch surface
+    # lands with an asserting smoke-mode golden exercising at
+    # least one begin+end pair end-to-end AND an asserting golden
+    # for a verify pass.
+    "CMD_AUDIT INIT OK":
+        "Wave UMB-W21 R139.M3: src/kernel/core/svc/cmd_audit.pdx "
+        "emits this unconditionally on boot via _cmd_audit_init in "
+        "the svc.* bringup cascade (after _hs_init, before _shell_"
+        "jobs_init). Retires when the dispatch surface (shell "
+        "parent, jail supervisor, or remote-shell) lands an "
+        "asserting smoke-mode golden driving begin+end around at "
+        "least one command.",
+    "CMD_AUDIT BEGIN OK":
+        "Wave UMB-W21 R139.M3: src/kernel/core/svc/cmd_audit.pdx "
+        "emits this from _cmd_audit_begin on successful slot "
+        "allocation + metadata write. Unreachable from any "
+        "production path at M3 (no dispatch surface yet calls "
+        "_cmd_audit_begin; the R127.M5+ shell parent, R135 jail "
+        "supervisor, and R137 remote-shell dispatch loops land "
+        "the hook in future waves). Retires alongside the other "
+        "CMD_AUDIT verbs when the dispatch surface lands.",
+    "CMD_AUDIT END OK":
+        "Wave UMB-W21 R139.M3: src/kernel/core/svc/cmd_audit.pdx "
+        "emits this from _cmd_audit_end on successful finalization "
+        "(tsc_end + exit_code + flags=FINALIZED + BLAKE3 this_hash "
+        "written). Unreachable from any production path at M3 "
+        "(same reason as CMD_AUDIT BEGIN OK). Retires when the "
+        "dispatch surface lands.",
+    "CMD_AUDIT VERIFY OK":
+        "Wave UMB-W21 R139.M3: src/kernel/core/svc/cmd_audit.pdx "
+        "emits this from _cmd_audit_verify on successful self-hash "
+        "+ chain-prefix verification. Unreachable from any "
+        "production path at M3 (no caller yet; the KIND_SHELL_"
+        "SESSION op surface that would expose VERIFY to userspace "
+        "witnesses is a future-wave landing). Retires when the "
+        "op surface lands with an asserting smoke-mode golden "
+        "exercising a verify pass end-to-end.",
 
     # Wave UMB-W16 R127.M5 (paideia-os#2601): shell job-control
     # primitives substrate. SHELL_JOBS INIT OK fires on every boot
