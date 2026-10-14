@@ -334,6 +334,33 @@ ALLOWLIST = {
         "with R127.M6). Retires when R127.M6 wires the fg/bg verbs "
         "with an asserting smoke-mode golden.",
 
+    # Wave UMB-W17 R127.M6 (paideia-os#2602): session teardown discipline.
+    # SHELL_SESSION TEARDOWN OK fires from the cascade tail of
+    # _shell_session_destroy (jobs reaped -> history flushed ->
+    # raw-flags scrubbed -> active_job scrubbed -> row released ->
+    # fingerprint).  Three reach paths at M6:
+    #   (a) direct supervisor call to _shell_session_destroy;
+    #   (b) KIND_SHELL_SESSION DESTROY op through cap-invoke (R127.M2);
+    #   (c) sys_exit step 2.65 via _shell_session_teardown_notify,
+    #       which forwards to _shell_session_destroy on a lookup hit.
+    # No in-tree smoke mode reaches any of them at M6: no production
+    # path mints a KIND_SHELL_SESSION cap yet, no shell parent task
+    # calls _shell_session_create via the dispatch loop, and no exit-
+    # of-a-live-shell is driven in any mode's envelope.  Retires with
+    # the first smoke mode that drives a create + exit cycle through
+    # one of (a)/(b)/(c) end-to-end.
+    "SHELL_SESSION TEARDOWN OK":
+        "Wave UMB-W17 R127.M6: src/kernel/core/svc/shell_session.pdx "
+        "emits this from the cascade tail of _shell_session_destroy "
+        "(jobs reaped -> history flushed -> raw-flags scrubbed -> "
+        "active_job scrubbed -> row released).  Reach paths: direct "
+        "supervisor call, KIND_SHELL_SESSION DESTROY op (R127.M2), "
+        "and sys_exit step 2.65 via _shell_session_teardown_notify.  "
+        "No smoke mode drives any of them at M6 (no production path "
+        "mints or exits a live shell session).  Retires with the "
+        "first smoke mode that drives a session create + exit cycle "
+        "through one of these paths with an asserting golden.",
+
     # Wave UMB-W13 R141.M2 (paideia-os#2646): perf-sink logging layer.
     # PERF SINK INIT OK fires on every boot from _perf_sink_init in
     # kernel_main.pdx immediately after _mb_init (R141.M1 wiring).
