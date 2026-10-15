@@ -47,9 +47,17 @@ validator; three-entry surface `_eu_unify` / `_eu_check_rank` /
 `_eu_least` over the shared R225.M2 pool) -- landed. R226.M1
 (Datalog parser) -- landed. R229.M2 (SessionEnv: session-scoped
 bindings) -- landed. R229.M3 (TypeEnv: type-environment threading
-= scheme store + specialisation cache) -- landed.
-**Version:** 1.22.0.
+= scheme store + specialisation cache) -- landed. R229.M4
+(JobControl: per-shell-session 32-slot Job table backing
+`cmd &` / `fg %n` / `bg %n` / `jobs`; four-state lifecycle NEW /
+RUNNING / STOPPED / DONE under a 48-byte row stride; six public
+entry points over singleton `.bss`) -- landed. R223.M4
+(SortGroupReduce: standard `sort by` / `group by` / `reduce`
+aggregation combinators under a shared 32-byte record; four public
+entry points, zero `.bss`) -- landed.
+**Version:** 1.23.0.
 **Wave 124 landings:** R221.M7 FuzzHarness, R223.M3 FilterOp.
+**Wave 125 landings:** R229.M4 JobControl, R223.M4 SortGroupReduce.
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -358,6 +366,38 @@ ArgSpec + FlagSpec) quartet through the queryable form.
       representative OK/error cases (single select, multi select,
       multi project, over-long name, trailing comma, empty input,
       cap-exceeding list).
+
+### M4 -- sort/group/reduce standard combinators (paideia-os#2669, landed)
+
+- [x] **R223.M4-001** -- `src/sort_group_reduce.pdx` module
+      `SortGroupReduce` landed: `_sgr_init` (pure-leaf no-op boot
+      hook), `_sgr_skip_ws` (shared pure-leaf WS walker),
+      `_sgr_parse_impl` (shared body with 6-push + 24 B scratch
+      frame; three kind-dispatched paths), `_sgr_parse_sort` /
+      `_sgr_parse_group` / `_sgr_parse_reduce` (1-callee-save-push
+      wrappers that verify the head keyword and delegate with the
+      kind byte). 32-byte SortGroupReduce record (magic u32,
+      kind u8, flags u8, reserved u16, predicate_span u64, seed_span
+      u64, reserved u64). Per-kind magic FourCCs: SORT 0x54524F53
+      ("SORT" on disk), GROUP 0x53505247 ("GRPS"), REDUCE 0x55444552
+      ("REDU"). SGR_* status taxonomy in 0x4D00..0x4D0A. Label
+      prefix `sgr_` disjoint from every sibling satellite's prefix
+      and from paideia-as reserved keywords.
+- [x] **R223.M4-002** -- design doc landed:
+      `design/shell/sort-group-reduce.md`.
+- [ ] **R223.M4-003** -- 10-test corpus per combinator (`tests/
+      proptest_sort_group_reduce.pdx`): deferred to R223.M7 per
+      the umbrella decomposition. The design doc §7 enumerates
+      the thirty representative OK/error cases (`sort by k`,
+      `sort by k asc`, `sort by k desc`, missing-by, empty-expr,
+      `asc`-not-token-boundary, `group by k`, `group` missing-by,
+      `reduce { |a,r| a+r.x } 0`, missing-brace, binder-ident-too-
+      long, no-seed, etc.).
+- [ ] **R223.M4-004** (deferred) -- Multi-key sort `sort by k1, k2
+      desc, k3` and `group by k having PRED` filter clause: filed
+      as R223.M4.1 follow-up. The current M4 single-key form uses
+      the first unescaped word of the Expr body as the key; the
+      multi-key form will layer additively on `reserved[6..8]`.
 
 ## R224 lambda-lang checklist
 
@@ -798,6 +838,10 @@ Blocked by: M4 + pdxfs user profile schema.
 | pipeline-M3+     | 0x2B05..0x2BFF   | R223.M3+  | reserved |
 | record_projection | 0x3400..0x3402  | R223.M2   | landed |
 | record_projection-M3+ | 0x3403..0x34FF | R223.M3+ | reserved |
+| filter_op        | 0x4C00..0x4C09   | R223.M3   | landed |
+| filter_op-M3.1+  | 0x4C0A..0x4CFF   | R223.M3.1+ | reserved |
+| sort_group_reduce | 0x4D00..0x4D0A  | R223.M4   | landed |
+| sort_group_reduce-M4.1+ | 0x4D0B..0x4DFF | R223.M4.1+ | reserved |
 | lambda_lit       | 0x2C00..0x2C04   | R224.M1   | landed |
 | lambda_lit-M2+   | 0x2C05..0x2CFF   | R224.M2+  | reserved |
 | closure_capture  | 0x3500..0x3505   | R224.M2   | landed |

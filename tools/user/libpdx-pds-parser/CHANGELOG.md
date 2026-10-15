@@ -4,6 +4,178 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.23.0] -- 2026-10-15
+
+Wave 125: R229.M4 job control substrate. Lands the parser-tier
+user-space Job-row table that threads background commands (`cmd &`),
+`fg %n` / `bg %n` promotions, and the `jobs` listing through a
+four-state lifecycle (NEW / RUNNING / STOPPED / DONE). The companion
+piece R229.M3 (TypeEnv) deferred: a scheduler-side state transition
+retires or resumes the job row via `_jc_update_state`; the
+prompt-redraw path reads the active-job count from `_jc_list`'s
+packed return. Dispatched as the opening arm of Wave 125; sibling
+arms layer additively on the `0x4E00..0x4EFF` carve-out at later
+Wave 125 landings.
+
+### Added
+
+- `src/job_control.pdx` module `JobControl` (R229.M4,
+  paideia-os#2722): six public entry points over singleton `.bss`
+  state (`_jc_jobs` 1536 B = 32 slots x 48 B, `_jc_job_count` u64,
+  `_jc_fg_tid` u64).
+  - `_jc_init()` — defensive scrub of the two u64 scalars
+    (`_jc_job_count`, `_jc_fg_tid`); `_jc_jobs` relies on .bss
+    zero-init for the "magic == 0 means free" invariant.
+  - `_jc_submit(cmd_ptr, cmd_len, mode_u8, out_job_id_ptr)` —
+    linear-scans slots 0..32 for a reusable slot (magic == 0 OR
+    state == DONE); writes a 48-byte Job record (magic 'JOBS'
+    (0x53424F4A LE), 1-based job_id = slot_idx+1, state NEW, mode
+    input, flags/reserved 0, tid 0, command_inline bytes 0..min
+    (cmd_len, 16) zero-padded past, cmd_body_ref 0); bumps
+    `_jc_job_count` iff the slot was brand-new.
+  - `_jc_bg(job_id)` — STOPPED -> RUNNING with mode := BACKGROUND;
+    clears `_jc_fg_tid` if the slot was the current fg owner.
+  - `_jc_fg(job_id)` — STOPPED -> RUNNING with mode := FOREGROUND;
+    writes `_jc_fg_tid := slot.tid` so the TTY router picks up the
+    new fg route.
+  - `_jc_list(out, out_cap)` — walks slots 0..32 copying each
+    magic='JOBS', state!=DONE record contiguously; returns
+    `(bytes_written << 32) | status`. The prompt-count caller
+    divides `bytes_written` by 48.
+  - `_jc_update_state(job_id, new_state)` — scheduler-side callback
+    enforcing the transition policy "cur != new, cur != DONE,
+    new != NEW, new in [0..3]"; on a DONE transition of the current
+    fg owner, clears `_jc_fg_tid`.
+  Error band 0x4E00..0x4E06 (seven codes); 0x4E07..0x4EFF reserved
+  for R229.M4.1+ follow-ups.
+- `design/shell/job-control.md` (R229.M4 spec).
+
+### Changed
+
+- `src/lib.pdx`: version 1.22.0 → 1.23.0;
+  `LPX_PDS_PARSER_R229_M4_READY` flipped from 0 to 1; module-filename
+  / upstream-issues / design-doc comments extended.
+- `caps.decl`: added full 0x4E00..0x4EFF band section + R229.M4
+  catalogue paragraph + Wave 125 linker-dep entry.
+
+### Design notes
+
+- Stride 48 is NOT a power of two; slot addressing uses
+  `(idx<<5) + (idx<<4)` per the `cmd_registry.pdx` 48-byte entry
+  precedent. Never 2-op `imul r, imm`.
+- All six entry points are pure leaves (zero nested CALL). The
+  6-push shape in `_jc_submit` and the 4-push shape in `_jc_list`
+  carry no `sub rsp, 8` alignment pad.
+- JobControl's `.bss` is disjoint from every other satellite
+  module's `.bss` (parser-family / row-family / session-family /
+  lexer-family / scope-family / registry-family).
+- The user-side table (THIS module) and the kernel-side R127.M5
+  `shell_jobs.pdx` reconcile at the R229.M5 scheduler wire-up (both
+  receive the same lifecycle events). M4 lands only the user-side
+  call; the kernel-side bridge follows.
+
+### Notes
+
+- Fingerprint goldens for the smoke-mode asserter deferred to
+  R229.M4.3 along with the formal 10-job acceptance test
+  (`tests/proptest_job_control.pdx`). The design doc §8 enumerates
+  the seven OK + three REJ tags.
+
+### R223.M4 — SortGroupReduce
+
+Sibling arm of Wave 125. Lands the three standard aggregation
+combinators (`sort by`, `group by`, `reduce`) as peer entries in the
+pipeline-stage POST-pass taxonomy next to R223.M3 FilterOp. The arm
+touches disjoint `.bss` state (none — the module has zero `.bss`
+footprint at M4), a disjoint error band (`0x4D00..0x4DFF`), a
+disjoint label prefix (`sgr_`), and its own design doc
+(`design/shell/sort-group-reduce.md`). Shared surfaces are limited
+to the top-of-file `lib.pdx` manifest, this CHANGELOG, and
+`STATUS.md`.
+
+### Added
+
+- `src/sort_group_reduce.pdx` module `SortGroupReduce` (R223.M4,
+  paideia-os#2669): four public entry points over a single 32-byte
+  SortGroupReduce record shared by three kinds.
+  - `_sgr_init()` — pure-leaf idempotent boot hook; no `.bss`
+    state at M4 so the body is a bare `ret`.
+  - `_sgr_parse_sort(bytes, len, out, out_cap) -> packed_u64` —
+    parses `sort by EXPR (asc|desc)?`. Writes magic `'SORT'`
+    (0x54524F53 LE), kind=0, DESC flag set iff an explicit
+    `desc` suffix was present. The direction suffix is stripped
+    from the stored predicate byte span after a two-phase trailing-
+    WS trim (trim1 before suffix match; trim2 after suffix excise).
+  - `_sgr_parse_group(bytes, len, out, out_cap) -> packed_u64` —
+    parses `group by EXPR`. Writes magic `'GRPS'` (0x53505247 LE),
+    kind=1, flags=0.
+  - `_sgr_parse_reduce(bytes, len, out, out_cap) -> packed_u64` —
+    parses `reduce { |acc, r| body } seed`. Writes magic `'REDU'`
+    (0x55444552 LE), kind=2, HAS_SEED flag (bit 1) set. The seed
+    is MANDATORY at M4 (an un-seeded reducer leaves the accumulator
+    type ambiguous for R225 HM inference). Binder idents are
+    bounded 1..SGR_NAME_MAX (14) each.
+  Error band `0x4D00..0x4D0A` (eleven codes); `0x4D0B..0x4DFF`
+  reserved for M4.1+ (nested-brace reducer bodies, multi-key sort,
+  `group by K having PRED`, inline accumulator-type annotation).
+- `design/shell/sort-group-reduce.md` (R223.M4 spec).
+
+### Changed
+
+- `src/lib.pdx`: `LPX_PDS_PARSER_R223_M4_READY` flipped from 0 to 1;
+  the per-milestone comment updated from `@hostname annotation`
+  (prior scope) to `sort/group/reduce standard combinators
+  (SortGroupReduce)` (current re-scoped surface); module-filename /
+  upstream-issues / design-doc comments extended with
+  `src/sort_group_reduce.pdx`, `paideia-os#2669`, and
+  `design/shell/sort-group-reduce.md`.
+- `caps.decl`: added full `0x4D00..0x4DFF` band section + Wave 125
+  linker-dep entry.
+
+### Design notes
+
+- Magic reconciliation. The parent brief specified
+  `SORT='TROS'(0x53524F54 LE)`. Storing 0x53524F54 to memory LE
+  yields on-disk bytes "TORS", not "SORT". Per the FilterOp 'FILT'
+  precedent (u32 0x544C4946 → disk bytes "FILT"), the convention
+  is to pick the u32 that reads as the identifier when the bytes
+  are scanned sequentially. This module stores `SORT_MAGIC =
+  0x54524F53` (disk bytes "SORT"); the GROUP and REDUCE magic
+  values match the brief verbatim (0x53505247 → "GRPS",
+  0x55444552 → "REDU").
+- The three combinators share one 32-byte record because the stage
+  dispatcher treats them as peer entries in the standard-combinator
+  taxonomy and because the parser-tier record discipline scales
+  better by SHARING the stride than by growing three disjoint
+  16/24/40-byte records. The `kind` byte at offset 4 is the
+  per-record discriminator; the on-disk magic FourCC is per-kind so
+  a hex-dump scan reads unambiguously.
+- Reduce's `|acc, r|` prefix uses two comma-separated binders in
+  ONE pair of pipes rather than two pipe-pairs — matching
+  FilterOp's `BinderList` shape and the standard functional idiom.
+  The brief's grammar line `PipeBinder PipeBinder` is interpreted
+  as "two binders in the pipe prefix" per its English note.
+- SORT direction suffix (`asc`/`desc`) is a token-level trim rather
+  than a syntactic suffix because the body between `by` and the
+  suffix is OPAQUE (R224 Expr grammar, parsed later by _ll_parse).
+  The parser trims trailing WS → attempts the suffix match → re-
+  trims WS; the match requires a WS boundary before the token OR
+  the token sitting at body_start. If neither suffix matches, the
+  default ascending direction is implied (DESC flag clear).
+
+### Notes
+
+- 10-test acceptance corpus (sort / group / reduce — three sets of
+  ten) deferred to R223.M7 fuzz-corpus milestone per the umbrella
+  decomposition. The design doc §7 enumerates the thirty
+  representative OK / error cases that corpus will cover.
+- Runtime perf target `≥ 100 kg/s` (= 100 000 records/sec per
+  `design/terminal/semantic-shell.md` §14) is a THROUGHPUT target
+  on the downstream dispatch stage, not on this parser-tier
+  module. This module's cost is one 32-byte record emit per
+  stage parse (not per record flowing through the pipeline); it
+  runs at parse time, not at record-flow time.
+
 ## [1.22.0] -- 2026-10-15
 
 Wave 124: R221.M7 parser fuzz harness + R223.M3 where/filter/by

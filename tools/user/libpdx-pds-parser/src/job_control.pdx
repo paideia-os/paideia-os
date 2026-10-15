@@ -1,0 +1,1081 @@
+// src/job_control.pdx -- libpdx-pds-parser.R229.M4 (paideia-os#2722)
+//
+// JobControl: per-shell-session job table that threads background
+// commands (`cmd &`) through a four-state lifecycle so the REPL can
+// render a `jobs` listing, promote STOPPED jobs via `fg`/`bg`, and
+// report a live job count on every prompt redraw. The piece R229.M3
+// (TypeEnv) deferred: an evaluator-side command dispatched with the
+// `&` suffix (or paused via a future ^Z-equivalent) persists into the
+// job table until a scheduler-side state transition retires it.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// R229 is the REPL evaluator umbrella (paideia-os#2493; design doc
+// design/shell/repl-loop-scaffold.md). R229.M1 (src/kernel/core/shell/
+// repl_loop.pdx) landed the PROMPT/READING/PARSED/EVAL/WRITING/IDLE
+// state machine but owns NO per-turn state. R229.M2 (session_env.pdx)
+// landed the per-session binding map. R229.M3 (type_env.pdx) landed
+// the type-scheme storage + specialisation cache. R229.M4 (THIS
+// module) lands the companion substrate every REPL dispatch surfaces
+// on `cmd &` / `fg %n` / `bg %n` / `jobs`: a 32-slot ring of 48-byte
+// Job rows plus a two-slot scalar header (`_jc_job_count` append
+// cursor + `_jc_fg_tid` foreground-tid pointer).
+//
+// Position in the substrate graph:
+//
+//   TTY ISR -> _rl_tick (R229.M1) -> state := PARSED
+//        -> _rl_dispatch (R229.M4+) -- parses, infers, evaluates
+//              -> `cmd &` suffix seen in the parse-tree
+//                    -> _jc_submit(cmd_ptr, cmd_len, 1, &new_id)
+//                       (mode=1 for background)
+//                    -> klog_s1_fingerprint "JOB NEW RUNNING ..."
+//              -> `fg %n` built-in
+//                    -> _jc_fg(job_id)      [STOPPED -> RUNNING,
+//                                            mode := FOREGROUND]
+//              -> `bg %n` built-in
+//                    -> _jc_bg(job_id)      [STOPPED -> RUNNING,
+//                                            mode := BACKGROUND]
+//              -> `jobs` built-in
+//                    -> _jc_list(out, out_cap)  -- emits active rows
+//              -> prompt redraw (every EVAL -> WRITING tick)
+//                    -> _jc_list over a stack scratch buffer; count
+//                       = bytes_written / 48 (DONE rows excluded)
+//        -> scheduler reports a per-thread lifecycle event
+//              -> _jc_update_state(job_id, new_state)
+//                 (NEW -> RUNNING on first schedule; RUNNING -> DONE
+//                  on exit; RUNNING -> STOPPED on preempt; etc.)
+//        -> state := WRITING -> _rl_emit_prompt -> READING
+//
+// JobControl is PARSER-TIER by geography (same satellite library as
+// SessionEnv, TypeEnv, HmCore, LambdaLit, Pipeline, etc.) but is NOT
+// itself a parser -- the module stores opaque command byte spans and
+// records state transitions. The REPL dispatch at R229.M4+ (not
+// landed here) is where the two sides reify against the kernel-side
+// scheduler surface.
+//
+// Lives user-space because the shell runs user-space; the pool is
+// caller-process-local (singleton .bss, 1536 B + 16 B scalar); the
+// module touches no kernel KIND and consumes no capability (caps.decl
+// R229.M4 band note).
+//
+// Why JobControl is distinct from R127.M5 (shell_jobs.pdx):
+//   * R127.M5 lives KERNEL-side (src/kernel/core/svc/shell_jobs.pdx);
+//     its 64-byte Job rows record `(session_id, primary_pid)` pairs
+//     under the kernel's shell_session table and model
+//     `{RUNNING, PAUSED, COMPLETED, FAILED}`. R127.M5's cap-invoke
+//     surface and scheduler integration are the ground truth.
+//   * R229.M4 lives USER-space; its 48-byte Job rows record the
+//     SHELL's per-session mirror of what the kernel is already
+//     tracking. The shell owns `command_inline` / `cmd_body_ref`
+//     bytes (the kernel does not), owns the `NEW` pre-schedule state
+//     (the kernel sees jobs only once scheduled), and owns
+//     `_jc_fg_tid` which routes stdin on prompt redraw.
+//   * The two sides reconcile at R127.M6 / R229.M5 wire-up: the
+//     scheduler-side event callback dispatches BOTH into the kernel
+//     R127.M5 table (via `_shell_jobs_set_state`) AND into THIS user-
+//     side table (via `_jc_update_state`). At M4, the user-side
+//     call is sufficient for the 10-job acceptance test; the kernel
+//     wire-up follows at R229.M5.
+//
+// =============================================================================
+// RECORD LAYOUT
+// =============================================================================
+//
+// Job record (48 B, JC_JOB_BYTES):
+//
+//   offset  size  field
+//   ------  ----  -------------------------------------------------------
+//     0      4   magic              u32  'JOBS' (0x53424F4A LE). Zero
+//                                        for a never-used slot;
+//                                        non-zero marks the slot live
+//                                        (state DONE is live-but-
+//                                        reap-eligible). _jc_submit
+//                                        reuses a slot iff magic == 0
+//                                        OR state == DONE.
+//     4      4   job_id             u32  1-based session-scoped id
+//                                        (stored verbatim; equals
+//                                        pool_idx + 1).
+//     8      1   state              u8   JC_STATE_NEW (0)
+//                                        / JC_STATE_RUNNING (1)
+//                                        / JC_STATE_STOPPED (2)
+//                                        / JC_STATE_DONE (3)
+//     9      1   mode               u8   JC_MODE_FOREGROUND (0)
+//                                        / JC_MODE_BACKGROUND (1)
+//    10      1   flags              u8   reserved; 0 at M4.
+//    11      1   reserved           u8   reserved; 0 at M4.
+//    12      4   tid                u32  scheduled thread id (0 until
+//                                        scheduler-side first-schedule
+//                                        callback populates). M4 keeps
+//                                        this at 0; R229.M5 wire-up
+//                                        writes it from the scheduler.
+//    16     16   command_inline     u8[16] bytes 0..min(cmd_len, 16);
+//                                        zero-padded past.
+//    32      8   cmd_body_ref       u64  OPAQUE 64-bit handle to the
+//                                        full command body (pool
+//                                        offset / string arena index
+//                                        / 0 for inline-only). M4
+//                                        writes 0 unconditionally;
+//                                        R229.M5+ wires an arena.
+//    40      4   reserved           u32  reserved; 0 at M4.
+//    44      4   reserved           u32  reserved; 0 at M4.
+//
+//   total: 48 B
+//
+// Pool (`_jc_jobs`, 1536 B): 32 x 48 B. Slot base = `_jc_jobs +
+// idx * 48`. Stride 48 is NOT a power of two; address compute uses
+// the `(idx<<5) + (idx<<4)` identity (precedent: cmd_registry.pdx's
+// 48-byte entry stride). Never 2-op `imul r, imm`
+// (feedback_pdx_encoder_pitfalls).
+//
+// Scalars:
+//   `_jc_job_count : u64` -- append-cursor-style hint; equals the
+//     number of slots ever allocated (not the live count). M4 does
+//     NOT consult this during submit (submit linear-scans the full
+//     32-slot range for a reusable slot); R229.M5+ may fold it into
+//     a fast-path.
+//   `_jc_fg_tid : u64` -- the tid of the current foreground job (0
+//     if no fg job is live). `_jc_fg` writes it; a DONE-of-fg
+//     transition in `_jc_update_state` clears it back to 0.
+//
+// =============================================================================
+// PUBLIC API
+// =============================================================================
+//
+//   _jc_init() -> ()
+//     Boot hook. Defensive scrub of `_jc_job_count` and `_jc_fg_tid`
+//     (two u64 stores = 16 B). The `_jc_jobs` pool is NOT scrubbed
+//     -- .bss zero-init already satisfies the "magic == 0 means
+//     free" invariant at cold boot. A chaos-restart re-entry re-
+//     drives this hook defensively.
+//
+//   _jc_submit(cmd_ptr, cmd_len, mode_u8, out_job_id_ptr) -> errno
+//     Linear-scans slots 0..32 for a reusable slot (magic == 0 OR
+//     state == JC_STATE_DONE). On a free slot: writes magic
+//     ('JOBS'), job_id (slot_idx + 1), state (NEW), mode (input),
+//     flags/reserved (0), tid (0), command_inline (bytes 0..min
+//     (cmd_len, 16); zero-padded), cmd_body_ref (0), and writes
+//     (slot_idx + 1) through out_job_id_ptr. Bumps _jc_job_count
+//     iff this is a brand-new allocation (magic was 0 before the
+//     write). JC_OK on success; JC_ERR_POOL_FULL / JC_ERR_BAD_MODE
+//     / JC_ERR_BAD_CMD / JC_ERR_BAD_OUT_PTR on guards.
+//
+//   _jc_bg(job_id) -> errno
+//     Validates job_id in [1..32] and the referenced slot's magic
+//     == 'JOBS'. Requires slot state == JC_STATE_STOPPED. On OK:
+//     state := JC_STATE_RUNNING; mode := JC_MODE_BACKGROUND. If
+//     the slot was the current foreground owner (_jc_fg_tid ==
+//     slot.tid AND slot.tid != 0), clears _jc_fg_tid to 0 so the
+//     TTY router drops the fg route. JC_OK on success;
+//     JC_ERR_BAD_ID / JC_ERR_BAD_STATE on guards.
+//
+//   _jc_fg(job_id) -> errno
+//     Validates job_id in [1..32] and the referenced slot's magic
+//     == 'JOBS'. Requires slot state == JC_STATE_STOPPED. On OK:
+//     state := JC_STATE_RUNNING; mode := JC_MODE_FOREGROUND;
+//     _jc_fg_tid := slot.tid (0 at M4; the scheduler-side wire-up
+//     at R229.M5 populates slot.tid first). JC_OK on success;
+//     JC_ERR_BAD_ID / JC_ERR_BAD_STATE on guards.
+//
+//   _jc_list(out, out_cap) -> packed_u64
+//     Walks slots 0..32; for each slot with magic == 'JOBS' AND
+//     state != JC_STATE_DONE, copies the 48-byte record to the
+//     caller buffer contiguously. (DONE rows are excluded so the
+//     prompt-count caller can divide bytes_written by 48 directly;
+//     the `jobs` built-in that wants DONE visibility calls the
+//     M4.1 `_jc_list_all` variant, deferred.) Returns
+//     `(bytes_written << 32) | status`. JC_OK on success;
+//     JC_ERR_OUT_TOO_SMALL if a copy would overflow out_cap.
+//
+//   _jc_update_state(job_id, new_state) -> errno
+//     Scheduler-side callback. Validates job_id in [1..32], slot
+//     magic == 'JOBS', new_state in [0..3]. Transition policy:
+//       * cur == new_state: BAD_STATE (no-op is rejected to catch
+//         scheduler double-dispatch bugs).
+//       * cur == DONE: BAD_STATE (DONE is terminal).
+//       * new_state == NEW: BAD_STATE (NEW is set only by
+//         _jc_submit).
+//       * Otherwise: write new_state. If the transition retires
+//         the slot (new_state == DONE) AND the slot was the fg
+//         owner (slot.mode == FOREGROUND AND _jc_fg_tid ==
+//         slot.tid), clear _jc_fg_tid to 0.
+//
+// Register maps (SysV):
+//
+//   _jc_init()                                              -> ()
+//   _jc_submit(rdi, rsi, rdx, rcx)                          -> rax
+//   _jc_bg(rdi)                                             -> rax
+//   _jc_fg(rdi)                                             -> rax
+//   _jc_list(rdi, rsi)                                      -> rax
+//   _jc_update_state(rdi, rsi)                              -> rax
+//
+// =============================================================================
+// STATE MACHINE
+// =============================================================================
+//
+//   NEW  --(_jc_update_state ->RUNNING)-->  RUNNING
+//                                           ^   |   \
+//                                           |   |    \--(update_state ->DONE)
+//                                           |   |            |
+//                                           |   v            v
+//                                           |  STOPPED     DONE  (terminal)
+//                                           |   | ^           ^
+//                                           |   | |           |
+//                                           |   | +--(_jc_bg / _jc_fg)
+//                                           |   |
+//                                           |   +--(update_state ->DONE)
+//                                           |
+//                                           +--(update_state ->STOPPED)
+//
+// The scheduler owns NEW->RUNNING, RUNNING->STOPPED, RUNNING->DONE,
+// STOPPED->DONE. The user owns STOPPED->RUNNING (via `_jc_bg` or
+// `_jc_fg`). NEW -> {STOPPED, DONE} is also allowed by the
+// transition filter for the edge case where a job is submitted and
+// immediately pre-empted / failed-to-start.
+//
+// =============================================================================
+// STATUS-CODE NAMESPACE  --  0x4E00..0x4EFF
+// =============================================================================
+//
+// Job-control packed-status range. Seven slots used at R229.M4:
+//
+//   JC_OK                   = 0
+//   JC_ERR_POOL_FULL        = 0x4E00  (all 32 slots in a non-DONE,
+//                                      magic==JOBS state)
+//   JC_ERR_BAD_ID           = 0x4E01  (job_id == 0 or > 32 or slot
+//                                      magic != 'JOBS')
+//   JC_ERR_BAD_STATE        = 0x4E02  (transition not allowed by
+//                                      the state machine)
+//   JC_ERR_BAD_MODE         = 0x4E03  (_jc_submit with mode not in
+//                                      {0, 1})
+//   JC_ERR_BAD_CMD          = 0x4E04  (_jc_submit with cmd_len == 0
+//                                      or cmd_ptr == 0)
+//   JC_ERR_OUT_TOO_SMALL    = 0x4E05  (_jc_list out_cap would be
+//                                      exceeded by the next 48-byte
+//                                      copy)
+//   JC_ERR_BAD_OUT_PTR      = 0x4E06  (_jc_submit with
+//                                      out_job_id_ptr == 0)
+//
+// Slots 0x4E07..0x4EFF reserved for R229.M4.1+ follow-ups
+// (JC_ERR_SCHEDULER_UNAVAILABLE on the scheduler-wire-up at M5,
+// JC_ERR_CAP_DENIED on a KIND_JOB cap-invoke surface at M5.1,
+// JC_ERR_NAME_TOO_LONG on an extended-name arena at M5.2, etc.).
+//
+// Disjoint from every other parser-tier packed-status band
+// (0x27 utf8_nfc / 0x2A schemas_sig / 0x2B pipeline / 0x2C
+// lambda_lit / 0x2D hm_core / 0x2E datalog / 0x30 repl_loop
+// kernel-side / 0x33 command_sig / 0x34 record_projection /
+// 0x35 closure_capture / 0x36 row_types / 0x37 session_env /
+// 0x38 grapheme_iter / 0x39 functor_instance / 0x3C arg_flag_spec
+// / 0x3D type_env / 0x3E effect_row / 0x3F width_pass /
+// 0x40 utf8_nfc_m2 / 0x42 ctx_lexer / 0x43 cap_row / 0x44 ast
+// / 0x45 cmd_registry / 0x46 let_scope / 0x47 dispatch_mode /
+// 0x48 span_map / 0x49 effect_unify / 0x4A fuzz_harness /
+// 0x4C filter_op / 0x4D parallel-reserved for R223.M4 /
+// 0x4E THIS).
+//
+// Grep confirmation at R229.M4 landing time:
+//
+//   grep -rE '0x4E0[0-6]\b' paideia-os/{src,tools,design,tests}
+//     -> no packed-status hits outside this file + caps.decl +
+//        design/shell/job-control.md. (The CJK Unicode constant
+//        0x4E00 in libpdx-unicode-tables/src/width.pdx is a code-
+//        point range boundary, not a status code; the `0x4E` byte
+//        constants scattered across the HDA / NVMe / TPM drivers
+//        are MMIO register offsets and byte literals, not status
+//        codes. The grep above requires a 4-hex-digit boundary via
+//        `0x4E0[0-6]\b` and will not match any of those.)
+//
+// =============================================================================
+// INTERACTIONS
+// =============================================================================
+//
+//   R229.M1 (repl_loop.pdx, kernel) -- drives per-cycle state; does
+//     NOT touch JobControl at M1. R229.M4+ wires the EVAL stage to
+//     this module through the REPL dispatch surface.
+//
+//   R229.M2 (session_env.pdx) -- holds the session's bindings. Does
+//     NOT interact with JobControl at M4; a background command's
+//     `let x = ...` binding writes through SessionEnv unchanged, and
+//     JobControl tracks only the command's lifecycle.
+//
+//   R229.M3 (type_env.pdx) -- holds the session's type schemes. Does
+//     NOT interact with JobControl at M4; same orthogonality as
+//     R229.M2.
+//
+//   R127.M1 (shell_session.pdx) -- session_id is NOT part of the
+//     JobControl record at M4 (the pool is a flat 32-slot ring,
+//     session-flat). A multi-session REPL that wants per-session
+//     isolation partitions the pool by `(job_id - 1) / per_sid` at
+//     the dispatch layer; raw M4 is session-flat so the 10-job
+//     acceptance test runs against a single session.
+//
+//   R127.M5 (shell_jobs.pdx, KERNEL side) -- the kernel's job
+//     substrate. R229.M5 wire-up reconciles the two tables: a
+//     scheduler-side event callback dispatches BOTH into
+//     `_shell_jobs_set_state` (kernel) AND into `_jc_update_state`
+//     (THIS module). At M4, only the user-side call is landed; the
+//     scheduler wire follows.
+//
+// =============================================================================
+// paideia-as ENCODER DISCIPLINE (ABSOLUTE)
+// =============================================================================
+//
+//   - No `test rN, rN` -- every zero-check is `cmp reg, 0; je/jne`.
+//   - No `and rN, imm64` -- every mask is imm8 or imm32.
+//   - No 2-op `imul r, imm` -- slot stride 48 uses
+//     `mov tmpA, idx; mov tmpB, idx; shl tmpA, 5; shl tmpB, 4;
+//     add tmpA, tmpB` (cmd_registry.pdx precedent for the 48-byte
+//     entry stride).
+//   - No multiline `pub let = "..."` -- single-line justifications.
+//   - Module basename `JobControl` matches `job_control.pdx`.
+//   - Labels prefixed `jc_` (grep-disjoint from `ss_` / `sh_` /
+//     `sj_` / `hf_` / `cr_` / `rl_` / `se_` / `te_` kernel + sibling
+//     namespaces, and from parser-tier `u8n_` / `pl_` / `rp_` /
+//     `ll_` / `cc_` / `er_` / `hm_` / `rt_` / `dl_` / `sch_sig_` /
+//     `cmd_sig_` / `cl_` / `ast_` / `cmdreg_` / `ls_` / `fh_` /
+//     `fo_` / `eu_` / `sm_` / `dm_` namespaces). No bare `loop`,
+//     `if`, `let`, `fn`, `ret`, or `done` reserved-keyword labels.
+//   - All `cmp reg, imm` immediates (0, 1, 2, 3, 16, 32, 48, 0x4E00..
+//     0x4E06, 0x4A4F4253) fit imm32 with bit 31 clear so direct
+//     `cmp reg, imm32` is sign-extension-safe. No MOVABS staging.
+//   - Byte loads via `xor rax, rax; mov_b rax, [base + disp]`.
+//   - Byte stores via `mov_b [dst + disp], reg`.
+//   - u32 loads via `xor rax, rax; mov_d rax, [base + disp]`.
+//   - u32 stores via `mov_d [dst + disp], reg`.
+//   - u64 stores via plain `mov [dst + disp], reg`.
+//   - `.bss` writes via `lea r11, [rip + sym]; mov [r11 + disp], reg`.
+//   - `_jc_submit` and `_jc_list` use 6- and 4-callee-save-push
+//     frames respectively; both have NO nested CALL so no `sub rsp`
+//     alignment pad is required beyond the frames' natural shapes.
+//     The two 3-arg entry points (`_jc_bg`, `_jc_fg`,
+//     `_jc_update_state`) are pure leaves with zero pushes.
+//
+// =============================================================================
+// FORWARD PATH
+// =============================================================================
+//
+//   R229.M4.1  _jc_list_all variant that INCLUDES DONE rows for the
+//              `jobs` built-in's "show reaped" option.
+//   R229.M4.2  _jc_set_tid(job_id, tid) once R229.M5 scheduler wire
+//              populates slot.tid separately from state transitions.
+//   R229.M4.3  Fingerprint goldens for the smoke-mode asserter:
+//              seven OK + three REJ tags, keyed to the 10-job
+//              acceptance test.
+//   R229.M5    KIND_JOB cap-invoke surface + kernel-side
+//              `_shell_jobs_set_state` reconciliation wire.
+//   R229.M6+   Compacting pool reuse; cmd_body_ref string-arena.
+//
+// =============================================================================
+// Upstream: paideia-os#2493 (R229 REPL evaluator umbrella),
+// paideia-os#2722 (THIS ticket, R229.M4 Job control), paideia-os#2720
+// (R229.M2 SessionEnv), paideia-os#2721 (R229.M3 TypeEnv),
+// paideia-os#2719 (R229.M1 REPL loop substrate), paideia-os#2601
+// (R127.M5 kernel-side shell_jobs substrate). Design doc:
+// design/shell/job-control.md.
+
+module JobControl = structure {
+
+  // ==========================================================================
+  // SECTION 1 -- STATUS CODES (returned in rax)
+  // ==========================================================================
+  //
+  // Small-value range 0x4E00..0x4EFF, reserved for the R229.M4 job-
+  // control band. Disjoint from every other parser-tier packed-
+  // status range in the paideia-os tree (see header note).
+
+  pub let JC_OK                      : u64 = 0
+  pub let JC_ERR_POOL_FULL           : u64 = 0x4E00
+  pub let JC_ERR_BAD_ID              : u64 = 0x4E01
+  pub let JC_ERR_BAD_STATE           : u64 = 0x4E02
+  pub let JC_ERR_BAD_MODE            : u64 = 0x4E03
+  pub let JC_ERR_BAD_CMD             : u64 = 0x4E04
+  pub let JC_ERR_OUT_TOO_SMALL       : u64 = 0x4E05
+  pub let JC_ERR_BAD_OUT_PTR         : u64 = 0x4E06
+
+  // ==========================================================================
+  // SECTION 2 -- LAYOUT + KIND CONSTANTS
+  // ==========================================================================
+
+  pub let JC_POOL_SLOTS              : u64 = 32          // max concurrent jobs
+  pub let JC_JOB_BYTES               : u64 = 48          // row stride
+  pub let JC_POOL_BYTES              : u64 = 1536        // 32 * 48
+  pub let JC_CMD_INLINE_MAX          : u64 = 16          // bytes in command_inline
+
+  // Magic marker ('JOBS' little-endian: 'J'=0x4A, 'O'=0x4F, 'B'=0x42,
+  // 'S'=0x53 -> u32 LE = 0x53424F4A).
+  pub let JC_MAGIC                   : u64 = 0x53424F4A
+
+  // State tags (bytes at [slot + 8]).
+  pub let JC_STATE_NEW               : u64 = 0
+  pub let JC_STATE_RUNNING           : u64 = 1
+  pub let JC_STATE_STOPPED           : u64 = 2
+  pub let JC_STATE_DONE              : u64 = 3
+
+  // Mode tags (bytes at [slot + 9]).
+  pub let JC_MODE_FOREGROUND         : u64 = 0
+  pub let JC_MODE_BACKGROUND         : u64 = 1
+
+  // Job field offsets (bytes, from slot base).
+  pub let JC_OFF_MAGIC               : u64 = 0
+  pub let JC_OFF_JOB_ID              : u64 = 4
+  pub let JC_OFF_STATE               : u64 = 8
+  pub let JC_OFF_MODE                : u64 = 9
+  pub let JC_OFF_FLAGS               : u64 = 10
+  pub let JC_OFF_RESERVED_1          : u64 = 11
+  pub let JC_OFF_TID                 : u64 = 12
+  pub let JC_OFF_COMMAND_INLINE      : u64 = 16
+  pub let JC_OFF_CMD_BODY_REF        : u64 = 32
+  pub let JC_OFF_RESERVED_2          : u64 = 40
+  pub let JC_OFF_RESERVED_3          : u64 = 44
+
+  // ==========================================================================
+  // SECTION 3 -- STATIC STATE (.bss, singleton)
+  // ==========================================================================
+
+  pub let mut _jc_jobs       : [u8; 1536] = uninit @align(8)
+  pub let mut _jc_job_count  : u64        = uninit @align(8)
+  pub let mut _jc_fg_tid     : u64        = uninit @align(8)
+
+  // ==========================================================================
+  // _jc_init() -> ()
+  //
+  //   Boot hook. Defensive scrub of _jc_job_count and _jc_fg_tid
+  //   (two u64 stores = 16 B). The _jc_jobs pool is NOT scrubbed --
+  //   .bss zero-init already satisfies the "magic == 0 means free"
+  //   invariant at cold boot. A chaos-restart re-entry re-drives
+  //   this hook defensively.
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed jc_ini_.
+  // ==========================================================================
+  pub let _jc_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M4 (#2722): defensive scrub of _jc_job_count and _jc_fg_tid (two u64 stores = 16 B). _jc_jobs pool is NOT scrubbed because .bss is already zero at real boot (magic == 0 => free slot). Pure leaf; zero pushes; no stack frame; no nested CALL. Store 0 u64 to _jc_job_count and to _jc_fg_tid via `lea r11, [rip + sym]; mov [r11], rax` with rax=0. All immediates (0) fit imm32. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed jc_ini_.",
+      block: {
+        xor rax, rax;
+
+        lea r11, [rip + _jc_job_count];
+        mov [r11], rax;
+
+        lea r11, [rip + _jc_fg_tid];
+        mov [r11], rax;
+
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _jc_submit(cmd_ptr, cmd_len, mode_u8, out_job_id_ptr) -> errno
+  //
+  //   rdi = cmd_ptr
+  //   rsi = cmd_len
+  //   rdx = mode_u8   (0 = FOREGROUND, 1 = BACKGROUND)
+  //   rcx = out_job_id_ptr
+  //   rax = JC_OK / JC_ERR_BAD_CMD / JC_ERR_BAD_MODE /
+  //         JC_ERR_BAD_OUT_PTR / JC_ERR_POOL_FULL
+  //
+  //   Linear-scans slots 0..32 for a reusable slot (magic == 0 OR
+  //   state == JC_STATE_DONE). On hit: writes magic, job_id (slot_idx
+  //   + 1), state (NEW), mode (input), flags/reserved (0), tid (0),
+  //   command_inline (bytes 0..min(cmd_len, 16); zero-padded past),
+  //   cmd_body_ref (0), reserved (0). Writes (slot_idx + 1) through
+  //   out_job_id_ptr. Bumps _jc_job_count iff the slot was brand-new
+  //   (magic == 0 before the write).
+  //
+  // Register plan (6-push, pure-leaf):
+  //   rbx = cmd_ptr
+  //   rbp = cmd_len
+  //   r12 = mode_u8
+  //   r13 = out_job_id_ptr
+  //   r14 = slot_idx (scan cursor)
+  //   r15 = slot_addr (scratch)
+  //
+  // Labels prefixed jc_sub_.
+  // ==========================================================================
+  pub let _jc_submit : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (cmd_ptr: u64) (cmd_len: u64) (mode_u8: u64)
+       (out_job_id_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M4 (#2722): allocate a Job slot and record the submitted command. 6 callee-save pushes (rbx=cmd_ptr, rbp=cmd_len, r12=mode_u8, r13=out_job_id_ptr, r14=slot_idx, r15=slot_addr); pure leaf with no nested CALL so no sub-rsp pad is needed. Guards: cmd_ptr != 0 and cmd_len > 0 (JC_ERR_BAD_CMD); mode in {0, 1} (JC_ERR_BAD_MODE); out_job_id_ptr != 0 (JC_ERR_BAD_OUT_PTR). Scan slot_idx 0..32: slot_addr = &_jc_jobs + idx*48 via `mov a, idx; mov b, idx; shl a, 5; shl b, 4; add a, b; lea r11, [rip + _jc_jobs]; add a, r11`. Load magic u32 at [slot+0]; if 0 -> alloc path; else load state u8 at [slot+8]; if JC_STATE_DONE -> alloc path; else skip. On scan exhaust return JC_ERR_POOL_FULL. On alloc: write magic (0x53424F4A via mov_d), job_id (slot_idx+1 via mov_d), state (0 NEW via mov_b), mode (r12 via mov_b), flags/reserved_1 (0 via mov_b), tid (0 via mov_d), command_inline (copy min(cmd_len, 16) bytes from cmd_ptr; zero-pad to 16; precomputed destination base via `mov rsi, r15; add rsi, 16` for the mov_b [rsi + r10*1], rax store), cmd_body_ref (0 via plain mov), reserved_2 (0 via mov_d), reserved_3 (0 via mov_d). Write job_id (slot_idx+1) through out_job_id_ptr via mov_d. On brand-new allocation (magic==0 before the write), bump _jc_job_count by 1 via lea+mov. All immediates (0, 1, 2, 3, 16, 32, 48, 0x4E00..0x4E06, 0x53424F4A) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed jc_sub_.",
+      block: {
+        // ---- Prologue (6 callee-save pushes; no stack pad: pure leaf).
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Guard: cmd_ptr != 0.
+        cmp rdi, 0;
+        je  jc_sub_bad_cmd;
+
+        // ---- Guard: cmd_len > 0.
+        cmp rsi, 0;
+        je  jc_sub_bad_cmd;
+
+        // ---- Guard: mode_u8 in {0, 1}.
+        cmp rdx, 1;
+        ja  jc_sub_bad_mode;
+
+        // ---- Guard: out_job_id_ptr != 0.
+        cmp rcx, 0;
+        je  jc_sub_bad_out_ptr;
+
+        // Stash inputs in callee-saves.
+        mov rbx, rdi;                          // cmd_ptr
+        mov rbp, rsi;                          // cmd_len
+        mov r12, rdx;                          // mode_u8
+        mov r13, rcx;                          // out_job_id_ptr
+
+        // ---- Scan slots 0..32.
+        xor r14, r14;                          // slot_idx = 0
+
+      jc_sub_scan:
+        cmp r14, 32;                           // JC_POOL_SLOTS
+        jae jc_sub_pool_full;
+
+        // slot_addr = &_jc_jobs + slot_idx * 48 = idx*32 + idx*16.
+        mov r9, r14;
+        shl r9, 5;                             // idx * 32
+        mov r10, r14;
+        shl r10, 4;                            // idx * 16
+        add r9, r10;                           // idx * 48
+        lea r11, [rip + _jc_jobs];
+        add r9, r11;
+        mov r15, r9;                           // r15 = slot_addr
+
+        // Load magic u32.
+        xor rax, rax;
+        mov_d rax, [r15 + 0];                  // JC_OFF_MAGIC
+        cmp rax, 0;
+        je  jc_sub_alloc_fresh;
+
+        // Live slot: check state == DONE.
+        xor rax, rax;
+        mov_b rax, [r15 + 8];                  // JC_OFF_STATE
+        cmp rax, 3;                            // JC_STATE_DONE
+        je  jc_sub_alloc_reuse;
+
+        // Still live, non-DONE: skip.
+        add r14, 1;
+        jmp jc_sub_scan;
+
+        // -----------------------------------------------------------
+        // ALLOC: slot_addr in r15.
+        //
+        //   jc_sub_alloc_fresh: magic was 0 (brand-new slot).
+        //                       Need to bump _jc_job_count.
+        //   jc_sub_alloc_reuse: magic was 'JOBS' but state == DONE
+        //                       (recycled slot). No count bump.
+        // -----------------------------------------------------------
+      jc_sub_alloc_fresh:
+        // Bump _jc_job_count by 1.
+        lea r11, [rip + _jc_job_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        jmp jc_sub_write_slot;
+
+      jc_sub_alloc_reuse:
+        // No count bump (recycle).
+
+      jc_sub_write_slot:
+        // magic := 'JOBS' at [slot + 0].
+        mov rax, 0x53424F4A;                   // JC_MAGIC
+        mov_d [r15 + 0], rax;
+
+        // job_id := slot_idx + 1 at [slot + 4].
+        mov rax, r14;
+        add rax, 1;
+        mov_d [r15 + 4], rax;
+
+        // state := JC_STATE_NEW (0) at [slot + 8].
+        xor rax, rax;
+        mov_b [r15 + 8], rax;
+
+        // mode := r12 at [slot + 9].
+        mov_b [r15 + 9], r12;
+
+        // flags := 0 at [slot + 10].
+        xor rax, rax;
+        mov_b [r15 + 10], rax;
+
+        // reserved_1 := 0 at [slot + 11].
+        mov_b [r15 + 11], rax;
+
+        // tid := 0 (u32) at [slot + 12].
+        mov_d [r15 + 12], rax;
+
+        // -----------------------------------------------------------
+        // command_inline: copy min(cmd_len, 16) from cmd_ptr; zero-pad.
+        // Precomputed destination base in rsi to sidestep the
+        //   mov_b [reg + reg + off], reg
+        // encoder gap (precedent: session_env.pdx L440 note).
+        // -----------------------------------------------------------
+        mov rsi, r15;
+        add rsi, 16;                           // JC_OFF_COMMAND_INLINE
+
+        // Determine copy_len = min(cmd_len, 16).
+        mov rax, rbp;                          // rax = cmd_len
+        cmp rax, 16;                           // JC_CMD_INLINE_MAX
+        jbe jc_sub_name_len_ok;
+        mov rax, 16;
+      jc_sub_name_len_ok:
+        mov rdx, rax;                          // rdx = copy_len
+
+        // Copy loop.
+        xor r10, r10;                          // j = 0
+
+      jc_sub_name_copy:
+        cmp r10, rdx;
+        jae jc_sub_name_pad;
+        xor rax, rax;
+        mov_b rax, [rbx + r10 * 1];
+        mov_b [rsi + r10 * 1], rax;
+        add r10, 1;
+        jmp jc_sub_name_copy;
+
+      jc_sub_name_pad:
+        // Zero-pad bytes [copy_len .. 16).
+        xor rax, rax;
+
+      jc_sub_pad_loop:
+        cmp r10, 16;                           // JC_CMD_INLINE_MAX
+        jae jc_sub_name_done;
+        mov_b [rsi + r10 * 1], rax;
+        add r10, 1;
+        jmp jc_sub_pad_loop;
+
+      jc_sub_name_done:
+        // cmd_body_ref := 0 (u64) at [slot + 32].
+        xor rax, rax;
+        mov [r15 + 32], rax;
+
+        // reserved_2 := 0 (u32) at [slot + 40].
+        mov_d [r15 + 40], rax;
+
+        // reserved_3 := 0 (u32) at [slot + 44].
+        mov_d [r15 + 44], rax;
+
+        // -----------------------------------------------------------
+        // Write (slot_idx + 1) through out_job_id_ptr.
+        // out_job_id_ptr was validated != 0 at entry.
+        // Width: u32 (the ABI writes the low 32 bits).
+        // -----------------------------------------------------------
+        mov rax, r14;
+        add rax, 1;
+        mov_d [r13 + 0], rax;
+
+        // Return JC_OK.
+        xor rax, rax;
+        jmp jc_sub_epilogue;
+
+        // -----------------------------------------------------------
+        // Return paths.
+        // -----------------------------------------------------------
+      jc_sub_bad_cmd:
+        mov rax, 0x4E04;                       // JC_ERR_BAD_CMD
+        jmp jc_sub_epilogue;
+
+      jc_sub_bad_mode:
+        mov rax, 0x4E03;                       // JC_ERR_BAD_MODE
+        jmp jc_sub_epilogue;
+
+      jc_sub_bad_out_ptr:
+        mov rax, 0x4E06;                       // JC_ERR_BAD_OUT_PTR
+        jmp jc_sub_epilogue;
+
+      jc_sub_pool_full:
+        mov rax, 0x4E00;                       // JC_ERR_POOL_FULL
+        jmp jc_sub_epilogue;
+
+      jc_sub_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _jc_bg(job_id) -> errno
+  //
+  //   rdi = job_id (1..32)
+  //   rax = JC_OK / JC_ERR_BAD_ID / JC_ERR_BAD_STATE
+  //
+  //   Requires slot state == JC_STATE_STOPPED. On OK: state :=
+  //   JC_STATE_RUNNING; mode := JC_MODE_BACKGROUND. If the slot was
+  //   the current foreground owner, clears _jc_fg_tid to 0.
+  //
+  // Pure leaf -- zero callee-save pushes, no stack frame, no nested CALL.
+  // Labels prefixed jc_bg_.
+  // ==========================================================================
+  pub let _jc_bg : (u64) -> u64 !{mem} @{} =
+    fn (job_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M4 (#2722): STOPPED->RUNNING transition under BACKGROUND mode. Pure leaf; zero pushes; no stack frame; no nested CALL. Guards: job_id in [1..32] (JC_ERR_BAD_ID), slot magic == 'JOBS' (JC_ERR_BAD_ID), slot state == JC_STATE_STOPPED (JC_ERR_BAD_STATE). Compute slot_addr = &_jc_jobs + (job_id - 1) * 48 via `mov a, rdi; sub a, 1; mov b, a; shl a, 5; shl b, 4; add a, b; lea r11, [rip + _jc_jobs]; add a, r11`. Read-check magic u32 at [slot+0] vs 0x53424F4A. Read-check state u8 at [slot+8] vs JC_STATE_STOPPED (2). Write state := JC_STATE_RUNNING (1) at [slot+8]; mode := JC_MODE_BACKGROUND (1) at [slot+9]. If _jc_fg_tid == slot.tid AND slot.tid != 0, clear _jc_fg_tid to 0 so the TTY router drops the fg route. All immediates (0, 1, 2, 32, 48, 0x4E01, 0x4E02, 0x53424F4A) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed jc_bg_.",
+      block: {
+        // ---- Guard: job_id in [1..32].
+        cmp rdi, 0;
+        je  jc_bg_bad_id;
+        cmp rdi, 32;                           // JC_POOL_SLOTS
+        ja  jc_bg_bad_id;
+
+        // ---- Compute slot_addr = &_jc_jobs + (job_id - 1) * 48.
+        mov r9, rdi;
+        sub r9, 1;                             // idx = job_id - 1
+        mov r10, r9;
+        shl r9, 5;                             // idx * 32
+        shl r10, 4;                            // idx * 16
+        add r9, r10;                           // idx * 48
+        lea r11, [rip + _jc_jobs];
+        add r9, r11;                           // r9 = slot_addr
+
+        // ---- Guard: slot magic == 'JOBS'.
+        xor rax, rax;
+        mov_d rax, [r9 + 0];                   // JC_OFF_MAGIC
+        cmp rax, 0x53424F4A;                   // JC_MAGIC
+        jne jc_bg_bad_id;
+
+        // ---- Guard: slot state == STOPPED.
+        xor rax, rax;
+        mov_b rax, [r9 + 8];                   // JC_OFF_STATE
+        cmp rax, 2;                            // JC_STATE_STOPPED
+        jne jc_bg_bad_state;
+
+        // ---- Write state := RUNNING, mode := BACKGROUND.
+        mov rax, 1;                            // JC_STATE_RUNNING
+        mov_b [r9 + 8], rax;
+
+        mov rax, 1;                            // JC_MODE_BACKGROUND
+        mov_b [r9 + 9], rax;
+
+        // ---- If this slot owned the fg route, clear _jc_fg_tid.
+        xor rax, rax;
+        mov_d rax, [r9 + 12];                  // JC_OFF_TID (slot.tid)
+        cmp rax, 0;
+        je  jc_bg_done;                        // slot.tid == 0: no fg to drop
+
+        lea r11, [rip + _jc_fg_tid];
+        mov rdx, [r11];
+        cmp rdx, rax;
+        jne jc_bg_done;                        // some other job owns fg
+
+        // slot owned fg route: clear.
+        xor rax, rax;
+        mov [r11], rax;
+
+      jc_bg_done:
+        xor rax, rax;                          // JC_OK
+        ret;
+
+      jc_bg_bad_id:
+        mov rax, 0x4E01;                       // JC_ERR_BAD_ID
+        ret;
+
+      jc_bg_bad_state:
+        mov rax, 0x4E02;                       // JC_ERR_BAD_STATE
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _jc_fg(job_id) -> errno
+  //
+  //   rdi = job_id (1..32)
+  //   rax = JC_OK / JC_ERR_BAD_ID / JC_ERR_BAD_STATE
+  //
+  //   Requires slot state == JC_STATE_STOPPED. On OK: state :=
+  //   JC_STATE_RUNNING; mode := JC_MODE_FOREGROUND; _jc_fg_tid :=
+  //   slot.tid. (slot.tid is 0 at M4 until R229.M5 wire-up populates
+  //   it from the scheduler.)
+  //
+  // Pure leaf -- zero callee-save pushes, no stack frame, no nested CALL.
+  // Labels prefixed jc_fg_.
+  // ==========================================================================
+  pub let _jc_fg : (u64) -> u64 !{mem} @{} =
+    fn (job_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M4 (#2722): STOPPED->RUNNING transition under FOREGROUND mode. Pure leaf; zero pushes; no stack frame; no nested CALL. Guards: job_id in [1..32] (JC_ERR_BAD_ID), slot magic == 'JOBS' (JC_ERR_BAD_ID), slot state == JC_STATE_STOPPED (JC_ERR_BAD_STATE). Compute slot_addr identically to _jc_bg. Write state := JC_STATE_RUNNING (1) at [slot+8]; mode := JC_MODE_FOREGROUND (0) at [slot+9]; _jc_fg_tid := slot.tid (zero-extended u32 -> u64). All immediates (0, 1, 2, 32, 48, 0x4E01, 0x4E02, 0x53424F4A) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed jc_fg_.",
+      block: {
+        // ---- Guard: job_id in [1..32].
+        cmp rdi, 0;
+        je  jc_fg_bad_id;
+        cmp rdi, 32;                           // JC_POOL_SLOTS
+        ja  jc_fg_bad_id;
+
+        // ---- Compute slot_addr.
+        mov r9, rdi;
+        sub r9, 1;
+        mov r10, r9;
+        shl r9, 5;
+        shl r10, 4;
+        add r9, r10;
+        lea r11, [rip + _jc_jobs];
+        add r9, r11;                           // r9 = slot_addr
+
+        // ---- Guard: magic == 'JOBS'.
+        xor rax, rax;
+        mov_d rax, [r9 + 0];
+        cmp rax, 0x53424F4A;
+        jne jc_fg_bad_id;
+
+        // ---- Guard: state == STOPPED.
+        xor rax, rax;
+        mov_b rax, [r9 + 8];
+        cmp rax, 2;                            // JC_STATE_STOPPED
+        jne jc_fg_bad_state;
+
+        // ---- Write state := RUNNING, mode := FOREGROUND.
+        mov rax, 1;                            // JC_STATE_RUNNING
+        mov_b [r9 + 8], rax;
+
+        xor rax, rax;                          // JC_MODE_FOREGROUND = 0
+        mov_b [r9 + 9], rax;
+
+        // ---- _jc_fg_tid := slot.tid (zero-extended u32 -> u64).
+        xor rax, rax;
+        mov_d rax, [r9 + 12];                  // JC_OFF_TID
+        lea r11, [rip + _jc_fg_tid];
+        mov [r11], rax;
+
+        xor rax, rax;                          // JC_OK
+        ret;
+
+      jc_fg_bad_id:
+        mov rax, 0x4E01;                       // JC_ERR_BAD_ID
+        ret;
+
+      jc_fg_bad_state:
+        mov rax, 0x4E02;                       // JC_ERR_BAD_STATE
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _jc_update_state(job_id, new_state) -> errno
+  //
+  //   rdi = job_id (1..32)
+  //   rsi = new_state (0..3)
+  //   rax = JC_OK / JC_ERR_BAD_ID / JC_ERR_BAD_STATE
+  //
+  //   Scheduler-side callback. Transition policy:
+  //     * cur == new_state: BAD_STATE (no-op rejected).
+  //     * cur == DONE: BAD_STATE (terminal).
+  //     * new_state == NEW: BAD_STATE (NEW is set only by _jc_submit).
+  //     * new_state > 3: BAD_STATE.
+  //     * Otherwise: OK.
+  //   On a DONE transition for the current fg owner, clears
+  //   _jc_fg_tid to 0.
+  //
+  // Pure leaf -- zero callee-save pushes, no stack frame, no nested CALL.
+  // Labels prefixed jc_us_.
+  // ==========================================================================
+  pub let _jc_update_state : (u64, u64) -> u64 !{mem} @{} =
+    fn (job_id: u64) (new_state: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M4 (#2722): scheduler-driven state transition. Pure leaf; zero pushes; no stack frame; no nested CALL. Guards: job_id in [1..32] (JC_ERR_BAD_ID), slot magic == 'JOBS' (JC_ERR_BAD_ID), new_state in [0..3] (JC_ERR_BAD_STATE), new_state != JC_STATE_NEW (JC_ERR_BAD_STATE), cur != JC_STATE_DONE (JC_ERR_BAD_STATE), cur != new_state (JC_ERR_BAD_STATE). On OK: write new_state u8 at [slot+8]. On DONE transition (new_state == 3) where slot.mode == JC_MODE_FOREGROUND AND _jc_fg_tid == slot.tid, clear _jc_fg_tid to 0. Compute slot_addr identically to _jc_bg. All immediates (0, 1, 2, 3, 32, 48, 0x4E01, 0x4E02, 0x53424F4A) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed jc_us_.",
+      block: {
+        // ---- Guard: job_id in [1..32].
+        cmp rdi, 0;
+        je  jc_us_bad_id;
+        cmp rdi, 32;                           // JC_POOL_SLOTS
+        ja  jc_us_bad_id;
+
+        // ---- Guard: new_state in [0..3].
+        cmp rsi, 3;
+        ja  jc_us_bad_state;
+
+        // ---- Guard: new_state != JC_STATE_NEW (0).
+        cmp rsi, 0;
+        je  jc_us_bad_state;
+
+        // ---- Compute slot_addr.
+        mov r9, rdi;
+        sub r9, 1;
+        mov r10, r9;
+        shl r9, 5;
+        shl r10, 4;
+        add r9, r10;
+        lea r11, [rip + _jc_jobs];
+        add r9, r11;                           // r9 = slot_addr
+
+        // ---- Guard: magic == 'JOBS'.
+        xor rax, rax;
+        mov_d rax, [r9 + 0];
+        cmp rax, 0x53424F4A;
+        jne jc_us_bad_id;
+
+        // ---- Load cur state.
+        xor rax, rax;
+        mov_b rax, [r9 + 8];                   // rax = cur_state
+
+        // ---- Guard: cur != DONE.
+        cmp rax, 3;                            // JC_STATE_DONE
+        je  jc_us_bad_state;
+
+        // ---- Guard: cur != new_state.
+        cmp rax, rsi;
+        je  jc_us_bad_state;
+
+        // ---- Transition OK: write new_state.
+        mov_b [r9 + 8], rsi;
+
+        // ---- If new_state != DONE, done.
+        cmp rsi, 3;                            // JC_STATE_DONE
+        jne jc_us_done;
+
+        // ---- DONE path: clear _jc_fg_tid if this was the fg owner.
+        // slot.mode at [slot+9]; require FOREGROUND (0).
+        xor rax, rax;
+        mov_b rax, [r9 + 9];                   // JC_OFF_MODE
+        cmp rax, 0;                            // JC_MODE_FOREGROUND
+        jne jc_us_done;
+
+        // Compare _jc_fg_tid vs slot.tid.
+        xor rax, rax;
+        mov_d rax, [r9 + 12];                  // slot.tid (u32 zero-extend)
+        cmp rax, 0;
+        je  jc_us_done;                        // slot.tid == 0: nothing to drop
+
+        lea r11, [rip + _jc_fg_tid];
+        mov rdx, [r11];
+        cmp rdx, rax;
+        jne jc_us_done;                        // some other job owns fg
+
+        // Clear fg route.
+        xor rax, rax;
+        mov [r11], rax;
+
+      jc_us_done:
+        xor rax, rax;                          // JC_OK
+        ret;
+
+      jc_us_bad_id:
+        mov rax, 0x4E01;                       // JC_ERR_BAD_ID
+        ret;
+
+      jc_us_bad_state:
+        mov rax, 0x4E02;                       // JC_ERR_BAD_STATE
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _jc_list(out, out_cap) -> packed_u64
+  //
+  //   rdi = out      (ptr to caller buffer; filled on OK)
+  //   rsi = out_cap  (byte capacity of the caller buffer)
+  //   rax = (bytes_written << 32) | status
+  //
+  //   Walks slots 0..32; for each slot with magic == 'JOBS' AND state
+  //   != JC_STATE_DONE, copies the 48-byte record contiguously into
+  //   the caller buffer. Returns (bytes_written << 32) | JC_OK on
+  //   success. On the first copy that would overflow out_cap,
+  //   returns JC_ERR_OUT_TOO_SMALL (top 32 bits undefined on error).
+  //
+  // Register plan (4-push, pure-leaf):
+  //   rbx = out
+  //   r12 = out_cap
+  //   r13 = n_written_bytes
+  //   r14 = slot_idx (scan cursor)
+  //
+  //   No nested CALL -> no align pad. Pure leaf.
+  //
+  // Labels prefixed jc_lst_.
+  // ==========================================================================
+  pub let _jc_list : (u64, u64) -> u64 !{mem} @{} =
+    fn (out: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R229.M4 (#2722): list all active (magic='JOBS', state != DONE) Job rows into the caller buffer. 4 callee-save pushes (rbx=out, r12=out_cap, r13=n_written, r14=slot_idx); pure leaf with no nested CALL so no sub-rsp pad is needed. Walk slot_idx 0..32: slot_addr = &_jc_jobs + idx*48 via `mov a, idx; mov b, idx; shl a, 5; shl b, 4; add a, b; lea r11, [rip + _jc_jobs]; add a, r11`. Load magic u32 at [slot+0]; if 0, skip (free slot). Load state u8 at [slot+8]; if JC_STATE_DONE (3), skip. Capacity: (n_written + 48) <= out_cap else JC_ERR_OUT_TOO_SMALL. Copy 48 B from slot to out+n_written via 6 u64 moves (0, 8, 16, 24, 32, 40). Bump n_written by 48. On loop exit, return (n_written << 32) | JC_OK via `mov rax, r13; shl rax, 32`. All immediates (0, 3, 32, 48, 0x4E05, 0x53424F4A) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed jc_lst_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                          // out
+        mov r12, rsi;                          // out_cap
+        xor r13, r13;                          // n_written = 0
+        xor r14, r14;                          // slot_idx = 0
+
+      jc_lst_walk:
+        cmp r14, 32;                           // JC_POOL_SLOTS
+        jae jc_lst_done;
+
+        // slot_addr = &_jc_jobs + slot_idx * 48.
+        mov r9, r14;
+        shl r9, 5;
+        mov r10, r14;
+        shl r10, 4;
+        add r9, r10;
+        lea r11, [rip + _jc_jobs];
+        add r9, r11;                           // r9 = slot_addr
+
+        // magic check.
+        xor rax, rax;
+        mov_d rax, [r9 + 0];
+        cmp rax, 0;
+        je  jc_lst_skip;
+
+        // state != DONE check.
+        xor rax, rax;
+        mov_b rax, [r9 + 8];
+        cmp rax, 3;                            // JC_STATE_DONE
+        je  jc_lst_skip;
+
+        // Capacity: n_written + 48 <= out_cap.
+        mov r8, r13;
+        add r8, 48;                            // JC_JOB_BYTES
+        cmp r8, r12;
+        ja  jc_lst_oos;
+
+        // Copy 48 B = 6 x u64 from slot to out + n_written.
+        mov r10, rbx;
+        add r10, r13;                          // dst = out + n_written
+
+        mov rax, [r9 + 0];
+        mov [r10 + 0], rax;
+        mov rax, [r9 + 8];
+        mov [r10 + 8], rax;
+        mov rax, [r9 + 16];
+        mov [r10 + 16], rax;
+        mov rax, [r9 + 24];
+        mov [r10 + 24], rax;
+        mov rax, [r9 + 32];
+        mov [r10 + 32], rax;
+        mov rax, [r9 + 40];
+        mov [r10 + 40], rax;
+
+        add r13, 48;                           // n_written += 48
+
+      jc_lst_skip:
+        add r14, 1;
+        jmp jc_lst_walk;
+
+      jc_lst_done:
+        // Return (n_written << 32) | JC_OK.
+        mov rax, r13;
+        shl rax, 32;
+        jmp jc_lst_epilogue;
+
+      jc_lst_oos:
+        mov rax, 0x4E05;                       // JC_ERR_OUT_TOO_SMALL
+
+      jc_lst_epilogue:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+}

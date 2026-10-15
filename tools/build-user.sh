@@ -40,6 +40,14 @@ PDX_CONSUME_LINK_SCRIPT="${USER_SRC}/pdx_consume.ld"
 # (sys_caps_grant_override) is unwired at M5 and returns -ENOSYS until the
 # M5-cont kernel-side landing; /bin/run detects that and warns to stderr.
 RUN_LINK_SCRIPT="${USER_SRC}/run.ld"
+# R222.M7 (paideia-os #2664, umbrella #2486): /bin/sh front-end dispatcher.
+# Self-contained (inlines SC+ 12/59/60), so its own object set + linker
+# script + link step (mirrors the run/touch/cat classification pattern).
+# Reads PDX_SHELL_MODE from envp; semantic path is an M7 stub that falls
+# through to legacy. The eventual swap of /bin/sh = sh_dispatch.elf (and
+# seed of /bin/legacy-sh = shell.elf) in bin_seeds.pdx is deferred to the
+# R229-close landing per design/shell/sh-dispatch.md §SECTION 4.
+SH_DISPATCH_LINK_SCRIPT="${USER_SRC}/sh_dispatch.ld"
 
 if [[ ! -f "${SHELL_LINK_SCRIPT}" ]]; then
     echo "shell linker script missing: ${SHELL_LINK_SCRIPT}" >&2
@@ -156,6 +164,11 @@ if [[ ! -f "${RUN_LINK_SCRIPT}" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${SH_DISPATCH_LINK_SCRIPT}" ]]; then
+    echo "sh_dispatch linker script missing: ${SH_DISPATCH_LINK_SCRIPT}" >&2
+    exit 1
+fi
+
 # Satellite-tool ELF preservation (design/build/satellite-elf-preservation.md).
 #
 # tools/build.sh's r64v2-tools block stages mkfs.pdxfs.elf /
@@ -215,6 +228,8 @@ PDX_PRODUCE_OBJECTS=()
 PDX_CONSUME_OBJECTS=()
 # R125.M5 (paideia-os #2595): /bin/run cap-grant surface object set.
 RUN_OBJECTS=()
+# R222.M7 (paideia-os #2664): /bin/sh front-end dispatcher object set.
+SH_DISPATCH_OBJECTS=()
 LIBC_OBJECTS=()
 AML_OBJECTS=()
 LIBS_OBJECTS=()
@@ -389,6 +404,17 @@ while IFS= read -r -d '' pdx; do
         # and falls through to a plain execve with a warning. Mirrors
         # the touch.pdx / cat.pdx classification pattern.
         RUN_OBJECTS+=("${obj}")
+    elif [[ "${rel}" == "sh_dispatch.pdx" ]]; then
+        # R222.M7 (paideia-os #2664, umbrella #2486): /bin/sh front-end
+        # dispatcher. Self-contained (inlines sys_debug_puts/sys_execve/
+        # sys_exit) so its object goes to its own set only -- no library
+        # pull-in. Mirrors run.pdx / touch.pdx / cat.pdx classification
+        # pattern. CRUCIALLY not routed to SHELL_OBJECTS: the legacy shell
+        # (src/user/shell.pdx) must remain linkable as a standalone image
+        # until the R229-close landing swaps /bin/sh = sh_dispatch.elf and
+        # /bin/legacy-sh = shell.elf in bin_seeds.pdx. See design/shell/
+        # sh-dispatch.md §SECTION 4 for the staged swap sequencing.
+        SH_DISPATCH_OBJECTS+=("${obj}")
     elif [[ "${rel}" == libc/* ]]; then
         # R57.M4-001 (#1797): src/user/libc/ -- userspace runtime library
         # for the growing R57 ring-3 surface (ls, cat, mkdir, ...). Each
@@ -1044,6 +1070,56 @@ if [[ ${#RUN_OBJECTS[@]} -gt 0 ]]; then
 
     echo "[ok] ${BUILD_DIR}/run.elf"
     echo "[ok] ${BUILD_DIR}/run.bin"
+fi
+
+# Link sh_dispatch.elf with sh_dispatch objects only (R222.M7 paideia-os
+# #2664, umbrella #2486). Self-contained; no libs, no shim. Inlines
+# sys_debug_puts (SC+ ID 12) + sys_execve (SC+ ID 59) + sys_exit (SC+ ID
+# 60). envp_slot (u64 .bss @align(8)) lives in .bss; the R31.M2-1595
+# (#1595) contiguity rule is preserved by sh_dispatch.ld verbatim.
+#
+# This builds the front-end dispatcher that will replace /bin/sh at the
+# R229-close landing. At M7 the ELF ships on disk but is NOT yet seeded
+# into tmpfs by bin_seeds.pdx -- init continues to fork+exec the legacy
+# shell.elf unchanged. See design/shell/sh-dispatch.md §SECTION 4.
+if [[ ${#SH_DISPATCH_OBJECTS[@]} -gt 0 ]]; then
+    echo "[link-user] ld -T sh_dispatch.ld -> sh_dispatch.elf"
+    ld -nostdlib --warn-common --fatal-warnings \
+        -T "${SH_DISPATCH_LINK_SCRIPT}" \
+        -o "${BUILD_DIR}/sh_dispatch.elf" \
+        "${SH_DISPATCH_OBJECTS[@]}"
+
+    echo "[objcopy-user] sh_dispatch.elf -> sh_dispatch.bin"
+    objcopy -O binary "${BUILD_DIR}/sh_dispatch.elf" "${BUILD_DIR}/sh_dispatch.bin"
+
+    echo "[ok] ${BUILD_DIR}/sh_dispatch.elf"
+    echo "[ok] ${BUILD_DIR}/sh_dispatch.bin"
+fi
+
+# =============================================================================
+# ALIAS: legacy-sh.elf (R222.M7 paideia-os #2664, umbrella #2486)
+# =============================================================================
+#
+# Hard-link build/user/legacy-sh.elf -> build/user/shell.elf so the
+# alias artifact exists on disk at the exact byte-identical shape the
+# post-R229 /bin/legacy-sh tmpfs seed will need. A hard link (rather
+# than cp or a symlink) keeps the single on-disk inode and matches the
+# "satellite-tool ELF preservation" discipline already in effect for
+# *.pdxfs.elf earlier in this script. On a Linux ext4 build tree a hard
+# link is free; on other FSes `ln` falls back to a reflink or cp per
+# util-linux defaults.
+#
+# IMPORTANT: at M7 the kernel-side bin_seeds.pdx seed table does NOT
+# yet reference legacy-sh.elf -- the alias file ships, but /bin/legacy-sh
+# is not yet present in tmpfs at runtime, so sys_execve('/bin/legacy-sh')
+# returns -ENOENT and _sd_legacy_fallback (sh_dispatch.pdx) emits the
+# fail marker. The seed-table landing is deferred to the R229-close
+# ticket noted in design/shell/sh-dispatch.md §SECTION 4.
+if [[ -f "${BUILD_DIR}/shell.elf" ]]; then
+    echo "[alias-user] ln -f shell.elf -> legacy-sh.elf (R222.M7 #2664)"
+    rm -f "${BUILD_DIR}/legacy-sh.elf"
+    ln "${BUILD_DIR}/shell.elf" "${BUILD_DIR}/legacy-sh.elf"
+    echo "[ok] ${BUILD_DIR}/legacy-sh.elf (hard-link alias of shell.elf)"
 fi
 
 # R31.M2-1595 (#1595): PT_LOAD extent gate over every image linked above.

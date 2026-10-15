@@ -1,0 +1,66 @@
+/* PaideiaOS /bin/sh (post-R229) front-end dispatcher linker script.
+ * R222.M7 (paideia-os #2664, umbrella #2486).
+ *
+ * Identical shape to run.ld / cat.ld / touch.ld / ps.ld: text at
+ * 0x00400000, data at 0x00600000, .bss contiguous with .data per the
+ * R31.M2-1595 (#1595) PT_LOAD-extent discipline.  sh_dispatch.pdx is a
+ * single-object binary (one-file-one-ELF, no shared library pull-in), so
+ * there is nothing distinctive here beyond ENTRY(_start).
+ *
+ * envp_slot (u64 .bss @align(8)) and the string literals (.rodata) are
+ * both laid down by the SECTIONS clauses below.  Immutable string parts
+ * live in .rodata and are folded into the text PT_LOAD by the ALIGN(8)
+ * .rodata clause; the single mutable scratch (envp_slot) lives in .bss
+ * backed by the data PT_LOAD.
+ *
+ * The eventual kernel-side bin_seeds.pdx landing that swaps /bin/sh =
+ * sh_dispatch.elf (and seeds /bin/legacy-sh = shell.elf) is cited at
+ * design/shell/sh-dispatch.md §SECTION 4.
+ */
+
+OUTPUT_FORMAT(elf64-x86-64)
+OUTPUT_ARCH(i386:x86-64)
+ENTRY(_start)
+
+PHDRS
+{
+    text PT_LOAD FLAGS(5);
+    data PT_LOAD FLAGS(6);
+}
+
+SECTIONS
+{
+    . = 0x00400000;
+
+    .text : ALIGN(4K) {
+        KEEP(*(.text._start))
+        *(.text .text.*)
+    } :text
+
+    .rodata : ALIGN(8) {
+        *(.rodata .rodata.*)
+    } :text
+
+    . = 0x00600000;
+
+    .data : ALIGN(4K) {
+        *(.data .data.*)
+    } :data
+
+    /* R31.M2-1595 (#1595): .bss follows .data CONTIGUOUSLY -- there is
+     * no `. = 0x00700000;` here, and there must not be one.  See true.ld
+     * for the full rationale (the 1 MiB PT_LOAD hole this discipline
+     * closes).
+     */
+    .bss (NOLOAD) : ALIGN(4K) {
+        *(COMMON)
+        *(.bss .bss.*)
+        . = ALIGN(4K);
+    } :data
+
+    /DISCARD/ : {
+        *(.comment)
+        *(.eh_frame*)
+        *(.note.*)
+    }
+}
