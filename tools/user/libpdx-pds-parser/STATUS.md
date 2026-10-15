@@ -301,6 +301,36 @@ TF_ERR_BAD_MAGIC 0x6006, TF_ERR_MISMATCH 0x6007, TF_ERR_BAD_LEN
 0x6008, TF_ERR_BAD_EXPECTED 0x6009); 500-turn smoke acceptance
 corpus enumerated in `design/shell/turn-fingerprint.md` §8 and
 deferred to R229.M10.5 golden landing).
+**Wave 132 landings (parallel-arm):** R225.M9 ProptestHm
+(property-based test HARNESS over random pds-lang programs
+implementing the §15.6 verification clause for the typechecker tier;
+four public entry points `_pth_init` / `_pth_generate` /
+`_pth_check_property` / `_pth_run_corpus` over caller-supplied
+buffers; `.bss` state is two u64 scalars + a 64-byte scratch
+program buffer; `.rodata` holds an 8-entry 32-byte-stride random-
+program template table and two 24-byte canonical schemes for the
+RankCheck stride; `_pth_generate` deterministically emits one of 8
+template programs selected by the low 3 bits of a xorshift64-mixed
+seed, each prefixed with the welltyped tag '+' = 0x2B or '-' =
+0x2D; `_pth_check_property` validates the tag against the caller's
+expected_welltyped bit AND calls R225.M6 `_rc_check_scheme` on the
+well-typed OR ill-typed canonical scheme to prove the typechecker
+wire-up executes in both directions; `_pth_run_corpus` loops N
+times, zero-fills a 128-byte PthStats record with magic 'PTHS' =
+0x53485450 LE and version u16 = 1, bucket-counts each verdict in
+six u64 counters (n_wt_pass / n_wt_fail / n_it_pass / n_it_fail /
+n_p3_pass / n_p3_fail), and stashes the last non-OK verdict's
+status + program index at [+64] / [+68]; error band
+0x6100..0x61FF with thirteen PTH_* slots (PTH_OK, PTH_ERR_BAD_OUT
+0x6100, PTH_ERR_OUT_TOO_SMALL 0x6101, PTH_ERR_BAD_INPUT 0x6102,
+PTH_ERR_INPUT_TOO_LARGE 0x6103, PTH_ERR_BAD_LEN 0x6104,
+PTH_ERR_BAD_EXPECTED 0x6105, PTH_ERR_N_TOO_LARGE 0x6106,
+PTH_ERR_BAD_STATS 0x6107, PTH_ERR_PROPERTY_P1_VIOLATION 0x6110,
+PTH_ERR_PROPERTY_P2_VIOLATION 0x6111,
+PTH_ERR_PROPERTY_P3_VIOLATION 0x6112, PTH_ERR_UNKNOWN_TAG 0x6114,
+PTH_ERR_RC_STRIDE_FAIL 0x6115); 10k-random-program corpus +
+24-hour sustained-run acceptance clauses deferred to R225.M9.5
+along with the full HM elaborator wire-up).
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -1306,11 +1336,69 @@ Blocked by: R220.M11.
 
 Blocked by: R220.M9.
 
-### M9 -- Property-based test corpus (deferred)
+### M9 -- Property-based test corpus (paideia-os#2690, landed)
 
-Blocked by: M6. 10k random-program corpus + 24-hour run gate landing.
-Will also seed the 40-test row-types corpus and the 100-test HM core
-corpus deferred from M1 and M2.
+- [x] **R225.M9-001** -- `src/proptest_hm.pdx` module `ProptestHm`
+      landed: four public entry points over caller-supplied buffers.
+      - `_pth_init()` -- resets `_pth_prng_state` to 1 (xorshift64 is
+        degenerate on state 0) and `_pth_program_counter` to 0.
+        Pure leaf; zero callee-save pushes; no stack frame; no
+        nested CALL.
+      - `_pth_generate(seed, out, out_cap) -> packed_u64` --
+        deterministically emits one of 8 template programs. Template
+        index = low 3 bits of a xorshift64-mixed seed. Each emitted
+        program's first byte is the welltyped tag '+' (0x2B) for
+        well-typed or '-' (0x2D) for ill-typed. Pure leaf.
+      - `_pth_check_property(program_ptr, len, expected_welltyped)
+        -> status` -- validates expected_welltyped against the tag
+        at program[0]; calls R225.M6 `_rc_check_scheme` on one of
+        two canonical schemes (`_pth_canon_wt_scheme` with
+        TyCon(u64) body; `_pth_canon_it_scheme` with TYFORALL=5
+        body) to prove the typechecker wire-up executes BOTH ways
+        (OK on well-typed canonical, non-OK on ill-typed canonical).
+        Returns a P1 (0x6110) / P2 (0x6111) / stride-fail (0x6115)
+        verdict on disagreement. 4-push callee-save frame + sub
+        rsp,8 pad = 40 B; one nested CALL to `_rc_check_scheme`.
+      - `_pth_run_corpus(seed, n_programs, out_stats, out_cap)
+        -> packed_u64` -- outer loop. Zero-fills 128 B at out_stats;
+        stamps magic 'PTHS' (0x53485450 LE) at [+0], version u16 = 1
+        at [+4], seed u64 at [+72]. Loops N times, calling
+        `_pth_generate` + `_pth_check_property` and bucketing each
+        verdict into six u64 counters (n_wt_pass/fail, n_it_pass/
+        fail, n_p3_pass/fail); stashes the last non-OK verdict's
+        status + program index at [+64] / [+68]. 6-push callee-save
+        frame + sub rsp,8 pad = 56 B; two nested CALLs per
+        iteration. P3 counter is a canned pass at raw M9 (real
+        wire-up at M9.3).
+      - PTH_* status taxonomy in `0x6100..0x61FF` (thirteen slots
+        used; 0x6108..0x610F, 0x6113, 0x6116..0x61FF reserved for
+        M9.1+ follow-ups).
+- [x] **R225.M9-002** -- design doc landed:
+      `design/shell/proptest-hm.md`. Ten sections: scope + motivation,
+      why dedicated harness (not a flag on `_fh_drive`), random-program
+      source (xorshift64 + 8-template `.rodata` table + determinism
+      guarantee), property oracle (P1/P2 tag-byte decision table + P3
+      canned-pass note), corpus driver flow + stats accumulator map,
+      stats record layout, status taxonomy, encoder discipline,
+      forward path (M9.1..M9.7), cross-references.
+- [ ] **R225.M9-003** (deferred) -- M9.1 real HM elaborator wire-up:
+      replace tag-byte oracle with hash of `_hm_instantiate` /
+      `_hm_unify`'s actual emit over the program AST.
+- [ ] **R225.M9-004** (deferred) -- M9.2 grammar-driven random walk:
+      replace 8-template `.rodata` table with a bounded-depth
+      generator producing 10^9+ distinct programs.
+- [ ] **R225.M9-005** (deferred) -- M9.3 P3 monotone wire-up:
+      compose two pipeline stages via R224.M3 EffectRow + R225.M4
+      EffectUnify; verify width covariance.
+- [ ] **R225.M9-006** (deferred) -- M9.4 state-carried corpus mode.
+- [ ] **R225.M9-007** (deferred) -- M9.5 10k-program seed corpus
+      under `tests/shell/proptest-hm/seeds/` + 24-hour sustained-run
+      smoke gate (the acceptance clause landing).
+- [ ] **R225.M9-008** (deferred) -- M9.6 AFL++ / libFuzzer driver
+      shim.
+- [ ] **R225.M9-009** (deferred) -- M9.7 per-iteration oracle arm
+      (assert rax in band {0x6100..0x61FF, 0x5810..0x5811,
+      0x2D00..0x2D03}).
 
 ### M10 -- Per-turn type-check fingerprint (deferred)
 
@@ -1998,6 +2086,92 @@ finalised; the line-editor primitive is the standing M6 commitment).
       but no export references it; needs R224.M4 CapRow row-
       flow pass).
 
+### R227.M6 -- Version pragma + resolution (paideia-os#2708, landed)
+
+- [x] **R227.M6-001** -- `src/version_pragma.pdx` module
+      `VersionPragma` landed: three public entry points
+      (`_vp_init`, `_vp_parse`, `_vp_check`); ZERO `.bss` state
+      at raw M6 (every record is caller-owned on all operational
+      paths). 32-byte VersionPragma record with magic 'RVPR' =
+      0x52505652 LE u32 @ [+0]; op u8 @ [+4]; flags u8 @ [+5]
+      (bit 0 = VP_FLAG_PATCH_PRESENT); reserved u16 @ [+6];
+      major u32 @ [+8]; minor u32 @ [+12]; patch u32 @ [+16];
+      reserved u8[12] @ [+20]. Stride 32 is a power of two
+      (`shl rN, 5` addressing without 2-op imul-r-imm) for a
+      future per-import pragma cache. `_vp_init` is bare `ret`
+      (zero pushes); `_vp_parse` 6-push PURE LEAF (no nested
+      CALL) with rbx=bytes_ptr, rbp=bytes_len, r12=out,
+      r13=cursor, r14=parsed_op, r15=patch_flag; semver digit
+      runs capped at 9 digits (R133.M4 Wave 118 u32 overflow
+      guard); digit accumulator uses `(acc<<3)+(acc<<1) = acc*10`
+      via shl + add (no 2-op imul-r-imm); `_vp_check` 4-push
+      PURE LEAF (no nested CALL) with rbx=record_ref,
+      rbp=running_major, r12=running_minor, r13=running_patch
+      taking the running-system triple as explicit u64 arguments
+      so the caller picks the compare target (kernel version,
+      shell version, federated-peer version). Grammar
+      `#requires-paideia OP X.Y[.Z]` with OP in {=, >=, <=, >,
+      <, ~=}; three-way lex compare on (major, minor, patch)
+      into rsi in {0 LO, 1 EQ, 2 HI}; op dispatch per the kernel-
+      side R133.M4 VersionGate semantics (two halves of the
+      same version-check machinery in disjoint error-code
+      spaces). VP_* status taxonomy in 0x6200..0x6210 (band
+      0x6200..0x62FF with the full VP_OK (0),
+      VP_ERR_BAD_DIRECTIVE (0x6200), VP_ERR_BAD_OP (0x6201),
+      VP_ERR_BAD_SEMVER (0x6202), VP_ERR_OUT_TOO_SMALL
+      (0x6203), VP_ERR_BAD_RECORD (0x6204),
+      VP_ERR_SRC_TOO_SHORT (0x6205),
+      VP_ERR_VERSION_MISMATCH (0x6210); the 0x6206..0x620F
+      slots reserved for M6.1+ parse diagnostics; the
+      0x6211..0x62FF slots reserved for M6.2+ check
+      diagnostics). NO intra-library linker-visible FUNCTION
+      dep at raw M6; declared forward-path deps on R227.M3
+      ImportResolve (M6.3 per-import version pin), R225.M7
+      DiagReport (M6.4 err-span injection). NO external cross-
+      library linker dep. NO intra-library DATA linker
+      reference at raw M6 (the module's own 18-byte
+      `vp_prefix` is .rodata-local). Mirror: paideia-os#2623
+      (R133.M4 kernel-side VersionGate) -- grammar + comparison
+      semantics identical; error-code spaces disjoint (0x6200
+      parser-tier vs. 0x3B00 kernel-tier).
+- [x] **R227.M6-002** -- design doc landed:
+      `design/shell/version-pragma.md`.
+- [ ] **R227.M6-003** -- 8-fixture acceptance corpus
+      (`tests/proptest_version_pragma.pdx`): fixture 1
+      (`#requires-paideia >= 1.0` vs running 1.2.0 -> VP_OK),
+      2 (`#requires-paideia >= 2.0` vs running 1.2.0 ->
+      VP_ERR_VERSION_MISMATCH), 3 (`#requires-paideia = 1.2`
+      vs running 1.2.0 -> VP_OK), 4 (`#requires-paideia = 1.2`
+      vs running 1.3.0 -> VP_ERR_VERSION_MISMATCH), 5
+      (`#requires-paideia ~= 2.5` vs running 2.9.0 -> VP_OK),
+      6 (`#requires-paideia ~= 2.5` vs running 3.0.0 ->
+      VP_ERR_VERSION_MISMATCH), 7 (`#requires-paideia < 2.0`
+      vs running 1.9.9 -> VP_OK), 8 (`#requires-paideia > 1.0`
+      vs running 1.0.0 -> VP_ERR_VERSION_MISMATCH). Deferred
+      along with the broader parser-tier property-test harness
+      (R221.M9 landing); the raw M6 surface satisfies every
+      fixture by the three-entry-point validation flows
+      enumerated in the design doc §7.
+- [ ] **R227.M6.1** (deferred) -- Prerelease tag parse
+      (`-alpha.1`, `-rc.2` per SemVer 2.0 §9) into the
+      reserved tail; VP_ERR_BAD_PRERELEASE diagnostic in
+      0x6206..0x620F reserved slot.
+- [ ] **R227.M6.2** (deferred) -- Build-metadata parse
+      (`+build.1` per SemVer 2.0 §10) with
+      VP_FLAG_BUILD_PRESENT bit.
+- [ ] **R227.M6.3** (deferred) -- Per-import version pin:
+      ImportResolve carries a parsed VersionPragma pointer
+      per ImportDirective; the loader cross-checks against
+      the imported module's own `#requires-paideia` on
+      resolve.
+- [ ] **R227.M6.4** (deferred) -- Diagnostic span: `src_offset`
+      + `src_length` u16 pair in the reserved tail so a
+      downstream reporter can render the exact directive bytes
+      without re-reading the source line.
+- [ ] **R227.M6.5** (deferred) -- 8-fixture acceptance corpus
+      landing (`tests/proptest_version_pragma.pdx`); landing
+      with R221.M9 property-test harness.
+
 ## Error-band accounting
 
 | Band             | Range            | Milestone | Status |
@@ -2083,6 +2257,10 @@ finalised; the line-editor primitive is the standing M6 commitment).
 | turn_fingerprint-M10.1+ | 0x600A..0x60FF | R229.M10.1+ | reserved |
 | module_functor   | 0x5F00..0x5F11   | R227.M5   | landed |
 | module_functor-M5.1+ | 0x5F12..0x5FFF | R227.M5.1+ | reserved |
+| version_pragma   | 0x6200..0x6210   | R227.M6   | landed |
+| version_pragma-M6.1+ | 0x6211..0x62FF | R227.M6.1+ | reserved |
+| proptest_hm      | 0x6100..0x6115   | R225.M9   | landed |
+| proptest_hm-M9.1+ | 0x6116..0x61FF  | R225.M9.1+ | reserved |
 
 Codes live in the parser-tier packed-status range (0x2700..0x2EFF
 slice). Disjoint from every user-space `0xFFFFExxx` error band in

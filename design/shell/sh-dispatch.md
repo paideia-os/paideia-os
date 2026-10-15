@@ -1,15 +1,23 @@
-# `/bin/sh` front-end dispatcher — R222.M7 (paideia-os#2664)
+# `/bin/sh` front-end dispatcher — R222.M7 (paideia-os#2664) +
+# R229.M11 default-flip (paideia-os#2729, umbrella #2493)
 
-**Status.** Accepted. User-space binary + build alias landed at R222.M7
-(stub body for the semantic path, every mode falls through to the legacy
-shell). Kernel-side swap of the `/bin/sh` and `/bin/legacy-sh` tmpfs
-seeds, and the real semantic-shell body, deferred to the R229-close
-landing cited at §SECTION 4.
+**Status.** Accepted. User-space binary + build alias landed at R222.M7.
+Default-routing flip from legacy to semantic landed at R229.M11
+(paideia-os#2729) under umbrella #2493: the semantic path is now the
+default routing target for an unset / unknown / missing-envp invocation;
+`PDX_SHELL_MODE=legacy` is now the explicit opt-out. The semantic path
+is still stubbed at M11 (every invocation still ends in the legacy
+shell via the stub's tail-call), so the user-visible behavior remains
+stable; what changed is which fingerprint sequence the DEFAULT path
+emits. The real semantic-shell body replaces the stub in a sibling
+landing per `legacy-shell-retirement.md`.
 
-**Umbrella.** paideia-os#2486 — R222..R229 shell-replacement roadmap.
-This milestone (M7) wires the gate; a sibling milestone replaces the
-stub with the real semantic shell; the umbrella's R229 close flips the
-default.
+**Umbrella.** paideia-os#2486 — R222..R229 shell-replacement roadmap
+(M7 gate wiring). paideia-os#2493 — R229 legacy-retirement umbrella
+(M11 default-flip + alias deprecation window). This file retains both
+milestone's rationale: M7 remains the gate's architecture; M11 edits
+only `_sd_route`'s match target and jump polarity. See §SECTION 2 for
+the active routing table and §SECTION 4 for the full landing timeline.
 
 **Scope.** Keep the current POSIX-shaped `src/user/shell.pdx` alive
 under an alias (`legacy-sh`) for the duration of R222..R229 so every
@@ -71,18 +79,36 @@ Not taking this surface would mean:
 
 `PDX_SHELL_MODE` is an envp variable the parent (shell, init, or any
 caller of `/bin/sh`) sets. The dispatcher reads it once at `_start` and
-routes exactly once:
+routes exactly once.
+
+### 2.a Active table at R229.M11 (post-flip, paideia-os#2729)
 
 | Value             | Route                                       | Rationale                                                      |
 | ----------------- | ------------------------------------------- | -------------------------------------------------------------- |
-| `semantic`        | `_sd_semantic_stub` -> legacy fallback      | M7 stub; real semantic shell replaces this at a sibling wave.  |
-| `legacy`          | `_sd_legacy_fallback`                       | Explicit opt-in to the legacy shell. Documented, same code path as the unset default. |
-| unset / missing   | `_sd_legacy_fallback`                       | Default is legacy throughout R222..R229 to preserve every existing workflow. |
-| anything else     | `_sd_legacy_fallback`                       | Conservative: unknown modes do NOT fail the invocation; they fall through to legacy. |
-| envp == NULL      | `_sd_legacy_fallback`                       | Pre-execve-abi.md call sites that still pass envp=NULL get legacy. |
+| `semantic`        | `_sd_semantic_stub` -> legacy fallback      | Symmetric opt-in. Takes the same code path as the unset default (both land on the semantic stub). Retained so a smoke can grep rodata to confirm the literal is wired; a future landing may distinguish "user asked for semantic" from "default fall-through" without touching this table. |
+| `legacy`          | `_sd_legacy_fallback`                       | Explicit opt-OUT of the new semantic default. Keeps the retiring shell reachable for the one-release-cycle grace window per `legacy-shell-retirement.md` §5. |
+| unset / missing   | `_sd_semantic_stub` -> legacy fallback      | **NEW DEFAULT at R229.M11.** Semantic path is the default; still stubbed, so still falls through to legacy via the stub's tail-call. When the real semantic entry replaces the stub, this row flips to the real semantic shell with no edit to the table. |
+| anything else     | `_sd_semantic_stub` -> legacy fallback      | Conservative: unknown values take the new default rather than the retiring shell. A typo like `PDX_SHELL_MODE=sematic` must NOT silently keep the user on legacy. |
+| envp == NULL      | `_sd_semantic_stub` -> legacy fallback      | Legacy call sites still passing envp=NULL now take the new default. |
 
-At R229 close one line in this table changes: the "unset / missing"
-row routes to the real semantic path.
+### 2.b Historical table at R222.M7 (pre-flip, paideia-os#2664)
+
+Preserved for reviewers walking the git history; the R222.M7 build
+emitted this exact routing table.
+
+| Value             | Route                                       | Rationale (M7 only)                                             |
+| ----------------- | ------------------------------------------- | --------------------------------------------------------------- |
+| `semantic`        | `_sd_semantic_stub` -> legacy fallback      | M7 stub; real semantic shell replaces this at a sibling wave.   |
+| `legacy`          | `_sd_legacy_fallback`                       | Explicit opt-in to the legacy shell. Same code path as default. |
+| unset / missing   | `_sd_legacy_fallback`                       | Default was legacy throughout R222..R228 to preserve workflows. |
+| anything else     | `_sd_legacy_fallback`                       | Conservative: unknown modes fell through to legacy.             |
+| envp == NULL      | `_sd_legacy_fallback`                       | Pre-execve-abi.md call sites that still passed envp=NULL.       |
+
+The R229.M11 landing is exactly the one-line table edit the M7 doc
+anticipated: match target `sd_semantic_val` -> `sd_legacy_val`, match
+length constant 9 -> 7, jump polarity inverted at the match/miss sites.
+Every other invariant (gate wiring, alias discipline, encoder discipline,
+register plan) is byte-identical across the flip.
 
 ### 2.1 Byte-level match discipline
 
@@ -95,23 +121,30 @@ tree uses for env-key matches (`shell.pdx` `shell_home_scan` for
   codebase).
 - 15-byte prefix compare against `"PDX_SHELL_MODE="` (no NUL on the
   wire).
-- 9-byte value compare against `"semantic\0"` including the trailing
-  NUL. A value of `semantic-foo` matches the first 8 bytes but diverges
-  at byte 8 (`-` vs NUL) and falls through to legacy -- *not* to
-  semantic -- so partial prefixes do not accidentally opt into the
-  semantic path.
+- **R229.M11 active:** 7-byte value compare against `"legacy\0"`
+  including the trailing NUL. A value of `legacy-foo` matches the first
+  6 bytes but diverges at byte 6 (`-` vs NUL) and falls through to the
+  semantic stub -- *not* to the explicit legacy path -- so partial
+  prefixes do not accidentally opt out of the new default.
+- **R222.M7 (historical):** was a 9-byte value compare against
+  `"semantic\0"`; the match target and length constant inverted at
+  R229.M11 per paideia-os#2729.
 
-### 2.2 Why the `legacy` literal is in rodata but unmatched at M7
+### 2.2 Why the `semantic` literal is in rodata but unmatched at R229.M11
 
-`sd_legacy_val` ("legacy\0") ships in rodata and is grep-able but is
-not matched against anywhere today -- the fall-through branch covers it.
-The literal is here for two reasons:
+`sd_semantic_val` ("semantic\0") ships in rodata and is grep-able but
+is not actively matched against anywhere today -- the fall-through
+branch covers it. The literal is here for two reasons (same two reasons
+`sd_legacy_val` held the symmetric role at M7):
 
-1. **Documentation.** A future reader can `grep legacy src/user/sh_dispatch.pdx`
-   and find the symmetric opt-in next to the semantic opt-in.
-2. **Smoke anchor.** A boot smoke that greps the rodata of the shipped
-   ELF can confirm the explicit-legacy literal is wired (useful once
-   `legacy` becomes an opt-OUT of the new semantic default at R229+).
+1. **Documentation.** A future reader can `grep semantic src/user/sh_dispatch.pdx`
+   and find the symmetric opt-in next to the explicit legacy opt-out.
+2. **Smoke anchor + future distinguishability.** A boot smoke that
+   greps the rodata of the shipped ELF can confirm the explicit-semantic
+   literal is wired. More importantly: once the real semantic shell
+   lands, a future landing may want to distinguish "user explicitly
+   asked for the real semantic shell" from "the user hit the default
+   fall-through"; the compare constant is already here for that landing.
 
 ---
 
@@ -161,40 +194,56 @@ See §SECTION 4 for the full staged swap.
 
 ---
 
-## 4. R229-close swap plan
+## 4. Landing timeline
 
-The umbrella #2486 names R229 as the point at which the semantic shell
-becomes the default. The sequencing of landings between M7 and R229 is:
+The umbrella #2486 named R229 as the point at which the semantic shell
+becomes the default; umbrella #2493 scheduled the retirement sequence.
+The actual landings:
 
-| Milestone | Landing                                                            | Blocker                      |
-| --------- | ------------------------------------------------------------------ | ---------------------------- |
-| M7 (this) | `sh_dispatch.elf` builds, `legacy-sh.elf` alias ships              | --                           |
-| M7-cont   | `bin_seeds.pdx` seeds `/bin/legacy-sh = shell.elf`                 | M7                           |
-| M7-cont   | `bin_seeds.pdx` swaps `/bin/sh = sh_dispatch.elf`                  | M7-cont /legacy-sh seed      |
-| M8..R228  | Real semantic-shell body replaces `_sd_semantic_stub` body         | Semantic shell dependencies  |
-| R229-close| Table in §2 edit: "unset / missing" routes to semantic             | Semantic shell soak-tested   |
+| Milestone  | Landing                                                             | Status                               |
+| ---------- | ------------------------------------------------------------------- | ------------------------------------ |
+| M7         | `sh_dispatch.elf` builds, `legacy-sh.elf` alias ships               | Landed (paideia-os#2664)             |
+| M7-cont    | `bin_seeds.pdx` seeds `/bin/legacy-sh = shell.elf`                  | Landed                               |
+| M7-cont    | `bin_seeds.pdx` swaps `/bin/sh = sh_dispatch.elf`                   | Landed                               |
+| M8..R228   | Real semantic-shell body replaces `_sd_semantic_stub` body          | Progressive wave work                |
+| **R229.M11** | **Table in §2 flipped: "unset / missing" routes to semantic**     | **Landed (paideia-os#2729) — this**  |
+| Post-R229  | `legacy-sh` alias retired from tools/build-user.sh after grace window | Deferred per `legacy-shell-retirement.md` §5 |
 
-At every intermediate milestone the invariant is: `PDX_SHELL_MODE=legacy`
-reaches the legacy shell unchanged, and `PDX_SHELL_MODE=semantic` reaches
-the stub (M7..M7-cont) or the real semantic shell (M8+). The default (no
-`PDX_SHELL_MODE`) stays legacy until R229 close.
+At every intermediate milestone the invariant was: `PDX_SHELL_MODE=legacy`
+reached the legacy shell unchanged (M7 onward), and `PDX_SHELL_MODE=semantic`
+reached the stub (M7..M11) or the real semantic shell (post-M11 whenever
+the stub body is replaced). The default (no `PDX_SHELL_MODE`) stayed
+legacy from R222.M7 through R229.M10 and flipped to the semantic path
+at R229.M11.
 
 ### 4.1 Rollback story
 
-If any milestone exposes a dispatcher bug, the kernel-side rollback is a
-one-line edit in `bin_seeds.pdx`:
+Two independent rollback surfaces, one per flip:
+
+**R229.M11 default-flip rollback (user-space).** If the semantic-stub
+default surfaces a bug (e.g. the stub's "not yet available" marker
+breaks a downstream smoke that was depending on the legacy start
+fingerprint arriving before any other output), the rollback is a two-
+line revert inside `_sd_route` in `src/user/sh_dispatch.pdx`: restore
+the match target to `sd_semantic_val` and the match-length constant
+to 9. Every other invariant stays identical. See §SECTION 2.b for the
+exact routing table the revert restores.
+
+**M7-cont kernel-side rollback.** If `sh_dispatch.elf` itself surfaces
+a bug (e.g. a seg-fault in `_start` before `_sd_route`), the kernel-
+side rollback is a one-line edit in `bin_seeds.pdx`:
 
 ```
 # Before (M7-cont and later):
 #   bin_sh_seed_source: &_sh_dispatch_bin_start / _sh_dispatch_bin_end
-# Rollback (back to M7):
+# Rollback (back to pre-M7-cont):
 #   bin_sh_seed_source: &_shell_bin_start / _shell_bin_end
 ```
 
 The dispatcher binary stays on disk; only the kernel-side seed pointer
-flips back. No user-space edit is required for rollback, which is the
-point of keeping the dispatcher and the legacy shell as two separate
-ELFs through the whole wave.
+flips back. No user-space edit is required for this rollback, which is
+the point of keeping the dispatcher and the legacy shell as two separate
+ELFs across every milestone of the retirement wave.
 
 ---
 
@@ -240,12 +289,12 @@ Every marker rides `sys_debug_puts` (SC+ ID 12) rather than `sys_write`
 so it lands on serial regardless of whether the shell has wired stdout
 yet. Lowercase per the tree's §SKIP fingerprint discipline.
 
-| Marker                                             | Who emits it                     | When                                     |
-| -------------------------------------------------- | -------------------------------- | ---------------------------------------- |
-| `SH DISPATCH START`                                | `_start`                         | Every dispatcher invocation.             |
-| `sh dispatch mode=legacy`                          | `_sd_legacy_fallback`            | Legacy route decided (either explicit `legacy`, unset, or semantic-stub fall-through). |
-| `sh dispatch mode=semantic (stub)`                 | `_sd_semantic_stub`              | Semantic route decided (stub body only). |
-| `sh dispatch semantic shell not yet available`     | `_sd_semantic_stub`              | Right before stub tails to legacy.       |
+| Marker                                             | Who emits it                     | When (R229.M11)                           |
+| -------------------------------------------------- | -------------------------------- | ----------------------------------------- |
+| `SH DISPATCH START`                                | `_start`                         | Every dispatcher invocation.              |
+| `sh dispatch mode=legacy`                          | `_sd_legacy_fallback`            | Legacy route decided (either explicit `PDX_SHELL_MODE=legacy`, OR semantic-stub fall-through after the stub emits its own markers). The "unset-defaults-to-legacy" cause from the M7 table is GONE at R229.M11 — unset now routes to semantic. |
+| `sh dispatch mode=semantic (stub)`                 | `_sd_semantic_stub`              | Semantic route decided — the DEFAULT at R229.M11 (unset / unknown / semantic / envp==NULL all land here). Stub body only; real semantic shell replaces the body in a sibling landing. |
+| `sh dispatch semantic shell not yet available`     | `_sd_semantic_stub`              | Right before stub tails to legacy.        |
 | `sh dispatch: execve legacy-sh failed`             | `_sd_legacy_fallback`            | `sys_execve` returned (image not seeded or kernel-side refusal). |
 
 The uppercase `SH DISPATCH START` matches the shell's own
@@ -307,48 +356,61 @@ own 3 pushes return to `%16 == 0`, and SYSCALL does not care.
 
 ---
 
-## 9. Acceptance (quoting #2664)
+## 9. Acceptance
+
+### 9.a R222.M7 acceptance (quoting #2664)
 
 > Both shells bootable side by side; smoke test runs
 > `PDX_SHELL_MODE=legacy /bin/sh -c 'ls'` and
 > `PDX_SHELL_MODE=semantic /bin/sh -c 'ls'` -- both succeed.
 
-At M7 the AC is partially satisfiable:
+At M7 this was partially satisfiable (full AC land at M7-cont + the
+semantic-shell sibling milestone). See the git history for the per-
+mode breakdown; at R229.M11 it is fully satisfiable because the
+kernel-side swap has long since landed.
 
-- **`PDX_SHELL_MODE=legacy /bin/sh`**: the dispatcher routes to legacy
-  via `_sd_legacy_fallback` and `sys_execve('/bin/legacy-sh', ...)`. The
-  AC succeeds once M7-cont seeds `/bin/legacy-sh` and swaps `/bin/sh`.
-  Until then the dispatcher binary exists on disk but is not mounted at
-  `/bin/sh`, so `/bin/sh` continues to be the legacy shell verbatim and
-  the AC is trivially met for the legacy mode (unchanged behavior).
-- **`PDX_SHELL_MODE=semantic /bin/sh`**: at M7 this is identical to the
-  legacy case because the stub body falls through. The semantic-shell
-  marker IS emitted (fingerprint anchor), proving the gate decoded the
-  env var. Full AC lands with the real semantic body at the sibling
-  milestone named in §SECTION 4.
-- **`-c 'ls'`**: both shells today ignore argv past argv[0]; the AC's
-  `-c` syntax is aspirational per the umbrella #2486 roadmap and lands
-  at a future milestone that wires it on both sides without touching
-  the dispatch gate.
+### 9.b R229.M11 acceptance (quoting #2729)
 
-The two boot smokes `tests/boot_smokes/boot_sh_dispatch_legacy.pdx` and
-`tests/boot_smokes/boot_sh_dispatch_semantic_stub.pdx` are shape stubs
-at M7 declaring the fingerprint sequence the full-AC run will assert
-once the kernel-side swap lands.
+> Boot smoke: `/bin/sh` is semantic; `legacy-sh` still works.
+
+At R229.M11 the AC fully lands:
+
+- **`/bin/sh` with no `PDX_SHELL_MODE` set**: the dispatcher routes to
+  the semantic stub via `_sd_semantic_stub`, which emits
+  `sh dispatch mode=semantic (stub)` and
+  `sh dispatch semantic shell not yet available` and then tail-calls
+  `_sd_legacy_fallback`. The legacy shell then runs the user's command
+  (the stub body is still a fall-through at M11). Exit 0 on clean
+  termination.
+- **`/bin/legacy-sh` (direct invocation)**: unchanged. The hard-linked
+  alias still points at `shell.elf`; the legacy shell boots verbatim.
+- **`PDX_SHELL_MODE=legacy /bin/sh`**: `_sd_route` matches the "legacy\0"
+  value and routes to `_sd_legacy_fallback` directly, skipping the stub
+  markers. The legacy shell boots as before.
+
+The boot smoke `tests/boot_smokes/boot_sh_dispatch_flip.pdx` asserts
+the R229.M11 fingerprint sequence for the unset-envp default path. The
+pre-flip smokes
+(`boot_sh_dispatch_legacy.pdx` and `boot_sh_dispatch_semantic_stub.pdx`)
+remain valid under the explicit-opt-out and explicit-opt-in forms.
 
 ---
 
 ## 10. References
 
 - Design doc: `design/shell/sh-dispatch.md` (this document).
+- R229.M11 retirement doc: `design/shell/legacy-shell-retirement.md`.
 - Source: `src/user/sh_dispatch.pdx`, `src/user/sh_dispatch.ld`.
 - Build: `tools/build-user.sh` SH_DISPATCH + ALIAS blocks.
 - Smokes: `tests/boot_smokes/boot_sh_dispatch_legacy.pdx`,
-  `tests/boot_smokes/boot_sh_dispatch_semantic_stub.pdx`.
+  `tests/boot_smokes/boot_sh_dispatch_semantic_stub.pdx`,
+  `tests/boot_smokes/boot_sh_dispatch_flip.pdx` (R229.M11).
 - Upstream envp ABI: `design/user/execve-abi.md`.
 - Prior art for envp scan: `src/user/shell.pdx` `shell_home_scan`
   (`HOME=`), `src/user/dispatch.pdx` `dispatch_find_path_env`
   (`PATH=`).
 - Prior art for self-contained one-file-one-ELF binaries:
   `src/user/true.pdx`, `src/user/cat.pdx`, `src/user/run.pdx`.
-- Umbrella: paideia-os#2486, this ticket: paideia-os#2664.
+- Umbrellas: paideia-os#2486 (M7 gate wiring), paideia-os#2493
+  (M11 legacy-retirement). Tickets: paideia-os#2664 (M7),
+  paideia-os#2729 (M11).
