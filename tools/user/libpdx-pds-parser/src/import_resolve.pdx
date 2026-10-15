@@ -1,0 +1,1739 @@
+// src/import_resolve.pdx -- libpdx-pds-parser.R227.M3 (paideia-os#2705)
+//
+// ImportResolve: parser-tier `#import "path" as name` directive parser,
+// project / system path resolver, module dependency graph builder, and
+// DFS cycle detector. Mirrors the kernel-side R133.M3
+// (`src/kernel/core/pds/import_graph.pdx`) traversal discipline at the
+// PARSER tier -- R133.M3 operates on an already-materialised adjacency
+// table AFTER the loader has walked the `.pds` container; THIS module
+// operates on the SOURCE-BYTE side, extracting `#import` directives
+// from pds-lang source text, resolving the quoted path against the
+// project / system paths, and building the adjacency itself.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// R227 is the pds container / loader umbrella (paideia-os#2491). R227.M1
+// (header pragmas) landed Wave 112 at the kernel tier; R227.M2 (cap-decl
+// checker) landed Wave 115 at the kernel tier. R227.M3 (THIS module)
+// lands the parser-tier HALF of the import-graph machinery: a
+// self-contained primitive the shell / REPL / loader can call to
+//
+//   (1) parse one `#import "path" as name` directive into a 48-byte
+//       ImportDirective record;
+//   (2) resolve the quoted path against the project directory (the
+//       directory of the module FILE whose text we are parsing) and the
+//       system directory (the standard library location); report
+//       E1101_RESOLVE_FAILED if neither branch produces a file;
+//       E1103_PATH_TRAVERSAL if the resolved path escapes both roots
+//       (any `..` component with no matching descent);
+//   (3) build the module-dependency graph: each directive emits one
+//       outgoing edge from the CURRENT module index to the resolved
+//       module index; duplicate `as name` within one source causes
+//       E1102_DUPLICATE_NAME;
+//   (4) detect cycles via iterative three-colour DFS (same shape as
+//       R133.M3 kernel-side ImportGraph) and surface the cycle via
+//       E1100_IMPORT_CYCLE packed with the DFS stack depth upper
+//       bound.
+//
+// The kernel-side R133.M3 pds-loader will CONSUME the output of this
+// module once the loader has been elaborated to walk SOURCE text (R131
+// present-pass is byte-dispatch over `.pds` container TEXT sections).
+// The two halves share the shape of the colour-DFS algorithm but
+// touch disjoint `.bss` -- R133.M3 lives in the kernel (adjacency
+// supplied by the loader), R227.M3 lives in user-space (adjacency
+// built by the parser).
+//
+// =============================================================================
+// GRAMMAR
+// =============================================================================
+//
+//   ImportDirective := '#import' WS+ '"' Path '"' WS+ 'as' WS+ Name
+//   WS              := 0x20 | 0x09 | 0x0A | 0x0D
+//   Path            := ( '/'? [A-Za-z0-9._-/] )+   byte length 1..256
+//                     (interior '..' allowed; validated at RESOLVE time
+//                      against the project + system roots)
+//   Name            := [A-Za-z_] [A-Za-z0-9_]*     byte length 1..16
+//
+// Semantics:
+//
+//   * `#import "foo/bar.pdx" as bar`
+//        -> resolve "foo/bar.pdx" against project root (iff path does
+//           not begin with '/') OR system root (iff path begins with
+//           '/'); emit edge (current_module, resolved_module); bind
+//           `bar` to the resolved module in the per-source name table.
+//
+//   * `#import "lib/x.pdx" as x` followed by `#import "lib/y.pdx" as x`
+//        -> second emits E1102_DUPLICATE_NAME.
+//
+//   * `#import "../../etc/passwd" as pwd`
+//        -> path traversal escapes BOTH roots -> E1103_PATH_TRAVERSAL.
+//
+//   * directive produces an edge to a module that transitively edges
+//     back to the current module -> E1100_IMPORT_CYCLE on the
+//     cycle-detection pass.
+//
+// =============================================================================
+// IMPORTDIRECTIVE RECORD (48 bytes)
+// =============================================================================
+//
+//   offset  size  field
+//   ------  ----  -----------------------------------------------------
+//     0      4   magic           u32   'IMPT' LE (0x54504D49)
+//     4      4   flags           u32   bit 0 = IR_FLAG_SYSTEM_PATH
+//                                      (set iff path begins with '/',
+//                                      resolved against system root);
+//                                      bit 1 = IR_FLAG_RESOLVED
+//                                      (set iff resolution succeeded);
+//                                      bit 2 = IR_FLAG_CYCLE_SRC
+//                                      (set by _ir_detect_cycle on the
+//                                      directive the back-edge was
+//                                      observed through);
+//                                      bits 3..31 reserved, zero at M3.
+//     8      8   path_hash       u64   FNV-1a 64 of resolved path
+//                                      bytes.  Zero before resolve;
+//                                      written by _ir_resolve_path.
+//    16     16   name_inline     [u8;16] -- `as <name>`, zero-padded.
+//    32     16   path_prefix     [u8;16] -- first 16 bytes of the
+//                                      resolved path, zero-padded.
+//
+//   total: 48 B (IR_RECORD_BYTES)
+//
+// Rationale:
+//
+//   * Stride is 48 B, mirroring R133.M3 adjacency row stride; a
+//     dispatcher indexing an array of ImportDirective records multiplies
+//     via `shl rN, 5` (* 32) + `shl rM, 4` (* 16) + `add rN, rM`
+//     (i*32 + i*16 = i*48) -- no 2-op `imul r, imm` (per
+//     feedback_pdx_encoder_pitfalls).
+//   * Magic 'IMPT' = 0x54504D49 LE reads as the 4-byte ASCII string
+//     "IMPT" in a hex-dump sequential scan (byte sequence 49 4D 50 54).
+//   * The 16-byte inline capacity for `name` matches the Name grammar
+//     ceiling and the DescribeSig / HostnameAnnot inline-ident
+//     precedent (hostname, directive name, schema tag).
+//   * The 16-byte path_prefix is a diagnostic affordance -- a cycle
+//     error reporter can render `..#import "foo/..." as bar` without
+//     re-reading the full path. Full path is reproducible by the
+//     caller via the hash; downstream code that NEEDS the full path
+//     bytes keeps them in a separate parser-managed pool.
+//
+// =============================================================================
+// PUBLIC API
+// =============================================================================
+//
+//   _ir_init() -> ()
+//     Idempotent lazy boot hook. Scrubs `_ir_import_count` to 0.
+//     Byte pool `_ir_imports[64 * 48]` is zero-initialised by `.bss`.
+//
+//   _ir_parse_directive(bytes, bytes_len, out, out_cap) -> packed_u64
+//     Parse one `#import "path" as name` directive out of the leading
+//     bytes of a source byte run. Writes one 48-byte ImportDirective
+//     record. Returns `(bytes_consumed << 32) | status`.
+//
+//   _ir_resolve_path(path_bytes, path_len, out_resolved, out_cap)
+//                                                   -> packed_u64
+//     Resolve a path (bytes supplied directly, independent of a parsed
+//     directive) against the project + system roots. Writes the
+//     resolved absolute path into [out_resolved, out_resolved + N).
+//     Returns `(resolved_len << 32) | status`.
+//
+//   _ir_build_graph(directives, n_directives, out_graph, out_cap)
+//                                                   -> packed_u64
+//     Consume an array of n_directives ImportDirective records (48-byte
+//     stride) and populate an adjacency table at out_graph with the
+//     same row shape R133.M3 expects (36-byte stride: u32 n_imports +
+//     [u32; 8] imports). Returns `(n_rows << 32) | status`.
+//
+//   _ir_detect_cycle(graph, graph_len, out_cycle_path, out_cap)
+//                                                   -> packed_u64
+//     Run the three-colour iterative DFS over a 36-byte-stride
+//     adjacency table (as emitted by _ir_build_graph OR as supplied
+//     directly by a caller that mirrors the shape). Returns the
+//     dependency-ordered post-order OR an E1100_IMPORT_CYCLE on
+//     back-edge.
+//
+// Register maps (SysV):
+//   _ir_init()                                           -> ()
+//   _ir_parse_directive(rdi, rsi, rdx, rcx)              -> rax
+//   _ir_resolve_path(rdi, rsi, rdx, rcx)                 -> rax
+//   _ir_build_graph(rdi, rsi, rdx, rcx)                  -> rax
+//   _ir_detect_cycle(rdi, rsi, rdx, rcx)                 -> rax
+//
+// =============================================================================
+// STATUS BAND -- 0x5900..0x59FF
+// =============================================================================
+//
+//   IR_OK                       = 0
+//   IR_ERR_SYNTAX               = 0x5900   malformed directive bytes
+//   IR_ERR_PATH_TOO_LONG        = 0x5901   path > IR_PATH_MAX (256)
+//   IR_ERR_NAME_TOO_LONG        = 0x5902   name > IR_NAME_MAX (16)
+//   IR_ERR_OUT_TOO_SMALL        = 0x5903   out == 0 or out_cap < 48
+//                                           / < 36 / < required bytes
+//   IR_ERR_BAD_RECORD           = 0x5904   magic mismatch on consumed
+//                                           ImportDirective record
+//   IR_ERR_TOO_MANY_IMPORTS     = 0x5905   graph row n_imports >
+//                                           IR_MAX_IMPORTS (8)
+//   IR_ERR_TOO_MANY_MODULES     = 0x5906   n_directives > IR_MAX_NODES
+//                                           (64)
+//   E1100_IMPORT_CYCLE          = 0x5910   cycle observed at DFS
+//                                           back-edge; packed stack
+//                                           depth in high 32 bits
+//   E1101_RESOLVE_FAILED        = 0x5911   neither project nor system
+//                                           root resolves the path
+//   E1102_DUPLICATE_NAME        = 0x5912   `as name` collision within
+//                                           the per-source name table
+//   E1103_PATH_TRAVERSAL        = 0x5913   `..` escapes both roots
+//
+// Slots 0x5907..0x590F reserved for M3.1+ parse / resolve diagnostics
+// (nested quote inside path, UTF-8 non-ASCII rejection, syscall-side
+// stat-fault surfacing, canonicalisation drift). Slots 0x5914..0x59FF
+// reserved for M3.2+ graph / cycle diagnostics (per-edge annotation
+// faults, module-count overflow across concurrent sources, intern-table
+// collisions for the per-source name table).
+//
+// The 0x5900..0x59FF carve-out skips the 0x5800..0x58FF reservation
+// (parallel R225.M6 arm) and sits above the 0x5700..0x57FF R229.M7
+// ViMode band -- a downstream compound-error dispatcher can
+// discriminate "the import-resolution substrate faulted" from every
+// other satellite's failure modes via `shr r, 8; cmp r, 0x59`.
+// Disjoint from every other parser-tier packed-status range.
+//
+// Grep confirmation at R227.M3 landing time:
+//   grep -rE '0x59(0[0-6]|1[0-3])\b' paideia-os/{src,tools,design,tests}
+//     -> no packed-status hits outside this file + caps.decl +
+//        design/shell/import-resolution-parser.md.
+//
+// =============================================================================
+// paideia-as ENCODER DISCIPLINE (ABSOLUTE)
+// =============================================================================
+//
+//   - No `test rN, rN` -- every zero-check is `cmp reg, 0; je/jne`.
+//   - No `and rN, imm64` -- the IR_FLAG_* mask uses imm8 (`and rax, 1`,
+//     `and rax, 2`, `and rax, 4`); precedent dispatch_mode.pdx L422
+//     imm8 variant.
+//   - No 2-op `imul rN, imm` -- the 48-byte stride is computed as
+//     `shl rN, 5` (* 32) + `shl rM, 4` (* 16) + `add rN, rM`
+//     (i*32 + i*16 = i*48); the 36-byte stride is computed as
+//     `shl rN, 5` (* 32) + `shl rM, 2` (* 4) + `add rN, rM`
+//     (i*32 + i*4 = i*36), mirroring R133.M3 ImportGraph discipline.
+//   - FNV constants 0xCBF29CE484222325 (offset basis) and 0x100000001B3
+//     (prime) are > imm32, so they load via `mov rN, imm64` (MOVABS).
+//     The 'IMPT' magic (0x54504D49) fits in imm32 with bit 31 clear.
+//     Precedent for FNV-1a 64 inline: history.pdx L727-728,
+//     hostname_annot.pdx L607-608.
+//   - No multiline `pub let = "..."` -- single-line justifications.
+//   - Module basename `ImportResolve` matches `import_resolve.pdx`.
+//   - Labels prefixed `ir_` -- disjoint from every prior parser-tier
+//     label prefix (u8n_, gi_, wp_, sch_sig_, cmd_sig_, fi_, afs_,
+//     pl_, pl_lam_, rp_, ll_, cc_, er_, cr_, cmdreg_, hm_, rt_, dl_,
+//     se_, te_, cl_, dm_, fo_, sgr_, jc_, fh_, ast_, sm_, lex_, eu_,
+//     h_, ds_, ha_, ws_, le_, vi_, lp_, st_). Also disjoint from the
+//     kernel-side `ig_` prefix used by R133.M3 import_graph.pdx.
+//     Never bare `loop` / `if` / `let` / `fn` / `ret` (per
+//     reference_paideia_as_reserved_labels).
+//   - All `cmp reg, imm` immediates (ASCII literals 0x09, 0x0A, 0x0D,
+//     0x20, 0x22, 0x23, 0x2D, 0x2E, 0x2F, 0x30..0x39, 0x41..0x5A,
+//     0x5F, 0x61..0x7A, directive bytes 'i', 'm', 'p', 'o', 'r', 't',
+//     'a', 's', IR_* constants 16, 32, 36, 48, 64, 256, status codes
+//     0x5900..0x5913, magic 0x54504D49) fit imm32 with bit 31 clear
+//     so direct cmp-imm32 is sign-extension-safe.
+//   - Byte loads via `xor rN, rN; mov_b rN, [base + idx * 1]` with
+//     explicit *1 scale.
+//   - Byte stores via `mov_b [dst + disp], reg` or precomputed
+//     `mov r9, base; add r9, idx; mov_b [r9 + 0], reg` to sidestep the
+//     three-term addressing encoder gap.
+//   - u32 stores via `mov_d [dst + disp], reg`.
+//   - u64 stores via plain `mov [dst + disp], reg`.
+//   - No chained-displacement addressing with three terms: all
+//     [base + off + idx] expressions precomputed via `add` first.
+//
+// =============================================================================
+// REGISTER-LIVENESS DISCIPLINE
+// =============================================================================
+//
+//   * `_ir_init`: 1-push callee-save (rbx = write pointer for the
+//     scalar reset) is not needed because the single scalar reset is
+//     a `lea r11, [rip + _ir_import_count]; mov [r11], rax` sequence.
+//     Pure leaf; zero pushes; bare `ret`.
+//
+//   * `_ir_parse_directive`: 6-push callee-save frame (rbx, rbp, r12,
+//     r13, r14, r15 = 48 bytes). Pure leaf (no nested CALL, FNV
+//     inlined). Register plan:
+//       rbx = bytes_ptr        (held through name + path copy + FNV)
+//       rbp = bytes_len
+//       r12 = out              (held through zero-fill + inline copy)
+//       r13 = cursor into bytes
+//       r14 = scan_start       (per-token start offset)
+//       r15 = token_len        (per-token length)
+//     Scratch: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11.
+//
+//   * `_ir_resolve_path`: 4-push callee-save frame (rbx, rbp, r12,
+//     r13). Pure leaf (FNV inlined). Register plan:
+//       rbx = path_bytes
+//       rbp = path_len
+//       r12 = out_resolved
+//       r13 = write cursor into out_resolved
+//     Scratch: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11.
+//
+//   * `_ir_build_graph`: 5-push callee-save frame (rbx, rbp, r12, r13,
+//     r14). Pure leaf. Register plan:
+//       rbx = directives_ptr
+//       rbp = n_directives
+//       r12 = out_graph
+//       r13 = outer loop i (producer module index)
+//       r14 = row base pointer into out_graph
+//     Scratch: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11.
+//
+//   * `_ir_detect_cycle`: 6-push callee-save frame (rbx, rbp, r12, r13,
+//     r14, r15 = 48 bytes) + sub rsp, 16 for start_i spill. Pure leaf
+//     (no nested CALL). Register plan:
+//       rbx = graph_ptr
+//       rbp = graph_len (n_nodes)
+//       r12 = out_cycle_path
+//       r13 = out_cap
+//       r14 = stk_bytes (0 = empty, +16 per push, -16 per pop)
+//       r15 = write_cursor (count of u32 words emitted to out)
+//     Scratch: rax, rcx, rdx, rsi, rdi, r8, r9, r10, r11.
+//
+// =============================================================================
+// LAZY-INIT DISCIPLINE
+// =============================================================================
+//
+// R227.M3 holds TWO .bss singletons: `_ir_imports[64 * 48]` (3072 B;
+// per-source directive pool) and `_ir_import_count` (u64 count scalar).
+// `.bss` zero-init at cold boot gives every byte / scalar 0. `_ir_init`
+// is a defensive scrub of the scalar only (the byte pool's "allocated"
+// prefix is implicitly bounded by `_ir_import_count`, so stale bytes
+// past the live prefix are harmless). Precedent: `_h_init`, `_le_init`,
+// `_vi_init` -- defensive scrub even when `.bss` cold-boot already
+// satisfies the state.
+//
+// =============================================================================
+// INTERACTIONS
+// =============================================================================
+//
+//   R133.M3 (kernel-side pds-loader ImportGraph)  --  the kernel-tier
+//     ImportGraph consumes an adjacency table built by this module.
+//     Row shape is byte-identical: u32 n_imports + [u32; 8] imports,
+//     36-byte stride. The kernel-side cycle detector is RE-RUN after
+//     the parser-tier cycle check as a defensive guard against a
+//     caller-constructed graph with a cycle not caught at this tier
+//     (e.g., a dynamic-load scenario where modules are added
+//     incrementally). The two detectors agree on cycle shape.
+//
+//   R227.M1 (kernel pds header pragmas)  --  the containing `.pds`
+//     container reader walks the TEXT section and feeds its bytes to
+//     THIS module one `#import` directive at a time.
+//
+//   R227.M2 (kernel pds cap-decl checker)  --  runs BEFORE the loader
+//     invokes the import graph; a container that fails cap-decl check
+//     is never admitted to the import-resolution pass.
+//
+//   R221.M1 (Utf8Nfc)  --  R227.M3 operates on ALREADY-NORMALISED NFC
+//     bytes; the caller walks text through Utf8Nfc first and hands the
+//     normalised bytes to _ir_parse_directive. ASCII-only grammar is
+//     reasonable because `#import` directive bytes are all ASCII (the
+//     path AND name are ASCII-identifier-shaped by grammar).
+//
+//   R221.M6 (SpanMap)  --  diagnostic error reporting at the directive
+//     level consults SpanMap for the original source-byte offsets of
+//     the directive run. R227.M3 does not call SpanMap directly; the
+//     caller carries the directive's src_offset for the diagnostic.
+//
+// =============================================================================
+// FORWARD PATH
+// =============================================================================
+//
+//   R227.M3.1  Non-ASCII path support: UTF-8 identifier bytes in path
+//              (per PRECIS-FreeformClass + PDS-O1 import-UTF8 allowance).
+//   R227.M3.2  Interned name table: hash-based lookup for repeated
+//              import names across concurrent source parses.
+//   R227.M3.3  Resolve syscall wire-up: the resolver stub at raw M3
+//              validates the path shape but does NOT call `stat`;
+//              M3.3 wires in the kernel-side VFS probe.
+//   R227.M3.4  Multi-source concurrent parse: a single process may
+//              parse multiple sources in parallel; M3.4 moves the
+//              singleton `.bss` pool into a per-source handle.
+//
+// =============================================================================
+// Upstream: paideia-os#2491 (R227 pds container umbrella), paideia-os
+// #2705 (THIS ticket, R227.M3 Import resolution + module graph).
+// Mirror: paideia-os#2622 (R133.M3 kernel-side ImportGraph) --
+// adjacency row shape identical; cycle detection shares algorithm.
+// Design doc: design/shell/import-resolution-parser.md.
+
+module ImportResolve = structure {
+
+  // ==========================================================================
+  // SECTION 1 -- STATUS CODES (returned in low 32 bits of packed result)
+  // ==========================================================================
+  //
+  // Small-value range 0x5900..0x59FF, reserved for the R227.M3 import-
+  // resolution band. Disjoint from every prior landed satellite band
+  // and from the parallel R225.M6 arm (0x5800..0x58FF).
+
+  pub let IR_OK                       : u64 = 0
+  pub let IR_ERR_SYNTAX               : u64 = 0x5900
+  pub let IR_ERR_PATH_TOO_LONG        : u64 = 0x5901
+  pub let IR_ERR_NAME_TOO_LONG        : u64 = 0x5902
+  pub let IR_ERR_OUT_TOO_SMALL        : u64 = 0x5903
+  pub let IR_ERR_BAD_RECORD           : u64 = 0x5904
+  pub let IR_ERR_TOO_MANY_IMPORTS     : u64 = 0x5905
+  pub let IR_ERR_TOO_MANY_MODULES     : u64 = 0x5906
+  pub let E1100_IMPORT_CYCLE          : u64 = 0x5910
+  pub let E1101_RESOLVE_FAILED        : u64 = 0x5911
+  pub let E1102_DUPLICATE_NAME        : u64 = 0x5912
+  pub let E1103_PATH_TRAVERSAL        : u64 = 0x5913
+
+  // ==========================================================================
+  // SECTION 2 -- LAYOUT CONSTANTS
+  // ==========================================================================
+
+  pub let IR_RECORD_BYTES             : u64 = 48
+  pub let IR_PATH_MAX                 : u64 = 256
+  pub let IR_NAME_MAX                 : u64 = 16
+  pub let IR_MAX_NODES                : u64 = 64
+  pub let IR_MAX_IMPORTS              : u64 = 8
+  pub let IR_ADJ_STRIDE               : u64 = 36       // u32 count + 8 u32
+
+  // Magic: 'IMPT' little-endian = 0x54504D49. Reads as the 4-byte
+  // ASCII string "IMPT" in a hex dump (bytes 49 4D 50 54).
+  pub let IR_RECORD_MAGIC             : u64 = 0x54504D49
+
+  // Field offsets within one ImportDirective record.
+  pub let IR_OFF_MAGIC                : u64 = 0        // u32
+  pub let IR_OFF_FLAGS                : u64 = 4        // u32
+  pub let IR_OFF_PATH_HASH            : u64 = 8        // u64
+  pub let IR_OFF_NAME_INLINE          : u64 = 16       // [u8;16]
+  pub let IR_OFF_PATH_PREFIX          : u64 = 32       // [u8;16]
+
+  // Flag bits in the `flags` u32 at [record + 4].
+  pub let IR_FLAG_SYSTEM_PATH         : u64 = 0x00000001
+  pub let IR_FLAG_RESOLVED            : u64 = 0x00000002
+  pub let IR_FLAG_CYCLE_SRC           : u64 = 0x00000004
+
+  // DFS colour palette (mirrors R133.M3 ImportGraph).
+  pub let IR_WHITE                    : u64 = 0
+  pub let IR_GRAY                     : u64 = 1
+  pub let IR_BLACK                    : u64 = 2
+
+  // ==========================================================================
+  // SECTION 3 -- STATIC STATE (.bss, singleton)
+  // ==========================================================================
+  //
+  // `_ir_imports` holds up to IR_MAX_NODES (64) ImportDirective records
+  // of IR_RECORD_BYTES (48) each. `_ir_import_count` tracks the live
+  // prefix. `_ir_color` and `_ir_stk` are scratch for the cycle
+  // detector (same layout as R133.M3 ImportGraph).
+
+  pub let mut _ir_imports        : [u8;  3072] = uninit @align(64)
+  pub let mut _ir_import_count   : u64         = uninit @align(8)
+  pub let mut _ir_color          : [u8;    64] = uninit @align(64)
+  pub let mut _ir_stk            : [u64;  128] = uninit @align(64)
+
+  // ==========================================================================
+  // _ir_init() -> ()
+  //
+  //   Defensive scrub of the live-count scalar. The byte pool is
+  //   bounded by _ir_import_count on every read, so stale bytes past
+  //   the live prefix are harmless; `.bss` zero-init at cold boot
+  //   already satisfies the scalar invariant. Pure leaf.
+  //
+  // Labels prefixed ir_ini_.
+  // ==========================================================================
+  pub let _ir_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R227.M3 (#2705): defensive scrub of _ir_import_count (u64 scalar). The byte pool `_ir_imports[64 * 48]` is bounded by the count on every read, so stale bytes past the live prefix are harmless; `.bss` zero-init at cold boot already satisfies the scalar invariant. Pure leaf; zero pushes; no stack frame; no nested CALL. Store via `lea r11, [rip + _ir_import_count]; mov [r11], rax` with rax=0. All immediates (0) fit imm32. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed ir_ini_.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + _ir_import_count];
+        mov [r11], rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _ir_parse_directive(bytes, bytes_len, out, out_cap)
+  //                                     -> (bytes_consumed << 32) | status
+  //
+  //   rdi = bytes
+  //   rsi = bytes_len
+  //   rdx = out
+  //   rcx = out_cap
+  //   rax = (bytes_consumed << 32) | status
+  //
+  // Parse one `#import "path" as name` directive. See the top-of-file
+  // API block for the full flow and semantics. Pure leaf (6-push,
+  // FNV-1a 64 inlined; no nested CALL).
+  //
+  // Flow:
+  //   1. Validate out != 0, out_cap >= IR_RECORD_BYTES (48).
+  //   2. Zero-fill the 48-byte record via six u64 stores.
+  //   3. Skip leading WS.
+  //   4. Expect '#import' (7 bytes).
+  //   5. Skip WS+.
+  //   6. Expect '"' (0x22).
+  //   7. Scan path bytes until closing '"'; validate length 1..256;
+  //      detect leading '/' for system-path flag.
+  //   8. Skip WS+.
+  //   9. Expect 'as' (2 bytes).
+  //  10. Skip WS+.
+  //  11. Scan name bytes until first non-ident byte; validate 1..16.
+  //  12. Compute FNV-1a 64 over the path bytes.
+  //  13. Emit record: magic + flags + path_hash + name_inline + path_prefix.
+  //  14. Return packed (bytes_consumed << 32) | IR_OK.
+  //
+  // Labels prefixed ir_pa_.
+  // ==========================================================================
+  pub let _ir_parse_directive : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (bytes: u64) (bytes_len: u64) (out: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R227.M3 (#2705): _ir_parse_directive parses one `#import \"path\" as name` directive out of the leading bytes of a source byte run and emits a 48-byte ImportDirective record. 6 callee-save pushes (rbx=bytes_ptr, rbp=bytes_len, r12=out, r13=cursor, r14=token_start, r15=token_len); pure leaf (FNV-1a 64 inlined) with no nested CALL so no sub-rsp pad is needed. Guards: out != 0 (cmp rdx, 0; je ir_pa_oos); out_cap >= IR_RECORD_BYTES 48 (cmp rcx, 48; jb ir_pa_oos). Zero-fill the 48-byte record at [out, out+48) via six u64 stores at displacements 0, 8, 16, 24, 32, 40 with rax=0. Skip leading WS (SP 0x20, TAB 0x09, LF 0x0A, CR 0x0D) advancing r13. Expect '#import' (7 bytes 0x23 'i' 'm' 'p' 'o' 'r' 't'): byte-by-byte cmp through the keyword; on mismatch IR_ERR_SYNTAX. Skip WS+. Expect '\"' (0x22); on mismatch IR_ERR_SYNTAX. Record token_start = cursor+1 into r14; advance r13 past '\"'. Detect SYSTEM_PATH: load byte at [rbx + r13 * 1]; if it's '/' (0x2F) set IR_FLAG_SYSTEM_PATH into r11 for later OR into flags. Scan path bytes until closing '\"'; r15 = cursor - token_start; validate r15 >= 1 (IR_ERR_SYNTAX if 0); validate r15 <= IR_PATH_MAX 256 (IR_ERR_PATH_TOO_LONG). Advance r13 past closing '\"'. Skip WS+. Expect 'as' (2 bytes 0x61 0x73); on mismatch IR_ERR_SYNTAX. Skip WS+. Scan name bytes while byte is in [A-Za-z0-9_]; token_start = cursor; token_len = cursor - token_start; validate >= 1 (IR_ERR_SYNTAX if 0); validate <= IR_NAME_MAX 16 (IR_ERR_NAME_TOO_LONG). Emit magic 'IMPT' u32 at [r12+0] via mov_d; emit flags u32 at [r12+4] via mov_d (SYSTEM_PATH bit if set). Copy name_inline from [rbx + name_start, name_len) into [r12 + 16 + i] via byte-by-byte loop (precompute dst = r12 + 16 + i into r9 before mov_b to sidestep the three-term addressing encoder gap). Copy path_prefix: min(16, path_len) bytes from [rbx + path_start, up to 16) into [r12 + 32 + i]. Compute FNV-1a 64 over all path bytes: rax = 0xCBF29CE484222325 (basis, MOVABS), rcx = 0x100000001B3 (prime, MOVABS, held across loop); loop body xor rax,byte then mul rcx; precompute src = rbx + path_start + i into r11; after loop write rax at [r12 + 8]. Pack return: shl r13 (consumed_bytes) by 32 into rax, OR with IR_OK (0). All cmp immediates (0, 1, 2, 16, 48, 256, 0x09, 0x0A, 0x0D, 0x20, 0x22, 0x23, 0x2F, 0x30, 0x39, 0x41, 0x5A, 0x5F, 0x61, 0x61..0x7A, 'i' 0x69, 'm' 0x6D, 'p' 0x70, 'o' 0x6F, 'r' 0x72, 't' 0x74, 's' 0x73, 0x54504D49 'IMPT', 0x5900..0x5903) fit imm32 with bit 31 clear so direct cmp-imm32 is sign-safe. FNV constants > imm32 load via MOVABS (precedent history.pdx L727-728). No test; no and-imm64; no imul-r-imm (FNV uses one-op `mul rcx`); no multiline let; no three-term addressing. Labels prefixed ir_pa_.",
+      block: {
+        // ---- Prologue --------------------------------------------------
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                          // bytes_ptr
+        mov rbp, rsi;                          // bytes_len
+        mov r12, rdx;                          // out
+        xor r13, r13;                          // cursor = 0
+        xor r14, r14;                          // token_start = 0
+        xor r15, r15;                          // token_len   = 0
+
+        // ---- Validate output buffer -----------------------------------
+        cmp r12, 0;
+        je  ir_pa_oos;
+        cmp rcx, 48;                           // IR_RECORD_BYTES
+        jb  ir_pa_oos;
+
+        // ---- Zero-fill 48-B record via six u64 stores -----------------
+        xor rax, rax;
+        mov [r12 + 0], rax;
+        mov [r12 + 8], rax;
+        mov [r12 + 16], rax;
+        mov [r12 + 24], rax;
+        mov [r12 + 32], rax;
+        mov [r12 + 40], rax;
+
+        // ---- Skip leading WS ------------------------------------------
+      ir_pa_ws1:
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x20;                         // SP
+        je  ir_pa_ws1_adv;
+        cmp rax, 0x09;                         // TAB
+        je  ir_pa_ws1_adv;
+        cmp rax, 0x0A;                         // LF
+        je  ir_pa_ws1_adv;
+        cmp rax, 0x0D;                         // CR
+        je  ir_pa_ws1_adv;
+        jmp ir_pa_kw_hash;
+
+      ir_pa_ws1_adv:
+        add r13, 1;
+        jmp ir_pa_ws1;
+
+        // ---- Expect '#import' (7 bytes) --------------------------------
+      ir_pa_kw_hash:
+        // '#' at [cursor]
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x23;                         // '#'
+        jne ir_pa_syn;
+        add r13, 1;
+
+        // 'i'
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x69;                         // 'i'
+        jne ir_pa_syn;
+        add r13, 1;
+
+        // 'm'
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x6D;                         // 'm'
+        jne ir_pa_syn;
+        add r13, 1;
+
+        // 'p'
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x70;                         // 'p'
+        jne ir_pa_syn;
+        add r13, 1;
+
+        // 'o'
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x6F;                         // 'o'
+        jne ir_pa_syn;
+        add r13, 1;
+
+        // 'r'
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x72;                         // 'r'
+        jne ir_pa_syn;
+        add r13, 1;
+
+        // 't'
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x74;                         // 't'
+        jne ir_pa_syn;
+        add r13, 1;
+
+        // ---- Skip WS+ (at least one) ----------------------------------
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x20;                         // SP
+        je  ir_pa_ws2_adv;
+        cmp rax, 0x09;
+        je  ir_pa_ws2_adv;
+        cmp rax, 0x0A;
+        je  ir_pa_ws2_adv;
+        cmp rax, 0x0D;
+        je  ir_pa_ws2_adv;
+        jmp ir_pa_syn;                         // required WS missing
+
+      ir_pa_ws2_adv:
+        add r13, 1;
+
+      ir_pa_ws2:
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x20;
+        je  ir_pa_ws2_more;
+        cmp rax, 0x09;
+        je  ir_pa_ws2_more;
+        cmp rax, 0x0A;
+        je  ir_pa_ws2_more;
+        cmp rax, 0x0D;
+        je  ir_pa_ws2_more;
+        jmp ir_pa_openq;
+
+      ir_pa_ws2_more:
+        add r13, 1;
+        jmp ir_pa_ws2;
+
+        // ---- Expect opening '"' ---------------------------------------
+      ir_pa_openq:
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x22;                         // '"'
+        jne ir_pa_syn;
+        add r13, 1;
+
+        // Record path_start = cursor; detect SYSTEM_PATH on first byte.
+        mov r14, r13;                          // path_start
+
+        // Detect '/' at path_start for SYSTEM_PATH bit.
+        //   r8 carries the flags accumulator; defaults to 0.
+        xor r8, r8;
+        cmp r13, rbp;
+        jae ir_pa_syn;                         // empty path -> syntax
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x22;                         // immediate '"' -> empty
+        je  ir_pa_syn;
+        cmp rax, 0x2F;                         // '/'
+        jne ir_pa_path_scan;
+        mov r8, 1;                             // IR_FLAG_SYSTEM_PATH
+
+        // ---- Scan path bytes until closing '"' -------------------------
+      ir_pa_path_scan:
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x22;                         // '"' terminator
+        je  ir_pa_path_done;
+        // Byte must be printable ASCII; refuse control bytes.
+        cmp rax, 0x20;
+        jb  ir_pa_syn;
+        cmp rax, 0x7F;
+        jae ir_pa_syn;
+        add r13, 1;
+        jmp ir_pa_path_scan;
+
+      ir_pa_path_done:
+        // path_len = cursor - path_start.
+        mov r15, r13;
+        sub r15, r14;
+        cmp r15, 0;
+        je  ir_pa_syn;
+        cmp r15, 256;                          // IR_PATH_MAX
+        ja  ir_pa_path_too_long;
+
+        // Advance past closing '"'.
+        add r13, 1;
+
+        // ---- Emit path_prefix (min(16, path_len) bytes) ---------------
+        // Save path_start into r9 for the FNV loop later; copy prefix.
+        xor r10, r10;                          // i = 0
+
+      ir_pa_pref_loop:
+        cmp r10, 16;
+        jae ir_pa_pref_done;
+        cmp r10, r15;
+        jae ir_pa_pref_pad;
+        // src_addr = rbx + r14 + i
+        mov r11, rbx;
+        add r11, r14;
+        add r11, r10;
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        // dst_addr = r12 + 32 + i
+        mov r9, r12;
+        add r9, 32;                            // IR_OFF_PATH_PREFIX
+        add r9, r10;
+        mov_b [r9 + 0], rax;
+        add r10, 1;
+        jmp ir_pa_pref_loop;
+
+      ir_pa_pref_pad:
+        // zero-pad [path_len..16) at prefix offset
+        xor rax, rax;
+        mov r9, r12;
+        add r9, 32;
+        add r9, r10;
+        mov_b [r9 + 0], rax;
+        add r10, 1;
+        jmp ir_pa_pref_loop;
+
+      ir_pa_pref_done:
+        // ---- Compute FNV-1a 64 over the FULL path bytes ---------------
+        // r14 = path_start, r15 = path_len, rbx = bytes_ptr.
+        // Preserve r8 (flags) across FNV loop by stashing in rdi.
+        mov rdi, r8;                           // rdi = flags accumulator
+        mov rax, 0xCBF29CE484222325;           // offset basis
+        mov rcx, 0x100000001B3;                // prime
+        xor r10, r10;                          // i = 0
+
+      ir_pa_fnv_loop:
+        cmp r10, r15;
+        jae ir_pa_fnv_done;
+        mov r11, rbx;
+        add r11, r14;
+        add r11, r10;
+        xor r9, r9;
+        mov_b r9, [r11 + 0];
+        xor rax, r9;
+        xor rdx, rdx;
+        mul rcx;
+        add r10, 1;
+        jmp ir_pa_fnv_loop;
+
+      ir_pa_fnv_done:
+        // Write path_hash u64 at [out + 8].
+        mov [r12 + 8], rax;
+        // Restore flags accumulator.
+        mov r8, rdi;
+
+        // ---- Skip WS+ (at least one) between path and 'as' -------------
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x20;
+        je  ir_pa_ws3_adv;
+        cmp rax, 0x09;
+        je  ir_pa_ws3_adv;
+        cmp rax, 0x0A;
+        je  ir_pa_ws3_adv;
+        cmp rax, 0x0D;
+        je  ir_pa_ws3_adv;
+        jmp ir_pa_syn;
+
+      ir_pa_ws3_adv:
+        add r13, 1;
+
+      ir_pa_ws3:
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x20;
+        je  ir_pa_ws3_more;
+        cmp rax, 0x09;
+        je  ir_pa_ws3_more;
+        cmp rax, 0x0A;
+        je  ir_pa_ws3_more;
+        cmp rax, 0x0D;
+        je  ir_pa_ws3_more;
+        jmp ir_pa_as_a;
+
+      ir_pa_ws3_more:
+        add r13, 1;
+        jmp ir_pa_ws3;
+
+        // ---- Expect 'as' (2 bytes) ------------------------------------
+      ir_pa_as_a:
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x61;                         // 'a'
+        jne ir_pa_syn;
+        add r13, 1;
+
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x73;                         // 's'
+        jne ir_pa_syn;
+        add r13, 1;
+
+        // ---- Skip WS+ between 'as' and name --------------------------
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x20;
+        je  ir_pa_ws4_adv;
+        cmp rax, 0x09;
+        je  ir_pa_ws4_adv;
+        cmp rax, 0x0A;
+        je  ir_pa_ws4_adv;
+        cmp rax, 0x0D;
+        je  ir_pa_ws4_adv;
+        jmp ir_pa_syn;
+
+      ir_pa_ws4_adv:
+        add r13, 1;
+
+      ir_pa_ws4:
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x20;
+        je  ir_pa_ws4_more;
+        cmp rax, 0x09;
+        je  ir_pa_ws4_more;
+        cmp rax, 0x0A;
+        je  ir_pa_ws4_more;
+        cmp rax, 0x0D;
+        je  ir_pa_ws4_more;
+        jmp ir_pa_name_begin;
+
+      ir_pa_ws4_more:
+        add r13, 1;
+        jmp ir_pa_ws4;
+
+        // ---- Scan name: [A-Za-z_] [A-Za-z0-9_]* -----------------------
+      ir_pa_name_begin:
+        // First byte must be [A-Za-z_].
+        cmp r13, rbp;
+        jae ir_pa_syn;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        // Save name_start into r14 (reused -- the path_start is no
+        // longer needed after FNV).
+        mov r14, r13;
+        // Validate first byte.
+        cmp rax, 0x5F;                         // '_'
+        je  ir_pa_name_scan;
+        cmp rax, 0x41;
+        jb  ir_pa_syn;
+        cmp rax, 0x5A;
+        jbe ir_pa_name_scan;
+        cmp rax, 0x61;
+        jb  ir_pa_syn;
+        cmp rax, 0x7A;
+        ja  ir_pa_syn;
+
+      ir_pa_name_scan:
+        // Advance past first byte already validated.
+        add r13, 1;
+      ir_pa_name_more:
+        cmp r13, rbp;
+        jae ir_pa_name_done;
+        xor rax, rax;
+        mov_b rax, [rbx + r13 * 1];
+        cmp rax, 0x5F;                         // '_'
+        je  ir_pa_name_adv;
+        cmp rax, 0x30;                         // '0'
+        jb  ir_pa_name_done;
+        cmp rax, 0x39;                         // '9'
+        jbe ir_pa_name_adv;
+        cmp rax, 0x41;                         // 'A'
+        jb  ir_pa_name_done;
+        cmp rax, 0x5A;                         // 'Z'
+        jbe ir_pa_name_adv;
+        cmp rax, 0x61;                         // 'a'
+        jb  ir_pa_name_done;
+        cmp rax, 0x7A;                         // 'z'
+        ja  ir_pa_name_done;
+
+      ir_pa_name_adv:
+        add r13, 1;
+        jmp ir_pa_name_more;
+
+      ir_pa_name_done:
+        // name_len = cursor - name_start.
+        mov r15, r13;
+        sub r15, r14;
+        cmp r15, 0;
+        je  ir_pa_syn;
+        cmp r15, 16;                           // IR_NAME_MAX
+        ja  ir_pa_name_too_long;
+
+        // ---- Copy name_inline (up to 16 bytes, zero-padded) ----------
+        xor r10, r10;                          // i = 0
+      ir_pa_name_copy:
+        cmp r10, 16;
+        jae ir_pa_emit_hdr;
+        cmp r10, r15;
+        jae ir_pa_name_pad;
+        mov r11, rbx;
+        add r11, r14;
+        add r11, r10;
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        mov r9, r12;
+        add r9, 16;                            // IR_OFF_NAME_INLINE
+        add r9, r10;
+        mov_b [r9 + 0], rax;
+        add r10, 1;
+        jmp ir_pa_name_copy;
+
+      ir_pa_name_pad:
+        xor rax, rax;
+        mov r9, r12;
+        add r9, 16;
+        add r9, r10;
+        mov_b [r9 + 0], rax;
+        add r10, 1;
+        jmp ir_pa_name_copy;
+
+        // ---- Emit magic + flags u32 ----------------------------------
+      ir_pa_emit_hdr:
+        // magic 'IMPT' u32 at [out + 0].
+        mov r9, 0x54504D49;                    // IR_RECORD_MAGIC
+        mov_d [r12 + 0], r9;
+        // flags u32 at [out + 4]: r8 carries SYSTEM_PATH bit (0 or 1).
+        mov_d [r12 + 4], r8;
+
+        // ---- Pack return: (bytes_consumed << 32) | IR_OK -------------
+        mov rax, r13;
+        shl rax, 32;                           // IR_OK = 0
+        jmp ir_pa_epilogue;
+
+      // ------------------------------------------------------------------
+      // Error paths
+      // ------------------------------------------------------------------
+      ir_pa_syn:
+        mov rax, r13;
+        shl rax, 32;
+        or  rax, 0x5900;                       // IR_ERR_SYNTAX
+        jmp ir_pa_epilogue;
+
+      ir_pa_path_too_long:
+        mov rax, r13;
+        shl rax, 32;
+        or  rax, 0x5901;                       // IR_ERR_PATH_TOO_LONG
+        jmp ir_pa_epilogue;
+
+      ir_pa_name_too_long:
+        mov rax, r13;
+        shl rax, 32;
+        or  rax, 0x5902;                       // IR_ERR_NAME_TOO_LONG
+        jmp ir_pa_epilogue;
+
+      ir_pa_oos:
+        xor rax, rax;
+        shl rax, 32;
+        or  rax, 0x5903;                       // IR_ERR_OUT_TOO_SMALL
+        jmp ir_pa_epilogue;
+
+      ir_pa_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _ir_resolve_path(path_bytes, path_len, out_resolved, out_cap)
+  //                                     -> (resolved_len << 32) | status
+  //
+  //   rdi = path_bytes
+  //   rsi = path_len
+  //   rdx = out_resolved
+  //   rcx = out_cap
+  //   rax = (resolved_len << 32) | status
+  //
+  // Resolve a path against the project + system roots. At raw M3 the
+  // resolver is a byte-walker that:
+  //
+  //   (a) if path begins with '/'      -> system root prefix (literal
+  //                                       "/pds/", 5 bytes) +
+  //                                       path[1..] (strip leading '/').
+  //   (b) else                         -> project root prefix (literal
+  //                                       "./", 2 bytes) + path.
+  //
+  // After concatenation, walk the result and refuse any `..` component
+  // that would ESCAPE the root (an unmatched `..` at depth 0 after root
+  // prefix). On success, write the canonicalised path into
+  // [out_resolved, out_resolved + resolved_len).
+  //
+  // The syscall-side `stat` wire-up (actually checking the file exists)
+  // is deferred to M3.3. At raw M3 the resolver is pure byte walk +
+  // path-traversal refusal.
+  //
+  // Labels prefixed ir_re_.
+  // ==========================================================================
+  pub let _ir_resolve_path : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (path_bytes: u64) (path_len: u64) (out_resolved: u64)
+       (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R227.M3 (#2705): _ir_resolve_path concatenates a resolver root prefix with the caller-supplied path and refuses any `..` component that escapes the root. 6 callee-save pushes (rbx=path_bytes, rbp=path_len, r12=out_resolved, r13=write_cursor_into_out, r14=comp_start, r15=comp_len); pure leaf; no nested CALL. Guards: out_resolved != 0 (cmp rdx, 0; je ir_re_oos); out_cap >= path_len + 5 (cmp rcx, needed; jb ir_re_oos) -- conservative 5-byte system prefix is the max. Dispatch on path first byte: '/' (0x2F) -> system root; else -> project root. System path: write literal '/pds/' into [out+0..+5] via five mov_b stores; skip leading '/' of path; copy remainder into out_cursor. Project path: write literal './' into [out+0..+2] via two mov_b stores; copy full path into out_cursor. Then walk the written out[0..out_cursor) looking for `..` sequences at component boundaries ('/' prefix): maintain depth counter d (0 at root); '/' advances; '..' at depth 0 after root prefix is traversal violation (E1103_PATH_TRAVERSAL 0x5913); '..' at depth > 0 decrements d; non-'..' component increments d. All cmp immediates (0, 1, 2, 5, 0x09, 0x0A, 0x0D, 0x20, 0x2E, 0x2F, status codes 0x5903, 0x5911, 0x5913) fit imm32 with bit 31 clear. No test; no and-imm64; no imul-r-imm; no multiline let; no three-term addressing (all [base+idx+off] precomputed into r11 or r9). Labels prefixed ir_re_.",
+      block: {
+        // ---- Prologue --------------------------------------------------
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                          // path_bytes
+        mov rbp, rsi;                          // path_len
+        mov r12, rdx;                          // out_resolved
+        xor r13, r13;                          // write_cursor = 0
+
+        // ---- Validate output buffer -----------------------------------
+        cmp r12, 0;
+        je  ir_re_oos;
+        // Conservative capacity: path_len + 5 ("/pds/" prefix).
+        mov r10, rbp;
+        add r10, 5;
+        cmp rcx, r10;
+        jb  ir_re_oos;
+
+        // ---- Validate path non-empty ----------------------------------
+        cmp rbp, 0;
+        je  ir_re_fail;
+
+        // ---- Dispatch on first byte: system vs project ---------------
+        xor rax, rax;
+        mov_b rax, [rbx + 0 * 1];
+        cmp rax, 0x2F;                         // '/'
+        je  ir_re_system;
+
+        // ---- Project root: write "./" then path ----------------------
+        mov rax, 0x2E;                         // '.'
+        mov r9, r12;
+        add r9, r13;
+        mov_b [r9 + 0], rax;
+        add r13, 1;
+        mov rax, 0x2F;                         // '/'
+        mov r9, r12;
+        add r9, r13;
+        mov_b [r9 + 0], rax;
+        add r13, 1;
+
+        // Copy full path into out at write_cursor.
+        xor r10, r10;                          // i = 0
+      ir_re_proj_copy:
+        cmp r10, rbp;
+        jae ir_re_walk_begin;
+        mov r11, rbx;
+        add r11, r10;
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        mov r9, r12;
+        add r9, r13;
+        mov_b [r9 + 0], rax;
+        add r13, 1;
+        add r10, 1;
+        jmp ir_re_proj_copy;
+
+        // ---- System root: write "/pds/" then path[1..] ---------------
+      ir_re_system:
+        mov rax, 0x2F;                         // '/'
+        mov r9, r12;
+        add r9, r13;
+        mov_b [r9 + 0], rax;
+        add r13, 1;
+        mov rax, 0x70;                         // 'p'
+        mov r9, r12;
+        add r9, r13;
+        mov_b [r9 + 0], rax;
+        add r13, 1;
+        mov rax, 0x64;                         // 'd'
+        mov r9, r12;
+        add r9, r13;
+        mov_b [r9 + 0], rax;
+        add r13, 1;
+        mov rax, 0x73;                         // 's'
+        mov r9, r12;
+        add r9, r13;
+        mov_b [r9 + 0], rax;
+        add r13, 1;
+        mov rax, 0x2F;                         // '/'
+        mov r9, r12;
+        add r9, r13;
+        mov_b [r9 + 0], rax;
+        add r13, 1;
+
+        // Copy path[1..] into out at write_cursor.
+        mov r10, 1;                            // i = 1 (skip leading '/')
+      ir_re_sys_copy:
+        cmp r10, rbp;
+        jae ir_re_walk_begin;
+        mov r11, rbx;
+        add r11, r10;
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        mov r9, r12;
+        add r9, r13;
+        mov_b [r9 + 0], rax;
+        add r13, 1;
+        add r10, 1;
+        jmp ir_re_sys_copy;
+
+        // ---- Walk the concatenated out[0..r13) looking for `..` -----
+        // At this landing the `..` traversal check is a simplified
+        // byte-level scan: a `..` substring preceded by '/' and
+        // followed by '/' or EOI is a component. We refuse any '..'
+        // component when depth == 0.
+      ir_re_walk_begin:
+        xor r8, r8;                            // depth = 0
+        xor r10, r10;                          // scan cursor
+        // Skip the root prefix bytes so depth starts at 0 at the first
+        // user-supplied component.
+        //   For project root (./): skip 2 bytes.
+        //   For system root (/pds/): skip 5 bytes.
+        xor rax, rax;
+        mov_b rax, [r12 + 0 * 1];
+        cmp rax, 0x2F;                         // '/'
+        je  ir_re_walk_sys;
+        mov r10, 2;                            // skip "./"
+        jmp ir_re_walk_loop;
+
+      ir_re_walk_sys:
+        mov r10, 5;                            // skip "/pds/"
+
+      ir_re_walk_loop:
+        cmp r10, r13;
+        jae ir_re_ok;
+        // Look at current component.
+        // Component start = r10. Scan to next '/' or EOI.
+        mov r14, r10;                          // comp_start
+      ir_re_comp_scan:
+        cmp r10, r13;
+        jae ir_re_comp_done;
+        mov r11, r12;
+        add r11, r10;
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        cmp rax, 0x2F;                         // '/'
+        je  ir_re_comp_done;
+        add r10, 1;
+        jmp ir_re_comp_scan;
+      ir_re_comp_done:
+        // comp_len = r10 - r14. If component is exactly '..' refuse at
+        // depth 0; else decrement depth.
+        mov r15, r10;
+        sub r15, r14;
+        cmp r15, 2;
+        jne ir_re_comp_normal;
+        // Check both bytes == '.'
+        mov r11, r12;
+        add r11, r14;
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        cmp rax, 0x2E;                         // '.'
+        jne ir_re_comp_normal;
+        mov r11, r12;
+        add r11, r14;
+        add r11, 1;
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        cmp rax, 0x2E;
+        jne ir_re_comp_normal;
+        // `..` component. Depth > 0 -> decrement; depth 0 -> refuse.
+        cmp r8, 0;
+        je  ir_re_traverse;
+        sub r8, 1;
+        jmp ir_re_comp_sep;
+
+      ir_re_comp_normal:
+        // normal component -> depth += 1 (unless empty, which happens
+        // between consecutive '/' separators).
+        cmp r15, 0;
+        je  ir_re_comp_sep;
+        add r8, 1;
+
+      ir_re_comp_sep:
+        // Skip the separating '/'.
+        cmp r10, r13;
+        jae ir_re_walk_loop;
+        mov r11, r12;
+        add r11, r10;
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        cmp rax, 0x2F;
+        jne ir_re_walk_loop;
+        add r10, 1;
+        jmp ir_re_walk_loop;
+
+      ir_re_ok:
+        // Pack return: (resolved_len << 32) | IR_OK (0).
+        mov rax, r13;
+        shl rax, 32;
+        jmp ir_re_epilogue;
+
+      ir_re_traverse:
+        xor rax, rax;
+        shl rax, 32;
+        or  rax, 0x5913;                       // E1103_PATH_TRAVERSAL
+        jmp ir_re_epilogue;
+
+      ir_re_fail:
+        xor rax, rax;
+        shl rax, 32;
+        or  rax, 0x5911;                       // E1101_RESOLVE_FAILED
+        jmp ir_re_epilogue;
+
+      ir_re_oos:
+        xor rax, rax;
+        shl rax, 32;
+        or  rax, 0x5903;                       // IR_ERR_OUT_TOO_SMALL
+        jmp ir_re_epilogue;
+
+      ir_re_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _ir_build_graph(directives, n_directives, out_graph, out_cap)
+  //                                     -> (n_rows << 32) | status
+  //
+  //   rdi = directives     (ptr to ImportDirective[n_directives];
+  //                         48-byte stride)
+  //   rsi = n_directives
+  //   rdx = out_graph      (ptr to adjacency ImportAdjRow[n_directives];
+  //                         36-byte stride)
+  //   rcx = out_cap
+  //   rax = (n_rows << 32) | status
+  //
+  // Build an R133.M3-shaped adjacency table from a packed array of
+  // ImportDirective records. At raw M3 the construction is one-to-one:
+  // each directive at index i emits ONE outgoing edge from module i to
+  // module (i + 1) mod n_directives -- a parse-tier placeholder that
+  // ensures the row stride and n_imports field are byte-identical to
+  // R133.M3's expectation. A later landing (M3.5) elaborates the edge
+  // computation to consult the per-source name table and resolve each
+  // directive's `as name` to the corresponding module index.
+  //
+  // At raw M3 we also enforce an INTRA-SOURCE DUPLICATE check: if any
+  // two directives share the same name_inline bytes, emit
+  // E1102_DUPLICATE_NAME.
+  //
+  // Row shape (36 bytes, matches R133.M3 ImportAdjRow):
+  //   [ 0.. 4] u32  n_imports
+  //   [ 4.. 8] u32  import[0]
+  //   [ 8..12] u32  import[1]
+  //   ...
+  //   [32..36] u32  import[7]
+  //
+  // Labels prefixed ir_bg_.
+  // ==========================================================================
+  pub let _ir_build_graph : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (directives: u64) (n_directives: u64) (out_graph: u64)
+       (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R227.M3 (#2705): _ir_build_graph consumes an array of n_directives ImportDirective records (48-byte stride) and emits an R133.M3-shaped adjacency table at out_graph (36-byte stride). 5 callee-save pushes (rbx=directives_ptr, rbp=n_directives, r12=out_graph, r13=outer loop i, r14=row_base); pure leaf; no nested CALL. Guards: out_graph != 0 (IR_ERR_OUT_TOO_SMALL on fail); out_cap >= n_directives * 36 (IR_ERR_OUT_TOO_SMALL on fail; computed via shl r10,5 + shl r11,2 + add r10,r11 = i*32 + i*4 = i*36 per R133.M3 encoder discipline). n_directives <= IR_MAX_NODES 64 (IR_ERR_TOO_MANY_MODULES 0x5906 on fail). Intra-source duplicate scan: for each pair (i, j) with i < j < n_directives, compare the 16-byte name_inline fields at [directives + i*48 + 16] and [directives + j*48 + 16]; byte-equal pair -> E1102_DUPLICATE_NAME 0x5912. Record emit: outer loop i in [0, n_directives); row_base = out_graph + i*36; validate magic at [directives + i*48 + 0] via mov_d; mismatch -> IR_ERR_BAD_RECORD 0x5904. Write n_imports u32 = 1 at [row_base + 0]; write import[0] u32 = (i + 1) mod n_directives at [row_base + 4]. Remaining 7 import slots left zero from zero-fill. Zero-fill the whole adjacency region first via 9-byte run (36B per row * n_directives). All cmp immediates (0, 1, 2, 4, 8, 16, 32, 36, 48, 64, status codes 0x5903, 0x5904, 0x5906, 0x5912, magic 0x54504D49) fit imm32 with bit 31 clear. Strides computed via shl + add (no imul-r-imm). No test; no and-imm64; no multiline let. Labels prefixed ir_bg_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+
+        mov rbx, rdi;                          // directives_ptr
+        mov rbp, rsi;                          // n_directives
+        mov r12, rdx;                          // out_graph
+        xor r13, r13;                          // outer i
+        xor r14, r14;                          // row_base scratch
+
+        // ---- Validate args ---------------------------------------------
+        cmp r12, 0;
+        je  ir_bg_oos;
+        cmp rbp, 64;                           // IR_MAX_NODES
+        ja  ir_bg_too_many;
+
+        // out_cap >= n_directives * 36 (via shl + shl + add).
+        mov r10, rbp;
+        shl r10, 5;                            // n*32
+        mov r11, rbp;
+        shl r11, 2;                            // n*4
+        add r10, r11;                          // n*36
+        cmp rcx, r10;
+        jb  ir_bg_oos;
+
+        // ---- Zero-fill adjacency region (n*36 bytes, u64-wise) --------
+        // Walk by 8-byte chunks until remainder bytes.
+        xor r8, r8;                            // write idx
+        xor rax, rax;
+      ir_bg_zf_loop:
+        cmp r8, r10;
+        jae ir_bg_dup_begin;
+        // if r10 - r8 >= 8 -> u64 store; else fall through to byte.
+        mov r11, r10;
+        sub r11, r8;
+        cmp r11, 8;
+        jb  ir_bg_zf_byte;
+        mov r9, r12;
+        add r9, r8;
+        mov [r9 + 0], rax;
+        add r8, 8;
+        jmp ir_bg_zf_loop;
+      ir_bg_zf_byte:
+        mov r9, r12;
+        add r9, r8;
+        mov_b [r9 + 0], rax;
+        add r8, 1;
+        jmp ir_bg_zf_loop;
+
+        // ---- Intra-source duplicate name scan (O(n^2) 16-byte cmp) ----
+      ir_bg_dup_begin:
+        xor r13, r13;                          // i = 0
+
+      ir_bg_dup_i:
+        cmp r13, rbp;
+        jae ir_bg_build_begin;
+        // j = i + 1
+        mov r8, r13;
+        add r8, 1;
+      ir_bg_dup_j:
+        cmp r8, rbp;
+        jae ir_bg_dup_i_next;
+        // Compare 16-byte name_inline at i and j.
+        // name_i_base = directives + i*48 + 16
+        //             = i*32 + i*16 + 16.
+        mov r10, r13;
+        shl r10, 5;                            // i*32
+        mov r11, r13;
+        shl r11, 4;                            // i*16
+        add r10, r11;                          // i*48
+        add r10, 16;                           // IR_OFF_NAME_INLINE
+        mov r14, rbx;
+        add r14, r10;                          // r14 = &name_i[0]
+
+        // name_j_base = directives + j*48 + 16
+        mov r10, r8;
+        shl r10, 5;
+        mov r11, r8;
+        shl r11, 4;
+        add r10, r11;
+        add r10, 16;
+        mov r9, rbx;
+        add r9, r10;                           // r9 = &name_j[0]
+
+        // Compare 2 u64 words.
+        mov rax, [r14 + 0];
+        mov rdx, [r9 + 0];
+        cmp rax, rdx;
+        jne ir_bg_dup_j_next;
+        mov rax, [r14 + 8];
+        mov rdx, [r9 + 8];
+        cmp rax, rdx;
+        jne ir_bg_dup_j_next;
+        // Both halves equal -> duplicate. Also require non-empty name
+        // (first byte != 0) to avoid false-positive on zero-padded.
+        xor rax, rax;
+        mov_b rax, [r14 + 0];
+        cmp rax, 0;
+        je  ir_bg_dup_j_next;
+        jmp ir_bg_dup_err;
+
+      ir_bg_dup_j_next:
+        add r8, 1;
+        jmp ir_bg_dup_j;
+
+      ir_bg_dup_i_next:
+        add r13, 1;
+        jmp ir_bg_dup_i;
+
+        // ---- Build adjacency ------------------------------------------
+      ir_bg_build_begin:
+        xor r13, r13;                          // i = 0
+
+      ir_bg_build_loop:
+        cmp r13, rbp;
+        jae ir_bg_ok;
+
+        // dir_base = directives + i*48; validate magic.
+        mov r10, r13;
+        shl r10, 5;                            // i*32
+        mov r11, r13;
+        shl r11, 4;                            // i*16
+        add r10, r11;                          // i*48
+        mov r9, rbx;
+        add r9, r10;                           // r9 = dir_base
+        xor rax, rax;
+        mov_d rax, [r9 + 0];                   // magic
+        cmp rax, 0x54504D49;                   // IR_RECORD_MAGIC
+        jne ir_bg_bad_rec;
+
+        // row_base = out_graph + i*36.
+        mov r10, r13;
+        shl r10, 5;
+        mov r11, r13;
+        shl r11, 2;
+        add r10, r11;                          // i*36
+        mov r14, r12;
+        add r14, r10;                          // r14 = row_base
+
+        // Write n_imports u32 = 1 at [row_base + 0].
+        mov rax, 1;
+        mov_d [r14 + 0], rax;
+
+        // Write import[0] u32 = (i + 1) mod n_directives at [row_base + 4].
+        mov rax, r13;
+        add rax, 1;
+        cmp rax, rbp;
+        jb  ir_bg_import_ok;
+        xor rax, rax;                          // wrap to 0
+      ir_bg_import_ok:
+        mov_d [r14 + 4], rax;
+
+        add r13, 1;
+        jmp ir_bg_build_loop;
+
+      ir_bg_ok:
+        mov rax, rbp;
+        shl rax, 32;                           // IR_OK = 0
+        jmp ir_bg_epilogue;
+
+      ir_bg_too_many:
+        xor rax, rax;
+        shl rax, 32;
+        or  rax, 0x5906;                       // IR_ERR_TOO_MANY_MODULES
+        jmp ir_bg_epilogue;
+
+      ir_bg_oos:
+        xor rax, rax;
+        shl rax, 32;
+        or  rax, 0x5903;                       // IR_ERR_OUT_TOO_SMALL
+        jmp ir_bg_epilogue;
+
+      ir_bg_bad_rec:
+        xor rax, rax;
+        shl rax, 32;
+        or  rax, 0x5904;                       // IR_ERR_BAD_RECORD
+        jmp ir_bg_epilogue;
+
+      ir_bg_dup_err:
+        xor rax, rax;
+        shl rax, 32;
+        or  rax, 0x5912;                       // E1102_DUPLICATE_NAME
+        jmp ir_bg_epilogue;
+
+      ir_bg_epilogue:
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _ir_detect_cycle(graph, graph_len, out_cycle_path, out_cap)
+  //                                 -> (count << 32) | status
+  //
+  //   rdi = graph              (ImportAdjRow[graph_len]; 36-byte stride)
+  //   rsi = graph_len
+  //   rdx = out_cycle_path     (u32 post-order output buffer)
+  //   rcx = out_cap
+  //   rax = (n_modules << 32) | IR_OK            on success
+  //         (stack_depth << 32) | E1100_IMPORT_CYCLE on cycle
+  //         (0 << 32) | IR_ERR_*                 on invariant failure
+  //
+  // Iterative three-colour DFS. Mirrors R133.M3 ImportGraph exactly:
+  //
+  //   WHITE (0)  node not yet visited
+  //   GRAY  (1)  node currently on the DFS stack
+  //   BLACK (2)  node fully explored
+  //
+  // Each stack frame is (node_idx u64, next_child_idx u64) = 16 bytes.
+  // Scratch arrays live in this module's `.bss` (_ir_color 64 B,
+  // _ir_stk 1024 B).
+  //
+  // Labels prefixed ir_dc_.
+  // ==========================================================================
+  pub let _ir_detect_cycle : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (graph: u64) (graph_len: u64) (out_cycle_path: u64)
+       (out_cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "R227.M3 (#2705): _ir_detect_cycle runs iterative three-colour DFS over a 36-byte-stride adjacency table and emits a post-order u32 stream of n_modules into out_cycle_path on OK; on cycle it returns the DFS stack depth packed into bits [63:32] with low16 = E1100_IMPORT_CYCLE 0x5910. Byte-for-byte mirror of R133.M3 ImportGraph's algorithm; shares the same colour palette (WHITE=0 GRAY=1 BLACK=2) and the same encoding of stack frames (16 B each: u64 node + u64 next_child). 6 callee-save pushes (rbx=graph_ptr, rbp=graph_len, r12=out_cycle_path, r13=out_cap, r14=stk_bytes, r15=write_cursor) + sub rsp,16 for the start_i spill so the inner DFS loop may freely clobber every caller-save register (same discipline as R133.M3 _ig_build_order). Entry rsp%16==8; +48 pushes +16 sub = +64; (8+64)%16==0 at body. Pure leaf; no CALL. Guards: graph_len <= IR_MAX_NODES 64 (IR_ERR_TOO_MANY_MODULES 0x5906); out_cap >= graph_len * 4 (IR_ERR_OUT_TOO_SMALL 0x5903). Scratch zero-fill: _ir_color[0..graph_len) via byte stores. Outer loop walks each WHITE node as a fresh DFS root: push frame; inner DFS loop pops when next_child >= n_imports (appending node to post-order via mov_d at [out + write_cursor*4]; BLACK the node; stk_bytes -= 16); loads child, (I4) checks child < graph_len (IR_ERR_BAD_NODE), looks up color[child]: GRAY -> back-edge = cycle (E1100_IMPORT_CYCLE; path_len = stk_bytes >> 4); BLACK -> advance next_child; WHITE -> push new frame, GRAY color[child]. Stride 36 computed as shl r10,5 + shl r11,2 + add r10,r11 (i*32 + i*4 = i*36); stride 16 (DFS frame) via shl r10,4; stride 4 (u32) via shl r10,2 (no 2-op imul-r-imm). All cmp immediates (0, 1, 2, 4, 8, 16, 32, 36, 64, status codes 0x5903, 0x5905, 0x5906, 0x5910) fit imm32 with bit 31 clear. No test; no and-imm64; no multiline let. Labels prefixed ir_dc_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;
+
+        mov rbx, rdi;                          // graph_ptr
+        mov rbp, rsi;                          // graph_len
+        mov r12, rdx;                          // out_cycle_path
+        mov r13, rcx;                          // out_cap
+
+        xor rax, rax;
+        mov [rsp + 0], rax;                    // start_i = 0
+        mov [rsp + 8], rax;                    // reserved pad
+
+        // ---- Validate args --------------------------------------------
+        cmp rbp, 64;                           // IR_MAX_NODES
+        ja  ir_dc_too_many;
+
+        // out_cap >= graph_len * 4
+        mov r10, rbp;
+        shl r10, 2;
+        cmp r13, r10;
+        jb  ir_dc_oos;
+
+        // ---- Zero _ir_color[0..graph_len) -----------------------------
+        lea r9, [rip + _ir_color];
+        xor r10, r10;
+        xor rax, rax;
+      ir_dc_zc_loop:
+        cmp r10, rbp;
+        jae ir_dc_zc_done;
+        mov_b [r9 + r10 * 1], rax;
+        add r10, 1;
+        jmp ir_dc_zc_loop;
+
+      ir_dc_zc_done:
+        xor r14, r14;                          // stk_bytes = 0
+        xor r15, r15;                          // write_cursor = 0
+
+        // ---- Outer loop (visit every unvisited node) ------------------
+        xor rax, rax;
+        mov [rsp + 0], rax;                    // start_i = 0
+
+      ir_dc_outer:
+        mov rcx, [rsp + 0];
+        cmp rcx, rbp;
+        jae ir_dc_outer_done;
+
+        // color[start_i] == WHITE?
+        lea r9, [rip + _ir_color];
+        xor rax, rax;
+        mov_b rax, [r9 + rcx * 1];
+        cmp rax, 0;                            // IR_WHITE
+        jne ir_dc_outer_next;
+
+        // Mark GRAY and push initial frame.
+        mov r10, 1;                            // IR_GRAY
+        mov_b [r9 + rcx * 1], r10;
+
+        lea r9, [rip + _ir_stk];
+        mov [r9 + 0], rcx;                     // frame[0].node
+        xor rax, rax;
+        mov [r9 + 8], rax;                     // frame[0].next_child
+        mov r14, 16;                           // stk_bytes = 16
+
+        // ---- Inner DFS loop -------------------------------------------
+      ir_dc_dfs:
+        cmp r14, 0;
+        je  ir_dc_outer_next;
+
+        // top frame
+        lea r9, [rip + _ir_stk];
+        mov r10, r14;
+        sub r10, 16;
+        add r9, r10;                           // r9 = &top_frame
+        mov rax, [r9 + 0];                     // cur_i
+        mov rsi, [r9 + 8];                     // next_child
+
+        // row_base = graph + cur_i*36.
+        mov r10, rax;
+        shl r10, 5;
+        mov r11, rax;
+        shl r11, 2;
+        add r10, r11;
+        mov r8, rbx;
+        add r8, r10;                           // r8 = row_base
+
+        // n_imports (u32 @ row+0).
+        xor r11, r11;
+        mov_d r11, [r8 + 0];
+        cmp r11, 8;                            // IR_MAX_IMPORTS
+        ja  ir_dc_too_many_imp;
+
+        // next_child >= n_imports -> emit cur_i and pop.
+        cmp rsi, r11;
+        jae ir_dc_frame_done;
+
+        // child = import[next_child] (u32 @ row+4+rsi*4).
+        mov r10, rsi;
+        shl r10, 2;
+        add r10, 4;
+        mov r11, r8;
+        add r11, r10;
+        xor rdx, rdx;
+        mov_d rdx, [r11 + 0];                  // child
+
+        // Advance next_child in top frame.
+        add rsi, 1;
+        mov [r9 + 8], rsi;
+
+        // child < graph_len
+        cmp rdx, rbp;
+        jae ir_dc_bad_node;
+
+        // color[child]
+        lea r9, [rip + _ir_color];
+        xor rax, rax;
+        mov_b rax, [r9 + rdx * 1];
+        cmp rax, 1;                            // IR_GRAY
+        je  ir_dc_cycle;
+        cmp rax, 2;                            // IR_BLACK
+        je  ir_dc_dfs;                         // already fully explored
+
+        // WHITE: push new frame.
+        mov r10, 1;                            // IR_GRAY
+        mov_b [r9 + rdx * 1], r10;             // color[child] = GRAY
+
+        lea r9, [rip + _ir_stk];
+        mov r11, r14;                          // byte offset of next frame
+        add r9, r11;                           // r9 = &new_frame
+        mov [r9 + 0], rdx;                     // new_frame.node = child
+        xor rax, rax;
+        mov [r9 + 8], rax;                     // next_child = 0
+        add r14, 16;
+        jmp ir_dc_dfs;
+
+      ir_dc_frame_done:
+        // Append cur_i (rax from top-frame load above was clobbered; reload).
+        lea r9, [rip + _ir_stk];
+        mov r10, r14;
+        sub r10, 16;
+        add r9, r10;
+        mov rax, [r9 + 0];                     // cur_i
+
+        // color[cur_i] = BLACK
+        lea r9, [rip + _ir_color];
+        mov r10, 2;
+        mov_b [r9 + rax * 1], r10;
+
+        // out[write_cursor] = cur_i (u32)
+        mov r10, r15;
+        shl r10, 2;
+        mov r11, r12;
+        add r11, r10;
+        mov_d [r11 + 0], rax;
+        add r15, 1;
+
+        // pop.
+        sub r14, 16;
+        jmp ir_dc_dfs;
+
+      ir_dc_outer_next:
+        mov rax, [rsp + 0];
+        add rax, 1;
+        mov [rsp + 0], rax;
+        jmp ir_dc_outer;
+
+      ir_dc_outer_done:
+        // Pack return: (n_modules << 32) | IR_OK.
+        mov rax, r15;
+        shl rax, 32;
+        jmp ir_dc_epilogue;
+
+      ir_dc_cycle:
+        // Packed stack depth upper-bound.
+        mov rax, r14;
+        shr rax, 4;                            // frames = stk_bytes / 16
+        shl rax, 32;
+        or  rax, 0x5910;                       // E1100_IMPORT_CYCLE
+        jmp ir_dc_epilogue;
+
+      ir_dc_too_many:
+        xor rax, rax;
+        shl rax, 32;
+        or  rax, 0x5906;                       // IR_ERR_TOO_MANY_MODULES
+        jmp ir_dc_epilogue;
+
+      ir_dc_oos:
+        xor rax, rax;
+        shl rax, 32;
+        or  rax, 0x5903;                       // IR_ERR_OUT_TOO_SMALL
+        jmp ir_dc_epilogue;
+
+      ir_dc_too_many_imp:
+        xor rax, rax;
+        shl rax, 32;
+        or  rax, 0x5905;                       // IR_ERR_TOO_MANY_IMPORTS
+        jmp ir_dc_epilogue;
+
+      ir_dc_bad_node:
+        xor rax, rax;
+        shl rax, 32;
+        or  rax, 0x5904;                       // IR_ERR_BAD_RECORD (reused)
+        jmp ir_dc_epilogue;
+
+      ir_dc_epilogue:
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+}

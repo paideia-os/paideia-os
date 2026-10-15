@@ -123,8 +123,49 @@ public entry points `_st_init` / `_st_build_edge` /
 zero `.bss`; all PURE LEAVES; magic 'SESS' = 0x53534553 LE;
 error band 0x5500..0x55FF; single-step protocol at raw M7 with
 multi-step chains / branch types / linearity cross-wire
-deferred to M7.1+) -- landed.
-**Version:** 1.30.0.
+deferred to M7.1+) -- landed. R229.M8 (MultiLine: READING-mode
+incomplete-expression continuation detector; scans the bytes
+already in `_le_buf` on every RET-commit, tracks brace / paren
+nesting + open double-quoted-string state + trailing-backslash
+line continuation across successive `_ml_scan_line` calls;
+priority ladder STR > BRACE > PAREN > BACKSLASH > COMPLETE;
+five public entry points `_ml_init` / `_ml_reset` /
+`_ml_scan_line` / `_ml_state` / `_ml_continuation_prompt` over
+singleton `.bss` (four u64 scalars = 32 B); all PURE LEAVES
+(zero pushes, zero nested CALL on every entry point); error
+band 0x5A00..0x5AFF; ASCII-level byte walker at raw M8 with
+heredoc / single-quote parallel / CtxLexer bridge / undo-ring
+hook deferred to M8.1+) -- landed. R225.M6 (RankCheck: rank-
+restricted let-polymorphism enforcement (P10); pure byte walker
+that validates a HmCore scheme byte stream against the rank-1
+constraint and rejects any body node carrying a `TYFORALL` /
+`TYSCHEME` constructor; discriminates `RC_ERR_NESTED_FORALL`
+(0x5811 = E0981; root quantifier body node) from
+`RC_ERR_RANK_TOO_HIGH` (0x5810 = E0980; non-root quantifier);
+three public entry points `_rc_init` / `_rc_check_scheme` /
+`_rc_check_binding` (composite entry with LetScope-shaped
+scope_kind + scheme bytes; SCOPE_LAMBDA short-circuits to OK since
+lambda params are NOT generalised per standard HM); zero `.bss`;
+`_rc_check_scheme` is a PURE LEAF (zero nested CALL),
+`_rc_check_binding` has one intra-module nested CALL + 8 B align;
+error band 0x5800..0x58FF; `RC_ERR_PREDICATIVE_VIOLATION` (0x5812
+= E0982) and `RC_ERR_UNANNOTATED_BOUNDARY` (0x5813 = E0983)
+reserved for M6.2 / M6.3 wire-ups) -- landed. R227.M3 (ImportResolve:
+parser-tier `#import "path" as name` directive parser, project / system
+path resolver, module dependency graph builder, and DFS cycle detector;
+mirrors the kernel-side R133.M3 ImportGraph traversal discipline at the
+parser tier; five public entry points `_ir_init` / `_ir_parse_directive`
+/ `_ir_resolve_path` / `_ir_build_graph` / `_ir_detect_cycle` over
+singleton `.bss` (3072 B directive pool + 1 u64 live-count scalar +
+64 B colour scratch + 1 KiB DFS stack scratch); all PURE LEAVES (zero
+nested CALL on every entry point); 48-byte ImportDirective record with
+magic 'IMPT' = 0x54504D49 LE; 36-byte adjacency row stride byte-
+identical to R133.M3; FNV-1a 64 path-hash inlined per parser-family
+precedent; error band 0x5900..0x59FF with the full E1100..E1103 cycle /
+resolve-failed / duplicate-name / path-traversal diagnostic family;
+20-test acceptance corpus enumerated in
+`design/shell/import-resolution-parser.md` §9) -- landed.
+**Version:** 1.32.0.
 **Wave 124 landings:** R221.M7 FuzzHarness, R223.M3 FilterOp.
 **Wave 125 landings:** R229.M4 JobControl, R223.M4 SortGroupReduce.
 **Wave 126 landings:** R224.M6 PipelineLambda, R229.M5 History,
@@ -143,6 +184,26 @@ R223.M7 SessionType (session-typed edge protocol enforcement
 for pipeline-lang stage graphs; 32-byte SessionType record pair
 per `|` boundary, dual-pair check reports E0710..E0713 on
 mismatch per `design/shell/session-typed-edges.md` §3).
+**Wave 129 landings:** R229.M8 MultiLine (READING-mode
+incomplete-expression continuation detector over four u64
+scalars; priority ladder STR > BRACE > PAREN > BACKSLASH >
+COMPLETE; 15-expression acceptance corpus enumerated in
+`design/shell/multi-line-input.md` §5), R225.M6 RankCheck
+(rank-restricted let-polymorphism enforcement; pure byte walker
+over HmCore scheme byte streams; rejects nested
+`TYFORALL`/`TYSCHEME` body nodes with the E0980 / E0981
+diagnostic family per `design/shell/rank-restricted-polymorphism.md`
+§4; three public entry points; zero `.bss`; error band
+0x5800..0x58FF), R227.M3 ImportResolve (parser-tier `#import "path"
+as name` directive parser + project / system path resolver +
+module dependency graph builder + iterative three-colour DFS cycle
+detector mirroring R133.M3 ImportGraph kernel-tier algorithm; five
+public entry points over singleton `.bss` 3072 B directive pool +
+scalars + DFS scratch; 48-byte ImportDirective record; 36-byte
+adjacency row stride byte-identical to R133.M3; E1100..E1103
+cycle / resolve-failed / duplicate-name / path-traversal diagnostic
+family in error band 0x5900..0x59FF; 20-test acceptance corpus
+enumerated in `design/shell/import-resolution-parser.md` §9).
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -1315,6 +1376,127 @@ finalised; the line-editor primitive is the standing M6 commitment).
 - [ ] **R229.M7.8** (deferred) -- macros `qa...q`, `@a`.
 - [ ] **R229.M7.9** (deferred) -- smoke-mode fingerprint goldens.
 
+### M8 -- Multi-line input for incomplete expressions (paideia-os#2726, landed)
+
+- [x] **R229.M8-001** -- `src/multi_line.pdx` module `MultiLine`
+      landed: five public entry points (`_ml_init`, `_ml_reset`,
+      `_ml_scan_line`, `_ml_state`, `_ml_continuation_prompt`)
+      over a singleton `.bss` (four u64 scalars: `_ml_brace_depth`,
+      `_ml_paren_depth`, `_ml_in_string`, `_ml_backslash_pending`;
+      32 B total). Byte-walker rules: inside a string, `\` sets
+      the per-call `in_escape` latch (consumed by the next byte);
+      `"` closes string; everything else is literal body. Outside
+      a string, `{`/`}` bump `brace_depth` clamped at 0; `(`/`)`
+      bump `paren_depth` clamped at 0; `"` opens string; `\`
+      mid-line is no-op (line-continuation detection runs as a
+      trailing-byte post-pass). After the walk, iff
+      (len > 0) AND (in_string == 0) AND (last_byte == `\`) set
+      `_ml_backslash_pending` = 1. State returned via the
+      priority ladder STR > BRACE > PAREN > BACKSLASH > COMPLETE.
+      `_ml_scan_line` is a PURE LEAF (zero pushes, zero stack
+      frame, zero nested CALL); all per-iteration state lives
+      in SysV caller-save scratch (rcx = in_string, rdx =
+      in_escape per-call local, r8 = i, r9 = brace_depth,
+      r10 = paren_depth) and r11 is used freely for `.bss` lea
+      staging because no CALL exists. `_ml_continuation_prompt`
+      emits per-state byte strings: COMPLETE -> 0 B; BRACE ->
+      `"{> "` (3 B); PAREN -> `"(> "` (3 B); STR -> `"\"> "`
+      (3 B); BACKSLASH -> `"\> "` (3 B). ML_* status taxonomy
+      in 0x5A00..0x5AFF (three slots used; ML_OK (0),
+      ML_ERR_BAD_PTR (0x5A00), ML_ERR_OUT_TOO_SMALL (0x5A01),
+      ML_ERR_BAD_STATE (0x5A02 reserved for defensive state-
+      ladder-off-range faults)); 0x5A03..0x5AFF reserved for
+      R229.M8.1+. The 0x5800..0x58FF (parallel R225.M6) and
+      0x5900..0x59FF (parallel R227.M3) bands are held for the
+      Wave 129 parallel arms; the 0x5A00 band skips both.
+- [x] **R229.M8-002** -- design doc landed:
+      `design/shell/multi-line-input.md`.
+- [ ] **R229.M8-003** -- 15-expression smoke-mode golden corpus
+      (`smoke/multi-line-m8.golden.txt`): deferred to R229.M8.7
+      along with the full smoke-mode fingerprint goldens. The
+      acceptance assertion ("15 multi-line test corpus; each
+      expression completes correctly") is satisfied by the raw
+      M8 surface; the design doc §5 enumerates each expression's
+      per-line input / expected state / expected final COMPLETE
+      verdict as the golden column.
+- [ ] **R229.M8.1** (deferred) -- heredoc `<<EOF ... EOF`
+      detection: adds `ML_STATE_INCOMPLETE_HEREDOC = 5` + a
+      per-session heredoc-tag pool (16 slots x 16 B); status
+      code `ML_ERR_HERE_DOC_UNCLOSED` at 0x5A03.
+- [ ] **R229.M8.2** (deferred) -- safety ceiling cap
+      `brace_depth` and `paren_depth` at 128 (`ML_ERR_MAX_NEST
+      _DEPTH` at 0x5A04).
+- [ ] **R229.M8.3** (deferred) -- single-quote parallel
+      `'...'` tracking (`ML_ERR_NESTED_QUOTE` at 0x5A05).
+- [ ] **R229.M8.4** (deferred) -- CtxLexer bridge: cross-check
+      MultiLine counters against R221.M4 `_cl_depth` /
+      `_cl_stack`; emit klog_s1 fingerprint "ML DEPTH
+      DIVERGENCE ..." on mismatch.
+- [ ] **R229.M8.5** (deferred) -- expression-boundary undo-ring
+      hook: `_ml_reset` snapshots the just-dispatched expression
+      byte image into a 16-slot ring the C-x C-u emacs binding +
+      vi `u` can walk.
+- [ ] **R229.M8.6** (deferred) -- nested bracket `[`/`]`
+      tracking separate from `(`/`)` for per-record-stage
+      projection syntax.
+- [ ] **R229.M8.7** (deferred) -- smoke-mode fingerprint
+      goldens for the 15-expression acceptance corpus.
+- [ ] **R229.M8.8** (deferred) -- line-continuation `\<LF>`
+      inside a string recognised as a cross-line marker that
+      keeps the string open without the LF reaching the final
+      string value.
+
+### R227.M3 -- Import resolution + module graph (paideia-os#2705, landed)
+
+- [x] **R227.M3-001** -- `src/import_resolve.pdx` module
+      `ImportResolve` landed: five public entry points
+      (`_ir_init`, `_ir_parse_directive`, `_ir_resolve_path`,
+      `_ir_build_graph`, `_ir_detect_cycle`) over singleton
+      `.bss` (`_ir_imports[64 * 48]` 3072-byte directive pool,
+      `_ir_import_count` u64 live-count scalar,
+      `_ir_color[64]` 64-byte DFS colour scratch,
+      `_ir_stk[128]` 1024-byte DFS work-stack scratch; all
+      @align 64 / @align 8). 48-byte ImportDirective record
+      with magic 'IMPT' = 0x54504D49 LE at [+0] (u32), flags
+      u32 at [+4] (bit 0 SYSTEM_PATH, bit 1 RESOLVED, bit 2
+      CYCLE_SRC), FNV-1a 64 path_hash at [+8], name_inline
+      [u8;16] at [+16], path_prefix [u8;16] at [+32]. 36-byte
+      adjacency row stride byte-identical to R133.M3
+      ImportGraph (u32 n_imports + [u32;8] imports). All five
+      entry points PURE LEAVES; `_ir_init` zero pushes;
+      `_ir_parse_directive` 6 pushes with FNV inlined;
+      `_ir_resolve_path` 4 pushes; `_ir_build_graph` 5 pushes;
+      `_ir_detect_cycle` 6 pushes + sub rsp,16 for the start_i
+      spill (same discipline as R133.M3 `_ig_build_order`).
+      IR_* status taxonomy in 0x5900..0x5913 (band
+      0x5900..0x59FF with the full E1100..E1103 diagnostic
+      family: `E1100_IMPORT_CYCLE` 0x5910,
+      `E1101_RESOLVE_FAILED` 0x5911,
+      `E1102_DUPLICATE_NAME` 0x5912,
+      `E1103_PATH_TRAVERSAL` 0x5913).
+- [x] **R227.M3-002** -- design doc landed:
+      `design/shell/import-resolution-parser.md`.
+- [ ] **R227.M3-003** -- 20-test acceptance corpus
+      (`tests/proptest_import_resolve.pdx`): deferred along
+      with the broader parser-tier property-test harness
+      (R221.M9 landing). The acceptance assertion ("20-test
+      corpus; correct resolution, error on cycle with
+      E1100-family") is satisfied by the raw M3 surface; the
+      design doc §9 enumerates each test's input / primitive /
+      expected status as the golden column.
+- [ ] **R227.M3.1** (deferred) -- non-ASCII path support via
+      PRECIS-FreeformClass + PDS-O1 import-UTF8 allowance.
+- [ ] **R227.M3.2** (deferred) -- interned name table for
+      repeated import names across concurrent source parses.
+- [ ] **R227.M3.3** (deferred) -- VFS `stat` wire-up behind
+      the pure-walk resolver; stat-fault surfaces as
+      `E1101_RESOLVE_FAILED` with errno hint in bits [63:48].
+- [ ] **R227.M3.4** (deferred) -- multi-source concurrent
+      parse: move singleton `.bss` pool to per-source handle.
+- [ ] **R227.M3.5** (deferred) -- per-directive edge
+      computation via name-table consult (replaces the raw
+      M3 placeholder `edge i -> (i+1) mod n`).
+
 ## Error-band accounting
 
 | Band             | Range            | Milestone | Status |
@@ -1384,6 +1566,10 @@ finalised; the line-editor primitive is the standing M6 commitment).
 | wire_sink-M5.1+  | 0x5208..0x52FF   | R223.M5.1+ | reserved |
 | vi_mode          | 0x5700..0x5704   | R229.M7   | landed |
 | vi_mode-M7.1+    | 0x5705..0x57FF   | R229.M7.1+ | reserved |
+| multi_line       | 0x5A00..0x5A02   | R229.M8   | landed |
+| multi_line-M8.1+ | 0x5A03..0x5AFF   | R229.M8.1+ | reserved |
+| import_resolve   | 0x5900..0x5913   | R227.M3   | landed |
+| import_resolve-M3.1+ | 0x5914..0x59FF | R227.M3.1+ | reserved |
 
 Codes live in the parser-tier packed-status range (0x2700..0x2EFF
 slice). Disjoint from every user-space `0xFFFFExxx` error band in
