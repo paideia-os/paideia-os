@@ -4,6 +4,164 @@ All notable changes to this library are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) +
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] -- 2026-10-14
+
+R222.M2 of the semantic-shell cmd-functor umbrella (paideia-os#2486,
+decomposed into paideia-os#2659 for this M2) -- COMMANDSIG: the
+cmd-functor-identity block that declares a command's human-readable
+name, required capability set (up to 8 (name, rights) pairs),
+SemVer-shaped version, and stability tier. Lands as the second R222
+wave on the parser-tier satellite, companion to R222.M1 SchemasSig
+(which declared the command's input + output record SHAPES).
+
+### Added
+
+- `src/command_sig.pdx` module `CommandSig`: parser-tier primitive
+  that recognises a `command_sig { ... }` body and emits a flat
+  128-byte CommandSigHeader followed by up to 8 x 32-byte CapDecl
+  descriptors.
+  - `_cs_parse_body(bytes_ptr, bytes_len, out_ptr, out_cap) -> packed_u64`
+    -- public entry point. Parses whitespace-separated `name :
+    "..."`, `cap : <name> : 0x<rights>`, `version : "..."`, and
+    `stability : (stable | experimental | deprecated)` decls in any
+    order (duplicates land last-wins; max 8 cap decls per sig).
+    Returns `(bytes_written << 32) | status`.
+  - `_cmd_sig_skip_ws(bytes_ptr, bytes_len, cursor) -> new_cursor`
+    -- pure leaf ASCII-whitespace skipper. Mirrors SchemasSig /
+    LambdaLit / Datalog leaves byte-for-byte so the whitespace
+    discipline is a shared property of the pds-lang family.
+  - `_cmd_sig_fnv1a64(ptr, len) -> u64` -- pure leaf FNV-1a 64 hash
+    over the cap-name bytes. Uses `mul rcx` (one-op unsigned mul)
+    with the standard 64-bit FNV prime (0x100000001B3) loaded via
+    `mov rN, imm64`; the one-op mul form is distinct from the
+    pitfall-listed 2-op `imul r, imm`.
+  - CommandSigHeader (128 B): magic u32 'CSIG' (= 0x47495343),
+    n_caps u8, stability u8, name_len u8, version_len u8,
+    name_inline `[u8; 48]`, version_inline `[u8; 16]`, caps_offset
+    u32, caps_len u32, flags u32 (has-name / has-version /
+    has-stability bits), reserved `[u8; 44]`.
+  - CapDecl descriptor (32 B each): name_hash u64 (FNV-1a 64 of
+    the full cap name; identity hash preserving names past the
+    16-byte inline window), rights u64 (bitmask parsed from
+    HEX_RIGHTS), name_inline `[u8; 16]` (first 16 bytes of the cap
+    name, zero-padded, truncated past 16 chars).
+  - Grammar M2 scope: `name` len 1..48 printable ASCII in quotes,
+    `cap` ident 1..48 chars + `0x<hex>` rights (1..16 hex digits),
+    `version` len 1..16 printable ASCII in quotes, `stability`
+    unquoted keyword from the fixed `{stable, experimental,
+    deprecated}` set. Max 8 cap decls per sig (CS_MAX_CAPS).
+  - Error band `0x3300..0x33FF` (R222.M2 CommandSig):
+    - `CS_OK = 0`
+    - `CS_ERR_SYNTAX = 0x3300`
+    - `CS_ERR_TOO_MANY_CAPS = 0x3301`
+    - `CS_ERR_UNKNOWN_STABILITY = 0x3302`
+    - `CS_ERR_OUT_TOO_SMALL = 0x3303`
+  - Pure in-process; no KIND surface; no external linker
+    dependencies.
+  - Label prefix `cmd_sig_` (not `cs_` -- `cs_*` is already used by
+    203 kernel-side labels + 30 user-space labels across the repo,
+    grep-confirmed at R222.M2 landing time). The public API still
+    owns the `_cs_*` entry-point namespace since that is a distinct
+    "with-underscore prefix" convention.
+
+### Changed
+
+- `src/lib.pdx` bumps `LPX_PDS_PARSER_VERSION_MINOR` 8 -> 9 and
+  adds the R222 feature-gate block
+  (`LPX_PDS_PARSER_R222_M1_READY = 1`,
+   `LPX_PDS_PARSER_R222_M2_READY = 1`, M3..M8 reserved).
+- `caps.decl` adds the `0x3300..0x33FF` R222.M2 band entry,
+  R222.M1 + R222.M2 consumed_kinds landing notes, grep-disjointness
+  confirmation for `0x330[0-3]`, and R222.M1 / R222.M2 linker-
+  dependency notes (both are pure-leaf; no external deps).
+
+### Design notes
+
+- `design/shell/cmd-functor-command-sig.md` -- grammar, record
+  layout, interaction with R222.M1 SchemasSig + R227.M2 cap-decl
+  checker + R133.M2 container header pragma gate.
+
+## [1.8.0] -- 2026-10-14
+
+R223.M2 of the semantic-shell pipeline-lang umbrella (paideia-os#2487,
+decomposed into paideia-os#2667 for this M2) -- RECORD PROJECTION:
+the `select FIELDS` / `project FIELDS` pipeline operators that filter
+the typed-record stream by field name. Lands as the second R223 wave
+on the parser-tier satellite. The 1.7.0 slot is reserved for a
+parallel landing in the same wave.
+
+### Added
+
+- `src/record_projection.pdx` module `RecordProjection`: parser-tier
+  primitive that reads a comma-separated field-name list and emits
+  a flat array of 16-byte `FieldSelector` records.
+  - `_rp_parse_select(bytes_ptr, bytes_len, out_ptr, out_cap) -> packed_u64`
+    -- public entry point for the `select FIELDS` operator. Emits
+    FieldSelector records with flags = 0. Returns
+    `(n_fields << 32) | status`.
+  - `_rp_parse_project(bytes_ptr, bytes_len, out_ptr, out_cap) -> packed_u64`
+    -- public entry point for the `project FIELDS` operator. Emits
+    FieldSelector records with flags = `RP_FLAG_PROJECT` (= 1). At
+    M2 the semantics are identical to `_rp_parse_select`; the
+    per-field flag survives for R223.M3's differentiation between
+    `select` (reorder) and `project` (drop-unselected).
+  - `_rp_parse_impl(bytes_ptr, bytes_len, out_ptr, out_cap, flags_byte) -> packed_u64`
+    -- shared body of the two public wrappers; writes `flags_byte`
+    into each FieldSelector's flags slot.
+  - `_rp_skip_ws(bytes_ptr, bytes_len, cursor_in) -> new_cursor`
+    -- pure leaf whitespace skipper (SP/TAB/LF/CR). Mirrors
+    SchemasSig's `_sch_sig_skip_ws` byte-for-byte.
+  - FieldSelector record (16 B): `name_len` u8, `flags` u8,
+    `name_inline` `[u8; 14]`.
+  - Grammar: `argv_body := WS* field_name (WS* ',' WS* field_name)* WS*`;
+    `field_name := [A-Za-z_] [A-Za-z0-9_]*` with byte length
+    `1..RP_NAME_MAX = 14`.
+  - Return codes `RP_OK = 0`, `RP_ERR_SYNTAX = 0x3400`,
+    `RP_ERR_TOO_MANY_FIELDS = 0x3401`,
+    `RP_ERR_OUT_TOO_SMALL = 0x3402`.
+  - Shape constants `RP_FIELD_SELECTOR_BYTES = 16`,
+    `RP_NAME_MAX = 14`, `RP_MAX_FIELDS = 32`, plus field-offset
+    constants (`RP_OFF_NAME_LEN`, `RP_OFF_FLAGS`, `RP_OFF_NAME_INLINE`)
+    and the flag bit `RP_FLAG_PROJECT = 0x01`.
+- `src/lib.pdx` module `LibpdxPdsParser`: flipped
+  `LPX_PDS_PARSER_R223_M2_READY` from 0 to 1; minor version bump
+  1.6.0 -> 1.8.0 (the 1.7.0 slot is reserved for a parallel landing
+  in the same wave).
+- `caps.decl`: 0x3400..0x34FF error-band reservation for R223.M2;
+  disjointness proof updated against R221 utf8_nfc (0x2700..),
+  R222 schemas_sig (0x2A00..), R223.M1 pipeline (0x2B00..),
+  R224 lambda_lit (0x2C00..), R225 hm_core (0x2D00..), R226 datalog
+  (0x2E00..), and the kernel-side Pipeline module's 0xFFFFEC40..42
+  band. The two R223 submodules carve out disjoint bands so a
+  downstream dispatcher's compound error path can distinguish
+  outer-pipeline faults from inner-projection faults.
+- `STATUS.md`: R223.M2 checklist landed; error-band accounting
+  table extended with the record_projection row and the pipeline
+  slice reservation retargeted from M2+ to M3+.
+
+### Design doc
+
+- `design/shell/pipeline-record-projection.md` (NEW): grammar,
+  FieldSelector layout rationale (16 B stride with 14 B inline name
+  parallel to SchemasSig's 13 B slot plus the extra byte freed by
+  having no type_code), capacity/bound-check matrix, interaction
+  with R129.M4 schema_fmt (fields that pass projection are the
+  fields the formatter sees), interaction with R222.M1 SchemasSig
+  (bare name vs name:type declarations), interaction with R223.M1
+  Pipeline (post-pass on the stage's argv bytes), forward path to
+  R223.M3 differentiation of select vs project semantics,
+  status-code namespace reservation (0x3400..0x34FF), representative
+  OK/error cases (deferred corpus to R223.M7).
+
+### Linker dependencies
+
+- `src/record_projection.pdx` adds NO external linker dependency;
+  `_rp_parse_select` and `_rp_parse_project` are 1-nested-call
+  wrappers that CALL the module-private `_rp_parse_impl`, which in
+  turn CALLs the module-private `_rp_skip_ws` leaf; all three (plus
+  the two wrappers) live in the same object. All four public entry
+  points can be linked standalone.
+
 ## [1.6.0] -- 2026-10-14
 
 R224.M1 + R225.M1 + R226.M1 consolidated under Wave 114 — three

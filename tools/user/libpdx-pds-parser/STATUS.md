@@ -9,11 +9,12 @@
 - R225 (typechecker umbrella, paideia-os#2489)
 - R226 (datalog umbrella, paideia-os#2490)
 **Current milestones:** R221.M1 (UTF-8 decoder + NFC normalizer) --
-landed. R222.M1 (SchemasSig parser) -- landed. R223.M1 (Pipeline
-stage parser) -- landed. R224.M1 (LambdaLit grammar) -- landed.
-R225.M1 (HM algorithm W core) -- landed. R226.M1 (Datalog parser) --
-landed.
-**Version:** 1.6.0.
+landed. R222.M1 (SchemasSig parser) -- landed. R222.M2 (CommandSig
+parser) -- landed. R223.M1 (Pipeline stage parser) -- landed. R223.M2
+(RecordProjection: select/project FIELDS) -- landed. R224.M1 (LambdaLit
+grammar) -- landed. R225.M1 (HM algorithm W core) -- landed. R226.M1
+(Datalog parser) -- landed.
+**Version:** 1.9.0.
 
 See the R221 M-table in the umbrella issue (paideia-os#2485) and in
 `design/terminal/semantic-shell-language-plan.md` §4 R221 for the
@@ -83,6 +84,24 @@ Blocked by: M5. 24-hour AFL run gates landing.
       (`tests/proptest_pipeline.pdx`): deferred to R223.M7 per the
       umbrella decomposition; the design doc §12 enumerates the
       representative OK/error cases that corpus will cover.
+
+### M2 -- Record projection: select/project FIELDS (paideia-os#2667, landed)
+
+- [x] **R223.M2-001** -- `src/record_projection.pdx` module
+      `RecordProjection` landed: `_rp_parse_select` /
+      `_rp_parse_project` 1-nested-call wrappers delegate to the
+      module-private `_rp_parse_impl`; `_rp_skip_ws` is a pure leaf
+      whitespace skipper. 16-byte FieldSelector record (name_len u8,
+      flags u8, name_inline `[u8; 14]`). RP_* status taxonomy in
+      0x3400..0x34FF.
+- [x] **R223.M2-002** -- design doc landed:
+      `design/shell/pipeline-record-projection.md`.
+- [ ] **R223.M2-003** -- 20-test parser corpus
+      (`tests/proptest_record_projection.pdx`): deferred to R223.M7
+      per the umbrella decomposition; the design doc enumerates the
+      representative OK/error cases (single select, multi select,
+      multi project, over-long name, trailing comma, empty input,
+      cap-exceeding list).
 
 ## R224 lambda-lang checklist
 
@@ -157,7 +176,9 @@ Blocked by: M4. 20-test parser corpus + fuzz run gate landing.
 | span_map         | 0x2760..0x276F   | R221.M6   | reserved |
 | schemas_sig      | 0x2A00..0x2A03   | R222.M1   | landed |
 | pipeline         | 0x2B00..0x2B04   | R223.M1   | landed |
-| pipeline-M2+     | 0x2B05..0x2BFF   | R223.M2+  | reserved |
+| pipeline-M3+     | 0x2B05..0x2BFF   | R223.M3+  | reserved |
+| record_projection | 0x3400..0x3402  | R223.M2   | landed |
+| record_projection-M3+ | 0x3403..0x34FF | R223.M3+ | reserved |
 | lambda_lit       | 0x2C00..0x2C04   | R224.M1   | landed |
 | lambda_lit-M2+   | 0x2C05..0x2CFF   | R224.M2+  | reserved |
 | hm_core          | 0x2D00..0x2D03   | R225.M1   | landed |

@@ -1,0 +1,706 @@
+// src/record_projection.pdx -- libpdx-pds-parser (paideia-os#2667, R223.M2)
+//
+// RecordProjection: parser-tier primitive that reads the ARGV bytes of
+// a pipeline stage whose head word is `select` or `project` and emits
+// a flat array of 16-byte FieldSelector records -- one per named
+// field. Consumers (R129.M4 schema_fmt, R223.M2 planner-ABI
+// materialiser follow-ups) use the resulting array to filter the
+// typed-record stream by field name before it reaches the formatter.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// R223 is the pipeline-lang umbrella (paideia-os#2487). R223.M1
+// (`src/pipeline.pdx`, Wave 113) landed the lexer-tier parser that
+// turns `cmd1 arg | cmd2 arg | ...` into PipelineStage records.
+// R223.M2 (THIS module) adds RECORD PROJECTION: when a stage's head
+// word is `select` or `project`, its argv bytes are a comma-separated
+// list of field NAMES (not full `name: type` field DECLARATIONS -- the
+// shape SchemasSig parses) that selects a subset of columns from the
+// typed-record stream flowing through the pipeline.
+//
+//   `select name1, name2, name3`
+//     -- "pass only these three fields of each record downstream;
+//        drop every other field".
+//
+//   `project name1, name2, name3`
+//     -- at R223.M2 THE SAME SEMANTICS as `select`; M3 will
+//        differentiate (project = drop unselected fields, preserving
+//        the input order of the kept fields; select = pick these
+//        fields in the specified order, possibly reordering).
+//
+// The dispatch byte sits in the FieldSelector's `flags` field so the
+// downstream M3 differentiator reads the flag rather than carrying a
+// separate "which operator?" tag per stage. All M2 users treat both
+// operators identically; the flag survives for M3+.
+//
+// =============================================================================
+// GRAMMAR
+// =============================================================================
+//
+//   argv_body := WS* field_name ( WS* ',' WS* field_name )* WS*
+//   field_name := [A-Za-z_] [A-Za-z0-9_]*       (byte length 1..RP_NAME_MAX)
+//   WS         := 0x20 | 0x09 | 0x0A | 0x0D
+//
+// Rejected: empty input, trailing comma, consecutive commas, leading
+// comma, a field_name whose byte length exceeds RP_NAME_MAX (14),
+// a non-ASCII start byte, zero fields parsed, out_cap too small to
+// hold the resulting FieldSelector array, or more than RP_MAX_FIELDS
+// (32) selectors.
+//
+// The parser's INPUT is the ARGV bytes of a `select` or `project`
+// pipeline stage AFTER the head word has been consumed. The caller
+// (the R223.M2+ stage dispatcher) locates the argv span inside the
+// PipelineStage record (word_slot 0 through n_args-1 of the stage;
+// their byte offsets live in `argv_offsets[]` / `argv_lens[]`), and
+// hands those bytes to this module. The parser treats the whole span
+// as one flat byte stream so that it accepts both
+// `select name1, name2` (single argv with the whole list inside) and
+// `select name1 , name2` (three argv tokens) -- the comma-separated
+// grammar is uniform regardless of how the pipeline tokeniser split
+// the bytes.
+//
+// =============================================================================
+// FIELDSELECTOR RECORD (16 bytes)
+// =============================================================================
+//
+//   offset  size  field
+//   ------  ----  -----------------------------------------------------
+//     0      1   name_len     u8    1 .. RP_NAME_MAX (= 14)
+//     1      1   flags        u8    bit 0 = RP_FLAG_PROJECT (project op),
+//                                   bits 1..7 reserved; 0 for `select`.
+//     2     14   name_inline  [u8; 14]  ASCII identifier, zero-padded.
+//
+//   total: 16 B (RP_FIELD_SELECTOR_BYTES)
+//
+// Rationale for the 16-byte stride:
+//
+//   * Stride is a power of two: field-index arithmetic multiplies by
+//     16 via `shl rN, 4` -- no 2-op `imul r, imm` (per
+//     feedback_pdx_encoder_pitfalls).
+//   * Max 32 fields plus one caller-side end-marker (not written by
+//     this module) fits in 528 bytes; shells seat the output buffer
+//     on stack or in the elaborator's per-session arena.
+//   * Name is INLINE (14 bytes) rather than (ptr, len): the selector
+//     array is byte-identical when hashed into a projection
+//     fingerprint, and the downstream formatter does not need to
+//     dereference back into the pipeline source bytes to compare.
+//   * The flags byte distinguishes `project` from `select` at the
+//     per-field granularity so M3's semantic split (reorder vs drop)
+//     can be applied field-by-field. At M2 all fields in one call
+//     carry the SAME flag byte -- an invariant the caller does not
+//     need to enforce because this module writes it.
+//
+// Name max is 14 bytes because that is what fits inline. SchemasSig
+// (R222.M1) chose SS_NAME_MAX = 13 because it stores the name in a
+// 14-byte slot after a 1-byte name_len and 1-byte type_code with
+// 2-byte reservation. This module has NO type_code (every selector
+// is "just a name"), so the full 14 bytes are usable for the name.
+// Names longer than 14 bytes are RP_ERR_SYNTAX -- the caller must
+// either re-type the field name or wait for R223.M3+ to introduce a
+// pointer-indirect long-name mode.
+//
+// =============================================================================
+// PUBLIC API
+// =============================================================================
+//
+//   _rp_parse_select(stage_argv_ptr, stage_argv_len,
+//                    out_fields_ptr, out_cap)        -> packed_u64
+//
+//     Parses the argv bytes of a `select` pipeline stage. Writes
+//     FieldSelector records (flags = 0) to out_fields_ptr. Returns
+//     `(n_fields << 32) | status`.
+//
+//   _rp_parse_project(stage_argv_ptr, stage_argv_len,
+//                     out_fields_ptr, out_cap)       -> packed_u64
+//
+//     Same shape; records carry flags = RP_FLAG_PROJECT. At M2 the
+//     semantics are identical; M3 differentiates.
+//
+//   Both wrappers delegate to the module-private `_rp_parse_impl`
+//   which is NOT a public entry point. A caller that wants to mix
+//   both flag kinds in one call sees that as a non-use case and
+//   invokes the two wrappers separately.
+//
+// Register maps (SysV):
+//
+//   _rp_parse_select / _rp_parse_project(rdi, rsi, rdx, rcx) -> rax
+//       rdi = bytes_ptr
+//       rsi = bytes_len
+//       rdx = out_fields_ptr
+//       rcx = out_cap
+//       rax = (n_fields << 32) | status
+//
+//   _rp_parse_impl(rdi, rsi, rdx, rcx, r8) -> rax
+//       rdi..rcx = as above
+//       r8  = flags_byte (0 for select, RP_FLAG_PROJECT for project)
+//       rax = (n_fields << 32) | status
+//
+//   _rp_skip_ws(rdi, rsi, rdx) -> rax
+//       rdi = bytes_ptr
+//       rsi = bytes_len
+//       rdx = cursor_in
+//       rax = cursor_out
+//
+// =============================================================================
+// RETURN CODES
+// =============================================================================
+//
+//   RP_OK                   = 0
+//   RP_ERR_SYNTAX           = 0x3400
+//   RP_ERR_TOO_MANY_FIELDS  = 0x3401
+//   RP_ERR_OUT_TOO_SMALL    = 0x3402
+//
+// `n_fields` is the count of FieldSelector records written on
+// success. On error, `n_fields` is the count written BEFORE the
+// fault point (caller should ignore).
+//
+// =============================================================================
+// STATUS-CODE NAMESPACE
+// =============================================================================
+//
+// RP_* codes live in 0x3400..0x34FF, disjoint from every other
+// user-space packed-status range in the paideia-os tree:
+//
+//   * libpdx-pds-parser R221.M1 utf8_nfc  U8N_*  : 0x2700..0x27FF
+//   * libpdx-pds-parser R222.M1 schemas_sig SS_* : 0x2A00..0x2AFF
+//   * libpdx-pds-parser R223.M1 pipeline PL_*    : 0x2B00..0x2BFF
+//   * libpdx-pds-parser R223.M2 record_projection RP_* : 0x3400..0x34FF
+//                                                        (this)
+//   * libpdx-pds-parser R224.M1 lambda_lit LL_*  : 0x2C00..0x2CFF
+//   * libpdx-pds-parser R225.M1 hm_core HM_*     : 0x2D00..0x2DFF
+//   * libpdx-pds-parser R226.M1 datalog DL_*     : 0x2E00..0x2EFF
+//
+// The 0x3400..0x34FF slot sits above the contiguous R221..R226 block
+// (which stops at 0x2EFF). The gap 0x2F00..0x33FF is reserved for
+// R227+ parser-tier primitives (pds container, pipeline-record row
+// types, etc.) that will land before R223.M2's semantic split in
+// M3.
+//
+// Grep confirmation at R223.M2 landing time:
+//
+//   grep -rE '0x340[0-2]' paideia-os/{src,tools,design,tests}
+//     -> no packed-status hits outside this file,
+//        design/shell/pipeline-record-projection.md and caps.decl.
+//     (0x3400 as a Unicode code point in width.pdx, as a boot witness
+//      marker in bdl_synth / owner_sweep, and 0x34000 as a cap manifest
+//      bit in r29_registry are NOT packed-status codes and sit in
+//      disjoint semantic namespaces.)
+//
+// =============================================================================
+// INTERACTIONS
+// =============================================================================
+//
+//   R129.M4 (schema_fmt)  --  the FORMATTER consumes a typed-record
+//     stream plus a schema descriptor. R223.M2's RecordProjection
+//     output is a prefilter: the fields that pass projection are the
+//     fields the formatter sees. The formatter needs no awareness of
+//     projection -- the projection pass walks each incoming record,
+//     emits only the selected (name, bytes) pairs, and hands the
+//     reduced record on. (The projection PASS itself is a separate
+//     R223.M2+ pipeline-stage dispatcher that CONSUMES this module's
+//     FieldSelector array; this module is the parser only.)
+//
+//   R222.M1 (SchemasSig)  --  parses `name: type` DECLARATIONS, not
+//     bare `name` SELECTORS. The two modules are deliberately
+//     separate: SchemasSig emits 16-byte descriptors with a type_code
+//     byte, whereas RecordProjection emits 16-byte descriptors with
+//     a flag byte and NO type (the field types are already pinned by
+//     the input record's schema). Downstream consumers that need
+//     both -- e.g. a projection pass that wants type information
+//     to render -- carry a (FieldSelector, type_code) pair in their
+//     own per-field view model.
+//
+//   R223.M1 (Pipeline)  --  this module is a POST-pass on the
+//     PipelineStage records that R223.M1 emits. The caller
+//     identifies a stage whose cmd_name matches `select` or
+//     `project`, concatenates its argv_offsets[]/argv_lens[] spans
+//     into a flat byte buffer (or passes a single argv span directly
+//     when the whole list is one quoted token), and calls the
+//     matching entry point.
+//
+//   R223.M3 (future)  --  will differentiate `select` from `project`.
+//     The CURRENT M2 flag byte is the only wire-level change needed;
+//     the downstream dispatcher reads bit 0 of each FieldSelector's
+//     flags byte and routes to either the reordering (select) or the
+//     drop-unselected (project) path at that time. Nothing in this
+//     module changes at M3.
+//
+// =============================================================================
+// paideia-as ENCODER DISCIPLINE (ABSOLUTE)
+// =============================================================================
+//
+//   - No `test rN, rN` -- every zero-check is `cmp reg, 0` or
+//     `cmp reg, imm32`.
+//   - No `and rN, imm64` -- every mask is imm8 or imm32.
+//   - No 2-op `imul r, imm` -- the 16-byte stride is handled via
+//     straight register arithmetic (increment r13 by 16, decrement
+//     r14 by 16 after each field); no index-by-16 multiply is
+//     generated.
+//   - No multiline `pub let = "..."` -- single-line justifications.
+//   - Module basename `RecordProjection` matches `record_projection.pdx`.
+//   - Labels prefixed `rp_` for `_rp_parse_impl`, `rp_sw_` for
+//     `_rp_skip_ws`, `rp_sel_` for `_rp_parse_select`, `rp_proj_` for
+//     `_rp_parse_project` -- disjoint from paideia-as reserved
+//     keywords (`loop`, `if`, `let`, `fn`, `ret`, `done`, etc.) and
+//     from every other label prefix in libpdx-pds-parser (`pl_` /
+//     `pl_ew_` for Pipeline, `sch_sig_*` for SchemasSig, `ll_*` for
+//     LambdaLit, `hm_*` for HmCore, `dl_*` for Datalog, `sch_sig_sw_`
+//     for SchemasSig's skip_ws).
+//   - All `cmp reg, imm` immediates (ASCII literals 0x20..0x7F,
+//     RP_NAME_MAX = 14, RP_MAX_FIELDS = 32, status codes
+//     0x3400..0x3402) fit in imm32 with bit 31 clear so direct
+//     `cmp reg, imm32` is sign-extension-safe. No MOVABS staging.
+//   - Byte loads via `xor rax, rax; mov_b rax, [rbx + idx * 1]` with
+//     explicit *1 scale (paideia-as #1248 + U1606 mitigation per
+//     libpdx-audit audit_file_sink precedent).
+//   - Byte stores via `mov_b [dst + disp], reg` (same shape as
+//     SchemasSig's descriptor write).
+//   - `_rp_skip_ws` is a pure leaf: no callee-save push, no stack
+//     frame, no nested CALL.
+//   - `_rp_parse_select` and `_rp_parse_project` are 1-nested-call
+//     wrappers: `sub rsp, 8` + `mov r8, imm` + `call` + `add rsp, 8`
+//     + `ret`. Entry rsp%16==8; after `sub rsp, 8` rsp%16==0; the
+//     nested CALL into `_rp_parse_impl` lands aligned.
+//   - `_rp_parse_impl` has a 6-push + 24-byte scratch frame:
+//     push rbx, rbp, r12, r13, r14, r15 (= 48 B) + sub rsp, 24
+//     -> rsp%16==0 steady (entry %16==8; +48 pushes -> %16==8;
+//     +24 scratch -> %16==0; nested CALLs into `_rp_skip_ws` land
+//     aligned).
+//
+// =============================================================================
+// Upstream: paideia-os#2487 (R223 umbrella), paideia-os#2667 (THIS
+// ticket, R223.M2). Substrate: paideia-os#2666 (R223.M1 pipeline
+// stage parser), paideia-os#2658 (R222.M1 SchemasSig -- separate
+// name:type descriptor shape; this module reuses NEITHER its code
+// path NOR its band). Design doc:
+// design/shell/pipeline-record-projection.md.
+
+module RecordProjection = structure {
+
+  // ==========================================================================
+  // SECTION 1 -- STATUS CODES (returned in low 32 bits of packed result)
+  // ==========================================================================
+
+  pub let RP_OK                   : u64 = 0
+  pub let RP_ERR_SYNTAX           : u64 = 0x3400
+  pub let RP_ERR_TOO_MANY_FIELDS  : u64 = 0x3401
+  pub let RP_ERR_OUT_TOO_SMALL    : u64 = 0x3402
+
+  // ==========================================================================
+  // SECTION 2 -- FIELDSELECTOR LAYOUT CONSTANTS
+  // ==========================================================================
+
+  pub let RP_FIELD_SELECTOR_BYTES : u64 = 16
+  pub let RP_NAME_MAX             : u64 = 14
+  pub let RP_MAX_FIELDS           : u64 = 32
+
+  // Field-descriptor offsets (bytes, from desc base).
+  pub let RP_OFF_NAME_LEN         : u64 = 0
+  pub let RP_OFF_FLAGS            : u64 = 1
+  pub let RP_OFF_NAME_INLINE      : u64 = 2
+
+  // Flag bits in the `flags` u8 at [desc + 1].
+  //
+  //   bit 0  RP_FLAG_PROJECT  set by _rp_parse_project; clear by
+  //                           _rp_parse_select. At R223.M2 both
+  //                           operators are semantically equivalent;
+  //                           R223.M3 differentiates by reading this
+  //                           bit per field.
+  pub let RP_FLAG_PROJECT         : u64 = 0x01
+
+  // ==========================================================================
+  // _rp_skip_ws(bytes_ptr, bytes_len, cursor_in) -> new_cursor
+  //
+  //   rdi = bytes_ptr
+  //   rsi = bytes_len
+  //   rdx = cursor_in
+  //   rax = cursor_out
+  //
+  // Walks the cursor forward past bytes in {0x20, 0x09, 0x0A, 0x0D}.
+  // Returns the first index at which bytes_ptr[cursor] is NOT a
+  // space-class byte, OR cursor == bytes_len (end-of-input is a
+  // valid stop).
+  //
+  // Pure leaf -- no callee-save push, no stack frame, no nested CALL.
+  // Labels prefixed rp_sw_. Shape parallel to SchemasSig's
+  // _sch_sig_skip_ws (R222.M1) byte-for-byte so the two modules'
+  // whitespace semantics stay bit-identical.
+  // ==========================================================================
+  pub let _rp_skip_ws : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (bytes_ptr: u64) (bytes_len: u64) (cursor_in: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R223.M2 (#2667): skip ASCII whitespace in {SP, TAB, LF, CR}. Pure leaf; zero pushes; no stack frame; no nested CALL. rax starts at the entry cursor and advances while [rdi + rax] is in the space-class set. The space-class check is four cmp-imm32 branches rather than a bitmap because the set is small and the branch predictor can speculate the common no-ws case. End-of-input (rax == rsi) is a valid stop and returns the current cursor unchanged. All `cmp` immediates (0x20, 0x09, 0x0A, 0x0D) fit in imm32 with bit 31 clear. Byte load via `mov_b rcx, [rdi + rax]` zero-extends into the full qword so the subsequent cmp is sign-safe. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed rp_sw_.",
+      block: {
+        mov rax, rdx;                          // cursor := cursor_in
+
+      rp_sw_loop:
+        cmp rax, rsi;
+        jae rp_sw_done;
+        xor rcx, rcx;
+        mov_b rcx, [rdi + rax];
+        cmp rcx, 0x20;
+        je  rp_sw_advance;
+        cmp rcx, 0x09;
+        je  rp_sw_advance;
+        cmp rcx, 0x0A;
+        je  rp_sw_advance;
+        cmp rcx, 0x0D;
+        je  rp_sw_advance;
+        jmp rp_sw_done;
+
+      rp_sw_advance:
+        add rax, 1;
+        jmp rp_sw_loop;
+
+      rp_sw_done:
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _rp_parse_impl(bytes_ptr, bytes_len, out_ptr, out_cap, flags_byte)
+  //
+  //   rdi = bytes_ptr
+  //   rsi = bytes_len
+  //   rdx = out_ptr
+  //   rcx = out_cap
+  //   r8  = flags_byte (0 for select, RP_FLAG_PROJECT for project)
+  //   rax = (n_fields << 32) | status
+  //
+  // Walks the comma-separated identifier list and emits one
+  // FieldSelector per field. The flag byte written to each selector
+  // is `r8` -- the caller (either _rp_parse_select or
+  // _rp_parse_project) sets it before calling.
+  //
+  // State machine:
+  //
+  //   skip_ws
+  //   if EOI               -> RP_ERR_SYNTAX (zero fields is not valid)
+  //   parse_name
+  //     name_len == 0      -> RP_ERR_SYNTAX
+  //     name_len > 14      -> RP_ERR_SYNTAX
+  //   write descriptor (name_len, flags, name bytes, zero-pad)
+  //   loop:
+  //     skip_ws
+  //     if EOI             -> RP_OK with n_fields counter
+  //     if peek == ','     -> advance, parse next
+  //     else               -> RP_ERR_SYNTAX
+  //
+  // Field-count guard: `n_fields < RP_MAX_FIELDS = 32`.
+  // Capacity guard:    `out_cap >= RP_FIELD_SELECTOR_BYTES = 16`.
+  //
+  // Register plan:
+  //   rbx = bytes_ptr
+  //   rbp = bytes_len
+  //   r12 = cursor
+  //   r13 = current_out_ptr (walks by 16 after each field)
+  //   r14 = out_cap_remaining
+  //   r15 = n_fields written so far
+  //   [rsp +  0] = flags_byte  (spilled from r8 across nested calls)
+  //   [rsp +  8] = alignment pad (unused)
+  //   [rsp + 16] = alignment pad (unused)
+  //
+  // Labels prefixed rp_.
+  // ==========================================================================
+  pub let _rp_parse_impl : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (bytes_ptr: u64) (bytes_len: u64)
+       (out_ptr: u64) (out_cap: u64)
+       (flags_byte: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R223.M2 (#2667): shared body of _rp_parse_select and _rp_parse_project. Walks a WS* name (WS* ',' WS* name)* WS* list, emits one 16-byte FieldSelector per name into out_ptr. Each FieldSelector carries (name_len u8, flags u8 = r8, name_inline 14 B zero-padded). 6 callee-save pushes (rbx=bytes_ptr, rbp=bytes_len, r12=cursor, r13=current_out_ptr, r14=cap_remaining, r15=n_fields) + sub rsp, 24 scratch (slot 0 = flags_byte spill; slots 8/16 = alignment pad) -> rsp%16==0 steady (entry %16==8, +48 pushes = %16==8, +24 scratch = %16==0). Nested CALLs into _rp_skip_ws (pure leaf) therefore need no additional per-call pad. Name scan: first byte in [A-Za-z_]; continuation in [A-Za-z0-9_]. Name length bounded 1..RP_NAME_MAX (14); 0 or > 14 -> SYNTAX. Descriptor write: name_len u8 at [r13+0], flags u8 at [r13+1], 14 ident bytes at [r13+2..15] with trailing zero-pad. Field-stride uses straight `add r13, 16; sub r14, 16; add r15, 1` after each successful emit -- no 2-op imul-r-imm. Field-count guard `cmp r15, 32; jae rp_err_too_many` and capacity guard `cmp r14, 16; jb rp_err_oos` at the top of every parse_field iteration. All `cmp` immediates (ASCII 0x20..0x7F, RP_NAME_MAX=14, RP_MAX_FIELDS=32, status codes 0x3400..0x3402, RP_FIELD_SELECTOR_BYTES=16) fit in imm32 with bit 31 clear so direct cmp-imm32 is sign-safe. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed rp_.",
+      block: {
+        // ---- Prologue --------------------------------------------------
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 24;
+
+        // Spill flags_byte (we need it across nested calls that may
+        // clobber r8).
+        mov [rsp + 0], r8;
+        xor rax, rax;
+        mov [rsp + 8], rax;                    // pad
+        mov [rsp + 16], rax;                   // pad
+
+        // Load state regs.
+        mov rbx, rdi;                          // bytes_ptr
+        mov rbp, rsi;                          // bytes_len
+        xor r12, r12;                          // cursor = 0
+        mov r13, rdx;                          // current_out_ptr
+        mov r14, rcx;                          // cap_remaining
+        xor r15, r15;                          // n_fields = 0
+
+        // Capacity guard: need at least one FieldSelector.
+        cmp r14, 16;
+        jb  rp_err_oos;
+
+        // ------------------------------------------------------------
+        // parse_field entry: zero or more fields; the FIRST call must
+        // find at least one field (EOI before first field -> SYNTAX).
+        // ------------------------------------------------------------
+      rp_parse_field:
+        // Field-count guard.
+        cmp r15, 32;                           // RP_MAX_FIELDS
+        jae rp_err_too_many;
+
+        // Capacity guard: need this field (16 B).
+        cmp r14, 16;
+        jb  rp_err_oos;
+
+        // skip_ws
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r12;
+        call _rp_skip_ws;
+        mov r12, rax;
+
+        // EOI before a field body is a syntax error (empty input, or
+        // trailing comma already consumed).
+        cmp r12, rbp;
+        jae rp_err_syntax;
+
+        // ---- Name scan ----
+        mov r10, r12;                          // name_start = cursor
+        xor rax, rax;
+        mov_b rax, [rbx + r12];
+
+        // First byte must be in [A-Za-z_].
+        cmp rax, 0x5F;                         // '_'
+        je  rp_name_cont;
+        cmp rax, 0x41;                         // 'A'
+        jb  rp_err_syntax;
+        cmp rax, 0x5A;                         // 'Z'
+        jbe rp_name_cont;
+        cmp rax, 0x61;                         // 'a'
+        jb  rp_err_syntax;
+        cmp rax, 0x7A;                         // 'z'
+        ja  rp_err_syntax;
+
+      rp_name_cont:
+        add r12, 1;
+
+      rp_name_loop:
+        cmp r12, rbp;
+        jae rp_name_done;
+        xor rax, rax;
+        mov_b rax, [rbx + r12];
+        // '_'
+        cmp rax, 0x5F;
+        je  rp_name_step;
+        // 0..9
+        cmp rax, 0x30;
+        jb  rp_name_check_alpha;
+        cmp rax, 0x39;
+        jbe rp_name_step;
+      rp_name_check_alpha:
+        // A..Z
+        cmp rax, 0x41;
+        jb  rp_name_done;
+        cmp rax, 0x5A;
+        jbe rp_name_step;
+        // a..z
+        cmp rax, 0x61;
+        jb  rp_name_done;
+        cmp rax, 0x7A;
+        ja  rp_name_done;
+      rp_name_step:
+        add r12, 1;
+        jmp rp_name_loop;
+
+      rp_name_done:
+        // name_len = cursor - name_start
+        mov r11, r12;
+        sub r11, r10;
+        cmp r11, 0;
+        je  rp_err_syntax;
+        cmp r11, 14;                           // RP_NAME_MAX
+        ja  rp_err_syntax;
+
+        // ---- Write descriptor ----
+        //   [r13 + 0]  = name_len
+        //   [r13 + 1]  = flags  (from [rsp + 0])
+        //   [r13 + 2..15] = name bytes, zero-padded.
+        mov rax, r11;
+        mov_b [r13 + 0], rax;                  // name_len
+
+        mov rax, [rsp + 0];                    // flags_byte spilled
+        mov_b [r13 + 1], rax;                  // flags
+
+        // Copy name bytes into [r13 + 2 .. r13 + 2 + name_len).
+        xor r9, r9;                            // i = 0
+      rp_name_copy:
+        cmp r9, r11;
+        jae rp_name_pad;
+        // src_addr = rbx + r10 + i
+        mov rdi, rbx;
+        add rdi, r10;
+        add rdi, r9;
+        xor rax, rax;
+        mov_b rax, [rdi + 0];
+        // dst_addr = r13 + 2 + i
+        mov rsi, r13;
+        add rsi, 2;
+        add rsi, r9;
+        mov_b [rsi + 0], rax;
+        add r9, 1;
+        jmp rp_name_copy;
+
+      rp_name_pad:
+        // Zero-pad bytes [2 + name_len .. 16).
+        mov r9, r11;
+        add r9, 2;                             // start_off = 2 + name_len
+      rp_name_pad_loop:
+        cmp r9, 16;
+        jae rp_desc_done;
+        mov rsi, r13;
+        add rsi, r9;
+        xor rax, rax;
+        mov_b [rsi + 0], rax;
+        add r9, 1;
+        jmp rp_name_pad_loop;
+
+      rp_desc_done:
+        // Advance output cursor + accounting.
+        add r13, 16;
+        sub r14, 16;
+        add r15, 1;
+
+        // skip_ws before the comma-or-EOI decision.
+        mov rdi, rbx;
+        mov rsi, rbp;
+        mov rdx, r12;
+        call _rp_skip_ws;
+        mov r12, rax;
+
+        // EOI after a field is a clean termination.
+        cmp r12, rbp;
+        jae rp_done;
+
+        // Else expect ',' then another field.
+        xor rax, rax;
+        mov_b rax, [rbx + r12];
+        cmp rax, 0x2C;                         // ','
+        jne rp_err_syntax;
+        add r12, 1;
+        jmp rp_parse_field;
+
+      rp_done:
+        // Pack return: (n_fields << 32) | RP_OK.
+        mov r10, 0;                            // RP_OK
+        mov rax, r15;
+        shl rax, 32;
+        or  rax, r10;
+        jmp rp_epilogue;
+
+        // ------------------------------------------------------------
+        // Error return paths
+        // ------------------------------------------------------------
+      rp_err_syntax:
+        mov r10, 0x3400;
+        mov rax, r15;
+        shl rax, 32;
+        or  rax, r10;
+        jmp rp_epilogue;
+
+      rp_err_too_many:
+        mov r10, 0x3401;
+        mov rax, r15;
+        shl rax, 32;
+        or  rax, r10;
+        jmp rp_epilogue;
+
+      rp_err_oos:
+        mov r10, 0x3402;
+        mov rax, r15;
+        shl rax, 32;
+        or  rax, r10;
+        jmp rp_epilogue;
+
+      rp_epilogue:
+        add rsp, 24;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _rp_parse_select(bytes_ptr, bytes_len, out_ptr, out_cap)
+  //
+  //   rdi = bytes_ptr
+  //   rsi = bytes_len
+  //   rdx = out_ptr
+  //   rcx = out_cap
+  //   rax = (n_fields << 32) | status
+  //
+  // Thin wrapper: sets flags_byte = 0 and delegates to
+  // _rp_parse_impl. Emits FieldSelector records with flags = 0 (the
+  // SELECT variant).
+  //
+  // Prologue: `sub rsp, 8` + `mov r8, 0` + `call` + `add rsp, 8` +
+  // `ret`. Entry rsp%16==8; after `sub rsp, 8` rsp%16==0; the
+  // nested CALL into _rp_parse_impl lands aligned (callee entry
+  // rsp%16==8, which the callee's own 48+24 push+sub lifts to %16==0
+  // steady).
+  //
+  // Labels prefixed rp_sel_.
+  // ==========================================================================
+  pub let _rp_parse_select : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (bytes_ptr: u64) (bytes_len: u64)
+       (out_ptr: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R223.M2 (#2667): public `select FIELDS` entry point. One-nested-call wrapper that sets r8 = 0 (flags_byte = 0, the SELECT variant) and delegates to _rp_parse_impl. Prologue is `sub rsp, 8` only (no callee-save push); after the sub, rsp%16==0 so the nested CALL into _rp_parse_impl lands aligned (callee entry rsp%16==8). Returns _rp_parse_impl's packed (n_fields << 32) | status unchanged. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed rp_sel_.",
+      block: {
+      rp_sel_entry:
+        sub rsp, 8;
+        mov r8, 0;                             // flags = 0 (SELECT)
+        call _rp_parse_impl;
+        add rsp, 8;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // _rp_parse_project(bytes_ptr, bytes_len, out_ptr, out_cap)
+  //
+  //   rdi = bytes_ptr
+  //   rsi = bytes_len
+  //   rdx = out_ptr
+  //   rcx = out_cap
+  //   rax = (n_fields << 32) | status
+  //
+  // Thin wrapper: sets flags_byte = RP_FLAG_PROJECT (= 1) and
+  // delegates to _rp_parse_impl. Emits FieldSelector records with
+  // flags = 1 (the PROJECT variant). At M2 the semantics are
+  // identical to _rp_parse_select; the flag is written so M3's
+  // downstream dispatcher can differentiate per-field.
+  //
+  // Same alignment plan as _rp_parse_select.
+  //
+  // Labels prefixed rp_proj_.
+  // ==========================================================================
+  pub let _rp_parse_project : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (bytes_ptr: u64) (bytes_len: u64)
+       (out_ptr: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R223.M2 (#2667): public `project FIELDS` entry point. One-nested-call wrapper that sets r8 = RP_FLAG_PROJECT (= 1) (flags_byte = 1, the PROJECT variant) and delegates to _rp_parse_impl. Prologue is `sub rsp, 8` only (no callee-save push); after the sub, rsp%16==0 so the nested CALL into _rp_parse_impl lands aligned. At M2 both operators share semantics; the per-field flag survives for the M3 differentiation that routes `select` through a reordering pass and `project` through a drop-unselected pass. Returns _rp_parse_impl's packed (n_fields << 32) | status unchanged. No test; no and-imm64; no imul-r-imm; no multiline let. Labels prefixed rp_proj_.",
+      block: {
+      rp_proj_entry:
+        sub rsp, 8;
+        mov r8, 1;                             // flags = RP_FLAG_PROJECT
+        call _rp_parse_impl;
+        add rsp, 8;
+        ret;
+      }
+    }
+
+}
